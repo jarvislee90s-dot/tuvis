@@ -12,9 +12,28 @@
 
 **范围注记（审阅时裁决）：** 本计划覆盖 **H1–H12**（用户 2026-10-04 指令）；spec 裁决 19 现文为 H1–H13（H13 = dsh 写侧 ACP stdio）。若审定要并入 H13 → 在 Task 11 后追加 11b（结构同 Task 11，ACP over stdio）。
 
-**分支与门禁：** 新分支 `feat/h1-h12-headless`（off `origin/main` `8e674d0`）；每 Task 一 commit，全门禁绿才 commit：`cd src-tauri && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check`；涉前端另跑 `pnpm test && pnpm build && pnpm format:check && pnpm lint`。`git add` 只加任务列明文件，**严禁 `-u`/`-A`/`.`**。
+**分支与门禁（用户 2026-10-05 裁决）**：工作分支 `feat/h1-h12-headless`（off `origin/main` `88b43ae`）；**全部任务完成并通过 Task 15 统一手工测试前，一律不 push 到远端**——所有 commit 落本地分支；每 Task 一 commit，全门禁绿才 commit：`cd src-tauri && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check`；涉前端另跑 `pnpm test && pnpm build && pnpm format:check && pnpm lint`。`git add` 只加任务列明文件，**严禁 `-u`/`-A`/`.`**。
 
 **已知实机环境（USER-ASSIST 点会标注）：** 本机 MAM dev 在跑（改后端需重启验证）；ZCode / DeepSeek Harness / WorkBuddy / ChatGPT.app(codex) 均已装；zcode CLI 0.16.9（`ELECTRON_RUN_AS_NODE=1 "D:/Program Files/ZCode/ZCode.exe" "D:/Program Files/ZCode/resources/glm/zcode.cjs"`）；codex 0.160.0；WB 5.7.3（Win 端点未启用——Task 11 有前置检查）；探测定案的证据目录 `~/mam-probe-closure/20261003-022408/`。
+
+---
+
+## 复用清单（现有实现与探测结果——执行者从这里取，不要重造）
+
+**在产函数/模块（直接调用或同构仿写）**：
+
+| 复用物 | 位置 | 用于任务 |
+|---|---|---|
+| `find_dsh_desktop_host_pid`（宿主进程扫描形态） | `monitor/dsh/mod.rs`（H1 交付） | Task 8 的 zcode APP 活跃探测仿其「遍历进程 → cmdline 特征匹配」骨架 |
+| `mangle_project_path` / `session_jsonl_path` / `find_session_jsonl` / `derive_status_from_tail` / `title_from_db` | `monitor/workbuddy_parser.rs:130-259` | Task 2（db 源的状态映射）、Task 11（`projects/` 转写补扫与落盘佐证）直接调用 |
+| 注入三端点骨架与审计双行口径 | `remote/api.rs:569+`（`一次 session-send 最多落两类审计行` 既有架构注释） | Task 5/8/9 的端点接线与 `action=headless` 审计照抄同构 |
+| settings 键模式 | `remote/mod.rs` `KEY_ENABLED` 族 + `database::get/set_setting` | Task 5/6 的 `remote.headless_enabled/_timeout_ms/_concurrency` 照抄键命名 |
+| codex 会话文件路径推导 | `monitor/codex_parser.rs`（`sessions/<Y/M/D>/rollout-*`） | Task 9 thread id = adapter 已有路径取 basename，不重写扫描 |
+| `projcache::load` / `identity_matches` | `monitor/dsh/projcache.rs:19,55` | Task 1 修复对象本体（version 白名单在此） |
+| `win32::collect_ancestor_pids` / 进程组口径 | `window/win32.rs:31` | Task 6 kill 树的进程侧查询 |
+| 按会话串行 + W5 内容摘要口径 | `inject/queue.rs`（在产） | Task 6 串行层与审计摘要对齐，不另造口径 |
+
+**探测定案事实（附录 D 直译，测试断言以此为真值）**：zcode 争用锁 1s 失败形态（Task 8 `classify_exit`）；codex `-C` 前置与单写者锁 -32600（Task 9）；WB ACP wire 序列与已结束会话静默挂（Task 11）；claude argv 全集与 control_response 规则（Task 13，附录 E ①②）；stdout 前缀污染样本（Task 6 receipt 测试）；`workbuddy.db` sessions 表 40 列结构（Task 2）；`recentProjects` 位置 `~/.zcode/v2/setting.json`（Task 12）。
 
 ---
 
@@ -257,7 +276,7 @@ engine 靶向入口接线：候选集 >1 且能取 TTY → `resolve_by_tty`；�
 - Modify: `src-tauri/src/remote/mod.rs`（`pub const KEY_HEADLESS: &str = "remote.headless_enabled";` 纳入 status 组装）
 - Modify: `src-tauri/src/remote/api.rs`（session-send 路由到无头通道前的开关校验）
 - Modify: `src/components/settings/RemoteSection.tsx` + `src/i18n/locales/{zh,en}.json`（「无头注入」开关 + 一次性安全说明）
-- Test: `tests/remote/*`（已有套件追加）+ `tests/`（RemoteSection 用例）
+- Test: `src-tauri/src/remote/api.rs` tests 模块（既有远程端点测试同位追加）+ `tests/`（RemoteSection 前端用例，沿用既有 settings 区测试文件）
 
 - [ ] **Step 1: 写失败测试**（后端）：开关关闭时对 zcode 会话 session-send → `403 {"error":"headless_disabled"}`；开启后放行到路由层。前端：RemoteSection 渲染开关、默认 off、点开弹安全说明（i18n 双语键 `remote.headless.title/hint/confirm`）。
 - [ ] **Step 2: 确认失败** → **Step 3: 实现**：`database::get_setting(KEY_HEADLESS)` 默认 `"false"`；`remote_status` JSON 加 `headlessEnabled`；RemoteSection 三件套之第一件（本任务只放开关，超时/并发上限控件随 Task 6 的配置落点一起加）；开关翻转写审计 `action='setting' detail='headless=<v>'`。安全说明文案（zh）：「无头注入将在不经过终端可视确认的情况下直接驱动 Agent 执行消息（含工具调用）。zcode 通道默认 yolo 档（不弹审批）。开启即表示知悉。」
@@ -316,15 +335,18 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 
 ```rust
     #[test]
-    fn zcode_probe_requires_prompt_dryrun_not_version() {
+    fn zcode_probe_uses_prompt_dryrun_not_version() {
         // 附录 E/探测定案：--version 不需要 provider config 会漏判——探针必须 --prompt 干跑
-        let spec = super::ProbeSpec::Zcode { exe: "D:/Program Files/ZCode/ZCode.exe".into(), cjs: "...".into() };
-        assert!(super::probe_argv(&spec).iter().any(|a| a == "--version").not() /* 伪码意图：不含 --version，含 --prompt */);
+        let spec = super::ProbeSpec::Zcode { exe: "D:/Program Files/ZCode/ZCode.exe".into(), cjs: "D:/Program Files/ZCode/resources/glm/zcode.cjs".into() };
+        let argv = super::probe_argv(&spec);
+        assert!(argv.iter().any(|a| a == "--prompt"), "探针须 --prompt 干跑: {argv:?}");
+        assert!(!argv.iter().any(|a| a == "--version"), "探针不得用 --version（会漏判 provider 缺失）: {argv:?}");
     }
 ```
 
 探针：zcode = `--prompt "" --mode yolo --json` 干跑（超时 15s，能出 JSON 即过；Mac 缺 env var 时报 VersionGate 并附修复提示）；codex = `queue --help` 子命令在场；结果缓存（进程存在性 + mtime 键）。
-- [ ] **Step 4: 全门禁**；**Step 5: Commit** `git commit -m "feat(headless): H4/H6 底座——runner(600s watchdog/kill树/取消/并发2) + receipt 归一(前缀跳过) + 版本门控探针 + 审计"`
+- [ ] **Step 4: 设置页「无头」子区三件套收齐**——Task 5 只放了总开关，本步补另两件：`remote.headless_timeout_ms`（默认 600000）与 `remote.headless_concurrency`（默认 2）的 RemoteSection 控件 + `remote_status` 下发 + runner 启动时读取（spec H4 配置落点）。前端用例：三控件渲染 + 默认值断言。
+- [ ] **Step 5: 全门禁**；**Step 6: Commit** `git commit -m "feat(headless): H4/H6 底座——runner(600s watchdog/kill树/取消/并发2) + receipt 归一(前缀跳过) + 版本门控探针 + 无头子区三件套 + 审计"`
 
 ### Task 7: C1-③ 路由表扩展（H 系通道入路由）
 
@@ -357,7 +379,7 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
     }
 ```
 
-- [ ] **Step 2: 确认失败** → **Step 3: 实现**：`Channel` 加 `Headless(HeadlessKind)`；`HeadlessKind { Zcode, CodexQueue, CodexExec, WbAcp, ClaudeP, KimiP, OpencodeRun }`；`Visibility` 加 `AfterRestart`（zcode 已信任）/ `MamOnly`（zcode 未信任）——携元数据 `visibility_note: &'static str`（移动端提示文案键）；`tool_gate` 重写：workbuddy/dsh/zcode 不再一律黑盒——zcode→Headless(Zcode)、workbuddy→Headless(WbAcp)、dsh CLI 形态→终端注入保留 + APP 形态→NotInjectable(reason_code="dsh_headless_pending")〔H13 范围注记〕；codex 按形态分派（cli→终端 / app→CodexQueue）。既有 `app_form` 断言测试翻转语义。
+- [ ] **Step 2: 确认失败** → **Step 3: 实现**：`Channel` 加 `Headless(HeadlessKind)`；`HeadlessKind { Zcode, CodexQueue, CodexExec, WbAcp, ClaudeP, KimiP, OpencodeRun }`；`Visibility` 加 `AfterRestart`（zcode 已信任）/ `MamOnly`（zcode 未信任）——携元数据 `visibility_note: &'static str`（移动端提示文案键）；`tool_gate` 重写：workbuddy/dsh/zcode 不再一律黑盒——zcode→Headless(Zcode)、workbuddy→Headless(WbAcp)、dsh CLI 形态→终端注入保留 + APP 形态→NotInjectable(reason_code="dsh_headless_pending")〔**范围注记：若审阅裁 H13 并入 → 此分支改路由 Headless(DshAcp) 并在 HeadlessKind 加变体**〕；codex 按形态分派（cli→终端 / app→CodexQueue）。既有 `app_form` 断言测试翻转语义。
 - [ ] **Step 4: 全门禁**；**Step 5: Commit** `git commit -m "feat(routing): H 系无头通道入路由——四家 APP 形态分派 + 可见性元数据（AfterRestart/MamOnly）"`
 
 ### Task 8: C1-④ H7 zcode 无头适配器 + session-send 接线 + 回执卡
@@ -438,9 +460,9 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 ### Task 11: C2 H9 WorkBuddy ACP 适配器（HTTP 型）
 
 **Files:**
-- Create: `src-tauri/src/inject/headless/wb_acp.rs`
+- Create: `src-tauri/src/inject/headless/wb_acp.rs`（`MockHttp` 为本任务内定义的注入缝：`Box<dyn Fn(HttpReq) -> HttpResp>` 封装，非外部依赖）
 - Modify: `src-tauri/src/monitor/workbuddy_parser.rs`（读链路补扫 `~/.workbuddy/projects/<munged-cwd>/*.jsonl`——ACP 会话不进 db，Task 2 的 db 源扫不到）
-- Test: wb_acp.rs tests（wire 纯核用注入闭包 mock HTTP）
+- Test: wb_acp.rs tests（wire 纯核用 MockHttp）
 
 - [ ] **Step 1: 写失败测试**（协议序列纯核——Mac 实测 wire 为准）：
 
@@ -521,25 +543,56 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
     }
 ```
 
-- [ ] **Step 2: 确认失败** → **Step 3: 实现**：claude = runner 长驻变体（进程存活至 turn 结束——裁决 8 特例）：stdout 双流解析（stream-json 事件流 + `control_request` 控制面分离）→ `control_request{can_use_tool}` 投影成移动端审批卡/问答卡（复用 H5 接口与 Task 10 类型）→ 用户选择 → stdin 写 `control_response`；turn 终点判据 = `stream_event{message_delta{stop_reason}}`（E-①，勿等 result 帧）；kimi = `kimi -p -S <id> "<text>"`；opencode = `opencode run <text>`（会话续接参数 C4 实机首任务定案——B/C 级证据）；回执解析各一（末条 assistant + token）。
+- [ ] **Step 2: 确认失败** → **Step 3: 实现**：claude = runner 长驻变体（进程存活至 turn 结束——裁决 8 特例）：stdout 双流解析（stream-json 事件流 + `control_request` 控制面分离）→ `control_request{can_use_tool}` 投影成移动端审批卡/问答卡（复用 H5 接口与 Task 10 类型）→ 用户选择 → stdin 写 `control_response`；turn 终点判据 = `stream_event{message_delta{stop_reason}}`（E-①，勿等 result 帧）；kimi = `kimi -p -S <id> "<text>"`；opencode = `opencode run <text>`（两家的会话续接参数属 B/C 级证据——**本任务实机首步**先各自无头跑一条探针定案续接形态，再落适配器）；回执解析各一（末条 assistant + token）。
 - [ ] **Step 4: 全门禁**；**Step 5: USER-ASSIST 实机**：对一个无窗 claude 会话发消息 → 审批卡弹出 → 批准 → 工具执行 → 回执。
 - [ ] **Step 6: Commit** `git commit -m "feat(cli-three): H11 claude/kimi/opencode 无头——argv 全集/审批双向 wire/问答 answers 映射（附录 E 规格）"`
 
 ### Task 14: 收尾——E2E 骨架 + 全门禁 + spec 进度回填
 
 **Files:**
-- Create: `src-tauri/tests/headless_e2e.rs`（`#![cfg_attr(not(windows), ignore)]` 实机套件骨架，m9r 模式）
+- Create: `src-tauri/tests/headless_e2e.rs`（跨平台 `#[ignore]` 实机套件——无头通道本就双平台，**不做 windows-only 编译门**，单机跑不了的用例按平台条件 skip 并登记）
 - Modify: spec 附录 B（状态翻 🔄/✅）
 
 - [ ] **Step 1: E2E 用例**（全 `#[ignore]`，实机跑）：`zcode_send_roundtrip`（发→回执→rollout 落盘核验）/ `codex_queue_consumed` / `wb_acp_prompt_landed` / `claude_approval_roundtrip`。空跑验证编译 + `cargo test -- --ignored --list` 列出。
 - [ ] **Step 2: 全门禁总跑**（cargo test/clippy/fmt + pnpm test/build/format/lint）+ 既有 `#[ignore]` 套件不回归。
 - [ ] **Step 3: spec 附录 B 回填 commit + push** `git commit -m "docs(spec): H1-H12 实施进度回填（本计划执行完毕）"`
 
+### Task 15: 统一手工测试用例（用户执行——仅限 agent 无法操作的项）
+
+> 时机：**Task 1–14 全部完成、代码 review 通过之后，用户一次性统一执行**（用户 2026-10-05 裁决）。凡 agent 能用电脑直接操作的（命令行验证、DB/文件核对、API 调用、进程检查）都已在前序任务的实机核验步覆盖——本清单**只收**手机操作、GUI 目视、APP 内交互、账号态四类。每用例带通过判据；发现不符记录现象回主线。
+
+**前置准备（一次）**：MAM dev 以本分支最新代码重启；手机连同一局域网打开 `/m` 并 PIN 配对；ZCode / WorkBuddy / ChatGPT.app / DeepSeek Harness 保持安装可用。
+
+| # | 功能点 | 手工步骤（只有你能做的部分） | 通过判据 |
+|---|---|---|---|
+| M1 | H3 总开关·关闭态 | 设置页确认「无头注入」默认关 → 手机打开任一 zcode 会话详情 | 发送入口置灰 + 提示「无头通道未开启，请在电脑端 MAM 设置中开启」 |
+| M2 | H3 总开关·开启 | 电脑端开启开关（读安全说明并确认）→ 回手机刷新 | 入口恢复可用 |
+| M3 | H7 zcode 发消息 | 手机对 Test2 的 zcode 会话发「hi [测试]」 | 回执卡出现：末条 assistant 摘要 + token + 耗时；下方灰字「重启 ZCode 应用后可见」 |
+| M4 | H7 可见性兑现 | 重启 ZCode APP → 打开 Test2 工作区 | M3 的回合出现在会话里 |
+| M5 | H4 取消 | 手机对任一会话发一条长任务（如「数到 100」）→ 回执进行中点「取消」 | 回执变「已取消（用户终止）」，进程消失（电脑任务管理器无残留 zcode.cjs） |
+| M6 | H8 codex APP | 手机对 Test2 的 codex 会话发「ok? [测试]」→ 切到 ChatGPT.app 看 | APP 内 ~1 分钟出现该消息并开始回复 |
+| M7 | H9 WB 前置 | （WB 未开远程控制时）手机对 WB 会话发消息 | 如实收到「WorkBuddy 远程控制端点未启用」提示（不谎报成功） |
+| M8 | H9 WB 全链 | 在 WorkBuddy 设置里开启远程控制类开关（找到与否都告知主线）→ 手机对活跃 WB 会话发「hi」 | WB APP 内出现消息并执行；找不到开关 = 记录后跳过（风险 16 活账） |
+| M9 | H10 zcode 新建 | 手机「+ 新建会话」→ 工具选 zcode → 项目选 Test2 → 首句默认 → 提交 | 回执出新 sess_id → 看板出现新卡 → 重启 ZCode APP 后 Test2 里可见 |
+| M10 | H11 claude 审批 | 手机对一个无窗 claude 会话发「列出本目录文件」 | 手机弹出审批卡（Bash 工具 + 命令原文）→ 点批准 → 工具执行 → 回执含结果 |
+| M11 | H11 问答卡 | 手机发一条会触发 claude AskUserQuestion 的消息（如「问我一个单选题」） | 问答卡出现：单选/多选/Other 自由文本可用；**不全答无法提交**；提交后 claude 收到答案 |
+| M12 | H1+T1 dsh 正文 | 在 DeepSeek Harness 里随便一个项目发一条消息 | MAM 看板 dsh 卡正文/预览随之更新（不再「无消息」） |
+| M13 | H12 WB 上板 | 在 WorkBuddy 里新建一个会话说一句 | MAM 看板出现该 WB 卡（无心跳场景） |
+| M14 | L13 拒绝歧义 | 电脑开两个终端、同目录各起一个 claude → 手机对其中一张卡发消息 | 收到明确拒绝提示「同目录存在多个候选会话…」（而不是打进错误窗口） |
+| M15 | 回执诚实性抽查 | 手机随便发 2–3 条到不同工具 | 每条要么明确成功（有消费证据）要么明确失败原因——**没有任何一条谎报成功** |
+
+（L14 的 macOS 假成功修复属 Mac 侧验收——下次 Mac 有空时按 Mac 报告 ③-5 场景复测 Esc 生效即可，不阻塞本批。）
+
+- [ ] **Step 1: 用户按表统一执行，逐条记录 PASS/FAIL/现象**
+- [ ] **Step 2: 主线汇总结果回填 spec 附录 B + 修复 FAIL 项（若有）**
+- [ ] **Step 3: 全部 PASS 后：主线征得用户同意再 push 分支与合流**
+
 ---
 
-## 自审记录（Self-Review）
+## 自审记录（Self-Review，含 2026-10-05 复审轮）
 
-1. **Spec 覆盖**：H1（Task 1，诊断驱动——含对既有交付代码的 v4 修复）/ H2（✅ 已完成探测，无实现任务——结论供 Task 9/11 用）/ H3（5）/ H4+H6（6）/ H5（10+13）/ H7（8）/ H8（9）/ H9（11）/ H10（12）/ H11（13）/ H12（2）/ L13（3）/ L14（4）。C0 四件 = Task 1–4 ✓。**H13（dsh 写侧）不在本计划**（范围注记，审阅裁决）。
+1. **Spec 覆盖**：H1（Task 1，诊断驱动——含对既有交付代码的 v4 修复）/ H2（✅ 已完成探测，无实现任务——结论供 Task 9/11 用）/ H3（5）/ H4+H6（6）/ H5（10+13）/ H7（8）/ H8（9）/ H9（11）/ H10（12）/ H11（13）/ H12（2）/ L13（3）/ L14（4）。C0 四件 = Task 1–4 ✓。**H13（dsh 写侧）不在本计划**（范围注记，审阅裁决）。**Task 15 覆盖全部 H 节的手工验收面**（M1–M15）。
 2. **占位符扫描**：实现要点均给出核心代码或明确规格表；`db_snapshot_fresh`/`agent_tty` 等给签名+行为契约（内部逻辑为直白 IO，执行者按契约落码）；无 TBD。
 3. **类型一致性**：`Receipt/Stage/HeadlessKind/Channel::Headless/PermissionSpec/Decision/Q` 在 Task 6/7/8/10/13 间交叉引用已对齐；`codex -C` 前置（Task 9 argv[1] 断言）与附录 E-④ 一致。
 4. **实测对齐**：Task 1 的诊断三连源自「版本门结论被代码事实推翻」的更正；Task 8 争用锁/Task 9 分派/Task 11 复活语义均为两端探测定案直译。
+5. **复审轮修订（2026-10-05，用户指令内审）**：① 执行纪律改为「本地分支 `feat/h1-h12-headless`、全任务完成且 Task 15 通过前不 push」；② 新增复用清单节（在产函数 8 项 + 探测定案真值 7 项，标注用于哪个任务）；③ gate.rs 伪码测试改真码（`--prompt` 在场断言 + `--version` 缺席断言）；④ Task 6 补「无头子区三件套收齐」步（超时/并发控件原漏排）；⑤ Task 11 MockHttp 定义为任务内注入缝；⑥ Task 13「C4 实机首任务」自指措辞改「本任务实机首步」；⑦ Task 14 E2E 去 windows-only 编译门（无头通道双平台）；⑧ 新增 Task 15（15 个手工用例，仅收手机/GUI 目视/APP 交互/账号态四类不可自动化项，统一于 review 通过后执行）。
