@@ -11,9 +11,10 @@ use crate::adapter::AgentProcess;
 use crate::session::{jump_supported_for, AgentType, ProcessForm, Session, SessionStatus};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// L2 摘要缓存（monitor::session_scan）：workbuddy 为进程界定有界扫描
 /// （心跳文件直达会话 jsonl），L1+L2 已足够（见 session_scan 模块文档）
@@ -62,7 +63,7 @@ const TITLE_HEAD_LINES: usize = 500;
 pub static LAST_SEEN_SESSIONS: Lazy<Mutex<HashMap<u32, (String, String)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Heartbeat {
     pub pid: u32,
     #[serde(rename = "sessionId")]
@@ -254,6 +255,42 @@ pub fn derive_status_from_tail(lines: &[String]) -> SessionStatus {
     derive_status_with_tail(lines).0
 }
 
+/// 转写证据（心跳源与 db 源共用）：L2 摘要缓存产物 + 每次现算的时间叠加。
+/// 抽出的理由：H12 db 源要与心跳源**同一套**状态/正文/活动时间口径，
+/// 复制一份时间叠加逻辑必然漂移（spec §4 App 形态 300s 阈值 / §4.2 完成防抖窗）
+struct TailEvidence {
+    /// JSONL mtime（epoch 毫秒）；缺失 → None（防御私有格式/权限异常）
+    mtime_ms: Option<u64>,
+    /// 转写口径的最终状态（防抖 + App 形态 mtime 叠加后）
+    status: SessionStatus,
+    last_message: Option<String>,
+}
+
+fn read_tail_evidence(jsonl: &Path, now: u64) -> TailEvidence {
+    // 尾部解析走 L2 摘要缓存（monitor::session_scan；行数与 codex 一致 500）
+    let digest = WORKBUDDY_SCAN.parse(jsonl, read_workbuddy_tail_digest);
+    let d = digest.as_ref();
+    // JSONL mtime（epoch 毫秒）只取一次，供状态叠加与 last_activity_at 复用
+    let mtime_ms = jsonl
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|dur| dur.as_millis() as u64);
+    // 叠加 App 形态 mtime 阈值（spec §4：App 形态 300s，与 Codex APP 一致）——
+    // 函数调用尾部停更 >= 300s 视为等待而非运行中；mtime 缺失按未过期处理（防御）
+    let mtime_age_ms = mtime_ms.map_or(0, |m| now.saturating_sub(m));
+    let status = overlay_mtime_stale(
+        apply_green_debounce(d.status_core.clone(), d.tail_kind, mtime_age_ms),
+        mtime_age_ms,
+    );
+    TailEvidence {
+        mtime_ms,
+        status,
+        last_message: d.last_message.clone(),
+    }
+}
+
 /// 会话标题：只读打开 workbuddy.db 读 sessions 标题（P2-1：custom_title 非空优先，否则 title）；
 /// 失败降级 None（调用方再降级首条 user 消息）。共享 helper 打开（只读 + busy_timeout，P1-4）
 pub fn title_from_db(home: &Path, session_id: &str) -> Option<String> {
@@ -289,6 +326,220 @@ fn resolve_title(
         .map(|t| t.chars().take(60).collect::<String>())
 }
 
+// ==================== H12：workbuddy.db 会话真相源（5.7.3 心跳废弃适配） ====================
+//
+// WB 5.7.3（Windows 实测）起交互会话不再写 sessions/<pid>.json 心跳，`workbuddy.db` 的
+// sessions 表成为唯一真相源：心跳驱动发现失明 → 适配器 find_processes 返回空 → 编排层
+// L1「零进程零解析」短路（adapter/mod.rs::get_all_sessions_inner）→ 会话永不上板。
+// 故 db 源必须**同时**贡献进程与卡片：进程侧以 pid=0 哨兵占位（见 DB_ONLY_PID）。
+
+/// db 活动窗（对齐三层预算 L3 与未读池 24h 口径）：窗外历史行不上板
+pub(crate) const DB_ACTIVITY_WINDOW_MS: i64 = 24 * 3600 * 1000;
+
+/// db 源合成的 AgentProcess pid 哨兵：**无存活宿主进程**（WorkBuddy 未运行 / 会话宿主
+/// 已退出）。沿用既有惯例——未读卡同为 `pid: 0 + form: App`（adapter/mod.rs
+/// build_unread_cards「pid 失效场景：跳转走 activate_agent_app 的按工具兜底」）。
+/// 安全性（消费面已核）：①注入路由 `inject::routing::route` 先判 `pid == 0` →
+/// NotInjectable(no_process)，入队前门（remote/api.rs ④ 路由判定）拦下；
+/// ②跳转 Windows 走 resolve_and_focus(pid=0) 失败 → pid_dead → reactivate_tool_app
+/// 按工具激活宿主 APP（App 形态深链分支只看 sessionId）；macOS 侧
+/// should_try_deep_link(0, _) / tool_enumeration_allowed(0, _) 对 pid=0 均放行；
+/// ③屏读类端点里只有**模式菜单**（remote/api.rs session-mode/menu）显式拒绝 pid=0；
+/// session-mode 读/切不看 pid，由工具门挡下（`inject::mode::mode_structure` 对 workbuddy
+/// 返回 Unsupported → 端点 409 no_mechanism）。
+const DB_ONLY_PID: u32 = 0;
+
+/// db 快照缓存条目上限（与 FALLBACK_HITS_CAP 同款防无界增长；超限整体清空即可——
+/// 条目失效由 mtime 门兜底，清空后下一轮自然重建）
+const DB_SNAPSHOT_CAP: usize = 64;
+
+/// workbuddy.db sessions 表行（5.7.3+ 真相源；列语义按 2026-10-04 实测 40 列之关键子集）
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbSession {
+    pub id: String,
+    pub cwd: String,
+    pub title: String,
+    /// completed / terminated / …（映射见 db_terminal_status）
+    pub status: String,
+    /// ms epoch（**不参与存活判定**——活动时间一律取转写 mtime）。
+    /// 列值为 NULL（私有格式演进）时读作 0 → 恒落 24h 窗外，即该行不上板（保守：不猜时间）
+    pub updated_at: i64,
+}
+
+/// 双源合并条目：同 sessionId 二选一（心跳胜出）。用枚举而非
+/// `{heartbeat: Option, db: Option}`——非法态（两个 Some / 两个 None）不可表示
+#[derive(Debug, Clone)]
+pub(crate) enum MergedSession {
+    Heartbeat(Heartbeat),
+    Db(DbSession),
+}
+
+/// 双源并集去重纯核（spec H12「心跳与 db 双源并集去重」）：
+/// 同 sessionId → 心跳胜出（心跳带活跃态，比 db 行更准）；db 行只补无心跳会话。
+/// 不做心跳有效性过滤（严格 UUID / 新鲜度 / prewarm 由收集侧负责）——纯核只表达合并语义
+pub(crate) fn merge_sources(
+    heartbeats: Vec<Heartbeat>,
+    db_rows: Vec<DbSession>,
+) -> Vec<MergedSession> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<MergedSession> = Vec::with_capacity(heartbeats.len() + db_rows.len());
+    for hb in heartbeats {
+        // 同会话多心跳文件（异常形态）：首见胜出，不重复出条
+        if !seen.insert(hb.session_id.clone()) {
+            continue;
+        }
+        out.push(MergedSession::Heartbeat(hb));
+    }
+    for row in db_rows {
+        if row.id.is_empty() || !seen.insert(row.id.clone()) {
+            continue;
+        }
+        out.push(MergedSession::Db(row));
+    }
+    out
+}
+
+/// 读 workbuddy.db 的 sessions 表（H12 真相源）。
+/// - **只读**：走共享 helper `sqlite::open_readonly_with_timeout`（与同库既有的
+///   `title_from_db`/`get_workbuddy_sessions` 同源纪律：只读连接 + busy_timeout(1000)）。
+///   spec 写「读副本」的**意图**是「绝不写活库」，项目既有纪律是只读连接——本函数不落任何写
+/// - `deleted_at IS NULL`：与 `title_from_conn` 同过滤（实测 14 行中 2 行为软删）
+/// - **不在此处做 24h 窗过滤**：窗口依赖当前时钟，挪到 `db_rows_in_window`（注入 now），
+///   否则夹具行会随真实时间流逝过期（测试腐烂）
+/// - 按 updated_at 倒序、`LIMIT 500` 兜底（实测 14 行；私有表理论上无界，防止
+///   升级后表膨胀把每轮读取拖成全表扫描；窗口过滤仍在纯核，见上）
+pub fn read_db_sessions(db: &Path) -> rusqlite::Result<Vec<DbSession>> {
+    let conn = super::sqlite::open_readonly_with_timeout(db)
+        .ok_or_else(|| rusqlite::Error::InvalidPath(db.to_path_buf()))?;
+    let mut st = conn.prepare(
+        "SELECT id, cwd, title, status, updated_at FROM sessions
+         WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 500",
+    )?;
+    let rows = st.query_map([], |r| {
+        // 防御私有格式：各列均按可空读取后降级（NULL 不得 panic）
+        Ok(DbSession {
+            id: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            cwd: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            status: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            updated_at: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+        })
+    })?;
+    rows.collect()
+}
+
+/// db 代际戳（轮询预算的门）：主库与 -wal 侧车取最大。
+/// - WAL 活跃时写入落在 `workbuddy.db-wal`，主库 mtime 可能直到 checkpoint 才更新
+/// - **不含 -shm**：实测只读连接本身就会刷新 `-shm` 的 mtime（2026-10-05 实机验证），
+///   纳入代际会让门恒失效（每轮重查）
+fn db_generation(home: &Path) -> Option<SystemTime> {
+    let base = home.join(".workbuddy");
+    let mut gen = std::fs::metadata(base.join("workbuddy.db"))
+        .ok()?
+        .modified()
+        .ok()?;
+    if let Ok(wal) = std::fs::metadata(base.join("workbuddy.db-wal")).and_then(|m| m.modified()) {
+        if wal > gen {
+            gen = wal;
+        }
+    }
+    Some(gen)
+}
+
+/// mtime 门 + 读（状态由调用方持有，测试可注入）。返回 `None` 有两种情形，调用方
+/// 一律「沿用上轮快照」即可，但 `*last_mtime` 两条路都已推进到本轮观测到的代际
+/// （调用方必须把它存回去，否则读失败会退化成每轮重复 open + SELECT）：
+/// - 代际未变 → 跳过重查；
+/// - 代际变化但读失败（锁竞争/权限/库被删）→ 跳过本轮结果，等下次代际变化再试
+pub(crate) fn db_snapshot_fresh(
+    home: &Path,
+    last_mtime: &mut Option<SystemTime>,
+) -> Option<Vec<DbSession>> {
+    let gen = db_generation(home);
+    if gen == *last_mtime {
+        return None; // 代际未变（含「库一直缺席」）→ 跳过
+    }
+    *last_mtime = gen; // 先推进：失败也不连轮重试（库再变才算新代际）
+    read_db_sessions(&home.join(".workbuddy").join("workbuddy.db")).ok()
+}
+
+/// 生产轮询路径的 db 快照缓存条目
+#[derive(Default)]
+struct DbSnapshot {
+    /// 读取时的 db 代际（mtime 门的比对基准）
+    generation: Option<SystemTime>,
+    rows: Vec<DbSession>,
+}
+
+/// 生产路径 mtime 门（进程内按 home 缓存）。三条边各自钉死：
+/// - 代际未变 → 直接沿用缓存行（不碰 SQLite）；
+/// - 代际变化且读成功 → 换新行；
+/// - 代际变化但读失败 → **沿用上轮行**（瞬时锁竞争不清空在板卡），并把推进后的代际
+///   存回去——下轮不再重试，直到库再次变化（避免 3s 一轮的重复 open + SELECT）；
+/// - 库文件消失（代际 → None）→ 记空快照：db 源就该为空，不留陈旧行。
+///
+/// 锁内只做内存读写（锁 hygiene：不持锁做 I/O）
+fn db_sessions_gated(home: &Path) -> Vec<DbSession> {
+    static DB_SNAPSHOTS: Lazy<Mutex<HashMap<PathBuf, DbSnapshot>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    let cached = DB_SNAPSHOTS
+        .lock()
+        .unwrap()
+        .get(home)
+        .map(|s| (s.generation, s.rows.clone()));
+    let cached_gen = cached.as_ref().map(|(gen, _)| *gen);
+    let mut last = cached_gen.unwrap_or(None);
+    let result = db_snapshot_fresh(home, &mut last);
+    let rows = match result {
+        Some(rows) => rows, // 代际变化且读成功 → 换新
+        // 库缺席（代际 None，含「先有后删」）→ db 源为空，不留陈旧行
+        None if last.is_none() => Vec::new(),
+        // 代际未变或读失败 → 沿用上轮行
+        None => cached.map(|(_, rows)| rows).unwrap_or_default(),
+    };
+    // 仅在代际推进（或尚无缓存条目）时写回；未变时行也必然未变
+    if cached_gen != Some(last) {
+        let mut map = DB_SNAPSHOTS.lock().unwrap();
+        if map.len() >= DB_SNAPSHOT_CAP {
+            map.clear();
+        }
+        map.insert(
+            home.to_path_buf(),
+            DbSnapshot {
+                generation: last,
+                rows: rows.clone(),
+            },
+        );
+    }
+    rows
+}
+
+/// 24h 活动窗过滤纯核（注入 now，可测）：`updated_at` 比 now 新（时钟偏移）同样保留——
+/// 误剔活跃会话的代价高于多出一张老卡（与未读池/观测表同向的保守取舍）
+pub(crate) fn db_rows_in_window(rows: Vec<DbSession>, now_ms: u64) -> Vec<DbSession> {
+    let now = i64::try_from(now_ms).unwrap_or(i64::MAX);
+    rows.into_iter()
+        .filter(|r| now.saturating_sub(r.updated_at) < DB_ACTIVITY_WINDOW_MS)
+        .collect()
+}
+
+/// db `status` 列 → 三色终态映射（spec H12）：
+/// - `completed` 族 → 绿（Finished）
+/// - `terminated` 族 → 红·中断（Waiting：与 dsh 的 `interrupted → Waiting` 同口径，
+///   本仓库「红」即 Waiting——StatusLight.tsx STATUS_CONFIG）
+/// - 其余（运行中/未知）→ None：状态交转写尾部 + App 形态 mtime 心跳口径判定，
+///   **db 行自己的 updated_at 不得当作存活证据**
+fn db_terminal_status(status: &str) -> Option<SessionStatus> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "completed" | "complete" | "done" | "success" | "succeeded" => {
+            Some(SessionStatus::Finished)
+        }
+        "terminated" | "cancelled" | "canceled" | "failed" | "error" | "aborted"
+        | "interrupted" => Some(SessionStatus::Waiting),
+        _ => None,
+    }
+}
+
 fn heartbeat_path(home: &Path, pid: u32) -> PathBuf {
     home.join(".workbuddy")
         .join("sessions")
@@ -302,20 +553,34 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 心跳目录驱动的会话进程发现核心（P0-1）：
-/// 枚举 ~/.workbuddy/sessions/<PID>.json，逐个防御性解析心跳，按过滤规则（严格 UUID +
-/// kind 非 prewarm + 心跳新鲜 < 90s）判定活跃会话进程，再以 pid 回查进程表补充
-/// cpu/exe 构装 AgentProcess；进程表查无此 pid → 跳过（消失场景由 W4 补偿经
-/// LAST_SEEN_SESSIONS 处理，语义不变）。
-/// 不使用进程名匹配——Windows 上会话宿主与主进程同名 WorkBuddy.exe（Electron 以自身
-/// 作 Node 运行 cli/bin/codebuddy 脚本，无 codebuddy 进程），进程名匹配恒空且「父进程
-/// 同名」会被通用子代理过滤误杀。任何文件缺失/损坏/解析失败一律跳过，不 panic。
-/// process_info 以闭包注入（pid → (cpu_usage, exe)），可测核心不依赖 sysinfo 进程表构造
-fn discover_workbuddy_processes_with(
+/// 心跳可用性判定（心跳源两处共用：进程发现与出卡，防止过滤规则只改一处的漂移）：
+/// 严格 UUID 形态（真实任务会话）且 kind 非 prewarm（双保险，字段缺失视为通过）
+/// 且心跳新鲜，且文件名/内容 pid 一致（issue #35 nit：竞态窗口内文件名 pid 与内容 pid
+/// 不一致 = 竞态/损坏心跳，不为无关进程出卡，下轮真实心跳自愈）
+fn heartbeat_is_usable(hb: &Heartbeat, filename_pid: u32, now: u64) -> bool {
+    heartbeat_session_id_is_uuid(hb)
+        && hb.kind.as_deref() != Some("prewarm")
+        && heartbeat_is_alive(hb, now)
+        && hb.pid == filename_pid
+}
+
+/// 存活心跳条目（心跳源产物）：心跳内容 + 进程表回查字段
+struct LiveHeartbeat {
+    pid: u32,
+    hb: Heartbeat,
+    cpu_usage: f32,
+    exe: Option<PathBuf>,
+}
+
+/// 心跳源收集（P0-1 过滤规则不变）：枚举 ~/.workbuddy/sessions/<PID>.json，逐个防御性
+/// 解析，按「严格 UUID + kind 非 prewarm + 心跳新鲜 < 90s + 文件名/内容 pid 一致」过滤，
+/// 再以 pid 回查进程表（查无 → 跳过，消失场景由 W4 补偿经 LAST_SEEN_SESSIONS 处理）。
+/// 任何文件缺失/损坏/解析失败一律跳过，不 panic
+fn live_heartbeats_with(
     home: &Path,
     process_info: &dyn Fn(u32) -> Option<(f32, Option<PathBuf>)>,
     now_ms: u64,
-) -> Vec<AgentProcess> {
+) -> Vec<LiveHeartbeat> {
     let sessions_dir = home.join(".workbuddy").join("sessions");
     let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
         return Vec::new(); // 目录缺失/不可读 → 空集，不 panic
@@ -337,27 +602,65 @@ fn discover_workbuddy_processes_with(
         else {
             continue;
         };
-        // 过滤：严格 UUID + kind 非 prewarm + 心跳新鲜（与 get_workbuddy_sessions 同规）
-        // + pid 交叉校验（issue #35 nit）：pid 复用竞态窗口内文件名与内容 pid 可能
-        // 不一致，视为无效心跳，不为无关进程出卡（下轮真实心跳自愈）
-        if !heartbeat_session_id_is_uuid(&hb)
-            || hb.kind.as_deref() == Some("prewarm")
-            || !heartbeat_is_alive(&hb, now_ms)
-            || hb.pid != pid
-        {
+        // 过滤规则见 heartbeat_is_usable（与 get_workbuddy_sessions 共用同一判定）
+        if !heartbeat_is_usable(&hb, pid, now_ms) {
             continue;
         }
         // 以 pid 回查进程表：查无 → 跳过（进程已消失，不产出进程）
         let Some((cpu_usage, exe)) = process_info(pid) else {
             continue;
         };
-        found.push(AgentProcess {
+        found.push(LiveHeartbeat {
             pid,
+            hb,
             cpu_usage,
-            cwd: Some(PathBuf::from(&hb.cwd)),
             exe,
-            form: ProcessForm::App,
         });
+    }
+    found
+}
+
+/// 心跳目录驱动的会话进程发现核心（P0-1）+ **db 源**（H12）：
+/// 心跳源规则见 live_heartbeats_with；db 源把无心跳会话补成 `pid = DB_ONLY_PID` 的
+/// AgentProcess——不补则编排层 L1 零进程零解析短路，db 行永远上不了板。
+/// 不使用进程名匹配——Windows 上会话宿主与主进程同名 WorkBuddy.exe（Electron 以自身
+/// 作 Node 运行 cli/bin/codebuddy 脚本，无 codebuddy 进程），进程名匹配恒空且「父进程
+/// 同名」会被通用子代理过滤误杀。
+/// process_info 以闭包注入（pid → (cpu_usage, exe)），可测核心不依赖 sysinfo 进程表构造
+fn discover_workbuddy_processes_with(
+    home: &Path,
+    process_info: &dyn Fn(u32) -> Option<(f32, Option<PathBuf>)>,
+    now_ms: u64,
+) -> Vec<AgentProcess> {
+    let live = live_heartbeats_with(home, process_info, now_ms);
+    // db 源（H12）：窗口内的无心跳会话 → pid=0 哨兵进程（心跳在场者由心跳源覆盖）
+    let db_rows = db_rows_in_window(db_sessions_gated(home), now_ms);
+    let heartbeats: Vec<Heartbeat> = live.iter().map(|l| l.hb.clone()).collect();
+    let mut found = Vec::with_capacity(live.len() + 1);
+    // 进程集同样由并集产出（心跳条目的 cpu/exe 取自进程表回查结果）
+    for entry in merge_sources(heartbeats, db_rows) {
+        match entry {
+            MergedSession::Heartbeat(hb) => {
+                // live_heartbeats_with 已确认过进程表，必命中
+                let Some(l) = live.iter().find(|l| l.pid == hb.pid) else {
+                    continue;
+                };
+                found.push(AgentProcess {
+                    pid: l.pid,
+                    cpu_usage: l.cpu_usage,
+                    cwd: Some(PathBuf::from(&hb.cwd)),
+                    exe: l.exe.clone(),
+                    form: ProcessForm::App,
+                });
+            }
+            MergedSession::Db(row) => found.push(AgentProcess {
+                pid: DB_ONLY_PID,
+                cpu_usage: 0.0,
+                cwd: Some(PathBuf::from(&row.cwd)),
+                exe: None,
+                form: ProcessForm::App,
+            }),
+        }
     }
     found
 }
@@ -378,98 +681,153 @@ pub fn discover_workbuddy_processes(system: &sysinfo::System) -> Vec<AgentProces
     )
 }
 
+/// db 行 → 卡（H12 第二半：进程侧补 pid=0 哨兵，卡片侧在此补出）：
+/// 转写是状态/正文/活动时间的证据源（与心跳路径共用 read_tail_evidence，口径合一）；
+/// 终态取 db `status` 列覆盖（completed→绿 / terminated→红·中断），非终态沿用转写
+/// mtime 心跳口径。转写未落盘（mangle + projects 全目录兜底均未命中）→ None 不出卡
+/// （与心跳路径同规：无证据不出卡；`projects/` 补扫属 Task 11 范围，不在此实现）
+fn db_session_card(
+    home: &Path,
+    db_conn: Option<&rusqlite::Connection>,
+    row: &DbSession,
+    now: u64,
+) -> Option<Session> {
+    let jsonl = find_session_jsonl(home, &row.cwd, &row.id)?;
+    let evidence = read_tail_evidence(&jsonl, now);
+    // db 终态优先；非终态用转写口径（db 行的 updated_at 不作存活证据）
+    let status = db_terminal_status(&row.status).unwrap_or_else(|| evidence.status.clone());
+    // 标题链与心跳路径同源（custom_title 优先 → title → 首条 user 消息）；
+    // 连接不可用时降级 db 行的 title 列（read_db_sessions 已取回）
+    let title = resolve_title(db_conn, &row.id, &jsonl).or_else(|| {
+        (!row.title.trim().is_empty()).then(|| row.title.chars().take(60).collect::<String>())
+    });
+    Some(workbuddy_card(
+        &row.id,
+        &row.cwd,
+        title,
+        status,
+        &evidence,
+        DB_ONLY_PID,
+        0.0,
+    ))
+}
+
+/// epoch 毫秒 → RFC3339（心跳卡 / db 卡共用；时间戳不可表 → 空串，与既有降级一致）
+fn rfc3339_from_ms(ms: u64) -> String {
+    chrono::DateTime::from_timestamp((ms / 1000) as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
+}
+
+/// 卡构造共用核（心跳源与 db 源只差 id/cwd/标题/状态/pid/cpu 六项）：
+/// 抽出防止「字段集漂移」之外的**取值漂移**（unread / jump_supported / form 组合
+/// 编译器抓不到，两处各写一份必然走样）
+fn workbuddy_card(
+    id: &str,
+    cwd: &str,
+    title: Option<String>,
+    status: SessionStatus,
+    evidence: &TailEvidence,
+    pid: u32,
+    cpu_usage: f32,
+) -> Session {
+    Session {
+        id: id.to_string(),
+        agent_type: AgentType::WorkBuddy,
+        project_name: project_name_from_path(cwd),
+        project_path: cwd.to_string(),
+        title,
+        git_branch: None,
+        github_url: get_github_url(cwd),
+        status,
+        last_message: evidence.last_message.clone().filter(|m| !m.is_empty()),
+        last_message_role: None,
+        last_message_subagent_report: false,
+        flap_from_subagent_activity: false,
+        last_activity_at: evidence.mtime_ms.map(rfc3339_from_ms).unwrap_or_default(),
+        pid,
+        cpu_usage,
+        active_subagent_count: 0,
+        form: ProcessForm::App,
+        jump_supported: jump_supported_for(ProcessForm::App),
+        unread: false, // 扫描出的活跃卡默认非未读；未读卡由 adapter 层合并
+    }
+}
+
 /// 主入口：活跃心跳的 WorkBuddy 进程 → 每会话一张卡
 pub fn get_workbuddy_sessions(processes: &[AgentProcess]) -> Vec<Session> {
-    let mut sessions = Vec::new();
     let Some(home) = dirs::home_dir() else {
-        return sessions;
+        return Vec::new();
     };
-    let now = now_ms();
+    get_workbuddy_sessions_with(&home, processes, now_ms())
+}
+
+/// 可测核心（home/时钟注入）：心跳路径逐进程出卡（规则原样保留）+ db 源补无心跳会话
+fn get_workbuddy_sessions_with(home: &Path, processes: &[AgentProcess], now: u64) -> Vec<Session> {
+    // L1 零进程零解析（纵深防御；契约见 adapter::session_scan_contract_tests）：
+    // 空进程列表 → 不读心跳、不查 db。db 源进程侧已由 discover 侧补哨兵，
+    // 故此处早退不会掩盖 db 会话
+    if processes.is_empty() {
+        return Vec::new();
+    }
+    let mut sessions = Vec::new();
     // issue #35 nit：单轮复用一条只读连接（title_from_db 原先每会话各开一次 SQLite）
     let db_conn =
         super::sqlite::open_readonly_with_timeout(&home.join(".workbuddy").join("workbuddy.db"));
+    // 已出卡的心跳（供并集去重：心跳优先于同 id 的 db 行）
+    let mut heartbeats = Vec::new();
 
     for process in processes {
-        // 防御：心跳文件缺失/损坏 → 跳过该进程（含独立 CLI、空闲 prewarm）
-        let Some(hb) = std::fs::read_to_string(heartbeat_path(&home, process.pid))
+        // 防御：心跳文件缺失/损坏 → 跳过该进程（含独立 CLI、空闲 prewarm、db 源哨兵 pid=0）
+        let Some(hb) = std::fs::read_to_string(heartbeat_path(home, process.pid))
             .ok()
             .and_then(|s| parse_heartbeat(&s))
         else {
             continue;
         };
-        // 过滤：严格 UUID 形态（真实任务会话）+ 心跳新鲜 + kind 非 prewarm（双保险，字段缺失视为通过）
-        // + pid 交叉校验（issue #35 nit：文件名 pid 与内容 pid 不一致 = 竞态/损坏心跳）
-        if !heartbeat_session_id_is_uuid(&hb)
-            || hb.kind.as_deref() == Some("prewarm")
-            || !heartbeat_is_alive(&hb, now)
-            || hb.pid != process.pid
-        {
+        // 过滤规则见 heartbeat_is_usable（与进程发现共用同一判定）
+        if !heartbeat_is_usable(&hb, process.pid, now) {
             continue;
         }
 
-        let jsonl = find_session_jsonl(&home, &hb.cwd, &hb.session_id);
+        let jsonl = find_session_jsonl(home, &hb.cwd, &hb.session_id);
         let Some(jsonl) = jsonl else {
             continue; // 会话文件未落盘/未命中（防御；mangle 兜底扫描也失败）
         };
 
-        // 尾部解析走 L2 摘要缓存（monitor::session_scan；行数与 codex 一致 500）
-        let digest = WORKBUDDY_SCAN.parse(&jsonl, read_workbuddy_tail_digest);
-        let d = digest.as_ref();
-        // JSONL mtime（epoch 毫秒）只取一次，供状态叠加与 last_activity_at 复用
-        let jsonl_mtime_ms = jsonl
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|dur| dur.as_millis() as u64);
-        // 叠加 App 形态 mtime 阈值（spec §4：App 形态 300s，与 Codex APP 一致）——
-        // 函数调用尾部停更 >= 300s 视为等待而非运行中；mtime 缺失按未过期处理（防御）
-        let mtime_age_ms = jsonl_mtime_ms.map_or(0, |m| now.saturating_sub(m));
-        let status = overlay_mtime_stale(
-            apply_green_debounce(d.status_core.clone(), d.tail_kind, mtime_age_ms),
-            mtime_age_ms,
-        );
-        let last_message = d.last_message.clone().unwrap_or_default();
-
+        let evidence = read_tail_evidence(&jsonl, now);
         let title = resolve_title(db_conn.as_ref(), &hb.session_id, &jsonl);
-
-        sessions.push(Session {
-            id: hb.session_id.clone(),
-            agent_type: AgentType::WorkBuddy,
-            project_name: project_name_from_path(&hb.cwd),
-            project_path: hb.cwd.clone(),
+        sessions.push(workbuddy_card(
+            &hb.session_id,
+            &hb.cwd,
             title,
-            git_branch: None,
-            github_url: get_github_url(&hb.cwd),
-            status,
-            last_message: if last_message.is_empty() {
-                None
-            } else {
-                Some(last_message)
-            },
-            last_message_role: None,
-            last_message_subagent_report: false,
-            flap_from_subagent_activity: false,
-            last_activity_at: jsonl_mtime_ms
-                .map(|ms| {
-                    chrono::DateTime::from_timestamp((ms / 1000) as i64, 0)
-                        .map(|dt| dt.to_rfc3339())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default(),
-            pid: process.pid,
-            cpu_usage: process.cpu_usage,
-            active_subagent_count: 0,
-            form: ProcessForm::App,
-            jump_supported: jump_supported_for(ProcessForm::App),
-            unread: false, // 扫描出的活跃卡默认非未读；未读卡由 adapter 层合并
-        });
+            evidence.status.clone(),
+            &evidence,
+            process.pid,
+            process.cpu_usage,
+        ));
 
-        // 记录本轮 pid→(tool, session)（心跳消失补偿依据；含工具归属便于按工具隔离清理）
+        // 记录本轮 pid→(tool, session)（心跳消失补偿依据；含工具归属便于按工具隔离清理）。
+        // db 源卡（pid=0）**不记**——实际后果（已知限制，非正确性保证）：db 源会话因此
+        // 永远不进未读池（W4 补偿只遍历心跳 pid，compensate_vanished_heartbeats_in），
+        // WorkBuddy 退出后它们被 filter_host_dead_cards 清掉，会话就此彻底离板
+        // （无「进程退出 → 未读卡接管」的兜底）。要补这条得让补偿认 db 行，属后续任务
         LAST_SEEN_SESSIONS.lock().unwrap().insert(
             process.pid,
             ("workbuddy".to_string(), hb.session_id.clone()),
         );
+        heartbeats.push(hb);
+    }
+
+    // db 源（H12）：窗口内的无心跳会话补卡（心跳覆盖的 id 由 merge_sources 剔除）
+    let db_rows = db_rows_in_window(db_sessions_gated(home), now);
+    for entry in merge_sources(heartbeats, db_rows) {
+        let MergedSession::Db(row) = entry else {
+            continue;
+        };
+        if let Some(card) = db_session_card(home, db_conn.as_ref(), &row, now) {
+            sessions.push(card);
+        }
     }
     sessions
 }
@@ -1727,6 +2085,426 @@ mod debounce_tests {
                 crate::session::SessionStatus::Processing,
                 Some(AppEntryKind::ToolCall)
             )
+        );
+    }
+}
+
+// ---- H12 db 双源发现（WB 5.7.3 心跳废弃适配）：tempdir 造实测形态的 workbuddy.db ----
+
+#[cfg(test)]
+mod db_source_tests {
+    use super::*;
+
+    const SID: &str = "3f12ca20-eae5-4713-a7a4-adf64a44f346";
+    const CWD: &str = "E:/LLMproject/Github/Test2";
+    /// 注入时钟：与实测 db 行 updated_at 同刻（夹具不随真实时间流逝腐烂）
+    const NOW_MS: u64 = 1_791_121_748_142;
+
+    const USER_MSG: &str = r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"你是什么模型"}]}"#;
+    const ASSISTANT_MSG: &str = r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"我是 WorkBuddy"}]}"#;
+    const TOOL_TAIL: &str = r#"{"type":"function_call","name":"shell"}"#;
+
+    /// 夹具行：(id, cwd, title, status, updated_at, deleted_at)
+    type FixtureRow<'a> = (&'a str, &'a str, &'a str, &'a str, i64, Option<i64>);
+
+    /// 造 workbuddy.db（对齐 2026-10-04 实测 40 列的关键子集）：custom_title 与
+    /// deleted_at 必须在内——`title_from_conn` 的真实查询是
+    /// `COALESCE(NULLIF(custom_title,''), title) … AND deleted_at IS NULL`，
+    /// 仅 7 列的夹具覆盖不到该路径（计划内审更正常见）
+    fn seed_db(home: &Path, rows: &[FixtureRow<'_>]) -> PathBuf {
+        let dir = home.join(".workbuddy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("workbuddy.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, cwd TEXT, user_id TEXT, title TEXT, custom_title TEXT,
+                status TEXT, created_at INTEGER, updated_at INTEGER, last_activity_at INTEGER,
+                deleted_at INTEGER, is_playground INTEGER, source_mode TEXT, mode TEXT,
+                model TEXT, permission_mode TEXT, transport TEXT, visibility TEXT, unread INTEGER
+            );",
+        )
+        .unwrap();
+        for (id, cwd, title, status, updated_at, deleted_at) in rows {
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, title, custom_title, status, updated_at,
+                    deleted_at, transport, source_mode)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, 'local', 'craft')",
+                rusqlite::params![id, cwd, title, status, updated_at, deleted_at],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    /// 转写落盘（~/.workbuddy/projects/<mangle(cwd)>/<sessionId>.jsonl）
+    fn write_transcript(home: &Path, cwd: &str, sid: &str, lines: &[&str]) -> PathBuf {
+        let dir = home
+            .join(".workbuddy/projects")
+            .join(mangle_project_path(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join(format!("{sid}.jsonl"));
+        std::fs::write(&jsonl, lines.join("\n")).unwrap();
+        jsonl
+    }
+
+    /// 文件 mtime（epoch 毫秒）——用于把「此刻」钉在转写实际 mtime 上（免时钟猜测）
+    fn jsonl_mtime_ms(path: &Path) -> u64 {
+        path.metadata()
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// mtime 显式前推（不靠睡等时钟粒度，跨平台确定性）
+    fn bump_mtime(path: &Path, secs: u64) {
+        let base = path.metadata().unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(base + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn db_source_surfaces_session_without_heartbeat() {
+        // WB 5.7.3：交互会话无心跳，只在 workbuddy.db sessions 表——db 源应能独立发现
+        let dir = tempfile::tempdir().unwrap();
+        let db = seed_db(
+            dir.path(),
+            &[(SID, CWD, "你是什么模型", "completed", NOW_MS as i64, None)],
+        );
+        let rows = read_db_sessions(&db).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, SID);
+        assert_eq!(rows[0].cwd, CWD);
+        assert_eq!(rows[0].status, "completed");
+    }
+
+    #[test]
+    fn union_dedup_heartbeat_wins_on_conflict() {
+        // 心跳在场的会话以心跳为准（活跃态更准），db 行只补无心跳会话
+        let hb = parse_heartbeat(
+            r#"{"pid":1,"lastHeartbeat":9,"sessionId":"a","cwd":"C:/x","kind":"interactive"}"#,
+        )
+        .unwrap();
+        let db_rows = vec![DbSession {
+            id: "a".into(),
+            cwd: "C:/x".into(),
+            title: "t".into(),
+            status: "completed".into(),
+            updated_at: 9,
+        }];
+        let merged = merge_sources(vec![hb], db_rows);
+        assert_eq!(merged.len(), 1);
+        assert!(matches!(merged[0], MergedSession::Heartbeat(_)));
+        // 无心跳的 db 行独立成条（变体即来源标注）
+        let only_db = merge_sources(
+            Vec::new(),
+            vec![DbSession {
+                id: "b".into(),
+                cwd: "E:/t".into(),
+                title: "t2".into(),
+                status: "completed".into(),
+                updated_at: 9,
+            }],
+        );
+        assert_eq!(only_db.len(), 1);
+        match &only_db[0] {
+            MergedSession::Db(row) => assert_eq!(row.cwd, "E:/t"),
+            other => panic!("无心跳的 db 行应以 Db 变体出条，实得 {other:?}"),
+        }
+    }
+
+    /// spec H12 三色映射：completed → 绿（Finished）；terminated 族 → 红·中断
+    /// （Waiting，与 dsh 的 interrupted→Waiting 同口径）；非终态 → None（交转写 mtime 口径）
+    #[test]
+    fn db_status_maps_three_colours() {
+        assert_eq!(
+            db_terminal_status("completed"),
+            Some(SessionStatus::Finished)
+        );
+        assert_eq!(
+            db_terminal_status(" Completed "),
+            Some(SessionStatus::Finished)
+        );
+        assert_eq!(
+            db_terminal_status("terminated"),
+            Some(SessionStatus::Waiting)
+        );
+        assert_eq!(db_terminal_status("failed"), Some(SessionStatus::Waiting));
+        assert_eq!(db_terminal_status("running"), None);
+        assert_eq!(db_terminal_status(""), None);
+    }
+
+    /// H12 行为回归锁（计划夹具未覆盖的真实路径）：无心跳、无存活进程时，
+    /// db 源必须①贡献 AgentProcess（否则编排层 L1 零进程零解析短路，db 行永不上板）
+    /// ②出卡；且 24h 窗外的历史行不得被带出
+    #[test]
+    fn db_only_session_reaches_board_without_process_or_heartbeat() {
+        let home = tempfile::tempdir().unwrap();
+        let old_sid = "7005f4cd-ef8b-4b7c-bcc5-b0f914c8a58c";
+        let old_updated = NOW_MS as i64 - DB_ACTIVITY_WINDOW_MS - 1; // 窗外
+        seed_db(
+            home.path(),
+            &[
+                (SID, CWD, "你是什么模型", "completed", NOW_MS as i64, None),
+                (
+                    old_sid,
+                    "E:/old",
+                    "远古会话",
+                    "completed",
+                    old_updated,
+                    None,
+                ),
+            ],
+        );
+        write_transcript(home.path(), CWD, SID, &[USER_MSG, ASSISTANT_MSG]);
+
+        // 进程表注入空（WorkBuddy 未运行）+ 无心跳文件：只剩 db 源可贡献进程
+        let procs = discover_workbuddy_processes_with(home.path(), &|_| None, NOW_MS);
+        assert_eq!(
+            procs.len(),
+            1,
+            "db 源未贡献进程 → 编排层 L1 短路，会话扫描根本不会发生（H12 症状根因）"
+        );
+        assert_eq!(
+            procs[0].pid, 0,
+            "pid=0 哨兵：无存活宿主进程（未读卡同款惯例）"
+        );
+        assert_eq!(procs[0].form, ProcessForm::App);
+        assert_eq!(procs[0].cwd.as_deref(), Some(Path::new(CWD)));
+
+        let sessions = get_workbuddy_sessions_with(home.path(), &procs, NOW_MS);
+        assert_eq!(sessions.len(), 1, "窗外历史行不得出卡");
+        let card = &sessions[0];
+        assert_eq!(card.id, SID);
+        assert_eq!(card.status, SessionStatus::Finished); // completed → 绿
+        assert_eq!(card.form, ProcessForm::App);
+        assert_eq!(card.pid, 0);
+        assert_eq!(card.project_path, CWD);
+        assert_eq!(card.project_name, "Test2");
+        // 标题走真实查询链（custom_title 优先 → title）：夹具含 custom_title/deleted_at
+        assert_eq!(card.title.as_deref(), Some("你是什么模型"));
+        assert_eq!(card.last_message.as_deref(), Some("我是 WorkBuddy"));
+    }
+
+    /// 红·中断：db status=terminated → Waiting（转写尾部是 assistant 也不得转绿）
+    #[test]
+    fn terminated_db_row_is_red_waiting() {
+        let home = tempfile::tempdir().unwrap();
+        seed_db(
+            home.path(),
+            &[(SID, CWD, "被中断的会话", "terminated", NOW_MS as i64, None)],
+        );
+        write_transcript(home.path(), CWD, SID, &[USER_MSG, ASSISTANT_MSG]);
+        let procs = discover_workbuddy_processes_with(home.path(), &|_| None, NOW_MS);
+        let sessions = get_workbuddy_sessions_with(home.path(), &procs, NOW_MS);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Waiting);
+    }
+
+    /// 运行中判据 = 转写 mtime 心跳口径（App 形态 300s 阈值），**不是** db 的 updated_at：
+    /// 同一行、同一份转写——「此刻」= 转写 mtime → 黄；「此刻」= 停更 300s 后 → 红。
+    /// 若实现把 db.updated_at 当存活证据，两侧都会恒黄（此测试即红）
+    #[test]
+    fn running_db_row_uses_transcript_mtime_idiom_not_updated_at() {
+        let home = tempfile::tempdir().unwrap();
+        let jsonl = write_transcript(home.path(), CWD, SID, &[USER_MSG, TOOL_TAIL]);
+        let now = jsonl_mtime_ms(&jsonl);
+        seed_db(
+            home.path(),
+            &[(SID, CWD, "在跑的会话", "running", now as i64, None)],
+        );
+        let procs = discover_workbuddy_processes_with(home.path(), &|_| None, now);
+        assert_eq!(procs.len(), 1);
+        let fresh = get_workbuddy_sessions_with(home.path(), &procs, now);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].status, SessionStatus::Processing); // function_call 尾 + mtime 新鲜 → 黄
+
+        let later = now + APP_STATUS_STALE_MS + 1;
+        let stale = get_workbuddy_sessions_with(home.path(), &procs, later);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].status, SessionStatus::Waiting); // 停更 >= 300s → 红（非恒黄）
+    }
+
+    /// 24h 活动窗（对齐三层预算 L3）：窗外行剔除、窗内保留、时钟偏移的未来行不误剔
+    #[test]
+    fn activity_window_excludes_old_and_includes_fresh_row() {
+        let row = |id: &str, updated_at: i64| DbSession {
+            id: id.into(),
+            cwd: CWD.into(),
+            title: "t".into(),
+            status: "completed".into(),
+            updated_at,
+        };
+        let now = NOW_MS as i64;
+        let kept: Vec<String> = db_rows_in_window(
+            vec![
+                row("fresh", now - 1),
+                row("boundary", now - DB_ACTIVITY_WINDOW_MS),
+                row("old", now - DB_ACTIVITY_WINDOW_MS - 1),
+                row("skew", now + 60_000),
+            ],
+            NOW_MS,
+        )
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+        assert_eq!(kept, vec!["fresh".to_string(), "skew".to_string()]);
+    }
+
+    /// deleted_at 非空 = 软删（实测 14 行中 2 行如此）→ 不得出卡（与 title_from_conn 同过滤）
+    #[test]
+    fn deleted_rows_are_excluded() {
+        let home = tempfile::tempdir().unwrap();
+        seed_db(
+            home.path(),
+            &[
+                (SID, CWD, "在册会话", "completed", NOW_MS as i64, None),
+                (
+                    "ecbf3d35-76e9-42df-b71d-89409ec156ea",
+                    "C:/x",
+                    "已删会话",
+                    "terminated",
+                    NOW_MS as i64,
+                    Some(NOW_MS as i64),
+                ),
+            ],
+        );
+        let rows = read_db_sessions(&home.path().join(".workbuddy/workbuddy.db")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, SID);
+    }
+
+    /// mtime 门（轮询预算）：代际未变 → None（跳过重查）；库变化且 mtime 前推 → 重读
+    #[test]
+    fn db_snapshot_mtime_gate_skips_unchanged_and_rereads_after_change() {
+        let home = tempfile::tempdir().unwrap();
+        let db = seed_db(
+            home.path(),
+            &[(SID, CWD, "t", "completed", NOW_MS as i64, None)],
+        );
+        let mut last = None;
+        let first = db_snapshot_fresh(home.path(), &mut last).expect("首轮必读");
+        assert_eq!(first.len(), 1);
+        assert!(last.is_some(), "读成功后回填代际");
+        // 未变 → None
+        assert!(db_snapshot_fresh(home.path(), &mut last).is_none());
+        // 库变化 + mtime 显式前推（不靠睡等时钟粒度）
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, title, custom_title, status, updated_at,
+                    deleted_at, transport, source_mode)
+                 VALUES ('7005f4cd-ef8b-4b7c-bcc5-b0f914c8a58c', 'E:/t3', 't3', NULL,
+                    'completed', ?1, NULL, 'local', 'craft')",
+                rusqlite::params![NOW_MS as i64],
+            )
+            .unwrap();
+        }
+        bump_mtime(&db, 5);
+        let again = db_snapshot_fresh(home.path(), &mut last).expect("代际变化必重读");
+        assert_eq!(again.len(), 2);
+    }
+
+    /// mtime 门失败路径（生产包装，Minor 5）：库还在但读失败（表被删/锁竞争）→
+    /// **沿用上轮行**（瞬时故障不清空在板卡），且代际已推进（下轮不重复 open+SELECT）；
+    /// 库文件消失 → 记空快照（db 源就该为空，不留陈旧行）
+    #[test]
+    fn db_gate_keeps_rows_on_read_failure_and_empties_when_db_vanishes() {
+        let home = tempfile::tempdir().unwrap();
+        seed_db(
+            home.path(),
+            &[(SID, CWD, "t", "completed", NOW_MS as i64, None)],
+        );
+        let first = db_sessions_gated(home.path());
+        assert_eq!(first.len(), 1, "首轮重读");
+
+        // 读失败路径：表被删（mtime 显式前推，确保代际变化）→ 沿用上轮行
+        let db = home.path().join(".workbuddy/workbuddy.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("DROP TABLE sessions;").unwrap();
+        }
+        bump_mtime(&db, 5);
+        let after_failure = db_sessions_gated(home.path());
+        assert_eq!(after_failure.len(), 1, "读失败不得清空在板卡（沿用上轮行）");
+
+        // 库消失 → db 源为空（不沿用陈旧行），且后续轮次不再尝试读取
+        std::fs::remove_file(&db).unwrap();
+        assert!(
+            db_sessions_gated(home.path()).is_empty(),
+            "库消失即无 db 源"
+        );
+        assert!(db_sessions_gated(home.path()).is_empty(), "缺席态稳定");
+    }
+
+    /// 本机核验（skip-mode，只读）：真实 ~/.workbuddy/workbuddy.db 在场且 Test2 会话
+    /// （3f12ca20-…）仍在 24h 窗内时，断言其经 db 源独立发现并出卡。
+    /// 前置不满足（未装 WorkBuddy / 行已删 / 超窗 / 转写缺失 / 只读打开失败）→ eprintln
+    /// 说明后 return：各 skip 分支前缀互异（row-absent / aged-out / no-transcript /
+    /// read-failed），与 PASS 可区分，绝不 panic；全程只读，绝不写 ~/.workbuddy
+    #[test]
+    fn real_home_db_discovers_test2_session_skip_mode() {
+        let Some(home) = dirs::home_dir() else {
+            eprintln!("SKIP(workbuddy-db): 无 home 目录");
+            return;
+        };
+        let db = home.join(".workbuddy").join("workbuddy.db");
+        if !db.exists() {
+            eprintln!(
+                "SKIP(workbuddy-db): {} 不存在（本机未装 WorkBuddy）",
+                db.display()
+            );
+            return;
+        }
+        let now = now_ms();
+        let rows = match read_db_sessions(&db) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("SKIP(workbuddy-db/read-failed): 只读打开/查询失败（{e}）——WAL/权限形态，不判失败");
+                return;
+            }
+        };
+        // 先判「行还在不在」（不随时间腐烂的事实），再判窗——两条 skip 语义不同：
+        // 行在但超窗 = aged-out（数据老了）；行不在 = 用户删了会话/换了机器
+        let Some(target) = rows.iter().find(|r| r.id.starts_with("3f12ca20")) else {
+            eprintln!(
+                "SKIP(workbuddy-db/row-absent): 实测 Test2 会话 3f12ca20 已不在 sessions 表（存活 {} 行）",
+                rows.len()
+            );
+            return;
+        };
+        if db_rows_in_window(vec![target.clone()], now).is_empty() {
+            let age_h = (now as i64).saturating_sub(target.updated_at) / 3_600_000;
+            eprintln!(
+                "SKIP(workbuddy-db/aged-out): Test2 会话 3f12ca20 仍在表中但已出 24h 活动窗（updated_at 距今 {age_h}h）——时效已过，非代码问题"
+            );
+            return;
+        }
+        // 真实代码路径：进程表注入空（= WorkBuddy 未运行），只剩 db 源
+        let procs = discover_workbuddy_processes_with(&home, &|_| None, now);
+        let sessions = get_workbuddy_sessions_with(&home, &procs, now);
+        let Some(card) = sessions.iter().find(|s| s.id == target.id) else {
+            eprintln!(
+                "SKIP(workbuddy-db/no-transcript): db 行在窗但转写未落盘（{}）→ 出卡路径不成立，不判失败",
+                target.cwd
+            );
+            return;
+        };
+        // 只断言**不会腐烂**的发现事实（id 已由上方 find 绑定）；状态/颜色/标题映射
+        // 归 hermetic 测试——用户继续该会话会让 status 变成运行中，在此断言必烂
+        assert_eq!(card.id, target.id);
+        assert_eq!(card.pid, 0, "无心跳/无宿主进程的 db 卡必须走 pid=0 哨兵");
+        assert_eq!(card.form, ProcessForm::App);
+        eprintln!(
+            "PASS(workbuddy-db/discovered-card): {} 经 db 源发现并出卡（pid=0 哨兵 / 状态 {:?}）",
+            card.id, card.status
         );
     }
 }
