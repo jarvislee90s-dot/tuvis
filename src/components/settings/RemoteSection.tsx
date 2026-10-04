@@ -43,6 +43,7 @@ import {
   resetDevices,
   setPin,
   toggleChannel,
+  toggleHeadless,
   type RemoteDevice,
   type RemoteStatus,
   type TsServeEntry,
@@ -70,6 +71,10 @@ const HOST_NAME_KEY = "remote.host_name";
 // 隧道 Token：与 Rust 端 remote::KEY_TUNNEL_TOKEN 对齐；A6 起保存走通用 set_setting
 //（remote_set_channel 已下线），开关由自有域名卡片开关（remote_toggle_channel）驱动
 const TUNNEL_TOKEN_KEY = "remote.tunnel_token";
+// H3 一次性安全说明的**已读记忆键**：与后端同库（settings 表）持久化——同 codex
+// 一次性提示（monitor/hooks.rs 的 codex_hook_notice_shown）的既有口径：确认过即写
+// "true"，此后开启不再弹；换机器/清库会再弹一次（可接受：说明本就该在陌生环境重放）
+const HEADLESS_ACK_KEY = "remote.headless_notice_ack";
 // 电源保活：与 Rust 端 remote::power::KEY_KEEPALIVE 对齐；默认开，
 // 后端 should_acquire（None/乱串 → true）是唯一口径，前端仅同步展示
 const KEEPALIVE_KEY = "remote.keepalive";
@@ -233,6 +238,10 @@ export function RemoteSection() {
   const [editName, setEditName] = useState("");
   // TLS 对外绑定确认弹窗：lan 开关触发（toggle_channel Err 特征文案 → 确认 → 重试）
   const [tlsOpen, setTlsOpen] = useState(false);
+  // H3 无头安全说明弹窗（一次性：确认过即写 HEADLESS_ACK_KEY，此后不再弹）
+  const [headlessNoticeOpen, setHeadlessNoticeOpen] = useState(false);
+  // H3 说明已读记忆（进面板读一次；读失败/缺键 = 未确认 → 照常弹，宁多提示不漏提示）
+  const headlessAckRef = useRef(false);
   // 重置设备二次确认弹窗
   const [resetOpen, setResetOpen] = useState(false);
   // 开关在途互斥：连点会并发远程命令（启停竞态），与旧版 busy 语义一致
@@ -302,6 +311,17 @@ export function RemoteSection() {
     void (async () => setToken((await getSetting(TUNNEL_TOKEN_KEY)) ?? ""))();
   }, []);
 
+  // H3 安全说明已读回填：进面板读一次（"true" = 已确认过 → 开启不再弹）
+  useEffect(() => {
+    void (async () => {
+      try {
+        headlessAckRef.current = (await getSetting(HEADLESS_ACK_KEY)) === "true";
+      } catch {
+        /* 读失败按未确认处理（照常弹说明） */
+      }
+    })();
+  }, []);
+
   // PIN 回填：首个非空 status.pin 填一次（ref 闸），轮询不覆盖编辑中值
   useEffect(() => {
     if (pinInitRef.current) return;
@@ -320,6 +340,8 @@ export function RemoteSection() {
   }, [selected]);
 
   const enabled = status?.enabled ?? false;
+  // H3 无头总开关态：唯一数据源 = remote_status.headlessEnabled（缺键/旧载荷 = 关）
+  const headlessEnabled = status?.headlessEnabled ?? false;
 
   // 花名册与状态 3s 轮询恒开（与移动端看板同节奏）。花名册是 DB 语义（已配对设备
   // 的吊销/重命名管理入口），不随远程关闭清空——Mac 报告七-6「关闭期间 0/10 而 DB
@@ -596,6 +618,44 @@ export function RemoteSection() {
     }
     setTlsOpen(false);
     await changeChannel("lan", true);
+  };
+
+  // H3 无头总开关落盘（后端 remote_toggle_headless：写 KV + 审计 + 广播）。开关态以
+  // status.headlessEnabled 为准（后端是唯一数据源），失败仅 toast 不回弹本地态
+  const applyHeadless = async (v: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await toggleHeadless(v);
+      await refreshStatus();
+    } catch (e) {
+      toast.error(formatInvokeError(e, t));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 开启方向：**首次**（未确认过）先弹一次性安全说明，确认后才真正开启；已确认过
+  // （HEADLESS_ACK_KEY="true"）或关闭方向：直接落盘
+  const changeHeadless = async (v: boolean) => {
+    if (busy) return;
+    if (v && !headlessAckRef.current) {
+      setHeadlessNoticeOpen(true);
+      return;
+    }
+    await applyHeadless(v);
+  };
+
+  // 安全说明确认：先记已读（写失败不阻断开启——说明已展示过），再开启并关弹窗
+  const confirmHeadlessNotice = async () => {
+    headlessAckRef.current = true;
+    try {
+      await setSetting(HEADLESS_ACK_KEY, "true");
+    } catch {
+      /* 记忆写失败不阻断开启（最坏下次再弹一次说明，不谎报已读以外的事） */
+    }
+    setHeadlessNoticeOpen(false);
+    await applyHeadless(true);
   };
 
   // Token 保存（A6 落点：通用 set_setting）；开关由自有域名卡片开关驱动，后端
@@ -1330,6 +1390,46 @@ export function RemoteSection() {
       <p className="mt-1 rounded-lg bg-amber-50 px-2.5 py-1.5 text-xs text-amber-600 dark:bg-amber-500/10 dark:text-amber-400">
         {t("settings.remote.notice")}
       </p>
+
+      {/* ④ 无头注入（H3 / 裁决 9-10）：**单一总开关**（不做每工具分开关），默认关；
+          开启前弹一次性安全说明。spec H4 的 watchdog 超时 / 并发上限两件随 Task 6 的
+          「无头」子区控件一并落在本分组内（本任务只放开关） */}
+      <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
+        {t("settings.remote.groupHeadless")}
+      </div>
+      <div className="flex items-center justify-between gap-4 py-3">
+        <div className="flex-1">
+          <label className="text-sm font-semibold">{t("settings.remote.headlessTitle")}</label>
+          <p className="text-muted-foreground mt-0.5 text-xs">
+            {t("settings.remote.headlessHint")}
+          </p>
+        </div>
+        <Switch
+          aria-label={t("settings.remote.headlessTitle")}
+          checked={headlessEnabled}
+          disabled={busy || !status}
+          onCheckedChange={(v) => void changeHeadless(v)}
+        />
+      </div>
+
+      {/* H3 一次性安全说明（开启动作首次触发；确认 = 记已读 + 开启，取消仅关弹窗、
+          不调后端——同 TLS Dialog 的既有交互口径） */}
+      <Dialog open={headlessNoticeOpen} onOpenChange={setHeadlessNoticeOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t("settings.remote.headlessTitle")}</DialogTitle>
+            <DialogDescription>{t("settings.remote.headlessConfirm")}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setHeadlessNoticeOpen(false)}>
+              {t("settings.remote.cancel")}
+            </Button>
+            <Button onClick={() => void confirmHeadlessNotice()} disabled={busy}>
+              {t("settings.remote.tlsDialogConfirm")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* 重置设备二次确认弹窗（对齐仓库既有 Dialog 组件） */}
       <Dialog open={resetOpen} onOpenChange={setResetOpen}>

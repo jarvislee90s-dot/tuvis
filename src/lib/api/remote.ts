@@ -8,6 +8,9 @@ export type RemoteStatus = {
   enabled: boolean;
   /** 设备上限（线稿「已接入设备 N / 上限」徽标；KV 可改，未设置默认 10） */
   maxDevices: number;
+  /** H3：无头注入总开关（KV remote.headless_enabled；缺键 = 默认关）。
+   *  可选——旧后端载荷无此键，前端按 undefined = 关渲染（不谎报开） */
+  headlessEnabled?: boolean;
   // M5 A5：四通道状态 + 当前访问密码（设置页卡片与详情区的唯一数据源；
   // 形状契约见 Rust 端 channels_payload 注释——A6 卡片与 A7 移动端消费同一形状）
   channels: RemoteChannels;
@@ -92,6 +95,12 @@ export async function renameDevice(id: string, name: string): Promise<void> {
 // TLS 前置确认（P7 安全门）：置位 remote.public_ack，解锁对外绑定
 export async function remoteConfirmPublic(): Promise<void> {
   return await invoke("remote_confirm_public");
+}
+// H3 无头注入总开关（默认关，显式开启；裁决 9 单一总开关）：写 KV remote.headless_enabled
+// + 审计 + 广播 remote-changed。无头绑定会话在关闭态被后端 403 headless_disabled 拦下
+// （移动端则由 /session-send-info 的 injectable=false + reason 置灰——门在前）
+export async function toggleHeadless(enabled: boolean): Promise<void> {
+  return await invoke("remote_toggle_headless", { enabled });
 }
 
 // ============================================================

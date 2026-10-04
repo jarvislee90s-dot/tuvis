@@ -379,7 +379,11 @@
       "tsClearedNotice": "Revoked; {{count}} non-Tuvis entr(y/ies) were cleared along with it:",
       "tsClearedToast": "Revoked: {{count}} non-Tuvis entr(y/ies) were cleared along with it",
       "namedRunningHint": "Tunnel connected; the address is permanent",
-      "namedOffHint": "Switch is off — the public address is unreachable; turn it on to restore it (the address never changes)."
+      "namedOffHint": "Switch is off — the public address is unreachable; turn it on to restore it (the address never changes).",
+      "groupHeadless": "4. Headless injection (bypasses terminal confirmation)",
+      "headlessTitle": "Headless injection",
+      "headlessHint": "Off by default. While off, headless-channel sessions (ZCode / Codex APP / WorkBuddy) cannot be messaged from the phone; the four terminal-injection tools are unaffected.",
+      "headlessConfirm": "Headless injection drives the Agent to execute messages (including tool calls) without visible confirmation in the terminal. The zcode channel defaults to yolo mode (no approval prompt). Enabling means you acknowledge this."
     },
     "audit": {
       "title": "Injection Audit",

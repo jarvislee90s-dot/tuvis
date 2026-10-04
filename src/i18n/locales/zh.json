@@ -379,7 +379,11 @@
       "tsClearedNotice": "已撤销；另有 {{count}} 条非 兔维斯 条目被一并清除：",
       "tsClearedToast": "已撤销：另有 {{count}} 条非 兔维斯 条目被一并清除",
       "namedRunningHint": "隧道已连接；地址永久有效",
-      "namedOffHint": "开关未打开——公网地址暂不可达；打开开关后恢复（地址不变，无需重配）。"
+      "namedOffHint": "开关未打开——公网地址暂不可达；打开开关后恢复（地址不变，无需重配）。",
+      "groupHeadless": "④ 无头注入（绕过终端可视确认）",
+      "headlessTitle": "无头注入",
+      "headlessHint": "默认关闭。关闭时，手机端无法向无头通道会话（ZCode / Codex APP / WorkBuddy）发消息；终端注入四家不受影响。",
+      "headlessConfirm": "无头注入将在不经过终端可视确认的情况下直接驱动 Agent 执行消息（含工具调用）。zcode 通道默认 yolo 档（不弹审批）。开启即表示知悉。"
     },
     "audit": {
       "title": "注入审计",

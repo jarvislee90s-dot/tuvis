@@ -5190,7 +5190,9 @@ mod tests {
         assert_eq!(audits[0].result, "ok");
     }
 
-    /// 拒绝矩阵：workbuddy → 403 blackbox；zcode → 403 headless_only（均不入队）；
+    /// 拒绝矩阵：**H3 门在最前**——开关关闭（缺键 = 默认关）时 workbuddy / zcode 一律
+    /// 403 headless_disabled（不再透出路由层原因）；**开关开启后**才轮到路由层判据
+    /// （workbuddy → blackbox；zcode → headless_only），两段都在本测锁住（路由层契约不丢）。
     /// 未知会话 → 404 no_session；空/全空白 text 与超长（MAX_SEND_CHARS+1）→ 400
     #[tokio::test]
     async fn send_rejects_not_injectable_and_missing() {
@@ -5198,8 +5200,29 @@ mod tests {
         let state = inject_state(fake.clone());
         persist_named_device(&state, "mm", "测试设备");
         let app = router(state.clone());
-        // workbuddy 黑盒 → 403 not_injectable + reasonCode=blackbox（原因写在报错处，
-        // 仅已过闸设备可见——M5 P2-a 同口径）
+        // ① H3 门（开关关闭 = 默认态）：workbuddy / zcode 均 403 headless_disabled
+        for sid in ["sess_c", "sess_d"] {
+            let r = app
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    "/m/api/v1/session-send",
+                    Some("mam_device=mm"),
+                    Some(&format!(r#"{{"sessionId":"{sid}","text":"hi"}}"#)),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 403);
+            let body = body_string(r).await;
+            assert!(
+                body.contains("headless_disabled"),
+                "H3 门在最前（{sid}）：关闭态拒绝体必须是 headless_disabled：{body}"
+            );
+        }
+        // ② 开关开启 → 门放行，路由层原判据照旧可辨（workbuddy 黑盒 zcode 无头限定）
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
         let r = app
             .clone()
             .oneshot(req(
@@ -5214,9 +5237,9 @@ mod tests {
         let body = body_string(r).await;
         assert!(
             body.contains("not_injectable") && body.contains("blackbox"),
-            "403 体必须带 not_injectable + reasonCode：{body}"
+            "开关开启后 workbuddy 仍应按路由层黑盒拒绝（403 体带 not_injectable + reasonCode）：{body}"
         );
-        // zcode 走无头（M11）→ 403 headless_only
+        // zcode 走无头（M11）→ 开关开启后落路由层 403 headless_only
         let r = app
             .clone()
             .oneshot(req(
@@ -5691,6 +5714,162 @@ mod tests {
         );
     }
 
+    // ==== H3（Task 5）：无头总开关门（session-send 路由判定之前）====
+    // 契约（spec H3 / 裁决 9-10）：无头注入默认关；关闭时对无头绑定会话发送 →
+    // 403 {"error":"headless_disabled"}；开启则放行到既有路由层（断言「不是
+    // headless_disabled」而非具体成功——Task 7 把 zcode 路由进无头通道后本测语义不变）；
+    // **边界**：终端注入四家（claude/kimi/opencode/codex CLI）完全不经此门。
+    // 零污染：开关 KV 经 DeviceStore::memory 内存库 seed（生产 Global = 全局 DB 同锁
+    // 同连接，同语义）；未 seed = 缺键 = 默认关（正是默认态用例）。
+
+    /// 覆盖 state 的会话源（建造器刚返回的 Arc 引用计数为 1 → `Arc::get_mut` 可取可变
+    /// 引用；一经共享即 panic，不会静默改到别人头上）——与 [`with_target_evidence`] 同款
+    fn with_sessions(
+        mut state: Arc<RemoteState>,
+        sessions: Vec<crate::session::Session>,
+    ) -> Arc<RemoteState> {
+        Arc::get_mut(&mut state)
+            .expect("state 尚未共享（建造器返回值立即覆盖）")
+            .session_source = Box::new(move || crate::session::SessionsResponse {
+            total_count: sessions.len(),
+            sessions: sessions.clone(),
+            waiting_count: 0,
+        });
+        state
+    }
+
+    /// H3 门专用 state：**zcode APP 形态**会话（无头绑定；form 显式置 APP——真实
+    /// ZCode 宿主形态）+ claude / **kimi / opencode** CLI Processing（终端注入家，走
+    /// 留队臂：不碰 in-flight 守卫与注入器——边界用例的端点级证据，Minor 2）。会话 id
+    /// 独占（守卫 id 立规②——虽然本族用例在门/路由处即返回，不占守卫，仍按规避开既有
+    /// id 字符串）
+    fn headless_gate_state(
+        injector: std::sync::Arc<dyn crate::inject::engine::Injector>,
+    ) -> Arc<RemoteState> {
+        let mut zcode = inj_sess(
+            "sess_h3_zcode",
+            crate::session::AgentType::ZCode,
+            41,
+            crate::session::SessionStatus::Waiting,
+        );
+        zcode.form = crate::session::ProcessForm::App;
+        let terminal = [
+            ("sess_h3_claude", crate::session::AgentType::Claude, 42),
+            ("sess_h3_kimi", crate::session::AgentType::Kimi, 43),
+            ("sess_h3_opencode", crate::session::AgentType::OpenCode, 44),
+        ]
+        .into_iter()
+        .map(|(id, tool, pid)| inj_sess(id, tool, pid, crate::session::SessionStatus::Processing))
+        .collect::<Vec<_>>();
+        let mut sessions = vec![zcode];
+        sessions.extend(terminal);
+        with_sessions(inject_state(injector), sessions)
+    }
+
+    /// H3：开关**关闭**（KV 缺键 = 默认 "false"）→ zcode 无头绑定会话 403
+    /// headless_disabled，且不落队、不注入（门在最前）
+    #[tokio::test]
+    async fn headless_gate_refuses_when_disabled() {
+        let fake = FakeInjector::ok();
+        let state = headless_gate_state(fake.clone());
+        assert!(
+            state
+                .store
+                .with(|c| crate::database::dao::settings::get_setting_conn(
+                    c,
+                    // 键名字面量：与 Rust 端 KEY_HEADLESS 常量双锁（键名是对外约定，
+                    // setting_keys_are_stable 另有常量侧断言）
+                    "remote.headless_enabled"
+                ))
+                .is_none(),
+            "前提自证：缺键 = 默认关（本用例不 seed 开关 KV）"
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_h3_zcode","text":"你好"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "无头通道未开启必须拒绝");
+        let body = body_string(r).await;
+        assert!(
+            body.contains("\"error\":\"headless_disabled\""),
+            "拒绝体必须是 headless_disabled（不是路由层的 not_injectable）：{body}"
+        );
+        assert!(fake.recorded().is_empty(), "门在注入之前：不投递任何内容");
+        let pending = state.store.with(|c| {
+            crate::database::dao::inject_queue::pending_for_session_conn(c, "sess_h3_zcode")
+        });
+        assert!(pending.is_empty(), "门在入队之前：不落队");
+    }
+
+    /// H3：开关**开启**（KV "true"）→ 放行到既有路由层（今日 zcode 仍被 tool_gate
+    /// 拒 not_injectable；本测只锁「不是 headless_disabled」——Task 7 路由表扩展后
+    /// 语义不变）
+    #[tokio::test]
+    async fn headless_gate_allows_when_enabled() {
+        let state = headless_gate_state(FakeInjector::ok());
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_h3_zcode","text":"你好"}"#),
+            ))
+            .await
+            .unwrap();
+        let body = body_string(r).await;
+        assert!(
+            !body.contains("headless_disabled"),
+            "开关开启后不得再被 H3 门拒绝（今日落到路由层 not_injectable 属预期）：{body}"
+        );
+    }
+
+    /// H3 **边界**：终端注入工具（claude）不经此门——开关关闭也照常进入既有路径
+    /// （断言请求确实抵达路由层：留队 queued 或平台门 not_injectable，二者皆非本门）
+    #[tokio::test]
+    async fn headless_gate_leaves_terminal_tools_untouched() {
+        let state = headless_gate_state(FakeInjector::ok());
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        // 端点级边界（Minor 2）：claude / **kimi** / **opencode** 三家 CLI 会话在开关
+        // 关闭（默认）下均不得被 H3 门拒绝——请求必须抵达路由层（Windows/macOS 黄灯
+        // 留队 queued；其他平台平台门 not_injectable），路由层的正常答复照旧
+        for sid in ["sess_h3_claude", "sess_h3_kimi", "sess_h3_opencode"] {
+            let r = app
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    "/m/api/v1/session-send",
+                    Some("mam_device=mm"),
+                    Some(&format!(
+                        r#"{{"sessionId":"{sid}","text":"终端四家不受影响"}}"#
+                    )),
+                ))
+                .await
+                .unwrap();
+            let body = body_string(r).await;
+            assert!(
+                !body.contains("headless_disabled"),
+                "终端注入工具绝不被 H3 门拦（spec H3 边界，{sid}）：{body}"
+            );
+            assert!(
+                body.contains("\"status\":\"queued\"") || body.contains("not_injectable"),
+                "请求应抵达路由层（Windows/macOS 留队 queued；其他平台平台门拒绝，{sid}）：{body}"
+            );
+        }
+    }
+
     /// send-info 可用性矩阵：可注入会话 → injectable=true + channels/visibility
     /// （channels 随本机平台——routing platform = std::env::consts::OS，macOS 三通道 /
     /// windows 单通道，断言按编译平台取期望）；workbuddy → injectable=false + blackbox；
@@ -5741,7 +5920,32 @@ mod tests {
             "channels 应为 wire 小写字符串数组（本机平台）"
         );
         assert_eq!(v["visibility"], "realtime");
-        // workbuddy 黑盒 → injectable=false + reasonCode=blackbox + reason 文案
+        // workbuddy（无头绑定：H9 ACP）→ **H3 门在最前**：开关关闭（默认）时
+        // injectable=false + reasonCode=headless_disabled + spec H3 逐字置灰文案
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-send-info?session_id=sess_c",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["injectable"], false);
+        assert_eq!(v["reasonCode"], "headless_disabled");
+        assert!(
+            v["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("无头通道未开启，请在电脑端 MAM 设置中开启")),
+            "关闭态置灰必须带 spec H3 逐字原因：{v}"
+        );
+        // 开关开启 → 门放行，路由层判据照旧（workbuddy 黑盒 → blackbox）
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
         let r = app
             .clone()
             .oneshot(req(

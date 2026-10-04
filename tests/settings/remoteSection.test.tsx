@@ -82,6 +82,8 @@ const channelsOf = (
 const statusOf = (over: Record<string, unknown> = {}) => ({
   enabled: true,
   maxDevices: 10,
+  // H3：无头总开关状态（缺省 off——后端缺键即默认关，前端 undefined 同样按关渲染）
+  headlessEnabled: false,
   channels: channelsOf(over.channels as never),
   pin: "4827",
   host: { name: "matebook16s", platform: "windows", version: "0.4.2", bootId: "boot-x" },
@@ -407,8 +409,121 @@ describe("RemoteSection 展示态取 running、开关取 enabled（评审 C-I1�
   });
 });
 
-describe("RemoteSection lan 开关 P7 TLS Dialog 流（M5 A6）", () => {
-  const lanOffStatus = () =>
+// H3（Task 5）：无头注入总开关——默认关 / 开启弹一次性安全说明 / 确认即知悉并落盘
+// 记忆（KV remote.headless_notice_ack，同 codex 一次性提示的持久化口径）/ 已确认过
+// 再开不再弹 / 关闭方向直接落盘不弹。开关状态唯一数据源 = remote_status.headlessEnabled。
+describe("RemoteSection 无头注入总开关（H3 / Task 5）", () => {
+  const headlessSwitch = () => screen.getByRole("switch", { name: /headless injection/i });
+  const ackCalls = () =>
+    invokeMock.mock.calls.filter(
+      (call) =>
+        call[0] === "set_setting" &&
+        (call[1] as { key?: string } | undefined)?.key === "remote.headless_notice_ack"
+    );
+
+  it("渲染「无头注入」开关：status.headlessEnabled=false → 默认关 + 行提示（不影响终端四家）", async () => {
+    render(<RemoteSection />);
+    await waitFor(() => expect(headlessSwitch()).toBeEnabled());
+    expect(headlessSwitch()).not.toBeChecked();
+    expect(screen.getByText(/the four terminal-injection tools are unaffected/i)).toBeTruthy();
+  });
+
+  it("缺键（旧后端载荷 undefined）也按关渲染——不谎报开", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status") return statusOf({ headlessEnabled: undefined });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() => expect(headlessSwitch()).toBeEnabled());
+    expect(headlessSwitch()).not.toBeChecked();
+  });
+
+  it("status.headlessEnabled=true → 开关为开（后端唯一数据源）", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status") return statusOf({ headlessEnabled: true });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() => expect(headlessSwitch()).toBeChecked());
+  });
+
+  it("点开（未确认过）→ 弹一次性安全说明（含 yolo 档与「开启即知悉」）；确认 → remote_toggle_headless(true) + 落盘 ack + Dialog 关", async () => {
+    render(<RemoteSection />);
+    await waitFor(() => expect(headlessSwitch()).toBeEnabled());
+    fireEvent.click(headlessSwitch());
+    // 安全说明：不经终端可视确认 + zcode 默认 yolo 档（spec H3 文案）
+    expect(await screen.findByText(/without visible confirmation in the terminal/i)).toBeTruthy();
+    expect(screen.getByText(/zcode channel defaults to yolo mode/i)).toBeTruthy();
+    // 未确认前不落盘开关（确认才开启）
+    expect(invokeMock).not.toHaveBeenCalledWith("remote_toggle_headless", expect.anything());
+    fireEvent.click(screen.getByRole("button", { name: /I understand, enable/i }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_toggle_headless", { enabled: true })
+    );
+    // 一次性记忆落盘（后续开启不再弹）
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_setting", {
+        key: "remote.headless_notice_ack",
+        value: "true",
+      })
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("安全说明取消 → 不调 remote_toggle_headless、不落盘 ack，开关停在关", async () => {
+    render(<RemoteSection />);
+    await waitFor(() => expect(headlessSwitch()).toBeEnabled());
+    fireEvent.click(headlessSwitch());
+    fireEvent.click(await screen.findByRole("button", { name: /^cancel$/i }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(invokeMock).not.toHaveBeenCalledWith("remote_toggle_headless", expect.anything());
+    expect(ackCalls()).toEqual([]);
+    expect(headlessSwitch()).not.toBeChecked();
+  });
+
+  it("已确认过（ack=true）→ 再开启不再弹说明，直接 remote_toggle_headless(true)", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: { key?: string }) => {
+      if (cmd === "remote_status") return statusOf();
+      if (cmd === "get_setting" && args?.key === "remote.headless_notice_ack") return "true";
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    // ack 回填完成后再点（effect 异步读 KV）
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("get_setting", { key: "remote.headless_notice_ack" })
+    );
+    await waitFor(() => expect(headlessSwitch()).toBeEnabled());
+    fireEvent.click(headlessSwitch());
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_toggle_headless", { enabled: true })
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("关闭方向：headlessEnabled=true 点关 → 直接 remote_toggle_headless(false)，不弹说明", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status") return statusOf({ headlessEnabled: true });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() => expect(headlessSwitch()).toBeChecked());
+    fireEvent.click(headlessSwitch());
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_toggle_headless", { enabled: false })
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+});
+
+describe("RemoteSection lan 开关 P7 TLS Dialog 流（M5 A6）", () => {  const lanOffStatus = () =>
     statusOf({ channels: channelsOf({ lan: { enabled: false, running: false } }) });
 
   it("开 lan 收到 P7 特征 Err → 弹 TLS 确认 Dialog，不 toast 报错", async () => {

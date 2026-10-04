@@ -296,6 +296,8 @@ pub fn run() {
         // §C2：Tailscale 首次配置引导一条龙（向导探测 + 单步触发）
         remote::remote_ts_probe,
         remote::remote_ts_run_step,
+        // H3（二期收尾 Task 5）：无头注入总开关——默认关，翻转写审计 + 广播状态
+        remote::remote_toggle_headless,
         // M7 W5：桌面端写审计查看（最近 N 条，只读）
         inject::inject_list_audit,
         // 用量域（计划①）：采集 / 大看板 / 记录页 / CSV / 设置读写

@@ -47,6 +47,14 @@ pub const KEY_MAX_DEVICES: &str = "remote.max_devices";
 pub const KEY_NAMED_ADDR_LAST: &str = "remote.named_addr_last";
 /// 访问密码键（M5 A2）：4 位数字（validate_pin 唯一口径；A3 端点 / A4 命令消费）
 pub const KEY_ACCESS_PIN: &str = "remote.access_pin";
+/// **无头注入总开关键（H3 / 裁决 10）**：默认关（缺键 = 关），显式开启才放行无头通道；
+/// 值口径与 KEY_ENABLED 同（写侧恒 "true"/"false" 显式两值，读侧只认 "true"）。
+/// 消费方：session-send / session-send-info 的 H3 门（`headless_enabled_conn`）、
+/// `remote_status.headlessEnabled` 下发、设置页「无头注入」开关（`remote_toggle_headless`）。
+/// 裁决 9：**单一总开关**——不做每工具分开关（Task 6 的超时/并发两键同住本区）
+pub const KEY_HEADLESS: &str = "remote.headless_enabled";
+/// H3 关闭态文案（spec H3 逐字）：移动端输入区置灰的原因——send-info 的 reason 原样透出
+pub const HEADLESS_DISABLED_REASON: &str = "无头通道未开启，请在电脑端 MAM 设置中开启";
 
 /// 上限解析（纯函数）：None/乱串 → 10（M5 A5 用户裁决：默认 3 → 10；已存值不迁移）；
 /// clamp 1..=10 不变
@@ -67,6 +75,74 @@ fn max_devices_from_kv() -> usize {
 // 同 monitor/git.rs 先例。tailscale 通道开着时轮询每 5–60s 一次 CLI 探测
 // （status.rs run_cli），漏加就是用户看到的「连环黑色终端弹窗」。
 // remote 模块所有 spawn 点统一走这里，调用点不用 #[cfg] 门控（非 Windows no-op）。
+// H3 无头总开关（默认关）：解析 + 读取缝
+// ============================================================
+
+/// 无头开关解析（纯函数）：仅 `"true"` 为开——缺键（未设置 = 默认关，裁决 10）/
+/// `"false"` / 乱串一律判关（与 KEY_ENABLED 的 `v == "true"` 同口径，不认第二真值）
+pub fn headless_enabled_from(v: Option<&str>) -> bool {
+    v == Some("true")
+}
+
+/// 无头开关读取（**store 缝版本**，两个 H3 门共用）：直用调用方 `DeviceStore.with`
+/// 短临界区传入的 conn（不自取任何锁，锁内只做这一条 SQL + 纯解析）。生产
+/// `DeviceStore::Global` = 全局 DB 同锁同连接，语义与直读 settings KV 完全一致；
+/// 测试经 `DeviceStore::memory()` 自建库 seed —— 零接触真实 ~/.tuvis
+/// （同 `inject::approve::load_mappings_conn` 的缝模式）
+pub fn headless_enabled_conn(conn: &rusqlite::Connection) -> bool {
+    headless_enabled_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_HEADLESS).as_deref(),
+    )
+}
+
+/// **无头状态下发装配（可测缝）**：从注入的连接读开关并写入 status 载荷——键名与取值
+/// 口径的唯一落点（H3：开关状态持久化 settings 表并随 `remote_status` 下发）。
+/// 生产 = `DeviceStore::global()` 的 conn（与门**同一条读取路径**，杜绝「状态显示开、
+/// 门却判关」的双轨漂移）；测试 = `memory_conn()` 自建库（零接触真实 ~/.tuvis/tuvis.db）。
+pub fn apply_headless_status(st: &mut serde_json::Value, conn: &rusqlite::Connection) {
+    st["headlessEnabled"] = serde_json::json!(headless_enabled_conn(conn));
+}
+
+/// 无头开关内核（**可测核**；conn 与审计出口以参数注入——对齐 [`toggle_core`] /
+/// `toggle_channel_core` 的既有可测核模式）：写设置 SSOT → 审计留痕 → 广播状态变更。
+/// 生产薄壳 = [`remote_toggle_headless`]；测试直驱本内核 + 内存库 + 记录型审计闭包。
+///
+/// **审计口径**：走 `events::audit`（`remote_audit` 日志出口）——与既有设置类动作
+/// （`channel_toggled` / `pin_set`）同机制；动作词按既有词表形态取 `headless_toggled`
+/// （对齐 `channel_toggled`），detail 保留计划书的 `headless=<v>`。计划书字面的
+/// `action='setting'` 指的是 write_audit 表（移动端注入账本：9 列全 NOT NULL、含
+/// device/session 上下文，摘要列名 `summary` 而非 `detail`）——桌面设置翻转不落该表，
+/// 故按既有机制记（偏差见 Task 5 报告）。
+fn toggle_headless_core(
+    conn: &rusqlite::Connection,
+    enabled: bool,
+    audit: impl FnOnce(&str, &str),
+) {
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_HEADLESS,
+        if enabled { "true" } else { "false" },
+    );
+    audit("headless_toggled", &format!("headless={enabled}"));
+    events::emit_ui(
+        "remote-changed",
+        serde_json::json!({ "headlessEnabled": enabled }),
+    );
+}
+
+/// 无头注入总开关翻转（H3 / 裁决 10：默认关，显式开启；裁决 9：单一总开关，不做每
+/// 工具分开关）。薄壳：注入全局 store 的 conn 后直驱 [`toggle_headless_core`]。
+///
+/// **本命令无进程动作**：无头 runner 的 spawn/回收归 Task 6（H4）；此处只翻转 KV，
+/// 让门与状态即刻生效（emit 的 remote-changed 供设置页/移动端即时刷新）。
+#[tauri::command]
+pub fn remote_toggle_headless(enabled: bool) -> Result<(), String> {
+    pairing::DeviceStore::global().with(|c| toggle_headless_core(c, enabled, events::audit));
+    Ok(())
+}
+
+// ============================================================
+// 三通道独立开关（M5 A5）：KV + 惰性迁移 + bind 派生
 // ============================================================
 
 // 非 Windows 构建：NoWindow impl 整体编译裁掉（下方两个 impl 均 #[cfg(windows)]），
@@ -1024,6 +1100,10 @@ pub fn remote_status() -> serde_json::Value {
     st["enabled"] = serde_json::json!(enabled);
     // 设备上限（线稿「已接入设备 N / 上限」徽标；KV 可改，未设置默认 10——决策 #17）
     st["maxDevices"] = serde_json::json!(max_devices_from_kv());
+    // H3：无头注入总开关状态下发（设置页开关初值 + 移动端置灰判据；缺键 = 默认关）。
+    // 经可测缝 apply_headless_status（与门同一条读取路径）；Task 6 的 watchdog 超时 /
+    // 并发上限两键随「无头」子区一并追加于此（本任务只此一键）
+    pairing::DeviceStore::global().with(|c| apply_headless_status(&mut st, c));
     // M5 A5：通道开关（read_channels 含惰性迁移）+ 隧道双通道快照 + tailscale 快照
     let chans = read_channels();
     let tun = tunnel::snapshot();
@@ -1909,7 +1989,99 @@ mod tests {
         assert_eq!(KEY_PORT, "remote.port");
         assert_eq!(KEY_PUBLIC_ACK, "remote.public_ack");
         assert_eq!(KEY_HOST_NAME, "remote.host_name");
+        // H3 无头总开关：设置表持久化键（前端设置页 + 门 + 状态装配三方共用）
+        assert_eq!(KEY_HEADLESS, "remote.headless_enabled");
         assert_eq!(DEFAULT_PORT, 9420);
+    }
+
+    /// H3：无头开关解析口径（纯函数）——**缺键 = 默认关**（裁决 10），只认 "true"；
+    /// "false"/乱串/空串一律判关（与 KEY_ENABLED 同口径，不认第二真值）
+    #[test]
+    fn headless_enabled_parsing_defaults_off() {
+        assert!(!headless_enabled_from(None), "缺键 = 默认关（裁决 10）");
+        assert!(!headless_enabled_from(Some("false")));
+        assert!(headless_enabled_from(Some("true")));
+        for junk in ["1", "TRUE", "True", "yes", "on", "", " true"] {
+            assert!(!headless_enabled_from(Some(junk)), "乱串一律判关：{junk:?}");
+        }
+    }
+
+    /// H3：store 缝读取（session-send 门 / send-info 置灰 / remote_status 三方共用）——
+    /// 内存库缺键判关，显式 "true" 判开
+    #[test]
+    fn headless_enabled_conn_reads_memory_store() {
+        let conn = memory_conn();
+        assert!(!headless_enabled_conn(&conn), "空库 = 缺键 = 默认关");
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "true");
+        assert!(headless_enabled_conn(&conn));
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "false");
+        assert!(!headless_enabled_conn(&conn), "显式关同样判关");
+    }
+
+    /// H3：**状态下发**（spec H3「开关状态持久化 settings 表并随 remote_status 下发」）
+    /// ——装配缝 `apply_headless_status` 直驱内存库，断言 status 载荷**开/关两态**都带
+    /// `headlessEnabled`（键存在且布尔正确）。`remote_status()` 本体读全局库+端口+隧道
+    /// 快照，无法在单测里跑（会触真实 ~/.tuvis）；故此处锁的是它内部唯一的装配缝
+    /// （生产薄壳只做 `DeviceStore::global().with(|c| apply_headless_status(&mut st, c))`
+    /// ——同一函数、同一读取路径）
+    #[test]
+    fn status_payload_carries_headless_enabled_both_ways() {
+        let conn = memory_conn();
+        // 缺键（默认态）：字段必须在（前端开关初值 + 移动端置灰判据都读它），值为 false
+        let mut st = serde_json::json!({ "enabled": true });
+        apply_headless_status(&mut st, &conn);
+        assert!(
+            st.get("headlessEnabled").is_some(),
+            "status 载荷必须带 headlessEnabled 键（缺键即前端拿不到开关态）：{st}"
+        );
+        assert_eq!(st["headlessEnabled"], serde_json::json!(false));
+        // 显式开：同键翻转 true
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "true");
+        let mut st = serde_json::json!({ "enabled": true });
+        apply_headless_status(&mut st, &conn);
+        assert_eq!(st["headlessEnabled"], serde_json::json!(true));
+        // 显式关：回到 false（不残留上一拍真值）
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "false");
+        let mut st = serde_json::json!({ "headlessEnabled": true });
+        apply_headless_status(&mut st, &conn);
+        assert_eq!(st["headlessEnabled"], serde_json::json!(false));
+    }
+
+    /// H3：**开关翻转写路径**（Minor 3）——可测核 `toggle_headless_core` 直驱内存库 +
+    /// 记录型审计闭包：断言**两个方向**都写 KV（门/状态随即读到新值）且都发审计
+    /// （action=headless_toggled，detail=headless=<v>；生产出口 = events::audit，
+    /// 与既有 channel_toggled 同机制）
+    #[test]
+    fn toggle_headless_core_writes_kv_and_audits_both_directions() {
+        let conn = memory_conn();
+        let mut audits: Vec<(String, String)> = Vec::new();
+        // 开
+        toggle_headless_core(&conn, true, |a, d| audits.push((a.into(), d.into())));
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_HEADLESS).as_deref(),
+            Some("true"),
+            "开启必须落库为显式 \"true\""
+        );
+        assert!(
+            headless_enabled_conn(&conn),
+            "落库值经门/状态同一条读取路径可见"
+        );
+        // 关
+        toggle_headless_core(&conn, false, |a, d| audits.push((a.into(), d.into())));
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_HEADLESS).as_deref(),
+            Some("false"),
+            "关闭必须落库为显式 \"false\"（不删键：缺键与显式关同判关，但写侧恒两值）"
+        );
+        assert!(!headless_enabled_conn(&conn));
+        assert_eq!(
+            audits,
+            vec![
+                ("headless_toggled".to_string(), "headless=true".to_string()),
+                ("headless_toggled".to_string(), "headless=false".to_string()),
+            ],
+            "两个方向各一条审计（action/detail 口径固定）"
+        );
     }
 
     // ==== Task 4 生命周期接线：纯逻辑测试 ====
