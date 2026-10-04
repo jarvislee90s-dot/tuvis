@@ -1071,16 +1071,24 @@ fn find_session_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<crate::s
 /// - `session_send_info`：`Some(reason)` ⇒ `injectable:false` + `reasonCode` +
 ///   `reason`（移动端发送入口置灰标因，spec H3 输出与效果）。
 ///
-/// 判据 = `routing::is_headless_bound`（过渡期谓词，Task 7 换真路由，义务清单见其
-/// 文档）+ `KEY_HEADLESS`（缺键 = 默认关），开关经 `st.store` 缝读取——生产 =
-/// `DeviceStore::Global` 全局 DB 同锁同连接，测试 = 内存库（零接触真实 ~/.mam）。
-/// **边界**：终端注入四家 `is_headless_bound` 恒 false，完全不经此门。
+/// 判据 = **路由结论**（Task 7 义务 1：`routing::headless_kind_of(route(...))`——「这条
+/// 会话会不会被无头通道驱动」只有 `route()` 一个答案；Task 5 的平行谓词
+/// `routing::is_headless_bound` 已删除，**勿复活**）+ `KEY_HEADLESS`（缺键 = 默认关），
+/// 开关经 `st.store` 缝读取——生产 = `DeviceStore::Global` 全局 DB 同锁同连接，
+/// 测试 = 内存库（零接触真实 ~/.mam）。
+///
+/// **边界（按构造成立，不再靠人工记忆）**：终端注入四家的路由候选全是终端通道 →
+/// `headless_kind_of` 恒 `None` → 完全不经此门；**dsh 亦不经此门**（H13 写侧不在本批，
+/// 其需要无头的场合路由判 `dsh_headless_pending` → 非 Injectable → 本门不拦——范围裁决，
+/// 详见 `routing::headless_kind_of` 文档）。
 fn headless_blocked(
     st: &Arc<RemoteState>,
     tool: &str,
     form: crate::session::ProcessForm,
+    pid: u32,
 ) -> Option<&'static str> {
-    if crate::inject::routing::is_headless_bound(tool, form)
+    let outcome = crate::inject::routing::route(tool, form, pid, std::env::consts::OS);
+    if crate::inject::routing::headless_kind_of(&outcome).is_some()
         && !st.store.with(super::headless_enabled_conn)
     {
         Some(super::HEADLESS_DISABLED_REASON)
@@ -1088,6 +1096,29 @@ fn headless_blocked(
         None
     }
 }
+
+/// **无头分派未接线的诚实拒绝码**（Task 7 过渡态）：路由已判「本条只能经无头通道投递」
+/// （无头候选在场且无终端候选），但无头执行器要到 Task 8/9/11/13 才逐家落地——接线前
+/// **不投递也不入队**（绝不落终端注入臂：zcode/workbuddy 的 pid 不是终端宿主，终端注入
+/// 会打错窗口）。本拒绝是**入队侧**的保证：它在唯一生产 INSERT 之前拦下，故无头条目进不了
+/// 队列；**它不是投递侧保证**（队列 flush 循环既不判 H3 开关也不重跑路由——入队**之后**才
+/// 变成无头绑定的条目仍会被终端注入器投递，详见 `inject/queue.rs` 模块头的 H 系登记段）。
+///
+/// **Task 8 义务（读到本行的第一件事，编号勿漏）**：
+/// 1. **真分派**：把本码替换为按 `routing::headless_kind_of` 结论走对应无头适配器
+///    （Task 6 底座：`headless::runner_from_conn` 取超时/并发、`headless::audit_headless`
+///    落账）；
+/// 2. **每回合 spawn、不得入队**（裁决 8）：无头回合不得经 `enqueue_conn` 进队列——入队会让
+///    `inject/queue.rs` 的 flush 循环用终端注入器投递无头条目（该循环无 H3 门）；
+/// 3. **补投递侧重判**：裁决 `inject::queue::try_flush_with` 是否在投递前重跑 H3 门/路由
+///    结论，**不得让总开关被「入队后状态漂移」绕过**（收口点登记在 `inject/queue.rs`
+///    模块头 H 系登记段第 2 条）；
+/// 4. **两个消费点同步改**（session_send ⑤b 与 session_send_info 的本段判据），否则移动端会
+///    出现「输入框可用但发送必败」。
+pub(crate) const HEADLESS_PENDING_CODE: &str = "headless_pending";
+/// 上述拒绝的置灰/回执文案（与 `HEADLESS_DISABLED_REASON` 同款：后端给文案、前端只渲染）
+pub(crate) const HEADLESS_PENDING_REASON: &str =
+    "无头通道分派待接线（H7–H11 逐家落地中），本次不投递";
 
 /// 端点审计 action 选择（丁T3 裁2，**单点**）：`/` 开头消息记 `slash`，其余按投递
 /// 路径记 `send` / `queue`。
@@ -1122,7 +1153,9 @@ fn audit_action_for(text: &str, base: &'static str) -> &'static str {
 /// - 缺参 / 空 text / 超 MAX_SEND_CHARS → 400 bad_request；
 /// - 设备 cookie 缺失 → 403 防御（gate 已拦，理论不可达）；
 /// - 会话不在快照 → 404 no_session；路由判不可注入 → 403 not_injectable（带
-///   reasonCode/reason——W1 定位失败语义的前置闸，不入队）；
+///   reasonCode/reason——W1 定位失败语义的前置闸，不入队）；**路由判「只能走无头通道」**
+///   （H 系四家 APP 形态 / H11 无进程三家）→ 403 not_injectable + reasonCode=
+///   `headless_pending`（Task 7 过渡态：无头执行器未接线，见 ⑤b 与 [`HEADLESS_PENDING_CODE`]）；
 /// - 可输入态（is_input_ready）→ 入队后即刻 flush_one 直发（jump=false），五态精确
 ///   映射（P1-4 + D7/T3）：Sent → 200 delivered；Submitted → 200 submitted（已投递
 ///   未确认中性回执——注入 Ok + 戳未中 + 屏读无滞留草稿 = 消息已被 TUI 收进内部
@@ -1185,11 +1218,11 @@ pub async fn session_send(
     };
     // ④ H3 无头通道总开关（spec H3 / 裁决 9-10：**默认关，显式开启**；**门在最前**
     //    ——无头绑定会话先看开关，再看路由判据）。判据单点在 [`headless_blocked`]
-    //    （谓词 + 开关；开关经 st.store 缝读取——生产 = 全局 DB 同锁同连接，测试 =
+    //    （路由结论 + 开关；开关经 st.store 缝读取——生产 = 全局 DB 同锁同连接，测试 =
     //    内存库）。**边界**：终端注入四家（claude/kimi/opencode/codex CLI）恒不受本门
     //    影响；远程总开关关闭时无头入口自然一并不可达（gate 在前）
     let tool = session.agent_type.tool_id().to_string();
-    if headless_blocked(&st, &tool, session.form).is_some() {
+    if headless_blocked(&st, &tool, session.form, session.pid).is_some() {
         return json_no_store(
             StatusCode::FORBIDDEN,
             serde_json::json!({ "error": "headless_disabled" }),
@@ -1200,10 +1233,12 @@ pub async fn session_send(
     // `pairingHint=true`；**不拦截**——投递路径与 status 语义零变化（提示 ≠ 拒绝）。
     // 与表单黄字（C6 ≥1 活跃会话）是两个分层信号：本判据只数运行进程。
     let pairing_hint = pairing_ambiguous.contains(&pairing_key(&tool, &session.project_name));
+    let outcome =
+        crate::inject::routing::route(&tool, session.form, session.pid, std::env::consts::OS);
     if let crate::inject::routing::RouteOutcome::NotInjectable {
         reason_code,
         reason,
-    } = crate::inject::routing::route(&tool, session.form, session.pid, std::env::consts::OS)
+    } = &outcome
     {
         return json_no_store(
             StatusCode::FORBIDDEN,
@@ -1211,6 +1246,28 @@ pub async fn session_send(
                 "error": "not_injectable",
                 "reason": reason,
                 "reasonCode": reason_code,
+            }),
+        );
+    }
+    // ⑤b 无头通道分派点（**Task 8/9/11/13 在这里接**，H7–H11 逐家落地）：路由判出无头
+    //     候选而**无终端候选** = 本条只能经无头通道投递。执行器接线前**如实拒绝**（见
+    //     [`HEADLESS_PENDING_CODE`] 文档的 Task 8 义务），**绝不落终端注入臂**——zcode /
+    //     workbuddy / codex APP 的 pid 不是终端宿主，终端注入会打错窗口。
+    //     本拒绝是**入队侧**的保证（唯一生产 INSERT 在它之后——入队口只此一处）：无头条目
+    //     进不了队列。**但它不是投递侧保证**：flush 循环
+    //     （`inject/queue.rs::flush_one` / `try_flush_with`）既不判 H3 开关也不重跑 `route()`，
+    //     故**入队之后**才变成无头绑定的条目（如 claude 进程退出 → pid = 0 未读卡）仍会被
+    //     终端注入器投递，开关管不到——该漂移的收口是 Task 8 的**编号义务第 3 条**
+    //     （见 [`HEADLESS_PENDING_CODE`] 文档与 `inject/queue.rs` H 系登记段）。
+    if crate::inject::routing::headless_kind_of(&outcome).is_some()
+        && !crate::inject::routing::has_terminal_candidate(&outcome)
+    {
+        return json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "not_injectable",
+                "reason": HEADLESS_PENDING_REASON,
+                "reasonCode": HEADLESS_PENDING_CODE,
             }),
         );
     }
@@ -1479,7 +1536,11 @@ pub async fn session_send(
     json_no_store(StatusCode::OK, queued)
 }
 
-/// routing Channel → wire 小写字符串（枚举未派生 serde，端点侧手工映射防漂移）
+/// routing Channel → wire 小写字符串（枚举未派生 serde，端点侧手工映射防漂移）。
+/// 无头通道名**经 [`crate::inject::routing::HeadlessKind::wire_name`]**——与审计 channel
+/// 列同源（词表只此一份，别在这里重抄）。Task 7 起无头候选在 `session_send*` 两个端点
+/// 都不会到达本函数（接线前落 `headless_pending` 拒绝，见 [`HEADLESS_PENDING_CODE`]）；
+/// Task 8 接线后本臂即为移动端展示通道名的出口。
 fn channel_wire(c: &crate::inject::routing::Channel) -> &'static str {
     use crate::inject::routing::Channel;
     match c {
@@ -1487,15 +1548,21 @@ fn channel_wire(c: &crate::inject::routing::Channel) -> &'static str {
         Channel::Iterm2 => "iterm2",
         Channel::TerminalApp => "terminal_app",
         Channel::WindowsConsole => "windows_console",
+        Channel::Headless(kind) => kind.wire_name(),
     }
 }
 
-/// routing Visibility → wire 字符串（与移动端 SendInfo 联合类型对齐）
+/// routing Visibility → wire 字符串（与移动端 SendInfo 联合类型对齐）。
+/// **Task 8 义务**：`after_restart` / `tuvis_only` 两值须同步进移动端 `SendInfo.visibility`
+/// 联合类型（`src/mobile/api.ts`）并接 `Visibility::note()` 的提示文案——本批无头候选不
+/// 到达端点，故前端类型暂未扩（避免加了没人发的值）。
 fn visibility_wire(v: &crate::inject::routing::Visibility) -> &'static str {
     use crate::inject::routing::Visibility;
     match v {
         Visibility::Realtime => "realtime",
         Visibility::AfterRefresh => "after_refresh",
+        Visibility::AfterRestart => "after_restart",
+        Visibility::TuvisOnly => "tuvis_only",
     }
 }
 
@@ -1536,8 +1603,9 @@ pub async fn session_send_info(
     // 效果：移动端发送入口置灰 + 「无头通道未开启，请在电脑端 MAM 设置中开启」）。
     // 移动端输入区（MessageComposer）据本载荷的 injectable/reason 渲染禁用态与原因，
     // 故标因落在本端点即完成置灰——不需要移动端改动。判据与 session-send 的 H3 门
-    // **同一函数**（[`headless_blocked`]），两个端点的口径不可能漂移
-    if let Some(reason) = headless_blocked(&st, &tool, session.form) {
+    // **同一函数**（[`headless_blocked`]，Task 7 起两者同样从路由结论派生），两个端点的
+    // 口径不可能漂移
+    if let Some(reason) = headless_blocked(&st, &tool, session.form, session.pid) {
         return json_no_store(
             StatusCode::OK,
             serde_json::json!({
@@ -1547,9 +1615,21 @@ pub async fn session_send_info(
             }),
         );
     }
-    let body =
-        match crate::inject::routing::route(&tool, session.form, session.pid, std::env::consts::OS)
-        {
+    let outcome =
+        crate::inject::routing::route(&tool, session.form, session.pid, std::env::consts::OS);
+    let body = if crate::inject::routing::headless_kind_of(&outcome).is_some()
+        && !crate::inject::routing::has_terminal_candidate(&outcome)
+    {
+        // 无头分派未接线（Task 7 过渡态）：与 session-send ⑤b **同一判据**——发送端点
+        // 必败的会话不得在这里报 injectable:true（否则移动端出现「输入框可用、发送必败」）。
+        // Task 8 接线时两端点同步改为真分派（见 [`HEADLESS_PENDING_CODE`] 的义务清单）
+        serde_json::json!({
+            "injectable": false,
+            "reasonCode": HEADLESS_PENDING_CODE,
+            "reason": HEADLESS_PENDING_REASON,
+        })
+    } else {
+        match outcome {
             crate::inject::routing::RouteOutcome::Injectable {
                 candidates,
                 visibility,
@@ -1568,7 +1648,8 @@ pub async fn session_send_info(
                     "reason": reason,
                 })
             }
-        };
+        }
+    };
     json_no_store(StatusCode::OK, body)
 }
 

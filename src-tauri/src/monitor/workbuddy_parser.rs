@@ -339,8 +339,12 @@ pub(crate) const DB_ACTIVITY_WINDOW_MS: i64 = 24 * 3600 * 1000;
 /// db 源合成的 AgentProcess pid 哨兵：**无存活宿主进程**（WorkBuddy 未运行 / 会话宿主
 /// 已退出）。沿用既有惯例——未读卡同为 `pid: 0 + form: App`（adapter/mod.rs
 /// build_unread_cards「pid 失效场景：跳转走 activate_agent_app 的按工具兜底」）。
-/// 安全性（消费面已核）：①注入路由 `inject::routing::route` 先判 `pid == 0` →
-/// NotInjectable(no_process)，入队前门（remote/api.rs ④ 路由判定）拦下；
+/// 安全性（消费面已核，**Task 7 起机制已变、结论不变**）：①注入路由
+/// `inject::routing::route` 对 workbuddy **不看 pid**——工具级恒判无头通道
+/// （`Headless(WbAcp)`），故 pid=0 的哨兵卡在端点侧先被 H3 门拦（remote/api.rs ④：
+/// 开关关闭 → 403 `headless_disabled`）、开关开启则落无头分派点（⑤b → 403
+/// `headless_pending`，Task 8 接线后走 H9 ACP 通道）——**任何一种都不会经终端注入器
+/// 投递**（旧注释的「先判 pid == 0 → no_process」已被 Task 7 的无头路由取代）；
 /// ②跳转 Windows 走 resolve_and_focus(pid=0) 失败 → pid_dead → reactivate_tool_app
 /// 按工具激活宿主 APP（App 形态深链分支只看 sessionId）；macOS 侧
 /// should_try_deep_link(0, _) / tool_enumeration_allowed(0, _) 对 pid=0 均放行；

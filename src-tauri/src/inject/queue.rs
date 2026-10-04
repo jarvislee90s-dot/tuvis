@@ -50,6 +50,38 @@
 //! 不触真实目录），单测另可拆分内核 [`try_flush`]（快照复核 + 注入 + A1 确认，
 //! 零 DB）+ [`settle`]（落账 + 审计，conn 显式注入内存库）直接驱动；两者的组合即
 //! `flush_one` 全部行为，组合本身仅 10 行取件/落账薄壳。
+//!
+//! ## H 系无头条目与 flush 循环（Task 7 裁决⑤；**Task 8 必读**）
+//!
+//! 本循环（[`flush_one`] / [`reconcile_once`] / [`try_flush_with`]）**不判 H3 无头开关、
+//! 也不重跑 `routing::route()`**，投递一律走终端注入器（`st.injector`）。Task 7 在**入队
+//! 侧**给出的保证是这一条（**只此一条，勿读成投递侧保证**）：
+//!
+//! - **无头条目进不了队列**：唯一生产入队口 = `remote::api::session_send` 的
+//!   `enqueue_conn`（本模块的 `enqueue_conn` 调用面只有测试夹具），该端点在 Task 7 起对
+//!   「无头路由 + 无终端候选」的会话**在 INSERT 之前**即拒绝（403 not_injectable +
+//!   reasonCode=`headless_pending`，判据 `routing::headless_kind_of` +
+//!   `routing::has_terminal_candidate`，即 Task 8 的无头分派接线点）。
+//!
+//! **投递侧不重判路由 ⇒ 入队后的状态漂移仍在开关之外**：一条**入队当时**判终端通道的条目
+//! （如 claude 有活 pid）若其会话进程随后退出、卡片转成未读卡（`pid = 0` + `form = App`，
+//! 见 `adapter::build_unread_cards`），此刻路由判的是 `Headless(ClaudeP)`——本循环照旧用
+//! 终端注入器投递，H3 开关管不到它。**影响有界**（不是「无危害」）：pid = 0 时 Windows 侧
+//! `resolve_target` 先 `AttachConsole(0)` 失败、`collect_ancestor_pids(0)` 亦为空 → 直接
+//! 失败（行如实落 `failed:<e>`，不会打错窗口）；只有「活着的**非终端** pid」才可能走到祖先
+//! 链回退那一格。该漂移类**先于本 commit 存在**——投递侧从来不看路由，本 commit 未改这一点。
+//!
+//! ### Task 8 义务（**编号**；读到本段的第 1/2 条即本模块的收口点）
+//! 1. **无头回合在端点每回合 spawn**（裁决 8：turn 生命周期 = 进程生命周期），**不得经
+//!    `enqueue_conn` 入队**——一旦入队，本循环就会用终端注入器把无头正文打进一个不是终端
+//!    宿主的 pid（zcode/workbuddy/codex APP），且 H3 开关关着也照投。
+//! 2. **补投递侧重判**：Task 8 必须裁决 [`try_flush_with`]（及 [`reconcile_once`] 补投路径）
+//!    是否在投递前重跑 H3 门 / 路由结论，**不得让总开关被「入队后状态漂移」绕过**（本条即
+//!    上述缺口的收口点）。若补：判据同样从路由结论派生（`routing::headless_kind_of`），
+//!    **不得另立工具/形态表**（Task 5 的平行谓词教训）；命中即**不投递且不消费队首**
+//!    （复用既有 `Deferred` 语义，行保持 pending，等开关开启或会话回归终端通道）。
+//! 3. 若将来确有「无头排队」需求（如 H8 的 APP 原生排队语义由 MAM 自建队列承接），**先落
+//!    第 2 条再谈入队**（否则无头条目直接暴露在无门的投递路径上）。
 
 use crate::database::dao::inject_queue::{self, QueueRow};
 use crate::session::SessionStatus;

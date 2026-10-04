@@ -5192,7 +5192,9 @@ mod tests {
 
     /// 拒绝矩阵：**H3 门在最前**——开关关闭（缺键 = 默认关）时 workbuddy / zcode 一律
     /// 403 headless_disabled（不再透出路由层原因）；**开关开启后**才轮到路由层判据
-    /// （workbuddy → blackbox；zcode → headless_only），两段都在本测锁住（路由层契约不丢）。
+    /// （Task 7 起两家都路由进无头通道〈H9/H7〉，无头执行器未接线 → `headless_pending`；
+    /// 旧断言里的 `blackbox` / `headless_only` 两码已随路由表重写消失——本测更新为新真相，
+    /// 语义未削弱：两段仍各自锁住「门在最前」与「开关开启后走路由/分派层」）。
     /// 未知会话 → 404 no_session；空/全空白 text 与超长（MAX_SEND_CHARS+1）→ 400
     #[tokio::test]
     async fn send_rejects_not_injectable_and_missing() {
@@ -5219,39 +5221,38 @@ mod tests {
                 "H3 门在最前（{sid}）：关闭态拒绝体必须是 headless_disabled：{body}"
             );
         }
-        // ② 开关开启 → 门放行，路由层原判据照旧可辨（workbuddy 黑盒 zcode 无头限定）
+        // ② 开关开启 → 门放行，路由层照判（workbuddy → Headless(WbAcp)、zcode →
+        //    Headless(Zcode)）：两家都只能走无头通道，而 Task 7 尚无无头执行器 →
+        //    统一的 headless_pending 拒绝（**不落终端注入臂**：这两家的 pid 不是终端宿主）
         state.store.with(|c| {
             crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
         });
-        let r = app
-            .clone()
-            .oneshot(req(
-                "POST",
-                "/m/api/v1/session-send",
-                Some("mam_device=mm"),
-                Some(r#"{"sessionId":"sess_c","text":"hi"}"#),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 403);
-        let body = body_string(r).await;
+        for sid in ["sess_c", "sess_d"] {
+            let r = app
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    "/m/api/v1/session-send",
+                    Some("mam_device=mm"),
+                    Some(&format!(r#"{{"sessionId":"{sid}","text":"hi"}}"#)),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 403);
+            let body = body_string(r).await;
+            assert!(
+                body.contains("not_injectable") && body.contains("headless_pending"),
+                "开关开启后 {sid} 应落到无头分派点（not_injectable + headless_pending）：{body}"
+            );
+            assert!(
+                !body.contains("headless_disabled"),
+                "开关开启后不得再被 H3 门拒绝（{sid}）：{body}"
+            );
+        }
         assert!(
-            body.contains("not_injectable") && body.contains("blackbox"),
-            "开关开启后 workbuddy 仍应按路由层黑盒拒绝（403 体带 not_injectable + reasonCode）：{body}"
+            fake.recorded().is_empty(),
+            "无头路由会话在分派接线前零注入（不落终端注入臂）"
         );
-        // zcode 走无头（M11）→ 开关开启后落路由层 403 headless_only
-        let r = app
-            .clone()
-            .oneshot(req(
-                "POST",
-                "/m/api/v1/session-send",
-                Some("mam_device=mm"),
-                Some(r#"{"sessionId":"sess_d","text":"hi"}"#),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 403);
-        assert!(body_string(r).await.contains("headless_only"));
         // 不存在的会话 → 404 no_session（W1：定位失败不入队）
         let r = app
             .clone()
@@ -5740,9 +5741,11 @@ mod tests {
 
     /// H3 门专用 state：**zcode APP 形态**会话（无头绑定；form 显式置 APP——真实
     /// ZCode 宿主形态）+ claude / **kimi / opencode** CLI Processing（终端注入家，走
-    /// 留队臂：不碰 in-flight 守卫与注入器——边界用例的端点级证据，Minor 2）。会话 id
-    /// 独占（守卫 id 立规②——虽然本族用例在门/路由处即返回，不占守卫，仍按规避开既有
-    /// id 字符串）
+    /// 留队臂：不碰 in-flight 守卫与注入器——边界用例的端点级证据，Minor 2）+ Task 7
+    /// 新增 **claude 无进程卡（pid = 0）**：H11 的无头场景（会话在册但无 TUI 可写 →
+    /// 路由判 `Headless(ClaudeP)` → 必须同样受 H3 门管辖，义务 2 的端点级证据）。
+    /// 会话 id 独占（守卫 id 立规②——虽然本族用例在门/路由处即返回，不占守卫，仍按规
+    /// 避开既有 id 字符串）
     fn headless_gate_state(
         injector: std::sync::Arc<dyn crate::inject::engine::Injector>,
     ) -> Arc<RemoteState> {
@@ -5763,6 +5766,15 @@ mod tests {
         .collect::<Vec<_>>();
         let mut sessions = vec![zcode];
         sessions.extend(terminal);
+        // Task 7：无进程的 claude 卡 = H11 无头会话（未读卡兜底/进程已退出的在册会话）
+        let mut claude_no_proc = inj_sess(
+            "sess_h3_claude_noproc",
+            crate::session::AgentType::Claude,
+            0,
+            crate::session::SessionStatus::Waiting,
+        );
+        claude_no_proc.form = crate::session::ProcessForm::Cli;
+        sessions.push(claude_no_proc);
         with_sessions(inject_state(injector), sessions)
     }
 
@@ -5808,9 +5820,72 @@ mod tests {
         assert!(pending.is_empty(), "门在入队之前：不落队");
     }
 
-    /// H3：开关**开启**（KV "true"）→ 放行到既有路由层（今日 zcode 仍被 tool_gate
-    /// 拒 not_injectable；本测只锁「不是 headless_disabled」——Task 7 路由表扩展后
-    /// 语义不变）
+    /// **义务 2 的端点级证据**（Task 7）：H11 的「无进程 CLI 会话」（pid = 0 → 路由判
+    /// `Headless(ClaudeP)`）**同样受 H3 门管辖**——开关关闭 → 403 headless_disabled；
+    /// 开关开启 → 落无头分派点（headless_pending）。Task 5 的临时谓词
+    /// `is_headless_bound` 对 claude 恒判 false，且 `no_process` 早退先于一切路由，
+    /// 这条会话在 Task 7 前是**漏管面**（H3 开关管不到它的无头面）
+    #[tokio::test]
+    async fn headless_gate_covers_h11_processless_cli_sessions() {
+        let fake = FakeInjector::ok();
+        let state = headless_gate_state(fake.clone());
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let payload = r#"{"sessionId":"sess_h3_claude_noproc","text":"无进程在册会话"}"#;
+        // ① 开关关闭（缺键 = 默认）：判无头绑定 → 403（不是 no_process）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(payload),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "H11 无头会话必须受 H3 门管辖");
+        let body = body_string(r).await;
+        assert!(
+            body.contains("headless_disabled"),
+            "关闭态拒绝体必须是 headless_disabled（不是 no_process）：{body}"
+        );
+        // ② 开关开启 → 抵达无头分派点（Task 7 过渡态码）
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(payload),
+            ))
+            .await
+            .unwrap();
+        let body = body_string(r).await;
+        assert!(
+            body.contains("headless_pending"),
+            "开关开启后 H11 无进程会话应抵达无头分派点：{body}"
+        );
+        // ③ 与兄弟门用例同强度的收尾断言（Minor 2）：两态全程零注入、零入队
+        //    （门与 ⑤b 都在入队之前：H11 无头会话绝不会经终端注入器投递）
+        assert!(
+            fake.recorded().is_empty(),
+            "H11 无头路径全程零注入（两态都在入队/投递之前拦下）"
+        );
+        let pending = state.store.with(|c| {
+            crate::database::dao::inject_queue::pending_for_session_conn(c, "sess_h3_claude_noproc")
+        });
+        assert!(
+            pending.is_empty(),
+            "H11 无头路径不得入队（拒绝先于唯一 INSERT）"
+        );
+    }
+
+    /// H3：开关**开启**（KV "true"）→ 放行到路由/分派层（Task 7 起 zcode 路由进无头通道
+    /// 〈`Headless(Zcode)`〉，无头执行器未接线 → 落 `headless_pending`；本测锁「不是
+    /// headless_disabled」**且**「确实走到了无头分派点」——门与分派两段都在断言里）
     #[tokio::test]
     async fn headless_gate_allows_when_enabled() {
         let state = headless_gate_state(FakeInjector::ok());
@@ -5831,12 +5906,19 @@ mod tests {
         let body = body_string(r).await;
         assert!(
             !body.contains("headless_disabled"),
-            "开关开启后不得再被 H3 门拒绝（今日落到路由层 not_injectable 属预期）：{body}"
+            "开关开启后不得再被 H3 门拒绝（今日落到无头分派点的 headless_pending 属预期）：{body}"
+        );
+        assert!(
+            body.contains("headless_pending"),
+            "开关开启后必须抵达无头分派点（Task 7 过渡态码，Task 8 换成真分派）：{body}"
         );
     }
 
     /// H3 **边界**：终端注入工具（claude）不经此门——开关关闭也照常进入既有路径
-    /// （断言请求确实抵达路由层：留队 queued 或平台门 not_injectable，二者皆非本门）
+    /// （断言请求确实抵达路由层：留队 queued 或平台门 not_injectable，二者皆非本门）。
+    /// **三个 id 都是活进程会话**（pid 42/43/44）：有 TUI 可写 → 路由判终端通道（W3），
+    /// 故不受无头开关影响；H11 的「无进程」面（pid = 0 → 无头通道）由
+    /// [`headless_gate_covers_h11_processless_cli_sessions`] 反向锁住
     #[tokio::test]
     async fn headless_gate_leaves_terminal_tools_untouched() {
         let state = headless_gate_state(FakeInjector::ok());
@@ -5872,7 +5954,9 @@ mod tests {
 
     /// send-info 可用性矩阵：可注入会话 → injectable=true + channels/visibility
     /// （channels 随本机平台——routing platform = std::env::consts::OS，macOS 三通道 /
-    /// windows 单通道，断言按编译平台取期望）；workbuddy → injectable=false + blackbox；
+    /// windows 单通道，断言按编译平台取期望）；workbuddy / zcode（Task 7 起两家都路由进
+    /// 无头通道〈H9/H7〉）→ 开关关闭 injectable=false + headless_disabled、开关开启
+    /// injectable=false + headless_pending（旧断言的 blackbox 码已随路由表重写消失）；
     /// 另锁定缺参 400 与未知会话 404 no_session
     #[tokio::test]
     #[cfg_attr(
@@ -5942,25 +6026,39 @@ mod tests {
                 .is_some_and(|s| s.contains("无头通道未开启，请在电脑端 MAM 设置中开启")),
             "关闭态置灰必须带 spec H3 逐字原因：{v}"
         );
-        // 开关开启 → 门放行，路由层判据照旧（workbuddy 黑盒 → blackbox）
+        // 开关开启 → 门放行，落无头分派点（Task 7：workbuddy 路由 = Headless(WbAcp)，
+        // 执行器未接线 → injectable=false + headless_pending。**与 session-send ⑤b
+        // 同判据**：发送必败的会话不得在这里报 injectable:true）
         state.store.with(|c| {
             crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
         });
-        let r = app
-            .clone()
-            .oneshot(req(
-                "GET",
-                "/m/api/v1/session-send-info?session_id=sess_c",
-                Some("mam_device=mm"),
-                None,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 200);
-        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
-        assert_eq!(v["injectable"], false);
-        assert_eq!(v["reasonCode"], "blackbox");
-        assert!(v["reason"].is_string(), "不可注入必须带 reason 文案");
+        for sid in ["sess_c", "sess_d"] {
+            let r = app
+                .clone()
+                .oneshot(req(
+                    "GET",
+                    &format!("/m/api/v1/session-send-info?session_id={sid}"),
+                    Some("mam_device=mm"),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+            assert_eq!(v["injectable"], false, "{sid}");
+            assert_eq!(
+                v["reasonCode"], "headless_pending",
+                "开关开启后无头会话应落到分派点码（{sid}）：{v}"
+            );
+            assert!(
+                v["reason"].is_string(),
+                "不可注入必须带 reason 文案（{sid}）"
+            );
+            assert!(
+                v["channels"].is_null(),
+                "不可注入分支不返回 channels/visibility（{sid}）：{v}"
+            );
+        }
         // 缺参 → 400；未知会话 → 404 no_session
         let r = app
             .clone()
