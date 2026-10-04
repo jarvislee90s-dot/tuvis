@@ -44,6 +44,7 @@ import {
   setPin,
   toggleChannel,
   toggleHeadless,
+  setHeadlessLimits,
   type RemoteDevice,
   type RemoteStatus,
   type TsServeEntry,
@@ -81,6 +82,11 @@ const KEEPALIVE_KEY = "remote.keepalive";
 // 远程消息设备签名开关（2026-10-05 用户裁决）：默认关（省 token；溯源在注入审计页）——
 // 与 Rust 侧 normalize::message_signature_enabled 的 KV 键/取值逐字对齐
 const SIGNATURE_KEY = "remote_message_signature";
+// H4（Task 6）：无头子区两件的文档默认值——与 Rust 端
+// inject::headless::{DEFAULT_TIMEOUT_MS, DEFAULT_CONCURRENCY} 同值（缺键/旧后端载荷
+// 时按此渲染，不让输入框空着）；后端是唯一权威（clamp 后落库）
+const DEFAULT_HEADLESS_TIMEOUT_MS = 600000;
+const DEFAULT_HEADLESS_CONCURRENCY = 2;
 // P7 门特征文案（与 Rust PUBLIC_ACK_REQUIRED_MSG 单点常量同源的前缀特征）：前端只做
 // includes 判别分流弹既有 TLS Dialog，不复制门槛判定——文案漂移由后端常量保证
 const PUBLIC_ACK_FEATURE = "对外绑定需先确认已配置 TLS 反向代理";
@@ -244,6 +250,13 @@ export function RemoteSection() {
   const headlessAckRef = useRef(false);
   // 重置设备二次确认弹窗
   const [resetOpen, setResetOpen] = useState(false);
+  // H4（Task 6）无头配置两件：超时（毫秒）+ 全局并发上限。首个 status 到达即回填并
+  // 上锁（ref 闸）——3s 轮询不 clobber 编辑中的输入框（同 hostName 的既有口径）
+  const [headlessTimeout, setHeadlessTimeout] = useState(String(DEFAULT_HEADLESS_TIMEOUT_MS));
+  const [headlessConcurrency, setHeadlessConcurrency] = useState(
+    String(DEFAULT_HEADLESS_CONCURRENCY)
+  );
+  const headlessLimitsInitRef = useRef(false);
   // 开关在途互斥：连点会并发远程命令（启停竞态），与旧版 busy 语义一致
   const [busy, setBusy] = useState(false);
 
@@ -338,6 +351,13 @@ export function RemoteSection() {
   useEffect(() => {
     setTsCleared(null);
   }, [selected]);
+  // H4 无头配置回填：首个 status 到达填一次（缺键 → 文档默认值，输入框不留空）
+  useEffect(() => {
+    if (headlessLimitsInitRef.current || !status) return;
+    headlessLimitsInitRef.current = true;
+    setHeadlessTimeout(String(status.headlessTimeoutMs ?? DEFAULT_HEADLESS_TIMEOUT_MS));
+    setHeadlessConcurrency(String(status.headlessConcurrency ?? DEFAULT_HEADLESS_CONCURRENCY));
+  }, [status]);
 
   const enabled = status?.enabled ?? false;
   // H3 无头总开关态：唯一数据源 = remote_status.headlessEnabled（缺键/旧载荷 = 关）
@@ -666,6 +686,26 @@ export function RemoteSection() {
       toast.success(t("settings.remote.tokenSaved"));
     } catch (e) {
       toast.error(formatInvokeError(e, t));
+    }
+  };
+
+  // H4（Task 6）无头配置保存：后端 remote_set_headless_limits（越界 clamp 后落 KV +
+  // 审计 + 广播 remote-changed）。失败仅 toast、不回弹本地值（后端未变，可再点一次）；
+  // 空/非法输入交给后端 clamp（前端只做数字框约束，口径单点在后端）
+  const saveHeadlessLimits = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await setHeadlessLimits(
+        Number(headlessTimeout) || DEFAULT_HEADLESS_TIMEOUT_MS,
+        Number(headlessConcurrency) || DEFAULT_HEADLESS_CONCURRENCY
+      );
+      toast.success(t("settings.remote.tokenSaved"));
+      await refreshStatus();
+    } catch (e) {
+      toast.error(formatInvokeError(e, t));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -1410,6 +1450,59 @@ export function RemoteSection() {
           disabled={busy || !status}
           onCheckedChange={(v) => void changeHeadless(v)}
         />
+      </div>
+
+      {/* H4（Task 6）：「无头」子区三件套之另两件——watchdog 超时 + 全局并发上限
+          （spec H4「配置落点」：三件同住本分组，不另开页面）。数据源 = remote_status
+          的同名两键（后端 clamp 后落 KV + 审计 + 广播），旧后端缺键 → 文档默认值 */}
+      <div
+        data-headless-limits
+        className="flex flex-wrap items-start gap-4 border-t border-dashed py-3"
+      >
+        <div className="min-w-[190px] flex-1">
+          <label htmlFor="headless-timeout" className="text-sm font-semibold">
+            {t("settings.remote.headlessTimeoutLabel")}
+          </label>
+          <Input
+            id="headless-timeout"
+            type="number"
+            min={1000}
+            max={3600000}
+            step={1000}
+            value={headlessTimeout}
+            onChange={(e) => setHeadlessTimeout(e.target.value)}
+            className="mt-1"
+          />
+          <p className="text-muted-foreground mt-0.5 text-xs">
+            {t("settings.remote.headlessTimeoutHint")}
+          </p>
+        </div>
+        <div className="min-w-[160px] flex-1">
+          <label htmlFor="headless-concurrency" className="text-sm font-semibold">
+            {t("settings.remote.headlessConcurrencyLabel")}
+          </label>
+          <Input
+            id="headless-concurrency"
+            type="number"
+            min={1}
+            max={8}
+            step={1}
+            value={headlessConcurrency}
+            onChange={(e) => setHeadlessConcurrency(e.target.value)}
+            className="mt-1"
+          />
+          <p className="text-muted-foreground mt-0.5 text-xs">
+            {t("settings.remote.headlessConcurrencyHint")}
+          </p>
+        </div>
+        <Button
+          className="mt-6"
+          aria-label={t("settings.remote.headlessLimitsSave")}
+          disabled={busy || !status}
+          onClick={() => void saveHeadlessLimits()}
+        >
+          {t("settings.remote.save")}
+        </Button>
       </div>
 
       {/* H3 一次性安全说明（开启动作首次触发；确认 = 记已读 + 开启，取消仅关弹窗、

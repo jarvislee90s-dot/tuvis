@@ -383,7 +383,12 @@
       "groupHeadless": "4. Headless injection (bypasses terminal confirmation)",
       "headlessTitle": "Headless injection",
       "headlessHint": "Off by default. While off, headless-channel sessions (ZCode / Codex APP / WorkBuddy) cannot be messaged from the phone; the four terminal-injection tools are unaffected.",
-      "headlessConfirm": "Headless injection drives the Agent to execute messages (including tool calls) without visible confirmation in the terminal. The zcode channel defaults to yolo mode (no approval prompt). Enabling means you acknowledge this."
+      "headlessConfirm": "Headless injection drives the Agent to execute messages (including tool calls) without visible confirmation in the terminal. The zcode channel defaults to yolo mode (no approval prompt). Enabling means you acknowledge this.",
+      "headlessLimitsSave": "Save headless settings",
+      "headlessTimeoutLabel": "Headless timeout (ms)",
+      "headlessTimeoutHint": "Watchdog limit for a single headless turn; on expiry the process tree is killed and the receipt reports stage=timeout (retryable). Default 600000 (10 minutes).",
+      "headlessConcurrencyLabel": "Headless concurrency cap",
+      "headlessConcurrencyHint": "Maximum number of concurrent headless turns (1-8); excess requests queue immediately and their receipt carries the global queue position. Default 2."
     },
     "audit": {
       "title": "Injection Audit",

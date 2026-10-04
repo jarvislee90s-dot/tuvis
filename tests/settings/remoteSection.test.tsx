@@ -84,6 +84,9 @@ const statusOf = (over: Record<string, unknown> = {}) => ({
   maxDevices: 10,
   // H3：无头总开关状态（缺省 off——后端缺键即默认关，前端 undefined 同样按关渲染）
   headlessEnabled: false,
+  // H4（Task 6）：无头子区另两件——watchdog 超时 + 全局并发上限（后端缺键即默认值）
+  headlessTimeoutMs: 600000,
+  headlessConcurrency: 2,
   channels: channelsOf(over.channels as never),
   pin: "4827",
   host: { name: "matebook16s", platform: "windows", version: "0.4.2", bootId: "boot-x" },
@@ -523,7 +526,88 @@ describe("RemoteSection 无头注入总开关（H3 / Task 5）", () => {
   });
 });
 
-describe("RemoteSection lan 开关 P7 TLS Dialog 流（M5 A6）", () => {  const lanOffStatus = () =>
+// H4（Task 6）：「无头」子区三件套收齐——总开关（H3）+ watchdog 超时 + 全局并发上限。
+// 数据源 = remote_status.headlessTimeoutMs / headlessConcurrency（缺键 → 文档默认值
+// 600000ms / 2）；保存走 remote_set_headless_limits（后端 clamp + 审计 + 广播）。
+describe("RemoteSection 无头子区三件套（H4 / Task 6）", () => {
+  const timeoutInput = () => screen.getByLabelText("Headless timeout (ms)") as HTMLInputElement;
+  const concurrencyInput = () =>
+    screen.getByLabelText("Headless concurrency cap") as HTMLInputElement;
+  const limitsRow = () => document.querySelector("[data-headless-limits]") as HTMLElement;
+  const saveButton = () =>
+    within(limitsRow()).getByRole("button", { name: /save headless settings/i });
+
+  it("三控件同区渲染：总开关 + 超时 + 并发上限", async () => {
+    render(<RemoteSection />);
+    await waitFor(() => expect(timeoutInput()).toBeTruthy());
+    expect(screen.getByRole("switch", { name: /headless injection/i })).toBeTruthy();
+    expect(concurrencyInput()).toBeTruthy();
+    expect(saveButton()).toBeTruthy();
+    // 行提示（默认值口径写进 UI，不让用户猜）
+    expect(screen.getByText(/Default 600000/i)).toBeTruthy();
+    expect(screen.getByText(/Default 2\b/i)).toBeTruthy();
+  });
+
+  it("缺键（旧后端载荷 undefined）→ 渲染文档默认值 600000 / 2", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status")
+        return statusOf({ headlessTimeoutMs: undefined, headlessConcurrency: undefined });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() => expect(timeoutInput().value).toBe("600000"));
+    expect(concurrencyInput().value).toBe("2");
+  });
+
+  it("status 带值 → 控件回填（后端是唯一数据源）", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status")
+        return statusOf({ headlessTimeoutMs: 120000, headlessConcurrency: 3 });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() => expect(timeoutInput().value).toBe("120000"));
+    expect(concurrencyInput().value).toBe("3");
+  });
+
+  it("改值保存 → remote_set_headless_limits({timeoutMs, concurrency}) + 成功提示", async () => {
+    render(<RemoteSection />);
+    await waitFor(() => expect(timeoutInput().value).toBe("600000"));
+    fireEvent.change(timeoutInput(), { target: { value: "120000" } });
+    fireEvent.change(concurrencyInput(), { target: { value: "3" } });
+    fireEvent.click(saveButton());
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_set_headless_limits", {
+        timeoutMs: 120000,
+        concurrency: 3,
+      })
+    );
+    expect(toastSuccessMock).toHaveBeenCalled();
+  });
+
+  it("保存失败 → toast 报错（不静默吞），控件值不回弹", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status") return statusOf();
+      if (cmd === "remote_set_headless_limits") throw "后端拒绝（模拟）";
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() => expect(timeoutInput().value).toBe("600000"));
+    fireEvent.change(timeoutInput(), { target: { value: "90000" } });
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalled());
+    expect(timeoutInput().value).toBe("90000");
+  });
+});
+
+describe("RemoteSection lan 开关 P7 TLS Dialog 流（M5 A6）", () => {
+  const lanOffStatus = () =>
     statusOf({ channels: channelsOf({ lan: { enabled: false, running: false } }) });
 
   it("开 lan 收到 P7 特征 Err → 弹 TLS 确认 Dialog，不 toast 报错", async () => {

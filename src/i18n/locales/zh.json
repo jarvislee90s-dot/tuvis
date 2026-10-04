@@ -383,7 +383,12 @@
       "groupHeadless": "④ 无头注入（绕过终端可视确认）",
       "headlessTitle": "无头注入",
       "headlessHint": "默认关闭。关闭时，手机端无法向无头通道会话（ZCode / Codex APP / WorkBuddy）发消息；终端注入四家不受影响。",
-      "headlessConfirm": "无头注入将在不经过终端可视确认的情况下直接驱动 Agent 执行消息（含工具调用）。zcode 通道默认 yolo 档（不弹审批）。开启即表示知悉。"
+      "headlessConfirm": "无头注入将在不经过终端可视确认的情况下直接驱动 Agent 执行消息（含工具调用）。zcode 通道默认 yolo 档（不弹审批）。开启即表示知悉。",
+      "headlessLimitsSave": "保存无头配置",
+      "headlessTimeoutLabel": "无头超时（毫秒）",
+      "headlessTimeoutHint": "单次无头 turn 的看门狗上限：到点杀进程树并回执 stage=timeout（可重试）。默认 600000（10 分钟）。",
+      "headlessConcurrencyLabel": "无头并发上限",
+      "headlessConcurrencyHint": "同时进行的无头 turn 数上限（1–8）：超额请求即时排队，回执带全局队列位置。默认 2。"
     },
     "audit": {
       "title": "注入审计",

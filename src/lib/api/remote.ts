@@ -11,6 +11,12 @@ export type RemoteStatus = {
   /** H3：无头注入总开关（KV remote.headless_enabled；缺键 = 默认关）。
    *  可选——旧后端载荷无此键，前端按 undefined = 关渲染（不谎报开） */
   headlessEnabled?: boolean;
+  /** H4（Task 6）：无头 watchdog 超时毫秒（KV remote.headless_timeout_ms，后端
+   *  默认 600000 / clamp 1000..3600000）。缺键 = 旧后端 → 前端按 600000 渲染 */
+  headlessTimeoutMs?: number;
+  /** H4（Task 6）：无头全局并发上限（KV remote.headless_concurrency，后端默认 2 /
+   *  clamp 1..8）。缺键 = 旧后端 → 前端按 2 渲染 */
+  headlessConcurrency?: number;
   // M5 A5：四通道状态 + 当前访问密码（设置页卡片与详情区的唯一数据源；
   // 形状契约见 Rust 端 channels_payload 注释——A6 卡片与 A7 移动端消费同一形状）
   channels: RemoteChannels;
@@ -101,6 +107,12 @@ export async function remoteConfirmPublic(): Promise<void> {
 // （移动端则由 /session-send-info 的 injectable=false + reason 置灰——门在前）
 export async function toggleHeadless(enabled: boolean): Promise<void> {
   return await invoke("remote_toggle_headless", { enabled });
+}
+// H4（Task 6）无头配置两件：watchdog 超时（毫秒）+ 全局并发上限。后端
+// remote_set_headless_limits 写 KV remote.headless_timeout_ms / remote.headless_concurrency
+// （越界值 clamp 后落库，不报错）+ 审计 + 广播 remote-changed；runner 启动时读同一路径
+export async function setHeadlessLimits(timeoutMs: number, concurrency: number): Promise<void> {
+  return await invoke("remote_set_headless_limits", { timeoutMs, concurrency });
 }
 
 // ============================================================

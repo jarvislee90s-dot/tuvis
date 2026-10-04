@@ -168,6 +168,10 @@ pub fn run() {
             // 升级残留清理：Windows 升级流把安装包留在 %TEMP% 的
             // `{app}-*-updater-*` 目录（插件装完 exit(0) 不回收），启动即扫除
             crate::commands::updater::cleanup_updater_temp_dirs(app.handle());
+            // H4（Task 6）：无头配置启动装配——把设置里的 watchdog 超时/并发上限落到
+            // 运行期（并发写进全局名额）。缺键 = 默认 600000ms / 2。
+            // 不放在 `register_all_hooks` 那个早期闭包里：那条路径在 DB/设置层就绪前跑。
+            crate::remote::init_headless_limits();
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
@@ -298,6 +302,8 @@ pub fn run() {
         remote::remote_ts_run_step,
         // H3（二期收尾 Task 5）：无头注入总开关——默认关，翻转写审计 + 广播状态
         remote::remote_toggle_headless,
+        // H4（二期收尾 Task 6）：无头子区另两件——watchdog 超时 + 全局并发上限
+        remote::remote_set_headless_limits,
         // M7 W5：桌面端写审计查看（最近 N 条，只读）
         inject::inject_list_audit,
         // 用量域（计划①）：采集 / 大看板 / 记录页 / CSV / 设置读写
@@ -352,4 +358,11 @@ pub(crate) fn exit_cleanup() {
     // exit_cleanup 后升级安装路径（on_before_exit）同样不孤儿化它。
     crate::remote::tailscale::cancel_login_attempt();
     crate::remote::power::release();
+    // H4（Task 6）：在飞无头进程**优雅关闭**——整树终结，不留孤儿。与隧道同一
+    // 退出钩子；Windows 侧 Job 句柄（KILL_ON_JOB_CLOSE）是兜底，即使本钩子没
+    // 跑到也不留孤儿。重启后的孤儿自检需持久 pid 账本，登记在 Task 14。
+    let killed = crate::inject::headless::runner::shutdown_inflight();
+    if killed > 0 {
+        log::info!("退出：已终结 {killed} 个在飞无头进程树");
+    }
 }

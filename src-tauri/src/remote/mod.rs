@@ -55,6 +55,50 @@ pub const KEY_ACCESS_PIN: &str = "remote.access_pin";
 pub const KEY_HEADLESS: &str = "remote.headless_enabled";
 /// H3 关闭态文案（spec H3 逐字）：移动端输入区置灰的原因——send-info 的 reason 原样透出
 pub const HEADLESS_DISABLED_REASON: &str = "无头通道未开启，请在电脑端 MAM 设置中开启";
+/// **无头 watchdog 超时键（H4 / Task 6）**：毫秒，默认 [`DEFAULT_HEADLESS_TIMEOUT_MS`]
+/// （600000 = 裁决 15 定值）。值口径与其余数值键同：写侧恒十进制字符串、读侧
+/// 缺键/乱串回默认、越界 clamp（1_000..=3_600_000，数字单点在 `inject::headless`）。
+/// 消费方：设置页「无头」子区超时控件、`remote_status.headlessTimeoutMs` 下发、
+/// runner 启动读取（`headless::HeadlessLimits::from_conn`）。
+pub const KEY_HEADLESS_TIMEOUT_MS: &str = "remote.headless_timeout_ms";
+/// **无头全局并发上限键（H4 / Task 6）**：默认 [`DEFAULT_HEADLESS_CONCURRENCY`]（2），
+/// clamp 1..=8。超额请求即时排队（回执含全局队列位置），不静默丢也不阻塞死等。
+pub const KEY_HEADLESS_CONCURRENCY: &str = "remote.headless_concurrency";
+/// watchdog 默认超时（数字单点在 `inject::headless`，此处只做别名导出防两处漂移）
+pub const DEFAULT_HEADLESS_TIMEOUT_MS: u64 = crate::inject::headless::DEFAULT_TIMEOUT_MS;
+/// 全局并发上限默认值（同上）
+pub const DEFAULT_HEADLESS_CONCURRENCY: usize = crate::inject::headless::DEFAULT_CONCURRENCY;
+
+/// 无头超时解析（纯函数）：缺键/乱串 → 默认 600000；越界 → clamp（不报错——与
+/// `max_devices_from` 的容错口径一致，设置页非法输入不致通道不可用）
+pub fn headless_timeout_ms_from(v: Option<&str>) -> u64 {
+    match v.map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
+        Some(n) => crate::inject::headless::clamp_timeout_ms(n),
+        None => DEFAULT_HEADLESS_TIMEOUT_MS,
+    }
+}
+
+/// 无头并发上限解析（纯函数）：缺键/乱串 → 默认 2；越界 → clamp 1..=8
+pub fn headless_concurrency_from(v: Option<&str>) -> usize {
+    match v.map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) => crate::inject::headless::clamp_concurrency(n),
+        None => DEFAULT_HEADLESS_CONCURRENCY,
+    }
+}
+
+/// 无头超时读取（store 缝版本；runner 启动与状态下发共用）
+pub fn headless_timeout_ms_conn(conn: &rusqlite::Connection) -> u64 {
+    headless_timeout_ms_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_HEADLESS_TIMEOUT_MS).as_deref(),
+    )
+}
+
+/// 无头并发上限读取（store 缝版本；同上）
+pub fn headless_concurrency_conn(conn: &rusqlite::Connection) -> usize {
+    headless_concurrency_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_HEADLESS_CONCURRENCY).as_deref(),
+    )
+}
 
 /// 上限解析（纯函数）：None/乱串 → 10（M5 A5 用户裁决：默认 3 → 10；已存值不迁移）；
 /// clamp 1..=10 不变
@@ -95,12 +139,16 @@ pub fn headless_enabled_conn(conn: &rusqlite::Connection) -> bool {
     )
 }
 
-/// **无头状态下发装配（可测缝）**：从注入的连接读开关并写入 status 载荷——键名与取值
-/// 口径的唯一落点（H3：开关状态持久化 settings 表并随 `remote_status` 下发）。
+/// **无头状态下发装配（可测缝）**：从注入的连接读开关 + H4 两项配置并写入 status
+/// 载荷——键名与取值口径的唯一落点（H3：开关状态持久化 settings 表并随 `remote_status`
+/// 下发；H4：watchdog 超时与并发上限随「无头」子区同住，三件套控件同一数据源）。
 /// 生产 = `DeviceStore::global()` 的 conn（与门**同一条读取路径**，杜绝「状态显示开、
 /// 门却判关」的双轨漂移）；测试 = `memory_conn()` 自建库（零接触真实 ~/.tuvis/tuvis.db）。
 pub fn apply_headless_status(st: &mut serde_json::Value, conn: &rusqlite::Connection) {
     st["headlessEnabled"] = serde_json::json!(headless_enabled_conn(conn));
+    // H4：缺键也上线默认值（前端三件套控件不出现 undefined）
+    st["headlessTimeoutMs"] = serde_json::json!(headless_timeout_ms_conn(conn));
+    st["headlessConcurrency"] = serde_json::json!(headless_concurrency_conn(conn));
 }
 
 /// 无头开关内核（**可测核**；conn 与审计出口以参数注入——对齐 [`toggle_core`] /
@@ -139,6 +187,75 @@ fn toggle_headless_core(
 pub fn remote_toggle_headless(enabled: bool) -> Result<(), String> {
     pairing::DeviceStore::global().with(|c| toggle_headless_core(c, enabled, events::audit));
     Ok(())
+}
+
+/// 无头配置写入内核（**可测核**；与 [`toggle_headless_core`] 同模式：conn 与审计出口
+/// 参数注入）：两键 clamp 后落 KV → 审计留痕 → 广播状态变更。越界值**收进区间再落库**
+/// （runner 侧永不拿到 0/超界——否则 watchdog 即刻到点或所有请求永久排队）。
+///
+/// **审计口径**：与 `headless_toggled` 同机制（`events::audit` 日志出口，非 write_audit
+/// 表——桌面设置动作不落移动端注入账本，理由见 [`toggle_headless_core`]）。
+fn set_headless_limits_core(
+    conn: &rusqlite::Connection,
+    timeout_ms: u64,
+    concurrency: usize,
+    audit: impl FnOnce(&str, &str),
+) {
+    let timeout_ms = crate::inject::headless::clamp_timeout_ms(timeout_ms);
+    let concurrency = crate::inject::headless::clamp_concurrency(concurrency);
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_HEADLESS_TIMEOUT_MS,
+        &timeout_ms.to_string(),
+    );
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_HEADLESS_CONCURRENCY,
+        &concurrency.to_string(),
+    );
+    // **改设置即生效**（H4「可配」不是摆设）：并发上限立刻落到全局名额。
+    // 超时是回合属性——下一回合由端点经 `headless::runner_from_conn` 读取。
+    crate::inject::headless::apply_limits_to(conn, &crate::inject::headless::runner::global_sem());
+    audit(
+        "headless_limits_set",
+        &format!("timeoutMs={timeout_ms} concurrency={concurrency}"),
+    );
+    events::emit_ui(
+        "remote-changed",
+        serde_json::json!({
+            "headlessTimeoutMs": timeout_ms,
+            "headlessConcurrency": concurrency,
+        }),
+    );
+}
+
+/// 无头配置写入（H4 配置落点：设置页「无头」子区的超时 + 并发上限两件）。
+/// 薄壳：注入全局 store 的 conn 后直驱 [`set_headless_limits_core`]。越界值不报错、
+/// 按区间 clamp 落库（前端输入框的 min/max 只是提示，后端是唯一口径）。
+#[tauri::command]
+pub fn remote_set_headless_limits(timeout_ms: u64, concurrency: usize) -> Result<(), String> {
+    pairing::DeviceStore::global()
+        .with(|c| set_headless_limits_core(c, timeout_ms, concurrency, events::audit));
+    Ok(())
+}
+
+/// **H4 配置启动装配**（`lib.rs` setup 调用一次）：把设置里的超时/并发落到运行期——
+/// 并发上限写进全局名额（[`crate::inject::headless::runner::global_sem`]），runner 每回合
+/// 经 `headless::runner_from_conn` 读超时。缺键 = 默认 2 / 600000（裁决 15）。
+/// **不做这一步**，进程启动后 `GLOBAL_SEM` 会一直是代码里的默认 2、runner 一直跑默认
+/// 600s——设置页两个控件就只是摆设（评审 Important 3 的根因）。
+pub fn init_headless_limits() {
+    pairing::DeviceStore::global().with(|c| {
+        let limits = crate::inject::headless::apply_limits_to(
+            c,
+            &crate::inject::headless::runner::global_sem(),
+        );
+        log::info!(
+            "无头配置装配：watchdog={}ms 并发上限={}",
+            limits.timeout_ms,
+            limits.concurrency
+        );
+    });
 }
 
 // ============================================================
@@ -1101,8 +1218,8 @@ pub fn remote_status() -> serde_json::Value {
     // 设备上限（线稿「已接入设备 N / 上限」徽标；KV 可改，未设置默认 10——决策 #17）
     st["maxDevices"] = serde_json::json!(max_devices_from_kv());
     // H3：无头注入总开关状态下发（设置页开关初值 + 移动端置灰判据；缺键 = 默认关）。
-    // 经可测缝 apply_headless_status（与门同一条读取路径）；Task 6 的 watchdog 超时 /
-    // 并发上限两键随「无头」子区一并追加于此（本任务只此一键）
+    // 经可测缝 apply_headless_status（与门同一条读取路径）；Task 6 起同缝一并下发
+    // H4 的 watchdog 超时与并发上限（「无头」子区三件套 = 开关 + 超时 + 并发）
     pairing::DeviceStore::global().with(|c| apply_headless_status(&mut st, c));
     // M5 A5：通道开关（read_channels 含惰性迁移）+ 隧道双通道快照 + tailscale 快照
     let chans = read_channels();
@@ -2081,6 +2198,150 @@ mod tests {
                 ("headless_toggled".to_string(), "headless=false".to_string()),
             ],
             "两个方向各一条审计（action/detail 口径固定）"
+        );
+    }
+
+    /// H4（Task 6）：无头配置两键——键名固定 + 解析口径（缺键/乱串 → 默认；越界 clamp）
+    #[test]
+    fn headless_limit_keys_and_parsing_are_pinned() {
+        assert_eq!(KEY_HEADLESS_TIMEOUT_MS, "remote.headless_timeout_ms");
+        assert_eq!(KEY_HEADLESS_CONCURRENCY, "remote.headless_concurrency");
+        assert_eq!(DEFAULT_HEADLESS_TIMEOUT_MS, 600_000, "裁决 15 定值");
+        assert_eq!(DEFAULT_HEADLESS_CONCURRENCY, 2, "H4 定值");
+        assert_eq!(headless_timeout_ms_from(None), 600_000, "缺键 = 默认 600s");
+        assert_eq!(headless_timeout_ms_from(Some("120000")), 120_000);
+        for junk in ["", "abc", "10s", "-5", "1e6", " 12 000"] {
+            assert_eq!(
+                headless_timeout_ms_from(Some(junk)),
+                DEFAULT_HEADLESS_TIMEOUT_MS,
+                "乱串回默认：{junk:?}"
+            );
+        }
+        assert_eq!(headless_timeout_ms_from(Some("0")), 1_000, "0 收到下界");
+        assert_eq!(headless_timeout_ms_from(Some("99999999")), 3_600_000);
+        assert_eq!(headless_concurrency_from(None), 2);
+        assert_eq!(headless_concurrency_from(Some("3")), 3);
+        assert_eq!(headless_concurrency_from(Some("abc")), 2);
+        assert_eq!(
+            headless_concurrency_from(Some("0")),
+            1,
+            "0 会让所有请求永久排队"
+        );
+        assert_eq!(headless_concurrency_from(Some("100")), 8);
+    }
+
+    /// H4：store 缝读取（runner 启动 + 状态下发**同一条路径**）——空库取默认，
+    /// 写键即生效，且 `HeadlessLimits::from_conn`（runner 侧）与之一致
+    #[test]
+    fn headless_limits_conn_reads_memory_store() {
+        let conn = memory_conn();
+        assert_eq!(headless_timeout_ms_conn(&conn), DEFAULT_HEADLESS_TIMEOUT_MS);
+        assert_eq!(
+            headless_concurrency_conn(&conn),
+            DEFAULT_HEADLESS_CONCURRENCY
+        );
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS_TIMEOUT_MS, "90000");
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS_CONCURRENCY, "5");
+        assert_eq!(headless_timeout_ms_conn(&conn), 90_000);
+        assert_eq!(headless_concurrency_conn(&conn), 5);
+        let limits = crate::inject::headless::HeadlessLimits::from_conn(&conn);
+        assert_eq!(limits.timeout_ms, 90_000, "runner 启动读取须同路径");
+        assert_eq!(limits.concurrency, 5);
+        // 乱串落库（手改 DB）同样回默认，不让 runner 拿到 0
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS_CONCURRENCY, "junk");
+        assert_eq!(
+            headless_concurrency_conn(&conn),
+            DEFAULT_HEADLESS_CONCURRENCY
+        );
+    }
+
+    /// H4：**状态下发带两键**（前端三件套控件的数据源）——缺键上线默认值，
+    /// 显式值上线显式值（不残留上一拍真值）
+    #[test]
+    fn status_payload_carries_headless_limits_both_ways() {
+        let conn = memory_conn();
+        let mut st = serde_json::json!({ "enabled": true });
+        apply_headless_status(&mut st, &conn);
+        assert_eq!(st["headlessTimeoutMs"], serde_json::json!(600_000));
+        assert_eq!(st["headlessConcurrency"], serde_json::json!(2));
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS_TIMEOUT_MS, "120000");
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS_CONCURRENCY, "3");
+        let mut st = serde_json::json!({
+            "headlessTimeoutMs": 600_000,
+            "headlessConcurrency": 2
+        });
+        apply_headless_status(&mut st, &conn);
+        assert_eq!(st["headlessTimeoutMs"], serde_json::json!(120_000));
+        assert_eq!(st["headlessConcurrency"], serde_json::json!(3));
+    }
+
+    /// H4：**写入内核**——两键落库（越界值 clamp 后落）+ 审计（log 通道，同
+    /// `channel_toggled`/`headless_toggled` 机制）
+    #[test]
+    fn set_headless_limits_core_writes_kv_and_audits() {
+        let conn = memory_conn();
+        let mut audits: Vec<(String, String)> = Vec::new();
+        set_headless_limits_core(&conn, 120_000, 3, |a, d| audits.push((a.into(), d.into())));
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_HEADLESS_TIMEOUT_MS)
+                .as_deref(),
+            Some("120000")
+        );
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_HEADLESS_CONCURRENCY)
+                .as_deref(),
+            Some("3")
+        );
+        assert_eq!(headless_timeout_ms_conn(&conn), 120_000);
+        assert_eq!(headless_concurrency_conn(&conn), 3);
+        // 越界值：clamp 后落库（配置面与 runner 面永不看到 0/超界）
+        set_headless_limits_core(&conn, 0, 0, |a, d| audits.push((a.into(), d.into())));
+        assert_eq!(headless_timeout_ms_conn(&conn), 1_000);
+        assert_eq!(headless_concurrency_conn(&conn), 1);
+        assert_eq!(
+            audits,
+            vec![
+                (
+                    "headless_limits_set".to_string(),
+                    "timeoutMs=120000 concurrency=3".to_string()
+                ),
+                (
+                    "headless_limits_set".to_string(),
+                    "timeoutMs=1000 concurrency=1".to_string()
+                ),
+            ],
+            "写入必须留痕（action/detail 口径固定），且 detail 记 clamp 后的实值"
+        );
+    }
+
+    /// 评审 Important 3：H4「可配」必须**真生效**——写入内核把并发上限落到全局名额
+    /// （不是只写 KV 让 `GLOBAL_SEM` 永远停在默认 2）。
+    /// 持 `HEADLESS_CAP_TEST_LOCK`：本测改**进程级单例**名额，与 headless 侧同型用例
+    /// （runner 启动装配）互斥串行——同 `LOOP_HANDLE_TEST_LOCK` 的既有先例（独占资源
+    /// 方案，替代重试启发式），避免并行断言窗口交错。
+    #[test]
+    fn set_headless_limits_core_applies_concurrency_to_global_sem() {
+        let _serial = crate::inject::headless::HEADLESS_CAP_TEST_LOCK
+            .lock()
+            .unwrap();
+        let conn = memory_conn();
+        set_headless_limits_core(&conn, 120_000, 3, |_, _| {});
+        assert_eq!(
+            crate::inject::headless::runner::global_sem().cap(),
+            3,
+            "改设置即生效：全局名额必须随之上调"
+        );
+        set_headless_limits_core(&conn, 120_000, 1, |_, _| {});
+        assert_eq!(
+            crate::inject::headless::runner::global_sem().cap(),
+            1,
+            "下调同样即时生效（已在飞者不打断，自然退出即回落）"
+        );
+        // 复位进程级单例，别把 1 留给后续用例
+        crate::inject::headless::runner::global_sem().set_cap(DEFAULT_HEADLESS_CONCURRENCY);
+        assert_eq!(
+            crate::inject::headless::runner::global_sem().cap(),
+            DEFAULT_HEADLESS_CONCURRENCY
         );
     }
 
