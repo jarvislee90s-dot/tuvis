@@ -15,7 +15,10 @@
 //!     确认」（[`DirectReceipt::Submitted`]），不冒充送达；
 //!   - **投递后确认**（其余插队路径）：以**占用排空**确认（Windows
 //!     `wait_input_drained` ≤2s，[`JUMP_DRAIN_TIMEOUT_MS`]）——它判的是「我们投出去
-//!     的键被终端消费了没」，与「回合停没停」是两件事（见该常量注）。
+//!     的键被终端消费了没」，与「回合停没停」是两件事（见该常量注）。**无确认面
+//!     平台（macOS/Linux）→ 中性「已投递未确认」**（L14 诚实化：无 drain/无屏读可查，
+//!     键是否被消费无从验证——旧口径在此报已送达 = macOS 假成功；判定见
+//!     [`triage_jump_receipt`] 表④与守门）。
 //!
 //! 屏读草稿尾在插队路径为 best-effort 诊断（busy TUI 可能在屏读前已把草稿消费进自身
 //! 缓冲，不 Gate 结果）。
@@ -25,7 +28,9 @@
 //!   （列表含戳）/ [`stamp_hit_in_page`]（user 侧过滤 + 含戳）/
 //!   [`direct_confirm_fail_copy`]（族 × 平台感知失败文案，Mac 报告 §四-C）/
 //!   [`triage_screen_recovery`]（D7/T3 分诊纯核：屏读回查结果 → 直发确认三态，
-//!   判定因果见该函数注）/ [`turn_stopped_in_lines`] + [`poll_turn_stopped`]
+//!   判定因果见该函数注）/ [`triage_jump_receipt`]（L14 插队回执纯核：排空探针 × os
+//!   → 三态，确认面不可达一律中性 Submitted——判定表见该函数注）+
+//!   [`jump_confirm_face_available`]（平台确认面可得性，os 参数化）/ [`turn_stopped_in_lines`] + [`poll_turn_stopped`]
 //!   （插队「等回合停」：判据纯函数 + 动态轮询内核，测试用脚本化屏序列驱动）；
 //! - **契约/测试面 API**：[`session_stamp_hit`]（复用会话消息读路径；flush_one 不直接
 //!   用它——生产确认调用全部经 `RemoteState.confirm_probe` 缝，本函数不参加生产
@@ -512,11 +517,16 @@ pub(crate) enum TurnStopWait {
     /// 不能丢），但回执只能落到「已投递未确认」（[`DirectReceipt::Submitted`]）——
     /// 这正是 2026-09-22 实机 bug 的形态：消息可能落进旧回合的内部队列
     StillRunning,
-    /// **判据不可用**（首拍屏读 `None`：非 Windows / attach 失败 / 无可见控制台）：
-    /// 「没读到」不是「回合没停」——回执**保持既有 best-effort 口径**（投递成功即
-    /// `Sent`），与 D7/T3 在非 Windows 上「分诊不可达 → 行为与 T3 前一致」同一裁决
-    /// （macOS 没有屏读能力，若因能力缺失就一律降级，等于把 macOS 的插队回执永久
-    /// 打成「已投递未确认」——那是**编造**，我们并不知道回合停没停）。
+    /// **判据不可用**（首拍屏读 `None`：attach 失败 / 无可见控制台 / 非 Windows）：
+    /// 「没读到」不是「回合没停」——在**已确认投递**的前提下保持 best-effort 口径
+    /// （投递成功即 `Sent`）。
+    ///
+    /// **L14 起本格的适用面收窄到「屏读通道临时失败」**（Windows attach 失败等）：
+    /// 非 Windows（macOS/Linux）无排空确认面，插队回执**先一步**已是
+    /// [`DirectReceipt::Submitted`]（[`triage_jump_receipt`] 守门），合流
+    /// （`queue::resolve_jump_receipt`）根本不咨询本态——故本格旧注顾虑的「把 macOS
+    /// 的插队回执永久打成未确认 = 编造」不再成立：L14 裁决「无确认面」本身就是
+    /// **事实上的未确认**，如实上报它才是诚实（编造的是旧口径的 delivered）。
     Unverifiable,
     /// **本路径不需要等**：非 claude（Esc 语义未实测 → 不发 Esc）、或会话不在运行中
     /// （本来就空闲，无回合可停）。回执按投递结果定（best-effort 语义不变）
@@ -535,8 +545,9 @@ impl TurnStopWait {
 }
 
 /// 排空超时回执（对齐 PARTIAL_WARN 防重纪律，质量评审 Minor 3）：目标可能仍在
-/// 消费，盲目重试会叠加正文——先引导人工检查终端
-#[cfg_attr(not(windows), allow(dead_code))]
+/// 消费，盲目重试会叠加正文——先引导人工检查终端。**文案与防重语义钉死**：L14
+/// 诚实化只改「确认面不可达」格的去向（Confirmed → Submitted），本常量是排空
+/// **真超时**的判据，任何平台都不得被软化（见 [`triage_jump_receipt`] 判定表②）。
 const DELIVERY_TIMEOUT_MSG: &str = "投递超时（目标可能仍在消费，重试前请检查终端）";
 
 /// 直发确认失败文案选择（纯函数，F2 更正：文案按「工具 × 平台」感知，跨平台
@@ -602,22 +613,29 @@ pub(crate) enum ScreenRecovery {
 }
 
 /// flush 内核三态回执（D7/T3：**注入失败 / 插队 / 直发确认三路共用**，
-/// `queue::try_flush_with` 按此映射 [`super::queue::FlushOutcome`]：Confirmed→Sent /
-/// Submitted→Submitted / Failed→Failed）。`Submitted` 仅直发确认分诊产出；另两态
-/// 的构造点与载荷随路径而异（见各变体注）。
+/// `queue::outcome_of_receipt` 按此映射 [`super::queue::FlushOutcome`]：Confirmed→Sent /
+/// Submitted→Submitted / Failed→Failed）。`Submitted` 有两个构造点：直发确认分诊
+/// （非滞留）与**插队 × 确认面不可达**（L14）；另两态的构造点与载荷随路径而异
+/// （见各变体注）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirectReceipt {
     /// 确认通过（→ Sent）。**跨路径载荷差异**：直发 = 戳命中（轮询窗内，或屏读
     /// 回查补回车后 3s 窗内）= 已确认落盘；插队 = 占用排空 / best-effort（无戳
-    /// 可查，屏读只作诊断不 Gate）。
+    /// 可查，屏读只作诊断不 Gate）。**平台边界（L14）**：插队的本态只在**有排空
+    /// 确认面的平台**（Windows）产出——无确认面平台（macOS/Linux）一律
+    /// [`DirectReceipt::Submitted`]（见 [`triage_jump_receipt`]）。
     Confirmed,
-    /// 注入 Ok + 戳未中 + 屏读无滞留草稿 = **已投递未确认**（中性，仅直发分诊
-    /// 产出）：消息已被 TUI 收进内部队列，agent 空闲后处理——不失败、不提供重试
-    /// （重试 = 双发，且 TUI 那份无法撤回；验收问题 #5 的「假失败诱导重试」根因
-    /// 即此态被误判）
+    /// 已投递未确认（中性）。**两个构造点，语义同一**：
+    /// - 直发分诊：注入 Ok + 戳未中 + 屏读无滞留草稿 = 消息已被 TUI 收进内部队列；
+    /// - 插队 × 确认面不可达（L14）：平台无排空/屏读 API（macOS/Linux），键已投递
+    ///   但消费无从验证。
+    ///
+    /// 两种都不失败、都不提供重试（重试 = 双发，且 TUI 那份无法撤回；验收问题 #5
+    /// 的「假失败诱导重试」根因即此态被误判）。
     Submitted,
     /// 失败（载荷随路径而异）：直发确认 = 防重警示文案 ± 补按回车失败原因（真
-    /// 失败，重试由用户判断）；注入失败 = 注入器错误原文（裸注入错误，短路确认）。
+    /// 失败，重试由用户判断）；注入失败 = 注入器错误原文（裸注入错误，短路确认）；
+    /// 插队 = 排空超时（[`DELIVERY_TIMEOUT_MSG`]）。
     Failed(String),
 }
 
@@ -766,6 +784,73 @@ fn stuck_on_input_line(pid: u32, content: &str) -> bool {
     }
 }
 
+/// **插队确认面探针结局**（纯核 [`triage_jump_receipt`] 的唯一输入；平台执行侧
+/// [`jump_receipt`] 产出，形态对齐 [`ScreenRecovery`] 先例：执行侧如实上报观察，
+/// 结论交纯核）。Windows 有输入缓冲排空 API（`windows_console::wait_input_drained`）
+/// → 前三格；非 Windows（macOS/Linux）无排空/屏读确认面 → 末格。
+///
+/// **平台可见性**（条件化 allow，按 `ScreenRecovery` / resume.rs 先例）：非 Windows
+/// 构建只构造 `NoConfirmFace`（前三格仅测试构造），Windows 非测试构建不构造
+/// `NoConfirmFace`——两个方向都需 allow，否则 `-D warnings` 门禁红。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum JumpDrainProbe {
+    /// 排空成功：我们投出去的键已被终端消费（输入缓冲事件数回落）
+    Drained,
+    /// 排空超时：窗内未回落（[`DELIVERY_TIMEOUT_MSG`] 防重口径——目标可能仍在消费）
+    Timeout,
+    /// 排空查询基础设施失败（假 pid / 控制台失效）：诊断通道不可用
+    InfraUnavailable,
+    /// **平台无排空/屏读确认面**（macOS/Linux 执行臂的唯一产出）：确认面不可达——
+    /// 键是否被终端消费**无从验证**
+    #[cfg_attr(all(windows, not(test)), allow(dead_code))]
+    NoConfirmFace,
+}
+
+/// 平台确认面可得性（纯函数，os 参数化——同 [`direct_confirm_fail_copy`] 先例，
+/// 使 macOS/Linux 列在 Windows 门禁里同样可钉）：插队确认靠输入缓冲排空 API
+/// （`windows_console::wait_input_drained`，`#[cfg(windows)]` 实现），故**只有
+/// Windows 有这份确认面**；其余平台（macOS/Linux）无排空、无屏读可查。
+pub(crate) fn jump_confirm_face_available(os: &str) -> bool {
+    os == "windows"
+}
+
+/// 插队回执分诊纯核（L14 诚实化；探针结局 × os → 三态 [`DirectReceipt`]）。
+///
+/// # 判定表与因果（防后人改回「投了就报送达」的旧口径）
+///
+/// ① **排空成功**（[`JumpDrainProbe::Drained`]）→ `Confirmed`：键已被终端消费；
+/// ② **排空超时**（[`JumpDrainProbe::Timeout`]）→ `Failed`（[`DELIVERY_TIMEOUT_MSG`]）
+///    ——**与平台无关**：真超时是「目标可能仍在消费」的证据，软化即丢掉「重试前先
+///    检查终端」的防重指引（该格在无确认面平台不可达，但语义不得被平台守门吞掉）；
+/// ③ **排空基础设施失败**（[`JumpDrainProbe::InfraUnavailable`]）→ `Confirmed`
+///    best-effort：诊断通道不可用不得误报投递超时（既有裁决，错误进日志）；
+/// ④ **确认面不可达**（[`JumpDrainProbe::NoConfirmFace`]，或平台谓词判无面）→
+///    **中性 `Submitted`**（已投递未确认）：键已投递但消费**未被验证**，
+///    既不冒充 `delivered`（spec 风险 13 / C0 ①：macOS 假成功根修），也不误报
+///    `Failed`（那会诱导重试 = 双发）。
+///
+/// **守门为 fail-closed**：无确认面的平台上，任何成功类探针都不得升级为
+/// `Confirmed`——平台错配或将来新增 API 未接分诊时，诚实默认（中性）胜出。
+/// `os` 作参数而非函数内硬取 `std::env::consts::OS`：全象限在任一平台可钉
+/// （生产调用点传本机 OS）。
+pub(crate) fn triage_jump_receipt(probe: JumpDrainProbe, os: &str) -> DirectReceipt {
+    match probe {
+        // ② 排空超时（防重口径）：**先于平台守门**判定——真超时是「目标可能仍在
+        //    消费」的证据，不得因平台无确认面而被软化成中性（该格在无确认面平台
+        //    不可达，但语义不被守门吞掉）
+        JumpDrainProbe::Timeout => DirectReceipt::Failed(DELIVERY_TIMEOUT_MSG.to_string()),
+        // **确认面守门（L14 核心，fail-closed）**：本平台无排空/屏读 API → 成功类
+        // 探针一律不得升级为 Confirmed（平台错配 / 将来新增 API 未接分诊时，诚实
+        // 默认「已投递未确认」胜出）
+        _ if !jump_confirm_face_available(os) => DirectReceipt::Submitted,
+        // ① 排空成功 / ③ 排空基础设施失败（best-effort）→ 已确认（既有口径）
+        JumpDrainProbe::Drained | JumpDrainProbe::InfraUnavailable => DirectReceipt::Confirmed,
+        // ④ 执行侧自报「无确认面」：即使平台谓词放行（Windows）也不冒充送达
+        JumpDrainProbe::NoConfirmFace => DirectReceipt::Submitted,
+    }
+}
+
 /// **插队「等回合停」**（投递**前**的屏读轮询，宪法 D20(a)(b)；2026-09-22 R2 复评）。
 ///
 /// # 为什么需要它（旧实现错在哪，实机 bug 的根因）
@@ -811,11 +896,14 @@ where
 }
 
 /// 插队确认（裁决 A1 插队语义）：写后等占用排空 ≤2s（Windows
-/// `wait_input_drained`）——排空成功 → `Ok`（已送达；屏读草稿尾为 best-effort
-/// 诊断只进日志，不 Gate 结果）；排空超时 → `Err`（[`DELIVERY_TIMEOUT_MSG`]，
+/// `wait_input_drained`）——排空成功 → `Confirmed`（已送达；屏读草稿尾为 best-effort
+/// 诊断只进日志，不 Gate 结果）；排空超时 → `Failed`（[`DELIVERY_TIMEOUT_MSG`]，
 /// 防重口径）；排空查询基础设施失败（假 pid / 控制台失效）→ best-effort 以
-/// 「写入成功」为准返回 Ok（诊断通道不可用不得误报投递超时，错误进日志）。
-/// macOS 无占用/屏读 API → 直接 Ok（保持既有行为，插队无 drain 可等）。
+/// 「写入成功」为准 `Confirmed`（诊断通道不可用不得误报投递超时，错误进日志）。
+/// **macOS/Linux（无排空/屏读 API）→ 中性 [`DirectReceipt::Submitted`]**（L14 诚实化：
+/// 键已投递但确认面不可达，消费无从验证——旧口径此处直接 `Ok(())` 等价
+/// `Confirmed`，端点回 delivered 即「macOS 假成功」的根因）。
+/// 结论收口为纯核 [`triage_jump_receipt`]（探针结局 × os），平台臂只产出探针。
 ///
 /// # 为什么本处**保留** drain 语义（R2 复评的裁决与理由）
 ///
@@ -831,17 +919,19 @@ pub(crate) fn await_jump_receipt(
     st: &crate::remote::server::RemoteState,
     session: &crate::session::Session,
     content: &str,
-) -> Result<(), String> {
+) -> DirectReceipt {
     // st 缝在插队路径暂无消费（屏读/占用直走 windows_console；参数形状保留供
     // Task 6/后续诊断扩展），显式弃用防跨平台未用告警
     let _ = st;
     jump_receipt(session, content)
 }
 
-/// 插队确认平台实现分派（见 [`await_jump_receipt`] 语义注）。
+/// 插队确认平台实现分派（见 [`await_jump_receipt`] 语义注）：产出探针结局，结论
+/// 交纯核 [`triage_jump_receipt`]（本机 os 作参数）。
 #[cfg(windows)]
-fn jump_receipt(session: &crate::session::Session, content: &str) -> Result<(), String> {
-    match super::windows_console::wait_input_drained(session.pid, JUMP_DRAIN_TIMEOUT_MS) {
+fn jump_receipt(session: &crate::session::Session, content: &str) -> DirectReceipt {
+    let drain = match super::windows_console::wait_input_drained(session.pid, JUMP_DRAIN_TIMEOUT_MS)
+    {
         Ok(true) => {
             // 屏读草稿尾：best-effort 诊断（裁决「屏读失败则以写入成功+排空为准」；
             // busy TUI 消费后草稿离开输入行亦属正常，故不含也只记日志）
@@ -853,22 +943,26 @@ fn jump_receipt(session: &crate::session::Session, content: &str) -> Result<(), 
                 Ok(_) => {}
                 Err(e) => log::debug!("插队屏读失败（best-effort 不 Gate）：{e}"),
             }
-            Ok(())
+            JumpDrainProbe::Drained
         }
-        Ok(false) => Err(DELIVERY_TIMEOUT_MSG.to_string()),
+        Ok(false) => JumpDrainProbe::Timeout,
         Err(e) => {
             log::debug!("插队排空查询失败（best-effort 以写入成功为准）：{e}");
-            Ok(())
+            JumpDrainProbe::InfraUnavailable
         }
-    }
+    };
+    triage_jump_receipt(drain, std::env::consts::OS)
 }
 
-/// 插队确认平台实现分派（macOS 降级：无 drain 可等，直接 Sent 保持既有行为）。
+/// 插队确认平台实现分派（macOS/Linux 降级：无 drain 可等、无屏读可查 —— **确认面
+/// 不可达**）→ 中性 [`DirectReceipt::Submitted`]（L14 诚实化）。旧口径此处无条件
+/// `Ok(())`（注释：直接 Sent 保持既有行为）——那是「macOS 假成功」的根因：端点据
+/// Confirmed 回 delivered，而键是否被消费从未被验证。
 #[cfg(not(windows))]
-fn jump_receipt(session: &crate::session::Session, content: &str) -> Result<(), String> {
+fn jump_receipt(session: &crate::session::Session, content: &str) -> DirectReceipt {
     let _ = session;
     let _ = content;
-    Ok(())
+    triage_jump_receipt(JumpDrainProbe::NoConfirmFace, std::env::consts::OS)
 }
 
 #[cfg(test)]
@@ -1527,8 +1621,10 @@ mod tests {
     /// 「无判据只读一拍」先例同构）。
     ///
     /// **本态与 `StillRunning` 分列的存在意义**（防合并成布尔的回归）：合并会把「没读屏」
-    /// 说成「回合没停」——那是编造（本仓「结论不超证据」）。macOS 无屏读，若因此降级，
-    /// 它的插队回执会被永久打成「已投递未确认」。
+    /// 说成「回合没停」——那是编造（本仓「结论不超证据」）。**L14 更正**：本态不再承担
+    /// 「非 Windows 回执照样 Sent」的职责（那已由 [`triage_jump_receipt`] 的确认面守门
+    /// 判为中性 Submitted）——本格现在只表示「屏读通道临时读不到」，其 best-effort 口径
+    /// 只在 Windows（有排空确认面、投递已确认）的合流里生效。
     ///
     /// **稳定闸不适用于本格**（没有「连续 N 拍」可言）：一拍都读不到即返回，故读数恒 1。
     ///
@@ -1635,5 +1731,102 @@ mod tests {
             crate::inject::timing::poll_rounds(crate::inject::timing::TURN_STOP_POLL_TOTAL_MS),
             TURN_STOP_STABLE_FRAMES
         );
+    }
+
+    // ==== C0-④ L14：插队回执诚实化（确认面不可达 → 中性 submitted，非 delivered）====
+    //
+    // 根因形态：非 Windows 执行臂旧口径 `Ok(())` 无条件成功（注释写「无 drain 可等，
+    // 直接 Sent 保持既有行为」）——端点据此回 delivered，而键是否被 TUI 消费**从未
+    // 被验证**（macOS 无排空/屏读 API 可查）。spec 风险 13 / C0 ① 裁决：确认面不可达
+    // 时报中性 `submitted` 不报 `delivered`。判定收口为 os 参数化纯核（同
+    // `direct_confirm_fail_copy` / `triage_screen_recovery` 先例）——执行臂
+    // `#[cfg(not(windows))]` 在 Windows 门禁里测不到，纯核使全表任一平台可钉。
+
+    /// **L14 核心断言（本任务即「翻转语义」）**：确认面不可达（非 Windows 无排空/屏读
+    /// API = macOS 形态）→ 插队回执**不得**是 `Confirmed`（端点 delivered），必须是中性
+    /// [`DirectReceipt::Submitted`]（已投递未确认）——比照 codex 诚实失败范式。
+    ///
+    /// 还原动作（变异）：把 [`triage_jump_receipt`] 的 `NoConfirmFace` 格改回
+    /// `Confirmed`，或删掉确认面守门 → 本测试先红（红格即旧口径的 macOS 假成功）。
+    #[test]
+    fn macos_unverifiable_jump_reports_submitted_not_delivered() {
+        // 执行侧缝：非 Windows 臂的唯一产出 = `NoConfirmFace`，os = 本机 OS
+        let r = super::triage_jump_receipt(super::JumpDrainProbe::NoConfirmFace, "macos");
+        assert_eq!(
+            r,
+            DirectReceipt::Submitted,
+            "L14：确认面不可达 → 中性 submitted（已投递未确认）"
+        );
+        // 互斥态锁（防有人把本格折回「投了就报送达」的旧口径）
+        assert_ne!(
+            r,
+            DirectReceipt::Confirmed,
+            "**不得**冒充确认送达——旧口径的 macOS 假成功正是本任务要根修的形态"
+        );
+        assert!(
+            !matches!(r, DirectReceipt::Failed(_)),
+            "确认面不可达 ≠ 失败（Failed 会诱导重试 = 双发）：{r:?}"
+        );
+    }
+
+    /// **插队回执分诊全表（探针结局 × os，任一平台可钉）**：钉死 L14 的四条语义——
+    /// ① Windows 三格（排空成功 / 排空超时 / 排空基础设施失败）逐格保持既有口径；
+    /// ② 确认面不可达平台（macOS/Linux）**任何探针结局都不得升级为 `Confirmed`**；
+    /// ③ 排空超时（[`DELIVERY_TIMEOUT_MSG`] 防重口径）**任何平台都不得被软化成中性**
+    ///    ——超时是「目标可能仍在消费」的证据，软化即丢掉「重试前先检查终端」的指引；
+    /// ④ 平台可得性谓词（只有 Windows 有排空确认面）本身也在此钉住。
+    #[test]
+    fn jump_receipt_triage_table_pinned() {
+        use super::JumpDrainProbe::*;
+        // ④ 确认面可得性（本仓排空 API = `windows_console::wait_input_drained`，
+        //    仅 `#[cfg(windows)]` 实现）
+        assert!(
+            jump_confirm_face_available("windows"),
+            "Windows 有排空确认面"
+        );
+        assert!(
+            !jump_confirm_face_available("macos") && !jump_confirm_face_available("linux"),
+            "非 Windows 无排空/屏读确认面（本任务的分诊前提）"
+        );
+        let cases: Vec<(super::JumpDrainProbe, &str, DirectReceipt)> = vec![
+            // ① Windows 三格：既有口径逐格不动
+            (Drained, "windows", DirectReceipt::Confirmed),
+            (
+                Timeout,
+                "windows",
+                DirectReceipt::Failed(DELIVERY_TIMEOUT_MSG.to_string()),
+            ),
+            (InfraUnavailable, "windows", DirectReceipt::Confirmed),
+            // ② 确认面不可达的平台自报格（执行侧唯一产出）
+            (NoConfirmFace, "macos", DirectReceipt::Submitted),
+            (NoConfirmFace, "linux", DirectReceipt::Submitted),
+            // Windows 上不可达，但纯核不撒谎（穷尽性格）
+            (NoConfirmFace, "windows", DirectReceipt::Submitted),
+            // 守门（fail-closed）：无确认面的平台上成功类探针也不得升级为 Confirmed
+            (Drained, "macos", DirectReceipt::Submitted),
+            (Drained, "linux", DirectReceipt::Submitted),
+            (InfraUnavailable, "macos", DirectReceipt::Submitted),
+            // ③ 超时格不被平台守门软化（防重口径与平台无关）
+            (
+                Timeout,
+                "macos",
+                DirectReceipt::Failed(DELIVERY_TIMEOUT_MSG.to_string()),
+            ),
+        ];
+        for (probe, os, want) in cases {
+            assert_eq!(
+                triage_jump_receipt(probe.clone(), os),
+                want,
+                "插队回执格 ({probe:?}, {os})"
+            );
+        }
+        // ② 整列锁：macOS（确认面不可达）任何探针结局都不得报 Confirmed
+        for probe in [Drained, Timeout, InfraUnavailable, NoConfirmFace] {
+            assert_ne!(
+                triage_jump_receipt(probe.clone(), "macos"),
+                DirectReceipt::Confirmed,
+                "macOS 不得报 Confirmed：{probe:?}"
+            );
+        }
     }
 }

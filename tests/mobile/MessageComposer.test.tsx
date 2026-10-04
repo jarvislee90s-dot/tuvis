@@ -504,6 +504,31 @@ describe("MessageComposer：M9R 注入加固（P2-7 / 灰3 / P2-10）", () => {
     expect(screen.queryByTestId("queue-row-7")).toBeNull(); // 确认不在队 → 行同步移除
   });
 
+  it("jump_submitted_neutral_chip：插队回执 submitted（L14：确认面不可达平台 macOS/Linux）→ 中性「已投递未确认」chip + 行移除；不落 failed（无「可重试」＝不诱导双发）", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.send = { status: "queued", itemId: 7, position: 1 };
+    // L14：非 Windows 无排空/屏读确认面 → 后端插队回执恒 submitted（旧口径回
+    // delivered 是 macOS 假成功）。前端分支 j.status === "submitted"（kimi 排队制
+    // 同款）此前无用例覆盖——本条即该分支的锁
+    routes.jump = { status: "submitted" };
+    routes.queue = [queueItem({ id: 7, position: 2 })];
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "插队一下" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("queue-row-7");
+    fireEvent.click(screen.getByTestId("queue-jump"));
+    const chip = await screen.findByTestId("send-receipt-submitted");
+    expect(chip.textContent).toBe("已投递至终端输入，agent 空闲后处理（未确认落盘）");
+    expect(chip.textContent).not.toContain("可重试");
+    // 消息已在 TUI 手里 → 行离开 MAM 队列（不得走「复核 → gone」对账，
+    // 更不得落 failed：两者都会诱导用户重发 = 对 TUI 那份双发）
+    expect(screen.queryByTestId("queue-row-7")).toBeNull();
+    expect(screen.queryByTestId("send-receipt-failed")).toBeNull();
+    expect(screen.queryByTestId("send-receipt-gone")).toBeNull();
+  });
+
   it("retract_failure_same_reconcile：撤回网络错 → 同款队列复核 → 条目仍在 → 恢复排队视图（不落 failed 终态，可重试）", async () => {
     installFetch();
     routes.info = sendInfo();

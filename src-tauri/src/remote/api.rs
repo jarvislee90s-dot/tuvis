@@ -1557,10 +1557,11 @@ pub async fn session_queue(
 /// POST /m/api/v1/session-queue/jump（裁决 12 插队）：按 itemId 点名该会话 pending 中
 /// 的条目（可非队首）即刻投递（黄态照发）——flush_given 内核，settle 落账审计 action=jump。
 /// - 缺参 → 400；无此 pending 项 → 404 not_found；
-/// - 五态精确映射（P1-4 + D7/T3）：Sent → 200 delivered；Failed(e) → 200 failed{error}
-///   （注入失败行已退出 pending）；Submitted → 200 submitted（防御性臂：Submitted
-///   仅直发分诊产出，插队以占用排空定论，本臂实际不可达）；Deferred | Suspended →
-///   200 queued + itemId/position
+/// - 五态精确映射（P1-4 + D7/T3 + L14）：Sent → 200 delivered；Failed(e) → 200 failed{error}
+///   （注入失败行已退出 pending）；Submitted → 200 submitted（**L14 起本臂可达**：
+///   非 Windows（macOS/Linux）无排空/屏读确认面 → 插队回执恒中性 submitted，不冒充
+///   delivered〔旧口径在此回 delivered = macOS 假成功〕；Windows 上另有回合停窗尽的
+///   降级来源）；Deferred | Suspended → 200 queued + itemId/position
 ///   （行保持 pending 等会话回来/下个跃迁，语义即排队——jump 点名场景 Deferred 的黄态
 ///   臂实际不可达〔jump 跳过黄态复核〕，守卫忙让位与会话消失〔Suspended〕亦按 queued）；
 /// - in-flight 守卫忙 → 200 queued{itemId,position}（**回执契约变化，F1 裁决**：旧忙时
@@ -1633,8 +1634,8 @@ pub async fn session_queue_jump(
         crate::inject::queue::FlushOutcome::Sent => {
             json_no_store(StatusCode::OK, serde_json::json!({ "status": "delivered" }))
         }
-        // D7/T3：Submitted 仅直发确认分诊产出（插队以占用排空定论，本臂实际不可达，
-        // 为穷尽性保留）——防御性回中性 submitted，不冒充 delivered 也不冒充 failed
+        // D7/T3 + L14：已投递未确认（非 Windows 无确认面 → 插队恒本态；Windows 上
+        // 另有回合停窗尽降级）——中性回执，不冒充 delivered 也不冒充 failed
         crate::inject::queue::FlushOutcome::Submitted => {
             json_no_store(StatusCode::OK, serde_json::json!({ "status": "submitted" }))
         }
