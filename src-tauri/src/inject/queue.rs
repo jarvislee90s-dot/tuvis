@@ -108,6 +108,13 @@ pub enum FlushOutcome {
     /// 「未投递」前缀，回执文案由端点统一拼接——单一措辞出口）。
     /// **不自动清空输入行**（claude 清空键未实测，spec §5 保守中止），请用户人工确认。
     NotDelivered(String),
+    /// **靶向歧义拒绝**（L13，C0-③）：同 agent + 同 cwd 多实例使卡片 pid 不可信
+    /// （解析器按 cwd 启发式配对，可交叉），且无独立 TTY 证据可消歧 → **零注入**（不猜，
+    /// 判据见 [`crate::window::tty_map`]）。行 mark_failed 退出 pending、审计
+    /// **action=fail result=ambiguous_target**（机器可读原因码，与通道故障 `failed:e`、
+    /// 撤回防护 `aborted:` 分列——这是**拒绝**，不是通道故障）；载荷 = 候选数，
+    /// 回执文案 = [`crate::window::tty_map::ambiguous_target_error`]（plan 定形）。
+    AmbiguousTarget(usize),
     /// 快照中无此会话（红·中断挂起，W2）：不消费不落账
     Suspended,
     /// 仍在运行且非插队：不消费不落账（等下个可输入态事件）。[`flush_one`] 无
@@ -159,7 +166,7 @@ pub(crate) fn try_flush_with(
 ) -> FlushOutcome {
     // 会话 id 只在工具内唯一（watcher/dedup 同口径）：必须按 (tool, id) 复合匹配，
     // 跨工具撞 id 时裸 id 匹配会向错误会话的 pid 注入
-    let Some(session) = (st.session_source)()
+    let Some(mut session) = (st.session_source)()
         .sessions
         .into_iter()
         .find(|s| s.id == item.session_id && s.agent_type.tool_id() == item.agent_type)
@@ -168,6 +175,40 @@ pub(crate) fn try_flush_with(
     };
     if is_running(&session.status) && !jump {
         return FlushOutcome::Deferred;
+    }
+    // ===== L13 靶向闸（C0-③）：同 cwd 多实例 = 卡片 pid 不可信 =====
+    //
+    // 位置两处讲究：
+    // - 在「仍在运行 → Deferred」**之后**：黄态条目保持排队（不因歧义提前消费），
+    //   真正要注入的那一刻才判定；
+    // - 在所有注入/按键**之前**：拒绝必须**零副作用**（不猜 = 不多打一个字）。
+    //
+    // 判定内核 = [`crate::window::tty_map::resolve_session_target`]——**所有注入路径共用同一
+    // 入口**（本漏斗 + approve/reject / question / mode menu / mode switch 端点的按键与
+    // 菜单路）。为什么缺口在写侧而不在终端层：终端层已是 TTY 精确匹配（给定正确 pid 必
+    // 落该窗口——`window/tty_map` 模块文档有完整根因链），乱窜源于**卡片 pid 是「进程名 +
+    // cwd」启发式配对的产物**（claude 同 cwd 桶内下标配对 / codex 同 cwd 首个未占用
+    // 文件），同 cwd 多实例时配对可交叉，写侧原样信任它。候选集由进程扫描直接给出
+    // （同工具 + 同 cwd 活动进程，不经解析器配对），故与卡片 pid 是否交叉无关：
+    // - 无候选 / 唯一候选 → 放行（无歧义可消，含 Windows「TTY 采不到」的正常单窗场景）；
+    // - ≥2 且无独立 TTY 证据 → 拒绝（[`FlushOutcome::AmbiguousTarget`]：报错 + 审计）；
+    // - ≥2 且 TTY 精确命中唯一候选 → 以**证据指明的 pid** 为注入目标（正向证据才改道）。
+    let evidence =
+        (st.target_evidence)(session.agent_type.tool_id(), session.project_path.as_str());
+    if let Err(crate::window::tty_map::AmbiguousTarget(n)) =
+        crate::window::tty_map::resolve_session_target(
+            &mut session,
+            &evidence,
+            std::env::consts::OS,
+        )
+    {
+        log::warn!(
+            "L13 靶向闸拒绝：同目录 {n} 个候选会话，无法确定投递目标（会话 {}，pid {}，cwd {}）",
+            item.session_id,
+            session.pid,
+            session.project_path
+        );
+        return FlushOutcome::AmbiguousTarget(n);
     }
     let spec = crate::inject::families::family_for(&item.agent_type)
         .unwrap_or(crate::inject::families::FALLBACK_SPEC);
@@ -554,6 +595,17 @@ pub(crate) fn settle(
             );
             Err(format!("未投递：{reason}，请人工确认"))
         }
+        FlushOutcome::AmbiguousTarget(n) => {
+            // L13 靶向歧义拒绝落账（C0-③）：**零注入**（不猜），行 mark_failed 退出
+            // pending（不静默重投——重试由用户显式发起：关掉多余窗口再发）。
+            // 审计 action=fail result=ambiguous_target（机器可读原因码；与通道故障
+            // failed:e 分列——拒绝不是通道故障）；Err 载荷 = plan 定形文案（端点
+            // failed 回执数据源，单一措辞出口）
+            let msg = crate::window::tty_map::ambiguous_target_error(n);
+            inject_queue::mark_failed_conn(conn, item.id, &msg);
+            audit(conn, "fail", "ambiguous_target");
+            Err(msg)
+        }
     }
 }
 
@@ -717,6 +769,12 @@ pub(crate) fn reconcile_once(state: &std::sync::Arc<crate::remote::server::Remot
         match flush_one(state, &sid, false) {
             FlushOutcome::Sent => {}
             FlushOutcome::Failed(e) => log::warn!("对账补投失败（会话 {sid}）: {e}"),
+            // L13 靶向歧义拒绝：settle 已按 fail/ambiguous_target 落账——warn 留痕
+            //（对账路径同样受闸保护：不因是后台补投就放松「不猜」纪律）
+            FlushOutcome::AmbiguousTarget(n) => log::warn!(
+                "对账补投遇靶向歧义拒绝（会话 {sid}，{n} 个候选）：{}",
+                crate::window::tty_map::ambiguous_target_error(n)
+            ),
             // Submitted（D7/T3）：已投递未确认，settle 已按 unconfirmed 落账——
             // 非失败静默；Deferred/Suspended：不消费不落账——静默；
             // NotDelivered（E1① 撤回防护中止）：settle 已按 aborted 落账——静默
@@ -910,6 +968,12 @@ pub fn spawn_flush_loop(state: std::sync::Arc<crate::remote::server::RemoteState
                                     Ok(FlushOutcome::Failed(e)) => {
                                         log::warn!("flush 投递失败（会话 {sid}）: {e}")
                                     }
+                                    // L13 靶向歧义拒绝：settle 已按 fail/ambiguous_target
+                                    // 落账——warn 留痕（行已 mark_failed，不重投）
+                                    Ok(FlushOutcome::AmbiguousTarget(n)) => log::warn!(
+                                        "flush 遇靶向歧义拒绝（会话 {sid}，{n} 个候选）：{}",
+                                        crate::window::tty_map::ambiguous_target_error(n)
+                                    ),
                                     Ok(FlushOutcome::Deferred | FlushOutcome::Suspended) => {}
                                     // E1① 撤回防护中止：settle 已按 aborted 落账——常规
                                     // 路径（jump=false）本不产出本态，穷尽性防御臂（warn
@@ -1107,6 +1171,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: Box::new(|_, _| crate::window::tty_map::TargetEvidence::default()),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
@@ -1153,6 +1218,33 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::database::schema::init(&conn);
         conn
+    }
+
+    /// L13 合成靶向证据：`pids` 个同 cwd 候选进程（cwd = 夹具 project_path `/tmp/proj`）
+    fn evidence_in_cwd(pids: &[u32]) -> crate::window::tty_map::TargetEvidence {
+        crate::window::tty_map::TargetEvidence {
+            processes: pids
+                .iter()
+                .map(|pid| crate::adapter::AgentProcess {
+                    pid: *pid,
+                    cpu_usage: 0.0,
+                    cwd: Some(std::path::PathBuf::from("/tmp/proj")),
+                    exe: None,
+                    form: crate::session::ProcessForm::Cli,
+                })
+                .collect(),
+            candidate_ttys: Vec::new(),
+            session_tty: None,
+        }
+    }
+
+    /// L13 测试用：覆盖 state 的靶向证据源（建造器返回值引用计数为 1 → `Arc::get_mut`）
+    fn with_target_evidence(
+        mut st: crate::remote::server::RemoteState,
+        evidence: crate::window::tty_map::TargetEvidence,
+    ) -> crate::remote::server::RemoteState {
+        st.target_evidence = Box::new(move |_, _| evidence.clone());
+        st
     }
 
     fn enq(conn: &rusqlite::Connection, sid: &str, content: &str) -> i64 {
@@ -1318,6 +1410,121 @@ mod tests {
             inject_queue::next_pending_conn(&c, "s-wait").is_none(),
             "失败行退出 pending（下一跃迁不再重试同一行）"
         );
+    }
+
+    // ==== L13 靶向消歧闸（C0-③）：拒绝落账 + 闸接线（零注入、可改道） ====
+
+    /// 拒绝落账：mark_failed + 审计 action=fail result=ambiguous_target（机器可读原因码，
+    /// 与通道故障 failed:e 分列）+ settle 返回 plan 定形文案（端点失败回执数据源）；
+    /// **零注入副作用**（无 sent_at、行退出 pending——不静默重投）
+    #[test]
+    fn ambiguous_target_settle_audits_and_marks_failed() {
+        let c = mem();
+        enq(&c, "s-amb", "歧义消息");
+        let st = state_with(
+            vec![sess("s-amb", SessionStatus::Waiting, 7)],
+            FakeInjector::ok(),
+        );
+        let item = inject_queue::next_pending_conn(&c, "s-amb").unwrap();
+        let msg = crate::window::tty_map::ambiguous_target_error(3);
+
+        let err = settle(&c, &st, &item, false, FlushOutcome::AmbiguousTarget(3))
+            .expect_err("拒绝必须返回 Err（端点 failed 回执数据源）");
+        assert_eq!(err, msg, "回执文案 = plan 定形（同目录存在 N 个候选会话…）");
+        let row = inject_queue::get_conn(&c, item.id).unwrap();
+        assert_eq!(row.failed_reason.as_deref(), Some(msg.as_str()));
+        assert_eq!(row.sent_at, None, "拒绝 = 零注入：不得落 sent_at");
+        let audits = write_audit::recent_conn(&c, 10);
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "fail");
+        assert_eq!(
+            audits[0].result, "ambiguous_target",
+            "审计原因码单列（区别于通道故障 failed:e / 撤回防护 aborted:）"
+        );
+        assert!(
+            inject_queue::next_pending_conn(&c, "s-amb").is_none(),
+            "拒绝行退出 pending（不静默重投；重试由用户显式发起）"
+        );
+    }
+
+    /// **真靶向闸**（生产同一代码路径：真 `candidates_in_cwd` + 真 `decide_target`；
+    /// 只把**证据换成合成表**——单测无法构造「同工具同 cwd 多实例」的真进程集合）：
+    /// 多候选 + 无 TTY 证据 → **注入前**即拒绝，fake 注入器零文本零按键，行落 failed
+    /// + 审计 ambiguous_target（端到端 flush 路径，非仅纯核）。
+    #[test]
+    fn ambiguous_gate_refuses_before_any_injection() {
+        let fake = FakeInjector::ok();
+        // 卡片 pid 7 与合成兄弟 8 同 cwd（夹具 project_path = /tmp/proj）
+        let st = with_target_evidence(
+            state_with(
+                vec![sess("s-amb2", SessionStatus::Waiting, 7)],
+                fake.clone(),
+            ),
+            evidence_in_cwd(&[7, 8, 9]),
+        );
+        let item_id = st.store.with(|c| enq(c, "s-amb2", "不该注入的消息"));
+        let item = st
+            .store
+            .with(|c| inject_queue::next_pending_conn(c, "s-amb2").unwrap());
+
+        let outcome = try_flush(&st, &item, false);
+        assert_eq!(
+            outcome,
+            FlushOutcome::AmbiguousTarget(3),
+            "三候选 → 真闸拒绝（载荷 = 候选数）"
+        );
+        assert!(fake.recorded().is_empty(), "拒绝必须零注入（不猜）");
+        assert!(fake.ops().is_empty(), "零副作用：连按键都不得发");
+
+        let settled = st
+            .store
+            .with(|c| settle(c, &st, &item, false, outcome.clone()));
+        assert!(settled.is_err(), "落账返回 Err（回执数据源）");
+        let row = st
+            .store
+            .with(|c| inject_queue::get_conn(c, item_id).unwrap());
+        assert_eq!(row.sent_at, None, "零注入：不得落 sent_at");
+        assert_eq!(
+            row.failed_reason.as_deref(),
+            Some(crate::window::tty_map::ambiguous_target_error(3).as_str())
+        );
+        let audits = st.store.with(|c| write_audit::recent_conn(c, 10));
+        assert_eq!(audits[0].action, "fail");
+        assert_eq!(audits[0].result, "ambiguous_target");
+    }
+
+    /// 闸放行臂（真闸 + 唯一候选证据）：照常投递，注入目标 = 卡片 pid（不改道）
+    #[test]
+    fn single_candidate_evidence_allows_flush_unchanged() {
+        let fake = FakeInjector::ok();
+        let st = with_target_evidence(
+            state_with(vec![sess("s-one", SessionStatus::Waiting, 7)], fake.clone()),
+            evidence_in_cwd(&[7]),
+        );
+        st.store.with(|c| enq(c, "s-one", "单候选消息"));
+
+        assert_eq!(
+            flush_one(&st, "s-one", false),
+            FlushOutcome::Sent,
+            "唯一候选 → 放行（TTY 有无不影响）"
+        );
+        assert_eq!(fake.recorded(), vec![(7u32, "单候选消息".to_string())]);
+    }
+
+    /// 回归锁：**真闸 + 生产证据源**（真进程扫描）在「同 cwd 无多候选」时不得误拒——
+    /// 单候选/无候选照常投递（否则全平台注入瘫痪；本用例的假会话 cwd 无同工具进程）
+    #[test]
+    fn production_gate_allows_unambiguous_flush() {
+        let fake = FakeInjector::ok();
+        let st = state_with(vec![sess("s-ok", SessionStatus::Waiting, 7)], fake.clone());
+        st.store.with(|c| enq(c, "s-ok", "正常消息"));
+
+        assert_eq!(
+            flush_one(&st, "s-ok", false),
+            FlushOutcome::Sent,
+            "无同 cwd 多候选 → 真闸放行（候选 0/1 不拒绝）"
+        );
+        assert_eq!(fake.recorded(), vec![(7u32, "正常消息".to_string())]);
     }
 
     /// 审计摘要走 W5 截断口径（只存摘要防审计库膨胀）

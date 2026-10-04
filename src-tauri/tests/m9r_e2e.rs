@@ -1028,6 +1028,10 @@ async fn e2e_http_full_chain() {
         ui_config_source: Box::new(|| None),
         subagent_source: std::collections::HashMap::new(),
         subagent_message_source: std::collections::HashMap::new(),
+        // L13 靶向证据缝：空证据 = 无候选 → 靶向无歧义（本套件不构造同 cwd 多实例）
+        target_evidence: Box::new(|_, _| {
+            multi_agents_manager_lib::window::tty_map::TargetEvidence::default()
+        }),
         capability_table: multi_agents_manager_lib::inject::capability::new_table(),
         session_source: Box::new(
             move || multi_agents_manager_lib::session::SessionsResponse {

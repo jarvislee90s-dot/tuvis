@@ -11,6 +11,7 @@ mod iterm;
 mod terminal_app;
 #[cfg(target_os = "macos")]
 pub(crate) mod tmux;
+pub mod tty_map;
 #[cfg(windows)]
 pub mod win32;
 

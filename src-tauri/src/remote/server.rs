@@ -580,6 +580,15 @@ pub struct RemoteState {
     /// pid 锚定缝、工具安装探测缝、步距睡眠缝。布局说明与各缝语义见
     /// [`CreateTaskHub`] 文档；测试装配 `CreateTaskHub::stub()`。
     pub create_hub: std::sync::Arc<CreateTaskHub>,
+    /// **靶向证据源**（L13，C0-③）：`(工具 id, 会话 cwd) -> 靶向证据`（候选进程表 +
+    /// 候选 TTY 表 + 会话级 TTY 证据）。生产 = `window::tty_map::tool_target_evidence`
+    /// （共享进程快照 + adapter 进程发现 + macOS TTY 采数 + 恒 None 的会话级证据）；
+    /// 测试注入合成证据（零真实进程 / 零窗口）。
+    /// **消费方 = 写侧全部注入路径的唯一靶向入口**
+    /// `window::tty_map::resolve_session_target`（send 漏斗 `inject::queue` +
+    /// approve/reject、question、mode menu、mode switch 端点）：缝只收「目标是谁」的
+    /// 输入，判定在内核——避免把判定逻辑复制到各端点。
+    pub target_evidence: Box<crate::window::tty_map::TargetEvidenceFn>,
     /// 敏感黑名单主目录基准注入缝（M5 P2-a 追记）：生产 = `dirs::home_dir()`；
     /// 测试注入 tempdir home（零接触真实主目录）。**端点必须消费它**——
     /// 3d22e2e 曾传 None 使 ~/.ssh 等黑名单整段失效（单元测试全绿而生产裸奔）
@@ -773,11 +782,48 @@ mod tests {
     // M4 T0a（编译硬阻断补 import，先例同上）：SSE 流逐帧消费需要 StreamExt::next
     use futures::StreamExt as _;
 
+    /// L13 靶向证据桩（缺省）：空证据 = 无候选进程 → 靶向无歧义 → 放行（与修复前行为
+    /// 一致）。需要「≥2 候选 ⇒ 拒绝」的用例用 [`with_target_evidence`] 覆盖。
+    fn no_target_evidence() -> Box<crate::window::tty_map::TargetEvidenceFn> {
+        Box::new(|_, _| crate::window::tty_map::TargetEvidence::default())
+    }
+
+    /// L13 测试用：覆盖 state 的靶向证据源（建造器刚返回的 `Arc` 引用计数为 1 →
+    /// `Arc::get_mut` 可取可变引用；一经共享即 panic，不会静默改到别人头上）。
+    fn with_target_evidence(
+        mut state: Arc<RemoteState>,
+        evidence: crate::window::tty_map::TargetEvidence,
+    ) -> Arc<RemoteState> {
+        Arc::get_mut(&mut state)
+            .expect("state 尚未共享（建造器返回值立即覆盖）")
+            .target_evidence = Box::new(move |_, _| evidence.clone());
+        state
+    }
+
+    /// L13 合成证据：`pids` 个同 cwd 候选进程（cwd = 会话夹具的 `project_path`）
+    fn target_evidence_in_cwd(cwd: &str, pids: &[u32]) -> crate::window::tty_map::TargetEvidence {
+        crate::window::tty_map::TargetEvidence {
+            processes: pids
+                .iter()
+                .map(|pid| crate::adapter::AgentProcess {
+                    pid: *pid,
+                    cpu_usage: 0.0,
+                    cwd: Some(std::path::PathBuf::from(cwd)),
+                    exe: None,
+                    form: crate::session::ProcessForm::Cli,
+                })
+                .collect(),
+            candidate_ttys: Vec::new(),
+            session_tty: None,
+        }
+    }
+
     fn test_state() -> Arc<RemoteState> {
         Arc::new(RemoteState {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(|| crate::session::SessionsResponse {
                 sessions: vec![],
@@ -1425,6 +1471,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(|| {
                 std::thread::sleep(std::time::Duration::from_millis(300));
@@ -1819,6 +1866,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(|| crate::session::SessionsResponse {
                 sessions: vec![],
@@ -1931,6 +1979,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(|| crate::session::SessionsResponse {
                 sessions: vec![],
@@ -2153,6 +2202,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
@@ -2454,6 +2504,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
@@ -2637,6 +2688,7 @@ mod tests {
                 ui_config_source: Box::new(|| None),
                 subagent_source: std::collections::HashMap::new(),
                 subagent_message_source: std::collections::HashMap::new(),
+                target_evidence: no_target_evidence(),
                 capability_table: crate::inject::capability::new_table(),
                 session_source: Box::new(|| crate::session::SessionsResponse {
                     sessions: vec![],
@@ -3851,6 +3903,7 @@ mod tests {
                     ui_config_source: Box::new(|| None),
                     subagent_source: std::collections::HashMap::new(),
                     subagent_message_source: std::collections::HashMap::new(),
+                    target_evidence: no_target_evidence(),
                     capability_table: crate::inject::capability::new_table(),
                     session_source: Box::new(|| crate::session::SessionsResponse {
                         sessions: vec![],
@@ -4099,8 +4152,9 @@ mod tests {
     /// Task 6 专用夹具会话（sess_a Waiting / sess_b Processing / sess_c workbuddy
     /// 黑盒 / sess_d zcode headless / sess_e Waiting 供失败回执测试与直发测试错开会话 /
     /// sess_f Processing 备用 / sess_i Waiting 独占——busy 直发测试专用 / sess_t3
-    /// Waiting 独占——D7/T3 直发未确认端点测试专用）+ 指定注入器；其余缝与
-    /// test_state 同口径（内存库，零接触真实 ~/.tuvis）。
+    /// Waiting 独占——D7/T3 直发未确认端点测试专用；另三例 sess_send_ready、
+    /// sess_send_qof、sess_send_slash 独占——send 族真投递用例专用，守卫 id 立规。
+    /// 另加指定注入器；其余缝与 test_state 同口径（内存库，零接触真实 ~/.tuvis）。
     /// **守卫 id 立规（复检裁决，全测试集适用）**：①守卫持到测尾（或长窗口占用）的
     /// 测试必须占**全测试集唯一** id；②两个夹具不得共享同一 id 字符串——INFLIGHT
     /// 按裸 id 字符串全局占用，跨夹具撞 id 即跨夹具串键（sess_h 曾被本夹具 busy
@@ -4191,11 +4245,37 @@ mod tests {
                     crate::session::SessionStatus::Waiting,
                 )
             },
+            // ===== send 族真投递用例独占会话（守卫 id 立规①/②，2026-10-05 复检）=====
+            // 三例（send_delivers_when_input_ready / send_queue_only_false_keeps_direct_delivery
+            // / slash_message_bare_injects_and_audits_slash）原先共用 `sess_a`：INFLIGHT 按
+            // 裸 id 全局占用 → 并行跑时互抢守卫，先到者持守卫，后到者收到 queued
+            // （Deferred）假红——实测（warm 全量 `cargo test --lib`）：基线 1/6 假红，
+            // 测试集增删带来的调度漂移会把假红推成必发；skip 对照（仅跳过这三例）6/6 绿，
+            // 各占唯一 id 后同样 6/6 绿。`sess_a` 保留给其余用例（GET 面 / 纯入队路径）。
+            inj_sess(
+                "sess_send_ready",
+                crate::session::AgentType::Claude,
+                31,
+                crate::session::SessionStatus::Waiting,
+            ),
+            inj_sess(
+                "sess_send_qof",
+                crate::session::AgentType::Claude,
+                32,
+                crate::session::SessionStatus::Waiting,
+            ),
+            inj_sess(
+                "sess_send_slash",
+                crate::session::AgentType::Claude,
+                33,
+                crate::session::SessionStatus::Waiting,
+            ),
         ];
         Arc::new(RemoteState {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
@@ -4427,11 +4507,37 @@ mod tests {
                 24,
                 crate::session::SessionStatus::Waiting,
             ),
+            // ===== L13 靶向闸用例独占会话（守卫 id 立规①/②，2026-10-05 复审补口）=====
+            // 批准/拒绝两条真投递用例各占唯一 id：与 approve_sends_key(sess_h) /
+            // approve_reject_audits_reject(sess_g) 错开——INFLIGHT 按裸 id 全局占用，
+            // 撞 id 会让对方收到「投递进行中」假红（本批实测：并行跑即红）。
+            // last_message 与 sess_a/sess_h 同源（detect 命中，映射键位才下发）
+            {
+                let mut s = inj_sess(
+                    "sess_l13ap",
+                    crate::session::AgentType::Claude,
+                    81,
+                    crate::session::SessionStatus::Waiting,
+                );
+                s.last_message = sess_a_last.map(str::to_string);
+                s
+            },
+            {
+                let mut s = inj_sess(
+                    "sess_l13rj",
+                    crate::session::AgentType::Claude,
+                    82,
+                    crate::session::SessionStatus::Waiting,
+                );
+                s.last_message = sess_a_last.map(str::to_string);
+                s
+            },
         ];
         Arc::new(RemoteState {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
@@ -4535,7 +4641,7 @@ mod tests {
                 "POST",
                 "/m/api/v1/session-send",
                 Some("mam_device=mm"),
-                Some(r#"{"sessionId":"sess_a","text":"你好\n继续"}"#),
+                Some(r#"{"sessionId":"sess_send_ready","text":"你好\n继续"}"#),
             ))
             .await
             .unwrap();
@@ -4552,12 +4658,12 @@ mod tests {
             body.contains("\"status\":\"delivered\""),
             "可输入态直发应 delivered：{body}"
         );
-        // 注入器收到 (pid=11, "你好\n继续")——真实换行归一为字面 \n（裁决 6）。
+        // 注入器收到 (pid=31, "你好\n继续")——真实换行归一为字面 \n（裁决 6）。
         // 签名默认关（2026-10-05 用户裁决，KV 未设 = off）→ 裸正文；开关开的形态
         // 由 send_composes_signature_when_setting_on 专测覆盖
         assert_eq!(
             fake.recorded(),
-            vec![(11u32, "你好\\n继续".to_string())],
+            vec![(31u32, "你好\\n继续".to_string())],
             "直发必须携带归一正文（签名默认关=裸注入）"
         );
         // 审计：最新一条 action=send result=ok channel=fake
@@ -4569,13 +4675,13 @@ mod tests {
         assert_eq!(audits[0].action, "send");
         assert_eq!(audits[0].result, "ok");
         assert_eq!(audits[0].channel, "fake");
-        assert_eq!(audits[0].session_id, "sess_a");
+        assert_eq!(audits[0].session_id, "sess_send_ready");
         assert_eq!(audits[0].device_name, "测试设备");
         // 队列无残留（直发行 mark_sent 退出 pending）
         let r = app
             .oneshot(req(
                 "GET",
-                "/m/api/v1/session-queue?session_id=sess_a",
+                "/m/api/v1/session-queue?session_id=sess_send_ready",
                 Some("mam_device=mm"),
                 None,
             ))
@@ -4928,18 +5034,19 @@ mod tests {
                 "POST",
                 "/m/api/v1/session-send",
                 Some("mam_device=mm"),
-                Some(r#"{"sessionId":"sess_a","text":"普通发送","queueOnly":false}"#),
+                Some(r#"{"sessionId":"sess_send_qof","text":"普通发送","queueOnly":false}"#),
             ))
             .await
             .unwrap();
         assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
         assert!(
-            body_string(r).await.contains("\"status\":\"delivered\""),
-            "queueOnly=false 可输入态照旧直发"
+            body.contains("\"status\":\"delivered\""),
+            "queueOnly=false 可输入态照旧直发：{body}"
         );
         assert_eq!(
             fake.recorded(),
-            vec![(11u32, "普通发送".to_string())],
+            vec![(32u32, "普通发送".to_string())],
             "queueOnly=false 直发行为不得漂移"
         );
     }
@@ -4964,7 +5071,7 @@ mod tests {
                 "POST",
                 "/m/api/v1/session-send",
                 Some("mam_device=mm"),
-                Some(r#"{"sessionId":"sess_a","text":"/permissions"}"#),
+                Some(r#"{"sessionId":"sess_send_slash","text":"/permissions"}"#),
             ))
             .await
             .unwrap();
@@ -4973,7 +5080,7 @@ mod tests {
         assert!(body.contains("\"status\":\"delivered\""), "{body}");
         assert_eq!(
             fake.recorded(),
-            vec![(11u32, "/permissions".to_string())],
+            vec![(33u32, "/permissions".to_string())],
             "斜杠命令必须裸注入（不加签名——签名会破坏命令解析）"
         );
         let audits = state
@@ -4989,7 +5096,7 @@ mod tests {
             audits[0].device_name, "测试设备",
             "slash 的溯源靠设备名在账"
         );
-        assert_eq!(audits[0].session_id, "sess_a");
+        assert_eq!(audits[0].session_id, "sess_send_slash");
         assert_eq!(
             audits[0].summary, "/permissions",
             "摘要即裸命令原文（无签名可读）"
@@ -6418,6 +6525,17 @@ mod tests {
                 60,
                 crate::session::SessionStatus::Waiting,
             ),
+            // ===== L13 靶向闸用例独占会话（守卫 id 立规①/②，2026-10-05 复审补口）=====
+            // 问答作答两条真投递用例各占唯一 id（与 question_answer_select_sends_digit
+            // 的 sess_v 错开——INFLIGHT 按裸 id 全局占用，撞 id 即假红）
+            sess("sess_l13q", 81, crate::session::SessionStatus::Waiting),
+            sess("sess_l13r", 82, crate::session::SessionStatus::Waiting),
+            // **sess_ad 家族收敛（复审 item 6b）**：`sess_ad` 原被两条真投递用例共用
+            // （advance→next / submit），默认并行度下 `cargo test --lib
+            // remote::server::tests` 必红（复现 3/3，父提交同样如此）。两条各占唯一 id；
+            // `sess_ad` 留给不注入的审批标记隔离用例（question_endpoints_blocked_by_*）
+            sess("sess_l13s", 83, crate::session::SessionStatus::Waiting),
+            sess("sess_l13t", 84, crate::session::SessionStatus::Waiting),
             // ===== 丁T2 计划双卡族（问题 3/4）：sess_as..sess_ax =====
             // 全测试集唯一 id（守卫 id 立规）。**kimi** 四例（sess_au..sess_ax）与
             // **codex** 两例（sess_as/sess_at）：计划预期态是 codex/kimi 的计划确认
@@ -6604,6 +6722,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
@@ -7642,6 +7761,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
@@ -10776,6 +10896,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
@@ -11898,6 +12019,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
@@ -12179,6 +12301,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: {
                 let s = codex_sess.clone();
@@ -12670,6 +12793,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
@@ -12725,6 +12849,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
@@ -12810,6 +12935,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: no_target_evidence(),
             capability_table: crate::inject::capability::new_table(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: vec![session.clone()],
@@ -15390,5 +15516,329 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 403);
+    }
+
+    // ==== L13 靶向闸：**注入端点全覆盖**（C0-③ 复审补口）====
+    //
+    // 消息投递漏斗（inject::queue）之外，还有四条端点路径直接拿卡片 pid 按键/打字：
+    // approve/reject、question answer、mode switch、mode menu。四条都改走同一靶向入口
+    // [`crate::window::tty_map::resolve_session_target`]，本组用例逐条钉「≥2 候选 ⇒
+    // 零注入拒绝 + 审计 ambiguous_target」与「恰 1 候选 ⇒ 行为不变」。
+    // 证据经 `RemoteState.target_evidence` 缝注入（合成同 cwd 候选进程——单测不起真进程）。
+
+    /// 合成证据的 cwd 与会话夹具一致（`inj_sess` 的 `project_path`）
+    const FIXTURE_CWD: &str = "/tmp/proj";
+
+    /// 审批（批准）：≥2 候选 → 200 failed{plan 文案} + **零按键** + 审计
+    /// `approve/ambiguous_target`（回执契约与本端点既有失败臂同形）
+    #[tokio::test]
+    async fn approve_refuses_when_target_ambiguous() {
+        let fake = FakeInjector::ok();
+        let state = with_target_evidence(
+            approve_state(fake.clone(), Some(APPROVE_HIT_MSG)),
+            target_evidence_in_cwd(FIXTURE_CWD, &[81, 19]),
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-approve",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_l13ap","optionId":"approve"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            body.contains(&crate::window::tty_map::ambiguous_target_error(2)),
+            "拒绝文案 = plan 定形：{body}"
+        );
+        assert!(body.contains("\"status\":\"failed\""), "{body}");
+        assert!(fake.recorded_keys().is_empty(), "拒绝必须零按键（不猜）");
+        assert!(fake.recorded().is_empty(), "拒绝必须零文本注入");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "approve");
+        assert_eq!(audits[0].result, "ambiguous_target");
+        assert_eq!(audits[0].session_id, "sess_l13ap");
+    }
+
+    /// 审批（拒绝）：同上——action 词表沿 optionId 记 `reject`
+    #[tokio::test]
+    async fn reject_refuses_when_target_ambiguous() {
+        let fake = FakeInjector::ok();
+        let state = with_target_evidence(
+            approve_state(fake.clone(), Some(APPROVE_HIT_MSG)),
+            target_evidence_in_cwd(FIXTURE_CWD, &[82, 19]),
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-approve",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_l13rj","optionId":"reject"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            body.contains(&crate::window::tty_map::ambiguous_target_error(2)),
+            "{body}"
+        );
+        assert!(fake.recorded_keys().is_empty(), "拒绝必须零按键（不猜）");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits[0].action, "reject");
+        assert_eq!(audits[0].result, "ambiguous_target");
+    }
+
+    /// 审批对照（恰 1 候选 ⇒ 行为不变）：照常发映射键 + 审计 ok
+    #[tokio::test]
+    async fn approve_allows_with_single_candidate() {
+        let fake = FakeInjector::ok();
+        let state = with_target_evidence(
+            approve_state(fake.clone(), Some(APPROVE_HIT_MSG)),
+            target_evidence_in_cwd(FIXTURE_CWD, &[81]),
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-approve",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_l13ap","optionId":"approve"}"#),
+            ))
+            .await
+            .unwrap();
+        let body = body_string(r).await;
+        assert!(body.contains("\"status\":\"key_sent\""), "{body}");
+        assert_eq!(fake.recorded_keys(), vec![(81u32, "1".to_string())]);
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits[0].result, "ok", "单候选路径零漂移");
+    }
+
+    /// 问答作答（单选 select）：≥2 候选 → 200 failed{plan 文案} + 零按键 + 审计
+    /// `answer/ambiguous_target`
+    #[tokio::test]
+    async fn question_answer_refuses_when_target_ambiguous() {
+        let (state, fake, _script) = stage_rig(vec![], false);
+        let state = with_target_evidence(state, target_evidence_in_cwd(FIXTURE_CWD, &[81, 82]));
+        mark_question(&state, "claude", "sess_l13q", Q_SINGLE_PAYLOAD);
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-question/answer",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_l13q","action":"select","index":1}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            body.contains(&crate::window::tty_map::ambiguous_target_error(2)),
+            "{body}"
+        );
+        assert!(body.contains("\"status\":\"failed\""), "{body}");
+        assert!(fake.recorded_keys().is_empty(), "拒绝必须零按键（不猜）");
+        assert!(fake.recorded().is_empty(), "拒绝必须零文本注入");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "answer");
+        assert_eq!(audits[0].result, "ambiguous_target");
+        assert_eq!(audits[0].summary, "select#2", "摘要沿既有动作标签");
+    }
+
+    /// 问答作答对照（恰 1 候选 ⇒ 行为不变）：照常发数字键 + 审计 ok
+    #[tokio::test]
+    async fn question_answer_allows_with_single_candidate() {
+        let (state, fake, _script) = stage_rig(
+            vec![
+                screen_fixtures::multi_option_focus(),
+                screen_fixtures::multi_option_focus(),
+            ],
+            false,
+        );
+        let state = with_target_evidence(state, target_evidence_in_cwd(FIXTURE_CWD, &[82]));
+        mark_question(&state, "claude", "sess_l13r", Q_SINGLE_PAYLOAD);
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-question/answer",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_l13r","action":"select","index":1}"#),
+            ))
+            .await
+            .unwrap();
+        let body = body_string(r).await;
+        assert!(body.contains("\"status\":\"key_sent\""), "{body}");
+        assert_eq!(fake.recorded_keys(), vec![(82u32, "2".to_string())]);
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits[0].result, "ok", "单候选路径零漂移");
+    }
+
+    /// 模式切换（键路 shift+tab）：≥2 候选 → 409 `ambiguous_target` + 零按键 + 审计
+    /// `mode/ambiguous_target`（码形与本端点既有守卫拒绝同形：`error` + `reason`）
+    #[tokio::test]
+    async fn mode_switch_refuses_when_target_ambiguous() {
+        let fake = FakeInjector::ok();
+        let (state, sid) = mode_guard_state(
+            fake.clone(),
+            "sess_l13a",
+            crate::session::AgentType::Claude,
+            72,
+            std::sync::Arc::new(|_, _| None),
+        );
+        let state = with_target_evidence(state, target_evidence_in_cwd(FIXTURE_CWD, &[72, 73]));
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/switch",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{sid}","target":"plan"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 409, "靶向歧义 = 守卫类拒绝 → 409");
+        let body = body_string(r).await;
+        assert!(body.contains("\"error\":\"ambiguous_target\""), "{body}");
+        assert!(
+            body.contains(&crate::window::tty_map::ambiguous_target_error(2)),
+            "reason = plan 定形文案：{body}"
+        );
+        assert!(fake.recorded_keys().is_empty(), "拒绝必须零按键（不猜）");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits[0].action, "mode");
+        assert_eq!(audits[0].result, "ambiguous_target");
+    }
+
+    /// 模式切换对照（恰 1 候选 ⇒ 行为不变）：照常发 shift+tab + 审计 ok
+    #[tokio::test]
+    async fn mode_switch_allows_with_single_candidate() {
+        let fake = FakeInjector::ok();
+        let (state, sid) = mode_guard_state(
+            fake.clone(),
+            "sess_l13b",
+            crate::session::AgentType::Claude,
+            72,
+            std::sync::Arc::new(|_, _| None),
+        );
+        let state = with_target_evidence(state, target_evidence_in_cwd(FIXTURE_CWD, &[72]));
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/switch",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{sid}","target":"plan"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(body.contains("\"status\":\"key_sent\""), "{body}");
+        assert_eq!(fake.recorded_keys(), vec![(72u32, "shift+tab".to_string())]);
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits[0].result, "ok", "单候选路径零漂移");
+    }
+
+    /// 终端菜单单选（codex picker，action=open）：≥2 候选 → 409 `ambiguous_target` +
+    /// **零投递零探测**（闸位在守卫探测之前）+ 审计 `mode/ambiguous_target`
+    #[tokio::test]
+    async fn mode_menu_refuses_when_target_ambiguous() {
+        let fake = FakeInjector::ok();
+        let (state, sid) = mode_guard_state(
+            fake.clone(),
+            "sess_l13c",
+            crate::session::AgentType::Codex,
+            81,
+            std::sync::Arc::new(|_, _| None),
+        );
+        let state = with_target_evidence(state, target_evidence_in_cwd(FIXTURE_CWD, &[81, 82]));
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/menu",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{sid}","action":"open"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 409);
+        let body = body_string(r).await;
+        assert!(body.contains("\"error\":\"ambiguous_target\""), "{body}");
+        assert!(
+            body.contains(&crate::window::tty_map::ambiguous_target_error(2)),
+            "{body}"
+        );
+        assert!(fake.recorded_keys().is_empty(), "拒绝必须零按键（不猜）");
+        assert!(fake.recorded().is_empty(), "拒绝必须零文本注入");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "mode");
+        assert_eq!(audits[0].result, "ambiguous_target");
+    }
+
+    /// 终端菜单对照（恰 1 候选 ⇒ 行为不变）：**不再报歧义**——落回本端点既有的
+    /// 「屏读不可用/菜单读不到」失败面（本机假 pid 无真控制台；判据是「不是歧义拒绝」）
+    #[tokio::test]
+    async fn mode_menu_allows_with_single_candidate() {
+        let fake = FakeInjector::ok();
+        let (state, sid) = mode_guard_state(
+            fake.clone(),
+            "sess_l13d",
+            crate::session::AgentType::Codex,
+            81,
+            std::sync::Arc::new(|_, _| None),
+        );
+        let state = with_target_evidence(state, target_evidence_in_cwd(FIXTURE_CWD, &[81]));
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/menu",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{sid}","action":"open"}}"#)),
+            ))
+            .await
+            .unwrap();
+        let body = body_string(r).await;
+        assert!(
+            !body.contains("ambiguous_target"),
+            "单候选不得报歧义：{body}"
+        );
+        assert!(
+            !body.contains(&crate::window::tty_map::ambiguous_target_error(1)),
+            "{body}"
+        );
     }
 }

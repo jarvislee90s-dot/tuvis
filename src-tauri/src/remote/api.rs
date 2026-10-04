@@ -1015,6 +1015,47 @@ fn endpoint_audit(
     });
 }
 
+/// L13 靶向解析（api 层唯一薄壳）：证据经 `RemoteState.target_evidence` 缝取，判定内核 =
+/// [`crate::window::tty_map::resolve_session_target`]（**就地改写 `session.pid`**——调用方
+/// 此后一律用 `session.pid`，杜绝「拿了返回值忘了用」）。
+/// `Err(AmbiguousTarget(n))` = 同 cwd 多候选且无独立 TTY 证据 → 调用方**必须**按其既有
+/// 失败契约拒绝（零注入 + 如实回执 + `ambiguous_target` 审计行）。
+fn resolve_session_target(
+    st: &crate::remote::server::RemoteState,
+    session: &mut crate::session::Session,
+) -> Result<(), crate::window::tty_map::AmbiguousTarget> {
+    let evidence =
+        (st.target_evidence)(session.agent_type.tool_id(), session.project_path.as_str());
+    crate::window::tty_map::resolve_session_target(session, &evidence, std::env::consts::OS)
+}
+
+/// L13 拒绝的**统一落账 + 文案**（四个注入端点——approve/question/mode menu/mode switch
+/// ——的拒绝臂共用；回执体各端点自定，保持各自既有失败契约）。返回 plan 定形文案。
+#[allow(clippy::too_many_arguments)]
+fn ambiguous_target_refusal(
+    st: &Arc<RemoteState>,
+    device_id: &str,
+    device_name: &str,
+    tool: &str,
+    session_id: &str,
+    content: &str,
+    action: &str,
+    n: usize,
+) -> String {
+    let msg = crate::window::tty_map::ambiguous_target_error(n);
+    endpoint_audit(
+        st,
+        device_id,
+        device_name,
+        tool,
+        session_id,
+        content,
+        action,
+        "ambiguous_target",
+    );
+    msg
+}
+
 /// 快照中按 session_id 找会话（spawn_blocking 内调用：session_source 是同步阻塞扫描）。
 /// 数据同源铁律：直调注入源（与看板/内容读取同一份快照），不另立查找函数
 fn find_session_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<crate::session::Session> {
@@ -1330,6 +1371,30 @@ pub async fn session_send(
                     }),
                 )
             }
+            // L13 靶向歧义拒绝（C0-③）：同 agent + 同 cwd 多实例且无 TTY 证据可消歧
+            // → **零注入**（不猜，判定见 window::tty_map）。行已 mark_failed 退出
+            // pending（settle 落 action=fail result=ambiguous_target）；本端点按契约
+            // 另写用户动作行 action=send（/ 开头消息仍记 slash）result=ambiguous_target
+            // ——机器可读原因码与落账行同码，两行职责不同（用户动作 / 投递机制）
+            crate::inject::queue::FlushOutcome::AmbiguousTarget(n) => {
+                endpoint_audit(
+                    &st,
+                    &device_id,
+                    &device_name,
+                    &tool,
+                    &sid,
+                    &content,
+                    audit_action_for(&req.text, "send"),
+                    "ambiguous_target",
+                );
+                json_no_store(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "status": "failed",
+                        "error": crate::window::tty_map::ambiguous_target_error(n),
+                    }),
+                )
+            }
             // Deferred/Suspended（含守卫忙让位）：行保持 pending 等会话回来/下个跃迁，
             // 语义即排队（Suspended 亦 queued）——回查 pending 取该条目实时位次回执
             crate::inject::queue::FlushOutcome::Deferred
@@ -1581,6 +1646,11 @@ pub async fn session_queue_jump(
             failed_body(format!("未投递：{reason}，请人工确认"))
         }
         crate::inject::queue::FlushOutcome::Failed(e) => failed_body(e),
+        // L13 靶向歧义拒绝（C0-③）：零注入（不猜），回 failed{error}=plan 定形文案；
+        // 落账行 action=fail result=ambiguous_target 由 settle 写，本臂只回执
+        crate::inject::queue::FlushOutcome::AmbiguousTarget(n) => {
+            failed_body(crate::window::tty_map::ambiguous_target_error(n))
+        }
         // Deferred/Suspended（含守卫忙让位/已被他方消费）：行保持 pending 或已退出，
         // 语义即排队——回查 pending 取该条目实时位次回执
         crate::inject::queue::FlushOutcome::Deferred
@@ -2984,7 +3054,7 @@ pub async fn session_approve(
             );
         }
     };
-    let (session, tool, option, keys, verify_plan) = match lookup {
+    let (mut session, tool, option, keys, verify_plan) = match lookup {
         Ok(v) => v,
         Err(code) => {
             let status = if code == "not_waiting" {
@@ -2995,6 +3065,44 @@ pub async fn session_approve(
             return json_no_store(status, serde_json::json!({ "error": code }));
         }
     };
+    // 审计 action 词表（W5 词表 send|queue|flush|jump|retract|approve|reject|fail|key|open；
+    // open = Task 11 一键 resume（session-open 端点），Task 7 的预留标注已兑现）：
+    // approve/reject 语义化；域外 id（KV 定制表
+    // 可含任意 id）不进词表——收敛为新增词表动作 "key" 并 log::warn 留痕，防自由文本
+    // 污染审计 action 列（AuditLogSection 前端「原样小写展示」契约不受影响）。
+    // 位置前移到靶向闸之前：拒绝臂要按同一 action 落账（单一判据，不复制映射）
+    let action = match option.id.as_str() {
+        "approve" => "approve",
+        "reject" => "reject",
+        // R1-4：对话框选项（`dialog:N`）语义上是**批准动作**（用户在真实选项里选了一个），
+        // 归 approve——与 C-23 文档「审计 action=approve、content=dialog:N」一致。
+        // 原实现落 "key"+warn，属域外 id 兜底路径的误伤。
+        d if d.starts_with("dialog:") => "approve",
+        other => {
+            log::warn!("审批动作域外 id：{other}，审计记 key");
+            "key"
+        }
+    };
+    // ===== L13 靶向闸（C0-③）：同 cwd 多候选 = 卡片 pid 不可信 =====
+    // 零按键拒绝（不猜）+ 如实回执与审计；判定内核见 window::tty_map 模块文档
+    if let Err(crate::window::tty_map::AmbiguousTarget(n)) =
+        resolve_session_target(&st, &mut session)
+    {
+        let msg = ambiguous_target_refusal(
+            &st,
+            &device_id,
+            &device_name,
+            &tool,
+            &sid,
+            &option_id,
+            action,
+            n,
+        );
+        return json_no_store(
+            StatusCode::OK,
+            serde_json::json!({ "status": "failed", "error": msg }),
+        );
+    }
     // F2：按键按该会话工具取族规格（先 family_for 再 FALLBACK 兜底，与 Task 5
     // try_flush 同款）——族表未收录的工具（路由层已拦）走快消费者默认口径
     let spec = crate::inject::families::family_for(&tool)
@@ -3140,23 +3248,7 @@ pub async fn session_approve(
             Err("内部任务异常".to_string())
         }
     };
-    // 审计 action 词表（W5 词表 send|queue|flush|jump|retract|approve|reject|fail|key|open；
-    // open = Task 11 一键 resume（session-open 端点），Task 7 的预留标注已兑现）：
-    // approve/reject 语义化；域外 id（KV 定制表
-    // 可含任意 id）不进词表——收敛为新增词表动作 "key" 并 log::warn 留痕，防自由文本
-    // 污染审计 action 列（AuditLogSection 前端「原样小写展示」契约不受影响）
-    let action = match option.id.as_str() {
-        "approve" => "approve",
-        "reject" => "reject",
-        // R1-4：对话框选项（`dialog:N`）语义上是**批准动作**（用户在真实选项里选了一个），
-        // 归 approve——与 C-23 文档「审计 action=approve、content=dialog:N」一致。
-        // 原实现落 "key"+warn，属域外 id 兜底路径的误伤。
-        d if d.starts_with("dialog:") => "approve",
-        other => {
-            log::warn!("审批动作域外 id：{other}，审计记 key");
-            "key"
-        }
-    };
+    // 审计 action 词表已在靶向闸之前求得（`action`，单一判据——拒绝臂与成功臂同源）
     match sent {
         Ok(()) => {
             endpoint_audit(
@@ -4698,7 +4790,7 @@ pub async fn session_question_answer(
         }
     };
     let (
-        session,
+        mut session,
         sequence,
         q_for_plan,
         q_tool,
@@ -4726,9 +4818,32 @@ pub async fn session_question_answer(
             return json_no_store(status, serde_json::json!({ "error": code }));
         }
     };
+    // 本会话工具 id（纯函数；位置前移到靶向闸之前——拒绝臂的审计要按工具落账）
+    let tool = session.agent_type.tool_id().to_string();
+    // 审计摘要标签（纯函数，同样前移：拒绝臂按同一标签落账）
+    let audit_label = action.audit_label(req.index);
+    // ===== L13 靶向闸（C0-③）：同 cwd 多候选 = 卡片 pid 不可信 =====
+    // 零按键拒绝（不猜）；回执体与本端点既有失败臂同形（status=failed + error）
+    if let Err(crate::window::tty_map::AmbiguousTarget(n)) =
+        resolve_session_target(&st, &mut session)
+    {
+        let msg = ambiguous_target_refusal(
+            &st,
+            &device_id,
+            &device_name,
+            &tool,
+            &sid,
+            &audit_label,
+            "answer",
+            n,
+        );
+        return json_no_store(
+            StatusCode::OK,
+            serde_json::json!({ "status": "failed", "error": msg }),
+        );
+    }
     // F2：序列按键按该会话工具取族规格（先 family_for 再 FALLBACK 兜底）——"down"
     // 的 A/B 族形态分发（claude=VT 序列 / codex=VK 键）由 spec 承载
-    let tool = session.agent_type.tool_id().to_string();
     let spec = crate::inject::families::family_for(&tool)
         .unwrap_or(crate::inject::families::FALLBACK_SPEC);
     let injector = st.injector.clone();
@@ -7689,7 +7804,7 @@ pub async fn session_mode_menu(
             .find(|s| s.id == probe_sid)
     })
     .await;
-    let session = match found {
+    let mut session = match found {
         Ok(Some(s)) => s,
         Ok(None) => return mode_menu_err(StatusCode::NOT_FOUND, "no_session", None),
         Err(e) => {
@@ -7713,6 +7828,30 @@ pub async fn session_mode_menu(
             "no_mechanism",
             Some("该会话没有可读屏的终端进程"),
         );
+    }
+    // ===== L13 靶向闸（C0-③）：同 cwd 多候选 = 卡片 pid 不可信 =====
+    // 位在守卫探测**之前**：靶向不可信时连屏读都不该做（读的是兄弟窗口）——零投递、
+    // 零探测、如实 409 + 审计（拒绝码与本端点其它守卫拒绝同形：error + reason）。
+    // 注：switch 端点的闸位在其三态守卫之后（那三条是既有契约且探针只读）——两处
+    // 位次差异是本端点「零探测」与 switch「守卫码优先」两种取舍的显式结果
+    if let Err(crate::window::tty_map::AmbiguousTarget(n)) =
+        resolve_session_target(&st, &mut session)
+    {
+        let audit_content = match req.number {
+            Some(number) => format!("终端菜单第 {number} 项（权限切换）"),
+            None => "打开权限菜单（终端菜单单选）".to_string(),
+        };
+        let msg = ambiguous_target_refusal(
+            &st,
+            &device_id,
+            &device_name,
+            &tool,
+            &sid,
+            &audit_content,
+            "mode",
+            n,
+        );
+        return mode_menu_err(StatusCode::CONFLICT, "ambiguous_target", Some(&msg));
     }
     // ===== 守卫（三态，与 switch 端点同源；codex 自身 overlay 豁免）=====
     let pid = session.pid;
@@ -8345,7 +8484,7 @@ pub async fn session_mode_switch(
             );
         }
     };
-    let (session, tool, group, plan, readback, label, before) = match lookup {
+    let (mut session, tool, group, plan, readback, label, before) = match lookup {
         Ok(v) => v,
         Err(code) => {
             let status = if code == "no_session" {
@@ -8456,6 +8595,36 @@ pub async fn session_mode_switch(
             );
         }
         None => {}
+    }
+    // ===== L13 靶向闸（C0-③）：同 cwd 多候选 = 卡片 pid 不可信 =====
+    //
+    // 位在所有注入之前、在既有三态守卫之后（守卫契约不变）。**本拒绝落审计**——
+    // 与上面三态守卫的「零注入零审计」口径**刻意不同**：那三条是「当前状态不允许这个
+    // 动作」（未投递的动作无需留痕），本条是「无法确定投递目标」的**投递路拒绝**，
+    // 与 send 漏斗的 `fail/ambiguous_target` 同族，须进审计供事后核对（同一缺口在
+    // 手机端的可追溯性）。回执码形与守卫拒绝一致（409 + error + reason）。
+    if let Err(crate::window::tty_map::AmbiguousTarget(n)) =
+        resolve_session_target(&st, &mut session)
+    {
+        let audit_content = if group == crate::inject::mode::ModeGroupId::Mode {
+            format!("切换模式至 {label}")
+        } else {
+            format!("切换{}至 {label}", group.label())
+        };
+        let msg = ambiguous_target_refusal(
+            &st,
+            &device_id,
+            &device_name,
+            &tool,
+            &sid,
+            &audit_content,
+            "mode",
+            n,
+        );
+        return json_no_store(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "error": "ambiguous_target", "reason": msg }),
+        );
     }
     let spec = crate::inject::families::family_for(&tool)
         .unwrap_or(crate::inject::families::FALLBACK_SPEC);

@@ -309,6 +309,10 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
                 Vec::new()
             }
         }),
+        // L13（C0-③）靶向证据源：候选进程（共享快照，与卡片同源同轮）+ 候选 TTY 采数
+        // （macOS ps）+ **恒 None 的会话级 TTY 证据**（卡片 pid 的 TTY 是自证循环，
+        // 见 window::tty_map 模块文档——生产两平台都走拒绝臂）
+        target_evidence: Box::new(crate::window::tty_map::tool_target_evidence),
         store: pairing::DeviceStore::global(),
         // M7 Task 5（方案 A）：注入器生产装配——消费方 flush_one / session-send 直发；
         // Task 6 已接线：api_router 注册 session-send 等路由 + serve() 挂 spawn_flush_loop
