@@ -37,16 +37,17 @@
 //! 回合编排经注入的 `make_runner`/`run` 缝驱动 Task 6 的 `run_once` 脚本缝，信任探针走
 //! tempdir 夹具。
 
-use std::collections::{BTreeMap, HashMap};
-use std::future::Future;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
+// `Arc`/`Mutex` 只在测试面用（脚本桩构造）：生产码已改用底座 `turn::cancel_fn_of`，
+// 登记表的内部锁归 `turn::TurnRegistry`
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::gate::provider_config_env;
 use super::receipt::{FrameAccumulator, Receipt, ReceiptStatus, Stage};
-use super::runner::{CancelHandle, RunnerCfg};
+use super::runner::RunnerCfg;
 use crate::inject::normalize;
 use crate::inject::routing::{zcode_visibility, Visibility};
 
@@ -58,15 +59,10 @@ pub const WORKSPACE_BUSY_MARKER: &str = "Model creation failed";
 pub const BUSY_MAX_RETRIES: usize = 2;
 /// busy 重试间隔（spec H7：5s）
 pub const BUSY_RETRY_SPACING_MS: u64 = 5_000;
-/// 证据串行数上限（[`ExitObs`] 的输入；探测定案里 busy 串就是首批输出）
-const EVIDENCE_HEAD_LINES: usize = 32;
 /// 斜杠命令拒绝文案（spec H7：slash 命令是**字面文本**、与 APP 内命令不具等价性——
 /// 显式告知而不是静默透传冒充支持）
 pub const SLASH_REFUSAL: &str =
     "斜杠命令在无头通道不可用（无头 CLI 把 `/…` 当普通文本，不具 ZCode 应用内命令语义）——请在 ZCode 应用内执行";
-
-/// 盒装 future 别名（执行缝/等待缝共用；避免 clippy::type_complexity）
-pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 // ============================================================
 // 命令形态
@@ -541,18 +537,17 @@ pub fn resolve_spec(roots: &[String], os: &str) -> Option<ZcodeSpec> {
 // ============================================================
 // 单回合编排（Task 6 底座的唯一消费入口）
 // ============================================================
-
-/// 一次**尝试**的观测（执行缝的产物；回执 + 原始流供退出分类/回执归一消费）
-#[derive(Debug, Clone)]
-pub struct TurnObs {
-    pub receipt: Receipt,
-    pub stdout: Vec<String>,
-    pub stderr: String,
-    pub exit: Option<i32>,
-}
-
-/// 执行缝（生产 = `RunnerCfg::run().await` 真 spawn；测试 = Task 6 的 `run_once` 脚本缝）
-pub type RunSeam = dyn Fn(RunnerCfg) -> BoxFuture<TurnObs> + Send + Sync;
+//
+// **共享件已上提**（Task 9 复审）：执行缝（[`RunSeam`]/[`TurnObs`]/[`production_run_seam`]）、
+// 回执→审计词（[`receipt_result_word`]）、会话串行锁 / 取消靶子登记表
+// （[`registry`]/[`TurnSlot`]/[`CancelFn`]）、证据头（[`head_of`]）现在定义在
+// [`super::turn`]——zcode 与 codex 共用底座，通道之间不互相依赖（WB 接入时同规）。
+// 下方 `pub use` 是**兼容转出**：Task 8 既有调用面（`zcode::registry()` 等）保持不变。
+use super::turn::head_of;
+pub use super::turn::{
+    production_run_seam, receipt_result_word, registry, BoxFuture, CancelFn, RunSeam, TurnObs,
+    TurnRegistry, TurnSlot,
+};
 
 /// 编排依赖（探活/等待/回执源/重试节奏全可注入，测试零真实等待零真实进程表零真实会话库）
 pub struct TurnDeps {
@@ -603,26 +598,6 @@ pub struct TurnOutcome {
     pub busy_final: bool,
     /// 回执来源（`SessionStore` = 真机常态；`Unconfirmed` = 如实的不确认）
     pub receipt_source: ReceiptSource,
-}
-
-/// 回执 → 审计 result 词（H6 口径：终态；失败带阶段码。阶段词经 serde **单一来源**
-/// 取 [`Stage`] 的 wire 名，不另抄一份词表）
-pub fn receipt_result_word(r: &Receipt) -> String {
-    match r.status {
-        ReceiptStatus::Ok => "ok".to_string(),
-        ReceiptStatus::Queued => "queued".to_string(),
-        ReceiptStatus::Cancelled => "cancelled".to_string(),
-        ReceiptStatus::Failed => match r.stage {
-            Some(st) => {
-                let word = serde_json::to_value(st)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_else(|| "unknown".to_string());
-                format!("failed({word})")
-            }
-            None => "failed".to_string(),
-        },
-    }
 }
 
 /// 帧统计（复用 Task 6 的前缀跳过累积器——**不另写解析**）
@@ -742,32 +717,6 @@ pub enum ReceiptSource {
     NotApplicable,
 }
 
-/// 证据头（生产/测试共用）：前 [`EVIDENCE_HEAD_LINES`] 行拼接（判定为子串匹配）
-fn head_of(lines: &[String]) -> String {
-    lines
-        .iter()
-        .take(EVIDENCE_HEAD_LINES)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// 生产执行缝（真 spawn：`RunnerCfg::run().await`；超时/取消/kill 树/在飞登记全归
-/// [`super::runner`]）。断言用脚本缝见测试模块（Task 6 的 `run_once`）。
-pub fn production_run_seam() -> Box<RunSeam> {
-    Box::new(|mut cfg: RunnerCfg| {
-        Box::pin(async move {
-            let receipt = cfg.run().await;
-            TurnObs {
-                receipt,
-                stdout: cfg.captured_stdout(),
-                stderr: cfg.captured_stderr(),
-                exit: cfg.last_exit_code(),
-            }
-        })
-    })
-}
-
 /// 单回合编排（**唯一**消费 Task 6 底座的地方：并发经 runner 的全局名额、看门狗与取消
 /// 归 runner、回执归 receipt 归一）。流程：
 /// 每次尝试 → `make_runner(inv)` 建回合配置（端点侧经 `headless::runner_from_conn`，
@@ -799,11 +748,9 @@ pub async fn run_turn(
     loop {
         attempts += 1;
         let cfg = make_runner(inv);
-        // 取消靶子逐尝试更新（版本门控期间靶子为空 → 取消如实报「未送达」）
-        registry().arm(session_id, {
-            let handle: CancelHandle = cfg.cancel_handle();
-            Arc::new(move || handle.cancel())
-        });
+        // 取消靶子逐尝试更新（版本门控期间靶子为空 → 取消如实报「未送达」）——
+        // 包法单点复用底座 [`super::turn::cancel_fn_of`]
+        registry().arm(session_id, super::turn::cancel_fn_of(&cfg));
         let obs = run(cfg);
         let obs = obs.await;
         // 证据串（先判争用锁再判退出码：busy 形态退出码是 0）
@@ -973,108 +920,8 @@ fn busy_receipt(
 }
 
 // ============================================================
-// 会话串行锁 + 取消靶子（MAM 自己的；zcode 无头不拒绝并发）
+// 版本门控探针缓存（会话串行锁 / 取消靶子登记表已上提 [`super::turn`]）
 // ============================================================
-
-/// 取消请求口（Task 6 的 [`CancelHandle`] 包一层，便于测试注入「送达/未送达」两形态）
-pub type CancelFn = Arc<dyn Fn() -> bool + Send + Sync>;
-
-/// 在飞回合槽位（取消靶子 + 回合起跑时刻 + 审计上下文）。
-///
-/// **不含设备身份**：回合审计行的设备取**发起发送的**设备（端点持有），取消审计行的设备
-/// 取**按下取消的**设备（取消端点持有）——槽位只保留两者都要用的回合自身信息。
-pub struct TurnSlot {
-    pub cancel: CancelFn,
-    pub started: Instant,
-    /// 本回合的注入正文（取消审计行与回合审计行同源）
-    pub content: String,
-    /// 会话工具 id（回合/取消两行审计的 agent_type 列）
-    pub agent_type: String,
-}
-
-impl TurnSlot {
-    /// 占位槽（取消靶子待 [`TurnRegistry::arm`] 逐尝试更新）
-    pub fn placeholder(agent_type: &str, content: String) -> Self {
-        Self {
-            cancel: Arc::new(|| false),
-            started: Instant::now(),
-            content,
-            agent_type: agent_type.to_string(),
-        }
-    }
-}
-
-/// 进程级在飞登记表（会话串行锁的唯一判据出口）
-#[derive(Default)]
-pub struct TurnRegistry {
-    map: Mutex<HashMap<String, TurnSlot>>,
-}
-
-impl TurnRegistry {
-    /// 占位（`false` = 该会话已有在飞回合——调用方必须**如实拒绝**：不排队、不覆盖）
-    pub fn begin(&self, session_id: &str, slot: TurnSlot) -> bool {
-        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        if g.contains_key(session_id) {
-            return false;
-        }
-        g.insert(session_id.to_string(), slot);
-        true
-    }
-
-    /// 更新取消靶子（每尝试一次；无槽位时 no-op——测试直驱 [`run_turn`] 不建槽）
-    pub fn arm(&self, session_id: &str, cancel: CancelFn) {
-        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = g.get_mut(session_id) {
-            slot.cancel = cancel;
-        }
-    }
-
-    /// 回合终结：注销槽位
-    pub fn end(&self, session_id: &str) {
-        self.map
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(session_id);
-    }
-
-    pub fn in_flight(&self, session_id: &str) -> bool {
-        self.map
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(session_id)
-    }
-
-    /// 请求取消：`None` = 无在飞回合；`Some(false)` = 有回合但取消未送达（已终结/已取消
-    /// ——先到者生效）；`Some(true)` = 送达。**不注销槽位**（终结由回合自身 [`Self::end`]
-    /// 负责，取消只是请求）。
-    pub fn request_cancel(&self, session_id: &str) -> Option<bool> {
-        let cancel = {
-            let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
-            g.get(session_id).map(|s| s.cancel.clone())
-        };
-        cancel.map(|f| f())
-    }
-
-    /// 槽位快照（取消端点写审计行用：回合正文 + 工具 + 回合已跑时长）
-    pub fn slot_snapshot(&self, session_id: &str) -> Option<(String, String, u64)> {
-        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        g.get(session_id).map(|s| {
-            (
-                s.content.clone(),
-                s.agent_type.clone(),
-                s.started.elapsed().as_millis() as u64,
-            )
-        })
-    }
-}
-
-static REGISTRY: std::sync::LazyLock<TurnRegistry> =
-    std::sync::LazyLock::new(TurnRegistry::default);
-
-/// 进程级登记表句柄
-pub fn registry() -> &'static TurnRegistry {
-    &REGISTRY
-}
 
 /// 版本门控探针缓存（进程级；键 = exe 在场性 + mtime，工具升级即失效重探）
 static PROBE_CACHE: std::sync::LazyLock<super::gate::ProbeCache> =

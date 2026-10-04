@@ -264,7 +264,10 @@ export function HeadlessReceiptCard({
             data-testid="headless-queued"
             className="rounded-full bg-slate-200/70 px-2 py-0.5 text-slate-600 dark:bg-slate-700/60 dark:text-slate-300"
           >
-            排队中（全局并发名额已满）
+            {/* **成因只由后端 reason 说话**（Task 9 / H8 起同一 queued 状态有两个成因：
+                H4 全局并发名额已满〔zcode〕、H8 codex 已入队待 APP 消费）——此前的固定括注
+                「全局并发名额已满」对后者是假话，故改为中性文案 + 下方 reason 原样透出 */}
+            排队中（原因见下）
           </span>
         )}
         {cancelled && (

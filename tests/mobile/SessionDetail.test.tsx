@@ -2851,6 +2851,85 @@ describe("SessionDetail：预览区 sheet 化（T1）", () => {
 // 无头会话（zcode）的发送是**回合级**动作：HTTP 请求要等整个无头进程跑完（实测 8–23s，
 // 长则看门狗 600s），故回执卡必须与「发送中」共存并给取消入口；回执里的 assistant 摘要 /
 // token / 耗时 / 可见性提示全部由后端下发（**后端给文案、前端只渲染**——与 H3 置灰同纪律）。
+// ==== Task 9（H8）：codex 入队回执（**入队 ≠ 已送达**）====
+//
+// `codex queue` 的 exit 0 只证入队：后端在 60s 消费确认后给 `ok`（rollout 追加命中 =
+// 已消费）或 `queued`（已入队未消费，附可执行建议）。同一 `queued` 状态自 Task 9 起有
+// 两个成因（H4 全局并发名额满 / H8 APP 入队待消费）⇒ 卡片**只渲染中性「排队中」**，
+// 成因一律由后端 `reason` 原样透出（后端给文案、前端只渲染的同一纪律）。
+describe("SessionDetail：codex 入队回执（Task 9 / H8）", () => {
+  function codexSession() {
+    return makeSession({ id: "sess-h8", agentType: "codex", form: "app", status: "idle" });
+  }
+
+  async function sendFromComposer(text: string) {
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: text } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+  }
+
+  it("已入队未消费：queued 卡不冒充成功、不编成因；输入框保留正文（可重试/改道）", async () => {
+    installFetch();
+    routes.sendInfo = {
+      injectable: true,
+      channels: ["headless_codex_queue", "headless_codex_exec"],
+      visibility: "realtime",
+    };
+    routes.sessionSend = {
+      status: "headless",
+      channel: "headless_codex_queue",
+      receipt: {
+        status: "queued",
+        sessionId: "sess-h8",
+        durationMs: 61234,
+        reason:
+          "已入队未消费：thread 01a10735-1354-7d10-822a-f3bd9e041c12 的条目仍滞留在 codex 队列" +
+          "（queue_1.sqlite 副本的 queued_items 查到）= thread 未被 APP 打开；建议在 APP 打开该会话，" +
+          "或改走 exec resume（入队回执 id=m-2）",
+      },
+    };
+    render(<SessionDetail session={codexSession()} onBack={() => {}} />);
+    await sendFromComposer("hi [mobile]");
+    await waitFor(() => expect(screen.getByTestId("headless-queued")).toBeTruthy());
+    // 中性成因文案：不得再对 H8 谎报「全局并发名额已满」
+    expect(screen.getByTestId("headless-queued").textContent).not.toContain("全局并发名额");
+    expect(screen.getByTestId("headless-reason").textContent).toContain("已入队未消费");
+    expect(screen.getByTestId("headless-reason").textContent).toContain("APP 打开该会话");
+    // 未确认消费 ⇒ 不是成功：无末条回复、无「完成」标、正文保留
+    expect(screen.queryByTestId("headless-ok")).toBeNull();
+    expect(screen.queryByTestId("headless-last-assistant")).toBeNull();
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("hi [mobile]");
+  });
+
+  it("已消费：ok 卡如实标注「回合归 APP 自身」（不编末条回复）", async () => {
+    installFetch();
+    routes.sendInfo = {
+      injectable: true,
+      channels: ["headless_codex_queue", "headless_codex_exec"],
+      visibility: "realtime",
+    };
+    routes.sessionSend = {
+      status: "headless",
+      channel: "headless_codex_queue",
+      receipt: {
+        status: "ok",
+        sessionId: "sess-h8",
+        durationMs: 21234,
+        reason:
+          "APP 已消费该消息（目标 rollout 追加命中消息文本；入队回执 id=m-7）——" +
+          "回合执行与回复由 codex APP 自身完成，请在 APP 内或看板刷新后查看",
+      },
+    };
+    render(<SessionDetail session={codexSession()} onBack={() => {}} />);
+    await sendFromComposer("hi");
+    await waitFor(() => expect(screen.getByTestId("headless-ok")).toBeTruthy());
+    expect(screen.getByTestId("headless-reason").textContent).toContain("已消费该消息");
+    expect(screen.queryByTestId("headless-last-assistant")).toBeNull();
+    // 已消费 = 消息真的进了会话 → 清空输入区（与终端 delivered 同口径）
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+  });
+});
+
 describe("SessionDetail：无头回执卡（Task 8 / H7）", () => {
   function headlessSession() {
     return makeSession({ id: "sess-h7", agentType: "zcode", status: "waiting" });

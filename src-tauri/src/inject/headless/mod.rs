@@ -1,19 +1,25 @@
 // 无头注入底座（H4 生命周期 / H6 回执·审计·版本门控）——Task 6。
 //
 // **范围**：本模块只做**共享底座**，不含任何工具通道（zcode/codex/WB/CLI 四家
-// 分属 Task 8/9/11/13）。三层结构：
+// 分属 Task 8/9/11/13）。四层结构：
 // - [`receipt`]：回执归一（纯函数；前缀跳过 JSON 解析、未知帧不猜、200 字截断）；
 // - [`runner`]：进程生命周期（全局并发上限、watchdog 超时、取消、kill 进程树）；
-// - [`gate`]：版本门控探针（`--prompt` 干跑 / `queue --help` 子命令在场 + 结果缓存）。
+// - [`gate`]：版本门控探针（`--prompt` 干跑 / `queue --help` 子命令在场 + 结果缓存）；
+// - [`turn`]：共享回合件（Task 9 复审上提：执行缝 / 回执→审计词 / 串行锁登记表 /
+//   证据头）——各通道**只依赖底座**，通道之间不互相依赖。
 //
 // **审计归属（Task 6 裁决 A）**：无头动作落**既有的** `write_audit` 表（W5 单一账本，
 // 9 列 NOT NULL；该表 `action` 列无 CHECK 约束——见 `database/schema.rs`，故**无需
 // migration**）。设备身份（device_id/device_name）来自移动端 gate 上下文，
 // **runner 不自造**：runner 只归一回执 + 记录终止方，由端点（持有 gate 上下文与连接）
 // 经 [`audit_headless`] 落 `headless` / `headless_cancel` 两行。
+pub mod codex;
 pub mod gate;
 pub mod receipt;
 pub mod runner;
+/// 共享回合件（Task 9 复审上提：执行缝 / 审计词 / 串行锁登记表）——zcode 与 codex 现共用，
+/// WB（Task 11）/ H11 三家（Task 13）接入时同规，禁止再从 `zcode.rs` 取
+pub mod turn;
 /// H7 zcode 无头通道（Task 8；codex/workbuddy/CLI 三家分属 Task 9/11/13）
 pub mod zcode;
 

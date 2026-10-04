@@ -1097,17 +1097,17 @@ fn headless_blocked(
     }
 }
 
-/// **无头分派未接线的诚实拒绝码**（Task 7 过渡态；**Task 8 起只覆盖尚未接线的家**）：
+/// **无头分派未接线的诚实拒绝码**（Task 7 过渡态；**Task 8/9 起只覆盖尚未接线的家**）：
 /// 路由已判「本条只能经无头通道投递」（无头候选在场且无终端候选），但无头执行器逐家落地
 /// ——接线前**不投递也不入队**（绝不落终端注入臂：zcode/workbuddy 的 pid 不是终端宿主，
 /// 终端注入会打错窗口）。本拒绝是**入队侧**的保证：它在唯一生产 INSERT 之前拦下，故无头
 /// 条目进不了队列。
 ///
-/// **Task 8 落地后的覆盖面**：**zcode 已摘出本码**——`Headless(Zcode)` 走
-/// [`zcode_headless_dispatch`] 真分派（每回合 spawn、会话串行锁、版本门控、审计、回执
-/// 封套）。仍在册的家 = `CodexQueue` / `CodexExec`（Task 9）、`WbAcp`（Task 11）、
-/// `ClaudeP` / `KimiP` / `OpencodeRun`（Task 13）——**这些必须继续拒在本码上，且不得落
-/// 终端注入臂**（⑤b 的 `has_terminal_candidate` 门 + 本臂都在 INSERT 之前）。
+/// **Task 8/9 落地后的覆盖面**：**zcode 已摘出**（`Headless(Zcode)` → [`zcode_headless_dispatch`]）、
+/// **codex 已摘出**（`Headless(CodexQueue|CodexExec)` → [`codex_headless_dispatch`]，H8 按
+/// APP 在场分派 queue/exec resume）。仍在册的家 = `WbAcp`（Task 11）、`ClaudeP` / `KimiP` /
+/// `OpencodeRun`（Task 13）——**这些必须继续拒在本码上，且不得落终端注入臂**
+/// （⑤b 的 `has_terminal_candidate` 门 + 本臂都在 INSERT 之前）。
 ///
 /// **投递侧重判已补**（Task 8 义务 2，收口点见 `inject/queue.rs::try_flush_with`）：入队
 /// **之后**才变成无头绑定的条目（如 claude 进程退出 → pid=0 未读卡）在投递前重跑路由结论，
@@ -1115,7 +1115,7 @@ fn headless_blocked(
 pub(crate) const HEADLESS_PENDING_CODE: &str = "headless_pending";
 /// 上述拒绝的置灰/回执文案（与 `HEADLESS_DISABLED_REASON` 同款：后端给文案、前端只渲染）
 pub(crate) const HEADLESS_PENDING_REASON: &str =
-    "无头通道分派待接线（H7–H11 逐家落地中），本次不投递";
+    "无头通道分派待接线（H9–H11 逐家落地中），本次不投递";
 
 // ============================================================
 // H7 zcode 无头分派（Task 8）
@@ -1183,7 +1183,7 @@ impl ZcodeTurnCtx {
     }
 
     /// 落账（回合终态/取消/拒绝共用；result 词 = 终态 + 阶段码，见
-    /// `zcode::receipt_result_word`）
+    /// `crate::inject::headless::turn::receipt_result_word`）
     fn audit(&self, st: &Arc<RemoteState>, action: &str, result: &str, duration_ms: u64) {
         audit_headless_ctx(st, &self.audit_ctx(), action, result, duration_ms);
     }
@@ -1202,7 +1202,7 @@ impl ZcodeTurnCtx {
         self.audit(
             st,
             crate::inject::headless::ACTION_HEADLESS,
-            &crate::inject::headless::zcode::receipt_result_word(&receipt),
+            &crate::inject::headless::turn::receipt_result_word(&receipt),
             receipt.duration_ms,
         );
         json_no_store(
@@ -1237,17 +1237,17 @@ async fn run_zcode_turn(
         }
         cfg
     };
-    let seam = crate::inject::headless::zcode::production_run_seam();
+    let seam = crate::inject::headless::turn::production_run_seam();
     let out =
         crate::inject::headless::zcode::run_turn(&inv, &ctx.sid, &project, &build, &deps, &*seam)
             .await;
     ctx.audit(
         &st,
         crate::inject::headless::ACTION_HEADLESS,
-        &crate::inject::headless::zcode::receipt_result_word(&out.receipt),
+        &crate::inject::headless::turn::receipt_result_word(&out.receipt),
         out.receipt.duration_ms,
     );
-    crate::inject::headless::zcode::registry().end(&ctx.sid);
+    crate::inject::headless::turn::registry().end(&ctx.sid);
     out
 }
 
@@ -1302,7 +1302,7 @@ pub(crate) async fn zcode_headless_dispatch(
         return ctx.refuse(st, Stage::Refused, reason);
     }
     // 3) 会话串行锁
-    if !zcode::registry().begin(
+    if !crate::inject::headless::turn::registry().begin(
         &session.id,
         zcode::TurnSlot::placeholder(&ctx.tool, ctx.content.clone()),
     ) {
@@ -1314,7 +1314,7 @@ pub(crate) async fn zcode_headless_dispatch(
     }
     // 4) 安装形态（占位后失败必须注销槽位）
     let Some(spec) = zcode::resolve_spec(&zcode::production_roots(session.pid), os) else {
-        zcode::registry().end(&session.id);
+        crate::inject::headless::turn::registry().end(&session.id);
         return ctx.refuse(
             st,
             Stage::Spawn,
@@ -1343,11 +1343,11 @@ pub(crate) async fn zcode_headless_dispatch(
     if let Some(receipt) =
         crate::inject::headless::gate::version_gate_receipt(&session.id, &verdict)
     {
-        zcode::registry().end(&session.id);
+        crate::inject::headless::turn::registry().end(&session.id);
         ctx.audit(
             st,
             crate::inject::headless::ACTION_HEADLESS,
-            &zcode::receipt_result_word(&receipt),
+            &crate::inject::headless::turn::receipt_result_word(&receipt),
             receipt.duration_ms,
         );
         return json_no_store(
@@ -1367,7 +1367,7 @@ pub(crate) async fn zcode_headless_dispatch(
         Ok(o) => o,
         Err(e) => {
             log::error!("zcode 无头回合任务异常: {e}");
-            zcode::registry().end(&session.id); // 本路径占过位 → 必须注销
+            crate::inject::headless::turn::registry().end(&session.id); // 本路径占过位 → 必须注销
             return ctx.refuse(
                 st,
                 Stage::ChannelError,
@@ -1381,6 +1381,245 @@ pub(crate) async fn zcode_headless_dispatch(
     json_no_store(
         StatusCode::OK,
         headless_envelope(HeadlessKind::Zcode, &out.receipt, Some(visibility)),
+    )
+}
+
+// ============================================================
+// H8 codex APP 托管会话无头分派（Task 9）
+// ============================================================
+
+/// codex 回合的审计上下文（设备身份由端点注入；`channel_kind` 在回合终结时按**实际走向**
+/// 回填——改道后如实记 `headless_codex_queue`，不把改道记成原计划）
+#[derive(Clone)]
+struct CodexTurnCtx {
+    device_id: String,
+    device_name: String,
+    tool: String,
+    sid: String,
+    content: String,
+    channel_kind: crate::inject::routing::HeadlessKind,
+}
+
+impl CodexTurnCtx {
+    fn audit_ctx(&self) -> crate::inject::headless::HeadlessAuditCtx {
+        crate::inject::headless::HeadlessAuditCtx {
+            device_id: self.device_id.clone(),
+            device_name: self.device_name.clone(),
+            agent_type: self.tool.clone(),
+            session_id: self.sid.clone(),
+            channel: self.channel_kind.wire_name().to_string(),
+            content: self.content.clone(),
+        }
+    }
+
+    fn audit(&self, st: &Arc<RemoteState>, action: &str, result: &str, duration_ms: u64) {
+        audit_headless_ctx(st, &self.audit_ctx(), action, result, duration_ms);
+    }
+
+    /// 拒绝/失败臂（同 [`ZcodeTurnCtx::refuse`]：HTTP 200 + `receipt.status=failed` + 落账；
+    /// **不碰串行锁**——占位前的拒绝若误注销会把**别人的**在飞回合槽位注销掉）
+    fn refuse(
+        &self,
+        st: &Arc<RemoteState>,
+        stage: crate::inject::headless::receipt::Stage,
+        reason: &str,
+    ) -> Response {
+        let receipt = crate::inject::headless::receipt::Receipt::failed(stage, reason)
+            .with_session(&self.sid);
+        self.audit(
+            st,
+            crate::inject::headless::ACTION_HEADLESS,
+            &crate::inject::headless::turn::receipt_result_word(&receipt),
+            receipt.duration_ms,
+        );
+        json_no_store(
+            StatusCode::OK,
+            headless_envelope(self.channel_kind, &receipt, None),
+        )
+    }
+}
+
+/// 真回合执行（**每回合 spawn 子进程**，裁决 8）：并发/超时经
+/// [`crate::inject::headless::runner_from_conn`] 读设置（不自建 `GlobalSem`）、执行缝复用
+/// Task 8 的 [`crate::inject::headless::turn::production_run_seam`]（通道无关：跑一个
+/// `RunnerCfg` 并把回执 + 原始流交回），回合终结后落 `headless` 审计行并注销串行锁。
+async fn run_codex_turn(
+    st: Arc<RemoteState>,
+    mut ctx: CodexTurnCtx,
+    plan: crate::inject::headless::codex::Plan,
+    shape: crate::inject::headless::codex::SpawnShape,
+    tref: crate::inject::headless::codex::ThreadRef,
+    project: String,
+) -> crate::inject::headless::codex::TurnOutcome {
+    use crate::inject::headless::codex;
+    let deps = codex::TurnDeps::production();
+    // 每回合新建回合配置（超时是回合属性；并发上限是全局名额，读设置即生效）。
+    // `-C` 已由计划自带（exec resume）；cwd 不另设（按 spec 命令形态逐字投递）
+    let build = |plan: &codex::Plan| {
+        let mut cfg = st
+            .store
+            .with(|c| crate::inject::headless::runner_from_conn(&shape.program, c));
+        cfg = cfg
+            .args(
+                shape
+                    .prefix
+                    .iter()
+                    .cloned()
+                    .chain(plan.args().iter().cloned()),
+            )
+            .session_id(ctx.sid.clone());
+        cfg
+    };
+    let seam = codex::run_seam();
+    let args = codex::TurnArgs {
+        sid: &ctx.sid,
+        project: &project,
+        rollout: tref.rollout_path.as_deref(),
+    };
+    let out = codex::run_turn(&args, &plan, &build, &deps, &*seam).await;
+    // 审计 channel 列 = **实际走向**（改道后如实记 queue）
+    ctx.channel_kind = out.plan_used.headless_kind();
+    ctx.audit(
+        &st,
+        crate::inject::headless::ACTION_HEADLESS,
+        &crate::inject::headless::turn::receipt_result_word(&out.receipt),
+        out.receipt.duration_ms,
+    );
+    codex::registry().end(&ctx.sid);
+    out
+}
+
+/// **codex 无头分派**（H8 / Task 9；`session_send` ⑤b 的
+/// `Headless(CodexQueue | CodexExec)` 臂）。
+///
+/// 顺序与理由（每步都有判据依赖，勿随意改）：
+/// 1. **APP 在场**（[`crate::inject::headless::codex::production_presence`]：会话宿主进程
+///    存活 ∪ APP 主进程在场）→ 走向：开 ⇒ `queue`（首选，APP 原生排队可见）；关 ⇒
+///    `exec resume`（兜底）；
+/// 2. **thread UUID**（rollout 文件名 UUID **唯一**来源；解析不出即如实拒绝——**绝不按
+///    会话名投递**：Mac 普查 202 thread 中「hi」重名 ×5，且 `queue --thread` 自认收名字）；
+/// 3. **命令形态**（正文经 W4 单点 [`crate::inject::normalize::compose_injection`] 组装 +
+///    [`crate::inject::headless::codex::dispatch`]）；此后审计 `content` = 最终载荷；
+/// 4. **会话串行锁**（占位；与取消靶子共表——取消端点只认 Task 8 那一份进程级登记表）；
+/// 5. **CLI 发现 + 版本门控**（`queue --help` 子命令在场；经
+///    [`crate::inject::headless::codex::probe_cli`]——Windows npm 垫片经 cmd 转一手，
+///    判定/缓存/键全部复用 Task 6 单点，**不触模型、不占无头回合名额**）；
+/// 6. **回合**（detached task，与 zcode 同口径：正文已进 codex，丢回执可以、丢用户消息
+///    不行；回执/审计/注销都在任务内完成）——queue 路径内含**消费确认自建**；
+/// 7. 回执封套 + 路由表可见性档（**单源** = Task 7 路由表，本任务不改可见性口径；
+///    `channel` 取**实际走向**，改道后如实记 queue）。
+pub(crate) async fn codex_headless_dispatch(
+    st: &Arc<RemoteState>,
+    device_id: &str,
+    device_name: &str,
+    session: &crate::session::Session,
+    text: &str,
+) -> Response {
+    use crate::inject::headless::codex;
+    use crate::inject::headless::receipt::Stage;
+    use crate::inject::routing::{HeadlessKind, RouteOutcome};
+
+    let os = std::env::consts::OS;
+    let tool = session.agent_type.tool_id().to_string();
+    // 1) APP 在场 → 计划走向（拒绝臂的 channel 也按此分类：Open→queue 类别 / 关→exec 类别）
+    let presence = codex::presence_of(&codex::production_presence(session.form, session.pid));
+    let planned_kind = match presence {
+        codex::AppPresence::Open => HeadlessKind::CodexQueue,
+        codex::AppPresence::Closed => HeadlessKind::CodexExec,
+    };
+    let mut ctx = CodexTurnCtx {
+        device_id: device_id.to_string(),
+        device_name: device_name.to_string(),
+        tool: tool.clone(),
+        sid: session.id.clone(),
+        content: text.to_string(),
+        channel_kind: planned_kind,
+    };
+    // 可见性档（单源 = Task 7 路由表的 Injectable 结论）
+    let visibility = match crate::inject::routing::route(&tool, session.form, session.pid, os) {
+        RouteOutcome::Injectable { visibility, .. } => Some(visibility),
+        _ => None,
+    };
+    // 2) thread UUID（rollout 文件名；读链路库发现经 st.home_source 缝——测试注入 None）
+    let home = (st.home_source)().map(std::path::PathBuf::from);
+    let rollout = codex::production_rollout_path(home.as_deref(), &session.id);
+    let Some(tref) = codex::resolve_thread(rollout.as_deref(), &session.id) else {
+        return ctx.refuse(
+            st,
+            Stage::Refused,
+            "无法确定 codex thread UUID（rollout 文件名里没有 UUID，且会话号不是 UUID 形态）\
+             ——不按会话名投递（会话名有重名歧义）",
+        );
+    };
+    // 3) 命令形态（W4 单点组装：正文归一 + 移动端尾签名）
+    let payload = crate::inject::normalize::compose_injection(device_name, text);
+    let plan = codex::dispatch(presence, &tref.id, &session.project_path, &payload);
+    ctx.content = payload;
+    // 4) 会话串行锁（占位后每条失败路径都必须注销槽位——否则该会话被自己的锁挡死）
+    if !codex::registry().begin(
+        &session.id,
+        codex::TurnSlot::placeholder(&tool, ctx.content.clone()),
+    ) {
+        return ctx.refuse(
+            st,
+            Stage::Refused,
+            "该会话已有在飞的无头回合（MAM 串行锁，防同会话两回合交错）——本条未投递，\
+             请等回执后再发",
+        );
+    }
+    // 5) CLI 发现（找不到 ⇒ 如实拒绝，绝不 spawn 不存在的程序）
+    let Some(exe) = codex::production_exe() else {
+        codex::registry().end(&session.id);
+        return ctx.refuse(
+            st,
+            Stage::Spawn,
+            "codex CLI 不可达（PATH 上未找到 codex / codex.exe / codex.cmd）",
+        );
+    };
+    // 5b) 版本门控（H6：`queue --help` 子命令在场；结论按 exe mtime 缓存）
+    let verdict = codex::probe_cli(&exe, codex::probe_cache(), os).await;
+    if let Some(receipt) =
+        crate::inject::headless::gate::version_gate_receipt(&session.id, &verdict)
+    {
+        codex::registry().end(&session.id);
+        ctx.audit(
+            st,
+            crate::inject::headless::ACTION_HEADLESS,
+            &crate::inject::headless::turn::receipt_result_word(&receipt),
+            receipt.duration_ms,
+        );
+        return json_no_store(
+            StatusCode::OK,
+            headless_envelope(planned_kind, &receipt, None),
+        );
+    }
+    // 6) 回合（detached spawn；Windows npm 垫片经 spawn 形态转一手）
+    let shape = codex::spawn_shape(&exe, os);
+    let project = session.project_path.clone();
+    let task = tokio::spawn(run_codex_turn(
+        st.clone(),
+        ctx.clone(),
+        plan,
+        shape,
+        tref,
+        project,
+    ));
+    let out = match task.await {
+        Ok(o) => o,
+        Err(e) => {
+            log::error!("codex 无头回合任务异常: {e}");
+            codex::registry().end(&session.id); // 本路径占过位 → 必须注销
+            return ctx.refuse(
+                st,
+                Stage::ChannelError,
+                "回合内部任务异常终止（结果未知，请在会话内容中确认）",
+            );
+        }
+    };
+    // 7) 回执封套（channel = 实际走向；可见性档来自路由表单源）
+    json_no_store(
+        StatusCode::OK,
+        headless_envelope(out.plan_used.headless_kind(), &out.receipt, visibility),
     )
 }
 
@@ -1513,18 +1752,25 @@ pub async fn session_send(
             }),
         );
     }
-    // ⑤b 无头通道分派点（**Task 8 起 zcode 真分派**，其余家按 Task 9/11/13 逐家落地）：
-    //     路由判出无头候选而**无终端候选** = 本条只能经无头通道投递。
+    // ⑤b 无头通道分派点（**Task 8 起 zcode 真分派、Task 9 起 codex 真分派**，其余家按
+    //     Task 11/13 逐家落地）：路由判出无头候选而**无终端候选** = 本条只能经无头通道投递。
     //     - `Headless(Zcode)` → [`zcode_headless_dispatch`]（每回合 spawn、串行锁、版本门控、
     //       审计、回执封套；**绝不入队**——裁决 8）；
-    //     - 其余无头家（codex queue/exec、WorkBuddy ACP、H11 三家）执行器未接线 →
-    //       照旧如实拒绝（[`HEADLESS_PENDING_CODE`]），**绝不落终端注入臂**。
-    //     两臂都在唯一生产 INSERT（⑥）之前：无头条目进不了队列。
+    //     - `Headless(CodexQueue | CodexExec)` → [`codex_headless_dispatch`]（H8：APP 在场
+    //       分派 queue/exec resume + 消费确认自建；同样每回合 spawn、绝不入队）；
+    //     - 其余无头家（WorkBuddy ACP、H11 三家）执行器未接线 → 照旧如实拒绝
+    //       （[`HEADLESS_PENDING_CODE`]），**绝不落终端注入臂**。
+    //     三臂都在唯一生产 INSERT（⑥）之前：无头条目进不了队列。
     if let Some(kind) = crate::inject::routing::headless_kind_of(&outcome) {
         if !crate::inject::routing::has_terminal_candidate(&outcome) {
             return match kind {
                 crate::inject::routing::HeadlessKind::Zcode => {
                     zcode_headless_dispatch(&st, &device_id, &device_name, &session, &req.text)
+                        .await
+                }
+                crate::inject::routing::HeadlessKind::CodexQueue
+                | crate::inject::routing::HeadlessKind::CodexExec => {
+                    codex_headless_dispatch(&st, &device_id, &device_name, &session, &req.text)
                         .await
                 }
                 _ => json_no_store(
@@ -1805,9 +2051,9 @@ pub async fn session_send(
 
 /// routing Channel → wire 小写字符串（枚举未派生 serde，端点侧手工映射防漂移）。
 /// 无头通道名**经 [`crate::inject::routing::HeadlessKind::wire_name`]**——与审计 channel
-/// 列同源（词表只此一份，别在这里重抄）。Task 7 起无头候选在 `session_send*` 两个端点
-/// 都不会到达本函数（接线前落 `headless_pending` 拒绝，见 [`HEADLESS_PENDING_CODE`]）；
-/// Task 8 接线后本臂即为移动端展示通道名的出口。
+/// 列同源（词表只此一份，别在这里重抄）。**Task 8/9 起已接线的无头家**（zcode、codex）在
+/// `session_send_info` 的 `channels` 里经本函数透出（候选原样取自路由表）；未接线的家
+/// （WB / H11 三家）仍落 `headless_pending` 拒绝（见 [`HEADLESS_PENDING_CODE`]）。
 fn channel_wire(c: &crate::inject::routing::Channel) -> &'static str {
     use crate::inject::routing::Channel;
     match c {
@@ -1905,8 +2151,37 @@ pub async fn session_send_info(
                 "channels": [kind.wire_name()],
                 "visibility": visibility_wire(&visibility),
             })
+        } else if matches!(
+            kind,
+            crate::inject::routing::HeadlessKind::CodexQueue
+                | crate::inject::routing::HeadlessKind::CodexExec
+        ) {
+            // **Task 9：codex APP 已真分派**（H8）→ 输入区可用 + **路由表给出的候选与
+            // 可见性档原样透出**（单源 = Task 7 路由表：`[headless_codex_queue,
+            // headless_codex_exec]`，首选 = queue；APP 原生排队 ⇒ 实时可见）。
+            // 与 session-send 的实发口径同源（同一条 `route()` 结论），不在这里另判一次
+            // APP 在场性——在场性是**每回合**的运行期事实（dispatch 侧判定），不是静态能力
+            let (channels, visibility) = match &outcome {
+                crate::inject::routing::RouteOutcome::Injectable {
+                    candidates,
+                    visibility,
+                } => (
+                    candidates.iter().map(channel_wire).collect::<Vec<_>>(),
+                    visibility_wire(visibility),
+                ),
+                // 不可达（上面已 filter 出 headless_only）：如实保守回本工具的首选档
+                _ => (
+                    vec![kind.wire_name()],
+                    visibility_wire(&crate::inject::routing::Visibility::Realtime),
+                ),
+            };
+            serde_json::json!({
+                "injectable": true,
+                "channels": channels,
+                "visibility": visibility,
+            })
         } else {
-            // 其余无头家（codex/WB/H11）执行器未接线：发送必败的会话不得在这里报
+            // 其余无头家（WB/H11）执行器未接线：发送必败的会话不得在这里报
             // injectable:true（见 [`HEADLESS_PENDING_CODE`]）
             serde_json::json!({
                 "injectable": false,
@@ -1958,7 +2233,7 @@ pub struct HeadlessCancelReq {
 /// - 迟到取消（回合已终结 / watchdog 先到 / 探针期靶子未武装）→ `{cancelled:false, reason}`，
 ///   **不落取消行**（watchdog 先到的形态由回合自身记 `headless` + stage=timeout，Task 6 口径）。
 ///
-/// 取消只是「请求」：槽位由**回合自身**注销（[`crate::inject::headless::zcode::TurnRegistry::end`]），
+/// 取消只是「请求」：槽位由**回合自身**注销（[`crate::inject::headless::turn::TurnRegistry::end`]），
 /// 本端点不注销——否则回合结束前的第二发取消会看到空槽位而谎报「无在飞回合」。
 pub async fn session_headless_cancel(
     State(st): State<Arc<RemoteState>>,
@@ -1973,7 +2248,7 @@ pub async fn session_headless_cancel(
         return forbidden_defense();
     };
     let Some((content, agent_type, elapsed_ms)) =
-        crate::inject::headless::zcode::registry().slot_snapshot(&sid)
+        crate::inject::headless::turn::registry().slot_snapshot(&sid)
     else {
         return json_no_store(
             StatusCode::OK,
@@ -1983,7 +2258,7 @@ pub async fn session_headless_cancel(
             }),
         );
     };
-    match crate::inject::headless::zcode::registry().request_cancel(&sid) {
+    match crate::inject::headless::turn::registry().request_cancel(&sid) {
         Some(true) => {
             let ctx = crate::inject::headless::HeadlessAuditCtx {
                 device_id,
