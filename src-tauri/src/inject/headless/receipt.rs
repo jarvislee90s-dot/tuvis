@@ -23,7 +23,13 @@ pub enum ReceiptStatus {
     Cancelled,
 }
 
-/// 分阶段失败档（spec H6；WorkspaceBusy = zcode 工作区争用锁专档，Task 8 用）
+/// 分阶段失败档（spec H6；WorkspaceBusy = zcode 工作区争用锁专档，Task 8 用）。
+///
+/// `Refused` 是 **Task 8 复审追补**的第八档：**投递前拒绝**——回合**未起跑、零字节投递**
+/// 的拒绝（斜杠命令不具无头语义 / 会话串行锁占用 / 本平台无该通道形态）。它**不是**
+/// `ChannelError`（那一档的语义是「通道跑过了但没拿到有效回执」）——混用会让移动端分诊
+/// 文案说错话（把「没发出去」显示成「通道异常」）。线上为**增量**变体：老客户端读到
+/// 未知档时的兜底由前端分诊表负责（见 `src/mobile/SessionDetail.tsx` 的未分类兜底）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
@@ -34,6 +40,7 @@ pub enum Stage {
     ChannelError,
     Dialog,
     WorkspaceBusy,
+    Refused,
 }
 
 /// 终止方（H4：取消与 watchdog **先到者生效，回执注明由谁终止**）。由
@@ -133,7 +140,8 @@ impl Receipt {
             (ReceiptStatus::Queued, _) => Terminator::NotStarted,
             (ReceiptStatus::Cancelled, _) => Terminator::Cancel,
             (ReceiptStatus::Failed, Some(Stage::Timeout)) => Terminator::Watchdog,
-            (ReceiptStatus::Failed, Some(Stage::Spawn | Stage::VersionGate)) => {
+            // 未起跑三档：排队/版本门控拒发/投递前拒绝（Refused —— 零字节投递）
+            (ReceiptStatus::Failed, Some(Stage::Spawn | Stage::VersionGate | Stage::Refused)) => {
                 Terminator::NotStarted
             }
             _ => Terminator::Exit,
@@ -401,7 +409,10 @@ mod tests {
         }
     }
 
-    /// 阶段串钉死（移动端按 stage 分诊文案）：七档全量在册
+    /// 阶段串钉死（移动端按 stage 分诊文案）：八档全量在册。
+    /// **跨语言锁**：同一份名单另存 `tests/fixtures/headless_stages.json`，前端分诊表
+    /// （`src/mobile/SessionDetail.tsx`）与 Rust 侧各自对照它断言——任一侧新增变体而另一侧
+    /// 没跟上，必有一侧先红（夹具是唯一名单来源，避免两处硬编码漂移）。
     #[test]
     fn stage_wire_names_are_pinned() {
         let pairs = [
@@ -412,10 +423,43 @@ mod tests {
             (Stage::ChannelError, "channel_error"),
             (Stage::Dialog, "dialog"),
             (Stage::WorkspaceBusy, "workspace_busy"),
+            (Stage::Refused, "refused"),
         ];
         for (st, name) in pairs {
             assert_eq!(serde_json::to_value(st).unwrap(), serde_json::json!(name));
         }
+        // 跨语言夹具锁：枚举变体集合 == 夹具名单（新增变体必须同步夹具与前端分诊表）
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("tests")
+                .join("fixtures")
+                .join("headless_stages.json"),
+        )
+        .expect("跨语言夹具必须存在（tests/fixtures/headless_stages.json）");
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("夹具必须是合法 JSON");
+        let mut want: Vec<String> = fixture["stages"]
+            .as_array()
+            .expect("夹具须有 stages 数组")
+            .iter()
+            .map(|v| v.as_str().expect("stages 元素须为字符串").to_string())
+            .collect();
+        let mut got: Vec<String> = pairs
+            .iter()
+            .map(|(st, _)| {
+                serde_json::to_value(st)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        want.sort();
+        got.sort();
+        assert_eq!(
+            got, want,
+            "Stage 变体集合与跨语言夹具不一致（前端分诊表按同一夹具断言）"
+        );
     }
 
     /// 前缀跳过：无 JSON 行 → None（调用方据此判 channel_error，不猜）

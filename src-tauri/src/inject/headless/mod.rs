@@ -14,6 +14,8 @@
 pub mod gate;
 pub mod receipt;
 pub mod runner;
+/// H7 zcode 无头通道（Task 8；codex/workbuddy/CLI 三家分属 Task 9/11/13）
+pub mod zcode;
 
 /// 无头动作审计词（H6）：turn 落账（终态 = 回执终态）
 pub const ACTION_HEADLESS: &str = "headless";

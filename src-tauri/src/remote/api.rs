@@ -1097,28 +1097,292 @@ fn headless_blocked(
     }
 }
 
-/// **无头分派未接线的诚实拒绝码**（Task 7 过渡态）：路由已判「本条只能经无头通道投递」
-/// （无头候选在场且无终端候选），但无头执行器要到 Task 8/9/11/13 才逐家落地——接线前
-/// **不投递也不入队**（绝不落终端注入臂：zcode/workbuddy 的 pid 不是终端宿主，终端注入
-/// 会打错窗口）。本拒绝是**入队侧**的保证：它在唯一生产 INSERT 之前拦下，故无头条目进不了
-/// 队列；**它不是投递侧保证**（队列 flush 循环既不判 H3 开关也不重跑路由——入队**之后**才
-/// 变成无头绑定的条目仍会被终端注入器投递，详见 `inject/queue.rs` 模块头的 H 系登记段）。
+/// **无头分派未接线的诚实拒绝码**（Task 7 过渡态；**Task 8 起只覆盖尚未接线的家**）：
+/// 路由已判「本条只能经无头通道投递」（无头候选在场且无终端候选），但无头执行器逐家落地
+/// ——接线前**不投递也不入队**（绝不落终端注入臂：zcode/workbuddy 的 pid 不是终端宿主，
+/// 终端注入会打错窗口）。本拒绝是**入队侧**的保证：它在唯一生产 INSERT 之前拦下，故无头
+/// 条目进不了队列。
 ///
-/// **Task 8 义务（读到本行的第一件事，编号勿漏）**：
-/// 1. **真分派**：把本码替换为按 `routing::headless_kind_of` 结论走对应无头适配器
-///    （Task 6 底座：`headless::runner_from_conn` 取超时/并发、`headless::audit_headless`
-///    落账）；
-/// 2. **每回合 spawn、不得入队**（裁决 8）：无头回合不得经 `enqueue_conn` 进队列——入队会让
-///    `inject/queue.rs` 的 flush 循环用终端注入器投递无头条目（该循环无 H3 门）；
-/// 3. **补投递侧重判**：裁决 `inject::queue::try_flush_with` 是否在投递前重跑 H3 门/路由
-///    结论，**不得让总开关被「入队后状态漂移」绕过**（收口点登记在 `inject/queue.rs`
-///    模块头 H 系登记段第 2 条）；
-/// 4. **两个消费点同步改**（session_send ⑤b 与 session_send_info 的本段判据），否则移动端会
-///    出现「输入框可用但发送必败」。
+/// **Task 8 落地后的覆盖面**：**zcode 已摘出本码**——`Headless(Zcode)` 走
+/// [`zcode_headless_dispatch`] 真分派（每回合 spawn、会话串行锁、版本门控、审计、回执
+/// 封套）。仍在册的家 = `CodexQueue` / `CodexExec`（Task 9）、`WbAcp`（Task 11）、
+/// `ClaudeP` / `KimiP` / `OpencodeRun`（Task 13）——**这些必须继续拒在本码上，且不得落
+/// 终端注入臂**（⑤b 的 `has_terminal_candidate` 门 + 本臂都在 INSERT 之前）。
+///
+/// **投递侧重判已补**（Task 8 义务 2，收口点见 `inject/queue.rs::try_flush_with`）：入队
+/// **之后**才变成无头绑定的条目（如 claude 进程退出 → pid=0 未读卡）在投递前重跑路由结论，
+/// 命中即 `Deferred`（不投递、不消费队首）——总开关不再被「入队后状态漂移」绕过。
 pub(crate) const HEADLESS_PENDING_CODE: &str = "headless_pending";
 /// 上述拒绝的置灰/回执文案（与 `HEADLESS_DISABLED_REASON` 同款：后端给文案、前端只渲染）
 pub(crate) const HEADLESS_PENDING_REASON: &str =
     "无头通道分派待接线（H7–H11 逐家落地中），本次不投递";
+
+// ============================================================
+// H7 zcode 无头分派（Task 8）
+// ============================================================
+
+/// 无头落账薄壳（Task 6 单一账本：`headless::audit_headless` + 既有 `write_audit` 表）。
+/// 设备/会话/通道/正文全在 ctx 里（W5 摘要口径、耗时编码都在 Task 6 侧单点）。
+fn audit_headless_ctx(
+    st: &Arc<RemoteState>,
+    ctx: &crate::inject::headless::HeadlessAuditCtx,
+    action: &str,
+    result: &str,
+    duration_ms: u64,
+) {
+    st.store
+        .with(|c| crate::inject::headless::audit_headless(c, ctx, action, result, duration_ms));
+}
+
+/// 无头回执**线上封套**（H7 契约）：`status:"headless"` + Task 6 的
+/// [`crate::inject::headless::receipt::Receipt`]（**原样透出，不重造**——形状由 Task 6
+/// 钉死）+ 可见性档与文案（文案经 `routing::Visibility::note()` 单点，前端只渲染）。
+/// HTTP 恒 200（与 `session-send` 的「语义在 body.status」同口径）：失败在
+/// `receipt.status/stage/reason` 里如实上报——**绝不冒充成功**。
+fn headless_envelope(
+    kind: crate::inject::routing::HeadlessKind,
+    receipt: &crate::inject::headless::receipt::Receipt,
+    visibility: Option<crate::inject::routing::Visibility>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "status": "headless",
+        "channel": kind.wire_name(),
+        "receipt": receipt,
+    });
+    if let Some(v) = visibility {
+        body["visibility"] = serde_json::json!(visibility_wire(&v));
+        body["visibilityNote"] = serde_json::json!(v.note());
+    }
+    body
+}
+
+/// 单回合分派的审计上下文（**设备身份由端点注入**——机器自发动作不得冒充某台手机）。
+/// `content` 在命令形态组装后更新为**最终 `--prompt` 载荷**（与终端注入的 composed
+/// content 同口径）；早于组装的拒绝行记录**用户原文**（未组装即未发送，如实记）。
+#[derive(Clone)]
+struct ZcodeTurnCtx {
+    device_id: String,
+    device_name: String,
+    tool: String,
+    sid: String,
+    content: String,
+}
+
+impl ZcodeTurnCtx {
+    fn audit_ctx(&self) -> crate::inject::headless::HeadlessAuditCtx {
+        crate::inject::headless::HeadlessAuditCtx {
+            device_id: self.device_id.clone(),
+            device_name: self.device_name.clone(),
+            agent_type: self.tool.clone(),
+            session_id: self.sid.clone(),
+            channel: crate::inject::routing::HeadlessKind::Zcode
+                .wire_name()
+                .to_string(),
+            content: self.content.clone(),
+        }
+    }
+
+    /// 落账（回合终态/取消/拒绝共用；result 词 = 终态 + 阶段码，见
+    /// `zcode::receipt_result_word`）
+    fn audit(&self, st: &Arc<RemoteState>, action: &str, result: &str, duration_ms: u64) {
+        audit_headless_ctx(st, &self.audit_ctx(), action, result, duration_ms);
+    }
+
+    /// 拒绝/失败臂：如实失败回执（HTTP 200 + `receipt.status=failed`）+ 落账。
+    /// **不碰串行锁**：槽位只由「占过位」的路径注销（占位前的拒绝若误调 `end`，会把
+    /// **别人的**在飞回合槽位注销掉——取消靶子随之消失，移动端取消钮变成哑的）。
+    fn refuse(
+        &self,
+        st: &Arc<RemoteState>,
+        stage: crate::inject::headless::receipt::Stage,
+        reason: &str,
+    ) -> Response {
+        let receipt = crate::inject::headless::receipt::Receipt::failed(stage, reason)
+            .with_session(&self.sid);
+        self.audit(
+            st,
+            crate::inject::headless::ACTION_HEADLESS,
+            &crate::inject::headless::zcode::receipt_result_word(&receipt),
+            receipt.duration_ms,
+        );
+        json_no_store(
+            StatusCode::OK,
+            headless_envelope(crate::inject::routing::HeadlessKind::Zcode, &receipt, None),
+        )
+    }
+}
+
+/// 真回合执行（**每回合 spawn 子进程**，裁决 8：turn 生命周期 = 进程生命周期）；
+/// 超时/并发按设置经 `headless::runner_from_conn` 读取（Task 6 义务②：不自建 `GlobalSem`），
+/// 回合终结后落 `headless` 审计行并注销串行锁。
+async fn run_zcode_turn(
+    st: Arc<RemoteState>,
+    ctx: ZcodeTurnCtx,
+    inv: crate::inject::headless::zcode::ZcodeInvocation,
+    project: String,
+) -> crate::inject::headless::zcode::TurnOutcome {
+    let os = std::env::consts::OS;
+    let deps = crate::inject::headless::zcode::TurnDeps::production(os);
+    // 每尝试新建回合配置（超时是回合属性；并发上限是全局名额，读设置即生效）
+    let build = |inv: &crate::inject::headless::zcode::ZcodeInvocation| {
+        let mut cfg = st
+            .store
+            .with(|c| crate::inject::headless::runner_from_conn(&inv.program, c));
+        cfg = cfg
+            .args(inv.argv.clone())
+            .cwd(project.clone())
+            .session_id(ctx.sid.clone());
+        for (k, v) in &inv.env {
+            cfg = cfg.env(k.clone(), v.clone());
+        }
+        cfg
+    };
+    let seam = crate::inject::headless::zcode::production_run_seam();
+    let out =
+        crate::inject::headless::zcode::run_turn(&inv, &ctx.sid, &project, &build, &deps, &*seam)
+            .await;
+    ctx.audit(
+        &st,
+        crate::inject::headless::ACTION_HEADLESS,
+        &crate::inject::headless::zcode::receipt_result_word(&out.receipt),
+        out.receipt.duration_ms,
+    );
+    crate::inject::headless::zcode::registry().end(&ctx.sid);
+    out
+}
+
+/// **zcode 无头分派**（H7 / Task 8；`session_send` ⑤b 的 `Headless(Zcode)` 臂）。
+///
+/// 顺序与理由（每步都有判据依赖，勿随意改）：
+/// 1. **平台门**：无头命令形态只有 Windows/macOS 两态（探测定案）——其他平台如实拒绝；
+/// 2. **斜杠命令显式拒绝**（spec H7：`/…` 在无头 CLI 里是字面文本、与 APP 内命令不具
+///    等价性——显式告知，不静默透传冒充支持）；判据复用 `normalize::is_slash_message`；
+/// 3. **会话串行锁**（MAM 自己的）：同会话重叠回合如实拒绝（不排队、不覆盖——zcode 无头
+///    自身不拒绝并发，两个进程交错写同一个库会互相踩）。**排在安装/版本检查之前**：
+///    锁保护的是会话，越早占位竞态窗口越小；
+/// 4. **安装形态发现**（会话宿主进程 exe 优先 + 常见安装路径）：找不到 cjs → 如实拒绝
+///    （**绝不 spawn 不存在的程序**）+ 注销槽位（否则该会话被自己的锁挡死）；
+/// 5. **命令形态组装**（`zcode::build_argv`；正文签名/换行归一走 W4 单点）——此后落账的
+///    `content` 是**最终 `--prompt` 载荷**（与终端注入的 composed content 同口径）；
+///    组装前的行（斜杠/串行锁/安装不可达）记**用户原文**（如实：那时还没组装）；
+/// 6. **版本门控探针**（H6：`--prompt` 干跑能出 JSON 即过；结论按 exe/cjs mtime 缓存）；
+/// 7. **回合**（detached task：客户端断连不打断已起跑的回合——**正文已进 ZCode，丢回执
+///    可以，丢用户消息不行**；回执/审计/注销都在任务内完成）；
+/// 8. 回执封套 + **信任可见性**（`~/.zcode/v2/setting.json` 只读，经 `st.home_source`
+///    缝取主目录——测试注入 tempdir/None，绝不触真实 `~/.zcode`）。
+pub(crate) async fn zcode_headless_dispatch(
+    st: &Arc<RemoteState>,
+    device_id: &str,
+    device_name: &str,
+    session: &crate::session::Session,
+    text: &str,
+) -> Response {
+    use crate::inject::headless::receipt::Stage;
+    use crate::inject::headless::zcode;
+    use crate::inject::routing::HeadlessKind;
+
+    let os = std::env::consts::OS;
+    let mut ctx = ZcodeTurnCtx {
+        device_id: device_id.to_string(),
+        device_name: device_name.to_string(),
+        tool: session.agent_type.tool_id().to_string(),
+        sid: session.id.clone(),
+        content: text.to_string(),
+    };
+    // 1) 平台门（投递前拒绝：本平台没有该无头命令形态 —— 回合未起跑、零字节投递）
+    if os != "windows" && os != "macos" {
+        return ctx.refuse(
+            st,
+            Stage::Refused,
+            "zcode 无头通道只支持 Windows / macOS（探测定案两形态）",
+        );
+    }
+    // 2) 斜杠命令：显式拒绝（不冒充支持；未起跑、零字节投递 → Refused 而非 ChannelError）
+    if let Some(reason) = zcode::slash_refusal(text) {
+        return ctx.refuse(st, Stage::Refused, reason);
+    }
+    // 3) 会话串行锁
+    if !zcode::registry().begin(
+        &session.id,
+        zcode::TurnSlot::placeholder(&ctx.tool, ctx.content.clone()),
+    ) {
+        return ctx.refuse(
+            st,
+            Stage::Refused,
+            "该会话已有在飞的无头回合（MAM 串行锁，防同会话两回合交错写库）——本条未投递，请等回执后再发",
+        );
+    }
+    // 4) 安装形态（占位后失败必须注销槽位）
+    let Some(spec) = zcode::resolve_spec(&zcode::production_roots(session.pid), os) else {
+        zcode::registry().end(&session.id);
+        return ctx.refuse(
+            st,
+            Stage::Spawn,
+            "ZCode 安装路径不可达（未找到 resources/glm/zcode.cjs；会话宿主进程不在场时请确认 ZCode 装在默认路径）",
+        );
+    };
+    // 5) 命令形态（W4 单点组装：正文归一 + 移动端尾签名）
+    let inv = zcode::build_argv(
+        &spec,
+        text,
+        &session.id,
+        &session.project_path,
+        Some(device_name),
+    );
+    ctx.content = inv.prompt.clone();
+    // 6) 版本门控（探针期间取消靶子仍是空占位——取消会如实报「未送达」）
+    let verdict = crate::inject::headless::gate::probe(
+        &crate::inject::headless::gate::ProbeSpec::Zcode {
+            exe: spec.exe.clone(),
+            cjs: spec.cjs.clone(),
+        },
+        zcode::probe_cache(),
+        os,
+    )
+    .await;
+    if let Some(receipt) =
+        crate::inject::headless::gate::version_gate_receipt(&session.id, &verdict)
+    {
+        zcode::registry().end(&session.id);
+        ctx.audit(
+            st,
+            crate::inject::headless::ACTION_HEADLESS,
+            &zcode::receipt_result_word(&receipt),
+            receipt.duration_ms,
+        );
+        return json_no_store(
+            StatusCode::OK,
+            headless_envelope(HeadlessKind::Zcode, &receipt, None),
+        );
+    }
+    // 7) 回合（detached spawn）
+    let project = session.project_path.clone();
+    let task = tokio::spawn(run_zcode_turn(
+        st.clone(),
+        ctx.clone(),
+        inv,
+        project.clone(),
+    ));
+    let out = match task.await {
+        Ok(o) => o,
+        Err(e) => {
+            log::error!("zcode 无头回合任务异常: {e}");
+            zcode::registry().end(&session.id); // 本路径占过位 → 必须注销
+            return ctx.refuse(
+                st,
+                Stage::ChannelError,
+                "回合内部任务异常终止（结果未知，请在会话内容中确认）",
+            );
+        }
+    };
+    // 8) 回执封套 + 可见性（信任表只读；读不到 = 保守判未信任）
+    let home = (st.home_source)().map(std::path::PathBuf::from);
+    let visibility = zcode::visibility_of(&project, home.as_deref(), os);
+    json_no_store(
+        StatusCode::OK,
+        headless_envelope(HeadlessKind::Zcode, &out.receipt, Some(visibility)),
+    )
+}
 
 /// 端点审计 action 选择（丁T3 裁2，**单点**）：`/` 开头消息记 `slash`，其余按投递
 /// 路径记 `send` / `queue`。
@@ -1249,27 +1513,30 @@ pub async fn session_send(
             }),
         );
     }
-    // ⑤b 无头通道分派点（**Task 8/9/11/13 在这里接**，H7–H11 逐家落地）：路由判出无头
-    //     候选而**无终端候选** = 本条只能经无头通道投递。执行器接线前**如实拒绝**（见
-    //     [`HEADLESS_PENDING_CODE`] 文档的 Task 8 义务），**绝不落终端注入臂**——zcode /
-    //     workbuddy / codex APP 的 pid 不是终端宿主，终端注入会打错窗口。
-    //     本拒绝是**入队侧**的保证（唯一生产 INSERT 在它之后——入队口只此一处）：无头条目
-    //     进不了队列。**但它不是投递侧保证**：flush 循环
-    //     （`inject/queue.rs::flush_one` / `try_flush_with`）既不判 H3 开关也不重跑 `route()`，
-    //     故**入队之后**才变成无头绑定的条目（如 claude 进程退出 → pid = 0 未读卡）仍会被
-    //     终端注入器投递，开关管不到——该漂移的收口是 Task 8 的**编号义务第 3 条**
-    //     （见 [`HEADLESS_PENDING_CODE`] 文档与 `inject/queue.rs` H 系登记段）。
-    if crate::inject::routing::headless_kind_of(&outcome).is_some()
-        && !crate::inject::routing::has_terminal_candidate(&outcome)
-    {
-        return json_no_store(
-            StatusCode::FORBIDDEN,
-            serde_json::json!({
-                "error": "not_injectable",
-                "reason": HEADLESS_PENDING_REASON,
-                "reasonCode": HEADLESS_PENDING_CODE,
-            }),
-        );
+    // ⑤b 无头通道分派点（**Task 8 起 zcode 真分派**，其余家按 Task 9/11/13 逐家落地）：
+    //     路由判出无头候选而**无终端候选** = 本条只能经无头通道投递。
+    //     - `Headless(Zcode)` → [`zcode_headless_dispatch`]（每回合 spawn、串行锁、版本门控、
+    //       审计、回执封套；**绝不入队**——裁决 8）；
+    //     - 其余无头家（codex queue/exec、WorkBuddy ACP、H11 三家）执行器未接线 →
+    //       照旧如实拒绝（[`HEADLESS_PENDING_CODE`]），**绝不落终端注入臂**。
+    //     两臂都在唯一生产 INSERT（⑥）之前：无头条目进不了队列。
+    if let Some(kind) = crate::inject::routing::headless_kind_of(&outcome) {
+        if !crate::inject::routing::has_terminal_candidate(&outcome) {
+            return match kind {
+                crate::inject::routing::HeadlessKind::Zcode => {
+                    zcode_headless_dispatch(&st, &device_id, &device_name, &session, &req.text)
+                        .await
+                }
+                _ => json_no_store(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({
+                        "error": "not_injectable",
+                        "reason": HEADLESS_PENDING_REASON,
+                        "reasonCode": HEADLESS_PENDING_CODE,
+                    }),
+                ),
+            };
+        }
     }
     // ⑥ 组装（裁决 6 归一在入队时一次完成）+ 入队（FIFO 保序）。
     //
@@ -1553,9 +1820,10 @@ fn channel_wire(c: &crate::inject::routing::Channel) -> &'static str {
 }
 
 /// routing Visibility → wire 字符串（与移动端 SendInfo 联合类型对齐）。
-/// **Task 8 义务**：`after_restart` / `tuvis_only` 两值须同步进移动端 `SendInfo.visibility`
-/// 联合类型（`src/mobile/api.ts`）并接 `Visibility::note()` 的提示文案——本批无头候选不
-/// 到达端点，故前端类型暂未扩（避免加了没人发的值）。
+/// **Task 8 已接线**：`after_restart` / `tuvis_only` 两值已同步进移动端 `SendInfo.visibility`
+/// 联合类型（`src/mobile/api.ts`），提示文案走 `routing::Visibility::note()`（无头回执封套
+/// 的 `visibilityNote` 键）；zcode 的 `session-send-info` / `session-send` 两条路径都按
+/// **真信任档**下发（信任探针见 `headless::zcode::visibility_of`）。
 fn visibility_wire(v: &crate::inject::routing::Visibility) -> &'static str {
     use crate::inject::routing::Visibility;
     match v {
@@ -1617,17 +1885,35 @@ pub async fn session_send_info(
     }
     let outcome =
         crate::inject::routing::route(&tool, session.form, session.pid, std::env::consts::OS);
-    let body = if crate::inject::routing::headless_kind_of(&outcome).is_some()
-        && !crate::inject::routing::has_terminal_candidate(&outcome)
-    {
-        // 无头分派未接线（Task 7 过渡态）：与 session-send ⑤b **同一判据**——发送端点
-        // 必败的会话不得在这里报 injectable:true（否则移动端出现「输入框可用、发送必败」）。
-        // Task 8 接线时两端点同步改为真分派（见 [`HEADLESS_PENDING_CODE`] 的义务清单）
-        serde_json::json!({
-            "injectable": false,
-            "reasonCode": HEADLESS_PENDING_CODE,
-            "reason": HEADLESS_PENDING_REASON,
-        })
+    // 无头归属 + 无终端候选 = 本条只能经无头通道投递（判据与 session-send ⑤b 同源）
+    let headless_only = crate::inject::routing::headless_kind_of(&outcome)
+        .filter(|_| !crate::inject::routing::has_terminal_candidate(&outcome));
+    let body = if let Some(kind) = headless_only {
+        if kind == crate::inject::routing::HeadlessKind::Zcode {
+            // **Task 8：zcode 已真分派** → 输入区可用（injectable:true）+ 无头通道名 +
+            // **真可见性档**（信任探针经 `st.home_source` 缝取主目录：生产 = dirs::home_dir
+            // → `~/.zcode/v2/setting.json` 只读；测试 = None/tempdir，**绝不触真实 ~/.zcode**）。
+            // 与 session-send 的实发口径一致，杜绝「输入框可用但发送必败」的反向形态。
+            let home = (st.home_source)().map(std::path::PathBuf::from);
+            let visibility = crate::inject::headless::zcode::visibility_of(
+                &session.project_path,
+                home.as_deref(),
+                std::env::consts::OS,
+            );
+            serde_json::json!({
+                "injectable": true,
+                "channels": [kind.wire_name()],
+                "visibility": visibility_wire(&visibility),
+            })
+        } else {
+            // 其余无头家（codex/WB/H11）执行器未接线：发送必败的会话不得在这里报
+            // injectable:true（见 [`HEADLESS_PENDING_CODE`]）
+            serde_json::json!({
+                "injectable": false,
+                "reasonCode": HEADLESS_PENDING_CODE,
+                "reason": HEADLESS_PENDING_REASON,
+            })
+        }
     } else {
         match outcome {
             crate::inject::routing::RouteOutcome::Injectable {
@@ -1651,6 +1937,83 @@ pub async fn session_send_info(
         }
     };
     json_no_store(StatusCode::OK, body)
+}
+
+/// POST /m/api/v1/session-headless-cancel 请求体（camelCase；缺参由 handler 统一 400，
+/// 不让 serde 提取器抢答——与 `SessionSendReq` 同口径）
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadlessCancelReq {
+    #[serde(default)]
+    pub session_id: String,
+}
+
+/// POST /m/api/v1/session-headless-cancel（H4/H6 + Task 8 移动端取消钮）：
+/// 取消该会话**在飞**的无头回合。契约（HTTP 恒 200，语义在 body）：
+/// - 缺参/空 → 400；无设备 cookie → 403 防御；
+/// - 无在飞回合 → `{cancelled:false, reason}`（**不落审计**——没有取消动作发生）；
+/// - 取消送达（**先到者生效**）→ `{cancelled:true}` + `headless_cancel` 审计行
+///   （Task 6 词表：`ACTION_HEADLESS_CANCEL`；设备 = **按下取消的这台设备**，正文/工具 =
+///   回合自身——与 `headless` 行同源；耗时 = 回合起跑到取消送达的墙钟）；
+/// - 迟到取消（回合已终结 / watchdog 先到 / 探针期靶子未武装）→ `{cancelled:false, reason}`，
+///   **不落取消行**（watchdog 先到的形态由回合自身记 `headless` + stage=timeout，Task 6 口径）。
+///
+/// 取消只是「请求」：槽位由**回合自身**注销（[`crate::inject::headless::zcode::TurnRegistry::end`]），
+/// 本端点不注销——否则回合结束前的第二发取消会看到空槽位而谎报「无在飞回合」。
+pub async fn session_headless_cancel(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<HeadlessCancelReq>,
+) -> Response {
+    let sid = req.session_id.trim().to_string();
+    if sid.is_empty() {
+        return bad_request();
+    }
+    let Some((device_id, device_name)) = device_identity(&st, &headers) else {
+        return forbidden_defense();
+    };
+    let Some((content, agent_type, elapsed_ms)) =
+        crate::inject::headless::zcode::registry().slot_snapshot(&sid)
+    else {
+        return json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "cancelled": false,
+                "reason": "该会话没有在飞的无头回合",
+            }),
+        );
+    };
+    match crate::inject::headless::zcode::registry().request_cancel(&sid) {
+        Some(true) => {
+            let ctx = crate::inject::headless::HeadlessAuditCtx {
+                device_id,
+                device_name,
+                agent_type,
+                session_id: sid,
+                channel: crate::inject::routing::HeadlessKind::Zcode
+                    .wire_name()
+                    .to_string(),
+                content,
+            };
+            audit_headless_ctx(
+                &st,
+                &ctx,
+                crate::inject::headless::ACTION_HEADLESS_CANCEL,
+                "cancelled",
+                elapsed_ms,
+            );
+            json_no_store(StatusCode::OK, serde_json::json!({ "cancelled": true }))
+        }
+        // Some(false) = 回合已终结/已取消（先到者生效）；None = 槽位在快照与请求之间被
+        // 回合注销（并发窗口）——两形态都如实报「未送达」，不落账
+        _ => json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "cancelled": false,
+                "reason": "取消未送达（回合已终结或已取消——先到者生效）",
+            }),
+        ),
+    }
 }
 
 /// GET /m/api/v1/session-queue?session_id=（W4 排队视图）：该会话全部待发消息

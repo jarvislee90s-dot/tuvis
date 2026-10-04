@@ -142,6 +142,23 @@
   `--prompt "<文本> [mobile <花名>]" --resume <sess_id> --cwd <项目> --mode yolo --json`
   → stdout 解析（**跳过非 JSON 前缀行**——Mac 实证 `ZCode Built-in missing/skipped (not-due)` 污染）→ 归一回执（末条 assistant 摘要 + token 用量 + 耗时 + sessionId）→ 移动端回执卡；可见性提示**两端定案文案**：「已信任工作区：重启 ZCode 应用后可见；未信任工作区：仅 MAM 可见」。消息落库经读链路自然上板（手机/桌面 MAM 可见）。
 - **边界**：**在册工作区限定**（F2.3/D6 不变）；`--mode` 默认 yolo（裁决 14，H3 兜底）；同会话串行 MAM 自建维持（zcode 无头不拒绝并发，PZ 定案）；**APP×无头并发 = 工作区级瞬态争用锁**（Mac 逐变量排除定案：APP 活跃工作区 → `Model creation failed` 1s，APP 空闲即恢复；争用型非排他型）→ **注入前置「APP 工作区活跃探测 + 探活重试」，冲突回执「工作区忙，稍后自动重试或手动再发」**；多行 `\n` 归一与 W4 同口径；斜杠命令字面化（PZ 定案：不等效，MAM 侧拦截或明示）。
+- **⚠️ Task 8 实机修订（2026-10-05，Windows + ZCode v0.16.9，硬证据——更正本节字面）**：
+  1. **provider config 在 Windows 同样需要**（本节原字面只说 macOS）：真机 CLI 自报查找表为
+     `<root>\resources\glm\provider\zcode-builtin.json` 与 `<盘>:\config\provider\zcode-builtin.json`，
+     而装包**实际**把文件放在 `<root>\resources\config\provider\zcode-builtin.json`（真机 stat 实证）
+     ——**与 Mac 同款的打包布局错位**；不设 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 时（Windows 上）
+     `--prompt` **直接失败**：`无法定位 CLI ZCode Built-in Provider Config：…`（exit 1、0.5s 内退出、
+     不触模型）。**两端统一按 cjs 反推路径**（`<Resources>/config/provider/zcode-builtin.json`）；
+     实现取「macOS 无条件设、Windows 推导路径在场才设」（见 `inject/headless/gate.rs::provider_config_env`）。
+  2. **版本探针不是 `--prompt ""` 干跑，而是**一次**真实最小模型回合**：真机 CLI 拒绝空载荷
+     （`--prompt requires non-empty text.`）——空串探针在真机**恒失败**，会把通道变成永久拒发。
+     现探针载荷 = 最短非空（`hi`），结论按 (exe 在场性 + mtime) **成功长缓存 / 失败 5 分钟 TTL**
+     （失败不得钉死通道；见 `gate.rs::PROBE_PROMPT` / `FAILURE_TTL_MS`）。
+  3. **回执真源 = 会话库，不是 stdout**：真机 `--resume` 回合进程 exit 0 且会话库确有回复
+     （末条 assistant + `tokens.output`），但 **stdout 没有可解析 JSON**——故 stdout 只作**完成信号**
+     （退出码 / 看门狗 / 争用串），`lastAssistant`/`tokens` 取自 `~/.zcode/cli/db/db.sqlite` 只读读链路
+     （确认判据 = 回合前后「末条 assistant 消息 id 变了」，有界轮询 3×1s）；stdout JSON 路径保留为**第一优先**
+     （未来子命令仍可能出 JSON）。
 
 ### H8 · codex APP 托管会话发消息
 

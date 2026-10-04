@@ -46,6 +46,8 @@ import {
   fetchSessionFiles,
   fetchSessionMessages,
   fetchSessionSubagents,
+  headlessCancel,
+  type HeadlessTurn,
   type SessionFileEntry,
   type SessionMessage,
   type SubagentView,
@@ -115,6 +117,220 @@ const FONT_SCALES = [0.5, 0.75, 1, 1.25] as const;
 /** 拉取失败态：status=null 表示网络层异常（无 HTTP 状态可读） */
 interface LoadError {
   status: number | null;
+}
+
+// ============================================================
+// 无头回执卡（Task 8 / H7）：发送中 / 回执 / 失败分诊 + 取消钮
+// ============================================================
+
+/** 失败阶段 → **用户可读分诊文案**（与 Rust `inject::headless::receipt::Stage` 的 wire 词
+ *  一一对应，勿漂移）。这是**分诊**不是编造结论：每条只说该阶段实际发生了什么；未知档
+ *  如实显示「未分类失败」+ 后端 reason 原文，不猜成因。
+ *
+ *  **跨语言锁**：本表键集合必须与 `tests/fixtures/headless_stages.json` 的 `stages`
+ *  逐项相等（Rust 侧 `receipt::stage_wire_names_are_pinned` 断言同一份夹具）——任一侧
+ *  新增变体而另一侧没跟上，必有一侧先红。 */
+export const HEADLESS_STAGE_TRIAGE: Record<string, string> = {
+  spawn: "进程未能启动（安装路径 / 权限）",
+  version_gate: "版本门控未通过（CLI flag 面已变，MAM 拒发以防盲发）",
+  timeout: "回合超时（看门狗已终止进程树）",
+  crash: "进程异常退出",
+  channel_error: "通道异常（未拿到有效回执）",
+  dialog: "终端对话框在场",
+  workspace_busy: "工作区忙（ZCode 应用正在该工作区活动）",
+  // 投递前拒绝（Task 8 复审追补）：回合**未起跑、零字节投递**——不是通道故障，
+  // 与 channel_error 分列，文案必须说清「没发出去」
+  refused: "投递前拒绝（未起跑、未发送）——原因见下",
+};
+
+/** 阶段分诊文案（未知/缺省 → 如实标注，不编成因） */
+export function headlessStageText(stage?: string | null): string {
+  if (!stage) return "未分类失败";
+  return HEADLESS_STAGE_TRIAGE[stage] ?? `未分类失败（${stage}）`;
+}
+
+/** 耗时展示：<1s 走毫秒（探测级回合），≥1s 走秒（一位小数） */
+export function headlessDurationText(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** 无头回执卡（Task 8 / H7）：三态——发送中（带取消钮）/ 回执 / 失败分诊。
+ *
+ *  **文案纪律**：assistant 摘要、token、耗时、可见性提示**全部来自后端回执**（`Visibility::note()`
+ *  逐字文案）——前端只渲染不另编，与 H3 置灰同款单一措辞出口。可见性提示只在**回合真的
+ *  落到工作区**（ok/cancelled）时展示：失败/排队时什么都没写进工作区，承诺「重启后可见」
+ *  就是谎报。
+ *
+ *  **取消钮**：仅在发送中在场；点它调 `/session-headless-cancel`（**请求**语义——送达与否
+ *  如实回显，回合照常以回执收尾）。`data-phase` 供测试与样式分态。 */
+export function HeadlessReceiptCard({
+  session,
+  turn,
+  onDismiss,
+}: {
+  session: Session;
+  turn: HeadlessTurn | null;
+  onDismiss: () => void;
+}) {
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelNote, setCancelNote] = useState<string | null>(null);
+  // 回合态翻转即清掉上一发的取消提示（避免「已请求取消」标签挂在下一回合上）
+  useEffect(() => {
+    setCancelNote(null);
+  }, [turn]);
+  if (turn === null) return null;
+
+  if (turn.phase === "sending") {
+    return (
+      <div
+        data-testid="headless-receipt-card"
+        data-phase="sending"
+        className="mx-3 mb-2 rounded-lg border border-sky-300/60 bg-sky-500/5 px-3 py-2 dark:border-sky-700/60 dark:bg-sky-400/5"
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            data-testid="headless-sending"
+            className="rounded-full bg-sky-500/10 px-2 py-0.5 text-xs text-sky-700 dark:bg-sky-400/10 dark:text-sky-300"
+          >
+            <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-sky-500 align-middle" />
+            无头回合进行中…（进程级回合，可能持续数十秒）
+          </span>
+          <button
+            type="button"
+            data-testid="headless-cancel"
+            disabled={cancelling}
+            onClick={() => {
+              setCancelling(true);
+              void headlessCancel(session.id)
+                .then((res) => {
+                  setCancelNote(
+                    res.cancelled
+                      ? "已请求取消（回合会以「已取消」回执收尾）"
+                      : (res.reason ?? "取消未送达（回合可能已结束）")
+                  );
+                })
+                .catch((e: unknown) => {
+                  setCancelNote(
+                    e instanceof ApiError ? `取消失败：${e.message}` : `取消失败：${String(e)}`
+                  );
+                })
+                .finally(() => setCancelling(false));
+            }}
+            className="rounded-full bg-rose-500/10 px-2 py-0.5 text-xs text-rose-700 disabled:opacity-40 dark:bg-rose-400/10 dark:text-rose-300"
+          >
+            取消
+          </button>
+          {cancelNote && (
+            <span
+              data-testid="headless-cancel-note"
+              className="text-xs text-slate-500 dark:text-slate-400"
+            >
+              {cancelNote}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const r = turn.receipt;
+  const failed = r.status === "failed";
+  const cancelled = r.status === "cancelled";
+  // 可见性提示只在回合真的落到工作区时展示（ok / cancelled）
+  const showVisibility = (r.status === "ok" || cancelled) && !!turn.visibilityNote;
+  return (
+    <div
+      data-testid="headless-receipt-card"
+      data-phase="done"
+      data-status={r.status}
+      className={`mx-3 mb-2 rounded-lg border px-3 py-2 ${
+        failed
+          ? "border-rose-300/60 bg-rose-500/5 dark:border-rose-700/60 dark:bg-rose-400/5"
+          : "border-slate-300/60 bg-slate-500/5 dark:border-slate-700/60 dark:bg-slate-400/5"
+      }`}
+    >
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        {r.status === "ok" && (
+          <span
+            data-testid="headless-ok"
+            className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-400"
+          >
+            无头回合完成
+          </span>
+        )}
+        {r.status === "queued" && (
+          <span
+            data-testid="headless-queued"
+            className="rounded-full bg-slate-200/70 px-2 py-0.5 text-slate-600 dark:bg-slate-700/60 dark:text-slate-300"
+          >
+            排队中（全局并发名额已满）
+          </span>
+        )}
+        {cancelled && (
+          <span
+            data-testid="headless-cancelled"
+            className="rounded-full bg-slate-200/70 px-2 py-0.5 text-slate-600 dark:bg-slate-700/60 dark:text-slate-300"
+          >
+            已取消
+          </span>
+        )}
+        {failed && (
+          <span
+            data-testid="headless-failed"
+            className="rounded-full bg-rose-500/10 px-2 py-0.5 text-rose-700 dark:bg-rose-400/10 dark:text-rose-400"
+          >
+            无头回合失败
+          </span>
+        )}
+        {failed && (
+          <span data-testid="headless-stage" className="text-rose-700 dark:text-rose-300">
+            {headlessStageText(r.stage)}
+          </span>
+        )}
+        <span data-testid="headless-duration" className="text-slate-500 dark:text-slate-400">
+          耗时 {headlessDurationText(r.durationMs)}
+        </span>
+        {typeof r.tokens === "number" && (
+          <span data-testid="headless-tokens" className="text-slate-500 dark:text-slate-400">
+            {r.tokens} tokens
+          </span>
+        )}
+        <button
+          type="button"
+          data-testid="headless-dismiss"
+          onClick={onDismiss}
+          className="ml-auto text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+        >
+          收起
+        </button>
+      </div>
+      {r.lastAssistant && (
+        <p
+          data-testid="headless-last-assistant"
+          className="mt-1 text-xs break-words whitespace-pre-wrap text-slate-700 dark:text-slate-200"
+        >
+          {r.lastAssistant}
+        </p>
+      )}
+      {r.reason && (
+        <p
+          data-testid="headless-reason"
+          className="mt-1 text-xs break-words text-slate-600 dark:text-slate-300"
+        >
+          {r.reason}
+        </p>
+      )}
+      {showVisibility && (
+        <p
+          data-testid="headless-visibility"
+          className="mt-1 text-xs text-amber-700 dark:text-amber-400"
+        >
+          {turn.visibilityNote}
+        </p>
+      )}
+    </div>
+  );
 }
 
 // ============================================================
@@ -298,6 +514,11 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // 跳转失败提示（书签指向更早范围，当前窗口内找不到）
   const [bookmarkJumpMiss, setBookmarkJumpMiss] = useState(false);
   const [preview, setPreview] = useState<PreviewState | null>(null);
+  // **无头回执卡态**（Task 8 / H7）：由 MessageComposer 经 `onHeadlessTurn` 上报——
+  // 「发送中」在 composer 发请求前上报（无头回合 = 进程生命周期，请求要在飞数十秒），
+  // 终态回执在响应落地后上报。卡渲染在本页（回执卡是页面级信息：回合摘要 + 可见性提示
+  // + 取消入口），composer 只负责上报，不重复渲染（单回执槽语义）。
+  const [headlessTurn, setHeadlessTurn] = useState<HeadlessTurn | null>(null);
   // 文件栏占比（可拖分隔条，需求 2026-09-16）：两形态各自保留用户拖出的比例，
   // 初值 0.5（对半分，与旧版 h-1/2 / w-1/2 观感一致）
   const [fileRatioV, setFileRatioV] = useState(0.5);
@@ -1323,7 +1544,19 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               {messageArea}
             </MessageScrollArea>
             {cardDock}
-            <MessageComposer key={`composer-${session.id}`} session={session} />
+            {/* 无头回执卡（Task 8 / H7）：紧跟发送输入区之上（发完即见回执/取消钮）；
+                key 带会话号防跨会话串卡（T1 活状态流同款防线） */}
+            <HeadlessReceiptCard
+              key={`headless-${session.id}`}
+              session={session}
+              turn={headlessTurn}
+              onDismiss={() => setHeadlessTurn(null)}
+            />
+            <MessageComposer
+              key={`composer-${session.id}`}
+              session={session}
+              onHeadlessTurn={setHeadlessTurn}
+            />
           </div>
           <SplitHandle
             orientation={preview.mode === "split-h" ? "horizontal" : "vertical"}
@@ -1391,8 +1624,19 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           {cardDock}
           {/* 发送输入区（M7 Task 7，W4）：**全布局态挂载**（正文 / split / split-h，
               2026-09-19 用户裁决）——分屏时对话列同样可发消息；
-              send-info 拉取失败时组件自静默，不影响对话渲染；钥匙口径同上 */}
-          <MessageComposer key={`composer-${session.id}`} session={session} />
+              send-info 拉取失败时组件自静默，不影响对话渲染；钥匙口径同上。
+              Task 8：无头回执卡同层挂载（两分支一致），composer 经 onHeadlessTurn 上报 */}
+          <HeadlessReceiptCard
+            key={`headless-${session.id}`}
+            session={session}
+            turn={headlessTurn}
+            onDismiss={() => setHeadlessTurn(null)}
+          />
+          <MessageComposer
+            key={`composer-${session.id}`}
+            session={session}
+            onHeadlessTurn={setHeadlessTurn}
+          />
         </div>
       )}
 

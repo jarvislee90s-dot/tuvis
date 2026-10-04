@@ -3,10 +3,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "@/mobile/App";
 import SessionDetail, { isPlanPending } from "@/mobile/SessionDetail";
 import type { SessionFileEntry, SessionMessage, SubagentView } from "@/mobile/api";
+import SessionDetail, {
+  HEADLESS_STAGE_TRIAGE,
+  headlessStageText,
+  isPlanPending,
+} from "@/mobile/SessionDetail";
+import type { SessionFileEntry, SessionMessage } from "@/mobile/api";
 import { BOOKMARK_COLORS, clearBookmarks, messageAnchor } from "@/mobile/bookmarks";
 import { MockEventSource } from "./eventSourceMock";
 import type { Session } from "@/types/session";
 import planPendingCases from "../fixtures/plan_pending_cases.json";
+import stagesFixture from "../fixtures/headless_stages.json";
 
 // M3 Task 8：ZCode 式会话详情页渲染矩阵。fetch 全量 stub（盖过 setup.ts 的 msw），
 // 按 URL 分路到 messages / session-files / file 三端点；jsdom 无真实高亮，
@@ -94,6 +101,23 @@ interface Routes {
   /** 子 agent 全量名单（观察台 T5：SessionDetail 挂载即拉；缺省 [] = 无子 agent，
    *  卡区/chip 不渲染——既有用例行为不变） */
   subagents?: SubagentView[];
+  /** **Task 8（H7）无头回合回执**：给对象 → 立即 200 返回该载荷；给 `"pending"` → 返回
+   *  可手动 resolve 的 promise（驱动「发送中」态：发送中卡片与取消钮必须在场） */
+  sessionSend?: Record<string, unknown> | "pending" | "reject";
+  /** 无头回合取消（POST /session-headless-cancel）回执 */
+  headlessCancel?: { cancelled: boolean; reason?: string };
+}
+
+/** 手动闸：`routes.sessionSend === "pending"` 时由用例自行 resolve（零真实等待） */
+let sendGate: { promise: Promise<Response>; resolve: (body: unknown) => void } | null = null;
+
+function openSendGate() {
+  let resolve!: (body: unknown) => void;
+  const promise = new Promise<Response>((res) => {
+    resolve = (body: unknown) => res(new Response(JSON.stringify(body), { status: 200 }));
+  });
+  sendGate = { promise, resolve };
+  return promise;
 }
 
 let routes: Routes;
@@ -101,6 +125,7 @@ let fetchMock: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   routes = {};
+  sendGate = null;
   // 书签 store 用例间隔离（模块级单例 + localStorage 镜像，不清理会串场——
   // 如上一个用例占用了某颜色，下一个用例的调色板里该色就变置灰不可点）
   clearBookmarks("sess-1");
@@ -164,6 +189,21 @@ function installFetch() {
         ),
         { status: 200 }
       );
+    }
+    if (url.includes("/session-headless-cancel")) {
+      // Task 8：取消钮目标（无头回执卡）
+      return new Response(JSON.stringify(routes.headlessCancel ?? { cancelled: true }), {
+        status: 200,
+      });
+    }
+    if (url.includes("/session-send")) {
+      // Task 8：发送回执（缺省 delivered，与既有终端路径同形）；"pending" = 手动闸；
+      // "reject" = 请求本身抛异常（网络断/开关中途关/500）
+      if (routes.sessionSend === "reject") throw new TypeError("network down");
+      if (routes.sessionSend === "pending") return openSendGate();
+      return new Response(JSON.stringify(routes.sessionSend ?? { status: "delivered" }), {
+        status: 200,
+      });
     }
     if (url.includes("/session-question/answer")) {
       // 问答应答 POST（F2-1 用例需要 key_sent 终态）；判序在 GET 之前——
@@ -2804,5 +2844,195 @@ describe("SessionDetail：预览区 sheet 化（T1）", () => {
     expect(screen.getByTestId("subagent-detail")).toBeTruthy();
     expect(screen.getByTestId("split-container").className).toContain("flex-row");
     expect(screen.getByTestId("subagent-back")).toBeTruthy(); // 两层级导航：详情级必有返回钮
+
+
+// ==== Task 8（H7）：无头回执卡（发送中 / 回执 / 失败分诊 + 取消钮）====
+//
+// 无头会话（zcode）的发送是**回合级**动作：HTTP 请求要等整个无头进程跑完（实测 8–23s，
+// 长则看门狗 600s），故回执卡必须与「发送中」共存并给取消入口；回执里的 assistant 摘要 /
+// token / 耗时 / 可见性提示全部由后端下发（**后端给文案、前端只渲染**——与 H3 置灰同纪律）。
+describe("SessionDetail：无头回执卡（Task 8 / H7）", () => {
+  function headlessSession() {
+    return makeSession({ id: "sess-h7", agentType: "zcode", status: "waiting" });
+  }
+
+  /** send-info 报无头通道（输入区可用 + 通道名 + 可见性档） */
+  function headlessSendInfo(visibility = "after_restart") {
+    return { injectable: true, channels: ["headless_zcode"], visibility };
+  }
+
+  function headlessReceipt(over: Record<string, unknown> = {}) {
+    return {
+      status: "ok",
+      sessionId: "sess-h7",
+      lastAssistant: "已经改好了",
+      tokens: 321,
+      durationMs: 8456,
+      ...over,
+    };
+  }
+
+  async function sendFromComposer(text: string) {
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: text } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+  }
+
+  it("发送中出无头进度卡与取消钮；回执到达后展示末条 assistant/token/耗时/可见性提示", async () => {
+    installFetch();
+    routes.sendInfo = headlessSendInfo("after_restart");
+    routes.sessionSend = "pending"; // 手动闸：驱动「发送中」态
+    render(<SessionDetail session={headlessSession()} onBack={() => {}} />);
+    await sendFromComposer("无头你好");
+
+    const card = await screen.findByTestId("headless-receipt-card");
+    expect(card.getAttribute("data-phase")).toBe("sending");
+    expect(screen.getByTestId("headless-sending")).toBeTruthy();
+    const cancel = screen.getByTestId("headless-cancel");
+    expect(cancel).toBeTruthy();
+
+    // 取消钮 → POST /session-headless-cancel（带会话号；回合照常收尾）
+    fireEvent.click(cancel);
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find((c) =>
+        String(c[0]).includes("/session-headless-cancel")
+      );
+      expect(call).toBeTruthy();
+      expect(String((call?.[1] as RequestInit | undefined)?.body)).toContain("sess-h7");
+    });
+
+    act(() => {
+      sendGate?.resolve({
+        status: "headless",
+        channel: "headless_zcode",
+        receipt: headlessReceipt(),
+        visibility: "after_restart",
+        visibilityNote: "已信任工作区：重启 ZCode 应用后可见",
+      });
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("headless-receipt-card").getAttribute("data-phase")).toBe("done")
+    );
+    expect(screen.getByTestId("headless-last-assistant").textContent).toContain("已经改好了");
+    expect(screen.getByTestId("headless-tokens").textContent).toContain("321");
+    expect(screen.getByTestId("headless-duration").textContent).toContain("8.5");
+    expect(screen.getByTestId("headless-visibility").textContent).toContain(
+      "重启 ZCode 应用后可见"
+    );
+    expect(screen.queryByTestId("headless-cancel")).toBeNull();
+    // 成功回合 = 消息已进 ZCode → 输入框清空（与终端的 delivered 同口径）
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("无头失败：分诊卡如实展示阶段与原因，输入框保留正文（可重试）且不承诺可见性", async () => {
+    installFetch();
+    routes.sendInfo = headlessSendInfo("tuvis_only");
+    routes.sessionSend = {
+      status: "headless",
+      channel: "headless_zcode",
+      receipt: headlessReceipt({
+        status: "failed",
+        stage: "workspace_busy",
+        reason:
+          "工作区忙：ZCode 应用在项目 /tmp/proj 活跃；已重试 2 次仍失败——请在该工作区空闲后重发",
+        lastAssistant: undefined,
+        tokens: undefined,
+        durationMs: 15234,
+      }),
+    };
+    render(<SessionDetail session={headlessSession()} onBack={() => {}} />);
+    await sendFromComposer("给我改代码");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("headless-receipt-card").getAttribute("data-phase")).toBe("done")
+    );
+    expect(screen.getByTestId("headless-failed")).toBeTruthy();
+    expect(screen.getByTestId("headless-stage").textContent).toContain("工作区忙");
+    expect(screen.getByTestId("headless-reason").textContent).toContain("请在该工作区空闲后重发");
+    expect(screen.queryByTestId("headless-visibility")).toBeNull();
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("给我改代码");
+    expect(screen.queryByTestId("headless-cancel")).toBeNull();
+  });
+
+  it("无头取消回执：如实报「已取消」，不冒充成功；输入框保留正文", async () => {
+    installFetch();
+    routes.sendInfo = headlessSendInfo();
+    routes.sessionSend = {
+      status: "headless",
+      channel: "headless_zcode",
+      receipt: headlessReceipt({
+        status: "cancelled",
+        reason: "已取消（移动端请求，先到者生效）；kill 进程树 = job_object",
+        lastAssistant: undefined,
+        tokens: undefined,
+      }),
+    };
+    render(<SessionDetail session={headlessSession()} onBack={() => {}} />);
+    await sendFromComposer("这条会被取消");
+    await waitFor(() => expect(screen.getByTestId("headless-cancelled")).toBeTruthy());
+    expect(screen.getByTestId("headless-reason").textContent).toContain("已取消");
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe(
+      "这条会被取消"
+    );
+  });
+
+  it("终端通道会话不渲染无头卡（零回归）", async () => {
+    installFetch();
+    routes.sendInfo = { injectable: true, channels: ["tmux"], visibility: "realtime" };
+    routes.sessionSend = { status: "delivered" };
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    await sendFromComposer("终端消息");
+    await waitFor(() => expect(screen.getByTestId("send-receipt-delivered")).toBeTruthy());
+    expect(screen.queryByTestId("headless-receipt-card")).toBeNull();
+  });
+
+  /// **复审 Important 1（假在飞态）**：请求本身抛异常（网络断/开关中途关闭/500）时，
+  /// 卡片**不得**停在「无头回合进行中…」（那是一个编造的在飞回合，且取消钮永远挂着）——
+  /// 必须落到失败终态：无取消钮、分诊如实、输入框保留正文
+  it("请求抛异常时无头卡落到失败终态（不留假在飞态、无取消钮）", async () => {
+    installFetch();
+    routes.sendInfo = headlessSendInfo("tuvis_only");
+    routes.sessionSend = "reject";
+    render(<SessionDetail session={headlessSession()} onBack={() => {}} />);
+    await sendFromComposer("这条发不出去");
+    await waitFor(() =>
+      expect(screen.getByTestId("headless-receipt-card").getAttribute("data-phase")).toBe("done")
+    );
+    const card = screen.getByTestId("headless-receipt-card");
+    expect(card.getAttribute("data-status")).toBe("failed");
+    expect(screen.getByTestId("headless-failed")).toBeTruthy();
+    expect(screen.getByTestId("headless-stage").textContent).toContain("通道异常");
+    expect(screen.getByTestId("headless-reason").textContent).toContain("网络");
+    expect(screen.queryByTestId("headless-cancel")).toBeNull();
+    expect(screen.queryByTestId("headless-sending")).toBeNull();
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe(
+      "这条发不出去"
+    );
+    // 终端通道的同型请求异常：仍走既有 failed chip（零回归），不产生无头卡
+    cleanup();
+    installFetch();
+    routes.sendInfo = { injectable: true, channels: ["tmux"], visibility: "realtime" };
+    routes.sessionSend = "reject";
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    await sendFromComposer("终端也断了");
+    await waitFor(() => expect(screen.getByTestId("send-receipt-failed")).toBeTruthy());
+    expect(screen.queryByTestId("headless-receipt-card")).toBeNull();
+  });
+
+  /// **复审：跨语言 stage 名单锁**（`tests/fixtures/headless_stages.json` 是唯一名单）：
+  /// 前端分诊表必须**恰好**覆盖后端 `inject::headless::receipt::Stage` 的全部 wire 名——
+  /// 任一侧新增变体而另一侧没跟上，Rust 侧（receipt.rs 同名断言）或本测必有一侧先红
+  it("分诊表与跨语言 stage 名单逐项一致（后端变体不多不少）", () => {
+    const fixture = stagesFixture as { stages: string[] };
+    const mine = Object.keys(HEADLESS_STAGE_TRIAGE).sort();
+    const want = [...fixture.stages].sort();
+    expect(mine).toEqual(want);
+    // 每个 stage 都有非空分诊文案（不得留空串导致卡片显示空白）
+    for (const key of want) {
+      expect(HEADLESS_STAGE_TRIAGE[key]?.length ?? 0).toBeGreaterThan(0);
+    }
+    // 未知档如实兜底（不编成因）
+    expect(headlessStageText("brand_new_stage")).toContain("未分类失败");
+    expect(headlessStageText(undefined)).toBe("未分类失败");
   });
 });

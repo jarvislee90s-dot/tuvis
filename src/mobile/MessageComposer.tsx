@@ -67,6 +67,7 @@ import {
   fetchQueue,
   fetchSendInfo,
   fetchSessionQuestion,
+  headlessChannelOf,
   queueJump,
   queueRetract,
   questionAnswerErrorCopy,
@@ -74,6 +75,7 @@ import {
   sessionSend,
   uploadAttachment,
   type ChannelInfo,
+  type HeadlessTurn,
   type QueueItemView,
   type SendInfo,
 } from "./api";
@@ -83,6 +85,10 @@ import { etaRemainingText, formatBytes, transferRateBps, type TransferSample } f
 interface MessageComposerProps {
   /** 会话（本组件只消费 id；结构化类型，完整 Session 可直接传入） */
   session: { id: string };
+  /** **无头回合上报**（Task 8 / H7）：无头通道（zcode）的发送是**回合级**动作——请求要在飞
+   *  整个无头进程的生命周期（实测 8–23s），回执卡与取消钮因此挂在 SessionDetail（页面级），
+   *  本组件只上报「发送中 / 终态回执」两个翻转点。**终端通道不调用**（零回归）。 */
+  onHeadlessTurn?: (turn: HeadlessTurn) => void;
 }
 
 /** 待发附件条目（组件内态）：status=uploading → ready/failed；
@@ -229,7 +235,7 @@ function upsertQueueItem(items: QueueItemView[], item: QueueItemView): QueueItem
   return next;
 }
 
-export default function MessageComposer({ session }: MessageComposerProps) {
+export default function MessageComposer({ session, onHeadlessTurn }: MessageComposerProps) {
   // 可用性：sendInfo=null 且未就绪 → 不渲染（加载中 / 拉取失败 / 403）
   const [sendInfo, setSendInfo] = useState<SendInfo | null>(null);
   const [infoReady, setInfoReady] = useState(false);
@@ -439,6 +445,10 @@ export default function MessageComposer({ session }: MessageComposerProps) {
     const body = text.trim();
     if (!body || sending || busy || sendInfo === null || !sendInfo.injectable) return;
     if (attachments.some((a) => a.status === "uploading")) return; // 上传中禁发（防消息先于落盘）
+    // **无头通道分流判据**（Task 8 / H7）：在 try 之前定下来——catch 也必须知道本次是
+    // 无头发送（否则请求抛异常时回执卡会永远停在「无头回合进行中…」= 编造在飞态）。
+    const headless = headlessChannelOf(sendInfo) !== null;
+    const startedAt = Date.now();
     setSending(true);
     try {
       // ===== 丁T3 接入②：发送时刻**复探**卡片在场（§2.4 裁3 的安全面）=====
@@ -525,8 +535,36 @@ export default function MessageComposer({ session }: MessageComposerProps) {
       // 失败的话，用户重试走的是普通发送语义（后端失败行已退出 pending，可重发）
       const forceQueue = queueOnlyNext;
       setQueueOnlyNext(false);
+      // **无头通道分流**（Task 8 / H7）：send-info 报无头通道（`headless_*`）⇒ 本条是
+      // 回合级发送——请求要等整个无头进程跑完。上报「发送中」给页面级回执卡（取消钮随之
+      // 出现），回执到达后上报终态。判据与后端 `HeadlessKind::wire_name` 同源（单一词表）。
+      // `headless` 在 try **之前**就定下来（catch 也要用——见下），起点时刻用于本地计时。
+      if (headless) {
+        // 无头回合的入队标志无意义（每回合 spawn，无 MAM 队列）：不随请求上送
+        onHeadlessTurn?.({ phase: "sending" });
+      }
       // 多行原样上行（trim 只用于判空，不改写正文——归一在服务端）
-      const res = await sessionSend(session.id, fullText, forceQueue ? true : undefined);
+      const res = await sessionSend(
+        session.id,
+        fullText,
+        forceQueue && !headless ? true : undefined
+      );
+      if (res.status === "headless") {
+        // 终态回执：**成功才清空输入区**（与终端 delivered 同口径）；失败/取消/排队时
+        // 消息未确认落到 ZCode —— 保留正文让用户重试，绝不冒充成功。
+        if (res.receipt.status === "ok") {
+          setText("");
+          setAttachments([]);
+        }
+        // 回执卡由页面级组件渲染（本组件不另设 chip——单回执槽语义）
+        setReceipt(null);
+        onHeadlessTurn?.({
+          phase: "done",
+          receipt: res.receipt,
+          visibilityNote: res.visibilityNote ?? null,
+        });
+        return;
+      }
       if (res.status === "delivered") {
         setText("");
         setAttachments([]);
@@ -564,16 +602,45 @@ export default function MessageComposer({ session }: MessageComposerProps) {
         setReceipt({ kind: "failed", error: res.error });
       }
     } catch (e) {
-      if (e instanceof ApiError) {
-        const reason = typeof e.data?.reason === "string" ? e.data.reason : null;
-        setReceipt({ kind: "failed", error: reason ?? e.message });
-      } else {
-        setReceipt({ kind: "failed", error: String(e) });
+      const errorCopy =
+        e instanceof ApiError
+          ? typeof e.data?.reason === "string"
+            ? e.data.reason
+            : e.message
+          : String(e);
+      // **无头发送的异常必须收敛为失败终态**（复审 Important 1）：请求本身抛（网络断/
+      // 开关中途关闭/500）时若只落 composer chip，页面级回执卡会永远停在「无头回合进行中…」
+      // 并挂着取消钮 —— 那是一个**编造的在飞回合**（本批最要不得的那种不诚实）。
+      // 回执按本地事实构造：status=failed + stage=channel_error（请求未拿到有效回执，
+      // 语义与后端 channel_error 一致）+ 本地计时；**不编 tokens/assistant**。
+      if (headless) {
+        onHeadlessTurn?.({
+          phase: "done",
+          receipt: {
+            status: "failed",
+            sessionId: session.id,
+            durationMs: Date.now() - startedAt,
+            stage: "channel_error",
+            reason: `无头回合请求失败：${errorCopy}`,
+          },
+          visibilityNote: null,
+        });
       }
+      setReceipt({ kind: "failed", error: errorCopy });
     } finally {
       setSending(false);
     }
-  }, [text, attachments, sending, busy, sendInfo, session.id, queueOnlyNext, probeCardPresence]);
+  }, [
+    text,
+    attachments,
+    sending,
+    busy,
+    sendInfo,
+    session.id,
+    queueOnlyNext,
+    probeCardPresence,
+    onHeadlessTurn,
+  ]);
 
   // P2-7 失败对账（插队/撤回/修改共用）：失败后复核 /session-queue——
   // - 条目仍在 pending → 恢复排队视图（刷新队位，行同步更新，「立即发送/修改/撤回」

@@ -17,6 +17,12 @@ use super::runner::{GlobalSem, RunnerCfg};
 
 /// 探针干跑超时（H6：15s；探针是短命干跑，不是 turn）
 pub const PROBE_TIMEOUT_MS: u64 = 15_000;
+/// **探针载荷（Task 8 真机实证修订）**：真机 ZCode CLI **拒绝空载荷**——
+/// `--prompt ""` → `--prompt requires non-empty text.`（exit=1、0.5s 内退出、**不触模型**），
+/// 故 Task 6 设计的「空串干跑」在真机恒失败（会让版本门控拒绝掉全部投递）。探针改用
+/// **最短真实载荷**：一次极小回合（成本 = 一次最小模型往返，结论按 exe/cjs mtime 缓存，
+/// 工具升级才重探）。取值与用户配额纪律一致（`hi` = 最短可用载荷）。
+pub const PROBE_PROMPT: &str = "hi";
 /// macOS zcode 的 provider config 环境变量名（spec H7：Mac 打包布局 bug 的对策，
 /// 不设则 `--prompt` 静默无 JSON）
 pub const ZCODE_PROVIDER_CONFIG_ENV: &str = "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE";
@@ -50,11 +56,12 @@ impl ProbeSpec {
 /// 探针 argv（**不含 exe 自身**；生产 spawn = exe + 本 argv + [`probe_env`]）
 pub fn probe_argv(spec: &ProbeSpec) -> Vec<String> {
     match spec {
-        // --prompt "" 干跑：不真喂消息（provider 缺失时这里就会静默无 JSON → 门控拦下）
+        // `--prompt <最短非空载荷>` 干跑：真机 CLI 拒绝空串（见 [`PROBE_PROMPT`]）；
+        // provider 缺失/打包错位时这里就出不了 JSON → 门控拦下
         ProbeSpec::Zcode { cjs, .. } => vec![
             cjs.clone(),
             "--prompt".into(),
-            String::new(),
+            PROBE_PROMPT.into(),
             "--mode".into(),
             "yolo".into(),
             "--json".into(),
@@ -78,15 +85,42 @@ pub fn zcode_provider_config_path(cjs: &str) -> Option<String> {
     )
 }
 
-/// 探针环境（平台分叉）：Electron 主程序当 node 跑恒定；macOS 另设 provider config
+/// **provider config 环境变量（两端共用单点；Task 8 真机实证修订）**。
+///
+/// # 真机实证（2026-10-05，本机 Windows 11 + ZCode `D:\Program Files\ZCode`）
+/// 不设该变量时 `--prompt` 干跑**直接失败**（不是静默）：
+/// `无法定位 CLI ZCode Built-in Provider Config：<root>\resources\glm\provider\zcode-builtin.json,
+/// <盘>:\config\provider\zcode-builtin.json`（exit=1，0.5s 内退出、不触模型）。
+/// 而装包**实际**把文件放在 `<root>\resources\config\provider\zcode-builtin.json`
+/// （真机 stat 实证）——**与 Mac 同款的打包布局错位**：CLI 的查找表里没有打包的真实位置。
+/// 两端的正确路径推导**同一个**（cjs 的祖父目录 + `config/provider/zcode-builtin.json`），
+/// 故本函数按「cjs → 推导路径」取值，供探针与真回合共用（**单一出口**，两处不得各写一份）。
+///
+/// # 平台规则（有意不对称，各有实证依据）
+/// - macOS：**无条件**给（spec H7 定案：不设则 `--prompt` **静默无 JSON**——静默形态
+///   比报错更危险，宁可指向推导路径让 CLI 明确报「定位不到」）；
+/// - Windows：**推导路径在场才给**（真机实证该位置就是打包位置；若某天装包修好、文件
+///   挪去 `<resources>/glm/provider/`，本函数自动不设，让 CLI 走自己的查找——不指向
+///   一个不存在的文件）。
+///
+/// 返回 `None` = 本平台不设该变量（CLI 走自身查找）。
+pub fn provider_config_env(cjs: &str, os: &str) -> Option<(String, String)> {
+    let path = zcode_provider_config_path(cjs)?;
+    if os == "macos" || std::path::Path::new(&path).is_file() {
+        Some((ZCODE_PROVIDER_CONFIG_ENV.to_string(), path))
+    } else {
+        None
+    }
+}
+
+/// 探针环境（平台分叉）：Electron 主程序当 node 跑恒定；provider config 见
+/// [`provider_config_env`]（Windows 亦适用——真机实证）。
 pub fn probe_env(spec: &ProbeSpec, os: &str) -> Vec<(String, String)> {
     match spec {
         ProbeSpec::Zcode { cjs, .. } => {
             let mut env = vec![("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string())];
-            if os == "macos" {
-                if let Some(cfg) = zcode_provider_config_path(cjs) {
-                    env.push((ZCODE_PROVIDER_CONFIG_ENV.to_string(), cfg));
-                }
+            if let Some(kv) = provider_config_env(cjs, os) {
+                env.push(kv);
             }
             env
         }
@@ -232,26 +266,67 @@ fn stat_ms(path: &str) -> (bool, Option<u64>) {
     }
 }
 
-/// 探针结果缓存（进程存在性 + mtime 键 → 结论）
+/// 探针结果缓存（进程存在性 + mtime 键 → 结论 + 记录时刻）。
+///
+/// # 成功长缓存、失败带 TTL（Task 8 复审 Important 2）
+/// 探针**已是真实最小回合**（见 [`PROBE_PROMPT`]）——一次瞬时失败（工作区争用
+/// `Model creation failed`、15s 超时、网络抖动、provider 临时不可用）绝不能把通道
+/// **钉死一整个进程生命周期**（旧行为：失败与成功同样长缓存 → 一次抖动 = 该工具永久
+/// `version_gate` 拒发，且没有任何重探路径）。
+/// 现策略：
+/// - **成功**：按 (exe 在场性 + mtime) 键长缓存（工具升级才失效重探——成本 = 一次最小回合）；
+/// - **失败**：只缓存 [`FAILURE_TTL_MS`]，过期即失效 → 下一次投递自然重探（成本上界 =
+///   通道坏着时每 TTL 至多一次最小回合；下界 = 抖动恢复后 ≤ TTL 即自动恢复）。
 #[derive(Default)]
 pub struct ProbeCache {
-    map: Mutex<HashMap<String, (ProbeKey, ProbeVerdict)>>,
+    map: Mutex<HashMap<String, (ProbeKey, ProbeVerdict, u64)>>,
+}
+
+/// 失败结论的缓存生存期（5 分钟）：ZCode 工作区争用锁的常见持续量级 ≥ 分钟级——
+/// 太短会把「真实回合成本」付成高频重探，太长则抖动恢复被人为推迟。可用 `--`
+/// 常量调；口径与「成功长缓存」不对称是**有意**的（失败便宜、成功贵）。
+pub const FAILURE_TTL_MS: u64 = 300_000;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl ProbeCache {
+    /// 读缓存（真实时钟）：**失败且超 TTL → 视为未命中**（`get_at` 是纯口径）
     pub fn get(&self, key: &ProbeKey) -> Option<ProbeVerdict> {
+        self.get_at(key, now_ms())
+    }
+
+    /// 读缓存（时钟注入；TTL 判定全在这里）：成功恒命中；失败只在 TTL 内命中
+    pub fn get_at(&self, key: &ProbeKey, now_ms: u64) -> Option<ProbeVerdict> {
         let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
         match g.get(&key.exe) {
-            Some((k, v)) if k == key => Some(v.clone()),
+            Some((k, v, at)) if k == key => {
+                if v.is_pass() || now_ms.saturating_sub(*at) < FAILURE_TTL_MS {
+                    Some(v.clone())
+                } else {
+                    None // 失败过期：重探
+                }
+            }
             _ => None,
         }
     }
 
+    /// 写缓存（真实时钟）
     pub fn put(&self, key: ProbeKey, verdict: ProbeVerdict) {
+        self.put_at(key, verdict, now_ms());
+    }
+
+    /// 写缓存（时钟注入）
+    pub fn put_at(&self, key: ProbeKey, verdict: ProbeVerdict, now_ms: u64) {
         self.map
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.exe.clone(), (key, verdict));
+            .insert(key.exe.clone(), (key, verdict, now_ms));
     }
 
     pub fn len(&self) -> usize {
@@ -263,12 +338,14 @@ impl ProbeCache {
     }
 }
 
-/// 带缓存的探针执行：命中即返回（不跑执行体）；缺席的可执行文件直接判失败（不 spawn）
+/// 带缓存的探针执行：命中即返回（不跑执行体）；缺席的可执行文件直接判失败（不 spawn）。
+/// 缓存命中语义（含失败 TTL）见 [`ProbeCache`]。
 pub fn probe_cached<F>(cache: &ProbeCache, key: ProbeKey, run: F) -> ProbeVerdict
 where
     F: FnOnce() -> ProbeVerdict,
 {
-    if let Some(hit) = cache.get(&key) {
+    let now = now_ms();
+    if let Some(hit) = cache.get_at(&key, now) {
         return hit;
     }
     let verdict = if key.exe_present {
@@ -276,7 +353,7 @@ where
     } else {
         ProbeVerdict::fail(format!("可执行文件不在场（不 spawn）：{}", key.exe))
     };
-    cache.put(key, verdict.clone());
+    cache.put_at(key, verdict.clone(), now);
     verdict
 }
 
@@ -342,9 +419,20 @@ mod tests {
             !argv.iter().any(|a| a == "--version"),
             "探针不得用 --version（会漏判 provider 缺失）: {argv:?}"
         );
-        // 干跑档 = yolo + --json（能出 JSON 即过）
+        // 干跑档 = yolo + --json（能出 JSON 即过）；**载荷必须非空**
+        // （Task 8 真机实证：`--prompt ""` 被 CLI 拒绝——`--prompt requires non-empty text.`，
+        // 空串探针在真机恒失败，会把门控变成「永远拒发」）
         assert!(argv.iter().any(|a| a == "--mode"));
         assert!(argv.iter().any(|a| a == "--json"));
+        let i = argv
+            .iter()
+            .position(|a| a == "--prompt")
+            .expect("须有 --prompt");
+        assert_eq!(argv[i + 1], PROBE_PROMPT);
+        assert!(
+            !argv[i + 1].trim().is_empty(),
+            "探针载荷不得为空（真机 CLI 拒绝空串）：{argv:?}"
+        );
         assert!(
             !argv.iter().any(|a| a == "--help"),
             "zcode 探针须干跑而非帮助面"
@@ -411,7 +499,7 @@ mod tests {
         assert_eq!(
             win,
             vec![("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string())],
-            "Windows 只设 Electron 当 node 跑的开关"
+            "Windows 且推导路径不在场：只设 Electron 当 node 跑的开关（不指向不存在的文件）"
         );
         let mac = probe_env(&spec, "macos");
         assert!(mac.contains(&("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string())));
@@ -436,6 +524,42 @@ mod tests {
             "macos"
         )
         .is_empty());
+    }
+
+    /// **Windows 的 provider config 规则（Task 8 真机实证修订）**：推导路径在场 → 设
+    /// （真机 ZCode 装包就把文件放在 `<resources>/config/provider/`，而 CLI 自己的查找表
+    /// 里没有该位置——不设则 `--prompt` 直接报「无法定位」）；不在场 → 不设（不指向
+    /// 不存在的文件，让 CLI 走自身查找）。用 tempdir 夹具驱动，**不触真机安装路径**。
+    #[test]
+    fn provider_config_env_is_set_on_windows_only_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let cjs = std::path::Path::new(&root)
+            .join("resources")
+            .join("glm")
+            .join("zcode.cjs");
+        let cfgdir = std::path::Path::new(&root)
+            .join("resources")
+            .join("config")
+            .join("provider");
+        std::fs::create_dir_all(&cfgdir).unwrap();
+        std::fs::create_dir_all(cjs.parent().unwrap()).unwrap();
+        std::fs::write(&cjs, "// stub").unwrap();
+        let cjs_s = cjs.to_string_lossy().to_string();
+        // 不在场（文件还没写）→ 不设
+        assert!(
+            provider_config_env(&cjs_s, "windows").is_none(),
+            "推导路径不在场时不得设（否则指向不存在的文件，CLI 报定位失败）"
+        );
+        // 在场 → 设，且值 = 推导路径
+        let cfg = cfgdir.join("zcode-builtin.json");
+        std::fs::write(&cfg, "{}").unwrap();
+        let (k, v) = provider_config_env(&cjs_s, "windows").expect("文件在场必须设");
+        assert_eq!(k, ZCODE_PROVIDER_CONFIG_ENV);
+        assert_eq!(v, cfg.to_string_lossy().to_string());
+        // macOS 侧与文件在场性无关（spec：无条件设）
+        let (_, mv) = provider_config_env("/nope/glm/zcode.cjs", "macos").unwrap();
+        assert!(mv.ends_with("zcode-builtin.json"));
     }
 
     /// 缓存命中不重跑；**mtime 变化即失效**（工具升级 = 版本漂移复核，H6）
@@ -475,6 +599,44 @@ mod tests {
         assert!(!missing.exe_present);
         assert!(!probe_cached(&cache, missing, || ProbeVerdict::fail("缺少可执行文件")).is_pass());
         assert_eq!(cache.len(), 2, "另一可执行文件另占一格");
+    }
+
+    /// **Task 8 复审 Important 2**：失败结论**带 TTL**、成功结论长缓存——探针已是真实最小
+    /// 回合，一次瞬时失败（争用锁/超时/网络抖）不得把通道钉死整个进程生命周期；反过来
+    /// 也不能让「坏着」的通道每次投递都付一次真实回合（TTL 内仍复用失败结论）。
+    #[test]
+    fn failure_verdicts_expire_but_successes_do_not() {
+        let cache = ProbeCache::default();
+        let key = ProbeKey::of_parts("zcode.exe", true, Some(1), Some(2));
+        cache.put_at(key.clone(), ProbeVerdict::fail("瞬时抖动"), 1_000);
+        // TTL 内命中（坏着时不重复烧真实回合）
+        let hit = cache
+            .get_at(&key, 1_000 + FAILURE_TTL_MS - 1)
+            .expect("TTL 内必须命中");
+        assert!(!hit.is_pass());
+        // 过期即未命中 → 下一次投递自然重探（通道不会被永久钉死）
+        assert!(
+            cache.get_at(&key, 1_000 + FAILURE_TTL_MS).is_none(),
+            "失败结论过期必须失效（否则一次抖动 = 永久拒发）"
+        );
+        // 成功不受 TTL 约束（mtime 键长缓存：工具升级才失效——重探成本 = 一次真实回合）
+        cache.put_at(key.clone(), ProbeVerdict::pass("ok"), 1_000);
+        assert!(
+            cache
+                .get_at(&key, 1_000 + FAILURE_TTL_MS * 100)
+                .is_some_and(|v| v.is_pass()),
+            "成功结论必须长缓存"
+        );
+        // 生产路径（真实时钟）：过期的失败必须真的重跑执行体，且恢复结论可上线
+        let expired = ProbeKey::of_parts("z2.exe", true, Some(1), None);
+        cache.put_at(expired.clone(), ProbeVerdict::fail("旧失败"), 0);
+        let mut ran = 0;
+        let v = probe_cached(&cache, expired, || {
+            ran += 1;
+            ProbeVerdict::pass("抖动恢复")
+        });
+        assert_eq!(ran, 1, "失败过期后 probe_cached 必须真的重探");
+        assert!(v.is_pass(), "重探结论必须可用（通道自动恢复）");
     }
 
     /// 真 fs 键：不存在的可执行文件 → 缺席；存在的 → 带 mtime（零网络、只 stat）

@@ -649,7 +649,12 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         .route("/session-queue", get(api::session_queue))
         .route("/session-queue/jump", post(api::session_queue_jump))
         .route("/session-queue/retract", post(api::session_queue_retract))
-        // M8 Task 11：审批端点（红卡一键批准/拒绝——选项可用性 + 按键应答；PIN 门禁
+        // Task 8（H7）：无头回合取消（移动端回执卡的取消钮）——PIN 门禁内层 gate
+        // 结构性覆盖，新端点不需要各自鉴权代码
+        .route(
+            "/session-headless-cancel",
+            post(api::session_headless_cancel),
+        ) // M8 Task 11：审批端点（红卡一键批准/拒绝——选项可用性 + 按键应答；PIN 门禁
         // 内层 gate 结构性覆盖，新端点不需要各自鉴权代码）
         .route(
             "/session-approve-options",
@@ -5221,37 +5226,64 @@ mod tests {
                 "H3 门在最前（{sid}）：关闭态拒绝体必须是 headless_disabled：{body}"
             );
         }
-        // ② 开关开启 → 门放行，路由层照判（workbuddy → Headless(WbAcp)、zcode →
-        //    Headless(Zcode)）：两家都只能走无头通道，而 Task 7 尚无无头执行器 →
-        //    统一的 headless_pending 拒绝（**不落终端注入臂**：这两家的 pid 不是终端宿主）
+        // ② 开关开启 → 门放行，路由层照判：workbuddy → Headless(WbAcp)（Task 11 未接线 →
+        //    headless_pending 拒绝）；**zcode → Headless(Zcode)（Task 8 已真分派）**——
+        //    落无头回执封套（测试构建零真实安装路径 → 如实报「安装不可达」，**绝不 spawn**）。
+        //    两家都**不落终端注入臂**（pid 不是终端宿主）
         state.store.with(|c| {
             crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
         });
-        for sid in ["sess_c", "sess_d"] {
-            let r = app
-                .clone()
-                .oneshot(req(
-                    "POST",
-                    "/m/api/v1/session-send",
-                    Some("mam_device=mm"),
-                    Some(&format!(r#"{{"sessionId":"{sid}","text":"hi"}}"#)),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(r.status(), 403);
-            let body = body_string(r).await;
-            assert!(
-                body.contains("not_injectable") && body.contains("headless_pending"),
-                "开关开启后 {sid} 应落到无头分派点（not_injectable + headless_pending）：{body}"
-            );
-            assert!(
-                !body.contains("headless_disabled"),
-                "开关开启后不得再被 H3 门拒绝（{sid}）：{body}"
-            );
-        }
+        // workbuddy：执行器未接线 → 仍是过渡拒绝码（不得落终端臂、不得入队）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_c","text":"hi"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+        let body = body_string(r).await;
+        assert!(
+            body.contains("not_injectable") && body.contains("headless_pending"),
+            "开关开启后 workbuddy（Task 11 未接线）应落到无头分派点：{body}"
+        );
+        assert!(
+            !body.contains("headless_disabled"),
+            "开关开启后不得再被 H3 门拒绝（sess_c）：{body}"
+        );
+        // zcode：真分派（HTTP 200 + headless 封套 + 如实的安装不可达失败）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_d","text":"hi"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "zcode 已真分派：回执走 headless 封套");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless");
+        assert_eq!(v["channel"], "headless_zcode");
+        assert_eq!(v["receipt"]["status"], "failed", "{v}");
+        assert_eq!(v["receipt"]["stage"], "spawn", "安装不可达 → spawn 档：{v}");
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("安装路径不可达")),
+            "必须如实说清失败原因（不冒充成功）：{v}"
+        );
+        assert!(
+            !v.to_string().contains("headless_pending"),
+            "zcode 不得再落过渡拒绝码：{v}"
+        );
         assert!(
             fake.recorded().is_empty(),
-            "无头路由会话在分派接线前零注入（不落终端注入臂）"
+            "无头路由会话零终端注入（不落终端注入臂）"
         );
         // 不存在的会话 → 404 no_session（W1：定位失败不入队）
         let r = app
@@ -5883,9 +5915,9 @@ mod tests {
         );
     }
 
-    /// H3：开关**开启**（KV "true"）→ 放行到路由/分派层（Task 7 起 zcode 路由进无头通道
-    /// 〈`Headless(Zcode)`〉，无头执行器未接线 → 落 `headless_pending`；本测锁「不是
-    /// headless_disabled」**且**「确实走到了无头分派点」——门与分派两段都在断言里）
+    /// H3：开关**开启**（KV "true"）→ 放行到路由/分派层（Task 8 起 zcode 路由进无头通道
+    /// 〈`Headless(Zcode)`〉并**真分派**——落 headless 回执封套，不再是过渡拒绝码；
+    /// 本测锁「不是 headless_disabled」**且**「确实走到了无头分派点」两段）
     #[tokio::test]
     async fn headless_gate_allows_when_enabled() {
         let state = headless_gate_state(FakeInjector::ok());
@@ -5903,14 +5935,21 @@ mod tests {
             ))
             .await
             .unwrap();
-        let body = body_string(r).await;
+        assert_eq!(
+            r.status(),
+            200,
+            "开关开启后 zcode 走真分派（headless 封套）"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["channel"], "headless_zcode");
         assert!(
-            !body.contains("headless_disabled"),
-            "开关开启后不得再被 H3 门拒绝（今日落到无头分派点的 headless_pending 属预期）：{body}"
+            !v.to_string().contains("headless_disabled"),
+            "开关开启后不得再被 H3 门拒绝：{v}"
         );
         assert!(
-            body.contains("headless_pending"),
-            "开关开启后必须抵达无头分派点（Task 7 过渡态码，Task 8 换成真分派）：{body}"
+            !v.to_string().contains("headless_pending"),
+            "Task 8 起 zcode 不得再落过渡拒绝码：{v}"
         );
     }
 
@@ -6026,13 +6065,34 @@ mod tests {
                 .is_some_and(|s| s.contains("无头通道未开启，请在电脑端 MAM 设置中开启")),
             "关闭态置灰必须带 spec H3 逐字原因：{v}"
         );
-        // 开关开启 → 门放行，落无头分派点（Task 7：workbuddy 路由 = Headless(WbAcp)，
-        // 执行器未接线 → injectable=false + headless_pending。**与 session-send ⑤b
-        // 同判据**：发送必败的会话不得在这里报 injectable:true）
+        // 开关开启 → 门放行：zcode 真分派（injectable:true + 无头通道名 + 可见性档），
+        // workbuddy（Task 11 未接线）仍落 headless_pending。**与 session-send ⑤b 同判据**：
+        // 发送必败的会话不得在这里报 injectable:true
         state.store.with(|c| {
             crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
         });
-        for sid in ["sess_c", "sess_d"] {
+        // ②' zcode（**Task 8 已真分派**）：injectable:true + 通道名 + 可见性档。夹具
+        //     home_source = None（读不到信任表）→ 保守判**未信任**（「仅 MAM 可见」——
+        //     绝不谎报「重启后可见」）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-send-info?session_id=sess_d",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["injectable"], true, "zcode 已接线 → 输入区必须可用：{v}");
+        assert_eq!(v["channels"], serde_json::json!(["headless_zcode"]));
+        assert_eq!(
+            v["visibility"], "mam_only",
+            "读不到信任表 = 保守判未信任：{v}"
+        );
+        for sid in ["sess_c"] {
             let r = app
                 .clone()
                 .oneshot(req(
@@ -6048,7 +6108,7 @@ mod tests {
             assert_eq!(v["injectable"], false, "{sid}");
             assert_eq!(
                 v["reasonCode"], "headless_pending",
-                "开关开启后无头会话应落到分派点码（{sid}）：{v}"
+                "开关开启后未接线的无头会话应落到分派点码（{sid}）：{v}"
             );
             assert!(
                 v["reason"].is_string(),
@@ -6090,6 +6150,340 @@ mod tests {
 
     /// opencode 多选题载荷（GET 快照用例；引号直接写——raw string 内不需转义）
     const PAYLOAD_OC_MULTI: &str = r#"{"questions":[{"header":"优化重点","multiSelect":true,"question":"你希望这次优化重点放在哪些方面？","options":[{"label":"画面美感与细节"},{"label":"性能与兼容性"}]}]}"#;
+
+    // ==== Task 8（H7）：zcode 无头分派链 / 取消端点（`/session-headless-cancel`）====
+    //
+    // **测试构建的确定性**：`zcode::production_roots` 在 `cfg(test)` 下恒空表（宪法级：
+    // 本机真装了 ZCode，若单测也去咨询真机安装路径，端点用例就会**真的 spawn 一个真实
+    // 回合**——消耗用户真实账号配额并写真实 ~/.zcode）。故分派链在门禁里恒落
+    // 「安装不可达」拒绝臂；真回合的执行语义由 `zcode::run_turn` 的脚本缝用例覆盖，
+    // 真实一次调用登记在 Task 8 报告里（USER-ASSIST/实机步骤）。
+
+    /// zcode 分派用 state：开关开启 + 设备 + **指定会话**（id 独占，避免与其它夹具
+    /// 撞裸 id 字符串——守卫 id 立规②）
+    fn zcode_dispatch_state(sessions: Vec<crate::session::Session>) -> Arc<RemoteState> {
+        let state = with_sessions(inject_state(FakeInjector::ok()), sessions);
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        state
+    }
+
+    /// zcode 无头分派链（开关开启 → 真分派臂）：
+    /// ① HTTP 200 + `headless` 封套（Task 6 回执原样透出）；
+    /// ② 安装不可达 = 如实的 `spawn` 失败（**不冒充成功、不落终端注入臂、不入队**）；
+    /// ③ 落 `headless` 审计行（result = 终态 + 阶段码，通道列 = `headless_zcode`）；
+    /// ④ 拒绝后串行锁**已注销**（否则该会话的下一条永远被自己的锁挡住）
+    #[tokio::test]
+    async fn zcode_headless_dispatch_is_honest_when_install_is_unreachable() {
+        let state = zcode_dispatch_state(vec![inj_sess(
+            "sess_h7_dispatch",
+            crate::session::AgentType::ZCode,
+            14,
+            crate::session::SessionStatus::Waiting,
+        )]);
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_h7_dispatch","text":"无头你好"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "无头分派：HTTP 200 + 语义在 body");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["channel"], "headless_zcode");
+        assert_eq!(v["receipt"]["status"], "failed");
+        assert_eq!(v["receipt"]["stage"], "spawn", "安装不可达 → spawn 档：{v}");
+        assert_eq!(v["receipt"]["sessionId"], "sess_h7_dispatch");
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("安装路径不可达")),
+            "失败必须点明原因：{v}"
+        );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "无头回合必须落既有 W5 单账本：{audits:?}");
+        assert_eq!(audits[0].action, "headless");
+        assert_eq!(audits[0].channel, "headless_zcode", "通道列 = 无头通道名");
+        assert_eq!(audits[0].session_id, "sess_h7_dispatch");
+        assert_eq!(audits[0].device_name, "测试设备");
+        assert_eq!(
+            audits[0].result, "failed(spawn) · 0ms",
+            "终态 + 阶段码 + 耗时口径（Task 6 单点）"
+        );
+        assert!(
+            !crate::inject::headless::zcode::registry().in_flight("sess_h7_dispatch"),
+            "拒绝臂必须注销串行锁（否则该会话被自己的锁永久挡死）"
+        );
+        let pending = state.store.with(|c| {
+            crate::database::dao::inject_queue::pending_for_session_conn(c, "sess_h7_dispatch")
+        });
+        assert!(pending.is_empty(), "无头回合绝不入队（裁决 8）");
+    }
+
+    /// 斜杠命令在无头通道**显式拒绝**（spec H7：字面文本、不具等价性——不静默透传冒充
+    /// 支持）；同样如实落账、不入队
+    #[tokio::test]
+    async fn zcode_headless_refuses_slash_commands_explicitly() {
+        let state = zcode_dispatch_state(vec![inj_sess(
+            "sess_h7_slash",
+            crate::session::AgentType::ZCode,
+            14,
+            crate::session::SessionStatus::Waiting,
+        )]);
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_h7_slash","text":"/plan 看代码"}"#),
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless", "{v}");
+        // **投递前拒绝**用 `refused` 档（Task 8 复审追补）：回合未起跑、零字节投递——
+        // 与 `channel_error`（通道跑过但没拿到有效回执）分列，移动端分诊文案才说得准
+        assert_eq!(v["receipt"]["stage"], "refused", "{v}");
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("斜杠命令")),
+            "必须显式说明斜杠命令不可用：{v}"
+        );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits[0].result, "failed(refused) · 0ms");
+        assert!(state
+            .store
+            .with(
+                |c| crate::database::dao::inject_queue::pending_for_session_conn(
+                    c,
+                    "sess_h7_slash"
+                )
+            )
+            .is_empty());
+    }
+
+    /// **会话串行锁**（MAM 自己的）：同会话已有在飞无头回合 → 第二次请求如实拒绝
+    /// （不排队、不覆盖），且**不得碰第一个回合的槽位**（取消靶子必须还在——否则移动端
+    /// 取消钮变哑的）
+    #[tokio::test]
+    async fn zcode_headless_serial_lock_refuses_second_turn() {
+        let state = zcode_dispatch_state(vec![inj_sess(
+            "sess_h7_lock",
+            crate::session::AgentType::ZCode,
+            14,
+            crate::session::SessionStatus::Waiting,
+        )]);
+        // 模拟「已有在飞回合」：占位 + 已武装取消靶子（真回合由 run_turn 逐尝试 arm）
+        let reg = crate::inject::headless::zcode::registry();
+        assert!(reg.begin(
+            "sess_h7_lock",
+            crate::inject::headless::zcode::TurnSlot::placeholder("zcode", "在飞正文".into())
+        ));
+        let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hit2 = hit.clone();
+        reg.arm(
+            "sess_h7_lock",
+            std::sync::Arc::new(move || {
+                hit2.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            }),
+        );
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_h7_lock","text":"第二条"}"#),
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["receipt"]["status"], "failed");
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("串行锁")),
+            "必须如实说明被串行锁拒绝：{v}"
+        );
+        assert!(
+            reg.in_flight("sess_h7_lock"),
+            "拒绝臂不得注销**别人**的在飞槽位"
+        );
+        assert_eq!(
+            reg.request_cancel("sess_h7_lock"),
+            Some(true),
+            "第一个回合的取消靶子必须原样保留"
+        );
+        assert!(hit.load(std::sync::atomic::Ordering::SeqCst));
+        reg.end("sess_h7_lock");
+    }
+
+    /// 取消端点：在飞回合 + 靶子送达 → `{cancelled:true}` + `headless_cancel` 审计行
+    /// （设备 = 按下取消的这台设备；正文/工具 = 回合自身——与 `headless` 行同源）
+    #[tokio::test]
+    async fn headless_cancel_endpoint_audits_delivered_cancel() {
+        let state = inject_state(FakeInjector::ok());
+        persist_named_device(&state, "mm", "测试设备");
+        let reg = crate::inject::headless::zcode::registry();
+        assert!(reg.begin(
+            "sess_h7_cancel",
+            crate::inject::headless::zcode::TurnSlot::placeholder("zcode", "回合正文".into())
+        ));
+        reg.arm(
+            "sess_h7_cancel",
+            std::sync::Arc::new({
+                // 模拟 Task 6 的「先到者生效」：取消口一次一臂——第一发取走靶子，第二发报 false
+                let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                move || armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+            }),
+        );
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-headless-cancel",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_h7_cancel"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["cancelled"], true, "{v}");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "取消送达必须落账：{audits:?}");
+        assert_eq!(audits[0].action, "headless_cancel");
+        assert_eq!(audits[0].channel, "headless_zcode");
+        assert_eq!(audits[0].session_id, "sess_h7_cancel");
+        assert_eq!(audits[0].device_name, "测试设备");
+        assert!(
+            audits[0].result.starts_with("cancelled · ") && audits[0].result.ends_with("ms"),
+            "终态 + 耗时口径（Task 6 单点）：{}",
+            audits[0].result
+        );
+        assert!(
+            audits[0].summary.contains("回合正文"),
+            "取消行的内容摘要取回合原文（与回合行同源）：{}",
+            audits[0].summary
+        );
+        // 取消只是请求：槽位由回合自身注销（本端点不得注销——否则第二发取消会谎报
+        // 「无在飞回合」）
+        assert!(reg.in_flight("sess_h7_cancel"));
+        // 重复取消：靶子已被先到者取走 → 如实报「未送达」，不落第二行
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-headless-cancel",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_h7_cancel"}"#),
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["cancelled"], false, "先到者生效：重复取消不生效：{v}");
+        assert!(v["reason"].as_str().is_some_and(|s| s.contains("未送达")));
+        assert_eq!(
+            state
+                .store
+                .with(|c| crate::database::dao::write_audit::recent_conn(c, 10))
+                .len(),
+            1,
+            "未送达的取消不得落账"
+        );
+        reg.end("sess_h7_cancel");
+    }
+
+    /// 取消端点的诚实面：无在飞回合 → `{cancelled:false, reason}` 且**零审计行**；
+    /// 迟到取消（靶子返回 false = 回合已终结/watchdog 先到）同样不落取消行；缺参 400
+    #[tokio::test]
+    async fn headless_cancel_endpoint_is_honest_when_nothing_to_cancel() {
+        let state = inject_state(FakeInjector::ok());
+        persist_named_device(&state, "mm", "测试设备");
+        let reg = crate::inject::headless::zcode::registry();
+        let app = router(state.clone());
+        // ① 无在飞回合
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-headless-cancel",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_h7_none"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["cancelled"], false, "{v}");
+        assert!(v["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("没有在飞的无头回合")));
+        assert!(
+            state
+                .store
+                .with(|c| crate::database::dao::write_audit::recent_conn(c, 10))
+                .is_empty(),
+            "没有取消动作就不落账（不编造审计行）"
+        );
+        // ② 迟到取消：槽位在但靶子已失效（先到者已生效 / 回合已终结）
+        assert!(reg.begin(
+            "sess_h7_late",
+            crate::inject::headless::zcode::TurnSlot::placeholder("zcode", "旧回合".into())
+        ));
+        reg.arm("sess_h7_late", std::sync::Arc::new(|| false));
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-headless-cancel",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_h7_late"}"#),
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["cancelled"], false, "迟到取消不生效（先到者生效）：{v}");
+        assert!(
+            state
+                .store
+                .with(|c| crate::database::dao::write_audit::recent_conn(c, 10))
+                .is_empty(),
+            "未送达的取消不落账"
+        );
+        reg.end("sess_h7_late");
+        // ③ 缺参 400
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-headless-cancel",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"  "}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        assert!(body_string(r).await.contains("bad_request"));
+    }
 
     /// 审批选项（可批）：sess_a Waiting + last_message 命中 → 200 available=true +
     /// options 恰为 允许/拒绝 两项（**无 key 字段**——键位不外泄给 UI）+

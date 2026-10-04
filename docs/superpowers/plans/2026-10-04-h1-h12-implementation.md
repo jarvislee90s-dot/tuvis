@@ -415,7 +415,13 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 
 - [ ] **Step 2: 确认失败** → **Step 3: 实现**：`build_argv`（`--prompt <text> --resume <sess> --cwd <proj> --mode yolo --json`；Win/Mac 两形态 + env 集）；执行走 Task 6 runner；`WorkspaceBusy` → 探活重试（APP 工作区活跃探测 = `find_dsh_desktop_host_pid` 同款扫描法的 zcode 版：查 ZCode APP 是否活跃于该项目——按 app-server 进程 cwd 扫描，探测定案口径）最多 2 次（间隔 5s），仍忙 → 回执失败 +「工作区忙」原因；成功 → Receipt + 可见性提示文案（已信任=「重启 ZCode 应用后可见」/未信任=「仅 MAM 可见」，信任判定 = recentProjects 含该项目路径——读 `~/.zcode/v2/setting.json` 只读）。api.rs：`Headless(Zcode)` 分派 → 会话串行锁（per-session MutexMap）→ runner → 回执 + 审计。移动端回执卡三态 + 取消按钮（调 `/session-headless-cancel`）。
 - [ ] **Step 4: 全门禁**；**Step 5: USER-ASSIST 实机**：手机对探测留下的自建 zcode 会话（`sess_4d37f1f3` 等）发一条 → 回执卡出（末条 assistant + token + 耗时）→ 重启 ZCode APP 后 Test2 工作区可见该回合。
-- [ ] **Step 6: Commit** `git commit -m "feat(zcode): H7 无头发消息——平台分叉 argv/争用锁探活重试/yolo/回执卡 + session-send 接线"`
+- [x] **Step 6: Commit** `git commit -m "feat(zcode): H7 无头发消息——平台分叉 argv/争用锁探活重试/yolo/回执卡 + session-send 接线"`（`7e288ab`；复审追补合并入同 commit 的 amend）
+
+**⚠️ Task 8 实施记录（2026-10-05 实机 + 复审追补，**更正本任务书字面**）**：
+1. **provider config 两端都要**（任务书只写 Mac）：真机 Windows CLI 自报查找 `<root>\resources\glm\provider\` 与 `<盘>:\config\provider\`，装包实际在 `<root>\resources\config\provider\zcode-builtin.json`（stat 实证）——不设则 `--prompt` 报「无法定位 CLI ZCode Built-in Provider Config」exit 1。实现 `gate::provider_config_env`：macOS 无条件设、Windows 推导路径在场才设（探针与真回合**共用单点**）。
+2. **版本探针 = 一次真实最小模型回合**（任务书与 Task 6 代码都当作「空串干跑」）：真机 CLI 拒绝空载荷（`--prompt requires non-empty text.`），故 `PROBE_PROMPT = "hi"`；结论缓存改为**成功长缓存 / 失败 5 分钟 TTL**（`FAILURE_TTL_MS`）——一次瞬时抖动不得把通道钉死整个进程生命周期。成本：每安装版本一次最小回合（mtime 键失效重探）。
+3. **回执真源 = 会话库**：真机 `--resume` 回合 exit 0、会话库确有回复（`tokens.output=16493` 实测），但 **stdout 无可解析 JSON** ⇒ stdout 只作完成信号；`lastAssistant`/`tokens` 取自 `~/.zcode/cli/db/db.sqlite` 只读链路（`zcode_parser::store_snapshot` 复用既有解析件；确认判据 = 末条 assistant **消息 id** 变化，有界轮询 3×1s）；stdout JSON 仍为第一优先；两者都无 → 如实的 channel_error（不冒充成功）。
+4. **新增 stage `refused`**（投递前拒绝：斜杠命令/会话串行锁/平台不支持——回合未起跑、零字节投递），与 `channel_error` 分列；stage 名单跨语言锁定于 `tests/fixtures/headless_stages.json`（Rust 枚举与移动端分诊表各自断言）。
 
 ### Task 9: C1-⑤ H8 codex APP 适配器（queue 主 / exec resume 兜底）
 
@@ -580,6 +586,7 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 | M13 | H12 WB 上板 | 在 WorkBuddy 里新建一个会话说一句 | MAM 看板出现该 WB 卡（无心跳场景） |
 | M14 | L13 拒绝歧义 | 电脑开两个终端、同目录各起一个 claude → 手机对其中一张卡发消息 | 收到明确拒绝提示「同目录存在多个候选会话…」（而不是打进错误窗口） |
 | M15 | 回执诚实性抽查 | 手机随便发 2–3 条到不同工具 | 每条要么明确成功（有消费证据）要么明确失败原因——**没有任何一条谎报成功** |
+| M16 | **H7 resume 路径回执源（Task 8 复审追补）** | 手机对**探针自建**的 zcode 会话（会话列表里标题为 `hi` 的那几张，e.g. `sess_6c502451-4f7f-498c-ae4b-5b6fc4c4164c`）发「hi [测试]」 | 回执卡显示**末条 assistant 摘要 + 耗时**（`tokens` 取库 `tokens.output`，有则显示）；**不是**「未拿到回执」——stdout 无 JSON 的 resume 路径必须由会话库确认（若显示 channel_error = FAIL，记录并回报主线）；随后重启 ZCode APP → 该回合在工作区可见 |
 
 （L14 的 macOS 假成功修复属 Mac 侧验收——下次 Mac 有空时按 Mac 报告 ③-5 场景复测 Esc 生效即可，不阻塞本批。）
 
@@ -596,3 +603,4 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 3. **类型一致性**：`Receipt/Stage/HeadlessKind/Channel::Headless/PermissionSpec/Decision/Q` 在 Task 6/7/8/10/13 间交叉引用已对齐；`codex -C` 前置（Task 9 argv[1] 断言）与附录 E-④ 一致。
 4. **实测对齐**：Task 1 的诊断三连源自「版本门结论被代码事实推翻」的更正；Task 8 争用锁/Task 9 分派/Task 11 复活语义均为两端探测定案直译。
 5. **复审轮修订（2026-10-05，用户指令内审）**：① 执行纪律改为「本地分支 `feat/h1-h12-headless`、全任务完成且 Task 15 通过前不 push」；② 新增复用清单节（在产函数 8 项 + 探测定案真值 7 项，标注用于哪个任务）；③ gate.rs 伪码测试改真码（`--prompt` 在场断言 + `--version` 缺席断言）；④ Task 6 补「无头子区三件套收齐」步（超时/并发控件原漏排）；⑤ Task 11 MockHttp 定义为任务内注入缝；⑥ Task 13「C4 实机首任务」自指措辞改「本任务实机首步」；⑦ Task 14 E2E 去 windows-only 编译门（无头通道双平台）；⑧ 新增 Task 15（15 个手工用例，仅收手机/GUI 目视/APP 交互/账号态四类不可自动化项，统一于 review 通过后执行）。
+6. **Task 8 实机修订（2026-10-05，硬证据；同步回填 H7 spec）**：① `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` **Windows 同样需要**（打包布局错位，真机 stat + CLI 报错逐字）；② 版本探针**不是空串干跑而是真实最小回合**（CLI 拒绝空载荷），失败结论改 5 分钟 TTL；③ **回执真源改会话库**（resume 路径 stdout 无 JSON 但库有回复），stdout 只作完成信号；④ 新增 `Stage::Refused` 与跨语言 stage 夹具锁。Task 15 相应新增 M16（resume 路径回执源）。

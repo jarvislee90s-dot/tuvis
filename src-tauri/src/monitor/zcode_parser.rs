@@ -761,6 +761,113 @@ fn first_user_text(
     None
 }
 
+// ===== 会话库快照（Task 8 无头回执源；**只读**）=====
+
+/// 会话库快照（H7 无头回合的回执真源）。真机实证（2026-10-05）：`--resume` 无头回合
+/// stdout **没有**可解析 JSON（exit 0 正常结束、会话库确有回复），故回执的
+/// `lastAssistant`/`tokens` 只能取自会话库——stdout 退化为**完成信号**。
+///
+/// 字段语义：
+/// - `last_seq`：该会话消息表的**最大序**（`sequence` 列优先，缺列降级 `time_created`——
+///   与 [`load_tail_messages`] 同判据）；无消息 = 0。回合前后对比的「有没有新东西」背景证据；
+/// - `last_assistant_id`：末条 **assistant** 消息的 id（**确认判据的主键**：同一文本的两轮
+///   回复也能区分开，纯文本比较做不到）；
+/// - `last_assistant`：该消息的末个 text part（口径同 [`last_message_summary`]：记账消息
+///   跳过、倒扫取最新）；
+/// - `tokens`：该消息 `data.tokens.output`（真机形态 `{"tokens":{"total":…,"output":…}}`；
+///   缺则 `total`；都没有 = `None`，**不编数字**）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ZcodeStoreSnapshot {
+    pub last_seq: i64,
+    pub last_assistant_id: Option<String>,
+    pub last_assistant: Option<String>,
+    pub tokens: Option<u64>,
+}
+
+/// 读一个会话的库快照（Task 8 回执源）。**只读**、零写；任何读失败（缺库/缺表/加锁/
+/// 格式漂移）→ `None`（调用方如实判「不可确认」，绝不猜）。
+///
+/// 复用本模块既有私有读取件（[`load_tail_messages`] / [`load_parts_for_messages`] /
+/// [`part_text`]）——**不另写第二份解析**。
+pub fn store_snapshot(roots: &ZcodeRoots, session_id: &str) -> Option<ZcodeStoreSnapshot> {
+    let conn = open_readonly_with_timeout(&roots.cli_db)?;
+    store_snapshot_conn(&conn, session_id)
+}
+
+/// 生产便利壳：`<home>/.zcode` 根（与 [`ZcodeRoots::from_home`] 同源）
+pub fn store_snapshot_home(home: &Path, session_id: &str) -> Option<ZcodeStoreSnapshot> {
+    store_snapshot(&ZcodeRoots::from_home(home), session_id)
+}
+
+/// 快照内核（conn 注入，测试直驱）
+fn store_snapshot_conn(conn: &Connection, session_id: &str) -> Option<ZcodeStoreSnapshot> {
+    let order_col = if conn.prepare("SELECT sequence FROM message LIMIT 0").is_ok() {
+        "sequence"
+    } else if conn
+        .prepare("SELECT time_created FROM message LIMIT 0")
+        .is_ok()
+    {
+        "time_created"
+    } else {
+        return None; // 升级改表：如实读不到
+    };
+    let last_seq: i64 = conn
+        .query_row(
+            &format!("SELECT COALESCE(MAX({order_col}), 0) FROM message WHERE session_id = ?1"),
+            [session_id],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let messages = load_tail_messages(conn, session_id)?;
+    let parts = load_parts_for_messages(conn, &messages);
+    let (last_assistant_id, last_assistant, tokens) = last_assistant_facts(&messages, &parts);
+    Some(ZcodeStoreSnapshot {
+        last_seq,
+        last_assistant_id,
+        last_assistant,
+        tokens,
+    })
+}
+
+/// 末条 assistant 消息的三件事实（id / 文本 / token 用量）：倒扫，记账消息跳过，
+/// 只认 `role == "assistant"` 且带非空 text part 的消息；文本取该消息**最后一个** text part
+/// （与 [`last_message_summary`] 同口径）。
+fn last_assistant_facts(
+    messages: &[MessageRow],
+    parts: &HashMap<String, Vec<PartRow>>,
+) -> (Option<String>, Option<String>, Option<u64>) {
+    for msg in messages.iter().rev() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg.data) else {
+            continue;
+        };
+        if v.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(msg_parts) = parts.get(&msg.id) else {
+            continue;
+        };
+        let Some(text) = msg_parts.iter().rev().find_map(part_text) else {
+            continue;
+        };
+        return (Some(msg.id.clone()), Some(text), message_tokens(&v));
+    }
+    (None, None, None)
+}
+
+/// 消息级 token 用量（真机形态：`data.tokens = {"total":…,"input":…,"output":…}`）。
+/// 取 `output`（与回执读帧「output_tokens 优先」口径一致），缺则 `total`；
+/// 标量形态（老库/他形态）直接采用；都没有 = `None`（**不编数字**）。
+fn message_tokens(v: &serde_json::Value) -> Option<u64> {
+    match v.get("tokens") {
+        Some(serde_json::Value::Number(n)) => n.as_u64(),
+        Some(obj @ serde_json::Value::Object(_)) => obj
+            .get("output")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| obj.get("total").and_then(serde_json::Value::as_u64)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1996,6 +2103,84 @@ mod tests {
     }
 
     // ===== 标题降级链与卡片字段 =====
+
+    /// **Task 8 回执源**（H7 无头回合）：快照 = 最大序 + 末条 assistant（id/文本/tokens）。
+    /// fixture 驱动（tempdir），**零真实 ~/.zcode**；形态对齐真机 message.data
+    /// （`{"role":"assistant","tokens":{"total":…,"output":…}}`，2026-10-05 实测）。
+    #[test]
+    fn store_snapshot_reads_last_assistant_and_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        let cli = build_cli_db(&roots.cli_db);
+        insert_session(
+            &cli,
+            SID_A,
+            None,
+            "/tmp/proj",
+            "interactive",
+            Some("t"),
+            1_000,
+        );
+        insert_message(
+            &cli,
+            "m1",
+            SID_A,
+            1,
+            10,
+            r#"{"role":"user","semantics":{"kind":"user_prompt"}}"#,
+        );
+        insert_part(&cli, "p1", "m1", 1, r#"{"type":"text","text":"你好"}"#);
+        insert_message(
+            &cli,
+            "m2",
+            SID_A,
+            2,
+            20,
+            r#"{"role":"assistant","tokens":{"total":83980,"input":67487,"output":16493}}"#,
+        );
+        insert_part(&cli, "p2", "m2", 1, r#"{"type":"reasoning","text":"想想"}"#);
+        insert_part(&cli, "p3", "m2", 2, r#"{"type":"text","text":"改好了"}"#);
+        drop(cli);
+
+        let snap = store_snapshot(&roots, SID_A).expect("库可读必须给快照");
+        assert_eq!(snap.last_seq, 2, "最大序 = message.sequence 的最大值");
+        assert_eq!(snap.last_assistant_id.as_deref(), Some("m2"));
+        assert_eq!(
+            snap.last_assistant.as_deref(),
+            Some("改好了"),
+            "取末个 text part（与末条摘要同口径）"
+        );
+        assert_eq!(
+            snap.tokens,
+            Some(16493),
+            "tokens 取 output（与回执读帧 output_tokens 优先口径一致）"
+        );
+        // 无此会话 → 仍是「可读」快照（空态），不是 None（None 专表「读不到」）
+        let empty =
+            store_snapshot(&roots, "sess_ffffffff-ffff-4fff-8fff-ffffffffffff").expect("库可读");
+        assert_eq!(empty.last_seq, 0);
+        assert_eq!(empty.last_assistant_id, None);
+        // 缺库 → None（如实「读不到」，调用方判不可确认）
+        let missing = ZcodeRoots {
+            tasks_db: tmp.path().join("nope-tasks.sqlite"),
+            cli_db: tmp.path().join("nope-cli.sqlite"),
+        };
+        assert!(store_snapshot(&missing, SID_A).is_none());
+    }
+
+    /// token 字段多形态（真机对象 / 标量 / 全缺）：**没有就是 None，不编数字**
+    #[test]
+    fn message_tokens_forms() {
+        let v = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert_eq!(
+            message_tokens(&v(r#"{"tokens":{"output":7,"total":9}}"#)),
+            Some(7)
+        );
+        assert_eq!(message_tokens(&v(r#"{"tokens":{"total":9}}"#)), Some(9));
+        assert_eq!(message_tokens(&v(r#"{"tokens":42}"#)), Some(42));
+        assert_eq!(message_tokens(&v(r#"{"role":"assistant"}"#)), None);
+        assert_eq!(message_tokens(&v(r#"{"tokens":{}}"#)), None);
+    }
 
     #[test]
     fn title_degradation_chain() {

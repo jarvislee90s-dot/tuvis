@@ -51,37 +51,41 @@
 //! 零 DB）+ [`settle`]（落账 + 审计，conn 显式注入内存库）直接驱动；两者的组合即
 //! `flush_one` 全部行为，组合本身仅 10 行取件/落账薄壳。
 //!
-//! ## H 系无头条目与 flush 循环（Task 7 裁决⑤；**Task 8 必读**）
+//! ## H 系无头条目与 flush 循环（Task 7 裁决⑤；**Task 8 已收口**）
 //!
-//! 本循环（[`flush_one`] / [`reconcile_once`] / [`try_flush_with`]）**不判 H3 无头开关、
-//! 也不重跑 `routing::route()`**，投递一律走终端注入器（`st.injector`）。Task 7 在**入队
-//! 侧**给出的保证是这一条（**只此一条，勿读成投递侧保证**）：
+//! ### Task 8 收口（**已实现，勿删**）
+//! [`try_flush_with`] 在投递前**重跑路由结论**（判据从
+//! `routing::headless_kind_of(&routing::route(...))` 派生——**不另立工具/形态表**，Task 5
+//! 的平行谓词教训）：命中即 [`FlushOutcome::Deferred`]——**不投递、不消费队首**（行保持
+//! pending，等总开关开启后端点真分派，或会话回归终端通道）。测试：
+//! `headless_bound_entry_is_not_delivered_by_terminal_injector`（claude pid=0 未读卡 +
+//! zcode 工具级无头两形态）。
+//!
+//! **为什么是「一律 Deferred」而不是「按开关分流」**：本循环只有**终端注入器**
+//! （`st.injector`）——无头回合由端点在无头通道里每回合 spawn 子进程（裁决 8，见
+//! `remote::api::zcode_headless_dispatch`）。循环里既没有无头执行器，也就没有任何
+//! 「开关开着就照投」的合法形态：照投 = 把正文打进一个不是终端宿主的 pid。
+//!
+//! ### 历史登记（Task 7 的缺口描述，保留作判据来源）
+//! 本循环（[`flush_one`] / [`reconcile_once`] / [`try_flush_with`]）**不判 H3 无头开关**，
+//! 投递一律走终端注入器（`st.injector`）。Task 7 在**入队侧**给出的保证是这一条：
 //!
 //! - **无头条目进不了队列**：唯一生产入队口 = `remote::api::session_send` 的
 //!   `enqueue_conn`（本模块的 `enqueue_conn` 调用面只有测试夹具），该端点在 Task 7 起对
-//!   「无头路由 + 无终端候选」的会话**在 INSERT 之前**即拒绝（403 not_injectable +
-//!   reasonCode=`headless_pending`，判据 `routing::headless_kind_of` +
-//!   `routing::has_terminal_candidate`，即 Task 8 的无头分派接线点）。
+//!   「无头路由 + 无终端候选」的会话**在 INSERT 之前**即处理（Task 8 起 zcode 走真分派，
+//!   其余家仍 403 + reasonCode=`headless_pending`）。
 //!
-//! **投递侧不重判路由 ⇒ 入队后的状态漂移仍在开关之外**：一条**入队当时**判终端通道的条目
-//! （如 claude 有活 pid）若其会话进程随后退出、卡片转成未读卡（`pid = 0` + `form = App`，
-//! 见 `adapter::build_unread_cards`），此刻路由判的是 `Headless(ClaudeP)`——本循环照旧用
-//! 终端注入器投递，H3 开关管不到它。**影响有界**（不是「无危害」）：pid = 0 时 Windows 侧
-//! `resolve_target` 先 `AttachConsole(0)` 失败、`collect_ancestor_pids(0)` 亦为空 → 直接
-//! 失败（行如实落 `failed:<e>`，不会打错窗口）；只有「活着的**非终端** pid」才可能走到祖先
-//! 链回退那一格。该漂移类**先于本 commit 存在**——投递侧从来不看路由，本 commit 未改这一点。
+//! **投递侧重判前的漂移形态（Task 8 已由上面那段收口）**：一条**入队当时**判终端通道的
+//! 条目（如 claude 有活 pid）若其会话进程随后退出、卡片转成未读卡（`pid = 0` + `form = App`，
+//! 见 `adapter::build_unread_cards`），此刻路由判的是 `Headless(ClaudeP)`——Task 8 前本循环
+//! 照旧用终端注入器投递，H3 开关管不到它。**影响有界**（不是「无危害」）：pid = 0 时
+//! Windows 侧 `resolve_target` 先 `AttachConsole(0)` 失败、`collect_ancestor_pids(0)` 亦为空
+//! → 直接失败（行如实落 `failed:<e>`，不会打错窗口）；只有「活着的**非终端** pid」才可能
+//! 走到祖先链回退那一格。该漂移类在 Task 8 的重判落地后不再可达。
 //!
-//! ### Task 8 义务（**编号**；读到本段的第 1/2 条即本模块的收口点）
-//! 1. **无头回合在端点每回合 spawn**（裁决 8：turn 生命周期 = 进程生命周期），**不得经
-//!    `enqueue_conn` 入队**——一旦入队，本循环就会用终端注入器把无头正文打进一个不是终端
-//!    宿主的 pid（zcode/workbuddy/codex APP），且 H3 开关关着也照投。
-//! 2. **补投递侧重判**：Task 8 必须裁决 [`try_flush_with`]（及 [`reconcile_once`] 补投路径）
-//!    是否在投递前重跑 H3 门 / 路由结论，**不得让总开关被「入队后状态漂移」绕过**（本条即
-//!    上述缺口的收口点）。若补：判据同样从路由结论派生（`routing::headless_kind_of`），
-//!    **不得另立工具/形态表**（Task 5 的平行谓词教训）；命中即**不投递且不消费队首**
-//!    （复用既有 `Deferred` 语义，行保持 pending，等开关开启或会话回归终端通道）。
-//! 3. 若将来确有「无头排队」需求（如 H8 的 APP 原生排队语义由 MAM 自建队列承接），**先落
-//!    第 2 条再谈入队**（否则无头条目直接暴露在无门的投递路径上）。
+//! ### 后续义务（Task 9/11/13 读这里）
+//! 若将来确有「无头排队」需求（如 H8 的 APP 原生排队语义由 MAM 自建队列承接），**先落
+//! 上面那段重判再谈入队**（否则无头条目直接暴露在无门的投递路径上）。
 
 use crate::database::dao::inject_queue::{self, QueueRow};
 use crate::session::SessionStatus;
@@ -248,6 +252,34 @@ pub(crate) fn try_flush_with(
         return FlushOutcome::Suspended;
     };
     if is_running(&session.status) && !jump {
+        return FlushOutcome::Deferred;
+    }
+    // ===== H 系**投递侧重判**（Task 8 义务 2；缺口收口点）=====
+    //
+    // 入队**之后**才变成无头绑定的条目（如 claude 会话在队时还有活 pid，随后进程退出 →
+    // 未读卡 pid = 0 → 路由判 `Headless(ClaudeP)`；zcode 更是**工具级**无头）绝不能经
+    // 终端注入器投递：无头回合由端点在**无头通道**里每回合 spawn（裁决 8），本循环既不判
+    // H3 开关、也不跑无头执行器——照投即「把正文打进一个不是终端宿主的 pid」，且开关关着
+    // 也照投（Task 7 登记的唯一漏管面）。
+    //
+    // 判据**只从路由结论派生**（[`crate::inject::routing::headless_kind_of`]——不另立
+    // 工具/形态表；Task 5 的平行谓词教训），命中即 [`FlushOutcome::Deferred`]：
+    // **不投递、不消费队首**（行保持 pending，等总开关开启后端点真分派，或会话回归终端
+    // 通道）。位置在 is_running 之后、L13 靶向闸之前：黄态照旧先挂起，且本闸零副作用。
+    let headless_bound = crate::inject::routing::headless_kind_of(&crate::inject::routing::route(
+        session.agent_type.tool_id(),
+        session.form,
+        session.pid,
+        std::env::consts::OS,
+    ))
+    .is_some();
+    if headless_bound {
+        log::debug!(
+            "投递侧重判：会话 {} 已归无头通道（工具 {}，pid {}）——本轮不投递不消费队首",
+            item.session_id,
+            item.agent_type,
+            session.pid
+        );
         return FlushOutcome::Deferred;
     }
     // ===== L13 靶向闸（C0-③）：同 cwd 多实例 = 卡片 pid 不可信 =====
@@ -1383,6 +1415,64 @@ mod tests {
         assert_eq!(audits[0].result, want_result);
         assert_eq!(audits[0].session_id, "s-run");
         assert!(inject_queue::next_pending_conn(&c, "s-run").is_none());
+    }
+
+    /// **Task 8 义务 2（投递侧重判）**：入队**之后**才变成无头绑定的条目绝不走终端注入器。
+    /// 场景：claude 会话在队时还有活 pid（入队当刻判终端通道），随后进程退出 → 卡片成
+    /// 「未读卡」（pid = 0）→ 路由结论变成 `Headless(ClaudeP)`；同理 zcode 是**工具级**
+    /// 无头（任何 pid 都判无头）。本循环不判 H3 开关、不跑无头执行器 ⇒ 命中即
+    /// [`FlushOutcome::Deferred`]：**不投递、不消费队首**（H3 开关关着也照投的缺口在此收口）。
+    /// 判据**从路由结论派生**（`routing::headless_kind_of`——不另立工具/形态表，Task 5 教训）。
+    #[test]
+    fn headless_bound_entry_is_not_delivered_by_terminal_injector() {
+        // ① claude：进程退出后的未读卡（pid = 0）——H11 无头面
+        let c = mem();
+        enq(&c, "s-headless", "给未读卡的消息");
+        let fake = FakeInjector::ok();
+        let st = state_with(
+            vec![sess("s-headless", SessionStatus::Waiting, 0)],
+            fake.clone(),
+        );
+        let item = inject_queue::next_pending_conn(&c, "s-headless").unwrap();
+        assert_eq!(
+            try_flush(&st, &item, false),
+            FlushOutcome::Deferred,
+            "无头绑定条目必须让位（Deferred），绝不落终端注入臂"
+        );
+        assert!(
+            fake.recorded().is_empty(),
+            "无头绑定条目不得经终端注入器投递（pid 不是终端宿主）"
+        );
+        assert!(settle(&c, &st, &item, false, FlushOutcome::Deferred).is_ok());
+        assert!(
+            inject_queue::next_pending_conn(&c, "s-headless").is_some(),
+            "不消费队首：行保持 pending，等开关开启/会话回归终端通道"
+        );
+        assert!(
+            write_audit::recent_conn(&c, 10).is_empty(),
+            "未消费不写审计（与黄态挂起同口径）"
+        );
+        // ② zcode：工具级无头（**不看形态与 pid**）——活 pid 也照判无头
+        let c2 = mem();
+        inject_queue::enqueue_conn(
+            &c2,
+            "s-zc",
+            "zcode",
+            "dev-1",
+            "测试设备",
+            "给 zcode 的消息",
+            1000,
+        );
+        let fake2 = FakeInjector::ok();
+        let mut zc = sess("s-zc", SessionStatus::Waiting, 55);
+        zc.agent_type = AgentType::ZCode;
+        let st2 = state_with(vec![zc], fake2.clone());
+        let item2 = inject_queue::next_pending_conn(&c2, "s-zc").unwrap();
+        assert_eq!(try_flush(&st2, &item2, true), FlushOutcome::Deferred);
+        assert!(
+            fake2.recorded().is_empty(),
+            "zcode 条目即使插队也不得走终端注入器（工具级无头）"
+        );
     }
 
     /// Waiting（红·等待）会话常规路径消费队首：投递 + mark_sent + 审计 action=flush

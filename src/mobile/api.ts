@@ -425,8 +425,55 @@ export interface SendInfo {
   reasonCode?: string;
   reason?: string;
   channels?: string[];
-  visibility?: "realtime" | "after_refresh";
+  /** 可见性档（后端 `routing::Visibility` 的 wire 词）。Task 8 补齐无头两档：
+   *  `after_restart` = 已信任工作区（重启 ZCode 应用后可见）/ `tuvis_only` = 未信任（仅兔维斯
+   *  可见）——两档文案由后端 `Visibility::note()` 下发，前端只渲染不编。 */
+  visibility?: "realtime" | "after_refresh" | "after_restart" | "tuvis_only";
 }
+
+/** 无头通道名判定（send-info 的 channels 里是否含无头通道 `headless_*`）。
+ *  **单一判据**：发送路径据此分流（无头回合 = 请求等整个进程跑完 + 可取消 + 回执卡），
+ *  通道名与后端 `HeadlessKind::wire_name` 同源（词表只此一份）。 */
+export function headlessChannelOf(info: SendInfo | null): string | null {
+  return info?.channels?.find((c) => c.startsWith("headless_")) ?? null;
+}
+
+/** 无头回合回执（spec H6 形状，与 Rust `inject::headless::receipt::Receipt` 逐字段对应，
+ *  勿漂移）：status ∈ ok|queued|failed|cancelled；stage 是**分阶段失败档**（zcode 专档
+ *  `workspace_busy` = 应用争用锁）；可选键缺席即不上线（后端 `skip_serializing_if`）。
+ *  `stage` 与 `refused`（投递前拒绝）的完整名单见 `tests/fixtures/headless_stages.json`
+ *  ——前端分诊表与 Rust 枚举各自对照它断言（跨语言锁）。 */
+export interface HeadlessReceipt {
+  status: "ok" | "queued" | "failed" | "cancelled";
+  sessionId: string;
+  lastAssistant?: string;
+  tokens?: number;
+  durationMs: number;
+  stage?:
+    | "spawn"
+    | "version_gate"
+    | "timeout"
+    | "crash"
+    | "channel_error"
+    | "dialog"
+    | "workspace_busy"
+    /** 投递前拒绝（回合未起跑、零字节投递：斜杠命令/会话串行锁/平台不支持） */
+    | "refused";
+  reason?: string;
+}
+
+/** 无头回合卡片态（SessionDetail 持有；MessageComposer 经 `onHeadlessTurn` 上报）：
+ *  - `sending`：HTTP 在飞（无头回合 = 进程生命周期，实测 8–23s；期间只此一态 + 取消钮）
+ *  - `done`：终态回执（`receipt.status` 分诊：ok/queued 回执卡；failed 失败分诊卡；
+ *    cancelled 取消卡——**三态都由 receipt 自身说话，前端不另编成功/失败**） */
+export type HeadlessTurn =
+  | { phase: "sending" }
+  | {
+      phase: "done";
+      receipt: HeadlessReceipt;
+      /** 可见性提示（后端 `Visibility::note()` 逐字文案；失败/取消时后端不给） */
+      visibilityNote?: string | null;
+    };
 
 /** 拉取输入区可用性（W4：输入区挂载时一次）。403（设备失效，与 fetchSessions
  *  同语义）→ null；其余失败（404 会话不在快照 / 网络异常）→ 抛 ApiError，
@@ -454,7 +501,18 @@ export type SendResult =
   | { status: "delivered" }
   | { status: "submitted" }
   | { status: "queued"; itemId: number; position: number }
-  | { status: "failed"; error: string };
+  | { status: "failed"; error: string }
+  /** **无头回合回执**（Task 8 / H7）：`receipt` 是后端 Task 6 归一产物原样透出
+   *  （ok|queued|failed|cancelled + stage/reason），`visibilityNote` 是可见性提示逐字文案
+   *  （未信任/失败时缺省）。**与终端四态分列**：无头回合没有「入队」概念（每回合 spawn），
+   *  故不合成 queued{itemId}/delivered 语义。 */
+  | {
+      status: "headless";
+      channel?: string;
+      receipt: HeadlessReceipt;
+      visibility?: SendInfo["visibility"];
+      visibilityNote?: string;
+    };
 
 /** 发送消息（W4 直发/入队分派，后端按输入态路由；多行原样上行，归一在服务端
  *  入队时一次完成）。非 2xx（400 参数非法 / 404 会话消失 / 403 不可注入）→
@@ -489,6 +547,29 @@ export async function sessionSend(
     throw new ApiError(r.status, `session-send ${r.status}`, data);
   }
   return (await r.json()) as SendResult;
+}
+
+/** **取消在飞的无头回合**（Task 8 / H4）：POST /session-headless-cancel。
+ *  契约（HTTP 恒 200，语义在 body）：
+ *  - `{cancelled:true}` = 取消**送达**（先到者生效），回合会以 `cancelled` 回执收尾；
+ *  - `{cancelled:false, reason}` = 未送达（无在飞回合 / 回合已终结 / 已被取消）——
+ *    **不是错误**，只是这一发取消没赶上；前端照常等回执。
+ *  非 2xx（400 缺参 / 403 设备失效）→ 抛 ApiError（调用方静默降级为提示，不阻断回合）。 */
+export async function headlessCancel(
+  sessionId: string
+): Promise<{ cancelled: boolean; reason?: string }> {
+  let r: Response;
+  try {
+    r = await fetch("/m/api/v1/session-headless-cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId }),
+    });
+  } catch (e) {
+    throw new ApiError(null, `session-headless-cancel 网络异常: ${String(e)}`);
+  }
+  if (!r.ok) throw new ApiError(r.status, `session-headless-cancel ${r.status}`);
+  return (await r.json()) as { cancelled: boolean; reason?: string };
 }
 
 /** 上传附件（2026-09-20）：原始字节 POST 到 /session-attachment——服务端落盘到
