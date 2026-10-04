@@ -1,4 +1,5 @@
-// dsh 会话日志读取层：三代际并存（v0/v2/v3，取代际最大者——M0 F2），
+// dsh 会话日志读取层：四代际并存（v0/v2/v3 存量 + v4 rc.2 现行——C0-① 实测；
+// 取代际最大者 M0 F2），
 // header 必读（目录名 ~XXXX 转义不可反解 id，评审漏项 #3；header 兼得子 Agent 过滤字段）
 
 use serde::Deserialize;
@@ -42,7 +43,8 @@ pub fn is_subagent(h: &DshHeader) -> bool {
     h.origin.as_deref() == Some("subagent") || h.delegation_depth > 0
 }
 
-/// 文件名 → 代际号；不识别的文件名忽略（版本门：未来 v4 只需放宽正则）
+/// 文件名 → 代际号（v0/v2/v3/v4 实测均在用）；不识别的文件名忽略
+/// （代际门的读侧入口只认文件名，header.version 门在上层 mod.rs）
 fn parse_generation(name: &str) -> Option<i64> {
     if name == "session.jsonl" || name == "session.jsonl.zstd" {
         return Some(0);
@@ -182,5 +184,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(read_best_generation(dir.path()).is_none());
         assert!(generation_logs(dir.path()).is_empty());
+    }
+
+    /// 行为：v4 文件名解析出代际 4、多帧 zstd 全解、v4 header 与全部事件行可解析
+    /// （含 v4 独有 `agent/inbox/spliced` 帧）。
+    /// 溯源：此断言**修复前即通过**——它是「读侧底座（代际门/解码/schema）无罪」的
+    /// 证据，故障真根因在上层 header.version 白名单（见 mod.rs is_known_generation）
+    #[test]
+    fn v4_filename_parses_and_multiframe_log_decodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // rc.2 实测 header 键集：type/version/id/createdAt/cwd/isSeeded/delegationDepth/agentPreset
+        let header = "{\"type\":\"session\",\"version\":4,\"id\":\"session-v4\",\"createdAt\":1000,\"cwd\":\"/tmp/p\",\"isSeeded\":false,\"delegationDepth\":0,\"agentPreset\":\"default\"}";
+        // 多帧拼接（对齐真实文件 76 帧形态：header 帧 + 追加写入的事件帧）
+        let mut frame = zstd::stream::encode_all(format!("{header}\n").as_bytes(), 3).unwrap();
+        frame.extend_from_slice(
+            &zstd::stream::encode_all(
+                "{\"type\":\"turn/start\",\"seq\":1,\"data\":{}}\n{\"type\":\"agent/inbox/spliced\",\"seq\":2,\"data\":{}}\n"
+                    .as_bytes(),
+                3,
+            )
+            .unwrap(),
+        );
+        std::fs::write(d.join("session.v4.jsonl.zstd"), &frame).unwrap();
+
+        // ① 代际门：文件名 → 4
+        let gens = generation_logs(d);
+        assert_eq!(gens.len(), 1);
+        assert_eq!(gens[0].0, 4, "v4 文件名须解析为代际 4");
+        // ③ 多帧解码 + ② header/事件解析
+        let read = read_best_generation(d).expect("v4 应可读");
+        assert_eq!(read.version, 4);
+        assert_eq!(read.torn_frames, 0, "v4 帧形态无需容错丢弃");
+        let h = parse_header(&read.text).expect("v4 header 可解析");
+        assert_eq!(h.id, "session-v4");
+        assert_eq!(h.version, Some(4));
+        assert_eq!(h.delegation_depth, 0);
+        assert!(!is_subagent(&h));
+        // header 行本身也是一行合法 JSON，parse_events 一并收下（kind="session"，
+        // 各消费层不匹配即落空——preview/status 均按已知 kind 匹配）
+        let events = parse_events(&read.text);
+        assert_eq!(events.len(), 3, "header 行 + 2 事件行均可解析");
+        assert!(
+            events.iter().any(|e| e.kind == "agent/inbox/spliced"),
+            "v4 独有帧可解析（是否消费由上层决定：未知帧不猜 ⇒ 静默落空）"
+        );
+        assert!(events.iter().any(|e| e.kind == "turn/start"));
     }
 }

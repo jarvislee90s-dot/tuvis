@@ -203,6 +203,18 @@ const CARD_WINDOW_MS: i64 = 24 * 3600 * 1000;
 /// 出卡上限（对齐 zcode `RECENT_SESSIONS_LIMIT`）：按活跃度倒序取最近 N 张
 const RECENT_SESSIONS_LIMIT: usize = 100;
 
+/// 已知代际集单源谓词（版本门与测试共用，防两处漂移）：v0（未压缩存量）/
+/// v2/v3（存量）/ v4（rc.2 现行，C0-① 实测——v4 header 与事件 schema 均已被
+/// preview/status 层正确消费，放行即出正常卡）。
+/// 采用**连续区间** 0..=4 而非显式枚举：v1 属「未观测但同区间」——真机存量只有
+/// v0（283 个 session.jsonl.zstd）/v3/v4，v1 从未出现；区间写法对未观测的中间代际
+/// 采取与相邻代际相同的宽容（若未来真机出现 v1，其 header 与事件 schema 落在
+/// v0–v4 演进区间内，语义不猜的风险由 preview/status 的「未知 kind 落空」兜住）。
+/// 集外（v5+）→ 降级卡「格式待适配」：未知语义不猜（探测红线）
+fn is_known_generation(v: i64) -> bool {
+    (0..=4).contains(&v)
+}
+
 /// 内部扫描（home 注入，测试直调——避免 DSH_HOME 环境变量在并行测试中互踩）。
 /// scan 注入式（R1 同思路）：测试用私有 SessionFileScan，防全局 namespace 被
 /// 并行测试的 retain_existing 互踩（含本测试注入条目被别处清掉的时序问题）
@@ -269,10 +281,18 @@ fn scan_sessions(
             if digest.is_subagent {
                 continue; // 子 Agent 不出卡（M0 F7）
             }
-            // 版本门（设计 P5 + 备忘 A8）：header.version 超出已知集（0..=3）→
-            // 降级卡"格式待适配"（未知语义不猜——探测红线），不影响其他会话
+            // 版本门（设计 P5 + 备忘 A8）：header.version 超出已知集（见
+            // 版本门（见 is_known_generation，现行含 v4）→ 降级卡"格式待适配"（未知
+            // 语义不猜——探测红线），不影响其他会话。C0-①：rc.2 会话为 v4，旧白名单
+            // 0..=3 会把全部现行会话整卡降级（症状 = 有卡无消息体），故放行 v4。
+            //
+            // header.version 缺省（None）**有意不过门**：v0 存量正是「header 无 version
+            // 字段」的形态（未压缩 session.jsonl / session.jsonl.zstd），文件名代际已由
+            // generation_logs 选定。若改用文件名代际补判，无 version 的 v0 存量会被判
+            // 成未知代际而整卡降级（行为倒退）；语义判断以 header 为准、文件名只作定位，
+            // 故「header 无 version ⇒ 按 v0 时代已知代际放行」是有意为之的兜底
             if let Some(v) = header.version {
-                if !(0..=3).contains(&v) {
+                if !is_known_generation(v) {
                     ::log::warn!("dsh: 会话 {} 为未知代际 v{}，出降级卡", header.id, v);
                     // 超窗拦截已前移到 stat 预过滤（两分支共用），此处无需重复
                     cards.push((
@@ -537,14 +557,25 @@ mod integration_tests {
 
     /// 造一个隔离 dsh home：一个项目 + 一个会话（zstd 单帧事件）
     fn make_home(events: &str) -> tempfile::TempDir {
+        make_home_versioned(3, "session-abc", events)
+    }
+
+    /// 造一个指定代际的隔离 dsh home（文件名 session.v<N>.jsonl.zstd + header.version=N）。
+    /// header 形态对齐 rc.2 v4 实测键集：type/version/id/createdAt/cwd/isSeeded/
+    /// delegationDepth/agentPreset（serde 忽略多余键，v3 用例共用同一构造不敏感）
+    fn make_home_versioned(version: i64, session_id: &str, events: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let sess = dir.path().join("sessions/--tmp-proj--/session-abc");
+        let sess = dir.path().join("sessions/--tmp-proj--").join(session_id);
         std::fs::create_dir_all(&sess).unwrap();
         // JSON 花括号不能进 format! 格式串——header 行用普通字面量变量拼接
-        let header_line = "{\"type\":\"session\",\"version\":3,\"id\":\"session-abc\",\"cwd\":\"/tmp/proj\",\"createdAt\":1000,\"isSeeded\":false}";
+        let header_line = format!(
+            "{{\"type\":\"session\",\"version\":{v},\"id\":\"{sid}\",\"cwd\":\"/tmp/proj\",\"createdAt\":1000,\"isSeeded\":false,\"delegationDepth\":0,\"agentPreset\":\"default\"}}",
+            v = version,
+            sid = session_id
+        );
         let frame =
             zstd::stream::encode_all(format!("{header_line}\n{events}").as_bytes(), 3).unwrap();
-        std::fs::write(sess.join("session.v3.jsonl.zstd"), &frame).unwrap();
+        std::fs::write(sess.join(format!("session.v{version}.jsonl.zstd")), &frame).unwrap();
         dir
     }
 
@@ -836,6 +867,483 @@ mod integration_tests {
             cards[0].status,
             SessionStatus::Waiting,
             "追加 error 帧后应重扫"
+        );
+    }
+
+    // ===== C0-① rc.2 读侧修复（v4 代际）=====
+
+    /// 红→绿驱动测试（根因层 = 本文件上层 header.version 白名单）：rc.2 现行 v4 会话
+    /// 必须出正常卡。修复前该会话被版本门判为「未知代际」→ 整卡降级为
+    /// 「dsh 格式待适配（v4）」且 last_message=None（用户报的「无消息」症状根因）。
+    /// 事件形态照抄 rc.2 实测：v4 独有 `agent/inbox/spliced` 帧按「未知帧不猜」静默落空
+    #[test]
+    fn v4_header_emits_normal_card_with_message_and_title() {
+        let home = make_home_versioned(
+            4,
+            "session-1b6c5c45",
+            "{\"type\":\"turn/start\",\"seq\":4,\"data\":{}}\n\
+             {\"type\":\"user/message\",\"seq\":8,\"data\":{\"content\":[{\"type\":\"text\",\"text\":\"hi v4\"}],\"source\":{\"kind\":\"user\"}}}\n\
+             {\"type\":\"agent/inbox/spliced\",\"seq\":9,\"data\":{\"seqs\":[1,2]}}\n\
+             {\"type\":\"assistant/message\",\"seq\":10,\"data\":{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}}\n\
+             {\"type\":\"session/title\",\"seq\":11,\"data\":{\"title\":\"v4 会话标题\"}}\n\
+             {\"type\":\"turn/end\",\"seq\":12,\"data\":{\"reason\":{\"kind\":\"completed\"}}}\n",
+        );
+        let sessions = scan_sessions(home.path(), &fake_host(), &test_scan());
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.id, "session-1b6c5c45");
+        assert_eq!(
+            s.title.as_deref(),
+            Some("v4 会话标题"),
+            "v4 须出正常卡（标题取自 session/title 事件），不得是降级卡"
+        );
+        assert_eq!(s.last_message.as_deref(), Some("done"), "v4 须有消息体");
+        assert_eq!(s.last_message_role.as_deref(), Some("assistant"));
+        assert_eq!(s.status, SessionStatus::Finished);
+    }
+
+    /// 回归锁：v4 放行 ≠ 拆掉版本门——未知代际（v5+）仍出降级卡，语义不猜
+    #[test]
+    fn unknown_generation_still_emits_degraded_card() {
+        let home = make_home_versioned(
+            5,
+            "session-future",
+            "{\"type\":\"turn/start\",\"seq\":4,\"data\":{}}\n\
+             {\"type\":\"assistant/message\",\"seq\":9,\"data\":{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}}\n\
+             {\"type\":\"turn/end\",\"seq\":10,\"data\":{\"reason\":{\"kind\":\"completed\"}}}\n",
+        );
+        let sessions = scan_sessions(home.path(), &fake_host(), &test_scan());
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.title.as_deref(), Some("dsh 格式待适配（v5）"));
+        assert_eq!(s.status, SessionStatus::Idle);
+        assert_eq!(s.last_message, None, "未知代际不猜语义：不出消息体");
+        assert_eq!(s.last_message_role, None);
+    }
+
+    /// 已知代际集单源谓词（版本门与测试共用，防两处漂移）：v0–v4 放行、v5+ 降级。
+    /// v1 的断言记录了「连续区间」这一设计决定（真机未观测 v1，区间写法有意宽容，
+    /// 理由见谓词注释）；v0 的断言是 v0 放行唯一的锁（模块内 v0 夹具是子 Agent 卡，
+    /// 在版本门之前就被过滤，锁不住本谓词）
+    #[test]
+    fn is_known_generation_admits_v0_through_v4() {
+        assert!(is_known_generation(0), "v0 未压缩存量（真机 283 个）");
+        assert!(
+            is_known_generation(1),
+            "v1 真机未观测：连续区间有意宽容（见 is_known_generation 注释）"
+        );
+        assert!(is_known_generation(2), "v2 存量");
+        assert!(is_known_generation(3), "v3 存量");
+        assert!(is_known_generation(4), "v4 = rc.2 现行（C0-① 修复点）");
+        assert!(!is_known_generation(5), "未来代际仍走降级卡");
+        assert!(!is_known_generation(-1));
+        assert!(!is_known_generation(99));
+    }
+
+    // --- 实机核验夹具工具（本地专属测试用；只读夹具与用户数据）---
+
+    /// 夹具遍历深度上限 / 目录数上限（防病态目录把测试挂死）
+    const FIXTURE_WALK_MAX_DEPTH: usize = 6;
+    const FIXTURE_WALK_MAX_DIRS: usize = 4096;
+
+    /// 递归收集夹具下的**普通文件**（防卡死三件套，评审后实测抓获真实危害）：
+    /// ① 符号链接/交接点一律不跟随也不计入（`file_type().is_symlink()` **先判**——
+    ///    Windows 交接点同时带目录属性，先判 `is_dir()` 会照样走进去：真实 home 的
+    ///    `profiles/node_modules/*` 正是指向 dsh 安装树的 junction，跟随会走进数万
+    ///    文件把测试挂死，实测 >10min 未完）；
+    /// ② 深度上限；③ 目录数上限。
+    /// 起步目录：home 布局只走 `<root>/sessions`（会话日志唯一所在，绕开 node_modules
+    /// 等无关大树）；扁平探针布局才走整个夹具根
+    fn collect_fixture_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let start = if root.join("sessions").is_dir() {
+            root.join("sessions")
+        } else {
+            root.to_path_buf()
+        };
+        let mut out = Vec::new();
+        let mut dirs_seen = 0usize;
+        let mut stack = vec![(start, 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > FIXTURE_WALK_MAX_DEPTH || dirs_seen >= FIXTURE_WALK_MAX_DIRS {
+                continue;
+            }
+            dirs_seen += 1;
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let Ok(ft) = e.file_type() else {
+                    continue;
+                }; // 不跟随链接
+                if ft.is_symlink() {
+                    continue;
+                }
+                if ft.is_dir() {
+                    stack.push((e.path(), depth + 1));
+                } else if ft.is_file() {
+                    out.push(e.path());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// 夹具下的 dsh 代际日志文件（名如 `session*.jsonl[.zstd]`）
+    fn collect_generation_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        collect_fixture_files(root)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("session.") && n.contains(".jsonl"))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// 夹具下的 v4 代际日志（评审 Important：兼容两种布局，照计划文档填充也能真验）
+    /// ① 原生 dsh home 布局（可被 scan_sessions 直接扫描）：
+    ///    `<root>/sessions/<项目目录>/<会话 id>/session.v4.jsonl.zstd`
+    /// ② 计划文档 Task 1 Step 1 的扁平探针布局（scan_sessions 扫不出 → 暂存临时 home）：
+    ///    `<root>/<任意子目录>/session.v4.jsonl.zstd`
+    fn collect_v4_logs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        collect_generation_files(root)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n == "session.v4.jsonl.zstd")
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// 夹具下的 projcache 记录候选：`.json` 且顶层同时含 `version` 与 `record`
+    /// （布局①的 `storages/session_projcache/sessions/<id>.json` 与布局②的
+    /// `projcache-v7.json` 通吃；其余 .json 不误收）。走 `collect_fixture_files`
+    /// （同一套防卡死护栏）
+    fn collect_projcache_records(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        collect_fixture_files(root)
+            .into_iter()
+            .filter(|p| {
+                let small = std::fs::metadata(p).map(|m| m.len() < 4 * 1024 * 1024);
+                small.unwrap_or(false)
+                    && p.extension().and_then(|x| x.to_str()) == Some("json")
+                    && std::fs::read_to_string(p)
+                        .ok()
+                        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                        .map(|v| v.get("version").is_some() && v.get("record").is_some())
+                        .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// 布局②（扁平探针）→ 暂存成临时 home，使 scan_sessions 可扫。
+    /// **拷贝落到 tempdir，不写夹具**；暂存件 mtime 置当下（24h 出卡窗口是生产语义，
+    /// 不该让临时副本被它挡掉；夹具原件 mtime 全程不被触碰）。
+    /// projcache 配对：文件名 = 会话 id；布局②文件名（`projcache-v7.json`）不含 id
+    /// 时按「单日志 + 单记录」唯一配对；未对位的记录 eprintln 报出（不静默丢弃）
+    fn stage_fixture_as_home(
+        logs: &[(std::path::PathBuf, String)],
+        records: &[std::path::PathBuf],
+    ) -> tempfile::TempDir {
+        let staging = tempfile::tempdir().unwrap();
+        let mut paired: Vec<std::path::PathBuf> = Vec::new();
+        for (src, id) in logs {
+            let dir = staging.path().join("sessions/--probe--").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let dst = dir.join("session.v4.jsonl.zstd");
+            std::fs::copy(src, &dst).unwrap();
+            let _ = filetime::set_file_mtime(
+                &dst,
+                filetime::FileTime::from_system_time(std::time::SystemTime::now()),
+            );
+            let hit = records
+                .iter()
+                .find(|p| p.file_stem().and_then(|s| s.to_str()) == Some(id.as_str()))
+                .or_else(|| {
+                    if records.len() == 1 && logs.len() == 1 {
+                        records.first()
+                    } else {
+                        None
+                    }
+                });
+            let Some(rec) = hit else {
+                continue;
+            };
+            paired.push(rec.clone());
+            let cache_dir = staging.path().join("storages/session_projcache/sessions");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            std::fs::copy(rec, cache_dir.join(format!("{id}.json"))).unwrap();
+        }
+        for rec in records {
+            if !paired.contains(rec) {
+                eprintln!(
+                    "[dsh-v4 实机核验] 注意：projcache 候选 {} 未能对位到任何 v4 会话 id（未暂存，本次不验该记录）",
+                    rec.display()
+                );
+            }
+        }
+        staging
+    }
+
+    /// 回归锁（评审后实测抓获的卡死事故）：夹具遍历必须有护栏——
+    /// ① home 布局下只走 `<root>/sessions`（真实 home 的 `profiles/node_modules/*`
+    ///    是指向 dsh 安装树的 junction，全树遍历实测 >10min 未完）；
+    /// ② 深度上限：超深目录不再下钻；
+    /// ③ 符号链接/交接点不跟随（Windows 建链接需权限，建不出时跳过该断）
+    #[test]
+    fn fixture_walk_is_guarded_against_huge_or_linked_trees() {
+        // ① home 布局（sessions/ 存在）→ 只走会话目录；无关大树里的同名文件不收集
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sess = root.join("sessions/--proj--/session-abc");
+        std::fs::create_dir_all(&sess).unwrap();
+        std::fs::write(sess.join("session.v4.jsonl.zstd"), b"x").unwrap();
+        let unrelated = root.join("profiles/node_modules/pkg/deep");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::write(unrelated.join("session.v4.jsonl.zstd"), b"x").unwrap();
+        let found = collect_v4_logs(root);
+        assert_eq!(
+            found.len(),
+            1,
+            "home 布局只走 sessions/（绕开 node_modules 等大树）：{found:?}"
+        );
+        assert!(found[0].starts_with(root.join("sessions")));
+
+        // 扁平探针布局（无 sessions/）→ 走夹具根，浅层仍可收集
+        let flat = tempfile::tempdir().unwrap();
+        let probe = flat.path().join("session-abc-probe");
+        std::fs::create_dir_all(&probe).unwrap();
+        std::fs::write(probe.join("session.v4.jsonl.zstd"), b"x").unwrap();
+        assert_eq!(collect_v4_logs(flat.path()).len(), 1, "扁平布局应可收集");
+
+        // ② 深度护栏：超上限的深链不再下钻（不会无限递归）
+        let deep_root = tempfile::tempdir().unwrap();
+        let mut d = deep_root.path().to_path_buf();
+        for i in 0..(FIXTURE_WALK_MAX_DEPTH + 3) {
+            d = d.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("session.v4.jsonl.zstd"), b"x").unwrap();
+        assert!(
+            collect_v4_logs(deep_root.path()).is_empty(),
+            "超过深度上限的目录不得下钻"
+        );
+
+        // ③ 链接护栏：树内链接指向树外目录（内含 v4 日志）→ 不得跟随
+        #[cfg(windows)]
+        {
+            let link_root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("session.v4.jsonl.zstd"), b"x").unwrap();
+            let tree = link_root.path().join("tree");
+            std::fs::create_dir_all(&tree).unwrap();
+            let link = tree.join("linked");
+            if std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok() {
+                assert!(
+                    collect_v4_logs(link_root.path()).is_empty(),
+                    "遍历不得跟随符号链接/交接点"
+                );
+            }
+        }
+    }
+
+    /// 实机核验（本地专属，**skip 模式**）：对真实 rc.2 v4 会话 + 真实 v7 projcache
+    /// 端到端复验。仓库内该目录只提交 .gitignore（`*` + `!.gitignore`）——真实用户
+    /// 会话内容永不入库。**只读夹具/用户数据**：布局②的暂存拷贝落到 tempdir，不写
+    /// 夹具，也不做 mtime 归一化（真实 home 可只读直验）。
+    /// 夹具遍历自带护栏（只走 `sessions/`、不跟随符号链接/交接点、深度与目录数上限，
+    /// 见 collect_fixture_files）——指向真实 ~/.dsh 不会被 `profiles/node_modules/*`
+    /// 的 junction 大树拖死（这是评审后实测抓获的事故）。
+    ///
+    /// **跳过绝不静默**（评审 Important）：三条跳过路径（夹具根不存在 / 无 v4 日志 /
+    /// 无窗内非子 Agent 会话）各自 eprintln 跳因 + 探过的路径 + 实际找到的东西，
+    /// 跳过与「通过」不可混淆。
+    ///
+    /// 夹具填充（两种布局任选；Git Bash，`cp` 不带 -p ⇒ 拷贝件 mtime 即当下）：
+    ///   布局①（原生 home 结构）：
+    ///     D=src-tauri/tests/fixtures/dsh-v4
+    ///     mkdir -p $D/sessions/<项目目录名>/<会话 id>
+    ///     cp ~/.dsh/sessions/<项目目录名>/<会话 id>/session.v4.jsonl.zstd $D/sessions/<项目目录名>/<会话 id>/
+    ///     mkdir -p $D/storages/session_projcache/sessions
+    ///     cp ~/.dsh/storages/session_projcache/sessions/<会话 id>.json $D/storages/session_projcache/sessions/
+    ///   布局②（计划 Task 1 Step 1 的扁平探针形态，同样被支持）：
+    ///     D=src-tauri/tests/fixtures/dsh-v4
+    ///     mkdir -p $D/session-<id>-probe
+    ///     cp ~/.dsh/sessions/<项目目录名>/<会话 id>/session.v4.jsonl.zstd $D/session-<id>-probe/
+    ///     cp ~/.dsh/storages/session_projcache/sessions/<会话 id>.json $D/projcache-v7.json
+    /// 实机直验（零拷贝，指向真实 home 亦可——本测试只读）：
+    ///   MAM_DSH_V4_HOME=~/.dsh cargo test --lib real_v4_fixture_end_to_end_verification -- --nocapture
+    #[test]
+    fn real_v4_fixture_end_to_end_verification() {
+        let root = std::env::var_os("MAM_DSH_V4_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dsh-v4")
+            });
+        // 跳过路径①：夹具根目录不存在（仓库常态、CI）
+        if !root.is_dir() {
+            eprintln!(
+                "[dsh-v4 实机核验] 跳过：夹具根目录不存在 {}\n  探过的布局① {}/sessions/<项目目录>/<会话 id>/session.v4.jsonl.zstd\n  探过的布局② {}/<任意子目录>/session.v4.jsonl.zstd\n  填充方法见本测试文档注释（MAM_DSH_V4_HOME 可指向真实 ~/.dsh 只读直验）",
+                root.display(),
+                root.display(),
+                root.display()
+            );
+            return;
+        }
+        // 跳过路径②：无 v4 日志（打印实际找到的代际日志，便于对位填充错误）
+        let all_logs = collect_generation_files(&root);
+        let logs = collect_v4_logs(&root);
+        if logs.is_empty() {
+            eprintln!(
+                "[dsh-v4 实机核验] 跳过：{} 下未找到 session.v4.jsonl.zstd\n  探过的布局① {}/sessions/<项目目录>/<会话 id>/session.v4.jsonl.zstd\n  探过的布局② {}/<任意子目录>/session.v4.jsonl.zstd\n  实际找到 {} 个代际日志：{:?}",
+                root.display(),
+                root.display(),
+                root.display(),
+                all_logs.len(),
+                all_logs
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+            return;
+        }
+
+        // 读侧（布局无关、与出卡窗口无关）：每个 v4 日志必须可解码 + header/事件可解析
+        let mut parsed: Vec<(std::path::PathBuf, String)> = Vec::new();
+        for gen in &logs {
+            let d = build_digest(gen).unwrap_or_else(|| {
+                panic!(
+                    "真实 v4 日志应可解析（多帧解码 + header + 事件）：{}",
+                    gen.display()
+                )
+            });
+            assert_eq!(
+                d.header.version,
+                Some(4),
+                "文件名为 v4 但 header.version={:?}：{}",
+                d.header.version,
+                gen.display()
+            );
+            parsed.push((gen.clone(), d.header.id.clone()));
+        }
+
+        // 原生 home 布局 → 直接扫（零拷贝；真实 home 只读直验）；
+        // 扁平探针布局 → 暂存临时 home（拷贝件，mtime 置当下）
+        let staged;
+        let scan_root: std::path::PathBuf = if root.join("sessions").is_dir() {
+            root.clone()
+        } else {
+            let records = collect_projcache_records(&root);
+            if records.is_empty() {
+                eprintln!(
+                    "[dsh-v4 实机核验] 注意：扁平布局下未找到 projcache 记录候选（顶层含 version+record 的 .json）——本次不验 projcache 层"
+                );
+            }
+            staged = stage_fixture_as_home(&parsed, &records);
+            staged.path().to_path_buf()
+        };
+
+        // 出卡候选：窗内 + 非子 Agent（mtime 口径 = 扫描根上的实际文件）
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut candidates: Vec<String> = Vec::new();
+        let (mut subagents, mut stale) = (0usize, 0usize);
+        for gen in collect_v4_logs(&scan_root) {
+            let d = build_digest(&gen).expect("暂存/夹具 v4 日志应可解析");
+            if d.is_subagent {
+                subagents += 1; // 真实 home 内有子 Agent v4 会话：M0 F7 正常过滤
+                continue;
+            }
+            if d.log_mtime_ms < now - CARD_WINDOW_MS {
+                stale += 1;
+                continue;
+            }
+            candidates.push(d.header.id.clone());
+        }
+        // 跳过路径③：无窗内非子 Agent 会话（读侧已验，出卡断言不适用）
+        if candidates.is_empty() {
+            eprintln!(
+                "[dsh-v4 实机核验] 跳过出卡断言：扫描根 {} 的 v4 日志中窗内非子 Agent 会话为 0（子 Agent {}，超窗 {}）——读侧断言已通过（代际/多帧解码/header 正常）",
+                scan_root.display(),
+                subagents,
+                stale
+            );
+            return;
+        }
+
+        let sessions = scan_sessions(&scan_root, &fake_host(), &test_scan());
+        let cards: Vec<&Session> = sessions
+            .iter()
+            .filter(|s| candidates.contains(&s.id))
+            .collect();
+        assert_eq!(
+            cards.len(),
+            candidates.len(),
+            "窗内真实 v4 会话应全部出卡（代际门放行），候选 {:?}",
+            candidates
+        );
+
+        // 硬断言①（代际门回归的判别器：门一收紧，降级卡的 title 立刻命中）
+        for s in &cards {
+            let title = s.title.clone().unwrap_or_default();
+            assert!(
+                !title.starts_with("dsh 格式待适配"),
+                "真实 v4 会话不得出降级卡（id={} title={title}）",
+                s.id
+            );
+        }
+        // 硬断言②：至少一张卡带非空消息体。不逐卡要求——全新会话尚无消息是合法形态，
+        // 逐卡断言会把「刚开的新会话」误报成红灯（评审 Important）
+        assert!(
+            cards.iter().any(|s| s
+                .last_message
+                .as_deref()
+                .map(|m| !m.is_empty())
+                .unwrap_or(false)),
+            "至少一张真实 v4 卡应带非空消息体：{:?}",
+            cards
+                .iter()
+                .map(|s| (&s.id, &s.last_message))
+                .collect::<Vec<_>>()
+        );
+        // projcache 层（诊断层① 证据）：夹具含 projcache 目录 ⇒ 至少一张记录可加载
+        let cache_hits = cards
+            .iter()
+            .filter(|s| projcache::load(&scan_root, &s.id).is_some())
+            .count();
+        if scan_root
+            .join("storages/session_projcache/sessions")
+            .is_dir()
+        {
+            assert!(
+                cache_hits > 0,
+                "夹具含 projcache 目录，至少一张 v4 卡的记录应可加载（白名单 3..=7 含 7）；实际 {cache_hits}/{}",
+                cards.len()
+            );
+        } else {
+            eprintln!(
+                "[dsh-v4 实机核验] 注意：{} 无 storages/session_projcache/sessions ⇒ 本次未验 projcache 层",
+                scan_root.display()
+            );
+        }
+        // 逐卡摘要（诊断可见：不静默、不靠断言间接表达）
+        for s in &cards {
+            eprintln!(
+                "[dsh-v4 实机核验] 卡 {} status={:?} role={:?} msg={:?} title={:?} projcache={}",
+                s.id,
+                s.status,
+                s.last_message_role,
+                s.last_message,
+                s.title,
+                projcache::load(&scan_root, &s.id).is_some()
+            );
+        }
+        eprintln!(
+            "[dsh-v4 实机核验] 通过：{} 张真实 v4 卡正常出卡（扫描根 {}）",
+            cards.len(),
+            scan_root.display()
         );
     }
 }

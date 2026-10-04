@@ -170,4 +170,69 @@ mod tests {
         );
         assert!(load(home, "session-missing").is_none());
     }
+
+    /// 行为：rc.2 现行 record wrapper `"version": 7` 放行；集外 wrapper version
+    /// （8 / 2）弃缓存 → 降级走日志源。形状取自实测（rows.<key>.{ver,seq,val}）。
+    /// 溯源：wrapper 白名单一项**修复前即通过**——「白名单只到 6」的假设不成立
+    /// （identity 块不在此测：`load` 不读 identity，见下一个用例）
+    #[test]
+    fn v7_wrapper_record_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let sess = home.join("storages/session_projcache/sessions");
+        std::fs::create_dir_all(&sess).unwrap();
+        let record = |wrapper_version: i64| {
+            serde_json::to_string(&json!({
+                "version": wrapper_version,
+                "record": { "rows": {
+                    "title": { "ver": 1, "seq": 5, "val": "reply ok" },
+                    "sessionListMetadata": { "ver": 1, "seq": 6, "val": { "lastPromptAt": 123456 } }
+                }}
+            }))
+            .unwrap()
+        };
+        let path = sess.join("session-1b6c5c45.json");
+
+        std::fs::write(&path, record(7)).unwrap();
+        let v = load(home, "session-1b6c5c45").expect("v7 记录应加载（白名单 3..=7 命中 7）");
+        assert_eq!(
+            v.title.as_deref(),
+            Some("reply ok"),
+            "实测形态 title 行可读"
+        );
+        // 白名单两侧边界（此前无用例覆盖）：集外 wrapper version 弃缓存，
+        // 调用方据此降级走日志源（backup-and-skip 同语义）
+        std::fs::write(&path, record(8)).unwrap();
+        assert!(
+            load(home, "session-1b6c5c45").is_none(),
+            "wrapper version 8（未来）应弃缓存"
+        );
+        std::fs::write(&path, record(2)).unwrap();
+        assert!(
+            load(home, "session-1b6c5c45").is_none(),
+            "wrapper version 2（下界外）应弃缓存"
+        );
+    }
+
+    /// 行为：identity 校验接受与日志代际一致的 `formatVersion`，拒绝错配代际。
+    /// 溯源（评审：真实代际的密闭断言此前缺失，层① 清白只靠本地 skip 模式夹具撑着）：
+    /// rc.2 现行形状就是 `version: 4` 日志对 `{"formatVersion": 4, ...}` identity，
+    /// 既有 identity 用例只覆盖 formatVersion 3
+    #[test]
+    fn identity_accepts_format_version_matching_log_header() {
+        let mut h = header();
+        h.version = Some(4); // 现行代际（文件代际由调用方以第 3 参传入）
+        let v4_identity =
+            json!({ "formatVersion": 4, "createdAt": 1000, "cwd": "/tmp/p", "isSeeded": false });
+        assert!(
+            identity_matches(&v4_identity, &h, 4),
+            "v4 日志 + formatVersion 4 必须通过（rc.2 现行形状）"
+        );
+        // 错配：缓存是别的代际写的 → 拒绝，避免张冠李戴
+        let stale_identity = json!({ "formatVersion": 3, "createdAt": 1000, "cwd": "/tmp/p" });
+        assert!(
+            !identity_matches(&stale_identity, &h, 4),
+            "formatVersion 3 对 v4 日志必须拒绝"
+        );
+    }
 }
