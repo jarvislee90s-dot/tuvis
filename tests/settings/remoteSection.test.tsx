@@ -431,13 +431,14 @@ describe("RemoteSection 无头注入总开关（H3 / Task 5）", () => {
     expect(screen.getByText(/the four terminal-injection tools are unaffected/i)).toBeTruthy();
   });
 
-  /// **H5（Task 10）：审批面状态如实披露**——`settings.remote.headlessApprovalPending`
-  /// 的**真实消费者**（此前该键无消费者；移动端回执卡占位因移动页无 i18n 运行时为内联字面）
-  it("无头分组渲染「审批待 C4」状态行（i18n 键有真实消费者，不谎报已可用）", async () => {
+  /// **H5（Task 10）+ Task 13/C4 状态更新**：`settings.remote.headlessApprovalLive`
+  /// 的**真实消费者**（Task 10 的「审批将在 C4 启用」在 C4 落地后是过期声明，故改写为
+  /// 「审批卡已启用」——设置页不得谎报未启用，也不得在已启用后继续说「将启用」）
+  it("无头分组渲染「审批卡已启用」状态行（不谎报未启用、不留过期声明）", async () => {
     render(<RemoteSection />);
-    const note = await screen.findByTestId("headless-approval-pending-note");
-    expect(note.textContent).toContain("Headless channel approval");
-    expect(note.textContent).toContain("claude channel (C4)");
+    const note = await screen.findByTestId("headless-approval-live-note");
+    expect(note.textContent).toContain("Approval cards for the claude headless channel are live");
+    expect(note.textContent).not.toContain("will be enabled");
   });
 
   it("缺键（旧后端载荷 undefined）也按关渲染——不谎报开", async () => {

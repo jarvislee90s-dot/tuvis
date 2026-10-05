@@ -655,6 +655,17 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
             "/session-headless-cancel",
             post(api::session_headless_cancel),
         )
+        // Task 13（C4 / H11）：claude 无头审批卡两端点——GET 取**当前待答**的审批/问答请求
+        // （无在飞回合或无待答项 → `{pending:null}`），POST 投递决策（allow/deny/answer；
+        // 送达才落 `headless_approve` 审计行）。PIN 门禁内层 gate 结构性覆盖，与取消端点同规。
+        .route(
+            "/session-headless-approval",
+            get(api::session_headless_approval),
+        )
+        .route(
+            "/session-headless-approve",
+            post(api::session_headless_approve),
+        )
         // Task 12（H10）：zcode 无头**新建**——POST 建会话并注入首句；GET 是表单前置面
         // （候选列表 + 总开关状态 + 黄字信号）。PIN 门禁内层 gate 结构性覆盖。
         .route("/session-create-zcode", post(api::session_create_zcode))
@@ -5204,8 +5215,9 @@ mod tests {
 
     /// 拒绝矩阵：**H3 门在最前**——开关关闭（缺键 = 默认关）时 workbuddy / zcode 一律
     /// 403 headless_disabled（不再透出路由层原因）；**开关开启后**才轮到路由层判据
-    /// （Task 7 起两家都路由进无头通道〈H9/H7〉，无头执行器未接线 → `headless_pending`；
-    /// 旧断言里的 `blackbox` / `headless_only` 两码已随路由表重写消失——本测更新为新真相，
+    /// （Task 7 起两家都路由进无头通道〈H9/H7〉，**Task 8/9/11 起真分派**——落 headless
+    /// 回执封套，不再是过渡拒绝码；旧断言里的 `blackbox` / `headless_only` / `headless_pending`
+    /// 三码均已随路由表重写与 Task 13 收口消失——本测更新为新真相，
     /// 语义未削弱：两段仍各自锁住「门在最前」与「开关开启后走路由/分派层」）。
     /// 未知会话 → 404 no_session；空/全空白 text 与超长（MAX_SEND_CHARS+1）→ 400
     #[tokio::test]
@@ -5873,11 +5885,12 @@ mod tests {
         assert!(pending.is_empty(), "门在入队之前：不落队");
     }
 
-    /// **义务 2 的端点级证据**（Task 7）：H11 的「无进程 CLI 会话」（pid = 0 → 路由判
-    /// `Headless(ClaudeP)`）**同样受 H3 门管辖**——开关关闭 → 403 headless_disabled；
-    /// 开关开启 → 落无头分派点（headless_pending）。Task 5 的临时谓词
-    /// `is_headless_bound` 对 claude 恒判 false，且 `no_process` 早退先于一切路由，
-    /// 这条会话在 Task 7 前是**漏管面**（H3 开关管不到它的无头面）
+    /// **义务 2 的端点级证据**（Task 7；Task 13/C4 更新收尾判据）：H11 的「无进程 CLI 会话」
+    /// （pid = 0 → 路由判 `Headless(ClaudeP)`）**同样受 H3 门管辖**——开关关闭 → 403
+    /// headless_disabled；开关开启 → 落无头分派点（**Task 13 起是真分派臂**：回执封套
+    /// `channel=headless_claude_p`，本夹具 cwd 不在场 ⇒ 如实 `refused`（续接 cwd 门）——
+    /// 不再是过渡码 `headless_pending`）。Task 5 的临时谓词 `is_headless_bound` 对 claude
+    /// 恒判 false，且 `no_process` 早退先于一切路由，这条会话在 Task 7 前是**漏管面**
     #[tokio::test]
     async fn headless_gate_covers_h11_processless_cli_sessions() {
         let fake = FakeInjector::ok();
@@ -5902,7 +5915,7 @@ mod tests {
             body.contains("headless_disabled"),
             "关闭态拒绝体必须是 headless_disabled（不是 no_process）：{body}"
         );
-        // ② 开关开启 → 抵达无头分派点（Task 7 过渡态码）
+        // ② 开关开启 → 抵达**真分派臂**（Task 13/C4：claude 通道 + 如实拒绝，不再是过渡码）
         state.store.with(|c| {
             crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
         });
@@ -5916,10 +5929,29 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(r.status(), 200, "真分派：HTTP 200 + 语义在 body");
         let body = body_string(r).await;
         assert!(
-            body.contains("headless_pending"),
-            "开关开启后 H11 无进程会话应抵达无头分派点：{body}"
+            !body.contains("headless_pending"),
+            "过渡码必须已消失（Task 13 收口）：{body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "headless", "{body}");
+        assert_eq!(
+            v["channel"], "headless_claude_p",
+            "H11 无进程 claude 会话必须进 claude 无头通道：{body}"
+        );
+        assert_eq!(v["receipt"]["status"], "failed", "{body}");
+        assert_eq!(
+            v["receipt"]["stage"], "refused",
+            "夹具 cwd 不在场 ⇒ 续接 cwd 门如实拒绝（投递前、零字节）：{body}"
+        );
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("工作目录"),
+            "{body}"
         );
         // ③ 与兄弟门用例同强度的收尾断言（Minor 2）：两态全程零注入、零入队
         //    （门与 ⑤b 都在入队之前：H11 无头会话绝不会经终端注入器投递）
@@ -7685,20 +7717,39 @@ mod tests {
         assert!(pending.is_empty(), "拒绝臂不入队");
     }
 
-    /// **⑤b 剩余未接线家仍不得落终端注入臂**（Task 9 义务 3 复核）：H11 三家（claude/kimi/
-    /// opencode）在 `pid == 0` 时路由进无头（`ClaudeP` 等）→ 执行器未接线 ⇒ 照旧
-    /// `headless_pending` 403，且**零终端注入、零入队**（与 ④ H3 门的最前性一并复核：
-    /// 开关关闭时它们仍先落 `headless_disabled`）
+    /// **H11 三家（claude/kimi/opencode）已真分派**（Task 13/C4 收口）：`pid == 0` 时路由进
+    /// 无头（`ClaudeP`/`KimiP`/`OpencodeRun`）⇒ **不再落 `headless_pending` 过渡码**，
+    /// 而是进 [`api::cli_headless_dispatch`]：测试构建里 CLI 发现恒不可达（宪法级测试纪律）
+    /// ⇒ 回执**如实**报 `failed(spawn)` + 「CLI 不可达」，HTTP 仍 200（语义在 body）；
+    /// 且**零终端注入、零入队**。④ H3 门的最前性一并复核（开关关闭时先落 `headless_disabled`）。
+    ///
+    /// **串行纪律**（Task 13 复审追补）：本测断言的是「测试构建默认 CLI 不可达」——
+    /// 而 [`crate::inject::headless::cli_three::test_hooks`] 能让它暂时可达（断连取证用），
+    /// 故**必须**持该钩子的 LOCK 串行执行（否则并行跑到断连用例注入假 CLI 时，这里会看到
+    /// `channel_error` 而不是 `spawn`——一次性假红的真实成因）。
+    ///
+    /// 夹具 cwd 用**真在场目录**（tempdir）：`cli_headless_dispatch` 的续接 cwd 门
+    /// （会话工作目录未知/不在场 → `refused`）在 CLI 发现之前——夹具若用 `/tmp/proj`
+    /// 这类 Windows 上不在场的路径，本用例就测不到「CLI 不可达」这条真正的测试纪律。
     #[tokio::test]
-    async fn h11_pid_zero_sessions_still_pend_and_never_reach_terminal_arm() {
+    async fn h11_pid_zero_sessions_dispatch_to_cli_channel_and_fail_honestly() {
+        // 钩子是进程级全局态：本测断言「默认不可达」，必须与注入假 CLI 的断连用例串行
+        let _serial = crate::inject::headless::cli_three::test_hooks::LOCK
+            .lock()
+            .await;
         let fake = FakeInjector::ok();
+        let tmp = std::env::temp_dir();
         let sessions: Vec<crate::session::Session> = [
             ("sess_h11_claude", crate::session::AgentType::Claude),
             ("sess_h11_kimi", crate::session::AgentType::Kimi),
             ("sess_h11_oc", crate::session::AgentType::OpenCode),
         ]
         .into_iter()
-        .map(|(id, tool)| inj_sess(id, tool, 0, crate::session::SessionStatus::Idle))
+        .map(|(id, tool)| {
+            let mut s = inj_sess(id, tool, 0, crate::session::SessionStatus::Idle);
+            s.project_path = tmp.to_string_lossy().to_string();
+            s
+        })
         .collect();
         let state = with_sessions(inject_state(fake.clone()), sessions);
         persist_named_device(&state, "mm", "测试设备");
@@ -7718,11 +7769,16 @@ mod tests {
             assert_eq!(r.status(), 403, "{sid}");
             assert!(body_string(r).await.contains("headless_disabled"), "{sid}");
         }
-        // 开关开启 → 分派点：未接线 ⇒ headless_pending（**不是**终端注入、不入队）
+        // 开关开启 → 真分派臂：CLI 不可达（测试构建恒不可达）⇒ 如实失败，**不是**过渡码
         state.store.with(|c| {
             crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
         });
-        for sid in ["sess_h11_claude", "sess_h11_kimi", "sess_h11_oc"] {
+        let want_channel = [
+            ("sess_h11_claude", "headless_claude_p", "claude"),
+            ("sess_h11_kimi", "headless_kimi_p", "kimi"),
+            ("sess_h11_oc", "headless_opencode_run", "opencode"),
+        ];
+        for (sid, channel, program) in want_channel {
             let r = app
                 .clone()
                 .oneshot(req(
@@ -7733,15 +7789,537 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            assert_eq!(r.status(), 403, "{sid}");
+            assert_eq!(r.status(), 200, "{sid}");
             let body = body_string(r).await;
-            assert!(body.contains("headless_pending"), "{sid}: {body}");
+            assert!(
+                !body.contains("headless_pending"),
+                "{sid} 过渡码必须已消失（Task 13 收口）: {body}"
+            );
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["status"], "headless", "{sid}");
+            assert_eq!(v["channel"], channel, "{sid}");
+            assert_eq!(v["receipt"]["status"], "failed", "{sid}");
+            assert_eq!(v["receipt"]["stage"], "spawn", "{sid}");
+            assert!(
+                v["receipt"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("CLI 不可达"),
+                "{sid} 必须如实报 CLI 不可达（测试构建绝不 spawn 真 CLI）: {body}"
+            );
+            assert!(
+                v["receipt"]["reason"].as_str().unwrap().contains(program),
+                "{sid} 失败原因必须点名是哪家 CLI（{program}）: {body}"
+            );
             let pending = state
                 .store
                 .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, sid));
             assert!(pending.is_empty(), "{sid} 不入队");
         }
         assert_eq!(fake.recorded().len(), 0, "无头家零终端注入");
+    }
+
+    // ==== Task 13（C4 / H11）：审批卡两端点（GET 待答载荷 / POST 决策）====
+
+    /// H11 state：开关开启 + 设备 + 指定会话（id 独占；cwd 用**真在场目录**——续接 cwd 门
+    /// 在 CLI 发现之前，夹具路径不在场就测不到真分派臂）
+    fn cli_dispatch_state(
+        sessions: Vec<crate::session::Session>,
+    ) -> std::sync::Arc<super::RemoteState> {
+        let state = with_sessions(inject_state(FakeInjector::ok()), sessions);
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        state
+    }
+
+    /// `session-send-info` 对三家报**真实状态**（已接线 ⇒ 输入区可用 + 路由表候选/可见性同源）
+    #[tokio::test]
+    async fn h11_send_info_reports_real_state_per_tool() {
+        use crate::session::{AgentType, SessionStatus};
+        let tmp = std::env::temp_dir().to_string_lossy().to_string();
+        let cases = [
+            (
+                "sess_c3_info_claude",
+                AgentType::Claude,
+                "headless_claude_p",
+                "after_refresh",
+            ),
+            (
+                "sess_c3_info_kimi",
+                AgentType::Kimi,
+                "headless_kimi_p",
+                "after_refresh",
+            ),
+            (
+                "sess_c3_info_oc",
+                AgentType::OpenCode,
+                "headless_opencode_run",
+                "realtime",
+            ),
+        ];
+        let sessions: Vec<crate::session::Session> = cases
+            .iter()
+            .map(|(id, tool, _, _)| {
+                let mut s = inj_sess(id, tool.clone(), 0, SessionStatus::Idle);
+                s.project_path = tmp.clone();
+                s
+            })
+            .collect();
+        let state = cli_dispatch_state(sessions);
+        let app = router(state.clone());
+        for (sid, _, channel, visibility) in cases {
+            let info = app
+                .clone()
+                .oneshot(req(
+                    "GET",
+                    &format!("/m/api/v1/session-send-info?session_id={sid}"),
+                    Some("mam_device=mm"),
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(info.status(), 200, "{sid}");
+            let v: serde_json::Value = serde_json::from_str(&body_string(info).await).unwrap();
+            assert_eq!(v["injectable"], true, "{sid} 已接线 → 输入区可用：{v}");
+            assert_eq!(v["channels"], serde_json::json!([channel]), "{sid}: {v}");
+            assert_eq!(v["visibility"], visibility, "{sid}: {v}");
+            assert!(
+                !v.to_string().contains("headless_pending"),
+                "{sid} 不得再落过渡码：{v}"
+            );
+        }
+    }
+
+    /// 审批卡**全链（端点侧纯核）**：GET 取待答载荷（工具名 + 命令原文 + tier/permissionMode
+    /// + 选项词）→ POST 决策 → `delivered:true` + `headless_approve` 审计行（result=决策词、
+    /// 通道列、正文=「工具: 入参」、耗时=待答时长）→ 再 GET 已无待答项 → 重复 POST 如实报未送达。
+    #[tokio::test]
+    async fn headless_approval_round_trip_then_honest_not_delivered() {
+        use crate::inject::headless::cli_three as c3;
+        let sid = "sess_c3_approval_ep";
+        let state = cli_dispatch_state(vec![]);
+        let app = router(state.clone());
+        // 装一个待答审批（模拟长驻回合在等）：rx 由本用例持有，验证决策真的投给了回合
+        let (pending, mut rx) = c3::pending_for_test(
+            "req-ep-1",
+            c3::PendingKind::Approval,
+            "Bash",
+            "ls -la",
+            Vec::new(),
+            sid,
+            "headless_claude_p",
+        );
+        c3::pending_registry()
+            .register(pending)
+            .expect("登记待答项");
+        // GET：卡面载荷（命令原文 + 档位 + 选项 id 词表）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-headless-approval?session_id={sid}"),
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["pending"]["requestId"], "req-ep-1");
+        assert_eq!(v["pending"]["kind"], "approval");
+        assert_eq!(v["pending"]["toolName"], "Bash");
+        assert_eq!(v["pending"]["input"], "ls -la");
+        assert_eq!(v["pending"]["tier"], "stdio");
+        assert_eq!(v["pending"]["permissionMode"], "default");
+        assert_eq!(
+            v["pending"]["options"],
+            serde_json::json!([
+                {"id": "allow", "label": "允许"},
+                {"id": "deny", "label": "拒绝"},
+            ])
+        );
+        // POST allow → 送达 + 审计行
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-headless-approve",
+                Some("mam_device=mm"),
+                Some(&format!(
+                    r#"{{"sessionId":"{sid}","requestId":"req-ep-1","decision":"allow"}}"#
+                )),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["delivered"], true, "{v}");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            c3::Decision::Allow,
+            "决策必须交给回合"
+        );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "送达才落账：{audits:?}");
+        assert_eq!(audits[0].action, "headless_approve");
+        assert!(
+            audits[0].result.starts_with("allow · "),
+            "result 列 = 决策词 + 待答时长（H6 耗时编码同规）：{:?}",
+            audits[0].result
+        );
+        assert_eq!(audits[0].channel, "headless_claude_p");
+        assert_eq!(audits[0].agent_type, "claude");
+        assert_eq!(audits[0].session_id, sid);
+        assert_eq!(audits[0].device_name, "测试设备");
+        assert!(
+            audits[0].summary.contains("Bash") && audits[0].summary.contains("ls -la"),
+            "审计摘要必须能回答「谁批准了什么」：{:?}",
+            audits[0].summary
+        );
+        // 再 GET：无待答项
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-headless-approval?session_id={sid}"),
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert!(v["pending"].is_null(), "{v}");
+        // 重复 POST：如实报未送达（不谎报已答、不落第二行审计）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-headless-approve",
+                Some("mam_device=mm"),
+                Some(&format!(
+                    r#"{{"sessionId":"{sid}","requestId":"req-ep-1","decision":"allow"}}"#
+                )),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["delivered"], false, "{v}");
+        assert!(v["reason"].as_str().unwrap().contains("没有待答"), "{v}");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "未送达不得落账：{audits:?}");
+    }
+
+    /// 端点参数与完整性门（belt & braces 的**端点侧**）：缺参 400 / 未知决策词 400 /
+    /// `answer` 未答全 400 且**逐题点名** / 无设备 cookie 403；且未答全时**不消费**待答项
+    /// （用户可改答案再提交——防静默丢题的端到端保证）
+    #[tokio::test]
+    async fn headless_approve_rejects_bad_params_and_incomplete_answers() {
+        use crate::inject::headless::cli_three as c3;
+        let sid = "sess_c3_approval_q";
+        let state = cli_dispatch_state(vec![]);
+        let app = router(state.clone());
+        let (pending, mut rx) = c3::pending_for_test(
+            "req-q-1",
+            c3::PendingKind::Question,
+            "AskUserQuestion",
+            "{\"questions\":[]}",
+            // **登记题集是核侧权威**（多选判定与完整性都从它取）：端点用例必须给真题集
+            vec![
+                c3::Q::multi("选框架", vec!["a", "b"], vec![]),
+                c3::Q::single("确认?", vec!["y", "n"], ""),
+            ],
+            sid,
+            "headless_claude_p",
+        );
+        c3::pending_registry()
+            .register(pending)
+            .expect("登记待答项");
+        let post = |body: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(req(
+                    "POST",
+                    "/m/api/v1/session-headless-approve",
+                    Some("mam_device=mm"),
+                    Some(&body),
+                ))
+                .await
+                .unwrap()
+            }
+        };
+        // 缺参 / 未知词 → 400
+        assert_eq!(
+            post(r#"{"sessionId":"","requestId":"r","decision":"allow"}"#.into())
+                .await
+                .status(),
+            400
+        );
+        assert_eq!(
+            post(format!(
+                r#"{{"sessionId":"{sid}","requestId":"req-q-1","decision":"maybe"}}"#
+            ))
+            .await
+            .status(),
+            400
+        );
+        // answer 无载荷 → 400
+        assert_eq!(
+            post(format!(
+                r#"{{"sessionId":"{sid}","requestId":"req-q-1","decision":"answer"}}"#
+            ))
+            .await
+            .status(),
+            400
+        );
+        // answer 未答全（多选空标签）→ 400 + 逐题点名 + 待答项**仍在**（可改后重提交）
+        let r = post(format!(
+            r#"{{"sessionId":"{sid}","requestId":"req-q-1","decision":"answer","answers":[{{"question":"选框架","labels":[]}},{{"question":"确认?","labels":["y"]}}]}}"#
+        ))
+        .await;
+        assert_eq!(r.status(), 400);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert!(v["reason"].as_str().unwrap().contains("未答全"), "{v}");
+        assert_eq!(v["missing"], serde_json::json!(["选框架"]), "{v}");
+        assert!(
+            c3::pending_registry().has(sid),
+            "未答全被拒后待答项必须还在（用户可补答——不是静默丢题）"
+        );
+        // 答全 → 送达（多选 = 数组，单选题 = 字符串——由 build_ask_answers 单点决定）
+        let r = post(format!(
+            r#"{{"sessionId":"{sid}","requestId":"req-q-1","decision":"answer","answers":[{{"question":"选框架","labels":["a","b"]}},{{"question":"确认?","labels":["y"]}}]}}"#
+        ))
+        .await;
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["delivered"], true, "{v}");
+        match rx.try_recv().unwrap() {
+            c3::Decision::Answer(set) => {
+                let answers = c3::build_ask_answers(set.questions());
+                assert!(answers.contains(r#""选框架":["a","b"]"#), "{answers}");
+                assert!(answers.contains(r#""确认?":"y""#), "{answers}");
+            }
+            other => panic!("必须是 Answer 决策：{other:?}"),
+        }
+        // 无设备 cookie → 403 防御（两道端点同规）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-headless-approval?session_id={sid}"),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-headless-approve",
+                None,
+                Some(&format!(
+                    r#"{{"sessionId":"{sid}","requestId":"r","decision":"allow"}}"#
+                )),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+    }
+
+    // ==== Task 13 复审 Important C：断连后的收尾所有权（审计 + 串行锁注销在**任务内**）====
+
+    /// 假 CLI 形态（**无害系统程序**）：`node -e "setTimeout(…)" -- <多余 argv>` 睡 1.2s 后退出。
+    /// 只用于「客户端断连」取证——**绝不 spawn 真 claude/kimi/opencode**（真实配额 +
+    /// 真实会话库）。`--` 是必需的：node 会把 `--session` 这类多余 argv 当自己的选项而
+    /// 立即 `bad option` 退出（实测），`--` 之后才落进 `process.argv`（无害）。
+    fn fake_slow_cli_shape() -> crate::inject::headless::cli_three::SpawnShape {
+        crate::inject::headless::cli_three::SpawnShape {
+            program: "node".to_string(),
+            prefix: vec![
+                "-e".to_string(),
+                "setTimeout(()=>{},1200)".to_string(),
+                "--".to_string(),
+            ],
+        }
+    }
+
+    /// 钩子收尾守卫（panic 也清——钩子是进程级全局态，别把假 CLI 留给后续用例）
+    struct CliHookClear;
+    impl Drop for CliHookClear {
+        fn drop(&mut self) {
+            crate::inject::headless::cli_three::test_hooks::set_shape(None);
+        }
+    }
+
+    /// **断连取证**（kimi 臂）：handler future 被 drop（客户端断开）后，**串行锁注销与
+    /// `headless` 审计行仍必须发生**——因为它们写在 detached 任务里（Task 13 复审
+    /// Important C）。旧实现把两者写在 handler 尾部：断连即漏 → 该会话此后每一次无头发送
+    /// 都被判「已有在飞的无头回合」，直到 MAM 重启。
+    #[tokio::test]
+    async fn cli_oneshot_arm_releases_the_slot_in_the_detached_task_after_disconnect() {
+        use crate::inject::headless::runner;
+        // 钩子是进程级全局态：与其它用钩子的用例串行
+        let _serial = crate::inject::headless::cli_three::test_hooks::LOCK
+            .lock()
+            .await;
+        let _clear = CliHookClear;
+        crate::inject::headless::cli_three::test_hooks::set_shape(Some(fake_slow_cli_shape()));
+        let sid = "sess_c3_disconnect_kimi";
+        let mut s = inj_sess(
+            sid,
+            crate::session::AgentType::Kimi,
+            0,
+            crate::session::SessionStatus::Idle,
+        );
+        s.project_path = std::env::temp_dir().to_string_lossy().to_string();
+        let state = cli_dispatch_state(vec![s]);
+        let baseline = runner::global_sem().in_flight(); // 其它用例可能占着名额：只比较相对量
+        let app = router(state.clone());
+        let fut = app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some("mam_device=mm"),
+            Some(&format!(r#"{{"sessionId":"{sid}","text":"hi"}}"#)),
+        ));
+        let handle = tokio::spawn(fut);
+        // handler 占锁是**同步**的（在 spawn 之前），故很快可见
+        for _ in 0..200 {
+            if crate::inject::headless::turn::registry().in_flight(sid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            crate::inject::headless::turn::registry().in_flight(sid),
+            "回合必须已占住串行锁"
+        );
+        // 让 detached 任务真的起跑（假 CLI 在睡），随后**模拟客户端断连**：abort handler
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        handle.abort();
+        let _ = handle.await;
+        // 槽位此刻仍在飞（回合没跑完）——必须由任务在收尾时注销
+        assert!(
+            crate::inject::headless::turn::registry().in_flight(sid),
+            "断连不该取消已在跑的回合（回合应继续，直到自己收尾）"
+        );
+        for _ in 0..500 {
+            if !crate::inject::headless::turn::registry().in_flight(sid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(sid),
+            "断连后槽位必须被**任务自身**注销（否则该会话被永久挡死）"
+        );
+        // 并发名额回到基线（既不泄漏也不提前释放）
+        for _ in 0..200 {
+            if runner::global_sem().in_flight() <= baseline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            runner::global_sem().in_flight() <= baseline,
+            "并发名额必须随任务结束归还（不自建 GlobalSem、不泄漏）"
+        );
+        // 审计行在任务内落账（断连不丢）
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(
+            audits.len(),
+            1,
+            "断连后审计行仍必须落账（写在任务里，不在 handler 里）: {audits:?}"
+        );
+        assert_eq!(audits[0].action, "headless");
+        assert_eq!(audits[0].channel, "headless_kimi_p");
+        assert_eq!(audits[0].session_id, sid);
+        assert!(audits[0].result.starts_with("failed("));
+    }
+
+    /// **断连取证**（claude 臂）：同上，且额外钉住**全局并发名额在任务作用域内持有**——
+    /// 断连后名额**不得**提前归还（旧实现把它放在 handler 里，abort 即提前释放 = 反方向的错）。
+    #[tokio::test]
+    async fn claude_arm_keeps_the_permit_and_release_inside_the_detached_task() {
+        use crate::inject::headless::runner;
+        let _serial = crate::inject::headless::cli_three::test_hooks::LOCK
+            .lock()
+            .await;
+        let _clear = CliHookClear;
+        crate::inject::headless::cli_three::test_hooks::set_shape(Some(fake_slow_cli_shape()));
+        let sid = "sess_c3_disconnect_claude";
+        let mut s = inj_sess(
+            sid,
+            crate::session::AgentType::Claude,
+            0,
+            crate::session::SessionStatus::Idle,
+        );
+        s.project_path = std::env::temp_dir().to_string_lossy().to_string();
+        let state = cli_dispatch_state(vec![s]);
+        let baseline = runner::global_sem().in_flight();
+        let app = router(state.clone());
+        let fut = app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some("mam_device=mm"),
+            Some(&format!(r#"{{"sessionId":"{sid}","text":"hi"}}"#)),
+        ));
+        let handle = tokio::spawn(fut);
+        for _ in 0..200 {
+            if crate::inject::headless::turn::registry().in_flight(sid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(crate::inject::headless::turn::registry().in_flight(sid));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.abort();
+        let _ = handle.await;
+        // **名额仍在占用**（回合未跑完）：断连不得提前释放
+        assert!(
+            runner::global_sem().in_flight() > baseline,
+            "断连后 claude 回合的并发名额必须仍被持有（名额在任务作用域内）"
+        );
+        assert!(
+            crate::inject::headless::turn::registry().in_flight(sid),
+            "断连不该取消已在跑的 claude 回合"
+        );
+        for _ in 0..500 {
+            if !crate::inject::headless::turn::registry().in_flight(sid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(sid),
+            "断连后 claude 回合的槽位必须被任务自身注销"
+        );
+        for _ in 0..200 {
+            if runner::global_sem().in_flight() <= baseline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            runner::global_sem().in_flight() <= baseline,
+            "任务收尾后名额必须归还"
+        );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0].action, "headless");
+        assert_eq!(audits[0].channel, "headless_claude_p");
+        assert_eq!(audits[0].session_id, sid);
     }
 
     // ==== Task 11（H9）：WorkBuddy ACP 分派链（HTTP 型；wire 经 MockHttp 注入，零真网络） ====

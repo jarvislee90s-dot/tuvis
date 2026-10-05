@@ -1097,27 +1097,21 @@ fn headless_blocked(
     }
 }
 
-/// **无头分派未接线的诚实拒绝码**（Task 7 过渡态；**Task 8/9/11 起只覆盖尚未接线的家**）：
-/// 路由已判「本条只能经无头通道投递」（无头候选在场且无终端候选），但无头执行器逐家落地
-/// ——接线前**不投递也不入队**（绝不落终端注入臂：zcode/workbuddy 的 pid 不是终端宿主，
-/// 终端注入会打错窗口）。本拒绝是**入队侧**的保证：它在唯一生产 INSERT 之前拦下，故无头
-/// 条目进不了队列。
-///
-/// **Task 8/9/11 落地后的覆盖面**：**zcode 已摘出**（`Headless(Zcode)` → [`zcode_headless_dispatch`]）、
-/// **codex 已摘出**（`Headless(CodexQueue|CodexExec)` → [`codex_headless_dispatch`]，H8 按
-/// APP 在场分派 queue/exec resume）、**workbuddy 已摘出**（`Headless(WbAcp)` →
-/// [`wb_headless_dispatch`]，H9 ACP HTTP）。仍在册的家 = `ClaudeP` / `KimiP` /
-/// `OpencodeRun`（Task 13，H11 三家）——**这三家必须继续拒在本码上，且不得落终端注入臂**
-/// （⑤b 的 `has_terminal_candidate` 门 + 本臂都在 INSERT 之前）。
-///
-/// **投递侧重判已补**（Task 8 义务 2，收口点见 `inject/queue.rs::try_flush_with`）：入队
-/// **之后**才变成无头绑定的条目（如 claude 进程退出 → pid=0 未读卡）在投递前重跑路由结论，
-/// 命中即 `Deferred`（不投递、不消费队首）——总开关不再被「入队后状态漂移」绕过。
-pub(crate) const HEADLESS_PENDING_CODE: &str = "headless_pending";
-/// 上述拒绝的置灰/回执文案（与 `HEADLESS_DISABLED_REASON` 同款：后端给文案、前端只渲染）
-pub(crate) const HEADLESS_PENDING_REASON: &str =
-    "无头通道分派待接线（H11 三家 CLI 落地中），本次不投递";
-
+// **无头分派过渡码——已删除**（Task 13/C4 收口）。
+//
+// Task 7 引入的 `headless_pending`（`403 not_injectable` + 该 reasonCode）是**过渡态**：
+// 路由已判「本条只能经无头通道投递」而执行器尚未接线时，如实拒绝、绝不落终端注入臂。
+// Task 8/9/11/13 逐家接线后，`crate::inject::routing::HeadlessKind` 的**七个变体全部**
+// 有了真分派臂（⑤b 的匹配**没有 `_` 兜底**）⇒ 该码成了死代码：留着它反而危险——将来新增
+// 无头变体若忘了接线，会静默落回「拒绝」，而不是编译报错。故删除（**不是遗忘**）。
+//
+// 保留此注记供后续读者对照：`headless_pending` 这个词在**生产代码里不应再出现**
+// （`remote::server` 的测试若还在找它，那是在追一段已作废的过渡态）。
+//
+// **投递侧重判的收口点不变**（Task 8 义务 2，见 `inject/queue.rs::try_flush_with`）：入队
+// **之后**才变成无头绑定的条目（如 claude 进程退出 → pid=0 未读卡）在投递前重跑路由结论，
+// 命中即 `Deferred`（不投递、不消费队首）——总开关不再被「入队后状态漂移」绕过。
+//
 // ============================================================
 // H7 zcode 无头分派（Task 8）
 // ============================================================
@@ -2359,8 +2353,8 @@ fn audit_action_for(text: &str, base: &'static str) -> &'static str {
 /// - 设备 cookie 缺失 → 403 防御（gate 已拦，理论不可达）；
 /// - 会话不在快照 → 404 no_session；路由判不可注入 → 403 not_injectable（带
 ///   reasonCode/reason——W1 定位失败语义的前置闸，不入队）；**路由判「只能走无头通道」**
-///   （H 系四家 APP 形态 / H11 无进程三家）→ 403 not_injectable + reasonCode=
-///   `headless_pending`（Task 7 过渡态：无头执行器未接线，见 ⑤b 与 [`HEADLESS_PENDING_CODE`]）；
+///   （H 系四家 APP 形态 / H11 无进程三家）→ **真分派臂**（Task 8/9/11/13 七家全部接线，
+///   HTTP 200 + headless 回执封套，语义在 body——见 ⑤b）；
 /// - 可输入态（is_input_ready）→ 入队后即刻 flush_one 直发（jump=false），五态精确
 ///   映射（P1-4 + D7/T3）：Sent → 200 delivered；Submitted → 200 submitted（已投递
 ///   未确认中性回执——注入 Ok + 戳未中 + 屏读无滞留草稿 = 消息已被 TUI 收进内部
@@ -2455,40 +2449,38 @@ pub async fn session_send(
         );
     }
     // ⑤b 无头通道分派点（**Task 8 起 zcode 真分派、Task 9 起 codex 真分派、
-    //     Task 11 起 workbuddy 真分派**，其余家按 Task 13 逐家落地）：路由判出无头候选而
-    //     **无终端候选** = 本条只能经无头通道投递。
+    //     Task 11 起 workbuddy 真分派、Task 13 起 H11 三家 CLI 真分派**）：路由判出无头
+    //     候选而**无终端候选** = 本条只能经无头通道投递。
     //     - `Headless(Zcode)` → [`zcode_headless_dispatch`]（每回合 spawn、串行锁、版本门控、
     //       审计、回执封套；**绝不入队**——裁决 8）；
     //     - `Headless(CodexQueue | CodexExec)` → [`codex_headless_dispatch`]（H8：APP 在场
     //       分派 queue/exec resume + 消费确认自建；同样每回合 spawn、绝不入队）；
     //     - `Headless(WbAcp)` → [`wb_headless_dispatch`]（H9：HTTP 型——connect→initialize→
     //       load/new→prompt，端点不可用/已结束会话都**如实回执**；同样绝不入队）；
-    //     - 其余无头家（H11 三家 CLI）执行器未接线 → 照旧如实拒绝
-    //       （[`HEADLESS_PENDING_CODE`]），**绝不落终端注入臂**。
+    //     - `Headless(ClaudeP | KimiP | OpencodeRun)` → [`cli_headless_dispatch`]（H11/C4：
+    //       claude 长驻双向审批桥 / kimi / opencode 一次性进程；同样绝不入队）。
+    //     **七家全部接线完毕，本匹配无 `_` 兜底臂**（过渡码 `headless_pending` 已删除——
+    //     新增无头变体时编译器会在此处立刻报错，这正是我们要的：不允许静默落回拒绝臂）。
     //     各臂都在唯一生产 INSERT（⑥）之前：无头条目进不了队列。
     if let Some(kind) = crate::inject::routing::headless_kind_of(&outcome) {
         if !crate::inject::routing::has_terminal_candidate(&outcome) {
+            use crate::inject::routing::HeadlessKind as K;
             return match kind {
-                crate::inject::routing::HeadlessKind::Zcode => {
+                K::Zcode => {
                     zcode_headless_dispatch(&st, &device_id, &device_name, &session, &req.text)
                         .await
                 }
-                crate::inject::routing::HeadlessKind::CodexQueue
-                | crate::inject::routing::HeadlessKind::CodexExec => {
+                K::CodexQueue | K::CodexExec => {
                     codex_headless_dispatch(&st, &device_id, &device_name, &session, &req.text)
                         .await
                 }
-                crate::inject::routing::HeadlessKind::WbAcp => {
+                K::WbAcp => {
                     wb_headless_dispatch(&st, &device_id, &device_name, &session, &req.text).await
                 }
-                _ => json_no_store(
-                    StatusCode::FORBIDDEN,
-                    serde_json::json!({
-                        "error": "not_injectable",
-                        "reason": HEADLESS_PENDING_REASON,
-                        "reasonCode": HEADLESS_PENDING_CODE,
-                    }),
-                ),
+                K::ClaudeP | K::KimiP | K::OpencodeRun => {
+                    cli_headless_dispatch(&st, &device_id, &device_name, &session, &req.text, kind)
+                        .await
+                }
             };
         }
     }
@@ -2759,9 +2751,10 @@ pub async fn session_send(
 
 /// routing Channel → wire 小写字符串（枚举未派生 serde，端点侧手工映射防漂移）。
 /// 无头通道名**经 [`crate::inject::routing::HeadlessKind::wire_name`]**——与审计 channel
-/// 列同源（词表只此一份，别在这里重抄）。**Task 8/9/11 起已接线的无头家**（zcode、codex、
-/// workbuddy）在 `session_send_info` 的 `channels` 里经本函数透出（候选原样取自路由表）；
-/// 未接线的家（H11 三家 CLI）仍落 `headless_pending` 拒绝（见 [`HEADLESS_PENDING_CODE`]）。
+/// 列同源（词表只此一份，别在这里重抄）。**Task 8/9/11/13 起七家无头家全部已接线**
+/// （zcode、codex queue/exec、workbuddy、claude/kimi/opencode）在 `session_send_info` 的
+/// `channels` 里经本函数透出（候选原样取自路由表）——没有「未接线的家」了，过渡码
+/// `headless_pending` 随 Task 13 删除。
 fn channel_wire(c: &crate::inject::routing::Channel) -> &'static str {
     use crate::inject::routing::Channel;
     match c {
@@ -2918,12 +2911,30 @@ pub async fn session_send_info(
                 "visibility": visibility,
             })
         } else {
-            // 其余无头家（H11 三家 CLI）执行器未接线：发送必败的会话不得在这里报
-            // injectable:true（见 [`HEADLESS_PENDING_CODE`]）
+            // **Task 13：H11 三家 CLI 已真分派**（C4）→ 输入区可用 + **路由表给出的候选与
+            // 可见性档原样透出**（单源 = Task 7 路由表：claude/kimi = 刷新后可见、
+            // opencode = 实时；与 `session-send` 的实发口径同源，不在这里另判一次）。
+            // 运行时失败面（CLI 未装 / cwd 不可续接）由**回执**如实上报——静态能力面
+            // 谎报置灰会把「装了但 PATH 没配好」等形态说成永久不可用（zcode/codex/WB 同款
+            // 口径：能判的判、判不准的交回执）。
+            let (channels, visibility) = match &outcome {
+                crate::inject::routing::RouteOutcome::Injectable {
+                    candidates,
+                    visibility,
+                } => (
+                    candidates.iter().map(channel_wire).collect::<Vec<_>>(),
+                    visibility_wire(visibility),
+                ),
+                // 不可达（上面已 filter 出 headless_only）：如实保守回本通道首选档
+                _ => (
+                    vec![kind.wire_name()],
+                    visibility_wire(&crate::inject::routing::Visibility::AfterRefresh),
+                ),
+            };
             serde_json::json!({
-                "injectable": false,
-                "reasonCode": HEADLESS_PENDING_CODE,
-                "reason": HEADLESS_PENDING_REASON,
+                "injectable": true,
+                "channels": channels,
+                "visibility": visibility,
             })
         }
     } else {
@@ -2949,6 +2960,561 @@ pub async fn session_send_info(
         }
     };
     json_no_store(StatusCode::OK, body)
+}
+
+// ============================================================
+// H11 三家 CLI 无头分派（Task 13 / C4：claude 长驻双向桥 / kimi / opencode）
+// ============================================================
+
+/// CLI 三家的回合审计上下文（设备身份由端点注入，机器自发动作不得冒充某台手机）。
+/// `content` 在命令形态组装后更新为**最终正文载荷**（与 zcode/codex 同口径）。
+#[derive(Clone)]
+struct CliTurnCtx {
+    device_id: String,
+    device_name: String,
+    tool: String,
+    sid: String,
+    content: String,
+    kind: crate::inject::routing::HeadlessKind,
+}
+
+impl CliTurnCtx {
+    fn audit_ctx(&self) -> crate::inject::headless::HeadlessAuditCtx {
+        crate::inject::headless::HeadlessAuditCtx {
+            device_id: self.device_id.clone(),
+            device_name: self.device_name.clone(),
+            agent_type: self.tool.clone(),
+            session_id: self.sid.clone(),
+            channel: self.kind.wire_name().to_string(),
+            content: self.content.clone(),
+        }
+    }
+
+    fn audit(&self, st: &Arc<RemoteState>, action: &str, result: &str, duration_ms: u64) {
+        audit_headless_ctx(st, &self.audit_ctx(), action, result, duration_ms);
+    }
+
+    /// 拒绝/失败臂：如实失败回执 + 落账（**不碰串行锁**——槽位只由占过位的路径注销）
+    fn refuse(
+        &self,
+        st: &Arc<RemoteState>,
+        stage: crate::inject::headless::receipt::Stage,
+        reason: &str,
+    ) -> Response {
+        let receipt = crate::inject::headless::receipt::Receipt::failed(stage, reason)
+            .with_session(&self.sid);
+        self.audit(
+            st,
+            crate::inject::headless::ACTION_HEADLESS,
+            &crate::inject::headless::turn::receipt_result_word(&receipt),
+            receipt.duration_ms,
+        );
+        json_no_store(StatusCode::OK, headless_envelope(self.kind, &receipt, None))
+    }
+}
+
+/// H11 三家 CLI 的回执解析器形态（kimi / opencode 各一；`run_cli_oneshot` 消费）——
+/// 起别名是为了让端点里的盒子类型可读（clippy::type_complexity）
+type CliReceiptParser =
+    dyn Fn(&[String]) -> crate::inject::headless::cli_three::CliReceipt + Send + Sync;
+
+/// **H11 三家 CLI 无头分派**（`session_send` ⑤b 的三条臂：`ClaudeP` / `KimiP` / `OpencodeRun`）。
+///
+/// 顺序与理由（每步都有判据依赖）：
+/// 1. **会话串行锁**（MAM 自己的）：同会话重叠回合如实拒绝（不排队、不覆盖）；锁保护的是
+///    会话，越早占位竞态窗口越小；
+/// 2. **续接 cwd 门**（[`crate::inject::headless::cli_three::cwd_gate`]）：三家 CLI 的续接都
+///    按工作目录键控（附录 E-①：claude 按 cwd 键控磁盘会话；opencode 的会话是 project
+///    作用域——探针即在会话所属目录跑通）⇒ 路径未知/目录不在场**如实拒绝**，绝不盲 spawn；
+/// 3. **CLI 发现**（[`crate::inject::headless::cli_three::production_cli_spec`]）：找不到 ⇒
+///    如实拒绝（**绝不 spawn 不存在的程序**）——测试构建恒不可达，故端点用例断言的是
+///    如实的不可达失败（零真实账号配额）；
+/// 4. **命令形态组装**（W4 单点签名/换行归一）——此后落账的 `content` 是**最终载荷**；
+/// 5. **回合**（detached task：客户端断连不打断已起跑的回合）+ 审计 + 注销槽位；
+/// 6. 回执封套 + 可见性档（单源 = Task 7 路由表的 `Injectable` 结论）。
+///
+/// **claude 与另两家的形态差异**（同一分派内的唯一分叉，有据可依）：
+/// - claude = **长驻双向**（裁决 8 特例）：进程存活至 turn 结束，stdout 双流解复用，
+///   控制面请求 → 移动端审批卡 → `control_response` 写 stdin；全局并发名额与 watchdog
+///   超时仍走 Task 6 底座（[`crate::inject::headless::runner_from_conn`] +
+///   [`crate::inject::headless::runner::global_sem`]），取消走
+///   [`crate::inject::headless::runner::RunnerCfg::arm_cancel`]（与 runner 同一套
+///   「先到者生效」语义）；
+/// - kimi / opencode = **一次性进程**（同 zcode/codex）：`RunnerCfg::run()` 一把梭，
+///   回执由各家解析器从 stdout 帧提取。
+///
+/// **平台门**：三家都没有 zcode 那样的平台分叉命令形态（argv 跨平台同形；
+/// Windows 的 npm 垫片由 [`SpawnShape`] 统一处理）⇒ 不设平台门，如实失败面只有
+/// 「CLI 不可达」与「cwd 不可续接」两条。
+pub(crate) async fn cli_headless_dispatch(
+    st: &Arc<RemoteState>,
+    device_id: &str,
+    device_name: &str,
+    session: &crate::session::Session,
+    text: &str,
+    kind: crate::inject::routing::HeadlessKind,
+) -> Response {
+    use crate::inject::headless::cli_three as c3;
+    use crate::inject::headless::receipt::Stage;
+    use crate::inject::routing::{HeadlessKind, RouteOutcome};
+
+    let os = std::env::consts::OS;
+    let tool = session.agent_type.tool_id().to_string();
+    let program = match kind {
+        HeadlessKind::ClaudeP => c3::CLAUDE_PROGRAM,
+        HeadlessKind::KimiP => c3::KIMI_PROGRAM,
+        HeadlessKind::OpencodeRun => c3::OPENCODE_PROGRAM,
+        // 分派点只投这三家（其余家各有自己的分派臂）——防御性如实拒绝，不 panic
+        other => {
+            log::error!("cli_headless_dispatch 收到非 CLI 家: {other:?}");
+            return json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal" }),
+            );
+        }
+    };
+    let mut ctx = CliTurnCtx {
+        device_id: device_id.to_string(),
+        device_name: device_name.to_string(),
+        tool,
+        sid: session.id.clone(),
+        content: text.to_string(),
+        kind,
+    };
+    // 1) 会话串行锁（**声明通道**：取消审计行 channel 列从槽位取）
+    if !crate::inject::headless::turn::registry().begin(
+        &session.id,
+        c3::placeholder_slot(&ctx.tool, ctx.content.clone(), kind.wire_name()),
+    ) {
+        return ctx.refuse(
+            st,
+            Stage::Refused,
+            "该会话已有在飞的无头回合（MAM 串行锁，防同会话两回合交错）——本条未投递，\
+             请等回执后再发",
+        );
+    }
+    // 2) 续接 cwd 门（占位后失败必须注销槽位）
+    if let Some(reason) = c3::cwd_gate(&session.project_path) {
+        crate::inject::headless::turn::registry().end(&session.id);
+        return ctx.refuse(st, Stage::Refused, reason);
+    }
+    // 3) CLI 发现
+    let Some(shape) = c3::production_cli_spec(program, os) else {
+        crate::inject::headless::turn::registry().end(&session.id);
+        return ctx.refuse(
+            st,
+            Stage::Spawn,
+            &format!(
+                "{program} CLI 不可达（PATH 上未找到 {program} / {program}.exe / {program}.cmd）"
+            ),
+        );
+    };
+    // 4) 命令形态（W4 单点组装：正文归一 + 移动端尾签名）
+    let payload = crate::inject::normalize::compose_injection(device_name, text);
+    ctx.content = payload.clone();
+    // 5) 回合 = **一个自持所有权的 detached 任务**（Task 13 复审 Important C）：
+    //    回合执行 + `headless` 审计 + 串行锁注销 + 全局并发名额释放**全在任务内**。
+    //    为什么：客户端断连会 drop **handler future**（本函数）——若审计/注销写在 handler 里，
+    //    那条会话的槽位就永远不会注销（此后该会话的每一次无头发送都被判「已有在飞回合」
+    //    直到 MAM 重启），审计行也丢；claude 的全局名额还会被**提前**释放（反方向的错）。
+    //    任务自持所有权后，回执走 oneshot 回传（handler 只是「等回执的信封」）——
+    //    handler 被 drop 只是没人收信封，收尾照常发生（与 zcode/codex 的 `run_*_turn` 同规）。
+    let (tx, rx) = tokio::sync::oneshot::channel::<crate::inject::headless::receipt::Receipt>();
+    let st_task = st.clone();
+    let ctx_task = ctx.clone();
+    let sid_task = session.id.clone();
+    let kind_task = kind;
+    let task_session = TaskSession {
+        id: session.id.clone(),
+        project_path: session.project_path.clone(),
+    };
+    tokio::spawn(async move {
+        let receipt = if kind_task == HeadlessKind::ClaudeP {
+            claude_turn_in_task(st_task.clone(), &ctx_task, shape, task_session, payload).await
+        } else {
+            oneshot_turn_in_task(
+                st_task.clone(),
+                &ctx_task,
+                shape,
+                task_session,
+                payload,
+                kind_task,
+            )
+            .await
+        };
+        ctx_task.audit(
+            &st_task,
+            crate::inject::headless::ACTION_HEADLESS,
+            &crate::inject::headless::turn::receipt_result_word(&receipt),
+            receipt.duration_ms,
+        );
+        crate::inject::headless::turn::registry().end(&sid_task);
+        let _ = tx.send(receipt);
+    });
+    let receipt = match rx.await {
+        Ok(r) => r,
+        Err(_) => {
+            // 任务在交出回执前消失（panic）：槽位可能未注销 → 尽力注销 + 如实拒绝
+            log::error!("CLI 无头回合任务异常终止（未交出回执）");
+            crate::inject::headless::turn::registry().end(&session.id);
+            return ctx.refuse(
+                st,
+                Stage::ChannelError,
+                "回合内部任务异常终止（结果未知，请在会话内容中确认）",
+            );
+        }
+    };
+    // 6) 回执封套 + 可见性档（单源 = 路由表）
+    let visibility = match crate::inject::routing::route(&ctx.tool, session.form, session.pid, os) {
+        RouteOutcome::Injectable { visibility, .. } => Some(visibility),
+        _ => None,
+    };
+    json_no_store(
+        StatusCode::OK,
+        headless_envelope(kind, &receipt, visibility),
+    )
+}
+
+/// 任务侧需要的最小会话快照（**不能把 `&Session` 搬进 `'static` 任务**；只搬用得到的字段，
+/// 免得整个 Session 结构变化时这里被动跟着改）
+struct TaskSession {
+    id: String,
+    project_path: String,
+}
+
+/// **一次性 CLI（kimi / opencode）的任务侧回合**：经 Task 6 底座跑完，回执交回调用方
+/// （审计与注销由任务的收尾段统一做——见 [`cli_headless_dispatch`] 的 Important C 论证）。
+async fn oneshot_turn_in_task(
+    st: Arc<RemoteState>,
+    ctx: &CliTurnCtx,
+    shape: crate::inject::headless::cli_three::SpawnShape,
+    session: TaskSession,
+    payload: String,
+    kind: crate::inject::routing::HeadlessKind,
+) -> crate::inject::headless::receipt::Receipt {
+    use crate::inject::headless::cli_three as c3;
+    use crate::inject::routing::HeadlessKind;
+
+    let parse: Box<CliReceiptParser> = match kind {
+        HeadlessKind::KimiP => Box::new(c3::parse_kimi_receipt),
+        _ => Box::new(c3::parse_opencode_receipt),
+    };
+    let argv = match kind {
+        HeadlessKind::KimiP => c3::kimi_argv(&payload, &session.id),
+        _ => c3::opencode_argv(&payload, &session.id),
+    };
+    let _ = ctx;
+    // 每回合经 runner_from_conn 取设置超时/全局名额（Task 6 义务②：不自建 GlobalSem）
+    let mut cfg = st
+        .store
+        .with(|c| crate::inject::headless::runner_from_conn(&shape.program, c));
+    cfg = cfg
+        .args(shape.prefix.into_iter().chain(argv))
+        .cwd(session.project_path)
+        .session_id(session.id.clone());
+    // 取消靶子：Task 6 的单点包装（与 zcode/codex 同规）
+    crate::inject::headless::turn::registry().arm(
+        &session.id,
+        crate::inject::headless::cli_three::cancel_of(&cfg),
+    );
+    let (receipt, _parsed) = c3::run_cli_oneshot(cfg, &session.id, &*parse).await;
+    receipt
+}
+
+/// **claude 长驻回合的任务侧装配**（detached：客户端断连不打断已起跑的回合）。
+///
+/// 三件事在此接线（全部走 Task 6 底座的公开口，**不自建**），且**全部在任务作用域内**：
+/// ① **全局并发名额**（H4：与其余无头通道同一份 [`runner::global_sem`]）——满额即如实
+///    `queued`（含队列位次），不起进程；名额守卫**活到任务结束**（客户端断连不提前释放）；
+/// ② **watchdog 超时**（设置页值，经 [`crate::inject::headless::runner_from_conn`] 读）；
+/// ③ **取消靶子**（[`runner::RunnerCfg::arm_cancel`]：与 runner 内同一套「先到者生效」语义；
+///    回合收尾 `disarm_cancel`，此后迟到取消如实报未送达）。
+async fn claude_turn_in_task(
+    st: Arc<RemoteState>,
+    ctx: &CliTurnCtx,
+    shape: crate::inject::headless::cli_three::SpawnShape,
+    session: TaskSession,
+    payload: String,
+) -> crate::inject::headless::receipt::Receipt {
+    use crate::inject::headless::cli_three as c3;
+    use crate::inject::headless::receipt::Receipt;
+    use crate::inject::headless::runner;
+
+    // 超时/并发从设置读（同一路径；并发上限落在全局名额上）
+    let runner_cfg = st
+        .store
+        .with(|c| crate::inject::headless::runner_from_conn(&shape.program, c));
+    let Some(_slot) = runner::global_sem().try_acquire() else {
+        // 满额：**如实排队回执**（含位次），不起进程；槽位由任务收尾段注销
+        return Receipt::queued(runner::global_sem().queue_position()).with_session(&session.id);
+    };
+    let timeout_ms = runner_cfg.watchdog_timeout_ms();
+    let (cancel_handle, cancel_rx) = runner_cfg.arm_cancel();
+    let cancel_fn: crate::inject::headless::turn::CancelFn =
+        std::sync::Arc::new(move || cancel_handle.cancel());
+    crate::inject::headless::turn::registry().arm(&session.id, cancel_fn);
+
+    let argv = c3::claude_argv(&payload, Some(&session.id), None);
+    let sp = c3::ClaudeSpawn {
+        shape,
+        argv,
+        cwd: session.project_path.clone(),
+    };
+    let proc = match c3::spawn_claude(&sp).await {
+        Ok(p) => p,
+        Err(e) => {
+            runner_cfg.disarm_cancel();
+            return Receipt::failed(
+                crate::inject::headless::receipt::Stage::Spawn,
+                &format!("claude 进程 spawn 失败：{e}"),
+            )
+            .with_session(&session.id);
+        }
+    };
+    let input = c3::ClaudeTurnInput {
+        session_id: session.id.clone(),
+        channel: ctx.kind.wire_name(),
+        user_frame: c3::claude_user_frame(&payload),
+        timeout_ms,
+        tier: crate::inject::headless::PermissionSpec::claude_default().tier(),
+        permission_mode: crate::inject::headless::PermissionSpec::claude_default()
+            .permission_mode()
+            .unwrap_or("default"),
+        cancel: Some(cancel_rx),
+    };
+    let kill = proc.kill_fn();
+    let out = c3::run_claude_turn(proc.io, input, &kill).await;
+    runner_cfg.disarm_cancel();
+    out.receipt
+}
+
+/// GET /m/api/v1/session-headless-approval?session_id=（Task 13 / C4 审批卡数据源）：
+/// 该会话**当前待答**的审批/问答请求（无 → `{"pending": null}`）。
+///
+/// 契约（HTTP 恒 200，语义在 body）：
+/// - 缺参 → 400；无设备 cookie → 403 防御；
+/// - `{pending: {...}}` = 卡面载荷（`requestId/kind/toolName/input/sessionId/channel/tier/
+///   permissionMode/options/questions/waitedMs`；camelCase，见 `cli_three::PendingRequest`）；
+/// - `{pending: null}` = 没有待答项（回合未到审批点 / 已终结 / 已超时）。
+///
+/// 移动端**只在无头回合在飞时轮询本端点**（不做常驻轮询）：拿到的载荷直接渲染审批卡
+/// （`input` 是命令原文——用户必须看清要批准什么）。
+pub async fn session_headless_approval(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let _ = &st;
+    let Some(sid) = params
+        .get("session_id")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return bad_request();
+    };
+    if device_identity(&st, &headers).is_none() {
+        return forbidden_defense();
+    }
+    let pending = crate::inject::headless::cli_three::pending_registry().payload_of(&sid);
+    json_no_store(StatusCode::OK, serde_json::json!({ "pending": pending }))
+}
+
+/// POST /m/api/v1/session-headless-approve 请求体（camelCase；缺参由 handler 统一 400）
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadlessApproveReq {
+    #[serde(default)]
+    pub session_id: String,
+    /// 待答项的请求标识（必须与 GET 载荷的 `requestId` 一致——陈旧页面不误答别人的请求）
+    #[serde(default)]
+    pub request_id: String,
+    /// 决策 wire 词：`allow` / `deny` / `answer`（跨语言夹具锁定；未知词 → 400）
+    #[serde(default)]
+    pub decision: String,
+    /// 问答卡提交的答案（`answer` 决策必带）：`[{question, labels[]}]`（键 = 题面全文）
+    #[serde(default)]
+    pub answers: Option<Vec<HeadlessAnswerEntry>>,
+}
+
+/// 问答卡的一题答案（移动端上行形态）
+#[derive(Deserialize)]
+pub struct HeadlessAnswerEntry {
+    /// 题面全文（**就是 claude answers 的键**——不要传 header/序号）
+    pub question: String,
+    /// 已选标签（多选 = 多项；单选 = 至多一项）
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+/// POST /m/api/v1/session-headless-approve（Task 13 / C4 审批卡应答端点）。
+///
+/// 契约（HTTP 恒 200，语义在 body；**对齐取消端点的诚实口径**）：
+/// - 缺参/空/未知决策词 → 400；
+/// - 无设备 cookie → 403 防御；
+/// - **送达** → `{delivered:true}` + `headless_approve` 审计行（设备 = 按下按钮的这台设备；
+///   正文 = `工具名: 入参展示原文`——这一行回答「谁批准了什么」；耗时 = **待答时长**
+///   （从请求登记到应答送达的墙钟，用户能看出自己犹豫了多久）；
+/// - 未送达 → `{delivered:false, reason}`（**不是错误**）：无待答项 / 请求标识不符 /
+///   回合已不再等待（取消/超时竞态）——三种原因逐条如实，不落审计行（没有应答动作发生）；
+/// - `answer` 决策**必须答全**（[`AnswerSet::new`]，未答全 → 400 + 逐题点名的原因）：
+///   防静默丢题（附录 E-②：claude 对未答题静默丢弃且不重问）。
+///
+/// **弃卡（dismiss）= deny**（附录 E-②）：移动端「关闭卡片」必须发 `deny`——不发
+/// `allow` 空答案（那才是静默丢题）。
+pub async fn session_headless_approve(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<HeadlessApproveReq>,
+) -> Response {
+    use crate::inject::headless::cli_three as c3;
+
+    let sid = req.session_id.trim().to_string();
+    let request_id = req.request_id.trim().to_string();
+    let word = req.decision.trim().to_string();
+    if sid.is_empty() || request_id.is_empty() || word.is_empty() {
+        return bad_request();
+    }
+    let Some((device_id, device_name)) = device_identity(&st, &headers) else {
+        return forbidden_defense();
+    };
+    // 待答项快照（**一次取全**：决策构造要用登记题集当权威；审计行的通道/正文/时长也从它取
+    // ——与取消端点同规）
+    let Some(pending) = crate::inject::headless::cli_three::pending_registry().payload_of(&sid)
+    else {
+        return json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "delivered": false,
+                "reason": "没有待答的审批/问答请求（回合可能已终结、被取消或已超时）",
+            }),
+        );
+    };
+    // 决策构造：answer 走「已答全」类型（**多选判定取核侧登记题集**，不信任上行标志；
+    // 未答全/漏题/单选多答 → 400 并逐题点名）
+    let decision = match word.as_str() {
+        "answer" => {
+            let entries: Vec<(String, Vec<String>)> = req
+                .answers
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| (e.question, e.labels))
+                .collect();
+            if entries.is_empty() {
+                return json_no_store(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({
+                        "error": "bad_request",
+                        "reason": "answer 决策必须携带 answers（问答卡未提交任何答案）",
+                    }),
+                );
+            }
+            let registered = pending["questions"].as_array().cloned().unwrap_or_default();
+            match c3::answer_set_from_entries(&registered, &entries) {
+                Ok(set) => c3::Decision::Answer(set),
+                Err(reject) => {
+                    return json_no_store(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({
+                            "error": "bad_request",
+                            "reason": reject.reason,
+                            "missing": reject.missing,
+                        }),
+                    )
+                }
+            }
+        }
+        other => match c3::Decision::from_wire(other) {
+            Some(d) => d,
+            // 未知词不猜（**含 `answer` 无载荷的形态**：上面已单独处理）
+            None => {
+                return json_no_store(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({
+                        "error": "bad_request",
+                        "reason": format!("未知决策词 {other:?}（合法值：allow / deny / answer）"),
+                    }),
+                )
+            }
+        },
+    };
+    let channel = pending["channel"].as_str().unwrap_or_default().to_string();
+    let content = format!(
+        "{}: {}",
+        pending["toolName"].as_str().unwrap_or_default(),
+        pending["input"].as_str().unwrap_or_default()
+    );
+    let waited_ms = pending["waitedMs"].as_u64().unwrap_or(0);
+    match crate::inject::headless::cli_three::pending_registry().deliver(
+        &sid,
+        &request_id,
+        decision.clone(),
+    ) {
+        Ok(()) => {
+            // 工具列的**单点反查**：通道 wire 名 → 工具 id。反查不到（登记表被将来某个
+            // 新通道写入而本函数没跟上）**不冒充 claude**——落显式哨兵词 + warn，
+            // 与取消端点的 `headless_unattributed` 同规（Task 13 复审 Minor 3：
+            // 「保守猜一个」在审计账本上是假话，宁可如实说不认识）。
+            let agent_type = match channel_to_tool(&channel) {
+                Some(t) => t.to_string(),
+                None => {
+                    log::warn!(
+                        "headless approve: 审计无法归属工具（通道 {channel} 不在已知词表）—— \
+                         按 {UNATTRIBUTED_AGENT_TYPE} 如实落账，不冒充既有工具"
+                    );
+                    UNATTRIBUTED_AGENT_TYPE.to_string()
+                }
+            };
+            let ctx = crate::inject::headless::HeadlessAuditCtx {
+                device_id,
+                device_name,
+                agent_type,
+                session_id: sid,
+                channel,
+                content,
+            };
+            audit_headless_ctx(
+                &st,
+                &ctx,
+                crate::inject::headless::ACTION_HEADLESS_APPROVE,
+                decision.wire(),
+                waited_ms,
+            );
+            json_no_store(StatusCode::OK, serde_json::json!({ "delivered": true }))
+        }
+        // 未送达（标识不符 / 竞态）：如实报因，**不落审计行**（没有应答动作发生）
+        Err(reason) => json_no_store(
+            StatusCode::OK,
+            serde_json::json!({ "delivered": false, "reason": reason }),
+        ),
+    }
+}
+
+/// 无头通道 wire 名 → 工具 id（审批审计行的 `agent_type` 列）。
+/// **单一映射点**：通道名由 [`crate::inject::routing::HeadlessKind::wire_name`] 产生，
+/// 这里只做反查。**反查不到时调用方落 [`UNATTRIBUTED_AGENT_TYPE`] 哨兵**（如实说不认识，
+/// 不猜一个既有工具——审计账本上的假归属比空值更坏；与取消端点的
+/// [`CANCEL_UNATTRIBUTED_CHANNEL`] 同规）。
+fn channel_to_tool(channel: &str) -> Option<&'static str> {
+    use crate::inject::routing::HeadlessKind as K;
+    [
+        K::ClaudeP,
+        K::KimiP,
+        K::OpencodeRun,
+        K::Zcode,
+        K::CodexQueue,
+        K::CodexExec,
+        K::WbAcp,
+    ]
+    .into_iter()
+    .find(|k| k.wire_name() == channel)
+    .map(|k| match k {
+        K::Zcode => "zcode",
+        K::CodexQueue | K::CodexExec => "codex",
+        K::WbAcp => "workbuddy",
+        K::ClaudeP => "claude",
+        K::KimiP => "kimi",
+        K::OpencodeRun => "opencode",
+    })
 }
 
 /// POST /m/api/v1/session-headless-cancel 请求体（camelCase；缺参由 handler 统一 400，
@@ -3065,6 +3631,10 @@ fn cancel_is_unwired_for(channel: &str) -> bool {
 
 /// 未声明通道的审计哨兵词（不冒充任何既有通道；正常生产路径不会出现——三条分派臂都声明）
 pub(crate) const CANCEL_UNATTRIBUTED_CHANNEL: &str = "headless_unattributed";
+
+/// 审批审计行**工具列**的哨兵词：通道名不在已知词表时用它（不冒充 claude 等既有工具；
+/// 正常生产路径不会出现——登记表只由 claude 通道写入）
+pub(crate) const UNATTRIBUTED_AGENT_TYPE: &str = "unknown";
 
 /// 「本通道未接线取消」的诚实措辞（**回合仍在运行**——不是「已终结」）
 pub(crate) const CANCEL_NOT_WIRED_REASON: &str =

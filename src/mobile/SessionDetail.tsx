@@ -43,10 +43,14 @@ import PreviewModeSwitcher, { type PreviewMode } from "./PreviewModeSwitcher";
 import SplitHandle from "./SplitHandle";
 import {
   ApiError,
+  fetchHeadlessApproval,
   fetchSessionFiles,
   fetchSessionMessages,
   fetchSessionSubagents,
+  headlessApprove,
   headlessCancel,
+  type HeadlessApprovalPending,
+  type HeadlessApprovalQuestion,
   type HeadlessTurn,
   type SessionFileEntry,
   type SessionMessage,
@@ -155,6 +159,284 @@ export function headlessDurationText(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
+// ============================================================
+// 无头审批 / 问答卡（Task 13 / C4：claude 双向桥的移动端面）
+// ============================================================
+
+/** claude 无头通道 wire 名（与 Rust `routing::HeadlessKind::ClaudeP.wire_name()` 同源）。
+ *  **唯一用途**：回执卡据此判断「本条要不要轮询审批卡」——审批面只属于 claude 双向桥
+ *  （codex queue / zcode yolo 无审批面；kimi/opencode 在非交互模式下由 CLI 自行拒绝权限
+ *  请求，Task 13 实测）。别拿它做通道白名单。 */
+export const HEADLESS_CLAUDE_CHANNEL = "headless_claude_p";
+
+/** 审批卡轮询周期（**只在无头回合在飞时**轮询；不做常驻轮询）。
+ *  1.5s 的取舍：审批是「回合停下来等人」的形态，用户看到卡的延迟要短；而每次轮询只是一条
+ *  只读查询（进程内内存态，无 IO），代价可忽略。 */
+export const HEADLESS_APPROVE_POLL_MS = 1500;
+
+/** 一题的已答标签（**判据与核侧 `Q::answered` / `answer_set_from_entries` 同规**）。
+ *
+ *  - **多选**：勾选表 + 自由文本行（自由文本作为额外标签，编成 JSON 数组）；
+ *  - **单选**：**至多一个标签**——自由文本行**取代**勾选（不是追加）。为什么必须取代：
+ *    核侧对单选收到多个标签是**如实拒绝**（「单选题只允许一个答案」，附录 E-② 的
+ *    单选值 = 标签字符串、多选值 = 数组），若前端把「勾了 A + 又写了其他」拼成两个标签，
+ *    用户点提交只会拿到 400——那是**死角落**（Task 13 复审 Minor 1）。
+ *    界面上的互斥由 [`HeadlessApprovalCard`] 的 onChange 保证（选选项清空自由文本、
+ *    写自由文本清空选项），本函数再兜一层：无论状态怎么漂，单选**永不吐两个标签**。 */
+export function headlessAnswerLabels(
+  q: HeadlessApprovalQuestion,
+  picked: string[],
+  free: string
+): string[] {
+  const f = free.trim();
+  if (f) {
+    return q.multiSelect ? [...picked, f] : [f];
+  }
+  return q.multiSelect ? [...picked] : picked.slice(0, 1);
+}
+
+/** 未答题面（空 = 可提交；防静默丢题的第一道闸——第二道在核侧 `AnswerSet::new`） */
+export function headlessUnanswered(
+  questions: HeadlessApprovalQuestion[],
+  picked: Record<number, string[]>,
+  free: Record<number, string>
+): string[] {
+  return questions
+    .map((q, i) => ({ q, i }))
+    .filter(({ q, i }) => headlessAnswerLabels(q, picked[i] ?? [], free[i] ?? "").length === 0)
+    .map(({ q }) => q.question);
+}
+
+/** **审批 / 问答卡**（Task 13 / C4 激活；Task 10 的接口预留位就是这里）。
+ *
+ *  数据来自 `GET /session-headless-approval`（父组件轮询），应答走
+ *  `POST /session-headless-approve`：
+ *  - **审批卡**：标题 = 工具名，主体 = **入参原文**（Bash 就是命令行——用户必须看清要批准
+ *    什么），并显示**权限档**（`tier` = 审批面形态 `stdio` + `permissionMode` = CLI 内部档
+ *    `default`，Task 10 的 tier 展示义务在此兑现）；两钮「允许 / 拒绝」；
+ *  - **问答卡**：逐题渲染单选/多选 + 「其他」自由文本；**不全答则提交禁用**并列出未答题面
+ *    （防静默丢题，附录 E-②/③）；
+ *  - **弃卡 = 拒绝**（附录 E-②：allow 但未答 = 静默丢题，故关闭卡片一律发 `deny`，
+ *    绝不发空答案）；
+ *  - 未送达（`delivered:false`）如实回显原因并停止等待（回合可能已终结/超时）。 */
+export function HeadlessApprovalCard({ pending }: { pending: HeadlessApprovalPending }) {
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const [picked, setPicked] = useState<Record<number, string[]>>({});
+  const [free, setFree] = useState<Record<number, string>>({});
+  const isQuestion = pending.kind === "question";
+  const unanswered = isQuestion ? headlessUnanswered(pending.questions, picked, free) : [];
+  // 题面缺失（claude 给了 control_request 但 questions 为空）：**不编题、也不放行提交**
+  const noQuestions = isQuestion && pending.questions.length === 0;
+  const canSubmit = isQuestion && !noQuestions && unanswered.length === 0 && !busy;
+
+  const answer = (
+    decision: "allow" | "deny" | "answer",
+    answers?: { question: string; labels: string[] }[]
+  ) => {
+    setBusy(true);
+    setNote(null);
+    void headlessApprove(pending.sessionId, pending.requestId, decision, answers)
+      .then((res) => {
+        // 送达 = 回合已收到这一答（卡由轮询自然收走：核侧登记表已清空）
+        if (res.delivered) {
+          setNote("已送达——回合继续执行");
+          return;
+        }
+        // 未送达：如实回显（不是错误，只是这一答没赶上）；下一轮轮询会据核侧状态收走卡片
+        setNote(res.reason ?? "应答未送达（回合可能已结束）");
+      })
+      .catch((e: unknown) => {
+        const reason =
+          e instanceof ApiError && e.data && typeof e.data.reason === "string"
+            ? e.data.reason
+            : e instanceof ApiError
+              ? e.message
+              : String(e);
+        setNote(`应答失败：${reason}`);
+      })
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div
+      data-testid="headless-approval-card"
+      data-kind={pending.kind}
+      className="mx-3 mb-2 rounded-lg border border-amber-300/70 bg-amber-500/5 px-3 py-2 dark:border-amber-700/70 dark:bg-amber-400/5"
+    >
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span
+          data-testid="headless-approval-title"
+          className="rounded-full bg-amber-500/15 px-2 py-0.5 font-medium text-amber-800 dark:bg-amber-400/15 dark:text-amber-300"
+        >
+          {isQuestion ? `claude 提问：${pending.toolName}` : `审批请求：${pending.toolName}`}
+        </span>
+        {/* 权限档展示（Task 10 的义务）：tier = 审批面形态；permissionMode = CLI 内部权限档 */}
+        <span data-testid="headless-approval-tier" className="text-slate-500 dark:text-slate-400">
+          审批档 {pending.tier}
+          {pending.permissionMode ? ` · 权限模式 ${pending.permissionMode}` : ""}
+        </span>
+        <span data-testid="headless-approval-waited" className="text-slate-400 dark:text-slate-500">
+          已等待 {headlessDurationText(pending.waitedMs)}
+        </span>
+      </div>
+      {!isQuestion && (
+        <pre
+          data-testid="headless-approval-input"
+          className="mt-1 max-h-40 overflow-auto rounded bg-slate-900/5 px-2 py-1 text-xs break-all whitespace-pre-wrap text-slate-800 dark:bg-slate-100/5 dark:text-slate-100"
+        >
+          {pending.input}
+        </pre>
+      )}
+      {noQuestions && (
+        <p
+          data-testid="headless-approval-no-questions"
+          className="mt-1 text-xs text-rose-700 dark:text-rose-300"
+        >
+          这一条问询没有携带任何题面（questions 为空）——如实告知，MAM 不替你编题；请拒绝并在
+          终端里回答
+        </p>
+      )}
+      {isQuestion &&
+        pending.questions.map((q, i) => {
+          const sel = picked[i] ?? [];
+          return (
+            <div key={`${q.question}-${i}`} data-testid={`headless-question-${i}`} className="mt-2">
+              <p className="text-xs font-medium text-slate-700 dark:text-slate-200">
+                {q.header ? `${q.header}｜` : ""}
+                {q.question}
+                {q.multiSelect ? "（多选）" : ""}
+              </p>
+              <div className="mt-1 flex flex-col gap-1">
+                {q.options.map((o, j) => (
+                  <label
+                    key={`${o.label}-${j}`}
+                    className="flex items-start gap-1 text-xs text-slate-700 dark:text-slate-200"
+                  >
+                    <input
+                      type={q.multiSelect ? "checkbox" : "radio"}
+                      name={`headless-q-${i}`}
+                      data-testid={`headless-q-${i}-opt-${j}`}
+                      checked={sel.includes(o.label)}
+                      onChange={() => {
+                        setPicked((prev) => {
+                          const cur = prev[i] ?? [];
+                          const next = q.multiSelect
+                            ? cur.includes(o.label)
+                              ? cur.filter((x) => x !== o.label)
+                              : [...cur, o.label]
+                            : [o.label];
+                          return { ...prev, [i]: next };
+                        });
+                        // **单选互斥**（Task 13 复审 Minor 1）：选了选项就清掉「其他」自由文本
+                        // ——单选只能有一个答案（核侧对多标签是 400，死角落必须在前端就堵死）
+                        if (!q.multiSelect) {
+                          setFree((prev) => ({ ...prev, [i]: "" }));
+                        }
+                      }}
+                    />
+                    <span>
+                      {o.label}
+                      {o.description ? (
+                        <span className="text-slate-400 dark:text-slate-500">
+                          （{o.description}）
+                        </span>
+                      ) : null}
+                    </span>
+                  </label>
+                ))}
+                <input
+                  type="text"
+                  data-testid={`headless-q-${i}-free`}
+                  placeholder="其他（自由作答）"
+                  value={free[i] ?? ""}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setFree((prev) => ({ ...prev, [i]: v }));
+                    // 单选互斥的另一半：写了「其他」就清掉已选选项（取代，不是追加）
+                    if (!q.multiSelect && v.trim() !== "") {
+                      setPicked((prev) => ({ ...prev, [i]: [] }));
+                    }
+                  }}
+                  className="rounded border border-slate-300/70 bg-transparent px-2 py-1 text-xs text-slate-800 dark:border-slate-600/70 dark:text-slate-100"
+                />
+              </div>
+            </div>
+          );
+        })}
+      {isQuestion && !noQuestions && unanswered.length > 0 && (
+        <p
+          data-testid="headless-question-incomplete"
+          className="mt-2 text-xs text-rose-700 dark:text-rose-300"
+        >
+          还有 {unanswered.length} 题未作答，不能提交（防静默丢题）：{unanswered.join("；")}
+        </p>
+      )}
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        {isQuestion ? (
+          <button
+            type="button"
+            data-testid="headless-question-submit"
+            disabled={!canSubmit}
+            onClick={() =>
+              answer(
+                "answer",
+                pending.questions.map((q, i) => ({
+                  question: q.question,
+                  labels: headlessAnswerLabels(q, picked[i] ?? [], free[i] ?? ""),
+                }))
+              )
+            }
+            className="rounded-full bg-emerald-500/15 px-3 py-0.5 text-xs text-emerald-800 disabled:opacity-40 dark:bg-emerald-400/15 dark:text-emerald-300"
+          >
+            提交答案
+          </button>
+        ) : (
+          pending.options.map((o) => (
+            <button
+              key={o.id}
+              type="button"
+              data-testid={`headless-approval-${o.id}`}
+              disabled={busy}
+              onClick={() => answer(o.id === "allow" ? "allow" : "deny")}
+              className={`rounded-full px-3 py-0.5 text-xs disabled:opacity-40 ${
+                o.id === "allow"
+                  ? "bg-emerald-500/15 text-emerald-800 dark:bg-emerald-400/15 dark:text-emerald-300"
+                  : "bg-rose-500/15 text-rose-800 dark:bg-rose-400/15 dark:text-rose-300"
+              }`}
+            >
+              {o.label}
+            </button>
+          ))
+        )}
+        {/* 弃卡 = 拒绝（附录 E-②）：绝不发 allow 空答案（那是静默丢题） */}
+        {isQuestion && (
+          <button
+            type="button"
+            data-testid="headless-approval-dismiss"
+            disabled={busy}
+            onClick={() => answer("deny")}
+            className="rounded-full bg-rose-500/15 px-3 py-0.5 text-xs text-rose-800 disabled:opacity-40 dark:bg-rose-400/15 dark:text-rose-300"
+          >
+            拒绝（关闭卡片）
+          </button>
+        )}
+        <span className="text-xs text-slate-400 dark:text-slate-500">
+          会话 {pending.sessionId} · 通道 {pending.channel}
+        </span>
+      </div>
+      {note && (
+        <p
+          data-testid="headless-approval-note"
+          className="mt-1 text-xs text-slate-600 dark:text-slate-300"
+        >
+          {note}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** 无头回执卡（Task 8 / H7）：三态——发送中（带取消钮）/ 回执 / 失败分诊。
  *
  *  **文案纪律**：assistant 摘要、token、耗时、可见性提示**全部来自后端回执**（`Visibility::note()`
@@ -175,10 +457,36 @@ export function HeadlessReceiptCard({
 }) {
   const [cancelling, setCancelling] = useState(false);
   const [cancelNote, setCancelNote] = useState<string | null>(null);
+  // Task 13/C4：在飞期间轮询**当前待答**的审批/问答请求（只在 claude 通道上开——审批面
+  // 只属于 claude 双向桥；其余通道白轮询既是浪费也会误导用户以为有审批面）
+  const [approval, setApproval] = useState<HeadlessApprovalPending | null>(null);
+  const claudeChannel = turn?.phase === "sending" && turn.channel === HEADLESS_CLAUDE_CHANNEL;
   // 回合态翻转即清掉上一发的取消提示（避免「已请求取消」标签挂在下一回合上）
   useEffect(() => {
     setCancelNote(null);
   }, [turn]);
+  useEffect(() => {
+    if (!claudeChannel) {
+      setApproval(null);
+      return;
+    }
+    let alive = true;
+    const tick = () => {
+      void fetchHeadlessApproval(session.id)
+        .then((p) => {
+          if (alive) setApproval(p);
+        })
+        .catch(() => {
+          /* 拉取失败静默降级为「暂无卡」（回合照常跑；拿不到卡不等于出错） */
+        });
+    };
+    tick();
+    const timer = window.setInterval(tick, HEADLESS_APPROVE_POLL_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [claudeChannel, session.id]);
   if (turn === null) return null;
 
   if (turn.phase === "sending") {
@@ -230,6 +538,13 @@ export function HeadlessReceiptCard({
             </span>
           )}
         </div>
+        {/* Task 13/C4：待答的审批/问答卡（claude 双向桥）——用户在回合在飞期间即可应答。
+            卡的生命周期由轮询驱动：核侧登记表清空（答完/回合终结/超时）后自然收走 */}
+        {approval && (
+          <div className="mt-2">
+            <HeadlessApprovalCard pending={approval} />
+          </div>
+        )}
       </div>
     );
   }
@@ -308,17 +623,8 @@ export function HeadlessReceiptCard({
           收起
         </button>
       </div>
-      {/* H5（Task 10）审批面**预留**：无头审批卡尚未接线——claude 通道（C4/Task 13）才启用，
-          故这里如实挂一行占位：面存在（数据类型 `HeadlessApprovalRequest` 见 ./api），
-          且**明说现在不生效**；不渲染任何可点控件（不假装可用）。
-          同一句话在桌面设置页经 i18n `settings.remote.headlessApprovalPending`（zh/en）展示；
-          移动页无 i18n 运行时（全页硬编码中文），故此处内联同字面。 */}
-      <p
-        data-testid="headless-approval-pending"
-        className="mt-1 text-xs text-slate-500 dark:text-slate-400"
-      >
-        无头通道审批将在 claude 通道（C4）启用
-      </p>
+      {/* Task 10 的审批占位已**作废**（Task 13/C4 起审批卡真接线——见 `HeadlessApprovalCard`，
+          在飞期间挂在本卡下方）。此处不再有任何「尚未启用」文案：那是过期声明。 */}
       {r.lastAssistant && (
         <p
           data-testid="headless-last-assistant"

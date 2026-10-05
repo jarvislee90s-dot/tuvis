@@ -71,7 +71,8 @@ pub(crate) const FALLBACK_SPEC: FamilySpec = FamilySpec {
 /// M6R 探测定案表；其余工具返回 None（flush 循环以 [`FALLBACK_SPEC`] 兜底）。
 /// **Task 7 起路由表已按实际分派定性——旧口径的「黑盒/无头家」不再对应同一批工具**：
 /// workbuddy → `Headless(WbAcp)`（H9）、zcode → `Headless(Zcode)`（H7/H10）、codex APP 形态
-/// → `Headless(CodexQueue)`（H8）、dsh 需要无头的场合 → `dsh_headless_pending`（H13 不在本批）、
+/// → `Headless(CodexQueue)`（H8）、claude/kimi/opencode 无进程形态 → `Headless(ClaudeP|
+/// KimiP|OpencodeRun)`（H11/C4）、dsh 需要无头的场合 → `dsh_headless_pending`（H13 不在本批）、
 /// openclaw → `blackbox`（gateway 另评）——这些家在端点**入队之前**即被拒（H3 门/路由/
 /// 无头分派点），正常路径不消费本表。
 pub fn family_for(tool: &str) -> Option<FamilySpec> {

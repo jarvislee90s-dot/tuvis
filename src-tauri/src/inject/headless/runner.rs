@@ -655,6 +655,26 @@ impl RunnerCfg {
         }
     }
 
+    /// **长驻变体的取消观察口**（Task 13 / H11 claude：进程存活至 turn 结束，没有 `run()`
+    /// 的 wait 事件环）。语义与 [`Self::run`] 内的取消**同一套**（同一个 [`CancelSlot`] 单点、
+    /// 先到者生效）——武装后返回（句柄, 接收端）：句柄交给 [`super::turn::registry`] 当取消靶子，
+    /// 接收端由长驻回合 `select!` 等待；回合终结时调用 [`Self::disarm_cancel`]，此后迟到的
+    /// 取消与既有通道同口径地**如实报「未送达」**（不谎报已取消）。
+    ///
+    /// **为什么必须在此加口**（而不是让 claude 自建一套）：取消的「先到者生效」与
+    /// watchdog 的关系是 H4 的既有语义，第二套实现必然漂移；本方法是**唯一**让外部回合
+    /// 接到该语义的公开面（`arm`/`disarm` 仍是私有）。
+    pub fn arm_cancel(&self) -> (CancelHandle, tokio::sync::oneshot::Receiver<()>) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        self.arm(CancelSink::Async(tx));
+        (self.cancel_handle(), rx)
+    }
+
+    /// 解除取消武装（长驻回合收尾；此后 `CancelHandle::cancel()` 恒 `false` = 未送达）
+    pub fn disarm_cancel(&self) {
+        self.disarm();
+    }
+
     /// 本回合的 kill 记录（pid, 路径）——测试断言「watchdog/取消必须 kill」用
     pub fn kill_calls(&self) -> Vec<(u32, KillOutcome)> {
         self.kill_log

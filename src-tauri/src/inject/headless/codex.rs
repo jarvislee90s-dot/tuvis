@@ -603,68 +603,14 @@ pub fn rollout_path_in_db(db_path: &Path, thread: &str) -> Option<String> {
 // CLI 发现 / spawn 形态（Windows npm 垫片）
 // ============================================================
 
-/// PATH 分段（纯核）：分隔符按平台取（Windows `;` / 其余 `:`），空段与引号壳滤除
-pub fn path_dirs(path_env: &str, os: &str) -> Vec<String> {
-    let sep = if os == "windows" { ';' } else { ':' };
-    path_env
-        .split(sep)
-        .map(|d| d.trim().trim_matches('"'))
-        .filter(|d| !d.is_empty())
-        .map(str::to_string)
-        .collect()
-}
+/// PATH 分段 / `cmd /c` 垫片包装 / spawn 形态（**Task 13 上提到 [`super::turn`]**——
+/// H11 三家 CLI 共用同一套；此处 `pub use` + 薄委托保持 codex 既有调用面与测试不变，
+/// **零行为变化**）
+pub use super::turn::{path_dirs, shim_needs_cmd, spawn_shape, SpawnShape};
 
-/// PATH 扫描（纯核）：**按 PATH 顺序**在每段目录内试 `.exe` → `.cmd` → `.bat`
-/// （与 Windows 自身的解析顺序一致——PATH 顺序决定用哪个安装，目录内则真实可执行体优先：
-/// 垫片要经 `cmd` 转一手，而 cmd 会重解析命令行）；POSIX 找裸名文件。
-/// 找不到 → `None`（调用方如实拒绝，**绝不 spawn 不存在的程序**）
+/// PATH 扫描（**codex 专用入口**：委托给泛化的 [`super::turn::cli_in_path`]）
 pub fn codex_in_path(path_env: &str, os: &str) -> Option<String> {
-    let exts: &[&str] = if os == "windows" {
-        &[".exe", ".cmd", ".bat"]
-    } else {
-        &[""]
-    };
-    for dir in path_dirs(path_env, os) {
-        for ext in exts {
-            let cand = Path::new(&dir).join(format!("codex{ext}"));
-            if cand.is_file() {
-                return Some(cand.to_string_lossy().to_string());
-            }
-        }
-    }
-    None
-}
-
-/// 是否 Windows 批处理垫片（`.cmd`/`.bat`；CreateProcess 不认批处理）
-pub fn shim_needs_cmd(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .is_some_and(|e| e == "cmd" || e == "bat")
-}
-
-/// spawn 形态（Windows 垫片经 cmd 转一手；其余直 spawn）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpawnShape {
-    pub program: String,
-    pub prefix: Vec<String>,
-}
-
-/// spawn 形态构造（唯一构造点）。**登记限制**：`cmd /c` 会重解析命令行——正文中的
-/// `%VAR%` 会被展开（未定义变量原样保留）；这是 Windows npm 垫片的固有代价，
-/// 故 [`codex_in_path`] 让 `.exe` 优先
-pub fn spawn_shape(exe: &str, os: &str) -> SpawnShape {
-    if os == "windows" && shim_needs_cmd(exe) {
-        SpawnShape {
-            program: "cmd".to_string(),
-            prefix: vec!["/c".to_string(), exe.to_string()],
-        }
-    } else {
-        SpawnShape {
-            program: exe.to_string(),
-            prefix: Vec::new(),
-        }
-    }
+    super::turn::cli_in_path("codex", path_env, os)
 }
 
 /// 回合配置工厂（端点侧闭包：经 [`super::runner_from_conn`] 取设置超时/全局名额，再按

@@ -592,6 +592,20 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 1. **新建形态是否出 JSON 帧**：M9 回执的 `confirmation` 字段即答案——`store` ⇒ CLI 未出可解析 JSON 帧（与 `--resume` 同形态，走会话库发现）；`stdout_frame` ⇒ 新建形态**会**出帧（Task 8 只实证了 `--resume` 不出，新建从未取证）。两种都算 PASS，但**必须记录是哪一种**（这是 H10 唯一未取证的形态面，也决定 Task 15 后续复测该盯哪条路）。
 2. **库行 `task_type` 取值**：新建的库发现按 `task_type='interactive'` 过滤（与出卡枚举同源假设，**未经真机核实**）。若 M9 出现「会话确实建出、看板也有了卡，但回执 `confirmation` 恒为 `none`/`stdout_frame` 而非 `store`」，先怀疑该假设——用只读查询核对新行的 `task_type`（`PRAGMA table_info(session)` / `SELECT task_type FROM session WHERE id='<新 sess_id>'`），把实测值回报主线（若取值不同，改 `zcode_parser::stored_sessions` 的过滤口径 + 其用例）。
 
+**M10/M11 取证附则（Task 13 复审登记，2026-10-05——验 H11 两家卡时必须逐条记录；每条都只有实机能答）**：
+
+> 背景：Task 13 的**单次 claude 探针**（2.1.287，1 次真实调用，2026-10-05）只取证了 argv 全集、stdin user 帧形态、`stream_event{message_delta{stop_reason}}` 的两级语义（`tool_use` 中途 / `end_turn` 终结）与进程退出；**没有抓到 `can_use_tool` 审批帧**（该次回合模型自选不调工具，且本机 claude 的宿主侧允许规则可能短路了弹窗）——审批 wire 的权威仍是 spec 附录 E-②（AionCore 源码级 + LIVE-PINNED 2.1.178–2.1.227）。故下列各条**必须**由 M10 实机补齐，**默认不假设它们成立**。
+
+1. **审批卡是否真的弹出**（M10 第一判据）：手机发一条**必定触发工具**的消息（如「列出本目录文件」）。若卡不弹而 claude 直接执行了工具 → **不是 PASS 也不是 FAIL，而是形态取证**：记录「宿主侧 allow 规则短路了审批」（并记下 `~/.claude/settings.json` 里是否有 `permissions.allow` 命中该工具）——这决定后续是否需要请求更严的档（`permission-mode plan` 等，本批未取证）。
+2. **卡面四要件**（逐项记「有/无」）：① 工具名；② **命令原文逐字**（`input` 展示字段，不是截断摘要）；③ 权限档显示（`审批档 stdio · 权限模式 default`）；④ 已等待时长。
+3. **批准后工具真的执行了吗**（假成功的反面）：看回执卡 `reason` 里的**工具结果计数**（`工具结果 N`）+ claude 侧会话内容里该命令的实际效果（如列目录的输出）。只看到「已送达」**不足以**判 PASS——附录 E-② 明示 `updatedInput` 缺失时工具**永不执行**（那是静默失败）。
+4. **拒绝是否报「拒绝」而非「失败」**：点「拒绝」后回执必须是 `ok`（`stage` 为空）且 `reason` 含「已被用户拒绝（deny）」——若显示 `failed(...)` 或 `channel_error`，记录现象回报主线（那是诚实口径破了）。
+5. **问答卡不全答是否真的禁提交**：只勾一题时「提交答案」必须置灰 + 显示「还有 N 题未作答」；**并记一次强行绕过**（若能在浏览器控制台直接 POST 未答全的 answers，`POST /session-headless-approve` 必须回 400「未答全」且待答项仍在——核侧第二道闸）。
+6. **弃卡语义**：点「拒绝（关闭卡片）」后，claude 收到的必须是 `deny`（会话里模型应表现为「用户拒绝」）——**不得**出现「题目被静默丢弃」（附录 E-② 的失败模式）。
+7. **超时诚实性**：审批卡弹出后**什么都不点**，等到看门狗到点（默认 600s；可临时把设置里的无头超时调到 60s 加速）→ 回执必须是 `failed(timeout)` + reason 含「正在等待审批/问答应答」，且卡消失（待答项已注销）。
+8. **kimi / opencode 回执诚实性**（M11 相邻面）：两家各发一条 `hi`——末条回复进回执（kimi 的 `tokens` **应为空**：2.1.1 的 stream-json 无 usage 帧，如实不显示即 PASS）；本机 opencode 默认模型若仍是退役模型（410），回执必须是 `failed(channel_error)` + provider 原文（**谎报成功即 FAIL**）。
+9. **`--resume` 形态本轮未实机取证**（Task 13 复审登记，2026-10-05）：Task 13 的单次 claude 探针走的是 **fresh（`--session-id`）** 形态，M10 才是第一次真跑 **`--resume <在册会话>`**。风险面：claude 在 resume 时**可能把历史回合的帧一并重放**（历史 `assistant` / 历史 `control_request`）——若真如此，`cli_three::demux_line` 会把历史帧当成「本回合」事件（症状：卡片弹出历史审批、回执 `lastAssistant` 是旧内容、turn 在历史 `end_turn` 上提前收尾）。**取证动作**：M10 发消息时逐条留意 ① 审批卡里的命令是否**本次**要跑的命令；② 回执 `lastAssistant` 是否**本次**回复；③ `reason` 的「控制请求 N」是否明显大于本次实际弹卡数。任一不符即回报主线（修法方向：只认 `--replay-user-messages` 之后的帧、或以本回合 user 帧 uuid 划界——**未取证前不预写**）。
+
 - [ ] **Step 1: 用户按表统一执行，逐条记录 PASS/FAIL/现象**
 - [ ] **Step 2: 主线汇总结果回填 spec 附录 B + 修复 FAIL 项（若有）**
 - [ ] **Step 3: 全部 PASS 后：主线征得用户同意再 push 分支与合流**

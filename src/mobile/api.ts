@@ -468,11 +468,13 @@ export interface HeadlessReceipt {
 }
 
 /** 无头回合卡片态（SessionDetail 持有；MessageComposer 经 `onHeadlessTurn` 上报）：
- *  - `sending`：HTTP 在飞（无头回合 = 进程生命周期，实测 8–23s；期间只此一态 + 取消钮）
+ *  - `sending`：HTTP 在飞（无头回合 = 进程生命周期，实测 8–23s；期间只此一态 + 取消钮。
+ *    `channel` = 本条走的无头通道 wire 名——**审批卡轮询只在 claude 通道上开**
+ *    （其余通道没有审批面：codex queue/zcode yolo 无、kimi/opencode 由 CLI 自行拒绝））
  *  - `done`：终态回执（`receipt.status` 分诊：ok/queued 回执卡；failed 失败分诊卡；
  *    cancelled 取消卡——**三态都由 receipt 自身说话，前端不另编成功/失败**） */
 export type HeadlessTurn =
-  | { phase: "sending" }
+  | { phase: "sending"; channel?: string | null }
   | {
       phase: "done";
       receipt: HeadlessReceipt;
@@ -480,43 +482,135 @@ export type HeadlessTurn =
       visibilityNote?: string | null;
     };
 
-// ==== H5（Task 10）：无头审批卡数据接口（**预留**——本批未接线）====
+// ==== H5（Task 10 立接口）+ H11（Task 13/C4 激活）：无头审批 / 问答卡 ====
+
+/** 决策词表（**跨语言夹具 `tests/fixtures/headless_decision_words.json` 的 `decisions`**；
+ *  Rust 侧 `inject::headless::cli_three::Decision::wire` 与本常量各自对照同一夹具断言）。
+ *  - `allow`：批准（后端把请求原始 input 原样回显成 `updatedInput`——前端**不回带 input**）；
+ *  - `deny`：拒绝；**用户弃卡（关闭卡片）也必须发 deny**（附录 E-②：allow 但未答 = 静默丢题）；
+ *  - `answer`：问答卡提交（**必须答全**，见 `HeadlessApprovalQuestion`）。 */
+export const HEADLESS_DECISION_WORDS = ["allow", "deny", "answer"] as const;
+export type HeadlessDecisionWord = (typeof HEADLESS_DECISION_WORDS)[number];
+
+/** 待答种类词表（同一夹具的 `kinds`）：`approval` = 工具审批卡；`question` = 问答卡 */
+export const HEADLESS_PENDING_KINDS = ["approval", "question"] as const;
+export type HeadlessPendingKind = (typeof HEADLESS_PENDING_KINDS)[number];
 
 /** 审批决策选项（与 `ApproveOptionsView.options` 同形：id 供应答端点回带、label 供展示）。
- *  C4 落地时 id 取 claude `control_response` 的 behavior 词（附录 E-②：allow / deny；
- *  用户弃卡（dismiss）按 deny 处理，**不得静默丢弃**）——具体词表由 C4 的 wire 规格钉死，
- *  前端只渲染不另编。 */
+ *  id 来自上表（`allow` / `deny`）；**前端只渲染不另编词**。 */
 export interface HeadlessApprovalOption {
   id: string;
   label: string;
 }
 
-/** **无头通道审批请求**（H5 数据接口：本批**只定义类型、不接线**——占位渲染见
- *  `SessionDetail.tsx` 的 `headless-approval-pending`）。
+/** 问答卡的一题（Rust `cli_three::Q` 的载荷投影；附录 E-② 的 `{question, header?,
+ *  options:[{label,description?}], multiSelect?}` 收敛同形）。
  *
- *  C4（Task 13）由 claude 的 stdio 双向桥投影成本形状：stdout 的
- *  `control_request{can_use_tool}`（工具名 + 入参）→ 移动端审批卡 → 用户选择 → 后端写
- *  `control_response`。**应答不经前端回带 input**：allow 所需的 `updatedInput`（原 input
- *  原样回显，缺则工具永不执行）由后端持有原始 input 完成。
+ *  **作答完整性（防静默丢题，附录 E-②/③）**：多选至少一项、单选必选一项或填「其他」自由文本
+ *  ——未答全时提交按钮**禁用**并显示未答题面（核侧再拒一次：`AnswerSet::new`）。 */
+export interface HeadlessApprovalQuestion {
+  /** 题面全文（**就是 answers 的键**——不要用 header / 序号） */
+  question: string;
+  header?: string | null;
+  multiSelect: boolean;
+  options: { label: string; description?: string | null }[];
+}
+
+/** **无头通道待答请求**（Task 13/C4：claude 的 stdio 双向桥投影成本形状）。
  *
- *  边界：**codex queue 通道没有审批面**（H8 定案）——queue 只是入队短命进程，turn 执行与
- *  审批归 codex APP 自身；该形状只属于 claude 的双向桥（zcode yolo 亦无审批面，裁决 14）。 */
-export interface HeadlessApprovalRequest {
-  /** 请求标识（C4：`control_request` 的请求 id——应答须回带同一 id） */
+ *  来源：`GET /m/api/v1/session-headless-approval`（`{pending: …}`）。stdout 的
+ *  `control_request{can_use_tool}`（工具名 + 入参原文）→ 卡片 → 用户选择 →
+ *  `POST /m/api/v1/session-headless-approve` → 后端写 `control_response` 到 claude stdin。
+ *
+ *  **应答不经前端回带 input**：allow 所需的 `updatedInput`（原 input 原样回显，缺则工具
+ *  永不执行）由后端持有原始 input 完成；问答卡的 `answers` 由前端按题面文本上行。
+ *
+ *  边界：**codex queue 通道没有审批面**（H8 定案），zcode yolo 亦无（裁决 14），
+ *  kimi/opencode 的非交互模式由 CLI 自行拒绝权限请求（Task 13 实测）——本形状**只属于
+ *  claude 的双向桥**（`channel === "headless_claude_p"`）。 */
+export interface HeadlessApprovalPending {
+  /** 请求标识（应答须回带同一 id；陈旧页面的 id 会被核侧如实拒绝） */
   requestId: string;
-  /** 工具名（如 Bash / Edit）——卡片标题 */
+  /** 待答种类（`approval` / `question`） */
+  kind: HeadlessPendingKind;
+  /** 工具名（如 Bash / AskUserQuestion）——卡片标题 */
   toolName: string;
-  /** 入参**展示原文**（Bash = 命令行原文；其余工具 = 参数文本）——卡片主体 */
+  /** 入参**展示原文**（Bash = 命令行原文）——卡片主体：用户必须看清要批准什么 */
   input: string;
-  /** 会话号（卡片归属会话） */
   sessionId: string;
-  /** 无头通道 wire 名（如 `headless_claude_p`，与 Rust `HeadlessKind::wire_name` 同源） */
+  /** 无头通道 wire 名（如 `headless_claude_p`） */
   channel: string;
-  /** 该通道 **spawn 时选定**的权限档 wire 词（Rust `PermissionSpec::tier()` 的产物：
-   *  claude = `stdio`）。本批只展示，**不做移动端主动切档**（三期 F3.1） */
+  /** 该通道 **spawn 时选定**的权限档 wire 词（Rust `PermissionSpec::tier()`：claude = `stdio`
+   *  = 审批走 stdio 双向桥）。本批只展示，**不做移动端主动切档**（三期 F3.1） */
   tier: string;
-  /** 决策选项（至少 allow / deny 两项；词表由 C4 的 wire 规格定，前端只渲染） */
+  /** claude 的 `--permission-mode` 档（如 `default`）——与 `tier` 并列展示：
+   *  `tier` 说「审批面形态」，本字段说「工具审批在 CLI 内部的档」 */
+  permissionMode?: string | null;
+  /** 审批卡的两枚决策（`kind==="approval"` 时用；词表 = `HEADLESS_DECISION_WORDS` 前两项） */
   options: HeadlessApprovalOption[];
+  /** 问答卡的题集（`kind==="question"` 时用；空数组 = 题面缺失，卡片如实说明不编题） */
+  questions: HeadlessApprovalQuestion[];
+  /** 已等待毫秒（用户能看出回合在等自己多久了） */
+  waitedMs: number;
+}
+
+/** 拉取**当前待答**的无头审批/问答请求（Task 13/C4）：GET /session-headless-approval。
+ *  `{pending: null}` = 没有待答项（回合未到审批点 / 已终结 / 已超时）。
+ *  非 2xx（400 缺参 / 403 设备失效）→ 抛 ApiError（调用方静默降级为「无卡」）。 */
+export async function fetchHeadlessApproval(
+  sessionId: string
+): Promise<HeadlessApprovalPending | null> {
+  const q = new URLSearchParams({ session_id: sessionId });
+  let r: Response;
+  try {
+    r = await fetch(`/m/api/v1/session-headless-approval?${q}`);
+  } catch (e) {
+    throw new ApiError(null, `session-headless-approval 网络异常: ${String(e)}`);
+  }
+  if (!r.ok) throw new ApiError(r.status, `session-headless-approval ${r.status}`);
+  const body = (await r.json()) as { pending?: HeadlessApprovalPending | null };
+  return body.pending ?? null;
+}
+
+/** 应答**在飞无头回合的审批/问答卡**（Task 13/C4）：POST /session-headless-approve。
+ *  契约（HTTP 恒 200，语义在 body，与取消端点同规）：
+ *  - `{delivered:true}` = 应答已交给回合（回合随后写 `control_response` 到 stdin）；
+ *  - `{delivered:false, reason}` = **未送达**（无待答项 / 请求标识不符 / 回合已不再等待）
+ *    ——**不是错误**，只是这一答没赶上（回合可能已终结/超时）；前端如实回显并停止轮询。
+ *  非 2xx（400 缺参或未答全 / 403 设备失效）→ 抛 ApiError（400 的 body.reason 可直接展示，
+ *  如「问答未答全…」——核侧的完整性拒绝）。 */
+export async function headlessApprove(
+  sessionId: string,
+  requestId: string,
+  decision: HeadlessDecisionWord,
+  answers?: { question: string; labels: string[] }[]
+): Promise<{ delivered: boolean; reason?: string }> {
+  let r: Response;
+  try {
+    r = await fetch("/m/api/v1/session-headless-approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sessionId,
+        requestId,
+        decision,
+        ...(answers ? { answers } : {}),
+      }),
+    });
+  } catch (e) {
+    throw new ApiError(null, `session-headless-approve 网络异常: ${String(e)}`);
+  }
+  if (!r.ok) {
+    // 400 的 body.reason（未答全等）解析进 data 供调用方展示（对齐 sessionSend 惯例）
+    let data: Record<string, unknown> | null = null;
+    try {
+      data = (await r.json()) as Record<string, unknown>;
+    } catch {
+      /* 交验失败保持 null */
+    }
+    throw new ApiError(r.status, `session-headless-approve ${r.status}`, data);
+  }
+  return (await r.json()) as { delivered: boolean; reason?: string };
 }
 
 /** 拉取输入区可用性（W4：输入区挂载时一次）。403（设备失效，与 fetchSessions

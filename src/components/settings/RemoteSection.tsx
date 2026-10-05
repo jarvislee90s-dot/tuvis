@@ -1505,15 +1505,15 @@ export function RemoteSection() {
         </Button>
       </div>
 
-      {/* H5（Task 10）：审批面**状态如实披露**——无头审批卡尚未接线（claude 通道 C4 才启用）。
-          本句的单一来源 = i18n `settings.remote.headlessApprovalPending`（zh/en）；移动端回执卡
-          的占位（SessionDetail 的 `headless-approval-pending`）因移动页无 i18n 运行时（见
-          `src/mobile/main.tsx`：不引入 i18n）而内联同字面。 */}
+      {/* H5（Task 10 立行）+ Task 13/C4 **状态更新**：claude 无头通道的审批卡**已启用**
+          ——旧文案「审批将在 claude 通道（C4）启用」在 C4 落地后成了过期声明，故随实现改写
+          （不谎报未启用）。本句的单一来源 = i18n `settings.remote.headlessApprovalLive`
+          （zh/en）；移动端审批卡本体在 `SessionDetail.tsx` 的 `HeadlessApprovalCard`。 */}
       <p
-        data-testid="headless-approval-pending-note"
+        data-testid="headless-approval-live-note"
         className="text-muted-foreground border-t border-dashed py-2 text-xs"
       >
-        {t("settings.remote.headlessApprovalPending")}
+        {t("settings.remote.headlessApprovalLive")}
       </p>
 
       {/* H3 一次性安全说明（开启动作首次触发；确认 = 记已读 + 开启，取消仅关弹窗、

@@ -13,6 +13,8 @@
 // migration**）。设备身份（device_id/device_name）来自移动端 gate 上下文，
 // **runner 不自造**：runner 只归一回执 + 记录终止方，由端点（持有 gate 上下文与连接）
 // 经 [`audit_headless`] 落 `headless` / `headless_cancel` 两行。
+/// H11 三家 CLI 无头（Task 13 / C4）：claude 主体（长驻双向审批桥）+ kimi/opencode 薄适配
+pub mod cli_three;
 pub mod codex;
 pub mod gate;
 pub mod receipt;
@@ -33,6 +35,11 @@ pub const ACTION_HEADLESS: &str = "headless";
 /// 无头取消审计词（H4/H6）：移动端主动取消（**先到者生效**——watchdog 先到则记
 /// `headless` 且 stage=timeout，不落本词）
 pub const ACTION_HEADLESS_CANCEL: &str = "headless_cancel";
+/// 无头审批应答审计词（Task 13/C4）：移动端在审批/问答卡上按下决策（allow/deny/answer）。
+/// 与取消行同规——**只有真的送达才落账**（未送达不落：没有应答动作发生）；
+/// 正文列 = `工具名: 入参展示原文`（这一行回答「谁批准了什么」），
+/// 耗时列 = **待答时长**（请求登记 → 应答送达的墙钟；与回合耗时口径不同，勿混读）。
+pub const ACTION_HEADLESS_APPROVE: &str = "headless_approve";
 
 /// watchdog 默认超时（H4 / 裁决 15：600s；两端实测 turn 仅 8–23s，留足余量）
 pub const DEFAULT_TIMEOUT_MS: u64 = 600_000;
@@ -169,16 +176,18 @@ pub fn runner_from_conn(program: &str, conn: &rusqlite::Connection) -> runner::R
 // H5 权限档：通道 spawn 时**选定**的权限/审批面（Task 10）
 // ============================================================
 //
-// **本模块只描述「档」**——不做审批流，也不实现 claude 的双向协议（后者归 Task 13 / C4）。
+// **本模块只描述「档」**——审批**流**在 `cli_three`（claude 双向桥，Task 13/C4 已接线）。
 // 一个无头通道 spawn 时的权限行为由三件事决定（spec H5）：
 //   ① claude = 审批走 stdio **双向桥**（`control_request` → 移动端审批卡 → `control_response`，
-//      进程存活至 turn 结束 = 裁决 8 特例）——**argv 与协议归 Task 13**，本批只定义档
-//      （[`ClaudeApprovalMode::Stdio`]）与移动端接口（`src/mobile/api.ts` 的
-//      `HeadlessApprovalRequest`）；
+//      进程存活至 turn 结束 = 裁决 8 特例）——**argv 与协议在 [`cli_three`]**，
+//      [`ClaudeApprovalMode`] 单点产生权限旗子（`--permission-prompt-tool stdio` +
+//      恒带的 `--permission-mode`），移动端接口是 `src/mobile/api.ts` 的
+//      `HeadlessApprovalPending`（`src/mobile/api.ts`；`kind`/`toolName`/`input`/`tier`/
+//      `permissionMode`/`options`/`questions`）；
 //   ② codex exec / kimi / opencode = **策略驱动**：档在 spawn 时给定 ⇒ turn 不因审批阻塞，
-//      需批准/被拒的事件回流回执、可调策略重试（**本批只交付「spawn 时选档」**：旗子注入
-//      已接线；**档位展示面与改档/重试面都尚未接线**——展示随审批卡归 Task 13（C4），
-//      改档属后续批次。勿据 `tier()` 的存在推断已有展示/选择通路）；
+//      需批准/被拒的事件回流回执、可调策略重试（**本批只交付「spawn 时选档」**：
+//      旗子注入已接线；**改档/重试面仍未接线**——改档属后续批次。kimi/opencode 连
+//      策略旗子都未取证 ⇒ `flags()` 为空、档位词 `default` 如实展示）；
 //   ③ zcode = `--mode` 档位，**唯一档 yolo**（裁决 14：Mac 实测 `build` 档在无 permission
 //      client 时阻断全部工具执行 —— `No permission client configured for Bash`）。
 //
@@ -189,8 +198,13 @@ pub fn runner_from_conn(program: &str, conn: &rusqlite::Connection) -> runner::R
 // - **zcode yolo 没有审批面**（裁决 14）：无头 argv 只表达档位，审批交互只存在于 APP 内；
 //   安全面由 H3 总开关（默认关）+ 开启知情文案承担（设置页 `settings.remote.headlessConfirm`）
 //   ——不在这里造审批流；
+// - **kimi/opencode 也没有审批面**（Task 13 实测补充）：opencode `run` 在非交互模式下把
+//   权限请求**自动拒绝**（本机 v2.0.22 二进制内的 `permission requested: …; auto-rejecting`），
+//   kimi 的 prompt 模式同理不接受交互应答 ⇒ 这两家的无头回合**不阻塞在审批上**，
+//   「需批准」的结果由 CLI 自己拒绝后写进回复（回执如实透出）。它们的档位词 `default`
+//   只是**如实展示**「MAM 没加策略旗子」，不是「已确认存在 default 档」。
 // - **本批不做移动端主动切档**（三期 F3.1）：只有 spawn 时选档（旗子注入）已接线；
-//   **档位展示面待 Task 13（C4）接线**（`tier()` 目前无生产调用者，见其文档）。
+//   claude 的档位**展示面**已随审批卡接线（Task 13/C4），改档仍未接线。
 
 /// zcode 权限档（H5 / 裁决 14）：**只此一档**——yolo。
 ///
@@ -268,8 +282,8 @@ impl CodexApprovalPolicy {
 }
 
 /// claude 审批桥形态（H5 / C4）：`Stdio` = `--permission-prompt-tool stdio` 双向桥
-/// （附录 E-①：还须恒带 `--permission-mode` 等一组 flag——**全集归 Task 13**）。
-/// 本批只定义档与移动端接口，[`PermissionSpec::flags`] 对它**返回空**——绝不假装已接线。
+/// （附录 E-①：还须恒带 `--permission-mode`——**两条旗子都在本变体的 [`Self::flags`] 里
+/// 单点产生**，Task 13/C4 起已真接线）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudeApprovalMode {
     Stdio,
@@ -281,6 +295,33 @@ impl ClaudeApprovalMode {
         match self {
             ClaudeApprovalMode::Stdio => "stdio",
         }
+    }
+
+    /// **权限模式**（`--permission-mode <值>`）——本批**唯一档** `default`。
+    ///
+    /// 为什么是 `default` 而不是更宽的档：`default` 下常规工具（Bash/Write…）**也会**弹
+    /// `can_use_tool`（附录 E-② LIVE 2.1.191），这正是审批卡要接的面；而省略该旗子时
+    /// claude 无头默认 `bypassPermissions`（附录 E-① LIVE-PROBED）——那不是「宽松一点」，
+    /// 是**审批面整体消失**（工具静默执行）。故本批只发 `default`，且
+    /// [`PermissionSpec::ClaudeP`] 的旗子恒含它（fail-closed，见 `cli_three::claude_argv`）。
+    ///
+    /// **不提供 bypass 变体**（结构性保证）：要收紧档也须先有实测证据（附录 E-① 的六值
+    /// 白名单里 `acceptEdits`/`plan`/`dontAsk`/`auto` 本批未取证），不按名字猜语义。
+    pub const fn permission_mode(self) -> &'static str {
+        match self {
+            ClaudeApprovalMode::Stdio => "default",
+        }
+    }
+
+    /// 本档的 argv 旗子（**单一来源**：`cli_three::claude_argv` 不再写第二份字面量）：
+    /// `--permission-prompt-tool stdio`（双向桥开）+ `--permission-mode default`（fail-closed）
+    pub fn flags(self) -> Vec<&'static str> {
+        vec![
+            "--permission-prompt-tool",
+            self.wire(),
+            "--permission-mode",
+            self.permission_mode(),
+        ]
     }
 }
 
@@ -317,36 +358,60 @@ impl PermissionSpec {
         PermissionSpec::CodexExec(CodexApprovalPolicy::OnRequest)
     }
 
+    /// claude `-p` 的 spawn 档（**唯一档**：stdio 双向桥 + `--permission-mode default`）。
+    /// Task 13/C4 的 `cli_three::claude_argv` 是它的**唯一消费点**——权限旗子不许另写一份
+    pub const fn claude_default() -> Self {
+        PermissionSpec::ClaudeP(ClaudeApprovalMode::Stdio)
+    }
+
     /// 本档追加的 argv 旗子（**不含**程序名/子命令；调用方按实测位置插入）。
     /// **空的两种情形都是有意为之**，不得读成「忘了填」：
-    /// - [`PermissionSpec::ClaudeP`]：argv 全集归 Task 13（本批只留接口）；
-    /// - kimi/opencode：策略旗子形态未取证（不猜、不发）。
+    /// - [`PermissionSpec::ClaudeP`]：**Task 13/C4 起已接线**——旗子 = `--permission-prompt-tool
+    ///   stdio` + `--permission-mode default`（由 [`ClaudeApprovalMode::flags`] 单点产生，
+    ///   `cli_three::claude_argv` 消费；恒带 `--permission-mode` 是 fail-closed 要求）；
+    /// - kimi/opencode：策略旗子形态未取证（Task 13 实机探针只取证了**续接形态**与
+    ///   回执帧，未取证权限旗子）⇒ 不猜、不发（档位词 `default` 照实展示）。
     pub fn flags(self) -> Vec<&'static str> {
         match self {
             PermissionSpec::Zcode(m) => m.flags(),
             PermissionSpec::CodexExec(p) => p.flags(),
-            PermissionSpec::ClaudeP(_) => Vec::new(),
+            PermissionSpec::ClaudeP(m) => m.flags(),
             PermissionSpec::KimiDefault | PermissionSpec::OpencodeDefault => Vec::new(),
         }
     }
 
-    /// 档的**展示词**（移动端/回执/审计读它——单一来源，勿另抄）：
+    /// 档的**展示词**（移动端/审计读它——单一来源，勿另抄）：
     /// `yolo` / `on-request|never` / `stdio` / `default`。
     ///
     /// `default` 是 **MAM 侧占位词**（「不追加任何策略旗子、用 CLI 自身默认档」），
-    /// **不是** CLI 自己的枚举词——C4 实测到 kimi/opencode 的旗子后按实测改词。
+    /// **不是** CLI 自己的枚举词——kimi/opencode 的权限旗子至今未取证（Task 13 探针只取证了
+    /// 续接形态），故按占位词如实展示，**不猜**。
     ///
-    /// **接线状态（Task 10 现状，如实登记）**：本函数**目前没有生产调用者**（与
-    /// `audit_headless` 同款的显式登记；`pub` 不触发 dead_code，未接线既不会编译报错也不会
-    /// 测试红，故别让它被漏掉）——**档位展示面尚未接线**：展示随审批卡归 **Task 13（C4）**
-    /// （`HeadlessApprovalRequest.tier` 就是它的消费位）。本批只有测试与文档在约束它，
-    /// **勿据其存在推断已有展示通路**。
+    /// **接线状态（Task 13/C4 起，已接线）**：**唯一**消费位 = claude 审批卡载荷的 `tier` 键
+    /// （`cli_three::PendingRequest::to_payload` → 移动端 `HeadlessApprovalPending.tier` →
+    /// `SessionDetail.tsx` 的 `HeadlessApprovalCard` 显示「审批档 <tier> · 权限模式
+    /// <permissionMode>」）。本函数**不再是「无生产调用者」的预留件**。
+    ///
+    /// **如实登记的缺口**：**无头回执卡不显示 tier**（回执封套里没有这个键——为一个
+    /// 「回合没走到审批点」的回合补 tier 需要改 H6 的线上形状，本批不做）；故用户看到档位
+    /// 的时机 = **回合确实弹了审批卡时**。kimi/opencode 两档的权限旗子仍未取证，它们的
+    /// `flags()` 依旧为空（那是「不猜」的诚实表达，不是漏填）。
     pub const fn tier(self) -> &'static str {
         match self {
             PermissionSpec::Zcode(m) => m.wire(),
             PermissionSpec::CodexExec(p) => p.wire(),
             PermissionSpec::ClaudeP(m) => m.wire(),
             PermissionSpec::KimiDefault | PermissionSpec::OpencodeDefault => "default",
+        }
+    }
+
+    /// 权限模式的**wire 词**（仅 claude 有独立权限模式旗子；其余家 = 无此概念 → `None`）。
+    /// 审批卡另发 `permissionMode` 键：`tier` 说的是「审批面形态」（stdio），
+    /// 本函数说的是「工具审批在 CLI 内部的档」（default）——两者都要给用户看见
+    pub const fn permission_mode(self) -> Option<&'static str> {
+        match self {
+            PermissionSpec::ClaudeP(m) => Some(m.permission_mode()),
+            _ => None,
         }
     }
 }
@@ -445,6 +510,10 @@ mod tests {
     fn audit_actions_are_pinned() {
         assert_eq!(ACTION_HEADLESS, "headless");
         assert_eq!(ACTION_HEADLESS_CANCEL, "headless_cancel");
+        assert_eq!(
+            ACTION_HEADLESS_APPROVE, "headless_approve",
+            "Task 13/C4：审批应答行的动作词（送达才落账）"
+        );
     }
 
     /// 评审 Important 3：H4「可配」必须**真生效**——设置值落到全局名额，
@@ -515,8 +584,10 @@ mod tests {
 
     /// H5 权限档参数面（**纯描述、可测**）：每档的旗子 / 展示词 / 默认值逐项钉死。
     /// zcode 恒 `--mode yolo`（裁决 14，**唯一档**）；codex exec 默认 `on-request`（spec H5）；
-    /// claude / kimi / opencode 的 argv 面归 C4（Task 13）——本批**空旗子**是「未接线」的
-    /// 诚实表达（不假装已发），但**档位词仍须可展示**（移动端要读）。
+    /// claude **Task 13/C4 起已接线**（旗子 = `--permission-prompt-tool stdio` + 恒带的
+    /// `--permission-mode default`，见 [`ClaudeApprovalMode::flags`]）；kimi / opencode 的
+    /// 权限旗子**至今未取证** ⇒ 空旗子是「不猜」的诚实表达（不假装已发），但**档位词仍须
+    /// 可展示**（移动端审批卡要读）。
     #[test]
     fn permission_spec_flags_and_tiers_are_pinned() {
         // zcode：唯一合法档 = yolo（裁决 14）
@@ -538,15 +609,29 @@ mod tests {
             PermissionSpec::CodexExec(CodexApprovalPolicy::Never).tier(),
             "never"
         );
-        // claude：stdio 双向桥档（C4 接线；本批零旗子）
-        let cl = PermissionSpec::ClaudeP(ClaudeApprovalMode::Stdio);
+        // claude：stdio 双向桥档（**Task 13/C4 起已接线**——权限旗子单点产生）
+        let cl = PermissionSpec::claude_default();
+        assert_eq!(cl, PermissionSpec::ClaudeP(ClaudeApprovalMode::Stdio));
         assert_eq!(cl.tier(), "stdio");
-        assert!(
-            cl.flags().is_empty(),
-            "claude 的 `--permission-prompt-tool stdio` argv 全集归 Task 13（附录 E-①）——\
-             本批只定义档与移动端接口，空旗子即「未接线」的诚实表达"
+        assert_eq!(
+            cl.flags(),
+            vec![
+                "--permission-prompt-tool",
+                "stdio",
+                "--permission-mode",
+                "default"
+            ],
+            "claude 的权限旗子（含恒带的 --permission-mode，fail-closed）由此单点产生——\
+             `cli_three::claude_argv` 不得另写第二份字面量"
         );
-        // kimi / opencode：默认档（策略旗子形态待 C4 实机取证——不猜、不发）
+        assert_eq!(cl.permission_mode(), Some("default"));
+        assert_eq!(
+            PermissionSpec::Zcode(ZcodePermissionMode::Yolo).permission_mode(),
+            None,
+            "非 claude 家没有独立的权限模式旗子——不得凭空造词"
+        );
+        // kimi / opencode：默认档（Task 13 实机探针只取证了续接形态与回执帧，
+        // **未取证权限旗子**——不猜、不发）
         for spec in [PermissionSpec::KimiDefault, PermissionSpec::OpencodeDefault] {
             assert!(
                 spec.flags().is_empty(),
@@ -574,8 +659,23 @@ mod tests {
             "配置值 = approval_policy=<展示词>（两处不得漂移）"
         );
         assert_eq!(
-            PermissionSpec::ClaudeP(ClaudeApprovalMode::Stdio).tier(),
+            PermissionSpec::claude_default().tier(),
             ClaudeApprovalMode::Stdio.wire()
+        );
+        // 权限模式词与旗子里的值同源（两处不得漂移）
+        let cl = PermissionSpec::claude_default();
+        assert!(
+            cl.flags().windows(2).any(|w| w
+                == [
+                    "--permission-mode",
+                    ClaudeApprovalMode::Stdio.permission_mode()
+                ]),
+            "旗子里的权限模式必须由档单点产生: {:?}",
+            cl.flags()
+        );
+        assert_eq!(
+            cl.permission_mode(),
+            Some(ClaudeApprovalMode::Stdio.permission_mode())
         );
     }
 }

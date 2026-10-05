@@ -448,6 +448,9 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
     // **无头通道分流判据**（Task 8 / H7）：在 try 之前定下来——catch 也必须知道本次是
     // 无头发送（否则请求抛异常时回执卡会永远停在「无头回合进行中…」= 编造在飞态）。
     const headless = headlessChannelOf(sendInfo) !== null;
+    // 通道名（Task 13/C4）：随「发送中」上报——页面级回执卡据此**只在 claude 通道**上
+    // 轮询审批卡（其余无头通道没有审批面，白轮询是浪费也是误导）
+    const headlessChannel = headlessChannelOf(sendInfo);
     const startedAt = Date.now();
     setSending(true);
     try {
@@ -541,7 +544,7 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
       // `headless` 在 try **之前**就定下来（catch 也要用——见下），起点时刻用于本地计时。
       if (headless) {
         // 无头回合的入队标志无意义（每回合 spawn，无 MAM 队列）：不随请求上送
-        onHeadlessTurn?.({ phase: "sending" });
+        onHeadlessTurn?.({ phase: "sending", channel: headlessChannel });
       }
       // 多行原样上行（trim 只用于判空，不改写正文——归一在服务端）
       const res = await sessionSend(

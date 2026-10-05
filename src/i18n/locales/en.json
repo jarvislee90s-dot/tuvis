@@ -389,7 +389,7 @@
       "headlessTimeoutHint": "Watchdog limit for a single headless turn; on expiry the process tree is killed and the receipt reports stage=timeout (retryable). Default 600000 (10 minutes).",
       "headlessConcurrencyLabel": "Headless concurrency cap",
       "headlessConcurrencyHint": "Maximum number of concurrent headless turns (1-8); excess requests queue immediately and their receipt carries the global queue position. Default 2.",
-      "headlessApprovalPending": "Headless channel approval will be enabled with the claude channel (C4)."
+      "headlessApprovalLive": "Approval cards for the claude headless channel are live: while a turn waits for a tool approval or an answer, the mobile session detail page shows an approval card (allow / deny / submit answers); dismissing a card counts as deny."
     },
     "audit": {
       "title": "Injection Audit",

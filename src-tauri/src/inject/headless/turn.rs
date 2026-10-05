@@ -22,6 +22,81 @@ pub type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 /// 证据串行数上限（各类退出分类/锁判定的输入行数；子串匹配只看头部）
 pub const EVIDENCE_HEAD_LINES: usize = 32;
 
+// ============================================================
+// CLI 发现 / Windows 垫片 spawn 形态（**通道无关**；Task 13 自 `codex.rs` 上提）
+// ============================================================
+//
+// **为什么上提**（Task 13）：H11 三家 CLI（claude/kimi/opencode）与本机 codex 一样，
+// 在 Windows 上常是 npm 垫片（`claude.cmd` / `opencode.cmd`；CreateProcess 不认批处理），
+// 需要**同一套** PATH 扫描 + `cmd /c` 包装。留在 `codex.rs` 会让 `cli_three.rs` 变成
+// 「通道依赖通道」——与 Task 9 复审上提 `RunSeam`/`registry` 同一条纪律。
+// **零行为变化**：定义逐字搬迁 + 泛化（`codex_in_path` → [`cli_in_path`]），
+// `codex.rs` 以 `pub use` 与薄委托保持既有调用面与既有测试不变。
+
+/// PATH 分段（纯核）：分隔符按平台取（Windows `;` / 其余 `:`），空段与引号壳滤除
+pub fn path_dirs(path_env: &str, os: &str) -> Vec<String> {
+    let sep = if os == "windows" { ';' } else { ':' };
+    path_env
+        .split(sep)
+        .map(|d| d.trim().trim_matches('"'))
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// PATH 扫描（纯核，**按工具名泛化**）：**按 PATH 顺序**在每段目录内试
+/// `.exe` → `.cmd` → `.bat`（与 Windows 自身的解析顺序一致——PATH 顺序决定用哪个安装，
+/// 目录内则真实可执行体优先：垫片要经 `cmd` 转一手，而 cmd 会重解析命令行）；POSIX 找裸名文件。
+/// 找不到 → `None`（调用方如实拒绝，**绝不 spawn 不存在的程序**）
+pub fn cli_in_path(tool: &str, path_env: &str, os: &str) -> Option<String> {
+    let exts: &[&str] = if os == "windows" {
+        &[".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    for dir in path_dirs(path_env, os) {
+        for ext in exts {
+            let cand = std::path::Path::new(&dir).join(format!("{tool}{ext}"));
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 是否 Windows 批处理垫片（`.cmd`/`.bat`；CreateProcess 不认批处理）
+pub fn shim_needs_cmd(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|e| e == "cmd" || e == "bat")
+}
+
+/// spawn 形态（Windows 垫片经 cmd 转一手；其余直 spawn）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnShape {
+    pub program: String,
+    pub prefix: Vec<String>,
+}
+
+/// spawn 形态构造（唯一构造点）。**登记限制**：`cmd /c` 会重解析命令行——正文中的
+/// `%VAR%` 会被展开（未定义变量原样保留）；这是 Windows npm 垫片的固有代价，
+/// 故 [`cli_in_path`] 让 `.exe` 优先
+pub fn spawn_shape(exe: &str, os: &str) -> SpawnShape {
+    if os == "windows" && shim_needs_cmd(exe) {
+        SpawnShape {
+            program: "cmd".to_string(),
+            prefix: vec!["/c".to_string(), exe.to_string()],
+        }
+    } else {
+        SpawnShape {
+            program: exe.to_string(),
+            prefix: Vec::new(),
+        }
+    }
+}
+
 /// 证据头（生产/测试共用）：前 [`EVIDENCE_HEAD_LINES`] 行拼接（判定为子串匹配）
 pub fn head_of(lines: &[String]) -> String {
     lines

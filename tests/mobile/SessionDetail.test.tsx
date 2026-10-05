@@ -4,17 +4,27 @@ import App from "@/mobile/App";
 import SessionDetail, { isPlanPending } from "@/mobile/SessionDetail";
 import type { SessionFileEntry, SessionMessage, SubagentView } from "@/mobile/api";
 import SessionDetail, {
+  HEADLESS_APPROVE_POLL_MS,
+  HEADLESS_CLAUDE_CHANNEL,
   HEADLESS_STAGE_TRIAGE,
   HeadlessReceiptCard,
+  headlessAnswerLabels,
   headlessStageText,
+  headlessUnanswered,
   isPlanPending,
 } from "@/mobile/SessionDetail";
-import type { SessionFileEntry, SessionMessage } from "@/mobile/api";
+import {
+  HEADLESS_DECISION_WORDS,
+  HEADLESS_PENDING_KINDS,
+  type SessionFileEntry,
+  type SessionMessage,
+} from "@/mobile/api";
 import { BOOKMARK_COLORS, clearBookmarks, messageAnchor } from "@/mobile/bookmarks";
 import { MockEventSource } from "./eventSourceMock";
 import type { Session } from "@/types/session";
 import planPendingCases from "../fixtures/plan_pending_cases.json";
 import stagesFixture from "../fixtures/headless_stages.json";
+import decisionWordsFixture from "../fixtures/headless_decision_words.json";
 
 // M3 Task 8：ZCode 式会话详情页渲染矩阵。fetch 全量 stub（盖过 setup.ts 的 msw），
 // 按 URL 分路到 messages / session-files / file 三端点；jsdom 无真实高亮，
@@ -107,6 +117,14 @@ interface Routes {
   sessionSend?: Record<string, unknown> | "pending" | "reject";
   /** 无头回合取消（POST /session-headless-cancel）回执 */
   headlessCancel?: { cancelled: boolean; reason?: string };
+  /** **Task 13（C4）审批卡数据源**（GET /session-headless-approval）：缺省 null =
+   *  没有待答项（卡不渲染）；给对象 → 卡片载荷（`HeadlessApprovalPending`） */
+  headlessApproval?: Record<string, unknown> | null;
+  /** 审批/问答应答 POST 回执：对象 = 200 `{delivered}`；`"reject"` = 400 + reason
+   *  （核侧完整性拒绝，如「问答未答全」） */
+  headlessApprove?: Record<string, unknown> | "reject";
+  headlessApproveReason?: string;
+  headlessApproveStatus?: number;
 }
 
 /** 手动闸：`routes.sessionSend === "pending"` 时由用例自行 resolve（零真实等待） */
@@ -194,6 +212,27 @@ function installFetch() {
     if (url.includes("/session-headless-cancel")) {
       // Task 8：取消钮目标（无头回执卡）
       return new Response(JSON.stringify(routes.headlessCancel ?? { cancelled: true }), {
+        status: 200,
+      });
+    }
+    if (url.includes("/session-headless-approval")) {
+      // Task 13/C4：审批卡数据源（回执卡在飞期间轮询；缺省无待答项）
+      return new Response(JSON.stringify({ pending: routes.headlessApproval ?? null }), {
+        status: 200,
+      });
+    }
+    if (url.includes("/session-headless-approve")) {
+      // Task 13/C4：审批应答 POST（判序在 -approval 之后——前缀包含关系）
+      if (routes.headlessApprove === "reject") {
+        return new Response(
+          JSON.stringify({
+            error: "bad_request",
+            reason: routes.headlessApproveReason ?? "问答未答全，不允许提交（防静默丢题）",
+          }),
+          { status: routes.headlessApproveStatus ?? 400 }
+        );
+      }
+      return new Response(JSON.stringify(routes.headlessApprove ?? { delivered: true }), {
         status: 200,
       });
     }
@@ -3116,27 +3155,266 @@ describe("SessionDetail：无头回执卡（Task 8 / H7）", () => {
     expect(headlessStageText(undefined)).toBe("未分类失败");
   });
 
-  /// **Task 10（H5）审批卡接口预留**：回执卡里如实说明「无头审批面**未接线**」（claude
-  /// 通道 C4 才启用）——占位面存在且不假装可用。文案与 i18n
-  /// `settings.remote.headlessApprovalPending`（zh/en 双语键；桌面设置页有真实消费者）同字面。
-  it("回执卡渲染审批占位：明说 claude 通道（C4）才启用，卡上无可交互审批控件", () => {
-    render(
-      <HeadlessReceiptCard
-        session={headlessSession()}
-        turn={{ phase: "done", receipt: headlessReceipt() }}
-        onDismiss={() => {}}
-      />
+  /// **Task 13（C4）审批卡激活**（Task 10 的占位已作废）：在飞的无头回合（claude 通道）轮询
+  /// `GET /session-headless-approval` → 渲染真卡：**工具名 + 命令原文 + 权限档**
+  /// （Task 10 的 tier 展示义务）→ 点「允许」→ `POST /session-headless-approve`
+  /// （decision=allow，**不回带 input**——updatedInput 由后端持有原始 input 完成）。
+  it("审批卡：显示工具名/命令原文/权限档，点允许即回带 allow 决策", async () => {
+    installFetch();
+    routes.sendInfo = {
+      injectable: true,
+      channels: ["headless_claude_p"],
+      visibility: "after_refresh",
+    };
+    routes.sessionSend = "pending"; // 手动闸：保持「在飞」态
+    routes.headlessApproval = {
+      requestId: "req-1",
+      kind: "approval",
+      toolName: "Bash",
+      input: "rm -rf build/",
+      sessionId: "sess-h7",
+      channel: "headless_claude_p",
+      tier: "stdio",
+      permissionMode: "default",
+      options: [
+        { id: "allow", label: "允许" },
+        { id: "deny", label: "拒绝" },
+      ],
+      questions: [],
+      waitedMs: 1200,
+    };
+    render(<SessionDetail session={headlessSession()} onBack={() => {}} />);
+    await sendFromComposer("删掉构建目录");
+
+    const card = await screen.findByTestId("headless-approval-card");
+    expect(card.getAttribute("data-kind")).toBe("approval");
+    expect(screen.getByTestId("headless-approval-title").textContent).toContain("Bash");
+    // 用户必须看清要批准什么：命令原文在场
+    expect(screen.getByTestId("headless-approval-input").textContent).toContain("rm -rf build/");
+    // Task 10 的 tier 展示义务在此兑现（审批面形态 + CLI 内部权限档）
+    const tier = screen.getByTestId("headless-approval-tier").textContent ?? "";
+    expect(tier).toContain("stdio");
+    expect(tier).toContain("default");
+    // 已等待时长（Task 13 复审 Minor 2）：走既有耗时口径（<1s 毫秒 / ≥1s 秒·一位小数）
+    expect(screen.getByTestId("headless-approval-waited").textContent).toBe("已等待 1.2s");
+    fireEvent.click(screen.getByTestId("headless-approval-allow"));
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find((c) =>
+        String(c[0]).includes("/session-headless-approve")
+      );
+      expect(call).toBeTruthy();
+      const body = String((call?.[1] as RequestInit | undefined)?.body);
+      expect(body).toContain('"requestId":"req-1"');
+      expect(body).toContain('"decision":"allow"');
+      expect(body).not.toContain("updatedInput");
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("headless-approval-note").textContent).toContain("已送达")
     );
-    const note = screen.getByTestId("headless-approval-pending");
-    expect(note.textContent).toContain("无头通道审批将在 claude 通道（C4）启用");
-    // 未接线 = 卡片上除「收起」外**没有任何可交互控件**（不假装可用）：全卡按钮表逐项
-    // 钉死（多出任何审批钮即红），且占位子树内不得有按钮/输入框/role=button
-    const buttons = screen.getAllByRole("button");
-    expect(buttons.map((b) => b.getAttribute("data-testid"))).toEqual(["headless-dismiss"]);
-    expect(within(note).queryAllByRole("button")).toHaveLength(0);
-    expect(within(note).queryAllByRole("textbox")).toHaveLength(0);
-    expect(note.querySelectorAll("input, button, [role='button']")).toHaveLength(0);
-    expect(screen.queryByTestId("headless-approval-allow")).toBeNull();
-    expect(screen.queryByTestId("headless-approval-deny")).toBeNull();
+    // 卡的生命周期由**轮询**驱动（核侧登记表清空 → 下一轮 GET 返回 null → 卡自然收走），
+    // 不是本地立刻卸载——这样「已送达」的回显用户看得到（本地立刻卸载会让回显永远看不到）
+    expect(screen.getByTestId("headless-approval-card")).toBeTruthy();
+  });
+
+  /// 非 claude 通道**不轮询审批卡**（审批面只属于 claude 双向桥：zcode yolo / codex queue
+  /// 无审批面，kimi/opencode 由 CLI 自行拒绝）——零额外请求，也不显示任何审批控件
+  it("非 claude 无头通道不轮询审批卡（零额外请求、无审批控件）", async () => {
+    installFetch();
+    routes.sendInfo = {
+      injectable: true,
+      channels: ["headless_zcode"],
+      visibility: "after_restart",
+    };
+    routes.sessionSend = "pending";
+    routes.headlessApproval = {
+      requestId: "req-x",
+      kind: "approval",
+      toolName: "Bash",
+      input: "ls",
+      sessionId: "sess-h7",
+      channel: "headless_claude_p",
+      tier: "stdio",
+      permissionMode: "default",
+      options: [{ id: "allow", label: "允许" }],
+      questions: [],
+      waitedMs: 1,
+    };
+    render(<SessionDetail session={headlessSession()} onBack={() => {}} />);
+    await sendFromComposer("无头你好");
+    await screen.findByTestId("headless-receipt-card");
+    expect(screen.queryByTestId("headless-approval-card")).toBeNull();
+    expect(
+      fetchMock.mock.calls.some((c) => String(c[0]).includes("/session-headless-approval"))
+    ).toBe(false);
+  });
+
+  /// **问答卡（防静默丢题，belt & braces 的前端侧）**：不全答则提交禁用并逐题点名；
+  /// 答全后可提交，上行 answers 的键 = **题面全文**、多选 = 数组
+  it("问答卡：不全答禁用提交并点名缺题；答全后上行 answers（键=题面）", async () => {
+    installFetch();
+    routes.sendInfo = {
+      injectable: true,
+      channels: ["headless_claude_p"],
+      visibility: "after_refresh",
+    };
+    routes.sessionSend = "pending";
+    routes.headlessApproval = {
+      requestId: "req-q",
+      kind: "question",
+      toolName: "AskUserQuestion",
+      input: "{}",
+      sessionId: "sess-h7",
+      channel: "headless_claude_p",
+      tier: "stdio",
+      permissionMode: "default",
+      options: [],
+      questions: [
+        {
+          question: "选框架",
+          header: "框架",
+          multiSelect: true,
+          options: [{ label: "a", description: "A 方案" }, { label: "b" }],
+        },
+        { question: "确认?", multiSelect: false, options: [{ label: "y" }, { label: "n" }] },
+      ],
+      waitedMs: 300,
+    };
+    render(<SessionDetail session={headlessSession()} onBack={() => {}} />);
+    await sendFromComposer("问我两个问题");
+
+    await screen.findByTestId("headless-approval-card");
+    const submit = (await screen.findByTestId("headless-question-submit")) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    const note = screen.getByTestId("headless-question-incomplete").textContent ?? "";
+    expect(note).toContain("2 题未作答");
+    expect(note).toContain("选框架");
+    expect(note).toContain("确认?");
+    // 只勾多选一题 → 仍禁用（防静默丢题）
+    fireEvent.click(screen.getByTestId("headless-q-0-opt-0"));
+    expect(submit.disabled).toBe(true);
+    expect(screen.getByTestId("headless-question-incomplete").textContent).toContain("1 题未作答");
+    // **单选题互斥**（Task 13 复审 Minor 1）：先选选项、再写「其他」→ 自由文本**取代**选项
+    // （单选永不吐两个标签——核侧对多标签是 400，死角落必须在前端堵死）
+    fireEvent.click(screen.getByTestId("headless-q-1-opt-0"));
+    expect((screen.getByTestId("headless-q-1-opt-0") as HTMLInputElement).checked).toBe(true);
+    fireEvent.change(screen.getByTestId("headless-q-1-free"), {
+      target: { value: "走自定义" },
+    });
+    expect(
+      (screen.getByTestId("headless-q-1-opt-0") as HTMLInputElement).checked,
+      "写了「其他」必须清掉已选选项（取代而非追加）"
+    ).toBe(false);
+    expect(submit.disabled).toBe(false);
+    fireEvent.click(submit);
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find((c) =>
+        String(c[0]).includes("/session-headless-approve")
+      );
+      expect(call).toBeTruthy();
+      const body = String((call?.[1] as RequestInit | undefined)?.body);
+      expect(body).toContain('"decision":"answer"');
+      expect(body).toContain('"question":"选框架"');
+      expect(body).toContain('"labels":["a"]');
+      expect(body).toContain('"question":"确认?"');
+      // 单选：只有自由文本一个标签（**不得**出现 ["y","走自定义"] 那种被核侧 400 的形态）
+      expect(body).toContain('"labels":["走自定义"]');
+      expect(body).not.toContain('"y","走自定义"');
+    });
+  });
+
+  /// 弃卡 = **拒绝**（附录 E-②：allow 但未答是静默丢题）：问答卡上「拒绝（关闭卡片）」发 deny
+  it("问答卡弃卡发 deny（绝不发 allow 空答案）", async () => {
+    installFetch();
+    routes.sendInfo = {
+      injectable: true,
+      channels: ["headless_claude_p"],
+      visibility: "after_refresh",
+    };
+    routes.sessionSend = "pending";
+    routes.headlessApproval = {
+      requestId: "req-q2",
+      kind: "question",
+      toolName: "AskUserQuestion",
+      input: "{}",
+      sessionId: "sess-h7",
+      channel: "headless_claude_p",
+      tier: "stdio",
+      permissionMode: "default",
+      options: [],
+      questions: [{ question: "确认?", multiSelect: false, options: [{ label: "y" }] }],
+      waitedMs: 10,
+    };
+    render(<SessionDetail session={headlessSession()} onBack={() => {}} />);
+    await sendFromComposer("问我一个问题");
+    fireEvent.click(await screen.findByTestId("headless-approval-dismiss"));
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find((c) =>
+        String(c[0]).includes("/session-headless-approve")
+      );
+      expect(call).toBeTruthy();
+      const body = String((call?.[1] as RequestInit | undefined)?.body);
+      expect(body).toContain('"decision":"deny"');
+      expect(body).not.toContain('"decision":"allow"');
+      expect(body).not.toContain("answers");
+    });
+  });
+
+  /// 核侧完整性拒绝（400 + reason）如实回显（**不谎报已提交**），卡片留在原地让用户补答
+  it("核侧拒绝未答全：如实回显 reason，卡片不消失", async () => {
+    installFetch();
+    routes.sendInfo = {
+      injectable: true,
+      channels: ["headless_claude_p"],
+      visibility: "after_refresh",
+    };
+    routes.sessionSend = "pending";
+    routes.headlessApprove = "reject";
+    routes.headlessApproveReason = "问答未答全，不允许提交（防静默丢题）：仍有 1 题未作答——选框架";
+    routes.headlessApproval = {
+      requestId: "req-q3",
+      kind: "question",
+      toolName: "AskUserQuestion",
+      input: "{}",
+      sessionId: "sess-h7",
+      channel: "headless_claude_p",
+      tier: "stdio",
+      permissionMode: "default",
+      options: [],
+      questions: [{ question: "选框架", multiSelect: false, options: [{ label: "a" }] }],
+      waitedMs: 5,
+    };
+    render(<SessionDetail session={headlessSession()} onBack={() => {}} />);
+    await sendFromComposer("问我一个问题");
+    fireEvent.click(await screen.findByTestId("headless-q-0-opt-0"));
+    fireEvent.click(screen.getByTestId("headless-question-submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("headless-approval-note").textContent).toContain("未答全")
+    );
+    expect(screen.getByTestId("headless-approval-card")).toBeTruthy();
+  });
+
+  /// **跨语言决策词表锁**（`tests/fixtures/headless_decision_words.json` 是唯一名单）：
+  /// 前端常量与 Rust `Decision::wire` / `PendingKind::wire` 各自对照同一夹具断言——
+  /// 任一侧新增词而另一侧没跟上，必有一侧先红（与 stage 名单同款做法）
+  it("决策词/待答种类与跨语言夹具逐项一致", async () => {
+    const fixture = decisionWordsFixture as { decisions: string[]; kinds: string[] };
+    expect([...HEADLESS_DECISION_WORDS].sort()).toEqual([...fixture.decisions].sort());
+    expect([...HEADLESS_PENDING_KINDS].sort()).toEqual([...fixture.kinds].sort());
+    // 审批轮询只认 claude 通道 wire 名（与 Rust `HeadlessKind::ClaudeP.wire_name()` 同源）
+    expect(HEADLESS_CLAUDE_CHANNEL).toBe("headless_claude_p");
+    expect(HEADLESS_APPROVE_POLL_MS).toBeGreaterThan(0);
+    // 未答全判定为**纯函数**且与核侧同规（选项非空 ∨ 自由文本 trim 非空）
+    const q = { question: "q", multiSelect: true, options: [{ label: "a" }] };
+    expect(headlessAnswerLabels(q, [], "  ")).toEqual([]);
+    expect(headlessAnswerLabels(q, ["a"], "")).toEqual(["a"]);
+    expect(headlessAnswerLabels(q, ["a"], " b ")).toEqual(["a", "b"]);
+    // **单选**：自由文本**取代**勾选（永不吐两个标签——核侧对单选多标签是 400）
+    const single = { ...q, multiSelect: false };
+    expect(headlessAnswerLabels(single, ["a", "b"], "")).toEqual(["a"]);
+    expect(headlessAnswerLabels(single, ["a"], "b")).toEqual(["b"]);
+    expect(headlessAnswerLabels(single, ["a", "b"], "c")).toEqual(["c"]);
+    expect(headlessUnanswered([q], {}, {})).toEqual(["q"]);
+    expect(headlessUnanswered([q], { 0: ["a"] }, {})).toEqual([]);
+    expect(headlessUnanswered([single], { 0: [] }, { 0: "  " })).toEqual(["q"]);
   });
 });

@@ -72,8 +72,8 @@
 //!
 //! - **无头条目进不了队列**：唯一生产入队口 = `remote::api::session_send` 的
 //!   `enqueue_conn`（本模块的 `enqueue_conn` 调用面只有测试夹具），该端点在 Task 7 起对
-//!   「无头路由 + 无终端候选」的会话**在 INSERT 之前**即处理（Task 8 起 zcode 走真分派，
-//!   其余家仍 403 + reasonCode=`headless_pending`）。
+//!   「无头路由 + 无终端候选」的会话**在 INSERT 之前**即处理（Task 8/9/11/13 起七家无头
+//!   变体全部走真分派臂；过渡码 `headless_pending` 随 Task 13 收口删除）。
 //!
 //! **投递侧重判前的漂移形态（Task 8 已由上面那段收口）**：一条**入队当时**判终端通道的
 //! 条目（如 claude 有活 pid）若其会话进程随后退出、卡片转成未读卡（`pid = 0` + `form = App`，
