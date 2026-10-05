@@ -308,6 +308,17 @@ export function HeadlessReceiptCard({
           收起
         </button>
       </div>
+      {/* H5（Task 10）审批面**预留**：无头审批卡尚未接线——claude 通道（C4/Task 13）才启用，
+          故这里如实挂一行占位：面存在（数据类型 `HeadlessApprovalRequest` 见 ./api），
+          且**明说现在不生效**；不渲染任何可点控件（不假装可用）。
+          同一句话在桌面设置页经 i18n `settings.remote.headlessApprovalPending`（zh/en）展示；
+          移动页无 i18n 运行时（全页硬编码中文），故此处内联同字面。 */}
+      <p
+        data-testid="headless-approval-pending"
+        className="mt-1 text-xs text-slate-500 dark:text-slate-400"
+      >
+        无头通道审批将在 claude 通道（C4）启用
+      </p>
       {r.lastAssistant && (
         <p
           data-testid="headless-last-assistant"

@@ -388,7 +388,8 @@
       "headlessTimeoutLabel": "Headless timeout (ms)",
       "headlessTimeoutHint": "Watchdog limit for a single headless turn; on expiry the process tree is killed and the receipt reports stage=timeout (retryable). Default 600000 (10 minutes).",
       "headlessConcurrencyLabel": "Headless concurrency cap",
-      "headlessConcurrencyHint": "Maximum number of concurrent headless turns (1-8); excess requests queue immediately and their receipt carries the global queue position. Default 2."
+      "headlessConcurrencyHint": "Maximum number of concurrent headless turns (1-8); excess requests queue immediately and their receipt carries the global queue position. Default 2.",
+      "headlessApprovalPending": "Headless channel approval will be enabled with the claude channel (C4)."
     },
     "audit": {
       "title": "Injection Audit",

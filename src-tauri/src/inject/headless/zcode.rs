@@ -11,7 +11,9 @@
 //!   无 JSON**）——路径推导复用 [`super::gate::zcode_provider_config_path`]（单一来源）。
 //! - `--mode yolo` 固定（裁决 14）：`build` 档在无 permission client 时**阻断全部工具
 //!   执行**（`No permission client configured for Bash`），可用性由 H3 总开关（默认关）
-//!   + 开启安全说明承担。
+//!   + 开启安全说明承担。**档位旗子来自 [`super::PermissionSpec::zcode_default`]**（H5
+//!   参数面，Task 10）——本模块不再写字面 `yolo`。**zcode 无头没有审批面**：无头 argv 只
+//!   表达档位，审批/许可交互只在 APP 内；H3 开启知情文案是这条边界的兜底控制。
 //! - stdout 前缀污染（Mac 实测 `ZCode Built-in missing/skipped (not-due)`）由 Task 6 的
 //!   [`super::receipt::FrameAccumulator`] 前缀跳过消化——本模块**不另写一份解析**。
 //!
@@ -48,6 +50,8 @@ use std::time::{Duration, Instant};
 use super::gate::provider_config_env;
 use super::receipt::{FrameAccumulator, Receipt, ReceiptStatus, Stage};
 use super::runner::RunnerCfg;
+// H5 权限档参数面（Task 10）：`--mode` 档位从它取——**单一来源**，勿在本模块另写字面
+use super::PermissionSpec;
 use crate::inject::normalize;
 use crate::inject::routing::{zcode_visibility, Visibility};
 
@@ -141,23 +145,32 @@ impl std::ops::Deref for ZcodeInvocation {
 }
 
 /// 回合 flag 表（spec H7 命令形态逐字序：`--prompt <text> [--resume <sess>] --cwd <proj>
-/// --mode yolo --json`）。
+/// <权限档旗子> --json`）。
+///
+/// `perm` = **H5 权限档旗子**（唯一来源 [`PermissionSpec::zcode_default`]——本函数与调用方
+/// 都不再写字面 `yolo`）：按实测序插在 `--cwd <项目>` 之后、`--json` 之前。
+/// zcode **没有审批面**（裁决 14）：这里只表达档位，审批/许可交互只存在于 APP 内，
+/// 安全面由 H3 总开关（默认关）+ 开启知情文案承担。
 ///
 /// `resume = None` 即 **H10 无头新建**形态（无在册会话可续）——本批（Task 8）不接线，
 /// 形态先留好：新增调用点只需换传 `None`，不需要动 flag 序。
-fn turn_flags(resume: Option<&str>, project: &str, prompt: &str, cjs: &str) -> Vec<String> {
+fn turn_flags(
+    resume: Option<&str>,
+    project: &str,
+    prompt: &str,
+    cjs: &str,
+    perm: &[&str],
+) -> Vec<String> {
     let mut argv = vec![cjs.to_string(), "--prompt".into(), prompt.to_string()];
     if let Some(id) = resume {
         argv.push("--resume".into());
         argv.push(id.to_string());
     }
-    argv.extend([
-        "--cwd".into(),
-        project.to_string(),
-        "--mode".into(),
-        "yolo".into(),
-        "--json".into(),
-    ]);
+    argv.push("--cwd".into());
+    argv.push(project.to_string());
+    // H5 权限档（Task 10）：档位旗子来自 spec，**不是**本文件里的字面量
+    argv.extend(perm.iter().map(|f| (*f).to_string()));
+    argv.push("--json".into());
     argv
 }
 
@@ -188,7 +201,14 @@ pub fn build_argv(
     }
     ZcodeInvocation {
         program: spec.exe.clone(),
-        argv: turn_flags(Some(session_id), project, &prompt, &spec.cjs),
+        // H5：档位旗子从 spec 取（单一来源）——`--mode yolo` 不再由本模块字面直写
+        argv: turn_flags(
+            Some(session_id),
+            project,
+            &prompt,
+            &spec.cjs,
+            &PermissionSpec::zcode_default().flags(),
+        ),
         env,
         prompt,
     }
@@ -940,7 +960,7 @@ mod tests {
     // ===== 计划 Step 1 原例（Task 8 的红灯测试） =====
 
     /// 探测定案 D1：Mac 必须补 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`（否则 --prompt 静默无 JSON）；
-    /// 两端都设 `ELECTRON_RUN_AS_NODE`；argv 含 cjs 脚本；`--mode yolo`（裁决 14）
+    /// 两端都设 `ELECTRON_RUN_AS_NODE`；argv 含 cjs 脚本；档位段来自 [`PermissionSpec`]（裁决 14）
     #[test]
     fn argv_windows_and_mac_diverge() {
         // 探测定案 D1：Mac 必须补 ZCODE_BUILTIN_PROVIDER_CONFIG_FILE
@@ -952,7 +972,16 @@ mod tests {
             None,
         );
         assert!(w.iter().any(|a| a.contains("zcode.cjs")));
-        assert!(w.windows(2).any(|p| p[0] == "--mode" && p[1] == "yolo")); // 裁决 14
+        // 档位段**从 spec 派生**期望（不是本测自己抄一份字面）——spec 改档时本测跟着走；
+        // 逐字面锁在同文件的 `argv_pins_the_probed_command_form`（独立期望，故意写死）
+        let perm = PermissionSpec::zcode_default().flags();
+        assert!(
+            w.argv
+                .windows(perm.len())
+                .any(|p| p.iter().map(String::as_str).eq(perm.iter().copied())),
+            "argv 档位段必须来自己 H5 档面（裁决 14）: {:?}",
+            w.argv
+        );
         let m = super::build_argv(
             &super::ZcodeSpec::mac("/Applications/ZCode.app"),
             "hi",
@@ -1011,6 +1040,9 @@ mod tests {
                 "sess_9".into(),
                 "--cwd".into(),
                 "E:/proj".into(),
+                // 注意：这里的 `--mode` / `yolo` 是**测试面字面量**（独立期望——向量锁故意
+                // 不从实现派生，实现真被改坏时它才拦得住）；「档位来自 spec」的同源断言见
+                // `mode_flag_is_injected_from_the_permission_spec`
                 "--mode".into(),
                 "yolo".into(),
                 "--json".into(),
@@ -1068,6 +1100,51 @@ mod tests {
                 .join("glm")
                 .join("zcode.cjs")
                 .to_string_lossy()
+        );
+    }
+
+    /// H5 权限档（Task 10）：zcode 的 `--mode` 段**来自** [`PermissionSpec::zcode_default`]
+    /// ——本文件不再写字面 `yolo`（单一来源）。旗子按实测序插在 `--cwd <项目>` 之后、
+    /// `--json` 之前；zcode **没有审批面**（裁决 14），这里只表达档位。
+    #[test]
+    fn mode_flag_is_injected_from_the_permission_spec() {
+        let spec = PermissionSpec::zcode_default();
+        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_1", "E:/p", None);
+        let i = inv
+            .argv
+            .iter()
+            .position(|a| a == "--mode")
+            .expect("`--mode` 必须在场（裁决 14：yolo 保可用性）");
+        assert_eq!(
+            &inv.argv[i..i + spec.flags().len()],
+            spec.flags().as_slice(),
+            "argv 的档位段必须逐字来自 spec（顺序敏感）"
+        );
+        assert_eq!(
+            inv.argv.iter().filter(|a| *a == "--mode").count(),
+            1,
+            "档位旗子只此一处（不得既从 spec 注入又留字面）"
+        );
+        assert_eq!(
+            inv.argv.last().map(String::as_str),
+            Some("--json"),
+            "`--json` 仍是尾 flag（档位段插在它之前）"
+        );
+        // 注入点**参数化**（构造器不写死 yolo）：换一组旗子即换输出
+        let alt = turn_flags(
+            Some("sess_1"),
+            "E:/p",
+            "hi",
+            "zcode.cjs",
+            &["--mode", "plan"],
+        );
+        assert!(
+            alt.windows(2).any(|w| w == ["--mode", "plan"]),
+            "构造器必须按传入旗子组装: {alt:?}"
+        );
+        assert!(
+            !alt.iter().any(|a| a == "yolo"),
+            "构造器不得自带字面档位: {alt:?}"
         );
     }
 

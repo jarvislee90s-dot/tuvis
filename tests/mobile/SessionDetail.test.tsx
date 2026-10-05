@@ -5,6 +5,7 @@ import SessionDetail, { isPlanPending } from "@/mobile/SessionDetail";
 import type { SessionFileEntry, SessionMessage, SubagentView } from "@/mobile/api";
 import SessionDetail, {
   HEADLESS_STAGE_TRIAGE,
+  HeadlessReceiptCard,
   headlessStageText,
   isPlanPending,
 } from "@/mobile/SessionDetail";
@@ -3113,5 +3114,29 @@ describe("SessionDetail：无头回执卡（Task 8 / H7）", () => {
     // 未知档如实兜底（不编成因）
     expect(headlessStageText("brand_new_stage")).toContain("未分类失败");
     expect(headlessStageText(undefined)).toBe("未分类失败");
+  });
+
+  /// **Task 10（H5）审批卡接口预留**：回执卡里如实说明「无头审批面**未接线**」（claude
+  /// 通道 C4 才启用）——占位面存在且不假装可用。文案与 i18n
+  /// `settings.remote.headlessApprovalPending`（zh/en 双语键；桌面设置页有真实消费者）同字面。
+  it("回执卡渲染审批占位：明说 claude 通道（C4）才启用，卡上无可交互审批控件", () => {
+    render(
+      <HeadlessReceiptCard
+        session={headlessSession()}
+        turn={{ phase: "done", receipt: headlessReceipt() }}
+        onDismiss={() => {}}
+      />
+    );
+    const note = screen.getByTestId("headless-approval-pending");
+    expect(note.textContent).toContain("无头通道审批将在 claude 通道（C4）启用");
+    // 未接线 = 卡片上除「收起」外**没有任何可交互控件**（不假装可用）：全卡按钮表逐项
+    // 钉死（多出任何审批钮即红），且占位子树内不得有按钮/输入框/role=button
+    const buttons = screen.getAllByRole("button");
+    expect(buttons.map((b) => b.getAttribute("data-testid"))).toEqual(["headless-dismiss"]);
+    expect(within(note).queryAllByRole("button")).toHaveLength(0);
+    expect(within(note).queryAllByRole("textbox")).toHaveLength(0);
+    expect(note.querySelectorAll("input, button, [role='button']")).toHaveLength(0);
+    expect(screen.queryByTestId("headless-approval-allow")).toBeNull();
+    expect(screen.queryByTestId("headless-approval-deny")).toBeNull();
   });
 });

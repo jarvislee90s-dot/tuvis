@@ -388,7 +388,8 @@
       "headlessTimeoutLabel": "无头超时（毫秒）",
       "headlessTimeoutHint": "单次无头 turn 的看门狗上限：到点杀进程树并回执 stage=timeout（可重试）。默认 600000（10 分钟）。",
       "headlessConcurrencyLabel": "无头并发上限",
-      "headlessConcurrencyHint": "同时进行的无头 turn 数上限（1–8）：超额请求即时排队，回执带全局队列位置。默认 2。"
+      "headlessConcurrencyHint": "同时进行的无头 turn 数上限（1–8）：超额请求即时排队，回执带全局队列位置。默认 2。",
+      "headlessApprovalPending": "无头通道审批将在 claude 通道（C4）启用"
     },
     "audit": {
       "title": "注入审计",

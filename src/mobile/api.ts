@@ -475,6 +475,45 @@ export type HeadlessTurn =
       visibilityNote?: string | null;
     };
 
+// ==== H5（Task 10）：无头审批卡数据接口（**预留**——本批未接线）====
+
+/** 审批决策选项（与 `ApproveOptionsView.options` 同形：id 供应答端点回带、label 供展示）。
+ *  C4 落地时 id 取 claude `control_response` 的 behavior 词（附录 E-②：allow / deny；
+ *  用户弃卡（dismiss）按 deny 处理，**不得静默丢弃**）——具体词表由 C4 的 wire 规格钉死，
+ *  前端只渲染不另编。 */
+export interface HeadlessApprovalOption {
+  id: string;
+  label: string;
+}
+
+/** **无头通道审批请求**（H5 数据接口：本批**只定义类型、不接线**——占位渲染见
+ *  `SessionDetail.tsx` 的 `headless-approval-pending`）。
+ *
+ *  C4（Task 13）由 claude 的 stdio 双向桥投影成本形状：stdout 的
+ *  `control_request{can_use_tool}`（工具名 + 入参）→ 移动端审批卡 → 用户选择 → 后端写
+ *  `control_response`。**应答不经前端回带 input**：allow 所需的 `updatedInput`（原 input
+ *  原样回显，缺则工具永不执行）由后端持有原始 input 完成。
+ *
+ *  边界：**codex queue 通道没有审批面**（H8 定案）——queue 只是入队短命进程，turn 执行与
+ *  审批归 codex APP 自身；该形状只属于 claude 的双向桥（zcode yolo 亦无审批面，裁决 14）。 */
+export interface HeadlessApprovalRequest {
+  /** 请求标识（C4：`control_request` 的请求 id——应答须回带同一 id） */
+  requestId: string;
+  /** 工具名（如 Bash / Edit）——卡片标题 */
+  toolName: string;
+  /** 入参**展示原文**（Bash = 命令行原文；其余工具 = 参数文本）——卡片主体 */
+  input: string;
+  /** 会话号（卡片归属会话） */
+  sessionId: string;
+  /** 无头通道 wire 名（如 `headless_claude_p`，与 Rust `HeadlessKind::wire_name` 同源） */
+  channel: string;
+  /** 该通道 **spawn 时选定**的权限档 wire 词（Rust `PermissionSpec::tier()` 的产物：
+   *  claude = `stdio`）。本批只展示，**不做移动端主动切档**（三期 F3.1） */
+  tier: string;
+  /** 决策选项（至少 allow / deny 两项；词表由 C4 的 wire 规格定，前端只渲染） */
+  options: HeadlessApprovalOption[];
+}
+
 /** 拉取输入区可用性（W4：输入区挂载时一次）。403（设备失效，与 fetchSessions
  *  同语义）→ null；其余失败（404 会话不在快照 / 网络异常）→ 抛 ApiError，
  *  由调用方静默降级（不渲染输入区，详情页正文照常） */

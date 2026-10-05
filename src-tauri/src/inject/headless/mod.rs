@@ -160,6 +160,192 @@ pub fn runner_from_conn(program: &str, conn: &rusqlite::Connection) -> runner::R
     cfg
 }
 
+// ============================================================
+// H5 权限档：通道 spawn 时**选定**的权限/审批面（Task 10）
+// ============================================================
+//
+// **本模块只描述「档」**——不做审批流，也不实现 claude 的双向协议（后者归 Task 13 / C4）。
+// 一个无头通道 spawn 时的权限行为由三件事决定（spec H5）：
+//   ① claude = 审批走 stdio **双向桥**（`control_request` → 移动端审批卡 → `control_response`，
+//      进程存活至 turn 结束 = 裁决 8 特例）——**argv 与协议归 Task 13**，本批只定义档
+//      （[`ClaudeApprovalMode::Stdio`]）与移动端接口（`src/mobile/api.ts` 的
+//      `HeadlessApprovalRequest`）；
+//   ② codex exec / kimi / opencode = **策略驱动**：档在 spawn 时给定 ⇒ turn 不因审批阻塞，
+//      需批准/被拒的事件回流回执、可调策略重试（**本批只交付「spawn 时选档」**：旗子注入
+//      已接线；**档位展示面与改档/重试面都尚未接线**——展示随审批卡归 Task 13（C4），
+//      改档属后续批次。勿据 `tier()` 的存在推断已有展示/选择通路）；
+//   ③ zcode = `--mode` 档位，**唯一档 yolo**（裁决 14：Mac 实测 `build` 档在无 permission
+//      client 时阻断全部工具执行 —— `No permission client configured for Bash`）。
+//
+// **边界（落码于此，勿在别处另说一套）**：
+// - **codex queue 通道没有审批面**（H8 定案）：`queue` 只是把消息入队的**短命进程**，turn
+//   执行（含工具审批）归 codex APP 自身、按 APP 自己的配置走 ⇒ MAM 侧没有可注入的档位旗子
+//   （见 `codex::queue_argv`，测试 `queue_plan_carries_no_permission_flag` 钉死）；
+// - **zcode yolo 没有审批面**（裁决 14）：无头 argv 只表达档位，审批交互只存在于 APP 内；
+//   安全面由 H3 总开关（默认关）+ 开启知情文案承担（设置页 `settings.remote.headlessConfirm`）
+//   ——不在这里造审批流；
+// - **本批不做移动端主动切档**（三期 F3.1）：只有 spawn 时选档（旗子注入）已接线；
+//   **档位展示面待 Task 13（C4）接线**（`tier()` 目前无生产调用者，见其文档）。
+
+/// zcode 权限档（H5 / 裁决 14）：**只此一档**——yolo。
+///
+/// 为什么唯一：Mac 实测 `build` 档在**无 permission client** 时阻断全部工具执行
+/// （`No permission client configured for Bash`）⇒ 无头通道不可用；yolo 保可用性。
+/// 安全面由 H3 总开关（默认关）+ 开启知情文案承担（**无头通道无审批面**）。
+/// `plan→yolo` 的粘滞疑云归版本门控复核；后续若要收紧档，**加变体 + 证据**，
+/// 不要在 `zcode.rs` 里写第二份字面量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZcodePermissionMode {
+    Yolo,
+}
+
+impl ZcodePermissionMode {
+    /// argv 值/展示词**单点**（`--mode <wire>`）——argv 与移动端展示同源
+    pub const fn wire(self) -> &'static str {
+        match self {
+            ZcodePermissionMode::Yolo => "yolo",
+        }
+    }
+
+    /// 本档追加的 argv 旗子（调用方负责放到实测位置：`--cwd` 之后、`--json` 之前）
+    pub fn flags(self) -> Vec<&'static str> {
+        vec!["--mode", self.wire()]
+    }
+}
+
+/// codex 审批策略档（H5）：**spawn 时给定**（策略驱动）⇒ turn 不因审批阻塞。
+///
+/// 值集取自本机 `codex-cli 0.160.0`：`-a/--ask-for-approval` 帮助的 `Possible values`
+/// 只列 `on-request` / `never`，二进制内 `AskForApproval` 枚举另有 `untrusted`/`granular`
+/// ——**本批只收 CLI 明示的两档**（可引证）；其余档名在 0.160.0 的 `-a` 面不出现、语义未经
+/// 取证 ⇒ 不按版本猜测（新增档须同样有证据）。
+///
+/// `OnRequest` 是 spec H5 的默认档：`codex exec` 是非交互面，模型请求批准时**没有审批
+/// 客户端** ⇒ 该请求即刻被拒并把失败返回给模型（回合不阻塞）——这正是「策略驱动」的含义；
+/// 拒绝/需批准事件随回执/审计可见，用户可换档重发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexApprovalPolicy {
+    /// 模型按需请求批准（**默认档**，spec H5）
+    OnRequest,
+    /// 从不请求批准（执行失败直接返回模型）。
+    ///
+    /// **当前生产不可达（Task 10 现状，如实登记）**：唯一生产入口
+    /// [`PermissionSpec::codex_exec_default`] 恒 `OnRequest`，本批**没有**配置/环境变量/
+    /// 移动端的档位选择面（spec H5 边界：不做移动端主动切档）。`Never` 是「策略可调」面
+    /// 预留的合法档，只在测试与文档里被构造——**勿据此推断已有选择通路**。
+    Never,
+}
+
+impl CodexApprovalPolicy {
+    /// 配置值单点（`~/.codex/config.toml` 的 `approval_policy` 取值；旗子形如
+    /// `-c approval_policy=<wire>`）
+    pub const fn wire(self) -> &'static str {
+        match self {
+            CodexApprovalPolicy::OnRequest => "on-request",
+            CodexApprovalPolicy::Never => "never",
+        }
+    }
+
+    /// 旗子的**配置项原文**（`approval_policy=<wire>`；由 [`Self::wire`] 同源派生，
+    /// 测试钉死「配置值 = approval_policy=<展示词>」不得漂移）
+    pub const fn config_arg(self) -> &'static str {
+        match self {
+            CodexApprovalPolicy::OnRequest => "approval_policy=on-request",
+            CodexApprovalPolicy::Never => "approval_policy=never",
+        }
+    }
+
+    /// 本档追加的 argv 旗子。**位置有实测依据**（见 `codex::exec_resume_argv`）：
+    /// `-c/--config` 在 `exec resume` 的选项表里在场 ⇒ 置于 `resume` **之后**（子命令内选项）
+    pub fn flags(self) -> Vec<&'static str> {
+        vec!["-c", self.config_arg()]
+    }
+}
+
+/// claude 审批桥形态（H5 / C4）：`Stdio` = `--permission-prompt-tool stdio` 双向桥
+/// （附录 E-①：还须恒带 `--permission-mode` 等一组 flag——**全集归 Task 13**）。
+/// 本批只定义档与移动端接口，[`PermissionSpec::flags`] 对它**返回空**——绝不假装已接线。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeApprovalMode {
+    Stdio,
+}
+
+impl ClaudeApprovalMode {
+    /// 展示词单点（`stdio` = 审批走标准输入输出的双向控制面）
+    pub const fn wire(self) -> &'static str {
+        match self {
+            ClaudeApprovalMode::Stdio => "stdio",
+        }
+    }
+}
+
+/// **H5 权限档参数面**：一个无头通道 spawn 时选定的档——**纯描述**（可测、可展示），
+/// 由各通道的 argv 构造器消费（`zcode::build_argv` / `codex::exec_resume_argv`）。
+/// 审批**流**不在这里：claude 的双向桥归 Task 13（本批只留接口与占位渲染）。
+///
+/// **env 面**：本批各档都是 argv 旗子，**没有 env 面**——若将来某档需要 env（如 claude 桥的
+/// 开关），加 `env()` 方法并在此登记，**不预造空壳方法**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionSpec {
+    /// zcode（H7/H10）：`--mode <档>`；唯一档 = yolo（裁决 14；**无审批面**）
+    Zcode(ZcodePermissionMode),
+    /// codex `exec resume`（H8 兜底路）：`-c approval_policy=<档>`（策略驱动，默认 on-request）；
+    /// **queue 路没有审批面**（H8 定案）⇒ 该路不取本档
+    CodexExec(CodexApprovalPolicy),
+    /// claude `-p`（H11/C4）：审批走 stdio 双向桥（`control_request` ← → 移动端审批卡）。
+    /// 本批只定义档与移动端接口；**argv 全集与协议归 Task 13**
+    ClaudeP(ClaudeApprovalMode),
+    /// kimi `-p`（H11/C4）：默认档——策略旗子形态**未取证**（Task 13 实机首步），不猜
+    KimiDefault,
+    /// opencode `run`（H11/C4）：默认档——同上
+    OpencodeDefault,
+}
+
+impl PermissionSpec {
+    /// zcode 通道的 spawn 档（**唯一来源**：`zcode.rs` 不再写字面 `yolo`）
+    pub const fn zcode_default() -> Self {
+        PermissionSpec::Zcode(ZcodePermissionMode::Yolo)
+    }
+
+    /// codex `exec resume` 的 spawn 档（**默认 on-request**，spec H5）
+    pub const fn codex_exec_default() -> Self {
+        PermissionSpec::CodexExec(CodexApprovalPolicy::OnRequest)
+    }
+
+    /// 本档追加的 argv 旗子（**不含**程序名/子命令；调用方按实测位置插入）。
+    /// **空的两种情形都是有意为之**，不得读成「忘了填」：
+    /// - [`PermissionSpec::ClaudeP`]：argv 全集归 Task 13（本批只留接口）；
+    /// - kimi/opencode：策略旗子形态未取证（不猜、不发）。
+    pub fn flags(self) -> Vec<&'static str> {
+        match self {
+            PermissionSpec::Zcode(m) => m.flags(),
+            PermissionSpec::CodexExec(p) => p.flags(),
+            PermissionSpec::ClaudeP(_) => Vec::new(),
+            PermissionSpec::KimiDefault | PermissionSpec::OpencodeDefault => Vec::new(),
+        }
+    }
+
+    /// 档的**展示词**（移动端/回执/审计读它——单一来源，勿另抄）：
+    /// `yolo` / `on-request|never` / `stdio` / `default`。
+    ///
+    /// `default` 是 **MAM 侧占位词**（「不追加任何策略旗子、用 CLI 自身默认档」），
+    /// **不是** CLI 自己的枚举词——C4 实测到 kimi/opencode 的旗子后按实测改词。
+    ///
+    /// **接线状态（Task 10 现状，如实登记）**：本函数**目前没有生产调用者**（与
+    /// `audit_headless` 同款的显式登记；`pub` 不触发 dead_code，未接线既不会编译报错也不会
+    /// 测试红，故别让它被漏掉）——**档位展示面尚未接线**：展示随审批卡归 **Task 13（C4）**
+    /// （`HeadlessApprovalRequest.tier` 就是它的消费位）。本批只有测试与文档在约束它，
+    /// **勿据其存在推断已有展示通路**。
+    pub const fn tier(self) -> &'static str {
+        match self {
+            PermissionSpec::Zcode(m) => m.wire(),
+            PermissionSpec::CodexExec(p) => p.wire(),
+            PermissionSpec::ClaudeP(m) => m.wire(),
+            PermissionSpec::KimiDefault | PermissionSpec::OpencodeDefault => "default",
+        }
+    }
+}
+
 /// 测试专用串行锁（仅 cfg(test)；与 `inject::queue::LOOP_HANDLE_TEST_LOCK` 同型同用法，
 /// 故置于模块顶层而非 tests 内——`remote::mod` 的测试要跨模块取它）。理由：H4 的并发
 /// 上限住在**进程级单例** `runner::global_sem()` 上，两个用例会改它并断言其值（本模块的
@@ -318,5 +504,73 @@ mod tests {
         assert_eq!(runner::global_sem().cap(), DEFAULT_CONCURRENCY);
         // 复位全局名额（进程级单例，别把 3 留给后续用例）
         runner::global_sem().set_cap(DEFAULT_CONCURRENCY);
+    }
+
+    // ===== H5 权限档（Task 10）=====
+
+    /// H5 权限档参数面（**纯描述、可测**）：每档的旗子 / 展示词 / 默认值逐项钉死。
+    /// zcode 恒 `--mode yolo`（裁决 14，**唯一档**）；codex exec 默认 `on-request`（spec H5）；
+    /// claude / kimi / opencode 的 argv 面归 C4（Task 13）——本批**空旗子**是「未接线」的
+    /// 诚实表达（不假装已发），但**档位词仍须可展示**（移动端要读）。
+    #[test]
+    fn permission_spec_flags_and_tiers_are_pinned() {
+        // zcode：唯一合法档 = yolo（裁决 14）
+        let z = PermissionSpec::zcode_default();
+        assert_eq!(z, PermissionSpec::Zcode(ZcodePermissionMode::Yolo));
+        assert_eq!(z.flags(), vec!["--mode", "yolo"]);
+        assert_eq!(z.tier(), "yolo");
+        // codex exec：策略驱动，默认 on-request（spec H5）
+        let c = PermissionSpec::codex_exec_default();
+        assert_eq!(c, PermissionSpec::CodexExec(CodexApprovalPolicy::OnRequest));
+        assert_eq!(c.flags(), vec!["-c", "approval_policy=on-request"]);
+        assert_eq!(c.tier(), "on-request");
+        // 策略**可调**（本轮只选档 + 展示；改档重试属后续批次）
+        assert_eq!(
+            PermissionSpec::CodexExec(CodexApprovalPolicy::Never).flags(),
+            vec!["-c", "approval_policy=never"]
+        );
+        assert_eq!(
+            PermissionSpec::CodexExec(CodexApprovalPolicy::Never).tier(),
+            "never"
+        );
+        // claude：stdio 双向桥档（C4 接线；本批零旗子）
+        let cl = PermissionSpec::ClaudeP(ClaudeApprovalMode::Stdio);
+        assert_eq!(cl.tier(), "stdio");
+        assert!(
+            cl.flags().is_empty(),
+            "claude 的 `--permission-prompt-tool stdio` argv 全集归 Task 13（附录 E-①）——\
+             本批只定义档与移动端接口，空旗子即「未接线」的诚实表达"
+        );
+        // kimi / opencode：默认档（策略旗子形态待 C4 实机取证——不猜、不发）
+        for spec in [PermissionSpec::KimiDefault, PermissionSpec::OpencodeDefault] {
+            assert!(
+                spec.flags().is_empty(),
+                "C4 未取证前不得凭空发旗子: {spec:?}"
+            );
+            assert_eq!(spec.tier(), "default");
+        }
+    }
+
+    /// 档位**可展示**（移动端要读）：展示词与旗子里的配置值**同源**——单一来源，勿另抄一份
+    #[test]
+    fn permission_tier_words_match_their_flags() {
+        let z = PermissionSpec::zcode_default();
+        assert_eq!(z.flags(), vec!["--mode", ZcodePermissionMode::Yolo.wire()]);
+        assert_eq!(z.tier(), ZcodePermissionMode::Yolo.wire());
+        let c = PermissionSpec::codex_exec_default();
+        assert_eq!(
+            c.flags(),
+            vec!["-c", CodexApprovalPolicy::OnRequest.config_arg()],
+            "旗子里的配置值必须由档单点产生"
+        );
+        assert_eq!(
+            CodexApprovalPolicy::OnRequest.config_arg(),
+            format!("approval_policy={}", c.tier()),
+            "配置值 = approval_policy=<展示词>（两处不得漂移）"
+        );
+        assert_eq!(
+            PermissionSpec::ClaudeP(ClaudeApprovalMode::Stdio).tier(),
+            ClaudeApprovalMode::Stdio.wire()
+        );
     }
 }

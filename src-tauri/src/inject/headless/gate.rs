@@ -14,6 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::receipt::{parse_json_skipping_prefix, Receipt, Stage};
 use super::runner::{GlobalSem, RunnerCfg};
+// H5 权限档（Task 10）：zcode 探针的档位旗子也从 spec 取——探针与真回合**同一份**口径
+use super::PermissionSpec;
 
 /// 探针干跑超时（H6：15s；探针是短命干跑，不是 turn）
 pub const PROBE_TIMEOUT_MS: u64 = 15_000;
@@ -54,18 +56,27 @@ impl ProbeSpec {
 }
 
 /// 探针 argv（**不含 exe 自身**；生产 spawn = exe + 本 argv + [`probe_env`]）
+///
+/// **H5 权限档（Task 10）**：zcode 面的档位旗子来自 [`PermissionSpec::zcode_default`]——
+/// 与真回合（`zcode::build_argv`）**同一份 spec**，故不存在「探针探 yolo、回合 spawn 别的档」
+/// 的静默漂移：档位一旦收紧/加变体，探针跟着探新档。测试
+/// `zcode_probe_argv_mode_comes_from_the_permission_spec` 把探针与真回合钉在同一段旗子上。
 pub fn probe_argv(spec: &ProbeSpec) -> Vec<String> {
     match spec {
         // `--prompt <最短非空载荷>` 干跑：真机 CLI 拒绝空串（见 [`PROBE_PROMPT`]）；
-        // provider 缺失/打包错位时这里就出不了 JSON → 门控拦下
-        ProbeSpec::Zcode { cjs, .. } => vec![
-            cjs.clone(),
-            "--prompt".into(),
-            PROBE_PROMPT.into(),
-            "--mode".into(),
-            "yolo".into(),
-            "--json".into(),
-        ],
+        // provider 缺失/打包错位时这里就出不了 JSON → 门控拦下。
+        // 档位段（`--mode <档>`）插在 `--json` 之前——与真回合的 flag 序一致（H5）
+        ProbeSpec::Zcode { cjs, .. } => {
+            let mut argv = vec![cjs.clone(), "--prompt".into(), PROBE_PROMPT.into()];
+            argv.extend(
+                PermissionSpec::zcode_default()
+                    .flags()
+                    .into_iter()
+                    .map(str::to_string),
+            );
+            argv.push("--json".into());
+            argv
+        }
         ProbeSpec::Codex { .. } => vec!["queue".into(), "--help".into()],
     }
 }
@@ -436,6 +447,53 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a == "--help"),
             "zcode 探针须干跑而非帮助面"
+        );
+    }
+
+    /// **H5（Task 10）：探针的档位段与真回合同源**——两处都从 [`PermissionSpec::zcode_default`]
+    /// 取旗子。此测是「探针不得留旧档位字面」的防漂移锁：档位一旦收紧/新增变体，
+    /// 探针与 `zcode::build_argv` 必须同时跟着 spec 走（否则门控探的是旧档、回合 spawn 的是新档）。
+    #[test]
+    fn zcode_probe_argv_mode_comes_from_the_permission_spec() {
+        let spec = ProbeSpec::Zcode {
+            exe: "D:/Program Files/ZCode/ZCode.exe".into(),
+            cjs: "D:/Program Files/ZCode/resources/glm/zcode.cjs".into(),
+        };
+        let argv = probe_argv(&spec);
+        let want = PermissionSpec::zcode_default().flags();
+        let i = argv
+            .iter()
+            .position(|a| a == "--mode")
+            .expect("探针须带档位旗子");
+        assert_eq!(
+            &argv[i..i + want.len()],
+            want.as_slice(),
+            "探针档位段必须逐字来自 spec: {argv:?}"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--mode").count(),
+            1,
+            "档位旗子只此一处（不得既从 spec 注入又留字面）: {argv:?}"
+        );
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("--json"),
+            "`--json` 仍是尾 flag（档位段插在它之前，与真回合同序）"
+        );
+        // 与**真回合**同源：zcode::build_argv 的 argv 里是同一段旗子（同一 spec）
+        let turn = crate::inject::headless::zcode::build_argv(
+            &crate::inject::headless::zcode::ZcodeSpec::win("Z:/mam-nonexistent-zcode-root"),
+            "hi",
+            "sess_1",
+            "E:/p",
+            None,
+        );
+        assert!(
+            turn.argv
+                .windows(want.len())
+                .any(|w| w.iter().map(String::as_str).eq(want.iter().copied())),
+            "真回合 argv 必须带同一段档位旗子: {:?}",
+            turn.argv
         );
     }
 

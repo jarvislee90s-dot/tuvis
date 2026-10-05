@@ -431,6 +431,15 @@ describe("RemoteSection 无头注入总开关（H3 / Task 5）", () => {
     expect(screen.getByText(/the four terminal-injection tools are unaffected/i)).toBeTruthy();
   });
 
+  /// **H5（Task 10）：审批面状态如实披露**——`settings.remote.headlessApprovalPending`
+  /// 的**真实消费者**（此前该键无消费者；移动端回执卡占位因移动页无 i18n 运行时为内联字面）
+  it("无头分组渲染「审批待 C4」状态行（i18n 键有真实消费者，不谎报已可用）", async () => {
+    render(<RemoteSection />);
+    const note = await screen.findByTestId("headless-approval-pending-note");
+    expect(note.textContent).toContain("Headless channel approval");
+    expect(note.textContent).toContain("claude channel (C4)");
+  });
+
   it("缺键（旧后端载荷 undefined）也按关渲染——不谎报开", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "remote_status") return statusOf({ headlessEnabled: undefined });

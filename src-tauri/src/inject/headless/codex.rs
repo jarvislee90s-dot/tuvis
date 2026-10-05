@@ -8,11 +8,23 @@
 //! - APP 开（thread 被打开/索引）：`codex queue --thread <UUID> --message "<正文> [mobile 花名]"`
 //!   （`Usage: codex queue [OPTIONS] --thread <THREAD> --message <TEXT>`）；回执 =
 //!   `Queued message <msg-id>` + exit 0 —— **只证明入队，不证明投递**（消费确认见下）。
-//! - APP 关：`codex -C <项目> exec resume <UUID> "<正文> [mobile 花名]" --skip-git-repo-check`。
+//! - APP 关：`codex -C <项目> exec resume -c approval_policy=<档> <UUID> "<正文> [mobile 花名]"
+//!   --skip-git-repo-check`（H5 策略旗子见 [`exec_resume_argv`] 的实测说明）。
 //!   **`-C`/`--cd` 是顶层全局 flag，必须置于子命令之前**（`codex exec resume --help` 的选项表
-//!   里**没有** `-C` ⇒ 置于 `exec` 之后会 exit 2，Mac 实测同款）。本模块把 argv 构造成
+//!   里**没有** `-C` ⇒ 置于 `exec` 之后会 exit 2，Mac 实测同款），而 `-c/--config` 两处都在场
+//!   ⇒ 策略旗子放在子命令 `resume` **之后**。本模块把 argv 构造成
 //!   「`argv[0]` = 程序名 + `argv[1]` = `-C`」并**由单一构造器保证**（[`exec_resume_argv`]），
-//!   测试钉死位置（`argv[1] == "-C"` 且 `-C` 的下标恒小于 `exec`）。
+//!   测试钉死位置（`argv[1] == "-C"` 且 `-C` 的下标恒小于 `exec`、`-c` 恒大于 `resume`）。
+//!
+//! # ⚠️ 登记：`-c approval_policy=…` 是**行为面改动**，语义未实机验证（归 H11/M11 实机批次）
+//! Task 10（H5）给 exec 兜底路注入 `-c approval_policy=on-request` —— **本机只取证了旗子的
+//! 形态**（`--help` 解析 + 退出码，见 [`exec_resume_argv`]），**没取证它的行为语义**：非交互
+//! `exec` 面在模型请求批准时到底如何收场（即刻拒绝 / 自动批准 / 挂起不返回）目前只有 spec H5
+//! 的「turn 不阻塞」说法，无本机证据。`codex --help` 另有 `--approve-for-me`（把批准交给自动
+//! 审查）这一**候选形态**——本批不猜、不改。
+//! **义务归属**：codex/kimi/opencode 的策略**语义**随 **H11 / M11 实机探测**关账（spec §H5
+//! 「策略驱动」条 + 计划 Task 13 Step 5 USER-ASSIST 实机步与 Task 15 的 M11 验收行）——届时按
+//! 实测修订默认档、旗子形态与回执文案（含「需批准/被拒事件回流回执」是否真的成立）。
 //!
 //! # thread id = rollout 文件名里的 UUIDv7（**唯一**来源）
 //! `~/.codex/sessions/<Y/M/D>/rollout-<ts>-<uuid>.jsonl`；`session_index.jsonl` 实测滞后
@@ -71,6 +83,8 @@ use std::time::{Duration, Instant};
 use super::gate::{ProbeCache, ProbeKey, ProbeSpec, ProbeVerdict};
 use super::receipt::{Receipt, ReceiptStatus, Stage};
 use super::runner::{GlobalSem, RunnerCfg};
+// H5 权限档参数面（Task 10）：exec 兜底路的策略旗子从它取——**单一来源**，勿另写字面
+use super::PermissionSpec;
 // **只依赖底座**（Task 9 复审上提）：共享回合件定义在 [`super::turn`]，**不再从 zcode.rs 取**
 // ——WB（Task 11）/ H11（Task 13）接入同规，禁止让通道之间互相依赖
 use super::turn::{head_of, RunSeam};
@@ -295,6 +309,12 @@ pub fn normalize_project_path(p: &str) -> String {
 
 /// 分派（**纯函数**）：APP 开 → queue；关 → exec resume 兜底。`text` = **最终载荷**
 /// （调用方经 W4 单点 [`normalize::compose_injection`] 组装；本函数不二次签名）
+///
+/// **H5 权限档（Task 10）**：只有 exec 兜底路取档（[`PermissionSpec::codex_exec_default`]，
+/// 默认 `on-request`）——`-c approval_policy=…` 在 spawn 时给定，turn 不因审批阻塞。
+/// **queue 路没有审批面**（H8 定案）：入队只是短命进程，turn 执行与审批归 codex APP 自身，
+/// 故 Queue 臂**不取**任何权限档（也不得顺手加旗子——测试 `queue_plan_carries_no_permission_flag`
+/// 钉死）。
 pub fn dispatch(presence: AppPresence, thread: &str, project: &str, text: &str) -> Plan {
     match presence {
         AppPresence::Open => Plan::Queue {
@@ -303,7 +323,7 @@ pub fn dispatch(presence: AppPresence, thread: &str, project: &str, text: &str) 
             message: text.to_string(),
         },
         AppPresence::Closed => Plan::ExecResume {
-            argv: exec_resume_argv(project, thread, text),
+            argv: exec_resume_argv(project, thread, text, PermissionSpec::codex_exec_default()),
             thread: thread.to_string(),
             message: text.to_string(),
         },
@@ -312,6 +332,12 @@ pub fn dispatch(presence: AppPresence, thread: &str, project: &str, text: &str) 
 
 /// `codex queue --thread <UUID> --message <text>`（本机 `codex queue --help` usage 逐字：
 /// `Usage: codex queue [OPTIONS] --thread <THREAD> --message <TEXT>`）
+///
+/// **H5 边界落码（H8 定案）：queue 通道没有审批面。** 本命令只是把消息**入队**的短命
+/// 进程；turn 执行（含工具审批）归 codex APP 自身、按 APP 自己的配置走 ⇒ MAM 侧**没有**
+/// 可注入的权限档旗子。故本函数一个字都不加（由
+/// `queue_plan_carries_no_permission_flag` 钉死）——需要策略驱动的场合
+/// 走 `exec resume`（见 [`exec_resume_argv`]）。
 fn queue_argv(thread: &str, message: &str) -> Vec<String> {
     vec![
         CODEX_PROGRAM.to_string(),
@@ -323,22 +349,42 @@ fn queue_argv(thread: &str, message: &str) -> Vec<String> {
     ]
 }
 
-/// `codex -C <dir> exec resume <UUID> <text> --skip-git-repo-check`
+/// `codex -C <dir> exec resume -c approval_policy=<档> <UUID> <text> --skip-git-repo-check`
 ///
 /// **`-C` 全局 flag 前置（唯一构造点）**：本机 `codex exec resume --help` 的选项表里
 /// **没有** `-C`（只有 `-c/--config`）⇒ 它只能是顶层全局 flag，置于 `exec` 之后即 exit 2。
 /// argv 的 `-C` 位置由本函数**按构造保证**，测试再钉一次下标顺序（[`super::tests`]）
-fn exec_resume_argv(project: &str, thread: &str, message: &str) -> Vec<String> {
-    vec![
+///
+/// **H5 策略旗子位置（Task 10 实测）**：`-c/--config` 在**顶层与 `exec resume` 两处**都在场
+/// ——`codex exec resume -c approval_policy=on-request --help` ⇒ exit 0；对照
+/// `codex exec resume -C E:/t2 --help` ⇒ exit 2 `unexpected argument '-C' found`
+/// （`-C` 是全局-only 的证明）。故 `-c` 放在子命令 `resume` **之后**（照 usage
+/// `codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]` 的选项前置序），与 `-C` 的全局前置
+/// 方向相反——**勿挪位**，测试钉死下标。
+/// 档位来自 [`PermissionSpec`]（[`PermissionSpec::codex_exec_default`] = `on-request`）。
+///
+/// **⚠️ 登记（行为面未实机验证 → 归 H11/M11）**：`-c approval_policy=<档>` 的**语义**
+/// （非交互 exec 面在模型需批准时如何收场、`--approve-for-me` 是否更合适）**无本机证据**，
+/// 本批只取证旗子形态；义务随 **H11/M11 实机探测**关账——完整指针见模块头「⚠️ 登记」段。
+fn exec_resume_argv(
+    project: &str,
+    thread: &str,
+    message: &str,
+    perm: PermissionSpec,
+) -> Vec<String> {
+    let mut argv = vec![
         CODEX_PROGRAM.to_string(),
         "-C".to_string(),
         normalize_project_path(project),
         "exec".to_string(),
         "resume".to_string(),
-        thread.to_string(),
-        message.to_string(),
-        SKIP_GIT_REPO_CHECK.to_string(),
-    ]
+    ];
+    // H5 策略旗子（`-c approval_policy=<档>`）：档由 spec 单点产生
+    argv.extend(perm.flags().into_iter().map(str::to_string));
+    argv.push(thread.to_string());
+    argv.push(message.to_string());
+    argv.push(SKIP_GIT_REPO_CHECK.to_string());
+    argv
 }
 
 // ============================================================
@@ -1322,6 +1368,8 @@ pub mod test_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // H5 档位枚举（Task 10）：仅测试面直取（生产面只用 `PermissionSpec::codex_exec_default`）
+    use crate::inject::headless::CodexApprovalPolicy;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -1377,7 +1425,12 @@ mod tests {
     }
 
     /// exec resume 形态逐字；**`-C` 位置由构造单点保证**（置于 `exec` 之后 = exit 2，
-    /// 本机 `codex exec resume --help` 选项表里没有 `-C` ⇒ 它只能是顶层全局 flag）
+    /// 本机 `codex exec resume --help` 选项表里没有 `-C` ⇒ 它只能是顶层全局 flag）。
+    /// **H5 策略旗子（Task 10）**：`-c approval_policy=on-request` 紧接 `resume`——
+    /// 本机 `codex exec resume --help` 的选项表**列有** `-c, --config <key=value>`，
+    /// 且实测 `codex exec resume -c approval_policy=on-request --help` 退出码 0
+    /// （对照：`codex exec resume -C E:/t2 --help` ⇒ exit 2 `unexpected argument '-C' found`）
+    /// ⇒ 子命令后接受 `-c`，位置照 usage `[OPTIONS] [SESSION_ID] [PROMPT]` 前置。
     #[test]
     fn exec_resume_argv_pins_global_c_before_subcommand() {
         let p = super::dispatch(AppPresence::Closed, UUID, "E:/t2", "hi [mobile iPad]");
@@ -1389,11 +1442,13 @@ mod tests {
                 "E:/t2".into(),
                 "exec".into(),
                 "resume".into(),
+                "-c".into(),
+                "approval_policy=on-request".into(),
                 UUID.into(),
                 "hi [mobile iPad]".into(),
                 SKIP_GIT_REPO_CHECK.into(),
             ],
-            "exec resume argv 必须逐字对齐 spec H8（`-C` 前置 + 尾 flag）"
+            "exec resume argv 必须逐字对齐 spec H8 + H5 策略旗子（`-C` 全局前置、`-c` 子命令内）"
         );
         let argv = p.argv();
         let c = argv
@@ -1410,7 +1465,66 @@ mod tests {
         );
         assert_eq!(c, 1, "`-C` 恒在 argv[1]（程序名之后、一切子命令之前）");
         assert_eq!(argv[2], "E:/t2", "`-C` 的取值紧跟其后");
+        // H5 策略旗子：子命令**之内**（`resume` 之后）——与 `-C` 的全局前置相反，勿挪
+        let resume_idx = argv
+            .iter()
+            .position(|a| a == "resume")
+            .expect("resume 必须在 argv 里");
+        let policy = argv
+            .iter()
+            .position(|a| a == "-c")
+            .expect("H5 策略旗子必须在");
+        assert!(
+            policy > resume_idx,
+            "`-c` 下标（{policy}）必须大于子命令 `resume` 下标（{resume_idx}）——它是子命令内选项"
+        );
+        assert_eq!(
+            argv[policy + 1],
+            "approval_policy=on-request",
+            "策略旗子必须带默认档 on-request"
+        );
         assert_eq!(p.kind(), PlanKind::ExecResume);
+    }
+
+    /// H5 边界落码（H8 定案）：**queue 通道没有审批面**——`queue` 只是把消息入队的短命
+    /// 进程，turn 执行（含工具审批）归 codex APP 自身、按 APP 自己的配置走 ⇒ MAM 侧没有
+    /// 可注入的权限档旗子。本测钉死这条边界（防「顺手也给 queue 加一个 -c/--mode」）。
+    #[test]
+    fn queue_plan_carries_no_permission_flag() {
+        let p = super::dispatch(AppPresence::Open, UUID, "E:/t2", "hi [mobile iPad]");
+        let argv = p.argv();
+        assert!(
+            !argv.iter().any(|a| matches!(a.as_str(), "-c" | "--mode")),
+            "queue 通道无审批面（H8 定案）——不得注入权限档旗子: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("approval_policy")),
+            "queue 不得携带审批策略: {argv:?}"
+        );
+    }
+
+    /// H5 策略档**参数化**：exec resume 的旗子随 [`PermissionSpec`] 变（本轮只 spawn 选档 +
+    /// 展示；改档重试属后续批次）；**默认档恒 on-request**（dispatch 用的那条）
+    #[test]
+    fn exec_resume_policy_flag_follows_the_spec() {
+        let alt = super::exec_resume_argv(
+            "E:/t2",
+            UUID,
+            "hi",
+            PermissionSpec::CodexExec(CodexApprovalPolicy::Never),
+        );
+        assert!(
+            alt.windows(2).any(|w| w == ["-c", "approval_policy=never"]),
+            "换档必须换旗子（策略驱动）: {alt:?}"
+        );
+        let d = super::dispatch(AppPresence::Closed, UUID, "E:/t2", "hi");
+        assert!(
+            d.argv()
+                .windows(2)
+                .any(|w| w == ["-c", "approval_policy=on-request"]),
+            "分派默认档必须 on-request: {:?}",
+            d.argv()
+        );
     }
 
     /// 通道名映射单点（回执封套/Audit channel 列同源，勿在端点另抄）
