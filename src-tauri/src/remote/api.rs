@@ -1097,16 +1097,17 @@ fn headless_blocked(
     }
 }
 
-/// **无头分派未接线的诚实拒绝码**（Task 7 过渡态；**Task 8/9 起只覆盖尚未接线的家**）：
+/// **无头分派未接线的诚实拒绝码**（Task 7 过渡态；**Task 8/9/11 起只覆盖尚未接线的家**）：
 /// 路由已判「本条只能经无头通道投递」（无头候选在场且无终端候选），但无头执行器逐家落地
 /// ——接线前**不投递也不入队**（绝不落终端注入臂：zcode/workbuddy 的 pid 不是终端宿主，
 /// 终端注入会打错窗口）。本拒绝是**入队侧**的保证：它在唯一生产 INSERT 之前拦下，故无头
 /// 条目进不了队列。
 ///
-/// **Task 8/9 落地后的覆盖面**：**zcode 已摘出**（`Headless(Zcode)` → [`zcode_headless_dispatch`]）、
+/// **Task 8/9/11 落地后的覆盖面**：**zcode 已摘出**（`Headless(Zcode)` → [`zcode_headless_dispatch`]）、
 /// **codex 已摘出**（`Headless(CodexQueue|CodexExec)` → [`codex_headless_dispatch`]，H8 按
-/// APP 在场分派 queue/exec resume）。仍在册的家 = `WbAcp`（Task 11）、`ClaudeP` / `KimiP` /
-/// `OpencodeRun`（Task 13）——**这些必须继续拒在本码上，且不得落终端注入臂**
+/// APP 在场分派 queue/exec resume）、**workbuddy 已摘出**（`Headless(WbAcp)` →
+/// [`wb_headless_dispatch`]，H9 ACP HTTP）。仍在册的家 = `ClaudeP` / `KimiP` /
+/// `OpencodeRun`（Task 13，H11 三家）——**这三家必须继续拒在本码上，且不得落终端注入臂**
 /// （⑤b 的 `has_terminal_candidate` 门 + 本臂都在 INSERT 之前）。
 ///
 /// **投递侧重判已补**（Task 8 义务 2，收口点见 `inject/queue.rs::try_flush_with`）：入队
@@ -1115,7 +1116,7 @@ fn headless_blocked(
 pub(crate) const HEADLESS_PENDING_CODE: &str = "headless_pending";
 /// 上述拒绝的置灰/回执文案（与 `HEADLESS_DISABLED_REASON` 同款：后端给文案、前端只渲染）
 pub(crate) const HEADLESS_PENDING_REASON: &str =
-    "无头通道分派待接线（H9–H11 逐家落地中），本次不投递";
+    "无头通道分派待接线（H11 三家 CLI 落地中），本次不投递";
 
 // ============================================================
 // H7 zcode 无头分派（Task 8）
@@ -1301,10 +1302,11 @@ pub(crate) async fn zcode_headless_dispatch(
     if let Some(reason) = zcode::slash_refusal(text) {
         return ctx.refuse(st, Stage::Refused, reason);
     }
-    // 3) 会话串行锁
+    // 3) 会话串行锁（**声明通道**：取消审计行 channel 列从槽位取——Task 11 复审 Important 2）
     if !crate::inject::headless::turn::registry().begin(
         &session.id,
-        zcode::TurnSlot::placeholder(&ctx.tool, ctx.content.clone()),
+        zcode::TurnSlot::placeholder(&ctx.tool, ctx.content.clone())
+            .with_channel(HeadlessKind::Zcode.wire_name()),
     ) {
         return ctx.refuse(
             st,
@@ -1555,10 +1557,13 @@ pub(crate) async fn codex_headless_dispatch(
     let payload = crate::inject::normalize::compose_injection(device_name, text);
     let plan = codex::dispatch(presence, &tref.id, &session.project_path, &payload);
     ctx.content = payload;
-    // 4) 会话串行锁（占位后每条失败路径都必须注销槽位——否则该会话被自己的锁挡死）
+    // 4) 会话串行锁（占位后每条失败路径都必须注销槽位——否则该会话被自己的锁挡死）。
+    //    **声明计划通道**：取消审计行 channel 列从槽位取（Task 11 复审 Important 2）——
+    //    改道（exec→queue）时槽位仍是**计划**通道，取消行口径以此为准（回合行记实际走向）
     if !codex::registry().begin(
         &session.id,
-        codex::TurnSlot::placeholder(&tool, ctx.content.clone()),
+        codex::TurnSlot::placeholder(&tool, ctx.content.clone())
+            .with_channel(planned_kind.wire_name()),
     ) {
         return ctx.refuse(
             st,
@@ -1620,6 +1625,220 @@ pub(crate) async fn codex_headless_dispatch(
     json_no_store(
         StatusCode::OK,
         headless_envelope(out.plan_used.headless_kind(), &out.receipt, visibility),
+    )
+}
+
+// ============================================================
+// H9 WorkBuddy ACP 无头分派（Task 11；HTTP 型——不 spawn 进程）
+// ============================================================
+
+/// WB 回合的审计上下文（设备身份由端点注入；通道恒 `headless_wb_acp`——
+/// H9 只有 ACP 一条路，没有 codex 那样的改道分叉）
+#[derive(Clone)]
+struct WbTurnCtx {
+    device_id: String,
+    device_name: String,
+    tool: String,
+    sid: String,
+    content: String,
+}
+
+impl WbTurnCtx {
+    fn audit_ctx(&self) -> crate::inject::headless::HeadlessAuditCtx {
+        crate::inject::headless::HeadlessAuditCtx {
+            device_id: self.device_id.clone(),
+            device_name: self.device_name.clone(),
+            agent_type: self.tool.clone(),
+            session_id: self.sid.clone(),
+            channel: crate::inject::routing::HeadlessKind::WbAcp
+                .wire_name()
+                .to_string(),
+            content: self.content.clone(),
+        }
+    }
+
+    fn audit(&self, st: &Arc<RemoteState>, action: &str, result: &str, duration_ms: u64) {
+        audit_headless_ctx(st, &self.audit_ctx(), action, result, duration_ms);
+    }
+
+    /// 拒绝/失败臂（同 [`ZcodeTurnCtx::refuse`]：HTTP 200 + `receipt.status=failed` + 落账；
+    /// **不碰串行锁**——占位前的拒绝若误注销会把**别人的**在飞回合槽位注销掉）
+    fn refuse(
+        &self,
+        st: &Arc<RemoteState>,
+        stage: crate::inject::headless::receipt::Stage,
+        reason: &str,
+    ) -> Response {
+        let receipt = crate::inject::headless::receipt::Receipt::failed(stage, reason)
+            .with_session(&self.sid);
+        self.audit(
+            st,
+            crate::inject::headless::ACTION_HEADLESS,
+            &crate::inject::headless::turn::receipt_result_word(&receipt),
+            receipt.duration_ms,
+        );
+        json_no_store(
+            StatusCode::OK,
+            headless_envelope(crate::inject::routing::HeadlessKind::WbAcp, &receipt, None),
+        )
+    }
+}
+
+/// 真回合执行（**HTTP 型**：不 spawn 进程——ACP 链全在 [`crate::inject::headless::wb_acp`]、
+/// IO 只经注入的 HTTP 缝）。
+///
+/// **阻塞纪律**：HTTP 缝是同步的，故整条链放 `spawn_blocking`——**绝不在 async 运行时
+/// 线程上阻塞**（ACP prompt 的流读取可能跑满 watchdog）。超时/并发经
+/// [`crate::inject::headless::runner_from_conn`] 读设置（**不自建 `GlobalSem`**）。
+///
+/// **取消**：本通道**不武装取消靶子**（槽位只作会话串行锁）——ACP 的 `session/cancel`
+/// 通知本批未接线，取消端点对 WB 回合如实报「未送达」；**不谎报已取消**。理由：武装靶子会
+/// 让取消审计行的 channel 列写成别的通道名（该端点当前把通道写死为 zcode），那是假值。
+/// 回合终结后落 `headless` 审计行并注销串行锁。
+async fn run_wb_turn(
+    st: Arc<RemoteState>,
+    ctx: WbTurnCtx,
+    args: crate::inject::headless::wb_acp::WbTurnArgs,
+    deps: crate::inject::headless::wb_acp::WbDeps,
+) -> crate::inject::headless::wb_acp::WbTurnOutcome {
+    use crate::inject::headless::wb_acp::WbTurnOutcome;
+    let sid = args.sid.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        crate::inject::headless::wb_acp::run_turn(&args, &deps)
+    });
+    let out = match task.await {
+        Ok(o) => o,
+        Err(e) => {
+            log::error!("workbuddy 无头回合任务异常: {e}");
+            crate::inject::headless::turn::registry().end(&sid);
+            return WbTurnOutcome {
+                receipt: crate::inject::headless::receipt::Receipt::failed(
+                    crate::inject::headless::receipt::Stage::ChannelError,
+                    "回合内部任务异常终止（结果未知，请在 WorkBuddy 应用内确认）",
+                )
+                .with_session(&sid),
+                endpoint: None,
+                verdict: None,
+                corroboration: Default::default(),
+            };
+        }
+    };
+    ctx.audit(
+        &st,
+        crate::inject::headless::ACTION_HEADLESS,
+        &crate::inject::headless::turn::receipt_result_word(&out.receipt),
+        out.receipt.duration_ms,
+    );
+    crate::inject::headless::turn::registry().end(&sid);
+    out
+}
+
+/// **WorkBuddy ACP 无头分派**（H9 / Task 11；`session_send` ⑤b 的 `Headless(WbAcp)` 臂）。
+///
+/// 顺序与理由（每步都有判据依赖，勿随意改）：
+/// 1. **平台门**：ACP 端点发现只有 Windows（端口指纹）/ macOS（心跳 endpoint）两形态
+///    ——其他平台如实拒绝（投递前、零字节）；
+/// 2. **命令形态/正文组装**（W4 单点 `compose_injection`：换行归一 + 移动端尾签名）
+///    ——此后审计 `content` 是**最终载荷**（与 ACP prompt 同源），组装前的行记用户原文；
+/// 3. **回合依赖装配**（home 缝 → 探针/HTTP 缝；watchdog 经
+///    [`crate::inject::headless::runner_from_conn`] 读设置、并发用**进程级**
+///    [`crate::inject::headless::runner::global_sem`]）——**排在串行锁之前**（锁内的路径越少越好）；
+/// 4. **会话串行锁**（[`crate::inject::headless::turn::registry`]）：同会话重叠回合如实拒绝
+///    （不排队、不覆盖）——**不武装取消靶子**（见 [`run_wb_turn`] 文档）；占位后唯一路径是
+///    回合自身注销，故**不在此注销**（否则会把别人的在飞槽位注销掉）；
+/// 5. **回合**（detached task：客户端断连不打断已起跑的回合——**正文已进 ACP，丢回执可以、
+///    丢用户消息不行**；回执/审计/注销都在任务内完成）；
+/// 6. 回执封套 + 可见性档（**单源** = Task 7 路由表：ACP 写入 APP 内 ⇒ realtime）。
+pub(crate) async fn wb_headless_dispatch(
+    st: &Arc<RemoteState>,
+    device_id: &str,
+    device_name: &str,
+    session: &crate::session::Session,
+    text: &str,
+) -> Response {
+    use crate::inject::headless::receipt::Stage;
+    use crate::inject::headless::wb_acp;
+    use crate::inject::routing::{HeadlessKind, RouteOutcome};
+
+    let os = std::env::consts::OS;
+    let tool = session.agent_type.tool_id().to_string();
+    let mut ctx = WbTurnCtx {
+        device_id: device_id.to_string(),
+        device_name: device_name.to_string(),
+        tool: tool.clone(),
+        sid: session.id.clone(),
+        content: text.to_string(),
+    };
+    // 1) 平台门（投递前拒绝：本平台没有该端点发现形态 —— 回合未起跑、零字节投递）
+    if os != "windows" && os != "macos" {
+        return ctx.refuse(
+            st,
+            Stage::Refused,
+            "WorkBuddy ACP 通道只支持 Windows / macOS（端点发现两形态：心跳 endpoint / 端口指纹）",
+        );
+    }
+    // 2) 正文组装（W4 单点：换行归一 + 移动端尾签名）——ACP prompt 载荷与审计同源
+    let payload = crate::inject::normalize::compose_injection(device_name, text);
+    ctx.content = payload.clone();
+    // 3) 回合依赖（探针/HTTP 缝 + home 缝；超时/并发读取口径单点复用 runner_from_conn）。
+    //    **本通道不 spawn 进程**：借 `runner_from_conn` 只为「H4 设置 → 回合超时 + 全局
+    //    并发上限」这条**单一读取路径**（杜绝「设置页 90s、通道仍跑 600s」的双轨），
+    //    返回的 cfg 本身不执行；程序名只作标签
+    let home = (st.home_source)().map(std::path::PathBuf::from);
+    let program = HeadlessKind::WbAcp.wire_name();
+    let watchdog_ms = st
+        .store
+        .with(|c| crate::inject::headless::runner_from_conn(program, c).watchdog_timeout_ms());
+    let deps = wb_acp::deps_for(
+        os,
+        home,
+        watchdog_ms,
+        crate::inject::headless::runner::global_sem(),
+    );
+    let args = wb_acp::WbTurnArgs {
+        sid: session.id.clone(),
+        project: session.project_path.clone(),
+        payload,
+        pid: session.pid,
+    };
+    // 4) 会话串行锁（占位；不武装取消靶子——见 run_wb_turn 文档）。
+    //    **声明通道**：取消端点据此分辨「本通道未接线取消（回合仍在跑）」与「已终结」
+    //    （`headless_wb_acp`，取消审计行 channel 列的单点来源——Task 11 复审 Important 2/3）
+    if !crate::inject::headless::turn::registry().begin(
+        &session.id,
+        crate::inject::headless::turn::TurnSlot::placeholder(&tool, ctx.content.clone())
+            .with_channel(HeadlessKind::WbAcp.wire_name()),
+    ) {
+        return ctx.refuse(
+            st,
+            Stage::Refused,
+            "该会话已有在飞的无头回合（MAM 串行锁，防同会话两回合交错）——本条未投递，\
+             请等回执后再发",
+        );
+    }
+    // 5) 回合（detached spawn；占位后唯一路径 = 回合自身注销槽位）
+    let task = tokio::spawn(run_wb_turn(st.clone(), ctx.clone(), args, deps));
+    let out = match task.await {
+        Ok(o) => o,
+        Err(e) => {
+            // 理论不可达（run_wb_turn 内部吞掉 spawn_blocking 的 JoinError）；防御性保留
+            log::error!("workbuddy 无头回合任务异常: {e}");
+            crate::inject::headless::turn::registry().end(&session.id);
+            return ctx.refuse(
+                st,
+                Stage::ChannelError,
+                "回合内部任务异常终止（结果未知，请在 WorkBuddy 应用内确认）",
+            );
+        }
+    };
+    // 6) 回执封套 + 可见性档（单源 = Task 7 路由表的 Injectable 结论）
+    let visibility = match crate::inject::routing::route(&tool, session.form, session.pid, os) {
+        RouteOutcome::Injectable { visibility, .. } => Some(visibility),
+        _ => None,
+    };
+    json_no_store(
+        StatusCode::OK,
+        headless_envelope(HeadlessKind::WbAcp, &out.receipt, visibility),
     )
 }
 
@@ -1752,15 +1971,18 @@ pub async fn session_send(
             }),
         );
     }
-    // ⑤b 无头通道分派点（**Task 8 起 zcode 真分派、Task 9 起 codex 真分派**，其余家按
-    //     Task 11/13 逐家落地）：路由判出无头候选而**无终端候选** = 本条只能经无头通道投递。
+    // ⑤b 无头通道分派点（**Task 8 起 zcode 真分派、Task 9 起 codex 真分派、
+    //     Task 11 起 workbuddy 真分派**，其余家按 Task 13 逐家落地）：路由判出无头候选而
+    //     **无终端候选** = 本条只能经无头通道投递。
     //     - `Headless(Zcode)` → [`zcode_headless_dispatch`]（每回合 spawn、串行锁、版本门控、
     //       审计、回执封套；**绝不入队**——裁决 8）；
     //     - `Headless(CodexQueue | CodexExec)` → [`codex_headless_dispatch`]（H8：APP 在场
     //       分派 queue/exec resume + 消费确认自建；同样每回合 spawn、绝不入队）；
-    //     - 其余无头家（WorkBuddy ACP、H11 三家）执行器未接线 → 照旧如实拒绝
+    //     - `Headless(WbAcp)` → [`wb_headless_dispatch`]（H9：HTTP 型——connect→initialize→
+    //       load/new→prompt，端点不可用/已结束会话都**如实回执**；同样绝不入队）；
+    //     - 其余无头家（H11 三家 CLI）执行器未接线 → 照旧如实拒绝
     //       （[`HEADLESS_PENDING_CODE`]），**绝不落终端注入臂**。
-    //     三臂都在唯一生产 INSERT（⑥）之前：无头条目进不了队列。
+    //     各臂都在唯一生产 INSERT（⑥）之前：无头条目进不了队列。
     if let Some(kind) = crate::inject::routing::headless_kind_of(&outcome) {
         if !crate::inject::routing::has_terminal_candidate(&outcome) {
             return match kind {
@@ -1772,6 +1994,9 @@ pub async fn session_send(
                 | crate::inject::routing::HeadlessKind::CodexExec => {
                     codex_headless_dispatch(&st, &device_id, &device_name, &session, &req.text)
                         .await
+                }
+                crate::inject::routing::HeadlessKind::WbAcp => {
+                    wb_headless_dispatch(&st, &device_id, &device_name, &session, &req.text).await
                 }
                 _ => json_no_store(
                     StatusCode::FORBIDDEN,
@@ -2051,9 +2276,9 @@ pub async fn session_send(
 
 /// routing Channel → wire 小写字符串（枚举未派生 serde，端点侧手工映射防漂移）。
 /// 无头通道名**经 [`crate::inject::routing::HeadlessKind::wire_name`]**——与审计 channel
-/// 列同源（词表只此一份，别在这里重抄）。**Task 8/9 起已接线的无头家**（zcode、codex）在
-/// `session_send_info` 的 `channels` 里经本函数透出（候选原样取自路由表）；未接线的家
-/// （WB / H11 三家）仍落 `headless_pending` 拒绝（见 [`HEADLESS_PENDING_CODE`]）。
+/// 列同源（词表只此一份，别在这里重抄）。**Task 8/9/11 起已接线的无头家**（zcode、codex、
+/// workbuddy）在 `session_send_info` 的 `channels` 里经本函数透出（候选原样取自路由表）；
+/// 未接线的家（H11 三家 CLI）仍落 `headless_pending` 拒绝（见 [`HEADLESS_PENDING_CODE`]）。
 fn channel_wire(c: &crate::inject::routing::Channel) -> &'static str {
     use crate::inject::routing::Channel;
     match c {
@@ -2180,8 +2405,37 @@ pub async fn session_send_info(
                 "channels": channels,
                 "visibility": visibility,
             })
+        } else if kind == crate::inject::routing::HeadlessKind::WbAcp {
+            // **Task 11：WorkBuddy ACP 已真分派**（H9）→ 输入区可用 + 通道名 + **路由表
+            // 可见性档**（ACP 写入 APP 内 ⇒ 实时）。运行时不可用（远程控制端点未启用）
+            // 由**回执**如实上报（`refused` + 启用条件文案）——不在静态能力面谎报置灰：
+            // 端点按需生成（心跳转瞬即逝、Win 端要用户在 APP 里开开关），静态判定必然误判。
+            //
+            // **残留 UX 缺口（登记，主线跟进——Task 11 复审裁决保留本口径）**：从未启用远程
+            // 控制的机器上输入区**仍然亮着**，每次发送都会收到 `refused`。静态置灰做不到
+            // （判不准），后续可考虑：把最近一次 `refused` 的原因回显到输入区，或按
+            // 「心跳/宿主进程在场性」做**软提示**（提示而不置灰）——本批不做。
+            let (channels, visibility) = match &outcome {
+                crate::inject::routing::RouteOutcome::Injectable {
+                    candidates,
+                    visibility,
+                } => (
+                    candidates.iter().map(channel_wire).collect::<Vec<_>>(),
+                    visibility_wire(visibility),
+                ),
+                // 不可达（上面已 filter 出 headless_only）：如实保守回本通道首选档
+                _ => (
+                    vec![kind.wire_name()],
+                    visibility_wire(&crate::inject::routing::Visibility::Realtime),
+                ),
+            };
+            serde_json::json!({
+                "injectable": true,
+                "channels": channels,
+                "visibility": visibility,
+            })
         } else {
-            // 其余无头家（WB/H11）执行器未接线：发送必败的会话不得在这里报
+            // 其余无头家（H11 三家 CLI）执行器未接线：发送必败的会话不得在这里报
             // injectable:true（见 [`HEADLESS_PENDING_CODE`]）
             serde_json::json!({
                 "injectable": false,
@@ -2229,9 +2483,14 @@ pub struct HeadlessCancelReq {
 /// - 无在飞回合 → `{cancelled:false, reason}`（**不落审计**——没有取消动作发生）；
 /// - 取消送达（**先到者生效**）→ `{cancelled:true}` + `headless_cancel` 审计行
 ///   （Task 6 词表：`ACTION_HEADLESS_CANCEL`；设备 = **按下取消的这台设备**，正文/工具 =
-///   回合自身——与 `headless` 行同源；耗时 = 回合起跑到取消送达的墙钟）；
-/// - 迟到取消（回合已终结 / watchdog 先到 / 探针期靶子未武装）→ `{cancelled:false, reason}`，
-///   **不落取消行**（watchdog 先到的形态由回合自身记 `headless` + stage=timeout，Task 6 口径）。
+///   回合自身——与 `headless` 行同源；耗时 = 回合起跑到取消送达的墙钟；
+///   **通道列取自槽位**（[`crate::inject::headless::turn::CancelSnapshot::channel`]），
+///   **不再写死常量**——Task 11 复审 Important 2：写死会把 codex/WB 的取消记成 zcode）；
+/// - 迟到取消（回合已终结 / 已被取消）→ `{cancelled:false, reason}`，**不落取消行**；
+/// - **未送达但要分辨「回合还在跑」的两形态**（Task 11 复审 Important 3，措辞必须诚实）：
+///   ① 通道本批**未接线取消**（H9 WB ACP 的 `session/cancel` 通知未实现）⇒
+///   [`CANCEL_NOT_WIRED_REASON`]——**回合仍在运行**，不是「已终结」；
+///   ② 已接线通道但靶子**尚未武装**（版本门控/预检窗口）⇒ [`CANCEL_NOT_ARMED_REASON`]。
 ///
 /// 取消只是「请求」：槽位由**回合自身**注销（[`crate::inject::headless::turn::TurnRegistry::end`]），
 /// 本端点不注销——否则回合结束前的第二发取消会看到空槽位而谎报「无在飞回合」。
@@ -2247,9 +2506,8 @@ pub async fn session_headless_cancel(
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
-    let Some((content, agent_type, elapsed_ms)) =
-        crate::inject::headless::turn::registry().slot_snapshot(&sid)
-    else {
+    // 一次取全：内容/工具/**通道**/靶子是否武装/已跑时长（分两次查表会留竞态窗口）
+    let Some(snap) = crate::inject::headless::turn::registry().cancel_snapshot(&sid) else {
         return json_no_store(
             StatusCode::OK,
             serde_json::json!({
@@ -2258,27 +2516,49 @@ pub async fn session_headless_cancel(
             }),
         );
     };
+    // 通道名的**单点来源** = 槽位声明（空 = 未声明：如实记哨兵词 + warn，不冒充既有通道）
+    let channel = if snap.channel.trim().is_empty() {
+        log::warn!(
+            "headless cancel: 槽位未声明通道（会话 {sid}）——审计按 headless_unattributed 如实落账"
+        );
+        CANCEL_UNATTRIBUTED_CHANNEL.to_string()
+    } else {
+        snap.channel.clone()
+    };
     match crate::inject::headless::turn::registry().request_cancel(&sid) {
         Some(true) => {
             let ctx = crate::inject::headless::HeadlessAuditCtx {
                 device_id,
                 device_name,
-                agent_type,
+                agent_type: snap.agent_type,
                 session_id: sid,
-                channel: crate::inject::routing::HeadlessKind::Zcode
-                    .wire_name()
-                    .to_string(),
-                content,
+                channel,
+                content: snap.content,
             };
             audit_headless_ctx(
                 &st,
                 &ctx,
                 crate::inject::headless::ACTION_HEADLESS_CANCEL,
                 "cancelled",
-                elapsed_ms,
+                snap.elapsed_ms,
             );
             json_no_store(StatusCode::OK, serde_json::json!({ "cancelled": true }))
         }
+        // 未送达但回合**仍在跑**：本通道未接线取消（WB）或靶子尚未武装（版本门控/预检）
+        Some(false) if !snap.cancel_wired && cancel_is_unwired_for(&channel) => json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "cancelled": false,
+                "reason": CANCEL_NOT_WIRED_REASON,
+            }),
+        ),
+        Some(false) if !snap.cancel_wired => json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "cancelled": false,
+                "reason": CANCEL_NOT_ARMED_REASON,
+            }),
+        ),
         // Some(false) = 回合已终结/已取消（先到者生效）；None = 槽位在快照与请求之间被
         // 回合注销（并发窗口）——两形态都如实报「未送达」，不落账
         _ => json_no_store(
@@ -2290,6 +2570,28 @@ pub async fn session_headless_cancel(
         ),
     }
 }
+
+/// **本批未接线取消**的无头通道（H4 取消面）——判定单点，措辞与测试都读它，别另抄通道名。
+///
+/// 目前只有 H9 WorkBuddy ACP：ACP 的 `session/cancel` 通知未实现（Task 11 登记项，主线跟进），
+/// 故其槽位**永远不武装靶子**——若不分辨，端点会把「回合仍在运行」说成「回合已终结」，
+/// 用户据此以为投递已中止（Task 11 复审 Important 3）。
+fn cancel_is_unwired_for(channel: &str) -> bool {
+    channel == crate::inject::routing::HeadlessKind::WbAcp.wire_name()
+}
+
+/// 未声明通道的审计哨兵词（不冒充任何既有通道；正常生产路径不会出现——三条分派臂都声明）
+pub(crate) const CANCEL_UNATTRIBUTED_CHANNEL: &str = "headless_unattributed";
+
+/// 「本通道未接线取消」的诚实措辞（**回合仍在运行**——不是「已终结」）
+pub(crate) const CANCEL_NOT_WIRED_REASON: &str =
+    "本通道尚未接线取消（WorkBuddy ACP 的 `session/cancel` 通知未实现）：该回合**仍在运行**、\
+     本次未取消——请等它跑完（watchdog 到点会自动终结并如实回执）";
+
+/// 「靶子尚未武装」的诚实措辞（版本门控/预检窗口；**回合仍在运行**）
+pub(crate) const CANCEL_NOT_ARMED_REASON: &str =
+    "取消暂不可送达（回合仍在前置检查/版本门控阶段，取消靶子尚未武装）：该回合**仍在运行**、\
+     本次未取消——请稍后重试";
 
 /// GET /m/api/v1/session-queue?session_id=（W4 排队视图）：该会话全部待发消息
 /// FIFO（position = 1 起的队位；content 已是入队时 compose 完成的最终注入文本）。

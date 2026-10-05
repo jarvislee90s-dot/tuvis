@@ -342,9 +342,11 @@ pub(crate) const DB_ACTIVITY_WINDOW_MS: i64 = 24 * 3600 * 1000;
 /// 安全性（消费面已核，**Task 7 起机制已变、结论不变**）：①注入路由
 /// `inject::routing::route` 对 workbuddy **不看 pid**——工具级恒判无头通道
 /// （`Headless(WbAcp)`），故 pid=0 的哨兵卡在端点侧先被 H3 门拦（remote/api.rs ④：
-/// 开关关闭 → 403 `headless_disabled`）、开关开启则落无头分派点（⑤b → 403
-/// `headless_pending`，Task 8 接线后走 H9 ACP 通道）——**任何一种都不会经终端注入器
+/// 开关关闭 → 403 `headless_disabled`）、开关开启则走 **H9 ACP 无头分派**
+/// （`wb_headless_dispatch`：端点未启用 → `refused` 如实拒绝；**Task 11 已接线**——
+/// 旧注释的「⑤b → 403 `headless_pending`」已作废）——**任何一种都不会经终端注入器
 /// 投递**（旧注释的「先判 pid == 0 → no_process」已被 Task 7 的无头路由取代）；
+/// **ACP 会话**（不进 db 的那批）由 [`acp_transcript_cards`] 以同一 pid 哨兵补卡；
 /// ②跳转 Windows 走 resolve_and_focus(pid=0) 失败 → pid_dead → reactivate_tool_app
 /// 按工具激活宿主 APP（App 形态深链分支只看 sessionId）；macOS 侧
 /// should_try_deep_link(0, _) / tool_enumeration_allowed(0, _) 对 pid=0 均放行；
@@ -548,6 +550,45 @@ fn heartbeat_path(home: &Path, pid: u32) -> PathBuf {
     home.join(".workbuddy")
         .join("sessions")
         .join(format!("{}.json", pid))
+}
+
+/// 心跳里的 **ACP 端点字段**（H9 端点发现，Task 11）。
+///
+/// **为什么只读这一个字段、不扩 [`Heartbeat`]**：`Heartbeat` 被多处测试字面量构造
+/// （加字段会波及一批无关用例），而端点发现只需要 `endpoint` 一个值；两字段名都是
+/// **实测样本**所见——`endpoint`（spec §H9 定案字段）与 `url`（本仓库既有心跳样本
+/// `HEARTBEAT_SERVE` / 本机 `sessions/2664.json` 两者并存），取首个在场者。
+#[derive(Debug, Default, Deserialize)]
+struct HeartbeatEndpoint {
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// 心跳端点快照（H9 端点发现的**唯一读口**，定义在读侧：心跳格式归本模块管）。
+///
+/// `usable` 复用 [`heartbeat_is_usable`]（严格 UUID + 非 prewarm + 新鲜 < 90s +
+/// 文件名/内容 pid 一致）——**陈旧心跳的 endpoint 绝不可用**（本机实测：37 个陈旧心跳
+/// 文件全带 endpoint，但进程早已退出、端口不再监听）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartbeatSnapshot {
+    pub session_id: String,
+    pub endpoint: Option<String>,
+    pub usable: bool,
+}
+
+/// 读某 pid 的心跳端点快照（任何读/解析失败 → `None`，防御私有格式演进，不 panic）
+pub fn heartbeat_snapshot(home: &Path, pid: u32, now_ms: u64) -> Option<HeartbeatSnapshot> {
+    let raw = std::fs::read_to_string(heartbeat_path(home, pid)).ok()?;
+    let hb = parse_heartbeat(raw.trim_start_matches('\u{feff}'))?;
+    let ep: HeartbeatEndpoint = serde_json::from_str(raw.trim_start_matches('\u{feff}'))
+        .unwrap_or_else(|_| HeartbeatEndpoint::default());
+    Some(HeartbeatSnapshot {
+        session_id: hb.session_id.clone(),
+        endpoint: ep.endpoint.or(ep.url),
+        usable: heartbeat_is_usable(&hb, pid, now_ms),
+    })
 }
 
 fn now_ms() -> u64 {
@@ -766,7 +807,169 @@ pub fn get_workbuddy_sessions(processes: &[AgentProcess]) -> Vec<Session> {
     get_workbuddy_sessions_with(&home, processes, now_ms())
 }
 
+// ==================== Task 11 读链路补扫：projects/ 转写源（ACP 会话） ====================
+//
+// ACP 新会话**不进 `workbuddy.db`**（spec H9 定案），只落 `~/.workbuddy/projects/<munged-cwd>/`
+// 转写 ⇒ H12 的 db 源扫不到它们。本源的**扫描面按目录名界定**（已知会话的 munged cwd），
+// 故属有界扫描：只需 L1（零进程零解析，编排层已强制）+ L2（`WORKBUDDY_SCAN` 摘要缓存），
+// **不做 24h 窗口过滤**（AGENTS.md 扫描预算：目录界定的有界扫描窗口化会丢空闲超窗的活跃卡）。
+
+/// 目录内 `<UUID>.jsonl` 会话号表（**不递归**——`<sid>/subagents/` 是子目录，非会话卡；
+/// 文件名非严格 UUID 形态的一律跳过，与心跳侧同一判据 [`is_strict_uuid_form`]）
+pub(crate) fn project_transcript_ids(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if is_strict_uuid_form(stem) {
+            out.push(stem.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// db 已知会话 id 上限（防私有表膨胀把每轮读取拖成全表扫描；id 列有唯一索引，
+/// 命中上限即索引扫描前 N 行）。
+///
+/// **完整性纪律（Task 11 复审 Minor 4）**：命中上限 ⇒ 排除集**视为不可确认**
+/// （`Ok(None)` ⇒ [`db_known_ids_gated`] 回 `None` ⇒ 转写补扫**整源跳过**）——
+/// 「要么完整、要么不出卡」：截断集会把「未出现在截断结果里」误判成「db 不知情」，
+/// 从而把用户删掉的会话/窗口外历史行复活。
+const DB_KNOWN_IDS_CAP: usize = 20_000;
+
+/// db 全量会话 id（**含软删行**）：转写补扫的排除集。
+///
+/// 只取 id 列（`sessions` 有 id 唯一索引，查询即索引扫描；`LIMIT` 兜底防私有表膨胀）。
+/// **不过滤 `deleted_at`**：软删会话的转写还在盘上，把它当「未知」会让用户删掉的会话被
+/// 转写源复活——本源只补 db **完全不知情**的会话（ACP 会话正是这一类）。
+fn read_db_all_ids_with_cap(db: &Path, cap: usize) -> rusqlite::Result<Option<HashSet<String>>> {
+    let conn = super::sqlite::open_readonly_with_timeout(db)
+        .ok_or_else(|| rusqlite::Error::InvalidPath(db.to_path_buf()))?;
+    // **ORDER BY id**：截断点确定、行为可复现（不依赖存储顺序/查询计划；
+    // Task 11 复审 Minor 4——原查询 `LIMIT 5000` 无序，超限时排除集不完整）
+    let mut st = conn.prepare("SELECT id FROM sessions ORDER BY id LIMIT ?1")?;
+    let rows = st.query_map([cap as i64], |r| r.get::<_, Option<String>>(0))?;
+    let mut out: HashSet<String> = HashSet::new();
+    for row in rows {
+        if let Some(id) = row? {
+            if !id.is_empty() {
+                out.insert(id);
+            }
+        }
+    }
+    // 命中上限（含恰好等于）⇒ 无法证明「完整」⇒ **不确认**（保守：宁可本轮不出 ACP 卡，
+    // 也绝不用截断集去判「db 不知情」——那会复活用户删掉的会话）
+    if out.len() >= cap {
+        log::warn!("workbuddy: db 已知会话集达到上限 {cap} 行——排除集不可确认，转写补扫本轮跳过");
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
+/// 生产上限的排除集读口（生产唯一出口；[`db_known_ids_gated_with`] 供测试注入上限）
+fn db_known_ids_gated(home: &Path) -> Option<HashSet<String>> {
+    db_known_ids_gated_with(home, DB_KNOWN_IDS_CAP)
+}
+
+/// 可注入上限的排除集读口（**缓存键含 cap**：键必须覆盖全部输入，否则不同上限串缓存）。
+/// `None` = **不可确认**（库不在/读失败且无上轮缓存/**命中上限**）——调用方必须按
+/// 「不可确认 ⇒ 不出卡」保守处理（宁可少出卡，不可复活用户删掉的会话）。
+fn db_known_ids_gated_with(home: &Path, cap: usize) -> Option<HashSet<String>> {
+    type IdsCache =
+        Lazy<Mutex<HashMap<(PathBuf, usize), (Option<SystemTime>, Option<HashSet<String>>)>>>;
+    static IDS: IdsCache = Lazy::new(|| Mutex::new(HashMap::new()));
+    let key = (home.to_path_buf(), cap);
+    // **有意的收窄（登记，Task 11 复审）**：库缺席（`db_generation` 为 None）或读不到
+    // ⇒ 排除集不可确认 ⇒ 转写补扫**整源跳过**，即「无 `workbuddy.db` 时一张 ACP 卡都不出」。
+    // 理由：无从把「db 不知情（真 ACP 会话）」与「db 读不到（临时锁/权限）」区分开——
+    // 宁可不出卡，也不复活用户删掉的会话（保守方向与「不可确认 ⇒ 不出卡」一致）。
+    let gen = db_generation(home)?; // 库不在 = 无 db 源（也就不补转写卡）
+    let cached = IDS
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|(g, ids)| (*g, ids.clone()));
+    if let Some((cached_gen, ids)) = &cached {
+        if *cached_gen == Some(gen) {
+            return ids.clone();
+        }
+    }
+    match read_db_all_ids_with_cap(&home.join(".workbuddy").join("workbuddy.db"), cap) {
+        Ok(ids) => {
+            let mut map = IDS.lock().unwrap();
+            if map.len() >= DB_SNAPSHOT_CAP {
+                map.clear();
+            }
+            map.insert(key, (Some(gen), ids.clone()));
+            ids
+        }
+        Err(e) => {
+            // 读失败：沿用上轮（有则用）——不连轮重试，下次代际变化再试
+            log::warn!("workbuddy: db 已知会话集读取失败（沿用上轮）: {e}");
+            cached.and_then(|(_, ids)| ids)
+        }
+    }
+}
+
+/// projects/ 转写补扫（Task 11）：已知项目目录下**db 不知情**的转写 → 出卡。
+///
+/// - `known_ids` = 本轮已出卡的会话（心跳 ∪ 窗口内 db 行，由调用方给）；
+/// - `db_ids` = db 全量 id（含软删）——**db 里出现过的会话一律不出卡**；
+/// - `cwds` = 已知会话的项目目录（扫描面按目录名界定）；
+/// - 状态/正文/活动时间一律走 [`read_tail_evidence`]（与心跳源/db 源**同一份口径**，
+///   L2 摘要缓存复用），标题走 [`resolve_title`]（db 标题优先 → 首条 user 消息）；
+///   pid = [`DB_ONLY_PID`]（ACP 会话无独立宿主进程，与 db 源哨兵卡同规）。
+fn acp_transcript_cards(
+    home: &Path,
+    db_conn: Option<&rusqlite::Connection>,
+    known_ids: &HashSet<String>,
+    db_ids: &HashSet<String>,
+    cwds: &[String],
+    now: u64,
+) -> Vec<Session> {
+    let mut out = Vec::new();
+    let mut seen_dirs: HashSet<String> = HashSet::new();
+    for cwd in cwds {
+        if cwd.trim().is_empty() || !seen_dirs.insert(mangle_project_path(cwd)) {
+            continue;
+        }
+        let dir = home
+            .join(".workbuddy")
+            .join("projects")
+            .join(mangle_project_path(cwd));
+        for id in project_transcript_ids(&dir) {
+            if known_ids.contains(&id) || db_ids.contains(&id) {
+                continue;
+            }
+            let jsonl = session_jsonl_path(home, cwd, &id);
+            let evidence = read_tail_evidence(&jsonl, now);
+            let title = resolve_title(db_conn, &id, &jsonl);
+            out.push(workbuddy_card(
+                &id,
+                cwd,
+                title,
+                evidence.status.clone(),
+                &evidence,
+                DB_ONLY_PID,
+                0.0,
+            ));
+        }
+    }
+    out
+}
+
 /// 可测核心（home/时钟注入）：心跳路径逐进程出卡（规则原样保留）+ db 源补无心跳会话
+/// + **projects/ 转写补扫**（Task 11：ACP 会话不进 db）
 fn get_workbuddy_sessions_with(home: &Path, processes: &[AgentProcess], now: u64) -> Vec<Session> {
     // L1 零进程零解析（纵深防御；契约见 adapter::session_scan_contract_tests）：
     // 空进程列表 → 不读心跳、不查 db。db 源进程侧已由 discover 侧补哨兵，
@@ -825,13 +1028,38 @@ fn get_workbuddy_sessions_with(home: &Path, processes: &[AgentProcess], now: u64
 
     // db 源（H12）：窗口内的无心跳会话补卡（心跳覆盖的 id 由 merge_sources 剔除）
     let db_rows = db_rows_in_window(db_sessions_gated(home), now);
-    for entry in merge_sources(heartbeats, db_rows) {
+    // 转写补扫（Task 11）的输入面：已知会话 id（排除集之一）＋ 项目目录（扫描面界定）
+    let mut known_ids: HashSet<String> = heartbeats.iter().map(|h| h.session_id.clone()).collect();
+    let mut cwds: Vec<String> = heartbeats
+        .iter()
+        .map(|h| h.cwd.clone())
+        .filter(|c| !c.trim().is_empty())
+        .collect();
+    for row in &db_rows {
+        known_ids.insert(row.id.clone());
+        if !row.cwd.trim().is_empty() {
+            cwds.push(row.cwd.clone());
+        }
+    }
+    for entry in merge_sources(std::mem::take(&mut heartbeats), db_rows) {
         let MergedSession::Db(row) = entry else {
             continue;
         };
         if let Some(card) = db_session_card(home, db_conn.as_ref(), &row, now) {
             sessions.push(card);
         }
+    }
+
+    // projects/ 转写补扫（Task 11）：ACP 会话不进 db（spec H9）——排除集不可确认则整源跳过
+    if let Some(db_ids) = db_known_ids_gated(home) {
+        sessions.extend(acp_transcript_cards(
+            home,
+            db_conn.as_ref(),
+            &known_ids,
+            &db_ids,
+            &cwds,
+            now,
+        ));
     }
     sessions
 }
@@ -1106,6 +1334,292 @@ mod tests {
             mangle_project_path("/Users/jarvis/Documents/MultiAgents-Manager"),
             "Users-jarvis-Documents-MultiAgents-Manager"
         );
+    }
+
+    // ==================== Task 11：projects/ 转写补扫（ACP 会话） ====================
+
+    /// 最小 `sessions` 表夹具（只建本源读到的列；**tempdir 内**，零真实 `~/.workbuddy`）
+    fn write_min_db(home: &Path, rows: &[(&str, &str, i64, bool)]) {
+        let db = home.join(".workbuddy").join("workbuddy.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, title TEXT, status TEXT,
+                                    updated_at INTEGER, deleted_at INTEGER);",
+        )
+        .unwrap();
+        for (id, cwd, updated_at, deleted) in rows {
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, title, status, updated_at, deleted_at)
+                 VALUES (?1, ?2, NULL, 'active', ?3, ?4)",
+                rusqlite::params![id, cwd, updated_at, deleted.then_some(1i64)],
+            )
+            .unwrap();
+        }
+    }
+
+    /// db 源哨兵进程（pid=0；本轮扫描只需进程表非空以过 L1 早退）
+    fn db_sentinel(cwd: &str) -> AgentProcess {
+        AgentProcess {
+            pid: 0,
+            cpu_usage: 0.0,
+            cwd: Some(PathBuf::from(cwd)),
+            exe: None,
+            form: ProcessForm::App,
+        }
+    }
+
+    const ACP_SID: &str = "aeadb65e-1111-4222-8333-444455556666";
+    const DB_SID: &str = "ecbf3d35-76e9-42df-b71d-89409ec156ea";
+    const DEL_SID: &str = "0c468ece-f47f-4765-a120-3fa9c45f2bdf";
+    const OLD_SID: &str = "5ee8ead4-c4bb-4c18-8e44-b26c3816ab9f";
+    const PROJ: &str = "C:\\Users\\bunny\\WorkBuddy\\proj";
+
+    fn write_transcript(home: &Path, cwd: &str, sid: &str, text: &str) {
+        let dir = home
+            .join(".workbuddy")
+            .join("projects")
+            .join(mangle_project_path(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{sid}.jsonl")),
+            format!(
+                "{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"text\":\"{text}\"}}]}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Task 11 主例：ACP 会话**不进 db**（spec H9）⇒ db 源扫不到，转写补扫必须补出卡；
+    /// 状态/正文走既有 `read_tail_evidence` 口径，pid = db 源哨兵（0）
+    #[test]
+    fn acp_transcript_surfaces_though_absent_from_db() {
+        let home = tempfile::tempdir().unwrap();
+        let now = 1_800_000_000_000u64;
+        write_min_db(home.path(), &[(DB_SID, PROJ, now as i64, false)]);
+        write_transcript(home.path(), PROJ, DB_SID, "db 里的老会话");
+        write_transcript(home.path(), PROJ, ACP_SID, "ACP 新会话");
+        let cards = get_workbuddy_sessions_with(home.path(), &[db_sentinel(PROJ)], now);
+        let ids: Vec<&str> = cards.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&DB_SID), "db 行本身照旧出卡：{ids:?}");
+        assert!(
+            ids.contains(&ACP_SID),
+            "db 不知情的 ACP 转写必须补出卡（H9：ACP 会话不进 db）：{ids:?}"
+        );
+        let acp = cards.iter().find(|c| c.id == ACP_SID).unwrap();
+        assert_eq!(acp.pid, 0, "ACP 会话无独立宿主进程（与 db 源哨兵同规）");
+        assert_eq!(acp.form, ProcessForm::App);
+        assert_eq!(acp.project_path, PROJ);
+        assert_eq!(
+            acp.title.as_deref(),
+            Some("ACP 新会话"),
+            "标题走既有降级链（db 无行 → 首条 user 消息）"
+        );
+        assert_eq!(acp.last_message.as_deref(), Some("ACP 新会话"));
+        assert!(acp.jump_supported, "App 形态跳转支持与 db 源卡同源");
+    }
+
+    /// 转写补扫**不得复活** db 里出现过的会话：软删行与窗口外历史行都不出卡
+    /// （本源只补 db 完全不知情的会话）
+    #[test]
+    fn soft_deleted_and_windowed_out_db_sessions_are_not_resurrected() {
+        let home = tempfile::tempdir().unwrap();
+        let now = 1_800_000_000_000u64;
+        let two_days_ago = now as i64 - 48 * 3600 * 1000;
+        write_min_db(
+            home.path(),
+            &[
+                (DB_SID, PROJ, now as i64, false),    // 窗口内锚点（提供扫描目录）
+                (DEL_SID, PROJ, now as i64, true),    // 软删
+                (OLD_SID, PROJ, two_days_ago, false), // 窗口外
+            ],
+        );
+        for sid in [DB_SID, DEL_SID, OLD_SID] {
+            write_transcript(home.path(), PROJ, sid, "旧内容");
+        }
+        let cards = get_workbuddy_sessions_with(home.path(), &[db_sentinel(PROJ)], now);
+        let ids: Vec<&str> = cards.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&DB_SID), "{ids:?}");
+        assert!(!ids.contains(&DEL_SID), "软删会话不得被转写源复活：{ids:?}");
+        assert!(
+            !ids.contains(&OLD_SID),
+            "窗口外历史行不得被转写源复活：{ids:?}"
+        );
+    }
+
+    /// 转写补扫的**扫描面按目录名界定**（已知会话的 munged cwd）——未知项目目录里的
+    /// 转写不出卡（有界扫描；不做无界 projects/ 遍历）
+    #[test]
+    fn transcript_scan_is_bounded_to_known_project_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let now = 1_800_000_000_000u64;
+        write_min_db(home.path(), &[(DB_SID, PROJ, now as i64, false)]);
+        write_transcript(home.path(), PROJ, DB_SID, "已知项目");
+        write_transcript(
+            home.path(),
+            "C:\\Users\\bunny\\WorkBuddy\\other",
+            ACP_SID,
+            "别的项目",
+        );
+        let cards = get_workbuddy_sessions_with(home.path(), &[db_sentinel(PROJ)], now);
+        let ids: Vec<&str> = cards.iter().map(|c| c.id.as_str()).collect();
+        assert!(!ids.contains(&ACP_SID), "未知项目目录不得被扫描：{ids:?}");
+    }
+
+    /// **排除集查询的完整性纪律**（Task 11 复审 Minor 4）：上限内 ⇒ 完整集（含软删）；
+    /// **命中上限 ⇒ 不可确认**（`None`，不是截断集）——门控层同样回 `None` ⇒ 转写补扫
+    /// 整源跳过。「要么完整、要么不出卡」：截断集会复活用户删掉的会话。
+    #[test]
+    fn db_known_ids_is_complete_or_unconfirmable_never_truncated() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join(".workbuddy").join("workbuddy.db");
+        write_min_db(
+            home.path(),
+            &[
+                (DB_SID, PROJ, 0, false),
+                (DEL_SID, PROJ, 0, true),
+                (OLD_SID, PROJ, 0, false),
+            ],
+        );
+        // 上限 > 行数 ⇒ 完整集（含软删行）
+        let full = read_db_all_ids_with_cap(&db, 10).unwrap().unwrap();
+        assert_eq!(full.len(), 3, "{full:?}");
+        assert!(full.contains(DEL_SID), "软删行也在排除集里：{full:?}");
+        // 上限 <= 行数 ⇒ 不可确认（None）——**不得**回截断集
+        assert!(
+            read_db_all_ids_with_cap(&db, 3).unwrap().is_none(),
+            "恰好命中上限也不确认（无法证明完整）"
+        );
+        assert!(read_db_all_ids_with_cap(&db, 2).unwrap().is_none());
+        // 门控层同语义（缓存键含 cap，故两个上限不串缓存）
+        assert!(db_known_ids_gated_with(home.path(), 2).is_none());
+        assert_eq!(
+            db_known_ids_gated_with(home.path(), 10)
+                .map(|s| s.len())
+                .unwrap_or(0),
+            3
+        );
+        // 库不在 ⇒ 也回 None（无 db 源可确认）
+        let other = tempfile::tempdir().unwrap();
+        assert!(db_known_ids_gated_with(other.path(), 10).is_none());
+    }
+
+    /// 目录枚举：只收严格 UUID 形态的 `*.jsonl`，**不递归**（`<sid>/subagents/` 是子目录）
+    #[test]
+    fn project_transcript_ids_filters_and_does_not_recurse() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("proj");
+        let sub = dir.join(DB_SID).join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join(format!("{ACP_SID}.jsonl")), "x").unwrap();
+        std::fs::write(dir.join("not-a-uuid.jsonl"), "x").unwrap();
+        std::fs::write(dir.join(format!("{DB_SID}.txt")), "x").unwrap();
+        std::fs::write(sub.join("agent-d8622189.jsonl"), "x").unwrap();
+        assert_eq!(project_transcript_ids(&dir), vec![ACP_SID.to_string()]);
+        // 目录缺失 → 空表（不 panic）
+        assert!(project_transcript_ids(&home.path().join("missing")).is_empty());
+    }
+
+    /// 心跳端点快照（H9 端点发现读口）：`endpoint` 优先、旧样本 `url` 兜底；
+    /// `usable` 复用既有可用性判定（陈旧心跳的 endpoint **不可用**——本机实测 37 个
+    /// 陈旧心跳全带 endpoint，但端口早已不在监听）
+    #[test]
+    fn heartbeat_snapshot_reads_endpoint_and_judges_usability() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".workbuddy").join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = 1_800_000_000_000u64;
+        // `endpoint` 字段在场 + 新鲜 + 严格 UUID → 可用
+        std::fs::write(
+            dir.join("77765.json"),
+            format!(
+                r#"{{"pid":77765,"lastHeartbeat":{now},"sessionId":"{DB_SID}",
+                     "cwd":"C:\\Users\\bunny\\WorkBuddy\\proj","kind":"interactive",
+                     "url":"http://127.0.0.1:1111","endpoint":"http://127.0.0.1:63928"}}"#
+            ),
+        )
+        .unwrap();
+        let snap = heartbeat_snapshot(home.path(), 77765, now).unwrap();
+        assert_eq!(snap.session_id, DB_SID);
+        assert_eq!(snap.endpoint.as_deref(), Some("http://127.0.0.1:63928"));
+        assert!(snap.usable);
+        assert!(
+            !heartbeat_snapshot(home.path(), 77765, now + HEARTBEAT_FRESH_MS + 1)
+                .unwrap()
+                .usable,
+            "过期心跳的 endpoint 不得被当可用（陈旧端口已不在监听）"
+        );
+        // 只有旧样本的 `url` 字段 → 同样取到；prewarm → 不可用
+        std::fs::write(
+            dir.join("88888.json"),
+            format!(
+                r#"{{"pid":88888,"lastHeartbeat":{now},"sessionId":"{DB_SID}",
+                     "cwd":"C:\\x","kind":"interactive","url":"http://127.0.0.1:2222"}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            heartbeat_snapshot(home.path(), 88888, now)
+                .unwrap()
+                .endpoint
+                .as_deref(),
+            Some("http://127.0.0.1:2222")
+        );
+        std::fs::write(
+            dir.join("99999.json"),
+            format!(
+                r#"{{"pid":99999,"lastHeartbeat":{now},"sessionId":"prewarm-wb-pool-1788496419201-bb1050",
+                     "cwd":"C:\\x","kind":"prewarm","endpoint":"http://127.0.0.1:3333"}}"#
+            ),
+        )
+        .unwrap();
+        assert!(!heartbeat_snapshot(home.path(), 99999, now).unwrap().usable);
+        // 文件不在 / pid 不一致 → 防御性降级
+        assert!(heartbeat_snapshot(home.path(), 12345, now).is_none());
+        assert!(!heartbeat_snapshot(home.path(), 77765, now).is_none());
+    }
+
+    /// **实机只读体检**（`#[ignore]`——常规门禁只编译不跑）：真实 `~/.workbuddy` 的
+    /// projects/ 转写与 db 已知集对照。**全程只读**，不写任何文件；跑法：
+    /// `cargo test --lib workbuddy_real_projects_scan_readonly -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn workbuddy_real_projects_scan_readonly() {
+        let Some(home) = dirs::home_dir() else {
+            println!("无主目录：跳过");
+            return;
+        };
+        let projects = home.join(".workbuddy").join("projects");
+        let now = now_ms();
+        let db_ids = db_known_ids_gated(&home);
+        let mut dirs = 0usize;
+        let mut total = 0usize;
+        let mut unknown = 0usize;
+        for entry in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            dirs += 1;
+            for id in project_transcript_ids(&dir) {
+                total += 1;
+                let known = db_ids.as_ref().map(|s| s.contains(&id));
+                if known == Some(false) {
+                    unknown += 1;
+                    println!(
+                        "ACP 候选（db 不知情）: {} / {}",
+                        dir.file_name().unwrap().to_string_lossy(),
+                        id
+                    );
+                }
+            }
+        }
+        println!(
+            "WorkBuddy projects/ 实机体检：目录 {dirs} 个，转写 {total} 条，db 已知集 {} 条，db 不知情（ACP 候选）{unknown} 条",
+            db_ids.as_ref().map(|s| s.len()).unwrap_or(0)
+        );
+        assert!(now > 0);
+        let _ = db_rows_in_window(db_sessions_gated(&home), now).len();
     }
 
     // ---- Windows 盘符形态（P0-2）：盘符小写 + 去冒号 + 分隔符→-（实测目录名） ----

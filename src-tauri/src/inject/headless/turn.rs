@@ -93,11 +93,28 @@ pub type CancelFn = Arc<dyn Fn() -> bool + Send + Sync>;
 /// 取**按下取消的**设备（取消端点持有）——槽位只保留两者都要用的回合自身信息。
 pub struct TurnSlot {
     pub cancel: CancelFn,
+    /// 取消靶子**是否武装过**（[`TurnRegistry::arm`] 置 true）。
+    ///
+    /// 取消端点据此分辨两种都返回 `false` 但**语义不同**的形态（Task 11 复审 Important 3）：
+    /// - 未武装 + 通道本批未接线（H9 WB ACP）⇒「本通道未接线取消，**回合仍在运行**」；
+    /// - 未武装 + 已接线通道（zcode/codex 的版本门控/预检窗口）⇒「尚未进入可取消阶段，
+    ///   **回合仍在运行**，请稍后重试」；
+    /// - 已武装 ⇒ 回合已终结/已被取消（先到者生效）。
+    pub cancel_wired: bool,
     pub started: std::time::Instant,
     /// 本回合的注入正文（取消审计行与回合审计行同源）
     pub content: String,
     /// 会话工具 id（回合/取消两行审计的 agent_type 列）
     pub agent_type: String,
+    /// 本回合的**无头通道 wire 名**（取消审计行 channel 列的**单点来源**）。
+    ///
+    /// **为什么存在**（Task 11 复审 Important 2）：取消端点原先把 channel 写死
+    /// `headless_zcode`，而 codex 回合**真的武装取消靶子** ⇒ 送达的 codex 取消被记成
+    /// `headless_zcode`（审计/历史把取消归错通道）。通道名由各通道占位时声明
+    /// （[`TurnSlot::with_channel`]），端点从槽位取，**不得再写常量**。
+    /// 空串 = 未声明（只可能来自测试桩或将来新增通道漏声明——端点按
+    /// `headless_unattributed` 如实落账并 warn，不冒充任何既有通道）。
+    pub channel: String,
 }
 
 impl TurnSlot {
@@ -105,11 +122,32 @@ impl TurnSlot {
     pub fn placeholder(agent_type: &str, content: String) -> Self {
         Self {
             cancel: Arc::new(|| false),
+            cancel_wired: false,
             started: std::time::Instant::now(),
             content,
             agent_type: agent_type.to_string(),
+            channel: String::new(),
         }
     }
+
+    /// 声明本回合的无头通道（取消审计行 channel 列的单点来源；生产三条分派臂都必须声明）
+    pub fn with_channel(mut self, channel: &str) -> Self {
+        self.channel = channel.to_string();
+        self
+    }
+}
+
+/// 取消端点**一次取全**的槽位快照（内容/工具/通道/靶子是否武装/已跑时长）。
+///
+/// **为什么一次取全**（Task 11 复审 Important 2/3）：取消行要写通道名、措辞要分辨
+/// 「未接线 / 未武装 / 已终结」——分两次查表既有竞态窗口，也逼调用方另抄一份判定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelSnapshot {
+    pub content: String,
+    pub agent_type: String,
+    pub channel: String,
+    pub cancel_wired: bool,
+    pub elapsed_ms: u64,
 }
 
 /// 进程级在飞登记表（会话串行锁的唯一判据出口）
@@ -129,11 +167,14 @@ impl TurnRegistry {
         true
     }
 
-    /// 更新取消靶子（每尝试一次；无槽位时 no-op——测试直驱各通道 `run_turn` 不建槽）
+    /// 更新取消靶子（每尝试一次；无槽位时 no-op——测试直驱各通道 `run_turn` 不建槽）。
+    /// **同时置 [`TurnSlot::cancel_wired`]**：取消端点据此分辨「未武装」与「已终结」
+    /// （两者都返回 `false`，但措辞必须不同——Task 11 复审 Important 3）
     pub fn arm(&self, session_id: &str, cancel: CancelFn) {
         let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = g.get_mut(session_id) {
             slot.cancel = cancel;
+            slot.cancel_wired = true;
         }
     }
 
@@ -163,16 +204,23 @@ impl TurnRegistry {
         cancel.map(|f| f())
     }
 
-    /// 槽位快照（取消端点写审计行用：回合正文 + 工具 + 回合已跑时长）
-    pub fn slot_snapshot(&self, session_id: &str) -> Option<(String, String, u64)> {
+    /// 取消端点**一次取全**的快照（内容/工具/通道/靶子是否武装/已跑时长）——
+    /// 取消审计行的 channel 列与措辞判定都从这里取，**不再写常量、不再分两次查表**
+    pub fn cancel_snapshot(&self, session_id: &str) -> Option<CancelSnapshot> {
         let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        g.get(session_id).map(|s| {
-            (
-                s.content.clone(),
-                s.agent_type.clone(),
-                s.started.elapsed().as_millis() as u64,
-            )
+        g.get(session_id).map(|s| CancelSnapshot {
+            content: s.content.clone(),
+            agent_type: s.agent_type.clone(),
+            channel: s.channel.clone(),
+            cancel_wired: s.cancel_wired,
+            elapsed_ms: s.started.elapsed().as_millis() as u64,
         })
+    }
+
+    /// 三元素槽位快照（诊断/测试面；实现单点 = [`Self::cancel_snapshot`]，避免两份判定）
+    pub fn slot_snapshot(&self, session_id: &str) -> Option<(String, String, u64)> {
+        self.cancel_snapshot(session_id)
+            .map(|s| (s.content, s.agent_type, s.elapsed_ms))
     }
 }
 

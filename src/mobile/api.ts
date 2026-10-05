@@ -416,10 +416,15 @@ export function connectEvents(
 
 /** 输入区可用性矩阵（GET /session-send-info 载荷，与 Rust `session_send_info`
  *  的 JSON 逐字段对应，勿漂移）：injectable=false 时 reasonCode/reason 携带不可
- *  注入原因（如 WorkBuddy 黑盒），**channels/visibility 不返回**（后端
+ *  注入原因（如 `headless_disabled` 总开关关闭 / `dsh_headless_pending` 写通道未接线 /
+ *  路由层 `no_process` 等），**channels/visibility 不返回**（后端
  *  RouteOutcome::NotInjectable 分支只给 {injectable,reasonCode,reason}）→ 前端
  *  类型须 optional（M9R P2-10 对齐）；injectable=true 时 channels 为候选注入
- *  通道（tmux/iterm2/…），visibility=after_refresh 表示注入后需刷新才见回显 */
+ *  通道（tmux/iterm2/… 或 `headless_*`），visibility=after_refresh 表示注入后需刷新才见回显。
+ *
+ *  **注意（Task 11 起）**：`injectable:true` 表达的是**静态可注入能力**——WorkBuddy ACP
+ *  这类无头通道的运行时不可用（远程控制端点未启用）**不在本载荷里预判**，由**发送回执**
+ *  如实上报（`refused` + reason 文案）；故「输入区可用」≠「必达」，回执才是真相。 */
 export interface SendInfo {
   injectable: boolean;
   reasonCode?: string;

@@ -20,6 +20,8 @@ pub mod runner;
 /// 共享回合件（Task 9 复审上提：执行缝 / 审计词 / 串行锁登记表）——zcode 与 codex 现共用，
 /// WB（Task 11）/ H11 三家（Task 13）接入时同规，禁止再从 `zcode.rs` 取
 pub mod turn;
+/// H9 WorkBuddy ACP 通道（Task 11；zcode/codex/CLI 三家分属 Task 8/9/13）
+pub mod wb_acp;
 /// H7 zcode 无头通道（Task 8；codex/workbuddy/CLI 三家分属 Task 9/11/13）
 pub mod zcode;
 
