@@ -1175,10 +1175,10 @@ mod integration_tests {
     ///     cp ~/.dsh/sessions/<项目目录名>/<会话 id>/session.v4.jsonl.zstd $D/session-<id>-probe/
     ///     cp ~/.dsh/storages/session_projcache/sessions/<会话 id>.json $D/projcache-v7.json
     /// 实机直验（零拷贝，指向真实 home 亦可——本测试只读）：
-    ///   MAM_DSH_V4_HOME=~/.dsh cargo test --lib real_v4_fixture_end_to_end_verification -- --nocapture
+    ///   TUVIS_DSH_V4_HOME=~/.dsh cargo test --lib real_v4_fixture_end_to_end_verification -- --nocapture
     #[test]
     fn real_v4_fixture_end_to_end_verification() {
-        let root = std::env::var_os("MAM_DSH_V4_HOME")
+        let root = std::env::var_os("TUVIS_DSH_V4_HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dsh-v4")
@@ -1186,7 +1186,7 @@ mod integration_tests {
         // 跳过路径①：夹具根目录不存在（仓库常态、CI）
         if !root.is_dir() {
             eprintln!(
-                "[dsh-v4 实机核验] 跳过：夹具根目录不存在 {}\n  探过的布局① {}/sessions/<项目目录>/<会话 id>/session.v4.jsonl.zstd\n  探过的布局② {}/<任意子目录>/session.v4.jsonl.zstd\n  填充方法见本测试文档注释（MAM_DSH_V4_HOME 可指向真实 ~/.dsh 只读直验）",
+                "[dsh-v4 实机核验] 跳过：夹具根目录不存在 {}\n  探过的布局① {}/sessions/<项目目录>/<会话 id>/session.v4.jsonl.zstd\n  探过的布局② {}/<任意子目录>/session.v4.jsonl.zstd\n  填充方法见本测试文档注释（TUVIS_DSH_V4_HOME 可指向真实 ~/.dsh 只读直验）",
                 root.display(),
                 root.display(),
                 root.display()

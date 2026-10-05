@@ -1,7 +1,7 @@
 # 二期收尾总设计 · APP 类注入 + 无头通道 + 交接导出 v2（需求说明书）
 
 > 日期：2026-09-27（2026-10-04 落档）· 状态：**定稿落档**——Phase P+ 探测两端完成 + 裁决门六裁（裁决 12–17）+ 补测暴露缺陷裁决（裁决 18）+ Windows 补测收口；实现批次（C0 起）计划另立文档
-> 基线：`origin/main` `78bf114`（v0.5.0-beta.1；M6–M9 注入主线 + M6R–M9R 加固已交付）；工作分支 `feat/phase2-closure-app-injection`
+> 基线：`origin/main` `78bf114`（v0.5.0-beta.1；M6–M9 注入主线 + M6R–M9R 加固已交付）；工作分支 `feat/phase2-closure-app-injection`。**2026-10-10 二次 rebase 校准**：本文与实施计划所引 commit 哈希已按 `feat/h1-h12-headless` rebase 到 `origin/main` `2de6365` 后的新哈希逐一改写；哈希再变时以分支 `git log --oneline origin/main..HEAD` 按 subject 定位，勿照旧字面引用
 > 上位文档：`docs/MASTER-PLAN.md`（宪法）；`docs/superpowers/specs/2026-09-18-phase2-message-injection-design.md`（二期注入总 spec，本批 = 其 W7/M11 提前扩容 + W9/M10 落地 + 收尾编排；功能点 H 系与旧 spec W 系映射见附录 C）
 > 文档关系（用户 2026-09-27 裁决）：**本 spec（总设计）→ 探测阶段计划（单独立）→ 探测结果回传 → 修订本 spec → 实现批次计划（单独立）**
 > 功能点编号 H1–H13（H1–H11 按执行顺序；**H12（WB 读侧）/ H13（dsh 写侧）为落档前后整理补号**，批次归属见 §8）
@@ -186,7 +186,7 @@
 - **输入**：session_id + 文本 + 花名；**端点发现 = 心跳 `~/.workbuddy/sessions/<pid>.json` 的 `endpoint` 字段**（每会话异端口；**按活跃轮询**——心跳文件按需生成，查空 ≠ 形态不存在，两端定案）。
 - **输出与效果**（ACP 全链，Mac 实证）：`POST <endpoint>/api/v1/acp/connect`（**免鉴权**）→ `{connectionId, sessionToken}` → `POST /api/v1/acp`（头 `acp-connection-id` / `acp-session-token` + `Accept: application/json, text/event-stream`）→ `initialize` → **活跃会话 = `session/load` + `session/prompt`；新建 = `session/new` + `session/prompt`** → SSE 流事件归一回执（agentPhase / session_update）。可见性 = APP 内实时（端点即宿主运行时）。
 - **边界**：**prompt 仅对新建/活跃会话生效**——对已结束会话（load 后 `endReason=end_turn`）静默挂（接口语义，非鉴权）→ 已结束会话的复活语义（重开回合）C2 实现时定案；ACP 新会话**不进 `workbuddy.db`** 仅落 `~/.workbuddy/projects/<munged-cwd>/` 转写 → 读链路补扫 `projects/`；Permission Mode 协议级四档（default/acceptEdits/plan/auto）只读展示，切换留三期 F3.1；**端点发现的平台差异（补测定案）**：macOS = 心跳 `endpoint` 字段直读；**Windows 5.7.3 = 无交互心跳且无 per-session serve 端点**（3 端口实测均非 CodeBuddy 形态）→ 端点启用条件（APP 内远程控制开关）= **C2 开工前置跟进（风险 16）**，期间路线 B/C 为备选；API 为逆向 bundle 所得（非公开文档）→ 版本门控覆盖 WB 升级漂移；不修改 WorkBuddy 安装本体。
-- **实施回填（2026-10-05，C1-Task 11 / commit `7ddeb51`）**：适配器与编排已落码（免鉴权握手 → `initialize` → 活跃/新建二分 → `session/prompt` → SSE 归一 → 转写佐证 → 回执；端点发现双路：心跳 `endpoint` ∪ 端口指纹；发现不到 → **投递前 `refused` + 端点未启用文案**，零 HTTP），纯核 wire 用例与 `MockHttp` 缝齐备，读链路补扫 `projects/` 同批交付。
+- **实施回填（2026-10-05，C1-Task 11 / commit `9525e41`）**：适配器与编排已落码（免鉴权握手 → `initialize` → 活跃/新建二分 → `session/prompt` → SSE 归一 → 转写佐证 → 回执；端点发现双路：心跳 `endpoint` ∪ 端口指纹；发现不到 → **投递前 `refused` + 端点未启用文案**，零 HTTP），纯核 wire 用例与 `MockHttp` 缝齐备，读链路补扫 `projects/` 同批交付。
   - **实机未取证（不得读成已验证）**：**WB ACP 通道的实机投递未验证**——本机 Windows 5.7.3 未启用远程控制端点（生产发现链如实返回 `Unavailable`），Task 11 的 `#[ignore]` 实机面与 Task 15 **M7（如实提示）/ M8（全链，含「找不到开关就记录后跳过」）** 是它的验收面；已结束会话的「需复活」判定同为**推断**（60s 无 `agentPhase`），非服务端显式信号。
   - **登记（诚实面）**：`session/cancel` 未接线（取消端点对该通道回合如实报「本通道未接线取消，回合仍在运行」）；路由表对该工具报乐观 `injectable:true`，运行期不可用经回执的 `refused` 如实透出。
 
@@ -198,7 +198,7 @@
   `ELECTRON_RUN_AS_NODE=1 <ZCode.exe> <…>/zcode.cjs --prompt "<首句> [mobile <花名>]" --cwd <项目> [--surface desktop] --mode <档> --json`
   （`--surface` 无差异，两端定案）→ 新 `sess_id` 回执 → 会话经读链路自然上板 → **可见性提示两端定案：项目在 APP 已信任 → 「重启 ZCode 应用后可见」；未信任 → 「仅 MAM 可见」**；同项目已有活跃 zcode 会话 → 黄字提示（复用配对不确定门信号，不拦截）。**候选列表口径（两端定案）：以 APP 已信任工作区清单（recentProjects）为主源**——未信任目录的新会话 APP 永不收录，如实标注。**移动端入口**：新建表单的工具选择器新增 zcode 分组（本批独立交付；与四家 CLI 新建入口的 UI 融合留 session-create Phase C）。
 - **边界**：仅 zcode；路径黑名单同源文件预览黑名单（session-create 口径）；不做无头「删除/归档」会话；宪法登记动作见 §13。
-- **实施回填（2026-10-05，C1-Task 12 / commit `61aba43`）**：候选列表（`recentProjects` ∪ 看板快照）、手填校验（黑名单同源 + 盘符存在 + 不递归创建）、新建回合编排（`--resume` 缺席形态复用同一 `turn_flags`）、`POST /session-create-zcode` 端点与移动端新建表单 zcode 分组、以及 **`confirmation` 三值**（`stdout_frame` / `store` / `none`，跨语言夹具 `tests/fixtures/zcode_create_confirmations.json` 锁定）均已落码并过纯核用例。
+- **实施回填（2026-10-05，C1-Task 12 / commit `301aaa2`）**：候选列表（`recentProjects` ∪ 看板快照）、手填校验（黑名单同源 + 盘符存在 + 不递归创建）、新建回合编排（`--resume` 缺席形态复用同一 `turn_flags`）、`POST /session-create-zcode` 端点与移动端新建表单 zcode 分组、以及 **`confirmation` 三值**（`stdout_frame` / `store` / `none`，跨语言夹具 `tests/fixtures/zcode_create_confirmations.json` 锁定）均已落码并过纯核用例。
   - **实机未取证（不得读成已验证）**：**新建形态是否出 stdout JSON 帧**——本批只实证了 `--resume` 形态**不出**帧（回执真源因此改会话库），新建形态从未取证；两种都算 PASS 但**必须记录是哪一种**（Task 15 **M9**；取证附则 1）。同理未核：库发现按 `task_type='interactive'` 过滤（与出卡枚举同源**假设**，M9 取证附则 2 给出只读核对命令）。
 
 ### H11 · claude / kimi / opencode 无头（**已裁并入**，裁决 13；M11 随本批关账）
@@ -206,7 +206,7 @@
 - **需求**：未开窗的 CLI 会话也能被驱动（W7 原需求）。
 - **输出与效果**：`claude -p --resume <session> --output-format stream-json`（+`--permission-prompt-tool stdio` 审批双向，裁决 8 特例）/ `kimi -p -S <id>` / `opencode run`，全部走 H3–H6 底座；回执与可见性同口径。
 - **边界**：无头对已开 TUI 的会话默认不路由（W3）；三家命令面为 B/C 级官方证据，C4 实现首任务逐家实机验证。
-- **实施回填（2026-10-05，C1-Task 13 / commit `f4b8daa`）**：claude 长驻双向桥（argv 全集恒带 `--permission-mode` / `control_request{can_use_tool}` → 移动端审批卡 → `control_response`；allow 必带 `updatedInput` 原样回显、弃卡=deny、问答 answers 按题面文本为键、全答才可提交）、kimi/opencode 薄适配、审批卡与问答卡接线、决策词跨语言夹具（`tests/fixtures/headless_decision_words.json`）均已落码；wire 规格按 **附录 E**（AionCore 源码级 + LIVE-PINNED）直译，纯核用例齐备。
+- **实施回填（2026-10-05，C1-Task 13 / commit `f96b5b0`）**：claude 长驻双向桥（argv 全集恒带 `--permission-mode` / `control_request{can_use_tool}` → 移动端审批卡 → `control_response`；allow 必带 `updatedInput` 原样回显、弃卡=deny、问答 answers 按题面文本为键、全答才可提交）、kimi/opencode 薄适配、审批卡与问答卡接线、决策词跨语言夹具（`tests/fixtures/headless_decision_words.json`）均已落码；wire 规格按 **附录 E**（AionCore 源码级 + LIVE-PINNED）直译，纯核用例齐备。
   - **实机取证面（Task 13 单次 claude 探针，2.1.287，1 次真实调用）**：argv 全集被接受 ✓、stdin user 帧形态被回显 ✓（`--replay-user-messages`）、`stream_event{message_delta{stop_reason}}` 两级语义（中途 `tool_use` / 终结 `end_turn`）✓、进程退出 ✓。
   - **实机未取证（逐条，不得读成已验证）**：
     1. **claude 审批往返未取证**——该次探针**没有抓到 `can_use_tool` 帧**（模型自选不调工具；宿主侧 allow 规则可能短路弹窗）。审批 wire 的权威仍是**附录 E-②**（源码级 + 2.1.178–2.1.227 实机标定），本批**不是**实机结论。验收面 = Task 15 **M10**（含 9 条取证附则：卡面四要件、批准后工具真的执行、拒绝措辞、弃卡语义、超时诚实性、问答不全答禁提交……）；
@@ -383,22 +383,22 @@
 
 | 功能点 | 里程碑 | 状态 |
 |---|---|---|
-| H1 dsh 桌面端读侧接入 | C-P+ / C0 扩容 | ✅ 宿主判定 + 上板 + APP 级跳转（`4c7b004`/`08ef620`，GUI 核验）+ ✅ v4 放行修复（`ba9f3a8`：**上层 `header.version` 白名单 `0..=3`→`0..=4`**，边界用例 `is_known_generation_admits_v0_through_v4` 钉死；真因更正见 §5 H1）；🔄 **看板正文恢复 + 新会话上板的实机复看 = M12** |
+| H1 dsh 桌面端读侧接入 | C-P+ / C0 扩容 | ✅ 宿主判定 + 上板 + APP 级跳转（`4c7b004`/`08ef620`，GUI 核验）+ ✅ v4 放行修复（`616a6a2`：**上层 `header.version` 白名单 `0..=3`→`0..=4`**，边界用例 `is_known_generation_admits_v0_through_v4` 钉死；真因更正见 §5 H1）；🔄 **看板正文恢复 + 新会话上板的实机复看 = M12** |
 | H2 OpenClaw/dsh 写通道探测 | C-P+ | ✅ 两端定案（D14 已出评，裁决 16）——探测结论，无实现面 |
-| **C0 四件（L13 靶向 TTY / L14 诚实化 / dsh v4 / WB 双源，裁决 17+18）** | C0 | ✅ 四件代码 + 门禁全部落码（`6151ca7`/`3f6210c`/`ba9f3a8`/`6ed324d`）；🔄 各件实机面分行见下 |
+| **C0 四件（L13 靶向 TTY / L14 诚实化 / dsh v4 / WB 双源，裁决 17+18）** | C0 | ✅ 四件代码 + 门禁全部落码（`300247e`/`d0650ee`/`616a6a2`/`614280e`）；🔄 各件实机面分行见下 |
 | ├ L13 注入靶向 TTY 消歧 | C0 | ✅ 纯核（`resolve_by_tty`/`fallback_cwd_policy`）+ 引擎侧「多候选拒绝并报错」路径过测；🔄 实机复验 = **M14**（Windows 无 TTY 等价键为登记后续项） |
-| ├ L14 macOS 插队诚实化 | C0 | 🔄 **代码 + 纯核过测**（`3f6210c`：确认面不可达 → 中性 `submitted`，前端配色为中性 slate），**但 macOS 实机复验本批无环境**（本机 Windows；该缺陷的现场是 Mac 段）——**本批无对应用例**，登记为跨平台复验遗留（计划遗留登记 **L-08**） |
+| ├ L14 macOS 插队诚实化 | C0 | 🔄 **代码 + 纯核过测**（`d0650ee`：确认面不可达 → 中性 `submitted`，前端配色为中性 slate），**但 macOS 实机复验本批无环境**（本机 Windows；该缺陷的现场是 Mac 段）——**本批无对应用例**，登记为跨平台复验遗留（计划遗留登记 **L-08**） |
 | ├ H1 v4 代际放行 | C0 | ✅ 见 H1 行（真因 = 上层 `header.version` 白名单，非文件名正则） |
-| └ H12 WB 发现双源 | C0 | ✅ 代码 + 夹具过测（`6ed324d`：心跳 ∪ `workbuddy.db` sessions 表、心跳优先去重、只读连接纪律）；🔄 实机上板（无心跳场景）= **M13** |
-| H3 无头通道总开关 | C1 | 🔄 代码 + 后端/前端用例（`9523fc6`：默认关 + `remote_status` 下发 + 安全说明 + 审计）；实机 = **M1 / M2** |
-| H4 无头进程生命周期 | C1 | 🔄 代码 + 用例（`afda8c9`：600s watchdog / kill 树 / 取消 / 全局并发 2 / 三件套配置）；实机取消与「无残留进程」= **M5** |
-| H5 无头审批与权限档 | C1 / C4 | 🔄 代码 + 用例（`1b2886b` 参数面 + `f4b8daa` claude 双向桥接线）；审批卡实机 = **M10**，问答卡 = **M11** |
+| └ H12 WB 发现双源 | C0 | ✅ 代码 + 夹具过测（`614280e`：心跳 ∪ `workbuddy.db` sessions 表、心跳优先去重、只读连接纪律）；🔄 实机上板（无心跳场景）= **M13** |
+| H3 无头通道总开关 | C1 | 🔄 代码 + 后端/前端用例（`3d4c8dc`：默认关 + `remote_status` 下发 + 安全说明 + 审计）；实机 = **M1 / M2** |
+| H4 无头进程生命周期 | C1 | 🔄 代码 + 用例（`77a7bef`：600s watchdog / kill 树 / 取消 / 全局并发 2 / 三件套配置）；实机取消与「无残留进程」= **M5** |
+| H5 无头审批与权限档 | C1 / C4 | 🔄 代码 + 用例（`9280310` 参数面 + `f96b5b0` claude 双向桥接线）；审批卡实机 = **M10**，问答卡 = **M11** |
 | H6 回执 / 审计 / 版本门控（横切） | C1 | ✅ 归一回执 + **8 档 stage 跨语言锁**（`inject/headless/receipt.rs` ↔ `tests/fixtures/headless_stages.json` ↔ `src/mobile/SessionDetail.tsx`，两侧各自对照夹具断言）+ ✅ 审计**三**词（`headless`/`headless_cancel`/`headless_approve`——词表单点 = `src-tauri/src/inject/headless/mod.rs:34`（`ACTION_HEADLESS`）/`:37`（`ACTION_HEADLESS_CANCEL`）/`:42`（`ACTION_HEADLESS_APPROVE`）；原写「双词」是 Task 13 补 `headless_approve` **前**的字面，R11 按代码实数改正）与探针缓存 TTL 过测；🔄 实机回执诚实性抽查 = **M15** |
-| H7 zcode 无头发消息（在册会话） | C1 | ✅ CLI 链路**真机实证**（`06104f9` + Task 8 实施记录：provider config 两端都需要、探针 = 一次真实最小回合、回执真源 = 会话库、`refused` 第八档、争用锁探活重试）；🔄 手机 → 回执卡 → 重启 ZCode 可见 = **M3 / M4 / M16** |
-| H8 codex APP 托管会话注入 | C1 | 🔄 代码 + 纯核/编排用例（`9ee7f77`：APP 在场分派 `queue` 主 / `exec resume` 兜底 + 消费确认自建 + UUID 唯一 + 单写者锁改道如实注明）；APP 内消费实机 = **M6**（Mac 三态 / Win ~55s 抽验属**探测期**证据，不是本实现的实机结论） |
-| H9 WorkBuddy 路线 A（ACP） | C2 | 🔄 代码 + 纯核与 `MockHttp` 缝用例（`7ddeb51`：免鉴权握手 / 活跃-新建二分 / 复活提示 / 端点发现双路 / 读链路补扫 `projects/`）；**实机投递未验证**——本机 Win 5.7.3 端点未启用（生产发现链如实 `refused`）= **M7 / M8**；端点启用条件为活账（风险 16）。详见 §5 H9 实施回填 |
-| H10 zcode 无头新建 | C3 | 🔄 代码 + 用例（`61aba43`：候选/手填黑名单/首句注入/可见性分层/`confirmation` 三值跨语言夹具）；实机 = **M9**；**新建形态是否出 stdout JSON 帧未取证**（M9 取证附则 1）、库发现 `task_type='interactive'` 过滤为**未经真机核实的假设**（附则 2） |
-| H11 三家 CLI 无头（claude / kimi / opencode） | C4 | 🔄 代码 + wire 纯核用例（`f4b8daa`）+ 单次 claude 探针（argv 全集 / stdin user 帧回显 / `stop_reason` 两级语义 / 进程退出——真机取证）；**未取证**：claude 审批往返（= **M10**）、claude `--resume` 形态（= **M10 附则 9**）、opencode 成功文本帧（= **M11 附则 8**）。详见 §5 H11 实施回填 |
+| H7 zcode 无头发消息（在册会话） | C1 | ✅ CLI 链路**真机实证**（`043040b` + Task 8 实施记录：provider config 两端都需要、探针 = 一次真实最小回合、回执真源 = 会话库、`refused` 第八档、争用锁探活重试）；🔄 手机 → 回执卡 → 重启 ZCode 可见 = **M3 / M4 / M16** |
+| H8 codex APP 托管会话注入 | C1 | 🔄 代码 + 纯核/编排用例（`d44754b`：APP 在场分派 `queue` 主 / `exec resume` 兜底 + 消费确认自建 + UUID 唯一 + 单写者锁改道如实注明）；APP 内消费实机 = **M6**（Mac 三态 / Win ~55s 抽验属**探测期**证据，不是本实现的实机结论） |
+| H9 WorkBuddy 路线 A（ACP） | C2 | 🔄 代码 + 纯核与 `MockHttp` 缝用例（`9525e41`：免鉴权握手 / 活跃-新建二分 / 复活提示 / 端点发现双路 / 读链路补扫 `projects/`）；**实机投递未验证**——本机 Win 5.7.3 端点未启用（生产发现链如实 `refused`）= **M7 / M8**；端点启用条件为活账（风险 16）。详见 §5 H9 实施回填 |
+| H10 zcode 无头新建 | C3 | 🔄 代码 + 用例（`301aaa2`：候选/手填黑名单/首句注入/可见性分层/`confirmation` 三值跨语言夹具）；实机 = **M9**；**新建形态是否出 stdout JSON 帧未取证**（M9 取证附则 1）、库发现 `task_type='interactive'` 过滤为**未经真机核实的假设**（附则 2） |
+| H11 三家 CLI 无头（claude / kimi / opencode） | C4 | 🔄 代码 + wire 纯核用例（`f96b5b0`）+ 单次 claude 探针（argv 全集 / stdin user 帧回显 / `stop_reason` 两级语义 / 进程退出——真机取证）；**未取证**：claude 审批往返（= **M10**）、claude `--resume` 形态（= **M10 附则 9**）、opencode 成功文本帧（= **M11 附则 8**）。详见 §5 H11 实施回填 |
 | H13 dsh 无头发消息（ACP stdio） | **本批外** | ⬜ **不在本批范围**（本批 = H1–H12，裁决 19 + 计划范围注记）——后续批次（C2 余项） |
 | M7 Mac 终验 / README / CHANGELOG / 发版 | C5 | 后续计划（M7 终验 Mac 段已完成；其暴露的 L14 已 C0 化，但 macOS 侧复验未做 → 计划遗留登记 **L-08**） |
 

@@ -117,7 +117,7 @@ git add src-tauri/src/monitor/dsh/ src-tauri/tests/fixtures/dsh-v4/
 git commit -m "fix(dsh): rc.2 会话读侧修复——真实 v4/v7 夹具诊断驱动（代际✓/projcache 白名单/或 schema 层，按实测命中）"
 ```
 
-**⚠️ Task 1 实施记录（2026-10-05 诊断驱动实机 + 复审追补，**更正本任务书字面**；commit `ba9f3a8`）**：
+**⚠️ Task 1 实施记录（2026-10-05 诊断驱动实机 + 复审追补，**更正本任务书字面**；commit `616a6a2`）**：
 
 1. **根因不是三层嫌疑里的前两层**：本任务书的三路嫌疑（① projcache wrapper 白名单只到 6；② v4 schema 演进；③ zstd 多帧解码）**②③ 修复前即通过**、**① 不成立**（`projcache.rs` 白名单原文就是 `3..=7`，rc.2 的 `"version": 7` 本就可加载）。**真因 = 上层 `header.version` 白名单**：`monitor/dsh/mod.rs` 的出卡版本门当时只认 `0..=3`，v4 会话整卡降级「格式待适配」（症状 = 有卡无消息体 / 新会话不上板）。**修法 = 谓词更名 `is_known_generation(v) = (0..=4)`**（连续区间有意宽容：v1 真机未观测但同区间；v5+ 仍走降级卡），边界用例 `is_known_generation_admits_v0_through_v4` 钉死。**故 Step 4a 的「把 projcache 白名单扩到 7」是伪修法（勿照做）**；`log.rs` 本任务只补注释 + 证据性测试，未改解析逻辑。
 2. **夹具布局：实际 harness **两种布局都接受**（本任务书 Step 1 只写了扁平布局②，Step 2 的 `load(fx, "projcache-v7")` 命名约定亦非实际做法）**。实际夹具消费点 = `monitor/dsh/mod.rs::real_v4_fixture_end_to_end_verification`：
@@ -429,9 +429,9 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 
 - [ ] **Step 2: 确认失败** → **Step 3: 实现**：`build_argv`（`--prompt <text> --resume <sess> --cwd <proj> --mode yolo --json`；Win/Mac 两形态 + env 集）；执行走 Task 6 runner；`WorkspaceBusy` → 探活重试（APP 工作区活跃探测 = `find_dsh_desktop_host_pid` 同款扫描法的 zcode 版：查 ZCode APP 是否活跃于该项目——按 app-server 进程 cwd 扫描，探测定案口径）最多 2 次（间隔 5s），仍忙 → 回执失败 +「工作区忙」原因；成功 → Receipt + 可见性提示文案（已信任=「重启 ZCode 应用后可见」/未信任=「仅 MAM 可见」，信任判定 = recentProjects 含该项目路径——读 `~/.zcode/v2/setting.json` 只读）。api.rs：`Headless(Zcode)` 分派 → 会话串行锁（per-session MutexMap）→ runner → 回执 + 审计。移动端回执卡三态 + 取消按钮（调 `/session-headless-cancel`）。
 - [ ] **Step 4: 全门禁**；**Step 5: USER-ASSIST 实机**：手机对探测留下的自建 zcode 会话（`sess_4d37f1f3` 等）发一条 → 回执卡出（末条 assistant + token + 耗时）→ 重启 ZCode APP 后 Test2 工作区可见该回合。
-- [x] **Step 6: Commit** `git commit -m "feat(zcode): H7 无头发消息——平台分叉 argv/争用锁探活重试/yolo/回执卡 + session-send 接线"`（**现行 hash = `06104f9`**；原 commit `7e288ab` 已被「复审追补合并入同 commit」的 **amend 取代**——本行此前记的是 amend **前**的 hash，勿再照旧字面引用：`git log --oneline main..HEAD` 里在册的是 `06104f9`）
+- [x] **Step 6: Commit** `git commit -m "feat(zcode): H7 无头发消息——平台分叉 argv/争用锁探活重试/yolo/回执卡 + session-send 接线"`（**现行 hash = `043040b`**；原 commit `7e288ab` 已被「复审追补合并入同 commit」的 **amend 取代**——本行此前记的是 amend **前**的 hash，勿再照旧字面引用：`git log --oneline main..HEAD` 里在册的是 `043040b`）
 
-**⚠️ Task 8 实施记录（2026-10-05 实机 + 复审追补，**更正本任务书字面**；commit = `06104f9`，即 Step 6 那个 commit 的 amend 后形态）**：
+**⚠️ Task 8 实施记录（2026-10-05 实机 + 复审追补，**更正本任务书字面**；commit = `043040b`，即 Step 6 那个 commit 的 amend 后形态）**：
 1. **provider config 两端都要**（任务书只写 Mac）：真机 Windows CLI 自报查找 `<root>\resources\glm\provider\` 与 `<盘>:\config\provider\`，装包实际在 `<root>\resources\config\provider\zcode-builtin.json`（stat 实证）——不设则 `--prompt` 报「无法定位 CLI ZCode Built-in Provider Config」exit 1。实现 `gate::provider_config_env`：macOS 无条件设、Windows 推导路径在场才设（探针与真回合**共用单点**）。
 2. **版本探针 = 一次真实最小模型回合**（任务书与 Task 6 代码都当作「空串干跑」）：真机 CLI 拒绝空载荷（`--prompt requires non-empty text.`），故 `PROBE_PROMPT = "hi"`；结论缓存改为**成功长缓存 / 失败 5 分钟 TTL**（`FAILURE_TTL_MS`）——一次瞬时抖动不得把通道钉死整个进程生命周期。成本：每安装版本一次最小回合（mtime 键失效重探）。
 3. **回执真源 = 会话库**：真机 `--resume` 回合 exit 0、会话库确有回复（`tokens.output=16493` 实测），但 **stdout 无可解析 JSON** ⇒ stdout 只作完成信号；`lastAssistant`/`tokens` 取自 `~/.zcode/cli/db/db.sqlite` 只读链路（`zcode_parser::store_snapshot` 复用既有解析件；确认判据 = 末条 assistant **消息 id** 变化，有界轮询 3×1s）；stdout JSON 仍为第一优先；两者都无 → 如实的 channel_error（不冒充成功）。
@@ -530,7 +530,7 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 - Modify: `src-tauri/src/inject/headless/mod.rs`（claude 审批双向桥）、`src/mobile/SessionDetail.tsx`（审批卡激活）
 - Test: cli_three.rs tests（wire 纯核 mock stdin/stdout 帧）
 
-**实际落地文件面（R11 回填；取自 `git show --name-status f4b8daa`——`f4b8daa` 是 Task 13 commit 的 amend **后现行 hash**〔同一 subject 的 amend 链：`a99dcd9` → `fb91b54` → `f4b8daa`，`git reflog` 可验；`git log --oneline main..HEAD` 里在册的就是它〕）**——上面的三行计划清单**远小于**实际落地：审批双向 wire 的接线面横跨无头底座与远程端点两侧。
+**实际落地文件面（R11 回填；取自 `git show --name-status 1d29b1c`——`f96b5b0` 是 Task 13 commit 的 amend **后现行 hash**〔同一 subject 的 amend 链：`a99dcd9` → `fb91b54` → `f96b5b0`，`git reflog` 可验；`git log --oneline main..HEAD` 里在册的就是它〕）**——上面的三行计划清单**远小于**实际落地：审批双向 wire 的接线面横跨无头底座与远程端点两侧。
 
 | 文件 | 动作 | 为什么在这个 commit 里 |
 |---|---|---|
@@ -669,7 +669,7 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 3. **类型一致性**：`Receipt/Stage/HeadlessKind/Channel::Headless/PermissionSpec/Decision/Q` 在 Task 6/7/8/10/13 间交叉引用已对齐；`codex -C` 前置（Task 9 argv[1] 断言）与附录 E-④ 一致。
 4. **实测对齐**：Task 1 的诊断三连源自「版本门结论被代码事实推翻」的更正——**该项在本行原文里仍是计划初稿的三路嫌疑，实为两路被实测推翻（Task 1 实施记录已更正：真因 = 上层 `header.version` 白名单）**；Task 8 争用锁/Task 9 分派/Task 11 复活语义均为两端探测定案直译。
 5. **复审轮修订（2026-10-05，用户指令内审）**：① 执行纪律改为「本地分支 `feat/h1-h12-headless`、全任务完成且 Task 15 通过前不 push」；② 新增复用清单节（在产函数 8 项 + 探测定案真值 7 项，标注用于哪个任务）；③ gate.rs 伪码测试改真码（`--prompt` 在场断言 + `--version` 缺席断言）；④ Task 6 补「无头子区三件套收齐」步（超时/并发控件原漏排）；⑤ Task 11 MockHttp 定义为任务内注入缝；⑥ Task 13「C4 实机首任务」自指措辞改「本任务实机首步」；⑦ Task 14 E2E 去 windows-only 编译门（无头通道双平台）；⑧ 新增 Task 15（15 个手工用例，仅收手机/GUI 目视/APP 交互/账号态四类不可自动化项，统一于 review 通过后执行）。
-6. **Task 8 实机修订（2026-10-05，硬证据；同步回填 H7 spec；commit = `06104f9`——Step 6 原记的 `7e288ab` 已被「复审追补合并入同 commit」的 amend 取代，勿照旧字面引用）**：① `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` **Windows 同样需要**（打包布局错位，真机 stat + CLI 报错逐字）；② 版本探针**不是空串干跑而是真实最小回合**（CLI 拒绝空载荷），失败结论改 5 分钟 TTL；③ **回执真源改会话库**（resume 路径 stdout 无 JSON 但库有回复），stdout 只作完成信号；④ 新增 `Stage::Refused` 与跨语言 stage 夹具锁。Task 15 相应新增 M16（resume 路径回执源）。
+6. **Task 8 实机修订（2026-10-05，硬证据；同步回填 H7 spec；commit = `043040b`——Step 6 原记的 `7e288ab` 已被「复审追补合并入同 commit」的 amend 取代，勿照旧字面引用）**：① `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` **Windows 同样需要**（打包布局错位，真机 stat + CLI 报错逐字）；② 版本探针**不是空串干跑而是真实最小回合**（CLI 拒绝空载荷），失败结论改 5 分钟 TTL；③ **回执真源改会话库**（resume 路径 stdout 无 JSON 但库有回复），stdout 只作完成信号；④ 新增 `Stage::Refused` 与跨语言 stage 夹具锁。Task 15 相应新增 M16（resume 路径回执源）。
 7. **Task 14 收尾修订（2026-10-05，实施批末轮）**：① Task 1 补「实施记录」（**更正三路嫌疑：真因 = 上层 `header.version` 白名单；夹具两种布局都接受**）；② Task 4 的「黄色态」改**中性态**（与 spec 风险 13 原文一致）；③ Task 14 Step 3 的「+ push」按执行纪律改为**只提交不 push**（红线：全任务完成且 Task 15 通过前一律不 push）；④ spec 附录 B 按「不 overclaim」纪律整表回填（✅/🔄 + Task 15 用例号 + 明确拒绝 ✅ 的五项 + H13 范围边界）；⑤ spec H6 的 stage 枚举由 6 档改正为**8 档**并指明跨语言唯一名单；⑥ spec H1 的 dsh v4 根因改正；⑦ 新增本节之后的「遗留与跟进登记」。
 
 ---
