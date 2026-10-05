@@ -997,8 +997,10 @@ mod tests {
         //   a 正文 = "请帮我检查一下这个文件"
         //   b 正文 = "然后重新检查一下这个文件"
         // 旧口径下两条的尾 24 字符都是 `"检查一下这个文件 [mobile iPhone]"`（相同）。
-        let a = compose_injection("iPhone", "请帮我检查一下这个文件");
-        let b = compose_injection("iPhone", "然后重新检查一下这个文件");
+        let a = compose_injection("iPhone", "请帮我检查一下这个文件")
+            .expect("测试花名在册（白名单内，见 turn::device_name_refusal）");
+        let b = compose_injection("iPhone", "然后重新检查一下这个文件")
+            .expect("测试花名在册（白名单内，见 turn::device_name_refusal）");
         // 前置：夹具必须真的构成「共享长尾」形态（否则本用例退回空断言——
         // 这条自检是 F4-1 的根因防线，勿删）
         assert!(
@@ -1041,7 +1043,8 @@ mod tests {
         assert!(!sa.contains("[mobile"), "戳不得含签名：{sa:?}");
         assert!(!sb.contains("[mobile"), "戳不得含签名：{sb:?}");
         // 极短正文：戳=正文全量（签名同样不参与）
-        let short = compose_injection("iPhone", "好");
+        let short = compose_injection("iPhone", "好")
+            .expect("测试花名在册（白名单内，见 turn::device_name_refusal）");
         assert_eq!(stamp_of(&short), "好");
     }
 
@@ -1050,7 +1053,8 @@ mod tests {
     #[test]
     fn screen_probe_uses_body_tail_too() {
         use crate::inject::normalize::compose_injection;
-        let composed = compose_injection("iPhone", "一条用于屏读滞留判定的正文");
+        let composed = compose_injection("iPhone", "一条用于屏读滞留判定的正文")
+            .expect("测试花名在册（白名单内，见 turn::device_name_refusal）");
         let probe = screen_probe(&composed);
         assert!(!probe.contains("[mobile"), "探针不得含签名：{probe:?}");
         assert!(composed.contains(&probe), "探针必须仍是 composed 的子串");

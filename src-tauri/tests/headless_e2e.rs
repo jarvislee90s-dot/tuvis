@@ -102,9 +102,9 @@ fn probe_text() -> String {
     pin("MAM_E2E_TEXT").unwrap_or_else(|| "hi".to_string())
 }
 
-/// 最终载荷（W4 单点组装：换行归一字面化 + 尾签名）
+/// 最终载荷（W4 单点组装：换行归一字面化 + 尾签名 + 花名白名单，裁决 24b）
 fn payload() -> String {
-    normalize::compose_injection(E2E_DEVICE, &probe_text())
+    normalize::compose_injection(E2E_DEVICE, &probe_text()).expect("E2E 花名 `e2e` 在白名单内")
 }
 
 /// 会话号（claude fresh 形态用）：时间纳秒 xor pid → 8-4-4-4-12 hex，并强制 v4 版本位与
@@ -367,7 +367,8 @@ async fn zcode_send_roundtrip() {
 
     // ⑤ 真回合（回执源基线 = 回合前库快照）
     let before = zcode_parser::store_snapshot_home(&home, &sid);
-    let inv = zcode::build_argv(&spec, &probe_text(), &sid, &project, Some(E2E_DEVICE));
+    let inv = zcode::build_argv(&spec, &probe_text(), &sid, &project, Some(E2E_DEVICE))
+        .expect("E2E 花名 `e2e` 在白名单内（裁决 24b）");
     let build = |inv: &zcode::ZcodeInvocation| {
         // 与端点 `runner_from_conn` 的唯一差异：E2E 无 DB 上下文 ⇒ 用底座默认 600s 超时
         // （并发仍是同一份进程级全局名额——`RunnerCfg::new` 自取 `runner::global_sem()`）
@@ -641,7 +642,8 @@ async fn claude_approval_roundtrip() {
     let text = normalize::compose_injection(
         E2E_DEVICE,
         &pin("MAM_E2E_TEXT").unwrap_or_else(|| CLAUDE_TOOL_TEXT.to_string()),
-    );
+    )
+    .expect("E2E 花名 `e2e` 在白名单内（裁决 24b）");
     if !turn::registry().begin(
         &sid,
         c3::placeholder_slot(

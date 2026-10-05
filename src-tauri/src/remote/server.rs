@@ -3433,6 +3433,70 @@ mod tests {
         assert_eq!(rows, 4, "重绑不新增行");
     }
 
+    /// **R12-S2 / 裁决 24b：设备名注册点拒危险花名**（登记 = 配对时刻）——400
+    /// `device_name_unsafe` + 原因（**点名具体字符** + 给出路）+ **不落库、不下发 cookie**；
+    /// 对照组：正常中文花名照常配对成功（白名单不得误伤中文——票面点名的回归面）。
+    ///
+    /// **门序**：花名判据在 ③ PIN 校验与 ④ 名额门**之后**（落在 `persist_and_cookie` 内）
+    /// ——故本端点不会把「花名合法与否」变成 PIN 预言机（错误 PIN 仍走 401，见 invalid_pin 族）。
+    /// 移动端现版本只发 `{pin}`（`name` 可选、缺省回落「新设备」恒安全）⇒ 本门只挡自报
+    /// 花名的客户端（QR/第三方），移动端行为不变。
+    #[tokio::test]
+    async fn pin_pairing_rejects_unsafe_device_name() {
+        let (state, _t) = a3_state(Some("1234"), 3, &[], &[], false);
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(pin_post(
+                "10.7.7.7:7000",
+                Some("192.168.1.7:9420"),
+                Some("ua-y"),
+                r#"{"pin":"1234","name":"花&名"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "危险花名 ⇒ 拒登记（400，语义在 body）");
+        assert!(
+            r.headers().get("set-cookie").is_none(),
+            "拒登记不得下发任何凭证"
+        );
+        let body = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "device_name_unsafe", "{v}");
+        let reason = v["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains('&') && reason.contains("未投递") && reason.contains("改名"),
+            "拒绝原因必须点名具体字符 + 说清零字节投递 + 给出路（改名）: {v}"
+        );
+        let rows: i64 = state.store.with(|c| {
+            c.query_row("SELECT COUNT(*) FROM remote_devices", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(rows, 0, "拒登记不得落库（不是「登记后再拒投递」）");
+
+        // 对照组：正常中文花名 ⇒ 200 + cookie + 落库一行（白名单不得误伤中文）
+        let r = app
+            .clone()
+            .oneshot(pin_post(
+                "10.7.7.7:7000",
+                Some("192.168.1.7:9420"),
+                Some("ua-y"),
+                r#"{"pin":"1234","name":"小明的手机"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "正常中文花名必须配对成功");
+        assert!(
+            r.headers().get("set-cookie").is_some(),
+            "配对成功必须下发 cookie"
+        );
+        let rows: i64 = state.store.with(|c| {
+            c.query_row("SELECT COUNT(*) FROM remote_devices", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(rows, 1, "对照组落库一行");
+    }
+
     /// 限速矩阵（矩阵 5）：连错 4 次 → 401 且 remaining 递减（4,3,2,1）；第 5 次错 → 401
     /// （remaining 0）；第 6 次请求（即使 PIN 对）→ 429 + retryAfter=600；时钟推进过锁期
     /// （now_source 注入缝）→ 正确 PIN 配对成功
@@ -7819,6 +7883,394 @@ mod tests {
         assert_eq!(fake.recorded().len(), 0, "无头家零终端注入");
     }
 
+    // ==== R3（P0 安全）：cmd 垫片路径上「带元字符的用户正文」= 投递前拒绝 ====
+
+    /// R3 夹具：**无害** `.cmd` 垫片——**被真的执行时**才写一个标记文件。
+    /// 返回（垫片路径，标记文件路径）。「零投递」的物证：拒绝臂若失效，垫片就会起进程、
+    /// 标记文件出现（对照组反过来证明本机垫片形态**真的会**起进程，否则该断言是空的）。
+    fn r3_probe_shim(tag: &str) -> (String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mam_r3_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran.txt");
+        let shim = dir.join("probe.cmd");
+        std::fs::write(
+            &shim,
+            format!(
+                "@echo off\r\n> \"{}\" echo ran\r\nexit /b 0\r\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&marker); // 起点干净（同进程内重复跑本用例时）
+        (shim.to_string_lossy().to_string(), marker)
+    }
+
+    /// **R3 票面第一条（端点级取证）**：`cmd` 垫片 + 元字符正文 ⇒ `refused` + **零投递**。
+    ///
+    /// 形态：直接注入 `cmd /c <无害垫片>`（生产里由 `turn::spawn_shape` 在 Windows 上为
+    /// `.cmd`/`.bat` 产出）。判据只看**形态 + 正文**，故与宿主平台无关（非 Windows 上
+    /// 注入这种形态在生产不会出现，但「见到 cmd 形态就拒」这条纪律本身是平台无关的）。
+    ///
+    /// 断言的三件事：① `refused`（既有投递前拒绝档：未起跑、零字节投递）；
+    /// ② **零投递**——标记文件必须不存在（没有任何进程被起）；③ 拒绝后串行锁已注销、
+    /// 未入队、零终端注入（诚实收尾）。
+    ///
+    /// 对照组（仅 Windows 可证）：**普通正文**在同一垫片形态下必须**放行**，且垫片
+    /// 真的起进程（标记出现）——证明「标记不出现」不是空断言。
+    #[tokio::test]
+    async fn cmd_shim_metachar_body_is_refused_with_zero_delivery() {
+        let _serial = crate::inject::headless::cli_three::test_hooks::LOCK
+            .lock()
+            .await;
+        let _clear = CliHookClear;
+        let sid = "sess_r3_kimi_shim";
+        let (shim, marker) = r3_probe_shim("kimi");
+        crate::inject::headless::cli_three::test_hooks::set_shape(Some(
+            crate::inject::headless::cli_three::SpawnShape {
+                program: "cmd".to_string(),
+                prefix: vec!["/c".to_string(), shim],
+            },
+        ));
+        let fake = FakeInjector::ok();
+        let mut s = inj_sess(
+            sid,
+            crate::session::AgentType::Kimi,
+            0,
+            crate::session::SessionStatus::Idle,
+        );
+        s.project_path = std::env::temp_dir().to_string_lossy().to_string();
+        let state = with_sessions(inject_state(fake.clone()), vec![s]);
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+
+        // ── 对照组：普通正文 ⇒ 放行（且垫片真的起进程 —— Windows 上标记文件会出现）──
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{sid}","text":"hi"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_ne!(
+            v["receipt"]["stage"], "refused",
+            "普通正文不得被拒（判据必须只看正文里的元字符）: {v}"
+        );
+        for _ in 0..200 {
+            if marker.is_file() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        #[cfg(windows)]
+        assert!(
+            marker.is_file(),
+            "对照组：本机垫片形态真的会起进程（否则零投递断言无意义）"
+        );
+        let _ = std::fs::remove_file(&marker); // 只看下面那次的物证
+                                               // 对照组回合收尾（槽位在任务内注销）后才能测拒绝臂本身
+        for _ in 0..500 {
+            if !crate::inject::headless::turn::registry().in_flight(sid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(sid),
+            "对照组回合必须已收尾（否则下面的拒绝可能是被串行锁挡下的，测错了东西）"
+        );
+
+        // ── 本体：垫片 + 元字符正文 ⇒ 投递前拒绝 + 零投递 ──
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(&format!(
+                    r#"{{"sessionId":"{sid}","text":"跑一下 & rem 注入面 %PATH%"}}"#
+                )),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "HTTP 200 + 语义在 body");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["receipt"]["status"], "failed", "{v}");
+        assert_eq!(
+            v["receipt"]["stage"], "refused",
+            "cmd 垫片 + 元字符正文必须是**投递前拒绝**（未起跑、零字节投递）: {v}"
+        );
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("cmd") && s.contains('%')),
+            "拒绝原因必须说清「cmd 重解析」并点名元字符（同斜杠命令拒绝的显式告知风格）: {v}"
+        );
+        assert!(
+            !marker.is_file(),
+            "零投递：拒绝臂不得起任何进程（垫片标记文件必须不存在）"
+        );
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(sid),
+            "拒绝臂必须注销占位（否则该会话被自己的串行锁永久挡死）"
+        );
+        let pending = state
+            .store
+            .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, sid));
+        assert!(pending.is_empty(), "拒绝臂不入队（零字节投递）");
+        assert_eq!(fake.recorded().len(), 0, "拒绝臂零终端注入");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(
+            audits.len(),
+            2,
+            "对照组 + 拒绝臂各一行账（拒绝也必须落账，且如实记 refused）: {audits:?}"
+        );
+        assert!(
+            audits.iter().any(|a| a.result.contains("refused")),
+            "拒绝臂审计必须记 refused（不得冒充成功）: {audits:?}"
+        );
+    }
+
+    /// **R3 票面第一条（codex 臂）**：本机 codex 常是 npm 垫片（`codex.cmd`）——而
+    /// [`crate::inject::headless::turn::spawn_shape`] 只在 **Windows** 上对 `.cmd`/`.bat`
+    /// 产出 `cmd /c`，故本用例 `cfg(windows)`（非 Windows 上形态是直 spawn，拒绝臂
+    /// **正确地**不适用；该平台的判据面无此风险）。
+    ///
+    /// 断言：① 垫片 + 元字符 ⇒ `refused`（点名 cmd 重解析与具体元字符）+ 串行锁已注销
+    /// + 不入队；② **对照组**：同一垫片形态 + 普通正文 ⇒ 不得被拒（判据只看正文）。
+    ///
+    /// 另钉住**顺序**：探针钩子装的是 `probe_pass = false`——拒绝发生在**版本探针之前**，
+    /// 故回执必须是 `refused` 而不是版本门档（谁把顺序改成「先探针后拒绝」，本用例即红）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn codex_cmd_shim_metachar_body_is_refused_before_probe_and_spawn() {
+        use crate::inject::headless::codex::test_hooks;
+        // 独占会话号（守卫 id 立规②：裸 id 字符串不得跨用例共享；必须是**合法 UUID**，
+        // 否则 dispatch 会先在 thread UUID 解析处拒绝——测不到本用例的判据面）
+        const SID: &str = "01a10735-3a05-7d10-822a-f3bd9e041c3a";
+        let _serial = test_hooks::LOCK.lock().await;
+        test_hooks::set(Some("C:/fake/codex.cmd"), false, Vec::new());
+        let _clear = CodexHookClear; // panic 也清钩子
+        let state = codex_dispatch_state(vec![codex_app_sess(SID, 0)]);
+        let app = router(state.clone());
+        // ① 元字符正文 ⇒ 投递前拒绝
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(&format!(
+                    r#"{{"sessionId":"{SID}","text":"hi & whoami %PATH%"}}"#
+                )),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["receipt"]["status"], "failed", "{v}");
+        assert_eq!(
+            v["receipt"]["stage"], "refused",
+            "codex 垫片 + 元字符必须是**投递前拒绝**（未起跑、零字节投递）: {v}"
+        );
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("cmd") && s.contains('%')),
+            "拒绝原因必须说清 cmd 重解析并点名具体元字符（显式告知，不静默改正文）: {v}"
+        );
+        assert!(
+            !crate::inject::headless::codex::registry().in_flight(SID),
+            "拒绝臂必须注销占位（否则该会话被自己的串行锁永久挡死）"
+        );
+        let pending = state
+            .store
+            .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, SID));
+        assert!(pending.is_empty(), "拒绝臂不入队（零字节投递）");
+        // ② 对照组：同一垫片 + 普通正文 ⇒ 放行（此处由版本门钩子收尾，绝不真 spawn）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{SID}","text":"hi"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v2: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_ne!(
+            v2["receipt"]["stage"], "refused",
+            "普通正文不得被拒（判据必须只看正文里的元字符）: {v2}"
+        );
+    }
+
+    // ==== R12-S2（裁决 24b）：花名 cmd 安全白名单 —— 端点级三臂取证 ====
+    //
+    // 形态统一：设备表里**直接落**一个危险花名（[`persist_named_device`] 绕过注册点——
+    // 「存量设备」正是这个形态；本轮注册点只挡新增，旧的靠**投递点**兜住，见
+    // `headless::turn::device_name_refusal` 的调用点节）。三臂都断言：`refused`（未起跑、
+    // 零字节投递）+ 原因**点名具体字符** + 串行锁未占/已注销 + 未入队 + 零终端注入。
+    // 判据缺席时本条会落到 spawn / 版本门档 ⇒ 断言即红（不是「恰好没走到」）。
+
+    /// 三臂共用夹具：开关开启 + `mm`（正常花名）+ `legacy`（**危险花名**，直接落库）+
+    /// 注入器可见（用于断言零终端注入）
+    fn unsafe_name_dispatch_state(
+        sessions: Vec<crate::session::Session>,
+        unsafe_name: &str,
+    ) -> (Arc<RemoteState>, Arc<FakeInjector>) {
+        let fake = FakeInjector::ok();
+        let state = with_sessions(inject_state(fake.clone()), sessions);
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        persist_named_device(&state, "legacy", unsafe_name);
+        (state, fake)
+    }
+
+    /// 三臂共用的拒绝断言（票面四件 + 两条诚实收尾）
+    fn assert_unsafe_name_refused(
+        v: &serde_json::Value,
+        sid: &str,
+        c: char,
+        state: &Arc<RemoteState>,
+        fake: &Arc<FakeInjector>,
+    ) {
+        assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["receipt"]["status"], "failed", "{v}");
+        assert_eq!(
+            v["receipt"]["stage"], "refused",
+            "花名白名单 = **投递前拒绝**（未起跑、零字节投递）: {v}"
+        );
+        let reason = v["receipt"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains(c),
+            "拒绝原因必须**点名具体字符**（用户据此改名）: {v}"
+        );
+        assert!(
+            reason.contains("cmd") && reason.contains("未投递") && reason.contains("改名"),
+            "拒绝原因必须说清 cmd 重解析面 + 零字节投递 + 给出路（改名）: {v}"
+        );
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(sid),
+            "拒绝臂不得留下占位（否则该会话被自己的串行锁挡死）"
+        );
+        let pending = state
+            .store
+            .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, sid));
+        assert!(pending.is_empty(), "拒绝臂不入队（零字节投递）");
+        assert_eq!(fake.recorded().len(), 0, "拒绝臂零终端注入");
+    }
+
+    /// **codex 臂**（`queue --message` / `exec resume` 都把载荷放 argv；本机常是 npm 垫片）
+    #[tokio::test]
+    async fn codex_legacy_unsafe_device_name_is_refused_with_zero_delivery() {
+        // 合法 UUID（过 dispatch 的 thread UUID 步）；独占字符串（守卫 id 立规②）
+        const SID: &str = "01a10735-3a05-7d10-822a-f3bd9e041c3c";
+        let (state, fake) = unsafe_name_dispatch_state(vec![codex_app_sess(SID, 0)], "花&名");
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=legacy"),
+                Some(&format!(r#"{{"sessionId":"{SID}","text":"hi"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "HTTP 200 + 语义在 body");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_unsafe_name_refused(&v, SID, '&', &state, &fake);
+    }
+
+    /// **kimi 臂**（`kimi --prompt <载荷>`：签名进 argv）
+    ///
+    /// 注入的假 CLI 形态只为**过 CLI 发现那一步**（本用例在组装步就被拒，永不 spawn；
+    /// program 故意取一个不存在的名字——判据若缺席，回执会是 `spawn` 而不是 `refused`）。
+    #[tokio::test]
+    async fn kimi_legacy_unsafe_device_name_is_refused_with_zero_delivery() {
+        use crate::inject::headless::cli_three::test_hooks;
+        const SID: &str = "sess_r12_name_kimi";
+        let _serial = test_hooks::LOCK.lock().await;
+        test_hooks::set_shape(Some(crate::inject::headless::cli_three::SpawnShape {
+            program: "mam-r12-must-not-spawn.exe".to_string(),
+            prefix: Vec::new(),
+        }));
+        let _clear = CliHookClear;
+        let mut s = inj_sess(
+            SID,
+            crate::session::AgentType::Kimi,
+            0,
+            crate::session::SessionStatus::Idle,
+        );
+        // cwd 门在 CLI 发现之前：夹具路径必须真在场（tempdir），否则测的是 cwd 门不是花名门
+        s.project_path = std::env::temp_dir().to_string_lossy().to_string();
+        let (state, fake) = unsafe_name_dispatch_state(vec![s], "手机%1");
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=legacy"),
+                Some(&format!(r#"{{"sessionId":"{SID}","text":"hi"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "HTTP 200 + 语义在 body");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_unsafe_name_refused(&v, SID, '%', &state, &fake);
+    }
+
+    /// **opencode 臂**（`opencode run --session <id> <载荷>`：签名进 argv 位置参数）
+    #[tokio::test]
+    async fn opencode_legacy_unsafe_device_name_is_refused_with_zero_delivery() {
+        use crate::inject::headless::cli_three::test_hooks;
+        const SID: &str = "sess_r12_name_oc";
+        let _serial = test_hooks::LOCK.lock().await;
+        test_hooks::set_shape(Some(crate::inject::headless::cli_three::SpawnShape {
+            program: "mam-r12-must-not-spawn.exe".to_string(),
+            prefix: Vec::new(),
+        }));
+        let _clear = CliHookClear;
+        let mut s = inj_sess(
+            SID,
+            crate::session::AgentType::OpenCode,
+            0,
+            crate::session::SessionStatus::Idle,
+        );
+        s.project_path = std::env::temp_dir().to_string_lossy().to_string();
+        let (state, fake) = unsafe_name_dispatch_state(vec![s], "say\"hi");
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=legacy"),
+                Some(&format!(r#"{{"sessionId":"{SID}","text":"hi"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "HTTP 200 + 语义在 body");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_unsafe_name_refused(&v, SID, '"', &state, &fake);
+    }
+
     // ==== Task 13（C4 / H11）：审批卡两端点（GET 待答载荷 / POST 决策）====
 
     /// H11 state：开关开启 + 设备 + 指定会话（id 独占；cwd 用**真在场目录**——续接 cwd 门
@@ -8134,6 +8586,212 @@ mod tests {
         assert_eq!(r.status(), 403);
     }
 
+    /// **空题面 = 坏参数**（R11 顺手项）：`HeadlessAnswerEntry.question` 字段**缺席**或**全空白**
+    /// 必须走**同一条 400 坏参数路径**（`error=bad_request`）——不是 serde 拒绝的 422，也不是被
+    /// `answer_set_from_entries` 的「题面不在本回合的题集里（陈旧页面或串话）」措辞误导
+    /// （那会把「客户端漏传字段」说成「页面陈旧」，排查方向是错的）。且**零消费**：待答项仍在、
+    /// 决策未交给回合、零审计行——随后答全仍能送达（卡没被吃掉）。
+    #[tokio::test]
+    async fn headless_approve_rejects_empty_question_text() {
+        use crate::inject::headless::cli_three as c3;
+        let sid = "sess_c3_approval_empty_q";
+        let state = cli_dispatch_state(vec![]);
+        let app = router(state.clone());
+        let (pending, mut rx) = c3::pending_for_test(
+            "req-eq-1",
+            c3::PendingKind::Question,
+            "AskUserQuestion",
+            "{\"questions\":[]}",
+            vec![c3::Q::single("确认?", vec!["y", "n"], "")],
+            sid,
+            "headless_claude_p",
+        );
+        c3::pending_registry()
+            .register(pending)
+            .expect("登记待答项");
+        let post = |body: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(req(
+                    "POST",
+                    "/m/api/v1/session-headless-approve",
+                    Some("mam_device=mm"),
+                    Some(&body),
+                ))
+                .await
+                .unwrap()
+            }
+        };
+        // ① 题面**字段缺席** → 400（`#[serde(default)]` 之前这里是 serde 拒绝的 422：字段缺失
+        //    在 axum 的 `Json` 提取器里是反序列化失败，直接 422 且措辞不提「题面」）
+        let r = post(format!(
+            r#"{{"sessionId":"{sid}","requestId":"req-eq-1","decision":"answer","answers":[{{"labels":["y"]}}]}}"#
+        ))
+        .await;
+        assert_eq!(
+            r.status(),
+            400,
+            "题面缺席必须走既有 400 坏参数路径（不是 serde 的 422）"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["error"], "bad_request", "{v}");
+        assert!(
+            v["reason"].as_str().unwrap().contains("题面"),
+            "原因必须点名题面缺失：{v}"
+        );
+        // ② 题面**全空白** → 同判（空白题面同样不是「题面不在题集」，是坏参数）
+        let r = post(format!(
+            r#"{{"sessionId":"{sid}","requestId":"req-eq-1","decision":"answer","answers":[{{"question":"   ","labels":["y"]}}]}}"#
+        ))
+        .await;
+        assert_eq!(r.status(), 400, "空白题面同判");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["error"], "bad_request", "{v}");
+        // ③ 零消费：待答项还在、决策没交给回合、零审计行（两次被拒都不许动卡）
+        assert!(
+            c3::pending_registry().has(sid),
+            "坏参数被拒后待答项必须还在（拒的是这一发，不是这张卡）"
+        );
+        assert!(rx.try_recv().is_err(), "坏参数不得把决策交给回合");
+        assert!(
+            state
+                .store
+                .with(|c| crate::database::dao::write_audit::recent_conn(c, 10))
+                .is_empty(),
+            "被参数门拦下的请求什么动作都没发生——不得落审计行"
+        );
+        // ④ 卡仍可用：答全 → 送达（证明零消费，不是「静默丢卡」）
+        let r = post(format!(
+            r#"{{"sessionId":"{sid}","requestId":"req-eq-1","decision":"answer","answers":[{{"question":"确认?","labels":["y"]}}]}}"#
+        ))
+        .await;
+        assert_eq!(r.status(), 200);
+        assert!(matches!(rx.try_recv().unwrap(), c3::Decision::Answer(_)));
+    }
+
+    /// **审批端点与 H3 总开关同冻**（R4 / 裁决 22）：开关关闭 ⇒ **403 `headless_disabled`**
+    /// （码 + 逐字文案与 session-send / session-create-zcode 单点同源），且**零消费**——
+    /// 待答项仍在、决策未交给回合、零审计行；**重新开启后同一张卡仍可正常应答**（冻结 ≠ 丢弃，
+    /// 这正是「关中途开关 = 冻结在飞审批卡」的语义：回合由 watchdog 诚实终结，不伪造成功）。
+    /// 开关开启 ⇒ 既有路径原样（送达 + `headless_approve` 审计行）。
+    ///
+    /// **门位**（与新建端点 ①参数 ②设备 ③开关 同序）：参数校验（400）与设备身份（403 防御）
+    /// 之后、待答项查询之前。用例把三段顺序都钉住：缺参在关闭态仍回 400、无 cookie 仍回
+    /// `forbidden`（不是 `headless_disabled`）——否则「门在最前」会把既有失败契约改掉。
+    #[tokio::test]
+    async fn headless_approve_requires_the_headless_switch() {
+        use crate::inject::headless::cli_three as c3;
+        let sid = "sess_c3_approval_switch";
+        let state = cli_dispatch_state(vec![]); // 开关初始 = 开（cli_dispatch_state 种 "true"）
+        let app = router(state.clone());
+        let set_switch = |v: &str| {
+            state.store.with(|c| {
+                // 键名字面量：与 Rust 端 KEY_HEADLESS 常量双锁（与 cli_dispatch_state 同款）
+                crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", v)
+            })
+        };
+        // **回合已在等应答（在飞审批卡）时，用户去电脑端把开关关了**
+        set_switch("false");
+        let (pending, mut rx) = c3::pending_for_test(
+            "req-sw-1",
+            c3::PendingKind::Approval,
+            "Bash",
+            "ls -la",
+            Vec::new(),
+            sid,
+            "headless_claude_p",
+        );
+        c3::pending_registry()
+            .register(pending)
+            .expect("登记待答项");
+        let post = |body: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(req(
+                    "POST",
+                    "/m/api/v1/session-headless-approve",
+                    Some("mam_device=mm"),
+                    Some(&body),
+                ))
+                .await
+                .unwrap()
+            }
+        };
+        // ① 关闭态 → 403 + 单点码与逐字文案（与 session-create-zcode 同源，不是第二份）
+        let allow_body =
+            format!(r#"{{"sessionId":"{sid}","requestId":"req-sw-1","decision":"allow"}}"#);
+        let r = post(allow_body.clone()).await;
+        assert_eq!(r.status(), 403, "总开关关闭 ⇒ 审批端点必须与 H3 同冻");
+        let b = body_string(r).await;
+        assert!(
+            b.contains("\"error\":\"headless_disabled\"")
+                && b.contains("无头通道未开启，请在电脑端 MAM 设置中开启"),
+            "关闭态必须带单点码与逐字文案：{b}"
+        );
+        // ② 零消费：待答项还在、决策没交给回合、零审计行（冻结 ≠ 丢弃，也 ≠ 悄悄吞掉）
+        assert!(
+            c3::pending_registry().has(sid),
+            "关闭态不得消费待答项（重新开启后同一张卡还要能用）"
+        );
+        assert!(rx.try_recv().is_err(), "关闭态不得把决策交给回合");
+        assert!(
+            state
+                .store
+                .with(|c| crate::database::dao::write_audit::recent_conn(c, 10))
+                .is_empty(),
+            "被门拦下的请求什么动作都没发生——不得落审计行"
+        );
+        // ③ 门位：参数校验在前（缺参仍 400，不被开关吞成 403）
+        assert_eq!(
+            post(r#"{"sessionId":"","requestId":"r","decision":"allow"}"#.into())
+                .await
+                .status(),
+            400,
+            "参数校验（400）必须排在开关门之前"
+        );
+        // ④ 门位：设备身份在前——**直调 handler**（无 cookie 的请求在路由内层 gate 就被拦成
+        //    空体 403，走不到 handler 的防御分支，故路由面测不出这段顺序）。开关关闭 + 无
+        //    cookie ⇒ handler 必须先回防御 403 `forbidden`，**不是** `headless_disabled`。
+        let r = crate::remote::api::session_headless_approve(
+            axum::extract::State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::Json(crate::remote::api::HeadlessApproveReq {
+                session_id: sid.to_string(),
+                request_id: "req-sw-1".to_string(),
+                decision: "allow".to_string(),
+                answers: None,
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), 403);
+        let b = body_string(r).await;
+        assert!(
+            b.contains("forbidden") && !b.contains("headless_disabled"),
+            "设备身份（防御 403）必须排在开关门之前：{b}"
+        );
+        // ⑤ 重新开启 → 同一张卡照常可答（正常路径原样：送达 + 审计行）
+        set_switch("true");
+        let r = post(allow_body).await;
+        assert_eq!(r.status(), 200, "开关重新开启后审批端点回到既有契约");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["delivered"], true, "{v}");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            c3::Decision::Allow,
+            "决策必须交给回合（冻结期内未丢失）"
+        );
+        assert!(
+            !c3::pending_registry().has(sid),
+            "送达即注销待答项（既有语义不变）"
+        );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "送达才落账：{audits:?}");
+        assert_eq!(audits[0].action, "headless_approve");
+        assert_eq!(audits[0].session_id, sid);
+    }
+
     // ==== Task 13 复审 Important C：断连后的收尾所有权（审计 + 串行锁注销在**任务内**）====
 
     /// 假 CLI 形态（**无害系统程序**）：`node -e "setTimeout(…)" -- <多余 argv>` 睡 1.2s 后退出。
@@ -8341,6 +8999,8 @@ mod tests {
     /// 端点未启用用例独占会话 id（同上：**不得与全链用例共享 id**——并行跑时
     /// 两条用例会互抢同一会话的串行锁，后到者收到「已有在飞回合」假红）
     const WB_ACP_SID_OFFLINE: &str = "3f12ca20-cccc-4713-a7a4-adf64a44fccc";
+    /// 内层 JoinError（R10）用例独占会话 id（同上：id 立规②）
+    const WB_ACP_SID_PANIC: &str = "3f12ca20-dddd-4713-a7a4-adf64a44fddd";
     fn wb_sess(id: &str, pid: u32) -> crate::session::Session {
         let mut s = inj_sess(
             id,
@@ -8538,6 +9198,89 @@ mod tests {
             .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, WB_ACP_SID));
         assert!(pending.is_empty(), "无头回合绝不入队（裁决 8）");
         http.assert_clean();
+    }
+
+    /// **R10：WB 回合的内层 `spawn_blocking` JoinError 也必须落审计行**——ACP 链内 panic 时
+    /// 旧的 JoinError 臂只写 log 就返回回执：回合「起跑了但从未入账」，审计页上这条投递凭空
+    /// 消失（ticket 的「回合起跑无审计行」）。本用例用**必 panic 的 HTTP 缝**把
+    /// `wb_acp::run_turn` 打炸（真回合里的等价值 = ACP 链内部 panic）⇒ 断言回执如实
+    /// `failed(channel_error)` **且**落一行 WB 通道的 `headless` 账（与兄弟路径同源：
+    /// 同 action、同 channel 列、同 agent_type、同 `audit_result` 口径）。
+    ///
+    /// 还原动作（变异）：删掉内层臂的 `ctx.audit(...)` → 本用例先红（审计 0 行）。
+    #[tokio::test]
+    async fn wb_acp_inner_join_error_still_leaves_an_audit_row() {
+        use crate::inject::headless::wb_acp::test_hooks;
+        let _serial = test_hooks::LOCK.lock().await;
+        let _clear = WbHookClear;
+        test_hooks::set(
+            Some(test_hooks::FakeHeartbeat {
+                session_id: WB_ACP_SID_PANIC.into(),
+                endpoint: Some("http://127.0.0.1:63928".into()),
+                usable: true,
+            }),
+            Vec::new(),
+            Vec::new(),
+        );
+        // ACP 链内 panic（等价形态：回合内部任务异常终止）
+        test_hooks::set_http(std::sync::Arc::new(|_req| {
+            panic!("模拟 ACP 链内 panic（R10：回合起跑无审计行）")
+        }));
+        let fake = FakeInjector::ok();
+        let state = wb_dispatch_state(vec![wb_sess(WB_ACP_SID_PANIC, 77767)]);
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(&format!(
+                    r#"{{"sessionId":"{WB_ACP_SID_PANIC}","text":"hi [mobile]"}}"#
+                )),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "无头分派：HTTP 200 + 语义在 body");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["channel"], "headless_wb_acp");
+        assert_eq!(v["receipt"]["status"], "failed", "{v}");
+        assert_eq!(
+            v["receipt"]["stage"], "channel_error",
+            "回合内部异常 = 通道异常（不是 refused——正文已经起跑）: {v}"
+        );
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("回合内部任务异常终止")),
+            "reason 必须如实说明结果未知、请到应用内确认: {v}"
+        );
+        assert_eq!(fake.recorded().len(), 0, "无头路由会话零终端注入");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(
+            audits.len(),
+            1,
+            "内层 JoinError 臂必须落账（否则这条回合在账上凭空消失）: {audits:?}"
+        );
+        assert_eq!(audits[0].action, "headless");
+        assert_eq!(audits[0].channel, "headless_wb_acp", "通道列 = WB ACP");
+        assert_eq!(
+            audits[0].agent_type, "workbuddy",
+            "工具列 = WB（与兄弟路径同源：槽位/ctx 的 tool_id）"
+        );
+        assert_eq!(audits[0].session_id, WB_ACP_SID_PANIC);
+        assert!(
+            audits[0].result.starts_with("failed(channel_error) · "),
+            "result 列 = 终态 + 耗时（audit_result 单点口径）: {}",
+            audits[0].result
+        );
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(WB_ACP_SID_PANIC),
+            "异常臂也必须注销串行锁（否则该会话被自己的锁永久挡死）"
+        );
     }
 
     /// H9 会话串行锁：同会话已有在飞无头回合 → **如实的投递前拒绝**（不排队、不覆盖、

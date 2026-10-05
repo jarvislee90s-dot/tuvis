@@ -18,6 +18,18 @@
 //    零真实账号配额、零真实工具会话库写入。
 // 2. **诚实**：审批送不达要说送不达；没有 `stop_reason` 就不能报成功；被拒的工具报「已拒绝」
 //    而不是「失败」；未取证的东西在**读者会看的那一行**登记（不是只写在本文件头）。
+//
+// # cmd 垫片风险的**签名面已收口**（裁决 24b；原为 R3 的登记残留）
+// kimi / opencode 的正文**进 argv**（claude 走 stdin 是例外面），R3 的
+// [`super::turn::cmd_shim_body_refusal`] 只判**用户正文**——我们追加的 `[mobile <花名>]`
+// 签名当时**不在判据内**：Windows 上这两家常是 npm 垫片（`.cmd` ⇒ `cmd /c` 重解析整条
+// 命令行），故花名含 `&`/`%` 时签名同样可能被截断/改写/串联执行（codex 模块头有同样的登记）。
+// **收尾轮（2026-10-05，裁决 24b）以白名单收口**：判据 = [`super::turn::device_name_refusal`]
+// （Unicode 字母数字 + 空格 `-` `_` `.` `·`），落点在**共享组装单点**
+// [`crate::inject::normalize::compose_injection`]（**拼签名之前** fail closed；本通道第 4 步
+// 只是 `Err` 的收口臂，见该步注释）+ 设备名注册点（`remote::api::persist_and_cookie`）。
+// **本通道不再有签名面敞口**——纪律是「签名只能在 compose 单点拼」：新通道若自拼签名，
+// 才会重新打开这个口子（判据不按通道分岔，claude 的 stdin 例外面不适用于花名）。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -218,6 +230,14 @@ pub struct ControlRequest {
     pub input: serde_json::Value,
 }
 
+/// 审批卡入参展示上限（**字符数**）——**单一来源**，调用点不得再写字面量。
+///
+/// 为什么是 2000：旧口径借用审计摘要的 `receipt::LAST_ASSISTANT_CHARS = 200`，
+/// 而 Bash 命令（管道、多行脚本、长路径）常超 200 —— 静默砍掉的正是**用户要批准的内容**
+/// （P0 安全：信息不得静默丢失）。2000 覆盖绝大多数真实命令；仍超限时由
+/// [`crate::inject::normalize::truncate_with_size_marker`] **显式**标出真实总长。
+pub const APPROVAL_INPUT_DISPLAY_CHARS: usize = 2_000;
+
 impl ControlRequest {
     /// 是 AskUserQuestion（**走问答卡，不走审批卡**——附录 E-②：投影成独立事件）
     pub fn is_question(&self) -> bool {
@@ -225,13 +245,17 @@ impl ControlRequest {
     }
 
     /// 入参**展示原文**（卡片主体）：Bash = 命令原文；其余工具 = 参数 JSON 文本。
-    /// 截断口径沿用回执摘要单点（不另立一套长度）
+    ///
+    /// 截断口径**只此一处**：上限 [`APPROVAL_INPUT_DISPLAY_CHARS`]，超限时产物带
+    /// 「…已截断，共 N 字符」（**绝不静默截断**——审批卡的本职是让人看清将要跑什么）。
+    /// 注意与审计摘要 `receipt::LAST_ASSISTANT_CHARS`（200，尾巴只有一个 `…`）
+    /// **不是一套口径**：那是回执防膨胀，这是用户展示保真。
     pub fn input_display(&self) -> String {
         let raw = match self.input.get("command").and_then(|v| v.as_str()) {
             Some(cmd) => cmd.to_string(),
             None => self.input.to_string(),
         };
-        crate::inject::normalize::summarize(&raw, super::receipt::LAST_ASSISTANT_CHARS)
+        crate::inject::normalize::truncate_with_size_marker(&raw, APPROVAL_INPUT_DISPLAY_CHARS)
     }
 }
 
@@ -2124,6 +2148,106 @@ mod tests {
         assert!(allow.contains("updatedInput") && allow.contains(r#""command":"ls""#));
         let deny = super::build_control_response(&req, &super::Decision::Deny);
         assert!(deny.contains(r#""behavior":"deny""#) && !deny.contains("updatedInput"));
+    }
+
+    // ===== R2（P0 安全）：审批卡不得静默截断「将要执行的命令」=====
+
+    /// R2 帧夹具：给定 Bash 命令原文的 `can_use_tool` 真帧（其余形状同
+    /// [`control_request_frame`]——此处只换载荷）。
+    fn control_request_frame_with_command(cmd: &str) -> String {
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": "req-r2",
+            "request": {"subtype": "can_use_tool", "tool_name": "Bash",
+                        "input": {"command": cmd}, "tool_use_id": "t1"},
+        })
+        .to_string()
+    }
+
+    /// **R2 红→绿（本用例先于实现写就）**：> 200 字符的命令必须**逐字**上卡。
+    ///
+    /// 缺陷原状（红）：[`ControlRequest::input_display`] 复用审计摘要口径
+    /// `receipt::LAST_ASSISTANT_CHARS = 200`，静默砍到 200 字符加一个 `…`——
+    /// 用户**看不到**剩下的 65 字符，却要对这条命令点「批准」（审批卡的本职是
+    /// 让人看清将要跑什么）。
+    /// 绿：展示上限提为 [`APPROVAL_INPUT_DISPLAY_CHARS`]，266 字符**逐字**在卡上。
+    #[test]
+    fn approval_input_display_shows_over_200_char_command_verbatim() {
+        let cmd = format!("echo {}", "a".repeat(260)); // 266 字符（> 200，票面逐字要求）
+        let shown = super::parse_control_request(&control_request_frame_with_command(&cmd))
+            .unwrap()
+            .input_display();
+        assert_eq!(
+            shown, cmd,
+            "266 字符的命令必须在审批卡上逐字展示（旧口径在 200 处静默截断 = \
+             用户被迫批准一条读不全的命令）"
+        );
+    }
+
+    /// **R2 边界（恰在上限）**：等于上限 → **逐字原文**，既不截断也不加标记
+    /// （没有隐藏任何内容，就无需声明长度）。同时把阈值本身钉住：票面要求 2000。
+    #[test]
+    fn approval_input_display_at_the_limit_is_verbatim() {
+        assert_eq!(
+            APPROVAL_INPUT_DISPLAY_CHARS, 2_000,
+            "阈值变更的显式绊线（票面要求提到 2000）"
+        );
+        let cmd = "d".repeat(APPROVAL_INPUT_DISPLAY_CHARS);
+        let shown = super::parse_control_request(&control_request_frame_with_command(&cmd))
+            .unwrap()
+            .input_display();
+        assert_eq!(shown, cmd, "恰在上限必须逐字（不得静默改动）");
+        assert!(!shown.contains("已截断"), "未超限不该出现截断标记: {shown}");
+    }
+
+    /// **R2 边界（刚过界 2001）**：保留前 2000 字 + 显式标记，标记里的总数是**原文**长度。
+    #[test]
+    fn approval_input_display_over_the_limit_keeps_prefix_and_names_true_total() {
+        let n = APPROVAL_INPUT_DISPLAY_CHARS + 1; // 2001：刚过界一字符
+        let cmd = "c".repeat(n);
+        let shown = super::parse_control_request(&control_request_frame_with_command(&cmd))
+            .unwrap()
+            .input_display();
+        let prefix = "c".repeat(APPROVAL_INPUT_DISPLAY_CHARS);
+        assert_eq!(
+            shown,
+            format!("{prefix}…已截断，共 {n} 字符"),
+            "必须保留前 {APPROVAL_INPUT_DISPLAY_CHARS} 字 + 显式报真实总长 {n}"
+        );
+    }
+
+    /// **R2 非命令分支同口径**：非 Bash 工具的入参 JSON 同样经**同一处**截断核
+    /// （截断单源；不另立一份 JSON 展示口径）。
+    ///
+    /// 注：这里的 `raw` 由测试自己 `Value::to_string()` 算出——与实现同源的**wire 文本**。
+    /// 本用例测的是「截断是否诚实」（前缀 + 真实总长），不是 JSON 排版口径，故不循环论证。
+    #[test]
+    fn approval_input_display_json_branch_uses_the_same_truncation() {
+        let input = serde_json::json!({
+            "file_path": "E:/tmp/big.txt",
+            "content": "e".repeat(APPROVAL_INPUT_DISPLAY_CHARS + 5),
+        });
+        let frame = serde_json::json!({
+            "type": "control_request",
+            "request_id": "req-r2-json",
+            "request": {"subtype": "can_use_tool", "tool_name": "Write",
+                        "input": input.clone(), "tool_use_id": "t2"},
+        })
+        .to_string();
+        let shown = super::parse_control_request(&frame)
+            .unwrap()
+            .input_display();
+        let raw = input.to_string();
+        assert!(
+            raw.chars().count() > APPROVAL_INPUT_DISPLAY_CHARS,
+            "夹具必须真超限（否则本用例不测任何东西）"
+        );
+        let prefix: String = raw.chars().take(APPROVAL_INPUT_DISPLAY_CHARS).collect();
+        assert_eq!(
+            shown,
+            format!("{prefix}…已截断，共 {} 字符", raw.chars().count()),
+            "非命令分支必须与命令分支同一口径（含真实总长）"
+        );
     }
 
     #[test]

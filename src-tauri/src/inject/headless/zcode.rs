@@ -41,10 +41,11 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-// `Arc`/`Mutex` 只在测试面用（脚本桩构造）：生产码已改用底座 `turn::cancel_fn_of`，
-// 登记表的内部锁归 `turn::TurnRegistry`
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+// `Mutex` 只在测试面用（脚本桩构造）：生产码的登记表内部锁归 `turn::TurnRegistry`
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::gate::provider_config_env;
@@ -179,13 +180,18 @@ fn turn_flags(
 /// `device_name = Some(名)` ⇒ 正文经 **W4 单点** [`normalize::compose_injection`]（换行归一
 /// 成字面 `\n` + 尾部 ` [mobile 名]` 签名——与终端注入同一条组装出口，不另造一份）；
 /// `None` = 调用方已自行拼好签名/裸文本（原样上送，不二次签名）。
+///
+/// **`Result`（裁决 24b）**：花名过白名单判据（`turn::device_name_refusal`）失败时
+/// [`normalize::compose_injection`] 回 `Err(原因)`——本函数**原样上抛**，调用方按
+/// `refused` 档零字节投递（**不吞、不降级成无签名载荷**：那会把「花名不安全」静默变成
+/// 「这条消息没有来源标注」）。
 pub fn build_argv(
     spec: &ZcodeSpec,
     text: &str,
     session_id: &str,
     project: &str,
     device_name: Option<&str>,
-) -> ZcodeInvocation {
+) -> Result<ZcodeInvocation, String> {
     build_with(Some(session_id), spec, text, project, device_name)
 }
 
@@ -193,15 +199,18 @@ pub fn build_argv(
 /// `device_name = Some(名)` ⇒ 正文经 **W4 单点** [`normalize::compose_injection`]（换行归一
 /// 成字面 `\n` + 尾部 ` [mobile 名]` 签名——与终端注入同一条组装出口，不另造一份）；
 /// `None` = 调用方已自行拼好签名/裸文本（原样上送，不二次签名）。
+///
+/// 花名判据不在这里（也不该在任何 argv 构造器里）：门设在共享组装单点
+/// [`normalize::compose_injection`] 内，本函数只是 `?` 上抛——**通道无从绕开**。
 fn build_with(
     resume: Option<&str>,
     spec: &ZcodeSpec,
     text: &str,
     project: &str,
     device_name: Option<&str>,
-) -> ZcodeInvocation {
+) -> Result<ZcodeInvocation, String> {
     let prompt = match device_name {
-        Some(name) => normalize::compose_injection(name, text),
+        Some(name) => normalize::compose_injection(name, text)?,
         None => text.to_string(),
     };
     let mut env = BTreeMap::new();
@@ -213,7 +222,7 @@ fn build_with(
     if let Some((k, v)) = provider_config_env(&spec.cjs, spec.os) {
         env.insert(k, v);
     }
-    ZcodeInvocation {
+    Ok(ZcodeInvocation {
         program: spec.exe.clone(),
         // H5：档位旗子从 spec 取（单一来源）——`--mode yolo` 不再由本模块字面直写
         argv: turn_flags(
@@ -225,7 +234,7 @@ fn build_with(
         ),
         env,
         prompt,
-    }
+    })
 }
 
 /// **H10 无头新建形态**（Task 12）：`resume = None` —— 无在册会话可续，argv 里**没有**
@@ -233,12 +242,13 @@ fn build_with(
 ///
 /// flag 序与 [`build_argv`] **同源**（同一个 [`turn_flags`]），本函数只把 resume 位显式
 /// 留空——**不另写第二个 argv 构造器**（Task 8 的 `turn_flags` 文档早已预留本形态）。
+/// 花名判据同 [`build_argv`]（`Result` 的来由见其文档；判据本体在共享组装单点内）。
 pub fn build_create_argv(
     spec: &ZcodeSpec,
     text: &str,
     project: &str,
     device_name: Option<&str>,
-) -> ZcodeInvocation {
+) -> Result<ZcodeInvocation, String> {
     build_with(None, spec, text, project, device_name)
 }
 
@@ -773,6 +783,80 @@ pub enum ReceiptSource {
     NotApplicable,
 }
 
+/// 退避窗取消闩（**回合生命期**；R9）。
+///
+/// 争用锁拒绝后子进程已经退了，runner 的取消靶子随 `disarm` 消失——此刻
+/// [`super::runner::CancelHandle::cancel`] 恒 `false`，退避窗内到达的取消请求会被静默
+/// 吞掉（用户已叫停，回合却还在重试）。闩把两件事分开记：
+/// - `requested`：登记表上到达过取消请求（退避醒来后据此收尾为 `cancelled`）；
+/// - `live`：回合仍在 [`run_turn`] 内（**返回后迟到的取消不得冒领送达**——否则取消端点会
+///   为一条已以别的终态收尾的回合落 `cancelled` 取消审计行，与回合自身的行口径矛盾），
+///   由 [`LiveGuard`] 在任一出口落闩。
+struct CancelLatch {
+    requested: Arc<AtomicBool>,
+    live: Arc<AtomicBool>,
+}
+
+impl CancelLatch {
+    fn new() -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+            live: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// 逐尝试武装的取消靶子：**透传给 runner**（活体尝试才真能 kill 进程树）+ **闩住请求**。
+    ///
+    /// 返回值与 runner 同口径（`true` = 送达；先到者生效）：活体尝试交 runner 仲裁；
+    /// 进程已退/尚未起跑时 runner 报 `false`，**但只要回合还在跑，这一发就是有效的**
+    /// （退避醒来即收尾为 `cancelled`）——如实报「送达」，取消端点才会落取消审计行、
+    /// 用户也才不会收到「回合已终结」的假话。
+    fn target(&self, cfg: &RunnerCfg) -> CancelFn {
+        let inner = super::turn::cancel_fn_of(cfg);
+        let requested = self.requested.clone();
+        let live = self.live.clone();
+        Arc::new(move || {
+            let first = !requested.swap(true, Ordering::SeqCst);
+            let delivered = inner();
+            delivered || (first && live.load(Ordering::SeqCst))
+        })
+    }
+
+    /// 退避窗内是否已收到取消请求（[`run_turn`] 的检查点读它）
+    fn requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+}
+
+/// `live` 落闩守卫（`run_turn` 任一出口生效；**Drop 而非逐 return 点写**——漏一处就会让
+/// 「回合已终结」的取消被冒领）
+struct LiveGuard(Arc<AtomicBool>);
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 取消收尾的终态（**两段取消检查点共用**：退避窗内 [`CancelLatch`] 检查点，与**武装后起跑前**
+/// 的复检命中——后者不经退避窗，故原因文案必须同时覆盖两段，见下），形状**对齐 codex
+/// `cancelled_outcome`**：`Receipt::cancelled` + 会话号 + 回合墙钟；stage 留空——取消不是失败
+/// 阶段，绝不报成 timeout / channel_error。
+fn cancelled_outcome(session_id: &str, attempts: usize, total_ms: u64) -> TurnOutcome {
+    TurnOutcome {
+        receipt: Receipt::cancelled(
+            "已取消（移动端请求）——叫停发生在工作区争用锁的重试退避窗内、或本轮武装后起跑前的\
+             复检窗口（含武装后起跑前复检命中）：本条不再重试、后续尝试一律不发起；本次是否已\
+             送达请在 ZCode 会话内容中核实，ZCode 应用仍占用该工作区时请稍后重发",
+        )
+        .with_session(session_id)
+        .with_duration_ms(total_ms),
+        attempts,
+        busy_final: false,
+        receipt_source: ReceiptSource::NotApplicable,
+    }
+}
+
 /// 单回合编排（**唯一**消费 Task 6 底座的地方：并发经 runner 的全局名额、看门狗与取消
 /// 归 runner、回执归 receipt 归一）。流程：
 /// 每次尝试 → `make_runner(inv)` 建回合配置（端点侧经 `headless::runner_from_conn`，
@@ -780,6 +864,11 @@ pub enum ReceiptSource {
 /// - 争用锁 → 探活 + [`busy_step`]（≤[`TurnDeps::max_busy_retries`] 次重试，仍忙 →
 ///   **如实的 [`Stage::WorkspaceBusy`] 失败回执**，绝不冒充成功）；
 /// - 其他 → 终结（见 [`finalize`]）。
+///
+/// **取消检查点（R9 两段）**：① **退避后**（每次退避等待之后、下一次尝试武装之前）与
+/// ② **武装后起跑前**（复检；R12-S3 / 裁决 24c-③）各查一次 [`CancelLatch`]——两段窗口里
+/// 到达的取消都在此收尾为 [`cancelled_outcome`]（此时进程已退或尚未起跑，只有闩记得住那一发）。
+/// **两处都不注销槽位**（单主不变量：`begin`/`end` 成对归包装器——理由与误删竞态见复检臂注释）。
 ///
 /// # 回执源（H6 契约的真源；真机实证修订）
 /// **stdout 只作完成信号**（退出码 / 看门狗 / 争用锁特征串）；`lastAssistant`/`tokens`
@@ -800,13 +889,51 @@ pub async fn run_turn(
     let started = Instant::now();
     // 回执源基线（回合**前**读一次库）：本轮是否真的写入了新的 assistant 回复
     let before = (deps.store_probe)(session_id);
+    // 退避窗取消闩（R9）：逐尝试武装、退避醒来查；`_live` 保证「回合终结后不冒领」
+    let cancel = CancelLatch::new();
+    let _live = LiveGuard(cancel.live.clone());
     let mut attempts = 0usize;
     loop {
         attempts += 1;
         let cfg = make_runner(inv);
         // 取消靶子逐尝试更新（版本门控期间靶子为空 → 取消如实报「未送达」）——
-        // 包法单点复用底座 [`super::turn::cancel_fn_of`]
-        registry().arm(session_id, super::turn::cancel_fn_of(&cfg));
+        // 包法单点复用底座 [`super::turn::cancel_fn_of`]，外加退避窗闩（[`CancelLatch`]）
+        registry().arm(session_id, cancel.target(&cfg));
+        // **取消复检（R9 微窗口，R12-S3 / 裁决 24c-③）**：武装之后、**起跑之前**再查一次闩。
+        // 上一发检查点（循环尾）与本次武装之间还有一段（`make_runner` 读设置 + 武装本身），
+        // 落在其中的取消会让**本发照跑**：runner 的取消 sink 要到 `run()` 内部（spawn 之后）
+        // 才武装，`CancelHandle::cancel` 此刻恒 `false` ⇒ 只有闩记得住那一发。不查的后果
+        // 不是「少杀一个进程」而是**多起一个进程**（恒忙夹具下会多试一次；真机上是多 spawn
+        // 一次并可能跑完整个回合），而取消端点已按闩如实报「送达」——两边口径矛盾。
+        //
+        // 收尾 = **只回 [`cancelled_outcome`]，绝不 `registry().end()`**。槽位是**包装器**的：
+        // `begin`/`end` 成对归各分派臂（`remote::api::run_zcode_turn` 的注销落在审计行**之后**；
+        // 新建通道同形，注销的是项目锁键），而 `run_turn` 有多条调用面（`zcode_create` 也走它）
+        // ⇒ 它**不拥有**槽位。代庖注销会开出**误删竞态**（U1，2026-10-05 收尾轮）：本臂一删旧
+        // 槽位，包装器写审计行的窗口里移动端立刻发下一条 ⇒ 新回合 `begin()` 成功（旧槽位已不在，
+        // 串行锁放行）⇒ 包装器随后按**会话号**注销，删掉的正是**新**回合的槽位（新回合从此无取消
+        // 靶子、串行锁形同虚设；它自己的 `end` 还会再去删下一条）。**单主不变量：只有占位者能
+        // 注销**——本臂返回后由包装器注销（`post_arm_cancel_does_not_end_the_slot_the_wrapper_owns`
+        // 钉死该时序）。
+        //
+        // 「不留已武装靶子」的顾虑（上一轮代庖注销的理由）另有解：本臂返回后**同一 detached 任务**
+        // 随即写审计行并注销槽位；触发本臂的那一发取消本就打在**已武装靶子**上，由闩如实报
+        // 「送达」——而它换来的回执正是 `cancelled`（**自洽**：靶子留给它真正的收件人，而非抢着
+        // 注销）；`run_turn` 返回后（`LiveGuard` 已落闩）到达的取消由同一靶子如实报「未送达」，
+        // 取消端点据此说「回合已终结」（**不冒领**）。
+        //
+        // **登记的残余（已知限制，未在本轮关闭；裁决 27）**：本复检只覆盖「武装后、`run()`
+        // 之前」这一段；取消若落在 `run()` 内部而 runner 尚未武装 sink（**spawn 窗口**，含并发
+        // 名额满的 `queued` 早退臂），仍会被闩记成「已送达」而不生效——那一发的回执按**实际
+        // 结局**如实上报（可能是 `ok`，即「叫停来晚了，这一发已经跑完」）。要彻底关掉需在 runner
+        // 侧把 sink 武装前移到 spawn 之前（改的是公共底座、影响所有 spawn 型通道），不在本轮范围。
+        // **已登记 issue [#115](https://github.com/jarvislee90s-dot/MultiAgents-Manager/issues/115)，
+        // 排期下一批**（计划遗留登记 **L-36** 同条）：窗口毫秒级、后果 = 多跑一发（token 消耗），
+        // 不是数据风险（串行锁与审计不受影响）；**勿用「跑完后查闩改判 cancelled」的错误修法**
+        // ——那会把已跑完的回合谎报成取消（issue 正文明确拒绝过该方案）。
+        if cancel.requested() {
+            return cancelled_outcome(session_id, attempts, started.elapsed().as_millis() as u64);
+        }
         let obs = run(cfg);
         let obs = obs.await;
         // 证据串（先判争用锁再判退出码：busy 形态退出码是 0）
@@ -854,6 +981,11 @@ pub async fn run_turn(
             }
             BusyStep::RetryNow => {}
             BusyStep::RetryAfterWait(d) => (deps.wait)(d).await,
+        }
+        // **取消检查点（R9）**：退避等待之后、下一次尝试武装之前——退避窗内到达的取消在
+        // 这里收尾（子进程已退、runner 靶子已解除武装，只有闩记得住那一发；不查就会再试一次）
+        if cancel.requested() {
+            return cancelled_outcome(session_id, attempts, started.elapsed().as_millis() as u64);
         }
     }
 }
@@ -1002,7 +1134,8 @@ mod tests {
             "sess_1",
             "E:/p",
             None,
-        );
+        )
+        .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         assert!(w.iter().any(|a| a.contains("zcode.cjs")));
         // 档位段**从 spec 派生**期望（不是本测自己抄一份字面）——spec 改档时本测跟着走；
         // 逐字面锁在同文件的 `argv_pins_the_probed_command_form`（独立期望，故意写死）
@@ -1020,7 +1153,8 @@ mod tests {
             "sess_1",
             "/tmp/p",
             None,
-        );
+        )
+        .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         assert!(m.env.contains_key("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"));
         assert!(m.env.contains_key("ELECTRON_RUN_AS_NODE"));
     }
@@ -1050,7 +1184,8 @@ mod tests {
             "sess_9",
             "E:/proj",
             None,
-        );
+        )
+        .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         assert_eq!(
             w.program,
             PathBuf::from("D:/Program Files/ZCode")
@@ -1093,13 +1228,15 @@ mod tests {
             "sess_9",
             "E:/proj",
             None,
-        );
+        )
+        .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         assert!(
             !absent.env.contains_key(ZCODE_PROVIDER_CONFIG_ENV),
             "推导路径不在场 → Windows 不设（不指向不存在的文件；真机实证见 gate::provider_config_env）"
         );
         let (_fixture, fixture_root) = tmp_install("windows");
-        let present = build_argv(&ZcodeSpec::win(&fixture_root), "x", "s", "E:/p", None);
+        let present = build_argv(&ZcodeSpec::win(&fixture_root), "x", "s", "E:/p", None)
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         assert!(
             present
                 .env
@@ -1115,7 +1252,8 @@ mod tests {
             "s",
             "/p",
             None,
-        );
+        )
+        .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         let cfg = m
             .env
             .get(ZCODE_PROVIDER_CONFIG_ENV)
@@ -1141,7 +1279,8 @@ mod tests {
     #[test]
     fn mode_flag_is_injected_from_the_permission_spec() {
         let spec = PermissionSpec::zcode_default();
-        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_1", "E:/p", None);
+        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_1", "E:/p", None)
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         let i = inv
             .argv
             .iter()
@@ -1186,7 +1325,8 @@ mod tests {
     #[test]
     fn create_form_omits_resume_and_keeps_the_flag_order() {
         let spec = ZcodeSpec::win("D:/Program Files/ZCode");
-        let c = build_create_argv(&spec, "hi", "E:/proj", Some("iPad"));
+        let c = build_create_argv(&spec, "hi", "E:/proj", Some("iPad"))
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
         assert!(
             !c.argv.iter().any(|a| a == "--resume"),
             "H10 新建形态绝无 `--resume`（无在册会话可续）: {:?}",
@@ -1219,7 +1359,8 @@ mod tests {
             c.argv
         );
         // 与 H7 形态同源：只差 resume 两位
-        let h7 = build_argv(&spec, "hi", "sess_9", "E:/proj", Some("iPad"));
+        let h7 = build_argv(&spec, "hi", "sess_9", "E:/proj", Some("iPad"))
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         let mut expected_drop = h7.argv.clone();
         let ri = expected_drop
             .iter()
@@ -1257,7 +1398,8 @@ mod tests {
             "sess_1",
             "E:/p",
             Some("iPad"),
-        );
+        )
+        .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         assert_eq!(
             inv.prompt, "第一行\\n第二行 [mobile iPad]",
             "多行归一走 W4 单点（字面 \\n）+ 尾签名"
@@ -1269,7 +1411,8 @@ mod tests {
             "s",
             "E:/p",
             None,
-        );
+        )
+        .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         assert_eq!(
             raw.prompt, "已拼好 [mobile iPad]",
             "None = 原样（不二次签名）"
@@ -1701,7 +1844,8 @@ mod tests {
             "sess_1",
             "E:/p",
             Some("iPad"),
-        );
+        )
+        .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let waits = Arc::new(Mutex::new(Vec::new()));
         let seam = scripted_seam(counter.clone(), 1);
@@ -1730,7 +1874,8 @@ mod tests {
     /// 尝试 3 次（= 重试上限 + 1），退避 2 次
     #[tokio::test]
     async fn run_turn_reports_workspace_busy_after_retries() {
-        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_1", "E:/p", None);
+        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_1", "E:/p", None)
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let waits = Arc::new(Mutex::new(Vec::new()));
         let seam = scripted_seam(counter.clone(), usize::MAX);
@@ -1754,11 +1899,334 @@ mod tests {
         assert_eq!(waits.lock().unwrap().len(), BUSY_MAX_RETRIES);
     }
 
+    /// **R9：退避窗内的取消必须收尾为 cancelled**——争用锁拒绝时子进程已经退了，runner 的
+    /// 取消靶子随 `disarm` 消失：此刻移动端叫停只落在登记表上，旧实现静默吞掉它、照样再试。
+    ///
+    /// 还原动作（变异）：把 `run_turn` 退避后的取消检查点删掉 → 本用例先红
+    /// （尝试 1 → 3、终态 `failed(workspace_busy)`）。
+    #[tokio::test]
+    async fn run_turn_honours_cancel_during_busy_backoff() {
+        let sid = "sess_zcode_busy_cancel";
+        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", sid, "E:/p", None)
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
+        registry().begin(sid, TurnSlot::placeholder("zcode", "hi".into()));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seam = scripted_seam(runs.clone(), usize::MAX); // 恒忙：旧实现会试满 3 次
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let delivery = Arc::new(Mutex::new(None));
+        let mut deps = test_deps(true, waits.clone());
+        deps.wait = Box::new({
+            let waits = waits.clone();
+            let delivery = delivery.clone();
+            move |d: Duration| {
+                let waits = waits.clone();
+                let delivery = delivery.clone();
+                Box::pin(async move {
+                    waits
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(d.as_millis() as u64);
+                    // 退避窗内到达的取消（生产 = 取消端点经登记表打的同一发）
+                    *delivery.lock().unwrap_or_else(|e| e.into_inner()) =
+                        registry().request_cancel(sid);
+                })
+            }
+        });
+        let out = run_turn(
+            &inv,
+            sid,
+            "E:/p",
+            &|_: &ZcodeInvocation| RunnerCfg::for_test().session_id(sid),
+            &deps,
+            &*seam,
+        )
+        .await;
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "退避窗内叫停后不得再发起任何尝试（执行缝只能被调一次）"
+        );
+        assert_eq!(out.attempts, 1, "尝试计数不得增加");
+        assert_eq!(
+            out.receipt.status,
+            ReceiptStatus::Cancelled,
+            "终态必须是 cancelled（旧实现落到 failed(workspace_busy)）: {:?}",
+            out.receipt
+        );
+        assert_eq!(
+            out.receipt.stage, None,
+            "取消不是失败阶段——不得报成 timeout / channel_error"
+        );
+        assert_eq!(out.receipt.session_id, sid, "取消回执带出会话号");
+        assert_eq!(
+            out.receipt_source,
+            ReceiptSource::NotApplicable,
+            "取消档不咨询会话库（与 codex cancelled_outcome 同口径）"
+        );
+        assert!(!out.busy_final, "取消不是「工作区忙」终态");
+        assert_eq!(
+            receipt_result_word(&out.receipt),
+            "cancelled",
+            "审计 result 列 = 取消终态词（耗时由 audit_result 追加）"
+        );
+        assert!(
+            crate::inject::headless::audit_result(&receipt_result_word(&out.receipt), 12)
+                .starts_with("cancelled · "),
+            "审计行按批次口径渲染为「cancelled · <n>ms」"
+        );
+        assert_eq!(
+            *delivery.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(true),
+            "退避窗内的取消必须如实报「送达」——否则取消端点谎报「回合已终结」且不落取消行"
+        );
+        assert_eq!(
+            registry().request_cancel(sid),
+            Some(false),
+            "回合终结后的迟到取消不得冒领送达（先到者生效）"
+        );
+        registry().end(sid);
+    }
+
+    /// **R9②（回归锁）：回合已以别的工作区忙终态收尾后，迟到的取消不得被冒领**——
+    /// 冒领会让取消端点为一个并非因取消而终结的回合落 `cancelled` 取消审计行
+    /// （与回合自身的 `headless` 行口径矛盾）。
+    #[tokio::test]
+    async fn late_cancel_after_busy_terminal_turn_is_not_claimed() {
+        let sid = "sess_zcode_late_cancel";
+        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", sid, "E:/p", None)
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
+        registry().begin(sid, TurnSlot::placeholder("zcode", "hi".into()));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seam = scripted_seam(runs.clone(), usize::MAX);
+        let out = run_turn(
+            &inv,
+            sid,
+            "E:/p",
+            &|_: &ZcodeInvocation| RunnerCfg::for_test().session_id(sid),
+            &test_deps(true, Arc::new(Mutex::new(Vec::new()))),
+            &*seam,
+        )
+        .await;
+        assert!(out.busy_final, "恒忙 ⇒ 终态就是工作区忙: {:?}", out.receipt);
+        assert_eq!(
+            registry().request_cancel(sid),
+            Some(false),
+            "回合已终结（闩已落幕）⇒ 迟到取消如实未送达"
+        );
+        registry().end(sid);
+    }
+
+    /// **R9 微窗口（R12-S3 / 裁决 24c-③）**：闩检查通过之后、下一发**武装**前后到达的取消。
+    ///
+    /// 窗口（**R9 引入退避窗检查点之后仍在**的一段）：退避后的检查点（`run_turn` 循环尾）与下一发
+    /// `registry().arm` 之间还有一段（`make_runner` 读设置 + 武装本身）——落在其中的取消会让
+    /// **下一发照跑**：闩记得住（取消端点据此如实报「送达」），但那一发既没被叫停、也白跑一次
+    /// （恒忙夹具下 = 多起一次进程；真机上可能跑完整个回合），用户看到的「已取消」与回合实际
+    /// 结局矛盾。**复检臂**关掉的正是这段：武装之后、起跑之前再查一次闩。
+    ///
+    /// 时序构造（本用例的关键）：第 2 发的 `make_runner`（= 武装**之前**那一步）里发取消——
+    /// 此刻槽位上的靶子仍是**第 1 发武装的闩靶子**，故这一发正落在闩上（`request_cancel`
+    /// 返回 `Some(true)`：进程已退、但回合仍在跑 ⇒ 如实「送达」）。
+    ///
+    /// 还原动作（变异）：删掉武装后的闩复检 → 本用例先红，**红例形态已实跑核过**（收尾轮 U5
+    /// 更正）：执行缝被调 **2** 次（`runs=2`；红在「执行缝只能被调一次」那一条）、
+    /// `attempts=2`、由退避后的**循环尾**检查点收尾 ⇒ 终态**仍是 `cancelled`**、登记表槽位
+    /// **仍在飞**（留给包装器注销）。即**这一发白跑了一次**，而不是试满 3 次。
+    /// ⚠️「试满 3 次 + `failed(workspace_busy)`」是 **R9 退避窗检查点也一并删掉**（= R9 之前的
+    /// 基线）时的形态——两个窗口不同，别把本用例的变异写成那个形态。
+    #[tokio::test]
+    async fn run_turn_honours_cancel_arriving_just_after_arm() {
+        use std::sync::atomic::Ordering;
+        let sid = "sess_zcode_arm_window";
+        let inv =
+            build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", sid, "E:/p", None).expect("测试花名在册");
+        registry().begin(sid, TurnSlot::placeholder("zcode", "hi".into()));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seam = scripted_seam(runs.clone(), usize::MAX); // 恒忙：不修就会试满 3 次
+        let issued = Arc::new(Mutex::new(None));
+        let make = {
+            let runs = runs.clone();
+            let issued = issued.clone();
+            move |_: &ZcodeInvocation| {
+                // 第 2 发武装之前发取消（只发一次——第一发已跑过执行缝即说明闩检查已通过）
+                if runs.load(Ordering::SeqCst) >= 1 {
+                    let mut g = issued.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.is_none() {
+                        *g = registry().request_cancel(sid);
+                    }
+                }
+                RunnerCfg::for_test().session_id(sid)
+            }
+        };
+        let out = run_turn(
+            &inv,
+            sid,
+            "E:/p",
+            &make,
+            &test_deps(true, Arc::new(Mutex::new(Vec::new()))),
+            &*seam,
+        )
+        .await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "微窗口内叫停后不得再发起任何尝试（执行缝只能被调一次）"
+        );
+        assert_eq!(
+            out.attempts, 2,
+            "第 2 发在**起跑前**收尾（尝试计数只到 2，不再 +1）"
+        );
+        assert_eq!(
+            out.receipt.status,
+            ReceiptStatus::Cancelled,
+            "终态必须是 cancelled（旧实现落到 failed(workspace_busy)）: {:?}",
+            out.receipt
+        );
+        assert_eq!(
+            out.receipt.stage, None,
+            "取消不是失败阶段——不得报成 timeout / channel_error"
+        );
+        assert_eq!(out.receipt.session_id, sid, "取消回执带出会话号");
+        assert_eq!(
+            out.receipt_source,
+            ReceiptSource::NotApplicable,
+            "取消档不咨询会话库（与退避窗臂同口径）"
+        );
+        assert!(!out.busy_final, "取消不是「工作区忙」终态");
+        assert_eq!(receipt_result_word(&out.receipt), "cancelled");
+        assert_eq!(
+            *issued.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(true),
+            "微窗口里的取消必须如实报「送达」（闩记得住——否则取消端点谎报「回合已终结」）"
+        );
+        // **登记表本身**的断言（不只是回执）：槽位**仍在飞**——注销归**包装器**（同一 detached
+        // 任务里写完审计行之后），本臂**不代庖**（单主不变量；竞态与红例见
+        // `post_arm_cancel_does_not_end_the_slot_the_wrapper_owns`）
+        assert!(
+            registry().in_flight(sid),
+            "复检臂不得注销槽位（注销归包装器：remote::api::run_zcode_turn 的审计行之后）"
+        );
+        // 包装器注销（同形动作）→ 会话锁释放、不留已武装靶子
+        registry().end(sid);
+        assert!(
+            !registry().in_flight(sid),
+            "包装器注销后会话锁必须释放（否则该会话被自己的串行锁挡死）"
+        );
+        assert!(
+            registry().cancel_snapshot(sid).is_none(),
+            "包装器注销后不得留下已武装靶子（残留占位会让下一次取消请求打在一个已终结的回合上）"
+        );
+    }
+
+    /// **U1 · 单主不变量：复检臂不得注销它不拥有的槽位**（收尾轮，2026-10-05）。
+    ///
+    /// 上一轮的复检臂在返回 `cancelled` 之前顺手 `registry().end(session_id)`——可它**不是**
+    /// 槽位的主人：`begin`/`end` 都归**包装器**（`remote::api::run_zcode_turn` 的
+    /// `registry().end(&ctx.sid)` 落在审计行**之后**；新建通道同形，见 `session_create_zcode`
+    /// 的 `registry().end(&lock_key)`）。误删竞态（本用例钉死的就是它）：
+    /// ① 复检命中 → `run_turn` 抢先注销**旧**槽位；② 包装器还要写一行审计（SQLite 写），
+    /// 这个窗口里移动端立刻发下一条 ⇒ **新回合 `begin()` 成功**（旧槽位已不在，串行锁放行）；
+    /// ③ 包装器回到 `registry().end(sid)`——按**会话号**删，删掉的正是**新**回合的槽位
+    /// （新回合此后无取消靶子、串行锁形同虚设，而它自己的 `end` 还会再去删下一条……）。
+    ///
+    /// 断言三件事：① 包装器注销之前的 `begin()` 必须被串行锁**如实拒绝**——旧槽位仍在飞就
+    /// 没有「新槽位」，也就不存在能被陈旧 `end` 误删的对象（**红例即此条**：旧实现里 begin
+    /// 竟成功）；② 上一条的**因** = **单主不变量**（复检命中后旧槽位必须还在，旧实现此处已删）；
+    /// ③ 包装器注销之后新回合方能占位，且此后**没有任何陈旧 `end`** 会波及它（新槽位存活）。
+    ///
+    /// 还原动作（变异）：把 `registry().end(session_id)` 加回复检臂 → ① 先红（`begin` 成功）、
+    /// ② 随之也红（`in_flight`/快照为空）。
+    #[tokio::test]
+    async fn post_arm_cancel_does_not_end_the_slot_the_wrapper_owns() {
+        use std::sync::atomic::Ordering;
+        let sid = "sess_zcode_slot_owner";
+        let inv =
+            build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", sid, "E:/p", None).expect("测试花名在册");
+        assert!(
+            registry().begin(sid, TurnSlot::placeholder("zcode", "first".into())),
+            "包装器占位（生产 = zcode_headless_dispatch 的串行锁臂）"
+        );
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seam = scripted_seam(runs.clone(), usize::MAX); // 恒忙：不修就会试满 3 次
+
+        // 与 S3 用例同一时序构造：第 2 发武装**之前**发取消（落在第 1 发武装的闩靶子上）
+        let issued = Arc::new(Mutex::new(None));
+        let make = {
+            let runs = runs.clone();
+            let issued = issued.clone();
+            move |_: &ZcodeInvocation| {
+                if runs.load(Ordering::SeqCst) >= 1 {
+                    let mut g = issued.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.is_none() {
+                        *g = registry().request_cancel(sid);
+                    }
+                }
+                RunnerCfg::for_test().session_id(sid)
+            }
+        };
+        let out = run_turn(
+            &inv,
+            sid,
+            "E:/p",
+            &make,
+            &test_deps(true, Arc::new(Mutex::new(Vec::new()))),
+            &*seam,
+        )
+        .await;
+        assert_eq!(
+            out.receipt.status,
+            ReceiptStatus::Cancelled,
+            "复检命中 ⇒ 回执仍是 cancelled（只有槽位归属变，回执不变）: {:?}",
+            out.receipt
+        );
+        assert_eq!(
+            *issued.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(true),
+            "这一发必须如实报「送达」（闩记得住）"
+        );
+        // ① 竞态本体的**否定面**（先断言它，红例即竞态本身）：包装器的审计窗口里，移动端
+        //    发下一条 ⇒ 新回合占位**必须被串行锁如实拒绝**（旧槽位仍在飞 ⇒ 不存在「新槽位」，
+        //    也就没有能被陈旧 `end` 误删的对象）。旧实现此处 begin 成功 = 竞态成立。
+        let old_slot = registry().slot_snapshot(sid).map(|(c, _, _)| c);
+        let started_new = registry().begin(sid, TurnSlot::placeholder("zcode", "second".into()));
+        assert!(
+            !started_new,
+            "复检臂抢先注销旧槽位 ⇒ 包装器审计窗口内的新回合得以占位（begin={started_new}）\
+             ⇒ 包装器随后按会话号注销时删掉的正是**新**回合的槽位（竞态本体）"
+        );
+        // ② 上一条的**因**（单主不变量）：复检臂只回回执，不动别人的槽位
+        assert_eq!(
+            old_slot.as_deref(),
+            Some("first"),
+            "复检臂不得 end() 它不拥有的槽位（注销归包装器：审计行之后）——旧实现此处槽位已空"
+        );
+        assert_eq!(
+            registry().slot_snapshot(sid).map(|(c, _, _)| c).as_deref(),
+            Some("first"),
+            "旧槽位（正文/工具/通道）必须原样留存，直到包装器注销"
+        );
+        // ③ 包装器注销（= `remote::api::run_zcode_turn` 的同形动作）之后，新回合才能占位；
+        //    此后没有任何陈旧 end 会波及它 —— 新槽位存活
+        registry().end(sid);
+        assert!(!registry().in_flight(sid), "包装器注销后旧槽位释放");
+        assert!(
+            registry().begin(sid, TurnSlot::placeholder("zcode", "second".into())),
+            "旧槽位释放后，新回合才能占位"
+        );
+        assert_eq!(
+            registry().slot_snapshot(sid).map(|(c, _, _)| c).as_deref(),
+            Some("second"),
+            "新回合槽位存活（不被任何陈旧 end 波及）"
+        );
+        registry().end(sid);
+    }
+
     /// APP 已离开该工作区 → 立即重试（不空等）；0 退出但**无 JSON 帧** → channel_error
     /// （不把「没产出」报成 ok——Mac 缺 provider config 的静默形态）
     #[tokio::test]
     async fn run_turn_retries_immediately_when_idle_and_flags_empty_output() {
-        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_1", "E:/p", None);
+        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_1", "E:/p", None)
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let waits = Arc::new(Mutex::new(Vec::new()));
         let seam = scripted_seam(counter, 1);
@@ -1932,7 +2400,8 @@ mod tests {
     /// 也把 H6 的 `lastAssistant`/`tokens`/`durationMs` 真正兑现
     #[tokio::test]
     async fn run_turn_builds_receipt_from_session_store() {
-        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_db", "E:/p", None);
+        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_db", "E:/p", None)
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         let seam = scripted_seam(Arc::new(std::sync::atomic::AtomicUsize::new(0)), 0);
         // 逐行无 JSON 的 stdout（真机 resume 形态）
         let empty_stdout: Box<RunSeam> = Box::new(|cfg: RunnerCfg| {
@@ -1980,7 +2449,8 @@ mod tests {
     /// 不冒充成功）；原因点明「库里没有新的 assistant 回复」
     #[tokio::test]
     async fn run_turn_reports_unconfirmed_when_store_shows_no_new_assistant() {
-        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_db2", "E:/p", None);
+        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_db2", "E:/p", None)
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         let empty_stdout: Box<RunSeam> = Box::new(|cfg: RunnerCfg| {
             let mut cfg = cfg;
             cfg = cfg.stdout_lines(vec!["ZCode Built-in skipped (not-due)".to_string()]);
@@ -2035,7 +2505,8 @@ mod tests {
     /// （懒落库/WAL 可见性），并如实给 Ok 回执
     #[tokio::test]
     async fn run_turn_polls_store_until_the_write_lands() {
-        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_db3", "E:/p", None);
+        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_db3", "E:/p", None)
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         let empty_stdout: Box<RunSeam> = Box::new(|cfg: RunnerCfg| {
             let mut cfg = cfg;
             cfg = cfg.stdout_lines(vec!["ZCode Built-in skipped (not-due)".to_string()]);
@@ -2079,7 +2550,8 @@ mod tests {
     /// stdout JSON **优先于**库（Task 6 原口径不退化；未来子命令仍可能出 JSON）
     #[tokio::test]
     async fn run_turn_prefers_stdout_json_over_store() {
-        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_db4", "E:/p", None);
+        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_db4", "E:/p", None)
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         let seam = scripted_seam(Arc::new(std::sync::atomic::AtomicUsize::new(0)), 0);
         let (probe, calls) = store_queue(vec![
             Some(snap(10, Some("m1"), Some("上一轮"), Some(5))),
@@ -2115,7 +2587,8 @@ mod tests {
             "sess_cancel",
             "E:/p",
             None,
-        );
+        )
+        .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         registry().begin("sess_cancel", TurnSlot::placeholder("zcode", "hi".into()));
         let seam: Box<RunSeam> = Box::new(|cfg: RunnerCfg| {
             Box::pin(async move {

@@ -36,7 +36,8 @@
 //! # 消费确认自建（回执诚实性的核心）
 //! `queue` 的 exit 0 只是「已入队」：本模块在**回合前**记目标 rollout 的字节长度基线，
 //! 入队后**有界轮询** `[基线..EOF]` 的新增段（命中消息文本 = 已消费）；超时仍未命中时
-//! 再查 `~/.codex/queue_1.sqlite` **副本**的 `queued_items`（活库不直查纪律）交叉验证，
+//! 再查 `~/.codex/queue_1.sqlite` **副本**的 `queued_items` 交叉验证（**codex 特例**：APP 持
+//! WAL 写锁，故走副本——**裁决 20 豁免项**；WB 已改只读直连，两者不是同一条纪律），
 //! 且**按入队回执 id 认领本条目**（只凭 thread 有行会变成「本条未消费」的过度断言）：
 //! - 命中本条目 id ⇒ 「**已入队未消费**」+ 观测事实（等待 N s 无追加）+ **可能原因**
 //!   （thread 未在 APP 打开；Mac 实测可滞留 19.2 分钟，Windows 抽验消费 ~55s——58s 预算
@@ -64,9 +65,17 @@
 //! `.cmd`/`.bat` 时走此路（[`spawn_shape`]）。
 //! 缓解 = [`codex_in_path`] 的 `.exe` 优先——但该优先序**只在同一目录内生效**（PATH 顺序
 //! 仍先于扩展名优先），故本机这种「PATH 上只有 npm 垫片」的安装**正在走垫片路径**。
-//! 结论：本形态**登记为已知限制**，关闭路径 = 实机探测定案（Task 15 实机批次：用含
-//! `"` `&` `%VAR%` 的载荷真跑一次，记录 cmd 的实际行为，再决定是否需要「经 `codex.js`
-//! 反解真实 exe」或「拒绝含危险字符的正文」）——本任务不做未经证据的猜测式加固。
+//! 结论（**R3 复审升级**）：该形态原先只「登记为已知限制」，现升级为**投递前拒绝**——
+//! [`super::turn::cmd_shim_body_refusal`]（正文 + 已解析形态 ⇒ 放行/拒绝，通道无关单点）
+//! 在两处分派点（本通道 + `cli_three` 的 kimi/opencode 臂）拒绝含元字符的正文，回执档 =
+//! `Stage::Refused`（未起跑、零字节投递，文案风格同斜杠命令拒绝）。`.exe` 直装不受影响。
+//! **签名面已收口（裁决 24b，收尾轮）**：R3 当时只判**用户正文**——我们追加的
+//! `[mobile <花名>]` 签名不在判据内，故花名含 `&`/`%` 时该签名仍可能被 cmd 重解析（本条当时
+//! **如实登记为残留**）。收尾轮按当时写下的收口方向落地：花名走**白名单**
+//! [`super::turn::device_name_refusal`]（Unicode 字母数字 + 空格 `-` `_` `.` `·`），判据落在
+//! **共享组装单点** [`crate::inject::normalize::compose_injection`]（拼签名前 fail closed，
+//! 回执档同样 `refused`）+ 设备名注册点（`remote::api::persist_and_cookie`，拒登记）。
+//! **残留已关**（不再是敞口）：本通道的签名由 compose 单点产出，无第二条拼签名路径。
 //!
 //! # 测试纪律（宪法级）
 //! 单测**绝不** spawn 真 codex（真实账号配额 + 真实 `~/.codex` 读写）：CLI 发现、rollout 定位、
@@ -534,9 +543,12 @@ pub fn queue_evidence_in_db(db_path: &Path, thread: &str, msg_id: &str) -> Optio
     })
 }
 
-/// **活库不直查纪律**（同 H12/WB 口径）：把队列库 **复制**到临时文件再查——APP 持 WAL
-/// 写锁，直查会阻塞甚至被拒。`-wal`/`-shm` 一并复制（WAL 里才有最近的提交）。副本读完
-/// 逐个文件删除（**不做递归删除**）
+/// **codex 特例：APP 持 WAL 写锁故走副本（裁决 20 豁免项；WB 已改只读直连）**：把队列库
+/// **复制**到临时文件再查——APP 持 WAL 写锁，直查会阻塞甚至被拒。`-wal`/`-shm` 一并复制
+/// （WAL 里才有最近的提交）。副本读完逐个文件删除（**不做递归删除**）。
+/// 注意与「只读直连」的区别：项目读侧纪律是**只读连接直查活库**（裁决 20，WB/zcode/opencode
+/// 同规），codex **队列库**是**唯一豁免**——写锁在 APP 手里，只读连接也拿不到一致视图。
+/// 别把本函数「统一」成只读直连（那会在这条通道上引入阻塞/被拒）。
 pub fn queue_evidence_via_replica(
     db_path: &Path,
     thread: &str,
@@ -1084,7 +1096,8 @@ pub fn production_rollout_path(home: Option<&Path>, session_id: &str) -> Option<
     }
 }
 
-/// 队列滞留查询：`~/.codex/queue_*.sqlite` **副本**读（版本号取最大者，发现口径与
+/// 队列滞留查询：`~/.codex/queue_*.sqlite` **副本**读（**codex 特例**：APP 持 WAL 写锁故走
+/// 副本，**裁决 20 豁免项**——见 [`queue_evidence_via_replica`]；版本号取最大者，发现口径与
 /// state/history 双库同源）。**`cfg(test)` 恒 `None`** = 「无法确认」（绝不读真实 ~/.codex）
 pub fn production_queue_holds(thread: &str, msg_id: &str) -> Option<QueueEvidence> {
     #[cfg(test)]
@@ -1769,8 +1782,9 @@ mod tests {
         );
     }
 
-    /// **活库不直查纪律**：队列副本读只碰副本，源库字节原样（本机实测 APP 持 WAL 写锁）；
-    /// 副本读完即清（逐个文件删，不做递归删除）
+    /// **codex 特例：APP 持 WAL 写锁故走副本（裁决 20 豁免项；WB 已改只读直连）**：队列副本
+    /// 读只碰副本，源库字节原样（本机实测 APP 持 WAL 写锁）；副本读完即清（逐个文件删，
+    /// 不做递归删除）
     #[test]
     fn queue_replica_read_never_touches_the_live_db() {
         let dir = tempfile::tempdir().unwrap();
@@ -1797,7 +1811,7 @@ mod tests {
         assert_eq!(
             std::fs::read(&db).unwrap(),
             before,
-            "源库字节必须原样（活库不直查：只读副本）"
+            "源库字节必须原样（codex 特例：只读副本，不直查活库）"
         );
         assert_eq!(
             queue_evidence_via_replica(&dir.path().join("missing.sqlite"), UUID, "m9"),

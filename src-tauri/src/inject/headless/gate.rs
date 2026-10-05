@@ -487,7 +487,8 @@ mod tests {
             "sess_1",
             "E:/p",
             None,
-        );
+        )
+        .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
         assert!(
             turn.argv
                 .windows(want.len())

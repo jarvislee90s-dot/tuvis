@@ -360,7 +360,7 @@ pub(crate) fn exit_cleanup() {
     crate::remote::power::release();
     // H4（Task 6）：在飞无头进程**优雅关闭**——整树终结，不留孤儿。与隧道同一
     // 退出钩子；Windows 侧 Job 句柄（KILL_ON_JOB_CLOSE）是兜底，即使本钩子没
-    // 跑到也不留孤儿。重启后的孤儿自检需持久 pid 账本，登记在 Task 14。
+    // 跑到也不留孤儿。重启后的孤儿自检需持久 pid 账本，**排期下一批，见 issue #114（裁决 21）**（原注「登记在 Task 14」：Task 14 只交付 E2E 骨架，未实现本项）。
     let killed = crate::inject::headless::runner::shutdown_inflight();
     if killed > 0 {
         log::info!("退出：已终结 {killed} 个在飞无头进程树");

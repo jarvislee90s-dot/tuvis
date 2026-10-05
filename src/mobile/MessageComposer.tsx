@@ -445,12 +445,12 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
     const body = text.trim();
     if (!body || sending || busy || sendInfo === null || !sendInfo.injectable) return;
     if (attachments.some((a) => a.status === "uploading")) return; // 上传中禁发（防消息先于落盘）
-    // **无头通道分流判据**（Task 8 / H7）：在 try 之前定下来——catch 也必须知道本次是
-    // 无头发送（否则请求抛异常时回执卡会永远停在「无头回合进行中…」= 编造在飞态）。
-    const headless = headlessChannelOf(sendInfo) !== null;
     // 通道名（Task 13/C4）：随「发送中」上报——页面级回执卡据此**只在 claude 通道**上
     // 轮询审批卡（其余无头通道没有审批面，白轮询是浪费也是误导）
     const headlessChannel = headlessChannelOf(sendInfo);
+    // **无头通道分流判据**（Task 8 / H7）：在 try 之前定下来——catch 也必须知道本次是
+    // 无头发送（否则请求抛异常时回执卡会永远停在「无头回合进行中…」= 编造在飞态）。
+    const headless = headlessChannel !== null;
     const startedAt = Date.now();
     setSending(true);
     try {

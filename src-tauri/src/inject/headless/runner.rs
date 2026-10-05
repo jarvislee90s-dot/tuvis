@@ -20,8 +20,8 @@
 // MAM 退出时 [`shutdown_inflight`] 逐个终结（lib.rs `RunEvent::Exit` 接线）；Windows
 // 侧 Job 句柄随进程关闭触发 `KILL_ON_JOB_CLOSE`，即使退出钩子未跑到也不留孤儿。
 //
-// **重启后的孤儿自检 = 未实现，登记给 Task 14（E2E 批次）**，本文件只给到「退出即收」
-// 这一半。Task 14 需要补齐的最小件（照此做，别另起炉灶）：
+// **重启后的孤儿自检 = 未实现，排期下一批，见 issue #114（裁决 21）**，本文件只给到
+// 「退出即收」这一半。下一批需要补齐的最小件（照此做，别另起炉灶）：
 // ① **跨进程持久 pid 账本**：spawn 时把 `(tool, session_id, pid, 进程启动时刻)` 落库
 //    （退出时删行）——内存里的 [`inflight_registry`] 跨不过进程重启，光靠它查不到上代孤儿；
 // ② **启动清扫**：MAM 启动时遍历账本，用 pid + **启动时刻**双判据复核存活（裸 pid 会被
@@ -29,7 +29,7 @@
 //    [`TreeGuard::kill`]（Windows 收编后热终止 / POSIX 组信号）后再删行；
 // ③ **身份再验**：清扫前校验进程名/命令行确属本工具，避免误杀复用同一 pid 的无关进程；
 // ④ 该清扫需要进程侧查询（`window/win32.rs::collect_ancestor_pids` / sysinfo 同源），
-//    放在 Task 14 的 E2E 面，与「连续崩溃 N 次熔断提示」（H4 崩溃段）同批。
+//    放在**下一批**的 E2E 面，与「连续崩溃 N 次熔断提示」（H4 崩溃段）同批。
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -104,8 +104,16 @@ impl GlobalSem {
         }
     }
 
-    /// 阻塞取名额（端点侧排队泵用：先把「已排队 + 位次」回执发出去，再等名额放行）
-    pub fn acquire(&self) -> SemGuard {
+    /// 阻塞取名额（**今日只有用例在用**；生产路径走 [`Self::try_acquire`] 的**即时排队回执**
+    /// ——`RunnerCfg::run` 两处与端点均为「无名额即回 `queued` + 位次」，不阻塞等名额）。
+    ///
+    /// **`pub(crate)` + `#[cfg(test)]`**（R11）：调用点全部在本 crate 的 `#[cfg(test)]` 模块
+    /// （`runner`/`mod`/`wb_acp` 的用例）；集成测试（`src-tauri/tests/`）是**外部 crate**，
+    /// 只用 `global_sem()`/`RunnerCfg`，不直呼本函数。收窄可见性后 `cargo clippy --all-targets
+    /// -- -D warnings` 的 `dead_code` 会点名「生产构建零调用」——这正是事实，故按测试专用件
+    /// 标注，而不是用 `allow(dead_code)` 把它盖回生产面（将来若要上阻塞泵，再按需放开）。
+    #[cfg(test)]
+    pub(crate) fn acquire(&self) -> SemGuard {
         let mut st = self.lock();
         st.waiting += 1;
         while st.in_flight >= self.cap() {

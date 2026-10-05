@@ -21,7 +21,7 @@
 - 四家 CLI 的远程新建会话（独立轨道 `probe/remote-session-create`；本批只做 zcode 无头新建——该轨道明确排除的 APP 形态）
 - 推送网关 / APK 壳（三期收尾，裁决 16）
 
-## 2. 裁决记录（2026-09-27 对齐 + 2026-10-04 裁决门/落档补裁，实施不得重议）
+## 2. 裁决记录（2026-09-27 对齐 + 2026-10-04 裁决门/落档补裁 + 2026-10-05 复审裁决与补裁，实施不得重议）
 
 | # | 裁决 | 内容 |
 |---|---|---|
@@ -44,6 +44,14 @@
 | 17 | L13/L14 缺口排期 | **并入新增 C0 前置小批**（靶向 TTY 修法 + 插队诚实化，先于 C1 交付） |
 | 18 | 补测暴露的两处读侧缺陷（2026-10-04 晚） | **并入 C0 扩容**：① dsh 桌面端 rc.2 起会话日志代际升 `session.v4.jsonl.zstd`，解析器版本门未放行（正文「无消息」/新会话不上板的根因）→ 放宽正则（H1 扩容）〔**根因更正（2026-10-05，C0-① 实测）：真因是上层 `header.version` 白名单 `0..=3`，不是文件名正则**——见 §5 H1 与 §8 C0 行〕；② WB 5.7.3 交互会话心跳废弃（Test2 会话不上板的根因）→ 发现层改 workbuddy.db 双源（新增 H12） |
 | 19 | 实施计划范围（2026-10-04 落档时） | **本期实施计划只覆盖第一部分 H1–H13**（H12/H13 为整理补号，对应裁决 18 的 WB 读侧与裁决 11/16 的 dsh 写侧；C0 前置修复 + C1 底座与 zcode/codex APP 注入 + C2 WB/dsh 写侧 + H10 无头新建 + C4 三家 CLI 无头）；**M10 交接导出（§6 三件）与收尾杂项（§7，M7 终验已完成）移出本期，另立后续计划** |
+| 20 | WB 读侧纪律（2026-10-05 复审裁决） | **只读直连活库**（不是「读副本」）：`~/.workbuddy/workbuddy.db` 一律经共享 helper `monitor/sqlite.rs::open_readonly_with_timeout` 打开（`SQLITE_OPEN_READ_ONLY` + `busy_timeout(1000)`，与 zcode/opencode **同纪律**），**不落任何写、不拷副本**——原措辞「读副本查询（活库不直查）」的**意图是「绝不写活库」**，由只读连接达成；§5 H12 与 §9 输入输出总表措辞随之更正（代码事实见 §5 H12 与本表裁决 18） |
+| 21 | 重启后的孤儿自检（2026-10-05 复审裁决） | **本批不做，排期下一批**：MAM 重启后遗留的无头孤儿进程自检**本批未实现**（代码自述「登记给 Task 14」，而 Task 14 只交付了 E2E 骨架）——已登记 issue **[#114](https://github.com/jarvislee90s-dot/MultiAgents-Manager/issues/114)**，**下一批自此起步**（实现清单四件 = ①跨进程持久 pid 账本 ②启动清扫 ③身份再验 ④进程侧查询落点，见计划遗留登记 **L-15** 与 `src-tauri/src/inject/headless/runner.rs:23-32` 模块头；退出钩子现状 = `src-tauri/src/lib.rs:322`（`runner::shutdown_inflight()`；注释 `:319-321`），只给到「退出即收」这一半）。缺口定性：Windows 侧由 Job Object 结构性覆盖（`KILL_ON_JOB_CLOSE`），**真实缺口在 POSIX**（`process_group(0)` 只保证「可整组杀」、不保证「父死子亡」）。**本批未做 ≠ 已交付**——勿因 Task 14 已完成而当作已实现 |
+| 22 | 审批端点与 H3 总开关同冻（2026-10-05 复审裁决） | **审批应答端点与 H3 总开关同生共死**（实现 = R4，2026-10-05 评审返工轮；原 22 个 R/S/U 返工 commit 已合并为单一返工 commit，见该 commit message 中的原区间记录）：总开关关闭（默认态）⇒ `POST /m/api/v1/session-headless-approve` 回 **403 `headless_disabled`**（码与文案单点 = `src-tauri/src/remote/api.rs` 的 `headless_disabled_forbidden`，与 `session-create-zcode` 同源），**门位 = ①参数 ②设备身份 ③开关 ④待答项查询**（开关在查询**之前**：`remote/api.rs` 的 `session_headless_approve` 里 `headless_enabled_conn` 门排在 `pending_registry().payload_of` 之前 ⇒ 关闭态连待答项都不读，**零消费**）。**冻结语义**：已在飞的无头回合**继续运行**（H3 是**动作门**、不是回合控制器），只是这张卡从此答不动；该回合随后由既有 **watchdog 到点诚实终结**——`failed(timeout)` + reason 明写「回合当时**正在等待审批/问答应答**」，审计行 `action=headless` + `result=failed(timeout)`，待答项由回合自身注销（卡消失）。即**不伪造成功、不静默吞掉这张卡**；冻结期的应答丢失是「未答」，由回执如实报成超时。**取数端点的门位（本行原文记「当前读法、不是定论」——2026-10-05 **补裁 24a** 已升格为**定论**，见本表第 24 行）**：被门住的是**审批决策端点**；**审批卡取数端点 `GET /m/api/v1/session-headless-approval` 有意不过门**（`remote/api.rs` 的 `session_headless_approval` 只校验参数与设备身份，函数内 `let _ = &st;` 明示不读开关）——**读不是动作**，冻结期的卡面仍可见，移动端据此把 403 的原因渲染出来（`src/mobile/SessionDetail.tsx` 的「应答失败」分支：`ApiError.data.reason` 原样透出为「应答失败：…」）；若连读都门住，用户只会看到「没有待答项」，那是**假话** |
+| 23 | 设置类动作的审计通道（2026-10-05 复审裁决） | **定案（不是缺口，勿登记为遗留）**：无头总开关的审计走 **`remote_audit` 日志出口**（`events::audit` 的 `headless_toggled`；单点 = `remote/mod.rs` 的 `toggle_headless_core`），**刻意不写 `write_audit` 表**——后者是**移动端注入动作账本**（`database/schema.rs` 的 `write_audit`：9 列全 NOT NULL，含 `device_id/device_name/session_id/channel` 上下文，摘要列名 `summary`），桌面设置翻转没有这些上下文。既有先例同机制：`channel_toggled` / `pin_set`（设置类）与无头超时/并发两键。**两轨分工不得互改**（别把开关「补」进表，也别把注入账本改成日志）。**事实核对**：`src/mobile` 目前**无任何审计面**（全目录唯一一处 `audit` 是 `MessageComposer.tsx:144` 的注释，既无审计页组件也无审计 API 调用；审计页在桌面侧 `src/components/settings/AuditLogSection.tsx`，读的就是该表）。**前瞻项（非缺口）**：将来若为移动端建审计页，再评估把日志镜像进表，届时重新裁决 |
+| 24 | 审批卡取数端点有意不过门（**2026-10-05 补裁 24a**——裁决 22 的读法升格为定论） | **补裁（日期：2026-10-05）**：裁决 22 里「审批卡取数端点 `GET /m/api/v1/session-headless-approval` 有意不过门」由「当前读法、非定论」**升格为定论**——不是漏门，是**有意设计**。总开关关闭（默认态）时的三件事：**① 卡可见**（GET 照常服务，只校验参数与设备身份；见 `remote/api.rs` 的 `session_headless_approval`，函数内 `let _ = &st;` 明示不读开关）；**② 按不动**（POST `/session-headless-approve` ⇒ 403 `headless_disabled`，冻结期**零消费**，见裁决 22）；**③ 如实告知用户「有一个在飞的回合正等你批」**——读不是动作，把读也门住只会让用户看到「没有待答项」，那是**假话**。语义落点 = `src-tauri/src/remote/api.rs` 的 GET 端点文档（定论口径：卡可见、按不动、如实告知在飞回合存在）+ POST 端点文档（裁决 22 冻结语义，交叉引用本行）；移动端据此把 403 的原因原样渲染（`src/mobile/SessionDetail.tsx` 的「应答失败」分支：`ApiError.data.reason` → 「应答失败：…」）。冻结中的回合仍由既有 watchdog 到点诚实终结（`failed(timeout)`，见裁决 22） |
+| 25 | 花名白名单**有意从严**（2026-10-05 裁决） | **定案（文档化，判据代码零改动）**：`inject::headless::turn::device_name_refusal` 的**字符类白名单**（Unicode 字母数字 + 空格 `-` `_` `.` `·`）是**故意收窄**的——**自定义花名用常规字符即可，emoji / 未列举符号一律拒**；**不按威胁面逐个放宽**（**即便**某符号在 `cmd` 下未必真能被解析成动作）。用户理由：要在 `cmd` 重解析面**之上留余量**，不做「该字符看起来无害」的减法论证。落点 = ① 判据本体文档（`src-tauri/src/inject/headless/turn.rs` 的 `device_name_refusal`「有意从严（裁决 25）」节）+ ② 组装单点的调用点注释（`src-tauri/src/inject/normalize.rs` 的 `compose_injection` 文档）——**只写文档，不改代码**（本条即该轮 U4）。判据的全部调用点见 `device_name_refusal` 的调用点节（组装单点 / 配对登记点 / 改名内核，裁决 26）|
+| 26 | 改名路径补门（2026-10-05 裁决） | **`remote_rename_device` 与配对登记点同门同码**（实现 = 收尾轮 U2）：改名内核 `remote::rename_device_core` 在**触 DAO 之前**过唯一决策点 `inject::headless::turn::device_name_refusal`（**不另写第二份白名单**），危险花名返回 **`device_name_unsafe: <原因>`**——与配对点**同错误码、同一句原因文案**（码单点 = `turn::DEVICE_NAME_UNSAFE_CODE`，配对点的 JSON `error` 字段也改读它，两处不可能漂移）。**对称性就是本条的目的**：错误必须在**改名当下**浮出，不能拖到投递时才炸。原因文案只点名具体字符，**不回写危险花名原文**（改名路径不落任何含花名的日志；成功审计行只记 `id=`）。上一轮把改名路径**有意**留作敞口（登记的取舍，见 `device_name_refusal` 调用点节）——本条关闭它，相关注释（`turn.rs` 调用点节、`remote/api.rs` 的 `persist_and_cookie` 文档）已同步更正，代码不再声称「未加门」。测试：危险花名 ⇒ 拒 + **不触 DAO** + 库里旧名原样（`rename_device_core_unsafe_name_rejected_without_dao_call` / `rename_device_core_unsafe_name_leaves_db_name_unchanged`）；中文与白名单内点缀字符 ⇒ 放行（`rename_device_core_accepts_normal_and_chinese_names_end_to_end`） |
+| 27 | R9 spawn 窗口残余登记（2026-10-05 裁决） | **登记为已知限制 + 另立 issue 排下一批**（不阻塞本批合并）：`run_turn` 的取消复检（R9 微窗，见裁决 24c-③）只覆盖「武装后、`run()` 之前」；取消若落在 `run()` 内部而 runner **尚未武装**取消 sink（**spawn 窗口**，含并发名额满的 `queued` 早退臂）⇒ 闩记「已送达」但**不生效**，那一发的回执按**实际结局**如实上报（可能是 `ok`，即「叫停来晚了，这一发已经跑完」——不谎报）。已登记 issue **[#115](https://github.com/jarvislee90s-dot/MultiAgents-Manager/issues/115)**（`gh issue view 115` 核过：`runner` 底座改造——取消管道武装前移到 spawn 之前；OPEN），计划遗留登记 = 本节之后的「遗留与跟进登记」**L-36**，**排期下一批**。定性：毫秒级窗口，后果 = 多跑一发（token 消耗）而**非**数据风险（串行锁与审计不受影响）；**勿用「跑完后查闩改判 `cancelled`」的错误修法**（会把已跑完的回合谎报成取消） |
 
 ## 3. 现状与证据基线（2026-09-27 立项时快照；探测后演进以附录 D 为准——如 codex 0.156.1→0.160.0、WB 内嵌 2.115→2.137/5.7.3、dsh 端口归属等）
 
@@ -108,7 +116,7 @@
 
 - **需求**：无头注入（H7–H11）**默认关闭，显式开启**（裁决 10）；用户知情后才暴露该安全面。
 - **输入**：设置页远程区「无头注入」开关（**单一总开关**，裁决 9 不做每工具分开关）。
-- **输出与效果**：开关状态持久化 settings 表并随 `remote_status` 下发；关闭态下移动端对无头路由会话的发送入口**置灰 + 标因**（「无头通道未开启，请在电脑端 MAM 设置中开启」）；开启动作弹一次性安全说明（无头 = 绕过终端可视确认直接驱动 Agent；zcode 审批档位选择）；开关翻转写审计。
+- **输出与效果**：开关状态持久化 settings 表并随 `remote_status` 下发；关闭态下移动端对无头路由会话的发送入口**置灰 + 标因**（「无头通道未开启，请在电脑端 MAM 设置中开启」）；开启动作弹一次性安全说明（无头 = 绕过终端可视确认直接驱动 Agent；zcode 审批档位选择）；开关翻转写审计（**裁决 23 定案**：走 `remote_audit` 日志出口 `headless_toggled`，**不写** `write_audit` 表——后者是移动端注入动作账本；两轨分工与理由见 §2 裁决 23）。
 - **边界**：不影响终端注入四家（不经此开关）；远程总开关关闭时无头入口自然一并不可达（gate 在前）。
 
 ### H4 · 无头进程生命周期控制（裁决 9 用户点名功能点）
@@ -211,7 +219,7 @@
 
 - **需求**：WB 5.7.3（Windows 实测）起**交互会话不再写 `sessions/<pid>.json` 心跳**（目录里仅 prewarm 池会话的瞬态残留，会话结束即清理）——MAM 的心跳驱动发现失明，会话不上板（Test2 实证：转写与 db 行都在，看板无卡）。
 - **输入**：发现层双源——①心跳路径保留（旧版兼容；macOS 5.4.7 仍写，且**按需生成、转瞬即逝**，轮询判读不能靠单次查空否定形态）；②**`~/.workbuddy/workbuddy.db` 的 `sessions` 表**（新真相源：`id/cwd/title/status/transport/source_mode/permission_mode/updated_at` 等 40 列；Windows 实测 Test2 会话 `3f12ca20` 即在表中）。
-- **输出与效果**：db 触发 = `workbuddy.db` 文件 mtime 轮询（WAL 活跃，实测分钟级更新）→ 读副本查询（活库不直查纪律）→ 会话上板；三色状态按 `status` 列（completed/terminated…）映射对齐既有口径；心跳与 db 双源并集去重。
+- **输出与效果**：db 触发 = `workbuddy.db` 文件 mtime 轮询（WAL 活跃，实测分钟级更新）→ 只读连接 + busy_timeout（与 zcode/opencode 同纪律）→ 会话上板；三色状态按 `status` 列（completed/terminated…）映射对齐既有口径；心跳与 db 双源并集去重。
 - **边界**：只读 db；`transport`/`source_mode` 等列的完整语义 C0 实现时对齐（实测 transport=local / source_mode=craft/working）；ACP 写通道（H9）不依赖本节——但**端点发现受连带影响**（见风险 16：Windows 无 per-session serve，端点启用条件为 C2 前置跟进）。
 
 ### H13 · dsh 无头发消息（ACP stdio，C2；整理补号——原散落于裁决 11/16 与 C2 行的实现需求收拢）
@@ -279,7 +287,7 @@
 | H9 WorkBuddy 发消息 | session_id + 文本；心跳 endpoint 发现 | **路线 A（定案）**：ACP 免鉴权全链（connect→initialize→load/new→prompt）；SSE 事件归一回执；APP 内实时可见；已结束会话语义 C2 定 |
 | H10 zcode 无头新建 | 项目路径（候选/手填）+ 首句 | 无头起会话 + 首句注入 + sess_id 回执 + 上板 + 可见性提示；黄字多实例提示 |
 | H11 三家 CLI 无头（已裁并入） | session_id + 文本 | claude/kimi/opencode 一次 turn + 回执（W7 口径） |
-| H12 WB 会话发现双源 | 心跳（旧版）∪ workbuddy.db sessions 表（mtime 轮询 + 副本查询） | WB 5.7.3+ 交互会话上板；三色状态按 status 列映射；双源并集去重 |
+| H12 WB 会话发现双源 | 心跳（旧版）∪ workbuddy.db sessions 表（mtime 轮询 + 只读连接 + busy_timeout） | WB 5.7.3+ 交互会话上板；三色状态按 status 列映射；双源并集去重 |
 | H13 dsh 无头发消息 | session_id + 文本；projcache id 映射 | ACP stdio spawn（一次一进程）→ session/prompt 投递 → 事件流归一回执；queue 默认/steer 登记；可见性如实提示 |
 | M10-a 交接双档 | 会话卡「交接」+ 两级单选 | HANDOFF v1 + 收割转移 + 索引；注入自总结/规则摘要自动降档（含无头通道） |
 | M10-b 交接配置 | 设置页交接区 | .json 附本开关（默认开）/ 自总结超时（默认 10min）/ 保留期档位 + 清理 / 打开目录 |
@@ -385,7 +393,7 @@
 | H3 无头通道总开关 | C1 | 🔄 代码 + 后端/前端用例（`9523fc6`：默认关 + `remote_status` 下发 + 安全说明 + 审计）；实机 = **M1 / M2** |
 | H4 无头进程生命周期 | C1 | 🔄 代码 + 用例（`afda8c9`：600s watchdog / kill 树 / 取消 / 全局并发 2 / 三件套配置）；实机取消与「无残留进程」= **M5** |
 | H5 无头审批与权限档 | C1 / C4 | 🔄 代码 + 用例（`1b2886b` 参数面 + `f4b8daa` claude 双向桥接线）；审批卡实机 = **M10**，问答卡 = **M11** |
-| H6 回执 / 审计 / 版本门控（横切） | C1 | ✅ 归一回执 + **8 档 stage 跨语言锁**（`inject/headless/receipt.rs` ↔ `tests/fixtures/headless_stages.json` ↔ `src/mobile/SessionDetail.tsx`，两侧各自对照夹具断言）+ ✅ 审计双词（`headless`/`headless_cancel`/`headless_approve`）与探针缓存 TTL 过测；🔄 实机回执诚实性抽查 = **M15** |
+| H6 回执 / 审计 / 版本门控（横切） | C1 | ✅ 归一回执 + **8 档 stage 跨语言锁**（`inject/headless/receipt.rs` ↔ `tests/fixtures/headless_stages.json` ↔ `src/mobile/SessionDetail.tsx`，两侧各自对照夹具断言）+ ✅ 审计**三**词（`headless`/`headless_cancel`/`headless_approve`——词表单点 = `src-tauri/src/inject/headless/mod.rs:34`（`ACTION_HEADLESS`）/`:37`（`ACTION_HEADLESS_CANCEL`）/`:42`（`ACTION_HEADLESS_APPROVE`）；原写「双词」是 Task 13 补 `headless_approve` **前**的字面，R11 按代码实数改正）与探针缓存 TTL 过测；🔄 实机回执诚实性抽查 = **M15** |
 | H7 zcode 无头发消息（在册会话） | C1 | ✅ CLI 链路**真机实证**（`06104f9` + Task 8 实施记录：provider config 两端都需要、探针 = 一次真实最小回合、回执真源 = 会话库、`refused` 第八档、争用锁探活重试）；🔄 手机 → 回执卡 → 重启 ZCode 可见 = **M3 / M4 / M16** |
 | H8 codex APP 托管会话注入 | C1 | 🔄 代码 + 纯核/编排用例（`9ee7f77`：APP 在场分派 `queue` 主 / `exec resume` 兜底 + 消费确认自建 + UUID 唯一 + 单写者锁改道如实注明）；APP 内消费实机 = **M6**（Mac 三态 / Win ~55s 抽验属**探测期**证据，不是本实现的实机结论） |
 | H9 WorkBuddy 路线 A（ACP） | C2 | 🔄 代码 + 纯核与 `MockHttp` 缝用例（`7ddeb51`：免鉴权握手 / 活跃-新建二分 / 复活提示 / 端点发现双路 / 读链路补扫 `projects/`）；**实机投递未验证**——本机 Win 5.7.3 端点未启用（生产发现链如实 `refused`）= **M7 / M8**；端点启用条件为活账（风险 16）。详见 §5 H9 实施回填 |

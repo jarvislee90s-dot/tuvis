@@ -282,9 +282,9 @@ fn scan_sessions(
                 continue; // 子 Agent 不出卡（M0 F7）
             }
             // 版本门（设计 P5 + 备忘 A8）：header.version 超出已知集（见
-            // 版本门（见 is_known_generation，现行含 v4）→ 降级卡"格式待适配"（未知
-            // 语义不猜——探测红线），不影响其他会话。C0-①：rc.2 会话为 v4，旧白名单
-            // 0..=3 会把全部现行会话整卡降级（症状 = 有卡无消息体），故放行 v4。
+            // is_known_generation，现行含 v4）→ 降级卡"格式待适配"（未知语义不猜——探测
+            // 红线），不影响其他会话。C0-①：rc.2 会话为 v4，旧白名单 0..=3 会把全部现行
+            // 会话整卡降级（症状 = 有卡无消息体），故放行 v4。
             //
             // header.version 缺省（None）**有意不过门**：v0 存量正是「header 无 version
             // 字段」的形态（未压缩 session.jsonl / session.jsonl.zstd），文件名代际已由

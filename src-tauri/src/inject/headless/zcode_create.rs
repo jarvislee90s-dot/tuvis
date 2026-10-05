@@ -1354,7 +1354,8 @@ mod tests {
     /// 新会话号**只认会话库**：创建前不在册的新会话出现 + 其库内 assistant 回复 ⇒ 确认
     #[tokio::test]
     async fn run_create_confirms_the_new_session_from_the_store() {
-        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None);
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
         let old = stored(UUID_A, "E:/proj");
         let fresh = stored_at(UUID_B, "E:/proj", created_now());
         let (stored_fn, calls) = stored_seq(vec![
@@ -1403,7 +1404,8 @@ mod tests {
     /// 库写入滞后：前两次还没看到新会话、第三次看到 → **有界轮询**等到它（不无限等）
     #[tokio::test]
     async fn run_create_polls_the_store_until_the_new_session_lands() {
-        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None);
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
         let old = stored(UUID_A, "E:/proj");
         let fresh = stored_at(UUID_B, "E:/proj", created_now());
         let (stored_fn, calls) = stored_seq(vec![
@@ -1443,7 +1445,8 @@ mod tests {
     /// stdout JSON 帧（`sessionId`）是**一等来源**：命中即确认，且不再做库发现轮询
     #[tokio::test]
     async fn run_create_prefers_the_stdout_frame_session_id() {
-        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None);
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
         let (stored_fn, calls) = stored_seq(vec![Some(vec![])]);
         let waits = Arc::new(Mutex::new(Vec::new()));
         let deps = test_deps(
@@ -1485,7 +1488,8 @@ mod tests {
     /// 也绝不把「老会话被更新」说成新建
     #[tokio::test]
     async fn run_create_never_fabricates_a_session_id() {
-        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None);
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
         let old = stored(UUID_A, "E:/proj");
         let (stored_fn, _) = stored_seq(vec![Some(vec![old.clone()]), Some(vec![old.clone()])]);
         let waits = Arc::new(Mutex::new(Vec::new()));
@@ -1530,7 +1534,8 @@ mod tests {
     /// 出现多个新会话 → 归属不可判定：如实报歧义，绝不挑一个冒充（同一诚实红线）
     #[tokio::test]
     async fn run_create_reports_ambiguity_instead_of_guessing() {
-        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None);
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
         let old = stored(UUID_A, "E:/proj");
         let fresh = stored_at(UUID_B, "E:/proj", created_now());
         let f2 = stored_at(UUID_C, "E:/proj", created_now());
@@ -1570,7 +1575,8 @@ mod tests {
     /// 已在场则不建；建目录失败 → 投递前拒绝（零字节投递，原因点名）
     #[tokio::test]
     async fn run_create_creates_only_the_missing_leaf_dir() {
-        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj/new", None);
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj/new", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
         let made = Arc::new(Mutex::new(Vec::<String>::new()));
         let made2 = made.clone();
         let (stored_fn, _) = stored_seq(vec![Some(vec![])]);
@@ -1673,7 +1679,8 @@ mod tests {
     /// 如实保留 `timeout` 失败 + 填上**已确认**的会话号 + 注明「会话已建但本轮未正常结束」
     #[tokio::test]
     async fn run_create_keeps_failure_status_even_if_the_session_landed() {
-        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None);
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
         let old = stored(UUID_A, "E:/proj");
         let fresh = stored_at(UUID_B, "E:/proj", created_now());
         let (stored_fn, _) = stored_seq(vec![
@@ -1737,7 +1744,8 @@ mod tests {
     /// 审计行的会话号列也不再等于「未确认」。
     #[tokio::test]
     async fn run_create_never_keeps_a_frame_id_when_the_turn_crashed() {
-        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None);
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
         let old = stored(UUID_A, "E:/proj");
         // 库里**没有**新会话（崩溃形态：会话可能没落库）
         let (stored_fn, _) = stored_seq(vec![
@@ -1804,7 +1812,8 @@ mod tests {
     ///    （`time_created` 主证据的结构防线）。
     #[tokio::test]
     async fn run_create_never_reports_a_pre_existing_session_from_a_failed_baseline() {
-        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None);
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
         let seam = scripted_seam(0, vec!["ZCode Built-in skipped (not-due)".to_string()]);
         let old_proj = stored_at(UUID_A, "E:/proj", created_before());
         // ① 基线 = None（库不可读），但脚本里**已经备好**下一次读成功会吐出的旧会话——
@@ -1904,7 +1913,8 @@ mod tests {
     /// 失败回执；新建路径同样不冒充成功、不给会话号
     #[tokio::test]
     async fn run_create_reports_workspace_busy_honestly() {
-        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None);
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
         // 基线 + 三次「读得到但没有新会话」：让两段节奏各自走满（争用退避 2 次 + 库确认 2 次）
         let (stored_fn, _) =
             stored_seq(vec![Some(vec![]), Some(vec![]), Some(vec![]), Some(vec![])]);

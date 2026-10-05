@@ -29,8 +29,11 @@
 //!   归一到 [`PromptOutcome::permission_mode`]，**没有展示面也没有切换面**（切换留三期 F3.1；
 //!   展示随审批卡归 C4/Task 13）。
 //! - 取消：本通道**不武装取消靶子**（槽位用 [`super::turn::TurnSlot::placeholder`]）——ACP 的
-//!   `session/cancel` 通知**本批未接线**，故取消端点如实报「未送达」（不谎报已取消）；理由
-//!   另见编排函数文档（武装靶子会让取消审计行的 channel 列写成 `headless_zcode`——那是假值）。
+//!   `session/cancel` 通知**本批未接线**，故取消端点如实报「未送达（回合仍在运行）」
+//!   （不谎报已取消）；理由另见编排函数文档。**原括号里的旧理由已作废**（R11 删除）：取消
+//!   审计行的 channel 列自 Task 11 复审起取自**槽位声明**（[`super::turn::TurnSlot::with_channel`]），
+//!   「武装靶子会把 channel 列写成 `headless_zcode`」不再是事实——WB 臂声明的是
+//!   [`crate::inject::routing::HeadlessKind::WbAcp`] 的 wire 名。
 //! - API 为**逆向 bundle 所得（非公开文档）** ⇒ 版本门控覆盖 WB 升级漂移；本批的诚实形态是
 //!   「端点不可用/协议不符即如实回执」，**绝不修改 WorkBuddy 安装本体**。
 //!
@@ -149,6 +152,13 @@ pub const SHORT_TIMEOUT_MS: u64 = 20_000;
 /// 指纹探测超时（候选端口可能是任意本地服务——必须有界；连接被拒即刻返回，只有
 /// 「收 TCP 不答 HTTP」的服务才吃满这个超时）
 pub const FINGERPRINT_TIMEOUT_MS: u64 = 1_000;
+/// 共享 HTTP 客户端的**连接**超时（毫秒）= 旧逐请求 `clamp(500, 15_000)` 的**天花板**。
+/// 逐请求**总量**超时仍单发（`RequestBuilder::timeout`，见 [`production_http_seam`]）；
+/// 本模块实际出现的超时值只有 [`FINGERPRINT_TIMEOUT_MS`]（1000）与 `≥ 20_000`
+/// （[`SHORT_TIMEOUT_MS`] / watchdog 上取 max），两者在旧口径下的连接界与新口径
+/// **逐一相等**（1000 / 15000）⇒ 客户端单例化**零行为变化**（旧形态逐请求重建，
+/// 连连接池与 TLS 配置都丢）。
+pub const CLIENT_CONNECT_TIMEOUT_MS: u64 = 15_000;
 /// 端口候选上限（WB 是 Electron，监听端口不止一个；双确认前逐个试，**有界**）。
 /// 最坏代价 = 上限 ×（`/` + `/health`）× 探测超时 ≈ 16s（只有候选端口全部「收 TCP
 /// 不答 HTTP」时），典型（WB 未监听任何端口）= 0 次请求；**探测预算用尽即如实拒绝**
@@ -241,7 +251,8 @@ pub struct StreamEvidence {
     pub phases: Vec<String>,
     /// 回合终点（`stopReason`；响应帧给出）
     pub stop_reason: Option<String>,
-    /// 末条 assistant 文本（`session_update` 的 `agent_message_chunk`）
+    /// assistant 正文（`session_update` 的 `agent_message_chunk` **逐块累积**；总长封顶
+    /// [`ASSISTANT_ACCUM_CAP_CHARS`]——回执那一刀仍在 `receipt_for` → `normalize::summarize`）
     pub assistant: Option<String>,
     /// 权限档（`config_option_update` 的 mode `currentValue`；**只读展示面未接线**）
     pub permission_mode: Option<String>,
@@ -335,6 +346,28 @@ fn deep_str(v: &serde_json::Value, key: &str) -> Option<String> {
     }
 }
 
+/// assistant 正文的**累积总长上限**（4 × 回执摘要长度）。
+///
+/// 为什么需要：`agent_message_chunk` 逐块到达，一个回合的流可以无限长——只留最后一块会丢
+/// 正文（回执只带答复的尾巴），而无上限拼接又会让失控的流把内存吃光。取 4 ×
+/// [`super::receipt::LAST_ASSISTANT_CHARS`]：足够喂满回执那一刀（200 字），再多也只是被砍掉。
+///
+/// **这不是第二套截断口径**：本上限只防无界增长（不追加省略号、不做摘要），回执产物的
+/// 截断语义仍单点在 `receipt_for` → [`crate::inject::normalize::summarize`]。
+pub const ASSISTANT_ACCUM_CAP_CHARS: usize = 4 * super::receipt::LAST_ASSISTANT_CHARS;
+
+/// 累积一块 assistant 文本（`get_or_insert` + `push_str` 风格；**总长封顶**——见
+/// [`ASSISTANT_ACCUM_CAP_CHARS`]）。首块即建缓冲（哪怕空串，与「帧含已知键」同判据）。
+fn accumulate_assistant(slot: &mut Option<String>, text: &str) {
+    let buf = slot.get_or_insert_with(String::new);
+    let used = buf.chars().count();
+    if used >= ASSISTANT_ACCUM_CAP_CHARS {
+        return;
+    }
+    // 只取余量（按**字符**：多字节安全，与 summarize 同口径）；超长块不做无谓拷贝
+    buf.extend(text.chars().take(ASSISTANT_ACCUM_CAP_CHARS - used));
+}
+
 /// 吸收一帧（返回是否含**已知键**——未知帧只计数不解释）
 fn absorb(v: &serde_json::Value, ev: &mut StreamEvidence) -> bool {
     let mut known = false;
@@ -357,7 +390,7 @@ fn absorb(v: &serde_json::Value, ev: &mut StreamEvidence) -> bool {
         }
         if kind == "agent_message_chunk" {
             if let Some(text) = deep_str(v, "text") {
-                ev.assistant = Some(text);
+                accumulate_assistant(&mut ev.assistant, &text);
                 known = true;
             }
         }
@@ -1509,30 +1542,62 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 生产 HTTP 缝（reqwest：rustls + system-proxy，与 `remote::tunnel` 同款客户机构建）。
+/// **共享 HTTP 客户端（进程内单例）**：`reqwest::Client` 自带连接池与 TLS 配置，
+/// 逐请求重建 = 每次请求丢一次池子（本缝的打点是**本机回环**、控制面请求密集，
+/// 旧的 `production_http_seam` 正是逐请求重建）。构建失败只发生一次并**缓存**该失败
+/// （`Result` 进 `LazyLock`：不把一次配置错误变成每个请求重复付的代价）。
+///
+/// # `.no_proxy()`（P0 安全：**回环流量绝不走系统代理**）
+/// `Cargo.toml` 开了 reqwest 的 `system-proxy` feature ⇒ 默认会读系统代理。本缝只打
+/// 回环 ACP 端点（`127.0.0.1:<port>`），走代理是**双重风险**：
+/// ① `acp-session-token` / `acp-connection-id` 头会随 CONNECT/请求交给代理进程（凭据外泄）；
+/// ② 代理若到不了 `127.0.0.1`（企业代理很常见），通道直接死。
+///
+/// # 与 `remote::tunnel` 的**对比**（后来者勿「统一」两处客户机构建）
+/// `remote::tunnel` 下的是 **GitHub 资产（广域网）**，它**故意**走系统代理——用户在企业网里
+/// 常只有那条路能出去；本缝是**回环**，显式无代理是纪律、不是遗漏。两处 builder 形状相近
+/// 而**代理语义相反**，合并会同时弄坏两边（一边泄凭据、一边断下载）。
+#[cfg(not(test))]
+fn acp_http_client() -> &'static Result<reqwest::Client, String> {
+    static CLIENT: std::sync::LazyLock<Result<reqwest::Client, String>> =
+        std::sync::LazyLock::new(|| {
+            reqwest::Client::builder()
+                // 回环专用：**不读系统代理**（见上方对比说明）
+                .no_proxy()
+                .connect_timeout(std::time::Duration::from_millis(CLIENT_CONNECT_TIMEOUT_MS))
+                .build()
+                .map_err(|e| format!("HTTP 客户端构建失败: {e}"))
+        });
+    &CLIENT
+}
+
+/// 生产 HTTP 缝（reqwest：rustls + **no_proxy**，与 `remote::tunnel` 的
+/// 「rustls + system-proxy」**形状相近而代理语义相反**——详见 [`acp_http_client`]）。
 ///
 /// **`cfg(not(test))`**：测试构建里本函数不存在 ⇒ 单测无法触达真实网络（宪法级纪律）。
+/// **代价（如实申报）**：本缝因此**无法单测**——它的验证面 = 代码评审 + Task 15 的
+/// M7/M8 实机用例（WB 卡收发）。别为了能写用例而放宽这道门。
 /// **同步外壳**（house style）：调用方在 `spawn_blocking` 线程上跑，故此处
 /// `tauri::async_runtime::block_on` 单次执行一条请求；流式响应用 [`StreamScanner`]
 /// 逐块判停（`Response::chunk` 不需要 reqwest 的 `stream` feature——**不新增依赖**）。
 #[cfg(not(test))]
 pub fn production_http_seam() -> HttpSeam {
     Arc::new(|req: HttpReq| {
-        let client = match reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_millis(
-                req.timeout_ms.clamp(500, 15_000),
-            ))
-            .timeout(std::time::Duration::from_millis(req.timeout_ms.max(1_000)))
-            .build()
-        {
+        // 单例客户端（`.no_proxy()` 已在此定死；逐请求只调总量超时）
+        let client = match acp_http_client() {
             Ok(c) => c,
-            Err(e) => return HttpResp::transport_error(&format!("HTTP 客户端构建失败: {e}")),
+            Err(e) => return HttpResp::transport_error(e),
         };
         tauri::async_runtime::block_on(async move {
-            let mut rb = client.request(
-                reqwest::Method::from_bytes(req.method.as_bytes()).unwrap_or(reqwest::Method::GET),
-                &req.url,
-            );
+            let mut rb = client
+                .request(
+                    reqwest::Method::from_bytes(req.method.as_bytes())
+                        .unwrap_or(reqwest::Method::GET),
+                    &req.url,
+                )
+                // 逐请求总量超时（含连接）：连接超时是**客户端级**配置（不可逐请求），
+                // 故连接界由「客户端 connect_timeout 与本次总量超时取小」决定
+                .timeout(std::time::Duration::from_millis(req.timeout_ms.max(1_000)));
             for (k, v) in &req.headers {
                 rb = rb.header(k.as_str(), v.as_str());
             }
@@ -2034,21 +2099,44 @@ mod tests {
     }
 
     fn prompt_sse(id: u64, phases: &[&str], stop: Option<&str>, assistant: Option<&str>) -> String {
+        let chunks: Vec<&str> = assistant.into_iter().collect();
+        prompt_sse_chunks(id, phases, stop, &chunks)
+    }
+
+    /// 单块 assistant 帧（`session_update` 的 `agent_message_chunk`；真机逐块吐字）
+    fn chunk_frame(sid: &str, text: &str) -> serde_json::Value {
+        rpc_update(serde_json::json!({
+            "sessionId": sid,
+            "update": {"sessionUpdate": "agent_message_chunk",
+                       "content": {"type": "text", "text": text}},
+        }))
+    }
+
+    /// 多块流式回复（R8：一个回合的正文按 chunk **多次**到达，不是一次性给全）
+    fn prompt_sse_chunks(id: u64, phases: &[&str], stop: Option<&str>, chunks: &[&str]) -> String {
         let mut frames = Vec::new();
         for p in phases {
             frames.push(phase_frame(SID, p));
         }
-        if let Some(a) = assistant {
-            frames.push(rpc_update(serde_json::json!({
-                "sessionId": SID,
-                "update": {"sessionUpdate": "agent_message_chunk",
-                           "content": {"type": "text", "text": a}},
-            })));
+        for c in chunks {
+            frames.push(chunk_frame(SID, c));
         }
         if let Some(s) = stop {
             frames.push(rpc_ok(id, serde_json::json!({ "stopReason": s })));
         }
         sse(&frames)
+    }
+
+    /// 装填一次全链期望（connect → initialize → session/load → prompt；prompt 体由调用方给）
+    fn expect_full_wire(http: &mut MockHttp, prompt_body: &str) {
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&load_sse(2, None, "fullAccess"));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(prompt_body);
     }
 
     /// 生产缝的最小装配（测试自持名额：不抢全局 `GlobalSem`）
@@ -2619,6 +2707,98 @@ mod tests {
                 .contains("转写佐证未命中"),
             "ok 回执必须如实标注佐证状态：{:?}",
             out.receipt.reason
+        );
+        http.assert_clean();
+    }
+
+    /// **R8①：流式分块的 assistant 文本必须累积**——ACP 一个回合的正文按
+    /// `agent_message_chunk` 逐块到达，只留最后一块 = 回执只带答复的尾巴。
+    ///
+    /// 还原动作（变异）：把 `absorb` 的 chunk 臂改回 `ev.assistant = Some(text)` → 本用例先红
+    /// （纯核断言只剩「后半」、端到端断言只剩「后半」）。
+    #[test]
+    fn agent_message_chunks_accumulate_into_the_complete_assistant() {
+        // ① 纯核：首块单独解释（顺序不能丢）；两块**按序拼接**（不是覆盖、不是倒序）
+        let first = read_stream(&sse(&[chunk_frame(SID, "前半")]));
+        assert_eq!(first.assistant.as_deref(), Some("前半"));
+        let both = read_stream(&sse(&[chunk_frame(SID, "前半"), chunk_frame(SID, "后半")]));
+        assert_eq!(
+            both.assistant.as_deref(),
+            Some("前半后半"),
+            "多块流式回复必须拼成完整正文（覆盖式实现只留「后半」）"
+        );
+        assert_eq!(both.frames, 2, "两块都是含已知键的帧");
+        // ② 端到端：回执带出的 lastAssistant 就是完整正文（截断单点在 receipt_for）
+        let mut http = MockHttp::new();
+        expect_full_wire(
+            &mut http,
+            &prompt_sse_chunks(
+                3,
+                &["model_requesting", "generating"],
+                Some("end_turn"),
+                &["前半", "后半"],
+            ),
+        );
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        assert_eq!(
+            out.receipt.last_assistant.as_deref(),
+            Some("前半后半"),
+            "回执必须带完整正文（未超限 ⇒ 逐字原样）"
+        );
+        http.assert_clean();
+    }
+
+    /// **R8②：累积有总上限、最终截断仍单点**——流可以无限长，累积缓冲必须封顶
+    /// （4 × `LAST_ASSISTANT_CHARS`）；封顶**不是**第二套截断：回执那一刀仍归
+    /// `receipt_for` → `normalize::summarize`（产物 = 200 字 + **一个** 省略号）。
+    ///
+    /// 还原动作（变异）：去掉累积上限 → 第一条断言先红（缓冲随流无界增长）。
+    #[test]
+    fn assistant_accumulation_is_capped_without_a_second_truncation() {
+        let cap = 4 * super::super::receipt::LAST_ASSISTANT_CHARS;
+        assert_eq!(
+            ASSISTANT_ACCUM_CAP_CHARS, cap,
+            "累积总上限的口径 = 4 × LAST_ASSISTANT_CHARS（单一来源，勿另写常数）"
+        );
+        // 20 块 × 150 字 = 3000 字（远超上限）——每块前缀不同，可判「取的是头部」
+        let chunks: Vec<String> = (0..20).map(|i| format!("{i:02}").repeat(25)).collect();
+        let body = sse(&chunks
+            .iter()
+            .map(|c| chunk_frame(SID, c))
+            .collect::<Vec<_>>());
+        let ev = read_stream(&body);
+        let full: String = chunks.concat();
+        let capped: String = full.chars().take(cap).collect();
+        assert_eq!(
+            ev.assistant.as_deref(),
+            Some(capped.as_str()),
+            "累积缓冲必须封顶在上限处（无界流不得把内存拖垮）"
+        );
+        // 端到端：封顶后的正文照样只经 summarize 一刀 ⇒ 头部 200 字 + 单个省略号
+        let mut http = MockHttp::new();
+        let refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        expect_full_wire(
+            &mut http,
+            &prompt_sse_chunks(3, &["generating"], Some("end_turn"), &refs),
+        );
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        let last = out.receipt.last_assistant.clone().unwrap();
+        let expected: String = full
+            .chars()
+            .take(super::super::receipt::LAST_ASSISTANT_CHARS)
+            .collect();
+        assert_eq!(
+            last,
+            format!("{expected}…"),
+            "最终摘要 = 累积文本头部 200 字 + 一个省略号（截断单点未被复制）"
+        );
+        assert_eq!(
+            last.chars().filter(|c| *c == '…').count(),
+            1,
+            "只许一个省略号（两个 = 累积期也截了一刀，即第二套口径）"
         );
         http.assert_clean();
     }

@@ -1631,7 +1631,10 @@ pub fn remote_set_pin(pin: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 设备重命名内核（可测核心，DAO 注入）：trim 后空 → Err（不触 DAO）；DAO 未命中
+/// 设备重命名内核（可测核心，DAO 注入）：trim 后空 → Err（不触 DAO）；**花名含命令行不安全
+/// 字符 → Err（不触 DAO——判据本体 = 唯一决策点
+/// [`crate::inject::headless::turn::device_name_refusal`]，错误码与原因文案与配对登记点
+/// 同一份：裁决 26 的对称性要求「错误在改名时浮出，不拖到投递时」）**；DAO 未命中
 /// （返回 false）→ Err 404 语义；命中 → Ok。40 字截断收敛在 DAO（A1 自守，与
 /// /pair/pin 设备自报名同一口径），本层不重复截断
 fn rename_device_core(
@@ -1643,6 +1646,15 @@ fn rename_device_core(
     if name.is_empty() {
         return Err("设备名称不能为空".to_string());
     }
+    // 花名白名单（裁决 24b 判据的**第三落点**；裁决 26 收口上一轮「改名不加门」的取舍）：
+    // **在触 DAO 之前**拒，错误码/原因文案与配对登记点共用（同一判据、同一句话）；
+    // 原因只点名具体字符，**不回写危险花名原文**（本路径不落任何含花名的日志）
+    if let Some(reason) = crate::inject::headless::turn::device_name_refusal(name) {
+        return Err(format!(
+            "{}: {reason}",
+            crate::inject::headless::turn::DEVICE_NAME_UNSAFE_CODE
+        ));
+    }
     if rename(name)? {
         Ok(())
     } else {
@@ -1650,7 +1662,8 @@ fn rename_device_core(
     }
 }
 
-/// 设备重命名（M5 A4，桌面端保存）：空名拒绝；未命中 404 语义；超 40 字由 DAO 截断
+/// 设备重命名（M5 A4，桌面端保存）：空名拒绝；**危险花名拒绝（裁决 26：同码同文案，
+/// 见 `device_name_refusal` 的调用点节）**；未命中 404 语义；超 40 字由 DAO 截断
 #[tauri::command]
 pub fn remote_rename_device(id: String, name: String) -> Result<(), String> {
     let st = STATE.clone();
@@ -3504,6 +3517,81 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored, "甲".repeat(40), "DAO 40 字截断贯穿命令内核");
+    }
+
+    /// 重命名内核（**裁决 26 收口**）：花名含命令行不安全字符 → `Err` 且**不触 DAO**。
+    ///
+    /// 判据本体 = 唯一决策点 [`crate::inject::headless::turn::device_name_refusal`]（与配对
+    /// 登记点、组装单点**同一份**，本层不另写白名单）；错误形制与配对点同码
+    /// （`device_name_unsafe` + 同一句原因文案）——**在改名时**就拒，不拖到投递时才炸。
+    /// 另钉住：错误文案**不回写危险花名原文**（只点名具体字符）。
+    #[test]
+    fn rename_device_core_unsafe_name_rejected_without_dao_call() {
+        for bad in ["小明的手机📱", "a&b", "iPhone\n15"] {
+            let r = rename_device_core("d1", bad, |_| panic!("危险花名 {bad:?} 不得触 DAO"));
+            let e = r.expect_err("危险花名必须拒绝");
+            assert!(
+                e.starts_with("device_name_unsafe:"),
+                "错误必须与配对登记点同码（device_name_unsafe）: {e}"
+            );
+            assert!(
+                e.contains("命令行不安全字符"),
+                "原因文案复用 device_name_refusal 的输出: {e}"
+            );
+            assert!(
+                !e.contains(bad),
+                "错误文案不得回写危险花名原文（只点名具体字符）: {e}"
+            );
+        }
+    }
+
+    /// 重命名内核（裁决 26）：危险花名被拒后**库里旧名原样**（端到端内存库）——
+    /// 拒绝发生在 DAO 之前，故不存在「半写」形态
+    #[test]
+    fn rename_device_core_unsafe_name_leaves_db_name_unchanged() {
+        let conn = memory_conn();
+        let now = chrono::Utc::now().timestamp_millis();
+        pairing::persist_device(&conn, &synth_device("rn_bad", now)).unwrap();
+        let old: String = conn
+            .query_row(
+                "SELECT name FROM remote_devices WHERE id = 'rn_bad'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let r = rename_device_core("rn_bad", "小明的手机📱", |n| {
+            pairing::rename_device(&conn, "rn_bad", n)
+        });
+        assert!(r.is_err(), "危险花名必须拒绝");
+        let stored: String = conn
+            .query_row(
+                "SELECT name FROM remote_devices WHERE id = 'rn_bad'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, old, "拒绝后旧名必须原样（不得半写）");
+    }
+
+    /// 重命名内核（裁决 26 对照）：正常花名照常放行——**中文**（Unicode 字母）与白名单内
+    /// 点缀字符（空格 `-` `_` `.` `·`）都过；端到端内存库验证落库值
+    #[test]
+    fn rename_device_core_accepts_normal_and_chinese_names_end_to_end() {
+        let conn = memory_conn();
+        let now = chrono::Utc::now().timestamp_millis();
+        pairing::persist_device(&conn, &synth_device("rn_ok", now)).unwrap();
+        for good in ["小明的手机", "  iPhone 15 Pro·Max  ", "客厅-平板_2"] {
+            rename_device_core("rn_ok", good, |n| pairing::rename_device(&conn, "rn_ok", n))
+                .unwrap_or_else(|e| panic!("正常花名 {good:?} 必须放行: {e}"));
+            let stored: String = conn
+                .query_row(
+                    "SELECT name FROM remote_devices WHERE id = 'rn_ok'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, good.trim(), "正常花名落库（trim 后）");
+        }
     }
 
     /// 花名册与远程开关态解耦（Mac 报告七-6 定案锁）：关闭远程（SSE 注册表空、
