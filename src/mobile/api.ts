@@ -1621,6 +1621,111 @@ export async function createSession(body: {
   return (await r.json()) as CreateSessionAccepted;
 }
 
+// ==== H10（Task 12）：zcode 无头新建 ====
+
+/** 新建候选项目（与 Rust `zcode_create::ProjectCandidate` + info 端点的 JSON 逐字段对应，
+ *  勿漂移）：`source` = 来源（`trusted` = APP 信任表主源 / `board` = 看板快照项目）；
+ *  `trusted` = 是否在 APP 信任表内——**false 必须如实标注**：该目录的新会话 APP 永不收录，
+ *  仅 MAM 可见；`note` = 信任档**逐字文案**（后端 `Visibility::note()` 单点，与回执的
+ *  `visibilityNote` 同源——前端**不再自带一份**「已信任/未信任」措辞，复审 Minor 2）。
+ *  候选列表已由后端按「存在 ∧ 不在同源敏感黑名单内」过滤，前端不做二次筛选。 */
+export interface ZcodeCreateCandidate {
+  path: string;
+  source: "trusted" | "board";
+  trusted: boolean;
+  note?: string;
+}
+
+/** GET /session-create-zcode-info 载荷：`available=false`（H3 总开关关闭）时**不给候选**
+ *  （与 `session-send-info` 关闭态同口径），`reasonCode`/`reason` 是后端单点码与逐字文案；
+ *  `warning` = 选中项目的黄字信号（同项目已有在册 zcode 会话，**不拦截**），
+ *  `defaultFirstText` = 首句默认值（spec H10 探针 `hi`，后端单点下发）。 */
+export interface ZcodeCreateInfo {
+  available: boolean;
+  reasonCode?: string;
+  reason?: string;
+  tool?: string;
+  defaultFirstText?: string;
+  candidates?: ZcodeCreateCandidate[];
+  warning?: string;
+}
+
+/** 新会话确认来源的**跨语言唯一名单**（与 `tests/fixtures/zcode_create_confirmations.json`
+ *  逐项相等——本常量、Rust 侧 `remote::api::confirmation_wire`、夹具三处任一漂移即有一侧先红，
+ *  做法同 `headless_stages.json`；复审 Minor 4）。语义见 [`ZcodeCreateConfirmation`]。 */
+export const ZCODE_CREATE_CONFIRMATIONS = ["stdout_frame", "store", "none"] as const;
+
+/** 新会话确认来源（取自 [`ZCODE_CREATE_CONFIRMATIONS`]，与 Rust
+ *  `zcode_create::NewSessionConfirmation` 的 wire 词对应）：
+ *  `stdout_frame` = CLI 回执帧点名；`store` = 会话库发现（创建前不在册、且建行时刻不早于
+ *  回合起点的新会话）；`none` = **未确认**——此时 `sessionId` 恒空串（后端绝不编造 sess_id，
+ *  前端也不得凭空显示）。 */
+export type ZcodeCreateConfirmation = (typeof ZCODE_CREATE_CONFIRMATIONS)[number];
+
+/** POST /session-create-zcode 回执（HTTP 恒 200，语义在 body——与无头封套同口径）：
+ *  - `sessionId` 只在**确认到**新会话时非空；
+ *  - `receipt` = Task 6 回执原样透出（status/stage/reason 的分诊复用 SessionDetail 单点）；
+ *  - `visibility`/`visibilityNote` 只在确认到新会话时下发（未确认时什么都没落到工作区，
+ *    承诺「重启后可见」就是谎报）；
+ *  - `warning` = 黄字信号（不拦截）。 */
+export interface ZcodeCreateResult {
+  channel?: string;
+  sessionId: string;
+  confirmation: ZcodeCreateConfirmation;
+  receipt: HeadlessReceipt;
+  visibility?: SendInfo["visibility"];
+  visibilityNote?: string;
+  warning?: string | null;
+}
+
+/** 拉取新建表单前置面（挂载时一次；可选点名项目以取黄字信号）。403（设备失效，与
+ *  fetchSendInfo 同语义）→ null；其余非 2xx / 网络异常 → 抛 ApiError，调用方如实提示
+ *  「表单不可用」，不渲染半截表单。 */
+export async function fetchZcodeCreateInfo(project?: string): Promise<ZcodeCreateInfo | null> {
+  const qs = project ? `?project=${encodeURIComponent(project)}` : "";
+  let r: Response;
+  try {
+    r = await fetch(`/m/api/v1/session-create-zcode-info${qs}`);
+  } catch (e) {
+    throw new ApiError(null, `session-create-zcode-info 网络异常: ${String(e)}`);
+  }
+  if (r.status === 403) return null; // 设备失效 → 回配对页（fetchSendInfo 同口径）
+  if (!r.ok) throw new ApiError(r.status, `session-create-zcode-info ${r.status}`);
+  return (await r.json()) as ZcodeCreateInfo;
+}
+
+/** 无头新建一个 zcode 会话并注入首句（H10）。`firstText` 缺省时**不带上该键**
+ *  （后端按 spec H10 默认探针 `hi` 补齐——默认值单点在服务端）。非 2xx（400 请求不合法 /
+ *  403 总开关关闭或设备失效）→ 抛 ApiError（403 的 `reason` 是后端逐字文案，解析进 data
+ *  供调用方展示——对齐 sessionSend 惯例）。 */
+export async function sessionCreateZcode(
+  project: string,
+  firstText?: string
+): Promise<ZcodeCreateResult> {
+  let r: Response;
+  try {
+    r = await fetch("/m/api/v1/session-create-zcode", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project, ...(firstText ? { firstText } : {}) }),
+    });
+  } catch (e) {
+    throw new ApiError(null, `session-create-zcode 网络异常: ${String(e)}`);
+  }
+  if (!r.ok) {
+    let data: Record<string, unknown> | null = null;
+    try {
+      data = (await r.json()) as Record<string, unknown>;
+    } catch {
+      /* 非 JSON 错误体（代理页等）：data 保持 null，按状态码兜底 */
+    }
+    throw new ApiError(r.status, `session-create-zcode ${r.status}`, data);
+  }
+  return (await r.json()) as ZcodeCreateResult;
+}
+
+
+
 /** 新建任务快照（GET /session-create/status 载荷，与 Rust `CreateTaskShared`
  *  camelCase 序列化逐字段对应，勿漂移）：
  *  phase ∈ opening_terminal / dialog_handling / injecting_first /

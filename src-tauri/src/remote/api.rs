@@ -1387,6 +1387,489 @@ pub(crate) async fn zcode_headless_dispatch(
 }
 
 // ============================================================
+// H10 zcode 无头新建（Task 12）
+// ============================================================
+//
+// 两个端点（**任务态内存态**：不落任何新表、无 migration——新建是一次性动作，
+// 状态就是本次 HTTP 响应的回执 + 进程内项目级串行锁）：
+//   POST /session-create-zcode       → 200 {sessionId, confirmation, receipt, visibility?, warning?}
+//   GET  /session-create-zcode-info  → 200 {tool, available, reasonCode?, reason?,
+//                                          defaultFirstText, candidates[], warning?}
+// 拒绝臂一律 HTTP 200 + `receipt.status=failed`（与 H7 的 headless 封套同口径：
+// 「投递前拒绝」是语义，不是 HTTP 错误）；仅**请求本身不合法**给 400、
+// **总开关关闭**给 403 headless_disabled（与 session-send 同码同文案）。
+
+/// POST /m/api/v1/session-create-zcode 请求体（camelCase；字段全 default——缺参不触发
+/// axum 提取器 422，由 handler 统一按契约给 400 bad_request）
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCreateZcodeReq {
+    /// 项目目录（候选列表的值，或手填完整绝对路径）
+    #[serde(default)]
+    pub project: String,
+    /// 首句（缺省/空白 = [`crate::inject::headless::zcode_create::DEFAULT_FIRST_TEXT`]；
+    /// spec H10 默认探针 `hi`）
+    #[serde(default)]
+    pub first_text: Option<String>,
+}
+
+/// 新建动作的审计上下文（设备身份由端点注入，机器自发动作不得冒充某台手机）。
+/// `content` 在命令形态组装后更新为最终 `--prompt` 载荷（与 H7 同口径，W5 摘要单点截断）。
+#[derive(Clone)]
+struct ZcodeCreateCtx {
+    device_id: String,
+    device_name: String,
+    content: String,
+}
+
+impl ZcodeCreateCtx {
+    /// 落账（回合终态/拒绝共用；**会话号列如实**：未确认到新会话就留空——
+    /// 绝不拿锁键/项目路径充数，与回执的诚实口径一致）
+    fn audit(
+        &self,
+        st: &Arc<RemoteState>,
+        session_id: &str,
+        action: &str,
+        result: &str,
+        duration_ms: u64,
+    ) {
+        audit_headless_ctx(
+            st,
+            &crate::inject::headless::HeadlessAuditCtx {
+                device_id: self.device_id.clone(),
+                device_name: self.device_name.clone(),
+                agent_type: "zcode".to_string(),
+                session_id: session_id.to_string(),
+                channel: crate::inject::routing::HeadlessKind::Zcode
+                    .wire_name()
+                    .to_string(),
+                content: self.content.clone(),
+            },
+            action,
+            result,
+            duration_ms,
+        );
+    }
+
+    /// 拒绝/失败臂：HTTP 200 + 如实失败回执（`sessionId` 空串）+ 落账。
+    /// **不碰串行锁**：槽位只由「占过位」的路径注销（占位前的拒绝若误调 `end`，
+    /// 会把别人的在飞回合槽位注销掉——Task 8 同款纪律）。
+    fn refuse(
+        &self,
+        st: &Arc<RemoteState>,
+        stage: crate::inject::headless::receipt::Stage,
+        reason: &str,
+        warning: Option<String>,
+    ) -> Response {
+        let receipt = crate::inject::headless::receipt::Receipt::failed(stage, reason);
+        self.audit(
+            st,
+            "",
+            crate::inject::headless::ACTION_HEADLESS,
+            &crate::inject::headless::turn::receipt_result_word(&receipt),
+            receipt.duration_ms,
+        );
+        json_no_store(
+            StatusCode::OK,
+            create_envelope(
+                &receipt,
+                crate::inject::headless::zcode_create::NewSessionConfirmation::Unconfirmed,
+                warning,
+                None,
+            ),
+        )
+    }
+}
+
+/// 确认来源 → wire 词（移动端 `ZcodeCreateResult.confirmation` 逐字对应）。
+///
+/// **跨语言锁**：同一份名单另存 `tests/fixtures/zcode_create_confirmations.json`，本侧
+/// （`confirmation_wire_names_are_pinned_by_the_cross_language_fixture`）与前端
+/// （`src/mobile/api.ts` 的 `ZCODE_CREATE_CONFIRMATIONS`，由 `tests/mobile/
+/// NewSessionForm.test.tsx` 对照同一夹具断言）各自对照它断言——任一侧新增状态而另一侧
+/// 没跟上，必有一侧先红（与 `headless_stages.json` 同款做法）。
+pub(crate) fn confirmation_wire(
+    c: &crate::inject::headless::zcode_create::NewSessionConfirmation,
+) -> &'static str {
+    use crate::inject::headless::zcode_create::NewSessionConfirmation as C;
+    match c {
+        C::StdoutFrame(_) => "stdout_frame",
+        C::Store(_) => "store",
+        C::Unconfirmed => "none",
+    }
+}
+
+/// 新建回执**线上封套**（HTTP 恒 200，语义在 body）：
+/// - `sessionId` **只在确认到新会话时非空**（未确认 = 空串——绝不编造 sess_id）。这是
+///   **结构性保证**（复审 Important 1）：未确认的来路包括「CLI 先打了带 `sessionId` 的帧、
+///   随后崩溃」——那种回执里的会话号是**看着合法**的帧号，靠「来源是否可疑」去清是漏的；
+///   故出口**无条件**按 `confirmation` 决定是否透出会话号（回执侧 `unconfirmed_receipt`
+///   同样无条件清空——两层都把「Unconfirmed ⇒ 空串」当契约，而不是当巧合）；
+/// - `confirmation` = 确认来源（`stdout_frame` / `store` / `none`，诊断面）；
+/// - `visibility`/`visibilityNote`（经 `Visibility::note()` 单点文案）**只在确认到新会话时**
+///   下发：失败/未确认时什么都没落到工作区，承诺「重启后可见」就是谎报（Task 8 同款纪律）；
+/// - `warning` = 黄字信号（同项目已有在册 zcode 会话；**不拦截**），任何 200 响应都带。
+pub(crate) fn create_envelope(
+    receipt: &crate::inject::headless::receipt::Receipt,
+    confirmation: crate::inject::headless::zcode_create::NewSessionConfirmation,
+    warning: Option<String>,
+    visibility: Option<crate::inject::routing::Visibility>,
+) -> serde_json::Value {
+    use crate::inject::headless::zcode_create::NewSessionConfirmation as C;
+    let confirmed = confirmation != C::Unconfirmed;
+    let session_id = if confirmed {
+        receipt.session_id.as_str()
+    } else {
+        ""
+    };
+    let mut body = serde_json::json!({
+        "channel": crate::inject::routing::HeadlessKind::Zcode.wire_name(),
+        "sessionId": session_id,
+        "confirmation": confirmation_wire(&confirmation),
+        "receipt": receipt,
+        "warning": warning,
+    });
+    if confirmed {
+        if let Some(v) = visibility {
+            body["visibility"] = serde_json::json!(visibility_wire(&v));
+            body["visibilityNote"] = serde_json::json!(v.note());
+        }
+    }
+    body
+}
+
+/// 真回合执行（**每回合 spawn 子进程**；H10 与 H7 同构）：并发/超时经
+/// [`crate::inject::headless::runner_from_conn`] 读设置（不自建 `GlobalSem`）、执行缝复用
+/// [`crate::inject::headless::turn::production_run_seam`]（通道无关）、回合终结后落
+/// `headless` 审计行并注销**项目级**串行锁。
+///
+/// 回合配置**不设** `session_id`：创建时尚无会话号，回执的兜底会话号由
+/// [`crate::inject::headless::zcode_create::run_create`] 的确认结论决定（未确认即空串）。
+async fn run_zcode_create_turn(
+    st: Arc<RemoteState>,
+    ctx: ZcodeCreateCtx,
+    inv: crate::inject::headless::zcode::ZcodeInvocation,
+    project: String,
+    plan: crate::inject::headless::zcode_create::PathPlan,
+    lock_key: String,
+) -> crate::inject::headless::zcode_create::CreateOutcome {
+    use crate::inject::headless::zcode_create;
+    let deps = zcode_create::CreateDeps::production(std::env::consts::OS);
+    // 每尝试新建回合配置（超时是回合属性；并发上限是全局名额，读设置即生效）
+    let build = |inv: &crate::inject::headless::zcode::ZcodeInvocation| {
+        let mut cfg = st
+            .store
+            .with(|c| crate::inject::headless::runner_from_conn(&inv.program, c));
+        cfg = cfg.args(inv.argv.clone()).cwd(project.clone());
+        for (k, v) in &inv.env {
+            cfg = cfg.env(k.clone(), v.clone());
+        }
+        cfg
+    };
+    let seam = crate::inject::headless::turn::production_run_seam();
+    let out =
+        zcode_create::run_create(&inv, &project, plan, &lock_key, &build, &deps, &*seam).await;
+    ctx.audit(
+        &st,
+        &out.receipt.session_id,
+        crate::inject::headless::ACTION_HEADLESS,
+        &crate::inject::headless::turn::receipt_result_word(&out.receipt),
+        out.receipt.duration_ms,
+    );
+    crate::inject::headless::turn::registry().end(&lock_key);
+    out
+}
+
+/// POST /m/api/v1/session-create-zcode（H10 无头新建；spec H10 + 计划 Task 12）。
+///
+/// 顺序与理由（每步都有判据依赖，勿随意调换）：
+/// 1. **参数**：项目空 / 首句超长 → 400 bad_request（请求本身不合法）；
+/// 2. **设备身份**：cookie 缺失 → 403 防御（gate 已拦，理论不可达）；
+/// 3. **H3 无头总开关**（默认关）→ 403 `headless_disabled`（新建是无头动作，必须同门；
+///    此处没有路由结论可判——还没有会话——故门 = 开关本身，码与文案复用 session-send 单点）；
+/// 4. **看板快照**（一次，spawn_blocking）：黄字信号判据 + **安装发现的宿主 pid 证据**
+///    （看板里任一 zcode 会话的 pid = APP 宿主进程；找不到就 0，只探常见安装路径）；
+/// 5. **提示面**（`zcode_create::create_hints` 单点：可见性分层 + 黄字信号文案）；
+/// 6. **平台门**：无头命令形态只有 Windows/macOS 两态 → 其他平台如实拒绝；
+/// 7. **路径校验**（`validate_manual_path`：绝对性 + 盘符在场 + **同源黑名单**
+///    （`remote::files` 的文件预览口径）+ **绝不递归建目录**）→ 拒绝即 `refused`（零字节投递）；
+/// 8. **项目级串行锁**（`create_lock_key`）：同项目两次新建不许重叠（两个无头进程同时在该
+///    工作区开会话会互相争用）；排在安装/版本检查之前（越早占位竞态窗口越小）；
+/// 9. **安装形态**（`production_roots` + `resolve_spec`）：找不到 cjs → 如实拒绝 + **注销槽位**
+///    （否则该项目被自己的锁挡死）；
+/// 10. **命令形态**（`build_create_argv`：`resume = None`——argv 里**没有** `--resume`）；
+///     此后落账的 `content` 是最终 `--prompt` 载荷；
+/// 11. **版本门控**（Task 8 单源探针；探针期间取消靶子仍是空占位——取消会如实报「未送达」）；
+/// 12. **回合**（detached task：客户端断连不打断已起跑的回合——正文已进 ZCode，丢回执可以，
+///     丢用户消息不行；回执/审计/注销都在任务内完成）。
+pub async fn session_create_zcode(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<SessionCreateZcodeReq>,
+) -> Response {
+    use crate::inject::headless::receipt::Stage;
+    use crate::inject::headless::zcode;
+    use crate::inject::headless::zcode_create;
+    use crate::inject::routing::HeadlessKind;
+
+    // ① 参数（首句缺省 = spec H10 探针 `hi`；原文上送，归一在命令形态组装时一次完成）
+    let project = req.project.trim().to_string();
+    let first = req
+        .first_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(zcode_create::DEFAULT_FIRST_TEXT)
+        .to_string();
+    if project.is_empty() || first.chars().count() > MAX_SEND_CHARS {
+        return bad_request();
+    }
+    // ② 设备身份（防御 403 + 花名）
+    let Some((device_id, device_name)) = device_identity(&st, &headers) else {
+        return forbidden_defense();
+    };
+    // ③ H3 无头总开关（默认关；码与文案复用单点常量）
+    if !st.store.with(super::headless_enabled_conn) {
+        return json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "headless_disabled",
+                "reason": super::HEADLESS_DISABLED_REASON,
+            }),
+        );
+    }
+    let os = std::env::consts::OS;
+    let mut ctx = ZcodeCreateCtx {
+        device_id,
+        device_name,
+        content: first.clone(),
+    };
+    // ④ 看板快照（同步阻塞扫描 → spawn_blocking）
+    let probe_st = st.clone();
+    let board =
+        match tokio::task::spawn_blocking(move || (probe_st.session_source)().sessions).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("session-create-zcode 会话扫描任务异常: {e}");
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        };
+    // ⑤ 提示面（可见性分层 + 黄字信号；文案全在 zcode_create 单点）
+    let home = (st.home_source)().map(std::path::PathBuf::from);
+    let visibility = zcode::visibility_of(&project, home.as_deref(), os);
+    let warning = zcode_create::create_hints(&project, visibility, &board, os).warning;
+    // ⑥ 平台门（投递前拒绝：本平台没有该无头命令形态 —— 回合未起跑、零字节投递）
+    if os != "windows" && os != "macos" {
+        return ctx.refuse(
+            &st,
+            Stage::Refused,
+            "zcode 无头通道只支持 Windows / macOS（探测定案两形态）",
+            warning,
+        );
+    }
+    // ⑦ 路径校验（黑名单**同源文件预览**；绝不递归建目录）
+    let probe = zcode_create::production_probe(home.as_deref(), cfg!(windows));
+    let plan = match zcode_create::validate_manual_path(&project, cfg!(windows), &probe) {
+        Ok(p) => p,
+        Err(rej) => return ctx.refuse(&st, Stage::Refused, &rej.reason(), warning),
+    };
+    // ⑧ 项目级串行锁（**声明通道**：取消审计行 channel 列从槽位取）
+    let lock_key = zcode::create_lock_key(&project, os);
+    if !crate::inject::headless::turn::registry().begin(
+        &lock_key,
+        zcode::TurnSlot::placeholder("zcode", ctx.content.clone())
+            .with_channel(HeadlessKind::Zcode.wire_name()),
+    ) {
+        return ctx.refuse(
+            &st,
+            Stage::Refused,
+            "该项目已有在飞的新建回合（MAM 项目级串行锁，防同项目两次新建交错争用同一工作区）——本条未投递，请等回执后再试",
+            warning,
+        );
+    }
+    // ⑨ 安装形态（占位后失败必须注销槽位）
+    let host_pid = board
+        .iter()
+        .find(|s| s.agent_type == crate::session::AgentType::ZCode)
+        .map(|s| s.pid)
+        .unwrap_or(0);
+    let Some(spec) = zcode::resolve_spec(&zcode::production_roots(host_pid), os) else {
+        crate::inject::headless::turn::registry().end(&lock_key);
+        return ctx.refuse(
+            &st,
+            Stage::Spawn,
+            "ZCode 安装路径不可达（未找到 resources/glm/zcode.cjs）——请在电脑端确认 ZCode 的安装位置（看板里没有 zcode 会话时只探常见安装路径）",
+            warning,
+        );
+    };
+    // ⑩ 命令形态（`resume = None`：无 `--resume` 的新建形态；正文走 W4 单点组装）
+    let inv = zcode::build_create_argv(&spec, &first, &project, Some(&ctx.device_name));
+    ctx.content = inv.prompt.clone();
+    // ⑪ 版本门控（探针结论按 exe/cjs mtime 缓存；会话号位传空串——**不许把项目路径
+    //    当会话号**写进回执）
+    let verdict = crate::inject::headless::gate::probe(
+        &crate::inject::headless::gate::ProbeSpec::Zcode {
+            exe: spec.exe.clone(),
+            cjs: spec.cjs.clone(),
+        },
+        zcode::probe_cache(),
+        os,
+    )
+    .await;
+    if let Some(receipt) = crate::inject::headless::gate::version_gate_receipt("", &verdict) {
+        crate::inject::headless::turn::registry().end(&lock_key);
+        ctx.audit(
+            &st,
+            "",
+            crate::inject::headless::ACTION_HEADLESS,
+            &crate::inject::headless::turn::receipt_result_word(&receipt),
+            receipt.duration_ms,
+        );
+        return json_no_store(
+            StatusCode::OK,
+            create_envelope(
+                &receipt,
+                zcode_create::NewSessionConfirmation::Unconfirmed,
+                warning,
+                None,
+            ),
+        );
+    }
+    // ⑫ 回合（detached spawn）
+    let task = tokio::spawn(run_zcode_create_turn(
+        st.clone(),
+        ctx.clone(),
+        inv,
+        project.clone(),
+        plan,
+        lock_key.clone(),
+    ));
+    let out = match task.await {
+        Ok(o) => o,
+        Err(e) => {
+            log::error!("session-create-zcode 回合任务异常: {e}");
+            crate::inject::headless::turn::registry().end(&lock_key); // 本路径占过位 → 必须注销
+            return ctx.refuse(
+                &st,
+                Stage::ChannelError,
+                "回合内部任务异常终止（结果未知——请在会话列表中确认是否已建出会话，勿盲目重发）",
+                warning,
+            );
+        }
+    };
+    // ⑬ 封套（可见性只在**确认到**新会话时下发）
+    let confirmed = out.confirmation != zcode_create::NewSessionConfirmation::Unconfirmed;
+    json_no_store(
+        StatusCode::OK,
+        create_envelope(
+            &out.receipt,
+            out.confirmation,
+            warning,
+            confirmed.then_some(visibility),
+        ),
+    )
+}
+
+/// GET /m/api/v1/session-create-zcode-info?project=（H10 新建表单前置面）：
+/// 候选列表（信任表主源 ∪ 看板快照项目）+ 总开关状态 + 选中项目的黄字信号。
+///
+/// 契约（HTTP 恒 200；与 `session-send-info` 同款「可用性在 body」）：
+/// - 总开关关闭 → `{available:false, reasonCode:"headless_disabled", reason}`（**不给候选**，
+///   与 send-info 关闭态同口径——表单整体置灰）；
+/// - 开启 → `{available:true, tool:"zcode", defaultFirstText,
+///   candidates:[{path,source,trusted,note}]}`：
+///   - 准入 = **存在 ∧ 不在同源黑名单内**（复审 Minor 5：列表不提供创建路径必然拒绝的候选
+///     ——同一个 `remote::files` 口径，不另写第二份判据）；
+///   - `note` = `Visibility::note()` 的**逐字文案**（复审 Minor 2：前端不再自带一份
+///     「已信任/未信任」措辞——信任档文案只有后端一个出口，与 `visibilityNote` 同源）；
+/// - `?project=` 命中同项目在册 zcode 会话 → 追加 `warning`（黄字，不拦截）。
+pub async fn session_create_zcode_info(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    use crate::inject::headless::zcode;
+    use crate::inject::headless::zcode_create;
+
+    if device_identity(&st, &headers).is_none() {
+        return forbidden_defense();
+    }
+    if !st.store.with(super::headless_enabled_conn) {
+        return json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "available": false,
+                "reasonCode": "headless_disabled",
+                "reason": super::HEADLESS_DISABLED_REASON,
+            }),
+        );
+    }
+    let os = std::env::consts::OS;
+    let windows = cfg!(windows);
+    let home = (st.home_source)().map(std::path::PathBuf::from);
+    // 信任表（**只读** ~/.zcode/v2/setting.json；读不到 = 空表 = 全部未信任，保守）
+    let trusted = zcode::trusted_projects(home.as_deref());
+    // 看板快照项目（同步阻塞扫描 → spawn_blocking）
+    let probe_st = st.clone();
+    let board =
+        match tokio::task::spawn_blocking(move || (probe_st.session_source)().sessions).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("session-create-zcode-info 会话扫描任务异常: {e}");
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        };
+    let board_projects: Vec<String> = board.iter().map(|s| s.project_path.clone()).collect();
+    // 候选准入：存在 ∧ **不在同源黑名单内**（与 POST 的路径校验同一份 `remote::files` 口径）
+    let admissible = |p: &str| {
+        std::path::Path::new(p).exists()
+            && !crate::remote::files::project_path_rejected(
+                std::path::Path::new(p),
+                home.as_deref(),
+                windows,
+            )
+    };
+    let candidates: Vec<serde_json::Value> =
+        zcode_create::candidates(&trusted, &board_projects, &admissible, os)
+            .into_iter()
+            .map(|c| {
+                // 信任档文案经 Task 7 单点（与 POST 的 visibilityNote 同一条 note()）
+                let note = zcode::visibility_of(&c.path, home.as_deref(), os).note();
+                serde_json::json!({
+                    "path": c.path,
+                    "source": c.source,
+                    "trusted": c.trusted,
+                    "note": note,
+                })
+            })
+            .collect();
+    let mut body = serde_json::json!({
+        "available": true,
+        "tool": "zcode",
+        "defaultFirstText": zcode_create::DEFAULT_FIRST_TEXT,
+        "candidates": candidates,
+    });
+    // 选中项目的黄字信号（表单选完项目即可见；提交时 POST 回执也会带一次当时的结论）
+    if let Some(project) = params
+        .get("project")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        let visibility = zcode::visibility_of(&project, home.as_deref(), os);
+        if let Some(w) = zcode_create::create_hints(&project, visibility, &board, os).warning {
+            body["warning"] = serde_json::json!(w);
+        }
+    }
+    json_no_store(StatusCode::OK, body)
+}
+
+// ============================================================
 // H8 codex APP 托管会话无头分派（Task 9）
 // ============================================================
 
@@ -13174,5 +13657,122 @@ mod plan_feedback_tests {
             "队首旧态不算证据，新回执行出现即命中"
         );
         assert_eq!(last, fresh, "命中拍行集 = screen_tail 消费面");
+    }
+}
+
+// ============================================================
+// Task 12（H10）新建封套的**纯核**用例（复审 Minor 4：成功臂此前无任何端点级覆盖）
+// ============================================================
+//
+// 为什么在 api 侧直测封套而不是端点：端点成功臂要在 cfg(test) 下真 spawn 一个 zcode 回合才
+// 可能到达，而 `zcode::production_roots` 在测试构建里恒空表（宪法级纪律：绝不消耗真机配额/
+// 写真实 ~/.zcode）⇒ 端点级用例只能覆盖拒绝臂。真回合的**确认语义**由
+// `inject::headless::zcode_create` 的脚本缝用例覆盖；**线上形状**（wire 词、sessionId 契约、
+// 可见性挂载）由本模块直测 `create_envelope`——两侧合起来把成功臂钉死，且零真实进程。
+#[cfg(test)]
+mod create_envelope_tests {
+    use super::*;
+    use crate::inject::headless::receipt::Receipt;
+    use crate::inject::headless::zcode_create::NewSessionConfirmation as C;
+    use crate::inject::routing::Visibility;
+
+    const SID: &str = "sess_22222222-2222-2222-2222-222222222222";
+
+    /// **Important 1 的线契约层**：`confirmation:"none"` ⇒ `sessionId` 恒空串——
+    /// **哪怕回执里带的是一个形态合法的帧号**（崩溃前打过的帧就是这种来路）。
+    #[test]
+    fn unconfirmed_envelope_never_exposes_a_session_id() {
+        let mut receipt = Receipt::failed(
+            crate::inject::headless::receipt::Stage::Crash,
+            "退出码 1（帧已打出但回合崩了）",
+        );
+        // 手工构造「看着合法」的来路：崩溃回执带着帧里的会话号
+        receipt.session_id = SID.to_string();
+        let body = create_envelope(
+            &receipt,
+            C::Unconfirmed,
+            None,
+            Some(Visibility::AfterRestart),
+        );
+        assert_eq!(body["sessionId"], "", "{body}");
+        assert_eq!(body["confirmation"], "none");
+        assert!(
+            body.get("visibility").is_none() && body.get("visibilityNote").is_none(),
+            "未确认 ⇒ 不得承诺可见性（什么都没落到工作区）：{body}"
+        );
+        assert_eq!(
+            body["receipt"]["sessionId"], SID,
+            "回执原文照透（形状不篡改）"
+        );
+    }
+
+    /// 成功臂（两个确认来源）：wire 词 + 会话号透出 + **可见性挂载**（档 + 逐字文案）
+    #[test]
+    fn confirmed_envelope_mounts_session_and_visibility() {
+        let receipt = Receipt::ok(SID, 8_000);
+        for (conf, word) in [
+            (C::StdoutFrame(SID.to_string()), "stdout_frame"),
+            (C::Store(SID.to_string()), "store"),
+        ] {
+            let body = create_envelope(
+                &receipt,
+                conf,
+                Some("黄字信号".to_string()),
+                Some(Visibility::AfterRestart),
+            );
+            assert_eq!(body["sessionId"], SID, "{body}");
+            assert_eq!(body["confirmation"], word, "{body}");
+            assert_eq!(body["channel"], "headless_zcode");
+            assert_eq!(body["visibility"], "after_restart");
+            assert_eq!(
+                body["visibilityNote"], "已信任工作区：重启 ZCode 应用后可见",
+                "可见性文案经 Visibility::note() 单点：{body}"
+            );
+            assert_eq!(body["warning"], "黄字信号", "黄字信号任何 200 都带：{body}");
+            assert_eq!(body["receipt"]["status"], "ok");
+        }
+        // 确认到会话但**没给**可见性（调用方选择不下发）⇒ 键缺席，不以 null 出现
+        let body = create_envelope(&receipt, C::Store(SID.to_string()), None, None);
+        assert!(body.get("visibility").is_none() && body.get("visibilityNote").is_none());
+        assert!(
+            body["warning"].is_null(),
+            "无信号时为 null（前端 optional）：{body}"
+        );
+        assert_eq!(body["receipt"]["status"], "ok");
+    }
+
+    /// **跨语言确认词锁**（复审 Minor 4）：本侧 wire 词集合 == 夹具名单；前端
+    /// `ZCODE_CREATE_CONFIRMATIONS` 对同一夹具断言（`tests/mobile/NewSessionForm.test.tsx`）
+    #[test]
+    fn confirmation_wire_names_are_pinned_by_the_cross_language_fixture() {
+        let mut got: Vec<String> = [
+            C::StdoutFrame("s".into()),
+            C::Store("s".into()),
+            C::Unconfirmed,
+        ]
+        .iter()
+        .map(|c| confirmation_wire(c).to_string())
+        .collect();
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("tests")
+                .join("fixtures")
+                .join("zcode_create_confirmations.json"),
+        )
+        .expect("跨语言夹具必须存在（tests/fixtures/zcode_create_confirmations.json）");
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("夹具必须是合法 JSON");
+        let mut want: Vec<String> = fixture["confirmations"]
+            .as_array()
+            .expect("夹具须有 confirmations 数组")
+            .iter()
+            .map(|v| v.as_str().expect("元素须为字符串").to_string())
+            .collect();
+        got.sort();
+        want.sort();
+        assert_eq!(
+            got, want,
+            "confirmation wire 词集合与跨语言夹具不一致（前端常量按同一夹具断言）"
+        );
     }
 }

@@ -24,6 +24,9 @@ pub mod turn;
 pub mod wb_acp;
 /// H7 zcode 无头通道（Task 8；codex/workbuddy/CLI 三家分属 Task 9/11/13）
 pub mod zcode;
+/// H10 zcode 无头**新建**（Task 12）：候选列表/手填校验纯核 + 新建回合编排
+/// （命令形态复用 [`zcode::build_create_argv`] 的 `resume = None` 形态）
+pub mod zcode_create;
 
 /// 无头动作审计词（H6）：turn 落账（终态 = 回执终态）
 pub const ACTION_HEADLESS: &str = "headless";

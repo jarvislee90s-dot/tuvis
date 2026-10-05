@@ -654,6 +654,13 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         .route(
             "/session-headless-cancel",
             post(api::session_headless_cancel),
+        )
+        // Task 12（H10）：zcode 无头**新建**——POST 建会话并注入首句；GET 是表单前置面
+        // （候选列表 + 总开关状态 + 黄字信号）。PIN 门禁内层 gate 结构性覆盖。
+        .route("/session-create-zcode", post(api::session_create_zcode))
+        .route(
+            "/session-create-zcode-info",
+            get(api::session_create_zcode_info),
         ) // M8 Task 11：审批端点（红卡一键批准/拒绝——选项可用性 + 按键应答；PIN 门禁
         // 内层 gate 结构性覆盖，新端点不需要各自鉴权代码）
         .route(
@@ -7092,6 +7099,390 @@ mod tests {
             "键位经 spec 覆写委托照旧记录（无 [mobile] 前缀）"
         );
         assert!(fake.recorded().is_empty(), "审批走按键通道，不走文本注入");
+    }
+
+    // ==== Task 12（H10）：zcode 无头新建端点（POST 建 + GET 前置面）====
+    //
+    // **测试构建的确定性**（与 Task 8 同款宪法级纪律）：`zcode::production_roots` 在
+    // `cfg(test)` 下恒空表（本机真装了 ZCode，若单测也咨询真机安装路径就会**真的 spawn
+    // 一个真实回合**——消耗真实账号配额并写真实 `~/.zcode`）。故端点用例覆盖的是
+    // **门/参数/路径校验/安装不可达**等确定性臂；真回合的确认语义（会话库发现、诚实
+    // 未确认、歧义、争用锁）由 `inject::headless::zcode_create` 的脚本缝用例覆盖。
+    // 主目录一律 tempdir 夹具或 None，**绝不触真实 ~/.zcode / ~/.mam**。
+
+    /// H10 新建端点专用 state：开关开启 + 设备 + 指定会话源 + 可注入 home_source
+    /// （信任表/黑名单基准的 tempdir 夹具；None = 保守判未信任 + fail-closed 全段黑名单）
+    fn zcode_create_state(
+        sessions: Vec<crate::session::Session>,
+        home: Option<std::path::PathBuf>,
+    ) -> Arc<RemoteState> {
+        let mut state = with_sessions(inject_state(FakeInjector::ok()), sessions);
+        Arc::get_mut(&mut state)
+            .expect("state 尚未共享（建造器返回值立即覆盖）")
+            .home_source = Box::new(move || home.as_ref().map(|h| h.to_string_lossy().to_string()));
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        state
+    }
+
+    /// zcode 会话夹具（项目路径可指到 tempdir 真实目录——端点侧存在性判定是真的 FS 判定）
+    fn create_sess(
+        id: &str,
+        project_path: &str,
+        pid: u32,
+        status: crate::session::SessionStatus,
+    ) -> crate::session::Session {
+        let mut s = inj_sess(id, crate::session::AgentType::ZCode, pid, status);
+        s.project_path = project_path.to_string();
+        s.project_name = "proj".into();
+        s
+    }
+
+    fn create_lock_of(project: &str) -> String {
+        crate::inject::headless::zcode::create_lock_key(project, std::env::consts::OS)
+    }
+
+    /// H3 总开关是新建的**同门**（无头动作一律默认关）：关闭 → POST 403 headless_disabled
+    /// （码与文案与 session-send 单点同源）+ 零审计行；GET 前置面 200 但 `available:false`
+    /// 且**不给候选**（与 `session-send-info` 关闭态同口径）
+    #[tokio::test]
+    async fn zcode_create_requires_the_headless_switch() {
+        let state = with_sessions(inject_state(FakeInjector::ok()), vec![]);
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-create-zcode",
+                Some("mam_device=mm"),
+                Some(r#"{"project":"E:/proj"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "总开关关闭 → 403（门在最前）");
+        let b = body_string(r).await;
+        assert!(
+            b.contains("headless_disabled")
+                && b.contains("无头通道未开启，请在电脑端 MAM 设置中开启"),
+            "关闭态必须带单点码与逐字文案：{b}"
+        );
+        assert!(
+            state
+                .store
+                .with(|c| crate::database::dao::write_audit::recent_conn(c, 10))
+                .is_empty(),
+            "被门拦下的请求什么动作都没发生——不得落审计行"
+        );
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-create-zcode-info",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "前置面：可用性在 body（同 send-info）");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["available"], false, "{v}");
+        assert_eq!(v["reasonCode"], "headless_disabled");
+        assert!(
+            v["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("无头通道未开启")),
+            "{v}"
+        );
+        assert!(
+            v.get("candidates").is_none(),
+            "关闭态不给候选（表单整体置灰，与 send-info 同口径）：{v}"
+        );
+        // 无设备 cookie → 403 防御（gate 已拦，理论不可达）
+        let r = app
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-create-zcode-info",
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+    }
+
+    /// 参数与手填路径的**逐格诚实面**：请求不合法 400；非法路径一律 200 + `refused`
+    /// （回合未起跑、`sessionId` 空串、`confirmation:"none"`、原因点名）；合法路径走到
+    /// 安装不可达（cfg(test) 确定性臂）→ `spawn` 失败但同样不编会话号；每条都落 `headless`
+    /// 审计行、入队零残留、项目级串行锁**已注销**
+    #[tokio::test]
+    async fn zcode_create_refuses_bad_input_and_illegal_paths_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let proj_s = proj.to_string_lossy().to_string();
+        let state = zcode_create_state(
+            vec![create_sess(
+                "sess_h10_act",
+                &proj_s,
+                0,
+                crate::session::SessionStatus::Processing,
+            )],
+            None,
+        );
+        let app = router(state.clone());
+        let post = |body: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(req(
+                    "POST",
+                    "/m/api/v1/session-create-zcode",
+                    Some("mam_device=mm"),
+                    Some(&body),
+                ))
+                .await
+                .unwrap()
+            }
+        };
+
+        // ① 缺项目 / 全空白项目 / 首句超长 → 400（请求本身不合法）
+        for body in [
+            r#"{}"#.to_string(),
+            r#"{"project":"   "}"#.to_string(),
+            format!(
+                r#"{{"project":"E:/proj","firstText":"{}"}}"#,
+                "改".repeat(crate::remote::api::MAX_SEND_CHARS + 1)
+            ),
+        ] {
+            let r = post(body.clone()).await;
+            assert_eq!(r.status(), 400, "不合法请求：{body}");
+        }
+        assert!(
+            state
+                .store
+                .with(|c| crate::database::dao::write_audit::recent_conn(c, 10))
+                .is_empty(),
+            "400 是请求层拒绝：不落审计行（与 session-send 同口径）"
+        );
+
+        // ② 相对路径 → refused（点名「绝对路径」）
+        let r = post(r#"{"project":"proj/rel"}"#.to_string()).await;
+        assert_eq!(r.status(), 200, "投递前拒绝：HTTP 200 + 语义在 body");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["receipt"]["stage"], "refused", "{v}");
+        assert_eq!(v["sessionId"], "", "未确认不得给会话号：{v}");
+        assert_eq!(v["confirmation"], "none");
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("绝对路径")),
+            "拒绝必须点名原因：{v}"
+        );
+        assert!(
+            v.get("visibility").is_none() && v.get("visibilityNote").is_none(),
+            "未确认时不得承诺可见性（什么都没落到工作区）：{v}"
+        );
+
+        // ③ 敏感目录（同源文件预览黑名单；home 读不到 → fail-closed 全段匹配）
+        let r = post(r#"{"project":"C:/Users/me/.ssh/proj"}"#.to_string()).await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["receipt"]["stage"], "refused", "{v}");
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("敏感目录黑名单")),
+            "必须点名黑名单：{v}"
+        );
+
+        // ④ 需递归创建（父目录不在场）→ refused（点名「不递归创建」）
+        let deep = dir.path().join("nope").join("deep");
+        let r = post(format!(
+            r#"{{"project":{}}}"#,
+            serde_json::json!(deep.to_string_lossy())
+        ))
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["receipt"]["stage"], "refused", "{v}");
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("不递归创建")),
+            "必须点名「不递归建目录」：{v}"
+        );
+        assert!(!deep.exists(), "拒绝即零副作用：绝不真的建目录");
+
+        // ⑤ 合法在册目录 → 走到安装发现（cfg(test) 恒不可达）→ spawn 档失败，仍不编会话号
+        let r = post(format!(r#"{{"project":{}}}"#, serde_json::json!(proj_s))).await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["receipt"]["stage"], "spawn", "{v}");
+        assert!(
+            v["receipt"]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains("安装路径不可达")),
+            "{v}"
+        );
+        assert_eq!(v["sessionId"], "", "安装不可达 ⇒ 未确认（绝不编 sess_id）");
+        assert_eq!(v["confirmation"], "none");
+        assert_eq!(v["channel"], "headless_zcode");
+        assert!(
+            v["warning"].as_str().is_some_and(|s| s.contains("不拦截")),
+            "同项目已有在册 zcode 会话 → 黄字信号（**不拦截**：本条照常走到安装发现）：{v}"
+        );
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(&create_lock_of(&proj_s)),
+            "安装不可达的拒绝臂必须注销项目级串行锁（否则该项目被自己的锁挡死）"
+        );
+        assert!(
+            state
+                .store
+                .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, &proj_s))
+                .is_empty(),
+            "新建绝不入队（裁决 8：无头回合每回合 spawn）"
+        );
+        // 审计行：四条语义拒绝各一条，末条 = spawn 失败；通道/工具/设备逐列可查，
+        // 会话号列**留空**（未确认——不拿项目路径充数）
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 4, "四条拒绝必须各落一行：{audits:?}");
+        assert_eq!(audits[0].action, "headless");
+        assert_eq!(audits[0].channel, "headless_zcode");
+        assert_eq!(audits[0].agent_type, "zcode");
+        assert_eq!(audits[0].device_name, "测试设备");
+        assert_eq!(
+            audits[0].result, "failed(spawn) · 0ms",
+            "终态+阶段码+耗时口径"
+        );
+        assert_eq!(audits[0].session_id, "", "未确认 = 会话号列留空（不冒充）");
+        assert_eq!(audits[3].result, "failed(refused) · 0ms");
+    }
+
+    /// GET 前置面：候选 = 信任表（主源，含信任档标注 + **逐字可见性文案**）+ 看板快照项目，
+    /// **准入过滤**（缺席 ∧ 同源黑名单）；`?project=` 命中同项目在册 zcode 会话才给黄字信号
+    /// （干净项目不误报）
+    #[tokio::test]
+    async fn zcode_create_info_lists_candidates_and_yellow_signal() {
+        let home = tempfile::tempdir().unwrap();
+        let trusted_proj = home.path().join("trusted_proj");
+        let board_proj = home.path().join("board_proj");
+        let ghost_proj = home.path().join("ghost_proj"); // 不在场 → 候选过滤
+        let ssh_proj = home.path().join(".ssh").join("proj"); // 同源黑名单 → 候选过滤
+        std::fs::create_dir_all(&trusted_proj).unwrap();
+        std::fs::create_dir_all(&board_proj).unwrap();
+        std::fs::create_dir_all(&ssh_proj).unwrap();
+        let v2 = home.path().join(".zcode").join("v2");
+        std::fs::create_dir_all(&v2).unwrap();
+        std::fs::write(
+            v2.join("setting.json"),
+            serde_json::json!({
+                "recentProjects": [
+                    trusted_proj.to_string_lossy(),
+                    ghost_proj.to_string_lossy(),
+                    ssh_proj.to_string_lossy(),
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let board_s = board_proj.to_string_lossy().to_string();
+        let trusted_s = trusted_proj.to_string_lossy().to_string();
+        let state = zcode_create_state(
+            vec![create_sess(
+                "sess_h10_info",
+                &board_s,
+                0,
+                crate::session::SessionStatus::Idle,
+            )],
+            Some(home.path().to_path_buf()),
+        );
+        let app = router(state.clone());
+
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-create-zcode-info",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["available"], true, "{v}");
+        assert_eq!(v["tool"], "zcode");
+        assert_eq!(
+            v["defaultFirstText"], "hi",
+            "首句默认值由后端单点下发（spec H10 探针）"
+        );
+        let cands = v["candidates"].as_array().unwrap();
+        assert_eq!(
+            cands.len(),
+            2,
+            "准入过滤后只留两个候选（缺席目录 + **同源黑名单目录**都被滤掉）：{cands:?}"
+        );
+        assert_eq!(cands[0]["path"], serde_json::json!(trusted_s));
+        assert_eq!(cands[0]["source"], "trusted", "信任表主源在前：{cands:?}");
+        assert_eq!(cands[0]["trusted"], true);
+        assert_eq!(
+            cands[0]["note"], "已信任工作区：重启 ZCode 应用后可见",
+            "信任档文案由后端逐字下发（Visibility::note() 单点，前端不另编）：{cands:?}"
+        );
+        assert_eq!(cands[1]["path"], serde_json::json!(board_s));
+        assert_eq!(cands[1]["source"], "board");
+        assert_eq!(
+            cands[1]["trusted"], false,
+            "未信任目录必须如实标注（该新会话 APP 永不收录）：{cands:?}"
+        );
+        assert_eq!(cands[1]["note"], "未信任工作区：仅 MAM 可见");
+        assert!(
+            !cands
+                .iter()
+                .any(|c| c["path"].as_str().unwrap_or("").contains(".ssh")),
+            "敏感目录不得出现在候选里（列表不提供创建路径必拒的候选，复审 Minor 5）：{cands:?}"
+        );
+        assert!(
+            v.get("warning").is_none(),
+            "未点名项目 → 不给黄字信号（不做无判据预警）：{v}"
+        );
+
+        // 点名有在册 zcode 会话的项目 → 黄字信号；干净项目 → 无
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!(
+                    "/m/api/v1/session-create-zcode-info?project={}",
+                    uri_encode(&board_s)
+                ),
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert!(
+            v["warning"]
+                .as_str()
+                .is_some_and(|s| s.contains('1') && s.contains("不拦截")),
+            "同项目有在册 zcode 会话 → 黄字信号（不拦截）：{v}"
+        );
+        let r = app
+            .oneshot(req(
+                "GET",
+                &format!(
+                    "/m/api/v1/session-create-zcode-info?project={}",
+                    uri_encode(&trusted_s)
+                ),
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert!(v.get("warning").is_none(), "干净项目不得报警：{v}");
     }
 
     // ==== Task 9（H8）：codex APP 无头分派链（queue 主 / exec resume 兜底）====

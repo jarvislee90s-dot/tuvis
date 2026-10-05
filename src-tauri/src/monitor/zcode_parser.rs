@@ -42,6 +42,11 @@ use std::path::{Path, PathBuf};
 const CARD_WINDOW_MS: i64 = 24 * 3600 * 1000;
 /// 每轮枚举的近期会话上限（time_updated 倒序取前 N，防御异常大库）
 const RECENT_SESSIONS_LIMIT: usize = 100;
+/// 新建基线（[`stored_sessions`]）的**读取代价界**：90 天 / 2000 行——正确性不靠它
+/// （「新建」由 `time_created >= 回合起点` 主证据 + id 基线两道承担），本界只保证
+/// 单次读取有界；见该函数文档的「窗口的角色」。
+const STORED_SESSIONS_WINDOW_MS: i64 = 90 * 24 * 3600 * 1000;
+const STORED_SESSIONS_LIMIT: usize = 2000;
 /// 尾部消息读取深度（与既有工具 JSONL 尾读 500 行同档；ZCode 按消息计）
 const TAIL_MESSAGES_LIMIT: usize = 200;
 /// 无语义条目兜底的新鲜阈值（与 APP 形态 300s 停更阈值同源）
@@ -799,6 +804,78 @@ pub fn store_snapshot_home(home: &Path, session_id: &str) -> Option<ZcodeStoreSn
     store_snapshot(&ZcodeRoots::from_home(home), session_id)
 }
 
+/// 会话库**在册会话 `(id, 目录, 建行时刻)` 表**（H10 Task 12 新建基线；**只读**）。
+///
+/// # 返回 `Option`（复审 Important 2）
+/// `None` = **库不可读**（缺库 / 缺表 / 加锁 / 格式漂移）——调用方据此**如实判「基线不可
+/// 得」并放弃发现**，**绝不把它当成「该项目没有会话」**：否则「基线读失败一次 → 轮询读成功
+/// 一次」就能把在册旧会话说成本轮新建（回执给出真实但**不属于本次创建**的 sess_id）。
+///
+/// # `created_at` = `session.time_created`
+/// 真机表列（2026-10-05 只读 `PRAGMA table_info(session)` 核实：真实表含 `time_created`
+/// INTEGER）。**它是「新建」判据的主证据**（`time_created >= 回合起点` ⇒ 旧会话结构上不可能
+/// 被判成新建）；该列缺失/类型漂移 → `None` 降级为「无时间证据」（判据退回 id 基线 ——
+/// 不让一次 schema 漂移废掉整条发现链）。
+///
+/// # 窗口的角色（复审后重定位）
+/// 90 天 / 2000 行**只承担读取代价界**，不再承担正确性（正确性由 `created_at` 判据 +
+/// id 基线两道承担）。其余口径与出卡同源：`task_type='interactive'`（子代理会话排除）、
+/// `parent_id` 空、合规 id（[`is_valid_session_id`]）。
+pub fn stored_sessions(roots: &ZcodeRoots) -> Option<Vec<(String, String, Option<i64>)>> {
+    let conn = open_readonly_with_timeout(&roots.cli_db)?;
+    let cutoff = now_ms() - STORED_SESSIONS_WINDOW_MS;
+    let cols = "id, parent_id, directory";
+    let tail = format!(
+        "FROM session WHERE task_type = 'interactive' AND time_updated >= ?1
+         ORDER BY time_updated DESC LIMIT {}",
+        STORED_SESSIONS_LIMIT
+    );
+    // 首选带时间列形态（「新建」主证据）；列缺失（升级改表）→ prepare 失败 → 退无时间形态
+    if let Ok(mut stmt) = conn.prepare(&format!("SELECT {cols}, time_created {tail}")) {
+        let rows = stmt.query_map([cutoff], |row| {
+            Ok((
+                get_text(row, 0)?,
+                row.get::<_, Option<String>>(1)?,
+                get_text(row, 2).unwrap_or_default(),
+                row.get::<_, Option<i64>>(3).unwrap_or(None),
+            ))
+        });
+        // 查询失败 = 真读不到（不是「没数据」）→ 如实 None，不回退冒充空表
+        let rows = rows.ok()?;
+        return Some(
+            rows.filter_map(|r| r.ok())
+                .filter(|(id, parent, _, _)| admissible(id, parent.as_deref()))
+                .map(|(id, _, dir, created)| (id, dir, created))
+                .collect(),
+        );
+    }
+    let mut stmt = conn.prepare(&format!("SELECT {cols} {tail}")).ok()?;
+    let rows = stmt.query_map([cutoff], |row| {
+        Ok((
+            get_text(row, 0)?,
+            row.get::<_, Option<String>>(1)?,
+            get_text(row, 2).unwrap_or_default(),
+        ))
+    });
+    let rows = rows.ok()?;
+    Some(
+        rows.filter_map(|r| r.ok())
+            .filter(|(id, parent, _)| admissible(id, parent.as_deref()))
+            .map(|(id, _, dir)| (id, dir, None))
+            .collect(),
+    )
+}
+
+/// 基线读件的行准入（子代理行与不合规 id 一律排除——与出卡口径同源）
+fn admissible(id: &str, parent: Option<&str>) -> bool {
+    is_valid_session_id(id) && !parent.map(|p| !p.trim().is_empty()).unwrap_or(false)
+}
+
+/// 生产便利壳（真实 home）
+pub fn stored_sessions_home(home: &Path) -> Option<Vec<(String, String, Option<i64>)>> {
+    stored_sessions(&ZcodeRoots::from_home(home))
+}
+
 /// 快照内核（conn 注入，测试直驱）
 fn store_snapshot_conn(conn: &Connection, session_id: &str) -> Option<ZcodeStoreSnapshot> {
     let order_col = if conn.prepare("SELECT sequence FROM message LIMIT 0").is_ok() {
@@ -894,7 +971,8 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE session (
                 id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
-                task_type TEXT, title TEXT, time_updated INTEGER
+                task_type TEXT, title TEXT, time_updated INTEGER,
+                time_created INTEGER
              );
              CREATE TABLE message (
                 id TEXT PRIMARY KEY, session_id TEXT, sequence INTEGER,
@@ -938,6 +1016,15 @@ mod tests {
             "INSERT INTO session (id, parent_id, directory, task_type, title, time_updated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![id, parent_id, dir, task_type, title, time_updated],
+        )
+        .unwrap();
+    }
+
+    /// 补写 `session.time_created`（H10 基线的时间证据；既有 INSERT 不设该列 → NULL = 无证据）
+    fn set_time_created(conn: &Connection, id: &str, ms: i64) {
+        conn.execute(
+            "UPDATE session SET time_created = ?2 WHERE id = ?1",
+            rusqlite::params![id, ms],
         )
         .unwrap();
     }
@@ -2166,6 +2253,136 @@ mod tests {
             cli_db: tmp.path().join("nope-cli.sqlite"),
         };
         assert!(store_snapshot(&missing, SID_A).is_none());
+    }
+
+    /// **H10 新建基线读件**（Task 12 + 复审 Important 2）：`stored_sessions` = 在册
+    /// `(id, 目录, time_created)` 表——与出卡同源口径（interactive / 子代理排除 / 合规 id /
+    /// 有界），**返回 `Option`**（`None` = 库不可读，**不是**「没有会话」），并给出
+    /// `time_created`（「新建」判据的主证据）。只读、tempdir fixture、零真实 ~/.zcode。
+    #[test]
+    fn stored_sessions_lists_recent_interactive_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        let cli = build_cli_db(&roots.cli_db);
+        let now = now_ms();
+        // 新鲜会话 / 25 小时前（出卡 24h 窗外，基线仍须在册）/ 25 天前（仍在 90 天窗内）
+        insert_session(&cli, SID_A, None, "/tmp/proj", "interactive", None, now);
+        set_time_created(&cli, SID_A, now - 1_000);
+        insert_session(
+            &cli,
+            "sess_22222222-2222-4222-8222-222222222222",
+            None,
+            "/tmp/old",
+            "interactive",
+            None,
+            now - 25 * 3600 * 1000,
+        );
+        set_time_created(
+            &cli,
+            "sess_22222222-2222-4222-8222-222222222222",
+            now - 26 * 3600 * 1000,
+        );
+        insert_session(
+            &cli,
+            "sess_33333333-3333-4333-8333-333333333333",
+            None,
+            "/tmp/older",
+            "interactive",
+            None,
+            now - 25 * 24 * 3600 * 1000,
+        );
+        // 子代理会话（parent_id 非空）/ 非 interactive / 不合规 id → 一律不进基线
+        insert_session(
+            &cli,
+            SID_CHILD,
+            Some(SID_A),
+            "/tmp/proj",
+            "interactive",
+            None,
+            now,
+        );
+        insert_session(
+            &cli,
+            "sess_44444444-4444-4444-8444-444444444444",
+            None,
+            "/tmp/proj",
+            "subagent",
+            None,
+            now,
+        );
+        insert_session(
+            &cli,
+            "dirty-id",
+            None,
+            "/tmp/proj",
+            "interactive",
+            None,
+            now,
+        );
+        drop(cli);
+
+        let rows = stored_sessions(&roots).expect("库可读 ⇒ Some（空表也是 Some）");
+        let ids: Vec<&str> = rows.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                SID_A,
+                "sess_22222222-2222-4222-8222-222222222222",
+                "sess_33333333-3333-4333-8333-333333333333",
+            ],
+            "在册基线：interactive + 合规 id + 90 天窗（子代理/脏 id 不进）: {rows:?}"
+        );
+        assert_eq!(rows[0].1, "/tmp/proj", "目录随行给出（匹配口径归调用方）");
+        assert_eq!(
+            rows[0].2,
+            Some(now - 1_000),
+            "time_created 随行给出（「新建」判据的主证据）"
+        );
+        assert_eq!(
+            rows[2].2, None,
+            "未设 time_created 的行 = 无时间证据（判据退回 id 基线）"
+        );
+        // 缺库 → **None**（库不可读，绝不是「该项目没有会话」——复审 Important 2）
+        let missing = ZcodeRoots {
+            tasks_db: tmp.path().join("nope-tasks.sqlite"),
+            cli_db: tmp.path().join("nope-cli.sqlite"),
+        };
+        assert!(
+            stored_sessions(&missing).is_none(),
+            "库不可读必须如实 None（冒充空表会把旧会话误报成新建）"
+        );
+    }
+
+    /// 老库/改表**没有 `time_created` 列**时：读件退回「无时间证据」形态（`created_at = None`），
+    /// **不让一次 schema 漂移废掉整条发现链**（判据退 id 基线，而不是整条发现失效）
+    #[test]
+    fn stored_sessions_falls_back_when_time_created_column_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        std::fs::create_dir_all(roots.cli_db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&roots.cli_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                task_type TEXT, title TEXT, time_updated INTEGER
+             );",
+        )
+        .unwrap();
+        insert_session(
+            &conn,
+            SID_A,
+            None,
+            "/tmp/proj",
+            "interactive",
+            None,
+            now_ms(),
+        );
+        drop(conn);
+
+        let rows = stored_sessions(&roots).expect("库可读 ⇒ Some（列缺失不是读失败）");
+        assert_eq!(rows.len(), 1, "缺列仍须给出在册表：{rows:?}");
+        assert_eq!(rows[0].0, SID_A);
+        assert_eq!(rows[0].2, None, "无该列 ⇒ 无时间证据（判据退回 id 基线）");
     }
 
     /// token 字段多形态（真机对象 / 标量 / 全缺）：**没有就是 None，不编数字**

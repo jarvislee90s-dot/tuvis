@@ -80,6 +80,36 @@ pub fn receipt_result_word(r: &Receipt) -> String {
     }
 }
 
+/// 末条 assistant 的**摘要口径单点**（截断长度 = [`super::receipt::LAST_ASSISTANT_CHARS`]、
+/// 截断语义 = [`crate::inject::normalize::summarize`]，与 W5 审计摘要同源）。
+///
+/// **为什么单独成函数**（Task 12 复审 Minor 3）：[`ok_receipt_with_assistant`] 与
+/// 「回执已在手、只补摘要」的调用点（`zcode_create::fill_missing_from_store` /
+/// `confirmed_receipt` 的失败臂）必须走同一条截断——各自内联
+/// `summarize(.., LAST_ASSISTANT_CHARS)` 就是同一口径的两份写法，改一处漏一处不会编译报错。
+pub fn assistant_summary(text: &str) -> String {
+    crate::inject::normalize::summarize(text, super::receipt::LAST_ASSISTANT_CHARS)
+}
+
+/// 库/通道确认成功时的 **Ok 回执**（`lastAssistant` 摘要 + tokens）。
+///
+/// **为什么在底座**（Task 12 复审式上提）：`zcode.rs` 原有的私有 `ok_receipt_from_store`
+/// 是**通道无关**的收尾件（截断口径 = [`super::receipt::LAST_ASSISTANT_CHARS`] +
+/// [`crate::inject::normalize::summarize`] 单点），而 H10 新建路径（`zcode_create.rs`）
+/// 从会话库确认新会话时要用同一条口径——留在 `zcode.rs` 就会从通道模块外借私有件，
+/// 或被迫抄第二份截断。定义上提到此，`zcode.rs` 的既有调用改为委托（**零行为变化**）。
+pub fn ok_receipt_with_assistant(
+    session_id: &str,
+    text: &str,
+    tokens: Option<u64>,
+    duration_ms: u64,
+) -> Receipt {
+    let mut r = Receipt::ok(session_id, duration_ms);
+    r.last_assistant = Some(assistant_summary(text));
+    r.tokens = tokens;
+    r
+}
+
 // ============================================================
 // 会话串行锁 + 取消靶子（MAM 自己的；zcode 无头不拒绝并发，codex 复用同一表）
 // ============================================================

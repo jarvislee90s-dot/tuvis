@@ -186,6 +186,20 @@ pub fn build_argv(
     project: &str,
     device_name: Option<&str>,
 ) -> ZcodeInvocation {
+    build_with(Some(session_id), spec, text, project, device_name)
+}
+
+/// 命令形态组装内核（**唯一**组装出口；`resume` 是它与 [`build_create_argv`] 的唯一差别）：
+/// `device_name = Some(名)` ⇒ 正文经 **W4 单点** [`normalize::compose_injection`]（换行归一
+/// 成字面 `\n` + 尾部 ` [mobile 名]` 签名——与终端注入同一条组装出口，不另造一份）；
+/// `None` = 调用方已自行拼好签名/裸文本（原样上送，不二次签名）。
+fn build_with(
+    resume: Option<&str>,
+    spec: &ZcodeSpec,
+    text: &str,
+    project: &str,
+    device_name: Option<&str>,
+) -> ZcodeInvocation {
     let prompt = match device_name {
         Some(name) => normalize::compose_injection(name, text),
         None => text.to_string(),
@@ -203,7 +217,7 @@ pub fn build_argv(
         program: spec.exe.clone(),
         // H5：档位旗子从 spec 取（单一来源）——`--mode yolo` 不再由本模块字面直写
         argv: turn_flags(
-            Some(session_id),
+            resume,
             project,
             &prompt,
             &spec.cjs,
@@ -212,6 +226,28 @@ pub fn build_argv(
         env,
         prompt,
     }
+}
+
+/// **H10 无头新建形态**（Task 12）：`resume = None` —— 无在册会话可续，argv 里**没有**
+/// `--resume`（spec H10 逐字形态）。
+///
+/// flag 序与 [`build_argv`] **同源**（同一个 [`turn_flags`]），本函数只把 resume 位显式
+/// 留空——**不另写第二个 argv 构造器**（Task 8 的 `turn_flags` 文档早已预留本形态）。
+pub fn build_create_argv(
+    spec: &ZcodeSpec,
+    text: &str,
+    project: &str,
+    device_name: Option<&str>,
+) -> ZcodeInvocation {
+    build_with(None, spec, text, project, device_name)
+}
+
+/// **H10 新建的项目级串行锁键**（Task 12）：项目路径按**工作区比对口径**归一
+/// （复用 [`norm_path`]——与 [`same_workspace`] 同源：分隔符归一 + 去尾分隔 +
+/// Windows 大小写折叠），前缀 `create|` 与真实会话号的命名空间隔离（锁表是同一张
+/// [`TurnRegistry`]，键必须不可能撞上 `sess_…`）。
+pub fn create_lock_key(project: &str, os: &str) -> String {
+    format!("create|{}", norm_path(project, os))
 }
 
 /// 斜杠命令的**显式拒绝**（spec H7；`None` = 普通消息可发）。
@@ -899,21 +935,17 @@ async fn finalize(
     }
 }
 
-/// 库确认成功时的回执（**截断口径复用 Task 6 单点**：`receipt::LAST_ASSISTANT_CHARS`
-/// + `normalize::summarize`——不另写一份截断）
+/// 库确认成功时的回执（**截断口径复用 Task 6 单点**：`receipt::LAST_ASSISTANT_CHARS` +
+/// `normalize::summarize`——不另写一份截断）。定义已上提到 `turn` 底座的
+/// [`super::turn::ok_receipt_with_assistant`]（Task 12：H10 新建路径要用同一条口径；
+/// 它是通道无关的收尾件），此处保留薄壳以维持 Task 8 既有调用面。
 fn ok_receipt_from_store(
     session_id: &str,
     text: &str,
     tokens: Option<u64>,
     total_ms: u64,
 ) -> Receipt {
-    let mut r = Receipt::ok(session_id, total_ms);
-    r.last_assistant = Some(normalize::summarize(
-        text,
-        super::receipt::LAST_ASSISTANT_CHARS,
-    ));
-    r.tokens = tokens;
-    r
+    super::turn::ok_receipt_with_assistant(session_id, text, tokens, total_ms)
 }
 
 /// 争用锁重试用尽的失败回执（**如实报「工作区忙」**，不冒充成功）
@@ -1145,6 +1177,73 @@ mod tests {
         assert!(
             !alt.iter().any(|a| a == "yolo"),
             "构造器不得自带字面档位: {alt:?}"
+        );
+    }
+
+    /// **H10 无头新建形态**（Task 12）：`build_create_argv` 与 [`build_argv`] 同源同序，
+    /// **唯一差别 = 没有 `--resume`**（以及不传会话号）——完整向量已由
+    /// `argv_pins_the_probed_command_form` 钉死，本测**只加**新建特有的断言（不抄一份向量）
+    #[test]
+    fn create_form_omits_resume_and_keeps_the_flag_order() {
+        let spec = ZcodeSpec::win("D:/Program Files/ZCode");
+        let c = build_create_argv(&spec, "hi", "E:/proj", Some("iPad"));
+        assert!(
+            !c.argv.iter().any(|a| a == "--resume"),
+            "H10 新建形态绝无 `--resume`（无在册会话可续）: {:?}",
+            c.argv
+        );
+        assert!(
+            c.argv.windows(2).any(|w| w == ["--cwd", "E:/proj"]),
+            "`--cwd <项目>` 必须在场: {:?}",
+            c.argv
+        );
+        assert_eq!(c.prompt, "hi [mobile iPad]", "W4 单点组装（签名后置）");
+        assert_eq!(c.argv[2], c.prompt, "argv 载荷与 prompt 同源");
+        assert_eq!(
+            c.argv.last().map(String::as_str),
+            Some("--json"),
+            "`--json` 仍是尾 flag: {:?}",
+            c.argv
+        );
+        // 档位段仍来自 H5 spec（单一来源），且**紧跟 `--cwd`**（Task 8 实测序）
+        let perm = PermissionSpec::zcode_default().flags();
+        let i = c
+            .argv
+            .iter()
+            .position(|a| a == "--cwd")
+            .expect("--cwd 在场");
+        assert_eq!(
+            &c.argv[i + 2..i + 2 + perm.len()],
+            perm.as_slice(),
+            "新建形态与 H7 同一 flag 序（档位段在 --cwd 之后）: {:?}",
+            c.argv
+        );
+        // 与 H7 形态同源：只差 resume 两位
+        let h7 = build_argv(&spec, "hi", "sess_9", "E:/proj", Some("iPad"));
+        let mut expected_drop = h7.argv.clone();
+        let ri = expected_drop
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("H7 形态带 --resume");
+        expected_drop.drain(ri..ri + 2);
+        assert_eq!(c.argv, expected_drop, "两形态只差 resume 段（同源同序）");
+    }
+
+    /// H10 项目级串行锁键：工作区口径归一（分隔符/尾分隔/平台大小写）——同项目两次新建
+    /// 必须落同一个键（否则重叠创建不受串行锁保护）
+    #[test]
+    fn create_lock_key_normalizes_like_the_workspace_probe() {
+        let a = create_lock_key("E:\\LLMproject\\Proj\\", "windows");
+        assert_eq!(a, create_lock_key("E:/LLMproject/proj", "windows"));
+        assert!(a.starts_with("create|"), "与 sess_… 命名空间隔离: {a}");
+        assert!(
+            !a.starts_with("sess_"),
+            "锁键不得与会话号形态混淆（取消端点只认 sess_… 的槽位）: {a}"
+        );
+        assert_ne!(
+            create_lock_key("/tmp/P", "macos"),
+            create_lock_key("/tmp/p", "macos"),
+            "macOS 不折叠大小写（与 same_workspace 同口径）"
         );
     }
 

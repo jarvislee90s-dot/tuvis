@@ -579,7 +579,7 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 | M6 | H8 codex APP | 手机对 Test2 的 codex 会话发「ok? [测试]」→ 切到 ChatGPT.app 看 | APP 内 ~1 分钟出现该消息并开始回复 |
 | M7 | H9 WB 前置 | （WB 未开远程控制时）手机对 WB 会话发消息 | 如实收到「WorkBuddy 远程控制端点未启用」提示（不谎报成功） |
 | M8 | H9 WB 全链 | 在 WorkBuddy 设置里开启远程控制类开关（找到与否都告知主线）→ 手机对活跃 WB 会话发「hi」 | WB APP 内出现消息并执行；找不到开关 = 记录后跳过（风险 16 活账） |
-| M9 | H10 zcode 新建 | 手机「+ 新建会话」→ 工具选 zcode → 项目选 Test2 → 首句默认 → 提交 | 回执出新 sess_id → 看板出现新卡 → 重启 ZCode APP 后 Test2 里可见 |
+| M9 | H10 zcode 新建 | 手机「+ 新建会话」→ 工具选 zcode → 项目选 Test2 → 首句默认 → 提交 | 回执出新 sess_id（**并记录回执里的 `confirmation` 值**：`stdout_frame` / `store` / `none`）→ 看板出现新卡 → 重启 ZCode APP 后 Test2 里可见；`confirmation:"none"`（未确认，回执 `sessionId` 为空串）不得显示任何会话号 |
 | M10 | H11 claude 审批 | 手机对一个无窗 claude 会话发「列出本目录文件」 | 手机弹出审批卡（Bash 工具 + 命令原文）→ 点批准 → 工具执行 → 回执含结果 |
 | M11 | H11 问答卡 | 手机发一条会触发 claude AskUserQuestion 的消息（如「问我一个单选题」） | 问答卡出现：单选/多选/Other 自由文本可用；**不全答无法提交**；提交后 claude 收到答案 |
 | M12 | H1+T1 dsh 正文 | 在 DeepSeek Harness 里随便一个项目发一条消息 | MAM 看板 dsh 卡正文/预览随之更新（不再「无消息」） |
@@ -588,7 +588,9 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 | M15 | 回执诚实性抽查 | 手机随便发 2–3 条到不同工具 | 每条要么明确成功（有消费证据）要么明确失败原因——**没有任何一条谎报成功** |
 | M16 | **H7 resume 路径回执源（Task 8 复审追补）** | 手机对**探针自建**的 zcode 会话（会话列表里标题为 `hi` 的那几张，e.g. `sess_6c502451-4f7f-498c-ae4b-5b6fc4c4164c`）发「hi [测试]」 | 回执卡显示**末条 assistant 摘要 + 耗时**（`tokens` 取库 `tokens.output`，有则显示）；**不是**「未拿到回执」——stdout 无 JSON 的 resume 路径必须由会话库确认（若显示 channel_error = FAIL，记录并回报主线）；随后重启 ZCode APP → 该回合在工作区可见 |
 
-（L14 的 macOS 假成功修复属 Mac 侧验收——下次 Mac 有空时按 Mac 报告 ③-5 场景复测 Esc 生效即可，不阻塞本批。）
+**M9 取证附则（Task 12 复审登记，2026-10-05——验 M9 时**必须**同时记下这两条，它们各自只有实机能答）**：
+1. **新建形态是否出 JSON 帧**：M9 回执的 `confirmation` 字段即答案——`store` ⇒ CLI 未出可解析 JSON 帧（与 `--resume` 同形态，走会话库发现）；`stdout_frame` ⇒ 新建形态**会**出帧（Task 8 只实证了 `--resume` 不出，新建从未取证）。两种都算 PASS，但**必须记录是哪一种**（这是 H10 唯一未取证的形态面，也决定 Task 15 后续复测该盯哪条路）。
+2. **库行 `task_type` 取值**：新建的库发现按 `task_type='interactive'` 过滤（与出卡枚举同源假设，**未经真机核实**）。若 M9 出现「会话确实建出、看板也有了卡，但回执 `confirmation` 恒为 `none`/`stdout_frame` 而非 `store`」，先怀疑该假设——用只读查询核对新行的 `task_type`（`PRAGMA table_info(session)` / `SELECT task_type FROM session WHERE id='<新 sess_id>'`），把实测值回报主线（若取值不同，改 `zcode_parser::stored_sessions` 的过滤口径 + 其用例）。
 
 - [ ] **Step 1: 用户按表统一执行，逐条记录 PASS/FAIL/现象**
 - [ ] **Step 2: 主线汇总结果回填 spec 附录 B + 修复 FAIL 项（若有）**

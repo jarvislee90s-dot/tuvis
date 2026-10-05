@@ -233,25 +233,12 @@ pub fn read_file_safe(
     // - 基准不可用（未注入 / 无法 canonicalize）→ **全段保守匹配**（fail-closed：
     //   宁可少读一个文件，凭据防护不因基准缺失而失效；也不让一个坏基准把全部
     //   预览打成 NotFound——根因回归锁，生产曾在 3d22e2e 传 None 致黑名单整段跳过）
-    match home.and_then(|h| Path::new(h).canonicalize().ok()) {
-        Some(home_canon) => {
-            // firmlink 折叠与归属/段匹配收敛在 sensitive_under_home（纯函数、
-            // 跨平台 CI 锁定——CI 无 macOS runner，平台门控的端到端锁永不执行）
-            // T6：黑名单命中但落在豁免产物子树（.claude/plans 等）→ 放行预览
-            if sensitive_under_home(&canon, &home_canon, cfg!(windows))
-                && !exempt_subpath_under_home(&canon, &home_canon, cfg!(windows))
-            {
-                return Err(FileRejectReason::Sensitive);
-            }
-        }
-        // fail-closed：基准不可用 → 全段匹配（仅凭据目录——AppData/Library 为
-        // 主目录内语义段，全局匹配在 Windows 会误伤 TEMP（其位于 AppData 下），
-        // 见 CREDENTIAL_DIRS 注释）
-        None => {
-            if is_credential_path(&canon.to_string_lossy(), cfg!(windows)) {
-                return Err(FileRejectReason::Sensitive);
-            }
-        }
+    //
+    // 判定内核已抽出为 [`sensitive_rejected`]（H10 Task 12 复用点：项目路径选择
+    // 必须与文件预览**同一份黑名单**，不得另造第二份）——本处行为逐字不变。
+    let home_canon = home.and_then(|h| Path::new(h).canonicalize().ok());
+    if sensitive_rejected(&canon, home_canon.as_deref(), cfg!(windows)) {
+        return Err(FileRejectReason::Sensitive);
     }
     let meta = canon.metadata().map_err(|_| FileRejectReason::NotFound)?;
     if !meta.is_file() {
@@ -283,6 +270,56 @@ fn is_sensitive_path(child: &str, home: &str, windows: bool) -> bool {
 /// fail-closed 全段面（基准不可用）：仅凭据目录参与（见 CREDENTIAL_DIRS 注释）
 fn is_credential_path(child: &str, windows: bool) -> bool {
     any_segment_hit(child, "/", CREDENTIAL_DIRS, windows)
+}
+
+/// 黑名单判定**内核**（纯函数，平台语义注入；H10 Task 12 自 [`read_file_safe`] 抽出，
+/// 行为逐字不变——抽出理由 = 项目路径选择必须与文件预览**同一份黑名单**，不得另造）：
+/// - 基准可用：路径在主目录内 ∧ 命中 [`SENSITIVE_DIRS`] ∧ **不在**豁免产物子树
+///   （[`EXEMPT_SUBPATHS`]）⇒ 拒；
+/// - 基准不可用：fail-closed 全段匹配（仅凭据目录，见 [`CREDENTIAL_DIRS`] 注释）。
+pub(crate) fn sensitive_rejected(child: &Path, home_canon: Option<&Path>, windows: bool) -> bool {
+    match home_canon {
+        Some(home) => {
+            // firmlink 折叠与归属/段匹配收敛在 sensitive_under_home（纯函数、
+            // 跨平台 CI 锁定——CI 无 macOS runner，平台门控的端到端锁永不执行）
+            // T6：黑名单命中但落在豁免产物子树（.claude/plans 等）→ 放行预览
+            sensitive_under_home(child, home, windows)
+                && !exempt_subpath_under_home(child, home, windows)
+        }
+        None => is_credential_path(&child.to_string_lossy(), windows),
+    }
+}
+
+/// **项目路径**黑名单判定（H10 Task 12 的**唯一复用口**）：与文件预览同源同口径
+/// （[`sensitive_rejected`]）。
+///
+/// 与 [`read_file_safe`] 的差别**只有解析深度**（复审 Minor 1 修正）：预览判的是
+/// `canonicalize` 后的真实 inode；本函数面对的是「可能还不存在」的目录，故按
+/// **尽力解 symlink** 的顺序解析（[`resolve_for_blacklist`]）——字面路径在非敏感处、
+/// 却**指向**敏感目录的链接必须照拦（与文件预览同结论），叶节点不存在时至少解掉父级链接。
+/// `home` 基准仍经 canonicalize（与预览同源，含 macOS firmlink 折叠）；读不到即
+/// **fail-closed 全段匹配**——基准缺失不得让黑名单整段失效。
+pub(crate) fn project_path_rejected(child: &Path, home: Option<&Path>, windows: bool) -> bool {
+    let home_canon = home.and_then(|h| h.canonicalize().ok());
+    let resolved = resolve_for_blacklist(child);
+    sensitive_rejected(&resolved, home_canon.as_deref(), windows)
+}
+
+/// 待判路径的**尽力解析**（只解链接，不改变 fail-closed 方向）：
+/// ① 路径在场 → 直接 `canonicalize`（解掉链上全部 symlink/junction，与文件预览同结论）；
+/// ② 叶节点不在场 → `canonicalize` 其**父目录**再拼回叶名（父级是链接时同样解掉）；
+/// ③ 都解不了（父目录也不在场/无权限）→ 原样返回字面路径（段匹配本就基于字面路径，
+/// 且此形态与修复前行为一致，不会把可读目录误拦）。
+fn resolve_for_blacklist(child: &Path) -> PathBuf {
+    if let Ok(c) = child.canonicalize() {
+        return c;
+    }
+    if let (Some(parent), Some(name)) = (child.parent(), child.file_name()) {
+        if let Ok(p) = parent.canonicalize() {
+            return p.join(name);
+        }
+    }
+    child.to_path_buf()
 }
 
 /// 豁免子路径判定（T6 纯函数，平台语义可注入）：路径相对主目录的 rel 前缀命中
