@@ -3443,7 +3443,7 @@ mod tests {
     /// 花名的客户端（QR/第三方），移动端行为不变。
     #[tokio::test]
     async fn pin_pairing_rejects_unsafe_device_name() {
-        let (state, _t) = a3_state(Some("1234"), 3, &[], &[], false);
+        let (state, _t) = a3_state(Some("1234"), 3, &[], &[], &[], false);
         let app = router(state.clone());
         let r = app
             .clone()
@@ -6191,7 +6191,7 @@ mod tests {
             crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
         });
         // ②' zcode（**Task 8 已真分派**）：injectable:true + 通道名 + 可见性档。夹具
-        //     home_source = None（读不到信任表）→ 保守判**未信任**（「仅 MAM 可见」——
+        //     home_source = None（读不到信任表）→ 保守判**未信任**（「仅兔维斯可见」——
         //     绝不谎报「重启后可见」）
         let r = app
             .clone()
@@ -6208,7 +6208,7 @@ mod tests {
         assert_eq!(v["injectable"], true, "zcode 已接线 → 输入区必须可用：{v}");
         assert_eq!(v["channels"], serde_json::json!(["headless_zcode"]));
         assert_eq!(
-            v["visibility"], "mam_only",
+            v["visibility"], "tuvis_only",
             "读不到信任表 = 保守判未信任：{v}"
         );
         // ②'' workbuddy（**Task 11 已真分派**）：injectable:true + `headless_wb_acp`
@@ -7532,7 +7532,7 @@ mod tests {
             cands[1]["trusted"], false,
             "未信任目录必须如实标注（该新会话 APP 永不收录）：{cands:?}"
         );
-        assert_eq!(cands[1]["note"], "未信任工作区：仅 MAM 可见");
+        assert_eq!(cands[1]["note"], "未信任工作区：仅兔维斯可见");
         assert!(
             !cands
                 .iter()
@@ -17424,6 +17424,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(screens.into()));
         let q = queue.clone();
         Arc::new(RemoteState {
+            target_evidence: no_target_evidence(),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
@@ -18386,6 +18387,7 @@ mod tests {
         );
         Arc::new(RemoteState {
             ui_config_source: Box::new(|| None),
+            target_evidence: no_target_evidence(),
             subagent_source: fakes,
             subagent_message_source: std::collections::HashMap::new(),
             capability_table: crate::inject::capability::new_table(),
@@ -18547,6 +18549,7 @@ mod tests {
     ) -> Arc<RemoteState> {
         Arc::new(RemoteState {
             ui_config_source: Box::new(|| None),
+            target_evidence: no_target_evidence(),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: fakes,
             capability_table: crate::inject::capability::new_table(),

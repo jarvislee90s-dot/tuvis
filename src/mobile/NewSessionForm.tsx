@@ -173,7 +173,7 @@ export default function NewSessionForm({ onBack }: { onBack?: () => void }) {
         </div>
       </section>
 
-      {/* 候选列表：信任档如实标注（未信任目录的新会话 APP 永不收录，仅 MAM 可见） */}
+      {/* 候选列表：信任档如实标注（未信任目录的新会话 APP 永不收录，仅兔维斯可见） */}
       {available && (
         <section>
           <h3 className="mb-1 text-xs text-slate-500 dark:text-slate-400">

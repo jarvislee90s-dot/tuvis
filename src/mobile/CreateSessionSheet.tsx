@@ -494,113 +494,118 @@ export default function CreateSessionSheet({
               </section>
             )}
 
-            {tool !== "zcode" && (<>
-              {/* 目录：候选列表（path + 相对活跃时间 + 工具名）或手填切换。
+            {tool !== "zcode" && (
+              <>
+                {/* 目录：候选列表（path + 相对活跃时间 + 工具名）或手填切换。
                   候选是「后端已滤除不可用路径」的短名单（CreateProjectView 契约） */}
-              <section className="mb-4">
-                <h3 className="mb-2 text-sm font-medium">目录</h3>
-                {projects === null ? (
-                  <p className="text-xs text-[var(--mut)]">目录候选加载中…</p>
-                ) : projects.length > 0 ? (
-                  <ul data-testid="create-project-list" className="mb-2 space-y-1">
-                    {projects.map((p, i) => (
-                      <li key={p.path}>
-                        <button
-                          type="button"
-                          data-testid={`create-project-${i}`}
-                          aria-pressed={!manualMode && selectedPath === p.path}
-                          onClick={() => {
-                            setManualMode(false);
-                            setSelectedPath(p.path);
-                          }}
-                          className={`w-full rounded-[var(--rr)] border px-3 py-2 text-left ${
-                            !manualMode && selectedPath === p.path
-                              ? "border-[var(--btnp)] bg-[var(--bub)]"
-                              : "border-[var(--cb)] bg-[var(--cbg)]"
-                          }`}
+                <section className="mb-4">
+                  <h3 className="mb-2 text-sm font-medium">目录</h3>
+                  {projects === null ? (
+                    <p className="text-xs text-[var(--mut)]">目录候选加载中…</p>
+                  ) : projects.length > 0 ? (
+                    <ul data-testid="create-project-list" className="mb-2 space-y-1">
+                      {projects.map((p, i) => (
+                        <li key={p.path}>
+                          <button
+                            type="button"
+                            data-testid={`create-project-${i}`}
+                            aria-pressed={!manualMode && selectedPath === p.path}
+                            onClick={() => {
+                              setManualMode(false);
+                              setSelectedPath(p.path);
+                            }}
+                            className={`w-full rounded-[var(--rr)] border px-3 py-2 text-left ${
+                              !manualMode && selectedPath === p.path
+                                ? "border-[var(--btnp)] bg-[var(--bub)]"
+                                : "border-[var(--cb)] bg-[var(--cbg)]"
+                            }`}
+                          >
+                            <span className="block truncate text-sm">{p.path}</span>
+                            <span className="block text-xs text-[var(--mut)]">
+                              {formatRelativeTime(p.lastActiveAt, now)} ·{" "}
+                              {p.tools.map((t) => TOOL_LABELS[t as AgentType] ?? t).join("、")}
+                            </span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mb-2 text-xs text-[var(--mut)]">
+                      {projectsFailed
+                        ? "目录候选不可用，请手动输入路径"
+                        : "近 7 天无活跃项目，请手动输入路径"}
+                    </p>
+                  )}
+                  <button
+                    type="button"
+                    data-testid="create-manual-toggle"
+                    aria-pressed={manualMode}
+                    onClick={() => setManualMode((v) => !v)}
+                    className={`rounded-full px-3 py-1 text-xs ${
+                      manualMode
+                        ? "bg-[var(--btnp)] text-[var(--btnpt)]"
+                        : "bg-[var(--cb)] text-[var(--mut)]"
+                    }`}
+                  >
+                    手动输入路径
+                  </button>
+                  {manualMode && (
+                    <>
+                      <input
+                        type="text"
+                        data-testid="create-manual-input"
+                        value={manualPath}
+                        onChange={(e) => setManualPath(e.target.value)}
+                        placeholder="X:\path\to\project"
+                        className="mt-2 w-full rounded-[var(--rr)] border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)]"
+                      />
+                      {needsWindowsFormHint(manualPath) && (
+                        <p
+                          data-testid="create-win-hint"
+                          className="mt-1 text-xs text-amber-600 dark:text-amber-400"
                         >
-                          <span className="block truncate text-sm">{p.path}</span>
-                          <span className="block text-xs text-[var(--mut)]">
-                            {formatRelativeTime(p.lastActiveAt, now)} ·{" "}
-                            {p.tools.map((t) => TOOL_LABELS[t as AgentType] ?? t).join("、")}
-                          </span>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="mb-2 text-xs text-[var(--mut)]">
-                    {projectsFailed
-                      ? "目录候选不可用，请手动输入路径"
-                      : "近 7 天无活跃项目，请手动输入路径"}
-                  </p>
-                )}
+                          Windows 路径须为 X:\ 形态（以服务端校验为准）
+                        </p>
+                      )}
+                    </>
+                  )}
+                  {!manualMode && selectedPath !== null && (
+                    <p
+                      data-testid="create-selected-path"
+                      className="mt-1 text-xs text-[var(--mut)]"
+                    >
+                      已选：{selectedPath}
+                    </p>
+                  )}
+                </section>
+
+                {/* 首句：占位 hi；留空提交 → 请求体省 firstMessage 键（后端缺省探针 hi） */}
+                <section className="mb-4">
+                  <h3 className="mb-2 text-sm font-medium">首句</h3>
+                  <input
+                    type="text"
+                    data-testid="create-first-message"
+                    placeholder="hi"
+                    value={firstMessage}
+                    onChange={(e) => setFirstMessage(e.target.value)}
+                    className="w-full rounded-[var(--rr)] border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)]"
+                  />
+                  <p className="mt-1 text-xs text-[var(--mut)]">留空将发送默认问候「hi」</p>
+                </section>
+
+                {formYellow && activeHint}
+
                 <button
                   type="button"
-                  data-testid="create-manual-toggle"
-                  aria-pressed={manualMode}
-                  onClick={() => setManualMode((v) => !v)}
-                  className={`rounded-full px-3 py-1 text-xs ${
-                    manualMode
-                      ? "bg-[var(--btnp)] text-[var(--btnpt)]"
-                      : "bg-[var(--cb)] text-[var(--mut)]"
-                  }`}
+                  data-testid="create-submit"
+                  disabled={!canSubmit}
+                  onClick={() => void handleSubmit()}
+                  className="w-full rounded-[var(--rr)] bg-[var(--btnp)] px-3 py-2 text-sm font-medium text-[var(--btnpt)] disabled:opacity-40"
                 >
-                  手动输入路径
+                  {submitting ? "提交中…" : "开始创建"}
                 </button>
-                {manualMode && (
-                  <>
-                    <input
-                      type="text"
-                      data-testid="create-manual-input"
-                      value={manualPath}
-                      onChange={(e) => setManualPath(e.target.value)}
-                      placeholder="X:\path\to\project"
-                      className="mt-2 w-full rounded-[var(--rr)] border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)]"
-                    />
-                    {needsWindowsFormHint(manualPath) && (
-                      <p
-                        data-testid="create-win-hint"
-                        className="mt-1 text-xs text-amber-600 dark:text-amber-400"
-                      >
-                        Windows 路径须为 X:\ 形态（以服务端校验为准）
-                      </p>
-                    )}
-                  </>
-                )}
-                {!manualMode && selectedPath !== null && (
-                  <p data-testid="create-selected-path" className="mt-1 text-xs text-[var(--mut)]">
-                    已选：{selectedPath}
-                  </p>
-                )}
-              </section>
-  
-              {/* 首句：占位 hi；留空提交 → 请求体省 firstMessage 键（后端缺省探针 hi） */}
-              <section className="mb-4">
-                <h3 className="mb-2 text-sm font-medium">首句</h3>
-                <input
-                  type="text"
-                  data-testid="create-first-message"
-                  placeholder="hi"
-                  value={firstMessage}
-                  onChange={(e) => setFirstMessage(e.target.value)}
-                  className="w-full rounded-[var(--rr)] border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)]"
-                />
-                <p className="mt-1 text-xs text-[var(--mut)]">留空将发送默认问候「hi」</p>
-              </section>
-  
-              {formYellow && activeHint}
-  
-              <button
-                type="button"
-                data-testid="create-submit"
-                disabled={!canSubmit}
-                onClick={() => void handleSubmit()}
-                className="w-full rounded-[var(--rr)] bg-[var(--btnp)] px-3 py-2 text-sm font-medium text-[var(--btnpt)] disabled:opacity-40"
-              >
-                {submitting ? "提交中…" : "开始创建"}
-              </button>
-</>)}
+              </>
+            )}
           </>
         ) : deviceInvalid ? (
           // 评审修复④：进度轮询/提交遇 403 = 设备 cookie 判废——停拍并如实指向

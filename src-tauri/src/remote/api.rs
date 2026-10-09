@@ -12039,22 +12039,24 @@ pub async fn session_create(
     let signature_on = st
         .store
         .with(crate::inject::normalize::message_signature_enabled_conn);
-    let composed =
-        match crate::inject::normalize::compose_injection_flagged(&device_name, &text, signature_on)
-        {
-            Ok(c) => c,
-            // 花名白名单（裁决 24b）的纵深防御臂：注册点已挡新增、组装点兜存量——
-            // 命中即拒绝创建（fail closed，零字节注入），400 + 原因与设备名注册点同码
-            Err(reason) => {
-                return json_no_store(
-                    StatusCode::BAD_REQUEST,
-                    serde_json::json!({
-                        "error": crate::inject::headless::turn::DEVICE_NAME_UNSAFE_CODE,
-                        "reason": reason,
-                    }),
-                )
-            }
-        };
+    let composed = match crate::inject::normalize::compose_injection_flagged(
+        &device_name,
+        &text,
+        signature_on,
+    ) {
+        Ok(c) => c,
+        // 花名白名单（裁决 24b）的纵深防御臂：注册点已挡新增、组装点兜存量——
+        // 命中即拒绝创建（fail closed，零字节注入），400 + 原因与设备名注册点同码
+        Err(reason) => {
+            return json_no_store(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": crate::inject::headless::turn::DEVICE_NAME_UNSAFE_CODE,
+                    "reason": reason,
+                }),
+            )
+        }
+    };
     let run = CreateRun {
         task_id,
         tool,

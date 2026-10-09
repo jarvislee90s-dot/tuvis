@@ -1818,8 +1818,6 @@ export async function sessionCreateZcode(
   return (await r.json()) as ZcodeCreateResult;
 }
 
-
-
 /** 新建任务快照（GET /session-create/status 载荷，与 Rust `CreateTaskShared`
  *  camelCase 序列化逐字段对应，勿漂移）：
  *  phase ∈ opening_terminal / dialog_handling / injecting_first /

@@ -110,7 +110,11 @@ pub fn compose_injection_flagged(
         // 签名关：裸正文（花名门已在上方无条件通过——纵深防御，拒绝面保持一致）
         return Ok(body);
     }
-    Ok(format!("{} [mobile {}]", body, normalize_newlines(device_name)))
+    Ok(format!(
+        "{} [mobile {}]",
+        body,
+        normalize_newlines(device_name)
+    ))
 }
 /// 「远程消息带设备签名」设置的**读取单点**（api.rs 两处 compose 调用共用）：
 /// settings KV `remote_message_signature`，缺省 **off**（2026-10-05 用户裁决——
@@ -307,16 +311,16 @@ mod tests {
         use super::compose_injection_flagged as compose;
         assert_eq!(
             compose("iPhone", "帮我看看这个文件", false),
-            "帮我看看这个文件"
+            Ok("帮我看看这个文件".to_string())
         );
         assert_eq!(
             compose("iPhone", "帮我看看这个文件", true),
-            "帮我看看这个文件 [mobile iPhone]",
+            Ok("帮我看看这个文件 [mobile iPhone]".to_string()),
             "开关开 = 既有签名形态（compose_injection 兼容壳同款）"
         );
         // 斜杠命令两态都裸（签名开关不得给命令追加任何文本）
-        assert_eq!(compose("iPhone", "/plan", false), "/plan");
-        assert_eq!(compose("iPhone", "/plan", true), "/plan");
+        assert_eq!(compose("iPhone", "/plan", false), Ok("/plan".to_string()));
+        assert_eq!(compose("iPhone", "/plan", true), Ok("/plan".to_string()));
     }
 
     /// `is_slash_message` 与 compose 的裸注入判据同源（单点判据的自锁）：

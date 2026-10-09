@@ -84,7 +84,7 @@ pub enum Visibility {
     AfterRefresh,
     /// H7/H10 zcode **已信任工作区**：重启 ZCode APP 后可见（两端定案逐字，见 [`Visibility::note`]）
     AfterRestart,
-    /// H7/H10 zcode **未信任工作区**：仅 MAM 可见（APP 永不收录——两端定案）
+    /// H7/H10 zcode **未信任工作区**：仅兔维斯可见（APP 永不收录——两端定案）
     TuvisOnly,
 }
 
@@ -92,7 +92,7 @@ impl Visibility {
     /// 可见性提示文案（计划里的 `visibility_note` 元数据；spec H7/H10「两端定案文案」）：
     /// **后端给文案、前端只渲染**——与 H3 的 `HEADLESS_DISABLED_REASON` 同款单一措辞出口
     /// （移动页当前硬编码中文、i18n 随 M3 完善，故后端不另造 key 体系）。词表取自 spec
-    /// 附录 A「有头可见性」列（实时 / 刷新后 / 重启级 / 仅 MAM 可见）；zcode 两档为
+    /// 附录 A「有头可见性」列（实时 / 刷新后 / 重启级 / 仅兔维斯可见）；zcode 两档为
     /// **两端定案逐字文案，勿改写**。
     pub const fn note(self) -> &'static str {
         match self {
@@ -105,7 +105,7 @@ impl Visibility {
 }
 
 /// zcode 可见性两档的**单点映射**（H7/H10 两端定案）：已信任 → 重启 APP 后可见；
-/// 未信任 → 仅 MAM 可见。信任判定（`~/.zcode/v2/setting.json` 的 recentProjects 只读
+/// 未信任 → 仅兔维斯可见。信任判定（`~/.zcode/v2/setting.json` 的 recentProjects 只读
 /// 探针，Task 8/12）**不是** `route` 的输入（纯路由核的输入契约只有 tool/form/pid/platform），
 /// 故 [`headless_route`] 取已信任默认档，端点按探针结果经本函数降级——变体与文案只此一处。
 pub const fn zcode_visibility(trusted: bool) -> Visibility {

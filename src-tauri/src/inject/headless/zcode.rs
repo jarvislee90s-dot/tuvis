@@ -25,7 +25,7 @@
 //!
 //! # 可见性（两端定案）
 //! 项目在 APP 信任列表（`~/.zcode/v2/setting.json` 的 `recentProjects`，**只读**，元素是
-//! **路径字符串**）⇒ 重启 ZCode 应用后可见；否则仅 MAM 可见。映射**复用 Task 7** 的
+//! **路径字符串**）⇒ 重启 ZCode 应用后可见；否则仅兔维斯可见。映射**复用 Task 7** 的
 //! [`crate::inject::routing::zcode_visibility`] 与 [`Visibility::note`]，不另造第二份。
 //!
 //! # 会话串行锁
@@ -459,7 +459,7 @@ pub fn project_trusted(project: &str, trusted: &[String], os: &str) -> bool {
     trusted.iter().any(|p| same_workspace(p, project, os))
 }
 
-/// 可见性档：**复用 Task 7 的单点映射** [`zcode_visibility`]（未信任 ⇒ 仅 MAM 可见）
+/// 可见性档：**复用 Task 7 的单点映射** [`zcode_visibility`]（未信任 ⇒ 仅兔维斯可见）
 pub fn visibility_of(project: &str, home: Option<&Path>, os: &str) -> Visibility {
     zcode_visibility(project_trusted(project, &trusted_projects(home), os))
 }
@@ -1604,11 +1604,11 @@ mod tests {
         assert_eq!(trusted, Visibility::AfterRestart);
         assert_eq!(trusted.note(), "已信任工作区：重启 ZCode 应用后可见");
         let untrusted = visibility_of("E:/q", Some(dir.path()), "windows");
-        assert_eq!(untrusted, Visibility::MamOnly);
-        assert_eq!(untrusted.note(), "未信任工作区：仅 MAM 可见");
+        assert_eq!(untrusted, Visibility::TuvisOnly);
+        assert_eq!(untrusted.note(), "未信任工作区：仅兔维斯可见");
         assert_eq!(
             visibility_of("E:/p", None, "windows"),
-            Visibility::MamOnly,
+            Visibility::TuvisOnly,
             "读不到信任表 = 保守判未信任"
         );
     }

@@ -1,8 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "@/mobile/App";
-import SessionDetail, { isPlanPending } from "@/mobile/SessionDetail";
-import type { SessionFileEntry, SessionMessage, SubagentView } from "@/mobile/api";
 import SessionDetail, {
   HEADLESS_APPROVE_POLL_MS,
   HEADLESS_CLAUDE_CHANNEL,
@@ -18,6 +16,7 @@ import {
   HEADLESS_PENDING_KINDS,
   type SessionFileEntry,
   type SessionMessage,
+  type SubagentView,
 } from "@/mobile/api";
 import { BOOKMARK_COLORS, clearBookmarks, messageAnchor } from "@/mobile/bookmarks";
 import { MockEventSource } from "./eventSourceMock";
@@ -2884,7 +2883,8 @@ describe("SessionDetail：预览区 sheet 化（T1）", () => {
     expect(screen.getByTestId("subagent-detail")).toBeTruthy();
     expect(screen.getByTestId("split-container").className).toContain("flex-row");
     expect(screen.getByTestId("subagent-back")).toBeTruthy(); // 两层级导航：详情级必有返回钮
-
+  });
+});
 
 // ==== Task 8（H7）：无头回执卡（发送中 / 回执 / 失败分诊 + 取消钮）====
 //

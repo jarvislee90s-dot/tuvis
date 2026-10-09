@@ -20,7 +20,7 @@
 //!    stdout 只作完成信号。
 //!
 //! # 提示面（两端定案）
-//! - **可见性分层**：项目在 APP 信任表内 ⇒「重启 ZCode 应用后可见」；否则「仅 MAM 可见」
+//! - **可见性分层**：项目在 APP 信任表内 ⇒「重启 ZCode 应用后可见」；否则「仅兔维斯可见」
 //!   ——映射复用 Task 7 单点 [`crate::inject::routing::zcode_visibility`]（经
 //!   [`super::zcode::visibility_of`]），**不另造第二份**；
 //! - **黄字信号**：同项目已有在册 zcode 会话 ⇒ 提示（**不拦截**）——沿用配对不确定门
@@ -66,7 +66,7 @@ pub struct ProjectCandidate {
     /// 路径**原样保留**来源形态（信任表里的写法 / 看板卡片里的写法）
     pub path: String,
     pub source: CandidateSource,
-    /// 是否在 APP 信任表内（false ⇒ 新会话仅 MAM 可见）
+    /// 是否在 APP 信任表内（false ⇒ 新会话仅兔维斯可见）
     pub trusted: bool,
 }
 
@@ -725,6 +725,8 @@ mod tests {
             status,
             last_message: None,
             last_message_role: None,
+            last_message_subagent_report: false,
+            flap_from_subagent_activity: false,
             last_activity_at: "2026-10-05T00:00:00Z".into(),
             pid: 0,
             cpu_usage: 0.0,
@@ -1138,7 +1140,7 @@ mod tests {
 
     // ===== 提示面 =====
 
-    /// 可见性分层：信任 → 重启可见；未信任/读不到信任表 → 仅 MAM 可见（保守，不谎报）
+    /// 可见性分层：信任 → 重启可见；未信任/读不到信任表 → 仅兔维斯可见（保守，不谎报）
     #[test]
     fn visibility_hint_layers_by_trust() {
         let dir = tempfile::tempdir().unwrap();
@@ -1169,8 +1171,8 @@ mod tests {
             &[],
             "windows",
         );
-        assert_eq!(untrusted.visibility, Visibility::MamOnly);
-        assert_eq!(untrusted.visibility_note, "未信任工作区：仅 MAM 可见");
+        assert_eq!(untrusted.visibility, Visibility::TuvisOnly);
+        assert_eq!(untrusted.visibility_note, "未信任工作区：仅兔维斯可见");
 
         let no_home = create_hints(
             "E:/proj",
@@ -1179,7 +1181,7 @@ mod tests {
             "windows",
         );
         assert_eq!(
-            no_home.visibility_note, "未信任工作区：仅 MAM 可见",
+            no_home.visibility_note, "未信任工作区：仅兔维斯可见",
             "读不到信任表 = 保守判未信任（同 H7）"
         );
     }
@@ -1224,14 +1226,14 @@ mod tests {
         assert_eq!(active_zcode_in_project("E:/proj2", &board, "windows"), 1);
         assert_eq!(active_zcode_in_project("E:/nope", &board, "windows"), 0);
 
-        let hinted = create_hints("E:/proj", Visibility::MamOnly, &board, "windows");
+        let hinted = create_hints("E:/proj", Visibility::TuvisOnly, &board, "windows");
         let warn = hinted.warning.unwrap_or_default();
         assert!(
             warn.contains('2') && warn.contains("不拦截"),
             "黄字信号必须给出数量并申明不拦截：{warn}"
         );
         assert!(
-            create_hints("E:/nope", Visibility::MamOnly, &board, "windows")
+            create_hints("E:/nope", Visibility::TuvisOnly, &board, "windows")
                 .warning
                 .is_none(),
             "干净项目不得凭空报警"
