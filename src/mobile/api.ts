@@ -416,16 +416,201 @@ export function connectEvents(
 
 /** 输入区可用性矩阵（GET /session-send-info 载荷，与 Rust `session_send_info`
  *  的 JSON 逐字段对应，勿漂移）：injectable=false 时 reasonCode/reason 携带不可
- *  注入原因（如 WorkBuddy 黑盒），**channels/visibility 不返回**（后端
+ *  注入原因（如 `headless_disabled` 总开关关闭 / `dsh_headless_pending` 写通道未接线 /
+ *  路由层 `no_process` 等），**channels/visibility 不返回**（后端
  *  RouteOutcome::NotInjectable 分支只给 {injectable,reasonCode,reason}）→ 前端
  *  类型须 optional（M9R P2-10 对齐）；injectable=true 时 channels 为候选注入
- *  通道（tmux/iterm2/…），visibility=after_refresh 表示注入后需刷新才见回显 */
+ *  通道（tmux/iterm2/… 或 `headless_*`），visibility=after_refresh 表示注入后需刷新才见回显。
+ *
+ *  **注意（Task 11 起）**：`injectable:true` 表达的是**静态可注入能力**——WorkBuddy ACP
+ *  这类无头通道的运行时不可用（远程控制端点未启用）**不在本载荷里预判**，由**发送回执**
+ *  如实上报（`refused` + reason 文案）；故「输入区可用」≠「必达」，回执才是真相。 */
 export interface SendInfo {
   injectable: boolean;
   reasonCode?: string;
   reason?: string;
   channels?: string[];
-  visibility?: "realtime" | "after_refresh";
+  /** 可见性档（后端 `routing::Visibility` 的 wire 词）。Task 8 补齐无头两档：
+   *  `after_restart` = 已信任工作区（重启 ZCode 应用后可见）/ `tuvis_only` = 未信任（仅兔维斯
+   *  可见）——两档文案由后端 `Visibility::note()` 下发，前端只渲染不编。 */
+  visibility?: "realtime" | "after_refresh" | "after_restart" | "tuvis_only";
+}
+
+/** 无头通道名判定（send-info 的 channels 里是否含无头通道 `headless_*`）。
+ *  **单一判据**：发送路径据此分流（无头回合 = 请求等整个进程跑完 + 可取消 + 回执卡），
+ *  通道名与后端 `HeadlessKind::wire_name` 同源（词表只此一份）。 */
+export function headlessChannelOf(info: SendInfo | null): string | null {
+  return info?.channels?.find((c) => c.startsWith("headless_")) ?? null;
+}
+
+/** 无头回合回执（spec H6 形状，与 Rust `inject::headless::receipt::Receipt` 逐字段对应，
+ *  勿漂移）：status ∈ ok|queued|failed|cancelled；stage 是**分阶段失败档**（zcode 专档
+ *  `workspace_busy` = 应用争用锁）；可选键缺席即不上线（后端 `skip_serializing_if`）。
+ *  `stage` 与 `refused`（投递前拒绝）的完整名单见 `tests/fixtures/headless_stages.json`
+ *  ——前端分诊表与 Rust 枚举各自对照它断言（跨语言锁）。 */
+export interface HeadlessReceipt {
+  status: "ok" | "queued" | "failed" | "cancelled";
+  sessionId: string;
+  lastAssistant?: string;
+  tokens?: number;
+  durationMs: number;
+  stage?:
+    | "spawn"
+    | "version_gate"
+    | "timeout"
+    | "crash"
+    | "channel_error"
+    | "dialog"
+    | "workspace_busy"
+    /** 投递前拒绝（回合未起跑、零字节投递：斜杠命令/会话串行锁/平台不支持） */
+    | "refused";
+  reason?: string;
+}
+
+/** 无头回合卡片态（SessionDetail 持有；MessageComposer 经 `onHeadlessTurn` 上报）：
+ *  - `sending`：HTTP 在飞（无头回合 = 进程生命周期，实测 8–23s；期间只此一态 + 取消钮。
+ *    `channel` = 本条走的无头通道 wire 名——**审批卡轮询只在 claude 通道上开**
+ *    （其余通道没有审批面：codex queue/zcode yolo 无、kimi/opencode 由 CLI 自行拒绝））
+ *  - `done`：终态回执（`receipt.status` 分诊：ok/queued 回执卡；failed 失败分诊卡；
+ *    cancelled 取消卡——**三态都由 receipt 自身说话，前端不另编成功/失败**） */
+export type HeadlessTurn =
+  | { phase: "sending"; channel?: string | null }
+  | {
+      phase: "done";
+      receipt: HeadlessReceipt;
+      /** 可见性提示（后端 `Visibility::note()` 逐字文案；失败/取消时后端不给） */
+      visibilityNote?: string | null;
+    };
+
+// ==== H5（Task 10 立接口）+ H11（Task 13/C4 激活）：无头审批 / 问答卡 ====
+
+/** 决策词表（**跨语言夹具 `tests/fixtures/headless_decision_words.json` 的 `decisions`**；
+ *  Rust 侧 `inject::headless::cli_three::Decision::wire` 与本常量各自对照同一夹具断言）。
+ *  - `allow`：批准（后端把请求原始 input 原样回显成 `updatedInput`——前端**不回带 input**）；
+ *  - `deny`：拒绝；**用户弃卡（关闭卡片）也必须发 deny**（附录 E-②：allow 但未答 = 静默丢题）；
+ *  - `answer`：问答卡提交（**必须答全**，见 `HeadlessApprovalQuestion`）。 */
+export const HEADLESS_DECISION_WORDS = ["allow", "deny", "answer"] as const;
+export type HeadlessDecisionWord = (typeof HEADLESS_DECISION_WORDS)[number];
+
+/** 待答种类词表（同一夹具的 `kinds`）：`approval` = 工具审批卡；`question` = 问答卡 */
+export const HEADLESS_PENDING_KINDS = ["approval", "question"] as const;
+export type HeadlessPendingKind = (typeof HEADLESS_PENDING_KINDS)[number];
+
+/** 审批决策选项（与 `ApproveOptionsView.options` 同形：id 供应答端点回带、label 供展示）。
+ *  id 来自上表（`allow` / `deny`）；**前端只渲染不另编词**。 */
+export interface HeadlessApprovalOption {
+  id: string;
+  label: string;
+}
+
+/** 问答卡的一题（Rust `cli_three::Q` 的载荷投影；附录 E-② 的 `{question, header?,
+ *  options:[{label,description?}], multiSelect?}` 收敛同形）。
+ *
+ *  **作答完整性（防静默丢题，附录 E-②/③）**：多选至少一项、单选必选一项或填「其他」自由文本
+ *  ——未答全时提交按钮**禁用**并显示未答题面（核侧再拒一次：`AnswerSet::new`）。 */
+export interface HeadlessApprovalQuestion {
+  /** 题面全文（**就是 answers 的键**——不要用 header / 序号） */
+  question: string;
+  header?: string | null;
+  multiSelect: boolean;
+  options: { label: string; description?: string | null }[];
+}
+
+/** **无头通道待答请求**（Task 13/C4：claude 的 stdio 双向桥投影成本形状）。
+ *
+ *  来源：`GET /m/api/v1/session-headless-approval`（`{pending: …}`）。stdout 的
+ *  `control_request{can_use_tool}`（工具名 + 入参原文）→ 卡片 → 用户选择 →
+ *  `POST /m/api/v1/session-headless-approve` → 后端写 `control_response` 到 claude stdin。
+ *
+ *  **应答不经前端回带 input**：allow 所需的 `updatedInput`（原 input 原样回显，缺则工具
+ *  永不执行）由后端持有原始 input 完成；问答卡的 `answers` 由前端按题面文本上行。
+ *
+ *  边界：**codex queue 通道没有审批面**（H8 定案），zcode yolo 亦无（裁决 14），
+ *  kimi/opencode 的非交互模式由 CLI 自行拒绝权限请求（Task 13 实测）——本形状**只属于
+ *  claude 的双向桥**（`channel === "headless_claude_p"`）。 */
+export interface HeadlessApprovalPending {
+  /** 请求标识（应答须回带同一 id；陈旧页面的 id 会被核侧如实拒绝） */
+  requestId: string;
+  /** 待答种类（`approval` / `question`） */
+  kind: HeadlessPendingKind;
+  /** 工具名（如 Bash / AskUserQuestion）——卡片标题 */
+  toolName: string;
+  /** 入参**展示原文**（Bash = 命令行原文）——卡片主体：用户必须看清要批准什么 */
+  input: string;
+  sessionId: string;
+  /** 无头通道 wire 名（如 `headless_claude_p`） */
+  channel: string;
+  /** 该通道 **spawn 时选定**的权限档 wire 词（Rust `PermissionSpec::tier()`：claude = `stdio`
+   *  = 审批走 stdio 双向桥）。本批只展示，**不做移动端主动切档**（三期 F3.1） */
+  tier: string;
+  /** claude 的 `--permission-mode` 档（如 `default`）——与 `tier` 并列展示：
+   *  `tier` 说「审批面形态」，本字段说「工具审批在 CLI 内部的档」 */
+  permissionMode?: string | null;
+  /** 审批卡的两枚决策（`kind==="approval"` 时用；词表 = `HEADLESS_DECISION_WORDS` 前两项） */
+  options: HeadlessApprovalOption[];
+  /** 问答卡的题集（`kind==="question"` 时用；空数组 = 题面缺失，卡片如实说明不编题） */
+  questions: HeadlessApprovalQuestion[];
+  /** 已等待毫秒（用户能看出回合在等自己多久了） */
+  waitedMs: number;
+}
+
+/** 拉取**当前待答**的无头审批/问答请求（Task 13/C4）：GET /session-headless-approval。
+ *  `{pending: null}` = 没有待答项（回合未到审批点 / 已终结 / 已超时）。
+ *  非 2xx（400 缺参 / 403 设备失效）→ 抛 ApiError（调用方静默降级为「无卡」）。 */
+export async function fetchHeadlessApproval(
+  sessionId: string
+): Promise<HeadlessApprovalPending | null> {
+  const q = new URLSearchParams({ session_id: sessionId });
+  let r: Response;
+  try {
+    r = await fetch(`/m/api/v1/session-headless-approval?${q}`);
+  } catch (e) {
+    throw new ApiError(null, `session-headless-approval 网络异常: ${String(e)}`);
+  }
+  if (!r.ok) throw new ApiError(r.status, `session-headless-approval ${r.status}`);
+  const body = (await r.json()) as { pending?: HeadlessApprovalPending | null };
+  return body.pending ?? null;
+}
+
+/** 应答**在飞无头回合的审批/问答卡**（Task 13/C4）：POST /session-headless-approve。
+ *  契约（HTTP 恒 200，语义在 body，与取消端点同规）：
+ *  - `{delivered:true}` = 应答已交给回合（回合随后写 `control_response` 到 stdin）；
+ *  - `{delivered:false, reason}` = **未送达**（无待答项 / 请求标识不符 / 回合已不再等待）
+ *    ——**不是错误**，只是这一答没赶上（回合可能已终结/超时）；前端如实回显并停止轮询。
+ *  非 2xx（400 缺参或未答全 / 403 设备失效）→ 抛 ApiError（400 的 body.reason 可直接展示，
+ *  如「问答未答全…」——核侧的完整性拒绝）。 */
+export async function headlessApprove(
+  sessionId: string,
+  requestId: string,
+  decision: HeadlessDecisionWord,
+  answers?: { question: string; labels: string[] }[]
+): Promise<{ delivered: boolean; reason?: string }> {
+  let r: Response;
+  try {
+    r = await fetch("/m/api/v1/session-headless-approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sessionId,
+        requestId,
+        decision,
+        ...(answers ? { answers } : {}),
+      }),
+    });
+  } catch (e) {
+    throw new ApiError(null, `session-headless-approve 网络异常: ${String(e)}`);
+  }
+  if (!r.ok) {
+    // 400 的 body.reason（未答全等）解析进 data 供调用方展示（对齐 sessionSend 惯例）
+    let data: Record<string, unknown> | null = null;
+    try {
+      data = (await r.json()) as Record<string, unknown>;
+    } catch {
+      /* 交验失败保持 null */
+    }
+    throw new ApiError(r.status, `session-headless-approve ${r.status}`, data);
+  }
+  return (await r.json()) as { delivered: boolean; reason?: string };
 }
 
 /** 拉取输入区可用性（W4：输入区挂载时一次）。403（设备失效，与 fetchSessions
@@ -454,7 +639,18 @@ export type SendResult =
   | { status: "delivered" }
   | { status: "submitted" }
   | { status: "queued"; itemId: number; position: number }
-  | { status: "failed"; error: string };
+  | { status: "failed"; error: string }
+  /** **无头回合回执**（Task 8 / H7）：`receipt` 是后端 Task 6 归一产物原样透出
+   *  （ok|queued|failed|cancelled + stage/reason），`visibilityNote` 是可见性提示逐字文案
+   *  （未信任/失败时缺省）。**与终端四态分列**：无头回合没有「入队」概念（每回合 spawn），
+   *  故不合成 queued{itemId}/delivered 语义。 */
+  | {
+      status: "headless";
+      channel?: string;
+      receipt: HeadlessReceipt;
+      visibility?: SendInfo["visibility"];
+      visibilityNote?: string;
+    };
 
 /** 发送消息（W4 直发/入队分派，后端按输入态路由；多行原样上行，归一在服务端
  *  入队时一次完成）。非 2xx（400 参数非法 / 404 会话消失 / 403 不可注入）→
@@ -489,6 +685,29 @@ export async function sessionSend(
     throw new ApiError(r.status, `session-send ${r.status}`, data);
   }
   return (await r.json()) as SendResult;
+}
+
+/** **取消在飞的无头回合**（Task 8 / H4）：POST /session-headless-cancel。
+ *  契约（HTTP 恒 200，语义在 body）：
+ *  - `{cancelled:true}` = 取消**送达**（先到者生效），回合会以 `cancelled` 回执收尾；
+ *  - `{cancelled:false, reason}` = 未送达（无在飞回合 / 回合已终结 / 已被取消）——
+ *    **不是错误**，只是这一发取消没赶上；前端照常等回执。
+ *  非 2xx（400 缺参 / 403 设备失效）→ 抛 ApiError（调用方静默降级为提示，不阻断回合）。 */
+export async function headlessCancel(
+  sessionId: string
+): Promise<{ cancelled: boolean; reason?: string }> {
+  let r: Response;
+  try {
+    r = await fetch("/m/api/v1/session-headless-cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId }),
+    });
+  } catch (e) {
+    throw new ApiError(null, `session-headless-cancel 网络异常: ${String(e)}`);
+  }
+  if (!r.ok) throw new ApiError(r.status, `session-headless-cancel ${r.status}`);
+  return (await r.json()) as { cancelled: boolean; reason?: string };
 }
 
 /** 上传附件（2026-09-20）：原始字节 POST 到 /session-attachment——服务端落盘到
@@ -1494,6 +1713,109 @@ export async function createSession(body: {
     throw new ApiError(r.status, `session-create ${r.status}`, data);
   }
   return (await r.json()) as CreateSessionAccepted;
+}
+
+// ==== H10（Task 12）：zcode 无头新建 ====
+
+/** 新建候选项目（与 Rust `zcode_create::ProjectCandidate` + info 端点的 JSON 逐字段对应，
+ *  勿漂移）：`source` = 来源（`trusted` = APP 信任表主源 / `board` = 看板快照项目）；
+ *  `trusted` = 是否在 APP 信任表内——**false 必须如实标注**：该目录的新会话 APP 永不收录，
+ *  仅 MAM 可见；`note` = 信任档**逐字文案**（后端 `Visibility::note()` 单点，与回执的
+ *  `visibilityNote` 同源——前端**不再自带一份**「已信任/未信任」措辞，复审 Minor 2）。
+ *  候选列表已由后端按「存在 ∧ 不在同源敏感黑名单内」过滤，前端不做二次筛选。 */
+export interface ZcodeCreateCandidate {
+  path: string;
+  source: "trusted" | "board";
+  trusted: boolean;
+  note?: string;
+}
+
+/** GET /session-create-zcode-info 载荷：`available=false`（H3 总开关关闭）时**不给候选**
+ *  （与 `session-send-info` 关闭态同口径），`reasonCode`/`reason` 是后端单点码与逐字文案；
+ *  `warning` = 选中项目的黄字信号（同项目已有在册 zcode 会话，**不拦截**），
+ *  `defaultFirstText` = 首句默认值（spec H10 探针 `hi`，后端单点下发）。 */
+export interface ZcodeCreateInfo {
+  available: boolean;
+  reasonCode?: string;
+  reason?: string;
+  tool?: string;
+  defaultFirstText?: string;
+  candidates?: ZcodeCreateCandidate[];
+  warning?: string;
+}
+
+/** 新会话确认来源的**跨语言唯一名单**（与 `tests/fixtures/zcode_create_confirmations.json`
+ *  逐项相等——本常量、Rust 侧 `remote::api::confirmation_wire`、夹具三处任一漂移即有一侧先红，
+ *  做法同 `headless_stages.json`；复审 Minor 4）。语义见 [`ZcodeCreateConfirmation`]。 */
+export const ZCODE_CREATE_CONFIRMATIONS = ["stdout_frame", "store", "none"] as const;
+
+/** 新会话确认来源（取自 [`ZCODE_CREATE_CONFIRMATIONS`]，与 Rust
+ *  `zcode_create::NewSessionConfirmation` 的 wire 词对应）：
+ *  `stdout_frame` = CLI 回执帧点名；`store` = 会话库发现（创建前不在册、且建行时刻不早于
+ *  回合起点的新会话）；`none` = **未确认**——此时 `sessionId` 恒空串（后端绝不编造 sess_id，
+ *  前端也不得凭空显示）。 */
+export type ZcodeCreateConfirmation = (typeof ZCODE_CREATE_CONFIRMATIONS)[number];
+
+/** POST /session-create-zcode 回执（HTTP 恒 200，语义在 body——与无头封套同口径）：
+ *  - `sessionId` 只在**确认到**新会话时非空；
+ *  - `receipt` = Task 6 回执原样透出（status/stage/reason 的分诊复用 SessionDetail 单点）；
+ *  - `visibility`/`visibilityNote` 只在确认到新会话时下发（未确认时什么都没落到工作区，
+ *    承诺「重启后可见」就是谎报）；
+ *  - `warning` = 黄字信号（不拦截）。 */
+export interface ZcodeCreateResult {
+  channel?: string;
+  sessionId: string;
+  confirmation: ZcodeCreateConfirmation;
+  receipt: HeadlessReceipt;
+  visibility?: SendInfo["visibility"];
+  visibilityNote?: string;
+  warning?: string | null;
+}
+
+/** 拉取新建表单前置面（挂载时一次；可选点名项目以取黄字信号）。403（设备失效，与
+ *  fetchSendInfo 同语义）→ null；其余非 2xx / 网络异常 → 抛 ApiError，调用方如实提示
+ *  「表单不可用」，不渲染半截表单。 */
+export async function fetchZcodeCreateInfo(project?: string): Promise<ZcodeCreateInfo | null> {
+  const qs = project ? `?project=${encodeURIComponent(project)}` : "";
+  let r: Response;
+  try {
+    r = await fetch(`/m/api/v1/session-create-zcode-info${qs}`);
+  } catch (e) {
+    throw new ApiError(null, `session-create-zcode-info 网络异常: ${String(e)}`);
+  }
+  if (r.status === 403) return null; // 设备失效 → 回配对页（fetchSendInfo 同口径）
+  if (!r.ok) throw new ApiError(r.status, `session-create-zcode-info ${r.status}`);
+  return (await r.json()) as ZcodeCreateInfo;
+}
+
+/** 无头新建一个 zcode 会话并注入首句（H10）。`firstText` 缺省时**不带上该键**
+ *  （后端按 spec H10 默认探针 `hi` 补齐——默认值单点在服务端）。非 2xx（400 请求不合法 /
+ *  403 总开关关闭或设备失效）→ 抛 ApiError（403 的 `reason` 是后端逐字文案，解析进 data
+ *  供调用方展示——对齐 sessionSend 惯例）。 */
+export async function sessionCreateZcode(
+  project: string,
+  firstText?: string
+): Promise<ZcodeCreateResult> {
+  let r: Response;
+  try {
+    r = await fetch("/m/api/v1/session-create-zcode", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project, ...(firstText ? { firstText } : {}) }),
+    });
+  } catch (e) {
+    throw new ApiError(null, `session-create-zcode 网络异常: ${String(e)}`);
+  }
+  if (!r.ok) {
+    let data: Record<string, unknown> | null = null;
+    try {
+      data = (await r.json()) as Record<string, unknown>;
+    } catch {
+      /* 非 JSON 错误体（代理页等）：data 保持 null，按状态码兜底 */
+    }
+    throw new ApiError(r.status, `session-create-zcode ${r.status}`, data);
+  }
+  return (await r.json()) as ZcodeCreateResult;
 }
 
 /** 新建任务快照（GET /session-create/status 载荷，与 Rust `CreateTaskShared`

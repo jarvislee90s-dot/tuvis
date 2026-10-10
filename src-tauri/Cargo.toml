@@ -118,8 +118,9 @@ junction = "2.1"
 # （父进程链遍历）为 tuvis-marker helper（src/bin）所需
 # Win32_UI_Input_KeyboardAndMouse（M9R：VkKeyScanW/MapVirtualKeyW 真实键位布局）；
 # Win32_UI_WindowsAndMessaging：win32（窗口枚举）/ tuvis-marker（跳转 marker）/
-# deep_link（深链）
-windows = { version = "0.62", features = ["Win32_Security", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Threading", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Power", "Win32_System_Registry", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+# deep_link（深链）；Win32_System_JobObjects（Task 6 无头 kill 树）：Job Object
+# 整树收编（KILL_ON_JOB_CLOSE + TerminateJobObject，spec 附录 E-⑥）
+windows = { version = "0.62", features = ["Win32_Security", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Threading", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Power", "Win32_System_Registry", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_JobObjects"] }
 winreg = "0.55"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

@@ -86,8 +86,10 @@ impl CodexThreadRoots {
 }
 
 /// 取目录下 `{prefix}{N}.sqlite` 中版本号 N 最大者（文件名带版本号，升级 state_5 →
-/// state_6 不破；按数值比较避免 state_10 < state_9 的字典序陷阱）。无匹配 → None
-fn latest_versioned(dir: &Path, prefix: &str) -> Option<PathBuf> {
+/// state_6 不破；按数值比较避免 state_10 < state_9 的字典序陷阱）。无匹配 → None。
+/// **`pub(crate)`（Task 9）**：H8 的队列库发现（`queue_` 前缀）复用同一份版本号发现口径，
+/// 不另写一份文件名解析
+pub(crate) fn latest_versioned(dir: &Path, prefix: &str) -> Option<PathBuf> {
     let best: Option<(u64, PathBuf)> = std::fs::read_dir(dir)
         .ok()?
         .flatten()

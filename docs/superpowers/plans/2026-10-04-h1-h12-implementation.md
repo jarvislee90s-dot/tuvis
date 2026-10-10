@@ -6,15 +6,34 @@
 
 **Architecture:** 一次性进程 per turn（裁决 8）：每条消息 spawn 一次目标工具命令，回执归一后退出；三族通道（spawn 型 / WB 的 HTTP ACP / 在产终端注入）经路由表分派，共用一套底座（总开关默认关、按会话串行、watchdog 600s、取消、版本门控、审计）。素材库 = spec 附录 E（AionCore 源码级结论，claude argv 全集 / control_response 构造器 / codex 重放面等直接采用）。
 
-**Tech Stack:** Rust（sysinfo 进程扫描 / tokio 异步 spawn / rusqlite 只读副本）· Tauri IPC · React 19 + TS（移动端 `/m` 与设置页）· ACP JSON-RPC over HTTP（WB）· 各家无头 CLI。
+**Tech Stack:** Rust（sysinfo 进程扫描 / tokio 异步 spawn / rusqlite **只读连接**〔`SQLITE_OPEN_READ_ONLY` + `busy_timeout(1000)`，**不拷副本**——裁决 20 定案，见 Task 2〕）· Tauri IPC · React 19 + TS（移动端 `/m` 与设置页）· ACP JSON-RPC over HTTP（WB）· 各家无头 CLI。
 
 **上位 spec：** `docs/superpowers/specs/2026-09-27-phase2-closure-app-injection-design.md`（H 节为需求权威；裁决 1–19 不得重议；附录 D 探测定案 = 通道参数事实源；附录 E = 实现素材索引）。
 
 **范围注记（审阅时裁决）：** 本计划覆盖 **H1–H12**（用户 2026-10-04 指令）；spec 裁决 19 现文为 H1–H13（H13 = dsh 写侧 ACP stdio）。若审定要并入 H13 → 在 Task 11 后追加 11b（结构同 Task 11，ACP over stdio）。
 
-**分支与门禁：** 新分支 `feat/h1-h12-headless`（off `origin/main` `8e674d0`）；每 Task 一 commit，全门禁绿才 commit：`cd src-tauri && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check`；涉前端另跑 `pnpm test && pnpm build && pnpm format:check && pnpm lint`。`git add` 只加任务列明文件，**严禁 `-u`/`-A`/`.`**。
+**分支与门禁（用户 2026-10-05 裁决）**：工作分支 `feat/h1-h12-headless`（off `origin/main` `88b43ae`）；**全部任务完成并通过 Task 15 统一手工测试前，一律不 push 到远端**——所有 commit 落本地分支；每 Task 一 commit，全门禁绿才 commit：`cd src-tauri && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check`；涉前端另跑 `pnpm test && pnpm build && pnpm format:check && pnpm lint`。`git add` 只加任务列明文件，**严禁 `-u`/`-A`/`.`**。
 
 **已知实机环境（USER-ASSIST 点会标注）：** 本机 MAM dev 在跑（改后端需重启验证）；ZCode / DeepSeek Harness / WorkBuddy / ChatGPT.app(codex) 均已装；zcode CLI 0.16.9（`ELECTRON_RUN_AS_NODE=1 "D:/Program Files/ZCode/ZCode.exe" "D:/Program Files/ZCode/resources/glm/zcode.cjs"`）；codex 0.160.0；WB 5.7.3（Win 端点未启用——Task 11 有前置检查）；探测定案的证据目录 `~/mam-probe-closure/20261003-022408/`。
+
+---
+
+## 复用清单（现有实现与探测结果——执行者从这里取，不要重造）
+
+**在产函数/模块（直接调用或同构仿写）**：
+
+| 复用物 | 位置 | 用于任务 |
+|---|---|---|
+| `find_dsh_desktop_host_pid`（宿主进程扫描形态） | `monitor/dsh/mod.rs`（H1 交付） | Task 8 的 zcode APP 活跃探测仿其「遍历进程 → cmdline 特征匹配」骨架 |
+| `mangle_project_path` / `session_jsonl_path` / `find_session_jsonl` / `derive_status_from_tail` / `title_from_db` | `monitor/workbuddy_parser.rs:130-259` | Task 2（db 源的状态映射）、Task 11（`projects/` 转写补扫与落盘佐证）直接调用 |
+| 注入三端点骨架与审计双行口径 | `remote/api.rs:569+`（`一次 session-send 最多落两类审计行` 既有架构注释） | Task 5/8/9 的端点接线与 `action=headless` 审计照抄同构 |
+| settings 键模式 | `remote/mod.rs` `KEY_ENABLED` 族 + `database::get/set_setting` | Task 5/6 的 `remote.headless_enabled/_timeout_ms/_concurrency` 照抄键命名 |
+| codex 会话文件路径推导 | `monitor/codex_parser.rs`（`sessions/<Y/M/D>/rollout-*`） | Task 9 thread id = adapter 已有路径取 basename，不重写扫描 |
+| `projcache::load` / `identity_matches` | `monitor/dsh/projcache.rs:19,55` | Task 1 修复对象本体（version 白名单在此） |
+| `win32::collect_ancestor_pids` / 进程组口径 | `window/win32.rs:31` | Task 6 kill 树的进程侧查询 |
+| 按会话串行 + W5 内容摘要口径 | `inject/queue.rs`（在产） | Task 6 串行层与审计摘要对齐，不另造口径 |
+
+**探测定案事实（附录 D 直译，测试断言以此为真值）**：zcode 争用锁 1s 失败形态（Task 8 `classify_exit`）；codex `-C` 前置与单写者锁 -32600（Task 9）；WB ACP wire 序列与已结束会话静默挂（Task 11）；claude argv 全集与 control_response 规则（Task 13，附录 E ①②）；stdout 前缀污染样本（Task 6 receipt 测试）；`workbuddy.db` sessions 表 40 列结构（Task 2）；`recentProjects` 位置 `~/.zcode/v2/setting.json`（Task 12）。
 
 ---
 
@@ -98,6 +117,17 @@ git add src-tauri/src/monitor/dsh/ src-tauri/tests/fixtures/dsh-v4/
 git commit -m "fix(dsh): rc.2 会话读侧修复——真实 v4/v7 夹具诊断驱动（代际✓/projcache 白名单/或 schema 层，按实测命中）"
 ```
 
+**⚠️ Task 1 实施记录（2026-10-05 诊断驱动实机 + 复审追补，**更正本任务书字面**；commit `616a6a2`）**：
+
+1. **根因不是三层嫌疑里的前两层**：本任务书的三路嫌疑（① projcache wrapper 白名单只到 6；② v4 schema 演进；③ zstd 多帧解码）**②③ 修复前即通过**、**① 不成立**（`projcache.rs` 白名单原文就是 `3..=7`，rc.2 的 `"version": 7` 本就可加载）。**真因 = 上层 `header.version` 白名单**：`monitor/dsh/mod.rs` 的出卡版本门当时只认 `0..=3`，v4 会话整卡降级「格式待适配」（症状 = 有卡无消息体 / 新会话不上板）。**修法 = 谓词更名 `is_known_generation(v) = (0..=4)`**（连续区间有意宽容：v1 真机未观测但同区间；v5+ 仍走降级卡），边界用例 `is_known_generation_admits_v0_through_v4` 钉死。**故 Step 4a 的「把 projcache 白名单扩到 7」是伪修法（勿照做）**；`log.rs` 本任务只补注释 + 证据性测试，未改解析逻辑。
+2. **夹具布局：实际 harness **两种布局都接受**（本任务书 Step 1 只写了扁平布局②，Step 2 的 `load(fx, "projcache-v7")` 命名约定亦非实际做法）**。实际夹具消费点 = `monitor/dsh/mod.rs::real_v4_fixture_end_to_end_verification`：
+   - **布局①（原生 home 结构）**：`tests/fixtures/dsh-v4/sessions/<项目目录名>/<会话 id>/session.v4.jsonl.zstd` + `tests/fixtures/dsh-v4/storages/session_projcache/sessions/<会话 id>.json`（原生布局下**零拷贝直扫**，不暂存）；
+   - **布局②（本任务书的扁平探针形态）**：`tests/fixtures/dsh-v4/session-<id>-probe/session.v4.jsonl.zstd` + `tests/fixtures/dsh-v4/projcache-v7.json`（扁平布局下**暂存为临时 home**，mtime 置当下）；
+   - **第三种：零拷贝指向真实 home**——`MAM_DSH_V4_HOME=~/.dsh cargo test --lib real_v4_fixture_end_to_end_verification -- --nocapture`（只读直验；夹具目录在仓库内只有 `.gitignore`，真实用户会话内容**永不入库**）。
+   - 三条跳过路径（夹具根不存在 / 无 v4 日志 / 无窗内非子 Agent 会话）**各自 eprintln 跳因 + 探过的路径 + 实际找到的东西**——跳过与通过不可混淆。
+3. **遍历护栏（评审后实测抓获的事故）**：把夹具根指向真实 `~/.dsh` 时，递归会跟随 `profiles/node_modules/*` 的 junction 大树 → 测试 >10min 挂死。遍历改为「home 布局只走 `sessions/` + 不跟随符号链接/交接点 + 深度与目录数上限」，并有 hermetic 回归锁 `fixture_walk_is_guarded_against_huge_or_linked_trees`。
+4. **出卡断言口径**：改为「无降级卡（代际门回归判别器）+ 至少一张带消息体」，不逐卡要求消息体（全新会话为空是**合法**形态）。
+
 ### Task 2: C0-② H12 WorkBuddy 发现双源（心跳 ∪ workbuddy.db）
 
 **Files:**
@@ -139,7 +169,9 @@ git commit -m "fix(dsh): rc.2 会话读侧修复——真实 v4/v7 夹具诊断�
 ```
 
 - [ ] **Step 2: 确认失败** `cd src-tauri && cargo test db_source_surfaces`——`read_db_sessions`/`DbSession`/`merge_sources` 未定义。
-- [ ] **Step 3: 实现**（workbuddy_parser.rs 追加；读取走**副本**，活库不直查——拷到 tempdir 再 open，对齐项目 SQLite 纪律）：
+- [ ] **Step 3: 实现**（workbuddy_parser.rs 追加；**读取走只读连接直连活库**——`SQLITE_OPEN_READ_ONLY` + `busy_timeout(1000)`，与 zcode/opencode 同纪律，**不拷副本**）：
+
+> **⚠️ 裁决 20 更正（2026-10-05 复审；原字面照录在本块引号内——不静默改写历史）**：本步原文写「读取走**副本**，活库不直查——拷到 tempdir 再 open，对齐项目 SQLite 纪律」——**那是计划时设计，已被裁决 20 推翻**：项目 SQLite 纪律的真实含义是「**绝不写活库**」，由**只读连接**达成；活库**直查**（`busy_timeout` 挡住应用写入高峰），不落任何写、不拷副本。落地代码 = `monitor/workbuddy_parser.rs:408-419`（`read_db_sessions`，经共享 helper `monitor/sqlite.rs::open_readonly_with_timeout`，该 helper 第 12-19 行即 `SQLITE_OPEN_READ_ONLY|SQLITE_OPEN_NO_MUTEX` + `busy_timeout(1000)`）。**下面伪码里的 `db_copy` 形参名与 doc 措辞同属计划时口径**，落地签名是 `read_db_sessions(db: &Path)`；**唯一仍是「副本读」的是 codex 的 `~/.codex/queue_1.sqlite`**（Task 9，`inject/headless/codex.rs:541-584` 的 `queue_evidence_via_replica`：doc「活库不直查纪律」+ 主库/`-wal`/`-shm` 逐文件复制到 tempdir、读完逐个删除），**那一处不得按本条改**。
 
 ```rust
 /// workbuddy.db sessions 表行（5.7.3+ 真相源；列语义按 2026-10-04 实测）
@@ -151,10 +183,11 @@ pub struct DbSession {
     pub updated_at: i64,     // ms epoch
 }
 
-/// 读 db 副本的 sessions 表（按 updated_at 倒序，限 24h 活动窗——对齐三层预算 L3）
-pub fn read_db_sessions(db_copy: &Path) -> rusqlite::Result<Vec<DbSession>> {
+/// 读 workbuddy.db 的 sessions 表（**只读连接直连活库**——裁决 20；按 updated_at 倒序，
+/// 限 24h 活动窗——对齐三层预算 L3）
+pub fn read_db_sessions(db: &Path) -> rusqlite::Result<Vec<DbSession>> {
     let con = rusqlite::Connection::open_with_flags(
-        db_copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     let mut st = con.prepare(
         "SELECT id, cwd, title, status, updated_at FROM sessions
@@ -167,8 +200,8 @@ pub fn read_db_sessions(db_copy: &Path) -> rusqlite::Result<Vec<DbSession>> {
     rows.collect()
 }
 
-/// db mtime 变化才重拷重读（轮询预算：~/.workbuddy/workbuddy.db mtime 对比）
-pub fn db_snapshot_fresh(home: &Path, last_mtime: &mut Option<SystemTime>) -> Option<Vec<DbSession>> { /* 拷副本→read_db_sessions；mtime 未变返回 None 跳过 */ }
+/// db 代际（mtime）变化才重读**活库**（轮询预算：~/.workbuddy/workbuddy.db mtime 对比）
+pub fn db_snapshot_fresh(home: &Path, last_mtime: &mut Option<SystemTime>) -> Option<Vec<DbSession>> { /* 只读直连→read_db_sessions；mtime 未变返回 None 跳过 */ }
 ```
 
 `discover_workbuddy_processes`/`get_workbuddy_sessions` 接线：心跳路径原样保留；db 源经 `merge_sources`（心跳优先去重）补 AgentProcess/Session；`status` 映射三色（`completed`→绿、`terminated`→红·中断、运行中判据沿用转写 mtime 心跳口径）。`Source` 枚举标注来源供测试。
@@ -248,7 +281,7 @@ engine 靶向入口接线：候选集 >1 且能取 TTY → `resolve_by_tty`；�
 ```
 
 （`ConfirmCtx`/`JumpConfirm` 按现有类型接缝 mock；核心断言 = **不再是 Delivered**。）
-- [ ] **Step 2: 确认失败** → **Step 3: 实现**：`JumpConfirm` 枚举加 `Submitted { note: String }` 变体；confirm.rs macOS 分支由 `Ok(→Delivered)` 改返回 `Submitted { note: "macOS 无占用/屏读确认面，键已投递未验证消费（L14 诚实化）" }`；api.rs jump 回执 `status` 透传 `submitted`；queue.rs `DELIVERY_TIMEOUT_MSG` 防重口径不动（那是 Windows 排空超时语义）。移动端按 `submitted` 渲染「已投递未确认」黄色态（区别于 delivered 绿）。
+- [ ] **Step 2: 确认失败** → **Step 3: 实现**：`JumpConfirm` 枚举加 `Submitted { note: String }` 变体；confirm.rs macOS 分支由 `Ok(→Delivered)` 改返回 `Submitted { note: "macOS 无占用/屏读确认面，键已投递未验证消费（L14 诚实化）" }`；api.rs jump 回执 `status` 透传 `submitted`；queue.rs `DELIVERY_TIMEOUT_MSG` 防重口径不动（那是 Windows 排空超时语义）。移动端按 `submitted` 渲染「已投递未确认」**中性态**（区别于 delivered 绿）——**措辞更正（2026-10-05 实施回填，更正本任务书原字面的「黄色态」）**：本批实际落地与 spec 一致为**中性**（`src/mobile/MessageComposer.tsx` 的「D7/T3 中性回执」：配色与 gone 同族 **slate 灰**，文案「已投递至终端输入，agent 空闲后处理（未确认落盘）」；**不带「（可重试）」**——该语义只属 failed 态，出现在此会诱导双发）。spec §5 H5 风险 13 与 §12 风险 13 的原文即「中性 `submitted`」，实现与之对齐。
 - [ ] **Step 4: 过测 + 全门禁（含 pnpm）**；**Step 5: Commit** `git add src-tauri/src/inject/confirm.rs src-tauri/src/inject/queue.rs src-tauri/src/remote/api.rs src/mobile/ tests/mobile/ && git commit -m "fix(inject): L14 插队回执诚实化——确认面不可达报 submitted 不报 delivered（macOS 假成功根修）"`
 
 ### Task 5: C1-① H3 无头通道总开关（默认关）
@@ -257,7 +290,7 @@ engine 靶向入口接线：候选集 >1 且能取 TTY → `resolve_by_tty`；�
 - Modify: `src-tauri/src/remote/mod.rs`（`pub const KEY_HEADLESS: &str = "remote.headless_enabled";` 纳入 status 组装）
 - Modify: `src-tauri/src/remote/api.rs`（session-send 路由到无头通道前的开关校验）
 - Modify: `src/components/settings/RemoteSection.tsx` + `src/i18n/locales/{zh,en}.json`（「无头注入」开关 + 一次性安全说明）
-- Test: `tests/remote/*`（已有套件追加）+ `tests/`（RemoteSection 用例）
+- Test: `src-tauri/src/remote/api.rs` tests 模块（既有远程端点测试同位追加）+ `tests/`（RemoteSection 前端用例，沿用既有 settings 区测试文件）
 
 - [ ] **Step 1: 写失败测试**（后端）：开关关闭时对 zcode 会话 session-send → `403 {"error":"headless_disabled"}`；开启后放行到路由层。前端：RemoteSection 渲染开关、默认 off、点开弹安全说明（i18n 双语键 `remote.headless.title/hint/confirm`）。
 - [ ] **Step 2: 确认失败** → **Step 3: 实现**：`database::get_setting(KEY_HEADLESS)` 默认 `"false"`；`remote_status` JSON 加 `headlessEnabled`；RemoteSection 三件套之第一件（本任务只放开关，超时/并发上限控件随 Task 6 的配置落点一起加）；开关翻转写审计 `action='setting' detail='headless=<v>'`。安全说明文案（zh）：「无头注入将在不经过终端可视确认的情况下直接驱动 Agent 执行消息（含工具调用）。zcode 通道默认 yolo 档（不弹审批）。开启即表示知悉。」
@@ -316,15 +349,18 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 
 ```rust
     #[test]
-    fn zcode_probe_requires_prompt_dryrun_not_version() {
+    fn zcode_probe_uses_prompt_dryrun_not_version() {
         // 附录 E/探测定案：--version 不需要 provider config 会漏判——探针必须 --prompt 干跑
-        let spec = super::ProbeSpec::Zcode { exe: "D:/Program Files/ZCode/ZCode.exe".into(), cjs: "...".into() };
-        assert!(super::probe_argv(&spec).iter().any(|a| a == "--version").not() /* 伪码意图：不含 --version，含 --prompt */);
+        let spec = super::ProbeSpec::Zcode { exe: "D:/Program Files/ZCode/ZCode.exe".into(), cjs: "D:/Program Files/ZCode/resources/glm/zcode.cjs".into() };
+        let argv = super::probe_argv(&spec);
+        assert!(argv.iter().any(|a| a == "--prompt"), "探针须 --prompt 干跑: {argv:?}");
+        assert!(!argv.iter().any(|a| a == "--version"), "探针不得用 --version（会漏判 provider 缺失）: {argv:?}");
     }
 ```
 
 探针：zcode = `--prompt "" --mode yolo --json` 干跑（超时 15s，能出 JSON 即过；Mac 缺 env var 时报 VersionGate 并附修复提示）；codex = `queue --help` 子命令在场；结果缓存（进程存在性 + mtime 键）。
-- [ ] **Step 4: 全门禁**；**Step 5: Commit** `git commit -m "feat(headless): H4/H6 底座——runner(600s watchdog/kill树/取消/并发2) + receipt 归一(前缀跳过) + 版本门控探针 + 审计"`
+- [ ] **Step 4: 设置页「无头」子区三件套收齐**——Task 5 只放了总开关，本步补另两件：`remote.headless_timeout_ms`（默认 600000）与 `remote.headless_concurrency`（默认 2）的 RemoteSection 控件 + `remote_status` 下发 + runner 启动时读取（spec H4 配置落点）。前端用例：三控件渲染 + 默认值断言。
+- [ ] **Step 5: 全门禁**；**Step 6: Commit** `git commit -m "feat(headless): H4/H6 底座——runner(600s watchdog/kill树/取消/并发2) + receipt 归一(前缀跳过) + 版本门控探针 + 无头子区三件套 + 审计"`
 
 ### Task 7: C1-③ 路由表扩展（H 系通道入路由）
 
@@ -357,7 +393,7 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
     }
 ```
 
-- [ ] **Step 2: 确认失败** → **Step 3: 实现**：`Channel` 加 `Headless(HeadlessKind)`；`HeadlessKind { Zcode, CodexQueue, CodexExec, WbAcp, ClaudeP, KimiP, OpencodeRun }`；`Visibility` 加 `AfterRestart`（zcode 已信任）/ `MamOnly`（zcode 未信任）——携元数据 `visibility_note: &'static str`（移动端提示文案键）；`tool_gate` 重写：workbuddy/dsh/zcode 不再一律黑盒——zcode→Headless(Zcode)、workbuddy→Headless(WbAcp)、dsh CLI 形态→终端注入保留 + APP 形态→NotInjectable(reason_code="dsh_headless_pending")〔H13 范围注记〕；codex 按形态分派（cli→终端 / app→CodexQueue）。既有 `app_form` 断言测试翻转语义。
+- [ ] **Step 2: 确认失败** → **Step 3: 实现**：`Channel` 加 `Headless(HeadlessKind)`；`HeadlessKind { Zcode, CodexQueue, CodexExec, WbAcp, ClaudeP, KimiP, OpencodeRun }`；`Visibility` 加 `AfterRestart`（zcode 已信任）/ `MamOnly`（zcode 未信任）——携元数据 `visibility_note: &'static str`（移动端提示文案键）；`tool_gate` 重写：workbuddy/dsh/zcode 不再一律黑盒——zcode→Headless(Zcode)、workbuddy→Headless(WbAcp)、dsh CLI 形态→终端注入保留 + APP 形态→NotInjectable(reason_code="dsh_headless_pending")〔**范围注记：若审阅裁 H13 并入 → 此分支改路由 Headless(DshAcp) 并在 HeadlessKind 加变体**〕；codex 按形态分派（cli→终端 / app→CodexQueue）。既有 `app_form` 断言测试翻转语义。
 - [ ] **Step 4: 全门禁**；**Step 5: Commit** `git commit -m "feat(routing): H 系无头通道入路由——四家 APP 形态分派 + 可见性元数据（AfterRestart/MamOnly）"`
 
 ### Task 8: C1-④ H7 zcode 无头适配器 + session-send 接线 + 回执卡
@@ -393,7 +429,13 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 
 - [ ] **Step 2: 确认失败** → **Step 3: 实现**：`build_argv`（`--prompt <text> --resume <sess> --cwd <proj> --mode yolo --json`；Win/Mac 两形态 + env 集）；执行走 Task 6 runner；`WorkspaceBusy` → 探活重试（APP 工作区活跃探测 = `find_dsh_desktop_host_pid` 同款扫描法的 zcode 版：查 ZCode APP 是否活跃于该项目——按 app-server 进程 cwd 扫描，探测定案口径）最多 2 次（间隔 5s），仍忙 → 回执失败 +「工作区忙」原因；成功 → Receipt + 可见性提示文案（已信任=「重启 ZCode 应用后可见」/未信任=「仅 MAM 可见」，信任判定 = recentProjects 含该项目路径——读 `~/.zcode/v2/setting.json` 只读）。api.rs：`Headless(Zcode)` 分派 → 会话串行锁（per-session MutexMap）→ runner → 回执 + 审计。移动端回执卡三态 + 取消按钮（调 `/session-headless-cancel`）。
 - [ ] **Step 4: 全门禁**；**Step 5: USER-ASSIST 实机**：手机对探测留下的自建 zcode 会话（`sess_4d37f1f3` 等）发一条 → 回执卡出（末条 assistant + token + 耗时）→ 重启 ZCode APP 后 Test2 工作区可见该回合。
-- [ ] **Step 6: Commit** `git commit -m "feat(zcode): H7 无头发消息——平台分叉 argv/争用锁探活重试/yolo/回执卡 + session-send 接线"`
+- [x] **Step 6: Commit** `git commit -m "feat(zcode): H7 无头发消息——平台分叉 argv/争用锁探活重试/yolo/回执卡 + session-send 接线"`（**现行 hash = `043040b`**；原 commit `7e288ab` 已被「复审追补合并入同 commit」的 **amend 取代**——本行此前记的是 amend **前**的 hash，勿再照旧字面引用：`git log --oneline main..HEAD` 里在册的是 `043040b`）
+
+**⚠️ Task 8 实施记录（2026-10-05 实机 + 复审追补，**更正本任务书字面**；commit = `043040b`，即 Step 6 那个 commit 的 amend 后形态）**：
+1. **provider config 两端都要**（任务书只写 Mac）：真机 Windows CLI 自报查找 `<root>\resources\glm\provider\` 与 `<盘>:\config\provider\`，装包实际在 `<root>\resources\config\provider\zcode-builtin.json`（stat 实证）——不设则 `--prompt` 报「无法定位 CLI ZCode Built-in Provider Config」exit 1。实现 `gate::provider_config_env`：macOS 无条件设、Windows 推导路径在场才设（探针与真回合**共用单点**）。
+2. **版本探针 = 一次真实最小模型回合**（任务书与 Task 6 代码都当作「空串干跑」）：真机 CLI 拒绝空载荷（`--prompt requires non-empty text.`），故 `PROBE_PROMPT = "hi"`；结论缓存改为**成功长缓存 / 失败 5 分钟 TTL**（`FAILURE_TTL_MS`）——一次瞬时抖动不得把通道钉死整个进程生命周期。成本：每安装版本一次最小回合（mtime 键失效重探）。
+3. **回执真源 = 会话库**：真机 `--resume` 回合 exit 0、会话库确有回复（`tokens.output=16493` 实测），但 **stdout 无可解析 JSON** ⇒ stdout 只作完成信号；`lastAssistant`/`tokens` 取自 `~/.zcode/cli/db/db.sqlite` 只读链路（`zcode_parser::store_snapshot` 复用既有解析件；确认判据 = 末条 assistant **消息 id** 变化，有界轮询 3×1s）；stdout JSON 仍为第一优先；两者都无 → 如实的 channel_error（不冒充成功）。
+4. **新增 stage `refused`**（投递前拒绝：斜杠命令/会话串行锁/平台不支持——回合未起跑、零字节投递），与 `channel_error` 分列；stage 名单跨语言锁定于 `tests/fixtures/headless_stages.json`（Rust 枚举与移动端分诊表各自断言）。
 
 ### Task 9: C1-⑤ H8 codex APP 适配器（queue 主 / exec resume 兜底）
 
@@ -423,7 +465,7 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 
 - [ ] **Step 2: 确认失败** → **Step 3: 实现**：AppPresence 判定 = 会话宿主 form + ChatGPT.app 进程在场扫描；`Plan::Queue` → `codex queue --thread <UUID> --message <text>`（回执 = message-id + exit 0 只证入队）→ **消费确认自建**：轮询目标 rollout 文件追加（命中消息文本 = 已消费；60s 未消费且 `queue_1.sqlite` 副本查到该 thread 滞留 → 回执「已入队未消费（thread 未被 APP 打开），建议在 APP 打开该会话或改走 exec」）；`Plan::ExecResume` → `codex -C <dir> exec resume <UUID> "<text>" --skip-git-repo-check`（runner 跑，stdout 尾行=末条回复）；单写者锁报错（`already has an active writer`）→ 自动改道 Queue 并如实注明。id 映射：MAM codex 会话 → rollout 文件名 UUID（adapter 读链已有文件路径，取 basename）。
 - [ ] **Step 4: 全门禁**；**Step 5: USER-ASSIST 实机**：手机对 Test2 的 codex APP 会话发消息 → APP 内 ~1min 出现并执行。
-- [ ] **Step 6: Commit** `git commit -m "feat(codex): H8 APP 托管会话注入——queue 主/exec resume 兜底按 APP 在场分派 + 消费确认自建 + UUID 唯一"`
+- [x] **Step 6: Commit** `git commit -m "feat(codex): H8 APP 托管会话注入——queue 主/exec resume 兜底按 APP 在场分派 + 消费确认自建 + UUID 唯一"`
 
 ### Task 10: C1-⑥ H5 审批与权限档（参数化 + 边界落码）
 
@@ -433,14 +475,14 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 - Test: mod.rs tests
 
 - [ ] **Step 1: 失败测试 + 实现**：`PermissionSpec { Zcode(Yolo 固定——裁决 14), CodexExec(policy: "on-request" 默认), ClaudeP(Stdio /* C4 用 */, KimiDefault, OpencodeDefault }`——spawn 构造器按 spec 注入旗子；断言 zcode argv 恒 `--mode yolo`、codex exec 恒带 `-c approval_policy=...`；移动端审批卡接口 `HeadlessApprovalRequest`（type 定义 + 渲染占位「无头通道审批将在 claude 通道（C4）启用」）。边界注释落码：codex queue 无审批面（H8 定案）、zcode yolo 无审批（裁决 14 + H3 知情文案兜底）。
-- [ ] **Step 2: 全门禁**；**Step 3: Commit** `git commit -m "feat(headless): H5 权限档参数化——zcode yolo 固定/策略驱动旗子/审批卡接口预留(C4)"`
+- [x] **Step 2: 全门禁**；**Step 3: Commit** `git commit -m "feat(headless): H5 权限档参数化——zcode yolo 固定/策略驱动旗子/审批卡接口预留(C4)"`（Task 10 的 Step 2/3 共用本行一个复选框——票面指令只勾 Task 9 Step 6 与本行这两处，其余复选框维持未勾状态）
 
 ### Task 11: C2 H9 WorkBuddy ACP 适配器（HTTP 型）
 
 **Files:**
-- Create: `src-tauri/src/inject/headless/wb_acp.rs`
+- Create: `src-tauri/src/inject/headless/wb_acp.rs`（`MockHttp` 为本任务内定义的注入缝：`Box<dyn Fn(HttpReq) -> HttpResp>` 封装，非外部依赖）
 - Modify: `src-tauri/src/monitor/workbuddy_parser.rs`（读链路补扫 `~/.workbuddy/projects/<munged-cwd>/*.jsonl`——ACP 会话不进 db，Task 2 的 db 源扫不到）
-- Test: wb_acp.rs tests（wire 纯核用注入闭包 mock HTTP）
+- Test: wb_acp.rs tests（wire 纯核用 MockHttp）
 
 - [ ] **Step 1: 写失败测试**（协议序列纯核——Mac 实测 wire 为准）：
 
@@ -483,10 +525,27 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
 
 ### Task 13: C4 H11 三家 CLI 无头（claude / kimi / opencode）
 
-**Files:**
+**Files（计划时清单）:**
 - Create: `src-tauri/src/inject/headless/cli_three.rs`（claude 主体 + kimi/opencode 薄适配）
 - Modify: `src-tauri/src/inject/headless/mod.rs`（claude 审批双向桥）、`src/mobile/SessionDetail.tsx`（审批卡激活）
 - Test: cli_three.rs tests（wire 纯核 mock stdin/stdout 帧）
+
+**实际落地文件面（R11 回填；取自 `git show --name-status 1d29b1c`——`f96b5b0` 是 Task 13 commit 的 amend **后现行 hash**〔同一 subject 的 amend 链：`a99dcd9` → `fb91b54` → `f96b5b0`，`git reflog` 可验；`git log --oneline main..HEAD` 里在册的就是它〕）**——上面的三行计划清单**远小于**实际落地：审批双向 wire 的接线面横跨无头底座与远程端点两侧。
+
+| 文件 | 动作 | 为什么在这个 commit 里 |
+|---|---|---|
+| `src-tauri/src/inject/headless/cli_three.rs` | 新建 | claude 主体（argv 全集 / stream-json 双流 demux / `control_response` 双向 / AskUserQuestion 投影与 answers 映射）+ kimi/opencode 薄适配；模块头即证据常量与未取证面清单 |
+| `src-tauri/src/remote/api.rs` | 修改 | 审批/问答两端点：`GET /m/api/v1/session-headless-approval`（卡面载荷）+ `POST /m/api/v1/session-headless-approve`（决策送达 + `headless_approve` 审计行）；claude 通道分派 |
+| `src-tauri/src/remote/server.rs` | 修改 | 两端点入路由表（PIN 门禁内层 gate）+ 端点级用例（参数/完整性/开关/未送达） |
+| `src-tauri/src/inject/headless/turn.rs` | 修改 | 通道无关件（Task 9 已上提）之上补 CLI 发现/spawn 形态（`.cmd` 垫片 + `cmd /c`）与 R3 的 `cmd_shim_body_refusal`——正文走 argv vs 走 stdin 之别正是 claude 通道的例外面 |
+| `src-tauri/src/inject/headless/mod.rs` | 修改 | 审批载荷/决策/权限档参数面（`HeadlessApprovalRequest` 类型族）+ claude 双向桥接线 |
+| `src-tauri/src/inject/headless/codex.rs`、`runner.rs` | 修改 | 与 claude 共用的 spawn 形态/收尾件适配（零行为变化的面） |
+| `src-tauri/src/inject/families.rs`、`src-tauri/src/inject/queue.rs` | 修改 | 三家 CLI 的家族判定与队列口径接入 |
+| `src/mobile/SessionDetail.tsx`、`src/mobile/api.ts`、`src/mobile/MessageComposer.tsx` | 修改 | 审批卡/问答卡激活、两端点客户端、无头回执分诊 |
+| `src/components/settings/RemoteSection.tsx`、`src/i18n/locales/{zh,en}.json` | 修改 | 无头子区文案随审批面补键 |
+| `tests/fixtures/headless_decision_words.json` | 新建 | 决策 wire 词跨语言夹具锁（`allow`/`deny`/`answer`） |
+| `tests/mobile/SessionDetail.test.tsx`、`tests/settings/remoteSection.test.tsx` | 修改 | 前端审批卡/设置区用例 |
+| `docs/superpowers/plans/2026-10-04-h1-h12-implementation.md` | 修改 | 本任务书的 Task 13 回填（同 commit） |
 
 - [ ] **Step 1: 写失败测试**（附录 E ①② 的 wire 规格直译）：
 
@@ -521,25 +580,162 @@ runner 生产路径：`tokio::process::Command::spawn` → `Stdio::piped` 读 st
     }
 ```
 
-- [ ] **Step 2: 确认失败** → **Step 3: 实现**：claude = runner 长驻变体（进程存活至 turn 结束——裁决 8 特例）：stdout 双流解析（stream-json 事件流 + `control_request` 控制面分离）→ `control_request{can_use_tool}` 投影成移动端审批卡/问答卡（复用 H5 接口与 Task 10 类型）→ 用户选择 → stdin 写 `control_response`；turn 终点判据 = `stream_event{message_delta{stop_reason}}`（E-①，勿等 result 帧）；kimi = `kimi -p -S <id> "<text>"`；opencode = `opencode run <text>`（会话续接参数 C4 实机首任务定案——B/C 级证据）；回执解析各一（末条 assistant + token）。
+- [ ] **Step 2: 确认失败** → **Step 3: 实现**：claude = runner 长驻变体（进程存活至 turn 结束——裁决 8 特例）：stdout 双流解析（stream-json 事件流 + `control_request` 控制面分离）→ `control_request{can_use_tool}` 投影成移动端审批卡/问答卡（复用 H5 接口与 Task 10 类型）→ 用户选择 → stdin 写 `control_response`；turn 终点判据 = `stream_event{message_delta{stop_reason}}`（E-①，勿等 result 帧）；kimi = `kimi -p -S <id> "<text>"`；opencode = `opencode run <text>`（两家的会话续接参数属 B/C 级证据——**本任务实机首步**先各自无头跑一条探针定案续接形态，再落适配器）；回执解析各一（末条 assistant + token）。
 - [ ] **Step 4: 全门禁**；**Step 5: USER-ASSIST 实机**：对一个无窗 claude 会话发消息 → 审批卡弹出 → 批准 → 工具执行 → 回执。
 - [ ] **Step 6: Commit** `git commit -m "feat(cli-three): H11 claude/kimi/opencode 无头——argv 全集/审批双向 wire/问答 answers 映射（附录 E 规格）"`
 
 ### Task 14: 收尾——E2E 骨架 + 全门禁 + spec 进度回填
 
 **Files:**
-- Create: `src-tauri/tests/headless_e2e.rs`（`#![cfg_attr(not(windows), ignore)]` 实机套件骨架，m9r 模式）
-- Modify: spec 附录 B（状态翻 🔄/✅）
+- Create: `src-tauri/tests/headless_e2e.rs`（跨平台 `#[ignore]` 实机套件——无头通道本就双平台，**不做 windows-only 编译门**，单机跑不了的用例按平台条件 skip 并登记）
+- Modify: spec 附录 B（状态翻 🔄/✅）+ spec §5 H1/H6/H9/H10/H11（根因更正 / stage 枚举更正 / 实施回填 + 未取证面）
+- Modify: 本计划（Task 1 实施记录、Task 4 中性态字面、Task 14 不 push 字面、自审记录第 7 条、**遗留与跟进登记**）
 
-- [ ] **Step 1: E2E 用例**（全 `#[ignore]`，实机跑）：`zcode_send_roundtrip`（发→回执→rollout 落盘核验）/ `codex_queue_consumed` / `wb_acp_prompt_landed` / `claude_approval_roundtrip`。空跑验证编译 + `cargo test -- --ignored --list` 列出。
-- [ ] **Step 2: 全门禁总跑**（cargo test/clippy/fmt + pnpm test/build/format/lint）+ 既有 `#[ignore]` 套件不回归。
-- [ ] **Step 3: spec 附录 B 回填 commit + push** `git commit -m "docs(spec): H1-H12 实施进度回填（本计划执行完毕）"`
+- [x] **Step 1: E2E 用例**（全 `#[ignore]`，实机跑）：`zcode_send_roundtrip`（发→回执→**会话库**落盘核验〔末条 assistant 消息 id 变化，`tests/headless_e2e.rs:393-396` 的 `zcode_parser::store_snapshot_home`〕——原字面写「rollout 落盘核验」是 Task 8 修订**前**的口径：回执真源已改会话库〔`~/.zcode/cli/db/db.sqlite`〕，zcode 侧没有 rollout 这个件〔rollout 是 codex 的会话文件形态〕）/ `codex_queue_consumed` / `wb_acp_prompt_landed` / `claude_approval_roundtrip`。空跑验证编译 + `cargo test -- --ignored --list` 列出。
+  - **Task 14 交底**：目标编译通过（`cargo test --test headless_e2e --no-run`）；`cargo test --test headless_e2e -- --ignored --list` 列出**恰好这 4 名**（`zcode_send_roundtrip` / `codex_queue_consumed` / `wb_acp_prompt_landed` / `claude_approval_roundtrip`）；**四例在本任务期间一律未实机执行**（配额红线：不得消耗真实 agent 回合），故其真机行为属**未取证面**——文件头「证据纪律」节已逐条写明，首次实机跑请按该节读输出。
+- [x] **Step 2: 全门禁总跑**（cargo test/clippy/fmt + pnpm test/build/format/lint）+ 既有 `#[ignore]` 套件不回归。
+  - **Task 14 交底（实跑数字，见「遗留与跟进登记」L-28~L-33）**：`cargo clippy --all-targets -- -D warnings` **0 告警**、`cargo fmt --check` **通过**；`cargo test --no-fail-fast`（末轮，冻结树）= lib **1750 过 / 30 败 / 29 ignored**（30 败**全为 junction/符号链接权限环境因**，见 L-28/L-29；首轮另有 1 次载型抖动见 L-30，末轮未复现）、`dao_test` 7/0、`linker_test` 3/2（同环境因）、`preset_v2_test` 20/19（15 = 同环境因，4 条另因见 L-31）、`headless_e2e` **0 跑 / 4 ignored**、`m9r_e2e` **7 ignored 未回归**、lib 的 `monitor::hooks::*` 6 例实机 E2E 仍 ignored；前端 `pnpm test` **84 文件 / 876 用例全过**、`pnpm build` ✓、`pnpm format:check` ✓、`pnpm lint` 0 error / 6 warning（退出码 0，与既有 13 个 commit 的门禁口径一致）。
+- [x] **Step 3: spec 附录 B 回填 → commit（⚠️ 只提交，不 push）**（本条 commit = 分支末条 `docs(spec): H1-H12 实施进度回填 + 遗留登记（E2E 骨架；本地分支不 push）`）
+
+  ```bash
+  git add docs/superpowers/specs/2026-09-27-phase2-closure-app-injection-design.md docs/superpowers/plans/2026-10-04-h1-h12-implementation.md src-tauri/tests/headless_e2e.rs
+  git commit -m "docs(spec): H1-H12 实施进度回填 + 遗留登记（E2E 骨架；本地分支不 push）"
+  ```
+
+  **红线（用户 2026-10-05 裁决，优先于本行任何历史字面）**：本计划的**每一步都不 push**——工作分支 `feat/h1-h12-headless` 上的所有 commit 一律留本地，**全任务完成且 Task 15 统一手工测试通过之前，任何形式、任何远端都不 push**；不碰 `main` 与其它分支；`git add` 只列明文件（**严禁 `-u`/`-A`/`.`**）。push 与合流是 **Task 15 Step 3** 之后由用户/主线另行裁决的动作（见 Task 15 Step 3 与文首「分支与门禁」节）。**本条原文曾写作「spec 附录 B 回填 commit + push」——2026-10-05 已按执行纪律改正，勿照旧字面执行。**
+
+### Task 15: 统一手工测试用例（用户执行——仅限 agent 无法操作的项）
+
+> 时机：**Task 1–14 全部完成、代码 review 通过之后，用户一次性统一执行**（用户 2026-10-05 裁决）。凡 agent 能用电脑直接操作的（命令行验证、DB/文件核对、API 调用、进程检查）都已在前序任务的实机核验步覆盖——本清单**只收**手机操作、GUI 目视、APP 内交互、账号态四类。每用例带通过判据；发现不符记录现象回主线。
+
+**前置准备（一次）**：MAM dev 以本分支最新代码重启；手机连同一局域网打开 `/m` 并 PIN 配对；ZCode / WorkBuddy / ChatGPT.app / DeepSeek Harness 保持安装可用。
+
+| # | 功能点 | 手工步骤（只有你能做的部分） | 通过判据 |
+|---|---|---|---|
+| M1 | H3 总开关·关闭态 | 设置页确认「无头注入」默认关 → 手机打开任一 zcode 会话详情 | 发送入口置灰 + 提示「无头通道未开启，请在电脑端 MAM 设置中开启」 |
+| M2 | H3 总开关·开启 | 电脑端开启开关（读安全说明并确认）→ 回手机刷新 | 入口恢复可用 |
+| M3 | H7 zcode 发消息 | 手机对 Test2 的 zcode 会话发「hi [测试]」 | 回执卡出现：末条 assistant 摘要 + token + 耗时；下方灰字「重启 ZCode 应用后可见」 |
+| M4 | H7 可见性兑现 | 重启 ZCode APP → 打开 Test2 工作区 | M3 的回合出现在会话里 |
+| M5 | H4 取消 | 手机对任一会话发一条长任务（如「数到 100」）→ 回执进行中点「取消」 | 回执变「已取消（用户终止）」，进程消失（电脑任务管理器无残留 zcode.cjs） |
+| M6 | H8 codex APP | 手机对 Test2 的 codex 会话发「ok? [测试]」→ 切到 ChatGPT.app 看 | APP 内 ~1 分钟出现该消息并开始回复 |
+| M7 | H9 WB 前置 | （WB 未开远程控制时）手机对 WB 会话发消息 | 如实收到「WorkBuddy 远程控制端点未启用」提示（不谎报成功） |
+| M8 | H9 WB 全链 | 在 WorkBuddy 设置里开启远程控制类开关（找到与否都告知主线）→ 手机对活跃 WB 会话发「hi」 | WB APP 内出现消息并执行；找不到开关 = 记录后跳过（风险 16 活账） |
+| M9 | H10 zcode 新建 | 手机「+ 新建会话」→ 工具选 zcode → 项目选 Test2 → 首句默认 → 提交 | 回执出新 sess_id（**并记录回执里的 `confirmation` 值**：`stdout_frame` / `store` / `none`）→ 看板出现新卡 → 重启 ZCode APP 后 Test2 里可见；`confirmation:"none"`（未确认，回执 `sessionId` 为空串）不得显示任何会话号 |
+| M10 | H11 claude 审批 | 手机对一个无窗 claude 会话发「列出本目录文件」 | 手机弹出审批卡（Bash 工具 + 命令原文）→ 点批准 → 工具执行 → 回执含结果 |
+| M11 | H11 问答卡 | 手机发一条会触发 claude AskUserQuestion 的消息（如「问我一个单选题」） | 问答卡出现：单选/多选/Other 自由文本可用；**不全答无法提交**；提交后 claude 收到答案 |
+| M12 | H1+T1 dsh 正文 | 在 DeepSeek Harness 里随便一个项目发一条消息 | MAM 看板 dsh 卡正文/预览随之更新（不再「无消息」） |
+| M13 | H12 WB 上板 | 在 WorkBuddy 里新建一个会话说一句 | MAM 看板出现该 WB 卡（无心跳场景） |
+| M14 | L13 拒绝歧义 | 电脑开两个终端、同目录各起一个 claude → 手机对其中一张卡发消息 | 收到明确拒绝提示「同目录存在多个候选会话…」（而不是打进错误窗口） |
+| M15 | 回执诚实性抽查 | 手机随便发 2–3 条到不同工具 | 每条要么明确成功（有消费证据）要么明确失败原因——**没有任何一条谎报成功** |
+| M16 | **H7 resume 路径回执源（Task 8 复审追补）** | 手机对**探针自建**的 zcode 会话（会话列表里标题为 `hi` 的那几张，e.g. `sess_6c502451-4f7f-498c-ae4b-5b6fc4c4164c`）发「hi [测试]」 | 回执卡显示**末条 assistant 摘要 + 耗时**（`tokens` 取库 `tokens.output`，有则显示）；**不是**「未拿到回执」——stdout 无 JSON 的 resume 路径必须由会话库确认（若显示 channel_error = FAIL，记录并回报主线）；随后重启 ZCode APP → 该回合在工作区可见 |
+| M17（**可选**） | R9 取消端点端到端（**可选**，收尾轮 R12-S4 登记） | 让 zcode 工作区**处于争用锁态**（ZCode APP 正占着该工作区）→ 手机对 Test2 的 zcode 会话发一条消息 → 在**退避重试窗内**（回执卡还在「进行中」）点「取消」 | 回执转 `cancelled` 且**不再多试一次**；审计页出现 `headless_cancel` 行（设备 = 按下取消的这台机器），同时该回合的 `headless` 行口径为 `cancelled · <n>ms`。**为什么可选**：**代码级证明已有**（`inject/headless/zcode.rs` 的 `run_turn_honours_cancel_during_busy_backoff`〔退避窗内〕与 `run_turn_honours_cancel_arriving_just_after_arm`〔武装后微窗口〕，均由脚本缝直驱 `run_turn`），而**端点级**现有用例（`remote::server::tests::headless_cancel_endpoint_audits_delivered_cancel`）用的是**手工武装的假靶子**——「争用锁退避窗 + 真端点」这一格是**推断**，故本用例做了更好、不做不影响本批收尾（**别把它读成已验证**） |
+
+**M7/M8 前置条件（R1 收尾轮登记，2026-10-05——**验 WB 两卡前先看这条**）**：M7/M8 是 **WorkBuddy ACP 回环 HTTP** 的实机面，而 R1 的安全修复正是「**回环流量绝不走系统代理**」（`src-tauri/src/inject/headless/wb_acp.rs` 的 `acp_http_client` 里 `.no_proxy()`；`src-tauri/Cargo.toml:84` 的 reqwest **显式开了 `system-proxy` 特性**，故「走代理」才是默认行为——这条修复不是空转）。
+1. **该证明要求被测机器上真的配了系统代理**（环境变量或系统代理设置）：只有存在代理时，「回环不外发给代理」才是**可观测的差异面**。**若本机没有配代理**：M7/M8 照跑（卡收发本身仍要验），但**必须如实标注验证强度受限**——写「本机无系统代理 ⇒ 本次未观测到代理面差异；`no_proxy` 一格的证据强度 = 代码评审级」，**不得**把「跑过了」写成「代理面已验证」（那是伪造证据）。
+2. 该缝是 `#[cfg(not(test))]`（**无法单测**已如实申报：验证面 = 代码评审 + 本两卡），故上面这条前置条件**就是它唯一的实机证据面**。
+
+**M9 取证附则（Task 12 复审登记，2026-10-05——验 M9 时**必须**同时记下这两条，它们各自只有实机能答）**：
+1. **新建形态是否出 JSON 帧**：M9 回执的 `confirmation` 字段即答案——`store` ⇒ CLI 未出可解析 JSON 帧（与 `--resume` 同形态，走会话库发现）；`stdout_frame` ⇒ 新建形态**会**出帧（Task 8 只实证了 `--resume` 不出，新建从未取证）。两种都算 PASS，但**必须记录是哪一种**（这是 H10 唯一未取证的形态面，也决定 Task 15 后续复测该盯哪条路）。
+2. **库行 `task_type` 取值**：新建的库发现按 `task_type='interactive'` 过滤（与出卡枚举同源假设，**未经真机核实**）。若 M9 出现「会话确实建出、看板也有了卡，但回执 `confirmation` 恒为 `none`/`stdout_frame` 而非 `store`」，先怀疑该假设——用只读查询核对新行的 `task_type`（`PRAGMA table_info(session)` / `SELECT task_type FROM session WHERE id='<新 sess_id>'`），把实测值回报主线（若取值不同，改 `zcode_parser::stored_sessions` 的过滤口径 + 其用例）。
+
+**M10/M11 取证附则（Task 13 复审登记，2026-10-05——验 H11 两家卡时必须逐条记录；每条都只有实机能答）**：
+
+> 背景：Task 13 的**单次 claude 探针**（2.1.287，1 次真实调用，2026-10-05）只取证了 argv 全集、stdin user 帧形态、`stream_event{message_delta{stop_reason}}` 的两级语义（`tool_use` 中途 / `end_turn` 终结）与进程退出；**没有抓到 `can_use_tool` 审批帧**（该次回合模型自选不调工具，且本机 claude 的宿主侧允许规则可能短路了弹窗）——审批 wire 的权威仍是 spec 附录 E-②（AionCore 源码级 + LIVE-PINNED 2.1.178–2.1.227）。故下列各条**必须**由 M10 实机补齐，**默认不假设它们成立**。
+
+1. **审批卡是否真的弹出**（M10 第一判据）：手机发一条**必定触发工具**的消息（如「列出本目录文件」）。若卡不弹而 claude 直接执行了工具 → **不是 PASS 也不是 FAIL，而是形态取证**：记录「宿主侧 allow 规则短路了审批」（并记下 `~/.claude/settings.json` 里是否有 `permissions.allow` 命中该工具）——这决定后续是否需要请求更严的档（`permission-mode plan` 等，本批未取证）。
+2. **卡面四要件**（逐项记「有/无」）：① 工具名；② **命令完整展示，或带真实总长的显式截断标记**（`input` 展示字段：≤ 2000 字符时**逐字原文**；超限时必须是「…已截断，共 N 字符」，`N` = 命令原文**真实**字符数——**不得**出现不带长度信息的静默截断）；③ 权限档显示（`审批档 stdio · 权限模式 default`）；④ 已等待时长。
+   - **②的口径更正（R2 复审登记，2026-10-05）**：本条原文要求「**命令原文逐字**（`input` 展示字段，不是截断摘要）」——该要求在任意长度的命令上**不可能恒成立**（管道/多行脚本/长路径可以让命令任意长，卡面必须有一条上限）。R2 判定「**静默**截断」才是缺陷：上限提为 2000（`cli_three::APPROVAL_INPUT_DISPLAY_CHARS`，单点常数），**超限时必须自报真实总长**——有了长度标记，用户在任何长度下都能判断「我看到的够不够批」，审批诚实性不再依赖「命令恰好很短」。故本要件改为「**完整展示或显式截断标记**」。
+   - **验收动作（补进 M10）**：① 发一条**超 200 字符**的命令 → 卡面必须**完整**显示（旧口径会在 200 处砍掉）；② 再造一条**超 2000 字符**的 → 必须出现「…已截断，共 N 字符」且 `N` 等于命令原文长度（对不上即 FAIL）。
+3. **批准后工具真的执行了吗**（假成功的反面）：看回执卡 `reason` 里的**工具结果计数**（`工具结果 N`）+ claude 侧会话内容里该命令的实际效果（如列目录的输出）。只看到「已送达」**不足以**判 PASS——附录 E-② 明示 `updatedInput` 缺失时工具**永不执行**（那是静默失败）。
+4. **拒绝是否报「拒绝」而非「失败」**：点「拒绝」后回执必须是 `ok`（`stage` 为空）且 `reason` 含「已被用户拒绝（deny）」——若显示 `failed(...)` 或 `channel_error`，记录现象回报主线（那是诚实口径破了）。
+5. **问答卡不全答是否真的禁提交**：只勾一题时「提交答案」必须置灰 + 显示「还有 N 题未作答」；**并记一次强行绕过**（若能在浏览器控制台直接 POST 未答全的 answers，`POST /session-headless-approve` 必须回 400「未答全」且待答项仍在——核侧第二道闸）。
+6. **弃卡语义**：点「拒绝（关闭卡片）」后，claude 收到的必须是 `deny`（会话里模型应表现为「用户拒绝」）——**不得**出现「题目被静默丢弃」（附录 E-② 的失败模式）。
+7. **超时诚实性**：审批卡弹出后**什么都不点**，等到看门狗到点（默认 600s；可临时把设置里的无头超时调到 60s 加速）→ 回执必须是 `failed(timeout)` + reason 含「正在等待审批/问答应答」，且卡消失（待答项已注销）。
+8. **kimi / opencode 回执诚实性**（M11 相邻面）：两家各发一条 `hi`——末条回复进回执（kimi 的 `tokens` **应为空**：2.1.1 的 stream-json 无 usage 帧，如实不显示即 PASS）；本机 opencode 默认模型若仍是退役模型（410），回执必须是 `failed(channel_error)` + provider 原文（**谎报成功即 FAIL**）。
+9. **`--resume` 形态本轮未实机取证**（Task 13 复审登记，2026-10-05）：Task 13 的单次 claude 探针走的是 **fresh（`--session-id`）** 形态，M10 才是第一次真跑 **`--resume <在册会话>`**。风险面：claude 在 resume 时**可能把历史回合的帧一并重放**（历史 `assistant` / 历史 `control_request`）——若真如此，`cli_three::demux_line` 会把历史帧当成「本回合」事件（症状：卡片弹出历史审批、回执 `lastAssistant` 是旧内容、turn 在历史 `end_turn` 上提前收尾）。**取证动作**：M10 发消息时逐条留意 ① 审批卡里的命令是否**本次**要跑的命令；② 回执 `lastAssistant` 是否**本次**回复；③ `reason` 的「控制请求 N」是否明显大于本次实际弹卡数。任一不符即回报主线（修法方向：只认 `--replay-user-messages` 之后的帧、或以本回合 user 帧 uuid 划界——**未取证前不预写**）。
+10. **关中途总开关 = 冻结在飞的审批卡**（R4 / 裁决 22 + **补裁 24a**；收尾轮 R12-S4 登记）：M10 的卡**弹着不动**时，去电脑端把「无头注入」总开关**关掉**，然后逐条验三件事——① 手机上的卡**仍然可见**（取数端点 `GET /session-headless-approval` **有意不过门**：「读不是动作」，补裁 24a 的定论）；② 点「允许」→ 必须回 **403 `headless_disabled`** 且**原因在卡面可见**（移动端把 `ApiError.data.reason` 原样渲染成「应答失败：…」，`src/mobile/SessionDetail.tsx:237-243`）——**不是**静默失败、**更不是**「没有待答项」；③ 什么都不点、等 watchdog 到点 → 回执 `failed(timeout)` + reason 含「**正在等待审批/问答应答**」（`cli_three.rs` 的 `EndWhy::Timeout` 臂；可先把设置里的无头超时调到 60s 加速，同第 7 条），卡随待答项注销而消失。
+    **判据**：三件都成立才 PASS。**FAIL 形态**：关掉开关后卡**直接消失**（= 把读也门住了，与补裁 24a 的定论相反）；或点「允许」后卡面**没有原因**（诚实口径破，别只记「失败了」）。
+
+- [ ] **Step 1: 用户按表统一执行，逐条记录 PASS/FAIL/现象**
+- [ ] **Step 2: 主线汇总结果回填 spec 附录 B + 修复 FAIL 项（若有）**
+- [ ] **Step 3: 全部 PASS 后：主线征得用户同意再 push 分支与合流**
 
 ---
 
-## 自审记录（Self-Review）
+## 自审记录（Self-Review，含 2026-10-05 复审轮）
 
-1. **Spec 覆盖**：H1（Task 1，诊断驱动——含对既有交付代码的 v4 修复）/ H2（✅ 已完成探测，无实现任务——结论供 Task 9/11 用）/ H3（5）/ H4+H6（6）/ H5（10+13）/ H7（8）/ H8（9）/ H9（11）/ H10（12）/ H11（13）/ H12（2）/ L13（3）/ L14（4）。C0 四件 = Task 1–4 ✓。**H13（dsh 写侧）不在本计划**（范围注记，审阅裁决）。
+1. **Spec 覆盖**：H1（Task 1，诊断驱动——含对既有交付代码的 v4 修复）/ H2（✅ 已完成探测，无实现任务——结论供 Task 9/11 用）/ H3（5）/ H4+H6（6）/ H5（10+13）/ H7（8）/ H8（9）/ H9（11）/ H10（12）/ H11（13）/ H12（2）/ L13（3）/ L14（4）。C0 四件 = Task 1–4 ✓。**H13（dsh 写侧）不在本计划**（范围注记，审阅裁决）。**Task 15 覆盖全部 H 节的手工验收面**（M1–M16；其中 L14 的 macOS 复验**无对应用例**——见遗留登记 L-08）。
 2. **占位符扫描**：实现要点均给出核心代码或明确规格表；`db_snapshot_fresh`/`agent_tty` 等给签名+行为契约（内部逻辑为直白 IO，执行者按契约落码）；无 TBD。
 3. **类型一致性**：`Receipt/Stage/HeadlessKind/Channel::Headless/PermissionSpec/Decision/Q` 在 Task 6/7/8/10/13 间交叉引用已对齐；`codex -C` 前置（Task 9 argv[1] 断言）与附录 E-④ 一致。
-4. **实测对齐**：Task 1 的诊断三连源自「版本门结论被代码事实推翻」的更正；Task 8 争用锁/Task 9 分派/Task 11 复活语义均为两端探测定案直译。
+4. **实测对齐**：Task 1 的诊断三连源自「版本门结论被代码事实推翻」的更正——**该项在本行原文里仍是计划初稿的三路嫌疑，实为两路被实测推翻（Task 1 实施记录已更正：真因 = 上层 `header.version` 白名单）**；Task 8 争用锁/Task 9 分派/Task 11 复活语义均为两端探测定案直译。
+5. **复审轮修订（2026-10-05，用户指令内审）**：① 执行纪律改为「本地分支 `feat/h1-h12-headless`、全任务完成且 Task 15 通过前不 push」；② 新增复用清单节（在产函数 8 项 + 探测定案真值 7 项，标注用于哪个任务）；③ gate.rs 伪码测试改真码（`--prompt` 在场断言 + `--version` 缺席断言）；④ Task 6 补「无头子区三件套收齐」步（超时/并发控件原漏排）；⑤ Task 11 MockHttp 定义为任务内注入缝；⑥ Task 13「C4 实机首任务」自指措辞改「本任务实机首步」；⑦ Task 14 E2E 去 windows-only 编译门（无头通道双平台）；⑧ 新增 Task 15（15 个手工用例，仅收手机/GUI 目视/APP 交互/账号态四类不可自动化项，统一于 review 通过后执行）。
+6. **Task 8 实机修订（2026-10-05，硬证据；同步回填 H7 spec；commit = `043040b`——Step 6 原记的 `7e288ab` 已被「复审追补合并入同 commit」的 amend 取代，勿照旧字面引用）**：① `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` **Windows 同样需要**（打包布局错位，真机 stat + CLI 报错逐字）；② 版本探针**不是空串干跑而是真实最小回合**（CLI 拒绝空载荷），失败结论改 5 分钟 TTL；③ **回执真源改会话库**（resume 路径 stdout 无 JSON 但库有回复），stdout 只作完成信号；④ 新增 `Stage::Refused` 与跨语言 stage 夹具锁。Task 15 相应新增 M16（resume 路径回执源）。
+7. **Task 14 收尾修订（2026-10-05，实施批末轮）**：① Task 1 补「实施记录」（**更正三路嫌疑：真因 = 上层 `header.version` 白名单；夹具两种布局都接受**）；② Task 4 的「黄色态」改**中性态**（与 spec 风险 13 原文一致）；③ Task 14 Step 3 的「+ push」按执行纪律改为**只提交不 push**（红线：全任务完成且 Task 15 通过前一律不 push）；④ spec 附录 B 按「不 overclaim」纪律整表回填（✅/🔄 + Task 15 用例号 + 明确拒绝 ✅ 的五项 + H13 范围边界）；⑤ spec H6 的 stage 枚举由 6 档改正为**8 档**并指明跨语言唯一名单；⑥ spec H1 的 dsh v4 根因改正；⑦ 新增本节之后的「遗留与跟进登记」。
+
+---
+
+## 遗留与跟进登记（Task 14 汇总；**登记不修**——修/不修由主线与用户裁决）
+
+> **读法**：本表是本批**唯一**的遗留总账（spec 附录 B 只给状态、不复述）。每条给：**锚点（`file:line`）**、**为什么本批没修**、**自然归属**、**核对方式**。
+> **核对方式三档**：`锚点已核` = 我逐行读过该处代码/文档并确认机制；`实跑观测` = 本批 Task 14 门禁实跑看到的数字；`转述登记` = 来自复审/任务书的登记，我只定位了周边代码（**未复验机制，修前请先复验**）。
+
+### A · 未取证面（证据缺口，不是缺陷——**不得读成已验证**）
+
+| # | 项 | 锚点 | 为什么没修 | 归属 / 核对 |
+|---|---|---|---|---|
+| L-01 | **claude 审批往返未实机取证**（`can_use_tool` 帧从未捕获；宿主 allow 规则疑短路） | `src-tauri/src/inject/headless/cli_three.rs`（`PendingRegistry`/`run_claude_turn`）；权威 = spec 附录 E-② | 取证需一次**真实**带工具的回合 + 真人点卡；本批只有 1 次探针（模型自选不调工具） | Task 15 **M10**（用户）；`锚点已核` |
+| L-02 | **WB ACP 端点未启用 ⇒ 通道实机面零证据**（Win 5.7.3 无 per-session serve 端点） | `src-tauri/src/inject/headless/wb_acp.rs:451`（`ENDPOINT_UNAVAILABLE_REASON`）+ spec 风险 16 | 端点启用是 **APP 内开关**（用户动作）；本机无该功能面 | 用户（开远程控制）+ 主线；`锚点已核` |
+| L-03 | **opencode 成功文本帧无样本**（只观测到续接形态 + provider 410 错误帧） | `src-tauri/src/inject/headless/cli_three.rs:66`（`OPENCODE_ARGV_EVIDENCE`）、`:1633`（`parse_opencode_receipt`） | 需要本机 opencode 换一个在役模型再跑一次真实回合（账号态） | Task 15 **M11 附则 8**；`锚点已核` |
+| L-04 | **zcode 新建形态是否出 stdout JSON 帧未取证**（只实证 `--resume` **不出**帧） | `src-tauri/src/inject/headless/zcode_create.rs`（`NewSessionConfirmation` 判定）+ `src-tauri/src/remote/api.rs:1145-1171` | 需要一次真实无头新建（手机/GUI 面） | Task 15 **M9 取证附则 1**（须记录 `confirmation` 取值）；`锚点已核` |
+| L-05 | **库发现按 `task_type='interactive'` 过滤是未经真机核实的假设** | `src-tauri/src/monitor/zcode_parser.rs:827`（`WHERE task_type = 'interactive'`） | 核实要真机只读查新行的 `task_type`（M9 场景才有新行） | Task 15 **M9 取证附则 2**（附核对命令）；`锚点已核` |
+| L-06 | **claude `--resume` 形态未取证**（历史帧重放风险：历史 assistant/`control_request` 可能被当本回合） | `src-tauri/src/inject/headless/cli_three.rs:156-158`（resume/fresh 互斥与形态说明）、`demux_line`(≈:721) | 探针走 fresh；resume 需在册会话（M10 场景） | Task 15 **M10 附则 9**；`锚点已核` |
+| L-07 | **kimi / opencode 无权限档旗子**（两家工具回合由 CLI 自身拒绝/自动拒绝，MAM 侧无审批面） | `src-tauri/src/inject/headless/mod.rs:374-380`（`flags()` 两变体恒空）、`:201-205`（kimi/opencode 无审批面） | 策略旗子形态**未取证 ⇒ 不猜不发**（本批纪律）；要做需先探测 | 后续批次（若要做改档/审批面）；`锚点已核` |
+| L-08 | **L14 的 macOS 实机复验缺失**（代码 + 纯核过测，但缺陷现场是 Mac） | `src-tauri/src/inject/confirm.rs:829-850`、`:903-958`（确认面不可达 → 中性 `Submitted`；枚举 `:635`）、L14 用例 `:1747-1758` | 本机 Windows，无 Mac 环境（该格在 macOS 走 `DirectReceipt::Submitted`，无法在本机真实触发）；Task 15 表里也**没有**这一条 | 主线（跨平台复验批次）；`锚点已核` |
+| L-09 | **WB `session/cancel` 未接线**（取消端点如实报「未送达」，不谎报已取消） | `src-tauri/src/inject/headless/wb_acp.rs:31-32`、`:1265`（不武装取消靶子） | ACP 取消通知形态未取证 + 本批取消语义只覆盖 spawn 型 | 后续批次；`锚点已核` |
+| L-10 | **槽位记录的是「计划通道」**（codex exec 被单写者锁拒 → 自动改道 queue 后，取消审计行的 channel 列仍是计划通道） | `src-tauri/src/remote/api.rs:1696-1703`（占位时写计划通道）、`:1619`（回合行改写为实际走向） | 有意的口径选择（取消行以「用户点取消时页面显示的通道」为准），但需读者知情 | 后续批次（若要统一口径）；`锚点已核` |
+
+### B · 工程债（代码级；本批只登记）
+
+| # | 项 | 锚点 | 为什么没修 | 归属 / 核对 |
+|---|---|---|---|---|
+| L-11 | **单写者锁证据也扫 stdout** ⇒ 非零退出只要 stdout **引用**了该短语也会改道，并断言「被锁拒绝」 | `src-tauri/src/inject/headless/codex.rs:411`（`writer_lock_evidence(stdout_head, stderr_head)`）、`:772-783`（改道判据） | 窄化证据源（只认 stderr）会改变改道语义，须配套重跑 codex 实机面 | 后续批次（窄化证据源）；`锚点已核` |
+| L-12 | **会话库读是 async 任务里的阻塞 rusqlite 读**（建议 `spawn_blocking`） | `src-tauri/src/inject/headless/zcode.rs:639-642`（`TurnDeps::production` 的 `store_probe`）、`:802`（`run_turn` 内直调） | 读为有界小查询（末条 20 行），本批按「可接受」放行；改法涉及 deps 形态 | 后续批次；`锚点已核` |
+| L-13 | **`ZcodeStoreSnapshot.last_seq` 未参与确认**（只作背景证据；主判据 = 末条 assistant **消息 id**） | `src-tauri/src/monitor/zcode_parser.rs:774-784`（字段语义）、生产确认逻辑在 `zcode.rs::finalize` | 有意保留为诊断面（id 比 seq 更能区分同文两轮） | 后续批次（若确认不用，考虑删字段以免误读）；`锚点已核` |
+| L-14 | **版本探针无 single-flight** ⇒ 并发首探可各自烧一次真实最小回合 | `src-tauri/src/inject/headless/gate.rs:374-408`（check-then-run，读缓存与写缓存之间无锁） | 加锁会引入 await 持锁问题；本批以「失败 5 分钟 TTL」兜底 | 后续批次；`锚点已核` |
+| L-15 | **重启后的孤儿自检未实现**（代码自述「登记给 Task 14」，而 Task 14 只做了 E2E 骨架）——**已登记 issue [#114](https://github.com/jarvislee90s-dot/MultiAgents-Manager/issues/114)，排期下一批实现**（2026-10-05 复审裁决 21；issue 定性：Windows 侧由 Job Object 结构性覆盖（`KILL_ON_JOB_CLOSE`），真实缺口在 POSIX——`process_group(0)` 只保证「可整组杀」，不保证「父死子亡」） | `src-tauri/src/inject/headless/runner.rs:23-32`（模块头**四件实现清单**：①跨进程持久 pid 账本 ②启动清扫 ③身份再验 ④进程侧查询落点——**下一批自此清单起步，勿另起炉灶**）、`src-tauri/src/lib.rs:319-321`（退出钩子只给到「退出即收」这一半） | 需要**跨进程 pid 账本**（内存登记表跨不过进程重启）——设计面未定 | **下一批**（issue #114；本批明确未做，勿因 Task 14 已完成而当作已交付）；`锚点已核` |
+| L-16 | **潜伏的前置闸探针读 pre-gate pid**（question 计划/查表、mode-switch 前置守卫） | `src-tauri/src/remote/api.rs:8492-8500`（switch：闸在三态守卫**之后**）、`:7843-7849`（menu：闸在守卫**之前**）、`:5854-5857`（question 闸位） | 今天这些探针**只读不投**（危害 = 读错窗口），且 TTY 臂在 Windows 恒拒绝 ⇒ 本批按「已知」放行 | **TTY 臂启用时（macOS 实测定案后）必须复闸**；`锚点已核` |
+| L-17 | **`CwdFallback::Allow(u32)` 载荷未被消费** | `src-tauri/src/window/tty_map.rs:54-70`（枚举与构造）、`:152-158`（只匹配 `Allow(_)`） | 无害（单候选时直接用 `session_pid`） | 后续批次（或改成无载荷变体）；`锚点已核` |
+| L-18 | **精确 TTY 臂目前是纯核**（唯一可得的 TTY = 卡片自身 pid 的 TTY ⇒ 循环自证） | `src-tauri/src/window/tty_map.rs:130-132`（「会话级 TTY 证据必须独立于卡片 pid」）+ 模块文档「自证循环」 | 缺**独立的 session↔tty 源**（读链未采 TTY）；Windows 侧采数亦未实现 | 后续批次（先解决独立 TTY 源）；`锚点已核` |
+| L-19 | **`green_card_is_data_driven` 不覆盖 WorkBuddy** ⇒ completed 的 db 行绿卡最长 24h **不自清**（读时不清） | `src-tauri/src/adapter/mod.rs:1832`（函数）、`:674`（调用点）、`:2357-2374`（测试断言 WorkBuddy = `false`） | **产品决策**（要不要让 db 源绿卡随读自清）——不属工程实现范围 | **主线 / 用户裁决**；`锚点已核` |
+| L-20 | **junction 护栏注释的机制表述不精确**（把「交接点在 std 里也算 symlink」写成「交接点同时带目录属性」的因果） | `src-tauri/src/monitor/dsh/mod.rs:943-948` | 仅注释措辞；本批不动（改了要重跑夹具面） | 后续批次（顺手改注释）；`锚点已核` |
+| L-21 | **护栏③（夹具遍历回归锁）在无建链权限的机器上静默跳过 ⇒ 不覆盖真实 junction** | `src-tauri/src/monitor/dsh/mod.rs:1085-1130`（跳过文案 `:1089`：「Windows 建链接需权限，建不出时跳过该断」） | 本机**建不出**链接（见 L-28）；补覆盖需开发者模式/提权或另找判据 | 后续批次 + 环境（见 L-28）；`锚点已核` |
+| L-22 | **逐卡 `eprintln!` 打印真实标题/预览摘录**（仅本地终端，不入库） | `src-tauri/src/monitor/dsh/mod.rs:1326-1335`（`msg={:?} title={:?}`）；夹具目录 `.gitignore` = `src-tauri/tests/fixtures/dsh-v4/.gitignore` | 只读诊断面（本地跑才打印），且真实夹具内容已被 `.gitignore` 挡住入库 | 后续批次（打印前脱敏或改计数）；`锚点已核` |
+| L-23 | **WB 端口指纹最坏 ~16s 且无 TTL 缓存**（8 端口 × 2 探 × 1s） | `src-tauri/src/inject/headless/wb_acp.rs:151-156`、`:575-599` | 端点未启用（L-02）⇒ 本机每回合实际不进入该路径；优化需端点在场才有意义 | 后续批次（随 L-02 一起做）；`锚点已核` |
+| L-24 | **WB 心跳 JSON 被解析两次**（同一次发现里重复读/解析同一文件） | `src-tauri/src/inject/headless/wb_acp.rs:552`（`probe.heartbeat`）、`src-tauri/src/monitor/workbuddy_parser.rs:582`（`heartbeat_snapshot`） | **转述登记**：我只定位到单次调用点，未找出第二处解析；**修前先复验** | 后续批次；`转述登记` |
+| L-25 | **WB 路由报乐观 `injectable:true`**（运行期不可用经回执 `refused` 透出） | `src-tauri/src/inject/routing.rs:156`、`:182-183`（workbuddy → `Headless(WbAcp)`） | 路由表是**静态能力面**（工具级），端点在场与否是**运行期**事实；把后者塞进路由会污染静态表 | 后续批次（若要「路由即真相」，需引入运行期探针缓存）；`锚点已核` |
+| L-26 | **kimi 短旗标形态不可用**（2.1.1 实测：`-p -S <id>` 不可用 ⇒ 实现用长旗标） | `src-tauri/src/inject/headless/cli_three.rs:54`（`KIMI_ARGV_EVIDENCE`）、`:1561-1565`（`kimi_argv`） | **不是遗留而是更正**——登记防后人照旧文档写短旗标 | 维护提示（改 argv 前先读证据常量）；`锚点已核` |
+| L-27 | **zcode Windows 探针必须带 provider env + 非空 `--prompt`** | `src-tauri/src/inject/headless/gate.rs:27`（`PROBE_PROMPT = "hi"`）、`:118-125`（`provider_config_env`） | 同上：已落码的实证结论，登记防回退（空串探针在真机**恒失败**） | 维护提示；`锚点已核` |
+| L-36 | **R9 残余：取消的 spawn 窗口盲区**——取消落在 `run(cfg)` 内部、runner **尚未武装**取消 sink 的那一段（**含并发名额满的 `queued` 早退臂**）→ 闩记「已送达」却不生效（那一发回执按**实际结局**如实上报，可能是 `ok`）——**已登记 issue [#115](https://github.com/jarvislee90s-dot/MultiAgents-Manager/issues/115)，排期下一批**（2026-10-05 用户裁决 27；编号按登记先后，晚于 D 节 L-34/L-35，属工程债类故列本节） | `src-tauri/src/inject/headless/zcode.rs`（`run_turn` 复检臂的「登记的残余」注释段，本轮已补 issue 链接）；根因在 `src-tauri/src/inject/headless/runner.rs`（取消 sink 要到 `run()` 内部、**spawn 之后**才武装——`CancelHandle::cancel` 在此之前恒 `false`） | 修法 = 把 sink 武装**前移到 spawn 之前**（**公共底座**改动，影响所有 spawn 型通道：zcode / codex / kimi / opencode / claude），不在本轮范围；**勿用「跑完后查闩改判 `cancelled`」的错误修法**（会把已跑完的回合谎报成取消——issue 正文已明确拒绝该方案） | **下一批**（issue #115）；定性：毫秒级窗口、后果 = 多跑一发（token 消耗）而**非**数据风险（串行锁与审计不受影响）；`锚点已核` |
+
+### C · 横切：门禁非 hermetic 与环境性失败集（**与功能回归无关，勿混判**）
+
+| # | 项 | 锚点 / 实测 | 为什么没修 | 归属 / 核对 |
+|---|---|---|---|---|
+| L-28 | **junction/symlink 创建在本机被拒**（`PermissionDenied` / 拒绝访问 `os error 5`）⇒ 一大批用例**在 setup 阶段**失败 | 失败集见下；根因 = 本机无建链权限（无管理员、开发者模式注册表键缺席；`mklink /J` 亦拒） | 属**机器权限**，非代码；本批未改 `src/linker`/`src/services`/`src/commands`（**逐文件核对：本批 13 个 commit 在这三棵树里改动 0 个文件**） | 用户/环境：开启 **Windows 开发者模式** 或**提权运行**即可恢复 0 失败门禁；`实跑观测`+`锚点已核` |
+| L-29 | 上条的具体失败集（Task 14 全门禁实跑，**两轮**）：**lib 30 败**（末轮 1750/30/29；首轮 1749/31/29 = 本 30 + L-30 抖动）、**`linker_test` 2 败**（同因）、**`preset_v2_test` 19 败**（15 = 同因；另 4 条见 L-31） | 明细：`services::resource`(9) / `services::tool_settings`(8) / `linker::detector`(5) / `commands::manifest`(4) / `linker::link_health_tests`(2) / `services::pet`(1) / `commands::resource`(1) = 30（与用户独立核验的 30 名**逐名一致**） | 同上 | 用户/环境；`实跑观测` |
+| L-30 | **`inject::approve::tests::probe_version_via_cmd_shim` 载型 flake**：**本批 2 次全量跑中 1 次失败**（首轮），末轮未复现；单例 `--exact` 复跑 **ok（0.04s）** | `src-tauri/src/inject/approve.rs`（该测试） | 载型竞态（并行测试下的时序），非确定性；修法 = 串行锁或注入缝 | 后续批次；`实跑观测` |
+| L-31 | **`preset_v2_test` 的环境失败集比文档记录的更宽**：4 条非建链原因（① `backfill_registry_covers_nested_suite_skills` 注册表回填断言 ② `mcp_import_and_backfill_register_rows` ③ `recover_orphans_reclaims_unledgered_stash_dirs`「暂存区应清空」 ④ `reveal_dir_whitelist_validation_v2m2`「路径不存在: /tmp」= **Windows 无 `/tmp`**） | ①–④ 见 `src-tauri/tests/preset_v2_test.rs`；文档基线 = `docs/release-notes/m6r-m9r-acceptance-checklist.md:500`（「4 名恒定 + 1 名自抖（5/6 之间）」） | ①–③ 疑与本机真实 `~/.mam` 残留状态/并行污染有关（**本批未深挖**）；④ 是平台假设（测试写死 `/tmp`） | 后续批次（①–③ 需在**干净环境**复跑定性；④ 属测试跨平台债）；`实跑观测` |
+| L-32 | **门禁非 hermetic**：`cargo test` 会碰真实 `~/.mam/mam.db`（写路径存在） | `src-tauri/src/database/connection.rs:24,38`（真实库路径）；纪律注释反证：`src-tauri/src/services/resource/mod.rs:368`、`src-tauri/src/remote/pin.rs:150`（「测试禁触」）；另有 1 个既有 `inject::approve` 测试同样触碰 | 需要「测试专用 DB 注入」改造（面大），本批不动 | 后续批次（测试隔离）；`转述登记`+`锚点已核`（**未做**「关闭后台 MAM dev 后单独复现」的定性实验，故不声称已独立证实写行为） |
+| L-33 | **前端套件基线 flaky**（同批代码连跑失败数 0/1/2 抖且名字每次不同） | `docs/release-notes/m6r-m9r-acceptance-checklist.md:500` | 与本批无关（文档已定性）；本批实跑 **84 文件 / 876 用例全过**（本次未抖） | 既有基线债；`实跑观测` |
+
+### D · 范围与后续批次（**不属于本批**）
+
+| # | 项 | 锚点 | 说明 | 归属 |
+|---|---|---|---|---|
+| L-34 | **H13（dsh 写侧 ACP stdio）不在本批** | spec §2 裁决 19 + 本计划文首「范围注记」；spec 附录 B 的 H13 行 = ⬜ | 本批 = H1–H12；H13 是「H13 并入与否」待审阅裁决的项 | 后续批次（C2 余项） |
+| L-35 | **kill 树的「孙进程可达」与 `taskkill` 保底路径无独立证据** | `src-tauri/src/inject/headless/runner.rs:154-330`（Job Object 收编 + `taskkill /T /F` 保底）、`:1343-1380`（真 spawn 用例：**只断言「收编成功 + 子进程消失」，且接受 `JobObject|Taskkill` 两种结局** ⇒ 未钉死走的是哪条路、也未覆盖孙进程） | 真进程树取证需实机多级子进程场景；本批只到「直系子进程必消失」 | Task 15 **M5**（形态级：zcode 进程消失）+ 后续批次（逐形态对照）；`锚点已核` |
+
+**本批未修、但已在计划内更正**的任务书字面（不是遗留，登记为「已更正」防回退）：Task 1 Step 4a 的「projcache 白名单扩到 7」伪修法（见 Task 1 实施记录）、Task 4 的「黄色态」（改中性态）、Task 14 Step 3 的「+ push」（改只提交不 push）、**Task 2 Step 3 的「读取走副本／活库不直查／拷到 tempdir」**（裁决 20 推翻的计划时设计，改「只读连接直连活库」——见 Task 2 Step 3 的 ⚠️ 更正块与文首 Tech Stack；**codex `queue_1.sqlite` 的副本读不在此列**）。
+
+**本批定案（不是遗留，登记防误改）**：**设置类动作的审计走日志、不走 `write_audit` 表**（裁决 23，2026-10-05 复审定案）——无头总开关 `headless_toggled`（`src-tauri/src/remote/mod.rs:147-172` 的 `toggle_headless_core`，生产出口 = `events::audit`）、无头超时/并发两键（`:189-190` 同机制）、以及既有 `channel_toggled` / `pin_set` 全部走 `remote_audit` 日志出口；`write_audit` 是**移动端注入动作账本**（`src-tauri/src/database/schema.rs:176-187`：9 列全 NOT NULL——`ts/device_id/device_name/agent_type/session_id/channel/action/summary/result`，摘要列名 `summary` 而非 `detail`），桌面设置翻转没有 device/session 上下文。**两轨分工不得互改**（任务书原字面 `action='setting'` 指的就是该表，已按既有设置类机制记——偏差见 Task 5 报告）。**事实核对**：`src/mobile` 目前**没有任何审计面**——全目录唯一一处 `audit` 是 `MessageComposer.tsx:144` 的注释（「真实归属需后端审计回传」，是投递归属说明，不是审计页），既无审计页组件也无审计 API 调用；桌面侧的审计页（`src/components/settings/AuditLogSection.tsx` → `inject_list_audit` → `write_audit::recent_conn`）读的正是该表。**前瞻项（非缺口）**：将来若为移动端建审计页，再评估把 `remote_audit` 日志镜像进表，届时重新裁决——不预先改轨。
+

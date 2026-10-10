@@ -47,6 +47,58 @@ pub const KEY_MAX_DEVICES: &str = "remote.max_devices";
 pub const KEY_NAMED_ADDR_LAST: &str = "remote.named_addr_last";
 /// 访问密码键（M5 A2）：4 位数字（validate_pin 唯一口径；A3 端点 / A4 命令消费）
 pub const KEY_ACCESS_PIN: &str = "remote.access_pin";
+/// **无头注入总开关键（H3 / 裁决 10）**：默认关（缺键 = 关），显式开启才放行无头通道；
+/// 值口径与 KEY_ENABLED 同（写侧恒 "true"/"false" 显式两值，读侧只认 "true"）。
+/// 消费方：session-send / session-send-info 的 H3 门（`headless_enabled_conn`）、
+/// `remote_status.headlessEnabled` 下发、设置页「无头注入」开关（`remote_toggle_headless`）。
+/// 裁决 9：**单一总开关**——不做每工具分开关（Task 6 的超时/并发两键同住本区）
+pub const KEY_HEADLESS: &str = "remote.headless_enabled";
+/// H3 关闭态文案（spec H3 逐字）：移动端输入区置灰的原因——send-info 的 reason 原样透出
+pub const HEADLESS_DISABLED_REASON: &str = "无头通道未开启，请在电脑端 MAM 设置中开启";
+/// **无头 watchdog 超时键（H4 / Task 6）**：毫秒，默认 [`DEFAULT_HEADLESS_TIMEOUT_MS`]
+/// （600000 = 裁决 15 定值）。值口径与其余数值键同：写侧恒十进制字符串、读侧
+/// 缺键/乱串回默认、越界 clamp（1_000..=3_600_000，数字单点在 `inject::headless`）。
+/// 消费方：设置页「无头」子区超时控件、`remote_status.headlessTimeoutMs` 下发、
+/// runner 启动读取（`headless::HeadlessLimits::from_conn`）。
+pub const KEY_HEADLESS_TIMEOUT_MS: &str = "remote.headless_timeout_ms";
+/// **无头全局并发上限键（H4 / Task 6）**：默认 [`DEFAULT_HEADLESS_CONCURRENCY`]（2），
+/// clamp 1..=8。超额请求即时排队（回执含全局队列位置），不静默丢也不阻塞死等。
+pub const KEY_HEADLESS_CONCURRENCY: &str = "remote.headless_concurrency";
+/// watchdog 默认超时（数字单点在 `inject::headless`，此处只做别名导出防两处漂移）
+pub const DEFAULT_HEADLESS_TIMEOUT_MS: u64 = crate::inject::headless::DEFAULT_TIMEOUT_MS;
+/// 全局并发上限默认值（同上）
+pub const DEFAULT_HEADLESS_CONCURRENCY: usize = crate::inject::headless::DEFAULT_CONCURRENCY;
+
+/// 无头超时解析（纯函数）：缺键/乱串 → 默认 600000；越界 → clamp（不报错——与
+/// `max_devices_from` 的容错口径一致，设置页非法输入不致通道不可用）
+pub fn headless_timeout_ms_from(v: Option<&str>) -> u64 {
+    match v.map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
+        Some(n) => crate::inject::headless::clamp_timeout_ms(n),
+        None => DEFAULT_HEADLESS_TIMEOUT_MS,
+    }
+}
+
+/// 无头并发上限解析（纯函数）：缺键/乱串 → 默认 2；越界 → clamp 1..=8
+pub fn headless_concurrency_from(v: Option<&str>) -> usize {
+    match v.map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) => crate::inject::headless::clamp_concurrency(n),
+        None => DEFAULT_HEADLESS_CONCURRENCY,
+    }
+}
+
+/// 无头超时读取（store 缝版本；runner 启动与状态下发共用）
+pub fn headless_timeout_ms_conn(conn: &rusqlite::Connection) -> u64 {
+    headless_timeout_ms_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_HEADLESS_TIMEOUT_MS).as_deref(),
+    )
+}
+
+/// 无头并发上限读取（store 缝版本；同上）
+pub fn headless_concurrency_conn(conn: &rusqlite::Connection) -> usize {
+    headless_concurrency_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_HEADLESS_CONCURRENCY).as_deref(),
+    )
+}
 
 /// 上限解析（纯函数）：None/乱串 → 10（M5 A5 用户裁决：默认 3 → 10；已存值不迁移）；
 /// clamp 1..=10 不变
@@ -67,6 +119,147 @@ fn max_devices_from_kv() -> usize {
 // 同 monitor/git.rs 先例。tailscale 通道开着时轮询每 5–60s 一次 CLI 探测
 // （status.rs run_cli），漏加就是用户看到的「连环黑色终端弹窗」。
 // remote 模块所有 spawn 点统一走这里，调用点不用 #[cfg] 门控（非 Windows no-op）。
+// H3 无头总开关（默认关）：解析 + 读取缝
+// ============================================================
+
+/// 无头开关解析（纯函数）：仅 `"true"` 为开——缺键（未设置 = 默认关，裁决 10）/
+/// `"false"` / 乱串一律判关（与 KEY_ENABLED 的 `v == "true"` 同口径，不认第二真值）
+pub fn headless_enabled_from(v: Option<&str>) -> bool {
+    v == Some("true")
+}
+
+/// 无头开关读取（**store 缝版本**，两个 H3 门共用）：直用调用方 `DeviceStore.with`
+/// 短临界区传入的 conn（不自取任何锁，锁内只做这一条 SQL + 纯解析）。生产
+/// `DeviceStore::Global` = 全局 DB 同锁同连接，语义与直读 settings KV 完全一致；
+/// 测试经 `DeviceStore::memory()` 自建库 seed —— 零接触真实 ~/.tuvis
+/// （同 `inject::approve::load_mappings_conn` 的缝模式）
+pub fn headless_enabled_conn(conn: &rusqlite::Connection) -> bool {
+    headless_enabled_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_HEADLESS).as_deref(),
+    )
+}
+
+/// **无头状态下发装配（可测缝）**：从注入的连接读开关 + H4 两项配置并写入 status
+/// 载荷——键名与取值口径的唯一落点（H3：开关状态持久化 settings 表并随 `remote_status`
+/// 下发；H4：watchdog 超时与并发上限随「无头」子区同住，三件套控件同一数据源）。
+/// 生产 = `DeviceStore::global()` 的 conn（与门**同一条读取路径**，杜绝「状态显示开、
+/// 门却判关」的双轨漂移）；测试 = `memory_conn()` 自建库（零接触真实 ~/.tuvis/tuvis.db）。
+pub fn apply_headless_status(st: &mut serde_json::Value, conn: &rusqlite::Connection) {
+    st["headlessEnabled"] = serde_json::json!(headless_enabled_conn(conn));
+    // H4：缺键也上线默认值（前端三件套控件不出现 undefined）
+    st["headlessTimeoutMs"] = serde_json::json!(headless_timeout_ms_conn(conn));
+    st["headlessConcurrency"] = serde_json::json!(headless_concurrency_conn(conn));
+}
+
+/// 无头开关内核（**可测核**；conn 与审计出口以参数注入——对齐 [`toggle_core`] /
+/// `toggle_channel_core` 的既有可测核模式）：写设置 SSOT → 审计留痕 → 广播状态变更。
+/// 生产薄壳 = [`remote_toggle_headless`]；测试直驱本内核 + 内存库 + 记录型审计闭包。
+///
+/// **审计口径**：走 `events::audit`（`remote_audit` 日志出口）——与既有设置类动作
+/// （`channel_toggled` / `pin_set`）同机制；动作词按既有词表形态取 `headless_toggled`
+/// （对齐 `channel_toggled`），detail 保留计划书的 `headless=<v>`。计划书字面的
+/// `action='setting'` 指的是 write_audit 表（移动端注入账本：9 列全 NOT NULL、含
+/// device/session 上下文，摘要列名 `summary` 而非 `detail`）——桌面设置翻转不落该表，
+/// 故按既有机制记（偏差见 Task 5 报告）。
+fn toggle_headless_core(
+    conn: &rusqlite::Connection,
+    enabled: bool,
+    audit: impl FnOnce(&str, &str),
+) {
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_HEADLESS,
+        if enabled { "true" } else { "false" },
+    );
+    audit("headless_toggled", &format!("headless={enabled}"));
+    events::emit_ui(
+        "remote-changed",
+        serde_json::json!({ "headlessEnabled": enabled }),
+    );
+}
+
+/// 无头注入总开关翻转（H3 / 裁决 10：默认关，显式开启；裁决 9：单一总开关，不做每
+/// 工具分开关）。薄壳：注入全局 store 的 conn 后直驱 [`toggle_headless_core`]。
+///
+/// **本命令无进程动作**：无头 runner 的 spawn/回收归 Task 6（H4）；此处只翻转 KV，
+/// 让门与状态即刻生效（emit 的 remote-changed 供设置页/移动端即时刷新）。
+#[tauri::command]
+pub fn remote_toggle_headless(enabled: bool) -> Result<(), String> {
+    pairing::DeviceStore::global().with(|c| toggle_headless_core(c, enabled, events::audit));
+    Ok(())
+}
+
+/// 无头配置写入内核（**可测核**；与 [`toggle_headless_core`] 同模式：conn 与审计出口
+/// 参数注入）：两键 clamp 后落 KV → 审计留痕 → 广播状态变更。越界值**收进区间再落库**
+/// （runner 侧永不拿到 0/超界——否则 watchdog 即刻到点或所有请求永久排队）。
+///
+/// **审计口径**：与 `headless_toggled` 同机制（`events::audit` 日志出口，非 write_audit
+/// 表——桌面设置动作不落移动端注入账本，理由见 [`toggle_headless_core`]）。
+fn set_headless_limits_core(
+    conn: &rusqlite::Connection,
+    timeout_ms: u64,
+    concurrency: usize,
+    audit: impl FnOnce(&str, &str),
+) {
+    let timeout_ms = crate::inject::headless::clamp_timeout_ms(timeout_ms);
+    let concurrency = crate::inject::headless::clamp_concurrency(concurrency);
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_HEADLESS_TIMEOUT_MS,
+        &timeout_ms.to_string(),
+    );
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_HEADLESS_CONCURRENCY,
+        &concurrency.to_string(),
+    );
+    // **改设置即生效**（H4「可配」不是摆设）：并发上限立刻落到全局名额。
+    // 超时是回合属性——下一回合由端点经 `headless::runner_from_conn` 读取。
+    crate::inject::headless::apply_limits_to(conn, &crate::inject::headless::runner::global_sem());
+    audit(
+        "headless_limits_set",
+        &format!("timeoutMs={timeout_ms} concurrency={concurrency}"),
+    );
+    events::emit_ui(
+        "remote-changed",
+        serde_json::json!({
+            "headlessTimeoutMs": timeout_ms,
+            "headlessConcurrency": concurrency,
+        }),
+    );
+}
+
+/// 无头配置写入（H4 配置落点：设置页「无头」子区的超时 + 并发上限两件）。
+/// 薄壳：注入全局 store 的 conn 后直驱 [`set_headless_limits_core`]。越界值不报错、
+/// 按区间 clamp 落库（前端输入框的 min/max 只是提示，后端是唯一口径）。
+#[tauri::command]
+pub fn remote_set_headless_limits(timeout_ms: u64, concurrency: usize) -> Result<(), String> {
+    pairing::DeviceStore::global()
+        .with(|c| set_headless_limits_core(c, timeout_ms, concurrency, events::audit));
+    Ok(())
+}
+
+/// **H4 配置启动装配**（`lib.rs` setup 调用一次）：把设置里的超时/并发落到运行期——
+/// 并发上限写进全局名额（[`crate::inject::headless::runner::global_sem`]），runner 每回合
+/// 经 `headless::runner_from_conn` 读超时。缺键 = 默认 2 / 600000（裁决 15）。
+/// **不做这一步**，进程启动后 `GLOBAL_SEM` 会一直是代码里的默认 2、runner 一直跑默认
+/// 600s——设置页两个控件就只是摆设（评审 Important 3 的根因）。
+pub fn init_headless_limits() {
+    pairing::DeviceStore::global().with(|c| {
+        let limits = crate::inject::headless::apply_limits_to(
+            c,
+            &crate::inject::headless::runner::global_sem(),
+        );
+        log::info!(
+            "无头配置装配：watchdog={}ms 并发上限={}",
+            limits.timeout_ms,
+            limits.concurrency
+        );
+    });
+}
+
+// ============================================================
+// 三通道独立开关（M5 A5）：KV + 惰性迁移 + bind 派生
 // ============================================================
 
 // 非 Windows 构建：NoWindow impl 整体编译裁掉（下方两个 impl 均 #[cfg(windows)]），
@@ -309,6 +502,10 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
                 Vec::new()
             }
         }),
+        // L13（C0-③）靶向证据源：候选进程（共享快照，与卡片同源同轮）+ 候选 TTY 采数
+        // （macOS ps）+ **恒 None 的会话级 TTY 证据**（卡片 pid 的 TTY 是自证循环，
+        // 见 window::tty_map 模块文档——生产两平台都走拒绝臂）
+        target_evidence: Box::new(crate::window::tty_map::tool_target_evidence),
         store: pairing::DeviceStore::global(),
         // M7 Task 5（方案 A）：注入器生产装配——消费方 flush_one / session-send 直发；
         // Task 6 已接线：api_router 注册 session-send 等路由 + serve() 挂 spawn_flush_loop
@@ -1020,6 +1217,10 @@ pub fn remote_status() -> serde_json::Value {
     st["enabled"] = serde_json::json!(enabled);
     // 设备上限（线稿「已接入设备 N / 上限」徽标；KV 可改，未设置默认 10——决策 #17）
     st["maxDevices"] = serde_json::json!(max_devices_from_kv());
+    // H3：无头注入总开关状态下发（设置页开关初值 + 移动端置灰判据；缺键 = 默认关）。
+    // 经可测缝 apply_headless_status（与门同一条读取路径）；Task 6 起同缝一并下发
+    // H4 的 watchdog 超时与并发上限（「无头」子区三件套 = 开关 + 超时 + 并发）
+    pairing::DeviceStore::global().with(|c| apply_headless_status(&mut st, c));
     // M5 A5：通道开关（read_channels 含惰性迁移）+ 隧道双通道快照 + tailscale 快照
     let chans = read_channels();
     let tun = tunnel::snapshot();
@@ -1430,7 +1631,10 @@ pub fn remote_set_pin(pin: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 设备重命名内核（可测核心，DAO 注入）：trim 后空 → Err（不触 DAO）；DAO 未命中
+/// 设备重命名内核（可测核心，DAO 注入）：trim 后空 → Err（不触 DAO）；**花名含命令行不安全
+/// 字符 → Err（不触 DAO——判据本体 = 唯一决策点
+/// [`crate::inject::headless::turn::device_name_refusal`]，错误码与原因文案与配对登记点
+/// 同一份：裁决 26 的对称性要求「错误在改名时浮出，不拖到投递时」）**；DAO 未命中
 /// （返回 false）→ Err 404 语义；命中 → Ok。40 字截断收敛在 DAO（A1 自守，与
 /// /pair/pin 设备自报名同一口径），本层不重复截断
 fn rename_device_core(
@@ -1442,6 +1646,15 @@ fn rename_device_core(
     if name.is_empty() {
         return Err("设备名称不能为空".to_string());
     }
+    // 花名白名单（裁决 24b 判据的**第三落点**；裁决 26 收口上一轮「改名不加门」的取舍）：
+    // **在触 DAO 之前**拒，错误码/原因文案与配对登记点共用（同一判据、同一句话）；
+    // 原因只点名具体字符，**不回写危险花名原文**（本路径不落任何含花名的日志）
+    if let Some(reason) = crate::inject::headless::turn::device_name_refusal(name) {
+        return Err(format!(
+            "{}: {reason}",
+            crate::inject::headless::turn::DEVICE_NAME_UNSAFE_CODE
+        ));
+    }
     if rename(name)? {
         Ok(())
     } else {
@@ -1449,7 +1662,8 @@ fn rename_device_core(
     }
 }
 
-/// 设备重命名（M5 A4，桌面端保存）：空名拒绝；未命中 404 语义；超 40 字由 DAO 截断
+/// 设备重命名（M5 A4，桌面端保存）：空名拒绝；**危险花名拒绝（裁决 26：同码同文案，
+/// 见 `device_name_refusal` 的调用点节）**；未命中 404 语义；超 40 字由 DAO 截断
 #[tauri::command]
 pub fn remote_rename_device(id: String, name: String) -> Result<(), String> {
     let st = STATE.clone();
@@ -1905,7 +2119,243 @@ mod tests {
         assert_eq!(KEY_PORT, "remote.port");
         assert_eq!(KEY_PUBLIC_ACK, "remote.public_ack");
         assert_eq!(KEY_HOST_NAME, "remote.host_name");
+        // H3 无头总开关：设置表持久化键（前端设置页 + 门 + 状态装配三方共用）
+        assert_eq!(KEY_HEADLESS, "remote.headless_enabled");
         assert_eq!(DEFAULT_PORT, 9420);
+    }
+
+    /// H3：无头开关解析口径（纯函数）——**缺键 = 默认关**（裁决 10），只认 "true"；
+    /// "false"/乱串/空串一律判关（与 KEY_ENABLED 同口径，不认第二真值）
+    #[test]
+    fn headless_enabled_parsing_defaults_off() {
+        assert!(!headless_enabled_from(None), "缺键 = 默认关（裁决 10）");
+        assert!(!headless_enabled_from(Some("false")));
+        assert!(headless_enabled_from(Some("true")));
+        for junk in ["1", "TRUE", "True", "yes", "on", "", " true"] {
+            assert!(!headless_enabled_from(Some(junk)), "乱串一律判关：{junk:?}");
+        }
+    }
+
+    /// H3：store 缝读取（session-send 门 / send-info 置灰 / remote_status 三方共用）——
+    /// 内存库缺键判关，显式 "true" 判开
+    #[test]
+    fn headless_enabled_conn_reads_memory_store() {
+        let conn = memory_conn();
+        assert!(!headless_enabled_conn(&conn), "空库 = 缺键 = 默认关");
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "true");
+        assert!(headless_enabled_conn(&conn));
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "false");
+        assert!(!headless_enabled_conn(&conn), "显式关同样判关");
+    }
+
+    /// H3：**状态下发**（spec H3「开关状态持久化 settings 表并随 remote_status 下发」）
+    /// ——装配缝 `apply_headless_status` 直驱内存库，断言 status 载荷**开/关两态**都带
+    /// `headlessEnabled`（键存在且布尔正确）。`remote_status()` 本体读全局库+端口+隧道
+    /// 快照，无法在单测里跑（会触真实 ~/.tuvis）；故此处锁的是它内部唯一的装配缝
+    /// （生产薄壳只做 `DeviceStore::global().with(|c| apply_headless_status(&mut st, c))`
+    /// ——同一函数、同一读取路径）
+    #[test]
+    fn status_payload_carries_headless_enabled_both_ways() {
+        let conn = memory_conn();
+        // 缺键（默认态）：字段必须在（前端开关初值 + 移动端置灰判据都读它），值为 false
+        let mut st = serde_json::json!({ "enabled": true });
+        apply_headless_status(&mut st, &conn);
+        assert!(
+            st.get("headlessEnabled").is_some(),
+            "status 载荷必须带 headlessEnabled 键（缺键即前端拿不到开关态）：{st}"
+        );
+        assert_eq!(st["headlessEnabled"], serde_json::json!(false));
+        // 显式开：同键翻转 true
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "true");
+        let mut st = serde_json::json!({ "enabled": true });
+        apply_headless_status(&mut st, &conn);
+        assert_eq!(st["headlessEnabled"], serde_json::json!(true));
+        // 显式关：回到 false（不残留上一拍真值）
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "false");
+        let mut st = serde_json::json!({ "headlessEnabled": true });
+        apply_headless_status(&mut st, &conn);
+        assert_eq!(st["headlessEnabled"], serde_json::json!(false));
+    }
+
+    /// H3：**开关翻转写路径**（Minor 3）——可测核 `toggle_headless_core` 直驱内存库 +
+    /// 记录型审计闭包：断言**两个方向**都写 KV（门/状态随即读到新值）且都发审计
+    /// （action=headless_toggled，detail=headless=<v>；生产出口 = events::audit，
+    /// 与既有 channel_toggled 同机制）
+    #[test]
+    fn toggle_headless_core_writes_kv_and_audits_both_directions() {
+        let conn = memory_conn();
+        let mut audits: Vec<(String, String)> = Vec::new();
+        // 开
+        toggle_headless_core(&conn, true, |a, d| audits.push((a.into(), d.into())));
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_HEADLESS).as_deref(),
+            Some("true"),
+            "开启必须落库为显式 \"true\""
+        );
+        assert!(
+            headless_enabled_conn(&conn),
+            "落库值经门/状态同一条读取路径可见"
+        );
+        // 关
+        toggle_headless_core(&conn, false, |a, d| audits.push((a.into(), d.into())));
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_HEADLESS).as_deref(),
+            Some("false"),
+            "关闭必须落库为显式 \"false\"（不删键：缺键与显式关同判关，但写侧恒两值）"
+        );
+        assert!(!headless_enabled_conn(&conn));
+        assert_eq!(
+            audits,
+            vec![
+                ("headless_toggled".to_string(), "headless=true".to_string()),
+                ("headless_toggled".to_string(), "headless=false".to_string()),
+            ],
+            "两个方向各一条审计（action/detail 口径固定）"
+        );
+    }
+
+    /// H4（Task 6）：无头配置两键——键名固定 + 解析口径（缺键/乱串 → 默认；越界 clamp）
+    #[test]
+    fn headless_limit_keys_and_parsing_are_pinned() {
+        assert_eq!(KEY_HEADLESS_TIMEOUT_MS, "remote.headless_timeout_ms");
+        assert_eq!(KEY_HEADLESS_CONCURRENCY, "remote.headless_concurrency");
+        assert_eq!(DEFAULT_HEADLESS_TIMEOUT_MS, 600_000, "裁决 15 定值");
+        assert_eq!(DEFAULT_HEADLESS_CONCURRENCY, 2, "H4 定值");
+        assert_eq!(headless_timeout_ms_from(None), 600_000, "缺键 = 默认 600s");
+        assert_eq!(headless_timeout_ms_from(Some("120000")), 120_000);
+        for junk in ["", "abc", "10s", "-5", "1e6", " 12 000"] {
+            assert_eq!(
+                headless_timeout_ms_from(Some(junk)),
+                DEFAULT_HEADLESS_TIMEOUT_MS,
+                "乱串回默认：{junk:?}"
+            );
+        }
+        assert_eq!(headless_timeout_ms_from(Some("0")), 1_000, "0 收到下界");
+        assert_eq!(headless_timeout_ms_from(Some("99999999")), 3_600_000);
+        assert_eq!(headless_concurrency_from(None), 2);
+        assert_eq!(headless_concurrency_from(Some("3")), 3);
+        assert_eq!(headless_concurrency_from(Some("abc")), 2);
+        assert_eq!(
+            headless_concurrency_from(Some("0")),
+            1,
+            "0 会让所有请求永久排队"
+        );
+        assert_eq!(headless_concurrency_from(Some("100")), 8);
+    }
+
+    /// H4：store 缝读取（runner 启动 + 状态下发**同一条路径**）——空库取默认，
+    /// 写键即生效，且 `HeadlessLimits::from_conn`（runner 侧）与之一致
+    #[test]
+    fn headless_limits_conn_reads_memory_store() {
+        let conn = memory_conn();
+        assert_eq!(headless_timeout_ms_conn(&conn), DEFAULT_HEADLESS_TIMEOUT_MS);
+        assert_eq!(
+            headless_concurrency_conn(&conn),
+            DEFAULT_HEADLESS_CONCURRENCY
+        );
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS_TIMEOUT_MS, "90000");
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS_CONCURRENCY, "5");
+        assert_eq!(headless_timeout_ms_conn(&conn), 90_000);
+        assert_eq!(headless_concurrency_conn(&conn), 5);
+        let limits = crate::inject::headless::HeadlessLimits::from_conn(&conn);
+        assert_eq!(limits.timeout_ms, 90_000, "runner 启动读取须同路径");
+        assert_eq!(limits.concurrency, 5);
+        // 乱串落库（手改 DB）同样回默认，不让 runner 拿到 0
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS_CONCURRENCY, "junk");
+        assert_eq!(
+            headless_concurrency_conn(&conn),
+            DEFAULT_HEADLESS_CONCURRENCY
+        );
+    }
+
+    /// H4：**状态下发带两键**（前端三件套控件的数据源）——缺键上线默认值，
+    /// 显式值上线显式值（不残留上一拍真值）
+    #[test]
+    fn status_payload_carries_headless_limits_both_ways() {
+        let conn = memory_conn();
+        let mut st = serde_json::json!({ "enabled": true });
+        apply_headless_status(&mut st, &conn);
+        assert_eq!(st["headlessTimeoutMs"], serde_json::json!(600_000));
+        assert_eq!(st["headlessConcurrency"], serde_json::json!(2));
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS_TIMEOUT_MS, "120000");
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS_CONCURRENCY, "3");
+        let mut st = serde_json::json!({
+            "headlessTimeoutMs": 600_000,
+            "headlessConcurrency": 2
+        });
+        apply_headless_status(&mut st, &conn);
+        assert_eq!(st["headlessTimeoutMs"], serde_json::json!(120_000));
+        assert_eq!(st["headlessConcurrency"], serde_json::json!(3));
+    }
+
+    /// H4：**写入内核**——两键落库（越界值 clamp 后落）+ 审计（log 通道，同
+    /// `channel_toggled`/`headless_toggled` 机制）
+    #[test]
+    fn set_headless_limits_core_writes_kv_and_audits() {
+        let conn = memory_conn();
+        let mut audits: Vec<(String, String)> = Vec::new();
+        set_headless_limits_core(&conn, 120_000, 3, |a, d| audits.push((a.into(), d.into())));
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_HEADLESS_TIMEOUT_MS)
+                .as_deref(),
+            Some("120000")
+        );
+        assert_eq!(
+            crate::database::dao::settings::get_setting_conn(&conn, KEY_HEADLESS_CONCURRENCY)
+                .as_deref(),
+            Some("3")
+        );
+        assert_eq!(headless_timeout_ms_conn(&conn), 120_000);
+        assert_eq!(headless_concurrency_conn(&conn), 3);
+        // 越界值：clamp 后落库（配置面与 runner 面永不看到 0/超界）
+        set_headless_limits_core(&conn, 0, 0, |a, d| audits.push((a.into(), d.into())));
+        assert_eq!(headless_timeout_ms_conn(&conn), 1_000);
+        assert_eq!(headless_concurrency_conn(&conn), 1);
+        assert_eq!(
+            audits,
+            vec![
+                (
+                    "headless_limits_set".to_string(),
+                    "timeoutMs=120000 concurrency=3".to_string()
+                ),
+                (
+                    "headless_limits_set".to_string(),
+                    "timeoutMs=1000 concurrency=1".to_string()
+                ),
+            ],
+            "写入必须留痕（action/detail 口径固定），且 detail 记 clamp 后的实值"
+        );
+    }
+
+    /// 评审 Important 3：H4「可配」必须**真生效**——写入内核把并发上限落到全局名额
+    /// （不是只写 KV 让 `GLOBAL_SEM` 永远停在默认 2）。
+    /// 持 `HEADLESS_CAP_TEST_LOCK`：本测改**进程级单例**名额，与 headless 侧同型用例
+    /// （runner 启动装配）互斥串行——同 `LOOP_HANDLE_TEST_LOCK` 的既有先例（独占资源
+    /// 方案，替代重试启发式），避免并行断言窗口交错。
+    #[test]
+    fn set_headless_limits_core_applies_concurrency_to_global_sem() {
+        let _serial = crate::inject::headless::HEADLESS_CAP_TEST_LOCK
+            .lock()
+            .unwrap();
+        let conn = memory_conn();
+        set_headless_limits_core(&conn, 120_000, 3, |_, _| {});
+        assert_eq!(
+            crate::inject::headless::runner::global_sem().cap(),
+            3,
+            "改设置即生效：全局名额必须随之上调"
+        );
+        set_headless_limits_core(&conn, 120_000, 1, |_, _| {});
+        assert_eq!(
+            crate::inject::headless::runner::global_sem().cap(),
+            1,
+            "下调同样即时生效（已在飞者不打断，自然退出即回落）"
+        );
+        // 复位进程级单例，别把 1 留给后续用例
+        crate::inject::headless::runner::global_sem().set_cap(DEFAULT_HEADLESS_CONCURRENCY);
+        assert_eq!(
+            crate::inject::headless::runner::global_sem().cap(),
+            DEFAULT_HEADLESS_CONCURRENCY
+        );
     }
 
     // ==== Task 4 生命周期接线：纯逻辑测试 ====
@@ -3067,6 +3517,81 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored, "甲".repeat(40), "DAO 40 字截断贯穿命令内核");
+    }
+
+    /// 重命名内核（**裁决 26 收口**）：花名含命令行不安全字符 → `Err` 且**不触 DAO**。
+    ///
+    /// 判据本体 = 唯一决策点 [`crate::inject::headless::turn::device_name_refusal`]（与配对
+    /// 登记点、组装单点**同一份**，本层不另写白名单）；错误形制与配对点同码
+    /// （`device_name_unsafe` + 同一句原因文案）——**在改名时**就拒，不拖到投递时才炸。
+    /// 另钉住：错误文案**不回写危险花名原文**（只点名具体字符）。
+    #[test]
+    fn rename_device_core_unsafe_name_rejected_without_dao_call() {
+        for bad in ["小明的手机📱", "a&b", "iPhone\n15"] {
+            let r = rename_device_core("d1", bad, |_| panic!("危险花名 {bad:?} 不得触 DAO"));
+            let e = r.expect_err("危险花名必须拒绝");
+            assert!(
+                e.starts_with("device_name_unsafe:"),
+                "错误必须与配对登记点同码（device_name_unsafe）: {e}"
+            );
+            assert!(
+                e.contains("命令行不安全字符"),
+                "原因文案复用 device_name_refusal 的输出: {e}"
+            );
+            assert!(
+                !e.contains(bad),
+                "错误文案不得回写危险花名原文（只点名具体字符）: {e}"
+            );
+        }
+    }
+
+    /// 重命名内核（裁决 26）：危险花名被拒后**库里旧名原样**（端到端内存库）——
+    /// 拒绝发生在 DAO 之前，故不存在「半写」形态
+    #[test]
+    fn rename_device_core_unsafe_name_leaves_db_name_unchanged() {
+        let conn = memory_conn();
+        let now = chrono::Utc::now().timestamp_millis();
+        pairing::persist_device(&conn, &synth_device("rn_bad", now)).unwrap();
+        let old: String = conn
+            .query_row(
+                "SELECT name FROM remote_devices WHERE id = 'rn_bad'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let r = rename_device_core("rn_bad", "小明的手机📱", |n| {
+            pairing::rename_device(&conn, "rn_bad", n)
+        });
+        assert!(r.is_err(), "危险花名必须拒绝");
+        let stored: String = conn
+            .query_row(
+                "SELECT name FROM remote_devices WHERE id = 'rn_bad'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, old, "拒绝后旧名必须原样（不得半写）");
+    }
+
+    /// 重命名内核（裁决 26 对照）：正常花名照常放行——**中文**（Unicode 字母）与白名单内
+    /// 点缀字符（空格 `-` `_` `.` `·`）都过；端到端内存库验证落库值
+    #[test]
+    fn rename_device_core_accepts_normal_and_chinese_names_end_to_end() {
+        let conn = memory_conn();
+        let now = chrono::Utc::now().timestamp_millis();
+        pairing::persist_device(&conn, &synth_device("rn_ok", now)).unwrap();
+        for good in ["小明的手机", "  iPhone 15 Pro·Max  ", "客厅-平板_2"] {
+            rename_device_core("rn_ok", good, |n| pairing::rename_device(&conn, "rn_ok", n))
+                .unwrap_or_else(|e| panic!("正常花名 {good:?} 必须放行: {e}"));
+            let stored: String = conn
+                .query_row(
+                    "SELECT name FROM remote_devices WHERE id = 'rn_ok'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, good.trim(), "正常花名落库（trim 后）");
+        }
     }
 
     /// 花名册与远程开关态解耦（Mac 报告七-6 定案锁）：关闭远程（SSE 注册表空、

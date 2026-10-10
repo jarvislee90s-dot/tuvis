@@ -516,6 +516,46 @@ pub fn all_adapters_with_ids() -> Vec<(&'static str, Box<dyn AgentAdapter>)> {
 /// 共享 System 实例 — 每轮询周期刷新一次，所有 adapter 共用
 static SHARED_SYSTEM: Mutex<Option<System>> = Mutex::new(None);
 
+/// 进程刷新规格（**唯一事实源**：`get_all_sessions_inner` 与
+/// [`with_shared_processes`] 共用，防两处规格漂移导致候选/卡片口径不一）
+fn process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .with_cmd(sysinfo::UpdateKind::Always)
+        .with_cwd(sysinfo::UpdateKind::Always)
+        // exe 路径是 Windows MSIX 形态判定（classify_form）的关键输入：
+        // 缺失时 ChatGPT 内嵌 codex.exe 会被误判为 CLI（提权进程 cmd 也读不到）
+        .with_exe(sysinfo::UpdateKind::Always)
+        .with_cpu()
+}
+
+/// 新建进程快照（按 [`process_refresh_kind`] 规格一次性填充）
+fn new_process_system() -> System {
+    System::new_with_specifics(RefreshKind::nothing().with_processes(process_refresh_kind()))
+}
+
+/// 共享进程快照的**只读借用**（进程发现口径单源）。借用期间只做内存匹配——
+/// **不得做文件 I/O、不得取 DB 锁**（与 `get_all_sessions` 的锁纪律同款：Phase 1 持
+/// 锁刷进程、Phase 2 放锁做文件 I/O）。快照由读侧每轮 `get_all_sessions` 刷新。
+///
+/// **不初始化**：快照从未建立（`None`）→ 返回 `None`，调用方按「无进程表可判」降级
+/// （L13 靶向闸 = 候选为空 → 放行，即修复前行为）。**会等刷新**（读侧正在扫描时阻塞
+/// 至该轮完成，而非 try_lock 失败即降级）：候选判定不得因「恰逢刷新」而静默失效——
+/// 生产路径上调用方（`inject::queue`）刚经 `session_source`（= 本函数同源的
+/// `get_all_sessions`）取到会话，快照必然已建立，故 `None` 只出现在测试注入源等
+/// 非生产形态。
+///
+/// 不初始化的理由：写侧不该替读侧建状态，且**注入 in-flight 守卫内**不得做全表刷新
+/// （首次初始化的全表扫会拉长守卫占用；实测把既有「裸会话 id 撞 INFLIGHT 键」的测试
+/// 假红（repo 已知缺口）从偶发推成必发——该缺口的正解是测试 id 立规，见
+/// `remote::server` 的 send 族独占会话）。
+///
+/// 消费方：L13 靶向闸（`window::tty_map::cwd_candidate_pids`）——候选集必须与读侧
+/// 卡片同一份进程口径（同源铁律），新鲜度与卡片同轮（最长一轮轮询龄）。
+pub(crate) fn with_shared_processes<R>(f: impl FnOnce(&System) -> R) -> Option<R> {
+    let guard = SHARED_SYSTEM.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(f)
+}
+
 /// get_all_sessions 单飞护栏（评审 R3）：主窗口与桌宠各自 3s 轮询，相位接近时
 /// 两请求并发进入同一段多秒扫描——堆叠放大 CPU/IO 峰值。try_lock 抢扫描权，
 /// 抢不到的请求立即返回最近一次快照（0=尚无快照时返回空响应，首窗口可接受）。
@@ -594,27 +634,9 @@ fn get_all_sessions_inner() -> SessionsResponse {
         let mut guard = SHARED_SYSTEM.lock().unwrap();
         let system = guard.get_or_insert_with(|| {
             log::debug!("Initializing shared System instance");
-            System::new_with_specifics(
-                RefreshKind::nothing().with_processes(
-                    ProcessRefreshKind::nothing()
-                        .with_cmd(sysinfo::UpdateKind::Always)
-                        .with_cwd(sysinfo::UpdateKind::Always)
-                        // exe 路径是 Windows MSIX 形态判定（classify_form）的关键输入：
-                        // 缺失时 ChatGPT 内嵌 codex.exe 会被误判为 CLI（提权进程 cmd 也读不到）
-                        .with_exe(sysinfo::UpdateKind::Always)
-                        .with_cpu(),
-                ),
-            )
+            new_process_system()
         });
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing()
-                .with_cmd(sysinfo::UpdateKind::Always)
-                .with_cwd(sysinfo::UpdateKind::Always)
-                .with_exe(sysinfo::UpdateKind::Always)
-                .with_cpu(),
-        );
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, process_refresh_kind());
 
         adapters.iter().map(|a| a.find_processes(system)).collect()
     }; // 释放 System 锁 — 下方文件 I/O 无需持锁

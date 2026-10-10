@@ -36,6 +36,6 @@ mod tests {
     #[test]
     fn audit_writes_log_line() {
         // 审计出口不 panic（真实留痕由 remote_audit target 的日志侧验证）
-        audit("pair_pin_ok", "via=lan ip=127.0.0.1");
+        audit("pair_pin_verified", "via=lan ip=127.0.0.1");
     }
 }
