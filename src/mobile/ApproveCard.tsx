@@ -130,14 +130,6 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
   // 手动「检查终端对话框」按钮同样保留。sent 后不再轮询（终态）。handleCheck 定义
   // 在下方——经 ref 间接调用（本 effect 声明在前）。
   const handleCheckRef = useRef<(() => void) | null>(null);
-  useEffect(() => {
-    if (!degraded || sent) return;
-    const t = window.setInterval(() => {
-      handleCheckRef.current?.();
-    }, 2500);
-    return () => window.clearInterval(t);
-  }, [degraded, sent]);
-
   // 挂载拉取一次选项可用性；拉取失败 → 静默保持隐藏。
   // ready 只表示「载荷已落地」（available/reason 的分诊移到渲染侧——严格档
   // available=false + reason 也要渲染提示条，不能拿 available 当 ready）
@@ -168,9 +160,12 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
     try {
       const v = await fetchApproveOptions(session.id);
       setOptions(v);
-      // 仍未读到选项（planPending 仍立且无 dialog）→ 明示未命中，不假装成功
+      // 仍未读到选项 → 明示未命中，不假装成功。两个形态：planPending 仍立且无
+      // dialog（计划条）/ **降级态重拉后仍降级**（二元卡核对未命中——评审
+      // Important 4 锁的行为面：用户点了检查得知道「没读到」而不是停在「核对中」）
       const stillPending = v.available === true && v.planPending === true && v.dialog !== true;
-      setCheckMissed(stillPending && v.options.length === 0);
+      const stillDegraded = typeof v.degradedHint === "string" && v.degradedHint.trim() !== "";
+      setCheckMissed((stillPending && v.options.length === 0) || stillDegraded);
     } catch {
       setCheckMissed(true);
     } finally {

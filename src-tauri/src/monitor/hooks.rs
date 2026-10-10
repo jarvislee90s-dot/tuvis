@@ -462,6 +462,19 @@ fn hook_command_matches_spec(
 /// 形态不同（command 直启 vs commandWindows 覆盖），规格单一事实源避免注册/核验/
 /// 迁移三处口径漂移。`matchers` 为 (事件名, matcher) 对（T2：claude Notification
 /// → permission_prompt；无 matcher 的事件传 `&[]`）
+/// 用户 hook 配置文件的**读入 + UTF-8 BOM 剥离**（2026-10-11 评审 Important 2）：
+/// Windows 编辑器（Notepad/部分 PowerShell `Out-File`）写出的文件带
+/// `EF BB BF` 前缀——`serde_json::from_str`/`toml_edit::parse` 都不剥，
+/// 直接「解析配置文件失败: expected value at line 1 column 1」（2026-10-10
+/// 22:16 实机：codex hooks.json 带 BOM → 每次启动注册失败）。四个用户配置
+/// 读取点（JSON 注册 / TOML 注册 / 核验 / 诊断）统一走本函数；自家事件文件
+/// 不经此（写入方无 BOM 面）。
+fn read_user_config_text(path: &std::path::Path) -> std::io::Result<String> {
+    Ok(std::fs::read_to_string(path)?
+        .trim_start_matches('\u{feff}')
+        .to_string())
+}
+
 pub(crate) fn register_hooks_for_tool(
     config_path: &std::path::Path,
     events: &[&str],
@@ -493,7 +506,7 @@ fn register_hooks_in_file(
     matchers: &[(&str, &str)],
 ) -> Result<(usize, usize), String> {
     // 读取现有配置（不存在则创建空对象）
-    let existing = fs::read_to_string(config_path).unwrap_or_else(|_| "{}".to_string());
+    let existing = read_user_config_text(config_path).unwrap_or_else(|_| "{}".to_string());
     let mut config: serde_json::Value =
         serde_json::from_str(&existing).map_err(|e| format!("解析配置文件失败: {}", e))?;
 
@@ -743,7 +756,7 @@ fn register_kimi_hooks_in_file(
     spec: &HookCommandSpec,
 ) -> Result<(usize, usize), String> {
     // toml_edit 保注释保格式（codex config.toml MCP 写链同款先例，services/mcp）
-    let content = fs::read_to_string(config_path).unwrap_or_default();
+    let content = read_user_config_text(config_path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
         .parse()
         .map_err(|e| format!("解析 TOML 失败: {}", e))?;
@@ -1066,7 +1079,7 @@ pub fn register_all_hooks() {
         // 的我方条目恰好一条**（2026-09-24 双注册残留核验——helper 与旧 bash 兜底
         // 并存会双写同一事件文件、后者覆盖前者的富载荷，claude AUQ 误判审批的根因）
         // 才跳过。kimi 走 TOML 核验（[[hooks]] 事件+命令逐条在场）
-        let verified = fs::read_to_string(&config_path)
+        let verified = read_user_config_text(&config_path)
             .map(|c| {
                 if tool_id == "kimi" {
                     hooks_toml_verified(&c, &spec.command, &events)
@@ -1153,7 +1166,7 @@ fn command_is_pure_ours(command: &str, markers: &[String]) -> bool {
 #[doc(hidden)]
 pub fn codex_hooks_all_ours(home: &std::path::Path) -> bool {
     let path = home.join(".codex").join("hooks.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = read_user_config_text(&path) else {
         return false;
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -3647,6 +3660,36 @@ mod t2_approval_registration_tests {
         )
         .unwrap();
         assert_eq!((added2, migrated2), (0, 0));
+    }
+
+    /// **UTF-8 BOM 兼容回归**（2026-10-11 评审 Important 2）：Windows 编辑器写出的
+    /// 配置带 `EF BB BF` 前缀——注册必须照常成功（2026-10-10 22:16 实机：codex
+    /// hooks.json 带 BOM → 每次启动「解析配置文件失败」）。还原动作：把
+    /// `read_user_config_text` 的剥 BOM 去掉 → 本用例先红。
+    #[test]
+    fn register_tolerates_utf8_bom_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("hooks.json");
+        let body = serde_json::json!({"hooks": {}}).to_string();
+        let mut with_bom = "\u{feff}".as_bytes().to_vec();
+        with_bom.extend_from_slice(body.as_bytes());
+        std::fs::write(&cfg, &with_bom).unwrap();
+
+        let (added, _) = register_hooks_in_file(
+            &cfg,
+            &["Notification"],
+            true,
+            SCRIPT,
+            &claude_spec(),
+            &[("Notification", "permission_prompt")],
+        )
+        .expect("带 BOM 的配置必须照常注册成功");
+        assert!(added > 0, "BOM 不应吞掉注册");
+        // 注册后的文件仍合法 JSON（读回验证）
+        let reread: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap())
+                .expect("注册产物应是合法 JSON");
+        assert!(reread.get("hooks").is_some());
     }
 }
 
