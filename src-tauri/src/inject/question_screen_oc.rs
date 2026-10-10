@@ -559,6 +559,20 @@ pub fn codex_question_screen_snapshot(lines: &[String]) -> Option<CodexQuestionS
     None
 }
 
+/// 选项行文本判据（与 [`parse_codex_option_row`] 的编号解析**同源**）：
+/// 到首个 `.` 之前的串全 ASCII 数字且非空 = `N. label` 选项行。
+///
+/// **2026-10-11 评审 Important 3 修正**：旧判据「首字符是数字即跳过」把数字开头的
+/// 备注文本（如「3 点建议」）误当选项行——notes 行系统性失明，清空路径还会假报
+/// 成功（读不到 note = 无字）。同源判据下「3 点建议」的 `3` 后无 `.`，不再误判。
+fn looks_like_option_text(text: &str) -> bool {
+    let Some(dot) = text.find('.') else {
+        return false;
+    };
+    let head = &text[..dot];
+    !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// codex 面板 **notes 行文本**解析（2026-10-10 用户指令：「note 位置但凡有输入，
 /// 一定要显示在远端页面上」——GET/回执消费）：
 /// 题号头之后、首个 `› ` 前缀**非选项**行（选项行 `› N. label` 带编号点，已排除）。
@@ -580,8 +594,8 @@ pub fn codex_notes_row_text(lines: &[String]) -> Option<String> {
         if text.is_empty() {
             continue;
         }
-        // 选项行（`› N. …`）跳过
-        if text.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        // 选项行（`› N. …`）跳过——同源判据（数字串 + `.`），数字开头的备注不误伤
+        if looks_like_option_text(text) {
             continue;
         }
         let lower = text.to_lowercase();
@@ -616,8 +630,8 @@ pub fn codex_notes_input_ready(lines: &[String]) -> bool {
         if text.is_empty() {
             continue;
         }
-        if text.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            continue; // 选项行
+        if looks_like_option_text(text) {
+            continue; // 选项行（同源判据——数字开头的备注不误伤）
         }
         if text.to_lowercase().starts_with("ask codex") {
             continue; // composer 提示行（面板外）
@@ -629,6 +643,39 @@ pub fn codex_notes_input_ready(lines: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// **数字开头备注不误判为选项行**（2026-10-11 评审 Important 3）：旧判据「首字符
+    /// 是数字即跳过」把「3 点建议」当 `3. …` 选项行——notes 行失明、清空路径假报
+    /// 成功。同源判据（数字串 + `.`）下必须照常读出。还原动作：把
+    /// `looks_like_option_text` 退回首字符判据 → 本用例先红。
+    #[test]
+    fn codex_notes_row_text_allows_digit_prefixed_note() {
+        let frame = vec![
+            "  Question 1/1 (1 unanswered)".to_string(),
+            "  你偏好哪种协作方式?".to_string(),
+            "  › 1. 直接开干 (Recommended)  我直接动手实现".to_string(),
+            "    2. None of the above  Optionally, add details in notes (tab)".to_string(),
+            "  › 3 点建议：先讨论再动手".to_string(),
+            "  tab or esc to clear notes | enter to submit answer".to_string(),
+        ];
+        assert_eq!(
+            codex_notes_row_text(&frame).as_deref(),
+            Some("3 点建议：先讨论再动手"),
+            "数字开头的备注必须照常读出（不是选项行）"
+        );
+        assert!(codex_notes_input_ready(&frame));
+        // 对照：真选项行（`3. label`）仍被跳过——扫到的是下一行占位 → None
+        let option_like = vec![
+            "  Question 1/1 (1 unanswered)".to_string(),
+            "  你偏好哪种协作方式?".to_string(),
+            "  › 1. 直接开干".to_string(),
+            "  › 3. 真选项行".to_string(),
+            "  › Add notes".to_string(),
+            "  tab or esc to clear notes | enter to submit answer".to_string(),
+        ];
+        assert_eq!(codex_notes_row_text(&option_like), None, "真选项行仍须跳过");
+    }
+
     use super::*;
 
     fn multi_page() -> Vec<String> {

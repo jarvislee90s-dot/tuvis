@@ -326,9 +326,15 @@ describe("ApproveCard：降级警示脚注（R1-3）", () => {
     const hint = await screen.findByTestId("approve-degraded-hint");
     expect(hint.textContent).toContain("未读到终端对话框选项");
     expect(hint.textContent).toContain("建议到终端确认");
-    // 二元按钮仍在（降级不是自隐——用户仍可操作，只是被警示）
-    expect(screen.getByTestId("approve-option-approve")).toBeTruthy();
-    expect(screen.getByTestId("approve-option-reject")).toBeTruthy();
+    // **降级禁用**（2026-10-10 用户裁决「读不到就别给钮」+ 评审 Important 4 锁）：
+    // 按钮在场但禁用——多选面板误读成审批框时点「允许」会真实发键（21:55 事故）
+    const allow = screen.getByTestId("approve-option-approve") as HTMLButtonElement;
+    const reject = screen.getByTestId("approve-option-reject") as HTMLButtonElement;
+    expect(allow.disabled).toBe(true);
+    expect(reject.disabled).toBe(true);
+    // 降级态辅助面：手动检查钮 + 核对中状态文案
+    expect(screen.getByTestId("approve-degraded-check")).toBeTruthy();
+    expect(screen.getByTestId("approve-degraded-state").textContent).toContain("核对");
   });
 
   it("degradedHint=null/缺省：不渲染脚注（未降级零变化）", async () => {
@@ -337,6 +343,67 @@ describe("ApproveCard：降级警示脚注（R1-3）", () => {
     render(<ApproveCard session={{ id: "sess-nodeg" }} />);
     await screen.findByTestId("approve-option-approve");
     expect(screen.queryByTestId("approve-degraded-hint")).toBeNull();
+  });
+
+  it("降级态自动重读：2.5s 后重拉选项端点，读到选项即恢复可用（fake timers）", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      installFetch();
+      // 首拉 = 降级态；重拉 = 读到对话框选项（降级解除）——按调用次数翻转
+      const degraded = approveOptions({
+        degradedHint: "未读到终端对话框选项——终端可能正显示多选项，二元键可能错位，建议到终端确认",
+      });
+      const recovered = approveOptions({
+        dialog: true,
+        options: [
+          { id: "dialog:1", label: "Yes, and use auto mode" },
+          { id: "dialog:2", label: "No" },
+        ],
+      });
+      let optionsGets = 0;
+      const prev = routes.options;
+      Object.defineProperty(routes, "options", {
+        configurable: true,
+        get() {
+          optionsGets += 1;
+          return optionsGets === 1 ? degraded : recovered;
+        },
+      });
+      render(<ApproveCard session={{ id: "sess-deg-retry" }} />);
+      const allow = await screen.findByTestId("approve-option-approve");
+      expect((allow as HTMLButtonElement).disabled).toBe(true);
+
+      // 快进 2.5s → 自动重拉触发（fetch 的 options 端点被再次调用）
+      await vi.advanceTimersByTimeAsync(2600);
+      expect(optionsGets).toBeGreaterThanOrEqual(2);
+      // 重拉读到选项 → 按钮恢复可用（dialog 编号选项形态）
+      const dialogOpt = await screen.findByTestId("approve-option-dialog:1");
+      expect((dialogOpt as HTMLButtonElement).disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("降级态自动重读：仍读不到选项 → 按钮保持禁用且显示未读到文案", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      installFetch();
+      routes.options = approveOptions({
+        degradedHint: "未读到终端对话框选项——终端可能正显示多选项，二元键可能错位，建议到终端确认",
+      });
+      render(<ApproveCard session={{ id: "sess-deg-still" }} />);
+      const allow = await screen.findByTestId("approve-option-approve");
+      expect((allow as HTMLButtonElement).disabled).toBe(true);
+      await vi.advanceTimersByTimeAsync(2600);
+      // 重拉是异步 promise——用 waitFor 等 state 文案翻转（同步 getBy 会抢在冲刷前）
+      await screen.findByText(/仍未读到/);
+      expect(screen.getByTestId("approve-degraded-state").textContent).toContain("仍未读到");
+      expect((screen.getByTestId("approve-option-approve") as HTMLButtonElement).disabled).toBe(
+        true
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("对话框模式（dialog=true）不渲染降级脚注（读到选项即未降级）", async () => {
