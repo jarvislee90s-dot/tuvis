@@ -1475,4 +1475,40 @@ mod tests {
         });
         assert_eq!(seen.load(AtomicOrdering::SeqCst), 7777);
     }
+
+    /// **Task 2（P0）B 主修的前提钉死**：watchdog 超时被 kill 后，已捕获的 stdout
+    /// 缓冲必须仍可读（`captured_stdout()`）——gate 探针的超时分支靠它做
+    /// 「证据优先于时序」判定（超时被杀但 stdout 已出 JSON ⇒ Pass）。
+    /// 真 spawn 缝：子进程 = 本测试二进制（打印标记行 + JSON 后挂 30s），
+    /// 短 watchdog 必超时——kill 之后缓冲里的两行都必须还在。
+    #[tokio::test]
+    async fn runner_kill_preserves_captured_stdout_buffer() {
+        let exe = std::env::current_exe().expect("测试二进制路径");
+        let mut r = RunnerCfg::new(exe.to_string_lossy().to_string())
+            .args([
+                "--exact",
+                "inject::headless::runner::tests::stdout_helper_prints_then_hangs",
+                "--ignored",
+                "--nocapture",
+            ])
+            .timeout_ms(5_000)
+            .sem(GlobalSem::new(4));
+        let out = r.run().await;
+        assert!(matches!(out.stage, Some(Stage::Timeout)), "{out:?}");
+        let captured = r.captured_stdout().join("\n");
+        assert!(
+            captured.contains("MAW-KILL-BUFFER-MARKER") && captured.contains("s-kill-buffer"),
+            "kill 后已捕获缓冲必须仍可读（B 主修的前提）: {captured}"
+        );
+    }
+
+    /// 上面 kill 缓冲缝测的**子进程桩**：打印标记行 + JSON 后挂 30s（逼 watchdog kill）。
+    /// `#[ignore]` = 正常套件不跑；只由缝测以 `--ignored --exact` 拉起。
+    #[test]
+    #[ignore]
+    fn stdout_helper_prints_then_hangs() {
+        println!("MAW-KILL-BUFFER-MARKER");
+        println!("{{\"sessionId\":\"s-kill-buffer\",\"response\":\"late\"}}");
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
 }

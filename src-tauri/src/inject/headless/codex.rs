@@ -1202,6 +1202,32 @@ pub async fn probe_cli(exe: &str, cache: &ProbeCache, os: &str) -> ProbeVerdict 
         cache.put(key, v.clone());
         return v;
     }
+    // 返工 M-1：真探针分支起止计时——spawn 尝试/超时/正常三路的实测墙钟都计入
+    // verdict（与 gate.rs 同机制），api.rs:2155 审计行据此出真实耗时（旧态恒「· 0ms」）
+    let started = Instant::now();
+    let verdict = {
+        #[cfg(test)]
+        {
+            // 缝（返工 M-1）：测试注入执行体替代真 spawn——缓存/exe 在场性检查仍走真路径
+            if let Some(round) = test_hooks::probe_round() {
+                round()
+            } else {
+                probe_cli_round(exe, &spec, os).await
+            }
+        }
+        #[cfg(not(test))]
+        {
+            probe_cli_round(exe, &spec, os).await
+        }
+    }
+    .with_duration_ms(started.elapsed().as_millis() as u64);
+    cache.put(key, verdict.clone());
+    verdict
+}
+
+/// 真探针执行体（从 [`probe_cli`] 分离，仅为让 M-1 的计时不被缓存/exe 检查稀释）：
+/// spawn `queue --help`（Windows npm 垫片经 [`spawn_shape`] 转一手）+ 判定。
+async fn probe_cli_round(exe: &str, spec: &ProbeSpec, os: &str) -> ProbeVerdict {
     let shape = spawn_shape(exe, os);
     let mut cfg = RunnerCfg::new(&shape.program)
         .args(
@@ -1209,24 +1235,29 @@ pub async fn probe_cli(exe: &str, cache: &ProbeCache, os: &str) -> ProbeVerdict 
                 .prefix
                 .iter()
                 .cloned()
-                .chain(super::gate::probe_argv(&spec)),
+                .chain(super::gate::probe_argv(spec)),
         )
         .timeout_ms(super::gate::PROBE_TIMEOUT_MS)
         .sem(GlobalSem::new(1));
     let receipt = cfg.run().await;
-    let verdict = if receipt.stage == Some(Stage::Timeout) {
-        ProbeVerdict::fail("探针干跑超时（15s）——codex 可能挂死")
-    } else if receipt.stage == Some(Stage::Spawn) {
-        ProbeVerdict::fail(format!("探针 spawn 失败：{exe}"))
-    } else {
-        super::gate::codex_verdict(
-            &cfg.captured_stdout().join("\n"),
-            &cfg.captured_stderr(),
-            cfg.last_exit_code(),
-        )
-    };
-    cache.put(key, verdict.clone());
-    verdict
+    probe_cli_verdict(&receipt, &cfg, exe)
+}
+
+/// 探针判定（纯函数，返工 M-2 缝）：Timeout → **复用 [`gate::timeout_zero_output_hint`]**
+/// 的单一文案源（秒数从常量生成——旧写死「15s/可能挂死」字面与阈值漂移且误导归因）；
+/// Spawn → spawn 失败；其余 → [`gate::codex_verdict`]。
+fn probe_cli_verdict(receipt: &Receipt, cfg: &RunnerCfg, exe: &str) -> ProbeVerdict {
+    if receipt.stage == Some(Stage::Timeout) {
+        return ProbeVerdict::fail(super::gate::timeout_zero_output_hint());
+    }
+    if receipt.stage == Some(Stage::Spawn) {
+        return ProbeVerdict::fail(format!("探针 spawn 失败：{exe}"));
+    }
+    super::gate::codex_verdict(
+        &cfg.captured_stdout().join("\n"),
+        &cfg.captured_stderr(),
+        cfg.last_exit_code(),
+    )
 }
 
 /// 探针缓存（进程级；键 = exe 在场性 + mtime：codex 升级即失效重探）
@@ -1266,6 +1297,9 @@ pub mod test_hooks {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    /// 真探针执行体缝的句柄类型（类型别名：clippy::type_complexity）
+    pub(crate) type ProbeRoundFn = std::sync::Arc<dyn Fn() -> ProbeVerdict + Send + Sync>;
+
     /// 钩子用例串行锁（持锁期间其它端点用例不得断言 CLI 可达性）。
     /// **tokio 互斥量**（不是 std）：用例是 `#[tokio::test]`，守卫必然跨 await 持有——
     /// std 守卫跨 await 会被 `clippy::await_holding_lock` 正当地拦下
@@ -1275,6 +1309,10 @@ pub mod test_hooks {
     static CLI: std::sync::LazyLock<Mutex<Option<String>>> =
         std::sync::LazyLock::new(|| Mutex::new(None));
     static PROBE: std::sync::LazyLock<Mutex<Option<ProbeVerdict>>> =
+        std::sync::LazyLock::new(|| Mutex::new(None));
+    /// 真探针分支的执行体缝（返工 M-1）：`Some` = 替代真 spawn 的注入执行体
+    /// （同步闭包，返回即 verdict；`Arc` 便于按句柄克隆取出）。默认 None = 真 spawn。
+    static PROBE_ROUND: std::sync::LazyLock<Mutex<Option<ProbeRoundFn>>> =
         std::sync::LazyLock::new(|| Mutex::new(None));
     static SCRIPT: std::sync::LazyLock<Mutex<VecDeque<TurnObs>>> =
         std::sync::LazyLock::new(|| Mutex::new(VecDeque::new()));
@@ -1294,7 +1332,21 @@ pub mod test_hooks {
     pub(crate) fn clear() {
         *CLI.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *PROBE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *PROBE_ROUND.lock().unwrap_or_else(|e| e.into_inner()) = None;
         SCRIPT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// 装填真探针执行体缝（**调用方必须已持 [`LOCK`]**；None = 清除，恢复真 spawn）
+    pub(crate) fn set_probe_round(f: Option<ProbeRoundFn>) {
+        *PROBE_ROUND.lock().unwrap_or_else(|e| e.into_inner()) = f;
+    }
+
+    /// 取真探针执行体缝（None = 无注入，走真 spawn）
+    pub(crate) fn probe_round() -> Option<ProbeRoundFn> {
+        PROBE_ROUND
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub(crate) fn cli() -> Option<String> {
@@ -2443,6 +2495,58 @@ mod tests {
         assert!(
             reason.contains('2') || reason.contains("queue"),
             "改道后的失败证据也要在（不吞掉第二段原因）：{reason}"
+        );
+    }
+
+    // ============================================================
+    // Task 2 返工（spec 审 M-1/M-2）：probe_cli duration 回填 + 超时文案单一源
+    // ============================================================
+
+    /// **M-1**：真探针分支起止计时——结论携带实测墙钟（≥ 注入执行体的 20ms 行程），
+    /// 且 verdict 本体不被计时改写——api.rs:2155 审计行的数据源就是它（旧态恒「· 0ms」）。
+    /// 缝：`test_hooks::probe_round()` 替代 spawn 执行体（缓存/exe 在场性检查仍走真路径）。
+    #[tokio::test]
+    async fn probe_cli_real_branch_carries_wallclock_duration() {
+        let _guard = test_hooks::LOCK.lock().await;
+        test_hooks::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("codex-probe-stub.exe");
+        std::fs::write(&exe, "stub").unwrap();
+        let exe_s = exe.to_string_lossy().to_string();
+        test_hooks::set_probe_round(Some(std::sync::Arc::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            ProbeVerdict::fail("round 注入：模拟真探针行程")
+        })));
+        let v = probe_cli(&exe_s, &ProbeCache::default(), "windows").await;
+        test_hooks::set_probe_round(None);
+        assert!(!v.is_pass());
+        assert!(
+            v.duration_ms() >= 20,
+            "真分支结论必须携带实测墙钟: {}",
+            v.duration_ms()
+        );
+        assert_eq!(
+            v.hint(),
+            Some("round 注入：模拟真探针行程"),
+            "verdict 本体不得被计时回填改写"
+        );
+    }
+
+    /// **M-2**：超时 hint 复用 gate 的单一文案源（秒数从常量生成）——
+    /// 旧字面「15s」与「可能挂死」误导归因必须退场。
+    #[test]
+    fn probe_timeout_hint_drops_stale_15s_and_hang_blame() {
+        let receipt = Receipt::failed(Stage::Timeout, "watchdog 到点");
+        let cfg = RunnerCfg::for_test();
+        let v = probe_cli_verdict(&receipt, &cfg, "codex");
+        assert!(!v.is_pass());
+        let hint = v.hint().unwrap_or_default();
+        assert!(!hint.contains("15s"), "旧写死秒数不得在场: {hint}");
+        assert!(!hint.contains("挂死"), "误导归因必须退场: {hint}");
+        assert!(hint.contains("网络/模型服务"), "{hint}");
+        assert!(
+            hint.contains(&format!("{}s", super::super::gate::PROBE_TIMEOUT_MS / 1000)),
+            "秒数从常量生成（阈值改文案跟着走）: {hint}"
         );
     }
 }

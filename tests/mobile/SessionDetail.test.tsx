@@ -3155,6 +3155,19 @@ describe("SessionDetail：无头回执卡（Task 8 / H7）", () => {
     expect(headlessStageText(undefined)).toBe("未分类失败");
   });
 
+  /// **Task 2（P0）version_gate 分诊文案去误导（裁决 29c）**：探针已是真实最小
+  /// 回合（本机实测 15–19s），拒发的归因不再是「CLI flag 面已变」——
+  /// 文案只说「未出有效回执」，真实成因看回执的原因行（后端 reason）。
+  /// 旧字面不得再出现在任何 stage 的分诊文案里。
+  it("version_gate 分诊文案：新字面锁钉 + 旧误导字面（CLI flag 面已变）不再出现", () => {
+    expect(HEADLESS_STAGE_TRIAGE.version_gate).toBe(
+      "版本门控未通过（探针回合未出有效回执；详见原因行）"
+    );
+    for (const text of Object.values(HEADLESS_STAGE_TRIAGE)) {
+      expect(text).not.toContain("CLI flag 面已变");
+    }
+  });
+
   /// **Task 13（C4）审批卡激活**（Task 10 的占位已作废）：在飞的无头回合（claude 通道）轮询
   /// `GET /session-headless-approval` → 渲染真卡：**工具名 + 命令原文 + 权限档**
   /// （Task 10 的 tier 展示义务）→ 点「允许」→ `POST /session-headless-approve`

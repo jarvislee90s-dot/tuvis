@@ -136,7 +136,7 @@ interface LoadError {
  *  新增变体而另一侧没跟上，必有一侧先红。 */
 export const HEADLESS_STAGE_TRIAGE: Record<string, string> = {
   spawn: "进程未能启动（安装路径 / 权限）",
-  version_gate: "版本门控未通过（CLI flag 面已变，MAM 拒发以防盲发）",
+  version_gate: "版本门控未通过（探针回合未出有效回执；详见原因行）",
   timeout: "回合超时（看门狗已终止进程树）",
   crash: "进程异常退出",
   channel_error: "通道异常（未拿到有效回执）",

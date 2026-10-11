@@ -1,24 +1,36 @@
 // 版本门控探针（H6）：投递前校验各工具 flag 面，结果缓存 + 版本变化提示复核，不盲发。
 //
 // **探测定案（spec 附录 E / H7，测试断言以此为真值）**：
-// - zcode：**必须 `--prompt` 干跑**——`--version`/`--help` 不需要 provider config，
+// - zcode：**必须 `--prompt` 真回合**——`--version`/`--help` 不需要 provider config，
 //   会漏判「Mac 打包布局 bug 下缺 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 时 `--prompt`
-//   静默无 JSON」；干跑超时 15s，**能出 JSON 即过**（前缀噪音行不算失败）；
+//   静默无 JSON」。**两级化（裁决 33a）**：L0 快面（exe/cjs/provider-config
+//   在场性 stat + `--help` 能起能印，零模型成本）过了才跑 L1 真回合——
+//   **L0 是串联闸门不是替代**（`--help` 漏判静默形态，Task 8 实证教训）；
+//   L1 超时被杀后**先看已捕获 stdout**（B 主修，裁决 29c：证据优先于
+//   时序——有 JSON = 回合已完成即过），零输出才按超时 fail；
 // - codex：`queue --help` 子命令在场（experimental 面，升级可能消失）。
 //
 // 结果缓存键 = **可执行文件在场性 + mtime**（含辅助产物如 zcode.cjs）——工具升级即
 // 失效重探（版本漂移复核）；进程缺席直接判失败，绝不 spawn 一个不存在的程序。
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::receipt::{parse_json_skipping_prefix, Receipt, Stage};
 use super::runner::{GlobalSem, RunnerCfg};
 // H5 权限档（Task 10）：zcode 探针的档位旗子也从 spec 取——探针与真回合**同一份**口径
 use super::PermissionSpec;
 
-/// 探针干跑超时（H6：15s；探针是短命干跑，不是 turn）
-pub const PROBE_TIMEOUT_MS: u64 = 15_000;
+/// 探针回合超时（Task 2 / 裁决 29a+A：45s）。探针是**真实最小模型回合**（见
+/// [`PROBE_PROMPT`]），本机实测最小回合 15–19s（空目录 18s / repo 15s，探测报告 §2）——
+/// 旧值 15s 会把通道恒超时判死；取实测上界 ×2+ 余量。超时分支先看已捕获
+/// stdout（B 主修），零输出才按本阈值 fail（hint 的秒数从本常量格式化生成）。
+pub const PROBE_TIMEOUT_MS: u64 = 45_000;
+
+/// L0 帮助面超时（裁决 33a）：`--help` 实测 0.9s 能起能印——10s 已是十倍
+/// 余量；帮助面 10s 起不来即结构性坏（与 L1 真回合阈值无关，**不共享常量**）。
+const L0_HELP_TIMEOUT_MS: u64 = 10_000;
 /// **探针载荷（Task 8 真机实证修订）**：真机 ZCode CLI **拒绝空载荷**——
 /// `--prompt ""` → `--prompt requires non-empty text.`（exit=1、0.5s 内退出、**不触模型**），
 /// 故 Task 6 设计的「空串干跑」在真机恒失败（会让版本门控拒绝掉全部投递）。探针改用
@@ -140,22 +152,46 @@ pub fn probe_env(spec: &ProbeSpec, os: &str) -> Vec<(String, String)> {
     }
 }
 
-/// 探针结论（失败即 version_gate 拒发，H6）
+/// 探针结论（失败即 version_gate 拒发，H6）。`duration_ms` = **实测墙钟**（Task 2：
+/// 由探针编排层起止计时回填；纯判定函数构造的结论不带墙钟（默认 0），
+/// [`version_gate_receipt`] 据此透传给回执——审计行不再「· 0ms」误导）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeVerdict {
-    Pass { detail: String },
-    Fail { hint: String },
+    Pass { detail: String, duration_ms: u64 },
+    Fail { hint: String, duration_ms: u64 },
 }
 
 impl ProbeVerdict {
     pub fn pass(detail: impl Into<String>) -> Self {
         ProbeVerdict::Pass {
             detail: detail.into(),
+            duration_ms: 0,
         }
     }
 
     pub fn fail(hint: impl Into<String>) -> Self {
-        ProbeVerdict::Fail { hint: hint.into() }
+        ProbeVerdict::Fail {
+            hint: hint.into(),
+            duration_ms: 0,
+        }
+    }
+
+    /// 回填实测墙钟（探针编排层调用；纯判定函数不知道墙钟）
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        match &mut self {
+            ProbeVerdict::Pass { duration_ms: d, .. }
+            | ProbeVerdict::Fail { duration_ms: d, .. } => *d = duration_ms,
+        }
+        self
+    }
+
+    /// 实测墙钟（0 = 纯判定构造、未经编排层计时）
+    pub fn duration_ms(&self) -> u64 {
+        match self {
+            ProbeVerdict::Pass { duration_ms, .. } | ProbeVerdict::Fail { duration_ms, .. } => {
+                *duration_ms
+            }
+        }
     }
 
     pub fn is_pass(&self) -> bool {
@@ -164,7 +200,7 @@ impl ProbeVerdict {
 
     pub fn hint(&self) -> Option<&str> {
         match self {
-            ProbeVerdict::Fail { hint } => Some(hint),
+            ProbeVerdict::Fail { hint, .. } => Some(hint),
             ProbeVerdict::Pass { .. } => None,
         }
     }
@@ -174,12 +210,14 @@ impl ProbeVerdict {
 pub fn version_gate_receipt(session_id: &str, verdict: &ProbeVerdict) -> Option<Receipt> {
     match verdict {
         ProbeVerdict::Pass { .. } => None,
-        ProbeVerdict::Fail { hint } => Some(
+        ProbeVerdict::Fail { hint, .. } => Some(
             Receipt::failed(
                 Stage::VersionGate,
                 &format!("版本门控未通过（拒发，不盲发）；{hint}"),
             )
-            .with_session(session_id),
+            .with_session(session_id)
+            // Task 2 duration 透传：审计行出真实耗时（旧态是回执默认值的「· 0ms」）
+            .with_duration_ms(verdict.duration_ms()),
         ),
     }
 }
@@ -218,6 +256,219 @@ pub fn codex_verdict(stdout: &str, stderr_tail: &str, exit: Option<i32>) -> Prob
     ProbeVerdict::fail(format!(
         "codex queue 子命令不在场（experimental 面，升级可能消失；exit={exit:?}）；stderr={detail}"
     ))
+}
+
+// ============================================================
+// Task 2（P0）：B 超时先看 stdout + L0 快面（裁决 29c / 33a）
+// ============================================================
+
+/// B 主修（裁决 29c）：**证据优先于时序**——watchdog 超时被杀后，先看已捕获
+/// stdout：有 JSON = 进程真跑完了回合（只是超阈值被杀，stdout 是完成证据），
+/// 判 **Pass**；零输出才按超时 fail。前提：runner kill 路径不丢弃已捕获
+/// 缓冲（`runner::tests::runner_kill_preserves_captured_stdout_buffer` 钉死）。
+fn timeout_verdict(captured_stdout: &str) -> ProbeVerdict {
+    if parse_json_skipping_prefix(captured_stdout).is_some() {
+        return ProbeVerdict::pass(
+            "探针超时被杀但 stdout 已出 JSON——回合实际完成（证据优先于时序）",
+        );
+    }
+    ProbeVerdict::fail(timeout_zero_output_hint())
+}
+
+/// 超时零输出的 fail hint（A 兜底文案：不再误导归因「挂死/缺 provider
+/// config」——探针已是真实最小回合，超时更可能是网络/模型服务侧慢；
+/// 秒数从 [`PROBE_TIMEOUT_MS`] 格式化生成，不写死字面——改阈值时文案跟着走）。
+/// **`pub(crate)`（返工 M-2）**：`codex::probe_cli` 的超时分支复用本函数——
+/// 两通道共用同一份文案生成，禁止各自维护副本漂移。
+pub(crate) fn timeout_zero_output_hint() -> String {
+    format!(
+        "探针回合超时（本机实测最小回合 15–19s，阈值已放宽至 {}s）——反复超时请检查网络/模型服务",
+        PROBE_TIMEOUT_MS / 1000
+    )
+}
+
+/// L0 的 provider config 在场性（与 [`provider_config_env`] 的平台规则同源）：
+/// - macOS：推导路径必须在场（env 无条件指向它，不在场 = CLI 必然定位不到）；
+/// - Windows/其他：推导路径 **或** CLI 自查首选位（`<resources>/glm/provider/`）任一
+///   在场——装包修好、文件挪去 CLI 自查位后不误杀（与
+///   [`provider_config_env`] 的同一不对称：它在不在场时不设 env、让 CLI 走自己的查找表）。
+///
+/// **边界如实申报（返工 m-4）——以下两形态 L0 不认，会误报「provider config 缺失」拒发**：
+/// ① CLI 查找表的第二位（盘根位 `<盘>:\config\provider\zcode-builtin.json`）——只查
+///   推导位与 `<resources>/glm/provider/` 首选位，盘根位属异形安装；
+/// ② 用户自设 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 环境变量指向自定义位置（env 已带
+///   provider config 时 CLI 可定位，但 L0 的 stat 看不见进程 env）。
+/// 兜底：误报的 fail 结论只缓存 [`FAILURE_TTL_MS`]（5min）——修复/重装/改回标准布局后
+/// 自动失效重探，不损数据、不会永久钉死通道。
+fn provider_config_present(cjs: &str, os: &str) -> bool {
+    let derived = zcode_provider_config_path(cjs)
+        .map(|p| std::path::Path::new(&p).is_file())
+        .unwrap_or(false);
+    if os == "macos" {
+        return derived;
+    }
+    let cli_lookup = std::path::Path::new(cjs)
+        .parent()
+        .map(|glm| glm.join("provider").join("zcode-builtin.json").is_file())
+        .unwrap_or(false);
+    derived || cli_lookup
+}
+
+/// L0 结构检查（裁决 33a，零模型成本 stat）：exe / cjs / provider-config
+/// 在场性。返回 `Some(fail)` = 结构性坏，直接拒发（连 L0 `--help`
+/// spawn 都不起，更不烧 L1 真回合）；`None` = 过，放行去跑 L0
+/// 帮助面。hint 区分「可执行不在场」与「provider config 缺失」。
+fn l0_stat_verdict(spec: &ProbeSpec, os: &str) -> Option<ProbeVerdict> {
+    if !std::path::Path::new(spec.exe()).is_file() {
+        return Some(ProbeVerdict::fail(format!(
+            "L0 结构检查：可执行不在场（不 spawn）：{}",
+            spec.exe()
+        )));
+    }
+    match spec {
+        // codex 无 cjs/provider-config 概念（exe 在场性已在上方统一判定）
+        ProbeSpec::Codex { .. } => None,
+        ProbeSpec::Zcode { cjs, .. } => {
+            if !std::path::Path::new(cjs).is_file() {
+                return Some(ProbeVerdict::fail(format!(
+                    "L0 结构检查：zcode.cjs 缺失（resources/glm 布局损坏）：{cjs}"
+                )));
+            }
+            if !provider_config_present(cjs, os) {
+                let expected = zcode_provider_config_path(cjs).unwrap_or_default();
+                return Some(ProbeVerdict::fail(format!(
+                    "L0 结构检查：provider config 缺失（预期 {expected} 或 <resources>/glm/provider/zcode-builtin.json；修复/重装 ZCode 后自动重探）"
+                )));
+            }
+            None
+        }
+    }
+}
+
+/// L0 帮助面 argv：`<exe> <cjs> --help`（不带档位段——帮助面不需要）
+fn l0_help_argv(spec: &ProbeSpec) -> Vec<String> {
+    match spec {
+        ProbeSpec::Zcode { cjs, .. } => vec![cjs.clone(), "--help".into()],
+        ProbeSpec::Codex { .. } => vec!["--help".into()],
+    }
+}
+
+/// L0 帮助面执行体（裁决 33a）：`--help` 能起能印（实测 0.9s，零模型
+/// 成本）——spawn 后交纯判定 [`l0_help_verdict`]（判定与执行分离，三分支
+/// 可脱离真 spawn 缝测，见 `l0_help_verdict_covers_timeout_nonzero_exit_and_silent_zero_output`）。
+async fn l0_help_run(spec: &ProbeSpec, os: &str) -> ProbeVerdict {
+    let mut r = RunnerCfg::new(spec.exe())
+        .args(l0_help_argv(spec))
+        .timeout_ms(L0_HELP_TIMEOUT_MS)
+        .sem(GlobalSem::new(1));
+    for (k, v) in probe_env(spec, os) {
+        r = r.env(k, v);
+    }
+    let receipt = r.run().await;
+    l0_help_verdict(
+        receipt.stage,
+        r.last_exit_code(),
+        &r.captured_stdout().join("\n"),
+        &r.captured_stderr(),
+        spec.exe(),
+    )
+}
+
+/// L0 帮助面判定（纯函数，返工 m-5 缝）：Timeout/Spawn/非零退出/零输出 =
+/// 结构性坏 fail（不烧 L1 真回合）；**能起能印**（exit 0 且 stdout/stderr
+/// 有输出，两个条件缺一不可）→ pass 放行 L1。
+fn l0_help_verdict(
+    stage: Option<Stage>,
+    exit: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    exe: &str,
+) -> ProbeVerdict {
+    if stage == Some(Stage::Spawn) {
+        return ProbeVerdict::fail(format!("L0 --help spawn 失败：{exe}"));
+    }
+    if stage == Some(Stage::Timeout) {
+        return ProbeVerdict::fail(format!(
+            "L0 --help 超时（{}s 内未起未印——CLI 起动面已坏，不烧真回合）",
+            L0_HELP_TIMEOUT_MS / 1000
+        ));
+    }
+    let printed = !stdout.trim().is_empty() || !stderr.trim().is_empty();
+    if exit == Some(0) && printed {
+        return ProbeVerdict::pass("L0 过（--help 能起能印）；放行 L1 真回合");
+    }
+    let detail =
+        crate::inject::normalize::summarize(stderr, crate::inject::normalize::AUDIT_SUMMARY_CHARS);
+    ProbeVerdict::fail(format!(
+        "L0 --help 未能起能印（exit={exit:?}，stdout {} 字节）；stderr={detail}",
+        stdout.len()
+    ))
+}
+
+/// 两级探针编排（裁决 33a；执行体注入可测）：L0 stat 败 → 直接
+/// fail（零 spawn）；L0 帮助面败 → fail（不烧 L1）；L0 过 → **仍跑
+/// L1**（红线：L0 是串联闸门不是替代——`--help` 漏判静默形态，
+/// Task 8 实证教训；结论以 L1 为准）。起止计时在此回填：最终
+/// 结论携带实测墙钟（Task 2 duration 透传的数据源）。
+async fn two_level_probe<L0F, L1F, L0Fut, L1Fut>(
+    spec: &ProbeSpec,
+    os: &str,
+    l0: L0F,
+    l1: L1F,
+) -> ProbeVerdict
+where
+    L0F: FnOnce() -> L0Fut,
+    L0Fut: Future<Output = ProbeVerdict>,
+    L1F: FnOnce() -> L1Fut,
+    L1Fut: Future<Output = ProbeVerdict>,
+{
+    let started = Instant::now();
+    let verdict = if let Some(stat_fail) = l0_stat_verdict(spec, os) {
+        stat_fail
+    } else {
+        let l0v = l0().await;
+        if l0v.is_pass() {
+            l1().await
+        } else {
+            l0v
+        }
+    };
+    verdict.with_duration_ms(started.elapsed().as_millis() as u64)
+}
+
+/// L1 执行体（zcode = 真回合 `"hi"`；codex 变体 = 既有单级探针执行体）：
+/// spawn + watchdog（[`PROBE_TIMEOUT_MS`] ）+ 判定。超时分支走 [`timeout_verdict`]（B 主修）。
+async fn probe_round(spec: &ProbeSpec, os: &str) -> ProbeVerdict {
+    let mut r = RunnerCfg::new(spec.exe())
+        .args(probe_argv(spec))
+        .timeout_ms(PROBE_TIMEOUT_MS)
+        .sem(GlobalSem::new(1));
+    for (k, v) in probe_env(spec, os) {
+        r = r.env(k, v);
+    }
+    let receipt = r.run().await;
+    if receipt.stage == Some(Stage::Timeout) {
+        // B 主修（裁决 29c）：证据优先于时序——kill 后已捕获 stdout
+        // 仍可读（runner 缓冲保留语义由
+        // `runner::tests::runner_kill_preserves_captured_stdout_buffer` 钉死）
+        match spec {
+            ProbeSpec::Zcode { .. } => timeout_verdict(&r.captured_stdout().join("\n")),
+            // codex 的过判据是 exit 0 + usage 文本（不是 JSON）——超时无第二判据，如实 fail
+            ProbeSpec::Codex { .. } => ProbeVerdict::fail(timeout_zero_output_hint()),
+        }
+    } else if receipt.stage == Some(Stage::Spawn) {
+        ProbeVerdict::fail(format!("探针 spawn 失败：{}", spec.exe()))
+    } else {
+        let stdout = r.captured_stdout().join("\n");
+        let stderr = r.captured_stderr();
+        // 评审 Minor 1：退出码取**真实值**（`last_exit_code`）——不得把非零退出谎报成
+        // None 再塞进失败提示（用户看到的是「exit=Some(7)」而不是「exit=None」）
+        let code = r.last_exit_code();
+        match spec {
+            ProbeSpec::Zcode { .. } => zcode_verdict(&stdout, &stderr, code, os),
+            ProbeSpec::Codex { .. } => codex_verdict(&stdout, &stderr, code),
+        }
+    }
 }
 
 /// 缓存键：可执行文件**在场性 + mtime**（+ 辅助产物 mtime）——工具升级即失效
@@ -368,9 +619,12 @@ where
     verdict
 }
 
-/// 生产探针（真 spawn；Task 8/9/12 消费）：走 H4 底座（watchdog = [`PROBE_TIMEOUT_MS`]），
-/// stdout/stderr 归一后交纯判定，结论入缓存。**探针不占无头 turn 的全局名额**
-/// （自持 cap=1 的名额——版本门控是前置动作，不该让用户请求陪它排队）。
+/// 生产探针（真 spawn；Task 8/9/12 消费）：**zcode 走两级**（L0 快面 → L1
+/// 真回合，裁决 33a；缓存命中（含成功长缓存）时 L0/L1 都不跑）；codex
+/// 变体维持单级（其活体探针在 `codex::probe_cli`，本函数的 Codex 分支
+/// 仅作同构兜底）。结论入缓存（成功长缓存 / 失败 5min TTL，见
+/// [`ProbeCache`]）。**探针不占无头 turn 的全局名额**（L0/L1 各自持 cap=1
+/// 的名额——版本门控是前置动作，不该让用户请求陪它排队）。
 pub async fn probe(spec: &ProbeSpec, cache: &ProbeCache, os: &str) -> ProbeVerdict {
     let key = ProbeKey::of(spec);
     if let Some(hit) = cache.get(&key) {
@@ -381,27 +635,19 @@ pub async fn probe(spec: &ProbeSpec, cache: &ProbeCache, os: &str) -> ProbeVerdi
         cache.put(key, v.clone());
         return v;
     }
-    let mut r = RunnerCfg::new(spec.exe())
-        .args(probe_argv(spec))
-        .timeout_ms(PROBE_TIMEOUT_MS)
-        .sem(GlobalSem::new(1));
-    for (k, v) in probe_env(spec, os) {
-        r = r.env(k, v);
-    }
-    let receipt = r.run().await;
-    let verdict = if receipt.stage == Some(Stage::Timeout) {
-        ProbeVerdict::fail("探针干跑超时（15s）——工具可能挂死或缺 provider config")
-    } else if receipt.stage == Some(Stage::Spawn) {
-        ProbeVerdict::fail(format!("探针 spawn 失败：{}", spec.exe()))
-    } else {
-        let stdout = r.captured_stdout().join("\n");
-        let stderr = r.captured_stderr();
-        // 评审 Minor 1：退出码取**真实值**（`last_exit_code`）——不得把非零退出谎报成
-        // None 再塞进失败提示（用户看到的是「exit=Some(7)」而不是「exit=None」）
-        let code = r.last_exit_code();
-        match spec {
-            ProbeSpec::Zcode { .. } => zcode_verdict(&stdout, &stderr, code, os),
-            ProbeSpec::Codex { .. } => codex_verdict(&stdout, &stderr, code),
+    let verdict = match spec {
+        // 两级编排（裁决 33a）：L0 stat → L0 `--help` → L1 真回合；
+        // duration（实测墙钟）由 two_level_probe 起止计时回填
+        ProbeSpec::Zcode { .. } => {
+            two_level_probe(spec, os, || l0_help_run(spec, os), || probe_round(spec, os)).await
+        }
+        // codex：无 L0 概念（其探针本就是零模型成本的 `queue --help`
+        // 面；活体路径在 `codex::probe_cli`）——单级，仅回填墙钟
+        ProbeSpec::Codex { .. } => {
+            let started = Instant::now();
+            probe_round(spec, os)
+                .await
+                .with_duration_ms(started.elapsed().as_millis() as u64)
         }
     };
     cache.put(key, verdict.clone());
@@ -732,5 +978,258 @@ mod tests {
         let old = codex_verdict("error: unrecognized subcommand 'queue'", "", Some(2));
         assert!(!old.is_pass());
         assert!(old.hint().unwrap_or_default().contains("queue"));
+    }
+
+    // ============================================================
+    // Task 2（P0）探针修复：A 阈值 45s + B 超时先看 stdout + L0 快面 + duration
+    // ============================================================
+
+    /// L0 全在场夹具（tempdir：exe + cjs + 推导位 provider config 都是普通 stub 文件
+    /// ——stat 只看在场性，不触真机安装路径）
+    fn l0_ok_fixture() -> (tempfile::TempDir, ProbeSpec) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let exe = root.join("ZCode.exe");
+        std::fs::write(&exe, "stub").unwrap();
+        let cjs = root.join("resources").join("glm").join("zcode.cjs");
+        std::fs::create_dir_all(cjs.parent().unwrap()).unwrap();
+        std::fs::write(&cjs, "// stub").unwrap();
+        let cfg = root.join("resources").join("config").join("provider");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("zcode-builtin.json"), "{}").unwrap();
+        (
+            dir,
+            ProbeSpec::Zcode {
+                exe: exe.to_string_lossy().to_string(),
+                cjs: cjs.to_string_lossy().to_string(),
+            },
+        )
+    }
+
+    /// A 兜底：阈值钉值 45s（本机实测最小回合 15–19s ×2 余量；改常量必须连着 hint 走，
+    /// 见 [`timeout_with_zero_output_fails_with_new_hint`]）
+    #[test]
+    fn probe_timeout_is_45s() {
+        assert_eq!(PROBE_TIMEOUT_MS, 45_000);
+    }
+
+    /// B 主修（裁决 29c）：超时被杀但已捕获 stdout 有 JSON → **Pass**——证据优先于
+    /// 时序（进程真跑完了回合、只是超阈值被杀，stdout 是完成证据）；纯噪音前缀不算证据。
+    #[test]
+    fn timeout_with_captured_stdout_json_passes() {
+        let v = timeout_verdict(
+            "ZCode Built-in skipped (not-due)\n{\"sessionId\":\"s1\",\"response\":\"hi\"}",
+        );
+        assert!(v.is_pass(), "超时但有 JSON = 回合已完成，必须过: {v:?}");
+        assert!(
+            !timeout_verdict("ZCode Built-in skipped (not-due)").is_pass(),
+            "噪音前缀不是完成证据，不得混过"
+        );
+    }
+
+    /// B/A 合流：超时且零输出 → Fail + 新 hint（秒数从常量格式化生成、含「网络/模型服务」，
+    /// 旧误导归因「挂死」必须退场）
+    #[test]
+    fn timeout_with_zero_output_fails_with_new_hint() {
+        let v = timeout_verdict("");
+        assert!(!v.is_pass());
+        let hint = v.hint().unwrap_or_default();
+        assert!(
+            hint.contains(&format!("{}s", PROBE_TIMEOUT_MS / 1000)),
+            "秒数必须从常量生成（改阈值文案跟着走）: {hint}"
+        );
+        assert!(hint.contains("网络/模型服务"), "{hint}");
+        assert!(!hint.contains("挂死"), "旧误导归因必须退场: {hint}");
+    }
+
+    /// duration 透传：探针结论携带实测墙钟（≥ 注入的 L1 睡眠时长，绝非默认 0），
+    /// `version_gate_receipt` 原样透传给回执（审计行不再「· 0ms」）
+    #[tokio::test]
+    async fn verdict_carries_real_wallclock_duration() {
+        let (_dir, spec) = l0_ok_fixture();
+        let v = two_level_probe(
+            &spec,
+            "windows",
+            || async { ProbeVerdict::pass("L0 过") },
+            || async {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                ProbeVerdict::fail("L1 跑了")
+            },
+        )
+        .await;
+        assert!(!v.is_pass());
+        assert!(
+            v.duration_ms() >= 30,
+            "duration 必须是实测墙钟（≥ 注入的 30ms）: {}",
+            v.duration_ms()
+        );
+        // 透传链：verdict.duration_ms → Receipt.duration_ms（审计行的数据源）
+        let receipt = version_gate_receipt("s1", &v).expect("fail 必须出回执");
+        assert_eq!(receipt.duration_ms, v.duration_ms());
+    }
+
+    /// L0 快面（裁决 33a）：stat 层结构性坏 → 直接 fail——连 L0 帮助面 spawn 都不起、
+    /// 更不烧 L1 真回合；hint 区分「可执行不在场」与「provider config 缺失」。
+    #[tokio::test]
+    async fn l0_stat_failure_blocks_l1_without_burning_a_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // ① 可执行缺席
+        let spec = ProbeSpec::Zcode {
+            exe: "mam-nonexistent-zcode-exe.exe".into(),
+            cjs: "mam-nonexistent-zcode.cjs".into(),
+        };
+        let burned = std::sync::Arc::new(AtomicUsize::new(0));
+        let b = burned.clone();
+        let v = two_level_probe(
+            &spec,
+            "windows",
+            || async { panic!("stat 失败时 L0 帮助面不得起") },
+            move || async move {
+                b.fetch_add(1, Ordering::SeqCst);
+                ProbeVerdict::pass("L1 不该跑")
+            },
+        )
+        .await;
+        assert!(!v.is_pass());
+        assert!(
+            v.hint().unwrap_or_default().contains("不在场"),
+            "可执行缺席要有专属 hint: {:?}",
+            v.hint()
+        );
+        assert_eq!(burned.load(Ordering::SeqCst), 0, "L1 真回合一次都不烧");
+        // ② provider config 缺失（exe/cjs 都在）→ 与「不在场」分列的专属 hint
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let exe = std::path::Path::new(&root).join("ZCode.exe");
+        std::fs::write(&exe, "stub").unwrap();
+        let cjs = std::path::Path::new(&root)
+            .join("resources")
+            .join("glm")
+            .join("zcode.cjs");
+        std::fs::create_dir_all(cjs.parent().unwrap()).unwrap();
+        std::fs::write(&cjs, "// stub").unwrap();
+        let spec = ProbeSpec::Zcode {
+            exe: exe.to_string_lossy().to_string(),
+            cjs: cjs.to_string_lossy().to_string(),
+        };
+        let v = two_level_probe(
+            &spec,
+            "windows",
+            || async { panic!("stat 失败时 L0 帮助面不得起") },
+            || async { ProbeVerdict::pass("L1 不该跑") },
+        )
+        .await;
+        assert!(!v.is_pass());
+        let hint = v.hint().unwrap_or_default();
+        assert!(hint.contains("provider config"), "{hint}");
+        assert!(!hint.contains("不在场"), "缺失与不在场必须分列: {hint}");
+    }
+
+    /// L0 快面红线：L0 过 **不替代** L1（`--help` 漏判静默形态，Task 8 实证教训）——
+    /// L0 过只是放行，结论以 L1 为准（L1 fail ⇒ 整体 fail）。
+    #[tokio::test]
+    async fn l0_pass_does_not_shortcircuit_l1() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_dir, spec) = l0_ok_fixture();
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let r2 = ran.clone();
+        let v = two_level_probe(
+            &spec,
+            "windows",
+            || async { ProbeVerdict::pass("L0 过（--help 能起能印）") },
+            move || async move {
+                r2.fetch_add(1, Ordering::SeqCst);
+                ProbeVerdict::pass("L1 真回合出 JSON")
+            },
+        )
+        .await;
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "L0 过必须放行 L1 真回合");
+        assert!(v.is_pass());
+        assert!(
+            matches!(&v, ProbeVerdict::Pass { detail, .. } if detail.contains("L1")),
+            "结论必须来自 L1（L0 的 detail 不得冒充通过结论）: {v:?}"
+        );
+        // 红线反向：L1 才有判定权——L0 过但 L1 fail ⇒ 整体 fail
+        let v2 = two_level_probe(
+            &spec,
+            "windows",
+            || async { ProbeVerdict::pass("L0 过") },
+            || async { ProbeVerdict::fail("L1 静默无 JSON") },
+        )
+        .await;
+        assert!(!v2.is_pass(), "L0 过不能替代 L1 的判定权");
+    }
+
+    /// 缓存纪律不回归：成功结论命中 → 探针零执行（L0/L1 都不跑；stub 文件真去
+    /// spawn 必失败，返回 pass 即证明零执行）；mtime 键长缓存语义不变。
+    #[tokio::test]
+    async fn cached_success_skips_probe() {
+        let (_dir, spec) = l0_ok_fixture();
+        let cache = ProbeCache::default();
+        cache.put(ProbeKey::of(&spec), ProbeVerdict::pass("已验证过"));
+        let v = probe(&spec, &cache, "windows").await;
+        assert!(v.is_pass());
+        assert!(
+            matches!(&v, ProbeVerdict::Pass { detail, .. } if detail == "已验证过"),
+            "命中缓存必须原样返回: {v:?}"
+        );
+    }
+
+    /// **返工 m-5**：L0 帮助面判定的三个失败分支（纯函数缝）——超时 / exit≠0 /
+    /// exit 0 但零输出（能起不能印不算过）；正向形态（exit 0 + 有输出 = 能起能印）
+    /// 顺手钉死。
+    #[test]
+    fn l0_help_verdict_covers_timeout_nonzero_exit_and_silent_zero_output() {
+        // 超时 → fail（CLI 起动面已坏，hint 说明不烧真回合）
+        let v = l0_help_verdict(Some(Stage::Timeout), None, "", "", "stub.exe");
+        assert!(!v.is_pass(), "{v:?}");
+        assert!(v.hint().unwrap_or_default().contains("未起未印"));
+        // exit≠0（有输出也救不了——退出码非 0 = 起动面自己认输）
+        let v = l0_help_verdict(None, Some(1), "usage: zcode ...", "", "stub.exe");
+        assert!(!v.is_pass(), "{v:?}");
+        assert!(v.hint().unwrap_or_default().contains("未能起能印"));
+        // exit 0 但零输出 → fail（能起**不能印**不算过——「能起能印」两个条件缺一不可）
+        let v = l0_help_verdict(None, Some(0), "", "", "stub.exe");
+        assert!(!v.is_pass(), "{v:?}");
+        assert!(v.hint().unwrap_or_default().contains("未能起能印"));
+        // 正向：exit 0 + 有输出 → pass（放行 L1）
+        let v = l0_help_verdict(None, Some(0), "Usage: zcode", "", "stub.exe");
+        assert!(v.is_pass(), "{v:?}");
+    }
+
+    /// **返工 m-5**：三个 L0 失败形态经 [`two_level_probe`] 的 L0 注入点 → **L1 一次都不
+    /// 烧**、最终结论 = L0 的 fail 原样透传（不重写不吞）。
+    #[tokio::test]
+    async fn l0_help_failure_shapes_block_l1_via_two_level_seam() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_dir, spec) = l0_ok_fixture();
+        let shapes = vec![
+            l0_help_verdict(Some(Stage::Timeout), None, "", "", "stub.exe"),
+            l0_help_verdict(None, Some(1), "usage: zcode ...", "", "stub.exe"),
+            l0_help_verdict(None, Some(0), "", "", "stub.exe"),
+        ];
+        for shape in shapes {
+            let ran = std::sync::Arc::new(AtomicUsize::new(0));
+            let r2 = ran.clone();
+            let injected = shape.clone();
+            let want_hint = shape.hint().map(str::to_string);
+            let v = two_level_probe(
+                &spec,
+                "windows",
+                move || async move { injected },
+                move || async move {
+                    r2.fetch_add(1, Ordering::SeqCst);
+                    ProbeVerdict::pass("L1 不该跑")
+                },
+            )
+            .await;
+            assert!(!v.is_pass(), "L0 失败形态必须直接 fail: {v:?}");
+            assert_eq!(ran.load(Ordering::SeqCst), 0, "L0 帮助面失败不烧 L1 真回合");
+            assert_eq!(
+                v.hint().map(str::to_string),
+                want_hint,
+                "最终结论 = L0 的 fail 原样透传"
+            );
+        }
     }
 }
