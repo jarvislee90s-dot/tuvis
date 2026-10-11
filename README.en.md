@@ -12,6 +12,8 @@ A desktop app to monitor, notify, jump to, and manage Claude Code / Codex CLI / 
 
 English · [中文](README.md)
 
+<img src="docs/images/tuvis-hero.png" width="400" alt="Tuvis — AI Agent for Developers" />
+
 </div>
 
 ---

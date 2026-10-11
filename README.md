@@ -12,6 +12,8 @@
 
 [English](README.en.md) · 中文
 
+<img src="docs/images/tuvis-hero.png" width="400" alt="兔维斯 —— 聪明的 AI 伙伴" />
+
 </div>
 
 ---
