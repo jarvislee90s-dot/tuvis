@@ -50,7 +50,8 @@
     "presetsLabel": "预设",
     "on": "开",
     "off": "关",
-    "remote": "远程接入"
+    "remote": "远程接入",
+    "autostart": "开机自动启动"
   },
   "updater": {
     "checkForUpdates": "检查更新",
@@ -80,8 +81,8 @@
     "nav": {
       "appearance": "外观与皮肤",
       "appearanceDesc": "本机主题与语言，以及远程端（手机看板 / 网页）的字体、皮肤、圆角与品牌色",
-      "desktop": "桌面与提醒",
-      "desktopDesc": "全局快捷键、桌面通知与音效，以及 Foxbell 桌宠本体",
+      "desktop": "通知与桌宠",
+      "desktopDesc": "桌面通知与音效浮窗，Foxbell 桌宠本体与其启动跟随，以及应用开机自启",
       "tools": "工具与体检",
       "toolsDesc": "各 CLI 工具的启停，以及技能 / 链接一致性体检",
       "usage": "用量统计",
@@ -92,8 +93,7 @@
       "dataDesc": "移动端附件占用与清理"
     },
     "appearance": {
-      "title": "外观",
-      "description": "自定义应用的外观和语言",
+      "title": "桌面端外观",
       "theme": "主题",
       "light": "浅色",
       "dark": "深色",
@@ -187,6 +187,8 @@
       "desc": "Foxbell 桌宠：悬浮状态卡片与语音提醒",
       "enable": "开启桌宠",
       "alwaysOnTop": "悬浮在所有程序最前",
+      "followStartup": "启动时跟出",
+      "followStartupDesc": "软件每次启动时桌宠自动出现；关闭后启动先不出，从托盘或标题栏随时打开",
       "scale": "大小",
       "enabledToast": "桌宠已开启",
       "disabledToast": "桌宠已隐藏",
@@ -194,6 +196,14 @@
       "switchPet": "切换宠物",
       "importPet": "导入宠物",
       "managePet": "修改宠物"
+    },
+    "autostart": {
+      "heading": "开机启动",
+      "description": "兔维斯 随系统登录自动启动；启动后静默进托盘，主窗口不弹出",
+      "row": "开机自动启动",
+      "rowDesc": "写入系统登录启动项（Windows 注册表 / macOS 登录项），关闭开关即撤销注册；自启后仅驻托盘，从托盘随时打开主窗口",
+      "onToast": "已开启开机自动启动",
+      "offToast": "已关闭开机自动启动"
     },
     "tools": {
       "title": "工具管理",
@@ -492,7 +502,8 @@
     "tabDashboard": "看板",
     "tabResources": "资源",
     "petToggle": "显示/隐藏桌宠",
-    "clearFinishedCards": "一键清除已完成卡片"
+    "clearFinishedCards": "一键清除已完成卡片",
+    "filterAll": "全部"
   },
   "status": {
     "waiting": "待处理",
@@ -788,6 +799,7 @@
     }
   },
   "sessions": {
+    "filterEmpty": "「{{tool}}」暂无会话",
     "jumpToTerminal": "点击跳转到终端",
     "jumpUnsupported": "当前平台或形态不支持跳转",
     "jumpFailed": "跳转失败: {{error}}",

@@ -6,12 +6,15 @@ use tauri::{
     plugin::{Builder, TauriPlugin},
     AppHandle, Emitter, Manager, Runtime,
 };
+use tauri_plugin_autostart::ManagerExt;
 
 /// 托盘菜单标签集（Task 16 i18n 参数化）：真值源在前端（i18next），经 refresh_tray
 /// 下发并持久化到 settings；托盘事件线程 / session.rs 启发式等无前端语境的重建
 /// 路径沿用最近一次持久化值（此前预设重建会把基础项打回中文占位、语言切换会
 /// 丢预设项——统一重建后两个问题一并消除）。M4 T4 并入后新增 remote 字段
-///（远程开关项标签，勾选态/地址 Rust 侧自查 remote::tray_display）
+///（远程开关项标签，勾选态/地址 Rust 侧自查 remote::tray_display）。
+/// 2026-10-11 并入 autostart 字段（开机自启开关项标签；勾选态 = 重建时实时读
+/// autostart 插件状态，同样 Rust 侧自查——真值源在 OS 侧，不落 KV）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct TrayLabels {
@@ -22,6 +25,8 @@ pub struct TrayLabels {
     pub quit: String,
     /// 远程接入开关项标签（"远程接入" / "Remote Access"）
     pub remote: String,
+    /// 开机自启开关项标签（"开机自动启动" / "Launch at Login"）
+    pub autostart: String,
 }
 
 impl Default for TrayLabels {
@@ -33,6 +38,7 @@ impl Default for TrayLabels {
             pet: "显示/隐藏桌宠".into(),
             quit: "退出".into(),
             remote: "远程接入".into(),
+            autostart: "开机自动启动".into(),
         }
     }
 }
@@ -63,6 +69,7 @@ impl TrayLabels {
         pet: Option<String>,
         quit: Option<String>,
         remote: Option<String>,
+        autostart: Option<String>,
     ) -> Self {
         let mut labels = saved_tray_labels();
         if let Some(v) = presets {
@@ -79,6 +86,9 @@ impl TrayLabels {
         }
         if let Some(v) = remote {
             labels.remote = v;
+        }
+        if let Some(v) = autostart {
+            labels.autostart = v;
         }
         // set_setting 返回 ()（内部自兜错），持久化失败不影响本次重建
         crate::database::set_setting(
@@ -179,6 +189,24 @@ fn push_remote_items<'a, R: Runtime>(
     Ok(())
 }
 
+/// 开机自启勾选项（2026-10-11）：插在「显示主窗口」之后紧跟（用户裁决）。
+/// 勾选态 = `autostart` 插件实时读的 OS 侧真值（注册表 Run 键 / LaunchAgent
+/// 实际注册与否）——插件 `ManagerExt::autolaunch` 提供。三条重建路径统一走本
+/// helper 防漏挂（对齐 push_remote_items 模式；owned 容器存活语义见其注释）
+fn push_autostart_item<'a, R: Runtime>(
+    app: &AppHandle<R>,
+    items: &mut Vec<&'a dyn IsMenuItem<R>>,
+    owned: &'a mut Vec<CheckMenuItem<R>>,
+    label: &str,
+) -> Result<(), String> {
+    let checked = app.autolaunch().is_enabled().unwrap_or(false);
+    let item = CheckMenuItem::with_id(app, "autostart", label, true, checked, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    owned.push(item);
+    items.push(owned.last().unwrap() as _);
+    Ok(())
+}
+
 // Update tray menu with localized text（遗留基础路径：lib.rs 命令仍注册，
 // 前端已改走 refresh_tray 统一重建；保留至下个清理窗口与命令一并移除）
 pub fn update_tray_menu(
@@ -187,8 +215,9 @@ pub fn update_tray_menu(
     quit_text: &str,
     pet_text: &str,
     remote_on_text: &str,
+    autostart_text: &str,
 ) -> Result<(), String> {
-    // owned 容器 + 引用收集：远程区项（sep → 开关 → 地址）统一插在 quit 之前
+    // owned 容器 + 引用收集：自启项紧跟 show，远程区项（sep → 开关 → 地址）统一插在 quit 之前
     let show =
         MenuItem::with_id(app, "show", show_text, true, None::<&str>).map_err(|e| e.to_string())?;
     let pet =
@@ -197,7 +226,11 @@ pub fn update_tray_menu(
     let quit =
         MenuItem::with_id(app, "quit", quit_text, true, None::<&str>).map_err(|e| e.to_string())?;
 
-    let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![&show, &pet, &sep1];
+    let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![&show];
+    let mut autostart_owned: Vec<CheckMenuItem<tauri::Wry>> = Vec::new();
+    push_autostart_item(app, &mut items, &mut autostart_owned, autostart_text)?;
+    items.push(&pet);
+    items.push(&sep1);
     let mut remote_owned: Vec<CheckMenuItem<tauri::Wry>> = Vec::new();
     let mut remote_addr_owned: Vec<MenuItem<tauri::Wry>> = Vec::new();
     let mut remote_seps: Vec<PredefinedMenuItem<tauri::Wry>> = Vec::new();
@@ -231,7 +264,13 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             let sep1 = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-            let mut items: Vec<&dyn IsMenuItem<R>> = vec![&show, &pet, &sep1];
+            let mut items: Vec<&dyn IsMenuItem<R>> = vec![&show];
+            // 开机自启勾选项（2026-10-11）：勾选态 = OS 侧实时真值；文本为英文
+            // 占位（与同路径其它基础项一致），主窗口挂载后由前端本地化重建
+            let mut autostart_owned: Vec<CheckMenuItem<R>> = Vec::new();
+            push_autostart_item(app, &mut items, &mut autostart_owned, "Launch at Login")?;
+            items.push(&pet);
+            items.push(&sep1);
             let mut remote_owned: Vec<CheckMenuItem<R>> = Vec::new();
             let mut remote_addr_owned: Vec<MenuItem<R>> = Vec::new();
             let mut remote_seps: Vec<PredefinedMenuItem<R>> = Vec::new();
@@ -322,6 +361,28 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
                                 "remote-copy-addr",
                                 serde_json::json!({ "url": addr }),
                             );
+                        }
+                    }
+                    "autostart" => {
+                        // 开机自启翻转（2026-10-11）：读写全链收在 flip_and_sync 单点
+                        //（含 Windows 引号修复 I1 / debug 拒写门 N3 / 事件广播）。
+                        // 读失败不猜方向（评审 M1）：只告警，不翻转——随后统一重建让
+                        // 勾选态回落真实状态；翻转失败同样靠重建回落
+                        match app.autolaunch().is_enabled() {
+                            Ok(current) => {
+                                if let Err(e) =
+                                    crate::commands::autostart::flip_and_sync(app, !current)
+                                {
+                                    log::warn!("托盘开机自启翻转失败: {e}");
+                                } else {
+                                    log::info!("托盘开机自启翻转完成: {} → {}", current, !current);
+                                }
+                            }
+                            Err(e) => log::warn!("托盘开机自启：当前档不可判定，不翻转: {e}"),
+                        }
+                        let labels = saved_tray_labels();
+                        if let Err(e) = update_tray_with_presets_labeled(app, &labels) {
+                            log::warn!("托盘菜单重建失败: {e}");
                         }
                     }
                     // 预设接线（spec §7.5，P5）：点击 = 直接执行翻转（裁决 2026-09-15）。
@@ -447,6 +508,14 @@ pub fn update_tray_with_presets_labeled<R: Runtime>(
     let quit = MenuItem::with_id(app, "quit", &labels.quit, true, None::<&str>)
         .map_err(|e| e.to_string())?;
 
+    // 自启项紧跟 show（用户裁决位置；勾选态 = OS 侧实时真值）
+    let mut autostart_owned: Vec<CheckMenuItem<R>> = Vec::new();
+    let mut items: Vec<&dyn IsMenuItem<R>> = Vec::new();
+    items.push(&show);
+    push_autostart_item(app, &mut items, &mut autostart_owned, &labels.autostart)?;
+    items.push(&pet);
+    items.push(&sep1);
+
     // 已启用工具（通用预设子菜单的子项集；与 commands::settings::list_enabled_tools 同口径）
     let enabled_tools: Vec<(String, String)> = crate::adapter::TOOL_IDS
         .iter()
@@ -515,11 +584,7 @@ pub fn update_tray_with_presets_labeled<R: Runtime>(
         Some(PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?)
     };
 
-    // 收集引用
-    let mut items: Vec<&dyn IsMenuItem<R>> = Vec::new();
-    items.push(&show);
-    items.push(&pet);
-    items.push(&sep1);
+    // 预设项接在基础项（show → 自启 → pet → sep1）之后
     for item in &preset_items {
         items.push(item);
     }
@@ -640,7 +705,8 @@ mod startup_tray_labels_tests {
 
     /// serde(default) 容错口径：半截 JSON（缺字段）按 Default 补齐仍可用，
     /// 不判为损坏——语言切换只回写部分字段的旧版本数据也能正常恢复。
-    /// M4 T4 并入后 remote 同样享受缺省补齐（旧持久化值无 remote 字段）
+    /// M4 T4 并入后 remote 同样享受缺省补齐（旧持久化值无 remote 字段）；
+    /// 2026-10-11 autostart 同（升级用户的旧 tray_labels 值无该字段）
     #[test]
     fn partial_json_fills_defaults() {
         let labels =
@@ -649,5 +715,6 @@ mod startup_tray_labels_tests {
         assert_eq!(labels.show, TrayLabels::default().show);
         assert_eq!(labels.quit, TrayLabels::default().quit);
         assert_eq!(labels.remote, TrayLabels::default().remote);
+        assert_eq!(labels.autostart, TrayLabels::default().autostart);
     }
 }

@@ -14,7 +14,7 @@ import {
   type PetScan,
   type ValidationIssue,
 } from "./petValidation";
-import { saveVisible } from "./petConfig";
+import { saveConfig, saveVisible } from "./petConfig";
 import { isPetRpcError, petErrMsg, PetError } from "./petErrors";
 
 function toFoxbell(msgKey: string) {
@@ -115,6 +115,9 @@ export function PetStartupGuard() {
 
   const hidePet = () => {
     saveVisible(false);
+    // 启动跟随顺带关（2026-10-11 用户裁决）：素材损坏场景下「隐藏」是收走的意思，
+    // 不关跟随的话下次启动坏宠还会跟出来把守卫弹窗再弹一遍
+    saveConfig({ followStartup: false });
     void invoke("set_pet_visible", { visible: false }).catch(() => {});
     toast.info(t("pet.startup.petHidden"));
     setFatal(null);

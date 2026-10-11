@@ -22,7 +22,7 @@
 //   是 `commands/resource.rs` 的既有命令；Task 21 复用的是白名单核 `ensure_reveal_allowed`，
 //   并**没有**调 `reveal_dir`——导出侧首次接线在本任务）——**未新增命令、未新增权限/capability、
 //   未新增依赖**。定位与落盘**必须分开报错**（`export.rs` 明文：定位失败不代表导出失败）。
-import { SETTINGS_CARD_TITLE, SETTINGS_SUBTITLE } from "@/components/settings/typography";
+import { SETTINGS_CARD_TITLE } from "@/components/settings/typography";
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Activity, FolderOpen, RefreshCw } from "lucide-react";
@@ -175,226 +175,236 @@ export function UsageStatusSection() {
     ms > 0 ? new Date(ms).toLocaleString() : t("settings.usageStatus.neverCollected");
 
   return (
-    <div>
-      <div className="flex items-center justify-between gap-2">
+    <div className="overflow-hidden rounded-xl border">
+      {/* 卡头条（2026-10-11 两级标题拉开）：h2 保留档位常量搬进条内；说明收条右侧 */}
+      <div className="bg-muted/40 flex items-center justify-between gap-2 border-b px-4 py-2.5">
         <h2 className={SETTINGS_CARD_TITLE}>{t("settings.usageStatus.title")}</h2>
-        <Button
-          variant="outline"
-          size="sm"
-          data-testid="usage-status-collect"
-          onClick={() => void collect()}
-          disabled={collecting}
-        >
-          <RefreshCw className="mr-1 h-3 w-3" />
-          {/* 采集中钩子：只在在途期间带 testid（可测性的唯一抓手） */}
-          <span data-testid={collecting ? "usage-status-collecting" : undefined}>
-            {collecting ? t("settings.usageStatus.collecting") : t("settings.usageStatus.collect")}
+        <div className="flex min-w-0 items-baseline gap-2">
+          <span className="text-muted-foreground truncate text-xs">
+            {t("settings.usageStatus.description")}
           </span>
-        </Button>
-      </div>
-      <p className={`mt-1 ${SETTINGS_SUBTITLE}`}>{t("settings.usageStatus.description")}</p>
-
-      {/* 采集结果：汇总 + 逐源（失败源标红 + 错误码文案） */}
-      {collectError ? (
-        <p className="mt-3 text-sm text-red-500" data-testid="usage-status-collect-error">
-          {t("settings.usageStatus.collectFailed")}：{usageErrMsg(collectError, t)}
-        </p>
-      ) : null}
-      {result ? (
-        <div className="mt-3 space-y-2">
-          <div
-            className="text-muted-foreground flex flex-wrap gap-x-4 text-xs"
-            data-testid="usage-status-summary"
-          >
-            <span>
-              {/* 零源轮（总开关关闭）没有可报的截止时间：`collectedAt` 是「now」而**不是**读到的
-                  数据代际 → 写「—」，避免给不可得填一个像真的时间 */}
-              {t("settings.usageStatus.collectedAt")}：
-              {result.sources.length === 0
-                ? t("settings.usageStatus.notAvailable")
-                : fmtTime(result.collectedAt)}
-            </span>
-            <span>
-              {t("settings.usageStatus.duration")}：{result.durationMs} ms
-            </span>
-            <span>
-              {t("settings.usageStatus.newRecords")}：{result.totalNewRecords}
-            </span>
-          </div>
-          {result.sources.length === 0 ? (
-            // 总开关关闭时 `usage_collect` 返回空源列表（零扫描）→ 给显式空态，
-            // 否则「新增记录 0」会被误读成「采过、但没数据」
-            <p className="text-muted-foreground text-xs" data-testid="usage-status-no-sources">
-              {t("settings.usageStatus.noSources")}
-            </p>
-          ) : (
-            <div className="divide-border divide-y rounded-md border">
-              {result.sources.map((s) => (
-                <div
-                  key={s.sourceId}
-                  data-testid="usage-source-row"
-                  className="flex items-center justify-between gap-3 px-3 py-1.5"
-                >
-                  <div className="flex items-center gap-2">
-                    <Activity className="text-muted-foreground h-3.5 w-3.5" />
-                    <span className="font-mono text-xs">{s.sourceId}</span>
-                    {s.ok ? (
-                      <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-500">
-                        {t("settings.usageStatus.sourceOk")}
-                      </span>
-                    ) : (
-                      <span className="rounded bg-red-500/10 px-1.5 py-0.5 text-[10px] text-red-500">
-                        {t("settings.usageStatus.sourceFailed")}
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-muted-foreground flex items-center gap-3 text-[11px]">
-                    {!s.ok && s.errorCode ? (
-                      // 错误码走①的错误码表：usage.rpc.<code>（未知码在 usageErrMsg 内收敛 internal）。
-                      // 逐源失败**只有泛码**（契约 §2 的 UsageSourceStatus 无 detail 字段，W-28）
-                      <span className="text-red-500">{usageErrMsg({ code: s.errorCode }, t)}</span>
-                    ) : null}
-                    <span>
-                      {t("settings.usageStatus.parsedFiles")} {s.parsedFiles}
-                    </span>
-                    <span>
-                      {t("settings.usageStatus.newRecordsShort")} {s.newRecords}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      ) : null}
-
-      {/* 今日口径：三态（加载 / 错误可重试 / 空态） */}
-      <h3 className={`mt-5 ${SETTINGS_CARD_TITLE}`}>{t("settings.usageStatus.todayTitle")}</h3>
-      {/* 总开关关闭提示：关闭态 dashboard 早退成空态，与「今天没跑」在数字上完全同形，
-          只有这句提示能把两者分开（GC 7：不得把「不可得/被关掉」伪装成合法值） */}
-      {switchEnabled === false ? (
-        <p className="mt-2 text-sm text-amber-500" data-testid="usage-status-disabled">
-          {t("settings.usageStatus.disabledNotice")}
-        </p>
-      ) : null}
-      {loadError ? (
-        <div className="mt-2 flex items-center gap-2" data-testid="usage-status-error">
-          <p className="text-sm text-red-500">
-            {t("settings.usageStatus.loadError")}：{usageErrMsg(loadError, t)}
-          </p>
-          <Button variant="outline" size="sm" onClick={() => void loadToday()} disabled={loading}>
-            {t("settings.usageStatus.retry")}
-          </Button>
-        </div>
-      ) : loading && !today ? (
-        <p className="text-muted-foreground mt-2 text-sm">…</p>
-      ) : isEmpty ? (
-        <p className="text-muted-foreground mt-2 text-sm" data-testid="usage-status-empty">
-          {/* 已知关闭时**不**再说「可能今天没跑」（那就是把「被关掉」伪装成「没数据」） */}
-          {switchEnabled === false
-            ? t("settings.usageStatus.emptyDisabled")
-            : t("settings.usageStatus.empty")}
-        </p>
-      ) : today ? (
-        <div className="mt-2 grid gap-x-8 gap-y-1 sm:grid-cols-2">
-          <div data-testid="usage-today-buckets">
-            {BUCKET_KEYS.map((b) => (
-              <BucketRow key={b.key} label={t(b.i18n)} value={today.totalsBuckets[b.key]} />
-            ))}
-          </div>
-          <div>
-            <div className="flex items-baseline justify-between gap-4 py-0.5">
-              <span className="text-muted-foreground text-xs">
-                {t("settings.usageStatus.hitRate")}
-              </span>
-              {/* 契约：cacheHitRate 是 0–1 分数 → UI 乘 100 并保留 1 位小数。
-               **W-08**：分母（requests）为 0 时 0.0% 与「真的 0% 命中」不可区分 → 写「—」 */}
-              <span className="font-mono text-sm tabular-nums" data-testid="usage-today-hit-rate">
-                {today.totals.requests === 0
-                  ? t("settings.usageStatus.notAvailable")
-                  : `${(today.totals.cacheHitRate * 100).toFixed(1)}%`}
-              </span>
-            </div>
-            <div className="flex items-baseline justify-between gap-4 py-0.5">
-              <span className="text-muted-foreground text-xs">
-                {t("settings.usageStatus.requests")}
-              </span>
-              <span className="font-mono text-sm tabular-nums">
-                {today.totals.requests.toLocaleString()}
-              </span>
-            </div>
-            {/* GC 7：userEst 可空（zcode/opencode/dsh 恒 null）→ 空态「—」，**绝不显示 0**。
-                M4：用 `typeof … === "number"`（而非严格 `=== null`）兜住「上游漏序列化该键
-                → `undefined`」的情形，否则 `.toLocaleString()` 会抛、整段分区白屏 */}
-            <div
-              className="flex items-baseline justify-between gap-4 py-0.5"
-              data-testid="usage-today-user-est"
-            >
-              <span className="text-muted-foreground text-xs">
-                {t("settings.usageStatus.userEst")}
-              </span>
-              <span className="font-mono text-sm tabular-nums">
-                {typeof today.totals.userEst === "number" && Number.isFinite(today.totals.userEst)
-                  ? today.totals.userEst.toLocaleString()
-                  : t("settings.usageStatus.notAvailable")}
-              </span>
-            </div>
-            <div className="flex items-baseline justify-between gap-4 py-0.5">
-              <span className="text-muted-foreground text-xs">
-                {t("settings.usageStatus.collectedAt")}
-              </span>
-              <span className="text-xs">{fmtTime(today.collectedAt)}</span>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
-      {/* 导出今日 CSV + 打开所在目录：`ensure_reveal_allowed` 白名单的唯一手工验收点
-          （必须在**真机**上点，浏览器 mock 的 reveal_dir 是 no-op） */}
-      <div className="mt-5 space-y-1">
-        <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
             size="sm"
-            data-testid="usage-status-export"
-            onClick={() => void exportCsv()}
-            disabled={exporting}
+            data-testid="usage-status-collect"
+            onClick={() => void collect()}
+            disabled={collecting}
           >
-            <FolderOpen className="mr-1 h-3 w-3" />
-            {exporting
-              ? t("settings.usageStatus.exporting")
-              : t("settings.usageStatus.exportAndReveal")}
+            <RefreshCw className="mr-1 h-3 w-3" />
+            {/* 采集中钩子：只在在途期间带 testid（可测性的唯一抓手） */}
+            <span data-testid={collecting ? "usage-status-collecting" : undefined}>
+              {collecting
+                ? t("settings.usageStatus.collecting")
+                : t("settings.usageStatus.collect")}
+            </span>
           </Button>
-          {exportedPath ? (
-            <span
-              className="text-muted-foreground font-mono text-[11px]"
-              data-testid="usage-status-export-path"
-            >
-              {exportedPath}
-            </span>
-          ) : null}
-          {exportError ? (
-            <span className="text-sm text-red-500" data-testid="usage-status-export-error">
-              {t("settings.usageStatus.exportFailed")}：{usageErrMsg(exportError, t)}
-            </span>
-          ) : null}
-          {/* 定位失败**不是**导出失败（文件已落盘）：独立文案，且路径照常显示 */}
-          {revealFailed ? (
-            <span className="text-sm text-amber-500" data-testid="usage-status-reveal-error">
-              {t("settings.usageStatus.revealFailed", { path: exportedPath ?? "" })}
-            </span>
-          ) : null}
         </div>
-        <p className="text-muted-foreground text-xs">{t("settings.usageStatus.exportHint")}</p>
-        {/* **C-3（用户裁决：保持现状 + 补一条前端提示）**：CSV **不受**总开关门控（不改代码），
+      </div>
+      <div className="p-3">
+        {/* 采集结果：汇总 + 逐源（失败源标红 + 错误码文案） */}
+        {collectError ? (
+          <p className="mt-3 text-sm text-red-500" data-testid="usage-status-collect-error">
+            {t("settings.usageStatus.collectFailed")}：{usageErrMsg(collectError, t)}
+          </p>
+        ) : null}
+        {result ? (
+          <div className="mt-3 space-y-2">
+            <div
+              className="text-muted-foreground flex flex-wrap gap-x-4 text-xs"
+              data-testid="usage-status-summary"
+            >
+              <span>
+                {/* 零源轮（总开关关闭）没有可报的截止时间：`collectedAt` 是「now」而**不是**读到的
+                  数据代际 → 写「—」，避免给不可得填一个像真的时间 */}
+                {t("settings.usageStatus.collectedAt")}：
+                {result.sources.length === 0
+                  ? t("settings.usageStatus.notAvailable")
+                  : fmtTime(result.collectedAt)}
+              </span>
+              <span>
+                {t("settings.usageStatus.duration")}：{result.durationMs} ms
+              </span>
+              <span>
+                {t("settings.usageStatus.newRecords")}：{result.totalNewRecords}
+              </span>
+            </div>
+            {result.sources.length === 0 ? (
+              // 总开关关闭时 `usage_collect` 返回空源列表（零扫描）→ 给显式空态，
+              // 否则「新增记录 0」会被误读成「采过、但没数据」
+              <p className="text-muted-foreground text-xs" data-testid="usage-status-no-sources">
+                {t("settings.usageStatus.noSources")}
+              </p>
+            ) : (
+              <div className="divide-border divide-y rounded-md border">
+                {result.sources.map((s) => (
+                  <div
+                    key={s.sourceId}
+                    data-testid="usage-source-row"
+                    className="flex items-center justify-between gap-3 px-3 py-1.5"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Activity className="text-muted-foreground h-3.5 w-3.5" />
+                      <span className="font-mono text-xs">{s.sourceId}</span>
+                      {s.ok ? (
+                        <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-500">
+                          {t("settings.usageStatus.sourceOk")}
+                        </span>
+                      ) : (
+                        <span className="rounded bg-red-500/10 px-1.5 py-0.5 text-[10px] text-red-500">
+                          {t("settings.usageStatus.sourceFailed")}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-muted-foreground flex items-center gap-3 text-[11px]">
+                      {!s.ok && s.errorCode ? (
+                        // 错误码走①的错误码表：usage.rpc.<code>（未知码在 usageErrMsg 内收敛 internal）。
+                        // 逐源失败**只有泛码**（契约 §2 的 UsageSourceStatus 无 detail 字段，W-28）
+                        <span className="text-red-500">
+                          {usageErrMsg({ code: s.errorCode }, t)}
+                        </span>
+                      ) : null}
+                      <span>
+                        {t("settings.usageStatus.parsedFiles")} {s.parsedFiles}
+                      </span>
+                      <span>
+                        {t("settings.usageStatus.newRecordsShort")} {s.newRecords}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : null}
+
+        {/* 今日口径：三态（加载 / 错误可重试 / 空态） */}
+        <h3 className={`mt-5 ${SETTINGS_CARD_TITLE}`}>{t("settings.usageStatus.todayTitle")}</h3>
+        {/* 总开关关闭提示：关闭态 dashboard 早退成空态，与「今天没跑」在数字上完全同形，
+          只有这句提示能把两者分开（GC 7：不得把「不可得/被关掉」伪装成合法值） */}
+        {switchEnabled === false ? (
+          <p className="mt-2 text-sm text-amber-500" data-testid="usage-status-disabled">
+            {t("settings.usageStatus.disabledNotice")}
+          </p>
+        ) : null}
+        {loadError ? (
+          <div className="mt-2 flex items-center gap-2" data-testid="usage-status-error">
+            <p className="text-sm text-red-500">
+              {t("settings.usageStatus.loadError")}：{usageErrMsg(loadError, t)}
+            </p>
+            <Button variant="outline" size="sm" onClick={() => void loadToday()} disabled={loading}>
+              {t("settings.usageStatus.retry")}
+            </Button>
+          </div>
+        ) : loading && !today ? (
+          <p className="text-muted-foreground mt-2 text-sm">…</p>
+        ) : isEmpty ? (
+          <p className="text-muted-foreground mt-2 text-sm" data-testid="usage-status-empty">
+            {/* 已知关闭时**不**再说「可能今天没跑」（那就是把「被关掉」伪装成「没数据」） */}
+            {switchEnabled === false
+              ? t("settings.usageStatus.emptyDisabled")
+              : t("settings.usageStatus.empty")}
+          </p>
+        ) : today ? (
+          <div className="mt-2 grid gap-x-8 gap-y-1 sm:grid-cols-2">
+            <div data-testid="usage-today-buckets">
+              {BUCKET_KEYS.map((b) => (
+                <BucketRow key={b.key} label={t(b.i18n)} value={today.totalsBuckets[b.key]} />
+              ))}
+            </div>
+            <div>
+              <div className="flex items-baseline justify-between gap-4 py-0.5">
+                <span className="text-muted-foreground text-xs">
+                  {t("settings.usageStatus.hitRate")}
+                </span>
+                {/* 契约：cacheHitRate 是 0–1 分数 → UI 乘 100 并保留 1 位小数。
+                 **W-08**：分母（requests）为 0 时 0.0% 与「真的 0% 命中」不可区分 → 写「—」 */}
+                <span className="font-mono text-sm tabular-nums" data-testid="usage-today-hit-rate">
+                  {today.totals.requests === 0
+                    ? t("settings.usageStatus.notAvailable")
+                    : `${(today.totals.cacheHitRate * 100).toFixed(1)}%`}
+                </span>
+              </div>
+              <div className="flex items-baseline justify-between gap-4 py-0.5">
+                <span className="text-muted-foreground text-xs">
+                  {t("settings.usageStatus.requests")}
+                </span>
+                <span className="font-mono text-sm tabular-nums">
+                  {today.totals.requests.toLocaleString()}
+                </span>
+              </div>
+              {/* GC 7：userEst 可空（zcode/opencode/dsh 恒 null）→ 空态「—」，**绝不显示 0**。
+                M4：用 `typeof … === "number"`（而非严格 `=== null`）兜住「上游漏序列化该键
+                → `undefined`」的情形，否则 `.toLocaleString()` 会抛、整段分区白屏 */}
+              <div
+                className="flex items-baseline justify-between gap-4 py-0.5"
+                data-testid="usage-today-user-est"
+              >
+                <span className="text-muted-foreground text-xs">
+                  {t("settings.usageStatus.userEst")}
+                </span>
+                <span className="font-mono text-sm tabular-nums">
+                  {typeof today.totals.userEst === "number" && Number.isFinite(today.totals.userEst)
+                    ? today.totals.userEst.toLocaleString()
+                    : t("settings.usageStatus.notAvailable")}
+                </span>
+              </div>
+              <div className="flex items-baseline justify-between gap-4 py-0.5">
+                <span className="text-muted-foreground text-xs">
+                  {t("settings.usageStatus.collectedAt")}
+                </span>
+                <span className="text-xs">{fmtTime(today.collectedAt)}</span>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {/* 导出今日 CSV + 打开所在目录：`ensure_reveal_allowed` 白名单的唯一手工验收点
+          （必须在**真机**上点，浏览器 mock 的 reveal_dir 是 no-op） */}
+        <div className="mt-5 space-y-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              data-testid="usage-status-export"
+              onClick={() => void exportCsv()}
+              disabled={exporting}
+            >
+              <FolderOpen className="mr-1 h-3 w-3" />
+              {exporting
+                ? t("settings.usageStatus.exporting")
+                : t("settings.usageStatus.exportAndReveal")}
+            </Button>
+            {exportedPath ? (
+              <span
+                className="text-muted-foreground font-mono text-[11px]"
+                data-testid="usage-status-export-path"
+              >
+                {exportedPath}
+              </span>
+            ) : null}
+            {exportError ? (
+              <span className="text-sm text-red-500" data-testid="usage-status-export-error">
+                {t("settings.usageStatus.exportFailed")}：{usageErrMsg(exportError, t)}
+              </span>
+            ) : null}
+            {/* 定位失败**不是**导出失败（文件已落盘）：独立文案，且路径照常显示 */}
+            {revealFailed ? (
+              <span className="text-sm text-amber-500" data-testid="usage-status-reveal-error">
+                {t("settings.usageStatus.revealFailed", { path: exportedPath ?? "" })}
+              </span>
+            ) : null}
+          </div>
+          <p className="text-muted-foreground text-xs">{t("settings.usageStatus.exportHint")}</p>
+          {/* **C-3（用户裁决：保持现状 + 补一条前端提示）**：CSV **不受**总开关门控（不改代码），
             但关闭态下必须说清导出的是什么——「**已采集的历史账本**」。否则用户会以为导出的是
             「关闭后的空账本」，或以为要先打开开关才能导出。按钮本身**保留可点**：关掉采集后
             仍要能备份自己的历史账本（那才是真正的数据可用性损失），隐私风险不因开关变化。 */}
-        {switchEnabled === false ? (
-          <p className="text-xs text-amber-500" data-testid="usage-status-export-disabled-hint">
-            {t("settings.usageStatus.exportHintDisabled")}
-          </p>
-        ) : null}
+          {switchEnabled === false ? (
+            <p className="text-xs text-amber-500" data-testid="usage-status-export-disabled-hint">
+              {t("settings.usageStatus.exportHintDisabled")}
+            </p>
+          ) : null}
+        </div>
       </div>
     </div>
   );

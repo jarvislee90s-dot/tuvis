@@ -701,6 +701,15 @@ if (!isTauri) {
         }
         return Promise.resolve(null);
 
+      // 开机自动启动（2026-10-11）：mock 无法真写注册表/LaunchAgent——布尔镜像
+      // localStorage["mam-mock-autostart"]，set/get 同 key 回读（手验闭环）
+      case "get_autostart_enabled":
+        return Promise.resolve(localStorage.getItem("mam-mock-autostart") === "true");
+
+      case "set_autostart_enabled":
+        localStorage.setItem("mam-mock-autostart", String(args?.enabled === true));
+        return Promise.resolve(undefined);
+
       case "set_setting":
         // mock 无 DB：忽略版本镜像到 localStorage，get_setting 同 key 回读（手验忽略闭环）
         if (args?.key === "updater_skipped_version") {
@@ -862,7 +871,8 @@ if (!isTauri) {
       case "plugin:notification|is_permission_granted":
         return Promise.resolve(false);
 
-      // M4 T4：新增 remoteOnText 第四参——mock 无状态托盘，多余参数忽略（无返回）
+      // M4 T4：新增 remoteOnText 第四参；2026-10-11 又并入 autostartText 第五参
+      //（开机自启开关项标签）——mock 无状态托盘，多余参数忽略（无返回）
       case "update_tray_menu":
         return Promise.resolve(undefined);
 

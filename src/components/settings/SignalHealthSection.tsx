@@ -4,7 +4,7 @@
 // 数据源 = hook_signal_health（后端复用会话扫描快照 + 30s TTL 事件目录既有信息，
 // 零新增扫描预算）；挂载/手动刷新各拉一次，无轮询（同 AuditLogSection 惯例）。
 import { SETTINGS_FIELD } from "@/components/settings/typography";
-import { SETTINGS_CARD_TITLE, SETTINGS_SUBTITLE } from "@/components/settings/typography";
+import { SETTINGS_CARD_TITLE } from "@/components/settings/typography";
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Copy } from "lucide-react";
@@ -79,72 +79,79 @@ export function SignalHealthSection() {
   };
 
   return (
-    <div>
-      <div className="flex items-center justify-between gap-2">
+    <div className="overflow-hidden rounded-xl border">
+      {/* 卡头条（2026-10-11 两级标题拉开）：h2 保留档位常量搬进条内；说明收条右侧 */}
+      <div className="bg-muted/40 flex items-center justify-between gap-2 border-b px-4 py-2.5">
         <h2 className={SETTINGS_CARD_TITLE}>{t("settings.signalHealth.title")}</h2>
-        <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={loading}>
-          {t("settings.signalHealth.refresh")}
-        </Button>
-      </div>
-      <p className={`mt-1 ${SETTINGS_SUBTITLE}`}>{t("settings.signalHealth.description")}</p>
-
-      {items.length === 0 ? (
-        loadError ? (
-          <p className="mt-4 text-sm text-red-500" data-testid="signal-health-load-error">
-            {t("settings.signalHealth.loadError")}
-          </p>
-        ) : (
-          <p className="text-muted-foreground mt-4 text-sm">{t("settings.signalHealth.empty")}</p>
-        )
-      ) : (
-        <div className="divide-border mt-2 divide-y rounded-md border">
-          {items.map((h) => (
-            <div
-              key={h.toolId}
-              data-signal-row={h.toolId}
-              className="flex items-center justify-between gap-3 px-3 py-2"
-            >
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <ToolIcon toolId={h.toolId} size={16} />
-                <span className={SETTINGS_FIELD}>{h.label}</span>
-                {!h.registered ? (
-                  // 灰：未注册
-                  <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10px]">
-                    {t("settings.signalHealth.statusUnregistered")}
-                  </span>
-                ) : h.lastEventAt ? (
-                  // 绿：正常 · 最近事件 xx 前
-                  <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-500">
-                    {t("settings.signalHealth.ok", { ago: ago(h.lastEventAt) })}
-                  </span>
-                ) : h.hasActiveSessions ? (
-                  // 待办：判据命中（已注册 ∧ 活跃会话 ∧ 零事件）。文案按工具区分：
-                  // codex 有信任门（注册成功 ≠ 事件触发）→ 专属引导 + 复制 /hooks；
-                  // 其余工具无信任门 → 通用零事件排查文案（复制 /hooks 无意义，不显示）
-                  <>
-                    <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-500">
-                      {h.toolId === "codex"
-                        ? t("settings.signalHealth.trustNeeded", { tool: h.label })
-                        : t("settings.signalHealth.zeroEvents", { tool: h.label })}
-                    </span>
-                    {h.toolId === "codex" && (
-                      <Button variant="outline" size="sm" onClick={() => void copyCommand()}>
-                        <Copy className="mr-1 h-3 w-3" />
-                        {t("settings.signalHealth.copyCommand")}
-                      </Button>
-                    )}
-                  </>
-                ) : (
-                  // 中性：已注册但无活跃会话（零事件属正常等待，不算故障）
-                  <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10px]">
-                    {t("settings.signalHealth.noActiveSessions")}
-                  </span>
-                )}
-              </div>
-            </div>
-          ))}
+        <div className="flex min-w-0 items-baseline gap-2">
+          <span className="text-muted-foreground truncate text-xs">
+            {t("settings.signalHealth.description")}
+          </span>
+          <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={loading}>
+            {t("settings.signalHealth.refresh")}
+          </Button>
         </div>
-      )}
+      </div>
+
+      <div className="p-3">
+        {items.length === 0 ? (
+          loadError ? (
+            <p className="text-sm text-red-500" data-testid="signal-health-load-error">
+              {t("settings.signalHealth.loadError")}
+            </p>
+          ) : (
+            <p className="text-muted-foreground text-sm">{t("settings.signalHealth.empty")}</p>
+          )
+        ) : (
+          <div className="divide-border divide-y">
+            {items.map((h) => (
+              <div
+                key={h.toolId}
+                data-signal-row={h.toolId}
+                className="flex items-center justify-between gap-3 px-3 py-2"
+              >
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
+                  <ToolIcon toolId={h.toolId} size={16} />
+                  <span className={SETTINGS_FIELD}>{h.label}</span>
+                  {!h.registered ? (
+                    // 灰：未注册
+                    <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10px]">
+                      {t("settings.signalHealth.statusUnregistered")}
+                    </span>
+                  ) : h.lastEventAt ? (
+                    // 绿：正常 · 最近事件 xx 前
+                    <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-500">
+                      {t("settings.signalHealth.ok", { ago: ago(h.lastEventAt) })}
+                    </span>
+                  ) : h.hasActiveSessions ? (
+                    // 待办：判据命中（已注册 ∧ 活跃会话 ∧ 零事件）。文案按工具区分：
+                    // codex 有信任门（注册成功 ≠ 事件触发）→ 专属引导 + 复制 /hooks；
+                    // 其余工具无信任门 → 通用零事件排查文案（复制 /hooks 无意义，不显示）
+                    <>
+                      <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-500">
+                        {h.toolId === "codex"
+                          ? t("settings.signalHealth.trustNeeded", { tool: h.label })
+                          : t("settings.signalHealth.zeroEvents", { tool: h.label })}
+                      </span>
+                      {h.toolId === "codex" && (
+                        <Button variant="outline" size="sm" onClick={() => void copyCommand()}>
+                          <Copy className="mr-1 h-3 w-3" />
+                          {t("settings.signalHealth.copyCommand")}
+                        </Button>
+                      )}
+                    </>
+                  ) : (
+                    // 中性：已注册但无活跃会话（零事件属正常等待，不算故障）
+                    <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10px]">
+                      {t("settings.signalHealth.noActiveSessions")}
+                    </span>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

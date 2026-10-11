@@ -41,6 +41,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -156,6 +157,8 @@ type SettingSection =
   | "skin"
   | "notifications"
   | "pet"
+  // 开机自动启动（2026-10-11）：与通知/桌宠同属桌面行为块
+  | "autostart"
   | "tools"
   | "health"
   | "signal"
@@ -195,6 +198,16 @@ const SETTINGS_BLOCKS: {
   icon: LucideIcon;
   sections: SettingSection[];
 }[] = [
+  // 块序（2026-10-11 用户裁决）：桌面（通知/桌宠/自启）→ 外观与皮肤 → 远程接入 →
+  // 用量统计 → 工具与体检 → 数据管理
+  {
+    id: "desktop",
+    labelKey: "settings.nav.desktop",
+    descKey: "settings.nav.desktopDesc",
+    icon: Bell,
+    // 开机自动启动（2026-10-11）：软件级常规卡，与宠物卡内的「启动跟随」分卡分层
+    sections: ["notifications", "pet", "autostart"],
+  },
   {
     id: "appearance",
     labelKey: "settings.nav.appearance",
@@ -203,11 +216,11 @@ const SETTINGS_BLOCKS: {
     sections: ["appearance", "skin"],
   },
   {
-    id: "desktop",
-    labelKey: "settings.nav.desktop",
-    descKey: "settings.nav.desktopDesc",
-    icon: Bell,
-    sections: ["notifications", "pet"],
+    id: "remote",
+    labelKey: "settings.nav.remote",
+    descKey: "settings.nav.remoteDesc",
+    icon: Smartphone,
+    sections: ["remote", "signal", "audit"],
   },
   {
     id: "usage",
@@ -215,13 +228,6 @@ const SETTINGS_BLOCKS: {
     descKey: "settings.nav.usageDesc",
     icon: BarChart3,
     sections: ["usage", "usageStatus"],
-  },
-  {
-    id: "remote",
-    labelKey: "settings.nav.remote",
-    descKey: "settings.nav.remoteDesc",
-    icon: Smartphone,
-    sections: ["remote", "signal", "audit"],
   },
   {
     id: "tools",
@@ -242,6 +248,12 @@ const SETTINGS_BLOCKS: {
 export default function SettingsPage() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [subagentReportEnabled, setSubagentReportEnabled] = useState(true);
+  // 开机自动启动（2026-10-11）：真值源 = OS 侧插件状态（注册表/登录项，不落 KV
+  // 镜像），加载时实时读；托盘翻转经 autostart-changed 事件回流同步。缺省关
+  const [autostartEnabled, setAutostartEnabled] = useState(false);
+  // 用户动作过路标（终审 Min-3）：置位后丢弃尚未 resolve 的初读结果——
+  // 防挂载初读（毫秒级注册表读）在手速 toggle 之后 resolve 用陈旧值回退 UI
+  const autostartTouchedRef = useRef(false);
   // F2b 子 agent 活动打标静默开关（终审发现 C）：默认 true=静默，与消费侧
   // （useNotification / 手机端默认静默）同一缺省语义
   const [silenceSubagentFlap, setSilenceSubagentFlap] = useState(true);
@@ -249,8 +261,8 @@ export default function SettingsPage() {
   // 一级导航状态 = 当前**块**。块内所有卡片同时渲染（用户裁决的形态），故不再有
   // 「当前分区」这一层状态 —— 删掉 `activeSection` 是刻意的：留着一个不参与渲染的旧状态，
   // 会造出「工具卡已脏但守卫不触发」的空档（见 `switchBlock`）。
-  const [activeBlock, setActiveBlock] = useState<SettingBlock>("appearance");
-  /** 当前块要渲染的 12 个分区集合（JSX 里 12 处守卫都读它） */
+  const [activeBlock, setActiveBlock] = useState<SettingBlock>("desktop");
+  /** 当前块要渲染的 13 个分区集合（JSX 里 13 处守卫都读它；评审 n2 顺手修） */
   /** 当前块的元数据（侧栏与块标题共用同一张表；`??` 只为类型收窄，`activeBlock` 恒在表内） */
   const activeBlockMeta = SETTINGS_BLOCKS.find((b) => b.id === activeBlock) ?? SETTINGS_BLOCKS[0];
   const visibleIds = new Set(
@@ -328,6 +340,25 @@ export default function SettingsPage() {
         /* 缺省静默 */
       }
     })();
+  }, []);
+
+  // 开机自动启动（2026-10-11）：加载实时读 OS 侧真值；托盘翻转事件回流同步
+  //（两窗口各自独立 WebView，K/V 不互通，靠后端广播对齐）
+  useEffect(() => {
+    void (async () => {
+      try {
+        const v = await invoke<boolean>("get_autostart_enabled");
+        if (!autostartTouchedRef.current) setAutostartEnabled(v === true);
+      } catch {
+        /* 读取失败维持缺省关（不假开） */
+      }
+    })();
+    const unlisten = listen<{ enabled: boolean }>("autostart-changed", (e) => {
+      setAutostartEnabled(e.payload.enabled === true);
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
   }, []);
 
   useEffect(
@@ -520,6 +551,20 @@ export default function SettingsPage() {
     );
   };
 
+  // 开机自动启动（2026-10-11）：乐观更新对齐既有开关手感；enable/disable 写
+  // 注册表/LaunchAgent 可能被系统策略拦 → 失败回滚乐观态并如实报错
+  const toggleAutostart = async (next: boolean) => {
+    autostartTouchedRef.current = true;
+    setAutostartEnabled(next);
+    try {
+      await invoke("set_autostart_enabled", { enabled: next });
+      toast.success(next ? t("settings.autostart.onToast") : t("settings.autostart.offToast"));
+    } catch (e) {
+      setAutostartEnabled(!next);
+      toast.error(formatInvokeError(e, t));
+    }
+  };
+
   // 桌宠显隐：写 localStorage + 同步 Rust 端窗口创建/销毁
   const onPetVisibleChange = async (v: boolean) => {
     saveVisible(v);
@@ -573,81 +618,74 @@ export default function SettingsPage() {
 
       <div className="flex-1 overflow-auto">
         <div className="max-w-3xl space-y-4 p-4">
-          {/* 一级导航选中的那一块的标题 + 一句话说明（块内各节自带 h2，故这里是 h2 之上的块头） */}
-          <div>
-            <h2 className={`mb-1 ${SETTINGS_PAGE_TITLE}`}>{t(activeBlockMeta.labelKey)}</h2>
+          {/* 一级标题（2026-10-11 两级标题拉开）：左侧 primary 色条 + 大字块标题与说明行，
+              与卡内灰底小字头条（SETTINGS_CARD_TITLE 在 bg-muted 条内）形成强对比 */}
+          <div className="border-primary border-l-4 pl-3">
+            <h2 className={SETTINGS_PAGE_TITLE}>{t(activeBlockMeta.labelKey)}</h2>
             <p className={SETTINGS_SUBTITLE}>{t(activeBlockMeta.descKey)}</p>
           </div>
+          {/* 框一 · 桌面端外观（即点即生效，本期维持现状）——卡头条 = 二级卡头；
+              一级是页顶色条大标题。2026-10-11：卡外同名 h2 取缔（同名双标题正是
+              「两级分不清」的病灶） */}
           {visibleIds.has("appearance") && (
-            <div className="space-y-4">
-              <div>
-                <h2 className={`mb-1 ${SETTINGS_CARD_TITLE}`}>{t("settings.appearance.title")}</h2>
-                <p className={SETTINGS_SUBTITLE}>{t("settings.appearance.description")}</p>
+            <div className="overflow-hidden rounded-xl border">
+              <div className="bg-muted/40 flex items-baseline gap-2 border-b px-4 py-2.5">
+                <h2 className={SETTINGS_CARD_TITLE}>{t("settings.appearance.title")}</h2>
+                <span className="text-muted-foreground text-xs">
+                  {t("settings.remoteAppearance.desktopHint")}
+                </span>
+                <span className="ml-auto rounded-full bg-emerald-600/10 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
+                  {t("settings.remoteAppearance.localOnly")}
+                </span>
               </div>
-
-              {/* 框一 · 桌面端外观（即点即生效，本期维持现状） */}
-              <div className="overflow-hidden rounded-xl border">
-                <div className="bg-muted/40 flex items-baseline gap-2 border-b px-4 py-2.5">
-                  <span className="text-sm font-semibold">{t("settings.appearance.title")}</span>
-                  <span className="text-muted-foreground text-xs">
-                    {t("settings.remoteAppearance.desktopHint")}
-                  </span>
-                  <span className="ml-auto rounded-full bg-emerald-600/10 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
-                    {t("settings.remoteAppearance.localOnly")}
-                  </span>
-                </div>
-                <div className="px-4 py-1">
-                  <div className="space-y-0">
-                    <div className="flex items-center justify-between py-2.5">
-                      <label className={SETTINGS_FIELD}>{t("settings.appearance.theme")}</label>
-                      <div className="flex gap-2">
-                        <Button
-                          variant={theme === "light" ? "default" : "outline"}
-                          size="sm"
-                          onClick={() => setTheme("light")}
-                          className="flex items-center gap-1.5"
-                        >
-                          <Sun className="h-3.5 w-3.5" />
-                          {t("settings.appearance.light")}
-                        </Button>
-                        <Button
-                          variant={theme === "dark" ? "default" : "outline"}
-                          size="sm"
-                          onClick={() => setTheme("dark")}
-                          className="flex items-center gap-1.5"
-                        >
-                          <Moon className="h-3.5 w-3.5" />
-                          {t("settings.appearance.dark")}
-                        </Button>
-                        <Button
-                          variant={theme === "system" ? "default" : "outline"}
-                          size="sm"
-                          onClick={() => setTheme("system")}
-                          className="flex items-center gap-1.5"
-                        >
-                          <Monitor className="h-3.5 w-3.5" />
-                          {t("settings.appearance.system")}
-                        </Button>
-                      </div>
+              <div className="px-4 py-1">
+                <div className="space-y-0">
+                  <div className="flex items-center justify-between py-2.5">
+                    <label className={SETTINGS_FIELD}>{t("settings.appearance.theme")}</label>
+                    <div className="flex gap-2">
+                      <Button
+                        variant={theme === "light" ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setTheme("light")}
+                        className="flex items-center gap-1.5"
+                      >
+                        <Sun className="h-3.5 w-3.5" />
+                        {t("settings.appearance.light")}
+                      </Button>
+                      <Button
+                        variant={theme === "dark" ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setTheme("dark")}
+                        className="flex items-center gap-1.5"
+                      >
+                        <Moon className="h-3.5 w-3.5" />
+                        {t("settings.appearance.dark")}
+                      </Button>
+                      <Button
+                        variant={theme === "system" ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setTheme("system")}
+                        className="flex items-center gap-1.5"
+                      >
+                        <Monitor className="h-3.5 w-3.5" />
+                        {t("settings.appearance.system")}
+                      </Button>
                     </div>
+                  </div>
 
-                    <div className="border-t" />
+                  <div className="border-t" />
 
-                    <div className="flex items-center justify-between py-2.5">
-                      <label className={SETTINGS_FIELD}>{t("settings.appearance.language")}</label>
-                      <LanguageToggle />
-                    </div>
+                  <div className="flex items-center justify-between py-2.5">
+                    <label className={SETTINGS_FIELD}>{t("settings.appearance.language")}</label>
+                    <LanguageToggle />
                   </div>
                 </div>
               </div>
             </div>
           )}
 
-          {/* 远程端外观（皮肤）：**独立成卡**（2026-10-06 两级导航）。原先它是「外观」框二，
-              与「本机外观（主题 + 语言）」挤在同一个分区里；它本身就是一个完整的折叠配置器
-              （字体气质 / 皮肤底色 / 卡片圆角 / 品牌色 + 双列预览），拆开才与「外观与皮肤」这个
-              块名对得上，也才让「皮肤相关」在导航里有一处可指的位置。
-              它自带卡壳与折叠头，故这里**不再套一层卡**（套了就成卡中卡）。 */}
+          {/* 远程端外观（皮肤）：独立成卡（2026-10-06 两级导航）——桌面端外观 / 远程端外观
+              两卡标题按 2026-10-11 裁决区分（本卡配置器折叠交互已移除，常展开）。 */}
           {visibleIds.has("skin") && <RemoteAppearanceSection />}
 
           {/* 快捷键分区**整节已移除**（2026-10-07 用户裁决 D4：UI 与功能一起去掉）。
@@ -656,269 +694,321 @@ export default function SettingsPage() {
               设置块表里也不再有 `shortcut` 这一节。 */}
 
           {visibleIds.has("notifications") && (
-            <div className="space-y-4">
-              <div>
-                <h2 className={`mb-1 ${SETTINGS_CARD_TITLE}`}>
-                  {t("settings.notifications.heading")}
-                </h2>
-                <p className={SETTINGS_SUBTITLE}>{t("settings.notifications.description")}</p>
+            <div className="overflow-hidden rounded-xl border">
+              {/* 卡头条（2026-10-11 两级标题拉开）：h2 保留档位常量搬进条内；说明收条右侧 */}
+              <div className="bg-muted/40 flex items-baseline justify-between gap-2 border-b px-4 py-2.5">
+                <h2 className={SETTINGS_CARD_TITLE}>{t("settings.notifications.heading")}</h2>
+                <span className="text-muted-foreground truncate text-xs">
+                  {t("settings.notifications.description")}
+                </span>
               </div>
-              <div className="space-y-0">
-                <div className="flex items-center justify-between py-2.5">
-                  <div className="flex-1">
-                    <label className={SETTINGS_FIELD}>{t("settings.notifications.desktop")}</label>
-                    <p className="text-muted-foreground mt-0.5 text-xs">
-                      {t("settings.notifications.desktopDesc")}
-                    </p>
-                  </div>
-                  <Button
-                    variant={notificationsEnabled ? "default" : "outline"}
-                    size="sm"
-                    onClick={toggleNotifications}
-                  >
-                    {notificationsEnabled
-                      ? t("settings.notifications.on")
-                      : t("settings.notifications.off")}
-                  </Button>
-                </div>
-                <div className="border-t" />
-                <div className="flex items-center justify-between py-2.5">
-                  <div className="flex-1">
-                    <label className={SETTINGS_FIELD}>
-                      {t("settings.notifications.subagentReport")}
-                    </label>
-                    <p className="text-muted-foreground mt-0.5 text-xs">
-                      {t("settings.notifications.subagentReportDesc")}
-                    </p>
-                  </div>
-                  <Button
-                    variant={subagentReportEnabled ? "default" : "outline"}
-                    size="sm"
-                    onClick={toggleSubagentReport}
-                  >
-                    {subagentReportEnabled
-                      ? t("settings.notifications.on")
-                      : t("settings.notifications.off")}
-                  </Button>
-                </div>
-                <div className="border-t" />
-                {/* F2b 进阶开关（终审发现 C）：子 agent 活动引发的状态跃迁默认静默 */}
-                <div className="flex items-center justify-between py-2.5">
-                  <div className="flex-1">
-                    <label className={SETTINGS_FIELD}>
-                      {t("settings.notifications.silenceSubagentFlap")}
-                    </label>
-                    <p className="text-muted-foreground mt-0.5 text-xs">
-                      {t("settings.notifications.silenceSubagentFlapDesc")}
-                    </p>
-                  </div>
-                  <Button
-                    variant={silenceSubagentFlap ? "default" : "outline"}
-                    size="sm"
-                    onClick={toggleSilenceSubagentFlap}
-                  >
-                    {silenceSubagentFlap
-                      ? t("settings.notifications.on")
-                      : t("settings.notifications.off")}
-                  </Button>
-                </div>
-                <div className="border-t" />
-                <div className="space-y-3 py-2.5">
-                  {/* 全局完成音：所有工具默认播放的音效 */}
-                  <div className="flex items-center justify-between gap-2">
-                    <label className={SETTINGS_FIELD}>
-                      {t("settings.notifications.soundGlobalDefault")}
-                    </label>
-                    <div className="flex items-center gap-1.5">
-                      <select
-                        className="bg-background h-7 rounded border px-1.5 text-xs"
-                        value={soundConfig.default}
-                        onChange={(e) => updateSound({ default: e.currentTarget.value })}
-                      >
-                        {SOUND_IDS.map((id) => (
-                          <option key={id} value={id}>
-                            {id}
-                          </option>
-                        ))}
-                        <option value="mute">{t("settings.notifications.soundMute")}</option>
-                      </select>
-                      {soundConfig.default !== "mute" && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => playSound(soundConfig.default)}
-                        >
-                          <Volume2 className="mr-1 h-3 w-3" />
-                          {t("settings.notifications.soundTest")}
-                        </Button>
-                      )}
+              <div className="px-4 py-1">
+                <div className="space-y-0">
+                  <div className="flex items-center justify-between py-2.5">
+                    <div className="flex-1">
+                      <label className={SETTINGS_FIELD}>
+                        {t("settings.notifications.desktop")}
+                      </label>
+                      <p className="text-muted-foreground mt-0.5 text-xs">
+                        {t("settings.notifications.desktopDesc")}
+                      </p>
                     </div>
+                    <Button
+                      variant={notificationsEnabled ? "default" : "outline"}
+                      size="sm"
+                      onClick={toggleNotifications}
+                    >
+                      {notificationsEnabled
+                        ? t("settings.notifications.on")
+                        : t("settings.notifications.off")}
+                    </Button>
                   </div>
-                  {/* 工具专属音：覆盖全局默认，空值=跟随全局 */}
-                  <label className={SETTINGS_FIELD}>
-                    {t("settings.notifications.soundToolOverride")}
-                  </label>
-                  {enabledTools.map((tool) => {
-                    // 后端工具 id 与 audio.ts 的 SoundConfig.tools 键同源（P2-9：均由
-                    // AgentType 联合派生，tool.id 已具类型，无需 as keyof 强转）
-                    const key = tool.id;
-                    return (
-                      <div key={key} className="flex items-center justify-between gap-2">
-                        <span className="text-muted-foreground text-xs">{tool.label}</span>
-                        <div className="flex items-center gap-1.5">
-                          <select
-                            className="bg-background h-7 rounded border px-1.5 text-xs"
-                            value={soundConfig.tools[key] ?? ""}
-                            onChange={(e) =>
-                              updateSound({
-                                tools: {
-                                  ...soundConfig.tools,
-                                  [key]: e.currentTarget.value || undefined,
-                                },
-                              })
-                            }
-                          >
-                            <option value="">
-                              {t("settings.notifications.soundFollowGlobal")}
+                  <div className="border-t" />
+                  <div className="flex items-center justify-between py-2.5">
+                    <div className="flex-1">
+                      <label className={SETTINGS_FIELD}>
+                        {t("settings.notifications.subagentReport")}
+                      </label>
+                      <p className="text-muted-foreground mt-0.5 text-xs">
+                        {t("settings.notifications.subagentReportDesc")}
+                      </p>
+                    </div>
+                    <Button
+                      variant={subagentReportEnabled ? "default" : "outline"}
+                      size="sm"
+                      onClick={toggleSubagentReport}
+                    >
+                      {subagentReportEnabled
+                        ? t("settings.notifications.on")
+                        : t("settings.notifications.off")}
+                    </Button>
+                  </div>
+                  <div className="border-t" />
+                  {/* F2b 进阶开关（终审发现 C）：子 agent 活动引发的状态跃迁默认静默 */}
+                  <div className="flex items-center justify-between py-2.5">
+                    <div className="flex-1">
+                      <label className={SETTINGS_FIELD}>
+                        {t("settings.notifications.silenceSubagentFlap")}
+                      </label>
+                      <p className="text-muted-foreground mt-0.5 text-xs">
+                        {t("settings.notifications.silenceSubagentFlapDesc")}
+                      </p>
+                    </div>
+                    <Button
+                      variant={silenceSubagentFlap ? "default" : "outline"}
+                      size="sm"
+                      onClick={toggleSilenceSubagentFlap}
+                    >
+                      {silenceSubagentFlap
+                        ? t("settings.notifications.on")
+                        : t("settings.notifications.off")}
+                    </Button>
+                  </div>
+                  <div className="border-t" />
+                  <div className="space-y-3 py-2.5">
+                    {/* 全局完成音：所有工具默认播放的音效 */}
+                    <div className="flex items-center justify-between gap-2">
+                      <label className={SETTINGS_FIELD}>
+                        {t("settings.notifications.soundGlobalDefault")}
+                      </label>
+                      <div className="flex items-center gap-1.5">
+                        <select
+                          className="bg-background h-7 rounded border px-1.5 text-xs"
+                          value={soundConfig.default}
+                          onChange={(e) => updateSound({ default: e.currentTarget.value })}
+                        >
+                          {SOUND_IDS.map((id) => (
+                            <option key={id} value={id}>
+                              {id}
                             </option>
-                            {SOUND_IDS.map((id) => (
-                              <option key={id} value={id}>
-                                {id}
-                              </option>
-                            ))}
-                            <option value="mute">{t("settings.notifications.soundMute")}</option>
-                          </select>
+                          ))}
+                          <option value="mute">{t("settings.notifications.soundMute")}</option>
+                        </select>
+                        {soundConfig.default !== "mute" && (
                           <Button
                             variant="outline"
                             size="sm"
-                            onClick={() => {
-                              // 试听：优先该工具当前生效音（未配置则回退全局）
-                              const id = soundConfig.tools[key] || soundConfig.default;
-                              if (id !== "mute") playSound(id);
-                            }}
+                            onClick={() => playSound(soundConfig.default)}
                           >
                             <Volume2 className="mr-1 h-3 w-3" />
                             {t("settings.notifications.soundTest")}
                           </Button>
-                        </div>
+                        )}
                       </div>
-                    );
-                  })}
-                </div>
-                <div className="border-t" />
-                <div className="flex items-center justify-between py-2.5">
-                  <div className="flex-1">
+                    </div>
+                    {/* 工具专属音：覆盖全局默认，空值=跟随全局 */}
                     <label className={SETTINGS_FIELD}>
-                      {t("settings.notifications.floatTest")}
+                      {t("settings.notifications.soundToolOverride")}
                     </label>
-                    <p className="text-muted-foreground mt-0.5 text-xs">
-                      {t("settings.notifications.floatTestDesc")}
-                    </p>
+                    {enabledTools.map((tool) => {
+                      // 后端工具 id 与 audio.ts 的 SoundConfig.tools 键同源（P2-9：均由
+                      // AgentType 联合派生，tool.id 已具类型，无需 as keyof 强转）
+                      const key = tool.id;
+                      return (
+                        <div key={key} className="flex items-center justify-between gap-2">
+                          <span className="text-muted-foreground text-xs">{tool.label}</span>
+                          <div className="flex items-center gap-1.5">
+                            <select
+                              className="bg-background h-7 rounded border px-1.5 text-xs"
+                              value={soundConfig.tools[key] ?? ""}
+                              onChange={(e) =>
+                                updateSound({
+                                  tools: {
+                                    ...soundConfig.tools,
+                                    [key]: e.currentTarget.value || undefined,
+                                  },
+                                })
+                              }
+                            >
+                              <option value="">
+                                {t("settings.notifications.soundFollowGlobal")}
+                              </option>
+                              {SOUND_IDS.map((id) => (
+                                <option key={id} value={id}>
+                                  {id}
+                                </option>
+                              ))}
+                              <option value="mute">{t("settings.notifications.soundMute")}</option>
+                            </select>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => {
+                                // 试听：优先该工具当前生效音（未配置则回退全局）
+                                const id = soundConfig.tools[key] || soundConfig.default;
+                                if (id !== "mute") playSound(id);
+                              }}
+                            >
+                              <Volume2 className="mr-1 h-3 w-3" />
+                              {t("settings.notifications.soundTest")}
+                            </Button>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={async () => {
-                      try {
-                        // [Bug A 取证插桩·临时] 第二调用方（设置页浮窗试听按钮，手动触发）：
-                        // 带 3 帧栈提示，用于与 useNotification 主路径对账（H1 排除用）
-                        console.debug(
-                          "[notif] SHOW_WINDOW(settings-test)",
-                          new Error().stack?.split("\n").slice(0, 3).join(" | "),
-                          Date.now()
-                        );
-                        await invoke("show_notification_window", {
-                          payload: {
-                            agentType: "claude",
-                            agentLabel: "Claude",
-                            projectName: t("settings.notifications.testProject"),
-                            statusColor: "yellow",
-                            status: "waiting",
-                            lastMessage: t("settings.notifications.testMessage"),
-                            title: "",
-                            pid: 0,
-                            sessionId: "test",
-                          },
-                        });
-                      } catch (e) {
-                        console.error("float preview failed:", e);
-                      }
-                    }}
-                  >
-                    <Bell className="mr-1.5 h-3.5 w-3.5" />
-                    {t("settings.notifications.testFloat")}
-                  </Button>
+                  <div className="border-t" />
+                  <div className="flex items-center justify-between py-2.5">
+                    <div className="flex-1">
+                      <label className={SETTINGS_FIELD}>
+                        {t("settings.notifications.floatTest")}
+                      </label>
+                      <p className="text-muted-foreground mt-0.5 text-xs">
+                        {t("settings.notifications.floatTestDesc")}
+                      </p>
+                    </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={async () => {
+                        try {
+                          // [Bug A 取证插桩·临时] 第二调用方（设置页浮窗试听按钮，手动触发）：
+                          // 带 3 帧栈提示，用于与 useNotification 主路径对账（H1 排除用）
+                          console.debug(
+                            "[notif] SHOW_WINDOW(settings-test)",
+                            new Error().stack?.split("\n").slice(0, 3).join(" | "),
+                            Date.now()
+                          );
+                          await invoke("show_notification_window", {
+                            payload: {
+                              agentType: "claude",
+                              agentLabel: "Claude",
+                              projectName: t("settings.notifications.testProject"),
+                              statusColor: "yellow",
+                              status: "waiting",
+                              lastMessage: t("settings.notifications.testMessage"),
+                              title: "",
+                              pid: 0,
+                              sessionId: "test",
+                            },
+                          });
+                        } catch (e) {
+                          console.error("float preview failed:", e);
+                        }
+                      }}
+                    >
+                      <Bell className="mr-1.5 h-3.5 w-3.5" />
+                      {t("settings.notifications.testFloat")}
+                    </Button>
+                  </div>
                 </div>
               </div>
             </div>
           )}
 
           {visibleIds.has("pet") && (
-            <div className="space-y-4">
-              <div>
-                <h2 className={`mb-1 ${SETTINGS_CARD_TITLE}`}>{t("settings.pet.title")}</h2>
-                <p className={SETTINGS_SUBTITLE}>{t("settings.pet.desc")}</p>
+            <div className="overflow-hidden rounded-xl border">
+              {/* 卡头条（2026-10-11 两级标题拉开）：h2 保留档位常量搬进条内；说明收条右侧 */}
+              <div className="bg-muted/40 flex items-baseline justify-between gap-2 border-b px-4 py-2.5">
+                <h2 className={SETTINGS_CARD_TITLE}>{t("settings.pet.title")}</h2>
+                <span className="text-muted-foreground truncate text-xs">
+                  {t("settings.pet.desc")}
+                </span>
               </div>
-              <div className="space-y-0">
-                {/* 开启开关：显隐同步 Rust 端创建/销毁宠物窗口 */}
-                <div className="flex items-center justify-between py-2.5">
-                  <div className="flex-1">
-                    <label className={SETTINGS_FIELD}>{t("settings.pet.enable")}</label>
+              <div className="px-4 py-1">
+                <div className="space-y-0">
+                  {/* 开启开关：显隐同步 Rust 端创建/销毁宠物窗口 */}
+                  <div className="flex items-center justify-between py-2.5">
+                    <div className="flex-1">
+                      <label className={SETTINGS_FIELD}>{t("settings.pet.enable")}</label>
+                    </div>
+                    <Switch checked={petVisible} onCheckedChange={onPetVisibleChange} />
                   </div>
-                  <Switch checked={petVisible} onCheckedChange={onPetVisibleChange} />
-                </div>
-                <div className="border-t" />
-                {/* 置顶开关：置顶时抑制主窗口浮窗通知（spec D4） */}
-                <div className="flex items-center justify-between py-2.5">
-                  <div className="flex-1">
-                    <label className={SETTINGS_FIELD}>{t("settings.pet.alwaysOnTop")}</label>
+                  <div className="border-t" />
+                  {/* 启动跟随开关（2026-10-11 用户裁决）：开 = 软件每次启动自动跟出（哪怕
+                    上次隐身——显隐开关只管本会话中途）；关 = 启动后先不出，托盘/标题栏
+                    随时可开。未设置过 = 默认开（petConfig 缺省位） */}
+                  <div className="flex items-center justify-between py-2.5">
+                    <div className="flex-1">
+                      <label className={SETTINGS_FIELD}>{t("settings.pet.followStartup")}</label>
+                      <p className="text-muted-foreground mt-0.5 text-xs">
+                        {t("settings.pet.followStartupDesc")}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={petCfg.followStartup}
+                      onCheckedChange={(v) => onPetCfgChange({ followStartup: v })}
+                    />
                   </div>
-                  <Switch
-                    checked={petCfg.alwaysOnTop}
-                    onCheckedChange={(v) => onPetCfgChange({ alwaysOnTop: v })}
-                  />
-                </div>
-                <div className="border-t" />
-                {/* 大小三档 */}
-                <div className="flex items-center justify-between py-2.5">
-                  <label className={SETTINGS_FIELD}>{t("settings.pet.scale")}</label>
-                  <div className="flex gap-1">
-                    {PET_SCALES.map((s) => (
-                      <button
-                        key={s}
-                        onClick={() => onPetCfgChange({ scale: s })}
-                        className={`rounded px-3 py-1 text-sm transition-colors ${
-                          petCfg.scale === s
-                            ? "bg-accent text-accent-foreground font-medium"
-                            : "text-muted-foreground hover:bg-accent/50"
-                        }`}
-                      >
-                        {s === 0.75
-                          ? t("pet.scale.small")
-                          : s === 1
-                            ? t("pet.scale.medium")
-                            : t("pet.scale.large")}
-                      </button>
-                    ))}
+                  <div className="border-t" />
+                  {/* 置顶开关：置顶时抑制主窗口浮窗通知（spec D4） */}
+                  <div className="flex items-center justify-between py-2.5">
+                    <div className="flex-1">
+                      <label className={SETTINGS_FIELD}>{t("settings.pet.alwaysOnTop")}</label>
+                    </div>
+                    <Switch
+                      checked={petCfg.alwaysOnTop}
+                      onCheckedChange={(v) => onPetCfgChange({ alwaysOnTop: v })}
+                    />
+                  </div>
+                  <div className="border-t" />
+                  {/* 大小三档 */}
+                  <div className="flex items-center justify-between py-2.5">
+                    <label className={SETTINGS_FIELD}>{t("settings.pet.scale")}</label>
+                    <div className="flex gap-1">
+                      {PET_SCALES.map((s) => (
+                        <button
+                          key={s}
+                          onClick={() => onPetCfgChange({ scale: s })}
+                          className={`rounded px-3 py-1 text-sm transition-colors ${
+                            petCfg.scale === s
+                              ? "bg-accent text-accent-foreground font-medium"
+                              : "text-muted-foreground hover:bg-accent/50"
+                          }`}
+                        >
+                          {s === 0.75
+                            ? t("pet.scale.small")
+                            : s === 1
+                              ? t("pet.scale.medium")
+                              : t("pet.scale.large")}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="border-t" />
+                  {/* 当前宠物 + 三入口（spec §11）：切换在 Task 13，导入在 Task 16，修改在 Task 17 */}
+                  <div className="flex items-center justify-between gap-2 py-2.5">
+                    <label className={SETTINGS_FIELD}>{t("settings.pet.currentPet")}</label>
+                    <span className="text-muted-foreground mr-auto pl-2 text-sm">
+                      {activePetName}
+                    </span>
+                    <div className="flex gap-2">
+                      <Button size="sm" variant="outline" onClick={() => setSwitchOpen(true)}>
+                        {t("settings.pet.switchPet")}
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
+                        {t("settings.pet.importPet")}
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={() => setManageOpen(true)}>
+                        {t("settings.pet.managePet")}
+                      </Button>
+                    </div>
                   </div>
                 </div>
-                <div className="border-t" />
-                {/* 当前宠物 + 三入口（spec §11）：切换在 Task 13，导入在 Task 16，修改在 Task 17 */}
-                <div className="flex items-center justify-between gap-2 py-2.5">
-                  <label className={SETTINGS_FIELD}>{t("settings.pet.currentPet")}</label>
-                  <span className="text-muted-foreground mr-auto pl-2 text-sm">
-                    {activePetName}
-                  </span>
-                  <div className="flex gap-2">
-                    <Button size="sm" variant="outline" onClick={() => setSwitchOpen(true)}>
-                      {t("settings.pet.switchPet")}
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
-                      {t("settings.pet.importPet")}
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={() => setManageOpen(true)}>
-                      {t("settings.pet.managePet")}
-                    </Button>
+              </div>
+            </div>
+          )}
+
+          {/* 开机自动启动（2026-10-11）：「通知与桌宠」块的软件级常规卡（与宠物卡内的
+              「启动跟随」分卡分层——本开关管整个软件与 OS 自启项，勾选态 = OS 侧实时真值） */}
+          {visibleIds.has("autostart") && (
+            <div className="overflow-hidden rounded-xl border">
+              <div className="bg-muted/40 flex items-baseline justify-between gap-2 border-b px-4 py-2.5">
+                <h2 className={SETTINGS_CARD_TITLE}>{t("settings.autostart.heading")}</h2>
+                <span className="text-muted-foreground truncate text-xs">
+                  {t("settings.autostart.description")}
+                </span>
+              </div>
+              <div className="px-4 py-1">
+                <div className="space-y-0">
+                  <div className="flex items-center justify-between py-2.5">
+                    <div className="flex-1">
+                      <label className={SETTINGS_FIELD}>{t("settings.autostart.row")}</label>
+                      <p className="text-muted-foreground mt-0.5 text-xs">
+                        {t("settings.autostart.rowDesc")}
+                      </p>
+                    </div>
+                    <Switch checked={autostartEnabled} onCheckedChange={toggleAutostart} />
                   </div>
                 </div>
               </div>
@@ -926,49 +1016,59 @@ export default function SettingsPage() {
           )}
 
           {visibleIds.has("tools") && (
-            <div className="space-y-4">
-              <div>
-                <h2 className={`mb-1 ${SETTINGS_CARD_TITLE}`}>{t("settings.tools.title")}</h2>
-                <p className={SETTINGS_SUBTITLE}>{t("settings.tools.hint")}</p>
+            <div className="overflow-hidden rounded-xl border">
+              {/* 卡头条（2026-10-11 两级标题拉开）：h2 保留档位常量搬进条内；说明收条右侧 */}
+              <div className="bg-muted/40 flex items-baseline justify-between gap-2 border-b px-4 py-2.5">
+                <h2 className={SETTINGS_CARD_TITLE}>{t("settings.tools.title")}</h2>
+                <span className="text-muted-foreground truncate text-xs">
+                  {t("settings.tools.hint")}
+                </span>
               </div>
-              {/* 行式开关列表：名称 + 安装状态 badge + Switch */}
-              <div className="divide-border divide-y rounded-md border">
-                {toolRows.map((r) => (
-                  <div key={r.toolId} className="flex items-center justify-between px-3 py-2">
-                    <div className="flex items-center gap-2">
-                      {/* issue #36-6：行首补图标（spec §6「图标 + 名称 + badge + 开关」） */}
-                      <ToolIcon toolId={r.toolId} size={16} />
-                      <span className={SETTINGS_FIELD}>{r.name}</span>
-                      <span
-                        className={cn(
-                          `rounded px-1.5 py-0.5 ${SETTINGS_BADGE}`,
-                          r.installed
-                            ? "bg-emerald-500/10 text-emerald-500"
-                            : "bg-muted text-muted-foreground"
-                        )}
-                      >
-                        {r.installed
-                          ? t("settings.tools.installed")
-                          : t("settings.tools.notInstalled")}
-                      </span>
+              <div className="px-1 py-1">
+                {/* 行式开关列表：名称 + 安装状态 badge + Switch */}
+                <div className="divide-border divide-y">
+                  {toolRows.map((r) => (
+                    <div key={r.toolId} className="flex items-center justify-between px-3 py-2">
+                      <div className="flex items-center gap-2">
+                        {/* issue #36-6：行首补图标（spec §6「图标 + 名称 + badge + 开关」） */}
+                        <ToolIcon toolId={r.toolId} size={16} />
+                        <span className={SETTINGS_FIELD}>{r.name}</span>
+                        <span
+                          className={cn(
+                            `rounded px-1.5 py-0.5 ${SETTINGS_BADGE}`,
+                            r.installed
+                              ? "bg-emerald-500/10 text-emerald-500"
+                              : "bg-muted text-muted-foreground"
+                          )}
+                        >
+                          {r.installed
+                            ? t("settings.tools.installed")
+                            : t("settings.tools.notInstalled")}
+                        </span>
+                      </div>
+                      <Switch
+                        checked={r.enabled}
+                        onCheckedChange={(v) => toggleTool(r.toolId, v)}
+                      />
                     </div>
-                    <Switch checked={r.enabled} onCheckedChange={(v) => toggleTool(r.toolId, v)} />
-                  </div>
-                ))}
+                  ))}
+                </div>
+                {toolDirty && (
+                  <Button onClick={() => setConfirmOpen(true)}>{t("settings.tools.save")}</Button>
+                )}
               </div>
-              {toolDirty && (
-                <Button onClick={() => setConfirmOpen(true)}>{t("settings.tools.save")}</Button>
-              )}
             </div>
           )}
 
-          {/* 一致性体检（spec §13）：同 query 数据只读摘要 + 立即体检（处置入口在资源页卡片） */}
+          {/* 一致性体检（spec §13）：同 query 数据只读摘要（处置入口在资源页卡片） */}
           {visibleIds.has("health") && (
-            <div className="space-y-4">
-              <div>
-                <h2 className={`mb-1 ${SETTINGS_CARD_TITLE}`}>{t("resources.health.title")}</h2>
+            <div className="overflow-hidden rounded-xl border">
+              <div className="bg-muted/40 flex items-baseline gap-2 border-b px-4 py-2.5">
+                <h2 className={SETTINGS_CARD_TITLE}>{t("resources.health.title")}</h2>
               </div>
-              <HealthSummary />
+              <div className="p-3">
+                <HealthSummary />
+              </div>
             </div>
           )}
           {visibleIds.has("remote") && <RemoteSection />}

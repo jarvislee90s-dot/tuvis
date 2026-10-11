@@ -23,6 +23,8 @@ export function LanguageToggle() {
         // M4 T4：远程开关项标签随语言重建（勾选态 Rust 侧自查）；
         // main 侧 preset-v2 补的 quitText 一并传入（合并：两侧参数并集）
         remoteOnText: t("tray.remote", { lng: newLang }),
+        // 2026-10-11：开机自启开关项标签随语言重建（勾选态 Rust 侧自查）
+        autostartText: t("tray.autostart", { lng: newLang }),
         quitText: t("tray.quit", { lng: newLang }),
       });
     } catch (error) {

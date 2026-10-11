@@ -7,6 +7,7 @@
 //   1. window_alive：OS 层校验（hwnd 失效即未落地），不信任 build() 的返回值
 //   2. create_pet_window：幽灵销毁重建 + 重试（5 次 × 300ms）
 //   3. set_pet_visible(true) 兜底：窗口缺失/幽灵时现场重建，保证开关必然拉出桌宠
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 const PET_W: f64 = 340.0;
@@ -60,6 +61,16 @@ fn clear_pet_window(app: &AppHandle) {
     }
 }
 
+/// 页面显隐权威已行使标记（评审 B1，2026-10-11）：`set_pet_visible` 的调用来源
+///（宠物页面 / 标题栏 / 设置页 / 启动守卫）都算「权威到过场」；注意**托盘臂
+/// 不是**——它是窗口级直 show/hide、不经本命令，不在登记面（复评 I-1 如实
+/// 修正：托盘在启动 ~5.8s 窗内的显隐不被兜底尊重，极窄时窗，留 fast-follow 收）。
+/// 启动兜底触发前查它——兜底存在的意义是「页面死了救活」；页面活着且明确发声
+///（含**把窗口藏起来**的那一次：跟随关的启动路径）就不许 5s 后翻脸把它弹回去。
+/// 复位纪律：**只在新建成功**分支复位（新页面还没说过话）；复用已有窗口不复位
+///（旧页面的隐藏决定继续权威）。
+static PET_PAGE_SPOKE: AtomicBool = AtomicBool::new(false);
+
 /// **启动兜底**（2026-10-07 用户裁决 E2）：宠物窗口是**隐藏态**建的，而把它显示出来的**唯一**
 /// 路径是宠物页面自己的 JS（`pet.tsx` 那条 `invoke("set_pet_visible", …)`）。
 ///
@@ -87,6 +98,12 @@ fn schedule_show_fallback(app: &AppHandle) {
         };
         // 正常路径：页面已经自己显示过了（那就什么都不做）。窗口没了也别碰。
         if !window_alive(&w) || w.is_visible().unwrap_or(false) {
+            return;
+        }
+        // 评审 B1：页面行使过显隐权威（哪怕是把窗口**藏起来**的那次——启动跟随
+        // 关掉的路径）＝页面活着且已有决定，兜底不得二次解释
+        if PET_PAGE_SPOKE.load(Ordering::SeqCst) {
+            log::info!("pet window 页面已行使显隐权威 → 启动兜底不插手");
             return;
         }
         log::warn!(
@@ -136,6 +153,8 @@ pub fn create_pet_window(app: &AppHandle) -> Result<(), String> {
                     if attempt > 1 {
                         log::info!("pet window 第 {} 次尝试创建成功", attempt);
                     }
+                    // 评审 B1：新窗口＝新页面还没说过话，权威标记复位（复用分支不复位）
+                    PET_PAGE_SPOKE.store(false, Ordering::SeqCst);
                     schedule_show_fallback(app);
                     return Ok(());
                 }
@@ -226,6 +245,9 @@ fn build_pet_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
 
 #[tauri::command]
 pub async fn set_pet_visible(app: AppHandle, visible: bool) -> Result<(), String> {
+    // 评审 B1：显隐权威行使登记——无论来源与方向，页面体系的显隐声音已经出现过，
+    // 5s 启动兜底就此闭嘴（详见 PET_PAGE_SPOKE 注释）
+    PET_PAGE_SPOKE.store(true, Ordering::SeqCst);
     if visible {
         // 开启兜底：窗口缺失或幽灵（启动竞态被吞错）→ 现场重建再显示，
         // 保证无论启动抽签结果如何，开关一定能把桌宠拉出来

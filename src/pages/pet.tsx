@@ -4,7 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { Toaster } from "@/components/ui/sonner";
 import { FoxbellPet } from "@/components/pet/FoxbellPet";
-import { loadConfig, loadVisible, saveVisible, subscribeConfig } from "@/components/pet/petConfig";
+import { loadConfig, saveVisible, subscribeConfig } from "@/components/pet/petConfig";
 import { invoke } from "@tauri-apps/api/core";
 
 export default function PetPage() {
@@ -12,11 +12,16 @@ export default function PetPage() {
     // 诊断（决策三输入）：这一行回答「本次走的是哪条路」——`visible` 决定是否 show，
     // `alwaysOnTop` 决定置顶是否被设，`hash` 证明这个 WebView 确实被判成了宠物窗口
     // （`main.tsx` 按 `#/pet` 分流；分错了会静默回落首页 ⇒ 本 effect 压根不跑）。
-    const requestedVisible = loadVisible();
+    // 启动跟随（2026-10-11 用户裁决）：requestedVisible 改读 followStartup——
+    // 开（默认）= 每次启动都 show + set_pet_visible(true)（上次隐身也跟出，「显隐」
+    // 只管本会话中途，会被这一把重置为 true）；关 = 启动后先不出（requested=false，
+    // 与「宠物被关掉」同一安全路径：可见态建窗 + 页面挂载后收回）。
     const cfg = loadConfig();
+    const requestedVisible = cfg.followStartup;
     console.info("[pet] mount", {
       hash: window.location.hash,
       visible: requestedVisible,
+      followStartup: cfg.followStartup,
       alwaysOnTop: cfg.alwaysOnTop,
     });
     const apply = async () => {
@@ -45,6 +50,11 @@ export default function PetPage() {
     // 诊断（**最要紧的一行**）：这个调用是宠物窗口**唯一**的显示路径，而原先的
     // `.catch(() => {})` 把它的一切失败都吞掉了 ——「宠物不显示」因此**永远无迹可查**。
     // 失败必须留痕，且要带上「发出去的 visible 值」，否则分不清是「没发」还是「发了没生效」。
+    // 启动决策落为权威值（评审 M1）：visible 键必须与窗口实况同步——跟随跟出把
+    // 上次隐身覆盖为 true（storage 事件把标题栏/设置页开关同步成开，FoxbellPet
+    // 的语音闸门随 loadVisible() 放行，跟出来的宠物不再哑）；跟随关写 false
+    //（防隐形宠物的幽灵语音与「浮窗被 petSuppressPopup 抑制」的黑窗）
+    saveVisible(requestedVisible);
     invoke("set_pet_visible", { visible: requestedVisible }).catch((e) => {
       console.error("[pet] set_pet_visible 失败", { requested: requestedVisible, error: e });
     });

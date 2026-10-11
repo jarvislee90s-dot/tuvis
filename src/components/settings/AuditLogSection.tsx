@@ -62,63 +62,66 @@ export function AuditLogSection() {
   }, [refresh]);
 
   return (
-    <div>
-      <div className="flex items-center justify-between gap-2">
+    <div className="overflow-hidden rounded-xl border">
+      {/* 卡头条（2026-10-11 两级标题拉开）：h2 保留档位常量搬进条内（测试锁/语义不动） */}
+      <div className="bg-muted/40 flex items-center justify-between gap-2 border-b px-4 py-2.5">
         <h2 className={SETTINGS_CARD_TITLE}>{t("settings.audit.title")}</h2>
         <Button variant="outline" size="sm" onClick={() => void refresh()} disabled={loading}>
           {t("settings.audit.refresh")}
         </Button>
       </div>
 
-      {items.length === 0 ? (
-        loadError ? (
-          <p className="mt-4 text-sm text-red-500" data-testid="audit-load-error">
-            {t("settings.audit.loadError")}
-          </p>
+      <div className="p-3">
+        {items.length === 0 ? (
+          loadError ? (
+            <p className="text-sm text-red-500" data-testid="audit-load-error">
+              {t("settings.audit.loadError")}
+            </p>
+          ) : (
+            <p className="text-muted-foreground text-sm">{t("settings.audit.empty")}</p>
+          )
         ) : (
-          <p className="text-muted-foreground mt-4 text-sm">{t("settings.audit.empty")}</p>
-        )
-      ) : (
-        <div className="mt-2 overflow-hidden rounded-xl border text-[12.5px]">
-          {/* 表头（与行共用五列网格） */}
-          <div
-            data-audit-header
-            className={`text-muted-foreground bg-muted/40 px-3 py-1.5 text-[11px] font-semibold ${GRID_COLS}`}
-          >
-            <span>{t("settings.audit.time")}</span>
-            <span>{t("settings.audit.device")}</span>
-            <span>{t("settings.audit.session")}</span>
-            <span>{t("settings.audit.action")}</span>
-            <span>{t("settings.audit.summary")}</span>
+          <div className="text-[12.5px]">
+            {/* 表头（与行共用五列网格） */}
+            <div
+              data-audit-header
+              className={`text-muted-foreground bg-muted/40 px-3 py-1.5 text-[11px] font-semibold ${GRID_COLS}`}
+            >
+              <span>{t("settings.audit.time")}</span>
+              <span>{t("settings.audit.device")}</span>
+              <span>{t("settings.audit.session")}</span>
+              <span>{t("settings.audit.action")}</span>
+              <span>{t("settings.audit.summary")}</span>
+            </div>
+            {/* `max-h` + 内滚只加在**行列表**上，表头留在滚动区外 ⇒ 滚到底也看得见列名
+                （2026-10-07 用户裁决：「注入审计的窗口有点过长了，限定一个高度，在里面做滚轮」）。
+                `60vh` 的取法：设置窗口 880×640 ⇒ 约 384px 高，一屏能看到表头 + 6~7 行；
+                再高就会把同块内的「远程服务 / 信号健康度」两张卡整个顶出视野。 */}
+            <ul className="max-h-[60vh] overflow-y-auto">
+              {items.map((r, i) => (
+                <li
+                  // AuditRow 无唯一 id（ts 理论可撞），拼 index 兜底键稳定
+                  key={`${r.ts}-${r.sessionId}-${i}`}
+                  data-audit-row
+                  className={`${GRID_COLS} items-center px-3 py-2 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-dashed`}
+                >
+                  <span className="text-muted-foreground text-xs">{shortTime(r.ts)}</span>
+                  <span className="truncate" title={r.deviceName}>
+                    {r.deviceName}
+                  </span>
+                  <span className="truncate font-mono text-xs" title={r.sessionId}>
+                    {r.sessionId}
+                  </span>
+                  <span className="font-mono text-xs">{r.action}</span>
+                  <span className="truncate" title={r.summary}>
+                    {r.summary}
+                  </span>
+                </li>
+              ))}
+            </ul>
           </div>
-          {/* `max-h` + 内滚只加在**行列表**上，表头留在滚动区外 ⇒ 滚到底也看得见列名
-              （2026-10-07 用户裁决：「注入审计的窗口有点过长了，限定一个高度，在里面做滚轮」）。
-              `60vh` 的取法：设置窗口 880×640 ⇒ 约 384px 高，一屏能看到表头 + 6~7 行；
-              再高就会把同块内的「远程服务 / 信号健康度」两张卡整个顶出视野。 */}
-          <ul className="max-h-[60vh] overflow-y-auto">
-            {items.map((r, i) => (
-              <li
-                // AuditRow 无唯一 id（ts 理论可撞），拼 index 兜底键稳定
-                key={`${r.ts}-${r.sessionId}-${i}`}
-                data-audit-row
-                className={`${GRID_COLS} items-center px-3 py-2 [&:not(:last-child)]:border-b [&:not(:last-child)]:border-dashed`}
-              >
-                <span className="text-muted-foreground text-xs">{shortTime(r.ts)}</span>
-                <span className="truncate" title={r.deviceName}>
-                  {r.deviceName}
-                </span>
-                <span className="truncate font-mono text-xs" title={r.sessionId}>
-                  {r.sessionId}
-                </span>
-                <span className="font-mono text-xs">{r.action}</span>
-                <span className="truncate" title={r.summary}>
-                  {r.summary}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }

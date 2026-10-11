@@ -1,4 +1,6 @@
 // tests/pet/petConfig.test.ts
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   loadConfig,
@@ -28,6 +30,7 @@ describe("petConfig", () => {
       approvalAction: "waiting",
       errorAction: "failed",
       doneAction: "jumping",
+      followStartup: true,
     });
     expect(loadVisible()).toBe(false);
     expect(loadPosition()).toBeNull();
@@ -68,6 +71,36 @@ describe("petConfig", () => {
     expect(petSuppressPopup()).toBe(true);
     saveConfig({ alwaysOnTop: true });
     expect(petSuppressPopup()).toBe(true);
+  });
+});
+
+describe("启动跟随（2026-10-11 用户裁决，评审 M2 补锁）", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("旧存档缺 followStartup 键 → 默认 true 兜底（「没设置过 = 默认开」）", () => {
+    localStorage.setItem("mam-pet-config", JSON.stringify({ scale: 1.25 }));
+    expect(loadConfig().followStartup).toBe(true);
+  });
+
+  it("关闭后回环：存 false 读 false，下次启动即不跟出", () => {
+    expect(loadConfig().followStartup).toBe(true);
+    saveConfig({ followStartup: false });
+    expect(loadConfig().followStartup).toBe(false);
+  });
+
+  it("启动靴源码锁：requestedVisible 只由 followStartup 驱动且落权威值（评审 B1/M1 接线）", () => {
+    const boot = readFileSync(path.join(process.cwd(), "src/pages/pet.tsx"), "utf8");
+    // 启动显隐决策 = 跟随键（不是上次 visible——「隐了下次跟出」就是这一行实现的）
+    expect(boot).toContain("const requestedVisible = cfg.followStartup;");
+    // 决策落为权威值（saveVisible）：窗口实况与键同步，防哑宠物/幽灵语音
+    expect(boot).toContain("saveVisible(requestedVisible);");
+    // Rust 侧：新窗复位权威标记 + set_pet_visible 登记行使 + 兜底按标记闭嘴
+    const petRust = readFileSync(path.join(process.cwd(), "src-tauri/src/commands/pet.rs"), "utf8");
+    expect(petRust.match(/PET_PAGE_SPOKE/g)?.length ?? 0).toBeGreaterThanOrEqual(4);
+    expect(petRust).toContain("PET_PAGE_SPOKE.store(false");
+    // 行使登记（B1 心脏行）不设防的话删掉它余下断言依然绿（复评 I-2）
+    expect(petRust).toContain("PET_PAGE_SPOKE.store(true");
+    expect(petRust).toContain("PET_PAGE_SPOKE.load");
   });
 });
 
