@@ -249,7 +249,7 @@ git commit -m "fix(zcode): 探针修复——超时先看stdout(B)+阈值45s(A)+
 
 ## Task 3（P0）：codex APP 止血门（三入口 409）+ 设置页工具勾选文案（裁决 34a）【**api.rs 触点 · 串行位 2（前有 Task 2 传参面）**】
 
-**目标**：根因①止血（设计 §7 P0）：codex APP 会话的模式/权限/问答动作在协议臂落地前明确拒绝（不再把键序打进不存在的控制台、报 `AttachConsole 0x80070006`）；设置页补「取消勾选的工具有看板与远程能力」提示（裁决 34a）。
+**目标**：根因①止血（设计 §7 P0）：codex APP 会话的模式/权限/问答动作在协议臂落地前明确拒绝（不再把键序打进不存在的控制台、报 `AttachConsole 0x80070006`）；设置页补「取消勾选的工具不会出现在看板，也无法远程发送」提示（裁决 34a；2026-10-12 控制者裁定否定语义——原代拟肯定句系笔误，已勘误）。
 
 **前置依赖**：无探测 gate（止血门是纯拒绝分支；T0.1/T0.2 只影响 Task 6a/6b 把它翻转为真臂——**翻转分两步：模式两入口归 6a、问答入口归 6b**）。
 
@@ -264,7 +264,7 @@ git commit -m "fix(zcode): 探针修复——超时先看stdout(B)+阈值45s(A)+
 2. **拒绝形态**：`409 Conflict` + `{"error":"app_form_pending","reason":"APP 会话该操作走协议通道，开发中——请在 APP 内操作"}`（reason 走既有错误载荷形态）。
 3. **审计如实**：三入口的 409 拒绝各落一行审计（action 沿用既有词 + result=refused/app_form_pending，摘要含 session_id）——「开发中」状态对用户可见、对账本可查。
 4. **CLI 直通**：`form == Cli` 的 codex 会话三入口行为零变化（既有键序 + 屏读闭环不动——设计 §3.1 原则 1「CLI 版固化」）。
-5. **设置页文案（裁决 34a）**：勾选框旁一句「取消勾选的工具有看板与远程能力」（zh）/"Unchecked tools keep board & remote capabilities"（en，措辞可润色但语义不变）；`no_session` 载荷**不附 hint**（不为边缘态扩查询面——设计 §5.4 原文）。
+5. **设置页文案（裁决 34a）**：勾选框旁一句「取消勾选的工具不会出现在看板，也无法远程发送」（zh）/"Unchecked tools are hidden from the board and cannot receive remote messages"（en；2026-10-12 控制者裁定否定语义——原代拟肯定句系笔误，措辞随否定语义勘误）；`no_session` 载荷**不附 hint**（不为边缘态扩查询面——设计 §5.4 原文）。
 6. **移动端 version_gate 文案两侧同步**：已并入 Task 2（本任务不动移动端）。
 
 **测试清单**：

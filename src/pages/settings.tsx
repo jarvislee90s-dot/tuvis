@@ -956,6 +956,10 @@ export default function SettingsPage() {
                   </div>
                 ))}
               </div>
+              {/* 裁决 34a（设计 §5.4）：未启用工具的错误引导收敛在设置页文案级——
+                  勾选行旁明示取消勾选对看板与远程能力的影响；no_session 载荷不附
+                  hint（不为边缘态扩查询面） */}
+              <p className={SETTINGS_SUBTITLE}>{t("settings.tools.boardRemoteNote")}</p>
               {toolDirty && (
                 <Button onClick={() => setConfirmOpen(true)}>{t("settings.tools.save")}</Button>
               )}

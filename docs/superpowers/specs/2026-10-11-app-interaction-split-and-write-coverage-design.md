@@ -194,7 +194,7 @@ mode 读写（Windows 无通道）、session/cancel 接线：维持三期/P2 登
 
 ### 5.4 未启用工具错误引导（裁决 34a = 设置页文案级）
 
-设置页勾选框旁补一句「取消勾选的工具有看板与远程能力」；`no_session` 载荷不附 hint（不为边缘态扩查询面）。
+设置页勾选框旁补一句「取消勾选的工具不会出现在看板，也无法远程发送」（en：Unchecked tools are hidden from the board and cannot receive remote messages；2026-10-12 控制者裁定否定语义——原代拟句「取消勾选的工具有看板与远程能力」系肯定式笔误，如实修正）；`no_session` 载荷不附 hint（不为边缘态扩查询面）。
 
 ---
 

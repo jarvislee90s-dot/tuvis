@@ -1091,6 +1091,44 @@ fn ambiguous_target_refusal(
     msg
 }
 
+/// ===== codex APP 止血门（Task 3，2026-10-12 P0；设计 §1 根因① / §7 P0 表）=====
+///
+/// codex APP（ChatGPT 桌面 GUI）会话**没有控制台**——模式/权限切换与问答作答的
+/// CLI 键序通道（`shift+tab` / `/permissions` / 数字键 + 屏读闭环）对 APP 是**错误
+/// 通道**：真机实证打键报 `AttachConsole 0x80070006`、屏读「零投递」、问答
+/// `aborted:select`（2026-10-11 Task 15 手工测试四路失败之一）。本门 = 协议臂
+/// （`codex_app.rs`，Task 6a 模式两入口 / Task 6b 问答入口）落地前的止血拒绝：
+/// 命中 ⇒ 三写入口（`session_mode_switch` / `session_mode_menu` /
+/// `session_question_answer`）在任何屏读与注入之前 409 `app_form_pending`。
+///
+/// **判据单点**：`form == App && tool == "codex"`——与 `session_send` 的路由口径、
+/// Task 6a/6b 的翻转点同一判据；翻转协议臂时改本函数（或其调用点）即全端点同步。
+/// **GET 类端点不受门**（`session_mode` / `session_mode_menu_read` /
+/// `session_question` 读侧照常——设计 §3.1 原则 3）；**CLI 形态零变化**（原则 1）。
+fn codex_app_form(session: &crate::session::Session) -> bool {
+    session.agent_type.tool_id() == "codex"
+        && matches!(session.form, crate::session::ProcessForm::App)
+}
+
+/// 止血门错误码（前端据此分诊「开发中」态，与版本门 `version_gate` 同族）
+const APP_FORM_PENDING_CODE: &str = "app_form_pending";
+/// 止血门 reason（走既有错误载荷形态 error + reason——同 `ambiguous_target`）；
+/// 移动端原样渲染，引导用户回 APP 内操作
+const APP_FORM_PENDING_REASON: &str = "APP 会话该操作走协议通道，开发中——请在 APP 内操作";
+/// 止血门审计 result（「开发中」状态对账本可查：refused + 拒绝码，形如 failed:{e}）
+const APP_FORM_PENDING_AUDIT_RESULT: &str = "refused:app_form_pending";
+
+/// 止血门 409 回执（三入口共用同一形态：409 + error + reason）
+fn app_form_pending_response() -> Response {
+    json_no_store(
+        StatusCode::CONFLICT,
+        serde_json::json!({
+            "error": APP_FORM_PENDING_CODE,
+            "reason": APP_FORM_PENDING_REASON,
+        }),
+    )
+}
+
 /// 快照中按 session_id 找会话（spawn_blocking 内调用：session_source 是同步阻塞扫描）。
 /// 数据同源铁律：直调注入源（与看板/内容读取同一份快照），不另立查找函数
 fn find_session_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<crate::session::Session> {
@@ -6984,6 +7022,12 @@ pub async fn session_question_answer(
         let Some((session, hit)) = question_scan_sync(&probe_st, &probe_sid) else {
             return Err("no_question");
         };
+        // codex APP 止血门（Task 3）：问答在场 ∧ codex APP 形态 → 零键序零屏读拒绝
+        //（门在键序构造与阶段机之前；Task 6b 翻转 = 补投臂在此接管）。错误码经 Err
+        // 串上行，审计 + 409 回执在 lookup 的拒绝分支。
+        if codex_app_form(&session) {
+            return Err(APP_FORM_PENDING_CODE);
+        }
         let tool_id = session.agent_type.tool_id();
         // 「结论不超证据」→ 批次戊 E4-E6 + 2026-09-24 更新：kimi（K-5 数字直选+自动
         // 推进+Review 汇总屏）/ codex（数字即答+Tab 备注+末题 submit all）/ opencode
@@ -7137,6 +7181,24 @@ pub async fn session_question_answer(
     ) = match lookup {
         Ok(v) => v,
         Err(code) => {
+            // codex APP 止血门（Task 3，设计 §7 P0）：409 + 审计（投递路拒绝留痕，
+            // 与 L13 同族——其余校验失败码维持下方「零注入零审计」口径）。审计 tool
+            // 位恒 codex（判据单点 codex_app_form 只在 codex 命中）；摘要 = 既有
+            // audit_label 形态（select#2 / submit / …）。
+            if code == APP_FORM_PENDING_CODE {
+                let audit_label = action.audit_label(req.index);
+                endpoint_audit(
+                    &st,
+                    &device_id,
+                    &device_name,
+                    "codex",
+                    &sid,
+                    &audit_label,
+                    "answer",
+                    APP_FORM_PENDING_AUDIT_RESULT,
+                );
+                return app_form_pending_response();
+            }
             // 校验失败零注入零审计（approve guards 同口径）：
             // - no_question（409）：会话不在快照 / 审批标记隔离 / 双通道均未命中
             //   ——统一 409（不给存在性预言机；审批标记在场时本就不得出问答键）
@@ -10126,6 +10188,17 @@ pub async fn session_mode_menu(
     if action != "open" && action != "pick" {
         return bad_request();
     }
+    // open/pick 的审计摘要构造（本端点两处拒绝臂共用——止血门与 L13 靶向闸）：
+    // 按**已校验的 action** 分派（二值已过上面的 400 门），不用 `req.number` 在场性
+    // 反推动作——pick 可不带 number（缺号在 pick 臂另有 400 拦截），number 与 action
+    // 的相关性是巧合不是契约。
+    let menu_audit_content = || match action.as_str() {
+        "pick" => match req.number {
+            Some(number) => format!("终端菜单第 {number} 项（权限切换）"),
+            None => "终端菜单选择项（权限切换，编号缺省）".to_string(),
+        },
+        _ => "打开权限菜单（终端菜单单选）".to_string(),
+    };
     let Some((device_id, device_name)) = device_identity(&st, &headers) else {
         return forbidden_defense();
     };
@@ -10148,6 +10221,30 @@ pub async fn session_mode_menu(
         }
     };
     let tool = session.agent_type.tool_id().to_string();
+    // ===== codex APP 止血门（Task 3）=====
+    // 门位 = 会话定位后、靶向闸与守卫探测**之前**（APP 无屏可读——先于一切屏读与
+    // 注入；L13 靶向闸在 CLI 路径才需要）。审计摘要经 [`menu_audit_content`]（与
+    // L13 拒绝臂同一构造）；tool 位恒 codex（判据单点）。
+    if codex_app_form(&session) {
+        let audit_content = menu_audit_content();
+        endpoint_audit(
+            &st,
+            &device_id,
+            &device_name,
+            &tool,
+            &sid,
+            &audit_content,
+            "mode",
+            APP_FORM_PENDING_AUDIT_RESULT,
+        );
+        // 回执走本端点统一错误壳 [`mode_menu_err`]（error + reason——与
+        // [`app_form_pending_response`] 同形态，端点内不另立响应构造）
+        return mode_menu_err(
+            StatusCode::CONFLICT,
+            APP_FORM_PENDING_CODE,
+            Some(APP_FORM_PENDING_REASON),
+        );
+    }
     if tool != "codex" {
         // 单选面板目前**只有 codex**（kimi 菜单无屏上编号，数字直达不适用；其余工具
         // 无权限菜单）。如实拒绝，不假装支持。
@@ -10172,10 +10269,7 @@ pub async fn session_mode_menu(
     if let Err(crate::window::tty_map::AmbiguousTarget(n)) =
         resolve_session_target(&st, &mut session)
     {
-        let audit_content = match req.number {
-            Some(number) => format!("终端菜单第 {number} 项（权限切换）"),
-            None => "打开权限菜单（终端菜单单选）".to_string(),
-        };
+        let audit_content = menu_audit_content();
         let msg = ambiguous_target_refusal(
             &st,
             &device_id,
@@ -10779,6 +10873,12 @@ pub async fn session_mode_switch(
             .find(|s| s.id == probe_sid)
             .ok_or_else(|| "no_session".to_string())?;
         let tool = session.agent_type.tool_id().to_string();
+        // codex APP 止血门（Task 3）：门位 = 会话定位后、组推断与**任何屏读/注入之前**
+        //（下方的 read_mode_from_screen 对 APP 会话就是 AttachConsole 0x80070006 的
+        // 错误通道）。错误码经 Err 串上行，审计 + 409 回执在 lookup 的拒绝分支。
+        if codex_app_form(&session) {
+            return Err(APP_FORM_PENDING_CODE.to_string());
+        }
         // 组推断（旧客户端不带 group 的兼容口径；显式 group 必须存在于结构）
         let group = crate::inject::mode::resolve_group(&tool, requested_group, mode)
             .map_err(|_| "no_mechanism".to_string())?;
@@ -10822,6 +10922,38 @@ pub async fn session_mode_switch(
     let (mut session, tool, group, plan, readback, label, before) = match lookup {
         Ok(v) => v,
         Err(code) => {
+            // codex APP 止血门（Task 3）：409 + 审计（其余校验失败码维持零审计口径
+            //——本条与 L13 ambiguous_target 同族：投递路拒绝，须留痕供事后核对）。
+            // 审计 tool 位恒 codex（判据单点 codex_app_form 只在 codex 命中）。组词与
+            // 档标签是纯函数，拒绝臂就地重算：档标签与成功臂**同源**（tier 屏显标签，
+            // 非 MamMode 通用名）；显式组与目标档错配（resolve_group Err）时按推断组
+            // 如实记（None 推断 = 该档实际所属组），两组均解析不出才兜底 Mode 组词
+            //（防御位——codex 全档均落两组之一，按构造不可达）。
+            if code == APP_FORM_PENDING_CODE {
+                let group = crate::inject::mode::resolve_group("codex", requested_group, mode)
+                    .or_else(|_| crate::inject::mode::resolve_group("codex", None, mode))
+                    .unwrap_or(crate::inject::mode::ModeGroupId::Mode);
+                let label = crate::inject::mode::mode_structure("codex")
+                    .group(group)
+                    .and_then(|spec| spec.tiers.iter().find(|t| t.mode == mode).map(|t| t.label))
+                    .unwrap_or_else(|| mode.label());
+                let audit_content = if group == crate::inject::mode::ModeGroupId::Mode {
+                    format!("切换模式至 {label}")
+                } else {
+                    format!("切换{}至 {label}", group.label())
+                };
+                endpoint_audit(
+                    &st,
+                    &device_id,
+                    &device_name,
+                    "codex",
+                    &sid,
+                    &audit_content,
+                    "mode",
+                    APP_FORM_PENDING_AUDIT_RESULT,
+                );
+                return app_form_pending_response();
+            }
             let status = if code == "no_session" {
                 StatusCode::NOT_FOUND
             } else {

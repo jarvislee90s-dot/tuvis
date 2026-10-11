@@ -19014,4 +19014,417 @@ mod tests {
             "{body}"
         );
     }
+    // ==== Task 3（2026-10-12 P0）：codex APP 止血门——三写入口 409 app_form_pending ====
+    //
+    // 根因①（设计 §1）：codex APP（ChatGPT 桌面 GUI）无控制台，模式/权限/问答写动作
+    // 仍走 CLI 终端键序通道 = 错误通道（真机 AttachConsole 0x80070006、「零投递」）。
+    // 止血门 = 协议臂（Task 6a/6b）落地前的明确拒绝，判据单点 = `api::codex_app_form`
+    // （tool=codex ∧ form=App）。**GET 类端点不受门**（读侧正常是设计 §3.1 原则 3，
+    // 用例 get_mode_and_menu_read_not_gated_for_app_form 钉住）；**CLI 形态零变化**
+    // （原则 1「CLI 版固化」，用例 codex_cli_mode_and_question_pass_through_unchanged
+    // 钉住）。
+
+    /// 止血门夹具：N 个 codex 会话（指定进程形态）+ 缺省缝（无对话框/无屏读/无靶向
+    /// 证据——与 [`mode_guard_state`] 同口径）。`inj_sess` 缺省 Cli，形态在此覆写
+    /// （守卫 id 立规：投递类用例各占唯一会话 id）。
+    fn codex_form_state(
+        injector: std::sync::Arc<dyn crate::inject::engine::Injector>,
+        form: crate::session::ProcessForm,
+        id_pid: &[(&str, u32)],
+    ) -> Arc<RemoteState> {
+        debug_assert!(
+            !id_pid.is_empty(),
+            "codex_form_state 需要至少一个会话（首项用于建造 state）"
+        );
+        let sessions: Vec<crate::session::Session> = id_pid
+            .iter()
+            .map(|&(sid, pid)| {
+                let mut s = inj_sess(
+                    sid,
+                    crate::session::AgentType::Codex,
+                    pid,
+                    crate::session::SessionStatus::Waiting,
+                );
+                s.form = form;
+                s
+            })
+            .collect();
+        let (mut state, _) = mode_guard_state(
+            injector,
+            id_pid[0].0,
+            crate::session::AgentType::Codex,
+            id_pid[0].1,
+            std::sync::Arc::new(|_, _| None),
+        );
+        let st = std::sync::Arc::get_mut(&mut state).expect("建造器返回独占引用");
+        st.session_source = Box::new(move || crate::session::SessionsResponse {
+            total_count: sessions.len(),
+            waiting_count: 0,
+            sessions: sessions.clone(),
+        });
+        state
+    }
+
+    /// ① 切档入口（session-mode/switch）：codex APP 会话 → 409 `app_form_pending` +
+    /// reason 引导 + **零注入**（门在屏读与注入之前——键序对 APP 是错误通道）
+    #[tokio::test]
+    async fn mode_switch_rejects_codex_app_form_with_409() {
+        let fake = FakeInjector::ok();
+        let state = codex_form_state(
+            fake.clone(),
+            crate::session::ProcessForm::App,
+            &[("sess_app_sw", 61)],
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let r = router(state)
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/switch",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_app_sw","target":"plan","group":"mode"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 409);
+        let body = body_string(r).await;
+        assert!(body.contains("\"error\":\"app_form_pending\""), "{body}");
+        assert!(
+            body.contains("请在 APP 内操作"),
+            "reason 走既有错误载荷形态（引导文案在场）：{body}"
+        );
+        assert!(
+            fake.recorded().is_empty() && fake.recorded_keys().is_empty(),
+            "止血门零注入（键序不进 APP 的错误通道）：{body}"
+        );
+    }
+
+    /// ② 菜单入口（session-mode/menu，open 与 pick 两动作同门）：codex APP → 409
+    /// `app_form_pending` + 零注入（门先于靶向闸与守卫探测——APP 无屏可读）
+    #[tokio::test]
+    async fn mode_menu_rejects_codex_app_form_with_409() {
+        let fake = FakeInjector::ok();
+        let state = codex_form_state(
+            fake.clone(),
+            crate::session::ProcessForm::App,
+            &[("sess_app_mn", 62)],
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state);
+        for (payload, tag) in [
+            (r#"{"sessionId":"sess_app_mn","action":"open"}"#, "open"),
+            (
+                r#"{"sessionId":"sess_app_mn","action":"pick","number":1}"#,
+                "pick",
+            ),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    "/m/api/v1/session-mode/menu",
+                    Some("mam_device=mm"),
+                    Some(payload),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 409, "{tag}");
+            let body = body_string(r).await;
+            assert!(
+                body.contains("\"error\":\"app_form_pending\""),
+                "{tag}: {body}"
+            );
+            assert!(body.contains("请在 APP 内操作"), "{tag}: {body}");
+        }
+        assert!(
+            fake.recorded().is_empty() && fake.recorded_keys().is_empty(),
+            "两动作均零注入"
+        );
+    }
+
+    /// ③ 问答作答入口（session-question/answer）：问答在场 ∧ codex APP → 409
+    /// `app_form_pending` + 零键序零文本（门在键序构造与阶段机之前）
+    #[tokio::test]
+    async fn question_answer_rejects_codex_app_form_with_409() {
+        let fake = FakeInjector::ok();
+        let state = codex_form_state(
+            fake.clone(),
+            crate::session::ProcessForm::App,
+            &[("sess_app_qa", 63)],
+        );
+        state.store.with(|conn| {
+            crate::database::dao::question_wait::mark(
+                conn,
+                "codex",
+                "sess_app_qa",
+                1_000,
+                "等待回答",
+                Some(Q_SINGLE_PAYLOAD),
+            )
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        let r = router(state)
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-question/answer",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_app_qa","action":"select","index":0}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 409);
+        let body = body_string(r).await;
+        assert!(body.contains("\"error\":\"app_form_pending\""), "{body}");
+        assert!(body.contains("请在 APP 内操作"), "{body}");
+        assert!(
+            fake.recorded().is_empty() && fake.recorded_keys().is_empty(),
+            "零键序零文本（补投臂未落地前不出手）：{body}"
+        );
+    }
+
+    /// CLI 形态直通（设计 §3.1 原则 1「CLI 版固化」）：三入口对 form=Cli 的 codex
+    /// 会话**零变化**——不出现 `app_form_pending`，走既有 CLI 面（CI/无屏读缝下：
+    /// 切档 200 failed「读不到屏」/ 菜单 open 既有失败面 / 问答 select 零键中止）。
+    /// 固化件的完整行为由既有用例钉死，此处只断言「门不在 CLI 形态上」。注入断言
+    /// 逐入口给（菜单 open 的既有面 = preflight 过闸即投递 /permissions 再如实失败
+    /// 「命令已发送，档位未切」——它**不是**零注入，不与另两入口共用断言）。
+    #[tokio::test]
+    async fn codex_cli_mode_and_question_pass_through_unchanged() {
+        let fake = FakeInjector::ok();
+        let state = codex_form_state(
+            fake.clone(),
+            crate::session::ProcessForm::Cli,
+            &[
+                ("sess_cli_sw", 71),
+                ("sess_cli_mn", 72),
+                ("sess_cli_pk", 74),
+                ("sess_cli_qa", 73),
+            ],
+        );
+        state.store.with(|conn| {
+            crate::database::dao::question_wait::mark(
+                conn,
+                "codex",
+                "sess_cli_qa",
+                1_000,
+                "等待回答",
+                Some(Q_SINGLE_PAYLOAD),
+            )
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state);
+        // ① 切档：200（failed「读不到屏」——既有 CI 面）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/switch",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_cli_sw","target":"plan","group":"mode"}"#),
+            ))
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = body_string(r).await;
+        assert_eq!(status, 200, "CLI 直通（切档）：{body}");
+        assert!(
+            !body.contains("app_form_pending"),
+            "CLI 直通（切档）：{body}"
+        );
+        assert!(
+            fake.recorded().is_empty() && fake.recorded_keys().is_empty(),
+            "切档既有面零注入（读不到屏 → 前读闸拒，不盲发）：{body}"
+        );
+        // ② 菜单 open：非 409 门（既有失败面）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/menu",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_cli_mn","action":"open"}"#),
+            ))
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = body_string(r).await;
+        assert_ne!(status, 409, "CLI 直通（菜单 open）：{body}");
+        assert!(
+            !body.contains("app_form_pending"),
+            "CLI 直通（菜单 open）：{body}"
+        );
+        // ②' 菜单 pick：非 409 门（既有失败面——硬前置屏读不在场即零投递拒）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/menu",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_cli_pk","action":"pick","number":1}"#),
+            ))
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = body_string(r).await;
+        assert_ne!(status, 409, "CLI 直通（菜单 pick）：{body}");
+        assert!(
+            !body.contains("app_form_pending"),
+            "CLI 直通（菜单 pick）：{body}"
+        );
+        // ③ 问答 select：200（零键中止——codex 阶段机既有 CI 面）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-question/answer",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_cli_qa","action":"select","index":0}"#),
+            ))
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = body_string(r).await;
+        assert_eq!(status, 200, "CLI 直通（问答）：{body}");
+        assert!(
+            !body.contains("app_form_pending"),
+            "CLI 直通（问答）：{body}"
+        );
+        assert!(
+            fake.recorded_keys().iter().all(|(p, _)| *p == 72),
+            "唯菜单 open 的既有 tab 键（pid 72）；切档/问答/pick 均零键（既有面）：{body}"
+        );
+    }
+
+    /// 审计如实（设计 §7 P0 / M20）：三入口的 409 各落一行审计——action 沿用既有词
+    /// （mode/mode/answer）、result=`refused:app_form_pending`、行携带 session_id
+    /// （「开发中」状态对账本可查）。
+    #[tokio::test]
+    async fn codex_app_rejections_are_audited() {
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::App,
+            &[
+                ("sess_aud_sw", 81),
+                ("sess_aud_mn", 82),
+                ("sess_aud_qa", 83),
+            ],
+        );
+        state.store.with(|conn| {
+            crate::database::dao::question_wait::mark(
+                conn,
+                "codex",
+                "sess_aud_qa",
+                1_000,
+                "等待回答",
+                Some(Q_SINGLE_PAYLOAD),
+            )
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let posts = [
+            (
+                "/m/api/v1/session-mode/switch",
+                r#"{"sessionId":"sess_aud_sw","target":"plan","group":"mode"}"#,
+            ),
+            (
+                "/m/api/v1/session-mode/menu",
+                r#"{"sessionId":"sess_aud_mn","action":"open"}"#,
+            ),
+            (
+                "/m/api/v1/session-question/answer",
+                r#"{"sessionId":"sess_aud_qa","action":"select","index":0}"#,
+            ),
+        ];
+        for (uri, payload) in posts {
+            let r = app
+                .clone()
+                .oneshot(req("POST", uri, Some("mam_device=mm"), Some(payload)))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 409, "{uri}");
+        }
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 3, "三入口各落一行审计");
+        // recent_conn 最新在前：投递序 sw(mode)→mn(mode)→qa(answer)
+        assert_eq!(audits[2].action, "mode", "切档审计 action 沿用既有词");
+        assert_eq!(audits[1].action, "mode", "菜单审计 action 沿用既有词");
+        assert_eq!(audits[0].action, "answer", "问答审计 action 沿用既有词");
+        for a in &audits {
+            assert_eq!(a.result, "refused:app_form_pending", "result 标拒绝码");
+            assert_eq!(a.agent_type, "codex");
+        }
+        assert_eq!(audits[2].session_id, "sess_aud_sw", "行携带 session_id");
+        assert_eq!(audits[1].session_id, "sess_aud_mn", "行携带 session_id");
+        assert_eq!(audits[0].session_id, "sess_aud_qa", "行携带 session_id");
+    }
+
+    /// GET 类端点不受门（设计 §3.1 原则 3「读侧不动」）：APP 会话的 GET
+    /// /session-mode（结构+当前档）与 GET /session-mode/menu（菜单读回）照常服务
+    /// ——止血门只拦写入口，读侧不是 409。
+    #[tokio::test]
+    async fn get_mode_and_menu_read_not_gated_for_app_form() {
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::App,
+            &[("sess_app_get", 91)],
+        );
+        // 带问答标记：GET /session-question 走真实载荷路径（available:true），
+        // 不只是空载荷的 200——读侧对 APP 会话完整服务
+        state.store.with(|conn| {
+            crate::database::dao::question_wait::mark(
+                conn,
+                "codex",
+                "sess_app_get",
+                1_000,
+                "等待回答",
+                Some(Q_SINGLE_PAYLOAD),
+            )
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state);
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-mode?session_id=sess_app_get",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "GET /session-mode 读侧正常");
+        let body = body_string(r).await;
+        assert!(!body.contains("app_form_pending"), "{body}");
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-mode/menu?session_id=sess_app_get",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "GET /session-mode/menu 读侧正常");
+        let body = body_string(r).await;
+        assert!(!body.contains("app_form_pending"), "{body}");
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-question?session_id=sess_app_get",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "GET /session-question 读侧正常");
+        let body = body_string(r).await;
+        assert!(!body.contains("app_form_pending"), "{body}");
+        assert!(
+            body.contains("\"available\":true"),
+            "问答载荷照常下发（读侧完整链路不受门）：{body}"
+        );
+    }
 }
