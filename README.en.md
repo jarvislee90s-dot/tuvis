@@ -44,7 +44,7 @@ Open the same eight-tool session board from your phone browser. Settings → Rem
 | ------------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 📶 LAN                               | Phone and computer on the same WiFi / cable (**recommended**) | Fastest; requires the access PIN; **your own browser on this computer uses this card's address too** (its switch must be on)                                                                                                                     |
 | 🔀 Quick tunnel                      | You're away and your phone is on cellular                     | Public, no signup (Cloudflare); **address changes every time it's enabled**                                                                                                                                                                      |
-| 🌐 Own domain                        | You want a stable entry point                                 | Needs a Cloudflare account (free plan works) + a Tunnel Token; the address is **permanent** once configured — Tuvis downloads and supervises cloudflared for you, with a step-by-step guide in Settings                                            |
+| 🌐 Own domain                        | You want a stable entry point                                 | Needs a Cloudflare account (free plan works) + a Tunnel Token; the address is **permanent** once configured — Tuvis downloads and supervises cloudflared for you, with a step-by-step guide in Settings                                          |
 | 🛰 External domain (no domain needed) | You don't have a domain but still want a permanent address    | **No domain required**: the card's wizard walks you through installing Tailscale and enabling Funnel to get a **permanent** address like `https://<machine>.<tailnet>.ts.net/m`; you only install and sign in to Tailscale once on this computer |
 
 **The access PIN applies to this computer too**: loopback access is **no longer PIN-free** — opening the board from this machine's own browser is treated exactly like a remote device (enter the PIN once, then remembered for 180 days). "This machine" is **no longer a channel card**: it is just one way to connect, using the address shown on the "LAN" card.
@@ -382,9 +382,9 @@ pnpm lint:fix     # ESLint auto-fix
 
 The app stores its data in `~/.tuvis/`:
 
-| Path                          | Purpose                                                        |
-| ----------------------------- | -------------------------------------------------------------- |
-| `~/.tuvis/tuvis.db`               | SQLite database (settings, extensions, presets, session cache) |
+| Path                            | Purpose                                                        |
+| ------------------------------- | -------------------------------------------------------------- |
+| `~/.tuvis/tuvis.db`             | SQLite database (settings, extensions, presets, session cache) |
 | `~/.tuvis/skills/`              | Global skill repository                                        |
 | `~/.tuvis/mcp/`                 | Global MCP server configs                                      |
 | `~/.tuvis/hooks/status-hook.sh` | Shared Hook script for status events                           |
