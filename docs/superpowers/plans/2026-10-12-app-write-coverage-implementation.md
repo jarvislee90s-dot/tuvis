@@ -731,6 +731,7 @@ git commit -m "docs(spec): APP 写通道全覆盖批验收回填 + M18-M28 结�
 | 本批-4 | WB session/cancel 接线 + 模型选择展示（availableModels 面已实测可读） | 设计 §7 P2；前批 L-09 |
 | 本批-5 | codex queue 消费翻转信号（回执卡「排队中→已消费」）——若 Task 8 未消化后端信号面，前端状态位如实「消费确认建设中」 | 设计 §3.7(b) 契约缺口 |
 | 本批-6 | zcode `--mode` 档位原语（无此面，裁决 14）；WB mode（Windows 探测证伪）；dsh mode（刻意无）——三家均如实 ⬜ | 设计 §2 结论 2 |
+| 本批-8 | Task 2 质量审三条 Minor 随 Task 7 顺手处理：① codex 帮助面共享 45s L1 阈值（应单设 ~10s 常量，codex.rs:1240）；② 共享超时文案把 zcode「网络/模型服务」归因带进 codex 提示（gate.rs:283-288 消费点 codex.rs:1251）；③ `zcode_verdict` 用户可见 hint 残留「干跑」术语（gate.rs:229/240/243 + :78 注释改「真回合」口径） | Task 2 质量审报告（5320a625） |
 
 ---
 
