@@ -127,8 +127,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
 
   // 降级态自动重读：每 2.5s 重拉一次选项端点（现场屏读）——真审批框一旦绘制完成
   // 即读到选项、degraded 解除按钮亮起；假审批（多选面板等）永远读不到、按钮恒禁用。
-  // 手动「检查终端对话框」按钮同样保留。sent 后不再轮询（终态）。handleCheck 定义
-  // 在下方——经 ref 间接调用（本 effect 声明在前）。
+  // 手动「检查终端对话框」按钮同样保留。sent 后不再轮询（终态）。
   const handleCheckRef = useRef<(() => void) | null>(null);
   // 挂载拉取一次选项可用性；拉取失败 → 静默保持隐藏。
   // ready 只表示「载荷已落地」（available/reason 的分诊移到渲染侧——严格档

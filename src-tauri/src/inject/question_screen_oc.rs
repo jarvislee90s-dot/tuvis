@@ -559,24 +559,15 @@ pub fn codex_question_screen_snapshot(lines: &[String]) -> Option<CodexQuestionS
     None
 }
 
-/// 选项行文本判据（与 [`parse_codex_option_row`] 的编号解析**同源**）：
-/// 到首个 `.` 之前的串全 ASCII 数字且非空 = `N. label` 选项行。
-///
-/// **2026-10-11 评审 Important 3 修正**：旧判据「首字符是数字即跳过」把数字开头的
-/// 备注文本（如「3 点建议」）误当选项行——notes 行系统性失明，清空路径还会假报
-/// 成功（读不到 note = 无字）。同源判据下「3 点建议」的 `3` 后无 `.`，不再误判。
-fn looks_like_option_text(text: &str) -> bool {
-    let Some(dot) = text.find('.') else {
-        return false;
-    };
-    let head = &text[..dot];
-    !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit())
-}
-
 /// codex 面板 **notes 行文本**解析（2026-10-10 用户指令：「note 位置但凡有输入，
 /// 一定要显示在远端页面上」——GET/回执消费）：
 /// 题号头之后、首个 `› ` 前缀**非选项**行（选项行 `› N. label` 带编号点，已排除）。
 /// `› Add notes` 占位 = 空备注 → `None`；composer 提示行（面板外）按已知文案排除。
+///
+/// 选项行排除判据直接复用 [`parse_codex_option_row`]（2026-10-11 评审 Minor：
+/// 独立文本判据会在 `0. …`/裸 `3.`/超长编号等边缘与解析器分叉）——真同源。
+/// 代价（如实申报）：纯文本「数字+`.` 前缀的备注」（如 `› 123.5kg 备注`）与
+/// 选项行在文本层不可分，同样按选项行跳过——继承解析器的既有边界，不自行加判。
 ///
 /// 只认**题号头之下**的首个命中——面板之下的滚回区/composer 草稿不误收。
 pub fn codex_notes_row_text(lines: &[String]) -> Option<String> {
@@ -594,8 +585,8 @@ pub fn codex_notes_row_text(lines: &[String]) -> Option<String> {
         if text.is_empty() {
             continue;
         }
-        // 选项行（`› N. …`）跳过——同源判据（数字串 + `.`），数字开头的备注不误伤
-        if looks_like_option_text(text) {
+        // 选项行（`› N. …`）跳过——直接用选项行解析器判定（真同源），数字开头的备注不误伤
+        if parse_codex_option_row(text).is_some() {
             continue;
         }
         let lower = text.to_lowercase();
@@ -630,8 +621,8 @@ pub fn codex_notes_input_ready(lines: &[String]) -> bool {
         if text.is_empty() {
             continue;
         }
-        if looks_like_option_text(text) {
-            continue; // 选项行（同源判据——数字开头的备注不误伤）
+        if parse_codex_option_row(text).is_some() {
+            continue; // 选项行（真同源判定——数字开头的备注不误伤）
         }
         if text.to_lowercase().starts_with("ask codex") {
             continue; // composer 提示行（面板外）
@@ -646,8 +637,8 @@ mod tests {
 
     /// **数字开头备注不误判为选项行**（2026-10-11 评审 Important 3）：旧判据「首字符
     /// 是数字即跳过」把「3 点建议」当 `3. …` 选项行——notes 行失明、清空路径假报
-    /// 成功。同源判据（数字串 + `.`）下必须照常读出。还原动作：把
-    /// `looks_like_option_text` 退回首字符判据 → 本用例先红。
+    /// 成功。现直接用 [`parse_codex_option_row`] 真同源判定，必须照常读出。
+    /// 还原动作：跳过判据退回「首字符数字即跳过」形态 → 本用例先红。
     #[test]
     fn codex_notes_row_text_allows_digit_prefixed_note() {
         let frame = vec![

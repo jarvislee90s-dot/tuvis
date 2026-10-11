@@ -457,11 +457,6 @@ fn hook_command_matches_spec(
     }
 }
 
-/// 为指定工具注册 Hook（生产入口：脚本落盘 + helper 安装 + 命令规格注入核心）。
-/// `spec` 由调用方按工具构造（[`hook_command_spec_for`]）——claude/codex 的命令
-/// 形态不同（command 直启 vs commandWindows 覆盖），规格单一事实源避免注册/核验/
-/// 迁移三处口径漂移。`matchers` 为 (事件名, matcher) 对（T2：claude Notification
-/// → permission_prompt；无 matcher 的事件传 `&[]`）
 /// 用户 hook 配置文件的**读入 + UTF-8 BOM 剥离**（2026-10-11 评审 Important 2）：
 /// Windows 编辑器（Notepad/部分 PowerShell `Out-File`）写出的文件带
 /// `EF BB BF` 前缀——`serde_json::from_str`/`toml_edit::parse` 都不剥，
@@ -475,6 +470,11 @@ fn read_user_config_text(path: &std::path::Path) -> std::io::Result<String> {
         .to_string())
 }
 
+/// 为指定工具注册 Hook（生产入口：脚本落盘 + helper 安装 + 命令规格注入核心）。
+/// `spec` 由调用方按工具构造（[`hook_command_spec_for`]）——claude/codex 的命令
+/// 形态不同（command 直启 vs commandWindows 覆盖），规格单一事实源避免注册/核验/
+/// 迁移三处口径漂移。`matchers` 为 (事件名, matcher) 对（T2：claude Notification
+/// → permission_prompt；无 matcher 的事件传 `&[]`）。
 pub(crate) fn register_hooks_for_tool(
     config_path: &std::path::Path,
     events: &[&str],

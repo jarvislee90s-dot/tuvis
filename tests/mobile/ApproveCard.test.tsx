@@ -361,7 +361,6 @@ describe("ApproveCard：降级警示脚注（R1-3）", () => {
         ],
       });
       let optionsGets = 0;
-      const prev = routes.options;
       Object.defineProperty(routes, "options", {
         configurable: true,
         get() {
@@ -662,11 +661,11 @@ describe("ApproveCard：计划批准卡（2026-10-04）", () => {
       await screen
         .findByTestId("approve-card")
         .then((el) => el.textContent)
-        .then((t) => t?.includes("计划批准")),
+        .then((t) => t?.includes("计划批准"))
     ).toBe(true);
     // 反馈项 = 独立 testid 入口（不直发按键）
     expect(screen.getByTestId("approve-option-feedback").textContent).toContain(
-      "Tell Claude what to change",
+      "Tell Claude what to change"
     );
     // 其余选项照常（dialog 编号 id 形态）
     expect(screen.getByTestId("approve-option-dialog:1")).toBeTruthy();
@@ -689,7 +688,7 @@ describe("ApproveCard：计划批准卡（2026-10-04）", () => {
       optionId: "dialog:3",
     });
     const fbCalls = fetchMock.mock.calls.filter((c: unknown[]) =>
-      String(c[0]).includes("/session-plan-feedback"),
+      String(c[0]).includes("/session-plan-feedback")
     );
     expect(fbCalls).toHaveLength(0);
   });
@@ -705,11 +704,11 @@ describe("ApproveCard：计划批准卡（2026-10-04）", () => {
       await screen
         .findByTestId("approve-error")
         .then((el) => el.textContent)
-        .then((t) => t?.includes("对话框已不在场")),
+        .then((t) => t?.includes("对话框已不在场"))
     ).toBe(true);
     expect(onReady).not.toHaveBeenCalled();
     expect((screen.getByTestId("approve-option-feedback") as HTMLButtonElement).disabled).toBe(
-      false,
+      false
     );
   });
 });
