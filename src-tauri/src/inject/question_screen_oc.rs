@@ -564,6 +564,11 @@ pub fn codex_question_screen_snapshot(lines: &[String]) -> Option<CodexQuestionS
 /// 题号头之后、首个 `› ` 前缀**非选项**行（选项行 `› N. label` 带编号点，已排除）。
 /// `› Add notes` 占位 = 空备注 → `None`；composer 提示行（面板外）按已知文案排除。
 ///
+/// 选项行排除判据直接复用 [`parse_codex_option_row`]（2026-10-11 评审 Minor：
+/// 独立文本判据会在 `0. …`/裸 `3.`/超长编号等边缘与解析器分叉）——真同源。
+/// 代价（如实申报）：纯文本「数字+`.` 前缀的备注」（如 `› 123.5kg 备注`）与
+/// 选项行在文本层不可分，同样按选项行跳过——继承解析器的既有边界，不自行加判。
+///
 /// 只认**题号头之下**的首个命中——面板之下的滚回区/composer 草稿不误收。
 pub fn codex_notes_row_text(lines: &[String]) -> Option<String> {
     // 定位最后一个题号头（面板顶；与 codex_question_screen_snapshot 的
@@ -580,8 +585,8 @@ pub fn codex_notes_row_text(lines: &[String]) -> Option<String> {
         if text.is_empty() {
             continue;
         }
-        // 选项行（`› N. …`）跳过
-        if text.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        // 选项行（`› N. …`）跳过——直接用选项行解析器判定（真同源），数字开头的备注不误伤
+        if parse_codex_option_row(text).is_some() {
             continue;
         }
         let lower = text.to_lowercase();
@@ -616,8 +621,8 @@ pub fn codex_notes_input_ready(lines: &[String]) -> bool {
         if text.is_empty() {
             continue;
         }
-        if text.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            continue; // 选项行
+        if parse_codex_option_row(text).is_some() {
+            continue; // 选项行（真同源判定——数字开头的备注不误伤）
         }
         if text.to_lowercase().starts_with("ask codex") {
             continue; // composer 提示行（面板外）
@@ -629,6 +634,39 @@ pub fn codex_notes_input_ready(lines: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// **数字开头备注不误判为选项行**（2026-10-11 评审 Important 3）：旧判据「首字符
+    /// 是数字即跳过」把「3 点建议」当 `3. …` 选项行——notes 行失明、清空路径假报
+    /// 成功。现直接用 [`parse_codex_option_row`] 真同源判定，必须照常读出。
+    /// 还原动作：跳过判据退回「首字符数字即跳过」形态 → 本用例先红。
+    #[test]
+    fn codex_notes_row_text_allows_digit_prefixed_note() {
+        let frame = vec![
+            "  Question 1/1 (1 unanswered)".to_string(),
+            "  你偏好哪种协作方式?".to_string(),
+            "  › 1. 直接开干 (Recommended)  我直接动手实现".to_string(),
+            "    2. None of the above  Optionally, add details in notes (tab)".to_string(),
+            "  › 3 点建议：先讨论再动手".to_string(),
+            "  tab or esc to clear notes | enter to submit answer".to_string(),
+        ];
+        assert_eq!(
+            codex_notes_row_text(&frame).as_deref(),
+            Some("3 点建议：先讨论再动手"),
+            "数字开头的备注必须照常读出（不是选项行）"
+        );
+        assert!(codex_notes_input_ready(&frame));
+        // 对照：真选项行（`3. label`）仍被跳过——扫到的是下一行占位 → None
+        let option_like = vec![
+            "  Question 1/1 (1 unanswered)".to_string(),
+            "  你偏好哪种协作方式?".to_string(),
+            "  › 1. 直接开干".to_string(),
+            "  › 3. 真选项行".to_string(),
+            "  › Add notes".to_string(),
+            "  tab or esc to clear notes | enter to submit answer".to_string(),
+        ];
+        assert_eq!(codex_notes_row_text(&option_like), None, "真选项行仍须跳过");
+    }
+
     use super::*;
 
     fn multi_page() -> Vec<String> {

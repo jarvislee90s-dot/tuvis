@@ -275,8 +275,8 @@ pub fn parse_dialog_options(lines: &[String]) -> Option<Vec<DialogOption>> {
     // 选项（审批卡缺位，用户到终端作答——「未验不出手」）。
     if best.iter().any(|o| {
         let squeezed = o.label.replace(' ', "");
-        squeezed.contains("[ ]")
-            || squeezed.contains("[]")
+        // （`squeezed` 已去空格，"[ ]" 形态不可能出现——评审 Minor 指出的死分支已删）
+        squeezed.contains("[]")
             || squeezed.contains("[x]")
             || squeezed.contains("[X]")
             || squeezed.contains("[✔]")

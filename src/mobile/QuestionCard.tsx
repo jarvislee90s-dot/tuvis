@@ -857,9 +857,10 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                 repullAndSync(epoch);
               }, 2000);
             }
-            setAbortedStage(res.stage);
             // **中止后重拉**（评审 I6）：键可能在轮询窗尽后才被终端消费——重拉 GET
-            // 用屏读快照把卡面拉回与终端一致（快照对位失败则维持现状）
+            // 用屏读快照把卡面拉回与终端一致（快照对位失败则维持现状）。
+            // 静默调和同走本重拉（立即一次 + 上面 2s 补拍）；**不设 abortedStage**
+            //（评审 Minor：此前无条件重设把静默调和击穿，琥珀横幅照样挂）
             repullAndSync(epoch);
           }
         }

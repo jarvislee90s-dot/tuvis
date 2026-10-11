@@ -491,6 +491,12 @@ Kimi Code 支持 `KIMI_CODE_HOME` 环境变量重定向数据根（默认 `~/.ki
 
 ---
 
+## 二次开发指引
+
+欢迎 fork 与二次开发。按 MIT 许可证的要求，分发衍生版本时请保留原版权声明与许可证文本；在此基础上，欢迎（非强制）在项目说明中注明"基于兔维斯（Tuvis）二次开发"并回链本仓库，帮助用户识别上游。品牌名称与 Logo 的使用边界见 [TRADEMARK.md](TRADEMARK.md)。改进欢迎以 PR 形式回馈上游，让你的成果随主线一起演进。
+
+---
+
 ## 商标与非官方声明
 
 兔维斯 是一个独立的开源项目，与 Anthropic（Claude / Claude Code）、OpenAI（Codex / ChatGPT）、OpenCode、OpenClaw、月之暗面（Kimi Code）、WorkBuddy、ZCode、dsh 及本仓库提及的其他任何公司或产品均无关联、未获其背书或赞助。文中出现的名称与商标归其各自所有者所有，仅用于描述兼容性（名词性合理使用）。应用内图标为原创设计，部分配色仅用于辨识对应工具，不代表任何官方身份。

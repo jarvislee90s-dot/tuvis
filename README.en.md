@@ -456,6 +456,12 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ---
 
+## Forking & Derivative Works
+
+Forks and derivative projects are welcome. As required by the MIT License, please retain the original copyright notice and license text when redistributing. On top of that, you are welcome (but not obliged) to note "based on Tuvis" in your project description with a link back to this repository, so users can identify the upstream. See [TRADEMARK.md](TRADEMARK.md) for the boundaries on using the brand name and logo. Improvements are best contributed back upstream via PR, so your work evolves with the mainline.
+
+---
+
 ## Trademarks & Non-Affiliation
 
 Tuvis is an independent, open-source project. It is not affiliated with, endorsed by, or sponsored by Anthropic (Claude / Claude Code), OpenAI (Codex / ChatGPT), OpenCode, OpenClaw, Moonshot AI (Kimi Code), WorkBuddy, ZCode, dsh, or any other company or product mentioned in this repository. All product names, logos, and brands are the property of their respective owners; they are used here solely to describe compatibility (nominative fair use). Icons in this app are original designs; some color schemes are used only to help identify the corresponding tool and do not imply any official status.
