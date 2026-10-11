@@ -21,7 +21,8 @@
 //!   字段（每会话异端口、**按需轮询**——心跳按需生成，查空 ≠ 形态不存在）；Windows 5.7.3 =
 //!   无交互心跳且无 per-session serve ⇒ **心跳缺席时直接如实拒绝**（[`ENDPOINT_UNAVAILABLE_REASON`]，
 //!   不盲扫），启用了远程控制才走**端口指纹**路（`Get-NetTCPConnection` 按 WB pid 过滤 →
-//!   `/` 标题指纹 + `/health` `{"status":"UP"}` **双确认**）。
+//!   `/` 标题指纹 + connect 活体〔探测后连接即弃〕**双确认**；`/health` UP 降为兼容分支
+//!   ——Windows 内嵌版的 `/health` 被 AUTH_REQUIRED 挡，曾致双确认恒败误杀端点，M26 根修）。
 //! - ACP 会话**不进 `workbuddy.db`**，只落 `~/.workbuddy/projects/<munged-cwd>/` 转写 ⇒
 //!   读链路补扫归 `monitor::workbuddy_parser`（Task 11 同批）；本模块只做**落盘佐证**
 //!   （[`corroborate`]，二次确认，不作唯一证据）。
@@ -133,6 +134,19 @@ impl HttpReq {
             stream: StreamPolicy::whole(FINGERPRINT_TIMEOUT_MS),
         }
     }
+
+    /// connect 活体探测用 POST（照抄 [`AcpClient::handshake`] 建连形状：POST/空体/无头；
+    /// 超时与 [`Self::probe_get`] 同纪律——本机回环、探测后连接即弃，见 [`fingerprint_port`]）
+    pub fn probe_post(url: String) -> Self {
+        Self {
+            method: "POST",
+            url,
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: FINGERPRINT_TIMEOUT_MS,
+            stream: StreamPolicy::whole(FINGERPRINT_TIMEOUT_MS),
+        }
+    }
 }
 
 impl StreamPolicy {
@@ -160,9 +174,10 @@ pub const FINGERPRINT_TIMEOUT_MS: u64 = 1_000;
 /// 连连接池与 TLS 配置都丢）。
 pub const CLIENT_CONNECT_TIMEOUT_MS: u64 = 15_000;
 /// 端口候选上限（WB 是 Electron，监听端口不止一个；双确认前逐个试，**有界**）。
-/// 最坏代价 = 上限 ×（`/` + `/health`）× 探测超时 ≈ 16s（只有候选端口全部「收 TCP
-/// 不答 HTTP」时），典型（WB 未监听任何端口）= 0 次请求；**探测预算用尽即如实拒绝**
-/// （宁可慢一点回绝，也不盲扫、不冒充）
+/// 最坏代价 = 上限 ×（`/` + connect + `/health` 三发）× 探测超时 ≈ 24s（只有候选端口
+/// 全部「收 TCP 不答 HTTP」时——connect/health 被拒即刻返回，不吃满超时），典型（WB
+/// 未监听任何端口）= 0 次请求；**探测预算用尽即如实拒绝**（宁可慢一点回绝，也不盲扫、
+/// 不冒充）
 pub const MAX_PORT_CANDIDATES: usize = 8;
 /// 已结束会话判定死线（探测定案 + plan Step 1 原例逐字：60s 无 `agentPhase` 事件）
 pub const PHASE_DEADLINE_MS: u64 = 60_000;
@@ -508,7 +523,10 @@ pub fn loopback_url(raw: &str) -> Option<String> {
     ok.then(|| s.trim_end_matches('/').to_string())
 }
 
-/// `/health` 双确认之一：体须为 `{"status":"UP"}`（严格 JSON 解析——不猜）
+/// `/health` UP 判据——**第二腿兼容分支**（Mac 旧版：connect 不可达时的兜底，见
+/// [`fingerprint_port`]）。Windows 内嵌版的 `/health` 被 AUTH_REQUIRED 挡 ⇒ 本判据
+/// 恒 false，**无否决权**（端点是否认可走 connect 活体主路）。体须为
+/// `{"status":"UP"}`（严格 JSON 解析——不猜）
 pub fn health_ok(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body.trim())
         .ok()
@@ -520,13 +538,26 @@ pub fn health_ok(body: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 端口指纹**双确认**（标题指纹 + `/health` UP——单侧命中一律不认，防把别的本地服务
-/// 当 WorkBuddy 远程控制端点）
-pub fn fingerprint_hit(root_body: &str, health_body: &str) -> bool {
+/// 第一腿：`/` 标题指纹命中（大小写不敏感子串——探测定案：CodeBuddy Remote Control）
+pub fn title_hit(root_body: &str) -> bool {
     root_body
         .to_lowercase()
         .contains(&TITLE_FINGERPRINT.to_lowercase())
-        && health_ok(health_body)
+}
+
+/// 第二腿主路：connect 活体响应判据——体须含**非空** `connectionId`（严格 JSON 解析，
+/// 不猜）。只查 connectionId 不查 sessionToken：身份证据在 connectionId；sessionToken
+/// 形态漂移由投递链真建连（[`AcpClient::handshake`] 双字段严查）兜住——探测只判
+/// 「是 WB 且可用」，不做完整建连解析。
+pub fn connect_ok(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body.trim())
+        .ok()
+        .and_then(|v| {
+            v.get("connectionId")
+                .and_then(|s| s.as_str())
+                .map(|s| !s.is_empty())
+        })
+        .unwrap_or(false)
 }
 
 /// `Get-NetTCPConnection | Select -ExpandProperty LocalPort` 输出 → 端口表（纯核；
@@ -552,17 +583,37 @@ pub fn is_wb_host_exe(exe: Option<&Path>) -> bool {
         .unwrap_or(false)
 }
 
-/// 端口指纹双确认（GET `/` + GET `/health`，**都走注入缝**）
+/// 端口指纹双确认（第一腿 GET `/` 标题指纹 → 第二腿① connect 活体〔主路〕 /
+/// 第二腿② GET `/health` UP〔兼容分支〕，**都走注入缝**）。
+///
+/// **根因（2026-10-12 00:13 用户实测 + 审计 16:13:27Z，M26 修前复现）**：Windows 内嵌
+/// WB 的 `/health` 被鉴权挡（`AUTH_REQUIRED`），旧判据严格 `{"status":"UP"}` ⇒ 恒
+/// false ⇒ 双确认恒败（4 候选 0 命中）——端点在监听却永远发现不了。第二腿主路改
+/// connect 活体：免鉴权、即刻返回 connectionId = 比 health 更强的「是 WB 且可用」证据。
+///
+/// **探测后连接即弃**：逆向 API 无 disconnect 面（探测报告未见关闭端点，无从优雅
+/// 关闭）；ACP HTTP 形态逐请求 POST、不持长连（连接由 HTTP 客户端池管理）。「弃」的
+/// 语义 = 不保留探测凭据（connectionId/sessionToken 即弃）、不再发携带它们的任何请求
+/// ——投递链 [`AcpClient::handshake`] 自开新连接，不复用探测产物。
 fn fingerprint_port(http: &HttpSeam, root: &str) -> Option<String> {
     let root_resp = http(HttpReq::probe_get(format!("{root}/")));
     if root_resp.error.is_some() {
         return None; // 连接失败/超时：本候选不认（继续下一个）
     }
+    if !title_hit(&root_resp.body) {
+        return None; // 第一腿不过：不浪费第二腿（别的本地服务直接跳过）
+    }
+    // 第二腿①（主路）：connect 活体——Windows 内嵌版（/health 被 AUTH_REQUIRED 挡）靠它救
+    let probe = http(HttpReq::probe_post(format!("{root}{CONNECT_PATH}")));
+    if probe.error.is_none() && (200..300).contains(&probe.status) && connect_ok(&probe.body) {
+        return Some(root.to_string()); // 探测连接即弃（见函数文档）
+    }
+    // 第二腿②（兼容分支，Mac 旧版）：health 只作兜底不作否决——connect 失败不阻断
     let health = http(HttpReq::probe_get(format!("{root}/health")));
     if health.error.is_some() {
         return None;
     }
-    fingerprint_hit(&root_resp.body, &health.body).then_some(root.to_string())
+    health_ok(&health.body).then_some(root.to_string())
 }
 
 /// 端点发现内核（**心跳优先 → Windows 端口指纹 → 如实不可用**）。
@@ -570,7 +621,8 @@ fn fingerprint_port(http: &HttpSeam, root: &str) -> Option<String> {
 /// 心跳路要求四件事同时成立（Mac/旧版形态）：心跳**可用**（严格 UUID + 非 prewarm +
 /// 新鲜 < 90s + 文件名/内容 pid 一致）、**会话号匹配**（每会话异端口）、`endpoint` 在场、
 /// 且为**回环**形态。Windows 5.7.3（无交互心跳）→ 端口指纹路：WB 宿主 pid 过滤 →
-/// 逐候选端口 `/` 标题指纹 + `/health` **双确认**（候选有界）。
+/// 逐候选端口 `/` 标题指纹 + connect 活体〔主路，探测后连接即弃〕 / `/health` UP
+/// 〔兼容分支〕**双确认**（候选有界）。
 /// 两路都落空 ⇒ 如实 [`EndpointDiscovery::Unavailable`]，**不盲扫**。
 pub fn discover_endpoint(
     probe: &EndpointProbe,
@@ -2359,29 +2411,46 @@ mod tests {
         }
     }
 
-    /// Windows 端口指纹路：**双确认**（`/` 标题指纹 **且** `/health` UP）才认；
-    /// 单侧命中一律不认（防把别的本地服务当 WB 远程控制端点）
+    /// Windows 端口指纹路：三判据纯核——第一腿 `/` 标题指纹、第二腿① connect 活体
+    /// （主路）、第二腿② `/health` UP（兼容分支）；AUTH_REQUIRED 的 health **不是 UP**
+    /// 但**无否决权**（Windows 内嵌版靠 connect 活体过，不再被 health 误杀——本修根因）
     #[test]
     fn port_fingerprint_requires_both_confirmations() {
-        assert!(fingerprint_hit(
-            "<title>CodeBuddy Remote Control</title>",
-            r#"{"status":"UP"}"#
+        // 第一腿：标题指纹（探测定案逐字；大小写不敏感子串）
+        assert!(title_hit("<title>CodeBuddy Remote Control</title>"));
+        assert!(
+            !title_hit("<title>something else</title>"),
+            "标题不符 ⇒ 第一腿不过"
+        );
+        assert!(
+            title_hit("<TITLE>codebuddy remote control</TITLE>"),
+            "大小写不敏感"
+        );
+        // 第二腿①（主路）：connect 活体判据（非空 connectionId 即认；不查 sessionToken——
+        // 漂移由投递链真 handshake 双字段严查兜住）
+        assert!(connect_ok(
+            r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#
         ));
+        assert!(!connect_ok("not json"), "非 JSON 不猜");
         assert!(
-            !fingerprint_hit(
-                "<title>CodeBuddy Remote Control</title>",
-                r#"{"status":"DOWN"}"#
-            ),
-            "title 命中但 health 不对 ⇒ 不认"
+            !connect_ok(r#"{"sessionToken":"probe-t0"}"#),
+            "缺 connectionId ⇒ 不认"
         );
         assert!(
-            !fingerprint_hit("<title>something else</title>", r#"{"status":"UP"}"#),
-            "health 对但 title 不对 ⇒ 不认"
+            !connect_ok(r#"{"connectionId":""}"#),
+            "空 connectionId ⇒ 不认"
         );
+        // 第二腿②（兼容分支，Mac 旧版）：health UP 仍认
         assert!(!health_ok("not json"), "非 JSON 不猜");
         assert!(
             health_ok(" {\"status\":\"up\"} \n"),
             "空白/大小写容忍（JSON 语义不变）"
+        );
+        // 本修根因形态（探测报告 §3.1）：Windows 内嵌版 /health 被 AUTH_REQUIRED 挡——
+        // 体不是 UP（严格解析），但 health 只是兜底分支、无否决权
+        assert!(
+            !health_ok(r#"{"error":{"code":"AUTH_REQUIRED","message":"authentication required"}}"#),
+            "AUTH_REQUIRED 体不是 UP：旧判据曾在此形态下误杀全部候选（00:13 实测 0 命中）"
         );
         // 端口表解析：表头/噪声/越界一律跳过
         assert_eq!(
@@ -2406,19 +2475,29 @@ mod tests {
         assert_eq!(loopback_url("file:///etc/passwd"), None);
     }
 
-    /// 端口指纹路的完整发现（WB 进程在、端口双确认）：经**同一条** HTTP 缝拿 `/` 与 `/health`
+    /// 端口指纹路的完整发现（多候选迭代，经**同一条** HTTP 缝）：候选一（35578）标题
+    /// 命中但 connect/health 双败 ⇒ 不认；候选二（63928）标题 + connect 200 ⇒ Found
+    /// ——期望表按序 5 发（`/`、connect、`/health` | `/`、connect）
     #[test]
     fn port_fingerprint_discovery_uses_the_injected_seam() {
         let mut http = MockHttp::new();
+        // 候选一（35578）：标题命中但两腿皆败 → 本候选不认（继续下一个）
         http.expect_get("/")
             .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_transport_error("connect refused");
         http.expect_get("/health")
-            .respond_json(r#"{"status":"UP"}"#);
+            .respond_transport_error("health refused");
+        // 候选二（63928）：标题 + connect 200 → Found（不再问 /health）
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
         let probe = EndpointProbe {
             os: "windows",
             heartbeat: Box::new(|_pid| None),
             wb_pids: Box::new(|| vec![4242]),
-            listening_ports: Box::new(|_pid| vec![63928]),
+            listening_ports: Box::new(|_pid| vec![35578, 63928]),
         };
         let found = discover_endpoint(&probe, &http.clone().seam(), SID, 0);
         assert_eq!(
@@ -2430,6 +2509,202 @@ mod tests {
                     port: 63928
                 }
             }
+        );
+        assert_eq!(
+            http.calls().len(),
+            5,
+            "按序 5 发：/,connect,health | /,connect"
+        );
+        http.assert_clean();
+    }
+
+    /// Windows 内嵌版主路（本修目标形态）：标题 + connect 200 ⇒ 双确认过——**不装
+    /// /health 期望**（多打即违规）；connect 过即停（零 health 咨询）
+    #[test]
+    fn connect_liveness_passes_double_confirm() {
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        let probe = EndpointProbe {
+            os: "windows",
+            heartbeat: Box::new(|_pid| None),
+            wb_pids: Box::new(|| vec![4242]),
+            listening_ports: Box::new(|_pid| vec![63928]),
+        };
+        assert_eq!(
+            discover_endpoint(&probe, &http.clone().seam(), SID, 0),
+            EndpointDiscovery::Found {
+                url: BASE.to_string(),
+                source: EndpointSource::PortFingerprint {
+                    pid: 4242,
+                    port: 63928
+                }
+            }
+        );
+        assert_eq!(
+            http.calls().len(),
+            2,
+            "connect 过 ⇒ 第二腿即成，零 health 咨询"
+        );
+        http.assert_clean();
+    }
+
+    /// Mac 旧版兼容分支：connect 不可达（transport_error）但 health `{"status":"UP"}`
+    /// ⇒ 双确认仍过——health 只作兜底，不作否决
+    #[test]
+    fn legacy_health_up_branch_kept() {
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_transport_error("connect refused");
+        http.expect_get("/health")
+            .respond_json(r#"{"status":"UP"}"#);
+        let probe = EndpointProbe {
+            os: "windows",
+            heartbeat: Box::new(|_pid| None),
+            wb_pids: Box::new(|| vec![4242]),
+            listening_ports: Box::new(|_pid| vec![63928]),
+        };
+        assert_eq!(
+            discover_endpoint(&probe, &http.clone().seam(), SID, 0),
+            EndpointDiscovery::Found {
+                url: BASE.to_string(),
+                source: EndpointSource::PortFingerprint {
+                    pid: 4242,
+                    port: 63928
+                }
+            }
+        );
+        http.assert_clean();
+    }
+
+    /// **本修主断言**：AUTH_REQUIRED 的 health 不再误杀——①纯判据面：AUTH_REQUIRED 体
+    /// 不是 UP（health_ok 恒 false，但无否决权——不因它拒掉端点）；②行为面：connect
+    /// 活体过 ⇒ 端点发现命中，health 零咨询（不得预装不消费的 /health 期望）
+    #[test]
+    fn auth_required_health_not_misjudged() {
+        assert!(
+            !health_ok(r#"{"error":{"code":"AUTH_REQUIRED","message":"authentication required"}}"#),
+            "① AUTH_REQUIRED 体不是 UP（旧判据在此形态下误杀全部候选——修前实测 0 命中）"
+        );
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        let probe = EndpointProbe {
+            os: "windows",
+            heartbeat: Box::new(|_pid| None),
+            wb_pids: Box::new(|| vec![4242]),
+            listening_ports: Box::new(|_pid| vec![63928]),
+        };
+        assert_eq!(
+            discover_endpoint(&probe, &http.clone().seam(), SID, 0),
+            EndpointDiscovery::Found {
+                url: BASE.to_string(),
+                source: EndpointSource::PortFingerprint {
+                    pid: 4242,
+                    port: 63928
+                }
+            },
+            "② connect 过 ⇒ 端点命中（health 被鉴权挡也救得回来）"
+        );
+        assert!(
+            http.calls().iter().all(|c| !c.url.contains("/health")),
+            "connect 过 ⇒ health 零咨询：{:?}",
+            http.calls()
+        );
+        http.assert_clean();
+    }
+
+    /// 双确认双败（标题命中但 connect refused + health AUTH_REQUIRED）⇒ 投递前拒绝
+    /// ——「请开启远程控制」引导**只在此时**出现（M26 修前它在本可发现的形态下是误导，
+    /// 语义自此恢复准确）；探测 3 发（`/` + connect + `/health`）后如实回绝
+    #[test]
+    fn both_legs_fail_means_refused_with_enable_hint() {
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_transport_error("connect refused");
+        http.expect_get("/health").respond_status(
+            401,
+            r#"{"error":{"code":"AUTH_REQUIRED","message":"authentication required"}}"#,
+        );
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert_eq!(
+            out.receipt.stage,
+            Some(Stage::Refused),
+            "未起跑、零字节投递 = 投递前拒绝（不是 channel_error）：{:?}",
+            out.receipt
+        );
+        assert_eq!(
+            out.receipt.terminator(),
+            super::super::receipt::Terminator::NotStarted
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(reason.contains("WorkBuddy 远程控制端点未启用"), "{reason}");
+        assert!(
+            reason.contains("请在 WorkBuddy 设置中开启远程控制"),
+            "{reason}"
+        );
+        assert!(reason.contains("0 命中"), "如实报探测结论：{reason}");
+        assert_eq!(
+            http.calls().len(),
+            3,
+            "探测 = `/` + connect + `/health` 三发"
+        );
+        http.assert_clean();
+    }
+
+    /// 探测连接即弃（run_turn 全链）：探测 connect 回 probe-c0/probe-t0，投递链
+    /// handshake **自开新连接**（c1/t1）；ACP wire 头**钉值** `acp-connection-id: c1` /
+    /// `acp-session-token: t1`——若复用探测凭据必头值不符 ⇒ 违规红（证明弃得干净）
+    #[test]
+    fn connect_probe_discards_connection() {
+        const PINNED_HDRS: &[&str] = &[
+            "acp-connection-id: c1",
+            "acp-session-token: t1",
+            "Accept: application/json, text/event-stream",
+        ];
+        let mut http = MockHttp::new();
+        // 端点发现：第一腿 + 探测 connect（凭据 probe-* 用完即弃，不保留、不再携带）
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        // 投递链：handshake 自开连接（c1/t1）→ initialize → load → prompt（头钉值）
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(PINNED_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(PINNED_HDRS))
+            .respond_sse(&load_sse(2, None, "fullAccess"));
+        http.expect_post(ACP_PATH, Some(PINNED_HDRS))
+            .respond_sse(&prompt_sse(
+                3,
+                &["model_requesting"],
+                Some("end_turn"),
+                Some("好的"),
+            ));
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        assert_eq!(
+            out.endpoint,
+            Some(EndpointDiscovery::Found {
+                url: BASE.to_string(),
+                source: EndpointSource::PortFingerprint {
+                    pid: 4242,
+                    port: 63928
+                }
+            }),
+            "Windows 主路（connect 活体）发现的端点照常进投递链"
         );
         http.assert_clean();
     }
