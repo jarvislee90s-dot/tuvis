@@ -22,7 +22,15 @@
     "feature3": "TypeScript - 类型安全",
     "feature4": "Tailwind CSS v4 - 现代 CSS 框架",
     "feature5": "shadcn/ui - 精美的 UI 组件",
-    "close": "关闭"
+    "close": "关闭",
+    "updateTo": "更新到 v{{version}}",
+    "newVersionDetected": "检测到新版本：{{version}}",
+    "officialRepo": "官方仓库",
+    "changelog": "更新日志",
+    "recentUpdates": "近期更新",
+    "starMessage": "如果 兔维斯 帮到了你，请在 GitHub 点个 Star，这对我们意义重大",
+    "starAction": "去点 Star",
+    "starDismiss": "关闭横幅"
   },
   "theme": {
     "toggle": "切换主题"
