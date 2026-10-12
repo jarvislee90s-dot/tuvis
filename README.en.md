@@ -34,6 +34,7 @@ Real-time traffic-light status board for all active AI coding tool sessions.
 - Distinguishes CLI vs. desktop APP form: APP sessions support session-level deep-link jumps (`workbuddy://chat/<id>`, `codex://threads/<id>`, with APP-foreground fallback) and persistent unread cards (kept across restarts, cleared when the host exits); dsh (web-hosted) jumps focus/open the dsh tab in your browser (macOS)
 - Shows project name, git branch, last message preview, CPU usage, runtime
 - Sorts by priority: waiting → running → idle
+- **Tool filter chips** ("All" + 8 tools) below the tab bar — icons/colors share one source with the card badges; the choice is remembered locally, the counter stays global, and an empty result names the tool instead of showing a blank board
 - System tray icon reflects aggregate status (🔴/🟡/🟢)
 
 ### Remote Access & Mobile Board (LAN / Quick Tunnel / Own Domain / External Domain)
@@ -84,6 +85,7 @@ Not just looking — you can **act**: send messages, approve tool calls, answer 
 - **Remote Q&A**: single-choice, multi-select, and free-form answers (including **Other — overwrite & clear**: enter edit, backspace to empty, then type; an empty text is rejected honestly), per-question progression with a confirmation card; multi-select taps only toggle, "next question" advances explicitly (opencode/kimi also support ◀/▶ back and forth) — the phone and the terminal always stay on the same question. **Confirmation-card answers are sourced from the terminal's Review page via screen reading**: after a refresh or page reopen they match the terminal summary exactly; local memory is only a fallback
 - **Permission modes**: kimi's three tiers (`/permission` / `/yolo` / `/auto`) use a **two-step flow** — open the menu, screen-read the highlighted row, only then press Enter — plus a **mode/permission dual read-back** in the status bar (both the switch receipt and the current tier carry screen-read evidence); codex switches via the terminal menu single-select
 - **Guards**: while a dialog is pending, ordinary message injection is blocked (to avoid answering the default by accident); input-line residue is detected to prevent double sends; dangerous keys (such as Ctrl+C, which quits OpenCode) are blacklisted
+- **Write actions on codex desktop APP sessions are refused until the protocol channel lands**: APP sessions have no console, so the keystroke channel cannot reach them. Mode switching / permission menu / Q&A answers / approval responses now return a "work in progress" notice before touching the terminal and point you back to the APP (refusals are audited — see "Injection audit" in Settings). **CLI sessions are unaffected, and read-only features keep working**
 
 |                Session detail · messages                |              Send · queue & jump               |
 | :-----------------------------------------------------: | :--------------------------------------------: |
@@ -113,6 +115,7 @@ A talking fox companion that lives in the corner of your screen and watches ever
 - Drag physics: pinned-to-cursor dragging, gravity fall on release, throw inertia, squash-and-bounce landing (optional)
 - Single-click waves, double-click talks, right-click menu: sound / subtitles / physics / always-on-top / size / per-scene action binding / hide
 - Dashboard integration: takes over completion chimes, suppresses toast popups while always-on-top; toggle from the dashboard 🦊 button, system tray, or settings
+- **"Launch with the app" switch** (Settings → "Notifications & Pet" block, on by default): decides whether the pet follows Tuvis at startup; once turned off it stays off and is no longer overridden by the startup fallback logic
 
 #### External Pets
 
@@ -179,6 +182,13 @@ surfaces are not implemented yet (upcoming work), so this version ships no UI en
 - Configurable on/off toggle in settings
 - Clickable notifications with "View Session" action to jump to terminal
 
+### Launch at Login
+
+- Toggle it from the Settings → "Notifications & Pet" card, or from below the tray's "Show Window" item — both share one read/write path and keep the checkbox state in sync
+- What you see is the **real OS-side state, read live** (Windows registry Run key, including the enable/disable flag Task Manager writes; macOS login items) — no local cache, and a failed toggle rolls back and reports honestly
+- When launched by autostart, the main window **starts hidden in the tray** and the desktop pet still follows (no window popping up on boot)
+- On Windows, uninstalling removes the startup entry for the user who uninstalls it; macOS has no uninstall hook, so remove the matching plist under `~/Library/LaunchAgents/` manually
+
 ### Quick Terminal Jump
 
 Click a session card to instantly focus the corresponding terminal tab:
@@ -233,7 +243,7 @@ A dedicated settings section to decide which tools Tuvis monitors and manages:
 
 ## Tool Support Matrix
 
-Capabilities across the 8 terminal-class AI coding tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported):
+Capabilities across the 12 capability rows × 8 terminal-class AI coding tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported) — this is the master capability table, updated with every release (structured source: [`docs/capabilities.json`](docs/capabilities.json), shared with the website):
 
 | Capability                         | Claude Code | Codex CLI | OpenCode | OpenClaw | Kimi Code    | WorkBuddy | ZCode           | dsh         |
 | ---------------------------------- | ----------- | --------- | -------- | -------- | ------------ | --------- | --------------- | ----------- |
@@ -247,6 +257,8 @@ Capabilities across the 8 terminal-class AI coding tools (✅ supported / ◐ pa
 | Mobile · file preview              | ✅          | ✅        | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
 | Mobile · send messages (injection) | 🧪          | 🧪        | 🧪       | ❌       | 🧪           | ❌        | ❌              | ❌          |
 | Mobile · create sessions           | 🧪          | 🧪        | 🧪       | ❌       | 🧪           | ❌        | ❌              | ❌          |
+| Token usage collection             | ✅          | ✅        | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
+| Mobile · sub-agent observatory     | ✅          | ❌        | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
 
 **Mobile remote control (v0.5.0, experimental)**: message viewing and file preview cover 7 of the 8 tools (OpenClaw's black-box build is not remotely readable yet); **sending messages to CLI sessions and creating sessions from your phone are experimental**, currently supporting Claude Code / Codex CLI / OpenCode / Kimi Code. Messages are injected as keystrokes into the terminal and verified by screen-reading receipts (no false "delivered"); queueing, interrupt-and-jump, remote approvals, question answering, permission-mode switching, and session creation are included. See the Chinese README for illustrated walkthroughs and per-tool limitations.
 
@@ -427,12 +439,17 @@ The app stores its data in `~/.tuvis/`:
 - [x] APP-form session cards and deep-link jumps
 - [x] Plugin management (file/config hybrid)
 - [x] i18n (Chinese + English)
-- [x] Auto-update via GitHub Releases
+- [x] Auto-update via GitHub Releases (redone in v0.5.1: prerelease channel + ignore-this-version + title-bar upgrade badge)
 - [x] Dark/light theme sync with system
 - [x] Windows support (NSIS installer + deep links + nearest-ancestor window focus)
 - [x] Remote control phase 2 (v0.5.0, experimental) — send messages / queue & jump the queue / remote approvals / Q&A / permission switching from your phone (Claude Code / Codex CLI / Kimi Code / OpenCode)
 - [x] Mobile archived history (registry-based archiving + reactivation loop)
 - [x] Remote access · External domain (no domain needed) fixed-address channel (one-click Tailscale onboarding + public-side reachability verification + automatic recovery on boot; access from this computer now requires the PIN)
+- [x] External-domain wizard validated on Windows (v0.5.1) — custom Tailscale CLI path lookup fixed at the root + the login step hands you the authorization link (never logs in for you)
+- [x] Token usage dashboard (phase 1 collection substrate & ledger + phase 2 settings section / pet mini-bar; see the "Token Usage Dashboard" section for the exact accounting rules)
+- [x] Mobile sub-agent observatory (running-session chip + sub-agent board + execution detail)
+- [x] Launch at login (Settings + tray entries; source of truth = live OS-side state, no local cache)
+- [x] Board filtering by tool (desktop 8-tool chips + local memory, same semantics as mobile)
 - [ ] Linux support
 - [ ] Kitty & WezTerm terminal jump support
 
