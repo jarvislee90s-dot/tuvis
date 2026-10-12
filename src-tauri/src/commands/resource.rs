@@ -884,8 +884,14 @@ fn resolve_tool_resource_path(
 fn open_dir_in_system(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        use std::process::Stdio;
+        // release 版是 windows_subsystem="windows" GUI 进程（无控制台），默认继承的
+        // std 句柄无效 → CreateProcess 报 os error 6（句柄无效）。显式置 null 不继承。
         std::process::Command::new("explorer")
             .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("打开目录失败: {}", e))?;
     }
@@ -911,9 +917,14 @@ fn open_dir_in_system(path: &std::path::Path) -> Result<(), String> {
 fn open_file_in_system(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        // start 的首个带引号参数会被当作窗口标题，须补空标题
+        use std::process::Stdio;
+        // start 的首个带引号参数会被当作窗口标题，须补空标题；stdio 置 null 的原因
+        // 同 open_dir_in_system（GUI 进程继承无效句柄 → os error 6）
         std::process::Command::new("cmd")
             .args(["/C", "start", "", &path.to_string_lossy()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("打开文件失败: {}", e))?;
     }
