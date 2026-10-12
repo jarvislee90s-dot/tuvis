@@ -2764,6 +2764,40 @@ pub async fn session_approve_options(
     )
 }
 
+/// 模式端点的审计摘要**文案单点**（M4：成功臂与止血门拒绝臂各写一份格式化迟早漂移，
+/// 而账本正是拿它对账）。
+///
+/// 组+档一起进摘要——二维工具的组是语义的一部分：只记「切换至默认」无法区分是模式组
+/// 的默认还是权限组的默认。`Mode` 组沿用历史措辞「切换模式至 X」（与前端 ModeBar 的
+/// 「模式」组标题一致）；其余组按组屏显标签出「切换{组}至 X」（如「切换权限至 只读」）。
+fn mode_audit_content(group: crate::inject::mode::ModeGroupId, label: &str) -> String {
+    if group == crate::inject::mode::ModeGroupId::Mode {
+        format!("切换模式至 {label}")
+    } else {
+        format!("切换{}至 {label}", group.label())
+    }
+}
+
+/// 审批端点的审计 action 词表（**判据单点**：成功臂与止血门拒绝臂共用——两臂各写
+/// 一份 match 迟早漂移，而账本正是拿它对账）。
+///
+/// approve/reject 语义化；`dialog:<n>`（R1-4：对话框选项语义上是**批准动作**，用户在
+/// 真实选项里选了一个）归 approve——与 C-23 文档「审计 action=approve、
+/// content=dialog:N」一致，原实现落 "key"+warn 属域外兜底路径的误伤；域外 id（KV
+/// 定制表可含任意 id）不进词表——收敛为 "key" 并 `log::warn` 留痕，防自由文本污染
+/// 审计 action 列（AuditLogSection 前端「原样小写展示」契约不受影响）。
+fn approve_audit_action(option_id: &str) -> &'static str {
+    match option_id {
+        "approve" => "approve",
+        "reject" => "reject",
+        d if d.starts_with("dialog:") => "approve",
+        other => {
+            log::warn!("审批动作域外 id：{other}，审计记 key");
+            "key"
+        }
+    }
+}
+
 /// POST /m/api/v1/session-approve 请求体（camelCase；字段全 default——缺参不触发
 /// axum 提取器 422，由 handler 统一按契约给 400 bad_request）
 #[derive(Deserialize)]
@@ -2847,6 +2881,24 @@ pub async fn session_approve(
         else {
             return Err("no_session");
         };
+        // ===== Task 15 止血门（I2 复评，2026-10-12 P0）：**同根因的兄弟写路径** =====
+        //
+        // 根因与三写入口（session-mode/switch・session-mode/menu・
+        // session-question/answer，见 [`codex_app_form`] 文档）**完全同类**：codex APP
+        // 会话没有控制台，CLI 键序通道对它就是错误通道。而 codex 的默认审批映射
+        // （[`crate::inject::approve::DEFAULT_MAPPINGS_JSON`]：approve→"y" /
+        // reject→"esc"，verified_with=0.154.0，**不是** probe-pending 严格档）在本端点
+        // **走映射表这条路径不读屏、直接发键**——APP 卡片在 Waiting（`derive_app_status`
+        // 停更）或计划预期态下给出的「允许/拒绝」点下去，就是向无控制台宿主注入
+        // y / esc。故本端点并入同一道门。
+        //
+        // **门位：会话定位之后、Waiting/计划预期态判据与 dialog 选项解析（含
+        // `read_dialog_options_render_wait` 屏读）之前**——与三写入口「任何屏读与注入
+        // 之前」同一口径（APP 无屏可读，读屏还要先 attach 控制台，纯白付代价）。读侧
+        // `/session-approve-options`（GET）**不受门**，与「GET 类端点不受门」一致。
+        if codex_app_form(&session) {
+            return Err(APP_FORM_PENDING_CODE);
+        }
         // T4：Waiting 门改「Waiting ∨ 等待标记」（与 approve-options 同口径——
         // 审批等待期状态判 processing，标记经 store.with 点查）
         let tool = session.agent_type.tool_id().to_string();
@@ -3024,6 +3076,24 @@ pub async fn session_approve(
     let (session, tool, option, keys, verify_plan) = match lookup {
         Ok(v) => v,
         Err(code) => {
+            // codex APP 止血门（I2）：409 + 审计（其余校验失败码维持下方「零注入零
+            // 审计」口径——本条是投递路拒绝，须留痕供事后核对，与三写入口同形）。
+            // 审计 tool 位恒 codex（判据单点 [`codex_app_form`] 只在 codex 命中）；
+            // action 走与成功臂**同一个**纯函数 [`approve_audit_action`]（防两臂词表
+            // 漂移），content = optionId（与成功臂同形，见端点文档的审计契约）。
+            if code == APP_FORM_PENDING_CODE {
+                endpoint_audit(
+                    &st,
+                    &device_id,
+                    &device_name,
+                    "codex",
+                    &sid,
+                    &option_id,
+                    approve_audit_action(&option_id),
+                    APP_FORM_PENDING_AUDIT_RESULT,
+                );
+                return app_form_pending_response();
+            }
             let status = if code == "not_waiting" {
                 StatusCode::CONFLICT
             } else {
@@ -3179,21 +3249,8 @@ pub async fn session_approve(
     };
     // 审计 action 词表（W5 词表 send|queue|flush|jump|retract|approve|reject|fail|key|open；
     // open = Task 11 一键 resume（session-open 端点），Task 7 的预留标注已兑现）：
-    // approve/reject 语义化；域外 id（KV 定制表
-    // 可含任意 id）不进词表——收敛为新增词表动作 "key" 并 log::warn 留痕，防自由文本
-    // 污染审计 action 列（AuditLogSection 前端「原样小写展示」契约不受影响）
-    let action = match option.id.as_str() {
-        "approve" => "approve",
-        "reject" => "reject",
-        // R1-4：对话框选项（`dialog:N`）语义上是**批准动作**（用户在真实选项里选了一个），
-        // 归 approve——与 C-23 文档「审计 action=approve、content=dialog:N」一致。
-        // 原实现落 "key"+warn，属域外 id 兜底路径的误伤。
-        d if d.starts_with("dialog:") => "approve",
-        other => {
-            log::warn!("审批动作域外 id：{other}，审计记 key");
-            "key"
-        }
-    };
+    // 判据单点见 [`approve_audit_action`]——成功臂与止血门拒绝臂共用（防两臂漂移）。
+    let action = approve_audit_action(&option.id);
     match sent {
         Ok(()) => {
             endpoint_audit(
@@ -8461,11 +8518,10 @@ pub async fn session_mode_switch(
                     .group(group)
                     .and_then(|spec| spec.tiers.iter().find(|t| t.mode == mode).map(|t| t.label))
                     .unwrap_or_else(|| mode.label());
-                let audit_content = if group == crate::inject::mode::ModeGroupId::Mode {
-                    format!("切换模式至 {label}")
-                } else {
-                    format!("切换{}至 {label}", group.label())
-                };
+                // 组词与档标签是纯函数，拒绝臂就地重算后走**与成功臂同一个**
+                // [`mode_audit_content`]（M4：两臂各写一份格式化迟早漂移，而账本
+                // 正是拿它对账）
+                let audit_content = mode_audit_content(group, label);
                 endpoint_audit(
                     &st,
                     &device_id,
@@ -8749,12 +8805,9 @@ pub async fn session_mode_switch(
     };
     // 组+档进审计摘要（二维工具的组是语义的一部分：只记「切换至默认」无法区分
     // 是模式组的默认还是权限组的默认）。2026-10-10 用户指令：零投递闸移除——
-    // toggle 臂恒真发键，审计摘要不再有 zero-key 标注态。
-    let audit_content = if group == crate::inject::mode::ModeGroupId::Mode {
-        format!("切换模式至 {label}")
-    } else {
-        format!("切换{}至 {label}", group.label())
-    };
+    // toggle 臂恒真发键，审计摘要不再有 zero-key 标注态。**判据单点**
+    // [`mode_audit_content`]——成功行与止血门拒绝行共用（账本正是拿它对账）。
+    let audit_content = mode_audit_content(group, label);
     let (result_str, status_line) = match &result {
         Ok(_) => ("ok".to_string(), "key_sent"),
         Err(e) => (format!("failed:{e}"), "failed"),
@@ -10191,6 +10244,24 @@ pub async fn create_projects(
 mod tests {
     use super::*;
     use crate::remote::content::SessionMessage;
+
+    /// M4 回归锁：审计摘要文案**单点** [`mode_audit_content`]——成功臂与止血门拒绝臂
+    /// 共用同一函数，本用例钉住两组各自的措辞（对账口径：账本正是拿它逐字对账，
+    /// 两臂若各写一份格式化，措辞漂移即对不上账）。
+    #[test]
+    fn mode_audit_content_pins_group_wording() {
+        use crate::inject::mode::ModeGroupId;
+        // Mode 组沿用历史措辞「切换模式至 X」（空档名也照原样拼装，不特判）
+        assert_eq!(
+            mode_audit_content(ModeGroupId::Mode, "计划"),
+            "切换模式至 计划"
+        );
+        // 其余组按组屏显标签出「切换{组}至 X」
+        assert_eq!(
+            mode_audit_content(ModeGroupId::Permission, "只读"),
+            "切换权限至 只读"
+        );
+    }
 
     /// **poll_screen_changed 三态**（2026-10-06 SingleKey/KimiToggle 轮询升级的
     /// 回归锁）：变化即停（不带多余等待）；窗尽原样 → Unchanged（= 如实 Failed

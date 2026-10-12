@@ -3979,6 +3979,17 @@ mod tests {
     /// F2：补 key_spec_calls 记录 locate_and_send_key_spec 收到的族规格（trait 默认实现
     /// 只透传不记录——覆写以断言「审批路径族传递」；键位经委托旧方法照旧入 key_calls，
     /// 既有键位断言不受影响，fail 语义同源）
+    /// 注入器桩（记录派发，不真注入）。
+    ///
+    /// **零投递断言的盲区（复评 M3，如实申报，本轮不改）**：本桩覆写了
+    /// [`crate::inject::engine::Injector`] 的 `locate_and_inject` /
+    /// `locate_and_send_key` / `locate_and_send_key_spec` 三条（有记录），但**未覆写**
+    /// 默认方法 `locate_and_inject_draft_spec`（草稿注入）与
+    /// `locate_and_send_backspaces_spec`（批量退格）——`inject/engine.rs` 的默认实现
+    /// 恒返回 `Err` 且**不记录**。故凡「零投递」断言（含止血门用例）覆盖的只有前三条；
+    /// 若将来有路径经这两条默认方法被误触达，用例拿到的是 Err 而非「记录非空」，
+    /// **不会被判红**（属断言面缺口，不是行为已正确）。收口办法：在桩里补这两个方法
+    /// 并把调用推进同一份记录表（本轮不动：会改变既有用例的 Err 语义面，属独立改动）。
     struct FakeInjector {
         calls: std::sync::Mutex<Vec<(u32, String)>>,
         key_calls: std::sync::Mutex<Vec<(u32, String)>>,
@@ -15523,7 +15534,15 @@ mod tests {
     }
 
     /// ③ 问答作答入口（session-question/answer）：问答在场 ∧ codex APP → 409
-    /// `app_form_pending` + 零键序零文本（门在键序构造与阶段机之前）
+    /// `app_form_pending` + 零键序零文本（门在键序构造与阶段机之前）。
+    ///
+    /// **在场通道的申报（复评 M9）**：本用例的问答在场走**通道 A**（
+    /// `question_wait::mark` + 载荷），而 codex APP 真机的问答在场是**通道 B**
+    /// （消息尾部/屏读形态）。门位在一切通道判定与屏读**之前**（判据只看
+    /// `form = App ∧ tool = codex`），故两通道的拒绝结论同源；但「零投递」的**证据面**
+    /// 只覆盖通道 A——通道 B 下「门先于通道探测」这一条由门位的代码顺序与本用例的
+    /// dialog 探针计数（见 `approve_rejects_codex_app_form_with_409`）间接保证，
+    /// 未在通道 B 上单独取证。
     #[tokio::test]
     async fn question_answer_rejects_codex_app_form_with_409() {
         let fake = FakeInjector::ok();
@@ -15562,6 +15581,67 @@ mod tests {
         );
     }
 
+    /// ④ 审批入口（session-approve）：codex APP → 409 `app_form_pending` + **零注入 +
+    /// 零屏读**。兄弟写路径同根因（codex 默认审批映射 approve→"y"/reject→"esc" 走
+    /// **映射表直发键**，不读屏；见 api.rs 的 `approve_audit_action` 与门位注释）——
+    /// 两 action 各一条：`dialog:N`（会走 dialog 选项解析 = 屏读路径）与 `approve`
+    /// （走映射表 = 不读屏直接发键）。dialog 探针计数 0 即钉住「门在一切屏读与注入之前」
+    /// （门若被挪到 dialog 解析之后，本断言立刻红）。
+    #[tokio::test]
+    async fn approve_rejects_codex_app_form_with_409() {
+        let fake = FakeInjector::ok();
+        let mut state = codex_form_state(
+            fake.clone(),
+            crate::session::ProcessForm::App,
+            &[("sess_app_ap", 64)],
+        );
+        let probe_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = probe_calls.clone();
+        std::sync::Arc::get_mut(&mut state)
+            .expect("codex_form_state 返回独占引用")
+            .dialog_probe = std::sync::Arc::new(move |_, _| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        for (oid, tag) in [
+            ("dialog:1", "dialog 选项（屏读解析路径）"),
+            ("approve", "映射键位（不读屏直发键）"),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    "/m/api/v1/session-approve",
+                    Some("mam_device=mm"),
+                    Some(&format!(
+                        r#"{{"sessionId":"sess_app_ap","optionId":"{oid}"}}"#
+                    )),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 409, "{tag}");
+            let body = body_string(r).await;
+            assert!(
+                body.contains("\"error\":\"app_form_pending\""),
+                "{tag}: {body}"
+            );
+            assert!(body.contains("请在 APP 内操作"), "{tag}: {body}");
+        }
+        assert_eq!(
+            probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "门先于屏读（dialog 探针零调用——APP 无屏可读，读屏还要先 attach 控制台）"
+        );
+        assert!(
+            fake.recorded().is_empty()
+                && fake.recorded_keys().is_empty()
+                && fake.recorded_key_specs().is_empty(),
+            "零投递（键序不进 APP 的错误通道；草稿注入/批量退格两条默认方法不在本桩的记录面，见 FakeInjector 盲区申报）"
+        );
+    }
+
     /// CLI 形态直通（「CLI 版固化」）：三入口对 form=Cli 的 codex 会话**零变化**——
     /// 不出现 `app_form_pending`，走既有 CLI 面。固化件的完整行为由既有用例钉死，
     /// 此处只断言「门不在 CLI 形态上」（不钉注入数——零投递闸移除后 CLI 直通面
@@ -15590,7 +15670,7 @@ mod tests {
         });
         persist_named_device(&state, "mm", "测试设备");
         let app = router(state);
-        // ① 切档：既有 CLI 面（无 app_form_pending 标记即可）
+        // ① 切档：既有 CLI 面（M2：status 200 + 无 app_form_pending 标记）
         let r = app
             .clone()
             .oneshot(req(
@@ -15601,11 +15681,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        let status = r.status();
+        assert_eq!(r.status(), 200, "CLI 直通（切档）：既有 CLI 面照常服务");
         let body = body_string(r).await;
         assert!(
             !body.contains("app_form_pending"),
-            "CLI 直通（切档）：{status} {body}"
+            "CLI 直通（切档）：{body}"
         );
         // ② 菜单 open：非 409 门（既有失败面）
         let r = app
@@ -15618,11 +15698,15 @@ mod tests {
             ))
             .await
             .unwrap();
-        let status = r.status();
+        assert_eq!(
+            r.status(),
+            200,
+            "CLI 直通（菜单 open）：既有 CLI 面照常服务"
+        );
         let body = body_string(r).await;
         assert!(
             !body.contains("app_form_pending"),
-            "CLI 直通（菜单 open）：{status} {body}"
+            "CLI 直通（菜单 open）：{body}"
         );
         // ③ 问答 select：既有 CLI 面（无 app_form_pending 标记即可）
         let r = app
@@ -15635,15 +15719,62 @@ mod tests {
             ))
             .await
             .unwrap();
-        let status = r.status();
+        assert_eq!(r.status(), 200, "CLI 直通（问答）：既有 CLI 面照常服务");
         let body = body_string(r).await;
         assert!(
             !body.contains("app_form_pending"),
-            "CLI 直通（问答）：{status} {body}"
+            "CLI 直通（问答）：{body}"
+        );
+        // M2（复评补正）：**正向断言**——「响应里没有 app_form_pending」**不等于**
+        // 「路还通」（别的校验码把 CLI 也一并拦下时，上面三条照样绿：负向断言只证
+        // 「不是这道门」，不证「门后还有路」）。此处钉「FakeInjector 真被投递过至少
+        // 一次」＝门外的投递路径确实通着（三入口各自的完整行为仍由各自用例管辖）。
+        assert!(
+            !fake.recorded_keys().is_empty() || !fake.recorded().is_empty(),
+            "CLI 形态真投递（键序/文本至少一条落到注入器）：keys={:?} text={:?}",
+            fake.recorded_keys(),
+            fake.recorded()
         );
     }
 
-    /// 审计如实：三入口的 409 各落一行审计——action 沿用既有词（mode/mode/answer）、
+    /// 兄弟路径（session-approve）的 CLI 形态直通：codex CLI 会话**零变化**——
+    /// 200 key_sent + 映射键位照发（approve→"y"，`DEFAULT_MAPPINGS_JSON` 0.154.0
+    /// 实机取证档；不是 409 也不是零投递）。I2 的负向用例
+    /// `approve_rejects_codex_app_form_with_409` 与本节各钉一侧（门只拦 APP）。
+    #[tokio::test]
+    async fn approve_cli_codex_passes_through_unchanged() {
+        let fake = FakeInjector::ok();
+        let state = codex_form_state(
+            fake.clone(),
+            crate::session::ProcessForm::Cli,
+            &[("sess_cli_ap", 74)],
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let r = router(state)
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-approve",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_cli_ap","optionId":"approve"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "CLI 直通（审批）：既有 CLI 面照常服务");
+        let body = body_string(r).await;
+        assert!(
+            !body.contains("app_form_pending"),
+            "CLI 直通（审批）：{body}"
+        );
+        assert!(body.contains("\"status\":\"key_sent\""), "{body}");
+        assert!(
+            fake.recorded_keys().iter().any(|(_, k)| k == "y"),
+            "codex 审批映射照发（approve→y）：{:?}",
+            fake.recorded_keys()
+        );
+    }
+
+    /// 审计如实：**四个写入口**（三写入口 + I2 并入的 `/session-approve`）的 409 各落
+    /// 一行审计——action 沿用既有词（mode/mode/answer/approve）、
     /// result=`refused:app_form_pending`、行携带 session_id（「开发中」状态对账本可查）。
     #[tokio::test]
     async fn codex_app_rejections_are_audited() {
@@ -15654,6 +15785,7 @@ mod tests {
                 ("sess_aud_sw", 81),
                 ("sess_aud_mn", 82),
                 ("sess_aud_qa", 83),
+                ("sess_aud_ap", 84),
             ],
         );
         state.store.with(|conn| {
@@ -15681,6 +15813,12 @@ mod tests {
                 "/m/api/v1/session-question/answer",
                 r#"{"sessionId":"sess_aud_qa","action":"select","index":0}"#,
             ),
+            // I2：审批写路径（同根因兄弟入口）——action 走与成功臂同一个纯函数
+            // approve_audit_action：approve → "approve"
+            (
+                "/m/api/v1/session-approve",
+                r#"{"sessionId":"sess_aud_ap","optionId":"approve"}"#,
+            ),
         ];
         for (uri, payload) in posts {
             let r = app
@@ -15693,18 +15831,33 @@ mod tests {
         let audits = state
             .store
             .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
-        assert_eq!(audits.len(), 3, "三入口各落一行审计");
-        // recent_conn 最新在前：投递序 sw(mode)→mn(mode)→qa(answer)
-        assert_eq!(audits[2].action, "mode", "切档审计 action 沿用既有词");
-        assert_eq!(audits[1].action, "mode", "菜单审计 action 沿用既有词");
-        assert_eq!(audits[0].action, "answer", "问答审计 action 沿用既有词");
+        assert_eq!(audits.len(), 4, "四个写入口各落一行审计");
+        // recent_conn 最新在前：投递序 sw(mode)→mn(mode)→qa(answer)→ap(approve)
+        assert_eq!(audits[3].action, "mode", "切档审计 action 沿用既有词");
+        assert_eq!(audits[2].action, "mode", "菜单审计 action 沿用既有词");
+        assert_eq!(audits[1].action, "answer", "问答审计 action 沿用既有词");
+        assert_eq!(audits[0].action, "approve", "审批审计 action 沿用既有词");
         for a in &audits {
             assert_eq!(a.result, "refused:app_form_pending", "result 标拒绝码");
             assert_eq!(a.agent_type, "codex");
         }
-        assert_eq!(audits[2].session_id, "sess_aud_sw", "行携带 session_id");
-        assert_eq!(audits[1].session_id, "sess_aud_mn", "行携带 session_id");
-        assert_eq!(audits[0].session_id, "sess_aud_qa", "行携带 session_id");
+        assert_eq!(audits[3].session_id, "sess_aud_sw", "行携带 session_id");
+        assert_eq!(audits[2].session_id, "sess_aud_mn", "行携带 session_id");
+        assert_eq!(audits[1].session_id, "sess_aud_qa", "行携带 session_id");
+        assert_eq!(audits[0].session_id, "sess_aud_ap", "行携带 session_id");
+        // 内容列与成功臂同形：审批臂 content = optionId（拒绝行也记原始协议标识，
+        // 落库进 summary 列——与既有成功行的写法一致）
+        assert!(
+            audits[0].summary.contains("approve"),
+            "审批拒绝行 content=optionId：{}",
+            audits[0].summary
+        );
+        // M4：模式拒绝行的摘要走与成功行**同一个** mode_audit_content——组词「模式」
+        // + 档屏显标签「计划」（账本逐字对账口径；两臂各写一份格式化即在此红）
+        assert_eq!(
+            audits[3].summary, "切换模式至 计划",
+            "拒绝行摘要与成功行同一格式化"
+        );
     }
 
     /// GET 类端点不受门（「读侧不动」）：APP 会话的 GET /session-mode（结构+当前档）
