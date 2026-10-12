@@ -34,13 +34,16 @@ fn open_url_windows(url: &str) -> Result<(), String> {
     }
     // 兜底：保留旧 cmd /C start 链路（无 Shell32 异常环境）。走统一出口（I3）：与
     // `open_file_in_system` 完全同形（GUI 进程继承句柄不可用 → 真机 os error 6）；
-    // 不等回执 → needs_console=false 顺带防闪窗。机制与定案状态见
+    // 不等回执 → Detached 臂顺带防闪窗。机制与定案状态见
     // [`crate::window::detached`] 模块文档
     let mut cmd = std::process::Command::new("cmd");
     cmd.args(["/C", "start", "", url]);
-    crate::window::detached::spawn_detached(&mut cmd, false)
-        .map(|_| ())
-        .map_err(|e| format!("start url failed: {}", e))
+    crate::window::detached::spawn_detached(
+        &mut cmd,
+        crate::window::detached::ConsoleMode::Detached,
+    )
+    .map(|_| ())
+    .map_err(|e| format!("start url failed: {}", e))
 }
 
 /// ShellExecuteW("open", url)：成功返回实例句柄（>32）；错误码（≤32）转 Err

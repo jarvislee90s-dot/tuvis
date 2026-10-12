@@ -722,6 +722,7 @@ pub fn focus_hwnd(hwnd_val: isize) -> Result<(), String> {
 /// I3：走统一出口 [`crate::window::detached::spawn_detached`]（此前就地裸 spawn 且
 /// **漏了 stdin**——同形缺口；统一后三个句柄一致置空，防 release 版 os error 6）。
 fn spawn_marker_helper(args: &[&str]) -> bool {
+    use crate::window::detached::{spawn_detached, ConsoleMode};
     let helper = dirs::home_dir()
         .unwrap_or_default()
         .join(".tuvis")
@@ -732,7 +733,8 @@ fn spawn_marker_helper(args: &[&str]) -> bool {
     }
     let mut cmd = std::process::Command::new(&helper);
     cmd.args(args);
-    crate::window::detached::spawn_detached(&mut cmd, false).is_ok()
+    // 辅助 exe 不需要控制台：Detached 臂（NUL stdio + 防闪窗）
+    spawn_detached(&mut cmd, ConsoleMode::Detached).is_ok()
 }
 
 /// 跳转前按需注入（spec 2026-09-12 §3.2）：spawn helper 附加目标会话控制台贴

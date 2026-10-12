@@ -802,16 +802,19 @@ pub fn spawn_terminal(spec: &SpawnSpec) -> Result<(), String> {
                 // CREATE_NEW_CONSOLE：为 conhost 回退开全新控制台窗
                 cmd.creation_flags(0x0000_0010);
             }
-            // 统一出口（I3）：置 null stdio 不再触碰 GUI 宿主继承的 std 句柄——真机在
-            // 同形的 explorer 派发点上复现过 os error 6，本处修改前同为「三路全继承 +
-            // spawn()」。**根因定案状态**：本处是否真会失败未在 Windows 真机验证
-            //（属同形加固，不是已验证的第二处缺陷），机制与定案实验见
-            // [`crate::window::detached`] 模块文档。
-            // needs_console=true：本条就是要开一个终端窗（wt / conhost 回退），不得补
-            // CREATE_NO_WINDOW（会把窗口压掉）
-            crate::window::detached::spawn_detached(&mut cmd, true)
-                .map(|_| ())
-                .map_err(|e| format!("终端启动失败（{program}）：{e}"))
+            // 统一出口（I3）：本条要的是「新控制台自己的标准句柄」，走
+            // [`crate::window::detached::ConsoleMode::OwnConsole`]——**不碰 stdio、也不碰
+            // creation_flags**（J2 复评：此前一律置 NUL，会让窗内 cmd /k 的 stdin 指向
+            // NUL 设备而可能开出死窗；上面 CREATE_NEW_CONSOLE 的起窗语义亦必须原样保留）。
+            // 真机在 explorer 派发点上复现过 os error 6，本处改动前同为「三路全继承 +
+            // spawn()」；本处是否真会失败**未在 Windows 真机验证**（属同形加固，不是
+            // 已验证的第二处缺陷），机制与定案实验见该模块文档
+            crate::window::detached::spawn_detached(
+                &mut cmd,
+                crate::window::detached::ConsoleMode::OwnConsole,
+            )
+            .map(|_| ())
+            .map_err(|e| format!("终端启动失败（{program}）：{e}"))
         }
         #[cfg(not(windows))]
         SpawnSpec::Windows { program, .. } => Err(format!("当前平台不支持终端 spawn（{program}）")),

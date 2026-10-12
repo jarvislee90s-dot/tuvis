@@ -884,14 +884,15 @@ fn resolve_tool_resource_path(
 fn open_dir_in_system(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        use crate::window::detached::{spawn_detached, ConsoleMode};
         // release 版是 windows_subsystem="windows" GUI 进程（无控制台），继承来的 std
         // 句柄不可用（真机症状：os error 6）。走统一出口
-        // [`crate::window::detached::spawn_detached`]（显式置 null stdio，不再触碰继承
-        // 句柄；根因机制与定案状态见该模块文档）；explorer 是 GUI 程序，NO_WINDOW 位
-        // 对它无效，取 false 只为与同族派发点同款
+        // [`crate::window::detached::spawn_detached`]（Detached 臂显式置 null stdio，
+        // 不再触碰继承句柄；根因机制与定案状态见该模块文档）；explorer 是 GUI 程序，
+        // NO_WINDOW 位对它无效，取 Detached 只为与同族派发点同款
         let mut cmd = std::process::Command::new("explorer");
         cmd.arg(path);
-        crate::window::detached::spawn_detached(&mut cmd, false)
+        spawn_detached(&mut cmd, ConsoleMode::Detached)
             .map_err(|e| format!("打开目录失败: {}", e))?;
     }
     #[cfg(target_os = "macos")]
@@ -916,12 +917,13 @@ fn open_dir_in_system(path: &std::path::Path) -> Result<(), String> {
 fn open_file_in_system(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        use crate::window::detached::{spawn_detached, ConsoleMode};
         // start 的首个带引号参数会被当作窗口标题，须补空标题；stdio 置 null 的原因
         // 同 open_dir_in_system（GUI 进程继承句柄不可用），走统一出口
-        //（cmd 是控制台程序且不等回执 → needs_console=false 顺带防闪黑框）
+        //（cmd 是控制台程序且不等回执 → Detached 臂顺带防闪黑框）
         let mut cmd = std::process::Command::new("cmd");
         cmd.args(["/C", "start", "", &path.to_string_lossy()]);
-        crate::window::detached::spawn_detached(&mut cmd, false)
+        spawn_detached(&mut cmd, ConsoleMode::Detached)
             .map_err(|e| format!("打开文件失败: {}", e))?;
     }
     #[cfg(target_os = "macos")]
