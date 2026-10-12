@@ -772,3 +772,4 @@ git commit -m "docs(spec): APP 写通道全覆盖批验收回填 + M18-M28 结�
 - **双审轨迹**：每任务 spec 审 + 质量审双关（Task 4b/5/6a/6b/7/8/10 含收口 delta 复核），全部 ✅ 后合入；新增审出项已按裁决登记后续批次（Task 8 质量审 I-1 同源教训、6b 吞帧竞窗 M22 观察项、toggle 取消方向 Task 8 契约、queue 消费翻转信号本批-5、en 徽章溢出已修）。
 - **真机验收（Step 2）**：M18–M28 表移交用户执行；新增真机项——资源管理页改版（sheet 化/两列选择/来源徽章）、关于页改版（自动检测/更新主按钮/Star 横幅）、目录跳转打包版复验（`af07c548`）、dsh request_permission 展示与 M25 余额充值后行为级复验。
 - **git 状态**：全部 commit 在本地 `feat/h1-h12-headless`，未 push（推送须用户指令）。
+- **M25 前置解除（2026-10-12 深夜）**：用户提供 ollama.com 服务商后，三项余额阻断项已补验——① update 成功流 + `stopReason=end_turn` ✅、② 在飞 cancel → `stopReason=cancelled` ✅、③ request_permission 未触发（模型相关，维持 M25 真机项）。配置接缝定案：acp profile 覆写点 = 同 id `acp` 的 config（provider/model），传输 = `llm-pi-ai` `providers.ollama`（key 走 env）；`~/.dsh/profiles/acp/cordis.patch.yml` 已写入（原文件备份），生产 `assemble_client` 继承 ollama 路由——**M25 不再依赖充值**。证据 = 探测报告附录 B（本地）。
