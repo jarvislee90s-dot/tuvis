@@ -12,7 +12,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ResourceByKindView } from "@/components/resources/ResourceByKindView";
-import type { SsotResource } from "@/types/extension";
+import { RESOURCES, TOOLS } from "./fixtures/resourceView";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
@@ -23,40 +23,6 @@ import i18n from "@/i18n";
 beforeAll(async () => {
   await i18n.changeLanguage("zh");
 });
-
-const res = (o: Partial<SsotResource>): SsotResource => ({
-  name: "x",
-  kind: "skill",
-  enabledTools: [],
-  ...o,
-});
-
-/** alpha 全启用（claude+codex）/ beta 未启用：搜 alpha 或 beta 各命中 1 行 → 计数 1 */
-const RESOURCES = {
-  skills: [
-    res({ name: "alpha", enabledTools: ["claude", "codex"] }),
-    res({ name: "beta", enabledTools: [] }),
-  ],
-  mcp: [res({ name: "mcp-x", kind: "mcp", enabledTools: ["claude"] })],
-  plugins: [res({ name: "plug-x", kind: "plugin", enabledTools: ["codex"] })],
-};
-
-const TOOLS = [
-  {
-    id: "claude",
-    label: "Claude Code",
-    skillToggleSupported: true,
-    mcpSupported: true,
-    pluginSupported: true,
-  },
-  {
-    id: "codex",
-    label: "Codex CLI",
-    skillToggleSupported: true,
-    mcpSupported: true,
-    pluginSupported: true,
-  },
-];
 
 const SEARCH_PLACEHOLDER = "搜索 skill...";
 
