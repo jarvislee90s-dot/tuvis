@@ -28,7 +28,7 @@ vi.mock("@tauri-apps/api/app", () => ({ getVersion: getVersionMock }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: openUrlMock }));
 // toast 断言走 mock（真 sonner 无 Toaster 挂载时无法断言）；Toaster 本体替换为空
 vi.mock("sonner", () => ({
-  toast: { error: vi.fn(), info: vi.fn(), success: vi.fn() },
+  toast: { error: vi.fn(), info: vi.fn(), success: vi.fn(), warning: vi.fn() },
   Toaster: () => null,
 }));
 // WindowFrame / About 页直接牵连 webviewWindow API（jsdom 无 __TAURI_INTERNALS__）→ stub 窗口面
@@ -112,6 +112,12 @@ beforeEach(() => {
 const checkCalls = () =>
   vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "check_for_github_update").length;
 
+/** 契约：up-to-date 只给行内提示——四个 toast 通道都不许响 */
+const expectNoToast = () =>
+  [toast.error, toast.info, toast.success, toast.warning].forEach((fn) =>
+    expect(fn).not.toHaveBeenCalled()
+  );
+
 describe("关于页改版（自动检测 + 醒目更新入口 + 快捷行 + Star 横幅）", () => {
   it("T1 on mount 自动检查一次：有新版本 → 主色按钮 + 状态行；次按钮退场；弹窗不自动开", async () => {
     render(<AboutPage />);
@@ -184,9 +190,11 @@ describe("关于页改版（自动检测 + 醒目更新入口 + 快捷行 + Star
     mode.upToDate = true;
     render(<AboutPage />);
 
-    // mount 自动检查（静默）落地即点亮行内提示；此时尚未点过任何按钮
+    // mount 自动检查（静默）落地即点亮行内提示；此时尚未点过任何按钮（check 恰好 1 次，
+    // 后面的 === 2 才自洽）
     expect(await screen.findByText("您正在使用最新版本！")).toBeInTheDocument();
-    expect(toast.error).not.toHaveBeenCalled();
+    expect(checkCalls()).toBe(1);
+    expectNoToast();
     const btn = screen.getByRole("button", { name: "检查更新" });
     expect(btn).not.toBeDisabled();
 
@@ -194,7 +202,7 @@ describe("关于页改版（自动检测 + 醒目更新入口 + 快捷行 + Star
     fireEvent.click(btn);
     await waitFor(() => expect(checkCalls()).toBe(2));
     expect(await screen.findByText("您正在使用最新版本！")).toBeInTheDocument();
-    expect(toast.error).not.toHaveBeenCalled();
+    expectNoToast();
   });
 
   it("T3 Star 横幅：默认可见；去点 Star openUrl 仓库；X 关闭写版本化 localStorage 且重挂载不再现", async () => {

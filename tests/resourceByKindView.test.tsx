@@ -4,6 +4,8 @@
 //    都是过滤后结果（不是只测 ResourceKindDialog 的合成 Host——那绕过了 ResourceByKindView
 //    的提升状态与 props 接线，是本轮补的短板）
 // ② 弹窗内改词 → 清空 → 关闭 → 重开：关键词不丢、过滤结果一致、不复活旧词
+// ③ 弹窗内改词后不清空直接关窗 → 重开：关键词仍是该词（关闭 ≠ 清空，M3「关闭即清空」
+//    式回归会红）
 // mock 面（弹窗挂载即查）：资源 list_ssot_resources / 工具 list_enabled_tools /
 // 专属绑定 list_resource_bindings / 常驻锁 list_tool_residents
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -146,5 +148,30 @@ describe("ResourceByKindView 真视图（F3 搜索闭环：卡片 ↔ 弹窗同�
     expect(within(dialogRoot()).getByText("alpha")).toBeInTheDocument();
     expect(within(dialogRoot()).getByText("beta")).toBeInTheDocument();
     expect(within(dialogRoot()).getByRole("button", { name: "Skill (2)" })).toBeInTheDocument();
+  });
+
+  it("③ 弹窗内输入后直接关窗：关键词不丢（关闭 ≠ 清空），重开仍是 beta、alpha 被过滤", async () => {
+    await renderView();
+
+    // 卡片无词 → 全量开弹窗
+    fireEvent.click(screen.getByRole("button", { name: "Skill (2)" }));
+    await screen.findByRole("dialog");
+
+    // 弹窗内输入 beta，不清空直接点 X 关闭（关窗是关窗、不是清词）
+    fireEvent.change(dialogBox(), { target: { value: "beta" } });
+    expect(within(dialogRoot()).getByText("beta")).toBeInTheDocument();
+    fireEvent.click(within(dialogRoot()).getByRole("button", { name: "Close" }));
+
+    // 等弹窗消失：卡片框保留 beta（提升状态没被关闭动作重置）
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(cardBox()).toHaveValue("beta");
+
+    // 重开：弹窗框仍为 beta，alpha 依然被过滤、tab 计数 Skill (1)
+    fireEvent.click(screen.getByRole("button", { name: "Skill (1)" }));
+    await screen.findByRole("dialog");
+    expect(dialogBox()).toHaveValue("beta");
+    expect(within(dialogRoot()).getByText("beta")).toBeInTheDocument();
+    expect(within(dialogRoot()).queryByText("alpha")).not.toBeInTheDocument();
+    expect(within(dialogRoot()).getByRole("button", { name: "Skill (1)" })).toBeInTheDocument();
   });
 });
