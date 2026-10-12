@@ -6,9 +6,13 @@
 //! `POST <endpoint>/api/v1/acp/connect`（**免鉴权**）→ `{connectionId, sessionToken}` →
 //! 逐请求 `POST <endpoint>/api/v1/acp`（头 `acp-connection-id` / `acp-session-token` /
 //! `Accept: application/json, text/event-stream`——**Accept 缺一即 `-32000 Not Acceptable`**，
-//! 见探测定案逐字）→ `initialize`（能力协商）→ **目标语义二分**（活跃 = `session/load` +
-//! `session/prompt`；新建 = `session/new` + `session/prompt`）→ SSE 事件归一（`agentPhase` /
-//! `session_update`）→ 回执。
+//! 见探测定案逐字）→ `initialize`（能力协商）→ **投递臂按端点发现形态分派**（Task 4b /
+//! 设计 §5.2：心跳〔macOS/旧版〕= `session/load` + `session/prompt` 双臂；端口指纹
+//! 〔Windows〕= `session/new` + `session/prompt` **单臂**——`session/load` 在 Windows 恒
+//! `writer_occupied` 结构性不可用，`session/new` 绑定 APP 当前活跃会话〔无视 cwd〕）→
+//! SSE 事件归一（`agentPhase` / `session_update`）→ 回执（Windows 臂：**成功回执**恒带
+//! 靶向标注、不一致明示在成功/已推进未确认/需复活三态可达，[`delivered_session_note`]
+//! ——**没有 sessionId 的成功回执不允许出现**）。
 //!
 //! # 诚实边界（**落码于此，勿在别处另说一套**）
 //! - **已结束会话静默挂**（探测定案风险 15）：`session/prompt` 只对**新建/活跃**会话生效；
@@ -17,6 +21,14 @@
 //!   （[`PromptVerdict::RevivalNeeded`]）——**绝不静默挂、绝不冒充成功**。注意：`session/load`
 //!   回放里出现 `session_end(end_turn)` **不是**「该会话不可投递」的判据（任何跑完过一回合的
 //!   会话回放都有它），它只作**诊断证据**写进复活回执的原因里（见 [`LoadOutcome`]）。
+//! - **投递靶向（Windows new 臂，Task 4b / 设计 §5.2）**：Windows 的 `session/new` 绑定的是
+//!   **WB APP 当前打开的会话**，不是 MAM 卡面所选会话（探测定案 §3.3；WB-PROBE-OK 误投用户
+//!   会话的先例转强制项）⇒ 回执 session 字段 = **实际投递会话号**；**成功回执**的 reason
+//!   恒带「已投递至 WorkBuddy 当前会话（sessionId=…）」，不一致明示语在成功 / 已推进未
+//!   确认 / 需复活三态都可达（Failed 态由 session 字段承载投递会话号，
+//!   [`delivered_session_note`]）；
+//!   审计 result 词双记投递会话（[`audit_word_with_targeting`]，调用点在 api.rs
+//!   `run_wb_turn`）。**红线：没有 sessionId 的成功回执不允许出现。**
 //! - **端点发现平台差异**：macOS/旧版 = 心跳 `~/.workbuddy/sessions/<pid>.json` 的 `endpoint`
 //!   字段（每会话异端口、**按需轮询**——心跳按需生成，查空 ≠ 形态不存在）；Windows 5.7.3 =
 //!   无交互心跳且无 per-session serve ⇒ **心跳缺席时直接如实拒绝**（[`ENDPOINT_UNAVAILABLE_REASON`]，
@@ -717,22 +729,25 @@ pub struct LoadOutcome {
     pub truncated: bool,
 }
 
-/// 目标语义二分（**协议核**）
+/// 目标语义（**协议核**；生产侧臂选择 = 端点发现形态分派，见 [`SessionSel::New`]）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionSel<'a> {
     /// 活跃会话：`session/load` + `session/prompt`
     Active { session_id: &'a str, cwd: &'a str },
-    /// 新建：`session/new` + `session/prompt`（**本批无生产调用者**——见模块文档；
-    /// 端点的 WB「新建会话」入口不在本批范围）
+    /// 新建：`session/new` + `session/prompt`——**Windows 单臂形态的生产臂**（Task 4b）：
+    /// 端口指纹发现的端点恒走此臂（`session/load` 在 Windows 恒 `writer_occupied`）。注意
+    /// Windows 的 `session/new` **不新建会话而是绑定 APP 当前活跃会话**（无视 cwd，探测定案
+    /// §3.3）⇒ 投递目标可能 ≠ 卡面所选，靶向标注必带（见 [`delivered_session_note`]）
     New { cwd: &'a str },
 }
 
 /// 目标定位产物
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
-    /// 实际投递的 ACP 会话号（`New` 时 = `session/new` 新建的 id）
+    /// 实际投递的 ACP 会话号（`New` 时 = `session/new` 返回的 id——Windows 形态下它
+    /// **绑定 APP 当前会话而非新建**，可能与卡面所选会话不同 ⇒ 靶向标注必带）
     pub session_id: String,
-    /// 是否新建
+    /// 是否经 `session/new` 臂（**只表示「走了 new 臂」**，不保证「新建」语义——见上）
     pub created: bool,
     /// `session/load` 回放证据（`New` 时 None）
     pub load: Option<LoadOutcome>,
@@ -939,7 +954,7 @@ impl AcpClient {
         })
     }
 
-    /// 目标定位（initialize + 二分：`session/load` 或 `session/new`）
+    /// 目标定位（initialize + `session/load` 或 `session/new`——臂由调用方按端点发现形态选定）
     pub fn open_target(&self, sess: &AcpSession, sel: &SessionSel<'_>) -> Result<Target, String> {
         let caps = self.initialize(sess)?;
         match sel {
@@ -1001,7 +1016,10 @@ impl AcpClient {
                 let new_sid = result
                     .get("sessionId")
                     .and_then(|x| x.as_str())
-                    .ok_or_else(|| "session/new 响应缺 sessionId".to_string())?;
+                    // 空串与缺席同拒（与 [`connect_ok`] 的非空纪律同构）——空号放行 =
+                    // 成功回执带不上投递会话（红线）
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "session/new 响应缺非空 sessionId".to_string())?;
                 Ok(Target {
                     session_id: new_sid.to_string(),
                     created: true,
@@ -1051,7 +1069,7 @@ impl AcpClient {
         })
     }
 
-    /// 一次性便捷口（plan Step 1 原例形状）：initialize + 二分 + prompt
+    /// 一次性便捷口（plan Step 1 原例形状）：initialize + 目标定位 + prompt
     pub fn prompt(
         &self,
         sess: &AcpSession,
@@ -1084,6 +1102,44 @@ pub enum PromptVerdict {
 /// 「已结束」是**从静默推断**（见 [`judge_prompt`]）——文案以「需复活语义」表达，不声称
 /// 服务端报告了会话终态。
 pub const REVIVAL_REASON: &str = "会话已结束（end_turn），需复活语义——ACP `session/prompt` 对已结束会话只接收不执行（接口语义，非鉴权）：请在 WorkBuddy 应用内重开该会话后再发，或走新建会话";
+
+/// 靶向词表共享片段（回执标注与审计双记同词表——两处格式串抽公共常量，防漂移）
+pub const TARGETING_PREFIX: &str = "已投递至 WorkBuddy 当前会话";
+/// 不一致明示语（M27/M28「不一致明示」判据的钉死文案——成功 / 已推进未确认 / 需复活
+/// 三态都必须可达，见 [`TargetingNote::mismatch`]）
+pub const MISMATCH_CLAUSE: &str = "消息已进入 APP 当前会话，与所选会话不同";
+
+/// new 臂靶向标注产物（Task 4b / M27·M28；设计 §5.2）。Windows 的 `session/new` 绑定
+/// **APP 当前活跃会话**（无视 cwd，探测定案 §3.3）——投递目标 ≠「卡面所选会话」是结构性
+/// 风险（WB-PROBE-OK 误投用户会话的先例转强制项），标注必须如实透出：
+/// - `full`（**成功回执专用**）：恒带「已投递至 WorkBuddy 当前会话（sessionId=…）」——
+///   **红线：没有 sessionId 的成功回执不允许出现**（session 字段与文案同源，双保险）；
+/// - `mismatch`（投递会话 ≠ 卡面会话时在场）：成功回执拼进 `full`；**已推进未确认
+///   （Advanced）/ 需复活（RevivalNeeded）两态同样必须带**（失败成因为主、明示语在后
+///   ——M28「不一致明示」三态可达，spec 审 Major 1）；Failed 态（RPC/传输失败，正文未必
+///   送达）不带明示语，投递会话号由回执 `session_id` 字段承载（`receipt_for` 的
+///   `with_session` 既有口径）。
+/// - **佐证措辞边界（spec 审 Minor 2）**：mismatch 在场时成功回执的「转写佐证未命中」
+///   注记换措辞——按（卡面 cwd, 投递会话号）查不到转写是**结构性的**（他会话的转写落在
+///   它自己的项目目录），不是「落盘滞后」（`receipt_for` 的 Completed 臂按此分叉）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetingNote {
+    /// 成功回执全文（恒带投递会话号；mismatch 时含「；注意：明示语」尾）
+    pub full: String,
+    /// 不一致明示语（投递会话 ≠ 卡面会话时在场）
+    pub mismatch: Option<&'static str>,
+}
+
+/// 组装 new 臂靶向标注（成功全文 + 不一致明示语；词表 = [`TARGETING_PREFIX`] /
+/// [`MISMATCH_CLAUSE`]，审计双记同词表）
+pub fn delivered_session_note(delivered_sid: &str, card_sid: &str) -> TargetingNote {
+    let mut full = format!("{TARGETING_PREFIX}（sessionId={delivered_sid}）");
+    let mismatch = (delivered_sid != card_sid).then_some(MISMATCH_CLAUSE);
+    if let Some(m) = mismatch {
+        full.push_str(&format!("；注意：{m}"));
+    }
+    TargetingNote { full, mismatch }
+}
 
 /// 未拿到终点的如实文案（**不冒充成功**）
 pub const UNCONFIRMED_REASON: &str =
@@ -1206,12 +1262,19 @@ pub fn corroborate(
 /// 回执归一（判定 + 转写佐证 → H6 回执）。**诚实铁律**：
 /// - 只有拿到回合终点（`stopReason`）才可能 `ok`——且转写佐证未命中时在 `reason` 里如实标注；
 /// - 未推进 → `failed(channel_error)` + [`REVIVAL_REASON`]（引导重开或新建）；
-/// - 推进但无终点 → watchdog 掐断记 `timeout`，流自己断了记 `channel_error`（都带未确认文案）。
+/// - 推进但无终点 → watchdog 掐断记 `timeout`，流自己断了记 `channel_error`（都带未确认文案）；
+/// - **靶向标注（Task 4b / M27·M28）**：`targeting` = new 臂（Windows 单臂）的投递
+///   会话标注（[`delivered_session_note`] 产物，load 臂传 `None`）——成功（拿到终点）时
+///   `full` 进 `reason` 且排在最前（最要紧的诚实面：投到了哪个会话）；`mismatch` 明示语
+///   在 Advanced / RevivalNeeded 两态追加在失败成因**之后**（M28「不一致明示」三态可达，
+///   不稀释失败文案）；session 字段恒为**实际投递会话号**（`used`），**红线：没有
+///   sessionId 的成功回执不允许出现**。
 pub fn receipt_for(
     sid: &str,
     verdict: &PromptVerdict,
     out: &PromptOutcome,
     load: Option<&LoadOutcome>,
+    targeting: Option<&TargetingNote>,
     corr: &Corroboration,
     duration_ms: u64,
 ) -> Receipt {
@@ -1227,11 +1290,26 @@ pub fn receipt_for(
                 .last_assistant
                 .as_deref()
                 .map(|t| normalize::summarize(t, super::receipt::LAST_ASSISTANT_CHARS));
+            // 成功回执的 reason 组装顺序：靶向标注在前（投到了哪个会话），佐证状态在后
+            let mut notes: Vec<String> = Vec::new();
+            if let Some(t) = targeting {
+                notes.push(t.full.clone());
+            }
             if !corr.confirmed() {
-                r.reason = Some(format!(
+                // mismatch 形态的措辞边界（TargetingNote doc）：按（卡面 cwd, 投递会话号）
+                // 查不到转写是结构性的（他会话的转写落在它自己的项目目录）——不是「落盘滞后」
+                let why = if targeting.and_then(|t| t.mismatch).is_some() {
+                    "投递至他会话，转写沿其项目目录另查"
+                } else {
+                    "转写落盘可能滞后"
+                };
+                notes.push(format!(
                     "ACP 回合已结束（stopReason={stop_reason}），但 projects/ 转写佐证未命中\
-                     （转写落盘可能滞后）——请在 WorkBuddy 应用内确认结果"
+                     （{why}）——请在 WorkBuddy 应用内确认结果"
                 ));
+            }
+            if !notes.is_empty() {
+                r.reason = Some(notes.join("；"));
             }
             r
         }
@@ -1240,12 +1318,15 @@ pub fn receipt_for(
                 StreamStop::Watchdog => (Stage::Timeout, "watchdog 到点掐断"),
                 _ => (Stage::ChannelError, "流已结束"),
             };
-            Receipt::failed(
-                stage,
-                &format!("{UNCONFIRMED_REASON}（{how}；已见 agentPhase={phase}）"),
-            )
-            .with_session(used)
-            .with_duration_ms(duration_ms)
+            let mut reason = format!("{UNCONFIRMED_REASON}（{how}；已见 agentPhase={phase}）");
+            // M28 三态可达（spec 审 Major 1）：不一致明示语追加在失败成因之后（失败成因
+            // 为主，不稀释；不带成功全文标注）
+            if let Some(m) = targeting.and_then(|t| t.mismatch) {
+                reason.push_str(&format!("；注意：{m}"));
+            }
+            Receipt::failed(stage, &reason)
+                .with_session(used)
+                .with_duration_ms(duration_ms)
         }
         PromptVerdict::RevivalNeeded { truncated } => {
             let obs = if *truncated {
@@ -1257,12 +1338,14 @@ pub fn receipt_for(
                 .and_then(|l| l.last_stop_reason.as_deref())
                 .map(|s| format!("；load 回放显示末回合 stopReason={s}"))
                 .unwrap_or_default();
-            Receipt::failed(
-                Stage::ChannelError,
-                &format!("{obs}{prev}；{REVIVAL_REASON}"),
-            )
-            .with_session(used)
-            .with_duration_ms(duration_ms)
+            let mut reason = format!("{obs}{prev}；{REVIVAL_REASON}");
+            // M28 三态可达（spec 审 Major 1）：不一致明示语追加在失败成因之后（同上）
+            if let Some(m) = targeting.and_then(|t| t.mismatch) {
+                reason.push_str(&format!("；注意：{m}"));
+            }
+            Receipt::failed(Stage::ChannelError, &reason)
+                .with_session(used)
+                .with_duration_ms(duration_ms)
         }
         PromptVerdict::Failed { detail } => Receipt::failed(
             Stage::ChannelError,
@@ -1271,6 +1354,21 @@ pub fn receipt_for(
         .with_session(used)
         .with_duration_ms(duration_ms),
     }
+}
+
+/// 审计 result 词的靶向双记（Task 4b / M27·M28，设计 §5.2「审计标注」/ §10 风险 5）。
+///
+/// 审计行的 session 列 = **卡面会话**（设备检索入口语义：用户对哪张卡做了动作——由
+/// `HeadlessAuditCtx.session_id` 单点产生，不动）；Windows new 臂的实际投递会话可能 ≠ 卡面
+/// ⇒ **不一致时把投递 sessionId 双记进 result 词**（session 列保留卡面视角，result 词补
+/// 投递视角——两个会话都可追溯，不二选一）。一致 / 投递号缺席（排队、拒绝类回执）⇒ 原词
+/// 零变化（session 列已是投递会话或本就没有投递发生）。调用点 = api.rs `run_wb_turn` 的
+/// 回合终结审计（文案与回执标注 [`delivered_session_note`] 同词表）。
+pub fn audit_word_with_targeting(word: &str, card_sid: &str, delivered_sid: &str) -> String {
+    if delivered_sid.is_empty() || delivered_sid == card_sid {
+        return word.to_string();
+    }
+    format!("{word}（{TARGETING_PREFIX} sessionId={delivered_sid}，{MISMATCH_CLAUSE}）")
 }
 
 // ============================================================
@@ -1345,7 +1443,7 @@ fn failed_outcome(
 
 /// 单回合编排（**同步**：HTTP 缝是阻塞的，调用方必须放 `spawn_blocking`——绝不在
 /// async 运行时线程上阻塞）。顺序：并发名额 → 端点发现 → connect → initialize →
-/// 二分（load/new）→ prompt → 判定 → 转写佐证 → 回执。
+/// 形态分派（load/new）→ prompt → 判定 → 转写佐证 → 回执。
 ///
 /// **取消**：本通道不武装取消靶子（见模块文档）——槽位由[`super::turn::TurnRegistry`]
 /// 持有作会话串行锁，取消端点对 WB 回合如实报「未送达」。
@@ -1369,7 +1467,7 @@ pub fn run_turn(args: &WbTurnArgs, deps: &WbDeps) -> WbTurnOutcome {
             Receipt::failed(Stage::Refused, &reason).with_session(&args.sid),
         );
     };
-    // ③ ACP 全链（connect → initialize → 二分 → prompt）
+    // ③ ACP 全链（connect → initialize → 形态分派 → prompt）
     let client = AcpClient::new(&url, deps.http.clone()).watchdog_ms(deps.watchdog_ms);
     let sess = match client.handshake() {
         Ok(s) => s,
@@ -1382,9 +1480,24 @@ pub fn run_turn(args: &WbTurnArgs, deps: &WbDeps) -> WbTurnOutcome {
             )
         }
     };
-    let sel = SessionSel::Active {
-        session_id: &args.sid,
-        cwd: &args.project,
+    // 形态分派（Task 4b / M27·M28，设计 §5.2）：投递臂由**端点发现形态**决定——端口指纹
+    // （Windows 形态）⇒ new+prompt **单臂**（`session/load` 恒 writer_occupied 结构性不可用；
+    // `session/new` 绑定 APP 当前活跃会话〔无视 cwd〕，探测定案 §3.3）；心跳（Mac 形态）⇒
+    // 既有 load+prompt 双臂**不动**。不写 tool/version 判断——形态即分派依据。
+    let new_arm = matches!(
+        &discovery,
+        EndpointDiscovery::Found {
+            source: EndpointSource::PortFingerprint { .. },
+            ..
+        }
+    );
+    let sel = if new_arm {
+        SessionSel::New { cwd: &args.project }
+    } else {
+        SessionSel::Active {
+            session_id: &args.sid,
+            cwd: &args.project,
+        }
     };
     let target = match client.open_target(&sess, &sel) {
         Ok(t) => t,
@@ -1418,11 +1531,20 @@ pub fn run_turn(args: &WbTurnArgs, deps: &WbDeps) -> WbTurnOutcome {
         &args.payload,
         baseline,
     );
+    // 靶向标注（仅 new 臂）：实际投递 sessionId + 与卡面不一致明示（M27/M28 判据面——
+    // 成功全文 + 三态可达的明示语，见 [`TargetingNote`]）；load 臂无此面（投递目标本来就是
+    // 卡面所选会话）
+    let targeting = if new_arm {
+        Some(delivered_session_note(&target.session_id, &args.sid))
+    } else {
+        None
+    };
     let receipt = receipt_for(
         &args.sid,
         &verdict,
         &out,
         target.load.as_ref(),
+        targeting.as_ref(),
         &corr,
         elapsed(&started),
     );
@@ -2251,7 +2373,7 @@ mod tests {
     // ===== plan Step 1 原例（Task 11 的红灯测试） =====
 
     /// plan Step 1 原例①（wire 以 Mac 实测为准）：connect（免鉴权）→ initialize →
-    /// 二分（新建 = `session/new`）→ `session/prompt`；`sess.token == "t1"`、
+    /// 目标定位（新建 = `session/new`）→ `session/prompt`；`sess.token == "t1"`、
     /// `ev.first_phase == "model_requesting"`。
     /// **与 plan 草图的一处偏差（如实登记）**：草图把整条 ACP 链压成**一次** `POST
     /// /api/v1/acp`，而实测 wire 是**逐请求一次 POST**（initialize / session/new /
@@ -2678,13 +2800,14 @@ mod tests {
             .respond_json("<title>CodeBuddy Remote Control</title>");
         http.expect_post(CONNECT_PATH, None)
             .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
-        // 投递链：handshake 自开连接（c1/t1）→ initialize → load → prompt（头钉值）
+        // 投递链：handshake 自开连接（c1/t1）→ initialize → session/new（Task 4b：端口
+        // 指纹发现的端点 = Windows 单臂形态）→ prompt（头钉值）
         http.expect_post(CONNECT_PATH, None)
             .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
         http.expect_post(ACP_PATH, Some(PINNED_HDRS))
             .respond_sse(&init_sse(1));
         http.expect_post(ACP_PATH, Some(PINNED_HDRS))
-            .respond_sse(&load_sse(2, None, "fullAccess"));
+            .respond_sse(&new_sse(2, "app-current-1"));
         http.expect_post(ACP_PATH, Some(PINNED_HDRS))
             .respond_sse(&prompt_sse(
                 3,
@@ -2705,6 +2828,342 @@ mod tests {
                 }
             }),
             "Windows 主路（connect 活体）发现的端点照常进投递链"
+        );
+        http.assert_clean();
+    }
+
+    // ===== Task 4b：Windows new+prompt 单臂 + 投递靶向标注（M27/M28）=====
+
+    /// 形态分派（M27 主断言）：端口指纹（connect 活体）发现的端点 ⇒ 投递臂 =
+    /// `session/new` + `session/prompt` **单臂**——wire 序列**不得出现 `session/load`**
+    /// （Windows 恒 writer_occupied 结构性不可用，探测定案 §3.3）；`session/prompt` 的
+    /// sessionId = `session/new` 返回的会话号（绑定 APP 当前会话——无视 cwd）。
+    /// 心跳路（Mac load+prompt 双臂）不动——由 [`ended_session_prompt_reports_revival_needed`]
+    /// 与 [`writer_occupied_honest_receipt_kept`] 等既有用例看守。
+    #[test]
+    fn windows_arm_uses_new_prompt_single_arm() {
+        let mut http = MockHttp::new();
+        // 端点发现（Windows 形态）：`/` 标题指纹 + connect 活体（探测连接即弃）
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        // 投递链：handshake 自开连接 → initialize → session/new → session/prompt
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, "app-current-1"));
+        // prompt 帧内 sessionId 与解析无关（归一只认 agentPhase/chunk/stopReason）
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&prompt_sse(
+                3,
+                &["model_requesting"],
+                Some("end_turn"),
+                Some("好的"),
+            ));
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        let bodies: Vec<serde_json::Value> = http
+            .calls()
+            .iter()
+            .filter(|c| c.url.ends_with(ACP_PATH))
+            .map(|c| serde_json::from_str(c.body.as_deref().unwrap()).unwrap())
+            .collect();
+        let methods: Vec<&str> = bodies
+            .iter()
+            .map(|b| b["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            methods,
+            vec!["initialize", "session/new", "session/prompt"],
+            "Windows 单臂：session/load 不得出现（恒 writer_occupied，探测定案）"
+        );
+        assert_eq!(
+            bodies[2]["params"]["sessionId"], "app-current-1",
+            "prompt 打到 session/new 绑定的会话（APP 当前会话，非卡面会话）"
+        );
+        http.assert_clean();
+    }
+
+    /// 回执靶向标注（M27）：new 臂成功回执必须带**实际投递 sessionId**——session 字段 =
+    /// `session/new` 产物（**红线：没有 sessionId 的成功回执不允许出现**——WB-PROBE-OK
+    /// 误投用户会话的先例转强制项），reason 恒带「已投递至 WorkBuddy 当前会话
+    /// （sessionId=…）」。本用例取 APP 当前会话 == 卡面所选（探测 §3.1 的可投卡形态）
+    /// ⇒ **不**出现不一致警示。
+    #[test]
+    fn receipt_annotates_delivered_session_id() {
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        // APP 当前打开的正是卡面所选会话（session/new 返回同一会话号）
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, SID));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&prompt_sse(
+                3,
+                &["model_requesting"],
+                Some("end_turn"),
+                Some("收到"),
+            ));
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        assert!(
+            !out.receipt.session_id.is_empty(),
+            "红线：成功回执必须带 sessionId：{:?}",
+            out.receipt
+        );
+        assert_eq!(
+            out.receipt.session_id, SID,
+            "session 字段 = 实际投递会话号（session/new 产物）"
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("已投递至 WorkBuddy 当前会话"),
+            "恒带靶向标注：{reason}"
+        );
+        assert!(
+            reason.contains(&format!("sessionId={SID}")),
+            "标注必须带实际投递会话号：{reason}"
+        );
+        assert!(
+            !reason.contains("与所选会话不同"),
+            "一致时不得出现不一致警示：{reason}"
+        );
+        http.assert_clean();
+    }
+
+    /// 不一致明示（M27/M28 判据面）：`session/new` 绑定的 APP 当前会话 ≠ 卡面所选 ⇒
+    /// 回执 session 字段 = **投递会话**（不是卡面会话）+ reason 明示「消息已进入 APP
+    /// 当前会话，与所选会话不同」——绝不静默投错。
+    #[test]
+    fn mismatch_with_card_session_is_explicit() {
+        const APP_CURRENT: &str = "11111111-aaaa-4bbb-8ccc-dddddddddddd";
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, APP_CURRENT));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&prompt_sse(
+                3,
+                &["model_requesting"],
+                Some("end_turn"),
+                Some("好的"),
+            ));
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        assert_eq!(
+            out.receipt.session_id, APP_CURRENT,
+            "session 字段 = 实际投递会话号（非卡面 {SID}）"
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains(&format!("sessionId={APP_CURRENT}")),
+            "标注必须带投递会话号：{reason}"
+        );
+        assert!(
+            reason.contains("消息已进入 APP 当前会话，与所选会话不同"),
+            "不一致必须明示（M27 判据）：{reason}"
+        );
+        assert!(
+            reason.contains("投递至他会话，转写沿其项目目录另查"),
+            "mismatch 形态的佐证注记必须换措辞（结构性查不到，不是落盘滞后）：{reason}"
+        );
+        assert!(
+            !reason.contains("转写落盘可能滞后"),
+            "误导措辞不得出现在 mismatch 形态：{reason}"
+        );
+        http.assert_clean();
+    }
+
+    /// 非成功回执的不一致明示（M28 三态可达·spec 审 Major 1）：**已推进未确认
+    /// （Advanced）** 臂同样带不一致明示语——失败成因为主、明示语在后（不稀释），
+    /// 不带成功全文标注；投递会话号仍由 session 字段承载。
+    #[test]
+    fn advanced_receipt_keeps_mismatch_explicit() {
+        const APP_CURRENT: &str = "11111111-bbbb-4bbb-8ccc-ddddddddddddb";
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, APP_CURRENT));
+        // watchdog 掐断的推进中回合（已见 agentPhase、无终点）
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_watchdog_sse(&format!(
+                "data: {}\n\n",
+                phase_frame(APP_CURRENT, "model_requesting")
+            ));
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert_eq!(out.receipt.stage, Some(Stage::Timeout), "{:?}", out.receipt);
+        assert_eq!(
+            out.receipt.session_id, APP_CURRENT,
+            "失败回执的 session 字段仍 = 实际投递会话号"
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        let fail_at = reason
+            .find("未拿到终点")
+            .expect("失败成因为主（未确认文案在前）");
+        let mm_at = reason
+            .find("消息已进入 APP 当前会话，与所选会话不同")
+            .expect("不一致明示语必须在场（M28 三态可达）");
+        assert!(mm_at > fail_at, "明示语在后（避免稀释）：{reason}");
+        http.assert_clean();
+    }
+
+    /// 非成功回执的不一致明示（M28 三态可达·spec 审 Major 1）：**需复活
+    /// （RevivalNeeded）** 臂同样带不一致明示语（失败成因为主、明示语在后）。
+    #[test]
+    fn revival_receipt_keeps_mismatch_explicit() {
+        const APP_CURRENT: &str = "11111111-cccc-4bbb-8ccc-ddddddddddddc";
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, APP_CURRENT));
+        // 静默死线掐断（无 agentPhase——探测定案的静默挂形态）
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_stalled_sse(":ok\n\n: heartbeat\n");
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert_eq!(
+            out.receipt.stage,
+            Some(Stage::ChannelError),
+            "{:?}",
+            out.receipt
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        let fail_at = reason.find("需复活").expect("失败成因为主（复活引导在前）");
+        let mm_at = reason
+            .find("消息已进入 APP 当前会话，与所选会话不同")
+            .expect("不一致明示语必须在场（M28 三态可达）");
+        assert!(mm_at > fail_at, "明示语在后（避免稀释）：{reason}");
+        http.assert_clean();
+    }
+
+    /// New 臂 sessionId 空串拒收（质量审 Minor 1）：`session/new` 返回**空** sessionId ⇒
+    /// 如实 Err（与 [`connect_ok`] 非空纪律同构；红线：没有 sessionId 的成功路径不允许
+    /// 出现——空号放行 = 成功回执带不上投递会话）。
+    #[test]
+    fn new_arm_rejects_empty_session_id() {
+        let mut http = MockHttp::new();
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, ""));
+        let client = AcpClient::new(BASE, http.clone());
+        let sess = client.handshake().unwrap();
+        let err = client
+            .open_target(&sess, &SessionSel::New { cwd: CWD })
+            .expect_err("空 sessionId 必须拒收");
+        assert!(
+            err.contains("缺") && err.contains("sessionId"),
+            "报错形态与「缺 sessionId」家族对齐：{err}"
+        );
+        http.assert_clean();
+    }
+
+    /// 审计可追溯（设计 §5.2「审计标注」/ §10 风险 5）：投递会话 ≠ 卡面会话 ⇒ 审计
+    /// result 词**双记**实际投递 sessionId（session 列 = 卡面会话不动——设备检索入口
+    /// 语义，见 api.rs `run_wb_turn` 调用点注释）；一致 / 投递号缺席 ⇒ 原词零变化
+    /// （Mac 双臂、拒绝臂、排队臂的审计行不受影响）。
+    #[test]
+    fn audit_line_carries_delivered_session_id() {
+        // 一致（Mac 双臂 / new 臂恰逢 APP 当前 == 卡面）⇒ 原词
+        assert_eq!(
+            audit_word_with_targeting("ok", "s-card", "s-card"),
+            "ok",
+            "一致时 session 列已是投递会话：零冗余"
+        );
+        // 投递号缺席（排队/拒绝类回执没有投递号）⇒ 原词
+        assert_eq!(
+            audit_word_with_targeting("failed(refused)", "s-card", ""),
+            "failed(refused)"
+        );
+        // 不一致（Windows new 臂绑定 APP 当前会话）⇒ 双记投递会话号
+        let word = audit_word_with_targeting("ok", "s-card", "s-app-current");
+        assert!(
+            word.starts_with("ok"),
+            "终态词在前（耗时由 audit_result 追加在后）：{word}"
+        );
+        assert!(
+            word.contains("s-app-current"),
+            "审计行可追溯实际投递会话：{word}"
+        );
+        assert!(word.contains("与所选会话不同"), "{word}");
+        // 失败臂同样双记（消息可能已进入 APP 当前会话——照样可追溯）
+        let failed = audit_word_with_targeting("failed(channel_error)", "s-card", "s-app-current");
+        assert!(
+            failed.contains("s-app-current"),
+            "失败回执的投递会话同样入账：{failed}"
+        );
+    }
+
+    /// M28（既有行为钉死，不回归）：load 路被服务端拒——Windows 实测形态
+    /// `-32000 "Persistent Session already has an external writer"` ⇒ 回执
+    /// `failed(channel_error)` 带原始报文，**绝不谎报成功**（分派改造后 load 只剩**心跳
+    /// 发现路**会走到——夹具 deps 的 os 硬编码 windows，但心跳优先于心跳缺席判定，生产
+    /// 对应 macOS/旧版形态；Windows 端口指纹路已改走 new 臂不再撞这堵墙——但若形态判据
+    /// 回归，本用例保证拒还是如实的拒）。
+    #[test]
+    fn writer_occupied_honest_receipt_kept() {
+        let mut http = MockHttp::new();
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS)).respond_sse(&format!(
+            "data: {}\n\n",
+            serde_json::json!({"jsonrpc":"2.0","id":2,
+                "error":{"code":-32000,"message":"Persistent Session already has an external writer"}})
+        ));
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        assert_ne!(out.receipt.status, ReceiptStatus::Ok, "绝不谎报成功");
+        assert_eq!(
+            out.receipt.stage,
+            Some(Stage::ChannelError),
+            "{:?}",
+            out.receipt
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(reason.contains("session/load"), "点明拒在 load：{reason}");
+        assert!(
+            reason.contains("already has an external writer"),
+            "带服务端原始报文（writer_occupied 语义）：{reason}"
         );
         http.assert_clean();
     }
@@ -2816,6 +3275,7 @@ mod tests {
             &judge_prompt(&out),
             &out,
             None,
+            None,
             &Corroboration::default(),
             7,
         );
@@ -2829,6 +3289,7 @@ mod tests {
             SID,
             &judge_prompt(&out2),
             &out2,
+            None,
             None,
             &Corroboration::default(),
             7,

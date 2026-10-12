@@ -2342,10 +2342,20 @@ async fn run_wb_turn(
             };
         }
     };
+    // M27/M28 靶向可追溯（Task 4b，设计 §5.2「审计标注」）：Windows new 臂的 `session/new`
+    // 绑定 APP 当前会话 ⇒ 实际投递会话可能 ≠ 卡面会话。审计 session 列 = 卡面会话**不动**
+    // （设备检索入口语义：用户对哪张卡做了动作）；**不一致时**实际投递 sessionId 双记进
+    // result 词——两个会话都可追溯，不二选一。一致时 session 列已是投递会话，零冗余
+    // （Mac 双臂 / 排队 / 拒绝类回执不受影响）。文案单点 = wb_acp（与回执标注同词表）。
+    let result = crate::inject::headless::wb_acp::audit_word_with_targeting(
+        &crate::inject::headless::turn::receipt_result_word(&out.receipt),
+        &ctx.sid,
+        &out.receipt.session_id,
+    );
     ctx.audit(
         &st,
         crate::inject::headless::ACTION_HEADLESS,
-        &crate::inject::headless::turn::receipt_result_word(&out.receipt),
+        &result,
         out.receipt.duration_ms,
     );
     crate::inject::headless::turn::registry().end(&sid);

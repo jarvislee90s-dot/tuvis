@@ -9200,6 +9200,119 @@ mod tests {
         http.assert_clean();
     }
 
+    /// **Task 4b 端点级看守（M27/M28·spec 审 Minor 2）**：Windows 形态（无心跳 + WB 宿主
+    /// 监听端口 ⇒ 端口指纹 + connect 活体发现）⇒ new+prompt 单臂；`session/new` 绑定的
+    /// APP 当前会话 ≠ 卡面所选 ⇒ 回执 session 字段 = 投递会话 + 不一致明示 + 佐证注记换
+    /// 措辞；**审计行 session 列 = 卡面会话、result 词双记投递 sessionId**——本用例钉死
+    /// api.rs `run_wb_turn` 的靶向接线（接线被删 ⇒ result 断言先红）。`#[cfg(windows)]`：
+    /// 端口指纹路本身只在 Windows 走（`deps_for` 的 os 取真机 OS）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn wb_acp_send_windows_arm_mismatch_audits_delivered_session() {
+        use crate::inject::headless::wb_acp::{
+            test_hooks, MockHttp, ACCEPT_BOTH, ACP_PATH, CONNECT_PATH,
+        };
+        /// 本用例独占会话 id（守卫 id 立规②：裸 id 字符串不得跨用例共享）
+        const CARD: &str = "3f12ca20-eeee-4713-a7a4-adf64a44feee";
+        /// session/new 绑定的 APP 当前会话（≠ 卡面）
+        const DELIVERED: &str = "11111111-aaaa-4bbb-8ccc-dddddddddddd";
+        let _serial = test_hooks::LOCK.lock().await;
+        let _clear = WbHookClear;
+        let accept = format!("Accept: {ACCEPT_BOTH}");
+        let hdrs: Vec<&str> = vec!["acp-connection-id", "acp-session-token", &accept];
+        let update = |v: serde_json::Value| format!("event: message\ndata: {v}\n\n");
+        let mut http = MockHttp::new();
+        // 端点发现（Windows 形态）：`/` 标题指纹 + connect 活体（探测连接即弃）
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        // 投递链：handshake 自开连接 → initialize → session/new（绑定 ≠ 卡面）→ prompt
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(&hdrs))
+            .respond_sse(&update(serde_json::json!({"jsonrpc":"2.0","id":1,
+                "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}})));
+        http.expect_post(ACP_PATH, Some(&hdrs)).respond_sse(&update(
+            serde_json::json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":DELIVERED}}),
+        ));
+        http.expect_post(ACP_PATH, Some(&hdrs)).respond_sse(&format!(
+            "{}{}",
+            update(serde_json::json!({"jsonrpc":"2.0","method":"session/update",
+                "params":{"sessionId":DELIVERED,
+                          "update":{"sessionUpdate":"agent_phase","agentPhase":"model_requesting"}}})),
+            update(serde_json::json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}})),
+        ));
+        // 无心跳 + WB 宿主监听端口 ⇒ 端口指纹路（Windows 形态，connect 活体双确认）
+        test_hooks::set(None, vec![4242], vec![(4242, vec![63928])]);
+        test_hooks::set_http(http.clone().seam());
+        let fake = FakeInjector::ok();
+        let state = wb_dispatch_state(vec![wb_sess(CARD, 77769)]);
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{CARD}","text":"hi [mobile]"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["channel"], "headless_wb_acp");
+        assert_eq!(v["receipt"]["status"], "ok", "{v}");
+        assert_eq!(
+            v["receipt"]["sessionId"], DELIVERED,
+            "回执 session 字段 = 实际投递会话号（session/new 绑定产物）：{v}"
+        );
+        let reason = v["receipt"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("已投递至 WorkBuddy 当前会话"),
+            "成功回执恒带靶向标注：{v}"
+        );
+        assert!(
+            reason.contains("消息已进入 APP 当前会话，与所选会话不同"),
+            "不一致明示（M27 判据）：{v}"
+        );
+        assert!(
+            reason.contains("投递至他会话，转写沿其项目目录另查"),
+            "mismatch 形态的佐证注记换措辞（不是「落盘滞后」）：{v}"
+        );
+        assert_eq!(fake.recorded().len(), 0, "无头路由会话零终端注入");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0].action, "headless");
+        assert_eq!(audits[0].channel, "headless_wb_acp");
+        assert_eq!(
+            audits[0].session_id, CARD,
+            "审计 session 列 = 卡面会话（设备检索入口语义，不动）"
+        );
+        assert!(
+            audits[0].result.starts_with("ok"),
+            "终态词在前（耗时由 audit_result 追加在后）：{}",
+            audits[0].result
+        );
+        assert!(
+            audits[0].result.contains(DELIVERED) && audits[0].result.contains("与所选会话不同"),
+            "审计 result 词双记投递 sessionId（防 api.rs 靶向接线被删无测试红）：{}",
+            audits[0].result
+        );
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(CARD),
+            "回合终结必须注销串行锁"
+        );
+        let pending = state
+            .store
+            .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, CARD));
+        assert!(pending.is_empty(), "无头回合绝不入队（裁决 8）");
+        http.assert_clean();
+    }
+
     /// **R10：WB 回合的内层 `spawn_blocking` JoinError 也必须落审计行**——ACP 链内 panic 时
     /// 旧的 JoinError 臂只写 log 就返回回执：回合「起跑了但从未入账」，审计页上这条投递凭空
     /// 消失（ticket 的「回合起跑无审计行」）。本用例用**必 panic 的 HTTP 缝**把
