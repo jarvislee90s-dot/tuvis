@@ -243,12 +243,12 @@ Capabilities across the 8 terminal-class AI coding tools (✅ supported / ◐ pa
 | MCP management                     | ✅ JSON     | ✅ TOML   | ✅ JSONC | ✅ JSON  | ✅ JSON      | ✅ JSON   | ✅ JSON subtree | ❌          |
 | Plugin management                  | ✅          | ✅        | ✅       | ✅       | ◐ file-based | ❌        | ❌              | ❌          |
 | Status hooks                       | ✅          | ✅        | ❌       | ❌       | ✅           | ❌        | ❌              | ❌          |
-| Mobile · message viewing           | ✅          | ✅        | ✅       | ✅       | ✅           | ✅        | ✅              | ✅          |
-| Mobile · file preview              | ✅          | ✅        | ✅       | ✅       | ✅           | ✅        | ✅              | ✅          |
+| Mobile · message viewing           | ✅          | ✅        | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
+| Mobile · file preview              | ✅          | ✅        | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
 | Mobile · send messages (injection) | 🧪          | 🧪        | 🧪       | ❌       | 🧪           | ❌        | ❌              | ❌          |
 | Mobile · create sessions           | 🧪          | 🧪        | 🧪       | ❌       | 🧪           | ❌        | ❌              | ❌          |
 
-**Mobile remote control (v0.5.0, experimental)**: message viewing and file preview cover all 8 tools; **sending messages to CLI sessions and creating sessions from your phone are experimental**, currently supporting Claude Code / Codex CLI / OpenCode / Kimi Code. Messages are injected as keystrokes into the terminal and verified by screen-reading receipts (no false "delivered"); queueing, interrupt-and-jump, remote approvals, question answering, permission-mode switching, and session creation are included. See the Chinese README for illustrated walkthroughs and per-tool limitations.
+**Mobile remote control (v0.5.0, experimental)**: message viewing and file preview cover 7 of the 8 tools (OpenClaw's black-box build is not remotely readable yet); **sending messages to CLI sessions and creating sessions from your phone are experimental**, currently supporting Claude Code / Codex CLI / OpenCode / Kimi Code. Messages are injected as keystrokes into the terminal and verified by screen-reading receipts (no false "delivered"); queueing, interrupt-and-jump, remote approvals, question answering, permission-mode switching, and session creation are included. See the Chinese README for illustrated walkthroughs and per-tool limitations.
 
 ---
 
