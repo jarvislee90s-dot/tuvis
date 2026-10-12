@@ -16,6 +16,10 @@
 /// H11 三家 CLI 无头（Task 13 / C4）：claude 主体（长驻双向审批桥）+ kimi/opencode 薄适配
 pub mod cli_three;
 pub mod codex;
+/// P1 codex APP 协议面客户端（Task 5）：`codex app-server` 裸方言 stdio JSON-RPC——
+/// per-action 短命会话 / thread·read 读回 / 档位写（载体① turn·start·approvalPolicy）/
+/// 自持回合 interrupt。daemon 通道已按 T0.1 删除（对 APP 持有线程两腿皆拒，零 WS 依赖）
+pub mod codex_app;
 pub mod gate;
 pub mod receipt;
 pub mod runner;
