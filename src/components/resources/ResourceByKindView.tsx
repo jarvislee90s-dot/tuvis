@@ -20,25 +20,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import {
-  Package,
-  Link2,
-  Plug,
-  FileJson,
-  FolderOpen,
-  ChevronRight,
-  type LucideIcon,
-} from "lucide-react";
+import { FileJson, FolderOpen, ChevronRight } from "lucide-react";
 import { useSsotResourcesQuery, SSOT_RESOURCES_KEY } from "@/lib/query/queries/resources";
-import { ResourceKindDialog, type ResourceKind } from "./ResourceKindDialog";
+import { ResourceKindDialog } from "./ResourceKindDialog";
+import { KIND_META, matchesResourceSearch, type ResourceKind } from "./kindMeta";
 import { ManifestInstallDialog } from "./ManifestInstallDialog";
-
-/** 三段入口配置（图标复用迁移前的段头图标；计数文案复用既有键，数字随搜索过滤如实） */
-const KIND_ENTRIES: { kind: ResourceKind; icon: LucideIcon; countKey: string }[] = [
-  { kind: "skill", icon: Package, countKey: "resources.skillsCount" },
-  { kind: "mcp", icon: Link2, countKey: "resources.mcpsCount" },
-  { kind: "plugin", icon: Plug, countKey: "resources.pluginsCount" },
-];
 
 /** 废止的折叠态 localStorage 键（A1：段头折叠机制随大表入弹窗而废止，一次性清理防遗留） */
 const LEGACY_COLLAPSED_KEY = "mam.resourceView.collapsed";
@@ -85,16 +71,14 @@ export function ResourceByKindView() {
     return <div className="text-muted-foreground py-4 text-xs">{t("common.loading")}</div>;
   }
 
-  const filterFn = (r: { name: string; enabledTools: string[] }) => {
-    if (!search.trim()) return true;
-    const q = search.trim().toLowerCase();
-    return [r.name, ...r.enabledTools].some((x) => x.toLowerCase().includes(q));
-  };
+  // 搜索判据与弹窗共用一个实现（kindMeta.matchesResourceSearch）：段头计数与弹窗 tab
+  // 计数、行过滤永远同口径
+  const matches = (r: { name: string; enabledTools: string[] }) => matchesResourceSearch(r, search);
   // 段头计数 = 搜索过滤后的段内条数（与弹窗内 tab 计数同口径）
   const counts: Record<ResourceKind, number> = {
-    skill: resources.skills.filter(filterFn).length,
-    mcp: resources.mcp.filter(filterFn).length,
-    plugin: resources.plugins.filter(filterFn).length,
+    skill: resources.skills.filter(matches).length,
+    mcp: resources.mcp.filter(matches).length,
+    plugin: resources.plugins.filter(matches).length,
   };
 
   const openKind = (kind: ResourceKind) => {
@@ -155,7 +139,7 @@ export function ResourceByKindView() {
 
         {/* 三段段头入口（A1）：数字留段头，点段头开 Dialog 并预选该类型 */}
         <div>
-          {KIND_ENTRIES.map(({ kind, icon: Icon, countKey }) => (
+          {KIND_META.map(({ kind, icon: Icon, countKey }) => (
             <button
               key={kind}
               type="button"

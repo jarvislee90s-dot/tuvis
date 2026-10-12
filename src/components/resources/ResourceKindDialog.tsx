@@ -19,19 +19,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import {
-  Package,
-  Link2,
-  Plug,
-  Info,
-  Trash2,
-  FileJson,
-  FolderOpen,
-  ArrowUpDown,
-  ArrowUp,
-  ArrowDown,
-  type LucideIcon,
-} from "lucide-react";
+import { Info, Trash2, FileJson, FolderOpen, ArrowUpDown, ArrowUp, ArrowDown } from "lucide-react";
 import {
   checkSkillTargetType,
   disableSkillForTool,
@@ -65,8 +53,7 @@ import {
   type PendingUninstall,
 } from "./ResourceDialogs";
 import type { ResourceBinding, SsotResource } from "@/types/extension";
-
-export type ResourceKind = "skill" | "mcp" | "plugin";
+import { KIND_META, matchesResourceSearch, type ResourceKind } from "./kindMeta";
 
 function formatSkillName(name: string): string {
   return name.includes("/") ? name.replace("/", ": ") : name;
@@ -265,13 +252,6 @@ type KindSectionConfig = {
   onToggleTool: (res: SsotResource, toolId: string, enabled: boolean) => void;
 };
 
-/** 弹窗内类型切换 tab 配置（标签复用既有计数文案键，随搜索结果如实计数） */
-const KIND_TABS: { kind: ResourceKind; icon: LucideIcon; countKey: string }[] = [
-  { kind: "skill", icon: Package, countKey: "resources.skillsCount" },
-  { kind: "mcp", icon: Link2, countKey: "resources.mcpsCount" },
-  { kind: "plugin", icon: Plug, countKey: "resources.pluginsCount" },
-];
-
 interface ResourceKindDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -410,14 +390,11 @@ export function ResourceKindDialog({
     return null; // 入口段头在卡片侧已按 resources 就绪渲染，弹窗打开时数据必在（同 key 共享缓存）
   }
 
-  const filterFn = (r: { name: string; enabledTools: string[] }) => {
-    if (!search.trim()) return true;
-    const q = search.trim().toLowerCase();
-    return [r.name, ...r.enabledTools].some((x) => x.toLowerCase().includes(q));
-  };
-  const filteredSkills = applySort(resources.skills.filter(filterFn), "skill");
-  const filteredMcp = applySort(resources.mcp.filter(filterFn), "mcp");
-  const filteredPlugins = applySort(resources.plugins.filter(filterFn), "plugin");
+  // 搜索判据与卡片段头计数共用一个实现（kindMeta.matchesResourceSearch）
+  const matches = (r: { name: string; enabledTools: string[] }) => matchesResourceSearch(r, search);
+  const filteredSkills = applySort(resources.skills.filter(matches), "skill");
+  const filteredMcp = applySort(resources.mcp.filter(matches), "mcp");
+  const filteredPlugins = applySort(resources.plugins.filter(matches), "plugin");
 
   const handleToggleMcp = async (name: string, toolId: string, enabled: boolean) => {
     if (capabilityBlocked(toolId, "mcp")) return;
@@ -862,7 +839,7 @@ export function ResourceKindDialog({
           {/* 类型切换（Skill/MCP/插件，可再切）+ 搜索框 + MCP「+ 添加」（随段头附加控件迁入） */}
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex gap-1">
-              {KIND_TABS.map(({ kind, icon: Icon, countKey }) => (
+              {KIND_META.map(({ kind, icon: Icon, countKey }) => (
                 <Button
                   key={kind}
                   size="sm"
