@@ -6,6 +6,7 @@
 // T2 无新版本 → 维持「检查更新」次按钮 + upToDate 行内提示
 // T2b mount 自动检查失败 → 静默不 toast（契约：网络失败静默）；弹窗不开、主按钮不出
 // T2c 手动点「检查更新」失败 → toast 带具体原因（Rust message 不吞）
+// T2d 手动路径 up-to-date → 只给行内「您正在使用最新版本！」，不 toast
 // T3 Star 横幅：默认可见；「去点 Star」openUrl 仓库；X 关闭写 localStorage
 //    （键含当前版本号，升级后重新出现）；重挂载不再出现（关闭记忆生效）
 // T3b localStorage 已有当前版本关闭态 → 横幅不出现
@@ -177,6 +178,23 @@ describe("关于页改版（自动检测 + 醒目更新入口 + 快捷行 + Star
       );
     });
     expect(checkCalls()).toBe(2);
+  });
+
+  it("T2d 手动路径 up-to-date：mount 静默检查落地后点「检查更新」→ 行内提示在场、无 toast", async () => {
+    mode.upToDate = true;
+    render(<AboutPage />);
+
+    // mount 自动检查（静默）落地即点亮行内提示；此时尚未点过任何按钮
+    expect(await screen.findByText("您正在使用最新版本！")).toBeInTheDocument();
+    expect(toast.error).not.toHaveBeenCalled();
+    const btn = screen.getByRole("button", { name: "检查更新" });
+    expect(btn).not.toBeDisabled();
+
+    // 手动再点一次：up-to-date 只走行内提示（手动路径的 toast 只属于失败分支）
+    fireEvent.click(btn);
+    await waitFor(() => expect(checkCalls()).toBe(2));
+    expect(await screen.findByText("您正在使用最新版本！")).toBeInTheDocument();
+    expect(toast.error).not.toHaveBeenCalled();
   });
 
   it("T3 Star 横幅：默认可见；去点 Star openUrl 仓库；X 关闭写版本化 localStorage 且重挂载不再现", async () => {
