@@ -294,7 +294,8 @@ export function useManualUpdateCheck() {
       // 不吞细节——弱网/代理/hosts 屏蔽场景用户第一眼就能看出卡在哪
       toast.error(t("updater.checkFailed", { message: r.message }));
     }
-    // available → UpdaterDialog（manualCheck 模式）自动弹窗
+    // available → 检查结果驱动消费方页面（autoOpen=false 的 About 用它点亮「更新到 vX」主按钮；
+    // 默认 autoOpen=true 的消费方才自动弹窗）
   };
 
   return { checkUpdate: handleCheckUpdate, checking, showNoUpdate };
