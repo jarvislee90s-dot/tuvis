@@ -1,25 +1,5 @@
-# Installation
+# Download and Installation
 
-Installation steps for macOS, Linux, and Windows
+Download the latest installer from the GitHub Releases page (Windows: `Tuvis-*-Windows-x64-setup.exe`; macOS: `Tuvis-*-macOS.dmg`). Requires Windows 10+ or macOS 14+; all app data stays local under `~/.tuvis/`.
 
-## Overview
-
-This chapter covers Installation functionality in Tuvis.
-
-## Features
-
-Tuvis provides comprehensive Installation features for managing AI programming tools.
-
-## Steps
-
-1. Open the main application window
-2. Configure relevant options
-3. Confirm settings are applied
-
-## Notes
-
-- Read the quick start guide for first-time setup
-- Refer to troubleshooting for issues
-- Visit the GitHub repository for more information
-
-![Screenshot](../../assets/screenshots/en/02-installation.png)
+> 📝 Full English version is in progress — the Chinese page has the complete content.
