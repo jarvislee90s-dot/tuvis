@@ -277,8 +277,10 @@ interface ResourceKindDialogProps {
   onOpenChange: (open: boolean) => void;
   /** 点段头进来的预选类型；每次 open 置真时重置 activeKind（可再切） */
   initialKind: ResourceKind;
-  /** 卡片搜索框状态提升：过滤弹窗内三段列表（A1/D 兼容注意） */
+  /** 搜索词（状态仍提升在卡片侧）：过滤弹窗内三段列表 + 驱动卡片段头计数 */
   search: string;
+  /** 弹窗内搜索框（F3）的受控回调：弹窗盖住卡片那只搜索框，弹窗内必须能改关键词 */
+  onSearchChange: (search: string) => void;
 }
 
 export function ResourceKindDialog({
@@ -286,6 +288,7 @@ export function ResourceKindDialog({
   onOpenChange,
   initialKind,
   search,
+  onSearchChange,
 }: ResourceKindDialogProps) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -856,7 +859,7 @@ export function ResourceKindDialog({
             <DialogTitle className="text-sm">{t("resources.repoTitle")}</DialogTitle>
           </DialogHeader>
 
-          {/* 类型切换（Skill/MCP/插件，可再切）+ MCP「+ 添加」（随段头附加控件迁入） */}
+          {/* 类型切换（Skill/MCP/插件，可再切）+ 搜索框 + MCP「+ 添加」（随段头附加控件迁入） */}
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex gap-1">
               {KIND_TABS.map(({ kind, icon: Icon, countKey }) => (
@@ -872,16 +875,28 @@ export function ResourceKindDialog({
                 </Button>
               ))}
             </div>
-            {activeKind === "mcp" && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 px-2 text-[10px]"
-                onClick={() => setMcpDialogOpen(true)}
-              >
-                {t("resources.addWithPlus")}
-              </Button>
-            )}
+            <div className="flex items-center gap-2">
+              {/* 弹窗内搜索框（F3）：卡片那只被模态遮罩盖住且不可聚焦，打开弹窗只能关掉
+                  再改关键词——这里与卡片共用同一份提升状态（受控 value + onChange），
+                  行过滤与 tab 计数实时联动，清空即恢复全量 */}
+              <input
+                type="text"
+                placeholder={t("resources.searchPlaceholder")}
+                value={search}
+                onChange={(e) => onSearchChange(e.currentTarget.value)}
+                className="h-7 w-40 rounded border px-2 text-xs"
+              />
+              {activeKind === "mcp" && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-[10px]"
+                  onClick={() => setMcpDialogOpen(true)}
+                >
+                  {t("resources.addWithPlus")}
+                </Button>
+              )}
+            </div>
           </div>
 
           {/* 矩阵图例（随大表迁入弹窗）：点亮图标 / 常驻徽标 / 表头定位语义 */}
