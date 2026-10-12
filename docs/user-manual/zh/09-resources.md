@@ -8,8 +8,6 @@ Skill、MCP 服务器与插件的统一仓库——一份资源，映射到八�
 
 ![资源管理页（Skill 总览）](../img/resources.png)
 
-> 🖼 TODO 截图：按工具视图（卡片式）一张。
-
 ## Skill 库
 
 全局仓库（SSOT）在 `~/.tuvis/skills/`，各工具读到的技能是**三层符号链接映射**：
