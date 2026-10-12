@@ -2798,6 +2798,21 @@ fn approve_audit_action(option_id: &str) -> &'static str {
     }
 }
 
+/// 权限菜单端点的审计摘要**文案单点**（第二轮复评 M-a：拒绝臂与两个成功臂此前各写死
+/// 一份，三处迟早漂移，而账本正是拿它对账）。形态与既有成功臂文案逐字对齐：
+///
+/// - `open`（打开菜单）→ `打开权限菜单（终端菜单单选）`；
+/// - `pick` + 编号 → `终端菜单第 {n} 项（权限切换）`；
+/// - `pick` 缺编号 → `终端菜单选择项（权限切换，编号缺省）`——**只在止血门拒绝臂可达**
+///   （成功臂的 `pick` 在更后方有 400 缺号门，走不到这里），如实记「缺省」而不编编号。
+fn menu_audit_content(action: &str, number: Option<u32>) -> String {
+    match (action, number) {
+        ("pick", Some(number)) => format!("终端菜单第 {number} 项（权限切换）"),
+        ("pick", None) => "终端菜单选择项（权限切换，编号缺省）".to_string(),
+        _ => "打开权限菜单（终端菜单单选）".to_string(),
+    }
+}
+
 /// POST /m/api/v1/session-approve 请求体（camelCase；字段全 default——缺参不触发
 /// axum 提取器 422，由 handler 统一按契约给 400 bad_request）
 #[derive(Deserialize)]
@@ -2813,6 +2828,14 @@ pub struct SessionApproveReq {
 /// - 缺参 → 400；设备 cookie 缺失 → 403 防御（gate 已拦，理论不可达）；
 /// - 会话不在快照 → 404 no_session；非 Waiting → 409 not_waiting（映射解析在其后，
 ///   运行中会话不付出 KV 读取代价）；
+/// - **codex APP 会话 → 409 `app_form_pending`（Task 15 止血门，2026-10-12）**：判据单点
+///   [`codex_app_form`]（`tool == codex ∧ form == App`）；**门位在会话定位之后、Waiting /
+///   计划预期态判据与 dialog 选项解析（含屏读）之前**——APP 没有控制台，CLI 键序通道对
+///   它就是**错误通道**（codex 默认审批映射 `approve→"y"` / `reject→"esc"` 走映射表**不读
+///   屏、直接发键**，与三写入口同根因），故协议臂落地前一律拒绝。`reason` =
+///   [`APP_FORM_PENDING_REASON`]（移动端 `approveErrorCopy` 原样渲染，缺省走同义兜底
+///   常量）；**读侧 `/session-approve-options` 不受门**、CLI 形态零变化。摘门条件见
+///   `docs/superpowers/specs/2026-10-12-codex-app-form-止血门底料与摘门条件.md`。
 ///
 /// **等待门（丁T2 F3-2 起）**：与 GET **同口径** = `Waiting ∨ 审批标记 ∨ 计划预期态`
 /// （计划预期态按 `plan_dialog_family` 收窄到 codex/kimi；判据用与 GET 同一份
@@ -2849,9 +2872,11 @@ pub struct SessionApproveReq {
 ///   成功 → 200 key_sent；失败 → 200 failed{error}（可重试回执）。
 ///   // M11：会话路由含无头通道时，此处按 approve option 分派 control_message 而非按键
 ///   （选项卡 UI 与端点契约通道无关，届时只扩这一处分派）
-/// - 审计：action=approve/reject 语义化，域外 id 收敛为 "key"（log::warn 留痕），
-///   result=ok/failed:{e}，channel=injector.name()，content=optionId（协议标识，
-///   stable 于展示文案定制）。
+/// - 审计：action=approve/reject 语义化（词表**单点** [`approve_audit_action`]，成功臂与
+///   止血门拒绝臂共用），域外 id 收敛为 "key"（log::warn 留痕），result=ok/failed:{e}，
+///   channel=injector.name()，content=optionId（协议标识，stable 于展示文案定制）；
+///   **止血门拒绝另落一行**：result=`refused:app_form_pending`（action 走同一函数、
+///   content 仍为 optionId——与成功行同形，「开发中」状态对账本可查）。
 pub async fn session_approve(
     State(st): State<Arc<RemoteState>>,
     headers: axum::http::HeaderMap,
@@ -7820,16 +7845,11 @@ pub async fn session_mode_menu(
     };
     let tool = session.agent_type.tool_id().to_string();
     // ===== codex APP 止血门（Task 3）=====
-    // 门位 = 会话定位后、工具判别与守卫探测**之前**（APP 无屏可读——先于一切屏读与
-    // 注入）。审计摘要按**已校验的 action** 分派：open / pick 各用本端点既有文案形态
-    //（与成功臂审计同源）；pick 的 number 400 门在更后方，缺号时按缺省摘要如实记。
-    // tool 位恒 codex（判据单点）。
+    // 门位 = 会话定位后、一切屏读与注入**之前**（APP 无屏可读——先于守卫探测与菜单读）。
+    // 审计摘要走与成功臂**同一个** [`menu_audit_content`]（M-a：三处各写一份迟早漂移）；
+    // pick 的 number 400 门在更后方，缺号时按缺省摘要如实记。tool 位恒 codex（判据单点）。
     if codex_app_form(&session) {
-        let audit_content = match (action.as_str(), req.number) {
-            ("pick", Some(number)) => format!("终端菜单第 {number} 项（权限切换）"),
-            ("pick", None) => "终端菜单选择项（权限切换，编号缺省）".to_string(),
-            _ => "打开权限菜单（终端菜单单选）".to_string(),
-        };
+        let audit_content = menu_audit_content(&action, req.number);
         endpoint_audit(
             &st,
             &device_id,
@@ -8017,7 +8037,8 @@ pub async fn session_mode_menu(
             &device_name,
             &tool,
             &sid,
-            "打开权限菜单（终端菜单单选）",
+            // M-a：摘要与止血门拒绝臂共用同一格式化（`open` 形态）
+            &menu_audit_content("open", None),
             "mode",
             &result_str,
         );
@@ -8249,7 +8270,8 @@ pub async fn session_mode_menu(
         &device_name,
         &tool,
         &sid,
-        &format!("终端菜单第 {number} 项（权限切换）"),
+        // M-a：摘要与止血门拒绝臂共用同一格式化（`pick` + 编号形态）
+        &menu_audit_content("pick", Some(number)),
         "mode",
         &result_str,
     );
@@ -10260,6 +10282,25 @@ mod tests {
         assert_eq!(
             mode_audit_content(ModeGroupId::Permission, "只读"),
             "切换权限至 只读"
+        );
+    }
+
+    /// M-a 回归锁：权限菜单端点的审计摘要**单点** [`menu_audit_content`]——三处（拒绝臂
+    /// / open 成功臂 / pick 成功臂）共用。三种形态逐字钉住；`pick` 缺编号这一态只在
+    /// 止血门拒绝臂可达（成功臂有 400 缺号门），如实记「编号缺省」而不编编号。
+    #[test]
+    fn menu_audit_content_pins_three_wording() {
+        assert_eq!(
+            menu_audit_content("open", None),
+            "打开权限菜单（终端菜单单选）"
+        );
+        assert_eq!(
+            menu_audit_content("pick", Some(2)),
+            "终端菜单第 2 项（权限切换）"
+        );
+        assert_eq!(
+            menu_audit_content("pick", None),
+            "终端菜单选择项（权限切换，编号缺省）"
         );
     }
 

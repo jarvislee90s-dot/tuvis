@@ -15858,6 +15858,12 @@ mod tests {
             audits[3].summary, "切换模式至 计划",
             "拒绝行摘要与成功行同一格式化"
         );
+        // M-a：菜单拒绝行（action=open）的摘要同样走 menu_audit_content——与 open 成功臂
+        // 逐字同源（三处各写一份格式化即在此红）
+        assert_eq!(
+            audits[2].summary, "打开权限菜单（终端菜单单选）",
+            "菜单拒绝行摘要与 open 成功臂同一格式化"
+        );
     }
 
     /// GET 类端点不受门（「读侧不动」）：APP 会话的 GET /session-mode（结构+当前档）
