@@ -957,20 +957,33 @@ export type QuestionAnswerResult =
     }
   | { status: "failed"; error: string; aborted?: boolean; stage?: QuestionAnswerStage };
 
+/** codex APP 止血门（Task 15，2026-10-12）的用户可读**缺省**文案：**单一来源**——
+ *  问答侧（[`questionAnswerErrorCopy`]）与模式栏侧（ModeBar 的 409 分诊）两条入口
+ *  共用同一常量，防两处兜底文案漂移；后端下发 `reason` 时一律以后端为准
+ *  （文案单一来源，与 `blocked_by_dialog` 同一惯例）。 */
+export const APP_FORM_PENDING_FALLBACK = "APP 会话该操作走协议通道，开发中——请在 APP 内操作";
+
 /** 问答应答**错误码 → 用户可读中文文案**（丁T6 复评抽出：卡内与 composer 两条入口
  *  必须**同口径**——两处各写一套 `if/else` 迟早漂移，且 composer 侧曾漏掉这条映射
  *  （读的是 `data.reason` 而问答端点回的是 `data.error`）→ 409 会显示成
  *  「session-question/answer 409」这种对用户无意义的串）。
  *
  *  取值来源：后端 `remote::api::session_question_answer` 的 409/400 错误码
- *  （`no_question` / `multi_questions` / `tool_readonly` / `bad_index`；
- *  另有 `bad_request` 兜底）。码不在表内 → 回原 message（不编文案）。 */
+ *  （`no_question` / `multi_questions` / `tool_readonly` / `bad_index` /
+ *  `app_form_pending`；另有 `bad_request` 兜底）。码不在表内 → 回原 message
+ *  （不编文案）。 */
 export function questionAnswerErrorCopy(e: ApiError): string {
   const code = typeof e.data?.error === "string" ? e.data.error : null;
   if (code === "no_question") return "当前没有待回答的问题";
   if (code === "multi_questions") return "多个问题请回到终端完成作答";
   if (code === "tool_readonly") return "该工具的远程作答尚未实测，请在终端完成作答";
   if (code === "bad_index") return "选项序号无效，请刷新后重试";
+  // Task 15 止血门：codex APP 会话的问答写动作走协议通道（开发中）——**必须**消费
+  // 这条码，否则用户看到的是「session-question/answer 409」这种无意义串（本函数的
+  // 存在理由同上）。文案用后端下发的 `reason`（单一来源），缺省走同义兜底常量
+  if (code === "app_form_pending") {
+    return typeof e.data?.reason === "string" ? e.data.reason : APP_FORM_PENDING_FALLBACK;
+  }
   return e.message;
 }
 

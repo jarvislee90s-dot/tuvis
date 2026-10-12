@@ -1919,6 +1919,27 @@ describe("卡片在场分流：审批拦截 / 问答转向自由作答 / 不可�
     expect(chip.textContent).toContain("当前没有待回答的问题");
   });
 
+  it("转向 freeText 遇 409 app_form_pending（Task 15 止血门）→ 中文引导文案，不是「... 409」", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.questionInfo = freeTextQuestionInfo();
+    routes.answerStatus = 409;
+    routes.answerBody = {
+      error: "app_form_pending",
+      reason: "APP 会话该操作走协议通道，开发中——请在 APP 内操作",
+    };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    await screen.findByTestId("composer-card-presence");
+    fireEvent.change(input, { target: { value: "回答内容" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    const chip = await screen.findByTestId("send-receipt-failed");
+    expect(chip.textContent).toContain("请在 APP 内操作");
+    expect(chip.textContent).not.toContain("409");
+    // 失败保留输入（与既有 failed 态同口径：可重试）
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("回答内容");
+  });
+
   it("两者都在场：审批优先（裁3 安全面更重——审批框放行自由文本 = 误触选项）", async () => {
     installFetch();
     routes.info = sendInfo();

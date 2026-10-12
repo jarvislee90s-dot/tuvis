@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { toneTokens } from "./InteractiveCard";
 import {
   ApiError,
+  APP_FORM_PENDING_FALLBACK,
   fetchSessionMode,
   sessionModeSwitch,
   type MamMode,
@@ -116,6 +117,15 @@ export default function ModeBar({ session }: { session: { id: string } }) {
               typeof e.data?.reason === "string"
                 ? e.data.reason
                 : "终端有待答的问题，请先在问答卡作答"
+            );
+          } else if (e.status === 409 && e.data?.error === "app_form_pending") {
+            // Task 15 止血门（2026-10-12）：codex APP 会话的模式/权限写动作走协议
+            // 通道（开发中）——后端在屏读与注入之前整条拒绝。分诊写法同
+            // blocked_by_dialog：文案用后端下发的 reason（单一来源），缺省走
+            // [`APP_FORM_PENDING_FALLBACK`]（与问答侧**同一常量**，两入口不漂移）。
+            // 不消费这条码的话用户只会看到「session-mode/switch 409」这种无意义串
+            setError(
+              typeof e.data?.reason === "string" ? e.data.reason : APP_FORM_PENDING_FALLBACK
             );
           } else {
             setError(e.message);
