@@ -762,3 +762,13 @@ git commit -m "docs(spec): APP 写通道全覆盖批验收回填 + M18-M28 结�
 | P2-10 | 锚点表 codex.rs 补目录 `inject/headless/codex.rs`（仓内 4 个同名）；Task 5 内联引用同步 | 锚点表两行 / Task 5 要点 3 |
 | P2-11 | Task 6 拆 **6a（模式族：switch/menu 翻转 + GET surface/degraded + H3 门 + 审计词）/ 6b（问答补投 + cancel 臂）**，同串行位两连号 commit；Task 7 标题补「api.rs 触点 · 串行位 4」；6a/6b 文件域补 codex_app.rs（条件性）；Task 9 的 cli_three.rs 补全路径 | 6a/6b 全节 / Task 7 标题 / Task 9 要点 2 / 执行方式串行清单 |
 | P2-12 | gate 表 T0.1 行 interrupt 措辞改正：**「仅 daemon 通道可用时提供；不可用时如实置灰」**——关闭态在飞回合来自 exec resume 路（归 H4 kill），协议 interrupt 关闭态无作用对象，不写「关闭态可用」 | gate 表 T0.1 行 / Task 5 要点 4 / Task 6b 要点 3 与测试 / M22 行 |
+
+---
+
+## ⚠️ Task 11 实施记录（2026-10-12 收官）
+
+- **全量门禁总跑（Step 1）**：`build:mobile` ✓ → `cargo check --all-targets` ✓（首跑 rustc STATUS_STACK_BUFFER_OVERRUN 崩溃 = 本机内存压力 flake，`-j 2` 复跑过）→ `cargo test -j 2` **2731 passed / 4 failed**（白名单原班：connection 隔离×2、tailscale 探针、1314 族；集成侧 preset_v2×6 + usage×2 已由 Task 10 收口 stash 基线逐条核对为存量）→ `clippy --all-targets -D warnings` ✓（期间一次失败系控制者 `-j` 旗子误放 `--` 之后被当编译器选项，非代码问题；`cargo clean -p tuvis` 已做无害）→ `fmt --check` ✓ → `pnpm lint/build/test/format:check` 全绿（**135 文件 / 1434 passed / 5 skipped**；首轮单败为瞬态 flake，连续两轮复跑全绿未复现）。
+- **实现轨迹**：Task 2 `5320a625`（收口含 codex.rs duration/文案）→ Task 3 `dffd7f57`（三轮合一 + 否定语义勘误）→ Task 4 `1fca0ba2` → Task 4b `31c86858`（含收口轮）→ Task 5 `833f72cb`（含收口轮 stderr drain）→ Task 6a `fb90ef42`（含 I1 resume-only 收口）→ Task 6b `3efb714a`（含取消安全收口）→ Task 7 `b8c55cde`+`c2fca791`+`7c3d8919` → Task 8 `85064183`（含三态挂载收口）→ Task 9 `8ba63c0b`（含硬化收口）→ Task 10 `826c6ba1`+`afaf0765`（接手 WIP + detached spawn 收口）。增补批次：资源管理页 UI 改版 `7f008dda`、关于页改版 + en 徽章 `fe56d782`、目录跳转 os error 6 热修 `af07c548`、capabilities.json 同步源（撤销待用户另 worktree 版本）。
+- **双审轨迹**：每任务 spec 审 + 质量审双关（Task 4b/5/6a/6b/7/8/10 含收口 delta 复核），全部 ✅ 后合入；新增审出项已按裁决登记后续批次（Task 8 质量审 I-1 同源教训、6b 吞帧竞窗 M22 观察项、toggle 取消方向 Task 8 契约、queue 消费翻转信号本批-5、en 徽章溢出已修）。
+- **真机验收（Step 2）**：M18–M28 表移交用户执行；新增真机项——资源管理页改版（sheet 化/两列选择/来源徽章）、关于页改版（自动检测/更新主按钮/Star 横幅）、目录跳转打包版复验（`af07c548`）、dsh request_permission 展示与 M25 余额充值后行为级复验。
+- **git 状态**：全部 commit 在本地 `feat/h1-h12-headless`，未 push（推送须用户指令）。
