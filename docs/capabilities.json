@@ -1,0 +1,212 @@
+{
+  "$comment": "Tuvis 多终端能力矩阵单一数据源。README「多终端能力矩阵（总表）」的结构化版本，两处随发版同步更新；tuvis-website 官网经 api.github.com 拉取本文件渲染兼容矩阵。",
+  "updated": "2026-10-12",
+  "legend": {
+    "yes": "✅ 支持",
+    "partial": "◐ 部分",
+    "experimental": "🧪 试验性",
+    "no": "❌ 不支持"
+  },
+  "tools": [
+    "claude",
+    "codex",
+    "opencode",
+    "kimi",
+    "workbuddy",
+    "zcode",
+    "dsh",
+    "openclaw"
+  ],
+  "groups": [
+    {
+      "key": "desktop",
+      "name": "桌面提醒",
+      "rows": [
+        {
+          "name": "会话监控（红绿灯）",
+          "key": "monitor",
+          "support": {
+            "claude": "yes",
+            "codex": "yes",
+            "opencode": "yes",
+            "openclaw": "yes",
+            "kimi": "yes",
+            "workbuddy": "yes",
+            "zcode": "yes",
+            "dsh": "yes"
+          }
+        },
+        {
+          "name": "本机桌面通知",
+          "key": "notify",
+          "support": {
+            "claude": "yes",
+            "codex": "yes",
+            "opencode": "yes",
+            "openclaw": "yes",
+            "kimi": "yes",
+            "workbuddy": "yes",
+            "zcode": "yes",
+            "dsh": "yes"
+          }
+        }
+      ]
+    },
+    {
+      "key": "skillmcp",
+      "name": "Skill · MCP 管理",
+      "rows": [
+        {
+          "name": "Skill 管理",
+          "key": "skill",
+          "support": {
+            "claude": "yes",
+            "codex": "yes",
+            "opencode": "yes",
+            "openclaw": "yes",
+            "kimi": "yes",
+            "workbuddy": "yes",
+            "zcode": "yes",
+            "dsh": "partial"
+          },
+          "note": "dsh 为只读"
+        },
+        {
+          "name": "MCP 管理",
+          "key": "mcp",
+          "support": {
+            "claude": "yes",
+            "codex": "yes",
+            "opencode": "yes",
+            "openclaw": "yes",
+            "kimi": "yes",
+            "workbuddy": "yes",
+            "zcode": "yes",
+            "dsh": "no"
+          },
+          "note": "ZCode 为 JSON 子树；dsh 暂不支持"
+        },
+        {
+          "name": "插件管理",
+          "key": "plugin",
+          "support": {
+            "claude": "yes",
+            "codex": "yes",
+            "opencode": "yes",
+            "openclaw": "yes",
+            "kimi": "partial",
+            "workbuddy": "no",
+            "zcode": "no",
+            "dsh": "no"
+          },
+          "note": "Kimi 为文件型"
+        },
+        {
+          "name": "状态 Hook",
+          "key": "hook",
+          "support": {
+            "claude": "yes",
+            "codex": "yes",
+            "opencode": "no",
+            "openclaw": "no",
+            "kimi": "yes",
+            "workbuddy": "no",
+            "zcode": "no",
+            "dsh": "no"
+          }
+        }
+      ]
+    },
+    {
+      "key": "remote",
+      "name": "远程操控",
+      "rows": [
+        {
+          "name": "手机 · 消息查看",
+          "key": "messages",
+          "support": {
+            "claude": "yes",
+            "codex": "yes",
+            "opencode": "yes",
+            "openclaw": "no",
+            "kimi": "yes",
+            "workbuddy": "yes",
+            "zcode": "yes",
+            "dsh": "yes"
+          }
+        },
+        {
+          "name": "手机 · 文件预览",
+          "key": "files",
+          "support": {
+            "claude": "yes",
+            "codex": "yes",
+            "opencode": "yes",
+            "openclaw": "no",
+            "kimi": "yes",
+            "workbuddy": "yes",
+            "zcode": "yes",
+            "dsh": "yes"
+          }
+        },
+        {
+          "name": "手机 · 发消息（注入）",
+          "key": "inject",
+          "support": {
+            "claude": "experimental",
+            "codex": "experimental",
+            "opencode": "experimental",
+            "openclaw": "no",
+            "kimi": "experimental",
+            "workbuddy": "no",
+            "zcode": "no",
+            "dsh": "no"
+          },
+          "note": "四家试验性：OpenClaw/WorkBuddy 黑盒无外部写通道，ZCode 预留无头通道，dsh 写通道另评"
+        },
+        {
+          "name": "手机 · 新建会话",
+          "key": "newsession",
+          "support": {
+            "claude": "experimental",
+            "codex": "experimental",
+            "opencode": "experimental",
+            "openclaw": "no",
+            "kimi": "experimental",
+            "workbuddy": "no",
+            "zcode": "no",
+            "dsh": "no"
+          }
+        },
+        {
+          "name": "Token 用量采集",
+          "key": "usage",
+          "support": {
+            "claude": "yes",
+            "codex": "yes",
+            "opencode": "yes",
+            "openclaw": "no",
+            "kimi": "yes",
+            "workbuddy": "yes",
+            "zcode": "yes",
+            "dsh": "yes"
+          }
+        },
+        {
+          "name": "手机 · 子 Agent 观察台",
+          "key": "subagents",
+          "support": {
+            "claude": "yes",
+            "codex": "no",
+            "opencode": "no",
+            "openclaw": "no",
+            "kimi": "no",
+            "workbuddy": "no",
+            "zcode": "no",
+            "dsh": "no"
+          }
+        }
+      ]
+    }
+  ]
+}
