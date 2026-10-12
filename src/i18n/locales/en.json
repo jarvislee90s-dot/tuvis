@@ -22,7 +22,15 @@
     "feature3": "TypeScript - Type safety",
     "feature4": "Tailwind CSS v4 - Modern CSS framework",
     "feature5": "shadcn/ui - Beautiful UI components",
-    "close": "Close"
+    "close": "Close",
+    "updateTo": "Update to v{{version}}",
+    "newVersionDetected": "New version detected: {{version}}",
+    "officialRepo": "Repository",
+    "changelog": "Changelog",
+    "recentUpdates": "What's New",
+    "starMessage": "If Tuvis has helped you, please give it a Star on GitHub — it means a lot to us",
+    "starAction": "Star on GitHub",
+    "starDismiss": "Dismiss banner"
   },
   "theme": {
     "toggle": "Toggle theme"
@@ -730,7 +738,7 @@
     "removeItem": "Remove item",
     "nativeSkills": "Native skills",
     "exclusiveBadge": "Exclusive",
-    "residentBadge": "Resident",
+    "residentBadge": "Res.",
     "switchToToolScopedHint": "Selection includes exclusive resources — consider switching to a tool-scoped preset",
     "activeOn": "Active",
     "saveFailedActive": "This preset is active — turn it off before saving changes",

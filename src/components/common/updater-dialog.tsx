@@ -5,7 +5,8 @@
 //   react-markdown 渲染 + 限高内滚（长 note 不撑爆弹窗）
 // - 预发布角标；「在 GitHub 查看」跳具体 tag 页（html_url，非 /releases/latest）
 // - 自动模式（home 挂载）每次启动检查一次：可用且未被忽略才自动弹；
-//   手动模式（About 挂载）由按钮触发检查，出结果即弹
+//   手动模式（About 挂载）由按钮触发检查——改版后（2026-10-12）检查结果点亮页面
+//   「更新到 vX.Y.Z」主按钮，弹窗由该按钮显式打开（autoOpen 默认仍为开，兼容旧路径）
 // - 图片弱网降级：加载失败显示 alt 文案占位，不露破图
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -29,6 +30,9 @@ import type { UpdateProgress } from "@/lib/updater";
 interface UpdaterDialogProps {
   /** 手动模式（About 挂载）：不自动检查，由手动检查结果驱动弹窗 */
   manualCheck?: boolean;
+  /** 手动模式下检查发现新版本时是否自动弹窗（默认开）。关于页改版（2026-10-12）
+      后改为页面「更新到 vX.Y.Z」主按钮显式打开——传 false 关闭该自动行为 */
+  autoOpen?: boolean;
 }
 
 /** note 内嵌图弱网降级：加载失败显示 alt 文案占位（raw.githubusercontent 时常不可达） */
@@ -87,7 +91,7 @@ const markdownComponents = {
   img: ({ src, alt }: { src?: string; alt?: string }) => <NotesImage src={src} alt={alt} />,
 };
 
-export function UpdaterDialog({ manualCheck = false }: UpdaterDialogProps) {
+export function UpdaterDialog({ manualCheck = false, autoOpen = true }: UpdaterDialogProps) {
   // 该组件消费 store 全部状态字段（弹窗判定/下载进度/忽略版本），整库订阅最直白；
   // 动作引用恒定，不会带来多余渲染
   const {
@@ -132,10 +136,11 @@ export function UpdaterDialog({ manualCheck = false }: UpdaterDialogProps) {
 
   // 手动模式：检查结束出结果即弹（无更新时由 useManualUpdateCheck 显示行内提示）。
   // checking 再变 true 时复位一次性标记：同一会话内再次手动检查发现新版本仍要弹
-  // （评审 I5：ref 不复位会让第二次检查完全无反馈）
+  // （评审 I5：ref 不复位会让第二次检查完全无反馈）。
+  // autoOpen=false（关于页改版）：mount 自动检查只点亮页面主按钮，弹窗交由点击显式打开
   const manualCompletedRef = useRef(false);
   useEffect(() => {
-    if (!manualCheck) return;
+    if (!manualCheck || !autoOpen) return;
     if (checking) {
       manualCompletedRef.current = false;
       return;
@@ -143,7 +148,7 @@ export function UpdaterDialog({ manualCheck = false }: UpdaterDialogProps) {
     if (manualCompletedRef.current || !result) return;
     manualCompletedRef.current = true;
     if (result.status === "available") openDialog();
-  }, [manualCheck, checking, result, openDialog]);
+  }, [manualCheck, autoOpen, checking, result, openDialog]);
 
   // note 限高滚动提示：内容超出可视高度才显示
   const notesRef = useRef<HTMLDivElement>(null);

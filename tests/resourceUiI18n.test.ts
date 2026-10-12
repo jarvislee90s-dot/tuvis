@@ -35,4 +35,9 @@ describe("资源管理页 UI 改版 i18n 新键（zh/en 双语在场）", () => 
     expect(Boolean((zh.presets as Record<string, string>)[key])).toBe(true);
     expect(Boolean((en.presets as Record<string, string>)[key])).toBe(true);
   });
+
+  it("常驻徽章文案宽度锁：en 为短式 Res.（56px 工具列不溢出），zh 保持「常驻」", () => {
+    expect(zh.presets.residentBadge).toBe("常驻");
+    expect(en.presets.residentBadge).toBe("Res.");
+  });
 });
