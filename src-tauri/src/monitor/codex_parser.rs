@@ -476,6 +476,51 @@ fn phase1_match(
 // Phase 2 旧聚合链（unclaimed_app_parsed / fresh_unclaimed_files / aggregate_app_sessions）
 // 已随 APP 存储迁移 SQLite 退役（2026-09-10），由 codex_thread_parser 双库产出 APP 卡
 
+/// rollout 尾部 `turn_context.approval_policy` 读回（Task 6a / T0.5 定案：
+/// app-server RPC 读回族全族不暴露档位，**唯一可靠真源 = rollout 文件层**——
+/// T0.2 载体②已证 `turn_context.approval_policy` 逐回合精确跟随 resume/turn
+/// 参数，尾窗内**最后一条** turn_context 即线程当前生效档）。消费方 =
+/// `inject::headless::codex_app::policy_readback`（GET /session-mode 的 codex
+/// APP current 与 POST 切档核对三态**共此一真源**）。
+///
+/// 语义：尾窗（[`RECENT_LINES`]）内最后一条 `turn_context` 为准——更旧回合的
+/// 档位不作数；其 `payload.approval_policy`：
+/// - 字符串 → 原词（trim；与 `codex_app::AppApprovalPolicy` 的 wire 词同词表，
+///   大小写/空白宽容由解析侧处理，这里原样上报）；
+/// - granular 结构化对象（2026-10 实测在档形态）→ 标记词 `"granular"`
+///   （不可映射三枚举——如实上报不猜内容）；
+/// - `null`（config 默认档回合）/ 缺场 / 未知形态 → None（「读不到」口径——
+///   调用方保守降级 current=null，**不猜默认档**）。
+///
+/// 无 turn_context 记录 / 文件不可读 → None。
+pub(crate) fn rollout_tail_approval_policy(jsonl_path: &Path) -> Option<String> {
+    let recent = read_recent_lines(jsonl_path, RECENT_LINES);
+    for line in recent.iter().rev() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("turn_context") {
+            continue;
+        }
+        // 倒扫首条 turn_context = 文件序最后一条——立即定格，不回看更旧回合
+        return v.get("payload").and_then(turn_context_approval_word);
+    }
+    None
+}
+
+/// `turn_context.payload.approval_policy` 的词提取（形态纪律见上）
+fn turn_context_approval_word(payload: &serde_json::Value) -> Option<String> {
+    match payload.get("approval_policy")? {
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        }
+        // granular 结构化变体（实测形态：{"granular":{…}}）——标记词上报，不猜内容
+        serde_json::Value::Object(m) if m.contains_key("granular") => Some("granular".to_string()),
+        _ => None, // null（默认档回合）/ 缺场 / 未知形态 → 读不到口径
+    }
+}
+
 /// 纯内容摘要（L2 缓存产物）：只由文件内容决定，与当前时间 / 进程无关。
 /// last_message 的 100 字符截断是纯内容操作，随摘要一并缓存
 struct CodexFileDigest {
@@ -1624,5 +1669,99 @@ mod scan_budget_tests {
         assert_eq!(second.len(), 1);
         assert_eq!(first[0].id, second[0].id);
         assert_eq!(first[0].project_path, second[0].project_path);
+    }
+}
+
+/// Task 6a（T0.5 定案）：rollout 尾部 turn_context.approval_policy 读回的形态纪律
+#[cfg(test)]
+mod rollout_policy_tests {
+    use super::*;
+
+    fn turn_context(policy_json: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-10-12T00:00:00Z","ordinal":1,"type":"turn_context","payload":{{"turn_id":"t1","cwd":"/w","approval_policy":{policy_json}}}}}"#
+        )
+    }
+
+    fn write_rollout(dir: &Path, lines: &[String]) -> PathBuf {
+        let path =
+            dir.join("rollout-2026-10-12T00-00-00-01a0cbc4-d55e-7c01-a308-d6c6bf87d297.jsonl");
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    /// 尾窗内**最后一条** turn_context 胜出（T0.2 实证序列：on-request → never，
+    /// 当前生效档 = never）——中间夹的语义条目（user/assistant）不干扰
+    #[test]
+    fn rollout_tail_policy_takes_last_turn_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = write_rollout(
+            tmp.path(),
+            &[
+                r#"{"timestamp":"2026-10-12T00:00:01Z","ordinal":0,"type":"session_meta","payload":{"id":"s1","cwd":"/w"}}"#.to_string(),
+                turn_context("\"on-request\""),
+                r#"{"timestamp":"2026-10-12T00:00:03Z","ordinal":2,"type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#.to_string(),
+                r#"{"timestamp":"2026-10-12T00:00:04Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#.to_string(),
+                turn_context("\"never\""),
+            ],
+        );
+        assert_eq!(
+            rollout_tail_approval_policy(&f).as_deref(),
+            Some("never"),
+            "最后一条 turn_context 的档位 = 当前生效档"
+        );
+    }
+
+    /// null（config 默认档回合）/ 字段缺场 → None（保守「读不到」，不猜默认档）
+    #[test]
+    fn rollout_tail_policy_null_or_absent_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = write_rollout(tmp.path(), &[turn_context("null")]);
+        assert_eq!(
+            rollout_tail_approval_policy(&f),
+            None,
+            "null 档 = 读不到口径"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let f = write_rollout(
+            tmp.path(),
+            &[r#"{"timestamp":"2026-10-12T00:00:00Z","ordinal":1,"type":"turn_context","payload":{"turn_id":"t1","cwd":"/w"}}"#.to_string()],
+        );
+        assert_eq!(rollout_tail_approval_policy(&f), None, "字段缺场 = 读不到");
+    }
+
+    /// granular 结构化对象（2026-10 实测在档形态）→ 标记词（不可映射三枚举，不猜内容）
+    #[test]
+    fn rollout_tail_policy_granular_object_reports_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = write_rollout(
+            tmp.path(),
+            &[turn_context(r#"{"granular":{"sandbox_approve":"never"}}"#)],
+        );
+        assert_eq!(
+            rollout_tail_approval_policy(&f).as_deref(),
+            Some("granular"),
+            "结构化档如实上报标记词"
+        );
+    }
+
+    /// 无 turn_context 记录 / 文件不可读 → None（旧会话与极新线程的降级面）
+    #[test]
+    fn rollout_tail_policy_missing_records_or_file_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = write_rollout(
+            tmp.path(),
+            &[r#"{"timestamp":"2026-10-12T00:00:01Z","ordinal":0,"type":"session_meta","payload":{"id":"s1","cwd":"/w"}}"#.to_string()],
+        );
+        assert_eq!(
+            rollout_tail_approval_policy(&f),
+            None,
+            "无 turn_context 记录"
+        );
+        assert_eq!(
+            rollout_tail_approval_policy(&tmp.path().join("missing.jsonl")),
+            None,
+            "文件不可读"
+        );
     }
 }

@@ -19127,15 +19127,18 @@ mod tests {
             "{body}"
         );
     }
-    // ==== Task 3（2026-10-12 P0）：codex APP 止血门——三写入口 409 app_form_pending ====
+    // ==== Task 3（2026-10-12 P0）→ Task 6a（2026-10-12 P1 翻转）：codex APP 模式族 ====
     //
-    // 根因①（设计 §1）：codex APP（ChatGPT 桌面 GUI）无控制台，模式/权限/问答写动作
-    // 仍走 CLI 终端键序通道 = 错误通道（真机 AttachConsole 0x80070006、「零投递」）。
-    // 止血门 = 协议臂（Task 6a/6b）落地前的明确拒绝，判据单点 = `api::codex_app_form`
-    // （tool=codex ∧ form=App）。**GET 类端点不受门**（读侧正常是设计 §3.1 原则 3，
-    // 用例 get_mode_and_menu_read_not_gated_for_app_form 钉住）；**CLI 形态零变化**
-    // （原则 1「CLI 版固化」，用例 codex_cli_mode_and_question_pass_through_unchanged
-    // 钉住）。
+    // 根因①（设计 §1）：codex APP（ChatGPT 桌面 GUI）无控制台，CLI 终端键序通道对 APP
+    // 是错误通道（真机 AttachConsole 0x80070006、「零投递」）。Task 3 止血门 = 三写入口
+    // 409 app_form_pending；**6a 翻转模式两入口**——switch 走协议切档臂（codex_app 客户端，
+    // T0.1/2/5 定案）、menu 如实拒「无菜单通道」（键序单选是 CLI 屏上编号机制，不新增
+    // 菜单能力）；question 入口的 409 保留（翻转归 Task 6b）。判据单点 = api::codex_app_form。
+    // **GET 类不受门**（读侧正常，get_mode_and_menu_read_not_gated_for_app_form 钉住——
+    // 6a 起载荷带 surface/degraded）；**CLI 形态零变化**
+    // （codex_cli_mode_and_question_pass_through_unchanged 钉住）；H3 同门
+    // （h3_gate_blocks_app_switch_menu_but_not_get 钉住）；协议臂执行经
+    // codex_app::test_hooks 缝注入（零真实进程零真实 ~/.codex）。
 
     /// 止血门夹具：N 个 codex 会话（指定进程形态）+ 缺省缝（无对话框/无屏读/无靶向
     /// 证据——与 [`mode_guard_state`] 同口径）。`inj_sess` 缺省 Cli，形态在此覆写
@@ -19178,55 +19181,428 @@ mod tests {
         state
     }
 
-    /// ① 切档入口（session-mode/switch）：codex APP 会话 → 409 `app_form_pending` +
-    /// reason 引导 + **零注入**（门在屏读与注入之前——键序对 APP 是错误通道）
+    /// 6a 夹具：协议臂帧构造（裸方言——响应帧无 jsonrpc 字段；与
+    /// `codex_app::parse_frame` 同判据）。测试钩子的 spawn 规格同置于此。
+    fn app_frame(id: u64, result: &str) -> String {
+        format!(r#"{{"id":{id},"result":{result}}}"#)
+    }
+
+    fn app_frame_err(id: u64, code: i64, msg: &str) -> String {
+        format!(r#"{{"id":{id},"error":{{"code":{code},"message":"{msg}"}}}}"#)
+    }
+
+    fn app_turn_completed(status: &str) -> String {
+        format!(
+            r#"{{"method":"turn/completed","params":{{"turn":{{"id":"turn-1","status":"{status}","durationMs":42}}}}}}"#
+        )
+    }
+
+    /// 协议臂成功回合脚本（initialize → resume → turn/start 受理 → turn/completed）
+    fn app_switch_script() -> Vec<String> {
+        vec![
+            app_frame(1, r#"{"userAgent":"codex-tui/0.162.1"}"#),
+            app_frame(2, r#"{"status":{"type":"idle"}}"#),
+            app_frame(
+                3,
+                r#"{"turnId":"turn-1","turn":{"id":"turn-1","status":"inProgress"}}"#,
+            ),
+            app_turn_completed("completed"),
+        ]
+    }
+
+    /// 测试钩子的 spawn 规格（codex 在场形态——真实 argv 形状由 codex_app 单测钉值）
+    fn app_hook_spec() -> crate::inject::headless::codex_app::SpawnSpec {
+        crate::inject::headless::codex_app::SpawnSpec {
+            argv: vec!["codex".to_string(), "app-server".to_string()],
+        }
+    }
+
+    /// ① 切档入口（Task 6a 翻转）：POST /session-mode/switch 对 codex APP 会话走
+    /// **协议臂**（H3 已开）——200 + `status:"app_switch"` + 核对三态载荷
+    /// （hit/mismatch/ineffective；读回真源 = rollout 经 test_hooks 缝注入，T0.5）。
+    /// **mismatch 腿 = 前端「不采信本地记忆、重拉 GET」的后端依据**（Task 8 消费）。
+    /// 发出的帧带 `turn/start.approvalPolicy`（T0.2 主载体①；极小输入必填）。
     #[tokio::test]
-    async fn mode_switch_rejects_codex_app_form_with_409() {
-        let fake = FakeInjector::ok();
+    async fn codex_app_mode_switch_routes_to_protocol_arm() {
+        let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
+            .lock()
+            .await;
+        let tid = "01a60001-0000-4000-8000-000000000001";
         let state = codex_form_state(
-            fake.clone(),
+            FakeInjector::ok(),
             crate::session::ProcessForm::App,
-            &[("sess_app_sw", 61)],
+            &[(tid, 61)],
         );
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
         persist_named_device(&state, "mm", "测试设备");
+        let app = router(state);
+        for (readback, verify_word, verified, readback_json) in [
+            (Some("never"), "hit", "true", None),
+            (
+                Some("on-request"),
+                "mismatch",
+                "false",
+                Some(r#""readback":"on-request""#),
+            ),
+            (None, "ineffective", "false", None),
+        ] {
+            crate::inject::headless::codex_app::test_hooks::set(
+                Some(app_hook_spec()),
+                vec![app_switch_script()],
+                readback.map(str::to_string),
+            );
+            let r = app
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    "/m/api/v1/session-mode/switch",
+                    Some("mam_device=mm"),
+                    Some(&format!(r#"{{"sessionId":"{tid}","target":"never"}}"#)),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200, "协议臂回执（verify={verify_word}）");
+            let body = body_string(r).await;
+            assert!(
+                body.contains(r#""status":"app_switch""#),
+                "409 止血门已翻转（verify={verify_word}）：{body}"
+            );
+            assert!(
+                !body.contains("app_form_pending"),
+                "翻转后不再回 app_form_pending：{body}"
+            );
+            assert!(
+                body.contains(&format!(r#""verify":"{verify_word}""#)),
+                "核对三态字段（verify={verify_word}）：{body}"
+            );
+            assert!(
+                body.contains(&format!(r#""verified":{verified}"#)),
+                "verified 随三态（verify={verify_word}）：{body}"
+            );
+            assert!(
+                body.contains(r#""policy":"never""#),
+                "请求档随回执透出：{body}"
+            );
+            if let Some(expect) = readback_json {
+                assert!(
+                    body.contains(expect),
+                    "mismatch 腿透出实际读回（前端不采信本地记忆的依据）：{body}"
+                );
+            }
+        }
+        // 主载体①帧断言：最后一腿发出的帧含 turn/start.approvalPolicy=never + 极小输入
+        let frames = crate::inject::headless::codex_app::test_hooks::sent_frames();
+        let last = frames.last().expect("三腿各 spawn 一枚实例");
+        assert!(
+            last.iter().any(|f| {
+                f.contains(r#""method":"turn/start""#) && f.contains(r#""approvalPolicy":"never""#)
+            }),
+            "档位挂在 turn/start（T0.2 主载体①）：{last:?}"
+        );
+        crate::inject::headless::codex_app::test_hooks::clear();
+    }
+
+    /// ② 活跃线程如实拒（T0.1 决定性负结论：裸/daemon 两腿对 APP 持有线程皆 -32600，
+    /// 协议层无 takeover 门）：回执 200 failed + 钉句（`ACTIVE_THREAD_WRITE_REASON`）
+    /// + code 旗标词；**零 turn/start**（resume 步即拒）；审计 refused 旗标词可查。
+    #[tokio::test]
+    async fn mode_switch_active_thread_honest_refusal() {
+        let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
+            .lock()
+            .await;
+        let tid = "01a60007-0000-4000-8000-000000000007";
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::App,
+            &[(tid, 67)],
+        );
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        crate::inject::headless::codex_app::test_hooks::set(
+            Some(app_hook_spec()),
+            vec![vec![
+                app_frame(1, r#"{"userAgent":"codex-tui/0.162.1"}"#),
+                app_frame_err(2, -32600, "thread 01a60007 already has an active writer"),
+            ]],
+            None,
+        );
+        let r = router(state.clone())
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/switch",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{tid}","target":"never"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            body.contains("会话正被 APP 使用，请关闭 APP 后重试或在 APP 内操作"),
+            "钉句如实拒（不假装可写）：{body}"
+        );
+        assert!(
+            body.contains(r#""code":"active_thread_write_unavailable""#),
+            "旗标词供程序分诊：{body}"
+        );
+        assert!(body.contains(r#""status":"failed""#), "{body}");
+        // 零 turn/start：唯一实例只发过 initialize + thread/resume（resume 即被锁拒）
+        let frames = crate::inject::headless::codex_app::test_hooks::sent_frames();
+        assert_eq!(frames.len(), 1, "一次拒绝 = 一枚实例（不起第二载体回合）");
+        assert!(
+            frames[0]
+                .iter()
+                .any(|f| f.contains(r#""method":"thread/resume""#)),
+            "{frames:?}"
+        );
+        assert!(
+            !frames[0].iter().any(|f| f.contains("turn/start")),
+            "锁拒后零回合（不烧 token）：{frames:?}"
+        );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 5));
+        assert!(
+            audits[0]
+                .result
+                .starts_with("refused:active_thread_write_unavailable"),
+            "审计如实（可查）：{:?}",
+            audits[0].result
+        );
+        crate::inject::headless::codex_app::test_hooks::clear();
+    }
+
+    /// ②'（review I1）：`-32601` 方法缺席 → 兜底腿 **resume-only**——只
+    /// `thread/resume {approvalPolicy}`（档位随 resume 持久化、后续回合生效），
+    /// 不起 turn/start；回执 verify=ineffective（**语义性**：本回合无新 turn_context，
+    /// 与读回缝无关——缝故意给「命中值」仍必须 ineffective）+ carrier=resumeOnly +
+    /// hint 注明持久化语义；审计 ineffective 可查。
+    #[tokio::test]
+    async fn mode_switch_fallback_resume_only_on_method_unavailable() {
+        let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
+            .lock()
+            .await;
+        let tid = "01a60009-0000-4000-8000-000000000009";
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::App,
+            &[(tid, 69)],
+        );
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        // 主载体实例：initialize → resume 放行 → turn/start -32601（方法缺席）；
+        // 兜底实例：initialize → resume（携档）→ 即收尾（无 turn/start 帧）
+        crate::inject::headless::codex_app::test_hooks::set(
+            Some(app_hook_spec()),
+            vec![
+                vec![
+                    app_frame(1, r#"{"userAgent":"codex-tui/0.162.1"}"#),
+                    app_frame(2, r#"{"status":{"type":"idle"}}"#),
+                    app_frame_err(3, -32601, "Method not found: turn/start"),
+                ],
+                vec![
+                    app_frame(1, r#"{"userAgent":"codex-tui/0.162.1"}"#),
+                    app_frame(2, r#"{"status":{"type":"idle"}}"#),
+                ],
+            ],
+            // 缝故意给「命中值」：resume-only 不查读回——verify 必须仍是 ineffective
+            Some("never".to_string()),
+        );
+        let r = router(state.clone())
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/switch",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{tid}","target":"never"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            body.contains(r#""status":"app_switch""#),
+            "兜底腿也是协议臂回执：{body}"
+        );
+        assert!(
+            body.contains(r#""verify":"ineffective""#),
+            "语义性 ineffective（本回合无新档位回合记录）：{body}"
+        );
+        assert!(
+            body.contains(r#""carrier":"resumeOnly""#),
+            "兜底载体可分诊：{body}"
+        );
+        assert!(
+            body.contains("档位已随 resume 持久化，下一回合生效"),
+            "持久化语义注明（review I1 措辞）：{body}"
+        );
+        assert!(
+            !body.contains("回合完成通知未观测到"),
+            "resume-only 无回合——不得误加「在途」后缀：{body}"
+        );
+        // 持久化语义断言：兜底实例（第二枚 spawn）只发 initialize + 携档 resume
+        let frames = crate::inject::headless::codex_app::test_hooks::sent_frames();
+        assert_eq!(frames.len(), 2, "主载体 + 兜底各一枚实例：{frames:?}");
+        assert!(
+            frames[1]
+                .iter()
+                .any(|f| f.contains(r#""method":"thread/resume""#)
+                    && f.contains(r#""approvalPolicy":"never""#)),
+            "档位随 resume 持久化（线程级）：{frames:?}"
+        );
+        assert!(
+            !frames[1].iter().any(|f| f.contains("turn/start")),
+            "兜底腿零 turn/start（不白付回合）：{frames:?}"
+        );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 5));
+        assert!(
+            audits[0].result.starts_with("ineffective"),
+            "审计 ineffective 可查：{}",
+            audits[0].result
+        );
+        crate::inject::headless::codex_app::test_hooks::clear();
+    }
+
+    /// 「-32601 时不重试 turn/start」钉值（review I1 防回归面）：兜底绝不**再次**起
+    /// turn/start——全实例 turn/start 帧总数恰为 1（仅主载体那次失败尝试）。
+    /// 若有人把兜底改回全形态 Resume（或重试主载体），此断言即红（白付一次回合成本）。
+    #[tokio::test]
+    async fn fallback_on_32601_never_restarts_turn_start() {
+        let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
+            .lock()
+            .await;
+        let tid = "01a6000a-0000-4000-8000-00000000000a";
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::App,
+            &[(tid, 70)],
+        );
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        crate::inject::headless::codex_app::test_hooks::set(
+            Some(app_hook_spec()),
+            vec![
+                vec![
+                    app_frame(1, r#"{"userAgent":"codex-tui/0.162.1"}"#),
+                    app_frame(2, r#"{"status":{"type":"idle"}}"#),
+                    app_frame_err(3, -32601, "Method not found: turn/start"),
+                ],
+                vec![
+                    app_frame(1, r#"{"userAgent":"codex-tui/0.162.1"}"#),
+                    app_frame(2, r#"{"status":{"type":"idle"}}"#),
+                ],
+            ],
+            None,
+        );
         let r = router(state)
             .oneshot(req(
                 "POST",
                 "/m/api/v1/session-mode/switch",
                 Some("mam_device=mm"),
-                Some(r#"{"sessionId":"sess_app_sw","target":"plan","group":"mode"}"#),
+                Some(&format!(r#"{{"sessionId":"{tid}","target":"never"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let frames = crate::inject::headless::codex_app::test_hooks::sent_frames();
+        let turn_starts: usize = frames
+            .iter()
+            .flat_map(|inst| inst.iter())
+            .filter(|f| f.contains("turn/start"))
+            .count();
+        assert_eq!(
+            turn_starts, 1,
+            "turn/start 只许主载体尝试一次；兜底不得再起（全实例帧：{frames:?}）"
+        );
+        crate::inject::headless::codex_app::test_hooks::clear();
+    }
+
+    /// 6a-spec Minor 1：APP 面 + MamMode 词（如 plan——过得了双词表门）→ 409
+    /// no_mechanism + 审计 refused:no_mechanism（CLI 四档与协议三档不同构，硬译会说
+    /// 谎）；零 spawn（词表拒绝先于一切 spawn）。
+    #[tokio::test]
+    async fn mode_switch_app_form_mam_mode_word_refused() {
+        let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
+            .lock()
+            .await;
+        let tid = "01a6000b-0000-4000-8000-00000000000b";
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::App,
+            &[(tid, 72)],
+        );
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        // 钩子给满脚本——词表拒绝若误走到 spawn，会消费脚本并在此暴露
+        crate::inject::headless::codex_app::test_hooks::set(
+            Some(app_hook_spec()),
+            vec![app_switch_script()],
+            Some("never".to_string()),
+        );
+        let r = router(state.clone())
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/switch",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{tid}","target":"plan"}}"#)),
             ))
             .await
             .unwrap();
         assert_eq!(r.status(), 409);
         let body = body_string(r).await;
-        assert!(body.contains("\"error\":\"app_form_pending\""), "{body}");
         assert!(
-            body.contains("请在 APP 内操作"),
-            "reason 走既有错误载荷形态（引导文案在场）：{body}"
+            body.contains(r#""error":"no_mechanism""#),
+            "MamMode 词对协议面无载体——如实拒：{body}"
         );
+        assert!(body.contains("仅支持"), "回执给三档词表引导：{body}");
+        let frames = crate::inject::headless::codex_app::test_hooks::sent_frames();
         assert!(
-            fake.recorded().is_empty() && fake.recorded_keys().is_empty(),
-            "止血门零注入（键序不进 APP 的错误通道）：{body}"
+            frames.is_empty(),
+            "词表拒绝零 spawn（未付任何协议成本）：{frames:?}"
         );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 5));
+        assert!(
+            audits[0].result.starts_with("refused:no_mechanism"),
+            "审计如实：{}",
+            audits[0].result
+        );
+        crate::inject::headless::codex_app::test_hooks::clear();
     }
 
-    /// ② 菜单入口（session-mode/menu，open 与 pick 两动作同门）：codex APP → 409
-    /// `app_form_pending` + 零注入（门先于靶向闸与守卫探测——APP 无屏可读）
+    /// ③ 菜单入口（Task 6a 翻转）：menu 两动作（open/pick）对 APP 会话 = 无菜单通道
+    /// 如实拒——键序单选是 CLI 终端机制（编号 = 屏上实读值，APP 无屏可读），**不新增
+    /// 菜单能力**（切档入口 = switch 端点协议臂）。409 no_mechanism + 引导文案；
+    /// 零注入；审计 refused:app_no_menu_channel。
     #[tokio::test]
-    async fn mode_menu_rejects_codex_app_form_with_409() {
+    async fn mode_menu_app_form_no_menu_channel() {
         let fake = FakeInjector::ok();
-        let state = codex_form_state(
-            fake.clone(),
-            crate::session::ProcessForm::App,
-            &[("sess_app_mn", 62)],
-        );
+        let tid = "01a60002-0000-4000-8000-000000000002";
+        let state = codex_form_state(fake.clone(), crate::session::ProcessForm::App, &[(tid, 62)]);
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
         persist_named_device(&state, "mm", "测试设备");
-        let app = router(state);
+        let app = router(state.clone());
         for (payload, tag) in [
-            (r#"{"sessionId":"sess_app_mn","action":"open"}"#, "open"),
             (
-                r#"{"sessionId":"sess_app_mn","action":"pick","number":1}"#,
+                format!(r#"{{"sessionId":"{tid}","action":"open"}}"#),
+                "open",
+            ),
+            (
+                format!(r#"{{"sessionId":"{tid}","action":"pick","number":1}}"#),
                 "pick",
             ),
         ] {
@@ -19236,22 +19612,41 @@ mod tests {
                     "POST",
                     "/m/api/v1/session-mode/menu",
                     Some("mam_device=mm"),
-                    Some(payload),
+                    Some(&payload),
                 ))
                 .await
                 .unwrap();
             assert_eq!(r.status(), 409, "{tag}");
             let body = body_string(r).await;
             assert!(
-                body.contains("\"error\":\"app_form_pending\""),
-                "{tag}: {body}"
+                body.contains(r#""error":"no_mechanism""#),
+                "{tag}: 菜单对 APP 是无机制面：{body}"
             );
-            assert!(body.contains("请在 APP 内操作"), "{tag}: {body}");
+            assert!(
+                body.contains("APP 会话无菜单通道"),
+                "{tag}: 引导走协议切档：{body}"
+            );
+            assert!(
+                !body.contains("app_form_pending"),
+                "{tag}: 止血门已翻转：{body}"
+            );
         }
         assert!(
             fake.recorded().is_empty() && fake.recorded_keys().is_empty(),
-            "两动作均零注入"
+            "两动作零注入"
         );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 5));
+        assert_eq!(audits.len(), 2, "两动作各落一行审计");
+        for a in &audits {
+            assert_eq!(a.action, "mode", "action 沿用既有词");
+            assert!(
+                a.result.starts_with("refused:app_no_menu_channel"),
+                "{}",
+                a.result
+            );
+        }
     }
 
     /// ③ 问答作答入口（session-question/answer）：问答在场 ∧ codex APP → 409
@@ -19407,53 +19802,339 @@ mod tests {
         );
     }
 
-    /// 审计如实（设计 §7 P0 / M20）：三入口的 409 各落一行审计——action 沿用既有词
-    /// （mode/mode/answer）、result=`refused:app_form_pending`、行携带 session_id
-    /// （「开发中」状态对账本可查）。
+    /// ④ GET 的 APP 面（Task 6a / T0.5）：`surface:"app"` + `degraded` 字段在场（6a 恒
+    /// null——赋值来源归 Task 7 的 ProbeCache 探测，字段名与 Task 7/8 钉死同名）+
+    /// 权限组 `current` 来自 rollout 读回（currentSource="rollout"）；读不到 →
+    /// current=null（保守降级「模式未知，请人工核对 APP」）；模式组无协议载体 → null。
+    #[tokio::test]
+    async fn get_session_mode_app_surface_and_readback_current() {
+        let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
+            .lock()
+            .await;
+        let tid = "01a60003-0000-4000-8000-000000000003";
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::App,
+            &[(tid, 63)],
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state);
+        // 读到腿：rollout 尾部 approval_policy = never → 权限组 current="never"
+        crate::inject::headless::codex_app::test_hooks::set(
+            None,
+            Vec::new(),
+            Some("never".to_string()),
+        );
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-mode?session_id={tid}"),
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            body.contains(r#""surface":"app""#),
+            "surface 单点下发（app 面）：{body}"
+        );
+        assert!(
+            body.contains(r#""degraded":null"#),
+            "degraded 在场（6a 恒 null；Task 7 赋值来源）：{body}"
+        );
+        assert!(
+            body.contains(r#""currentSource":"rollout""#),
+            "权限组 current 来源 = rollout 读回（T0.5 定案真源）：{body}"
+        );
+        assert!(
+            body.contains(r#""current":"never""#),
+            "current = rollout 尾部 approval_policy 原词：{body}"
+        );
+        assert!(
+            body.contains(r#""currentLabel":"全自动""#),
+            "读回词的展示标签（never=全自动，T0.2 映射建议）：{body}"
+        );
+        // 读不到腿：current=null（保守降级——「模式未知，请人工核对 APP」由前端渲染）
+        crate::inject::headless::codex_app::test_hooks::set(None, Vec::new(), None);
+        let r = app
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-mode?session_id={tid}"),
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            !body.contains("rollout"),
+            "读不到 → 无 rollout 来源（current=null 保守降级）：{body}"
+        );
+        assert!(body.contains(r#""surface":"app""#), "{body}");
+        crate::inject::headless::codex_app::test_hooks::clear();
+    }
+
+    /// ⑤ GET 的 CLI 面：`surface:"terminal"` + `degraded:null`（全部 CLI 会话与其余
+    /// 工具的终端交互面——surface 由后端单点下发，防前端复制分派逻辑成第二真相源）
+    #[tokio::test]
+    async fn get_session_mode_cli_surface_terminal() {
+        let tid = "01a60004-0000-4000-8000-000000000004";
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::Cli,
+            &[(tid, 71)],
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let r = router(state)
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-mode?session_id={tid}"),
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            body.contains(r#""surface":"terminal""#),
+            "CLI 载荷 surface=terminal：{body}"
+        );
+        assert!(
+            body.contains(r#""degraded":null"#),
+            "terminal 形态 degraded 恒 null：{body}"
+        );
+        assert!(
+            !body.contains(r#""surface":"app""#),
+            "CLI 会话不落 app 面：{body}"
+        );
+    }
+
+    /// ⑥ 协议臂审计词（设计 §3.4 审计口径）：channel 列按实际走向记 `codex_appserver`
+    /// （**不动 HeadlessKind 路由枚举**——发送路由与动作分派两概念不搅）、action 沿用
+    /// 既有词 `mode`、result 带核对终态（hit → ok）与回合耗时。
+    #[tokio::test]
+    async fn mode_switch_audit_word_is_codex_appserver() {
+        let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
+            .lock()
+            .await;
+        let tid = "01a60005-0000-4000-8000-000000000005";
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::App,
+            &[(tid, 64)],
+        );
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        crate::inject::headless::codex_app::test_hooks::set(
+            Some(app_hook_spec()),
+            vec![app_switch_script()],
+            Some("never".to_string()),
+        );
+        let r = router(state.clone())
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/switch",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{tid}","target":"never"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 5));
+        assert_eq!(audits.len(), 1, "动作恰好一行审计");
+        assert_eq!(audits[0].channel, "codex_appserver", "channel=实际走向");
+        assert_eq!(audits[0].action, "mode", "action 沿用既有词");
+        assert_eq!(audits[0].agent_type, "codex");
+        assert_eq!(audits[0].session_id, tid);
+        assert!(
+            audits[0].result.starts_with("ok"),
+            "hit → ok（含耗时编码）：{}",
+            audits[0].result
+        );
+        crate::inject::headless::codex_app::test_hooks::clear();
+    }
+
+    /// ⑦ H3 同门（Task 6a）：开关关 → switch/menu 写路径 403 `headless_disabled`（与
+    /// session_send 同码同文案）、**GET 不进门**（读不是动作——补裁 24a 同理）；
+    /// CLI codex 切档不受门（headless_blocked 对终端路由恒 None——现状不变，M24 面）；
+    /// 开 → 恢复（协议臂接管）。
+    #[tokio::test]
+    async fn h3_gate_blocks_app_switch_menu_but_not_get() {
+        let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
+            .lock()
+            .await;
+        let tid = "01a60006-0000-4000-8000-000000000006";
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::App,
+            &[(tid, 65)],
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        // 关（缺省）：switch / menu open / menu pick → 403（同码同文案）
+        for (payload, tag) in [
+            (
+                format!(r#"{{"sessionId":"{tid}","target":"never"}}"#),
+                "switch",
+            ),
+            (
+                format!(r#"{{"sessionId":"{tid}","action":"open"}}"#),
+                "menu-open",
+            ),
+            (
+                format!(r#"{{"sessionId":"{tid}","action":"pick","number":1}}"#),
+                "menu-pick",
+            ),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    if tag == "switch" {
+                        "/m/api/v1/session-mode/switch"
+                    } else {
+                        "/m/api/v1/session-mode/menu"
+                    },
+                    Some("mam_device=mm"),
+                    Some(&payload),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 403, "{tag}");
+            let body = body_string(r).await;
+            assert!(
+                body.contains(r#""error":"headless_disabled""#),
+                "{tag}: 与 session_send 同码：{body}"
+            );
+        }
+        // GET 不进门（读不是动作）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-mode?session_id={tid}"),
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "GET 不受 H3 门");
+        // CLI codex 切档不受门（终端路由 → headless_blocked 恒 None——既有行为）
+        let cli_state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::Cli,
+            &[("01a60008-0000-4000-8000-000000000008", 68)],
+        );
+        persist_named_device(&cli_state, "mm", "测试设备");
+        let r = router(cli_state)
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/switch",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"01a60008-0000-4000-8000-000000000008","target":"plan","group":"mode"}"#),
+            ))
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = body_string(r).await;
+        assert!(
+            status != 403 && !body.contains("headless_disabled"),
+            "CLI codex 切档不受 H3 门（现状不变）：{status} {body}"
+        );
+        // 开 → 恢复：APP switch 交给协议臂（200 app_switch，不再 403）
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        crate::inject::headless::codex_app::test_hooks::set(
+            Some(app_hook_spec()),
+            vec![app_switch_script()],
+            Some("never".to_string()),
+        );
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/switch",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{tid}","target":"never"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "开关开 → 协议臂接管");
+        let body = body_string(r).await;
+        assert!(body.contains(r#""status":"app_switch""#), "{body}");
+        crate::inject::headless::codex_app::test_hooks::clear();
+    }
+
+    /// 审计如实（Task 3 原版随 6a 翻转改写）：switch（协议臂 ok）/ menu（无菜单通道拒）
+    /// 两行 channel=`codex_appserver`；question 行仍是 app_form_pending（止血门保留，
+    /// 翻转归 Task 6b）——三行 action 沿用既有词（mode/mode/answer）。
     #[tokio::test]
     async fn codex_app_rejections_are_audited() {
+        let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
+            .lock()
+            .await;
         let state = codex_form_state(
             FakeInjector::ok(),
             crate::session::ProcessForm::App,
             &[
-                ("sess_aud_sw", 81),
-                ("sess_aud_mn", 82),
-                ("sess_aud_qa", 83),
+                ("01a61001-0000-4000-8000-000000000001", 81),
+                ("01a61002-0000-4000-8000-000000000002", 82),
+                ("01a61003-0000-4000-8000-000000000003", 83),
             ],
         );
         state.store.with(|conn| {
             crate::database::dao::question_wait::mark(
                 conn,
                 "codex",
-                "sess_aud_qa",
+                "01a61003-0000-4000-8000-000000000003",
                 1_000,
                 "等待回答",
                 Some(Q_SINGLE_PAYLOAD),
             )
         });
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
         persist_named_device(&state, "mm", "测试设备");
+        crate::inject::headless::codex_app::test_hooks::set(
+            Some(app_hook_spec()),
+            vec![app_switch_script()],
+            Some("never".to_string()),
+        );
         let app = router(state.clone());
         let posts = [
             (
                 "/m/api/v1/session-mode/switch",
-                r#"{"sessionId":"sess_aud_sw","target":"plan","group":"mode"}"#,
+                r#"{"sessionId":"01a61001-0000-4000-8000-000000000001","target":"never"}"#,
+                200,
             ),
             (
                 "/m/api/v1/session-mode/menu",
-                r#"{"sessionId":"sess_aud_mn","action":"open"}"#,
+                r#"{"sessionId":"01a61002-0000-4000-8000-000000000002","action":"open"}"#,
+                409,
             ),
             (
                 "/m/api/v1/session-question/answer",
-                r#"{"sessionId":"sess_aud_qa","action":"select","index":0}"#,
+                r#"{"sessionId":"01a61003-0000-4000-8000-000000000003","action":"select","index":0}"#,
+                409,
             ),
         ];
-        for (uri, payload) in posts {
+        for (uri, payload, expect) in posts {
             let r = app
                 .clone()
                 .oneshot(req("POST", uri, Some("mam_device=mm"), Some(payload)))
                 .await
                 .unwrap();
-            assert_eq!(r.status(), 409, "{uri}");
+            assert_eq!(r.status(), expect, "{uri}");
         }
         let audits = state
             .store
@@ -19463,13 +20144,23 @@ mod tests {
         assert_eq!(audits[2].action, "mode", "切档审计 action 沿用既有词");
         assert_eq!(audits[1].action, "mode", "菜单审计 action 沿用既有词");
         assert_eq!(audits[0].action, "answer", "问答审计 action 沿用既有词");
+        // 模式两行 = 协议臂词；question 行 = Task 3 止血门形态（6b 翻转）
+        assert_eq!(audits[2].channel, "codex_appserver");
+        assert!(audits[2].result.starts_with("ok"), "{}", audits[2].result);
+        assert_eq!(audits[1].channel, "codex_appserver");
+        assert!(
+            audits[1].result.starts_with("refused:app_no_menu_channel"),
+            "{}",
+            audits[1].result
+        );
+        assert_eq!(
+            audits[0].result, "refused:app_form_pending",
+            "question 入口止血门保留（翻转归 6b）"
+        );
         for a in &audits {
-            assert_eq!(a.result, "refused:app_form_pending", "result 标拒绝码");
             assert_eq!(a.agent_type, "codex");
         }
-        assert_eq!(audits[2].session_id, "sess_aud_sw", "行携带 session_id");
-        assert_eq!(audits[1].session_id, "sess_aud_mn", "行携带 session_id");
-        assert_eq!(audits[0].session_id, "sess_aud_qa", "行携带 session_id");
+        crate::inject::headless::codex_app::test_hooks::clear();
     }
 
     /// GET 类端点不受门（设计 §3.1 原则 3「读侧不动」）：APP 会话的 GET

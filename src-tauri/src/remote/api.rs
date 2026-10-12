@@ -1091,18 +1091,22 @@ fn ambiguous_target_refusal(
     msg
 }
 
-/// ===== codex APP 止血门（Task 3，2026-10-12 P0；设计 §1 根因① / §7 P0 表）=====
+/// ===== codex APP 形态判据（Task 3 止血门引入，2026-10-12；**Task 6a 起为协议臂
+/// 分派判据**——doc 随翻转改写为现状）=====
 ///
-/// codex APP（ChatGPT 桌面 GUI）会话**没有控制台**——模式/权限切换与问答作答的
-/// CLI 键序通道（`shift+tab` / `/permissions` / 数字键 + 屏读闭环）对 APP 是**错误
-/// 通道**：真机实证打键报 `AttachConsole 0x80070006`、屏读「零投递」、问答
-/// `aborted:select`（2026-10-11 Task 15 手工测试四路失败之一）。本门 = 协议臂
-/// （`codex_app.rs`，Task 6a 模式两入口 / Task 6b 问答入口）落地前的止血拒绝：
-/// 命中 ⇒ 三写入口（`session_mode_switch` / `session_mode_menu` /
-/// `session_question_answer`）在任何屏读与注入之前 409 `app_form_pending`。
+/// codex APP（ChatGPT 桌面 GUI）会话**没有控制台**——CLI 键序通道（`shift+tab` /
+/// `/permissions` / 数字键 + 屏读闭环）对 APP 是**错误通道**（真机实证打键报
+/// `AttachConsole 0x80070006`、屏读「零投递」、问答 `aborted:select`——Task 15
+/// 手工测试四路失败之一）。
+///
+/// **现状（Task 6a 后）**：三写入口不再同门——
+/// - `session_mode_switch` / `session_mode_menu` **已翻转协议臂**：switch 走
+///   [`codex_app_mode_switch_arm`]（codex_app 协议切档），menu 如实拒「无菜单通道」；
+/// - `session_question_answer` **保留 Task 3 的 409 `app_form_pending` 止血拒绝**，
+///   翻转为问答补投臂归 Task 6b。
 ///
 /// **判据单点**：`form == App && tool == "codex"`——与 `session_send` 的路由口径、
-/// Task 6a/6b 的翻转点同一判据；翻转协议臂时改本函数（或其调用点）即全端点同步。
+/// Task 6b 的翻转点同一判据；翻转时改各入口的分派调用点即全端点同步。
 /// **GET 类端点不受门**（`session_mode` / `session_mode_menu_read` /
 /// `session_question` 读侧照常——设计 §3.1 原则 3）；**CLI 形态零变化**（原则 1）。
 fn codex_app_form(session: &crate::session::Session) -> bool {
@@ -1191,6 +1195,94 @@ fn headless_disabled_forbidden() -> Response {
             "reason": super::HEADLESS_DISABLED_REASON,
         }),
     )
+}
+
+// ===== codex APP 模式族协议臂（Task 6a，2026-10-12 P1；设计 §3.4/§3.6 + T0.1/2/5 回填）=====
+//
+// Task 3 的 409 止血门在模式两入口（switch/menu）翻转为真协议臂：切档 =
+// `codex app-server` 裸方言客户端（`inject::headless::codex_app`，Task 5）；
+// 菜单（键序单选面板）是 CLI 终端机制，对 APP 如实拒「无菜单通道」；GET /session-mode
+// 下发 `surface`/`degraded`（字段名与 Task 7/8 钉死同名）+ APP 权限组 current 改
+// rollout 读回（T0.5 定案）。问答入口（`session_question_answer`）的翻转归 Task 6b
+// （止血门 409 保留）。
+
+/// codex APP 协议动作的审计 channel 词（设计 §3.4 审计口径：channel 列记**实际走向**
+/// `codex_appserver`——协议路；**不动 `HeadlessKind` 路由枚举**，发送路由与动作分派
+/// 两概念不搅。APP 模式族全部动作行——含投递前拒绝（拒绝也是该臂出的）——同用本词，
+/// 账本上按臂过滤口径唯一）
+const CODEX_APPSERVER_AUDIT_CHANNEL: &str = "codex_appserver";
+
+/// APP 协议臂切档的极小输入（T0.2 主载体代价：`turn/start` 的 `input` 必填 ⇒ 纯切档
+/// 须附一条极小输入 = 一次回合成本。取自述性短句——会话历史里可读出这条回合的来由，
+/// 不留无解释的孤儿回合）
+const CODEX_APP_POLICY_SWITCH_INPUT: &str = "切换审批档位";
+
+/// APP 会话无菜单通道的 reason（menu 端点 APP 分支）：open/pick 的编号是 CLI **屏上
+/// 实读值**，APP 无屏可读——菜单机制整体不适用（不新增菜单能力）；切档入口 =
+/// switch 端点协议臂
+const CODEX_APP_NO_MENU_REASON: &str =
+    "APP 会话无菜单通道——档位切换请用切档（协议通道），其余操作请在 APP 内完成";
+
+/// APP 协议档位三枚举的展示标签（探测报告 §2.5 映射建议：全自动→never、默认→
+/// on-request、安全→untrusted）。与 CLI 权限组四档词表（只读/默认/自动审批/完全信任）
+/// **刻意不互译**——协议面就三档，硬译会说谎（如「自动审批」无协议载体即如实拒）
+fn codex_app_policy_label(
+    policy: crate::inject::headless::codex_app::AppApprovalPolicy,
+) -> &'static str {
+    use crate::inject::headless::codex_app::AppApprovalPolicy;
+    match policy {
+        AppApprovalPolicy::Never => "全自动",
+        AppApprovalPolicy::OnRequest => "默认",
+        AppApprovalPolicy::Untrusted => "安全",
+    }
+}
+
+/// codex APP 协议写动作的 H3 同门（Task 6a；**Task 6b 的 question/cancel 复用**）：
+/// 判据复用 [`headless_blocked`] 单点（路由结论 + 开关——codex APP 形态即无头绑定，
+/// CLI 形态走终端路由天然 `None`），门形与 [`session_send`] **同码同文案**
+/// （403 `{"error":"headless_disabled"}`，不带 reason——session_send 的移动端既有
+/// 契约）。CLI 侧模式不受 H3 是行为变化点仅限 APP 面（M24 回归）。
+fn codex_app_protocol_h3_blocked(
+    st: &Arc<RemoteState>,
+    session: &crate::session::Session,
+) -> Option<Response> {
+    if !codex_app_form(session) {
+        return None;
+    }
+    headless_blocked(st, "codex", session.form, session.pid).map(|_| {
+        json_no_store(
+            StatusCode::FORBIDDEN,
+            serde_json::json!({ "error": "headless_disabled" }),
+        )
+    })
+}
+
+/// codex APP 协议臂的审计单点（channel = [`CODEX_APPSERVER_AUDIT_CHANNEL`]；action
+/// 沿用既有词 `mode`——设计 §3.4「action 词沿用既有」；result 词见各调用处，失败与
+/// 不支持如实透出不谎报成功；duration = 回合收口观测毫秒，投递前拒绝恒 0）
+fn codex_appserver_audit(
+    st: &Arc<RemoteState>,
+    device_id: &str,
+    device_name: &str,
+    session_id: &str,
+    content: &str,
+    result: &str,
+    duration_ms: u64,
+) {
+    audit_headless_ctx(
+        st,
+        &crate::inject::headless::HeadlessAuditCtx {
+            device_id: device_id.to_string(),
+            device_name: device_name.to_string(),
+            agent_type: "codex".to_string(),
+            session_id: session_id.to_string(),
+            channel: CODEX_APPSERVER_AUDIT_CHANNEL.to_string(),
+            content: content.to_string(),
+        },
+        "mode",
+        result,
+        duration_ms,
+    );
 }
 
 // **无头分派过渡码——已删除**（Task 13/C4 收口）。
@@ -9654,6 +9746,10 @@ struct ModeScanHit {
     structure: crate::inject::mode::ModeStructure,
     /// 会话快照（权限轴屏读复用：kimi 权限组 = 底栏、codex = 最新回执行——GET 当前档）
     session: crate::session::Session,
+    /// Task 6a：codex APP 会话的协议读回档（rollout 尾部 `turn_context.approval_policy`
+    /// ——T0.5 定案真源；None = 读不到〔无记录/null/不可读〕→ 前端「模式未知，请人工
+    /// 核对 APP」保守降级）。非 codex-APP 形态恒 None
+    app_policy_readback: Option<String>,
 }
 
 /// 模式扫描（同步，spawn_blocking 内调用）：会话查找 → 结构表 → 屏读（一次）解析
@@ -9671,7 +9767,18 @@ fn mode_scan_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<ModeScanHit
     let structure = crate::inject::mode::mode_structure(&tool);
     let kind = crate::inject::mode::switch_kind(&tool);
     let readback = crate::inject::mode::mode_readback_supported(&tool);
-    let current = read_mode_from_screen(st, &session, &tool, readback);
+    // Task 6a：codex APP 面——无屏可读（AttachConsole 对 GUI 宿主是错误通道），不付
+    // 屏读代价；权限档真源 = rollout 协议读回（同步阻塞——本函数恒在 spawn_blocking
+    // 内调用）；CLI/其余工具照旧屏读（零变化）
+    let (current, app_policy_readback) = if codex_app_form(&session) {
+        let home = (st.home_source)().map(std::path::PathBuf::from);
+        (
+            None,
+            crate::inject::headless::codex_app::policy_readback(home.as_deref(), &session.id),
+        )
+    } else {
+        (read_mode_from_screen(st, &session, &tool, readback), None)
+    };
     Some(ModeScanHit {
         tool,
         current,
@@ -9679,6 +9786,7 @@ fn mode_scan_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<ModeScanHit
         kind,
         structure,
         session,
+        app_policy_readback,
     })
 }
 
@@ -9888,31 +9996,62 @@ pub async fn session_mode(
     // 屏读 None（滚出/形态漂移/无锚）回落「上次切换」记忆，屏读与记忆都无 = null
     let hit_session = hit.session.clone();
     let hit_tool = hit.tool.clone();
+    // Task 6a：交互面单点判定（后端下发 surface，防前端复制分派逻辑成第二真相源——
+    // 设计 §3.2；CLI 会话与其余工具恒 terminal）
+    let app_surface = codex_app_form(&hit.session);
     let groups: Vec<serde_json::Value> = hit
         .structure
         .groups()
         .into_iter()
         .map(|g| {
-            // 组当前档（终审 P1-2：三级回落**带来源**下发）。模式组 current 唯一
-            // 来源 = 屏读（Some 时 "screen"/无 "null"）；权限组 = 屏读（事件行）→
-            // 记忆 → null（spec §3.3），来源随载荷下发——前端「上次切换」标注只对
-            // "memory" 显示（旧判据 `readback === false` 在 readback 全开后不可达）。
-            let (current, current_source) = if g.id == crate::inject::mode::ModeGroupId::Mode {
-                // 模式组：**即时屏读**（2026-10-10 用户实测「切完卡面不高亮」根因——
-                // hit.current 是周期扫描快照，切换后一个扫描周期内读到旧档）。高亮
-                // 跟随要求 GET 反映终端当下状态；读不到 → null（未知如实；模式组
-                // 无记忆回落通道）
-                match read_mode_from_screen(&st, &hit_session, &hit_tool, g.readback) {
-                    Some(m) => (Some(m), "screen"),
-                    None => (None, "null"),
+            // 组当前档（终审 P1-2：三级回落**带来源**下发）。**Task 6a 的 APP 面**
+            //（设计 §3.6 权威源迁移）：模式组无协议载体 → null 如实（「模式未知，请
+            // 人工核对 APP」）；权限组 = rollout 协议读回（T0.5——RPC 全族不暴露档位），
+            // 来源标 "rollout"（与 CLI 的 screen/memory 词表并列，Task 8 前端消费）。
+            // CLI/终端面逻辑零变化：模式组 current 唯一来源 = 屏读（Some 时
+            // "screen"/无 "null"）；权限组 = 屏读（事件行）→ 记忆 → null（spec §3.3）
+            // ——来源随载荷下发，前端「上次切换」标注只对 "memory" 显示。
+            let (current_wire, current_label, current_source) = if app_surface {
+                match (g.id, hit.app_policy_readback.as_deref()) {
+                    (crate::inject::mode::ModeGroupId::Permission, Some(readback)) => {
+                        let label =
+                            crate::inject::headless::codex_app::AppApprovalPolicy::parse(readback)
+                                .map(codex_app_policy_label)
+                                .unwrap_or(readback);
+                        (
+                            Some(readback.to_string()),
+                            Some(label.to_string()),
+                            "rollout",
+                        )
+                    }
+                    // 模式组（无协议载体）/ 读不到 → null（保守降级，不猜默认档）
+                    _ => (None, None, "null"),
                 }
             } else {
-                match read_axis_from_screen(&st, &hit_session, &hit_tool, g.readback, g.id) {
-                    Some(m) => (Some(m), "screen"),
-                    None => match recall_permission_tier(&st.store, &sid) {
-                        Some(m) => (Some(m), "memory"),
-                        None => (None, "null"),
-                    },
+                let current = if g.id == crate::inject::mode::ModeGroupId::Mode {
+                    // 模式组：**即时屏读**（2026-10-10 用户实测「切完卡面不高亮」根因
+                    // ——hit.current 是周期扫描快照，切换后一个扫描周期内读到旧档）。
+                    // 高亮跟随要求 GET 反映终端当下状态；读不到 → null（未知如实；
+                    // 模式组无记忆回落通道）
+                    read_mode_from_screen(&st, &hit_session, &hit_tool, g.readback)
+                        .map(|m| (m, "screen"))
+                } else {
+                    match read_axis_from_screen(&st, &hit_session, &hit_tool, g.readback, g.id) {
+                        Some(m) => Some((m, "screen")),
+                        None => recall_permission_tier(&st.store, &sid).map(|m| (m, "memory")),
+                    }
+                };
+                match current {
+                    Some((m, source)) => {
+                        let label = g
+                            .tiers
+                            .iter()
+                            .find(|t| t.mode == m)
+                            .map(|t| t.label)
+                            .unwrap_or(m.label());
+                        (Some(m.wire().to_string()), Some(label.to_string()), source)
+                    }
+                    None => (None, None, "null"),
                 }
             };
             serde_json::json!({
@@ -9922,10 +10061,11 @@ pub async fn session_mode(
                 "readback": g.readback,
                 // 按钮布局（tiers=逐档钮 / toggle=单钮循环——codex 模式组）
                 "layout": g.layout.wire(),
-                "current": current.map(|m| m.wire()),
-                "currentLabel": current.map(|m| g.tiers.iter().find(|t| t.mode == m).map(|t| t.label).unwrap_or(m.label())),
+                "current": current_wire,
+                "currentLabel": current_label,
                 // 终审 P1-2：current 的来源——"screen"= 屏读 / "memory"= 上次切换
-                // 记忆回落 / "null"= 未知（前端据此决定是否标注「（上次切换）」）
+                // 记忆回落 / "rollout"= APP 协议读回（Task 6a）/ "null"= 未知（前端
+                // 据此决定是否标注「（上次切换）」）
                 "currentSource": current_source,
                 "tiers": g.tiers.iter().map(|t| serde_json::json!({
                     "mode": t.mode.wire(),
@@ -9977,6 +10117,12 @@ pub async fn session_mode(
             // 丁T4 增量：结构 + 两组（旧前端忽略未知字段，零破坏）
             "structure": hit.structure.wire(),
             "groups": groups,
+            // Task 6a：交互面单点下发——"app"= codex APP 协议面 / "terminal"= 终端
+            // 键序面（含全部 CLI 会话与其余工具）；`degraded` = 协议可用性降级原因
+            // 串（None=正常；**赋值来源归 Task 7** 的 ProbeCache 探测——字段名与
+            // Task 7/8 两侧钉死同名，本任务恒 null）
+            "surface": if app_surface { "app" } else { "terminal" },
+            "degraded": serde_json::Value::Null,
         }),
     )
 }
@@ -10231,28 +10377,31 @@ pub async fn session_mode_menu(
         }
     };
     let tool = session.agent_type.tool_id().to_string();
-    // ===== codex APP 止血门（Task 3）=====
-    // 门位 = 会话定位后、靶向闸与守卫探测**之前**（APP 无屏可读——先于一切屏读与
-    // 注入；L13 靶向闸在 CLI 路径才需要）。审计摘要经 [`menu_audit_content`]（与
-    // L13 拒绝臂同一构造）；tool 位恒 codex（判据单点）。
+    // ===== codex APP 分支（Task 6a：Task 3 止血门翻转——菜单键序是 CLI 终端机制）=====
+    // H3 同门在先（写路径与 session_send 同门——读不是动作的 GET 孪生不进门）；菜单
+    // 对 APP 无对应协议面（open/pick 的编号 = 屏上实读值，APP 无屏可读），如实拒 +
+    // 审计（**不新增菜单能力**；切档入口 = switch 端点协议臂）。tool 位恒 codex
+    // （判据单点 codex_app_form）；审计摘要经 [`menu_audit_content`]、channel 走
+    // [`CODEX_APPSERVER_AUDIT_CHANNEL`]（该臂出的拒绝也是协议臂动作行）。
     if codex_app_form(&session) {
+        if let Some(resp) = codex_app_protocol_h3_blocked(&st, &session) {
+            return resp;
+        }
         let audit_content = menu_audit_content();
-        endpoint_audit(
+        codex_appserver_audit(
             &st,
             &device_id,
             &device_name,
-            &tool,
             &sid,
             &audit_content,
-            "mode",
-            APP_FORM_PENDING_AUDIT_RESULT,
+            "refused:app_no_menu_channel",
+            0,
         );
-        // 回执走本端点统一错误壳 [`mode_menu_err`]（error + reason——与
-        // [`app_form_pending_response`] 同形态，端点内不另立响应构造）
+        // 回执走本端点统一错误壳 [`mode_menu_err`]（error + reason 同既有形态）
         return mode_menu_err(
             StatusCode::CONFLICT,
-            APP_FORM_PENDING_CODE,
-            Some(APP_FORM_PENDING_REASON),
+            "no_mechanism",
+            Some(CODEX_APP_NO_MENU_REASON),
         );
     }
     if tool != "codex" {
@@ -10849,6 +10998,308 @@ pub async fn session_mode_menu_read(
     }
 }
 
+/// `session_mode_switch` 会话定位 + CLI 校验的分支产物（Task 6a）：APP 形态在会话
+/// 定位后即分派协议臂（CLI 校验不适用）；CLI 形态携带既有校验产物走终端注入流
+enum ModeLookup {
+    /// codex APP → 协议臂（Task 3 的 409 止血门翻转点；H3 同门在臂前）
+    App(crate::session::Session),
+    /// CLI：会话 + 工具 + 组 + 切换计划 + 回读支持 + 档标签 + 前读档
+    Cli(
+        crate::session::Session,
+        String,
+        crate::inject::mode::ModeGroupId,
+        crate::inject::mode::ModeSwitchPlan,
+        bool,
+        &'static str,
+        Option<crate::inject::mode::MamMode>,
+    ),
+}
+
+/// 协议臂 spawn_blocking 闭包的产出（M2：thread 解析与拒因都在闭包内判定，回执与
+/// 审计统一在 await 之后构造——闭包只判不答）
+enum AppSwitchOutcome {
+    /// thread UUID 解析失败（rollout 文件名与会话号都无 UUID——投递前拒，零 spawn 零回合）
+    InvalidTarget,
+    /// codex CLI 不可达（PATH 扫描空——协议面不可用，不裸 spawn）
+    CliUnreachable,
+    /// 回合终态（成功回执或结构化协议错误，原样上交）
+    Done(
+        Result<
+            crate::inject::headless::codex_app::PolicyWriteReceipt,
+            crate::inject::headless::codex_app::AppServerError,
+        >,
+    ),
+}
+
+/// codex APP 协议切档臂（Task 6a——[`session_mode_switch`] 的 `codex_app_form` 分派）。
+/// 前置（调用点已保证）：H3 门已过、会话已定位、目标词过双词表门。
+///
+/// 流程（判据依赖序，勿随意改）：
+/// 1. **目标档词表**：APP 面 = app-server 三枚举（never/on-request/untrusted）。MamMode
+///    词（plan/bypass/…）对协议面无载体——如实拒（CLI 四档与协议三档语义不同构，硬译
+///    会说谎：如「自动审批」在协议面没有对应档）；
+/// 2. **thread 解析 + 依赖束 + 回合**（三步并进**同一个 `spawn_blocking` 闭包**——
+///    M2：`production_rollout_path` 的 SQLite 只读与 `resolve_thread` 也是同步阻塞，
+///    不占 async 线程；闭包产出「thread-id-或-拒因」枚举，拒绝回执与审计统一在
+///    await 之后构造）：thread UUID（H8 单点
+///    [`crate::inject::headless::codex::resolve_thread`]：rollout 文件名权威 → UUID
+///    形态会话号回退；都无 → 投递前拒，零 spawn 零回合）→ 主载体①
+///    `turn/start.approvalPolicy` + 极小输入（T0.2 主载体）；`-32601` 方法缺席
+///    （版本漂移如实信号）→ 兜底②' **resume-only**（review I1）：只
+///    `thread/resume.approvalPolicy`（线程级持久、后续回合生效），**不再起
+///    turn/start**——方法缺席还起回合 = 白付一次回合成本；
+/// 3. **回执三态**（[`crate::inject::headless::codex_app::PolicyVerify`]：命中/不符/
+///    未生效——不符时前端**不采信本地记忆、重拉 GET**，回执载荷带核对结果字段，
+///    Task 8 消费）。
+///
+/// 活跃线程（APP 持写者 → writer 锁拒，T0.1 决定性负结论：两腿皆 -32600 无 takeover
+/// 门）：如实拒 [`crate::inject::headless::codex_app::ACTIVE_THREAD_WRITE_REASON`] 钉句，
+/// 不假装可写。审计：channel=`codex_appserver`、action=`mode`（沿用既有词）、result
+/// 随实际结局（ok/mismatch/ineffective/refused/failed——失败与不支持如实）。
+async fn codex_app_mode_switch_arm(
+    st: Arc<RemoteState>,
+    device_id: String,
+    device_name: String,
+    session: crate::session::Session,
+    target: String,
+) -> Response {
+    use crate::inject::headless::codex_app::{
+        self, AppApprovalPolicy, PolicyCarrier, PolicyVerify,
+    };
+    let sid = session.id.clone();
+    // 1) 目标档词表（三枚举外如实拒——含 MamMode 词，见函数文档）
+    let Some(policy) = AppApprovalPolicy::parse(&target) else {
+        codex_appserver_audit(
+            &st,
+            &device_id,
+            &device_name,
+            &sid,
+            &format!("切换权限至 {target}"),
+            "refused:no_mechanism",
+            0,
+        );
+        return json_no_store(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "no_mechanism",
+                "reason": "APP 会话切档走协议通道，仅支持 全自动(never) / 默认(on-request) / 安全(untrusted) 三档",
+            }),
+        );
+    };
+    let label = codex_app_policy_label(policy);
+    let audit_content = format!("切换权限至 {label}");
+    // 2)+3) thread 解析 + 依赖束 + 回合——并进同一个 spawn_blocking（M2：
+    // production_rollout_path 的 SQLite 只读与 resolve_thread 也是同步阻塞，不占
+    // async 线程）；闭包产出「thread-id-或-拒因」枚举，拒绝回执与审计统一在
+    // await 之后构造（设备身份与文案留在 api 侧单点）
+    let home = (st.home_source)().map(std::path::PathBuf::from);
+    let deps = codex_app::app_arm_deps(home.as_deref());
+    let arm_sid = sid.clone();
+    let turn = tokio::task::spawn_blocking(move || -> AppSwitchOutcome {
+        // thread UUID（rollout 文件名权威 → UUID 形态会话号回退；都无 → 投递前拒
+        // 零 spawn 零回合）
+        let rollout =
+            crate::inject::headless::codex::production_rollout_path(home.as_deref(), &arm_sid);
+        let Some(tref) =
+            crate::inject::headless::codex::resolve_thread(rollout.as_deref(), &arm_sid)
+        else {
+            return AppSwitchOutcome::InvalidTarget;
+        };
+        let Some(spec) = deps.spec.clone() else {
+            return AppSwitchOutcome::CliUnreachable;
+        };
+        let client =
+            codex_app::CodexAppClient::new(deps.spawn.clone(), spec, codex_app::ClientInfo::mam());
+        let input = CODEX_APP_POLICY_SWITCH_INPUT.to_string();
+        let readback = deps.readback.clone();
+        let thread_id = tref.id.clone();
+        // 主载体①：turn/start.approvalPolicy（回合级即时生效、后续沿用——T0.2 定案）
+        let primary = client.switch_approval_policy(
+            &thread_id,
+            policy,
+            PolicyCarrier::TurnStart,
+            &input,
+            &readback,
+        );
+        // -32601（方法缺席，版本漂移信号）→ 兜底②' resume-only（review I1）：只
+        // resume 携档（线程级持久、后续回合生效），不再起 turn/start——方法缺席还起
+        // 回合 = 白付一次回合成本
+        let receipt = match primary {
+            Err(codex_app::AppServerError::MethodUnavailable { .. }) => client
+                .switch_approval_policy(
+                    &thread_id,
+                    policy,
+                    PolicyCarrier::ResumeOnly,
+                    &input,
+                    &readback,
+                ),
+            other => other,
+        };
+        AppSwitchOutcome::Done(receipt)
+    })
+    .await;
+    // 拒因/回合分派（回执与审计在此构造——闭包只判不答）
+    let receipt = match turn {
+        Ok(AppSwitchOutcome::Done(r)) => r,
+        Ok(AppSwitchOutcome::InvalidTarget) => {
+            codex_appserver_audit(
+                &st,
+                &device_id,
+                &device_name,
+                &sid,
+                &audit_content,
+                "refused:invalid_target",
+                0,
+            );
+            return json_no_store(
+                StatusCode::OK,
+                serde_json::json!({
+                    "status": "failed",
+                    "error": "无法确定 codex thread UUID（rollout 文件名与会话号都无 UUID）——不按会话名投递",
+                    "code": "invalid_target",
+                }),
+            );
+        }
+        Ok(AppSwitchOutcome::CliUnreachable) => {
+            codex_appserver_audit(
+                &st,
+                &device_id,
+                &device_name,
+                &sid,
+                &audit_content,
+                "failed:cli_unreachable",
+                0,
+            );
+            return json_no_store(
+                StatusCode::OK,
+                serde_json::json!({
+                    "status": "failed",
+                    "error": "codex CLI 不可达（PATH 上未找到 codex）——协议面不可用",
+                    "code": "cli_unreachable",
+                }),
+            );
+        }
+        Err(e) => {
+            log::error!("codex APP 切档回合任务异常: {e}");
+            codex_appserver_audit(
+                &st,
+                &device_id,
+                &device_name,
+                &sid,
+                &audit_content,
+                "failed:internal",
+                0,
+            );
+            return json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal" }),
+            );
+        }
+    };
+    // 4) 回执三态 + 审计（duration = 回合收口观测；未观测到完成时回执如实标注）
+    match receipt {
+        Ok(r) => {
+            let duration = r.turn_completion.duration_ms.unwrap_or(0);
+            let (verify_word, verified, readback_json, hint, audit_result) = match &r.verify {
+                PolicyVerify::Hit => (
+                    "hit",
+                    true,
+                    serde_json::Value::Null,
+                    format!("已切换至 {label}（协议读回核对一致）"),
+                    "ok".to_string(),
+                ),
+                PolicyVerify::Mismatch { readback } => (
+                    "mismatch",
+                    false,
+                    serde_json::json!(readback),
+                    format!(
+                        "档位读回为「{readback}」，与目标 {label} 不符——请以 APP 实况为准后重试"
+                    ),
+                    format!("mismatch:{readback}"),
+                ),
+                PolicyVerify::Ineffective => {
+                    // resume-only 兜底的 ineffective 是**语义性的**（review I1）：档位
+                    // 已随 resume 持久化、下一回合生效——本回合无新 turn_context，读回
+                    // 核对天然「未生效」；与「读不到」的 ineffective 用文案区分
+                    let hint = if r.carrier == PolicyCarrier::ResumeOnly {
+                        "档位已随 resume 持久化，下一回合生效（本回合无新档位回合记录，读回未生效）——请在 APP 内核对"
+                            .to_string()
+                    } else {
+                        "已投递但读不到档位回执（未确认生效）——请在 APP 内核对当前档位".to_string()
+                    };
+                    (
+                        "ineffective",
+                        false,
+                        serde_json::Value::Null,
+                        hint,
+                        "ineffective".to_string(),
+                    )
+                }
+            };
+            // 「回合完成通知未观测到」后缀只对**起了回合**的载体有意义（resume-only
+            // 无从观测是构造使然，不是在途——加后缀会误导）
+            let hint = if r.turn_completion.observed || r.carrier == PolicyCarrier::ResumeOnly {
+                hint
+            } else {
+                format!("{hint}；回合完成通知未观测到（可能仍在途）")
+            };
+            codex_appserver_audit(
+                &st,
+                &device_id,
+                &device_name,
+                &sid,
+                &audit_content,
+                &audit_result,
+                duration,
+            );
+            json_no_store(
+                StatusCode::OK,
+                serde_json::json!({
+                    "status": "app_switch",
+                    "verified": verified,
+                    // 核对三态（Task 8 消费：mismatch/ineffective → 不采信本地记忆、重拉 GET）
+                    "verify": verify_word,
+                    "policy": r.requested,
+                    "readback": readback_json,
+                    "carrier": match r.carrier {
+                        PolicyCarrier::TurnStart => "turnStart",
+                        PolicyCarrier::Resume => "resume",
+                        PolicyCarrier::ResumeOnly => "resumeOnly",
+                    },
+                    "turnObserved": r.turn_completion.observed,
+                    "hint": hint,
+                }),
+            )
+        }
+        Err(e) => {
+            // 活跃线程如实拒（钉句单点，Display 即钉句）；其余协议/通道错误如实透出
+            let audit_result = match &e {
+                codex_app::AppServerError::ActiveThreadWriteUnavailable => {
+                    format!("refused:{}", codex_app::ACTIVE_THREAD_WRITE_UNAVAILABLE)
+                }
+                other => format!("failed:{}", other.wire_word()),
+            };
+            codex_appserver_audit(
+                &st,
+                &device_id,
+                &device_name,
+                &sid,
+                &audit_content,
+                &audit_result,
+                0,
+            );
+            json_no_store(
+                StatusCode::OK,
+                serde_json::json!({
+                    "status": "failed",
+                    "error": e.to_string(),
+                    "code": e.wire_word(),
+                }),
+            )
+        }
+    }
+}
+
 pub async fn session_mode_switch(
     State(st): State<Arc<RemoteState>>,
     headers: axum::http::HeaderMap,
@@ -10856,10 +11307,16 @@ pub async fn session_mode_switch(
 ) -> Response {
     let sid = req.session_id.trim().to_string();
     let target = req.target.trim().to_string();
-    // 裁7：退役档在此**不可解析**（MamMode::parse 无对应 wire 词）→ 400
-    let Some(mode) = crate::inject::mode::MamMode::parse(&target) else {
+    // 裁7：退役档在此**不可解析**（MamMode::parse 无对应 wire 词）。**Task 6a 起目标词
+    // 双词表**：MamMode 词（CLI 终端面）或 app-server 档位词（never/on-request/
+    // untrusted——APP 协议面，T0.2 三枚举）——两者都解析不出才 400；哪个词表生效由
+    // 会话形态决定（APP 臂对 MamMode 词如实拒 no_mechanism；CLI 面对档位词维持既有
+    // 400 口径——见 lookup 的 bad_target 分支）
+    let mam_mode = crate::inject::mode::MamMode::parse(&target);
+    let app_policy = crate::inject::headless::codex_app::AppApprovalPolicy::parse(&target);
+    if mam_mode.is_none() && app_policy.is_none() {
         return bad_request();
-    };
+    }
     let requested_group = match req.group.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(g) => match crate::inject::mode::ModeGroupId::parse(g) {
@@ -10883,12 +11340,16 @@ pub async fn session_mode_switch(
             .find(|s| s.id == probe_sid)
             .ok_or_else(|| "no_session".to_string())?;
         let tool = session.agent_type.tool_id().to_string();
-        // codex APP 止血门（Task 3）：门位 = 会话定位后、组推断与**任何屏读/注入之前**
-        //（下方的 read_mode_from_screen 对 APP 会话就是 AttachConsole 0x80070006 的
-        // 错误通道）。错误码经 Err 串上行，审计 + 409 回执在 lookup 的拒绝分支。
+        // codex APP → 协议臂分派（Task 6a：Task 3 的 409 止血门翻转点）——CLI 校验
+        //（组推断/机制/前读屏读）对 APP 不适用（APP 无屏可读），H3 同门与协议编排在
+        // 臂内/臂前
         if codex_app_form(&session) {
-            return Err(APP_FORM_PENDING_CODE.to_string());
+            return Ok(ModeLookup::App(session));
         }
+        // CLI 面目标词必须是 MamMode 词（档位词对 CLI 无机制——400 口径不变）
+        let Some(mode) = mam_mode else {
+            return Err("bad_target".to_string());
+        };
         // 组推断（旧客户端不带 group 的兼容口径；显式 group 必须存在于结构）
         let group = crate::inject::mode::resolve_group(&tool, requested_group, mode)
             .map_err(|_| "no_mechanism".to_string())?;
@@ -10916,7 +11377,9 @@ pub async fn session_mode_switch(
         let readback = crate::inject::mode::mode_readback_supported(&tool);
         // 切档前的当前档（步进组的预期档要按环序算）——屏读一次
         let before = read_mode_from_screen(&probe_st, &session, &tool, readback);
-        Ok((session, tool, group, plan, readback, label, before))
+        Ok(ModeLookup::Cli(
+            session, tool, group, plan, readback, label, before,
+        ))
     })
     .await
     {
@@ -10930,40 +11393,23 @@ pub async fn session_mode_switch(
         }
     };
     let (mut session, tool, group, plan, readback, label, before) = match lookup {
-        Ok(v) => v,
-        Err(code) => {
-            // codex APP 止血门（Task 3）：409 + 审计（其余校验失败码维持零审计口径
-            //——本条与 L13 ambiguous_target 同族：投递路拒绝，须留痕供事后核对）。
-            // 审计 tool 位恒 codex（判据单点 codex_app_form 只在 codex 命中）。组词与
-            // 档标签是纯函数，拒绝臂就地重算：档标签与成功臂**同源**（tier 屏显标签，
-            // 非 MamMode 通用名）；显式组与目标档错配（resolve_group Err）时按推断组
-            // 如实记（None 推断 = 该档实际所属组），两组均解析不出才兜底 Mode 组词
-            //（防御位——codex 全档均落两组之一，按构造不可达）。
-            if code == APP_FORM_PENDING_CODE {
-                let group = crate::inject::mode::resolve_group("codex", requested_group, mode)
-                    .or_else(|_| crate::inject::mode::resolve_group("codex", None, mode))
-                    .unwrap_or(crate::inject::mode::ModeGroupId::Mode);
-                let label = crate::inject::mode::mode_structure("codex")
-                    .group(group)
-                    .and_then(|spec| spec.tiers.iter().find(|t| t.mode == mode).map(|t| t.label))
-                    .unwrap_or_else(|| mode.label());
-                let audit_content = if group == crate::inject::mode::ModeGroupId::Mode {
-                    format!("切换模式至 {label}")
-                } else {
-                    format!("切换{}至 {label}", group.label())
-                };
-                endpoint_audit(
-                    &st,
-                    &device_id,
-                    &device_name,
-                    "codex",
-                    &sid,
-                    &audit_content,
-                    "mode",
-                    APP_FORM_PENDING_AUDIT_RESULT,
-                );
-                return app_form_pending_response();
+        // Task 6a：codex APP → 协议臂（H3 同门先于一切协议编排——写路径与
+        // session_send 同门；helper 供 Task 6b 复用）
+        Ok(ModeLookup::App(app_session)) => {
+            if let Some(resp) = codex_app_protocol_h3_blocked(&st, &app_session) {
+                return resp;
             }
+            return codex_app_mode_switch_arm(st, device_id, device_name, app_session, target)
+                .await;
+        }
+        Ok(ModeLookup::Cli(session, tool, group, plan, readback, label, before)) => {
+            (session, tool, group, plan, readback, label, before)
+        }
+        // CLI 面收到档位词（上方双词表放进来的）——维持既有 400 口径
+        Err(code) if code == "bad_target" => return bad_request(),
+        Err(code) => {
+            // Task 3 的 app_form_pending 拒绝分支已随 6a 翻转删除（模式两入口归协议臂，
+            // 上方 App 分派）；其余校验失败码维持零审计口径
             let status = if code == "no_session" {
                 StatusCode::NOT_FOUND
             } else {
@@ -10971,6 +11417,11 @@ pub async fn session_mode_switch(
             };
             return json_no_store(status, serde_json::json!({ "error": code }));
         }
+    };
+    // CLI 面目标档（双词表门已保证 MamMode 词在 CLI 分支必可解析——bad_target 兜底在
+    // 闭包内；此处再解一次纯函数，CLI 流程零变化）
+    let Some(mode) = mam_mode else {
+        return bad_request();
     };
     // ===== 丁T3 接入① + 批次戊 E3②：投递前拦截判定（单点 [`mode_switch_block`]）=====
     //

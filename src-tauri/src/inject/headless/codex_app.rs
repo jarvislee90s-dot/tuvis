@@ -646,7 +646,8 @@ impl AppApprovalPolicy {
             .map(|(_, p)| p)
     }
 
-    /// 全部合法档（Task 6a `supported` 字段的数据源）
+    /// 全部合法档（三枚举全量）。**如实申报（M3）**：当前仅测试消费——GET 载荷的
+    /// tiers/supported 契约归 Task 8 定案（6a 未下发该表，本常量不是其数据源）
     pub const ALL: [AppApprovalPolicy; 3] = [
         AppApprovalPolicy::Never,
         AppApprovalPolicy::OnRequest,
@@ -654,16 +655,26 @@ impl AppApprovalPolicy {
     ];
 }
 
-/// 档位写载体（T0.2 定案兜底链）：① [`PolicyCarrier::TurnStart`] 主载体（回合级即时生效、
-/// 后续沿用；行为级翻转实证）；② [`PolicyCarrier::Resume`] 兜底（线程级一次 resume 长效；
-/// rollout `turn_context.approval_policy` 逐回合精确跟随【持久层】）。载体③
+/// 档位写载体（T0.2 定案兜底链 + 双审 I1 修订）：① [`PolicyCarrier::TurnStart`] 主载体
+/// （回合级即时生效、后续沿用；行为级翻转实证）；② [`PolicyCarrier::ResumeOnly`] 兜底
+/// **resume-only 形态**（review I1 修订：-32601 方法缺席的消费场景——只 resume 携档〔线程级
+/// 一次 resume 长效持久〕、**不起 turn/start**：方法缺席还起回合 = 白付一次回合成本；
+/// 本回合无新 turn_context ⇒ 核对恒 [`PolicyVerify::Ineffective`]，持久化语义由调用方
+/// 回执注明）。[`PolicyCarrier::Resume`] 全形态（resume + 起回合）是 Task 5 钉值的
+/// 能力面——生产兜底不走它（无消费者，留作能力文档与单测面）。载体③
 /// `config/value/write` 弃用（见模块头）——不留变体。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyCarrier {
     /// ① `turn/start.approvalPolicy`（主载体；input 必填 ⇒ 附极小输入）
     TurnStart,
-    /// ② `thread/resume.approvalPolicy`（兜底；对 MAM 自管 exec 会话最经济）
+    /// ② `thread/resume.approvalPolicy` 全形态（resume 装载 + 起一回合；Task 5 钉值
+    /// 能力面——生产兜底走 [`PolicyCarrier::ResumeOnly`]，本变体无生产消费者）
     Resume,
+    /// ②' **resume-only 兜底**（review I1 修订）：只 `thread/resume {approvalPolicy}`
+    /// （线程级持久、后续回合生效），不起 turn/start、无新 turn_context——核对恒
+    /// `Ineffective`（不查读回缝：rollout 尾部仍是旧回合的 turn_context，比对会误报
+    /// Mismatch），持久化语义在调用方 hint 注明
+    ResumeOnly,
 }
 
 /// 档位读回缝（thread_id → rollout 尾部 `turn_context.approval_policy`；None = 读不到）。
@@ -756,15 +767,17 @@ impl CodexAppClient {
         input_text: &str,
         readback: &PolicyReadbackSeam,
     ) -> Result<PolicyWriteReceipt, AppServerError> {
-        // 投递前拒（零 spawn 零回合——turn/start input 必填的诚实面，不烧 token）
+        // 投递前拒（零 spawn 零回合——turn/start input 必填的诚实面，不烧 token）。
+        // input 前置只约束「会起回合」的载体（① TurnStart / ② Resume 全形态）；
+        // ②' ResumeOnly 不起回合 ⇒ 不要求 input（review I1：无回合就无必填可言）
         if thread_id.trim().is_empty() {
             return Err(AppServerError::InvalidTarget(
                 "档位写需要 threadId（空值投递前拒）".to_string(),
             ));
         }
-        if input_text.trim().is_empty() {
+        if carrier != PolicyCarrier::ResumeOnly && input_text.trim().is_empty() {
             return Err(AppServerError::InvalidTarget(
-                "档位切换需附极小输入（协议回合 input 必填，主/兜底两载体同规）".to_string(),
+                "档位切换需附极小输入（协议回合 input 必填，会起回合的载体同规）".to_string(),
             ));
         }
         let mut s = self.session()?;
@@ -783,6 +796,24 @@ fn switch_on_session(
     input_text: &str,
     readback: &PolicyReadbackSeam,
 ) -> Result<PolicyWriteReceipt, AppServerError> {
+    // ②' resume-only（review I1 兜底形态）：只 resume 携档（线程级持久、后续回合生效），
+    // 不起 turn/start——本回合无新 turn_context ⇒ 核对恒 Ineffective（**不查读回缝**：
+    // rollout 尾部仍是旧回合的 turn_context，比对会误报 Mismatch）；turn 无从观测
+    // （observed=false 如实）。持久化语义由调用方 hint 注明
+    if carrier == PolicyCarrier::ResumeOnly {
+        s.resume_thread(thread_id, Some(&policy))?;
+        return Ok(PolicyWriteReceipt {
+            carrier,
+            requested: policy.wire().to_string(),
+            turn_id: None,
+            turn_completion: TurnCompletion {
+                status: None,
+                duration_ms: None,
+                observed: false,
+            },
+            verify: PolicyVerify::Ineffective,
+        });
+    }
     // 第一步 resume：装载线程（T0.2 兜底载体②时档位搭车；活跃线程在此步即被
     // -32600 拒 → ActiveThreadWriteUnavailable，调用方据此降级——不假装可写）
     let resume_policy = (carrier == PolicyCarrier::Resume).then_some(policy);
@@ -1056,6 +1087,197 @@ impl AppServerIo for ProcIo {
 impl Drop for ProcIo {
     fn drop(&mut self) {
         self.finish(); // 调用方忘 close 也优雅收尾（防进程泄漏）
+    }
+}
+
+// ============================================================
+// 端点依赖束 + 档位读回单点（Task 6a：api.rs 模式族协议臂的执行缝）
+// ============================================================
+
+/// api.rs 协议臂（`session_mode_switch` 的 codex APP 臂）的执行依赖束。
+/// 生产 = 真 spawn（[`production_spawn_seam`]）+ rollout 档位读回；测试构建 =
+/// [`test_hooks`] 脚本桩（零真实进程、零真实 ~/.codex——宪法级测试纪律的端点面
+/// 延伸，形态沿 wb_acp / codex 的 test_hooks 先例）。
+#[derive(Clone)]
+pub struct AppArmDeps {
+    /// spawn 规格（None = codex CLI 不在 PATH——端点如实拒「协议面不可用」，不裸 spawn）
+    pub spec: Option<SpawnSpec>,
+    /// spawn 缝（唯一进程出口）
+    pub spawn: SpawnSeam,
+    /// 档位读回缝（thread id → rollout 尾部 `turn_context.approval_policy`）
+    pub readback: PolicyReadbackSeam,
+}
+
+/// **档位读回单点**（thread id → rollout 尾部 `turn_context.approval_policy`）：
+/// GET /session-mode APP 臂的 `current` 与 POST 切档的核对三态**共此一真源**
+/// （T0.5 定案：RPC 读回族全族不暴露 approvalPolicy，唯一可靠真源 = rollout
+/// 文件层「最后一条 turn_context」——T0.2 载体②已证其逐回合精确跟随）。
+/// 线索发现单点 = [`super::codex::production_rollout_path`]（state DB 的
+/// threads.rollout_path；codex APP 会话号即 thread id）。**同步阻塞**
+/// （SQLite 只读 + 尾读）——调用方放 spawn_blocking。
+///
+/// **测试构建经 [`test_hooks`] 注入**（零真实 ~/.codex；缺省 None = 读不到的
+/// 保守降级形态，与生产缺位同向）。
+pub fn policy_readback(home: Option<&std::path::Path>, thread_id: &str) -> Option<String> {
+    #[cfg(test)]
+    {
+        let _ = (home, thread_id);
+        test_hooks::readback()
+    }
+    #[cfg(not(test))]
+    {
+        let path = super::codex::production_rollout_path(home, thread_id)?;
+        crate::monitor::codex_parser::rollout_tail_approval_policy(std::path::Path::new(&path))
+    }
+}
+
+/// 生产/测试装配单点（Task 6a）：POST 协议臂拿完整依赖束；GET 臂经
+/// [`policy_readback`] 间接消费读回缝（无需 spawn）。
+pub fn app_arm_deps(home: Option<&std::path::Path>) -> AppArmDeps {
+    #[cfg(test)]
+    {
+        let _ = home;
+        AppArmDeps {
+            spec: test_hooks::spec(),
+            spawn: test_hooks::spawn_seam(),
+            readback: test_hooks::readback_seam(),
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let seam_home = home.map(std::path::PathBuf::from);
+        AppArmDeps {
+            spec: production_spec(
+                &std::env::var("PATH").unwrap_or_default(),
+                std::env::consts::OS,
+            ),
+            spawn: production_spawn_seam(),
+            readback: Arc::new(move |tid: &str| policy_readback(seam_home.as_deref(), tid)),
+        }
+    }
+}
+
+/// 端点级测试钩子（仅 `cfg(test)`）：server.rs 的端点用例经 [`app_arm_deps`] /
+/// [`policy_readback`] 取到这里的桩——**零真实进程、零真实 ~/.codex**。
+///
+/// **并行纪律**（与 codex / wb_acp 的 test_hooks 同款）：凡装填/断言钩子的用例
+/// 必须持 [`LOCK`]（tokio 互斥量——用例是 `#[tokio::test]`，守卫必然跨 await 持有，
+/// std 守卫会被 `clippy::await_holding_lock` 正当拦下）；用例收尾调 [`clear`]
+/// （Drop 守卫模式亦可）。**缺省（未装填）**：spec = None / 脚本空（spawn 即失败）/
+/// readback = None——「未注入 = 如实降级」，与生产缺位形态同向。
+#[cfg(test)]
+pub mod test_hooks {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// 钩子用例串行锁（持锁期间其它端点用例不得断言协议臂行为）
+    pub(crate) static LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    static SPEC: std::sync::LazyLock<Mutex<Option<SpawnSpec>>> =
+        std::sync::LazyLock::new(|| Mutex::new(None));
+    /// 脚本桩队列：每 spawn 弹一队（一队 = 一枚实例的全部应答行）；耗尽 → spawn 失败
+    static SCRIPTS: std::sync::LazyLock<Mutex<VecDeque<Vec<String>>>> =
+        std::sync::LazyLock::new(|| Mutex::new(VecDeque::new()));
+    /// 读回值（对任意 thread id 恒定——端点用例只关心「读到/读不到」两态）
+    static READBACK: std::sync::LazyLock<Mutex<Option<String>>> =
+        std::sync::LazyLock::new(|| Mutex::new(None));
+    /// 每实例发出的帧（按 spawn 序——端点用例断言 turn/start 参数用）
+    static SENT: std::sync::LazyLock<Mutex<Vec<Vec<String>>>> =
+        std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+    /// 装填钩子（**调用方必须已持 [`LOCK`]**；`spec = None` 可模拟 codex 不可达）
+    pub(crate) fn set(
+        spec: Option<SpawnSpec>,
+        scripts: Vec<Vec<String>>,
+        readback: Option<String>,
+    ) {
+        *SPEC.lock().unwrap_or_else(|e| e.into_inner()) = spec;
+        *SCRIPTS.lock().unwrap_or_else(|e| e.into_inner()) = scripts.into();
+        *READBACK.lock().unwrap_or_else(|e| e.into_inner()) = readback;
+        SENT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// 清空钩子（用例收尾铁律——防串扰下一个用例）
+    pub(crate) fn clear() {
+        *SPEC.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        SCRIPTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *READBACK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        SENT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// 各实例发出的帧（按 spawn 序；每实例一个 Vec，帧为 JSON 原文）
+    pub(crate) fn sent_frames() -> Vec<Vec<String>> {
+        SENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn readback() -> Option<String> {
+        READBACK.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn spec() -> Option<SpawnSpec> {
+        SPEC.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn readback_seam() -> PolicyReadbackSeam {
+        Arc::new(|_tid: &str| readback())
+    }
+
+    pub(crate) fn spawn_seam() -> SpawnSeam {
+        Arc::new(|_spec: &SpawnSpec| {
+            let script = SCRIPTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front()
+                .ok_or_else(|| "test_hooks：脚本耗尽（未预期的额外 spawn）".to_string())?;
+            Ok(Box::new(HookIo {
+                script: VecDeque::from(script),
+                sent: Vec::new(),
+                finished: false,
+            }) as Box<dyn AppServerIo>)
+        })
+    }
+
+    /// 脚本桩 IO：recv 逐行弹脚本、send 记帧；finish 提交帧集（与单测 MockIo 的
+    /// M5 守卫同款：finish 时脚本仍有剩余行 → Drop panic——脚本期望与实现行为
+    /// 不符要当场炸出来，不留暗坑）
+    struct HookIo {
+        script: VecDeque<String>,
+        sent: Vec<String>,
+        finished: bool,
+    }
+
+    impl AppServerIo for HookIo {
+        fn send(&mut self, line: &str) -> Result<(), String> {
+            self.sent.push(line.to_string());
+            Ok(())
+        }
+
+        fn recv(&mut self) -> Option<Result<String, String>> {
+            self.script.pop_front().map(Ok)
+        }
+
+        fn finish(&mut self) {
+            self.finished = true;
+            let frames = std::mem::take(&mut self.sent);
+            SENT.lock().unwrap_or_else(|e| e.into_inner()).push(frames);
+        }
+    }
+
+    impl Drop for HookIo {
+        fn drop(&mut self) {
+            if !self.finished {
+                // 调用方忘 close：仍提交帧集（不丢断言面），再走剩余行守卫
+                self.finish();
+            }
+            if !self.script.is_empty() {
+                panic!(
+                    "test_hooks HookIo：finish 时脚本仍剩余 {} 行未消费（脚本期望与实现行为不符）",
+                    self.script.len()
+                );
+            }
+        }
     }
 }
 
@@ -1663,6 +1885,57 @@ mod tests {
         assert!(log.lock().unwrap().specs.is_empty(), "空输入零 spawn");
     }
 
+    /// ②' resume-only 兜底（review I1）：-32601 消费场景——只 resume 携档（线程级
+    /// 持久、后续回合生效）、**不起 turn/start**（零回合成本）；核对恒 Ineffective
+    /// （读回缝即便给「命中值」也不查——rollout 尾部仍是旧回合上下文，比对会误报
+    /// Mismatch）；turn 无从观测（observed=false 构造使然）；空 input 放行（无回合
+    /// 载体不要求 input——前置只约束会起回合的载体）。
+    #[test]
+    fn resume_only_carrier_skips_turn_start_and_reports_ineffective() {
+        // 读回缝故意给「命中值」——resume-only 仍必须 Ineffective（不查缝的自证）
+        let (seam, log) = mock_spawn(vec![vec![
+            init_ok(),
+            resp(2, r#"{"status":{"type":"idle"}}"#),
+        ]]);
+        let receipt = client_of(seam)
+            .switch_approval_policy(
+                TID,
+                AppApprovalPolicy::Never,
+                PolicyCarrier::ResumeOnly,
+                " ", // 空 input 放行：resume-only 无回合 ⇒ 无必填
+                &readback_of(Some("never")),
+            )
+            .unwrap();
+        assert_eq!(receipt.carrier, PolicyCarrier::ResumeOnly);
+        assert_eq!(
+            receipt.verify,
+            PolicyVerify::Ineffective,
+            "恒 Ineffective——不查读回缝（缝给了命中值也不采信）"
+        );
+        assert_eq!(receipt.requested, "never");
+        assert_eq!(receipt.turn_id, None);
+        assert!(
+            !receipt.turn_completion.observed,
+            "无回合无从观测（构造使然）"
+        );
+        let frames = sent_frames(&log);
+        assert_eq!(
+            frames.len(),
+            2,
+            "一枚实例只发 initialize + thread/resume 后即 close"
+        );
+        let resume = sent_json(&log, 1);
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(
+            resume["params"]["approvalPolicy"], "never",
+            "档位挂 resume（线程级持久）"
+        );
+        assert!(
+            !frames.iter().any(|f| f.contains("turn/start")),
+            "不起 turn/start（-32601 兜底不白付回合）"
+        );
+    }
+
     /// 附加钉值：裸 spawn argv 的 Windows 垫片包装（生产 spawn 形态的纯核面——
     /// `.cmd` 垫片经 `cmd /c` 转一手，`.exe` 直 spawn）
     #[test]
@@ -1730,7 +2003,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "目标不可用：档位切换需附极小输入（协议回合 input 必填，主/兜底两载体同规）"
+            "目标不可用：档位切换需附极小输入（协议回合 input 必填，会起回合的载体同规）"
         );
     }
 
