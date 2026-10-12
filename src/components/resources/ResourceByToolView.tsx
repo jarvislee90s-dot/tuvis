@@ -31,10 +31,16 @@ import type {
   ImportStats,
 } from "@/types/extension";
 import { ImportSuggestionDialog } from "@/components/resources/ImportSuggestionDialog";
+import { ResourceSourceBadge, type ResourceSource } from "./ResourceSourceBadge";
 
 function formatSkillName(name: string): string {
   return name.includes("/") ? name.replace("/", ": ") : name;
 }
+
+/** .agents 遗留链接面的适用工具（UI 改版 C9）：后端 detect_legacy_agents_links 只认指向
+ *  ~/.tuvis/active/codex（Layer 2）的链接（migration.rs is_legacy_codex_link），
+ *  故「.agents 可用」徽章仅 codex 卡面会出现 */
+const LEGACY_AGENTS_TOOL = "codex";
 
 export function ResourceByToolView() {
   const { t } = useTranslation();
@@ -141,6 +147,15 @@ export function ResourceByToolView() {
   };
 
   const [duplicates, setDuplicates] = useState<Record<string, string[]>>({});
+
+  // .agents 遗留链接名册（UI 改版 C9「.agents 可用」徽章数据源）：挂载时检测一次；
+  // 失败静默降级为空名册（该徽章面自然消失，不影响其余来源）
+  const [legacyAgents, setLegacyAgents] = useState<string[]>([]);
+  useEffect(() => {
+    invoke<string[]>("detect_legacy_agents_links")
+      .then((names) => setLegacyAgents(names))
+      .catch(() => {});
+  }, []);
 
   const loadDuplicates = useCallback(async (toolId: string) => {
     try {
@@ -272,6 +287,7 @@ export function ResourceByToolView() {
             onImport={handleImport}
             search={search}
             sortDir={sortDir}
+            legacyNames={new Set(legacyAgents)}
           />
 
           {/* 重复 skill 清理区 */}
@@ -326,87 +342,122 @@ export function ResourceByToolView() {
   );
 }
 
+/** 「按工具」视图清单（UI 改版 C8/C9）：每工具卡只显示实际配置的资源——
+ *  global 数组只保留该工具 assignments 已启用（enabled）项；native 原生项保留；
+ *  另纳 .agents 遗留链接可达项（仅 codex，见 LEGACY_AGENTS_TOOL）。Skill 段按名合并
+ *  三态互斥行（优先级 原生 > 全局仓库 > .agents 可用），每行右侧为来源徽章列；
+ *  MCP / 插件段仅已链接项，统一佩「全局仓库」徽章；段头计数随之如实。 */
 function ToolResourceList({
   toolId,
   resources,
   onImport,
   search,
   sortDir,
+  legacyNames,
 }: {
   toolId: string;
   resources?: ToolResources;
   onImport: (toolId: string, item: NativeExtension) => void;
   search: string;
   sortDir: SortDir;
+  legacyNames: Set<string>;
 }) {
   const { t } = useTranslation();
   if (!resources) {
     return <div className="text-muted-foreground py-2 text-xs">{t("common.loading")}</div>;
   }
 
-  // 名称筛选（大小写不敏感包含）+ 三态排序：全局与原生两块分别过滤后各自排序
+  // 名称筛选（大小写不敏感包含）+ 三态排序：作用于合并后的行（口径与「按资源」视图一致）
   const q = search.trim().toLowerCase();
   const match = (name: string) => !q || name.toLowerCase().includes(q);
-  const globalSkills = applyNameSort(
-    resources.global.filter((e) => e.kind === "skill" && match(e.name)),
+
+  // 「已启用/已链接」判定（UI 改版 C10，resource.rs list_tool_resources 契约）：
+  // assignments 按 toolId 过滤下发、每项至多一条；enabled = 账本启用位——disable 时
+  // 后端同步置 enabled=0 + link_status=missing，故 enabled 即「实际配置」的充分判据
+  const isLinked = (e: ExtensionWithAssignments) =>
+    e.assignments.some((a) => a.agentToolId === toolId && a.enabled);
+  const linkedGlobal = resources.global.filter(isLinked);
+  // 仅 .agents 遗留链接可达的仓库技能（未入启用账本；detect 面 codex 专属）
+  const legacyOnlyGlobal = resources.global.filter(
+    (e) =>
+      e.kind === "skill" && !isLinked(e) && toolId === LEGACY_AGENTS_TOOL && legacyNames.has(e.name)
+  );
+
+  // Skill 行按名合并（三态互斥优先级 原生 > 全局仓库 > .agents 可用）：
+  // 同名技能同时原生存在与全局链接（重复 skill 场景）只出一行，佩高优先级徽章；
+  // 重复清理由上方独立警示区负责，不在清单内重复列行
+  const skillRows = new Map<
+    string,
+    { name: string; source: ResourceSource; native?: NativeExtension }
+  >();
+  for (const n of resources.native) {
+    if (n.kind === "skill") skillRows.set(n.name, { name: n.name, source: "native", native: n });
+  }
+  for (const e of linkedGlobal) {
+    if (e.kind === "skill" && !skillRows.has(e.name)) {
+      skillRows.set(e.name, { name: e.name, source: "repo" });
+    }
+  }
+  for (const e of legacyOnlyGlobal) {
+    if (!skillRows.has(e.name)) skillRows.set(e.name, { name: e.name, source: "agents" });
+  }
+  const sortedSkillRows = applyNameSort(
+    [...skillRows.values()].filter((r) => match(r.name)),
     sortDir
   );
-  const nativeSkills = applyNameSort(
-    resources.native.filter((n) => n.kind === "skill" && match(n.name)),
-    sortDir
-  );
+
   const globalMcps = applyNameSort(
-    resources.global.filter((e) => e.kind === "mcp" && match(e.name)),
+    linkedGlobal.filter((e) => e.kind === "mcp" && match(e.name)),
     sortDir
   );
   const globalPlugins = applyNameSort(
-    resources.global.filter((e) => e.kind === "plugin" && match(e.name)),
+    linkedGlobal.filter((e) => e.kind === "plugin" && match(e.name)),
     sortDir
   );
 
   return (
     <div className="space-y-2">
-      {/* Skills */}
+      {/* Skills：三态合并行 + 右侧来源徽章列 */}
       <div>
         <h4 className="text-muted-foreground mb-1 text-xs font-medium">
-          Skills ({globalSkills.length + nativeSkills.length})
+          Skills ({sortedSkillRows.length})
         </h4>
         <div className="space-y-1">
-          {globalSkills.map((s) => (
-            <div
-              key={s.id}
-              className="bg-accent/50 flex items-center justify-between rounded px-2 py-1 text-xs"
-            >
-              <span>
-                {formatSkillName(s.name)}{" "}
-                <span className="text-green-600">{t("resources.inRepo")}</span>
-              </span>
+          {sortedSkillRows.length === 0 ? (
+            <div className="text-muted-foreground px-2 py-1 text-[11px]">
+              {t("resources.noSkillsHint")}
             </div>
-          ))}
-          {nativeSkills.map((s) => (
-            <div
-              key={s.id}
-              className="bg-muted flex items-center justify-between rounded px-2 py-1 text-xs"
-            >
-              <span>
-                {formatSkillName(s.name)}{" "}
-                <span className="text-orange-500">{t("resources.nativeTag")}</span>
-              </span>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-5 px-1 text-[10px]"
-                onClick={() => onImport(toolId, s)}
+          ) : (
+            sortedSkillRows.map((row) => (
+              <div
+                key={row.name}
+                className={`flex items-center justify-between gap-2 rounded px-2 py-1 text-xs ${
+                  row.source === "native" ? "bg-muted" : "bg-accent/50"
+                }`}
               >
-                <Import className="h-3 w-3" />
-                {t("common.import")}
-              </Button>
-            </div>
-          ))}
+                <span className="truncate">{formatSkillName(row.name)}</span>
+                <span className="flex shrink-0 items-center gap-1">
+                  {/* 原生技能保留导入动作（导入 SSOT 纳管） */}
+                  {row.native && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-5 px-1 text-[10px]"
+                      onClick={() => onImport(toolId, row.native!)}
+                    >
+                      <Import className="h-3 w-3" />
+                      {t("common.import")}
+                    </Button>
+                  )}
+                  <ResourceSourceBadge source={row.source} />
+                </span>
+              </div>
+            ))
+          )}
         </div>
       </div>
 
-      {/* MCP */}
+      {/* MCP：仅实际配置（已链接）项 + 全局仓库徽章 */}
       <div>
         <h4 className="text-muted-foreground mb-1 text-xs font-medium">
           MCP ({globalMcps.length})
@@ -420,18 +471,17 @@ function ToolResourceList({
             globalMcps.map((m) => (
               <div
                 key={m.id}
-                className="bg-accent/50 flex items-center justify-between rounded px-2 py-1 text-xs"
+                className="bg-accent/50 flex items-center justify-between gap-2 rounded px-2 py-1 text-xs"
               >
-                <span>
-                  {m.name} <span className="text-green-600">{t("resources.inRepo")}</span>
-                </span>
+                <span className="truncate">{m.name}</span>
+                <ResourceSourceBadge source="repo" />
               </div>
             ))
           )}
         </div>
       </div>
 
-      {/* Plugins */}
+      {/* Plugins：仅实际配置（已链接）项 + 全局仓库徽章 */}
       <div>
         <h4 className="text-muted-foreground mb-1 text-xs font-medium">
           Plugins ({globalPlugins.length})
@@ -445,11 +495,10 @@ function ToolResourceList({
             globalPlugins.map((p) => (
               <div
                 key={p.id}
-                className="bg-accent/50 flex items-center justify-between rounded px-2 py-1 text-xs"
+                className="bg-accent/50 flex items-center justify-between gap-2 rounded px-2 py-1 text-xs"
               >
-                <span>
-                  {p.name} <span className="text-green-600">{t("resources.inRepo")}</span>
-                </span>
+                <span className="truncate">{p.name}</span>
+                <ResourceSourceBadge source="repo" />
               </div>
             ))
           )}

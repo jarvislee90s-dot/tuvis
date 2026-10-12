@@ -51,13 +51,13 @@ const BINDINGS: ResourceBinding[] = [
   },
 ];
 
-function renderDialog(onClose = vi.fn()) {
+function renderDialog(onClose = vi.fn(), extensions: ExtensionWithAssignments[] = EXTENSIONS) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   render(
     <QueryClientProvider client={queryClient}>
-      <PresetEditDialog open preset={null} presetExtensions={EXTENSIONS} onClose={onClose} />
+      <PresetEditDialog open preset={null} presetExtensions={extensions} onClose={onClose} />
     </QueryClientProvider>
   );
   return onClose;
@@ -192,5 +192,60 @@ describe("PresetEditDialog（新建/编辑共用）", () => {
       })
     );
     await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+});
+
+describe("PresetEditDialog 两列选择区（UI 改版 B6/B7）", () => {
+  it("右列空态 → 勾选左列进右列 → 点右列对钩移出且左列复选回弹", async () => {
+    renderDialog();
+    expect(await screen.findByText("skill-alpha")).toBeInTheDocument();
+    // 初始空态文案
+    expect(screen.getByText("尚未选择资源")).toBeInTheDocument();
+    checkItem("skill-alpha");
+    // 右列（已选资源）出现勾选项
+    const rightCol = screen.getByText("已选资源").closest("div[class*='border']")!;
+    expect(within(rightCol).getByText("skill-alpha")).toBeInTheDocument();
+    // 点对钩 = 取消选中：右列移出、回到空态、左列复选框回弹
+    fireEvent.click(within(rightCol).getByRole("button", { name: "移除该项: skill-alpha" }));
+    expect(within(rightCol).queryByText("skill-alpha")).not.toBeInTheDocument();
+    expect(screen.getByText("尚未选择资源")).toBeInTheDocument();
+    const label = screen.getByText("skill-alpha").closest("label")!;
+    expect(within(label).getByRole("checkbox")).toHaveAttribute("data-state", "unchecked");
+  });
+
+  it("左列搜索过滤：输入 alpha → mcp 组隐藏、skill 项保留", async () => {
+    renderDialog();
+    expect(await screen.findByText("skill-alpha")).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText("按名称筛选…"), {
+      target: { value: "alpha" },
+    });
+    expect(screen.queryByText("mcp-exclusive")).not.toBeInTheDocument();
+    expect(screen.getByText("skill-alpha")).toBeInTheDocument();
+  });
+
+  it("左列排序切换：none→asc→desc 三态循环生效", async () => {
+    const EXT2: ExtensionWithAssignments[] = [
+      ext({ id: "s1", kind: "skill", name: "skill-zeta" }),
+      ext({ id: "s2", kind: "skill", name: "skill-alpha" }),
+    ];
+    renderDialog(vi.fn(), EXT2);
+    expect(await screen.findByText("skill-alpha")).toBeInTheDocument();
+    const leftCol = screen.getByText("可选资源").closest("div[class*='border']")!;
+    const names = () =>
+      within(leftCol)
+        .getAllByText(/skill-(alpha|zeta)/)
+        .map((el) => el.textContent);
+    expect(names()).toEqual(["skill-zeta", "skill-alpha"]); // 默认扫描序
+    fireEvent.click(screen.getByRole("button", { name: "按名字排序" })); // → asc
+    expect(names()).toEqual(["skill-alpha", "skill-zeta"]);
+    fireEvent.click(screen.getByRole("button", { name: "按名字排序" })); // → desc
+    expect(names()).toEqual(["skill-zeta", "skill-alpha"]);
+  });
+
+  it("保存/取消各仅一枚（B7：移入描述框下方，不再有底部 footer 操作钮）", async () => {
+    renderDialog();
+    expect(await screen.findByText("skill-alpha")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "保存" }).length).toBe(1);
+    expect(screen.getAllByRole("button", { name: "取消" }).length).toBe(1);
   });
 });

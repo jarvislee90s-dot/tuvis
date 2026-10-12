@@ -6,6 +6,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { PresetList } from "@/components/presets/PresetList";
 import type { EnabledTool } from "@/lib/query/queries/tools";
+import type { ExtensionWithAssignments } from "@/types/extension";
 
 const { invokeMock, toastMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
@@ -68,6 +69,7 @@ async function renderPresetList(opts: {
   enabledTools?: EnabledTool[];
   presets?: unknown[];
   activePresets?: unknown[];
+  extensions?: ExtensionWithAssignments[];
 }) {
   invokeMock.mockImplementation(async (cmd: string) => {
     if (cmd === "list_enabled_tools") return opts.enabledTools ?? [TOOL_CLAUDE];
@@ -81,7 +83,7 @@ async function renderPresetList(opts: {
   });
   const utils = render(
     <QueryClientProvider client={queryClient}>
-      <PresetList extensions={[]} />
+      <PresetList extensions={opts.extensions ?? []} />
     </QueryClientProvider>
   );
   // 等数据落地：预设名渲染 = list_presets 就绪；activePresets 查询已发出
@@ -232,5 +234,65 @@ describe("PresetList（v2 双分区 + 预设×工具开关）", () => {
     expect(msg).toContain("恢复默认失败");
     expect(msg).toContain("backend boom");
     expect(msg).not.toContain("应用失败");
+  });
+});
+
+describe("PresetCard 👁/✏️（UI 改版 B5）", () => {
+  const SOURCES_PRESET = {
+    ...UNIVERSAL_PRESET,
+    id: "p-src",
+    name: "来源组合",
+    items: [item("s1", "skill", "skill-a"), item("n1", "skill", "native-skill")],
+  };
+  const SOURCES_EXTENSIONS: ExtensionWithAssignments[] = [
+    {
+      id: "s1",
+      kind: "skill",
+      name: "skill-a",
+      description: null,
+      sourcePath: "/x",
+      sourceTool: null,
+      suite: null,
+      tags: null,
+      isNative: false,
+      assignments: [],
+    },
+    {
+      id: "n1",
+      kind: "skill",
+      name: "native-skill",
+      description: null,
+      sourcePath: "/y",
+      sourceTool: "codex",
+      suite: null,
+      tags: null,
+      isNative: true,
+      assignments: [],
+    },
+  ];
+
+  it("👁 预览：只读弹窗按 kind 分组列名 + 来源徽章（全局仓库/原生）", async () => {
+    await renderPresetList({ presets: [SOURCES_PRESET], extensions: SOURCES_EXTENSIONS });
+    fireEvent.click(screen.getByRole("button", { name: "预览预设" }));
+    const dlg = await screen.findByRole("dialog");
+    expect(within(dlg).getByText("Skill (2)")).toBeInTheDocument();
+    expect(within(dlg).getByText("skill-a")).toBeInTheDocument();
+    expect(within(dlg).getAllByText("全局仓库").length).toBe(1);
+    expect(within(dlg).getByText("native-skill")).toBeInTheDocument();
+    expect(within(dlg).getAllByText("原生").length).toBe(1);
+    // 只读预览不触发编辑弹窗
+    expect(screen.queryByText("编辑预设组")).not.toBeInTheDocument();
+  });
+
+  it("✏️ 编辑：图标入口打开编辑弹窗（预填），整卡点击仍为同一入口", async () => {
+    await renderPresetList({ presets: [SOURCES_PRESET] });
+    fireEvent.click(screen.getByRole("button", { name: "编辑预设" }));
+    expect(await screen.findByText("编辑预设组")).toBeInTheDocument();
+  });
+
+  it("整卡点击行为保持不变：点卡片名打开编辑弹窗（与 ✏️ 同入口）", async () => {
+    await renderPresetList({ presets: [SOURCES_PRESET] });
+    fireEvent.click(screen.getByText("来源组合"));
+    expect(await screen.findByText("编辑预设组")).toBeInTheDocument();
   });
 });

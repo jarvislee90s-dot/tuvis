@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { ApplyConfirmDialog } from "@/components/presets/ApplyConfirmDialog";
 import { PresetEditDialog } from "@/components/presets/PresetEditDialog";
+import { PresetPreviewDialog } from "@/components/presets/PresetPreviewDialog";
 import {
   Dialog,
   DialogContent,
@@ -20,7 +21,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Layers, Plus, Trash2, Play, X } from "lucide-react";
+import { Layers, Plus, Trash2, Play, X, Eye, Pencil } from "lucide-react";
 import type { PresetRecord } from "@/types/preset";
 import type { ActivePreset, ExtensionWithAssignments } from "@/types/extension";
 import { ToolIcon } from "@/components/common/ToolIcon";
@@ -57,6 +58,8 @@ export function PresetList({
   // 编辑弹窗（T7）：open + 编辑目标（null = 新建空表单）
   const [editOpen, setEditOpen] = useState(false);
   const [editPreset, setEditPreset] = useState<PresetRecord | null>(null);
+  // 只读预览弹窗目标（UI 改版 B5：卡片 👁 入口；null = 关闭）
+  const [previewTarget, setPreviewTarget] = useState<PresetRecord | null>(null);
   // 应用确认弹窗目标（T5 ApplyConfirmDialog；null = 关闭）。toolName 预查好供弹窗标题
   const [confirmTarget, setConfirmTarget] = useState<{
     presetId: string;
@@ -203,6 +206,7 @@ export function PresetList({
                   onSwitch={onSwitch}
                   onRequestDelete={setDeleteTarget}
                   onEdit={openEdit}
+                  onPreview={setPreviewTarget}
                 />
               ))}
             </section>
@@ -228,6 +232,7 @@ export function PresetList({
                       onSwitch={onSwitch}
                       onRequestDelete={setDeleteTarget}
                       onEdit={openEdit}
+                      onPreview={setPreviewTarget}
                     />
                   ))}
                 </div>
@@ -269,6 +274,16 @@ export function PresetList({
         onConfirm={confirmApply}
       />
 
+      {/* 只读预览弹窗（UI 改版 B5）：预设名册来自 ExtensionList 透传的 extensions */}
+      <PresetPreviewDialog
+        preset={previewTarget}
+        extensions={extensions}
+        open={previewTarget !== null}
+        onOpenChange={(o) => {
+          if (!o) setPreviewTarget(null);
+        }}
+      />
+
       {/* 编辑弹窗（T7，新建/编辑共用）：保存成功后弹窗自 invalidate PRESETS_KEY */}
       <PresetEditDialog
         open={editOpen}
@@ -288,6 +303,7 @@ function PresetCard({
   onSwitch,
   onRequestDelete,
   onEdit,
+  onPreview,
 }: {
   preset: PresetRecord;
   enabledTools: EnabledTool[];
@@ -295,6 +311,7 @@ function PresetCard({
   onSwitch: (presetId: string, toolId: string, next: boolean) => void;
   onRequestDelete: (preset: PresetRecord) => void;
   onEdit: (preset: PresetRecord) => void;
+  onPreview: (preset: PresetRecord) => void;
 }) {
   const { t } = useTranslation();
 
@@ -326,6 +343,32 @@ function PresetCard({
           <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10px]">
             {preset.items.length}
           </span>
+          {/* 👁 只读预览（UI 改版 B5）：按 Skill/MCP/插件 分组 + 来源徽章 */}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onPreview(preset);
+            }}
+            className="text-muted-foreground hover:text-foreground"
+            title={t("presets.previewPreset")}
+            aria-label={t("presets.previewPreset")}
+          >
+            <Eye className="h-3.5 w-3.5" />
+          </button>
+          {/* ✏️ 编辑（UI 改版 B5）：与整卡点击同一入口（onEdit 预填打开） */}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onEdit(preset);
+            }}
+            className="text-muted-foreground hover:text-foreground"
+            title={t("presets.editPreset")}
+            aria-label={t("presets.editPreset")}
+          >
+            <Pencil className="h-3.5 w-3.5" />
+          </button>
           <button
             onClick={(e) => {
               // 不触发整卡点击（onEdit 编辑弹窗）
