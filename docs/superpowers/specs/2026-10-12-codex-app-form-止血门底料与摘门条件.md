@@ -60,25 +60,35 @@
 |---|---|
 | `Command::spawn()` 三路 stdio 默认 `Inherit`（`needs_stdin = true`） | `library/std/src/process.rs:1084` |
 | 继承句柄不是直接转交：先 `GetStdHandle`，再 `DuplicateHandle(…, inherit = true)` 复制可继承副本 | `sys/process/windows.rs:605-618` |
-| 无控制台时槽位为 NULL → `get_handle` 返回 `Err(ERROR_INVALID_HANDLE)` → **句柄置 null 并被放过** | `sys/stdio/windows.rs:68-77` + `sys/process/windows.rs:613-614` |
+| 无控制台时 `GetStdHandle` 得 NULL ⇒ `get_handle` **返回** `Err(ERROR_INVALID_HANDLE)` | `sys/stdio/windows.rs:67-77` |
+| 吞掉该 `Err` 的是**调用方** `to_handle`（转成 null 句柄）——归属勿写反 | `sys/process/windows.rs:612-614` |
 | **仅当至少一个句柄非 null 才置 `STARTF_USESTDHANDLES`**（源码注释：与 Win7/Win8+ 行为一致） | `sys/process/windows.rs:360-369` |
+
+据此有**两条候选机制**，**explorer 那次命中哪一条仍未解释**（需真机句柄槽位取证）：
+
+1. **置了标志且其中带 NULL 项**：三路**全** NULL 时守卫为假、标志根本不置 ⇒ 按源码
+   **不该报错**（故「全 NULL」这一态解释不了 explorer 的那次失败）；但**混态**
+   （至少一路是有效非 NULL、其余 NULL）守卫为真 ⇒ 标志置上且**带 NULL 项** ⇒ 若
+   `CreateProcessW` 拒收 NULL 项则同样得 `ERROR_INVALID_HANDLE`。**未在真机验证**。
+2. **失效的非 NULL 值**：槽位里留着**已失效（非 NULL）**的句柄值（典型来源：由重定向过
+   stdio 的启动者拉起、启动者随后关闭了那些句柄）→ `to_handle` 的 `DuplicateHandle`
+   当场失败，错误码即 `ERROR_INVALID_HANDLE`（此时 `CreateProcessW` 可能**根本没被调用**）。
 
 推论：
 
 1. **「无控制台 ⇒ 继承的句柄是 NULL ⇒ CreateProcess 失败」这条链条不成立**：三路全为
    NULL 时 std 根本不把句柄交给 `CreateProcessW`，按源码不会报错。
-2. 真正能产生 `os error 6` 的可达路径是**槽位里留着失效的非 NULL 值**（典型来源：由
-   重定向过 stdio 的启动者拉起、启动者随后关闭了那些句柄）→ `to_handle` 的
-   `DuplicateHandle` 当场失败，错误码即 `ERROR_INVALID_HANDLE`（此时
-   `CreateProcessW` 可能**根本没被调用**）。
-3. 因此：**`resource.rs`（修改前）与 `inject/resume.rs:805`（修改前）完全同形**（三路全
-   继承 + `Command::spawn()`）——「resume 能起窗、explorer 报错」这一组合**无法**由该
-   机制解释（同形即同命）。要么 resume 其实也失败（只是没在真机上点过 / 被 wt→conhost
+2. 两条候选下「显式置 NUL stdio」都是对的：候选 1 下无害（本就是 NULL 语义，且不再把
+   NULL 项交给 OS），候选 2 下彻底绕开 `DuplicateHandle` 这条面 ⇒ 本次修复方向与
+   症状自洽，但**机制归属仍未定案**。
+3. **`resource.rs`（修改前）与 `inject/resume.rs:805`（修改前）完全同形**（三路全继承 +
+   `Command::spawn()`）——「resume 能起窗、explorer 报错」这一组合**无法**由上述任一
+   候选解释（同形即同命）。要么 resume 其实也失败（只是没在真机上点过 / 被 wt→conhost
    二次回退与合并错误文案掩盖），要么当时触发 explorer 失败的条件另有隐情
    （**具体启动方式**导致的失效句柄，例如由安装器/更新器拉起）。
-4. **本次 I3 的收敛是「同形加固」而不是「已验证的第二处缺陷」**：置 null stdio 在所有
-   路径上都安全，且彻底绕开 `DuplicateHandle` 这条面；但「resume 起窗是否也曾失败」
-   仍待真机取证。
+4. **I3 的收敛是「同形加固」而不是「已验证的第二处缺陷」**；J2 之后 resume 起窗**不再**
+   被置 NUL stdio（`ConsoleMode::OwnConsole` 一概不碰 stdio 与 creation_flags），
+   即那条路径保持改动前的继承语义，「resume 起窗是否也曾失败」仍待真机取证。
 
 **判定性实验（留给真机，30 分钟）**：
 
@@ -101,9 +111,10 @@
 摘门动作（**三处同步，缺一即残留**）：
 
 1. **判据单点**：`api::codex_app_form`（及其 4 个写入口的门）——改这一处即全端点同步；
-2. **前端文案**：删/改 `APP_FORM_PENDING_FALLBACK`（`src/mobile/api.ts`）与
-   `ModeBar` 的 `app_form_pending` 分诊分支（后端不再回该码后它们是死分支，
-   留着会把「开发中」误导文案挂在已可用的功能上）；
+2. **前端文案（四个消费者）**：`APP_FORM_PENDING_FALLBACK`（`src/mobile/api.ts`）+ 三处
+   分诊分支——`ModeBar`（切档）、`questionAnswerErrorCopy`（问答两入口）、
+   `approveErrorCopy`（审批卡两入口，第二轮 J1 补齐）。后端不再回该码后它们都是**死分支**，
+   留着会把「开发中」误导文案挂在已可用的功能上；
 3. **审计对账**：`refused:app_form_pending` 行应停止新增，回归既有
    `result = ok | failed:{e}`；
 4. **复核**：`src/pages/settings.tsx` 的 34a 注释（i18n 文案
