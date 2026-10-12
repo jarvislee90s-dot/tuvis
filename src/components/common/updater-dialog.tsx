@@ -274,14 +274,19 @@ export function UpdaterDialog({ manualCheck = false, autoOpen = true }: UpdaterD
   );
 }
 
-/** About 页手动检查：出结果前禁用按钮/出结果后给行内「已是最新」或错误 toast */
+/** About 页检查更新：手动（按钮）与自动（mount）两条路径共用同一条结果管线——
+ *  出结果前按钮禁用（checking）；无新版本给行内「已是最新」（showNoUpdate）；
+ *  仅手动路径在失败时 toast。自动路径静默是后端契约：cmd check_for_github_update
+ *  网络失败静默返回 error（src-tauri/src/commands/updater.rs），用户一个按钮都没点
+ *  就弹红条属于违约——断网/挂代理时开「关于」页不该挨一记报错 */
 export function useManualUpdateCheck() {
   const checkUpdate = useUpdaterStore((s) => s.checkUpdate);
   const checking = useUpdaterStore((s) => s.checking);
   const [showNoUpdate, setShowNoUpdate] = useState(false);
   const { t } = useTranslation();
 
-  const handleCheckUpdate = async () => {
+  /** silent = 失败不 toast（自动路径）；两条路径都落 store 结果 + 点亮「已是最新」行内提示 */
+  const runCheckUpdate = async (silent: boolean) => {
     setShowNoUpdate(false);
     const r = await checkUpdate();
 
@@ -289,7 +294,7 @@ export function useManualUpdateCheck() {
       setShowNoUpdate(true);
       return;
     }
-    if (r.status === "error") {
+    if (r.status === "error" && !silent) {
       // Rust 侧 message 自带定位线索（如「GitHub API 请求失败: connection refused」），
       // 不吞细节——弱网/代理/hosts 屏蔽场景用户第一眼就能看出卡在哪
       toast.error(t("updater.checkFailed", { message: r.message }));
@@ -298,5 +303,12 @@ export function useManualUpdateCheck() {
     // 默认 autoOpen=true 的消费方才自动弹窗）
   };
 
-  return { checkUpdate: handleCheckUpdate, checking, showNoUpdate };
+  return {
+    /** 手动检查（按钮）：失败 toast 带具体原因 */
+    checkUpdate: () => runCheckUpdate(false),
+    /** 自动检查（mount）：失败静默，仅落结果 */
+    checkUpdateSilent: () => runCheckUpdate(true),
+    checking,
+    showNoUpdate,
+  };
 }

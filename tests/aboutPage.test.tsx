@@ -4,7 +4,8 @@
 //    「检测到新版本」状态行；次按钮退场；弹窗不自动开（由主按钮显式打开）；检查恰好一次
 // T1b 点击主按钮 → 打开既有 UpdaterDialog 走既有安装流程（manualCheck + autoOpen=false）
 // T2 无新版本 → 维持「检查更新」次按钮 + upToDate 行内提示
-// T2b 检查失败 → toast 带具体原因（Rust message 不吞）；弹窗不开、主按钮不出
+// T2b mount 自动检查失败 → 静默不 toast（契约：网络失败静默）；弹窗不开、主按钮不出
+// T2c 手动点「检查更新」失败 → toast 带具体原因（Rust message 不吞）
 // T3 Star 横幅：默认可见；「去点 Star」openUrl 仓库；X 关闭写 localStorage
 //    （键含当前版本号，升级后重新出现）；重挂载不再出现（关闭记忆生效）
 // T3b localStorage 已有当前版本关闭态 → 横幅不出现
@@ -147,17 +148,35 @@ describe("关于页改版（自动检测 + 醒目更新入口 + 快捷行 + Star
     expect(screen.queryByText(/检测到新版本/)).not.toBeInTheDocument();
   });
 
-  it("T2b 检查失败 → toast 带具体原因；弹窗不开、主按钮不出", async () => {
+  it("T2b mount 自动检查失败 → 静默不 toast；弹窗不开、主按钮不出", async () => {
     mode.checkError = "GitHub API 请求失败: connection refused";
     render(<AboutPage />);
 
+    // 自动路径（用户没点任何按钮）：结果落 store 即视为已跑完，全程不得有 toast
+    await waitFor(() => expect(useUpdaterStore.getState().result?.status).toBe("error"));
+    expect(checkCalls()).toBe(1);
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(useUpdaterStore.getState().dialogOpen).toBe(false);
+    expect(screen.queryByRole("button", { name: /更新到 v/ })).not.toBeInTheDocument();
+    // 失败不占住按钮：checking 已回落，用户仍可自己再点一次
+    expect(screen.getByRole("button", { name: "检查更新" })).not.toBeDisabled();
+  });
+
+  it("T2c 点「检查更新」失败 → toast 带具体原因（手动路径才提示）", async () => {
+    mode.checkError = "GitHub API 请求失败: connection refused";
+    render(<AboutPage />);
+
+    // mount 那次自动检查静默落地后，手动再点一次
+    await waitFor(() => expect(useUpdaterStore.getState().result?.status).toBe("error"));
+    expect(toast.error).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "检查更新" }));
     await waitFor(() => {
       expect(toast.error).toHaveBeenCalledWith(
         "检查更新失败：GitHub API 请求失败: connection refused"
       );
     });
-    expect(useUpdaterStore.getState().dialogOpen).toBe(false);
-    expect(screen.queryByRole("button", { name: /更新到 v/ })).not.toBeInTheDocument();
+    expect(checkCalls()).toBe(2);
   });
 
   it("T3 Star 横幅：默认可见；去点 Star openUrl 仓库；X 关闭写版本化 localStorage 且重挂载不再现", async () => {
