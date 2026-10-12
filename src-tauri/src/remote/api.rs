@@ -1079,7 +1079,7 @@ const APP_FORM_PENDING_REASON: &str = "APP 会话该操作走协议通道，开�
 /// 止血门审计 result（「开发中」状态对账本可查：refused + 拒绝码，形如 failed:{e}）
 const APP_FORM_PENDING_AUDIT_RESULT: &str = "refused:app_form_pending";
 
-/// 止血门 409 回执（三入口共用同一形态：409 + error + reason）
+/// 止血门 409 回执（四处写入口共用同一形态：409 + error + reason）
 fn app_form_pending_response() -> Response {
     json_no_store(
         StatusCode::CONFLICT,
@@ -1088,6 +1088,41 @@ fn app_form_pending_response() -> Response {
             "reason": APP_FORM_PENDING_REASON,
         }),
     )
+}
+
+/// 止血门**拒绝臂审计单点**（2026-10-13 复评 S2 抽出；四处写入口共用：
+/// `session-mode/switch` / `session-mode/menu` / `session-question/answer` /
+/// `session-approve`）。
+///
+/// 抽出的理由不是行数，而是把「受门拒绝必须留痕」变成**结构约束**：新增第五个受门
+/// 写入口时只要调本函数，就不可能漏掉审计行——此前四处各写一遍
+/// `endpoint_audit(… "codex" … APP_FORM_PENDING_AUDIT_RESULT)`，口径靠人记，
+/// 而账本正是拿 `refused:app_form_pending` 对账的。
+///
+/// `agent_type` **不设参数**、恒记 `"codex"`：判据单点 [`codex_app_form`] 已保证进入
+/// 本函数时 `tool_id() == "codex"`，留参数只会给「传错工具」开口子。
+/// `content` / `action` 仍由各端点给出——摘要与成功臂**同源**（见各端点审计契约）。
+///
+/// 回执**不在此处**：各端点沿用自身统一错误壳（`app_form_pending_response` 或同形的
+/// `mode_menu_err`），载荷逐字节一致，故本函数只负责留痕。
+fn audit_app_form_pending(
+    st: &Arc<RemoteState>,
+    device_id: &str,
+    device_name: &str,
+    session_id: &str,
+    content: &str,
+    action: &str,
+) {
+    endpoint_audit(
+        st,
+        device_id,
+        device_name,
+        "codex",
+        session_id,
+        content,
+        action,
+        APP_FORM_PENDING_AUDIT_RESULT,
+    );
 }
 
 /// POST /m/api/v1/session-send（W4 直发/入队分派）：
@@ -3103,19 +3138,17 @@ pub async fn session_approve(
         Err(code) => {
             // codex APP 止血门（I2）：409 + 审计（其余校验失败码维持下方「零注入零
             // 审计」口径——本条是投递路拒绝，须留痕供事后核对，与三写入口同形）。
-            // 审计 tool 位恒 codex（判据单点 [`codex_app_form`] 只在 codex 命中）；
-            // action 走与成功臂**同一个**纯函数 [`approve_audit_action`]（防两臂词表
-            // 漂移），content = optionId（与成功臂同形，见端点文档的审计契约）。
+            // 留痕走单点 [`audit_app_form_pending`]（tool 恒 codex）；action 走与成功臂
+            // **同一个**纯函数 [`approve_audit_action`]（防两臂词表漂移），
+            // content = optionId（与成功臂同形，见端点文档的审计契约）。
             if code == APP_FORM_PENDING_CODE {
-                endpoint_audit(
+                audit_app_form_pending(
                     &st,
                     &device_id,
                     &device_name,
-                    "codex",
                     &sid,
                     &option_id,
                     approve_audit_action(&option_id),
-                    APP_FORM_PENDING_AUDIT_RESULT,
                 );
                 return app_form_pending_response();
             }
@@ -4839,21 +4872,11 @@ pub async fn session_question_answer(
         Ok(v) => v,
         Err(code) => {
             // codex APP 止血门（Task 3）：409 + 审计（投递路拒绝留痕——其余校验失败码
-            // 维持下方「零注入零审计」口径）。审计 tool 位恒 codex（判据单点
-            // codex_app_form 只在 codex 命中）；摘要 = 既有 audit_label 形态
-            //（select#2 / submit / …）。
+            // 维持下方「零注入零审计」口径）。留痕走单点 [`audit_app_form_pending`]
+            //（tool 恒 codex）；摘要 = 既有 audit_label 形态（select#2 / submit / …）。
             if code == APP_FORM_PENDING_CODE {
                 let audit_label = action.audit_label(answer_index);
-                endpoint_audit(
-                    &st,
-                    &device_id,
-                    &device_name,
-                    "codex",
-                    &sid,
-                    &audit_label,
-                    "answer",
-                    APP_FORM_PENDING_AUDIT_RESULT,
-                );
+                audit_app_form_pending(&st, &device_id, &device_name, &sid, &audit_label, "answer");
                 return app_form_pending_response();
             }
             // 校验失败零注入零审计（approve guards 同口径）：
@@ -7847,19 +7870,11 @@ pub async fn session_mode_menu(
     // ===== codex APP 止血门（Task 3）=====
     // 门位 = 会话定位后、一切屏读与注入**之前**（APP 无屏可读——先于守卫探测与菜单读）。
     // 审计摘要走与成功臂**同一个** [`menu_audit_content`]（M-a：三处各写一份迟早漂移）；
-    // pick 的 number 400 门在更后方，缺号时按缺省摘要如实记。tool 位恒 codex（判据单点）。
+    // pick 的 number 400 门在更后方，缺号时按缺省摘要如实记。留痕走单点
+    // [`audit_app_form_pending`]（tool 恒 codex——判据单点保证）。
     if codex_app_form(&session) {
         let audit_content = menu_audit_content(&action, req.number);
-        endpoint_audit(
-            &st,
-            &device_id,
-            &device_name,
-            &tool,
-            &sid,
-            &audit_content,
-            "mode",
-            APP_FORM_PENDING_AUDIT_RESULT,
-        );
+        audit_app_form_pending(&st, &device_id, &device_name, &sid, &audit_content, "mode");
         // 回执走本端点统一错误壳 `mode_menu_err`（error + reason）
         return mode_menu_err(
             StatusCode::CONFLICT,
@@ -8526,8 +8541,8 @@ pub async fn session_mode_switch(
         Ok(v) => v,
         Err(code) => {
             // codex APP 止血门（Task 3）：409 + 审计（其余校验失败码维持零审计口径
-            //——本条是投递路拒绝，须留痕供事后核对）。审计 tool 位恒 codex（判据
-            // 单点 codex_app_form 只在 codex 命中）。组词与档标签是纯函数，拒绝臂
+            //——本条是投递路拒绝，须留痕供事后核对）。留痕走单点
+            // [`audit_app_form_pending`]（tool 恒 codex）。组词与档标签是纯函数，拒绝臂
             // 就地重算：档标签与成功臂**同源**（tier 屏显标签，非 MamMode 通用名）；
             // 显式组与目标档错配（resolve_group Err）时按推断组如实记（None 推断 =
             // 该档实际所属组），两组均解析不出才兜底 Mode 组词（防御位——codex 全档
@@ -8544,16 +8559,7 @@ pub async fn session_mode_switch(
                 // [`mode_audit_content`]（M4：两臂各写一份格式化迟早漂移，而账本
                 // 正是拿它对账）
                 let audit_content = mode_audit_content(group, label);
-                endpoint_audit(
-                    &st,
-                    &device_id,
-                    &device_name,
-                    "codex",
-                    &sid,
-                    &audit_content,
-                    "mode",
-                    APP_FORM_PENDING_AUDIT_RESULT,
-                );
+                audit_app_form_pending(&st, &device_id, &device_name, &sid, &audit_content, "mode");
                 return app_form_pending_response();
             }
             let status = if code == "no_session" {
