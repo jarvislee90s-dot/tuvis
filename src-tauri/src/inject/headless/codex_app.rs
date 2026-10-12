@@ -55,6 +55,9 @@ use std::sync::Arc;
 // 计划明令复用（锚点 codex.rs:263-289）：rollout 文件名 UUID 唯一来源 + 单写者锁特征串
 // （跨通道纯函数复用，零运行时耦合；若后续上提到 turn.rs 由后续批次处理，勿在此复制实现）
 use super::codex::{resolve_thread, WRITER_LOCK_MARKER};
+// Task 7 可用性探测：复用 gate 的缓存纪律（ProbeCache/ProbeKey/probe_cached——
+// 平行 spec 结构，不扩 gate::ProbeSpec：探测体是交互式会话，不走 argv 单发探针族）
+use super::gate::{probe_cached, ProbeCache, ProbeKey, ProbeVerdict};
 
 /// `codex app-server` 子命令（裸 spawn = `<codex> app-server`）
 pub const APP_SERVER_ARG: &str = "app-server";
@@ -346,6 +349,10 @@ pub struct TurnStartReceipt {
     /// 受理态（探测：`inProgress`）
     pub status: Option<String>,
 }
+
+/// `turn/completed` 的 interrupted 终态词（探测 §1.5 活体；api.rs 切档回执的
+/// `interrupted` 字段同源——Task 7 提取常量防魔法串漂移）
+pub const TURN_STATUS_INTERRUPTED: &str = "interrupted";
 
 /// `turn/completed` 通知的观测产物
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -951,10 +958,18 @@ pub const FINISH_GRACE_MS: u64 = 5_000;
 #[cfg(not(test))]
 pub const STDERR_TAIL_LINES: usize = 8;
 
-/// 生产 spawn 规格（PATH 解析 codex——`.exe` 优先、垫片照认；os 运行期取值）
+/// PATH 解析 codex exe（`.exe` 优先、垫片照认；os 运行期取值）——[`production_spec`]
+/// 的解析单点，也是 Task 7 探测缓存键的 exe 来源（键用**垫片包装前**的解析路径，
+/// 不用 `SpawnSpec.argv[0]`——`.cmd` 垫片的 argv[0] 是 `cmd`，会撞键）
+#[cfg(not(test))]
+pub fn production_exe(path_env: &str, os: &str) -> Option<String> {
+    super::turn::cli_in_path("codex", path_env, os)
+}
+
+/// 生产 spawn 规格（PATH 解析 codex；os 运行期取值）
 #[cfg(not(test))]
 pub fn production_spec(path_env: &str, os: &str) -> Option<SpawnSpec> {
-    super::turn::cli_in_path("codex", path_env, os).map(|exe| SpawnSpec {
+    production_exe(path_env, os).map(|exe| SpawnSpec {
         argv: bare_argv(&exe, os),
     })
 }
@@ -1220,6 +1235,143 @@ pub fn app_arm_deps(home: Option<&std::path::Path>) -> AppArmDeps {
     }
 }
 
+// ============================================================
+// Task 7：app-server 可用性探测（设计 §3.5 版本门行 + §10 风险 2）
+// ============================================================
+
+/// 方法在场性探测集（T0.2/T0.5 定案方法面）：读回（`thread/read`）、档位写主载体①
+/// （`turn/start`）与兜底②（`thread/resume`）、中止（`turn/interrupt`）。schema 317
+/// 文件仅素材——**运行时以探测为准**（设计 §3.5）
+pub const PROBE_PRESENCE_METHODS: [&str; 4] = [
+    "thread/read",
+    "thread/resume",
+    "turn/start",
+    "turn/interrupt",
+];
+
+/// 探测降级文案前缀（api.rs 协议臂统一「协议面不可用：<原因>」——计划 Task 7 钉句；
+/// GET 载荷 `degraded` 的值即带本前缀的失败原因串）
+pub const PROBE_UNAVAILABLE_PREFIX: &str = "协议面不可用";
+
+/// 探测缓存（进程级；键 = codex exe 在场性 + mtime——版本漂移自动失效重探）。
+/// **独立于 `codex::probe_cache`**（CLI queue 探针）：两者 exe 同源，而
+/// [`ProbeCache`] 以 exe 串为格键——共用实例会互相覆盖结论
+static PROBE_CACHE: std::sync::LazyLock<ProbeCache> = std::sync::LazyLock::new(ProbeCache::default);
+
+/// app-server 探测缓存单点（api.rs 接线消费）
+pub fn probe_cache() -> &'static ProbeCache {
+    &PROBE_CACHE
+}
+
+/// 探测核心（纯缝参数化——单测直调：本地 cache + mock seam，零真实进程零网络）：
+/// spawn 裸实例 + initialize + [`PROBE_PRESENCE_METHODS`] 逐方法空参 ping。
+///
+/// # 方法在场性判据（零模型成本）
+/// ping 帧的 `params` 恒空对象——`turn/start` 无 threadId/input 必被参数面拒，
+/// 探针**绝不起真实回合**。应答分类只有缺席一罪：
+/// - `-32601`（method not found）→ 方法缺席 → 探测 fail（版本漂移的如实信号）；
+/// - **其余一切应答 = 在场**：`Ok` / `-32602` 参数面错 / **`-32600` + 单写者锁特征串**
+///   （writer 锁是方法分派后的语义拒，恰是在场证据——与 -32601 必须分清）/ 其他
+///   Rpc 错；通道面错误（EOF/IO/spawn/initialize 失败）→ fail。
+///
+/// **缓存纪律与 zcode/codex CLI 探针同款**（[`probe_cached`]）：成功长缓存 / 失败
+/// 5min TTL（[`gate::FAILURE_TTL_MS`]）/ 键含 exe mtime（codex 升级即失效重探——
+/// 防版本漂移时每动作都付一次失败 spawn，设计 §3.5 版本门行的初衷）。
+/// **同步阻塞**（spawn + 会话 IO）——调用方放 `spawn_blocking`。
+pub fn probe_app_server(
+    exe: &str,
+    spawn: &SpawnSeam,
+    spec: &SpawnSpec,
+    client: &ClientInfo,
+    cache: &ProbeCache,
+) -> ProbeVerdict {
+    let key = ProbeKey::of_exe(exe);
+    probe_cached(cache, key, || {
+        let started = std::time::Instant::now();
+        probe_body(spawn, spec, client).with_duration_ms(started.elapsed().as_millis() as u64)
+    })
+}
+
+/// 探测执行体（裸逻辑，不进缓存判定——只被 [`probe_app_server`] 的执行闭包调用）
+fn probe_body(spawn: &SpawnSeam, spec: &SpawnSpec, client: &ClientInfo) -> ProbeVerdict {
+    // spawn + initialize：握手失败一律通道面（spawn 失败 / EOF / 错误帧——握手没成
+    // 谈不上方法语义，与 [`AppServerSession::start`] 的归类同口径）
+    let mut s = match AppServerSession::start(spawn, spec, client) {
+        Ok(s) => s,
+        Err(AppServerError::Channel(m)) => {
+            return ProbeVerdict::fail(format!("app-server 通道不可用（spawn/initialize）：{m}"))
+        }
+        Err(e) => return ProbeVerdict::fail(format!("app-server 通道不可用：{e}")),
+    };
+    for method in PROBE_PRESENCE_METHODS {
+        match s.call(method, serde_json::json!({})) {
+            // -32601 = 方法缺席（版本漂移）——fail + 缺席方法名进原因；短路不再 ping
+            Err(AppServerError::MethodUnavailable { message, .. }) => {
+                s.close();
+                return ProbeVerdict::fail(format!(
+                    "app-server 方法缺席：{method}（{message}）——版本漂移，{PROBE_UNAVAILABLE_PREFIX}"
+                ));
+            }
+            // 通道面错误（EOF/IO）：探测中断，如实 fail
+            Err(AppServerError::Channel(m)) => {
+                s.close();
+                return ProbeVerdict::fail(format!(
+                    "app-server 探测中断（{method} 通道错误）：{m}"
+                ));
+            }
+            // 其余一切（Ok / -32600 writer 锁 / -32602 参数面 / 其他 Rpc）= 在场：
+            // 方法已分派，应答是语义层的；空参 ping 无协议副作用（零模型成本）
+            Ok(_) | Err(_) => {}
+        }
+    }
+    let ua = s.server_user_agent.clone();
+    s.close();
+    let ver = ua
+        .as_deref()
+        .map(|u| format!("；服务端 {u}"))
+        .unwrap_or_default();
+    ProbeVerdict::pass(format!(
+        "app-server 探测通过（initialize + {} 方法在场{ver}）",
+        PROBE_PRESENCE_METHODS.len()
+    ))
+}
+
+/// 端点侧探测入口（Task 7 接线——api.rs 的 POST 切档臂 / GET 载荷 `degraded` /
+/// cancel interrupt 臂前置）：PATH 解析 codex → [`probe_app_server`] + 进程级缓存
+/// [`probe_cache`]；不在 PATH → 如实 fail（零 spawn）。**同步阻塞**——调用方放
+/// `spawn_blocking`。
+pub fn probe_app_server_arm(cache: &ProbeCache) -> ProbeVerdict {
+    #[cfg(test)]
+    {
+        // 端点级测试钩子（零真实进程）：缺省 = **pass**——既有 6a/6b 端点用例的脚本面
+        // 只描述协议回合，探测作为新前置层不侵入其脚本；fail 专项用例经
+        // `test_hooks::set_probe` 显式装填。核心路径（缓存纪律/方法判定）由单测经
+        // [`probe_app_server`] 直测，不经本钩子
+        let _ = cache;
+        test_hooks::probe_verdict()
+    }
+    #[cfg(not(test))]
+    {
+        let os = std::env::consts::OS;
+        let path_env = std::env::var("PATH").unwrap_or_default();
+        let Some(exe) = production_exe(&path_env, os) else {
+            return ProbeVerdict::fail(format!(
+                "codex CLI 不可达（PATH 上未找到 codex）——{PROBE_UNAVAILABLE_PREFIX}"
+            ));
+        };
+        let spec = SpawnSpec {
+            argv: bare_argv(&exe, os),
+        };
+        probe_app_server(
+            &exe,
+            &production_spawn_seam(),
+            &spec,
+            &ClientInfo::mam(),
+            cache,
+        )
+    }
+}
+
 /// 端点级测试钩子（仅 `cfg(test)`）：server.rs 的端点用例经 [`app_arm_deps`] /
 /// [`policy_readback`] 取到这里的桩——**零真实进程、零真实 ~/.codex**。
 ///
@@ -1243,6 +1395,11 @@ pub mod test_hooks {
     /// 脚本桩队列：每 spawn 弹一队（一队 = 一枚实例的全部应答行）；耗尽 → spawn 失败
     static SCRIPTS: std::sync::LazyLock<Mutex<VecDeque<Vec<String>>>> =
         std::sync::LazyLock::new(|| Mutex::new(VecDeque::new()));
+    /// Task 7 探测门钩子（端点级）：缺省 None = **pass**（探测作为新前置层不侵入
+    /// 既有端点用例的脚本面）；fail 专项用例经 [`set_probe`] 显式装填。
+    /// 装填/断言须持 [`LOCK`]（与既有钩子同纪律——防并行用例互污）
+    static PROBE: std::sync::LazyLock<Mutex<Option<ProbeVerdict>>> =
+        std::sync::LazyLock::new(|| Mutex::new(None));
     /// 读回值（对任意 thread id 恒定——端点用例只关心「读到/读不到」两态）
     static READBACK: std::sync::LazyLock<Mutex<Option<String>>> =
         std::sync::LazyLock::new(|| Mutex::new(None));
@@ -1268,6 +1425,21 @@ pub mod test_hooks {
         SCRIPTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *READBACK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         SENT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *PROBE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 装填探测结论（Task 7；**调用方必须已持 [`LOCK`]**；None = 恢复缺省 pass）
+    pub(crate) fn set_probe(verdict: Option<ProbeVerdict>) {
+        *PROBE.lock().unwrap_or_else(|e| e.into_inner()) = verdict;
+    }
+
+    /// 取探测结论（缺省 = pass——「未注入 = 门控通过」，见 PROBE 文档）
+    pub(crate) fn probe_verdict() -> ProbeVerdict {
+        PROBE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| ProbeVerdict::pass("测试缺省：app-server 探测通过"))
     }
 
     /// 各实例发出的帧（按 spawn 序；每实例一个 Vec，帧为 JSON 原文）
@@ -2177,5 +2349,197 @@ s-2",
         s.close();
         drop(s);
         assert_eq!(log.lock().unwrap().instances.len(), 1);
+    }
+
+    // ============================================================
+    // Task 7：app-server 可用性探测（spawn + initialize + 方法在场性，零模型成本）
+    // ============================================================
+
+    /// 探测 exe 夹具（tempdir stub——ProbeKey 走真路径 stat，需要在场文件才能进执行体）
+    fn probe_exe_fixture() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("codex.exe");
+        std::fs::write(&exe, "stub").unwrap();
+        (dir, exe.to_string_lossy().to_string())
+    }
+
+    /// 全在场探测脚本：initialize + 4 方法各一应答帧（形态故意混搭：Ok / -32602 参数
+    /// 面错 / -32600 writer 锁——三种非 -32601 应答都是「在场」证据；ping 顺序见
+    /// [`PROBE_PRESENCE_METHODS`]：read → resume → start → interrupt）
+    fn probe_script() -> Vec<String> {
+        vec![
+            init_ok(),
+            // thread/read（id=2）：Ok = 在场
+            resp(2, r#"{"thread":{"id":"t"}}"#),
+            // thread/resume（id=3）：Ok = 在场
+            resp(3, r#"{"status":{"type":"idle"}}"#),
+            // turn/start（id=4）：-32602 参数面错 = 在场（空参 ping 无 threadId/input，
+            // 必被参数面拒——探针不起真实回合，零模型成本）
+            resp_err(4, -32602, "missing required field: threadId"),
+            // turn/interrupt（id=5）：-32600 + 单写者锁特征串 = 在场（方法分派后的
+            // 语义拒——Task 7 专项：与 -32601 必须分清）
+            resp_err(5, -32600, "thread 01a12b82 already has an active writer"),
+        ]
+    }
+
+    /// 计划 Task 7 主断言：initialize + 4 方法在场 → Pass；**零模型成本钉面**：方法
+    /// ping 帧 params 恒空对象（turn/start 不带 threadId/input——不起真实回合）；
+    /// 混搭应答形态（Ok / -32602 / -32600 writer 锁）都算在场
+    #[test]
+    fn codex_appserver_probe_passes_on_initialize_and_methods_present() {
+        let (_dir, exe) = probe_exe_fixture();
+        let (seam, log) = mock_spawn(vec![probe_script()]);
+        let cache = ProbeCache::default();
+        let v = probe_app_server(&exe, &seam, &spec(), &client_info(), &cache);
+        assert!(v.is_pass(), "{v:?}");
+        assert!(
+            matches!(&v, ProbeVerdict::Pass { detail, .. }
+                if detail.contains("4") && detail.contains("在场")),
+            "结论带方法数与「在场」措辞：{v:?}"
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(log.specs.len(), 1, "一枚短命实例");
+        assert!(log.instances[0].finished, "探测完优雅收尾（写者锁纪律）");
+        let start_frame = log.instances[0]
+            .sent
+            .iter()
+            .find(|f| f.contains("turn/start"))
+            .expect("turn/start ping 帧在场");
+        let frame: serde_json::Value = serde_json::from_str(start_frame).unwrap();
+        assert_eq!(
+            frame["params"],
+            serde_json::json!({}),
+            "方法 ping 空参——绝不起真实回合（零模型成本）"
+        );
+    }
+
+    /// -32601 → 探测 fail（unavailable + 原因）：缺席方法名进 hint；缺席后短路
+    /// （后续方法不再 ping）；失败路径也优雅收尾；结论进缓存（5min TTL 族）
+    #[test]
+    fn codex_appserver_probe_fails_when_method_absent() {
+        let (_dir, exe) = probe_exe_fixture();
+        let (seam, log) = mock_spawn(vec![vec![
+            init_ok(),
+            resp(2, r#"{"thread":{"id":"t"}}"#),
+            resp_err(3, -32601, "Method not found: thread/resume"),
+        ]]);
+        let cache = ProbeCache::default();
+        let v = probe_app_server(&exe, &seam, &spec(), &client_info(), &cache);
+        assert!(!v.is_pass(), "{v:?}");
+        let hint = v.hint().unwrap_or_default();
+        assert!(hint.contains("thread/resume"), "缺席方法名进原因：{hint}");
+        assert!(
+            hint.contains("-32601") || hint.contains("Method not found"),
+            "缺席判据（schema 面）进原因：{hint}"
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.instances[0].sent.len(),
+            3,
+            "缺席即短路：只发过 initialize + 两个 ping"
+        );
+        assert!(log.instances[0].finished, "失败路径也优雅收尾");
+        assert_eq!(cache.len(), 1, "失败结论也进缓存（FAILURE_TTL 族）");
+    }
+
+    /// 成功长缓存：命中后零 respawn（脚本只备一枚——第二次 spawn 会因脚本耗尽而
+    /// 失败，仍返回 pass 即「缓存命中未重探」的机器证明）
+    #[test]
+    fn codex_appserver_probe_cached_success_skips_respawn() {
+        let (_dir, exe) = probe_exe_fixture();
+        let (seam, log) = mock_spawn(vec![probe_script()]);
+        let cache = ProbeCache::default();
+        let v1 = probe_app_server(&exe, &seam, &spec(), &client_info(), &cache);
+        assert!(v1.is_pass());
+        let v2 = probe_app_server(&exe, &seam, &spec(), &client_info(), &cache);
+        assert!(
+            v2.is_pass(),
+            "缓存命中不重探（脚本已耗尽——respawn 必失败，pass 即零 respawn）：{v2:?}"
+        );
+        assert_eq!(log.lock().unwrap().specs.len(), 1, "只 spawn 过一枚实例");
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// 失败 TTL（5min 口径与 zcode/codex CLI 探针同款）：TTL 内失败结论原样命中
+    /// （零 spawn——通道坏着时不高频重探）；过期即重探（抖动恢复结论可上线）
+    #[test]
+    fn codex_appserver_probe_failure_ttl_5min() {
+        use super::super::gate::FAILURE_TTL_MS;
+        let now_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        };
+        let (_dir, exe) = probe_exe_fixture();
+        let key = ProbeKey::of_exe(&exe);
+        let cache = ProbeCache::default();
+        // ① TTL 内：失败结论原样命中，执行体零调用（零 spawn）
+        cache.put_at(key.clone(), ProbeVerdict::fail("瞬时抖动"), now_ms());
+        let (seam, log) = mock_spawn(vec![]);
+        let v = probe_app_server(&exe, &seam, &spec(), &client_info(), &cache);
+        assert_eq!(
+            v.hint(),
+            Some("瞬时抖动"),
+            "TTL 内原样复用失败结论（不重探不重写）：{v:?}"
+        );
+        assert!(
+            log.lock().unwrap().specs.is_empty(),
+            "TTL 内零 spawn（坏着时不重复付探测代价）"
+        );
+        // ② 过期：重探（脚本一枚）→ 抖动恢复结论上线并覆盖缓存
+        cache.put_at(
+            key.clone(),
+            ProbeVerdict::fail("旧失败"),
+            now_ms() - FAILURE_TTL_MS - 1,
+        );
+        let (seam, log) = mock_spawn(vec![probe_script()]);
+        let v = probe_app_server(&exe, &seam, &spec(), &client_info(), &cache);
+        assert!(v.is_pass(), "失败过期必须重探且恢复结论可用：{v:?}");
+        assert_eq!(log.lock().unwrap().specs.len(), 1);
+        assert!(
+            cache.get(&key).is_some_and(|c| c.is_pass()),
+            "恢复结论覆盖旧失败（成功长缓存）"
+        );
+    }
+
+    /// 探针语义专项（Task 7）：**-32600 + 单写者锁特征串 ≠ 方法缺席**——writer 锁
+    /// 是方法分派后的语义拒，恰是在场证据；全部方法都回 writer 锁形态 → 探测照过
+    /// （不误报缺席把通道判死）
+    #[test]
+    fn probe_writer_lock_response_counts_as_method_present() {
+        let (_dir, exe) = probe_exe_fixture();
+        let lock_resp =
+            |id: u64| resp_err(id, -32600, "thread 01a12b82 already has an active writer");
+        let (seam, _) = mock_spawn(vec![vec![
+            init_ok(),
+            lock_resp(2),
+            lock_resp(3),
+            lock_resp(4),
+            lock_resp(5),
+        ]]);
+        let v = probe_app_server(&exe, &seam, &spec(), &client_info(), &ProbeCache::default());
+        assert!(
+            v.is_pass(),
+            "writer 锁应答 = 方法在场（-32600 与 -32601 必须分清）：{v:?}"
+        );
+    }
+
+    /// initialize 失败（EOF / spawn 失败）→ 探测 fail 且原因走通道面（握手没成
+    /// 谈不上方法语义）；零方法 ping
+    #[test]
+    fn probe_initialize_failure_surfaces_channel_reason() {
+        let (_dir, exe) = probe_exe_fixture();
+        let (seam, log) = mock_spawn(vec![vec![]]); // EOF：spawn 成功但零输出即关
+        let v = probe_app_server(&exe, &seam, &spec(), &client_info(), &ProbeCache::default());
+        assert!(!v.is_pass());
+        let hint = v.hint().unwrap_or_default();
+        assert!(hint.contains("通道"), "握手失败归通道面：{hint}");
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.instances[0].sent.len(),
+            1,
+            "只发过 initialize——零方法 ping"
+        );
     }
 }

@@ -493,6 +493,22 @@ impl ProbeKey {
         }
     }
 
+    /// 单 exe 键（真 fs stat，无辅助产物面）。**Task 7 平行 spec 结构的键单点**：
+    /// codex app-server 探测体是交互式会话（spawn → initialize → 方法空参 ping，见
+    /// `codex_app::probe_app_server`），不流经 argv 单发探针族（[`ProbeSpec`] /
+    /// [`probe_argv`] / [`probe_round`]——强加变体要在多处 match 塞不可达臂），
+    /// 故不扩枚举、走平行结构；但**缓存键纪律同源**：exe 在场性 + mtime
+    /// （codex 升级即失效重探——版本漂移复核）。
+    pub fn of_exe(exe: &str) -> Self {
+        let (present, mtime) = stat_ms(exe);
+        Self {
+            exe: exe.to_string(),
+            exe_present: present,
+            exe_mtime_ms: mtime,
+            aux_mtime_ms: None,
+        }
+    }
+
     /// 纯构造（测试用；生产走 [`ProbeKey::of`]）
     pub fn of_parts(
         exe: &str,
@@ -1231,5 +1247,19 @@ mod tests {
                 "最终结论 = L0 的 fail 原样透传"
             );
         }
+    }
+
+    /// Task 7：单 exe 键推导（codex app-server 探测的平行 spec 结构键单点）——
+    /// 真 stat：在场带 mtime、缺席判 false、无辅助产物面
+    #[test]
+    fn probe_key_of_exe_stats_plain_binary() {
+        let exe = std::env::current_exe().expect("测试二进制路径");
+        let key = ProbeKey::of_exe(&exe.to_string_lossy());
+        assert!(key.exe_present, "自身二进制必然在场: {key:?}");
+        assert!(key.exe_mtime_ms.is_some());
+        assert_eq!(key.aux_mtime_ms, None, "单 exe 键无辅助产物面");
+        let bogus = ProbeKey::of_exe("mam-nonexistent-appserver-probe");
+        assert!(!bogus.exe_present);
+        assert!(bogus.exe_mtime_ms.is_none());
     }
 }

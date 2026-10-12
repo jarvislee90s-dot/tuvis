@@ -20211,6 +20211,11 @@ mod tests {
     /// ——止血门只拦写入口，读侧不是 409。
     #[tokio::test]
     async fn get_mode_and_menu_read_not_gated_for_app_form() {
+        // Task 7：GET 的 APP 面探测门后，本用例传递消费 codex_app 探测钩子（缺省
+        // pass → degraded 恒 null）——持 LOCK 防与探测 fail 专项用例并发互污
+        let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
+            .lock()
+            .await;
         let state = codex_form_state(
             FakeInjector::ok(),
             crate::session::ProcessForm::App,
@@ -20551,6 +20556,11 @@ mod tests {
     #[tokio::test]
     async fn headless_cancel_app_interrupt_vs_queue_stranded() {
         use crate::inject::headless::turn::{registry, TurnSlot};
+        // Task 7：interrupt 臂前置探测门后，本用例传递消费 codex_app 探测钩子（缺省
+        // pass）——持 LOCK 防与探测 fail 专项用例并发互污
+        let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
+            .lock()
+            .await;
         let state = codex_form_state(
             FakeInjector::ok(),
             crate::session::ProcessForm::App,
@@ -20627,6 +20637,187 @@ mod tests {
         }
         registry().end("sess_cxl_q");
         registry().end("sess_cxl_p");
+    }
+
+    /// Task 7 探测门（端点级）：探测 fail ⇒ ① GET /session-mode 的 `degraded` 置失败
+    /// 原因串（None=正常的反面钉值；surface 仍 "app"）；② POST 切档臂**降级回执不
+    /// 裸失败**——200 + status=failed + 「协议面不可用：<原因>」+ probe_unavailable 码
+    /// + 审计 refused:probe_unavailable；③ 协议臂零 spawn（门在串行锁与 spawn 之前
+    /// 拒收——脚本面留空，任何协议 spawn 都会被暴露）。
+    #[tokio::test]
+    async fn api_arm_returns_degraded_receipt_when_probe_fails() {
+        use crate::inject::headless::codex_app::test_hooks;
+        use crate::inject::headless::gate::ProbeVerdict;
+        let _hooks = test_hooks::LOCK.lock().await;
+        let tid = "01a60071-0000-4000-8000-000000000071";
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::App,
+            &[(tid, 171)],
+        );
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        // codex 不可达形态 + 零协议脚本（探测 fail ⇒ 根本不该起协议回合）
+        test_hooks::set(None, vec![], None);
+        test_hooks::set_probe(Some(ProbeVerdict::fail("测试注入：app-server 方法缺席")));
+        let app = router(state.clone());
+        // ① GET：degraded = 探测失败原因串（字段名与 Task 6a/8 钉死同名）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-mode?session_id={tid}"),
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(body.contains(r#""surface":"app""#), "{body}");
+        assert!(
+            body.contains(r#""degraded":"测试注入：app-server 方法缺席""#),
+            "GET degraded = 探测失败原因串（None=正常）：{body}"
+        );
+        // ② POST 切档臂：降级回执（不裸失败不 500）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-mode/switch",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{tid}","target":"never"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "降级回执不是 HTTP 错（不裸失败）");
+        let body = body_string(r).await;
+        assert!(body.contains(r#""status":"failed""#), "{body}");
+        assert!(
+            body.contains("协议面不可用：测试注入：app-server 方法缺席"),
+            "计划钉句「协议面不可用：〈原因〉」：{body}"
+        );
+        assert!(
+            body.contains(r#""code":"probe_unavailable""#),
+            "降级码供程序分诊：{body}"
+        );
+        // ③ 零协议 spawn + 审计行可查
+        assert!(
+            test_hooks::sent_frames().is_empty(),
+            "探测 fail ⇒ 零协议回合 spawn：{:?}",
+            test_hooks::sent_frames()
+        );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 5));
+        assert!(
+            audits[0].result.starts_with("refused:probe_unavailable"),
+            "审计如实（可查）：{:?}",
+            audits[0].result
+        );
+        test_hooks::clear();
+    }
+
+    /// Task 7：cancel 的 interrupt 臂前置探测门——codex_appserver 在飞回合（槽位已
+    /// armed）遇探测 fail ⇒ `cancelled:false` + 协议面不可用原因，**靶子不翻**
+    /// （armed 闭包零调用）、不落取消账（没有取消动作发生）；queue 滞留臂不经探测门
+    /// （对照腿：取消照常送达——补投走 queue 通道，不依赖协议面）。
+    #[tokio::test]
+    async fn cancel_interrupt_arm_gated_by_app_server_probe() {
+        use crate::inject::headless::codex_app::test_hooks;
+        use crate::inject::headless::gate::ProbeVerdict;
+        use crate::inject::headless::turn::{registry, TurnSlot};
+        let _hooks = test_hooks::LOCK.lock().await;
+        let state = codex_form_state(
+            FakeInjector::ok(),
+            crate::session::ProcessForm::App,
+            &[("sess_cxl_probe_i", 181), ("sess_cxl_probe_q", 182)],
+        );
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        test_hooks::set(None, vec![], None);
+        test_hooks::set_probe(Some(ProbeVerdict::fail("测试注入：CLI 不可达")));
+        // interrupt 臂靶子（翻旗可观测——gate 必须不翻）
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(registry().begin(
+            "sess_cxl_probe_i",
+            TurnSlot::placeholder("codex", "切换权限至 全自动".to_string())
+                .with_channel("codex_appserver"),
+        ));
+        {
+            let f = fired.clone();
+            registry().arm(
+                "sess_cxl_probe_i",
+                std::sync::Arc::new(move || {
+                    f.store(true, std::sync::atomic::Ordering::SeqCst);
+                    true
+                }),
+            );
+        }
+        // queue 滞留对照腿（不经探测门）
+        assert!(registry().begin(
+            "sess_cxl_probe_q",
+            TurnSlot::placeholder("codex", "补投正文".to_string())
+                .with_channel("headless_codex_queue"),
+        ));
+        registry().arm("sess_cxl_probe_q", std::sync::Arc::new(|| true));
+        let app = router(state.clone());
+        // interrupt 臂：探测 fail → cancelled:false + 原因；靶子未翻；不落取消账
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-headless-cancel",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_cxl_probe_i"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["cancelled"], false,
+            "探测 fail ⇒ 不翻靶子不谎报送达：{body}"
+        );
+        assert!(
+            v["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("协议面不可用")),
+            "降级原因如实：{body}"
+        );
+        assert!(
+            !fired.load(std::sync::atomic::Ordering::SeqCst),
+            "armed 靶子未翻（中止请求未送达）"
+        );
+        // queue 滞留臂：不经探测门（取消照常送达 + 撤回缺失明示）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-headless-cancel",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_cxl_probe_q"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["cancelled"], true, "queue 臂不受探测门影响：{body}");
+        // 只落 queue 腿一行取消账（interrupt 腿没有取消动作发生）
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 5));
+        assert_eq!(audits.len(), 1, "interrupt 腿不落取消账：{audits:?}");
+        assert_eq!(audits[0].channel, "headless_codex_queue");
+        registry().end("sess_cxl_probe_i");
+        registry().end("sess_cxl_probe_q");
+        test_hooks::clear();
     }
 
     /// ⑤ 非自持置灰（四分叉之四，T0.1 回填语义）：codex APP 会话**在跑**但 MAM 登记

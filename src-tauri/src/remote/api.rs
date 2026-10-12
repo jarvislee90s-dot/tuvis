@@ -1263,6 +1263,10 @@ const CODEX_APPSERVER_AUDIT_CHANNEL: &str = "codex_appserver";
 /// 不留无解释的孤儿回合）
 const CODEX_APP_POLICY_SWITCH_INPUT: &str = "切换审批档位";
 
+/// Task 7 探测门的降级回执码（协议面不可用——版本漂移/CLI 不可达/握手失败；探测
+/// fail ⇒ 跳过协议尝试直接降级回执，不裸失败不 500）
+const APP_PROBE_UNAVAILABLE_CODE: &str = "probe_unavailable";
+
 /// APP 会话无菜单通道的 reason（menu 端点 APP 分支）：open/pick 的编号是 CLI **屏上
 /// 实读值**，APP 无屏可读——菜单机制整体不适用（不新增菜单能力）；切档入口 =
 /// switch 端点协议臂
@@ -2320,8 +2324,10 @@ pub(crate) async fn codex_headless_dispatch_envelope(
     let plan = codex::dispatch(presence, &tref.id, &session.project_path, &payload);
     ctx.content = payload;
     // 4) 会话串行锁（占位后每条失败路径都必须注销槽位——否则该会话被自己的锁挡死）。
-    //    **声明计划通道**：取消审计行 channel 列从槽位取（Task 11 复审 Important 2）——
-    //    改道（exec→queue）时槽位仍是**计划**通道，取消行口径以此为准（回合行记实际走向）
+    //    **槽位通道声明**：取消审计行 channel 列从槽位取（Task 11 复审 Important 2）——
+    //    占位时记**计划**通道；改道（exec→queue）落定进消费等待时经
+    //    `turn::TurnRegistry::update_channel` 同步为实际通道（Task 6b review M-3：取消
+    //    端点按槽位通道词分叉，不同步则改道腿拿不到 queue 滞留语义），回合行记实际走向
     if !codex::registry().begin(
         &session.id,
         codex::TurnSlot::placeholder(&tool, ctx.content.clone())
@@ -4034,6 +4040,48 @@ pub async fn session_headless_cancel(
     } else {
         snap.channel.clone()
     };
+    // Task 7：cancel 的 **interrupt 臂**前置探测门（设计 §3.5 版本门行）——
+    // codex_appserver 在飞回合的中止依赖持连侧 `turn/interrupt`（协议面动作），
+    // 探测 fail（版本漂移/CLI 不可达）⇒ 如实降级：cancelled:false + 原因，**不翻
+    // 靶子**（armed 闭包零调用）、不落取消账（没有取消动作发生）；queue 滞留/exec
+    // kill 臂不经此门（queue 补投不依赖协议面、exec 走 H4 kill）。探测是阻塞 IO
+    // （缓存命中也含 fs stat）——spawn_blocking；缓存纪律 = 成功长缓存/失败 5min
+    // TTL/键含 exe mtime（坏通道不高频重探、升级即复核）
+    if channel == CODEX_APPSERVER_AUDIT_CHANNEL {
+        match tokio::task::spawn_blocking(|| {
+            crate::inject::headless::codex_app::probe_app_server_arm(
+                crate::inject::headless::codex_app::probe_cache(),
+            )
+        })
+        .await
+        {
+            Ok(v) => {
+                if let Some(hint) = v.hint() {
+                    return json_no_store(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "cancelled": false,
+                            "reason": format!(
+                                "{}：{hint}——中止请求未送达（在飞回合的协议中止依赖 turn/interrupt）",
+                                crate::inject::headless::codex_app::PROBE_UNAVAILABLE_PREFIX
+                            ),
+                        }),
+                    );
+                }
+            }
+            // 探测任务本身异常（join 失败）：门的面目未知——保守不翻靶子，如实请重试
+            Err(e) => {
+                log::error!("codex APP 探测任务异常（cancel interrupt 臂）: {e}");
+                return json_no_store(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "cancelled": false,
+                        "reason": "协议面状态未知（探测任务异常）——本次未取消，请重试",
+                    }),
+                );
+            }
+        }
+    }
     // queue 滞留分叉先记布尔（channel 串随后移进审计 ctx——用后即移，不留悬垂借用）
     let is_queue_stranded = channel == crate::inject::routing::HeadlessKind::CodexQueue.wire_name();
     match crate::inject::headless::turn::registry().request_cancel(&sid) {
@@ -7135,6 +7183,30 @@ use crate::inject::timing::POLL_STEP_MS;
 /// **每段的轮询步长**同为 `timing::POLL_STEP_MS`（100ms，五路同节奏）。
 pub use crate::inject::timing::QUESTION_STAGE_POLL_TOTAL_MS;
 
+/// `session_question_answer` 会话定位 + 双通道复核的分支产物（Task 6b 双臂）：
+/// [`AnswerLookup::Terminal`] = CLI 键序面（固化不动——会话 + 静态/阶段机序列）；
+/// [`AnswerLookup::AppRepost`] = codex APP 补投臂（模板三型组装完的作答文本，分派
+/// 经 H8 queue 通道——**不走协议面，无 Task 7 探测门**）。端点契约见 fn 文档
+enum AnswerLookup {
+    /// CLI 键序面（固化不动）：会话 + 静态/阶段机序列与既有载荷
+    Terminal {
+        session: crate::session::Session,
+        seq: Vec<String>,
+        q: crate::inject::question::Question,
+        tool_id: &'static str,
+        multi_question: bool,
+        pages: usize,
+        payload_questions: Vec<String>,
+        expected_idx: Option<usize>,
+        q_idx: usize,
+    },
+    /// codex APP 补投臂：模板三型组装完的作答文本（分派经 H8 queue 通道）
+    AppRepost {
+        session: crate::session::Session,
+        text: String,
+    },
+}
+
 /// POST /m/api/v1/session-question/answer（T8 问答应答；**丁T5 起提交/自由作答走阶段机**）：
 /// 参数校验 → 会话/隔离/双通道复核（spawn_blocking）→ **按动作分派**：
 ///
@@ -7181,28 +7253,6 @@ pub use crate::inject::timing::QUESTION_STAGE_POLL_TOTAL_MS;
 /// 键序（APP 无控制台——键序是错误通道），有作答文本的动作经 H8 queue 通道补投
 /// （模板三型 → [`codex_app_answer_repost_text`] → [`codex_headless_dispatch_envelope`]），
 /// 回执 `screen:null` + 引导文案「已补投为消息，请回 APP 核对题面」——**永不声称
-/// 已作答**；无作答文本的动作（切题/提交/中止）→ 409 `app_form_no_repost` 如实拒。
-/// CLI 形态零变化（下方 Terminal 臂原样）
-enum AnswerLookup {
-    /// CLI 键序面（固化不动）：会话 + 静态/阶段机序列与既有载荷
-    Terminal {
-        session: crate::session::Session,
-        seq: Vec<String>,
-        q: crate::inject::question::Question,
-        tool_id: &'static str,
-        multi_question: bool,
-        pages: usize,
-        payload_questions: Vec<String>,
-        expected_idx: Option<usize>,
-        q_idx: usize,
-    },
-    /// codex APP 补投臂：模板三型组装完的作答文本（分派经 H8 queue 通道）
-    AppRepost {
-        session: crate::session::Session,
-        text: String,
-    },
-}
-
 pub async fn session_question_answer(
     State(st): State<Arc<RemoteState>>,
     headers: axum::http::HeaderMap,
@@ -9965,6 +10015,11 @@ struct ModeScanHit {
     /// ——T0.5 定案真源；None = 读不到〔无记录/null/不可读〕→ 前端「模式未知，请人工
     /// 核对 APP」保守降级）。非 codex-APP 形态恒 None
     app_policy_readback: Option<String>,
+    /// Task 7：codex APP 面的协议可用性降级原因（ProbeCache 探测 fail 的 hint 串；
+    /// None = 正常/非 APP 面）——GET 载荷 `degraded` 字段的赋值来源。**探测是 GET 的
+    /// 附加面**：GET 自身数据路（rollout 读回）不走协议，`degraded` 只标记**协议动作**
+    /// （切档/中止）可用性，供前端 ModeBarApp 只读灰置（Task 8 消费）
+    app_probe_degraded: Option<String>,
 }
 
 /// 模式扫描（同步，spawn_blocking 内调用）：会话查找 → 结构表 → 屏读（一次）解析
@@ -9994,6 +10049,19 @@ fn mode_scan_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<ModeScanHit
     } else {
         (read_mode_from_screen(st, &session, &tool, readback), None)
     };
+    // Task 7：APP 面协议可用性探测（GET 载荷 `degraded` 的赋值来源——字段名与
+    // Task 6a/8 钉死同名，None=正常）。本函数恒在 spawn_blocking 内调用（探测的
+    // spawn/initialize 阻塞 IO 不占 async 线程）；缓存纪律 = 成功长缓存/失败 5min
+    // TTL/键含 exe mtime。CLI/其余形态恒 None（载荷 degraded=null 不变）
+    let app_probe_degraded = if codex_app_form(&session) {
+        crate::inject::headless::codex_app::probe_app_server_arm(
+            crate::inject::headless::codex_app::probe_cache(),
+        )
+        .hint()
+        .map(str::to_string)
+    } else {
+        None
+    };
     Some(ModeScanHit {
         tool,
         current,
@@ -10002,6 +10070,7 @@ fn mode_scan_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<ModeScanHit
         structure,
         session,
         app_policy_readback,
+        app_probe_degraded,
     })
 }
 
@@ -10334,10 +10403,10 @@ pub async fn session_mode(
             "groups": groups,
             // Task 6a：交互面单点下发——"app"= codex APP 协议面 / "terminal"= 终端
             // 键序面（含全部 CLI 会话与其余工具）；`degraded` = 协议可用性降级原因
-            // 串（None=正常；**赋值来源归 Task 7** 的 ProbeCache 探测——字段名与
-            // Task 7/8 两侧钉死同名，本任务恒 null）
+            // 串（None=正常；**赋值来源 = Task 7 的 ProbeCache 探测**——mode_scan_sync
+            // 内探测，APP 面 fail 时置 hint 串，字段名与 Task 6a/8 两侧钉死同名）
             "surface": if app_surface { "app" } else { "terminal" },
-            "degraded": serde_json::Value::Null,
+            "degraded": serde_json::json!(hit.app_probe_degraded),
         }),
     )
 }
@@ -11316,12 +11385,68 @@ async fn codex_app_mode_switch_arm(
     };
     let label = codex_app_policy_label(policy);
     let audit_content = format!("切换权限至 {label}");
+    // 0') Task 7 可用性探测门（设计 §3.5 版本门行 + §10 风险 2）：协议面动作前置
+    //     探测（spawn + initialize + 方法在场性——缓存纪律：成功长缓存/失败 5min
+    //     TTL/键含 exe mtime，防版本漂移时每动作都付一次失败 spawn）。门在串行锁
+    //     **之前**：拒收零槽位副作用；fail ⇒ 跳过协议尝试直接降级回执（不裸失败
+    //     不 500）。探测是阻塞 IO——spawn_blocking
+    {
+        let verdict = match tokio::task::spawn_blocking(|| {
+            crate::inject::headless::codex_app::probe_app_server_arm(
+                crate::inject::headless::codex_app::probe_cache(),
+            )
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("codex APP 探测任务异常（切档臂）: {e}");
+                codex_appserver_audit(
+                    &st,
+                    &device_id,
+                    &device_name,
+                    &sid,
+                    &audit_content,
+                    "failed:internal",
+                    0,
+                );
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        };
+        if let Some(hint) = verdict.hint() {
+            codex_appserver_audit(
+                &st,
+                &device_id,
+                &device_name,
+                &sid,
+                &audit_content,
+                "refused:probe_unavailable",
+                verdict.duration_ms(),
+            );
+            return json_no_store(
+                StatusCode::OK,
+                serde_json::json!({
+                    "status": "failed",
+                    "error": format!(
+                        "{}：{hint}",
+                        codex_app::PROBE_UNAVAILABLE_PREFIX
+                    ),
+                    "code": APP_PROBE_UNAVAILABLE_CODE,
+                }),
+            );
+        }
+    }
     // 0) 会话串行锁 + 取消靶子（Task 6b 中止臂接线）：与 queue/exec 分派共 turn
     //    登记表（同会话防两回合交错）；channel = 协议臂审计词 = cancel 端点「MAM
     //    自持协议回合」的**分叉判据**（在飞标记）。armed 靶子 = 置取消旗——回合自身
     //    的持连侧读旗后发 turn/interrupt（T0.1：自持 31ms 生效；跨连接会被写者锁拒，
     //    故不在 cancel 端点侧起新连接发）。占位后每条退出路径都必须注销槽位
-    //    （await 收口处统一 end——cancel 端点不注销，先到者语义同其他通道）
+    //    （**守卫化**〔review I-1〕：注销点在 spawn_blocking 闭包首行的
+    //    CodexAppSlotGuard——任一返回/早退/panic 路径随 Drop 注销，handler 侧不再
+    //    end；cancel 端点不注销，先到者语义同其他通道）
     let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if !crate::inject::headless::turn::registry().begin(
         &sid,
@@ -11541,7 +11666,8 @@ async fn codex_app_mode_switch_arm(
                     "status": "app_switch",
                     // Task 6b：在飞回合被远程中止的如实标注（cancel 端点 → armed 靶子
                     // → 持连侧 turn/interrupt → 完成帧 status=interrupted 自然流入）
-                    "interrupted": r.turn_completion.status.as_deref() == Some("interrupted"),
+                    "interrupted": r.turn_completion.status.as_deref()
+                        == Some(codex_app::TURN_STATUS_INTERRUPTED),
                     "verified": verified,
                     // 核对三态（Task 8 消费：mismatch/ineffective → 不采信本地记忆、重拉 GET）
                     "verify": verify_word,
