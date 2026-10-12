@@ -717,9 +717,11 @@ pub fn focus_hwnd(hwnd_val: isize) -> Result<(), String> {
 
 /// spawn tuvis-marker helper（helper 在场检查 + CREATE_NO_WINDOW 防闪窗 + null
 /// stdio）。返回是否成功派发：helper 缺失（未随包分发/被清理，合法状态）或
-/// spawn 失败（如 AV 拦截执行）均静默 false，调用方自行决定是否回落
+/// spawn 失败（如 AV 拦截执行）均静默 false，调用方自行决定是否回落。
+///
+/// I3：走统一出口 [`crate::window::detached::spawn_detached`]（此前就地裸 spawn 且
+/// **漏了 stdin**——同形缺口；统一后三个句柄一致置空，防 release 版 os error 6）。
 fn spawn_marker_helper(args: &[&str]) -> bool {
-    use std::os::windows::process::CommandExt;
     let helper = dirs::home_dir()
         .unwrap_or_default()
         .join(".tuvis")
@@ -728,13 +730,9 @@ fn spawn_marker_helper(args: &[&str]) -> bool {
     if !helper.is_file() {
         return false;
     }
-    std::process::Command::new(&helper)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(0x0800_0000)
-        .spawn()
-        .is_ok()
+    let mut cmd = std::process::Command::new(&helper);
+    cmd.args(args);
+    crate::window::detached::spawn_detached(&mut cmd, false).is_ok()
 }
 
 /// 跳转前按需注入（spec 2026-09-12 §3.2）：spawn helper 附加目标会话控制台贴

@@ -802,7 +802,14 @@ pub fn spawn_terminal(spec: &SpawnSpec) -> Result<(), String> {
                 // CREATE_NEW_CONSOLE：为 conhost 回退开全新控制台窗
                 cmd.creation_flags(0x0000_0010);
             }
-            cmd.spawn()
+            // 统一出口（I3）：置 null stdio 不再触碰 GUI 宿主继承的 std 句柄——真机在
+            // 同形的 explorer 派发点上复现过 os error 6，本处修改前同为「三路全继承 +
+            // spawn()」。**根因定案状态**：本处是否真会失败未在 Windows 真机验证
+            //（属同形加固，不是已验证的第二处缺陷），机制与定案实验见
+            // [`crate::window::detached`] 模块文档。
+            // needs_console=true：本条就是要开一个终端窗（wt / conhost 回退），不得补
+            // CREATE_NO_WINDOW（会把窗口压掉）
+            crate::window::detached::spawn_detached(&mut cmd, true)
                 .map(|_| ())
                 .map_err(|e| format!("终端启动失败（{program}）：{e}"))
         }
