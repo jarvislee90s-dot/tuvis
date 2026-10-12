@@ -1,10 +1,10 @@
-// 资源视图测试共用夹具（「按资源」卡片 与 资源大表弹窗两个用例文件）：
-// 两边断言的是同一份数据口径（段头计数 / tab 计数 / 行过滤），夹具各自复制一份的话，
-// 一旦有人只改一处，两个文件会各绿各的、谁也没错。
+// 资源视图测试共用夹具（「按资源」卡片 / 资源大表弹窗 / 「按工具」视图三个用例文件）：
+// 它们断言的是同一份数据口径（段头与 tab 计数 / 行过滤 / 工具列），夹具各自复制一份的话，
+// 一旦有人只改一处，几个文件会各绿各的、谁也没错。
 import type { SsotResource } from "@/types/extension";
 
-/** 省略字段的 SsotResource 构造器（默认 kind=skill、无启用工具） */
-export const res = (o: Partial<SsotResource>): SsotResource => ({
+/** 省略字段的 SsotResource 构造器（默认 kind=skill、无启用工具）；仅供本模块构造夹具用 */
+const res = (o: Partial<SsotResource>): SsotResource => ({
   name: "x",
   kind: "skill",
   enabledTools: [],
