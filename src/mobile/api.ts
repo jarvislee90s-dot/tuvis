@@ -987,6 +987,34 @@ export function questionAnswerErrorCopy(e: ApiError): string {
   return e.message;
 }
 
+/** 审批应答**错误码 → 用户可读中文文案**（第二轮复评 J1 抽出：ApproveCard 的
+ *  `handleAnswer` / `handleFeedbackStart` 两处 catch 本来就各写一套同义 `if/else`，
+ *  且**都没有**消费 Task 15 止血门的 `app_form_pending` → 用户屏幕上出现
+ *  「session-approve 409」这种无意义串。与 [`questionAnswerErrorCopy`] 同一条纪律：
+ *  一码一文案、单点映射，调用方勿另写一套）。
+ *
+ *  取值来源：后端 `remote::api::session_approve` 的 409/404 错误码
+ *  （`not_waiting` / `no_mapping` / `no_session` / `app_form_pending`；
+ *  另有 `bad_request` 兜底）。码不在表内 → 回原 message（不编文案）。
+ *
+ *  **收敛带来的行为变化（有意，如实申报）**：`no_mapping` 原先只在 `handleAnswer`
+ *  有映射，`handleFeedbackStart` 落到 `e.message`；两处合并后反馈入口同样给出
+ *  「该工具暂不支持审批应答，请用普通发送」——严格优于原来的无意义串。 */
+export function approveErrorCopy(e: ApiError): string {
+  const code = typeof e.data?.error === "string" ? e.data.error : null;
+  if (code === "not_waiting") return "会话不在等待状态";
+  if (code === "no_mapping") return "该工具暂不支持审批应答，请用普通发送";
+  if (code === "no_session") return "会话已结束，请返回看板刷新";
+  // Task 15 止血门（I2 新开的 409 出口）：codex APP 会话的审批写动作走协议通道
+  //（开发中）——**必须**消费这条码，否则用户看到的是「session-approve 409」。
+  // 文案用后端 `reason`（单一来源），缺省走同一个 [`APP_FORM_PENDING_FALLBACK`]
+  //（与问答侧 / ModeBar 侧同一常量，三入口不漂移）
+  if (code === "app_form_pending") {
+    return typeof e.data?.reason === "string" ? e.data.reason : APP_FORM_PENDING_FALLBACK;
+  }
+  return e.message;
+}
+
 /** 问答一键应答（T8；丁T5 起支持 freeText）。index = 选项序号（0 起；select/toggle
  *  必填）；text = 自由作答正文（freeText 必填；后端归一后走**字符通道**注入，
  *  不带 `[mobile]` 签名）。

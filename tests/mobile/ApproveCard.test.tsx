@@ -712,3 +712,62 @@ describe("ApproveCard：计划批准卡（2026-10-04）", () => {
     );
   });
 });
+
+// ==== Task 15 止血门（第二轮复评 J1）：session-approve 409 的前端分诊 ====
+// I2 给 `session-approve` 新开了一个 409 出口（codex APP 会话的四条写路径之一），
+// 而 ApproveCard 两处 catch（点选项 / 点反馈项）都没消费该码 → 用户屏幕上出现
+// 「session-approve 409」。本组钉住：两处入口都走 api.ts 的 `approveErrorCopy` 单点，
+// 渲染后端中文引导、且不含「409」。
+// 断言一律用**字面量**中文，不 import `APP_FORM_PENDING_FALLBACK` 去比对自身——
+// 否则常量一改用例照样绿，退化成循环断言（既有 mobile 用例同此惯例）。
+describe("ApproveCard：app_form_pending 分诊（Task 15 止血门）", () => {
+  /** 后端下发的引导原文（与 api.rs 的 APP_FORM_PENDING_REASON 逐字同义） */
+  const REASON = "APP 会话该操作走协议通道，开发中——请在 APP 内操作";
+
+  it("点选项遇 409 app_form_pending + reason：渲染后端中文引导（不是「session-approve 409」）", async () => {
+    installFetch();
+    routes.options = approveOptions();
+    routes.approveStatus = 409;
+    routes.approveBody = { error: "app_form_pending", reason: REASON };
+    render(<ApproveCard session={{ id: "sess-app-form-1" }} />);
+    fireEvent.click(await screen.findByTestId("approve-option-approve"));
+    const err = await screen.findByTestId("approve-error");
+    expect(err.textContent).toBe(REASON);
+    expect(err.textContent).not.toContain("409");
+  });
+
+  it("app_form_pending 无 reason（旧后端/异体）→ 同义兜底，仍不显示「... 409」", async () => {
+    installFetch();
+    routes.options = approveOptions();
+    routes.approveStatus = 409;
+    routes.approveBody = { error: "app_form_pending" };
+    render(<ApproveCard session={{ id: "sess-app-form-2" }} />);
+    fireEvent.click(await screen.findByTestId("approve-option-approve"));
+    const err = await screen.findByTestId("approve-error");
+    expect(err.textContent).toBe(REASON);
+    expect(err.textContent).not.toContain("409");
+  });
+
+  it("点反馈项（planDialog 形态）遇 409 app_form_pending：反馈入口同样分诊（收敛后不再漏）", async () => {
+    installFetch();
+    routes.options = approveOptions({
+      dialog: true,
+      planDialog: true,
+      feedbackOption: "dialog:3",
+      options: [
+        { id: "dialog:1", label: "Yes, and use auto mode" },
+        { id: "dialog:2", label: "Yes, manually approve edits" },
+        { id: "dialog:3", label: "Tell Claude what to change" },
+      ],
+    });
+    routes.approveStatus = 409;
+    routes.approveBody = { error: "app_form_pending", reason: REASON };
+    const onReady = vi.fn();
+    render(<ApproveCard session={{ id: "sess-app-form-3" }} onPlanFeedbackReady={onReady} />);
+    fireEvent.click(await screen.findByTestId("approve-option-feedback"));
+    const err = await screen.findByTestId("approve-error");
+    expect(err.textContent).toBe(REASON);
+    expect(err.textContent).not.toContain("409");
+    expect(onReady).not.toHaveBeenCalled();
+  });
+});
