@@ -774,3 +774,40 @@ describe("ModeBar：T5 codex 回执消费（observed）", () => {
     expect(receipt.textContent).toBe("屏已切换至 操作（预期 计划）——请人工核对终端");
   });
 });
+
+// ==== Task 15 止血门（2026-10-12）前端分诊：codex APP 会话的写动作 =====
+// 后端对 form=App ∧ tool=codex 的模式/权限/问答写入口 409 `app_form_pending` +
+// 中文 reason。**前端必须消费这条码**：不消费则 ModeBar 的 409 兜底分支把
+// 「session-mode/switch 409」这种对用户无意义的串显示出来（本仓库既有教训，
+// 见 api.ts 的 questionAnswerErrorCopy 注释），止血门的用户价值只落地一半。
+// 文案遵循既有惯例：后端 `reason` 在场用 reason（单一来源），缺省用同义兜底常量
+// （`APP_FORM_PENDING_FALLBACK`，与问答侧同一常量——两入口不漂移）。
+describe("Task 15 止血门：app_form_pending 分诊", () => {
+  /** 后端下发的引导原文（与 api.rs 的 APP_FORM_PENDING_REASON 逐字同义） */
+  const REASON = "APP 会话该操作走协议通道，开发中——请在 APP 内操作";
+
+  it("409 app_form_pending + reason：渲染后端中文引导（不是「session-mode/switch 409」）", async () => {
+    installFetch();
+    routes.mode = codexTwoAxis();
+    routes.switchStatus = 409;
+    routes.switchBody = { error: "app_form_pending", reason: REASON };
+    render(<ModeBar session={{ id: "app-sw-1" }} />);
+    // 二版 chips：current=plan → 点另一档「操作」chip 发切换
+    fireEvent.click(await screen.findByTestId("mode-switch-mode-default"));
+    const err = await screen.findByTestId("mode-error");
+    expect(err.textContent).toBe(REASON);
+    expect(err.textContent).not.toContain("409");
+  });
+
+  it("app_form_pending 无 reason（旧后端/异体）→ 同义兜底，仍不显示「... 409」", async () => {
+    installFetch();
+    routes.mode = codexTwoAxis();
+    routes.switchStatus = 409;
+    routes.switchBody = { error: "app_form_pending" };
+    render(<ModeBar session={{ id: "app-sw-2" }} />);
+    fireEvent.click(await screen.findByTestId("mode-switch-mode-default"));
+    const err = await screen.findByTestId("mode-error");
+    expect(err.textContent).toBe(REASON);
+    expect(err.textContent).not.toContain("409");
+  });
+});

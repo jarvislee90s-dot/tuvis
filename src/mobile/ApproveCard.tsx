@@ -13,9 +13,8 @@
 //   available=false 且无 reason（非 Waiting / 无映射 / 未命中）→ 卡自隐（原惯例）；
 // - 应答：POST /session-approve——key_sent → 「已发送按键」终态（按钮禁用）；
 //   failed{error} → 错误文案可重试（按钮保持可点，重按即重试）；ApiError（409/404
-//   带 data.error）→ 分診中文文案：not_waiting→「会话不在等待状态」、no_mapping→
-//   「该工具暂不支持审批应答，请用普通发送」、no_session→「会话已结束，请返回看板刷新」、
-//   其余显示 message。
+//   带 data.error）→ 中文文案走**单点映射** [`approveErrorCopy`]（api.ts；两处入口
+//   ——点选项与点反馈项——共用同一函数，不另写一套 if/else）。
 // 局限（本任务范围裁决）：mount 只拉一次选项，卡内不做轮询——红卡的出现/消失依赖
 // 页面数据刷新（SSE 快照 → 详情页重挂/卸载）自然带动；SSE 驱动卡内 re-fetch 属
 // Task 12 后优化，不在本任务范围。
@@ -23,7 +22,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import InteractiveCard, { type InteractiveCardTone } from "./InteractiveCard";
-import { ApiError, fetchApproveOptions, sessionApprove, type ApproveOptionsView } from "./api";
+import {
+  ApiError,
+  approveErrorCopy,
+  fetchApproveOptions,
+  sessionApprove,
+  type ApproveOptionsView,
+} from "./api";
 
 interface ApproveCardProps {
   /** 会话（本组件消费 id 与 status；结构化类型，完整 Session 可直接传入）。
@@ -185,20 +190,9 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
           setError(res.error);
         }
       } catch (e) {
-        if (e instanceof ApiError) {
-          const code = typeof e.data?.error === "string" ? e.data.error : null;
-          if (code === "not_waiting") {
-            setError("会话不在等待状态");
-          } else if (code === "no_mapping") {
-            setError("该工具暂不支持审批应答，请用普通发送");
-          } else if (code === "no_session") {
-            setError("会话已结束，请返回看板刷新");
-          } else {
-            setError(e.message);
-          }
-        } else {
-          setError(String(e));
-        }
+        // 错误码 → 中文文案走**单点映射**（[`approveErrorCopy`]）：点选项与点反馈项
+        // 两条入口用同一个函数，两处不再各写一套同义 if/else（复评 J1 抽出）
+        setError(e instanceof ApiError ? approveErrorCopy(e) : String(e));
       } finally {
         setBusy(false);
       }
@@ -222,18 +216,9 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
         setError(res.error);
       }
     } catch (e) {
-      if (e instanceof ApiError) {
-        const code = typeof e.data?.error === "string" ? e.data.error : null;
-        if (code === "not_waiting") {
-          setError("会话不在等待状态");
-        } else if (code === "no_session") {
-          setError("会话已结束，请返回看板刷新");
-        } else {
-          setError(e.message);
-        }
-      } else {
-        setError(String(e));
-      }
+      // 与点选项同一单点映射（[`approveErrorCopy`]）——反馈入口此前的无映射分支
+      //（no_mapping 落到 e.message）由收敛一并补齐，见该函数 doc
+      setError(e instanceof ApiError ? approveErrorCopy(e) : String(e));
     } finally {
       setBusy(false);
     }

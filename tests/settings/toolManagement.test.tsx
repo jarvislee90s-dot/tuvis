@@ -1,7 +1,7 @@
 // tests/settings/toolManagement.test.tsx — review F7①②：工具管理批量保存 happy path
 // 与未保存离开「放弃更改」路径（mock invoke，断言 IPC 入参与确认弹窗分类文案）
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
@@ -67,6 +67,11 @@ beforeEach(() => {
   });
 });
 
+// 语言是 i18n 单例状态：zh 用例结束必须还原 en，避免污染同文件既有英文断言
+afterEach(async () => {
+  await i18n.changeLanguage("en");
+});
+
 const renderPage = () =>
   render(
     <QueryClientProvider client={new QueryClient()}>
@@ -130,7 +135,7 @@ describe("工具管理（review F7①②）", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("update_tool_settings", expect.anything());
     // 回到工具分区：开关为已保存状态（checked）、dirty 已重置（无保存按钮）
     // 2026-10-06 两级导航：侧栏点击目标由「分区名」变为「块」（块内多卡并置），用 testid 更稳
-  fireEvent.click(await screen.findByTestId("settings-nav-tools"));
+    fireEvent.click(await screen.findByTestId("settings-nav-tools"));
     const opencode = await screen.findByText("OpenCode");
     const row = opencode.closest("div[class*='justify-between']") as HTMLElement;
     expect(row.querySelector('[role="switch"]')).toHaveAttribute("data-state", "checked");
@@ -151,5 +156,18 @@ describe("工具管理（review F7①②）", () => {
     fireEvent.click(screen.getByText("Discard Changes"));
     await waitFor(() => expect(screen.queryByText("Unsaved Changes")).not.toBeInTheDocument());
     expect(invokeMock).not.toHaveBeenCalledWith("update_tool_settings", expect.anything());
+  });
+
+  // Task 3（裁决 34a）：设置页工具勾选区旁补「取消勾选的工具……」提示——
+  // 后端对 APP 形态写动作以 409 app_form_pending 止血拒绝，本行是入口侧引导文案
+  it("裁决 34a：工具勾选区旁渲染看板与远程能力提示（zh）", async () => {
+    await i18n.changeLanguage("zh");
+    renderPage();
+    fireEvent.click(await screen.findByTestId("settings-nav-tools"));
+    // 勾选行列表在场 + 提示文案渲染（zh 键 = settings.tools.boardRemoteNote）
+    expect(await screen.findByText("Codex CLI")).toBeInTheDocument();
+    expect(
+      await screen.findByText("取消勾选的工具不会出现在看板，也无法远程发送")
+    ).toBeInTheDocument();
   });
 });

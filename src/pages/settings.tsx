@@ -1053,6 +1053,10 @@ export default function SettingsPage() {
                     </div>
                   ))}
                 </div>
+                {/* 裁决 34a：未启用工具的错误引导收敛在设置页文案级——勾选行旁明示
+                    取消勾选对看板与远程能力的影响；APP 形态会话的写动作后端以
+                    409 app_form_pending 拒绝（Task 3 止血门），本行是其入口侧引导 */}
+                <p className={SETTINGS_SUBTITLE}>{t("settings.tools.boardRemoteNote")}</p>
                 {toolDirty && (
                   <Button onClick={() => setConfirmOpen(true)}>{t("settings.tools.save")}</Button>
                 )}

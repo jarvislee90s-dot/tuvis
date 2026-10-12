@@ -216,6 +216,7 @@
     "tools": {
       "title": "Tool Management",
       "hint": "Unchecked tools are hidden from session monitoring, notifications and resource management; Tuvis-managed files are restored to real files",
+      "boardRemoteNote": "Unchecked tools are hidden from the board and cannot receive remote messages",
       "installed": "Installed",
       "notInstalled": "Not detected",
       "save": "Save Settings",
