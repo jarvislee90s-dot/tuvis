@@ -2865,16 +2865,34 @@ pub(crate) async fn dsh_acp_headless_dispatch(
             );
         }
     };
-    // 5) 回合（三态靶向在客户端 send 内部；占位后唯一注销路径 = 回合自身）
-    let out = run_dsh_turn(
+    // 5) 回合 = **detached 任务**（wb/cli/zcode/codex 四兄弟同款）：客户端断连会 drop
+    //    本 handler future——若内联 `.await`，`run_dsh_turn` 随 future 一起被丢，
+    //    `registry().end` 永不执行（TurnRegistry 无 TTL）⇒ 该会话此后每一次无头发送
+    //    都被判「已有在飞回合」直到 MAM 重启，R10 审计行也丢。spawn 自持后，审计 +
+    //    串行锁注销都在被 spawn 的任务内（步骤 5 设计意图的实现面），断连只丢回执、
+    //    不丢收尾；占位后唯一注销路径 = 任务自身
+    let task = tokio::spawn(run_dsh_turn(
         assemble_st,
-        ctx,
+        ctx.clone(),
         client,
         session.id.clone(),
         session.project_path.clone(),
         payload,
-    )
-    .await;
+    ));
+    let out = match task.await {
+        Ok(o) => o,
+        Err(e) => {
+            // 理论不可达（run_dsh_turn 内部已吞 spawn_blocking 的 JoinError 并如实落账）；
+            // 防御性保留——任务消失时槽位可能未注销：尽力注销 + 如实拒绝
+            log::error!("dsh 无头回合任务异常: {e}");
+            crate::inject::headless::turn::registry().end(&session.id);
+            return ctx.refuse(
+                st,
+                Stage::ChannelError,
+                "回合内部任务异常终止（结果未知，请打开 dsh 桌面端确认）",
+            );
+        }
+    };
     // 6) 回执封套 + 可见性档（单源 = 路由表）+ 权限请求透传
     let visibility = match crate::inject::routing::route(&tool, session.form, session.pid, os) {
         RouteOutcome::Injectable { visibility, .. } => Some(visibility),
@@ -16048,6 +16066,29 @@ mod create_envelope_tests {
         assert_eq!(
             got, want,
             "confirmation wire 词集合与跨语言夹具不一致（前端常量按同一夹具断言）"
+        );
+    }
+
+    /// Task 10 复审 M3：dsh 通道「未接线取消」措辞钉测——分通道措辞单点
+    /// [`cancel_unwired_reason`] 必须把 `headless_dsh_acp` 映射到 dsh 专属文案
+    /// （dsh 的理由 = `session/cancel` 原语存在但**跨连接不可达**；WB = 通知**未实现**
+    /// ——理由不同故措辞分开），不得落进 WB 通用兜底；WB 通道照旧走通用文案
+    /// （对照腿：分通道分岔没有被顺手全局化）。
+    #[test]
+    fn cancel_unwired_reason_pins_dsh_channel_to_dsh_wording() {
+        use crate::inject::routing::HeadlessKind;
+        assert_eq!(
+            cancel_unwired_reason(HeadlessKind::DshAcp.wire_name()),
+            CANCEL_NOT_WIRED_DSH_REASON
+        );
+        assert_ne!(
+            cancel_unwired_reason(HeadlessKind::DshAcp.wire_name()),
+            CANCEL_NOT_WIRED_REASON,
+            "dsh 的未接线理由与 WB 不同——落进兜底措辞即把「跨连接不可达」说成「通知未实现」"
+        );
+        assert_eq!(
+            cancel_unwired_reason(HeadlessKind::WbAcp.wire_name()),
+            CANCEL_NOT_WIRED_REASON
         );
     }
 }

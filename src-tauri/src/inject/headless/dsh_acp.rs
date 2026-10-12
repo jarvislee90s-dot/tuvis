@@ -1830,8 +1830,11 @@ fn discover_install_dir() -> Option<std::path::PathBuf> {
             }
         }
     }
-    // ② 常见安装位置（NSIS/Electron 常规布局 + 本机实测形态 D:\Program Files）：
-    //    只做存在性探测（`resources/app.asar` 在场即认），不做任何写动作
+    // ② 常见安装位置（NSIS/Electron 常规布局）：只做存在性探测（`resources/app.asar`
+    //    在场即认），不做任何写动作。**机器特定兜底申报**：`C:\`/`D:\` 两条硬编码盘符
+    //    来自本机实测形态（D:\Program Files；精简机器 env 三键可能全空）——env 键未命中
+    //    时的最后兜底，非跨机器保证。**macOS 明确不兜底**（安装形态未取证，模块头登记）
+    //    ——发现失败由调用方如实拒，不假装支持
     let mut roots: Vec<std::path::PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
         .iter()
         .filter_map(|k| std::env::var_os(k).map(std::path::PathBuf::from))
@@ -1841,9 +1844,6 @@ fn discover_install_dir() -> Option<std::path::PathBuf> {
     }
     roots.push(std::path::PathBuf::from("C:\\Program Files"));
     roots.push(std::path::PathBuf::from("D:\\Program Files"));
-    roots.push(std::path::PathBuf::from(
-        "/Applications/DeepSeek Harness.app/Contents",
-    ));
     for root in roots {
         let install = root.join("Deepseek-Harness");
         if install.exists() && asar_path(&install).exists() {

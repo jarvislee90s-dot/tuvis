@@ -9328,9 +9328,15 @@ mod tests {
         s
     }
 
-    /// H3 开启态（dsh 真分派用例）；dsh 无头路由自此受 H3 门（Task 10 行为变化）
-    fn dsh_dispatch_state(sessions: Vec<crate::session::Session>) -> Arc<RemoteState> {
-        let state = with_sessions(inject_state(FakeInjector::ok()), sessions);
+    /// H3 开启态（dsh 真分派用例）；dsh 无头路由自此受 H3 门（Task 10 行为变化）。
+    /// **注入器由调用方指定**（Task 10 复审 M1）：dsh 无头臂永不走终端注入面——
+    /// 三处「零注入」断言必须与 state 共享**同一 fake 实例**才有牙齿；旧写法在
+    /// 本夹具内部另建实例，调用方手里的 fake 永远零记录（断言恒真空转）
+    fn dsh_dispatch_state(
+        injector: std::sync::Arc<FakeInjector>,
+        sessions: Vec<crate::session::Session>,
+    ) -> Arc<RemoteState> {
+        let state = with_sessions(inject_state(injector), sessions);
         state.store.with(|c| {
             crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
         });
@@ -9412,7 +9418,7 @@ mod tests {
             frame(serde_json::json!({"jsonrpc":"2.0","id":6,"result":{}})),
         ]);
         let fake = FakeInjector::ok();
-        let state = dsh_dispatch_state(vec![dsh_sess(DSH_SID, 77771)]);
+        let state = dsh_dispatch_state(fake.clone(), vec![dsh_sess(DSH_SID, 77771)]);
         let app = router(state.clone());
         let r = app
             .oneshot(req(
@@ -9484,10 +9490,7 @@ mod tests {
         let _clear = DshHookClear;
         test_hooks::clear(); // 显式清空：本用例恒「无脚本缝」——门在前，缝根本不可达
         let fake = FakeInjector::ok();
-        let state = with_sessions(
-            inject_state(FakeInjector::ok()),
-            vec![dsh_sess(DSH_SID, 77772)],
-        );
+        let state = with_sessions(inject_state(fake.clone()), vec![dsh_sess(DSH_SID, 77772)]);
         persist_named_device(&state, "mm", "测试设备");
         let app = router(state.clone());
         let r = app
@@ -9538,7 +9541,7 @@ mod tests {
         let _serial = test_hooks::LOCK.lock().await;
         let _clear = DshHookClear;
         test_hooks::clear();
-        let state = dsh_dispatch_state(vec![dsh_sess(DSH_SID, 77773)]);
+        let state = dsh_dispatch_state(FakeInjector::ok(), vec![dsh_sess(DSH_SID, 77773)]);
         let app = router(state);
         let r = app
             .oneshot(req(
@@ -9587,7 +9590,7 @@ mod tests {
             ),
         ]);
         let fake = FakeInjector::ok();
-        let state = dsh_dispatch_state(vec![dsh_sess(DSH_SID, 77774)]);
+        let state = dsh_dispatch_state(fake.clone(), vec![dsh_sess(DSH_SID, 77774)]);
         let app = router(state.clone());
         let r = app
             .oneshot(req(
@@ -9637,6 +9640,106 @@ mod tests {
             .store
             .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, DSH_SID));
         assert!(pending.is_empty(), "无头回合绝不入队");
+    }
+
+    /// 挂起型 spawn 缝（断连取证专用，照 cli 臂 `fake_slow_cli_shape` 先例）：spawn
+    /// 成功但 stdout 挂 `hang_ms` 后 EOF——回合在飞窗口可控，EOF 让客户端按通道错误
+    /// 如实收尾（`failed(channel_error)`），取证「收尾发生在 handler 死后」。
+    /// **调用方必须已持 `dsh_acp::test_hooks::LOCK`**
+    fn dsh_hang_seam(hang_ms: u64) {
+        use crate::inject::headless::dsh_acp::{AcpIo, SpawnSeam};
+        use std::sync::Arc;
+        struct HangIo {
+            hang_ms: u64,
+        }
+        impl AcpIo for HangIo {
+            fn send(&mut self, _line: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn recv(&mut self) -> Option<Result<String, String>> {
+                std::thread::sleep(std::time::Duration::from_millis(self.hang_ms));
+                None // EOF：通道错误面如实收尾（审计 + 注销照常）
+            }
+            fn finish(&mut self) {}
+        }
+        let seam: SpawnSeam =
+            Arc::new(move |_spec| Ok(Box::new(HangIo { hang_ms }) as Box<dyn AcpIo>));
+        crate::inject::headless::dsh_acp::test_hooks::set_spawn(seam);
+    }
+
+    /// **断连取证**（dsh 臂，Task 10 复审 I1）：handler future 被 drop（移动端断连 →
+    /// hyper 丢 future）后，**串行锁注销与 `headless` 审计行仍必须发生**——因为它们
+    /// 写在 detached 回合任务里（照 cli 臂 Task 13 复审 Important C 同款取证）。旧实现
+    /// 把 `run_dsh_turn` 内联 `.await` 在 handler 里：断连即漏 → `registry().end` 永不
+    /// 执行（TurnRegistry 无 TTL）→ 该会话每一次无头发送都被判「已有在飞回合」直到
+    /// MAM 重启，且 R10 审计行丢失。
+    #[tokio::test]
+    async fn dsh_arm_releases_the_slot_in_the_detached_task_after_disconnect() {
+        use crate::inject::headless::dsh_acp::test_hooks;
+        const DSH_SID: &str = "session-9f14a8c5-5555-4222-8333-44445555aaaa";
+        let _serial = test_hooks::LOCK.lock().await;
+        let _clear = DshHookClear;
+        dsh_hang_seam(1200); // 回合在飞窗口：足够 handler 先被 abort
+        let fake = FakeInjector::ok();
+        let state = dsh_dispatch_state(fake.clone(), vec![dsh_sess(DSH_SID, 77775)]);
+        let app = router(state.clone());
+        let fut = app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some("mam_device=mm"),
+            Some(&format!(
+                r#"{{"sessionId":"{DSH_SID}","text":"hi [mobile]"}}"#
+            )),
+        ));
+        let handle = tokio::spawn(fut);
+        // 占锁 = 装配（测试缝即时）之后、回合起跑之前——很快可见
+        for _ in 0..200 {
+            if crate::inject::headless::turn::registry().in_flight(DSH_SID) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            crate::inject::headless::turn::registry().in_flight(DSH_SID),
+            "回合必须已占住串行锁"
+        );
+        // 回合在飞（慢 IO 挂着）→ **模拟客户端断连**：abort handler
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.abort();
+        let _ = handle.await;
+        // 槽位此刻仍在飞（回合没跑完）——断连不该取消已在跑的回合
+        assert!(
+            crate::inject::headless::turn::registry().in_flight(DSH_SID),
+            "断连不该取消已在跑的回合（回合应继续，直到自己收尾）"
+        );
+        for _ in 0..500 {
+            if !crate::inject::headless::turn::registry().in_flight(DSH_SID) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(DSH_SID),
+            "断连后槽位必须被**任务自身**注销（否则该会话被永久挡死到 MAM 重启）"
+        );
+        // 审计行在任务内落账（断连不丢——R10：绝不留下无审计行的回合）
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(
+            audits.len(),
+            1,
+            "断连后审计行仍必须落账（写在任务里，不在 handler 里）: {audits:?}"
+        );
+        assert_eq!(audits[0].action, "headless");
+        assert_eq!(audits[0].channel, "headless_dsh_acp");
+        assert_eq!(audits[0].session_id, DSH_SID);
+        assert!(
+            audits[0].result.starts_with("failed("),
+            "EOF 收尾 = 通道错误档如实失败: {}",
+            audits[0].result
+        );
+        assert_eq!(fake.recorded().len(), 0, "无头路由会话零终端注入");
     }
 
     /// **R10：WB 回合的内层 `spawn_blocking` JoinError 也必须落审计行**——ACP 链内 panic 时
