@@ -958,10 +958,19 @@ export type QuestionAnswerResult =
   | { status: "failed"; error: string; aborted?: boolean; stage?: QuestionAnswerStage };
 
 /** codex APP 止血门（Task 15，2026-10-12）的用户可读**缺省**文案：**单一来源**——
- *  问答侧（[`questionAnswerErrorCopy`]）与模式栏侧（ModeBar 的 409 分诊）两条入口
- *  共用同一常量，防两处兜底文案漂移；后端下发 `reason` 时一律以后端为准
- *  （文案单一来源，与 `blocked_by_dialog` 同一惯例）。 */
+ *  后端下发 `reason` 时一律以后端为准（文案单一来源，与 `blocked_by_dialog` 同惯例），
+ *  只在缺省（旧后端 / 异体响应）时用它。取值逻辑见 [`appFormPendingCopy`]。 */
 export const APP_FORM_PENDING_FALLBACK = "APP 会话该操作走协议通道，开发中——请在 APP 内操作";
+
+/** 止血门 `app_form_pending` → 用户可读文案（**取值逻辑单点**，2026-10-13 复评抽出）。
+ *
+ *  三处入口共用：问答侧 [`questionAnswerErrorCopy`]、审批侧 [`approveErrorCopy`]、
+ *  `ModeBar` 的 409 分诊。此前只抽出了常量 [`APP_FORM_PENDING_FALLBACK`]，而「取后端
+ *  `reason`、缺省兜底」这段**选择逻辑**仍被逐字抄了三份——正是抽常量要防的那种漂移
+ *  （常量单点了、逻辑还在漂）。调用方**勿再另写三元表达式**。 */
+export function appFormPendingCopy(e: ApiError): string {
+  return typeof e.data?.reason === "string" ? e.data.reason : APP_FORM_PENDING_FALLBACK;
+}
 
 /** 问答应答**错误码 → 用户可读中文文案**（丁T6 复评抽出：卡内与 composer 两条入口
  *  必须**同口径**——两处各写一套 `if/else` 迟早漂移，且 composer 侧曾漏掉这条映射
@@ -980,10 +989,8 @@ export function questionAnswerErrorCopy(e: ApiError): string {
   if (code === "bad_index") return "选项序号无效，请刷新后重试";
   // Task 15 止血门：codex APP 会话的问答写动作走协议通道（开发中）——**必须**消费
   // 这条码，否则用户看到的是「session-question/answer 409」这种无意义串（本函数的
-  // 存在理由同上）。文案用后端下发的 `reason`（单一来源），缺省走同义兜底常量
-  if (code === "app_form_pending") {
-    return typeof e.data?.reason === "string" ? e.data.reason : APP_FORM_PENDING_FALLBACK;
-  }
+  // 存在理由同上）。取值逻辑单点见 [`appFormPendingCopy`]（reason 优先、常量兜底）
+  if (code === "app_form_pending") return appFormPendingCopy(e);
   return e.message;
 }
 
@@ -1007,11 +1014,8 @@ export function approveErrorCopy(e: ApiError): string {
   if (code === "no_session") return "会话已结束，请返回看板刷新";
   // Task 15 止血门（I2 新开的 409 出口）：codex APP 会话的审批写动作走协议通道
   //（开发中）——**必须**消费这条码，否则用户看到的是「session-approve 409」。
-  // 文案用后端 `reason`（单一来源），缺省走同一个 [`APP_FORM_PENDING_FALLBACK`]
-  //（与问答侧 / ModeBar 侧同一常量，三入口不漂移）
-  if (code === "app_form_pending") {
-    return typeof e.data?.reason === "string" ? e.data.reason : APP_FORM_PENDING_FALLBACK;
-  }
+  // 取值逻辑单点见 [`appFormPendingCopy`]（与问答侧 / ModeBar 侧**同一实现**，不漂移）
+  if (code === "app_form_pending") return appFormPendingCopy(e);
   return e.message;
 }
 
