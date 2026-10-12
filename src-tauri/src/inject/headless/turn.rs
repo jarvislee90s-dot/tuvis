@@ -443,6 +443,17 @@ impl TurnRegistry {
         }
     }
 
+    /// 更新槽位声明的通道（与 [`Self::arm`] 同型的更新口；Task 6b review M-3）：
+    /// 改道（exec 计划 → 单写者锁拒 → 改投 queue）落定进入消费等待时同步槽位——
+    /// 取消端点的分叉判据读槽位通道词，不同步则改道腿拿不到「queue 滞留」语义。
+    /// 无槽位时 no-op（同 [`Self::arm`]——测试直驱内核不建槽）
+    pub fn update_channel(&self, session_id: &str, channel: &str) {
+        let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = g.get_mut(session_id) {
+            slot.channel = channel.to_string();
+        }
+    }
+
     /// 回合终结：注销槽位
     pub fn end(&self, session_id: &str) {
         self.map

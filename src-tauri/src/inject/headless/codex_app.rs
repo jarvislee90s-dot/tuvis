@@ -71,6 +71,11 @@ pub const ACTIVE_THREAD_WRITE_REASON: &str = "会话正被 APP 使用，请关�
 /// interrupt 对非 MAM 自持回合的如实不可用文案（Task 6b 消费——不在关闭态假装提供协议中止）
 pub const INTERRUPT_NOT_SELF_HELD_REASON: &str = "活跃回合由 APP 持有写者，暂无协议中止通道";
 
+/// 取消探针（Task 6b 中止臂接线）：回合持连侧在等待收口期轮询；`true` = 取消已请求
+/// （cancel 端点经 turn 登记表的 armed 靶子置旗）。interrupt 必须由**持连侧**发出
+/// （跨连接会被写者锁拒——T0.1 决定性负结论），本探针就是「持连侧感知取消」的缝。
+pub type CancelProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 // ============================================================
 // 裸方言帧解析（纯核）
 // ============================================================
@@ -525,12 +530,42 @@ impl AppServerSession {
     /// **等待上界（质量 M3）**：总等待预算归**调用方的 watchdog**；本方法不自带总死线，
     /// 只保证单帧读取不超过生产缝的 `PROC_READ_TIMEOUT_MS`（300s）预算。
     pub fn wait_turn_completed(&mut self) -> TurnCompletion {
+        self.wait_turn_completed_cancellable(None, "", None)
+    }
+
+    /// [`Self::wait_turn_completed`] 的可中止形态（Task 6b 中止臂接线）：每帧之间轮询
+    /// [`CancelProbe`]；首见 true 即在**本连接**上发 `turn/interrupt`（自持 31ms 生效
+    /// ——T0.1 决定性负结论：跨连接 interrupt 会被写者锁拒，故必须由持连侧执行）后
+    /// 继续等收口（完成帧的 `status=interrupted` 自然入 `TurnCompletion`）。interrupt
+    /// 发送失败（版本漂移/通道错）不中止等待：回合自然收口、观测如实。turnId 缺席
+    /// （形状漂移）= 无可中止对象 → 按未观测收口（不猜目标）。
+    pub fn wait_turn_completed_cancellable(
+        &mut self,
+        probe: Option<&CancelProbe>,
+        thread_id: &str,
+        turn_id: Option<&str>,
+    ) -> TurnCompletion {
         let unobserved = TurnCompletion {
             status: None,
             duration_ms: None,
             observed: false,
         };
+        let mut interrupt_sent = false;
         loop {
+            if let (Some(probe), false) = (probe, interrupt_sent) {
+                if probe() {
+                    match turn_id.map(str::trim).filter(|t| !t.is_empty()) {
+                        Some(tid) => {
+                            // 发送失败不中止等待：回合自然收口，观测如实（结局由完成
+                            // 态/读回判断，不在此假装已中止）
+                            let _ = self.interrupt(thread_id, tid);
+                            interrupt_sent = true;
+                        }
+                        // 无 turnId = 无可中止对象（形状漂移不猜目标）——按未观测收口
+                        None => return unobserved,
+                    }
+                }
+            }
             let line = match self.io.recv() {
                 Some(Ok(l)) => l,
                 // IO 错误与 EOF 同面收口：等待结束且未见完成通知（如实 observed=false，不猜）
@@ -767,6 +802,23 @@ impl CodexAppClient {
         input_text: &str,
         readback: &PolicyReadbackSeam,
     ) -> Result<PolicyWriteReceipt, AppServerError> {
+        self.switch_approval_policy_cancellable(
+            thread_id, policy, carrier, input_text, readback, None,
+        )
+    }
+
+    /// [`Self::switch_approval_policy`] 的可中止形态（Task 6b）：等待收口窗轮询取消
+    /// 探针——在飞回合可被 cancel 端点中止（持连侧自持 `turn/interrupt`）；其余步骤
+    /// 语义不变。resume-only 兜底无等待窗（无回合 = 无作用对象），探针自然不消费
+    pub fn switch_approval_policy_cancellable(
+        &self,
+        thread_id: &str,
+        policy: AppApprovalPolicy,
+        carrier: PolicyCarrier,
+        input_text: &str,
+        readback: &PolicyReadbackSeam,
+        probe: Option<CancelProbe>,
+    ) -> Result<PolicyWriteReceipt, AppServerError> {
         // 投递前拒（零 spawn 零回合——turn/start input 必填的诚实面，不烧 token）。
         // input 前置只约束「会起回合」的载体（① TurnStart / ② Resume 全形态）；
         // ②' ResumeOnly 不起回合 ⇒ 不要求 input（review I1：无回合就无必填可言）
@@ -781,7 +833,15 @@ impl CodexAppClient {
             ));
         }
         let mut s = self.session()?;
-        let out = switch_on_session(&mut s, thread_id, policy, carrier, input_text, readback);
+        let out = switch_on_session(
+            &mut s,
+            thread_id,
+            policy,
+            carrier,
+            input_text,
+            readback,
+            probe.as_ref(),
+        );
         s.close();
         out
     }
@@ -795,6 +855,7 @@ fn switch_on_session(
     carrier: PolicyCarrier,
     input_text: &str,
     readback: &PolicyReadbackSeam,
+    probe: Option<&CancelProbe>,
 ) -> Result<PolicyWriteReceipt, AppServerError> {
     // ②' resume-only（review I1 兜底形态）：只 resume 携档（线程级持久、后续回合生效），
     // 不起 turn/start——本回合无新 turn_context ⇒ 核对恒 Ineffective（**不查读回缝**：
@@ -821,8 +882,10 @@ fn switch_on_session(
     // 第二步 turn/start：极小输入起回合（主载体①时档位搭车——回合级生效后续沿用）
     let turn_policy = (carrier == PolicyCarrier::TurnStart).then_some(policy);
     let started = s.start_turn(thread_id, input_text, turn_policy.as_ref())?;
-    // 等回合收口：turn_context 落盘后读回才可信（T0.2 载体②持久层证据）
-    let turn_completion = s.wait_turn_completed();
+    // 等回合收口：turn_context 落盘后读回才可信（T0.2 载体②持久层证据）；等待窗 =
+    // interrupt 的作用窗（Task 6b：探针触发 → 持连侧自持 interrupt → 继续等收口）
+    let turn_completion =
+        s.wait_turn_completed_cancellable(probe, thread_id, started.turn_id.as_deref());
     // 读回三态核对（真源 = rollout 尾部 turn_context.approval_policy，缝注入——不走 RPC）
     let verify = match readback(thread_id) {
         // 质量 M1：宽容判定——读回串经 parse（trim + 大小写不敏感）比对，漂移不误报
@@ -1682,6 +1745,70 @@ mod tests {
             1,
             "空 turnId 在 spawn 后、发送前拒——只发过 initialize"
         );
+    }
+
+    /// Task 6b 中止臂接线（单测面）：等待窗探针触发 → **同连接**发 `turn/interrupt`
+    /// （帧带 threadId/turnId——跨连接会被写者锁拒，interrupt 只许持连侧发）→ 完成
+    /// 帧 status=interrupted 自然入 TurnCompletion；turnId 缺席 → 无可中止对象按未
+    /// 观测收口（零 interrupt 帧——不猜目标）
+    #[test]
+    fn cancel_probe_fires_self_held_interrupt_during_wait() {
+        let (seam, log) = mock_spawn(vec![vec![
+            init_ok(),
+            // turn/interrupt(id=2) 的响应帧（call 按 id 匹配——探针先于首帧触发）
+            resp(2, r#"{"turn":{"status":"interrupting"}}"#),
+            turn_completed("interrupted"),
+        ]]);
+        let mut s = AppServerSession::start(&seam, &spec(), &client_info()).unwrap();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let probe: CancelProbe = {
+            let f = flag.clone();
+            std::sync::Arc::new(move || f.load(std::sync::atomic::Ordering::SeqCst))
+        };
+        let done = s.wait_turn_completed_cancellable(Some(&probe), TID, Some("turn-6b"));
+        s.close();
+        assert!(done.observed, "interrupt 后继续等收口（完成帧入账）");
+        assert_eq!(done.status.as_deref(), Some("interrupted"));
+        // 第 2 帧（第 1 帧是 initialize）= 持连侧 interrupt：threadId/turnId 逐字进帧
+        let frame = sent_json(&log, 1);
+        assert_eq!(frame["method"], "turn/interrupt");
+        assert_eq!(frame["params"]["threadId"], TID);
+        assert_eq!(frame["params"]["turnId"], "turn-6b");
+        // turnId 缺席腿：探针再触发也无目标 → 未观测收口、零 interrupt 帧
+        let (seam2, log2) = mock_spawn(vec![vec![init_ok()]]);
+        let mut s2 = AppServerSession::start(&seam2, &spec(), &client_info()).unwrap();
+        let done2 = s2.wait_turn_completed_cancellable(Some(&probe), TID, None);
+        s2.close();
+        assert!(!done2.observed, "无可中止对象——按未观测收口（不猜目标）");
+        assert_eq!(
+            log2.lock().unwrap().instances[0].sent.len(),
+            1,
+            "turnId 缺席零 interrupt 帧（只发过 initialize）"
+        );
+    }
+
+    /// Task 6b review M-4：interrupt 响应是 error 帧（版本漂移 -32601 形态）→ 发送
+    /// 失败**不中止等待**——回合自然收口、observed 如实（不假装已中止、也不丢完成
+    /// 观测）；interrupt 帧确实发过（失败是通道侧回答，不是没发）
+    #[test]
+    fn interrupt_error_frame_keeps_waiting_and_observes_honestly() {
+        let (seam, log) = mock_spawn(vec![vec![
+            init_ok(),
+            // turn/interrupt(id=2) 的响应 = error 帧（-32601 method not found 形态）
+            resp_err(2, -32601, "Method not found: turn/interrupt"),
+            turn_completed("completed"),
+        ]]);
+        let mut s = AppServerSession::start(&seam, &spec(), &client_info()).unwrap();
+        let probe: CancelProbe = std::sync::Arc::new(|| true);
+        let done = s.wait_turn_completed_cancellable(Some(&probe), TID, Some("turn-err"));
+        s.close();
+        assert!(done.observed, "interrupt 失败不中止等待——完成帧照常观测");
+        assert_eq!(done.status.as_deref(), Some("completed"));
+        // 证据面：interrupt 帧确实发过（threadId/turnId 逐字）
+        let frame = sent_json(&log, 1);
+        assert_eq!(frame["method"], "turn/interrupt");
+        assert_eq!(frame["params"]["threadId"], TID);
+        assert_eq!(frame["params"]["turnId"], "turn-err");
     }
 
     /// 活跃线程写拒 → 降级旗标/错误如实（-32600 + active writer 实测形态）；

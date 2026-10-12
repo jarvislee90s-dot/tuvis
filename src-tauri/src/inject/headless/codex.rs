@@ -957,7 +957,15 @@ async fn consume_and_report(
                 .to_string(),
         );
     };
-    // 消费等待期的取消靶子：送达（true）⇒ 中止等待；如实说明消息已入队、撤不回
+    // 消费等待期的取消靶子：送达（true）⇒ 中止等待；如实说明消息已入队、撤不回。
+    // 槽位通道同步（Task 6b review M-3）：改道腿（exec 计划 → 锁拒 → 改投 queue）
+    // 落定进入消费等待——取消端点按槽位通道词分叉，不同步则改道腿的取消拿不到
+    // 「queue 滞留」的撤回缺失明示（裸 cancelled:true）。计划即 queue 的腿同步为
+    // 同值（幂等无副作用）
+    registry().update_channel(
+        sid,
+        crate::inject::routing::HeadlessKind::CodexQueue.wire_name(),
+    );
     let cancelled = Arc::new(AtomicBool::new(false));
     registry().arm(sid, {
         let flag = cancelled.clone();
@@ -2110,6 +2118,45 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 1, "只投递一次（不重发）");
         assert_eq!(argv_seen.lock().unwrap().len(), 1);
         assert_eq!(argv_seen.lock().unwrap()[0][1], "queue");
+    }
+
+    /// Task 6b review M-3：exec 计划被单写者锁拒 → 改道 queue 落定进入消费等待 ⇒
+    /// 槽位通道同步为 queue（取消端点按槽位通道词分叉——不同步则改道腿的取消拿
+    /// 不到「queue 滞留」撤回缺失明示）。占位形态模拟 api.rs 分派臂（计划通道 =
+    /// exec），断言在消费等待入口即已翻转（等待期内取消才看得到）
+    #[tokio::test]
+    async fn divert_to_queue_updates_slot_channel_for_cancel_branching() {
+        use crate::inject::routing::HeadlessKind;
+        let sid = "sess_div_ch_6b";
+        assert!(registry().begin(
+            sid,
+            TurnSlot::placeholder("codex", "hi".to_string())
+                .with_channel(HeadlessKind::CodexExec.wire_name()),
+        ));
+        let plan = dispatch(AppPresence::Closed, UUID, "E:/t2", "hi");
+        let (run, _) = scripted_run(vec![
+            // ① exec resume 被单写者锁拒（非 0 退出 + 锁证据 → 改道判据成立）
+            obs_exit(1, &[], "Error: -32600 already has an active writer"),
+            // ② 改道 queue：入队回执（exit 0 + Queued message）
+            queued_obs("m-div-ch"),
+        ]);
+        let (_a, make) = recording_runner();
+        let deps = deps_with(vec![Some(false)], Some(QueueEvidence::Ours));
+        let out = run_turn(&args_of(sid, Some(ROLLOUT)), &plan, &make, &deps, &*run).await;
+        assert!(
+            out.diverted,
+            "先证明确实走了改道腿：{:?}",
+            out.receipt.reason
+        );
+        let snap = registry()
+            .cancel_snapshot(sid)
+            .expect("槽位仍在（注销归 api 分派臂，内核不注销）");
+        assert_eq!(
+            snap.channel,
+            HeadlessKind::CodexQueue.wire_name(),
+            "改道落定进入消费等待 → 槽位通道同步（取消分叉判据）"
+        );
+        registry().end(sid);
     }
 
     /// queue 路径：60s 内未消费且队列副本查到滞留 → **如实报「已入队未消费」**+
