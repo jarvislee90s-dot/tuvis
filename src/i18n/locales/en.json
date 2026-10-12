@@ -653,8 +653,6 @@
       "save": "Save",
       "clear": "Clear binding"
     },
-    "collapseSection": "Collapse section",
-    "expandSection": "Expand section",
     "filterByName": "Filter by name…",
     "resident": {
       "toggle": "Resident lock (exempt from preset disable/stash)"
@@ -755,7 +753,6 @@
     "availableResources": "Available resources",
     "selectedResources": "Selected resources",
     "noSelectionHint": "No resources selected yet",
-    "previewTitle": "Preset preview",
     "previewPreset": "Preview preset",
     "editPreset": "Edit preset",
     "removeSelection": "Remove item"

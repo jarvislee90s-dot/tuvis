@@ -653,8 +653,6 @@
       "save": "保存",
       "clear": "清除绑定"
     },
-    "collapseSection": "收起该分组",
-    "expandSection": "展开该分组",
     "filterByName": "按名称筛选…",
     "resident": {
       "toggle": "常驻锁（预设应用时豁免停用/暂存）"
@@ -755,7 +753,6 @@
     "availableResources": "可选资源",
     "selectedResources": "已选资源",
     "noSelectionHint": "尚未选择资源",
-    "previewTitle": "预设预览",
     "previewPreset": "预览预设",
     "editPreset": "编辑预设",
     "removeSelection": "移除该项"

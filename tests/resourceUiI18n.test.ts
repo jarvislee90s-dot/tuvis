@@ -19,7 +19,6 @@ const PRESET_KEYS = [
   "availableResources",
   "selectedResources",
   "noSelectionHint",
-  "previewTitle",
   "previewPreset",
   "editPreset",
   "removeSelection",
