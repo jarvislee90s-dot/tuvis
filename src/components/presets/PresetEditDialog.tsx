@@ -263,7 +263,10 @@ export function PresetEditDialog({
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent
         aria-describedby={undefined}
-        className="flex max-h-[85vh] max-w-3xl flex-col overflow-hidden"
+        // 宽度提权（F1）：基类尾部 `sm:max-w-lg`（512px）在 ≥640px 视口下会顶掉无前缀
+        // max-w-*（B6/B7 两列改版要 768）→ 尾 `!` 提权；窄视口 1rem 边距用
+        // w-[calc(100%-2rem)] 兜住（基类 max-w-[calc(100%-2rem)] 已被 twMerge 顶掉）
+        className="flex max-h-[85vh] w-[calc(100%-2rem)] max-w-3xl! flex-col overflow-hidden"
       >
         <DialogHeader>
           <DialogTitle className="text-sm">

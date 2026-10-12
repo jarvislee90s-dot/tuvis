@@ -846,7 +846,11 @@ export function ResourceKindDialog({
       <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent
           aria-describedby={undefined}
-          className="flex max-h-[85vh] w-full max-w-5xl flex-col overflow-hidden"
+          // 宽度提权（F1）：基类尾部 `sm:max-w-lg`（512px）与无前缀 max-w-* 同特异性且媒体
+          // 规则排后 → ≥640px 视口下任何 max-w-* 覆盖都会被顶掉；尾 `!` 提权才能落到 1024。
+          // 窄视口边距用 w-[calc(100%-2rem)] 找回：基类 max-w-[calc(100%-2rem)] 已被
+          // twMerge 同组顶掉（提权后的 max-w-5xl! 亦不再与之同组，故宽度得自己兜）
+          className="flex max-h-[85vh] w-[calc(100%-2rem)] max-w-5xl! flex-col overflow-hidden"
         >
           <DialogHeader>
             <DialogTitle className="text-sm">{t("resources.repoTitle")}</DialogTitle>
