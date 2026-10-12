@@ -1273,6 +1273,11 @@ const APP_PROBE_UNAVAILABLE_CODE: &str = "probe_unavailable";
 const CODEX_APP_NO_MENU_REASON: &str =
     "APP 会话无菜单通道——档位切换请用切档（协议通道），其余操作请在 APP 内完成";
 
+/// APP 面**模式组**的灰置原因（Task 7 补遗——GET 组载荷 tiers 的 selectable=false
+/// 必填 reason，mode.rs 词表纪律）：模式（plan/default）无协议载体（T0.2 只定案了
+/// approvalPolicy 载体），APP 面不可切——如实灰置，不假装可点（POST 必拒 no_mechanism）
+const CODEX_APP_NO_MODE_CHANNEL_REASON: &str = "APP 会话暂无模式切换通道";
+
 /// APP 协议档位三枚举的展示标签（探测报告 §2.5 映射建议：全自动→never、默认→
 /// on-request、安全→untrusted）。与 CLI 权限组四档词表（只读/默认/自动审批/完全信任）
 /// **刻意不互译**——协议面就三档，硬译会说谎（如「自动审批」无协议载体即如实拒）
@@ -10338,6 +10343,72 @@ pub async fn session_mode(
                     None => (None, None, "null"),
                 }
             };
+            // Task 7 补遗（6a 审契约缝隙定案）：APP 面 tiers **与 current 同词表**——
+            // 权限组下发协议三档（AppApprovalPolicy::ALL 数据源 + codex_app_policy_label
+            // 标签单点）；CLI 四档词表（readOnly/default/acceptEdits/bypass）与 APP
+            // current（never/on-request/untrusted）永不相交，前端按 current 匹配 tiers
+            // 高亮必落空——词表单一真相源在后端，前端不自备三档表（surface 单点原则
+            // 的同族纪律，设计 §3.2）。支持位取**等效最小形态**：三档全 selectable:true
+            // 即可点信号（灰置走顶层 degraded——Task 7 探测门），不另设 supported 布尔。
+            // 模式组（无协议载体）：tiers 全灰 + 一句原因——APP 面 plan/default 无通道，
+            // selectable:true 会引出必拒 no_mechanism 的假可点（不假装可切）；
+            // legacy 清空——协议面无退役档历史（CLI legacy 的「untrusted 已退役」词条
+            // 尤其不得出现：untrusted 在协议面是活档，同词两义会误导）。CLI 面原样不动。
+            let (tiers_json, legacy_json) = if app_surface {
+                match g.id {
+                    crate::inject::mode::ModeGroupId::Permission => (
+                        crate::inject::headless::codex_app::AppApprovalPolicy::ALL
+                            .iter()
+                            .map(|&p| {
+                                serde_json::json!({
+                                    "mode": p.wire(),
+                                    "label": codex_app_policy_label(p),
+                                    "selectable": true,
+                                    "reason": serde_json::Value::Null,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                        Vec::new(),
+                    ),
+                    crate::inject::mode::ModeGroupId::Mode => (
+                        g.tiers
+                            .iter()
+                            .map(|t| {
+                                serde_json::json!({
+                                    "mode": t.mode.wire(),
+                                    "label": t.label,
+                                    "selectable": false,
+                                    "reason": CODEX_APP_NO_MODE_CHANNEL_REASON,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                        Vec::new(),
+                    ),
+                }
+            } else {
+                (
+                    g.tiers
+                        .iter()
+                        .map(|t| {
+                            serde_json::json!({
+                                "mode": t.mode.wire(),
+                                "label": t.label,
+                                "selectable": t.selectable,
+                                "reason": t.reason,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    g.legacy
+                        .iter()
+                        .map(|l| {
+                            serde_json::json!({
+                                "label": l.label,
+                                "note": l.note,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
             serde_json::json!({
                 "id": g.id.wire(),
                 "label": g.label,
@@ -10351,17 +10422,9 @@ pub async fn session_mode(
                 // 记忆回落 / "rollout"= APP 协议读回（Task 6a）/ "null"= 未知（前端
                 // 据此决定是否标注「（上次切换）」）
                 "currentSource": current_source,
-                "tiers": g.tiers.iter().map(|t| serde_json::json!({
-                    "mode": t.mode.wire(),
-                    "label": t.label,
-                    "selectable": t.selectable,
-                    "reason": t.reason,
-                })).collect::<Vec<_>>(),
+                "tiers": tiers_json,
                 // 裁7：退役旧档**如实展示**（前端不渲染为可点按钮）
-                "legacy": g.legacy.iter().map(|l| serde_json::json!({
-                    "label": l.label,
-                    "note": l.note,
-                })).collect::<Vec<_>>(),
+                "legacy": legacy_json,
             })
         })
         .collect();

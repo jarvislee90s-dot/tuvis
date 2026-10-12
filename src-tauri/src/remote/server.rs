@@ -19879,6 +19879,38 @@ mod tests {
             body.contains(r#""currentLabel":"全自动""#),
             "读回词的展示标签（never=全自动，T0.2 映射建议）：{body}"
         );
+        // Task 7 补遗（6a 审契约缝隙定案）：APP 面权限组 tiers = 协议三档
+        //（AppApprovalPolicy::ALL 数据源——与 current 同词表，交集闭合）
+        assert!(
+            body.contains(r#""mode":"never""#)
+                && body.contains(r#""mode":"on-request""#)
+                && body.contains(r#""mode":"untrusted""#),
+            "协议三档全在场（never/on-request/untrusted）：{body}"
+        );
+        // 排除面只圈权限组专属 CLI 词（acceptEdits/readOnly/bypass）——模式组的
+        // default/plan 词以灰置形态合法在场（见下）
+        assert!(
+            !body.contains(r#""mode":"acceptEdits""#)
+                && !body.contains(r#""mode":"readOnly""#)
+                && !body.contains(r#""mode":"bypass""#),
+            "CLI 权限词表不得出现在 APP 面 tiers（与 current 永不相交的缝隙根因）：{body}"
+        );
+        assert!(
+            body.contains(r#""label":"全自动""#),
+            "协议档展示标签（codex_app_policy_label 单点）：{body}"
+        );
+        // 模式组（无协议载体）：tiers 全灰 + 一句原因（不假装可切——APP 面
+        // plan/default 无通道，POST 必拒 no_mechanism）
+        assert!(
+            body.contains(r#""selectable":false"#) && body.contains("APP 会话暂无模式切换通道"),
+            "模式组灰置带原因（selectable=false 必填 reason——mode.rs 词表纪律）：{body}"
+        );
+        // 协议面无退役档历史（CLI legacy 的「untrusted 已退役」词条尤其不得出现——
+        // untrusted 在协议面是活档，同词两义会误导）
+        assert!(
+            body.contains(r#""legacy":[]"#) && !body.contains("官方 0.149.0 起退役"),
+            "APP 面 legacy 清空（协议面无退役档历史）：{body}"
+        );
         // 读不到腿：current=null（保守降级——「模式未知，请人工核对 APP」由前端渲染）
         crate::inject::headless::codex_app::test_hooks::set(None, Vec::new(), None);
         let r = app

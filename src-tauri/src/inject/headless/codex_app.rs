@@ -688,8 +688,10 @@ impl AppApprovalPolicy {
             .map(|(_, p)| p)
     }
 
-    /// 全部合法档（三枚举全量）。**如实申报（M3）**：当前仅测试消费——GET 载荷的
-    /// tiers/supported 契约归 Task 8 定案（6a 未下发该表，本常量不是其数据源）
+    /// 全部合法档（三枚举全量）。**GET /session-mode APP 面权限组 tiers 的数据源**
+    /// （Task 7 补遗定案——与 current〔rollout 读回 wire 词〕同词表，交集闭合；
+    /// 标签单点 = api.rs 的 codex_app_policy_label）。CLI 面 tiers 走 mode.rs 的
+    /// CLI 四档表，两表分面不下沉本模块
     pub const ALL: [AppApprovalPolicy; 3] = [
         AppApprovalPolicy::Never,
         AppApprovalPolicy::OnRequest,
