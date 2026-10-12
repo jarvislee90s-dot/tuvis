@@ -1709,6 +1709,185 @@ mod asar_extract {
 }
 
 // ============================================================
+// 生产装配 + 测试钩子（Task 10 接线层）
+// ============================================================
+
+/// 每动作客户端装配（Task 10 端点消费；照 `wb_acp::deps_for` 先例 cfg 切换）：
+/// - **生产**（`cfg(not(test))`）：真实发现链——`DSH_HOME`/home → runtime node →
+///   `runtime.json` 的 `desktopVersion`（缓存键）→ asar 幂等解包 → argv/env 钉值；
+/// - **测试**（`cfg(test)`）：缝来自 [`test_hooks`]（默认拒绝 spawn——零真实进程零
+///   真实 `~/.dsh` 接触，宪法级纪律），不做任何 fs 发现。
+///
+/// **`home` 语义**：调用方（api.rs 端点）经 `RemoteState.home_source` 缝传入——
+/// 生产 = 真实用户主目录；测试 = None/tempdir。缓存根 = `<home>/.tuvis/dsh-asar`
+/// （MAM 数据目录同源口径；`DSH_HOME` env 优先级归 `monitor::dsh::dsh_home_with`
+/// 单点，此处不另判）。
+pub fn assemble_client(home: Option<std::path::PathBuf>) -> Result<DshAcpClient, String> {
+    #[cfg(not(test))]
+    {
+        production_assemble(home)
+    }
+    #[cfg(test)]
+    {
+        // 测试构建：不做 fs 发现（零真实 ~/.dsh 接触）；规格是占位（缝桩不消费 spec）
+        let _ = home;
+        Ok(DshAcpClient::new(
+            test_hooks::spawn(),
+            SpawnSpec {
+                argv: Vec::new(),
+                env: Vec::new(),
+            },
+        ))
+    }
+}
+
+#[cfg(not(test))]
+fn production_assemble(home: Option<std::path::PathBuf>) -> Result<DshAcpClient, String> {
+    // 1) DSH_HOME（env 优先 → home/.dsh；单源 = monitor::dsh::dsh_home_with）
+    let dsh_home = crate::monitor::dsh::dsh_home_with(&home.clone().unwrap_or_default());
+    // 2) runtime node（T0.3 钉值：dsh 自带 runtime，不用系统 node）——不在场即如实拒
+    //    （安装未完成/未首启；零 spawn）
+    let node = runtime_node_exe(&dsh_home);
+    if !node.exists() {
+        return Err(format!(
+            "dsh runtime node 不可达（{}）——请先安装并启动一次 DeepSeek Harness 桌面端",
+            node.display()
+        ));
+    }
+    // 3) desktopVersion = 缓存键（runtime.json 与桌面同源更新；版本变 ⇒ 新缓存子目录
+    //    ⇒ 自动重解包——这是「缓存优先可跳过安装发现」的自愈面）
+    let runtime_json = dsh_home
+        .join("dsh-runtimes")
+        .join("dsh-primary-runtime")
+        .join("runtime.json");
+    let version = read_desktop_version(&runtime_json).ok_or_else(|| {
+        format!(
+            "读不到 desktopVersion（{}）——无法定位 dsh-acp 解包缓存键",
+            runtime_json.display()
+        )
+    })?;
+    // 4) 缓存根（home 缺席即如实拒——缓存与 MAM 数据目录同源）
+    let Some(home) = home else {
+        return Err("用户主目录不可用——无法定位 dsh-asar 解包缓存".to_string());
+    };
+    let cache_root = home.join(".tuvis").join("dsh-asar");
+    // 5) bin.js：缓存优先（幂等解包后常驻；此时无需安装目录在场）。未命中 → 安装发现
+    //    （进程表 cmdline 的 app.asar 路径〔桌面在跑时最真〕→ 常见安装位置兜底）→ 解包
+    let mut bin = {
+        let mut p = cache_root.join(sanitize_version(&version));
+        for part in EXTRACT_SUBTREE_REL.split('/') {
+            p = p.join(part);
+        }
+        p
+    };
+    if !bin.exists() {
+        let install_dir = discover_install_dir()
+            .ok_or("未发现 DeepSeek Harness 安装（桌面端未在运行、常见安装位置均未命中）——无法解包 dsh-acp 入口")?;
+        bin = ensure_extracted(&install_dir, &cache_root, &version)?;
+    }
+    // 6) argv/env 钉值（T0.3；不含 --patch——整对象替换红线见模块头）
+    Ok(DshAcpClient::new(
+        production_spawn_seam(),
+        SpawnSpec {
+            argv: acp_argv(&node.to_string_lossy(), &bin.to_string_lossy()),
+            env: acp_env(&dsh_home.to_string_lossy()),
+        },
+    ))
+}
+
+/// `runtime.json` 的 `desktopVersion`（缓存键原料；防御抽取，缺场 = None 不猜）
+#[cfg(not(test))]
+fn read_desktop_version(runtime_json: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(runtime_json).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("desktopVersion")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// 安装目录发现（冷缓存时才走；桌面在跑看进程表最真，否则常见安装位置兜底）。
+/// macOS 安装形态未取证（模块头登记）——发现失败由调用方如实拒，不假装支持
+#[cfg(not(test))]
+fn discover_install_dir() -> Option<std::path::PathBuf> {
+    // ① 进程表：桌面宿主 cmdline 含 `…\resources\app.asar\dsh\…`（monitor::dsh
+    //    实测取证形态）——特征判定复用单源 `cmdline_is_dsh_desktop_host`
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    for p in sys.processes().values() {
+        let cmd = p.cmd();
+        if cmd.is_empty() || !crate::monitor::dsh::cmdline_is_dsh_desktop_host(cmd) {
+            continue;
+        }
+        for tok in cmd {
+            let tok = tok.to_string_lossy();
+            // 归一查 `resources[/\]app.asar` 的出现位置——前缀即安装目录
+            let t = tok.replace('\\', "/");
+            if let Some(idx) = t.find("/resources/app.asar") {
+                let install = &t[..idx];
+                if !install.is_empty() {
+                    return Some(std::path::PathBuf::from(install));
+                }
+            }
+        }
+    }
+    // ② 常见安装位置（NSIS/Electron 常规布局 + 本机实测形态 D:\Program Files）：
+    //    只做存在性探测（`resources/app.asar` 在场即认），不做任何写动作
+    let mut roots: Vec<std::path::PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
+        .iter()
+        .filter_map(|k| std::env::var_os(k).map(std::path::PathBuf::from))
+        .collect();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(std::path::PathBuf::from(local).join("Programs"));
+    }
+    roots.push(std::path::PathBuf::from("C:\\Program Files"));
+    roots.push(std::path::PathBuf::from("D:\\Program Files"));
+    roots.push(std::path::PathBuf::from(
+        "/Applications/DeepSeek Harness.app/Contents",
+    ));
+    for root in roots {
+        let install = root.join("Deepseek-Harness");
+        if install.exists() && asar_path(&install).exists() {
+            return Some(install);
+        }
+    }
+    None
+}
+
+/// **测试专用注入钩子**（仅 `cfg(test)`；照 `wb_acp::test_hooks` 先例）：端点级用例
+/// 在测试构建里装配 spawn 缝（脚本桩），默认 = 拒绝 spawn（零真实进程纪律）。
+/// **并行纪律**（钩子是进程级全局态）：凡读写钩子的用例必须持 [`test_hooks::LOCK`]。
+#[cfg(test)]
+pub mod test_hooks {
+    use super::*;
+    type SeamSlot = std::sync::LazyLock<std::sync::Mutex<Option<SpawnSeam>>>;
+    static SEAM: SeamSlot = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+    /// 钩子用例串行锁（tokio 互斥量：守卫跨 await 持有，与 wb_acp::test_hooks::LOCK 同款）
+    type HookLock = std::sync::LazyLock<tokio::sync::Mutex<()>>;
+    pub(crate) static LOCK: HookLock = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// 装填 spawn 缝（**调用方必须已持 [`LOCK`]**）
+    pub(crate) fn set_spawn(seam: SpawnSeam) {
+        *SEAM.lock().unwrap_or_else(|e| e.into_inner()) = Some(seam);
+    }
+
+    /// 清空钩子（用例收尾；Drop 守卫调用）
+    pub(crate) fn clear() {
+        *SEAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// spawn 缝（默认：拒绝 spawn——测试构建绝不落真进程）
+    pub(crate) fn spawn() -> SpawnSeam {
+        if let Some(seam) = SEAM.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return seam;
+        }
+        Arc::new(|_spec: &SpawnSpec| {
+            Err("测试构建未装填 dsh-acp spawn 缝（零进程纪律）".to_string())
+        })
+    }
+}
+
+// ============================================================
 // tests（纯核：全部经缝 mock，零真实进程零网络——宪法级纪律）
 // ============================================================
 

@@ -9313,6 +9313,332 @@ mod tests {
         http.assert_clean();
     }
 
+    // ===== Task 10（H13 dsh · DshAcp 臂）：端点级分派/门/能力位/如实拒 =====
+
+    /// dsh 会话夹具（H13：恒 APP 形态 + 桌面宿主 pid；cwd 绝对形态——dsh-acp resume 必填）
+    fn dsh_sess(id: &str, pid: u32) -> crate::session::Session {
+        let mut s = inj_sess(
+            id,
+            crate::session::AgentType::Dsh,
+            pid,
+            crate::session::SessionStatus::Idle,
+        );
+        s.form = crate::session::ProcessForm::App;
+        s.project_path = "E:/t2".to_string();
+        s
+    }
+
+    /// H3 开启态（dsh 真分派用例）；dsh 无头路由自此受 H3 门（Task 10 行为变化）
+    fn dsh_dispatch_state(sessions: Vec<crate::session::Session>) -> Arc<RemoteState> {
+        let state = with_sessions(inject_state(FakeInjector::ok()), sessions);
+        state.store.with(|c| {
+            crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        state
+    }
+
+    /// dsh 钩子收尾守卫（钩子是进程级全局态，别把 spawn 缝留给后续用例）
+    struct DshHookClear;
+    impl Drop for DshHookClear {
+        fn drop(&mut self) {
+            crate::inject::headless::dsh_acp::test_hooks::clear();
+        }
+    }
+
+    /// 脚本化 ACP IO（有序帧队列——server.rs 侧端点用例的 spawn 缝桩；照 dsh_acp
+    /// 内部 MockIo 语义但独立实现：模块内 tests 不对外导出，这里只喂帧不留痕）
+    struct DshScriptIo {
+        lines: std::sync::Mutex<std::collections::VecDeque<String>>,
+    }
+
+    impl crate::inject::headless::dsh_acp::AcpIo for DshScriptIo {
+        fn send(&mut self, _line: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn recv(&mut self) -> Option<Result<String, String>> {
+            self.lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front()
+                .map(Ok)
+        }
+        fn finish(&mut self) {}
+    }
+
+    /// 装填脚本帧缝（**调用方必须已持 dsh_acp::test_hooks::LOCK**）
+    fn dsh_script_seam(frames: Vec<String>) {
+        use crate::inject::headless::dsh_acp::{AcpIo, SpawnSeam};
+        use std::sync::Arc;
+        let seam: SpawnSeam = Arc::new(move |_spec| {
+            let io = DshScriptIo {
+                lines: std::sync::Mutex::new(frames.clone().into()),
+            };
+            Ok(Box::new(io) as Box<dyn AcpIo>)
+        });
+        crate::inject::headless::dsh_acp::test_hooks::set_spawn(seam);
+    }
+
+    /// **H13 全链（resume 精确靶向）**：脚本帧缝注入 ACP 方言（initialize → authenticate →
+    /// list[cwd 命中] → resume → prompt[message_chunk + request_permission 旁流 + stopReason]
+    /// → close）⇒ HTTP 200 + headless 封套 + channel=`headless_dsh_acp` + 回执 ok（末条
+    /// assistant 摘要）；**权限请求透传面**（`permissionNotes`——Task 10 最小接入面）随
+    /// 封套下发；审计行 headless/headless_dsh_acp、串行锁注销、零终端注入、不入队。
+    #[tokio::test]
+    async fn session_send_dsh_app_dispatches_to_dsh_acp_arm() {
+        use crate::inject::headless::dsh_acp::test_hooks;
+        const DSH_SID: &str = "session-9f14a8c5-1111-4222-8333-444455556666";
+        let _serial = test_hooks::LOCK.lock().await;
+        let _clear = DshHookClear;
+        let frame = |v: serde_json::Value| v.to_string();
+        dsh_script_seam(vec![
+            frame(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{
+                "protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"image":false}}}})),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{}})),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":3,"result":{
+                "sessions":[{"sessionId":DSH_SID,"cwd":"E:/t2"}]}})),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":4,"result":{}})),
+            frame(
+                serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "update":{"agent_message_chunk":{"messageId":"m1",
+                    "content":{"type":"text","text":"收到"}}}}}),
+            ),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":100,
+                "method":"session/request_permission","params":{
+                    "sessionId":DSH_SID,"toolCall":{"toolCallId":"tc-1"},
+                    "options":[{"optionId":"allow_once","name":"允许一次","kind":"allow_once"},
+                               {"optionId":"reject_once","name":"拒绝一次","kind":"reject_once"}]}})),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}})),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":6,"result":{}})),
+        ]);
+        let fake = FakeInjector::ok();
+        let state = dsh_dispatch_state(vec![dsh_sess(DSH_SID, 77771)]);
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(&format!(
+                    r#"{{"sessionId":"{DSH_SID}","text":"hi [mobile]"}}"#
+                )),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "无头分派：HTTP 200 + 语义在 body");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["channel"], "headless_dsh_acp");
+        assert_eq!(v["receipt"]["status"], "ok", "{v}");
+        assert_eq!(v["receipt"]["sessionId"], DSH_SID, "resume 精确靶向：{v}");
+        assert_eq!(v["receipt"]["lastAssistant"], "收到");
+        assert_eq!(v["visibility"], "after_refresh", "dsh 自带 UI 刷新：{v}");
+        // 权限请求透传（只展示不代答）：display() 文案随封套下发（接入面裁决见 api.rs）
+        let notes = v["permissionNotes"].as_array().cloned().unwrap_or_default();
+        assert_eq!(notes.len(), 1, "等待窗内收集的权限请求必须透传：{v}");
+        assert!(
+            notes[0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("dsh 请求权限"),
+            "设计 §6.1 上屏文案：{v}"
+        );
+        assert!(
+            notes[0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("toolCallId=tc-1"),
+            "权限内容（toolCallId）必须可读：{v}"
+        );
+        assert_eq!(fake.recorded().len(), 0, "无头路由会话零终端注入");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0].action, "headless");
+        assert_eq!(audits[0].channel, "headless_dsh_acp", "通道列 = DshAcp");
+        assert_eq!(audits[0].session_id, DSH_SID);
+        assert!(
+            audits[0].result.starts_with("ok"),
+            "终态词在前：{}",
+            audits[0].result
+        );
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(DSH_SID),
+            "回合终结必须注销串行锁"
+        );
+        let pending = state
+            .store
+            .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, DSH_SID));
+        assert!(pending.is_empty(), "无头回合绝不入队（裁决 8）");
+    }
+
+    /// **H3 自然接管 dsh（Task 10 行为变化，M24 判据）**：开关关闭（默认态）+ dsh 会话 →
+    /// POST 403 `headless_disabled`（原 `not_injectable`/`dsh_headless_pending` 路径废止）；
+    /// send-info 同门标因（injectable=false + reasonCode）——移动端发送入口置灰的单一来源
+    #[tokio::test]
+    async fn session_send_dsh_h3_disabled_returns_403() {
+        use crate::inject::headless::dsh_acp::test_hooks;
+        const DSH_SID: &str = "session-9f14a8c5-2222-4222-8333-444455557777";
+        let _serial = test_hooks::LOCK.lock().await;
+        let _clear = DshHookClear;
+        test_hooks::clear(); // 显式清空：本用例恒「无脚本缝」——门在前，缝根本不可达
+        let fake = FakeInjector::ok();
+        let state = with_sessions(
+            inject_state(FakeInjector::ok()),
+            vec![dsh_sess(DSH_SID, 77772)],
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(&format!(
+                    r#"{{"sessionId":"{DSH_SID}","text":"hi [mobile]"}}"#
+                )),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "H3 门在最前：{r:?}");
+        let body = body_string(r).await;
+        assert!(
+            body.contains("headless_disabled"),
+            "关闭态拒绝体必须是 headless_disabled（不再是 not_injectable/dsh_headless_pending）：{body}"
+        );
+        let info = app
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-send-info?session_id={DSH_SID}"),
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(info.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(info).await).unwrap();
+        assert_eq!(v["injectable"], false, "{v}");
+        assert_eq!(v["reasonCode"], "headless_disabled", "{v}");
+        assert_eq!(fake.recorded().len(), 0, "门拦在前：零注入零入队");
+        let pending = state
+            .store
+            .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, DSH_SID));
+        assert!(pending.is_empty(), "不落队");
+    }
+
+    /// **send-info 能力位**（Task 10）：开关开启 + dsh 会话 → injectable:true +
+    /// channels=`["headless_dsh_acp"]`（composer 按 headless_ 前缀通道化消费——零前端
+    /// 改动即生效）+ visibility=after_refresh
+    #[tokio::test]
+    async fn send_info_lists_headless_dsh_acp_channel() {
+        use crate::inject::headless::dsh_acp::test_hooks;
+        const DSH_SID: &str = "session-9f14a8c5-3333-4222-8333-444455558888";
+        let _serial = test_hooks::LOCK.lock().await;
+        let _clear = DshHookClear;
+        test_hooks::clear();
+        let state = dsh_dispatch_state(vec![dsh_sess(DSH_SID, 77773)]);
+        let app = router(state);
+        let r = app
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-send-info?session_id={DSH_SID}"),
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["injectable"], true, "Task 10 起 dsh 已真分派：{v}");
+        assert_eq!(
+            v["channels"],
+            serde_json::json!(["headless_dsh_acp"]),
+            "{v}"
+        );
+        assert_eq!(v["visibility"], "after_refresh", "{v}");
+        assert!(
+            !v.to_string().contains("dsh_headless_pending"),
+            "过渡码已废止：{v}"
+        );
+    }
+
+    /// **活跃会话如实拒（端点层，三态靶向之②）**：resume 被单写者锁拒（-32603 +
+    /// `already owned by an active write handle` 同现）⇒ 回执 `failed(refused)` + 文案
+    /// 「会话正被桌面使用，请关闭后再投」（不做 queue 臆测——README 未提 queue）；
+    /// 零字节投递、审计落 refused、串行锁注销
+    #[tokio::test]
+    async fn dsh_active_session_send_returns_honest_refusal() {
+        use crate::inject::headless::dsh_acp::test_hooks;
+        const DSH_SID: &str = "session-9f14a8c5-4444-4222-8333-444455559999";
+        let _serial = test_hooks::LOCK.lock().await;
+        let _clear = DshHookClear;
+        let frame = |v: serde_json::Value| v.to_string();
+        dsh_script_seam(vec![
+            frame(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{
+                "protocolVersion":1,"agentCapabilities":{}}})),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{}})),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":3,"result":{
+                "sessions":[{"sessionId":DSH_SID,"cwd":"E:/t2"}]}})),
+            frame(
+                serde_json::json!({"jsonrpc":"2.0","id":4,"error":{"code":-32603,
+                "message":"Internal error, data.details: \"session-9f14 is already owned by an active write handle\""}}),
+            ),
+        ]);
+        let fake = FakeInjector::ok();
+        let state = dsh_dispatch_state(vec![dsh_sess(DSH_SID, 77774)]);
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(&format!(
+                    r#"{{"sessionId":"{DSH_SID}","text":"hi [mobile]"}}"#
+                )),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["channel"], "headless_dsh_acp");
+        assert_eq!(v["receipt"]["status"], "failed", "{v}");
+        assert_eq!(
+            v["receipt"]["stage"], "refused",
+            "桌面写者占用 = 投递前拒绝档：{v}"
+        );
+        let reason = v["receipt"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("会话正被桌面使用，请关闭后再投"),
+            "如实拒文案（dsh_acp::ACTIVE_SESSION_REFUSAL）：{v}"
+        );
+        assert!(
+            !reason.contains("已投递") && !reason.contains("queued"),
+            "绝不谎报投递/排队（无 queue 臆测）：{v}"
+        );
+        assert_eq!(fake.recorded().len(), 0);
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0].channel, "headless_dsh_acp");
+        assert!(
+            audits[0].result.starts_with("failed(refused)"),
+            "{}",
+            audits[0].result
+        );
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(DSH_SID),
+            "拒绝臂必须注销串行锁"
+        );
+        let pending = state
+            .store
+            .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, DSH_SID));
+        assert!(pending.is_empty(), "无头回合绝不入队");
+    }
+
     /// **R10：WB 回合的内层 `spawn_blocking` JoinError 也必须落审计行**——ACP 链内 panic 时
     /// 旧的 JoinError 臂只写 log 就返回回执：回合「起跑了但从未入账」，审计页上这条投递凭空
     /// 消失（ticket 的「回合起跑无审计行」）。本用例用**必 panic 的 HTTP 缝**把

@@ -1201,9 +1201,9 @@ fn find_session_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<crate::s
 /// 测试 = 内存库（零接触真实 ~/.mam）。
 ///
 /// **边界（按构造成立，不再靠人工记忆）**：终端注入四家的路由候选全是终端通道 →
-/// `headless_kind_of` 恒 `None` → 完全不经此门；**dsh 亦不经此门**（H13 写侧不在本批，
-/// 其需要无头的场合路由判 `dsh_headless_pending` → 非 Injectable → 本门不拦——范围裁决，
-/// 详见 `routing::headless_kind_of` 文档）。
+/// `headless_kind_of` 恒 `None` → 完全不经此门；**dsh 自 Task 10 起入无头绑定集**
+/// （H13 落地：需要无头的场合路由判 `Headless(DshAcp)` → 本门接管——开关关 →
+/// 403 `headless_disabled`，原「dsh 不经此门」的范围裁决口径废止）。
 fn headless_blocked(
     st: &Arc<RemoteState>,
     tool: &str,
@@ -2659,6 +2659,245 @@ pub(crate) async fn wb_headless_dispatch(
     )
 }
 
+/// 单回合分派的审计上下文（dsh 版；与 [`WbTurnCtx`]/[`ZcodeTurnCtx`] 同款三件套）
+#[derive(Clone)]
+struct DshTurnCtx {
+    device_id: String,
+    device_name: String,
+    tool: String,
+    sid: String,
+    content: String,
+}
+
+impl DshTurnCtx {
+    fn audit_ctx(&self) -> crate::inject::headless::HeadlessAuditCtx {
+        crate::inject::headless::HeadlessAuditCtx {
+            device_id: self.device_id.clone(),
+            device_name: self.device_name.clone(),
+            agent_type: self.tool.clone(),
+            session_id: self.sid.clone(),
+            channel: crate::inject::routing::HeadlessKind::DshAcp
+                .wire_name()
+                .to_string(),
+            content: self.content.clone(),
+        }
+    }
+
+    fn audit(&self, st: &Arc<RemoteState>, action: &str, result: &str, duration_ms: u64) {
+        audit_headless_ctx(st, &self.audit_ctx(), action, result, duration_ms);
+    }
+
+    /// 拒绝/失败臂（同 [`WbTurnCtx::refuse`]：HTTP 200 + `receipt.status=failed` + 落账；
+    /// **不碰串行锁**——未占位的拒绝若误注销会把别人的在飞槽位注销掉）
+    fn refuse(
+        &self,
+        st: &Arc<RemoteState>,
+        stage: crate::inject::headless::receipt::Stage,
+        reason: &str,
+    ) -> Response {
+        let receipt = crate::inject::headless::receipt::Receipt::failed(stage, reason)
+            .with_session(&self.sid);
+        self.audit(
+            st,
+            crate::inject::headless::ACTION_HEADLESS,
+            &crate::inject::headless::turn::receipt_result_word(&receipt),
+            receipt.duration_ms,
+        );
+        json_no_store(
+            StatusCode::OK,
+            headless_envelope(crate::inject::routing::HeadlessKind::DshAcp, &receipt, None),
+        )
+    }
+}
+
+/// dsh 回合产物：归一回执 + 权限请求透传面（`PermissionRequest::display()` 文案——
+/// 设计 §6.1「收到即上屏『dsh 请求权限：〈内容〉』」，代答列 P2）
+struct DshTurnOut {
+    receipt: crate::inject::headless::receipt::Receipt,
+    permission_notes: Vec<String>,
+}
+
+/// dsh 真回合执行（**spawn 型 + 同步阻塞客户端**：`DshAcpClient::send` 是同步调用
+/// 〔prompt 等待窗 = 回合时长——dsh_acp 模块头「调用契约」〕⇒ 整条链放 `spawn_blocking`，
+/// 绝不在 async 运行时线程直呼）。审计 + 串行锁注销**全在本函数内完成**（R10 纪律：
+/// 内层 JoinError 臂同样落账——回合已起跑，绝不留下无审计行的回合）。
+async fn run_dsh_turn(
+    st: Arc<RemoteState>,
+    ctx: DshTurnCtx,
+    client: crate::inject::headless::dsh_acp::DshAcpClient,
+    target_sid: String,
+    cwd: String,
+    payload: String,
+) -> DshTurnOut {
+    use crate::inject::headless::dsh_acp::DshAcpError;
+    use crate::inject::headless::receipt::{Receipt, Stage};
+
+    let sid = ctx.sid.clone();
+    let task = tokio::task::spawn_blocking(move || client.send(&target_sid, &cwd, &payload));
+    let out = match task.await {
+        Ok(Ok(out)) => DshTurnOut {
+            receipt: out.receipt,
+            permission_notes: out
+                .permission_requests
+                .iter()
+                .map(|p| p.display())
+                .collect(),
+        },
+        // 通道级/目标非法/provider 不可用——客户端如实 Err（send 内部已优雅收尾进程），
+        // 端点归一回执面不谎报：InvalidTarget/DesktopWriterActive = 投递前拒绝档，
+        // 其余（Channel/Rpc/MethodUnavailable/ProviderUnavailable）= 通道错误档
+        Ok(Err(e)) => {
+            let stage = match &e {
+                DshAcpError::InvalidTarget(_) | DshAcpError::DesktopWriterActive { .. } => {
+                    Stage::Refused
+                }
+                _ => Stage::ChannelError,
+            };
+            DshTurnOut {
+                receipt: Receipt::failed(stage, &e.to_string()).with_session(&sid),
+                permission_notes: Vec::new(),
+            }
+        }
+        // JoinError（spawn_blocking 任务 panic）：结果未知——如实失败 + 落账（R10）
+        Err(e) => {
+            log::error!("dsh 无头回合任务异常: {e}");
+            DshTurnOut {
+                receipt: Receipt::failed(
+                    Stage::ChannelError,
+                    "回合内部任务异常终止（结果未知，请打开 dsh 桌面端确认）",
+                )
+                .with_session(&sid),
+                permission_notes: Vec::new(),
+            }
+        }
+    };
+    ctx.audit(
+        &st,
+        crate::inject::headless::ACTION_HEADLESS,
+        &crate::inject::headless::turn::receipt_result_word(&out.receipt),
+        out.receipt.duration_ms,
+    );
+    crate::inject::headless::turn::registry().end(&ctx.sid);
+    out
+}
+
+/// **dsh ACP 无头分派**（H13 / Task 10；`session_send` ⑤b 的 `Headless(DshAcp)` 臂）。
+///
+/// 顺序与理由（照 wb/cli 先例，每步判据依赖）：
+/// 1. **cwd 门**（dsh-acp resume 的 cwd 必填且须绝对——相对路径被服务端 -32602 拒，
+///    MAM 侧投递前拒零协议副作用；占锁前拒免注销一步）；
+/// 2. **正文组装**（W4 单点 `compose_injection`：换行归一 + 移动端尾签名 + 花名白名单
+///    ——dsh 正文走 JSON-RPC stdin **不进 argv**，无 cmd 垫片面，cmd_shim 拒绝不适用）；
+/// 3. **会话串行锁**（声明通道 `headless_dsh_acp`——取消审计行 channel 列单点来源；
+///    **不武装取消靶子**：cancel 原语跨连接不可达，取消端点走
+///    [`CANCEL_NOT_WIRED_DSH_REASON`] 如实未接线——见 [`cancel_is_unwired_for`]）；
+/// 4. **客户端装配**（`dsh_acp::assemble_client`：runtime node 发现 + asar 幂等解包——
+///    fs IO 放 `spawn_blocking`；失败 = `spawn` 档如实拒，占位后失败必须注销槽位）；
+/// 5. **回合**（`run_dsh_turn`：审计/注销在任务内完成；三态靶向由客户端 `send()` 内部
+///    编排——resume 精确靶向 / 桌面写者占用如实拒 / 未命中 new 新建）；
+/// 6. 回执封套 + 可见性档 + **权限请求透传**（见下方 `permissionNotes` 接入面裁决）。
+pub(crate) async fn dsh_acp_headless_dispatch(
+    st: &Arc<RemoteState>,
+    device_id: &str,
+    device_name: &str,
+    session: &crate::session::Session,
+    text: &str,
+) -> Response {
+    use crate::inject::headless::dsh_acp;
+    use crate::inject::headless::receipt::Stage;
+    use crate::inject::routing::{HeadlessKind, RouteOutcome};
+
+    let os = std::env::consts::OS;
+    let tool = session.agent_type.tool_id().to_string();
+    let mut ctx = DshTurnCtx {
+        device_id: device_id.to_string(),
+        device_name: device_name.to_string(),
+        tool: tool.clone(),
+        sid: session.id.clone(),
+        content: text.to_string(),
+    };
+    // 1) cwd 门（投递前拒：相对 cwd 服务端必拒——不烧协议面；未占锁免注销）
+    if !std::path::Path::new(&session.project_path).is_absolute() {
+        return ctx.refuse(
+            st,
+            Stage::Refused,
+            &format!(
+                "会话项目路径非绝对形态（{}）——dsh resume 的 cwd 必填且须绝对，投递前拒",
+                session.project_path
+            ),
+        );
+    }
+    // 2) 正文组装（W4 单点；dsh 正文进 JSON-RPC stdin 不进 argv——无 cmd 垫片面）
+    let payload = match crate::inject::normalize::compose_injection(device_name, text) {
+        Ok(p) => p,
+        Err(reason) => return ctx.refuse(st, Stage::Refused, &reason),
+    };
+    ctx.content = payload.clone();
+    // 3) 会话串行锁（声明通道；不武装取消靶子——cancel 跨连接不可达，见函数级文档）
+    if !crate::inject::headless::turn::registry().begin(
+        &session.id,
+        crate::inject::headless::turn::TurnSlot::placeholder(&tool, ctx.content.clone())
+            .with_channel(HeadlessKind::DshAcp.wire_name()),
+    ) {
+        return ctx.refuse(
+            st,
+            Stage::Refused,
+            "该会话已有在飞的无头回合（MAM 串行锁，防同会话两回合交错）——本条未投递，\
+             请等回执后再发",
+        );
+    }
+    // 4) 客户端装配（fs 发现/解包 → spawn_blocking；失败注销槽位 + spawn 档如实拒）
+    let home = (st.home_source)().map(std::path::PathBuf::from);
+    let assemble_st = st.clone();
+    let client = match tokio::task::spawn_blocking(move || dsh_acp::assemble_client(home)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(reason)) => {
+            crate::inject::headless::turn::registry().end(&session.id);
+            return ctx.refuse(st, Stage::Spawn, &reason);
+        }
+        Err(e) => {
+            log::error!("dsh 客户端装配任务异常: {e}");
+            crate::inject::headless::turn::registry().end(&session.id);
+            return ctx.refuse(
+                st,
+                Stage::ChannelError,
+                "回合内部任务异常终止（装配阶段，未投递）——请重试",
+            );
+        }
+    };
+    // 5) 回合（三态靶向在客户端 send 内部；占位后唯一注销路径 = 回合自身）
+    let out = run_dsh_turn(
+        assemble_st,
+        ctx,
+        client,
+        session.id.clone(),
+        session.project_path.clone(),
+        payload,
+    )
+    .await;
+    // 6) 回执封套 + 可见性档（单源 = 路由表）+ 权限请求透传
+    let visibility = match crate::inject::routing::route(&tool, session.form, session.pid, os) {
+        RouteOutcome::Injectable { visibility, .. } => Some(visibility),
+        _ => None,
+    };
+    let mut body = headless_envelope(HeadlessKind::DshAcp, &out.receipt, visibility);
+    // **request_permission 透传的最小接入面裁决（Task 10，读代码后定案——登记）**：
+    // - 不挂 `cli_three::pending_registry`（审批卡通道）：前端审批轮询**只开 claude 通道**
+    //   （`SessionDetail` 的 `HEADLESS_CLAUDE_CHANNEL` 门 + api.ts 注释「其余通道没有
+    //   审批面」）——挂上去无人拉取；且 dsh send 是**同步阻塞** per-action 模型，权限
+    //   请求在回合终态才随回执可得，「在飞待答」语义不成立（注册即陈旧卡）；
+    // - 不挂 `session_question` available 机制：available 表达「问答在场待答」（双通道
+    //   hook/JSONL 扫描），dsh 权限请求是回合内已收集的历史面——复用会把「待答」说谎，
+    //   且 answer 端点对 dsh 是只读档（`question_profile_is_read_only`）文案引导错面；
+    // - 故最小面 = **回执封套透传**（`permissionNotes`，词 = `PermissionRequest::display()`
+    //   「dsh 请求权限：…」）——零新端点（「不新建端点优先」）；前端渲染与代答按钮列
+    //   P2（与 dsh 代答同批，本批-3）。
+    if !out.permission_notes.is_empty() {
+        body["permissionNotes"] = serde_json::json!(out.permission_notes);
+    }
+    json_no_store(StatusCode::OK, body)
+}
+
 /// 端点审计 action 选择（丁T3 裁2，**单点**）：`/` 开头消息记 `slash`，其余按投递
 /// 路径记 `send` / `queue`。
 ///
@@ -2789,8 +3028,9 @@ pub async fn session_send(
         );
     }
     // ⑤b 无头通道分派点（**Task 8 起 zcode 真分派、Task 9 起 codex 真分派、
-    //     Task 11 起 workbuddy 真分派、Task 13 起 H11 三家 CLI 真分派**）：路由判出无头
-    //     候选而**无终端候选** = 本条只能经无头通道投递。
+    //     Task 11 起 workbuddy 真分派、Task 13 起 H11 三家 CLI 真分派、Task 10 起 dsh
+    //     真分派（H13 · DshAcp）**）：路由判出无头候选而**无终端候选** = 本条只能经
+    //     无头通道投递。
     //     - `Headless(Zcode)` → [`zcode_headless_dispatch`]（每回合 spawn、串行锁、版本门控、
     //       审计、回执封套；**绝不入队**——裁决 8）；
     //     - `Headless(CodexQueue | CodexExec)` → [`codex_headless_dispatch`]（H8：APP 在场
@@ -2798,8 +3038,10 @@ pub async fn session_send(
     //     - `Headless(WbAcp)` → [`wb_headless_dispatch`]（H9：HTTP 型——connect→initialize→
     //       load/new→prompt，端点不可用/已结束会话都**如实回执**；同样绝不入队）；
     //     - `Headless(ClaudeP | KimiP | OpencodeRun)` → [`cli_headless_dispatch`]（H11/C4：
-    //       claude 长驻双向审批桥 / kimi / opencode 一次性进程；同样绝不入队）。
-    //     **七家全部接线完毕，本匹配无 `_` 兜底臂**（过渡码 `headless_pending` 已删除——
+    //       claude 长驻双向审批桥 / kimi / opencode 一次性进程；同样绝不入队）；
+    //     - `Headless(DshAcp)` → [`dsh_acp_headless_dispatch`]（H13/Task 10：dsh-acp
+    //       stdio 客户端三态靶向 resume/new，桌面写者占用如实拒；同样绝不入队）。
+    //     **八家全部接线完毕，本匹配无 `_` 兜底臂**（过渡码 `headless_pending` 已删除——
     //     新增无头变体时编译器会在此处立刻报错，这正是我们要的：不允许静默落回拒绝臂）。
     //     各臂都在唯一生产 INSERT（⑥）之前：无头条目进不了队列。
     if let Some(kind) = crate::inject::routing::headless_kind_of(&outcome) {
@@ -2819,6 +3061,10 @@ pub async fn session_send(
                 }
                 K::ClaudeP | K::KimiP | K::OpencodeRun => {
                     cli_headless_dispatch(&st, &device_id, &device_name, &session, &req.text, kind)
+                        .await
+                }
+                K::DshAcp => {
+                    dsh_acp_headless_dispatch(&st, &device_id, &device_name, &session, &req.text)
                         .await
                 }
             };
@@ -3259,6 +3505,31 @@ pub async fn session_send_info(
                 _ => (
                     vec![kind.wire_name()],
                     visibility_wire(&crate::inject::routing::Visibility::Realtime),
+                ),
+            };
+            serde_json::json!({
+                "injectable": true,
+                "channels": channels,
+                "visibility": visibility,
+            })
+        } else if kind == crate::inject::routing::HeadlessKind::DshAcp {
+            // **Task 10：dsh 已真分派**（H13）→ 输入区可用 + 通道名 + 路由表可见性档
+            // （刷新后 = dsh 自带 UI 刷新，spec 附录 A「自带 UI」）。运行时失败面
+            // （runtime node 不在场 / asar 解包失败 / 桌面写者占用 / 余额不足）由**回执**
+            // 如实上报——静态能力面谎报置灰会把「装了但安装位置未认出」说成永久不可用
+            // （zcode/codex/WB/CLI 四家同款口径：能判的判、判不准的交回执）。
+            let (channels, visibility) = match &outcome {
+                crate::inject::routing::RouteOutcome::Injectable {
+                    candidates,
+                    visibility,
+                } => (
+                    candidates.iter().map(channel_wire).collect::<Vec<_>>(),
+                    visibility_wire(visibility),
+                ),
+                // 不可达（上面已 filter 出 headless_only）：如实保守回本通道首选档
+                _ => (
+                    vec![kind.wire_name()],
+                    visibility_wire(&crate::inject::routing::Visibility::AfterRefresh),
                 ),
             };
             serde_json::json!({
@@ -3945,6 +4216,7 @@ fn channel_to_tool(channel: &str) -> Option<&'static str> {
         K::CodexQueue,
         K::CodexExec,
         K::WbAcp,
+        K::DshAcp,
     ]
     .into_iter()
     .find(|k| k.wire_name() == channel)
@@ -3955,6 +4227,7 @@ fn channel_to_tool(channel: &str) -> Option<&'static str> {
         K::ClaudeP => "claude",
         K::KimiP => "kimi",
         K::OpencodeRun => "opencode",
+        K::DshAcp => "dsh",
     })
 }
 
@@ -4131,7 +4404,7 @@ pub async fn session_headless_cancel(
             StatusCode::OK,
             serde_json::json!({
                 "cancelled": false,
-                "reason": CANCEL_NOT_WIRED_REASON,
+                "reason": cancel_unwired_reason(&channel),
             }),
         ),
         Some(false) if !snap.cancel_wired => json_no_store(
@@ -4155,12 +4428,33 @@ pub async fn session_headless_cancel(
 
 /// **本批未接线取消**的无头通道（H4 取消面）——判定单点，措辞与测试都读它，别另抄通道名。
 ///
-/// 目前只有 H9 WorkBuddy ACP：ACP 的 `session/cancel` 通知未实现（Task 11 登记项，主线跟进），
-/// 故其槽位**永远不武装靶子**——若不分辨，端点会把「回合仍在运行」说成「回合已终结」，
+/// 目前两家：H9 WorkBuddy ACP（`session/cancel` 通知未实现，Task 11 登记项，主线跟进）
+/// 与 H13 dsh（原语存在但跨连接不可达——见 [`CANCEL_NOT_WIRED_DSH_REASON`]，Task 10
+/// 接缝登记）。两家的槽位**永远不武装靶子**——若不分辨，端点会把「回合仍在运行」说成
+/// 「回合已终结」，
 /// 用户据此以为投递已中止（Task 11 复审 Important 3）。
 fn cancel_is_unwired_for(channel: &str) -> bool {
     channel == crate::inject::routing::HeadlessKind::WbAcp.wire_name()
+        || channel == crate::inject::routing::HeadlessKind::DshAcp.wire_name()
 }
+
+/// 未接线取消的**分通道措辞单点**（WB = 通知未实现；dsh = 同连接原语跨连接不可达——
+/// 理由不同故措辞分开，勿合并成一句含混文案）
+fn cancel_unwired_reason(channel: &str) -> &'static str {
+    if channel == crate::inject::routing::HeadlessKind::DshAcp.wire_name() {
+        CANCEL_NOT_WIRED_DSH_REASON
+    } else {
+        CANCEL_NOT_WIRED_REASON
+    }
+}
+
+/// dsh 通道取消未接线的诚实措辞（**回合仍在运行**——不是「已终结」）。cancel 原语
+/// （`session/cancel` notification）在 [`crate::inject::headless::dsh_acp`] 侧**存在**，
+/// 但它必须骑在**发起 prompt 的同一连接**上（per-action 短命模型：在飞会话由 `send()`
+/// 内部持有，连接不暴露给端点）——`session-headless-cancel` 跨连接**不可达**，如实
+/// 「未接线」不谎报（行为级效果 M25 真机待验，Task 10 接缝登记）
+pub(crate) const CANCEL_NOT_WIRED_DSH_REASON: &str =
+    "dsh 的取消原语骑在发起回合的同一连接上（per-action 短命模型），取消端点跨连接不可达：该回合**仍在运行**、本次未取消——请等它跑完或打开 dsh 桌面端处理（dsh 暂无撤回原语）";
 
 /// 未声明通道的审计哨兵词（不冒充任何既有通道；正常生产路径不会出现——三条分派臂都声明）
 pub(crate) const CANCEL_UNATTRIBUTED_CHANNEL: &str = "headless_unattributed";

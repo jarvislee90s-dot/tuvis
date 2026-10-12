@@ -11,8 +11,10 @@
 //!    早退——「会话在册但无存活进程」正是无头的主场景（Task 7 义务 2 的重排序）；
 //! 2. **判定只有一个出口**：`route()` 的结论即真相，H3 门经 [`headless_kind_of`] 读取
 //!    （Task 5 的平行谓词 `is_headless_bound` 已删除，勿复活）；
-//! 3. **dsh 刻意无无头通道**：H13（ACP stdio）不在本批 → 需要无头的 dsh 场合一律
-//!    `dsh_headless_pending`（H3 开关因此今天不管 dsh——范围裁决，见 [`HeadlessKind`]）。
+//! 3. **dsh 已入无头通道族（H13 · Task 10）**：APP 形态或进程不在 → `Headless(DshAcp)`
+//!    （原 `dsh_headless_pending` 刻意缺席分支删除）；H3 开关自此**自然接管 dsh**——
+//!    开关关 → dsh 发送 403 `headless_disabled` 置灰标因（行为变化，M24 验收）。
+//!    CLI 形态 + 活进程的终端注入格子保留（在产能力不动）。
 
 use crate::session::model::ProcessForm;
 
@@ -20,10 +22,9 @@ use crate::session::model::ProcessForm;
 /// （argv 构造 / 子进程生命周期 / 回执解析）在 `inject::headless` 底座与各工具适配器
 /// （Task 8/9/11/13）。
 ///
-/// **H13（dsh · ACP stdio）刻意缺席**：dsh 写侧不在本批范围，故不给 dsh 任何无头变体
-/// ——需要无头的 dsh 场合一律 `NotInjectable(dsh_headless_pending)`（见 [`headless_route`]）。
-/// 这是**范围裁决而非遗漏**：dsh 因此不进无头绑定集，H3 总开关今天管不到它；H13 落地时
-/// 加变体 + 路由分支即可（计划已注明「若审阅裁 H13 并入 → 改路由 `Headless(DshAcp)`」）。
+/// **H13（dsh · ACP stdio）已接线（Task 10）**：dsh 写侧经 `inject::headless::dsh_acp`
+/// 客户端投递（APP 形态或进程不在的场合；CLI 形态 + 活进程保留终端注入）。dsh 自此进
+/// 无头绑定集——H3 总开关接管它（原「刻意缺席、H3 不管 dsh」的范围裁决口径随之废止）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadlessKind {
     /// H7 在册注入 / H10 无头新建：`ELECTRON_RUN_AS_NODE=1 <ZCode> <…>/zcode.cjs --prompt …`
@@ -40,6 +41,10 @@ pub enum HeadlessKind {
     KimiP,
     /// H11：`opencode run`
     OpencodeRun,
+    /// H13：`<dsh runtime node.exe> <asar 解包缓存>\…\bin.js --profile acp`（stdio
+    /// JSON-RPC；三态靶向 resume/new + 桌面写者占用如实拒——客户端本体
+    /// `inject::headless::dsh_acp`，Task 9）
+    DshAcp,
 }
 
 impl HeadlessKind {
@@ -55,6 +60,7 @@ impl HeadlessKind {
             HeadlessKind::ClaudeP => "headless_claude_p",
             HeadlessKind::KimiP => "headless_kimi_p",
             HeadlessKind::OpencodeRun => "headless_opencode_run",
+            HeadlessKind::DshAcp => "headless_dsh_acp",
         }
     }
 }
@@ -132,8 +138,8 @@ pub enum RouteOutcome {
 /// 文档级），无外部写 API 故不可注入。
 ///
 /// **Task 7 起本表只剩这一行**（义务 3）：workbuddy / dsh / zcode 的原 `blackbox` /
-/// `headless_only` 两码已按**实际分派**改写（无头路由见 [`headless_route`]、dsh 见
-/// `dsh_headless_pending`）——`blackbox` 只保留在**真的没有外部写 API** 的家上，别再把
+/// `headless_only` 两码已按**实际分派**改写（无头路由见 [`headless_route`]；dsh 自
+/// Task 10 起入 `Headless(DshAcp)`）——`blackbox` 只保留在**真的没有外部写 API** 的家上，别再把
 /// 「有通道、只是本批不做」的工具塞进同一个码（Task 5 评审：那是第二真相源）。
 fn tool_gate(tool: &str) -> Option<(&'static str, String)> {
     match tool {
@@ -162,11 +168,12 @@ fn tool_gate(tool: &str) -> Option<(&'static str, String)> {
 /// - `claude` / `kimi` / `opencode`：**判据只能是「有无活进程可写」**（H11：三家同时存在
 ///   TUI 会话，`ProcessForm` 区分不了）——有活 pid = 已开 TUI = 终端注入；`pid == 0` =
 ///   没有可写的 TUI，无头是唯一通路（spec:169-173「全部走 H3–H6 底座」）
-/// - `dsh`：**刻意不给无头通道**（H13 写侧不在本批，见 [`HeadlessKind`]）——CLI 形态 +
-///   活进程的格子保留终端注入；APP 形态或进程不在（即「需要无头」的两种场合）→
-///   `dsh_headless_pending`。**生产现状**：`monitor::dsh` 恒判 APP 形态（桌面宿主 pid，
-///   无宿主则 0），故今天 dsh 一律落 `dsh_headless_pending`——CLI 形态那格是路由表口径，
-///   若将来 dsh 出现真实终端宿主形态须复核（宪法附 A：dsh 注入 ◐ 另评，未定案）
+/// - `dsh`：APP 形态或进程不在（「需要无头」的两种场合）→ `Headless(DshAcp)`（H13 ·
+///   Task 10——原 `dsh_headless_pending` 分支删除）；CLI 形态 + 活进程的格子保留终端
+///   注入（在产能力不动，W3：无头对已开 TUI 不路由）。**生产现状**：`monitor::dsh` 恒判
+///   APP 形态（桌面宿主 pid，无宿主则 0），故生产 dsh 会话实际都走 `DshAcp` 臂——CLI
+///   形态那格是路由表口径，若将来 dsh 出现真实终端宿主形态须复核（宪法附 A：dsh 注入
+///   ◐ 另评，未定案）
 /// - 其余工具（含 openclaw）：`None`
 ///
 /// 可见性按 spec 附录 A「有头可见性」列取档；候选首位 = 首选通道（与既有终端三通道的
@@ -203,11 +210,11 @@ fn headless_route(tool: &str, form: ProcessForm, pid: u32) -> Option<RouteOutcom
             vec![Channel::Headless(K::OpencodeRun)],
             Visibility::Realtime, // 官方 web 实时（附录 A）
         ),
+        // H13（Task 10）：需要无头的两种场合 → DshAcp（H3 自然接管；可见性 = 刷新后
+        // ——dsh 自带 UI 刷新，spec 附录 A「自带 UI」；写时桌面必然未持有该会话，
+        // 持有时被单写者锁如实拒〔`dsh_acp::ACTIVE_SESSION_REFUSAL`〕）
         "dsh" if form == ProcessForm::App || pid == 0 => {
-            return Some(RouteOutcome::NotInjectable {
-                reason_code: "dsh_headless_pending",
-                reason: "dsh 无头写通道（H13 · ACP stdio）不在本批，暂不可注入".into(),
-            })
+            (vec![Channel::Headless(K::DshAcp)], Visibility::AfterRefresh)
         }
         _ => return None,
     };
@@ -288,9 +295,10 @@ pub fn route(agent_tool_id: &str, form: ProcessForm, pid: u32, platform: &str) -
 /// 只有 `route()` 一个答案**，消费方（`remote::api::headless_blocked`，两个门点共用）经本
 /// 函数读取。
 ///
-/// **dsh 刻意落在 `None`**：H13（dsh 写侧）不在本批，dsh 需要无头的场合路由判
-/// `dsh_headless_pending`（不可注入 → 本函数 `None`）——即 H3 开关今天**不管 dsh，这是范围
-/// 裁决而非疏漏**（H13 落地、加 `DshAcp` 变体与路由分支后自然入集）。
+/// **dsh 已入集（Task 10）**：dsh 需要无头的场合路由判 `Headless(DshAcp)` → 本函数
+/// `Some(DshAcp)`——H3 开关自此接管 dsh（开关关 → dsh 发送 403 `headless_disabled`
+/// 置灰标因；原「H3 今天不管 dsh」的范围裁决口径废止）。CLI 形态 + 活进程保持终端
+/// 通道（`None`，不受 H3）。
 pub fn headless_kind_of(outcome: &RouteOutcome) -> Option<HeadlessKind> {
     match outcome {
         RouteOutcome::Injectable { candidates, .. } => candidates.iter().find_map(|c| match c {
@@ -387,7 +395,7 @@ mod tests {
     }
 
     /// 工具门（Task 7 重写后）：**`blackbox` 只剩 openclaw**（真的没有外部写 API 的家）；
-    /// workbuddy / zcode 已入无头通道；dsh 需要无头的场合如实报 `dsh_headless_pending`
+    /// workbuddy / zcode 已入无头通道；dsh 需要无头的场合已入 `Headless(DshAcp)`（Task 10）
     #[test]
     fn tool_gates_after_task7() {
         // openclaw：黑盒（gateway 另评），两种形态 + 活进程都判黑盒
@@ -410,20 +418,95 @@ mod tests {
                 );
             }
         }
-        // dsh：CLI 形态 + 活进程 = 在产终端注入保留；需要无头的两种场合 → dsh_headless_pending
+        // dsh：CLI 形态 + 活进程 = 在产终端注入保留（在产能力不动）；
+        // 需要无头的场合已入无头路由（H13 · Task 10——主断言见 dsh_routes_to_headless_dsh_acp）
         assert!(
             has_terminal_candidate(&route("dsh", cli(), 100, "macos")),
             "dsh CLI 形态 + 活进程必须保留终端注入（在产能力不动）"
         );
-        for (form, pid) in [(app(), 100), (cli(), 0)] {
+    }
+
+    /// **Task 10 主翻转断言**：dsh 需要无头的场合（APP 形态 / 进程不在）→
+    /// `Headless(DshAcp)`（原 `dsh_headless_pending` 刻意缺席分支删除——H13 已落地）。
+    /// 候选单通道 + 可见性 = 刷新后（dsh 自带 UI 刷新，spec 附录 A）
+    #[test]
+    fn dsh_routes_to_headless_dsh_acp() {
+        for (form, pid) in [(app(), 100), (cli(), 0), (app(), 0)] {
             let r = route("dsh", form, pid, "macos");
             assert!(
-                matches!(r, RouteOutcome::NotInjectable { reason_code, .. } if reason_code == "dsh_headless_pending"),
-                "dsh 需要无头的场合（APP 形态 / 进程不在）必须如实报 dsh_headless_pending：{r:?}"
+                matches!(r, RouteOutcome::Injectable { ref candidates, visibility }
+                    if *candidates == vec![Channel::Headless(HeadlessKind::DshAcp)]
+                        && visibility == Visibility::AfterRefresh),
+                "dsh（{form:?} + pid={pid}）必须路由到 Headless(DshAcp)：{r:?}"
             );
             assert!(
-                headless_kind_of(&r).is_none(),
-                "H13 不在本批：dsh 刻意不进无头绑定集（H3 开关今天不管它——范围裁决）"
+                !matches!(
+                    r,
+                    RouteOutcome::NotInjectable {
+                        reason_code: "dsh_headless_pending",
+                        ..
+                    }
+                ),
+                "dsh_headless_pending 刻意缺席口径已废止（Task 10）：{r:?}"
+            );
+        }
+    }
+
+    /// dsh 无头 wire 名钉值（Task 10）：审计 channel 列 + send-info channels 数组同源，
+    /// 且与既有七词互不碰撞
+    #[test]
+    fn dsh_wire_name_pinned_headless_dsh_acp() {
+        assert_eq!(HeadlessKind::DshAcp.wire_name(), "headless_dsh_acp");
+        let all = [
+            HeadlessKind::Zcode,
+            HeadlessKind::CodexQueue,
+            HeadlessKind::CodexExec,
+            HeadlessKind::WbAcp,
+            HeadlessKind::ClaudeP,
+            HeadlessKind::KimiP,
+            HeadlessKind::OpencodeRun,
+            HeadlessKind::DshAcp,
+        ];
+        let names: Vec<&str> = all.iter().map(|k| k.wire_name()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "wire 名必须互不碰撞：{names:?}");
+    }
+
+    /// **H3 管辖集扩 dsh**（Task 10 行为变化）：dsh 需要无头的场合判无头绑定
+    /// （`headless_kind_of` = Some ⇒ `remote::api::headless_blocked` 会拦——开关关 →
+    /// 403 `headless_disabled`）；CLI 形态 + 活进程保持非绑定（终端通道不受 H3）
+    #[test]
+    fn h3_bound_set_includes_dsh() {
+        for (form, pid) in [(app(), 100), (cli(), 0)] {
+            assert_eq!(
+                headless_kind_of(&route("dsh", form, pid, "windows")),
+                Some(HeadlessKind::DshAcp),
+                "dsh 需要无头的场合必须进无头绑定集（H3 自然接管——原「H3 今天不管 dsh」废止）"
+            );
+        }
+        let r = route("dsh", cli(), 100, "windows");
+        assert!(
+            headless_kind_of(&r).is_none() && has_terminal_candidate(&r),
+            "dsh CLI 形态 + 活进程 = 终端通道，不受 H3 门：{r:?}"
+        );
+    }
+
+    /// dsh CLI 形态 + 活进程的**在产终端注入**不回归（Task 10 只接走「需要无头」的格子）
+    #[test]
+    fn dsh_cli_form_with_live_process_keeps_terminal_route() {
+        for (platform, want) in [
+            ("windows", vec![Channel::WindowsConsole]),
+            (
+                "macos",
+                vec![Channel::Tmux, Channel::Iterm2, Channel::TerminalApp],
+            ),
+        ] {
+            let r = route("dsh", cli(), 100, platform);
+            assert!(
+                matches!(r, RouteOutcome::Injectable { ref candidates, .. } if *candidates == *want),
+                "dsh CLI + 活进程 @ {platform} 必须保持终端候选：{r:?}"
             );
         }
     }
@@ -534,10 +617,12 @@ mod tests {
             headless_kind_of(&route("codex", cli(), 100, "macos")).is_none(),
             "codex CLI 形态保持在产终端注入（W3）"
         );
+        // CLI 形态 + 活进程的非绑定家（dsh = 终端注入保留〔H13 只接走需要无头的格子，
+        // 见 h3_bound_set_includes_dsh〕；openclaw = 黑盒恒非无头）
         for tool in ["dsh", "openclaw"] {
             assert!(
                 headless_kind_of(&route(tool, cli(), 100, "macos")).is_none(),
-                "{tool} 不进无头绑定集（dsh：H13 不在本批——范围裁决）"
+                "{tool} CLI 形态 + 活进程不进无头绑定集（终端注入保留，不受 H3）"
             );
         }
     }
@@ -611,6 +696,7 @@ mod tests {
             (HeadlessKind::ClaudeP, "headless_claude_p"),
             (HeadlessKind::KimiP, "headless_kimi_p"),
             (HeadlessKind::OpencodeRun, "headless_opencode_run"),
+            (HeadlessKind::DshAcp, "headless_dsh_acp"),
         ] {
             assert_eq!(kind.wire_name(), name);
         }
