@@ -20,6 +20,11 @@ pub mod codex;
 /// per-action 短命会话 / thread·read 读回 / 档位写（载体① turn·start·approvalPolicy）/
 /// 自持回合 interrupt。daemon 通道已按 T0.1 删除（对 APP 持有线程两腿皆拒，零 WS 依赖）
 pub mod codex_app;
+/// P1 dsh 轨（H13，Task 9）：`@deepseek-ai/dsh-acp` stdio 客户端——T0.3/T0.4 定案的
+/// spawn 钉值（runtime node + 解包 bin.js + `--profile acp`）/ 三态靶向（list→resume·new）/
+/// prompt 通知流归一 / cancel（notification 形态）/ request_permission 只展示不代答。
+/// 路由接线（`HeadlessKind::DshAcp` + ⑤b 臂）归 Task 10
+pub mod dsh_acp;
 pub mod gate;
 pub mod receipt;
 pub mod runner;
