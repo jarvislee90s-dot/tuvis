@@ -1,11 +1,12 @@
-// 预设编辑弹窗（新建/编辑共用，spec §7.2）：
+// 预设编辑弹窗（新建/编辑共用，spec §7.2；资源管理页 UI 改版 B6/B7 两列改版）：
 // - 类型 Radio（通用/工具私有）+ 绑定工具原生 <select>（选项 = 已启用工具；编辑 tool-scope
 //   预设时锁定——bound_tool 是原生技能项的归属标识，改绑会破坏预设身份语义）
 // - 名称必填 + 描述 textarea（备忘录用途）
-// - 套件列表 skill/MCP/plugin 三组复选（数据源 presetExtensions，按 kind 分组）：
-//   通用 = 仅 兔维斯 资源（非 isNative），专属项带徽标但不禁选；
-//   工具私有 = 兔维斯 资源全列、「不适配」项置灰 + 原因 title（不适配 = 存在 binding 且
-//   exclusiveTools 非空且不含绑定工具），并追加「原生技能」组（isNative && sourceTool === boundTool）
+// - 保存/取消按钮在描述输入框下方、资源选择区上方（B7：不再放 Dialog 底部 footer）
+// - 资源选择区左右两列（B6）：左 = 全量可选（顶部搜索框 + 名称排序切换，Checkbox 列表按
+//   kind 分组）；右 = 已勾选列表（按 kind 分组、每项带对钩，点对钩即取消选中；空态文案提示）
+//   ——通用 = 仅 兔维斯 资源（非 isNative），专属项带徽标但不禁选；工具私有 = 兔维斯 资源
+//   全列、「不适配」项置灰 + 原因 title，并追加「原生技能」组（isNative && sourceTool === boundTool）
 // - 转类型建议：通用模式勾选任一专属资源 → 提示条 + 「转工具私有」快捷按钮
 // - 保存：新建 createPreset / 编辑 updatePreset；名称必填 + ≥1 项校验；
 //   后端激活守卫（错误串含 PRESET_ACTIVE）→ presets.saveFailedActive toast；
@@ -15,22 +16,17 @@ import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { Loader2 } from "lucide-react";
+import { Loader2, Check, ArrowUpDown, ArrowUp, ArrowDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { formatInvokeError } from "@/lib/invokeError";
 import { createPreset, updatePreset } from "@/lib/api/preset";
 import { PRESETS_KEY } from "@/lib/query/queries/presets";
 import { useEnabledToolsQuery } from "@/lib/query/queries/tools";
 import { useResourceBindingsQuery } from "@/lib/query/queries/bindings";
+import { applyNameSort, cycleSortDir, type SortDir } from "@/lib/nameSort";
 import type { PresetRecord } from "@/types/preset";
 import type { ExtensionWithAssignments } from "@/types/extension";
 
@@ -79,6 +75,9 @@ export function PresetEditDialog({
   // 选中集合：extensionId::kind 复合键（编辑回填时含 preset.items 中已不在列表的残留项，保存不丢）
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
+  // 左列检索/排序（B6）：仅影响左列展示，不动选中集合
+  const [leftSearch, setLeftSearch] = useState("");
+  const [leftSortDir, setLeftSortDir] = useState<SortDir>("none");
 
   // open 时按用途初始化表单：编辑回填 > FR-24 预填 > 新建空表单
   useEffect(() => {
@@ -102,6 +101,8 @@ export function PresetEditDialog({
       setBoundTool("");
       setSelected(new Set());
     }
+    setLeftSearch("");
+    setLeftSortDir("none");
   }, [open, preset, prefill]);
 
   // extensionId → 绑定信息（exclusiveTools 为逗号 join 串，与后端存储同形）
@@ -150,17 +151,43 @@ export function PresetEditDialog({
   const showSwitchHint =
     scope === "universal" && [...selected].some((k) => isExclusive(parseItemKey(k)[0]));
 
-  // 兔维斯 资源（非原生）按 kind 分组，空组不渲染
+  // 左列检索（大小写不敏感包含）+ 三态排序（口径与资源两视图一致，复用 nameSort）
+  const leftQuery = leftSearch.trim().toLowerCase();
+  const matchName = (name: string) => !leftQuery || name.toLowerCase().includes(leftQuery);
+
+  // 兔维斯 资源（非原生）按 kind 分组（过滤 + 排序后），空组不渲染
   const mamGroups = KINDS.map(({ kind, countKey }) => ({
     kind,
     countKey,
-    items: presetExtensions.filter((e) => e.kind === kind && !e.isNative),
+    items: applyNameSort(
+      presetExtensions.filter((e) => e.kind === kind && !e.isNative && matchName(e.name)),
+      leftSortDir
+    ),
   })).filter((g) => g.items.length > 0);
   // 原生技能组：仅工具私有模式且绑定工具已选时出现
   const nativeItems =
     scope === "tool" && boundTool
-      ? presetExtensions.filter((e) => e.isNative && e.sourceTool === boundTool)
+      ? applyNameSort(
+          presetExtensions.filter(
+            (e) => e.isNative && e.sourceTool === boundTool && matchName(e.name)
+          ),
+          leftSortDir
+        )
       : [];
+
+  // 右列（B6）：已勾选按 kind 分组；名称解析优先套件名册，回退编辑回填的 extensionName，再回退裸 id
+  const extNameOf = (id: string, kind: string): string =>
+    presetExtensions.find((e) => e.id === id)?.name ??
+    preset?.items.find((i) => i.extensionId === id && i.kind === kind)?.extensionName ??
+    id;
+  const rightGroups = KINDS.map(({ kind, countKey }) => ({
+    kind,
+    countKey,
+    items: [...selected]
+      .map(parseItemKey)
+      .filter(([, kind2]) => kind2 === kind)
+      .map(([id, kind2]) => ({ key: itemKey(id, kind2), name: extNameOf(id, kind2) })),
+  })).filter((g) => g.items.length > 0);
 
   const toggle = (key: string, next: boolean) => {
     setSelected((prev) => {
@@ -220,7 +247,7 @@ export function PresetEditDialog({
       invoke("refresh_tray", { presetsLabel: t("tray.presetsLabel") }).catch(() => {});
       onClose();
     } catch (e) {
-      // 后端守卫：预设正在应用中时错误串带 PRESET_ACTIVE 标记（commands/preset.rs）
+      // 后端守卫：预设正在应用中时错误串含 PRESET_ACTIVE 标记（commands/preset.rs）
       const msg = formatInvokeError(e, t);
       if (msg.includes("PRESET_ACTIVE")) toast.error(t("presets.saveFailedActive"));
       else toast.error(t("common.saveFailed", { error: msg }));
@@ -229,16 +256,25 @@ export function PresetEditDialog({
     }
   };
 
+  const SortIco =
+    leftSortDir === "asc" ? ArrowUp : leftSortDir === "desc" ? ArrowDown : ArrowUpDown;
+
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent aria-describedby={undefined} className="max-h-[80vh] max-w-lg overflow-y-auto">
+      <DialogContent
+        aria-describedby={undefined}
+        // 宽度提权（F1）：基类尾部 `sm:max-w-lg`（512px）在 ≥640px 视口下会顶掉无前缀
+        // max-w-*（B6/B7 两列改版要 768）→ 尾 `!` 提权；窄视口 1rem 边距用
+        // w-[calc(100%-2rem)] 兜住（基类 max-w-[calc(100%-2rem)] 已被 twMerge 顶掉）
+        className="flex max-h-[85vh] w-[calc(100%-2rem)] max-w-3xl! flex-col overflow-hidden"
+      >
         <DialogHeader>
           <DialogTitle className="text-sm">
             {preset ? t("presets.editTitle") : t("presets.createTitle")}
           </DialogTitle>
         </DialogHeader>
 
-        <div className="space-y-3">
+        <div className="flex min-h-0 flex-1 flex-col gap-3">
           {/* 类型：通用 / 工具私有（原生 radio） */}
           <div className="flex items-center gap-4">
             <span className="text-xs font-medium">{t("presets.type")}</span>
@@ -307,6 +343,18 @@ export function PresetEditDialog({
             />
           </div>
 
+          {/* 保存/取消（B7）：移到描述输入框下方、资源选择区上方（Dialog 底部不再放操作钮） */}
+          <div className="flex items-center justify-end gap-2">
+            {/* 取消恒可用（saving 中也可关） */}
+            <Button size="sm" variant="outline" onClick={onClose}>
+              {t("common.cancel")}
+            </Button>
+            <Button size="sm" onClick={handleSave} disabled={!canSave}>
+              {saving && <Loader2 className="h-3 w-3 animate-spin" />}
+              {t("common.save")}
+            </Button>
+          </div>
+
           {/* 转类型建议：通用模式勾选了专属资源 → 一键切工具私有（绑定工具需再手选） */}
           {showSwitchHint && (
             <div className="flex items-center justify-between gap-2 rounded border border-orange-500/30 bg-orange-500/10 p-2 text-xs">
@@ -322,80 +370,149 @@ export function PresetEditDialog({
             </div>
           )}
 
-          {/* 套件列表：skill / MCP / plugin 三组 兔维斯 资源复选 + 工具私有模式的原生技能组 */}
-          <div className="space-y-2">
-            {mamGroups.map((group) => (
-              <div key={group.kind}>
-                <h4 className="text-muted-foreground mb-1 text-xs font-medium">
-                  {t(group.countKey, { n: group.items.length })}
-                </h4>
-                <div className="space-y-1">
-                  {group.items.map((ext) => {
-                    const key = itemKey(ext.id, ext.kind);
-                    const mismatched = isMismatched(ext);
-                    const exclusive = isExclusive(ext.id);
-                    return (
-                      <label
-                        key={key}
-                        className={`flex items-center gap-2 text-xs ${
-                          mismatched ? "cursor-not-allowed opacity-50" : "cursor-pointer"
-                        }`}
-                        title={mismatched ? mismatchTitle(ext) : undefined}
-                      >
-                        <Checkbox
-                          checked={selected.has(key)}
-                          disabled={mismatched}
-                          onCheckedChange={(v) => toggle(key, v === true)}
-                        />
-                        <span className="truncate">{ext.name}</span>
-                        {/* 专属徽标：仅通用模式展示（可见不禁选）；工具私有模式以置灰 + 原因表达 */}
-                        {scope === "universal" && exclusive && (
-                          <span className="shrink-0 rounded bg-orange-500/15 px-1.5 py-0.5 text-[10px] text-orange-600">
-                            {t("presets.exclusiveBadge")}
-                          </span>
-                        )}
-                      </label>
-                    );
-                  })}
-                </div>
+          {/* 资源选择区左右两列（B6）：左 = 全量可选（搜索 + 排序 + 分组复选）；
+              右 = 已勾选（分组 + 对钩移除）。两列各自内部滚动 */}
+          <div className="grid min-h-[240px] flex-1 grid-cols-2 gap-3">
+            {/* 左列：全量可选 */}
+            <div className="flex min-h-0 flex-col rounded border p-2">
+              <div className="mb-2 flex items-center gap-1">
+                <span className="shrink-0 text-xs font-medium">
+                  {t("presets.availableResources")}
+                </span>
+                <input
+                  type="text"
+                  placeholder={t("resources.filterByName")}
+                  value={leftSearch}
+                  onChange={(e) => setLeftSearch(e.currentTarget.value)}
+                  className="ml-auto h-6 w-24 rounded border px-1.5 text-[11px]"
+                />
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className={`h-6 shrink-0 px-1.5 ${
+                    leftSortDir !== "none" ? "text-foreground" : "text-muted-foreground"
+                  }`}
+                  title={t("resources.sortByName")}
+                  aria-label={t("resources.sortByName")}
+                  onClick={() => setLeftSortDir((prev) => cycleSortDir(prev))}
+                >
+                  <SortIco className="h-3 w-3" />
+                  {leftSortDir !== "none" && <span>{leftSortDir === "asc" ? "↑" : "↓"}</span>}
+                </Button>
               </div>
-            ))}
+              <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+                {mamGroups.map((group) => (
+                  <div key={group.kind}>
+                    <h4 className="text-muted-foreground mb-1 text-xs font-medium">
+                      {t(group.countKey, { n: group.items.length })}
+                    </h4>
+                    <div className="space-y-1">
+                      {group.items.map((ext) => {
+                        const key = itemKey(ext.id, ext.kind);
+                        const mismatched = isMismatched(ext);
+                        const exclusive = isExclusive(ext.id);
+                        return (
+                          <label
+                            key={key}
+                            className={`flex items-center gap-2 text-xs ${
+                              mismatched ? "cursor-not-allowed opacity-50" : "cursor-pointer"
+                            }`}
+                            title={mismatched ? mismatchTitle(ext) : undefined}
+                          >
+                            <Checkbox
+                              checked={selected.has(key)}
+                              disabled={mismatched}
+                              onCheckedChange={(v) => toggle(key, v === true)}
+                            />
+                            <span className="truncate">{ext.name}</span>
+                            {/* 专属徽标：仅通用模式展示（可见不禁选）；工具私有模式以置灰 + 原因表达 */}
+                            {scope === "universal" && exclusive && (
+                              <span className="shrink-0 rounded bg-orange-500/15 px-1.5 py-0.5 text-[10px] text-orange-600">
+                                {t("presets.exclusiveBadge")}
+                              </span>
+                            )}
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
 
-            {/* 原生技能组：isNative && sourceTool === boundTool 的项（工具私有预设独有） */}
-            {scope === "tool" && nativeItems.length > 0 && (
-              <div>
-                <h4 className="text-muted-foreground mb-1 text-xs font-medium">
-                  {t("presets.nativeSkills")}
-                </h4>
-                <div className="space-y-1">
-                  {nativeItems.map((ext) => {
-                    const key = itemKey(ext.id, ext.kind);
-                    return (
-                      <label key={key} className="flex cursor-pointer items-center gap-2 text-xs">
-                        <Checkbox
-                          checked={selected.has(key)}
-                          onCheckedChange={(v) => toggle(key, v === true)}
-                        />
-                        <span className="truncate">{ext.name}</span>
-                      </label>
-                    );
-                  })}
-                </div>
+                {/* 原生技能组：isNative && sourceTool === boundTool 的项（工具私有预设独有） */}
+                {scope === "tool" && nativeItems.length > 0 && (
+                  <div>
+                    <h4 className="text-muted-foreground mb-1 text-xs font-medium">
+                      {t("presets.nativeSkills")}
+                    </h4>
+                    <div className="space-y-1">
+                      {nativeItems.map((ext) => {
+                        const key = itemKey(ext.id, ext.kind);
+                        return (
+                          <label
+                            key={key}
+                            className="flex cursor-pointer items-center gap-2 text-xs"
+                          >
+                            <Checkbox
+                              checked={selected.has(key)}
+                              onCheckedChange={(v) => toggle(key, v === true)}
+                            />
+                            <span className="truncate">{ext.name}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
-            )}
+            </div>
+
+            {/* 右列：已勾选 */}
+            <div className="flex min-h-0 flex-col rounded border p-2">
+              <div className="mb-2 flex items-center gap-1.5">
+                <span className="text-xs font-medium">{t("presets.selectedResources")}</span>
+                <span className="bg-muted text-muted-foreground rounded px-1.5 text-[10px]">
+                  {selected.size}
+                </span>
+              </div>
+              {rightGroups.length === 0 ? (
+                <div className="text-muted-foreground flex flex-1 items-center justify-center text-xs">
+                  {t("presets.noSelectionHint")}
+                </div>
+              ) : (
+                <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+                  {rightGroups.map((group) => (
+                    <div key={group.kind}>
+                      <h4 className="text-muted-foreground mb-1 text-xs font-medium">
+                        {t(group.countKey, { n: group.items.length })}
+                      </h4>
+                      <div className="space-y-1">
+                        {group.items.map((entry) => (
+                          <div
+                            key={entry.key}
+                            className="bg-accent/50 flex items-center justify-between gap-1 rounded px-1.5 py-1 text-xs"
+                          >
+                            <span className="truncate">{entry.name}</span>
+                            {/* 对钩即选中态本体：点击 = 取消选中（左列复选框同步回弹） */}
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-5 shrink-0 px-1"
+                              title={t("presets.removeSelection")}
+                              aria-label={`${t("presets.removeSelection")}: ${entry.name}`}
+                              onClick={() => toggle(entry.key, false)}
+                            >
+                              <Check className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         </div>
-
-        <DialogFooter>
-          {/* 取消恒可用（saving 中也可关） */}
-          <Button size="sm" variant="outline" onClick={onClose}>
-            {t("common.cancel")}
-          </Button>
-          <Button size="sm" onClick={handleSave} disabled={!canSave}>
-            {saving && <Loader2 className="h-3 w-3 animate-spin" />}
-            {t("common.save")}
-          </Button>
-        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

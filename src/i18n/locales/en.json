@@ -22,7 +22,15 @@
     "feature3": "TypeScript - Type safety",
     "feature4": "Tailwind CSS v4 - Modern CSS framework",
     "feature5": "shadcn/ui - Beautiful UI components",
-    "close": "Close"
+    "close": "Close",
+    "updateTo": "Update to v{{version}}",
+    "newVersionDetected": "New version detected: {{version}}",
+    "officialRepo": "Repository",
+    "changelog": "Changelog",
+    "recentUpdates": "What's New",
+    "starMessage": "If Tuvis has helped you, please give it a Star on GitHub — it means a lot to us",
+    "starAction": "Star on GitHub",
+    "starDismiss": "Dismiss banner"
   },
   "theme": {
     "toggle": "Toggle theme"
@@ -584,6 +592,13 @@
     "noPlugins": "No plugins yet",
     "allToolsOn": "Enable all",
     "allToolsOff": "Disable all",
+    "allPrefix": "All",
+    "allOnAction": "on",
+    "allOffAction": "off",
+    "sourceNative": "Native",
+    "sourceRepo": "Global repo",
+    "sourceAgents": ".agents",
+    "sourceAgentsHint": "Available via legacy ~/.agents/skills link (codex legacy migration surface; not in the enabled ledger)",
     "batchDone": "Done: {{ok}}, skipped: {{skipped}}",
     "batchFailed": "{{n}} failed",
     "deleteNativeTitle": "⚠️ Delete native skill",
@@ -638,8 +653,6 @@
       "save": "Save",
       "clear": "Clear binding"
     },
-    "collapseSection": "Collapse section",
-    "expandSection": "Expand section",
     "filterByName": "Filter by name…",
     "resident": {
       "toggle": "Resident lock (exempt from preset disable/stash)"
@@ -723,7 +736,7 @@
     "removeItem": "Remove item",
     "nativeSkills": "Native skills",
     "exclusiveBadge": "Exclusive",
-    "residentBadge": "Resident",
+    "residentBadge": "Res.",
     "switchToToolScopedHint": "Selection includes exclusive resources — consider switching to a tool-scoped preset",
     "activeOn": "Active",
     "saveFailedActive": "This preset is active — turn it off before saving changes",
@@ -736,7 +749,13 @@
     "toStashCount": "To stash ({{n}})",
     "toDisableCount": "To disable ({{n}})",
     "residentExemptCount": "Resident-exempt ({{n}})",
-    "saveAsPreset": "Save as Preset"
+    "saveAsPreset": "Save as Preset",
+    "availableResources": "Available resources",
+    "selectedResources": "Selected resources",
+    "noSelectionHint": "No resources selected yet",
+    "previewPreset": "Preview preset",
+    "editPreset": "Edit preset",
+    "removeSelection": "Remove item"
   },
   "manifest": {
     "installConfirm": "Confirm installation",

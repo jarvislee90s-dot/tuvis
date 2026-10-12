@@ -22,7 +22,15 @@
     "feature3": "TypeScript - 类型安全",
     "feature4": "Tailwind CSS v4 - 现代 CSS 框架",
     "feature5": "shadcn/ui - 精美的 UI 组件",
-    "close": "关闭"
+    "close": "关闭",
+    "updateTo": "更新到 v{{version}}",
+    "newVersionDetected": "检测到新版本：{{version}}",
+    "officialRepo": "官方仓库",
+    "changelog": "更新日志",
+    "recentUpdates": "近期更新",
+    "starMessage": "如果 兔维斯 帮到了你，请在 GitHub 点个 Star，这对我们意义重大",
+    "starAction": "去点 Star",
+    "starDismiss": "关闭横幅"
   },
   "theme": {
     "toggle": "切换主题"
@@ -584,6 +592,13 @@
     "noPlugins": "暂无插件",
     "allToolsOn": "全部启用",
     "allToolsOff": "全部禁用",
+    "allPrefix": "全部",
+    "allOnAction": "启用",
+    "allOffAction": "禁用",
+    "sourceNative": "原生",
+    "sourceRepo": "全局仓库",
+    "sourceAgents": ".agents 可用",
+    "sourceAgentsHint": "该技能经 ~/.agents/skills 遗留链接可用（codex 遗留迁移面，未入启用账本）",
     "batchDone": "完成 {{ok}} 项，跳过 {{skipped}} 项",
     "batchFailed": "{{n}} 项失败",
     "deleteNativeTitle": "⚠️ 删除原生 skill",
@@ -638,8 +653,6 @@
       "save": "保存",
       "clear": "清除绑定"
     },
-    "collapseSection": "收起该分组",
-    "expandSection": "展开该分组",
     "filterByName": "按名称筛选…",
     "resident": {
       "toggle": "常驻锁（预设应用时豁免停用/暂存）"
@@ -736,7 +749,13 @@
     "toStashCount": "将暂存 ({{n}})",
     "toDisableCount": "将停用 ({{n}})",
     "residentExemptCount": "常驻豁免 ({{n}})",
-    "saveAsPreset": "存为预设"
+    "saveAsPreset": "存为预设",
+    "availableResources": "可选资源",
+    "selectedResources": "已选资源",
+    "noSelectionHint": "尚未选择资源",
+    "previewPreset": "预览预设",
+    "editPreset": "编辑预设",
+    "removeSelection": "移除该项"
   },
   "manifest": {
     "installConfirm": "安装确认",
