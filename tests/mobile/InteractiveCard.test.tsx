@@ -75,7 +75,7 @@ describe("InteractiveCard：四套界面共用同一设计语言（T10 验收）
   it("ApproveCard / QuestionCard 的容器均来自本组件（tone 分族可断言）", async () => {
     // 静态锁：三套卡都渲染出本组件加的 data-tone 属性（容器统一的可观测证据）
     const { default: ApproveCard } = await import("@/mobile/ApproveCard");
-    const { default: QuestionCard } = await import("@/mobile/QuestionCard");
+    const { default: QuestionCard } = await import("@/mobile/QuestionCardCli");
     expect(ApproveCard).toBeTypeOf("function");
     expect(QuestionCard).toBeTypeOf("function");
     // data-tone 由 InteractiveCard 唯一产出（消费方无法自行伪造同名属性——

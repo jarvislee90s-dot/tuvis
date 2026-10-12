@@ -1,4 +1,6 @@
-// 移动端问答卡（批次乙 T8，AskUserQuestion 问答卡 · claude 先行）：挂在
+// 移动端问答卡 · **CLI 形态专属**（Task 8 双套分置改名固化——原 QuestionCard.tsx
+// 零逻辑平移；APP 形态（surface=app）由 QuestionCardApp.tsx 承担补投作答语义，
+// 本件不再服务 APP 会话）。批次乙 T8，AskUserQuestion 问答卡 · claude 先行：挂在
 // SessionDetail 正文视图 / 分屏对话列（**非结束态**；丁T1 放宽——ApproveCard 仍是
 // waiting 门，key 前缀 question-* 与 approve-*/composer-* 互异防 duplicate-key）。
 // - 可用性：挂载拉取一次 /session-question；**状态跃迁重拉**（丁T1 复评 F-1：

@@ -1213,6 +1213,29 @@ export async function sessionQuestionAnswer(
    *  内容时先退格清空再打新字；缺省 false = 已有内容即中止 */
   overwrite?: boolean
 ): Promise<QuestionAnswerResult> {
+  return (await sessionQuestionAnswerRaw(
+    sessionId,
+    action,
+    index,
+    text,
+    questionIndex,
+    direction,
+    overwrite
+  )) as QuestionAnswerResult;
+}
+
+/** POST /session-question/answer 的**共享请求内核**（Task 8 抽出）：CLI/App 两个
+ *  出口发同一请求体，差别仅在回执的**类型收窄**（动机同 sessionModeSwitchRaw——
+ *  联合宽类型会让改名固化的 QuestionCardCli 失去 else 分支收窄）。 */
+async function sessionQuestionAnswerRaw(
+  sessionId: string,
+  action: QuestionAnswerAction,
+  index?: number,
+  text?: string,
+  questionIndex?: number,
+  direction?: "prev" | "next",
+  overwrite?: boolean
+): Promise<unknown> {
   let r: Response;
   try {
     r = await fetch("/m/api/v1/session-question/answer", {
@@ -1233,7 +1256,36 @@ export async function sessionQuestionAnswer(
     }
     throw new ApiError(r.status, `session-question/answer ${r.status}`, data);
   }
-  return (await r.json()) as QuestionAnswerResult;
+  return await r.json();
+}
+
+/** 问答应答 **APP 补投臂回执**（Task 6b 下发、Task 8 消费）：codex APP 形态的
+ *  有作答文本动作（select/toggle/freeText）经 H8 queue 通道补投，回执不是
+ *  key_sent/failed 而是**无头封套**（与 /session-send 的 headless 形态同构），
+ *  外加两字段——`screen:null`（**显式 null**：补投不产屏读快照，前端不得显示
+ *  已翻转）+ `note`（仅 receipt.status ok/queued 附「已补投为消息，请回 APP 核对
+ *  题面」——failed/refused 不带，不谎报送达）。 */
+export interface QuestionAnswerAppEnvelope {
+  status: "headless";
+  channel: string;
+  receipt: HeadlessReceipt;
+  visibilityNote?: string | null;
+  screen: null;
+  note?: string;
+}
+
+/** 问答应答（**APP 补投出口**，Task 8）：同一端点同一请求体；App 套
+ *  （QuestionCardApp）用本出口（回执类型含无头封套），CLI 套继续用
+ *  [`sessionQuestionAnswer`]（类型收窄不动，改名文件零逻辑变化）。 */
+export async function sessionQuestionAnswerRepost(
+  sessionId: string,
+  action: QuestionAnswerAction,
+  index?: number,
+  text?: string,
+  questionIndex?: number
+): Promise<QuestionAnswerResult | QuestionAnswerAppEnvelope> {
+  return (await sessionQuestionAnswerRaw(sessionId, action, index, text, questionIndex)) as
+    QuestionAnswerResult | QuestionAnswerAppEnvelope;
 }
 
 // ==== 批次丙 T6：模式切换 ====
@@ -1241,6 +1293,13 @@ export async function sessionQuestionAnswer(
 /** 统一模式档（与 Rust `inject::mode::MamMode` 的 wire 词一一对应，勿漂移）。
  *  对齐 happy 的 8 值收敛为 兔维斯 5 值（auto/safe-yolo/yolo 合并为 bypass）。 */
 export type MamMode = "plan" | "default" | "acceptEdits" | "bypass" | "readOnly";
+
+/** codex APP 协议面档位词（Task 8，与 Rust `inject::headless::codex_app::
+ *  AppApprovalPolicy::wire` 同词表——never/on-request/untrusted）。**与 MamMode
+ *  刻意不互译**（后端 api.rs `codex_app_policy_label` 同款纪律：协议面就三档，
+ *  硬译会说谎，如「自动审批」无协议载体）；GET /session-mode 的 `surface:"app"`
+ *  载荷里权限组的 tiers/current 即本词表（全自动/默认/安全为后端下发标签）。 */
+export type AppPolicyMode = "never" | "on-request" | "untrusted";
 
 // 注（T4 复评 M4）：批次丙 T6 的 `MAM_MODE_LABELS` 通用档名表已删除——丁T4 起
 // 按钮标签一律用**后端下发的屏显标签**（`groups[].tiers[].label`，§2.6：标签必须
@@ -1255,7 +1314,8 @@ export type ModeGroupId = "mode" | "permission";
  *  通用名（用户看到的是终端上的词，对不上号等于没回显）。
  *  `selectable=false` → 不渲染为可点按钮（`reason` 是后端给出的如实原因）。 */
 export interface ModeTierView {
-  mode: MamMode;
+  /** CLI 面 = MamMode 词；APP 面（surface:"app"）权限组 = AppPolicyMode 协议三档词 */
+  mode: MamMode | AppPolicyMode;
   label: string;
   selectable: boolean;
   reason?: string | null;
@@ -1286,9 +1346,12 @@ export interface ModeGroupView {
   step: boolean;
   readback: boolean;
   layout?: "tiers" | "toggle" | "picker";
-  current: MamMode | null;
+  /** CLI 面 = MamMode；APP 面权限组 = AppPolicyMode（rollout 协议读回，T0.5 定案） */
+  current: MamMode | AppPolicyMode | null;
   currentLabel: string | null;
-  currentSource?: "screen" | "memory" | "null";
+  /** Task 6a 增补 `"rollout"` = APP 面协议读回（实时权威，与 CLI 的 screen/memory
+   *  并列——前端「（上次切换）」标注只对 "memory" 显示，rollout 不标注）。 */
+  currentSource?: "screen" | "memory" | "rollout" | "null";
   tiers: ModeTierView[];
   legacy?: ModeLegacyView[];
 }
@@ -1312,6 +1375,14 @@ export interface SessionModeView {
   /** "twoAxis" | "singleAxis" | "none"（旧后端无此字段） */
   structure?: "twoAxis" | "singleAxis" | "none";
   groups?: ModeGroupView[];
+  /** Task 6a/8：交互面单点下发——"app" = codex APP 协议面（cardDock 选套判据）/
+   *  "terminal" = 终端键序面（含全部 CLI 会话与其余工具）。旧后端无此字段
+   *  （前端按 `session.form` 兜底）。**单一真相源在后端 `codex_app_form` 单点**，
+   *  前端不复制分派逻辑。 */
+  surface?: "terminal" | "app";
+  /** Task 7：协议可用性降级原因串（赋值来源 = ProbeCache 探测；null/缺省 = 正常）。
+   *  非空 → ModeBarApp 只读 chips + 原因（设计 §3.3 降级链）。 */
+  degraded?: string | null;
 }
 
 /** 切档回执（POST /session-mode/switch）。verified=false 时 hint 给出人工核对提示
@@ -1361,13 +1432,24 @@ export async function sessionModeSwitch(
   target: MamMode,
   group?: ModeGroupId
 ): Promise<SessionModeSwitchResult> {
+  return (await sessionModeSwitchRaw(sessionId, target, group)) as SessionModeSwitchResult;
+}
+
+/** POST /session-mode/switch 的**共享请求内核**（Task 8 抽出）：CLI/App 两个出口
+ *  发同一请求体（group 缺省不发字段——旧后端逐字一致，便于抓包比对），差别仅在
+ *  调用方对回执的**类型收窄**——CLI 面（key_sent/failed）与 APP 协议面
+ *  （app_switch/failed）是同一端点的两副面孔，联合宽类型会让 CLI 件的 else 分支
+ *  失去收窄（改名固化的 ModeBarCli 零逻辑变化，故拆两个出口各自收窄）。 */
+async function sessionModeSwitchRaw(
+  sessionId: string,
+  target: MamMode | AppPolicyMode,
+  group?: ModeGroupId
+): Promise<unknown> {
   let r: Response;
   try {
     r = await fetch("/m/api/v1/session-mode/switch", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      // group 缺省时**不发字段**（旧后端不认识它，发了也只是被 serde 忽略——
-      // 但省掉字段可让请求体与旧版本逐字一致，便于抓包比对）
       body: JSON.stringify(
         group === undefined ? { sessionId, target } : { sessionId, target, group }
       ),
@@ -1384,7 +1466,43 @@ export async function sessionModeSwitch(
     }
     throw new ApiError(r.status, `session-mode/switch ${r.status}`, data);
   }
-  return (await r.json()) as SessionModeSwitchResult;
+  return await r.json();
+}
+
+/** POST /session-mode/switch **APP 协议臂回执**（Task 6a 下发、Task 8 消费——与
+ *  Rust `codex_app_switch_arm` 的 json! 逐字对应）：
+ *  - `status:"app_switch"`：核对三态 `verify` —— `hit`（协议读回一致）/ `mismatch`
+ *    （读回串与目标不符，`readback` 带实读串）/ `ineffective`（投递了但读不到档位
+ *    回执；`carrier:"resumeOnly"` 时 hint 为「档位已随 resume 持久化，下一回合生效」
+ *    的语义性未生效）。**三态都不得拿回执改本地状态**——卡面以重拉 GET 为准
+ *    （设计 §3.6）；
+ *  - `status:"failed"`：`code:"active_thread_write_unavailable"` = 活跃线程如实拒
+ *    （钉句在 `error`，T0.1 定案：APP 活跃会话无写通道）；其余协议/通道错误如实透出。 */
+export type SessionModeSwitchAppResult =
+  | {
+      status: "app_switch";
+      /** 在飞回合被远程中止的如实标注（Task 6b：cancel → turn/interrupt） */
+      interrupted: boolean;
+      verified: boolean;
+      verify: "hit" | "mismatch" | "ineffective";
+      /** 请求的目标档（AppPolicyMode wire 词） */
+      policy: string;
+      /** mismatch 时的协议读回实读串（hit/ineffective 为 null） */
+      readback?: string | null;
+      carrier: "turnStart" | "resume" | "resumeOnly";
+      turnObserved: boolean;
+      hint?: string | null;
+    }
+  | { status: "failed"; error: string; code?: string };
+
+/** 切档（**APP 协议臂出口**，Task 8）：目标 = AppPolicyMode 三档词（后端双词表门
+ *  生效——MamMode 词对协议面如实拒 no_mechanism）。`group` 不发（协议臂按
+ *  codex_app_form 分派，组概念只属终端面）。 */
+export async function sessionModeSwitchApp(
+  sessionId: string,
+  target: AppPolicyMode
+): Promise<SessionModeSwitchAppResult> {
+  return (await sessionModeSwitchRaw(sessionId, target)) as SessionModeSwitchAppResult;
 }
 
 // ==== 2026-09-23：codex 权限组的「终端菜单单选题」（用户方案）====

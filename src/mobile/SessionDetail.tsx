@@ -30,11 +30,13 @@ import ApproveCard from "./ApproveCard";
 import PlanFeedbackBar from "./PlanFeedbackBar";
 import { collapsedLabel, isProcessKind } from "./message-fold";
 import { useMessageRenderers } from "./message-render";
-import ModeBar from "./ModeBar";
+import ModeBarApp from "./ModeBarApp";
+import ModeBarCli from "./ModeBarCli";
 import SubagentChips from "./SubagentChips";
 import SubagentDetail from "./SubagentDetail";
 import SubagentList from "./SubagentList";
-import QuestionCard from "./QuestionCard";
+import QuestionCardApp from "./QuestionCardApp";
+import QuestionCardCli from "./QuestionCardCli";
 import BookmarkBar from "./BookmarkBar";
 import FilePanel from "./FilePanel";
 import FilePreview from "./FilePreview";
@@ -46,6 +48,7 @@ import {
   fetchHeadlessApproval,
   fetchSessionFiles,
   fetchSessionMessages,
+  fetchSessionMode,
   fetchSessionSubagents,
   headlessApprove,
   headlessCancel,
@@ -814,6 +817,45 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   useEffect(() => {
     setPlanFeedbackActive(false);
   }, [session.id]);
+
+  // ===== Task 8：surface 选套（设计 §3.3——cardDock 挂载点的形态分叉）=====
+  // GET /session-mode 的 `surface` 字段是交互面**单点判据**（后端 codex_app_form
+  // 判定下发，防前端复制分派逻辑成第二真相源）：terminal → Cli 套 / app → App 套。
+  // **载荷缺 surface（旧后端）→ 按 `session.form` 兜底**（分套主判据的兼容路径，
+  // 设计 §3.2 字段盘点）；拉取失败同兜底（form 已随 session prop 在手，不另起炉灶）。
+  // null = **未决帧两套都不挂载**（spec 审 M-1：null 帧若挂 Cli 套，APP 会话每次
+  // 打开详情都会闪一帧「终端」词汇 UI，且 Cli 套会白发两發 GET——三态化后未决帧
+  // **只发本 surface GET 一发**，套件零请求；代价 = CLI 会话晚一个 GET 往返才出
+  // 模式栏/问答卡）。代价申报：选套判定与套件自身数据是同端点两次轻量查询（选套
+  // 一次 + 套件数据一次）——换「选套判据单点在后端」，不让前端猜形态。
+  const [modeSurface, setModeSurface] = useState<"terminal" | "app" | null>(null);
+  useEffect(() => {
+    let alive = true;
+    setModeSurface(null);
+    fetchSessionMode(session.id)
+      .then((v) => {
+        if (!alive) return;
+        setModeSurface(
+          v.surface === "app"
+            ? "app"
+            : v.surface === "terminal"
+              ? "terminal"
+              : // 载荷缺 surface（旧后端前向兼容）→ form 兜底
+                session.form === "app"
+                ? "app"
+                : "terminal"
+        );
+      })
+      .catch(() => {
+        // 拉取失败兜底同 form（Cli 套挂载后自身拉取也失败会自隐——行为收敛）
+        if (alive) setModeSurface(session.form === "app" ? "app" : "terminal");
+      });
+    return () => {
+      alive = false;
+    };
+  }, [session.id, session.form]);
+  /** App 套在场位（ModeBarApp / QuestionCardApp + ApproveCard/PlanFeedbackBar 排除） */
+  const appSuite = modeSurface === "app";
   // 该会话涉及的文件（/session-files 提取结果，M3+）：一份数据两用——
   // fileEntries 驱动文件面板列表，派生 Set 驱动正文路径链接化
   const [fileEntries, setFileEntries] = useState<SessionFileEntry[]>([]);
@@ -1433,7 +1475,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       data-testid="card-dock"
       className="flex max-h-[55vh] shrink-0 flex-col gap-2 overflow-y-auto"
     >
+      {/* Task 8（设计 §3.3 树图第三行）：ApproveCard / PlanFeedbackBar 是**终端对话框
+          通道**（屏读选项 / 终端编辑行打字），APP 形态显式排除——防「请人工核对终端」
+          类文案漏出到 APP 会话。ApproveCard 另有组件级 form 守卫（纵深防御——未来
+          新挂载点继承同款排除）；PlanFeedbackBar 只在本挂载点消费，排除即完整。 */}
       {approveMounted &&
+        !appSuite &&
         (planFeedbackActive ? null : (
           <ApproveCard
             key={`approve-${session.id}`}
@@ -1441,14 +1488,26 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             onPlanFeedbackReady={() => setPlanFeedbackActive(true)}
           />
         ))}
-      {planFeedbackActive && (
+      {planFeedbackActive && !appSuite && (
         <PlanFeedbackBar
           key={`plan-fb-${session.id}`}
           sessionId={session.id}
+          agentName={
+            session.agentType === "claude" ? "Claude" : (TOOL_LABELS[session.agentType] ?? "Agent")
+          }
           onDismiss={() => setPlanFeedbackActive(false)}
         />
       )}
-      {!isSummary && <QuestionCard key={`question-${session.id}`} session={session} />}
+      {/* Task 8：QuestionCard 按 surface 选套（缺 surface 旧后端已在上方兜底进
+          appSuite 判定）——读侧同源（GET /session-question），写侧 CLI=键序闭环 /
+          APP=补投作答，两套互斥挂载。**三态**（spec 审 M-1）：未决帧（null）两套都
+          不挂（防「先 CLI 后 APP」闪烁 + 防未决帧白发 GET） */}
+      {!isSummary &&
+        (modeSurface === null ? null : appSuite ? (
+          <QuestionCardApp key={`question-app-${session.id}`} session={session} />
+        ) : (
+          <QuestionCardCli key={`question-${session.id}`} session={session} />
+        ))}
       {/* 2026-10-08 子 agent chip：与 ModeBar 同一行（flex-wrap 兄弟），生命周期
           解耦——mode 视图失败/unsupported 时 chip 仍活，反之亦然（spec §6）。
           finished 不挂载（idle 不拦：claude 后台 agent 可在主会话 idle 时仍在跑）；
@@ -1456,7 +1515,13 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           观察台 T5：chip 改纯展示，名单由上方 subagentList 单一数据源下发
           （拉取不再自持），点击直达详情对话框（§二.4）。 */}
       <div data-testid="status-row" className="flex flex-wrap items-center gap-2">
-        <ModeBar key={`mode-${session.id}`} session={session} />
+        {/* Task 8：ModeBar 按 surface 选套（互斥三态，spec 审 M-1：未决帧两套都不挂
+            ——只发选套 GET 一发，套件零请求零渲染） */}
+        {modeSurface === null ? null : appSuite ? (
+          <ModeBarApp key={`mode-app-${session.id}`} session={session} />
+        ) : (
+          <ModeBarCli key={`mode-${session.id}`} session={session} />
+        )}
         {session.status !== "finished" && (
           <SubagentChips
             key={`subagents-${session.id}`}

@@ -199,6 +199,65 @@ const APPROVE_PRESENT_RECEIPT = "终端等待审批，请用卡片按钮";
 const FREETEXT_WITH_ATTACHMENT_RECEIPT =
   "附件不能随「回答」发送（自由作答不带附件）。请移除附件后作为回答发送，或改用卡片按钮/终端";
 
+/** Task 8：composer 两套措辞（设计 §3.7(a) APP 词汇表）。判据 = 发送分流同源的
+ *  `headlessChannelOf`（headless_* 通道 = 无终端会话：codex APP / zcode /
+ *  WorkBuddy / dsh）——APP 面 CLI 专属词（终端/按键族）禁用，统一「会话/APP」
+ *  措辞；**CLI 面文案逐字不变**（既有用例锁死）。TUI 队列 UI（jump/edit/retract
+ *  的「忙时留队转闲 flush」语义）对 headless 通道天然不生效，按通道隐藏（词表
+ *  的 queueHint 即隐藏后的如实占位——消费确认信号是前后端合解的契约缺口，登记
+ *  Task 11 遗留，不谎报已消费）。 */
+interface ComposerCopy {
+  defaultPlaceholder: string;
+  freetextPlaceholder: string;
+  blockedPlaceholder: string;
+  approvePlaceholder: string;
+  questionHint: string;
+  approveHint: string;
+  delivered: string;
+  submitted: string;
+  questionBlockedReceipt: string;
+  approveReceipt: string;
+  freetextAttachmentReceipt: string;
+  /** 队列区说明行：CLI = 放行节奏说明；APP = 消费翻转未建的如实占位 */
+  queueHint: string;
+  /** APP 队列无撤回原语的补充说明（T0.1 回填钉句；CLI 恒空串不渲染） */
+  queueNoRetract: string;
+}
+
+const CLI_COPY: ComposerCopy = {
+  defaultPlaceholder: "输入消息发送到终端…",
+  freetextPlaceholder: QUESTION_FREETEXT_PLACEHOLDER,
+  blockedPlaceholder: "终端等待回答（本题请到卡片或终端作答）",
+  approvePlaceholder: "终端等待审批，请用卡片按钮",
+  questionHint: "终端正在等待回答——本输入框发送的内容将作为本题的回答送到终端",
+  approveHint: "终端等待审批——本输入框直发已被拦截，请用上方卡片按钮应答",
+  delivered: "已送达终端",
+  submitted: "已投递至终端输入，agent 空闲后处理（未确认落盘）",
+  questionBlockedReceipt: QUESTION_BLOCKED_RECEIPT,
+  approveReceipt: APPROVE_PRESENT_RECEIPT,
+  freetextAttachmentReceipt: FREETEXT_WITH_ATTACHMENT_RECEIPT,
+  queueHint: "空闲时将按序自动发送",
+  queueNoRetract: "",
+};
+
+const APP_COPY: ComposerCopy = {
+  defaultPlaceholder: "输入消息发送到会话…",
+  freetextPlaceholder: "输入内容将作为本题的回答补投到会话",
+  blockedPlaceholder: "会话等待回答（本题请到问答卡或 APP 内作答）",
+  approvePlaceholder: "会话等待审批，请用卡片按钮",
+  questionHint: "会话正在等待回答——本输入框发送的内容将作为本题的回答补投",
+  approveHint: "会话等待审批——本输入框直发已被拦截，请用上方卡片按钮应答",
+  delivered: "已送达会话",
+  submitted: "已投递至会话输入，agent 空闲后处理（未确认落盘）",
+  questionBlockedReceipt:
+    "会话正在等待回答，但本题不能在本输入框作答：请在问答卡中作答，或直接在 APP 内操作",
+  approveReceipt: "会话等待审批，请用卡片按钮",
+  freetextAttachmentReceipt:
+    "附件不能随「回答」发送（自由作答不带附件）。请移除附件后作为回答发送，或改用问答卡按钮/APP 内操作",
+  queueHint: "排队中（消费确认建设中）",
+  queueNoRetract: "已入队未消费，暂无撤回原语",
+};
+
 /** W1 来源标记（服务端 compose_injection 注入，非用户正文）：预览与「修改」放回正文
  *  时剥离——不剥则修改重发会二次叠加签名。
  *
@@ -472,12 +531,14 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
       // 拦截时输入框内容**保留**（与 failed 态同口径：用户可复制到卡片输入框或终端）。
       const presence = await probeCardPresence();
       setCardPresence(presence);
+      // Task 8：APP 面（headless_* 通道）拦截文案走 APP 词表（发送逻辑零变化）
+      const appCopy = headlessChannelOf(sendInfo) !== null ? APP_COPY : CLI_COPY;
       if (presence === "approve") {
-        setReceipt({ kind: "blocked", message: APPROVE_PRESENT_RECEIPT });
+        setReceipt({ kind: "blocked", message: appCopy.approveReceipt });
         return;
       }
       if (presence === "questionBlocked") {
-        setReceipt({ kind: "blocked", message: QUESTION_BLOCKED_RECEIPT });
+        setReceipt({ kind: "blocked", message: appCopy.questionBlockedReceipt });
         return;
       }
       if (presence === "questionFreeText") {
@@ -485,7 +546,7 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
         // 也没有附件入口——带了附件转向 freeText 必然**静默丢弃**它们（用户以为发
         // 出去了）。故拦截而不是忽略（理由见常量注）。
         if (attachments.length > 0) {
-          setReceipt({ kind: "blocked", message: FREETEXT_WITH_ATTACHMENT_RECEIPT });
+          setReceipt({ kind: "blocked", message: appCopy.freetextAttachmentReceipt });
           return;
         }
         // 转向自由作答：**不带附件标记行**（自由作答是「回答」不是「消息」——
@@ -914,6 +975,11 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
   // 拉取未就绪 / 失败 / 403：不渲染（详情页正文照常）
   if (!infoReady || sendInfo === null) return null;
 
+  // Task 8：APP 面（headless_* 通道 = 无终端会话）——词汇表与 TUI 队列 UI 的
+  // 按通道隐藏判据（与 handleSend 的发送分流同源 headlessChannelOf，不另立判定）
+  const appFace = headlessChannelOf(sendInfo) !== null;
+  const copy = appFace ? APP_COPY : CLI_COPY;
+
   const canSend =
     injectable &&
     !sending &&
@@ -943,9 +1009,7 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
           data-presence={cardPresence}
           className="mb-2 text-xs text-amber-700 dark:text-amber-400"
         >
-          {cardPresence === "approve"
-            ? "终端等待审批——本输入框直发已被拦截，请用上方卡片按钮应答"
-            : "终端正在等待回答——本输入框发送的内容将作为本题的回答送到终端"}
+          {cardPresence === "approve" ? copy.approveHint : copy.questionHint}
         </p>
       )}
       {/* 投递中（灰3）：send await 全程在场——慢消费者长文投递可达分钟级，
@@ -975,7 +1039,7 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
               data-testid="send-receipt-delivered"
               className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-400"
             >
-              已送达终端
+              {copy.delivered}
             </span>
           )}
           {receipt.kind === "submitted" && (
@@ -986,7 +1050,7 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
               data-testid="send-receipt-submitted"
               className="rounded-full bg-[var(--cb)]/70 px-2 py-0.5 text-xs text-[var(--mut)]"
             >
-              已投递至终端输入，agent 空闲后处理（未确认落盘）
+              {copy.submitted}
             </span>
           )}
           {receipt.kind === "failed" && (
@@ -1045,44 +1109,53 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
                 >
                   {queueItemPreview(item.content)}
                 </span>
-                <button
-                  type="button"
-                  data-testid="queue-jump"
-                  disabled={busy || sending}
-                  onClick={() => {
-                    void handleJump(item);
-                  }}
-                  className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
-                >
-                  立即发送
-                </button>
-                <button
-                  type="button"
-                  data-testid="queue-edit"
-                  disabled={busy || sending}
-                  onClick={() => {
-                    void handleEdit(item);
-                  }}
-                  className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
-                >
-                  修改
-                </button>
-                <button
-                  type="button"
-                  data-testid="queue-retract"
-                  disabled={busy || sending}
-                  onClick={() => {
-                    void handleRetract(item);
-                  }}
-                  className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--mut)] disabled:opacity-40"
-                >
-                  撤回
-                </button>
+                {/* Task 8：TUI 队列 UI（立即发送/修改/撤回）对 headless_* 通道隐藏
+                    ——「忙时留队转闲 flush」是终端 TUI 语义，对无终端通道天然不生效
+                    （不假装可操作）；CLI 面逐字不变 */}
+                {!appFace && (
+                  <>
+                    <button
+                      type="button"
+                      data-testid="queue-jump"
+                      disabled={busy || sending}
+                      onClick={() => {
+                        void handleJump(item);
+                      }}
+                      className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
+                    >
+                      立即发送
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="queue-edit"
+                      disabled={busy || sending}
+                      onClick={() => {
+                        void handleEdit(item);
+                      }}
+                      className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
+                    >
+                      修改
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="queue-retract"
+                      disabled={busy || sending}
+                      onClick={() => {
+                        void handleRetract(item);
+                      }}
+                      className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--mut)] disabled:opacity-40"
+                    >
+                      撤回
+                    </button>
+                  </>
+                )}
               </li>
             ))}
           </ul>
           <p data-testid="queue-hint" className="mt-1 text-[11px] text-[var(--mut)]">
-            空闲时将按序自动发送
+            {/* APP 面 = 消费翻转信号未建的如实占位（Task 11 遗留登记，不谎报已消费） */}
+            {copy.queueHint}
+            {appFace && copy.queueNoRetract !== "" ? `——${copy.queueNoRetract}` : ""}
           </p>
         </div>
       )}
@@ -1239,12 +1312,12 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
             !injectable
               ? "该会话不支持远程注入"
               : cardPresence === "questionFreeText"
-                ? QUESTION_FREETEXT_PLACEHOLDER
+                ? copy.freetextPlaceholder
                 : cardPresence === "questionBlocked"
-                  ? "终端等待回答（本题请到卡片或终端作答）"
+                  ? copy.blockedPlaceholder
                   : cardPresence === "approve"
-                    ? "终端等待审批，请用卡片按钮"
-                    : "输入消息发送到终端…"
+                    ? copy.approvePlaceholder
+                    : copy.defaultPlaceholder
           }
           className="min-h-0 flex-1 resize-none rounded-lg border border-[var(--cb)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none disabled:opacity-50"
         />

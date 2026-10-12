@@ -124,6 +124,14 @@ interface Routes {
   headlessApprove?: Record<string, unknown> | "reject";
   headlessApproveReason?: string;
   headlessApproveStatus?: number;
+  /** Task 8（surface 选套）：GET /session-mode 载荷——SessionDetail 挂载即拉一次
+   *  判交互面（surface=app → App 套 / terminal → Cli 套）；缺省不回该路由时
+   *  fetch 抛 unexpected → 选套 effect 走 catch 按 form 兜底（既有用例路径） */
+  sessionMode?: Record<string, unknown>;
+  /** Task 8（APP 词汇表用例）：GET /session-queue 的 items（headless 通道的队列行） */
+  queueItems?: unknown[];
+  /** Task 8（spec 审 M-1）：surface GET 永不 resolve——驱动「未决帧」用例 */
+  sessionModePending?: boolean;
 }
 
 /** 手动闸：`routes.sessionSend === "pending"` 时由用例自行 resolve（零真实等待） */
@@ -303,6 +311,19 @@ function installFetch() {
         JSON.stringify({ messages: [], truncated: false, supported: true }),
         { status: 200 }
       );
+    }
+    if (url.includes("/session-queue")) {
+      // Task 8：composer 挂载即拉完整队列；缺省空列表（既有用例行为不变——
+      // 此前该路由无桩走 throw→静默，显式化后语义同（空列表））
+      return new Response(JSON.stringify({ items: routes.queueItems ?? [] }), { status: 200 });
+    }
+    if (url.includes("/session-mode")) {
+      // Task 8：surface 选套数据源（SessionDetail 挂载即拉；套件自拉同路由）。
+      // 缺省不注册该路由数据（undefined → 抛 unexpected，选套 catch 按 form 兜底）；
+      // pending 闸 = 永不 resolve（spec 审 M-1 的「未决帧」用例）
+      if (routes.sessionModePending) return new Promise<Response>(() => {});
+      if (routes.sessionMode === undefined) throw new Error(`unexpected fetch: ${url}`);
+      return new Response(JSON.stringify(routes.sessionMode), { status: 200 });
     }
     throw new Error(`unexpected fetch: ${url}`);
   });
@@ -3429,5 +3450,305 @@ describe("SessionDetail：无头回执卡（Task 8 / H7）", () => {
     expect(headlessUnanswered([q], {}, {})).toEqual(["q"]);
     expect(headlessUnanswered([q], { 0: ["a"] }, {})).toEqual([]);
     expect(headlessUnanswered([single], { 0: [] }, { 0: "  " })).toEqual(["q"]);
+  });
+});
+
+// ============================================================
+// Task 8（P1 codex 轨）：APP 形态分套——surface 选套 + Approve/PlanFeedback
+// 排除 + APP 词汇表（设计 §3.3/§3.7）
+// ============================================================
+describe("SessionDetail：APP 形态分套（Task 8 surface 选套）", () => {
+  /** codex APP 面 GET /session-mode 载荷（surface:"app" + 权限组协议三档 + 模式组灰置）。
+   *  withSurface=false 剔除 surface/degraded（旧后端「载荷缺 surface」兼容形态）。 */
+  function codexAppMode(withSurface = true): Record<string, unknown> {
+    return {
+      tool: "codex",
+      current: null,
+      currentLabel: null,
+      readback: false,
+      switchKind: "slashCommand",
+      structure: "twoAxis",
+      ...(withSurface ? { surface: "app", degraded: null } : {}),
+      groups: [
+        {
+          id: "mode",
+          label: "模式",
+          step: false,
+          readback: false,
+          layout: "toggle",
+          current: null,
+          currentLabel: null,
+          currentSource: "null",
+          tiers: [
+            { mode: "plan", label: "计划", selectable: false, reason: "APP 会话暂无模式切换通道" },
+            { mode: "default", label: "操作", selectable: false, reason: "APP 会话暂无模式切换通道" },
+          ],
+          legacy: [],
+        },
+        {
+          id: "permission",
+          label: "权限",
+          step: false,
+          readback: true,
+          layout: "picker",
+          current: "on-request",
+          currentLabel: "默认",
+          currentSource: "rollout",
+          tiers: [
+            { mode: "never", label: "全自动", selectable: true, reason: null },
+            { mode: "on-request", label: "默认", selectable: true, reason: null },
+            { mode: "untrusted", label: "安全", selectable: true, reason: null },
+          ],
+          legacy: [],
+        },
+      ],
+    };
+  }
+
+  /** codex 终端面 GET /session-mode 载荷（surface:"terminal"——CLI 二维既有形态）。
+   *  withSurface=false 剔除 surface/degraded（旧后端兼容形态）。 */
+  function codexTerminalMode(withSurface = true): Record<string, unknown> {
+    return {
+      tool: "codex",
+      current: "plan",
+      currentLabel: "计划",
+      readback: true,
+      switchKind: "slashCommand",
+      structure: "twoAxis",
+      ...(withSurface ? { surface: "terminal", degraded: null } : {}),
+      groups: [
+        {
+          id: "mode",
+          label: "模式",
+          step: false,
+          readback: true,
+          layout: "toggle",
+          current: "plan",
+          currentLabel: "计划",
+          currentSource: "screen",
+          tiers: [
+            { mode: "plan", label: "计划", selectable: true, reason: null },
+            { mode: "default", label: "操作", selectable: true, reason: null },
+          ],
+          legacy: [],
+        },
+        {
+          id: "permission",
+          label: "权限",
+          step: false,
+          readback: true,
+          layout: "picker",
+          current: "bypass",
+          currentLabel: "完全信任",
+          currentSource: "screen",
+          tiers: [
+            { mode: "readOnly", label: "只读", selectable: true, reason: null },
+            { mode: "default", label: "默认", selectable: true, reason: null },
+            { mode: "acceptEdits", label: "自动审批", selectable: true, reason: null },
+            { mode: "bypass", label: "完全信任", selectable: true, reason: null },
+          ],
+          legacy: [],
+        },
+      ],
+    };
+  }
+
+  /** 问答载荷（App 套渲染用）：一单一多两题——多选题覆盖「取消勾选请在 APP 内操作」词条 */
+  function appQuestionPayload(): Record<string, unknown> {
+    return {
+      available: true,
+      answerable: true,
+      freeText: true,
+      multiQuestion: true,
+      screen: null,
+      questions: [
+        {
+          header: "Next step",
+          question: "下一步做什么？",
+          multiSelect: false,
+          options: [
+            { label: "Tool demo", description: "跑一遍工具演示" },
+            { label: "Skip", description: "" },
+          ],
+        },
+        {
+          header: "Scope",
+          question: "覆盖哪些范围？",
+          multiSelect: true,
+          options: [
+            { label: "仅文档", description: "" },
+            { label: "含测试", description: "" },
+          ],
+        },
+      ],
+      source: "scan",
+    };
+  }
+
+  it("session_detail_selects_cli_suite_on_terminal_surface：surface=terminal → Cli 套挂载", async () => {
+    installFetch();
+    routes.sessionMode = codexTerminalMode();
+    routes.questionInfo = {
+      available: true,
+      questions: [
+        { question: "下一步做什么？", multiSelect: false, options: [{ label: "Tool demo" }] },
+      ],
+    };
+    render(
+      <SessionDetail
+        session={makeSession({ agentType: "codex", form: "cli", status: "processing" })}
+        onBack={() => {}}
+      />
+    );
+    expect(await screen.findByTestId("mode-bar")).toBeTruthy();
+    expect(await screen.findByTestId("question-card")).toBeTruthy();
+    // Cli 套在场 ⇔ App 套不在场（选套互斥）
+    expect(screen.queryByTestId("mode-bar-app")).toBeNull();
+    expect(screen.queryByTestId("question-card-app")).toBeNull();
+  });
+
+  it("session_detail_selects_app_suite_on_app_surface：surface=app → App 套挂载", async () => {
+    installFetch();
+    routes.sessionMode = codexAppMode();
+    routes.questionInfo = {
+      available: true,
+      questions: [
+        { question: "下一步做什么？", multiSelect: false, options: [{ label: "Tool demo" }] },
+      ],
+    };
+    render(
+      <SessionDetail
+        session={makeSession({ agentType: "codex", form: "app", status: "processing" })}
+        onBack={() => {}}
+      />
+    );
+    expect(await screen.findByTestId("mode-bar-app")).toBeTruthy();
+    expect(await screen.findByTestId("question-card-app")).toBeTruthy();
+    expect(screen.queryByTestId("mode-bar")).toBeNull();
+    expect(screen.queryByTestId("question-card")).toBeNull();
+  });
+
+  it("session_detail_surface_fallback_to_form_when_absent：载荷缺 surface（旧后端）→ 按 form 兜底", async () => {
+    installFetch();
+    // form=app + 载荷无 surface → App 套（form 是分套主判据的兜底）
+    routes.sessionMode = codexAppMode(false);
+    const { unmount } = render(
+      <SessionDetail
+        session={makeSession({ agentType: "codex", form: "app", status: "processing" })}
+        onBack={() => {}}
+      />
+    );
+    expect(await screen.findByTestId("mode-bar-app")).toBeTruthy();
+    expect(screen.queryByTestId("mode-bar")).toBeNull();
+    unmount();
+    cleanup();
+    // form=cli + 载荷无 surface → Cli 套（ModeBarCli 渲染同载荷的终端面）
+    routes.sessionMode = codexTerminalMode(false);
+    render(
+      <SessionDetail
+        session={makeSession({ agentType: "codex", form: "cli", status: "processing" })}
+        onBack={() => {}}
+      />
+    );
+    expect(await screen.findByTestId("mode-bar")).toBeTruthy();
+    expect(screen.queryByTestId("mode-bar-app")).toBeNull();
+  });
+
+  it("approve_and_plan_feedback_hidden_for_app_form：APP 形态显式排除审批卡与计划反馈条", async () => {
+    installFetch();
+    routes.sessionMode = codexAppMode();
+    // waiting + approveOptions available=true：若排除缺失，ApproveCard 必挂载（红卡）
+    routes.approveOptions = {
+      available: true,
+      options: [
+        { id: "yes", label: "允许" },
+        { id: "no", label: "拒绝" },
+      ],
+      verifiedWith: "test",
+      currentVersion: null,
+      drift: false,
+    };
+    render(
+      <SessionDetail
+        session={makeSession({ agentType: "codex", form: "app", status: "waiting" })}
+        onBack={() => {}}
+      />
+    );
+    // 等 surface 判定落地（App 套挂载）——此拍审批选项 GET 早已返回，若未排除卡必在场
+    expect(await screen.findByTestId("mode-bar-app")).toBeTruthy();
+    expect(screen.queryByTestId("approve-card")).toBeNull();
+    expect(screen.queryByTestId("plan-feedback-bar")).toBeNull();
+  });
+
+  it("app_suite_copy_has_no_terminal_or_screen_read_words：App 套渲染输出禁「终端/屏读/按键」", async () => {
+    installFetch();
+    routes.sessionMode = codexAppMode();
+    routes.questionInfo = appQuestionPayload() as { available: boolean; questions: unknown[] };
+    // headless 通道 = APP 会话（composer 词汇表走 APP 面 + TUI 队列钮隐藏）
+    routes.sendInfo = {
+      injectable: true,
+      channels: ["headless_codex_queue", "headless_codex_exec"],
+      visibility: "realtime",
+    };
+    routes.queueItems = [{ id: 5, content: "排队消息预览", enqueuedAt: 1, position: 1 }];
+    const { container } = render(
+      <SessionDetail
+        session={makeSession({ agentType: "codex", form: "app", status: "processing" })}
+        onBack={() => {}}
+      />
+    );
+    expect(await screen.findByTestId("mode-bar-app")).toBeTruthy();
+    expect(await screen.findByTestId("question-card-app")).toBeTruthy();
+    // 多选题的「取消勾选请在 APP 内操作」词条在场（补投语义的如实边界）
+    expect(screen.getByTestId("question-card-app").textContent).toContain(
+      "取消勾选请在 APP 内操作"
+    );
+    // 队列行在场（headless 通道）：TUI 队列钮（立即发送/修改/撤回）按通道隐藏
+    expect(await screen.findByTestId("queue-list")).toBeTruthy();
+    expect(screen.queryByTestId("queue-jump")).toBeNull();
+    expect(screen.queryByTestId("queue-edit")).toBeNull();
+    expect(screen.queryByTestId("queue-retract")).toBeNull();
+    // 消费翻转信号未建 → 如实占位（Task 11 遗留登记，不谎报已消费）
+    expect(screen.getByTestId("queue-hint").textContent).toContain("排队中（消费确认建设中）");
+    // composer APP 词汇：占位语以「会话」为落点
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).placeholder).not.toContain(
+      "终端"
+    );
+    // 词汇表断言（设计 §3.7(a)）：App 套整页渲染输出扫描禁词
+    const text = container.textContent ?? "";
+    expect(text).not.toContain("终端");
+    expect(text).not.toContain("屏读");
+    expect(text).not.toContain("按键");
+  });
+
+  it("session_detail_mounts_nothing_while_surface_pending：未决帧两套都不挂、只发选套 GET 一发", async () => {
+    installFetch();
+    routes.sessionModePending = true;
+    routes.questionInfo = {
+      available: true,
+      questions: [
+        { question: "下一步做什么？", multiSelect: false, options: [{ label: "Tool demo" }] },
+      ],
+    };
+    render(
+      <SessionDetail
+        session={makeSession({ agentType: "codex", form: "app", status: "processing" })}
+        onBack={() => {}}
+      />
+    );
+    // 挂载完成锚（composer 不依赖 surface 判定）
+    expect(await screen.findByTestId("composer-input")).toBeTruthy();
+    // 未决帧（spec 审 M-1）：两套都不挂——无 Cli 套的「终端」词汇闪烁帧，也无 App 套抢跑
+    expect(screen.queryByTestId("mode-bar")).toBeNull();
+    expect(screen.queryByTestId("mode-bar-app")).toBeNull();
+    expect(screen.queryByTestId("question-card")).toBeNull();
+    expect(screen.queryByTestId("question-card-app")).toBeNull();
+    // 未决帧只发 surface GET 一发（M-1 原问题会多发 ModeBarCli 的 mode GET +
+    // QuestionCardCli 的 question GET——三态化后套件零请求）
+    const modeGets = fetchMock.mock.calls.filter(([u]) => String(u).includes("/session-mode?"));
+    expect(modeGets.length).toBe(1);
+    // question GET 只剩 composer 在场探针那一发（QuestionCardCli 未挂载零加发）
+    const qGets = fetchMock.mock.calls.filter(([u]) => String(u).includes("/session-question?"));
+    expect(qGets.length).toBe(1);
   });
 });

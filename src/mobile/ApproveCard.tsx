@@ -30,8 +30,11 @@ interface ApproveCardProps {
    *  status = 会话当前状态（2026-10-04 使命完成自隐用）：按键已投递（sent）且
    *  会话已离开 waiting（执行已开始）→ 本卡自隐——终端在跑新回合时挂着
    *  「已发送按键」会被误读为卡死（用户裁决 2026-10-04）。status 缺省（旧调用方）
-   *  → 不启用该规则（行为同旧版）。 */
-  session: { id: string; status?: string };
+   *  → 不启用该规则（行为同旧版）。
+   *  form（Task 8）：`"app"` = APP 形态 → 本卡**组件级排除**（设计 §3.3：审批卡是
+   *  终端对话框通道，APP 会话无屏可读——挂载点排除之外的第二道守卫，防「请人工
+   *  核对终端」类文案经未来新挂载点漏出）。缺省（旧调用方/CLI）→ 行为不变。 */
+  session: { id: string; status?: string; form?: string };
   /** 2026-10-04 计划批准卡：反馈入口 start 成功（终端已进反馈编辑态）→ 上报父级
    *  换渲染 PlanFeedbackBar（本卡随状态转黄自然卸载，反馈条独立存活） */
   onPlanFeedbackReady?: () => void;
@@ -97,6 +100,9 @@ function PlanBody({ plan }: { plan: { content: string; isFile: boolean } }) {
 }
 
 export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCardProps) {
+  // Task 8 APP 形态排除（组件级第二道守卫——挂载点排除见 SessionDetail cardDock）：
+  // APP 会话不走终端审批通道，零请求零渲染
+  const appForm = session.form === "app";
   // 选项可用性：ready=false（加载中 / 拉取失败）→ 不渲染（available/reason 分诊在渲染侧）
   const [options, setOptions] = useState<ApproveOptionsView | null>(null);
   const [ready, setReady] = useState(false);
@@ -142,6 +148,8 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
   // ready 只表示「载荷已落地」（available/reason 的分诊移到渲染侧——严格档
   // available=false + reason 也要渲染提示条，不能拿 available 当 ready）
   useEffect(() => {
+    // APP 形态不拉取（排除守卫的请求面——不发无意义的选项查询）
+    if (appForm) return;
     let alive = true;
     setReady(false);
     fetchApproveOptions(session.id)
@@ -156,7 +164,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
     return () => {
       alive = false;
     };
-  }, [session.id]);
+  }, [session.id, appForm]);
 
   /** 「检查终端对话框」（丁T2）：重拉一次选项端点——后端在计划预期态下**现场屏读**，
    *  命中即回 N 选项（id=`dialog:<n>`），未命中回零选项 + planPending=true。
@@ -259,7 +267,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
   }, [degraded, sent]);
 
   // 加载中 / 拉取失败 / options 未落地：不渲染
-  if (!ready || options === null) return null;
+  if (appForm || !ready || options === null) return null;
   // 严格档（M9R）：available=false 且后端给出 reason → 只渲染提示条不渲染按键；
   // available=false 且无 reason（非 Waiting / 无映射 / 未命中）：卡自身自隐（原惯例）
   const hintOnly =

@@ -10,7 +10,9 @@ import {
   type SessionModeView,
 } from "./api";
 
-/** 模式栏（批次丙 T6；批次丁 T4 扩二维与回读全开）。
+/** 模式栏 · **CLI 形态专属**（Task 8 双套分置改名固化——原 ModeBar.tsx 零逻辑
+ *  平移；APP 形态（surface=app）由 ModeBarApp.tsx 承担，本件不再服务 APP 会话）。
+ *  批次丙 T6；批次丁 T4 扩二维与回读全开。
  *
  * 数据源 GET /session-mode。**丁T4 起后端下发结构表**（§2.6 规格表）：
  * - 二维家（codex/kimi）→ `structure="twoAxis"`，`groups` = [模式组, 权限组]，
@@ -339,7 +341,9 @@ function ModeGroupRow({
                     if (t.mode === "bypass") {
                       setBypassArmed(true); // 不直接发——等「确认启用」（二次确认防线 chips 同守）
                     } else {
-                      onSwitch(t.mode);
+                      // Task 8：tiers[].mode 类型放宽（APP 面协议三档词并入联合）——
+                      // CLI 面载荷恒 MamMode 词（终端面后端词表），断言仅类型层
+                      onSwitch(t.mode as MamMode);
                     }
                   }}
                   className={chipClass(isCurrent)}
@@ -411,7 +415,8 @@ function ModeGroupRow({
                   if (t.mode === "bypass") {
                     setBypassArmed(true); // 不直接发——等「确认启用」
                   } else {
-                    onSwitch(t.mode);
+                    // 同上（Task 8 类型放宽的窄化断言，零运行时变化）
+                    onSwitch(t.mode as MamMode);
                   }
                 }}
                 className={`rounded-full px-2 py-0.5 text-[11px] disabled:opacity-40 ${
