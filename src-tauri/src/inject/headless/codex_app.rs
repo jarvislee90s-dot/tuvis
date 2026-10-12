@@ -1251,8 +1251,10 @@ pub const PROBE_PRESENCE_METHODS: [&str; 4] = [
     "turn/interrupt",
 ];
 
-/// 探测降级文案前缀（api.rs 协议臂统一「协议面不可用：<原因>」——计划 Task 7 钉句；
-/// GET 载荷 `degraded` 的值即带本前缀的失败原因串）
+/// 探测降级文案前缀（计划 Task 7 钉句「协议面不可用：<原因>」）。**spec 审 m-1
+/// 收口**：本前缀只在 api.rs 的组合点（`probe_degraded_reason`）统一添加——GET 载荷
+/// `degraded` / POST 臂 error / cancel 臂 reason 三路口径一致；探测结论的 hint 串
+/// **不内嵌本前缀**（防「协议面不可用：……——协议面不可用」双前缀）
 pub const PROBE_UNAVAILABLE_PREFIX: &str = "协议面不可用";
 
 /// 探测缓存（进程级；键 = codex exe 在场性 + mtime——版本漂移自动失效重探）。
@@ -1280,6 +1282,14 @@ pub fn probe_cache() -> &'static ProbeCache {
 /// 5min TTL（[`gate::FAILURE_TTL_MS`]）/ 键含 exe mtime（codex 升级即失效重探——
 /// 防版本漂移时每动作都付一次失败 spawn，设计 §3.5 版本门行的初衷）。
 /// **同步阻塞**（spawn + 会话 IO）——调用方放 `spawn_blocking`。
+///
+/// # 等待预算（spec 审 m-2 登记）
+/// 探测体**不自带独立超时**——单帧等待继承生产读超时 `PROC_READ_TIMEOUT_MS`
+/// （300s，生产传输面 ProcIo 的 recv 上限；测试构建该常量不在场，mock 缝无等待）。
+/// 探测帧面小（initialize + 4 ping），最坏形态 = 一帧 300s 后通道错误如实 fail；
+/// 失败结论经 5min TTL 缓频（坏通道每 TTL 至多重付一次探测，非每动作一付）。
+/// **更紧的独立探测预算留后续批次**（如 10–15s 量级的探针专属死线——登记 Task 11
+/// 遗留面，本批不动）。
 pub fn probe_app_server(
     exe: &str,
     spawn: &SpawnSeam,
@@ -1310,8 +1320,9 @@ fn probe_body(spawn: &SpawnSeam, spec: &SpawnSpec, client: &ClientInfo) -> Probe
             // -32601 = 方法缺席（版本漂移）——fail + 缺席方法名进原因；短路不再 ping
             Err(AppServerError::MethodUnavailable { message, .. }) => {
                 s.close();
+                // hint 不带降级前缀（组合点统一加——见 PROBE_UNAVAILABLE_PREFIX doc）
                 return ProbeVerdict::fail(format!(
-                    "app-server 方法缺席：{method}（{message}）——版本漂移，{PROBE_UNAVAILABLE_PREFIX}"
+                    "app-server 方法缺席：{method}（{message}）——版本漂移"
                 ));
             }
             // 通道面错误（EOF/IO）：探测中断，如实 fail
@@ -1357,9 +1368,8 @@ pub fn probe_app_server_arm(cache: &ProbeCache) -> ProbeVerdict {
         let os = std::env::consts::OS;
         let path_env = std::env::var("PATH").unwrap_or_default();
         let Some(exe) = production_exe(&path_env, os) else {
-            return ProbeVerdict::fail(format!(
-                "codex CLI 不可达（PATH 上未找到 codex）——{PROBE_UNAVAILABLE_PREFIX}"
-            ));
+            // hint 不带降级前缀（组合点统一加——见 PROBE_UNAVAILABLE_PREFIX doc）
+            return ProbeVerdict::fail("codex CLI 不可达（PATH 上未找到 codex）".to_string());
         };
         let spec = SpawnSpec {
             argv: bare_argv(&exe, os),

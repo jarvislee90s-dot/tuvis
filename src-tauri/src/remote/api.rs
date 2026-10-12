@@ -1267,6 +1267,17 @@ const CODEX_APP_POLICY_SWITCH_INPUT: &str = "切换审批档位";
 /// fail ⇒ 跳过协议尝试直接降级回执，不裸失败不 500）
 const APP_PROBE_UNAVAILABLE_CODE: &str = "probe_unavailable";
 
+/// 探测降级文案的**唯一组合点**（spec 审 m-1 收口）：`协议面不可用：<hint>`——
+/// hint 串本身（`codex_app` 探测结论）**不内嵌前缀**，前缀只在此处统一添加。三个
+/// 消费面共此单点：GET 载荷 `degraded` / POST 切档臂 error / cancel interrupt 臂
+/// reason——三路口径一致，杜绝「协议面不可用：……——协议面不可用」双前缀
+fn probe_degraded_reason(hint: &str) -> String {
+    format!(
+        "{}：{hint}",
+        crate::inject::headless::codex_app::PROBE_UNAVAILABLE_PREFIX
+    )
+}
+
 /// APP 会话无菜单通道的 reason（menu 端点 APP 分支）：open/pick 的编号是 CLI **屏上
 /// 实读值**，APP 无屏可读——菜单机制整体不适用（不新增菜单能力）；切档入口 =
 /// switch 端点协议臂
@@ -4067,8 +4078,8 @@ pub async fn session_headless_cancel(
                         serde_json::json!({
                             "cancelled": false,
                             "reason": format!(
-                                "{}：{hint}——中止请求未送达（在飞回合的协议中止依赖 turn/interrupt）",
-                                crate::inject::headless::codex_app::PROBE_UNAVAILABLE_PREFIX
+                                "{}——中止请求未送达（在飞回合的协议中止依赖 turn/interrupt）",
+                                probe_degraded_reason(hint)
                             ),
                         }),
                     );
@@ -7258,6 +7269,8 @@ enum AnswerLookup {
 /// 键序（APP 无控制台——键序是错误通道），有作答文本的动作经 H8 queue 通道补投
 /// （模板三型 → [`codex_app_answer_repost_text`] → [`codex_headless_dispatch_envelope`]），
 /// 回执 `screen:null` + 引导文案「已补投为消息，请回 APP 核对题面」——**永不声称
+/// 已作答**；无作答文本的动作（切题/提交/中止）→ 409 `app_form_no_repost` 如实拒。
+/// CLI 形态零变化（下方 Terminal 臂原样）
 pub async fn session_question_answer(
     State(st): State<Arc<RemoteState>>,
     headers: axum::http::HeaderMap,
@@ -10063,7 +10076,7 @@ fn mode_scan_sync(st: &Arc<RemoteState>, session_id: &str) -> Option<ModeScanHit
             crate::inject::headless::codex_app::probe_cache(),
         )
         .hint()
-        .map(str::to_string)
+        .map(probe_degraded_reason)
     } else {
         None
     };
@@ -11493,10 +11506,7 @@ async fn codex_app_mode_switch_arm(
                 StatusCode::OK,
                 serde_json::json!({
                     "status": "failed",
-                    "error": format!(
-                        "{}：{hint}",
-                        codex_app::PROBE_UNAVAILABLE_PREFIX
-                    ),
+                    "error": probe_degraded_reason(hint),
                     "code": APP_PROBE_UNAVAILABLE_CODE,
                 }),
             );

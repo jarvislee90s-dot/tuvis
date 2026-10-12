@@ -20710,8 +20710,19 @@ mod tests {
         let body = body_string(r).await;
         assert!(body.contains(r#""surface":"app""#), "{body}");
         assert!(
-            body.contains(r#""degraded":"测试注入：app-server 方法缺席""#),
-            "GET degraded = 探测失败原因串（None=正常）：{body}"
+            body.contains(r#""degraded":"协议面不可用：测试注入：app-server 方法缺席""#),
+            "GET degraded = 组合点加前缀的探测失败原因串（None=正常）：{body}"
+        );
+        // spec 审 m-1：前缀恰一次（hint 不内嵌 + 组合点统一——双前缀必炸此断言）
+        let degraded = body
+            .split("\"degraded\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default();
+        assert_eq!(
+            degraded.matches("协议面不可用").count(),
+            1,
+            "降级前缀恰一次（防「协议面不可用：……——协议面不可用」）：{body}"
         );
         // ② POST 切档臂：降级回执（不裸失败不 500）
         let r = app
