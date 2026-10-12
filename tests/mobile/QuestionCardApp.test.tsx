@@ -78,7 +78,10 @@ function singleChoicePayload(): QuestionInfoView {
 }
 
 /** Task 6b 补投回执（无头封套 + screen:null + note）。failed 不带 note（不谎报送达）。 */
-function repostEnvelope(status: "ok" | "queued" | "failed", reason?: string): Record<string, unknown> {
+function repostEnvelope(
+  status: "ok" | "queued" | "failed",
+  reason?: string
+): Record<string, unknown> {
   const receipt: Record<string, unknown> = { status, sessionId: "s1", durationMs: 900 };
   if (status === "failed") {
     receipt.stage = "channel_error";
@@ -91,9 +94,7 @@ function repostEnvelope(status: "ok" | "queued" | "failed", reason?: string): Re
     channel: "headless_codex_queue",
     receipt,
     screen: null,
-    ...(status === "ok" || status === "queued"
-      ? { note: "已补投为消息，请回 APP 核对题面" }
-      : {}),
+    ...(status === "ok" || status === "queued" ? { note: "已补投为消息，请回 APP 核对题面" } : {}),
   };
 }
 
@@ -112,7 +113,12 @@ describe("QuestionCardApp：APP 形态问答卡（Task 8 · 补投作答）", ()
     render(<QuestionCardApp session={{ id: "s1" }} />);
     fireEvent.click(await screen.findByTestId("question-app-option-0-0"));
     // 请求形状：action=select + index（模板由后端组装，前端只发语义参数）
-    expect(lastAnswerBody()).toEqual({ sessionId: "s1", action: "select", index: 0, questionIndex: 0 });
+    expect(lastAnswerBody()).toEqual({
+      sessionId: "s1",
+      action: "select",
+      index: 0,
+      questionIndex: 0,
+    });
     // 展示镜像（前端预告文案，与后端 codex_app_answer_repost_text 同模板）
     expect((await screen.findByTestId("question-app-progress")).textContent).toContain(
       "选择第 1 项：Tool demo"
@@ -203,5 +209,49 @@ describe("QuestionCardApp：APP 形态问答卡（Task 8 · 补投作答）", ()
       "codex 协议通道不可达"
     );
     expect(screen.queryByTestId("question-app-note")).toBeNull();
+  });
+
+  // ===== 收口 I-1：换题指纹重置（与 CLI 套 F2-1 同款判据）=====
+  // 同一会话可连续多次提问（CLI 套实测 rollout-2026-09-21 单会话连续 8 次）而组件
+  // key 随 session.id 不重挂 → 重拉 effect 此前只清 error：载荷换成新题时旧 note
+  // 谎称「已补投」（那是旧题的回执）、旧草稿灌进新题输入框、旧「最近补投」预览留痕。
+  it("question_card_app_fingerprint_reset_on_question_swap：同会话换题 → 旧 note/草稿/预览清空", async () => {
+    installFetch();
+    routes.question = singleChoicePayload();
+    const { rerender } = render(<QuestionCardApp session={{ id: "s1", status: "waiting" }} />);
+    // 第一题：留草稿 + 补投一拍（note + 最近补投预览在场）
+    const draft = (await screen.findByTestId("question-app-freetext-input-0")) as HTMLInputElement;
+    fireEvent.change(draft, { target: { value: "旧题的草稿" } });
+    fireEvent.click(screen.getByTestId("question-app-option-0-0"));
+    await screen.findByTestId("question-app-note");
+    expect(screen.getByTestId("question-app-progress").textContent).toContain("最近补投");
+    // 同一载荷重复拉取（状态跃迁 waiting→processing）：**不**清——补投痕迹属于本轮
+    rerender(<QuestionCardApp session={{ id: "s1", status: "processing" }} />);
+    await screen.findByTestId("question-app-q-0");
+    expect(screen.getByTestId("question-app-note")).toBeTruthy();
+    // 换题（题干+选项摘要变）→ 旧 note/预览/草稿一并清空（不把旧题回执带进新题）
+    routes.question = {
+      ...singleChoicePayload(),
+      questions: [
+        {
+          header: "Next step",
+          question: "换了一道新题：测试范围怎么选？",
+          multiSelect: false,
+          options: [
+            { label: "仅单元", description: "" },
+            { label: "含集成", description: "" },
+            { label: "全量", description: "" },
+          ],
+        },
+      ],
+    };
+    rerender(<QuestionCardApp session={{ id: "s1", status: "idle" }} />);
+    await screen.findByTestId("question-app-text-0");
+    expect(screen.getByTestId("question-app-text-0").textContent).toContain("换了一道新题");
+    expect(screen.queryByTestId("question-app-note")).toBeNull();
+    expect(screen.queryByTestId("question-app-progress")).toBeNull();
+    expect((screen.getByTestId("question-app-freetext-input-0") as HTMLInputElement).value).toBe(
+      ""
+    );
   });
 });

@@ -110,7 +110,9 @@ const MAX_FREE_TEXT_CHARS = 10000;
 /** 问答载荷的**内容指纹**（丁T1 复评 F2-1，纯函数）：题干 + 每题的选项标签与顺序
  *  + 多选标记 + 选项描述的组合摘要。同一问题重复拉取恒等；模型换题或改选项即变。
  *  为何不用 `JSON.stringify(info)` 直接比：载荷里含 `source`（"mark"/"scan"）——
- *  同一问题从标记通道落到扫描通道会翻字符串但问题并未变化，那不该重置终态。 */
+ *  同一问题从标记通道落到扫描通道会翻字符串但问题并未变化，那不该重置终态。
+ *  **CLI/APP 双套共享**（收口 I-1）：APP 套（QuestionCardApp）的换题重置用同一份
+ *  判据——纯函数零可变状态，不违反「双套分置」纪律；两处各抄一份迟早漂移。 */
 /** 题干归一化（与后端 `screen_question_matches` 的 norm 同规则镜像）：剥空白 +
  *  控制台读写损失字符（U+FFFD/变体选择符/键帽/星面 emoji）——屏读快照与载荷题干
  *  的对位判据（卡面状态权威源的对位面） */
@@ -266,7 +268,7 @@ function applyInteractionScreen(
   writeSnapshotState(screen, questionIndex, false, setters, multiSelect);
 }
 
-function questionFingerprint(info: QuestionInfoView): string {
+export function questionFingerprint(info: QuestionInfoView): string {
   return info.questions
     .map((q) =>
       [

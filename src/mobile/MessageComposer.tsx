@@ -72,6 +72,7 @@ import {
   queueRetract,
   questionAnswerErrorCopy,
   sessionQuestionAnswer,
+  sessionQuestionAnswerRepost,
   sessionSend,
   uploadAttachment,
   type ChannelInfo,
@@ -198,6 +199,11 @@ const APPROVE_PRESENT_RECEIPT = "终端等待审批，请用卡片按钮";
  *  静默丢用户内容是坏体验（本仓「回执如实」纪律的同一面）。故拦截并说清去处。 */
 const FREETEXT_WITH_ATTACHMENT_RECEIPT =
   "附件不能随「回答」发送（自由作答不带附件）。请移除附件后作为回答发送，或改用卡片按钮/终端";
+
+/** APP 补投封套 failed/cancelled 且后端未带 `receipt.reason` 时的兜底文案（C-1：
+ *  不得把 undefined 渲染成「发送失败：undefined」。措辞与 QuestionCardApp 的
+ *  失败兜底同口径——只在 APP 面（headless 通道）的补投臂出现，无 CLI 专属词）。 */
+const REPOST_FAILED_FALLBACK = "补投未成功，请重试或在 APP 内操作";
 
 /** Task 8：composer 两套措辞（设计 §3.7(a) APP 词汇表）。判据 = 发送分流同源的
  *  `headlessChannelOf`（headless_* 通道 = 无终端会话：codex APP / zcode /
@@ -531,8 +537,9 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
       // 拦截时输入框内容**保留**（与 failed 态同口径：用户可复制到卡片输入框或终端）。
       const presence = await probeCardPresence();
       setCardPresence(presence);
-      // Task 8：APP 面（headless_* 通道）拦截文案走 APP 词表（发送逻辑零变化）
-      const appCopy = headlessChannelOf(sendInfo) !== null ? APP_COPY : CLI_COPY;
+      // Task 8：APP 面（headless_* 通道）拦截文案走 APP 词表（发送逻辑零变化）。
+      // M-1：判据复用 try 前已有的 `headless`（同一 sendInfo 的同源派生，不重算）
+      const appCopy = headless ? APP_COPY : CLI_COPY;
       if (presence === "approve") {
         setReceipt({ kind: "blocked", message: appCopy.approveReceipt });
         return;
@@ -553,20 +560,51 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
         // 后端归一后走字符通道，不带 [mobile] 签名，见 api.ts 的
         // `sessionQuestionAnswer` 注释）。
         //
+        // **按通道分流出口**（Task 8 收口 C-1）：APP 形态（headless_* 通道）的后端
+        // 6b 臂对有作答文本的动作返回 **200 无头封套**
+        // `{status:"headless", receipt:{status…}, screen:null, note}`——不是
+        // key_sent/failed。旧实现只调 CLI 出口且只认两词：封套落到 else 臂且封套
+        // 无 `error` 字段 → 渲染「发送失败：undefined（可重试）」而补投其实已成功
+        // ——用户重试 = 双份补投。故 APP 面改调 `sessionQuestionAnswerRepost`
+        // （同一端点同一请求体，仅回执类型收窄不同）并按封套分诊；CLI 面出口与
+        // 分诊逐字不变（既有用例锁死）。
+        //
         // **非 2xx 分诊在本臂内单独处理**（不复用外层 catch）：问答端点的错误码在
         // `data.error`（`no_question`/`multi_questions`/`tool_readonly`/`bad_index`），
         // 而 `/session-send` 的失败细节在 `data.reason`——两个端点的载荷字段**不同**
         // （丁T6 复评核出：曾用同一段 `reason` 读取，问答 409 会显示成
         // 「session-question/answer 409」这种对用户无意义的串）。文案走
         // [`questionAnswerErrorCopy`]（与卡内**同一函数**，两入口不漂移）。
-        let res: Awaited<ReturnType<typeof sessionQuestionAnswer>>;
+        let res: Awaited<ReturnType<typeof sessionQuestionAnswerRepost>>;
         try {
-          res = await sessionQuestionAnswer(session.id, "freeText", undefined, text);
+          res = headless
+            ? await sessionQuestionAnswerRepost(session.id, "freeText", undefined, text)
+            : await sessionQuestionAnswer(session.id, "freeText", undefined, text);
         } catch (err) {
           setReceipt({
             kind: "failed",
             error: err instanceof ApiError ? questionAnswerErrorCopy(err) : String(err),
           });
+          return;
+        }
+        if (res.status === "headless") {
+          // **APP 补投封套分诊**（Task 6b；回执词汇复用本组件既有 chip，不另编）：
+          // - `ok` = 补投消息已被 APP 会话消费（无头回合完成）→ delivered；
+          // - `queued` = 已入 APP 原生队列（agent 空闲后处理）→ 中性 submitted
+          //   （未确认 ≠ 失败，与 D7/T3 同一纪律）；
+          // - `failed`/`cancelled` = 未投出（`receipt.reason` 为后端中文文案）→
+          //   failed 可重试，输入保留。reason 缺席（封套兜底）不渲染 undefined。
+          //   `screen` 恒 null——补投不产屏读快照，本组件不消费（不声称已作答）。
+          const r = res.receipt;
+          if (r.status === "ok") {
+            setText("");
+            setReceipt({ kind: "delivered" });
+          } else if (r.status === "queued") {
+            setText("");
+            setReceipt({ kind: "submitted" });
+          } else {
+            setReceipt({ kind: "failed", error: r.reason ?? REPOST_FAILED_FALLBACK });
+          }
           return;
         }
         if (res.status === "key_sent") {

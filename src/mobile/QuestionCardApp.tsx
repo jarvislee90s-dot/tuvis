@@ -11,8 +11,12 @@
 // - 无作答文本的动作（切题/提交/中止）后端如实 409 `app_form_no_repost`
 //  （reason 含「清空作答」说明）——本件不提供这三类入口，错误码到达时如实透出。
 // **APP 词汇表**（设计 §3.7(a)）：渲染输出禁「终端/屏读/按键」。
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import InteractiveCard from "./InteractiveCard";
+// 换题指纹判据与 CLI 套**同源**（收口 I-1）：questionFingerprint 是纯函数
+//（题干 + 选项摘要），抽共享不复制第二份（两处各抄一份迟早漂移——CLI 套的
+// 同款注释引 rollout-2026-09-21 实机事故）
+import { questionFingerprint } from "./QuestionCardCli";
 import {
   ApiError,
   fetchSessionQuestion,
@@ -66,6 +70,8 @@ export default function QuestionCardApp({
   const [freeTexts, setFreeTexts] = useState<Record<number, string>>({});
 
   const status = session.status;
+  // 上一轮载荷的**内容指纹**（收口 I-1）：换题检测判据，与 CLI 套 F2-1 同源
+  const lastFingerprint = useRef<string | null>(null);
   useEffect(() => {
     let alive = true;
     setReady(false);
@@ -73,6 +79,23 @@ export default function QuestionCardApp({
     fetchSessionQuestion(session.id)
       .then((v) => {
         if (!alive) return;
+        // **换题指纹重置**（收口 I-1）：重拉 effect 此前只清 error——载荷换成新题时
+        // 旧 note 谎称「已补投」（那是旧题的回执）、旧草稿灌进新题输入框、旧「最近
+        // 补投」预览留痕。判据与 CLI 套同款（questionFingerprint；rollout-2026-09-21
+        // 实机事故同一族）。**空载荷不参与判据**：「拉不到题」≠「换了题」（CLI 套
+        // 同款边界——available=false 的空窗不该把本轮痕迹误清）。
+        const fp = v.available && v.questions.length > 0 ? questionFingerprint(v) : "";
+        if (
+          lastFingerprint.current !== null &&
+          lastFingerprint.current !== "" &&
+          fp !== "" &&
+          lastFingerprint.current !== fp
+        ) {
+          setNote(null);
+          setPostedPreview(null);
+          setFreeTexts({});
+        }
+        if (fp !== "") lastFingerprint.current = fp;
         setInfo(v);
         setReady(true);
       })
@@ -241,7 +264,9 @@ export default function QuestionCardApp({
       ))}
       {postedPreview !== null && (
         <p data-testid="question-app-progress" className="mt-1.5 text-xs text-[var(--tx)]">
-          {busy ? "正在补投：" : "最近补投："}
+          {/* M-4：上一拍失败时「最近补投」会谎称投出——改「最近尝试补投」（error
+              在场即最近一次补投未成功；下一拍成功后 label 回落「最近补投」） */}
+          {busy ? "正在补投：" : error !== null ? "最近尝试补投：" : "最近补投："}
           <span className="font-medium">{postedPreview}</span>
         </p>
       )}

@@ -59,9 +59,16 @@ function installFetch() {
 
 /** GET /session-mode APP 面（codex）：权限组协议三档 + 模式组灰置。
  *  `permissionCurrent` = rollout 读回串（null = 旧会话无 approval_policy 记录）。 */
-function appSurface(opts?: { permissionCurrent?: string | null; degraded?: string | null }): SessionModeView {
+function appSurface(opts?: {
+  permissionCurrent?: string | null;
+  degraded?: string | null;
+}): SessionModeView {
   const permissionCurrent = opts?.permissionCurrent ?? null;
-  const labels: Record<string, string> = { never: "全自动", "on-request": "默认", untrusted: "安全" };
+  const labels: Record<string, string> = {
+    never: "全自动",
+    "on-request": "默认",
+    untrusted: "安全",
+  };
   return {
     tool: "codex",
     current: null,
@@ -96,7 +103,8 @@ function appSurface(opts?: { permissionCurrent?: string | null; degraded?: strin
         readback: true,
         layout: "picker",
         current: permissionCurrent,
-        currentLabel: permissionCurrent === null ? null : (labels[permissionCurrent] ?? permissionCurrent),
+        currentLabel:
+          permissionCurrent === null ? null : (labels[permissionCurrent] ?? permissionCurrent),
         currentSource: permissionCurrent === null ? "null" : "rollout",
         tiers: [
           { mode: "never", label: "全自动", selectable: true, reason: null },
@@ -132,12 +140,12 @@ describe("ModeBarApp：APP 形态模式栏（Task 8）", () => {
     // 协议读回档（on-request/默认）高亮；其余两档可点但不高亮
     const current = await screen.findByTestId("mode-app-switch-permission-on-request");
     expect(current.getAttribute("data-current")).toBe("true");
-    expect(screen.getByTestId("mode-app-switch-permission-never").getAttribute("data-current")).toBe(
-      "false"
-    );
-    expect(screen.getByTestId("mode-app-switch-permission-untrusted").getAttribute("data-current")).toBe(
-      "false"
-    );
+    expect(
+      screen.getByTestId("mode-app-switch-permission-never").getAttribute("data-current")
+    ).toBe("false");
+    expect(
+      screen.getByTestId("mode-app-switch-permission-untrusted").getAttribute("data-current")
+    ).toBe("false");
     // currentSource="rollout" 是实时协议读回——不得带 CLI 的「（上次切换）」标注
     expect(screen.queryByTestId("mode-current-source-permission")).toBeNull();
     // 模式组（无协议载体）：灰置 chips 在场，不带可点按钮语义
@@ -173,12 +181,12 @@ describe("ModeBarApp：APP 形态模式栏（Task 8）", () => {
     // hint 原样透传（含读回串与目标档——后端单点文案，前端不重拼）
     expect((await screen.findByTestId("mode-app-notice")).textContent).toContain("不符");
     // **不拿回执改本地状态**：目标档不高亮，原档保持（重拉 GET 的权威面才算数）
-    expect(screen.getByTestId("mode-app-switch-permission-never").getAttribute("data-current")).toBe(
-      "false"
-    );
-    expect(screen.getByTestId("mode-app-switch-permission-on-request").getAttribute("data-current")).toBe(
-      "true"
-    );
+    expect(
+      screen.getByTestId("mode-app-switch-permission-never").getAttribute("data-current")
+    ).toBe("false");
+    expect(
+      screen.getByTestId("mode-app-switch-permission-on-request").getAttribute("data-current")
+    ).toBe("true");
     // 自动重拉 GET：初始 1 次 + 回执后 1 次（GET 带 session_id 查询串）
     const gets = fetchMock.mock.calls.filter(([u]) => String(u).includes("/session-mode?"));
     expect(gets.length).toBe(2);
@@ -186,7 +194,10 @@ describe("ModeBarApp：APP 形态模式栏（Task 8）", () => {
 
   it("mode_bar_app_degraded_renders_readonly_chips_with_reason：探测降级 → 只读 chips + 原因", async () => {
     installFetch();
-    routes.mode = appSurface({ permissionCurrent: "on-request", degraded: "codex app-server 探测失败：spawn 不可达" });
+    routes.mode = appSurface({
+      permissionCurrent: "on-request",
+      degraded: "codex app-server 探测失败：spawn 不可达",
+    });
     render(<ModeBarApp session={{ id: "s1" }} />);
     await screen.findByTestId("mode-bar-app");
     // 只读：三档 chips 全部禁用（Task 7 降级档 → 前端消费 degraded 字段）
@@ -241,9 +252,7 @@ describe("ModeBarApp：APP 形态模式栏（Task 8）", () => {
     expect((await screen.findByTestId("mode-app-notice")).textContent).toContain(
       "未知档位词 bypass"
     );
-    const posts = fetchMock.mock.calls.filter(([u]) =>
-      String(u).includes("/session-mode/switch")
-    );
+    const posts = fetchMock.mock.calls.filter(([u]) => String(u).includes("/session-mode/switch"));
     expect(posts.length).toBe(0);
   });
 
@@ -262,5 +271,34 @@ describe("ModeBarApp：APP 形态模式栏（Task 8）", () => {
       const gets = fetchMock.mock.calls.filter(([u]) => String(u).includes("/session-mode?"));
       expect(gets.length).toBe(2);
     });
+  });
+
+  // ===== 收口 I-2：通用 failed 臂落 rose error（对齐 CLI 套 mode-error 语义）=====
+  // CLI 套（ModeBarCli）的 `failed{error}` / 网络异常走 rose `mode-error`，amber
+  // notice 只承载「未确认」语义（mismatch/ineffective）；APP 套此前把通用 failed
+  // 也落 amber notice——「失败」与「注意」两种语义漂移。refusal（活跃线程钉句）
+  // 单列不变（sticky 灰置是它专属的形态）。
+  it("mode_bar_app_generic_failed_renders_rose_error：failed{error} → rose error（非 amber notice）", async () => {
+    installFetch();
+    routes.mode = appSurface({ permissionCurrent: "on-request" });
+    routes.switchBody = { status: "failed", error: "codex 协议通道不可达" };
+    render(<ModeBarApp session={{ id: "s1" }} />);
+    fireEvent.click(await screen.findByTestId("mode-app-switch-permission-never"));
+    const err = await screen.findByTestId("mode-app-error");
+    expect(err.textContent).toContain("codex 协议通道不可达");
+    // 失败不落 amber notice（「未确认」语义与「失败」语义分列）
+    expect(screen.queryByTestId("mode-app-notice")).toBeNull();
+  });
+
+  it("mode_bar_app_network_error_renders_rose_error：非 2xx/网络异常 → rose error（对齐 CLI catch 臂）", async () => {
+    installFetch();
+    routes.mode = appSurface({ permissionCurrent: "on-request" });
+    routes.switchStatus = 500;
+    routes.switchBody = { error: "internal" };
+    render(<ModeBarApp session={{ id: "s1" }} />);
+    fireEvent.click(await screen.findByTestId("mode-app-switch-permission-never"));
+    expect(await screen.findByTestId("mode-app-error")).toBeTruthy();
+    expect(screen.queryByTestId("mode-app-notice")).toBeNull();
+    expect(screen.queryByTestId("mode-app-refusal")).toBeNull();
   });
 });

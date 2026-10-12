@@ -1891,6 +1891,101 @@ describe("卡片在场分流：审批拦截 / 问答转向自由作答 / 不可�
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("回答内容");
   });
 
+  // ===== Task 8 收口（C-1）：APP 会话（headless_* 通道）的转向路径适配 6b 无头封套 =====
+  // 后端 Task 6b 对 APP 形态的有作答文本动作返回 200 **无头封套**
+  // `{status:"headless", receipt:{status…}, screen:null, note}`——不是 key_sent/failed。
+  // 旧实现只调 CLI 出口且只认两词：封套落到 else 臂 `res.error` = undefined →
+  // 渲染「发送失败：undefined（可重试）」而补投其实已成功——用户重试 = 双份补投。
+  // 现有词汇表用例用双题载荷恰好绕开了此分支（多题 → questionBlocked 拦截），故
+  // 这里用**单题载荷 + headless 通道**直击转向分支，断言封套三态分诊。
+  /** APP 单题可自由作答载荷 + headless 通道（codex APP 形态的 send-info） */
+  function appFreeTextRoutes() {
+    routes.info = sendInfo({ channels: ["headless_codex_queue"] });
+    routes.questionInfo = freeTextQuestionInfo();
+  }
+  /** Task 6b 无头封套（与 QuestionCardApp.test 的 repostEnvelope 同构） */
+  function repostEnvelope(
+    status: "ok" | "queued" | "failed",
+    reason?: string
+  ): Record<string, unknown> {
+    const receipt: Record<string, unknown> = {
+      status,
+      sessionId: "sess-1",
+      durationMs: 900,
+    };
+    if (status === "failed") {
+      receipt.stage = "channel_error";
+      receipt.reason = reason ?? "codex 协议通道不可达";
+    }
+    return {
+      status: "headless",
+      channel: "headless_codex_queue",
+      receipt,
+      screen: null,
+      ...(status === "ok" || status === "queued"
+        ? { note: "已补投为消息，请回 APP 核对题面" }
+        : {}),
+    };
+  }
+
+  it("APP 会话（headless 通道）单题可自由作答：发送走补投出口 + 封套 ok → 送达回执 + 清输入（防双投）", async () => {
+    installFetch();
+    appFreeTextRoutes();
+    routes.answer = repostEnvelope("ok");
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    await screen.findByTestId("composer-card-presence");
+    expect(screen.getByTestId("composer-card-presence").getAttribute("data-presence")).toBe(
+      "questionFreeText"
+    );
+    // APP 词表的自由作答占位语（该路径此前未被任何用例覆盖）
+    expect(input.placeholder).toBe("输入内容将作为本题的回答补投到会话");
+    fireEvent.change(input, { target: { value: "补投的回答" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    // receipt.status=ok = 补投消息已被 APP 会话消费 → delivered（已送达会话）+
+    // 清空输入——**不得**落 failed「undefined（可重试）」（那会诱发双份补投）
+    expect(await screen.findByTestId("send-receipt-delivered").then((el) => el.textContent)).toBe(
+      "已送达会话"
+    );
+    expect(screen.queryByTestId("send-receipt-failed")).toBeNull();
+    expect(answerCalls()).toHaveLength(1);
+    expect(sendCalls()).toHaveLength(0);
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("APP 会话封套 queued：中性 submitted 回执 + 清输入（已入 APP 原生队列，非失败）", async () => {
+    installFetch();
+    appFreeTextRoutes();
+    routes.answer = repostEnvelope("queued");
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    await screen.findByTestId("composer-card-presence");
+    fireEvent.change(input, { target: { value: "补投的回答" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(await screen.findByTestId("send-receipt-submitted")).toBeTruthy();
+    expect(screen.queryByTestId("send-receipt-failed")).toBeNull();
+    expect(answerCalls()).toHaveLength(1);
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("APP 会话封套 failed：receipt.reason 作错误文案 + 输入保留（不渲染 undefined）", async () => {
+    installFetch();
+    appFreeTextRoutes();
+    routes.answer = repostEnvelope("failed", "codex 协议通道不可达");
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    await screen.findByTestId("composer-card-presence");
+    fireEvent.change(input, { target: { value: "补投的回答" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    const chip = await screen.findByTestId("send-receipt-failed");
+    expect(chip.textContent).toContain("codex 协议通道不可达");
+    expect(chip.textContent).not.toContain("undefined");
+    expect(answerCalls()).toHaveLength(1);
+    expect(sendCalls()).toHaveLength(0);
+    // 失败未投出 → 输入保留（可重试，与既有 failed 态同口径）
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("补投的回答");
+  });
+
   // ===== 丁T6 复评：问答端点的错误码分诊（**字段名与 /session-send 不同**）=====
   // 问答端点的错误码在响应体 `error` 字段（`{error:"multi_questions"}`），而
   // `/session-send` 的失败细节在 `reason` 字段——两条路径**不能复用同一段读取**。

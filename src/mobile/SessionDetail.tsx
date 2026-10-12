@@ -824,7 +824,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // **载荷缺 surface（旧后端）→ 按 `session.form` 兜底**（分套主判据的兼容路径，
   // 设计 §3.2 字段盘点）；拉取失败同兜底（form 已随 session prop 在手，不另起炉灶）。
   // null = **未决帧两套都不挂载**（spec 审 M-1：null 帧若挂 Cli 套，APP 会话每次
-  // 打开详情都会闪一帧「终端」词汇 UI，且 Cli 套会白发两發 GET——三态化后未决帧
+  // 打开详情都会闪一帧「终端」词汇 UI，且 Cli 套会白发两发 GET——三态化后未决帧
   // **只发本 surface GET 一发**，套件零请求；代价 = CLI 会话晚一个 GET 往返才出
   // 模式栏/问答卡）。代价申报：选套判定与套件自身数据是同端点两次轻量查询（选套
   // 一次 + 套件数据一次）——换「选套判据单点在后端」，不让前端猜形态。
@@ -1492,9 +1492,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         <PlanFeedbackBar
           key={`plan-fb-${session.id}`}
           sessionId={session.id}
-          agentName={
-            session.agentType === "claude" ? "Claude" : (TOOL_LABELS[session.agentType] ?? "Agent")
-          }
+          agentName={TOOL_LABELS[session.agentType] ?? "Agent"}
           onDismiss={() => setPlanFeedbackActive(false)}
         />
       )}

@@ -29,9 +29,11 @@ import {
  *   前端原样透出不重拼）；
  * - hit → hint 透传（回执色）+ 重拉 GET；mismatch/ineffective → hint 透传（注意色）
  *   + 重拉 GET——「未确认」不是失败，是如实申报；
+ * - 通用 `failed`{error} / 非 2xx / 网络异常 → **rose error**（收口 I-2：与 CLI 套
+ *   `mode-error` 同语义——失败与「未确认」注意色分列，不混装 amber）；
  * - 活跃线程拒绝（code="active_thread_write_unavailable"）→ **灰置 + 钉句**
  *   （T0.1 定案：APP 活跃会话在 0.162.1 无任何写通道——钉句来自后端 Display 单点，
- *   置灰直到卡片重挂，不自动试探）。
+ *   置灰直到卡片重挂，不自动试探；rose 单列，sticky 语义专属）。
  *
  * 降级链（设计 §3.3）：`degraded` 非空（Task 7 ProbeCache 探测失败）→ 只读 chips +
  * 原因串原样透出（协议面不可用时不裸失败、也不假装可写）。
@@ -46,6 +48,9 @@ export default function ModeBarApp({ session }: { session: { id: string } }) {
   const [receipt, setReceipt] = useState<string | null>(null);
   /** 未确认提示（mismatch/ineffective：后端 hint 原样透传，注意色） */
   const [notice, setNotice] = useState<string | null>(null);
+  /** 失败文案（收口 I-2：通用 `failed{error}` / 非 2xx / 网络异常——rose error，
+   *  与 CLI 套 `mode-error` 同语义；amber notice 只承载「未确认」一种语义） */
+  const [error, setError] = useState<string | null>(null);
   /** 活跃线程拒绝钉句（灰置原因；置位后 sticky——APP 关闭前重试必然同拒） */
   const [refusal, setRefusal] = useState<string | null>(null);
 
@@ -71,6 +76,7 @@ export default function ModeBarApp({ session }: { session: { id: string } }) {
       setBusy(true);
       setReceipt(null);
       setNotice(null);
+      setError(null);
       try {
         const res = await sessionModeSwitchApp(session.id, target);
         if (res.status === "app_switch") {
@@ -91,14 +97,17 @@ export default function ModeBarApp({ session }: { session: { id: string } }) {
           // 活跃线程如实拒：钉句单点透出 + 灰置（sticky——见 state 注释）
           setRefusal(res.error);
         } else {
-          setNotice(res.error);
+          // 通用 failed（收口 I-2）：失败是 error 语义（rose），不与「未确认」
+          // notice（amber）混装——CLI 套 else 臂 setError 同款分派
+          setError(res.error);
         }
       } catch (e) {
         if (e instanceof ApiError) {
-          // H3 同门（403 headless_disabled）与其余非 2xx：如实透出（无禁词）
-          setNotice(e.message);
+          // H3 同门（403 headless_disabled）与其余非 2xx：如实透出（无禁词）。
+          // 收口 I-2：异常也落 rose error（CLI 套 catch 臂同语义）
+          setError(e.message);
         } else {
-          setNotice(String(e));
+          setError(String(e));
         }
       } finally {
         setBusy(false);
@@ -145,6 +154,13 @@ export default function ModeBarApp({ session }: { session: { id: string } }) {
           className="text-[11px] text-rose-600 dark:text-rose-400"
         >
           {refusal}
+        </span>
+      )}
+      {error !== null && (
+        // 收口 I-2：失败文案 rose（对齐 CLI 套 mode-error 的取色与语义——
+        // 「失败」与 amber notice 的「未确认」两种语义不再混装）
+        <span data-testid="mode-app-error" className="text-[11px] text-rose-600 dark:text-rose-400">
+          {error}
         </span>
       )}
       {notice !== null && (

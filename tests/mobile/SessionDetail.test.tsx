@@ -307,10 +307,9 @@ function installFetch() {
     if (url.includes("/session-subagent-messages")) {
       // 观察台 T6：SubagentDetail 详情载荷桩（本页既有用例不开详情对话框，
       // 缺省空载荷即可——防御 SubagentDetail 挂载时的意外请求）
-      return new Response(
-        JSON.stringify({ messages: [], truncated: false, supported: true }),
-        { status: 200 }
-      );
+      return new Response(JSON.stringify({ messages: [], truncated: false, supported: true }), {
+        status: 200,
+      });
     }
     if (url.includes("/session-queue")) {
       // Task 8：composer 挂载即拉完整队列；缺省空列表（既有用例行为不变——
@@ -1315,10 +1314,9 @@ describe("书签跨加载窗口跳转（M5 P3-c）", () => {
       }
       if (url.includes("/session-subagent-messages")) {
         // 观察台 T6：详情载荷桩（同 installFetch，缺省空载荷）
-        return new Response(
-          JSON.stringify({ messages: [], truncated: false, supported: true }),
-          { status: 200 }
-        );
+        return new Response(JSON.stringify({ messages: [], truncated: false, supported: true }), {
+          status: 200,
+        });
       }
       throw new Error(`unexpected fetch: ${url}`);
     });
@@ -2071,10 +2069,9 @@ describe("SessionDetail：活状态流（T1）", () => {
         }
         if (url.includes("/session-subagent-messages")) {
           // 观察台 T6：详情载荷桩（同 installFetch，缺省空载荷）
-          return new Response(
-            JSON.stringify({ messages: [], truncated: false, supported: true }),
-            { status: 200 }
-          );
+          return new Response(JSON.stringify({ messages: [], truncated: false, supported: true }), {
+            status: 200,
+          });
         }
         throw new Error(`unexpected fetch: ${url}`);
       })
@@ -2898,7 +2895,9 @@ describe("SessionDetail：预览区 sheet 化（T1）", () => {
     // sheet=subagents + open=subagent + mode=split-h（两层级导航：chip 直达落详情级，返回钮回清单）
     await vi.waitFor(() => {
       expect(
-        document.querySelector('[data-sheet="subagents"][data-open="subagent"][data-mode="split-h"]')
+        document.querySelector(
+          '[data-sheet="subagents"][data-open="subagent"][data-mode="split-h"]'
+        )
       ).toBeTruthy();
     });
     expect(screen.getByTestId("subagent-detail")).toBeTruthy();
@@ -3481,7 +3480,12 @@ describe("SessionDetail：APP 形态分套（Task 8 surface 选套）", () => {
           currentSource: "null",
           tiers: [
             { mode: "plan", label: "计划", selectable: false, reason: "APP 会话暂无模式切换通道" },
-            { mode: "default", label: "操作", selectable: false, reason: "APP 会话暂无模式切换通道" },
+            {
+              mode: "default",
+              label: "操作",
+              selectable: false,
+              reason: "APP 会话暂无模式切换通道",
+            },
           ],
           legacy: [],
         },
@@ -3714,8 +3718,17 @@ describe("SessionDetail：APP 形态分套（Task 8 surface 选套）", () => {
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).placeholder).not.toContain(
       "终端"
     );
-    // 词汇表断言（设计 §3.7(a)）：App 套整页渲染输出扫描禁词
-    const text = container.textContent ?? "";
+    // 词汇表断言（设计 §3.7(a)）：App 套整页渲染输出扫描禁词——文本内容之外，
+    // **title / aria-label / placeholder 属性一并纳入**（收口 M-3：属性词同样到达
+    // 用户，如悬停 title 与读屏 aria-label；汇总后统一断言）
+    const attrs = Array.from(
+      container.querySelectorAll("[title], [aria-label], [placeholder]")
+    ).flatMap((el) => [
+      el.getAttribute("title") ?? "",
+      el.getAttribute("aria-label") ?? "",
+      el.getAttribute("placeholder") ?? "",
+    ]);
+    const text = [container.textContent ?? "", ...attrs].join("\n");
     expect(text).not.toContain("终端");
     expect(text).not.toContain("屏读");
     expect(text).not.toContain("按键");
