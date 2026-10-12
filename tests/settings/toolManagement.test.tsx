@@ -135,7 +135,7 @@ describe("工具管理（review F7①②）", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("update_tool_settings", expect.anything());
     // 回到工具分区：开关为已保存状态（checked）、dirty 已重置（无保存按钮）
     // 2026-10-06 两级导航：侧栏点击目标由「分区名」变为「块」（块内多卡并置），用 testid 更稳
-  fireEvent.click(await screen.findByTestId("settings-nav-tools"));
+    fireEvent.click(await screen.findByTestId("settings-nav-tools"));
     const opencode = await screen.findByText("OpenCode");
     const row = opencode.closest("div[class*='justify-between']") as HTMLElement;
     expect(row.querySelector('[role="switch"]')).toHaveAttribute("data-state", "checked");
