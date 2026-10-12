@@ -10,7 +10,7 @@
 
 Claude Code、Codex CLI、Kimi Code 支持 Hook 状态通道（状态判定更及时、更准）。兔维斯完成 Hook 注册后，需要你在**对应工具的终端里输入 `/hooks`**，找到兔维斯条目并**信任一次**；其中 Codex 另有信任门，需在 Codex 的 TUI 界面内亲自确认。
 
-> 🖼 TODO 截图：终端 /hooks 信任界面
+![Claude Code 的 /hooks 信任界面](../img/hooks-trust.png)
 
 > 💡 「设置 → 信号健康度」分区可以自查每个工具的 Hook 是否真正在工作：已注册但事件窗口内无事件时，会列出待办并附一键复制的 `/hooks` 命令。OpenCode 等不支持 Hook 的工具无需此步，状态由兔维斯自行推导。
 

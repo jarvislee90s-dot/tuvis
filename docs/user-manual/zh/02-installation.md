@@ -20,7 +20,7 @@
 
 **Windows**：双击安装包，按安装向导点击「下一步」直至完成。
 
-> 🖼 TODO 截图：NSIS 安装向导画面（宽约 800px）
+![安装向导](../img/install-wizard.png)
 
 **macOS**：打开 `.dmg`，将兔维斯拖入 Applications（应用程序）文件夹，再从启动台或访达打开。
 

@@ -2,7 +2,9 @@
 
 主会话派发的后台子 Agent 从此不再是黑盒：名字、时长、token 与完整执行过程实时可见。
 
-> 🖼 TODO 截图：子 Agent 观察台（v1 仅 Claude 全量，其余工具清单照常）
+![手机看板里的子 Agent 清单](../img/subagent-mobile.png)
+
+上图：手机看板（`/m`）中某 Claude 会话的「子 Agent」面板——清单按派发序排列，每个子 Agent 带名字、任务标题、时长与 token 消耗。
 
 ## 运行 chip：详情页里的实时小条
 
