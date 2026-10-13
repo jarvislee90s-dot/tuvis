@@ -173,7 +173,12 @@ pub(crate) fn probe_hook_listener_helper() -> bool {
     let Some(home) = dirs::home_dir() else {
         return false;
     };
-    probe_helper_from_to(src_dir, &helper_install_dir(&home), &HOOK_LISTENER_HELPER_NAMES).is_some()
+    probe_helper_from_to(
+        src_dir,
+        &helper_install_dir(&home),
+        &HOOK_LISTENER_HELPER_NAMES,
+    )
+    .is_some()
 }
 
 /// probe 核心（tempdir 可测缝，纯读零写——不拷贝、不建目录）：判定同布局下
