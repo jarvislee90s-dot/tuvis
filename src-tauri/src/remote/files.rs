@@ -52,6 +52,30 @@ const PATH_KEYS: &[&str] = &[
 /// 单个路径候选的长度上限（超长串不是可预览文件，纯防御）
 const MAX_PATH_LEN: usize = 4096;
 
+/// 「会话产物」上墙扩展名白名单（2026-10-13 用户裁决：可预览优先）。口径 =
+/// mime 表已知扩展（含并入 md 臂的 markdown）+ 补注册 html/htm + 纯文本回落类
+/// （txt/log/csv/tsv/xml——mime 表未注册、回落 text/plain，前端仍按纯文本预览）；
+/// pdf/xlsx/docx 等二进制交换格式暂不上墙，列为后续可选。仅作用于会话产物池；
+/// 工具触达条目不做类型过滤（两表一致性由 tests 内漂移锁守护）
+const ARTIFACT_EXT_ALLOWLIST: &[&str] = &[
+    "md", "markdown", "txt", "log", "json", "csv", "tsv", "yaml", "yml", "toml", "xml", "html",
+    "htm", "rs", "ts", "tsx", "js", "mjs", "cjs", "jsx", "py", "go", "java", "c", "h", "cpp", "cc",
+    "hpp", "css", "sh", "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico",
+];
+
+/// 产物候选的扩展名白名单判定（纯函数）：末段扩展名（大小写不敏感）命中即放行。
+/// URL 自带排除（与 [`is_path_candidate`] 的 `://` 判据同款——白名单是第二道闸，
+/// 不依赖调用方先过滤；否则 `https://x.com/a.md` 会因末段 `a.md` 命中而误放行）
+fn artifact_ext_allowed(path: &str) -> bool {
+    if path.contains("://") {
+        return false;
+    }
+    match last_segment_ext(path) {
+        Some((_, ext)) => ARTIFACT_EXT_ALLOWLIST.contains(&ext.to_ascii_lowercase().as_str()),
+        None => false,
+    }
+}
+
 // ============================================================
 // 安全读取（read_file_safe）
 // ============================================================
@@ -444,7 +468,12 @@ fn path_within_semantics(child: &str, ancestor: &str, windows: bool) -> bool {
 fn mime_from_ext(ext: &str) -> String {
     let lower = ext.to_ascii_lowercase();
     match lower.as_str() {
-        "md" => "text/markdown",
+        // markdown 并入 md 臂（2026-10-13 质量评审 Important 2：白名单收了
+        // .markdown，mime 表却只认 md，致 .markdown 产物按纯文本渲染）
+        "md" | "markdown" => "text/markdown",
+        // html/htm 此前漏注册（会话产物批补；前端 html 沙箱分支按扩展名判定，
+        // 不读 mime——注册作用面是预览载荷（GET /m/api/v1/file）的 mime 字段）
+        "html" | "htm" => "text/html",
         "rs" => "text/rust",
         "ts" | "tsx" => "text/typescript",
         "js" | "mjs" | "cjs" => "text/javascript",
@@ -559,7 +588,23 @@ pub(crate) fn extract_file_paths_with_env(
                     merger.merge(&path, seq, ts, FileOrigin::User);
                 }
             }
-            (merger.finish(), pg.truncated)
+            // 会话产物兜底（2026-10-13）：正文链接/行内反引号路径，命中既有池跳过；
+            // 去重键按会话 cwd 绝对化（工具绝对路径 + 正文相对链接不重复上墙）
+            merger.merge_artifact_fallback(
+                &extract_artifact_candidates(&pg.messages),
+                pg.cwd.as_deref(),
+            );
+            let mut out = merger.finish();
+            // 产物条目提取时校验存在；相对路径按会话 cwd 解析（codex rollout 提供）。
+            // ⚠️ 不变式：这里的 cwd 与**预览侧**解析同一相对路径用的
+            // `session.project_path`（api.rs 的 read_file_safe）必须同源——今天
+            // codex CLI 二者都取自 rollout 首行 payload.cwd，故一致；但两处是独立
+            // 推导链且 rollout 选取规则不同（本层未排序取首个含 id 者 / monitor 侧取
+            // mtime 最新），同一 session id 出现两份 rollout 时会分叉，表现为
+            // 「列表可见但点开预览到另一目录同名文件或 403」（静默方向）。
+            // 修法候选（未做）：提取期把相对产物解析为绝对路径随条目带出（展示仍原文）。
+            filter_artifacts_by_existence(&mut out, pg.cwd.as_deref(), &|p| p.exists());
+            (out, pg.truncated)
         }
         Err(_) => (Vec::new(), false),
     }
@@ -589,24 +634,32 @@ fn resolve_zcode_artifact(home: &Path, tail: &str) -> Option<String> {
     hit
 }
 
-/// 文件来源三池（M5 决策 10 / 线稿来源筛选）：user=用户上传/引用（附件抽取，
-/// B1 调研口径）；tool_read=工具只读；tool_write=工具改写。
-/// 同一文件多来源命中取信息量最大者（tool_write > tool_read > user）
+/// 文件来源四池（M5 决策 10 / 线稿来源筛选；第四池见 2026-10-13 用户裁决）：
+/// user=用户上传/引用（附件抽取，B1 调研口径）；tool_read=工具只读；
+/// tool_write=工具改写；session_artifact=会话产物（只在对话正文露路径）。
+/// 同一文件多来源命中取信息量最大者（tool_write > tool_read > user > session_artifact）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileOrigin {
+    /// 会话产物（2026-10-13 用户裁决）：路径出现在对话正文（markdown 链接 /
+    /// 行内反引号）且文件真实存在——脚本/命令生成的产物常只在正文里露路径
+    /// （tool-call 参数没有它）。rank 最低只兜底：三个既有池命中的文件不改标
+    SessionArtifact,
     User,
     ToolRead,
     ToolWrite,
 }
 
 impl FileOrigin {
-    /// 合并优先级（数值大者胜）：上传后被工具改写 → 显示「工具读写」
+    /// 合并优先级（数值大者胜）：上传后被工具改写 → 显示「工具读写」。
+    /// 数值仅内部相对序（serde 走 rename_all，不受影响）；相对序恒为
+    /// session_artifact < user < tool_read < tool_write
     fn rank(self) -> u8 {
         match self {
-            FileOrigin::User => 0,
-            FileOrigin::ToolRead => 1,
-            FileOrigin::ToolWrite => 2,
+            FileOrigin::SessionArtifact => 0,
+            FileOrigin::User => 1,
+            FileOrigin::ToolRead => 2,
+            FileOrigin::ToolWrite => 3,
         }
     }
 }
@@ -629,7 +682,8 @@ pub struct FileEntry {
     /// 常规色（仍是超链接，只是视觉上区分「只是看过」与「动过手」）。
     /// M5 B2 起与 origin 同步：modified == (origin == ToolWrite)
     pub modified: bool,
-    /// 来源三池（M5 B2）：user / tool_read / tool_write（snake_case 序列化）
+    /// 来源四池（M5 B2 三池 + 2026-10-13 第四池）：
+    /// user / tool_read / tool_write / session_artifact（snake_case 序列化）
     pub origin: FileOrigin,
 }
 
@@ -679,11 +733,55 @@ fn normalize_key(path: &str, windows: bool) -> String {
     }
 }
 
-/// 从统一消息流提取文件条目（纯函数，M3+ 富化 + M5 B2 来源三池）：
+/// 会话产物候选的去重键（2026-10-13 用户裁决）：cwd 可得且候选是**相对路径**时，
+/// 先按 cwd 绝对化再做**词法**规范化（`Path::components` 丢弃 `.` 段、合并重复
+/// 分隔符；**不触盘**，故仍是纯函数）——否则「工具参数写绝对路径 + 正文写相对
+/// 链接」会让同一物理文件在面板里出两行（一行工具读取、一行会话产物）。cwd
+/// 不可得/为空则退回原文（保守：不猜，宁可多一行也不误合）。`..` 段不解析
+/// （词法规范化的保守边界）。展示路径不受影响（仍用正文原文）
+///
+/// 落地要点（2026-10-13 补齐，实测 std 后修正）：`components()` 只归一**非行首**
+/// 的 `.` 段——`./out/x.md` 的组件是 `[CurDir, out, x.md]`，直接 `collect()` 会还原
+/// 成 `./out/x.md`（`Path::new(".").components()` 也非空，而是 `[CurDir]`），行首
+/// `.` 必须**显式滤掉**才算「`.` 段丢弃」。滤 CurDir 不会误合两个不同文件：无论
+/// cwd 如何，相对形态 `./x` 与 `x` 恒指同一物理文件。绝对路径候选同样过词法
+/// 规范化（工具侧 `C:/w/./x.md` 一并归到 `c:/w/x.md`）
+///
+/// 因果澄清（2026-10-13 最终评审批次，实测修正）：**内部** `.` 段与重复分隔符
+/// 本就由 `std::path::Components` 自行归一（`join` 之后前导 `.` 亦成内部段）；
+/// 本函数的显式 CurDir 过滤只在**键不 join** 时（cwd 不可得，键取相对原文）才
+/// 额外改变结果——即额外覆盖**行首** `.`（`./x` ≡ `x`）。故它不是「`.` 段归一」
+/// 的决定性修复，决定性归 std；本过滤是 cwd 不可得形态下的键稳定性补丁
+fn artifact_dedup_key(path: &str, cwd: Option<&str>, windows: bool) -> String {
+    let p = Path::new(path.trim());
+    let joined: PathBuf = match cwd {
+        Some(c) if !c.trim().is_empty() && !p.is_absolute() => Path::new(c.trim()).join(p),
+        _ => p.to_path_buf(),
+    };
+    let lexically_normal: PathBuf = joined
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    let normalized = lexically_normal.to_string_lossy();
+    if normalized.is_empty() {
+        // 退化输入（空串 / 只由 `.` 段构成，如 `.`、`./`）：词法规范化后无任何组件。
+        // 若统一取空键，彼此不同的原文形态会塌缩成同一行（误合）→ 退回原文归一化键，
+        // 与「cwd 不可得退回原文」同一保守口径。生产链路候选必经 `is_path_candidate`
+        // + `artifact_ext_allowed`（要求末段有白名单扩展名），这类输入到不了这里，
+        // 本守卫是纵深防御（不触盘、不改其它语义）
+        return normalize_key(path.trim(), windows);
+    }
+    normalize_key(&normalized, windows)
+}
+
+/// 从统一消息流提取文件条目（纯函数，M3+ 富化 + M5 B2 来源判定；来源值域四池）：
 /// - kind=="tool-call"：toolArgs JSON（PATH_KEYS 递归收集，既有逻辑不变）→
 ///   按读写白名单定 origin（tool_write / tool_read）；
 /// - kind=="user"：正文里的内联附件标记（B1 调研 kimi 实测形态
 ///   `<image path="X">` / `<file path="X">`，通用扫描对其它工具无害）→ origin=user。
+///
+/// 本文只产出 user / tool_read / tool_write 三池；第四池 session_artifact（会话产物）
+/// 不经消息流抽取，由 `EntryMerger::merge_artifact_fallback` 兜底落池。
 ///
 /// 按归一化键去重，记录最后出现 seq/ts 与 hits，输出按 last_seq 降序（最近出现的在上）。
 /// 生产入口（平台语义取编译目标）
@@ -749,11 +847,17 @@ impl EntryMerger {
         }
     }
 
-    /// 单路径并入：命中更新 last_seq/ts/hits 与来源优先级（优先级 tool_write
-    /// 最高，其次 tool_read，user 最低——B2）；未命中建行。modified 与
-    /// origin==ToolWrite 同步（字段保留为前端既有消费面）。
-    pub(crate) fn merge(&mut self, path: &str, seq: i64, ts: Option<i64>, origin: FileOrigin) {
-        let key = normalize_key(path, self.windows);
+    /// 单路径并入（键注入核）：`merge` 的键由 `normalize_key` 现算；会话产物池需要
+    /// 用**按 cwd 绝对化后的键**参与全局去重（同一物理文件不因绝对/相对两形态出
+    /// 两行），故把键的推导上提到调用方。展示路径仍保留传入原文（既有契约）
+    fn merge_with_key(
+        &mut self,
+        path: &str,
+        key: String,
+        seq: i64,
+        ts: Option<i64>,
+        origin: FileOrigin,
+    ) {
         match self.index.get(&key) {
             Some(&i) => {
                 let e = &mut self.out[i];
@@ -781,12 +885,81 @@ impl EntryMerger {
         }
     }
 
+    /// 单路径并入：命中更新 last_seq/ts/hits 与来源优先级（rank 序见
+    /// [`FileOrigin::rank`]——tool_write > tool_read > user > session_artifact）；
+    /// 未命中建行。modified 与 origin==ToolWrite 同步（字段保留为前端既有消费面）。
+    /// 会话产物池不经此函数落池（走 [`Self::merge_artifact_fallback`]）
+    pub(crate) fn merge(&mut self, path: &str, seq: i64, ts: Option<i64>, origin: FileOrigin) {
+        let key = normalize_key(path, self.windows);
+        self.merge_with_key(path, key, seq, ts, origin);
+    }
+
+    /// 会话产物兜底合并：候选命中**调用前已存在**的键（既有三池任一）→ 整体跳过
+    /// （不改标 / 不涨 hits / 不挪 lastSeq——「既有三池合并结果零变化」红线）；
+    /// 未命中才以 SessionArtifact 落池。**本趟自建的产物条目不受短路影响**：同一
+    /// 路径在正文里重复出现时累加 hits、取**最后一次**出现的 seq/ts/形态（2026-10-13
+    /// 用户裁决；与 FileEntry 字段契约一致）——故短路集合必须在循环前**一次性快照**，
+    /// 而不是边合并边查 index。去重键按会话 cwd 绝对化（见 [`artifact_dedup_key`]），
+    /// 且短路集合与候选键**同口径**（见下），故「工具写绝对/相对路径 + 正文写相对
+    /// 链接」都只出一行；展示路径仍是正文原文
+    ///
+    /// **调用顺序契约**：必须在 `absorb_messages`（及 zcode 附件第二抽取源）**之后**
+    /// 调用；反序会让相对形态的产物条目与后到的工具条目双行（键口径不同）
+    pub(crate) fn merge_artifact_fallback(
+        &mut self,
+        candidates: &[(String, i64, Option<i64>)],
+        cwd: Option<&str>,
+    ) {
+        // 短路集合必须在循环前一次性快照（本趟自建条目不受短路影响），且**两边同口径**：
+        // index 里的原始键（三池条目按 normalize_key 现算）∪ 既有条目展示路径经
+        // artifact_dedup_key 重算的键——否则「工具侧相对路径 + 正文相对链接」这类
+        // 同形形态会因一边绝对化、一边没绝对化而匹配不上，同一文件出两行
+        let mut preexisting: HashSet<String> = self.index.keys().cloned().collect();
+        for e in &self.out {
+            preexisting.insert(artifact_dedup_key(&e.path, cwd, self.windows));
+        }
+        for (path, seq, ts) in candidates {
+            let key = artifact_dedup_key(path, cwd, self.windows);
+            if preexisting.contains(&key) {
+                continue;
+            }
+            self.merge_with_key(path, key, *seq, *ts, FileOrigin::SessionArtifact);
+        }
+    }
+
     /// 收官：排序键 = 会话出现序（lastSeq 降序），用户裁决 1；同 seq 保持插入序（稳定）
     pub(crate) fn finish(self) -> Vec<FileEntry> {
         let mut out = self.out;
         out.sort_by_key(|b| std::cmp::Reverse(b.last_seq));
         out
     }
+}
+
+/// 「会话产物」条目存在性过滤（2026-10-13 用户裁决：提取时校验存在）：工具触达
+/// 条目不校验（既有行为不变）；产物条目——绝对路径直接判定，相对路径按会话 cwd
+/// 解析后判定，cwd 不可得（工具未提供）则丢弃（保守：宁可少上墙）。
+/// `exists` 注入缝：测试零真实盘接触。
+///
+/// 原地 `retain` 过滤：保持条目相对顺序（排序由 [`EntryMerger::finish`] 决定，
+/// 过滤不得重排）
+pub(crate) fn filter_artifacts_by_existence(
+    entries: &mut Vec<FileEntry>,
+    cwd: Option<&str>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) {
+    entries.retain(|e| {
+        if e.origin != FileOrigin::SessionArtifact {
+            return true;
+        }
+        let p = std::path::Path::new(e.path.trim());
+        if p.is_absolute() {
+            return exists(p);
+        }
+        match cwd {
+            Some(c) => exists(&std::path::Path::new(c).join(p)),
+            None => false,
+        }
+    });
 }
 
 /// kimi 实测内联附件标记（B1 调研）：`<image path="X">` / `<file path="X">` /
@@ -825,6 +998,127 @@ fn extract_inline_markup_paths(content: &str) -> Vec<String> {
                 }
             }
             from = inner_start + inner_end;
+        }
+    }
+    out
+}
+
+/// 对话正文里的「会话产物」候选（纯函数，2026-10-13 用户裁决）：assistant/user
+/// 正文中 ① markdown 链接 `[文字](路径)` ② 行内反引号 `` `路径` `` 两种定界形态；
+/// 三反引号代码围栏内 **不收**——围栏约束对**两种形态都生效**（裁决 1「围栏不收」
+/// 无形态限定；围栏是命令与路径样串密集区，误收温床）。候选还须
+/// 过 [`is_path_candidate`]（URL/换行/空串排除）与 [`artifact_ext_allowed`]。
+/// 相对路径合法（按会话 cwd 解析，存在性校验在 [`filter_artifacts_by_existence`]）。
+/// 返回 (path, seq, ts) 按消息出现序；单条消息内去重，跨消息去重归 EntryMerger。
+pub(crate) fn extract_artifact_candidates(
+    msgs: &[SessionMessage],
+) -> Vec<(String, i64, Option<i64>)> {
+    let mut out = Vec::new();
+    for m in msgs {
+        if m.kind != "user" && m.kind != "assistant" {
+            continue;
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        for path in scan_prose_paths(&m.content) {
+            if is_path_candidate(&path) && artifact_ext_allowed(&path) && seen.insert(path.clone())
+            {
+                out.push((path, m.seq, m.ts));
+            }
+        }
+    }
+    out
+}
+
+/// 三反引号代码围栏覆盖的字节区间（相对 `content` 的偏移，`[start, end)`）：
+/// 开启围栏那一行的**行首字节** → 闭合围栏那一行的**行尾字节**（不含行尾换行）；
+/// 未闭合围栏则一路到 `content` 末尾（与反引号趟「未闭合则其后全算围栏内」一致）。
+/// 已知边界（2026-10-13 用户裁决只提三反引号，不外扩）：`~~~` 波浪围栏与
+/// 4 空格缩进代码块**不**计入围栏判定。
+///
+/// 偏移一律以 `content` 的**绝对字节偏移**推进（`find('\n')` 累加行首下标），
+/// 不经 `lines()`——真实漂移源有二：① CRLF 行尾（`lines()` 剥掉 `\r`，按
+/// `len() + 1` 累加会逐行少算 1 字节）；② 末行无换行（`lines()` 不多出该行，
+/// 却仍按 `+ 1` 计会多算 1 字节）。多字节字符**不**造成错位：`.len()` 本就是
+/// 字节长度，且围栏判定只看行首前缀、行区间只由换行符字节（单字节 ASCII）切分，
+/// 中文行（如 `# 报告`）照常正确。
+fn fence_ranges(content: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut line_start = 0usize;
+    while line_start <= content.len() {
+        let line_end = match content[line_start..].find('\n') {
+            Some(i) => line_start + i,
+            None => content.len(),
+        };
+        if content[line_start..line_end]
+            .trim_start()
+            .starts_with("```")
+        {
+            match open {
+                None => open = Some(line_start),
+                Some(s) => {
+                    out.push((s, line_end));
+                    open = None;
+                }
+            }
+        }
+        if line_end == content.len() {
+            break;
+        }
+        line_start = line_end + 1; // 跳过 '\n'（单字节）
+    }
+    if let Some(s) = open {
+        out.push((s, content.len()));
+    }
+    out
+}
+
+/// 单条正文的两形态扫描（纯字符串）：① markdown 链接逐个 `](` 定界、读到下一个
+/// `)`（路径含 `(` 的罕见形态会截断，截断串过不了候选判定，宁缺勿错）；`#` 开头
+/// 为页内锚点跳过；② 行内反引号按行扫描，``` 围栏行切换围栏态（围栏内整行跳过），
+/// 非围栏行内逐对 `...` 取内容。
+///
+/// 围栏约束对**两形态都生效**（2026-10-13 用户裁决：裁决 1「围栏不收」无形态限定）：
+/// 形态 ① 由 [`fence_ranges`] 的字节区间判定候选起点是否落在围栏内，形态 ② 沿用
+/// 行式围栏态。未闭合围栏的两种口径一致（其后全算围栏内）。已知边界：`~~~` 波浪
+/// 围栏与 4 空格缩进代码块不在围栏判定内。
+fn scan_prose_paths(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let fences = fence_ranges(content);
+    let mut from = 0;
+    while let Some(i) = content[from..].find("](") {
+        let start = from + i + 2;
+        let Some(end_rel) = content[start..].find(')') else {
+            break;
+        };
+        // 候选起点（`](` 的 `]` 处绝对偏移）落在围栏区间内 → 不收
+        let in_fence = fences.iter().any(|&(s, e)| from + i >= s && from + i < e);
+        let cand = content[start..start + end_rel].trim();
+        if !in_fence && !cand.is_empty() && !cand.starts_with('#') {
+            out.push(cand.to_string());
+        }
+        from = start + end_rel;
+    }
+    let mut fenced = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(a) = rest.find('`') {
+            let after = &rest[a + 1..];
+            let Some(b) = after.find('`') else {
+                break;
+            };
+            let inner = after[..b].trim();
+            if !inner.is_empty() {
+                out.push(inner.to_string());
+            }
+            rest = &after[b + 1..];
         }
     }
     out
@@ -878,17 +1172,21 @@ fn is_path_candidate(s: &str) -> bool {
     s.contains('/') || s.contains('\\') || has_ext_like(s)
 }
 
+/// 末段的 (词干, 扩展名)（按 `/` `\` 切末段后取最后一个 `.`；`.` 前为空不算，
+/// 如 `.ssh`）；无 `.` → None。[`has_ext_like`] 与 [`artifact_ext_allowed`] 共用的
+/// 切分口径（两处曾各写一份，语义漂移温床）
+fn last_segment_ext(s: &str) -> Option<(&str, &str)> {
+    let last = s.rsplit(['/', '\\']).next().unwrap_or(s);
+    last.rsplit_once('.').filter(|(stem, _)| !stem.is_empty())
+}
+
 /// 形如带扩展名的文件名：末段含 `.字母数字后缀`（1-12 位）。
 /// 让 "README.md" / "Cargo.toml" 这类裸文件名也算候选（read_file_safe 会按
 /// 会话 cwd 解析相对路径）
 fn has_ext_like(s: &str) -> bool {
-    let last = s.rsplit(['/', '\\']).next().unwrap_or(s);
-    match last.rsplit_once('.') {
-        Some((stem, ext)) => {
-            !stem.is_empty()
-                && !ext.is_empty()
-                && ext.len() <= 12
-                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+    match last_segment_ext(s) {
+        Some((_, ext)) => {
+            !ext.is_empty() && ext.len() <= 12 && ext.chars().all(|c| c.is_ascii_alphanumeric())
         }
         None => false,
     }
@@ -1417,6 +1715,9 @@ mod tests {
     #[test]
     fn mime_from_ext_covers_brief_list_and_falls_back() {
         assert_eq!(mime_from_ext("md"), "text/markdown");
+        // 2026-10-13 质量评审 Important 2：白名单收了 .markdown，mime 表却只认 md，
+        // 导致 .markdown 产物回落 text/plain（前端 showMarkdown 读载荷 mime 字段）
+        assert_eq!(mime_from_ext("markdown"), "text/markdown");
         assert_eq!(mime_from_ext("rs"), "text/rust");
         assert_eq!(mime_from_ext("ts"), "text/typescript");
         assert_eq!(mime_from_ext("tsx"), "text/typescript");
@@ -1431,10 +1732,58 @@ mod tests {
         assert_eq!(mime_from_ext("toml"), "text/toml");
         assert_eq!(mime_from_ext("yaml"), "text/yaml");
         assert_eq!(mime_from_ext("yml"), "text/yaml");
+        // 会话产物批（2026-10-13）：html/htm 此前在 mime 表漏注册（事实），本轮补上
+        // text/html。前端 html 沙箱分支按**扩展名**判定（FilePreview.tsx 的 segKind），
+        // 不读 mime；注册的实际作用面是预览载荷（GET /m/api/v1/file，JSON
+        // {content, mime, size}）的 mime 字段与前端测试夹具口径
+        assert_eq!(mime_from_ext("html"), "text/html");
+        assert_eq!(mime_from_ext("htm"), "text/html");
         assert_eq!(mime_from_ext(""), "text/plain");
         assert_eq!(mime_from_ext("unknownxyz"), "text/plain");
         // 大写扩展名（IMG.PNG 实测形态）不误判为文本
         assert_eq!(mime_from_ext("PNG"), "image/png");
+    }
+
+    /// 产物扩展名白名单（纯函数）：可预览类放行、二进制交换格式与无扩展名拒绝、
+    /// 大小写不敏感（Windows 实测形态 .MD）
+    #[test]
+    fn artifact_ext_allowlist_filters_previewable_kinds_only() {
+        assert!(artifact_ext_allowed("C:/u/report.md"));
+        assert!(artifact_ext_allowed("C:/u/chart.svg"));
+        assert!(artifact_ext_allowed("C:/u/data.csv"));
+        assert!(artifact_ext_allowed("C:/u/page.HTML"), "大小写不敏感");
+        assert!(
+            !artifact_ext_allowed("C:/u/report.pdf"),
+            "二进制交换格式暂不上"
+        );
+        assert!(!artifact_ext_allowed("C:/u/archive.xlsx"));
+        assert!(!artifact_ext_allowed("C:/u/noext"), "无扩展名不是产物候选");
+        assert!(
+            !artifact_ext_allowed("https://x.com/a.md"),
+            "URL 候选由 is_path_candidate 排除，白名单双保险"
+        );
+        // Windows 原生分隔符形态：本批黄金案例（报告产物）就是反斜杠路径，
+        // rsplit 双分隔符分支此前零断言
+        assert!(
+            artifact_ext_allowed(r"C:\Users\u\Desktop\报告.md"),
+            "Windows 原生分隔符形态"
+        );
+        assert!(artifact_ext_allowed("C:/u/mod.mjs"));
+        assert!(artifact_ext_allowed("C:/u/main.cc"));
+        assert!(artifact_ext_allowed("C:/u/lib.hpp"));
+
+        // 漂移锁：mime 表已知扩展必须全部在白名单内（两表同文件却各自手写，
+        // 靠人眼维护必然漂移——评审 Important 1 的根因）
+        for ext in [
+            "md", "markdown", "html", "htm", "rs", "ts", "tsx", "js", "mjs", "cjs", "jsx", "py",
+            "go", "java", "c", "h", "cpp", "cc", "hpp", "css", "sh", "toml", "yaml", "yml", "json",
+            "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico",
+        ] {
+            assert!(
+                artifact_ext_allowed(&format!("C:/u/x.{ext}")),
+                "mime 表扩展名 {ext} 未进白名单（漂移）"
+            );
+        }
     }
 
     // ==== path_within_semantics（Windows 语义注入，darwin 全分支可测）====
@@ -1713,6 +2062,7 @@ mod tests {
     }
 
     /// FileEntry 新增 modified 的 camelCase 序列化契约 + M5 B2 origin snake_case
+    /// （2026-10-13 扩为**四池线缆值全锁**）
     #[test]
     fn file_entry_serializes_modified_flag() {
         let e = FileEntry {
@@ -1730,6 +2080,21 @@ mod tests {
             Some("tool_write"),
             "origin 序列化为 snake_case（移动端来源筛选值域）"
         );
+        // 第四池线缆契约锁（2026-10-13 最终评审批次）：前端 originLabel / 来源筛选档
+        // 按 snake_case 值对接——改名会让徽标静默显示裸 key、筛选档直接筛空。
+        // 与 mime 表「漂移回归锁」同类风险，本批此前只锁了后者
+        for (origin, wire) in [
+            (FileOrigin::User, "user"),
+            (FileOrigin::ToolRead, "tool_read"),
+            (FileOrigin::ToolWrite, "tool_write"),
+            (FileOrigin::SessionArtifact, "session_artifact"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(origin).unwrap(),
+                serde_json::json!(wire),
+                "FileOrigin 线缆值改了？前端筛选档与徽标文案必须同批更新"
+            );
+        }
     }
 
     /// M3+ 归一化比较键去重：`\`→`/`；Windows 语义（参数注入）再小写。
@@ -1802,7 +2167,8 @@ mod tests {
         assert_eq!(v.get("origin").and_then(|s| s.as_str()), Some("tool_read"));
     }
 
-    // ==== M5 B2：来源三池（user / tool_read / tool_write）====
+    // ==== M5 B2：来源池（user / tool_read / tool_write；第四池
+    // session_artifact 见下方 B3 分节）====
 
     /// 工具读写 → origin 推导：写类工具 ToolWrite+modified、读类工具 ToolRead
     #[test]
@@ -1839,6 +2205,443 @@ mod tests {
         );
     }
 
+    /// 会话产物候选扫描（黄金案例合成等价形态）：① markdown 链接与行内反引号
+    /// 两种定界形态都收（assistant 与 user 正文同权）；② 三反引号围栏内不收；
+    /// ③ URL/锚点/白名单外扩展排除；④ tool-call 消息不参与（其路径走既有六键面）
+    #[test]
+    fn artifact_candidates_scan_links_inline_backticks_and_skip_fences() {
+        // ① markdown 链接（绝对路径）
+        let link = text_msg(
+            "assistant",
+            "文件在 [报告](C:/Users/u/Desktop/公司/报告.md) 里。",
+        );
+        // ② 行内反引号
+        let tick = text_msg(
+            "assistant",
+            "在这里：`C:/Users/u/Desktop/公司/报告.md` 打开即可。",
+        );
+        // 围栏内路径样串不收（反引号与 markdown 链接**两形态都受围栏约束**，
+        // 2026-10-13 用户裁决：裁决 1「围栏不收」无形态限定）
+        let fenced = text_msg(
+            "assistant",
+            "命令如下：\n```bash\ncat /tmp/proj/leak.md\n`/tmp/proj/fenced-leak.md`\n[示例](docs/fenced-leak.md)\n```\n产物在 `out/summary.json`。",
+        );
+        // CRLF + 末行无换行（评审 Important 1 的回归牙齿）：Windows 实测正文常为
+        // CRLF；围栏区间判定按字节偏移实现，若未来重构回 lines() 式逐行偏移累加
+        // （offset 不含 \r 所致错位——18376e45 更正过的漂移源），本用例必红
+        let fenced_crlf = text_msg(
+            "assistant",
+            "命令如下：\r\n```bash\r\n[示例](docs/crlf-leak.md)\r\n```",
+        );
+        // URL 与锚点排除
+        let url = text_msg(
+            "assistant",
+            "见 [文档](https://example.com/a.md) 与 [章节](#intro)",
+        );
+        // 白名单外扩展
+        let pdf = text_msg("assistant", "报告在 [原件](C:/u/原件.pdf)");
+        // user 正文同权
+        let user = text_msg("user", "结果在 [输出](./out/data.json)");
+        // tool-call 消息不参与
+        let tool = tool_call(r#"{"cmd":"cat /tmp/proj/leak.md"}"#);
+
+        let paths = |msgs: &[SessionMessage]| -> Vec<String> {
+            extract_artifact_candidates(msgs)
+                .into_iter()
+                .map(|(p, _, _)| p)
+                .collect()
+        };
+        assert_eq!(
+            paths(std::slice::from_ref(&link)),
+            vec!["C:/Users/u/Desktop/公司/报告.md".to_string()]
+        );
+        assert_eq!(
+            paths(std::slice::from_ref(&tick)),
+            vec!["C:/Users/u/Desktop/公司/报告.md".to_string()]
+        );
+        assert_eq!(
+            paths(std::slice::from_ref(&fenced)),
+            vec!["out/summary.json".to_string()],
+            "围栏内不收（两形态）；围栏外行内反引号照收"
+        );
+        assert!(
+            paths(std::slice::from_ref(&fenced_crlf)).is_empty(),
+            "CRLF 行尾 + 末行无换行的闭合围栏：围栏内链接同样不收（评审 Important 1 牙齿）"
+        );
+        assert!(
+            paths(std::slice::from_ref(&url)).is_empty(),
+            "URL 与锚点排除"
+        );
+        assert!(
+            paths(std::slice::from_ref(&pdf)).is_empty(),
+            "白名单外扩展排除"
+        );
+        assert_eq!(
+            paths(std::slice::from_ref(&user)),
+            vec!["./out/data.json".to_string()],
+            "user 正文同权（cwd 相对路径）"
+        );
+        assert!(
+            paths(std::slice::from_ref(&tool)).is_empty(),
+            "tool-call 不参与"
+        );
+    }
+
+    /// 候选闸门牙齿（2026-10-13 评审补强）：① 内层含换行的链接只被
+    /// `is_path_candidate` 拦下（既有用例里该判据被 `artifact_ext_allowed`
+    /// 的 URL 双保险遮蔽，删掉调用仍绿）；② 单条消息内同路径两形态只记一次
+    /// （`seen` 去重分支此前零覆盖）
+    #[test]
+    fn artifact_candidates_reject_inner_newline_and_dedup_within_message() {
+        let wrapped = text_msg("assistant", "见 [x](dir\nname.md) 说明");
+        let dup = text_msg("assistant", "[报告](a/b.md) 与 `a/b.md` 是同一文件");
+        let paths = |msgs: &[SessionMessage]| -> Vec<String> {
+            extract_artifact_candidates(msgs)
+                .into_iter()
+                .map(|(p, _, _)| p)
+                .collect()
+        };
+        assert!(
+            paths(std::slice::from_ref(&wrapped)).is_empty(),
+            "内层含换行的链接被 is_path_candidate 拦下"
+        );
+        assert_eq!(
+            paths(std::slice::from_ref(&dup)),
+            vec!["a/b.md".to_string()],
+            "单条消息内同路径两形态只记一次"
+        );
+    }
+
+    // ==== M5 B3：会话产物兜底合并（第四池，2026-10-13 用户裁决）====
+
+    /// 兜底合并（2026-10-13 用户裁决）：正文候选命中既有池的键 → **整体跳过**
+    /// （不改标、不涨 hits、不挪 lastSeq——既有三池合并结果零变化）；
+    /// 未命中的落 SessionArtifact（rank 最低，modified=false）
+    #[test]
+    fn merge_artifact_fallback_skips_existing_keys_and_fills_new_ones() {
+        let mut merger = EntryMerger::new(false);
+        // 既有池：工具写 + 用户上传
+        merger.absorb_messages(&[tool_call(r#"{"file_path":"/p/edited.rs"}"#), {
+            let mut m = text_msg("user", "上传了 `<file path=\"/p/upload.png\">`");
+            m.content = "<file path=\"/p/upload.png\">".into();
+            m
+        }]);
+        // 既有条目快照（hits / lastSeq / origin 三者全锁）
+        let snap = |m: &EntryMerger| -> Vec<(String, usize, i64, FileOrigin)> {
+            m.out
+                .iter()
+                .map(|e| (e.path.clone(), e.hits, e.last_seq, e.origin))
+                .collect()
+        };
+        let before = snap(&merger);
+        // 正文候选：两个既有文件（工具写 + 用户上传，都要跳过）+ 一个纯正文路径（落新池）
+        // cwd=None（本轮新增第二参）：夹具全为绝对形态，绝对化与否键相同
+        merger.merge_artifact_fallback(
+            &[
+                ("/p/upload.png".to_string(), 9, Some(900)),
+                ("/p/edited.rs".to_string(), 9, Some(900)),
+                ("/p/generated-report.md".to_string(), 9, Some(900)),
+            ],
+            None,
+        );
+        // 既有条目零变化：只比对**合并前就存在**的条目（兜底合并会追加新条目，
+        // 直接整体比较会因长度不等而假红）
+        let after: Vec<(String, usize, i64, FileOrigin)> = snap(&merger)
+            .into_iter()
+            .filter(|(p, ..)| before.iter().any(|(bp, ..)| bp == p))
+            .collect();
+        assert_eq!(
+            before, after,
+            "命中既有键的候选整体跳过（hits 不涨、lastSeq 不挪、origin 不改）"
+        );
+        assert_eq!(
+            merger.out.len(),
+            before.len() + 1,
+            "只有未命中既有池的候选落新池（不重复建行）"
+        );
+        let edited = merger
+            .out
+            .iter()
+            .find(|e| e.path == "/p/edited.rs")
+            .unwrap();
+        assert_eq!(edited.origin, FileOrigin::ToolWrite, "工具亲手写过不改标");
+        // user 池命中同样整体跳过（hits 不涨——与 tool_write 池同一红线）
+        assert_eq!(
+            merger
+                .out
+                .iter()
+                .find(|e| e.path == "/p/upload.png")
+                .unwrap()
+                .hits,
+            1,
+            "user 池命中不改 hits"
+        );
+        // 新路径落会话产物池
+        let artifact = merger
+            .out
+            .iter()
+            .find(|e| e.path == "/p/generated-report.md")
+            .unwrap();
+        assert_eq!(artifact.origin, FileOrigin::SessionArtifact);
+        assert_eq!(artifact.last_seq, 9);
+        assert!(!artifact.modified, "产物条目不是工具改写");
+        // 空候选批次零副作用（防御：无候选不得 panic / 不得动 out）
+        merger.merge_artifact_fallback(&[], None);
+        assert_eq!(merger.out.len(), before.len() + 1, "空候选批次零副作用");
+    }
+
+    /// 产物池自身的重复语义（2026-10-13 用户裁决）：同一路径在正文里重复提及
+    /// → 只建一行、hits 累加、lastSeq/ts 取**最后一次**出现（与 FileEntry 字段
+    /// 契约一致）；「调用前已存在的键」短路不受此影响
+    #[test]
+    fn merge_artifact_fallback_duplicate_candidates_take_last_occurrence() {
+        let mut merger = EntryMerger::new(false);
+        merger.merge_artifact_fallback(
+            &[
+                ("/p/dup.md".to_string(), 3, Some(300)),
+                ("/p/dup.md".to_string(), 9, Some(900)),
+            ],
+            None,
+        );
+        assert_eq!(merger.out.len(), 1, "同路径只建一行");
+        assert_eq!(merger.out[0].hits, 2);
+        assert_eq!(merger.out[0].last_seq, 9, "取最后一次出现的 seq");
+        assert_eq!(merger.out[0].last_ts, Some(900));
+        assert_eq!(merger.out[0].origin, FileOrigin::SessionArtifact);
+        assert!(!merger.out[0].modified);
+    }
+
+    /// 来源优先级锁定（2026-10-13 评审补强）：产物池先落行后，工具/用户池再次
+    /// 命中同一路径必须**改标为更高优先级的池**——本用例锁 rank 取值为最小
+    /// （`merge` 用严格 `>` 比较，SessionArtifact 的 rank 必须是 0，否则本条即红）
+    #[test]
+    fn session_artifact_rank_is_lowest_than_existing_pools() {
+        let mut merger = EntryMerger::new(false);
+        merger.merge_artifact_fallback(&[("/p/up.md".to_string(), 1, Some(100))], None);
+        // user 正文内联附件标记命中同一路径
+        let mut m = text_msg("user", "");
+        m.content = "<file path=\"/p/up.md\">".into();
+        m.seq = 5;
+        merger.absorb_messages(&[m]);
+        let e = merger.out.iter().find(|e| e.path == "/p/up.md").unwrap();
+        assert_eq!(e.origin, FileOrigin::User, "更高优先级的池命中要改标");
+        assert_eq!(e.hits, 2, "跨池命中累加 hits");
+        assert_eq!(e.last_seq, 5);
+    }
+
+    /// 顺序补强（2026-10-13 评审）：**先** user 池建行、**后**兜底同路径候选 →
+    /// 既有键短路（origin 保持 User、hits 仍为 1、lastSeq 不被挪到候选 seq）。
+    /// 与上一用例（产物先落行 → 既有池改标）构成两个方向，锁死短路只认「调用前」集合
+    #[test]
+    fn merge_artifact_fallback_keeps_user_entry_created_before_it() {
+        let mut merger = EntryMerger::new(false);
+        let mut m = text_msg("user", "");
+        m.content = "<file path=\"/p/up.md\">".into();
+        m.seq = 3;
+        merger.absorb_messages(&[m]);
+        merger.merge_artifact_fallback(&[("/p/up.md".to_string(), 9, Some(900))], None);
+        assert_eq!(merger.out.len(), 1, "同路径不重复建行");
+        let e = &merger.out[0];
+        assert_eq!(e.origin, FileOrigin::User, "既有池命中不改标");
+        assert_eq!(e.hits, 1, "既有键短路：兜底候选不涨 hits");
+        assert_eq!(e.last_seq, 3, "既有键短路：lastSeq 不被挪到候选 seq");
+    }
+
+    /// 同一物理文件不因「绝对/相对」两形态出两行（2026-10-13 用户裁决）：
+    /// ① 工具触达（绝对路径）已存在 → 正文相对链接候选整体跳过（既有池零变化）；
+    /// ② 产物池内相对 + 绝对两形态只落一行，展示用最后一次出现的原文形态；
+    /// ③ cwd 不可得时无法绝对化对齐 → 仍是两行（保守口径，不猜不误合）；
+    /// ④⑤ `.` 段词法归一缺口（2026-10-13 补齐）：正文 `./out/x.md` 这种常见形态
+    /// 与工具侧绝对路径／与无前缀相对形态必须同键（字面拼接绝对化会留下 `.` 段 → 仍两行）；
+    /// ⑥⑦ **键口径回归**（2026-10-13 复审）：工具侧本身写**相对**路径时，短路集合
+    /// （取自 index 原始键，由 `normalize_key` 现算、从不绝对化）与候选键（绝对化）
+    /// 不同口径 → 同一字符串出两行。相对工具路径是受支持形态（见
+    /// `extract_accepts_relative_paths_and_bare_filenames_with_ext`），故必须两侧对齐
+    #[test]
+    fn merge_artifact_fallback_dedups_relative_and_absolute_forms() {
+        let cwd = if cfg!(windows) { "C:/w" } else { "/w" };
+        let abs = if cfg!(windows) {
+            "C:/w/out/report.md"
+        } else {
+            "/w/out/report.md"
+        };
+        // ① 工具参数写绝对路径（ToolWrite），正文用相对链接
+        let mut merger = EntryMerger::new(false);
+        merger.absorb_messages(&[tool_call(&format!(r#"{{"file_path":"{abs}"}}"#))]);
+        merger.merge_artifact_fallback(&[("out/report.md".to_string(), 9, Some(900))], Some(cwd));
+        assert_eq!(merger.out.len(), 1, "同一物理文件不得出两行");
+        assert_eq!(
+            merger.out[0].origin,
+            FileOrigin::ToolWrite,
+            "工具触达不改标"
+        );
+        assert_eq!(merger.out[0].path, abs, "展示保留工具侧原文");
+        // ② 产物池内相对 + 绝对两形态
+        let mut merger = EntryMerger::new(false);
+        merger.merge_artifact_fallback(
+            &[
+                ("out/report.md".to_string(), 3, Some(300)),
+                (abs.to_string(), 9, Some(900)),
+            ],
+            Some(cwd),
+        );
+        assert_eq!(merger.out.len(), 1, "产物池内同物理文件只落一行");
+        assert_eq!(merger.out[0].hits, 2);
+        assert_eq!(merger.out[0].last_seq, 9, "取最后一次出现的 seq");
+        assert_eq!(merger.out[0].path, abs, "展示用最后一次出现的原文形态");
+        // ③ cwd 不可得：两种形态各自成行（本批保守口径，仅记录现状）。
+        // 注：这是 **merger 级**契约，不等于面板行为——真实链路里相对形态的产物条目
+        // 会被 `filter_artifacts_by_existence` 丢弃（相对路径 + cwd 不可得 → 丢），
+        // 故面板实为一行。勿把本条读成端到端结果
+        let mut merger = EntryMerger::new(false);
+        merger.merge_artifact_fallback(
+            &[
+                ("out/report.md".to_string(), 3, Some(300)),
+                (abs.to_string(), 9, Some(900)),
+            ],
+            None,
+        );
+        assert_eq!(merger.out.len(), 2, "cwd 不可得时不猜（保守）");
+        // ④ 工具侧绝对路径 + 正文 `./` 相对链接（计划自身夹具形态）
+        let mut merger = EntryMerger::new(false);
+        merger.absorb_messages(&[tool_call(&format!(r#"{{"file_path":"{abs}"}}"#))]);
+        merger.merge_artifact_fallback(&[("./out/report.md".to_string(), 9, Some(900))], Some(cwd));
+        assert_eq!(merger.out.len(), 1, "`./` 前缀必须归一（正文常见形态）");
+        assert_eq!(
+            merger.out[0].origin,
+            FileOrigin::ToolWrite,
+            "工具触达不改标"
+        );
+        assert_eq!(
+            merger.out[0].path, abs,
+            "展示保留工具侧原文（相对形态不上墙）"
+        );
+        // ⑤ 产物池内 `./out/x.md` 与 `out/x.md` 两形态：一行、hits 2、展示取最后一次原文形态
+        let mut merger = EntryMerger::new(false);
+        merger.merge_artifact_fallback(
+            &[
+                ("out/report.md".to_string(), 3, Some(300)),
+                ("./out/report.md".to_string(), 9, Some(900)),
+            ],
+            Some(cwd),
+        );
+        assert_eq!(merger.out.len(), 1, "产物池内 `./` 形态同一文件只落一行");
+        assert_eq!(merger.out[0].hits, 2);
+        assert_eq!(merger.out[0].last_seq, 9, "取最后一次出现的 seq");
+        assert_eq!(
+            merger.out[0].path, "./out/report.md",
+            "展示取最后一次出现的原文形态（不被词法键改写）"
+        );
+        // ⑥ 工具侧**相对**路径 + 正文相对链接：同形必须只出一行（键口径两侧对齐）
+        let mut merger = EntryMerger::new(false);
+        merger.absorb_messages(&[tool_call(r#"{"file_path":"out/report.md"}"#)]);
+        merger.merge_artifact_fallback(&[("out/report.md".to_string(), 9, Some(900))], Some(cwd));
+        assert_eq!(merger.out.len(), 1, "工具相对路径 + 正文相对链接不得出两行");
+        assert_eq!(
+            merger.out[0].origin,
+            FileOrigin::ToolWrite,
+            "工具触达不改标"
+        );
+        assert_eq!(merger.out[0].hits, 1, "既有条目不得被正文提及干扰 hits");
+        // 既有条目零变化（相对形态路径上的直接证据）：展示形态 / lastSeq / ts 均不得
+        // 被候选挪动（`tool_call` 构造器 seq=1、ts=Some(1)）——短路是「整体跳过」
+        assert_eq!(
+            merger.out[0].path, "out/report.md",
+            "既有条目展示形态零变化"
+        );
+        assert_eq!(merger.out[0].last_seq, 1, "既有条目 lastSeq 不得被候选挪动");
+        assert_eq!(merger.out[0].last_ts, Some(1), "既有条目 ts 不得被候选挪动");
+        // ⑦ 工具侧 `./` 形态 + 正文 `./` 形态
+        let mut merger = EntryMerger::new(false);
+        merger.absorb_messages(&[tool_call(r#"{"file_path":"./out/report.md"}"#)]);
+        merger.merge_artifact_fallback(&[("./out/report.md".to_string(), 9, Some(900))], Some(cwd));
+        assert_eq!(
+            merger.out.len(),
+            1,
+            "工具 `./` 形态 + 正文 `./` 形态不得出两行"
+        );
+        assert_eq!(merger.out[0].hits, 1);
+        assert_eq!(
+            merger.out[0].origin,
+            FileOrigin::ToolWrite,
+            "工具触达不改标"
+        );
+        assert_eq!(
+            merger.out[0].path, "./out/report.md",
+            "既有条目展示形态零变化（不被 `./` 词法键改写）"
+        );
+        assert_eq!(merger.out[0].last_seq, 1, "既有条目 lastSeq 不得被候选挪动");
+    }
+
+    /// `.` 段词法归一（2026-10-13 补齐）：`./out/x.md` 与 `out/x.md`、与工具侧
+    /// 绝对路径必须是同一个键；`..` 段不解析（保守边界，不触盘）。
+    /// 注：std 的 `components()` 只归一**非行首**的 `.` 段（`./a/b` 比 `a/b` 多一个
+    /// CurDir 组件，`Path::new(".").components()` 也非空）——行首 CurDir 需显式滤掉，
+    /// 见 `artifact_dedup_key` 实现注释；本用例锁死该口径
+    #[test]
+    fn artifact_dedup_key_drops_dot_segments_but_keeps_parent_dir() {
+        let cwd = if cfg!(windows) { "C:/w" } else { "/w" };
+        let abs = if cfg!(windows) {
+            "C:/w/out/report.md"
+        } else {
+            "/w/out/report.md"
+        };
+        assert_eq!(
+            artifact_dedup_key("./out/report.md", Some(cwd), false),
+            artifact_dedup_key(abs, Some(cwd), false),
+            "`./` 前缀必须归一（正文常见形态，与工具侧绝对路径同键）"
+        );
+        assert_eq!(
+            artifact_dedup_key("out/report.md", Some(cwd), false),
+            artifact_dedup_key("./out/report.md", Some(cwd), false),
+            "有 cwd 时 `./x` 与 `x` 同键"
+        );
+        assert_eq!(
+            artifact_dedup_key("out/report.md", None, false),
+            "out/report.md",
+            "cwd 不可得 → 退回原文归一化键（不猜）"
+        );
+        assert_eq!(
+            artifact_dedup_key("./out/report.md", None, false),
+            artifact_dedup_key("out/report.md", None, false),
+            "无 cwd 时 `./` 前缀同样归一（行首 CurDir 显式丢弃）"
+        );
+        assert_eq!(
+            artifact_dedup_key("./out/./report.md", Some(cwd), false),
+            artifact_dedup_key("out//report.md", Some(cwd), false),
+            "中间 `.` 段与重复分隔符一并归一"
+        );
+        assert_ne!(
+            artifact_dedup_key("out/../out/report.md", Some(cwd), false),
+            artifact_dedup_key("out/report.md", Some(cwd), false),
+            "`..` 段不解析（词法规范化保守边界，不猜）"
+        );
+        // Windows 语义（生产 cfg!(windows)=true）：小写归一 + 分隔符归一
+        assert_eq!(
+            artifact_dedup_key("C:/W/Out/Report.MD", Some("C:/w"), true),
+            "c:/w/out/report.md",
+            "Windows 语义下大小写/分隔符/盘符风格归一"
+        );
+        // 空键守卫：词法规范化后无组件的退化输入（空串 / 只由 `.` 构成）各留各的
+        // 原文键，不塌缩成同一个空键（生产候选过不了 `is_path_candidate` +
+        // `artifact_ext_allowed`，到不了这里；此为纵深防御）
+        assert_eq!(
+            artifact_dedup_key(".", None, false),
+            ".",
+            "退化输入 `.` 单点：退回原文键，不产出空键"
+        );
+        assert_eq!(
+            artifact_dedup_key("", None, false),
+            "",
+            "空串退回原文键（空键仅此一态，不与 `.` 误合）"
+        );
+        assert_ne!(
+            artifact_dedup_key("", None, false),
+            artifact_dedup_key(".", None, false),
+            "两个不同的退化原文形态不得误合"
+        );
+    }
+
     /// 同一文件多来源：上传（user）后被工具改写（tool_write）→ 取信息量最大者
     #[test]
     fn merged_origin_takes_highest_priority() {
@@ -1851,6 +2654,154 @@ mod tests {
         assert_eq!(entries[0].origin, FileOrigin::ToolWrite);
         assert!(entries[0].modified);
         assert_eq!(entries[0].hits, 2);
+    }
+
+    // ==== Task 5：会话产物存在性过滤 + 总接线（2026-10-13 用户裁决）====
+
+    /// 会话产物存在性过滤（2026-10-13 用户裁决）：工具触达条目不校验；产物条目
+    /// 绝对路径直接 stat、相对路径按 cwd 解析、cwd 不可得则丢弃（保守）。
+    /// `exists` 注入缝：零真实盘接触
+    #[test]
+    fn filter_artifacts_by_existence_keeps_tool_entries_and_resolves_cwd_relative() {
+        // Windows 的绝对路径必须有盘符前缀（`/p/x` 在 Windows 上 is_absolute()==false），
+        // 夹具按平台取根，保证两平台语义一致；`exists` 按 `/` 归一化比较分隔符
+        // （PathBuf::join 在 Windows 上插 `\`）
+        let (root, cwd) = if cfg!(windows) {
+            ("C:/p", "C:/w")
+        } else {
+            ("/p", "/w")
+        };
+        let mk = |path: &str, origin: FileOrigin| FileEntry {
+            path: path.into(),
+            last_seq: 1,
+            last_ts: None,
+            hits: 1,
+            modified: origin == FileOrigin::ToolWrite,
+            origin,
+        };
+        let edited = format!("{root}/edited.rs");
+        let live = format!("{root}/live.md");
+        let gone = format!("{root}/gone.md");
+        let joined = format!("{cwd}/out/data.json");
+        let mut entries = vec![
+            mk(&edited, FileOrigin::ToolWrite), // 工具触达：不校验（假路径也留）
+            mk(&live, FileOrigin::SessionArtifact), // 绝对路径：exists=true 留
+            mk(&gone, FileOrigin::SessionArtifact), // 绝对路径：exists=false 丢
+            mk("out/data.json", FileOrigin::SessionArtifact), // 相对路径：cwd 拼接后 exists
+            mk("out/lost.json", FileOrigin::SessionArtifact), // 相对路径：不存在丢
+        ];
+        // 闭包按值捕获比较串（后续断言仍要用 live，故比较串先行克隆）
+        let (live_cmp, joined_cmp) = (live.clone(), joined.clone());
+        let exists = move |p: &std::path::Path| {
+            let s = p.to_string_lossy().replace('\\', "/");
+            s == live_cmp || s == joined_cmp
+        };
+        filter_artifacts_by_existence(&mut entries, Some(cwd), &exists);
+        let kept: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        assert_eq!(
+            kept,
+            vec![edited, live.clone(), "out/data.json".to_string()],
+            "工具触达不校验；产物按绝对/cwd 相对判定；不存在的产物丢弃（且相对顺序不变）"
+        );
+        // cwd 不可得：相对产物全丢，其余不变
+        let mut entries = vec![
+            mk(&live, FileOrigin::SessionArtifact),
+            mk("out/data.json", FileOrigin::SessionArtifact),
+        ];
+        filter_artifacts_by_existence(&mut entries, None, &|_| true);
+        let kept: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        assert_eq!(kept, vec![live], "cwd 不可得 → 相对产物保守丢弃");
+    }
+
+    /// 端到端牙齿（2026-10-13 评审共同建议）：存在性过滤是「正文候选兜底」的唯一
+    /// 防线——本用例走**真实提取链路**（codex rollout fixture → content 层统一出口
+    /// → 提取 → 兜底合并 → 过滤），夹具形态对齐 extract_chain_codex_*。
+    /// 生产路径不注入 exists（真实 `Path::exists()`），故用 tempdir 里真实
+    /// 创建/不创建文件区分两态。断言：正文提及但不存在的路径不入池；
+    /// 真实存在的相对路径按 rollout 首行 cwd 解析后以 session_artifact 入池
+    #[test]
+    fn extract_file_paths_filters_artifacts_by_existence_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(cwd.join("out")).unwrap();
+        std::fs::write(cwd.join("out").join("report.md"), "# 报告").unwrap();
+        let dir = tmp.path().join(".codex/sessions/2026/10/13");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join(format!("rollout-2026-10-13T00-00-00-{T9_UUID}.jsonl"));
+        // 首行 session_meta.payload.cwd = tempdir 内的真实目录（相对产物解析基准）；
+        // json! 序列化，Windows 反斜杠由 serde 转义
+        let meta = serde_json::json!({
+            "timestamp": "2026-10-13T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": { "id": T9_UUID, "cwd": cwd.to_string_lossy() },
+        });
+        let user = r#"{"timestamp":"2026-10-13T00:00:05.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"把报告写出来"}]}}"#;
+        // assistant 正文两形态齐出：markdown 链接（真实存在的产物）+ 行内反引号（幽灵路径）
+        let assistant = r#"{"timestamp":"2026-10-13T00:00:10.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"已生成 [报告](out/report.md)；另有 `docs/ghost.md` 未生成"}]}}"#;
+        std::fs::write(&rollout, format!("{meta}\n{user}\n{assistant}\n")).unwrap();
+
+        let entries = extract_file_paths_with(tmp.path(), "codex", T9_UUID, 200).0;
+        assert_eq!(entries.len(), 1, "恰一条：存在的产物入池，幽灵路径被丢");
+        let e = &entries[0];
+        assert_eq!(e.path, "out/report.md", "相对路径按 cwd 解析后判定存在");
+        assert_eq!(e.origin, FileOrigin::SessionArtifact);
+        assert!(!e.modified, "会话产物不是工具改写");
+        assert!(
+            entries.iter().all(|e| e.path != "docs/ghost.md"),
+            "正文提及但不存在 → 不入池（唯一防线端到端牙齿）"
+        );
+    }
+
+    /// 端到端牙齿（2026-10-13 会话产物去重缺陷）：真实链路上「工具参数写**绝对
+    /// 路径** + 正文写**相对链接**」指同一物理文件时只出一行（修复前 count=2：
+    /// 绝对键与相对键匹配不上 → 一行 tool_write + 一行 session_artifact）。
+    /// 夹具形态对齐上一条端到端用例；工具侧来源与绝对原文必须在展示里存活。
+    /// 正文形态取 **`./` 前缀**（计划自身夹具与真实手写习惯的常见形态）——字面拼接
+    /// 绝对化会留下 `.` 段使键对不上，故本用例同时是词法归一的端到端牙齿
+    #[test]
+    fn extract_file_paths_dedups_absolute_tool_path_and_relative_prose_link_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(cwd.join("out")).unwrap();
+        let report = cwd.join("out").join("report.md");
+        std::fs::write(&report, "# 报告").unwrap();
+        let dir = tmp.path().join(".codex/sessions/2026/10/13");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join(format!("rollout-2026-10-13T00-00-00-{T9_UUID}.jsonl"));
+        let meta = serde_json::json!({
+            "timestamp": "2026-10-13T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": { "id": T9_UUID, "cwd": cwd.to_string_lossy() },
+        });
+        // 工具参数：绝对路径（tempdir 内真实创建，Windows 反斜杠由 serde 转义）
+        let call = serde_json::json!({
+            "timestamp": "2026-10-13T00:00:05.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "Write",
+                "arguments": serde_json::json!({ "file_path": report.to_string_lossy() })
+                    .to_string(),
+            },
+        });
+        // 正文：相对链接指同一物理文件（展示形态与工具侧不同，键必须能对上）；
+        // `./` 前缀是真实手写常见形态——词法归一后键才与工具侧绝对路径相等
+        let assistant = r#"{"timestamp":"2026-10-13T00:00:10.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"已写到 [报告](./out/report.md)"}]}}"#;
+        std::fs::write(&rollout, format!("{meta}\n{call}\n{assistant}\n")).unwrap();
+
+        let entries = extract_file_paths_with(tmp.path(), "codex", T9_UUID, 200).0;
+        assert_eq!(
+            entries.len(),
+            1,
+            "同一物理文件不得出两行（工具绝对路径 + 正文相对链接）：{entries:?}"
+        );
+        let e = &entries[0];
+        assert_eq!(e.origin, FileOrigin::ToolWrite, "工具侧来源不改标");
+        assert_eq!(
+            e.path,
+            report.to_string_lossy(),
+            "展示保留工具侧绝对原文（相对形态不上墙）"
+        );
     }
 
     /// kimi 黄金夹具全链：wire 行 → map_kimi_lines → 抽取 → user 来源条目
