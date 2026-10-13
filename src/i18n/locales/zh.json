@@ -48,7 +48,16 @@
     "clearAllConfirm": "确认清空？",
     "clearRead": "清理已读",
     "clearedToast": "通知历史已清空",
-    "readClearedToast": "已读通知已清理"
+    "readClearedToast": "已读通知已清理",
+    "codexTrust": {
+      "title": "Codex 钩子需要信任",
+      "description": "在 Codex 终端输入以下命令并信任 兔维斯 条目（一次性），事件才会触发。",
+      "copy": "复制命令",
+      "never": "不再提醒",
+      "copyFailed": "复制失败，请按上方文本手动输入",
+      "ackFailed": "操作未生效，请重试",
+      "close": "关闭（下次启动再次提醒）"
+    }
   },
   "tray": {
     "show": "显示窗口",
@@ -419,6 +428,7 @@
       "empty": "暂无支持 Hook 通道的工具",
       "loadError": "信号状态加载失败，请刷新重试",
       "statusUnregistered": "未注册",
+      "helperNotShipped": "本平台暂不分发 Hook 通道，无需处理",
       "ok": "正常 · 最近事件 {{ago}}",
       "noActiveSessions": "暂无活跃会话，等待事件",
       "trustNeeded": "需在 {{tool}} 终端输入 /hooks 并信任 兔维斯 条目（一次性）",

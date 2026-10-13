@@ -179,9 +179,10 @@ pub fn run() {
             });
             // M4：全局句柄落位（先于 restore_on_launch——隧道自启即可发通知）
             let _ = crate::remote::events::APP_HANDLE.set(app.handle().clone());
-            // T5：codex 信任门一次性桌面通知——register_all_hooks 在 run() 早期
-            // 执行（彼时 builder 未构建、AppHandle 不可得）只置 pending KV，此处
-            // 句柄就绪后消费：pending 在场才发，一次落地 shown 后永不再弹
+            // T5（2A 改操作卡）：codex 信任门常驻操作卡——register_all_hooks 在
+            // run() 早期执行（彼时 builder 未构建、AppHandle 不可得）只置 pending
+            // KV，此处句柄就绪后消费：pending 且未销账（shown）才弹；销账只发生在
+            // 用户点「复制命令」/「不再提醒」（codex_trust_notice_ack 命令）
             monitor::hooks::consume_codex_trust_notice(app.handle());
             // M2 远程接入：按设置恢复远程服务器（开机自启语义；内部用
             // tauri::async_runtime，无 runtime 上下文的主线程可安全调用）
@@ -215,6 +216,8 @@ pub fn run() {
         // M6R–M9R Task 11：R5 一键 resume（桌面卡「在电脑上打开」）
         commands::session::session_open,
         commands::notification::show_notification_window,
+        // 2A：codex 信任门操作卡销账（前端操作卡按钮 ack）
+        commands::notification::codex_trust_notice_ack,
         commands::pet::set_pet_visible,
         commands::pet::set_pet_always_on_top,
         commands::pet::pet_list_pets,
