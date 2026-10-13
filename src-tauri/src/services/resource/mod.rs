@@ -6,6 +6,21 @@ pub mod reconcile;
 
 use crate::linker;
 
+/// id/name 口径归一（spec §8.1）：extensions 表登记的 skill id/name **恒为斜杠相对路径**。
+/// Windows 下 `scan_skill_dirs`（以及任何从目录派生的相对路径）产出原生 `\`，所有
+/// 「铸 id / 写 name」的点统一过此助手——backfill_registry、scan_native_resources、
+/// import_native_resources 三处共用，杜绝口径漂移（反斜杠 id 与斜杠登记行对不上：
+/// 已注册技能在原生扫描里重复显示为可导入、预设绑定与资源卡片按 id 匹配失效、
+/// 派发拍平按 `/` 拍平而反斜杠名被当成「无嵌套」派出嵌套路径）。
+/// 平台无关：无论跑在哪个平台都归一（与 backfill_registry 既有行为一致）。
+/// 文件系统层的两种形态各归其位：**仓库侧落点恒用斜杠相对路径**（SSOT 嵌套布局即
+/// `repo/<suite>/<skill>`；`install_to_repo` 还显式拒绝含 `\` 的名字，见
+/// `linker/mod.rs`），**扫描侧的原生相对路径**（`scan_native_resources` 的
+/// `dir.join(&name)` 与 source_path）保持原样
+pub fn slash_rel(rel: &str) -> String {
+    rel.replace('\\', "/")
+}
+
 /// 递归扫描目录，找到所有直接包含 SKILL.md 的子目录
 /// 返回相对路径列表（如 "brainstorming", "superpowers/brainstorming"）
 /// 深度上限 4 层，symlink 目录不跟随（防循环）
@@ -643,23 +658,33 @@ pub fn backfill_registry() {
     // 相对路径登记（id/name 均带斜杠路径）；套件目录本身（无 SKILL.md）不入表。
     // 旧实现只扫顶层，嵌套套件永远进不了 extensions 表，还会把套件目录误登记为技能
     let skills = home.join(".tuvis").join("skills");
+    // 存量迁移（2026-10-13 评审跟进 3，简化轮收编为唯一迁移通道）：按 DB 清单把所有
+    // 反斜杠 id 就地迁移为斜杠口径（new_id/new_name 同步取斜杠 rel），**与磁盘目录是否
+    // 存在无关**——skill 目录已删的存量行同样收敛（磁盘扫描永远触达不到它们）。
+    // 清单为空时零动作。曾并存过的逐目录迁移分支是其严格子集（磁盘在 ⊂ DB 清单），
+    // 迁移后恒为 no-op，已删。
+    // 与本函数尾部死行修剪（`source_path` 非空且不存在 → 删行 + 连带清三张引用表）
+    // 的分工：**目录已删**这一场景 prune 同样接管（同一次回填里晚于本步执行），所以本步
+    // 的持久价值不在那儿，而在两处——① `source_path` **为空**的行 prune 显式跳过
+    //（它只对非空路径判存在性），迁移是这些行的唯一出路；② `source_path` **仍有效**的
+    // 行（如原生行指向工具目录，磁盘扫描扫不到、prune 也不删）。以及必须先于下面的
+    // `ensure_extension`（INSERT OR IGNORE 斜杠 id）跑完：晚于它就会出现
+    // 「斜杠新行 + 反斜杠旧行」双登记，而 source_path 有效的旧行 prune 永远不会收拾
+    let moved = crate::database::migrate_backslash_skill_ids();
+    if moved > 0 {
+        log::info!(
+            "回填 skill：存量反斜杠 id 迁移 {} 行（含磁盘已删的存量行）",
+            moved
+        );
+    }
     if skills.is_dir() {
         for rel in scan_skill_dirs(&skills) {
             let path = skills.join(&rel);
             // 登记口径恒为**斜杠**相对路径（见上「id/name 均带斜杠路径」）：
-            // Windows 下 scan_skill_dirs 产出原生 `\`，这里统一转 `/`，保证 id 跨平台一致
-            //（预设绑定/资源卡片按 id 匹配，反斜杠 id 在 macOS 导入的预设里永远对不上）。
-            // 存量旧行（反斜杠 id）就地迁移，避免同一资源双行（斜杠新行 + 反斜杠旧行）
-            let slashed = rel.replace('\\', "/");
-            if slashed != rel {
-                if let Err(err) = crate::database::migrate_legacy_extension_id(
-                    &format!("skill-{}", rel),
-                    &format!("skill-{}", slashed),
-                    &slashed,
-                ) {
-                    log::warn!("回填 skill {} 旧 id 迁移失败: {}", rel, err);
-                }
-            }
+            // Windows 下 scan_skill_dirs 产出原生 `\`，统一过 `slash_rel` 转 `/`，
+            // 保证 id 跨平台一致（预设绑定/资源卡片按 id 匹配，反斜杠 id 在 macOS
+            // 导入的预设里永远对不上）；存量反斜杠行已由上面的清单迁移收敛
+            let slashed = slash_rel(&rel);
             // no-swallowed-errors（评审裁决 3）：回填失败逐条报告，不再吞错
             if let Err(err) = crate::database::ensure_extension(&crate::database::ExtensionRecord {
                 id: format!("skill-{}", slashed),
@@ -1120,5 +1145,32 @@ mod shared_source_import_tests {
 
         assert!(source_counts.contains(&("claude".to_string(), 2)));
         assert!(source_counts.contains(&(AGENTS_SHARED_SOURCE.to_string(), 1)));
+    }
+}
+
+// ---- id/name 口径归一助手（spec §8.1）：平台无关，Windows 形态在 macOS/Linux 上照样可测 ----
+#[cfg(test)]
+mod slash_rel_tests {
+    use super::slash_rel;
+
+    /// Windows 原生相对路径 → 斜杠口径（含多层嵌套）
+    #[test]
+    fn backslash_becomes_slash() {
+        assert_eq!(
+            slash_rel(r"superpowers\brainstorming"),
+            "superpowers/brainstorming"
+        );
+        assert_eq!(slash_rel(r"a\b\c"), "a/b/c");
+    }
+
+    /// 已是斜杠口径 / 顶层平铺名 / 空串 → 原样返回（幂等，不重复改写）
+    #[test]
+    fn slashed_and_plain_names_are_unchanged() {
+        assert_eq!(
+            slash_rel("superpowers/brainstorming"),
+            "superpowers/brainstorming"
+        );
+        assert_eq!(slash_rel("brainstorming"), "brainstorming");
+        assert_eq!(slash_rel(""), "");
     }
 }

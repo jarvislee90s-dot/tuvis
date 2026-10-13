@@ -472,7 +472,7 @@ fn second_round_reports_zero_new_records_for_every_source() {
     // （R-25 补充：Task 20 首跑踩过一次，11.9 s + 脏数据）。
     assert!(
         home.starts_with(std::env::temp_dir()),
-        "安全前提：HOME 必须是 support::setup() 的临时目录，实际 {}",
+        "安全前提：fixture 根必须在本进程 temp 目录下（support::usage_fixture_root()），实际 {}",
         home.display()
     );
     // 两个 env 重定向必须真的指向 fixture 根：删掉 `fixture_home` 里的 `set_var` 就会去读
