@@ -20,6 +20,21 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+/// 应用进程本次运行的稳定标识（进程内恒定、跨进程重启必变；首调时刻的纳秒时间戳）。
+/// 桌宠「物理坠落」按应用重启归位（2026-10-13 用户裁决）：前端启动时拿它比对
+/// localStorage 的运行标记，不一致 ⇒ 新一轮运行 ⇒ gravity 重置为关（会话内可再开）。
+/// 纯进程内时间戳，不落盘。
+#[tauri::command]
+fn app_run_id() -> String {
+    static RUN_ID: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_string())
+            .unwrap_or_default()
+    });
+    RUN_ID.clone()
+}
+
 #[tauri::command]
 fn update_tray_menu(
     app: tauri::AppHandle,
@@ -206,6 +221,8 @@ pub fn run() {
         .plugin(plugins::system_tray::init());
     let builder = builder.invoke_handler(tauri::generate_handler![
         greet,
+        // 物理坠落按应用重启归位的前端运行标记源（见上方 app_run_id 注释）
+        app_run_id,
         update_tray_menu,
         refresh_tray,
         commands::session::get_all_sessions,

@@ -1318,12 +1318,15 @@ mod tests {
             body.contains("<!doctype html>"),
             "/m 应返回入口 HTML，实际 {body:?}"
         );
+        // 锚「远程」而非具体品牌词：移动端标题现为「Tuvis 远程」（df5a7fec 品牌切换），
+        // 桌面 index 标题「Tuvis」不含「远程」——防串台判据不依赖品牌字样，下次微调不脆断
         assert!(
-            body.contains("tuvis"),
-            "入口应是 mobile.html 产物（含品牌标识；标题文案随品牌批在「兔维斯远程/Tuvis 远程」间合法变动，不写死）"
+            body.contains("远程"),
+            "入口应是 mobile.html 产物（含移动端标题）"
         );
 
-        // (2) PWA manifest → 200 + application/json（文件名随品牌批 manifest-mam → manifest）
+        // (2) PWA manifest → 200 + application/json（df5a7fec 品牌切换已把
+        // manifest-mam.json 改名 manifest.json，测试 URL 随产物对齐）
         let r = app
             .clone()
             .oneshot(req("GET", "/m/manifest.json", None, None))

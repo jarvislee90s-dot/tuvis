@@ -256,6 +256,7 @@ M4 是一期收尾里程碑：把 M2/M3 已在局域网验证的能力推到**�
 - **sha256 来源链**：五值逐字取自官方 release 页 `https://github.com/cloudflare/cloudflared/releases/tag/2026.9.1` 的 SHA256 Checksums 清单（核对日期 2026-09-17）。渠道一 = 控制器经网页阅读器抓取该页；渠道二 = 用户本机手动下载 `cloudflared-windows-amd64.exe` 实测 sha256（`2837888cc0f5d58f15b6dc478376de90b4d3ba5241c7947455d1e0a0df429712`）与渠道一取回值一致；入库前 spec 评审对代码内常量表逐字符比对。
 - **镜像回退**：候选序 = 官方 → `ghfast.top` 前缀 → `gh-proxy.com` 前缀；2026-09-17 两镜像 `curl -sI` 均 200（实现与评审两次独立实测）。每个候选下载后仍过 sha256 校验，不匹配即弃用换下一个——镜像失效时 sha256 兜底完整性，最坏回落官方 + 手动放置旁路（`~/.mam/bin/cloudflared` / `cloudflared.exe`）不变。
 - **超时与指引**：连接 15s / 总 600s；失败文案含 `cloudflared_path()` 绝对路径与官方下载页链接（commit 89f58c3）。
+- **2026-10-13 更正：.tgz 两行 sha256 登记值错误（上游清单坑）**：官方 release 正文「SHA256 Checksums」清单把**解包后内部二进制**的哈希标在了 `.tgz` 条目名下（2026.9.1 实测），上文「来源链」照抄正文导致 macOS 两平台下载校验必挂——用户报障 darwin-arm64 三镜像下载哈希彼此一致且与 GitHub asset digest 一致、仍全被拒。实测更正（本地下载 + GitHub API asset digest 双重验证）：`cloudflared-darwin-arm64.tgz = c27ab8fd0aa489449e3d201eb02f957ef460a13b613662928b1b23394bf1bcfe`、`cloudflared-darwin-amd64.tgz = ff0d3b51d5ff70eceef89d6b32145fee985018a2174596a5dbe405e2766e2ac4`；windows / linux 三行的清单值 = 资产字节真值（校验对象即二进制本体），维持不变。**升级流程修订：.tgz 值一律取自 GitHub API release assets 的 `digest` 字段或本地下载实测，勿抄正文清单**。
 
 ## 13. 2026-09-17 用户裁决追记 II：访问密码制替代审批制（M5 批）
 

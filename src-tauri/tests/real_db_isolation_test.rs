@@ -73,6 +73,7 @@ fn connection_cfg_test_home_fallback_is_inside_the_debug_gate() {
     );
 
     // 归一化后的逐字形态：`#[cfg(test)] return std::env::temp_dir().join(format!("tuvis-test-{}", std::process::id()));`
+    // （2026-10-10 品牌更名 cf69cf35：mam-test-{} → tuvis-test-{}，本针同步）
     let wanted = concat!(
         "#[cfg(test)]\n",
         "returnstd::env::temp_dir().join(format!(\"tuvis-test-{}\",std::process::id()));"
@@ -191,6 +192,39 @@ fn both_refusal_gates_are_pinned_verbatim() {
         src.contains("lethome=dirs::home_dir().unwrap_or_default();")
             && src.contains("#[cfg(not(test))]"),
         "**采集拒绝锁**：`run_collection()` 的 `cfg(not(test))` 生产扫描根必须逐字在场"
+    );
+}
+
+// =============================================================================
+// 锁 ⑤（源码半边）：集成测试的采集读源缝 `TUVIS_USAGE_FIXTURE_ROOT`
+// 行为半边在 `tests/usage_ipc_test.rs` 与 `tests/usage_two_round_incremental_test.rs`
+// （集成测试实跑）。2026-10-13 随缝落成，评审 P2-3 要求与 `TUVIS_HOME` 的门控针同款。
+// =============================================================================
+
+/// `run_collection()` 的读源根覆盖必须**逐字**保持三分支形态：
+/// ② 集成测试臂读 `TUVIS_USAGE_FIXTURE_ROOT`，且**必须**钉在
+///    `cfg(all(not(test), debug_assertions))]` 门内——release 读它 = 生产扫描根可被
+///    环境变量劫持（与 `connection.rs::app_data_home` 的 `TUVIS_HOME` 同一道门的道理）；
+/// ③ release 出路必须是 `cfg(all(not(test), not(debug_assertions)))]` 下的
+///    `dirs::home_dir().unwrap_or_default()`（门控外的真实 home 兜底不得被删）。
+/// 变异靶：把 env 读取挪出门外、删掉 release 出路臂，都在这里打红。
+/// （① lib 单测臂由上面的拒绝闸判据钉与 `both_refusal_gates_are_pinned_verbatim` 覆盖。）
+#[test]
+fn usage_fixture_root_env_is_inside_the_debug_gate() {
+    let src = squeeze(&read_src("src/services/usage/collect.rs"));
+    let env_arm = concat!(
+        "#[cfg(all(not(test),debug_assertions))]\n",
+        "lethome=matchstd::env::var_os(\"TUVIS_USAGE_FIXTURE_ROOT\"){"
+    );
+    let release_arm = concat!(
+        "#[cfg(all(not(test),not(debug_assertions)))]\n",
+        "lethome=dirs::home_dir().unwrap_or_default();"
+    );
+    let env_at = at(&src, env_arm, "集成测试读源根缝（debug 门内）");
+    let rel_at = at(&src, release_arm, "release 真实 home 出路臂");
+    assert!(
+        env_at < rel_at,
+        "读源根三分支必须保持 test → debug 门 → release 出路的顺序（实测 env@{env_at} / release@{rel_at}）"
     );
 }
 
