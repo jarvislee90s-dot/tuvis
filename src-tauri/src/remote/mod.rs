@@ -62,7 +62,8 @@ pub const HEADLESS_DISABLED_REASON: &str = "无头通道未开启，请在电脑
 /// runner 启动读取（`headless::HeadlessLimits::from_conn`）。
 pub const KEY_HEADLESS_TIMEOUT_MS: &str = "remote.headless_timeout_ms";
 /// **无头全局并发上限键（H4 / Task 6）**：默认 [`DEFAULT_HEADLESS_CONCURRENCY`]（2），
-/// clamp 1..=8。超额请求即时排队（回执含全局队列位置），不静默丢也不阻塞死等。
+/// clamp 1..=8。超额请求**即时如实回执**（本条未执行、未投递——生产无真排队，
+/// 不谎报位次；评审 I1），不静默丢也不阻塞死等。
 pub const KEY_HEADLESS_CONCURRENCY: &str = "remote.headless_concurrency";
 /// watchdog 默认超时（数字单点在 `inject::headless`，此处只做别名导出防两处漂移）
 pub const DEFAULT_HEADLESS_TIMEOUT_MS: u64 = crate::inject::headless::DEFAULT_TIMEOUT_MS;

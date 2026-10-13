@@ -3035,7 +3035,7 @@ mod tests {
         assert!(r.reason.clone().unwrap().contains("未拿到回执"));
 
         let q = finish_oneshot(
-            Receipt::queued(2).with_session("s"),
+            Receipt::concurrency_full(2).with_session("s"),
             &good,
             "s",
             "",
@@ -3043,7 +3043,14 @@ mod tests {
             &[],
         );
         assert_eq!(q.status, ReceiptStatus::Queued);
-        assert_eq!(q.queue_position(), Some(2));
+        // 评审 I1：满额回执如实说明未执行（不谎报排队位次）
+        assert!(
+            q.reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("无头并发已满（上限 2）"),
+            "{q:?}"
+        );
     }
 
     /// **Task 13 复审 Important A**：watchdog 杀掉的回合必须**保住 `timeout` 阶段码与措辞**——

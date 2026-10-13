@@ -526,7 +526,8 @@ mod tests {
     }
 
     /// 评审 Important 3：H4「可配」必须**真生效**——设置值落到全局名额，
-    /// 上限 1 时第二个并发回合**即时排队**（位置 2），不静默丢也不无限等
+    /// 上限 1 时第二个并发回合**即时未执行回执**（不静默丢也不无限等；评审 I1：
+    /// 回执如实说明未执行，**不再谎报排队位次**）
     #[test]
     fn configured_concurrency_cap_actually_gates_second_turn() {
         let conn = mem_conn();
@@ -545,9 +546,15 @@ mod tests {
         assert_eq!(
             out.status,
             receipt::ReceiptStatus::Queued,
-            "上限 1 时第二个回合必须排队: {out:?}"
+            "上限 1 时第二个回合必须即时返回未执行回执: {out:?}"
         );
-        assert_eq!(out.queue_position(), Some(2));
+        assert!(
+            out.reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("无头并发已满（上限 1）"),
+            "回执必须带出实际生效的上限: {out:?}"
+        );
         drop(hold);
         assert_eq!(sem.in_flight(), 0);
     }

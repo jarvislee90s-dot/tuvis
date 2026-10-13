@@ -913,7 +913,7 @@ async fn run_queue_turn(
             ReceiptSource::Unconfirmed,
         );
     };
-    consume_and_report(args, plan, deps, sid, &msg_id, divert, baseline, total_ms()).await
+    consume_and_report(args, plan, deps, sid, &msg_id, divert, baseline, started).await
 }
 
 /// 消费确认自建（入队回执之上再要一次**到达证据**）：
@@ -921,6 +921,11 @@ async fn run_queue_turn(
 /// 2. 有界轮询 `[基线..EOF]` 追加段（命中消息文本 = 已消费）——期间移动端取消**送达**
 ///    （中止等待，回执如实说明消息仍在队列、无法撤回）；
 /// 3. 仍未命中 → 查队列副本交叉验证（滞留 / 已无该条目 / 不可读，三态各自如实文案）。
+///
+/// **耗时口径（评审 I4）**：本函数收 `started`（回合起点）而**不是**一个已求值的 `u64`
+/// ——旧实现由调用方在 `await` 前求值，消费等待（最多 60s）全部漏计，与模块头
+/// 「回执耗时 = 整回合墙钟（**含消费等待**）」不符，且审计行同步少报。现在每个终态出口
+/// 各自现求 `started.elapsed()`（exec 路径 `exec_receipt` 早就是这写法，此处照搬）。
 #[allow(clippy::too_many_arguments)]
 async fn consume_and_report(
     args: &TurnArgs<'_>,
@@ -930,11 +935,12 @@ async fn consume_and_report(
     msg_id: &str,
     divert: Option<&str>,
     baseline: Option<u64>,
-    total_ms: u64,
+    started: Instant,
 ) -> TurnOutcome {
+    let total_ms = || started.elapsed().as_millis() as u64;
     let queued = |tail: String| TurnOutcome {
         receipt: {
-            let mut r = Receipt::ok(sid, total_ms);
+            let mut r = Receipt::ok(sid, total_ms());
             r.status = ReceiptStatus::Queued;
             r.reason = Some(prefixed(divert, &format!("{tail}（入队回执 id={msg_id}）")));
             r
@@ -979,12 +985,12 @@ async fn consume_and_report(
     let mut unreadable = 0usize;
     for i in 0..deps.consume_attempts.max(1) {
         if cancelled.load(Ordering::SeqCst) {
-            return cancelled_outcome(sid, msg_id, divert, total_ms);
+            return cancelled_outcome(sid, msg_id, divert, total_ms());
         }
         if i > 0 {
             (deps.wait)(deps.consume_interval).await;
             if cancelled.load(Ordering::SeqCst) {
-                return cancelled_outcome(sid, msg_id, divert, total_ms);
+                return cancelled_outcome(sid, msg_id, divert, total_ms());
             }
         }
         match (deps.rollout.appended_hit)(rollout, base, &needles) {
@@ -997,7 +1003,7 @@ async fn consume_and_report(
         }
     }
     if consumed {
-        let mut r = Receipt::ok(sid, total_ms);
+        let mut r = Receipt::ok(sid, total_ms());
         r.reason = Some(prefixed(
             divert,
             &format!(
@@ -2086,6 +2092,123 @@ mod tests {
             project: "E:/t2",
             rollout,
         }
+    }
+
+    /// **评审 I4**：queue 回执的 `durationMs` 必须**含消费等待**——模块头声明的口径是
+    /// 「整回合墙钟（含消费等待）」，旧实现由 `run_queue_turn` 在 `await` 前把
+    /// `total_ms()` 求值成一个冻结的 `u64` 传进 `consume_and_report`，于是消费等待
+    /// （生产最多 60s）全部漏计，审计行 `duration_ms` 同步少报。
+    ///
+    /// 本用例把等待缝换成**真睡觉 + 记账**，覆盖全部出口：已消费 / 四个未消费态 /
+    /// 取消。变异验证：把调用点改回 `total_ms()`（await 前求值）→ 全部断言红。
+    #[tokio::test]
+    async fn queue_receipt_durations_include_the_consume_wait() {
+        const WAIT_MS: u64 = 25;
+        // 真睡觉的消费等待缝（每次 wait 记一笔并真睡 WAIT_MS）
+        fn sleeping_deps(
+            hits: Vec<Option<bool>>,
+            holds: Option<QueueEvidence>,
+        ) -> (TurnDeps, Arc<Mutex<u64>>) {
+            let mut d = deps_with(hits, holds);
+            let slept: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+            let acc = slept.clone();
+            d.wait = Box::new(move |_| {
+                let acc = acc.clone();
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(WAIT_MS)).await;
+                    *acc.lock().unwrap_or_else(|e| e.into_inner()) += WAIT_MS;
+                })
+            });
+            (d, slept)
+        }
+        let plan = dispatch(AppPresence::Open, UUID, "E:/t2", "hi [mobile iPad]");
+        let slept_of = |s: &Arc<Mutex<u64>>| *s.lock().unwrap_or_else(|e| e.into_inner());
+
+        // ① 已消费出口（第 2 轮追加命中——第 1 轮后真等过一次）
+        let (run, _) = scripted_run(vec![queued_obs("m-1")]);
+        let (_, make) = recording_runner();
+        let (deps, slept) = sleeping_deps(vec![Some(false), Some(true)], Some(QueueEvidence::Ours));
+        let out = run_turn(
+            &args_of("sess_i4_consumed", Some(ROLLOUT)),
+            &plan,
+            &make,
+            &deps,
+            &*run,
+        )
+        .await;
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        assert!(slept_of(&slept) > 0, "本用例必须真的等过（否则断言空转）");
+        assert!(
+            out.receipt.duration_ms >= slept_of(&slept),
+            "已消费出口：耗时 {}ms 必须 ≥ 消费等待 {}ms",
+            out.receipt.duration_ms,
+            slept_of(&slept)
+        );
+
+        // ② 四个未消费出口（三态 + 副本不可读）：全程等待都发生在回执构造之前
+        for (holds, label) in [
+            (Some(QueueEvidence::Ours), "队列仍滞留本条目"),
+            (
+                Some(QueueEvidence::ThreadStalled { rows: 3 }),
+                "thread 有滞留",
+            ),
+            (Some(QueueEvidence::ThreadClear), "thread 无滞留"),
+            (None, "副本不可读"),
+        ] {
+            let (run, _) = scripted_run(vec![queued_obs("m-2")]);
+            let (_, make) = recording_runner();
+            let (deps, slept) = sleeping_deps(vec![Some(false), Some(false), Some(false)], holds);
+            let out = run_turn(
+                &args_of("sess_i4_queued", Some(ROLLOUT)),
+                &plan,
+                &make,
+                &deps,
+                &*run,
+            )
+            .await;
+            assert_eq!(out.receipt.status, ReceiptStatus::Queued, "{label}");
+            assert!(slept_of(&slept) > 0, "{label}：必须真的等过");
+            assert!(
+                out.receipt.duration_ms >= slept_of(&slept),
+                "{label}：耗时 {}ms 必须 ≥ 消费等待 {}ms",
+                out.receipt.duration_ms,
+                slept_of(&slept)
+            );
+        }
+
+        // ③ 取消出口（等待途中移动端叫停）：回执耗时同样必须含已发生的等待
+        let sid = "sess_i4_cancelled";
+        // 槽位按生产形态先占住（api.rs 分派臂先 begin，取消端点才找得到靶子）
+        assert!(registry().begin(sid, TurnSlot::placeholder("codex", "hi".to_string())));
+        let (run, _) = scripted_run(vec![queued_obs("m-3")]);
+        let (_, make) = recording_runner();
+        let mut deps = deps_with(vec![Some(false), Some(false)], Some(QueueEvidence::Ours));
+        let slept: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        let acc = slept.clone();
+        deps.wait = Box::new(move |_| {
+            let acc = acc.clone();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(WAIT_MS)).await;
+                *acc.lock().unwrap_or_else(|e| e.into_inner()) += WAIT_MS;
+                // 等待窗内送达取消（消费等待期已武装靶子 → 闩 + 中止）
+                let _ = registry().request_cancel(sid);
+            })
+        });
+        let out = run_turn(&args_of(sid, Some(ROLLOUT)), &plan, &make, &deps, &*run).await;
+        assert_eq!(
+            out.receipt.status,
+            ReceiptStatus::Cancelled,
+            "{:?}",
+            out.receipt
+        );
+        assert!(slept_of(&slept) > 0);
+        assert!(
+            out.receipt.duration_ms >= slept_of(&slept),
+            "取消出口：耗时 {}ms 必须 ≥ 消费等待 {}ms",
+            out.receipt.duration_ms,
+            slept_of(&slept)
+        );
+        registry().end(sid);
     }
 
     /// queue 路径：入队回执 + rollout 追加命中 = **已消费**（Ok 且如实标注证据来源；

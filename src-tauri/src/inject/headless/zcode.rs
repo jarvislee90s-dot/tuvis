@@ -389,14 +389,33 @@ pub fn workspace_active_in(project: &str, runtime_cwds: &[String], os: &str) -> 
         .any(|cwd| same_workspace(cwd, project, os))
 }
 
+/// MAM 无头回合形态的**独有旗子**：`--prompt`（[`turn_flags`] 恒定携带；ZCode 应用自身的
+/// 会话运行时不带）。用于把**自家 spawn 的子进程**从「APP 活跃」证据里剔除（评审 I3）。
+pub const HEADLESS_PROMPT_FLAG: &str = "--prompt";
+
+/// 命令行是否属 MAM 无头形态（`--prompt` 独立参数，或 `--prompt=…` 合并形态）
+fn carries_headless_prompt(cmd: &[std::ffi::OsString]) -> bool {
+    cmd.iter().any(|a| {
+        let s = a.to_string_lossy();
+        s == HEADLESS_PROMPT_FLAG || s.starts_with("--prompt=")
+    })
+}
+
 /// app-server（会话运行时）判定：exe 命中 ZCode（单源
 /// [`crate::monitor::zcode_parser::exe_basename_is_zcode`]）**且**命令行含 `zcode.cjs`。
 /// Electron 辅助进程（`--type=`）刻意排除——它们的 cwd 是应用目录，不代表某工作区活跃。
+///
+/// **再排除 MAM 自家无头回合子进程（评审 I3）**：端点把回合的 cwd 设成项目路径、
+/// exe 就是 ZCode、命令行也含 `zcode.cjs`——与 APP 的会话运行时**同形**。不排除就会在
+/// 「同项目两条并发无头回合」时，让第二条的 busy 探活看见第一条的 MAM 子进程，把
+/// 「工作区被另一条无头回合/应用层争用锁占用」**误报成「ZCode 应用活跃」**（归因是假的）。
+/// MAM 无头形态独有旗子 = `--prompt`（见 [`HEADLESS_PROMPT_FLAG`]）。
 pub fn is_app_server(exe: Option<&Path>, cmd: &[std::ffi::OsString]) -> bool {
     let exe_hit = exe
         .map(|e| crate::monitor::zcode_parser::exe_basename_is_zcode(&e.to_string_lossy()))
         .unwrap_or(false);
     exe_hit
+        && !carries_headless_prompt(cmd)
         && cmd.iter().any(|a| {
             a.to_string_lossy()
                 .to_lowercase()
@@ -1009,6 +1028,24 @@ async fn finalize(
     } = obs;
     let acc = frames_of_stdout(&stdout);
     let mut r = receipt;
+    // **并发名额已满不是可透传终态（评审 I1）**：runner 的即时回执只说明「本条未起跑」，
+    // 生产上**没有真排队**（无名额即早退，释放后也不会自动补跑）——若原样把 `queued`
+    // 透给移动端，用户看到的是「排队中」，而真相是「没执行，请自己重发」。驱动层在此
+    // 转译为 [`Stage::Refused`]（语义正是「投递前拒绝：回合未起跑、零字节投递」），
+    // 文案逐字沿用 [`Receipt::concurrency_full`] 的单点措辞（不另写一份）。
+    // `queued` 状态词从此只表示「已进下游队列、待确认消费」（codex 入队语义）。
+    if r.status == ReceiptStatus::Queued {
+        let reason = r
+            .reason
+            .clone()
+            .unwrap_or_else(|| "无头并发已满：本条未执行、未投递——请稍后重发".to_string());
+        return (
+            Receipt::failed(Stage::Refused, &reason)
+                .with_session(session_id)
+                .with_duration_ms(total_ms),
+            ReceiptSource::NotApplicable,
+        );
+    }
     if r.status != ReceiptStatus::Ok {
         // 非 0 退出 / 超时 / 取消：库不参与判定，原样如实上抛
         r.session_id = if r.session_id.is_empty() {
@@ -1094,7 +1131,10 @@ fn busy_receipt(
     Receipt::failed(
         Stage::WorkspaceBusy,
         &format!(
-            "工作区忙：ZCode 应用在项目 {project} 活跃，无头回合被应用层争用锁拒绝（{ev}）；\
+            // **归因中性化（评审 I3）**：争用锁的持有者既可能是 ZCode 应用，也可能是
+            // **另一条 MAM 无头回合**（探活已排除自家子进程，不再假装知道是哪一方）
+            "工作区忙：工作区 {project} 被 ZCode 应用或另一无头回合占用，\
+             无头回合被应用层争用锁拒绝（{ev}）；\
              已重试 {retries} 次（每次间隔 {}s）仍失败——请在该工作区空闲后重发",
             spacing.as_secs()
         ),
@@ -1559,6 +1599,62 @@ mod tests {
         assert!(!is_app_server(None, &[os("zcode.cjs")]));
     }
 
+    /// **评审 I3**：MAM 自家无头回合子进程**不算 APP 活跃**——它的 exe 就是 ZCode、
+    /// 命令行也含 `zcode.cjs`（[`turn_flags`] 的恒定形态），且端点把 cwd 设成项目路径，
+    /// 与 APP 的会话运行时同形；不排除就会在「同项目两条并发回合」时把「另一条无头回合
+    /// 占用」误报成「ZCode 应用活跃」。
+    ///
+    /// 变异验证：删掉 `is_app_server` 里的 `carries_headless_prompt` 判定 → 本用例红。
+    /// argv **取自真组装器**（[`build_argv`]）而不是手抄字面量——哪天 `turn_flags` 不再
+    /// 携带 `--prompt`，本用例同样会红（判据与形态同源，不会双双漂移）。
+    #[test]
+    fn mam_headless_turn_is_not_counted_as_app_activity() {
+        use std::ffi::OsString;
+        let os = |s: &str| OsString::from(s);
+        let spec = ZcodeSpec::win("D:/ZCode");
+        let inv = build_argv(&spec, "hi", "sess_1", "E:/p", Some("iPad"))
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
+        let mut cmd: Vec<std::ffi::OsString> = vec![std::ffi::OsString::from(inv.program.clone())];
+        cmd.extend(inv.argv.iter().map(std::ffi::OsString::from));
+        assert!(
+            carries_headless_prompt(&cmd),
+            "无头 argv 必须带 --prompt（本判据的锚点）: {cmd:?}"
+        );
+        assert!(
+            !is_app_server(Some(Path::new(&inv.program)), &cmd),
+            "MAM 自家无头回合子进程不得被算成 APP 会话运行时: {cmd:?}"
+        );
+        // 新建形态（无 --resume）同判：仍是 MAM 无头，不是 APP 活跃
+        let create = build_create_argv(&spec, "hi", "E:/p", Some("iPad"))
+            .expect("测试花名在册（新建 argv 同判据）");
+        let mut create_cmd: Vec<std::ffi::OsString> =
+            vec![std::ffi::OsString::from(create.program.clone())];
+        create_cmd.extend(create.argv.iter().map(std::ffi::OsString::from));
+        assert!(!is_app_server(
+            Some(Path::new(&create.program)),
+            &create_cmd
+        ));
+        // 合并形态 `--prompt=…` 同样排除（不因写法差异漏判）
+        assert!(!is_app_server(
+            Some(Path::new("D:\\Programs\\ZCode\\ZCode.exe")),
+            &[
+                os("ZCode.exe"),
+                os("D:\\Programs\\ZCode\\resources\\glm\\zcode.cjs"),
+                os("--prompt=hi"),
+            ]
+        ));
+        // 反向：APP 自身会话运行时不带 --prompt，仍必须被算成活跃（修复不得把探活打死）
+        assert!(is_app_server(
+            Some(Path::new("D:\\Programs\\ZCode\\ZCode.exe")),
+            &[
+                os("ZCode.exe"),
+                os("D:\\Programs\\ZCode\\resources\\glm\\zcode.cjs"),
+                os("--mode"),
+                os("yolo"),
+            ]
+        ));
+    }
+
     // ===== 信任可见性 =====
 
     fn tmp_home_with_setting(json: &str) -> tempfile::TempDir {
@@ -1708,7 +1804,7 @@ mod tests {
     #[test]
     fn receipt_result_word_covers_every_stage() {
         assert_eq!(receipt_result_word(&Receipt::ok("s", 1)), "ok");
-        assert_eq!(receipt_result_word(&Receipt::queued(2)), "queued");
+        assert_eq!(receipt_result_word(&Receipt::concurrency_full(2)), "queued");
         assert_eq!(receipt_result_word(&Receipt::cancelled("x")), "cancelled");
         assert_eq!(
             receipt_result_word(&Receipt::failed(Stage::WorkspaceBusy, "忙")),
@@ -1897,6 +1993,66 @@ mod tests {
         assert!(reason.contains("E:/p"), "原因必须点明工作区：{reason}");
         assert!(reason.contains("重试 2 次"), "{reason}");
         assert_eq!(waits.lock().unwrap().len(), BUSY_MAX_RETRIES);
+    }
+
+    /// **评审 I1**：并发名额已满 ⇒ zcode 驱动层**不把 `queued` 当可透传终态**——
+    /// 转译为 `failed(refused)`（语义 = 投递前拒绝：回合未起跑、零字节投递），文案如实
+    /// 说明「未执行」而不是「排队中」。
+    ///
+    /// 还原动作（变异）：删掉 `finalize` 顶部的 `ReceiptStatus::Queued` 分支 → 本用例会
+    /// 收到 `status=queued` 且 stage=None 而红。
+    #[tokio::test]
+    async fn run_turn_translates_concurrency_full_into_honest_refusal() {
+        use crate::inject::headless::runner::GlobalSem;
+        let inv = build_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "sess_cap", "E:/p", None)
+            .expect("测试花名在册（argv 构造，见 turn::device_name_refusal）");
+        let sem = GlobalSem::new(1);
+        let hold = sem.acquire(); // 占掉唯一名额 → 本回合必然满额早退
+        let seam: Box<RunSeam> = Box::new(|cfg: RunnerCfg| {
+            Box::pin(async move {
+                let mut cfg = cfg;
+                let receipt = cfg.run_once(|_| {});
+                TurnObs {
+                    receipt,
+                    stdout: cfg.captured_stdout(),
+                    stderr: cfg.captured_stderr(),
+                    exit: cfg.last_exit_code(),
+                }
+            })
+        });
+        let waits = Arc::new(Mutex::new(Vec::new()));
+        let out = run_turn(
+            &inv,
+            "sess_cap",
+            "E:/p",
+            &|_: &ZcodeInvocation| {
+                RunnerCfg::for_test()
+                    .sem(sem.clone())
+                    .session_id("sess_cap")
+            },
+            &test_deps(false, waits.clone()),
+            &*seam,
+        )
+        .await;
+        assert_eq!(
+            out.receipt.status,
+            ReceiptStatus::Failed,
+            "满额不得以 queued 形态透传给移动端: {:?}",
+            out.receipt
+        );
+        assert_eq!(out.receipt.stage, Some(Stage::Refused));
+        assert_eq!(
+            out.receipt.terminator(),
+            crate::inject::headless::receipt::Terminator::NotStarted,
+            "未起跑语义必须保住"
+        );
+        let reason = out.receipt.reason.unwrap_or_default();
+        assert!(reason.contains("无头并发已满（上限 1）"), "{reason}");
+        assert!(reason.contains("未执行"), "{reason}");
+        assert!(!reason.contains("位等待中"), "不得谎报排队位次: {reason}");
+        assert_eq!(out.attempts, 1, "满额不是争用锁，不得重试");
+        assert!(waits.lock().unwrap().is_empty(), "满额不得退避等待");
+        drop(hold);
     }
 
     /// **R9：退避窗内的取消必须收尾为 cancelled**——争用锁拒绝时子进程已经退了，runner 的

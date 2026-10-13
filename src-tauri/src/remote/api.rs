@@ -2735,14 +2735,26 @@ async fn run_dsh_turn(
     let sid = ctx.sid.clone();
     let task = tokio::task::spawn_blocking(move || client.send(&target_sid, &cwd, &payload));
     let out = match task.await {
-        Ok(Ok(out)) => DshTurnOut {
-            receipt: out.receipt,
-            permission_notes: out
-                .permission_requests
-                .iter()
-                .map(|p| p.display())
-                .collect(),
-        },
+        Ok(Ok(out)) => {
+            let mut receipt = out.receipt;
+            // **靶向明示（评审 I6）**：dsh 的三态靶向里 `NewSession` 意味着 resume **未命中**、
+            // 消息进了**新建会话**——投递目标 ≠ 卡面所选是结构性风险，回执不得是裸 ok。
+            // 明示语与审计双记同词表，单点在 [`crate::inject::headless::dsh_acp`]
+            // （对齐 WB `delivered_session_note` 纪律）。
+            crate::inject::headless::dsh_acp::apply_targeting_note(
+                &mut receipt,
+                &out.targeting,
+                &sid,
+            );
+            DshTurnOut {
+                receipt,
+                permission_notes: out
+                    .permission_requests
+                    .iter()
+                    .map(|p| p.display())
+                    .collect(),
+            }
+        }
         // 通道级/目标非法/provider 不可用——客户端如实 Err（send 内部已优雅收尾进程），
         // 端点归一回执面不谎报：InvalidTarget/DesktopWriterActive = 投递前拒绝档，
         // 其余（Channel/Rpc/MethodUnavailable/ProviderUnavailable）= 通道错误档
@@ -2771,10 +2783,17 @@ async fn run_dsh_turn(
             }
         }
     };
+    // 审计 result 词靶向双记（评审 I6，对齐 WB `audit_word_with_targeting`）：session 列 =
+    // 卡面会话不动，不一致时把**实际投递会话号**补进 result 词——两个会话都可追溯。
+    let result = crate::inject::headless::dsh_acp::audit_word_with_targeting(
+        &crate::inject::headless::turn::receipt_result_word(&out.receipt),
+        &ctx.sid,
+        &out.receipt.session_id,
+    );
     ctx.audit(
         &st,
         crate::inject::headless::ACTION_HEADLESS,
-        &crate::inject::headless::turn::receipt_result_word(&out.receipt),
+        &result,
         out.receipt.duration_ms,
     );
     crate::inject::headless::turn::registry().end(&ctx.sid);
@@ -3953,7 +3972,8 @@ async fn oneshot_turn_in_task(
 ///
 /// 三件事在此接线（全部走 Task 6 底座的公开口，**不自建**），且**全部在任务作用域内**：
 /// ① **全局并发名额**（H4：与其余无头通道同一份 [`runner::global_sem`]）——满额即如实
-///    `queued`（含队列位次），不起进程；名额守卫**活到任务结束**（客户端断连不提前释放）；
+///    `concurrency_full` 回执（如实说明未执行、未投递；不谎报位次——评审 I1），不起进程；
+///    名额守卫**活到任务结束**（客户端断连不提前释放）；
 /// ② **watchdog 超时**（设置页值，经 [`crate::inject::headless::runner_from_conn`] 读）；
 /// ③ **取消靶子**（[`runner::RunnerCfg::arm_cancel`]：与 runner 内同一套「先到者生效」语义；
 ///    回合收尾 `disarm_cancel`，此后迟到取消如实报未送达）。
@@ -3974,7 +3994,7 @@ async fn claude_turn_in_task(
         .with(|c| crate::inject::headless::runner_from_conn(&shape.program, c));
     let Some(_slot) = runner::global_sem().try_acquire() else {
         // 满额：**如实排队回执**（含位次），不起进程；槽位由任务收尾段注销
-        return Receipt::queued(runner::global_sem().queue_position()).with_session(&session.id);
+        return Receipt::concurrency_full(runner::global_sem().cap()).with_session(&session.id);
     };
     let timeout_ms = runner_cfg.watchdog_timeout_ms();
     let (cancel_handle, cancel_rx) = runner_cfg.arm_cancel();

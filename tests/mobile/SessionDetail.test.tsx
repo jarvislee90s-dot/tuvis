@@ -2915,8 +2915,12 @@ describe("SessionDetail：预览区 sheet 化（T1）", () => {
 //
 // `codex queue` 的 exit 0 只证入队：后端在 60s 消费确认后给 `ok`（rollout 追加命中 =
 // 已消费）或 `queued`（已入队未消费，附可执行建议）。同一 `queued` 状态自 Task 9 起有
-// 两个成因（H4 全局并发名额满 / H8 APP 入队待消费）⇒ 卡片**只渲染中性「排队中」**，
+// 两个成因（H4 全局并发名额满 / H8 APP 入队待消费）⇒ 卡片**只渲染中性徽章**，
 // 成因一律由后端 `reason` 原样透出（后端给文案、前端只渲染的同一纪律）。
+// 评审 I1：徽章措辞从「排队中」改为「未执行（原因见下）」——「排队中」暗示「已排队、
+// 会被自动执行」，而 H4 满额这一支生产上**没有真排队**（无名额即早退，释放后不补跑），
+// 是假话；「未执行」对两支（已入队待消费 / 名额已满）**都成立**（zcode 满额已改判
+// `failed(refused)`，不再走本支）。
 describe("SessionDetail：codex 入队回执（Task 9 / H8）", () => {
   function codexSession() {
     return makeSession({ id: "sess-h8", agentType: "codex", form: "app", status: "idle" });
@@ -2953,6 +2957,9 @@ describe("SessionDetail：codex 入队回执（Task 9 / H8）", () => {
     await waitFor(() => expect(screen.getByTestId("headless-queued")).toBeTruthy());
     // 中性成因文案：不得再对 H8 谎报「全局并发名额已满」
     expect(screen.getByTestId("headless-queued").textContent).not.toContain("全局并发名额");
+    // 评审 I1：徽章不得再声称「排队中」（对 H4 满额支是假话——生产无真排队）
+    expect(screen.getByTestId("headless-queued").textContent).toBe("未执行（原因见下）");
+    expect(screen.getByTestId("headless-queued").textContent).not.toContain("排队");
     expect(screen.getByTestId("headless-reason").textContent).toContain("已入队未消费");
     expect(screen.getByTestId("headless-reason").textContent).toContain("APP 打开该会话");
     // 未确认消费 ⇒ 不是成功：无末条回复、无「完成」标、正文保留
@@ -3091,6 +3098,40 @@ describe("SessionDetail：无头回执卡（Task 8 / H7）", () => {
     expect(screen.queryByTestId("headless-visibility")).toBeNull();
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("给我改代码");
     expect(screen.queryByTestId("headless-cancel")).toBeNull();
+  });
+
+  /// **评审 I1（假队列回执诚实化）**：并发名额已满在 zcode 驱动层转译为
+  /// `failed(refused)`（回合未起跑、零字节投递）——前端必须走「投递前拒绝」分诊，
+  /// **不得**再显示「排队中」徽章（那是假话：生产没有真排队，释放后不补跑）。
+  it("并发名额已满：如实显示「投递前拒绝/未执行」，不显示「排队中」", async () => {
+    installFetch();
+    routes.sendInfo = headlessSendInfo();
+    routes.sessionSend = {
+      status: "headless",
+      channel: "headless_zcode",
+      receipt: headlessReceipt({
+        status: "failed",
+        stage: "refused",
+        reason: "无头并发已满（上限 2）：本条未执行、未投递——请稍后重发",
+        lastAssistant: undefined,
+        tokens: undefined,
+        durationMs: 12,
+      }),
+    };
+    render(<SessionDetail session={headlessSession()} onBack={() => {}} />);
+    await sendFromComposer("并发满了这条");
+    await waitFor(() =>
+      expect(screen.getByTestId("headless-receipt-card").getAttribute("data-phase")).toBe("done")
+    );
+    expect(screen.queryByTestId("headless-queued")).toBeNull();
+    expect(screen.getByTestId("headless-failed")).toBeTruthy();
+    expect(screen.getByTestId("headless-stage").textContent).toContain("投递前拒绝");
+    expect(screen.getByTestId("headless-reason").textContent).toContain("未执行");
+    expect(screen.getByTestId("headless-reason").textContent).not.toContain("位等待中");
+    // 未投递 = 消息没进 ZCode → 输入框保留正文，用户重发
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe(
+      "并发满了这条"
+    );
   });
 
   it("无头取消回执：如实报「已取消」，不冒充成功；输入框保留正文", async () => {
@@ -3424,6 +3465,85 @@ describe("SessionDetail：无头回执卡（Task 8 / H7）", () => {
       expect(screen.getByTestId("headless-approval-note").textContent).toContain("未答全")
     );
     expect(screen.getByTestId("headless-approval-card")).toBeTruthy();
+  });
+
+  /// **评审 I7（移动端审批卡无 key 串态）**：claude 长回合会**连问多题**——核侧待答登记表
+  /// 按 requestId 排队，答完一题接上的是**下一题的新 id**（Rust 侧 `排队的请求必须接着上卡`
+  /// 用例）。轮询把 pending 换成另一 id 时，卡片必须是**新实例**：旧题未提交的自由作答草稿
+  /// 不得灌进新题的输入框（否则 `headlessUnanswered` 把旧草稿当新题已答 → 提交钮放行 →
+  /// **无感知把旧草稿当新题答案送出**），旧题的「已送达」回显也不得残留。
+  it("换题（requestId 变化）不串态：新卡自由作答为空、旧「已送达」note 不残留、提交禁用", async () => {
+    installFetch();
+    routes.sendInfo = {
+      injectable: true,
+      channels: ["headless_claude_p"],
+      visibility: "after_refresh",
+    };
+    routes.sessionSend = "pending"; // 手动闸：回合保持在飞（审批轮询持续跑）
+    routes.headlessApprove = { delivered: true };
+    routes.headlessApproval = {
+      requestId: "req-a",
+      kind: "question",
+      toolName: "AskUserQuestion",
+      input: "{}",
+      sessionId: "sess-h7",
+      channel: "headless_claude_p",
+      tier: "stdio",
+      permissionMode: "default",
+      options: [],
+      questions: [{ question: "第一题", multiSelect: false, options: [{ label: "a" }] }],
+      waitedMs: 100,
+    };
+    render(<SessionDetail session={headlessSession()} onBack={() => {}} />);
+    await sendFromComposer("第一问");
+
+    // 第一张卡（requestId=req-a）：在自由作答框写草稿但**不提交**（草稿只活在组件 useState 里）
+    await screen.findByTestId("headless-approval-card");
+    fireEvent.change(screen.getByTestId("headless-q-0-free"), {
+      target: { value: "第一题的草稿（未提交）" },
+    });
+    // 顺手在旧卡上留下「已送达」回显（弃卡 = deny；回执 delivered:true）——旧卡的两种残留态齐备
+    fireEvent.click(screen.getByTestId("headless-approval-dismiss"));
+    await waitFor(() =>
+      expect(screen.getByTestId("headless-approval-note").textContent).toContain("已送达")
+    );
+    expect((screen.getByTestId("headless-q-0-free") as HTMLInputElement).value).toBe(
+      "第一题的草稿（未提交）"
+    );
+
+    // 第二张卡上卡（requestId=req-b，另一道题）：由 1.5s 一拍的轮询自然换卡（非本地卸载）
+    routes.headlessApproval = {
+      requestId: "req-b",
+      kind: "question",
+      toolName: "AskUserQuestion",
+      input: "{}",
+      sessionId: "sess-h7",
+      channel: "headless_claude_p",
+      tier: "stdio",
+      permissionMode: "default",
+      options: [],
+      questions: [{ question: "第二题", multiSelect: false, options: [{ label: "b" }] }],
+      waitedMs: 50,
+    };
+    await waitFor(
+      () => expect(screen.getByTestId("headless-question-0").textContent).toContain("第二题"),
+      { timeout: 4000 }
+    );
+
+    // **换 id 即换实例**（撤掉 key 这三条断言全红）：
+    // ① 草稿不跨题（否则旧草稿会作为 req-b 的答案上行）
+    expect(
+      (screen.getByTestId("headless-q-0-free") as HTMLInputElement).value,
+      "旧题草稿不得灌进新题的自由作答框"
+    ).toBe("");
+    // ② 旧「已送达」不残留（否则新卡谎报已答）
+    expect(screen.queryByTestId("headless-approval-note")).toBeNull();
+    // ③ 新题确实被判为未答：提交禁用 + 点名缺题（串态下旧草稿会让它误判「已答」而放行）
+    expect((screen.getByTestId("headless-q-0-opt-0") as HTMLInputElement).checked).toBe(false);
+    expect(screen.getByTestId("headless-question-incomplete").textContent).toContain("1 题未作答");
+    expect((screen.getByTestId("headless-question-submit") as HTMLButtonElement).disabled).toBe(
+      true
+    );
   });
 
   /// **跨语言决策词表锁**（`tests/fixtures/headless_decision_words.json` 是唯一名单）：

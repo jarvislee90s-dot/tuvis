@@ -9494,6 +9494,97 @@ mod tests {
         assert!(pending.is_empty(), "无头回合绝不入队（裁决 8）");
     }
 
+    /// **评审 I6 端点级看守**：dsh 的 resume **未命中** ⇒ 客户端新建会话投递
+    /// （`Targeting::NewSession`）——投递目标 ≠ 卡面所选是**结构性**风险，回执**不得是裸 ok**：
+    /// reason 必须明示投递会话号 + 「与所选会话不同」；**审计 result 词双记投递会话号**
+    /// （session 列仍 = 卡面会话，设备检索入口语义不动）。`run_dsh_turn` 的靶向接线被删
+    /// ⇒ 本用例的 reason / result 断言先红。
+    ///
+    /// 与兄弟用例 `session_send_dsh_app_dispatches_to_dsh_acp_arm` 的差别：cwd 取**当前
+    /// 平台**的绝对形态（那份夹具写死 `E:/t2`，非 Windows 上会被 cwd 门拒——那是那条
+    /// 用例在本机恒红的原因，不在本批范围）；本用例走 New 臂、list 返回空表 ⇒ 不依赖
+    /// cwd 匹配，故可跨平台钉住接线。
+    #[tokio::test]
+    async fn dsh_new_session_delivery_notes_targeting_and_audits_delivered_session() {
+        use crate::inject::headless::dsh_acp::test_hooks;
+        const CARD: &str = "session-9f14a8c5-6666-4222-8333-44445555bbbb";
+        /// `session/new` 返回的裸 uuid（≠ 卡面 ⇒ resume 未命中）
+        const NEW_SID: &str = "3fb0c1d2-aaaa-4bbb-8ccc-dddddddddddd";
+        let _serial = test_hooks::LOCK.lock().await;
+        let _clear = DshHookClear;
+        let cwd = if cfg!(windows) { "E:/t2" } else { "/tmp/t2" };
+        let frame = |v: serde_json::Value| v.to_string();
+        dsh_script_seam(vec![
+            frame(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{
+                "protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"image":false}}}})),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{}})),
+            // list 为空 ⇒ 既有会话未命中 ⇒ 走 new 臂
+            frame(serde_json::json!({"jsonrpc":"2.0","id":3,"result":{"sessions":[]}})),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":4,
+                "result":{"sessionId":NEW_SID,"configOptions":[]}})),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}})),
+            frame(serde_json::json!({"jsonrpc":"2.0","id":6,"result":{}})),
+        ]);
+        let fake = FakeInjector::ok();
+        let mut sess = dsh_sess(CARD, 77776);
+        sess.project_path = cwd.to_string();
+        let state = dsh_dispatch_state(fake.clone(), vec![sess]);
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some("mam_device=mm"),
+                Some(&format!(r#"{{"sessionId":"{CARD}","text":"hi [mobile]"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "无头分派：HTTP 200 + 语义在 body");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["channel"], "headless_dsh_acp");
+        assert_eq!(v["receipt"]["status"], "ok", "{v}");
+        assert_eq!(
+            v["receipt"]["sessionId"], NEW_SID,
+            "回执 session 字段 = 实际投递会话号（新建产物）：{v}"
+        );
+        let reason = v["receipt"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("已投递至 dsh 新建会话"),
+            "成功回执必须明示投递会话（不得是裸 ok）：{v}"
+        );
+        assert!(reason.contains(&format!("sessionId={NEW_SID}")), "{v}");
+        assert!(
+            reason.contains("消息已进入新建会话，与所选会话不同"),
+            "不一致明示（I6 判据）：{v}"
+        );
+        assert_eq!(fake.recorded().len(), 0, "无头路由会话零终端注入");
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "{audits:?}");
+        assert_eq!(audits[0].action, "headless");
+        assert_eq!(audits[0].channel, "headless_dsh_acp");
+        assert_eq!(
+            audits[0].session_id, CARD,
+            "审计 session 列 = 卡面会话（设备检索入口语义，不动）"
+        );
+        assert!(
+            audits[0].result.starts_with("ok"),
+            "终态词在前：{}",
+            audits[0].result
+        );
+        assert!(
+            audits[0].result.contains(NEW_SID) && audits[0].result.contains("与所选会话不同"),
+            "审计 result 词双记投递 sessionId（防 api.rs 靶向接线被删无测试红）：{}",
+            audits[0].result
+        );
+        assert!(
+            !crate::inject::headless::turn::registry().in_flight(CARD),
+            "回合终结必须注销串行锁"
+        );
+    }
+
     /// **H3 自然接管 dsh（Task 10 行为变化，M24 判据）**：开关关闭（默认态）+ dsh 会话 →
     /// POST 403 `headless_disabled`（原 `not_injectable`/`dsh_headless_pending` 路径废止）；
     /// send-info 同门标因（injectable=false + reasonCode）——移动端发送入口置灰的单一来源

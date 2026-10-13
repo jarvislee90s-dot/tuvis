@@ -88,7 +88,7 @@ use std::sync::Arc;
 
 // 底座复用（turn.rs:325/336 单点口径）：Ok 回执的末条 assistant 摘要截断——
 // 不在本模块内联第二份截断写法
-use super::receipt::{Receipt, Stage};
+use super::receipt::{Receipt, ReceiptStatus, Stage};
 use super::turn::ok_receipt_with_assistant;
 
 /// dsh CLI 的 acp profile 名（`--profile acp`；T0.3 候选 A 定案）
@@ -1113,6 +1113,63 @@ impl Targeting {
     }
 }
 
+/// 靶向词表（评审 I6；与 WB [`super::wb_acp::TARGETING_PREFIX`] **同纪律、各自措辞**
+/// ——两家的「新建/当前会话」语义不同，共用一句话会说错话）。
+pub const TARGETING_PREFIX: &str = "已投递至 dsh 新建会话";
+/// 不一致明示语（投递会话 ≠ 卡面所选会话——用户以为发给了 A，实际进了新建的 B）
+pub const MISMATCH_CLAUSE: &str = "消息已进入新建会话，与所选会话不同";
+
+/// new 臂靶向标注（对齐 WB [`super::wb_acp::delivered_session_note`] 的语义，评审 I6）。
+///
+/// `Some(全文)` = **必须明示**：dsh 的 resume 未命中时新建会话投递
+/// （[`Targeting::NewSession`]）——投递目标 ≠ 卡面所选会话是**结构性**风险（不是异常），
+/// 回执必须自己说清「进了哪个会话、与所选不同」，否则用户只看到一个裸 `ok`。
+/// `None` = 无需标注（投递会话号为空 / 与卡面一致）。
+pub fn delivered_session_note(delivered_sid: &str, card_sid: &str) -> Option<String> {
+    if delivered_sid.is_empty() || delivered_sid == card_sid {
+        return None;
+    }
+    Some(format!(
+        "{TARGETING_PREFIX}（sessionId={delivered_sid}）；注意：{MISMATCH_CLAUSE}"
+    ))
+}
+
+/// 审计 result 词的靶向双记（对齐 WB [`super::wb_acp::audit_word_with_targeting`]，评审 I6）：
+/// 审计行的 session 列 = **卡面会话**（设备检索入口语义：用户对哪张卡做了动作，不动）；
+/// 不一致时把**实际投递会话号**双记进 result 词——两个会话都可追溯，不二选一。
+pub fn audit_word_with_targeting(word: &str, card_sid: &str, delivered_sid: &str) -> String {
+    if delivered_sid.is_empty() || delivered_sid == card_sid {
+        return word.to_string();
+    }
+    format!("{word}（{TARGETING_PREFIX} sessionId={delivered_sid}，{MISMATCH_CLAUSE}）")
+}
+
+/// 回执靶向明示的应用单点（评审 I6；api.rs `run_dsh_turn` 调用）：`NewSession` 且投递
+/// 会话 ≠ 卡面会话时，把明示语**追加**到 `receipt.reason`（原有成因保留在前，明示语在后
+/// ——与 WB 三态同款纪律）。
+///
+/// **Failed 不加**（对齐 WB `delivered_session_note` 的边界）：协议错误/通道错误下正文
+/// **未必送达**，此时说「消息已进入新建会话」是超出证据的结论；投递会话号仍由回执
+/// `session_id` 字段承载（可追溯性不丢）。返回是否实际追加（可观测面）。
+pub fn apply_targeting_note(receipt: &mut Receipt, targeting: &Targeting, card_sid: &str) -> bool {
+    if receipt.status == ReceiptStatus::Failed {
+        return false;
+    }
+    let Targeting::NewSession { session_id } = targeting else {
+        return false;
+    };
+    let Some(note) = delivered_session_note(session_id, card_sid) else {
+        return false;
+    };
+    let tail = receipt.reason.take().unwrap_or_default();
+    receipt.reason = Some(if tail.is_empty() {
+        note
+    } else {
+        format!("{tail}；{note}")
+    });
+    true
+}
+
 /// dsh 发送回执（归一 Receipt + 靶向标注 + 完成判据透传）
 #[derive(Debug, Clone, PartialEq)]
 pub struct DshSendReceipt {
@@ -1893,6 +1950,94 @@ pub mod test_hooks {
 
 #[cfg(test)]
 mod tests {
+
+    // ===== 靶向明示（评审 I6）=====
+
+    /// new 臂靶向标注与审计双记的**词表与判据单点**（纯核）：投递会话 ≠ 卡面会话时必须
+    /// 明示（含投递号 + 「与所选会话不同」）；一致/空号 → 无需标注（零冗余）。
+    /// 撤回修复（把 `delivered_session_note` 恒回 None）→ 前两条断言先红。
+    #[test]
+    fn new_session_delivery_note_is_mandatory_when_targeting_mismatches() {
+        const CARD: &str = "session-aaaa";
+        const NEW: &str = "3fb0c1d2-aaaa-4bbb-8ccc-dddddddddddd";
+        let note = delivered_session_note(NEW, CARD).expect("投递会话 ≠ 卡面 ⇒ 必须明示");
+        assert!(note.contains(TARGETING_PREFIX), "{note}");
+        assert!(note.contains(&format!("sessionId={NEW}")), "{note}");
+        assert!(note.contains(MISMATCH_CLAUSE), "{note}");
+        assert_eq!(
+            delivered_session_note(CARD, CARD),
+            None,
+            "投递会话 = 卡面 ⇒ 零冗余（不标注）"
+        );
+        assert_eq!(
+            delivered_session_note("", CARD),
+            None,
+            "空号 ⇒ 无投递会话可标"
+        );
+        // 审计双记：不一致时补投递视角；一致/空号时原词零变化
+        assert_eq!(audit_word_with_targeting("ok", CARD, CARD), "ok");
+        assert_eq!(audit_word_with_targeting("ok", CARD, ""), "ok");
+        let word = audit_word_with_targeting("ok", CARD, NEW);
+        assert!(
+            word.starts_with("ok（") && word.contains(NEW) && word.contains(MISMATCH_CLAUSE),
+            "终态词在前、投递号与明示语在后: {word}"
+        );
+    }
+
+    /// 回执明示的应用单点（评审 I6）：只有 `NewSession` 且**非 Failed** 才追加
+    /// （Failed 时正文未必送达——说「消息已进入新建会话」是超出证据的结论）；
+    /// 原成因保留在前，明示语在后。
+    #[test]
+    fn apply_targeting_note_only_for_new_session_success() {
+        const CARD: &str = "session-bbbb";
+        const NEW: &str = "3fb0c1d2-aaaa-4bbb-8ccc-dddddddddddd";
+        let mut ok = Receipt::ok(CARD, 12);
+        ok.reason = Some("回合完成".to_string());
+        assert!(apply_targeting_note(
+            &mut ok,
+            &Targeting::NewSession {
+                session_id: NEW.to_string()
+            },
+            CARD
+        ));
+        let reason = ok.reason.clone().unwrap_or_default();
+        assert!(
+            reason.starts_with("回合完成；") && reason.contains(MISMATCH_CLAUSE),
+            "原成因在前、明示语在后: {reason}"
+        );
+        // resume 命中 / 桌面占用（零字节投递）⇒ 不标注
+        let mut resumed = Receipt::ok(CARD, 12);
+        assert!(!apply_targeting_note(
+            &mut resumed,
+            &Targeting::Resumed {
+                session_id: CARD.to_string()
+            },
+            CARD
+        ));
+        assert_eq!(resumed.reason, None);
+        let mut refused = Receipt::failed(Stage::Refused, "桌面写者占用");
+        assert!(!apply_targeting_note(
+            &mut refused,
+            &Targeting::RefusedDesktopWriter {
+                session_id: CARD.to_string(),
+                lock_message: "lock".to_string()
+            },
+            CARD
+        ));
+        // 失败态即便走 NewSession 也不标注（正文未必送达——不超证据）
+        let mut failed = Receipt::failed(Stage::ChannelError, "回合失败（协议错误 -32000）");
+        assert!(!apply_targeting_note(
+            &mut failed,
+            &Targeting::NewSession {
+                session_id: NEW.to_string()
+            },
+            CARD
+        ));
+        assert_eq!(
+            failed.reason.as_deref(),
+            Some("回合失败（协议错误 -32000）")
+        );
+    }
     use super::super::receipt::ReceiptStatus;
     use super::*;
     use std::collections::VecDeque;

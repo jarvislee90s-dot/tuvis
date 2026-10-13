@@ -1453,7 +1453,7 @@ pub fn run_turn(args: &WbTurnArgs, deps: &WbDeps) -> WbTurnOutcome {
     // ① 全局并发名额（H4：**不自建 `GlobalSem`**；超额即时排队回执，不阻塞、不静默丢）
     let Some(_permit) = deps.sem.try_acquire() else {
         return WbTurnOutcome::not_started(
-            Receipt::queued(deps.sem.queue_position()).with_session(&args.sid),
+            Receipt::concurrency_full(deps.sem.cap()).with_session(&args.sid),
         );
     };
     // ② 端点发现（心跳 → 端口指纹 → **如实不可用**；不可用 = 投递前拒绝、零 HTTP）
@@ -3595,7 +3595,8 @@ mod tests {
 
     // ===== 名额与锁 =====
 
-    /// H4 全局名额：无名额 ⇒ **即时排队回执**（含全局位次），不盲试、不发 HTTP
+    /// H4 全局名额：无名额 ⇒ **即时未执行回执**（评审 I1：如实说明未执行、不谎报位次），
+    /// 不盲试、不发 HTTP
     #[test]
     fn over_cap_turn_returns_queued_receipt_without_http() {
         let http = MockHttp::new();
@@ -3611,12 +3612,19 @@ mod tests {
             "{:?}",
             out.receipt
         );
-        assert_eq!(
-            out.receipt.queue_position(),
-            Some(5),
-            "4 个在飞 → 本请求第 5 位"
+        let reason = out.receipt.reason.as_deref().unwrap_or("");
+        assert!(
+            reason.contains(&format!("无头并发已满（上限 {}）", fx.sem.cap()))
+                && reason.contains("未执行"),
+            "满额回执必须如实说明未执行 + 实际上限: {:?}",
+            out.receipt
         );
-        assert_eq!(http.calls().len(), 0, "排队请求不得起跑");
+        assert!(
+            !reason.contains("位等待中"),
+            "满额回执不得再声称排队等待（生产无真排队）: {:?}",
+            out.receipt
+        );
+        assert_eq!(http.calls().len(), 0, "满额请求不得起跑");
         drop((hold_a, hold_b, hold_c, hold_d));
         assert_eq!(fx.sem.in_flight(), 0, "名额必须归还（守卫 Drop）");
         http.assert_clean();

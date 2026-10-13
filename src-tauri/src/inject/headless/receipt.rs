@@ -72,10 +72,6 @@ pub struct Receipt {
     pub stage: Option<Stage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// 排队位次（H4：超额请求即时排队回执含全局队列位置）。**不上线**——线上位置
-    /// 由 `reason` 文案承载（spec H6 形状不含此键，不擅自扩契约）
-    #[serde(skip)]
-    pub queued_at: Option<usize>,
 }
 
 impl Receipt {
@@ -99,11 +95,17 @@ impl Receipt {
         r
     }
 
-    /// 排队终态（H4：**即时**排队回执，含全局队列位置；不阻塞、不静默丢）
-    pub fn queued(position: usize) -> Self {
+    /// 并发名额已满终态（H4：**即时**回执——不阻塞、不静默丢，但**本条未执行**）。
+    ///
+    /// **文案诚实化（评审 I1）**：旧文案「全局队列第 {position} 位等待中」是假话——
+    /// 生产上**没有真排队机制**（无名额即早退，释放后也不会自动补跑），位次恒等于
+    /// 「在飞数 + 1」（`waiting` 只有测试面的阻塞取名额会加），故位次与「等待中」一并删除。
+    /// 现在只描述**已发生的事实**：名额已满、本条未起跑、未投递，重发是用户的动作。
+    pub fn concurrency_full(cap: usize) -> Self {
         let mut r = Self::base(ReceiptStatus::Queued, "", 0);
-        r.queued_at = Some(position);
-        r.reason = Some(format!("全局队列第 {position} 位等待中"));
+        r.reason = Some(format!(
+            "无头并发已满（上限 {cap}）：本条未执行、未投递——请稍后重发"
+        ));
         r
     }
 
@@ -116,7 +118,6 @@ impl Receipt {
             duration_ms,
             stage: None,
             reason: None,
-            queued_at: None,
         }
     }
 
@@ -146,11 +147,6 @@ impl Receipt {
             }
             _ => Terminator::Exit,
         }
-    }
-
-    /// 排队位次（None = 未排队）
-    pub fn queue_position(&self) -> Option<usize> {
-        self.queued_at
     }
 }
 
@@ -352,13 +348,42 @@ mod tests {
         let ok = Receipt::ok("s1", 1234);
         assert_eq!(ok.status, ReceiptStatus::Ok);
         assert_eq!(ok.terminator(), Terminator::Exit);
-        // 排队回执（H4：超额请求即时排队，回执含全局队列位置）
-        let queued = Receipt::queued(3);
-        assert_eq!(queued.status, ReceiptStatus::Queued);
-        assert_eq!(queued.queue_position(), Some(3));
+        // 并发名额已满终态（H4）：未起跑；文案只陈述已发生的事实
+        let full = Receipt::concurrency_full(2);
+        assert_eq!(full.status, ReceiptStatus::Queued);
+        assert_eq!(full.terminator(), Terminator::NotStarted);
+        assert_eq!(
+            full.reason.as_deref(),
+            Some("无头并发已满（上限 2）：本条未执行、未投递——请稍后重发")
+        );
+    }
+
+    /// 评审 I1（假队列回执诚实化）：满额回执**不得**再声称「第 N 位等待中」——
+    /// 生产没有真排队（无名额即早退，释放后也不补跑），位次恒假。
+    /// 撤掉修复（回到 `queued(position)` + `queue_position()`）本测必红。
+    #[test]
+    fn concurrency_full_receipt_never_promises_a_queue_position() {
+        let r = Receipt::concurrency_full(2);
+        let reason = r.reason.as_deref().unwrap_or("");
+        for lie in ["位等待中", "第 3 位", "第 2 位", "全局队列"] {
+            assert!(
+                !reason.contains(lie),
+                "满额回执不得含排队位次话术「{lie}」: {reason}"
+            );
+        }
         assert!(
-            queued.reason.as_deref().unwrap_or("").contains('3'),
-            "排队回执必须在 reason 里带出队列位置: {queued:?}"
+            reason.contains("未执行"),
+            "必须如实说明本条未执行: {reason}"
+        );
+        assert!(reason.contains("未投递"), "必须如实说明零投递: {reason}");
+        assert!(reason.contains('2'), "必须带出实际并发上限: {reason}");
+        // 位次是**不上线的内部字段**，随假话术一并删除——线上不得出现任何位次键
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("queuedAt").is_none(), "满额回执不得上线条目位次: {v}");
+        assert_eq!(
+            v["status"],
+            serde_json::json!("queued"),
+            "状态词仍为「未起跑」档（驱动层负责转译为 refused）"
         );
     }
 
@@ -404,7 +429,7 @@ mod tests {
         let sparse = Receipt::ok("s1", 5);
         let sv = serde_json::to_value(&sparse).unwrap();
         assert_eq!(sv["status"], serde_json::json!("ok"));
-        for k in ["tokens", "stage", "reason", "lastAssistant", "queuedAt"] {
+        for k in ["tokens", "stage", "reason", "lastAssistant"] {
             assert!(sv.get(k).is_none(), "缺席的可选键不得以 null 出现: {sv}");
         }
     }

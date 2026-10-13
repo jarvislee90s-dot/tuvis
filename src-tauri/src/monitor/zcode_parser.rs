@@ -2255,6 +2255,66 @@ mod tests {
         assert!(store_snapshot(&missing, SID_A).is_none());
     }
 
+    /// **评审 I15 的形状事实钉**：**未知会话号 ⇒ `Some(空快照)`，绝不是 `None`**。
+    ///
+    /// 为什么必须钉死：生产 `TurnDeps::production` 的库读缝就是本文件的
+    /// [`store_snapshot_home`]，而 zcode **新建**通道按**锁键**（`create|e:/proj`——起跑时
+    /// 还没有会话号）读它，库里结构上不会有该键的行。若这里的结局是 `None`（「读不到」），
+    /// 下游 `confirm_from_store` 会判 `StoreConfirmation::Unavailable`（**库不可读**臂）；
+    /// 实际结局是 `Some(默认快照)` ⇒ 判 `NoNewAssistant`（**库读得到、只是没有本轮新回复**）。
+    /// 两臂的文案不同（`zcode::channel_error_reason`），**新建的真机常态走的是后者**——把
+    /// `None` 当常态，等于给「新建」语境抄一句只对 `--resume` 成立的空真诊断（I15）。
+    ///
+    /// 与 I5（[`store_snapshot_is_none_when_part_table_is_missing`]）合起来的完整形状：
+    /// **读失败才 `None`**（缺库 / 缺表 / 缺列 / 加锁 / parts 读失败）；**读得到 = `Some`**，
+    /// 哪怕一行都没有。
+    #[test]
+    fn store_snapshot_of_an_unknown_session_is_readable_empty_not_none() {
+        /// 在册、但**零消息行**的会话（懒落库 / 新建刚起跑的真机形态）
+        const SID_B: &str = "sess_22222222-2222-4222-8222-222222222222";
+        let tmp = tempfile::tempdir().unwrap();
+        // 走**生产 seam**（`store_snapshot_home` ⇒ `ZcodeRoots::from_home` = `<home>/.zcode`）
+        let home = tmp.path();
+        let roots = ZcodeRoots::from_home(home);
+        let cli = build_cli_db(&roots.cli_db);
+        // 库里非空：一个会话有 assistant 消息（证明「查不到行」不是「整库没数据」的假象）
+        insert_session(&cli, SID_A, None, "/tmp/proj", "interactive", None, 1_000);
+        insert_message(
+            &cli,
+            "m1",
+            SID_A,
+            1,
+            10,
+            r#"{"role":"assistant","tokens":{"output":5}}"#,
+        );
+        insert_part(&cli, "p1", "m1", 1, r#"{"type":"text","text":"别的会话"}"#);
+        // 在册但**零消息行**的会话（懒落库/新建刚起跑的真机形态）
+        insert_session(&cli, SID_B, None, "/tmp/proj", "interactive", None, 1_000);
+        drop(cli);
+
+        // ① 未在册的会话号（合规形态也不算数）→ 可读的空快照
+        let unknown = store_snapshot_home(home, "sess_ffffffff-ffff-4fff-8fff-ffffffffffff")
+            .expect("未知会话号 = 可读结局（空快照）；`None` 只留给「读不到」");
+        assert_eq!(unknown, ZcodeStoreSnapshot::default());
+        // ② 在册但零消息行的会话 → 同样是可读空快照
+        let no_rows = store_snapshot_home(home, SID_B).expect("零消息行的会话 = 可读结局");
+        assert_eq!(no_rows, ZcodeStoreSnapshot::default());
+        // ③ 新建通道实际读的键（**锁键**，连会话号形态都不是）同形：SQL 一行不匹配而已
+        let lock_key = "create|e:/proj";
+        let lock = store_snapshot_home(home, lock_key).expect("锁键读库同样可读（空快照）");
+        assert_eq!(lock, ZcodeStoreSnapshot::default());
+
+        // 反锚：库**真读不到** → 这时才是 `None`（两种结局必须分得开）
+        let missing = ZcodeRoots {
+            tasks_db: tmp.path().join("nope-tasks.sqlite"),
+            cli_db: tmp.path().join("nope-cli.sqlite"),
+        };
+        assert!(
+            store_snapshot(&missing, SID_A).is_none(),
+            "缺库 = 读不到 ⇒ None（与「读得到但没有行」严格区分）"
+        );
+    }
+
     /// **H10 新建基线读件**（Task 12 + 复审 Important 2）：`stored_sessions` = 在册
     /// `(id, 目录, time_created)` 表——与出卡同源口径（interactive / 子代理排除 / 合规 id /
     /// 有界），**返回 `Option`**（`None` = 库不可读，**不是**「没有会话」），并给出

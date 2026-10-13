@@ -535,6 +535,7 @@ pub async fn run_create(
         return CreateOutcome {
             receipt: unconfirmed_receipt(
                 turn.receipt,
+                turn.receipt_source,
                 &format!("stdout 帧给出的会话号形态不合规（{id}）——未确认新会话"),
             ),
             confirmation: NewSessionConfirmation::Unconfirmed,
@@ -545,7 +546,11 @@ pub async fn run_create(
     // 基线不可得 ⇒ 判据不可得（复审 Important 2）：**跳过发现**、如实未确认（不猜）
     let Some(before) = before else {
         return CreateOutcome {
-            receipt: unconfirmed_receipt(turn.receipt, BASELINE_UNAVAILABLE_NOTE),
+            receipt: unconfirmed_receipt(
+                turn.receipt,
+                turn.receipt_source,
+                BASELINE_UNAVAILABLE_NOTE,
+            ),
             confirmation: NewSessionConfirmation::Unconfirmed,
             attempts: turn.attempts,
             busy_final: turn.busy_final,
@@ -581,7 +586,11 @@ pub async fn run_create(
             }
         }
         other => CreateOutcome {
-            receipt: unconfirmed_receipt(turn.receipt, &discovery_note(&other)),
+            receipt: unconfirmed_receipt(
+                turn.receipt,
+                turn.receipt_source,
+                &discovery_note(&other),
+            ),
             confirmation: NewSessionConfirmation::Unconfirmed,
             attempts: turn.attempts,
             busy_final: turn.busy_final,
@@ -665,6 +674,36 @@ fn fill_missing_from_store(mut r: Receipt, id: &str, deps: &CreateDeps) -> Recei
     r
 }
 
+/// create 语境的未确认**基础文案**（评审 I15）：只说两件真事——
+/// ①「本轮未确认到新的 assistant 回复」（不冒充成功、不说「回复被吞」）；
+/// ②新建语境下用户能做什么（去 ZCode 应用里看那个新建会话，再决定是否重发）。
+///
+/// **不掺** H7 [`super::zcode::channel_error_reason`] 那句只对 `--resume` 成立的诊断
+/// （见 [`H7_NO_NEW_ASSISTANT_CLAUSE`]）。
+const CREATE_UNCONFIRMED_BASE: &str = "新建回合未确认到本轮新的 assistant 回复——\
+     请在 ZCode 应用内打开该项目下新建的会话核实首句是否送达，再决定是否重发\
+     （重发会再建一个会话）";
+
+/// H7 [`super::zcode::channel_error_reason`] 在「库**可读**、但没有本轮新 assistant 回复」
+/// 臂里的**空真诊断**子句（原样摘录，供 [`create_evidence`] 剥离）。
+///
+/// 为什么它在 create 语境里是空真：新建回合按**锁键**（`create|e:/proj`，起跑时尚无会话号）
+/// 读会话库，库里结构上不会有该键的行 ⇒「库里没有本轮新的 assistant 回复」对**任何**新建
+/// 回合都恒成立——它由**读键**决定，不是「回复被应用侧吞掉」的证据。照抄给用户听既解释不了
+/// 任何事，又与未确认附注的「勿盲目重发（重发会再建一个会话）」口径打架（评审 I15）。
+///
+/// 措辞若在 H7 侧漂移，剥离会失配 ⇒ 空真子句原样漏进回执 ⇒ 本模块的
+/// `run_create_normal_arm_...` 用例变红（**失败可见，不静默**）。
+const H7_NO_NEW_ASSISTANT_CLAUSE: &str = "，且会话库里**没有**本轮新的 assistant 回复\
+     （回合可能被应用侧中断/吞掉）——请在会话内容中确认后再决定是否重发";
+
+/// 把继承来的 H7 诊断**降级为证据**（评审 I15）：只做一次精确删减（剥掉
+/// [`H7_NO_NEW_ASSISTANT_CLAUSE`] 那句空真诊断），**其余逐字保留**——exit 0 / 无 JSON 帧 /
+/// stdout 头 / stderr 以及别的真成因（如「会话库不可读」）一个字不动，**不重写、不臆造**。
+fn create_evidence(reason: &str) -> String {
+    reason.replace(H7_NO_NEW_ASSISTANT_CLAUSE, "")
+}
+
 /// 未确认臂：**会话号一律清空**——**无论它看着多合法**。
 ///
 /// 为什么无条件（Task 12 复审 Important 1）：未确认的来路不止「锁键兜底」一种，最尖的一种是
@@ -674,13 +713,28 @@ fn fill_missing_from_store(mut r: Receipt, id: &str, deps: &CreateDeps) -> Recei
 /// `confirmation:"none"` 发出**非空 `sessionId`**：线契约自相矛盾，审计行的会话号列也不再是
 /// 「未确认」的意思。契约必须是「Unconfirmed ⇒ `sessionId` 为空」——**在源头（回执）与
 /// 出口（[`crate::remote::api::create_envelope`]）两层都成立**。
-fn unconfirmed_receipt(mut r: Receipt, note: &str) -> Receipt {
+///
+/// **评审 I15（本函数是未确认文案的单一决策点）**：`ReceiptSource::Unconfirmed` 是「exit 0
+/// 但按**锁键**读库没确认到本轮新回复」——H7 那套 `channel_error` 文案只对 `--resume` 成立，
+/// 套在**新建**语境上就是空真诊断。故按 create 语境**重建**基础文案（[`CREATE_UNCONFIRMED_BASE`]），
+/// 把 H7 的**真成因降级为证据**接在后面（**create 文案在前、原诊断在后**）。
+/// 其余来源（崩溃/超时/取消/工作区忙 = `NotApplicable`）的诊断是**真成因**，原样保留、不改写。
+fn unconfirmed_receipt(turn_receipt: Receipt, source: zcode::ReceiptSource, note: &str) -> Receipt {
+    let mut r = turn_receipt;
     r.session_id = String::new();
-    let base = r
-        .reason
-        .clone()
-        .unwrap_or_else(|| "新建回合未确认新会话".to_string());
-    r.reason = Some(format!("{base}｜{note}"));
+    let inherited = r.reason.clone();
+    r.reason = Some(match (source, inherited) {
+        (zcode::ReceiptSource::Unconfirmed, Some(diagnosis)) => format!(
+            "{CREATE_UNCONFIRMED_BASE}｜{note}｜\
+             原诊断（H7 按**锁键**读库，键不是会话号）：{}",
+            create_evidence(&diagnosis)
+        ),
+        (zcode::ReceiptSource::Unconfirmed, None) => {
+            format!("{CREATE_UNCONFIRMED_BASE}｜{note}")
+        }
+        (_, Some(diagnosis)) => format!("{diagnosis}｜{note}"),
+        (_, None) => format!("新建回合未确认新会话｜{note}"),
+    });
     r
 }
 
@@ -1259,13 +1313,25 @@ mod tests {
         (probe, calls)
     }
 
-    /// 只在**点名 id** 时命中（其余 = 读不到）：Task 8 的锁键探针在新建路径上必然落空，
-    /// 本桩把「新建会话的快照」与「按会话号的快照」分开，避免测试互相串味
+    /// 只在**点名 id** 时命中；**未命中 = 生产同形**（评审 I15）：库可读时，未知会话号
+    /// （含新建通道实际读的**锁键** `create|e:/proj`——起跑时尚无会话号）在真库里就是
+    /// 「SQL 一行不匹配」⇒ `store_snapshot_conn` 回 **`Some(ZcodeStoreSnapshot::default())`**
+    /// （空快照），**不是** `None`——`None` 专表「**读不到**」（缺库/缺表/缺列/加锁/parts 读失败，
+    /// 见 `zcode_parser::store_snapshot_is_none_when_part_table_is_missing` 与
+    /// `store_snapshot_of_an_unknown_session_is_readable_empty_not_none`）。
+    ///
+    /// 旧桩把未命中一律回 `None`，于是新建路径的**生产常态**（按锁键读库 ⇒ `Some(空)`
+    /// ⇒ `StoreConfirmation::NoNewAssistant` ⇒ `channel_error` 未确认臂）在测试里**从未发生过**，
+    /// 只覆盖了「库不可读」这条冷路径——那条臂的文案与常态臂不同，于是常态臂零覆盖（I15）。
+    /// 桩必须镜像生产形状；需要「真读不到」的用例请显式用 `Box::new(|_| None)` 缝。
     fn keyed_store(map: Vec<(&'static str, StoreSnapshot)>) -> Box<StoreProbe> {
         Box::new(move |sid: &str| {
-            map.iter()
-                .find(|(id, _)| *id == sid)
-                .map(|(_, s)| s.clone())
+            Some(
+                map.iter()
+                    .find(|(id, _)| *id == sid)
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_default(),
+            )
         })
     }
 
@@ -1530,6 +1596,142 @@ mod tests {
         assert!(
             !reason.contains("create|"),
             "原因里不得泄露内部锁键：{reason}"
+        );
+    }
+
+    /// **评审 I15：生产常态臂 + create 语境文案**（本用例是 I15 的主题用例）。
+    ///
+    /// 生产常态形状：`--json` 没打出可解析帧（exit 0 正常结束）⇒ 回合走会话库确认；而新建
+    /// 通道读库用的键是**锁键**（起跑时尚无会话号，见 [`zcode::create_lock_key`]）⇒ 库里一行
+    /// 都不匹配 ⇒ `store_snapshot_conn` 回 `Some(空快照)` ⇒
+    /// `StoreConfirmation::NoNewAssistant` ⇒ `ReceiptSource::Unconfirmed`。
+    ///
+    /// **旧实现为什么零覆盖**：旧测试桩 [`keyed_store`] 把未命中的键（正是锁键）一律回 `None`
+    /// ⇒ 同一回合被判成 `StoreConfirmation::Unavailable`（**库不可读**臂）——测试只跑了那条
+    /// 冷路径，而真机常态那条臂（库读得到、只是没有本轮新回复）**一次都没跑过**，H7 那段只对
+    /// `--resume` 成立的 `channel_error` 文案就这样逐字漏给「新建」语境（空真诊断）。
+    ///
+    /// 本用例断言：① 确实走常态臂（不是不可读臂）；② 文案是 **create 语境**（点明新建 +
+    /// create 的下一步动作）；③ 不含 H7 空真诊断的逐字原文；④ 原成因仍作证据留在末尾。
+    #[tokio::test]
+    async fn run_create_normal_arm_reports_a_create_context_unconfirmed_receipt() {
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
+        let lock_key = zcode::create_lock_key("E:/proj", "windows");
+        // 库可读但项目里空无一物：基线空表 + 回合后仍空表 ⇒ 发现判 None（如实未确认）
+        let (stored_fn, _) = stored_seq(vec![Some(vec![]), Some(vec![])]);
+        let probe = keyed_store(vec![]);
+        // 桩即生产形状（钉在断言里：桩若悄悄变回 `None`，本用例立刻红）
+        assert_eq!(
+            probe(&lock_key),
+            Some(StoreSnapshot::default()),
+            "桩必须镜像生产：锁键（不是会话号）在真库里就是一行不匹配 ⇒ Some(空快照)，不是 None"
+        );
+        let deps = test_deps(
+            stored_fn,
+            probe,
+            Box::new(|_| Ok(())),
+            false,
+            Arc::new(Mutex::new(Vec::new())),
+            1,
+        );
+        let seam = scripted_seam(0, vec!["ZCode Built-in skipped (not-due)".to_string()]);
+        let out = run_create(
+            &inv,
+            "E:/proj",
+            PathPlan::Existing,
+            &lock_key,
+            &make_runner,
+            &deps,
+            &*seam,
+        )
+        .await;
+        assert_eq!(out.confirmation, NewSessionConfirmation::Unconfirmed);
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert_eq!(out.receipt.stage, Some(Stage::ChannelError));
+        assert_eq!(out.receipt.session_id, "");
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        // ① 常态臂 ≠ 不可读臂（两条臂文案不同；混为一谈就说不清「读得到但没有」）
+        assert!(
+            !reason.contains("会话库不可读"),
+            "这是「库读得到、只是没有本轮新回复」的常态臂：{reason}"
+        );
+        // ② 不得逐字继承 H7 那句空真诊断（对任何新建回合恒真，且与「勿盲目重发」打架）
+        assert!(
+            !reason.contains("会话库里**没有**本轮新的 assistant 回复")
+                && !reason.contains("回合可能被应用侧中断/吞掉")
+                && !reason.contains("请在会话内容中确认后再决定是否重发"),
+            "create 语境不得照抄只对 --resume 成立的空真诊断：{reason}"
+        );
+        // ③ create 语境：点明新建 + create 的下一步动作
+        assert!(reason.contains("新建"), "必须点明「新建」语境：{reason}");
+        assert!(
+            reason.contains("未确认到本轮新的 assistant 回复"),
+            "必须如实只说「本轮未确认到新的 assistant 回复」：{reason}"
+        );
+        assert!(
+            reason.contains("ZCode 应用内打开") && reason.contains("再决定是否重发"),
+            "必须给出 create 语境下的下一步动作（而不是 resume 的「在会话内容中确认」）：{reason}"
+        );
+        // ④ 原成因仍作证据保留（exit 0 / 无 JSON 帧 / stdout 头 / stderr 都是真证据）
+        assert!(
+            reason.contains("原诊断（H7 按**锁键**读库")
+                && reason.contains("进程正常退出（exit 0）但未拿到回执")
+                && reason.contains("stdout 无可解析 JSON 帧"),
+            "原诊断的证据部分必须如实保留（create 文案在前、原诊断在后）：{reason}"
+        );
+        assert!(
+            reason.contains("未确认新会话") && reason.contains("勿盲目重发"),
+            "发现结论附注（未确认新会话 + 勿盲目重发）必须仍在：{reason}"
+        );
+    }
+
+    /// **评审 I15 的反锚**：真·读不到（读缝回 `None`，与常态形状严格区分）时，
+    /// `channel_error` 的**真成因**（「会话库不可读，无法确认本轮结果」）**不得**被 create
+    /// 语境的重建顺手抹掉——重建只换**基础文案**（create 文案在前），真成因原样留在证据位。
+    #[tokio::test]
+    async fn run_create_unreadable_store_keeps_the_real_cause_as_evidence() {
+        let inv = zcode::build_create_argv(&ZcodeSpec::win("D:/ZCode"), "hi", "E:/proj", None)
+            .expect("测试花名在册（新建 argv 构造，见 turn::device_name_refusal）");
+        let lock_key = zcode::create_lock_key("E:/proj", "windows");
+        let (stored_fn, _) = stored_seq(vec![Some(vec![]), Some(vec![])]);
+        let probe: Box<StoreProbe> = Box::new(|_: &str| None); // 真读不到（不是「读得到但没有」）
+        let deps = test_deps(
+            stored_fn,
+            probe,
+            Box::new(|_| Ok(())),
+            false,
+            Arc::new(Mutex::new(Vec::new())),
+            1,
+        );
+        let seam = scripted_seam(0, vec!["ZCode Built-in skipped (not-due)".to_string()]);
+        let out = run_create(
+            &inv,
+            "E:/proj",
+            PathPlan::Existing,
+            &lock_key,
+            &make_runner,
+            &deps,
+            &*seam,
+        )
+        .await;
+        assert_eq!(out.receipt.stage, Some(Stage::ChannelError));
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(
+            reason.starts_with("新建回合未确认到本轮新的 assistant 回复"),
+            "create 文案必须在前：{reason}"
+        );
+        assert!(
+            reason.contains("会话库不可读"),
+            "真成因（库读不到）不得被重建吞掉——它必须原样留在证据位：{reason}"
+        );
+        assert!(
+            reason.contains("ZCode 应用内打开"),
+            "create 语境的下一步动作必须给出：{reason}"
+        );
+        assert!(
+            !reason.contains("会话库里**没有**本轮新的 assistant 回复"),
+            "空真诊断（对新建恒真）任何来源下都不得继承：{reason}"
         );
     }
 

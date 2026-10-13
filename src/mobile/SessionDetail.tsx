@@ -542,10 +542,15 @@ export function HeadlessReceiptCard({
           )}
         </div>
         {/* Task 13/C4：待答的审批/问答卡（claude 双向桥）——用户在回合在飞期间即可应答。
-            卡的生命周期由轮询驱动：核侧登记表清空（答完/回合终结/超时）后自然收走 */}
+            卡的生命周期由轮询驱动：核侧登记表清空（答完/回合终结/超时）后自然收走。
+            **key = requestId（评审 I7）**：claude 长回合会**连问多题**（核侧待答登记表按
+            requestId 排队，答完一题接上下一题的**新 id**）——轮询把 pending 换成另一题时，
+            无 key 会让 React **原位复用**旧实例，把上一题的 picked/free 草稿与「已送达」
+            回显灌进新题（`headlessUnanswered` 据此误判「已答」→ 无感知把旧草稿当新题答案
+            送出）。key 换 id 即换实例：同 id 轮询刷新保留「已送达」回显，换 id 一律归零。 */}
         {approval && (
           <div className="mt-2">
-            <HeadlessApprovalCard pending={approval} />
+            <HeadlessApprovalCard key={approval.requestId} pending={approval} />
           </div>
         )}
       </div>
@@ -583,9 +588,12 @@ export function HeadlessReceiptCard({
             className="rounded-full bg-slate-200/70 px-2 py-0.5 text-slate-600 dark:bg-slate-700/60 dark:text-slate-300"
           >
             {/* **成因只由后端 reason 说话**（Task 9 / H8 起同一 queued 状态有两个成因：
-                H4 全局并发名额已满〔zcode〕、H8 codex 已入队待 APP 消费）——此前的固定括注
-                「全局并发名额已满」对后者是假话，故改为中性文案 + 下方 reason 原样透出 */}
-            排队中（原因见下）
+                H8 codex 已入队待 APP 消费、H4 并发名额已满）。**措辞再诚实化（评审 I1）**：
+                旧文案「排队中」暗示「已排队、会被自动执行」——H4 满额这一支生产上**没有
+                真排队机制**（无名额即早退，释放后不补跑），是假话；zcode 侧已改为
+                `failed(refused)` 不再走本支，WB/claude 侧仍走本支但 reason 已如实写明
+                「未执行、未投递」。故徽章取**对两支都成立的事实**：本条尚未执行 */}
+            未执行（原因见下）
           </span>
         )}
         {cancelled && (

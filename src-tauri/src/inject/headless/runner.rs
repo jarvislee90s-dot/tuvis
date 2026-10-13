@@ -51,8 +51,6 @@ const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Default)]
 struct SemState {
     in_flight: usize,
-    /// 阻塞在 [`GlobalSem::acquire`] 里的请求数（计入队列位置）
-    waiting: usize,
 }
 
 struct SemInner {
@@ -61,7 +59,8 @@ struct SemInner {
     cv: Condvar,
 }
 
-/// 全局并发名额（H4：超额请求**即时排队回执含全局队列位置**——不阻塞死等、不静默丢）
+/// 全局并发名额（H4：超额请求**即时如实回执**——不阻塞死等、不静默丢；**不做真排队**，
+/// 见 [`Receipt::concurrency_full`] 的诚实化说明）
 #[derive(Clone)]
 pub struct GlobalSem {
     inner: Arc<SemInner>,
@@ -93,7 +92,7 @@ impl GlobalSem {
         self.lock().in_flight
     }
 
-    /// 有名额即拿，无名额返回 `None`（调用方据此出**即时排队回执**，不在此阻塞）
+    /// 有名额即拿，无名额返回 `None`（调用方据此出**即时未执行回执**，不在此阻塞）
     pub fn try_acquire(&self) -> Option<SemGuard> {
         let mut st = self.lock();
         if st.in_flight < self.cap() {
@@ -104,8 +103,8 @@ impl GlobalSem {
         }
     }
 
-    /// 阻塞取名额（**今日只有用例在用**；生产路径走 [`Self::try_acquire`] 的**即时排队回执**
-    /// ——`RunnerCfg::run` 两处与端点均为「无名额即回 `queued` + 位次」，不阻塞等名额）。
+    /// 阻塞取名额（**今日只有用例在用**；生产路径走 [`Self::try_acquire`] 的**即时未执行
+    /// 回执**——`RunnerCfg::run` 两处与端点均为「无名额即回 `concurrency_full`」，不阻塞等名额）。
     ///
     /// **`pub(crate)` + `#[cfg(test)]`**（R11）：调用点全部在本 crate 的 `#[cfg(test)]` 模块
     /// （`runner`/`mod`/`wb_acp` 的用例）；集成测试（`src-tauri/tests/`）是**外部 crate**，
@@ -115,20 +114,12 @@ impl GlobalSem {
     #[cfg(test)]
     pub(crate) fn acquire(&self) -> SemGuard {
         let mut st = self.lock();
-        st.waiting += 1;
         while st.in_flight >= self.cap() {
             st = self.inner.cv.wait(st).unwrap_or_else(|e| e.into_inner());
         }
-        st.waiting -= 1;
         st.in_flight += 1;
         drop(st);
         SemGuard { sem: self.clone() }
-    }
-
-    /// 全局队列位次（1-based：在飞数 + 阻塞排队数 + 1）——排队回执的位置来源
-    pub fn queue_position(&self) -> usize {
-        let st = self.lock();
-        st.in_flight + st.waiting + 1
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SemState> {
@@ -743,7 +734,7 @@ impl RunnerCfg {
     {
         let started = Instant::now();
         let Some(_slot) = self.sem.try_acquire() else {
-            return Receipt::queued(self.sem.queue_position()).with_session(&self.session_id);
+            return Receipt::concurrency_full(self.sem.cap()).with_session(&self.session_id);
         };
         let mut acc = FrameAccumulator::default();
         for line in &self.scripted_stdout {
@@ -823,7 +814,7 @@ impl RunnerCfg {
     pub async fn run(&mut self) -> Receipt {
         let started = Instant::now();
         let Some(_slot) = self.sem.try_acquire() else {
-            return Receipt::queued(self.sem.queue_position()).with_session(&self.session_id);
+            return Receipt::concurrency_full(self.sem.cap()).with_session(&self.session_id);
         };
         let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args);
@@ -1045,9 +1036,10 @@ mod tests {
         assert_eq!(sem.in_flight(), 0);
     }
 
-    /// 超额请求：**即时**排队回执 + 全局队列位置（H4），不 spawn、不阻塞
+    /// 超额请求：**即时未执行回执**（H4；不 spawn、不阻塞）——**不再谎报排队位次**
+    /// （评审 I1：生产没有真排队，位次恒假）
     #[test]
-    fn over_cap_turn_returns_queued_receipt_with_position() {
+    fn over_cap_turn_returns_honest_not_executed_receipt() {
         let sem = GlobalSem::new(2);
         let hold_a = sem.acquire();
         let hold_b = sem.acquire();
@@ -1059,17 +1051,17 @@ mod tests {
         });
         assert_eq!(out.status, ReceiptStatus::Queued);
         assert_eq!(out.terminator(), Terminator::NotStarted);
-        assert_eq!(
-            out.queue_position(),
-            Some(3),
-            "2 个在飞 → 本请求全局第 3 位"
+        let reason = out.reason.as_deref().unwrap_or("");
+        assert!(
+            reason.contains("无头并发已满（上限 2）") && reason.contains("未执行"),
+            "满额回执必须如实说明未执行 + 实际上限: {out:?}"
         );
         assert!(
-            out.reason.as_deref().unwrap_or("").contains('3'),
-            "排队回执必须带出队列位置: {out:?}"
+            !reason.contains("位等待中"),
+            "满额回执不得再声称排队等待（生产无真排队）: {out:?}"
         );
-        assert!(!ran.load(AtomicOrdering::SeqCst), "排队请求不得起跑");
-        assert!(r.kill_calls().is_empty(), "排队请求不得 kill 任何进程");
+        assert!(!ran.load(AtomicOrdering::SeqCst), "满额请求不得起跑");
+        assert!(r.kill_calls().is_empty(), "满额请求不得 kill 任何进程");
         drop(hold_a);
         drop(hold_b);
     }
