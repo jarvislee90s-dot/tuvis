@@ -2616,12 +2616,17 @@ mod tests {
             artifact_dedup_key("out/report.md", Some(cwd), false),
             "`..` 段不解析（词法规范化保守边界，不猜）"
         );
-        // Windows 语义（生产 cfg!(windows)=true）：小写归一 + 分隔符归一
-        assert_eq!(
-            artifact_dedup_key("C:/W/Out/Report.MD", Some("C:/w"), true),
-            "c:/w/out/report.md",
-            "Windows 语义下大小写/分隔符/盘符风格归一"
-        );
+        // Windows 语义（生产 cfg!(windows)=true）：小写归一 + 分隔符归一。
+        // ⚠ `Path::is_absolute` 是**宿主平台**语义——`C:/…` 只在 Windows 上判绝对，
+        // Linux 上会按相对拼进 cwd（键多出一段）→ 该断言必须按宿主门控
+        //（与追记「MSYS 风格路径按相对解析」的残留边界同源，CI Linux 首跑抓获）
+        if cfg!(windows) {
+            assert_eq!(
+                artifact_dedup_key("C:/W/Out/Report.MD", Some("C:/w"), true),
+                "c:/w/out/report.md",
+                "Windows 语义下大小写/分隔符/盘符风格归一"
+            );
+        }
         // 空键守卫：词法规范化后无组件的退化输入（空串 / 只由 `.` 构成）各留各的
         // 原文键，不塌缩成同一个空键（生产候选过不了 `is_path_candidate` +
         // `artifact_ext_allowed`，到不了这里；此为纵深防御）
