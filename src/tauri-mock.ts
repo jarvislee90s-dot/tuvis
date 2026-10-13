@@ -129,6 +129,10 @@ if (!isTauri) {
   const fmSuggestionOrDefault = () =>
     localStorage.getItem("mam-mock-fm") === "empty" ? null : mockFmSuggestion;
 
+  // app_run_id（物理坠落按应用重启归位，2026-10-13）：浏览器预览下一次页面加载
+  // 即"一轮运行"——mock 安装时取一次常量，整页生命周期内恒定，刷新即变
+  const mockAppRunId = `mock-run-${Date.now()}`;
+
   // Mock __TAURI_INTERNALS__
   (window as unknown as { __TAURI_INTERNALS__: TauriInternalsMock }).__TAURI_INTERNALS__ = {
     metadata: {
@@ -150,6 +154,9 @@ if (!isTauri) {
   // Mock invoke responses for different commands
   function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise<unknown> {
     switch (cmd) {
+      case "app_run_id":
+        return Promise.resolve(mockAppRunId);
+
       // P2-2：settings 页窗口关闭拦截改用 getCurrentWindow().onCloseRequested。
       // 该 API 依赖上方 __TAURI_INTERNALS__ 的 metadata/transformCallback/postMessage
       //（本 mock 已提供），浏览器渲染下注册为 no-op 监听、永不触发，页面不崩溃——

@@ -10,6 +10,10 @@ import "./i18n";
 import "@/components/common/theme-provider";
 import { initTheme } from "@/components/common/theme-provider";
 void initTheme();
+// 物理坠落按应用重启归位（2026-10-13 用户裁决）：所有窗口入口统一前置触发一次
+// （幂等——同进程多窗口拿同一 run id，标记一致即空过；见 petConfig.resetGravityPerRun）
+import { resetGravityPerRun } from "@/components/pet/petConfig";
+void resetGravityPerRun();
 import { QueryClientProvider } from "@tanstack/react-query";
 import { queryClient } from "@/lib/query/queryClient";
 import { setupToolsChangedListener } from "@/lib/query/toolsChangedSync";
