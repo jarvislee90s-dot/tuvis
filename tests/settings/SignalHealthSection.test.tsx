@@ -2,6 +2,7 @@
 // 覆盖：挂载即 invoke hook_signal_health 渲染四态（未注册灰 / 正常绿含相对时间 /
 // 无活跃会话中性 / 判据命中待办文案 + 复制命令）/ 复制按钮调用剪贴板写入 "/hooks" /
 // 空载荷 → 空态、失败 → 错误态（不伪装空态）/ 刷新按钮触发再次 invoke /
+// 1A 未注册原因细分（helperNotShipped → 蓝 badge 替代裸「未注册」；无 reason 维持灰）/
 // i18n zh-en 无缺键（settings.signalHealth 子树，对齐 AuditLogSection.test.tsx 扫描）。
 // mock 模式沿用 AuditLogSection.test.tsx（vi.hoisted + vi.mock，自带 invoke/event/clipboard）。
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -174,6 +175,58 @@ describe("SignalHealthSection 加载失败态", () => {
     } finally {
       errSpy.mockRestore();
     }
+  });
+});
+
+// 1A 未注册原因细分（PR #146）：helperNotShipped = 本平台不随附 Hook 通道的设计内
+// 状态（如 macOS 上的 kimi）→ 蓝 badge 解释性文案替代裸「未注册」；无 reason /
+// reason 为 null（helper 在场的注册失败）→ 维持裸「未注册」待排查。四组合的 reason
+// 判定已在 Rust 侧入测（monitor/hooks.rs reason 判定四组合），此处锁前端分支互斥
+describe("SignalHealthSection 未注册原因细分（1A）", () => {
+  it("kimi 未注册 + helperNotShipped → 蓝 badge 文案，裸「未注册」不出现", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "hook_signal_health") {
+        return [
+          {
+            toolId: "kimi",
+            label: "Kimi Code",
+            registered: false,
+            hasActiveSessions: false,
+            lastEventAt: null,
+            unregisteredReason: "helperNotShipped",
+          },
+        ];
+      }
+      return null;
+    });
+    render(<SignalHealthSection />);
+    expect(await screen.findByText("Kimi Code")).toBeTruthy();
+    expect(
+      screen.getByText("Hook channel not shipped on this platform — no action needed")
+    ).toBeTruthy();
+    expect(screen.queryByText("Not registered")).toBeNull();
+    expect(document.querySelectorAll("[data-signal-row]").length).toBe(1);
+  });
+
+  it("kimi 未注册但 reason 为 null（helper 在场的注册失败）→ 维持裸「未注册」", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "hook_signal_health") {
+        return [
+          {
+            toolId: "kimi",
+            label: "Kimi Code",
+            registered: false,
+            hasActiveSessions: false,
+            lastEventAt: null,
+            unregisteredReason: null,
+          },
+        ];
+      }
+      return null;
+    });
+    render(<SignalHealthSection />);
+    expect(await screen.findByText("Not registered")).toBeTruthy();
+    expect(screen.queryByText(/no action needed/i)).toBeNull();
   });
 });
 
