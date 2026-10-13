@@ -421,15 +421,84 @@ pub struct TurnRegistry {
     map: Mutex<HashMap<String, TurnSlot>>,
 }
 
+/// 在飞槽位的 **RAII 守卫**（评审 I14）：[`TurnRegistry::begin_guarded`] 占位成功即返回它，
+/// **Drop 自动注销槽位**。
+///
+/// # 为什么需要
+/// `begin`/`end` 手工配对时代，每个 early-return 臂、每个 detached 任务、每次 panic 展开
+/// 都要记得 `end`——漏一处就是该会话**永久**「已有在飞回合」拒绝，直到 MAM 重启
+/// （`TurnRegistry` 无 TTL）。把配对收敛到类型上：占位者拿到守卫，守卫 Drop 即注销。
+///
+/// # 与旧 `end` 逐条等价的不变量
+/// - **refuse 路径不碰锁**：`begin_guarded` 失败**不返回守卫** ⇒ 调用方**无从**注销别人的
+///   槽位（旧 API 下「按会话号误删下一发槽位」的风险是真实存在过的——见 `zcode.rs` 的
+///   U1 记载）；本类型把那条竞态变成**不可表达**；
+/// - **单主**：只有守卫持有者能注销，且守卫**随任务移动**（detached 任务收尾 = 任务内
+///   Drop）——不再有「任何人按会话号全局注销」的口子；
+/// - **可显式早释放**：[`TurnGuard::release`]（与旧 `end` 同一时刻生效；用于「先释放锁、
+///   再写审计行」这类既有顺序），语义 = 消费守卫、Drop 不再重复注销。
+#[must_use = "守卫 Drop 即注销槽位；拿到就丢等于刚占位又立刻让出会话串行锁"]
+pub struct TurnGuard<'a> {
+    session_id: String,
+    registry: &'a TurnRegistry,
+    armed: bool,
+}
+
+impl TurnGuard<'_> {
+    /// 显式早释放（等价于旧 `end`）：消费守卫、立刻注销；Drop 不再重复注销。
+    pub fn release(mut self) {
+        self.armed = false;
+        self.registry.retire(&self.session_id);
+    }
+
+    /// 本守卫占的会话号（诊断/测试可观测面）
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.retire(&self.session_id);
+        }
+    }
+}
+
 impl TurnRegistry {
-    /// 占位（`false` = 该会话已有在飞回合——调用方必须**如实拒绝**：不排队、不覆盖）
-    pub fn begin(&self, session_id: &str, slot: TurnSlot) -> bool {
+    /// 占位内核（`false` = 该会话已有在飞回合）。**私有**：对外只有守卫入口
+    /// [`Self::begin_guarded`] 与测试面 shim [`Self::begin`]——手工配对面不出口到生产。
+    fn insert(&self, session_id: &str, slot: TurnSlot) -> bool {
         let mut g = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if g.contains_key(session_id) {
             return false;
         }
         g.insert(session_id.to_string(), slot);
         true
+    }
+
+    /// 占位并返回 **RAII 守卫**（评审 I14；**生产唯一入口**）：`None` = 该会话已有在飞回合
+    /// ——调用方必须**如实拒绝**（不排队、不覆盖）。拿不到守卫就没有注销能力——这正是
+    /// 「refuse 路径不碰锁」的类型级保证。
+    pub fn begin_guarded(&self, session_id: &str, slot: TurnSlot) -> Option<TurnGuard<'_>> {
+        if !self.insert(session_id, slot) {
+            return None;
+        }
+        Some(TurnGuard {
+            session_id: session_id.to_string(),
+            registry: self,
+            armed: true,
+        })
+    }
+
+    /// 手工占位（**仅测试面 shim**，评审 I14）：返回裸 `bool`，注销靠 [`Self::end`] 手工配对
+    /// ——生产**已零调用点**（七条分派臂全走 [`Self::begin_guarded`]），故按「生产构建零调用」
+    /// 收窄到 `#[cfg(test)]`：与 [`super::runner::GlobalSem::acquire`] 的 R11 同款处置，
+    /// **把手工配对的面从生产 API 里拿掉**，而不是留个口子等后人用出新漏点。
+    /// 用例要测「占位被拒」这类注册表自身语义时用它；要测注销语义请用守卫。
+    #[cfg(test)]
+    pub fn begin(&self, session_id: &str, slot: TurnSlot) -> bool {
+        self.insert(session_id, slot)
     }
 
     /// 更新取消靶子（每尝试一次；无槽位时 no-op——测试直驱各通道 `run_turn` 不建槽）。
@@ -454,12 +523,19 @@ impl TurnRegistry {
         }
     }
 
-    /// 回合终结：注销槽位
-    pub fn end(&self, session_id: &str) {
+    /// 回合终结：注销槽位（**内部**：单主的实现面——只有 [`TurnGuard`] 调得动）
+    fn retire(&self, session_id: &str) {
         self.map
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(session_id);
+    }
+
+    /// 手工注销（**仅测试面 shim**）：与 [`Self::begin`] 成对，理由同它（生产零调用点，
+    /// 收窄到 `#[cfg(test)]`）。
+    #[cfg(test)]
+    pub fn end(&self, session_id: &str) {
+        self.retire(session_id)
     }
 
     pub fn in_flight(&self, session_id: &str) -> bool {
@@ -569,6 +645,87 @@ mod tests {
         let head = head_of(&lines);
         assert_eq!(head.lines().count(), EVIDENCE_HEAD_LINES);
         assert!(head.starts_with("l0") && head.ends_with("l31"));
+    }
+
+    // ===== 串行锁守卫（评审 I14）=====
+
+    /// **守卫在 panic 展开时也必须注销槽位**（评审 I14 的核心承诺）：手工 `begin`/`end`
+    /// 配对的年代，分派臂里任何一处 panic 都会把槽位永久留在表里——该会话此后每次无头发送
+    /// 都被判「已有在飞回合」直到 MAM 重启（`TurnRegistry` 无 TTL）。Drop 守卫把这条路径
+    /// 收进类型。
+    ///
+    /// 变异验证：把 `TurnGuard` 的 `Drop` 体删掉 → 本用例第二条断言红。
+    #[test]
+    fn guard_releases_the_slot_on_panic_unwind() {
+        let reg = TurnRegistry::default();
+        let sid = "sess_i14_panic";
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = reg
+                .begin_guarded(sid, TurnSlot::placeholder("zcode", "hi".into()))
+                .expect("空闲会话必须占到槽位");
+            assert!(reg.in_flight(sid), "守卫存活期间槽位在册");
+            panic!("模拟分派臂 panic（结果未知）");
+        }));
+        assert!(panicked.is_err(), "夹具前提：闭包确实 panic 了");
+        assert!(
+            !reg.in_flight(sid),
+            "panic 展开必须注销槽位（否则该会话永久「已有在飞回合」）"
+        );
+        let again = reg
+            .begin_guarded(sid, TurnSlot::placeholder("zcode", "hi".into()))
+            .expect("槽位真释放——同会话可重新占位（不是残留死锁）");
+        drop(again);
+    }
+
+    /// **早退（early-return）也必须注销**：分派臂里「占位后某步失败 ⇒ return 拒绝」的路径
+    /// 最多——守卫随作用域收尾 Drop，不需要每条 return 记得写 `end`。
+    ///
+    /// 变异验证：把守卫换成 `std::mem::forget`（等价于漏 `end`）→ 本用例第二条断言红。
+    #[test]
+    fn guard_releases_the_slot_on_early_return() {
+        /// 模拟一条「占位后失败即 return」的分派臂
+        fn dispatch_arm(reg: &TurnRegistry, sid: &str, fail: bool) -> Result<(), &'static str> {
+            let _g = reg
+                .begin_guarded(sid, TurnSlot::placeholder("zcode", "hi".into()))
+                .ok_or("已有在飞回合")?;
+            if fail {
+                return Err("安装形态不可达"); // 早退：不写任何 end
+            }
+            Ok(())
+        }
+        let reg = TurnRegistry::default();
+        let sid = "sess_i14_early";
+        assert_eq!(dispatch_arm(&reg, sid, true), Err("安装形态不可达"));
+        assert!(!reg.in_flight(sid), "早退必须注销槽位（守卫随作用域 Drop）");
+        assert_eq!(dispatch_arm(&reg, sid, false), Ok(()));
+        assert!(!reg.in_flight(sid), "正常返回同样注销");
+    }
+
+    /// **拒占路径不碰锁**（评审 I14 点名必须保持的既有语义）：`begin_guarded` 失败返回
+    /// `None` ⇒ 调用方**拿不到守卫** ⇒ 结构上无从注销**别人**的槽位。
+    ///
+    /// 变异验证：把失败臂改成「先 `retire` 再返回 None」（模拟旧代码里按会话号误删）→
+    /// 本用例第三条断言红。
+    #[test]
+    fn guarded_begin_refusal_never_touches_the_occupied_slot() {
+        let reg = TurnRegistry::default();
+        let sid = "sess_i14_refuse";
+        let first = reg
+            .begin_guarded(sid, TurnSlot::placeholder("zcode", "first".into()))
+            .expect("第一次占位");
+        assert!(
+            reg.begin_guarded(sid, TurnSlot::placeholder("zcode", "second".into()))
+                .is_none(),
+            "同会话第二次占位必须如实拒绝（不排队、不覆盖）"
+        );
+        assert!(reg.in_flight(sid), "拒绝不得顺手注销在飞的那一发");
+        assert_eq!(
+            reg.slot_snapshot(sid).map(|(c, _, _)| c),
+            Some("first".to_string()),
+            "在飞内容不得被覆盖"
+        );
+        drop(first);
+        assert!(!reg.in_flight(sid));
     }
 
     // ===== R3：cmd 垫片正文拒绝（票面三条 + stdin 例外面）=====

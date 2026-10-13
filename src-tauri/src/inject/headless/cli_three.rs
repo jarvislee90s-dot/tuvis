@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::receipt::{Receipt, ReceiptStatus, Stage};
-use super::runner::RunnerCfg;
+use super::runner::{GlobalSem, RunnerCfg, SemGuard};
 use super::turn::{BoxFuture, CancelFn, TurnSlot};
 
 // ============================================================
@@ -1109,6 +1109,74 @@ pub struct ClaudeTurnInput {
     /// 取消观察口（生产 = `RunnerCfg::arm_cancel`；测试 = 手动 trigger）；
     /// `None` = 本回合不接取消（测试桩路径）
     pub cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// 全局并发名额停放器（评审 I2；`None` = 调用方未提供 ⇒ 退化为「全程占名额」旧行为）。
+    /// 见 [`PermitParking`]：审批等待期释放名额，应答**送达之前**重新取回。
+    pub permit: Option<PermitParking>,
+}
+
+/// 全局并发名额停放器（评审 I2）：**审批等待期不占名额**的接缝。
+///
+/// # 为什么
+/// claude 是**长驻回合**（进程存活至 turn 结束）。一张无人应答的审批卡会让本回合把
+/// 一个全局名额吃到 watchdog 到点（600s）——两张卡就能让全部八家无头通道在 10 分钟里
+/// 只能收到满额回执。而「等用户作答」期间本回合**并没有在跑**（进程阻塞在 stdin 上、
+/// 零 token 消耗、零工具执行），不该占着名额。
+///
+/// # 语义
+/// - [`Self::park`]：释放当前持有的名额（幂等：已释放则无操作）；
+/// - [`Self::unpark`]：重新取回名额；取不到回 `false`——**调用方必须如实回执并终止回合**
+///   （绝不允许「无名额继续跑」，那会让全局上限名存实亡）。
+///
+/// **名额守卫活到回合结束**：停放器自己持有守卫（`park` 期间为空、`unpark` 后归位），
+/// 停放器随 [`ClaudeTurnInput`] 一起 drop ⇒ 回合收尾必然归还名额（含 panic 展开）。
+pub struct PermitParking {
+    slot: std::sync::Mutex<Option<SemGuard>>,
+    sem: GlobalSem,
+}
+
+impl PermitParking {
+    /// 装配（生产与测试**同源**）：从一个已取到的名额守卫造停放器。
+    pub fn from_guard(guard: SemGuard, sem: GlobalSem) -> Self {
+        Self {
+            slot: std::sync::Mutex::new(Some(guard)),
+            sem,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<SemGuard>> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 释放名额（幂等）。守卫在锁外 Drop（`SemGuard::drop` 要拿名额自己的锁）。
+    pub fn park(&self) {
+        let taken = self.lock().take();
+        drop(taken);
+    }
+
+    /// 重新取回名额（幂等：已持有 → `true`）；取不到 → `false`（如实回执见调用方）。
+    pub fn unpark(&self) -> bool {
+        let mut g = self.lock();
+        if g.is_some() {
+            return true;
+        }
+        match self.sem.try_acquire() {
+            Some(s) => {
+                *g = Some(s);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 是否持有名额（诊断/测试可观测面）
+    pub fn holds(&self) -> bool {
+        self.lock().is_some()
+    }
+
+    /// 全局并发上限（回执措辞用）
+    pub fn cap(&self) -> usize {
+        self.sem.cap()
+    }
 }
 
 /// 回合结局（回执 + 审批计数 + 终结判据证据）
@@ -1144,6 +1212,9 @@ enum EndWhy {
     Timeout,
     /// `control_response` 写 stdin 失败（审批应答送不进去 → 回合无法继续，如实终止）
     WriteFailed,
+    /// 应答到达时**取不回全局并发名额**（评审 I2：等待期已释放名额，被别的回合占了）
+    /// ——不写入应答（绝不让本回合无名额继续跑），如实回执并终止
+    NoPermit,
 }
 
 /// 决策接收（`None` = 当前无待答项：**永不就绪**——由 `select!` 的 `if` 守卫关掉该分支）
@@ -1311,9 +1382,21 @@ pub async fn run_claude_turn(
     )> = std::collections::VecDeque::new();
     let mut exit_code: Option<i32> = None;
     let mut write_fail: Option<String> = None;
+    // **名额停放（评审 I2）**：`parked` = 本回合此刻**不占**全局名额（正在等用户作答）
+    let permit = input.permit.take();
+    let mut parked = false;
     let why: EndWhy;
 
     loop {
+        // 只要在等用户作答就释放名额。登记臂（下一处 `pending_req = Some(...)`）与循环顶
+        // 之间**没有 await**，故不存在「已上卡但仍占名额」的窗口；取回发生在应答**送达之前**
+        // （见 recv_decision 臂：取不回就不写 control_response，如实回执并终止）。
+        if pending_req.is_some() && !parked {
+            parked = true;
+            if let Some(p) = &permit {
+                p.park();
+            }
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             why = EndWhy::Timeout;
@@ -1394,6 +1477,22 @@ pub async fn run_claude_turn(
             d = recv_decision(&mut pending_rx) => {
                 if let Some(d) = d {
                     if let Some(req) = pending_req.take() {
+                        // **先取回名额、再送达（评审 I2）**：取不回 → **不写** control_response
+                        // （绝不让本回合无名额继续跑），如实回执并终止；应答未送达 = 用户
+                        // 需要重发，措辞必须说明这一点，不得谎报「已送达」。
+                        if parked {
+                            parked = false;
+                            if let Some(p) = &permit {
+                                if !p.unpark() {
+                                    log::warn!(
+                                        "headless claude: 审批应答到达但全局并发名额已被占满（会话 {}）——应答未送达，回合终止",
+                                        input.session_id
+                                    );
+                                    why = EndWhy::NoPermit;
+                                    break;
+                                }
+                            }
+                        }
                         match d {
                             Decision::Allow => acc.allowed += 1,
                             Decision::Deny => acc.denied += 1,
@@ -1511,6 +1610,19 @@ pub async fn run_claude_turn(
             &format!(
                 "审批应答写 stdin 失败（{}）——回合无法继续，已终止；kill 进程树 = {killed}",
                 write_fail.unwrap_or_else(|| "未知写错误".to_string())
+            ),
+        )
+        .with_session(&input.session_id)
+        .with_duration_ms(duration_ms),
+        // **如实报「应答未送达」（评审 I2）**：等待期本回合不占名额（这是修法的本意），
+        // 应答到达时名额可能已被别的回合取走——那就不能再让本回合跑下去。
+        EndWhy::NoPermit => Receipt::failed(
+            Stage::ChannelError,
+            &format!(
+                "全局并发名额已被占满（上限 {}）：审批/问答应答**未能送达**本回合\
+                 （等待期本回合不占名额，此刻名额被其他无头回合取走）——回合无法继续，\
+                 已终止，请稍后重发本条消息；kill 进程树 = {killed}",
+                permit.as_ref().map(PermitParking::cap).unwrap_or(0)
             ),
         )
         .with_session(&input.session_id)
@@ -1862,6 +1974,9 @@ pub struct ClaudeProcess {
     pub io: ClaudeIo,
     /// H4 进程树治理（Job Object / 进程组）——**复用底座**，不自建第二套 kill
     pub tree: super::runner::TreeGuard,
+    /// 在飞表票据（评审 I14 的 RAII 纪律）：句柄 Drop（含 stdin 失败早退/panic）即在飞表注销——
+    /// 裸 `register` 的旧写法全程无人注销，条目滞留到退出清扫，会对着已死/复用的 pid 再杀一次。
+    pub inflight: super::runner::InflightTicket<'static>,
 }
 
 impl ClaudeProcess {
@@ -1900,9 +2015,11 @@ pub async fn spawn_claude(sp: &ClaudeSpawn) -> Result<ClaudeProcess, String> {
         .map_err(|e| format!("spawn 失败（{}）：{e}", sp.shape.program))?;
     let pid = child.id().unwrap_or(0);
     let tree = super::runner::TreeGuard::adopt(pid);
-    super::runner::inflight_registry().register(pid, tree.clone());
+    // 在飞登记走 RAII 票据（评审 I14）：stdin 失败早退在票据 Drop 中一并注销，无须手工配对
+    let inflight = super::runner::inflight_registry().register_ticket(pid, tree.clone());
 
     let Some(stdin) = child.stdin.take() else {
+        // 早退路径：tree 显式终止；inflight 票据随本 return 的 Drop 自动注销
         let _ = tree.kill();
         return Err("claude stdin 管道不可用（spawn 配置异常）".to_string());
     };
@@ -1966,6 +2083,7 @@ pub async fn spawn_claude(sp: &ClaudeSpawn) -> Result<ClaudeProcess, String> {
             stderr: stderr_tail,
         },
         tree,
+        inflight,
     })
 }
 
@@ -2086,6 +2204,8 @@ mod tests {
             tier: PermissionSpec::claude_default().tier(),
             permission_mode: ClaudeApprovalMode::Stdio.permission_mode(),
             cancel: None,
+            // 默认不接名额停放（旧行为：全程占名额）；I2 用例单独装停放器
+            permit: None,
         }
     }
 
@@ -2469,6 +2589,137 @@ mod tests {
     }
 
     // ===== 长驻回合（剧本桩：stdin/stdout 帧纯核）=====
+
+    /// **评审 I2（a）**：审批等待期**不占全局并发名额**——一张无人应答的审批卡不得把
+    /// 名额吃到 watchdog 到点（两张卡就能让全部无头通道 10 分钟只收到满额回执）。
+    /// 应答**送达之前**必须重新取回名额（无名额不得继续跑）。
+    ///
+    /// 变异验证：把循环顶的停放同步删掉 → 「另一条通道此刻必须能取到名额」先红；
+    /// 把应答臂的 `unpark` 删掉 → 「应答送达后必须重新占住名额」红。
+    #[tokio::test]
+    async fn approval_wait_releases_the_global_slot_until_the_answer_is_delivered() {
+        let sid = "sess_c3_park";
+        let rig = script_io(&[
+            assistant_frame("先看看目录"),
+            control_request_frame("req-1"),
+        ]);
+        let written = rig.written.clone();
+        let kills = rig.kills.clone();
+        let lines = rig.lines.clone();
+        let sem = GlobalSem::new(1);
+        let guard = sem.try_acquire().expect("测试起点：唯一名额可取");
+        let mut input = turn_input(sid, 5_000);
+        input.permit = Some(PermitParking::from_guard(guard, sem.clone()));
+        assert_eq!(sem.in_flight(), 1, "起点：本回合持有唯一名额");
+        let kf = kill_fn(kills.clone());
+        let io = rig.io;
+        let sem_driver = sem.clone();
+        let driver = async move {
+            let p = wait_pending(sid).await;
+            assert_eq!(p["requestId"], "req-1");
+            // **本回合在等作答 ⇒ 另一条无头通道此刻必须拿得到名额**（全局上限的本意是
+            // 限「在跑的回合数」，不是限「挂着卡的回合数」）
+            let other = sem_driver
+                .try_acquire()
+                .expect("审批挂起时其他通道必须能取到名额（评审 I2）");
+            assert_eq!(sem_driver.in_flight(), 1, "此刻在飞的只有那条别的通道");
+            drop(other);
+            pending_registry()
+                .deliver(sid, "req-1", Decision::Allow)
+                .expect("待答项在场时必须送达");
+            wait_written(&written, 2).await;
+            // 应答已送达 ⇒ 本回合重新占住名额（无名额不得继续跑）
+            for _ in 0..400 {
+                if sem_driver.in_flight() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                sem_driver.in_flight(),
+                1,
+                "应答送达后本回合必须重新占住名额（否则全局上限名存实亡）"
+            );
+            lines.send(message_delta_frame("end_turn", 42)).unwrap();
+        };
+        let (out, ()) = tokio::join!(run_claude_turn(io, input, &kf), driver);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        assert_eq!((out.controls, out.allowed), (1, 1));
+        // 回合收尾 ⇒ 停放器随 input drop ⇒ 名额必然归还
+        assert_eq!(sem.in_flight(), 0, "回合结束后名额必须归还");
+    }
+
+    /// **评审 I2（a）的诚实出口**：应答到达时名额已被别的回合取走 ⇒ **不写
+    /// `control_response`**（绝不让本回合无名额继续跑），回执如实报「应答**未能送达**」，
+    /// 不谎报「已送达」，也不把用户的答复算作已消费。
+    ///
+    /// 变异验证：把 `unpark` 失败臂改成「继续送达」→ 本用例的「stdin 只有 user 帧」与
+    /// 「回执必须说明未送达」双双红。
+    #[tokio::test]
+    async fn answer_arriving_without_a_free_slot_is_reported_as_not_delivered() {
+        let sid = "sess_c3_nopermit";
+        let rig = script_io(&[
+            assistant_frame("先看看目录"),
+            control_request_frame("req-1"),
+        ]);
+        let written = rig.written.clone();
+        let kills = rig.kills.clone();
+        let sem = GlobalSem::new(1);
+        let guard = sem.try_acquire().expect("测试起点：唯一名额可取");
+        let mut input = turn_input(sid, 5_000);
+        input.permit = Some(PermitParking::from_guard(guard, sem.clone()));
+        let kf = kill_fn(kills.clone());
+        let io = rig.io;
+        let sem_driver = sem.clone();
+        let driver = async move {
+            wait_pending(sid).await;
+            // 别的回合把名额抢走（等待期本回合已释放 ⇒ 这是可达路径，不是理论态）
+            let stolen = sem_driver.try_acquire().expect("等待期名额应是空的");
+            pending_registry()
+                .deliver(sid, "req-1", Decision::Allow)
+                .expect("待答项在场时必须送达（投递本身成功，问题在回合能不能继续）");
+            for _ in 0..400 {
+                if written.lock().unwrap_or_else(|e| e.into_inner()).len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let w = written.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            assert_eq!(
+                w.len(),
+                1,
+                "取不回名额 ⇒ 不得写 control_response（只应有 user 帧）: {w:?}"
+            );
+            drop(stolen);
+        };
+        let (out, ()) = tokio::join!(run_claude_turn(io, input, &kf), driver);
+        assert_eq!(
+            out.receipt.status,
+            ReceiptStatus::Failed,
+            "{:?}",
+            out.receipt
+        );
+        let reason = out.receipt.reason.unwrap_or_default();
+        assert!(
+            reason.contains("未能送达"),
+            "必须如实说应答未送达（不得谎报已答）: {reason}"
+        );
+        assert!(reason.contains("全局并发名额已被占满"), "{reason}");
+        assert!(
+            reason.contains("上限 1"),
+            "必须点明实际生效的上限: {reason}"
+        );
+        assert_eq!(
+            (out.controls, out.allowed, out.denied, out.answered),
+            (1, 0, 0, 0),
+            "未送达的应答不得计入批准数"
+        );
+        assert_eq!(sem.in_flight(), 0, "回合结束后名额必须归还");
+        assert!(
+            !pending_registry().has(sid),
+            "回合终结必须注销待答项（卡不能永远挂着）"
+        );
+    }
 
     /// **审批往返全链（纯核）**：stdout 控制面请求 → 登记待答项（移动端可见的载荷）→
     /// 用户批准 → `control_response`（updatedInput 原样回显）写 stdin → 工具结果 →

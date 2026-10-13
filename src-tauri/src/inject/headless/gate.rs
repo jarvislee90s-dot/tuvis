@@ -14,7 +14,7 @@
 // 失效重探（版本漂移复核）；进程缺席直接判失败，绝不 spawn 一个不存在的程序。
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::receipt::{parse_json_skipping_prefix, Receipt, Stage};
@@ -558,6 +558,14 @@ fn stat_ms(path: &str) -> (bool, Option<u64>) {
 #[derive(Default)]
 pub struct ProbeCache {
     map: Mutex<HashMap<String, (ProbeKey, ProbeVerdict, u64)>>,
+    /// **single-flight 名额表（评审 I13）**：per-exe 的排队锁——同名可执行文件只放
+    /// **首个**请求跑真探针，后到者在这把锁上异步排队，醒来先读缓存（首者结论已在）。
+    ///
+    /// 键空间与 `map` 同源（exe 路径）：项数上界 = 本进程探过的可执行文件个数（生产里
+    /// 就是装了几个工具），与缓存本身同量级，故**不做逐次清理**——清理要在「首者注销
+    /// 名额」与「后到者接管」之间再补一轮登记，否则 mtime 变更场景下第三个请求会并行
+    /// 重探，得不偿失（详见 [`probe_single_flight`]）。
+    inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// 失败结论的缓存生存期（5 分钟）：ZCode 工作区争用锁的常见持续量级 ≥ 分钟级——
@@ -614,6 +622,19 @@ impl ProbeCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// 取（或建）per-exe 的 single-flight 名额：**只登记不排队**——真正的排队在返回的
+    /// tokio 锁上（`gate.lock().await`）。同 exe 的并发请求拿到**同一个** `Arc`，故首者
+    /// 持锁跑探针、后到者异步等待（让出执行权，不阻塞线程，首者可照常跑满
+    /// [`PROBE_TIMEOUT_MS`]）。
+    fn inflight_gate(&self, exe: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(exe.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
 }
 
 /// 带缓存的探针执行：命中即返回（不跑执行体）；缺席的可执行文件直接判失败（不 spawn）。
@@ -635,39 +656,88 @@ where
     verdict
 }
 
+/// **single-flight 探针核心（评审 I13）**：缓存 miss 时，同一可执行文件只放一个「首者」
+/// 跑真探针；后到者在此排队等首者结论，醒来**直接复用首者写入缓存的结论**。
+///
+/// # 为什么需要（缺陷形态：check-then-run 无锁）
+/// [`probe`] 在 `remote/api.rs` 的请求任务里被 `.await`（两条客户端请求天然并发）：
+/// 旧实现「先查缓存、未命中就开跑」之间没有互斥——两个客户端同时首发同一个 exe
+/// → 两边都 miss → **并行跑多次真实模型回合**。探针是 `--prompt "hi"` 的最小真回合
+/// （见 [`PROBE_PROMPT`]），重复跑是纯浪费 + **真实配额消耗**（不只是慢）。
+///
+/// # 为什么失败结论也要共享
+/// 失败同样付了一次真实回合的代价（工作区争用锁 / 超时 / 网络抖动），后到者若不等首者
+/// 自己再跑一遍，等于对同一个瞬时故障付两份成本。失败结论本就按 [`FAILURE_TTL_MS`]
+/// 进缓存（既有语义），本函数只是把「并发的 N 次首探」收敛成 1 次：**TTL 口径一字未改**
+/// ——首者写缓存后，后到者的二次读走的是同一条 [`ProbeCache::get_at`] 判定（成功恒命中 /
+/// 失败 TTL 内命中、过期即重探）。首者被取消（等待者等不到结论）时二次读必然 miss，
+/// 后到者自行补跑（不会挂死、也不会把通道静默钉死）。
+///
+/// # 为什么用 tokio Mutex 排队而不是 `Notify`
+/// `Notify::notify_waiters` 只唤醒**已注册**的等待者：后到者若在首者发通知之后才注册就
+/// 永远等不到（丢唤醒 = 挂死）。tokio Mutex 的等待队列由运行时管理，无丢唤醒竞态；且它是
+/// **异步**锁——等待者让出执行权而非阻塞线程。
+///
+/// # 不死锁的依据
+/// 执行体（[`probe_round`] → `RunnerCfg::run`）只 spawn 子进程，**不回调**本函数；等待者
+/// 只持名额锁、不持探针名额（[`GlobalSem`]），无锁序反转。首者 future 被 drop（请求中止）
+/// → 名额锁随之释放 → 等待者醒来发现未命中即自行补跑。
+async fn probe_single_flight<F, Fut>(cache: &ProbeCache, key: ProbeKey, run: F) -> ProbeVerdict
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ProbeVerdict>,
+{
+    // 快路径：命中即返回（成功长缓存 / 失败 TTL 内）——不进名额表，零并发代价
+    if let Some(hit) = cache.get(&key) {
+        return hit;
+    }
+    let gate = cache.inflight_gate(&key.exe);
+    // 首者在此独占该 exe 的名额；后到者在此排队（异步等待，不阻塞线程）
+    let _guard = gate.lock().await;
+    // 二次检查：首者可能刚写完结论——**含失败结论**（按既有 TTL 语义共享，不再跑一遍）
+    if let Some(hit) = cache.get(&key) {
+        return hit;
+    }
+    let verdict = if key.exe_present {
+        run().await
+    } else {
+        // 缺席即拒发（不 spawn 一个不存在的程序）——同样入缓存、同样被后到者复用
+        ProbeVerdict::fail(format!("可执行文件不在场（不 spawn）：{}", key.exe))
+    };
+    cache.put(key, verdict.clone());
+    verdict
+}
+
 /// 生产探针（真 spawn；Task 8/9/12 消费）：**zcode 走两级**（L0 快面 → L1
 /// 真回合，裁决 33a；缓存命中（含成功长缓存）时 L0/L1 都不跑）；codex
 /// 变体维持单级（其活体探针在 `codex::probe_cli`，本函数的 Codex 分支
 /// 仅作同构兜底）。结论入缓存（成功长缓存 / 失败 5min TTL，见
 /// [`ProbeCache`]）。**探针不占无头 turn 的全局名额**（L0/L1 各自持 cap=1
 /// 的名额——版本门控是前置动作，不该让用户请求陪它排队）。
+///
+/// **并发纪律（评审 I13）**：真正的执行体在 [`probe_single_flight`] 内——同 exe 的
+/// 并发首发只跑一次真回合，后到者复用首者结论（含失败结论）。缓存 TTL/键
+/// （exe 在场性 + mtime）、失败结论缓存策略与公开 API 形状均未改。
 pub async fn probe(spec: &ProbeSpec, cache: &ProbeCache, os: &str) -> ProbeVerdict {
     let key = ProbeKey::of(spec);
-    if let Some(hit) = cache.get(&key) {
-        return hit;
-    }
-    if !key.exe_present {
-        let v = ProbeVerdict::fail(format!("可执行文件不在场（不 spawn）：{}", key.exe));
-        cache.put(key, v.clone());
-        return v;
-    }
-    let verdict = match spec {
-        // 两级编排（裁决 33a）：L0 stat → L0 `--help` → L1 真回合；
-        // duration（实测墙钟）由 two_level_probe 起止计时回填
-        ProbeSpec::Zcode { .. } => {
-            two_level_probe(spec, os, || l0_help_run(spec, os), || probe_round(spec, os)).await
+    probe_single_flight(cache, key, || async {
+        match spec {
+            // 两级编排（裁决 33a）：L0 stat → L0 `--help` → L1 真回合；
+            // duration（实测墙钟）由 two_level_probe 起止计时回填
+            ProbeSpec::Zcode { .. } => {
+                two_level_probe(spec, os, || l0_help_run(spec, os), || probe_round(spec, os)).await
+            }
+            // codex：无 L0 概念（其探针本就是零模型成本的 `queue --help`
+            // 面；活体路径在 `codex::probe_cli`）——单级，仅回填墙钟
+            ProbeSpec::Codex { .. } => {
+                let started = Instant::now();
+                probe_round(spec, os)
+                    .await
+                    .with_duration_ms(started.elapsed().as_millis() as u64)
+            }
         }
-        // codex：无 L0 概念（其探针本就是零模型成本的 `queue --help`
-        // 面；活体路径在 `codex::probe_cli`）——单级，仅回填墙钟
-        ProbeSpec::Codex { .. } => {
-            let started = Instant::now();
-            probe_round(spec, os)
-                .await
-                .with_duration_ms(started.elapsed().as_millis() as u64)
-        }
-    };
-    cache.put(key, verdict.clone());
-    verdict
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1261,5 +1331,186 @@ mod tests {
         let bogus = ProbeKey::of_exe("mam-nonexistent-appserver-probe");
         assert!(!bogus.exe_present);
         assert!(bogus.exe_mtime_ms.is_none());
+    }
+
+    // ============================================================
+    // 评审 I13：版本探针 single-flight（并发首发同 exe 只跑一次真探针）
+    // ============================================================
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 合成探针执行体的返回类型（boxed：满足 `tokio::spawn` 的 `'static`，且能按
+    /// 趟次给不同结论——「第二趟的结论」本身就是缺陷复现的证据）
+    type SyntheticRound = std::pin::Pin<Box<dyn Future<Output = ProbeVerdict> + Send>>;
+
+    /// 并发时序窗口（[`synthetic_round`] 用）：首个进执行体的请求先等「两个请求都已
+    /// 进场」，再多停这么久——把**后到者的缓存检查**钉在**首者的缓存写入**之前。
+    ///
+    /// 为什么必须这样：旧实现（check-then-run 无锁）下若首者先写完缓存，后到者就会
+    /// 「命中缓存」而看不出缺陷（用例假绿）。本窗口把「没有 single-flight ⇒ 后到者
+    /// 必然 miss ⇒ 必然跑第二遍」变成**确定的时序**而非概率竞态：150ms ≫ 两次
+    /// HashMap 查找，且后到者的缓存检查发生在它**同一轮 poll 内**（进场报名之后
+    /// 立即执行），必然早于本窗口结束。
+    const CONCURRENT_PROBE_WINDOW_MS: u64 = 150;
+
+    /// 合成执行体（替代真 spawn：**不触模型、不付配额**，只计数）：
+    /// - `runs` = 「真实探针跑了第几遍」（0 起）——测试断言它的总数 = 真回合次数；
+    /// - `arrived` = 已进入探针的请求数（在**调探针之前**报名，见 [`race_two_probes`]）
+    ///   ——首者的等待因此不依赖「后到者是否真的进了执行体」（single-flight 生效时
+    ///   后到者永远进不了执行体，只能靠进场报名让它看到 2）。
+    fn synthetic_round(
+        arrived: Arc<AtomicUsize>,
+        runs: Arc<AtomicUsize>,
+        verdicts: Vec<ProbeVerdict>,
+    ) -> impl FnOnce() -> SyntheticRound + Send + 'static {
+        move || {
+            Box::pin(async move {
+                let nth = runs.fetch_add(1, Ordering::SeqCst);
+                // 等两个请求都进场（2s 兜底：单边缺席时不挂死，只是白等）
+                let deadline = Instant::now() + std::time::Duration::from_secs(2);
+                while arrived.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(CONCURRENT_PROBE_WINDOW_MS))
+                    .await;
+                verdicts
+                    .get(nth)
+                    .cloned()
+                    .unwrap_or_else(|| ProbeVerdict::fail("多余的探针趟次（single-flight 失效）"))
+            })
+        }
+    }
+
+    /// 并发两请求打同一个 cache / 同一个键（真并发任务，与生产里两客户端并发投递同构），
+    /// 返回（请求 1 结论、请求 2 结论、**真探针执行体被调用的次数**）。
+    /// `verdicts[n]` = 第 n 趟执行体的结论——趟次 >0 即缺陷复现。
+    async fn race_two_probes(
+        cache: Arc<ProbeCache>,
+        key: ProbeKey,
+        verdicts: Vec<ProbeVerdict>,
+    ) -> (ProbeVerdict, ProbeVerdict, usize) {
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let cache = cache.clone();
+            let key = key.clone();
+            let mark = arrived.clone();
+            let run = synthetic_round(arrived.clone(), runs.clone(), verdicts.clone());
+            tasks.push(tokio::spawn(async move {
+                // 进场报名（在探针之前）——首者据此确认「后到者已在跑」，从而把窗口
+                // 拉长到后到者完成缓存检查之后
+                mark.fetch_add(1, Ordering::SeqCst);
+                probe_single_flight(&cache, key, run).await
+            }));
+        }
+        let v1 = tasks.remove(0).await.expect("并发任务 1 必须正常结束");
+        let v2 = tasks.remove(0).await.expect("并发任务 2 必须正常结束");
+        (v1, v2, runs.load(Ordering::SeqCst))
+    }
+
+    /// **I13 主测**：两个客户端同时首发同一个 exe（同键）→ **真探针只跑一遍**，两边拿到
+    /// 同一结论。抓缺陷机理：撤掉 single-flight（回到 check-then-run 无锁）后，后到者
+    /// 必然 miss（时序窗口保证它先于首者的缓存写入完成检查）→ 执行体被调 2 次 = 两次
+    /// **真实模型回合**、两份真实配额；本测随即变红（`runs == 2` + 后到者结论是第二趟的）。
+    #[tokio::test]
+    async fn concurrent_probe_runs_real_round_only_once() {
+        let cache = Arc::new(ProbeCache::default());
+        let key = ProbeKey::of_parts("mam-concurrent-zcode.exe", true, Some(42), Some(7));
+        let leader = ProbeVerdict::pass("首者真回合出 JSON");
+        let (v1, v2, runs) = race_two_probes(
+            cache.clone(),
+            key,
+            vec![leader.clone(), ProbeVerdict::pass("第二遍不该跑")],
+        )
+        .await;
+        assert_eq!(
+            runs, 1,
+            "并发首发同一 exe 只许跑一次真探针（single-flight 失效 = 真实配额被重复消耗）"
+        );
+        assert_eq!(v1, leader, "首者结论原样返回");
+        assert_eq!(
+            v2, leader,
+            "后到者必须复用首者写入缓存的结论（不是自己重探的）"
+        );
+        assert_eq!(cache.len(), 1, "结论只落一格（缓存键/TTL 语义未变）");
+        assert_eq!(
+            cache
+                .inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1,
+            "同 exe 只登记一个名额（名额表键空间与缓存同源）"
+        );
+    }
+
+    /// **I13 失败面**：首者跑出**失败**结论（成本已付）→ 后到者复用失败结论、不再跑第二
+    /// 遍；且失败结论仍按既有 [`FAILURE_TTL_MS`] 语义进缓存（TTL 内命中、过期即失效重探
+    /// ——口径不因 single-flight 改变）。撤掉 single-flight 后本测同样变红：后到者会跑出
+    /// 第二趟的 pass 结论（`v2 != leader`）且 `runs == 2`。
+    #[tokio::test]
+    async fn concurrent_probe_reuses_leader_failure_verdict() {
+        let cache = Arc::new(ProbeCache::default());
+        let key = ProbeKey::of_parts("mam-concurrent-zcode.exe", true, Some(42), Some(7));
+        let leader = ProbeVerdict::fail("首者失败：工作区争用（真实回合成本已付）");
+        let t0 = now_ms();
+        let (v1, v2, runs) = race_two_probes(
+            cache.clone(),
+            key.clone(),
+            vec![
+                leader.clone(),
+                ProbeVerdict::pass("第二遍不该跑（跑到这里 = 缺陷复现）"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            runs, 1,
+            "失败结论也要共享——不得对同一个瞬时故障付两份真实回合成本"
+        );
+        assert!(
+            !v1.is_pass() && !v2.is_pass(),
+            "首者失败 ⇒ 两边都拒发：{v1:?} / {v2:?}"
+        );
+        assert_eq!(
+            v2, leader,
+            "后到者必须原样复用首者的失败结论（含 hint，不重写不重探）"
+        );
+        // 既有 TTL 口径未变（失败结论仍进缓存共享，不是「每次并发都重探」）
+        assert!(
+            cache.get_at(&key, t0 + FAILURE_TTL_MS - 1).is_some(),
+            "TTL 内必须命中失败结论"
+        );
+        assert!(
+            cache.get_at(&key, t0 + FAILURE_TTL_MS + 1_000).is_none(),
+            "失败结论过期必须失效（通道不被永久钉死）"
+        );
+    }
+
+    /// **I13 委派锁**：生产入口 [`probe`] 必须流经 [`probe_single_flight`]——否则上面的
+    /// 并发去重对生产无效（只测内部缝就成了「测了个没人走的函数」）。观测点：缺席的可执行
+    /// 文件走「不 spawn + 判失败 + 入缓存」老路（零 spawn、零真机依赖），但**名额表必须已
+    /// 登记**——只有 single-flight 核心会登记；撤掉修复此测同样变红。
+    #[tokio::test]
+    async fn probe_entry_delegates_to_single_flight_gate() {
+        let cache = ProbeCache::default();
+        let spec = ProbeSpec::Codex {
+            exe: "mam-nonexistent-i13-exe".into(),
+        };
+        let v = probe(&spec, &cache, "windows").await;
+        assert!(!v.is_pass(), "可执行缺席必须判失败（不 spawn）: {v:?}");
+        assert!(
+            v.hint().unwrap_or_default().contains("不在场"),
+            "缺席 hint 语义未变: {v:?}"
+        );
+        assert_eq!(cache.len(), 1, "缺席结论仍进缓存（既有语义未变）");
+        assert!(
+            cache
+                .inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("mam-nonexistent-i13-exe"),
+            "probe 必须流经 single-flight 名额表（否则并发去重对生产入口无效）"
+        );
     }
 }

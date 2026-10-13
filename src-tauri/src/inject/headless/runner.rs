@@ -395,12 +395,57 @@ pub struct InflightRegistry {
     map: Mutex<HashMap<u32, TreeGuard>>,
 }
 
+/// 在飞登记的 **RAII 票据**（评审 I14）：[`InflightRegistry::register_ticket`] 返回它，
+/// **Drop 自动 unregister**。
+///
+/// 为什么：`register`/`unregister` 手工配对时，early-return / panic 展开 / future 被
+/// drop（异步路径）都会漏掉注销——退场清扫就会对着早已死掉的 pid 再杀一次，表里也留下
+/// 永不清理的行（本进程的在飞表与真实在飞进程不再一一对应）。票据把这些路径统一收在
+/// Drop 上；**显式早释放**仍可用 [`InflightTicket::release`]（与旧 `unregister` 同一时刻）。
+#[must_use = "票据 Drop 即在飞表注销；拿到就丢等于没登记"]
+pub struct InflightTicket<'a> {
+    pid: u32,
+    registry: &'a InflightRegistry,
+    armed: bool,
+}
+
+impl InflightTicket<'_> {
+    /// 显式早释放（等价于旧 `unregister`）：消费票据、立刻注销；Drop 不再重复注销。
+    pub fn release(mut self) {
+        self.armed = false;
+        self.registry.unregister(self.pid);
+    }
+
+    /// 本票据登记的 pid（诊断/测试可观测面）
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+impl Drop for InflightTicket<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.unregister(self.pid);
+        }
+    }
+}
+
 impl InflightRegistry {
     pub fn register(&self, pid: u32, guard: TreeGuard) {
         self.map
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(pid, guard);
+    }
+
+    /// 登记并返回 **RAII 票据**（评审 I14；生产唯一入口）：Drop 自动注销。
+    pub fn register_ticket(&self, pid: u32, guard: TreeGuard) -> InflightTicket<'_> {
+        self.register(pid, guard);
+        InflightTicket {
+            pid,
+            registry: self,
+            armed: true,
+        }
     }
 
     pub fn unregister(&self, pid: u32) {
@@ -842,7 +887,9 @@ impl RunnerCfg {
         let pid = child.id().unwrap_or(0);
         let guard = TreeGuard::adopt(pid);
         self.tree = Some(guard.clone());
-        inflight_registry().register(pid, guard.clone());
+        // **RAII 票据**（评审 I14）：Drop 自动注销——中途 future 被 drop / panic 展开也
+        // 不会把死 pid 留在退场清扫表里（显式 `release()` 保留旧「此刻注销」的时序）
+        let inflight = inflight_registry().register_ticket(pid, guard.clone());
 
         let acc = Arc::new(Mutex::new(FrameAccumulator::default()));
         let tail = Arc::new(Mutex::new(String::new()));
@@ -904,7 +951,7 @@ impl RunnerCfg {
         for task in [stdout_task, stderr_task].into_iter().flatten() {
             let _ = tokio::time::timeout(READER_DRAIN_TIMEOUT, task).await;
         }
-        inflight_registry().unregister(pid);
+        inflight.release();
         let duration_ms = started.elapsed().as_millis() as u64;
         let stderr_tail = tail.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let acc = acc.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1422,6 +1469,40 @@ mod tests {
         assert!(!reg.is_empty());
         assert_eq!(reg.shutdown_all(), 1, "关停必须逐个终结在飞进程树");
         assert_eq!(reg.len(), 0);
+        let _ = child.kill();
+        let _ = child.wait(); // 收尸（clippy::zombie_processes）
+    }
+
+    /// **评审 I14：在飞票据 Drop 自动注销**（含 panic 展开）——手工 `register`/`unregister`
+    /// 配对漏一处，退场清扫就会留着死 pid（与真实在飞进程不再一一对应）。
+    ///
+    /// 变异验证：把 `InflightTicket::drop` 体删掉（等价于漏 unregister）→ 第二条断言红。
+    #[test]
+    fn inflight_ticket_unregisters_on_drop_and_panic() {
+        let reg = InflightRegistry::default();
+        let mut child = spawn_test_child();
+        let pid = child.id();
+        {
+            let ticket = reg.register_ticket(pid, TreeGuard::adopt(pid));
+            assert_eq!(ticket.pid(), pid);
+            assert_eq!(reg.len(), 1, "票据存活期间在册");
+        }
+        assert_eq!(reg.len(), 0, "票据 Drop 必须注销");
+        // panic 展开同样注销
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ticket = reg.register_ticket(pid, TreeGuard::adopt(pid));
+            panic!("模拟异步任务 panic 展开");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(reg.len(), 0, "panic 展开必须注销（否则表里留死 pid）");
+        // 显式早释放（与旧 unregister 同时刻）
+        let ticket = reg.register_ticket(pid, TreeGuard::adopt(pid));
+        ticket.release();
+        assert_eq!(reg.len(), 0, "显式 release 立刻注销");
+        // 关停仍能清表（既有语义未变）
+        reg.register(pid, TreeGuard::adopt(pid));
+        assert_eq!(reg.shutdown_all(), 1);
+        assert!(reg.is_empty());
         let _ = child.kill();
         let _ = child.wait(); // 收尸（clippy::zombie_processes）
     }

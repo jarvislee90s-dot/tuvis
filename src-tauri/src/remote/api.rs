@@ -1469,6 +1469,9 @@ async fn run_zcode_turn(
     ctx: ZcodeTurnCtx,
     inv: crate::inject::headless::zcode::ZcodeInvocation,
     project: String,
+    // **串行锁守卫（评审 I14）**：随回合任务移动，任务收尾（含返回/panic 展开）随
+    // Drop 注销——不再按会话号全局注销，杜绝「上一发删掉下一发槽位」的 U1 竞态
+    _slot: crate::inject::headless::turn::TurnGuard<'static>,
 ) -> crate::inject::headless::zcode::TurnOutcome {
     let os = std::env::consts::OS;
     let deps = crate::inject::headless::zcode::TurnDeps::production(os);
@@ -1496,7 +1499,7 @@ async fn run_zcode_turn(
         &crate::inject::headless::turn::receipt_result_word(&out.receipt),
         out.receipt.duration_ms,
     );
-    crate::inject::headless::turn::registry().end(&ctx.sid);
+    // 串行锁在**审计行之后**由守卫 Drop 释放（与旧 `end` 同一时序：审计 → 注销 → 返回）
     out
 }
 
@@ -1553,20 +1556,20 @@ pub(crate) async fn zcode_headless_dispatch(
         return ctx.refuse(st, Stage::Refused, reason);
     }
     // 3) 会话串行锁（**声明通道**：取消审计行 channel 列从槽位取——Task 11 复审 Important 2）
-    if !crate::inject::headless::turn::registry().begin(
+    let Some(slot) = crate::inject::headless::turn::registry().begin_guarded(
         &session.id,
         zcode::TurnSlot::placeholder(&ctx.tool, ctx.content.clone())
             .with_channel(HeadlessKind::Zcode.wire_name()),
-    ) {
+    ) else {
+        // 拿不到守卫 = 没有注销能力 ⇒ 「refuse 路径不碰锁」是类型级保证（评审 I14）
         return ctx.refuse(
             st,
             Stage::Refused,
             "该会话已有在飞的无头回合（MAM 串行锁，防同会话两回合交错写库）——本条未投递，请等回执后再发",
         );
-    }
-    // 4) 安装形态（占位后失败必须注销槽位）
+    };
+    // 4) 安装形态（占位后失败由守卫 Drop 注销——不再逐臂手写 `end`，评审 I14）
     let Some(spec) = zcode::resolve_spec(&zcode::production_roots(session.pid), os) else {
-        crate::inject::headless::turn::registry().end(&session.id);
         return ctx.refuse(
             st,
             Stage::Spawn,
@@ -1585,7 +1588,6 @@ pub(crate) async fn zcode_headless_dispatch(
         // 花名白名单（裁决 24b）：`Err` = 拼签名前 fail closed（未起跑、零字节投递）。
         // 占位在 3) 已就位 ⇒ 本条失败路径必须注销，否则该会话被自己的串行锁挡死。
         Err(reason) => {
-            crate::inject::headless::turn::registry().end(&session.id);
             return ctx.refuse(st, Stage::Refused, &reason);
         }
     };
@@ -1603,7 +1605,9 @@ pub(crate) async fn zcode_headless_dispatch(
     if let Some(receipt) =
         crate::inject::headless::gate::version_gate_receipt(&session.id, &verdict)
     {
-        crate::inject::headless::turn::registry().end(&session.id);
+        // **显式早释放**（与旧 `end` 同时刻）：原实现「先注销、再写审计行」，此处逐字保留
+        // 时序；守卫消费后 Drop 不再重复注销（评审 I14 的 `release()` 面）
+        slot.release();
         ctx.audit(
             st,
             crate::inject::headless::ACTION_HEADLESS,
@@ -1617,17 +1621,19 @@ pub(crate) async fn zcode_headless_dispatch(
     }
     // 7) 回合（detached spawn）
     let project = session.project_path.clone();
+    // 守卫**移动进任务**：任务收尾（含 panic 展开）随 Drop 注销。此处不再有 handler 侧
+    // 的按会话号注销——Task 里已 Drop 过，旧写法在这一臂会误删**下一发**新回合的槽位
     let task = tokio::spawn(run_zcode_turn(
         st.clone(),
         ctx.clone(),
         inv,
         project.clone(),
+        slot,
     ));
     let out = match task.await {
         Ok(o) => o,
         Err(e) => {
             log::error!("zcode 无头回合任务异常: {e}");
-            crate::inject::headless::turn::registry().end(&session.id); // 本路径占过位 → 必须注销
             return ctx.refuse(
                 st,
                 Stage::ChannelError,
@@ -1809,7 +1815,10 @@ async fn run_zcode_create_turn(
     inv: crate::inject::headless::zcode::ZcodeInvocation,
     project: String,
     plan: crate::inject::headless::zcode_create::PathPlan,
+    // 锁键仍要传：`run_create` 的库确认以**锁键**为键（新建时尚无会话号）
     lock_key: String,
+    // **项目锁守卫（评审 I14）**：随回合任务移动，任务收尾随 Drop 注销
+    _slot: crate::inject::headless::turn::TurnGuard<'static>,
 ) -> crate::inject::headless::zcode_create::CreateOutcome {
     use crate::inject::headless::zcode_create;
     let deps = zcode_create::CreateDeps::production(std::env::consts::OS);
@@ -1834,7 +1843,7 @@ async fn run_zcode_create_turn(
         &crate::inject::headless::turn::receipt_result_word(&out.receipt),
         out.receipt.duration_ms,
     );
-    crate::inject::headless::turn::registry().end(&lock_key);
+    // 项目锁在审计行之后由守卫 Drop 释放（与旧 `end` 同一时序）
     out
 }
 
@@ -1931,26 +1940,26 @@ pub async fn session_create_zcode(
     };
     // ⑧ 项目级串行锁（**声明通道**：取消审计行 channel 列从槽位取）
     let lock_key = zcode::create_lock_key(&project, os);
-    if !crate::inject::headless::turn::registry().begin(
+    let Some(slot) = crate::inject::headless::turn::registry().begin_guarded(
         &lock_key,
         zcode::TurnSlot::placeholder("zcode", ctx.content.clone())
             .with_channel(HeadlessKind::Zcode.wire_name()),
-    ) {
+    ) else {
+        // 拿不到守卫 = 没有注销能力 ⇒ refuse 路径不碰锁（评审 I14）
         return ctx.refuse(
             &st,
             Stage::Refused,
             "该项目已有在飞的新建回合（MAM 项目级串行锁，防同项目两次新建交错争用同一工作区）——本条未投递，请等回执后再试",
             warning,
         );
-    }
-    // ⑨ 安装形态（占位后失败必须注销槽位）
+    };
+    // ⑨ 安装形态（占位后失败由守卫 Drop 注销——不再逐臂手写 `end`，评审 I14）
     let host_pid = board
         .iter()
         .find(|s| s.agent_type == crate::session::AgentType::ZCode)
         .map(|s| s.pid)
         .unwrap_or(0);
     let Some(spec) = zcode::resolve_spec(&zcode::production_roots(host_pid), os) else {
-        crate::inject::headless::turn::registry().end(&lock_key);
         return ctx.refuse(
             &st,
             Stage::Spawn,
@@ -1964,7 +1973,6 @@ pub async fn session_create_zcode(
     let inv = match zcode::build_create_argv(&spec, &first, &project, Some(&ctx.device_name)) {
         Ok(inv) => inv,
         Err(reason) => {
-            crate::inject::headless::turn::registry().end(&lock_key);
             return ctx.refuse(&st, Stage::Refused, &reason, warning);
         }
     };
@@ -1981,7 +1989,8 @@ pub async fn session_create_zcode(
     )
     .await;
     if let Some(receipt) = crate::inject::headless::gate::version_gate_receipt("", &verdict) {
-        crate::inject::headless::turn::registry().end(&lock_key);
+        // 显式早释放（与旧 `end` 同时刻：先注销、再写审计行）
+        slot.release();
         ctx.audit(
             &st,
             "",
@@ -2006,13 +2015,13 @@ pub async fn session_create_zcode(
         inv,
         project.clone(),
         plan,
-        lock_key.clone(),
+        lock_key,
+        slot,
     ));
     let out = match task.await {
         Ok(o) => o,
         Err(e) => {
             log::error!("session-create-zcode 回合任务异常: {e}");
-            crate::inject::headless::turn::registry().end(&lock_key); // 本路径占过位 → 必须注销
             return ctx.refuse(
                 &st,
                 Stage::ChannelError,
@@ -2198,6 +2207,8 @@ async fn run_codex_turn(
     shape: crate::inject::headless::codex::SpawnShape,
     tref: crate::inject::headless::codex::ThreadRef,
     project: String,
+    // **串行锁守卫（评审 I14）**：随回合任务移动，任务收尾随 Drop 注销
+    _slot: crate::inject::headless::turn::TurnGuard<'static>,
 ) -> crate::inject::headless::codex::TurnOutcome {
     use crate::inject::headless::codex;
     let deps = codex::TurnDeps::production();
@@ -2233,7 +2244,7 @@ async fn run_codex_turn(
         &crate::inject::headless::turn::receipt_result_word(&out.receipt),
         out.receipt.duration_ms,
     );
-    codex::registry().end(&ctx.sid);
+    // 串行锁在审计行之后由守卫 Drop 释放（旧 `end(&ctx.sid)` 同一时序；评审 I14）
     out
 }
 
@@ -2339,26 +2350,27 @@ pub(crate) async fn codex_headless_dispatch_envelope(
     };
     let plan = codex::dispatch(presence, &tref.id, &session.project_path, &payload);
     ctx.content = payload;
-    // 4) 会话串行锁（占位后每条失败路径都必须注销槽位——否则该会话被自己的锁挡死）。
+    // 4) 会话串行锁（占位后每条失败路径都由守卫 Drop 注销——评审 I14 起不再逐臂
+    //    手写 `end`：拿不到守卫就没有注销能力，误删下一发槽位在类型层不可表达）。
     //    **槽位通道声明**：取消审计行 channel 列从槽位取（Task 11 复审 Important 2）——
     //    占位时记**计划**通道；改道（exec→queue）落定进消费等待时经
     //    `turn::TurnRegistry::update_channel` 同步为实际通道（Task 6b review M-3：取消
     //    端点按槽位通道词分叉，不同步则改道腿拿不到 queue 滞留语义），回合行记实际走向
-    if !codex::registry().begin(
+    let Some(slot) = codex::registry().begin_guarded(
         &session.id,
         codex::TurnSlot::placeholder(&tool, ctx.content.clone())
             .with_channel(planned_kind.wire_name()),
-    ) {
+    ) else {
+        // 拿不到守卫 = 没有注销能力 ⇒ refuse 路径不碰锁（评审 I14）
         return ctx.refuse_envelope(
             st,
             Stage::Refused,
             "该会话已有在飞的无头回合（MAM 串行锁，防同会话两回合交错）——本条未投递，\
              请等回执后再发",
         );
-    }
+    };
     // 5) CLI 发现（找不到 ⇒ 如实拒绝，绝不 spawn 不存在的程序）
     let Some(exe) = codex::production_exe() else {
-        codex::registry().end(&session.id);
         return ctx.refuse_envelope(
             st,
             Stage::Spawn,
@@ -2373,7 +2385,6 @@ pub(crate) async fn codex_headless_dispatch_envelope(
     //     codex 的正文进 argv（`plan.argv` 的 message），故 `body_travels_in_argv = true`。
     let shape = codex::spawn_shape(&exe, os);
     if let Some(reason) = crate::inject::headless::turn::cmd_shim_body_refusal(text, &shape, true) {
-        codex::registry().end(&session.id);
         return ctx.refuse_envelope(st, Stage::Refused, &reason);
     }
     // 5b) 版本门控（H6：`queue --help` 子命令在场；结论按 exe mtime 缓存）
@@ -2381,7 +2392,8 @@ pub(crate) async fn codex_headless_dispatch_envelope(
     if let Some(receipt) =
         crate::inject::headless::gate::version_gate_receipt(&session.id, &verdict)
     {
-        codex::registry().end(&session.id);
+        // 显式早释放（与旧 `end` 同时刻：先注销、再写审计行）
+        slot.release();
         ctx.audit(
             st,
             action,
@@ -2399,12 +2411,12 @@ pub(crate) async fn codex_headless_dispatch_envelope(
         shape,
         tref,
         project,
+        slot,
     ));
     let out = match task.await {
         Ok(o) => o,
         Err(e) => {
             log::error!("codex 无头回合任务异常: {e}");
-            codex::registry().end(&session.id); // 本路径占过位 → 必须注销
             return ctx.refuse_envelope(
                 st,
                 Stage::ChannelError,
@@ -2492,6 +2504,8 @@ async fn run_wb_turn(
     ctx: WbTurnCtx,
     args: crate::inject::headless::wb_acp::WbTurnArgs,
     deps: crate::inject::headless::wb_acp::WbDeps,
+    // **串行锁守卫（评审 I14）**：随回合任务移动，任务收尾随 Drop 注销
+    _slot: crate::inject::headless::turn::TurnGuard<'static>,
 ) -> crate::inject::headless::wb_acp::WbTurnOutcome {
     use crate::inject::headless::wb_acp::WbTurnOutcome;
     let sid = args.sid.clone();
@@ -2516,7 +2530,7 @@ async fn run_wb_turn(
                 &crate::inject::headless::turn::receipt_result_word(&receipt),
                 receipt.duration_ms,
             );
-            crate::inject::headless::turn::registry().end(&sid);
+            // 串行锁由守卫 Drop 释放（评审 I14；本臂是 join 失败——任务侧已随展开注销）
             return WbTurnOutcome {
                 receipt,
                 endpoint: None,
@@ -2541,7 +2555,7 @@ async fn run_wb_turn(
         &result,
         out.receipt.duration_ms,
     );
-    crate::inject::headless::turn::registry().end(&sid);
+    // 串行锁在审计行之后由守卫 Drop 释放（旧 `end(&sid)` 同一时序；评审 I14）
     out
 }
 
@@ -2621,26 +2635,26 @@ pub(crate) async fn wb_headless_dispatch(
     // 4) 会话串行锁（占位；不武装取消靶子——见 run_wb_turn 文档）。
     //    **声明通道**：取消端点据此分辨「本通道未接线取消（回合仍在跑）」与「已终结」
     //    （`headless_wb_acp`，取消审计行 channel 列的单点来源——Task 11 复审 Important 2/3）
-    if !crate::inject::headless::turn::registry().begin(
+    let Some(slot) = crate::inject::headless::turn::registry().begin_guarded(
         &session.id,
         crate::inject::headless::turn::TurnSlot::placeholder(&tool, ctx.content.clone())
             .with_channel(HeadlessKind::WbAcp.wire_name()),
-    ) {
+    ) else {
+        // 拿不到守卫 = 没有注销能力 ⇒ refuse 路径不碰锁（评审 I14）
         return ctx.refuse(
             st,
             Stage::Refused,
             "该会话已有在飞的无头回合（MAM 串行锁，防同会话两回合交错）——本条未投递，\
              请等回执后再发",
         );
-    }
+    };
     // 5) 回合（detached spawn；占位后唯一路径 = 回合自身注销槽位）
-    let task = tokio::spawn(run_wb_turn(st.clone(), ctx.clone(), args, deps));
+    let task = tokio::spawn(run_wb_turn(st.clone(), ctx.clone(), args, deps, slot));
     let out = match task.await {
         Ok(o) => o,
         Err(e) => {
             // 理论不可达（run_wb_turn 内部吞掉 spawn_blocking 的 JoinError）；防御性保留
             log::error!("workbuddy 无头回合任务异常: {e}");
-            crate::inject::headless::turn::registry().end(&session.id);
             return ctx.refuse(
                 st,
                 Stage::ChannelError,
@@ -2728,6 +2742,8 @@ async fn run_dsh_turn(
     target_sid: String,
     cwd: String,
     payload: String,
+    // **串行锁守卫（评审 I14）**：随回合任务移动，任务收尾随 Drop 注销
+    _slot: crate::inject::headless::turn::TurnGuard<'static>,
 ) -> DshTurnOut {
     use crate::inject::headless::dsh_acp::DshAcpError;
     use crate::inject::headless::receipt::{Receipt, Stage};
@@ -2796,7 +2812,7 @@ async fn run_dsh_turn(
         &result,
         out.receipt.duration_ms,
     );
-    crate::inject::headless::turn::registry().end(&ctx.sid);
+    // 串行锁在审计行之后由守卫 Drop 释放（旧 `end(&ctx.sid)` 同一时序；评审 I14）
     out
 }
 
@@ -2811,7 +2827,7 @@ async fn run_dsh_turn(
 ///    **不武装取消靶子**：cancel 原语跨连接不可达，取消端点走
 ///    [`CANCEL_NOT_WIRED_DSH_REASON`] 如实未接线——见 [`cancel_is_unwired_for`]）；
 /// 4. **客户端装配**（`dsh_acp::assemble_client`：runtime node 发现 + asar 幂等解包——
-///    fs IO 放 `spawn_blocking`；失败 = `spawn` 档如实拒，占位后失败必须注销槽位）；
+///    fs IO 放 `spawn_blocking`；失败 = `spawn` 档如实拒，占位后失败由守卫 Drop 注销）；
 /// 5. **回合**（`run_dsh_turn`：审计/注销在任务内完成；三态靶向由客户端 `send()` 内部
 ///    编排——resume 精确靶向 / 桌面写者占用如实拒 / 未命中 new 新建）；
 /// 6. 回执封套 + 可见性档 + **权限请求透传**（见下方 `permissionNotes` 接入面裁决）。
@@ -2853,30 +2869,29 @@ pub(crate) async fn dsh_acp_headless_dispatch(
     };
     ctx.content = payload.clone();
     // 3) 会话串行锁（声明通道；不武装取消靶子——cancel 跨连接不可达，见函数级文档）
-    if !crate::inject::headless::turn::registry().begin(
+    let Some(slot) = crate::inject::headless::turn::registry().begin_guarded(
         &session.id,
         crate::inject::headless::turn::TurnSlot::placeholder(&tool, ctx.content.clone())
             .with_channel(HeadlessKind::DshAcp.wire_name()),
-    ) {
+    ) else {
+        // 拿不到守卫 = 没有注销能力 ⇒ refuse 路径不碰锁（评审 I14）
         return ctx.refuse(
             st,
             Stage::Refused,
             "该会话已有在飞的无头回合（MAM 串行锁，防同会话两回合交错）——本条未投递，\
              请等回执后再发",
         );
-    }
+    };
     // 4) 客户端装配（fs 发现/解包 → spawn_blocking；失败注销槽位 + spawn 档如实拒）
     let home = (st.home_source)().map(std::path::PathBuf::from);
     let assemble_st = st.clone();
     let client = match tokio::task::spawn_blocking(move || dsh_acp::assemble_client(home)).await {
         Ok(Ok(c)) => c,
         Ok(Err(reason)) => {
-            crate::inject::headless::turn::registry().end(&session.id);
             return ctx.refuse(st, Stage::Spawn, &reason);
         }
         Err(e) => {
             log::error!("dsh 客户端装配任务异常: {e}");
-            crate::inject::headless::turn::registry().end(&session.id);
             return ctx.refuse(
                 st,
                 Stage::ChannelError,
@@ -2885,11 +2900,12 @@ pub(crate) async fn dsh_acp_headless_dispatch(
         }
     };
     // 5) 回合 = **detached 任务**（wb/cli/zcode/codex 四兄弟同款）：客户端断连会 drop
-    //    本 handler future——若内联 `.await`，`run_dsh_turn` 随 future 一起被丢，
-    //    `registry().end` 永不执行（TurnRegistry 无 TTL）⇒ 该会话此后每一次无头发送
-    //    都被判「已有在飞回合」直到 MAM 重启，R10 审计行也丢。spawn 自持后，审计 +
-    //    串行锁注销都在被 spawn 的任务内（步骤 5 设计意图的实现面），断连只丢回执、
-    //    不丢收尾；占位后唯一注销路径 = 任务自身
+    //    本 handler future——若内联 `.await`，`run_dsh_turn` 随 future 一起被丢：R10 审计行
+    //    丢掉，回执也无从送达。spawn 自持后，审计写在被 spawn 的任务内（步骤 5 设计意图的
+    //    实现面），断连只丢回执、不丢收尾。
+    //    **串行锁（评审 I14 后的口径）**：守卫随任务移动——即使内联，future 被 drop 时
+    //    守卫也会 Drop 注销（RAII 把「漏注销」这条路堵死了）；spawn 的真正必要性在**审计行
+    //    与回合自身跑完**，不再是「怕锁泄漏」。
     let task = tokio::spawn(run_dsh_turn(
         assemble_st,
         ctx.clone(),
@@ -2897,14 +2913,15 @@ pub(crate) async fn dsh_acp_headless_dispatch(
         session.id.clone(),
         session.project_path.clone(),
         payload,
+        slot,
     ));
     let out = match task.await {
         Ok(o) => o,
         Err(e) => {
             // 理论不可达（run_dsh_turn 内部已吞 spawn_blocking 的 JoinError 并如实落账）；
-            // 防御性保留——任务消失时槽位可能未注销：尽力注销 + 如实拒绝
+            // 防御性保留——守卫已随任务移动，任务消失（panic 展开）时任务侧已 Drop 注销，
+            // 此处**不得**再按会话号注销（会误删下一发新回合的槽位；评审 I14）
             log::error!("dsh 无头回合任务异常: {e}");
-            crate::inject::headless::turn::registry().end(&session.id);
             return ctx.refuse(
                 st,
                 Stage::ChannelError,
@@ -3805,25 +3822,24 @@ pub(crate) async fn cli_headless_dispatch(
         kind,
     };
     // 1) 会话串行锁（**声明通道**：取消审计行 channel 列从槽位取）
-    if !crate::inject::headless::turn::registry().begin(
+    let Some(slot) = crate::inject::headless::turn::registry().begin_guarded(
         &session.id,
         c3::placeholder_slot(&ctx.tool, ctx.content.clone(), kind.wire_name()),
-    ) {
+    ) else {
+        // 拿不到守卫 = 没有注销能力 ⇒ refuse 路径不碰锁（评审 I14）
         return ctx.refuse(
             st,
             Stage::Refused,
             "该会话已有在飞的无头回合（MAM 串行锁，防同会话两回合交错）——本条未投递，\
              请等回执后再发",
         );
-    }
-    // 2) 续接 cwd 门（占位后失败必须注销槽位）
+    };
+    // 2) 续接 cwd 门（占位后失败由守卫 Drop 注销——不再逐臂手写 `end`，评审 I14）
     if let Some(reason) = c3::cwd_gate(&session.project_path) {
-        crate::inject::headless::turn::registry().end(&session.id);
         return ctx.refuse(st, Stage::Refused, reason);
     }
     // 3) CLI 发现
     let Some(shape) = c3::production_cli_spec(program, os) else {
-        crate::inject::headless::turn::registry().end(&session.id);
         return ctx.refuse(
             st,
             Stage::Spawn,
@@ -3843,7 +3859,6 @@ pub(crate) async fn cli_headless_dispatch(
         &shape,
         kind != HeadlessKind::ClaudeP,
     ) {
-        crate::inject::headless::turn::registry().end(&session.id);
         return ctx.refuse(st, Stage::Refused, &reason);
     }
     // 4) 命令形态（W4 单点组装：正文归一 + 移动端尾签名 + **花名白名单**，裁决 24b）
@@ -3854,7 +3869,6 @@ pub(crate) async fn cli_headless_dispatch(
     let payload = match crate::inject::normalize::compose_injection(device_name, text) {
         Ok(p) => p,
         Err(reason) => {
-            crate::inject::headless::turn::registry().end(&session.id);
             return ctx.refuse(st, Stage::Refused, &reason);
         }
     };
@@ -3869,13 +3883,15 @@ pub(crate) async fn cli_headless_dispatch(
     let (tx, rx) = tokio::sync::oneshot::channel::<crate::inject::headless::receipt::Receipt>();
     let st_task = st.clone();
     let ctx_task = ctx.clone();
-    let sid_task = session.id.clone();
     let kind_task = kind;
     let task_session = TaskSession {
         id: session.id.clone(),
         project_path: session.project_path.clone(),
     };
+    // 守卫**移动进任务**：任务收尾（含 panic 展开）随 Drop 注销——不再按会话号全局注销
+    let slot_task = slot;
     tokio::spawn(async move {
+        let _slot = slot_task;
         let receipt = if kind_task == HeadlessKind::ClaudeP {
             claude_turn_in_task(st_task.clone(), &ctx_task, shape, task_session, payload).await
         } else {
@@ -3895,15 +3911,17 @@ pub(crate) async fn cli_headless_dispatch(
             &crate::inject::headless::turn::receipt_result_word(&receipt),
             receipt.duration_ms,
         );
-        crate::inject::headless::turn::registry().end(&sid_task);
+        // 释放时点注记（评审 N3，无行为变化）：守卫 `_slot` 在 send 之后、块尾才 Drop
+        // （I14 RAII 化前曾在 send 之前）——「审计先于释放」由 audit→函数返回→Drop 保住；
+        // send 是非阻塞 oneshot（接收端不在也照发），锁多持时长可忽略。
         let _ = tx.send(receipt);
     });
     let receipt = match rx.await {
         Ok(r) => r,
         Err(_) => {
-            // 任务在交出回执前消失（panic）：槽位可能未注销 → 尽力注销 + 如实拒绝
+            // 任务在交出回执前消失（panic）：守卫已随任务移动，任务侧展开时已 Drop 注销
+            // ——此处**不得**再按会话号注销（会误删下一发新回合的槽位；评审 I14）
             log::error!("CLI 无头回合任务异常终止（未交出回执）");
-            crate::inject::headless::turn::registry().end(&session.id);
             return ctx.refuse(
                 st,
                 Stage::ChannelError,
@@ -3992,8 +4010,8 @@ async fn claude_turn_in_task(
     let runner_cfg = st
         .store
         .with(|c| crate::inject::headless::runner_from_conn(&shape.program, c));
-    let Some(_slot) = runner::global_sem().try_acquire() else {
-        // 满额：**如实排队回执**（含位次），不起进程；槽位由任务收尾段注销
+    let Some(slot) = runner::global_sem().try_acquire() else {
+        // 满额：**如实未执行回执**（含实际上限），不起进程；槽位由任务收尾段注销
         return Receipt::concurrency_full(runner::global_sem().cap()).with_session(&session.id);
     };
     let timeout_ms = runner_cfg.watchdog_timeout_ms();
@@ -4029,6 +4047,10 @@ async fn claude_turn_in_task(
             .permission_mode()
             .unwrap_or("default"),
         cancel: Some(cancel_rx),
+        // **名额停放器（评审 I2）**：claude 是长驻回合，无人应答的审批卡会把一个全局名额
+        // 吃到 watchdog 到点——审批等待期释放、应答送达前取回（装配与单测同源）。
+        // 守卫随停放器活到回合结束：`run_claude_turn` 返回即 drop ⇒ 名额必然归还。
+        permit: Some(c3::PermitParking::from_guard(slot, runner::global_sem())),
     };
     let kill = proc.kill_fn();
     let out = c3::run_claude_turn(proc.io, input, &kill).await;
@@ -11865,18 +11887,10 @@ enum AppSwitchOutcome {
     ),
 }
 
-/// 切档臂串行锁的**取消安全注销**（review I-1）：spawn_blocking 闭包持本守卫——
-/// 闭包**任一**返回/早退/panic 路径都注销槽位。注销必须挂闭包侧而不是 handler 侧：
-/// handler 在协议回合 await 窗口被丢弃（移动端断连/杀后台 → hyper 丢 future）时，
-/// `spawn_blocking` 任务仍在阻塞线程池**跑完**（不随 await 句柄撤销），挂 handler
-/// 侧的 `end` 永不执行 ⇒ 槽位永久泄漏、该会话所有 MAM 写臂 `refused:busy` 到重启
-struct CodexAppSlotGuard(String);
-
-impl Drop for CodexAppSlotGuard {
-    fn drop(&mut self) {
-        crate::inject::headless::turn::registry().end(&self.0);
-    }
-}
+// 切档臂串行锁的**取消安全注销**（review I-1）自评审 I14 起改用底座
+// [`crate::inject::headless::turn::TurnGuard`]：同一个 RAII 语义（闭包任一返回/早退/
+// panic 路径随 Drop 注销），但**不再**在 api.rs 里另养一份只认会话号的守卫实现——
+// 「谁占位谁能注销、守卫随任务移动」是类型级不变量，全仓一份。
 
 /// codex APP 协议切档臂（Task 6a——[`session_mode_switch`] 的 `codex_app_form` 分派）。
 /// 前置（调用点已保证）：H3 门已过、会话已定位、目标词过双词表门。
@@ -11995,11 +12009,11 @@ async fn codex_app_mode_switch_arm(
     //    CodexAppSlotGuard——任一返回/早退/panic 路径随 Drop 注销，handler 侧不再
     //    end；cancel 端点不注销，先到者语义同其他通道）
     let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if !crate::inject::headless::turn::registry().begin(
+    let Some(slot) = crate::inject::headless::turn::registry().begin_guarded(
         &sid,
         crate::inject::headless::turn::TurnSlot::placeholder("codex", audit_content.clone())
             .with_channel(CODEX_APPSERVER_AUDIT_CHANNEL),
-    ) {
+    ) else {
         codex_appserver_audit(
             &st,
             &device_id,
@@ -12017,7 +12031,7 @@ async fn codex_app_mode_switch_arm(
                 "code": "busy",
             }),
         );
-    }
+    };
     {
         let flag = cancel_flag.clone();
         crate::inject::headless::turn::registry().arm(
@@ -12041,11 +12055,11 @@ async fn codex_app_mode_switch_arm(
     let arm_sid = sid.clone();
     let probe_fallback = interrupt_probe.clone();
     let turn = tokio::task::spawn_blocking(move || -> AppSwitchOutcome {
-        // 串行锁守卫（review I-1）：闭包任一返回/早退/panic 路径统一注销槽位——
-        // **注销挂本闭包**（spawn_blocking 不随 handler future 丢弃而撤销）；handler
-        // 侧**不得**再 end（闭包收口后到回执组装前，别的写臂可能已占新槽——二次
-        // end 会误注销别人的槽位）
-        let _slot_guard = CodexAppSlotGuard(arm_sid.clone());
+        // 串行锁守卫（review I-1 + 评审 I14）：**从 handler 移入的 TurnGuard**——闭包任一
+        // 返回/早退/panic 路径随 Drop 注销；**注销挂本闭包**（spawn_blocking 不随 handler
+        // future 丢弃而撤销）；handler 侧**不得**再 end（闭包收口后到回执组装前，别的写臂
+        // 可能已占新槽——二次 end 会误注销别人的槽位；TurnGuard 的「单主」从类型上禁掉了它）
+        let _slot_guard = slot;
         // thread UUID（rollout 文件名权威 → UUID 形态会话号回退；都无 → 投递前拒
         // 零 spawn 零回合）
         let rollout =
@@ -14220,32 +14234,35 @@ mod tests {
     fn codex_app_slot_guard_releases_slot_on_drop() {
         let sid = "sess_guard_6b_unit";
         let reg = crate::inject::headless::turn::registry();
-        assert!(reg.begin(
-            sid,
-            crate::inject::headless::turn::TurnSlot::placeholder(
-                "codex",
-                "切换权限至 全自动".to_string()
-            ),
-        ));
         {
-            let _g = CodexAppSlotGuard(sid.to_string());
+            let g = reg
+                .begin_guarded(
+                    sid,
+                    crate::inject::headless::turn::TurnSlot::placeholder(
+                        "codex",
+                        "切换权限至 全自动".to_string(),
+                    ),
+                )
+                .expect("空闲会话必须占到槽位");
             assert!(reg.in_flight(sid), "守卫存活期间槽位在册（串行锁生效）");
+            assert_eq!(g.session_id(), sid);
         }
         assert!(
             !reg.in_flight(sid),
             "守卫 Drop = 闭包收口（含早退/panic 展开）→ 槽位注销"
         );
-        assert!(
-            reg.begin(
+        let again = reg
+            .begin_guarded(
                 sid,
                 crate::inject::headless::turn::TurnSlot::placeholder(
                     "codex",
-                    "再次占位".to_string()
+                    "再次占位".to_string(),
                 ),
-            ),
-            "槽位真释放——同会话可重新占位（不是残留死锁）"
-        );
-        reg.end(sid);
+            )
+            .expect("槽位真释放——同会话可重新占位（不是残留死锁）");
+        // 显式早释放面（与旧 `end` 等价）
+        again.release();
+        assert!(!reg.in_flight(sid));
     }
 
     /// M4 回归锁：审计摘要文案**单点** [`mode_audit_content`]——成功臂与止血门拒绝臂

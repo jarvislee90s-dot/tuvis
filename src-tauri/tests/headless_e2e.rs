@@ -335,13 +335,15 @@ async fn zcode_send_roundtrip() {
     };
     let text = payload();
     // ③ 会话串行锁（与端点同规：占位失败 = 该会话已有在飞回合，如实 skip 不排队）
-    if !turn::registry().begin(
+    // 串行锁走**守卫**（评审 I14）：`_slot` 活到本函数收尾——任何 return / panic 展开都随
+    // Drop 注销，与端点生产路径同一套语义（E2E 是实机验收路径，不该用测试专用 shim）
+    let Some(_slot) = turn::registry().begin_guarded(
         &sid,
         zcode::TurnSlot::placeholder("zcode", text.clone())
             .with_channel(HeadlessKind::Zcode.wire_name()),
-    ) {
+    ) else {
         return skip(case, &format!("会话 {sid} 已有在飞的无头回合（串行锁）"));
-    }
+    };
     eprintln!(
         "[E2E] {case}：会话={sid}；项目={project}；安装根 cjs={}",
         spec.cjs
@@ -358,7 +360,6 @@ async fn zcode_send_roundtrip() {
     )
     .await;
     if let Some(receipt) = gate::version_gate_receipt(&sid, &verdict) {
-        turn::registry().end(&sid);
         panic!(
             "{case}：版本门控未通过（拒发）——按端点同规不得盲发；回执={receipt:?}；\
              判定={verdict:?}（缺 provider config 时先查 ZCODE_BUILTIN_PROVIDER_CONFIG_FILE 推导路径）"
@@ -385,7 +386,6 @@ async fn zcode_send_roundtrip() {
     let deps = zcode::TurnDeps::production(os);
     let seam = turn::production_run_seam();
     let out = zcode::run_turn(&inv, &sid, &project, &build, &deps, &*seam).await;
-    turn::registry().end(&sid);
     eprintln!(
         "[E2E] {case}：回执={:?}；来源={:?}；尝试={}；忙终={}",
         out.receipt, out.receipt_source, out.attempts, out.busy_final
@@ -460,16 +460,16 @@ async fn codex_queue_consumed() {
         );
     }
     let text = payload();
-    if !turn::registry().begin(
+    let Some(_slot) = turn::registry().begin_guarded(
         &probe.thread,
         codex::TurnSlot::placeholder("codex", text.clone())
             .with_channel(HeadlessKind::CodexQueue.wire_name()),
-    ) {
+    ) else {
         return skip(
             case,
             &format!("thread {} 已有在飞的无头回合（串行锁）", probe.thread),
         );
-    }
+    };
     eprintln!(
         "[E2E] {case}：thread={}；rollout={:?}；项目={}；CLI={exe}",
         probe.thread, probe.rollout, probe.project
@@ -506,7 +506,6 @@ async fn codex_queue_consumed() {
         rollout: probe.rollout.as_deref(),
     };
     let out = codex::run_turn(&args, &plan, &build, &deps, &*seam).await;
-    turn::registry().end(&probe.thread);
     eprintln!(
         "[E2E] {case}：回执={:?}；走向={:?}；改道={}；来源={:?}",
         out.receipt, out.plan_used, out.diverted, out.receipt_source
@@ -644,16 +643,16 @@ async fn claude_approval_roundtrip() {
         &pin("MAM_E2E_TEXT").unwrap_or_else(|| CLAUDE_TOOL_TEXT.to_string()),
     )
     .expect("E2E 花名 `e2e` 在白名单内（裁决 24b）");
-    if !turn::registry().begin(
+    let Some(_slot) = turn::registry().begin_guarded(
         &sid,
         c3::placeholder_slot(
             c3::CLAUDE_PROGRAM,
             text.clone(),
             HeadlessKind::ClaudeP.wire_name(),
         ),
-    ) {
+    ) else {
         return skip(case, &format!("会话 {sid} 已有在飞的无头回合（串行锁）"));
-    }
+    };
     eprintln!(
         "[E2E] {case}：会话={sid}；形态={}；项目={project}",
         if resume.is_some() {
@@ -677,7 +676,6 @@ async fn claude_approval_roundtrip() {
     let proc = match c3::spawn_claude(&sp).await {
         Ok(p) => p,
         Err(e) => {
-            turn::registry().end(&sid);
             panic!("{case}：claude spawn 失败：{e}");
         }
     };
@@ -691,6 +689,8 @@ async fn claude_approval_roundtrip() {
         tier: spec.tier(),
         permission_mode: spec.permission_mode().unwrap_or("default"),
         cancel: None,
+        // E2E 不装名额停放器（评审 I2 的停放面由 cli_three 单测覆盖；本文件是实机验收路径）
+        permit: None,
     };
     let turn_task = tokio::spawn(async move { c3::run_claude_turn(proc.io, input, &kill).await });
 
@@ -711,7 +711,6 @@ async fn claude_approval_roundtrip() {
             .await
             .ok()
             .and_then(|r| r.ok());
-        turn::registry().end(&sid);
         panic!(
             "{case}：{APPROVAL_WAIT:?} 内未等到 `can_use_tool` 审批帧——**属形态取证，不是普通失败**\
              （Task 15 M10 附则 1：宿主侧 allow 规则可能短路了审批；请查 ~/.claude/settings.json 的 \
@@ -736,23 +735,19 @@ async fn claude_approval_roundtrip() {
     if let Err(e) = c3::pending_registry().deliver(&sid, &request_id, c3::Decision::Allow) {
         let _ = tree.kill();
         let _ = tokio::time::timeout(TURN_WAIT, turn_task).await;
-        turn::registry().end(&sid);
         panic!("{case}：批准未送达：{e}");
     }
 
     let out = match tokio::time::timeout(TURN_WAIT, turn_task).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
-            turn::registry().end(&sid);
             panic!("{case}：回合任务异常终止：{e}");
         }
         Err(_) => {
             let _ = tree.kill();
-            turn::registry().end(&sid);
             panic!("{case}：回合未在 {TURN_WAIT:?} 内终结——按超时如实上报，勿当成功");
         }
     };
-    turn::registry().end(&sid);
     eprintln!(
         "[E2E] {case}：回执={:?}；控制请求={}（批准 {}/拒绝 {}/问答 {}）；命中终点={}；stop_reason={:?}",
         out.receipt, out.controls, out.allowed, out.denied, out.answered, out.turn_ended,
