@@ -135,6 +135,7 @@ describe("FilePanel 筛选条：单行三组下拉（决策 6 / 审查 S4 结构
       "我上传的",
       "工具读取",
       "工具读写",
+      "会话产物",
     ]);
     expect(kindSel.value).toBe("all");
     expect([...kindSel.options].map((o) => o.text)).toEqual(["全部", "文档", "图片"]);
@@ -287,13 +288,14 @@ describe("FilePanel 目录路径点击弹全路径（2026-09-16 用户裁决）"
 
 describe("FilePanel 来源筛选（M5 B3，下拉形态）", () => {
   const entries = [
-    entry("/p/upload.png", { lastSeq: 5, origin: "user" }),
-    entry("/p/read-only.rs", { lastSeq: 4, origin: "tool_read" }),
-    entry("/p/edited.rs", { lastSeq: 3, origin: "tool_write" }),
+    entry("/p/upload.png", { lastSeq: 6, origin: "user" }),
+    entry("/p/read-only.rs", { lastSeq: 5, origin: "tool_read" }),
+    entry("/p/edited.rs", { lastSeq: 4, origin: "tool_write" }),
+    entry("/p/generated-report.md", { lastSeq: 3, origin: "session_artifact" }),
     entry("/p/legacy.rs", { lastSeq: 2 }), // 旧载荷无 origin
   ];
 
-  it("默认「全部来源」：四条（含无 origin 的旧载荷条目）都可见", () => {
+  it("默认「全部来源」：五条（含无 origin 的旧载荷条目）都可见", () => {
     renderPanel(entries);
     expect(screen.getByText("upload.png")).toBeTruthy();
     expect(screen.getByText("legacy.rs")).toBeTruthy();
@@ -317,13 +319,27 @@ describe("FilePanel 来源筛选（M5 B3，下拉形态）", () => {
     expect(screen.queryByText("read-only.rs")).toBeNull();
   });
 
-  it("行内来源徽标：三值中文文案，旧载荷不渲染徽标", () => {
+  it("切「会话产物」：仅 origin=session_artifact 可见（第四池兜底，脚本产物上墙）", () => {
+    renderPanel(entries);
+    pick("file-origin-select", "session_artifact");
+    expect(screen.getByText("generated-report.md")).toBeTruthy();
+    expect(screen.queryByText("edited.rs")).toBeNull();
+    expect(screen.queryByText("upload.png")).toBeNull();
+  });
+
+  it("行内来源徽标：四值中文文案，旧载荷不渲染徽标", () => {
     renderPanel(entries);
     // 徽标按行内 testid 定位（筛选条里也有同文案，不能全局查文本）
     expect(screen.getByTestId("file-row-0-origin").textContent).toBe("我上传的");
     expect(screen.getByTestId("file-row-1-origin").textContent).toBe("工具读取");
     expect(screen.getByTestId("file-row-2-origin").textContent).toBe("工具读写");
-    expect(screen.queryByTestId("file-row-3-origin")).toBeNull();
+    expect(screen.getByTestId("file-row-3-origin").textContent).toBe("会话产物");
+    expect(screen.queryByTestId("file-row-4-origin")).toBeNull();
+  });
+
+  it("行内来源徽标含会话产物（session_artifact → 会话产物）", () => {
+    renderPanel(entries);
+    expect(screen.getByTestId("file-row-3-origin").textContent).toBe("会话产物");
   });
 
   it("来源筛选无匹配 → 「无匹配文件」空态", () => {
