@@ -101,11 +101,11 @@
       "desktop": "Notifications & Pet",
       "desktopDesc": "Desktop notifications and sounds, the Foxbell pet with its startup-follow, and app autostart at login",
       "tools": "Tools & health",
-      "toolsDesc": "Enable or disable each CLI tool, and run the skill / link health check",
+      "toolsDesc": "Enable or disable each CLI tool, and run the skill / link health check and signal health check",
       "usage": "Usage",
       "usageDesc": "Collection and mini-bar settings, plus collection status, today's numbers and export",
       "remote": "Remote access",
-      "remoteDesc": "Remote service and channels, access and security, paired devices, signal health and injection audit",
+      "remoteDesc": "Remote service and channels, access and security, paired devices, and injection audit",
       "data": "Data",
       "dataDesc": "Mobile attachment footprint and cleanup"
     },
