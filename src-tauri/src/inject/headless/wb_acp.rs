@@ -309,54 +309,199 @@ impl StreamEvidence {
     }
 }
 
-/// SSE 体 → JSON 帧表（+ 注释/噪音分账）。
+/// SSE **行级增量**帧解析器（纯核）：`parse_frames`（整段文本）与 [`StreamScanner`]（逐块
+/// 收流）**同源**——帧边界口径只此一处，不会长出第二套判据（评审 I11）。
 ///
-/// 帧边界按 SSE 规范：`data:` 行累积（多行以 `\n` 连接）、空行派发；`:` 起 = 注释帧
-/// （`:ok` / `: heartbeat`——探测定案里「已结束会话」的流正是这些）；`event:` / `id:` /
-/// `retry:` 行是元数据。**兜底**：既非注释也非 `data:` 的行若能解析为 JSON 也当帧收
-/// （部分实现直接吐 JSON 行）；否则记噪音行（不猜）。
-fn parse_frames(body: &str) -> (Vec<serde_json::Value>, usize, usize) {
-    let mut frames: Vec<serde_json::Value> = Vec::new();
-    let mut comments = 0usize;
-    let mut noise = 0usize;
-    let mut data = String::new();
-    let flush = |data: &mut String, frames: &mut Vec<serde_json::Value>, noise: &mut usize| {
-        let payload = data.trim();
-        if !payload.is_empty() {
-            match serde_json::from_str::<serde_json::Value>(payload) {
-                Ok(v) => frames.push(v),
-                Err(_) => *noise += 1,
-            }
+/// 状态只有两个缓冲：**未闭合的当前行**（字节）与**当前帧的 `data:` 载荷**。行切分点恒为
+/// ASCII `\n` ⇒ 跨块的多字节字符在行尾处才被解码，永不被切两半（评审 I10 的字节纪律）。
+/// 两个缓冲各自有上限（[`SSE_LINE_CAP_BYTES`] / [`SSE_DATA_CAP_BYTES`]，评审 N1）：
+/// 单条不收束的巨型行/载荷超限即丢续字节并如实计噪音——病态行不是判定原料，不静默吞。
+///
+/// 帧边界按 SSE 规范，**逐条对齐旧整段口径（勿「简化」）**：
+/// - 行尾剥 `\r`（`\r\n` 与 `\n` 同判）；空行 = 派发（冲刷载荷）；
+/// - `:` 起 = 注释帧（`:ok` / `: heartbeat`——探测定案里「已结束会话」的流正是这些）；
+///   `event:` / `id:` / `retry:` 行是元数据（跳过）；
+/// - `data:` 行按 `trim_start` 拼进载荷（多行以 `\n` 连接）；
+/// - **兜底**：既非注释也非 `data:` 的行若能解析为 JSON 也当帧收（部分实现直接吐 JSON 行），
+///   否则记噪音行（不猜）；
+/// - 末尾不足一行 / 未派发的载荷由 [`Self::finish`] 结算（= 旧口径的末尾 `flush`）。
+#[derive(Default)]
+struct SseFrames {
+    /// 未闭合的当前行（**字节**：`\n` 是 ASCII ⇒ 解码点恒落在字符边界上）
+    line: Vec<u8>,
+    /// 当前帧的 `data:` 载荷（未以空行派发；多行以 `\n` 连接）
+    data: Vec<u8>,
+    /// 行缓冲已超 [`SSE_LINE_CAP_BYTES`] 截断（续字节在丢；换行到达时 [`Self::take_line`]
+    /// 计**一次**噪音收尾——按行计，不按截断次数计）
+    line_truncated: bool,
+    /// 载荷缓冲已超 [`SSE_DATA_CAP_BYTES`] 截断（续行在丢；空行派发时 [`Self::flush`]
+    /// 计**一次**噪音收尾——按帧载荷计）
+    data_truncated: bool,
+    /// 注释帧数（不算推进证据）
+    comments: usize,
+    /// 既非注释也非 JSON 的行数（含超限截断作废的行/载荷——如实登记，不静默吞）
+    noise: usize,
+    /// **仅测试**：交给帧解析/尾判的字节数——I11 的回归断言面（增量 ⇒ 与流长同阶；
+    /// 旧口径是「每 push 重解析整个 body」⇒ 与流长平方同阶）
+    #[cfg(test)]
+    parsed_bytes: u64,
+}
+
+impl SseFrames {
+    /// 喂入一块**文本**（生产缝的块已按字符边界切齐，见 [`Utf8ChunkAssembler`]）：每产出一帧
+    /// 即回调 `sink`（**流式**：不攒帧表，内存只与「当前行 + 当前帧载荷」有关）
+    fn feed(&mut self, chunk: &str, sink: &mut dyn FnMut(serde_json::Value)) {
+        #[cfg(test)]
+        {
+            self.parsed_bytes += chunk.len() as u64;
         }
-        data.clear();
-    };
-    for raw in body.lines() {
-        let line = raw.trim_end_matches('\r');
-        if line.is_empty() {
-            flush(&mut data, &mut frames, &mut noise);
-            continue;
+        let bytes = chunk.as_bytes();
+        let mut start = 0usize;
+        while let Some(offset) = bytes[start..].iter().position(|b| *b == b'\n') {
+            self.line_extend(&bytes[start..start + offset]);
+            self.take_line(sink);
+            start += offset + 1;
         }
-        if line.starts_with(':') {
-            comments += 1;
-            continue;
+        // 尾部不足一行：留在行缓冲里等下一块（跨块的多字节字符也在这里拼齐）
+        self.line_extend(&bytes[start..]);
+    }
+
+    /// 行缓冲喂入（评审 N1 的内存界）：超 [`SSE_LINE_CAP_BYTES`] 即**丢续字节**并置截断
+    /// 标志——该行已作废，续字节不再追加（截断点可落在多字节字符中间：无碍，此行整体
+    /// 丢弃、不参与任何解码），换行到达时由 [`Self::take_line`] 计一次噪音收尾。
+    fn line_extend(&mut self, bytes: &[u8]) {
+        if self.line_truncated {
+            return; // 已截断：续字节照丢（噪音在行收束时一次性如实计，不按截断次数重复计）
         }
-        if let Some(rest) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(rest.trim_start());
-            continue;
-        }
-        if line.starts_with("event:") || line.starts_with("id:") || line.starts_with("retry:") {
-            continue;
-        }
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(v) => frames.push(v),
-            Err(_) => noise += 1,
+        let room = SSE_LINE_CAP_BYTES.saturating_sub(self.line.len());
+        if bytes.len() > room {
+            self.line.extend_from_slice(&bytes[..room]);
+            self.line_truncated = true;
+        } else {
+            self.line.extend_from_slice(bytes);
         }
     }
-    flush(&mut data, &mut frames, &mut noise);
-    (frames, comments, noise)
+
+    /// 收尾（流结束/死线到点时调用一次）：结算尾部**半行** + 未派发载荷——旧口径「每次
+    /// parse 都在输入末尾 flush」的最后一拍。**不调用它，紧跟流尾、无换行/空行收束的帧
+    /// 就认不出来**（如实登记的等价条件）。
+    fn finish(&mut self, sink: &mut dyn FnMut(serde_json::Value)) {
+        if !self.line.is_empty() {
+            self.take_line(sink);
+        }
+        self.flush(sink);
+    }
+
+    /// **乐观尾判**（只判不消费、不计数）：未派发载荷 / 未闭合半行此刻**已是完整 JSON** 就
+    /// 当帧回调——与旧口径「每拍 parse 都在末尾 flush 未派发载荷」逐拍对齐（例：响应帧
+    /// `data: {...}` 已到、收束空行未到，旧口径**当拍就认**，这里同样当拍认）。
+    /// 重复认同一帧无害：判定只问「是不是本次响应帧」，且停止态一旦置位不再翻转。
+    ///
+    /// CPU 界（评审 N1）：pending 超限即**跳过本拍重试**——sniff 是「提前一拍认」的乐观
+    /// 优化（收束空行一到，`take_line`/`flush` 照常全量解析），跳过只丢提前量、不丢判定。
+    /// 选「超限跳过」而非「块尾字节是 `}`/`]` 才试」：后者要改调用面把块尾字节传进来，
+    /// 且对「`}` 后带尾随空白」等形态仍会漏试；前者是纯内部一行守卫，零调用面改动。
+    fn sniff_pending(&mut self, sink: &mut dyn FnMut(serde_json::Value)) {
+        if self.data.len() + self.line.len() > SNIFF_PENDING_CAP_BYTES {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.parsed_bytes += (self.data.len() + self.line.len()) as u64;
+        }
+        if !self.data.is_empty() {
+            let payload = String::from_utf8_lossy(&self.data);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload.trim()) {
+                sink(v);
+            }
+        }
+        if !self.line.is_empty() {
+            let line = String::from_utf8_lossy(&self.line);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim_end_matches('\r')) {
+                sink(v);
+            }
+        }
+    }
+
+    /// 结算一行（调用点 = 行尾 `\n` 到达 / [`Self::finish`] 的尾部半行）
+    fn take_line(&mut self, sink: &mut dyn FnMut(serde_json::Value)) {
+        let mut raw = std::mem::take(&mut self.line);
+        let truncated = std::mem::take(&mut self.line_truncated);
+        while raw.last() == Some(&b'\r') {
+            raw.pop();
+        }
+        // 超限截断的行（评审 N1）：整体作废 + 如实计噪音（对齐 unknown 行口径，不静默吞）。
+        // 不走下面的正常分支——截断行既不可信地判 `data:` 前缀（残段拼进载荷只会污染），
+        // 也不值得再试 JSON（病态行不可能是判定原料，见 [`SSE_LINE_CAP_BYTES`]）
+        if truncated {
+            self.noise += 1;
+            return;
+        }
+        let line = String::from_utf8_lossy(&raw).into_owned();
+        if line.is_empty() {
+            self.flush(sink); // 空行 = 派发
+            return;
+        }
+        if line.starts_with(':') {
+            self.comments += 1;
+            return;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            if self.data_truncated {
+                return; // 载荷已截断：续行照丢（空行派发时 [`Self::flush`] 计一次噪音收尾）
+            }
+            if !self.data.is_empty() {
+                self.data.push(b'\n');
+            }
+            let rest = rest.trim_start().as_bytes();
+            let room = SSE_DATA_CAP_BYTES.saturating_sub(self.data.len());
+            if rest.len() > room {
+                // 载荷超限（评审 N1）：保留头部到上限、丢续字节——该载荷作废，
+                // 空行派发时如实计噪音
+                self.data.extend_from_slice(&rest[..room]);
+                self.data_truncated = true;
+            } else {
+                self.data.extend_from_slice(rest);
+            }
+            return;
+        }
+        if line.starts_with("event:") || line.starts_with("id:") || line.starts_with("retry:") {
+            return;
+        }
+        match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(v) => sink(v),
+            Err(_) => self.noise += 1,
+        }
+    }
+
+    /// 冲刷当前载荷（空行派发 / 收尾）：`trim` 后非空才试 JSON，失败记噪音（同旧口径）。
+    /// 超限截断的载荷直接作废 + 计噪音（截断的 JSON 不猜、不试半截）
+    fn flush(&mut self, sink: &mut dyn FnMut(serde_json::Value)) {
+        let raw = std::mem::take(&mut self.data);
+        let truncated = std::mem::take(&mut self.data_truncated);
+        if truncated {
+            self.noise += 1;
+            return;
+        }
+        let payload = String::from_utf8_lossy(&raw);
+        let payload = payload.trim();
+        if !payload.is_empty() {
+            match serde_json::from_str::<serde_json::Value>(payload) {
+                Ok(v) => sink(v),
+                Err(_) => self.noise += 1,
+            }
+        }
+    }
+}
+
+/// SSE 体 → JSON 帧表（+ 注释/噪音分账）——**整段口径**：即 [`SseFrames`] 一次喂完再收尾
+/// （帧边界判据与逐块收流同源；整段入口留给 `read_stream` / `rpc_result` 用）。
+fn parse_frames(body: &str) -> (Vec<serde_json::Value>, usize, usize) {
+    let mut parser = SseFrames::default();
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    parser.feed(body, &mut |v| frames.push(v));
+    parser.finish(&mut |v| frames.push(v));
+    (frames, parser.comments, parser.noise)
 }
 
 /// 递归取首个同名字符串值（**只认已知键**；找不到 = None，不猜）
@@ -1604,13 +1749,66 @@ pub fn deps_for(
 // 流扫描器（纯核：喂块 + 现算时钟）——生产缝读取循环与单测共用
 // ============================================================
 
+/// 已收流正文的**保留上限**（字节；超限只保留尾部窗口）。
+///
+/// **为什么是尾部、为什么这样切不丢判定原料**（评审 I11）：
+/// - 响应帧（JSON-RPC 结果）在**回合末尾**才到 ⇒ 恒在尾部窗口内；
+/// - assistant 摘要原料 = 回执 `lastAssistant` 那一刀（[`ASSISTANT_ACCUM_CAP_CHARS`] ≈ 800
+///   字符 ≈ 3 KB）取自正文**尾巴** ⇒ 恒在窗口内；
+/// - 判定本身（响应帧识别 / needle 命中 / 静默活性）走**增量状态**（见 [`StreamScanner`]），
+///   **不读窗口内容** ⇒ 驱逐只决定「交给下游 `read_stream` 的文本尾巴有多长」；
+/// - 1 MiB = 现实单帧（KB 级）的数十倍：失控流的内存从「GB 级」压到 1 MiB 级。
+///
+/// **如实登记的边界**：超限时头部帧被丢弃（早期 `agentPhase` / `session_end` 之类早期证据
+/// 不再出现在 `body()` 里）——判定（响应帧识别 / needle 命中 / 停因）不受影响，但下游
+/// `read_stream` 看到的 `phases` 会从窗口内第一帧起算（`Advanced` 回执的 phase 佐证在
+/// **超长流**上因此退化为较晚的 phase，不掩盖）。
+pub const STREAM_BODY_CAP_BYTES: usize = 1024 * 1024;
+
+/// 单条 SSE **行**（[`SseFrames::line`] 未闭合行缓冲）的长度上限（字节；评审 N1）。
+///
+/// 为什么需要：[`STREAM_BODY_CAP_BYTES`] 只裁 `StreamScanner::body` 窗口，[`SseFrames`]
+/// 自己的行缓冲若无上限，「单条**不收束**的巨型 `data:` 行按小块到达」会把内存吃到流长
+/// （watchdog 600s 内无界）。超限即**丢续字节 + 如实计噪音**（[`SseFrames::noise`]，
+/// 对齐 unknown 行口径——不许静默吞），该行整体作废：判定原料（响应帧）是 KB 级，
+/// 超过 1 MiB 的单行不可能是它。量级同 [`STREAM_BODY_CAP_BYTES`]，独立常量便于单独调。
+const SSE_LINE_CAP_BYTES: usize = 1024 * 1024;
+
+/// 当前帧 `data:` 载荷（[`SseFrames::data`] 未派发载荷缓冲）的长度上限（字节；评审 N1）。
+///
+/// 与 [`SSE_LINE_CAP_BYTES`] 分开设：data 载荷是**多行拼接**的（每行不超行上限，总量
+/// 可以超）——「行有界」推不出「帧载荷有界」。超限即丢续行 + 如实计噪音（空行派发时
+/// [`SseFrames::flush`] 一次性结算），语义同上：病态帧作废，不掩盖任何判定。
+const SSE_DATA_CAP_BYTES: usize = 1024 * 1024;
+
+/// 「乐观尾判」（[`SseFrames::sniff_pending`]）的重试解析上限（字节；评审 N1 的 CPU 界）。
+///
+/// sniff 是「提前一拍认」的优化：未收束的响应帧**已是完整 JSON** 就当拍回调——收束空行
+/// 一到，`take_line`/`flush` 照常全量解析 ⇒ 跳过只丢提前量、不丢判定。现实响应帧 KB 级，
+/// 64 KiB 是其数十倍余量；超过它的 pending 不可能是「马上收束的响应帧」，而每块对它重试
+/// JSON 解析正是二次方成本的来源（病态流 F、块 C ⇒ ≈ F²/2C 的扫描量）。
+const SNIFF_PENDING_CAP_BYTES: usize = 64 * 1024;
+
+/// `data:` 载荷行标记（字节判据用；注释帧 `: heartbeat` 不含它 ⇒ 不算活性）
+const DATA_MARKER: &[u8] = b"data:";
+
 /// SSE 流扫描器：**判定何时停**（响应帧 / 静默死线 / watchdog 上限）。
 ///
 /// 「数据帧」判据 = 块里出现 `data:` 载荷行——**注释帧 `: heartbeat` 不算**（探测定案里
 /// 「已结束会话」的流正是「200 + 心跳但回合不推进」，若把心跳当活性就会永远等下去）。
+///
+/// **逐块成本（评审 I11）**：每块只做 ① 字节级 `data:` 探测 ② needle 增量扫描（命中即锁存）
+/// ③ [`SseFrames`] **增量**喂入 + 未派发尾部乐观判——**不再每块全量重解析 body**
+/// （旧口径是每 push 一次整段 `parse_frames`：ΣO(body) ≈ O(流长²/块长)，且 body 无上限增长）。
 pub struct StreamScanner {
     policy: StreamPolicy,
+    /// 已收流正文（**有界**：超 [`STREAM_BODY_CAP_BYTES`] 只留尾部窗口——见该常量）
     body: String,
+    /// 行级增量帧解析器（与 [`parse_frames`] 同源）
+    frames: SseFrames,
+    /// needle 增量扫描的**跨块重叠窗口**（≤ needle.len()-1 字节）：不依赖 `body` 窗口，
+    /// 故超限驱逐不影响命中判定
+    needle_overlap: Vec<u8>,
     seen_needle: bool,
     started_ms: u64,
     last_data_ms: u64,
@@ -1622,6 +1820,8 @@ impl StreamScanner {
         Self {
             policy,
             body: String::new(),
+            frames: SseFrames::default(),
+            needle_overlap: Vec::new(),
             seen_needle: false,
             started_ms: now_ms,
             last_data_ms: now_ms,
@@ -1631,21 +1831,91 @@ impl StreamScanner {
 
     /// 喂入一块（返回 `true` = 已达停止条件）
     pub fn push(&mut self, chunk: &str, now_ms: u64) -> bool {
+        self.note_data(chunk, now_ms);
+        self.scan_needle(chunk);
         self.body.push_str(chunk);
-        if chunk.contains("data:") {
-            self.last_data_ms = now_ms;
-        }
-        if let Some(needle) = self.policy.idle_unless_seen {
-            if !self.seen_needle && self.body.contains(needle) {
-                self.seen_needle = true;
+        self.trim_window();
+        self.scan_frames(chunk);
+        self.check_deadlines(now_ms)
+    }
+
+    /// 收尾（**流结束/死线到点时调用一次**）：结算尾部半行与未派发载荷——旧口径每拍 parse
+    /// 都在输入末尾 flush，这里把最后一拍落在收流处；不结算会漏掉「紧跟流尾、无空行收束」
+    /// 的响应帧（旧口径认得出来，新口径必须同样认得出来）
+    pub fn finish(&mut self, now_ms: u64) -> bool {
+        let id = self.policy.stop_on_id;
+        let mut hit = false;
+        self.frames.finish(&mut |f| {
+            if id.is_some_and(|id| frame_is_response(&f, id)) {
+                hit = true;
             }
-        }
-        if let Some(id) = self.policy.stop_on_id {
-            if response_frame_present(&self.body, id) {
-                self.stop = Some(StreamStop::Complete);
-            }
+        });
+        if hit {
+            self.stop = Some(StreamStop::Complete);
         }
         self.check_deadlines(now_ms)
+    }
+
+    /// 活性：本块含 `data:` 载荷行才推进静默计时（注释帧不算——见类型文档）。
+    /// **字节判据**与旧 `chunk.contains("data:")` 等价：UTF-8 自同步，多字节序列的每个字节
+    /// 都 ≥ 0x80，切不出 ASCII 针（块边界按字符切齐后，块内 ASCII 针的出现集合逐一相同）
+    fn note_data(&mut self, chunk: &str, now_ms: u64) {
+        if contains_bytes(chunk.as_bytes(), DATA_MARKER) {
+            self.last_data_ms = now_ms;
+        }
+    }
+
+    /// needle 增量扫描（`idle_unless_seen`；**命中即锁存**，其后零成本）：只看「本块 + 上一块
+    /// 尾部 needle.len()-1 字节」——任何跨块的针都落在重叠窗内，与旧的 `body.contains(needle)`
+    /// 逐字等价（更早的字节已判过「起不出针」）
+    fn scan_needle(&mut self, chunk: &str) {
+        if self.seen_needle {
+            return;
+        }
+        let Some(needle) = self.policy.idle_unless_seen else {
+            return;
+        };
+        let needle = needle.as_bytes();
+        self.needle_overlap.extend_from_slice(chunk.as_bytes());
+        if contains_bytes(&self.needle_overlap, needle) {
+            self.seen_needle = true;
+            self.needle_overlap.clear(); // 锁存后不再需要窗口
+            return;
+        }
+        let keep = needle.len().saturating_sub(1);
+        if self.needle_overlap.len() > keep {
+            let drop = self.needle_overlap.len() - keep;
+            self.needle_overlap.drain(..drop);
+        }
+    }
+
+    /// 尾部窗口（评审 I11 的内存界）：超限即从**头部**驱逐（帧边界优先，其次字符边界）——
+    /// 判定原料都在尾部与锁存状态里，故驱逐不影响任何判定（见 [`STREAM_BODY_CAP_BYTES`]）
+    fn trim_window(&mut self) {
+        if self.body.len() > STREAM_BODY_CAP_BYTES {
+            let cut = window_cut(&self.body, STREAM_BODY_CAP_BYTES);
+            self.body.drain(..cut);
+        }
+    }
+
+    /// 帧判定（**增量**）：只喂新到的块 + 对「未派发尾部」做一次乐观判——响应帧一到即停，
+    /// 不再每块重解析整个 body（评审 I11）
+    fn scan_frames(&mut self, chunk: &str) {
+        if self.stop.is_some() {
+            return;
+        }
+        let Some(id) = self.policy.stop_on_id else {
+            return;
+        };
+        let mut hit = false;
+        self.frames
+            .feed(chunk, &mut |f| hit |= frame_is_response(&f, id));
+        // 旧口径「每拍 parse 都在末尾 flush」的等价拍：未以空行收束的响应帧当拍就认
+        self.frames
+            .sniff_pending(&mut |f| hit |= frame_is_response(&f, id));
+        if hit {
+            self.stop = Some(StreamStop::Complete);
+        }
     }
 
     /// 时钟推进（无数据的等待期；返回 `true` = 已达停止条件）
@@ -1700,12 +1970,37 @@ impl StreamScanner {
     }
 }
 
-/// 响应帧是否已在（`"id":<id>` 且同帧带 `result`/`error`）
-fn response_frame_present(body: &str, id: u64) -> bool {
-    parse_frames(body).0.iter().any(|f| {
-        f.get("id").and_then(|x| x.as_u64()) == Some(id)
-            && (f.get("result").is_some() || f.get("error").is_some())
-    })
+/// 该帧是否本次请求的**响应帧**（`id` 匹配且带 `result`/`error`——回合终点）。
+/// 旧的整段判据 `response_frame_present` 与本函数同义，只是喂入方式不同（整段 vs 增量）。
+fn frame_is_response(f: &serde_json::Value, id: u64) -> bool {
+    f.get("id").and_then(|x| x.as_u64()) == Some(id)
+        && (f.get("result").is_some() || f.get("error").is_some())
+}
+
+/// 字节级子串包含（**纯函数**）：与 `str::contains` 对同一段 UTF-8 文本**逐字节等价**
+/// （UTF-8 自同步：多字节序列的每个字节都 ≥ 0x80，不会切出 ASCII 针）
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// 字符边界对齐（**纯函数**）：返回 ≥ `idx` 的第一个 UTF-8 字符边界（越界给 `len`）
+fn utf8_boundary_at_or_after(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// 窗口切点（**纯函数**）：返回「只保留尾部 `keep` 字节」时该从头部丢掉的字节数。
+/// 切点优先落在**帧边界**（最近一个空行之后；`\r\n\r\n` 的末两字节同样是 `\n\n`）——下游
+/// `read_stream` 拿到的尾巴因此以完整帧开头，不会平白多出半个帧的噪音行；找不到空行
+/// （单帧本身就超窗）则退化为**字符边界**对齐（免得窗口头部被切出半个多字节字符、解码成
+/// U+FFFD）。两种切法都只影响交给下游的文本，不影响任何判定（见 [`STREAM_BODY_CAP_BYTES`]）。
+fn window_cut(body: &str, keep: usize) -> usize {
+    // `len - keep` 可能落在多字节字符中间：先对齐（切片不能劈字符）
+    let raw = utf8_boundary_at_or_after(body, body.len().saturating_sub(keep));
+    body[..raw].rfind("\n\n").map_or(raw, |idx| idx + 2)
 }
 
 #[cfg(not(test))]
@@ -1805,6 +2100,9 @@ pub fn production_http_seam() -> HttpSeam {
                 };
             }
             let mut scanner = StreamScanner::new(req.stream, now_ms());
+            // 字节 → 文本的切分器（纯核；跨 chunk 的多字节字符在这里拼齐，见
+            // [`Utf8ChunkAssembler`]——本缝 `cfg(not(test))` 不可单测，逻辑必须留在纯核里）
+            let mut asm = Utf8ChunkAssembler::default();
             loop {
                 let budget = scanner.next_budget_ms(now_ms());
                 match tokio::time::timeout(std::time::Duration::from_millis(budget), resp.chunk())
@@ -1817,13 +2115,22 @@ pub fn production_http_seam() -> HttpSeam {
                     }
                     Ok(Ok(None)) => break, // 流自然结束
                     Ok(Ok(Some(chunk))) => {
-                        if scanner.push(&String::from_utf8_lossy(&chunk), now_ms()) {
+                        // 只喂**字符边界对齐**的文本：reqwest `chunk()` 的字节边界是任意的，
+                        // 逐块 `from_utf8_lossy`（旧口径）会把跨块的多字节字符两侧各打成
+                        // U+FFFD ⇒ 回执 `lastAssistant` 乱码（M7/M8 实机路径）
+                        if asm.feed_scanner(&chunk, &mut scanner, now_ms()) {
                             break;
                         }
                     }
                     Ok(Err(e)) => return HttpResp::transport_error(&format!("流读取失败: {e}")),
                 }
             }
+            // 收尾：残留的半行/真被截断的尾字节一次性结算（**如实 lossy**，不假装修齐）——
+            // 旧口径每拍 parse 都在末尾 flush，这里补上最后一拍（漏掉会丢「紧跟流尾的响应帧」）
+            if let Some(tail) = asm.flush_tail() {
+                scanner.push(&tail, now_ms());
+            }
+            scanner.finish(now_ms());
             HttpResp {
                 status,
                 body: scanner.body().to_string(),
@@ -1832,6 +2139,85 @@ pub fn production_http_seam() -> HttpSeam {
             }
         })
     })
+}
+
+// ============================================================
+// 生产缝的「原始字节 → 字符边界对齐文本」切分（纯核；缝与单测同源）
+// ============================================================
+
+/// **UTF-8 块累积器**（纯核、无 IO）：按**原始字节**累积，只在**字符边界**切分——跨 chunk
+/// 的多字节字符（中文/emoji）留在 `pending` 里等下一块拼齐，绝不两侧各变 U+FFFD。
+///
+/// 为什么必须如此（评审 I10）：reqwest `Response::chunk()` 的字节边界是**任意**的（TCP 分段、
+/// 代理缓冲、TLS 记录都在切），旧缝对每块单独 `String::from_utf8_lossy` ⇒ 被切开的汉字两侧
+/// 各出一个 U+FFFD，回执 `lastAssistant` 因此乱码——而该缝 `cfg(not(test))` **按设计不可单测**
+/// （M7/M8 实机验收路径）。所以切分逻辑放在纯核里，生产缝与用例调用的是**同一个**
+/// [`Self::feed_scanner`]（缝的循环体就是那一行），不存在「测一套、跑一套」。
+///
+/// `pending` 至多 3 字节（一个 UTF-8 字符最多 4 字节）：`from_utf8` 的 `error_len() = None`
+/// 只表示「输入在字符中间**截断**」⇒ 尾巴留着等下一块；`error_len() = Some(n)` 是**真非法**
+/// 序列 ⇒ 立刻 lossy 如实标注并推进（**不能攒**：真非法字节永远等不到拼齐，会无界堆积）。
+#[derive(Default)]
+pub(crate) struct Utf8ChunkAssembler {
+    /// 上一块切剩的半个字符（≤ 3 字节）
+    pending: Vec<u8>,
+}
+
+impl Utf8ChunkAssembler {
+    /// 喂入一块原始字节，返回其中**完整字符前缀**（可能为空串：整块都是半个字符）
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> String {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(chunk);
+        let mut out = String::with_capacity(buf.len());
+        let mut rest: &[u8] = &buf;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(text) => {
+                    out.push_str(text);
+                    break;
+                }
+                Err(e) => {
+                    let ok = e.valid_up_to();
+                    // `..ok` 按定义是合法 UTF-8（不会失败；`unwrap_or_default` 只是不 panic）
+                    out.push_str(std::str::from_utf8(&rest[..ok]).unwrap_or_default());
+                    match e.error_len() {
+                        // 真非法序列：如实 lossy 标注并推进（绝不无限攒）
+                        Some(n) => {
+                            out.push_str(&String::from_utf8_lossy(&rest[ok..ok + n]));
+                            rest = &rest[ok + n..];
+                        }
+                        // 截断：这段尾巴就是半个字符，留到下一块拼（唯一的缓冲点）
+                        None => {
+                            self.pending = rest[ok..].to_vec();
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// **缝的循环体**：把一块原始字节切分后喂给扫描器（返回 `true` = 扫描器已判停）。
+    /// 生产缝与用例调的都是这一行 ⇒ 边界切分与实机路径同源（不留在 `cfg(not(test))` 里）
+    pub(crate) fn feed_scanner(
+        &mut self,
+        chunk: &[u8],
+        scanner: &mut StreamScanner,
+        now_ms: u64,
+    ) -> bool {
+        scanner.push(&self.push(chunk), now_ms)
+    }
+
+    /// 收尾：残留的截断尾字节（**真被截断**：流在字符中间断）一次性 lossy 兜底——如实标注
+    /// U+FFFD，不假装修齐、更不静默丢字节；无残留 = `None`
+    pub(crate) fn flush_tail(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let tail = std::mem::take(&mut self.pending);
+        Some(String::from_utf8_lossy(&tail).into_owned())
+    }
 }
 
 /// WB 宿主进程表（生产；sysinfo 只刷新 exe 字段——**只服务端口发现**）
@@ -3259,6 +3645,442 @@ mod tests {
         assert_eq!(sc4.stop(), StreamStop::Watchdog);
         // 预算永不返回 0（生产 timeout 会即刻到点）
         assert!(sc4.next_budget_ms(0) >= 1);
+    }
+
+    // ===== 评审 I10：缝的字节切分（跨 chunk 多字节字符不损坏）=====
+
+    /// 生产缝的读循环**单步** = [`Utf8ChunkAssembler::feed_scanner`]（缝与用例同源，逻辑不在
+    /// `cfg(not(test))` 里）：把整条 SSE 体按**任意字节位置**切开喂进去，断言还原无损、
+    /// **无 U+FFFD**。对照组 = 旧口径（逐块 `from_utf8_lossy`）凡切在字符中间必打花——本用例
+    /// 抓的就是这个缺陷机理（reqwest `chunk()` 的边界任意 ⇒ 中文回执两侧各一个替换符）。
+    #[test]
+    fn seam_chunk_split_never_breaks_multibyte_chars() {
+        let policy = StreamPolicy {
+            max_ms: 600_000,
+            idle_ms: PHASE_DEADLINE_MS,
+            idle_unless_seen: Some("agentPhase"),
+            stop_on_id: Some(3),
+        };
+        let body = prompt_sse_chunks(
+            3,
+            &["model_requesting"],
+            Some("end_turn"),
+            &["好的，中文回执正文——不许乱码。"],
+        );
+        for chunk_len in [1usize, 2, 3, 5, 7, 64] {
+            let mut asm = Utf8ChunkAssembler::default();
+            let mut sc = StreamScanner::new(policy, 0);
+            for piece in body.as_bytes().chunks(chunk_len) {
+                asm.feed_scanner(piece, &mut sc, 10);
+            }
+            if let Some(tail) = asm.flush_tail() {
+                sc.push(&tail, 10);
+            }
+            assert_eq!(sc.body(), body, "块长 {chunk_len}：字节累积必须无损还原");
+            assert!(
+                !sc.body().contains('\u{FFFD}'),
+                "块长 {chunk_len}：不得出现替换符（多字节字符跨块必须拼齐）"
+            );
+            // 对照组（旧口径逐块 lossy）：凡切在字符中间 ⇒ 必出 U+FFFD（机理，不是猜测）
+            if body
+                .as_bytes()
+                .chunks(chunk_len)
+                .any(|c| std::str::from_utf8(c).is_err())
+            {
+                let lossy: String = body
+                    .as_bytes()
+                    .chunks(chunk_len)
+                    .map(|c| String::from_utf8_lossy(c).into_owned())
+                    .collect();
+                assert!(
+                    lossy.contains('\u{FFFD}'),
+                    "块长 {chunk_len}：旧口径（逐块 lossy）必然打花"
+                );
+            }
+        }
+    }
+
+    /// 真非法字节（不是「被截断」）不得被无限攒在 `pending` 里：一次性 lossy 如实标注并推进
+    /// （否则 `push` 会永远返回空串、`pending` 无界堆积）
+    #[test]
+    fn utf8_assembler_never_hoards_definitely_invalid_bytes() {
+        let mut asm = Utf8ChunkAssembler::default();
+        // 0xFF 是**确定非法**的首字节（error_len = Some）⇒ 当拍就 lossy 出来
+        let out = asm.push(&[b'A', 0xFF, b'B']);
+        assert!(out.starts_with('A') && out.ends_with('B'), "{out:?}");
+        assert!(asm.flush_tail().is_none(), "确定非法字节不得留在 pending");
+        // 截断（合法字符的前缀）⇒ 留在 pending 等下一块，拼齐后无损
+        let mut asm2 = Utf8ChunkAssembler::default();
+        let head = "中".as_bytes();
+        assert_eq!(asm2.push(&head[..2]), "", "半个字符当拍不产出文本");
+        let out = asm2.push(&head[2..]);
+        assert_eq!(out, "中", "下一块拼齐后无损（无 U+FFFD）");
+    }
+
+    // ===== 评审 I11：增量解析 / 尾部窗口（判定语义不变）=====
+
+    /// 增量判定 ≡ 整段判定：同一 body 逐字符喂 vs 一次 `parse_frames` —— 钉死「帧边界口径
+    /// 同源」（含注释帧 / 裸 JSON 行 / 无空行收束 / `\r\n` 行尾 / 噪音行等形态矩阵）。
+    #[test]
+    fn incremental_verdict_matches_whole_body_parse() {
+        let policy = StreamPolicy {
+            max_ms: 600_000,
+            idle_ms: PHASE_DEADLINE_MS,
+            idle_unless_seen: Some("agentPhase"),
+            stop_on_id: Some(3),
+        };
+        let stop_frame = rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}));
+        let cases: Vec<String> = vec![
+            // 标准 SSE（空行收束）
+            sse(&[phase_frame(SID, "model_requesting"), stop_frame.clone()]),
+            // 单帧：data + 空行
+            format!("data: {stop_frame}\n\n"),
+            // **无空行收束**（旧口径靠「末尾 flush」当拍认；新口径靠乐观尾判）
+            format!("data: {stop_frame}"),
+            // **裸 JSON 行**（部分实现直接吐 JSON 行）
+            format!("{stop_frame}\n"),
+            // `\r\n` 行尾
+            format!("event: message\r\ndata: {stop_frame}\r\n\r\n"),
+            // 噪音行 + 注释帧夹在中间
+            format!(": heartbeat\n\ndata: not-json\n\ndata: {stop_frame}\n\n"),
+        ];
+        for body in cases {
+            assert!(
+                parse_frames(&body)
+                    .0
+                    .iter()
+                    .any(|f| frame_is_response(f, 3)),
+                "夹具本身必须含响应帧：{body:?}"
+            );
+            let mut sc = StreamScanner::new(policy, 0);
+            let mut hit = false;
+            for ch in body.chars() {
+                hit |= sc.push(&ch.to_string(), 10);
+            }
+            hit |= sc.finish(10);
+            assert!(
+                hit && sc.stop() == StreamStop::Complete,
+                "增量口径必须同样认出响应帧：{body:?}"
+            );
+        }
+    }
+
+    /// needle 增量扫描不得丢**跨块**命中（旧的 `body.contains` 是全量扫，增量化后必须逐字
+    /// 等价）：把 `agentPhase` 拆在两个块里照样命中；不含针的流不得误锁存（反向对照）。
+    #[test]
+    fn needle_scan_detects_cross_chunk_hits() {
+        let policy = StreamPolicy {
+            max_ms: 600_000,
+            idle_ms: PHASE_DEADLINE_MS,
+            idle_unless_seen: Some("agentPhase"),
+            stop_on_id: None,
+        };
+        let mut sc = StreamScanner::new(policy, 0);
+        sc.push("event: message\ndata: {\"agent", 10);
+        assert!(!sc.seen_needle, "半个针不算命中");
+        sc.push("Phase\":\"model_requesting\"}\n\n", 20);
+        assert!(sc.seen_needle, "跨块的针必须命中（重叠窗口）");
+        // 已锁存 ⇒ 静默死线不再提前停（时间轴仍在 watchdog 之内——否则停因会是 Watchdog）
+        assert!(
+            !sc.tick(PHASE_DEADLINE_MS * 2),
+            "已见 needle ⇒ 只受 watchdog 约束"
+        );
+        // 反向对照：无针流不得误锁存（防「恒真」桩）
+        let mut none = StreamScanner::new(policy, 0);
+        none.push(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"session/update\"}\n\n",
+            10,
+        );
+        assert!(!none.seen_needle, "无针流不得误判命中");
+        assert!(none.tick(10 + PHASE_DEADLINE_MS), "无针流静默到点必须停");
+        assert_eq!(none.stop(), StreamStop::Idle);
+    }
+
+    /// 长流（数千 chunk）下**解析代价不退化**：增量解析 ⇒ 总解析字节与流长同阶；旧口径
+    /// 「每 push 重解析整个 body」⇒ 与流长平方同阶（本断言必红，见报告里的变异验证）。
+    /// 计数桩 = [`SseFrames::parsed_bytes`]（**仅测试构建**；不为测试改生产 API）。
+    #[test]
+    fn long_stream_parse_cost_stays_linear() {
+        let policy = StreamPolicy {
+            max_ms: 600_000,
+            idle_ms: PHASE_DEADLINE_MS,
+            idle_unless_seen: Some("agentPhase"),
+            stop_on_id: Some(3),
+        };
+        let mut sc = StreamScanner::new(policy, 0);
+        let frame = format!(
+            "event: message\ndata: {}\n\n",
+            chunk_frame(SID, "流式正文块（中文，多字节）")
+        );
+        let pushes = 4_000u64;
+        let mut stream_bytes = 0u64;
+        for i in 0..pushes {
+            stream_bytes += frame.len() as u64;
+            assert!(
+                !sc.push(&frame, i * 10),
+                "第 {i} 块：未见响应帧不得停（夹具的时间轴在 watchdog 之内）"
+            );
+        }
+        let parsed = sc.frames.parsed_bytes;
+        assert!(
+            parsed <= stream_bytes * 4,
+            "解析字节数必须与流长同阶：parsed={parsed} stream={stream_bytes}\
+             （旧口径 ≈ {} = 每 push 全量重解析）",
+            stream_bytes * pushes / 2
+        );
+        // 判定语义仍在：响应帧一到即停
+        let now = pushes * 10 + 10;
+        assert!(
+            sc.push(
+                &format!(
+                    "data: {}\n\n",
+                    rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}))
+                ),
+                now
+            ),
+            "长流末尾的响应帧照样一到即停"
+        );
+        assert_eq!(sc.stop(), StreamStop::Complete);
+    }
+
+    /// 超限窗口下**判定语义不变**：驱逐只作用于交给下游 `read_stream` 的文本尾巴；判定原料
+    /// （响应帧 / needle / assistant 摘要尾巴）由增量状态与尾部窗口承载——逐条钉死。
+    #[test]
+    fn over_cap_window_keeps_verdict_material() {
+        let policy = StreamPolicy {
+            max_ms: 600_000,
+            idle_ms: PHASE_DEADLINE_MS,
+            idle_unless_seen: Some("agentPhase"),
+            stop_on_id: Some(3),
+        };
+        let mut sc = StreamScanner::new(policy, 0);
+        // ① 开头就来 needle（早期 agentPhase 落在**会被驱逐的头部**）
+        assert!(!sc.push(&sse(&[phase_frame(SID, "model_requesting")]), 1));
+        assert!(sc.seen_needle);
+        // ② 灌到超限（长回合的流式正文）
+        let filler = format!(
+            "event: message\ndata: {}\n\n",
+            chunk_frame(SID, &"正文".repeat(2_000))
+        );
+        let mut now = 10u64;
+        for _ in 0..(STREAM_BODY_CAP_BYTES / filler.len() + 4) {
+            now += 10;
+            assert!(!sc.push(&filler, now));
+        }
+        assert!(
+            sc.body().len() <= STREAM_BODY_CAP_BYTES + filler.len(),
+            "窗口必须限长（超限即驱逐头部）：{}",
+            sc.body().len()
+        );
+        assert!(
+            !sc.body().contains("model_requesting"),
+            "头部早期帧确已被驱逐（保留的是尾部窗口）"
+        );
+        // ③ 尾部摘要原料完整（回执 `lastAssistant` 那一刀取自正文尾巴）
+        let tail_text = "尾巴上的中文回执正文（多字节，不得被打断）";
+        now += 10;
+        assert!(!sc.push(&sse(&[chunk_frame(SID, tail_text)]), now));
+        assert!(
+            sc.body().contains(tail_text),
+            "尾部摘要原料必须完整：{:?}",
+            sc.body().chars().rev().take(60).collect::<String>()
+        );
+        assert!(
+            !sc.body().contains('\u{FFFD}'),
+            "窗口切点按字符边界对齐：不得切出替换符"
+        );
+        // ④ needle 已锁存 ⇒ 静默不再提前停（与驱逐无关；响应帧尚未到，stop 还是 None）
+        assert!(
+            !sc.tick(now + PHASE_DEADLINE_MS + 1),
+            "已见 needle ⇒ 不得按静默死线提前停"
+        );
+        // ⑤ 响应帧仍能认出来（判定不读窗口内容：增量解析）
+        now += 10;
+        assert!(
+            sc.push(
+                &format!(
+                    "data: {}\n\n",
+                    rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}))
+                ),
+                now
+            ),
+            "响应帧一到即停（即便早期帧已被驱逐）"
+        );
+        assert_eq!(sc.stop(), StreamStop::Complete);
+    }
+
+    /// 窗口切点纯函数：帧边界优先（下游拿到的尾巴以完整帧开头，不会多出半个帧的噪音行）；
+    /// 单帧超窗时退化为字符边界对齐（不得把多字节字符劈成半个）
+    #[test]
+    fn window_cut_prefers_frame_boundary_then_char_boundary() {
+        let body = "data: {}\n\ndata: [2]\n\n尾巴";
+        let cut = window_cut(body, 4);
+        assert!(body.is_char_boundary(cut), "切点必须落在字符边界上");
+        assert!(body.len() - cut >= 4, "至少保留 keep 字节：cut={cut}");
+        assert!(
+            body[..cut].ends_with("\n\n"),
+            "帧边界优先：切点落在空行之后（尾巴从新帧区开头起）：{:?}",
+            &body[cut..]
+        );
+        assert!(!body[cut..].starts_with("data: {}\n\n"), "头部确已丢弃");
+        // 没有空行（单帧超窗）⇒ 字符边界对齐：不得切在「尾」字中间
+        let single = "data: 中文尾巴";
+        let cut = window_cut(single, 3);
+        assert!(single.is_char_boundary(cut), "切点必须落在字符边界上");
+        assert!(
+            single[cut..].ends_with('巴'),
+            "尾巴完整：{:?}",
+            &single[cut..]
+        );
+        assert_eq!(utf8_boundary_at_or_after("中", 1), 3);
+    }
+
+    /// 病态**单帧不收束**（巨型 `data:` 行无换行、按小块到达）的残余无界面收口（评审 N1）：
+    /// [`STREAM_BODY_CAP_BYTES`] 只裁 body 窗口，[`SseFrames`] 的行/载荷缓冲与 sniff 重试
+    /// 还得各自有界。逐条钉死：① 行缓冲 ≤ 上限（**中途即查**——旧代码缓冲 = 已喂字节，
+    /// 喂过 1.5×上限当刻就红）；② 载荷缓冲 ≤ 上限（多行 `data:` 拼接超限——「行有界」
+    /// 推不出「帧载荷有界」）；③ 解析字节与流长同阶（旧口径每块对整个未派发载荷重试
+    /// JSON 解析 ⇒ 平方阶）；④ 截断如实计噪音（不静默吞）且不毒化后续帧；⑤ 对照：
+    /// 正常 KB 级帧不受影响（噪音 0、响应帧照常一到即停）。
+    #[test]
+    fn oversize_unclosed_frame_stays_bounded() {
+        let policy = StreamPolicy {
+            max_ms: 600_000,
+            idle_ms: PHASE_DEADLINE_MS,
+            idle_unless_seen: Some("agentPhase"),
+            stop_on_id: Some(3),
+        };
+        // —— ① 巨型无换行 `data:` 行（4 MiB、按 2 KiB 块到达）：行缓冲必须有界 ——
+        let mut sc = StreamScanner::new(policy, 0);
+        let giant = format!("data: {{\"filler\":\"{}\"}}", "x".repeat(4 * 1024 * 1024));
+        let bytes = giant.as_bytes();
+        let mut now = 0u64;
+        let mut i = 0usize;
+        let probe = SSE_LINE_CAP_BYTES + SSE_LINE_CAP_BYTES / 2;
+        while i < probe {
+            let end = (i + 2048).min(probe);
+            now += 10;
+            sc.push(
+                std::str::from_utf8(&bytes[i..end]).expect("纯 ASCII 填充"),
+                now,
+            );
+            i = end;
+        }
+        assert!(
+            sc.frames.line.len() <= SSE_LINE_CAP_BYTES,
+            "① 行缓冲必须已收口（已喂 {} 字节 > 上限 {}）：{}",
+            probe,
+            SSE_LINE_CAP_BYTES,
+            sc.frames.line.len()
+        );
+        while i < bytes.len() {
+            let end = (i + 2048).min(bytes.len());
+            now += 10;
+            assert!(
+                !sc.push(
+                    std::str::from_utf8(&bytes[i..end]).expect("纯 ASCII 填充"),
+                    now
+                ),
+                "未见响应帧不得停（时间轴在 watchdog 之内）"
+            );
+            i = end;
+        }
+        assert!(
+            sc.frames.line.len() <= SSE_LINE_CAP_BYTES,
+            "① 行缓冲长度全程有界：{}",
+            sc.frames.line.len()
+        );
+        // ③ 解析字节与流长同阶（旧口径每块全量重试 ⇒ 与流长平方同阶）
+        let parsed = sc.frames.parsed_bytes;
+        assert!(
+            parsed <= bytes.len() as u64 * 4,
+            "③ 解析字节必须与流长同阶：parsed={parsed} stream={}\
+             （旧口径 ≈ 每 push 对整个未派发载荷重试 JSON 解析）",
+            bytes.len()
+        );
+        // ④ 截断不静默吞：收尾结算时如实计噪音
+        sc.finish(now + 10);
+        assert!(
+            sc.frames.noise >= 1,
+            "④ 超限截断的行必须计噪音（不静默吞）：noise={}",
+            sc.frames.noise
+        );
+
+        // —— ② 多行 `data:` 拼接超限（每行不超行上限、载荷总量超载荷上限）——
+        let mut sc = StreamScanner::new(policy, 0);
+        let row = |c: char| format!("data: {}\n", c.to_string().repeat(768 * 1024));
+        let two_rows = format!("{}{}", row('a'), row('b'));
+        let bytes2 = two_rows.as_bytes();
+        let mut i = 0usize;
+        let mut now = 0u64;
+        while i < bytes2.len() {
+            let end = (i + 4096).min(bytes2.len());
+            now += 10;
+            sc.push(
+                std::str::from_utf8(&bytes2[i..end]).expect("纯 ASCII 填充"),
+                now,
+            );
+            i = end;
+        }
+        assert!(
+            sc.frames.data.len() <= SSE_DATA_CAP_BYTES,
+            "② 载荷缓冲必须有界（两行各 768 KiB 已全部喂入）：{}",
+            sc.frames.data.len()
+        );
+        // ④ 截断的帧结算（空行派发）⇒ 如实计噪音，且**不毒化后续帧**
+        now += 10;
+        assert!(!sc.push("\n", now), "截断帧本身无响应帧，不得停");
+        assert!(sc.frames.noise >= 1, "④ 超限截断的载荷必须计噪音");
+        assert!(sc.frames.data.is_empty(), "派发后载荷缓冲清空");
+        now += 10;
+        assert!(
+            sc.push(
+                &format!(
+                    "data: {}\n\n",
+                    rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}))
+                ),
+                now
+            ),
+            "④ 截断帧之后的正常响应帧照常一到即停（判定不被病态帧毒化）"
+        );
+        assert_eq!(sc.stop(), StreamStop::Complete);
+
+        // —— ⑤ 对照：正常 KB 级帧不受影响（噪音 0 + 判定照常）——
+        let mut sc = StreamScanner::new(policy, 0);
+        let normal = sse(&[
+            phase_frame(SID, "model_requesting"),
+            chunk_frame(SID, "流式正文块（中文，多字节，KB 级）"),
+        ]);
+        // 按字符边界攒 ~64B 的块（生产缝的块已按字符切齐——评审 I10 的字节纪律）
+        let mut piece = String::new();
+        let mut now = 0u64;
+        for ch in normal.chars() {
+            piece.push(ch);
+            if piece.len() >= 64 {
+                now += 10;
+                assert!(!sc.push(&piece, now), "正常流未见响应帧不得停");
+                piece.clear();
+            }
+        }
+        if !piece.is_empty() {
+            now += 10;
+            assert!(!sc.push(&piece, now), "正常流未见响应帧不得停");
+        }
+        assert_eq!(sc.frames.noise, 0, "⑤ 正常 KB 级帧零噪音（不误伤）");
+        assert_eq!(sc.frames.line.len(), 0, "正常帧收束后行缓冲清空");
+        now += 10;
+        assert!(
+            sc.push(
+                &format!(
+                    "data: {}\n\n",
+                    rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}))
+                ),
+                now
+            ),
+            "⑤ 正常流的响应帧照常一到即停"
+        );
+        assert_eq!(sc.stop(), StreamStop::Complete);
+        assert_eq!(sc.frames.noise, 0, "⑤ 全程零噪音");
     }
 
     // ===== 判定与诚实性 =====
