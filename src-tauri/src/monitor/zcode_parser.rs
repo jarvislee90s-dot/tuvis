@@ -468,7 +468,10 @@ fn build_one_session(
     now: i64,
 ) -> Option<Session> {
     let messages = load_tail_messages(conn, &row.id)?;
-    let parts = load_parts_for_messages(conn, &messages);
+    // 出卡路径对 parts 读失败**容忍降级**（卡片照出，只是少了 parts 明细——与旧行为等价：
+    // 卡片本来就不对「明细读不到」下结论）；**回执真源路径**（[`store_snapshot_conn`]）
+    // 相反，必须 fail-closed（评审 I5）。
+    let parts = load_parts_for_messages(conn, &messages).unwrap_or_default();
 
     let entries = flatten_entries(&messages, &parts);
     let age_ms = now.saturating_sub(row.time_updated).max(0) as u64;
@@ -577,14 +580,24 @@ fn load_tail_messages(conn: &Connection, session_id: &str) -> Option<Vec<Message
     Some(messages)
 }
 
-/// 尾部消息的全部 parts（单查询 IN 子句，按 message_id 分组保序）
+/// 尾部消息的全部 parts（单查询 IN 子句，按 message_id 分组保序）。
+///
+/// **返回 `Option`（评审 I5）**：`None` = **读失败**（part 表缺失 / prepare 或查询失败 /
+/// 库加锁），`Some(map)` = 读成功（`Some(空 map)` 表示**确实没有 part 行**——两种结局
+/// 必须分得开）。旧实现一律回空 map，于是「part 表读不到」与「这些消息没有 part」不可
+/// 区分：回执真源 [`store_snapshot_conn`] 会据此给出 `last_assistant = None` 的**貌似正常**
+/// 快照，而 zcode 的库确认在拿不到 assistant 文本时会退化到文本比较——那条路会把丢失的
+/// 消息读成「本轮没有新回复」，开出把「没送达」报成「已送达 + 回复」的假确认窗口。
+///
+/// **读失败的行级容忍保持不变**：单行 data 解码失败仍只跳过该行（既有防御语义），
+/// 本函数只把「整表/整查询级别的读失败」拆出来。
 fn load_parts_for_messages(
     conn: &Connection,
     messages: &[MessageRow],
-) -> HashMap<String, Vec<PartRow>> {
+) -> Option<HashMap<String, Vec<PartRow>>> {
     let mut map: HashMap<String, Vec<PartRow>> = HashMap::new();
     if messages.is_empty() {
-        return map;
+        return Some(map);
     }
     let order_col = if conn.prepare("SELECT sequence FROM part LIMIT 0").is_ok() {
         "sequence"
@@ -598,7 +611,7 @@ fn load_parts_for_messages(
         order_col
     );
     let Ok(mut stmt) = conn.prepare(&sql) else {
-        return map;
+        return None; // part 表缺失/加锁 → 读失败（不是「没有 part」）
     };
     let ids: Vec<&str> = messages.iter().map(|m| m.id.as_str()).collect();
     let params: Vec<&dyn rusqlite::types::ToSql> = ids
@@ -613,12 +626,12 @@ fn load_parts_for_messages(
             },
         ))
     }) else {
-        return map;
+        return None;
     };
     for row in rows.filter_map(|r| r.ok()) {
         map.entry(row.0).or_default().push(row.1);
     }
-    map
+    Some(map)
 }
 
 /// 消息 + parts → 归一化 APP 条目（共享判定核的 ZCode 格式翻译适配器）。
@@ -896,7 +909,10 @@ fn store_snapshot_conn(conn: &Connection, session_id: &str) -> Option<ZcodeStore
         )
         .ok()?;
     let messages = load_tail_messages(conn, session_id)?;
-    let parts = load_parts_for_messages(conn, &messages);
+    // **parts 读失败 → 整快照 `None`（评审 I5）**：快照的契约是「任何读失败 → None」，
+    // 而 parts 缺失会让 [`last_assistant_facts`] 恒回 (None, None, None)——那与「本会话
+    // 真的没有 assistant 回复」同形，会被下游读成「本轮没有新回复」（假确认窗口）。
+    let parts = load_parts_for_messages(conn, &messages)?;
     let (last_assistant_id, last_assistant, tokens) = last_assistant_facts(&messages, &parts);
     Some(ZcodeStoreSnapshot {
         last_seq,
@@ -2253,6 +2269,61 @@ mod tests {
             cli_db: tmp.path().join("nope-cli.sqlite"),
         };
         assert!(store_snapshot(&missing, SID_A).is_none());
+    }
+
+    /// **评审 I5**：part 表缺失 = **读失败**（不是「这些消息没有 part」）——快照必须整份
+    /// `None`，绝不给出 `last_assistant = None` 的貌似正常快照（那与「本会话真没有
+    /// assistant 回复」同形，会被下游读成「本轮没有新回复」→ 假确认窗口）。
+    ///
+    /// 变异验证：把 `store_snapshot_conn` 的 `load_parts_for_messages(...)?` 改回
+    /// `.unwrap_or_default()`（旧行为）→ 本用例红（会拿到 `Some` 快照）。
+    #[test]
+    fn store_snapshot_is_none_when_part_table_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        std::fs::create_dir_all(roots.cli_db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&roots.cli_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                task_type TEXT, title TEXT, time_updated INTEGER, time_created INTEGER
+             );
+             CREATE TABLE message (
+                id TEXT PRIMARY KEY, session_id TEXT, sequence INTEGER,
+                time_created INTEGER, data TEXT
+             );",
+        )
+        .unwrap();
+        insert_message(
+            &conn,
+            "m1",
+            SID_A,
+            1,
+            10,
+            r#"{"role":"assistant","tokens":{"output":7}}"#,
+        );
+        drop(conn);
+        assert!(
+            store_snapshot(&roots, SID_A).is_none(),
+            "part 表读不到 → 快照必须如实 None（不得给貌似正常的「无 assistant 回复」快照）"
+        );
+
+        // 反向锚（两种结局必须分得开）：把 part 表补上但留空 = **读得到、确实没有 part 行**
+        // → 这是可读结局，快照照给（只是没有 assistant 文本）
+        let conn = Connection::open(&roots.cli_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE part (
+                id TEXT PRIMARY KEY, message_id TEXT, sequence INTEGER, data TEXT
+             );",
+        )
+        .unwrap();
+        drop(conn);
+        let snap = store_snapshot(&roots, SID_A).expect("part 表在册（空表）= 可读");
+        assert_eq!(snap.last_seq, 1);
+        assert_eq!(
+            snap.last_assistant_id, None,
+            "确实没有 text part → 末条 assistant 事实为空"
+        );
     }
 
     /// **评审 I15 的形状事实钉**：**未知会话号 ⇒ `Some(空快照)`，绝不是 `None`**。

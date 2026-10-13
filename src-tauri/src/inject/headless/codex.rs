@@ -415,15 +415,27 @@ pub fn queued_message_id(stdout: &[String], stderr: &str) -> Option<String> {
         })
 }
 
+/// 单写者锁特征串命中（**大小写口径的唯一单点**，评审 M3）：ASCII 大小写不敏感。
+///
+/// 为什么必须单点：同一句锁告警在两处判据上出现过（本模块的 stdout/stderr 头扫描、
+/// `codex_app::classify` 的错误帧 message）——**一处 lowercase 再 contains、另一处原样
+/// 大小写敏感**，等于同一句告警换个大小写就一边判锁、一边判普通 RPC 错误（口径漂移）。
+/// 上游服务端原文的大小写不受我们控制（版本间也会漂），故判据必须宽容，且只有一份。
+pub fn hits_writer_lock_marker(text: &str) -> bool {
+    find_ascii_ci(text, WRITER_LOCK_MARKER).is_some()
+}
+
 /// 单写者锁证据（spec H8 / issue #47193）。判据：特征串命中，或 `-32600` 与 writer 语义
-/// **同现**——裸错误码不定性（别的 JSON-RPC 失败不得被当成锁）
+/// **同现**——裸错误码不定性（别的 JSON-RPC 失败不得被当成锁）。两分支都走
+/// [`find_ascii_ci`]（同一大小写口径）。
 pub fn writer_lock_evidence(stdout_head: &str, stderr_head: &str) -> Option<String> {
     for hay in [stdout_head, stderr_head] {
-        let lower = hay.to_ascii_lowercase();
-        if lower.contains(WRITER_LOCK_MARKER) {
+        if hits_writer_lock_marker(hay) {
             return Some(WRITER_LOCK_MARKER.to_string());
         }
-        if lower.contains(WRITER_LOCK_RPC_CODE) && lower.contains("writer") {
+        if find_ascii_ci(hay, WRITER_LOCK_RPC_CODE).is_some()
+            && find_ascii_ci(hay, "writer").is_some()
+        {
             return Some(format!("{WRITER_LOCK_RPC_CODE} + writer（单写者锁）"));
         }
     }
@@ -1706,6 +1718,31 @@ mod tests {
             "裸错误码不得定性为单写者锁"
         );
         assert!(writer_lock_evidence("all good", "").is_none());
+    }
+
+    /// **评审 M3：大小写口径的唯一单点**——`hits_writer_lock_marker` 是两处判据
+    /// （本模块的 stdout/stderr 头扫描、`codex_app::classify` 的错误帧 message）共用的
+    /// **同一份**比对。上游服务端原文的大小写不受我们控制（版本间也会漂），判据必须宽容；
+    /// 两处各写一份就必然漂移（旧 codex_app 口径是大小写敏感）。
+    ///
+    /// 变异验证：把 `hits_writer_lock_marker` 改回 `text.contains(WRITER_LOCK_MARKER)`
+    /// （即 codex_app 的旧口径）→ 本用例的大小写变体三条红。
+    #[test]
+    fn writer_lock_marker_matching_is_case_insensitive_single_point() {
+        assert!(hits_writer_lock_marker(WRITER_LOCK_MARKER));
+        assert!(hits_writer_lock_marker(
+            &WRITER_LOCK_MARKER.to_ascii_uppercase()
+        ));
+        assert!(hits_writer_lock_marker(
+            "Thread x Already Has An Active Writer"
+        ));
+        assert!(
+            !hits_writer_lock_marker("already has an active reader"),
+            "近似串不得命中（判据不得放宽成「含 writer」）"
+        );
+        // 头扫描与它同口径（同一函数，不是两份实现）
+        assert!(writer_lock_evidence("", "ALREADY HAS AN ACTIVE WRITER").is_some());
+        assert!(writer_lock_evidence("Already Has An Active Writer", "").is_some());
     }
 
     /// exec resume 的末条回复 = stdout 最后一条非空行（spec H8）

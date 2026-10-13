@@ -12173,11 +12173,18 @@ async fn codex_app_mode_switch_arm(
                     format!("mismatch:{readback}"),
                 ),
                 PolicyVerify::Ineffective => {
-                    // resume-only 兜底的 ineffective 是**语义性的**（review I1）：档位
-                    // 已随 resume 持久化、下一回合生效——本回合无新 turn_context，读回
-                    // 核对天然「未生效」；与「读不到」的 ineffective 用文案区分
+                    // 三条腿各自说自己的实话（同一档位、三种成因——别把「未做核对」说成
+                    // 「读不到」）：
+                    // ① resume-only = **语义性**未生效（review I1）：档位已随 resume
+                    //    持久化、下一回合生效，本回合无新 turn_context；
+                    // ② 未观测到回合收口（质量 M4）：**根本没做**读回核对——读回缝这时
+                    //    可能仍是旧回合上下文，比对会产出假 Mismatch，故不查；
+                    // ③ 其余 = 真「读不到」（读回缝给不出值）。
                     let hint = if r.carrier == PolicyCarrier::ResumeOnly {
                         "档位已随 resume 持久化，下一回合生效（本回合无新档位回合记录，读回未生效）——请在 APP 内核对"
+                            .to_string()
+                    } else if !r.turn_completion.observed {
+                        "已投递但**未做**档位读回核对（未观测到回合收口——读回可能仍是旧回合上下文，比对会误报不符）——请在 APP 内核对当前档位"
                             .to_string()
                     } else {
                         "已投递但读不到档位回执（未确认生效）——请在 APP 内核对当前档位".to_string()
@@ -12192,11 +12199,14 @@ async fn codex_app_mode_switch_arm(
                 }
             };
             // 「回合完成通知未观测到」后缀只对**起了回合**的载体有意义（resume-only
-            // 无从观测是构造使然，不是在途——加后缀会误导）
-            let hint = if r.turn_completion.observed || r.carrier == PolicyCarrier::ResumeOnly {
-                hint
-            } else {
+            // 无从观测是构造使然，不是在途——加后缀会误导）。**质量 M4 起未观测必然
+            // 降级 Ineffective，而那一臂的文案已自述「未做核对 / 未观测到收口」**——故此处
+            // 跳过，避免同一句事实写两遍（也避免把「未做核对」说成「仍可能补上」）
+            let unobserved = !r.turn_completion.observed && r.carrier != PolicyCarrier::ResumeOnly;
+            let hint = if unobserved && r.verify != PolicyVerify::Ineffective {
                 format!("{hint}；回合完成通知未观测到（可能仍在途）")
+            } else {
+                hint
             };
             codex_appserver_audit(
                 &st,

@@ -54,7 +54,7 @@ use std::sync::Arc;
 
 // 计划明令复用（锚点 codex.rs:263-289）：rollout 文件名 UUID 唯一来源 + 单写者锁特征串
 // （跨通道纯函数复用，零运行时耦合；若后续上提到 turn.rs 由后续批次处理，勿在此复制实现）
-use super::codex::{resolve_thread, WRITER_LOCK_MARKER};
+use super::codex::{hits_writer_lock_marker, resolve_thread};
 // Task 7 可用性探测：复用 gate 的缓存纪律（ProbeCache/ProbeKey/probe_cached——
 // 平行 spec 结构，不扩 gate::ProbeSpec：探测体是交互式会话，不走 argv 单发探针族）
 use super::gate::{probe_cached, ProbeCache, ProbeKey, ProbeVerdict};
@@ -223,7 +223,8 @@ impl std::fmt::Display for AppServerError {
 }
 
 /// 错误帧分类（纯核）：-32601 → 方法缺席（unavailable）；-32600 + 单写者锁特征串
-/// （[`WRITER_LOCK_MARKER`]，单点复用）→ 活跃线程写不可用；其余原样透传
+/// （[`hits_writer_lock_marker`]，**大小写口径与 `codex.rs` 共用同一个单点**——评审 M3）→
+/// 活跃线程写不可用；其余原样透传
 fn classify(method: &str, e: FrameError) -> AppServerError {
     if e.code == METHOD_NOT_FOUND_CODE {
         return AppServerError::MethodUnavailable {
@@ -231,7 +232,7 @@ fn classify(method: &str, e: FrameError) -> AppServerError {
             message: e.message,
         };
     }
-    if e.code == INVALID_REQUEST_CODE && e.message.contains(WRITER_LOCK_MARKER) {
+    if e.code == INVALID_REQUEST_CODE && hits_writer_lock_marker(&e.message) {
         // 跨实例对活跃线程写的实测形态（T0.1 §1.4）：-32600 与 writer 语义同现才定性——
         // 裸 -32600 不当锁（别的 invalid request 不得被误降级），同纪律见 codex.rs 的锁判据
         return AppServerError::ActiveThreadWriteUnavailable;
@@ -364,6 +365,27 @@ pub struct TurnCompletion {
     pub observed: bool,
 }
 
+/// `turn/completed` 通知参数 → 观测产物（**解析单点**：直接等待窗与 M22 留档补检同用）。
+/// 形状按探测归档（§1.5：`params.turn.{status,durationMs}`）；顶层 `status` 作兼容双路；
+/// 两路都缺 → status=None（观测到完成但形状漂移，不猜）。到达即 `observed=true`
+/// （「到达」是事实，「成败」看 status——两码事）
+fn turn_completion_from(params: &serde_json::Value) -> TurnCompletion {
+    let turn = params.get("turn");
+    let status = turn
+        .and_then(|t| t.get("status"))
+        .or_else(|| params.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let duration_ms = turn
+        .and_then(|t| t.get("durationMs"))
+        .and_then(serde_json::Value::as_u64);
+    TurnCompletion {
+        status,
+        duration_ms,
+        observed: true,
+    }
+}
+
 /// `turn/interrupt` 回执（仅 MAM 自持连接的在飞回合——T0.1：自持 31ms 生效）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterruptReceipt {
@@ -383,6 +405,11 @@ pub struct AppServerSession {
     next_id: u64,
     /// 通知旁流（无 id 帧的 method 序列——分道收集，绝不参与响应匹配）
     pub notifications: Vec<String>,
+    /// **M22 吞帧竞窗的接住点**：`call()` 等 id 匹配响应期间先到的 `turn/completed`
+    /// （interrupt 应答与完成帧竞态，见 [`Self::wait_turn_completed_cancellable`]）。
+    /// 旁流只留方法名、参数已丢（复原不出完成态），故完成态在此**原样留档**待等待窗
+    /// 认领——不静默吞掉「回合已完成」这一事实
+    pending_turn_completion: Option<TurnCompletion>,
     /// ServerRequest 收集（P2 审批应答扩展缝；本批只收集不代答）
     pub server_requests: Vec<(u64, String)>,
     /// initialize 回包 `userAgent`（版本坐标**登记不硬编码**：0.162.1 为探测态）
@@ -406,6 +433,7 @@ impl AppServerSession {
             io,
             next_id: 1,
             notifications: Vec::new(),
+            pending_turn_completion: None,
             server_requests: Vec::new(),
             server_user_agent: None,
             unknown_frames: 0,
@@ -463,7 +491,16 @@ impl AppServerSession {
                 },
                 // 他人 id 的响应帧：旁记计数（不匹配、不解释——同纪律的「不猜」面）
                 WireFrame::Response { .. } => self.stray_responses += 1,
-                WireFrame::Notification { method: m, .. } => self.notifications.push(m),
+                WireFrame::Notification { method: m, params } => {
+                    // 旁流照收（既有消费语义不变：方法名照旧进 `notifications`，不去重、
+                    // 不由本层取走）；`turn/completed` 另**留档**完成态——M22 吞帧竞窗：
+                    // 等响应期间先到的完成帧只留方法名的话，参数就丢了，外层等待窗此后
+                    // 永远等不到第二帧 ⇒ 丢失「回合已完成」这一事实（observed 恒假）
+                    if m == "turn/completed" {
+                        self.pending_turn_completion = Some(turn_completion_from(&params));
+                    }
+                    self.notifications.push(m);
+                }
                 WireFrame::ServerRequest { id: rid, method: m } => {
                     self.server_requests.push((rid, m))
                 }
@@ -546,6 +583,11 @@ impl AppServerSession {
     /// 继续等收口（完成帧的 `status=interrupted` 自然入 `TurnCompletion`）。interrupt
     /// 发送失败（版本漂移/通道错）不中止等待：回合自然收口、观测如实。turnId 缺席
     /// （形状漂移）= 无可中止对象 → 按未观测收口（不猜目标）。
+    ///
+    /// **M22 吞帧竞窗（质量 M5）**：`turn/completed` 可能**先于** interrupt 应答到达
+    /// ——`interrupt()` 的 [`Self::call`] 只认 id 匹配的应答帧，期间先到的完成帧会落进
+    /// 旁流留档（[`Self::pending_turn_completion`]）；本等待窗每轮先在留档位**补检**
+    /// 一次，绝不在已吞帧的前提下继续 `recv()` 空等一帧永远不来的「第二帧」。
     pub fn wait_turn_completed_cancellable(
         &mut self,
         probe: Option<&CancelProbe>,
@@ -559,6 +601,11 @@ impl AppServerSession {
         };
         let mut interrupt_sent = false;
         loop {
+            // M22 补检（单点，先于探针与 recv）：call() 窗口吞下的完成帧在此认领。
+            // 先于探针的理由：回合已收口 ⇒ 无在飞回合可中止，不必再发一次 interrupt
+            if let Some(done) = self.pending_turn_completion.take() {
+                return done;
+            }
             if let (Some(probe), false) = (probe, interrupt_sent) {
                 if probe() {
                     match turn_id.map(str::trim).filter(|t| !t.is_empty()) {
@@ -567,6 +614,9 @@ impl AppServerSession {
                             // 态/读回判断，不在此假装已中止）
                             let _ = self.interrupt(thread_id, tid);
                             interrupt_sent = true;
+                            // 立即回到补检：interrupt 应答等待窗内先到的完成帧已被
+                            // 留档——落到下面的 recv() 就是 M22 的空等（永远等不到）
+                            continue;
                         }
                         // 无 turnId = 无可中止对象（形状漂移不猜目标）——按未观测收口
                         None => return unobserved,
@@ -580,22 +630,7 @@ impl AppServerSession {
             };
             match parse_frame(&line) {
                 WireFrame::Notification { method, params } if method == "turn/completed" => {
-                    // 形状按探测归档（§1.5：params.turn.{status,durationMs}）；顶层 status
-                    // 作兼容双路；两路都缺 → status=None（观测到完成但形状漂移，不猜）
-                    let turn = params.get("turn");
-                    let status = turn
-                        .and_then(|t| t.get("status"))
-                        .or_else(|| params.get("status"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string);
-                    let duration_ms = turn
-                        .and_then(|t| t.get("durationMs"))
-                        .and_then(serde_json::Value::as_u64);
-                    return TurnCompletion {
-                        status,
-                        duration_ms,
-                        observed: true,
-                    };
+                    return turn_completion_from(&params);
                 }
                 WireFrame::Notification { method, .. } => self.notifications.push(method),
                 WireFrame::ServerRequest { id: rid, method: m } => {
@@ -747,7 +782,8 @@ pub struct PolicyWriteReceipt {
     pub turn_id: Option<String>,
     /// 回合收口观测（`turn/completed`；未观测到 = `observed=false`）
     pub turn_completion: TurnCompletion,
-    /// 读回核对三态
+    /// 读回核对三态（**未观测到回合收口时恒 [`PolicyVerify::Ineffective`]**——质量 M4：
+    /// 那时读回缝可能是**旧回合**上下文，比对会产出假 Mismatch）
     pub verify: PolicyVerify,
 }
 
@@ -896,12 +932,22 @@ fn switch_on_session(
     let turn_completion =
         s.wait_turn_completed_cancellable(probe, thread_id, started.turn_id.as_deref());
     // 读回三态核对（真源 = rollout 尾部 turn_context.approval_policy，缝注入——不走 RPC）
-    let verify = match readback(thread_id) {
-        // 质量 M1：宽容判定——读回串经 parse（trim + 大小写不敏感）比对，漂移不误报
-        // Mismatch；Mismatch.readback 仍报原始串（前端/审计看真值）
-        Some(got) if AppApprovalPolicy::parse(&got) == Some(policy) => PolicyVerify::Hit,
-        Some(got) => PolicyVerify::Mismatch { readback: got },
-        None => PolicyVerify::Ineffective,
+    let verify = if !turn_completion.observed {
+        // **质量 M4：未观测到回合收口 ⇒ 降级 Ineffective**（不查读回缝）。判据：本回合
+        // 的 `turn_context` 是随回合落盘的，`turn/completed` 未观测到意味着它未必已落盘
+        // ——读回缝这时看到的可能仍是**旧回合**的上下文，拿它比对会产出**假 Mismatch**
+        // （旧档 ≠ 请求档，前端据此判「不符」并丢弃乐观态）。三态里 Ineffective 的既有
+        // 语义正是「读不到/未生效如实」（不谎报生效），口径与 ②' resume-only 分支的
+        // 「不查读回缝」一致；真值仍可由调用方按 turn_completion 如实标注
+        PolicyVerify::Ineffective
+    } else {
+        match readback(thread_id) {
+            // 质量 M1：宽容判定——读回串经 parse（trim + 大小写不敏感）比对，漂移不误报
+            // Mismatch；Mismatch.readback 仍报原始串（前端/审计看真值）
+            Some(got) if AppApprovalPolicy::parse(&got) == Some(policy) => PolicyVerify::Hit,
+            Some(got) => PolicyVerify::Mismatch { readback: got },
+            None => PolicyVerify::Ineffective,
+        }
     };
     Ok(PolicyWriteReceipt {
         carrier,
@@ -1892,6 +1938,70 @@ mod tests {
         }
     }
 
+    /// 质量 M4（先红）：**未观测到回合收口**（`turn/completed` 直到 EOF 都没来 ⇒
+    /// observed=false）时，读回缝即便给「别档」值也**不得**产出 Mismatch——本回合
+    /// `turn_context` 未必落盘，缝里读到的可能仍是**旧回合**上下文，比对就是假不符；
+    /// 按既有三态降级 `Ineffective`（口径同 ②' resume-only：不查读回缝）。
+    /// 对照腿证明降级闸只认「观测态」：同一「别档」读回值在 observed=true 时照旧 Mismatch
+    #[test]
+    fn unobserved_turn_completion_downgrades_verify_to_ineffective() {
+        /// 到 turn/start 应答为止——turn/completed 永不投递（等待窗 EOF 收口）
+        fn no_completion_script() -> Vec<String> {
+            vec![
+                init_ok(),
+                resp(2, r#"{"status":{"type":"idle"}}"#),
+                resp(
+                    3,
+                    r#"{"turnId":"turn-1","turn":{"id":"turn-1","status":"inProgress"}}"#,
+                ),
+            ]
+        }
+        fn completed_script() -> Vec<String> {
+            let mut s = no_completion_script();
+            s.push(turn_completed("completed"));
+            s
+        }
+        // 未观测收口 + 读回为别档：必须 Ineffective（不是 Mismatch——假不符会误导前端）
+        let (seam, _) = mock_spawn(vec![no_completion_script()]);
+        let receipt = client_of(seam)
+            .switch_approval_policy(
+                TID,
+                AppApprovalPolicy::Never,
+                PolicyCarrier::TurnStart,
+                "。",
+                &readback_of(Some("on-request")),
+            )
+            .unwrap();
+        assert!(
+            !receipt.turn_completion.observed,
+            "turn/completed 直到 EOF 未投递——如实未观测"
+        );
+        assert_eq!(
+            receipt.verify,
+            PolicyVerify::Ineffective,
+            "未观测到回合收口 ⇒ 读回降级 Ineffective（别档读回值不得产出假 Mismatch）"
+        );
+        // 对照腿：同一读回值、观测到收口 → 照旧 Mismatch（降级只由观测态触发）
+        let (seam, _) = mock_spawn(vec![completed_script()]);
+        let receipt = client_of(seam)
+            .switch_approval_policy(
+                TID,
+                AppApprovalPolicy::Never,
+                PolicyCarrier::TurnStart,
+                "。",
+                &readback_of(Some("on-request")),
+            )
+            .unwrap();
+        assert!(receipt.turn_completion.observed);
+        assert_eq!(
+            receipt.verify,
+            PolicyVerify::Mismatch {
+                readback: "on-request".to_string()
+            },
+            "观测到收口时读回为别档照旧如实报不符"
+        );
+    }
+
     /// interrupt 回执 + turnId 校验：参数逐字进帧；回执回显 thread/turn + 响应态；
     /// 自持等待窗观测 turn/completed(interrupted)；空 turnId 投递前拒（零协议副作用）
     #[test]
@@ -1993,6 +2103,41 @@ mod tests {
         assert_eq!(frame["method"], "turn/interrupt");
         assert_eq!(frame["params"]["threadId"], TID);
         assert_eq!(frame["params"]["turnId"], "turn-err");
+    }
+
+    /// 质量 M5 / M22 吞帧竞窗（先红）：`turn/completed` **先于** interrupt 应答到达
+    /// ——`interrupt()` 的 call() 只认 id 匹配帧，完成帧先落旁流；旧行为外层此后只会
+    /// EOF（脚本已尽）⇒ observed=false，「回合已完成」这一事实被吞掉。修复后由留档位
+    /// 补检认领：observed=true **且** status/durationMs 一并复原（旁流只留方法名，
+    /// 复原不出完成态——这正是必须留档而非事后扫旁流的理由）
+    #[test]
+    fn turn_completed_before_interrupt_response_is_observed() {
+        let (seam, log) = mock_spawn(vec![vec![
+            init_ok(),
+            // 竞窗：完成帧先到（id=2 的 interrupt 应答还没来）
+            turn_completed("interrupted"),
+            resp(2, r#"{"turn":{"status":"interrupting"}}"#),
+        ]]);
+        let mut s = AppServerSession::start(&seam, &spec(), &client_info()).unwrap();
+        let probe: CancelProbe = std::sync::Arc::new(|| true);
+        let done = s.wait_turn_completed_cancellable(Some(&probe), TID, Some("turn-1"));
+        s.close();
+        assert!(
+            done.observed,
+            "先到的完成帧不得被 call() 吞掉（M22 竞窗——外层等不到第二帧）"
+        );
+        assert_eq!(done.status.as_deref(), Some("interrupted"));
+        assert_eq!(done.duration_ms, Some(6032));
+        // 既有旁流语义不变：该通知照旧进 notifications（不去重、不由本层取走）
+        assert!(
+            s.notifications.iter().any(|m| m == "turn/completed"),
+            "通知旁流照收（消费语义不变）：{:?}",
+            s.notifications
+        );
+        // 探针确实发过 interrupt（完成帧在应答之前，故 interrupt 已在飞——竞窗前提成立）
+        let frame = sent_json(&log, 1);
+        assert_eq!(frame["method"], "turn/interrupt");
+        assert_eq!(frame["params"]["turnId"], "turn-1");
     }
 
     /// 活跃线程写拒 → 降级旗标/错误如实（-32600 + active writer 实测形态）；
@@ -2513,6 +2658,49 @@ s-2",
             cache.get(&key).is_some_and(|c| c.is_pass()),
             "恢复结论覆盖旧失败（成功长缓存）"
         );
+    }
+
+    /// **评审 M3：错误帧分类的大小写口径与 exec 侧同源**——旧实现在此处
+    /// `message.contains(WRITER_LOCK_MARKER)` 是**大小写敏感**的，而 `codex.rs` 的
+    /// `writer_lock_evidence` 先 lowercase：同一句锁告警换个大小写，一处判锁、一处判普通
+    /// RPC 错误（口径漂移）。现在两侧共用 [`hits_writer_lock_marker`]。
+    ///
+    /// 变异验证：把 `classify` 改回大小写敏感的 `contains` → 本用例红
+    /// （大写变体落到 `AppServerError::Rpc`）。
+    #[test]
+    fn writer_lock_classification_is_case_insensitive_like_the_exec_side() {
+        let upper = FrameError {
+            code: INVALID_REQUEST_CODE,
+            message: "THREAD 01A12B82 ALREADY HAS AN ACTIVE WRITER".to_string(),
+        };
+        assert_eq!(
+            classify("thread/read", upper),
+            AppServerError::ActiveThreadWriteUnavailable,
+            "大小写变体必须与 exec 侧同判（口径单点 hits_writer_lock_marker）"
+        );
+        let mixed = FrameError {
+            code: INVALID_REQUEST_CODE,
+            message: "Already Has An Active Writer".to_string(),
+        };
+        assert_eq!(
+            classify("thread/read", mixed),
+            AppServerError::ActiveThreadWriteUnavailable
+        );
+        // 安全面一字不动：**裸 -32600 不得定性为锁**（近似串/无特征串同理）
+        for message in [
+            "invalid params",
+            "already has an active reader",
+            "writer busy",
+        ] {
+            let e = FrameError {
+                code: INVALID_REQUEST_CODE,
+                message: message.to_string(),
+            };
+            assert!(
+                matches!(classify("thread/read", e), AppServerError::Rpc { .. }),
+                "无锁特征串的 -32600 必须原样透传为 Rpc（{message}）"
+            );
+        }
     }
 
     /// 探针语义专项（Task 7）：**-32600 + 单写者锁特征串 ≠ 方法缺席**——writer 锁

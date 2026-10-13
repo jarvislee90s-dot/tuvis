@@ -25,6 +25,13 @@
 //! - **候选 ≥2 → 只有精确 TTY 命中能消歧**（[`resolve_by_tty`]）；命中不唯一
 //!   （两个候选同 TTY = TTY 不具判别力）/ 无 TTY 证据 / 平台不采 TTY → **拒绝**，
 //!   绝不任选（[`TargetDecision::Ambiguous`]）；
+//! - **TTY 表与候选集求交是内核自身责任**（[`decide_target`] 单点落地）：表内 pid 不在
+//!   候选集的行，**既不参与命中、也不参与唯一性计数**。调用方（证据源）**无需**预先
+//!   过滤——内核保证，勿把它降格成调用方约定：漏了这一步，TTY 就能命中不属于候选集的
+//!   进程（假命中 ⇒ 消息打进别的会话窗口），或把唯一性命中计数从 1 撑到 2（放弃本可用
+//!   的证据 ⇒ 假歧义拒绝）。今天生产之所以见不到这两种形态，仅因
+//!   [`tool_target_evidence`] 恰好按候选 pids 建表（且 `session_tty` 恒 None）——这是
+//!   巧合而非契约，独立证据源一接入就会暴露（评审 I16）；
 //! - **候选 0**（进程已死 / cwd 口径漂移）→ **不做歧义拒绝**：交既有链路如实失败。
 //!   拒绝文案只对「有多个候选」成立——「0 个候选」不是歧义（见 [`decide_target`]）。
 //!
@@ -75,6 +82,10 @@ pub fn fallback_cwd_policy(n: usize) -> CwdFallback {
 ///
 /// 相等而非包含/前缀：与 `parse_panes_find` 同纪律（`/dev/ttys100` 不得撞
 /// `/dev/ttys1000`）。入参两侧必须同形态（全路径，经 `normalize_dev_tty` 归一）。
+///
+/// **本函数是裸表查询**（照表找首个相等行，不校验 pid 是否属于候选集）：消歧路径上的
+/// 「表 ∩ 候选集」由 [`decide_target`] 单点完成（内核责任，见模块文档），别把未过滤的
+/// 表直接当消歧依据。
 pub fn resolve_by_tty(cands: &[(u32, &str)], target: &str) -> Option<u32> {
     cands.iter().find(|(_, t)| *t == target).map(|(p, _)| *p)
 }
@@ -128,16 +139,18 @@ pub fn agent_tty(_pid: u32) -> Option<String> {
 /// `confirm::triage_screen_recovery(recovery, tool, os)` 同款缝式）。
 ///
 /// 输入：候选 pid 表（判定基数，来源 = 同工具 + 同 cwd 活动进程）、候选 TTY 表
-/// （`(pid, tty)`，可能只覆盖部分候选 = 采不到者缺席）、**会话级 TTY 证据**
-/// （必须**独立于卡片 pid**，见模块文档「自证循环」）、会话 pid、平台。
+/// （`(pid, tty)`，可能只覆盖部分候选 = 采不到者缺席；表内**非候选 pid 的行由本函数剔除**
+/// ——求交是内核责任，调用方不必预过滤）、**会话级 TTY 证据**（必须**独立于卡片 pid**，
+/// 见模块文档「自证循环」）、会话 pid、平台。
 ///
 /// 判定顺序（与模块文档纪律一一对应）：
 /// 1. 候选 0 → `Resolved(session_pid)`：不是歧义（进程已死 / cwd 口径漂移），交既有
 ///    链路如实失败——**不产出 `Reject(0)` 文案**；
 /// 2. 候选唯一（[`fallback_cwd_policy`] 的 `Allow` 臂）→ `Resolved(session_pid)`：无歧义
 ///    可消，TTY 有无不影响（不因「取不到 TTY」把单候选路径一起打死）；
-/// 3. 候选 ≥2 → 仅当平台支持采数 **且** 有会话级 TTY 证据 **且** 候选表中**恰好一个**
-///    命中该 TTY（[`resolve_by_tty`]）→ `Resolved(命中 pid)`；其余一切情形 → `Ambiguous(n)`。
+/// 3. 候选 ≥2 → 仅当平台支持采数 **且** 有会话级 TTY 证据 **且** TTY 表与候选集求交后
+///    **恰好一个**命中该 TTY（[`resolve_by_tty`]）→ `Resolved(命中 pid)`；其余一切情形 →
+///    `Ambiguous(n)`。
 pub fn decide_target(
     candidate_pids: &[u32],
     candidate_ttys: &[(u32, &str)],
@@ -159,10 +172,18 @@ pub fn decide_target(
     // 3) ≥2 候选：只有精确 TTY 命中（且命中唯一）能消歧
     if tty_collection_supported(os) {
         if let Some(target) = session_tty {
-            if let Some(pid) = resolve_by_tty(candidate_ttys, target) {
+            // 内核责任（模块文档）：先与候选集求交，再判定命中与唯一性——表内非候选 pid
+            // 的行既不参与命中、也不参与计数（O(n·m)：n = 候选数，m = TTY 表长度，无碍）。
+            // 调用方不必预过滤：漏了这步即「假命中」或「假歧义」两种假阳性（评审 I16）
+            let scoped: Vec<(u32, &str)> = candidate_ttys
+                .iter()
+                .filter(|(pid, _)| candidate_pids.contains(pid))
+                .copied()
+                .collect();
+            if let Some(pid) = resolve_by_tty(&scoped, target) {
                 // 命中唯一性：两个候选同 TTY = 该 TTY 不具判别力（同终端内多实例），
                 // 照 find 的首个命中走就是「猜」——拒绝
-                if candidate_ttys.iter().filter(|(_, t)| *t == target).count() == 1 {
+                if scoped.iter().filter(|(_, t)| *t == target).count() == 1 {
                     return TargetDecision::Resolved(pid);
                 }
             }
@@ -557,6 +578,74 @@ mod tests {
         assert_eq!(
             super::decide_target(&pids, &ttys, Some("/dev/ttys000"), 1, "macos"),
             super::TargetDecision::Ambiguous(3)
+        );
+    }
+
+    /// **非候选行不得参与命中**（评审 I16 形态①）：TTY 表里混进一条非候选 pid 的行，
+    /// 它命中了目标 TTY，而候选集里**没有任何**进程在该 TTY 上 → 必须**不**判命中。
+    /// 旧实现（裸表 `resolve_by_tty` + 全表计数）会把这条外来行当命中，改道到候选集
+    /// 之外的 pid——即「独立证据源接入后」的假命中形态。
+    #[test]
+    fn tty_row_outside_candidate_set_cannot_hit() {
+        let pids = [44161u32, 44638];
+        let ttys = [
+            (44161u32, "/dev/ttys000"),
+            (44638u32, "/dev/ttys006"),
+            (99999u32, "/dev/ttys042"), // 非候选：别的 cwd / 采集陈旧行
+        ];
+        assert_eq!(
+            super::decide_target(&pids, &ttys, Some("/dev/ttys042"), 44161, "macos"),
+            super::TargetDecision::Ambiguous(2),
+            "非候选 pid 的行不得参与命中：目标 TTY 上无候选 → 拒绝（绝不是改道到 99999）"
+        );
+    }
+
+    /// **非候选行不得撑爆唯一性命中计数**（评审 I16 形态②）：候选集里恰有 1 个进程在
+    /// 目标 TTY 上，但表里另有一条非候选 pid 的行同 TTY → 计数仍须为 1 → 仍判**唯一命中**。
+    /// 旧实现按全表计数得 2 → 放弃可用证据、误判歧义（假歧义 = 假拒绝）。
+    #[test]
+    fn tty_row_outside_candidate_set_does_not_inflate_uniqueness_count() {
+        let pids = [44161u32, 44638];
+        let ttys = [
+            (44161u32, "/dev/ttys006"),
+            (44638u32, "/dev/ttys000"),
+            (99999u32, "/dev/ttys006"), // 非候选：旧实现把它算进唯一性计数
+        ];
+        assert_eq!(
+            super::decide_target(&pids, &ttys, Some("/dev/ttys006"), 44161, "macos"),
+            super::TargetDecision::Resolved(44161),
+            "非候选行不得把唯一性命中计数从 1 撑到 2"
+        );
+    }
+
+    /// 上面两形态再走一遍**真生产 seam**（[`resolve_target_pid`]）：证据源**不预过滤**
+    /// TTY 表，由内核自己求交——这是「交集是内核责任、不是调用方约定」的回归锁。
+    #[test]
+    fn resolve_target_pid_filters_tty_rows_to_candidates() {
+        let s = sess("s-3", "/work/demo", 44161);
+        // 形态②：候选 44161 在 /dev/ttys006，非候选 99999 也在同一 tty → 仍唯一命中
+        let ev = TargetEvidence {
+            processes: procs_in_cwd("/work/demo", &[44161, 44638]),
+            candidate_ttys: vec![
+                (44161, "/dev/ttys006".to_string()),
+                (44638, "/dev/ttys000".to_string()),
+                (99999, "/dev/ttys006".to_string()),
+            ],
+            session_tty: Some("/dev/ttys006".to_string()),
+        };
+        assert_eq!(super::resolve_target_pid(&s, &ev, "macos"), Ok(44161));
+        // 形态①：非候选 99999 独占目标 tty → 候选集里无命中 → 拒绝
+        let ev = TargetEvidence {
+            processes: procs_in_cwd("/work/demo", &[44161, 44638]),
+            candidate_ttys: vec![
+                (44161, "/dev/ttys000".to_string()),
+                (99999, "/dev/ttys042".to_string()),
+            ],
+            session_tty: Some("/dev/ttys042".to_string()),
+        };
+        assert_eq!(
+            super::resolve_target_pid(&s, &ev, "macos"),
+            Err(super::AmbiguousTarget(2))
         );
     }
 
