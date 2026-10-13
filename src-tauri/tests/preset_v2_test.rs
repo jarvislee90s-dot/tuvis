@@ -63,6 +63,7 @@ static PRESET_V2_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 ///   在 Windows 返回 os error 5（PermissionDenied）；
 /// - Unix 符号链接（不论指向目录还是文件）一律 `remove_file`；
 /// - 残留真目录（上次红跑中断遗留）`remove_dir_all` 整删，现场可重排。
+///
 /// 幂等：目标不在场时直接返回。
 ///
 /// Windows 判定细节：junction 的 `symlink_metadata().file_type().is_dir()` 被
