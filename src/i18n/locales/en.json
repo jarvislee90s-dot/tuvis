@@ -361,6 +361,7 @@
         "step_funnel": "Enable Funnel (fixed URL)",
         "step_verify": "Board reachability check",
         "tsNotLive": "Fixed address not live yet",
+        "tsTransientHint": "A connection failure is usually transient jitter on the public network path — Tuvis re-checks automatically every minute and it typically recovers within 1–2 minutes; turn off any TUN / system-proxy accelerator first, and only press \"Retry\" if it stays broken for over 10 minutes.",
         "retry": "Retry",
         "step_autostart": "Auto-restore on launch (handled by Tuvis)",
         "actAdmin": "Your action: the system will prompt for the admin password — enter it to finish installing",

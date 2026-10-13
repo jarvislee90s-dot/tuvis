@@ -847,11 +847,44 @@ describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () =
     expect(notLive.textContent).toContain("Fixed address not live yet");
     expect(notLive.textContent).toContain("公网解析不到该地址");
     expect(within(row).queryByText("Done")).toBeNull();
+    // 非连不通类失败 → 不挂瞬时抖动引导（那条只属于「地址已解析但连不通」）
+    expect(within(row).queryByTestId("ts-transient-hint")).toBeNull();
     // 重试按钮触发 verify 步（后端自动含自愈）
     fireEvent.click(within(row).getByTestId("ts-verify-retry"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("remote_ts_run_step", { step: "verify" })
     );
+  });
+
+  // 2026-10-13 真机定位：连不通类失败 = 公网链路瞬时抖动（60s 轮询自愈），重试门槛
+  // 与安抚文案跟上——reason 前缀「地址已解析但连不通」锚定（与 reach.rs 格式串同步）
+  it("reach=failed 且连不通类 reason → 「尚未生效」下挂瞬时抖动引导（ts-transient-hint）", async () => {
+    const unreachable = "地址已解析但连不通（试了 2 条）: 103.84.155.153: error sending request";
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_ts_probe")
+        return macProbe({
+          reach: { state: "failed", reason: unreachable },
+          states: [
+            state("detect", true),
+            state("download", false),
+            state("install", false),
+            state("sys_ext", true),
+            state("login", false),
+            state("shields_up", false),
+            state("funnel", false),
+            state("verify", false, unreachable),
+            state("autostart", true),
+          ],
+        });
+      return null;
+    });
+    render(<TailscaleWizard />);
+    await screen.findByText("Detect Tailscale");
+    const row = stepRow("verify");
+    expect(within(row).getByTestId("ts-not-live")).toBeTruthy();
+    const hint = within(row).getByTestId("ts-transient-hint");
+    expect(hint.textContent).toMatch(/transient jitter/i);
+    expect(hint.textContent).toMatch(/1[–-]2 minutes/i);
   });
 
   it("reach=verified：verify 行 Done 且无重试按钮；头部看板地址上墙", async () => {

@@ -2567,6 +2567,145 @@ mod tests {
         teardown_globals();
     }
 
+    /// 连不通类失败**不自愈**（2026-10-13 用户裁决）：「地址已解析但连不通」说明 DNS
+    /// 记录在、配置在，成因是到公网中继入口的链路瞬时抖动（真机实测 60s 轮询自愈）——
+    /// reset 只会把完好配置清掉再重发布 30–49 秒。verify 步必须原样返回该 Failed、
+    /// 一个写动作都不发。
+    /// 变异锚点：删掉 verify_with_heal 的 ADDR_UNREACHABLE_PREFIX 拦截分支 → ②③必红。
+    #[test]
+    fn run_step_verify_unreachable_class_does_not_heal() {
+        let _g = test_lock();
+        *DESIRED.lock().unwrap() = Some(9420); // 通道开着——旧实现正是在这态才自愈
+        let calls = spy_cli(|args: &[&str]| match args {
+            ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+            other => Err(format!("测试未应答的 CLI 调用: {other:?}")),
+        });
+        // 解析得到记录 + 钉 IP 逐条连不通 → 「地址已解析但连不通」类 Failed
+        set_verify_probe_override(Some(Box::new(|_h: &str| {
+            Ok(vec!["203.0.113.1".into(), "203.0.113.2".into()])
+        })));
+        set_http_probe_override(Some(Box::new(|_h, _ip| {
+            Err("error sending request for url (https://a.ts.net/m)".into())
+        })));
+
+        run_step("verify", 9420).expect("verify 应 Ok");
+        // ① 结果如实是连不通类 Failed（前缀 + 逐条失败明细）
+        match reachability() {
+            Reachability::Failed { reason } => {
+                assert!(
+                    reason.starts_with(ADDR_UNREACHABLE_PREFIX) && reason.contains("203.0.113.1"),
+                    "{reason}"
+                );
+            }
+            other => panic!("应 Failed: {other:?}"),
+        }
+        // ②③ 一个写动作都不发：不 reset、不重开、连自愈守卫读数都不该有
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == &["funnel".to_string(), "reset".to_string()]),
+            "连不通类不得 funnel reset: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with(&["funnel".to_string(), "--bg".to_string()])),
+            "连不通类不得重开 Funnel: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c
+                == &[
+                    "funnel".to_string(),
+                    "status".to_string(),
+                    "--json".to_string()
+                ]),
+            "连不通类不得进入自愈（守卫读数都不发生）: {calls:?}"
+        );
+        teardown_globals();
+    }
+
+    /// 对照上一条：**其他**失败（DoH 全挂 → 无法验证）仍走自愈——reset+重开的意义在
+    /// 「真故障时触发记录重发布」（2026-10-06 实测机理），2026-10-13 裁决只收窄连不通类。
+    #[test]
+    fn run_step_verify_other_failure_still_heals() {
+        let _g = test_lock();
+        *DESIRED.lock().unwrap() = Some(9420);
+        let calls = spy_cli(|args: &[&str]| match args {
+            ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+            ["funnel", "status", "--json"] => Ok("{}".into()),
+            ["funnel", "reset"] => Ok(String::new()),
+            ["set", "--shields-up=false"] => Ok(String::new()),
+            ["get", "--json"] => Ok(r#"{"shields-up": false}"#.into()),
+            ["funnel", "--bg", "9420"] => Ok(String::new()),
+            ["funnel", "status"] => Ok(String::new()),
+            other => Err(format!("测试未应答的 CLI 调用: {other:?}")),
+        });
+        // DoH 全挂 → Failed「无法验证地址…」（不是连不通类）
+        set_verify_probe_override(Some(Box::new(|_h: &str| {
+            Err("3 个 DoH 源均无有效应答: 223.5.5.5、223.6.6.6、1.12.12.12".into())
+        })));
+
+        run_step("verify", 9420).expect("verify 应 Ok");
+        assert!(
+            matches!(reachability(), Reachability::Failed { ref reason } if reason.contains("无法验证")),
+            "自愈后仍验不过 → 如实 Failed: {:?}",
+            reachability()
+        );
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &["funnel".to_string(), "reset".to_string()]),
+            "其他失败仍须 funnel reset（自愈正路）: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &["funnel".to_string(), "--bg".to_string(), "9420".to_string()]),
+            "其他失败仍须重开 Funnel: {calls:?}"
+        );
+        teardown_globals();
+    }
+
+    /// [`reach::error_with_source`]：reqwest 顶层 Display 只给「error sending request」，
+    /// source 链首层才是真实成因（tcp 超时 / TLS / 重置）——2026-10-13 实机定位的
+    /// 盲区补齐。纯函数：有 source 拼「（底层: …）」，无 source 原样返回。
+    #[test]
+    fn error_with_source_appends_first_source_layer() {
+        #[derive(Debug)]
+        struct Inner(&'static str);
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for Inner {}
+        #[derive(Debug)]
+        struct Outer(&'static str, Option<Inner>);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_ref().map(|i| i as _)
+            }
+        }
+        assert_eq!(
+            error_with_source(&Outer(
+                "error sending request",
+                Some(Inner("tcp connect timeout"))
+            )),
+            "error sending request（底层: tcp connect timeout）"
+        );
+        assert_eq!(
+            error_with_source(&Outer("error sending request", None)),
+            "error sending request"
+        );
+    }
+
     /// **I1（2026-10-07 评审）自愈的 `funnel reset` 必须记账**：自愈动作就是
     /// 「重置 Funnel 后重新开启」（§C3 要求 3），它**正是最该走「重新开通」档**的场景
     /// （reset 后重发布实测 30–49 秒）。旧实现直接 `let _ = run_cli(&["funnel","reset"])`

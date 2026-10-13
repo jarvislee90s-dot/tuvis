@@ -968,6 +968,33 @@ describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的
     expect(screen.queryByTestId("ts-wizard")).toBeNull();
     fireEvent.click(screen.getByTestId("ts-wizard-retry-entry"));
     expect(await screen.findByTestId("ts-wizard")).toBeTruthy();
+    // 非连不通类失败 → 不挂瞬时抖动引导（那条只属于「地址已解析但连不通」）
+    expect(screen.queryByTestId("ts-transient-hint")).toBeNull();
+  });
+
+  // 2026-10-13 真机定位：连不通类失败（瞬时抖动、60s 轮询自愈）在「已配置·未运行」卡面
+  // 也挂引导——error 前缀「地址已解析但连不通」锚定（与 reach.rs 格式串同步）
+  it("连不通类失败 → configuredIdle 卡面 error 行挂瞬时抖动引导（ts-transient-hint）", async () => {
+    const unreachable =
+      "地址已解析但连不通（试了 2 条）: 103.84.155.153: error sending request; 103.84.155.217: error sending request";
+    mock({
+      channels: channelsOf({
+        tailscale: {
+          enabled: true,
+          running: false,
+          address: null,
+          error: unreachable,
+          reach: { state: "failed", reason: unreachable },
+        },
+      }),
+    });
+    render(<RemoteSection />);
+    fireEvent.click(card("tailscale"));
+    await waitFor(() => expect(phaseEl().getAttribute("data-phase")).toBe("configuredIdle"));
+    expect(screen.getByText(/地址已解析但连不通/)).toBeTruthy();
+    const hint = screen.getByTestId("ts-transient-hint");
+    expect(hint.textContent).toMatch(/transient jitter/i);
+    expect(hint.textContent).toMatch(/1[–-]2 minutes/i);
   });
 
   it("外部域名卡 running=false ∧ 总开关开着：落到「已配置·未运行」态，成因是「服务没在监听」，不是笼统的「开关已关」", async () => {
@@ -1620,7 +1647,9 @@ describe("RemoteSection i18n zh/en 无缺键（M5 A6）", () => {
     const used = new Set<string>();
     for (const f of sources) {
       const text = readFileSync(f, "utf8");
-      for (const m of text.matchAll(/settings\.remote\.([A-Za-z0-9_]+)/g)) {
+      // 含点号：嵌套键（如 settings.remote.tsWizard.tsTransientHint，2026-10-13 连不通
+      // 引导首例）也必须整键在册——正则不认点号会把嵌套键截成不存在的段名
+      for (const m of text.matchAll(/settings\.remote\.([A-Za-z0-9_.]+)/g)) {
         used.add(m[0]);
       }
     }

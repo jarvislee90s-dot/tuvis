@@ -498,6 +498,18 @@ export function TailscaleWizard() {
                     {t("settings.remote.tsWizard.tsNotLive")}：{blocked}
                   </p>
                 )}
+                {/* 瞬时抖动引导（2026-10-13 真机定位）：「地址已解析但连不通」类失败多为
+                    公网入口瞬时抖动，60s 轮询会自愈——先安抚 + 给重试门槛，避免恢复窗口内
+                    狂点重试（重试在旧版还会触发 funnel reset 误伤配置）。前缀判定与
+                    reach.rs 的连不通类格式串同步（reason 恒中文，不随 UI 语言漂移） */}
+                {step.id === "verify" && blocked?.startsWith("地址已解析但连不通") && (
+                  <p
+                    data-testid="ts-transient-hint"
+                    className="text-xs text-amber-600 dark:text-amber-400"
+                  >
+                    {t("settings.remote.tsWizard.tsTransientHint")}
+                  </p>
+                )}
                 {/* 动作失败落行内错误位（Task 6 移交指针：不再吞错误零反馈） */}
                 {stepError?.step === step.id && (
                   <p data-testid="ts-step-error" className="mt-0.5 text-xs text-rose-500">

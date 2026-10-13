@@ -1197,6 +1197,16 @@ export function RemoteSection() {
                     {tsErr && (
                       <div className="mt-1 flex flex-wrap items-center gap-2">
                         <span className="text-xs text-amber-500">{tsErr}</span>
+                        {/* 瞬时抖动引导（2026-10-13）：连不通类失败 60s 轮询自愈——
+                            前缀判定与 reach.rs 格式串同步（reason 恒中文），详见向导侧同款 */}
+                        {tsErr.startsWith("地址已解析但连不通") && (
+                          <span
+                            data-testid="ts-transient-hint"
+                            className="text-muted-foreground text-xs"
+                          >
+                            {t("settings.remote.tsWizard.tsTransientHint")}
+                          </span>
+                        )}
                         {/* **M1（2026-10-07 评审 Minor）升级路径**：宽限窗过后仍连不通 /
                         后端持续未就绪（有界降级为 Failed，见 reach::BACKEND_INIT_GRACE）
                         时，本态必须给出**向导重试入口**——线稿状态五第 2 行承诺
