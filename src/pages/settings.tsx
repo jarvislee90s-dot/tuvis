@@ -184,7 +184,9 @@ type ToolRow = {
  *
  * 分块依据（修的是三条具体缺陷）：
  *  * **同族不再被拆到两端**：`usage`（用量设置）与 `usageStatus`（采集状态/导出）原先隔了 7 项，
- *    现在同属「用量统计」块；`remote`/`signal`/`audit` 同属「远程接入」块。
+ *    现在同属「用量统计」块；`remote`/`audit` 同属「远程接入」块。
+ *    （2026-10-13 用户裁决：`signal` 从「远程接入」挪入「工具与体检」——
+ *    hook 健康度检查的对象是各 CLI 工具，与工具启停/一致性体检同块更合语义。）
  *  * **只读查看面与手动设置项分开**：审计/体检/信号/数据这些「平时就看一看」的面各自归到
  *    语义相邻的块里，不再与开关项平铺混列。
  *  * **皮肤有自己的位置**：远程端外观整节原本塞在「外观」里，现在与「本机外观」并列为两张卡。
@@ -220,7 +222,7 @@ const SETTINGS_BLOCKS: {
     labelKey: "settings.nav.remote",
     descKey: "settings.nav.remoteDesc",
     icon: Smartphone,
-    sections: ["remote", "signal", "audit"],
+    sections: ["remote", "audit"],
   },
   {
     id: "usage",
@@ -234,7 +236,8 @@ const SETTINGS_BLOCKS: {
     labelKey: "settings.nav.tools",
     descKey: "settings.nav.toolsDesc",
     icon: Wrench,
-    sections: ["tools", "health"],
+    // signal（信号健康度）2026-10-13 用户裁决挪入：hook 通道自查与工具/体检同块
+    sections: ["tools", "health", "signal"],
   },
   {
     id: "data",
@@ -1075,9 +1078,10 @@ export default function SettingsPage() {
               </div>
             </div>
           )}
-          {visibleIds.has("remote") && <RemoteSection />}
-          {/* T5：信号健康度（hook 通道自查 + codex 信任门引导，与 RemoteSection 同级独立分区） */}
+          {/* T5：信号健康度（hook 通道自查 + codex 信任门引导）。2026-10-13 用户裁决
+              从「远程接入」块挪入本块——健康度检查对象是各 CLI 工具，与体检同块 */}
           {visibleIds.has("signal") && <SignalHealthSection />}
+          {visibleIds.has("remote") && <RemoteSection />}
           {/* M7 W5：注入审计桌面查看入口（与 RemoteSection 同级独立分区） */}
           {visibleIds.has("audit") && <AuditLogSection />}
           {/* 2026-09-20：数据管理首版（移动端附件占用列出/清理，C5） */}

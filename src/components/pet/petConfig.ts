@@ -1,4 +1,5 @@
 // 桌宠配置 — localStorage 单后端，跨窗口 storage 事件同步（spec §10）
+import { invoke } from "@tauri-apps/api/core";
 import { loadVoiceCap, ACTIVE_KEY, ACTIVE_NAME_KEY, ACTIVE_LOCAL_EVENT } from "./petRuntime";
 
 export type PetAction = "jumping" | "waving" | "failed" | "waiting" | "review" | "running";
@@ -103,6 +104,29 @@ export function subscribeConfig(fn: () => void): () => void {
     window.removeEventListener("storage", onStorage);
     window.removeEventListener(ACTIVE_LOCAL_EVENT, onActiveLocal);
   };
+}
+
+/** gravity 按应用重启归位的运行标记键（值 = 后端 app_run_id：进程内恒定、跨进程重启必变） */
+export const GRAVITY_RUN_KEY = "mam-pet-gravity-run";
+
+/**
+ * 物理坠落按应用重启归位（2026-10-13 用户裁决）：每次应用启动 gravity 默认关；
+ * 同一次运行内手动开启仍有效（跨窗口 storage 事件同步语义不变——窗口重开/后开
+ * 拿到同一 run id，标记一致即空过，不动会话内选择）。
+ * 配置后端仍是 localStorage 单后端（spec §10）——run id 只是启动期的一次性输入。
+ * 已知小竞态（如实登记）：启动重置落地前一瞬手动开 gravity 会被覆盖；main.tsx
+ * 模块顶层即调用以尽量前置，缩小窗口。
+ */
+export async function resetGravityPerRun(): Promise<void> {
+  try {
+    const runId = await invoke<string>("app_run_id");
+    if (localStorage.getItem(GRAVITY_RUN_KEY) === runId) return;
+    localStorage.setItem(GRAVITY_RUN_KEY, runId);
+    // 只在确实开着时写库：避免无谓的 storage 事件打扰跨窗口订阅方
+    if (loadConfig().gravity) saveConfig({ gravity: false });
+  } catch {
+    // 后端不可用（浏览器预览 mock 缺项等）：保持现状，不阻塞启动
+  }
 }
 
 export function loadVisible(): boolean {

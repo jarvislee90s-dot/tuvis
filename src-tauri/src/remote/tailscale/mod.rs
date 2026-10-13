@@ -1458,15 +1458,18 @@ mod tests {
     /// 除 verify（Task 7 占位）外全 done；CLI 读不到时 fail-closed + blocked_reason
     /// 如实说明，绝不把读不到伪装成完成或卡死
     ///
-    /// **平台门控（2026-10-07 存量债清理，Linux CI 门禁）**：本用例的期望建立在
-    /// **macOS/Windows 的步骤表**上——它按 id 取 `sys_ext` 步（一键配置特有），而
-    /// `current_platform()` 在 Linux 返回 `Platform::Other`，步骤表里没有该步 ⇒ 以
-    /// 「缺步骤 sys_ext」失败。一键配置向导只对 macOS/Windows 实现（产品只发这两个平台），
-    /// 故按平台门控。**不是静默跳过**：Linux 上它在 `cargo test` 里以 "N ignored" 可见，
-    /// 并可用 `--ignored` 显式跑（会如实失败，那正是本门控要记在案的那件事）。
+    /// **平台门控（2026-10-07 存量债清理，Linux CI 门禁）**：本用例的期望步骤表
+    /// **平台感知地取自 `wizard_steps(current_platform())`**——2026-10-13 修：原硬编码
+    /// 期望清单无条件含 `sys_ext`（macOS 独有步），与「Windows 步骤表恰少该步」相矛盾
+    /// （Windows 上必以「缺步骤 sys_ext」失败）；现与生产及
+    /// `windows_has_exactly_one_fewer_step_than_macos` 用例同源，不再另立第三份清单。
+    /// 一键配置向导只对 macOS/Windows 实现（产品只发这两个平台），而
+    /// `current_platform()` 在 Linux 返回 `Platform::Other`，不在支持面内，故按平台门控。
+    /// **不是静默跳过**：Linux 上它在 `cargo test` 里以 "N ignored" 可见，
+    /// 并可用 `--ignored` 显式跑。
     #[cfg_attr(
         not(any(target_os = "macos", target_os = "windows")),
-        ignore = "平台不适用：步骤表按平台给，sys_ext 只对 macOS/Windows 存在（current_platform() 在 Linux = Platform::Other）"
+        ignore = "平台不适用：步骤表按平台给，sys_ext 只对 macOS 存在（current_platform() 在 Linux = Platform::Other）"
     )]
     #[test]
     fn probe_steps_marks_each_criterion_honestly() {
@@ -1525,7 +1528,16 @@ mod tests {
             assert!(!s.done, "{id} 未装不得判完成");
             assert_eq!(s.blocked_reason, None, "{id} 是待做不是卡住: {s:?}");
         }
-        for id in ["sys_ext", "login", "shields_up", "funnel"] {
+        // 读不到须如实报「卡住 + 原因」的候选步里，期望清单按平台从 wizard_steps 取
+        // （单一事实源）：Windows 比 macOS 恰少 sys_ext 一步（与
+        // windows_has_exactly_one_fewer_step_than_macos 锁死的平台差异一致），不在此
+        // 再立第三份硬编码清单
+        let cli_blind: Vec<&str> = wizard_steps(current_platform())
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| ["sys_ext", "login", "shields_up", "funnel"].contains(id))
+            .collect();
+        for id in cli_blind {
             let s = state_of(&v, id);
             assert!(!s.done, "{id} 读不到状态不得判完成");
             assert!(

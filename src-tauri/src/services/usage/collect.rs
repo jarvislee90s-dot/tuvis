@@ -346,9 +346,19 @@ pub fn run_collection(now_ms: i64) -> UsageCollectResult {
     let settings = super::settings::load();
     // 扫描根：生产一半逐字不变（`dirs::home_dir()`）；lib 单测一半只认 fixture 根
     // ——`TUVIS_HOME` 保账本，fixture 根保**读源**，两半都要在。
+    // 集成测试（链接非 test 构建，没有上面的 lib 缝）走 `TUVIS_USAGE_FIXTURE_ROOT`
+    // 环境变量覆盖：**只在 debug/test 构建生效，release 根本不读**（与 `TUVIS_HOME`
+    // 同一门，`connection.rs::app_data_home` 先例）——2026-10-07 事故族收口：Windows
+    // 下 `dirs::home_dir()` 不认 HOME，只重定向账本不重定向读源时，集成测试会扫
+    // 开发机的**真实** profile（实测 zcode 71681 行），fixture 断言全被真机数据冲掉。
     #[cfg(test)]
     let home = tests::fixture_home().expect("上面那道拒绝闸已断言 fixture 根存在");
-    #[cfg(not(test))]
+    #[cfg(all(not(test), debug_assertions))]
+    let home = match std::env::var_os("TUVIS_USAGE_FIXTURE_ROOT") {
+        Some(root) if !root.is_empty() => std::path::PathBuf::from(root),
+        _ => dirs::home_dir().unwrap_or_default(),
+    };
+    #[cfg(all(not(test), not(debug_assertions)))]
     let home = dirs::home_dir().unwrap_or_default();
     let load_cursors = |sid: &str| crate::database::dao::usage::load_cursors(sid);
     // 落库走 `ledger::apply_delta`（分批短事务 + 批间让出，GC 2）；返回值只用于成败判定
@@ -1843,6 +1853,15 @@ mod tests {
     /// 两处增量都是**可计代码行**：判据面剥掉整行 `//` 注释（**含 `///` 文档注释**），
     /// 本轮新写的数百行文档注释因此**不进面**。`collect.rs` 生产半边**零改动** ——
     /// 日聚合由 `ledger::daily_rows_of` 从明细行折叠，落库路径不需要跟着改。
+    ///
+    /// **第 15 轮同步（2026-10-13 集成测试采集读源缝 `TUVIS_USAGE_FIXTURE_ROOT`）**：
+    /// 7234/156289 → **7239/156516**（**+5 行 / +227 字符**）。变化**只来自 `collect.rs`
+    /// 生产半边**的 `run_collection` 扫描根解析块——`#[cfg(not(test))]` 单臂换成三分支
+    /// cfg（test 保持 lib 拒绝闸半边原样 / ¬test∧debug_assertions 读环境变量覆盖 /
+    /// 其余构建原样 `dirs::home_dir()`）；函数其余逐字未改，无新增文件、排除区标记未动、
+    /// 其余 23 个文件逐字未改。集成测试半边的行为锁在
+    /// `tests/real_db_isolation_test.rs::usage_fixture_root_env_is_inside_the_debug_gate`
+    /// （源码针）与 `tests/usage_ipc_test.rs` / `usage_two_round_incremental_test.rs`（实跑）。
     #[test]
     fn scan_face_size_is_pinned() {
         let (mut lines, mut chars) = (0usize, 0usize);
@@ -1853,7 +1872,7 @@ mod tests {
         }
         assert_eq!(
             (lines, chars),
-            (7234, 156289),
+            (7239, 156516),
             "判据面尺寸变了（实测 {lines} 行 / {chars} 字符）：本用例是**声明 = 实际**的钉子——\
              先弄清面为什么变（新增文件？改了排除区标记？动了生产代码？），再同步本常量、\
              `no_source_timezone_is_fed_into_any_key_function` 的锁注释、`KNOWN-PLAN-DEFECTS.md` \

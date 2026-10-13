@@ -63,17 +63,22 @@ pub fn asset_name() -> &'static str {
     }
 }
 
-/// 官方 SHA256 表（纯函数）：逐字取自 cloudflared {CLOUDFLARED_VERSION} release 页
-/// 的 SHA256 Checksums 清单；macOS 的 .tgz 校验对象是**下载的压缩包本身**（解压前）。
+/// 官方 SHA256 表（纯函数）：各资产**下载字节本体**的 sha256（GitHub API release
+/// asset digest 口径）；macOS 的 .tgz 校验对象是**下载的压缩包本身**（解压前）。
+/// **勿抄 release 正文「SHA256 Checksums」清单的 .tgz 条目**——上游把解包后内部
+/// 二进制的哈希标在了 .tgz 名下（2026.9.1 实测：正文标 9a0b19f6…/1ea07ae7…，
+/// tgz 本体实为 c27ab8fd…/ff0d3b51…，本地下载 + GitHub asset digest 双重验证），
+/// 2026-09-17 版照抄导致 macOS 下载校验必挂（2026-10-13 更正，登记见 spec §12.5）。
 /// 未知资产直接 Err（防御性：资产名写错立刻暴露，绝不静默免检）。
-/// 升级流程：改 CLOUDFLARED_VERSION → 从新 release 页重取五值 → 逐项替换
+/// 升级流程：改 CLOUDFLARED_VERSION → 从新 release 的 GitHub API assets 取
+/// digest 字段（**剥去 `sha256:` 前缀**再入表；或本地下载实测）→ 逐项替换
 fn expected_sha256(asset: &str) -> Result<&'static str, String> {
     match asset {
         "cloudflared-darwin-amd64.tgz" => {
-            Ok("1ea07ae775b03236bd6be18ca1848d6bdc4af2f4f3bce398823b5a36e5761b75")
+            Ok("ff0d3b51d5ff70eceef89d6b32145fee985018a2174596a5dbe405e2766e2ac4")
         }
         "cloudflared-darwin-arm64.tgz" => {
-            Ok("9a0b19f67dc7a3011bc6b972c7ce06a5fcea8784ac6bd599ffa382ea4aeb5a6e")
+            Ok("c27ab8fd0aa489449e3d201eb02f957ef460a13b613662928b1b23394bf1bcfe")
         }
         "cloudflared-windows-amd64.exe" => {
             Ok("2837888cc0f5d58f15b6dc478376de90b4d3ba5241c7947455d1e0a0df429712")
@@ -969,15 +974,17 @@ mod tests {
     }
 
     #[test]
-    fn expected_sha256_table_matches_official_manifest() {
-        // 值逐字对齐 2026.9.1 release 页 SHA256 Checksums 清单（升级 = 改常量 + 更新本表）
+    fn expected_sha256_table_matches_release_asset_bytes() {
+        // 值 = 2026.9.1 各资产**下载字节本体**的 sha256（GitHub API asset digest，
+        // 本地下载实测一致；升级 = 改常量 + 更新本表）。.tgz 两行**不是** release
+        // 正文清单值——上游把内部二进制哈希标在 .tgz 名下（见 expected_sha256 注释）
         assert_eq!(
             expected_sha256("cloudflared-darwin-amd64.tgz").unwrap(),
-            "1ea07ae775b03236bd6be18ca1848d6bdc4af2f4f3bce398823b5a36e5761b75"
+            "ff0d3b51d5ff70eceef89d6b32145fee985018a2174596a5dbe405e2766e2ac4"
         );
         assert_eq!(
             expected_sha256("cloudflared-darwin-arm64.tgz").unwrap(),
-            "9a0b19f67dc7a3011bc6b972c7ce06a5fcea8784ac6bd599ffa382ea4aeb5a6e"
+            "c27ab8fd0aa489449e3d201eb02f957ef460a13b613662928b1b23394bf1bcfe"
         );
         assert_eq!(
             expected_sha256("cloudflared-windows-amd64.exe").unwrap(),

@@ -142,13 +142,25 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         let link = dir.path().join("link-proj");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        {
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(
+                project_realpath_of(&link.to_string_lossy()),
+                project_realpath_of(&real.to_string_lossy())
+            );
+        }
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&real, &link).unwrap();
-        assert_eq!(
-            project_realpath_of(&link.to_string_lossy()),
-            project_realpath_of(&real.to_string_lossy())
-        );
+        {
+            // Windows symlink_dir 需要开发者模式 / SeCreateSymbolicLinkPrivilege（无特权
+            // 机器上 os error 1314 必失败）；junction **不需要特权**且 realpath 解析同样
+            // 生效（linker 既有先例 junction::create）——用 junction 让断言在全部
+            // Windows 机器上真跑，而不是无开发者模式的机器上永久静默跳过
+            junction::create(&real, &link).expect("创建 junction 失败");
+            assert_eq!(
+                project_realpath_of(&link.to_string_lossy()),
+                project_realpath_of(&real.to_string_lossy())
+            );
+        }
         // 路径不存在 → 回退统一分隔符后的原文（不 panic、不返回空）
         assert_eq!(project_realpath_of("E:\\no\\such\\dir"), "E:/no/such/dir");
     }
