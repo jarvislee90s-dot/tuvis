@@ -1990,6 +1990,7 @@ mod tests {
                             },
                         ],
                         truncated: false,
+                        cwd: None,
                     })
                 } else {
                     Err("内部路径细节不应出现在响应里".to_string())
@@ -4476,6 +4477,7 @@ mod tests {
                 Some(p) => Ok(crate::remote::content::MessagesPage {
                     messages: p.clone(),
                     truncated: false,
+                    cwd: None,
                 }),
                 None => Err("测试桩：未注入内容源".to_string()),
             }),
@@ -8107,11 +8109,13 @@ mod tests {
                 "sess_ay" => Ok(crate::remote::content::MessagesPage {
                     messages: vec![auq_tool_call(0, Q_TWO_QUESTIONS_PAYLOAD)],
                     truncated: false,
+                    cwd: None,
                 }),
                 // kimi：同形（本机 wire 的 3 问题实录缩录为 2 题）
                 "sess_az" => Ok(crate::remote::content::MessagesPage {
                     messages: vec![auq_tool_call(0, KIMI_TWO_Q_PAYLOAD)],
                     truncated: false,
+                    cwd: None,
                 }),
                 _ => Err("无消息".to_string()),
             }),
@@ -9265,6 +9269,7 @@ mod tests {
         let page = crate::remote::content::MessagesPage {
             messages: vec![user_msg(0), auq_tool_call(1, Q_SINGLE_PAYLOAD)],
             truncated: false,
+            cwd: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -9336,6 +9341,7 @@ mod tests {
                 tool_result_msg(1, "Your questions have been answered: \"q\"=\"Tool demo\"."),
             ],
             truncated: false,
+            cwd: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -9401,6 +9407,7 @@ mod tests {
         let page = crate::remote::content::MessagesPage {
             messages: vec![auq_tool_call(0, Q_SINGLE_PAYLOAD)],
             truncated: false,
+            cwd: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -9446,6 +9453,7 @@ mod tests {
         let page = crate::remote::content::MessagesPage {
             messages: vec![user_msg(0), auq_tool_call(1, Q_SINGLE_PAYLOAD)],
             truncated: false,
+            cwd: None,
         };
         // 2026-10-03：select 走焦点守卫编排 → 需要屏读缝（焦点在选项行 → 守卫不触发）
         let probe_screen = screen_fixtures::multi_option_focus();
@@ -9509,6 +9517,7 @@ mod tests {
                 tool_result_msg(1, "Your questions have been answered: \"q\"=\"Tool demo\"."),
             ],
             truncated: false,
+            cwd: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -9592,6 +9601,7 @@ mod tests {
                 plan_msg(1, "# 《末班车》情感救赎版改写方案\n\n## Summary\n改写重点…"),
             ],
             truncated: false,
+            cwd: None,
         }
     }
 
@@ -9600,6 +9610,7 @@ mod tests {
         crate::remote::content::MessagesPage {
             messages: vec![user_msg(0), plan_msg(1, "# 计划"), user_msg(2), user_msg(3)],
             truncated: false,
+            cwd: None,
         }
     }
 
@@ -9623,6 +9634,7 @@ mod tests {
                 tool_result_msg(4, "Exited plan mode."),
             ],
             truncated: false,
+            cwd: None,
         }
     }
 
@@ -9725,6 +9737,7 @@ mod tests {
                         ),
                     ],
                     truncated: false,
+                    cwd: None,
                 }),
                 "sess_av" => Ok(plan_then_tool_event_page()),
                 _ => Err("无消息".to_string()),
@@ -9826,6 +9839,7 @@ mod tests {
                         },
                     ],
                     truncated: false,
+                    cwd: None,
                 }),
                 _ => Err("无消息".to_string()),
             }),
@@ -10032,6 +10046,7 @@ mod tests {
                 "sess_bh" => Ok(crate::remote::content::MessagesPage {
                     messages: vec![user_msg(0), plan_msg(1, "# 执行计划")],
                     truncated: false,
+                    cwd: None,
                 }),
                 _ => Err("无消息".to_string()),
             }),
@@ -10227,6 +10242,7 @@ mod tests {
                         plan_msg(3, "# 新版计划（审批中）"),
                     ],
                     truncated: false,
+                    cwd: None,
                 }),
                 // 审批已关：计划之后有工具事件（ExitPlanMode 回执）→ 预期态清除
                 "sess_ax" => Ok(plan_then_tool_event_page()),
@@ -15334,6 +15350,7 @@ mod tests {
                         collapsed: false,
                     }],
                     truncated: false,
+                    cwd: None,
                 })
             }),
         );

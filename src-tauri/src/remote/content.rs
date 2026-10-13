@@ -261,6 +261,11 @@ impl SessionMessage {
 pub struct MessagesPage {
     pub messages: Vec<SessionMessage>,
     pub truncated: bool,
+    /// 会话工作目录（可选，2026-10-13 会话产物批）：codex rollout（首行
+    /// session_meta.payload.cwd）已填；其余工具暂 None——文件面板「会话产物」
+    /// 相对路径的存在性校验基准。skip 序列化：/session-messages 载荷零变化
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// 会话内容源函数形态（RemoteState 注入缝的类型别名，生产 = read_session_messages）
@@ -367,6 +372,7 @@ fn page(msgs: Vec<SessionMessage>, limit: usize, truncated: bool) -> MessagesPag
     MessagesPage {
         messages: finalize(msgs, limit),
         truncated,
+        cwd: None,
     }
 }
 
@@ -1121,6 +1127,21 @@ fn rollout_session_id(path: &Path) -> Option<String> {
         .map(String::from)
 }
 
+/// rollout 首行 session_meta → 会话工作目录（payload.cwd；缺失/损坏 None）。
+/// 解析口径与 rollout_session_id 同款（同读首行 + 同指针取法）。**代价如实申报**：
+/// 本批为最小改动**再读一次首行**（rollout_session_id 已读过一次，两次各自开文件
+/// 读 1 行）；每请求 1 次、微秒级，代价可忽略
+fn rollout_session_cwd(path: &Path) -> Option<String> {
+    let first = crate::monitor::jsonl::read_first_lines(path, 1)
+        .into_iter()
+        .next()?;
+    let v: serde_json::Value = serde_json::from_str(&first).ok()?;
+    v.pointer("/payload/cwd")
+        .and_then(|c| c.as_str())
+        .map(String::from)
+        .filter(|s| !s.is_empty())
+}
+
 fn read_codex_rollout_with(
     home: &Path,
     session_id: &str,
@@ -1163,7 +1184,11 @@ fn read_codex_rollout_with(
         line_budget(limit),
         byte_budget(limit),
     );
-    Ok(page(map_codex_lines(&lines), limit, truncated))
+    let mut pg = page(map_codex_lines(&lines), limit, truncated);
+    // 会话产物批（2026-10-13）：cwd 作相对路径产物的解析基准。这里会**再读一次**
+    // rollout 首行（rollout_session_id 已读过一次）——每请求 1 次、微秒级，代价可忽略
+    pg.cwd = rollout_session_cwd(&f);
+    Ok(pg)
 }
 
 /// Codex rollout 行 → 统一条目（纯函数；codex_entry_kind 的内容版映射）。
@@ -2258,6 +2283,32 @@ mod tests {
         assert!(!SessionMessage::text("tool-result", "x", None).collapsed);
     }
 
+    /// 序列化面锁（2026-10-13 会话产物批）：cwd=None（其余七工具）时 /session-messages
+    /// 载荷零变化——不得凭空多出 cwd 键；codex 有基准时按 camelCase 透出
+    #[test]
+    fn messages_page_serializes_cwd_only_when_present() {
+        let none_page = MessagesPage {
+            messages: vec![],
+            truncated: false,
+            cwd: None,
+        };
+        let obj = serde_json::to_value(&none_page).unwrap();
+        let obj = obj.as_object().unwrap();
+        assert!(
+            !obj.contains_key("cwd"),
+            "cwd=None 必须 skip 序列化：{obj:?}"
+        );
+        assert_eq!(obj.len(), 2, "载荷恒为 messages + truncated 两键");
+
+        let some_page = MessagesPage {
+            messages: vec![],
+            truncated: false,
+            cwd: Some("/w".to_string()),
+        };
+        let v = serde_json::to_value(&some_page).unwrap();
+        assert_eq!(v["cwd"], serde_json::json!("/w"), "cwd 按原样透出");
+    }
+
     // ==== ZCode（tmp sqlite：message + part 表）====
 
     fn zcode_db(path: &Path) -> Connection {
@@ -3246,10 +3297,13 @@ mod tests {
         )
         .unwrap();
         // rollout 只有 meta（无内容条目）→ 应继续落空但不炸
-        let r = read_session_messages_with(tmp.path(), "codex", UUID, 200)
-            .unwrap()
-            .messages;
-        assert!(r.is_empty(), "仅 meta 的 rollout 映射为空");
+        let pg = read_session_messages_with(tmp.path(), "codex", UUID, 200).unwrap();
+        assert!(pg.messages.is_empty(), "仅 meta 的 rollout 映射为空");
+        assert_eq!(
+            pg.cwd.as_deref(),
+            Some("/w"),
+            "rollout 首行 session_meta.payload.cwd 必须透传（会话产物相对路径的解析基准）"
+        );
 
         // (b) APP 线路回退：thread_history sqlite（无 rollout 文件时）
         std::fs::remove_file(&rollout).unwrap();
@@ -3329,6 +3383,43 @@ mod tests {
             200
         )
         .is_err());
+    }
+
+    /// rollout_session_cwd：payload.cwd 透传；缺失/空串/损坏/文件不存在一律 None
+    #[test]
+    fn rollout_session_cwd_reads_payload_cwd_and_tolerates_absent_forms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let with_cwd = write(
+            "a.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"x\",\"cwd\":\"/w\"}}\n",
+        );
+        assert_eq!(rollout_session_cwd(&with_cwd).as_deref(), Some("/w"));
+        let no_cwd = write(
+            "b.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"x\"}}\n",
+        );
+        assert_eq!(
+            rollout_session_cwd(&no_cwd),
+            None,
+            "payload.cwd 缺失 → None"
+        );
+        let empty_cwd = write(
+            "c.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"\"}}\n",
+        );
+        assert_eq!(rollout_session_cwd(&empty_cwd), None, "空串 cwd 视同缺失");
+        let garbage = write("d.jsonl", "not json\n");
+        assert_eq!(rollout_session_cwd(&garbage), None, "损坏首行 → None");
+        assert_eq!(
+            rollout_session_cwd(&tmp.path().join("nope.jsonl")),
+            None,
+            "文件不存在 → None"
+        );
     }
 
     // ==== Kimi（合成 wire 行 + tmp home session_index）====

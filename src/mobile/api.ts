@@ -207,14 +207,15 @@ export async function fetchSessionMessages(
  *  modified = 是否被写类工具（Edit/Write…）改写触达（2026-09-16 用户裁决：
  *  前端据此把「仅读过」的文件名渲成常规色，与「动过手」的区分），
  *  origin = 来源三池（M5 B2）：user=我上传的 / tool_read=工具读取 / tool_write=
- *  工具读写；旧载荷无此键 → undefined（来源筛选按「全部来源」处理，行上不渲染徽标） */
+ *  工具读写；session_artifact = 会话产物（正文链接/反引号路径 + 存在性校验，2026-10-13）。
+ *  旧载荷无此键 → undefined（来源筛选按「全部来源」处理，行上不渲染徽标） */
 export interface SessionFileEntry {
   path: string;
   lastSeq: number;
   lastTs: number | null;
   hits: number;
   modified: boolean;
-  origin?: "user" | "tool_read" | "tool_write";
+  origin?: "user" | "tool_read" | "tool_write" | "session_artifact";
 }
 
 /** 拉取该会话涉及的文件表（/session-files，泛化提取）。一份数据两用：正文

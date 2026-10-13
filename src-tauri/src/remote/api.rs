@@ -692,6 +692,7 @@ pub async fn session_subagent_messages(
                 crate::remote::content::MessagesPage {
                     messages: Vec::new(),
                     truncated: false,
+                    cwd: None,
                 },
                 false,
             )),

@@ -63,9 +63,9 @@ export const FILE_SCOPES = [200, 500, 1000] as const;
 /** 类型过滤档（用户裁决 5）：全部 / 文档 / 图片；代码文件仅在「全部」可见 */
 export type FileKindFilter = "all" | "doc" | "image";
 
-/** 来源过滤档（M5 决策 10 / 线稿三池）：全部来源 / 我上传的 / 工具读取 / 工具读写。
- *  值与后端 FileEntry.origin（snake_case 序列化）一致 */
-export type FileOriginFilter = "all" | "user" | "tool_read" | "tool_write";
+/** 来源过滤档（M5 决策 10 / 线稿三池 + 会话产物兜底池）：全部来源 / 我上传的 /
+ *  工具读取 / 工具读写 / 会话产物。值与后端 FileEntry.origin（snake_case 序列化）一致 */
+export type FileOriginFilter = "all" | "user" | "tool_read" | "tool_write" | "session_artifact";
 
 /** 文档扩展名（用户裁决 5：md/markdown/txt） */
 const DOC_EXTS = ["md", "markdown", "txt"];
@@ -192,12 +192,14 @@ export default function FilePanel({
     { key: "user", label: "我上传的" },
     { key: "tool_read", label: "工具读取" },
     { key: "tool_write", label: "工具读写" },
+    { key: "session_artifact", label: "会话产物" },
   ];
   // 行内来源徽标文案（undefined = 旧载荷，不渲染）
   const originLabel: Record<string, string> = {
     user: "我上传的",
     tool_read: "工具读取",
     tool_write: "工具读写",
+    session_artifact: "会话产物",
   };
 
   return (
