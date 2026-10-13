@@ -478,9 +478,36 @@ pub fn project_trusted(project: &str, trusted: &[String], os: &str) -> bool {
     trusted.iter().any(|p| same_workspace(p, project, os))
 }
 
-/// 可见性档：**复用 Task 7 的单点映射** [`zcode_visibility`]（未信任 ⇒ 仅兔维斯可见）
+/// 可见性档：**复用 Task 7 的单点映射** [`zcode_visibility`]（未信任 ⇒ 仅兔维斯可见）。
+/// 本壳自己读信任表（每次调用一次文件读）——**批量场景（逐候选）请改用
+/// [`visibility_with_trusted`]**：那里信任表由调用方读一次后复用（评审 I12：旧写法
+/// 每候选各读一次 = 一次请求 N+2 次文件读）。
 pub fn visibility_of(project: &str, home: Option<&Path>, os: &str) -> Visibility {
-    zcode_visibility(project_trusted(project, &trusted_projects(home), os))
+    visibility_with_trusted(project, &trusted_projects(home), os)
+}
+
+/// 可见性档（**信任表已在外层读好**）：与 [`visibility_of`] 同一条映射，只是不再重读文件
+/// ——逐候选装配场景的唯一入口（评审 I12 的复用点）。
+pub fn visibility_with_trusted(project: &str, trusted: &[String], os: &str) -> Visibility {
+    zcode_visibility(project_trusted(project, trusted, os))
+}
+
+/// 可见性探针的**异步包装**（评审 I12）：`visibility_of` 是同步 fs IO（读
+/// `~/.zcode/v2/setting.json`）——**不得跑在 async 运行时线程上**（会阻塞该 worker 上的
+/// 其他请求）。故经 `spawn_blocking` 落到阻塞池；任务异常（panic）**保守判「仅兔维斯
+/// 可见」**（与「读不到 = 未信任」同款 fail-closed，不 panic、不冒充已信任）。
+pub async fn visibility_of_async(
+    project: String,
+    home: Option<std::path::PathBuf>,
+    os: &'static str,
+) -> Visibility {
+    match tokio::task::spawn_blocking(move || visibility_of(&project, home.as_deref(), os)).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("zcode 可见性探针任务异常（保守判未信任）: {e}");
+            zcode_visibility(false)
+        }
+    }
 }
 
 // ============================================================
@@ -1707,6 +1734,52 @@ mod tests {
             Visibility::TuvisOnly,
             "读不到信任表 = 保守判未信任"
         );
+    }
+
+    /// **评审 I12：信任表复用点**——`visibility_with_trusted` 只认调用方给的**那一份**表，
+    /// **不碰文件系统**（同目录下明明信任着 `E:/p`，传空表仍必须判未信任）。
+    /// 这是「逐候选装配时信任表只读一次」的判据基石（旧写法每候选各读一次文件）。
+    /// 变异验证：把 `visibility_with_trusted` 改成内部再读一次文件（即回退到
+    /// `visibility_of` 的实现）→ 第二条断言红。
+    #[test]
+    fn visibility_with_trusted_uses_the_caller_table_without_rereading() {
+        let dir = tmp_home_with_setting("{\"recentProjects\":[\"E:\\\\p\"]}");
+        // 文件里信任 E:/p：走文件读的壳给 AfterRestart
+        assert_eq!(
+            visibility_of("E:/p", Some(dir.path()), "windows"),
+            Visibility::AfterRestart
+        );
+        // 传入空表 = 调用方说「这一份快照里没有」——**不得**偷偷回读文件翻案
+        assert_eq!(
+            visibility_with_trusted("E:/p", &[], "windows"),
+            Visibility::TuvisOnly,
+            "复用点必须只认调用方给的表（偷偷回读文件 = I12 的 N+2 次读又回来了）"
+        );
+        // 传入真表 = 与文件读同结论（同一条 `zcode_visibility` 映射，不另造判定）
+        let trusted = trusted_projects(Some(dir.path()));
+        assert_eq!(
+            visibility_with_trusted("E:/p", &trusted, "windows"),
+            Visibility::AfterRestart
+        );
+    }
+
+    /// **评审 I12：异步包装语义等价**——`visibility_of_async` 只是把同步 fs IO 挪到阻塞池，
+    /// 结论必须与同步壳逐档一致（含「无 home = 保守未信任」）。换线程不得换结论。
+    #[tokio::test]
+    async fn visibility_of_async_matches_the_sync_probe() {
+        let dir = tmp_home_with_setting("{\"recentProjects\":[\"E:\\\\p\"]}");
+        for (project, home) in [
+            ("E:/p", Some(dir.path().to_path_buf())),
+            ("E:/q", Some(dir.path().to_path_buf())),
+            ("E:/p", None),
+        ] {
+            let sync = visibility_of(project, home.as_deref(), "windows");
+            let wrapped = visibility_of_async(project.to_string(), home.clone(), "windows").await;
+            assert_eq!(
+                wrapped, sync,
+                "异步包装不得换结论（project={project} home={home:?}）"
+            );
+        }
     }
 
     // ===== 安装路径发现 =====

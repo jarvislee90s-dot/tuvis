@@ -123,7 +123,7 @@ git commit -m "fix(dsh): rc.2 会话读侧修复——真实 v4/v7 夹具诊断�
 2. **夹具布局：实际 harness **两种布局都接受**（本任务书 Step 1 只写了扁平布局②，Step 2 的 `load(fx, "projcache-v7")` 命名约定亦非实际做法）**。实际夹具消费点 = `monitor/dsh/mod.rs::real_v4_fixture_end_to_end_verification`：
    - **布局①（原生 home 结构）**：`tests/fixtures/dsh-v4/sessions/<项目目录名>/<会话 id>/session.v4.jsonl.zstd` + `tests/fixtures/dsh-v4/storages/session_projcache/sessions/<会话 id>.json`（原生布局下**零拷贝直扫**，不暂存）；
    - **布局②（本任务书的扁平探针形态）**：`tests/fixtures/dsh-v4/session-<id>-probe/session.v4.jsonl.zstd` + `tests/fixtures/dsh-v4/projcache-v7.json`（扁平布局下**暂存为临时 home**，mtime 置当下）；
-   - **第三种：零拷贝指向真实 home**——`MAM_DSH_V4_HOME=~/.dsh cargo test --lib real_v4_fixture_end_to_end_verification -- --nocapture`（只读直验；夹具目录在仓库内只有 `.gitignore`，真实用户会话内容**永不入库**）。
+   - **第三种：零拷贝指向真实 home**——`TUVIS_DSH_V4_HOME=~/.dsh cargo test --lib real_v4_fixture_end_to_end_verification -- --nocapture`（只读直验；夹具目录在仓库内只有 `.gitignore`，真实用户会话内容**永不入库**）。
    - 三条跳过路径（夹具根不存在 / 无 v4 日志 / 无窗内非子 Agent 会话）**各自 eprintln 跳因 + 探过的路径 + 实际找到的东西**——跳过与通过不可混淆。
 3. **遍历护栏（评审后实测抓获的事故）**：把夹具根指向真实 `~/.dsh` 时，递归会跟随 `profiles/node_modules/*` 的 junction 大树 → 测试 >10min 挂死。遍历改为「home 布局只走 `sessions/` + 不跟随符号链接/交接点 + 深度与目录数上限」，并有 hermetic 回归锁 `fixture_walk_is_guarded_against_huge_or_linked_trees`。
 4. **出卡断言口径**：改为「无降级卡（代际门回归判别器）+ 至少一张带消息体」，不逐卡要求消息体（全新会话为空是**合法**形态）。

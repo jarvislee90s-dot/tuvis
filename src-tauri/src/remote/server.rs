@@ -20246,6 +20246,73 @@ mod tests {
         assert_eq!(audits[0].result, "refused:app_form_no_repost");
     }
 
+    /// **评审 M2**：GET `/session-approve-options` 对 codex **APP 形态**会话不再下发
+    /// 「点了必死」的键位。POST `/session-approve` 对 APP 形态恒 409 `app_form_pending`
+    /// （Task 15 止血门），而 GET 此前照常下发映射表 approve/reject ⇒ 移动端渲染一张
+    /// **点了必死的红卡**。现回 `available:false` + **POST 同一常量**的 reason + 零选项
+    /// （对齐 mode/menu 的 `no_mechanism` 处置）。
+    ///
+    /// 同时钉住**「GET 类端点不受门」的既有裁决**：本端点仍 **200 可达**、仍如实作答
+    /// （不是 403/409、不是 404 no_session、不是空响应）——门控「能不能读」与「下发什么」
+    /// 是两件事。变异验证：删掉 `approve_options_scan` 的 `codex_app_form` 分支 →
+    /// 本用例先红（available=true + options 非空 = 红卡复现）。
+    #[tokio::test]
+    async fn codex_app_form_approve_options_refuses_keys_honestly() {
+        let fake = FakeInjector::ok();
+        // Waiting 状态（夹具默认）⇒ 等待门直接过，测的正是「下发面」这一段
+        let state = codex_form_state(
+            fake.clone(),
+            crate::session::ProcessForm::App,
+            &[("sess_app_ap", 75)],
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                "/m/api/v1/session-approve-options?session_id=sess_app_ap",
+                Some("mam_device=mm"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "GET 类端点不受门（既有裁决）：仍 200 可达");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["available"], false, "APP 形态不得下发可点键位：{v}");
+        assert!(
+            v["options"].as_array().is_some_and(|o| o.is_empty()),
+            "零键位（有键 = 红卡复现）：{v}"
+        );
+        assert_eq!(
+            v["reason"],
+            serde_json::json!("APP 会话该操作走协议通道，开发中——请在 APP 内操作"),
+            "reason 必须复用 POST 的同一常量 APP_FORM_PENDING_REASON（不另写措辞）：{v}"
+        );
+        assert_eq!(
+            v["planPending"], false,
+            "available=false 时前端只渲染提示条（与严格档同款硬置，避免载荷与渲染表里不一）：{v}"
+        );
+        assert_eq!(v["dialog"], false, "{v}");
+        assert!(
+            fake.recorded().is_empty() && fake.recorded_keys().is_empty(),
+            "读侧零注入：{v}"
+        );
+        // 配对不变量：GET 说不可点、POST 就必须也拒（不再有「点了必死」的窗口）
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-approve",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_app_ap","optionId":"approve"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 409, "POST 止血门未变");
+        let body = body_string(r).await;
+        assert!(body.contains("app_form_pending"), "{body}");
+    }
+
     /// CLI 形态直通（设计 §3.1 原则 1「CLI 版固化」）：三入口对 form=Cli 的 codex
     /// 会话**零变化**——不出现 `app_form_pending`，走既有 CLI 面（CI/无屏读缝下：
     /// 切档 200 failed「读不到屏」/ 菜单 open 既有失败面 / 问答 select 零键中止）。

@@ -1642,8 +1642,9 @@ pub(crate) async fn zcode_headless_dispatch(
         }
     };
     // 8) 回执封套 + 可见性（信任表只读；读不到 = 保守判未信任）
+    // 同步 fs IO → spawn_blocking 封装（评审 I12）
     let home = (st.home_source)().map(std::path::PathBuf::from);
-    let visibility = zcode::visibility_of(&project, home.as_deref(), os);
+    let visibility = zcode::visibility_of_async(project.clone(), home, os).await;
     json_no_store(
         StatusCode::OK,
         headless_envelope(HeadlessKind::Zcode, &out.receipt, Some(visibility)),
@@ -1920,8 +1921,10 @@ pub async fn session_create_zcode(
             }
         };
     // ⑤ 提示面（可见性分层 + 黄字信号；文案全在 zcode_create 单点）
+    // 可见性探针 = 同步 fs IO（读 ~/.zcode/v2/setting.json）→ 走 spawn_blocking 封装
+    // （评审 I12：不在 handler 协程上做文件读）
     let home = (st.home_source)().map(std::path::PathBuf::from);
-    let visibility = zcode::visibility_of(&project, home.as_deref(), os);
+    let visibility = zcode::visibility_of_async(project.clone(), home.clone(), os).await;
     let warning = zcode_create::create_hints(&project, visibility, &board, os).warning;
     // ⑥ 平台门（投递前拒绝：本平台没有该无头命令形态 —— 回合未起跑、零字节投递）
     if os != "windows" && os != "macos" {
@@ -2080,9 +2083,8 @@ pub async fn session_create_zcode_info(
     let os = std::env::consts::OS;
     let windows = cfg!(windows);
     let home = (st.home_source)().map(std::path::PathBuf::from);
-    // 信任表（**只读** ~/.zcode/v2/setting.json；读不到 = 空表 = 全部未信任，保守）
-    let trusted = zcode::trusted_projects(home.as_deref());
-    // 看板快照项目（同步阻塞扫描 → spawn_blocking）
+    // 看板快照项目（同步阻塞扫描 → spawn_blocking）；信任表与候选装配同批落到同一个
+    // 阻塞池里（见下方装配段——评审 I12）
     let probe_st = st.clone();
     let board =
         match tokio::task::spawn_blocking(move || (probe_st.session_source)().sessions).await {
@@ -2095,46 +2097,70 @@ pub async fn session_create_zcode_info(
                 );
             }
         };
-    let board_projects: Vec<String> = board.iter().map(|s| s.project_path.clone()).collect();
-    // 候选准入：存在 ∧ **不在同源黑名单内**（与 POST 的路径校验同一份 `remote::files` 口径）
-    let admissible = |p: &str| {
-        std::path::Path::new(p).exists()
-            && !crate::remote::files::project_path_rejected(
-                std::path::Path::new(p),
-                home.as_deref(),
-                windows,
-            )
-    };
-    let candidates: Vec<serde_json::Value> =
-        zcode_create::candidates(&trusted, &board_projects, &admissible, os)
-            .into_iter()
-            .map(|c| {
-                // 信任档文案经 Task 7 单点（与 POST 的 visibilityNote 同一条 note()）
-                let note = zcode::visibility_of(&c.path, home.as_deref(), os).note();
-                serde_json::json!({
-                    "path": c.path,
-                    "source": c.source,
-                    "trusted": c.trusted,
-                    "note": note,
+    // **候选装配整段进 spawn_blocking（评审 I12）**：这一段全是同步 fs IO——信任表读
+    // `~/.zcode/v2/setting.json`、逐候选 `Path::exists()` + canonicalize（黑名单）、每候选
+    // 一次可见性判定。旧写法把它们跑在 handler 协程上（一次请求 N+2 次文件读 + N×2 次
+    // stat/canonicalize 阻塞 worker），且**每个候选各重读一次信任文件**。现在：
+    // ① 整段落到阻塞池；② 信任表**每请求只读一次**，逐候选经 [`zcode::visibility_with_trusted`]
+    // 复用（与 `visibility_of` 同一条映射，不另造判定）。
+    let selected = params
+        .get("project")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let scan_home = home.clone();
+    let assembled = tokio::task::spawn_blocking(move || {
+        // 信任表（**只读**；读不到 = 空表 = 全部未信任，保守）
+        let trusted = zcode::trusted_projects(scan_home.as_deref());
+        // 候选准入：存在 ∧ **不在同源黑名单内**（与 POST 的路径校验同一份 `remote::files` 口径）
+        let admissible = |p: &str| {
+            std::path::Path::new(p).exists()
+                && !crate::remote::files::project_path_rejected(
+                    std::path::Path::new(p),
+                    scan_home.as_deref(),
+                    windows,
+                )
+        };
+        let board_projects: Vec<String> = board.iter().map(|s| s.project_path.clone()).collect();
+        let candidates: Vec<serde_json::Value> =
+            zcode_create::candidates(&trusted, &board_projects, &admissible, os)
+                .into_iter()
+                .map(|c| {
+                    // 信任档文案经 Task 7 单点（与 POST 的 visibilityNote 同一条 note()）
+                    let note = zcode::visibility_with_trusted(&c.path, &trusted, os).note();
+                    serde_json::json!({
+                        "path": c.path,
+                        "source": c.source,
+                        "trusted": c.trusted,
+                        "note": note,
+                    })
                 })
-            })
-            .collect();
+                .collect();
+        // 选中项目的黄字信号（表单选完项目即可见；提交时 POST 回执也会带一次当时的结论）
+        let warning = selected.and_then(|project| {
+            let visibility = zcode::visibility_with_trusted(&project, &trusted, os);
+            zcode_create::create_hints(&project, visibility, &board, os).warning
+        });
+        (candidates, warning)
+    })
+    .await;
+    let (candidates, warning) = match assembled {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("session-create-zcode-info 候选装配任务异常: {e}");
+            return json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal" }),
+            );
+        }
+    };
     let mut body = serde_json::json!({
         "available": true,
         "tool": "zcode",
         "defaultFirstText": zcode_create::DEFAULT_FIRST_TEXT,
         "candidates": candidates,
     });
-    // 选中项目的黄字信号（表单选完项目即可见；提交时 POST 回执也会带一次当时的结论）
-    if let Some(project) = params
-        .get("project")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        let visibility = zcode::visibility_of(&project, home.as_deref(), os);
-        if let Some(w) = zcode_create::create_hints(&project, visibility, &board, os).warning {
-            body["warning"] = serde_json::json!(w);
-        }
+    if let Some(w) = warning {
+        body["warning"] = serde_json::json!(w);
     }
     json_no_store(StatusCode::OK, body)
 }
@@ -3551,12 +3577,14 @@ pub async fn session_send_info(
             // **真可见性档**（信任探针经 `st.home_source` 缝取主目录：生产 = dirs::home_dir
             // → `~/.zcode/v2/setting.json` 只读；测试 = None/tempdir，**绝不触真实 ~/.zcode**）。
             // 与 session-send 的实发口径一致，杜绝「输入框可用但发送必败」的反向形态。
+            // 可见性探针 = 同步 fs IO → spawn_blocking 封装（评审 I12）
             let home = (st.home_source)().map(std::path::PathBuf::from);
-            let visibility = crate::inject::headless::zcode::visibility_of(
-                &session.project_path,
-                home.as_deref(),
+            let visibility = crate::inject::headless::zcode::visibility_of_async(
+                session.project_path.clone(),
+                home,
                 std::env::consts::OS,
-            );
+            )
+            .await;
             serde_json::json!({
                 "injectable": true,
                 "channels": [kind.wire_name()],
@@ -5369,6 +5397,41 @@ fn approve_options_scan(st: &Arc<RemoteState>, session_id: &str) -> Option<Appro
         .with(|conn| crate::database::dao::question_wait::has(conn, &tool, session_id));
     if question_marked {
         return None;
+    }
+    // ===== 评审 M2：codex **APP 形态**不得下发「点了必死」的键位 =====
+    //
+    // POST `/session-approve` 对 APP 形态恒 409 `app_form_pending`（Task 15 止血门：
+    // APP 无控制台，CLI 键序通道对它就是错误通道），而本 GET 此前照常下发映射表二元
+    // 选项（codex 默认映射 approve→"y" / reject→"esc"）⇒ 移动端渲染一张**点了必死的
+    // 红卡**。
+    //
+    // 处置与 mode/menu 的 `no_mechanism` 同款：**不下发键位**、改为如实说明无机制。
+    // 判据单点复用 [`codex_app_form`]；码/文案复用 POST 的同一对常量
+    // （[`APP_FORM_PENDING_CODE`] / [`APP_FORM_PENDING_REASON`]）——不另写一份措辞。
+    //
+    // **这不违反「GET 类端点不受门」的既有裁决**（[`codex_app_form`] 文档）：本分支
+    // 不是 H3/止血门——读侧**照常 200 可达**且**如实作答**（available=false + reason +
+    // 零选项）。门控「能不能读」与「下发什么」是两件事：前者一字不动，后者纠偏。
+    //
+    // 门位 = 等待门与待决问答门之后、映射查找与（可能触发屏读的）dialog 解析**之前**：
+    // 与 POST 的实际生效条件对齐（客户端只在 GET 说 available 时才 POST），并省掉一次
+    // 对 APP 形态白付的屏读。[`plan_pending`] 与严格档同款**硬置 false**：前端在
+    // `available=false` 时只渲染提示条，两条不同屏（避免载荷与渲染表里不一）。
+    if codex_app_form(&session) {
+        return Some(ApproveScanHit {
+            available: false,
+            options: Vec::new(),
+            // 版本字段留空：本形态没有「键位取证版本」可言（与不可批三态同形）
+            verified_with: String::new(),
+            tool,
+            reason: Some(APP_FORM_PENDING_REASON.to_string()),
+            dialog: false,
+            plan_body: None,
+            degraded_hint: None,
+            plan_pending: false,
+            plan_dialog: false,
+            feedback_number: None,
+        });
     }
     let mapping = st
         .store
