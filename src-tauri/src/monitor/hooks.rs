@@ -83,10 +83,14 @@ fn install_marker_helper() -> Option<PathBuf> {
     install_helper_bin(&["tuvis-marker.exe", "tuvis-marker"])
 }
 
+/// tuvis-hook-listener helper 候选名（1A 单一事实源：install 分发与 probe 探测
+/// 共用，禁止两处各写一份——将来加候选（如新平台变体）只改这里，两侧自动同步）
+const HOOK_LISTENER_HELPER_NAMES: [&str; 2] = ["tuvis-hook-listener.exe", "tuvis-hook-listener"];
+
 /// 拷贝 tuvis-hook-listener helper 到 ~/.tuvis/bin/（批次甲 T1；返回目标路径）。
 /// 未构建/未随包分发 → None（注册回落 bash 形态，零回归）
 pub(crate) fn install_hook_listener_helper() -> Option<PathBuf> {
-    install_helper_bin(&["tuvis-hook-listener.exe", "tuvis-hook-listener"])
+    install_helper_bin(&HOOK_LISTENER_HELPER_NAMES)
 }
 
 /// helper 分发入口（marker / hook-listener 共用核心）：从当前 exe 同目录拷候选名
@@ -98,31 +102,49 @@ fn install_helper_bin(names: &[&str]) -> Option<PathBuf> {
     install_helper_from_to(&src_dir, &bin_dir, names)
 }
 
+/// src 侧存在候选判定（1A 单一事实源：install 拷贝循环与 probe 探测共用）：
+/// 按候选序返回 src_dir 下真实在场的候选名。install 侧逐个尝试拷贝（失败继续
+/// 下一个候选，行为不变）；probe 侧取首个存在者即「helper 在场」
+fn existing_src_names<'a>(src_dir: &std::path::Path, names: &[&'a str]) -> Vec<&'a str> {
+    names
+        .iter()
+        .copied()
+        .filter(|n| src_dir.join(n).is_file())
+        .collect()
+}
+
+/// dst 侧「已有安装副本回退」判定（1A 单一事实源：install 与 probe 共用）：
+/// dst_dir 下首个存在候选的路径（回退语义见 install_helper_from_to 回退注释）
+fn installed_copy_path(dst_dir: &std::path::Path, names: &[&str]) -> Option<PathBuf> {
+    names
+        .iter()
+        .find(|n| dst_dir.join(n).is_file())
+        .map(|n| dst_dir.join(n))
+}
+
 /// helper 安装路径解析 + 拷贝核心（tempdir 可测缝）：`names` 依序探测 src_dir 下
 /// 候选（Windows 发行 .exe 在前、非 Windows 开发态裸名在后），首个存在者拷到
-/// dst_dir 同名（无条件覆盖；unix 补 0755）
+/// dst_dir 同名（无条件覆盖；unix 补 0755）。存在性判定经 existing_src_names /
+/// installed_copy_path（与 probe_helper_from_to 同源，两侧永不漂移）
 fn install_helper_from_to(
     src_dir: &std::path::Path,
     dst_dir: &std::path::Path,
     names: &[&str],
 ) -> Option<PathBuf> {
     let _ = fs::create_dir_all(dst_dir);
-    for name in names {
-        let src = src_dir.join(name);
-        if src.is_file() {
-            let dst = dst_dir.join(name);
-            if fs::copy(&src, &dst).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(metadata) = fs::metadata(&dst) {
-                        let mut perms = metadata.permissions();
-                        perms.set_mode(0o755);
-                        let _ = fs::set_permissions(&dst, perms);
-                    }
+    for name in existing_src_names(src_dir, names) {
+        let dst = dst_dir.join(name);
+        if fs::copy(src_dir.join(name), &dst).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = fs::metadata(&dst) {
+                    let mut perms = metadata.permissions();
+                    perms.set_mode(0o755);
+                    let _ = fs::set_permissions(&dst, perms);
                 }
-                return Some(dst);
             }
+            return Some(dst);
         }
     }
     // **已有安装副本回退**（2026-10-03 事故修复）：源目录没有候选（如无 feature 的
@@ -132,13 +154,46 @@ fn install_helper_from_to(
     //（问答通道的 tool_name/tool_input 全丢——多选题误判审批卡的事故根因）。
     // 副本版本偏旧可接受：helper 的事件文件协议自 T8 起稳定，比 bash 兜底（零富
     // 字段）严格更优。
-    for name in names {
-        let dst = dst_dir.join(name);
-        if dst.is_file() {
-            return Some(dst);
-        }
-    }
-    None
+    installed_copy_path(dst_dir, names)
+}
+
+/// 无副作用探测 tuvis-hook-listener helper 是否可用（1A 信号健康度：区分
+/// 「结构上装不了」与「注册失败」）。存在性判定与 install_helper_from_to 完全
+/// 同源（共用 existing_src_names / installed_copy_path）：主程序同目录候选任一
+/// 在场，或 `~/.tuvis/bin/` 已有安装副本 → true；两处皆无 → false——即
+/// register_all_hooks 对 kimi「helper 缺席跳过注册」分支的同一口径，探测结论
+/// 直接对应「kimi 未注册是否分发缺口」
+pub(crate) fn probe_hook_listener_helper() -> bool {
+    let Some(exe) = std::env::current_exe().ok() else {
+        return false;
+    };
+    let Some(src_dir) = exe.parent() else {
+        return false;
+    };
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    probe_helper_from_to(
+        src_dir,
+        &helper_install_dir(&home),
+        &HOOK_LISTENER_HELPER_NAMES,
+    )
+    .is_some()
+}
+
+/// probe 核心（tempdir 可测缝，纯读零写——不拷贝、不建目录）：判定同布局下
+/// install_helper_from_to 的「存在性」——src_dir 下首个存在候选（返回 src 路径），
+/// 或 dst_dir 已有安装副本（返回该副本路径）；两处皆无 → None。返回路径仅作
+/// 测试断言锚点，调用方只关心 Some/None
+fn probe_helper_from_to(
+    src_dir: &std::path::Path,
+    dst_dir: &std::path::Path,
+    names: &[&str],
+) -> Option<PathBuf> {
+    existing_src_names(src_dir, names)
+        .first()
+        .map(|n| src_dir.join(n))
+        .or_else(|| installed_copy_path(dst_dir, names))
 }
 
 /// Windows hook 命令：**正斜杠**路径，含空格才加引号。两层转义约束（第四轮实机
@@ -929,6 +984,30 @@ pub struct ToolSignalHealth {
     pub has_active_sessions: bool,
     /// 该工具会话最近一次 hook 事件时间（RFC3339 UTC；30s TTL 目录内无匹配事件 → None）
     pub last_event_at: Option<String>,
+    /// 未注册原因（1A：区分「结构上装不了」与「注册失败」）。值域为字符串字面量、
+    /// 不上枚举——前端按字面量分支，扩展时两端各加一支即可。本批仅
+    /// [`UNREGISTERED_REASON_HELPER_NOT_SHIPPED`]（kimi 注册硬前置 helper 未随包
+    /// 分发且无历史副本，如 macOS 发布包——设计内状态，用户无需处理）。
+    /// registered=true 恒为 None（原因只解释未注册态）；由命令层后处理填充
+    ///（hook_signal_health），compute 纯函数恒置 None
+    pub unregistered_reason: Option<String>,
+}
+
+/// 未注册原因值：helper 未随包分发且无历史副本（kimi 注册硬前置缺席，
+/// 见 probe_hook_listener_helper / register_all_hooks 的 kimi 跳过分支）
+pub(crate) const UNREGISTERED_REASON_HELPER_NOT_SHIPPED: &str = "helperNotShipped";
+
+/// 未注册原因判定（纯函数，命令层后处理调用；helper 探测结果经参数注入保持
+/// 可测）：kimi 且未注册且 helper 探测不到 → "helperNotShipped"；其余组合 → None
+/// ——kimi 未注册但 helper 在场说明是注册失败（用户需排查）而非分发缺口；已注册
+/// 行与非 kimi 工具不带原因
+pub(crate) fn unregistered_reason_for(
+    tool_id: &str,
+    registered: bool,
+    helper_present: bool,
+) -> Option<String> {
+    (tool_id == "kimi" && !registered && !helper_present)
+        .then(|| UNREGISTERED_REASON_HELPER_NOT_SHIPPED.to_string())
 }
 
 /// 活跃会话判定：Idle（进程开着但空闲）与 Finished 不算——空闲会话本就长时间无
@@ -970,21 +1049,37 @@ pub fn compute_tool_signal_health(
                 registered: registered_of(tool_id),
                 has_active_sessions,
                 last_event_at,
+                // 1A：纯函数恒置 None——reason 依赖环境敏感的 helper 探测
+                // （current_exe/home），由命令层 hook_signal_health 后处理填充，
+                // 保持本函数 tempdir/内存可测的纯度（判定见 unregistered_reason_for）
+                unregistered_reason: None,
             }
         })
         .collect()
 }
 
-/// codex 信任门一次性通知的 KV 键（T5）。shown=已示过（永不再示）；pending=注册期
-/// 置位、setup 期消费——register_all_hooks 在 run() 早期执行，彼时 builder 尚未
-/// 构建、AppHandle 不可得，通知必须延迟到 setup 闭包（consume_codex_trust_notice）
+/// codex 信任门操作卡提醒的 KV 键（T5 引入、2A 改语义）。shown=已销账（用户点过
+/// 「复制命令」/「不再提醒」，永不再弹）；pending=注册期置位（enqueue）——
+/// register_all_hooks 在 run() 早期执行，彼时 builder 尚未构建、AppHandle 不可
+/// 得，浮窗必须延迟到 setup 闭包（consume_codex_trust_notice）。
+/// 与旧「一次性系统通知」的关键差异：pending 的消费不再等于销账——弹卡只消费
+/// 「本次展示」，销账（清 pending + 置 shown）只发生在按钮 ack；X 关闭两者皆不写
 const CODEX_NOTICE_SHOWN_KEY: &str = "codex_hook_notice_shown";
 const CODEX_NOTICE_PENDING_KEY: &str = "codex_hook_notice_pending";
 
 /// 一次性判定（纯函数，内存库可测）：shown 已置 "true" → 永不再提醒。后续待办
-/// 状态常驻设置页信号健康度分区，不靠重复弹窗
+/// 状态常驻设置页信号健康度分区，不靠重复弹窗。enqueue 写入门与下面 should_show
+/// 展示门共用本函数——shown 是两门共同的终态位
 fn codex_notice_should_enqueue(shown: Option<&str>) -> bool {
     shown != Some("true")
+}
+
+/// 2A 状态机展示门（纯函数）：pending 在场且未销账才弹操作卡。shown 门防御
+/// 半态脏数据（销账落 shown 时残留 pending="true" 的中间态，双写非原子）；
+/// 升级场景（存量 pending=true 且无 shown——旧版 enqueue 后未及消费）自然
+/// 命中本门 → 会弹
+fn codex_notice_should_show(pending: Option<&str>, shown: Option<&str>) -> bool {
+    pending == Some("true") && codex_notice_should_enqueue(shown)
 }
 
 /// conn 级内层（对齐 dao::settings 的 *_conn 模式）：KV 读写在同一连接内完成，
@@ -997,35 +1092,44 @@ fn enqueue_codex_trust_notice_conn(conn: &rusqlite::Connection) {
     }
 }
 
-/// codex 注册成功路径调用：未示过 → 置 pending（登记「启动后要示一次」）
+/// codex 注册成功路径调用：未销账 → 置 pending（登记「启动后要弹一次操作卡」）
 fn enqueue_codex_trust_notice() {
     let conn = crate::database::connection::DB.lock().unwrap();
     enqueue_codex_trust_notice_conn(&conn);
 }
 
-/// setup 期消费（AppHandle 已得）：pending 在场 → 发一次系统通知 → 落 shown。
-/// 通知发送失败也落 shown：一次性语义优先（失败重试会变成每次启动轰炸），待办
-/// 状态在设置页信号健康度分区常驻可见，信息不因通知失败而丢失。
-/// 文案不接 i18n：Rust 侧无 i18n 基建，通知一次性发出，双语完整文案在设置页分区
+/// 2A 销账内层（conn 级，内存库可测）：置 shown + 清 pending。「复制命令」与
+/// 「不再提醒」两个动作对 KV 同义（用户已处置），差异只在动作语义（命令层记日志）
+fn ack_codex_trust_notice_conn(conn: &rusqlite::Connection) {
+    crate::database::dao::settings::set_setting_conn(conn, CODEX_NOTICE_SHOWN_KEY, "true");
+    crate::database::dao::settings::set_setting_conn(conn, CODEX_NOTICE_PENDING_KEY, "false");
+}
+
+/// 销账生产壳：commands::notification::codex_trust_notice_ack（操作卡按钮）调用
+pub fn ack_codex_trust_notice() {
+    let conn = crate::database::connection::DB.lock().unwrap();
+    ack_codex_trust_notice_conn(&conn);
+}
+
+/// setup 期消费（AppHandle 已得）：展示门命中 → 弹常驻操作卡（复制 /hooks /
+/// 「不再提醒」/ X 暂忽略，commands/notification.rs 渲染）。2A 语义变更：旧版
+/// 「发系统桌面通知 + 发出即销账」，新版**点击才销账**——弹窗本身不写 KV，
+/// 销账只经 ack_codex_trust_notice（按钮）发生。窗口创建失败也不落 shown：
+/// 重启自然重试（无「每次启动轰炸」面——每次运行最多弹一次），且待办状态在
+/// 设置页信号健康度分区常驻可见，信息不因单次窗口失败而丢失。X 暂忽略由前端
+/// 藏窗实现、不触 KV：pending 保留 → 下次启动再弹；「本次运行内不再弹」由本
+/// 函数每次运行只在 setup 调用一次结构性保证（不在前端额外循环重弹）
 pub fn consume_codex_trust_notice(app: &tauri::AppHandle) {
-    if crate::database::get_setting(CODEX_NOTICE_PENDING_KEY).as_deref() != Some("true") {
+    if !codex_notice_should_show(
+        crate::database::get_setting(CODEX_NOTICE_PENDING_KEY).as_deref(),
+        crate::database::get_setting(CODEX_NOTICE_SHOWN_KEY).as_deref(),
+    ) {
         return;
     }
-    use tauri_plugin_notification::NotificationExt;
-    if let Err(e) = app
-        .notification()
-        .builder()
-        .title("Tuvis")
-        .body(
-            "Codex 钩子已注册，需信任后事件才会触发：请在 Codex 终端输入 /hooks \
-             并信任兔维斯条目（一次性）",
-        )
-        .show()
-    {
-        warn!("codex 信任门一次性通知发送失败: {e}");
-    }
-    crate::database::set_setting(CODEX_NOTICE_SHOWN_KEY, "true");
-    crate::database::set_setting(CODEX_NOTICE_PENDING_KEY, "false");
+    crate::commands::notification::show_action_notification(
+        app,
+        crate::commands::notification::codex_trust_hint_payload(),
+    );
 }
 
 /// 为所有支持 Hook 的工具注册 Hook（在应用启动时调用）
@@ -3067,7 +3171,7 @@ mod helper_migration_tests {
 /// T1 helper 安装管道（install_marker_helper 先例扩展的共用核心）
 #[cfg(test)]
 mod helper_install_tests {
-    use super::{helper_install_dir, install_helper_from_to};
+    use super::{helper_install_dir, install_helper_from_to, probe_helper_from_to};
 
     #[test]
     fn install_dir_is_home_mam_bin() {
@@ -3161,6 +3265,92 @@ mod helper_install_tests {
             b"v2",
             "重装必须覆盖旧版"
         );
+    }
+
+    /// 1A probe 探测（纯读零写）：src 有 .exe 候选 → Some(src)，且 dst 侧零足迹
+    ///（不拷贝、不建目录——probe 与 install 的副作用分界线）
+    #[test]
+    fn probe_finds_src_exe_candidate_without_side_effects() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("tuvis-hook-listener.exe"), b"exe").unwrap();
+        let names = ["tuvis-hook-listener.exe", "tuvis-hook-listener"];
+        assert_eq!(
+            probe_helper_from_to(src.path(), dst.path(), &names),
+            Some(src.path().join("tuvis-hook-listener.exe"))
+        );
+        assert!(
+            !dst.path().join("tuvis-hook-listener.exe").exists(),
+            "probe 不得拷贝文件"
+        );
+    }
+
+    /// 1A probe：两处皆无 → None，且 dst 目录不被创建——探针必须在「从未安装过」
+    /// 的机器上零足迹（install 会 create_dir_all，这正是本探针的存在意义：设置页
+    /// 打开信号健康度分区不应在用户磁盘上留下任何东西）
+    #[test]
+    fn probe_absent_everywhere_yields_none_without_creating_dst() {
+        let src = tempfile::tempdir().unwrap();
+        let dst_parent = tempfile::tempdir().unwrap();
+        let dst = dst_parent.path().join("bin"); // 刻意不存在的深层目录
+        assert!(
+            probe_helper_from_to(src.path(), &dst, &["tuvis-hook-listener.exe"]).is_none(),
+            "两处皆无 → None"
+        );
+        assert!(!dst.exists(), "probe 不得创建目录（无副作用纪律）");
+    }
+
+    /// 1A probe：src 无候选 + dst 有历史副本 → Some(dst)——2026-10-03 回退语义的
+    /// probe 侧镜像（老安装的副本让 helper 仍算「在场」，不误报未分发）
+    #[test]
+    fn probe_falls_back_to_installed_copy() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(dst.path().join("tuvis-hook-listener.exe"), b"installed").unwrap();
+        let names = ["tuvis-hook-listener.exe", "tuvis-hook-listener"];
+        assert_eq!(
+            probe_helper_from_to(src.path(), dst.path(), &names),
+            Some(dst.path().join("tuvis-hook-listener.exe"))
+        );
+    }
+
+    /// install / probe 存在性同源回归锁（1A 关键纪律）：同一布局下两者 Some/None
+    /// 结论必须一致——将来任一侧改判定（加候选名/改回退语义）忘了另一侧时本用例
+    /// 先红。probe 先跑（干净状态），install 后跑（含拷贝副作用不影响同布局判定）
+    #[test]
+    fn probe_agrees_with_install_presence_across_layouts() {
+        let names = ["tuvis-hook-listener.exe", "tuvis-hook-listener"];
+        for (layout, expected_present) in [
+            ("both-absent", false),
+            ("src-exe", true),
+            ("src-bare", true),
+            ("dst-copy-only", true),
+        ] {
+            let src = tempfile::tempdir().unwrap();
+            let dst = tempfile::tempdir().unwrap();
+            match layout {
+                "src-exe" => {
+                    std::fs::write(src.path().join("tuvis-hook-listener.exe"), b"e").unwrap();
+                }
+                "src-bare" => {
+                    std::fs::write(src.path().join("tuvis-hook-listener"), b"b").unwrap();
+                }
+                "dst-copy-only" => {
+                    std::fs::write(dst.path().join("tuvis-hook-listener"), b"old").unwrap();
+                }
+                _ => {}
+            }
+            assert_eq!(
+                probe_helper_from_to(src.path(), dst.path(), &names).is_some(),
+                expected_present,
+                "probe 布局 {layout} 判定错误"
+            );
+            assert_eq!(
+                install_helper_from_to(src.path(), dst.path(), &names).is_some(),
+                expected_present,
+                "install 布局 {layout} 判定错误（与 probe 漂移）"
+            );
+        }
     }
 }
 
@@ -3852,32 +4042,87 @@ mod signal_health_tests {
         assert!(!codex.has_active_sessions);
     }
 
-    /// codex 一次性通知 KV：未示过 → 置 pending；示过（shown=true）→ 永不再置
-    ///（内存库写断言，一次性语义）。走真实 enqueue_codex_trust_notice_conn 路径
-    ///（*_conn 模式）——键名/条件改错时本测试同步变红，不复刻逻辑
+    /// codex 信任门操作卡 KV 状态机（2A）：enqueue 写入门 / should_show 展示门 /
+    /// ack 销账 / snooze（X 仅藏窗、无写入路径）。走真实 *_conn 路径——键名/
+    /// 条件改错时本测试同步变红，不复刻逻辑
     #[test]
-    fn codex_notice_kv_is_one_shot() {
+    fn codex_notice_kv_state_machine() {
         let conn = mem_conn();
-        // 首次注册：未示过（键缺省）→ 置 pending
+        let pending = |c: &rusqlite::Connection| get_setting_conn(c, CODEX_NOTICE_PENDING_KEY);
+        let shown = |c: &rusqlite::Connection| get_setting_conn(c, CODEX_NOTICE_SHOWN_KEY);
+
+        // 首次注册（两键缺省）→ 置 pending，展示门命中（会弹）
+        enqueue_codex_trust_notice_conn(&conn);
+        assert_eq!(pending(&conn).as_deref(), Some("true"));
+        assert!(codex_notice_should_show(
+            pending(&conn).as_deref(),
+            shown(&conn).as_deref()
+        ));
+
+        // snooze（X 关闭）：后端无写入路径（前端仅藏窗）→ 两 KV 原样保留，
+        // 展示门持续命中（下次启动再弹）。本块不调用任何写函数即是要测的语义
+        assert!(codex_notice_should_show(
+            pending(&conn).as_deref(),
+            shown(&conn).as_deref()
+        ));
+        assert_eq!(pending(&conn).as_deref(), Some("true"));
+
+        // ack（「复制命令」/「不再提醒」）：置 shown + 清 pending → 展示门关闭
+        ack_codex_trust_notice_conn(&conn);
+        assert_eq!(shown(&conn).as_deref(), Some("true"));
+        assert_eq!(pending(&conn).as_deref(), Some("false"));
+        assert!(!codex_notice_should_show(
+            pending(&conn).as_deref(),
+            shown(&conn).as_deref()
+        ));
+
+        // 老用户（shown=true）永不弹：后续注册（重启/重注册）不得再置 pending
         enqueue_codex_trust_notice_conn(&conn);
         assert_eq!(
-            get_setting_conn(&conn, CODEX_NOTICE_PENDING_KEY).as_deref(),
-            Some("true"),
-            "首次注册必须登记 pending"
-        );
-        // setup 消费：发通知 → 落 shown + 清 pending（consume 的 KV 侧语义）
-        set_setting_conn(&conn, CODEX_NOTICE_SHOWN_KEY, "true");
-        set_setting_conn(&conn, CODEX_NOTICE_PENDING_KEY, "false");
-        // 后续再次注册（重启/重注册）：已示过 → 不得再置 pending
-        enqueue_codex_trust_notice_conn(&conn);
-        assert_eq!(
-            get_setting_conn(&conn, CODEX_NOTICE_PENDING_KEY).as_deref(),
+            pending(&conn).as_deref(),
             Some("false"),
-            "已示过后不得再登记 pending（一次性）"
+            "已销账后不得再登记 pending（一次性）"
         );
-        // 判定纯函数边界：shown 缺省/"false" 都算未示过（防半态脏数据卡死提醒）
+
+        // 升级场景：存量 pending=true 且无 shown（旧版 enqueue 后未及消费）→ 会弹
+        let old = mem_conn();
+        set_setting_conn(&old, CODEX_NOTICE_PENDING_KEY, "true");
+        assert!(codex_notice_should_show(
+            pending(&old).as_deref(),
+            shown(&old).as_deref()
+        ));
+
+        // 半态脏数据防御：销账落 shown 时残留 pending="true"（双写非原子）→ 不弹
+        assert!(!codex_notice_should_show(Some("true"), Some("true")));
+        // 判定纯函数边界：shown 缺省/"false" 都算未销账（防半态脏数据卡死提醒）
         assert!(codex_notice_should_enqueue(None));
         assert!(codex_notice_should_enqueue(Some("false")));
         assert!(!codex_notice_should_enqueue(Some("true")));
+    }
+
+    /// 1A 未注册原因判定：kimi 且未注册且 helper 探测不到 → "helperNotShipped"
+    /// （macOS 发布包不随附 helper 的设计内状态）；其余组合 → None——kimi 未注册
+    /// 但 helper 在场是注册失败（用户需排查）而非分发缺口；已注册行/非 kimi 不带原因
+    #[test]
+    fn unregistered_reason_only_for_kimi_without_helper() {
+        assert_eq!(
+            unregistered_reason_for("kimi", false, false).as_deref(),
+            Some(UNREGISTERED_REASON_HELPER_NOT_SHIPPED)
+        );
+        assert_eq!(
+            unregistered_reason_for("kimi", false, true),
+            None,
+            "helper 在场的未注册是注册失败，不是分发缺口"
+        );
+        assert_eq!(
+            unregistered_reason_for("kimi", true, false),
+            None,
+            "已注册行不带原因"
+        );
+        assert_eq!(
+            unregistered_reason_for("codex", false, false),
+            None,
+            "其余工具未注册不带原因（值域本批仅 kimi 分支）"
+        );
     }
 }

@@ -20,6 +20,9 @@ type ToolSignalHealth = {
   registered: boolean;
   hasActiveSessions: boolean;
   lastEventAt: string | null;
+  // 1A 未注册原因（值域见后端 ToolSignalHealth 注释；本批仅 "helperNotShipped"）。
+  // 可选防御：mock/旧后端不带该字段，按 undefined = 普通未注册处理
+  unregisteredReason?: string | null;
 };
 
 export function SignalHealthSection() {
@@ -114,10 +117,18 @@ export function SignalHealthSection() {
                   <ToolIcon toolId={h.toolId} size={16} />
                   <span className={SETTINGS_FIELD}>{h.label}</span>
                   {!h.registered ? (
-                    // 灰：未注册
-                    <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10px]">
-                      {t("settings.signalHealth.statusUnregistered")}
-                    </span>
+                    // 灰：未注册。1A 细分：helperNotShipped = 本平台不随附 Hook 通道的
+                    // 设计内状态（如 macOS 上的 kimi）→ 蓝 badge 解释性文案替代裸
+                    // 「未注册」，用户无需任何处理；其余维持裸「未注册」待用户排查
+                    h.unregisteredReason === "helperNotShipped" ? (
+                      <span className="rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] text-blue-600 dark:text-blue-400">
+                        {t("settings.signalHealth.helperNotShipped")}
+                      </span>
+                    ) : (
+                      <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10px]">
+                        {t("settings.signalHealth.statusUnregistered")}
+                      </span>
+                    )
                   ) : h.lastEventAt ? (
                     // 绿：正常 · 最近事件 xx 前
                     <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-500">

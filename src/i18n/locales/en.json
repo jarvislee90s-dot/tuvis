@@ -48,7 +48,16 @@
     "clearAllConfirm": "Confirm clear?",
     "clearRead": "Clear read",
     "clearedToast": "Notification history cleared",
-    "readClearedToast": "Read notifications cleared"
+    "readClearedToast": "Read notifications cleared",
+    "codexTrust": {
+      "title": "Codex hooks need trust",
+      "description": "Run the command below in the Codex terminal and trust the Tuvis entry (one time) for hook events to fire.",
+      "copy": "Copy command",
+      "never": "Don't remind again",
+      "copyFailed": "Copy failed — please type the command above manually",
+      "ackFailed": "Action failed, please retry",
+      "close": "Close (reminded again on next launch)"
+    }
   },
   "tray": {
     "show": "Show Window",
@@ -419,6 +428,7 @@
       "empty": "No tools with hook channels",
       "loadError": "Failed to load signal health, please refresh",
       "statusUnregistered": "Not registered",
+      "helperNotShipped": "Hook channel not shipped on this platform — no action needed",
       "ok": "OK · last event {{ago}}",
       "noActiveSessions": "No active sessions, waiting for events",
       "trustNeeded": "Enter /hooks in the {{tool}} terminal and trust the Tuvis entry (one-time)",
