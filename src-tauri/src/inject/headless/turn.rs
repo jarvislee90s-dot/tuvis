@@ -122,22 +122,48 @@ pub fn spawn_shape(exe: &str, os: &str) -> SpawnShape {
 /// **cmd 不认**⇒ 含这些字符的用户正文可能被**截断/改写/串联执行**。
 pub const CMD_SHIM_METACHARS: &[char] = &['&', '|', '^', '<', '>', '"', '%'];
 
-/// **正文 + 已解析 spawn 形态 ⇒ 放行 / 拒绝**（单一决策点；`Some(reason)` = 拒发）。
+/// 被判元字符的**分段身份**（评审 I8 文案诚实化）：字符表与判定只有一条
+/// （[`cmd_shim_refusal`]），但文案必须**点名实际命中的那一段**——项目路径命中时说
+/// 「正文含 cmd 元字符」是**错报对象**（用户会去改正文，而真凶是项目路径，改多少遍都没用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdShimSubject {
+    /// 用户正文（R3 正文面）
+    Body,
+    /// 项目路径（`-C` 的取值；评审 I8 项目路径面）
+    ProjectPath,
+    /// argv 里其余载荷分段（逐段判据的兜底面——不是正文也不是项目路径的那一段）
+    ArgvSegment,
+}
+
+impl CmdShimSubject {
+    /// 文案里的主语（**单一词表**：调用方不得自拼）
+    pub fn label(self) -> &'static str {
+        match self {
+            CmdShimSubject::Body => "正文",
+            CmdShimSubject::ProjectPath => "项目路径（-C 取值）",
+            CmdShimSubject::ArgvSegment => "命令行分段",
+        }
+    }
+}
+
+/// **载荷分段 + 已解析 spawn 形态 ⇒ 放行 / 拒绝**（单一决策点；`Some(reason)` = 拒发）。
 ///
-/// 只有「正文进 argv」且「形态经 `cmd` 垫片」两条同时成立才判——故：
+/// 只有「该分段进 argv」且「形态经 `cmd` 垫片」两条同时成立才判——故：
 /// - **`.exe` 直装**（形态不是 `cmd /c`）⇒ 放行（CRT 引号规则与 CreateProcess 一致，无重解析面）；
-/// - **正文走 stdin 的通道**（claude：`--input-format stream-json`）⇒ `body_travels_in_argv = false`
+/// - **正文走 stdin 的通道**（claude：`--input-format stream-json`）⇒ `in_argv = false`
 ///   ⇒ 放行（正文根本不经过命令行，垫片重解析面不存在——**别顺手把它也拒了**）。
 ///
-/// `text` 必须是**用户正文**（不含我们追加的 `[mobile <花名>]` 签名——签名是我们自己拼的，
-/// 不该由用户的正文判据代为背书）。判据是**纯函数**：零 I/O、零进程，故可单测；
-/// 调用点的纪律见 `remote::api` 的两处分派（拒绝 = `refused`，未起跑、零字节投递）。
-pub fn cmd_shim_body_refusal(
+/// `text` 必须是**用户可控的那一段原文**（不含我们追加的 `[mobile <花名>]` 签名——签名是
+/// 我们自己拼的，不该由用户的判据代为背书）。判据是**纯函数**：零 I/O、零进程，故可单测；
+/// 调用点的纪律见 `remote::api` 的分派点与 `codex::argv_shim_refusal`（拒绝 = `refused`，
+/// 未起跑、零字节投递）。
+pub fn cmd_shim_refusal(
+    subject: CmdShimSubject,
     text: &str,
     shape: &SpawnShape,
-    body_travels_in_argv: bool,
+    in_argv: bool,
 ) -> Option<String> {
-    if !body_travels_in_argv || !shape.via_cmd_shim() {
+    if !in_argv || !shape.via_cmd_shim() {
         return None;
     }
     let hit: Vec<String> = CMD_SHIM_METACHARS
@@ -149,14 +175,25 @@ pub fn cmd_shim_body_refusal(
         return None;
     }
     // 文案风格同斜杠命令拒绝（spec H7 / remote::api）：**显式告知**为什么 + 怎么办，
-    // 绝不静默改写正文（改写了用户就不知道 CLI 实际收到了什么）
+    // 绝不静默改写载荷（改写了用户就不知道 CLI 实际收到了什么）
     Some(format!(
-        "正文含 cmd 元字符（{}）：本机 CLI 是 npm 垫片（.cmd/.bat，经 `cmd /c` 启动），\
+        "{subject}含 cmd 元字符（{hits}）：本机 CLI 是 npm 垫片（.cmd/.bat，经 `cmd /c` 启动），\
          cmd 会重解析整条命令行（串联/重定向/转义/变量展开，引号配对规则也与 CRT 不同）——\
-         正文可能被截断、改写或串联执行。本条**未投递**（零字节投递）：请改用直装 CLI（.exe）\
+         {subject}可能被截断、改写或串联执行。本条**未投递**（零字节投递）：请改用直装 CLI（.exe）\
          或去掉这些字符后重发",
-        hit.join(" ")
+        subject = subject.label(),
+        hits = hit.join(" ")
     ))
+}
+
+/// 正文面的薄壳（等价于 [`cmd_shim_refusal`] 取 [`CmdShimSubject::Body`]）：既有调用点
+/// （`remote::api` 的 codex/cli 正文门）语义与文案**逐字未变**，故不需要跟着改签名。
+pub fn cmd_shim_body_refusal(
+    text: &str,
+    shape: &SpawnShape,
+    body_travels_in_argv: bool,
+) -> Option<String> {
+    cmd_shim_refusal(CmdShimSubject::Body, text, shape, body_travels_in_argv)
 }
 
 // ============================================================
@@ -753,6 +790,49 @@ mod tests {
         // `.bat` 同判（两种批处理后缀都是 cmd 垫片）
         let bat = spawn_shape(r"C:\npm\codex.bat", "windows");
         assert!(cmd_shim_body_refusal("a & b", &bat, true).is_some());
+    }
+
+    /// **评审 I8 追补：文案必须点名实际命中的那一段**——判定同一条，主语按分段身份取
+    /// （`CmdShimSubject::label` 单一词表）。项目路径命中时说「正文含…」是**错报对象**：
+    /// 用户会去改正文，而真凶在项目路径上，改多少遍都没用。
+    ///
+    /// 变异验证：让 `cmd_shim_refusal` 忽略 `subject` 恒用「正文」→ 本用例第二条断言红。
+    #[test]
+    fn cmd_shim_refusal_names_the_actual_offending_segment() {
+        let shim = spawn_shape(r"C:\npm\codex.cmd", "windows");
+        let body =
+            cmd_shim_refusal(CmdShimSubject::Body, "a & b", &shim, true).expect("正文命中必拒");
+        assert!(body.starts_with("正文含 cmd 元字符"), "{body}");
+        let path = cmd_shim_refusal(CmdShimSubject::ProjectPath, "E:/A&B", &shim, true)
+            .expect("项目路径命中必拒");
+        assert!(
+            path.starts_with("项目路径（-C 取值）含 cmd 元字符"),
+            "{path}"
+        );
+        let seg = cmd_shim_refusal(CmdShimSubject::ArgvSegment, "hi %PATH%", &shim, true)
+            .expect("argv 分段命中必拒");
+        assert!(seg.starts_with("命令行分段含 cmd 元字符"), "{seg}");
+        // 三个主语各自只出现自己那一段（词表单点，不串味）
+        for (reason, mine, others) in [
+            (&body, "正文", ["项目路径", "命令行分段"]),
+            (&path, "项目路径", ["正文含", "命令行分段"]),
+            (&seg, "命令行分段", ["正文含", "项目路径"]),
+        ] {
+            assert!(reason.contains(mine), "{reason}");
+            for o in others {
+                assert!(!reason.contains(o), "不得串到别段（{o}）: {reason}");
+            }
+        }
+        // 判定门与主语无关：形态不成立/不进 argv ⇒ 三个主语都放行
+        for subject in [
+            CmdShimSubject::Body,
+            CmdShimSubject::ProjectPath,
+            CmdShimSubject::ArgvSegment,
+        ] {
+            assert_eq!(cmd_shim_refusal(subject, "a & b", &shim, false), None);
+            let direct = spawn_shape("C:/bin/codex.exe", "windows");
+            assert_eq!(cmd_shim_refusal(subject, "a & b", &direct, true), None);
+        }
     }
 
     /// 票面第二条：**垫片 + 普通正文 ⇒ 放行**（判据不得扩大成「垫片一律拒」）。

@@ -58,24 +58,44 @@
 //! 批处理，裸名直 spawn 必失败 ⇒ [`spawn_shape`] 对其走 `cmd /c <垫片>`（与仓库既有
 //! `inject::approve` / `monitor::hooks` 的灰1 双路同口径）。
 //!
-//! **登记的完整风险（Task 9 复审，未实机验证）**：`cmd` 会**重解析整条命令行**——不只
-//! `%VAR%`（未定义变量原样保留）：`"` 的配对规则、`&` `|` `^` `<` `>` 的重定向/串联语义都
-//! 按 cmd 的口径解析，而 Rust 传参用的是 CRT 的 `\"` 转义风格（与 cmd 不同）⇒ **含这些
-//! 字符的用户正文在垫片路径上可能被截断/改写/串联执行**。边界：仅当解析出的 CLI 是
-//! `.cmd`/`.bat` 时走此路（[`spawn_shape`]）。
+//! **cmd 重解析面（三面收口；Windows 垫片真机行为仍未实机验证）**：`cmd` 会**重解析整条
+//! 命令行**——不只 `%VAR%`（未定义变量原样保留）：`"` 的配对规则、`&` `|` `^` `<` `>`
+//! 的重定向/串联语义都按 cmd 的口径解析，而 Rust 传参用的是 CRT 的 `\"` 转义风格（与
+//! cmd 不同）⇒ **含这些字符的命令行分段在垫片路径上可能被截断/改写/串联执行**。边界：
+//! 仅当解析出的 CLI 是 `.cmd`/`.bat` 时走此路（[`spawn_shape`]）——`.exe` 直连不过 cmd。
 //! 缓解 = [`codex_in_path`] 的 `.exe` 优先——但该优先序**只在同一目录内生效**（PATH 顺序
 //! 仍先于扩展名优先），故本机这种「PATH 上只有 npm 垫片」的安装**正在走垫片路径**。
-//! 结论（**R3 复审升级**）：该形态原先只「登记为已知限制」，现升级为**投递前拒绝**——
-//! [`super::turn::cmd_shim_body_refusal`]（正文 + 已解析形态 ⇒ 放行/拒绝，通道无关单点）
-//! 在两处分派点（本通道 + `cli_three` 的 kimi/opencode 臂）拒绝含元字符的正文，回执档 =
-//! `Stage::Refused`（未起跑、零字节投递，文案风格同斜杠命令拒绝）。`.exe` 直装不受影响。
-//! **签名面已收口（裁决 24b，收尾轮）**：R3 当时只判**用户正文**——我们追加的
-//! `[mobile <花名>]` 签名不在判据内，故花名含 `&`/`%` 时该签名仍可能被 cmd 重解析（本条当时
-//! **如实登记为残留**）。收尾轮按当时写下的收口方向落地：花名走**白名单**
-//! [`super::turn::device_name_refusal`]（Unicode 字母数字 + 空格 `-` `_` `.` `·`），判据落在
-//! **共享组装单点** [`crate::inject::normalize::compose_injection`]（拼签名前 fail closed，
-//! 回执档同样 `refused`）+ 设备名注册点（`remote::api::persist_and_cookie`，拒登记）。
-//! **残留已关**（不再是敞口）：本通道的签名由 compose 单点产出，无第二条拼签名路径。
+//!
+//! 逐面收口（**每面一个判据单点；都是投递前拒绝、零字节投递、文案同源**）：
+//! - **正文面（R3 复审升级）**：原先只「登记为已知限制」，R3 升级为**投递前拒绝**——
+//!   [`super::turn::cmd_shim_body_refusal`]（正文 + 已解析形态 ⇒ 放行/拒绝，通道无关单点）
+//!   在两处分派点（本通道 + `cli_three` 的 kimi/opencode 臂）拒绝含元字符的正文，回执档 =
+//!   `Stage::Refused`（未起跑、零字节投递，文案风格同斜杠命令拒绝）。`.exe` 直装不受影响。
+//! - **花名面（裁决 24b，收尾轮）**：R3 当时只判**用户正文**——我们追加的
+//!   `[mobile <花名>]` 签名不在判据内，故花名含 `&`/`%` 时该签名仍可能被 cmd 重解析（当时
+//!   **如实登记为残留**）。收尾轮按当时写下的收口方向落地：花名走**白名单**
+//!   [`super::turn::device_name_refusal`]（Unicode 字母数字 + 空格 `-` `_` `.` `·`），判据
+//!   落在**共享组装单点** [`crate::inject::normalize::compose_injection`]（拼签名前 fail
+//!   closed，回执档同样 `refused`）+ 设备名注册点（`remote::api::persist_and_cookie`，
+//!   拒登记）。本通道的签名由 compose 单点产出，无第二条拼签名路径。
+//! - **项目路径面（评审 I8，本轮）**：exec 兜底路的 [`exec_resume_argv`] 把
+//!   `-C <项目路径>`（会话 `project_path`，用户可控）放进 argv，而正文面/花名面**都只判
+//!   自己那一段** ⇒ 项目路径含 `&`/`%`/`^`/`"` 时整条命令行照样被 cmd 重解析（与两面
+//!   **同族**的敞口）。判据 = [`argv_shim_refusal`]（**逐段**委托正文面同一个函数 ⇒ 同源
+//!   字符表、**逐字相同**的文案），执行臂 = [`attempt`]——**spawn 前唯一咽喉**（exec 臂 /
+//!   queue 臂 / exec→queue 改道臂全经此处），命中即 `Receipt::failed(Stage::Refused, …)`：
+//!   在 `make_runner` **之前**返回 ⇒ 零回合配置、零进程、零并发名额占用。argv 全由
+//!   [`dispatch`]（[`Plan::argv`]）产出，无第二条拼 argv 路径。
+//!
+//! **如实登记的边界（都不是「未收口」，逐条写清免得后人误读成敞口）**：
+//! ① 项目路径面在**回合任务内**判：端点分派点的 `shape` 只与 `plan` 同场于该分派点，
+//!    单文件内以**同一个** [`spawn_shape`] + **同一个** [`production_exe`] 复算形态
+//!    （不是第二份「是不是垫片」判据），故它**晚于同请求内的版本探针一步**——探针不投递
+//!    任何载荷分段、不占回合名额，「零字节投递」与回执档（`refused`）都不变；
+//! ② `shape.prefix`（`cmd /c <垫片路径>`：垫片安装路径来自 PATH 解析、**不是用户数据**）
+//!    不在本判据面内——本面只收口「进 argv 的载荷分段」；
+//! ③ Windows npm 垫片的**真机行为**仍未实机验证（义务归 H11/M11 实机批次）：本面是「按
+//!    cmd 解析规则**前移到投递前拒绝**」，不是对 cmd 行为的实机取证。
 //!
 //! # 测试纪律（宪法级）
 //! 单测**绝不** spawn 真 codex（真实账号配额 + 真实 `~/.codex` 读写）：CLI 发现、rollout 定位、
@@ -353,7 +373,7 @@ fn queue_argv(thread: &str, message: &str) -> Vec<String> {
         "queue".to_string(),
         "--thread".to_string(),
         thread.to_string(),
-        "--message".to_string(),
+        CODEX_MESSAGE_FLAG.to_string(),
         message.to_string(),
     ]
 }
@@ -383,7 +403,7 @@ fn exec_resume_argv(
 ) -> Vec<String> {
     let mut argv = vec![
         CODEX_PROGRAM.to_string(),
-        "-C".to_string(),
+        CODEX_PROJECT_FLAG.to_string(),
         normalize_project_path(project),
         "exec".to_string(),
         "resume".to_string(),
@@ -637,6 +657,104 @@ pub fn codex_in_path(path_env: &str, os: &str) -> Option<String> {
     super::turn::cli_in_path("codex", path_env, os)
 }
 
+// ------------------------------------------------------------
+// 进 argv 的载荷分段 × cmd 垫片拒绝（**项目路径面收口**，评审 I8）
+// ------------------------------------------------------------
+
+/// **进 argv 的载荷分段 + 已解析 spawn 形态 ⇒ 放行 / 拒绝**（单一决策点；`Some(reason)` =
+/// 拒发）。**逐段委托** [`super::turn::cmd_shim_body_refusal`]——同源字符表
+/// （[`super::turn::CMD_SHIM_METACHARS`]）、同源形态门（[`SpawnShape::via_cmd_shim`]）、
+/// **逐字相同**的文案（不另抄一份字符表，也不另写第二套措辞）。
+///
+/// # 为什么需要（评审 I8：`-C <项目路径>` 曾绕过既有拒绝面）
+/// 正文面（R3）与花名面（裁决 24b）**都只判自己那一段**，而 `cmd /c` 重解析的是**整条
+/// 命令行**：exec 兜底路的 [`exec_resume_argv`] 把 `-C` 的取值 = 会话项目路径
+/// （`~/.codex` state 库 `threads.cwd` ⇒ **用户可控**）拼进 argv，含 `&` / `%` / `^` / `"`
+/// 时与正文/花名**同族**地被截断/改写/串联执行。本函数即该面的收口处。
+///
+/// # 判据面（`argv[0]` **之外**逐段全判）
+/// `argv[0]` **不判**：它是 [`CODEX_PROGRAM`] 程序名词表项（我们自己给的字面量，不是用户
+/// 数据）；其余分段**全判** ⇒ `-C` 的取值（本条目正主）、thread UUID、`-c` 策略旗子、
+/// 最终载荷都在判据面内，将来 argv 增段也自动落进来（用例从**真组装器**取 argv，形态一改
+/// 就一起红）。
+///
+/// # 文案（**同一个函数的原话**，不另起措辞——按「同款文案」的字面要求）
+/// 命中时返回的就是正文面那句原话：字符点名 +「cmd 会重解析整条命令行」的原因 +
+/// 「本条**未投递**（零字节投递）」+ 补救建议四段全在。**如实登记**：该句主语写的是
+/// 「正文」（它是正文面的单点文案）——本面按「别另写一套措辞」原样复用，故项目路径命中时
+/// 读到的也是这句话；要按分段改名须把文案参数化（在 [`super::turn`] 内，属另一文件）。
+///
+/// # 纯核
+/// 入参 = 形态 + argv，零 I/O、零进程 ⇒ 可脱离真实进程单测（见 tests 的
+/// `argv_shim_refusal_*`：形态取自 [`spawn_shape`] 的真实产物、argv 取自 [`dispatch`]
+/// 的真实产物，不手抄字面量）。
+///
+/// # 边界（见模块头「如实登记的边界」）
+/// `shape.prefix`（垫片安装路径，来自 PATH 解析、不是用户数据）不在判据面内。
+/// 项目路径旗子（`-C`，**单一来源**：argv 构造器与本函数的「段身份」判据同用一份，
+/// 免得两处各写一个字面量而漂移）
+pub const CODEX_PROJECT_FLAG: &str = "-C";
+
+/// 正文旗子（`--message`，queue 形态；**单一来源**：[`queue_argv`] 构造器与
+/// [`segment_subject`] 的正文段判据同用一份——同 [`CODEX_PROJECT_FLAG`] 的纪律）
+pub const CODEX_MESSAGE_FLAG: &str = "--message";
+
+/// argv 分段的**身份判据**（评审 N2：主语标注的原料，纯函数）：按旗子的**真实位置**推，
+/// 不按「前一段恰为 [`CODEX_PROJECT_FLAG`] 字面量」推——正文可以是任意字面量（含恰为
+/// `"-C"`），旧的「前一段」启发式会把正文 `"-C"` 的后邻段（如 `--skip-git-repo-check`）
+/// 误标成「项目路径（-C 取值）」。
+///
+/// - **项目路径段** = `-C` 旗子的取值：真旗子恒在 **argv[1]**（exec 形态全局前置，由
+///   [`exec_resume_argv`] 唯一构造器钉死、测试钉下标）⇒ 取值恒为 argv[2] 的**位置契约**。
+///   正文段（queue 的 [`CODEX_MESSAGE_FLAG`] 取值 / exec 的 PROMPT 位置参数）都到不了
+///   argv[1]，位置即把「正文伪造 `-C` 旗子」的面关死——等价于「显式定位正文段后排除」，
+///   且更简单（无需在判据里枚举正文段的全部形态）。
+/// - **正文段及其余分段**：主语按既有口径走兜底面 [`super::turn::CmdShimSubject::ArgvSegment`]
+///   ——正文面已有专门之门与「正文」文案（`cmd_shim_body_refusal`，I8 承诺逐字未变），
+///   本判据所在的 [`argv_shim_refusal`] 是**纵深防御**，不是第二判据（既有用例语义不动）。
+fn segment_subject(argv: &[String], i: usize) -> super::turn::CmdShimSubject {
+    if i == 2 && argv[1].as_str() == CODEX_PROJECT_FLAG {
+        return super::turn::CmdShimSubject::ProjectPath;
+    }
+    super::turn::CmdShimSubject::ArgvSegment
+}
+
+pub fn argv_shim_refusal(shape: &SpawnShape, argv: &[String]) -> Option<String> {
+    // 逐段判，**按段身份出文案**（评审 I8 文案诚实化）：`-C` 的取值是**项目路径**，
+    // 其余载荷分段是泛指的「命令行分段」。旧写法一律按「正文」出文案——项目路径命中时
+    // 用户会去改正文，而真凶在项目路径上，改多少遍都没用（错报对象 = 不诚实）。
+    // 段身份判据 = [`segment_subject`]（评审 N2：位置契约，不被正文 "-C" 伪造）。
+    let mut i = 1;
+    while i < argv.len() {
+        if let Some(reason) =
+            super::turn::cmd_shim_refusal(segment_subject(argv, i), &argv[i], shape, true)
+        {
+            return Some(reason);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 本回合 spawn 形态（**复算，不是第二判据**）：同一个 CLI 发现出口 [`production_exe`] +
+/// 同一个构造点 [`spawn_shape`]。生产下与端点分派点（`remote::api` 的 `5a` 步）解析出的
+/// 形态逐字段一致（同 PATH、同 `std::env::consts::OS`）——「是不是垫片」的判据仍只有
+/// [`SpawnShape::via_cmd_shim`] 一份。
+///
+/// `None` = CLI 不可达 ⇒ **不判**（端点侧对不可达早按 `Stage::Spawn` 如实拒绝，本函数的
+/// 调用点在生产上到不了；此处 fail-open 不漏投递：没有 exe 就没有 spawn）。
+///
+/// `cfg(test)` 面可经 [`test_hooks::shape`] 注入形态：`spawn_shape` 只在 `windows` +
+/// `.cmd`/`.bat` 上产出垫片形态，注入面让「垫片形态的**执行臂**」（不只是纯判据）在任何
+/// 平台都能被用例钉住。
+fn current_spawn_shape() -> Option<SpawnShape> {
+    #[cfg(test)]
+    if let Some(s) = test_hooks::shape() {
+        return Some(s);
+    }
+    production_exe().map(|exe| spawn_shape(&exe, std::env::consts::OS))
+}
+
 /// 回合配置工厂（端点侧闭包：经 [`super::runner_from_conn`] 取设置超时/全局名额，再按
 /// [`SpawnShape`] 与计划 argv 组装 `RunnerCfg`；测试 = 记录型桩 + Task 6 脚本缝）
 pub type MakeRunner<'a> = dyn Fn(&Plan) -> RunnerCfg + Send + Sync + 'a;
@@ -750,7 +868,21 @@ struct Attempt {
 /// [`super::runner_from_conn`]，超时/并发按设置）→ 逐尝试更新取消靶子 → 执行。
 /// 取消靶子走 Task 8 建立的**进程级登记表**（按会话号索引、与通道无关）——取消端点只认
 /// 这一份，codex 复用同一表，否则移动端取消钮对 codex 回合是哑的
+///
+/// **⓪ 进 argv 载荷分段的 cmd 垫片拒绝（评审 I8；判据 = [`argv_shim_refusal`]）**：本函数
+/// 是**唯一的 spawn 前咽喉**（exec 臂、queue 臂、exec→queue 改道臂全经此处），故判据不会
+/// 漏掉任何一条实际投递路径。命中即 `Stage::Refused`（与正文面/花名面**同档同文案**：
+/// 未起跑、零字节投递），且在 `make_runner` **之前**返回 ⇒ 零回合配置、零进程、零名额。
 async fn attempt(sid: &str, plan: &Plan, make_runner: &MakeRunner<'_>, run: &RunSeam) -> Attempt {
+    if let Some(shape) = current_spawn_shape() {
+        if let Some(reason) = argv_shim_refusal(&shape, plan.argv()) {
+            return Attempt {
+                receipt: Receipt::failed(Stage::Refused, &reason).with_session(sid),
+                stdout: Vec::new(),
+                stderr: String::new(),
+            };
+        }
+    }
     let cfg = make_runner(plan);
     let handle = cfg.cancel_handle();
     registry().arm(sid, Arc::new(move || handle.cancel()));
@@ -1342,6 +1474,11 @@ pub mod test_hooks {
         std::sync::LazyLock::new(|| Mutex::new(None));
     static SCRIPT: std::sync::LazyLock<Mutex<VecDeque<TurnObs>>> =
         std::sync::LazyLock::new(|| Mutex::new(VecDeque::new()));
+    /// spawn 形态缝（**评审 I8**）：默认 None = 按 [`production_exe`] + OS 真算。`spawn_shape`
+    /// 只在 `windows` + `.cmd`/`.bat` 上产出垫片形态，此缝让「垫片形态的**执行臂**」在任何
+    /// 平台都能被用例钉住（纯判据面本来就不依赖平台）。
+    static SHAPE: std::sync::LazyLock<Mutex<Option<SpawnShape>>> =
+        std::sync::LazyLock::new(|| Mutex::new(None));
 
     /// 装填钩子（**调用方必须已持 [`LOCK`]**）
     pub(crate) fn set(cli: Option<&str>, probe_pass: bool, script: Vec<TurnObs>) {
@@ -1360,6 +1497,17 @@ pub mod test_hooks {
         *PROBE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *PROBE_ROUND.lock().unwrap_or_else(|e| e.into_inner()) = None;
         SCRIPT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *SHAPE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 装填 spawn 形态缝（**调用方必须已持 [`LOCK`]**；None = 恢复按 CLI 发现 + OS 真算）
+    pub(crate) fn set_shape(shape: Option<SpawnShape>) {
+        *SHAPE.lock().unwrap_or_else(|e| e.into_inner()) = shape;
+    }
+
+    /// 取 spawn 形态缝（None = 无注入，真算）
+    pub(crate) fn shape() -> Option<SpawnShape> {
+        SHAPE.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 装填真探针执行体缝（**调用方必须已持 [`LOCK`]**；None = 清除，恢复真 spawn）
@@ -1600,6 +1748,167 @@ mod tests {
         );
         assert_eq!(normalize_project_path("/tmp/p"), "/tmp/p");
         assert_eq!(normalize_project_path("E:/t2"), "E:/t2");
+    }
+
+    // ===== 项目路径面：进 argv 的载荷分段 × cmd 垫片（评审 I8，纯核） =====
+
+    /// 垫片形态的真实产物（[`spawn_shape`] 单点）——不手抄「垫片」字面量，形态判据只有一份
+    fn shim_fixture() -> SpawnShape {
+        let s = spawn_shape(r"C:\Users\u\AppData\Roaming\npm\codex.cmd", "windows");
+        assert!(
+            s.via_cmd_shim(),
+            "夹具前提：windows + .cmd 必须产出垫片形态"
+        );
+        s
+    }
+
+    /// 直连 exe 的真实产物（对照：不过 cmd，CRT 与 CreateProcess 同规则 ⇒ 无重解析面）
+    fn direct_fixture() -> SpawnShape {
+        let s = spawn_shape("C:/bin/codex.exe", "windows");
+        assert!(!s.via_cmd_shim(), "夹具前提：.exe 必须是直 spawn 形态");
+        s
+    }
+
+    /// **评审 I8**：垫片形态 + `-C` 取值含元字符 ⇒ 拒。argv 取自**真组装器**
+    /// [`dispatch`]（不手抄字面量——将来 argv 形态一变，`-C` 取值断言先红）；
+    /// 文案与正文面**逐字相同**（同源判定：同一个函数、同一份字符表）。
+    #[test]
+    fn shim_shape_refuses_metachar_project_path_in_the_real_argv() {
+        let dirty = r"C:\work\A&B%TEMP%";
+        let plan = dispatch(AppPresence::Closed, UUID, dirty, "hi [mobile iPad]");
+        let argv = plan.argv();
+        assert_eq!(argv[2], dirty, "前提：`-C` 的取值就是项目路径（真组装器）");
+        let shim = shim_fixture();
+        let reason = argv_shim_refusal(&shim, argv).expect("垫片 + 含元字符的 -C 必须拒");
+        assert_eq!(
+            Some(&reason),
+            crate::inject::headless::turn::cmd_shim_refusal(
+                crate::inject::headless::turn::CmdShimSubject::ProjectPath,
+                dirty,
+                &shim,
+                true,
+            )
+            .as_ref(),
+            "项目路径面的判定与文案必须与判据单点同源（不另写第二套措辞）"
+        );
+        // **文案诚实化（评审 I8 追补）**：必须点名**项目路径**这一段——说「正文含…」
+        // 是错报对象（用户会去改正文，而真凶在项目路径上，改多少遍都没用）
+        assert!(
+            reason.contains("项目路径（-C 取值）含 cmd 元字符"),
+            "必须点名实际命中的那一段：{reason}"
+        );
+        assert!(
+            !reason.contains("正文含 cmd 元字符"),
+            "不得把项目路径的命中说成正文命中（错报对象）：{reason}"
+        );
+        for c in ['&', '%'] {
+            assert!(
+                reason.contains(c),
+                "拒绝原因必须点名具体元字符 {c}：{reason}"
+            );
+        }
+        assert!(reason.contains("cmd"), "必须说清是 cmd 重解析面：{reason}");
+        assert!(reason.contains("未投递"), "必须声明零字节投递：{reason}");
+    }
+
+    /// 对照：**非垫片形态**（直连 exe）下同一条含元字符的项目路径必须**照旧放行**
+    /// ——CRT 引号/转义规则与 CreateProcess 一致，没有 cmd 重解析面，不得误拒。
+    #[test]
+    fn direct_exe_shape_allows_the_same_metachar_project_path() {
+        let dirty = r"C:\work\A&B%TEMP%";
+        let plan = dispatch(AppPresence::Closed, UUID, dirty, "hi [mobile iPad]");
+        assert_eq!(
+            argv_shim_refusal(&direct_fixture(), plan.argv()),
+            None,
+            "直连 exe 不过 cmd：含 `&`/`%` 的项目路径必须照旧放行"
+        );
+        assert_eq!(
+            argv_shim_refusal(&spawn_shape("codex", "macos"), plan.argv()),
+            None,
+            "非 Windows 形态同样不过 cmd"
+        );
+    }
+
+    /// 垫片形态 + **干净路径** ⇒ 放行；且判据面是**全部载荷分段**（不只 `-C`）：
+    /// queue 形态的 `--message` 取值同样在面内（正文面的**纵深防御**，不是第二判据——
+    /// 判定委托同一个函数）。
+    #[test]
+    fn shim_shape_allows_clean_plan_but_judges_every_payload_segment() {
+        let shim = shim_fixture();
+        let clean = dispatch(AppPresence::Closed, UUID, "E:/t2", "hi [mobile iPad]");
+        assert_eq!(
+            argv_shim_refusal(&shim, clean.argv()),
+            None,
+            "干净项目路径 + 干净载荷在垫片形态下必须放行"
+        );
+        let queue = dispatch(AppPresence::Open, UUID, "E:/t2", "hi & whoami %PATH%");
+        assert!(
+            argv_shim_refusal(&shim, queue.argv()).is_some(),
+            "判据面 = argv[1..] 全段：queue 的 --message 取值也在内（纵深防御）"
+        );
+        assert_eq!(
+            argv_shim_refusal(&shim, queue.argv()),
+            crate::inject::headless::turn::cmd_shim_refusal(
+                crate::inject::headless::turn::CmdShimSubject::ArgvSegment,
+                "hi & whoami %PATH%",
+                &shim,
+                true,
+            ),
+            "逐段委托 ⇒ 与判据单点同源同文案（这一段不是 `-C` 取值 ⇒ 泛指「命令行分段」）"
+        );
+    }
+
+    /// **评审 N2**：主语判据不得被「正文恰为字面量 `"-C"`」伪造——旧的「前一段是不是
+    /// `-C`」启发式会把正文 `"-C"` 的后邻段（`--skip-git-repo-check`）误标成
+    /// 「项目路径（-C 取值）」。argv 取自**真组装器** [`dispatch`]；主语判据的原料
+    /// [`segment_subject`] 是纯函数，直接钉死（真实 argv 里后邻段无元字符 ⇒ 误标无可见
+    /// 文案，红绿面钉在判据本身）。行为级对照：正文 `"-C"` 自身无元字符 ⇒ 本场景整体
+    /// 放行（按真实判据断言，不造不存在的拒绝）。
+    #[test]
+    fn argv_subject_not_spoofed_by_literal_dash_c_body() {
+        use crate::inject::headless::turn::CmdShimSubject;
+        // exec 形态：正文（PROMPT 位置参数）恰为字面量 "-C"，项目路径干净
+        let plan = dispatch(AppPresence::Closed, UUID, "E:/t2", "-C");
+        let argv = plan.argv();
+        let skip_at = argv
+            .iter()
+            .position(|a| a == SKIP_GIT_REPO_CHECK)
+            .expect("真组装器：收尾旗子必在");
+        assert_eq!(
+            argv[skip_at - 1],
+            "-C",
+            "夹具前提：正文 '-C' 紧邻收尾旗子（正是旧启发式的误标对象）"
+        );
+        assert_eq!(
+            segment_subject(argv, skip_at),
+            CmdShimSubject::ArgvSegment,
+            "正文 '-C' 不是旗子：其后邻段不得被误标为项目路径（评审 N2 主红面）"
+        );
+        assert_eq!(
+            segment_subject(argv, 2),
+            CmdShimSubject::ProjectPath,
+            "位置契约不漏判：argv[1] 是构造器钉死的 '-C' 旗子 ⇒ argv[2] 仍正确标项目路径"
+        );
+        // 行为级对照：本场景（正文 "-C" 无元字符、项目路径干净）整体放行
+        assert_eq!(
+            argv_shim_refusal(&shim_fixture(), argv),
+            None,
+            "正文 '-C' 自身无元字符 ⇒ 无拒绝面，照实放行（不造不存在的拒绝）"
+        );
+        // queue 形态：正文段（`--message` 取值）主语照旧走兜底面（正文门另有专门文案）
+        let queue = dispatch(AppPresence::Open, UUID, "E:/t2", "-C");
+        let qargv = queue.argv();
+        let msg_at = qargv
+            .iter()
+            .position(|a| a == CODEX_MESSAGE_FLAG)
+            .expect("真组装器：--message 必在")
+            + 1;
+        assert_eq!(qargv[msg_at], "-C", "夹具前提：queue 正文也是 '-C'");
+        assert_eq!(
+            segment_subject(qargv, msg_at),
+            CmdShimSubject::ArgvSegment,
+            "正文段（--message 取值）照旧走兜底面（正文面已有专门之门，此处不另写文案）"
+        );
     }
 
     // ===== APP 在场判定 =====
@@ -2131,6 +2440,14 @@ mod tests {
         }
     }
 
+    /// spawn 形态缝收尾守卫（panic 也清——形态缝是进程级全局态，评审 I8 的执行臂用例用）
+    struct ShapeHookClear;
+    impl Drop for ShapeHookClear {
+        fn drop(&mut self) {
+            test_hooks::set_shape(None);
+        }
+    }
+
     /// **评审 I4**：queue 回执的 `durationMs` 必须**含消费等待**——模块头声明的口径是
     /// 「整回合墙钟（含消费等待）」，旧实现由 `run_queue_turn` 在 `await` 前把
     /// `total_ms()` 求值成一个冻结的 `u64` 传进 `consume_and_report`，于是消费等待
@@ -2504,6 +2821,88 @@ mod tests {
             reason.contains("队列") && (reason.contains("无法撤回") || reason.contains("仍在")),
             "必须如实说明消息已入队无法撤回：{reason}"
         );
+    }
+
+    /// **评审 I8（执行臂）**：垫片形态 + `-C` 取值含元字符 ⇒ **投递前拒绝**——回执档
+    /// `Stage::Refused`（与正文面/花名面同档同文案）、`make_runner` 与执行缝**都没被调用**
+    /// （零回合配置、零进程、零名额、零字节投递），也不得被误当成「可改道的失败」。
+    ///
+    /// 形态经 [`test_hooks::set_shape`] 注入：`spawn_shape` 只在 `windows` + `.cmd`/`.bat`
+    /// 上产出垫片形态，注入面让**执行臂**在任何平台都跑得到；argv 取自**真组装器**
+    /// [`dispatch`]，文案与正文面**逐字**比对（同源判定的字面证据）。
+    #[tokio::test]
+    async fn shim_metachar_project_path_is_refused_before_any_runner_is_built() {
+        let _serial = test_hooks::LOCK.lock().await;
+        let shim = shim_fixture();
+        test_hooks::set_shape(Some(shim.clone()));
+        let _clear = ShapeHookClear; // panic 也清形态缝
+        const SID: &str = "sess_i8_shim_refuse";
+        let dirty = r"C:\work\A&B%TEMP%";
+        let plan = dispatch(AppPresence::Closed, UUID, dirty, "hi");
+        assert_eq!(plan.argv()[2], dirty, "前提：`-C` 的取值就是项目路径");
+        let (seen, make) = recording_runner();
+        let (run, calls) = scripted_run(vec![queued_obs("m-must-not-run")]);
+        let deps = deps_with(vec![Some(true)], None);
+        let out = run_turn(&args_of(SID, Some(ROLLOUT)), &plan, &make, &deps, &*run).await;
+        assert_eq!(
+            out.receipt.status,
+            ReceiptStatus::Failed,
+            "{:?}",
+            out.receipt
+        );
+        assert_eq!(
+            out.receipt.stage,
+            Some(Stage::Refused),
+            "投递前拒绝档必须是 refused（未起跑、零字节投递）：{:?}",
+            out.receipt
+        );
+        assert_eq!(out.receipt.session_id, SID, "回执必须带会话号");
+        assert_eq!(out.plan_used, PlanKind::ExecResume);
+        assert_eq!(out.receipt_source, ReceiptSource::NotApplicable);
+        assert!(!out.diverted, "零尝试的拒绝不是「可改道的失败」");
+        assert_eq!(
+            out.receipt.reason,
+            crate::inject::headless::turn::cmd_shim_refusal(
+                crate::inject::headless::turn::CmdShimSubject::ProjectPath,
+                dirty,
+                &shim,
+                true,
+            ),
+            "项目路径面的文案必须与判据单点**同源同句**（不另写一套措辞）"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            0,
+            "拒绝臂必须零投递（执行缝未被调用）"
+        );
+        let recorded = seen.lock().unwrap().len();
+        assert_eq!(recorded, 0, "拒绝臂必须零回合配置（make_runner 未被调用）");
+    }
+
+    /// 对照（执行臂）：同一垫片形态 + **干净项目路径** ⇒ 照旧放行并**真的跑到**执行缝
+    /// （防「垫片形态一律拒」式的误拒）。
+    #[tokio::test]
+    async fn shim_clean_project_path_still_reaches_the_runner() {
+        let _serial = test_hooks::LOCK.lock().await;
+        test_hooks::set_shape(Some(shim_fixture()));
+        let _clear = ShapeHookClear;
+        let plan = dispatch(AppPresence::Closed, UUID, "E:/t2", "hi");
+        let (seen, make) = recording_runner();
+        let (run, calls) = scripted_run(vec![obs_exit(0, &["最终回复"], "")]);
+        let deps = deps_with(vec![], None);
+        let out = run_turn(
+            &args_of("sess_i8_shim_pass", None),
+            &plan,
+            &make,
+            &deps,
+            &*run,
+        )
+        .await;
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        assert_eq!(out.receipt_source, ReceiptSource::ExecStdout);
+        assert_eq!(*calls.lock().unwrap(), 1, "干净路径必须照旧投递一次");
+        let argv = seen.lock().unwrap()[0].clone();
+        assert_eq!(argv[2], "E:/t2", "实跑 argv 的 `-C` 取值：{argv:?}");
     }
 
     /// exec resume 成功：末条回复 = stdout 尾行（截断走 W5 单点）

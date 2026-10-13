@@ -1727,6 +1727,14 @@ fn now_ms() -> u64 {
 /// ① `acp-session-token` / `acp-connection-id` 头会随 CONNECT/请求交给代理进程（凭据外泄）；
 /// ② 代理若到不了 `127.0.0.1`（企业代理很常见），通道直接死。
 ///
+/// # `.redirect(Policy::none())`（P0 安全：**回环凭据绝不随 30x 外发**）
+/// reqwest 默认跟随最多 10 跳，且跨 host 重定向只剥 `Authorization`/`Cookie` 族头——本缝的
+/// 自定义凭据头 `acp-session-token` / `acp-connection-id` **不在**其列，会被原样带给重定向
+/// 目标，违反「凭据不出回环」威胁模型；而本缝只打 `127.0.0.1:<port>`，30x 在这里**没有**
+/// 任何合法语义（一跳都不该跟）。**为什么只能靠注释锚**：`reqwest::Client` 不暴露 policy
+/// getter（构造后取不回来），单测无从断言「这个 client 不跟随重定向」——故此处以注释为锚，
+/// 删改这段 Builder 即为回归（别为了写用例去改生产 API：门开在测试侧就再也关不上）。
+///
 /// # 与 `remote::tunnel` 的**对比**（后来者勿「统一」两处客户机构建）
 /// `remote::tunnel` 下的是 **GitHub 资产（广域网）**，它**故意**走系统代理——用户在企业网里
 /// 常只有那条路能出去；本缝是**回环**，显式无代理是纪律、不是遗漏。两处 builder 形状相近
@@ -1738,6 +1746,8 @@ fn acp_http_client() -> &'static Result<reqwest::Client, String> {
             reqwest::Client::builder()
                 // 回环专用：**不读系统代理**（见上方对比说明）
                 .no_proxy()
+                // 回环专用：**不跟随重定向**（见上方 30x 说明；默认 10 跳会让自定义凭据头外发）
+                .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(std::time::Duration::from_millis(CLIENT_CONNECT_TIMEOUT_MS))
                 .build()
                 .map_err(|e| format!("HTTP 客户端构建失败: {e}"))
