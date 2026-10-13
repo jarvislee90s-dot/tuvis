@@ -1019,12 +1019,14 @@ mod tests {
         let pg = crate::remote::content::MessagesPage {
             messages: vec![msg("user", "user", "[mobile t] body…")],
             truncated: false,
+            cwd: None,
         };
         assert!(stamp_hit_in_page(&pg, stamp));
         // 同文只在 assistant 侧（tool-result 回显）→ 不命中
         let pg2 = crate::remote::content::MessagesPage {
             messages: vec![msg("assistant", "tool-result", "[mobile t] body…")],
             truncated: false,
+            cwd: None,
         };
         assert!(!stamp_hit_in_page(&pg2, stamp));
         // 混合页：assistant 在前 user 在后 → 命中
@@ -1034,6 +1036,7 @@ mod tests {
                 msg("user", "user", format!("前缀 {stamp}").as_str()),
             ],
             truncated: false,
+            cwd: None,
         };
         assert!(stamp_hit_in_page(&pg3, stamp));
     }
@@ -1063,6 +1066,7 @@ mod tests {
                 format!("# 计划\n\n执行步骤引用 {stamp}").as_str(),
             )],
             truncated: false,
+            cwd: None,
         };
         assert!(!stamp_hit_in_page(&pg, stamp));
         // 对照格：同流加一条 user 正文命中 → 照常命中（user 过滤通道无回归）
@@ -1072,6 +1076,7 @@ mod tests {
                 msg("user", "user", stamp),
             ],
             truncated: false,
+            cwd: None,
         };
         assert!(stamp_hit_in_page(&pg2, stamp));
     }
