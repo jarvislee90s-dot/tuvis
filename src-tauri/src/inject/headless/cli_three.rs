@@ -1168,11 +1168,6 @@ impl PermitParking {
         }
     }
 
-    /// 是否持有名额（诊断/测试可观测面）
-    pub fn holds(&self) -> bool {
-        self.lock().is_some()
-    }
-
     /// 全局并发上限（回执措辞用）
     pub fn cap(&self) -> usize {
         self.sem.cap()

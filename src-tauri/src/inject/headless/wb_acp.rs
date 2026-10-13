@@ -3649,18 +3649,25 @@ mod tests {
 
     // ===== 评审 I10：缝的字节切分（跨 chunk 多字节字符不损坏）=====
 
+    /// 判定语义用例共用的扫描策略（评审 I10/I11 各用例同一场景配置）：watchdog 600s、
+    /// 静默死线取 [`PHASE_DEADLINE_MS`]、needle=`agentPhase`、响应帧 id=3——与典型
+    /// prompt 回合的缝输入同形。要测「无响应帧判定」面的用例（如 needle 专项）自建字面量。
+    fn verdict_policy() -> StreamPolicy {
+        StreamPolicy {
+            max_ms: 600_000,
+            idle_ms: PHASE_DEADLINE_MS,
+            idle_unless_seen: Some("agentPhase"),
+            stop_on_id: Some(3),
+        }
+    }
+
     /// 生产缝的读循环**单步** = [`Utf8ChunkAssembler::feed_scanner`]（缝与用例同源，逻辑不在
     /// `cfg(not(test))` 里）：把整条 SSE 体按**任意字节位置**切开喂进去，断言还原无损、
     /// **无 U+FFFD**。对照组 = 旧口径（逐块 `from_utf8_lossy`）凡切在字符中间必打花——本用例
     /// 抓的就是这个缺陷机理（reqwest `chunk()` 的边界任意 ⇒ 中文回执两侧各一个替换符）。
     #[test]
     fn seam_chunk_split_never_breaks_multibyte_chars() {
-        let policy = StreamPolicy {
-            max_ms: 600_000,
-            idle_ms: PHASE_DEADLINE_MS,
-            idle_unless_seen: Some("agentPhase"),
-            stop_on_id: Some(3),
-        };
+        let policy = verdict_policy();
         let body = prompt_sse_chunks(
             3,
             &["model_requesting"],
@@ -3723,12 +3730,7 @@ mod tests {
     /// 同源」（含注释帧 / 裸 JSON 行 / 无空行收束 / `\r\n` 行尾 / 噪音行等形态矩阵）。
     #[test]
     fn incremental_verdict_matches_whole_body_parse() {
-        let policy = StreamPolicy {
-            max_ms: 600_000,
-            idle_ms: PHASE_DEADLINE_MS,
-            idle_unless_seen: Some("agentPhase"),
-            stop_on_id: Some(3),
-        };
+        let policy = verdict_policy();
         let stop_frame = rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}));
         let cases: Vec<String> = vec![
             // 标准 SSE（空行收束）
@@ -3801,12 +3803,7 @@ mod tests {
     /// 计数桩 = [`SseFrames::parsed_bytes`]（**仅测试构建**；不为测试改生产 API）。
     #[test]
     fn long_stream_parse_cost_stays_linear() {
-        let policy = StreamPolicy {
-            max_ms: 600_000,
-            idle_ms: PHASE_DEADLINE_MS,
-            idle_unless_seen: Some("agentPhase"),
-            stop_on_id: Some(3),
-        };
+        let policy = verdict_policy();
         let mut sc = StreamScanner::new(policy, 0);
         let frame = format!(
             "event: message\ndata: {}\n\n",
@@ -3847,12 +3844,7 @@ mod tests {
     /// （响应帧 / needle / assistant 摘要尾巴）由增量状态与尾部窗口承载——逐条钉死。
     #[test]
     fn over_cap_window_keeps_verdict_material() {
-        let policy = StreamPolicy {
-            max_ms: 600_000,
-            idle_ms: PHASE_DEADLINE_MS,
-            idle_unless_seen: Some("agentPhase"),
-            stop_on_id: Some(3),
-        };
+        let policy = verdict_policy();
         let mut sc = StreamScanner::new(policy, 0);
         // ① 开头就来 needle（早期 agentPhase 落在**会被驱逐的头部**）
         assert!(!sc.push(&sse(&[phase_frame(SID, "model_requesting")]), 1));
@@ -3944,12 +3936,7 @@ mod tests {
     /// 正常 KB 级帧不受影响（噪音 0、响应帧照常一到即停）。
     #[test]
     fn oversize_unclosed_frame_stays_bounded() {
-        let policy = StreamPolicy {
-            max_ms: 600_000,
-            idle_ms: PHASE_DEADLINE_MS,
-            idle_unless_seen: Some("agentPhase"),
-            stop_on_id: Some(3),
-        };
+        let policy = verdict_policy();
         // —— ① 巨型无换行 `data:` 行（4 MiB、按 2 KiB 块到达）：行缓冲必须有界 ——
         let mut sc = StreamScanner::new(policy, 0);
         let giant = format!("data: {{\"filler\":\"{}\"}}", "x".repeat(4 * 1024 * 1024));

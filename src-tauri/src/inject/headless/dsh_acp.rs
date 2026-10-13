@@ -1950,6 +1950,10 @@ pub mod test_hooks {
 
 #[cfg(test)]
 mod tests {
+    use super::super::receipt::ReceiptStatus;
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     // ===== 靶向明示（评审 I6）=====
 
@@ -2038,10 +2042,6 @@ mod tests {
             Some("回合失败（协议错误 -32000）")
         );
     }
-    use super::super::receipt::ReceiptStatus;
-    use super::*;
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
 
     /// list/resume 形态会话号（`session-<uuid>` 前缀——探测 §2.2/§2.4 二象性之一）
     const SID: &str = "session-9f14a8c5-1111-4222-8333-444455556666";
