@@ -646,11 +646,25 @@ pub fn backfill_registry() {
     if skills.is_dir() {
         for rel in scan_skill_dirs(&skills) {
             let path = skills.join(&rel);
+            // 登记口径恒为**斜杠**相对路径（见上「id/name 均带斜杠路径」）：
+            // Windows 下 scan_skill_dirs 产出原生 `\`，这里统一转 `/`，保证 id 跨平台一致
+            //（预设绑定/资源卡片按 id 匹配，反斜杠 id 在 macOS 导入的预设里永远对不上）。
+            // 存量旧行（反斜杠 id）就地迁移，避免同一资源双行（斜杠新行 + 反斜杠旧行）
+            let slashed = rel.replace('\\', "/");
+            if slashed != rel {
+                if let Err(err) = crate::database::migrate_legacy_extension_id(
+                    &format!("skill-{}", rel),
+                    &format!("skill-{}", slashed),
+                    &slashed,
+                ) {
+                    log::warn!("回填 skill {} 旧 id 迁移失败: {}", rel, err);
+                }
+            }
             // no-swallowed-errors（评审裁决 3）：回填失败逐条报告，不再吞错
             if let Err(err) = crate::database::ensure_extension(&crate::database::ExtensionRecord {
-                id: format!("skill-{}", rel),
+                id: format!("skill-{}", slashed),
                 kind: "skill".to_string(),
-                name: rel.clone(),
+                name: slashed.clone(),
                 description: None,
                 source_path: path.to_string_lossy().to_string(),
                 source_url: None,

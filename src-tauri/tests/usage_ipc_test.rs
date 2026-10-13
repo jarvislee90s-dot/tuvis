@@ -37,12 +37,17 @@ static SERIAL: Mutex<()> = Mutex::new(());
 /// * kimi 采集器的根走 `KIMI_CODE_HOME`（优先于 `~/.kimi`）。`KIMI_CODE_HOME` 的注入
 ///   由 Task 13 的记录项目锁住（D-30）；两者若在本机被设置（本机 `DSH_HOME=~/.dsh`），
 ///   采集就会**扫真实家目录**——测试既慢又脏（实测：dashboard 用例因此读到别的用例
-///   采进来的真实行 → 断言失败）。故在取锁前把它们摘掉，让七个源都只看临时 home。
+///   采进来的真实行 → 断言失败）。故取锁前把两者指到 fixture 根下的空目录。
+/// * 采集扫描根本身走 `TUVIS_USAGE_FIXTURE_ROOT`（collect.rs 缝）：Windows 下
+///   `dirs::home_dir()` 不认 HOME，不设它七个源会直捣真实 profile（2026-10-07 事故族）。
 fn serial() -> MutexGuard<'static, ()> {
     support::setup();
-    // 生产语义：这两个变量是「宿主指定的数据根」，测试里一律摘掉（临时 home 里没有它们的目录）
-    std::env::remove_var("DSH_HOME");
-    std::env::remove_var("KIMI_CODE_HOME");
+    let root = support::usage_fixture_root();
+    // 读源根 = 进程专用 fixture 根（空根）；dsh/kimi 摘掉本机值后若不显式指向
+    // fixture 根，会回落到 `dirs::home_dir()/.dsh` / `/.kimi-code`——Windows 上即真实目录
+    std::env::set_var("TUVIS_USAGE_FIXTURE_ROOT", root);
+    std::env::set_var("DSH_HOME", root.join(".dsh"));
+    std::env::set_var("KIMI_CODE_HOME", root.join(".kimi-code"));
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -98,11 +103,14 @@ fn usage_collect_runs_seven_sources_and_pairs_ok_with_error_code() {
     // 本文件那份码表镜像**从不被查**（纸面断言）。故先造一个**必失败源**：
     // 往 `<temp home>/.workbuddy/workbuddy.db` 写**非 SQLite 内容** →
     // `workbuddy.rs` 的 `open_usage_db` 判 NOTADB 且 `db.exists()` → `Err("usage-source-io")`。
-    let home = dirs::home_dir().expect("HOME 必须可解析（support::setup() 已重定向）");
-    // 安全前提：绝不在真实家目录里写夹具（setup() 未生效时这里必须当场红，而不是写坏用户目录）
+    // fixture 落点 = 进程专用 fixture 根（tempdir）。**不要**用 `dirs::home_dir()` 取 home：
+    // Windows 下它不认 `support::setup()` 的 HOME 重定向，会拿到真实 home
+    let home = support::usage_fixture_root().to_path_buf();
+    // 安全前提：绝不在真实家目录里写夹具（fixture 根若不在 temp 下，这里当场红，
+    // 而不是写坏用户目录）
     assert!(
         home.starts_with(std::env::temp_dir()),
-        "安全前提：HOME 必须是 support::setup() 的临时目录，实际 {}",
+        "安全前提：fixture 根必须是 temp 下的专用目录，实际 {}",
         home.display()
     );
     let wb_dir = home.join(".workbuddy");

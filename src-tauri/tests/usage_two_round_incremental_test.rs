@@ -460,7 +460,12 @@ fn second_round_reports_zero_new_records_for_every_source() {
     // `support::open_ledger_db(tag)` 私有库 + `apply_delta_conn`，Global Constraints 19）形成对照。
     // **后续新增断言时保持本口径**：不要在这里写 `count_rows_conn(...) == N`。
     support::setup();
-    let home = std::path::PathBuf::from(std::env::var("HOME").expect("support::setup 已设 HOME"));
+    // fixture 根 = 采集读源根（collect.rs 的 `TUVIS_USAGE_FIXTURE_ROOT` 缝）同款 temp
+    // 目录。**不要**从 HOME 环境变量取：Windows 下 `run_collection` 的扫描根走
+    // `dirs::home_dir()`（不认 HOME），两边不同根时 fixture 落 A 处、采集扫 B 处
+    // （实测在 Windows 扫进真实 profile：zcode 71681 行、workbuddy 12 文件）
+    let home = support::usage_fixture_root().to_path_buf();
+    std::env::set_var("TUVIS_USAGE_FIXTURE_ROOT", &home);
     fixture_home(&home);
     // **安全前提（Task 20 同款纪律）**：绝不在真实家目录里跑采集——`support::setup()` 若未生效
     // （或 HOME 被外部覆盖），本断言**当场红**，而不是去扫开发机的真实 dsh/kimi 数据

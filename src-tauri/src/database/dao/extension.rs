@@ -54,6 +54,81 @@ pub fn ensure_extension(ext: &ExtensionRecord) -> Result<(), String> {
     Ok(())
 }
 
+/// 旧平台分隔符（Windows 反斜杠）skill id **就地迁移**为斜杠口径（backfill_registry 专用）：
+/// spec §8.1 约定 id/name 均带斜杠路径，2026-10-13 前的 Windows 机器上嵌套套件技能
+/// 登记出了 `skill-a\b` 形态的 id。schema 无外键约束（先例：引用表都是裸 TEXT 关联），
+/// 引用搬迁必须显式做——搬迁面 = 引用 extension_id 的**全部五张表**（2026-10-13 评审
+/// P1 补齐 `extension_assignments` / `tool_base_snapshot_items`，漏搬 = 技能启用态失联）。
+/// 迁移顺序 = 先搬引用再改主行；主行改 id 失败时引用已指向新 id、旧行下次启动重试收敛。
+/// 目标 id 已存在（病态双行）时按「斜杠行为准」合并：引用搬完删旧行。
+/// 全程单事务（中途失败整体回滚，下次启动重跑）；返回是否发生了迁移。
+pub fn migrate_legacy_extension_id(
+    old_id: &str,
+    new_id: &str,
+    new_name: &str,
+) -> Result<bool, String> {
+    if old_id == new_id {
+        return Ok(false);
+    }
+    let mut conn = DB.lock().unwrap();
+    let old_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM extensions WHERE id = ?1 AND kind = 'skill'",
+            params![old_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .map_err(|e| e.to_string())?;
+    if !old_exists {
+        return Ok(false);
+    }
+    let new_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM extensions WHERE id = ?1",
+            params![new_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    // 引用搬迁。`extension_assignments` / `resource_bindings` / `tool_residents` /
+    // `tool_base_snapshot_items` 都有含 extension_id 的唯一键（UNIQUE/PK）→ `OR IGNORE`
+    // 兼位「新 id 已有同引用行」的冲突，被跳过的行成为孤儿引用（仅病态双行情形，
+    // 如实登记不掩盖）；`preset_items` 对 extension_id **无**唯一约束（唯一键只有行
+    // id）→ `OR IGNORE` 对它是空操作，必须普通 UPDATE 全搬——病态「同一预设同时含
+    // 新旧两个 id」会留成重复条目，量级个位数、可由用户编辑消除。
+    tx.execute(
+        "UPDATE preset_items SET extension_id = ?2 WHERE extension_id = ?1",
+        params![old_id, new_id],
+    )
+    .map_err(|e| format!("迁移 preset_items 引用失败: {e}"))?;
+    for table in [
+        "extension_assignments",
+        "resource_bindings",
+        "tool_residents",
+        "tool_base_snapshot_items",
+    ] {
+        tx.execute(
+            &format!("UPDATE OR IGNORE {table} SET extension_id = ?2 WHERE extension_id = ?1"),
+            params![old_id, new_id],
+        )
+        .map_err(|e| format!("迁移 {table} 引用失败: {e}"))?;
+    }
+    if new_exists {
+        // 病态双行：斜杠行为准，删反斜杠旧行（引用已全部指向新 id）
+        tx.execute("DELETE FROM extensions WHERE id = ?1", params![old_id])
+            .map_err(|e| e.to_string())?;
+    } else {
+        tx.execute(
+            "UPDATE extensions SET id = ?2, name = ?3 WHERE id = ?1 AND kind = 'skill'",
+            params![old_id, new_id, new_name],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 pub fn list_extensions() -> Vec<ExtensionRecord> {
     let conn = DB.lock().unwrap();
     conn.prepare("SELECT id, kind, name, description, source_path, source_url, version, tags, suite, source_tool, is_native FROM extensions")
