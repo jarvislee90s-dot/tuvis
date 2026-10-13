@@ -326,9 +326,15 @@ describe("ApproveCard：降级警示脚注（R1-3）", () => {
     const hint = await screen.findByTestId("approve-degraded-hint");
     expect(hint.textContent).toContain("未读到终端对话框选项");
     expect(hint.textContent).toContain("建议到终端确认");
-    // 二元按钮仍在（降级不是自隐——用户仍可操作，只是被警示）
-    expect(screen.getByTestId("approve-option-approve")).toBeTruthy();
-    expect(screen.getByTestId("approve-option-reject")).toBeTruthy();
+    // **降级禁用**（2026-10-10 用户裁决「读不到就别给钮」+ 评审 Important 4 锁）：
+    // 按钮在场但禁用——多选面板误读成审批框时点「允许」会真实发键（21:55 事故）
+    const allow = screen.getByTestId("approve-option-approve") as HTMLButtonElement;
+    const reject = screen.getByTestId("approve-option-reject") as HTMLButtonElement;
+    expect(allow.disabled).toBe(true);
+    expect(reject.disabled).toBe(true);
+    // 降级态辅助面：手动检查钮 + 核对中状态文案
+    expect(screen.getByTestId("approve-degraded-check")).toBeTruthy();
+    expect(screen.getByTestId("approve-degraded-state").textContent).toContain("核对");
   });
 
   it("degradedHint=null/缺省：不渲染脚注（未降级零变化）", async () => {
@@ -337,6 +343,66 @@ describe("ApproveCard：降级警示脚注（R1-3）", () => {
     render(<ApproveCard session={{ id: "sess-nodeg" }} />);
     await screen.findByTestId("approve-option-approve");
     expect(screen.queryByTestId("approve-degraded-hint")).toBeNull();
+  });
+
+  it("降级态自动重读：2.5s 后重拉选项端点，读到选项即恢复可用（fake timers）", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      installFetch();
+      // 首拉 = 降级态；重拉 = 读到对话框选项（降级解除）——按调用次数翻转
+      const degraded = approveOptions({
+        degradedHint: "未读到终端对话框选项——终端可能正显示多选项，二元键可能错位，建议到终端确认",
+      });
+      const recovered = approveOptions({
+        dialog: true,
+        options: [
+          { id: "dialog:1", label: "Yes, and use auto mode" },
+          { id: "dialog:2", label: "No" },
+        ],
+      });
+      let optionsGets = 0;
+      Object.defineProperty(routes, "options", {
+        configurable: true,
+        get() {
+          optionsGets += 1;
+          return optionsGets === 1 ? degraded : recovered;
+        },
+      });
+      render(<ApproveCard session={{ id: "sess-deg-retry" }} />);
+      const allow = await screen.findByTestId("approve-option-approve");
+      expect((allow as HTMLButtonElement).disabled).toBe(true);
+
+      // 快进 2.5s → 自动重拉触发（fetch 的 options 端点被再次调用）
+      await vi.advanceTimersByTimeAsync(2600);
+      expect(optionsGets).toBeGreaterThanOrEqual(2);
+      // 重拉读到选项 → 按钮恢复可用（dialog 编号选项形态）
+      const dialogOpt = await screen.findByTestId("approve-option-dialog:1");
+      expect((dialogOpt as HTMLButtonElement).disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("降级态自动重读：仍读不到选项 → 按钮保持禁用且显示未读到文案", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      installFetch();
+      routes.options = approveOptions({
+        degradedHint: "未读到终端对话框选项——终端可能正显示多选项，二元键可能错位，建议到终端确认",
+      });
+      render(<ApproveCard session={{ id: "sess-deg-still" }} />);
+      const allow = await screen.findByTestId("approve-option-approve");
+      expect((allow as HTMLButtonElement).disabled).toBe(true);
+      await vi.advanceTimersByTimeAsync(2600);
+      // 重拉是异步 promise——用 waitFor 等 state 文案翻转（同步 getBy 会抢在冲刷前）
+      await screen.findByText(/仍未读到/);
+      expect(screen.getByTestId("approve-degraded-state").textContent).toContain("仍未读到");
+      expect((screen.getByTestId("approve-option-approve") as HTMLButtonElement).disabled).toBe(
+        true
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("对话框模式（dialog=true）不渲染降级脚注（读到选项即未降级）", async () => {
@@ -595,11 +661,11 @@ describe("ApproveCard：计划批准卡（2026-10-04）", () => {
       await screen
         .findByTestId("approve-card")
         .then((el) => el.textContent)
-        .then((t) => t?.includes("计划批准")),
+        .then((t) => t?.includes("计划批准"))
     ).toBe(true);
     // 反馈项 = 独立 testid 入口（不直发按键）
     expect(screen.getByTestId("approve-option-feedback").textContent).toContain(
-      "Tell Claude what to change",
+      "Tell Claude what to change"
     );
     // 其余选项照常（dialog 编号 id 形态）
     expect(screen.getByTestId("approve-option-dialog:1")).toBeTruthy();
@@ -622,7 +688,7 @@ describe("ApproveCard：计划批准卡（2026-10-04）", () => {
       optionId: "dialog:3",
     });
     const fbCalls = fetchMock.mock.calls.filter((c: unknown[]) =>
-      String(c[0]).includes("/session-plan-feedback"),
+      String(c[0]).includes("/session-plan-feedback")
     );
     expect(fbCalls).toHaveLength(0);
   });
@@ -638,11 +704,70 @@ describe("ApproveCard：计划批准卡（2026-10-04）", () => {
       await screen
         .findByTestId("approve-error")
         .then((el) => el.textContent)
-        .then((t) => t?.includes("对话框已不在场")),
+        .then((t) => t?.includes("对话框已不在场"))
     ).toBe(true);
     expect(onReady).not.toHaveBeenCalled();
     expect((screen.getByTestId("approve-option-feedback") as HTMLButtonElement).disabled).toBe(
-      false,
+      false
     );
+  });
+});
+
+// ==== Task 15 止血门（第二轮复评 J1）：session-approve 409 的前端分诊 ====
+// I2 给 `session-approve` 新开了一个 409 出口（codex APP 会话的四条写路径之一），
+// 而 ApproveCard 两处 catch（点选项 / 点反馈项）都没消费该码 → 用户屏幕上出现
+// 「session-approve 409」。本组钉住：两处入口都走 api.ts 的 `approveErrorCopy` 单点，
+// 渲染后端中文引导、且不含「409」。
+// 断言一律用**字面量**中文，不 import `APP_FORM_PENDING_FALLBACK` 去比对自身——
+// 否则常量一改用例照样绿，退化成循环断言（既有 mobile 用例同此惯例）。
+describe("ApproveCard：app_form_pending 分诊（Task 15 止血门）", () => {
+  /** 后端下发的引导原文（与 api.rs 的 APP_FORM_PENDING_REASON 逐字同义） */
+  const REASON = "APP 会话该操作走协议通道，开发中——请在 APP 内操作";
+
+  it("点选项遇 409 app_form_pending + reason：渲染后端中文引导（不是「session-approve 409」）", async () => {
+    installFetch();
+    routes.options = approveOptions();
+    routes.approveStatus = 409;
+    routes.approveBody = { error: "app_form_pending", reason: REASON };
+    render(<ApproveCard session={{ id: "sess-app-form-1" }} />);
+    fireEvent.click(await screen.findByTestId("approve-option-approve"));
+    const err = await screen.findByTestId("approve-error");
+    expect(err.textContent).toBe(REASON);
+    expect(err.textContent).not.toContain("409");
+  });
+
+  it("app_form_pending 无 reason（旧后端/异体）→ 同义兜底，仍不显示「... 409」", async () => {
+    installFetch();
+    routes.options = approveOptions();
+    routes.approveStatus = 409;
+    routes.approveBody = { error: "app_form_pending" };
+    render(<ApproveCard session={{ id: "sess-app-form-2" }} />);
+    fireEvent.click(await screen.findByTestId("approve-option-approve"));
+    const err = await screen.findByTestId("approve-error");
+    expect(err.textContent).toBe(REASON);
+    expect(err.textContent).not.toContain("409");
+  });
+
+  it("点反馈项（planDialog 形态）遇 409 app_form_pending：反馈入口同样分诊（收敛后不再漏）", async () => {
+    installFetch();
+    routes.options = approveOptions({
+      dialog: true,
+      planDialog: true,
+      feedbackOption: "dialog:3",
+      options: [
+        { id: "dialog:1", label: "Yes, and use auto mode" },
+        { id: "dialog:2", label: "Yes, manually approve edits" },
+        { id: "dialog:3", label: "Tell Claude what to change" },
+      ],
+    });
+    routes.approveStatus = 409;
+    routes.approveBody = { error: "app_form_pending", reason: REASON };
+    const onReady = vi.fn();
+    render(<ApproveCard session={{ id: "sess-app-form-3" }} onPlanFeedbackReady={onReady} />);
+    fireEvent.click(await screen.findByTestId("approve-option-feedback"));
+    const err = await screen.findByTestId("approve-error");
+    expect(err.textContent).toBe(REASON);
+    expect(err.textContent).not.toContain("409");
+    expect(onReady).not.toHaveBeenCalled();
   });
 });

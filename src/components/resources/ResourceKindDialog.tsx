@@ -19,19 +19,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import {
-  Package,
-  Link2,
-  Plug,
-  Info,
-  Trash2,
-  FileJson,
-  FolderOpen,
-  ArrowUpDown,
-  ArrowUp,
-  ArrowDown,
-  type LucideIcon,
-} from "lucide-react";
+import { Info, Trash2, FileJson, FolderOpen, ArrowUpDown, ArrowUp, ArrowDown } from "lucide-react";
 import {
   checkSkillTargetType,
   disableSkillForTool,
@@ -65,8 +53,7 @@ import {
   type PendingUninstall,
 } from "./ResourceDialogs";
 import type { ResourceBinding, SsotResource } from "@/types/extension";
-
-export type ResourceKind = "skill" | "mcp" | "plugin";
+import { KIND_META, matchesResourceSearch, type ResourceKind } from "./kindMeta";
 
 function formatSkillName(name: string): string {
   return name.includes("/") ? name.replace("/", ": ") : name;
@@ -265,20 +252,15 @@ type KindSectionConfig = {
   onToggleTool: (res: SsotResource, toolId: string, enabled: boolean) => void;
 };
 
-/** 弹窗内类型切换 tab 配置（标签复用既有计数文案键，随搜索结果如实计数） */
-const KIND_TABS: { kind: ResourceKind; icon: LucideIcon; countKey: string }[] = [
-  { kind: "skill", icon: Package, countKey: "resources.skillsCount" },
-  { kind: "mcp", icon: Link2, countKey: "resources.mcpsCount" },
-  { kind: "plugin", icon: Plug, countKey: "resources.pluginsCount" },
-];
-
 interface ResourceKindDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** 点段头进来的预选类型；每次 open 置真时重置 activeKind（可再切） */
   initialKind: ResourceKind;
-  /** 卡片搜索框状态提升：过滤弹窗内三段列表（A1/D 兼容注意） */
+  /** 搜索词（状态仍提升在卡片侧）：过滤弹窗内三段列表 + 驱动卡片段头计数 */
   search: string;
+  /** 弹窗内搜索框（F3）的受控回调：弹窗盖住卡片那只搜索框，弹窗内必须能改关键词 */
+  onSearchChange: (search: string) => void;
 }
 
 export function ResourceKindDialog({
@@ -286,6 +268,7 @@ export function ResourceKindDialog({
   onOpenChange,
   initialKind,
   search,
+  onSearchChange,
 }: ResourceKindDialogProps) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -407,14 +390,11 @@ export function ResourceKindDialog({
     return null; // 入口段头在卡片侧已按 resources 就绪渲染，弹窗打开时数据必在（同 key 共享缓存）
   }
 
-  const filterFn = (r: { name: string; enabledTools: string[] }) => {
-    if (!search.trim()) return true;
-    const q = search.trim().toLowerCase();
-    return [r.name, ...r.enabledTools].some((x) => x.toLowerCase().includes(q));
-  };
-  const filteredSkills = applySort(resources.skills.filter(filterFn), "skill");
-  const filteredMcp = applySort(resources.mcp.filter(filterFn), "mcp");
-  const filteredPlugins = applySort(resources.plugins.filter(filterFn), "plugin");
+  // 搜索判据与卡片段头计数共用一个实现（kindMeta.matchesResourceSearch）
+  const matches = (r: { name: string; enabledTools: string[] }) => matchesResourceSearch(r, search);
+  const filteredSkills = applySort(resources.skills.filter(matches), "skill");
+  const filteredMcp = applySort(resources.mcp.filter(matches), "mcp");
+  const filteredPlugins = applySort(resources.plugins.filter(matches), "plugin");
 
   const handleToggleMcp = async (name: string, toolId: string, enabled: boolean) => {
     if (capabilityBlocked(toolId, "mcp")) return;
@@ -846,16 +826,20 @@ export function ResourceKindDialog({
       <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent
           aria-describedby={undefined}
-          className="flex max-h-[85vh] w-full max-w-5xl flex-col overflow-hidden"
+          // 宽度提权（F1）：基类尾部 `sm:max-w-lg`（512px）与无前缀 max-w-* 同特异性且媒体
+          // 规则排后 → ≥640px 视口下任何 max-w-* 覆盖都会被顶掉；尾 `!` 提权才能落到 1024。
+          // 窄视口边距用 w-[calc(100%-2rem)] 找回：基类 max-w-[calc(100%-2rem)] 已被
+          // twMerge 同组顶掉（提权后的 max-w-5xl! 亦不再与之同组，故宽度得自己兜）
+          className="flex max-h-[85vh] w-[calc(100%-2rem)] max-w-5xl! flex-col overflow-hidden"
         >
           <DialogHeader>
             <DialogTitle className="text-sm">{t("resources.repoTitle")}</DialogTitle>
           </DialogHeader>
 
-          {/* 类型切换（Skill/MCP/插件，可再切）+ MCP「+ 添加」（随段头附加控件迁入） */}
+          {/* 类型切换（Skill/MCP/插件，可再切）+ 搜索框 + MCP「+ 添加」（随段头附加控件迁入） */}
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex gap-1">
-              {KIND_TABS.map(({ kind, icon: Icon, countKey }) => (
+              {KIND_META.map(({ kind, icon: Icon, countKey }) => (
                 <Button
                   key={kind}
                   size="sm"
@@ -868,16 +852,28 @@ export function ResourceKindDialog({
                 </Button>
               ))}
             </div>
-            {activeKind === "mcp" && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 px-2 text-[10px]"
-                onClick={() => setMcpDialogOpen(true)}
-              >
-                {t("resources.addWithPlus")}
-              </Button>
-            )}
+            <div className="flex items-center gap-2">
+              {/* 弹窗内搜索框（F3）：卡片那只被模态遮罩盖住且不可聚焦，打开弹窗只能关掉
+                  再改关键词——这里与卡片共用同一份提升状态（受控 value + onChange），
+                  行过滤与 tab 计数实时联动，清空即恢复全量 */}
+              <input
+                type="text"
+                placeholder={t("resources.searchPlaceholder")}
+                value={search}
+                onChange={(e) => onSearchChange(e.currentTarget.value)}
+                className="h-7 w-40 rounded border px-2 text-xs"
+              />
+              {activeKind === "mcp" && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-[10px]"
+                  onClick={() => setMcpDialogOpen(true)}
+                >
+                  {t("resources.addWithPlus")}
+                </Button>
+              )}
+            </div>
           </div>
 
           {/* 矩阵图例（随大表迁入弹窗）：点亮图标 / 常驻徽标 / 表头定位语义 */}

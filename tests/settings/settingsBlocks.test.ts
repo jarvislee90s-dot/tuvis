@@ -15,16 +15,18 @@ import { describe, expect, it } from "vitest";
 const SRC = readFileSync(path.join(process.cwd(), "src/pages/settings.tsx"), "utf8");
 
 /**
- * **12 个分区**（联合类型的唯一出处就是这张表；与 `SettingSection` 逐字对齐）。
+ * **13 个分区**（联合类型的唯一出处就是这张表；与 `SettingSection` 逐字对齐）。
  * 2026-10-07 D4：`shortcut`（全局快捷键）随功能一起移除 ⇒ 13 → 12，块表里也不再挂它。
+ * 2026-10-11：`autostart`（开机自动启动，桌面行为块第三卡）随功能加入 ⇒ 12 → 13。
  * 本锁的判据（各挂且只挂一次 / 联合类型逐字对齐 / 每分区一处守卫）**一个字都没改**，
- * 只是清单少一项 —— 这正是它该有的行为：删分区必须同时改三处，少改一处就红。
+ * 只是清单随分区增删同步——这正是它该有的行为：加/删分区必须同时改三处，少改一处就红。
  */
 const SECTIONS = [
   "appearance",
   "skin",
   "notifications",
   "pet",
+  "autostart",
   "tools",
   "health",
   "signal",
@@ -35,8 +37,8 @@ const SECTIONS = [
   "usageStatus",
 ] as const;
 
-/** 6 个块（顺序即侧栏顺序） */
-const BLOCKS = ["appearance", "desktop", "tools", "usage", "remote", "data"] as const;
+/** 6 个块（顺序即侧栏顺序；2026-10-11 顺序重派：桌面 → 外观 → 远程 → 用量 → 工具 → 数据） */
+const BLOCKS = ["desktop", "appearance", "remote", "usage", "tools", "data"] as const;
 
 /** 从 `SETTINGS_BLOCKS` 的每个 `sections: [...]` 里抽出分区 id（按出现顺序） */
 function declaredSections(): string[] {
@@ -51,17 +53,20 @@ function declaredSections(): string[] {
 }
 
 describe("设置页两级导航：块表与渲染守卫的可达性锁", () => {
-  it("① 12 个分区**各挂且只挂一个块**（漏挂 ⇒ 该分区在界面上永远看不见）", () => {
+  it("① 13 个分区**各挂且只挂一个块**（漏挂 ⇒ 该分区在界面上永远看不见）", () => {
     const declared = declaredSections();
     // 逐分区计数：重复挂载（同一个分区出现在两个块里）与漏挂都是回归
     for (const id of SECTIONS) {
-      expect(declared.filter((d) => d === id), `分区 ${id} 的挂载次数`).toHaveLength(1);
+      expect(
+        declared.filter((d) => d === id),
+        `分区 ${id} 的挂载次数`
+      ).toHaveLength(1);
     }
     // 反向：块表里不得出现 `SettingSection` 之外的 id（拼错的分区名同样是「永远看不见」）
     expect([...declared].sort()).toEqual([...SECTIONS].sort());
   });
 
-  it("② 联合类型恰好就是这 12 个分区（加/删分区必须同时改块表）", () => {
+  it("② 联合类型恰好就是这 13 个分区（加/删分区必须同时改块表）", () => {
     const m = /type SettingSection =([\s\S]*?);/.exec(SRC);
     expect(m, "找不到 `type SettingSection`").toBeTruthy();
     const union = [...(m as RegExpExecArray)[1].matchAll(/"(\w+)"/g)].map((x) => x[1]);

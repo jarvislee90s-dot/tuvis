@@ -307,6 +307,10 @@ pub type DialogProbeFn =
 /// （`inject::question` 的各 `probe_*`），端点只提供「怎么读」与「读的节奏」。
 /// 测试用脚本化屏序列注入，则整条编排（分段、复核、中止）在门禁里可断言，
 /// 而不是只有真机能覆盖。
+/// 首参语义（评审 Minor 澄清）：**调用方自选标识**，生产实现只打进日志、不参与
+/// 路由——问答阶段机链传 `tool`（codex/claude…），mode/权限链传 `sid`。两条链
+/// 各自一致即可；统一成单一语义需要牵动两链全部调用点，收益仅为日志观感（登记
+/// 为后续顺手项，不做签名变更）。
 pub type ScreenProbeFn = dyn Fn(&str, u32) -> Option<Vec<String>> + Send + Sync;
 
 /// 物化发现缝类型（C6，主会话裁决：做成缝——单测免真实 FS/家目录）：参数 =
@@ -4115,6 +4119,17 @@ mod tests {
     /// F2：补 key_spec_calls 记录 locate_and_send_key_spec 收到的族规格（trait 默认实现
     /// 只透传不记录——覆写以断言「审批路径族传递」；键位经委托旧方法照旧入 key_calls，
     /// 既有键位断言不受影响，fail 语义同源）
+    /// 注入器桩（记录派发，不真注入）。
+    ///
+    /// **零投递断言的盲区（复评 M3，如实申报，本轮不改）**：本桩覆写了
+    /// [`crate::inject::engine::Injector`] 的 `locate_and_inject` /
+    /// `locate_and_send_key` / `locate_and_send_key_spec` 三条（有记录），但**未覆写**
+    /// 默认方法 `locate_and_inject_draft_spec`（草稿注入）与
+    /// `locate_and_send_backspaces_spec`（批量退格）——`inject/engine.rs` 的默认实现
+    /// 恒返回 `Err` 且**不记录**。故凡「零投递」断言（含止血门用例）覆盖的只有前三条；
+    /// 若将来有路径经这两条默认方法被误触达，用例拿到的是 Err 而非「记录非空」，
+    /// **不会被判红**（属断言面缺口，不是行为已正确）。收口办法：在桩里补这两个方法
+    /// 并把调用推进同一份记录表（本轮不动：会改变既有用例的 Err 语义面，属独立改动）。
     struct FakeInjector {
         calls: std::sync::Mutex<Vec<(u32, String)>>,
         key_calls: std::sync::Mutex<Vec<(u32, String)>>,
@@ -20394,6 +20409,42 @@ mod tests {
         assert!(
             !body.contains(r#""surface":"app""#),
             "CLI 会话不落 app 面：{body}"
+        );
+    }
+
+    /// 兄弟路径（session-approve）的 CLI 形态直通（main #144 graft）：codex CLI 会话
+    /// **零变化**——200 key_sent + 映射键位照发（approve→"y"，`DEFAULT_MAPPINGS_JSON`
+    /// 0.154.0 实机取证档；不是拒绝也不是零投递）。APP 形态的对应面 = 6b 补投臂
+    /// （`codex_app_rejections_are_audited` 补投腿 + Task 6b 套件各钉一侧）。
+    #[tokio::test]
+    async fn approve_cli_codex_passes_through_unchanged() {
+        let fake = FakeInjector::ok();
+        let state = codex_form_state(
+            fake.clone(),
+            crate::session::ProcessForm::Cli,
+            &[("sess_cli_ap", 74)],
+        );
+        persist_named_device(&state, "mm", "测试设备");
+        let r = router(state)
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-approve",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_cli_ap","optionId":"approve"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "CLI 直通（审批）：既有 CLI 面照常服务");
+        let body = body_string(r).await;
+        assert!(
+            !body.contains("app_form_pending"),
+            "CLI 直通（审批）：{body}"
+        );
+        assert!(body.contains("\"status\":\"key_sent\""), "{body}");
+        assert!(
+            fake.recorded_keys().iter().any(|(_, k)| k == "y"),
+            "codex 审批映射照发（approve→y）：{:?}",
+            fake.recorded_keys()
         );
     }
 

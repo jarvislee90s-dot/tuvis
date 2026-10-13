@@ -1,7 +1,9 @@
 // 「按资源」视图（资源管理页 UI 改版 A1 瘦身）：卡片只留仓库入口行（标题 + 搜索框 +
 // 快捷跳转 + 从 Manifest 安装）与三段段头入口（Skill / MCP / 插件，计数留段头，点击
 // 打开 ResourceKindDialog 并预选该类型）；原三段纵向折叠段与大表整体移入弹窗
-// （ResourceKindDialog，逻辑原样随迁）。搜索框状态提升留卡片，过滤弹窗内列表。
+// （ResourceKindDialog，逻辑原样随迁）。搜索框状态提升留卡片，过滤弹窗内列表；
+// 弹窗内另渲染一枚同源搜索框（F3：模态遮罩盖住卡片这只，否则打开弹窗就只能关掉再改
+// 关键词），两边共用同一份提升状态。
 // 预设组区（PresetList）由父级 ExtensionList 在两视图下方共用渲染，不在本卡片内。
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -18,25 +20,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import {
-  Package,
-  Link2,
-  Plug,
-  FileJson,
-  FolderOpen,
-  ChevronRight,
-  type LucideIcon,
-} from "lucide-react";
+import { FileJson, FolderOpen, ChevronRight } from "lucide-react";
 import { useSsotResourcesQuery, SSOT_RESOURCES_KEY } from "@/lib/query/queries/resources";
-import { ResourceKindDialog, type ResourceKind } from "./ResourceKindDialog";
+import { ResourceKindDialog } from "./ResourceKindDialog";
+import { KIND_META, matchesResourceSearch, type ResourceKind } from "./kindMeta";
 import { ManifestInstallDialog } from "./ManifestInstallDialog";
-
-/** 三段入口配置（图标复用迁移前的段头图标；计数文案复用既有键，数字随搜索过滤如实） */
-const KIND_ENTRIES: { kind: ResourceKind; icon: LucideIcon; countKey: string }[] = [
-  { kind: "skill", icon: Package, countKey: "resources.skillsCount" },
-  { kind: "mcp", icon: Link2, countKey: "resources.mcpsCount" },
-  { kind: "plugin", icon: Plug, countKey: "resources.pluginsCount" },
-];
 
 /** 废止的折叠态 localStorage 键（A1：段头折叠机制随大表入弹窗而废止，一次性清理防遗留） */
 const LEGACY_COLLAPSED_KEY = "mam.resourceView.collapsed";
@@ -83,16 +71,14 @@ export function ResourceByKindView() {
     return <div className="text-muted-foreground py-4 text-xs">{t("common.loading")}</div>;
   }
 
-  const filterFn = (r: { name: string; enabledTools: string[] }) => {
-    if (!search.trim()) return true;
-    const q = search.trim().toLowerCase();
-    return [r.name, ...r.enabledTools].some((x) => x.toLowerCase().includes(q));
-  };
+  // 搜索判据与弹窗共用一个实现（kindMeta.matchesResourceSearch）：段头计数与弹窗 tab
+  // 计数、行过滤永远同口径
+  const matches = (r: { name: string; enabledTools: string[] }) => matchesResourceSearch(r, search);
   // 段头计数 = 搜索过滤后的段内条数（与弹窗内 tab 计数同口径）
   const counts: Record<ResourceKind, number> = {
-    skill: resources.skills.filter(filterFn).length,
-    mcp: resources.mcp.filter(filterFn).length,
-    plugin: resources.plugins.filter(filterFn).length,
+    skill: resources.skills.filter(matches).length,
+    mcp: resources.mcp.filter(matches).length,
+    plugin: resources.plugins.filter(matches).length,
   };
 
   const openKind = (kind: ResourceKind) => {
@@ -107,7 +93,8 @@ export function ResourceByKindView() {
 
         <div className="mb-3 flex items-center justify-between gap-2">
           <div className="flex items-center gap-1">
-            {/* 搜索框留卡片（A1）：状态提升，过滤 ResourceKindDialog 内三段列表 */}
+            {/* 搜索框留卡片（A1）：状态提升，过滤弹窗内三段列表 + 卡片段头计数；
+                弹窗打开后由 DialogContent 里那枚同源框接管（F3，同一 value/onChange） */}
             <input
               type="text"
               placeholder={t("resources.searchPlaceholder")}
@@ -152,7 +139,7 @@ export function ResourceByKindView() {
 
         {/* 三段段头入口（A1）：数字留段头，点段头开 Dialog 并预选该类型 */}
         <div>
-          {KIND_ENTRIES.map(({ kind, icon: Icon, countKey }) => (
+          {KIND_META.map(({ kind, icon: Icon, countKey }) => (
             <button
               key={kind}
               type="button"
@@ -167,12 +154,14 @@ export function ResourceByKindView() {
         </div>
       </div>
 
-      {/* 资源大表弹窗（A2）：大表 + 类型切换 + 行级子弹窗整体迁入 */}
+      {/* 资源大表弹窗（A2）：大表 + 类型切换 + 行级子弹窗整体迁入；搜索词受控传入
+          （F3：弹窗内改词 → 列表与 tab 计数实时联动） */}
       <ResourceKindDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         initialKind={dialogKind}
         search={search}
+        onSearchChange={setSearch}
       />
 
       {/* 从 Manifest 安装路径弹窗 */}

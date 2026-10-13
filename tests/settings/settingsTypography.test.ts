@@ -81,10 +81,12 @@ describe("设置页排版层级（C1）", () => {
       }
       checked += tiered.length;
     }
-    // 设置面标题总数：settings.tsx 6（1 一级 + 5 二级）+ 6 个组件各 1 + UsageStatusSection 的 h3 1 = 13。
-    // 2026-10-07 D4 把「快捷键」整节移除 ⇒ 由 14 降为 13（**本锁当场抓到过这次变化**：
-    // 删分区时它先红，逼我把数字与新事实对齐，而不是让计数悄悄漂）。
-    expect(checked, "设置面标题总数（少一个就说明有标题漏掉了档位）").toBe(13);
+    // 设置面标题总数：settings.tsx 7（1 一级色条 + 6 卡头条 h2）+ 7 个组件卡头条各 1
+    //（Remote/Audit/Signal/DataMgmt/Usage/UsageStatus/RemoteAppearance）+ UsageStatusSection 的 h3 1 = 15。
+    // 2026-10-07 D4 把「快捷键」整节移除 ⇒ 账曾由 14 降为 13；2026-10-11（a）开机自启
+    // 分区加入、（b）远程端外观卡头条化并补 h2 语义（原折叠壳无 h2）⇒ 14 → 15（**本锁
+    // 当场抓到过多次变化**：分区/卡增删时它先红，逼我们把数字与新事实对齐，而不是让计数悄悄漂）。
+    expect(checked, "设置面标题总数（少一个就说明有标题漏掉了档位）").toBe(15);
   });
 
   it("③ 小字号**只**允许出现在登记过的豁免面里（外溢即红）", () => {
@@ -106,7 +108,10 @@ describe("设置页排版层级（C1）", () => {
     const offenders = SURFACE.filter((f) =>
       readFileSync(f, "utf8").includes('className="text-sm font-medium"')
     ).map(rel);
-    expect(offenders, "设置面的字段名必须用 SETTINGS_FIELD（否则「字段名」这一档只是纸面规范）").toEqual([]);
+    expect(
+      offenders,
+      "设置面的字段名必须用 SETTINGS_FIELD（否则「字段名」这一档只是纸面规范）"
+    ).toEqual([]);
   });
 
   it("④ 豁免面自身仍在（防止「顺手规范密集网格」把列挤爆）", () => {

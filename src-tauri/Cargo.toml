@@ -1,6 +1,6 @@
 [package]
 name = "tuvis"
-version = "0.5.6"
+version = "0.5.7"
 description = "你的桌面多 Agent 指挥台"
 authors = ["jarvis"]
 edition = "2021"
@@ -126,6 +126,10 @@ winreg = "0.55"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
+# 开机自动启动（2026-10-11）：官方插件，Windows 写 HKCU\Run 注册表、macOS 写
+# LaunchAgent；注册时带 --tuvis-autostart 识别参数（commands::autostart::AUTOSTART_ARG），
+# 启动期据此实现「自启静默进托盘」。Rust 侧调用（ManagerExt），capabilities 零改动
+tauri-plugin-autostart = "2"
 
 [profile.release]
 lto = true

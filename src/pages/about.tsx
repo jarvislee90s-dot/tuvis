@@ -1,6 +1,7 @@
 // 关于页（2026-10-12 改版，CC Switch 风格）：
 // - 版本卡：appName + 当前版本 + 更新动作。on mount 自动检查一次更新（复用
-//   check_for_github_update，不轮询）——有新版本 → 右侧醒目主色「更新到 vX.Y.Z」
+//   check_for_github_update，不轮询；自动路径失败静默——用户没点按钮就不弹红条，
+//   仅手动点「检查更新」失败才 toast）——有新版本 → 右侧醒目主色「更新到 vX.Y.Z」
 //   主按钮（点击显式打开本窗口 UpdaterDialog 走既有安装流程）+「检测到新版本」
 //   状态行；无新版本 → 维持「检查更新」次按钮 + upToDate 行内提示
 // - 快捷行：官方仓库 / 更新日志 / 近期更新 三枚外链按钮
@@ -38,7 +39,7 @@ const techVersions = {
 export default function AboutPage() {
   const [appVersion, setAppVersion] = useState("");
   const { t } = useAppTranslation();
-  const { checkUpdate, checking, showNoUpdate } = useManualUpdateCheck();
+  const { checkUpdate, checkUpdateSilent, checking, showNoUpdate } = useManualUpdateCheck();
   // 有无新版本以 store 检查结果为权威（mount 自动检查与手动检查共用一条管道）
   const result = useUpdaterStore((s) => s.result);
   const openDialog = useUpdaterStore((s) => s.openDialog);
@@ -49,13 +50,15 @@ export default function AboutPage() {
   }, []);
 
   // on mount 自动检查一次（ref 门栓兜 dev StrictMode 双挂载；不轮询）。
+  // 走静默变体：用户没点任何按钮，断网时不该凭空弹红条（update 契约见 updater.rs
+  // check_for_github_update 尾注）——「已是最新」行内提示照常点亮。
   // 弹窗不自动开（UpdaterDialog autoOpen=false）——检查结果只点亮主按钮，点击才开
   const autoCheckRef = useRef(false);
   useEffect(() => {
     if (autoCheckRef.current) return;
     autoCheckRef.current = true;
-    void checkUpdate();
-  }, [checkUpdate]);
+    void checkUpdateSilent();
+  }, [checkUpdateSilent]);
 
   // Star 横幅关闭态：null = 版本未就绪（先不渲染，避免「闪现后又被藏起」）；
   // 版本就绪后读一次 localStorage 判定

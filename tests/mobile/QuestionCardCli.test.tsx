@@ -559,6 +559,29 @@ describe("QuestionCard：问答卡渲染与应答（批次乙 T8）", () => {
       cleanup();
     }
   });
+
+  it("Task 15 止血门：409 app_form_pending 渲染中文引导（不是「session-question/answer 409」）", async () => {
+    installFetch();
+    routes.question = singleQuestionInfo();
+    const REASON = "APP 会话该操作走协议通道，开发中——请在 APP 内操作";
+    // ① 后端带 reason：原样渲染（文案单一来源在 api.rs 的 APP_FORM_PENDING_REASON）
+    routes.answerStatus = 409;
+    routes.answerBody = { error: "app_form_pending", reason: REASON };
+    const first = render(<QuestionCard session={{ id: "sess-app-form" }} />);
+    fireEvent.click(await screen.findByTestId("question-option-0"));
+    const el = await screen.findByTestId("question-error");
+    expect(el.textContent).toBe(REASON);
+    expect(el.textContent).not.toContain("409");
+    first.unmount();
+    cleanup();
+    // ② 无 reason（旧后端/异体）：同义兜底，仍不是无意义串
+    routes.answerBody = { error: "app_form_pending" };
+    render(<QuestionCard session={{ id: "sess-app-form" }} />);
+    fireEvent.click(await screen.findByTestId("question-option-0"));
+    const el2 = await screen.findByTestId("question-error");
+    expect(el2.textContent).toBe(REASON);
+    expect(el2.textContent).not.toContain("409");
+  });
 });
 
 // ==== 联合断言：问答模式不渲染 允许/拒绝 + key 前缀互异 ====

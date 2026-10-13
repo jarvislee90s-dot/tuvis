@@ -14,6 +14,10 @@ export interface PetConfig {
   approvalAction: PetAction;
   errorAction: PetAction; // 占位：v1 无触发场景（spec D9/D14）
   doneAction: PetAction;
+  /** 启动跟随（2026-10-11 用户裁决）：开 = 软件每次启动宠物自动跟出（哪怕上次
+   *  隐身——显隐开关只管本会话中途）；关 = 启动后先不出，托盘/标题栏随时可开。
+   *  未设置过 = 默认开（DEFAULT 兜底）。消费点 = pet 窗口挂载靴（pets 页） */
+  followStartup: boolean;
 }
 
 export const CONFIG_KEY = "mam-pet-config";
@@ -40,10 +44,12 @@ const DEFAULT_CONFIG: PetConfig = {
   approvalAction: "waiting",
   errorAction: "failed",
   doneAction: "jumping",
+  followStartup: true,
 };
 
 const ACTION_KEYS = ["dblAction", "approvalAction", "errorAction", "doneAction"] as const;
-const BOOL_KEYS = ["alwaysOnTop", "muted", "talkative", "gravity"] as const;
+// followStartup 在 BOOL_KEYS 里一起享受 sanitize 白名单（旧存档无该键 → DEFAULT true 兜底）
+const BOOL_KEYS = ["alwaysOnTop", "muted", "talkative", "gravity", "followStartup"] as const;
 
 function sanitize(raw: unknown): PetConfig {
   const out = { ...DEFAULT_CONFIG };

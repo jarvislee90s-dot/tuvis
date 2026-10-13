@@ -1,5 +1,7 @@
 // Tauri IPC 命令 - 按功能域拆分到子模块
 
+// 开机自动启动（2026-10-11）：官方 autostart 插件命令封装（真值源 = OS 侧插件状态）
+pub mod autostart;
 pub mod data_management;
 // 导出落盘（计划① Task 21，契约 §3 新增 2 条命令；按字母序排在 data_management 之后）
 pub mod export;

@@ -1176,20 +1176,65 @@ export type QuestionAnswerResult =
     }
   | { status: "failed"; error: string; aborted?: boolean; stage?: QuestionAnswerStage };
 
+/** codex APP 止血门（Task 15，2026-10-12）的用户可读**缺省**文案：**单一来源**——
+ *  后端下发 `reason` 时一律以后端为准（文案单一来源，与 `blocked_by_dialog` 同惯例），
+ *  只在缺省（旧后端 / 异体响应）时用它。取值逻辑见 [`appFormPendingCopy`]。 */
+export const APP_FORM_PENDING_FALLBACK = "APP 会话该操作走协议通道，开发中——请在 APP 内操作";
+
+/** 止血门 `app_form_pending` → 用户可读文案（**取值逻辑单点**，2026-10-13 复评抽出）。
+ *
+ *  三处入口共用：问答侧 [`questionAnswerErrorCopy`]、审批侧 [`approveErrorCopy`]、
+ *  `ModeBar` 的 409 分诊。此前只抽出了常量 [`APP_FORM_PENDING_FALLBACK`]，而「取后端
+ *  `reason`、缺省兜底」这段**选择逻辑**仍被逐字抄了三份——正是抽常量要防的那种漂移
+ *  （常量单点了、逻辑还在漂）。调用方**勿再另写三元表达式**。 */
+export function appFormPendingCopy(e: ApiError): string {
+  return typeof e.data?.reason === "string" ? e.data.reason : APP_FORM_PENDING_FALLBACK;
+}
+
 /** 问答应答**错误码 → 用户可读中文文案**（丁T6 复评抽出：卡内与 composer 两条入口
  *  必须**同口径**——两处各写一套 `if/else` 迟早漂移，且 composer 侧曾漏掉这条映射
  *  （读的是 `data.reason` 而问答端点回的是 `data.error`）→ 409 会显示成
  *  「session-question/answer 409」这种对用户无意义的串）。
  *
  *  取值来源：后端 `remote::api::session_question_answer` 的 409/400 错误码
- *  （`no_question` / `multi_questions` / `tool_readonly` / `bad_index`；
- *  另有 `bad_request` 兜底）。码不在表内 → 回原 message（不编文案）。 */
+ *  （`no_question` / `multi_questions` / `tool_readonly` / `bad_index` /
+ *  `app_form_pending`；另有 `bad_request` 兜底）。码不在表内 → 回原 message
+ *  （不编文案）。 */
 export function questionAnswerErrorCopy(e: ApiError): string {
   const code = typeof e.data?.error === "string" ? e.data.error : null;
   if (code === "no_question") return "当前没有待回答的问题";
   if (code === "multi_questions") return "多个问题请回到终端完成作答";
   if (code === "tool_readonly") return "该工具的远程作答尚未实测，请在终端完成作答";
   if (code === "bad_index") return "选项序号无效，请刷新后重试";
+  // Task 15 止血门：codex APP 会话的问答写动作走协议通道（开发中）——**必须**消费
+  // 这条码，否则用户看到的是「session-question/answer 409」这种无意义串（本函数的
+  // 存在理由同上）。取值逻辑单点见 [`appFormPendingCopy`]（reason 优先、常量兜底）
+  if (code === "app_form_pending") return appFormPendingCopy(e);
+  return e.message;
+}
+
+/** 审批应答**错误码 → 用户可读中文文案**（第二轮复评 J1 抽出：ApproveCard 的
+ *  `handleAnswer` / `handleFeedbackStart` 两处 catch 本来就各写一套同义 `if/else`，
+ *  且**都没有**消费 Task 15 止血门的 `app_form_pending` → 用户屏幕上出现
+ *  「session-approve 409」这种无意义串。与 [`questionAnswerErrorCopy`] 同一条纪律：
+ *  一码一文案、单点映射，调用方勿另写一套）。
+ *
+ *  取值来源：后端 `remote::api::session_approve` 的 409/404 错误码
+ *  （`not_waiting` / `no_mapping` / `no_session` / `app_form_pending`；
+ *  另有 `bad_request` 兜底）。码不在表内 → 回原 message（不编文案）。
+ *
+ *  **收敛带来的行为变化（有意，如实申报）**：`no_mapping` 原先只在 `handleAnswer`
+ *  有映射，`handleFeedbackStart` 落到 `e.message`；两处合并后反馈入口同样给出
+ *  「该工具暂不支持审批应答，请用普通发送」——严格优于原来的无意义串。 */
+export function approveErrorCopy(e: ApiError): string {
+  const code = typeof e.data?.error === "string" ? e.data.error : null;
+  if (code === "not_waiting") return "会话不在等待状态";
+  if (code === "no_mapping") return "该工具暂不支持审批应答，请用普通发送";
+  if (code === "no_session") return "会话已结束，请返回看板刷新";
+  // Task 15 止血门（I2 新开的 409 出口）：codex APP 会话的审批写动作走协议通道
+  //（开发中）——**必须**消费这条码，否则用户看到的是「session-approve 409」。
+  // 取值逻辑单点见 [`appFormPendingCopy`]（与问答侧 / ModeBar 侧**同一实现**，不漂移）
+  if (code === "app_form_pending") return appFormPendingCopy(e);
   return e.message;
 }
 

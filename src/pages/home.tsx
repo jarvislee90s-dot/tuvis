@@ -19,6 +19,9 @@ import { Activity, AlertCircle } from "lucide-react";
 import { NotificationBell } from "@/components/notifications/NotificationBell";
 import { useLegacySkillMigration } from "@/hooks/useLegacySkillMigration";
 import { LegacySkillMigrationDialog } from "@/components/resources/LegacySkillMigrationDialog";
+import { ToolFilterChips } from "@/components/sessions/ToolFilterChips";
+import { AGENT_BADGE } from "@/lib/agentBadge";
+import { filterByAgent, loadToolFilter, saveToolFilter, type ToolFilter } from "@/lib/toolFilter";
 
 export default function HomePage() {
   useSessions();
@@ -29,6 +32,16 @@ export default function HomePage() {
   const { sessions, totalCount, waitingCount, loading } = useSessionStore();
   const { t } = useAppTranslation();
   const queryClient = useQueryClient();
+
+  // 按工具筛选（2026-10-11）：单选 chips + localStorage 记忆（重启保持上次选择，
+  // 首次默认「全部」）；纯筛选不动排序，计数条保持全量口径（与移动端 Board 一致）
+  const [toolFilter, setToolFilterState] = useState<ToolFilter>(() => loadToolFilter());
+  const setToolFilter = (filter: ToolFilter) => {
+    setToolFilterState(filter);
+    saveToolFilter(filter);
+  };
+  const filteredSessions = filterByAgent(sessions, toolFilter);
+  const filterToolLabel = toolFilter === "all" ? undefined : AGENT_BADGE[toolFilter]?.label;
 
   // 一键清除已完成卡片（绿/空闲）：对每张绿卡复用单卡 X 的同款语义——
   // 未读卡标已读（mark_session_read），其余 dismiss（dismiss_session_card）；
@@ -64,6 +77,7 @@ export default function HomePage() {
           petText: petOn ? t("tray.petHide") : t("tray.petShow"),
           quitText: t("tray.quit"),
           remoteOnText: t("tray.remote"), // M4 T4：远程开关项标签（勾选态 Rust 侧自查）
+          autostartText: t("tray.autostart"), // 2026-10-11：开机自启开关项标签（勾选态 Rust 侧自查）
         });
       } catch (error) {
         console.error("Failed to initialize tray menu:", error);
@@ -151,9 +165,16 @@ export default function HomePage() {
         </div>
       </div>
 
+      {/* 工具筛选 chips（2026-10-11）：仅看板 tab 出现，切扩展 tab 由条件渲染隐藏 */}
+      {activeTab === "dashboard" && <ToolFilterChips value={toolFilter} onChange={setToolFilter} />}
+
       {/* 内容区 */}
       <div className="flex-1 overflow-y-auto">
-        {activeTab === "dashboard" ? <SessionGrid sessions={sessions} /> : <ExtensionList />}
+        {activeTab === "dashboard" ? (
+          <SessionGrid sessions={filteredSessions} filterToolLabel={filterToolLabel} />
+        ) : (
+          <ExtensionList />
+        )}
       </div>
       {/* 启动校验弹窗（EP2）：外部宠物素材异常时主窗口确认，宠物窗口先行降级 */}
       <PetStartupGuard />

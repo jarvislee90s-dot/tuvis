@@ -30,6 +30,9 @@ describe("AGENT_BADGE", () => {
       expect(badge, `missing badge for ${tool}`).toBeDefined();
       expect(badge.label).toBeTruthy();
       expect(badge.className).toContain("border-");
+      // 2026-10-11 看板筛选 chips 依赖 iconClass（中性 chip 底上的图标色）：
+      // 穷尽锁与 label/className 同点，新工具接入漏列直接红
+      expect(badge.iconClass).toContain("text-");
     }
   });
 

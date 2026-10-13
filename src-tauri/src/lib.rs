@@ -27,14 +27,24 @@ fn update_tray_menu(
     quit_text: String,
     pet_text: String,
     remote_on_text: String,
+    autostart_text: String,
 ) -> Result<(), String> {
-    plugins::system_tray::update_tray_menu(&app, &show_text, &quit_text, &pet_text, &remote_on_text)
+    plugins::system_tray::update_tray_menu(
+        &app,
+        &show_text,
+        &quit_text,
+        &pet_text,
+        &remote_on_text,
+        &autostart_text,
+    )
 }
 
 /// 托盘菜单统一重建（Task 16）：基础项 + 预设项（带开/关选中态）一次成型。
 /// 标签合并语义：传入的标签覆盖持久化值，未传的沿用最近一次值——预设增删/
 /// 开关变化处可只追加 presetsLabel 一行调用，无需关心基础项文案。
 /// M4 T4 并入：新增 remote_on_text（远程开关项标签，勾选态/地址 Rust 侧自查）。
+/// 2026-10-11 并入：autostart_text（开机自启开关项标签，勾选态 Rust 侧实时
+/// 自查 autostart 插件状态）；未传沿用持久化值（旧持久化值缺字段按默认补齐）。
 /// `update_tray_menu` 保留但前端已不再调用（保留至下个清理窗口移除）
 #[tauri::command]
 fn refresh_tray(
@@ -44,6 +54,7 @@ fn refresh_tray(
     pet_text: Option<String>,
     quit_text: Option<String>,
     remote_on_text: Option<String>,
+    autostart_text: Option<String>,
 ) -> Result<(), String> {
     let labels = plugins::system_tray::TrayLabels::merged(
         presets_label,
@@ -51,6 +62,7 @@ fn refresh_tray(
         pet_text,
         quit_text,
         remote_on_text,
+        autostart_text,
     );
     plugins::system_tray::update_tray_with_presets_labeled(&app, &labels)
 }
@@ -137,6 +149,17 @@ pub fn run() {
             }
         }))
         .setup(|app| {
+            // 开机自启静默面（2026-10-11）：自启注册项带 --tuvis-autostart 识别参数，
+            // 检测到 → 主窗口不弹（托盘常驻，需要时从托盘点开）。手动启动无此参数，
+            // 永远正常显窗；桌宠不受影响（按其自身开关照常出现）。窗口虽以
+            // visible:true 静态创建，但 setup 先于事件循环首轮绘制，此处 hide 不闪窗
+            let argv: Vec<String> = std::env::args().collect();
+            if commands::autostart::is_autostart_launch(&argv) {
+                log::info!("开机自启启动：主窗口静默（托盘常驻）");
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
             // 在 dev 模式下自动打开 devtools，启用 CDP 远程调试
             #[cfg(debug_assertions)]
             {
@@ -177,6 +200,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        // 开机自动启动（2026-10-11）：注册时携带 --tuvis-autostart 识别参数，
+        // 插件把它写进平台自启项（注册表 Run 键 / launchd plist）
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![commands::autostart::AUTOSTART_ARG]),
+        ))
         .plugin(plugins::system_tray::init());
     let builder = builder.invoke_handler(tauri::generate_handler![
         greet,
@@ -262,6 +291,9 @@ pub fn run() {
         commands::mcp::read_mcp_servers,
         commands::mcp::write_mcp_server,
         commands::mcp::remove_mcp_server,
+        // 开机自动启动（2026-10-11）：真值源 = OS 侧插件状态，设置页与托盘共用
+        commands::autostart::get_autostart_enabled,
+        commands::autostart::set_autostart_enabled,
         commands::plugin::toggle_plugin_for_tool,
         commands::settings::get_setting,
         commands::settings::set_setting,

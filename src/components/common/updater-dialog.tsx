@@ -8,7 +8,7 @@
 //   手动模式（About 挂载）由按钮触发检查——改版后（2026-10-12）检查结果点亮页面
 //   「更新到 vX.Y.Z」主按钮，弹窗由该按钮显式打开（autoOpen 默认仍为开，兼容旧路径）
 // - 图片弱网降级：加载失败显示 alt 文案占位，不露破图
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useTranslation } from "react-i18next";
@@ -274,29 +274,49 @@ export function UpdaterDialog({ manualCheck = false, autoOpen = true }: UpdaterD
   );
 }
 
-/** About 页手动检查：出结果前禁用按钮/出结果后给行内「已是最新」或错误 toast */
+/** About 页检查更新：手动（按钮）与自动（mount）两条路径共用同一条结果管线——
+ *  出结果前按钮禁用（checking）；无新版本给行内「已是最新」（showNoUpdate）；
+ *  仅手动路径在失败时 toast。自动路径静默是后端契约：cmd check_for_github_update
+ *  网络失败静默返回 error（src-tauri/src/commands/updater.rs），用户一个按钮都没点
+ *  就弹红条属于违约——断网/挂代理时开「关于」页不该挨一记报错 */
 export function useManualUpdateCheck() {
   const checkUpdate = useUpdaterStore((s) => s.checkUpdate);
   const checking = useUpdaterStore((s) => s.checking);
   const [showNoUpdate, setShowNoUpdate] = useState(false);
   const { t } = useTranslation();
 
-  const handleCheckUpdate = async () => {
-    setShowNoUpdate(false);
-    const r = await checkUpdate();
+  /** silent = 失败不 toast（自动路径）；两条路径都落 store 结果 + 点亮「已是最新」行内提示。
+   *  useCallback 固化引用：消费方（About）把它放进 mount effect 的依赖数组，引用每次渲染
+   *  都变会让 effect 空转（目前只靠 ref 门栓兜住），依赖数组也就不再诚实 */
+  const runCheckUpdate = useCallback(
+    async (silent: boolean) => {
+      setShowNoUpdate(false);
+      const r = await checkUpdate();
 
-    if (r.status === "up-to-date") {
-      setShowNoUpdate(true);
-      return;
-    }
-    if (r.status === "error") {
-      // Rust 侧 message 自带定位线索（如「GitHub API 请求失败: connection refused」），
-      // 不吞细节——弱网/代理/hosts 屏蔽场景用户第一眼就能看出卡在哪
-      toast.error(t("updater.checkFailed", { message: r.message }));
-    }
-    // available → 检查结果驱动消费方页面（autoOpen=false 的 About 用它点亮「更新到 vX」主按钮；
-    // 默认 autoOpen=true 的消费方才自动弹窗）
+      if (r.status === "up-to-date") {
+        setShowNoUpdate(true);
+        return;
+      }
+      if (r.status === "error" && !silent) {
+        // Rust 侧 message 自带定位线索（如「GitHub API 请求失败: connection refused」），
+        // 不吞细节——弱网/代理/hosts 屏蔽场景用户第一眼就能看出卡在哪
+        toast.error(t("updater.checkFailed", { message: r.message }));
+      }
+      // available → 检查结果驱动消费方页面（autoOpen=false 的 About 用它点亮「更新到 vX」主按钮；
+      // 默认 autoOpen=true 的消费方才自动弹窗）
+    },
+    [checkUpdate, t]
+  );
+
+  const checkUpdateManual = useCallback(() => runCheckUpdate(false), [runCheckUpdate]);
+  const checkUpdateSilent = useCallback(() => runCheckUpdate(true), [runCheckUpdate]);
+
+  return {
+    /** 手动检查（按钮）：失败 toast 带具体原因 */
+    checkUpdate: checkUpdateManual,
+    /** 自动检查（mount）：失败静默，仅落结果 */
+    checkUpdateSilent,
+    checking,
+    showNoUpdate,
   };
-
-  return { checkUpdate: handleCheckUpdate, checking, showNoUpdate };
 }

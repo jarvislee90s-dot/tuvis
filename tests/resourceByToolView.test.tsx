@@ -7,6 +7,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ResourceByToolView } from "@/components/resources/ResourceByToolView";
+import { TOOLS } from "./fixtures/resourceView";
 import type {
   AssignmentSummary,
   ExtensionWithAssignments,
@@ -23,23 +24,6 @@ import i18n from "@/i18n";
 beforeAll(async () => {
   await i18n.changeLanguage("zh");
 });
-
-const TOOLS = [
-  {
-    id: "claude",
-    label: "Claude Code",
-    skillToggleSupported: true,
-    mcpSupported: true,
-    pluginSupported: true,
-  },
-  {
-    id: "codex",
-    label: "Codex CLI",
-    skillToggleSupported: true,
-    mcpSupported: true,
-    pluginSupported: true,
-  },
-];
 
 const assign = (toolId: string, enabled: boolean): AssignmentSummary[] => [
   { agentToolId: toolId, enabled, linkStatus: enabled ? "linked" : "missing" },
@@ -175,7 +159,9 @@ describe("ResourceByToolView（实际配置 + 来源徽章三态）", () => {
 
   it("计数如实：codex 卡 Skills (5)（链接2 + .agents1 + 原生2 - 同名合并1）、MCP (1)", async () => {
     await renderView();
-    const codexCard = screen.getByText("Codex", { selector: "h3" }).closest("div[class*='rounded border p-3']")!;
+    const codexCard = screen
+      .getByText("Codex", { selector: "h3" })
+      .closest("div[class*='rounded border p-3']")!;
     expect(within(codexCard).getByText("Skills (5)")).toBeInTheDocument();
     expect(within(codexCard).getByText("MCP (1)")).toBeInTheDocument();
     expect(within(codexCard).getByText("mcp-1")).toBeInTheDocument();

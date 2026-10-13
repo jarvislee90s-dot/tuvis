@@ -135,7 +135,7 @@ describe("工具管理（review F7①②）", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("update_tool_settings", expect.anything());
     // 回到工具分区：开关为已保存状态（checked）、dirty 已重置（无保存按钮）
     // 2026-10-06 两级导航：侧栏点击目标由「分区名」变为「块」（块内多卡并置），用 testid 更稳
-  fireEvent.click(await screen.findByTestId("settings-nav-tools"));
+    fireEvent.click(await screen.findByTestId("settings-nav-tools"));
     const opencode = await screen.findByText("OpenCode");
     const row = opencode.closest("div[class*='justify-between']") as HTMLElement;
     expect(row.querySelector('[role="switch"]')).toHaveAttribute("data-state", "checked");
@@ -158,8 +158,8 @@ describe("工具管理（review F7①②）", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("update_tool_settings", expect.anything());
   });
 
-  // Task 3（裁决 34a，设计 §5.4）：设置页工具勾选区旁补「取消勾选的工具……」提示
-  // （no_session 载荷不附 hint——不为边缘态扩查询面，引导收敛在设置页文案级）
+  // Task 3（裁决 34a）：设置页工具勾选区旁补「取消勾选的工具……」提示——
+  // 后端对 APP 形态写动作以 409 app_form_pending 止血拒绝，本行是入口侧引导文案
   it("裁决 34a：工具勾选区旁渲染看板与远程能力提示（zh）", async () => {
     await i18n.changeLanguage("zh");
     renderPage();

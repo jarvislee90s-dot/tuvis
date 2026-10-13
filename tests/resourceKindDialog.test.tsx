@@ -1,13 +1,15 @@
 // tests/resourceKindDialog.test.tsx — 资源大表弹窗（资源管理页 UI 改版 A2/A3/A4）
 // 覆盖：类型预选（initialKind）/ tab 再切 + tab 计数与行数一致 / 卡片 search 过滤弹窗列表 /
+// 弹窗内搜索框（F3）输入 → 行过滤与 tab 计数实时联动、清空即恢复 /
 // 竖排「全部启用」双行按钮渲染（全部/启用、全启用态 全部/禁用）与点击触发
 // handleToggleAll 的 invoke 序列（enable 方向逐工具直发；disable 方向先查类型再删链）/
 // 弹窗关闭（X → onOpenChange(false)）
+import { useState } from "react";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ResourceKindDialog } from "@/components/resources/ResourceKindDialog";
-import type { SsotResource } from "@/types/extension";
+import { RESOURCES, TOOLS } from "./fixtures/resourceView";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
@@ -19,43 +21,10 @@ beforeAll(async () => {
   await i18n.changeLanguage("zh");
 });
 
-const res = (o: Partial<SsotResource>): SsotResource => ({
-  name: "x",
-  kind: "skill",
-  enabledTools: [],
-  ...o,
-});
-
-/** alpha 全启用（claude+codex）→ 竖排钮态「全部/禁用」；beta 全未启用 → 「全部/启用」 */
-const RESOURCES = {
-  skills: [
-    res({ name: "alpha", enabledTools: ["claude", "codex"] }),
-    res({ name: "beta", enabledTools: [] }),
-  ],
-  mcp: [res({ name: "mcp-x", kind: "mcp", enabledTools: ["claude"] })],
-  plugins: [res({ name: "plug-x", kind: "plugin", enabledTools: ["codex"] })],
-};
-
-const TOOLS = [
-  {
-    id: "claude",
-    label: "Claude Code",
-    skillToggleSupported: true,
-    mcpSupported: true,
-    pluginSupported: true,
-  },
-  {
-    id: "codex",
-    label: "Codex CLI",
-    skillToggleSupported: true,
-    mcpSupported: true,
-    pluginSupported: true,
-  },
-];
-
 function renderDialog(props?: {
   initialKind?: "skill" | "mcp" | "plugin";
   search?: string;
+  onSearchChange?: (search: string) => void;
   onOpenChange?: ReturnType<typeof vi.fn>;
 }) {
   const queryClient = new QueryClient({
@@ -68,6 +37,7 @@ function renderDialog(props?: {
         onOpenChange={props?.onOpenChange ?? vi.fn()}
         initialKind={props?.initialKind ?? "skill"}
         search={props?.search ?? ""}
+        onSearchChange={props?.onSearchChange ?? vi.fn()}
       />
     </QueryClientProvider>
   );
@@ -110,6 +80,44 @@ describe("ResourceKindDialog（大表弹窗）", () => {
     expect(await screen.findByText("alpha")).toBeInTheDocument();
     expect(screen.queryByText("beta")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Skill (1)" })).toBeInTheDocument();
+  });
+
+  it("弹窗内搜索框（F3）：输入 → 行过滤与 tab 计数实时联动；清空即恢复全量", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // 有状态宿主：模拟 ResourceByKindView 的提升状态（value + onChange 闭环）
+    function Host() {
+      const [q, setQ] = useState("");
+      return (
+        <ResourceKindDialog
+          open
+          onOpenChange={vi.fn()}
+          initialKind="skill"
+          search={q}
+          onSearchChange={setQ}
+        />
+      );
+    }
+    render(
+      <QueryClientProvider client={queryClient}>
+        <Host />
+      </QueryClientProvider>
+    );
+
+    // 初始全量：tab 计数 2、两行都在
+    await screen.findByText("beta");
+    expect(screen.getByRole("button", { name: "Skill (2)" })).toBeInTheDocument();
+
+    // 弹窗内输入（模态遮罩下的卡片框点不到，这枚是弹窗内唯一可编辑搜索框）
+    const box = screen.getByPlaceholderText("搜索 skill...");
+    fireEvent.change(box, { target: { value: "alpha" } });
+    expect(screen.getByRole("button", { name: "Skill (1)" })).toBeInTheDocument();
+    expect(screen.getByText("alpha")).toBeInTheDocument();
+    expect(screen.queryByText("beta")).not.toBeInTheDocument();
+
+    // 清空即恢复：命中行与计数一起回来
+    fireEvent.change(box, { target: { value: "" } });
+    expect(screen.getByRole("button", { name: "Skill (2)" })).toBeInTheDocument();
+    expect(screen.getByText("beta")).toBeInTheDocument();
   });
 
   it("竖排全部启用钮（A4）：未全启用行 = 全部/启用 两行文本；点击 → 逐工具 enable 直发序列", async () => {

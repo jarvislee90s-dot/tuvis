@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
+import { SETTINGS_CARD_TITLE } from "@/components/settings/typography";
 
 // 远程端外观配置器（2026-10-05 UI 改版，spec §5；参考稿
 // docs/design/remote-ui/04-外观配置-设置节-定稿.html）：桌面端保存 → settings KV
@@ -150,10 +151,9 @@ function resVars(skinKey: string): CSSProperties {
 
 export default function RemoteAppearanceSection() {
   const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [config, setConfig] = useState<UiConfig>({ ...DEFAULTS });
   const [savedConfig, setSavedConfig] = useState<UiConfig>({ ...DEFAULTS });
-  const [loadFailed, setLoadFailed] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -396,166 +396,160 @@ export default function RemoteAppearanceSection() {
 
   return (
     <div className="overflow-hidden rounded-xl border">
-      {/* 框头：行为徽标（保存后下发）——与桌面端「即点即生效」框明确区分 */}
-      <button
-        type="button"
-        className="bg-muted/40 flex w-full items-baseline gap-2 px-4 py-2.5 text-left"
-        onClick={() => setExpanded((v) => !v)}
-      >
-        <span className="text-sm font-semibold">{t("settings.remoteAppearance.title")}</span>
+      {/* 卡头条（2026-10-11 两级标题拉开）：折叠交互按用户裁决**移除**（设置页为独立
+          窗口，空间足够，配置器常展开）；h2 语义补位与其它卡头条一致 */}
+      <div className="bg-muted/40 flex items-baseline gap-2 border-b px-4 py-2.5">
+        <h2 className={SETTINGS_CARD_TITLE}>{t("settings.remoteAppearance.title")}</h2>
         <span className="text-muted-foreground text-xs">{t("settings.remoteAppearance.hint")}</span>
         <span className="ml-auto rounded-full bg-amber-600/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400">
           {t("settings.remoteAppearance.scope")}
         </span>
-        <span className="text-muted-foreground text-xs">{expanded ? "▲" : "▼"}</span>
-      </button>
+      </div>
 
-      {expanded && (
-        <div className="space-y-4 px-4 py-4">
-          {loadFailed && (
-            <p className="text-xs text-amber-700 dark:text-amber-400">
-              {t("settings.remoteAppearance.loadFail")}
-            </p>
-          )}
+      <div className="space-y-4 px-4 py-4">
+        {loadFailed && (
+          <p className="text-xs text-amber-700 dark:text-amber-400">
+            {t("settings.remoteAppearance.loadFail")}
+          </p>
+        )}
 
-          {/* ① 字体（自证样式：文字即其字体本样） */}
-          <div className="border-b pb-4">
-            <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
-              {t("settings.remoteAppearance.fontLabel")}
-            </div>
-            <div className="grid grid-cols-4 gap-2">
-              {Object.entries(FONTS).map(([k, f]) => (
+        {/* ① 字体（自证样式：文字即其字体本样） */}
+        <div className="border-b pb-4">
+          <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
+            {t("settings.remoteAppearance.fontLabel")}
+          </div>
+          <div className="grid grid-cols-4 gap-2">
+            {Object.entries(FONTS).map(([k, f]) => (
+              <button
+                key={k}
+                type="button"
+                style={{ fontFamily: f.ui }}
+                className={optBtn(config.font === k)}
+                onClick={() => patch({ font: k })}
+              >
+                {t(`settings.remoteAppearance.${f.key}`)}
+                <span className="mt-0.5 block text-[10px] font-normal opacity-70">Aa 123</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* ② 皮肤（白天/夜间各选其一） */}
+        <div className="border-b pb-4">
+          <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
+            {t("settings.remoteAppearance.skinLabel")}
+          </div>
+          <div className="grid grid-cols-6 gap-2">
+            {Object.entries(SKINS).map(([k, s]) => {
+              const isDay = k.startsWith("l");
+              const on = config.daySkin === k || config.nightSkin === k;
+              return (
                 <button
                   key={k}
                   type="button"
-                  style={{ fontFamily: f.ui }}
-                  className={optBtn(config.font === k)}
-                  onClick={() => patch({ font: k })}
+                  className={optBtn(on)}
+                  onClick={() => patch(isDay ? { daySkin: k } : { nightSkin: k })}
                 >
-                  {t(`settings.remoteAppearance.${f.key}`)}
-                  <span className="mt-0.5 block text-[10px] font-normal opacity-70">Aa 123</span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* ② 皮肤（白天/夜间各选其一） */}
-          <div className="border-b pb-4">
-            <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
-              {t("settings.remoteAppearance.skinLabel")}
-            </div>
-            <div className="grid grid-cols-6 gap-2">
-              {Object.entries(SKINS).map(([k, s]) => {
-                const isDay = k.startsWith("l");
-                const on = config.daySkin === k || config.nightSkin === k;
-                return (
-                  <button
-                    key={k}
-                    type="button"
-                    className={optBtn(on)}
-                    onClick={() => patch(isDay ? { daySkin: k } : { nightSkin: k })}
+                  <span
+                    className="mx-auto mb-1 flex h-7 w-7 items-center justify-center rounded-full border"
+                    style={{ background: s.pg, borderColor: "rgba(0,0,0,.12)" }}
                   >
                     <span
-                      className="mx-auto mb-1 flex h-7 w-7 items-center justify-center rounded-full border"
-                      style={{ background: s.pg, borderColor: "rgba(0,0,0,.12)" }}
-                    >
-                      <span
-                        className="block h-3 w-2.5 rounded-sm border"
-                        style={{ background: s.cbg, borderColor: "rgba(255,255,255,.4)" }}
-                      />
-                    </span>
-                    <span className="block text-[10px] font-semibold">
-                      {t(`settings.remoteAppearance.skin_${k}`)}
-                    </span>
-                    <span className="block text-[9px] opacity-70">
-                      {isDay
-                        ? t("settings.remoteAppearance.day")
-                        : t("settings.remoteAppearance.night")}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* ③ 圆角 */}
-          <div className="border-b pb-4">
-            <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
-              {t("settings.remoteAppearance.radiusLabel")}
-            </div>
-            <div className="grid grid-cols-4 gap-2">
-              {RADII.map((r) => (
-                <button
-                  key={r}
-                  type="button"
-                  className={optBtn(String(config.radius) === r)}
-                  onClick={() => patch({ radius: Number(r) })}
-                >
-                  {t(`settings.remoteAppearance.r_${r}`)}
-                  <span className="mt-0.5 block text-[10px] font-normal opacity-70">{r}px</span>
+                      className="block h-3 w-2.5 rounded-sm border"
+                      style={{ background: s.cbg, borderColor: "rgba(255,255,255,.4)" }}
+                    />
+                  </span>
+                  <span className="block text-[10px] font-semibold">
+                    {t(`settings.remoteAppearance.skin_${k}`)}
+                  </span>
+                  <span className="block text-[9px] opacity-70">
+                    {isDay
+                      ? t("settings.remoteAppearance.day")
+                      : t("settings.remoteAppearance.night")}
+                  </span>
                 </button>
-              ))}
-            </div>
-          </div>
-
-          {/* ④ 品牌点缀 */}
-          <div className="border-b pb-4">
-            <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
-              {t("settings.remoteAppearance.accentLabel")}
-            </div>
-            <div className="grid grid-cols-4 gap-2">
-              {ACCENTS.map((a) => (
-                <button
-                  key={a}
-                  type="button"
-                  className={optBtn(config.accent === a)}
-                  onClick={() => patch({ accent: a })}
-                >
-                  {t(`settings.remoteAppearance.a_${a}`)}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* 预览：左白天右夜间 × 四排（看板/对话流/审批卡/文件面板） */}
-          <div>
-            <div className="text-foreground mb-1.5 text-xs font-bold">
-              {t("settings.remoteAppearance.preview")}
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              {previewBox("day")}
-              {previewBox("night")}
-            </div>
-          </div>
-
-          {/* 保存条：改动不自动生效（用户裁决），显式「保存并下发」 */}
-          <div className="flex min-h-9 items-center gap-2.5 border-t pt-3">
-            {!dirty && !justSaved && (
-              <span className="text-muted-foreground text-xs">
-                {t("settings.remoteAppearance.clean")}
-              </span>
-            )}
-            {dirty && (
-              <span className="rounded-full bg-amber-600/10 px-2.5 py-1 text-xs text-amber-700 dark:text-amber-400">
-                {t("settings.remoteAppearance.dirty")}
-              </span>
-            )}
-            {justSaved && (
-              <span className="text-xs font-medium text-emerald-700 dark:text-emerald-400">
-                {t("settings.remoteAppearance.saved")}
-              </span>
-            )}
-            <button
-              type="button"
-              disabled={!dirty || saving}
-              onClick={() => void save()}
-              className="bg-primary text-primary-foreground ml-auto rounded-lg px-5 py-2 text-xs font-semibold disabled:opacity-40"
-            >
-              {t("settings.remoteAppearance.save")}
-            </button>
+              );
+            })}
           </div>
         </div>
-      )}
+
+        {/* ③ 圆角 */}
+        <div className="border-b pb-4">
+          <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
+            {t("settings.remoteAppearance.radiusLabel")}
+          </div>
+          <div className="grid grid-cols-4 gap-2">
+            {RADII.map((r) => (
+              <button
+                key={r}
+                type="button"
+                className={optBtn(String(config.radius) === r)}
+                onClick={() => patch({ radius: Number(r) })}
+              >
+                {t(`settings.remoteAppearance.r_${r}`)}
+                <span className="mt-0.5 block text-[10px] font-normal opacity-70">{r}px</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* ④ 品牌点缀 */}
+        <div className="border-b pb-4">
+          <div className="text-muted-foreground mb-1.5 text-[11px] font-bold tracking-wide">
+            {t("settings.remoteAppearance.accentLabel")}
+          </div>
+          <div className="grid grid-cols-4 gap-2">
+            {ACCENTS.map((a) => (
+              <button
+                key={a}
+                type="button"
+                className={optBtn(config.accent === a)}
+                onClick={() => patch({ accent: a })}
+              >
+                {t(`settings.remoteAppearance.a_${a}`)}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* 预览：左白天右夜间 × 四排（看板/对话流/审批卡/文件面板） */}
+        <div>
+          <div className="text-foreground mb-1.5 text-xs font-bold">
+            {t("settings.remoteAppearance.preview")}
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            {previewBox("day")}
+            {previewBox("night")}
+          </div>
+        </div>
+
+        {/* 保存条：改动不自动生效（用户裁决），显式「保存并下发」 */}
+        <div className="flex min-h-9 items-center gap-2.5 border-t pt-3">
+          {!dirty && !justSaved && (
+            <span className="text-muted-foreground text-xs">
+              {t("settings.remoteAppearance.clean")}
+            </span>
+          )}
+          {dirty && (
+            <span className="rounded-full bg-amber-600/10 px-2.5 py-1 text-xs text-amber-700 dark:text-amber-400">
+              {t("settings.remoteAppearance.dirty")}
+            </span>
+          )}
+          {justSaved && (
+            <span className="text-xs font-medium text-emerald-700 dark:text-emerald-400">
+              {t("settings.remoteAppearance.saved")}
+            </span>
+          )}
+          <button
+            type="button"
+            disabled={!dirty || saving}
+            onClick={() => void save()}
+            className="bg-primary text-primary-foreground ml-auto rounded-lg px-5 py-2 text-xs font-semibold disabled:opacity-40"
+          >
+            {t("settings.remoteAppearance.save")}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

@@ -4,6 +4,12 @@ pub mod app_activation;
 pub(crate) mod applescript;
 #[cfg(any(target_os = "macos", windows))]
 pub mod deep_link;
+/// Windows「派发即忘」子进程的统一出口（`windows_subsystem = "windows"` GUI 进程无
+/// 控制台 → 继承的 std 句柄无效 → `CreateProcessW` 报 os error 6）。**仅 Windows
+/// 装配**：macOS/Linux 的同类派发点（`open` / `xdg-open`）不受此缺陷影响，故不在本
+/// 单点收敛面内（详见 `detached` 模块文档）。
+#[cfg(windows)]
+pub(crate) mod detached;
 pub mod dsh_tab;
 #[cfg(target_os = "macos")]
 mod iterm;

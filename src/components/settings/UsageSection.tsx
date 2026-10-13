@@ -15,7 +15,7 @@
 //  7 `exportQuote`           **已搬走**（2026-10-07 B1）→ 看板导出条的 `UsageQuoteEditor`
 //  8 `exportPose`            **已搬到看板「导出设置」弹层**（2026-10-07）
 import { SETTINGS_FIELD } from "@/components/settings/typography";
-import { SETTINGS_CARD_TITLE, SETTINGS_SUBTITLE } from "@/components/settings/typography";
+import { SETTINGS_CARD_TITLE } from "@/components/settings/typography";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Input } from "@/components/ui/input";
@@ -142,125 +142,128 @@ export function UsageSection() {
   }, [pose, save]);
 
   return (
-    <div>
-      <h2 className={SETTINGS_CARD_TITLE}>{t("settings.usage.title")}</h2>
-      <p className={`mt-1 ${SETTINGS_SUBTITLE}`}>{t("settings.usage.desc")}</p>
+    <div className="overflow-hidden rounded-xl border">
+      {/* 卡头条（2026-10-11 两级标题拉开）：h2 保留档位常量搬进条内；说明收条右侧 */}
+      <div className="bg-muted/40 flex items-baseline justify-between gap-2 border-b px-4 py-2.5">
+        <h2 className={SETTINGS_CARD_TITLE}>{t("settings.usage.title")}</h2>
+        <span className="text-muted-foreground truncate text-xs">{t("settings.usage.desc")}</span>
+      </div>
+      <div className="p-3">
+        {/* 保存失败：命令级整包拒绝（越界 / 形态不符 / 落库失败）→ 原因必须可见可重试（不静默） */}
+        {saveError ? (
+          <p className="mt-2 text-sm text-red-500" data-testid="usage-set-error">
+            {t("settings.usage.saveFailed")}：{usageErrMsg(saveError, t)}
+          </p>
+        ) : null}
 
-      {/* 保存失败：命令级整包拒绝（越界 / 形态不符 / 落库失败）→ 原因必须可见可重试（不静默） */}
-      {saveError ? (
-        <p className="mt-2 text-sm text-red-500" data-testid="usage-set-error">
-          {t("settings.usage.saveFailed")}：{usageErrMsg(saveError, t)}
-        </p>
-      ) : null}
-
-      {/* 三态：读失败（可见可重试） / 加载中 / 表单。已有表单时不再被「失效后重取的瞬时失败」清空
+        {/* 三态：读失败（可见可重试） / 加载中 / 表单。已有表单时不再被「失效后重取的瞬时失败」清空
           （写入自己的失败另有 usage-set-error 显示） */}
-      {!form ? (
-        settingsQuery.isError ? (
-          <div className="mt-2 flex items-center gap-2" data-testid="usage-load-error">
-            <p className="text-sm text-red-500">{usageErrMsg(settingsQuery.error, t)}</p>
-            <Button variant="outline" size="sm" onClick={() => void settingsQuery.refetch()}>
-              {t("common.retry")}
-            </Button>
-          </div>
+        {!form ? (
+          settingsQuery.isError ? (
+            <div className="mt-2 flex items-center gap-2" data-testid="usage-load-error">
+              <p className="text-sm text-red-500">{usageErrMsg(settingsQuery.error, t)}</p>
+              <Button variant="outline" size="sm" onClick={() => void settingsQuery.refetch()}>
+                {t("common.retry")}
+              </Button>
+            </div>
+          ) : (
+            <p className="text-muted-foreground mt-2 text-sm">{t("common.loading")}</p>
+          )
         ) : (
-          <p className="text-muted-foreground mt-2 text-sm">{t("common.loading")}</p>
-        )
-      ) : (
-        <div className="mt-2 space-y-0">
-          <SettingRow
-            label={t("settings.usage.enabled")}
-            hint={t("settings.usage.enabledHint")}
-            htmlFor="usage-enabled"
-          >
-            <Switch
-              id="usage-enabled"
-              data-testid="usage-enabled"
-              checked={form.enabled}
-              onCheckedChange={(v) => change({ enabled: v })}
-            />
-          </SettingRow>
-          <div className="border-t" />
-
-          <SettingRow label={t("settings.usage.miniBarRange")} htmlFor="usage-minibar-range">
-            <select
-              id="usage-minibar-range"
-              data-testid="usage-minibar-range"
-              className="bg-background h-8 rounded-md border px-2 text-sm"
-              value={form.miniBarRange}
-              onChange={(e) =>
-                change({ miniBarRange: e.currentTarget.value as UsageSettings["miniBarRange"] })
-              }
+          <div className="mt-2 space-y-0">
+            <SettingRow
+              label={t("settings.usage.enabled")}
+              hint={t("settings.usage.enabledHint")}
+              htmlFor="usage-enabled"
             >
-              {RANGE_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {t(o.key)}
-                </option>
-              ))}
-            </select>
-          </SettingRow>
-          <div className="border-t" />
+              <Switch
+                id="usage-enabled"
+                data-testid="usage-enabled"
+                checked={form.enabled}
+                onCheckedChange={(v) => change({ enabled: v })}
+              />
+            </SettingRow>
+            <div className="border-t" />
 
-          <SettingRow
-            label={t("settings.usage.miniBarToolRows")}
-            hint={t("settings.usage.miniBarToolRowsHint")}
-            htmlFor="usage-minibar-tool-rows"
-          >
-            <Input
-              id="usage-minibar-tool-rows"
-              data-testid="usage-minibar-tool-rows"
-              inputMode="numeric"
-              className="h-8 w-16 text-right font-mono text-sm tabular-nums"
-              value={form.miniBarToolRows}
-              onChange={(e) =>
-                onNumberChange(e.currentTarget.value, TOOL_ROWS_RANGE, "miniBarToolRows")
+            <SettingRow label={t("settings.usage.miniBarRange")} htmlFor="usage-minibar-range">
+              <select
+                id="usage-minibar-range"
+                data-testid="usage-minibar-range"
+                className="bg-background h-8 rounded-md border px-2 text-sm"
+                value={form.miniBarRange}
+                onChange={(e) =>
+                  change({ miniBarRange: e.currentTarget.value as UsageSettings["miniBarRange"] })
+                }
+              >
+                {RANGE_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {t(o.key)}
+                  </option>
+                ))}
+              </select>
+            </SettingRow>
+            <div className="border-t" />
+
+            <SettingRow
+              label={t("settings.usage.miniBarToolRows")}
+              hint={t("settings.usage.miniBarToolRowsHint")}
+              htmlFor="usage-minibar-tool-rows"
+            >
+              <Input
+                id="usage-minibar-tool-rows"
+                data-testid="usage-minibar-tool-rows"
+                inputMode="numeric"
+                className="h-8 w-16 text-right font-mono text-sm tabular-nums"
+                value={form.miniBarToolRows}
+                onChange={(e) =>
+                  onNumberChange(e.currentTarget.value, TOOL_ROWS_RANGE, "miniBarToolRows")
+                }
+              />
+            </SettingRow>
+            <div className="border-t" />
+
+            <SettingRow
+              label={t("settings.usage.detailRetentionDays")}
+              hint={
+                // testid：提示必须随值（且随夹取）实时更新 —— 用例 6 的唯一抓手
+                <span data-testid="usage-detail-retention-hint">
+                  {t("settings.usage.detailRetentionHint", { days: form.detailRetentionDays })}
+                </span>
               }
-            />
-          </SettingRow>
-          <div className="border-t" />
+              htmlFor="usage-detail-retention-days"
+            >
+              <Input
+                id="usage-detail-retention-days"
+                data-testid="usage-detail-retention-days"
+                inputMode="numeric"
+                className="h-8 w-20 text-right font-mono text-sm tabular-nums"
+                value={form.detailRetentionDays}
+                onChange={(e) =>
+                  onNumberChange(e.currentTarget.value, RETENTION_RANGE, "detailRetentionDays")
+                }
+              />
+            </SettingRow>
+            <div className="border-t" />
 
-          <SettingRow
-            label={t("settings.usage.detailRetentionDays")}
-            hint={
-              // testid：提示必须随值（且随夹取）实时更新 —— 用例 6 的唯一抓手
-              <span data-testid="usage-detail-retention-hint">
-                {t("settings.usage.detailRetentionHint", { days: form.detailRetentionDays })}
-              </span>
-            }
-            htmlFor="usage-detail-retention-days"
-          >
-            <Input
-              id="usage-detail-retention-days"
-              data-testid="usage-detail-retention-days"
-              inputMode="numeric"
-              className="h-8 w-20 text-right font-mono text-sm tabular-nums"
-              value={form.detailRetentionDays}
-              onChange={(e) =>
-                onNumberChange(e.currentTarget.value, RETENTION_RANGE, "detailRetentionDays")
-              }
-            />
-          </SettingRow>
-          <div className="border-t" />
+            <SettingRow
+              label={t("settings.usage.collectIntervalMin")}
+              hint={t("settings.usage.collectIntervalHint")}
+              htmlFor="usage-collect-interval-min"
+            >
+              <Input
+                id="usage-collect-interval-min"
+                data-testid="usage-collect-interval-min"
+                inputMode="numeric"
+                className="h-8 w-20 text-right font-mono text-sm tabular-nums"
+                value={form.collectIntervalMin}
+                onChange={(e) =>
+                  onNumberChange(e.currentTarget.value, INTERVAL_RANGE, "collectIntervalMin")
+                }
+              />
+            </SettingRow>
+            <div className="border-t" />
 
-          <SettingRow
-            label={t("settings.usage.collectIntervalMin")}
-            hint={t("settings.usage.collectIntervalHint")}
-            htmlFor="usage-collect-interval-min"
-          >
-            <Input
-              id="usage-collect-interval-min"
-              data-testid="usage-collect-interval-min"
-              inputMode="numeric"
-              className="h-8 w-20 text-right font-mono text-sm tabular-nums"
-              value={form.collectIntervalMin}
-              onChange={(e) =>
-                onNumberChange(e.currentTarget.value, INTERVAL_RANGE, "collectIntervalMin")
-              }
-            />
-          </SettingRow>
-          <div className="border-t" />
-
-          {/* 供应商映射规则（JSON）**已从界面撤下**（2026-10-07 用户裁决）：
+            {/* 供应商映射规则（JSON）**已从界面撤下**（2026-10-07 用户裁决）：
               用户原话「这个是啥意思呀？我都不太懂。要不就不提供给用户编辑了」。
               它要求用户手写 `{"rules":[{"prefix":…,"provider":…}]}` 这种形态，是**开发者口径**的东西，
               摆在设置页里既看不懂、又容易写坏（写坏了还得靠后端整包拒绝才发现）。
@@ -268,23 +271,24 @@ export function UsageSection() {
               只是不再提供手工编辑入口 —— 将来要开放，应做成「前缀 / 供应商」两列的可视化表格，
               而不是让人手写 JSON。 */}
 
-          {/* 分享图评语**不在本页**（2026-10-07 用户裁决 B1）：它搬到了「导出所在的地方」——
+            {/* 分享图评语**不在本页**（2026-10-07 用户裁决 B1）：它搬到了「导出所在的地方」——
               用量看板吸顶导出条上的「评语」按钮（`components/usage/UsageQuoteEditor.tsx`）。
               字段本身仍是 `UsageSettings.exportQuote`、仍走同一条 `usage_set_settings`。 */}
 
-          {/* 分享图姿态**不在本页**（2026-10-07 用户裁决）：与评语同理搬到了「导出所在的地方」——
+            {/* 分享图姿态**不在本页**（2026-10-07 用户裁决）：与评语同理搬到了「导出所在的地方」——
               用量看板导出条上的「导出设置」弹层（`components/usage/UsageExportSettings.tsx`）。
               字段仍是 `UsageSettings.exportPose`、仍走同一条 `usage_set_settings`。 */}
 
-          {/* 换宠物回退提示（只在真的发生过回退时出现） */}
-          {poseReset ? (
-            <p className="text-xs text-amber-500" data-testid="usage-pose-reset">
-              {t("settings.usage.poseResetOnSwitch")}
-              {/* 姿态选择器已搬到看板「导出设置」⇒ 提示里必须点明去哪儿改（否则用户在这页找不到它） */}
-            </p>
-          ) : null}
-        </div>
-      )}
+            {/* 换宠物回退提示（只在真的发生过回退时出现） */}
+            {poseReset ? (
+              <p className="text-xs text-amber-500" data-testid="usage-pose-reset">
+                {t("settings.usage.poseResetOnSwitch")}
+                {/* 姿态选择器已搬到看板「导出设置」⇒ 提示里必须点明去哪儿改（否则用户在这页找不到它） */}
+              </p>
+            ) : null}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

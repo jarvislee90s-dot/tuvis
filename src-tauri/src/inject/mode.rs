@@ -3044,8 +3044,23 @@ fn codex_preflight<T: MenuTerminal>(terminal: &mut T) -> Result<Option<Vec<Strin
                         .to_string(),
                 );
             }
-            log::info!(
-                "codex：composer 行不在场（有未知 overlay 占位）→ esc 清场并等 composer 回归"
+            // 锚漂移自报（评审 Minor：G1 未知 overlay 附 miss_report）——「权限菜单/
+            // 确认框的账本锚为何没命中」直接给出候选词形与本机版本，锚漂移时定位
+            // 从两轮走查缩到一次 grep（anchor_ledger::miss_report 的立项初衷）
+            log::warn!(
+                "codex：composer 行不在场（未知 overlay 占位）——权限菜单锚自报：{}；确认框锚自报：{} → esc 清场并等 composer 回归",
+                crate::inject::anchor_ledger::miss_report(
+                    "codex",
+                    crate::inject::anchor_ledger::scenario::PERMISSION_MENU,
+                    crate::inject::anchor_ledger::slot::TITLE,
+                    crate::inject::approve::cached_cli_version("codex").as_deref(),
+                ),
+                crate::inject::anchor_ledger::miss_report(
+                    "codex",
+                    crate::inject::anchor_ledger::scenario::APPROVE_COMMAND,
+                    crate::inject::anchor_ledger::slot::TITLE,
+                    crate::inject::approve::cached_cli_version("codex").as_deref(),
+                ),
             );
             terminal.send("esc")?;
             terminal.settle();

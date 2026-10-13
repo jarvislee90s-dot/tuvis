@@ -58,7 +58,8 @@
     "presetsLabel": "Presets",
     "on": "On",
     "off": "Off",
-    "remote": "Remote Access"
+    "remote": "Remote Access",
+    "autostart": "Launch at Login"
   },
   "updater": {
     "checkForUpdates": "Check for Updates",
@@ -88,8 +89,8 @@
     "nav": {
       "appearance": "Appearance & skin",
       "appearanceDesc": "Local theme and language, plus fonts, skins, corners and accent for the remote board / web",
-      "desktop": "Desktop & alerts",
-      "desktopDesc": "Global shortcut, desktop notifications and sounds, and the Foxbell pet itself",
+      "desktop": "Notifications & Pet",
+      "desktopDesc": "Desktop notifications and sounds, the Foxbell pet with its startup-follow, and app autostart at login",
       "tools": "Tools & health",
       "toolsDesc": "Enable or disable each CLI tool, and run the skill / link health check",
       "usage": "Usage",
@@ -100,8 +101,7 @@
       "dataDesc": "Mobile attachment footprint and cleanup"
     },
     "appearance": {
-      "title": "Appearance",
-      "description": "Customize the appearance and language of the app",
+      "title": "Desktop appearance",
       "theme": "Theme",
       "light": "Light",
       "dark": "Dark",
@@ -195,6 +195,8 @@
       "desc": "Foxbell pet: floating status cards and voice alerts",
       "enable": "Enable pet",
       "alwaysOnTop": "Always on top",
+      "followStartup": "Follow on startup",
+      "followStartupDesc": "The pet appears automatically every time the app starts; turned off, it stays hidden at launch — open it from the tray or title bar anytime",
       "scale": "Size",
       "enabledToast": "Pet enabled",
       "disabledToast": "Pet hidden",
@@ -202,6 +204,14 @@
       "switchPet": "Switch pet",
       "importPet": "Import pet",
       "managePet": "Manage pets"
+    },
+    "autostart": {
+      "heading": "Autostart",
+      "description": "Start Tuvis automatically when you log in — silently to the tray, main window stays hidden",
+      "row": "Launch at login",
+      "rowDesc": "Registers Tuvis in the system login items (Windows registry / macOS LaunchAgent); toggling off unregisters it. Once enabled, Tuvis starts minimized to the tray — open the main window from there anytime",
+      "onToast": "Launch-at-login enabled",
+      "offToast": "Launch-at-login disabled"
     },
     "tools": {
       "title": "Tool Management",
@@ -511,7 +521,8 @@
     "tabDashboard": "Dashboard",
     "tabResources": "Resources",
     "petToggle": "Show/hide pet",
-    "clearFinishedCards": "Clear finished cards"
+    "clearFinishedCards": "Clear finished cards",
+    "filterAll": "All"
   },
   "status": {
     "waiting": "Waiting",
@@ -653,8 +664,6 @@
       "save": "Save",
       "clear": "Clear binding"
     },
-    "collapseSection": "Collapse section",
-    "expandSection": "Expand section",
     "filterByName": "Filter by name…",
     "resident": {
       "toggle": "Resident lock (exempt from preset disable/stash)"
@@ -755,7 +764,6 @@
     "availableResources": "Available resources",
     "selectedResources": "Selected resources",
     "noSelectionHint": "No resources selected yet",
-    "previewTitle": "Preset preview",
     "previewPreset": "Preview preset",
     "editPreset": "Edit preset",
     "removeSelection": "Remove item"
@@ -821,6 +829,7 @@
     }
   },
   "sessions": {
+    "filterEmpty": "No {{tool}} sessions yet",
     "jumpToTerminal": "Click to jump to terminal",
     "jumpUnsupported": "Jump is not supported for this session type on this platform",
     "jumpFailed": "Jump failed: {{error}}",
