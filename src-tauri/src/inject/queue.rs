@@ -1046,7 +1046,7 @@ mod tests {
                 None => Ok(()),
             }
         }
-        fn locate_and_send_key(&self, _pid: u32, key: &str) -> Result<(), String> {
+        fn locate_and_send_key_inner(&self, _pid: u32, key: &str) -> Result<(), String> {
             self.ops.lock().unwrap().push(format!("key:{key}"));
             match self.key_fail {
                 Some(e) => Err(e.to_string()),
