@@ -1,5 +1,7 @@
 # M4 外网全链路（配对管控 + 隧道 + 保活 + 托盘）实施计划
 
+<!-- 历史标注（2026-10-14 · #131）：本文档成文于「命名隧道 → 自有域名」改名前；文中旧卡名「命名隧道」即现行「自有域名」卡，属历史记录，按裁决不改原文。 -->
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
 > **v2（2026-09-16）**：三文档对照核查（M4 spec v1.1 / 一期 v6 / 宪法 D1-D17）+ 代码实证修订 14 处——详见文末「对照核查记录」。
