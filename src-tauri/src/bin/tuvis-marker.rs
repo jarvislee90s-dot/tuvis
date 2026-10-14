@@ -24,8 +24,9 @@
 //! 正文）；主进程聚焦成功后以 `--clear` 清痕（按需注入本就是一次性模式，
 //! 清痕不损失信息，标题回到干净态）。
 //!
-//! marker 口径两处互引（改动须同步）：`commands/session.rs`（匹配侧构造）、
-//! 本文件 `marker_from_session_id`（注入侧构造）。
+//! marker 口径单一出处（#57 漂移封口）：注入侧与 `commands/session.rs`（匹配侧）
+//! 共用 `window/disambig.rs::marker_from_session_id`，两端各有字面向量测试——
+//! helper 此前的独立副本已删（复用 lib crate，同包零新依赖）。
 //! 12 位理由：codex UUIDv7 前 8 hex 只编码 65.5s 粒度，同分钟双开撞车（实测
 //! 2026-09-08）；12 位不撞。必须先剥连字符——UUID 第 9 位即 '-'。
 //!
@@ -96,19 +97,6 @@ fn parse_marker_args(args: &[String]) -> Option<(u32, Option<String>)> {
     }
 }
 
-/// marker 串构造：`TUVIS:` + 剥连字符后前 12 位（与 commands/session.rs 同口径）。
-/// 仅 windows 路由消费（非 Windows 编译为占位二进制）
-#[cfg_attr(not(windows), allow(dead_code))]
-fn marker_from_session_id(id: &str) -> String {
-    format!(
-        "TUVIS:{}",
-        id.chars()
-            .filter(|c| *c != '-')
-            .take(12)
-            .collect::<String>()
-    )
-}
-
 /// 剥掉标题尾部全部 marker 残留（` — TUVIS:<hex>` 可叠加多层，循环剥净；
 /// 只剥尾部、且仅剥 TUVIS: 前缀形态，用户标题正文不受影响）
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -140,9 +128,8 @@ fn title_with_marker(title: &str, marker: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        marker_from_session_id, parse_marker_args, strip_marker_suffix, title_with_marker,
-    };
+    use super::{parse_marker_args, strip_marker_suffix, title_with_marker};
+    use multi_agents_manager_lib::window::disambig::marker_from_session_id;
 
     #[test]
     fn marker_strips_hyphens_and_takes_12() {
@@ -277,6 +264,8 @@ mod tests {
 
 #[cfg(windows)]
 mod win {
+    use multi_agents_manager_lib::window::disambig::marker_from_session_id;
+
     use std::collections::HashMap;
     use windows::core::BOOL;
     use windows::core::HSTRING;
@@ -471,7 +460,7 @@ mod win {
     /// 时仅剥旧 marker 不贴新。退出码：0 = 至少一路成功；3 = 全失败
     /// （2 = 用法错，main 层解析失败时返回）
     pub fn run(target_pid: u32, session_id: Option<&str>) -> i32 {
-        let marker = session_id.map(super::marker_from_session_id);
+        let marker = session_id.map(marker_from_session_id);
         let snap = process_snapshot();
         let mut logs = Vec::new();
 

@@ -2,6 +2,10 @@
 pub mod app_activation;
 #[cfg(target_os = "macos")]
 pub(crate) mod applescript;
+/// 跳转消歧的纯字符串/集合逻辑（#57）：**未门控**——全部平台的 `cargo test` 都能
+/// 编译执行其单测（此前住在 `#[cfg(windows)]` 的 win32.rs 里，非 Windows 宿主
+/// 编译不到、CI 只编译不运行，约 25 个纯逻辑测试从未真正执行过）
+pub mod disambig;
 #[cfg(any(target_os = "macos", windows))]
 pub mod deep_link;
 /// Windows「派发即忘」子进程的统一出口（`windows_subsystem = "windows"` GUI 进程无
