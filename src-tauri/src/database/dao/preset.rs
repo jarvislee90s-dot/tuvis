@@ -87,7 +87,7 @@ pub fn update_preset(
         )
         .map_err(|e| format!("DB_PRESET_UPDATE_FAIL: 更新预设失败: {}", e))?;
     if n == 0 {
-        return Err(format!("DB_PRESET_MISSING:{}", id));
+        return Err(format!("DB_PRESET_MISSING:{}: 预设 {} 不存在", id, id));
     }
     tx.execute("DELETE FROM preset_items WHERE preset_id = ?1", [id])
         .map_err(|e| format!("DB_PRESET_UPDATE_FAIL: 更新预设失败: {}", e))?;

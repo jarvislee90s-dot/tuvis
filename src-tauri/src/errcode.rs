@@ -25,6 +25,10 @@
 //!   位置过一遍 `formatInvokeError` 即可，原文保留在码后供日志与未知码降级。
 //! * 既有三码 `W5_*` 与 `PRESET_ACTIVE:<id>` / `PRESET_NATIVE_IN_UNIVERSAL:<id>`
 //!   在前端以 legacy 别名兼容（映射到既有 errors.* 键），不强制改写。
+//! * **暂不打码的原文锚定族**（打码会打断消费方，登记于此防后人误补）：
+//!   question.rs 的 codex 备注段族与「阶段机段名」文案——remote/api.rs
+//!   `stage_from_abort` 按段名前缀（如「codex 备注:」）分类回执、mobile
+//!   QuestionCard 按文案子串（「备注文本」等）分支；上码须与两消费方同批改。
 //!
 //! # 为什么码放前缀而不是单独协议字段
 //! `Err(String)` 是 Tauri 命令的既有返回形态（539 处），逐处改返回类型是协议

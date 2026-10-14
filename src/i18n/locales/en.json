@@ -1402,7 +1402,7 @@
     "presetOtherActive": "Another preset is currently active on this tool",
     "presetSubagentUnsupported": "This kind does not support sub-agent level assignment",
     "presetSkillNotEnabled": "This skill is not enabled at tool level",
-    "presetSnapshotOrphan": "Snapshot exists without an active preset",
+    "presetSnapshotOrphan": "{{param}}: snapshot exists without an active preset",
     "stashNativeDirMissing": "Native skill directory does not exist",
     "stashNameTaken": "An item with this name already exists in the stash",
     "stashJournalFail": "Stash journaling failed and was rolled back — see logs",

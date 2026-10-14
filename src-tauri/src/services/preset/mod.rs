@@ -506,8 +506,7 @@ pub fn check_snapshot_invariants() -> Vec<String> {
         // clippy::single_match：等价 match 改写为 if let（Some((Some(_),_)) | None 臂为空）
         if let Some((None, _)) = database::get_base_snapshot(tool) {
             broken.push(format!(
-                "PRESET_SNAPSHOT_ORPHAN: {}：快照存在但无激活预设",
-                tool
+                "PRESET_SNAPSHOT_ORPHAN:{tool}: {tool}：快照存在但无激活预设"
             ));
         }
     }

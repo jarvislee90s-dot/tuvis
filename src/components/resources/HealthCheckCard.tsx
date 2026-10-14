@@ -113,7 +113,7 @@ export function HealthCheckCard() {
       } else if (outcome.fixed) {
         toast.success(outcome.message);
       } else {
-        toast.error(outcome.message);
+        toast.error(formatInvokeError(outcome.message, t));
       }
     } catch (e) {
       toast.error(formatInvokeError(e, t));
@@ -157,14 +157,17 @@ export function HealthCheckCard() {
     }
   };
 
-  // ② 不变量修复：toolId 取条目文本 '：' 前缀（后端格式 "{tool}：快照存在但无激活预设"）；
-  // toast 沿用 PresetList 开关「关」的同款 restore 文案（应用内一致）
-  const fixInvariant = async (line: string) => {
-    // #123 迁移后条目文本带错误码前缀（PRESET_SNAPSHOT_ORPHAN: {tool}：…）——先剥码再按全角冒号取 toolId
-    const toolId = line
-      .replace(/^[A-Z][A-Z0-9_]*:\s*/, "")
+  /** 不变量行解析（单点）：剥「CODE:」或「CODE:param:」前缀（形态 A/B 兼容）后按全角冒号取 toolId */
+  const parseInvariantLine = (line: string) =>
+    line
+      .replace(/^(?:[A-Z][A-Z0-9_]*:){1,2}\s*/, "")
       .split("：")[0]
-      ?.trim();
+      ?.trim() ?? "";
+
+  // ② 不变量修复：toolId 取条目文本 '：' 前缀（后端形态 "PRESET_SNAPSHOT_ORPHAN:{tool}：快照存在但无激活预设"）；
+  // 剥码走单点 parseInvariantLine（形态 A/B 兼容），与下方渲染位同一解析；toast 沿用 PresetList 的 restore 文案
+  const fixInvariant = async (line: string) => {
+    const toolId = parseInvariantLine(line);
     if (!toolId) return;
     setInvPending(toolId);
     try {
@@ -381,7 +384,7 @@ export function HealthCheckCard() {
                 {t("resources.health.invariantBroken")}
               </div>
               {invariants.map((line) => {
-                const toolId = line.split("：")[0]?.trim() ?? "";
+                const toolId = parseInvariantLine(line);
                 const enabled = toolEnabled(toolId);
                 return (
                   <div key={line} className="flex items-center gap-2">

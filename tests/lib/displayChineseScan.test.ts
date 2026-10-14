@@ -90,7 +90,11 @@ describe("上屏中文扫描（桌面零容忍 / mobile 白名单）", () => {
           }
         }
         line = stripComments(line);
-        if (/console\.(warn|error|log|info|debug)\(/.test(line)) consoleDepth = 1; // 日志不上屏
+        if (/console\.(warn|error|log|info|debug)\(/.test(line)) {
+          // 日志不上屏：跨行调用用括号深度跟踪（初值=本行净括号，单行闭合即归零）
+          consoleDepth = (line.match(/\(/g) ?? []).length - (line.match(/\)/g) ?? []).length;
+          return;
+        }
         if (consoleDepth > 0) {
           consoleDepth += (line.match(/\(/g) ?? []).length - (line.match(/\)/g) ?? []).length;
           if (consoleDepth <= 0) consoleDepth = 0;

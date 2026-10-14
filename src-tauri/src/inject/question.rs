@@ -830,12 +830,14 @@ where
     let mut sent_keys: Vec<String> = Vec::new();
     // 1. Review 已在场？（多题自动推进形态）——读不到屏 → 中止零按键
     let initial = read().ok_or_else(|| {
-        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: kimi 提交：读不到屏幕——已中止，未发任何键；请人工核对终端")
+        StageAbort::screen(
+            "INJECT_SCREEN_ABORT: kimi 提交：读不到屏幕——已中止，未发任何键；请人工核对终端",
+        )
     })?;
     if !kimi_review_present(&initial) {
-        terminal
-            .send("tab")
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: tab 投递失败（{e}）")))?;
+        terminal.send("tab").map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: tab 投递失败（{e}）"))
+        })?;
         sent_keys.push("tab".to_string());
         terminal.settle();
     }
@@ -857,9 +859,11 @@ where
             "Review 汇总屏在场但读不到确认项编号——已中止，未发确认键；请人工核对终端",
         )
     })?;
-    terminal
-        .send(&confirm_key)
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 确认键 {confirm_key} 投递失败（{e}）")))?;
+    terminal.send(&confirm_key).map_err(|e| {
+        StageAbort::delivery(format!(
+            "INJECT_DELIVERY_FAIL: 确认键 {confirm_key} 投递失败（{e}）"
+        ))
+    })?;
     sent_keys.push(confirm_key);
     terminal.settle();
     // 4. 终态（未见不是失败——语义与 run_submit_stages 同源）
@@ -908,12 +912,16 @@ where
     // 清空 = 进编辑退格到底真清除，不再前置拒——原「无法置空」裁决基于「空回车
     // no-op」，但退格到底后回车无害、文字已在编辑器内清掉）
     if text.trim().is_empty() && !overwrite {
-        return Err(StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 自由作答文本为空——已中止，未发任何键"));
+        return Err(StageAbort::screen(
+            "INJECT_SCREEN_ABORT: 自由作答文本为空——已中止，未发任何键",
+        ));
     }
     let mut sent_keys: Vec<String> = Vec::new();
     // 1. Other 行定位（读不到/无编号 → 中止零按键）
     let first = read().ok_or_else(|| {
-        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: kimi 自由作答：读不到屏幕——已中止，未发任何键；请人工核对终端")
+        StageAbort::screen(
+            "INJECT_SCREEN_ABORT: kimi 自由作答：读不到屏幕——已中止，未发任何键；请人工核对终端",
+        )
     })?;
     let other_digit = locate_kimi_other_digit(&first).ok_or_else(|| {
         StageAbort::screen(
@@ -924,9 +932,9 @@ where
     // 污染——"Other: 期权4" 末尾的 4 即定位数字）。基准 = 定位读的那一拍。
     let already_editing = kimi_editor_mode(&first);
     if !already_editing {
-        terminal
-            .send(&other_digit)
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: Other 定位键投递失败（{e}）")))?;
+        terminal.send(&other_digit).map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: Other 定位键投递失败（{e}）"))
+        })?;
         sent_keys.push(other_digit.clone());
         terminal.settle();
     }
@@ -961,7 +969,9 @@ where
                     let key = if t > c { "down" } else { "up" };
                     for _ in 0..(t as i64 - c as i64).abs() {
                         terminal.send(key).map_err(|e| {
-                            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 高亮导航投递失败（{e}）"))
+                            StageAbort::delivery(format!(
+                                "INJECT_DELIVERY_FAIL: 高亮导航投递失败（{e}）"
+                            ))
                         })?;
                         terminal.settle();
                         let now = read()
@@ -981,9 +991,9 @@ where
                 }
                 _ => {}
             }
-            terminal
-                .send("enter")
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 进编辑回车投递失败（{e}）")))?;
+            terminal.send("enter").map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 进编辑回车投递失败（{e}）"))
+            })?;
             sent_keys.push("enter".to_string());
             let rounds = crate::inject::timing::poll_rounds(
                 crate::inject::timing::DIGIT_VERIFY_POLL_TOTAL_MS,
@@ -1001,16 +1011,16 @@ where
                         "覆盖/清空：屏上读不到 Other 行勾选态——已中止，未发任何键；请人工核对终端",
                     )
                 })?;
-            terminal
-                .send(&other_digit)
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: Other 定位键投递失败（{e}）")))?;
+            terminal.send(&other_digit).map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: Other 定位键投递失败（{e}）"))
+            })?;
             sent_keys.push(other_digit.clone());
             terminal.settle();
             if other_checked0 {
                 // 已勾 → 刚才那下是取消勾 → 再按一次进编辑
-                terminal
-                    .send(&other_digit)
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 进编辑数字投递失败（{e}）")))?;
+                terminal.send(&other_digit).map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 进编辑数字投递失败（{e}）"))
+                })?;
                 sent_keys.push(other_digit.clone());
                 terminal.settle();
             }
@@ -1030,9 +1040,9 @@ where
         let before = len0.unwrap_or(0);
         if before > 0 {
             for _ in 0..before.min(400) {
-                terminal
-                    .send("right")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 光标右移投递失败（{e}）")))?;
+                terminal.send("right").map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 光标右移投递失败（{e}）"))
+                })?;
             }
             sent_keys.push(format!("<right×{}>", before.min(400)));
             terminal.settle();
@@ -1042,15 +1052,17 @@ where
             let mut len_now = before;
             for attempt in 0..2 {
                 if attempt == 1 {
-                    terminal
-                        .send("enter")
-                        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 试探回车投递失败（{e}）")))?;
+                    terminal.send("enter").map_err(|e| {
+                        StageAbort::delivery(format!(
+                            "INJECT_DELIVERY_FAIL: 试探回车投递失败（{e}）"
+                        ))
+                    })?;
                     sent_keys.push("enter".to_string());
                     terminal.settle();
                 }
-                terminal
-                    .send("backspace")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 试探退格投递失败（{e}）")))?;
+                terminal.send("backspace").map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 试探退格投递失败（{e}）"))
+                })?;
                 sent_keys.push("backspace".to_string());
                 terminal.settle();
                 len_now = probe_state(&mut read)
@@ -1068,9 +1080,9 @@ where
             // 退格到底（试探已退 1 格；min 400 参照块口径）
             let rest = (before - 1).min(400);
             for _ in 0..rest {
-                terminal
-                    .send("backspace")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 退格投递失败（{e}）")))?;
+                terminal.send("backspace").map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 退格投递失败（{e}）"))
+                })?;
             }
             if rest > 0 {
                 sent_keys.push(format!("<backspace×{rest}>"));
@@ -1087,9 +1099,9 @@ where
         }
         if text.trim().is_empty() {
             // **清空语义**：文字已清（或本来就空）→ 回车退出编辑态 → 有界轮询确认
-            terminal
-                .send("enter")
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 清空回车投递失败（{e}）")))?;
+            terminal.send("enter").map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 清空回车投递失败（{e}）"))
+            })?;
             sent_keys.push("enter".to_string());
             // 退出编辑态窗 6s（11:55 实录：空编辑态自行退出可超 3s——窗短误报）
             // 清空退出观察上限 2s（2026-10-07 用户裁决：终端 1~2s 内已正常，超时不等）
@@ -1100,13 +1112,15 @@ where
             let exited = if exited {
                 true
             } else {
-                terminal
-                    .send("enter")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 清空补回车投递失败（{e}）")))?;
+                terminal.send("enter").map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 清空补回车投递失败（{e}）"))
+                })?;
                 sent_keys.push("enter".to_string());
-                terminal
-                    .send("up")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 清空退出上键投递失败（{e}）")))?;
+                terminal.send("up").map_err(|e| {
+                    StageAbort::delivery(format!(
+                        "INJECT_DELIVERY_FAIL: 清空退出上键投递失败（{e}）"
+                    ))
+                })?;
                 sent_keys.push("up".to_string());
                 !wait_editor_mode(&mut read, terminal, rounds.max(1) as usize)
             };
@@ -1128,9 +1142,9 @@ where
         }
     }
     // 2. 打字（字符通道——用户文本绝不进键通道）
-    terminal
-        .send_text(text)
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）")))?;
+    terminal.send_text(text).map_err(|e| {
+        StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）"))
+    })?;
     sent_keys.push("<text>".to_string());
     terminal.settle();
     // 3. 保存（2026-10-07 用户方案，仅单选）：**回车 → ↓ + →** 替代——单选编辑态
@@ -1138,19 +1152,19 @@ where
     // 方向键下 = 保存（不触发选中链），落定后 → 归位。多选保持 enter（保存循环
     // 已实测收敛）。
     if multi_select {
-        terminal
-            .send("enter")
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 保存回车投递失败（{e}）")))?;
+        terminal.send("enter").map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 保存回车投递失败（{e}）"))
+        })?;
         sent_keys.push("enter".to_string());
     } else {
-        terminal
-            .send("down")
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 保存下键投递失败（{e}）")))?;
+        terminal.send("down").map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 保存下键投递失败（{e}）"))
+        })?;
         sent_keys.push("down".to_string());
         terminal.settle();
-        terminal
-            .send("right")
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 保存右键投递失败（{e}）")))?;
+        terminal.send("right").map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 保存右键投递失败（{e}）"))
+        })?;
         sent_keys.push("right".to_string());
     }
     terminal.settle();
@@ -1191,7 +1205,9 @@ where
                     // 行）——此时再发一次 enter 保存收尾退出，不留编辑态给后续操作
                     log::info!("kimi-freeText 多选：检测到编辑态 → enter 保存收尾");
                     terminal.send("enter").map_err(|e| {
-                        StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 编辑态保存收尾投递失败（{e}）"))
+                        StageAbort::delivery(format!(
+                            "INJECT_DELIVERY_FAIL: 编辑态保存收尾投递失败（{e}）"
+                        ))
                     })?;
                     sent_keys.push("enter".to_string());
                     terminal.settle();
@@ -1219,7 +1235,9 @@ where
                                 "kimi-freeText 多选补勾：连续 {unchecked_streak} 拍未勾 → 补发 enter（{ent}/2）"
                             );
                             terminal.send("enter").map_err(|e| {
-                                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 勾选补发回车投递失败（{e}）"))
+                                StageAbort::delivery(format!(
+                                    "INJECT_DELIVERY_FAIL: 勾选补发回车投递失败（{e}）"
+                                ))
                             })?;
                             sent_keys.push("enter".to_string());
                             unchecked_streak = 0;
@@ -1280,9 +1298,9 @@ where
                 log::info!(
                     "kimi-freeText 单选保存第 {round} 拍：cur={cur_eff} exp={exp_eff} review={review_here} → {key}"
                 );
-                terminal
-                    .send(key)
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 落点导航投递失败（{e}）")))?;
+                terminal.send(key).map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 落点导航投递失败（{e}）"))
+                })?;
                 sent_keys.push(key.to_string());
                 continue;
             }
@@ -1306,11 +1324,15 @@ where
         ));
     }
     let confirm_key = kimi_review_confirm_digit(&review).ok_or_else(|| {
-        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 读不到确认项编号——已中止，未发确认键；请人工核对终端")
+        StageAbort::screen(
+            "INJECT_SCREEN_ABORT: 读不到确认项编号——已中止，未发确认键；请人工核对终端",
+        )
     })?;
-    terminal
-        .send(&confirm_key)
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 确认键 {confirm_key} 投递失败（{e}）")))?;
+    terminal.send(&confirm_key).map_err(|e| {
+        StageAbort::delivery(format!(
+            "INJECT_DELIVERY_FAIL: 确认键 {confirm_key} 投递失败（{e}）"
+        ))
+    })?;
     sent_keys.push(confirm_key);
     terminal.settle();
     // 5. 终态
@@ -1440,7 +1462,9 @@ pub fn run_codex_notes_stages<T: FreeTextTerminal>(
 
     // 1. 入口闸：读屏 + 面板解析（确认屏与「解析不出」分开点名，§3.6）
     let first = terminal.read().ok_or_else(|| {
-        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: codex 备注：读不到屏幕——已中止，未发任何键；请人工核对终端")
+        StageAbort::screen(
+            "INJECT_SCREEN_ABORT: codex 备注：读不到屏幕——已中止，未发任何键；请人工核对终端",
+        )
     })?;
     let snap = match codex_question_screen_snapshot(&first) {
         Some(s) => s,
@@ -1497,9 +1521,9 @@ pub fn run_codex_notes_stages<T: FreeTextTerminal>(
             if !note_present(&l) {
                 break; // 已无字（含占位态）——清空目标达成
             }
-            terminal
-                .send("tab")
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 清空 Tab 投递失败（{e}）")))?;
+            terminal.send("tab").map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 清空 Tab 投递失败（{e}）"))
+            })?;
             sent_keys.push("tab".to_string());
             terminal.settle();
             poll_until(&mut poll, 4, |ls| !note_present(ls));
@@ -1519,9 +1543,9 @@ pub fn run_codex_notes_stages<T: FreeTextTerminal>(
         // 若停在空 notes 态（第二下 tab 落在答案态会「重开空 notes」）→ esc 退回，
         // 给发送段一个干净的答案态入口
         if notes_footer(&l) {
-            terminal
-                .send("esc")
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 退出 esc 投递失败（{e}）")))?;
+            terminal.send("esc").map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 退出 esc 投递失败（{e}）"))
+            })?;
             sent_keys.push("esc".to_string());
             terminal.settle();
             if !poll_until(&mut poll, 4, |ls| !notes_footer(ls)) {
@@ -1548,11 +1572,15 @@ pub fn run_codex_notes_stages<T: FreeTextTerminal>(
     //    + 走位 + tab 开 notes
     // 覆盖路径清空段发过键，入口快照已陈旧——重读重析（身份闸一并复核）
     let snap = if overwrite {
-        let l = terminal
-            .read()
-            .ok_or_else(|| StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: codex 备注：发送段读不到屏——已中止；请核对终端"))?;
+        let l = terminal.read().ok_or_else(|| {
+            StageAbort::screen(
+                "INJECT_SCREEN_ABORT: codex 备注：发送段读不到屏——已中止；请核对终端",
+            )
+        })?;
         let s = codex_question_screen_snapshot(&l).ok_or_else(|| {
-            StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: codex 备注：发送段解析不出问答面板——已中止；请核对终端")
+            StageAbort::screen(
+                "INJECT_SCREEN_ABORT: codex 备注：发送段解析不出问答面板——已中止；请核对终端",
+            )
         })?;
         if s.question_idx != q_idx {
             return Err(StageAbort::screen(format!(
@@ -1596,9 +1624,11 @@ pub fn run_codex_notes_stages<T: FreeTextTerminal>(
     let walk_key = if up < down { "k" } else { "j" };
     let mut focused = f0;
     for _ in 0..down.min(up) {
-        terminal
-            .send(walk_key)
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 走位键 {walk_key} 投递失败（{e}）")))?;
+        terminal.send(walk_key).map_err(|e| {
+            StageAbort::delivery(format!(
+                "INJECT_DELIVERY_FAIL: 走位键 {walk_key} 投递失败（{e}）"
+            ))
+        })?;
         sent_keys.push(walk_key.to_string());
         terminal.settle();
         match terminal
@@ -1627,11 +1657,9 @@ pub fn run_codex_notes_stages<T: FreeTextTerminal>(
     }
 
     // tab 开 notes + 有界轮询 footer 翻转
-    terminal.send("tab").map_err(|e| {
-        StageAbort::delivery(format!(
-            "INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: Tab 投递失败（{e}）"
-        ))
-    })?;
+    terminal
+        .send("tab")
+        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: Tab 投递失败（{e}）")))?;
     sent_keys.push("tab".to_string());
     terminal.settle();
     if !poll_until(&mut poll, 4, |lines| notes_footer(lines)) {
@@ -1652,9 +1680,9 @@ pub fn run_codex_notes_stages<T: FreeTextTerminal>(
 
     // 7. 打字 + 上屏核验（0.160.0「打字不可见静默丢失」的复防线：文本没上屏绝不发 Enter）
     if !text.is_empty() {
-        terminal
-            .send_text(text)
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 备注文本投递失败（{e}）")))?;
+        terminal.send_text(text).map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 备注文本投递失败（{e}）"))
+        })?;
         sent_keys.push("<text>".to_string());
         terminal.settle();
         // 证据自带失败（闸门 2）：核验各拍实读帧留存，误拦/真丢两可时日志是物证
@@ -1692,14 +1720,14 @@ pub fn run_codex_notes_stages<T: FreeTextTerminal>(
             let notes_still_open = last_frame.as_ref().is_some_and(|f| notes_footer(f));
             if notes_still_open {
                 log::warn!("codex-notes 上屏核验未命中但备注态仍在——清残重打一次（送达抖动重试）");
-                terminal
-                    .send("esc")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 清残 esc 投递失败（{e}）")))?;
+                terminal.send("esc").map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 清残 esc 投递失败（{e}）"))
+                })?;
                 sent_keys.push("esc".to_string());
                 terminal.settle();
-                terminal
-                    .send("tab")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 重试 tab 投递失败（{e}）")))?;
+                terminal.send("tab").map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 重试 tab 投递失败（{e}）"))
+                })?;
                 sent_keys.push("tab".to_string());
                 terminal.settle();
                 if !poll_until(&mut poll, 4, |lines| notes_footer(lines)) {
@@ -1728,9 +1756,9 @@ pub fn run_codex_notes_stages<T: FreeTextTerminal>(
             }
         }
         // 8. Enter 提交 + 终态（未见不是失败——如实 Some(false)）
-        terminal
-            .send("enter")
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）")))?;
+        terminal.send("enter").map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）"))
+        })?;
         sent_keys.push("enter".to_string());
         terminal.settle();
         let receipt_seen = stage_receipt_seen(&mut poll, codex_answered_present);
@@ -1884,9 +1912,11 @@ pub fn run_codex_select_stages<T: MenuTerminal>(
     // 2. 解析面板（确认屏与「解析不出」分开点名——用户要做的处置不同，§3.6）
     // 3. 身份闸：屏上题号必须与手机卡对位（错位发数字 = 打错题，§3.2 步 1）+
     //    题数交叉核对（评审 P2-10：终端问卷题数 ≠ 载荷题数 = 错卷，零键中止）
-    let first = terminal
-        .read()
-        .ok_or_else(|| StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: codex：读不到屏——已中止，未发任何键；请人工核对终端"))?;
+    let first = terminal.read().ok_or_else(|| {
+        StageAbort::screen(
+            "INJECT_SCREEN_ABORT: codex：读不到屏——已中止，未发任何键；请人工核对终端",
+        )
+    })?;
     let snap = match codex_question_screen_snapshot(&first) {
         Some(s) => s,
         None => {
@@ -1977,11 +2007,9 @@ fn run_codex_select_nonfinal<T: MenuTerminal>(
     let baseline = baseline_lines.to_vec();
     let digit = (index + 1).to_string();
     // 发数字（send → 记账 → settle，与既有阶段机同款三步）
-    terminal.send(&digit).map_err(|e| {
-        StageAbort::delivery(format!(
-            "INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 数字投递失败（{e}）"
-        ))
-    })?;
+    terminal
+        .send(&digit)
+        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 数字投递失败（{e}）")))?;
     sent_keys.push(digit);
     terminal.settle();
 
@@ -2046,9 +2074,9 @@ fn codex_select_resend_digit<T: MenuTerminal>(
     // 重投键 = 首投同数字（index+1——重投的语义是「同一个数字再发一遍」，
     // 不是别的题的编号）
     let digit = (index + 1).to_string();
-    terminal
-        .send(&digit)
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 重投数字投递失败（{e}）")))?;
+    terminal.send(&digit).map_err(|e| {
+        StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 重投数字投递失败（{e}）"))
+    })?;
     sent_keys.push(digit);
     terminal.settle();
     // 重投后同款基线变化轮询（窗尽/原样 → 两投中止）
@@ -2161,9 +2189,11 @@ fn run_codex_select_final<T: MenuTerminal>(
     let steps = down.min(up);
     let mut focused = f0;
     for _ in 0..steps {
-        terminal
-            .send(walk_key)
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 走位键 {walk_key} 投递失败（{e}）")))?;
+        terminal.send(walk_key).map_err(|e| {
+            StageAbort::delivery(format!(
+                "INJECT_DELIVERY_FAIL: 走位键 {walk_key} 投递失败（{e}）"
+            ))
+        })?;
         sent_keys.push(walk_key.to_string());
         terminal.settle();
         // 每步复读核验到位（不批量盲发——§3.3 步 2：选中态若错，归零闸发现不了选错了谁）
@@ -2206,9 +2236,9 @@ fn run_codex_select_final<T: MenuTerminal>(
     if !already_on_target_zero {
         // 键名 "space" 走注入通道的既有映射（与 run_toggle_stages 同款；通道侧
         // 按 codex 底料 §2.3 落成字符形态 `-Char ' '`），记账用同一语义名
-        terminal
-            .send("space")
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 空格投递失败（{e}）")))?;
+        terminal.send("space").map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 空格投递失败（{e}）"))
+        })?;
         sent_keys.push("space".to_string());
         terminal.settle();
     }
@@ -2299,9 +2329,9 @@ fn run_codex_select_final<T: MenuTerminal>(
         ));
     }
     //    - 面板在场 ∧ 计数段消失 → 发回车显式提交整卷（全答完无确认，定案 5）
-    terminal
-        .send("enter")
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）")))?;
+    terminal.send("enter").map_err(|e| {
+        StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）"))
+    })?;
     sent_keys.push("enter".to_string());
     terminal.settle();
 
@@ -2383,11 +2413,15 @@ pub fn run_codex_advance_stages<T: MenuTerminal>(
     // ---------- 1. 入口闸：读首屏，解析面板 ----------
     // 读不到 = 零键中止（屏读为准：动手前必须见到面板）
     let first = terminal.read().ok_or_else(|| {
-        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: codex 切题：读不到面板——已中止，未发任何键；请核对终端")
+        StageAbort::screen(
+            "INJECT_SCREEN_ABORT: codex 切题：读不到面板——已中止，未发任何键；请核对终端",
+        )
     })?;
     let before = codex_question_screen_snapshot(&first)
         .ok_or_else(|| {
-            StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: codex 切题：读不到面板——已中止，未发任何键；请核对终端")
+            StageAbort::screen(
+                "INJECT_SCREEN_ABORT: codex 切题：读不到面板——已中止，未发任何键；请核对终端",
+            )
         })?
         .question_idx;
 
@@ -2396,9 +2430,9 @@ pub fn run_codex_advance_stages<T: MenuTerminal>(
         crate::inject::question::NavDirection::Prev => "h",
         crate::inject::question::NavDirection::Next => "l",
     };
-    terminal
-        .send(key)
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: {key} 投递失败（{e}）")))?;
+    terminal.send(key).map_err(|e| {
+        StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: {key} 投递失败（{e}）"))
+    })?;
     terminal.settle();
 
     // ---------- 3. 核验：有界变化轮询（评审 P2-2，同 select 侧 P0-1 修法）----------
@@ -2745,13 +2779,15 @@ where
     let mut sent_keys: Vec<String> = Vec::new();
     // 1. Confirm 已在场判读（读不到屏 → 中止零按键）
     let initial = read().ok_or_else(|| {
-        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: opencode 提交：读不到屏幕——已中止，未发任何键；请人工核对终端")
+        StageAbort::screen(
+            "INJECT_SCREEN_ABORT: opencode 提交：读不到屏幕——已中止，未发任何键；请人工核对终端",
+        )
     })?;
     // 2. 不在 Confirm 页 → tab 切页（题目页 → Confirm 页；前向循环，戊探A ①）
     if !opencode_confirm_present(&initial) {
-        terminal
-            .send("tab")
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: tab 投递失败（{e}）")))?;
+        terminal.send("tab").map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: tab 投递失败（{e}）"))
+        })?;
         sent_keys.push("tab".to_string());
         terminal.settle();
     }
@@ -2767,9 +2803,9 @@ where
         ));
     }
     // 4. enter 提交（Confirm 页唯一回车点）
-    terminal
-        .send("enter")
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）")))?;
+    terminal.send("enter").map_err(|e| {
+        StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）"))
+    })?;
     sent_keys.push("enter".to_string());
     terminal.settle();
     // 5. 终态（未见不是失败）
@@ -2879,9 +2915,9 @@ fn oc_send_enter<T: FreeTextTerminal>(
     terminal: &mut T,
     sent_keys: &mut Vec<String>,
 ) -> Result<(), StageAbort> {
-    terminal
-        .send("enter")
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 开输入行回车投递失败（{e}）")))?;
+    terminal.send("enter").map_err(|e| {
+        StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 开输入行回车投递失败（{e}）"))
+    })?;
     sent_keys.push("enter".to_string());
     terminal.settle();
     Ok(())
@@ -2904,12 +2940,13 @@ where
     }
     // 0. 方言表（2026-10-05 推广批 F2）：定位/勾选标记/编辑门/光标全部读表——
     // 差异=数据；表无条目（未定案工具）→ 拒绝出手
-    let d = crate::inject::dialect::own_answer_dialect("opencode")
-        .ok_or_else(|| StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 方言表无该工具条目——已中止，未发任何键"))?;
+    let d = crate::inject::dialect::own_answer_dialect("opencode").ok_or_else(|| {
+        StageAbort::screen("INJECT_SCREEN_ABORT: 方言表无该工具条目——已中止，未发任何键")
+    })?;
     let mut sent_keys: Vec<String> = Vec::new();
     // 1. 定位 own answer 行 + 勾选态 + 已存文本
     let first = terminal.read().ok_or_else(|| {
-        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: opencode 自由作答：读不到屏幕——已中止，未发任何键；请人工核对终端")
+        StageAbort::screen("INJECT_SCREEN_ABORT: opencode 自由作答：读不到屏幕——已中止，未发任何键；请人工核对终端")
     })?;
     // ===== 单选页 N 探针流程（2026-10-05 用户设计定案）=====
     //
@@ -2942,14 +2979,16 @@ where
         let mut sent: Vec<String> = Vec::new();
         for _round in 0..=(own_num + 3) {
             // 按数字 N（到达探针 + 选中二合一）
-            terminal
-                .send(&n_key)
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: N 探针投递失败（{e}）")))?;
+            terminal.send(&n_key).map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: N 探针投递失败（{e}）"))
+            })?;
             sent.push(n_key.clone());
             terminal.settle();
-            let after = terminal
-                .read()
-                .ok_or_else(|| StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: N 探针后读不到屏幕——已中止；请人工核对终端"))?;
+            let after = terminal.read().ok_or_else(|| {
+                StageAbort::screen(
+                    "INJECT_SCREEN_ABORT: N 探针后读不到屏幕——已中止；请人工核对终端",
+                )
+            })?;
             // own 行消失 = 终端已推进（Submit 总结页）→ 收工
             let Some(cur_content) = opencode_single_own_row_content_at(&after, own_num) else {
                 log::info!("[single-select] N 探针后 own 行消失 = 已推进");
@@ -2984,9 +3023,9 @@ where
                         ""
                     }
                 );
-                terminal
-                    .send("backspace")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 退格投递失败（{e}）")))?;
+                terminal.send("backspace").map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 退格投递失败（{e}）"))
+                })?;
                 sent.push("backspace".to_string());
                 terminal.settle();
                 // **覆盖写入/清空：复用多选语义**（1754 行同款，2026-10-06 02:44
@@ -3003,31 +3042,39 @@ where
                         .count()
                         .min(400);
                     for _ in 0..n {
-                        terminal
-                            .send("backspace")
-                            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 退格投递失败（{e}）")))?;
+                        terminal.send("backspace").map_err(|e| {
+                            StageAbort::delivery(format!(
+                                "INJECT_DELIVERY_FAIL: 退格投递失败（{e}）"
+                            ))
+                        })?;
                     }
                     sent.push(format!("<backspace×{n}>"));
                     terminal.settle();
                 }
                 if !text.is_empty() {
-                    terminal
-                        .send_text(text)
-                        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）")))?;
+                    terminal.send_text(text).map_err(|e| {
+                        StageAbort::delivery(format!(
+                            "INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）"
+                        ))
+                    })?;
                     sent.push("<text>".to_string());
                     terminal.settle();
                     // 有内容 → ↑ 保存（2026-10-06 用户实测定案：字段**非空**时
                     // ↑=保存且不触发选择/即交；enter 在单选页=保存+确认连锁）
-                    terminal
-                        .send("up")
-                        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 保存上箭头投递失败（{e}）")))?;
+                    terminal.send("up").map_err(|e| {
+                        StageAbort::delivery(format!(
+                            "INJECT_DELIVERY_FAIL: 保存上箭头投递失败（{e}）"
+                        ))
+                    })?;
                     sent.push("up".to_string());
                 } else {
                     // 清空路径：退格后字段为**空** → 单纯 ↑ 不保存（2026-10-06
                     // 实测细化：空字段 ↑ 空转）→ enter 提交空答案=保存/退出
-                    terminal
-                        .send("enter")
-                        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 清空回车投递失败（{e}）")))?;
+                    terminal.send("enter").map_err(|e| {
+                        StageAbort::delivery(format!(
+                            "INJECT_DELIVERY_FAIL: 清空回车投递失败（{e}）"
+                        ))
+                    })?;
                     sent.push("enter".to_string());
                 }
                 terminal.settle();
@@ -3053,15 +3100,17 @@ where
             if after_checked != before_checked {
                 log::info!("[single-select] N 翻转了 own 行勾选 → 焦点在 own 行 → 打全文");
                 if !text.is_empty() {
-                    terminal
-                        .send_text(text)
-                        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）")))?;
+                    terminal.send_text(text).map_err(|e| {
+                        StageAbort::delivery(format!(
+                            "INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）"
+                        ))
+                    })?;
                     sent.push("<text>".to_string());
                     terminal.settle();
                 }
-                terminal
-                    .send("enter")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）")))?;
+                terminal.send("enter").map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）"))
+                })?;
                 sent.push("enter".to_string());
                 terminal.settle();
                 let receipt_seen = stage_receipt_seen(&mut poll_receipt, opencode_answered_present);
@@ -3090,16 +3139,16 @@ where
             }
             if other_flipped {
                 // 还原翻转的选项
-                terminal
-                    .send(&n_key)
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 还原投递失败（{e}）")))?;
+                terminal.send(&n_key).map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 还原投递失败（{e}）"))
+                })?;
                 sent.push(n_key.clone());
                 terminal.settle();
             }
             // 换位（↓）
-            terminal
-                .send("down")
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 下箭头投递失败（{e}）")))?;
+            terminal.send("down").map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 下箭头投递失败（{e}）"))
+            })?;
             sent.push("down".to_string());
             terminal.settle();
         }
@@ -3148,21 +3197,25 @@ where
         // 有界）。探针语义（18:12 日志定案）：未勾行=勾上+编辑器展开；已勾行=
         // 纯摘勾不开编辑器（→ 再 enter 勾回+编辑器展开）。
         for _ in 0..own_pos.saturating_sub(1) {
-            terminal
-                .send("down")
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 下箭头投递失败（{e}）")))?;
+            terminal.send("down").map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 下箭头投递失败（{e}）"))
+            })?;
             sent_keys.push("down".to_string());
             terminal.settle();
         }
         let cur = terminal.read().ok_or_else(|| {
-            StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 快路径走位后读不到屏幕——已中止，未发任何键；请人工核对终端")
+            StageAbort::screen(
+                "INJECT_SCREEN_ABORT: 快路径走位后读不到屏幕——已中止，未发任何键；请人工核对终端",
+            )
         })?;
         if opencode_own_answer_edit_open(&cur, &d) {
             // 已在编辑态（先前未完成的作答）→ 直接到打字段
         } else {
             oc_send_enter(terminal, &mut sent_keys)?;
             let after = terminal.read().ok_or_else(|| {
-                StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 快路径探针后读不到屏幕——已中止；请人工核对终端")
+                StageAbort::screen(
+                    "INJECT_SCREEN_ABORT: 快路径探针后读不到屏幕——已中止；请人工核对终端",
+                )
             })?;
             if opencode_own_answer_edit_open(&after, &d) {
                 // 未勾行：勾上 + 编辑器展开 → 到达（直接进入打字段）
@@ -3177,7 +3230,9 @@ where
                     // 已勾行：探针纯摘勾（无编辑器）→ 再 enter 勾回+编辑器展开 → 到达
                     oc_send_enter(terminal, &mut sent_keys)?;
                     let reopened = terminal.read().ok_or_else(|| {
-                        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 快路径勾回键后读不到屏幕——已中止；请人工核对终端")
+                        StageAbort::screen(
+                            "INJECT_SCREEN_ABORT: 快路径勾回键后读不到屏幕——已中止；请人工核对终端",
+                        )
                     })?;
                     if !opencode_own_answer_edit_open(&reopened, &d) {
                         return Err(StageAbort::screen(
@@ -3216,7 +3271,7 @@ where
                             }
                             oc_send_enter(terminal, &mut sent_keys)?;
                             let after = terminal.read().ok_or_else(|| {
-                                StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 探针回车后读不到屏幕——已中止；请人工核对终端")
+                                StageAbort::screen("INJECT_SCREEN_ABORT: 探针回车后读不到屏幕——已中止；请人工核对终端")
                             })?;
                             if opencode_own_answer_edit_open(&after, &d) {
                                 edit_ready = true;
@@ -3264,7 +3319,9 @@ where
                                 }
                             }
                             terminal.send("down").map_err(|e| {
-                                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 下箭头投递失败（{e}）"))
+                                StageAbort::delivery(format!(
+                                    "INJECT_DELIVERY_FAIL: 下箭头投递失败（{e}）"
+                                ))
                             })?;
                             sent_keys.push("down".to_string());
                             terminal.settle();
@@ -3283,14 +3340,16 @@ where
         let mut steps = 0usize;
         while steps < own_pos.saturating_sub(1) {
             let cur = terminal.read().ok_or_else(|| {
-                StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 走位中读不到屏幕——已中止，未发任何键；请人工核对终端")
+                StageAbort::screen(
+                    "INJECT_SCREEN_ABORT: 走位中读不到屏幕——已中止，未发任何键；请人工核对终端",
+                )
             })?;
             if opencode_own_row_highlighted(&cur, &d) {
                 break;
             }
-            terminal
-                .send("down")
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 下箭头投递失败（{e}）")))?;
+            terminal.send("down").map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 下箭头投递失败（{e}）"))
+            })?;
             sent_keys.push("down".to_string());
             terminal.settle();
             steps += 1;
@@ -3298,11 +3357,15 @@ where
         // 2.5 走位弱校验（F3）：高亮字符层不可见 → 无法逐行复核；以「走位后 own answer
         // 行仍在 + 编号未跳变 + 勾选/内容未变」降险（异常即中止零后续键）
         let after_walk = terminal.read().ok_or_else(|| {
-            StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 走位后读不到屏幕——已中止，未发任何键；请人工核对终端")
+            StageAbort::screen(
+                "INJECT_SCREEN_ABORT: 走位后读不到屏幕——已中止，未发任何键；请人工核对终端",
+            )
         })?;
         let (walked_pos, walked_checked, walked_saved) =
             opencode_own_answer_row_state(&after_walk, &d).ok_or_else(|| {
-                StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 走位后屏上找不到 own answer 行——已中止；请人工核对终端")
+                StageAbort::screen(
+                    "INJECT_SCREEN_ABORT: 走位后屏上找不到 own answer 行——已中止；请人工核对终端",
+                )
             })?;
         if walked_pos != own_pos || walked_checked != was_checked || walked_saved != saved_text {
             return Err(StageAbort::screen(
@@ -3361,25 +3424,25 @@ where
     if overwrite && !saved_text.is_empty() {
         let n = saved_text.chars().count().min(400);
         for _ in 0..n {
-            terminal
-                .send("backspace")
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 退格投递失败（{e}）")))?;
+            terminal.send("backspace").map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 退格投递失败（{e}）"))
+            })?;
         }
         sent_keys.push(format!("<backspace×{n}>"));
         terminal.settle();
     }
     // 6. 打字（字符通道；空文本 + overwrite = 仅清空）
     if !text.is_empty() {
-        terminal
-            .send_text(text)
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）")))?;
+        terminal.send_text(text).map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）"))
+        })?;
         sent_keys.push("<text>".to_string());
         terminal.settle();
     }
     // 7. enter 保存（锁定态——方向键不再影响编辑；推进走既有 tab/提交按钮）
-    terminal
-        .send("enter")
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 保存回车投递失败（{e}）")))?;
+    terminal.send("enter").map_err(|e| {
+        StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 保存回车投递失败（{e}）"))
+    })?;
     sent_keys.push("enter".to_string());
     terminal.settle();
     // 7.5 **保存后勾选闭环**（2026-10-05 用户实机语义定案）：own 行的勾选标记是
@@ -3409,7 +3472,9 @@ where
             }
             oc_send_enter(terminal, &mut sent_keys)?;
             let after = terminal.read().ok_or_else(|| {
-                StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 补勾回车后读不到屏幕——已中止；请人工核对终端")
+                StageAbort::screen(
+                    "INJECT_SCREEN_ABORT: 补勾回车后读不到屏幕——已中止；请人工核对终端",
+                )
             })?;
             if opencode_own_answer_edit_open(&after, &d) {
                 // 命中 own 行：勾上 + 编辑态 → 保存，回循环头复核
@@ -3420,7 +3485,9 @@ where
                 // 落在选项行 → 立即还原（翻转可逆，实测）
                 oc_send_enter(terminal, &mut sent_keys)?;
                 let restored = terminal.read().ok_or_else(|| {
-                    StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 补勾还原键后读不到屏幕——已中止；请人工核对终端")
+                    StageAbort::screen(
+                        "INJECT_SCREEN_ABORT: 补勾还原键后读不到屏幕——已中止；请人工核对终端",
+                    )
                 })?;
                 if opencode_option_flip(&cur, &restored, own_pos, &d) {
                     return Err(StageAbort::screen(
@@ -3428,9 +3495,11 @@ where
                     ));
                 }
             }
-            terminal
-                .send("down")
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 补勾走位下箭头投递失败（{e}）")))?;
+            terminal.send("down").map_err(|e| {
+                StageAbort::delivery(format!(
+                    "INJECT_DELIVERY_FAIL: 补勾走位下箭头投递失败（{e}）"
+                ))
+            })?;
             sent_keys.push("down".to_string());
             terminal.settle();
         }
@@ -4316,9 +4385,9 @@ fn prelift_focus_from_freetext<T: MenuTerminal>(
     if let Some(fi) = focus_idx {
         if rows[fi].kind == QuestionRowKind::FreeText {
             let free_label_before = rows[fi].label.clone();
-            terminal
-                .send("up")
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: ↑ 投递失败（{e}）")))?;
+            terminal.send("up").map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: ↑ 投递失败（{e}）"))
+            })?;
             sent_keys.push("up".to_string());
             terminal.settle();
             let back = terminal.read().ok_or_else(|| {
@@ -4362,7 +4431,7 @@ where
     let mut sent_keys: Vec<String> = Vec::new();
     // ===== 第 1 段：题屏在场 + 行块解析 + 题目身份核验（形态不符即中止，零按键）=====
     let first = poll_screen().map_err(StageAbort::screen)?.ok_or_else(|| {
-        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端")
+        StageAbort::screen("INJECT_SCREEN_ABORT: 读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端")
     })?;
     let mut rows = parse_question_rows(&first);
     if rows.is_empty() {
@@ -4401,13 +4470,15 @@ where
             // 数字 = **屏上编号**（1 起；翻转核验也按屏上编号对位——0 起下标只存在于
             // 载荷/调用侧）
             let digit_key = (target_option + 1).to_string();
-            terminal
-                .send(&digit_key)
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 数字投递失败（{e}）")))?;
+            terminal.send(&digit_key).map_err(|e| {
+                StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 数字投递失败（{e}）"))
+            })?;
             sent_keys.push(digit_key);
             terminal.settle();
             let after = terminal.read().ok_or_else(|| {
-                StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 切勾：数字发出后读不到屏幕——无法核验；请到终端核对勾选态")
+                StageAbort::screen(
+                    "INJECT_SCREEN_ABORT: 切勾：数字发出后读不到屏幕——无法核验；请到终端核对勾选态",
+                )
             })?;
             let after_rows = parse_question_rows(&after);
             let after_target = after_rows
@@ -4468,9 +4539,11 @@ where
             )));
         }
         let key = if target > cur { "down" } else { "up" };
-        terminal
-            .send(key)
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 方向键 {key} 投递失败（{e}）")))?;
+        terminal.send(key).map_err(|e| {
+            StageAbort::delivery(format!(
+                "INJECT_DELIVERY_FAIL: 方向键 {key} 投递失败（{e}）"
+            ))
+        })?;
         sent_keys.push(key.to_string());
         steps += 1;
         terminal.settle();
@@ -4486,7 +4559,7 @@ where
             ));
         }
         let next_cur = unique_focused_row(&next_rows).ok_or_else(|| {
-            StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 步进后屏上解析不到唯一焦点行——已中止，未发空格；请人工核对终端")
+            StageAbort::screen("INJECT_SCREEN_ABORT: 步进后屏上解析不到唯一焦点行——已中止，未发空格；请人工核对终端")
         })?;
         // 位移校验（评审 Minor-3）：必须**沿目标方向**恰好 1 行——反向位移（终端
         // 自行移动了焦点）同样中止，防「乒乓走到上限」的浪费按键路径
@@ -4506,11 +4579,9 @@ where
             "目标选项行没有勾选框（屏是单选形态？）——toggle 仅用于多选题，已中止，未发空格",
         )
     })?;
-    terminal.send("space").map_err(|e| {
-        StageAbort::delivery(format!(
-            "INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 空格投递失败（{e}）"
-        ))
-    })?;
+    terminal
+        .send("space")
+        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 空格投递失败（{e}）")))?;
     sent_keys.push("space".to_string());
     terminal.settle();
     // ===== 第 4 段：核验翻转 =====
@@ -4617,9 +4688,9 @@ where
                 advanced: false,
             }),
             NavDirection::Prev => {
-                terminal
-                    .send("left")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: ← 投递失败（{e}）")))?;
+                terminal.send("left").map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: ← 投递失败（{e}）"))
+                })?;
                 sent_keys.push("left".to_string());
                 terminal.settle();
                 poll_navigation_result(
@@ -4649,13 +4720,15 @@ where
         // ↑ 后核验**文字与勾选都还在**——↑ 若有意外副作用（吞字/取消勾选），切题就
         // 会把半途状态存进去，必须中止引导人工
         let free_label_before = rows[cur].label.clone();
-        terminal
-            .send("up")
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: ↑ 投递失败（{e}）")))?;
+        terminal.send("up").map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: ↑ 投递失败（{e}）"))
+        })?;
         sent_keys.push("up".to_string());
         terminal.settle();
         let back = terminal.read().ok_or_else(|| {
-            StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 切题：↑ 后读不到屏幕——已中止，未发 ←/→；请人工核对终端")
+            StageAbort::screen(
+                "INJECT_SCREEN_ABORT: 切题：↑ 后读不到屏幕——已中止，未发 ←/→；请人工核对终端",
+            )
         })?;
         let back_rows = parse_question_rows(&back);
         let on_option = unique_focused_row(&back_rows)
@@ -4729,7 +4802,9 @@ fn poll_navigation_result<T: MenuTerminal>(
             .max(1);
     for i in 0..rounds {
         let after = terminal.read().ok_or_else(|| {
-            StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 切题：←/→ 后读不到屏幕——无法确认是否切题；请人工核对终端")
+            StageAbort::screen(
+                "INJECT_SCREEN_ABORT: 切题：←/→ 后读不到屏幕——无法确认是否切题；请人工核对终端",
+            )
         })?;
         let on_review = matches!(probe_review_screen(&after), ScreenStep::Ready(_));
         match (direction, on_review) {
@@ -4889,9 +4964,11 @@ where
             }
             // 方向判定：行块里焦点位 vs 推进行位（块解析不出 → 回落 ↓，旧口径）
             let key = walk_direction_to_advance(&lines).unwrap_or("down");
-            terminal
-                .send(key)
-                .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 方向键 {key} 投递失败（{e}）")))?;
+            terminal.send(key).map_err(|e| {
+                StageAbort::delivery(format!(
+                    "INJECT_DELIVERY_FAIL: 方向键 {key} 投递失败（{e}）"
+                ))
+            })?;
             sent_keys.push(key.to_string());
             if key == "up" {
                 up_steps += 1;
@@ -4901,9 +4978,9 @@ where
             terminal.settle();
         }
         // ===== 第 3 段：提交（焦点已在提交行——唯一的回车点）=====
-        terminal
-            .send("enter")
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）")))?;
+        terminal.send("enter").map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）"))
+        })?;
         sent_keys.push("enter".to_string());
         terminal.settle();
         // ===== 第 4 段：Review 屏（未见即中止，**不发数字**）=====
@@ -4933,9 +5010,11 @@ where
         })?;
     let confirm_key = confirm_num.to_string();
     log::debug!("问答提交阶段机：Review 确认项「{confirm_line}」→ 确认键 '{confirm_key}'");
-    terminal
-        .send(&confirm_key)
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 确认键 {confirm_key} 投递失败（{e}）")))?;
+    terminal.send(&confirm_key).map_err(|e| {
+        StageAbort::delivery(format!(
+            "INJECT_DELIVERY_FAIL: 确认键 {confirm_key} 投递失败（{e}）"
+        ))
+    })?;
     sent_keys.push(confirm_key);
     terminal.settle();
     // ===== 第 5 段：终态回执核验（未见**不是失败**）=====
@@ -5102,7 +5181,9 @@ where
     if text.trim().is_empty() {
         // 「文本为空」是**参数问题**（端点已在入口 400 拦），落到这里属防御：
         // 归为屏读类（形态不符）而非投递类——**没有发生任何投递**
-        return Err(StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 自由作答文本为空——已中止，未发任何键"));
+        return Err(StageAbort::screen(
+            "INJECT_SCREEN_ABORT: 自由作答文本为空——已中止，未发任何键",
+        ));
     }
     let mut sent_keys: Vec<String> = Vec::new();
     // ===== 第 1 段：自由作答行在场（不在场即中止，零按键——K7：未定位直接打字无效）=====
@@ -5126,9 +5207,11 @@ where
         ))
     })?;
     // ===== 第 2 段：定位（仅移动焦点，不提交）=====
-    terminal
-        .send(&locate_key)
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 定位键 {locate_key} 投递失败（{e}）")))?;
+    terminal.send(&locate_key).map_err(|e| {
+        StageAbort::delivery(format!(
+            "INJECT_DELIVERY_FAIL: 定位键 {locate_key} 投递失败（{e}）"
+        ))
+    })?;
     sent_keys.push(locate_key.clone());
     terminal.settle();
     // **重读复核**：定位键之后必须重新屏读、确认自由作答行**仍在场**（焦点确实落上
@@ -5144,17 +5227,17 @@ where
         )));
     }
     // ===== 第 3 段：文本（唯一走字符通道的一步）=====
-    terminal
-        .send_text(text)
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）")))?;
+    terminal.send_text(text).map_err(|e| {
+        StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）"))
+    })?;
     // 审计/回执里的键序用**占位符**记文本（不落正文——正文属用户隐私，且长度可泄露
     // 答案形态）；字符数足以证明「投了什么规模的东西」。
     sent_keys.push(format!("<text:{} chars>", text.chars().count()));
     terminal.settle();
     // ===== 第 4 段：提交（回车；**不带数字、不带 Esc**——K2）=====
-    terminal
-        .send("enter")
-        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）")))?;
+    terminal.send("enter").map_err(|e| {
+        StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 提交回车投递失败（{e}）"))
+    })?;
     sent_keys.push("enter".to_string());
     terminal.settle();
     // ===== 第 5 段：终态回执核验（未见**不是失败**，同提交路径）=====
@@ -5206,7 +5289,9 @@ where
     // 被清掉。空文本且非 overwrite → 维持参数中止（防误触）。
     let clearing_only = text.trim().is_empty() && overwrite;
     if text.trim().is_empty() && !clearing_only {
-        return Err(StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 自由作答文本为空——已中止，未发任何键"));
+        return Err(StageAbort::screen(
+            "INJECT_SCREEN_ABORT: 自由作答文本为空——已中止，未发任何键",
+        ));
     }
     let mut sent_keys: Vec<String> = Vec::new();
     // ===== 第 1 段：定位 FreeText 行 =====
@@ -5265,18 +5350,22 @@ where
             )));
         }
         let key = if free_idx > cur { "down" } else { "up" };
-        terminal
-            .send(key)
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 方向键 {key} 投递失败（{e}）")))?;
+        terminal.send(key).map_err(|e| {
+            StageAbort::delivery(format!(
+                "INJECT_DELIVERY_FAIL: 方向键 {key} 投递失败（{e}）"
+            ))
+        })?;
         sent_keys.push(key.to_string());
         steps += 1;
         terminal.settle();
-        let after_lines = terminal
-            .read()
-            .ok_or_else(|| StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 自由作答走位后读不到屏幕——已中止，未打字"))?;
+        let after_lines = terminal.read().ok_or_else(|| {
+            StageAbort::screen("INJECT_SCREEN_ABORT: 自由作答走位后读不到屏幕——已中止，未打字")
+        })?;
         let after_rows = parse_question_rows(&after_lines);
         let next_cur = unique_focused_row(&after_rows).ok_or_else(|| {
-            StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 自由作答：步进后解析不到唯一焦点行——已中止，未打字")
+            StageAbort::screen(
+                "INJECT_SCREEN_ABORT: 自由作答：步进后解析不到唯一焦点行——已中止，未打字",
+            )
         })?;
         let expected_move: i64 = if key == "down" { 1 } else { -1 };
         if next_cur as i64 - cur as i64 != expected_move {
@@ -5293,16 +5382,20 @@ where
     if has_existing {
         let mut rounds = 0usize;
         loop {
-            let cur = terminal
-                .read()
-                .ok_or_else(|| StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 自由作答：退格前读不到屏幕——已中止，未清空"))?;
+            let cur = terminal.read().ok_or_else(|| {
+                StageAbort::screen(
+                    "INJECT_SCREEN_ABORT: 自由作答：退格前读不到屏幕——已中止，未清空",
+                )
+            })?;
             let cur_rows = parse_question_rows(&cur);
             let cur_label_len = cur_rows
                 .iter()
                 .find(|r| r.number == free_num && r.kind == QuestionRowKind::FreeText)
                 .map(|r| r.label.chars().count())
                 .ok_or_else(|| {
-                    StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 自由作答：退格前解析不到目标行——已中止，未清空")
+                    StageAbort::screen(
+                        "INJECT_SCREEN_ABORT: 自由作答：退格前解析不到目标行——已中止，未清空",
+                    )
                 })?;
             if cur_label_len == 0 {
                 break; // 已是占位（has_existing 才进这里，防御分支）
@@ -5321,22 +5414,24 @@ where
             // 退格只删光标前的字符——行首退格全无效）；行内 ←/→ 是编辑光标（两行
             // 例外取证），超出末尾的 right 是无操作，多按无害
             for _ in 0..cur_label_len {
-                terminal
-                    .send("right")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 右移投递失败（{e}）")))?;
+                terminal.send("right").map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 右移投递失败（{e}）"))
+                })?;
                 sent_keys.push("right".to_string());
             }
             // 再退格×L（从末尾往回删）
             for _ in 0..cur_label_len {
-                terminal
-                    .send("backspace")
-                    .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 退格投递失败（{e}）")))?;
+                terminal.send("backspace").map_err(|e| {
+                    StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 退格投递失败（{e}）"))
+                })?;
                 sent_keys.push("backspace".to_string());
             }
             terminal.settle();
             rounds += 1;
             let after = terminal.read().ok_or_else(|| {
-                StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 自由作答：退格后读不到屏幕——已中止，未打新字")
+                StageAbort::screen(
+                    "INJECT_SCREEN_ABORT: 自由作答：退格后读不到屏幕——已中止，未打新字",
+                )
             })?;
             let cleared = parse_question_rows(&after).iter().any(|r| {
                 r.number == free_num
@@ -5351,9 +5446,9 @@ where
     // ===== 第 3 段：打字（字符通道；直接输入即内联编辑——活体取证）=====
     // 清空模式跳过打字（退格循环已恢复占位；占位行打字核验的 label 翻转规则不适用）
     if !clearing_only {
-        terminal
-            .send_text(text)
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）")))?;
+        terminal.send_text(text).map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 作答文本投递失败（{e}）"))
+        })?;
         sent_keys.push(format!("<text:{} chars>", text.chars().count()));
         terminal.settle();
     }
@@ -5370,7 +5465,9 @@ where
         });
     }
     let after = terminal.read().ok_or_else(|| {
-        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 自由作答：打字后读不到屏幕——无法核验是否生效；请到终端人工核对")
+        StageAbort::screen(
+            "INJECT_SCREEN_ABORT: 自由作答：打字后读不到屏幕——无法核验是否生效；请到终端人工核对",
+        )
     })?;
     let after_rows = parse_question_rows(&after);
     // 翻转判据 = label 离开占位（2026-10-02 勾选兜底批：勾选态不参与本判定——
@@ -5391,7 +5488,9 @@ where
     let after_rows = parse_question_rows(&after);
     let target_pos = after_rows.iter().position(|r| r.number == free_num);
     let target_row = target_pos.and_then(|i| after_rows.get(i)).ok_or_else(|| {
-        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 自由作答：核验阶段解析不到目标行——已中止；请到终端人工核对")
+        StageAbort::screen(
+            "INJECT_SCREEN_ABORT: 自由作答：核验阶段解析不到目标行——已中止；请到终端人工核对",
+        )
     })?;
     if target_row.checked == Some(false) {
         let focus_on_target = unique_focused_row(&after_rows) == target_pos;
@@ -5400,13 +5499,13 @@ where
                 "自由作答：文字已入行但未勾选，且焦点已不在该行——不盲发空格（会勾到别的选项）。请到终端核对该行后手动勾选",
             ));
         }
-        terminal
-            .send("space")
-            .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 空格投递失败（{e}）")))?;
+        terminal.send("space").map_err(|e| {
+            StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 空格投递失败（{e}）"))
+        })?;
         sent_keys.push("space".to_string());
         terminal.settle();
         let recheck = terminal.read().ok_or_else(|| {
-            StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 自由作答：补勾选后读不到屏幕——无法核验；请到终端人工核对勾选态")
+            StageAbort::screen("INJECT_SCREEN_ABORT: 自由作答：补勾选后读不到屏幕——无法核验；请到终端人工核对勾选态")
         })?;
         let rechecked = parse_question_rows(&recheck)
             .iter()
@@ -5462,7 +5561,7 @@ where
 {
     let mut sent_keys: Vec<String> = Vec::new();
     let first = poll_screen().map_err(StageAbort::screen)?.ok_or_else(|| {
-        StageAbort::screen("INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: INJECT_SCREEN_ABORT: 读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端")
+        StageAbort::screen("INJECT_SCREEN_ABORT: 读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端")
     })?;
     // **Review 确认屏防线（评审 P1-1，2026-10-08）**：漂移场景（用户终端已答完、
     // 屏停在 Review 确认屏，手机卡再点选项）下数字会打进确认屏=替用户提交。
@@ -5484,11 +5583,9 @@ where
     let _rows = prelift_focus_from_freetext(terminal, rows, focus_idx, &mut sent_keys, "单选作答")?;
     // 数字 = 屏上编号（index 0 起 → 编号 index+1）
     let digit_key = (index + 1).to_string();
-    terminal.send(&digit_key).map_err(|e| {
-        StageAbort::delivery(format!(
-            "INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: INJECT_DELIVERY_FAIL: 数字投递失败（{e}）"
-        ))
-    })?;
+    terminal
+        .send(&digit_key)
+        .map_err(|e| StageAbort::delivery(format!("INJECT_DELIVERY_FAIL: 数字投递失败（{e}）")))?;
     sent_keys.push(digit_key);
     terminal.settle();
     Ok(sent_keys)

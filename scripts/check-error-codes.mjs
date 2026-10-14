@@ -91,7 +91,9 @@ function walk(dir) {
       continue;
     }
     if (!f.endsWith(".rs")) continue;
-    const src = stripComments(stripTests(readFileSync(p, "utf8")));
+    const raw = readFileSync(p, "utf8");
+    checkRepeated(stripComments(raw), p);
+    const src = stripComments(stripTests(raw));
     for (const re of [CODED_CALL, CODED_LITERAL]) {
       for (const m of src.matchAll(re)) codes.add(m[1]);
     }
@@ -111,7 +113,9 @@ function walkFe(dir) {
       continue;
     }
     if (!/\.(tsx?|ts)$/.test(f)) continue;
-    const src = stripComments(readFileSync(p, "utf8"));
+    const raw = readFileSync(p, "utf8");
+    checkRepeated(stripComments(raw), p);
+    const src = stripComments(raw);
     for (const m of src.matchAll(/["'`]([A-Z][A-Z0-9_]{2,}):/g)) codes.add(m[1]);
   }
 }
@@ -136,6 +140,18 @@ for (const key of Object.keys(zhErr)) {
 }
 if (enErr && Object.keys(enErr).length !== Object.keys(zhErr).length) {
   fail.push("zh/en errors 段键数不一致（由 check-i18n 兜底，此处冗余校验）");
+}
+
+// 重复前缀检测（B1 事故防复发：正则批量改写非幂等叠加会把同一码叠成多重前缀）
+function checkRepeated(src, label) {
+  src
+    .split("\n")
+    .forEach((l, i) => {
+      const t = l.trim();
+      if (t.startsWith("//") || t.startsWith("*")) return;
+      if (/([A-Z][A-Z0-9_]{2,}: ){2,}/.test(l))
+        fail.push(`${label}:${i + 1} 重复码前缀（批量改写叠加事故？）：${t.slice(0, 60)}`);
+    });
 }
 
 if (fail.length) {

@@ -7464,7 +7464,7 @@ mod tests {
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].action, "answer");
         assert_eq!(
-            audits[0].result, "failed:方向键 down 投递失败（注入通道拒绝）",
+            audits[0].result, "failed:INJECT_DELIVERY_FAIL: 方向键 down 投递失败（注入通道拒绝）",
             "审计 result = failed:错误文案（与批次丙同前缀口径；2026-09-24 走位方向感知后文案带键名）"
         );
         assert_eq!(audits[0].summary, "submit", "投递失败不追加段名");
