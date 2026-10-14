@@ -85,7 +85,9 @@ pub fn flip_and_sync<R: Runtime>(app: &AppHandle<R>, enabled: bool) -> Result<()
 /// `target/debug` 的开发二进制写进登录项，每次开机登录都被拉起——如实报错拒写
 pub fn ensure_writable_runtime() -> Result<(), String> {
     if cfg!(debug_assertions) {
-        return Err("Debug 构建不注册开机自启，请用正式安装版验证该开关".into());
+        return Err(
+            "AUTOSTART_DEBUG_BUILD: Debug 构建不注册开机自启，请用正式安装版验证该开关".into(),
+        );
     }
     Ok(())
 }
@@ -151,7 +153,7 @@ fn fix_run_value_quoting(exe_path: &str) -> Result<(), String> {
         let entries: Vec<(String, _)> = key
             .enum_values()
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("枚举 {label} Run 值失败: {e}"))?;
+            .map_err(|e| format!("AUTOSTART_REG_ENUM_FAIL: 枚举 {label} Run 值失败: {e}"))?;
         for (name, value) in entries {
             // 字符串三型（REG_SZ / REG_EXPAND_SZ / REG_MULTI_SZ，winreg 按
             // from_utf16_lossy 取文本）若字面命中本应用路径即接管；DWORD 等非
@@ -163,8 +165,11 @@ fn fix_run_value_quoting(exe_path: &str) -> Result<(), String> {
             let Some(fixed) = quoted_run_command(exe_path, &data) else {
                 continue;
             };
-            key.set_value(&name, &fixed)
-                .map_err(|e| format!("改写自启条目带引号形态失败（{label}\\{name}）: {e}"))?;
+            key.set_value(&name, &fixed).map_err(|e| {
+                format!(
+                    "AUTOSTART_REG_WRITE_FAIL: 改写自启条目带引号形态失败（{label}\\{name}）: {e}"
+                )
+            })?;
             log::info!("自启条目已原位改写为带引号形态: {label}\\{name}");
         }
     }

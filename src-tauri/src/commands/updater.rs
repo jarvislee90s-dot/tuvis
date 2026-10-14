@@ -155,13 +155,21 @@ async fn fetch_releases_with_client(client: reqwest::Client) -> Result<Vec<Githu
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .await
-        .map_err(|e| format!("GitHub API 请求失败: {}", flatten_error_chain(&e)))?;
+        .map_err(|e| {
+            format!(
+                "UPDATER_GITHUB_API_FAIL: GitHub API 请求失败: {}",
+                flatten_error_chain(&e)
+            )
+        })?;
     if !resp.status().is_success() {
-        return Err(format!("GitHub API 状态异常: {}", resp.status()));
+        return Err(format!(
+            "UPDATER_GITHUB_STATUS: GitHub API 状态异常: {}",
+            resp.status()
+        ));
     }
     resp.json::<Vec<GithubRelease>>()
         .await
-        .map_err(|e| format!("GitHub API 响应解析失败: {e}"))
+        .map_err(|e| format!("UPDATER_GITHUB_PARSE: GitHub API 响应解析失败: {e}"))
 }
 
 /// DoH 解析 + 钉 IP 直连兜底：**绕开本地 DNS 污染与失效代理**。
@@ -176,8 +184,8 @@ async fn fetch_releases_via_doh_pinned() -> Result<Vec<GithubRelease>, String> {
         crate::remote::tailscale::real_probe()("api.github.com")
     })
     .await
-    .map_err(|e| format!("DoH 解析任务失败: {e}"))?
-    .map_err(|e| format!("DoH 解析失败（所有源都不可用）: {e}"))?;
+    .map_err(|e| format!("UPDATER_DOH_TASK_FAIL: DoH 解析任务失败: {e}"))?
+    .map_err(|e| format!("UPDATER_DOH_ALL_FAIL: DoH 解析失败（所有源都不可用）: {e}"))?;
 
     // 钉 IP 直连：**必须 no_proxy**——经 HTTP 代理的 CONNECT 隧道把域名交给代理
     // 自己解析，resolve() 只对直连生效；这条路径的意义就是绕开一切本地干扰
@@ -202,7 +210,7 @@ async fn fetch_releases_via_doh_pinned() -> Result<Vec<GithubRelease>, String> {
         };
         match fetch_releases_with_client(client).await {
             Ok(list) => return Ok(list),
-            Err(e) => last_err = format!("钉 IP {addr} 直连失败: {e}"),
+            Err(e) => last_err = format!("UPDATER_PIN_FAIL: 钉 IP {addr} 直连失败: {e}"),
         }
     }
     Err(last_err)
@@ -217,7 +225,7 @@ async fn fetch_github_releases() -> Result<Vec<GithubRelease>, String> {
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(20))
         .build()
-        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
+        .map_err(|e| format!("UPDATER_CLIENT_BUILD: HTTP 客户端构建失败: {e}"))?;
     match fetch_releases_with_client(client).await {
         Ok(list) => Ok(list),
         Err(via_default) => match fetch_releases_via_doh_pinned().await {
@@ -279,10 +287,14 @@ pub async fn check_for_github_update(app: tauri::AppHandle) -> CheckUpdateStatus
 pub fn validate_latest_json_url(url: &str) -> Result<(), String> {
     let expected_prefix = format!("https://github.com/{GITHUB_REPO}/releases/download/");
     if !url.starts_with(&expected_prefix) {
-        return Err(format!("非法的升级清单地址（前缀不符）: {url}"));
+        return Err(format!(
+            "UPDATER_MANIFEST_PREFIX: 非法的升级清单地址（前缀不符）: {url}"
+        ));
     }
     if !url.ends_with("latest.json") {
-        return Err(format!("非法的升级清单地址（非 latest.json）: {url}"));
+        return Err(format!(
+            "UPDATER_MANIFEST_FILENAME: 非法的升级清单地址（非 latest.json）: {url}"
+        ));
     }
     Ok(())
 }
@@ -313,21 +325,21 @@ pub async fn install_github_update(
     validate_latest_json_url(&latest_json_url)?;
     let url: tauri::Url = latest_json_url
         .parse()
-        .map_err(|e| format!("升级清单地址无效: {e}"))?;
+        .map_err(|e| format!("UPDATER_MANIFEST_URL_INVALID: 升级清单地址无效: {e}"))?;
 
     let updater = app
         .updater_builder()
         .endpoints(vec![url])
-        .map_err(|e| format!("升级端点无效: {e}"))?
+        .map_err(|e| format!("UPDATER_ENDPOINT_INVALID: 升级端点无效: {e}"))?
         // 评审 I1：Windows 安装路径插件内部直接 exit(0)，不走 RunEvent::Exit——
         // 挂共享退出清理，保证隧道/电源锁不孤儿化（macOS 走 restart→Exit，钩子冗余无害）
         .on_before_exit(crate::exit_cleanup)
         .build()
-        .map_err(|e| format!("升级器构建失败: {e}"))?;
+        .map_err(|e| format!("UPDATER_BUILDER_FAIL: 升级器构建失败: {e}"))?;
     let update = updater
         .check()
         .await
-        .map_err(|e| format!("升级清单校验失败: {e}"))?
+        .map_err(|e| format!("UPDATER_MANIFEST_VERIFY: 升级清单校验失败: {e}"))?
         .ok_or("远端清单不包含可用更新")?;
 
     let emit_progress = |event: &str, downloaded: u64, content_length: Option<u64>| {
@@ -369,7 +381,7 @@ pub async fn install_github_update(
             },
         )
         .await
-        .map_err(|e| format!("下载或安装失败: {e}"))?;
+        .map_err(|e| format!("UPDATER_INSTALL_FAIL: 下载或安装失败: {e}"))?;
 
     // Windows：插件在 install 内部已 exit(0)（由 NSIS /UPDATE 装完重启），走不到这里；
     // macOS：换壳完成，重启进新版本（restart 返回 !，下方 Ok 仅非 macOS 路径可达）

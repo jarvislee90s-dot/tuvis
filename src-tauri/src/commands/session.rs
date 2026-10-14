@@ -92,7 +92,11 @@ pub fn focus_session(
                         mark_read_on_jump(&app, &session_id, &agent_type);
                         return Ok(serde_json::json!({ "via": "dsh-desktop" }));
                     }
-                    Err(e) => return Err(format!("无法聚焦 DeepSeek Harness 窗口：{e}")),
+                    Err(e) => {
+                        return Err(format!(
+                            "SESSION_FOCUS_FAIL: 无法聚焦 DeepSeek Harness 窗口：{e}"
+                        ))
+                    }
                 }
             }
             #[cfg(target_os = "macos")]
@@ -270,7 +274,11 @@ pub fn focus_session(
                     out["via"] = serde_json::Value::String("dsh".into());
                     return Ok(out);
                 }
-                Err(e) => return Err(format!("无法聚焦 dsh 页面：{e}（请手动打开 dsh web）")),
+                Err(e) => {
+                    return Err(format!(
+                        "SESSION_DSH_FOCUS_FAIL: 无法聚焦 dsh 页面：{e}（请手动打开 dsh web）"
+                    ))
+                }
             }
         }
         // CLI 形态：TTY 链路（tmux/iTerm2/Terminal.app）
@@ -342,7 +350,7 @@ pub fn focus_hwnd(hwnd: isize) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = hwnd;
-        Err("当前平台不支持".to_string())
+        Err("SESSION_PLATFORM_UNSUPPORTED: 当前平台不支持".to_string())
     }
 }
 
@@ -372,7 +380,7 @@ pub fn dismiss_session_card(agent_type: String, session_id: String, status: Stri
 pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
     let sid = session_id.trim().to_string();
     if sid.is_empty() {
-        return Err("缺少 session_id".to_string());
+        return Err("SESSION_ID_MISSING: 缺少 session_id".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
         // mut：T3 信任归一在 spawn 前原地改写 project_path（claude 专属，只读
@@ -411,7 +419,7 @@ pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(
         r
     })
     .await
-    .map_err(|e| format!("会话扫描任务异常: {e}"))?
+    .map_err(|e| format!("SESSION_SCAN_FAIL: 会话扫描任务异常: {e}"))?
     .map_err(|e| match e.as_str() {
         // 哨兵串转译（前端 toast 直展；与移动端禁用原因文案同义）
         "no_resume_command" => "该工具 resume 命令待查证，暂不支持一键打开".to_string(),
@@ -459,7 +467,7 @@ pub fn kill_pid(pid: u32) -> Result<(), String> {
         }
         Ok(())
     } else {
-        Err(format!("进程 {} 不存在", pid))
+        Err(format!("SESSION_PID_GONE:{pid}: 进程 {} 不存在", pid))
     }
 }
 

@@ -70,7 +70,7 @@ pub async fn show_notification_window(
     });
     match rx.await {
         Ok(result) => result,
-        Err(_) => Err("创建通知窗口线程异常".to_string()),
+        Err(_) => Err("NOTIFY_WINDOW_THREAD_FAIL: 创建通知窗口线程异常".to_string()),
     }
 }
 
@@ -125,7 +125,7 @@ fn create_notification_window(app: &AppHandle, payload: NotificationPayload) -> 
             .inner_size(W, H)
             .position(x, y)
             .build()
-            .map_err(|e| format!("创建通知窗口失败: {}", e))?;
+            .map_err(|e| format!("NOTIFY_WINDOW_FAIL: 创建通知窗口失败: {}", e))?;
         }
     }
     // 定向发送到该槽位窗口（emit 全局广播会让所有槽位同时弹出）
@@ -232,7 +232,7 @@ fn create_action_notification_window(
             .inner_size(ACTION_W, ACTION_H)
             .position(x, y)
             .build()
-            .map_err(|e| format!("创建操作提醒窗口失败: {}", e))?;
+            .map_err(|e| format!("NOTIFY_ACTION_WINDOW_FAIL: 创建操作提醒窗口失败: {}", e))?;
         }
     }
     let app2 = app.clone();
@@ -249,7 +249,9 @@ fn create_action_notification_window(
 fn validate_ack_action(action: &str) -> Result<(), String> {
     match action {
         "copy" | "never" => Ok(()),
-        other => Err(format!("非法销账动作: {other}（合法值: copy/never）")),
+        other => Err(format!(
+            "NOTIFY_INVALID_ACTION: 非法销账动作: {other}（合法值: copy/never）"
+        )),
     }
 }
 

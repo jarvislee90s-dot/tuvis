@@ -165,7 +165,10 @@ pub fn create_pet_window(app: &AppHandle) -> Result<(), String> {
         clear_pet_window(app);
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
-    Err(format!("桌宠窗口创建失败（已重试 5 次）: {}", last_err))
+    Err(format!(
+        "PET_WINDOW_RETRY_FAIL: 桌宠窗口创建失败（已重试 5 次）: {}",
+        last_err
+    ))
 }
 
 fn build_pet_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
@@ -236,7 +239,7 @@ fn build_pet_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
             });
         })
         .build()
-        .map_err(|e| format!("创建桌宠窗口失败: {}", e))?;
+        .map_err(|e| format!("PET_WINDOW_FAIL: 创建桌宠窗口失败: {}", e))?;
     // dev 模式下 WebView2 可能给 webview 自动附加 DevTools 独立窗口，显式关闭
     #[cfg(debug_assertions)]
     w.close_devtools();
