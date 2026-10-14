@@ -1,0 +1,13 @@
+{
+  "_comment": "H 系无头回执 stage 的**跨语言唯一名单**（Task 8 复审追补）：Rust `inject::headless::receipt::Stage` 的 serde snake_case 名与前端 `src/mobile/SessionDetail.tsx` 的 HEADLESS_STAGE_TRIAGE 键集合都必须与它逐项相等——任一侧新增变体而另一侧没跟上，必有一侧先红。改名/新增请同时改三处（枚举、前端分诊表、本文件）。",
+  "stages": [
+    "spawn",
+    "version_gate",
+    "timeout",
+    "crash",
+    "channel_error",
+    "dialog",
+    "workspace_busy",
+    "refused"
+  ]
+}

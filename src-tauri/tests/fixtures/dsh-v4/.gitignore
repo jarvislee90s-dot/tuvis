@@ -1,0 +1,5 @@
+# 真实 dsh v4 夹具目录：本地实机核验专用，仓库内只保留本 .gitignore
+# 真实用户会话内容永不入库（隐私红线）——填充方法见
+# src-tauri/src/monitor/dsh/mod.rs 的 real_v4_fixture_end_to_end_verification
+*
+!.gitignore

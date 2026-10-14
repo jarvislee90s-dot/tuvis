@@ -3,6 +3,10 @@
 //（由调用方约束，本层不校验；answer = 批次乙 T8 问答应答；mode = 批次丙 T6 模式切换；
 //  **slash = 丁T3 斜杠命令裸注入**——裁2：`/` 开头消息不带签名（前后缀都会破坏命令与
 //  参数），终端不留痕是可接受的，溯源只此一处：本表 action=slash + device_name 列）
+// Task 6（H4/H6）追加 **headless | headless_cancel**：无头 turn 落账与移动端取消
+//（词表常量与落账出口单点在 `inject::headless`；channel 列记无头通道名而非终端注入器名）。
+// **action 列是 TEXT NOT NULL、无 CHECK 约束**（见 database/schema.rs）——扩词只需改本
+// 注释与调用方，**不需要 migration**。
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 

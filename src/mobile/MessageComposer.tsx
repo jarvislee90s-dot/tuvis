@@ -67,13 +67,16 @@ import {
   fetchQueue,
   fetchSendInfo,
   fetchSessionQuestion,
+  headlessChannelOf,
   queueJump,
   queueRetract,
   questionAnswerErrorCopy,
   sessionQuestionAnswer,
+  sessionQuestionAnswerRepost,
   sessionSend,
   uploadAttachment,
   type ChannelInfo,
+  type HeadlessTurn,
   type QueueItemView,
   type SendInfo,
 } from "./api";
@@ -83,6 +86,10 @@ import { etaRemainingText, formatBytes, transferRateBps, type TransferSample } f
 interface MessageComposerProps {
   /** 会话（本组件只消费 id；结构化类型，完整 Session 可直接传入） */
   session: { id: string };
+  /** **无头回合上报**（Task 8 / H7）：无头通道（zcode）的发送是**回合级**动作——请求要在飞
+   *  整个无头进程的生命周期（实测 8–23s），回执卡与取消钮因此挂在 SessionDetail（页面级），
+   *  本组件只上报「发送中 / 终态回执」两个翻转点。**终端通道不调用**（零回归）。 */
+  onHeadlessTurn?: (turn: HeadlessTurn) => void;
 }
 
 /** 待发附件条目（组件内态）：status=uploading → ready/failed；
@@ -193,6 +200,70 @@ const APPROVE_PRESENT_RECEIPT = "终端等待审批，请用卡片按钮";
 const FREETEXT_WITH_ATTACHMENT_RECEIPT =
   "附件不能随「回答」发送（自由作答不带附件）。请移除附件后作为回答发送，或改用卡片按钮/终端";
 
+/** APP 补投封套 failed/cancelled 且后端未带 `receipt.reason` 时的兜底文案（C-1：
+ *  不得把 undefined 渲染成「发送失败：undefined」。措辞与 QuestionCardApp 的
+ *  失败兜底同口径——只在 APP 面（headless 通道）的补投臂出现，无 CLI 专属词）。 */
+const REPOST_FAILED_FALLBACK = "补投未成功，请重试或在 APP 内操作";
+
+/** Task 8：composer 两套措辞（设计 §3.7(a) APP 词汇表）。判据 = 发送分流同源的
+ *  `headlessChannelOf`（headless_* 通道 = 无终端会话：codex APP / zcode /
+ *  WorkBuddy / dsh）——APP 面 CLI 专属词（终端/按键族）禁用，统一「会话/APP」
+ *  措辞；**CLI 面文案逐字不变**（既有用例锁死）。TUI 队列 UI（jump/edit/retract
+ *  的「忙时留队转闲 flush」语义）对 headless 通道天然不生效，按通道隐藏（词表
+ *  的 queueHint 即隐藏后的如实占位——消费确认信号是前后端合解的契约缺口，登记
+ *  Task 11 遗留，不谎报已消费）。 */
+interface ComposerCopy {
+  defaultPlaceholder: string;
+  freetextPlaceholder: string;
+  blockedPlaceholder: string;
+  approvePlaceholder: string;
+  questionHint: string;
+  approveHint: string;
+  delivered: string;
+  submitted: string;
+  questionBlockedReceipt: string;
+  approveReceipt: string;
+  freetextAttachmentReceipt: string;
+  /** 队列区说明行：CLI = 放行节奏说明；APP = 消费翻转未建的如实占位 */
+  queueHint: string;
+  /** APP 队列无撤回原语的补充说明（T0.1 回填钉句；CLI 恒空串不渲染） */
+  queueNoRetract: string;
+}
+
+const CLI_COPY: ComposerCopy = {
+  defaultPlaceholder: "输入消息发送到终端…",
+  freetextPlaceholder: QUESTION_FREETEXT_PLACEHOLDER,
+  blockedPlaceholder: "终端等待回答（本题请到卡片或终端作答）",
+  approvePlaceholder: "终端等待审批，请用卡片按钮",
+  questionHint: "终端正在等待回答——本输入框发送的内容将作为本题的回答送到终端",
+  approveHint: "终端等待审批——本输入框直发已被拦截，请用上方卡片按钮应答",
+  delivered: "已送达终端",
+  submitted: "已投递至终端输入，agent 空闲后处理（未确认落盘）",
+  questionBlockedReceipt: QUESTION_BLOCKED_RECEIPT,
+  approveReceipt: APPROVE_PRESENT_RECEIPT,
+  freetextAttachmentReceipt: FREETEXT_WITH_ATTACHMENT_RECEIPT,
+  queueHint: "空闲时将按序自动发送",
+  queueNoRetract: "",
+};
+
+const APP_COPY: ComposerCopy = {
+  defaultPlaceholder: "输入消息发送到会话…",
+  freetextPlaceholder: "输入内容将作为本题的回答补投到会话",
+  blockedPlaceholder: "会话等待回答（本题请到问答卡或 APP 内作答）",
+  approvePlaceholder: "会话等待审批，请用卡片按钮",
+  questionHint: "会话正在等待回答——本输入框发送的内容将作为本题的回答补投",
+  approveHint: "会话等待审批——本输入框直发已被拦截，请用上方卡片按钮应答",
+  delivered: "已送达会话",
+  submitted: "已投递至会话输入，agent 空闲后处理（未确认落盘）",
+  questionBlockedReceipt:
+    "会话正在等待回答，但本题不能在本输入框作答：请在问答卡中作答，或直接在 APP 内操作",
+  approveReceipt: "会话等待审批，请用卡片按钮",
+  freetextAttachmentReceipt:
+    "附件不能随「回答」发送（自由作答不带附件）。请移除附件后作为回答发送，或改用问答卡按钮/APP 内操作",
+  queueHint: "排队中（消费确认建设中）",
+  queueNoRetract: "已入队未消费，暂无撤回原语",
+};
+
 /** W1 来源标记（服务端 compose_injection 注入，非用户正文）：预览与「修改」放回正文
  *  时剥离——不剥则修改重发会二次叠加签名。
  *
@@ -229,7 +300,7 @@ function upsertQueueItem(items: QueueItemView[], item: QueueItemView): QueueItem
   return next;
 }
 
-export default function MessageComposer({ session }: MessageComposerProps) {
+export default function MessageComposer({ session, onHeadlessTurn }: MessageComposerProps) {
   // 可用性：sendInfo=null 且未就绪 → 不渲染（加载中 / 拉取失败 / 403）
   const [sendInfo, setSendInfo] = useState<SendInfo | null>(null);
   const [infoReady, setInfoReady] = useState(false);
@@ -439,6 +510,13 @@ export default function MessageComposer({ session }: MessageComposerProps) {
     const body = text.trim();
     if (!body || sending || busy || sendInfo === null || !sendInfo.injectable) return;
     if (attachments.some((a) => a.status === "uploading")) return; // 上传中禁发（防消息先于落盘）
+    // 通道名（Task 13/C4）：随「发送中」上报——页面级回执卡据此**只在 claude 通道**上
+    // 轮询审批卡（其余无头通道没有审批面，白轮询是浪费也是误导）
+    const headlessChannel = headlessChannelOf(sendInfo);
+    // **无头通道分流判据**（Task 8 / H7）：在 try 之前定下来——catch 也必须知道本次是
+    // 无头发送（否则请求抛异常时回执卡会永远停在「无头回合进行中…」= 编造在飞态）。
+    const headless = headlessChannel !== null;
+    const startedAt = Date.now();
     setSending(true);
     try {
       // ===== 丁T3 接入②：发送时刻**复探**卡片在场（§2.4 裁3 的安全面）=====
@@ -459,12 +537,15 @@ export default function MessageComposer({ session }: MessageComposerProps) {
       // 拦截时输入框内容**保留**（与 failed 态同口径：用户可复制到卡片输入框或终端）。
       const presence = await probeCardPresence();
       setCardPresence(presence);
+      // Task 8：APP 面（headless_* 通道）拦截文案走 APP 词表（发送逻辑零变化）。
+      // M-1：判据复用 try 前已有的 `headless`（同一 sendInfo 的同源派生，不重算）
+      const appCopy = headless ? APP_COPY : CLI_COPY;
       if (presence === "approve") {
-        setReceipt({ kind: "blocked", message: APPROVE_PRESENT_RECEIPT });
+        setReceipt({ kind: "blocked", message: appCopy.approveReceipt });
         return;
       }
       if (presence === "questionBlocked") {
-        setReceipt({ kind: "blocked", message: QUESTION_BLOCKED_RECEIPT });
+        setReceipt({ kind: "blocked", message: appCopy.questionBlockedReceipt });
         return;
       }
       if (presence === "questionFreeText") {
@@ -472,12 +553,21 @@ export default function MessageComposer({ session }: MessageComposerProps) {
         // 也没有附件入口——带了附件转向 freeText 必然**静默丢弃**它们（用户以为发
         // 出去了）。故拦截而不是忽略（理由见常量注）。
         if (attachments.length > 0) {
-          setReceipt({ kind: "blocked", message: FREETEXT_WITH_ATTACHMENT_RECEIPT });
+          setReceipt({ kind: "blocked", message: appCopy.freetextAttachmentReceipt });
           return;
         }
         // 转向自由作答：**不带附件标记行**（自由作答是「回答」不是「消息」——
         // 后端归一后走字符通道，不带 [mobile] 签名，见 api.ts 的
         // `sessionQuestionAnswer` 注释）。
+        //
+        // **按通道分流出口**（Task 8 收口 C-1）：APP 形态（headless_* 通道）的后端
+        // 6b 臂对有作答文本的动作返回 **200 无头封套**
+        // `{status:"headless", receipt:{status…}, screen:null, note}`——不是
+        // key_sent/failed。旧实现只调 CLI 出口且只认两词：封套落到 else 臂且封套
+        // 无 `error` 字段 → 渲染「发送失败：undefined（可重试）」而补投其实已成功
+        // ——用户重试 = 双份补投。故 APP 面改调 `sessionQuestionAnswerRepost`
+        // （同一端点同一请求体，仅回执类型收窄不同）并按封套分诊；CLI 面出口与
+        // 分诊逐字不变（既有用例锁死）。
         //
         // **非 2xx 分诊在本臂内单独处理**（不复用外层 catch）：问答端点的错误码在
         // `data.error`（`no_question`/`multi_questions`/`tool_readonly`/`bad_index`），
@@ -485,14 +575,36 @@ export default function MessageComposer({ session }: MessageComposerProps) {
         // （丁T6 复评核出：曾用同一段 `reason` 读取，问答 409 会显示成
         // 「session-question/answer 409」这种对用户无意义的串）。文案走
         // [`questionAnswerErrorCopy`]（与卡内**同一函数**，两入口不漂移）。
-        let res: Awaited<ReturnType<typeof sessionQuestionAnswer>>;
+        let res: Awaited<ReturnType<typeof sessionQuestionAnswerRepost>>;
         try {
-          res = await sessionQuestionAnswer(session.id, "freeText", undefined, text);
+          res = headless
+            ? await sessionQuestionAnswerRepost(session.id, "freeText", undefined, text)
+            : await sessionQuestionAnswer(session.id, "freeText", undefined, text);
         } catch (err) {
           setReceipt({
             kind: "failed",
             error: err instanceof ApiError ? questionAnswerErrorCopy(err) : String(err),
           });
+          return;
+        }
+        if (res.status === "headless") {
+          // **APP 补投封套分诊**（Task 6b；回执词汇复用本组件既有 chip，不另编）：
+          // - `ok` = 补投消息已被 APP 会话消费（无头回合完成）→ delivered；
+          // - `queued` = 已入 APP 原生队列（agent 空闲后处理）→ 中性 submitted
+          //   （未确认 ≠ 失败，与 D7/T3 同一纪律）；
+          // - `failed`/`cancelled` = 未投出（`receipt.reason` 为后端中文文案）→
+          //   failed 可重试，输入保留。reason 缺席（封套兜底）不渲染 undefined。
+          //   `screen` 恒 null——补投不产屏读快照，本组件不消费（不声称已作答）。
+          const r = res.receipt;
+          if (r.status === "ok") {
+            setText("");
+            setReceipt({ kind: "delivered" });
+          } else if (r.status === "queued") {
+            setText("");
+            setReceipt({ kind: "submitted" });
+          } else {
+            setReceipt({ kind: "failed", error: r.reason ?? REPOST_FAILED_FALLBACK });
+          }
           return;
         }
         if (res.status === "key_sent") {
@@ -525,8 +637,36 @@ export default function MessageComposer({ session }: MessageComposerProps) {
       // 失败的话，用户重试走的是普通发送语义（后端失败行已退出 pending，可重发）
       const forceQueue = queueOnlyNext;
       setQueueOnlyNext(false);
+      // **无头通道分流**（Task 8 / H7）：send-info 报无头通道（`headless_*`）⇒ 本条是
+      // 回合级发送——请求要等整个无头进程跑完。上报「发送中」给页面级回执卡（取消钮随之
+      // 出现），回执到达后上报终态。判据与后端 `HeadlessKind::wire_name` 同源（单一词表）。
+      // `headless` 在 try **之前**就定下来（catch 也要用——见下），起点时刻用于本地计时。
+      if (headless) {
+        // 无头回合的入队标志无意义（每回合 spawn，无 MAM 队列）：不随请求上送
+        onHeadlessTurn?.({ phase: "sending", channel: headlessChannel });
+      }
       // 多行原样上行（trim 只用于判空，不改写正文——归一在服务端）
-      const res = await sessionSend(session.id, fullText, forceQueue ? true : undefined);
+      const res = await sessionSend(
+        session.id,
+        fullText,
+        forceQueue && !headless ? true : undefined
+      );
+      if (res.status === "headless") {
+        // 终态回执：**成功才清空输入区**（与终端 delivered 同口径）；失败/取消/排队时
+        // 消息未确认落到 ZCode —— 保留正文让用户重试，绝不冒充成功。
+        if (res.receipt.status === "ok") {
+          setText("");
+          setAttachments([]);
+        }
+        // 回执卡由页面级组件渲染（本组件不另设 chip——单回执槽语义）
+        setReceipt(null);
+        onHeadlessTurn?.({
+          phase: "done",
+          receipt: res.receipt,
+          visibilityNote: res.visibilityNote ?? null,
+        });
+        return;
+      }
       if (res.status === "delivered") {
         setText("");
         setAttachments([]);
@@ -564,16 +704,45 @@ export default function MessageComposer({ session }: MessageComposerProps) {
         setReceipt({ kind: "failed", error: res.error });
       }
     } catch (e) {
-      if (e instanceof ApiError) {
-        const reason = typeof e.data?.reason === "string" ? e.data.reason : null;
-        setReceipt({ kind: "failed", error: reason ?? e.message });
-      } else {
-        setReceipt({ kind: "failed", error: String(e) });
+      const errorCopy =
+        e instanceof ApiError
+          ? typeof e.data?.reason === "string"
+            ? e.data.reason
+            : e.message
+          : String(e);
+      // **无头发送的异常必须收敛为失败终态**（复审 Important 1）：请求本身抛（网络断/
+      // 开关中途关闭/500）时若只落 composer chip，页面级回执卡会永远停在「无头回合进行中…」
+      // 并挂着取消钮 —— 那是一个**编造的在飞回合**（本批最要不得的那种不诚实）。
+      // 回执按本地事实构造：status=failed + stage=channel_error（请求未拿到有效回执，
+      // 语义与后端 channel_error 一致）+ 本地计时；**不编 tokens/assistant**。
+      if (headless) {
+        onHeadlessTurn?.({
+          phase: "done",
+          receipt: {
+            status: "failed",
+            sessionId: session.id,
+            durationMs: Date.now() - startedAt,
+            stage: "channel_error",
+            reason: `无头回合请求失败：${errorCopy}`,
+          },
+          visibilityNote: null,
+        });
       }
+      setReceipt({ kind: "failed", error: errorCopy });
     } finally {
       setSending(false);
     }
-  }, [text, attachments, sending, busy, sendInfo, session.id, queueOnlyNext, probeCardPresence]);
+  }, [
+    text,
+    attachments,
+    sending,
+    busy,
+    sendInfo,
+    session.id,
+    queueOnlyNext,
+    probeCardPresence,
+    onHeadlessTurn,
+  ]);
 
   // P2-7 失败对账（插队/撤回/修改共用）：失败后复核 /session-queue——
   // - 条目仍在 pending → 恢复排队视图（刷新队位，行同步更新，「立即发送/修改/撤回」
@@ -844,6 +1013,11 @@ export default function MessageComposer({ session }: MessageComposerProps) {
   // 拉取未就绪 / 失败 / 403：不渲染（详情页正文照常）
   if (!infoReady || sendInfo === null) return null;
 
+  // Task 8：APP 面（headless_* 通道 = 无终端会话）——词汇表与 TUI 队列 UI 的
+  // 按通道隐藏判据（与 handleSend 的发送分流同源 headlessChannelOf，不另立判定）
+  const appFace = headlessChannelOf(sendInfo) !== null;
+  const copy = appFace ? APP_COPY : CLI_COPY;
+
   const canSend =
     injectable &&
     !sending &&
@@ -873,9 +1047,7 @@ export default function MessageComposer({ session }: MessageComposerProps) {
           data-presence={cardPresence}
           className="mb-2 text-xs text-amber-700 dark:text-amber-400"
         >
-          {cardPresence === "approve"
-            ? "终端等待审批——本输入框直发已被拦截，请用上方卡片按钮应答"
-            : "终端正在等待回答——本输入框发送的内容将作为本题的回答送到终端"}
+          {cardPresence === "approve" ? copy.approveHint : copy.questionHint}
         </p>
       )}
       {/* 投递中（灰3）：send await 全程在场——慢消费者长文投递可达分钟级，
@@ -905,7 +1077,7 @@ export default function MessageComposer({ session }: MessageComposerProps) {
               data-testid="send-receipt-delivered"
               className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-400"
             >
-              已送达终端
+              {copy.delivered}
             </span>
           )}
           {receipt.kind === "submitted" && (
@@ -916,7 +1088,7 @@ export default function MessageComposer({ session }: MessageComposerProps) {
               data-testid="send-receipt-submitted"
               className="rounded-full bg-[var(--cb)]/70 px-2 py-0.5 text-xs text-[var(--mut)]"
             >
-              已投递至终端输入，agent 空闲后处理（未确认落盘）
+              {copy.submitted}
             </span>
           )}
           {receipt.kind === "failed" && (
@@ -975,44 +1147,53 @@ export default function MessageComposer({ session }: MessageComposerProps) {
                 >
                   {queueItemPreview(item.content)}
                 </span>
-                <button
-                  type="button"
-                  data-testid="queue-jump"
-                  disabled={busy || sending}
-                  onClick={() => {
-                    void handleJump(item);
-                  }}
-                  className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
-                >
-                  立即发送
-                </button>
-                <button
-                  type="button"
-                  data-testid="queue-edit"
-                  disabled={busy || sending}
-                  onClick={() => {
-                    void handleEdit(item);
-                  }}
-                  className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
-                >
-                  修改
-                </button>
-                <button
-                  type="button"
-                  data-testid="queue-retract"
-                  disabled={busy || sending}
-                  onClick={() => {
-                    void handleRetract(item);
-                  }}
-                  className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--mut)] disabled:opacity-40"
-                >
-                  撤回
-                </button>
+                {/* Task 8：TUI 队列 UI（立即发送/修改/撤回）对 headless_* 通道隐藏
+                    ——「忙时留队转闲 flush」是终端 TUI 语义，对无终端通道天然不生效
+                    （不假装可操作）；CLI 面逐字不变 */}
+                {!appFace && (
+                  <>
+                    <button
+                      type="button"
+                      data-testid="queue-jump"
+                      disabled={busy || sending}
+                      onClick={() => {
+                        void handleJump(item);
+                      }}
+                      className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
+                    >
+                      立即发送
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="queue-edit"
+                      disabled={busy || sending}
+                      onClick={() => {
+                        void handleEdit(item);
+                      }}
+                      className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
+                    >
+                      修改
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="queue-retract"
+                      disabled={busy || sending}
+                      onClick={() => {
+                        void handleRetract(item);
+                      }}
+                      className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--mut)] disabled:opacity-40"
+                    >
+                      撤回
+                    </button>
+                  </>
+                )}
               </li>
             ))}
           </ul>
           <p data-testid="queue-hint" className="mt-1 text-[11px] text-[var(--mut)]">
-            空闲时将按序自动发送
+            {/* APP 面 = 消费翻转信号未建的如实占位（Task 11 遗留登记，不谎报已消费） */}
+            {copy.queueHint}
+            {appFace && copy.queueNoRetract !== "" ? `——${copy.queueNoRetract}` : ""}
           </p>
         </div>
       )}
@@ -1169,12 +1350,12 @@ export default function MessageComposer({ session }: MessageComposerProps) {
             !injectable
               ? "该会话不支持远程注入"
               : cardPresence === "questionFreeText"
-                ? QUESTION_FREETEXT_PLACEHOLDER
+                ? copy.freetextPlaceholder
                 : cardPresence === "questionBlocked"
-                  ? "终端等待回答（本题请到卡片或终端作答）"
+                  ? copy.blockedPlaceholder
                   : cardPresence === "approve"
-                    ? "终端等待审批，请用卡片按钮"
-                    : "输入消息发送到终端…"
+                    ? copy.approvePlaceholder
+                    : copy.defaultPlaceholder
           }
           className="min-h-0 flex-1 resize-none rounded-lg border border-[var(--cb)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none disabled:opacity-50"
         />

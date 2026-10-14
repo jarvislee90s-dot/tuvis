@@ -478,7 +478,9 @@ fn run_create_leg(ev: &Ev, tool: &'static str) -> Result<LegSummary, String> {
         send_key: &send_key,
         send_text: &send_text,
     };
-    let composed = compose_injection(DEVICE_NAME, FIRST_MESSAGE);
+    // compose 单点（裁决 24b）返回 Result：E2E 固定设备名在白名单内，expect 即可
+    let composed = compose_injection(DEVICE_NAME, FIRST_MESSAGE)
+        .expect("E2E 设备名须在花名白名单内（见 turn::device_name_refusal）");
     ev.log(tool, &format!("composed={composed:?}"));
     let params = Params {
         tool: tool.to_string(),
@@ -915,6 +917,10 @@ async fn e2e_create_http_full_chain() {
     //    - host_source 必须给 enabledTools（session-create 工具门第二道），故非 m9r
     //      的 Null 桩；其余缝照 m9r 最小假体（本链不触归档/看板隐藏/未读/硬杀）。
     let state = Arc::new(RemoteState {
+        // L13 靶向证据缝：E2E 不构造同 cwd 多实例 → 空证据 = 无候选 = 放行
+        target_evidence: Box::new(|_, _| {
+            multi_agents_manager_lib::window::tty_map::TargetEvidence::default()
+        }),
         capability_table: multi_agents_manager_lib::inject::capability::new_table(),
         session_source: Box::new(multi_agents_manager_lib::adapter::get_all_sessions),
         pairing_counter: Box::new(c9_running_projects),

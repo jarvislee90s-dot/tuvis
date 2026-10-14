@@ -57,7 +57,7 @@ pub const BASE_BUDGET_MS: u64 = 10_000;
 /// 极端 emoji 负载预算可能偏紧——Task 12 实机校准项。
 pub const BACKPRESSURE_MS_PER_CHAR: u64 = 45;
 
-/// 无族回退规格（queue 驱动的 flush 对黑盒/无头家的兜底——族表未收录的工具）：
+/// 无族回退规格（queue 驱动的 flush 对本表未收录工具的兜底）：
 /// 快消费者默认口径（A 族形态 + 5s 确认超时）。脆弱常量集中落点（宪法横切 6）
 /// 故放本模块；windows_console 旧薄壳已改引本常量，单一来源勿复制。
 pub(crate) const FALLBACK_SPEC: FamilySpec = FamilySpec {
@@ -68,8 +68,13 @@ pub(crate) const FALLBACK_SPEC: FamilySpec = FamilySpec {
 };
 
 /// 工具 → 族规格（小写精确匹配，对齐 `AgentType` serde lowercase 形态）。
-/// M6R 探测定案表；其余工具（workbuddy/dsh/zcode/openclaw 等黑盒/无头家）
-/// 返回 None——路由层已拦，此处纵深防御。
+/// M6R 探测定案表；其余工具返回 None（flush 循环以 [`FALLBACK_SPEC`] 兜底）。
+/// **Task 7 起路由表已按实际分派定性——旧口径的「黑盒/无头家」不再对应同一批工具**：
+/// workbuddy → `Headless(WbAcp)`（H9）、zcode → `Headless(Zcode)`（H7/H10）、codex APP 形态
+/// → `Headless(CodexQueue)`（H8）、claude/kimi/opencode 无进程形态 → `Headless(ClaudeP|
+/// KimiP|OpencodeRun)`（H11/C4）、dsh 需要无头的场合 → `dsh_headless_pending`（H13 不在本批）、
+/// openclaw → `blackbox`（gateway 另评）——这些家在端点**入队之前**即被拒（H3 门/路由/
+/// 无头分派点），正常路径不消费本表。
 pub fn family_for(tool: &str) -> Option<FamilySpec> {
     let (family, verified_with, slow_consumer) = match tool {
         "claude" => (TuiFamily::RawVt, "2.1.251", false),

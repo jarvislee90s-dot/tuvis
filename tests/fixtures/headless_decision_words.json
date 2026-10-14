@@ -1,0 +1,5 @@
+{
+  "_comment": "H11（Task 13）无头审批/问答 wire 词的**跨语言唯一名单**：Rust `inject::headless::cli_three` 的 `Decision::wire` / `PendingKind::wire`（由 `decision_words_are_pinned_by_the_cross_language_fixture` 断言）与前端 `src/mobile/api.ts` 的 `HEADLESS_DECISION_WORDS` / `HEADLESS_PENDING_KINDS`（由 `tests/mobile/SessionDetail.test.tsx` 对照同一夹具断言）都必须与它逐项相等——任一侧新增/改名词而另一侧没跟上，必有一侧先红（做法同 headless_stages.json）。语义：allow = 批准（allow 必带 updatedInput 原样回显）；deny = 拒绝（含用户弃卡 dismiss——附录 E-②：弃卡必须 deny，不得静默丢题）；answer = 问答卡提交（只装已答全的答案集，键 = 题面全文、多选 = 数组）。kinds：approval = 工具审批卡；question = AskUserQuestion 问答卡。",
+  "decisions": ["allow", "deny", "answer"],
+  "kinds": ["approval", "question"]
+}

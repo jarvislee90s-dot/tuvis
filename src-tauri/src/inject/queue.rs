@@ -50,6 +50,42 @@
 //! 不触真实目录），单测另可拆分内核 [`try_flush`]（快照复核 + 注入 + A1 确认，
 //! 零 DB）+ [`settle`]（落账 + 审计，conn 显式注入内存库）直接驱动；两者的组合即
 //! `flush_one` 全部行为，组合本身仅 10 行取件/落账薄壳。
+//!
+//! ## H 系无头条目与 flush 循环（Task 7 裁决⑤；**Task 8 已收口**）
+//!
+//! ### Task 8 收口（**已实现，勿删**）
+//! [`try_flush_with`] 在投递前**重跑路由结论**（判据从
+//! `routing::headless_kind_of(&routing::route(...))` 派生——**不另立工具/形态表**，Task 5
+//! 的平行谓词教训）：命中即 [`FlushOutcome::Deferred`]——**不投递、不消费队首**（行保持
+//! pending，等总开关开启后端点真分派，或会话回归终端通道）。测试：
+//! `headless_bound_entry_is_not_delivered_by_terminal_injector`（claude pid=0 未读卡 +
+//! zcode 工具级无头两形态）。
+//!
+//! **为什么是「一律 Deferred」而不是「按开关分流」**：本循环只有**终端注入器**
+//! （`st.injector`）——无头回合由端点在无头通道里每回合 spawn 子进程（裁决 8，见
+//! `remote::api::zcode_headless_dispatch`）。循环里既没有无头执行器，也就没有任何
+//! 「开关开着就照投」的合法形态：照投 = 把正文打进一个不是终端宿主的 pid。
+//!
+//! ### 历史登记（Task 7 的缺口描述，保留作判据来源）
+//! 本循环（[`flush_one`] / [`reconcile_once`] / [`try_flush_with`]）**不判 H3 无头开关**，
+//! 投递一律走终端注入器（`st.injector`）。Task 7 在**入队侧**给出的保证是这一条：
+//!
+//! - **无头条目进不了队列**：唯一生产入队口 = `remote::api::session_send` 的
+//!   `enqueue_conn`（本模块的 `enqueue_conn` 调用面只有测试夹具），该端点在 Task 7 起对
+//!   「无头路由 + 无终端候选」的会话**在 INSERT 之前**即处理（Task 8/9/11/13 起七家无头
+//!   变体全部走真分派臂；过渡码 `headless_pending` 随 Task 13 收口删除）。
+//!
+//! **投递侧重判前的漂移形态（Task 8 已由上面那段收口）**：一条**入队当时**判终端通道的
+//! 条目（如 claude 有活 pid）若其会话进程随后退出、卡片转成未读卡（`pid = 0` + `form = App`，
+//! 见 `adapter::build_unread_cards`），此刻路由判的是 `Headless(ClaudeP)`——Task 8 前本循环
+//! 照旧用终端注入器投递，H3 开关管不到它。**影响有界**（不是「无危害」）：pid = 0 时
+//! Windows 侧 `resolve_target` 先 `AttachConsole(0)` 失败、`collect_ancestor_pids(0)` 亦为空
+//! → 直接失败（行如实落 `failed:<e>`，不会打错窗口）；只有「活着的**非终端** pid」才可能
+//! 走到祖先链回退那一格。该漂移类在 Task 8 的重判落地后不再可达。
+//!
+//! ### 后续义务（Task 9/11/13 读这里）
+//! 若将来确有「无头排队」需求（如 H8 的 APP 原生排队语义由 MAM 自建队列承接），**先落
+//! 上面那段重判再谈入队**（否则无头条目直接暴露在无门的投递路径上）。
 
 use crate::database::dao::inject_queue::{self, QueueRow};
 use crate::session::SessionStatus;
@@ -108,12 +144,61 @@ pub enum FlushOutcome {
     /// 「未投递」前缀，回执文案由端点统一拼接——单一措辞出口）。
     /// **不自动清空输入行**（claude 清空键未实测，spec §5 保守中止），请用户人工确认。
     NotDelivered(String),
+    /// **靶向歧义拒绝**（L13，C0-③）：同 agent + 同 cwd 多实例使卡片 pid 不可信
+    /// （解析器按 cwd 启发式配对，可交叉），且无独立 TTY 证据可消歧 → **零注入**（不猜，
+    /// 判据见 [`crate::window::tty_map`]）。行 mark_failed 退出 pending、审计
+    /// **action=fail result=ambiguous_target**（机器可读原因码，与通道故障 `failed:e`、
+    /// 撤回防护 `aborted:` 分列——这是**拒绝**，不是通道故障）；载荷 = 候选数，
+    /// 回执文案 = [`crate::window::tty_map::ambiguous_target_error`]（plan 定形）。
+    AmbiguousTarget(usize),
     /// 快照中无此会话（红·中断挂起，W2）：不消费不落账
     Suspended,
     /// 仍在运行且非插队：不消费不落账（等下个可输入态事件）。[`flush_one`] 无
     /// pending 时亦归本态（编排裁决：无可投递亦非失败，与黄态同形——端点按 queued
     /// 回执，不谎报 delivered 也不误报失败）
     Deferred,
+}
+
+/// 回执三态 → 投递终态（[`try_flush_with`] 的收口映射，抽出为纯核使「回执 → 落账」
+/// 整链在门禁内可断言）：Confirmed→Sent / Submitted→Submitted（已投递未确认）/
+/// Failed→Failed（原因原样上抛，即端点 failed 回执数据源）。
+pub(crate) fn outcome_of_receipt(receipt: super::confirm::DirectReceipt) -> FlushOutcome {
+    match receipt {
+        super::confirm::DirectReceipt::Confirmed => FlushOutcome::Sent,
+        super::confirm::DirectReceipt::Submitted => FlushOutcome::Submitted,
+        super::confirm::DirectReceipt::Failed(e) => FlushOutcome::Failed(e),
+    }
+}
+
+/// **插队回执合流**（纯核）：排空回执 × 投递前的「等回合停」结论 → 终态回执。
+///
+/// 只有**已确认投递**（`Confirmed`）才需要看回合停状态——那是在「键已被终端吃进去」
+/// 的前提下判时机；其余回执照传（`Submitted` = 确认面不可达 / 窗尽未停；`Failed` =
+/// 排空超时或注入/键序失败，防重文案原样透出）。
+///
+/// `Confirmed` 的四个子格（既有语义，R2 复评 + E1 裁16 的推理，勿动）：
+/// - `Stopped`（回合确认已停）| `NotApplicable`（本路径无需等：空闲态/非 claude 不发
+///   Esc）→ `Confirmed`：既有的插队确认通过 = Sent；
+/// - `StillRunning`（**等回合停超时**，可能只是慢）→ `Submitted`：消息已投递但可能
+///   落在旧回合的内部队列里——如实落「已投递未确认」（中性，不冒充 delivered、不冒充
+///   failed——后者会诱导重试 = 双发）；
+/// - `Unverifiable`（**判据不可用**，屏读读不到）→ `Confirmed` best-effort：既不能说
+///   停了也不能说没停，保持既有口径。**本格是「屏读通道临时失败」的兜底，不是平台
+///   能力缺口**——macOS/Linux 无确认面时回执**先一步**已是 `Submitted`（L14），
+///   合流不咨询回合停状态，故不存在「把它的插队回执永久打成未确认」的编造问题。
+pub(crate) fn resolve_jump_receipt(
+    receipt: super::confirm::DirectReceipt,
+    wait: crate::inject::confirm::TurnStopWait,
+) -> super::confirm::DirectReceipt {
+    use crate::inject::confirm::{DirectReceipt, TurnStopWait};
+    match receipt {
+        DirectReceipt::Confirmed => match wait {
+            TurnStopWait::Stopped | TurnStopWait::NotApplicable => DirectReceipt::Confirmed,
+            TurnStopWait::StillRunning => DirectReceipt::Submitted,
+            TurnStopWait::Unverifiable => DirectReceipt::Confirmed,
+        },
+        other => other,
+    }
 }
 
 /// 快照复核 + 注入 + A1 写入确认（flush 的判定与投递半边，**零 DB 接触**；落账
@@ -159,7 +244,7 @@ pub(crate) fn try_flush_with(
 ) -> FlushOutcome {
     // 会话 id 只在工具内唯一（watcher/dedup 同口径）：必须按 (tool, id) 复合匹配，
     // 跨工具撞 id 时裸 id 匹配会向错误会话的 pid 注入
-    let Some(session) = (st.session_source)()
+    let Some(mut session) = (st.session_source)()
         .sessions
         .into_iter()
         .find(|s| s.id == item.session_id && s.agent_type.tool_id() == item.agent_type)
@@ -168,6 +253,68 @@ pub(crate) fn try_flush_with(
     };
     if is_running(&session.status) && !jump {
         return FlushOutcome::Deferred;
+    }
+    // ===== H 系**投递侧重判**（Task 8 义务 2；缺口收口点）=====
+    //
+    // 入队**之后**才变成无头绑定的条目（如 claude 会话在队时还有活 pid，随后进程退出 →
+    // 未读卡 pid = 0 → 路由判 `Headless(ClaudeP)`；zcode 更是**工具级**无头）绝不能经
+    // 终端注入器投递：无头回合由端点在**无头通道**里每回合 spawn（裁决 8），本循环既不判
+    // H3 开关、也不跑无头执行器——照投即「把正文打进一个不是终端宿主的 pid」，且开关关着
+    // 也照投（Task 7 登记的唯一漏管面）。
+    //
+    // 判据**只从路由结论派生**（[`crate::inject::routing::headless_kind_of`]——不另立
+    // 工具/形态表；Task 5 的平行谓词教训），命中即 [`FlushOutcome::Deferred`]：
+    // **不投递、不消费队首**（行保持 pending，等总开关开启后端点真分派，或会话回归终端
+    // 通道）。位置在 is_running 之后、L13 靶向闸之前：黄态照旧先挂起，且本闸零副作用。
+    let headless_bound = crate::inject::routing::headless_kind_of(&crate::inject::routing::route(
+        session.agent_type.tool_id(),
+        session.form,
+        session.pid,
+        std::env::consts::OS,
+    ))
+    .is_some();
+    if headless_bound {
+        log::debug!(
+            "投递侧重判：会话 {} 已归无头通道（工具 {}，pid {}）——本轮不投递不消费队首",
+            item.session_id,
+            item.agent_type,
+            session.pid
+        );
+        return FlushOutcome::Deferred;
+    }
+    // ===== L13 靶向闸（C0-③）：同 cwd 多实例 = 卡片 pid 不可信 =====
+    //
+    // 位置两处讲究：
+    // - 在「仍在运行 → Deferred」**之后**：黄态条目保持排队（不因歧义提前消费），
+    //   真正要注入的那一刻才判定；
+    // - 在所有注入/按键**之前**：拒绝必须**零副作用**（不猜 = 不多打一个字）。
+    //
+    // 判定内核 = [`crate::window::tty_map::resolve_session_target`]——**所有注入路径共用同一
+    // 入口**（本漏斗 + approve/reject / question / mode menu / mode switch 端点的按键与
+    // 菜单路）。为什么缺口在写侧而不在终端层：终端层已是 TTY 精确匹配（给定正确 pid 必
+    // 落该窗口——`window/tty_map` 模块文档有完整根因链），乱窜源于**卡片 pid 是「进程名 +
+    // cwd」启发式配对的产物**（claude 同 cwd 桶内下标配对 / codex 同 cwd 首个未占用
+    // 文件），同 cwd 多实例时配对可交叉，写侧原样信任它。候选集由进程扫描直接给出
+    // （同工具 + 同 cwd 活动进程，不经解析器配对），故与卡片 pid 是否交叉无关：
+    // - 无候选 / 唯一候选 → 放行（无歧义可消，含 Windows「TTY 采不到」的正常单窗场景）；
+    // - ≥2 且无独立 TTY 证据 → 拒绝（[`FlushOutcome::AmbiguousTarget`]：报错 + 审计）；
+    // - ≥2 且 TTY 精确命中唯一候选 → 以**证据指明的 pid** 为注入目标（正向证据才改道）。
+    let evidence =
+        (st.target_evidence)(session.agent_type.tool_id(), session.project_path.as_str());
+    if let Err(crate::window::tty_map::AmbiguousTarget(n)) =
+        crate::window::tty_map::resolve_session_target(
+            &mut session,
+            &evidence,
+            std::env::consts::OS,
+        )
+    {
+        log::warn!(
+            "L13 靶向闸拒绝：同目录 {n} 个候选会话，无法确定投递目标（会话 {}，pid {}，cwd {}）",
+            item.session_id,
+            session.pid,
+            session.project_path
+        );
+        return FlushOutcome::AmbiguousTarget(n);
     }
     let spec = crate::inject::families::family_for(&item.agent_type)
         .unwrap_or(crate::inject::families::FALLBACK_SPEC);
@@ -325,10 +472,7 @@ pub(crate) fn try_flush_with(
             });
         match drafted {
             Err(e) => super::confirm::DirectReceipt::Failed(e),
-            Ok(()) => match super::confirm::await_jump_receipt(st, &session, &item.content) {
-                Ok(()) => super::confirm::DirectReceipt::Confirmed,
-                Err(e) => super::confirm::DirectReceipt::Failed(e),
-            },
+            Ok(()) => super::confirm::await_jump_receipt(st, &session, &item.content),
         }
     } else {
         match st
@@ -349,30 +493,14 @@ pub(crate) fn try_flush_with(
                 {
                     super::confirm::DirectReceipt::Submitted
                 } else if jump {
-                    match super::confirm::await_jump_receipt(st, &session, &item.content) {
-                        Ok(()) => match turn_stop {
-                            // 回合确认已停（或本路径无需等）→ 既有的插队确认通过 = Sent
-                            crate::inject::confirm::TurnStopWait::Stopped
-                            | crate::inject::confirm::TurnStopWait::NotApplicable => {
-                                super::confirm::DirectReceipt::Confirmed
-                            }
-                            // **等回合停超时**（可能只是慢）：消息已投递但可能落在旧回合
-                            // 的内部队列里 —— 如实落「已投递未确认」（中性，不冒充
-                            // delivered、不冒充 failed——后者会诱导重试=双发）
-                            crate::inject::confirm::TurnStopWait::StillRunning => {
-                                super::confirm::DirectReceipt::Submitted
-                            }
-                            // **判据不可用**（屏读读不到）：既不能说停了也不能说没停 →
-                            // 保持既有 best-effort 口径（投递成功 = Sent）。理由见
-                            // `TurnStopWait::Unverifiable` 与 `poll_turn_stopped` 文档
-                            // （macOS 无屏读，若一律降级会把它的插队回执永久打成「已投递
-                            // 未确认」——那是编造）。
-                            crate::inject::confirm::TurnStopWait::Unverifiable => {
-                                super::confirm::DirectReceipt::Confirmed
-                            }
-                        },
-                        Err(e) => super::confirm::DirectReceipt::Failed(e),
-                    }
+                    // 排空回执 × 等回合停结论的合流（纯核 resolve_jump_receipt）：
+                    // 确认面不可达平台（macOS/Linux）的回执**先一步**已是 Submitted
+                    // （L14），故不再咨询回合停状态——那是在「已确认投递」前提下判
+                    // 时机，无确认面时无从谈起
+                    resolve_jump_receipt(
+                        super::confirm::await_jump_receipt(st, &session, &item.content),
+                        turn_stop,
+                    )
                 } else {
                     // timeout 同源下发（spec）；确认结论为 D7/T3 三态分诊（非滞留 =
                     // Submitted 中性；滞留补回车后命中 = Confirmed；其余 = Failed），
@@ -388,11 +516,8 @@ pub(crate) fn try_flush_with(
             }
         }
     };
-    match receipt {
-        super::confirm::DirectReceipt::Confirmed => FlushOutcome::Sent,
-        super::confirm::DirectReceipt::Submitted => FlushOutcome::Submitted,
-        super::confirm::DirectReceipt::Failed(e) => FlushOutcome::Failed(e),
-    }
+    // 回执 → 终态（收口纯核：三态映射 + 落账链在门禁内可整体断言）
+    outcome_of_receipt(receipt)
 }
 
 /// 脚本化屏序列的类型别名（clippy::type_complexity 收敛，对齐 `ViaHostsSource` 先例）：
@@ -525,13 +650,12 @@ pub(crate) fn settle(
             Ok(())
         }
         FlushOutcome::Submitted => {
-            // D7/T3：注入 Ok + 戳未中 + 屏读无滞留草稿 = 消息已被 TUI 收进内部
-            // 队列（已投递未确认）。行必须消费退出 pending——消息已在 TUI 手里，
-            // flush 循环再投即双发（TUI 那份无法撤回），故 mark_sent；但不得冒充
-            // 确认成功（Sent 的 ok）也不得误报失败（failed:e 会诱导重试 = 双发），
-            // 审计 result=unconfirmed 单列，与「确认送达 ok」「确认失败 failed:e」
-            // 三分。Submitted 仅直发分诊产出（jump 以占用排空定论），action 沿
-            // 路径标注仅为防呆对称
+            // D7/T3 + L14：已投递未确认——两个来源（直发分诊「无滞留草稿」；
+            // 插队 × 确认面不可达平台）。行必须消费退出 pending——消息已在 TUI
+            // 手里，flush 循环再投即双发（TUI 那份无法撤回），故 mark_sent；但不得
+            // 冒充确认成功（Sent 的 ok）也不得误报失败（failed:e 会诱导重试 =
+            // 双发），审计 result=unconfirmed 单列，与「确认送达 ok」「确认失败
+            // failed:e」三分。action 沿路径标注（jump/flush）
             inject_queue::mark_sent_conn(conn, item.id, chrono::Utc::now().timestamp_millis());
             audit(conn, if jump { "jump" } else { "flush" }, "unconfirmed");
             Ok(())
@@ -553,6 +677,17 @@ pub(crate) fn settle(
                 &format!("aborted:{reason}"),
             );
             Err(format!("未投递：{reason}，请人工确认"))
+        }
+        FlushOutcome::AmbiguousTarget(n) => {
+            // L13 靶向歧义拒绝落账（C0-③）：**零注入**（不猜），行 mark_failed 退出
+            // pending（不静默重投——重试由用户显式发起：关掉多余窗口再发）。
+            // 审计 action=fail result=ambiguous_target（机器可读原因码；与通道故障
+            // failed:e 分列——拒绝不是通道故障）；Err 载荷 = plan 定形文案（端点
+            // failed 回执数据源，单一措辞出口）
+            let msg = crate::window::tty_map::ambiguous_target_error(n);
+            inject_queue::mark_failed_conn(conn, item.id, &msg);
+            audit(conn, "fail", "ambiguous_target");
+            Err(msg)
         }
     }
 }
@@ -717,6 +852,12 @@ pub(crate) fn reconcile_once(state: &std::sync::Arc<crate::remote::server::Remot
         match flush_one(state, &sid, false) {
             FlushOutcome::Sent => {}
             FlushOutcome::Failed(e) => log::warn!("对账补投失败（会话 {sid}）: {e}"),
+            // L13 靶向歧义拒绝：settle 已按 fail/ambiguous_target 落账——warn 留痕
+            //（对账路径同样受闸保护：不因是后台补投就放松「不猜」纪律）
+            FlushOutcome::AmbiguousTarget(n) => log::warn!(
+                "对账补投遇靶向歧义拒绝（会话 {sid}，{n} 个候选）：{}",
+                crate::window::tty_map::ambiguous_target_error(n)
+            ),
             // Submitted（D7/T3）：已投递未确认，settle 已按 unconfirmed 落账——
             // 非失败静默；Deferred/Suspended：不消费不落账——静默；
             // NotDelivered（E1① 撤回防护中止）：settle 已按 aborted 落账——静默
@@ -910,6 +1051,12 @@ pub fn spawn_flush_loop(state: std::sync::Arc<crate::remote::server::RemoteState
                                     Ok(FlushOutcome::Failed(e)) => {
                                         log::warn!("flush 投递失败（会话 {sid}）: {e}")
                                     }
+                                    // L13 靶向歧义拒绝：settle 已按 fail/ambiguous_target
+                                    // 落账——warn 留痕（行已 mark_failed，不重投）
+                                    Ok(FlushOutcome::AmbiguousTarget(n)) => log::warn!(
+                                        "flush 遇靶向歧义拒绝（会话 {sid}，{n} 个候选）：{}",
+                                        crate::window::tty_map::ambiguous_target_error(n)
+                                    ),
                                     Ok(FlushOutcome::Deferred | FlushOutcome::Suspended) => {}
                                     // E1① 撤回防护中止：settle 已按 aborted 落账——常规
                                     // 路径（jump=false）本不产出本态，穷尽性防御臂（warn
@@ -1107,6 +1254,7 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+            target_evidence: Box::new(|_, _| crate::window::tty_map::TargetEvidence::default()),
             session_source: Box::new(move || crate::session::SessionsResponse {
                 sessions: sessions.clone(),
                 total_count: sessions.len(),
@@ -1149,10 +1297,55 @@ mod tests {
         }
     }
 
+    /// **插队投递「成功面」的平台期望**（L14 收口，唯一出口）：Windows 有输入缓冲
+    /// 排空确认面 → 投递通过即 `Sent` / 审计 `result=ok`；**非 Windows（macOS/Linux，
+    /// CI backend job 跑在 ubuntu）无排空/屏读确认面 → 回执恒中性 `Submitted` /
+    /// 审计 `result=unconfirmed`**（确认面不可达不得冒充送达，L14 翻转）。
+    ///
+    /// 为什么收口成一处：下游十几个 `jump → Sent` 用例钉的是**注入行为与落账**
+    /// （Esc 先于正文、屏读帧数、行终态、键序），**不是平台矩阵**——平台矩阵由
+    /// confirm.rs 的 `jump_receipt_triage_table_pinned` 与 queue 的
+    /// `macos_jump_submitted_receipt_settles_as_unconfirmed` 全格钉死。此处只做平台
+    /// 分派：值随 cfg 变，各用例的判别力（序/帧数/落账三分）原样保持。
+    fn jump_ok_expected() -> (FlushOutcome, &'static str) {
+        if cfg!(windows) {
+            (FlushOutcome::Sent, "ok")
+        } else {
+            (FlushOutcome::Submitted, "unconfirmed")
+        }
+    }
+
     fn mem() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::database::schema::init(&conn);
         conn
+    }
+
+    /// L13 合成靶向证据：`pids` 个同 cwd 候选进程（cwd = 夹具 project_path `/tmp/proj`）
+    fn evidence_in_cwd(pids: &[u32]) -> crate::window::tty_map::TargetEvidence {
+        crate::window::tty_map::TargetEvidence {
+            processes: pids
+                .iter()
+                .map(|pid| crate::adapter::AgentProcess {
+                    pid: *pid,
+                    cpu_usage: 0.0,
+                    cwd: Some(std::path::PathBuf::from("/tmp/proj")),
+                    exe: None,
+                    form: crate::session::ProcessForm::Cli,
+                })
+                .collect(),
+            candidate_ttys: Vec::new(),
+            session_tty: None,
+        }
+    }
+
+    /// L13 测试用：覆盖 state 的靶向证据源（建造器返回值引用计数为 1 → `Arc::get_mut`）
+    fn with_target_evidence(
+        mut st: crate::remote::server::RemoteState,
+        evidence: crate::window::tty_map::TargetEvidence,
+    ) -> crate::remote::server::RemoteState {
+        st.target_evidence = Box::new(move |_, _| evidence.clone());
+        st
     }
 
     fn enq(conn: &rusqlite::Connection, sid: &str, content: &str) -> i64 {
@@ -1191,7 +1384,8 @@ mod tests {
     }
 
     /// 插队语义回归锁（裁决 12）：jump=true 越过 is_running 复核照发，
-    /// FakeInjector 收到 content，行被 mark_sent，审计 action=jump channel=fake
+    /// FakeInjector 收到 content，行被 mark_sent，审计 action=jump channel=fake。
+    /// 终态 = [`jump_ok_expected`]（平台分派：Windows Sent/ok，非 Windows L14 Submitted/unconfirmed）
     #[test]
     fn jump_delivers_even_when_running() {
         let c = mem();
@@ -1202,14 +1396,15 @@ mod tests {
             fake.clone(),
         );
         let item = inject_queue::next_pending_conn(&c, "s-run").unwrap();
+        let (want, want_result) = jump_ok_expected();
 
-        assert_eq!(try_flush(&st, &item, true), FlushOutcome::Sent);
+        assert_eq!(try_flush(&st, &item, true), want);
         assert_eq!(
             fake.recorded(),
             vec![(7, "插队消息".to_string())],
             "插队必须照发（运行中 TUI 把消息放进自身输入缓冲）"
         );
-        assert!(settle(&c, &st, &item, true, FlushOutcome::Sent).is_ok());
+        assert!(settle(&c, &st, &item, true, want.clone()).is_ok());
         let row = inject_queue::get_conn(&c, item.id).unwrap();
         assert!(row.sent_at.is_some(), "mark_sent 落库");
         assert_eq!(row.failed_reason, None);
@@ -1217,9 +1412,67 @@ mod tests {
         assert_eq!(audits.len(), 1, "成功恰一条审计");
         assert_eq!(audits[0].action, "jump", "插队审计 action=jump");
         assert_eq!(audits[0].channel, "fake", "channel 取注入器名");
-        assert_eq!(audits[0].result, "ok");
+        assert_eq!(audits[0].result, want_result);
         assert_eq!(audits[0].session_id, "s-run");
         assert!(inject_queue::next_pending_conn(&c, "s-run").is_none());
+    }
+
+    /// **Task 8 义务 2（投递侧重判）**：入队**之后**才变成无头绑定的条目绝不走终端注入器。
+    /// 场景：claude 会话在队时还有活 pid（入队当刻判终端通道），随后进程退出 → 卡片成
+    /// 「未读卡」（pid = 0）→ 路由结论变成 `Headless(ClaudeP)`；同理 zcode 是**工具级**
+    /// 无头（任何 pid 都判无头）。本循环不判 H3 开关、不跑无头执行器 ⇒ 命中即
+    /// [`FlushOutcome::Deferred`]：**不投递、不消费队首**（H3 开关关着也照投的缺口在此收口）。
+    /// 判据**从路由结论派生**（`routing::headless_kind_of`——不另立工具/形态表，Task 5 教训）。
+    #[test]
+    fn headless_bound_entry_is_not_delivered_by_terminal_injector() {
+        // ① claude：进程退出后的未读卡（pid = 0）——H11 无头面
+        let c = mem();
+        enq(&c, "s-headless", "给未读卡的消息");
+        let fake = FakeInjector::ok();
+        let st = state_with(
+            vec![sess("s-headless", SessionStatus::Waiting, 0)],
+            fake.clone(),
+        );
+        let item = inject_queue::next_pending_conn(&c, "s-headless").unwrap();
+        assert_eq!(
+            try_flush(&st, &item, false),
+            FlushOutcome::Deferred,
+            "无头绑定条目必须让位（Deferred），绝不落终端注入臂"
+        );
+        assert!(
+            fake.recorded().is_empty(),
+            "无头绑定条目不得经终端注入器投递（pid 不是终端宿主）"
+        );
+        assert!(settle(&c, &st, &item, false, FlushOutcome::Deferred).is_ok());
+        assert!(
+            inject_queue::next_pending_conn(&c, "s-headless").is_some(),
+            "不消费队首：行保持 pending，等开关开启/会话回归终端通道"
+        );
+        assert!(
+            write_audit::recent_conn(&c, 10).is_empty(),
+            "未消费不写审计（与黄态挂起同口径）"
+        );
+        // ② zcode：工具级无头（**不看形态与 pid**）——活 pid 也照判无头
+        let c2 = mem();
+        inject_queue::enqueue_conn(
+            &c2,
+            "s-zc",
+            "zcode",
+            "dev-1",
+            "测试设备",
+            "给 zcode 的消息",
+            1000,
+        );
+        let fake2 = FakeInjector::ok();
+        let mut zc = sess("s-zc", SessionStatus::Waiting, 55);
+        zc.agent_type = AgentType::ZCode;
+        let st2 = state_with(vec![zc], fake2.clone());
+        let item2 = inject_queue::next_pending_conn(&c2, "s-zc").unwrap();
+        assert_eq!(try_flush(&st2, &item2, true), FlushOutcome::Deferred);
+        assert!(
+            fake2.recorded().is_empty(),
+            "zcode 条目即使插队也不得走终端注入器（工具级无头）"
+        );
     }
 
     /// Waiting（红·等待）会话常规路径消费队首：投递 + mark_sent + 审计 action=flush
@@ -1320,6 +1573,121 @@ mod tests {
         );
     }
 
+    // ==== L13 靶向消歧闸（C0-③）：拒绝落账 + 闸接线（零注入、可改道） ====
+
+    /// 拒绝落账：mark_failed + 审计 action=fail result=ambiguous_target（机器可读原因码，
+    /// 与通道故障 failed:e 分列）+ settle 返回 plan 定形文案（端点失败回执数据源）；
+    /// **零注入副作用**（无 sent_at、行退出 pending——不静默重投）
+    #[test]
+    fn ambiguous_target_settle_audits_and_marks_failed() {
+        let c = mem();
+        enq(&c, "s-amb", "歧义消息");
+        let st = state_with(
+            vec![sess("s-amb", SessionStatus::Waiting, 7)],
+            FakeInjector::ok(),
+        );
+        let item = inject_queue::next_pending_conn(&c, "s-amb").unwrap();
+        let msg = crate::window::tty_map::ambiguous_target_error(3);
+
+        let err = settle(&c, &st, &item, false, FlushOutcome::AmbiguousTarget(3))
+            .expect_err("拒绝必须返回 Err（端点 failed 回执数据源）");
+        assert_eq!(err, msg, "回执文案 = plan 定形（同目录存在 N 个候选会话…）");
+        let row = inject_queue::get_conn(&c, item.id).unwrap();
+        assert_eq!(row.failed_reason.as_deref(), Some(msg.as_str()));
+        assert_eq!(row.sent_at, None, "拒绝 = 零注入：不得落 sent_at");
+        let audits = write_audit::recent_conn(&c, 10);
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "fail");
+        assert_eq!(
+            audits[0].result, "ambiguous_target",
+            "审计原因码单列（区别于通道故障 failed:e / 撤回防护 aborted:）"
+        );
+        assert!(
+            inject_queue::next_pending_conn(&c, "s-amb").is_none(),
+            "拒绝行退出 pending（不静默重投；重试由用户显式发起）"
+        );
+    }
+
+    /// **真靶向闸**（生产同一代码路径：真 `candidates_in_cwd` + 真 `decide_target`；
+    /// 只把**证据换成合成表**——单测无法构造「同工具同 cwd 多实例」的真进程集合）：
+    /// 多候选 + 无 TTY 证据 → **注入前**即拒绝，fake 注入器零文本零按键，行落 failed
+    /// + 审计 ambiguous_target（端到端 flush 路径，非仅纯核）。
+    #[test]
+    fn ambiguous_gate_refuses_before_any_injection() {
+        let fake = FakeInjector::ok();
+        // 卡片 pid 7 与合成兄弟 8 同 cwd（夹具 project_path = /tmp/proj）
+        let st = with_target_evidence(
+            state_with(
+                vec![sess("s-amb2", SessionStatus::Waiting, 7)],
+                fake.clone(),
+            ),
+            evidence_in_cwd(&[7, 8, 9]),
+        );
+        let item_id = st.store.with(|c| enq(c, "s-amb2", "不该注入的消息"));
+        let item = st
+            .store
+            .with(|c| inject_queue::next_pending_conn(c, "s-amb2").unwrap());
+
+        let outcome = try_flush(&st, &item, false);
+        assert_eq!(
+            outcome,
+            FlushOutcome::AmbiguousTarget(3),
+            "三候选 → 真闸拒绝（载荷 = 候选数）"
+        );
+        assert!(fake.recorded().is_empty(), "拒绝必须零注入（不猜）");
+        assert!(fake.ops().is_empty(), "零副作用：连按键都不得发");
+
+        let settled = st
+            .store
+            .with(|c| settle(c, &st, &item, false, outcome.clone()));
+        assert!(settled.is_err(), "落账返回 Err（回执数据源）");
+        let row = st
+            .store
+            .with(|c| inject_queue::get_conn(c, item_id).unwrap());
+        assert_eq!(row.sent_at, None, "零注入：不得落 sent_at");
+        assert_eq!(
+            row.failed_reason.as_deref(),
+            Some(crate::window::tty_map::ambiguous_target_error(3).as_str())
+        );
+        let audits = st.store.with(|c| write_audit::recent_conn(c, 10));
+        assert_eq!(audits[0].action, "fail");
+        assert_eq!(audits[0].result, "ambiguous_target");
+    }
+
+    /// 闸放行臂（真闸 + 唯一候选证据）：照常投递，注入目标 = 卡片 pid（不改道）
+    #[test]
+    fn single_candidate_evidence_allows_flush_unchanged() {
+        let fake = FakeInjector::ok();
+        let st = with_target_evidence(
+            state_with(vec![sess("s-one", SessionStatus::Waiting, 7)], fake.clone()),
+            evidence_in_cwd(&[7]),
+        );
+        st.store.with(|c| enq(c, "s-one", "单候选消息"));
+
+        assert_eq!(
+            flush_one(&st, "s-one", false),
+            FlushOutcome::Sent,
+            "唯一候选 → 放行（TTY 有无不影响）"
+        );
+        assert_eq!(fake.recorded(), vec![(7u32, "单候选消息".to_string())]);
+    }
+
+    /// 回归锁：**真闸 + 生产证据源**（真进程扫描）在「同 cwd 无多候选」时不得误拒——
+    /// 单候选/无候选照常投递（否则全平台注入瘫痪；本用例的假会话 cwd 无同工具进程）
+    #[test]
+    fn production_gate_allows_unambiguous_flush() {
+        let fake = FakeInjector::ok();
+        let st = state_with(vec![sess("s-ok", SessionStatus::Waiting, 7)], fake.clone());
+        st.store.with(|c| enq(c, "s-ok", "正常消息"));
+
+        assert_eq!(
+            flush_one(&st, "s-ok", false),
+            FlushOutcome::Sent,
+            "无同 cwd 多候选 → 真闸放行（候选 0/1 不拒绝）"
+        );
+        assert_eq!(fake.recorded(), vec![(7u32, "正常消息".to_string())]);
+    }
+
     /// 审计摘要走 W5 截断口径（只存摘要防审计库膨胀）
     #[test]
     fn audit_summary_is_truncated() {
@@ -1405,9 +1773,12 @@ mod tests {
         }
     }
 
-    /// 插队 best-effort：假 pid 下排空查询基础设施失败（wait_input_drained Err）→
-    /// 以「写入成功」为准返回 Ok（诊断通道不可用不得误报投递超时）；macOS 无
-    /// drain 可等 → 直接 Ok（同断言跨平台恒真）
+    /// 插队 best-effort：**Windows** 假 pid 下排空查询基础设施失败（wait_input_drained
+    /// Err）→ 以「写入成功」为准 `Confirmed`（诊断通道不可用不得误报投递超时）；
+    /// **非 Windows**（macOS/Linux，CI backend job 跑在 ubuntu）无 drain 可等 →
+    /// **确认面不可达 → 中性 `Submitted`**（L14 翻转：旧口径此处无条件 `Ok` = Confirmed，
+    /// 端点回 delivered = macOS 假成功根因）。两平台共守的不变式：能力/诊断缺口
+    /// **都不得**误报投递超时（防重文案只属于真超时）。
     #[test]
     fn jump_receipt_best_effort_when_drain_unavailable() {
         let st = state_with(
@@ -1415,11 +1786,150 @@ mod tests {
             FakeInjector::ok(),
         );
         let s = sess("s-cj", SessionStatus::Processing, 22);
+        let r = super::super::confirm::await_jump_receipt(&st, &s, "插队确认消息");
+        assert!(
+            !matches!(r, super::super::confirm::DirectReceipt::Failed(_)),
+            "能力/诊断缺口不得误报投递超时（防重警示只属于真超时）：{r:?}"
+        );
+        #[cfg(windows)]
         assert_eq!(
-            super::super::confirm::await_jump_receipt(&st, &s, "插队确认消息"),
-            Ok(()),
+            r,
+            super::super::confirm::DirectReceipt::Confirmed,
             "排空查询基础设施失败走 best-effort（以写入成功为准）"
         );
+        #[cfg(not(windows))]
+        assert_eq!(
+            r,
+            super::super::confirm::DirectReceipt::Submitted,
+            "非 Windows 确认面不可达 → 中性已投递未确认（L14：不得冒充送达）"
+        );
+    }
+
+    /// **L14 用户可见诚实保证（插队整链锁）**：确认面不可达平台（macOS/Linux）的插队
+    /// 回执 `Submitted` → [`outcome_of_receipt`] → [`FlushOutcome::Submitted`] →
+    /// [`settle`] 落账：行 **mark_sent**（消费退出 pending——消息已在 TUI 手里，flush
+    /// 循环重投即双发）、审计 **action=jump result=unconfirmed**（与「确认送达 ok」
+    /// 「确认失败 failed:e」三分）、**不落** failed_reason（不诱导重试）。链上三段都是
+    /// 生产同一函数（纯核 → 收口映射 → 落账内核），非测试内复制。
+    ///
+    /// 「不谎报 delivered」的判定面在 `confirm::tests::jump_receipt_triage_table_pinned`
+    /// （全格）；本测钉的是**回执一旦落到 Submitted，用户看到的是什么**。
+    #[test]
+    fn macos_jump_submitted_receipt_settles_as_unconfirmed() {
+        use super::super::confirm::{DirectReceipt, JumpDrainProbe};
+        // ① 判定：macOS（无排空/屏读确认面）→ 中性 Submitted，绝不 Confirmed
+        let receipt =
+            super::super::confirm::triage_jump_receipt(JumpDrainProbe::NoConfirmFace, "macos");
+        assert_eq!(
+            receipt,
+            DirectReceipt::Submitted,
+            "L14：确认面不可达 → 已投递未确认"
+        );
+        assert_ne!(
+            receipt,
+            DirectReceipt::Confirmed,
+            "不得冒充确认送达（旧口径 macOS 假成功正落此格）"
+        );
+        // ② 收口映射：Submitted 回执不得映射成 Sent / Failed
+        let outcome = outcome_of_receipt(receipt);
+        assert_eq!(
+            outcome,
+            FlushOutcome::Submitted,
+            "回执 → 终态的收口映射（生产同一函数）"
+        );
+        // ③ 落账：jump + Submitted → mark_sent + 审计 unconfirmed
+        let st = state_with(
+            vec![sess("s-mac", SessionStatus::Processing, 51)],
+            FakeInjector::ok(),
+        );
+        let item_id = st.store.with(|c| enq(c, "s-mac", "macOS 插队消息"));
+        let item = st
+            .store
+            .with(|c| inject_queue::get_conn(c, item_id))
+            .expect("入队行必须可取");
+        assert!(
+            st.store
+                .with(|c| settle(c, &st, &item, true, outcome))
+                .is_ok(),
+            "Submitted 非失败：settle 返回 Ok（端点按 200 submitted 回执）"
+        );
+        let row = st
+            .store
+            .with(|c| inject_queue::get_conn(c, item_id))
+            .expect("行保留作审计痕迹");
+        assert!(
+            row.sent_at.is_some(),
+            "行必须 mark_sent 消费退出 pending（否则 flush 循环重投 = 双发）"
+        );
+        assert_eq!(
+            row.failed_reason, None,
+            "Submitted 非失败：不得落 failed_reason（不诱导重试）"
+        );
+        assert!(
+            st.store
+                .with(|c| inject_queue::next_pending_conn(c, "s-mac"))
+                .is_none(),
+            "不得留在 pending（消费退出）"
+        );
+        let audits = st.store.with(|c| write_audit::recent_conn(c, 10));
+        assert_eq!(audits.len(), 1, "恰一条审计");
+        assert_eq!(audits[0].action, "jump", "插队路径审计 action=jump");
+        assert_eq!(
+            audits[0].result, "unconfirmed",
+            "审计 result=unconfirmed（与 ok / failed:e 三分）"
+        );
+        assert_ne!(audits[0].result, "ok", "不得冒充确认送达");
+        assert!(
+            !audits[0].result.starts_with("failed:"),
+            "不得误报失败（会诱导重试 = 双发）"
+        );
+    }
+
+    /// **插队回执合流表（全格钉，平台无关）**：排空回执 × 等回合停结论
+    /// （[`resolve_jump_receipt`]）——`Confirmed` 的四子格保持既有语义；
+    /// **`Submitted`（确认面不可达）与 `Failed`（排空超时/注入失败）不被回合停状态
+    /// 改写**（L14：无可确认的投递，时机判定无从谈起；超时不得被软化成中性）。
+    ///
+    /// 还原动作（变异）：把 `other => other` 改成对 `Submitted` 也咨询回合停（例如
+    /// `StillRunning => Confirmed`）→ 本测试先红（确认面不可达的回执会被时机状态改写）；
+    /// 把 `Unverifiable => Confirmed` 改成 `=> Submitted` → 亦先红。
+    #[test]
+    fn resolve_jump_receipt_table_pinned() {
+        use super::super::confirm::{DirectReceipt, TurnStopWait};
+        let waits = [
+            TurnStopWait::Stopped,
+            TurnStopWait::NotApplicable,
+            TurnStopWait::StillRunning,
+            TurnStopWait::Unverifiable,
+        ];
+        // Confirmed（= 投递已确认）才咨询回合停：Stopped/NotApplicable/Unverifiable → Sent；
+        // StillRunning（窗尽未停）→ 中性 Submitted（不冒充送达 = 2026-09-22 实机 bug 形态）
+        let confirmed_cases = [
+            (TurnStopWait::Stopped, DirectReceipt::Confirmed),
+            (TurnStopWait::NotApplicable, DirectReceipt::Confirmed),
+            (TurnStopWait::StillRunning, DirectReceipt::Submitted),
+            (TurnStopWait::Unverifiable, DirectReceipt::Confirmed),
+        ];
+        for (wait, want) in confirmed_cases {
+            assert_eq!(
+                resolve_jump_receipt(DirectReceipt::Confirmed, wait),
+                want,
+                "Confirmed × {wait:?}"
+            );
+        }
+        // Submitted / Failed 与回合停状态无关（四个等待态逐格钉）
+        for wait in waits {
+            assert_eq!(
+                resolve_jump_receipt(DirectReceipt::Submitted, wait),
+                DirectReceipt::Submitted,
+                "确认面不可达的回执不得被回合停状态改写（{wait:?}）"
+            );
+            assert_eq!(
+                resolve_jump_receipt(DirectReceipt::Failed("排空超时（假体）".to_string()), wait),
+                DirectReceipt::Failed("排空超时（假体）".to_string()),
+                "失败载荷必须原样透出（{wait:?}）"
+            );
+        }
     }
 
     /// 契约/测试面 API 回归（session_stamp_hit 唯一消费者=测试模块——生产确认经
@@ -1591,8 +2101,10 @@ mod tests {
         assert_eq!(audits[0].result, "failed:定位终端失败：pid 不存在");
     }
 
-    /// 插队端到端不消费 confirm_probe（best-effort 恒 Sent）：probe 恒 false 也不得
-    /// 把插队投递打成失败（busy 态无文件戳可查——裁决 A1 插队语义，flush_one 全链路）
+    /// 插队端到端不消费 confirm_probe（best-effort：probe 恒 false 也不得把插队投递
+    /// 打成失败——busy 态无文件戳可查，裁决 A1 插队语义，flush_one 全链路）。
+    /// 终态 = [`jump_ok_expected`]（L14：非 Windows 确认面不可达 → Submitted/unconfirmed，
+    /// 但仍**非失败**——本测的判别力在「probe 不改写结论」而非具体档位）
     #[test]
     fn jump_delivery_ignores_confirm_probe() {
         let fake = FakeInjector::ok();
@@ -1602,11 +2114,12 @@ mod tests {
             std::sync::Arc::new(|_, _, _| false),
         );
         let item_id = st.store.with(|c| enq(c, "s-jp", "插队端到端消息"));
+        let (want, want_result) = jump_ok_expected();
 
         assert_eq!(
             flush_one(&st, "s-jp", true),
-            FlushOutcome::Sent,
-            "插队确认 best-effort：probe 恒 false 不得改写投递结论"
+            want,
+            "插队确认 best-effort：probe 恒 false 不得把结论改写成 Failed"
         );
         let sent_at = st
             .store
@@ -1615,7 +2128,12 @@ mod tests {
         let audits = st.store.with(|c| write_audit::recent_conn(c, 10));
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].action, "jump");
-        assert_eq!(audits[0].result, "ok");
+        assert_eq!(audits[0].result, want_result);
+        assert!(
+            !audits[0].result.starts_with("failed:"),
+            "非失败档位（不诱导重试 = 双发）：{}",
+            audits[0].result
+        );
     }
 
     /// 收尾批 P2（jump 守卫内 still_pending 复查抽函数）：flush_given_if_pending
@@ -1638,7 +2156,7 @@ mod tests {
         let _guard = try_acquire_inflight("s-jg").expect("空闲会话必须取到守卫");
         assert_eq!(
             flush_given_if_pending(&st, &item, true),
-            FlushOutcome::Sent,
+            jump_ok_expected().0,
             "仍 pending 必须照发（jump 插队语义）"
         );
         drop(_guard);
@@ -1840,7 +2358,7 @@ mod tests {
         );
         st.store.with(|c| enq(c, "s-int", "插队消息"));
         // jump=true 越过 is_running 复核（既有语义）
-        assert_eq!(flush_one(&st, "s-int", true), FlushOutcome::Sent);
+        assert_eq!(flush_one(&st, "s-int", true), jump_ok_expected().0);
         let ops = inj.ops();
         assert_eq!(ops.len(), 2, "应有两次操作：Esc 键 + 正文注入");
         assert_eq!(ops[0], "key:esc", "**Esc 必须先于正文**（先中断再投递）");
@@ -1854,7 +2372,7 @@ mod tests {
         let inj = FakeInjector::ok();
         let st = state_with(vec![sess("s-idle", SessionStatus::Idle, 4243)], inj.clone());
         st.store.with(|c| enq(c, "s-idle", "普通消息"));
-        assert_eq!(flush_one(&st, "s-idle", true), FlushOutcome::Sent);
+        assert_eq!(flush_one(&st, "s-idle", true), jump_ok_expected().0);
         let ops = inj.ops();
         assert_eq!(ops.len(), 1, "空闲态不应有 Esc: {ops:?}");
         assert!(ops[0].starts_with("text:"));
@@ -1878,7 +2396,7 @@ mod tests {
         st.store.with(|c| {
             inject_queue::enqueue_conn(c, "s-cx", "codex", "dev-1", "测试设备", "codex 插队", 1000)
         });
-        assert_eq!(flush_one(&st, "s-cx", true), FlushOutcome::Sent);
+        assert_eq!(flush_one(&st, "s-cx", true), jump_ok_expected().0);
         assert_eq!(
             inj.ops(),
             vec![
@@ -1905,7 +2423,7 @@ mod tests {
                 1000,
             )
         });
-        assert_eq!(flush_one(&st2, "s-oc", true), FlushOutcome::Sent);
+        assert_eq!(flush_one(&st2, "s-oc", true), jump_ok_expected().0);
         assert_eq!(
             inj2.ops(),
             vec!["key:esc".to_string(), "text:opencode 插队".to_string(),],
@@ -1962,7 +2480,11 @@ mod tests {
         );
         st.store.with(|c| enq(c, "s-esc", "仍要投递的消息"));
         let outcome = flush_one(&st, "s-esc", true);
-        assert_eq!(outcome, FlushOutcome::Sent, "Esc 失败不阻断正文投递");
+        assert_eq!(
+            outcome,
+            jump_ok_expected().0,
+            "Esc 失败不阻断正文投递（终态随平台，见 jump_ok_expected）"
+        );
         let ops = inj.ops();
         assert_eq!(ops.len(), 2, "{ops:?}");
         assert_eq!(ops[0], "key:esc", "Esc 尝试在前（失败）");
@@ -2000,7 +2522,8 @@ mod tests {
 
     /// **主回归锁（本 bug 的形态）**：运行中 claude 插队——真机忙屏 → 真机空闲屏 ×2 →
     /// 断言 **① 等到了稳定判据才投递正文**（屏读确实发生在正文注入之前，且稳定成立即停）、
-    /// **② 回执 = Sent**（回合确认已停）。
+    /// **② 回执 = Sent**（回合确认已停）。非 Windows（L14 无确认面）→ Submitted，
+    /// 见 [`jump_ok_expected`]——本测的判别力在帧数与注入序。
     ///
     /// 夹具三帧都是**真机原文**（忙态含 `·esc to interrupt ·`；空闲态是 `· ← for agents`）。
     /// 两帧空闲是**稳定闸**（`confirm::TURN_STOP_STABLE_FRAMES`）要的「连续一致」。
@@ -2025,8 +2548,8 @@ mod tests {
         let outcome = flush_one_scripted(&st, "s-turn1", true, mode);
         assert_eq!(
             outcome,
-            FlushOutcome::Sent,
-            "屏读到**稳定**的「回合已停」+ 投递成功 → Sent（这是修好后的形态）"
+            jump_ok_expected().0,
+            "屏读到**稳定**的「回合已停」+ 投递成功 → Sent（这是修好后的形态；非 Windows 见 jump_ok_expected）"
         );
         // 命中即停：三帧用完（只读 3 拍，不是读满 30 拍）
         assert_eq!(
@@ -2075,7 +2598,11 @@ mod tests {
             frame(real_frames::IDLE),
         ]);
         let outcome = flush_one_scripted(&st, "s-turn6", true, mode);
-        assert_eq!(outcome, FlushOutcome::Sent, "稳定判据最终成立 → Sent");
+        assert_eq!(
+            outcome,
+            jump_ok_expected().0,
+            "稳定判据最终成立 → Sent（非 Windows 见 jump_ok_expected）"
+        );
         assert_eq!(
             queue.lock().unwrap().len(),
             0,
@@ -2191,7 +2718,11 @@ mod tests {
             Some(interrupted),
         ]);
         let outcome = flush_one_scripted(&st, "s-cln", true, mode);
-        assert_eq!(outcome, FlushOutcome::Sent, "无残留 → 照常投递");
+        assert_eq!(
+            outcome,
+            jump_ok_expected().0,
+            "无残留 → 照常投递（终态随平台，见 jump_ok_expected）"
+        );
         assert_eq!(queue.lock().unwrap().len(), 0);
         let ops = inj.ops();
         assert_eq!(ops[0], "key:esc", "{ops:?}");
@@ -2275,13 +2806,20 @@ mod tests {
         );
     }
 
-    /// **判据不可用（屏读恒 None）→ 保持既有 best-effort 口径（Sent）**：与
-    /// `StillRunning` 分列的理由见 `TurnStopWait::Unverifiable`（macOS 无屏读，若因此
-    /// 降级会把它的插队回执永久打成「已投递未确认」——那是编造）。
+    /// **判据不可用（屏读恒 None）不得误报失败、也不得中止投递**：与 `StillRunning`
+    /// 分列的理由见 `TurnStopWait::Unverifiable`。
     ///
-    /// 还原动作（变异C）：把 `Unverifiable => Confirmed` 改成 `=> Submitted` →
-    /// 本测试先红；改成 `=> Failed(_)` 同样先红（能力缺失不得误报失败——与
-    /// `jump_receipt_best_effort_when_drain_unavailable` 的既有裁决同源）。
+    /// **L14 更正（本测的适用范围收窄）**：本态旧注以「macOS 无屏读」为由要求回执保持
+    /// Sent——L14 裁决恰好相反（无确认面 = 事实上的未确认，如实报 Submitted）。故本测
+    /// 钉的是**屏读通道临时失败**（Windows attach 失败形态）下的两条不变式：**正文照投**
+    /// （用户消息不丢）+ **不得误报 `Failed`**（能力缺失 ≠ 通道故障，防重文案只属真超时）；
+    /// 终态档位随平台（见 [`jump_ok_expected`]）。「Unverifiable ⇒ 合流回 Confirmed」这条
+    /// 映射本身由 `resolve_jump_receipt_table_pinned` 平台无关地钉死（本测在非 Windows 上
+    /// 够不到该格——确认面守门先一步给出 Submitted）。
+    ///
+    /// 还原动作（变异C）：把 `Unverifiable => Confirmed` 改成 `=> Failed(_)` →
+    /// 本测试先红（能力缺失不得误报失败）；`=> Submitted` 的红由
+    /// `resolve_jump_receipt_table_pinned` 平台无关地捕获。
     #[test]
     fn interrupt_jump_keeps_best_effort_when_screen_unavailable() {
         let inj = FakeInjector::ok();
@@ -2292,10 +2830,14 @@ mod tests {
         st.store.with(|c| enq(c, "s-turn3", "无屏读时的插队消息"));
         let (mode, queue) = scripted(vec![None]);
         let outcome = flush_one_scripted(&st, "s-turn3", true, mode);
+        assert!(
+            !matches!(outcome, FlushOutcome::Failed(_)),
+            "屏读不可用 ≠ 投递失败（不得误报投递超时）：{outcome:?}"
+        );
         assert_eq!(
             outcome,
-            FlushOutcome::Sent,
-            "屏读不可用 ≠ 回合没停：保持既有 best-effort 口径（投递成功 = Sent）"
+            jump_ok_expected().0,
+            "屏读通道临时失败保持既有 best-effort 档位（Windows = Sent；非 Windows 确认面守门先判 Submitted）"
         );
         assert_eq!(
             queue.lock().unwrap().len(),
@@ -2324,7 +2866,8 @@ mod tests {
         let (mode, queue) = scripted(vec![frame(real_frames::BUSY), frame(real_frames::BUSY)]);
         assert_eq!(
             flush_one_scripted(&st, "s-turn4", true, mode),
-            FlushOutcome::Sent
+            jump_ok_expected().0,
+            "空闲态 claude 插队终态随平台（Windows Sent；非 Windows 确认面守门 Submitted）"
         );
         assert_eq!(
             queue.lock().unwrap().len(),

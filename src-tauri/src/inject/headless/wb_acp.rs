@@ -1,0 +1,4555 @@
+//! H9 WorkBuddy ACP 通道（Task 11）：**HTTP 型**无头通道——**不 spawn 进程**，走 WorkBuddy
+//! 宿主运行时的 ACP over HTTP（探测定案：Mac 主证，`research/refs/phase2-消息注入/
+//! 2026-10-04-app-injection-probe-report-mac.md` 末轮；Windows 5.7.3 端点启用条件 = 风险 16）。
+//!
+//! # 协议链（Mac 实测 wire 为准）
+//! `POST <endpoint>/api/v1/acp/connect`（**免鉴权**）→ `{connectionId, sessionToken}` →
+//! 逐请求 `POST <endpoint>/api/v1/acp`（头 `acp-connection-id` / `acp-session-token` /
+//! `Accept: application/json, text/event-stream`——**Accept 缺一即 `-32000 Not Acceptable`**，
+//! 见探测定案逐字）→ `initialize`（能力协商）→ **投递臂按端点发现形态分派**（Task 4b /
+//! 设计 §5.2：心跳〔macOS/旧版〕= `session/load` + `session/prompt` 双臂；端口指纹
+//! 〔Windows〕= `session/new` + `session/prompt` **单臂**——`session/load` 在 Windows 恒
+//! `writer_occupied` 结构性不可用，`session/new` 绑定 APP 当前活跃会话〔无视 cwd〕）→
+//! SSE 事件归一（`agentPhase` / `session_update`）→ 回执（Windows 臂：**成功回执**恒带
+//! 靶向标注、不一致明示在成功/已推进未确认/需复活三态可达，[`delivered_session_note`]
+//! ——**没有 sessionId 的成功回执不允许出现**）。
+//!
+//! # 诚实边界（**落码于此，勿在别处另说一套**）
+//! - **已结束会话静默挂**（探测定案风险 15）：`session/prompt` 只对**新建/活跃**会话生效；
+//!   对 `session/load` 载入的**已结束**会话（末回合 `stopReason=end_turn`）会「200 + 心跳但
+//!   回合不推进」。故 [`PHASE_DEADLINE_MS`] 内**未见到 `agentPhase`** 即判「已结束需复活」
+//!   （[`PromptVerdict::RevivalNeeded`]）——**绝不静默挂、绝不冒充成功**。注意：`session/load`
+//!   回放里出现 `session_end(end_turn)` **不是**「该会话不可投递」的判据（任何跑完过一回合的
+//!   会话回放都有它），它只作**诊断证据**写进复活回执的原因里（见 [`LoadOutcome`]）。
+//! - **投递靶向（Windows new 臂，Task 4b / 设计 §5.2）**：Windows 的 `session/new` 绑定的是
+//!   **WB APP 当前打开的会话**，不是 MAM 卡面所选会话（探测定案 §3.3；WB-PROBE-OK 误投用户
+//!   会话的先例转强制项）⇒ 回执 session 字段 = **实际投递会话号**；**成功回执**的 reason
+//!   恒带「已投递至 WorkBuddy 当前会话（sessionId=…）」，不一致明示语在成功 / 已推进未
+//!   确认 / 需复活三态都可达（Failed 态由 session 字段承载投递会话号，
+//!   [`delivered_session_note`]）；
+//!   审计 result 词双记投递会话（[`audit_word_with_targeting`]，调用点在 api.rs
+//!   `run_wb_turn`）。**红线：没有 sessionId 的成功回执不允许出现。**
+//! - **端点发现平台差异**：macOS/旧版 = 心跳 `~/.workbuddy/sessions/<pid>.json` 的 `endpoint`
+//!   字段（每会话异端口、**按需轮询**——心跳按需生成，查空 ≠ 形态不存在）；Windows 5.7.3 =
+//!   无交互心跳且无 per-session serve ⇒ **心跳缺席时直接如实拒绝**（[`ENDPOINT_UNAVAILABLE_REASON`]，
+//!   不盲扫），启用了远程控制才走**端口指纹**路（`Get-NetTCPConnection` 按 WB pid 过滤 →
+//!   `/` 标题指纹 + connect 活体〔探测后连接即弃〕**双确认**；`/health` UP 降为兼容分支
+//!   ——Windows 内嵌版的 `/health` 被 AUTH_REQUIRED 挡，曾致双确认恒败误杀端点，M26 根修）。
+//! - ACP 会话**不进 `workbuddy.db`**，只落 `~/.workbuddy/projects/<munged-cwd>/` 转写 ⇒
+//!   读链路补扫归 `monitor::workbuddy_parser`（Task 11 同批）；本模块只做**落盘佐证**
+//!   （[`corroborate`]，二次确认，不作唯一证据）。
+//! - Permission Mode 是协议级四档（default/acceptEdits/plan/auto）**只读**——本模块只把它
+//!   归一到 [`PromptOutcome::permission_mode`]，**没有展示面也没有切换面**（切换留三期 F3.1；
+//!   展示随审批卡归 C4/Task 13）。
+//! - 取消：本通道**不武装取消靶子**（槽位用 [`super::turn::TurnSlot::placeholder`]）——ACP 的
+//!   `session/cancel` 通知**本批未接线**，故取消端点如实报「未送达（回合仍在运行）」
+//!   （不谎报已取消）；理由另见编排函数文档。**原括号里的旧理由已作废**（R11 删除）：取消
+//!   审计行的 channel 列自 Task 11 复审起取自**槽位声明**（[`super::turn::TurnSlot::with_channel`]），
+//!   「武装靶子会把 channel 列写成 `headless_zcode`」不再是事实——WB 臂声明的是
+//!   [`crate::inject::routing::HeadlessKind::WbAcp`] 的 wire 名。
+//! - API 为**逆向 bundle 所得（非公开文档）** ⇒ 版本门控覆盖 WB 升级漂移；本批的诚实形态是
+//!   「端点不可用/协议不符即如实回执」，**绝不修改 WorkBuddy 安装本体**。
+//!
+//! # 测试纪律（宪法级）
+//! 生产 HTTP 出口只有一处（[`production_http_seam`]，**`cfg(not(test))`**），测试构建里它
+//! 根本不存在：端点用例的探针与 HTTP 缝都来自 [`test_hooks`]（默认：无心跳、无 WB 进程、
+//! 任何 HTTP 请求一律**传输失败**）⇒ **单测零网络、零真实 `~/.workbuddy` 写入**（转写佐证
+//! 走 tempdir 夹具）。wire 纯核全部经 [`MockHttp`] 注入缝驱动。
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use super::receipt::{Receipt, Stage};
+// `ReceiptStatus` 只在测试面直取（生产路径只经 `Receipt::ok/failed/queued` 构造）
+#[cfg(test)]
+use super::receipt::ReceiptStatus;
+use super::runner::GlobalSem;
+use crate::inject::normalize;
+use crate::monitor::workbuddy_parser::HeartbeatSnapshot;
+
+// ============================================================
+// HTTP 注入缝（**本任务内定义**；非外部依赖）
+// ============================================================
+
+/// ACP 建连端点（免鉴权）
+pub const CONNECT_PATH: &str = "/api/v1/acp/connect";
+/// ACP JSON-RPC 端点（逐请求一次 POST；响应/通知经 SSE 承载）
+pub const ACP_PATH: &str = "/api/v1/acp";
+/// `Accept` 头**逐字**（探测定案：缺 → `-32000 Not Acceptable: Client must accept both…`）
+pub const ACCEPT_BOTH: &str = "application/json, text/event-stream";
+/// ACP 协议版本（initialize 协商值；Mac 实测 1）
+pub const ACP_PROTOCOL_VERSION: u32 = 1;
+/// ACP 客户端身份（initialize 的 clientInfo.name；版本取本 crate 版本）
+pub const CLIENT_NAME: &str = "mam-remote";
+
+/// 流读取策略（**纯描述**：seam 只按帧边界与时钟执行，不解释 ACP 语义）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamPolicy {
+    /// 绝对上限（毫秒；生产 = H4 watchdog）
+    pub max_ms: u64,
+    /// `data` 帧静默上限（毫秒；**注释帧 `: heartbeat` 不算数据帧**——探测定案里
+    /// 「已结束会话」的流正是「200 + 心跳但回合不推进」）
+    pub idle_ms: u64,
+    /// 整条流里**从未**出现该子串时，静默达 [`Self::idle_ms`] 即提前停（置
+    /// [`StreamStop::Idle`]）；已见该子串则静默只受 [`Self::max_ms`] 约束
+    pub idle_unless_seen: Option<&'static str>,
+    /// 见到该 JSON-RPC `id` 的响应帧即停（响应即终：initialize/load/new/prompt 同理）
+    pub stop_on_id: Option<u64>,
+}
+
+/// 流停止原因（**诚实标注**：谁掐断了流）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamStop {
+    /// 自然结束或见到响应帧
+    #[default]
+    Complete,
+    /// 静默死线（未见 `idle_unless_seen`）——探测定案的「已结束会话」形态
+    Idle,
+    /// 绝对上限（watchdog）
+    Watchdog,
+}
+
+/// HTTP 请求（缝的输入；**纯描述**，不含任何 reqwest 类型——测试零依赖构造）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpReq {
+    pub method: &'static str,
+    pub url: String,
+    /// 头（名按 HTTP 语义**大小写不敏感**比较；值逐字）
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+    /// 传输层超时（毫秒）
+    pub timeout_ms: u64,
+    pub stream: StreamPolicy,
+}
+
+impl HttpReq {
+    /// 普通 JSON 请求（无流）
+    pub fn json_post(url: String, headers: Vec<(String, String)>, body: String) -> Self {
+        Self {
+            method: "POST",
+            url,
+            headers,
+            body: Some(body),
+            timeout_ms: SHORT_TIMEOUT_MS,
+            stream: StreamPolicy::whole(SHORT_TIMEOUT_MS),
+        }
+    }
+
+    /// 指纹探测用 GET（短超时：本机回环、候选端口可能根本不是 HTTP）
+    pub fn probe_get(url: String) -> Self {
+        Self {
+            method: "GET",
+            url,
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: FINGERPRINT_TIMEOUT_MS,
+            stream: StreamPolicy::whole(FINGERPRINT_TIMEOUT_MS),
+        }
+    }
+
+    /// connect 活体探测用 POST（照抄 [`AcpClient::handshake`] 建连形状：POST/空体/无头；
+    /// 超时与 [`Self::probe_get`] 同纪律——本机回环、探测后连接即弃，见 [`fingerprint_port`]）
+    pub fn probe_post(url: String) -> Self {
+        Self {
+            method: "POST",
+            url,
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: FINGERPRINT_TIMEOUT_MS,
+            stream: StreamPolicy::whole(FINGERPRINT_TIMEOUT_MS),
+        }
+    }
+}
+
+impl StreamPolicy {
+    /// 不读流（按普通请求读全 body）
+    pub const fn whole(max_ms: u64) -> Self {
+        Self {
+            max_ms,
+            idle_ms: 0,
+            idle_unless_seen: None,
+            stop_on_id: None,
+        }
+    }
+}
+
+/// 短请求传输超时（connect / 指纹探测之外的控制面请求）
+pub const SHORT_TIMEOUT_MS: u64 = 20_000;
+/// 指纹探测超时（候选端口可能是任意本地服务——必须有界；连接被拒即刻返回，只有
+/// 「收 TCP 不答 HTTP」的服务才吃满这个超时）
+pub const FINGERPRINT_TIMEOUT_MS: u64 = 1_000;
+/// 共享 HTTP 客户端的**连接**超时（毫秒）= 旧逐请求 `clamp(500, 15_000)` 的**天花板**。
+/// 逐请求**总量**超时仍单发（`RequestBuilder::timeout`，见 [`production_http_seam`]）；
+/// 本模块实际出现的超时值只有 [`FINGERPRINT_TIMEOUT_MS`]（1000）与 `≥ 20_000`
+/// （[`SHORT_TIMEOUT_MS`] / watchdog 上取 max），两者在旧口径下的连接界与新口径
+/// **逐一相等**（1000 / 15000）⇒ 客户端单例化**零行为变化**（旧形态逐请求重建，
+/// 连连接池与 TLS 配置都丢）。
+pub const CLIENT_CONNECT_TIMEOUT_MS: u64 = 15_000;
+/// 端口候选上限（WB 是 Electron，监听端口不止一个；双确认前逐个试，**有界**）。
+/// 最坏代价 = 上限 ×（`/` + connect + `/health` 三发）× 探测超时 ≈ 24s（只有候选端口
+/// 全部「收 TCP 不答 HTTP」时——connect/health 被拒即刻返回，不吃满超时），典型（WB
+/// 未监听任何端口）= 0 次请求；**探测预算用尽即如实拒绝**（宁可慢一点回绝，也不盲扫、
+/// 不冒充）
+pub const MAX_PORT_CANDIDATES: usize = 8;
+/// 已结束会话判定死线（探测定案 + plan Step 1 原例逐字：60s 无 `agentPhase` 事件）
+pub const PHASE_DEADLINE_MS: u64 = 60_000;
+/// 短请求（initialize/load/new）的静默死线：响应帧即时到达，静默即异常
+pub const CONTROL_IDLE_MS: u64 = 5_000;
+
+/// HTTP 响应（缝的输出）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResp {
+    /// 0 = 传输层失败（[`Self::error`] 必有值）
+    pub status: u16,
+    pub body: String,
+    pub stop: StreamStop,
+    pub error: Option<String>,
+}
+
+impl HttpResp {
+    pub fn json(body: &str) -> Self {
+        Self {
+            status: 200,
+            body: body.to_string(),
+            stop: StreamStop::Complete,
+            error: None,
+        }
+    }
+
+    pub fn status(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            body: body.to_string(),
+            stop: StreamStop::Complete,
+            error: None,
+        }
+    }
+
+    /// SSE 正常收流（含响应帧）
+    pub fn sse(body: &str) -> Self {
+        Self::json(body)
+    }
+
+    /// SSE 被静默死线掐断（探测定案：已结束会话的「200 + 心跳但回合不推进」）
+    pub fn sse_stalled(body: &str) -> Self {
+        Self {
+            status: 200,
+            body: body.to_string(),
+            stop: StreamStop::Idle,
+            error: None,
+        }
+    }
+
+    /// SSE 被 watchdog 上限掐断
+    pub fn sse_watchdog(body: &str) -> Self {
+        Self {
+            status: 200,
+            body: body.to_string(),
+            stop: StreamStop::Watchdog,
+            error: None,
+        }
+    }
+
+    pub fn transport_error(msg: &str) -> Self {
+        Self {
+            status: 0,
+            body: String::new(),
+            stop: StreamStop::Complete,
+            error: Some(msg.to_string()),
+        }
+    }
+
+    pub fn is_transport_error(&self) -> bool {
+        self.error.is_some()
+    }
+}
+
+/// HTTP 执行缝（**唯一 IO 出口**）；`Box<dyn Fn(HttpReq) -> HttpResp>` 的 Arc 封装
+pub type HttpSeam = Arc<dyn Fn(HttpReq) -> HttpResp + Send + Sync>;
+
+// ============================================================
+// SSE / JSON-RPC 归一（纯核）
+// ============================================================
+
+/// 流证据（SSE → 归一产物；**未知帧只计数不解释**，与 Task 6 前缀跳过同纪律）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamEvidence {
+    /// `agentPhase` 事件序列（首个 = [`Self::first_phase`]）
+    pub phases: Vec<String>,
+    /// 回合终点（`stopReason`；响应帧给出）
+    pub stop_reason: Option<String>,
+    /// assistant 正文（`session_update` 的 `agent_message_chunk` **逐块累积**；总长封顶
+    /// [`ASSISTANT_ACCUM_CAP_CHARS`]——回执那一刀仍在 `receipt_for` → `normalize::summarize`）
+    pub assistant: Option<String>,
+    /// 权限档（`config_option_update` 的 mode `currentValue`；**只读展示面未接线**）
+    pub permission_mode: Option<String>,
+    /// JSON-RPC 错误（`error.message`）
+    pub rpc_error: Option<String>,
+    /// `session_update: session_end` 在场（load 回放诊断用）
+    pub session_end: bool,
+    /// **含已知键**的帧数（被吸收解释的帧）
+    pub frames: usize,
+    /// JSON 但无任何已知键的帧数（**只计数不解释**——与 Task 6 前缀跳过同纪律）
+    pub unknown_frames: usize,
+    /// 注释帧数（`:ok` / `: heartbeat`——**不算推进证据**）
+    pub comments: usize,
+    /// 既非注释也非 JSON 的行数
+    pub noise_lines: usize,
+}
+
+impl StreamEvidence {
+    /// 首个 `agentPhase`（无 = 空串；plan Step 1 原例的断言面）
+    pub fn first_phase(&self) -> String {
+        self.phases.first().cloned().unwrap_or_default()
+    }
+
+    /// 回合是否推进过（见到 `agentPhase`）
+    pub fn advanced(&self) -> bool {
+        !self.phases.is_empty()
+    }
+}
+
+/// SSE **行级增量**帧解析器（纯核）：`parse_frames`（整段文本）与 [`StreamScanner`]（逐块
+/// 收流）**同源**——帧边界口径只此一处，不会长出第二套判据（评审 I11）。
+///
+/// 状态只有两个缓冲：**未闭合的当前行**（字节）与**当前帧的 `data:` 载荷**。行切分点恒为
+/// ASCII `\n` ⇒ 跨块的多字节字符在行尾处才被解码，永不被切两半（评审 I10 的字节纪律）。
+/// 两个缓冲各自有上限（[`SSE_LINE_CAP_BYTES`] / [`SSE_DATA_CAP_BYTES`]，评审 N1）：
+/// 单条不收束的巨型行/载荷超限即丢续字节并如实计噪音——病态行不是判定原料，不静默吞。
+///
+/// 帧边界按 SSE 规范，**逐条对齐旧整段口径（勿「简化」）**：
+/// - 行尾剥 `\r`（`\r\n` 与 `\n` 同判）；空行 = 派发（冲刷载荷）；
+/// - `:` 起 = 注释帧（`:ok` / `: heartbeat`——探测定案里「已结束会话」的流正是这些）；
+///   `event:` / `id:` / `retry:` 行是元数据（跳过）；
+/// - `data:` 行按 `trim_start` 拼进载荷（多行以 `\n` 连接）；
+/// - **兜底**：既非注释也非 `data:` 的行若能解析为 JSON 也当帧收（部分实现直接吐 JSON 行），
+///   否则记噪音行（不猜）；
+/// - 末尾不足一行 / 未派发的载荷由 [`Self::finish`] 结算（= 旧口径的末尾 `flush`）。
+#[derive(Default)]
+struct SseFrames {
+    /// 未闭合的当前行（**字节**：`\n` 是 ASCII ⇒ 解码点恒落在字符边界上）
+    line: Vec<u8>,
+    /// 当前帧的 `data:` 载荷（未以空行派发；多行以 `\n` 连接）
+    data: Vec<u8>,
+    /// 行缓冲已超 [`SSE_LINE_CAP_BYTES`] 截断（续字节在丢；换行到达时 [`Self::take_line`]
+    /// 计**一次**噪音收尾——按行计，不按截断次数计）
+    line_truncated: bool,
+    /// 载荷缓冲已超 [`SSE_DATA_CAP_BYTES`] 截断（续行在丢；空行派发时 [`Self::flush`]
+    /// 计**一次**噪音收尾——按帧载荷计）
+    data_truncated: bool,
+    /// 注释帧数（不算推进证据）
+    comments: usize,
+    /// 既非注释也非 JSON 的行数（含超限截断作废的行/载荷——如实登记，不静默吞）
+    noise: usize,
+    /// **仅测试**：交给帧解析/尾判的字节数——I11 的回归断言面（增量 ⇒ 与流长同阶；
+    /// 旧口径是「每 push 重解析整个 body」⇒ 与流长平方同阶）
+    #[cfg(test)]
+    parsed_bytes: u64,
+}
+
+impl SseFrames {
+    /// 喂入一块**文本**（生产缝的块已按字符边界切齐，见 [`Utf8ChunkAssembler`]）：每产出一帧
+    /// 即回调 `sink`（**流式**：不攒帧表，内存只与「当前行 + 当前帧载荷」有关）
+    fn feed(&mut self, chunk: &str, sink: &mut dyn FnMut(serde_json::Value)) {
+        #[cfg(test)]
+        {
+            self.parsed_bytes += chunk.len() as u64;
+        }
+        let bytes = chunk.as_bytes();
+        let mut start = 0usize;
+        while let Some(offset) = bytes[start..].iter().position(|b| *b == b'\n') {
+            self.line_extend(&bytes[start..start + offset]);
+            self.take_line(sink);
+            start += offset + 1;
+        }
+        // 尾部不足一行：留在行缓冲里等下一块（跨块的多字节字符也在这里拼齐）
+        self.line_extend(&bytes[start..]);
+    }
+
+    /// 行缓冲喂入（评审 N1 的内存界）：超 [`SSE_LINE_CAP_BYTES`] 即**丢续字节**并置截断
+    /// 标志——该行已作废，续字节不再追加（截断点可落在多字节字符中间：无碍，此行整体
+    /// 丢弃、不参与任何解码），换行到达时由 [`Self::take_line`] 计一次噪音收尾。
+    fn line_extend(&mut self, bytes: &[u8]) {
+        if self.line_truncated {
+            return; // 已截断：续字节照丢（噪音在行收束时一次性如实计，不按截断次数重复计）
+        }
+        let room = SSE_LINE_CAP_BYTES.saturating_sub(self.line.len());
+        if bytes.len() > room {
+            self.line.extend_from_slice(&bytes[..room]);
+            self.line_truncated = true;
+        } else {
+            self.line.extend_from_slice(bytes);
+        }
+    }
+
+    /// 收尾（流结束/死线到点时调用一次）：结算尾部**半行** + 未派发载荷——旧口径「每次
+    /// parse 都在输入末尾 flush」的最后一拍。**不调用它，紧跟流尾、无换行/空行收束的帧
+    /// 就认不出来**（如实登记的等价条件）。
+    fn finish(&mut self, sink: &mut dyn FnMut(serde_json::Value)) {
+        if !self.line.is_empty() {
+            self.take_line(sink);
+        }
+        self.flush(sink);
+    }
+
+    /// **乐观尾判**（只判不消费、不计数）：未派发载荷 / 未闭合半行此刻**已是完整 JSON** 就
+    /// 当帧回调——与旧口径「每拍 parse 都在末尾 flush 未派发载荷」逐拍对齐（例：响应帧
+    /// `data: {...}` 已到、收束空行未到，旧口径**当拍就认**，这里同样当拍认）。
+    /// 重复认同一帧无害：判定只问「是不是本次响应帧」，且停止态一旦置位不再翻转。
+    ///
+    /// CPU 界（评审 N1）：pending 超限即**跳过本拍重试**——sniff 是「提前一拍认」的乐观
+    /// 优化（收束空行一到，`take_line`/`flush` 照常全量解析），跳过只丢提前量、不丢判定。
+    /// 选「超限跳过」而非「块尾字节是 `}`/`]` 才试」：后者要改调用面把块尾字节传进来，
+    /// 且对「`}` 后带尾随空白」等形态仍会漏试；前者是纯内部一行守卫，零调用面改动。
+    fn sniff_pending(&mut self, sink: &mut dyn FnMut(serde_json::Value)) {
+        if self.data.len() + self.line.len() > SNIFF_PENDING_CAP_BYTES {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.parsed_bytes += (self.data.len() + self.line.len()) as u64;
+        }
+        if !self.data.is_empty() {
+            let payload = String::from_utf8_lossy(&self.data);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload.trim()) {
+                sink(v);
+            }
+        }
+        if !self.line.is_empty() {
+            let line = String::from_utf8_lossy(&self.line);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim_end_matches('\r')) {
+                sink(v);
+            }
+        }
+    }
+
+    /// 结算一行（调用点 = 行尾 `\n` 到达 / [`Self::finish`] 的尾部半行）
+    fn take_line(&mut self, sink: &mut dyn FnMut(serde_json::Value)) {
+        let mut raw = std::mem::take(&mut self.line);
+        let truncated = std::mem::take(&mut self.line_truncated);
+        while raw.last() == Some(&b'\r') {
+            raw.pop();
+        }
+        // 超限截断的行（评审 N1）：整体作废 + 如实计噪音（对齐 unknown 行口径，不静默吞）。
+        // 不走下面的正常分支——截断行既不可信地判 `data:` 前缀（残段拼进载荷只会污染），
+        // 也不值得再试 JSON（病态行不可能是判定原料，见 [`SSE_LINE_CAP_BYTES`]）
+        if truncated {
+            self.noise += 1;
+            return;
+        }
+        let line = String::from_utf8_lossy(&raw).into_owned();
+        if line.is_empty() {
+            self.flush(sink); // 空行 = 派发
+            return;
+        }
+        if line.starts_with(':') {
+            self.comments += 1;
+            return;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            if self.data_truncated {
+                return; // 载荷已截断：续行照丢（空行派发时 [`Self::flush`] 计一次噪音收尾）
+            }
+            if !self.data.is_empty() {
+                self.data.push(b'\n');
+            }
+            let rest = rest.trim_start().as_bytes();
+            let room = SSE_DATA_CAP_BYTES.saturating_sub(self.data.len());
+            if rest.len() > room {
+                // 载荷超限（评审 N1）：保留头部到上限、丢续字节——该载荷作废，
+                // 空行派发时如实计噪音
+                self.data.extend_from_slice(&rest[..room]);
+                self.data_truncated = true;
+            } else {
+                self.data.extend_from_slice(rest);
+            }
+            return;
+        }
+        if line.starts_with("event:") || line.starts_with("id:") || line.starts_with("retry:") {
+            return;
+        }
+        match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(v) => sink(v),
+            Err(_) => self.noise += 1,
+        }
+    }
+
+    /// 冲刷当前载荷（空行派发 / 收尾）：`trim` 后非空才试 JSON，失败记噪音（同旧口径）。
+    /// 超限截断的载荷直接作废 + 计噪音（截断的 JSON 不猜、不试半截）
+    fn flush(&mut self, sink: &mut dyn FnMut(serde_json::Value)) {
+        let raw = std::mem::take(&mut self.data);
+        let truncated = std::mem::take(&mut self.data_truncated);
+        if truncated {
+            self.noise += 1;
+            return;
+        }
+        let payload = String::from_utf8_lossy(&raw);
+        let payload = payload.trim();
+        if !payload.is_empty() {
+            match serde_json::from_str::<serde_json::Value>(payload) {
+                Ok(v) => sink(v),
+                Err(_) => self.noise += 1,
+            }
+        }
+    }
+}
+
+/// SSE 体 → JSON 帧表（+ 注释/噪音分账）——**整段口径**：即 [`SseFrames`] 一次喂完再收尾
+/// （帧边界判据与逐块收流同源；整段入口留给 `read_stream` / `rpc_result` 用）。
+fn parse_frames(body: &str) -> (Vec<serde_json::Value>, usize, usize) {
+    let mut parser = SseFrames::default();
+    let mut frames: Vec<serde_json::Value> = Vec::new();
+    parser.feed(body, &mut |v| frames.push(v));
+    parser.finish(&mut |v| frames.push(v));
+    (frames, parser.comments, parser.noise)
+}
+
+/// 递归取首个同名字符串值（**只认已知键**；找不到 = None，不猜）
+fn deep_str(v: &serde_json::Value, key: &str) -> Option<String> {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(s) = map.get(key).and_then(|x| x.as_str()) {
+                return Some(s.to_string());
+            }
+            map.values().find_map(|x| deep_str(x, key))
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(|x| deep_str(x, key)),
+        _ => None,
+    }
+}
+
+/// assistant 正文的**累积总长上限**（4 × 回执摘要长度）。
+///
+/// 为什么需要：`agent_message_chunk` 逐块到达，一个回合的流可以无限长——只留最后一块会丢
+/// 正文（回执只带答复的尾巴），而无上限拼接又会让失控的流把内存吃光。取 4 ×
+/// [`super::receipt::LAST_ASSISTANT_CHARS`]：足够喂满回执那一刀（200 字），再多也只是被砍掉。
+///
+/// **这不是第二套截断口径**：本上限只防无界增长（不追加省略号、不做摘要），回执产物的
+/// 截断语义仍单点在 `receipt_for` → [`crate::inject::normalize::summarize`]。
+pub const ASSISTANT_ACCUM_CAP_CHARS: usize = 4 * super::receipt::LAST_ASSISTANT_CHARS;
+
+/// 累积一块 assistant 文本（`get_or_insert` + `push_str` 风格；**总长封顶**——见
+/// [`ASSISTANT_ACCUM_CAP_CHARS`]）。首块即建缓冲（哪怕空串，与「帧含已知键」同判据）。
+fn accumulate_assistant(slot: &mut Option<String>, text: &str) {
+    let buf = slot.get_or_insert_with(String::new);
+    let used = buf.chars().count();
+    if used >= ASSISTANT_ACCUM_CAP_CHARS {
+        return;
+    }
+    // 只取余量（按**字符**：多字节安全，与 summarize 同口径）；超长块不做无谓拷贝
+    buf.extend(text.chars().take(ASSISTANT_ACCUM_CAP_CHARS - used));
+}
+
+/// 吸收一帧（返回是否含**已知键**——未知帧只计数不解释）
+fn absorb(v: &serde_json::Value, ev: &mut StreamEvidence) -> bool {
+    let mut known = false;
+    if let Some(msg) = v
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+    {
+        ev.rpc_error = Some(msg.to_string());
+        known = true;
+    }
+    if let Some(phase) = deep_str(v, "agentPhase") {
+        ev.phases.push(phase);
+        known = true;
+    }
+    if let Some(kind) = deep_str(v, "sessionUpdate") {
+        if kind == "session_end" {
+            ev.session_end = true;
+            known = true;
+        }
+        if kind == "agent_message_chunk" {
+            if let Some(text) = deep_str(v, "text") {
+                accumulate_assistant(&mut ev.assistant, &text);
+                known = true;
+            }
+        }
+    }
+    if let Some(stop) = deep_str(v, "stopReason") {
+        ev.stop_reason = Some(stop);
+        known = true;
+    }
+    if deep_str(v, "category").as_deref() == Some("mode") {
+        if let Some(cur) = deep_str(v, "currentValue") {
+            ev.permission_mode = Some(cur);
+            known = true;
+        }
+    }
+    known
+}
+
+/// SSE 体 → 流证据（`data:` 逐行累积 + 裸 JSON 行兜底；注释/未知帧/噪音分账）
+pub fn read_stream(body: &str) -> StreamEvidence {
+    let (frames, comments, noise) = parse_frames(body);
+    let mut ev = StreamEvidence {
+        comments,
+        noise_lines: noise,
+        ..Default::default()
+    };
+    for f in &frames {
+        if absorb(f, &mut ev) {
+            ev.frames += 1;
+        } else {
+            ev.unknown_frames += 1;
+        }
+    }
+    ev
+}
+
+// ============================================================
+// 端点发现（心跳 → 端口指纹 → 如实不可用）
+// ============================================================
+
+/// 端点来源（回执/审计的可诊断面）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointSource {
+    /// 心跳 `endpoint` 字段（macOS/旧版；每会话异端口）
+    Heartbeat { pid: u32 },
+    /// 端口指纹双确认（Windows 启用远程控制后）
+    PortFingerprint { pid: u32, port: u16 },
+}
+
+/// 端点发现结论
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointDiscovery {
+    Found {
+        url: String,
+        source: EndpointSource,
+    },
+    /// **如实不可用**（不盲扫）：原因里必须带出**启用条件**
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl EndpointDiscovery {
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            EndpointDiscovery::Found { url, .. } => Some(url),
+            EndpointDiscovery::Unavailable { .. } => None,
+        }
+    }
+}
+
+/// 「端点在不在」的探测依赖（**全注入**：心跳读 / WB 宿主进程表 / 监听端口表）
+pub struct EndpointProbe {
+    /// 平台（`std::env::consts::OS` 原值；端口指纹路只在 Windows 走——探测定案）
+    pub os: &'static str,
+    /// 心跳快照（生产 = 读 `~/.workbuddy/sessions/<pid>.json`；测试 = 脚本桩）
+    pub heartbeat: Box<dyn Fn(u32) -> Option<HeartbeatSnapshot> + Send + Sync>,
+    /// WB **宿主**进程表（生产 = sysinfo 按 exe 名；测试 = 脚本桩）
+    pub wb_pids: Box<dyn Fn() -> Vec<u32> + Send + Sync>,
+    /// pid 的监听端口表（生产 = `Get-NetTCPConnection -State Listen -OwningProcess`）
+    pub listening_ports: Box<dyn Fn(u32) -> Vec<u16> + Send + Sync>,
+}
+
+/// 端点不可用的**统一文案**（plan Step 3 逐字：启用条件 + 风险 16 跟进项）。
+///
+/// **阶段词选择（义务 4，诚实裁决）**：文案里的 `channel_unavailable` 是**原因码**，
+/// **不新增 `Stage` 变体**——端点未启用时回合**未起跑、零字节投递**，正是既有
+/// [`Stage::Refused`]（投递前拒绝）的定义；`ChannelError` 的语义是「通道跑过了但没拿到
+/// 有效回执」，用在这里会让移动端分诊说错话（把「没发出去」显示成「通道异常」）。
+/// 故回执 = `failed(refused)` + 本文案（含原因码），跨语言夹具
+/// `tests/fixtures/headless_stages.json` **无须改动**（无新阶段）。
+pub const ENDPOINT_UNAVAILABLE_REASON: &str =
+    "WorkBuddy 远程控制端点未启用（channel_unavailable）——请在 WorkBuddy 设置中开启远程控制（风险 16 跟进项）";
+/// `/` 标题指纹（探测定案：CodeBuddy Remote Control）
+pub const TITLE_FINGERPRINT: &str = "CodeBuddy Remote Control";
+
+/// 回环端点校验（**安全铁律**：用户正文只许 POST 到本机回环——心跳文件是私有格式，
+/// 非回环形态一律丢弃，不猜、不外发）
+pub fn loopback_url(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let rest = s.strip_prefix("http://")?;
+    // 去路径/查询/片段，只留 authority
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.contains('@') {
+        return None; // 拒绝 userinfo（`http://evil@127.0.0.1` 一类混淆）
+    }
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next()?
+    } else {
+        authority.split(':').next()?
+    };
+    let ok = matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    );
+    ok.then(|| s.trim_end_matches('/').to_string())
+}
+
+/// `/health` UP 判据——**第二腿兼容分支**（Mac 旧版：connect 不可达时的兜底，见
+/// [`fingerprint_port`]）。Windows 内嵌版的 `/health` 被 AUTH_REQUIRED 挡 ⇒ 本判据
+/// 恒 false，**无否决权**（端点是否认可走 connect 活体主路）。体须为
+/// `{"status":"UP"}`（严格 JSON 解析——不猜）
+pub fn health_ok(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body.trim())
+        .ok()
+        .and_then(|v| {
+            v.get("status")
+                .and_then(|s| s.as_str())
+                .map(|s| s.eq_ignore_ascii_case("up"))
+        })
+        .unwrap_or(false)
+}
+
+/// 第一腿：`/` 标题指纹命中（大小写不敏感子串——探测定案：CodeBuddy Remote Control）
+pub fn title_hit(root_body: &str) -> bool {
+    root_body
+        .to_lowercase()
+        .contains(&TITLE_FINGERPRINT.to_lowercase())
+}
+
+/// 第二腿主路：connect 活体响应判据——体须含**非空** `connectionId`（严格 JSON 解析，
+/// 不猜）。只查 connectionId 不查 sessionToken：身份证据在 connectionId；sessionToken
+/// 形态漂移由投递链真建连（[`AcpClient::handshake`] 双字段严查）兜住——探测只判
+/// 「是 WB 且可用」，不做完整建连解析。
+pub fn connect_ok(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body.trim())
+        .ok()
+        .and_then(|v| {
+            v.get("connectionId")
+                .and_then(|s| s.as_str())
+                .map(|s| !s.is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// `Get-NetTCPConnection | Select -ExpandProperty LocalPort` 输出 → 端口表（纯核；
+/// 表头/噪声/越界值一律跳过，不猜）
+pub fn parse_ports(text: &str) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if let Ok(port) = t.parse::<u16>() {
+            if port > 0 && !out.contains(&port) {
+                out.push(port);
+            }
+        }
+    }
+    out
+}
+
+/// WB 宿主进程判定（**只服务端口发现**：要 APP 的 pid 去问它监听了什么；会话发现
+/// **禁用进程名匹配**——见 `monitor::workbuddy_parser` 模块文档）
+pub fn is_wb_host_exe(exe: Option<&Path>) -> bool {
+    exe.and_then(|e| e.file_name())
+        .map(|n| n.to_string_lossy().to_lowercase().contains("workbuddy"))
+        .unwrap_or(false)
+}
+
+/// 端口指纹双确认（第一腿 GET `/` 标题指纹 → 第二腿① connect 活体〔主路〕 /
+/// 第二腿② GET `/health` UP〔兼容分支〕，**都走注入缝**）。
+///
+/// **根因（2026-10-12 00:13 用户实测 + 审计 16:13:27Z，M26 修前复现）**：Windows 内嵌
+/// WB 的 `/health` 被鉴权挡（`AUTH_REQUIRED`），旧判据严格 `{"status":"UP"}` ⇒ 恒
+/// false ⇒ 双确认恒败（4 候选 0 命中）——端点在监听却永远发现不了。第二腿主路改
+/// connect 活体：免鉴权、即刻返回 connectionId = 比 health 更强的「是 WB 且可用」证据。
+///
+/// **探测后连接即弃**：逆向 API 无 disconnect 面（探测报告未见关闭端点，无从优雅
+/// 关闭）；ACP HTTP 形态逐请求 POST、不持长连（连接由 HTTP 客户端池管理）。「弃」的
+/// 语义 = 不保留探测凭据（connectionId/sessionToken 即弃）、不再发携带它们的任何请求
+/// ——投递链 [`AcpClient::handshake`] 自开新连接，不复用探测产物。
+fn fingerprint_port(http: &HttpSeam, root: &str) -> Option<String> {
+    let root_resp = http(HttpReq::probe_get(format!("{root}/")));
+    if root_resp.error.is_some() {
+        return None; // 连接失败/超时：本候选不认（继续下一个）
+    }
+    if !title_hit(&root_resp.body) {
+        return None; // 第一腿不过：不浪费第二腿（别的本地服务直接跳过）
+    }
+    // 第二腿①（主路）：connect 活体——Windows 内嵌版（/health 被 AUTH_REQUIRED 挡）靠它救
+    let probe = http(HttpReq::probe_post(format!("{root}{CONNECT_PATH}")));
+    if probe.error.is_none() && (200..300).contains(&probe.status) && connect_ok(&probe.body) {
+        return Some(root.to_string()); // 探测连接即弃（见函数文档）
+    }
+    // 第二腿②（兼容分支，Mac 旧版）：health 只作兜底不作否决——connect 失败不阻断
+    let health = http(HttpReq::probe_get(format!("{root}/health")));
+    if health.error.is_some() {
+        return None;
+    }
+    health_ok(&health.body).then_some(root.to_string())
+}
+
+/// 端点发现内核（**心跳优先 → Windows 端口指纹 → 如实不可用**）。
+///
+/// 心跳路要求四件事同时成立（Mac/旧版形态）：心跳**可用**（严格 UUID + 非 prewarm +
+/// 新鲜 < 90s + 文件名/内容 pid 一致）、**会话号匹配**（每会话异端口）、`endpoint` 在场、
+/// 且为**回环**形态。Windows 5.7.3（无交互心跳）→ 端口指纹路：WB 宿主 pid 过滤 →
+/// 逐候选端口 `/` 标题指纹 + connect 活体〔主路，探测后连接即弃〕 / `/health` UP
+/// 〔兼容分支〕**双确认**（候选有界）。
+/// 两路都落空 ⇒ 如实 [`EndpointDiscovery::Unavailable`]，**不盲扫**。
+pub fn discover_endpoint(
+    probe: &EndpointProbe,
+    http: &HttpSeam,
+    session_id: &str,
+    pid: u32,
+) -> EndpointDiscovery {
+    // ① 心跳路
+    let mut detail = if pid == 0 {
+        "会话无宿主进程（pid=0，db 源哨兵卡）且无心跳".to_string()
+    } else {
+        match (probe.heartbeat)(pid) {
+            Some(hb) if hb.usable && hb.session_id == session_id => {
+                match hb.endpoint.as_deref().and_then(loopback_url) {
+                    Some(url) => {
+                        return EndpointDiscovery::Found {
+                            url,
+                            source: EndpointSource::Heartbeat { pid },
+                        }
+                    }
+                    None => {
+                        "心跳在场但 endpoint 缺失或非回环（已丢弃——绝不把正文发出本机）".to_string()
+                    }
+                }
+            }
+            Some(hb) if hb.usable => {
+                "在场心跳属于别的会话（ACP 端点按会话隔离，不借他会话端点）".to_string()
+            }
+            Some(_) => "该会话心跳不可用（已过期/pid 不符/prewarm）——陈旧心跳的 endpoint 一律不用"
+                .to_string(),
+            None => "该会话无心跳文件".to_string(),
+        }
+    };
+    // ② 端口指纹路（**只在 Windows**：探测定案的平台差异——macOS 走心跳即可）
+    if probe.os == "windows" {
+        let pids = (probe.wb_pids)();
+        let mut tried = 0usize;
+        'outer: for wb_pid in &pids {
+            for port in (probe.listening_ports)(*wb_pid) {
+                if tried >= MAX_PORT_CANDIDATES {
+                    break 'outer;
+                }
+                tried += 1;
+                let root = format!("http://127.0.0.1:{port}");
+                if let Some(url) = fingerprint_port(http, &root) {
+                    return EndpointDiscovery::Found {
+                        url,
+                        source: EndpointSource::PortFingerprint { pid: *wb_pid, port },
+                    };
+                }
+            }
+        }
+        let host = if pids.is_empty() {
+            "WB 宿主进程不在场"
+        } else {
+            "WB 宿主在场"
+        };
+        detail = format!("{detail}；端口指纹路：{host}，候选 {tried} 个端口双确认 0 命中");
+    }
+    EndpointDiscovery::Unavailable {
+        reason: format!("{ENDPOINT_UNAVAILABLE_REASON}；本次探测：{detail}"),
+    }
+}
+
+// ============================================================
+// ACP 客户端（wire 纯核；**测试唯一入口 = MockHttp**）
+// ============================================================
+
+/// 连接态（connect 产物）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpSession {
+    pub connection_id: String,
+    pub token: String,
+}
+
+/// 能力协商结论（initialize 产物）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    pub protocol_version: Option<u32>,
+    /// `agentCapabilities.loadSession`（false ⇒ 活跃会话不可 load，如实拒绝）
+    pub load_session: bool,
+}
+
+/// `session/load` 回放证据（**诊断用**，不是投递前置）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoadOutcome {
+    /// 回放里末回合的 `stopReason`（非 None ⇒ 该会话上一次回合已结束）
+    pub last_stop_reason: Option<String>,
+    /// 权限档（只读；切换留三期 F3.1）
+    pub permission_mode: Option<String>,
+    /// 回放被静默死线掐断（历史很长时可能；不阻塞 prompt）
+    pub truncated: bool,
+}
+
+/// 目标语义（**协议核**；生产侧臂选择 = 端点发现形态分派，见 [`SessionSel::New`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSel<'a> {
+    /// 活跃会话：`session/load` + `session/prompt`
+    Active { session_id: &'a str, cwd: &'a str },
+    /// 新建：`session/new` + `session/prompt`——**Windows 单臂形态的生产臂**（Task 4b）：
+    /// 端口指纹发现的端点恒走此臂（`session/load` 在 Windows 恒 `writer_occupied`）。注意
+    /// Windows 的 `session/new` **不新建会话而是绑定 APP 当前活跃会话**（无视 cwd，探测定案
+    /// §3.3）⇒ 投递目标可能 ≠ 卡面所选，靶向标注必带（见 [`delivered_session_note`]）
+    New { cwd: &'a str },
+}
+
+/// 目标定位产物
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// 实际投递的 ACP 会话号（`New` 时 = `session/new` 返回的 id——Windows 形态下它
+    /// **绑定 APP 当前会话而非新建**，可能与卡面所选会话不同 ⇒ 靶向标注必带）
+    pub session_id: String,
+    /// 是否经 `session/new` 臂（**只表示「走了 new 臂」**，不保证「新建」语义——见上）
+    pub created: bool,
+    /// `session/load` 回放证据（`New` 时 None）
+    pub load: Option<LoadOutcome>,
+}
+
+/// prompt 流判定产物
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptOutcome {
+    pub session_id: String,
+    /// 首个 `agentPhase`（无 = 空串）
+    pub first_phase: String,
+    pub phases: Vec<String>,
+    pub stop_reason: Option<String>,
+    pub last_assistant: Option<String>,
+    pub permission_mode: Option<String>,
+    /// 流停止原因（诚实标注谁掐断的）
+    pub stop: StreamStop,
+    pub evidence: StreamEvidence,
+}
+
+impl PromptOutcome {
+    pub fn advanced(&self) -> bool {
+        !self.phases.is_empty()
+    }
+}
+
+/// ACP 客户端（**唯一 IO 出口 = 注入缝**；生产缝见 [`production_http_seam`]）
+pub struct AcpClient {
+    base: String,
+    http: HttpSeam,
+    next_id: std::sync::atomic::AtomicU64,
+    watchdog_ms: u64,
+}
+
+/// ACP `POST /api/v1/acp` 的三件套头（**逐字**；头名按 HTTP 语义大小写不敏感）
+fn acp_headers(sess: &AcpSession) -> Vec<(String, String)> {
+    vec![
+        ("accept".to_string(), ACCEPT_BOTH.to_string()),
+        ("content-type".to_string(), "application/json".to_string()),
+        ("acp-connection-id".to_string(), sess.connection_id.clone()),
+        ("acp-session-token".to_string(), sess.token.clone()),
+    ]
+}
+
+/// RPC 响应读取结论：`Ok(Some(v))` = 该 id 的结果；`Ok(None)` = **无响应帧**（流已尽力，
+/// 判定交给调用方）；`Err(_)` = 服务端显式错误（错误帧 / `error` 对象 / 非 2xx）
+fn rpc_result(id: u64, resp: &HttpResp) -> Result<Option<serde_json::Value>, String> {
+    if let Some(e) = &resp.error {
+        return Err(e.clone());
+    }
+    // 显式错误优先（服务端明确拒绝；含 SSE 帧里的 `error.message`）
+    let (frames, _, _) = parse_frames(&resp.body);
+    for frame in &frames {
+        for candidate in [Some(frame), frame.get("error")].into_iter().flatten() {
+            if let Some(msg) = candidate
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+            {
+                return Err(msg.to_string());
+            }
+        }
+    }
+    if !(200..300).contains(&resp.status) && resp.status != 0 {
+        let brief = normalize::summarize(&resp.body, normalize::AUDIT_SUMMARY_CHARS);
+        return Err(format!("HTTP {}：{brief}", resp.status));
+    }
+    if let Some(hit) = frames
+        .iter()
+        .find(|f| f.get("id").and_then(|x| x.as_u64()) == Some(id))
+    {
+        if let Some(result) = hit.get("result") {
+            return Ok(Some(result.clone()));
+        }
+    }
+    Ok(None)
+}
+
+impl AcpClient {
+    /// `base` = 端点根（如 `http://127.0.0.1:63928`）；`http` = 注入缝
+    /// （测试传 [`MockHttp`]，生产传 [`production_http_seam`]）
+    pub fn new<H: Into<HttpSeam>>(base: &str, http: H) -> Self {
+        Self {
+            base: base.trim_end_matches('/').to_string(),
+            http: http.into(),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+            watchdog_ms: super::DEFAULT_TIMEOUT_MS,
+        }
+    }
+
+    /// 回合 watchdog（决定流读取绝对上限；生产 = H4 设置）
+    pub fn watchdog_ms(mut self, ms: u64) -> Self {
+        self.watchdog_ms = super::clamp_timeout_ms(ms);
+        self
+    }
+
+    fn next_id(&self) -> u64 {
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 逐请求一次 `POST /api/v1/acp`（三头 + JSON-RPC 体；流策略由调用方给）
+    fn acp_post(
+        &self,
+        sess: &AcpSession,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+        policy: StreamPolicy,
+    ) -> Result<HttpResp, String> {
+        let body =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+                .to_string();
+        let resp = (self.http)(HttpReq {
+            method: "POST",
+            url: format!("{}{}", self.base, ACP_PATH),
+            headers: acp_headers(sess),
+            body: Some(body),
+            timeout_ms: policy.max_ms.max(SHORT_TIMEOUT_MS),
+            stream: policy,
+        });
+        if let Some(e) = &resp.error {
+            return Err(format!("{method} 请求未送达：{e}"));
+        }
+        Ok(resp)
+    }
+
+    /// `POST /api/v1/acp/connect`（**免鉴权**）→ 连接态
+    pub fn handshake(&self) -> Result<AcpSession, String> {
+        let resp = (self.http)(HttpReq {
+            method: "POST",
+            url: format!("{}{}", self.base, CONNECT_PATH),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: SHORT_TIMEOUT_MS,
+            stream: StreamPolicy::whole(SHORT_TIMEOUT_MS),
+        });
+        if let Some(e) = &resp.error {
+            return Err(format!("建连请求未送达：{e}"));
+        }
+        if !(200..300).contains(&resp.status) {
+            return Err(format!(
+                "建连 HTTP {}：{}",
+                resp.status,
+                normalize::summarize(&resp.body, normalize::AUDIT_SUMMARY_CHARS)
+            ));
+        }
+        let v: serde_json::Value = serde_json::from_str(resp.body.trim()).map_err(|e| {
+            format!(
+                "建连响应不是 JSON：{e}；体={}",
+                normalize::summarize(&resp.body, normalize::AUDIT_SUMMARY_CHARS)
+            )
+        })?;
+        let connection_id = v
+            .get("connectionId")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| {
+                "建连响应缺 connectionId（API 为逆向 bundle 所得，WorkBuddy 升级可能漂移）"
+                    .to_string()
+            })?;
+        let token = v
+            .get("sessionToken")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| {
+                "建连响应缺 sessionToken（同上：逆向 API 的版本漂移风险）".to_string()
+            })?;
+        Ok(AcpSession {
+            connection_id: connection_id.to_string(),
+            token: token.to_string(),
+        })
+    }
+
+    /// `initialize`（能力协商）
+    pub fn initialize(&self, sess: &AcpSession) -> Result<Capabilities, String> {
+        let id = self.next_id();
+        let params = serde_json::json!({
+            "protocolVersion": ACP_PROTOCOL_VERSION,
+            "clientInfo": {"name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")},
+            "clientCapabilities": {},
+        });
+        let policy = StreamPolicy {
+            max_ms: self.watchdog_ms,
+            idle_ms: CONTROL_IDLE_MS,
+            idle_unless_seen: None,
+            stop_on_id: Some(id),
+        };
+        let resp = self.acp_post(sess, id, "initialize", params, policy)?;
+        let result = rpc_result(id, &resp)
+            .map_err(|e| format!("initialize 被服务端拒绝：{e}"))?
+            .ok_or_else(|| {
+                "initialize 未拿到响应帧（探测定案：缺 Accept 头即 -32000）".to_string()
+            })?;
+        Ok(Capabilities {
+            protocol_version: result
+                .get("protocolVersion")
+                .and_then(|x| x.as_u64())
+                .map(|v| v as u32),
+            // 字段缺席 = 不支持（ACP 语义：loadSession 是可选能力）——保守判，不乐观默认
+            load_session: result
+                .get("agentCapabilities")
+                .and_then(|a| a.get("loadSession"))
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
+        })
+    }
+
+    /// 目标定位（initialize + `session/load` 或 `session/new`——臂由调用方按端点发现形态选定）
+    pub fn open_target(&self, sess: &AcpSession, sel: &SessionSel<'_>) -> Result<Target, String> {
+        let caps = self.initialize(sess)?;
+        match sel {
+            SessionSel::Active { session_id, cwd } => {
+                if !caps.load_session {
+                    return Err(
+                        "服务端 agentCapabilities.loadSession=false：活跃会话不可 session/load\
+                         （API 逆向所得，WorkBuddy 升级可能漂移）"
+                            .to_string(),
+                    );
+                }
+                let id = self.next_id();
+                let params = serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": [],
+                });
+                let policy = StreamPolicy {
+                    max_ms: self.watchdog_ms,
+                    idle_ms: CONTROL_IDLE_MS,
+                    idle_unless_seen: None,
+                    stop_on_id: Some(id),
+                };
+                let resp = self.acp_post(sess, id, "session/load", params, policy)?;
+                let result =
+                    rpc_result(id, &resp).map_err(|e| format!("session/load 被拒：{e}"))?;
+                let ev = read_stream(&resp.body);
+                // 无响应帧但**有回放证据**：属 best-effort（load 只作诊断，投递判定归 prompt）
+                if result.is_none()
+                    && !ev.session_end
+                    && ev.permission_mode.is_none()
+                    && ev.frames == 0
+                {
+                    return Err("session/load 未拿到响应帧也无回放证据".to_string());
+                }
+                Ok(Target {
+                    session_id: (*session_id).to_string(),
+                    created: false,
+                    load: Some(LoadOutcome {
+                        last_stop_reason: ev.stop_reason.clone(),
+                        permission_mode: ev.permission_mode.clone(),
+                        truncated: resp.stop != StreamStop::Complete,
+                    }),
+                })
+            }
+            SessionSel::New { cwd } => {
+                let id = self.next_id();
+                let params = serde_json::json!({ "cwd": cwd, "mcpServers": [] });
+                let policy = StreamPolicy {
+                    max_ms: self.watchdog_ms,
+                    idle_ms: CONTROL_IDLE_MS,
+                    idle_unless_seen: None,
+                    stop_on_id: Some(id),
+                };
+                let resp = self.acp_post(sess, id, "session/new", params, policy)?;
+                let result = rpc_result(id, &resp)
+                    .map_err(|e| format!("session/new 被拒：{e}"))?
+                    .ok_or_else(|| "session/new 未拿到响应帧".to_string())?;
+                let new_sid = result
+                    .get("sessionId")
+                    .and_then(|x| x.as_str())
+                    // 空串与缺席同拒（与 [`connect_ok`] 的非空纪律同构）——空号放行 =
+                    // 成功回执带不上投递会话（红线）
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "session/new 响应缺非空 sessionId".to_string())?;
+                Ok(Target {
+                    session_id: new_sid.to_string(),
+                    created: true,
+                    load: None,
+                })
+            }
+        }
+    }
+
+    /// 在已定位目标上投递 prompt（编排用：先取 load 证据再发）。
+    ///
+    /// 流策略是**诚实性的关键**：静默死线 60s（[`PHASE_DEADLINE_MS`]）且**只在从未出现
+    /// `agentPhase` 时生效**（已见 phase ⇒ 回合真的在跑，静默只受 watchdog 约束）；
+    /// 见到与本次 id 对应的响应帧（回合终点 `stopReason`）即收流。
+    pub fn prompt_on(
+        &self,
+        sess: &AcpSession,
+        target: &Target,
+        text: &str,
+    ) -> Result<PromptOutcome, String> {
+        let id = self.next_id();
+        let params = serde_json::json!({
+            "sessionId": target.session_id,
+            "prompt": [{"type": "text", "text": text}],
+        });
+        let policy = StreamPolicy {
+            max_ms: self.watchdog_ms,
+            idle_ms: PHASE_DEADLINE_MS,
+            idle_unless_seen: Some("agentPhase"),
+            stop_on_id: Some(id),
+        };
+        let resp = self.acp_post(sess, id, "session/prompt", params, policy)?;
+        rpc_result(id, &resp).map_err(|e| format!("session/prompt 被拒：{e}"))?;
+        let ev = read_stream(&resp.body);
+        Ok(PromptOutcome {
+            session_id: target.session_id.clone(),
+            first_phase: ev.first_phase(),
+            phases: ev.phases.clone(),
+            stop_reason: ev.stop_reason.clone(),
+            last_assistant: ev.assistant.clone(),
+            permission_mode: ev
+                .permission_mode
+                .clone()
+                .or_else(|| target.load.as_ref().and_then(|l| l.permission_mode.clone())),
+            stop: resp.stop,
+            evidence: ev,
+        })
+    }
+
+    /// 一次性便捷口（plan Step 1 原例形状）：initialize + 目标定位 + prompt
+    pub fn prompt(
+        &self,
+        sess: &AcpSession,
+        text: &str,
+        sel: SessionSel<'_>,
+    ) -> Result<PromptOutcome, String> {
+        let target = self.open_target(sess, &sel)?;
+        self.prompt_on(sess, &target, text)
+    }
+}
+
+// ============================================================
+// 判定与回执（纯核）
+// ============================================================
+
+/// prompt 流判定
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptVerdict {
+    /// 回合推进并拿到终点（响应帧 `stopReason`）
+    Completed { stop_reason: String },
+    /// 推进了但没拿到终点（`stop` 说明被谁掐断）——**不冒充成功**
+    Advanced { phase: String, stop: StreamStop },
+    /// 未推进（无 `agentPhase` 且无终点）⇒ **已结束需复活**（探测定案的静默挂形态）
+    RevivalNeeded { truncated: bool },
+    /// 明确失败（RPC 错误 / 传输错误）
+    Failed { detail: String },
+}
+
+/// 「需复活」回执文案骨架（plan Step 1 原例逐字意图：说清已结束 + 引导重开或新建）。
+/// 「已结束」是**从静默推断**（见 [`judge_prompt`]）——文案以「需复活语义」表达，不声称
+/// 服务端报告了会话终态。
+pub const REVIVAL_REASON: &str = "会话已结束（end_turn），需复活语义——ACP `session/prompt` 对已结束会话只接收不执行（接口语义，非鉴权）：请在 WorkBuddy 应用内重开该会话后再发，或走新建会话";
+
+/// 靶向词表共享片段（回执标注与审计双记同词表——两处格式串抽公共常量，防漂移）
+pub const TARGETING_PREFIX: &str = "已投递至 WorkBuddy 当前会话";
+/// 不一致明示语（M27/M28「不一致明示」判据的钉死文案——成功 / 已推进未确认 / 需复活
+/// 三态都必须可达，见 [`TargetingNote::mismatch`]）
+pub const MISMATCH_CLAUSE: &str = "消息已进入 APP 当前会话，与所选会话不同";
+
+/// new 臂靶向标注产物（Task 4b / M27·M28；设计 §5.2）。Windows 的 `session/new` 绑定
+/// **APP 当前活跃会话**（无视 cwd，探测定案 §3.3）——投递目标 ≠「卡面所选会话」是结构性
+/// 风险（WB-PROBE-OK 误投用户会话的先例转强制项），标注必须如实透出：
+/// - `full`（**成功回执专用**）：恒带「已投递至 WorkBuddy 当前会话（sessionId=…）」——
+///   **红线：没有 sessionId 的成功回执不允许出现**（session 字段与文案同源，双保险）；
+/// - `mismatch`（投递会话 ≠ 卡面会话时在场）：成功回执拼进 `full`；**已推进未确认
+///   （Advanced）/ 需复活（RevivalNeeded）两态同样必须带**（失败成因为主、明示语在后
+///   ——M28「不一致明示」三态可达，spec 审 Major 1）；Failed 态（RPC/传输失败，正文未必
+///   送达）不带明示语，投递会话号由回执 `session_id` 字段承载（`receipt_for` 的
+///   `with_session` 既有口径）。
+/// - **佐证措辞边界（spec 审 Minor 2）**：mismatch 在场时成功回执的「转写佐证未命中」
+///   注记换措辞——按（卡面 cwd, 投递会话号）查不到转写是**结构性的**（他会话的转写落在
+///   它自己的项目目录），不是「落盘滞后」（`receipt_for` 的 Completed 臂按此分叉）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetingNote {
+    /// 成功回执全文（恒带投递会话号；mismatch 时含「；注意：明示语」尾）
+    pub full: String,
+    /// 不一致明示语（投递会话 ≠ 卡面会话时在场）
+    pub mismatch: Option<&'static str>,
+}
+
+/// 组装 new 臂靶向标注（成功全文 + 不一致明示语；词表 = [`TARGETING_PREFIX`] /
+/// [`MISMATCH_CLAUSE`]，审计双记同词表）
+pub fn delivered_session_note(delivered_sid: &str, card_sid: &str) -> TargetingNote {
+    let mut full = format!("{TARGETING_PREFIX}（sessionId={delivered_sid}）");
+    let mismatch = (delivered_sid != card_sid).then_some(MISMATCH_CLAUSE);
+    if let Some(m) = mismatch {
+        full.push_str(&format!("；注意：{m}"));
+    }
+    TargetingNote { full, mismatch }
+}
+
+/// 未拿到终点的如实文案（**不冒充成功**）
+pub const UNCONFIRMED_REASON: &str =
+    "ACP 回合已推进但未拿到终点回执（流结束/被掐断）——请在 WorkBuddy 应用内确认结果后再决定是否重发";
+
+/// prompt 流判定（纯核）：
+/// - 显式 RPC 错误 → [`PromptVerdict::Failed`]；
+/// - 终点在场（`stopReason`）→ [`PromptVerdict::Completed`]；
+/// - 有 `agentPhase` 无终点 → [`PromptVerdict::Advanced`]（**不冒充成功**：watchdog 掐断
+///   记 timeout，流自己断了记 channel_error）；
+/// - **既无 `agentPhase` 也无终点 → [`PromptVerdict::RevivalNeeded`]**（探测定案的
+///   「已结束会话静默挂」形态；`truncated` = 是否由 60s 静默死线判出，供回执措辞）。
+///
+/// **这是「推断」而非「观测」（登记，Task 11 复审）**：ACP 不给「该会话已结束」的显式
+/// 信号（load 回放的 `session_end` 判不出活跃/已结束——跑完过一回合的会话回放都有它），
+/// 故「已结束」是**从静默推断**出来的：60s 内没有任何 `agentPhase`。措辞与回执据此如实
+/// 表达（「需复活语义」而非「服务端报告会话已结束」）。
+pub fn judge_prompt(out: &PromptOutcome) -> PromptVerdict {
+    if let Some(detail) = &out.evidence.rpc_error {
+        return PromptVerdict::Failed {
+            detail: detail.clone(),
+        };
+    }
+    if let Some(stop) = &out.stop_reason {
+        return PromptVerdict::Completed {
+            stop_reason: stop.clone(),
+        };
+    }
+    if out.advanced() {
+        return PromptVerdict::Advanced {
+            phase: out.first_phase.clone(),
+            stop: out.stop,
+        };
+    }
+    PromptVerdict::RevivalNeeded {
+        truncated: out.stop != StreamStop::Complete,
+    }
+}
+
+/// 转写佐证（`projects/` 落盘侦测；**二次确认**，不作唯一证据）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Corroboration {
+    /// 转写文件在场
+    pub present: bool,
+    /// mtime 相对回合前基线推进（主判据）
+    pub advanced: bool,
+    /// 尾部命中本次载荷标记（次级判据）
+    pub needle_hit: bool,
+    pub path: Option<PathBuf>,
+}
+
+impl Corroboration {
+    /// 是否已确认（两判据任一）
+    pub fn confirmed(&self) -> bool {
+        self.advanced || self.needle_hit
+    }
+}
+
+/// 载荷佐证标记（W4 尾签名优先——可读且稳定；无签名取正文前 16 字符）
+pub fn corroboration_needle(payload: &str) -> String {
+    match payload.rfind("[mobile ") {
+        Some(idx) => payload[idx..].trim_end().to_string(),
+        None => payload.trim().chars().take(16).collect(),
+    }
+}
+
+fn mtime_ms_of(path: &Path) -> Option<u64> {
+    path.metadata()
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+/// 转写 mtime（毫秒；文件不在/不可读 → None）。定位复用读侧
+/// `workbuddy_parser::find_session_jsonl`（**不另写转写定位**）
+pub fn transcript_mtime_ms(home: Option<&Path>, cwd: &str, session_id: &str) -> Option<u64> {
+    let path = crate::monitor::workbuddy_parser::find_session_jsonl(home?, cwd, session_id)?;
+    mtime_ms_of(&path)
+}
+
+/// 转写佐证（`projects/` 落盘侦测；**二次确认**，不作唯一证据——ACP 流的 `stopReason`
+/// 才是回合终点的主证据，转写可能滞后落盘）。
+/// 判据：mtime 相对回合前基线**推进**（主）∪ 尾部命中本次载荷标记（次，复用读侧
+/// `monitor::jsonl` 尾部读取——**不另写转写解析**）。
+pub fn corroborate(
+    home: Option<&Path>,
+    cwd: &str,
+    session_id: &str,
+    payload: &str,
+    baseline_mtime_ms: Option<u64>,
+) -> Corroboration {
+    let Some(home) = home else {
+        return Corroboration::default();
+    };
+    let Some(path) = crate::monitor::workbuddy_parser::find_session_jsonl(home, cwd, session_id)
+    else {
+        return Corroboration::default();
+    };
+    let now = mtime_ms_of(&path);
+    let advanced = match (baseline_mtime_ms, now) {
+        (Some(base), Some(now)) => now > base,
+        _ => false,
+    };
+    let needle = corroboration_needle(payload);
+    let needle_hit = !needle.is_empty()
+        && crate::monitor::jsonl::read_recent_lines(&path, 200)
+            .iter()
+            .any(|l| l.contains(&needle));
+    Corroboration {
+        present: true,
+        advanced,
+        needle_hit,
+        path: Some(path),
+    }
+}
+
+/// 回执归一（判定 + 转写佐证 → H6 回执）。**诚实铁律**：
+/// - 只有拿到回合终点（`stopReason`）才可能 `ok`——且转写佐证未命中时在 `reason` 里如实标注；
+/// - 未推进 → `failed(channel_error)` + [`REVIVAL_REASON`]（引导重开或新建）；
+/// - 推进但无终点 → watchdog 掐断记 `timeout`，流自己断了记 `channel_error`（都带未确认文案）；
+/// - **靶向标注（Task 4b / M27·M28）**：`targeting` = new 臂（Windows 单臂）的投递
+///   会话标注（[`delivered_session_note`] 产物，load 臂传 `None`）——成功（拿到终点）时
+///   `full` 进 `reason` 且排在最前（最要紧的诚实面：投到了哪个会话）；`mismatch` 明示语
+///   在 Advanced / RevivalNeeded 两态追加在失败成因**之后**（M28「不一致明示」三态可达，
+///   不稀释失败文案）；session 字段恒为**实际投递会话号**（`used`），**红线：没有
+///   sessionId 的成功回执不允许出现**。
+pub fn receipt_for(
+    sid: &str,
+    verdict: &PromptVerdict,
+    out: &PromptOutcome,
+    load: Option<&LoadOutcome>,
+    targeting: Option<&TargetingNote>,
+    corr: &Corroboration,
+    duration_ms: u64,
+) -> Receipt {
+    let used = if out.session_id.is_empty() {
+        sid
+    } else {
+        out.session_id.as_str()
+    };
+    match verdict {
+        PromptVerdict::Completed { stop_reason } => {
+            let mut r = Receipt::ok(used, duration_ms);
+            r.last_assistant = out
+                .last_assistant
+                .as_deref()
+                .map(|t| normalize::summarize(t, super::receipt::LAST_ASSISTANT_CHARS));
+            // 成功回执的 reason 组装顺序：靶向标注在前（投到了哪个会话），佐证状态在后
+            let mut notes: Vec<String> = Vec::new();
+            if let Some(t) = targeting {
+                notes.push(t.full.clone());
+            }
+            if !corr.confirmed() {
+                // mismatch 形态的措辞边界（TargetingNote doc）：按（卡面 cwd, 投递会话号）
+                // 查不到转写是结构性的（他会话的转写落在它自己的项目目录）——不是「落盘滞后」
+                let why = if targeting.and_then(|t| t.mismatch).is_some() {
+                    "投递至他会话，转写沿其项目目录另查"
+                } else {
+                    "转写落盘可能滞后"
+                };
+                notes.push(format!(
+                    "ACP 回合已结束（stopReason={stop_reason}），但 projects/ 转写佐证未命中\
+                     （{why}）——请在 WorkBuddy 应用内确认结果"
+                ));
+            }
+            if !notes.is_empty() {
+                r.reason = Some(notes.join("；"));
+            }
+            r
+        }
+        PromptVerdict::Advanced { phase, stop } => {
+            let (stage, how) = match stop {
+                StreamStop::Watchdog => (Stage::Timeout, "watchdog 到点掐断"),
+                _ => (Stage::ChannelError, "流已结束"),
+            };
+            let mut reason = format!("{UNCONFIRMED_REASON}（{how}；已见 agentPhase={phase}）");
+            // M28 三态可达（spec 审 Major 1）：不一致明示语追加在失败成因之后（失败成因
+            // 为主，不稀释；不带成功全文标注）
+            if let Some(m) = targeting.and_then(|t| t.mismatch) {
+                reason.push_str(&format!("；注意：{m}"));
+            }
+            Receipt::failed(stage, &reason)
+                .with_session(used)
+                .with_duration_ms(duration_ms)
+        }
+        PromptVerdict::RevivalNeeded { truncated } => {
+            let obs = if *truncated {
+                "prompt 后 60s 内无 agentPhase 事件（探测定案的静默挂形态）"
+            } else {
+                "prompt 流内始终没有 agentPhase 事件"
+            };
+            let prev = load
+                .and_then(|l| l.last_stop_reason.as_deref())
+                .map(|s| format!("；load 回放显示末回合 stopReason={s}"))
+                .unwrap_or_default();
+            let mut reason = format!("{obs}{prev}；{REVIVAL_REASON}");
+            // M28 三态可达（spec 审 Major 1）：不一致明示语追加在失败成因之后（同上）
+            if let Some(m) = targeting.and_then(|t| t.mismatch) {
+                reason.push_str(&format!("；注意：{m}"));
+            }
+            Receipt::failed(Stage::ChannelError, &reason)
+                .with_session(used)
+                .with_duration_ms(duration_ms)
+        }
+        PromptVerdict::Failed { detail } => Receipt::failed(
+            Stage::ChannelError,
+            &format!("WorkBuddy ACP 投递失败：{detail}"),
+        )
+        .with_session(used)
+        .with_duration_ms(duration_ms),
+    }
+}
+
+/// 审计 result 词的靶向双记（Task 4b / M27·M28，设计 §5.2「审计标注」/ §10 风险 5）。
+///
+/// 审计行的 session 列 = **卡面会话**（设备检索入口语义：用户对哪张卡做了动作——由
+/// `HeadlessAuditCtx.session_id` 单点产生，不动）；Windows new 臂的实际投递会话可能 ≠ 卡面
+/// ⇒ **不一致时把投递 sessionId 双记进 result 词**（session 列保留卡面视角，result 词补
+/// 投递视角——两个会话都可追溯，不二选一）。一致 / 投递号缺席（排队、拒绝类回执）⇒ 原词
+/// 零变化（session 列已是投递会话或本就没有投递发生）。调用点 = api.rs `run_wb_turn` 的
+/// 回合终结审计（文案与回执标注 [`delivered_session_note`] 同词表）。
+pub fn audit_word_with_targeting(word: &str, card_sid: &str, delivered_sid: &str) -> String {
+    if delivered_sid.is_empty() || delivered_sid == card_sid {
+        return word.to_string();
+    }
+    format!("{word}（{TARGETING_PREFIX} sessionId={delivered_sid}，{MISMATCH_CLAUSE}）")
+}
+
+// ============================================================
+// 单回合编排（Task 6/9 底座的唯一消费入口）
+// ============================================================
+
+/// 回合参数（自有数据——`spawn_blocking` 闭包要求 `'static`）
+#[derive(Debug, Clone)]
+pub struct WbTurnArgs {
+    /// MAM 会话号
+    pub sid: String,
+    /// 会话项目目录（ACP `session/load`/`new` 的 cwd）
+    pub project: String,
+    /// W4 组装后的最终载荷（审计 content 与 ACP prompt 同源）
+    pub payload: String,
+    /// 会话宿主 pid（0 = 无宿主：db 源哨兵卡）
+    pub pid: u32,
+}
+
+/// 编排依赖（**全注入**：探针 / HTTP 缝 / 转写 home / 名额 / watchdog）
+pub struct WbDeps {
+    /// 全局并发名额（**生产 = [`super::runner::global_sem`]**——不自建 `GlobalSem`）
+    pub sem: GlobalSem,
+    /// 回合 watchdog（生产 = H4 设置经 `headless::runner_from_conn` 读取）
+    pub watchdog_ms: u64,
+    pub probe: EndpointProbe,
+    /// **唯一 IO 出口**
+    pub http: HttpSeam,
+    /// 转写 home（测试注入 tempdir/None，**绝不触真实 `~/.workbuddy`**）
+    pub home: Option<PathBuf>,
+}
+
+/// 回合结局
+#[derive(Debug, Clone, PartialEq)]
+pub struct WbTurnOutcome {
+    pub receipt: Receipt,
+    /// 端点发现结论（未起跑 = None）
+    pub endpoint: Option<EndpointDiscovery>,
+    /// prompt 流判定（未起跑 = None）
+    pub verdict: Option<PromptVerdict>,
+    pub corroboration: Corroboration,
+}
+
+impl WbTurnOutcome {
+    /// 未起跑（排队/拒绝）的结局
+    fn not_started(receipt: Receipt) -> Self {
+        Self {
+            receipt,
+            endpoint: None,
+            verdict: None,
+            corroboration: Corroboration::default(),
+        }
+    }
+}
+
+/// 未起跑/失败的结局（端点结论照带——回执可诊断）
+fn failed_outcome(
+    sid: &str,
+    discovery: &EndpointDiscovery,
+    detail: String,
+    duration_ms: u64,
+) -> WbTurnOutcome {
+    WbTurnOutcome {
+        receipt: Receipt::failed(Stage::ChannelError, &detail)
+            .with_session(sid)
+            .with_duration_ms(duration_ms),
+        endpoint: Some(discovery.clone()),
+        verdict: None,
+        corroboration: Corroboration::default(),
+    }
+}
+
+/// 单回合编排（**同步**：HTTP 缝是阻塞的，调用方必须放 `spawn_blocking`——绝不在
+/// async 运行时线程上阻塞）。顺序：并发名额 → 端点发现 → connect → initialize →
+/// 形态分派（load/new）→ prompt → 判定 → 转写佐证 → 回执。
+///
+/// **取消**：本通道不武装取消靶子（见模块文档）——槽位由[`super::turn::TurnRegistry`]
+/// 持有作会话串行锁，取消端点对 WB 回合如实报「未送达」。
+pub fn run_turn(args: &WbTurnArgs, deps: &WbDeps) -> WbTurnOutcome {
+    let started = Instant::now();
+    let elapsed = |t: &Instant| t.elapsed().as_millis() as u64;
+    // ① 全局并发名额（H4：**不自建 `GlobalSem`**；超额即时排队回执，不阻塞、不静默丢）
+    let Some(_permit) = deps.sem.try_acquire() else {
+        return WbTurnOutcome::not_started(
+            Receipt::concurrency_full(deps.sem.cap()).with_session(&args.sid),
+        );
+    };
+    // ② 端点发现（心跳 → 端口指纹 → **如实不可用**；不可用 = 投递前拒绝、零 HTTP）
+    let discovery = discover_endpoint(&deps.probe, &deps.http, &args.sid, args.pid);
+    let Some(url) = discovery.url().map(str::to_string) else {
+        let reason = match &discovery {
+            EndpointDiscovery::Unavailable { reason } => reason.clone(),
+            EndpointDiscovery::Found { .. } => String::new(),
+        };
+        return WbTurnOutcome::not_started(
+            Receipt::failed(Stage::Refused, &reason).with_session(&args.sid),
+        );
+    };
+    // ③ ACP 全链（connect → initialize → 形态分派 → prompt）
+    let client = AcpClient::new(&url, deps.http.clone()).watchdog_ms(deps.watchdog_ms);
+    let sess = match client.handshake() {
+        Ok(s) => s,
+        Err(e) => {
+            return failed_outcome(
+                &args.sid,
+                &discovery,
+                format!("WorkBuddy ACP 建连失败（{url}）：{e}"),
+                elapsed(&started),
+            )
+        }
+    };
+    // 形态分派（Task 4b / M27·M28，设计 §5.2）：投递臂由**端点发现形态**决定——端口指纹
+    // （Windows 形态）⇒ new+prompt **单臂**（`session/load` 恒 writer_occupied 结构性不可用；
+    // `session/new` 绑定 APP 当前活跃会话〔无视 cwd〕，探测定案 §3.3）；心跳（Mac 形态）⇒
+    // 既有 load+prompt 双臂**不动**。不写 tool/version 判断——形态即分派依据。
+    let new_arm = matches!(
+        &discovery,
+        EndpointDiscovery::Found {
+            source: EndpointSource::PortFingerprint { .. },
+            ..
+        }
+    );
+    let sel = if new_arm {
+        SessionSel::New { cwd: &args.project }
+    } else {
+        SessionSel::Active {
+            session_id: &args.sid,
+            cwd: &args.project,
+        }
+    };
+    let target = match client.open_target(&sess, &sel) {
+        Ok(t) => t,
+        Err(e) => {
+            return failed_outcome(
+                &args.sid,
+                &discovery,
+                format!("WorkBuddy ACP 目标定位失败（会话 {}）：{e}", args.sid),
+                elapsed(&started),
+            )
+        }
+    };
+    // 转写基线（回合**前**读一次：佐证判「推进」）
+    let baseline = transcript_mtime_ms(deps.home.as_deref(), &args.project, &target.session_id);
+    let out = match client.prompt_on(&sess, &target, &args.payload) {
+        Ok(o) => o,
+        Err(e) => {
+            return failed_outcome(
+                &args.sid,
+                &discovery,
+                format!("WorkBuddy ACP 投递失败（会话 {}）：{e}", target.session_id),
+                elapsed(&started),
+            )
+        }
+    };
+    let verdict = judge_prompt(&out);
+    let corr = corroborate(
+        deps.home.as_deref(),
+        &args.project,
+        &target.session_id,
+        &args.payload,
+        baseline,
+    );
+    // 靶向标注（仅 new 臂）：实际投递 sessionId + 与卡面不一致明示（M27/M28 判据面——
+    // 成功全文 + 三态可达的明示语，见 [`TargetingNote`]）；load 臂无此面（投递目标本来就是
+    // 卡面所选会话）
+    let targeting = if new_arm {
+        Some(delivered_session_note(&target.session_id, &args.sid))
+    } else {
+        None
+    };
+    let receipt = receipt_for(
+        &args.sid,
+        &verdict,
+        &out,
+        target.load.as_ref(),
+        targeting.as_ref(),
+        &corr,
+        elapsed(&started),
+    );
+    WbTurnOutcome {
+        receipt,
+        endpoint: Some(discovery),
+        verdict: Some(verdict),
+        corroboration: corr,
+    }
+}
+
+/// 生产/测试装配（**测试构建零网络零真实进程表**：缝全部来自 [`test_hooks`]——
+/// 默认探针「无心跳/无 WB 进程」、默认 HTTP「任何请求传输失败」，故端点用例只能走到
+/// 如实的「端点不可用」拒绝，**绝不落真网络**）。
+///
+/// 生产心跳读口 = `monitor::workbuddy_parser::heartbeat_snapshot`（`home` 为 None 时恒 None
+/// ——连心跳文件都不读）；端口指纹只在 Windows 走（探测定案的平台差异）。
+pub fn deps_for(
+    os: &'static str,
+    home: Option<PathBuf>,
+    watchdog_ms: u64,
+    sem: GlobalSem,
+) -> WbDeps {
+    #[cfg(test)]
+    {
+        WbDeps {
+            sem,
+            watchdog_ms,
+            probe: test_hooks::probe(os),
+            http: test_hooks::http(),
+            home,
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let hb_home = home.clone();
+        WbDeps {
+            sem,
+            watchdog_ms,
+            probe: EndpointProbe {
+                os,
+                heartbeat: Box::new(move |pid| {
+                    hb_home.as_deref().and_then(|h| {
+                        crate::monitor::workbuddy_parser::heartbeat_snapshot(h, pid, now_ms())
+                    })
+                }),
+                wb_pids: Box::new(production_wb_pids),
+                listening_ports: Box::new(production_listening_ports),
+            },
+            http: production_http_seam(),
+            home,
+        }
+    }
+}
+
+// ============================================================
+// 流扫描器（纯核：喂块 + 现算时钟）——生产缝读取循环与单测共用
+// ============================================================
+
+/// 已收流正文的**保留上限**（字节；超限只保留尾部窗口）。
+///
+/// **为什么是尾部、为什么这样切不丢判定原料**（评审 I11）：
+/// - 响应帧（JSON-RPC 结果）在**回合末尾**才到 ⇒ 恒在尾部窗口内；
+/// - assistant 摘要原料 = 回执 `lastAssistant` 那一刀（[`ASSISTANT_ACCUM_CAP_CHARS`] ≈ 800
+///   字符 ≈ 3 KB）取自正文**尾巴** ⇒ 恒在窗口内；
+/// - 判定本身（响应帧识别 / needle 命中 / 静默活性）走**增量状态**（见 [`StreamScanner`]），
+///   **不读窗口内容** ⇒ 驱逐只决定「交给下游 `read_stream` 的文本尾巴有多长」；
+/// - 1 MiB = 现实单帧（KB 级）的数十倍：失控流的内存从「GB 级」压到 1 MiB 级。
+///
+/// **如实登记的边界**：超限时头部帧被丢弃（早期 `agentPhase` / `session_end` 之类早期证据
+/// 不再出现在 `body()` 里）——判定（响应帧识别 / needle 命中 / 停因）不受影响，但下游
+/// `read_stream` 看到的 `phases` 会从窗口内第一帧起算（`Advanced` 回执的 phase 佐证在
+/// **超长流**上因此退化为较晚的 phase，不掩盖）。
+pub const STREAM_BODY_CAP_BYTES: usize = 1024 * 1024;
+
+/// 单条 SSE **行**（[`SseFrames::line`] 未闭合行缓冲）的长度上限（字节；评审 N1）。
+///
+/// 为什么需要：[`STREAM_BODY_CAP_BYTES`] 只裁 `StreamScanner::body` 窗口，[`SseFrames`]
+/// 自己的行缓冲若无上限，「单条**不收束**的巨型 `data:` 行按小块到达」会把内存吃到流长
+/// （watchdog 600s 内无界）。超限即**丢续字节 + 如实计噪音**（[`SseFrames::noise`]，
+/// 对齐 unknown 行口径——不许静默吞），该行整体作废：判定原料（响应帧）是 KB 级，
+/// 超过 1 MiB 的单行不可能是它。量级同 [`STREAM_BODY_CAP_BYTES`]，独立常量便于单独调。
+const SSE_LINE_CAP_BYTES: usize = 1024 * 1024;
+
+/// 当前帧 `data:` 载荷（[`SseFrames::data`] 未派发载荷缓冲）的长度上限（字节；评审 N1）。
+///
+/// 与 [`SSE_LINE_CAP_BYTES`] 分开设：data 载荷是**多行拼接**的（每行不超行上限，总量
+/// 可以超）——「行有界」推不出「帧载荷有界」。超限即丢续行 + 如实计噪音（空行派发时
+/// [`SseFrames::flush`] 一次性结算），语义同上：病态帧作废，不掩盖任何判定。
+const SSE_DATA_CAP_BYTES: usize = 1024 * 1024;
+
+/// 「乐观尾判」（[`SseFrames::sniff_pending`]）的重试解析上限（字节；评审 N1 的 CPU 界）。
+///
+/// sniff 是「提前一拍认」的优化：未收束的响应帧**已是完整 JSON** 就当拍回调——收束空行
+/// 一到，`take_line`/`flush` 照常全量解析 ⇒ 跳过只丢提前量、不丢判定。现实响应帧 KB 级，
+/// 64 KiB 是其数十倍余量；超过它的 pending 不可能是「马上收束的响应帧」，而每块对它重试
+/// JSON 解析正是二次方成本的来源（病态流 F、块 C ⇒ ≈ F²/2C 的扫描量）。
+const SNIFF_PENDING_CAP_BYTES: usize = 64 * 1024;
+
+/// `data:` 载荷行标记（字节判据用；注释帧 `: heartbeat` 不含它 ⇒ 不算活性）
+const DATA_MARKER: &[u8] = b"data:";
+
+/// SSE 流扫描器：**判定何时停**（响应帧 / 静默死线 / watchdog 上限）。
+///
+/// 「数据帧」判据 = 块里出现 `data:` 载荷行——**注释帧 `: heartbeat` 不算**（探测定案里
+/// 「已结束会话」的流正是「200 + 心跳但回合不推进」，若把心跳当活性就会永远等下去）。
+///
+/// **逐块成本（评审 I11）**：每块只做 ① 字节级 `data:` 探测 ② needle 增量扫描（命中即锁存）
+/// ③ [`SseFrames`] **增量**喂入 + 未派发尾部乐观判——**不再每块全量重解析 body**
+/// （旧口径是每 push 一次整段 `parse_frames`：ΣO(body) ≈ O(流长²/块长)，且 body 无上限增长）。
+pub struct StreamScanner {
+    policy: StreamPolicy,
+    /// 已收流正文（**有界**：超 [`STREAM_BODY_CAP_BYTES`] 只留尾部窗口——见该常量）
+    body: String,
+    /// 行级增量帧解析器（与 [`parse_frames`] 同源）
+    frames: SseFrames,
+    /// needle 增量扫描的**跨块重叠窗口**（≤ needle.len()-1 字节）：不依赖 `body` 窗口，
+    /// 故超限驱逐不影响命中判定
+    needle_overlap: Vec<u8>,
+    seen_needle: bool,
+    started_ms: u64,
+    last_data_ms: u64,
+    stop: Option<StreamStop>,
+}
+
+impl StreamScanner {
+    pub fn new(policy: StreamPolicy, now_ms: u64) -> Self {
+        Self {
+            policy,
+            body: String::new(),
+            frames: SseFrames::default(),
+            needle_overlap: Vec::new(),
+            seen_needle: false,
+            started_ms: now_ms,
+            last_data_ms: now_ms,
+            stop: None,
+        }
+    }
+
+    /// 喂入一块（返回 `true` = 已达停止条件）
+    pub fn push(&mut self, chunk: &str, now_ms: u64) -> bool {
+        self.note_data(chunk, now_ms);
+        self.scan_needle(chunk);
+        self.body.push_str(chunk);
+        self.trim_window();
+        self.scan_frames(chunk);
+        self.check_deadlines(now_ms)
+    }
+
+    /// 收尾（**流结束/死线到点时调用一次**）：结算尾部半行与未派发载荷——旧口径每拍 parse
+    /// 都在输入末尾 flush，这里把最后一拍落在收流处；不结算会漏掉「紧跟流尾、无空行收束」
+    /// 的响应帧（旧口径认得出来，新口径必须同样认得出来）
+    pub fn finish(&mut self, now_ms: u64) -> bool {
+        let id = self.policy.stop_on_id;
+        let mut hit = false;
+        self.frames.finish(&mut |f| {
+            if id.is_some_and(|id| frame_is_response(&f, id)) {
+                hit = true;
+            }
+        });
+        if hit {
+            self.stop = Some(StreamStop::Complete);
+        }
+        self.check_deadlines(now_ms)
+    }
+
+    /// 活性：本块含 `data:` 载荷行才推进静默计时（注释帧不算——见类型文档）。
+    /// **字节判据**与旧 `chunk.contains("data:")` 等价：UTF-8 自同步，多字节序列的每个字节
+    /// 都 ≥ 0x80，切不出 ASCII 针（块边界按字符切齐后，块内 ASCII 针的出现集合逐一相同）
+    fn note_data(&mut self, chunk: &str, now_ms: u64) {
+        if contains_bytes(chunk.as_bytes(), DATA_MARKER) {
+            self.last_data_ms = now_ms;
+        }
+    }
+
+    /// needle 增量扫描（`idle_unless_seen`；**命中即锁存**，其后零成本）：只看「本块 + 上一块
+    /// 尾部 needle.len()-1 字节」——任何跨块的针都落在重叠窗内，与旧的 `body.contains(needle)`
+    /// 逐字等价（更早的字节已判过「起不出针」）
+    fn scan_needle(&mut self, chunk: &str) {
+        if self.seen_needle {
+            return;
+        }
+        let Some(needle) = self.policy.idle_unless_seen else {
+            return;
+        };
+        let needle = needle.as_bytes();
+        self.needle_overlap.extend_from_slice(chunk.as_bytes());
+        if contains_bytes(&self.needle_overlap, needle) {
+            self.seen_needle = true;
+            self.needle_overlap.clear(); // 锁存后不再需要窗口
+            return;
+        }
+        let keep = needle.len().saturating_sub(1);
+        if self.needle_overlap.len() > keep {
+            let drop = self.needle_overlap.len() - keep;
+            self.needle_overlap.drain(..drop);
+        }
+    }
+
+    /// 尾部窗口（评审 I11 的内存界）：超限即从**头部**驱逐（帧边界优先，其次字符边界）——
+    /// 判定原料都在尾部与锁存状态里，故驱逐不影响任何判定（见 [`STREAM_BODY_CAP_BYTES`]）
+    fn trim_window(&mut self) {
+        if self.body.len() > STREAM_BODY_CAP_BYTES {
+            let cut = window_cut(&self.body, STREAM_BODY_CAP_BYTES);
+            self.body.drain(..cut);
+        }
+    }
+
+    /// 帧判定（**增量**）：只喂新到的块 + 对「未派发尾部」做一次乐观判——响应帧一到即停，
+    /// 不再每块重解析整个 body（评审 I11）
+    fn scan_frames(&mut self, chunk: &str) {
+        if self.stop.is_some() {
+            return;
+        }
+        let Some(id) = self.policy.stop_on_id else {
+            return;
+        };
+        let mut hit = false;
+        self.frames
+            .feed(chunk, &mut |f| hit |= frame_is_response(&f, id));
+        // 旧口径「每拍 parse 都在末尾 flush」的等价拍：未以空行收束的响应帧当拍就认
+        self.frames
+            .sniff_pending(&mut |f| hit |= frame_is_response(&f, id));
+        if hit {
+            self.stop = Some(StreamStop::Complete);
+        }
+    }
+
+    /// 时钟推进（无数据的等待期；返回 `true` = 已达停止条件）
+    pub fn tick(&mut self, now_ms: u64) -> bool {
+        self.check_deadlines(now_ms)
+    }
+
+    fn check_deadlines(&mut self, now_ms: u64) -> bool {
+        if self.stop.is_some() {
+            return true;
+        }
+        // 静默死线：仅在「从未见到 idle_unless_seen」时提前停（已见 ⇒ 回合在跑，
+        // 静默只受 max_ms 约束）
+        let idle_applies = self.policy.idle_unless_seen.is_none() || !self.seen_needle;
+        if self.policy.idle_ms > 0
+            && idle_applies
+            && now_ms.saturating_sub(self.last_data_ms) >= self.policy.idle_ms
+        {
+            self.stop = Some(StreamStop::Idle);
+            return true;
+        }
+        if now_ms.saturating_sub(self.started_ms) >= self.policy.max_ms {
+            self.stop = Some(StreamStop::Watchdog);
+            return true;
+        }
+        false
+    }
+
+    /// 距下一个死线的剩余预算（毫秒；生产缝的 `timeout` 用它——**永不返回 0**）
+    pub fn next_budget_ms(&self, now_ms: u64) -> u64 {
+        let mut budget = self
+            .policy
+            .max_ms
+            .saturating_sub(now_ms.saturating_sub(self.started_ms));
+        let idle_applies = self.policy.idle_unless_seen.is_none() || !self.seen_needle;
+        if self.policy.idle_ms > 0 && idle_applies {
+            budget = budget.min(
+                self.policy
+                    .idle_ms
+                    .saturating_sub(now_ms.saturating_sub(self.last_data_ms)),
+            );
+        }
+        budget.max(1)
+    }
+
+    pub fn stop(&self) -> StreamStop {
+        self.stop.unwrap_or(StreamStop::Complete)
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+/// 该帧是否本次请求的**响应帧**（`id` 匹配且带 `result`/`error`——回合终点）。
+/// 旧的整段判据 `response_frame_present` 与本函数同义，只是喂入方式不同（整段 vs 增量）。
+fn frame_is_response(f: &serde_json::Value, id: u64) -> bool {
+    f.get("id").and_then(|x| x.as_u64()) == Some(id)
+        && (f.get("result").is_some() || f.get("error").is_some())
+}
+
+/// 字节级子串包含（**纯函数**）：与 `str::contains` 对同一段 UTF-8 文本**逐字节等价**
+/// （UTF-8 自同步：多字节序列的每个字节都 ≥ 0x80，不会切出 ASCII 针）
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// 字符边界对齐（**纯函数**）：返回 ≥ `idx` 的第一个 UTF-8 字符边界（越界给 `len`）
+fn utf8_boundary_at_or_after(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// 窗口切点（**纯函数**）：返回「只保留尾部 `keep` 字节」时该从头部丢掉的字节数。
+/// 切点优先落在**帧边界**（最近一个空行之后；`\r\n\r\n` 的末两字节同样是 `\n\n`）——下游
+/// `read_stream` 拿到的尾巴因此以完整帧开头，不会平白多出半个帧的噪音行；找不到空行
+/// （单帧本身就超窗）则退化为**字符边界**对齐（免得窗口头部被切出半个多字节字符、解码成
+/// U+FFFD）。两种切法都只影响交给下游的文本，不影响任何判定（见 [`STREAM_BODY_CAP_BYTES`]）。
+fn window_cut(body: &str, keep: usize) -> usize {
+    // `len - keep` 可能落在多字节字符中间：先对齐（切片不能劈字符）
+    let raw = utf8_boundary_at_or_after(body, body.len().saturating_sub(keep));
+    body[..raw].rfind("\n\n").map_or(raw, |idx| idx + 2)
+}
+
+#[cfg(not(test))]
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// **共享 HTTP 客户端（进程内单例）**：`reqwest::Client` 自带连接池与 TLS 配置，
+/// 逐请求重建 = 每次请求丢一次池子（本缝的打点是**本机回环**、控制面请求密集，
+/// 旧的 `production_http_seam` 正是逐请求重建）。构建失败只发生一次并**缓存**该失败
+/// （`Result` 进 `LazyLock`：不把一次配置错误变成每个请求重复付的代价）。
+///
+/// # `.no_proxy()`（P0 安全：**回环流量绝不走系统代理**）
+/// `Cargo.toml` 开了 reqwest 的 `system-proxy` feature ⇒ 默认会读系统代理。本缝只打
+/// 回环 ACP 端点（`127.0.0.1:<port>`），走代理是**双重风险**：
+/// ① `acp-session-token` / `acp-connection-id` 头会随 CONNECT/请求交给代理进程（凭据外泄）；
+/// ② 代理若到不了 `127.0.0.1`（企业代理很常见），通道直接死。
+///
+/// # `.redirect(Policy::none())`（P0 安全：**回环凭据绝不随 30x 外发**）
+/// reqwest 默认跟随最多 10 跳，且跨 host 重定向只剥 `Authorization`/`Cookie` 族头——本缝的
+/// 自定义凭据头 `acp-session-token` / `acp-connection-id` **不在**其列，会被原样带给重定向
+/// 目标，违反「凭据不出回环」威胁模型；而本缝只打 `127.0.0.1:<port>`，30x 在这里**没有**
+/// 任何合法语义（一跳都不该跟）。**为什么只能靠注释锚**：`reqwest::Client` 不暴露 policy
+/// getter（构造后取不回来），单测无从断言「这个 client 不跟随重定向」——故此处以注释为锚，
+/// 删改这段 Builder 即为回归（别为了写用例去改生产 API：门开在测试侧就再也关不上）。
+///
+/// # 与 `remote::tunnel` 的**对比**（后来者勿「统一」两处客户机构建）
+/// `remote::tunnel` 下的是 **GitHub 资产（广域网）**，它**故意**走系统代理——用户在企业网里
+/// 常只有那条路能出去；本缝是**回环**，显式无代理是纪律、不是遗漏。两处 builder 形状相近
+/// 而**代理语义相反**，合并会同时弄坏两边（一边泄凭据、一边断下载）。
+#[cfg(not(test))]
+fn acp_http_client() -> &'static Result<reqwest::Client, String> {
+    static CLIENT: std::sync::LazyLock<Result<reqwest::Client, String>> =
+        std::sync::LazyLock::new(|| {
+            reqwest::Client::builder()
+                // 回环专用：**不读系统代理**（见上方对比说明）
+                .no_proxy()
+                // 回环专用：**不跟随重定向**（见上方 30x 说明；默认 10 跳会让自定义凭据头外发）
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_millis(CLIENT_CONNECT_TIMEOUT_MS))
+                .build()
+                .map_err(|e| format!("HTTP 客户端构建失败: {e}"))
+        });
+    &CLIENT
+}
+
+/// 生产 HTTP 缝（reqwest：rustls + **no_proxy**，与 `remote::tunnel` 的
+/// 「rustls + system-proxy」**形状相近而代理语义相反**——详见 [`acp_http_client`]）。
+///
+/// **`cfg(not(test))`**：测试构建里本函数不存在 ⇒ 单测无法触达真实网络（宪法级纪律）。
+/// **代价（如实申报）**：本缝因此**无法单测**——它的验证面 = 代码评审 + Task 15 的
+/// M7/M8 实机用例（WB 卡收发）。别为了能写用例而放宽这道门。
+/// **同步外壳**（house style）：调用方在 `spawn_blocking` 线程上跑，故此处
+/// `tauri::async_runtime::block_on` 单次执行一条请求；流式响应用 [`StreamScanner`]
+/// 逐块判停（`Response::chunk` 不需要 reqwest 的 `stream` feature——**不新增依赖**）。
+#[cfg(not(test))]
+pub fn production_http_seam() -> HttpSeam {
+    Arc::new(|req: HttpReq| {
+        // 单例客户端（`.no_proxy()` 已在此定死；逐请求只调总量超时）
+        let client = match acp_http_client() {
+            Ok(c) => c,
+            Err(e) => return HttpResp::transport_error(e),
+        };
+        tauri::async_runtime::block_on(async move {
+            let mut rb = client
+                .request(
+                    reqwest::Method::from_bytes(req.method.as_bytes())
+                        .unwrap_or(reqwest::Method::GET),
+                    &req.url,
+                )
+                // 逐请求总量超时（含连接）：连接超时是**客户端级**配置（不可逐请求），
+                // 故连接界由「客户端 connect_timeout 与本次总量超时取小」决定
+                .timeout(std::time::Duration::from_millis(req.timeout_ms.max(1_000)));
+            for (k, v) in &req.headers {
+                rb = rb.header(k.as_str(), v.as_str());
+            }
+            if let Some(body) = &req.body {
+                rb = rb.body(body.clone());
+            }
+            let mut resp = match rb.send().await {
+                Ok(r) => r,
+                Err(e) => return HttpResp::transport_error(&format!("{e}")),
+            };
+            let status = resp.status().as_u16();
+            if req.stream.idle_ms == 0 && req.stream.stop_on_id.is_none() {
+                return match resp.text().await {
+                    Ok(body) => HttpResp {
+                        status,
+                        body,
+                        stop: StreamStop::Complete,
+                        error: None,
+                    },
+                    Err(e) => HttpResp::transport_error(&format!("读响应体失败: {e}")),
+                };
+            }
+            let mut scanner = StreamScanner::new(req.stream, now_ms());
+            // 字节 → 文本的切分器（纯核；跨 chunk 的多字节字符在这里拼齐，见
+            // [`Utf8ChunkAssembler`]——本缝 `cfg(not(test))` 不可单测，逻辑必须留在纯核里）
+            let mut asm = Utf8ChunkAssembler::default();
+            loop {
+                let budget = scanner.next_budget_ms(now_ms());
+                match tokio::time::timeout(std::time::Duration::from_millis(budget), resp.chunk())
+                    .await
+                {
+                    // 静默/上限死线到点：如实标注停因（**不冒充收流完整**）
+                    Err(_) => {
+                        scanner.tick(now_ms().saturating_add(budget));
+                        break;
+                    }
+                    Ok(Ok(None)) => break, // 流自然结束
+                    Ok(Ok(Some(chunk))) => {
+                        // 只喂**字符边界对齐**的文本：reqwest `chunk()` 的字节边界是任意的，
+                        // 逐块 `from_utf8_lossy`（旧口径）会把跨块的多字节字符两侧各打成
+                        // U+FFFD ⇒ 回执 `lastAssistant` 乱码（M7/M8 实机路径）
+                        if asm.feed_scanner(&chunk, &mut scanner, now_ms()) {
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) => return HttpResp::transport_error(&format!("流读取失败: {e}")),
+                }
+            }
+            // 收尾：残留的半行/真被截断的尾字节一次性结算（**如实 lossy**，不假装修齐）——
+            // 旧口径每拍 parse 都在末尾 flush，这里补上最后一拍（漏掉会丢「紧跟流尾的响应帧」）
+            if let Some(tail) = asm.flush_tail() {
+                scanner.push(&tail, now_ms());
+            }
+            scanner.finish(now_ms());
+            HttpResp {
+                status,
+                body: scanner.body().to_string(),
+                stop: scanner.stop(),
+                error: None,
+            }
+        })
+    })
+}
+
+// ============================================================
+// 生产缝的「原始字节 → 字符边界对齐文本」切分（纯核；缝与单测同源）
+// ============================================================
+
+/// **UTF-8 块累积器**（纯核、无 IO）：按**原始字节**累积，只在**字符边界**切分——跨 chunk
+/// 的多字节字符（中文/emoji）留在 `pending` 里等下一块拼齐，绝不两侧各变 U+FFFD。
+///
+/// 为什么必须如此（评审 I10）：reqwest `Response::chunk()` 的字节边界是**任意**的（TCP 分段、
+/// 代理缓冲、TLS 记录都在切），旧缝对每块单独 `String::from_utf8_lossy` ⇒ 被切开的汉字两侧
+/// 各出一个 U+FFFD，回执 `lastAssistant` 因此乱码——而该缝 `cfg(not(test))` **按设计不可单测**
+/// （M7/M8 实机验收路径）。所以切分逻辑放在纯核里，生产缝与用例调用的是**同一个**
+/// [`Self::feed_scanner`]（缝的循环体就是那一行），不存在「测一套、跑一套」。
+///
+/// `pending` 至多 3 字节（一个 UTF-8 字符最多 4 字节）：`from_utf8` 的 `error_len() = None`
+/// 只表示「输入在字符中间**截断**」⇒ 尾巴留着等下一块；`error_len() = Some(n)` 是**真非法**
+/// 序列 ⇒ 立刻 lossy 如实标注并推进（**不能攒**：真非法字节永远等不到拼齐，会无界堆积）。
+#[derive(Default)]
+pub(crate) struct Utf8ChunkAssembler {
+    /// 上一块切剩的半个字符（≤ 3 字节）
+    pending: Vec<u8>,
+}
+
+impl Utf8ChunkAssembler {
+    /// 喂入一块原始字节，返回其中**完整字符前缀**（可能为空串：整块都是半个字符）
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> String {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(chunk);
+        let mut out = String::with_capacity(buf.len());
+        let mut rest: &[u8] = &buf;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(text) => {
+                    out.push_str(text);
+                    break;
+                }
+                Err(e) => {
+                    let ok = e.valid_up_to();
+                    // `..ok` 按定义是合法 UTF-8（不会失败；`unwrap_or_default` 只是不 panic）
+                    out.push_str(std::str::from_utf8(&rest[..ok]).unwrap_or_default());
+                    match e.error_len() {
+                        // 真非法序列：如实 lossy 标注并推进（绝不无限攒）
+                        Some(n) => {
+                            out.push_str(&String::from_utf8_lossy(&rest[ok..ok + n]));
+                            rest = &rest[ok + n..];
+                        }
+                        // 截断：这段尾巴就是半个字符，留到下一块拼（唯一的缓冲点）
+                        None => {
+                            self.pending = rest[ok..].to_vec();
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// **缝的循环体**：把一块原始字节切分后喂给扫描器（返回 `true` = 扫描器已判停）。
+    /// 生产缝与用例调的都是这一行 ⇒ 边界切分与实机路径同源（不留在 `cfg(not(test))` 里）
+    pub(crate) fn feed_scanner(
+        &mut self,
+        chunk: &[u8],
+        scanner: &mut StreamScanner,
+        now_ms: u64,
+    ) -> bool {
+        scanner.push(&self.push(chunk), now_ms)
+    }
+
+    /// 收尾：残留的截断尾字节（**真被截断**：流在字符中间断）一次性 lossy 兜底——如实标注
+    /// U+FFFD，不假装修齐、更不静默丢字节；无残留 = `None`
+    pub(crate) fn flush_tail(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let tail = std::mem::take(&mut self.pending);
+        Some(String::from_utf8_lossy(&tail).into_owned())
+    }
+}
+
+/// WB 宿主进程表（生产；sysinfo 只刷新 exe 字段——**只服务端口发现**）
+#[cfg(not(test))]
+fn production_wb_pids() -> Vec<u32> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
+    sys.processes()
+        .values()
+        .filter(|p| is_wb_host_exe(p.exe()))
+        .map(|p| p.pid().as_u32())
+        .collect()
+}
+
+/// pid 的监听端口表（生产；`Get-NetTCPConnection -State Listen` 按 pid 过滤——
+/// **不扫全端口空间**，只问 WB 自己监听了哪些）
+#[cfg(not(test))]
+fn production_listening_ports(pid: u32) -> Vec<u16> {
+    if pid == 0 {
+        return Vec::new();
+    }
+    let script = format!(
+        "Get-NetTCPConnection -State Listen -OwningProcess {pid} -ErrorAction SilentlyContinue \
+         | Select-Object -ExpandProperty LocalPort"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) => parse_ports(&String::from_utf8_lossy(&o.stdout)),
+        Err(e) => {
+            log::warn!("workbuddy: Get-NetTCPConnection 启动失败: {e}");
+            Vec::new()
+        }
+    }
+}
+
+// ============================================================
+// 测试专用注入钩子（仅 cfg(test)）
+// ============================================================
+
+/// **测试专用注入钩子**（仅 `cfg(test)`）：端点级分派链在测试构建里本应恒「端点不可用」，
+/// 覆盖不到「真 ACP 链 → 回执 → 审计 → 锁注销」。故给端点用例三个可控面（心跳 / WB 进程 /
+/// HTTP 缝），**生产构建里这些开关根本不存在**。
+///
+/// **并行纪律**（钩子是进程级全局态）：凡读写钩子的用例必须持 [`test_hooks::LOCK`]。
+#[cfg(test)]
+pub mod test_hooks {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 钩子用例串行锁（tokio 互斥量：守卫跨 await 持有，std 守卫会被
+    /// `clippy::await_holding_lock` 正当拦下——与 codex `test_hooks::LOCK` 同款）
+    type HookLock = std::sync::LazyLock<tokio::sync::Mutex<()>>;
+    pub(crate) static LOCK: HookLock = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    static HEARTBEAT: std::sync::LazyLock<Mutex<Option<HeartbeatSnapshot>>> =
+        std::sync::LazyLock::new(|| Mutex::new(None));
+    static PIDS: std::sync::LazyLock<Mutex<Vec<u32>>> =
+        std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+    /// pid → 监听端口表（类型别名避免 clippy::type_complexity）
+    type HookPorts = std::sync::LazyLock<Mutex<Vec<(u32, Vec<u16>)>>>;
+    static PORTS: HookPorts = std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+    /// 装填的 HTTP 缝槽位（类型别名避免 clippy::type_complexity）
+    type HookHttp = std::sync::LazyLock<Mutex<Option<HttpSeam>>>;
+    static HTTP: HookHttp = std::sync::LazyLock::new(|| Mutex::new(None));
+
+    /// 心跳钩子形态
+    #[derive(Debug, Clone)]
+    pub struct FakeHeartbeat {
+        pub session_id: String,
+        pub endpoint: Option<String>,
+        pub usable: bool,
+    }
+
+    /// 装填钩子（**调用方必须已持 [`LOCK`]**）
+    pub(crate) fn set(hb: Option<FakeHeartbeat>, pids: Vec<u32>, ports: Vec<(u32, Vec<u16>)>) {
+        *HEARTBEAT.lock().unwrap_or_else(|e| e.into_inner()) = hb.map(|h| HeartbeatSnapshot {
+            session_id: h.session_id,
+            endpoint: h.endpoint,
+            usable: h.usable,
+        });
+        *PIDS.lock().unwrap_or_else(|e| e.into_inner()) = pids;
+        *PORTS.lock().unwrap_or_else(|e| e.into_inner()) = ports;
+    }
+
+    /// 装填 HTTP 缝（mock 的共享句柄留在用例侧供断言）
+    pub(crate) fn set_http(seam: HttpSeam) {
+        *HTTP.lock().unwrap_or_else(|e| e.into_inner()) = Some(seam);
+    }
+
+    /// 清空钩子（用例收尾；Drop 守卫调用）
+    pub(crate) fn clear() {
+        *HEARTBEAT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        PIDS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        PORTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *HTTP.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 探针缝（默认：无心跳、无 WB 进程、无端口——测试构建如实「端点不可用」）
+    pub(crate) fn probe(os: &'static str) -> EndpointProbe {
+        EndpointProbe {
+            os,
+            heartbeat: Box::new(|_pid| HEARTBEAT.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            wb_pids: Box::new(|| PIDS.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            listening_ports: Box::new(|pid| {
+                PORTS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .find(|(p, _)| *p == pid)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            }),
+        }
+    }
+
+    /// HTTP 缝（默认：**任何请求一律传输失败**——测试构建绝不落真网络）
+    pub(crate) fn http() -> HttpSeam {
+        if let Some(seam) = HTTP.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return seam;
+        }
+        Arc::new(|_req| HttpResp::transport_error("测试构建未装填 HTTP 缝（零网络纪律）"))
+    }
+}
+
+// ============================================================
+// MockHttp（注入缝的测试实现；**测试唯一 IO 路径**）
+// ============================================================
+
+/// ACP wire 的注入缝桩：**有序期望表** + 请求留痕 + 违规留痕。
+///
+/// - 期望**按序消费**（FIFO）：method/path/头逐项校验；不匹配即记违规并返回传输失败
+///   （**测试必然红**，不会静默放过）；
+/// - 未预期的请求同样记违规（证明「除了这条缝没有别的路」——没有真实客户端兜底）；
+/// - [`MockHttp::assert_clean`] = 期望全消费 + 零违规（用例收尾铁律）。
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct MockHttp {
+    inner: Arc<MockInner>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MockInner {
+    expects: std::sync::Mutex<std::collections::VecDeque<Expectation>>,
+    calls: std::sync::Mutex<Vec<HttpReq>>,
+    violations: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+struct Expectation {
+    method: &'static str,
+    path: String,
+    headers: Vec<String>,
+    resp: HttpResp,
+}
+
+#[cfg(test)]
+pub struct PendingExpect<'a> {
+    mock: &'a mut MockHttp,
+    exp: Expectation,
+}
+
+#[cfg(test)]
+impl MockHttp {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn expect_post(&mut self, path: &str, headers: Option<&[&str]>) -> PendingExpect<'_> {
+        PendingExpect {
+            mock: self,
+            exp: Expectation {
+                method: "POST",
+                path: path.to_string(),
+                headers: headers
+                    .map(|h| h.iter().map(|s| (*s).to_string()).collect())
+                    .unwrap_or_default(),
+                resp: HttpResp::transport_error("期望未装填响应"),
+            },
+        }
+    }
+
+    pub fn expect_get(&mut self, path: &str) -> PendingExpect<'_> {
+        PendingExpect {
+            mock: self,
+            exp: Expectation {
+                method: "GET",
+                path: path.to_string(),
+                headers: Vec::new(),
+                resp: HttpResp::transport_error("期望未装填响应"),
+            },
+        }
+    }
+
+    /// 请求留痕（顺序 = 实际发生顺序）
+    pub fn calls(&self) -> Vec<HttpReq> {
+        self.inner
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn violations(&self) -> Vec<String> {
+        self.inner
+            .violations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn expectations_left(&self) -> usize {
+        self.inner
+            .expects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// 用例收尾铁律：期望全消费 + 零违规
+    pub fn assert_clean(&self) {
+        assert!(
+            self.violations().is_empty(),
+            "MockHttp 违规（未预期请求/头不符）：{:?}\n实际请求：{:?}",
+            self.violations(),
+            self.calls()
+        );
+        assert_eq!(
+            self.expectations_left(),
+            0,
+            "MockHttp 期望未全部消费（wire 序列与预期不符）：{:?}",
+            self.calls()
+        );
+    }
+
+    /// 交给 `AcpClient` 的缝（与 mock 共享同一份账本）
+    pub fn seam(self) -> HttpSeam {
+        let inner = self.inner.clone();
+        Arc::new(move |req: HttpReq| Self::handle(&inner, req))
+    }
+
+    fn handle(inner: &Arc<MockInner>, req: HttpReq) -> HttpResp {
+        inner
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(req.clone());
+        let next = inner
+            .expects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        let Some(exp) = next else {
+            inner
+                .violations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("未预期的请求：{} {}", req.method, req.url));
+            return HttpResp::transport_error("MockHttp：未预期的请求（测试零网络纪律）");
+        };
+        if let Some(why) = expectation_mismatch(&exp, &req) {
+            inner
+                .violations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(why);
+            return HttpResp::transport_error("MockHttp：期望不匹配（测试零网络纪律）");
+        }
+        exp.resp.clone()
+    }
+}
+
+#[cfg(test)]
+impl From<MockHttp> for HttpSeam {
+    /// 直接 `AcpClient::new(base, mock)`（plan Step 1 原例的调用形状）
+    fn from(mock: MockHttp) -> Self {
+        mock.seam()
+    }
+}
+
+#[cfg(test)]
+impl PendingExpect<'_> {
+    fn push(self, resp: HttpResp) {
+        self.mock
+            .inner
+            .expects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(Expectation { resp, ..self.exp });
+    }
+
+    pub fn respond_json(self, body: &str) {
+        self.push(HttpResp::json(body));
+    }
+
+    pub fn respond_sse(self, body: &str) {
+        self.push(HttpResp::sse(body));
+    }
+
+    /// 静默死线掐断的 SSE（探测定案：已结束会话形态）
+    pub fn respond_stalled_sse(self, body: &str) {
+        self.push(HttpResp::sse_stalled(body));
+    }
+
+    /// watchdog 上限掐断的 SSE
+    pub fn respond_watchdog_sse(self, body: &str) {
+        self.push(HttpResp::sse_watchdog(body));
+    }
+
+    pub fn respond_status(self, status: u16, body: &str) {
+        self.push(HttpResp::status(status, body));
+    }
+
+    pub fn respond_transport_error(self, msg: &str) {
+        self.push(HttpResp::transport_error(msg));
+    }
+}
+
+/// 期望 vs 实际（返回 `Some(说明)` = 不符）：路径取 URL 的 path 段；头名大小写不敏感、
+/// 值逐字；头规格 `name` = 只要求在场，`name: value` = 值须相等
+#[cfg(test)]
+fn expectation_mismatch(exp: &Expectation, req: &HttpReq) -> Option<String> {
+    if exp.method != req.method {
+        return Some(format!("方法不符：期望 {} 实际 {}", exp.method, req.method));
+    }
+    let path = req
+        .url
+        .split("//")
+        .nth(1)
+        .and_then(|s| s.find('/').map(|i| &s[i..]));
+    let path = path.unwrap_or("/");
+    if path != exp.path {
+        return Some(format!(
+            "路径不符：期望 {} 实际 {}（{}）",
+            exp.path, path, req.url
+        ));
+    }
+    for spec in &exp.headers {
+        let (name, want) = match spec.split_once(':') {
+            Some((n, v)) => (n.trim().to_lowercase(), Some(v.trim().to_string())),
+            None => (spec.trim().to_lowercase(), None),
+        };
+        let got = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == name)
+            .map(|(_, v)| v.clone());
+        match (got, want) {
+            (None, _) => return Some(format!("缺头：{name}（实际头：{:?}）", req.headers)),
+            (Some(_), None) => {}
+            (Some(g), Some(w)) if g != w => {
+                return Some(format!("头值不符：{name} 期望 {w} 实际 {g}"))
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ACP wire 头三件套（plan Step 1 原例逐字；头名大小写不敏感、值逐字）
+    const ACP_HDRS: &[&str] = &[
+        "acp-connection-id",
+        "acp-session-token",
+        "Accept: application/json, text/event-stream",
+    ];
+    const CID: &str = "c1";
+    const TOK: &str = "t1";
+    const SID: &str = "3f12ca20-eae5-4713-a7a4-adf64a44f346";
+    const CWD: &str = "E:/t2";
+    const BASE: &str = "http://127.0.0.1:63928";
+
+    /// SSE 帧构造（真实 wire：`:ok` 注释 + `event:`/`data:` 帧）
+    fn sse(frames: &[serde_json::Value]) -> String {
+        let mut s = String::from(":ok\n\n");
+        for f in frames {
+            s.push_str("event: message\ndata: ");
+            s.push_str(&f.to_string());
+            s.push_str("\n\n");
+        }
+        s
+    }
+
+    fn rpc_ok(id: u64, result: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+    }
+
+    fn rpc_update(params: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "method": "session/update", "params": params})
+    }
+
+    fn phase_frame(sid: &str, phase: &str) -> serde_json::Value {
+        rpc_update(serde_json::json!({
+            "sessionId": sid,
+            "update": {"sessionUpdate": "agent_phase", "agentPhase": phase},
+        }))
+    }
+
+    fn init_sse(id: u64) -> String {
+        sse(&[rpc_ok(
+            id,
+            serde_json::json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {"loadSession": true, "promptCapabilities": {"image": true}},
+            }),
+        )])
+    }
+
+    fn load_sse(id: u64, last_stop: Option<&str>, mode: &str) -> String {
+        let mut frames = vec![
+            rpc_update(serde_json::json!({
+                "sessionId": SID,
+                "update": {"sessionUpdate": "config_option_update", "id": "mode",
+                           "name": "Permission Mode", "category": "mode",
+                           "currentValue": mode,
+                           "options": [{"value": "default", "name": "Always Ask"},
+                                       {"value": "acceptEdits", "name": "Accept Edits"},
+                                       {"value": "plan", "name": "Plan"},
+                                       {"value": "auto", "name": "Auto"}]},
+            })),
+            rpc_ok(id, serde_json::json!({})),
+        ];
+        if let Some(stop) = last_stop {
+            frames.insert(
+                0,
+                rpc_update(serde_json::json!({
+                    "sessionId": SID,
+                    "update": {"sessionUpdate": "session_end", "stopReason": stop},
+                })),
+            );
+        }
+        sse(&frames)
+    }
+
+    fn new_sse(id: u64, new_sid: &str) -> String {
+        sse(&[rpc_ok(id, serde_json::json!({ "sessionId": new_sid }))])
+    }
+
+    fn prompt_sse(id: u64, phases: &[&str], stop: Option<&str>, assistant: Option<&str>) -> String {
+        let chunks: Vec<&str> = assistant.into_iter().collect();
+        prompt_sse_chunks(id, phases, stop, &chunks)
+    }
+
+    /// 单块 assistant 帧（`session_update` 的 `agent_message_chunk`；真机逐块吐字）
+    fn chunk_frame(sid: &str, text: &str) -> serde_json::Value {
+        rpc_update(serde_json::json!({
+            "sessionId": sid,
+            "update": {"sessionUpdate": "agent_message_chunk",
+                       "content": {"type": "text", "text": text}},
+        }))
+    }
+
+    /// 多块流式回复（R8：一个回合的正文按 chunk **多次**到达，不是一次性给全）
+    fn prompt_sse_chunks(id: u64, phases: &[&str], stop: Option<&str>, chunks: &[&str]) -> String {
+        let mut frames = Vec::new();
+        for p in phases {
+            frames.push(phase_frame(SID, p));
+        }
+        for c in chunks {
+            frames.push(chunk_frame(SID, c));
+        }
+        if let Some(s) = stop {
+            frames.push(rpc_ok(id, serde_json::json!({ "stopReason": s })));
+        }
+        sse(&frames)
+    }
+
+    /// 装填一次全链期望（connect → initialize → session/load → prompt；prompt 体由调用方给）
+    fn expect_full_wire(http: &mut MockHttp, prompt_body: &str) {
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&load_sse(2, None, "fullAccess"));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(prompt_body);
+    }
+
+    /// 生产缝的最小装配（测试自持名额：不抢全局 `GlobalSem`）
+    fn deps(
+        http: MockHttp,
+        hb: Option<test_hooks::FakeHeartbeat>,
+        pids: Vec<u32>,
+        ports: Vec<(u32, Vec<u16>)>,
+    ) -> WbDeps {
+        let hb = hb.map(|h| HeartbeatSnapshot {
+            session_id: h.session_id,
+            endpoint: h.endpoint,
+            usable: h.usable,
+        });
+        WbDeps {
+            sem: GlobalSem::new(4),
+            watchdog_ms: 600_000,
+            probe: EndpointProbe {
+                os: "windows",
+                heartbeat: Box::new(move |_pid| hb.clone()),
+                wb_pids: Box::new(move || pids.clone()),
+                listening_ports: Box::new(move |pid| {
+                    ports
+                        .iter()
+                        .find(|(p, _)| *p == pid)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default()
+                }),
+            },
+            http: http.seam(),
+            home: None,
+        }
+    }
+
+    /// 钩子收尾守卫（panic 也清——钩子是进程级全局态，别把假端点留给后续用例）
+    struct HookClear;
+    impl Drop for HookClear {
+        fn drop(&mut self) {
+            test_hooks::clear();
+        }
+    }
+
+    fn args() -> WbTurnArgs {
+        WbTurnArgs {
+            sid: SID.to_string(),
+            project: CWD.to_string(),
+            payload: "probe [mobile iPad]".to_string(),
+            pid: 77765,
+        }
+    }
+
+    fn live_heartbeat() -> test_hooks::FakeHeartbeat {
+        test_hooks::FakeHeartbeat {
+            session_id: SID.to_string(),
+            endpoint: Some(BASE.to_string()),
+            usable: true,
+        }
+    }
+
+    // ===== plan Step 1 原例（Task 11 的红灯测试） =====
+
+    /// plan Step 1 原例①（wire 以 Mac 实测为准）：connect（免鉴权）→ initialize →
+    /// 目标定位（新建 = `session/new`）→ `session/prompt`；`sess.token == "t1"`、
+    /// `ev.first_phase == "model_requesting"`。
+    /// **与 plan 草图的一处偏差（如实登记）**：草图把整条 ACP 链压成**一次** `POST
+    /// /api/v1/acp`，而实测 wire 是**逐请求一次 POST**（initialize / session/new /
+    /// session/prompt 各一次），故期望表按真实序列装填四次——草图是提纲不是 wire。
+    #[test]
+    fn acp_handshake_and_prompt_sequence() {
+        let mut http = MockHttp::new();
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, "s-new-1"));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&prompt_sse(
+                3,
+                &["model_requesting"],
+                Some("end_turn"),
+                Some("好的"),
+            ));
+        let client = AcpClient::new(BASE, http.clone());
+        let sess = client.handshake().unwrap();
+        assert_eq!(sess.token, TOK);
+        assert_eq!(sess.connection_id, CID);
+        let ev = client
+            .prompt(&sess, "probe [mobile]", SessionSel::New { cwd: CWD })
+            .unwrap();
+        assert_eq!(ev.first_phase, "model_requesting");
+        assert_eq!(ev.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(ev.last_assistant.as_deref(), Some("好的"));
+        assert_eq!(
+            ev.session_id, "s-new-1",
+            "新建路的会话号 = session/new 产物"
+        );
+        http.assert_clean();
+    }
+
+    /// plan Step 1 原例②（探测定案）：load 已结束会话 → prompt 只「接收但未执行」
+    /// （200 + 心跳、回合不推进）⇒ **不许静默挂**：60s 无 `agentPhase` 即判「已结束需复活」
+    /// → 回执 `failed(stage=ChannelError, reason=「会话已结束（end_turn），需复活语义…」)`
+    #[test]
+    fn ended_session_prompt_reports_revival_needed() {
+        let mut http = MockHttp::new();
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&load_sse(2, Some("end_turn"), "fullAccess"));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_stalled_sse(":ok\n\n: heartbeat\n");
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert_eq!(
+            out.receipt.stage,
+            Some(Stage::ChannelError),
+            "通道跑过了但回合没推进：不能报 ok，也不是投递前拒绝：{:?}",
+            out.receipt
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(reason.contains("会话已结束"), "{reason}");
+        assert!(reason.contains("需复活"), "{reason}");
+        assert!(
+            reason.contains("重开该会话") || reason.contains("走新建"),
+            "必须引导用户重开或新建：{reason}"
+        );
+        assert!(
+            reason.contains("60s") && reason.contains("agentPhase"),
+            "必须说清 60s 无 agentPhase 的判据：{reason}"
+        );
+        assert!(
+            reason.contains("end_turn"),
+            "load 回放的 end_turn 是诊断证据：{reason}"
+        );
+        assert_eq!(out.receipt.session_id, SID);
+        http.assert_clean();
+    }
+
+    // ===== 端点发现 =====
+
+    /// Win 5.7.3 未启用远程控制（无心跳、无 WB 进程）：**直接如实拒绝**——文案带启用条件，
+    /// **零 HTTP 请求**（不盲扫），且是投递前拒绝（零字节投递）
+    #[test]
+    fn endpoint_absent_is_an_honest_refusal_naming_the_enablement_condition() {
+        let http = MockHttp::new(); // 零期望：任何请求都是违规
+        let fx = deps(http.clone(), None, Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert_eq!(
+            out.receipt.stage,
+            Some(Stage::Refused),
+            "未起跑、零字节投递 = 投递前拒绝（不是 channel_error）：{:?}",
+            out.receipt
+        );
+        assert_eq!(
+            out.receipt.terminator(),
+            super::super::receipt::Terminator::NotStarted
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("WorkBuddy 远程控制端点未启用"),
+            "plan Step 3 逐字文案：{reason}"
+        );
+        assert!(
+            reason.contains("请在 WorkBuddy 设置中开启远程控制"),
+            "{reason}"
+        );
+        assert!(reason.contains("风险 16"), "{reason}");
+        assert_eq!(http.calls().len(), 0, "无端点不盲扫：零 HTTP 请求");
+        http.assert_clean();
+    }
+
+    /// 心跳端点路（macOS/旧版形态）：会话号匹配 + 可用 + 回环 → 找到；
+    /// 会话号不匹配 / 心跳过期（usable=false）/ 非回环 → 一律不用（不猜、不外发）
+    #[test]
+    fn heartbeat_endpoint_requires_session_match_freshness_and_loopback() {
+        let probe = |hb: Option<HeartbeatSnapshot>| EndpointProbe {
+            os: "macos",
+            heartbeat: Box::new(move |_pid| hb.clone()),
+            wb_pids: Box::new(Vec::<u32>::new),
+            listening_ports: Box::new(|_pid| Vec::<u16>::new()),
+        };
+        let http = MockHttp::new().seam();
+        let facts = |sid: &str, ep: Option<&str>, usable: bool| HeartbeatSnapshot {
+            session_id: sid.to_string(),
+            endpoint: ep.map(str::to_string),
+            usable,
+        };
+        assert_eq!(
+            discover_endpoint(
+                &probe(Some(facts(SID, Some(BASE), true))),
+                &http,
+                SID,
+                77765
+            ),
+            EndpointDiscovery::Found {
+                url: BASE.to_string(),
+                source: EndpointSource::Heartbeat { pid: 77765 }
+            }
+        );
+        for bad in [
+            facts("other-session", Some(BASE), true), // 别的会话的心跳
+            facts(SID, Some(BASE), false),            // 过期（私有格式的陈旧心跳）
+            facts(SID, None, true),                   // 无 endpoint 字段
+            facts(SID, Some("http://10.0.0.9:1"), true), // 非回环（绝不出本机）
+        ] {
+            match discover_endpoint(&probe(Some(bad.clone())), &http, SID, 77765) {
+                EndpointDiscovery::Unavailable { reason } => {
+                    assert!(
+                        reason.contains("WorkBuddy 远程控制端点未启用"),
+                        "不可用原因必须带启用条件：{reason}"
+                    );
+                }
+                other => panic!("该形态不得判为可用：{bad:?} → {other:?}"),
+            }
+        }
+    }
+
+    /// Windows 端口指纹路：三判据纯核——第一腿 `/` 标题指纹、第二腿① connect 活体
+    /// （主路）、第二腿② `/health` UP（兼容分支）；AUTH_REQUIRED 的 health **不是 UP**
+    /// 但**无否决权**（Windows 内嵌版靠 connect 活体过，不再被 health 误杀——本修根因）
+    #[test]
+    fn port_fingerprint_requires_both_confirmations() {
+        // 第一腿：标题指纹（探测定案逐字；大小写不敏感子串）
+        assert!(title_hit("<title>CodeBuddy Remote Control</title>"));
+        assert!(
+            !title_hit("<title>something else</title>"),
+            "标题不符 ⇒ 第一腿不过"
+        );
+        assert!(
+            title_hit("<TITLE>codebuddy remote control</TITLE>"),
+            "大小写不敏感"
+        );
+        // 第二腿①（主路）：connect 活体判据（非空 connectionId 即认；不查 sessionToken——
+        // 漂移由投递链真 handshake 双字段严查兜住）
+        assert!(connect_ok(
+            r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#
+        ));
+        assert!(!connect_ok("not json"), "非 JSON 不猜");
+        assert!(
+            !connect_ok(r#"{"sessionToken":"probe-t0"}"#),
+            "缺 connectionId ⇒ 不认"
+        );
+        assert!(
+            !connect_ok(r#"{"connectionId":""}"#),
+            "空 connectionId ⇒ 不认"
+        );
+        // 第二腿②（兼容分支，Mac 旧版）：health UP 仍认
+        assert!(!health_ok("not json"), "非 JSON 不猜");
+        assert!(
+            health_ok(" {\"status\":\"up\"} \n"),
+            "空白/大小写容忍（JSON 语义不变）"
+        );
+        // 本修根因形态（探测报告 §3.1）：Windows 内嵌版 /health 被 AUTH_REQUIRED 挡——
+        // 体不是 UP（严格解析），但 health 只是兜底分支、无否决权
+        assert!(
+            !health_ok(r#"{"error":{"code":"AUTH_REQUIRED","message":"authentication required"}}"#),
+            "AUTH_REQUIRED 体不是 UP：旧判据曾在此形态下误杀全部候选（00:13 实测 0 命中）"
+        );
+        // 端口表解析：表头/噪声/越界一律跳过
+        assert_eq!(
+            parse_ports("LocalPort\r\n35578\r\n\r\n63928\r\nnot-a-port\r\n70000\r\n0\r\n"),
+            vec![35578, 63928],
+            "只收合法端口：噪声与越界值不猜"
+        );
+        // 宿主判定（只服务端口发现）
+        assert!(is_wb_host_exe(Some(Path::new("C:/x/WorkBuddy.exe"))));
+        assert!(!is_wb_host_exe(Some(Path::new("C:/x/codex.exe"))));
+        assert!(!is_wb_host_exe(None));
+        // 非回环一律丢弃
+        assert_eq!(
+            loopback_url("http://127.0.0.1:63928"),
+            Some(BASE.to_string())
+        );
+        assert_eq!(
+            loopback_url("http://localhost:1/"),
+            Some("http://localhost:1".into())
+        );
+        assert_eq!(loopback_url("http://10.0.0.9:63928"), None);
+        assert_eq!(loopback_url("file:///etc/passwd"), None);
+    }
+
+    /// 端口指纹路的完整发现（多候选迭代，经**同一条** HTTP 缝）：候选一（35578）标题
+    /// 命中但 connect/health 双败 ⇒ 不认；候选二（63928）标题 + connect 200 ⇒ Found
+    /// ——期望表按序 5 发（`/`、connect、`/health` | `/`、connect）
+    #[test]
+    fn port_fingerprint_discovery_uses_the_injected_seam() {
+        let mut http = MockHttp::new();
+        // 候选一（35578）：标题命中但两腿皆败 → 本候选不认（继续下一个）
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_transport_error("connect refused");
+        http.expect_get("/health")
+            .respond_transport_error("health refused");
+        // 候选二（63928）：标题 + connect 200 → Found（不再问 /health）
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        let probe = EndpointProbe {
+            os: "windows",
+            heartbeat: Box::new(|_pid| None),
+            wb_pids: Box::new(|| vec![4242]),
+            listening_ports: Box::new(|_pid| vec![35578, 63928]),
+        };
+        let found = discover_endpoint(&probe, &http.clone().seam(), SID, 0);
+        assert_eq!(
+            found,
+            EndpointDiscovery::Found {
+                url: BASE.to_string(),
+                source: EndpointSource::PortFingerprint {
+                    pid: 4242,
+                    port: 63928
+                }
+            }
+        );
+        assert_eq!(
+            http.calls().len(),
+            5,
+            "按序 5 发：/,connect,health | /,connect"
+        );
+        http.assert_clean();
+    }
+
+    /// Windows 内嵌版主路（本修目标形态）：标题 + connect 200 ⇒ 双确认过——**不装
+    /// /health 期望**（多打即违规）；connect 过即停（零 health 咨询）
+    #[test]
+    fn connect_liveness_passes_double_confirm() {
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        let probe = EndpointProbe {
+            os: "windows",
+            heartbeat: Box::new(|_pid| None),
+            wb_pids: Box::new(|| vec![4242]),
+            listening_ports: Box::new(|_pid| vec![63928]),
+        };
+        assert_eq!(
+            discover_endpoint(&probe, &http.clone().seam(), SID, 0),
+            EndpointDiscovery::Found {
+                url: BASE.to_string(),
+                source: EndpointSource::PortFingerprint {
+                    pid: 4242,
+                    port: 63928
+                }
+            }
+        );
+        assert_eq!(
+            http.calls().len(),
+            2,
+            "connect 过 ⇒ 第二腿即成，零 health 咨询"
+        );
+        http.assert_clean();
+    }
+
+    /// Mac 旧版兼容分支：connect 不可达（transport_error）但 health `{"status":"UP"}`
+    /// ⇒ 双确认仍过——health 只作兜底，不作否决
+    #[test]
+    fn legacy_health_up_branch_kept() {
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_transport_error("connect refused");
+        http.expect_get("/health")
+            .respond_json(r#"{"status":"UP"}"#);
+        let probe = EndpointProbe {
+            os: "windows",
+            heartbeat: Box::new(|_pid| None),
+            wb_pids: Box::new(|| vec![4242]),
+            listening_ports: Box::new(|_pid| vec![63928]),
+        };
+        assert_eq!(
+            discover_endpoint(&probe, &http.clone().seam(), SID, 0),
+            EndpointDiscovery::Found {
+                url: BASE.to_string(),
+                source: EndpointSource::PortFingerprint {
+                    pid: 4242,
+                    port: 63928
+                }
+            }
+        );
+        http.assert_clean();
+    }
+
+    /// **本修主断言**：AUTH_REQUIRED 的 health 不再误杀——①纯判据面：AUTH_REQUIRED 体
+    /// 不是 UP（health_ok 恒 false，但无否决权——不因它拒掉端点）；②行为面：connect
+    /// 活体过 ⇒ 端点发现命中，health 零咨询（不得预装不消费的 /health 期望）
+    #[test]
+    fn auth_required_health_not_misjudged() {
+        assert!(
+            !health_ok(r#"{"error":{"code":"AUTH_REQUIRED","message":"authentication required"}}"#),
+            "① AUTH_REQUIRED 体不是 UP（旧判据在此形态下误杀全部候选——修前实测 0 命中）"
+        );
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        let probe = EndpointProbe {
+            os: "windows",
+            heartbeat: Box::new(|_pid| None),
+            wb_pids: Box::new(|| vec![4242]),
+            listening_ports: Box::new(|_pid| vec![63928]),
+        };
+        assert_eq!(
+            discover_endpoint(&probe, &http.clone().seam(), SID, 0),
+            EndpointDiscovery::Found {
+                url: BASE.to_string(),
+                source: EndpointSource::PortFingerprint {
+                    pid: 4242,
+                    port: 63928
+                }
+            },
+            "② connect 过 ⇒ 端点命中（health 被鉴权挡也救得回来）"
+        );
+        assert!(
+            http.calls().iter().all(|c| !c.url.contains("/health")),
+            "connect 过 ⇒ health 零咨询：{:?}",
+            http.calls()
+        );
+        http.assert_clean();
+    }
+
+    /// 双确认双败（标题命中但 connect refused + health AUTH_REQUIRED）⇒ 投递前拒绝
+    /// ——「请开启远程控制」引导**只在此时**出现（M26 修前它在本可发现的形态下是误导，
+    /// 语义自此恢复准确）；探测 3 发（`/` + connect + `/health`）后如实回绝
+    #[test]
+    fn both_legs_fail_means_refused_with_enable_hint() {
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_transport_error("connect refused");
+        http.expect_get("/health").respond_status(
+            401,
+            r#"{"error":{"code":"AUTH_REQUIRED","message":"authentication required"}}"#,
+        );
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert_eq!(
+            out.receipt.stage,
+            Some(Stage::Refused),
+            "未起跑、零字节投递 = 投递前拒绝（不是 channel_error）：{:?}",
+            out.receipt
+        );
+        assert_eq!(
+            out.receipt.terminator(),
+            super::super::receipt::Terminator::NotStarted
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(reason.contains("WorkBuddy 远程控制端点未启用"), "{reason}");
+        assert!(
+            reason.contains("请在 WorkBuddy 设置中开启远程控制"),
+            "{reason}"
+        );
+        assert!(reason.contains("0 命中"), "如实报探测结论：{reason}");
+        assert_eq!(
+            http.calls().len(),
+            3,
+            "探测 = `/` + connect + `/health` 三发"
+        );
+        http.assert_clean();
+    }
+
+    /// 探测连接即弃（run_turn 全链）：探测 connect 回 probe-c0/probe-t0，投递链
+    /// handshake **自开新连接**（c1/t1）；ACP wire 头**钉值** `acp-connection-id: c1` /
+    /// `acp-session-token: t1`——若复用探测凭据必头值不符 ⇒ 违规红（证明弃得干净）
+    #[test]
+    fn connect_probe_discards_connection() {
+        const PINNED_HDRS: &[&str] = &[
+            "acp-connection-id: c1",
+            "acp-session-token: t1",
+            "Accept: application/json, text/event-stream",
+        ];
+        let mut http = MockHttp::new();
+        // 端点发现：第一腿 + 探测 connect（凭据 probe-* 用完即弃，不保留、不再携带）
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        // 投递链：handshake 自开连接（c1/t1）→ initialize → session/new（Task 4b：端口
+        // 指纹发现的端点 = Windows 单臂形态）→ prompt（头钉值）
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(PINNED_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(PINNED_HDRS))
+            .respond_sse(&new_sse(2, "app-current-1"));
+        http.expect_post(ACP_PATH, Some(PINNED_HDRS))
+            .respond_sse(&prompt_sse(
+                3,
+                &["model_requesting"],
+                Some("end_turn"),
+                Some("好的"),
+            ));
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        assert_eq!(
+            out.endpoint,
+            Some(EndpointDiscovery::Found {
+                url: BASE.to_string(),
+                source: EndpointSource::PortFingerprint {
+                    pid: 4242,
+                    port: 63928
+                }
+            }),
+            "Windows 主路（connect 活体）发现的端点照常进投递链"
+        );
+        http.assert_clean();
+    }
+
+    // ===== Task 4b：Windows new+prompt 单臂 + 投递靶向标注（M27/M28）=====
+
+    /// 形态分派（M27 主断言）：端口指纹（connect 活体）发现的端点 ⇒ 投递臂 =
+    /// `session/new` + `session/prompt` **单臂**——wire 序列**不得出现 `session/load`**
+    /// （Windows 恒 writer_occupied 结构性不可用，探测定案 §3.3）；`session/prompt` 的
+    /// sessionId = `session/new` 返回的会话号（绑定 APP 当前会话——无视 cwd）。
+    /// 心跳路（Mac load+prompt 双臂）不动——由 [`ended_session_prompt_reports_revival_needed`]
+    /// 与 [`writer_occupied_honest_receipt_kept`] 等既有用例看守。
+    #[test]
+    fn windows_arm_uses_new_prompt_single_arm() {
+        let mut http = MockHttp::new();
+        // 端点发现（Windows 形态）：`/` 标题指纹 + connect 活体（探测连接即弃）
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        // 投递链：handshake 自开连接 → initialize → session/new → session/prompt
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, "app-current-1"));
+        // prompt 帧内 sessionId 与解析无关（归一只认 agentPhase/chunk/stopReason）
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&prompt_sse(
+                3,
+                &["model_requesting"],
+                Some("end_turn"),
+                Some("好的"),
+            ));
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        let bodies: Vec<serde_json::Value> = http
+            .calls()
+            .iter()
+            .filter(|c| c.url.ends_with(ACP_PATH))
+            .map(|c| serde_json::from_str(c.body.as_deref().unwrap()).unwrap())
+            .collect();
+        let methods: Vec<&str> = bodies
+            .iter()
+            .map(|b| b["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            methods,
+            vec!["initialize", "session/new", "session/prompt"],
+            "Windows 单臂：session/load 不得出现（恒 writer_occupied，探测定案）"
+        );
+        assert_eq!(
+            bodies[2]["params"]["sessionId"], "app-current-1",
+            "prompt 打到 session/new 绑定的会话（APP 当前会话，非卡面会话）"
+        );
+        http.assert_clean();
+    }
+
+    /// 回执靶向标注（M27）：new 臂成功回执必须带**实际投递 sessionId**——session 字段 =
+    /// `session/new` 产物（**红线：没有 sessionId 的成功回执不允许出现**——WB-PROBE-OK
+    /// 误投用户会话的先例转强制项），reason 恒带「已投递至 WorkBuddy 当前会话
+    /// （sessionId=…）」。本用例取 APP 当前会话 == 卡面所选（探测 §3.1 的可投卡形态）
+    /// ⇒ **不**出现不一致警示。
+    #[test]
+    fn receipt_annotates_delivered_session_id() {
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        // APP 当前打开的正是卡面所选会话（session/new 返回同一会话号）
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, SID));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&prompt_sse(
+                3,
+                &["model_requesting"],
+                Some("end_turn"),
+                Some("收到"),
+            ));
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        assert!(
+            !out.receipt.session_id.is_empty(),
+            "红线：成功回执必须带 sessionId：{:?}",
+            out.receipt
+        );
+        assert_eq!(
+            out.receipt.session_id, SID,
+            "session 字段 = 实际投递会话号（session/new 产物）"
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("已投递至 WorkBuddy 当前会话"),
+            "恒带靶向标注：{reason}"
+        );
+        assert!(
+            reason.contains(&format!("sessionId={SID}")),
+            "标注必须带实际投递会话号：{reason}"
+        );
+        assert!(
+            !reason.contains("与所选会话不同"),
+            "一致时不得出现不一致警示：{reason}"
+        );
+        http.assert_clean();
+    }
+
+    /// 不一致明示（M27/M28 判据面）：`session/new` 绑定的 APP 当前会话 ≠ 卡面所选 ⇒
+    /// 回执 session 字段 = **投递会话**（不是卡面会话）+ reason 明示「消息已进入 APP
+    /// 当前会话，与所选会话不同」——绝不静默投错。
+    #[test]
+    fn mismatch_with_card_session_is_explicit() {
+        const APP_CURRENT: &str = "11111111-aaaa-4bbb-8ccc-dddddddddddd";
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, APP_CURRENT));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&prompt_sse(
+                3,
+                &["model_requesting"],
+                Some("end_turn"),
+                Some("好的"),
+            ));
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        assert_eq!(
+            out.receipt.session_id, APP_CURRENT,
+            "session 字段 = 实际投递会话号（非卡面 {SID}）"
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains(&format!("sessionId={APP_CURRENT}")),
+            "标注必须带投递会话号：{reason}"
+        );
+        assert!(
+            reason.contains("消息已进入 APP 当前会话，与所选会话不同"),
+            "不一致必须明示（M27 判据）：{reason}"
+        );
+        assert!(
+            reason.contains("投递至他会话，转写沿其项目目录另查"),
+            "mismatch 形态的佐证注记必须换措辞（结构性查不到，不是落盘滞后）：{reason}"
+        );
+        assert!(
+            !reason.contains("转写落盘可能滞后"),
+            "误导措辞不得出现在 mismatch 形态：{reason}"
+        );
+        http.assert_clean();
+    }
+
+    /// 非成功回执的不一致明示（M28 三态可达·spec 审 Major 1）：**已推进未确认
+    /// （Advanced）** 臂同样带不一致明示语——失败成因为主、明示语在后（不稀释），
+    /// 不带成功全文标注；投递会话号仍由 session 字段承载。
+    #[test]
+    fn advanced_receipt_keeps_mismatch_explicit() {
+        const APP_CURRENT: &str = "11111111-bbbb-4bbb-8ccc-ddddddddddddb";
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, APP_CURRENT));
+        // watchdog 掐断的推进中回合（已见 agentPhase、无终点）
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_watchdog_sse(&format!(
+                "data: {}\n\n",
+                phase_frame(APP_CURRENT, "model_requesting")
+            ));
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert_eq!(out.receipt.stage, Some(Stage::Timeout), "{:?}", out.receipt);
+        assert_eq!(
+            out.receipt.session_id, APP_CURRENT,
+            "失败回执的 session 字段仍 = 实际投递会话号"
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        let fail_at = reason
+            .find("未拿到终点")
+            .expect("失败成因为主（未确认文案在前）");
+        let mm_at = reason
+            .find("消息已进入 APP 当前会话，与所选会话不同")
+            .expect("不一致明示语必须在场（M28 三态可达）");
+        assert!(mm_at > fail_at, "明示语在后（避免稀释）：{reason}");
+        http.assert_clean();
+    }
+
+    /// 非成功回执的不一致明示（M28 三态可达·spec 审 Major 1）：**需复活
+    /// （RevivalNeeded）** 臂同样带不一致明示语（失败成因为主、明示语在后）。
+    #[test]
+    fn revival_receipt_keeps_mismatch_explicit() {
+        const APP_CURRENT: &str = "11111111-cccc-4bbb-8ccc-ddddddddddddc";
+        let mut http = MockHttp::new();
+        http.expect_get("/")
+            .respond_json("<title>CodeBuddy Remote Control</title>");
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"probe-c0","sessionToken":"probe-t0"}"#);
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, APP_CURRENT));
+        // 静默死线掐断（无 agentPhase——探测定案的静默挂形态）
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_stalled_sse(":ok\n\n: heartbeat\n");
+        let fx = deps(http.clone(), None, vec![4242], vec![(4242, vec![63928])]);
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert_eq!(
+            out.receipt.stage,
+            Some(Stage::ChannelError),
+            "{:?}",
+            out.receipt
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        let fail_at = reason.find("需复活").expect("失败成因为主（复活引导在前）");
+        let mm_at = reason
+            .find("消息已进入 APP 当前会话，与所选会话不同")
+            .expect("不一致明示语必须在场（M28 三态可达）");
+        assert!(mm_at > fail_at, "明示语在后（避免稀释）：{reason}");
+        http.assert_clean();
+    }
+
+    /// New 臂 sessionId 空串拒收（质量审 Minor 1）：`session/new` 返回**空** sessionId ⇒
+    /// 如实 Err（与 [`connect_ok`] 非空纪律同构；红线：没有 sessionId 的成功路径不允许
+    /// 出现——空号放行 = 成功回执带不上投递会话）。
+    #[test]
+    fn new_arm_rejects_empty_session_id() {
+        let mut http = MockHttp::new();
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&new_sse(2, ""));
+        let client = AcpClient::new(BASE, http.clone());
+        let sess = client.handshake().unwrap();
+        let err = client
+            .open_target(&sess, &SessionSel::New { cwd: CWD })
+            .expect_err("空 sessionId 必须拒收");
+        assert!(
+            err.contains("缺") && err.contains("sessionId"),
+            "报错形态与「缺 sessionId」家族对齐：{err}"
+        );
+        http.assert_clean();
+    }
+
+    /// 审计可追溯（设计 §5.2「审计标注」/ §10 风险 5）：投递会话 ≠ 卡面会话 ⇒ 审计
+    /// result 词**双记**实际投递 sessionId（session 列 = 卡面会话不动——设备检索入口
+    /// 语义，见 api.rs `run_wb_turn` 调用点注释）；一致 / 投递号缺席 ⇒ 原词零变化
+    /// （Mac 双臂、拒绝臂、排队臂的审计行不受影响）。
+    #[test]
+    fn audit_line_carries_delivered_session_id() {
+        // 一致（Mac 双臂 / new 臂恰逢 APP 当前 == 卡面）⇒ 原词
+        assert_eq!(
+            audit_word_with_targeting("ok", "s-card", "s-card"),
+            "ok",
+            "一致时 session 列已是投递会话：零冗余"
+        );
+        // 投递号缺席（排队/拒绝类回执没有投递号）⇒ 原词
+        assert_eq!(
+            audit_word_with_targeting("failed(refused)", "s-card", ""),
+            "failed(refused)"
+        );
+        // 不一致（Windows new 臂绑定 APP 当前会话）⇒ 双记投递会话号
+        let word = audit_word_with_targeting("ok", "s-card", "s-app-current");
+        assert!(
+            word.starts_with("ok"),
+            "终态词在前（耗时由 audit_result 追加在后）：{word}"
+        );
+        assert!(
+            word.contains("s-app-current"),
+            "审计行可追溯实际投递会话：{word}"
+        );
+        assert!(word.contains("与所选会话不同"), "{word}");
+        // 失败臂同样双记（消息可能已进入 APP 当前会话——照样可追溯）
+        let failed = audit_word_with_targeting("failed(channel_error)", "s-card", "s-app-current");
+        assert!(
+            failed.contains("s-app-current"),
+            "失败回执的投递会话同样入账：{failed}"
+        );
+    }
+
+    /// M28（既有行为钉死，不回归）：load 路被服务端拒——Windows 实测形态
+    /// `-32000 "Persistent Session already has an external writer"` ⇒ 回执
+    /// `failed(channel_error)` 带原始报文，**绝不谎报成功**（分派改造后 load 只剩**心跳
+    /// 发现路**会走到——夹具 deps 的 os 硬编码 windows，但心跳优先于心跳缺席判定，生产
+    /// 对应 macOS/旧版形态；Windows 端口指纹路已改走 new 臂不再撞这堵墙——但若形态判据
+    /// 回归，本用例保证拒还是如实的拒）。
+    #[test]
+    fn writer_occupied_honest_receipt_kept() {
+        let mut http = MockHttp::new();
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS)).respond_sse(&format!(
+            "data: {}\n\n",
+            serde_json::json!({"jsonrpc":"2.0","id":2,
+                "error":{"code":-32000,"message":"Persistent Session already has an external writer"}})
+        ));
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        assert_ne!(out.receipt.status, ReceiptStatus::Ok, "绝不谎报成功");
+        assert_eq!(
+            out.receipt.stage,
+            Some(Stage::ChannelError),
+            "{:?}",
+            out.receipt
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(reason.contains("session/load"), "点明拒在 load：{reason}");
+        assert!(
+            reason.contains("already has an external writer"),
+            "带服务端原始报文（writer_occupied 语义）：{reason}"
+        );
+        http.assert_clean();
+    }
+
+    // ===== SSE 归一 =====
+
+    /// SSE 归一：注释帧不算推进证据；未知帧只计数不解释；phase/assistant/mode/stop 归位
+    #[test]
+    fn sse_shapes_normalize_without_guessing() {
+        let body = format!(
+            ":ok\n\nevent: message\ndata: {}\n\n: heartbeat\n\ndata: {{\"whatever\":1}}\n\ndata: not-json\n\ndata: {}\n\n",
+            phase_frame(SID, "model_requesting"),
+            rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}))
+        );
+        let ev = read_stream(&body);
+        assert_eq!(ev.first_phase(), "model_requesting");
+        assert!(ev.advanced());
+        assert_eq!(ev.frames, 2, "只有含已知键的帧计数（phase + 终点）");
+        assert_eq!(ev.comments, 2, "`:ok` 与 `: heartbeat` 都是注释帧");
+        assert_eq!(
+            ev.unknown_frames, 1,
+            "JSON 但无已知键 ⇒ 只计数不解释（Task 6 同纪律）"
+        );
+        assert_eq!(ev.noise_lines, 1, "既非注释也非 JSON ⇒ 噪音行");
+        assert_eq!(ev.stop_reason.as_deref(), Some("end_turn"));
+        // RPC 错误帧
+        let err = read_stream(&format!(
+            "data: {}\n\n",
+            serde_json::json!({"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"Missing acp-connection-id header"}})
+        ));
+        assert_eq!(
+            err.rpc_error.as_deref(),
+            Some("Missing acp-connection-id header")
+        );
+        // load 回放：session_end + mode 选项
+        let load = read_stream(&load_sse(2, Some("end_turn"), "fullAccess"));
+        assert!(load.session_end);
+        assert_eq!(load.permission_mode.as_deref(), Some("fullAccess"));
+        assert_eq!(load.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    /// 流扫描器钉死**诚实性的时间判据**：心跳（注释帧）不重置静默计时 ⇒ 60s 无 `agentPhase`
+    /// 即停（[`StreamStop::Idle`]）；已见 `agentPhase` 后静默不再提前停；响应帧即停；
+    /// watchdog 上限照样掐。
+    #[test]
+    fn stream_scanner_pins_the_phase_deadline() {
+        let policy = StreamPolicy {
+            max_ms: 600_000,
+            idle_ms: PHASE_DEADLINE_MS,
+            idle_unless_seen: Some("agentPhase"),
+            stop_on_id: Some(3),
+        };
+        // ① 只有心跳：静默计时不重置
+        let mut sc = StreamScanner::new(policy, 0);
+        assert!(!sc.push(":ok\n\n: heartbeat\n", 1_000));
+        assert!(!sc.push(": heartbeat\n", 59_000));
+        assert!(
+            sc.push(": heartbeat\n", PHASE_DEADLINE_MS + 1),
+            "60s 无 data 帧且从未见 agentPhase ⇒ 必须停（不许静默挂）"
+        );
+        assert_eq!(sc.stop(), StreamStop::Idle);
+        // ② 已见 agentPhase：静默只受 max_ms 约束（回合真的在跑）
+        let mut sc2 = StreamScanner::new(policy, 0);
+        assert!(!sc2.push("data: {\"agentPhase\":\"model_requesting\"}\n\n", 10));
+        assert!(!sc2.tick(120_000), "已见 agentPhase ⇒ 不得按 60s 提前停");
+        // ③ 响应帧即停
+        let mut sc3 = StreamScanner::new(policy, 0);
+        assert!(sc3.push(
+            "data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}\n\n",
+            10
+        ));
+        assert_eq!(sc3.stop(), StreamStop::Complete);
+        // ④ watchdog 上限（静默死线关掉）
+        let mut sc4 = StreamScanner::new(
+            StreamPolicy {
+                max_ms: 100,
+                idle_ms: 0,
+                ..policy
+            },
+            0,
+        );
+        assert!(sc4.tick(100));
+        assert_eq!(sc4.stop(), StreamStop::Watchdog);
+        // 预算永不返回 0（生产 timeout 会即刻到点）
+        assert!(sc4.next_budget_ms(0) >= 1);
+    }
+
+    // ===== 评审 I10：缝的字节切分（跨 chunk 多字节字符不损坏）=====
+
+    /// 判定语义用例共用的扫描策略（评审 I10/I11 各用例同一场景配置）：watchdog 600s、
+    /// 静默死线取 [`PHASE_DEADLINE_MS`]、needle=`agentPhase`、响应帧 id=3——与典型
+    /// prompt 回合的缝输入同形。要测「无响应帧判定」面的用例（如 needle 专项）自建字面量。
+    fn verdict_policy() -> StreamPolicy {
+        StreamPolicy {
+            max_ms: 600_000,
+            idle_ms: PHASE_DEADLINE_MS,
+            idle_unless_seen: Some("agentPhase"),
+            stop_on_id: Some(3),
+        }
+    }
+
+    /// 生产缝的读循环**单步** = [`Utf8ChunkAssembler::feed_scanner`]（缝与用例同源，逻辑不在
+    /// `cfg(not(test))` 里）：把整条 SSE 体按**任意字节位置**切开喂进去，断言还原无损、
+    /// **无 U+FFFD**。对照组 = 旧口径（逐块 `from_utf8_lossy`）凡切在字符中间必打花——本用例
+    /// 抓的就是这个缺陷机理（reqwest `chunk()` 的边界任意 ⇒ 中文回执两侧各一个替换符）。
+    #[test]
+    fn seam_chunk_split_never_breaks_multibyte_chars() {
+        let policy = verdict_policy();
+        let body = prompt_sse_chunks(
+            3,
+            &["model_requesting"],
+            Some("end_turn"),
+            &["好的，中文回执正文——不许乱码。"],
+        );
+        for chunk_len in [1usize, 2, 3, 5, 7, 64] {
+            let mut asm = Utf8ChunkAssembler::default();
+            let mut sc = StreamScanner::new(policy, 0);
+            for piece in body.as_bytes().chunks(chunk_len) {
+                asm.feed_scanner(piece, &mut sc, 10);
+            }
+            if let Some(tail) = asm.flush_tail() {
+                sc.push(&tail, 10);
+            }
+            assert_eq!(sc.body(), body, "块长 {chunk_len}：字节累积必须无损还原");
+            assert!(
+                !sc.body().contains('\u{FFFD}'),
+                "块长 {chunk_len}：不得出现替换符（多字节字符跨块必须拼齐）"
+            );
+            // 对照组（旧口径逐块 lossy）：凡切在字符中间 ⇒ 必出 U+FFFD（机理，不是猜测）
+            if body
+                .as_bytes()
+                .chunks(chunk_len)
+                .any(|c| std::str::from_utf8(c).is_err())
+            {
+                let lossy: String = body
+                    .as_bytes()
+                    .chunks(chunk_len)
+                    .map(|c| String::from_utf8_lossy(c).into_owned())
+                    .collect();
+                assert!(
+                    lossy.contains('\u{FFFD}'),
+                    "块长 {chunk_len}：旧口径（逐块 lossy）必然打花"
+                );
+            }
+        }
+    }
+
+    /// 真非法字节（不是「被截断」）不得被无限攒在 `pending` 里：一次性 lossy 如实标注并推进
+    /// （否则 `push` 会永远返回空串、`pending` 无界堆积）
+    #[test]
+    fn utf8_assembler_never_hoards_definitely_invalid_bytes() {
+        let mut asm = Utf8ChunkAssembler::default();
+        // 0xFF 是**确定非法**的首字节（error_len = Some）⇒ 当拍就 lossy 出来
+        let out = asm.push(&[b'A', 0xFF, b'B']);
+        assert!(out.starts_with('A') && out.ends_with('B'), "{out:?}");
+        assert!(asm.flush_tail().is_none(), "确定非法字节不得留在 pending");
+        // 截断（合法字符的前缀）⇒ 留在 pending 等下一块，拼齐后无损
+        let mut asm2 = Utf8ChunkAssembler::default();
+        let head = "中".as_bytes();
+        assert_eq!(asm2.push(&head[..2]), "", "半个字符当拍不产出文本");
+        let out = asm2.push(&head[2..]);
+        assert_eq!(out, "中", "下一块拼齐后无损（无 U+FFFD）");
+    }
+
+    // ===== 评审 I11：增量解析 / 尾部窗口（判定语义不变）=====
+
+    /// 增量判定 ≡ 整段判定：同一 body 逐字符喂 vs 一次 `parse_frames` —— 钉死「帧边界口径
+    /// 同源」（含注释帧 / 裸 JSON 行 / 无空行收束 / `\r\n` 行尾 / 噪音行等形态矩阵）。
+    #[test]
+    fn incremental_verdict_matches_whole_body_parse() {
+        let policy = verdict_policy();
+        let stop_frame = rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}));
+        let cases: Vec<String> = vec![
+            // 标准 SSE（空行收束）
+            sse(&[phase_frame(SID, "model_requesting"), stop_frame.clone()]),
+            // 单帧：data + 空行
+            format!("data: {stop_frame}\n\n"),
+            // **无空行收束**（旧口径靠「末尾 flush」当拍认；新口径靠乐观尾判）
+            format!("data: {stop_frame}"),
+            // **裸 JSON 行**（部分实现直接吐 JSON 行）
+            format!("{stop_frame}\n"),
+            // `\r\n` 行尾
+            format!("event: message\r\ndata: {stop_frame}\r\n\r\n"),
+            // 噪音行 + 注释帧夹在中间
+            format!(": heartbeat\n\ndata: not-json\n\ndata: {stop_frame}\n\n"),
+        ];
+        for body in cases {
+            assert!(
+                parse_frames(&body)
+                    .0
+                    .iter()
+                    .any(|f| frame_is_response(f, 3)),
+                "夹具本身必须含响应帧：{body:?}"
+            );
+            let mut sc = StreamScanner::new(policy, 0);
+            let mut hit = false;
+            for ch in body.chars() {
+                hit |= sc.push(&ch.to_string(), 10);
+            }
+            hit |= sc.finish(10);
+            assert!(
+                hit && sc.stop() == StreamStop::Complete,
+                "增量口径必须同样认出响应帧：{body:?}"
+            );
+        }
+    }
+
+    /// needle 增量扫描不得丢**跨块**命中（旧的 `body.contains` 是全量扫，增量化后必须逐字
+    /// 等价）：把 `agentPhase` 拆在两个块里照样命中；不含针的流不得误锁存（反向对照）。
+    #[test]
+    fn needle_scan_detects_cross_chunk_hits() {
+        let policy = StreamPolicy {
+            max_ms: 600_000,
+            idle_ms: PHASE_DEADLINE_MS,
+            idle_unless_seen: Some("agentPhase"),
+            stop_on_id: None,
+        };
+        let mut sc = StreamScanner::new(policy, 0);
+        sc.push("event: message\ndata: {\"agent", 10);
+        assert!(!sc.seen_needle, "半个针不算命中");
+        sc.push("Phase\":\"model_requesting\"}\n\n", 20);
+        assert!(sc.seen_needle, "跨块的针必须命中（重叠窗口）");
+        // 已锁存 ⇒ 静默死线不再提前停（时间轴仍在 watchdog 之内——否则停因会是 Watchdog）
+        assert!(
+            !sc.tick(PHASE_DEADLINE_MS * 2),
+            "已见 needle ⇒ 只受 watchdog 约束"
+        );
+        // 反向对照：无针流不得误锁存（防「恒真」桩）
+        let mut none = StreamScanner::new(policy, 0);
+        none.push(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"session/update\"}\n\n",
+            10,
+        );
+        assert!(!none.seen_needle, "无针流不得误判命中");
+        assert!(none.tick(10 + PHASE_DEADLINE_MS), "无针流静默到点必须停");
+        assert_eq!(none.stop(), StreamStop::Idle);
+    }
+
+    /// 长流（数千 chunk）下**解析代价不退化**：增量解析 ⇒ 总解析字节与流长同阶；旧口径
+    /// 「每 push 重解析整个 body」⇒ 与流长平方同阶（本断言必红，见报告里的变异验证）。
+    /// 计数桩 = [`SseFrames::parsed_bytes`]（**仅测试构建**；不为测试改生产 API）。
+    #[test]
+    fn long_stream_parse_cost_stays_linear() {
+        let policy = verdict_policy();
+        let mut sc = StreamScanner::new(policy, 0);
+        let frame = format!(
+            "event: message\ndata: {}\n\n",
+            chunk_frame(SID, "流式正文块（中文，多字节）")
+        );
+        let pushes = 4_000u64;
+        let mut stream_bytes = 0u64;
+        for i in 0..pushes {
+            stream_bytes += frame.len() as u64;
+            assert!(
+                !sc.push(&frame, i * 10),
+                "第 {i} 块：未见响应帧不得停（夹具的时间轴在 watchdog 之内）"
+            );
+        }
+        let parsed = sc.frames.parsed_bytes;
+        assert!(
+            parsed <= stream_bytes * 4,
+            "解析字节数必须与流长同阶：parsed={parsed} stream={stream_bytes}\
+             （旧口径 ≈ {} = 每 push 全量重解析）",
+            stream_bytes * pushes / 2
+        );
+        // 判定语义仍在：响应帧一到即停
+        let now = pushes * 10 + 10;
+        assert!(
+            sc.push(
+                &format!(
+                    "data: {}\n\n",
+                    rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}))
+                ),
+                now
+            ),
+            "长流末尾的响应帧照样一到即停"
+        );
+        assert_eq!(sc.stop(), StreamStop::Complete);
+    }
+
+    /// 超限窗口下**判定语义不变**：驱逐只作用于交给下游 `read_stream` 的文本尾巴；判定原料
+    /// （响应帧 / needle / assistant 摘要尾巴）由增量状态与尾部窗口承载——逐条钉死。
+    #[test]
+    fn over_cap_window_keeps_verdict_material() {
+        let policy = verdict_policy();
+        let mut sc = StreamScanner::new(policy, 0);
+        // ① 开头就来 needle（早期 agentPhase 落在**会被驱逐的头部**）
+        assert!(!sc.push(&sse(&[phase_frame(SID, "model_requesting")]), 1));
+        assert!(sc.seen_needle);
+        // ② 灌到超限（长回合的流式正文）
+        let filler = format!(
+            "event: message\ndata: {}\n\n",
+            chunk_frame(SID, &"正文".repeat(2_000))
+        );
+        let mut now = 10u64;
+        for _ in 0..(STREAM_BODY_CAP_BYTES / filler.len() + 4) {
+            now += 10;
+            assert!(!sc.push(&filler, now));
+        }
+        assert!(
+            sc.body().len() <= STREAM_BODY_CAP_BYTES + filler.len(),
+            "窗口必须限长（超限即驱逐头部）：{}",
+            sc.body().len()
+        );
+        assert!(
+            !sc.body().contains("model_requesting"),
+            "头部早期帧确已被驱逐（保留的是尾部窗口）"
+        );
+        // ③ 尾部摘要原料完整（回执 `lastAssistant` 那一刀取自正文尾巴）
+        let tail_text = "尾巴上的中文回执正文（多字节，不得被打断）";
+        now += 10;
+        assert!(!sc.push(&sse(&[chunk_frame(SID, tail_text)]), now));
+        assert!(
+            sc.body().contains(tail_text),
+            "尾部摘要原料必须完整：{:?}",
+            sc.body().chars().rev().take(60).collect::<String>()
+        );
+        assert!(
+            !sc.body().contains('\u{FFFD}'),
+            "窗口切点按字符边界对齐：不得切出替换符"
+        );
+        // ④ needle 已锁存 ⇒ 静默不再提前停（与驱逐无关；响应帧尚未到，stop 还是 None）
+        assert!(
+            !sc.tick(now + PHASE_DEADLINE_MS + 1),
+            "已见 needle ⇒ 不得按静默死线提前停"
+        );
+        // ⑤ 响应帧仍能认出来（判定不读窗口内容：增量解析）
+        now += 10;
+        assert!(
+            sc.push(
+                &format!(
+                    "data: {}\n\n",
+                    rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}))
+                ),
+                now
+            ),
+            "响应帧一到即停（即便早期帧已被驱逐）"
+        );
+        assert_eq!(sc.stop(), StreamStop::Complete);
+    }
+
+    /// 窗口切点纯函数：帧边界优先（下游拿到的尾巴以完整帧开头，不会多出半个帧的噪音行）；
+    /// 单帧超窗时退化为字符边界对齐（不得把多字节字符劈成半个）
+    #[test]
+    fn window_cut_prefers_frame_boundary_then_char_boundary() {
+        let body = "data: {}\n\ndata: [2]\n\n尾巴";
+        let cut = window_cut(body, 4);
+        assert!(body.is_char_boundary(cut), "切点必须落在字符边界上");
+        assert!(body.len() - cut >= 4, "至少保留 keep 字节：cut={cut}");
+        assert!(
+            body[..cut].ends_with("\n\n"),
+            "帧边界优先：切点落在空行之后（尾巴从新帧区开头起）：{:?}",
+            &body[cut..]
+        );
+        assert!(!body[cut..].starts_with("data: {}\n\n"), "头部确已丢弃");
+        // 没有空行（单帧超窗）⇒ 字符边界对齐：不得切在「尾」字中间
+        let single = "data: 中文尾巴";
+        let cut = window_cut(single, 3);
+        assert!(single.is_char_boundary(cut), "切点必须落在字符边界上");
+        assert!(
+            single[cut..].ends_with('巴'),
+            "尾巴完整：{:?}",
+            &single[cut..]
+        );
+        assert_eq!(utf8_boundary_at_or_after("中", 1), 3);
+    }
+
+    /// 病态**单帧不收束**（巨型 `data:` 行无换行、按小块到达）的残余无界面收口（评审 N1）：
+    /// [`STREAM_BODY_CAP_BYTES`] 只裁 body 窗口，[`SseFrames`] 的行/载荷缓冲与 sniff 重试
+    /// 还得各自有界。逐条钉死：① 行缓冲 ≤ 上限（**中途即查**——旧代码缓冲 = 已喂字节，
+    /// 喂过 1.5×上限当刻就红）；② 载荷缓冲 ≤ 上限（多行 `data:` 拼接超限——「行有界」
+    /// 推不出「帧载荷有界」）；③ 解析字节与流长同阶（旧口径每块对整个未派发载荷重试
+    /// JSON 解析 ⇒ 平方阶）；④ 截断如实计噪音（不静默吞）且不毒化后续帧；⑤ 对照：
+    /// 正常 KB 级帧不受影响（噪音 0、响应帧照常一到即停）。
+    #[test]
+    fn oversize_unclosed_frame_stays_bounded() {
+        let policy = verdict_policy();
+        // —— ① 巨型无换行 `data:` 行（4 MiB、按 2 KiB 块到达）：行缓冲必须有界 ——
+        let mut sc = StreamScanner::new(policy, 0);
+        let giant = format!("data: {{\"filler\":\"{}\"}}", "x".repeat(4 * 1024 * 1024));
+        let bytes = giant.as_bytes();
+        let mut now = 0u64;
+        let mut i = 0usize;
+        let probe = SSE_LINE_CAP_BYTES + SSE_LINE_CAP_BYTES / 2;
+        while i < probe {
+            let end = (i + 2048).min(probe);
+            now += 10;
+            sc.push(
+                std::str::from_utf8(&bytes[i..end]).expect("纯 ASCII 填充"),
+                now,
+            );
+            i = end;
+        }
+        assert!(
+            sc.frames.line.len() <= SSE_LINE_CAP_BYTES,
+            "① 行缓冲必须已收口（已喂 {} 字节 > 上限 {}）：{}",
+            probe,
+            SSE_LINE_CAP_BYTES,
+            sc.frames.line.len()
+        );
+        while i < bytes.len() {
+            let end = (i + 2048).min(bytes.len());
+            now += 10;
+            assert!(
+                !sc.push(
+                    std::str::from_utf8(&bytes[i..end]).expect("纯 ASCII 填充"),
+                    now
+                ),
+                "未见响应帧不得停（时间轴在 watchdog 之内）"
+            );
+            i = end;
+        }
+        assert!(
+            sc.frames.line.len() <= SSE_LINE_CAP_BYTES,
+            "① 行缓冲长度全程有界：{}",
+            sc.frames.line.len()
+        );
+        // ③ 解析字节与流长同阶（旧口径每块全量重试 ⇒ 与流长平方同阶）
+        let parsed = sc.frames.parsed_bytes;
+        assert!(
+            parsed <= bytes.len() as u64 * 4,
+            "③ 解析字节必须与流长同阶：parsed={parsed} stream={}\
+             （旧口径 ≈ 每 push 对整个未派发载荷重试 JSON 解析）",
+            bytes.len()
+        );
+        // ④ 截断不静默吞：收尾结算时如实计噪音
+        sc.finish(now + 10);
+        assert!(
+            sc.frames.noise >= 1,
+            "④ 超限截断的行必须计噪音（不静默吞）：noise={}",
+            sc.frames.noise
+        );
+
+        // —— ② 多行 `data:` 拼接超限（每行不超行上限、载荷总量超载荷上限）——
+        let mut sc = StreamScanner::new(policy, 0);
+        let row = |c: char| format!("data: {}\n", c.to_string().repeat(768 * 1024));
+        let two_rows = format!("{}{}", row('a'), row('b'));
+        let bytes2 = two_rows.as_bytes();
+        let mut i = 0usize;
+        let mut now = 0u64;
+        while i < bytes2.len() {
+            let end = (i + 4096).min(bytes2.len());
+            now += 10;
+            sc.push(
+                std::str::from_utf8(&bytes2[i..end]).expect("纯 ASCII 填充"),
+                now,
+            );
+            i = end;
+        }
+        assert!(
+            sc.frames.data.len() <= SSE_DATA_CAP_BYTES,
+            "② 载荷缓冲必须有界（两行各 768 KiB 已全部喂入）：{}",
+            sc.frames.data.len()
+        );
+        // ④ 截断的帧结算（空行派发）⇒ 如实计噪音，且**不毒化后续帧**
+        now += 10;
+        assert!(!sc.push("\n", now), "截断帧本身无响应帧，不得停");
+        assert!(sc.frames.noise >= 1, "④ 超限截断的载荷必须计噪音");
+        assert!(sc.frames.data.is_empty(), "派发后载荷缓冲清空");
+        now += 10;
+        assert!(
+            sc.push(
+                &format!(
+                    "data: {}\n\n",
+                    rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}))
+                ),
+                now
+            ),
+            "④ 截断帧之后的正常响应帧照常一到即停（判定不被病态帧毒化）"
+        );
+        assert_eq!(sc.stop(), StreamStop::Complete);
+
+        // —— ⑤ 对照：正常 KB 级帧不受影响（噪音 0 + 判定照常）——
+        let mut sc = StreamScanner::new(policy, 0);
+        let normal = sse(&[
+            phase_frame(SID, "model_requesting"),
+            chunk_frame(SID, "流式正文块（中文，多字节，KB 级）"),
+        ]);
+        // 按字符边界攒 ~64B 的块（生产缝的块已按字符切齐——评审 I10 的字节纪律）
+        let mut piece = String::new();
+        let mut now = 0u64;
+        for ch in normal.chars() {
+            piece.push(ch);
+            if piece.len() >= 64 {
+                now += 10;
+                assert!(!sc.push(&piece, now), "正常流未见响应帧不得停");
+                piece.clear();
+            }
+        }
+        if !piece.is_empty() {
+            now += 10;
+            assert!(!sc.push(&piece, now), "正常流未见响应帧不得停");
+        }
+        assert_eq!(sc.frames.noise, 0, "⑤ 正常 KB 级帧零噪音（不误伤）");
+        assert_eq!(sc.frames.line.len(), 0, "正常帧收束后行缓冲清空");
+        now += 10;
+        assert!(
+            sc.push(
+                &format!(
+                    "data: {}\n\n",
+                    rpc_ok(3, serde_json::json!({"stopReason": "end_turn"}))
+                ),
+                now
+            ),
+            "⑤ 正常流的响应帧照常一到即停"
+        );
+        assert_eq!(sc.stop(), StreamStop::Complete);
+        assert_eq!(sc.frames.noise, 0, "⑤ 全程零噪音");
+    }
+
+    // ===== 判定与诚实性 =====
+
+    /// 推进了但没拿到终点：**不冒充成功**（watchdog ⇒ timeout；流自己断了 ⇒ channel_error）
+    #[test]
+    fn advanced_without_terminal_is_never_reported_as_success() {
+        let out = PromptOutcome {
+            session_id: SID.into(),
+            first_phase: "model_requesting".into(),
+            phases: vec!["model_requesting".into()],
+            stop: StreamStop::Watchdog,
+            ..Default::default()
+        };
+        assert_eq!(
+            judge_prompt(&out),
+            PromptVerdict::Advanced {
+                phase: "model_requesting".into(),
+                stop: StreamStop::Watchdog
+            }
+        );
+        let r = receipt_for(
+            SID,
+            &judge_prompt(&out),
+            &out,
+            None,
+            None,
+            &Corroboration::default(),
+            7,
+        );
+        assert_eq!(r.stage, Some(Stage::Timeout), "watchdog 掐断 = timeout 档");
+        assert!(!r.reason.clone().unwrap_or_default().is_empty());
+        let out2 = PromptOutcome {
+            stop: StreamStop::Idle,
+            ..out.clone()
+        };
+        let r2 = receipt_for(
+            SID,
+            &judge_prompt(&out2),
+            &out2,
+            None,
+            None,
+            &Corroboration::default(),
+            7,
+        );
+        assert_eq!(r2.stage, Some(Stage::ChannelError));
+        assert!(
+            r2.reason.clone().unwrap_or_default().contains("未拿到终点"),
+            "如实说清「没拿到终点」：{:?}",
+            r2.reason
+        );
+    }
+
+    /// 传输错误 / RPC 错误 ⇒ 如实的 channel_error（带原始报文摘要，不吞错）
+    #[test]
+    fn transport_and_rpc_errors_are_reported_honestly() {
+        let mut http = MockHttp::new();
+        http.expect_post(CONNECT_PATH, None)
+            .respond_transport_error("connect refused");
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.stage, Some(Stage::ChannelError));
+        assert!(
+            out.receipt
+                .reason
+                .clone()
+                .unwrap_or_default()
+                .contains("connect refused"),
+            "必须带出传输层原因：{:?}",
+            out.receipt.reason
+        );
+        http.assert_clean();
+        // RPC 错误：load 被服务端拒（如会话不存在）——同样如实
+        let mut http2 = MockHttp::new();
+        http2
+            .expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http2
+            .expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http2.expect_post(ACP_PATH, Some(ACP_HDRS)).respond_sse(&format!(
+            "data: {}\n\n",
+            serde_json::json!({"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"session not found"}})
+        ));
+        let fx2 = deps(
+            http2.clone(),
+            Some(live_heartbeat()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let out2 = run_turn(&args(), &fx2);
+        assert_eq!(out2.receipt.stage, Some(Stage::ChannelError));
+        assert!(
+            out2.receipt
+                .reason
+                .clone()
+                .unwrap_or_default()
+                .contains("session not found"),
+            "必须带出服务端原因：{:?}",
+            out2.receipt.reason
+        );
+        http2.assert_clean();
+        // 建连非 2xx（HTTP 500）→ 如实带状态码，不猜体
+        let mut http3 = MockHttp::new();
+        http3
+            .expect_post(CONNECT_PATH, None)
+            .respond_status(500, "boom");
+        let fx3 = deps(
+            http3.clone(),
+            Some(live_heartbeat()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let out3 = run_turn(&args(), &fx3);
+        assert_eq!(out3.receipt.stage, Some(Stage::ChannelError));
+        assert!(
+            out3.receipt
+                .reason
+                .clone()
+                .unwrap_or_default()
+                .contains("HTTP 500"),
+            "必须带出状态码：{:?}",
+            out3.receipt.reason
+        );
+        http3.assert_clean();
+    }
+
+    /// watchdog 掐断的**推进中**回合：回执 timeout（**不冒充成功**），并说清已见 agentPhase
+    #[test]
+    fn watchdog_cut_stream_maps_to_timeout_without_faking_success() {
+        let mut http = MockHttp::new();
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&load_sse(2, None, "fullAccess"));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_watchdog_sse(&format!(
+                "data: {}\n\n",
+                phase_frame(SID, "model_requesting")
+            ));
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert_eq!(out.receipt.stage, Some(Stage::Timeout), "{:?}", out.receipt);
+        assert_eq!(
+            out.receipt.terminator(),
+            super::super::receipt::Terminator::Watchdog
+        );
+        let reason = out.receipt.reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("未拿到终点") && reason.contains("model_requesting"),
+            "{reason}"
+        );
+        http.assert_clean();
+    }
+
+    /// 成功回执：末条 assistant 截断走 Task 6 单点；**转写佐证未命中时如实标注**
+    /// （ok + reason 说明「佐证未命中」，绝不把未确认说成已确认）
+    #[test]
+    fn completed_receipt_reports_transcript_corroboration_state() {
+        let mut http = MockHttp::new();
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&load_sse(2, None, "fullAccess"));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&prompt_sse(
+                3,
+                &["model_requesting", "generating"],
+                Some("end_turn"),
+                Some(&"答".repeat(260)),
+            ));
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        let last = out.receipt.last_assistant.clone().unwrap();
+        assert_eq!(
+            last.chars().count(),
+            super::super::receipt::LAST_ASSISTANT_CHARS + 1,
+            "截断口径必须复用 Task 6 单点（200 字 + 省略号）"
+        );
+        assert_eq!(out.receipt.tokens, None, "ACP 未给 token ⇒ 不编");
+        assert!(
+            out.receipt
+                .reason
+                .clone()
+                .unwrap_or_default()
+                .contains("转写佐证未命中"),
+            "ok 回执必须如实标注佐证状态：{:?}",
+            out.receipt.reason
+        );
+        http.assert_clean();
+    }
+
+    /// **R8①：流式分块的 assistant 文本必须累积**——ACP 一个回合的正文按
+    /// `agent_message_chunk` 逐块到达，只留最后一块 = 回执只带答复的尾巴。
+    ///
+    /// 还原动作（变异）：把 `absorb` 的 chunk 臂改回 `ev.assistant = Some(text)` → 本用例先红
+    /// （纯核断言只剩「后半」、端到端断言只剩「后半」）。
+    #[test]
+    fn agent_message_chunks_accumulate_into_the_complete_assistant() {
+        // ① 纯核：首块单独解释（顺序不能丢）；两块**按序拼接**（不是覆盖、不是倒序）
+        let first = read_stream(&sse(&[chunk_frame(SID, "前半")]));
+        assert_eq!(first.assistant.as_deref(), Some("前半"));
+        let both = read_stream(&sse(&[chunk_frame(SID, "前半"), chunk_frame(SID, "后半")]));
+        assert_eq!(
+            both.assistant.as_deref(),
+            Some("前半后半"),
+            "多块流式回复必须拼成完整正文（覆盖式实现只留「后半」）"
+        );
+        assert_eq!(both.frames, 2, "两块都是含已知键的帧");
+        // ② 端到端：回执带出的 lastAssistant 就是完整正文（截断单点在 receipt_for）
+        let mut http = MockHttp::new();
+        expect_full_wire(
+            &mut http,
+            &prompt_sse_chunks(
+                3,
+                &["model_requesting", "generating"],
+                Some("end_turn"),
+                &["前半", "后半"],
+            ),
+        );
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Ok, "{:?}", out.receipt);
+        assert_eq!(
+            out.receipt.last_assistant.as_deref(),
+            Some("前半后半"),
+            "回执必须带完整正文（未超限 ⇒ 逐字原样）"
+        );
+        http.assert_clean();
+    }
+
+    /// **R8②：累积有总上限、最终截断仍单点**——流可以无限长，累积缓冲必须封顶
+    /// （4 × `LAST_ASSISTANT_CHARS`）；封顶**不是**第二套截断：回执那一刀仍归
+    /// `receipt_for` → `normalize::summarize`（产物 = 200 字 + **一个** 省略号）。
+    ///
+    /// 还原动作（变异）：去掉累积上限 → 第一条断言先红（缓冲随流无界增长）。
+    #[test]
+    fn assistant_accumulation_is_capped_without_a_second_truncation() {
+        let cap = 4 * super::super::receipt::LAST_ASSISTANT_CHARS;
+        assert_eq!(
+            ASSISTANT_ACCUM_CAP_CHARS, cap,
+            "累积总上限的口径 = 4 × LAST_ASSISTANT_CHARS（单一来源，勿另写常数）"
+        );
+        // 20 块 × 150 字 = 3000 字（远超上限）——每块前缀不同，可判「取的是头部」
+        let chunks: Vec<String> = (0..20).map(|i| format!("{i:02}").repeat(25)).collect();
+        let body = sse(&chunks
+            .iter()
+            .map(|c| chunk_frame(SID, c))
+            .collect::<Vec<_>>());
+        let ev = read_stream(&body);
+        let full: String = chunks.concat();
+        let capped: String = full.chars().take(cap).collect();
+        assert_eq!(
+            ev.assistant.as_deref(),
+            Some(capped.as_str()),
+            "累积缓冲必须封顶在上限处（无界流不得把内存拖垮）"
+        );
+        // 端到端：封顶后的正文照样只经 summarize 一刀 ⇒ 头部 200 字 + 单个省略号
+        let mut http = MockHttp::new();
+        let refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+        expect_full_wire(
+            &mut http,
+            &prompt_sse_chunks(3, &["generating"], Some("end_turn"), &refs),
+        );
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        let last = out.receipt.last_assistant.clone().unwrap();
+        let expected: String = full
+            .chars()
+            .take(super::super::receipt::LAST_ASSISTANT_CHARS)
+            .collect();
+        assert_eq!(
+            last,
+            format!("{expected}…"),
+            "最终摘要 = 累积文本头部 200 字 + 一个省略号（截断单点未被复制）"
+        );
+        assert_eq!(
+            last.chars().filter(|c| *c == '…').count(),
+            1,
+            "只许一个省略号（两个 = 累积期也截了一刀，即第二套口径）"
+        );
+        http.assert_clean();
+    }
+
+    /// 转写佐证（tempdir 夹具，**零真实 ~/.workbuddy**）：mtime 推进 / 尾部命中载荷标记 /
+    /// 文件缺席 三形态；复用读侧 `find_session_jsonl`（不另写转写解析）
+    #[test]
+    fn transcript_corroboration_is_second_evidence_only() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home
+            .path()
+            .join(".workbuddy")
+            .join("projects")
+            .join(crate::monitor::workbuddy_parser::mangle_project_path(CWD));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join(format!("{SID}.jsonl"));
+        std::fs::write(
+            &jsonl,
+            "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"text\":\"probe [mobile iPad]\"}]}\n",
+        )
+        .unwrap();
+        let base = transcript_mtime_ms(Some(home.path()), CWD, SID);
+        assert!(base.is_some(), "在场文件必须给出 mtime 基线");
+        // 1) 不在场 → 未确认
+        let absent = corroborate(
+            Some(home.path()),
+            CWD,
+            "e3b0c442-0000-4000-8000-000000000000",
+            "x",
+            None,
+        );
+        assert!(!absent.present && !absent.confirmed());
+        // 2) 在场 + 尾部命中标记 → 确认（mtime 未推进也认）
+        let hit = corroborate(Some(home.path()), CWD, SID, "probe [mobile iPad]", base);
+        assert!(hit.present && hit.needle_hit && hit.confirmed(), "{hit:?}");
+        // 3) 在场 + mtime 推进 → 确认（主判据；用 filetime 显式置后——不靠写入竞速）
+        std::fs::write(
+            &jsonl,
+            "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}\n",
+        )
+        .unwrap();
+        let later = base.unwrap() + 5_000;
+        filetime::set_file_mtime(
+            &jsonl,
+            filetime::FileTime::from_unix_time(
+                (later / 1000) as i64,
+                ((later % 1000) * 1_000_000) as u32,
+            ),
+        )
+        .unwrap();
+        let adv = corroborate(Some(home.path()), CWD, SID, "nothing-matches", base);
+        assert!(adv.present && adv.advanced && adv.confirmed(), "{adv:?}");
+        // 标记取 W4 尾签名（可读、稳定）
+        assert_eq!(corroboration_needle("正文 [mobile iPad]"), "[mobile iPad]");
+        assert_eq!(corroboration_needle("裸文本无签名"), "裸文本无签名");
+        assert_eq!(corroboration_needle(""), "");
+    }
+
+    // ===== 名额与锁 =====
+
+    /// H4 全局名额：无名额 ⇒ **即时未执行回执**（评审 I1：如实说明未执行、不谎报位次），
+    /// 不盲试、不发 HTTP
+    #[test]
+    fn over_cap_turn_returns_queued_receipt_without_http() {
+        let http = MockHttp::new();
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let hold_a = fx.sem.acquire();
+        let hold_b = fx.sem.acquire();
+        let hold_c = fx.sem.acquire();
+        let hold_d = fx.sem.acquire();
+        let out = run_turn(&args(), &fx);
+        assert_eq!(
+            out.receipt.status,
+            ReceiptStatus::Queued,
+            "{:?}",
+            out.receipt
+        );
+        let reason = out.receipt.reason.as_deref().unwrap_or("");
+        assert!(
+            reason.contains(&format!("无头并发已满（上限 {}）", fx.sem.cap()))
+                && reason.contains("未执行"),
+            "满额回执必须如实说明未执行 + 实际上限: {:?}",
+            out.receipt
+        );
+        assert!(
+            !reason.contains("位等待中"),
+            "满额回执不得再声称排队等待（生产无真排队）: {:?}",
+            out.receipt
+        );
+        assert_eq!(http.calls().len(), 0, "满额请求不得起跑");
+        drop((hold_a, hold_b, hold_c, hold_d));
+        assert_eq!(fx.sem.in_flight(), 0, "名额必须归还（守卫 Drop）");
+        http.assert_clean();
+    }
+
+    // ===== 「除了这条缝没有别的路」 =====
+
+    /// 未预期请求必然违规 + 传输失败（**没有真实客户端兜底**）；默认钩子缝同样零网络
+    #[test]
+    fn mock_http_is_the_only_io_path() {
+        let mut http = MockHttp::new();
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        // 只装一条期望：后续 initialize 请求未预期 ⇒ 违规且失败
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let out = run_turn(&args(), &fx);
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert!(
+            out.receipt
+                .reason
+                .clone()
+                .unwrap_or_default()
+                .contains("未预期"),
+            "未预期请求必须显式失败（不许静默继续）：{:?}",
+            out.receipt.reason
+        );
+        assert!(!http.violations().is_empty(), "违规必须留痕");
+        let seen = http.calls().len();
+        // 默认钩子（未装填）：端点不可用 ⇒ 零 HTTP，绝不落真网络。
+        // **并行纪律**（钩子是进程级全局态）：本段读写钩子，必须持 [`test_hooks::LOCK`]——
+        // 否则会与端点用例互相 clear 对方装填的钩子/读到对方的假心跳（间歇性假红；
+        // Task 11 复审 Important 1）。本用例是同步 `#[test]`，故用 `blocking_lock`
+        // （与 `server.rs` 的 `#[tokio::test]` + `.lock().await` 同一把锁）。
+        let _serial = test_hooks::LOCK.blocking_lock();
+        let _clear = HookClear;
+        test_hooks::clear();
+        let fx2 = deps_for("windows", None, 600_000, GlobalSem::new(4));
+        let out2 = run_turn(&args(), &fx2);
+        assert_eq!(out2.receipt.stage, Some(Stage::Refused));
+        assert_eq!(
+            http.calls().len(),
+            seen,
+            "默认钩子下不得再有任何 HTTP 请求（真网络不可达）"
+        );
+    }
+
+    /// 载荷组装：prompt 的 `prompt` 数组逐字（ACP 文本块）+ cwd 逐字进 load/new 参数
+    #[test]
+    fn rpc_wire_bodies_are_pinned() {
+        let mut http = MockHttp::new();
+        http.expect_post(CONNECT_PATH, None)
+            .respond_json(r#"{"connectionId":"c1","sessionToken":"t1"}"#);
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&init_sse(1));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&load_sse(2, None, "fullAccess"));
+        http.expect_post(ACP_PATH, Some(ACP_HDRS))
+            .respond_sse(&prompt_sse(
+                3,
+                &["model_requesting"],
+                Some("end_turn"),
+                None,
+            ));
+        let fx = deps(http.clone(), Some(live_heartbeat()), Vec::new(), Vec::new());
+        let _ = run_turn(&args(), &fx);
+        let calls = http.calls();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0].method, "POST");
+        assert_eq!(calls[0].url, format!("{BASE}{CONNECT_PATH}"));
+        assert!(calls[0].body.is_none(), "connect 无体（免鉴权）");
+        let bodies: Vec<serde_json::Value> = calls[1..]
+            .iter()
+            .map(|c| serde_json::from_str(c.body.as_deref().unwrap()).unwrap())
+            .collect();
+        assert_eq!(bodies[0]["method"], "initialize");
+        assert_eq!(bodies[0]["params"]["protocolVersion"], 1);
+        assert_eq!(bodies[1]["method"], "session/load");
+        assert_eq!(bodies[1]["params"]["sessionId"], SID);
+        assert_eq!(bodies[1]["params"]["cwd"], CWD);
+        assert_eq!(bodies[2]["method"], "session/prompt");
+        assert_eq!(bodies[2]["params"]["sessionId"], SID);
+        assert_eq!(
+            bodies[2]["params"]["prompt"],
+            serde_json::json!([{ "type": "text", "text": "probe [mobile iPad]" }])
+        );
+        // 逐请求 id 递增（响应帧按 id 认领）
+        assert_eq!(bodies[0]["id"], 1);
+        assert_eq!(bodies[1]["id"], 2);
+        assert_eq!(bodies[2]["id"], 3);
+        // 头三件套逐条对齐（含 Accept 逐字）
+        for c in &calls[1..] {
+            for (k, v) in [
+                ("acp-connection-id", "c1"),
+                ("acp-session-token", "t1"),
+                ("accept", ACCEPT_BOTH),
+            ] {
+                assert_eq!(
+                    c.headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(k))
+                        .map(|(_, val)| val.as_str()),
+                    Some(v),
+                    "头 {k} 必须逐字（缺 Accept 服务端 -32000）"
+                );
+            }
+        }
+        http.assert_clean();
+    }
+}

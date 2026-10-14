@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import ModeBar from "@/mobile/ModeBar";
+import ModeBar from "@/mobile/ModeBarCli";
 import type { MamMode, SessionModeView } from "@/mobile/api";
 
 // 批次丙 T6 + 丁T4：模式栏。覆盖——

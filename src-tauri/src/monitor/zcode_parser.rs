@@ -42,6 +42,11 @@ use std::path::{Path, PathBuf};
 const CARD_WINDOW_MS: i64 = 24 * 3600 * 1000;
 /// 每轮枚举的近期会话上限（time_updated 倒序取前 N，防御异常大库）
 const RECENT_SESSIONS_LIMIT: usize = 100;
+/// 新建基线（[`stored_sessions`]）的**读取代价界**：90 天 / 2000 行——正确性不靠它
+/// （「新建」由 `time_created >= 回合起点` 主证据 + id 基线两道承担），本界只保证
+/// 单次读取有界；见该函数文档的「窗口的角色」。
+const STORED_SESSIONS_WINDOW_MS: i64 = 90 * 24 * 3600 * 1000;
+const STORED_SESSIONS_LIMIT: usize = 2000;
 /// 尾部消息读取深度（与既有工具 JSONL 尾读 500 行同档；ZCode 按消息计）
 const TAIL_MESSAGES_LIMIT: usize = 200;
 /// 无语义条目兜底的新鲜阈值（与 APP 形态 300s 停更阈值同源）
@@ -463,7 +468,10 @@ fn build_one_session(
     now: i64,
 ) -> Option<Session> {
     let messages = load_tail_messages(conn, &row.id)?;
-    let parts = load_parts_for_messages(conn, &messages);
+    // 出卡路径对 parts 读失败**容忍降级**（卡片照出，只是少了 parts 明细——与旧行为等价：
+    // 卡片本来就不对「明细读不到」下结论）；**回执真源路径**（[`store_snapshot_conn`]）
+    // 相反，必须 fail-closed（评审 I5）。
+    let parts = load_parts_for_messages(conn, &messages).unwrap_or_default();
 
     let entries = flatten_entries(&messages, &parts);
     let age_ms = now.saturating_sub(row.time_updated).max(0) as u64;
@@ -572,14 +580,24 @@ fn load_tail_messages(conn: &Connection, session_id: &str) -> Option<Vec<Message
     Some(messages)
 }
 
-/// 尾部消息的全部 parts（单查询 IN 子句，按 message_id 分组保序）
+/// 尾部消息的全部 parts（单查询 IN 子句，按 message_id 分组保序）。
+///
+/// **返回 `Option`（评审 I5）**：`None` = **读失败**（part 表缺失 / prepare 或查询失败 /
+/// 库加锁），`Some(map)` = 读成功（`Some(空 map)` 表示**确实没有 part 行**——两种结局
+/// 必须分得开）。旧实现一律回空 map，于是「part 表读不到」与「这些消息没有 part」不可
+/// 区分：回执真源 [`store_snapshot_conn`] 会据此给出 `last_assistant = None` 的**貌似正常**
+/// 快照，而 zcode 的库确认在拿不到 assistant 文本时会退化到文本比较——那条路会把丢失的
+/// 消息读成「本轮没有新回复」，开出把「没送达」报成「已送达 + 回复」的假确认窗口。
+///
+/// **读失败的行级容忍保持不变**：单行 data 解码失败仍只跳过该行（既有防御语义），
+/// 本函数只把「整表/整查询级别的读失败」拆出来。
 fn load_parts_for_messages(
     conn: &Connection,
     messages: &[MessageRow],
-) -> HashMap<String, Vec<PartRow>> {
+) -> Option<HashMap<String, Vec<PartRow>>> {
     let mut map: HashMap<String, Vec<PartRow>> = HashMap::new();
     if messages.is_empty() {
-        return map;
+        return Some(map);
     }
     let order_col = if conn.prepare("SELECT sequence FROM part LIMIT 0").is_ok() {
         "sequence"
@@ -593,7 +611,7 @@ fn load_parts_for_messages(
         order_col
     );
     let Ok(mut stmt) = conn.prepare(&sql) else {
-        return map;
+        return None; // part 表缺失/加锁 → 读失败（不是「没有 part」）
     };
     let ids: Vec<&str> = messages.iter().map(|m| m.id.as_str()).collect();
     let params: Vec<&dyn rusqlite::types::ToSql> = ids
@@ -608,12 +626,12 @@ fn load_parts_for_messages(
             },
         ))
     }) else {
-        return map;
+        return None;
     };
     for row in rows.filter_map(|r| r.ok()) {
         map.entry(row.0).or_default().push(row.1);
     }
-    map
+    Some(map)
 }
 
 /// 消息 + parts → 归一化 APP 条目（共享判定核的 ZCode 格式翻译适配器）。
@@ -761,6 +779,188 @@ fn first_user_text(
     None
 }
 
+// ===== 会话库快照（Task 8 无头回执源；**只读**）=====
+
+/// 会话库快照（H7 无头回合的回执真源）。真机实证（2026-10-05）：`--resume` 无头回合
+/// stdout **没有**可解析 JSON（exit 0 正常结束、会话库确有回复），故回执的
+/// `lastAssistant`/`tokens` 只能取自会话库——stdout 退化为**完成信号**。
+///
+/// 字段语义：
+/// - `last_seq`：该会话消息表的**最大序**（`sequence` 列优先，缺列降级 `time_created`——
+///   与 [`load_tail_messages`] 同判据）；无消息 = 0。回合前后对比的「有没有新东西」背景证据；
+/// - `last_assistant_id`：末条 **assistant** 消息的 id（**确认判据的主键**：同一文本的两轮
+///   回复也能区分开，纯文本比较做不到）；
+/// - `last_assistant`：该消息的末个 text part（口径同 [`last_message_summary`]：记账消息
+///   跳过、倒扫取最新）；
+/// - `tokens`：该消息 `data.tokens.output`（真机形态 `{"tokens":{"total":…,"output":…}}`；
+///   缺则 `total`；都没有 = `None`，**不编数字**）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ZcodeStoreSnapshot {
+    pub last_seq: i64,
+    pub last_assistant_id: Option<String>,
+    pub last_assistant: Option<String>,
+    pub tokens: Option<u64>,
+}
+
+/// 读一个会话的库快照（Task 8 回执源）。**只读**、零写；任何读失败（缺库/缺表/加锁/
+/// 格式漂移）→ `None`（调用方如实判「不可确认」，绝不猜）。
+///
+/// 复用本模块既有私有读取件（[`load_tail_messages`] / [`load_parts_for_messages`] /
+/// [`part_text`]）——**不另写第二份解析**。
+pub fn store_snapshot(roots: &ZcodeRoots, session_id: &str) -> Option<ZcodeStoreSnapshot> {
+    let conn = open_readonly_with_timeout(&roots.cli_db)?;
+    store_snapshot_conn(&conn, session_id)
+}
+
+/// 生产便利壳：`<home>/.zcode` 根（与 [`ZcodeRoots::from_home`] 同源）
+pub fn store_snapshot_home(home: &Path, session_id: &str) -> Option<ZcodeStoreSnapshot> {
+    store_snapshot(&ZcodeRoots::from_home(home), session_id)
+}
+
+/// 会话库**在册会话 `(id, 目录, 建行时刻)` 表**（H10 Task 12 新建基线；**只读**）。
+///
+/// # 返回 `Option`（复审 Important 2）
+/// `None` = **库不可读**（缺库 / 缺表 / 加锁 / 格式漂移）——调用方据此**如实判「基线不可
+/// 得」并放弃发现**，**绝不把它当成「该项目没有会话」**：否则「基线读失败一次 → 轮询读成功
+/// 一次」就能把在册旧会话说成本轮新建（回执给出真实但**不属于本次创建**的 sess_id）。
+///
+/// # `created_at` = `session.time_created`
+/// 真机表列（2026-10-05 只读 `PRAGMA table_info(session)` 核实：真实表含 `time_created`
+/// INTEGER）。**它是「新建」判据的主证据**（`time_created >= 回合起点` ⇒ 旧会话结构上不可能
+/// 被判成新建）；该列缺失/类型漂移 → `None` 降级为「无时间证据」（判据退回 id 基线 ——
+/// 不让一次 schema 漂移废掉整条发现链）。
+///
+/// # 窗口的角色（复审后重定位）
+/// 90 天 / 2000 行**只承担读取代价界**，不再承担正确性（正确性由 `created_at` 判据 +
+/// id 基线两道承担）。其余口径与出卡同源：`task_type='interactive'`（子代理会话排除）、
+/// `parent_id` 空、合规 id（[`is_valid_session_id`]）。
+pub fn stored_sessions(roots: &ZcodeRoots) -> Option<Vec<(String, String, Option<i64>)>> {
+    let conn = open_readonly_with_timeout(&roots.cli_db)?;
+    let cutoff = now_ms() - STORED_SESSIONS_WINDOW_MS;
+    let cols = "id, parent_id, directory";
+    let tail = format!(
+        "FROM session WHERE task_type = 'interactive' AND time_updated >= ?1
+         ORDER BY time_updated DESC LIMIT {}",
+        STORED_SESSIONS_LIMIT
+    );
+    // 首选带时间列形态（「新建」主证据）；列缺失（升级改表）→ prepare 失败 → 退无时间形态
+    if let Ok(mut stmt) = conn.prepare(&format!("SELECT {cols}, time_created {tail}")) {
+        let rows = stmt.query_map([cutoff], |row| {
+            Ok((
+                get_text(row, 0)?,
+                row.get::<_, Option<String>>(1)?,
+                get_text(row, 2).unwrap_or_default(),
+                row.get::<_, Option<i64>>(3).unwrap_or(None),
+            ))
+        });
+        // 查询失败 = 真读不到（不是「没数据」）→ 如实 None，不回退冒充空表
+        let rows = rows.ok()?;
+        return Some(
+            rows.filter_map(|r| r.ok())
+                .filter(|(id, parent, _, _)| admissible(id, parent.as_deref()))
+                .map(|(id, _, dir, created)| (id, dir, created))
+                .collect(),
+        );
+    }
+    let mut stmt = conn.prepare(&format!("SELECT {cols} {tail}")).ok()?;
+    let rows = stmt.query_map([cutoff], |row| {
+        Ok((
+            get_text(row, 0)?,
+            row.get::<_, Option<String>>(1)?,
+            get_text(row, 2).unwrap_or_default(),
+        ))
+    });
+    let rows = rows.ok()?;
+    Some(
+        rows.filter_map(|r| r.ok())
+            .filter(|(id, parent, _)| admissible(id, parent.as_deref()))
+            .map(|(id, _, dir)| (id, dir, None))
+            .collect(),
+    )
+}
+
+/// 基线读件的行准入（子代理行与不合规 id 一律排除——与出卡口径同源）
+fn admissible(id: &str, parent: Option<&str>) -> bool {
+    is_valid_session_id(id) && !parent.map(|p| !p.trim().is_empty()).unwrap_or(false)
+}
+
+/// 生产便利壳（真实 home）
+pub fn stored_sessions_home(home: &Path) -> Option<Vec<(String, String, Option<i64>)>> {
+    stored_sessions(&ZcodeRoots::from_home(home))
+}
+
+/// 快照内核（conn 注入，测试直驱）
+fn store_snapshot_conn(conn: &Connection, session_id: &str) -> Option<ZcodeStoreSnapshot> {
+    let order_col = if conn.prepare("SELECT sequence FROM message LIMIT 0").is_ok() {
+        "sequence"
+    } else if conn
+        .prepare("SELECT time_created FROM message LIMIT 0")
+        .is_ok()
+    {
+        "time_created"
+    } else {
+        return None; // 升级改表：如实读不到
+    };
+    let last_seq: i64 = conn
+        .query_row(
+            &format!("SELECT COALESCE(MAX({order_col}), 0) FROM message WHERE session_id = ?1"),
+            [session_id],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let messages = load_tail_messages(conn, session_id)?;
+    // **parts 读失败 → 整快照 `None`（评审 I5）**：快照的契约是「任何读失败 → None」，
+    // 而 parts 缺失会让 [`last_assistant_facts`] 恒回 (None, None, None)——那与「本会话
+    // 真的没有 assistant 回复」同形，会被下游读成「本轮没有新回复」（假确认窗口）。
+    let parts = load_parts_for_messages(conn, &messages)?;
+    let (last_assistant_id, last_assistant, tokens) = last_assistant_facts(&messages, &parts);
+    Some(ZcodeStoreSnapshot {
+        last_seq,
+        last_assistant_id,
+        last_assistant,
+        tokens,
+    })
+}
+
+/// 末条 assistant 消息的三件事实（id / 文本 / token 用量）：倒扫，记账消息跳过，
+/// 只认 `role == "assistant"` 且带非空 text part 的消息；文本取该消息**最后一个** text part
+/// （与 [`last_message_summary`] 同口径）。
+fn last_assistant_facts(
+    messages: &[MessageRow],
+    parts: &HashMap<String, Vec<PartRow>>,
+) -> (Option<String>, Option<String>, Option<u64>) {
+    for msg in messages.iter().rev() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg.data) else {
+            continue;
+        };
+        if v.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(msg_parts) = parts.get(&msg.id) else {
+            continue;
+        };
+        let Some(text) = msg_parts.iter().rev().find_map(part_text) else {
+            continue;
+        };
+        return (Some(msg.id.clone()), Some(text), message_tokens(&v));
+    }
+    (None, None, None)
+}
+
+/// 消息级 token 用量（真机形态：`data.tokens = {"total":…,"input":…,"output":…}`）。
+/// 取 `output`（与回执读帧「output_tokens 优先」口径一致），缺则 `total`；
+/// 标量形态（老库/他形态）直接采用；都没有 = `None`（**不编数字**）。
+fn message_tokens(v: &serde_json::Value) -> Option<u64> {
+    match v.get("tokens") {
+        Some(serde_json::Value::Number(n)) => n.as_u64(),
+        Some(obj @ serde_json::Value::Object(_)) => obj
+            .get("output")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| obj.get("total").and_then(serde_json::Value::as_u64)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,7 +987,8 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE session (
                 id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
-                task_type TEXT, title TEXT, time_updated INTEGER
+                task_type TEXT, title TEXT, time_updated INTEGER,
+                time_created INTEGER
              );
              CREATE TABLE message (
                 id TEXT PRIMARY KEY, session_id TEXT, sequence INTEGER,
@@ -831,6 +1032,15 @@ mod tests {
             "INSERT INTO session (id, parent_id, directory, task_type, title, time_updated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![id, parent_id, dir, task_type, title, time_updated],
+        )
+        .unwrap();
+    }
+
+    /// 补写 `session.time_created`（H10 基线的时间证据；既有 INSERT 不设该列 → NULL = 无证据）
+    fn set_time_created(conn: &Connection, id: &str, ms: i64) {
+        conn.execute(
+            "UPDATE session SET time_created = ?2 WHERE id = ?1",
+            rusqlite::params![id, ms],
         )
         .unwrap();
     }
@@ -1996,6 +2206,329 @@ mod tests {
     }
 
     // ===== 标题降级链与卡片字段 =====
+
+    /// **Task 8 回执源**（H7 无头回合）：快照 = 最大序 + 末条 assistant（id/文本/tokens）。
+    /// fixture 驱动（tempdir），**零真实 ~/.zcode**；形态对齐真机 message.data
+    /// （`{"role":"assistant","tokens":{"total":…,"output":…}}`，2026-10-05 实测）。
+    #[test]
+    fn store_snapshot_reads_last_assistant_and_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        let cli = build_cli_db(&roots.cli_db);
+        insert_session(
+            &cli,
+            SID_A,
+            None,
+            "/tmp/proj",
+            "interactive",
+            Some("t"),
+            1_000,
+        );
+        insert_message(
+            &cli,
+            "m1",
+            SID_A,
+            1,
+            10,
+            r#"{"role":"user","semantics":{"kind":"user_prompt"}}"#,
+        );
+        insert_part(&cli, "p1", "m1", 1, r#"{"type":"text","text":"你好"}"#);
+        insert_message(
+            &cli,
+            "m2",
+            SID_A,
+            2,
+            20,
+            r#"{"role":"assistant","tokens":{"total":83980,"input":67487,"output":16493}}"#,
+        );
+        insert_part(&cli, "p2", "m2", 1, r#"{"type":"reasoning","text":"想想"}"#);
+        insert_part(&cli, "p3", "m2", 2, r#"{"type":"text","text":"改好了"}"#);
+        drop(cli);
+
+        let snap = store_snapshot(&roots, SID_A).expect("库可读必须给快照");
+        assert_eq!(snap.last_seq, 2, "最大序 = message.sequence 的最大值");
+        assert_eq!(snap.last_assistant_id.as_deref(), Some("m2"));
+        assert_eq!(
+            snap.last_assistant.as_deref(),
+            Some("改好了"),
+            "取末个 text part（与末条摘要同口径）"
+        );
+        assert_eq!(
+            snap.tokens,
+            Some(16493),
+            "tokens 取 output（与回执读帧 output_tokens 优先口径一致）"
+        );
+        // 无此会话 → 仍是「可读」快照（空态），不是 None（None 专表「读不到」）
+        let empty =
+            store_snapshot(&roots, "sess_ffffffff-ffff-4fff-8fff-ffffffffffff").expect("库可读");
+        assert_eq!(empty.last_seq, 0);
+        assert_eq!(empty.last_assistant_id, None);
+        // 缺库 → None（如实「读不到」，调用方判不可确认）
+        let missing = ZcodeRoots {
+            tasks_db: tmp.path().join("nope-tasks.sqlite"),
+            cli_db: tmp.path().join("nope-cli.sqlite"),
+        };
+        assert!(store_snapshot(&missing, SID_A).is_none());
+    }
+
+    /// **评审 I5**：part 表缺失 = **读失败**（不是「这些消息没有 part」）——快照必须整份
+    /// `None`，绝不给出 `last_assistant = None` 的貌似正常快照（那与「本会话真没有
+    /// assistant 回复」同形，会被下游读成「本轮没有新回复」→ 假确认窗口）。
+    ///
+    /// 变异验证：把 `store_snapshot_conn` 的 `load_parts_for_messages(...)?` 改回
+    /// `.unwrap_or_default()`（旧行为）→ 本用例红（会拿到 `Some` 快照）。
+    #[test]
+    fn store_snapshot_is_none_when_part_table_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        std::fs::create_dir_all(roots.cli_db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&roots.cli_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                task_type TEXT, title TEXT, time_updated INTEGER, time_created INTEGER
+             );
+             CREATE TABLE message (
+                id TEXT PRIMARY KEY, session_id TEXT, sequence INTEGER,
+                time_created INTEGER, data TEXT
+             );",
+        )
+        .unwrap();
+        insert_message(
+            &conn,
+            "m1",
+            SID_A,
+            1,
+            10,
+            r#"{"role":"assistant","tokens":{"output":7}}"#,
+        );
+        drop(conn);
+        assert!(
+            store_snapshot(&roots, SID_A).is_none(),
+            "part 表读不到 → 快照必须如实 None（不得给貌似正常的「无 assistant 回复」快照）"
+        );
+
+        // 反向锚（两种结局必须分得开）：把 part 表补上但留空 = **读得到、确实没有 part 行**
+        // → 这是可读结局，快照照给（只是没有 assistant 文本）
+        let conn = Connection::open(&roots.cli_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE part (
+                id TEXT PRIMARY KEY, message_id TEXT, sequence INTEGER, data TEXT
+             );",
+        )
+        .unwrap();
+        drop(conn);
+        let snap = store_snapshot(&roots, SID_A).expect("part 表在册（空表）= 可读");
+        assert_eq!(snap.last_seq, 1);
+        assert_eq!(
+            snap.last_assistant_id, None,
+            "确实没有 text part → 末条 assistant 事实为空"
+        );
+    }
+
+    /// **评审 I15 的形状事实钉**：**未知会话号 ⇒ `Some(空快照)`，绝不是 `None`**。
+    ///
+    /// 为什么必须钉死：生产 `TurnDeps::production` 的库读缝就是本文件的
+    /// [`store_snapshot_home`]，而 zcode **新建**通道按**锁键**（`create|e:/proj`——起跑时
+    /// 还没有会话号）读它，库里结构上不会有该键的行。若这里的结局是 `None`（「读不到」），
+    /// 下游 `confirm_from_store` 会判 `StoreConfirmation::Unavailable`（**库不可读**臂）；
+    /// 实际结局是 `Some(默认快照)` ⇒ 判 `NoNewAssistant`（**库读得到、只是没有本轮新回复**）。
+    /// 两臂的文案不同（`zcode::channel_error_reason`），**新建的真机常态走的是后者**——把
+    /// `None` 当常态，等于给「新建」语境抄一句只对 `--resume` 成立的空真诊断（I15）。
+    ///
+    /// 与 I5（[`store_snapshot_is_none_when_part_table_is_missing`]）合起来的完整形状：
+    /// **读失败才 `None`**（缺库 / 缺表 / 缺列 / 加锁 / parts 读失败）；**读得到 = `Some`**，
+    /// 哪怕一行都没有。
+    #[test]
+    fn store_snapshot_of_an_unknown_session_is_readable_empty_not_none() {
+        /// 在册、但**零消息行**的会话（懒落库 / 新建刚起跑的真机形态）
+        const SID_B: &str = "sess_22222222-2222-4222-8222-222222222222";
+        let tmp = tempfile::tempdir().unwrap();
+        // 走**生产 seam**（`store_snapshot_home` ⇒ `ZcodeRoots::from_home` = `<home>/.zcode`）
+        let home = tmp.path();
+        let roots = ZcodeRoots::from_home(home);
+        let cli = build_cli_db(&roots.cli_db);
+        // 库里非空：一个会话有 assistant 消息（证明「查不到行」不是「整库没数据」的假象）
+        insert_session(&cli, SID_A, None, "/tmp/proj", "interactive", None, 1_000);
+        insert_message(
+            &cli,
+            "m1",
+            SID_A,
+            1,
+            10,
+            r#"{"role":"assistant","tokens":{"output":5}}"#,
+        );
+        insert_part(&cli, "p1", "m1", 1, r#"{"type":"text","text":"别的会话"}"#);
+        // 在册但**零消息行**的会话（懒落库/新建刚起跑的真机形态）
+        insert_session(&cli, SID_B, None, "/tmp/proj", "interactive", None, 1_000);
+        drop(cli);
+
+        // ① 未在册的会话号（合规形态也不算数）→ 可读的空快照
+        let unknown = store_snapshot_home(home, "sess_ffffffff-ffff-4fff-8fff-ffffffffffff")
+            .expect("未知会话号 = 可读结局（空快照）；`None` 只留给「读不到」");
+        assert_eq!(unknown, ZcodeStoreSnapshot::default());
+        // ② 在册但零消息行的会话 → 同样是可读空快照
+        let no_rows = store_snapshot_home(home, SID_B).expect("零消息行的会话 = 可读结局");
+        assert_eq!(no_rows, ZcodeStoreSnapshot::default());
+        // ③ 新建通道实际读的键（**锁键**，连会话号形态都不是）同形：SQL 一行不匹配而已
+        let lock_key = "create|e:/proj";
+        let lock = store_snapshot_home(home, lock_key).expect("锁键读库同样可读（空快照）");
+        assert_eq!(lock, ZcodeStoreSnapshot::default());
+
+        // 反锚：库**真读不到** → 这时才是 `None`（两种结局必须分得开）
+        let missing = ZcodeRoots {
+            tasks_db: tmp.path().join("nope-tasks.sqlite"),
+            cli_db: tmp.path().join("nope-cli.sqlite"),
+        };
+        assert!(
+            store_snapshot(&missing, SID_A).is_none(),
+            "缺库 = 读不到 ⇒ None（与「读得到但没有行」严格区分）"
+        );
+    }
+
+    /// **H10 新建基线读件**（Task 12 + 复审 Important 2）：`stored_sessions` = 在册
+    /// `(id, 目录, time_created)` 表——与出卡同源口径（interactive / 子代理排除 / 合规 id /
+    /// 有界），**返回 `Option`**（`None` = 库不可读，**不是**「没有会话」），并给出
+    /// `time_created`（「新建」判据的主证据）。只读、tempdir fixture、零真实 ~/.zcode。
+    #[test]
+    fn stored_sessions_lists_recent_interactive_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        let cli = build_cli_db(&roots.cli_db);
+        let now = now_ms();
+        // 新鲜会话 / 25 小时前（出卡 24h 窗外，基线仍须在册）/ 25 天前（仍在 90 天窗内）
+        insert_session(&cli, SID_A, None, "/tmp/proj", "interactive", None, now);
+        set_time_created(&cli, SID_A, now - 1_000);
+        insert_session(
+            &cli,
+            "sess_22222222-2222-4222-8222-222222222222",
+            None,
+            "/tmp/old",
+            "interactive",
+            None,
+            now - 25 * 3600 * 1000,
+        );
+        set_time_created(
+            &cli,
+            "sess_22222222-2222-4222-8222-222222222222",
+            now - 26 * 3600 * 1000,
+        );
+        insert_session(
+            &cli,
+            "sess_33333333-3333-4333-8333-333333333333",
+            None,
+            "/tmp/older",
+            "interactive",
+            None,
+            now - 25 * 24 * 3600 * 1000,
+        );
+        // 子代理会话（parent_id 非空）/ 非 interactive / 不合规 id → 一律不进基线
+        insert_session(
+            &cli,
+            SID_CHILD,
+            Some(SID_A),
+            "/tmp/proj",
+            "interactive",
+            None,
+            now,
+        );
+        insert_session(
+            &cli,
+            "sess_44444444-4444-4444-8444-444444444444",
+            None,
+            "/tmp/proj",
+            "subagent",
+            None,
+            now,
+        );
+        insert_session(
+            &cli,
+            "dirty-id",
+            None,
+            "/tmp/proj",
+            "interactive",
+            None,
+            now,
+        );
+        drop(cli);
+
+        let rows = stored_sessions(&roots).expect("库可读 ⇒ Some（空表也是 Some）");
+        let ids: Vec<&str> = rows.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                SID_A,
+                "sess_22222222-2222-4222-8222-222222222222",
+                "sess_33333333-3333-4333-8333-333333333333",
+            ],
+            "在册基线：interactive + 合规 id + 90 天窗（子代理/脏 id 不进）: {rows:?}"
+        );
+        assert_eq!(rows[0].1, "/tmp/proj", "目录随行给出（匹配口径归调用方）");
+        assert_eq!(
+            rows[0].2,
+            Some(now - 1_000),
+            "time_created 随行给出（「新建」判据的主证据）"
+        );
+        assert_eq!(
+            rows[2].2, None,
+            "未设 time_created 的行 = 无时间证据（判据退回 id 基线）"
+        );
+        // 缺库 → **None**（库不可读，绝不是「该项目没有会话」——复审 Important 2）
+        let missing = ZcodeRoots {
+            tasks_db: tmp.path().join("nope-tasks.sqlite"),
+            cli_db: tmp.path().join("nope-cli.sqlite"),
+        };
+        assert!(
+            stored_sessions(&missing).is_none(),
+            "库不可读必须如实 None（冒充空表会把旧会话误报成新建）"
+        );
+    }
+
+    /// 老库/改表**没有 `time_created` 列**时：读件退回「无时间证据」形态（`created_at = None`），
+    /// **不让一次 schema 漂移废掉整条发现链**（判据退 id 基线，而不是整条发现失效）
+    #[test]
+    fn stored_sessions_falls_back_when_time_created_column_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        std::fs::create_dir_all(roots.cli_db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&roots.cli_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                task_type TEXT, title TEXT, time_updated INTEGER
+             );",
+        )
+        .unwrap();
+        insert_session(
+            &conn,
+            SID_A,
+            None,
+            "/tmp/proj",
+            "interactive",
+            None,
+            now_ms(),
+        );
+        drop(conn);
+
+        let rows = stored_sessions(&roots).expect("库可读 ⇒ Some（列缺失不是读失败）");
+        assert_eq!(rows.len(), 1, "缺列仍须给出在册表：{rows:?}");
+        assert_eq!(rows[0].0, SID_A);
+        assert_eq!(rows[0].2, None, "无该列 ⇒ 无时间证据（判据退回 id 基线）");
+    }
+
+    /// token 字段多形态（真机对象 / 标量 / 全缺）：**没有就是 None，不编数字**
+    #[test]
+    fn message_tokens_forms() {
+        let v = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert_eq!(
+            message_tokens(&v(r#"{"tokens":{"output":7,"total":9}}"#)),
+            Some(7)
+        );
+        assert_eq!(message_tokens(&v(r#"{"tokens":{"total":9}}"#)), Some(9));
+        assert_eq!(message_tokens(&v(r#"{"tokens":42}"#)), Some(42));
+        assert_eq!(message_tokens(&v(r#"{"role":"assistant"}"#)), None);
+        assert_eq!(message_tokens(&v(r#"{"tokens":{}}"#)), None);
+    }
 
     #[test]
     fn title_degradation_chain() {

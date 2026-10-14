@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ApproveCard from "@/mobile/ApproveCard";
-import QuestionCard from "@/mobile/QuestionCard";
+import QuestionCard from "@/mobile/QuestionCardCli";
 import type { QuestionInfoView } from "@/mobile/api";
 
 // 批次乙 T8：移动端问答卡（AskUserQuestion）。fetch 全量 stub（盖过 setup.ts 的

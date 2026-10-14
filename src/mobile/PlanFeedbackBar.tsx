@@ -19,9 +19,14 @@ const SENT_DISMISS_MS = 1600;
 
 export default function PlanFeedbackBar({
   sessionId,
+  agentName = "Claude",
   onDismiss,
 }: {
   sessionId: string;
+  /** Agent 展示名（Task 8 参数化——设计 §3.7(a)：本条是计划反馈的打字通道，标题
+   *  原硬编码 Claude 品牌；参数化后其他工具的计划反馈可复用（默认 Claude 保持
+   *  既有文案逐字不变）。 */
+  agentName?: string;
   /** 发送成功（自隐倒计时）或用户点收起 → 通知父级卸载本条 */
   onDismiss?: () => void;
 }) {
@@ -87,7 +92,7 @@ export default function PlanFeedbackBar({
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="inline-block h-2 w-2 shrink-0 rounded-full bg-sky-500" />
         <span className="text-sm font-semibold text-sky-700 dark:text-sky-400">
-          告诉 Claude 要改什么
+          告诉 {agentName} 要改什么
         </span>
         <button
           type="button"
@@ -100,7 +105,7 @@ export default function PlanFeedbackBar({
         </button>
       </div>
       <p className="mt-1 text-xs text-sky-700/80 dark:text-sky-400/80">
-        输入修改意见发送后，Claude 仍停留在计划模式并重新出计划；选上面的选项 1/2 才会开始执行
+        输入修改意见发送后，{agentName} 仍停留在计划模式并重新出计划；选上面的选项 1/2 才会开始执行
       </p>
       <textarea
         data-testid="plan-feedback-input"
@@ -125,7 +130,7 @@ export default function PlanFeedbackBar({
           data-testid="plan-feedback-sent"
           className="mt-1 text-xs font-medium text-emerald-600 dark:text-emerald-400"
         >
-          已发送，Claude 正在修改计划…
+          已发送，{agentName} 正在修改计划…
         </p>
       )}
       <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
