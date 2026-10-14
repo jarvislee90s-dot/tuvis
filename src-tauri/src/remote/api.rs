@@ -3303,7 +3303,7 @@ pub async fn session_approve(
         }
         Err(e) => {
             log::error!("session-approve 投递任务异常: {e}");
-            Err("内部任务异常".to_string())
+            Err("RAPI_INTERNAL_TASK: 内部任务异常".to_string())
         }
     };
     // 审计 action 词表（W5 词表 send|queue|flush|jump|retract|approve|reject|fail|key|open；
@@ -3465,7 +3465,10 @@ pub(crate) fn run_plan_feedback_stages<T: PlanFeedbackTerminal>(
             }
             if *submit {
                 if text.is_empty() && len == 0 {
-                    return Err("没有可提交的内容（输入为空且终端行无暂存）".to_string());
+                    return Err(
+                        "RAPI_NOTHING_TO_SUBMIT: 没有可提交的内容（输入为空且终端行无暂存）"
+                            .to_string(),
+                    );
                 }
                 t.send_enter()?;
                 t.settle();
@@ -3589,7 +3592,7 @@ pub async fn session_plan_feedback(
         }
         Err(e) => {
             log::error!("session-plan-feedback 投递任务异常: {e}");
-            Err("内部任务异常".to_string())
+            Err("RAPI_INTERNAL_TASK: 内部任务异常".to_string())
         }
     };
     let audit_content = match &op_for_audit {
@@ -7072,7 +7075,9 @@ where
         if let Some(lines) = probe() {
             match crate::inject::question::probe_review_screen(&lines) {
                 ScreenStep::Ready(l) => return Ok(Some(l)),
-                ScreenStep::Fatal(why) => return Err(format!("{why}；请人工核对终端")),
+                ScreenStep::Fatal(why) => {
+                    return Err(format!("RAPI_SCREEN_FATAL: {why}；请人工核对终端"))
+                }
                 ScreenStep::NotYet(_) => {}
             }
         }
@@ -8068,7 +8073,7 @@ pub async fn session_mode_menu(
     let pick_tool = tool.clone();
     let r = tokio::task::spawn_blocking(move || -> Result<PickOutcome, String> {
         let Some(_guard) = crate::inject::queue::try_acquire_inflight(&pick_sid) else {
-            return Err("投递进行中，请稍后重试".to_string());
+            return Err("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试".to_string());
         };
         let key_delay = || {
             std::thread::sleep(std::time::Duration::from_millis(
@@ -9141,7 +9146,10 @@ fn menu_stages(
         // 非 Windows 无屏读 → 菜单路径无法定位（数字直达与闭环导航都必须屏读）。
         // **如实回执**：不盲发（猜错会选到别的档——与导航的保守面同源）。
         let _ = (tool, group, target, open_cmd, pid, spec, injector);
-        Err("本平台无屏读，权限菜单无法定位（命令已发送，请在终端选择档位）".to_string())
+        Err(
+            "RAPI_NO_SCREENREAD: 本平台无屏读，权限菜单无法定位（命令已发送，请在终端选择档位）"
+                .to_string(),
+        )
     }
     #[cfg(windows)]
     {
@@ -9289,11 +9297,17 @@ fn poll_menu_digit(pid: u32, target: crate::inject::mode::MamMode) -> Result<Str
             Ok(lines) => match crate::inject::mode::codex_permission_digit_probe(&lines, target) {
                 PollStep::Ready(digit) => return Ok(digit),
                 PollStep::Fatal(why) => {
-                    return Err(format!("{why}；请人工核对终端（命令已发送，档位未切）"))
+                    return Err(format!(
+                        "RAPI_MODE_FATAL: {why}；请人工核对终端（命令已发送，档位未切）"
+                    ))
                 }
                 PollStep::NotYet(why) => last = Some(why),
             },
-            Err(e) => last = Some(format!("权限菜单屏读失败（{e}）")),
+            Err(e) => {
+                last = Some(format!(
+                    "RAPI_PERMISSION_MENU_FAIL: 权限菜单屏读失败（{e}）"
+                ))
+            }
         }
         if i + 1 < rounds {
             std::thread::sleep(std::time::Duration::from_millis(POLL_STEP_MS));
@@ -9328,12 +9342,14 @@ fn poll_confirm_cluster(
                 ) {
                     PollStep::Ready((cluster, _)) => return Ok(Some(cluster)),
                     PollStep::Fatal(why) => {
-                        return Err(format!("{why}；请人工核对终端（Full Access 可能未生效）"))
+                        return Err(format!(
+                            "RAPI_CONFIRM_FATAL: {why}；请人工核对终端（Full Access 可能未生效）"
+                        ))
                     }
                     PollStep::NotYet(why) => last = Some(why),
                 }
             }
-            Err(e) => last = Some(format!("确认框屏读失败（{e}）")),
+            Err(e) => last = Some(format!("RAPI_CONFIRM_SCREEN_FAIL: 确认框屏读失败（{e}）")),
         }
         if i + 1 < rounds {
             std::thread::sleep(std::time::Duration::from_millis(POLL_STEP_MS));
@@ -9353,7 +9369,7 @@ fn poll_confirm_cluster(
 fn poll_confirm_cluster(
     _pid: u32,
 ) -> Result<Option<Vec<crate::inject::dialog::DialogOption>>, String> {
-    Err("确认框屏读簇仅 Windows 支持".to_string())
+    Err("RAPI_CONFIRM_WINDOWS_ONLY: 确认框屏读簇仅 Windows 支持".to_string())
 }
 
 /// **平台中立读屏缝**（丁T3 同思路）：仅 Windows 有屏读实现；非 Windows 一律
@@ -9406,10 +9422,19 @@ fn poll_menu_stage(
         match crate::inject::windows_console::read_screen_window(pid) {
             Ok(lines) => match plan.probe(&lines) {
                 PollStep::Ready(_) => return Ok(Some(lines)),
-                PollStep::Fatal(why) => return Err(format!("{why}；请人工核对终端（{advice}）")),
+                PollStep::Fatal(why) => {
+                    return Err(format!(
+                        "RAPI_POLL_FATAL: {why}；请人工核对终端（{advice}）"
+                    ))
+                }
                 PollStep::NotYet(why) => last = Some(why),
             },
-            Err(e) => last = Some(format!("{}屏读失败（{e}）", plan.stage())),
+            Err(e) => {
+                last = Some(format!(
+                    "RAPI_SCREEN_READ_FAIL: {}屏读失败（{e}）",
+                    plan.stage()
+                ))
+            }
         }
         if i + 1 < rounds {
             std::thread::sleep(std::time::Duration::from_millis(POLL_STEP_MS));
@@ -9424,7 +9449,9 @@ fn poll_menu_stage(
         log::debug!("{}：窗内未出现（{last}）→ 按回执核验", plan.stage());
         return Ok(None);
     }
-    Err(format!("{last}；请人工核对终端（{advice}）"))
+    Err(format!(
+        "RAPI_SCREEN_FATAL_RETRY: {last}；请人工核对终端（{advice}）"
+    ))
 }
 
 /// 轮询屏读**工具自己的成功回执行**（`receipt_seen`）。

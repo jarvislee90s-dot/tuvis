@@ -1319,6 +1319,19 @@
     "tswizFunnelStatusFail": "Cannot read Funnel status — see logs",
     "tswizStepUnknown": "Unknown step",
     "tswizChecksumMissing": "Installer has no checksum — refused to use it",
-    "tswizPreviewResetUnreadable": "Tailscale status unreadable — preview-revoke refused"
+    "tswizPreviewResetUnreadable": "Tailscale status unreadable — preview-revoke refused",
+    "rapiInternalTask": "Internal task error",
+    "rapiNothingToSubmit": "Nothing to submit — input is empty and the terminal line has no draft",
+    "rapiScreenFatal": "Screen-shape mismatch — aborted; please verify the terminal manually",
+    "rapiDeliveryBusy": "A delivery is already in progress — retry shortly",
+    "rapiNoScreenread": "No screen reader on this platform — the command was sent; pick the tier in the terminal yourself",
+    "rapiModeFatal": "Mode switch not confirmed — please verify the terminal manually",
+    "rapiPermissionMenuFail": "Permission menu screen read failed — see logs",
+    "rapiConfirmFatal": "Confirmation failed (Full Access may not be in effect) — please verify the terminal manually",
+    "rapiConfirmScreenFail": "Confirm-dialog screen read failed — see logs",
+    "rapiConfirmWindowsOnly": "Confirm-dialog screen-read clusters are Windows-only",
+    "rapiPollFatal": "Polling aborted — please verify the terminal manually",
+    "rapiScreenReadFail": "Screen read failed — see logs",
+    "rapiScreenFatalRetry": "Screen-read anomaly (aborted) — please verify the terminal manually"
   }
 }

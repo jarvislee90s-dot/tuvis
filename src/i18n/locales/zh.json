@@ -1319,6 +1319,19 @@
     "tswizFunnelStatusFail": "读不到 Funnel 状态——详见日志",
     "tswizStepUnknown": "未知步骤",
     "tswizChecksumMissing": "安装包无校验值，拒绝使用",
-    "tswizPreviewResetUnreadable": "读不到 Tailscale 状态，拒绝预览撤销"
+    "tswizPreviewResetUnreadable": "读不到 Tailscale 状态，拒绝预览撤销",
+    "rapiInternalTask": "内部任务异常",
+    "rapiNothingToSubmit": "没有可提交的内容（输入为空且终端行无暂存）",
+    "rapiScreenFatal": "屏读形态异常，已中止——请人工核对终端",
+    "rapiDeliveryBusy": "投递进行中，请稍后重试",
+    "rapiNoScreenread": "本平台无屏读，权限菜单无法定位（命令已发送，请在终端选择档位）",
+    "rapiModeFatal": "模式切换未确认，请人工核对终端",
+    "rapiPermissionMenuFail": "权限菜单屏读失败——详见日志",
+    "rapiConfirmFatal": "确认未通过（Full Access 可能未生效），请人工核对终端",
+    "rapiConfirmScreenFail": "确认框屏读失败——详见日志",
+    "rapiConfirmWindowsOnly": "确认框屏读簇仅 Windows 支持",
+    "rapiPollFatal": "轮询中止——请人工核对终端",
+    "rapiScreenReadFail": "屏读失败——详见日志",
+    "rapiScreenFatalRetry": "屏读异常（已中止）——请人工核对终端"
   }
 }
