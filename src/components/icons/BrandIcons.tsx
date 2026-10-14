@@ -1,7 +1,12 @@
-// 品牌图标 — path 取自 assets/icons/*.svg（simple-icons / opencode 官网），currentColor 随文字色
+// 品牌图标 — 全部 8 工具 canonical 标的唯一出处（2026-10-14 统一批定案）：
+// 桌面 chips/会话卡/通知、资源/预设/设置（经 ToolIcon 委托）、移动看板卡片
+// 全部消费本文件。claude/codex/kimi 沿用官方单色 path（currentColor 随文字色）；
+// opencode/zcode/dsh/workbuddy 按用户提供的官方参考图重绘（2026-10-14）；
+// openclaw 自 ToolIcon 实物搬迁为固定色。
+import { useId } from "react";
 
 // 兔维斯品牌标（扁平几何版吉祥物：兔耳 + 白框蓝片目镜 + 下巴绿色状态灯）
-// 固定品牌色（同 OpenCodeIcon 做法）；单色场合可把填充全部换成 currentColor
+// 固定品牌色；单色场合可把填充全部换成 currentColor
 export function TuvisLogoMark({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" role="img" aria-label="Tuvis">
@@ -63,17 +68,36 @@ export function OpenAIIcon({ className }: { className?: string }) {
   );
 }
 
+// OpenCode — 官方标（2026-10-14 用户对照官网参考图定案）：近直角黑方 + 白方膛 +
+// 膛内两段竖矩形（上黑 / 下中灰）。白底板四周溢出细白边（≈0.7px @14px chip）：
+// 近黑底（选中 chip、深色徽章底）勾出轮廓，白底上不可见
 export function OpenCodeIcon({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 512 512" role="img" aria-label="OpenCode">
-      {/* 自带配色（灰块+白环），徽标底为深色故两色均可见 */}
-      <path d="M320 224V352H192V224H320Z" fill="#5A5858" />
-      <path
-        fillRule="evenodd"
-        clipRule="evenodd"
-        d="M384 416H128V96H384V416ZM320 160H192V352H320V160Z"
-        fill="white"
-      />
+      {/* 细白边底板 */}
+      <rect x="30" y="30" width="452" height="452" fill="#FFFFFF" />
+      {/* 黑方主体 */}
+      <rect x="56" y="56" width="400" height="400" fill="#1A1A1A" />
+      {/* 白方膛 */}
+      <rect x="148" y="140" width="216" height="232" fill="#FFFFFF" />
+      {/* 膛内两段芯：上黑 ~34% / 下中灰 ~66%（比例/色值按参考图实测校准） */}
+      <rect x="198" y="180" width="116" height="50" fill="#1A1A1A" />
+      <rect x="198" y="230" width="116" height="102" fill="#5A5858" />
+    </svg>
+  );
+}
+
+// OpenClaw — 红底白机器人（原 ToolIcon 实物搬迁，2026-10-14 统一批；红 #D2453C
+// 与台账/移动卡檐同源，靛蓝回退值随 CSS 变量表一并退役）
+export function OpenClawIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 20 20" role="img" aria-label="OpenClaw">
+      <rect width="20" height="20" rx="5" fill="#D2453C" />
+      <circle cx="10" cy="11" r="4.5" stroke="white" strokeWidth="1.5" />
+      <circle cx="8" cy="10" r="0.8" fill="white" />
+      <circle cx="12" cy="10" r="0.8" fill="white" />
+      <path d="M6 6.5L8 4" stroke="white" strokeWidth="1.3" strokeLinecap="round" />
+      <path d="M14 6.5L12 4" stroke="white" strokeWidth="1.3" strokeLinecap="round" />
     </svg>
   );
 }
@@ -93,6 +117,116 @@ export function KimiIcon({ className }: { className?: string }) {
     >
       {/* 弦月（Feather moon）：Moonshot/Kimi 品牌意象 */}
       <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    </svg>
+  );
+}
+
+// WorkBuddy — 官方应用图标重绘（2026-10-14 用户参考图定案；r4 按「不够像」反馈
+// 对照参考图重校）：绿渐变圆角方 + 白猫头（右耳更高的整体右倾体态、双饱满耳、
+// 头部铺到左缘）+ 大号白描边圆角矩形脸（渐变透底 + 两枚胖竖椭圆眼，倾斜 ~18°）。
+// 渐变 id 用 useId，防同页多实例 id 冲突
+export function WorkBuddyIcon({ className }: { className?: string }) {
+  const gid = useId();
+  return (
+    <svg className={className} viewBox="0 0 256 256" role="img" aria-label="WorkBuddy">
+      <defs>
+        <linearGradient id={gid} x1="128" y1="16" x2="128" y2="240" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#5BC5A7" />
+          <stop offset="1" stopColor="#80CF7D" />
+        </linearGradient>
+      </defs>
+      {/* 圆角方渐变底 */}
+      <rect width="256" height="256" rx="58" fill={`url(#${gid})`} />
+      {/* 白猫头 + 脸框同组旋转（2026-10-14 用户定案：脸本身左右对称，倾斜只用
+          组旋转表达——头部几何严格镜像对称于 x=128，双耳等高、颅体居中） */}
+      <g transform="rotate(-16 128 148)">
+        <path
+          d="M34 186
+             C24 132 28 88 52 62
+             L62 34
+             C64 27 71 25 77 30
+             C92 43 109 50 128 50
+             C147 50 164 43 179 30
+             C185 25 192 27 194 34
+             L204 62
+             C228 88 232 132 222 186
+             Z"
+          fill="#FFFFFF"
+        />
+        {/* 大号白描边圆角矩形脸（渐变透底，与背景无缝续接） */}
+        <rect
+          x="55"
+          y="98"
+          width="146"
+          height="100"
+          rx="30"
+          fill={`url(#${gid})`}
+          stroke="#FFFFFF"
+          strokeWidth="14"
+        />
+        {/* 两枚白色胖竖椭圆眼（关于中轴对称；参考图实测眼径 rx15/ry20） */}
+        <ellipse cx="95" cy="174" rx="15" ry="20" fill="#FFFFFF" />
+        <ellipse cx="161" cy="174" rx="15" ry="20" fill="#FFFFFF" />
+      </g>
+    </svg>
+  );
+}
+
+// ZCode — 官方标重绘（2026-10-14 用户参考图定案）：炭灰大圆角方 + 白色斜切 Z
+// （横杠带楔形斜切 + 粗斜杠，微倾速度感）。白底板细白边防深底融入（浅底不可见）；
+// 图标随官方炭灰，卡片檐色台账 #141413 不受影响
+export function ZCodeIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 512 512" role="img" aria-label="ZCode">
+      {/* 细白边底板 */}
+      <rect width="512" height="512" rx="90" fill="#FFFFFF" />
+      {/* 炭灰圆角方 */}
+      <rect x="24" y="24" width="464" height="464" rx="76" fill="#2D2D2D" />
+      {/* 斜切 Z：斜杠横向厚度 ~130（参考图实测 28% Z 宽量级，ui-worker 首轮验收校准） */}
+      <path d="M96 114 H418 L260 348 H418 V398 H96 L260 156 H96 Z" fill="#FFFFFF" />
+    </svg>
+  );
+}
+
+// dsh（DeepSeek）— 官方蓝鲸 glyph 重绘（2026-10-14 用户参考图定案；r4 按「不够像」
+// 反馈对照参考图重校）：#4D6BFE 扁圆鲸身（长宽比 ~1.33、头左上）、头顶小尖突、
+// 右向翼状双尖尾鳍（鳍顶为全身最高点）、大白 swoosh 自左侧开口的斜贯带（左端厚
+// 切至鲸身 55% 高、右端收尖于鲸宽 ~60%）、左下 wave 弧分离、白环+蓝瞳眼位于鲸身
+// 中右（参考图实测 55-65% 鲸宽）。透明底，白区一律 evenodd 挖空
+export function DshIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 256 256" role="img" aria-label="DSH">
+      {/* 鲸上主体（额头条 + 头顶尖突 + 右向双尖尾鳍 + 沿 swoosh 上缘的斜贯咬口；
+          眼圈为挖空子路径，圆心 (156,108) 居鲸身中右） */}
+      <path
+        fillRule="evenodd"
+        d="M26 100
+           C30 66 48 44 72 38
+           L92 28 L102 42
+           C124 50 148 46 168 42
+           C180 30 192 24 204 26
+           C210 36 212 44 214 50
+           C222 50 232 54 240 62
+           C226 60 210 60 198 66
+           C206 92 202 120 186 146
+           C174 160 160 166 148 166
+           C112 154 62 134 28 108
+           Z
+           M156 95 a13 13 0 1 0 0.01 0 Z"
+        fill="#4D6BFE"
+      />
+      {/* 眼点（蓝瞳居白环中） */}
+      <circle cx="156" cy="108" r="5.5" fill="#4D6BFE" />
+      {/* 左下 wave 弧（与鲸上主体拉开 swoosh 斜贯透明缝，右端收尖贴向腹缘） */}
+      <path
+        d="M24 168
+           C60 180 100 184 134 180
+           C152 177 168 172 178 164
+           C170 180 148 190 120 192
+           C88 194 52 190 32 180
+           C26 176 22 172 24 168 Z"
+        fill="#4D6BFE"
+      />
     </svg>
   );
 }

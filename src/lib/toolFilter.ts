@@ -14,8 +14,9 @@ export function filterByAgent(sessions: Session[], filter: ToolFilter): Session[
   return sessions.filter((s) => s.agentType === filter);
 }
 
-/** 持久化读：空/损坏/超出八工具清单的值一律回落 "all"——防御 localStorage
- *  脏数据，AgentType 增删值后旧残留也不会把筛选卡死在不存在的工具上 */
+/** 持久化读：空/损坏/超出工具清单的值一律回落 "all"——防御 localStorage
+ *  脏数据，AgentType 增删值后旧残留也不会把筛选卡死在不存在的工具上
+ *  （含 2026-10-14 起 openclaw 移出筛选清单后存量 `"openclaw"` 的自动回落） */
 export function loadToolFilter(): ToolFilter {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);

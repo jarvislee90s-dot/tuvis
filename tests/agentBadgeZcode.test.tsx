@@ -2,9 +2,8 @@ import { render } from "@testing-library/react";
 import { describe, it, expect } from "vitest";
 import { AGENT_BADGE, getAgentLabel } from "@/lib/agentBadge";
 
-// ZCode 徽标专项（新文件，不触碰既有 agentBadge.test.tsx——该文件为基线零 diff，
-// 其显式 label 断言清单在基线即不含 workbuddy，zcode 的存在性覆盖由其
-// SUPPORTED_TOOLS 遍历承担；本文件补显式 label/渲染断言）
+// ZCode 徽标专项——zcode 的存在性 / brandHex / 渲染冒烟覆盖由 agentBadge.test.tsx
+// 的 SUPPORTED_TOOLS 遍历与穷尽键集冒烟承担；本文件补 zcode 显式 label / 渲染断言
 describe("agentBadge zcode", () => {
   it("maps zcode to its display name", () => {
     expect(getAgentLabel("zcode")).toBe("ZCode");
