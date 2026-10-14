@@ -1,0 +1,61 @@
+//! 用户可见错误的结构化码（#123/#150/#157 全量迁移，2026-10-14 定案）。
+//!
+//! # 问题
+//! Rust 侧 `Err(String)` 的中文文案经 Tauri IPC 原样上屏——英文界面用户在任何
+//! 出错路径都会看到中文。前端 [`crate`] 的既有先例 `W5_TOOL_DISABLED:<tool>`
+//! （services/tool_settings.rs）证明了「消息前缀码 + 前端按码取 i18n 键」可行，
+//! 但只有一个域在用。
+//!
+//! # 约定（唯一规则，前端 `src/lib/invokeError.ts` 与本模块互为镜像）
+//! * **形态 A（语义替换，大多数）**：`"EXPORT_NAME_EMPTY: 导出文件名不得为空"`
+//!   ——前缀码 + 冒号 + 空格 + 原中文句。前端命中已知码 → 整句换成 i18n 文案
+//!   （en 为纯英文语义句；动态数值细节留在原串里供日志与未知码回退，en 展示
+//!   不携带——如实申报的取舍）。
+//! * **形态 B（机器参数）**：`"SESSION_PID_GONE:12345: 进程 12345 不存在"`
+//!   ——码 + 冒号 + 单个机器值（id/pid/路径，**不含空格与冒号**）+ 冒号 + 原句。
+//!   前端模板以 `{{param}}` 插值。
+//! * **未知码 → 原样显示**（不静默吞）：迁移是逐点的，未迁移处走原文。
+//! * **码字符集** `[A-Z][A-Z0-9_]+`，命名 `域_原因`；locale 键 = `errors.` +
+//!   camelCase(码)（如 `REMOTE_NO_TUNNEL_TOKEN` → `errors.remoteNoTunnelToken`），
+//!   zh/en 双键齐备由 `scripts/check-error-codes.mjs`（挂 `pnpm check`）对账：
+//!   Rust 使用的码必须有双键；locale 有而 Rust 无 → 孤儿键报错（防拼写漂移）。
+//! * **协议结构体的 error 字段**（如 ChannelStatus）不走字符串前缀——按 #123
+//! 原案**加平行 `error_code` 字段**，原文保留供日志与未知码降级。
+//! * 既有三码 `W5_*` 与 `PRESET_ACTIVE:<id>` / `PRESET_NATIVE_IN_UNIVERSAL:<id>`
+//!   在前端以 legacy 别名兼容（映射到既有 errors.* 键），不强制改写。
+//!
+//! # 为什么码放前缀而不是单独协议字段
+//! `Err(String)` 是 Tauri 命令的既有返回形态（539 处），逐处改返回类型是协议
+//! 地震；前缀码对 Err(String) 零侵入，前端单点解析。log 与移动端原始展示不受
+//! 影响（码前缀可读性损失可接受）。
+
+/// 形态 A：`"CODE: 原中文句"`。detail 支持任意 Display（含 format! 结果）。
+pub fn coded(code: &str, detail: impl std::fmt::Display) -> String {
+    format!("{code}: {detail}")
+}
+
+/// 形态 B：`"CODE:机器参数: 原中文句"`。param 约定不含空格与冒号（id/pid/路径）。
+pub fn coded_param(
+    code: &str,
+    param: impl std::fmt::Display,
+    detail: impl std::fmt::Display,
+) -> String {
+    format!("{code}:{param}: {detail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{coded, coded_param};
+
+    #[test]
+    fn forms_are_as_documented() {
+        assert_eq!(
+            coded("EXPORT_NAME_EMPTY", "导出文件名不得为空"),
+            "EXPORT_NAME_EMPTY: 导出文件名不得为空"
+        );
+        assert_eq!(
+            coded_param("SESSION_PID_GONE", 12345, "进程 12345 不存在"),
+            "SESSION_PID_GONE:12345: 进程 12345 不存在"
+        );
+    }
+}

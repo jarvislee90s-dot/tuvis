@@ -169,7 +169,6 @@
       "allow": "Allow",
       "deny": "Deny"
     },
-
     "notifications": {
       "title": "Notifications",
       "heading": "Notification Settings",
@@ -1254,6 +1253,8 @@
   "errors": {
     "toolDisabled": "Tool {{tools}} is disabled — enable it in Settings → Tool Management first",
     "applyInProgress": "A tool settings save is already in progress",
-    "applyTaskFailed": "Tool settings save task crashed — please retry"
+    "applyTaskFailed": "Tool settings save task crashed — please retry",
+    "presetActive": "Preset {{param}} is currently active — restore defaults before editing it",
+    "presetNativeInUniversal": "Universal presets cannot contain native skill {{param}} (native items belong to tool-scoped presets only)"
   }
 }

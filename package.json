@@ -22,7 +22,7 @@
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css,json}\"",
     "lint": "eslint \"src/**/*.{ts,tsx}\" vite.config.ts vite.config.mobile.ts",
     "lint:fix": "eslint \"src/**/*.{ts,tsx}\" vite.config.ts vite.config.mobile.ts --fix",
-    "check": "pnpm format:check && pnpm lint && pnpm check:i18n && pnpm build",
+    "check": "pnpm format:check && pnpm lint && pnpm check:i18n && node scripts/check-error-codes.mjs && pnpm build",
     "check:i18n": "node scripts/check-i18n.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
