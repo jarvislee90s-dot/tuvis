@@ -248,9 +248,10 @@ export function PresetEditDialog({
       onClose();
     } catch (e) {
       // 后端守卫：预设正在应用中时错误串含 PRESET_ACTIVE 标记（commands/preset.rs）
-      const msg = formatInvokeError(e, t);
-      if (msg.includes("PRESET_ACTIVE")) toast.error(t("presets.saveFailedActive"));
-      else toast.error(t("common.saveFailed", { error: msg }));
+      // #123 前缀码化后：码判定必须在原文上做（formatInvokeError 会把已知码换成 i18n 文案）
+      const raw = typeof e === "string" ? e : String(e);
+      if (raw.includes("PRESET_ACTIVE")) toast.error(t("presets.saveFailedActive"));
+      else toast.error(t("common.saveFailed", { error: formatInvokeError(raw, t) }));
     } finally {
       setSaving(false);
     }

@@ -35,7 +35,10 @@ export function formatInvokeError(e: unknown, t: TranslateFn): string {
   for (const l of LEGACY) {
     const m = raw.match(l.re);
     if (m) {
-      const translated = t(l.key, l.param === "m1" ? { param: m[1], tools: m[1], id: m[1] } : undefined);
+      const translated = t(
+        l.key,
+        l.param === "m1" ? { param: m[1], tools: m[1], id: m[1] } : undefined
+      );
       // 键尚未登记（域迁移中间态）→ 原文回退，与未迁移域行为一致
       if (translated !== l.key) return translated;
       return raw;

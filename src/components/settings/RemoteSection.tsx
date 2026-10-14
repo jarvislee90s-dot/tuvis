@@ -1030,7 +1030,9 @@ export function RemoteSection() {
                       {t("settings.remote.copy")}
                     </Button>
                   )}
-                  {namedErr && <span className="text-xs text-amber-500">{formatInvokeError(namedErr, t)}</span>}
+                  {namedErr && (
+                    <span className="text-xs text-amber-500">{formatInvokeError(namedErr, t)}</span>
+                  )}
                 </div>
                 {/* 运行态行（B3，与 lan/quick 同一套 offCause 口径）：永久地址卡也必须有 */}
                 <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -1175,7 +1177,11 @@ export function RemoteSection() {
                       <span className="text-muted-foreground text-xs">
                         {t("settings.remote.tsRunningHint")}
                       </span>
-                      {tsErr && <span className="text-xs text-amber-500">{formatInvokeError(tsErr, t)}</span>}
+                      {tsErr && (
+                        <span className="text-xs text-amber-500">
+                          {formatInvokeError(tsErr, t)}
+                        </span>
+                      )}
                     </div>
                     {tsAddr && (
                       <div className="mt-3">
@@ -1200,7 +1206,9 @@ export function RemoteSection() {
                     )}
                     {tsErr && (
                       <div className="mt-1 flex flex-wrap items-center gap-2">
-                        <span className="text-xs text-amber-500">{formatInvokeError(tsErr, t)}</span>
+                        <span className="text-xs text-amber-500">
+                          {formatInvokeError(tsErr, t)}
+                        </span>
                         {/* 瞬时抖动引导（2026-10-13）：连不通类失败 60s 轮询自愈——
                             前缀判定与 reach.rs 格式串同步（reason 恒中文），详见向导侧同款 */}
                         {tsErr.startsWith("REACH_ADDR_UNREACHABLE") && (

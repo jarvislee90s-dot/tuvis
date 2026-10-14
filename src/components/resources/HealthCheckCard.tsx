@@ -160,7 +160,11 @@ export function HealthCheckCard() {
   // ② 不变量修复：toolId 取条目文本 '：' 前缀（后端格式 "{tool}：快照存在但无激活预设"）；
   // toast 沿用 PresetList 开关「关」的同款 restore 文案（应用内一致）
   const fixInvariant = async (line: string) => {
-    const toolId = line.split("：")[0]?.trim();
+    // #123 迁移后条目文本带错误码前缀（PRESET_SNAPSHOT_ORPHAN: {tool}：…）——先剥码再按全角冒号取 toolId
+    const toolId = line
+      .replace(/^[A-Z][A-Z0-9_]*:\s*/, "")
+      .split("：")[0]
+      ?.trim();
     if (!toolId) return;
     setInvPending(toolId);
     try {

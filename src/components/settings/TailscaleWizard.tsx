@@ -235,7 +235,7 @@ export function TailscaleWizard() {
       )}
       {loadError !== null && (
         <p data-testid="ts-load-error" className="mt-1 text-xs text-rose-500">
-          {t("settings.remote.tsWizard.loadFailed")}: {loadError}
+          {t("settings.remote.tsWizard.loadFailed")}: {formatInvokeError(loadError, t)}
         </p>
       )}
       {probe === null && loadError === null && (

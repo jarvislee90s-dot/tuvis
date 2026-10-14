@@ -20,9 +20,9 @@
 //!   zh/en 双键齐备由 `scripts/check-error-codes.mjs`（挂 `pnpm check`）对账：
 //!   Rust 使用的码必须有双键；locale 有而 Rust 无 → 孤儿键报错（防拼写漂移）。
 //! * **协议结构体的 error 字符串字段**（如 ChannelStatus.error）同样走前缀码——
-//! #123 原案是给 ChannelStatus 加平行 `error_code` 字段，全量迁移定案后统一为
-//! 前缀码（避免「539 处前缀 + 1 个结构体特例」两套规则）：前端展示该字段的
-//! 位置过一遍 `formatInvokeError` 即可，原文保留在码后供日志与未知码降级。
+//!   #123 原案是给 ChannelStatus 加平行 `error_code` 字段，全量迁移定案后统一为
+//!   前缀码（避免「539 处前缀 + 1 个结构体特例」两套规则）：前端展示该字段的
+//!   位置过一遍 `formatInvokeError` 即可，原文保留在码后供日志与未知码降级。
 //! * 既有三码 `W5_*` 与 `PRESET_ACTIVE:<id>` / `PRESET_NATIVE_IN_UNIVERSAL:<id>`
 //!   在前端以 legacy 别名兼容（映射到既有 errors.* 键），不强制改写。
 //!
