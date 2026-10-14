@@ -21,7 +21,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { formatInvokeError } from "@/lib/invokeError";
+import { formatInvokeError, hasErrorCode } from "@/lib/invokeError";
 import { createPreset, updatePreset } from "@/lib/api/preset";
 import { PRESETS_KEY } from "@/lib/query/queries/presets";
 import { useEnabledToolsQuery } from "@/lib/query/queries/tools";
@@ -250,7 +250,7 @@ export function PresetEditDialog({
       // 后端守卫：预设正在应用中时错误串含 PRESET_ACTIVE 标记（commands/preset.rs）
       // #123 前缀码化后：码判定必须在原文上做（formatInvokeError 会把已知码换成 i18n 文案）
       const raw = typeof e === "string" ? e : String(e);
-      if (raw.includes("PRESET_ACTIVE")) toast.error(t("presets.saveFailedActive"));
+      if (hasErrorCode(raw, "PRESET_ACTIVE")) toast.error(t("presets.saveFailedActive"));
       else toast.error(t("common.saveFailed", { error: formatInvokeError(raw, t) }));
     } finally {
       setSaving(false);

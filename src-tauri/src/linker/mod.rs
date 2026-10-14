@@ -275,7 +275,7 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
 pub fn write_config_locked(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|e| format!("LINKER_MKDIR_FAIL: 创建目录失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_MKDIR_FAIL: 创建目录失败: {}", e))?;
     }
     let file = fs::OpenOptions::new()
         .create(true)

@@ -61,11 +61,18 @@ function stripTests(src) {
   let out = "";
   let i = 0;
   while (i < src.length) {
-    const m = src.slice(i).search(/#\[cfg\(test\)\]/);
-    if (m < 0) {
-      out += src.slice(i);
+    // 锚点收紧为行首属性（评审 I1）：注释已由调用方剥掉，这里只会命中真正的
+    // `#[cfg(test)]` / `#[cfg(all(test, …))]`；宽松 search 会把文档注释里提到的
+    // cfg(test) 当锚点、整段吞掉后续生产代码（error.rs 41→242 实证漏网）
+    const rest = src.slice(i);
+    const lm = rest
+      .split("\n")
+      .reduce((acc, l, idx, arr) => acc ?? (/^\s*#\[cfg\((?:test|all\(test[^\)]*\))\)\s*$/.test(l) ? arr.slice(0, idx).join("\n").length + 1 : null), null);
+    if (lm === null) {
+      out += rest;
       break;
     }
+    const m = lm;
     out += src.slice(i, i + m);
     const brace = src.indexOf("{", i + m);
     if (brace < 0) break;
@@ -93,7 +100,7 @@ function walk(dir) {
     if (!f.endsWith(".rs")) continue;
     const raw = readFileSync(p, "utf8");
     checkRepeated(stripComments(raw), p);
-    const src = stripComments(stripTests(raw));
+    const src = stripTests(stripComments(raw)); // I1：先剥注释再锚定 cfg(test)——反序会把文档注释里的 cfg(test) 当锚点吞掉生产代码
     for (const re of [CODED_CALL, CODED_LITERAL]) {
       for (const m of src.matchAll(re)) codes.add(m[1]);
     }
@@ -149,9 +156,30 @@ function checkRepeated(src, label) {
     .forEach((l, i) => {
       const t = l.trim();
       if (t.startsWith("//") || t.startsWith("*")) return;
-      if (/([A-Z][A-Z0-9_]{2,}: ){2,}/.test(l))
+      // I2：覆盖形态 B（A:param: A:param: / A: CODE:param: 等叠加形态都要抓）
+      if (/([A-Z][A-Z0-9_]{2,}(?::[^:\s]+)?: ){2,}/.test(l))
         fail.push(`${label}:${i + 1} 重复码前缀（批量改写叠加事故？）：${t.slice(0, 60)}`);
     });
+}
+
+// 同串同码（评审 I4）：剥码后的同一字面量若映射到多个码 → 红（防「同句不同命」
+// ——同一句中文一处打码一处漏/换码，用户看到同句不同前缀）。Rust 与前端两源同查。
+const literalCodes = new Map(); // 剥码后原文 → Set<code>
+function collectLiteralCodes(src) {
+  // 转义引号容忍：字面量含 \" 时不能截断（jsonc.rs 的 section "{}" 实证）
+  for (const m of src.matchAll(/"([A-Z][A-Z0-9_]{2,})(?::[^:\s]+)?: ((?:[^"\\]|\\.)+)"/g)) {
+    const lit = m[2];
+    if (!literalCodes.has(lit)) literalCodes.set(lit, new Set());
+    literalCodes.get(lit).add(m[1]);
+  }
+}
+for (const f of readdirSync(SRC, { recursive: true })) {
+  if (typeof f !== "string" || !f.endsWith(".rs")) continue;
+  const raw = readFileSync(path.join(SRC, f), "utf8");
+  collectLiteralCodes(stripTests(stripComments(raw)));
+}
+for (const [lit, set] of literalCodes) {
+  if (set.size > 1) fail.push(`同一句中文映射了多个码（同串必须同码）："${lit.slice(0, 40)}…" → ${[...set].join(" / ")}`);
 }
 
 if (fail.length) {

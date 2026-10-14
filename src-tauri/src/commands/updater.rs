@@ -225,7 +225,7 @@ async fn fetch_github_releases() -> Result<Vec<GithubRelease>, String> {
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(20))
         .build()
-        .map_err(|e| format!("UPDATER_CLIENT_BUILD: HTTP 客户端构建失败: {e}"))?;
+        .map_err(|e| format!("HTTP_CLIENT_BUILD_FAIL: HTTP 客户端构建失败: {e}"))?;
     match fetch_releases_with_client(client).await {
         Ok(list) => Ok(list),
         Err(via_default) => match fetch_releases_via_doh_pinned().await {

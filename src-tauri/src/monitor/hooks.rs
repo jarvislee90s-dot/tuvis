@@ -814,7 +814,7 @@ fn register_kimi_hooks_in_file(
     let content = read_user_config_text(config_path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
         .parse()
-        .map_err(|e| format!("HOOKS_PARSE_TOML: 解析 TOML 失败: {}", e))?;
+        .map_err(|e| format!("MCP_PARSE_TOML: 解析 TOML 失败: {}", e))?;
     if doc.get("hooks").is_none() {
         doc["hooks"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
     }

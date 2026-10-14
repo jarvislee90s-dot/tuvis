@@ -54,3 +54,10 @@ export function formatInvokeError(e: unknown, t: TranslateFn): string {
   }
   return raw;
 }
+
+/** 码判定单点（评审 Minor）：判断原始错误串是否携带指定码——必须在【原文】上做
+ *  （formatInvokeError 会把已知码换成 i18n 文案，判码在换前）。 */
+export function hasErrorCode(e: unknown, code: string): boolean {
+  const raw = typeof e === "string" ? e : String(e);
+  return raw.includes(code);
+}

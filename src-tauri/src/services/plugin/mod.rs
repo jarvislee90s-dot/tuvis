@@ -30,7 +30,7 @@ pub fn install_plugin_to_repo(source: &Path, name: &str, overwrite: bool) -> Res
     let dest = repo.join(name);
     if dest.exists() {
         if !overwrite {
-            return Err(format!("PLUGIN_NAME_TAKEN: 已存在同名资源: {}", name));
+            return Err(format!("LINKER_NAME_TAKEN: 已存在同名资源: {}", name));
         }
         if dest.is_dir() {
             let _ = std::fs::remove_dir_all(&dest);
@@ -135,7 +135,7 @@ pub fn enable_config_plugin(
     match adapter.mcp_format() {
         crate::adapter::McpFormat::Json => {
             let mut root: serde_json::Value = serde_json::from_str(&content)
-                .map_err(|e| format!("PLUGIN_PARSE_JSON: 解析 JSON 配置失败: {}", e))?;
+                .map_err(|e| format!("MCP_PARSE_JSON: 解析 JSON 配置失败: {}", e))?;
             if root.get("plugins").is_none() {
                 root["plugins"] = serde_json::json!({});
             }
@@ -161,7 +161,7 @@ pub fn enable_config_plugin(
             let content = std::fs::read_to_string(config_path).unwrap_or_default();
             let mut doc: toml_edit::DocumentMut = content
                 .parse()
-                .map_err(|e| format!("PLUGIN_PARSE_TOML: 解析 TOML 失败: {}", e))?;
+                .map_err(|e| format!("MCP_PARSE_TOML: 解析 TOML 失败: {}", e))?;
             if doc.get("plugins").is_none() {
                 doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
             }
@@ -231,7 +231,7 @@ pub fn disable_config_plugin(plugin_name: &str, tool_id: &str) -> Result<(), Str
         crate::adapter::McpFormat::Json => {
             let content = std::fs::read_to_string(config_path).unwrap_or_else(|_| "{}".to_string());
             let mut root: serde_json::Value = serde_json::from_str(&content)
-                .map_err(|e| format!("PLUGIN_PARSE_JSON: 解析 JSON 配置失败: {}", e))?;
+                .map_err(|e| format!("MCP_PARSE_JSON: 解析 JSON 配置失败: {}", e))?;
             if let Some(plugins) = root.get_mut("plugins").and_then(|p| p.as_object_mut()) {
                 plugins.remove(plugin_name);
             }
@@ -247,7 +247,7 @@ pub fn disable_config_plugin(plugin_name: &str, tool_id: &str) -> Result<(), Str
             let content = std::fs::read_to_string(config_path).unwrap_or_default();
             let mut doc: toml_edit::DocumentMut = content
                 .parse()
-                .map_err(|e| format!("PLUGIN_PARSE_TOML: 解析 TOML 失败: {}", e))?;
+                .map_err(|e| format!("MCP_PARSE_TOML: 解析 TOML 失败: {}", e))?;
             if let Some(plugins) = doc.get_mut("plugins").and_then(|p| p.as_table_mut()) {
                 plugins.remove(plugin_name);
             }

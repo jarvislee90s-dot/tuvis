@@ -157,12 +157,15 @@ export function HealthCheckCard() {
     }
   };
 
-  /** 不变量行解析（单点）：剥「CODE:」或「CODE:param:」前缀（形态 A/B 兼容）后按全角冒号取 toolId */
+  /** 不变量行解析（单点）：形态 B 优先取 param 段（param 是小写工具 id，剥码正则吃不掉——评审 C1）；
+   *  形态 A / 无码回退剥一段后按全角冒号取 toolId */
   const parseInvariantLine = (line: string) =>
+    line.match(/^[A-Z][A-Z0-9_]{2,}:([^:\s]+):/)?.[1] ??
     line
-      .replace(/^(?:[A-Z][A-Z0-9_]*:){1,2}\s*/, "")
+      .replace(/^[A-Z][A-Z0-9_]*:\s*/, "")
       .split("：")[0]
-      ?.trim() ?? "";
+      ?.trim() ??
+    "";
 
   // ② 不变量修复：toolId 取条目文本 '：' 前缀（后端形态 "PRESET_SNAPSHOT_ORPHAN:{tool}：快照存在但无激活预设"）；
   // 剥码走单点 parseInvariantLine（形态 A/B 兼容），与下方渲染位同一解析；toast 沿用 PresetList 的 restore 文案
@@ -388,7 +391,9 @@ export function HealthCheckCard() {
                 const enabled = toolEnabled(toolId);
                 return (
                   <div key={line} className="flex items-center gap-2">
-                    <span className="min-w-0 flex-1 truncate text-xs text-amber-500">{line}</span>
+                    <span className="min-w-0 flex-1 truncate text-xs text-amber-500">
+                      {formatInvokeError(line, t)}
+                    </span>
                     <Button
                       size="sm"
                       variant="outline"

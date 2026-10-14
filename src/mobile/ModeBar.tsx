@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
+import { formatInvokeError } from "@/lib/invokeError";
+import i18n from "@/i18n";
 import { toneTokens } from "./InteractiveCard";
 import {
   ApiError,
@@ -125,7 +127,7 @@ export default function ModeBar({ session }: { session: { id: string } }) {
             // 不消费这条码的话用户只会看到「session-mode/switch 409」这种无意义串
             setError(appFormPendingCopy(e));
           } else {
-            setError(e.message);
+            setError(formatInvokeError(e.message, i18n.t));
           }
         } else {
           setError(String(e));

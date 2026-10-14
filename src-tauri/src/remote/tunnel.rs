@@ -276,7 +276,7 @@ pub(crate) fn download_url_to(url: &str, dest: &Path) -> Result<(), String> {
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(600))
         .build()
-        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
+        .map_err(|e| format!("HTTP_CLIENT_BUILD_FAIL: HTTP 客户端构建失败: {e}"))?;
     let bytes = tauri::async_runtime::block_on(async {
         client
             .get(url)
@@ -641,7 +641,7 @@ async fn supervise(mode: String, port: u16, stop: Arc<AtomicBool>) {
                 // spec T1b：放弃时桌面通知报错（Task 8 的 useRemoteEvents 监听）
                 crate::remote::events::emit_ui(
                     "remote-tunnel-error",
-                    serde_json::json!({"error": "cloudflared 连续失败 3 次，已停止守护", "channel": mode}),
+                    serde_json::json!({"error": "REMOTE_TUNNEL_GAVE_UP: cloudflared 连续失败 3 次，已停止守护", "channel": mode}),
                 );
                 return;
             }

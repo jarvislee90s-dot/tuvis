@@ -58,6 +58,8 @@
 //   探针失败（网络异常）→ 按「不在场」放行（能力缺失不阻断，与后端
 //   `blocks_control_injection` 同裁决）；代价是弱网下退化为无分流，如实申报。
 import { useCallback, useEffect, useRef, useState } from "react";
+import { formatInvokeError } from "@/lib/invokeError";
+import i18n from "@/i18n";
 import type { ClipboardEvent as ReactClipboardEvent } from "react";
 import { CircleHelp, Plus } from "lucide-react";
 import {
@@ -807,7 +809,7 @@ export default function MessageComposer({ session }: MessageComposerProps) {
           const reason =
             e instanceof ApiError && isNoCwd
               ? "该会话没有项目目录信息"
-              : String(e instanceof ApiError ? e.message : e);
+              : formatInvokeError(e instanceof ApiError ? e.message : String(e), i18n.t);
           setAttachments((prev) =>
             prev.map((a) => (a.id === id ? { ...a, status: "failed", error: reason } : a))
           );

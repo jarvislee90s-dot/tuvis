@@ -35,6 +35,8 @@ const LINE_WHITELIST: Record<string, (line: number) => boolean> = {
 };
 
 const CJK = /["'`][^"'`\n]*[\u4e00-\u9fff][^"'`\n]*["'`]/;
+// JSX 文本节点（>中文<）也算上屏面——评审 I7
+const CJK_JSX = />[^<>]*[一-鿿][^<>]*</;
 
 function walk(dir: string, files: string[] = []) {
   for (const f of readdirSync(dir)) {
@@ -101,12 +103,13 @@ describe("上屏中文扫描（桌面零容忍 / mobile 白名单）", () => {
           return;
         }
         if (LINE_WHITELIST[rel]?.(i + 1)) return;
-        if (CJK.test(line)) offenders.push(`${rel}:${i + 1}: ${line.trim().slice(0, 60)}`);
+        if (CJK.test(line) || CJK_JSX.test(line))
+          offenders.push(`${rel}:${i + 1}: ${line.trim().slice(0, 60)}`);
       });
     }
     expect(
       offenders,
-      `桌面端发现硬编码中文（新文案请走 t()；错误走错误码——见 src-tauri/src/errcode.ts 约定；\n` +
+      `桌面端发现硬编码中文（新文案请走 t()；错误走错误码——见 src-tauri/src/errcode.rs 约定；\n` +
         `若确属白名单面请在 FILE_WHITELIST 登记理由并同步 #157）：\n${offenders.join("\n")}`
     ).toEqual([]);
   });

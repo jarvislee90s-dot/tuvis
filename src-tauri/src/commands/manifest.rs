@@ -192,7 +192,7 @@ pub fn uninstall_resource(
     force: Option<bool>,
 ) -> Result<UninstallOutcome, String> {
     if !["skill", "mcp", "plugin"].contains(&kind.as_str()) {
-        return Err(format!("MANIFEST_UNKNOWN_KIND: 未知资源类型: {}", kind));
+        return Err(format!("RESOURCE_UNKNOWN_KIND: 未知资源类型: {}", kind));
     }
     let ext_id = format!("{}-{}", kind, name);
     let record = crate::database::list_extensions()

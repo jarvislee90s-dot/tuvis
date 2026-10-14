@@ -14,7 +14,7 @@ pub fn install_skill(source_path: &str, name: &str, overwrite: bool) -> Result<(
     let source = std::path::Path::new(source_path);
     if !source.exists() {
         return Err(format!(
-            "SKILL_SOURCE_MISSING: 源路径不存在: {}",
+            "LINKER_SOURCE_MISSING: 源路径不存在: {}",
             source_path
         ));
     }

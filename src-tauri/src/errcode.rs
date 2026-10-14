@@ -15,7 +15,7 @@
 //!   ——码 + 冒号 + 单个机器值（id/pid/路径，**不含空格与冒号**）+ 冒号 + 原句。
 //!   前端模板以 `{{param}}` 插值。
 //! * **未知码 → 原样显示**（不静默吞）：迁移是逐点的，未迁移处走原文。
-//! * **码字符集** `[A-Z][A-Z0-9_]+`，命名 `域_原因`；locale 键 = `errors.` +
+//! * **码字符集** `[A-Z][A-Z0-9_]{2,}`（≥3 字符，与门禁/前端解析器一致），命名 `域_原因`；locale 键 = `errors.` +
 //!   camelCase(码)（如 `REMOTE_NO_TUNNEL_TOKEN` → `errors.remoteNoTunnelToken`），
 //!   zh/en 双键齐备由 `scripts/check-error-codes.mjs`（挂 `pnpm check`）对账：
 //!   Rust 使用的码必须有双键；locale 有而 Rust 无 → 孤儿键报错（防拼写漂移）。
@@ -34,34 +34,9 @@
 //! `Err(String)` 是 Tauri 命令的既有返回形态（539 处），逐处改返回类型是协议
 //! 地震；前缀码对 Err(String) 零侵入，前端单点解析。log 与移动端原始展示不受
 //! 影响（码前缀可读性损失可接受）。
-
-/// 形态 A：`"CODE: 原中文句"`。detail 支持任意 Display（含 format! 结果）。
-pub fn coded(code: &str, detail: impl std::fmt::Display) -> String {
-    format!("{code}: {detail}")
-}
-
-/// 形态 B：`"CODE:机器参数: 原中文句"`。param 约定不含空格与冒号（id/pid/路径）。
-pub fn coded_param(
-    code: &str,
-    param: impl std::fmt::Display,
-    detail: impl std::fmt::Display,
-) -> String {
-    format!("{code}:{param}: {detail}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{coded, coded_param};
-
-    #[test]
-    fn forms_are_as_documented() {
-        assert_eq!(
-            coded("EXPORT_NAME_EMPTY", "导出文件名不得为空"),
-            "EXPORT_NAME_EMPTY: 导出文件名不得为空"
-        );
-        assert_eq!(
-            coded_param("SESSION_PID_GONE", 12345, "进程 12345 不存在"),
-            "SESSION_PID_GONE:12345: 进程 12345 不存在"
-        );
-    }
-}
+//!
+//! # 迁移实操口径
+//! 字面量直写为主：`"CODE: 原句"` / `"CODE:param: 原句"` 直接进
+//! `Err(format!(...))`——不设 helper（曾提供 coded()/coded_param()，零采用已删，
+//! 避免后人误以为必经 helper）。门禁 `scripts/check-error-codes.mjs` 与本文件
+//! 互为镜像，其 EXCLUDE_CODES（TUVIS marker 前缀）与 LEGACY 码表以脚本为单一出处。

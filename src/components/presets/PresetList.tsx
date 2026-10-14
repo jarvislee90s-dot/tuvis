@@ -8,7 +8,7 @@ import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { formatInvokeError } from "@/lib/invokeError";
+import { formatInvokeError, hasErrorCode } from "@/lib/invokeError";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { ApplyConfirmDialog } from "@/components/presets/ApplyConfirmDialog";
@@ -168,7 +168,7 @@ export function PresetList({
       // 后端守卫：预设正在应用中时错误串带 PRESET_ACTIVE 标记（commands/preset.rs）
       // #123 前缀码化后：码判定必须在原文上做（formatInvokeError 会把已知码换成 i18n 文案）
       const raw = typeof e === "string" ? e : String(e);
-      if (raw.includes("PRESET_ACTIVE")) toast.error(t("presets.cannotDeleteActive"));
+      if (hasErrorCode(raw, "PRESET_ACTIVE")) toast.error(t("presets.cannotDeleteActive"));
       else toast.error(t("common.deleteFailed", { error: formatInvokeError(raw, t) }));
     } finally {
       setDeleteTarget(null);

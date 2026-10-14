@@ -5758,7 +5758,7 @@ pub fn action_supported(
         AnswerAction::Submit => {
             if !q.multi_select {
                 return Err(ActionRefusal::BadParameter(
-                    "submit 仅用于多选题".to_string(),
+                    "Q_SUBMIT_MULTI_ONLY: submit 仅用于多选题".to_string(),
                 ));
             }
             match question_key_profile(tool) {
