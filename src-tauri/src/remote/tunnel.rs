@@ -184,7 +184,7 @@ fn try_download(
 /// 旧文案只给 `~/.tuvis/bin/` 相对写法，用户无法直接定位放置点
 fn download_failure_message(reason: &str, asset: &str, dest: &Path) -> String {
     format!(
-        "cloudflared 自动获取失败: {reason}；可从 \
+        "REMOTE_TUNNEL_DOWNLOAD_FAIL: cloudflared 自动获取失败: {reason}；可从 \
          https://github.com/cloudflare/cloudflared/releases 手动下载 {asset}，\
          放到 {} 后重试",
         dest.display()
@@ -480,7 +480,9 @@ pub fn start_channel(mode: &str, port: u16) {
             .map(|t| t.trim().is_empty())
             .unwrap_or(true)
     {
-        set_channel_snapshot(mode, |c| c.error = Some("自有域名缺少 Tunnel Token".into()));
+        set_channel_snapshot(mode, |c| {
+            c.error = Some("REMOTE_NO_TUNNEL_TOKEN: 自有域名缺少 Tunnel Token".into())
+        });
         return;
     }
     let mut slots = TUNNELS.lock().unwrap();
@@ -519,7 +521,7 @@ async fn supervise(mode: String, port: u16, stop: Arc<AtomicBool>) {
     let bin =
         match tokio::task::spawn_blocking(move || ensure_with(&bin_path, Box::new(download_to)))
             .await
-            .unwrap_or_else(|e| Err(format!("获取任务异常: {e}")))
+            .unwrap_or_else(|e| Err(format!("REMOTE_TUNNEL_TASK_PANIC: 获取任务异常: {e}")))
         {
             Ok(p) => p,
             Err(e) => {
@@ -557,7 +559,9 @@ async fn supervise(mode: String, port: u16, stop: Arc<AtomicBool>) {
             Ok(c) => c,
             Err(e) => {
                 set_channel_snapshot(&mode, |c| {
-                    c.error = Some(format!("cloudflared 启动失败: {e}"))
+                    c.error = Some(format!(
+                        "REMOTE_TUNNEL_START_FAIL: cloudflared 启动失败: {e}"
+                    ))
                 });
                 return;
             }
@@ -631,7 +635,8 @@ async fn supervise(mode: String, port: u16, stop: Arc<AtomicBool>) {
             }
             None => {
                 set_channel_snapshot(&mode, |c| {
-                    c.error = Some("cloudflared 连续失败 3 次，已停止守护".into())
+                    c.error =
+                        Some("REMOTE_TUNNEL_GAVE_UP: cloudflared 连续失败 3 次，已停止守护".into())
                 });
                 // spec T1b：放弃时桌面通知报错（Task 8 的 useRemoteEvents 监听）
                 crate::remote::events::emit_ui(

@@ -78,7 +78,7 @@ const KEEPALIVE_KEY = "remote.keepalive";
 const SIGNATURE_KEY = "remote_message_signature";
 // P7 门特征文案（与 Rust PUBLIC_ACK_REQUIRED_MSG 单点常量同源的前缀特征）：前端只做
 // includes 判别分流弹既有 TLS Dialog，不复制门槛判定——文案漂移由后端常量保证
-const PUBLIC_ACK_FEATURE = "对外绑定需先确认已配置 TLS 反向代理";
+const PUBLIC_ACK_CODE = "REMOTE_PUBLIC_ACK_REQUIRED";
 
 // 四通道标识（线稿 v6 四卡顺序固定；「本机」不是通道——零豁免 §C4 后它只是历史
 // via 值，见 VIA_LABEL_KEY 的保留映射）。值域与后端 ChannelKind::parse 一致
@@ -87,7 +87,7 @@ type ChannelKind = "lan" | "quick" | "named" | "tailscale";
 // P7 特征判别：invoke 错误透传形态为 string（Rust Err(String)），兜底 Error/任意值
 function isPublicAckRequired(e: unknown): boolean {
   const raw = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
-  return raw.includes(PUBLIC_ACK_FEATURE);
+  return raw.includes(PUBLIC_ACK_CODE);
 }
 
 type TFunc = ReturnType<typeof useAppTranslation>["t"];
@@ -1030,7 +1030,7 @@ export function RemoteSection() {
                       {t("settings.remote.copy")}
                     </Button>
                   )}
-                  {namedErr && <span className="text-xs text-amber-500">{namedErr}</span>}
+                  {namedErr && <span className="text-xs text-amber-500">{formatInvokeError(namedErr, t)}</span>}
                 </div>
                 {/* 运行态行（B3，与 lan/quick 同一套 offCause 口径）：永久地址卡也必须有 */}
                 <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -1175,7 +1175,7 @@ export function RemoteSection() {
                       <span className="text-muted-foreground text-xs">
                         {t("settings.remote.tsRunningHint")}
                       </span>
-                      {tsErr && <span className="text-xs text-amber-500">{tsErr}</span>}
+                      {tsErr && <span className="text-xs text-amber-500">{formatInvokeError(tsErr, t)}</span>}
                     </div>
                     {tsAddr && (
                       <div className="mt-3">
@@ -1200,10 +1200,10 @@ export function RemoteSection() {
                     )}
                     {tsErr && (
                       <div className="mt-1 flex flex-wrap items-center gap-2">
-                        <span className="text-xs text-amber-500">{tsErr}</span>
+                        <span className="text-xs text-amber-500">{formatInvokeError(tsErr, t)}</span>
                         {/* 瞬时抖动引导（2026-10-13）：连不通类失败 60s 轮询自愈——
                             前缀判定与 reach.rs 格式串同步（reason 恒中文），详见向导侧同款 */}
-                        {tsErr.startsWith("地址已解析但连不通") && (
+                        {tsErr.startsWith("REACH_ADDR_UNREACHABLE") && (
                           <span
                             data-testid="ts-transient-hint"
                             className="text-muted-foreground text-xs"

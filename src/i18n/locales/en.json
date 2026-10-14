@@ -1255,6 +1255,22 @@
     "applyInProgress": "A tool settings save is already in progress",
     "applyTaskFailed": "Tool settings save task crashed — please retry",
     "presetActive": "Preset {{param}} is currently active — restore defaults before editing it",
-    "presetNativeInUniversal": "Universal presets cannot contain native skill {{param}} (native items belong to tool-scoped presets only)"
+    "presetNativeInUniversal": "Universal presets cannot contain native skill {{param}} (native items belong to tool-scoped presets only)",
+    "remoteNoTunnelToken": "Custom domain requires a Cloudflare Tunnel Token — fill it in first",
+    "remoteTunnelTaskPanic": "Background task crashed while preparing cloudflared — see logs",
+    "remoteTunnelDownloadFail": "Automatic cloudflared download failed — see logs for the exact path, or download manually from the official releases page",
+    "remoteTunnelStartFail": "Failed to start cloudflared",
+    "remoteTunnelGaveUp": "cloudflared failed 3 times in a row — supervision stopped (see logs)",
+    "tsCliFailNoStderr": "Tailscale CLI failed with no stderr output (command and exit code in logs)",
+    "tsCliTimeout": "Tailscale CLI timed out and the process was terminated — it may be waiting for manual confirmation",
+    "tsWaitFail": "Failed to wait for the Tailscale process",
+    "tsCliFail": "Tailscale CLI call failed",
+    "tsStatusReadFail": "Failed to read Tailscale status",
+    "tsFunnelReadFail": "Failed to read Funnel status",
+    "tsDeferredOpenFail": "Deferred Funnel enablement after boot failed — see logs",
+    "tsForeignServe": "Non-Tuvis Tailscale serve/Funnel configuration detected — aborted to avoid overwriting it; run \"tailscale funnel reset\" or use the wizard's forced revoke, then retry",
+    "tsFunnelStatusUnreadable": "Funnel status unreadable — refused to proceed to avoid overwriting an existing serve configuration",
+    "reachAddrUnreachable": "Address resolves but unreachable (usually transient relay jitter — auto re-checked every 60s)",
+    "remotePublicAckRequired": "External binding requires confirming the TLS reverse proxy first (remote_confirm_public)"
   }
 }

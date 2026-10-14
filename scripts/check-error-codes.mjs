@@ -42,7 +42,18 @@ const camel = (code) =>
 // ---- ① 提取 Rust 使用的码 ----
 const codes = new Set();
 const CODED_CALL = /\bcoded(?:_param)?\(\s*"([A-Z][A-Z0-9_]+)"/g;
-const CODED_LITERAL = /\b(?:Err|format!|map_err[^(\n]*|e)\(?\s*"([A-Z][A-Z0-9_]{2,}):/g;
+// 任意字符串字面前缀形态（Err(/format!/Some(/map_err 一网打尽——只要引号内以码+冒号开头）
+const CODED_LITERAL = /"([A-Z][A-Z0-9_]{2,}):/g;
+
+function stripComments(src) {
+  // 剥块注释与行注释（行内注释仅当 // 前有空白——避开字符串里的 https://）。
+  // 文档注释（/// 与 //!）里的示例码不得算作生产使用。
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .map((l) => (/^\s*\/\//.test(l) ? "" : l.replace(/\s\/\/.*$/, "")))
+    .join("\n");
+}
 
 function stripTests(src) {
   // 剔除 #[cfg(test)] mod tests { ... }（到文件尾或下一个顶层项的粗切：按花括号配平）
@@ -79,7 +90,7 @@ function walk(dir) {
       continue;
     }
     if (!f.endsWith(".rs")) continue;
-    const src = stripTests(readFileSync(p, "utf8"));
+    const src = stripComments(stripTests(readFileSync(p, "utf8")));
     for (const re of [CODED_CALL, CODED_LITERAL]) {
       for (const m of src.matchAll(re)) codes.add(m[1]);
     }
@@ -100,8 +111,8 @@ for (const code of [...codes].sort()) {
 }
 for (const key of Object.keys(zhErr)) {
   if (LEGACY_KEYS.has(key)) continue;
-  // 孤儿键：locale 有键而 Rust 无对应码（反查：camel→大写下划线）
-  const code = key.replace(/([A-Z])/g, "_$1").toUpperCase().slice(1);
+  // 孤儿键：locale 有键而 Rust 无对应码（反查：camel→大写下划线；首字符小写不产生前导下划线）
+  const code = key.replace(/([A-Z])/g, "_$1").toUpperCase().replace(/^_/, "");
   if (!codes.has(code)) fail.push(`errors.${key} 是孤儿键（Rust 无码 ${code}；若为 legacy 请登记 scripts/check-error-codes.mjs 的 LEGACY_KEYS）`);
 }
 if (enErr && Object.keys(enErr).length !== Object.keys(zhErr).length) {

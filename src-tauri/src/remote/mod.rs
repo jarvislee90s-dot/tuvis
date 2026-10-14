@@ -639,7 +639,7 @@ fn is_external_bind(bind: &str) -> bool {
 /// 开关 Dialog 同判据）据此识别「需先确认 TLS 反代」——文案含 remote_confirm_public
 /// 指引。start_server_core 内联门与 ensure_public_ack_if_external 共用，防两处漂移
 const PUBLIC_ACK_REQUIRED_MSG: &str =
-    "对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
+    "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
 
 /// P7 门检查内核（纯函数）：对外绑定 + 未确认 TLS 前置 → Err 特征文案（沿用
 /// start_server_core 口径）；内环绑定或已确认 → Ok。remote_toggle_channel("lan", true)

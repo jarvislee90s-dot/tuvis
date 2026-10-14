@@ -10,6 +10,7 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { toast } from "sonner";
 import { useAppTranslation } from "@/hooks/use-app-translation";
+import { formatInvokeError } from "@/lib/invokeError";
 
 export function useRemoteEvents() {
   const { t } = useAppTranslation();
@@ -34,7 +35,7 @@ export function useRemoteEvents() {
         await listen<{ error: string }>("remote-tunnel-error", async (e) => {
           // spec T1b：守护放弃时桌面通知报错（toast 在窗口隐藏时不可见——双通道）
           await notify(t("settings.remote.tunnelErrorTitle"), e.payload.error);
-          toast.error(t("settings.remote.tunnelErrorToast", { error: e.payload.error }));
+          toast.error(t("settings.remote.tunnelErrorToast", { error: formatInvokeError(e.payload.error, t) }));
         })
       );
       unlisten.push(

@@ -468,7 +468,7 @@ pub(crate) const RECOVERING_HINT: &str =
 /// 配置在，成因是到公网中继入口的链路瞬时抖动（真机实测：两个入口同设施、常一起失败，
 /// 60s 轮询复验自愈），reset 只会把完好配置清掉再重发布 30–49 秒。前端
 /// tsTransientHint 引导文案锚定同一前缀（reason 恒中文），两处需同步维护。
-pub(super) const ADDR_UNREACHABLE_PREFIX: &str = "地址已解析但连不通";
+pub(super) const ADDR_UNREACHABLE_PREFIX: &str = "REACH_ADDR_UNREACHABLE: 地址已解析但连不通";
 
 /// 每轮校验结论落一行日志——2026-10-13 真机定位的盲区：remote 模块原先不写任何日志，
 /// 可达性失败没有时间线留痕，故障窗口只能事后观测反推。INFO 记常态、Failed 用 WARN

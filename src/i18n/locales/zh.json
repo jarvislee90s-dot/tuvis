@@ -1255,6 +1255,22 @@
     "applyInProgress": "工具设置正在保存中，请稍候",
     "applyTaskFailed": "工具设置保存任务异常，请重试",
     "presetActive": "预设正在 {{param}} 上激活，请先恢复默认再修改",
-    "presetNativeInUniversal": "通用预设不得包含原生技能 {{param}}（原生项只属于工具私有预设）"
+    "presetNativeInUniversal": "通用预设不得包含原生技能 {{param}}（原生项只属于工具私有预设）",
+    "remoteNoTunnelToken": "自有域名缺少 Tunnel Token",
+    "remoteTunnelTaskPanic": "后台任务异常，详见日志",
+    "remoteTunnelDownloadFail": "cloudflared 自动获取失败——详见日志中的完整路径，或到官方 releases 页手动下载",
+    "remoteTunnelStartFail": "cloudflared 启动失败",
+    "remoteTunnelGaveUp": "cloudflared 连续失败 3 次，已停止守护",
+    "tsCliFailNoStderr": "Tailscale CLI 失败且无 stderr 输出（命令与退出码见日志）",
+    "tsCliTimeout": "调用 Tailscale 超时，子进程已终止——它可能正在等待人工确认",
+    "tsWaitFail": "等待 Tailscale 进程失败",
+    "tsCliFail": "调用 Tailscale 失败",
+    "tsStatusReadFail": "读取 Tailscale 状态失败",
+    "tsFunnelReadFail": "读取 Funnel 状态失败",
+    "tsDeferredOpenFail": "开机后自动补开通 Funnel 失败——详见日志",
+    "tsForeignServe": "检测到非 兔维斯 的 Tailscale serve/Funnel 配置，为避免覆盖已中止操作；如确认可放弃该配置，请执行 tailscale funnel reset 后重试",
+    "tsFunnelStatusUnreadable": "读不到 Funnel 状态，已拒绝执行（无法确认是否会覆盖他人的 serve 配置）",
+    "reachAddrUnreachable": "地址已解析但连不通（多为公网入口瞬时抖动，60s 轮询自动复验）",
+    "remotePublicAckRequired": "对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）"
   }
 }
