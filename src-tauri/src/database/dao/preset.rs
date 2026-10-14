@@ -79,20 +79,21 @@ pub fn update_preset(
     // 事务（评审裁决 4）：UPDATE→清 items→重插 的中途失败会留下半截预设
     let tx = conn
         .unchecked_transaction()
-        .map_err(|e| format!("更新预设失败: {}", e))?;
+        .map_err(|e| format!("DB_PRESET_UPDATE_FAIL: 更新预设失败: {}", e))?;
     let n = tx
         .execute(
             "UPDATE presets SET name=?2, description=?3, scope=?4, bound_tool=?5 WHERE id=?1",
             params![id, name, description, scope, bound_tool],
         )
-        .map_err(|e| format!("更新预设失败: {}", e))?;
+        .map_err(|e| format!("DB_PRESET_UPDATE_FAIL: 更新预设失败: {}", e))?;
     if n == 0 {
-        return Err(format!("预设不存在: {}", id));
+        return Err(format!("DB_PRESET_MISSING:{}", id));
     }
     tx.execute("DELETE FROM preset_items WHERE preset_id = ?1", [id])
-        .map_err(|e| format!("更新预设失败: {}", e))?;
+        .map_err(|e| format!("DB_PRESET_UPDATE_FAIL: 更新预设失败: {}", e))?;
     insert_items(&tx, id, items)?;
-    tx.commit().map_err(|e| format!("更新预设失败: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("DB_PRESET_UPDATE_FAIL: 更新预设失败: {}", e))?;
     Ok(())
 }
 
@@ -176,17 +177,18 @@ pub fn delete_preset(preset_id: &str) -> Result<(), String> {
     // 事务（评审裁决 4）：三条 DELETE 半截失败会留下孤儿 items/applications
     let tx = conn
         .unchecked_transaction()
-        .map_err(|e| format!("删除预设失败: {}", e))?;
+        .map_err(|e| format!("DB_PRESET_DELETE_FAIL: 删除预设失败: {}", e))?;
     tx.execute("DELETE FROM preset_items WHERE preset_id = ?1", [preset_id])
-        .map_err(|e| format!("删除预设失败: {}", e))?;
+        .map_err(|e| format!("DB_PRESET_DELETE_FAIL: 删除预设失败: {}", e))?;
     tx.execute(
         "DELETE FROM preset_applications WHERE preset_id = ?1",
         [preset_id],
     )
-    .map_err(|e| format!("删除预设失败: {}", e))?;
+    .map_err(|e| format!("DB_PRESET_DELETE_FAIL: 删除预设失败: {}", e))?;
     tx.execute("DELETE FROM presets WHERE id = ?1", [preset_id])
-        .map_err(|e| format!("删除预设失败: {}", e))?;
-    tx.commit().map_err(|e| format!("删除预设失败: {}", e))?;
+        .map_err(|e| format!("DB_PRESET_DELETE_FAIL: 删除预设失败: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("DB_PRESET_DELETE_FAIL: 删除预设失败: {}", e))?;
     Ok(())
 }
 

@@ -562,8 +562,8 @@ fn register_hooks_in_file(
 ) -> Result<(usize, usize), String> {
     // 读取现有配置（不存在则创建空对象）
     let existing = read_user_config_text(config_path).unwrap_or_else(|_| "{}".to_string());
-    let mut config: serde_json::Value =
-        serde_json::from_str(&existing).map_err(|e| format!("解析配置文件失败: {}", e))?;
+    let mut config: serde_json::Value = serde_json::from_str(&existing)
+        .map_err(|e| format!("HOOKS_PARSE_JSON: 解析配置文件失败: {}", e))?;
 
     // 确保 hooks 对象存在
     if config.get("hooks").is_none() {
@@ -725,10 +725,10 @@ fn register_hooks_in_file(
             let backup = config_path.with_extension("json.bak");
             let _ = fs::copy(config_path, &backup);
         }
-        let pretty =
-            serde_json::to_string_pretty(&config).map_err(|e| format!("序列化配置失败: {}", e))?;
+        let pretty = serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("HOOKS_SERIALIZE: 序列化配置失败: {}", e))?;
         crate::linker::write_config_locked(config_path, &pretty)
-            .map_err(|e| format!("写入配置文件失败: {}", e))?;
+            .map_err(|e| format!("HOOKS_WRITE_FAIL: 写入配置文件失败: {}", e))?;
         // 仅迁移（added=0）时「已注册 0 个」有误导：日志区分迁移条目数
         if migrated > 0 {
             info!(
@@ -814,7 +814,7 @@ fn register_kimi_hooks_in_file(
     let content = read_user_config_text(config_path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
         .parse()
-        .map_err(|e| format!("解析 TOML 失败: {}", e))?;
+        .map_err(|e| format!("HOOKS_PARSE_TOML: 解析 TOML 失败: {}", e))?;
     if doc.get("hooks").is_none() {
         doc["hooks"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
     }
@@ -868,7 +868,7 @@ fn register_kimi_hooks_in_file(
             let _ = fs::copy(config_path, &backup);
         }
         crate::linker::write_config_locked(config_path, &doc.to_string())
-            .map_err(|e| format!("写入配置文件失败: {}", e))?;
+            .map_err(|e| format!("HOOKS_WRITE_FAIL: 写入配置文件失败: {}", e))?;
         if migrated > 0 {
             info!(
                 "已注册 {} 个 Hook（迁移旧条目 {} 处）到 {:?}",

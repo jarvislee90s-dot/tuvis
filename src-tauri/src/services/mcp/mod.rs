@@ -93,7 +93,7 @@ fn json_section_mut<'a>(
 
 /// 解析 JSON 配置内容（空内容按空对象；解析失败 → Err，调用方只报错不落盘）
 fn parse_json_config(content: &str) -> Result<serde_json::Value, String> {
-    serde_json::from_str(content).map_err(|e| format!("解析 JSON 配置失败: {}", e))
+    serde_json::from_str(content).map_err(|e| format!("MCP_PARSE_JSON: 解析 JSON 配置失败: {}", e))
 }
 
 /// 段查找（删除路径用）：Ok(Some)=段存在且为对象；Ok(None)=段缺失（无可删条目）；
@@ -177,7 +177,7 @@ fn write_mcp_toml(path: &std::path::Path, name: &str, config: &McpConfig) -> Res
     let content = std::fs::read_to_string(path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
         .parse()
-        .map_err(|e| format!("解析 TOML 失败: {}", e))?;
+        .map_err(|e| format!("MCP_PARSE_TOML: 解析 TOML 失败: {}", e))?;
 
     // 确保 mcp_servers 段存在
     if doc.get("mcp_servers").is_none() {
@@ -211,7 +211,7 @@ fn remove_mcp_toml(path: &std::path::Path, name: &str) -> Result<(), String> {
     let content = std::fs::read_to_string(path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
         .parse()
-        .map_err(|e| format!("解析 TOML 失败: {}", e))?;
+        .map_err(|e| format!("MCP_PARSE_TOML: 解析 TOML 失败: {}", e))?;
     if let Some(servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_mut()) {
         servers.remove(name);
     }

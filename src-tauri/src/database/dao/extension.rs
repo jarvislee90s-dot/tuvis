@@ -106,7 +106,7 @@ pub fn migrate_legacy_extension_id_on(
         "UPDATE preset_items SET extension_id = ?2 WHERE extension_id = ?1",
         params![old_id, new_id],
     )
-    .map_err(|e| format!("迁移 preset_items 引用失败: {e}"))?;
+    .map_err(|e| format!("DB_MIGRATE_REF_FAIL: 迁移 preset_items 引用失败: {e}"))?;
     for table in [
         "extension_assignments",
         "resource_bindings",
@@ -117,7 +117,7 @@ pub fn migrate_legacy_extension_id_on(
             &format!("UPDATE OR IGNORE {table} SET extension_id = ?2 WHERE extension_id = ?1"),
             params![old_id, new_id],
         )
-        .map_err(|e| format!("迁移 {table} 引用失败: {e}"))?;
+        .map_err(|e| format!("DB_MIGRATE_REF_FAIL: 迁移 {table} 引用失败: {e}"))?;
     }
     if new_exists {
         // 病态双行：斜杠行为准，删反斜杠旧行（引用已全部指向新 id）

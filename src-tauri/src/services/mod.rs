@@ -42,7 +42,7 @@ pub fn toggle_mcp(mcp_name: &str, tool_id: &str, enabled: bool) -> Result<(), St
         && crate::database::is_tool_resident(tool_id, &ext_id)
     {
         return Err(format!(
-            "MCP {} 是 {} 的常驻资源，先关闭常驻再停用",
+            "MCP_RESIDENT_CONFLICT: MCP {} 是 {} 的常驻资源，先关闭常驻再停用",
             mcp_name, tool_id
         ));
     }
@@ -53,7 +53,10 @@ pub fn toggle_mcp(mcp_name: &str, tool_id: &str, enabled: bool) -> Result<(), St
             .join("mcp");
         let config_path = repo.join(format!("{}.json", mcp_name));
         if !config_path.exists() {
-            return Err(format!("MCP 配置不在全局仓库中: {}", mcp_name));
+            return Err(format!(
+                "MCP_NOT_IN_REPO: MCP 配置不在全局仓库中: {}",
+                mcp_name
+            ));
         }
         let content = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
         let config: mcp::McpConfig = serde_json::from_str(&content).map_err(|e| e.to_string())?;
