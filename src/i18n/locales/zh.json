@@ -1509,6 +1509,7 @@
     "resumeSpawnUnsupported": "当前平台不支持终端 spawn",
     "resumeUnsupported": "当前平台不支持一键恢复会话",
     "createWindowTimeout": "起窗后超时未发现目标工具进程",
-    "injectMenuTableMalformed": "权限菜单档位表不自洽——不猜位置，请在终端选择"
+    "injectMenuTableMalformed": "权限菜单档位表不自洽——不猜位置，请在终端选择",
+    "mobileNetworkFail": "{{param}} 网络异常——详见日志"
   }
 }

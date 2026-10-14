@@ -1509,6 +1509,7 @@
     "resumeSpawnUnsupported": "Terminal spawn is not supported on this platform",
     "resumeUnsupported": "One-click session resume is not supported on this platform",
     "createWindowTimeout": "Tool process not found after launch within the timeout",
-    "injectMenuTableMalformed": "Permission menu tier table is inconsistent — refusing to guess; pick in the terminal"
+    "injectMenuTableMalformed": "Permission menu tier table is inconsistent — refusing to guess; pick in the terminal",
+    "mobileNetworkFail": "Network error on {{param}} — see logs"
   }
 }

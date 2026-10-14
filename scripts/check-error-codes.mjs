@@ -99,6 +99,24 @@ function walk(dir) {
 }
 walk(SRC);
 
+// 前端自产码（src/ 的 TS/TSX，同款前缀形态——mobile/api.ts 的 MOBILE_NETWORK_FAIL 族）
+const FE_SRC = path.join(ROOT, "src");
+const FE_SKIP = new Set(["i18n"]); // locale 目录不算
+function walkFe(dir) {
+  for (const f of readdirSync(dir)) {
+    const p = path.join(dir, f);
+    if (statSync(p).isDirectory()) {
+      if (FE_SKIP.has(f)) continue;
+      walkFe(p);
+      continue;
+    }
+    if (!/\.(tsx?|ts)$/.test(f)) continue;
+    const src = stripComments(readFileSync(p, "utf8"));
+    for (const m of src.matchAll(/["'`]([A-Z][A-Z0-9_]{2,}):/g)) codes.add(m[1]);
+  }
+}
+walkFe(FE_SRC);
+
 // ---- ② locale 对账 ----
 const zhErr = JSON.parse(readFileSync(path.join(ROOT, "src/i18n/locales/zh.json"), "utf8")).errors ?? {};
 const enErr = JSON.parse(readFileSync(path.join(ROOT, "src/i18n/locales/en.json"), "utf8")).errors ?? {};
