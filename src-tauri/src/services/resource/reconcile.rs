@@ -231,7 +231,15 @@ pub fn scan_drift() -> Vec<DriftItem> {
                     let ext_id = format!("skill-{}", name);
                     if path.is_symlink() {
                         let target = std::fs::read_link(&path).unwrap_or_default();
-                        if target.starts_with(&mam_root) {
+                        // #64-1：归属判定复用 detector 的 canonicalize 原语——字面
+                        // `target.starts_with(&mam_root)` 在 symlink home / macOS
+                        // `/var → /private/var` 别名下会把 兔维斯 自建链接误报成
+                        // L4 外链（两侧拼写不同而真实落点相同）。mam_root 解析失败
+                        // 时原语保守返回 false（视作外链），与「外链只报告不接管」
+                        // 的安全方向一致。
+                        if crate::linker::detector::link_target_in_mam_root(
+                            &path, &target, &mam_root,
+                        ) {
                             disk_mam_links.push(ext_id);
                         } else {
                             out.push(DriftItem {
