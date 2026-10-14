@@ -415,7 +415,7 @@ describe("RemoteSection lan 开关 P7 TLS Dialog 流（M5 A6）", () => {
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "remote_status") return lanOffStatus();
       if (cmd === "remote_toggle_channel" && args?.channel === "lan" && args?.on === true) {
-        throw "对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
+        throw "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
       }
       if (cmd === "get_setting") return null;
       if (cmd === "remote_devices") return [];
@@ -437,7 +437,7 @@ describe("RemoteSection lan 开关 P7 TLS Dialog 流（M5 A6）", () => {
       if (cmd === "remote_status") return lanOffStatus();
       if (cmd === "remote_toggle_channel" && args?.channel === "lan" && args?.on === true) {
         lanTries += 1;
-        if (lanTries === 1) throw "对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
+        if (lanTries === 1) throw "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
         return; // 重试成功
       }
       if (cmd === "get_setting") return null;
@@ -463,7 +463,7 @@ describe("RemoteSection lan 开关 P7 TLS Dialog 流（M5 A6）", () => {
       if (cmd === "remote_status") return lanOffStatus();
       if (cmd === "remote_toggle_channel" && args?.channel === "lan" && args?.on === true) {
         lanTries += 1;
-        throw "对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
+        throw "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
       }
       if (cmd === "get_setting") return null;
       if (cmd === "remote_devices") return [];
@@ -976,7 +976,7 @@ describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的
   // 也挂引导——error 前缀「地址已解析但连不通」锚定（与 reach.rs 格式串同步）
   it("连不通类失败 → configuredIdle 卡面 error 行挂瞬时抖动引导（ts-transient-hint）", async () => {
     const unreachable =
-      "地址已解析但连不通（试了 2 条）: 103.84.155.153: error sending request; 103.84.155.217: error sending request";
+      "REACH_ADDR_UNREACHABLE: 地址已解析但连不通（试了 2 条）: 103.84.155.153: error sending request; 103.84.155.217: error sending request";
     mock({
       channels: channelsOf({
         tailscale: {
@@ -991,7 +991,8 @@ describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的
     render(<RemoteSection />);
     fireEvent.click(card("tailscale"));
     await waitFor(() => expect(phaseEl().getAttribute("data-phase")).toBe("configuredIdle"));
-    expect(screen.getByText(/地址已解析但连不通/)).toBeTruthy();
+    // 错误 span 现经 formatInvokeError 渲染（码→英文模板，jsdom 默认英文语言）
+    expect(screen.getByText(/Address resolves but unreachable/)).toBeTruthy();
     const hint = screen.getByTestId("ts-transient-hint");
     expect(hint.textContent).toMatch(/transient jitter/i);
     expect(hint.textContent).toMatch(/1[–-]2 minutes/i);

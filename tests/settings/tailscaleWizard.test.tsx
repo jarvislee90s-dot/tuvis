@@ -859,7 +859,7 @@ describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () =
   // 2026-10-13 真机定位：连不通类失败 = 公网链路瞬时抖动（60s 轮询自愈），重试门槛
   // 与安抚文案跟上——reason 前缀「地址已解析但连不通」锚定（与 reach.rs 格式串同步）
   it("reach=failed 且连不通类 reason → 「尚未生效」下挂瞬时抖动引导（ts-transient-hint）", async () => {
-    const unreachable = "地址已解析但连不通（试了 2 条）: 103.84.155.153: error sending request";
+    const unreachable = "REACH_ADDR_UNREACHABLE: 地址已解析但连不通（试了 2 条）: 103.84.155.153: error sending request";
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "remote_ts_probe")
         return macProbe({
