@@ -151,7 +151,11 @@ pub(crate) fn single_survivor<'a>(
 /// 命中恰 1 个 → 直接锁定（title_match_lock）；≥2 个 → 调用方可做 UIA 尾串仲裁
 /// （issue #49 双开同模板场景）。键列表由调用方组装（opencode 需同时提供 DB title
 /// 等；kimi 传 state.title 一项即可）
-pub(crate) fn title_match_hits(cands: &[(isize, String)], agent: &str, keys: &[String]) -> Vec<isize> {
+pub(crate) fn title_match_hits(
+    cands: &[(isize, String)],
+    agent: &str,
+    keys: &[String],
+) -> Vec<isize> {
     let keys_norm: Vec<String> = keys
         .iter()
         .filter(|k| !k.trim().is_empty())
@@ -532,7 +536,10 @@ Microsoft Windows [版本 10.0.26200]"
     #[test]
     fn tail_unique_hit_locks_only_on_exactly_one_containment() {
         let mut texts = HashMap::new();
-        texts.insert(1isize, "会话正文……需要我帮你做什么吗 比如查看代码".to_string());
+        texts.insert(
+            1isize,
+            "会话正文……需要我帮你做什么吗 比如查看代码".to_string(),
+        );
         texts.insert(2, "另一个窗口 完全不同的内容".to_string());
         let (c1, c2) = ((1isize, String::new()), (2isize, String::new()));
         let cands: Vec<&(isize, String)> = vec![&c1, &c2];
