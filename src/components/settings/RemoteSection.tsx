@@ -9,7 +9,11 @@
 // 排版层级统一走 components/settings/typography.ts 单一出处（2026-10-07 用户裁决 C1）：
 // 卡标题取 SETTINGS_CARD_TITLE（2026-10-11 起搬进灰底卡头条），不再内联字号字重；本文件
 // 另被登记为小字号豁免面（密集数据网格），豁免理由见 typography.ts。
-import { SETTINGS_CARD_TITLE, SETTINGS_REMOTE_BADGE } from "@/components/settings/typography";
+import {
+  SETTINGS_CARD_TITLE,
+  SETTINGS_REMOTE_BADGE,
+  SETTINGS_REMOTE_QR_CAPTION,
+} from "@/components/settings/typography";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import QRCode from "qrcode";
 import { Button } from "@/components/ui/button";
@@ -190,7 +194,7 @@ function ChannelQr({ url, caption }: { url: string; caption: string }) {
       ) : (
         <div className="bg-muted/40 h-[132px] w-[132px] animate-pulse rounded-lg border" />
       )}
-      <p className="text-muted-foreground text-center text-[10.5px]">{caption}</p>
+      <p className={`text-muted-foreground text-center ${SETTINGS_REMOTE_QR_CAPTION}`}>{caption}</p>
     </div>
   );
 }

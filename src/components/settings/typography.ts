@@ -78,3 +78,31 @@ export const SETTINGS_BADGE = "text-[10px]";
  * 远程徽标一律用本档，压到 10px 即"实现与线稿不一致"。
  */
 export const SETTINGS_REMOTE_BADGE = "text-[10.5px]";
+
+/**
+ * 远程接入分区的二维码说明档（**线稿硬契约**，非层级档）。
+ *
+ * 出处：同一线稿的 `.qr { font-size: 10.5px; text-align: center; … }`——线稿把
+ * `.badge` 与 `.qr` 当两条**独立规则**（当前取值同为 10.5px 是巧合而非同档）；合成一条
+ * 的话，将来线稿只改其中之一时代码侧无法区分该改哪处。与徽标档不得互相替代。
+ * （#124：此处原为 `RemoteSection` 的内联字面量，2026-10-14 收口立档。）
+ */
+export const SETTINGS_REMOTE_QR_CAPTION = "text-[10.5px]";
+
+/**
+ * 远程接入分区的行正文档（**线稿硬契约**，非层级档）。
+ *
+ * 出处：同一线稿的 `.row { padding: 12px 0; …; font-size: 13px }`、
+ * `.sub { color: var(--muted); font-size: 13px }`、`.mode .name { font-weight: 700;
+ * font-size: 13px }`——行级正文与模式名。该值此前散落为裸字面量且从未登记
+ * （#125 核查时因此被排版锁视为「看不见」），2026-10-14 立档。
+ */
+export const SETTINGS_REMOTE_ROW = "text-[13px]";
+
+/**
+ * 远程接入分区的行内提示档（**线稿硬契约**，非层级档）。
+ *
+ * 出处：同一线稿的 `.row .hint { color: var(--muted); font-size: 12px }`。
+ * （#125 立档，同上。）
+ */
+export const SETTINGS_REMOTE_HINT = "text-[12px]";
