@@ -50,9 +50,7 @@ Open the same eight-tool session board from your phone browser. Settings → Rem
 
 **The access PIN applies to this computer too**: loopback access is **no longer PIN-free** — opening the board from this machine's own browser is treated exactly like a remote device (enter the PIN once, then remembered for 180 days). "This machine" is **no longer a channel card**: it is just one way to connect, using the address shown on the "LAN" card.
 
-![Remote Access · desktop settings page](docs/images/remote-settings-v0.5.0.png)
-
-> The screenshot above shows the old four-card UI from before this branch (Local / LAN / Quick tunnel / Named tunnel); its "Local · no PIN" note has since been overturned by the zero-exemption gate — a new screenshot is pending.
+![Remote Access · desktop settings page](docs/images/remote-settings-v0.6.0.png)
 
 How to connect: turn on "Enable Remote Access" → enable the channel you want → click its card to reveal the address / QR code (**the link already contains the PIN, so scanning fills it in automatically**) → open it on your phone (**the URL must end with `/m`**). **The first run of "External domain (no domain needed)" goes through the card's wizard**: click "One-click setup" and it walks through detect → download from the official source with checksum verification → install (one admin prompt from the system) → sign in to Tailscale (Tuvis turns the authorization link into a button; you finish in the browser) → turn off "block incoming connections" → enable Funnel → **reachability verification** — no command line at any point; on macOS you also approve Tailscale's system extension once in System Settings, and the first Funnel enablement may additionally need one browser approval (or none at all).
 
