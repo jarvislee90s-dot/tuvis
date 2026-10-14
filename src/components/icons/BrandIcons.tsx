@@ -1,7 +1,12 @@
-// 品牌图标 — path 取自 assets/icons/*.svg（simple-icons / opencode 官网），currentColor 随文字色
+// 品牌图标 — 全部 8 工具 canonical 标的唯一出处（2026-10-14 统一批定案）：
+// 桌面 chips/会话卡/通知、资源/预设/设置（经 ToolIcon 委托）、移动看板卡片
+// 全部消费本文件。claude/codex/kimi 沿用官方单色 path（currentColor 随文字色）；
+// opencode/zcode/dsh/workbuddy 按用户提供的官方参考图重绘（2026-10-14）；
+// openclaw 自 ToolIcon 实物搬迁为固定色。
+import { useId } from "react";
 
 // 兔维斯品牌标（扁平几何版吉祥物：兔耳 + 白框蓝片目镜 + 下巴绿色状态灯）
-// 固定品牌色（同 OpenCodeIcon 做法）；单色场合可把填充全部换成 currentColor
+// 固定品牌色；单色场合可把填充全部换成 currentColor
 export function TuvisLogoMark({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" role="img" aria-label="Tuvis">
@@ -63,17 +68,36 @@ export function OpenAIIcon({ className }: { className?: string }) {
   );
 }
 
+// OpenCode — 官方标（2026-10-14 用户对照官网参考图定案）：近直角黑方 + 白方膛 +
+// 膛内两段竖矩形（上黑 / 下中灰）。白底板四周溢出细白边（≈0.7px @14px chip）：
+// 近黑底（选中 chip、深色徽章底）勾出轮廓，白底上不可见
 export function OpenCodeIcon({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 512 512" role="img" aria-label="OpenCode">
-      {/* 自带配色（灰块+白环），徽标底为深色故两色均可见 */}
-      <path d="M320 224V352H192V224H320Z" fill="#5A5858" />
-      <path
-        fillRule="evenodd"
-        clipRule="evenodd"
-        d="M384 416H128V96H384V416ZM320 160H192V352H320V160Z"
-        fill="white"
-      />
+      {/* 细白边底板 */}
+      <rect x="30" y="30" width="452" height="452" fill="#FFFFFF" />
+      {/* 黑方主体 */}
+      <rect x="56" y="56" width="400" height="400" fill="#1A1A1A" />
+      {/* 白方膛 */}
+      <rect x="148" y="140" width="216" height="232" fill="#FFFFFF" />
+      {/* 膛内两段芯：上黑 ~34% / 下中灰 ~66%（比例/色值按参考图实测校准） */}
+      <rect x="198" y="180" width="116" height="50" fill="#1A1A1A" />
+      <rect x="198" y="230" width="116" height="102" fill="#5A5858" />
+    </svg>
+  );
+}
+
+// OpenClaw — 红底白机器人（原 ToolIcon 实物搬迁，2026-10-14 统一批；红 #D2453C
+// 与台账/移动卡檐同源，靛蓝回退值随 CSS 变量表一并退役）
+export function OpenClawIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 20 20" role="img" aria-label="OpenClaw">
+      <rect width="20" height="20" rx="5" fill="#D2453C" />
+      <circle cx="10" cy="11" r="4.5" stroke="white" strokeWidth="1.5" />
+      <circle cx="8" cy="10" r="0.8" fill="white" />
+      <circle cx="12" cy="10" r="0.8" fill="white" />
+      <path d="M6 6.5L8 4" stroke="white" strokeWidth="1.3" strokeLinecap="round" />
+      <path d="M14 6.5L12 4" stroke="white" strokeWidth="1.3" strokeLinecap="round" />
     </svg>
   );
 }
@@ -93,6 +117,105 @@ export function KimiIcon({ className }: { className?: string }) {
     >
       {/* 弦月（Feather moon）：Moonshot/Kimi 品牌意象 */}
       <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    </svg>
+  );
+}
+
+// WorkBuddy — 官方应用图标重绘（2026-10-14 用户参考图定案）：绿渐变圆角方
+// （左上浅薄荷 → 右下绿）+ 白猫头（双耳圆颅）+ 白描边圆角矩形脸（渐变透底 +
+// 两枚竖椭圆眼，整体微倾）。渐变 id 用 useId，防同页多实例 id 冲突
+export function WorkBuddyIcon({ className }: { className?: string }) {
+  const gid = useId();
+  return (
+    <svg className={className} viewBox="0 0 256 256" role="img" aria-label="WorkBuddy">
+      <defs>
+        <linearGradient id={gid} x1="40" y1="24" x2="216" y2="232" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#5BC5A7" />
+          <stop offset="1" stopColor="#80CF7D" />
+        </linearGradient>
+      </defs>
+      {/* 圆角方渐变底 */}
+      <rect width="256" height="256" rx="58" fill={`url(#${gid})`} />
+      {/* 白猫头（双耳 + 圆颅；耳间缺口按参考图加深；下缘没人脸框后面） */}
+      <path
+        d="M56 156 C50 112 54 84 64 64 L48 30 C46 24 52 19 58 23 L94 49 C105 50 116 52 128 52 C140 52 151 50 162 49 L198 23 C204 19 210 24 208 30 L192 64 C202 84 206 112 200 156 Z"
+        fill="#FFFFFF"
+      />
+      <g transform="rotate(-12 128 152)">
+        {/* 白描边圆角矩形脸（渐变透底，与背景无缝续接） */}
+        <rect
+          x="66"
+          y="110"
+          width="124"
+          height="86"
+          rx="26"
+          fill={`url(#${gid})`}
+          stroke="#FFFFFF"
+          strokeWidth="13"
+        />
+        {/* 两枚竖椭圆眼（透底 = 挖空观感） */}
+        <ellipse cx="104" cy="153" rx="7.5" ry="13" fill={`url(#${gid})`} />
+        <ellipse cx="152" cy="153" rx="7.5" ry="13" fill={`url(#${gid})`} />
+      </g>
+    </svg>
+  );
+}
+
+// ZCode — 官方标重绘（2026-10-14 用户参考图定案）：炭灰大圆角方 + 白色斜切 Z
+// （横杠带楔形斜切 + 粗斜杠，微倾速度感）。白底板细白边防深底融入（浅底不可见）；
+// 图标随官方炭灰，卡片檐色台账 #141413 不受影响
+export function ZCodeIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 512 512" role="img" aria-label="ZCode">
+      {/* 细白边底板 */}
+      <rect width="512" height="512" rx="90" fill="#FFFFFF" />
+      {/* 炭灰圆角方 */}
+      <rect x="24" y="24" width="464" height="464" rx="76" fill="#2D2D2D" />
+      {/* 斜切 Z：斜杠横向厚度 ~130（参考图实测 28% Z 宽量级，ui-worker 首轮验收校准） */}
+      <path d="M96 114 H418 L260 348 H418 V398 H96 L260 156 H96 Z" fill="#FFFFFF" />
+    </svg>
+  );
+}
+
+// dsh（DeepSeek）— 官方蓝鲸 glyph 重绘（2026-10-14 用户参考图定案；ui-worker
+// 首轮验收后按实测二次校准）：#4D6BFE 斜置椭圆鲸身（头左上）、翼状双尖尾鳍
+// （鳍顶为全身最高点、占鲸宽 ~1/3）、头顶小尖突、大白 swoosh 自左开口贯穿至
+// 腹部下缘（负空间是本标最大识别特征）、左下 wave 弧分离、白环+蓝瞳眼点。
+// 透明底（无方底），白区一律以 evenodd 挖空表达
+export function DshIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 256 256" role="img" aria-label="DSH">
+      {/* 鲸上主体（轮廓含：额头条 + 头顶尖突 + 双尖尾鳍 + 腹部沿 swoosh 上缘的
+          大弧咬口（ui-worker r2 校准：透明带最厚 ~30 单位 ≈ 鲸高 17%、右端达鲸宽
+          ~55%）+ 左侧开口的嘴位；眼圈为挖空子路径） */}
+      <path
+        fillRule="evenodd"
+        d="M24 112
+           C26 86 46 60 76 48
+           L84 34 L98 46
+           C126 54 154 48 176 56
+           C192 42 212 32 242 26
+           C230 44 228 60 236 76
+           C220 68 202 68 192 76
+           C200 96 202 116 196 134
+           C192 150 176 160 152 166
+           C114 156 62 148 26 148
+           Z
+           M66 71 a13 13 0 1 0 0.01 0 Z"
+        fill="#4D6BFE"
+      />
+      {/* 眼点（蓝瞳居白环中） */}
+      <circle cx="66" cy="84" r="5.5" fill="#4D6BFE" />
+      {/* 左下 wave 弧（上缘下压与鲸上主体拉开厚 swoosh 透明缝，右端收尖） */}
+      <path
+        d="M16 170
+           C48 184 88 188 118 182
+           C134 179 148 182 158 192
+           C146 208 118 215 88 216
+           C56 217 30 208 20 192
+           C15 184 13 176 16 170 Z"
+        fill="#4D6BFE"
+      />
     </svg>
   );
 }

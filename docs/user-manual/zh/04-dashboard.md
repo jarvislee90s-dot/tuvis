@@ -27,7 +27,9 @@
 
 ![按工具筛选](../img/dashboard-filter.png)
 
-卡片上方一排 chips：最左是「全部」，其后是八个工具（Claude Code / Codex / OpenCode / OpenClaw / Kimi Code / WorkBuddy / ZCode / dsh），单选，点谁筛谁，溢出自动换行。当前选择会记在本地——重启应用后仍停在上次选中的工具上。
+卡片上方一排 chips：最左是「全部」，其后是七个工具（Claude Code / Codex / OpenCode / Kimi Code / WorkBuddy / ZCode / dsh），单选，点谁筛谁，溢出自动换行。当前选择会记在本地——重启应用后仍停在上次选中的工具上。
+
+> 💡 OpenClaw 不支持消息提醒，不在筛选 chips 里（其会话仍会出现在「全部」中）。
 
 > 💡 chips 的图标与文案和卡片徽章同源，认脸即可对号。
 

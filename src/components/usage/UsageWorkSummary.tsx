@@ -101,7 +101,7 @@ export function UsageWorkSummary({ work, availability, t }: UsageWorkSummaryProp
    * `opencode.error_tool` / `kimi.interrupted` 均为 `false`，且 `availability_table()`
    * 对**每个**指标都挂 7 源全量映射）——**不得**按「哪几行看起来有缺口」写死，也不得一律加。
    * 源一律用**原始源 id** 呈现（① 的 `UsageStatusSection.tsx:239` 先例），**不得**走
-   * `usageAgentLabel`（`AGENT_BADGE` 无 `opencode`，会印成 `?`）。
+   * `usageAgentLabel`（这里是能力缺口诊断，要的是可对账的源 id 而非显示名）。
    * 值本身不可得时这条让位给「不可得原因」（见 `ValueRow` 的 title 取舍）。
    */
   const partialSourcesOf = (av: UsageAvailability | null): string | undefined => {
