@@ -1,8 +1,8 @@
 # 工具品牌配色台账（Tool Color Ledger）
 
-> **用途**：兔维斯 全端（桌面看板 / 移动远程看板）工具识别色的唯一权威表。新增工具、修改工具配色、新增彩色 UI 元素前，必须先对照本表检查色相冲突与辨识度。
+> **用途**：兔维斯 全端（桌面看板 / 移动远程看板）工具**识别檐色**与撞色规则的唯一权威表。新增工具、修改工具配色、新增彩色 UI 元素前，必须先对照本表检查色相冲突与辨识度。
 > **来源**：2026-10-05 远程端 UI 改版头脑风暴（用户逐项裁决 + 官方品牌调研）。
-> **实现落点**：CSS 变量 `--tool-*-bg` / `--tool-*-fg`（`src/index.css` 桌面 + `src/mobile/mobile.css` 移动）+ 共用组件 `src/components/common/ToolIcon.tsx`。改色一处生效两端。
+> **实现落点（2026-10-14 统一批起）**：图标 canonical 出处 = `src/components/icons/BrandIcons.tsx`（8 枚 canonical SVG：opencode/zcode/dsh/workbuddy/openclaw 固定品牌色且深色标自带细白边，claude/codex/kimi 为 currentColor）；配色/名字唯一表 = `src/lib/agentBadge.tsx`（`AGENT_BADGE`，含 `brandHex` 裸色）；资源/预设/设置/移动卡片经 `ToolIcon` 薄委托消费。卡片檐色 = `src/mobile/board-logic.ts` 的 `TOOL_BRAND_COLORS(_DARK)`（本表矩阵沿用；设置页远程外观预览亦查此表）。原 `--tool-*` CSS 变量双板体系已退役。
 
 ## 一、撞色规则（新工具入册 / 改色必须依次过这三条）
 
@@ -69,3 +69,5 @@
 | 2026-10-05 | 字体制度 | 备选两档 → 四档（标准/终端/圆润/书卷）＋ 双层字体制度（内容恒等宽） | 用户裁决「中英各加两种常用字体」 |
 | 2026-10-05 | 夜间规则 | 新增三条：黑系檐色夜间提亮表、卡片亮边、主按钮夜间反白 | 外观配置器迭代（v5–v9）；用户裁决 |
 | 2026-10-05 | 夜间规则 | 亮边/卡底/气泡/弱文字整体再提亮一档（真机反馈：元素与底相融） | 实装验收反馈；用户裁决 |
+| 2026-10-14 | 四枚图标 | opencode（黑方白膛两段芯）/ zcode（炭灰方斜切 Z）/ dsh（官方蓝鲸 glyph）/ workbuddy（绿渐变猫头脸框）按用户参考图重绘 | 用户裁决：旧形「多多少少不像」 |
+| 2026-10-14 | 图标制度 | 图标唯一出处 = BrandIcons.tsx + AGENT_BADGE 唯一表；`--tool-*` CSS 变量双板体系退役；openclaw 徽章 tint 灰→红 harmonize（机器人 #D2453C 同源） | 全端徽标统一（用户裁决「一个地方确定唯一设计语言」） |

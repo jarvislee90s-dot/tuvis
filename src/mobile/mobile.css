@@ -10,44 +10,11 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 /* ============================================================
- * 工具品牌图标双态变量（2026-10-05 台账重映射）：桌面共用组件 ToolIcon 的
- * SVG 经 style var() 引用。值以 docs/design/tool-color-ledger.md 颜色矩阵为准；
- * codex/opencode 反形（白底深符）与 zcode 夜间亮描边通过 fg/rim 变量表达，
- * 桌面表见 src/index.css 同名变量
+ * 工具品牌图标双态变量（2026-10-05 台账重映射）：已于 2026-10-14 统一批退役——
+ * 图标 canonical 出处 = src/components/icons/BrandIcons.tsx（固定品牌色，自带
+ * 深底白细边），经 ToolIcon 薄委托全端消费；配色/名字唯一表 = src/lib/agentBadge.tsx。
+ * 卡片檐色另见 src/mobile/board-logic.ts 的 TOOL_BRAND_COLORS(_DARK)（台账沿用）
  * ============================================================ */
-:root {
-  --tool-claude-bg: #d97757;
-  --tool-codex-bg: #ffffff;
-  --tool-codex-fg: #111111;
-  --tool-codex-rim: #1a1a1a;
-  --tool-opencode-bg: #ffffff;
-  --tool-opencode-fg: #111111;
-  --tool-opencode-rim: #2b2b28;
-  --tool-openclaw-bg: #d2453c;
-  --tool-kimi-bg: #0b0e1a;
-  --tool-kimi-fg: #ffffff;
-  --tool-workbuddy-bg: #4ad06a;
-  --tool-zcode-bg: #141413;
-  --tool-zcode-rim: transparent;
-  --tool-dsh-bg: #4d6bfe;
-}
-
-.dark {
-  --tool-claude-bg: #e08a66;
-  --tool-codex-bg: #1a1a1a;
-  --tool-codex-fg: #f5f5f5;
-  --tool-codex-rim: #ece9e2;
-  --tool-opencode-bg: #1a1a1a;
-  --tool-opencode-fg: #ffffff;
-  --tool-opencode-rim: #ece9e2;
-  --tool-openclaw-bg: #e06a5e;
-  --tool-kimi-bg: #e8edf8;
-  --tool-kimi-fg: #0b0e1a;
-  --tool-workbuddy-bg: #4ad06a;
-  --tool-zcode-bg: #141413;
-  --tool-zcode-rim: #ece9e2;
-  --tool-dsh-bg: #4d6bfe;
-}
 
 /* ============================================================
  * 远程端语义 Token（2026-10-05 UI 改版，spec §3.1）：
