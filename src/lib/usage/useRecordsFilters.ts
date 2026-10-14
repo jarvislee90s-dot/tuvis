@@ -25,7 +25,7 @@ import type { UsageFilters, UsageRange, UsageRecordsGroupBy, UsageSourceId } fro
  * 工具 chips = **D1 的 7 个采集源**。数组顺序即 chips 顺序（同时是选区的确定顺序：
  * `toggleTool` 按本表重排，同一次选择永远得到同一个查询键）。
  * ⚠️ 不是夹具那 4 个工具（`MOCK_USAGE_TOOL_IDS` 只是夹具数据、不是筛选清单），也不是
- * `SUPPORTED_TOOLS`（它含 `openclaw`，那不是用量源）。
+ * `SUPPORTED_TOOLS`（那是看板筛选清单，与用量 7 源口径不同）。
  */
 export const FILTER_TOOL_IDS: readonly UsageSourceId[] = [
   "claude",
