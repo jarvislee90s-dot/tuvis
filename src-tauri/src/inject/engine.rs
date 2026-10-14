@@ -467,7 +467,10 @@ pub trait Injector: Send + Sync {
         _text: &str,
         _spec: &crate::inject::families::FamilySpec,
     ) -> Result<(), String> {
-        Err("草稿注入（无提交回车）仅 Windows ConPTY 通道支持".to_string())
+        Err(
+            "INJECT_WINDOWS_ONLY_DRAFT: 草稿注入（无提交回车）仅 Windows ConPTY 通道支持"
+                .to_string(),
+        )
     }
 
     /// **批量退格**（2026-10-04 计划反馈通道）：`count` 个 VK_BACK 一次通道
@@ -481,7 +484,7 @@ pub trait Injector: Send + Sync {
         _count: usize,
         _spec: &crate::inject::families::FamilySpec,
     ) -> Result<(), String> {
-        Err("批量退格仅 Windows ConPTY 通道支持".to_string())
+        Err("INJECT_WINDOWS_ONLY_BACKSPACE: 批量退格仅 Windows ConPTY 通道支持".to_string())
     }
     fn locate_and_send_key_spec(
         &self,
@@ -501,8 +504,8 @@ pub struct RealInjector;
 #[cfg(target_os = "macos")]
 impl Injector for RealInjector {
     fn locate_and_inject(&self, pid: u32, text: &str) -> Result<(), String> {
-        let tty =
-            crate::window::get_tty_for_pid(pid).map_err(|e| format!("定位终端失败：{}", e))?;
+        let tty = crate::window::get_tty_for_pid(pid)
+            .map_err(|e| format!("INJECT_TTY_LOCATE_FAIL: 定位终端失败：{}", e))?;
         // tty 形如 /dev/ttys005（ps 也可能返回裸后缀）；iTerm2/Terminal 脚本
         // 收后缀、内部补 /dev/ 全路径相等匹配（P2-3）
         let suffix = tty.rsplit('/').next().unwrap_or(&tty);
@@ -516,10 +519,13 @@ impl Injector for RealInjector {
                 Ok(()) => {
                     return match run_tmux(&tmux_enter_args(&target)) {
                         Ok(()) => Ok(()),
-                        Err(e) => Err(format!("tmux 回车失败（文本已入 pane，勿重试）：{}", e)),
+                        Err(e) => Err(format!(
+                            "INJECT_TMUX_ENTER_FAIL: tmux 回车失败（文本已入 pane，勿重试）：{}",
+                            e
+                        )),
                     };
                 }
-                Err(e) => errs.push(format!("tmux 文本注入失败：{}", e)),
+                Err(e) => errs.push(format!("INJECT_TMUX_TEXT_FAIL: tmux 文本注入失败：{}", e)),
             }
         }
 
@@ -537,14 +543,17 @@ impl Injector for RealInjector {
             Ok(()) => Ok(()),
             Err(e) => {
                 errs.push(format!("Terminal.app 注入失败：{}", e));
-                Err(format!("全部注入通道失败：{}", errs.join("；")))
+                Err(format!(
+                    "INJECT_ALL_CHANNELS_FAIL: 全部注入通道失败：{}",
+                    errs.join("；")
+                ))
             }
         }
     }
 
     fn locate_and_send_key_inner(&self, pid: u32, key: &str) -> Result<(), String> {
-        let tty =
-            crate::window::get_tty_for_pid(pid).map_err(|e| format!("定位终端失败：{}", e))?;
+        let tty = crate::window::get_tty_for_pid(pid)
+            .map_err(|e| format!("INJECT_TTY_LOCATE_FAIL: 定位终端失败：{}", e))?;
         let suffix = tty.rsplit('/').next().unwrap_or(&tty);
         let mut errs: Vec<String> = Vec::new();
 
@@ -552,7 +561,7 @@ impl Injector for RealInjector {
         if let Some(target) = find_tmux_pane(&tty) {
             match run_tmux(&tmux_key_args(&target, key)) {
                 Ok(()) => return Ok(()),
-                Err(e) => errs.push(format!("tmux 按键失败：{}", e)),
+                Err(e) => errs.push(format!("INJECT_TMUX_KEY_FAIL: tmux 按键失败：{}", e)),
             }
         }
 
@@ -572,7 +581,10 @@ impl Injector for RealInjector {
             Ok(()) => Ok(()),
             Err(e) => {
                 errs.push(format!("Terminal.app 按键失败：{}", e));
-                Err(format!("全部注入通道失败：{}", errs.join("；")))
+                Err(format!(
+                    "INJECT_ALL_CHANNELS_FAIL: 全部注入通道失败：{}",
+                    errs.join("；")
+                ))
             }
         }
     }
@@ -595,7 +607,7 @@ fn run_tmux(args: &[String]) -> Result<(), String> {
     let output = std::process::Command::new("tmux")
         .args(args)
         .output()
-        .map_err(|e| format!("tmux 执行失败：{}", e))?;
+        .map_err(|e| format!("INJECT_TMUX_SPAWN_FAIL: tmux 执行失败：{}", e))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -657,10 +669,10 @@ impl Injector for RealInjector {
 #[cfg(not(any(target_os = "macos", windows)))]
 impl Injector for RealInjector {
     fn locate_and_inject(&self, _pid: u32, _text: &str) -> Result<(), String> {
-        Err("平台不支持".into())
+        Err("INJECT_PLATFORM_UNSUPPORTED: 平台不支持".into())
     }
     fn locate_and_send_key_inner(&self, _pid: u32, _key: &str) -> Result<(), String> {
-        Err("平台不支持".into())
+        Err("INJECT_PLATFORM_UNSUPPORTED: 平台不支持".into())
     }
 }
 
