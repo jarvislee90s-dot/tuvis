@@ -137,24 +137,25 @@ export function WorkBuddyIcon({ className }: { className?: string }) {
       </defs>
       {/* 圆角方渐变底 */}
       <rect width="256" height="256" rx="58" fill={`url(#${gid})`} />
-      {/* 白猫头（双饱满耳 + 圆颅，右耳更高；头左缘铺到图标左缘，下缘没人脸框后） */}
-      <path
-        d="M22 190
-           C12 136 20 88 48 60
-           L60 34
-           C62 28 68 26 74 30
-           C88 42 106 48 128 50
-           C150 48 168 40 180 28
-           C186 20 194 18 198 24
-           C204 32 206 44 202 58
-           C212 88 214 134 208 184
-           Z"
-        fill="#FFFFFF"
-      />
-      <g transform="rotate(-18 131 148)">
+      {/* 白猫头 + 脸框同组旋转（2026-10-14 用户定案：脸本身左右对称，倾斜只用
+          组旋转表达——头部几何严格镜像对称于 x=128，双耳等高、颅体居中） */}
+      <g transform="rotate(-16 128 148)">
+        <path
+          d="M34 186
+             C24 132 28 88 52 62
+             L62 34
+             C64 27 71 25 77 30
+             C92 43 109 50 128 50
+             C147 50 164 43 179 30
+             C185 25 192 27 194 34
+             L204 62
+             C228 88 232 132 222 186
+             Z"
+          fill="#FFFFFF"
+        />
         {/* 大号白描边圆角矩形脸（渐变透底，与背景无缝续接） */}
         <rect
-          x="58"
+          x="55"
           y="98"
           width="146"
           height="100"
@@ -163,10 +164,9 @@ export function WorkBuddyIcon({ className }: { className?: string }) {
           stroke="#FFFFFF"
           strokeWidth="14"
         />
-        {/* 两枚白色胖竖椭圆眼（参考图实测：脸内醒目白眼，位于脸框中下部；
-            眼径按参考实测校准 rx15/ry20） */}
-        <ellipse cx="106" cy="174" rx="15" ry="20" fill="#FFFFFF" />
-        <ellipse cx="172" cy="174" rx="15" ry="20" fill="#FFFFFF" />
+        {/* 两枚白色胖竖椭圆眼（关于中轴对称；参考图实测眼径 rx15/ry20） */}
+        <ellipse cx="95" cy="174" rx="15" ry="20" fill="#FFFFFF" />
+        <ellipse cx="161" cy="174" rx="15" ry="20" fill="#FFFFFF" />
       </g>
     </svg>
   );
