@@ -46,10 +46,11 @@ const CODED_CALL = /\bcoded(?:_param)?\(\s*"([A-Z][A-Z0-9_]+)"/g;
 const CODED_LITERAL = /"([A-Z][A-Z0-9_]{2,}):/g;
 
 function stripComments(src) {
-  // 剥块注释与行注释（行内注释仅当 // 前有空白——避开字符串里的 https://）。
-  // 文档注释（/// 与 //!）里的示例码不得算作生产使用。
+  // 只剥【行】注释（行内注释仅当 // 前有空白——避开字符串里的 https://）。
+  // 不剥块注释：本库注释里大量 `monitor/*_parser.rs`、`projects/*/` 形态的 /* 与 */
+  // 会被块注释正则配对吞掉中间的真代码（content.rs 实证——六处码凭空消失）；
+  // 真有 /* */ 内示例码被误报时登记 EXCLUDE_CODES 即可。
   return src
-    .replace(/\/\*[\s\S]*?\*\//g, "")
     .split("\n")
     .map((l) => (/^\s*\/\//.test(l) ? "" : l.replace(/\s\/\/.*$/, "")))
     .join("\n");

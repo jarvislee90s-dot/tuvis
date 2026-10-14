@@ -143,7 +143,7 @@ impl ChannelKind {
             "named" => Ok(Self::Named),
             "tailscale" => Ok(Self::Tailscale),
             other => Err(format!(
-                "通道值非法: {other}（仅 lan/quick/named/tailscale）"
+                "REMOTE_BAD_CHANNEL: 通道值非法: {other}（仅 lan/quick/named/tailscale）"
             )),
         }
     }
@@ -609,13 +609,13 @@ fn validate_bind(raw: &str) -> Result<&str, String> {
     // 静默把空串当 127.0.0.1 会掩盖写坏设置的真实故障
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("远程绑定地址为空（设置键存在但值为空串）".to_string());
+        return Err("REMOTE_BIND_EMPTY: 远程绑定地址为空（设置键存在但值为空串）".to_string());
     }
     if trimmed.eq_ignore_ascii_case("localhost") || trimmed.parse::<std::net::IpAddr>().is_ok() {
         Ok(trimmed)
     } else {
         Err(format!(
-            "远程绑定地址非法: {raw:?}（仅支持 127.0.0.1 / localhost / ::1 / 合法 IP 地址）"
+            "REMOTE_BIND_INVALID: 远程绑定地址非法: {raw:?}（仅支持 127.0.0.1 / localhost / ::1 / 合法 IP 地址）"
         ))
     }
 }
@@ -1393,7 +1393,7 @@ fn set_pin_core(
 ) -> Result<PinSetOutcome, String> {
     let new = new_pin.trim();
     if !pin::validate_pin(new) {
-        return Err("访问密码必须为 4 位数字".to_string());
+        return Err("REMOTE_PASSCODE_INVALID: 访问密码必须为 4 位数字".to_string());
     }
     match old.as_deref().map(str::trim) {
         None => {
@@ -1440,12 +1440,14 @@ fn rename_device_core(
 ) -> Result<(), String> {
     let name = name_raw.trim();
     if name.is_empty() {
-        return Err("设备名称不能为空".to_string());
+        return Err("REMOTE_DEVICE_NAME_EMPTY: 设备名称不能为空".to_string());
     }
     if rename(name)? {
         Ok(())
     } else {
-        Err(format!("设备不存在: {device_id}"))
+        Err(format!(
+            "REMOTE_DEVICE_NOT_FOUND:{device_id}: 设备不存在: {device_id}"
+        ))
     }
 }
 
@@ -1664,7 +1666,7 @@ pub async fn remote_ts_run_step(step: String) -> Result<serde_json::Value, Strin
     let (_, port) = bind_and_port().unwrap_or(("127.0.0.1".into(), DEFAULT_PORT));
     tauri::async_runtime::spawn_blocking(move || tailscale::run_step(&step, port))
         .await
-        .map_err(|e| format!("执行向导步骤失败: {e}"))?
+        .map_err(|e| format!("REMOTE_WIZARD_STEP_FAIL: 执行向导步骤失败: {e}"))?
 }
 
 // ============================================================

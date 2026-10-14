@@ -92,7 +92,7 @@ pub fn persist_device_with_fingerprint(
             |r| r.get(0),
         )
         .optional()
-        .map_err(|e| format!("persist_device 查指纹失败: {e}"))?;
+        .map_err(|e| format!("PAIRING_FINGERPRINT_QUERY_FAIL: persist_device 查指纹失败: {e}"))?;
     if let Some(id) = existing {
         // 命中路径：ua/origin_ip 实际与指纹输入同源（防御式重写），last_seen 必刷新；
         // via 刷新为本次接入通道；name / first_paired_at / revoked 不动
@@ -102,7 +102,7 @@ pub fn persist_device_with_fingerprint(
              WHERE id = ?1",
             rusqlite::params![id, d.ua, d.origin_ip, d.paired_at, d.via],
         )
-        .map_err(|e| format!("persist_device 更新失败: {e}"))?;
+        .map_err(|e| format!("PAIRING_FINGERPRINT_UPDATE_FAIL: persist_device 更新失败: {e}"))?;
         return Ok(id);
     }
     conn.execute(
@@ -111,7 +111,7 @@ pub fn persist_device_with_fingerprint(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 0)",
         rusqlite::params![d.id, d.name, d.ua, d.origin_ip, fp, d.via, d.paired_at],
     )
-    .map_err(|e| format!("persist_device 插入失败: {e}"))?;
+    .map_err(|e| format!("PAIRING_INSERT_FAIL: persist_device 插入失败: {e}"))?;
     Ok(d.id.clone())
 }
 
@@ -189,7 +189,7 @@ pub fn revoke_device(conn: &rusqlite::Connection, device_id: &str) -> Result<usi
         "UPDATE remote_devices SET revoked = 1 WHERE id = ?1 AND revoked = 0",
         [device_id],
     )
-    .map_err(|e| format!("吊销设备失败: {e}"))
+    .map_err(|e| format!("PAIRING_REVOKE_FAIL: 吊销设备失败: {e}"))
 }
 
 /// 设备 cookie 统一拼装（api::pair / pair-poll / pair-confirm 三处共用，防漂移）

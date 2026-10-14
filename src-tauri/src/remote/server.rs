@@ -744,7 +744,7 @@ pub fn router_with_static(state: Arc<RemoteState>) -> Router {
 pub async fn serve(bind: &str, port: u16, state: Arc<RemoteState>) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind((bind, port))
         .await
-        .map_err(|e| format!("绑定 {bind}:{port} 失败: {e}"))?;
+        .map_err(|e| format!("RSERVER_BIND_FAIL: 绑定 {bind}:{port} 失败: {e}"))?;
     // M3 Task 5：事件桥在**绑定成功后**启动（幂等——全局 Once 保证扫描循环全进程只
     // spawn 一次）。放在 bind 之后：端口被占等启动失败不遗留 2s 会话扫描（扫描是重活，
     // 见 adapter::get_all_sessions 的单飞护栏注释）；watcher 生命周期随进程结束，
