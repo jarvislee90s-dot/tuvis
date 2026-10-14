@@ -9,7 +9,7 @@
 - [ ] 工程化（chore）
 
 ## 测试
-- [ ] `cargo test` 通过
+- [ ] 已跑 `bash scripts/ci-backend-local.sh`（等同 CI backend job：含 `--features marker-helper` 与 Windows 交叉覆盖——本机裸 `cargo test` 无 feature，全绿推不出 CI 会绿，见 #127/#128）
 - [ ] `pnpm test` 通过
 - [ ] `pnpm check` 通过
 - [ ] 手动验证通过

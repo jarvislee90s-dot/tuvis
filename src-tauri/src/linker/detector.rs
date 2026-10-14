@@ -159,8 +159,16 @@ fn has_native_content_at(
 
 /// 判定链接目标是否位于 mam_root 下。canonicalize 穿透链接取真实落点（结果为
 /// `\\?\` 前缀形态，与 read_link 字面量不可直接比较，须规范化后再比）；
-/// 大小写不敏感更稳
-fn link_target_in_mam_root(link_path: &Path, link_target: &Path, mam_root: &Path) -> bool {
+/// 大小写不敏感更稳。
+///
+/// pub(crate)（#64-1，2026-10-14）：resource::reconcile 的 L4 外链判定复用本原语
+/// ——此前那边用 `target.starts_with(&mam_root)` 字面比较，symlink home 或
+/// macOS `/var → /private/var` 别名下会把 兔维斯 自建链接误报成 L4 外链。
+pub(crate) fn link_target_in_mam_root(
+    link_path: &Path,
+    link_target: &Path,
+    mam_root: &Path,
+) -> bool {
     // canonicalize 结果带 `\\?\` 前缀，须与解析后的链接落点同样剥前缀再比
     let Some(mam_norm) = mam_root.canonicalize().ok().map(strip_verbatim_prefix) else {
         return false; // mam_root 不存在/解析失败：无「兔维斯 自建」可言（保守）

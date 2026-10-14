@@ -19,6 +19,9 @@ import {
   SETTINGS_HINT,
   SETTINGS_NOTE,
   SETTINGS_PAGE_TITLE,
+  SETTINGS_REMOTE_HINT,
+  SETTINGS_REMOTE_QR_CAPTION,
+  SETTINGS_REMOTE_ROW,
   SETTINGS_SUBTITLE,
 } from "@/components/settings/typography";
 
@@ -35,22 +38,43 @@ const SURFACE = [
 const rel = (f: string) => path.relative(ROOT, f).replace(/\\/g, "/");
 
 /**
- * **豁免面**：小字号在这里是「装得下优先」，抬字号会把版面挤爆 —— 属版面问题，不属排版规范。
- *  * 前四个 = **密集数据网格**（五列审计表 / 信号矩阵 / 远程设备表 / 采集状态表）；
- *  * 第五个 = **缩小的设备预览**（`RemoteAppearanceSection` 里是一台模拟手机的聊天/通知/卡片
- *    预览，`text-[8px]`/`text-[9px]` 是它内部的**缩微**字号，放大就不像「预览」而像「正文」了）。
- * 要动这两类必须先重排版面，并同步改本清单与 `typography.ts` 的说明。
+ * **豁免面**（file → 具名理由）：小字号在这里是「装得下优先」，抬字号会把版面挤爆
+ *  —— 属版面问题，不属排版规范。要动必须先重排版面，并同步改本清单与 `typography.ts`。
+ * （2026-10-14 #125 方案 A：豁免仍按文件，但**放行的是登记值**——文件进豁免面
+ *  不再等于「里面写什么字号都没人管」，未登记值在豁免面内同样报红。）
  */
-const EXEMPT = new Set([
-  "src/components/settings/AuditLogSection.tsx",
-  "src/components/settings/SignalHealthSection.tsx",
-  "src/components/settings/RemoteSection.tsx",
-  "src/components/settings/UsageStatusSection.tsx",
-  "src/components/settings/RemoteAppearanceSection.tsx",
+const EXEMPT = new Map<string, string>([
+  ["src/components/settings/AuditLogSection.tsx", "五列审计表（密集网格）"],
+  ["src/components/settings/SignalHealthSection.tsx", "信号矩阵（密集网格）"],
+  ["src/components/settings/RemoteSection.tsx", "远程设备/文件表与模式名（密集网格）"],
+  ["src/components/settings/UsageStatusSection.tsx", "采集状态表（密集网格）"],
+  ["src/components/settings/RemoteAppearanceSection.tsx", "缩微设备预览（小字号是缩微的一部分）"],
 ]);
 
-/** 豁免档允许出现的小字号（徽标 + 密集网格单元格） */
-const ALLOWED_SMALL = ["text-[10px]", "text-[9px]", "text-[8px]", "text-[12.5px]", "text-[10.5px]"];
+/**
+ * **登记值总表**（2026-10-14 #125 方案 A）：一切合法 `text-[Npx]` 的值域。
+ * 未登记的值（如 12 与 13 曾是、将来的 13.5/7 等）在**任何**设置面文件里都报红
+ * ——「野字号」不再因为「没被枚举过」而对规则隐身（旧实现只枚举 5 个登记值，
+ * 谁写一个新字号谁就免检，正是本条要修的盲区）。出处：
+ *  * `8` / `9` / `12.5` —— 密集网格单元格与缩微预览（豁免档，仅豁免面内可用）；
+ *  * `10`   —— `SETTINGS_BADGE`；
+ *  * `10.5` —— `SETTINGS_REMOTE_BADGE` / `SETTINGS_REMOTE_QR_CAPTION`（线稿硬契约）；
+ *  * `11`   —— `SETTINGS_NOTE`（层级档，任何文件可用）；
+ *  * `12` / `13` —— `SETTINGS_REMOTE_HINT` / `SETTINGS_REMOTE_ROW`
+ *    （2026-09-17 线稿硬契约，#125 核查时发现散落未登记，2026-10-14 立档）。
+ */
+const REGISTERED = new Set(["8", "9", "10", "10.5", "11", "12", "12.5", "13"]);
+
+/**
+ * 登记值中的**小字号**：裸字面量只允许出现在豁免面内（外溢仍红）；非豁免文件
+ * 要用请走 `typography.ts` 常量（常量插值不算裸字面量）。`11` 不在列——它是
+ * `SETTINGS_NOTE` 层级档，与旧口径一致地在任何文件可用。
+ */
+const SMALL_LITERAL_ONLY_IN_EXEMPT = ["8", "9", "10", "10.5", "12", "12.5", "13"];
+
+/** 扫一段源码里的全部 `text-[Npx]` 字面量（规则本体抽成函数，反例测试才能直接打它） */
+const scanFontLiterals = (src: string): string[] =>
+  [...src.matchAll(/text-\[([0-9.]+)px\]/g)].map((m) => m[1]);
 
 describe("设置页排版层级（C1）", () => {
   it("① 档位表逐字钉住（二级标题必须比一级小一档 —— 改动前两者都是 18）", () => {
@@ -89,19 +113,46 @@ describe("设置页排版层级（C1）", () => {
     expect(checked, "设置面标题总数（少一个就说明有标题漏掉了档位）").toBe(15);
   });
 
-  it("③ 小字号**只**允许出现在登记过的豁免面里（外溢即红）", () => {
+  it("③ 字号按值登记：未登记值在任何文件都红；登记小字号的裸字面量不得外溢豁免面", () => {
     const offenders: string[] = [];
     for (const f of SURFACE) {
       const r = rel(f);
       const src = readFileSync(f, "utf8");
-      for (const small of ALLOWED_SMALL) {
-        if (!src.includes(small)) continue;
-        // 徽标档在**任何**设置面文件里都合法（它靠小区别于正文，与层级无关）
-        if (small === "text-[10px]" && src.includes("SETTINGS_BADGE")) continue;
-        if (!EXEMPT.has(r)) offenders.push(`${r} 出现 ${small}`);
+      for (const v of new Set(scanFontLiterals(src))) {
+        if (!REGISTERED.has(v)) {
+          offenders.push(`${r} 出现未登记字号 text-[${v}px]（先在 typography.ts 立档，再用药）`);
+          continue;
+        }
+        if (SMALL_LITERAL_ONLY_IN_EXEMPT.includes(v) && !EXEMPT.has(r)) {
+          // 徽标档在**任何**设置面文件里都合法（它靠小区别于正文，与层级无关）
+          if (v === "10" && src.includes("SETTINGS_BADGE")) continue;
+          offenders.push(
+            `${r} 出现小字号裸字面量 text-[${v}px]（非豁免面请走 typography.ts 常量）`
+          );
+        }
       }
     }
-    expect(offenders, "小字号外溢到非豁免文件（要加豁免请连同理由写进 typography.ts）").toEqual([]);
+    expect(
+      offenders,
+      "野字号（未登记值）与小字号外溢（要加豁免请连同理由写进 typography.ts 与 EXEMPT）"
+    ).toEqual([]);
+  });
+
+  it("③c 反例：登记表外的值必须被抓到（规则不能只靠「恰好没人踩到」验证）", () => {
+    // 构造含未登记字号的源码段——旧实现（枚举 5 个登记值）对这类源码是盲的
+    const wild = scanFontLiterals(
+      '<p className="text-[13.5px]">x</p><i className="text-[7px]">y</i>'
+    );
+    expect(wild).toEqual(["13.5", "7"]);
+    expect(wild.every((v) => !REGISTERED.has(v)), "13.5/7 不在登记表，规则必须能看见").toBe(
+      true
+    );
+    // 登记值照常通过（12.5 = 密集网格档）
+    expect(scanFontLiterals('<p className="text-[12.5px]">x</p>')).toEqual(["12.5"]);
+    // 线稿硬契约档的值逐字钉住（与 ① 同级纪律：防「顺手规范化」把线稿值改成整数档）
+    expect(SETTINGS_REMOTE_QR_CAPTION).toBe("text-[10.5px]");
+    expect(SETTINGS_REMOTE_ROW).toBe("text-[13px]");
+    expect(SETTINGS_REMOTE_HINT).toBe("text-[12px]");
   });
 
   it("③b 字段名也必须走档位（内联 `text-sm font-medium` 在设置面绝迹）", () => {
@@ -115,12 +166,13 @@ describe("设置页排版层级（C1）", () => {
   });
 
   it("④ 豁免面自身仍在（防止「顺手规范密集网格」把列挤爆）", () => {
-    // 逐个钉：这四个文件里至少各有一处小字号，且它们**不在**上面 ② 的标题档位替换范围里
-    for (const r of EXEMPT) {
+    // 逐个钉：每个豁免文件里至少各有一处登记过的小字号裸字面量，且它们**不在** ② 的
+    // 标题档位替换范围里（Map 遍历取 key，理由在 EXEMPT 登记处）
+    for (const [r, reason] of EXEMPT) {
       const src = readFileSync(path.join(ROOT, r), "utf8");
       expect(
-        ALLOWED_SMALL.some((s) => src.includes(s)),
-        `${r} 是密集网格豁免面，但已找不到任何小字号——若确实重排了版面，请同时更新本清单与 typography.ts`
+        SMALL_LITERAL_ONLY_IN_EXEMPT.some((v) => src.includes(`text-[${v}px]`)),
+        `${r}（${reason}）是豁免面，但已找不到任何登记小字号——若确实重排了版面，请同时更新本清单与 typography.ts`
       ).toBe(true);
     }
   });

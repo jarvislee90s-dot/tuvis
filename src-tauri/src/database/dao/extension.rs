@@ -176,6 +176,20 @@ pub fn migrate_backslash_skill_ids_on(conn: &rusqlite::Connection) -> usize {
     moved
 }
 
+/// 单行查询：某 id 的 is_native（#64-3 预设命令层防御用——universal 预设不得含
+/// 原生项）。None = 行不存在**或 DB 查询出错**（均降级放行——防御是宁严勿松方向
+/// 的加拦，不是必拦，查询失败不该把预设功能整个堵死）
+pub fn extension_is_native(ext_id: &str) -> Option<bool> {
+    let conn = DB.lock().unwrap();
+    conn.query_row(
+        "SELECT is_native FROM extensions WHERE id = ?1",
+        params![ext_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .ok()
+    .map(|n| n != 0)
+}
+
 pub fn list_extensions() -> Vec<ExtensionRecord> {
     let conn = DB.lock().unwrap();
     conn.prepare("SELECT id, kind, name, description, source_path, source_url, version, tags, suite, source_tool, is_native FROM extensions")

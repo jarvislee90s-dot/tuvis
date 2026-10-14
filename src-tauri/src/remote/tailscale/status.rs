@@ -474,6 +474,15 @@ pub(super) fn wait_child_bounded(
     let out = child.stdout.take().map(drain_pipe);
     let err = child.stderr.take().map(drain_pipe);
     // 正常退出：直接子进程已结束、自己的输出必然写完 ⇒ 无条件收，**不截断**大输出
+    //
+    // 【上条论断的失效条件（issue #126 登记，2026-10-14）——任一成立，本分支重回无界等待】
+    //  1. `run_cli_with_timeout` 的 spawn 形态从「直接可执行文件」改为经 shell
+    //     （`sh -c` / `cmd /c`）或改调可能 fork 的包装命令（脚本 / `sudo` / 代理进程）——
+    //     孙进程继承管道写端时，EOF 只在全部写端持有者退出后才来（同上第 3 条纪律的机制）；
+    //  2. 后果会放大：本路径在轮询线程上（`ensure_poller` 见旧线程未退出就不新起），
+    //     一次悬挂 = 轮询永久失去自愈/重验。
+    //  若将来确需给本分支加界：用「宽限内收满已知字节数即返回，否则继续无界等」的降级，
+    //  **不要**直接套超时分支的 [`collect_bounded`]——500ms 宽限会截断本要解析的大输出。
     let collect = |rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>| {
         rx.map(|rx| rx.recv().unwrap_or_default())
             .unwrap_or_default()

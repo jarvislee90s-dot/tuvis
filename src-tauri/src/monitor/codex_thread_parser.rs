@@ -145,6 +145,14 @@ pub fn build_sessions(
 /// `{"subagent":{...}}`，主会话 source ∈ cli/exec/vscode 等），updated_at 倒序 LIMIT。
 /// git_branch / git_origin_url / first_user_message 是后加列——prepare 探测，
 /// 旧版库缺列按 NULL 降级（zcode 列探测同款）
+///
+/// ⚠️ 防误用护栏（issue #97）：threads 表的 `tokens_used` 列**不可用于 token 用量统计**
+/// ——本机 425 个 rollout 全量对照实测，与 rollout 聚合真值仅 44.1% 吻合、30% 被放大约
+/// 10~100 倍（中位比值 1.19）。用量/缓存命中率只能读 rollout jsonl 的
+/// `event_msg.payload.token_count.info.last_token_usage`（四桶）；SQLite 侧只取
+/// 元数据（rollout_path/标题/归档标记），且查询前必须 `PRAGMA table_info(threads)`
+/// 探列（本机存在 40 列与 29 列两套 state 库）。**不要把 tokens_used 加进 SELECT。**
+/// 实测报告：`research/Codex-用量路径实测.md`（本地参考库）。
 fn list_recent_threads(conn: &Connection, now_s: i64) -> Vec<ThreadRow> {
     let has_col = |c: &str| {
         conn.prepare(&format!("SELECT {c} FROM threads LIMIT 0"))

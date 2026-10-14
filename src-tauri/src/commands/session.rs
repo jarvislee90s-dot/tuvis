@@ -169,19 +169,12 @@ pub fn focus_session(
             }
         }
         // marker 与按需注入 helper 贴的标题标记一致：TUVIS:<session_id 剥连字符后
-        // 前 12 位>。口径两处互引（改动须同步）：本处（匹配侧）/ tuvis-marker
-        // helper（src/bin/tuvis-marker.rs，注入侧）。8 位对 codex UUIDv7 只编码
-        // 65.5s 粒度、同分钟双开撞车（实测 2026-09-08），12 位不撞；必须先剥
-        // 连字符——UUID 第 9 位即 '-'，直接 take(12) 会切进分隔符
-        let marker = session_id.as_deref().map(|id| {
-            format!(
-                "TUVIS:{}",
-                id.chars()
-                    .filter(|c| *c != '-')
-                    .take(12)
-                    .collect::<String>()
-            )
-        });
+        // 前 12 位>。口径单一出处 = window::disambig::marker_from_session_id（#57
+        // 漂移封口：本处（匹配侧）与 tuvis-marker helper（注入侧）走同一函数，
+        // 两端各有字面向量测试；12 位理由与剥连字符的口径见该函数文档）
+        let marker = session_id
+            .as_deref()
+            .map(crate::window::disambig::marker_from_session_id);
         // 面板反推：当前所有运行会话的 (工具id, 项目名)，用于排除其他工具的终端窗口
         // （codex 终端标题=项目名，无 "codex" 关键词可静态认领）。进程扫描即可，无文件解析开销
         let running_projects = running_projects_from_processes(&system);

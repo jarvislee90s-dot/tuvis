@@ -3,6 +3,29 @@
 use crate::database::{PresetRecord, ResourceBindingRecord};
 use crate::services::preset::{ApplyPreview, PresetHealth, RestoreResult};
 
+/// #64-3 悬空键防御（2026-10-14）：**通用预设不得包含原生技能**（is_native=1 行）。
+/// 前端编辑弹窗已双层封死（切类型剪除 + 保存过滤，回归锁在案），但仅 UI 层——
+/// 经「已修复的泄漏路径创建预设 → 后删除该扩展」等绕过路径仍可能持久化出含
+/// 原生项的通用预设（应用侧此前只落 failures 列表非破坏性）。此处 Rust 侧直接拒绝。
+/// 未登记 id（查询 None）**不拦**：预设项允许前瞻引用既有行为。口径与 apply 路径
+/// （`services/preset`，`is_native && source_tool==工具` 双条件）的差异**如实申报**：
+/// 命令层按 `is_native` 单条件拦——更严（无 source_tool 的 is_native 行也进不了
+/// 通用预设），防御方向宁严勿松，非缺陷。
+fn reject_native_items_in_universal(scope: &str, items: &[(String, String)]) -> Result<(), String> {
+    if scope != "universal" {
+        return Ok(());
+    }
+    for (ext_id, _) in items {
+        if crate::database::dao::extension::extension_is_native(ext_id).unwrap_or(false) {
+            return Err(format!(
+                "通用预设不得包含原生技能 {ext_id}（原生项只属于工具私有预设；\
+                 PRESET_NATIVE_IN_UNIVERSAL:{ext_id}）"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PresetApplyResult {
@@ -26,6 +49,7 @@ pub fn create_preset(
     if scope == "tool" && bound_tool.is_none() {
         return Err("工具私有预设必须指定绑定工具".into());
     }
+    reject_native_items_in_universal(&scope, &items)?;
     crate::database::create_preset_with_meta(
         &name,
         &description.unwrap_or_default(),
@@ -63,6 +87,7 @@ pub fn update_preset(
     if scope == "tool" && bound_tool.is_none() {
         return Err("工具私有预设必须指定绑定工具".into());
     }
+    reject_native_items_in_universal(&scope, &items)?;
     crate::database::update_preset(
         &id,
         &name,

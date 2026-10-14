@@ -2608,3 +2608,92 @@ fn restore_exempts_post_snapshot_resident_v2m2() {
     let _ = std::fs::remove_dir_all(home.join(".tuvis/skills/v2m2-rx-a"));
     let _ = std::fs::remove_dir_all(home.join(".tuvis/skills/v2m2-rx-x"));
 }
+
+/// #64-3 悬空键防御（2026-10-14）：universal 预设含 is_native=1 行 → 命令层直接
+/// 拒绝（create 与 update 两口都拦）；工具私有预设含原生项合法（原生项只属于
+/// 工具预设）；未登记 id 不拦（前瞻引用既有行为）。
+/// 还原动作（变异）：删掉 reject_native_items_in_universal 调用 → 前两段断言红。
+#[test]
+fn preset_commands_reject_native_items_in_universal() {
+    let _guard = PRESET_V2_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    support::setup();
+    use multi_agents_manager_lib::commands::preset as preset_cmd;
+    use multi_agents_manager_lib::database;
+
+    // 播种：一个原生 skill（is_native=1 + source_tool）+ 一个普通 skill
+    for (id, native) in [("skill-v2m3-native-x", true), ("skill-v2m3-plain-x", false)] {
+        database::insert_extension(&database::ExtensionRecord {
+            id: id.into(),
+            kind: "skill".into(),
+            name: id.trim_start_matches("skill-").into(),
+            description: None,
+            source_path: format!("/tmp/{id}"),
+            source_url: None,
+            version: None,
+            tags: None,
+            suite: None,
+            source_tool: (id.ends_with("native-x")).then(|| "claude".to_string()),
+            is_native: native,
+        })
+        .unwrap();
+    }
+
+    // ① create：universal + 原生项 → Err（结构化码可检索）
+    let err = preset_cmd::create_preset(
+        "v2m3-def-native".into(),
+        vec![("skill-v2m3-native-x".into(), "skill".into())],
+        None,
+        Some("universal".into()),
+        None,
+    )
+    .expect_err("universal 预设含原生项必须被命令层拒绝");
+    assert!(
+        err.contains("PRESET_NATIVE_IN_UNIVERSAL:skill-v2m3-native-x"),
+        "错误应携带结构化码与违规项 id：{err}"
+    );
+
+    // ② create：universal + 普通项（含未登记 id）→ Ok（前瞻引用不拦）
+    let ok_pid = preset_cmd::create_preset(
+        "v2m3-def-ok".into(),
+        vec![
+            ("skill-v2m3-plain-x".into(), "skill".into()),
+            ("skill-v2m3-unregistered".into(), "skill".into()),
+        ],
+        None,
+        Some("universal".into()),
+        None,
+    )
+    .expect("universal + 普通项/未登记项不得误拦");
+
+    // ③ create：工具私有 + 原生项 → Ok（原生项只属于工具预设）
+    let tool_pid = preset_cmd::create_preset(
+        "v2m3-def-tool".into(),
+        vec![("skill-v2m3-native-x".into(), "skill".into())],
+        None,
+        Some("tool".into()),
+        Some("claude".into()),
+    )
+    .expect("工具私有预设含原生项是合法的");
+
+    // ④ update：把已存在的通用预设改成含原生项 → 同样拒绝
+    let err = preset_cmd::update_preset(
+        ok_pid.clone(),
+        "v2m3-def-ok".into(),
+        String::new(),
+        "universal".into(),
+        None,
+        vec![("skill-v2m3-native-x".into(), "skill".into())],
+    )
+    .expect_err("update 口同样必须拒绝原生项入通用预设");
+    assert!(err.contains("PRESET_NATIVE_IN_UNIVERSAL"));
+
+    // 清场
+    for pid in [ok_pid, tool_pid] {
+        let _ = database::delete_preset(&pid);
+    }
+    let _ = database::delete_extension("skill-v2m3-native-x");
+    let _ = database::delete_extension("skill-v2m3-plain-x");
+}

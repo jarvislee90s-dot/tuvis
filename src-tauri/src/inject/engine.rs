@@ -426,7 +426,21 @@ pub trait Injector: Send + Sync {
         "real"
     }
     fn locate_and_inject(&self, pid: u32, text: &str) -> Result<(), String>;
-    fn locate_and_send_key(&self, pid: u32, key: &str) -> Result<(), String>;
+    /// **原始通道派发**（不带黑名单）：macOS 三通道 / Windows ConPTY / 测试假体。
+    /// 生产与测试一律经 [`Injector::locate_and_send_key`] 入口进入，不直接调本方法。
+    fn locate_and_send_key_inner(&self, pid: u32, key: &str) -> Result<(), String>;
+
+    /// 单键注入**引擎入口**（#79 上提，2026-10-14）：键黑名单先于一切通道派发。
+    /// 此前黑名单只在 Windows `inject_key_spec` 生效，macOS 传统 locate 链
+    /// （tmux/iTerm2/Terminal）不经过它——裁19 的纵深缺口；上提后两平台与全部
+    /// 测试假体同受检，黑名单**本体仍单点** = [`forbidden_key_reason`]
+    /// （Windows 通道内的那次调用保留为纵深第二道，不承担唯一性）。
+    fn locate_and_send_key(&self, pid: u32, key: &str) -> Result<(), String> {
+        if let Some(reason) = forbidden_key_reason(key) {
+            return Err(reason);
+        }
+        self.locate_and_send_key_inner(pid, key)
+    }
 
     /// spec 感知注入（M9R，跨任务接口契约）：queue 驱动的 flush 必须能把
     /// opencode 等慢消费者族规格送达引擎。默认实现忽略 spec、委托旧方法
@@ -528,7 +542,7 @@ impl Injector for RealInjector {
         }
     }
 
-    fn locate_and_send_key(&self, pid: u32, key: &str) -> Result<(), String> {
+    fn locate_and_send_key_inner(&self, pid: u32, key: &str) -> Result<(), String> {
         let tty =
             crate::window::get_tty_for_pid(pid).map_err(|e| format!("定位终端失败：{}", e))?;
         let suffix = tty.rsplit('/').next().unwrap_or(&tty);
@@ -601,7 +615,7 @@ impl Injector for RealInjector {
     fn locate_and_inject(&self, pid: u32, text: &str) -> Result<(), String> {
         crate::inject::windows_console::locate_and_inject(pid, text)
     }
-    fn locate_and_send_key(&self, pid: u32, key: &str) -> Result<(), String> {
+    fn locate_and_send_key_inner(&self, pid: u32, key: &str) -> Result<(), String> {
         crate::inject::windows_console::locate_and_send_key(pid, key)
     }
     fn locate_and_inject_spec(
@@ -645,7 +659,7 @@ impl Injector for RealInjector {
     fn locate_and_inject(&self, _pid: u32, _text: &str) -> Result<(), String> {
         Err("平台不支持".into())
     }
-    fn locate_and_send_key(&self, _pid: u32, _key: &str) -> Result<(), String> {
+    fn locate_and_send_key_inner(&self, _pid: u32, _key: &str) -> Result<(), String> {
         Err("平台不支持".into())
     }
 }
@@ -934,6 +948,55 @@ mod tests {
         for k in ["enter", "esc", "tab", "y", "1", "ctrl+z", ""] {
             assert!(forbidden_key_reason(k).is_none(), "{k:?} 不在黑名单");
         }
+    }
+
+    /// 探针假体（#79 上提验收）：只记通道派发是否发生，不真注入——用来断言
+    /// **引擎入口**的黑名单在通道派发之前生效（macOS 传统 locate 链曾从这里漏过，
+    /// 本测试在任意平台跑都能锁住这个口子，不依赖 mac 宿主）。
+    struct ProbeInjector {
+        dispatched: std::sync::Mutex<Vec<String>>,
+    }
+    impl Injector for ProbeInjector {
+        fn locate_and_inject(&self, _pid: u32, _text: &str) -> Result<(), String> {
+            unreachable!("本测试只打单键口")
+        }
+        fn locate_and_send_key_inner(&self, _pid: u32, key: &str) -> Result<(), String> {
+            self.dispatched.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+    }
+
+    /// #79 上提的主验收：黑名单在 [`Injector::locate_and_send_key`] 入口生效——
+    /// 禁注键拿 Err 且**通道派发零发生**；放行键照常到达通道；`_spec` 默认路径
+    /// （macOS 走的就是它）经入口转发，同受检。
+    /// 还原动作（变异）：删掉入口守卫、trait 直接透传 → 前两段断言红。
+    #[test]
+    fn engine_entry_blacklist_guards_all_channels() {
+        let probe = ProbeInjector {
+            dispatched: std::sync::Mutex::new(Vec::new()),
+        };
+        // 禁注键：入口拒绝，且没有任何通道派发被触发
+        let err = probe
+            .locate_and_send_key(42, "ctrl+c")
+            .expect_err("ctrl+c 必须在引擎入口被拒（与平台无关）");
+        assert!(err.contains("opencode"), "拒绝原因点名危害：{err}");
+        assert!(
+            probe.dispatched.lock().unwrap().is_empty(),
+            "禁注键不得触达任何通道派发"
+        );
+        // 放行键：照常到达通道
+        probe.locate_and_send_key(42, "enter").expect("enter 放行");
+        assert_eq!(*probe.dispatched.lock().unwrap(), vec!["enter".to_string()]);
+        // spec 默认路径（macOS 生产路径）经入口转发 → 同受检
+        let err = probe
+            .locate_and_send_key_spec(42, "ctrl+c", &crate::inject::families::FALLBACK_SPEC)
+            .expect_err("spec 路径同样必须被入口黑名单拦下");
+        assert!(err.contains("opencode"));
+        assert_eq!(
+            *probe.dispatched.lock().unwrap(),
+            vec!["enter".to_string()],
+            "spec 路径的禁注键同样零通道派发"
+        );
     }
 
     #[test]

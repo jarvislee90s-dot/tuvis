@@ -16,7 +16,12 @@
 // 两级键由本文件承担（本目录 tailscaleWizard.test.tsx 以两级感知扫描把关双语言键齐备）。
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { SETTINGS_NOTE, SETTINGS_REMOTE_BADGE } from "@/components/settings/typography";
+import {
+  SETTINGS_NOTE,
+  SETTINGS_REMOTE_BADGE,
+  SETTINGS_REMOTE_HINT,
+  SETTINGS_REMOTE_ROW,
+} from "@/components/settings/typography";
 import { useAppTranslation } from "@/hooks/use-app-translation";
 import { cn } from "@/lib/utils";
 import {
@@ -242,7 +247,7 @@ export function TailscaleWizard() {
           <span className="mr-1 inline-block h-2 w-2 rounded-full bg-emerald-500 align-middle" />
           {t("settings.remote.tsWizard.runningBadge")} ·{" "}
           {t("settings.remote.tsWizard.boardUrlLabel")}:{" "}
-          <code className="bg-muted rounded-md px-1.5 py-0.5 font-mono text-[12px]">
+          <code className={`bg-muted rounded-md px-1.5 py-0.5 font-mono ${SETTINGS_REMOTE_HINT}`}>
             {probe.boardUrl}
           </code>
         </p>
@@ -328,7 +333,7 @@ export function TailscaleWizard() {
               />
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className={cn("text-[13px]", done && "text-muted-foreground")}>
+                  <span className={cn(SETTINGS_REMOTE_ROW, done && "text-muted-foreground")}>
                     {stepLabel(t, step.id)}
                   </span>
                   <span className={SETTINGS_NOTE}>

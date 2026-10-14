@@ -4040,7 +4040,7 @@ mod tests {
                 None => Ok(()),
             }
         }
-        fn locate_and_send_key(&self, pid: u32, key: &str) -> Result<(), String> {
+        fn locate_and_send_key_inner(&self, pid: u32, key: &str) -> Result<(), String> {
             self.key_calls.lock().unwrap().push((pid, key.to_string()));
             match self.fail {
                 Some(e) => Err(e.to_string()),
@@ -6990,7 +6990,7 @@ mod tests {
             }
             r
         }
-        fn locate_and_send_key(&self, pid: u32, key: &str) -> Result<(), String> {
+        fn locate_and_send_key_inner(&self, pid: u32, key: &str) -> Result<(), String> {
             let r = self.inner.locate_and_send_key(pid, key);
             if r.is_ok() && !self.failing {
                 self.script.advance();

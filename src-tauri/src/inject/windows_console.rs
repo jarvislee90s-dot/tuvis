@@ -596,7 +596,10 @@ fn key_records_for(key: &str, spec: &FamilySpec) -> Option<Vec<KeyRecordSpec>> {
 /// `pub` 仅服务 `super::e2e_support` 测试支撑面（缘由同 [`InjectStats`] 注）。
 pub fn inject_key_spec(pid: u32, key: &str, spec: &FamilySpec) -> Result<(), String> {
     // 键黑名单（批次戊 E1⑤，裁19）：先于域校验——ctrl+c 无论域内域外一律拒绝
-    // （opencode 按下即退出应用；单点拒绝防日后域扩展回归）
+    // （opencode 按下即退出应用；单点拒绝防日后域扩展回归）。
+    // 【#79 上提后本处是**纵深第二道**】：第一道已在 Injector 引擎入口
+    // （engine.rs `locate_and_send_key` 默认实现，macOS 三通道同受检）；黑名单
+    // 本体单点 = engine::forbidden_key_reason。此处保留防本文件被绕过直调。
     if let Some(reason) = super::engine::forbidden_key_reason(key) {
         return Err(reason);
     }
