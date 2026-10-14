@@ -25,15 +25,16 @@ describe("ToolIcon 委托渲染（AGENT_BADGE 查表）", () => {
     expect(container.innerHTML).toContain("#2D2D2D");
   });
 
-  it("openclaw renders the canonical red #D2453C", () => {
+  it("openclaw renders the official mascot gradient end #991b1b", () => {
     const { container } = render(<ToolIcon toolId="openclaw" />);
-    expect(container.innerHTML).toContain("#D2453C");
+    expect(container.innerHTML).toContain("#991b1b");
   });
 
-  it("workbuddy renders the canonical green gradient stops #5BC5A7 → #80CF7D", () => {
+  it("workbuddy renders the official app icon bitmap (img, extracted from WorkBuddy.exe)", () => {
     const { container } = render(<ToolIcon toolId="workbuddy" />);
-    expect(container.innerHTML).toContain("#5BC5A7");
-    expect(container.innerHTML).toContain("#80CF7D");
+    const img = container.querySelector("img");
+    expect(img).toBeTruthy();
+    expect(img?.getAttribute("src")).toContain("workbuddy-icon");
   });
 
   it("opencode renders the canonical lower-core grey #5A5858", () => {

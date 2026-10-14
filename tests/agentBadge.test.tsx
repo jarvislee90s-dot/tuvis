@@ -53,14 +53,17 @@ describe("AGENT_BADGE", () => {
   // AGENT_BADGE 键集与之全等（漏挂徽章/孤儿徽章双向红）。含已退出筛选清单的
   // openclaw——canonical 图标聚齐 BrandIcons 后，任何一图标实现崩溃（如缺
   // import / 组件抛错）在此直接红
-  it("renders an svg for every badge icon (smoke; key set derived from the exhaustive AgentType record)", () => {
+  it("renders a visible icon (svg or official bitmap img) for every badge (smoke; key set derived from the exhaustive AgentType record)", () => {
     const keys = Object.keys(TOOL_LABELS);
     expect(Object.keys(AGENT_BADGE).sort()).toEqual([...keys].sort());
     for (const key of keys) {
       const badge = AGENT_BADGE[key];
       expect(badge, `missing badge for ${key}`).toBeDefined();
       const { container } = render(<badge.Icon className="h-4 w-4" />);
-      expect(container.querySelector("svg"), `no svg rendered for ${key}`).toBeTruthy();
+      expect(
+        container.querySelector("svg, img"),
+        `no icon rendered for ${key}`,
+      ).toBeTruthy();
     }
   });
 
