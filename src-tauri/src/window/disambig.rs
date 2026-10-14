@@ -12,6 +12,14 @@
 //!   commands/session.rs 共用同一实现，两端各有字面向量测试）；
 //! * [`tail_unique_hit`]——①′ 双命中仲裁与 ④ 层的 lastMessage 尾串包含检查
 //!   （此前两处行内重复）。
+//!
+//! 【Linux dead_code 豁免】本模块多数条目的唯一消费方是 `#[cfg(windows)]` 的
+//! win32.rs——Linux 宿主的原生 clippy（CI 步骤③，`-D warnings`）看不到它，
+//! 会把整片判成 never used（PR #155 首轮 CI 实锤：disambig.rs:21 等 18 处）；
+//! Windows 宿主与 windows-gnu 交叉目标两层都看不见这类红。豁免照仓内先例
+//! `200e6942`（cfg_attr(not(windows)) 平台豁免 ×6），模块级一处盖住全部条目；
+//! 条目本身的执行由本文件 `#[cfg(test)] mod tests` 在全平台锁定。
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::collections::HashMap;
 
