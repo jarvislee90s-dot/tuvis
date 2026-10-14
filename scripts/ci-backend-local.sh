@@ -48,7 +48,13 @@ fail() {
 }
 
 WITH_CROSS=0
-[ "${1:-}" = "--with-cross" ] && WITH_CROSS=1
+case "${1:-}" in
+  "") ;;
+  --with-cross) WITH_CROSS=1 ;;
+  *) printf '用法: bash scripts/ci-backend-local.sh [--with-cross]
+未知参数: %s
+' "$1" >&2; exit 2 ;;
+esac
 
 HOST_WINDOWS=0
 case "$(uname -s)" in

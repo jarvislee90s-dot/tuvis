@@ -7,8 +7,10 @@ use crate::services::preset::{ApplyPreview, PresetHealth, RestoreResult};
 /// 前端编辑弹窗已双层封死（切类型剪除 + 保存过滤，回归锁在案），但仅 UI 层——
 /// 经「已修复的泄漏路径创建预设 → 后删除该扩展」等绕过路径仍可能持久化出含
 /// 原生项的通用预设（应用侧此前只落 failures 列表非破坏性）。此处 Rust 侧直接拒绝。
-/// 未登记 id（查询 None）**不拦**：预设项允许前瞻引用既有行为，且原生性以登记
-/// 线为准（`is_native=1 AND source_tool=工具` 才算原生——apply 路径同口径）。
+/// 未登记 id（查询 None）**不拦**：预设项允许前瞻引用既有行为。口径与 apply 路径
+/// （`services/preset`，`is_native && source_tool==工具` 双条件）的差异**如实申报**：
+/// 命令层按 `is_native` 单条件拦——更严（无 source_tool 的 is_native 行也进不了
+/// 通用预设），防御方向宁严勿松，非缺陷。
 fn reject_native_items_in_universal(scope: &str, items: &[(String, String)]) -> Result<(), String> {
     if scope != "universal" {
         return Ok(());
