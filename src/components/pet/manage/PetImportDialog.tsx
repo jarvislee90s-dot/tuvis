@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Loader2 } from "lucide-react";
-import { probeSheetRows, type PetRows } from "../petRuntime";
+import { RESERVED_PET_IDS, probeSheetRows, type PetRows } from "../petRuntime";
 import {
   judgeVoiceTier,
   petNameProblem,
@@ -162,7 +162,9 @@ export function PetImportDialog(props: { open: boolean; onOpenChange: (v: boolea
   };
 
   // 名称实时校验（issue #33-7，spec §8.4-1）：字符集/保留设备名/长度/重名（含内置 foxbell）
-  const nameProblem = petNameProblem(name, { existingIds: [...existingIds, "foxbell"] });
+  const nameProblem = petNameProblem(name, {
+    existingIds: [...existingIds, ...RESERVED_PET_IDS],
+  });
   const nameOk = nameProblem === null;
   const validCount = voiceRows.filter((r) => !voiceRowProblem(r)).length;
 

@@ -2,7 +2,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
 import { PetError } from "./petErrors";
-import { probeAudioDurationMs, probeSheetRows, saveActiveId } from "./petRuntime";
+import { builtinPet, probeAudioDurationMs, probeSheetRows, saveActiveId } from "./petRuntime";
 import {
   diffManifestVsScan,
   isAudioCandidate,
@@ -141,8 +141,9 @@ export async function repairManifest(
 /** 统一激活入口（切换/启动修复共用，spec §6） */
 export async function activatePet(id: string, confirm: MismatchConfirm): Promise<ActivationResult> {
   try {
-    if (id === "foxbell") {
-      saveActiveId("foxbell", true, "Foxbell");
+    const builtin = builtinPet(id);
+    if (builtin) {
+      saveActiveId(builtin.id, builtin.hasVoice, builtin.displayName);
       notifyPetChanged();
       return { status: "activated" };
     }

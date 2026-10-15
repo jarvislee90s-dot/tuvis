@@ -443,7 +443,7 @@ mod tests {
 
     /// P0-1 参数化恶意 id 样本：穿越（两种分隔符）、绝对路径（POSIX/Windows）、
     /// 空串、点、点前缀、保留名及其大小写变体
-    const BAD_IDS: [&str; 9] = [
+    const BAD_IDS: [&str; 13] = [
         "",
         ".",
         "..",
@@ -453,6 +453,10 @@ mod tests {
         r"C:\Windows",
         ".hidden",
         "foxbell",
+        "builtin-foxbell",
+        "Builtin-FoxBell",
+        "builtin-tuvis-3d",
+        "Builtin-Tuvis-3D",
     ];
 
     fn dummy_manifest(id: &str) -> manifest::PetManifest {

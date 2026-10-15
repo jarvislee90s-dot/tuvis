@@ -1,0 +1,108 @@
+{
+  "displayName": "tuvis-3D",
+  "spriteVersionNumber": 2,
+  "spritesheetSha256": "b9a49dfef97624686877a559d6fe988ca76cab8f83a8d05bb54c8ab1f24c5ef8",
+  "spriteDimensions": [1536, 2288],
+  "frameDimensions": [192, 208],
+  "runningScale": 0.8,
+  "source": "用户提供的语音.mp4；仅视频音轨切分与 AAC 编码，没有使用 TTS 生成或变调",
+  "sourceVideoSha256": "e629da589fce851a24db5fc462fbfaf7f235e21337a1b73cd2fdb2a901711672",
+  "clips": [
+    {
+      "group": "general",
+      "text": "叫我啦？兔维斯，随时待命！",
+      "start": 4.16,
+      "end": 7.63
+    },
+    {
+      "group": "general",
+      "text": "耳朵接收到信号：你该伸个懒腰啦。",
+      "start": 7.72,
+      "end": 11.18
+    },
+    {
+      "group": "general",
+      "text": "今天的灵感，要不要加点胡萝卜？",
+      "start": 11.36,
+      "end": 14.4
+    },
+    {
+      "group": "general",
+      "text": "你负责奇思妙想，我负责竖起耳朵。",
+      "start": 14.54,
+      "end": 18.08
+    },
+    {
+      "group": "approval",
+      "text": "滴滴，这一步需要你来确认。",
+      "start": 18.26,
+      "end": 20.96
+    },
+    {
+      "group": "approval",
+      "text": "我在这里等你，先看看这次的操作吧。",
+      "start": 21.09,
+      "end": 24.7
+    },
+    {
+      "group": "approval",
+      "text": "耳朵竖好了，就等你的决定啦。",
+      "start": 24.89,
+      "end": 27.76
+    },
+    {
+      "group": "approval",
+      "text": "前方确认点！接下来听你指挥。",
+      "start": 27.92,
+      "end": 31.57
+    },
+    {
+      "group": "done",
+      "text": "这轮任务完成，来看看成果吧！",
+      "start": 31.71,
+      "end": 34.81
+    },
+    {
+      "group": "done",
+      "text": "搞定啦！这只兔子值得一根胡萝卜。",
+      "start": 34.98,
+      "end": 38.42
+    },
+    {
+      "group": "done",
+      "text": "叮！成果已送达，请查收。",
+      "start": 38.57,
+      "end": 41.69
+    },
+    {
+      "group": "done",
+      "text": "呼，忙完这一轮！一起伸个懒腰吧。",
+      "start": 41.89,
+      "end": 45.7
+    },
+    {
+      "group": "error",
+      "text": "咦？卡住了，得看看哪里出了问题。",
+      "start": 45.87,
+      "end": 49.84
+    },
+    {
+      "group": "error",
+      "text": "哎呀，这次没成功，来看看错误信息吧。",
+      "start": 49.97,
+      "end": 54.02
+    },
+    {
+      "group": "error",
+      "text": "噗……怎么熄火了？我得检查一下。",
+      "start": 54.19,
+      "end": 57.42
+    },
+    {
+      "group": "error",
+      "text": "耳朵先垂一下……打起精神，再找找原因！",
+      "start": 57.57,
+      "end": 62.1
+    }
+  ]
+}

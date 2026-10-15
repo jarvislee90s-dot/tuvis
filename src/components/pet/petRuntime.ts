@@ -1,4 +1,4 @@
-// 激活宠物运行时 — 指针持久化、foxbell 描述符、外部宠物解析、媒体探测与音频内存快照（spec §7/§12）
+// 激活宠物运行时 — 指针持久化、内置宠物注册表、外部宠物解析、媒体探测与音频内存快照（spec §7/§12）
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { parseManifest, type VoiceEntry } from "./petVoices";
 import { PetError } from "./petErrors";
@@ -6,7 +6,7 @@ import { PetError } from "./petErrors";
 export const ACTIVE_KEY = "mam-pet-active";
 export const ACTIVE_NAME_KEY = "mam-pet-active-name";
 export const VOICE_CAP_KEY = "mam-pet-voice-cap";
-/** 闪切持久标记：管理对话框因编辑激活中宠物而闪切回 foxbell 时记录原宠物 id。
+/** 闪切持久标记：管理对话框因编辑激活中宠物而闪切回默认宠物时记录原宠物 id。
  *  存 localStorage 而非组件 state——跨对话框关闭/重开仍生效（P1-4 修订，回环修复） */
 export const FLASH_SWITCHED_KEY = "mam-pet-flash-switched";
 /** 同窗口激活变更通知：storage 事件只发给其它窗口，本窗口写入方（切换/管理对话框）
@@ -16,7 +16,7 @@ export const ACTIVE_LOCAL_EVENT = "mam-pet-active-local-changed";
 export type PetRows = 9 | 11;
 
 export interface ActivePet {
-  id: string; // "foxbell" | 外部宠物 ID
+  id: string; // 内置宠物或外部宠物 ID
   displayName: string;
   spritesheetUrl: string;
   rows: PetRows;
@@ -28,31 +28,76 @@ export interface ActivePet {
   dispose?: () => void;
 }
 
-/** 内置 foxbell 描述符（voices 由 manifest.json 拉取后填充，spec EP10） */
-export const FOXBELL: ActivePet = {
-  id: "foxbell",
-  displayName: "Foxbell",
-  spritesheetUrl: "/pet/spritesheet.webp",
-  rows: 11,
-  hasVoice: true,
-  hasSubtitle: true,
-  voices: [],
-  resolveVoiceUrl: (f) => `/pet/voice/${encodeURI(f)}`,
-};
+/**
+ * 内置宠物注册表：每个内置宠物一个同构静态目录 public/pet/<dirName>/
+ * （manifest.json 语音清单 + spritesheet.webp 图集 + voice/<group>/*.m4a）。
+ * 新增内置宠物 = 建同构目录 + 在此追加一行；数组顺序即切换对话框中的内置区顺序。
+ */
+interface BuiltinPetDef {
+  /** 静态资源目录名（public/pet/ 下），同时决定宠物 id：builtin-<dirName> */
+  dirName: string;
+  displayName: string;
+  rows: PetRows;
+}
+
+const BUILTIN_PET_DEFS: BuiltinPetDef[] = [
+  { dirName: "tuvis-3d", displayName: "tuvis-3D", rows: 11 },
+  { dirName: "foxbell", displayName: "Foxbell", rows: 11 },
+];
+
+/** 默认宠物（内部参数）：无激活记录 / 解析失败回落 / 管理对话框闪切都回到它，换默认只改这里 */
+const DEFAULT_BUILTIN_DIR_NAME = "tuvis-3d";
+
+/** 旧版本激活指针兼容：0.5.x 仅内置 foxbell 且 id 无 builtin- 前缀（读取时归一，写入恒为新 id） */
+const LEGACY_BUILTIN_IDS: Record<string, string> = { foxbell: "builtin-foxbell" };
+
+function toActivePet(def: BuiltinPetDef): ActivePet {
+  const dir = `/pet/${def.dirName}`;
+  return {
+    id: `builtin-${def.dirName}`,
+    displayName: def.displayName,
+    spritesheetUrl: `${dir}/spritesheet.webp`,
+    rows: def.rows,
+    hasVoice: true,
+    hasSubtitle: true,
+    voices: [],
+    resolveVoiceUrl: (f) => `${dir}/voice/${encodeURI(f)}`,
+  };
+}
+
+export const BUILTIN_PETS: ActivePet[] = BUILTIN_PET_DEFS.map(toActivePet);
+export const DEFAULT_PET: ActivePet =
+  BUILTIN_PETS.find((pet) => pet.id === `builtin-${DEFAULT_BUILTIN_DIR_NAME}`) ?? BUILTIN_PETS[0]!;
+
+export function builtinPet(id: string): ActivePet | undefined {
+  return BUILTIN_PETS.find((pet) => pet.id === id);
+}
+
+/** 内置保留名全集（含旧 id）：外部宠物命名/重命名禁用，与 src-tauri is_builtin_pet 保持对齐 */
+export const RESERVED_PET_IDS: string[] = [
+  ...BUILTIN_PETS.map((pet) => pet.id),
+  ...Object.keys(LEGACY_BUILTIN_IDS),
+];
 
 export function loadActiveId(): string {
   try {
-    return localStorage.getItem(ACTIVE_KEY) || "foxbell";
+    const raw = localStorage.getItem(ACTIVE_KEY);
+    if (!raw) return DEFAULT_PET.id;
+    return LEGACY_BUILTIN_IDS[raw] ?? raw;
   } catch {
-    return "foxbell";
+    return DEFAULT_PET.id;
   }
 }
 
 export function loadActiveName(): string {
   try {
-    return localStorage.getItem(ACTIVE_NAME_KEY) || "Foxbell";
+    return (
+      localStorage.getItem(ACTIVE_NAME_KEY) ||
+      builtinPet(loadActiveId())?.displayName ||
+      loadActiveId()
+    );
   } catch {
-    return "Foxbell";
+    return DEFAULT_PET.displayName;
   }
 }
 
@@ -211,7 +256,7 @@ async function snapshotVoices(
     await Promise.all(
       voices.map(async (v) => {
         const res = await fetch(convertFileSrc(`${dir}/${v.file}`));
-        if (!res.ok) throw new Error(`快照失败: ${v.file}`);
+        if (!res.ok) throw new PetError("audio-load-fail");
         const url = URL.createObjectURL(await res.blob());
         created.push(url);
         blobs.set(v.file, url);
@@ -252,17 +297,22 @@ async function snapshotVoices(
 
 /**
  * 解析当前激活宠物（宠物窗口启动 / 热切换共用）。
- * foxbell：静态描述符 + manifest.json 语音；外部：scan + manifest + 图集探测 + 音频快照。
- * 任何失败抛错，调用方回落 FOXBELL（spec §5.2 宠物永不白屏）。
+ * 内置宠物：静态描述符 + 各自 manifest.json 语音；外部：scan + manifest + 图集探测 + 音频快照。
+ * 任何失败抛错，调用方回落 DEFAULT_PET（spec §5.2 宠物永不白屏）。
  */
 export async function resolveActivePet(): Promise<ActivePet> {
   const id = loadActiveId();
-  if (id === "foxbell") {
+  const builtin = builtinPet(id);
+  if (builtin) {
     try {
-      const raw = await fetch("/pet/manifest.json").then((r) => r.json());
-      return { ...FOXBELL, voices: parseManifest(raw) };
+      const manifestUrl = builtin.spritesheetUrl.replace("spritesheet.webp", "manifest.json");
+      const raw = await fetch(manifestUrl).then((r) => {
+        if (!r.ok) throw new PetError("audio-load-fail");
+        return r.json();
+      });
+      return { ...builtin, voices: parseManifest(raw) };
     } catch {
-      return FOXBELL; // 浏览器渲染/素材缺失：静默降级
+      return { ...builtin, hasVoice: false, hasSubtitle: false }; // 图集仍可显示
     }
   }
   const scan = await invoke<PetScanDto>("pet_scan", { id });

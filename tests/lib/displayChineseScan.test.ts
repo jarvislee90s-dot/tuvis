@@ -29,10 +29,7 @@ const FILE_WHITELIST = new Set([
   "hooks/useNotification.ts", // 系统通知 action 标题（登记待迁）
 ]);
 /** 逐行豁免（文件 → 行号理由表）：日志行不上屏 */
-const LINE_WHITELIST: Record<string, (line: number) => boolean> = {
-  // pet 快照导出内部 throw（被 catch 落 console，不上 UI；登记 #157 待随 pet 面处理）
-  "components/pet/petRuntime.ts": (l) => l === 214,
-};
+const LINE_WHITELIST: Record<string, (line: number) => boolean> = {};
 
 const CJK = /["'`][^"'`\n]*[\u4e00-\u9fff][^"'`\n]*["'`]/;
 // JSX 文本节点（>中文<）也算上屏面——评审 I7

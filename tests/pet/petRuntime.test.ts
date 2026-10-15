@@ -4,7 +4,9 @@ import {
   saveActiveId,
   loadVoiceCap,
   rowsFromSize,
-  FOXBELL,
+  BUILTIN_PETS,
+  DEFAULT_PET,
+  builtinPet,
   loadFlashSwitched,
   saveFlashSwitched,
   clearFlashSwitched,
@@ -13,8 +15,8 @@ import {
 describe("petRuntime", () => {
   beforeEach(() => localStorage.clear());
 
-  it("激活指针：默认 foxbell，可读写", () => {
-    expect(loadActiveId()).toBe("foxbell");
+  it("激活指针：默认 tuvis-3D，可读写", () => {
+    expect(loadActiveId()).toBe("builtin-tuvis-3d");
     saveActiveId("starry-dew", false, "Starry Dew");
     expect(loadActiveId()).toBe("starry-dew");
     expect(loadVoiceCap()).toBe(false);
@@ -35,12 +37,26 @@ describe("petRuntime", () => {
     expect(rowsFromSize(1024, 1872)).toBeNull();
   });
 
-  it("FOXBELL 描述符：内置路径与全能力", () => {
-    expect(FOXBELL.id).toBe("foxbell");
-    expect(FOXBELL.rows).toBe(11);
-    expect(FOXBELL.hasVoice).toBe(true);
-    expect(FOXBELL.resolveVoiceUrl("a.m4a")).toBe("/pet/voice/a.m4a");
-    expect(FOXBELL.dispose).toBeUndefined(); // foxbell 无 blob 快照，无需回收
+  it("内置注册表：id=builtin-<目录名>，各指向自己的同构目录，全能力无快照", () => {
+    expect(BUILTIN_PETS.map((p) => p.id)).toEqual(["builtin-tuvis-3d", "builtin-foxbell"]);
+    for (const pet of BUILTIN_PETS) {
+      const dir = `/pet/${pet.id.replace(/^builtin-/, "")}`;
+      expect(pet.spritesheetUrl).toBe(`${dir}/spritesheet.webp`);
+      expect(pet.resolveVoiceUrl("a.m4a")).toBe(`${dir}/voice/${encodeURI("a.m4a")}`);
+      expect(pet.rows).toBe(11);
+      expect(pet.hasVoice).toBe(true);
+      expect(pet.dispose).toBeUndefined(); // 内置无 blob 快照，无需回收
+    }
+    expect(DEFAULT_PET.id).toBe("builtin-tuvis-3d"); // 默认宠物由注册表参数指定
+    expect(builtinPet("starry-dew")).toBeUndefined(); // 外部 id 不命中
+  });
+
+  it("旧版激活指针兼容：无前缀 foxbell 读取时归一为 builtin-foxbell（写入恒为新 id）", () => {
+    localStorage.setItem("mam-pet-active", "foxbell");
+    expect(loadActiveId()).toBe("builtin-foxbell");
+    expect(builtinPet(loadActiveId())?.displayName).toBe("Foxbell");
+    saveActiveId("builtin-foxbell", true, "Foxbell");
+    expect(localStorage.getItem("mam-pet-active")).toBe("builtin-foxbell");
   });
 
   describe("音频快照 blob URL 生命周期（spec §7/EP6）", () => {
