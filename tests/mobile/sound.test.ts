@@ -5,7 +5,7 @@
 // - 播放：两音上行；每音有增益包络（**去电子感的关键**，原实现硬起硬停）；
 // - 任何失败静默降级，不得抛出（提示音是锦上添花，不能中断提醒链路）。
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getSoundEnabled, playCompletionChime, toggleSoundEnabled } from "@/mobile/sound";
+import { getSoundEnabled, toggleSoundEnabled } from "@/mobile/sound";
 
 const KEY = "mam-mobile-sound";
 

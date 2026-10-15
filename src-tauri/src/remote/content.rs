@@ -2279,9 +2279,11 @@ mod tests {
     fn dispatch_rejects_unknown_tool_and_empty_session_id() {
         let tmp = tempfile::tempdir().unwrap();
         let r = read_session_messages_with(tmp.path(), "not-a-tool", SID, 200);
-        assert!(r.unwrap_err().contains("未知工具"));
+        assert!(r.unwrap_err().contains("CONTENT_UNKNOWN_TOOL: 未知工具"));
         let r = read_session_messages_with(tmp.path(), "zcode", "  ", 200);
-        assert!(r.unwrap_err().contains("session_id 为空"));
+        assert!(r
+            .unwrap_err()
+            .contains("CONTENT_SESSION_ID_EMPTY: session_id 为空"));
         // 路径穿越防御：claude/workbuddy 文件定位按 id 拼 `.jsonl` 文件名，
         // 分隔符 / .. / NUL 必须在内容层入口 fail-closed
         for evil in ["../../etc/passwd", "a/b", "a\\b", "..", "x\\0y"] {

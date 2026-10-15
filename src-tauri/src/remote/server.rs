@@ -5479,7 +5479,8 @@ mod tests {
         assert_eq!(r.status(), 200);
         let body = body_string(r).await;
         assert!(
-            body.contains("\"status\":\"failed\"") && body.contains("投递进行中，请稍后重试"),
+            body.contains("\"status\":\"failed\"")
+                && body.contains("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"),
             "in-flight 占用时撤回应 200 failed 短回执：{body}"
         );
         assert_eq!(fake.recorded().len(), 0, "占用期间不得注入");
@@ -6099,7 +6100,8 @@ mod tests {
         assert_eq!(r.status(), 200);
         let body = body_string(r).await;
         assert!(
-            body.contains("\"status\":\"failed\"") && body.contains("投递进行中，请稍后重试"),
+            body.contains("\"status\":\"failed\"")
+                && body.contains("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"),
             "in-flight 占用时 approve 应 200 failed 让位：{body}"
         );
         assert!(
@@ -8078,7 +8080,8 @@ mod tests {
         assert_eq!(r.status(), 200);
         let body = body_string(r).await;
         assert!(
-            body.contains("\"status\":\"failed\"") && body.contains("投递进行中，请稍后重试"),
+            body.contains("\"status\":\"failed\"")
+                && body.contains("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"),
             "in-flight 占用时问答应 200 failed 让位：{body}"
         );
         assert!(
@@ -8809,7 +8812,7 @@ mod tests {
         // INFLIGHT 守卫按裸 id 全局占用（守卫 id 立规注）：并行测试偶尔让位 →
         // 「投递进行中」是良性可重试态（2026-10-05 起连续全量命中的已知 flaky
         // 根治——仅测试侧重试，生产语义零改动）
-        if body.contains("投递进行中") {
+        if body.contains("RAPI_DELIVERY_BUSY: 投递进行中") {
             let r = app
                 .clone()
                 .oneshot(req(

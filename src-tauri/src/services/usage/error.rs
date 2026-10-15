@@ -1,5 +1,6 @@
 //! 用量域结构化错误（对齐 services/pet/error.rs 的 PetRpcError 模式）。
-//! code 是稳定错误码，前端 i18n 键 = `usage.rpc.<code>`；detail 是开发者可读原文（不展示）。
+//! code 是稳定错误码，前端 i18n 键 = `usage.rpc.<code>`；detail 经 `{{err}}` 插值展示。
+//! 固定 detail 文案使用英文机器诊断；路径/表名/底层错误等动态定位参数保留。
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,7 +79,7 @@ mod tests {
 
     #[test]
     fn serde_shape_camel_case() {
-        let e = UsageError::new("usage-range-invalid", "custom 缺 from");
+        let e = UsageError::new("usage-range-invalid", "custom range missing from");
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"code\":\"usage-range-invalid\""));
         assert!(json.contains("\"detail\""));
@@ -97,7 +98,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "未登记进 USAGE_CODES")]
     fn new_rejects_code_missing_from_the_table() {
-        let _ = UsageError::new("usage-not-registered", "未登记的生产码");
+        let _ = UsageError::new("usage-not-registered", "unregistered production code");
     }
 
     /// 契约 §2 逐字：sourceId 的序列化形态是小写工具 id（**不是 camelCase**）

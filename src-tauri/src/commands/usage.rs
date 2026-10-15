@@ -25,7 +25,7 @@ use crate::services::usage::{collect, query, settings};
 pub async fn usage_collect(force: bool) -> Result<UsageCollectResult, UsageError> {
     tauri::async_runtime::spawn_blocking(move || collect::collect(force))
         .await
-        .map_err(|e| UsageError::internal(format!("采集任务异常: {e}")))
+        .map_err(|e| UsageError::internal(format!("collect task failed: {e}")))
 }
 
 #[tauri::command]
@@ -37,7 +37,7 @@ pub async fn usage_dashboard(
         query::dashboard(&range, group_by, crate::services::usage::now_ms())
     })
     .await
-    .map_err(|e| UsageError::internal(format!("查询任务异常: {e}")))?
+    .map_err(|e| UsageError::internal(format!("query task failed: {e}")))?
 }
 
 #[tauri::command]
@@ -50,7 +50,7 @@ pub async fn usage_records(
         query::records(&range, group_by, &filters, crate::services::usage::now_ms())
     })
     .await
-    .map_err(|e| UsageError::internal(format!("查询任务异常: {e}")))?
+    .map_err(|e| UsageError::internal(format!("query task failed: {e}")))?
 }
 
 #[tauri::command]
@@ -63,7 +63,7 @@ pub async fn usage_export_csv(
         query::export_csv(&range, group_by, &filters, crate::services::usage::now_ms())
     })
     .await
-    .map_err(|e| UsageError::internal(format!("导出任务异常: {e}")))?
+    .map_err(|e| UsageError::internal(format!("export task failed: {e}")))?
 }
 
 /// 读用量设置。
@@ -100,7 +100,7 @@ pub async fn usage_set_settings(patch: UsageSettingsPatch) -> Result<UsageSettin
         Ok(merged)
     })
     .await
-    .map_err(|e| UsageError::internal(format!("设置写入任务异常: {e}")))?
+    .map_err(|e| UsageError::internal(format!("settings write task failed: {e}")))?
 }
 
 #[cfg(test)]

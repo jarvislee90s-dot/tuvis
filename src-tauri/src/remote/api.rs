@@ -9333,7 +9333,7 @@ fn poll_menu_digit(pid: u32, target: crate::inject::mode::MamMode) -> Result<Str
         }
     }
     Err(format!(
-        "{}；请人工核对终端（命令已发送，档位未切）",
+        "INJECT_MANUAL_CHECK: {}；请人工核对终端（命令已发送，档位未切）",
         last.unwrap_or_else(|| "权限菜单窗内未读屏".to_string())
     ))
 }

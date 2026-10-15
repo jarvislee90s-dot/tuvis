@@ -1346,7 +1346,7 @@ mod tests {
             fn collect(&self, _ctx: &CollectContext<'_>) -> Result<SourceDelta, UsageError> {
                 Err(UsageError::new(
                     "usage-source-io",
-                    "wire.jsonl: mtime 不可得",
+                    "wire.jsonl: mtime unavailable",
                 ))
             }
         }
@@ -1573,7 +1573,7 @@ mod tests {
     ///   文件头 → BEGIN 之前 **∪** END 之后 → 文件尾；去行内空白、剥**整行** `//` 注释）。
     ///   **实测（24 个文件逐一对账）**：20 个有测试模块的文件 = **生产半边**（标记包住测试模块）、
     ///   4 个无测试模块的文件 = **整文件**（两行标记相邻于末尾 ⇒ 排除区为空）；
-    ///   判据面合计 = **6913 行 / 149440 字符**（第 12 轮同步，见 `scan_face_size_is_pinned`；
+    ///   判据面合计 = **7241 行 / 156998 字符**（PR #158 四轮同步，见 `scan_face_size_is_pinned`；
     ///   第 4 轮口径曾报 191434 字符：那 8 个「整文件扫描」
     ///   的文件把测试代码也算进去了。本轮的"面"更小但**更准**——20 个文件 = 生产半边、4 个无测试
     ///   模块的文件 = 整文件，且 **END 之后追加的生产代码也在面内**。数字同步写进本批 commit
@@ -1862,6 +1862,9 @@ mod tests {
     /// 其余 23 个文件逐字未改。集成测试半边的行为锁在
     /// `tests/real_db_isolation_test.rs::usage_fixture_root_env_is_inside_the_debug_gate`
     /// （源码针）与 `tests/usage_ipc_test.rs` / `usage_two_round_incremental_test.rs`（实跑）。
+    ///
+    /// **PR #158 四轮同步**：7238/156598 → **7241/156998**。用量固定 detail 英文化
+    /// （含 ledger::internal）；dsh 的 format! 经 rustfmt 展开增加 3 行，排除区未移动。
     #[test]
     fn scan_face_size_is_pinned() {
         let (mut lines, mut chars) = (0usize, 0usize);
@@ -1872,7 +1875,7 @@ mod tests {
         }
         assert_eq!(
             (lines, chars),
-            (7238, 156598),
+            (7241, 156998),
             "判据面尺寸变了（实测 {lines} 行 / {chars} 字符）：本用例是**声明 = 实际**的钉子——\
              先弄清面为什么变（新增文件？改了排除区标记？动了生产代码？），再同步本常量、\
              `no_source_timezone_is_fed_into_any_key_function` 的锁注释、`KNOWN-PLAN-DEFECTS.md` \

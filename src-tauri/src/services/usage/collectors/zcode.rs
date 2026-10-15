@@ -106,7 +106,7 @@ impl ZCodeCollector {
         let Some(conn) = crate::monitor::sqlite::open_usage_db(&roots.cli_db) else {
             return Err(UsageError::new(
                 "usage-source-db-open",
-                "zcode db.sqlite 打不开（ro 与 immutable 均失败）",
+                "zcode db.sqlite open failed (ro and immutable)",
             ));
         };
         // **供应商规则从 ctx 注入**（§3.2.3 FIX-6）：lib 单测构建注入空规则 → 零 DB；
@@ -453,7 +453,7 @@ fn inflight_boundary(
         .map_err(|e| {
             UsageError::new(
                 "usage-source-io",
-                format!("zcode {table} 查询失败（在飞行行探测，列名/表结构不符）: {e}"),
+                format!("zcode {table} query failed (in-flight row probe; schema mismatch): {e}"),
             )
         })?;
     let Some(rowid) = blocked else {
@@ -469,7 +469,7 @@ fn inflight_boundary(
         .map_err(|e| {
             UsageError::new(
                 "usage-source-io",
-                format!("zcode {table} 读取失败（在飞行行时间戳）: {e}"),
+                format!("zcode {table} read failed (in-flight row timestamps): {e}"),
             )
         })?
         .flatten();
@@ -514,7 +514,7 @@ fn session_raw_model_provider(
         .map_err(|e| {
             UsageError::new(
                 "usage-source-io",
-                format!("zcode model_usage 会话模型回查失败（{session_id}）: {e}"),
+                format!("zcode model_usage session model lookup failed ({session_id}): {e}"),
             )
         })?;
     cache.insert(session_id.to_string(), row.clone());
@@ -565,7 +565,7 @@ fn load_sessions(conn: &Connection) -> Result<Vec<SessionRow>, UsageError> {
     let mut stmt = conn.prepare(sql).map_err(|e| {
         UsageError::new(
             "usage-source-io",
-            format!("zcode session 查询失败（列名/表结构不符）: {e}"),
+            format!("zcode session query failed (schema mismatch): {e}"),
         )
     })?;
     let rows = stmt
@@ -637,7 +637,7 @@ fn load_model_usage(
     let mut stmt = conn.prepare(sql).map_err(|e| {
         UsageError::new(
             "usage-source-io",
-            format!("zcode model_usage 查询失败（列名/表结构不符）: {e}"),
+            format!("zcode model_usage query failed (schema mismatch): {e}"),
         )
     })?;
     let rows = stmt
@@ -663,7 +663,7 @@ fn load_model_usage(
         .map_err(|e| {
             UsageError::new(
                 "usage-source-io",
-                format!("zcode model_usage 读取失败: {e}"),
+                format!("zcode model_usage read failed: {e}"),
             )
         })?;
     let mut out = Vec::new();
@@ -710,7 +710,7 @@ fn load_turn_usage(
     let mut stmt = conn.prepare(sql).map_err(|e| {
         UsageError::new(
             "usage-source-io",
-            format!("zcode turn_usage 查询失败（列名/表结构不符）: {e}"),
+            format!("zcode turn_usage query failed (schema mismatch): {e}"),
         )
     })?;
     let rows = stmt
@@ -774,7 +774,7 @@ fn load_tool_usage(
     let mut stmt = conn.prepare(sql).map_err(|e| {
         UsageError::new(
             "usage-source-io",
-            format!("zcode tool_usage 查询失败（列名/表结构不符）: {e}"),
+            format!("zcode tool_usage query failed (schema mismatch): {e}"),
         )
     })?;
     let rows = stmt
@@ -1107,7 +1107,7 @@ mod tests {
         // 只留给「打不开」）。这个码经 W-28 会出现在 Task 24 的验收面上，语义必须对。
         assert_eq!(err.code, "usage-source-io");
         assert!(
-            err.detail.contains(&format!("zcode {broken} 查询失败")),
+            err.detail.contains(&format!("zcode {broken} query failed")),
             "错误信息必须点名「{broken}」这张表的 prepare 失败: {}",
             err.detail
         );
@@ -1173,7 +1173,7 @@ mod tests {
                 "库开了但表没了 → 读失败码（D#7）"
             );
             assert!(
-                err.detail.contains(&format!("zcode {table} 查询失败")),
+                err.detail.contains(&format!("zcode {table} query failed")),
                 "错误信息必须点名缺失的表「{table}」: {}",
                 err.detail
             );

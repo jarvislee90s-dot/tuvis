@@ -26,7 +26,7 @@ const DEFAULT_PAGE = {
 function installFetch(routes: Record<string, unknown>) {
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
       const url = String(input);
       if (url.includes("/session-open")) {
         const body = routes["sessionOpen"] as Record<string, string> | undefined;

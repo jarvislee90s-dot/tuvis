@@ -12,11 +12,9 @@ import {
   BOOKMARK_LIMIT,
   addBookmark,
   clearBookmarks,
-  ensureBootId,
   listBookmarks,
   messageAnchor,
   removeBookmark,
-  restoreBookmarks,
   type Bookmark,
 } from "@/mobile/bookmarks";
 

@@ -18,7 +18,8 @@
 //! * **码字符集** `[A-Z][A-Z0-9_]{2,}`（≥3 字符，与门禁/前端解析器一致），命名 `域_原因`；locale 键 = `errors.` +
 //!   camelCase(码)（如 `REMOTE_NO_TUNNEL_TOKEN` → `errors.remoteNoTunnelToken`），
 //!   zh/en 双键齐备由 `scripts/check-error-codes.mjs`（挂 `pnpm check`）对账：
-//!   Rust 使用的码必须有双键；locale 有而 Rust 无 → 孤儿键报错（防拼写漂移）。
+//!   Rust 与前端 TS/TSX 使用的码必须有双键；locale 有而两源均无 → 孤儿键报错。
+//!   两源均参与同串同码与跨文件半迁移检查；测试/注释剔除与词法边界由隔离 CLI 自测守护。
 //! * **协议结构体的 error 字符串字段**（如 ChannelStatus.error）同样走前缀码——
 //!   #123 原案是给 ChannelStatus 加平行 `error_code` 字段，全量迁移定案后统一为
 //!   前缀码（避免「539 处前缀 + 1 个结构体特例」两套规则）：前端展示该字段的

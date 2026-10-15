@@ -4342,7 +4342,7 @@ mod tests {
         );
         let e = r.unwrap_err();
         assert!(
-            e.contains("当前平台暂不支持一键配置"),
+            e.contains("TSWIZ_PLATFORM_UNSUPPORTED: 当前平台暂不支持一键配置"),
             "Other 平台必须如实说「不支持」而不是「sha256 校验失败」: {e}"
         );
         assert!(!e.contains("sha256"), "不得落到误导文案: {e}");

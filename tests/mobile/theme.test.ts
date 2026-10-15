@@ -187,7 +187,6 @@ describe("mobile theme：mobile.html 内联脚本与 mobile.css 策略一致性"
 
   // 在 jsdom 全局上执行真实内联脚本（document / localStorage / matchMedia 均为全局）
   function runInlineScript() {
-    // eslint-disable-next-line no-new-func
     new Function(inlineScript())();
   }
 

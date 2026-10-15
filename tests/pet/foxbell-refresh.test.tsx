@@ -2,7 +2,7 @@
 // 并发两次 pet-active-changed：旧解析后到不得回滚显示、不得 dispose 新宠物的活跃快照；
 // 被丢弃的解析（过期或卸载）其 blob 快照必须回收。
 import { render, screen, act } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -49,7 +49,7 @@ vi.mock("@/components/pet/petRuntime", async (importOriginal) => {
 });
 
 // useSessionsQuery 需要 QueryClientProvider：本测试只关心 refresh 闸门，直接 mock 掉（与 foxbell-events 同款）
-let data: unknown = undefined;
+const data: unknown = undefined;
 vi.mock("@/lib/query/queries/sessions", () => ({ useSessionsQuery: () => ({ data }) }));
 
 import { FoxbellPet } from "@/components/pet/FoxbellPet";

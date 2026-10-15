@@ -65,7 +65,7 @@ function isOurVite(pid) {
  *  只杀 dev 构建产物，**不碰** Release 安装版（路径不同）。 */
 function killStaleDevApp() {
   if (process.platform === "win32") return;
-  let pids = "";
+  let pids;
   try {
     pids = execSync(`pgrep -f "${ROOT}/src-tauri/target/debug/(multi-agents-manager|tuvis)"`, {
       encoding: "utf8",

@@ -4671,7 +4671,7 @@ where
     // ===== 第 1 段：读屏 =====
     let first = poll_screen().map_err(StageAbort::screen)?.ok_or_else(|| {
         StageAbort::screen(
-            "切题前读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
+            "INJECT_SCREEN_ABORT: 切题前读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
         )
     })?;
     let pre_heading = question_heading_of(&first);
@@ -4755,7 +4755,7 @@ where
     };
     terminal.send(key).map_err(|e| {
         StageAbort::delivery(format!(
-            "{} 投递失败（{e}）",
+            "INJECT_DELIVERY_FAIL: {} 投递失败（{e}）",
             if key == "left" { "←" } else { "→" }
         ))
     })?;

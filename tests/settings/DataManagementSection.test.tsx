@@ -25,9 +25,6 @@ function row(project: string, files: number, bytes: number): Row {
   return { project, files, bytes };
 }
 
-const projectsOf = () =>
-  invokeMock.mock.calls.filter((c: unknown[]) => c[0] === "list_attachment_projects").length;
-
 beforeEach(() => {
   invokeMock.mockReset();
   invokeMock.mockImplementation(async (cmd: string) =>

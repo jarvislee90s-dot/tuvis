@@ -57,7 +57,6 @@ import i18n from "@/i18n";
 import SettingsPage from "@/pages/settings";
 import { UsageSection } from "@/components/settings/UsageSection";
 import { saveActiveId } from "@/components/pet/petRuntime";
-import { poseKeysFor } from "@/lib/usage/sheet";
 import type { UsageSettings, UsageSettingsPatch } from "@/types/usage";
 
 /** 与 Rust `UsageSettings::default()` 同值（spec §P7）：开 / 今日 / 3 条 / 90 天 / 10 分钟 / 空 / 空 / 随机 */

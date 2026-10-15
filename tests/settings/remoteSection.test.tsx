@@ -1211,7 +1211,7 @@ describe("RemoteSection 已接入设备列表（M5 A6）", () => {
   ];
 
   beforeEach(() => {
-    invokeMock.mockImplementation(async (cmd: string, args?: { key?: string }) => {
+    invokeMock.mockImplementation(async (cmd: string, _args?: { key?: string }) => {
       if (cmd === "remote_status") return statusOf();
       if (cmd === "get_setting") return null;
       if (cmd === "remote_devices") return devicesOf();
