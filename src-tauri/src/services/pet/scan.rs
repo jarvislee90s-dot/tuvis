@@ -130,7 +130,7 @@ pub fn list_pets_in(root: &Path) -> Vec<PetSummary> {
         let Some(id) = p.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if id.starts_with('.') {
+        if id.starts_with('.') || super::is_builtin_pet(id) {
             continue;
         }
         let m = manifest::load(&p);
@@ -277,6 +277,24 @@ mod tests {
         assert!(list[1].manifest_exists);
         assert_eq!(list[1].display_name, "b-pet-disp");
         assert!(list[1].has_voice);
+    }
+
+    #[test]
+    fn list_pets_hides_builtin_directories_without_deleting_them() {
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), "builtin-foxbell", true);
+        fixture(root.path(), "builtin-tuvis-3d", true);
+        fixture(root.path(), "FoxBell", true);
+        fixture(root.path(), "external", true);
+        fixture(root.path(), "tuvis-3d", true);
+        let list = list_pets_in(root.path());
+        assert_eq!(
+            list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["external", "tuvis-3d"]
+        );
+        assert!(pet_dir(root.path(), "builtin-tuvis-3d")
+            .join("spritesheet.webp")
+            .exists());
     }
 
     #[test]

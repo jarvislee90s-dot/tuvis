@@ -24,7 +24,12 @@ import {
   SHEET_COLS,
   type PetAnimKey,
 } from "@/components/pet/petAnimations";
-import { FOXBELL, loadActiveId, probeSheetRows, type PetRows } from "@/components/pet/petRuntime";
+import {
+  builtinPet,
+  loadActiveId,
+  probeSheetRows,
+  type PetRows,
+} from "@/components/pet/petRuntime";
 import type { PetScan } from "@/components/pet/petValidation";
 
 export type { PetRows };
@@ -153,14 +158,15 @@ export function poseCol(pose: string, col: number): number {
  *
  * **刻意不复用 `resolveActivePet()`**：那个入口顺带快照语音（拉音频 blob URL、写语音能力标记、
  * 派发变更事件），对「导一张图」是纯负担与**跨面副作用**。这里只要一张能 fetch 的图 + 行数：
- *  * 内置 foxbell → 静态描述符（零 IPC、零探测）；
+ *  * 内置宠物 → 静态描述符（零 IPC、零探测）；
  *  * 外部宠物 → 既有 `pet_scan` 目录扫描（4 处同款先例）+ `probeSheetRows` 探行数
  *    （`rowsFromSize` 是行数的唯一判据，§3 第 31 条）。
  * 取不到（扫描失败 / 图集缺失 / 非 9·11 尺寸）→ `null` → 不画立绘也要出图。
  */
 export async function activePetSheet(): Promise<{ url: string; rows: PetRows } | null> {
   const id = loadActiveId();
-  if (id === FOXBELL.id) return { url: FOXBELL.spritesheetUrl, rows: FOXBELL.rows };
+  const builtin = builtinPet(id);
+  if (builtin) return { url: builtin.spritesheetUrl, rows: builtin.rows };
   try {
     const scan = await invoke<PetScan>("pet_scan", { id });
     if (!scan.spritesheet.exists) return null;

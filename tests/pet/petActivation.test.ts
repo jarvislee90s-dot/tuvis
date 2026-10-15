@@ -28,10 +28,10 @@ describe("activatePet", () => {
     tauriInvokeMock.mockClear();
   });
 
-  it("foxbell：直接写指针并广播", async () => {
-    const r = await activatePet("foxbell", async () => "cancel");
+  it("内置宠物：直接写指针并广播", async () => {
+    const r = await activatePet("builtin-foxbell", async () => "cancel");
     expect(r.status).toBe("activated");
-    expect(localStorage.getItem("mam-pet-active")).toBe("foxbell");
+    expect(localStorage.getItem("mam-pet-active")).toBe("builtin-foxbell");
     expect(localStorage.getItem("mam-pet-active-name")).toBe("Foxbell");
   });
 

@@ -24,6 +24,7 @@ vi.mock("@/lib/query/queries/sessions", () => ({ useSessionsQuery: () => ({ data
 // manifest 返回 1 条 general 语音：空 manifest 会使 VoicePlayer.pick 返回 null（spec E5），
 // 字幕回调无从触发，因此需至少含一条 general 条目（jsdom 有 Audio，走 els 播放路径，时长兜底 2.5s）
 const fetchMock = vi.fn(async () => ({
+  ok: true,
   json: async () => [{ group: "general", name: "你好呀", file: "general/hello.m4a" }],
 }));
 vi.stubGlobal("fetch", fetchMock);

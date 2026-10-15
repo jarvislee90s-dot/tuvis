@@ -89,7 +89,7 @@ describe("PetManageDialog", () => {
     expect(await screen.findByTestId("manage-rename-input")).toBeInTheDocument();
   });
 
-  it("重命名激活中的宠物：经 foxbell 闪切，完成后指针回到新 id（EP5 修订/Bug3）", async () => {
+  it("重命名激活中的宠物：经默认宠物 闪切，完成后指针回到新 id（EP5 修订/Bug3）", async () => {
     localStorage.setItem("mam-pet-active", "starry-dew");
     render(<PetManageDialog open onOpenChange={() => {}} />);
     fireEvent.click(await screen.findByTestId("manage-pick-starry-dew"));
@@ -109,7 +109,7 @@ describe("PetManageDialog", () => {
   });
 
   it("重命名非激活宠物：指针不被动、无事件（Bug3）", async () => {
-    localStorage.setItem("mam-pet-active", "foxbell");
+    localStorage.setItem("mam-pet-active", "builtin-foxbell");
     emitMock.mockClear();
     render(<PetManageDialog open onOpenChange={() => {}} />);
     fireEvent.click(await screen.findByTestId("manage-pick-starry-dew"));
@@ -123,7 +123,7 @@ describe("PetManageDialog", () => {
         newId: "dew",
       })
     );
-    expect(localStorage.getItem("mam-pet-active")).toBe("foxbell"); // 未激活：不切回、不广播
+    expect(localStorage.getItem("mam-pet-active")).toBe("builtin-foxbell"); // 未激活：不切回、不广播
     expect(emitMock).not.toHaveBeenCalledWith("pet-active-changed", {});
   });
 
@@ -142,7 +142,7 @@ describe("PetManageDialog", () => {
   });
 
   it("保存非激活宠物：指针不被动、无事件（Bug3）", async () => {
-    localStorage.setItem("mam-pet-active", "foxbell");
+    localStorage.setItem("mam-pet-active", "builtin-foxbell");
     emitMock.mockClear();
     render(<PetManageDialog open onOpenChange={() => {}} />);
     fireEvent.click(await screen.findByTestId("manage-pick-starry-dew"));
@@ -151,7 +151,7 @@ describe("PetManageDialog", () => {
       const call = tauriInvokeMock.mock.calls.find((c) => c[0] === "pet_update_manifest");
       expect(call?.[1]?.backup).toBe(true);
     });
-    expect(localStorage.getItem("mam-pet-active")).toBe("foxbell");
+    expect(localStorage.getItem("mam-pet-active")).toBe("builtin-foxbell");
     expect(emitMock).not.toHaveBeenCalledWith("pet-active-changed", {});
   });
 
@@ -172,9 +172,9 @@ describe("PetManageDialog", () => {
     emitMock.mockClear();
     render(<PetManageDialog open onOpenChange={() => {}} />);
     fireEvent.click(await screen.findByTestId("manage-pick-starry-dew"));
-    // 添加音频触发直写保护：指针闪切回 foxbell（此后 doSave 若只读调用时点指针会恒判未激活）
+    // 添加音频触发直写保护：指针闪切回默认宠物（此后 doSave 若只读调用时点指针会恒判未激活）
     fireEvent.click(await screen.findByTestId("voice-add-general"));
-    await waitFor(() => expect(localStorage.getItem("mam-pet-active")).toBe("foxbell"));
+    await waitFor(() => expect(localStorage.getItem("mam-pet-active")).toBe("builtin-tuvis-3d"));
     fireEvent.click(screen.getByTestId("manage-save"));
     // 保存完成自动切回原宠物
     await waitFor(() => expect(localStorage.getItem("mam-pet-active")).toBe("starry-dew"));
@@ -188,7 +188,7 @@ describe("PetManageDialog", () => {
     render(<PetManageDialog open onOpenChange={onOpenChange} />);
     fireEvent.click(await screen.findByTestId("manage-pick-starry-dew"));
     fireEvent.click(await screen.findByTestId("voice-add-general"));
-    await waitFor(() => expect(localStorage.getItem("mam-pet-active")).toBe("foxbell"));
+    await waitFor(() => expect(localStorage.getItem("mam-pet-active")).toBe("builtin-tuvis-3d"));
     // 持久标记已写入（跨对话框重开仍生效）
     expect(localStorage.getItem("mam-pet-flash-switched")).toBe("starry-dew");
     // 不点保存，直接关对话框（X 关闭按钮）
@@ -207,7 +207,7 @@ describe("PetManageDialog", () => {
     const { rerender } = render(<PetManageDialog open onOpenChange={onOpenChange} />);
     fireEvent.click(await screen.findByTestId("manage-pick-starry-dew"));
     fireEvent.click(await screen.findByTestId("voice-add-general"));
-    await waitFor(() => expect(localStorage.getItem("mam-pet-active")).toBe("foxbell"));
+    await waitFor(() => expect(localStorage.getItem("mam-pet-active")).toBe("builtin-tuvis-3d"));
     // 关对话框 → 自动切回（真实流程：onOpenChange(false) 由父级把 open 置 false）
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     await waitFor(() => expect(localStorage.getItem("mam-pet-active")).toBe("starry-dew"));
@@ -221,8 +221,8 @@ describe("PetManageDialog", () => {
   });
 
   it("闪切标记在场（指针 foxbell）→ 重开保存 → 仍切回原宠物（回环修复，标记兜底）", async () => {
-    // 模拟：闪切标记已写入但指针仍停在 foxbell（如对话框关闭出口未消费标记的极端路径）
-    localStorage.setItem("mam-pet-active", "foxbell");
+    // 模拟：闪切标记已写入但指针仍停在默认宠物（如对话框关闭出口未消费标记的极端路径）
+    localStorage.setItem("mam-pet-active", "builtin-foxbell");
     localStorage.setItem("mam-pet-flash-switched", "starry-dew");
     emitMock.mockClear();
     render(<PetManageDialog open onOpenChange={() => {}} />);
@@ -305,7 +305,7 @@ describe("PetManageDialog", () => {
     await waitFor(() => expect(emitMock).toHaveBeenCalledWith("pet-active-changed", {}));
   });
 
-  it("删除激活中宠物：闪切标记清除、指针停在 foxbell 不切回（回环修复）", async () => {
+  it("删除激活中宠物：闪切标记清除、指针停在默认宠物不切回（回环修复）", async () => {
     localStorage.setItem("mam-pet-active", "starry-dew");
     emitMock.mockClear();
     render(<PetManageDialog open onOpenChange={() => {}} />);
@@ -317,13 +317,13 @@ describe("PetManageDialog", () => {
         "starry-dew"
       )
     );
-    // 删除成功：标记清除，指针停在 foxbell（宠物已不存在，不切回）
+    // 删除成功：标记清除，指针停在默认宠物（宠物已不存在，不切回）
     await waitFor(() => expect(localStorage.getItem("mam-pet-flash-switched")).toBeNull());
-    expect(localStorage.getItem("mam-pet-active")).toBe("foxbell");
+    expect(localStorage.getItem("mam-pet-active")).toBe("builtin-tuvis-3d");
   });
 
   it("未激活宠物增音频后关对话框：无标记、指针不被动（回环修复）", async () => {
-    localStorage.setItem("mam-pet-active", "foxbell");
+    localStorage.setItem("mam-pet-active", "builtin-foxbell");
     emitMock.mockClear();
     const onOpenChange = vi.fn();
     render(<PetManageDialog open onOpenChange={onOpenChange} />);
@@ -335,7 +335,7 @@ describe("PetManageDialog", () => {
     expect(localStorage.getItem("mam-pet-flash-switched")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
-    expect(localStorage.getItem("mam-pet-active")).toBe("foxbell");
+    expect(localStorage.getItem("mam-pet-active")).toBe("builtin-foxbell");
     expect(emitMock).not.toHaveBeenCalledWith("pet-active-changed", {});
   });
 
@@ -543,7 +543,7 @@ describe("PetManageDialog 校验与能力判定（issue #33-2/#33-7/#33-12）", 
     fireEvent.change(input, { target: { value: "con" } });
     expect(await screen.findByTestId("manage-rename-problem")).toHaveTextContent(/保留设备名/);
     expect(screen.getByTestId("manage-rename-btn")).toBeDisabled();
-    fireEvent.change(input, { target: { value: "foxbell" } }); // 内置保留名 → 重名
+    fireEvent.change(input, { target: { value: "builtin-foxbell" } }); // 内置保留名 → 重名
     expect(await screen.findByTestId("manage-rename-problem")).toHaveTextContent(/同名/);
     expect(screen.getByTestId("manage-rename-btn")).toBeDisabled();
     fireEvent.change(input, { target: { value: "dew" } });

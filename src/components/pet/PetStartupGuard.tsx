@@ -6,7 +6,14 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { loadActiveId, probeSheetRows, saveActiveId, type PetRows } from "./petRuntime";
+import {
+  DEFAULT_PET,
+  builtinPet,
+  loadActiveId,
+  probeSheetRows,
+  saveActiveId,
+  type PetRows,
+} from "./petRuntime";
 import { buildManifestFromScan, repairManifest } from "./petActivation";
 import {
   diffManifestVsScan,
@@ -17,8 +24,8 @@ import {
 import { saveConfig, saveVisible } from "./petConfig";
 import { isPetRpcError, petErrMsg, PetError } from "./petErrors";
 
-function toFoxbell(msgKey: string) {
-  saveActiveId("foxbell", true, "Foxbell");
+function toDefaultPet(msgKey: string) {
+  saveActiveId(DEFAULT_PET.id, DEFAULT_PET.hasVoice, DEFAULT_PET.displayName);
   emit("pet-active-changed", {}).catch(() => {});
   toast.success(msgKey);
 }
@@ -36,7 +43,7 @@ export function PetStartupGuard() {
     let disposed = false;
     (async () => {
       const id = loadActiveId();
-      if (id === "foxbell") return;
+      if (builtinPet(id)) return;
       try {
         const scan = await invoke<PetScan>("pet_scan", { id });
         if (!scan.spritesheet.exists) {
@@ -148,7 +155,7 @@ export function PetStartupGuard() {
                 size="sm"
                 data-testid="pet-startup-foxbell"
                 onClick={() => {
-                  toFoxbell(t("pet.startup.switched"));
+                  toDefaultPet(t("pet.startup.switched", { pet: DEFAULT_PET.displayName }));
                   setFatal(null);
                 }}
               >
@@ -181,7 +188,7 @@ export function PetStartupGuard() {
                 variant="outline"
                 data-testid="pet-startup-foxbell"
                 onClick={() => {
-                  toFoxbell(t("pet.startup.switched"));
+                  toDefaultPet(t("pet.startup.switched", { pet: DEFAULT_PET.displayName }));
                   setIssues(null);
                 }}
               >

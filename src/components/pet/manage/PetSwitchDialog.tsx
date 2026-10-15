@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { loadActiveId } from "../petRuntime";
+import { BUILTIN_PETS, builtinPet, loadActiveId } from "../petRuntime";
 import { activatePet, type MismatchChoice } from "../petActivation";
 import { petErrMsg } from "../petErrors";
 import type { ValidationIssue } from "../petValidation";
@@ -134,32 +134,36 @@ export function PetSwitchDialog(props: { open: boolean; onOpenChange: (v: boolea
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-2" data-testid="pet-switch-list">
-            {/* foxbell 永远第一张（内置） */}
-            <PetCard
-              info={{
-                id: "foxbell",
-                displayName: "Foxbell",
-                spriteVersionNumber: 2,
-                hasVoice: true,
-                hasSubtitle: true,
-                manifestExists: true,
-              }}
-              active={activeId === "foxbell"}
-              disabled={busy}
-              builtin
-              onClick={() => void doActivate("foxbell")}
-              t={t}
-            />
-            {pets.map((p) => (
+            {BUILTIN_PETS.map((pet) => (
               <PetCard
-                key={p.id}
-                info={p}
-                active={activeId === p.id}
+                key={pet.id}
+                info={{
+                  id: pet.id,
+                  displayName: pet.displayName,
+                  spriteVersionNumber: 2,
+                  hasVoice: true,
+                  hasSubtitle: true,
+                  manifestExists: true,
+                }}
+                active={activeId === pet.id}
                 disabled={busy}
-                onClick={() => void doActivate(p.id)}
+                builtin
+                onClick={() => void doActivate(pet.id)}
                 t={t}
               />
             ))}
+            {pets
+              .filter((p) => !builtinPet(p.id))
+              .map((p) => (
+                <PetCard
+                  key={p.id}
+                  info={p}
+                  active={activeId === p.id}
+                  disabled={busy}
+                  onClick={() => void doActivate(p.id)}
+                  t={t}
+                />
+              ))}
           </div>
         )}
       </DialogContent>
@@ -177,7 +181,7 @@ function PetCard(props: {
 }) {
   const { info, t } = props;
   const thumb = props.builtin
-    ? "url(/pet/spritesheet.webp)"
+    ? `url(${builtinPet(info.id)?.spritesheetUrl})`
     : info.dir
       ? `url(${convertFileSrc(`${info.dir}/spritesheet.webp`)})`
       : undefined;

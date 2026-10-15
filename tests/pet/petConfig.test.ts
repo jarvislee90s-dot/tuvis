@@ -125,7 +125,7 @@ describe("petConfig 激活指针订阅（P1-6）", () => {
     window.dispatchEvent(new StorageEvent("storage", { key: "mam-pet-active-name" }));
     expect(fn).toHaveBeenCalledTimes(3);
     unsub();
-    saveActiveId("foxbell", true);
+    saveActiveId("builtin-foxbell", true);
     expect(fn).toHaveBeenCalledTimes(3); // 退订后不再触达
   });
 });

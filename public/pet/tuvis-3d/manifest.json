@@ -1,0 +1,98 @@
+[
+  {
+    "index": 0,
+    "group": "general",
+    "name": "叫我啦？兔维斯，随时待命！",
+    "file": "general/叫我啦？兔维斯，随时待命！.m4a"
+  },
+  {
+    "index": 1,
+    "group": "general",
+    "name": "耳朵接收到信号：你该伸个懒腰啦。",
+    "file": "general/耳朵接收到信号：你该伸个懒腰啦。.m4a"
+  },
+  {
+    "index": 2,
+    "group": "general",
+    "name": "今天的灵感，要不要加点胡萝卜？",
+    "file": "general/今天的灵感，要不要加点胡萝卜？.m4a"
+  },
+  {
+    "index": 3,
+    "group": "general",
+    "name": "你负责奇思妙想，我负责竖起耳朵。",
+    "file": "general/你负责奇思妙想，我负责竖起耳朵。.m4a"
+  },
+  {
+    "index": 4,
+    "group": "approval",
+    "name": "滴滴，这一步需要你来确认。",
+    "file": "approval/滴滴，这一步需要你来确认。.m4a"
+  },
+  {
+    "index": 5,
+    "group": "approval",
+    "name": "我在这里等你，先看看这次的操作吧。",
+    "file": "approval/我在这里等你，先看看这次的操作吧。.m4a"
+  },
+  {
+    "index": 6,
+    "group": "approval",
+    "name": "耳朵竖好了，就等你的决定啦。",
+    "file": "approval/耳朵竖好了，就等你的决定啦。.m4a"
+  },
+  {
+    "index": 7,
+    "group": "approval",
+    "name": "前方确认点！接下来听你指挥。",
+    "file": "approval/前方确认点！接下来听你指挥。.m4a"
+  },
+  {
+    "index": 8,
+    "group": "done",
+    "name": "这轮任务完成，来看看成果吧！",
+    "file": "done/这轮任务完成，来看看成果吧！.m4a"
+  },
+  {
+    "index": 9,
+    "group": "done",
+    "name": "搞定啦！这只兔子值得一根胡萝卜。",
+    "file": "done/搞定啦！这只兔子值得一根胡萝卜。.m4a"
+  },
+  {
+    "index": 10,
+    "group": "done",
+    "name": "叮！成果已送达，请查收。",
+    "file": "done/叮！成果已送达，请查收。.m4a"
+  },
+  {
+    "index": 11,
+    "group": "done",
+    "name": "呼，忙完这一轮！一起伸个懒腰吧。",
+    "file": "done/呼，忙完这一轮！一起伸个懒腰吧。.m4a"
+  },
+  {
+    "index": 12,
+    "group": "error",
+    "name": "咦？卡住了，得看看哪里出了问题。",
+    "file": "error/咦？卡住了，得看看哪里出了问题。.m4a"
+  },
+  {
+    "index": 13,
+    "group": "error",
+    "name": "哎呀，这次没成功，来看看错误信息吧。",
+    "file": "error/哎呀，这次没成功，来看看错误信息吧。.m4a"
+  },
+  {
+    "index": 14,
+    "group": "error",
+    "name": "噗……怎么熄火了？我得检查一下。",
+    "file": "error/噗……怎么熄火了？我得检查一下。.m4a"
+  },
+  {
+    "index": 15,
+    "group": "error",
+    "name": "耳朵先垂一下……打起精神，再找找原因！",
+    "file": "error/耳朵先垂一下……打起精神，再找找原因！.m4a"
+  }
+]

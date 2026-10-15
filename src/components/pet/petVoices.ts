@@ -58,12 +58,13 @@ export class VoicePlayer {
   private lastIdx: Partial<Record<VoiceGroup, number>> = {};
   private shared: HTMLAudioElement | null = null;
   private unlocked = false;
-  private resolve: (file: string) => string = (f) => `/pet/voice/${encodeURI(f)}`;
+  // 无全局默认路径（内置目录按宠物区分、外部走 blob 快照）：调用方必须注入解析器
+  private resolve: (file: string) => string = () => "";
 
-  load(entries: VoiceEntry[], resolveUrl?: (file: string) => string): void {
+  load(entries: VoiceEntry[], resolveUrl: (file: string) => string): void {
     this.dispose();
     this.entries = entries;
-    if (resolveUrl) this.resolve = resolveUrl;
+    this.resolve = resolveUrl;
     try {
       this.els = entries.map((v) => {
         // 文件名含中文/空格/~：外部宠物用注入的解析器（blob 快照），内置走 encodeURI 路径
