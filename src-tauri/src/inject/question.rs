@@ -4953,7 +4953,9 @@ where
                 ScreenStep::Ready(_) => break, // 焦点已在推进行
                 ScreenStep::NotYet(_) => {}
                 ScreenStep::Fatal(why) => {
-                    return Err(StageAbort::screen(format!("{why}；请人工核对终端")))
+                    return Err(StageAbort::screen(format!(
+                        "INJECT_MANUAL_CHECK: {why}；请人工核对终端"
+                    )))
                 }
             }
             if down_steps + up_steps >= max_down_steps {
@@ -4995,7 +4997,9 @@ where
     // 复核（轮询拿到的屏再走一次同一判据——轮询闭包与复核用同一份探测器，
     // 不假定「轮询返回的就一定合判据」；形态在两次读之间变化时这里会如实拒）
     if let ScreenStep::NotYet(why) | ScreenStep::Fatal(why) = probe_review_screen(&review_lines) {
-        return Err(StageAbort::screen(format!("{why}；请人工核对终端")));
+        return Err(StageAbort::screen(format!(
+            "INJECT_MANUAL_CHECK: {why}；请人工核对终端"
+        )));
     }
     // 确认项行 → 屏上编号（屏上编号由 TUI 给，不硬编码 '1'）
     // 确认项的唯一性已由上面那次 `probe_review_screen` 复核过（恰 1 行），此处取它，
@@ -5719,7 +5723,7 @@ pub fn action_supported(
     // 工具未实测（只读档）优先于动作级判断：该工具任何动作都不可用
     if matches!(question_key_profile(tool), QuestionKeyProfile::ReadOnly) {
         return Err(ActionRefusal::ToolUnverified(format!(
-            "{tool} 问答键序未实测，只读展示"
+            "Q_READONLY_PROFILE: {tool} 问答键序未实测，只读展示"
         )));
     }
     match action {
@@ -8578,7 +8582,9 @@ mod tests {
             let cur = screens[cursor.get().min(n - 1)].clone();
             match probe(&cur) {
                 ScreenStep::Ready(l) => return Ok(Some(l)),
-                ScreenStep::Fatal(why) => return Err(format!("{why}；请人工核对终端")),
+                ScreenStep::Fatal(why) => {
+                    return Err(format!("INJECT_MANUAL_CHECK: {why}；请人工核对终端"))
+                }
                 ScreenStep::NotYet(_) => {
                     if cursor.get() + 1 < n {
                         cursor.set(cursor.get() + 1);

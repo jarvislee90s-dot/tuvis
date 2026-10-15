@@ -56,9 +56,7 @@ function walk(dir: string, files: string[] = []) {
 function stripComments(line: string): string {
   const t = line.trimStart();
   if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return "";
-  return line
-    .replace(/\{\/\*[\s\S]*?\*\/\}/g, "")
-    .replace(/\s\/\/.*$/, "");
+  return line.replace(/\{\/\*[\s\S]*?\*\/\}/g, "").replace(/\s\/\/.*$/, "");
 }
 
 describe("上屏中文扫描（桌面零容忍 / mobile 白名单）", () => {

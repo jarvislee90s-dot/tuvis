@@ -53,8 +53,15 @@ export function useRemoteEvents() {
       unlisten.push(
         await listen<{ error: string }>("remote-toggle-failed", async (e) => {
           // spec T4：托盘开关失败「桌面通知报错」——toast + 系统通知双通道
-          await notify(t("settings.remote.toggleFailedTitle"), e.payload.error);
-          toast.error(t("settings.remote.toggleFailedToast", { error: e.payload.error }));
+          await notify(
+            t("settings.remote.toggleFailedTitle"),
+            formatInvokeError(e.payload.error, t)
+          );
+          toast.error(
+            t("settings.remote.toggleFailedToast", {
+              error: formatInvokeError(e.payload.error, t),
+            })
+          );
         })
       );
     })();

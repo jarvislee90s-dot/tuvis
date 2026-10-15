@@ -6410,7 +6410,7 @@ fn dispatch_question_action(
                         out
                     }
                     QuestionScreenPoll::NoScreen => Err(crate::inject::question::StageAbort::screen(
-                        "读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
+                        "INJECT_SCREEN_ABORT: 读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
                     )),
                     QuestionScreenPoll::Unparseable(last) => {
                         Err(crate::inject::question::StageAbort::screen(format!(
@@ -6455,7 +6455,7 @@ fn dispatch_question_action(
                         )
                     }
                     QuestionScreenPoll::NoScreen => Err(crate::inject::question::StageAbort::screen(
-                        "切题前读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
+                        "INJECT_SCREEN_ABORT: 切题前读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
                     )),
                     QuestionScreenPoll::Unparseable(last) => {
                         Err(crate::inject::question::StageAbort::screen(format!(
@@ -11483,7 +11483,7 @@ mod tests {
                 QUESTION_STAGE_FREE_ROW,
             ),
             (
-                "INJECT_SCREEN_ABORT: codex：读不到屏——已中止，未对未识别界面发送任何键",
+                "INJECT_SCREEN_ABORT: codex：读不到屏——已中止，未发任何键；请人工核对终端",
                 "select",
             ),
             (
@@ -11496,7 +11496,7 @@ mod tests {
                 QUESTION_STAGE_TOGGLE,
             ),
             (
-                "读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
+                "INJECT_SCREEN_ABORT: 读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
                 QUESTION_STAGE_TOGGLE,
             ),
             (
@@ -11514,7 +11514,7 @@ mod tests {
             // 切题（advance）——「切题前读不到问答屏」同时含「问答屏」（切勾臂词）与
             // 「切题」（切题臂词）：切题臂在前是**有意的段归属**（切题编排的中止归切题段）
             (
-                "切题前读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
+                "INJECT_SCREEN_ABORT: 切题前读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
                 QUESTION_STAGE_ADVANCE,
             ),
             (

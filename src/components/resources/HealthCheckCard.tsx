@@ -167,7 +167,7 @@ export function HealthCheckCard() {
       ?.trim() ??
     "";
 
-  // ② 不变量修复：toolId 取条目文本 '：' 前缀（后端形态 "PRESET_SNAPSHOT_ORPHAN:{tool}：快照存在但无激活预设"）；
+  // ② 不变量修复：toolId 取条目文本 '：' 前缀（后端形态 "PRESET_SNAPSHOT_ORPHAN:{tool}: {tool}：快照存在但无激活预设"（形态 B））；
   // 剥码走单点 parseInvariantLine（形态 A/B 兼容），与下方渲染位同一解析；toast 沿用 PresetList 的 restore 文案
   const fixInvariant = async (line: string) => {
     const toolId = parseInvariantLine(line);

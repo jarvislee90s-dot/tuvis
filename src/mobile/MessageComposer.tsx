@@ -512,7 +512,7 @@ export default function MessageComposer({ session }: MessageComposerProps) {
           // failed：分诊与卡内同源——`aborted:true` 是阶段机中止（带段名，卡内
           // 渲染段名徽标；composer 无该视觉位，展示 `error` 整句原文即可，其中已
           // 含段名与原因），其余是投递失败（可重试）。**不另编文案**。
-          setReceipt({ kind: "failed", error: res.error });
+          setReceipt({ kind: "failed", error: formatInvokeError(res.error, i18n.t) });
         }
         return;
       }
@@ -563,7 +563,7 @@ export default function MessageComposer({ session }: MessageComposerProps) {
           })
         );
       } else {
-        setReceipt({ kind: "failed", error: res.error });
+        setReceipt({ kind: "failed", error: formatInvokeError(res.error, i18n.t) });
       }
     } catch (e) {
       if (e instanceof ApiError) {

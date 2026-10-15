@@ -97,7 +97,7 @@ export default function ModeBar({ session }: { session: { id: string } }) {
             setReceipt(res.hint ?? "已发送切换，请人工核对终端模式");
           }
         } else {
-          setError(res.error);
+          setError(formatInvokeError(res.error, i18n.t));
         }
       } catch (e) {
         if (e instanceof ApiError) {

@@ -54,7 +54,7 @@ export default function PlanFeedbackBar({
       try {
         const res = await sessionPlanFeedback(sessionId, action, opts);
         if (res.status === "failed") {
-          setError(res.error);
+          setError(formatInvokeError(res.error, i18n.t));
           return;
         }
         if (action === "clear") {
