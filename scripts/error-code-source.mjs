@@ -145,6 +145,25 @@ export function matchingClose(skeleton, open) {
   return skeleton.length - 1;
 }
 
+/**
+ * `<…>` 配对（尖括号不在 matchingClose 的括号族里）。
+ * 找不到配对返回 -1 —— 调用侧据此退回「当成比较运算符」的保守处理。
+ */
+export function matchingAngle(skeleton, open) {
+  let depth = 0;
+  for (let i = open; i < skeleton.length; i++) {
+    const c = skeleton[i];
+    if (c === "<") depth++;
+    else if (c === ">") {
+      const prev = skeleton[i - 1];
+      if (prev === "-" || prev === "=") continue; // `->` / `=>` / `>=` 的 `>` 不是收口
+      depth--;
+      if (!depth) return i;
+    } else if (c === ";" || c === "{" || c === "}") return -1; // 类型实参位不会出现这些
+  }
+  return -1;
+}
+
 export function stripTests(src) {
   const { skeleton } = sourceView(src);
   const cuts = [];
@@ -169,6 +188,22 @@ export function stripTests(src) {
       const c = skeleton[j];
       if (c === "(" || c === "[") {
         j = matchingClose(skeleton, j) + 1;
+        continue;
+      }
+      // 泛型/类型实参位（如 `-> Result<(String, u32), String>`）：型参里的顶层逗号
+      // 不是条目终止符。判定要求「前一个非空字符像标识符/收口括号」且「后一个像类型」，
+      // 且必须有配对 `>`，否则退回按普通字符处理（比较运算符 `a < b` 的保守路径）。
+      if (c === "<") {
+        const prev = skeleton.slice(0, j).trimEnd().slice(-1);
+        const next = skeleton.slice(j + 1).trimStart()[0] ?? "";
+        if (/[A-Za-z0-9_>)\]]/.test(prev) && /[A-Za-z_&'[(]/.test(next)) {
+          const gt = matchingAngle(skeleton, j);
+          if (gt > j) {
+            j = gt + 1;
+            continue;
+          }
+        }
+        j++;
         continue;
       }
       if (c === "{") {

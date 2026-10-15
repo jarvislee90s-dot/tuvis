@@ -1,7 +1,7 @@
 // @vitest-environment node
 // 真实 CLI + 临时树：探针不得写进仓库源码，避免影响并行测试与开发监视器。
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -249,5 +249,43 @@ describe("错误码门禁：交集与诊断", () => {
     );
     expect(red.status).toBe(1);
     expect(red.output).toContain("映射了多个码");
+  });
+});
+
+// 五轮复审 I-1 收口：条目终止符必须感知尖括号（类型位顶层逗号）与「`;` 先到」两态。
+describe("错误码门禁：条目边界（五轮回归）", () => {
+  it.each([
+    "Result<(String, u32), String>",
+    "Result<String, String>",
+    "std::collections::HashMap<String, Vec<Option<Box<u8>>>>",
+  ])("cfg(test) 项类型位 %s 的逗号不得结束条目", (ret) => {
+    const r = runGate({
+      "src-tauri/src/probe.rs": `#[cfg(test)]\nfn leak() -> ${ret} { let _ = "PROBE_HIDDEN: 测试码"; unimplemented!() }\n${PROD}`,
+    });
+    expect(r.output).not.toContain("PROBE_HIDDEN");
+    expect(r.output).toContain("PROBE_KEEP"); // 生产码仍在面内（缺键报出）
+  });
+  it("cfg(test) 无体声明（mod x;）之后的生产代码必须留在面内", () => {
+    const r = runGate({
+      "src-tauri/src/probe.rs": `#[cfg(test)]\nmod probe;\n${PROD}`,
+    });
+    // 若剔除器把「;」当块起点，会把文件尾部整段删掉并静默变绿 → 该断言即失效点。
+    expect(r.output).toContain("PROBE_KEEP");
+  });
+  it("struct pattern arm 的后缀表达式不结束条目", () => {
+    const r = runGate({
+      "src-tauri/src/probe.rs": `fn outer() { match e {\n#[cfg(test)]\nE::A => Fixture {}.run("PROBE_HIDDEN: 测试码"),\nE::B => {}\n} }\n${PROD}`,
+    });
+    expect(r.output).not.toContain("PROBE_HIDDEN");
+    expect(r.output).toContain("PROBE_KEEP");
+  });
+  it("真实测试夹具文件（attachment_fixtures.rs）内注码不得进生产面", () => {
+    // 五轮实测泄漏 36 条字面量（6 条污染棘轮基线）的真实文件：整文件由 mod 声明的
+    // #[cfg(test)] 门控，且文件内条目类型位含顶层逗号 —— 正是本轮修复的形态。
+    const fixture = readFileSync("src-tauri/src/remote/attachment_fixtures.rs", "utf8");
+    const r = runGate({
+      "src-tauri/src/remote/attachment_fixtures.rs": `${fixture}\n#[cfg(test)]\nfn leak() -> Result<(String, u32), String> { let _ = "PROBE_HIDDEN: 测试码"; unimplemented!() }\n`,
+    });
+    expect(r.output).not.toContain("PROBE_HIDDEN");
   });
 });
