@@ -135,7 +135,8 @@ pub(crate) fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), String> 
 pub(crate) fn verify_sha256_file(path: &Path, expected: &str) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    let mut f = std::fs::File::open(path).map_err(|e| format!("打开文件失败: {e}"))?;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("RESOURCE_OPEN_FILE_FAIL: 打开文件失败: {e}"))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -184,7 +185,7 @@ fn try_download(
 /// 旧文案只给 `~/.tuvis/bin/` 相对写法，用户无法直接定位放置点
 fn download_failure_message(reason: &str, asset: &str, dest: &Path) -> String {
     format!(
-        "cloudflared 自动获取失败: {reason}；可从 \
+        "REMOTE_TUNNEL_DOWNLOAD_FAIL: cloudflared 自动获取失败: {reason}；可从 \
          https://github.com/cloudflare/cloudflared/releases 手动下载 {asset}，\
          放到 {} 后重试",
         dest.display()
@@ -276,7 +277,7 @@ pub(crate) fn download_url_to(url: &str, dest: &Path) -> Result<(), String> {
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(600))
         .build()
-        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
+        .map_err(|e| format!("HTTP_CLIENT_BUILD_FAIL: HTTP 客户端构建失败: {e}"))?;
     let bytes = tauri::async_runtime::block_on(async {
         client
             .get(url)
@@ -480,7 +481,9 @@ pub fn start_channel(mode: &str, port: u16) {
             .map(|t| t.trim().is_empty())
             .unwrap_or(true)
     {
-        set_channel_snapshot(mode, |c| c.error = Some("自有域名缺少 Tunnel Token".into()));
+        set_channel_snapshot(mode, |c| {
+            c.error = Some("REMOTE_NO_TUNNEL_TOKEN: 自有域名缺少 Tunnel Token".into())
+        });
         return;
     }
     let mut slots = TUNNELS.lock().unwrap();
@@ -519,7 +522,7 @@ async fn supervise(mode: String, port: u16, stop: Arc<AtomicBool>) {
     let bin =
         match tokio::task::spawn_blocking(move || ensure_with(&bin_path, Box::new(download_to)))
             .await
-            .unwrap_or_else(|e| Err(format!("获取任务异常: {e}")))
+            .unwrap_or_else(|e| Err(format!("REMOTE_TUNNEL_TASK_PANIC: 获取任务异常: {e}")))
         {
             Ok(p) => p,
             Err(e) => {
@@ -557,7 +560,9 @@ async fn supervise(mode: String, port: u16, stop: Arc<AtomicBool>) {
             Ok(c) => c,
             Err(e) => {
                 set_channel_snapshot(&mode, |c| {
-                    c.error = Some(format!("cloudflared 启动失败: {e}"))
+                    c.error = Some(format!(
+                        "REMOTE_TUNNEL_START_FAIL: cloudflared 启动失败: {e}"
+                    ))
                 });
                 return;
             }
@@ -631,12 +636,13 @@ async fn supervise(mode: String, port: u16, stop: Arc<AtomicBool>) {
             }
             None => {
                 set_channel_snapshot(&mode, |c| {
-                    c.error = Some("cloudflared 连续失败 3 次，已停止守护".into())
+                    c.error =
+                        Some("REMOTE_TUNNEL_GAVE_UP: cloudflared 连续失败 3 次，已停止守护".into())
                 });
                 // spec T1b：放弃时桌面通知报错（Task 8 的 useRemoteEvents 监听）
                 crate::remote::events::emit_ui(
                     "remote-tunnel-error",
-                    serde_json::json!({"error": "cloudflared 连续失败 3 次，已停止守护", "channel": mode}),
+                    serde_json::json!({"error": "REMOTE_TUNNEL_GAVE_UP: cloudflared 连续失败 3 次，已停止守护", "channel": mode}),
                 );
                 return;
             }

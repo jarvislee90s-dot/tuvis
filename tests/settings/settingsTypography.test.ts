@@ -144,9 +144,10 @@ describe("设置页排版层级（C1）", () => {
       '<p className="text-[13.5px]">x</p><i className="text-[7px]">y</i>'
     );
     expect(wild).toEqual(["13.5", "7"]);
-    expect(wild.every((v) => !REGISTERED.has(v)), "13.5/7 不在登记表，规则必须能看见").toBe(
-      true
-    );
+    expect(
+      wild.every((v) => !REGISTERED.has(v)),
+      "13.5/7 不在登记表，规则必须能看见"
+    ).toBe(true);
     // 登记值照常通过（12.5 = 密集网格档）
     expect(scanFontLiterals('<p className="text-[12.5px]">x</p>')).toEqual(["12.5"]);
     // 线稿硬契约档的值逐字钉住（与 ① 同级纪律：防「顺手规范化」把线稿值改成整数档）

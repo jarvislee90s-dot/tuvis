@@ -744,7 +744,7 @@ pub fn router_with_static(state: Arc<RemoteState>) -> Router {
 pub async fn serve(bind: &str, port: u16, state: Arc<RemoteState>) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind((bind, port))
         .await
-        .map_err(|e| format!("绑定 {bind}:{port} 失败: {e}"))?;
+        .map_err(|e| format!("RSERVER_BIND_FAIL: 绑定 {bind}:{port} 失败: {e}"))?;
     // M3 Task 5：事件桥在**绑定成功后**启动（幂等——全局 Once 保证扫描循环全进程只
     // spawn 一次）。放在 bind 之后：端口被占等启动失败不遗留 2s 会话扫描（扫描是重活，
     // 见 adapter::get_all_sessions 的单飞护栏注释）；watcher 生命周期随进程结束，
@@ -5479,7 +5479,8 @@ mod tests {
         assert_eq!(r.status(), 200);
         let body = body_string(r).await;
         assert!(
-            body.contains("\"status\":\"failed\"") && body.contains("投递进行中，请稍后重试"),
+            body.contains("\"status\":\"failed\"")
+                && body.contains("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"),
             "in-flight 占用时撤回应 200 failed 短回执：{body}"
         );
         assert_eq!(fake.recorded().len(), 0, "占用期间不得注入");
@@ -6099,7 +6100,8 @@ mod tests {
         assert_eq!(r.status(), 200);
         let body = body_string(r).await;
         assert!(
-            body.contains("\"status\":\"failed\"") && body.contains("投递进行中，请稍后重试"),
+            body.contains("\"status\":\"failed\"")
+                && body.contains("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"),
             "in-flight 占用时 approve 应 200 failed 让位：{body}"
         );
         assert!(
@@ -7464,7 +7466,7 @@ mod tests {
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].action, "answer");
         assert_eq!(
-            audits[0].result, "failed:方向键 down 投递失败（注入通道拒绝）",
+            audits[0].result, "failed:INJECT_DELIVERY_FAIL: 方向键 down 投递失败（注入通道拒绝）",
             "审计 result = failed:错误文案（与批次丙同前缀口径；2026-09-24 走位方向感知后文案带键名）"
         );
         assert_eq!(audits[0].summary, "submit", "投递失败不追加段名");
@@ -8078,7 +8080,8 @@ mod tests {
         assert_eq!(r.status(), 200);
         let body = body_string(r).await;
         assert!(
-            body.contains("\"status\":\"failed\"") && body.contains("投递进行中，请稍后重试"),
+            body.contains("\"status\":\"failed\"")
+                && body.contains("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"),
             "in-flight 占用时问答应 200 failed 让位：{body}"
         );
         assert!(
@@ -8809,7 +8812,7 @@ mod tests {
         // INFLIGHT 守卫按裸 id 全局占用（守卫 id 立规注）：并行测试偶尔让位 →
         // 「投递进行中」是良性可重试态（2026-10-05 起连续全量命中的已知 flaky
         // 根治——仅测试侧重试，生产语义零改动）
-        if body.contains("投递进行中") {
+        if body.contains("RAPI_DELIVERY_BUSY: 投递进行中") {
             let r = app
                 .clone()
                 .oneshot(req(

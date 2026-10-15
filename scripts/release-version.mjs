@@ -29,7 +29,9 @@ function getCliLanguage() {
     return value;
   }
 
-  throw new Error(messages ? t("releaseVersion.errors.invalidLang") : "Invalid --lang value. Use zh or en.");
+  throw new Error(
+    messages ? t("releaseVersion.errors.invalidLang") : "Invalid --lang value. Use zh or en."
+  );
 }
 
 function run(command) {
@@ -62,7 +64,9 @@ function t(key, vars = {}) {
 }
 
 async function askYesNo(questionKey, defaultValue = false) {
-  const suffix = defaultValue ? t("releaseVersion.prompts.yesNoDefaultYes") : t("releaseVersion.prompts.yesNoDefaultNo");
+  const suffix = defaultValue
+    ? t("releaseVersion.prompts.yesNoDefaultYes")
+    : t("releaseVersion.prompts.yesNoDefaultNo");
   const answer = (await ask(`${t(questionKey)}${suffix}`)).toLowerCase();
 
   if (!answer) {
@@ -133,7 +137,9 @@ async function chooseVersion(currentVersion) {
   });
   console.log(`${suggestions.length + 1}. ${t("releaseVersion.options.custom")}`);
 
-  const choice = await ask(t("releaseVersion.prompts.enterChoice", { max: suggestions.length + 1 }));
+  const choice = await ask(
+    t("releaseVersion.prompts.enterChoice", { max: suggestions.length + 1 })
+  );
   const choiceNumber = Number(choice);
 
   if (choiceNumber >= 1 && choiceNumber <= suggestions.length) {
@@ -169,7 +175,9 @@ function getCargoPackageName(cargoToml) {
 }
 
 function getCargoLockVersion(cargoLock, packageName) {
-  const pattern = new RegExp(`(\\[\\[package\\]\\]\\s+name = "${packageName}"\\s+version = ")([^"]+)(")`);
+  const pattern = new RegExp(
+    `(\\[\\[package\\]\\]\\s+name = "${packageName}"\\s+version = ")([^"]+)(")`
+  );
   const match = cargoLock.match(pattern);
   if (!match) {
     throw new Error(t("releaseVersion.errors.cargoLockVersionNotFound"));
@@ -190,7 +198,7 @@ function ensureVersionsAreConsistent(packageVersion, tauriVersion, cargoVersion,
         tauriVersion,
         cargoVersion,
         cargoLockVersion,
-      }),
+      })
     );
   }
 }
@@ -251,10 +259,13 @@ async function updateVersions(newVersion) {
 
   const cargoToml = await readFile(cargoTomlPath, "utf8");
   let cargoVersionFound = false;
-  const nextCargoToml = cargoToml.replace(/^(version\s*=\s*")[^"]+("\s*)$/m, (_, prefix, suffix) => {
-    cargoVersionFound = true;
-    return `${prefix}${newVersion}${suffix}`;
-  });
+  const nextCargoToml = cargoToml.replace(
+    /^(version\s*=\s*")[^"]+("\s*)$/m,
+    (_, prefix, suffix) => {
+      cargoVersionFound = true;
+      return `${prefix}${newVersion}${suffix}`;
+    }
+  );
 
   if (!cargoVersionFound) {
     throw new Error(t("releaseVersion.errors.cargoVersionNotFound"));
@@ -264,7 +275,9 @@ async function updateVersions(newVersion) {
 
   const cargoLock = await readFile(cargoLockPath, "utf8");
   const cargoPackageName = getCargoPackageName(cargoToml);
-  const cargoLockPattern = new RegExp(`(\\[\\[package\\]\\]\\s+name = "${cargoPackageName}"\\s+version = ")([^"]+)(")`);
+  const cargoLockPattern = new RegExp(
+    `(\\[\\[package\\]\\]\\s+name = "${cargoPackageName}"\\s+version = ")([^"]+)(")`
+  );
   const nextCargoLock = cargoLock.replace(cargoLockPattern, `$1${newVersion}$3`);
 
   if (nextCargoLock === cargoLock) {
@@ -328,7 +341,9 @@ async function main() {
 
     await updateVersions(nextVersion);
 
-    runInteractive("git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock");
+    runInteractive(
+      "git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock"
+    );
 
     const stagedFiles = run("git diff --cached --name-only").split(/\r?\n/).filter(Boolean);
     const expectedFiles = [
@@ -339,7 +354,9 @@ async function main() {
     ];
 
     if (expectedFiles.some((file) => !stagedFiles.includes(file))) {
-      throw new Error(t("releaseVersion.errors.releaseStagingIncomplete", { stagedFiles: stagedFiles.join(", ") }));
+      throw new Error(
+        t("releaseVersion.errors.releaseStagingIncomplete", { stagedFiles: stagedFiles.join(", ") })
+      );
     }
 
     runInteractive(`git commit -m "chore: release ${nextVersion}"`);

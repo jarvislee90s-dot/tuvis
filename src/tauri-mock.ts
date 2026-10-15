@@ -98,7 +98,7 @@ if (!isTauri) {
     },
   ];
   const mockPresetHealthIssues = {
-    invariants: ["codex：快照存在但无激活预设"],
+    invariants: ["PRESET_SNAPSHOT_ORPHAN:codex: codex：快照存在但无激活预设"],
     stashPending: [
       {
         id: 1,

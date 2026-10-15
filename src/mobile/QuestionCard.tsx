@@ -61,6 +61,8 @@
 // - 卡片会在下一次**状态跃迁**驱动的重拉时出现（同属上一条「非跃迁变化不自动重拉」
 //   的限制族）。**不为它加占位卡或轮询**（超 T1 范围；重拉触发机制归丁T2 收口面）。
 import { useCallback, useEffect, useRef, useState } from "react";
+import i18n from "@/i18n";
+import { formatInvokeError } from "@/lib/invokeError";
 import InteractiveCard, { toneTokens } from "./InteractiveCard";
 import {
   ApiError,
@@ -844,7 +846,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             typeof res.error === "string" &&
             (res.error.includes("备注文本") || res.error.includes("备注态意外关闭"));
           if (!silentReconcile) {
-            setError(res.error);
+            setError(formatInvokeError(res.error, i18n.t));
           }
           if (res.aborted === true && res.stage) {
             if (!silentReconcile) {

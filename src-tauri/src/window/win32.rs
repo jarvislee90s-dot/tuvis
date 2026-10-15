@@ -183,7 +183,7 @@ fn try_lock(hwnd_val: isize) -> Result<FocusOutcome, String> {
     if force_foreground(hwnd_val) {
         Ok(FocusOutcome::Focused)
     } else {
-        Err("窗口聚焦被系统拒绝（目标窗口可能提权或被系统锁定）".to_string())
+        Err("FOCUS_DENIED: 窗口聚焦被系统拒绝（目标窗口可能提权或被系统锁定）".to_string())
     }
 }
 
@@ -439,7 +439,7 @@ pub fn resolve_and_focus(
         candidates.sort_by(|a, b| b.uia_prefix.cmp(&a.uia_prefix).then(b.score.cmp(&a.score)));
         return Ok(FocusOutcome::Ambiguous(candidates));
     }
-    Err("未找到可聚焦的窗口（终端可能已关闭）".to_string())
+    Err("FOCUS_NO_WINDOW: 未找到可聚焦的窗口（终端可能已关闭）".to_string())
 }
 
 /// 前端选择器点选后按句柄聚焦
@@ -447,7 +447,7 @@ pub fn focus_hwnd(hwnd_val: isize) -> Result<(), String> {
     if force_foreground(hwnd_val) {
         Ok(())
     } else {
-        Err("窗口聚焦被系统拒绝（窗口可能已关闭）".to_string())
+        Err("FOCUS_DENIED_CLOSED: 窗口聚焦被系统拒绝（窗口可能已关闭）".to_string())
     }
 }
 
@@ -522,7 +522,9 @@ pub fn focus_window_for_pid(pid: u32) -> Result<(), String> {
     };
     match resolve_and_focus(&system, pid, &hints, &[]) {
         Ok(FocusOutcome::Focused) => Ok(()),
-        Ok(FocusOutcome::Ambiguous(_)) => Err("存在多个候选窗口，请重试以打开选择器".to_string()),
+        Ok(FocusOutcome::Ambiguous(_)) => {
+            Err("FOCUS_AMBIGUOUS: 存在多个候选窗口，请重试以打开选择器".to_string())
+        }
         Err(e) => Err(e),
     }
 }
@@ -541,7 +543,7 @@ pub fn reactivate_tool_app(
         .map(|a| a.to_lowercase())
         .filter(|t| matches!(t.as_str(), "workbuddy" | "codex" | "zcode"))
     else {
-        return Err("未知工具，无法兜底激活".to_string());
+        return Err("FOCUS_UNKNOWN_TOOL: 未知工具，无法兜底激活".to_string());
     };
     let wins = all_windows();
     // AllWindows.by_pid：pid → 该进程名下全部可见顶层窗口 (hwnd, title)，按 pid 分组迭代
@@ -562,7 +564,7 @@ pub fn reactivate_tool_app(
             }
         }
     }
-    Err("未找到该工具的可聚焦窗口".to_string())
+    Err("FOCUS_TOOL_WINDOW_MISSING: 未找到该工具的可聚焦窗口".to_string())
 }
 
 // ===== P1-2 B：深度链接派发后的前台验证（仅 Windows） =====

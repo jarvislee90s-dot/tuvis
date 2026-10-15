@@ -19,6 +19,8 @@
 // 页面数据刷新（SSE 快照 → 详情页重挂/卸载）自然带动；SSE 驱动卡内 re-fetch 属
 // Task 12 后优化，不在本任务范围。
 import { useCallback, useEffect, useRef, useState } from "react";
+import i18n from "@/i18n";
+import { formatInvokeError } from "@/lib/invokeError";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import InteractiveCard, { type InteractiveCardTone } from "./InteractiveCard";
@@ -187,7 +189,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
         if (res.status === "key_sent") {
           setSent(true);
         } else {
-          setError(res.error);
+          setError(formatInvokeError(res.error, i18n.t));
         }
       } catch (e) {
         // 错误码 → 中文文案走**单点映射**（[`approveErrorCopy`]）：点选项与点反馈项
@@ -213,7 +215,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
       if (res.status === "key_sent") {
         onPlanFeedbackReady?.();
       } else {
-        setError(res.error);
+        setError(formatInvokeError(res.error, i18n.t));
       }
     } catch (e) {
       // 与点选项同一单点映射（[`approveErrorCopy`]）——反馈入口此前的无映射分支

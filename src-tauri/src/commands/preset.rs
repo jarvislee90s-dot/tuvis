@@ -47,7 +47,7 @@ pub fn create_preset(
 ) -> Result<String, String> {
     let scope = scope.unwrap_or_else(|| "universal".to_string());
     if scope == "tool" && bound_tool.is_none() {
-        return Err("工具私有预设必须指定绑定工具".into());
+        return Err("PRESET_BINDING_REQUIRED: 工具私有预设必须指定绑定工具".into());
     }
     reject_native_items_in_universal(&scope, &items)?;
     crate::database::create_preset_with_meta(
@@ -85,7 +85,7 @@ pub fn update_preset(
         }
     }
     if scope == "tool" && bound_tool.is_none() {
-        return Err("工具私有预设必须指定绑定工具".into());
+        return Err("PRESET_BINDING_REQUIRED: 工具私有预设必须指定绑定工具".into());
     }
     reject_native_items_in_universal(&scope, &items)?;
     crate::database::update_preset(

@@ -12,6 +12,8 @@
 // 本条独立存活；发送成功提示后自隐；会话切换/页面卸载即清态。**刷新后不恢复反馈态**
 // （终端直接打字即可——如实登记的已知边界，不做编辑态屏面识别）。
 import { useCallback, useState } from "react";
+import { formatInvokeError } from "@/lib/invokeError";
+import i18n from "@/i18n";
 import { ApiError, sessionPlanFeedback } from "./api";
 
 const MAX_FEEDBACK_CHARS = 2000;
@@ -38,9 +40,9 @@ export default function PlanFeedbackBar({
       const code = typeof e.data?.error === "string" ? e.data.error : null;
       if (code === "not_waiting") setError("会话不在等待状态");
       else if (code === "no_session") setError("会话已结束，请返回看板刷新");
-      else setError(e.message);
+      else setError(formatInvokeError(e.message, i18n.t));
     } else {
-      setError(String(e));
+      setError(formatInvokeError(String(e), i18n.t));
     }
   }, []);
 
@@ -52,7 +54,7 @@ export default function PlanFeedbackBar({
       try {
         const res = await sessionPlanFeedback(sessionId, action, opts);
         if (res.status === "failed") {
-          setError(res.error);
+          setError(formatInvokeError(res.error, i18n.t));
           return;
         }
         if (action === "clear") {

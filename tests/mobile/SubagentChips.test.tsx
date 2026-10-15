@@ -1,6 +1,10 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import SubagentChips, { chipTokenText, formatElapsed, subagentElapsedMs } from "@/mobile/SubagentChips";
+import SubagentChips, {
+  chipTokenText,
+  formatElapsed,
+  subagentElapsedMs,
+} from "@/mobile/SubagentChips";
 import type { SubagentView } from "@/mobile/api";
 
 // 观察台 T5：chip 改纯展示（拉取上提 SessionDetail）——本文件测
@@ -29,7 +33,10 @@ describe("SubagentChips（纯展示）", () => {
     vi.setSystemTime(new Date("2026-10-08T07:36:45Z"));
     render(
       <SubagentChips
-        list={[sa("a1", "running", "2026-10-08T07:31:07Z"), sa("b1", "idle", "2026-10-08T07:00:00Z")]}
+        list={[
+          sa("a1", "running", "2026-10-08T07:31:07Z"),
+          sa("b1", "idle", "2026-10-08T07:00:00Z"),
+        ]}
         onOpenDetail={() => {}}
       />
     );
@@ -52,7 +59,9 @@ describe("SubagentChips（纯展示）", () => {
     let parentRenders = 0;
     const Probe = () => {
       parentRenders += 1;
-      return <SubagentChips list={[sa("a1", "running", "2026-10-08T07:36:35Z")]} onOpenDetail={onOpen} />;
+      return (
+        <SubagentChips list={[sa("a1", "running", "2026-10-08T07:36:35Z")]} onOpenDetail={onOpen} />
+      );
     };
     render(<Probe />);
     expect(screen.getByTestId("subagent-chip-a1").textContent).toContain("0:00");

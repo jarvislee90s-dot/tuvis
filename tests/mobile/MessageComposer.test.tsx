@@ -230,6 +230,7 @@ class FakeXHR {
       this.upload.onprogress?.(new ProgressEvent("progress", { loaded, total }));
     }
     if (routes.attachHang) {
+      // eslint-disable-next-line @typescript-eslint/no-this-alias -- 测试放行器需要持有挂起的 XHR 实例
       pendingAttachXhr = this;
       return;
     }
@@ -403,7 +404,7 @@ describe("MessageComposer：发送与回执（W4）", () => {
     fireEvent.change(input, { target: { value: "再来一次" } });
     fireEvent.click(screen.getByTestId("composer-send"));
     const chip = await screen.findByTestId("send-receipt-failed");
-    expect(chip.textContent).toContain("发送失败");
+    expect(chip.textContent).toContain("Send failed");
     expect(chip.textContent).toContain("定位终端失败：tmux 会话不存在");
     // 失败不清空输入（保留原文供重试）
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("再来一次");
@@ -697,7 +698,7 @@ describe("排队回执：修改按钮（撤回保持丢弃语义）", () => {
   });
 
   it("修改：确认出队（{ok:true}）→ 正文放回输入框（可继续编辑），行收敛", async () => {
-    const input = await sendIntoQueued("跑个长任务");
+    await sendIntoQueued("跑个长任务");
     fireEvent.click(screen.getByTestId("queue-edit"));
     await waitFor(() => expect(screen.queryByTestId("queue-row-7")).toBeNull());
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("跑个长任务");
@@ -708,7 +709,7 @@ describe("排队回执：修改按钮（撤回保持丢弃语义）", () => {
 
   it("修改：正文超长时截断到 MAX_SEND_CHARS（与输入框 maxLength 对齐）", async () => {
     const long = "长".repeat(10001);
-    const input = await sendIntoQueued(long);
+    await sendIntoQueued(long);
     fireEvent.click(screen.getByTestId("queue-edit"));
     await waitFor(() => expect(screen.queryByTestId("queue-row-7")).toBeNull());
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toHaveLength(10000);
@@ -717,7 +718,7 @@ describe("排队回执：修改按钮（撤回保持丢弃语义）", () => {
   it("修改：忙时 failed（条目仍在队）→ 排队视图保留、输入框保持为空（防双份）", async () => {
     routes.retractBusy = true;
     routes.queue = [queueItem({ id: 7, position: 1, content: "跑个长任务" })];
-    const input = await sendIntoQueued("跑个长任务");
+    await sendIntoQueued("跑个长任务");
     // 复核发现条目仍在队 → 恢复排队视图；正文不得放回（否则队里 + 输入框双份）。
     // 挂载拉取已计入列表调用，改用增量断言锁定「复核确已发生」
     const callsBefore = queueListCalls();
@@ -728,7 +729,7 @@ describe("排队回执：修改按钮（撤回保持丢弃语义）", () => {
   });
 
   it("撤回回归锁：仍为完全取消——确认出队后行收敛且输入框保持为空", async () => {
-    const input = await sendIntoQueued("只想取消");
+    await sendIntoQueued("只想取消");
     fireEvent.click(screen.getByTestId("queue-retract"));
     await waitFor(() => expect(screen.queryByTestId("queue-row-7")).toBeNull());
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
@@ -912,9 +913,9 @@ describe("直发确认分诊回执（D7/T3）", () => {
     fireEvent.change(input, { target: { value: "滞留真失败" } });
     fireEvent.click(screen.getByTestId("composer-send"));
     const chip = await screen.findByTestId("send-receipt-failed");
-    expect(chip.textContent).toContain("发送失败");
+    expect(chip.textContent).toContain("Send failed");
     expect(chip.textContent).toContain("已注入未确认（未见会话记录），请检查终端后重试");
-    expect(chip.textContent).toContain("（可重试）");
+    expect(chip.textContent).toContain("(retry available)");
     // 分诊两态不混淆：failed 不得渲染成 submitted 中性 chip
     expect(screen.queryByTestId("send-receipt-submitted")).toBeNull();
   });
@@ -1232,7 +1233,7 @@ describe("移动端附件上传（2026-09-20）", () => {
     routes.attachStatus = 404;
     routes.attachError = "no_cwd";
     render(<MessageComposer session={{ id: "sess-1" }} />);
-    const input = await screen.findByTestId("composer-input");
+    await screen.findByTestId("composer-input");
     fireEvent.change(screen.getByTestId("attach-file-input"), {
       target: { files: [pngFile("nc.png")] },
     });
@@ -1245,7 +1246,7 @@ describe("移动端附件上传（2026-09-20）", () => {
     installFetch();
     routes.info = sendInfo();
     render(<MessageComposer session={{ id: "sess-1" }} />);
-    const input = await screen.findByTestId("composer-input");
+    await screen.findByTestId("composer-input");
     expect(screen.queryByTestId("attach-hint")).toBeNull();
     fireEvent.click(screen.getByTestId("attach-help"));
     const hint = screen.getByTestId("attach-hint");

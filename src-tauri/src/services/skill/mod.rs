@@ -13,7 +13,10 @@ fn get_tool_skill_dir(tool_id: &str) -> Option<std::path::PathBuf> {
 pub fn install_skill(source_path: &str, name: &str, overwrite: bool) -> Result<(), String> {
     let source = std::path::Path::new(source_path);
     if !source.exists() {
-        return Err(format!("源路径不存在: {}", source_path));
+        return Err(format!(
+            "LINKER_SOURCE_MISSING: 源路径不存在: {}",
+            source_path
+        ));
     }
     linker::install_to_repo(source, name, overwrite)?;
     let ext = database::ExtensionRecord {
@@ -46,7 +49,7 @@ pub fn enable_skill_for_tool(skill_name: &str, tool_id: &str) -> Result<(), Stri
     let flat = crate::linker::dispatch_name(skill_name);
     if flat != skill_name && crate::linker::ensure_repo_dir().join(&flat).exists() {
         return Err(format!(
-            "拍平名与现有技能冲突：{} 的派发名 {} 已被仓库内另一平铺技能占用",
+            "SKILL_FLATTEN_CONFLICT: 拍平名与现有技能冲突：{} 的派发名 {} 已被仓库内另一平铺技能占用",
             skill_name, flat
         ));
     }
@@ -75,7 +78,7 @@ pub fn enable_skill_for_tool(skill_name: &str, tool_id: &str) -> Result<(), Stri
                 };
                 if occupied_by_other {
                     return Err(format!(
-                        "拍平名冲突：{} 已被另一技能的链接占用（如嵌套技能的拍平链接），请先停用占用该名字的技能",
+                        "SKILL_FLATTEN_LINK_TAKEN: 拍平名冲突：{} 已被另一技能的链接占用（如嵌套技能的拍平链接），请先停用占用该名字的技能",
                         tool_target.display()
                     ));
                 }
@@ -94,7 +97,10 @@ pub fn enable_skill_for_tool(skill_name: &str, tool_id: &str) -> Result<(), Stri
             && !tool_target.is_symlink()
             && crate::adapter::is_builtin_native_skill(tool_id, skill_name, &tool_target)
         {
-            return Err(format!("工具内建技能，不可操作: {}", tool_target.display()));
+            return Err(format!(
+                "SKILL_BUILTIN_READONLY: 工具内建技能，不可操作: {}",
+                tool_target.display()
+            ));
         }
     }
 
@@ -122,7 +128,7 @@ pub fn enable_skill_for_tool(skill_name: &str, tool_id: &str) -> Result<(), Stri
                 // 纳管走资源面板的显式清理流程（cleanup_duplicate_skills）
                 if !crate::linker::dir_contents_equal(&tool_target, &repo_skill) {
                     return Err(format!(
-                        "{} 为真实目录且与共享仓库内容不一致，已拒绝替换为链接（防止覆盖本地修改）；如需纳管请先在资源面板处理同名技能",
+                        "SKILL_DIR_DIRTY: {} 为真实目录且与共享仓库内容不一致，已拒绝替换为链接（防止覆盖本地修改）；如需纳管请先在资源面板处理同名技能",
                         tool_target.display()
                     ));
                 }
@@ -153,7 +159,7 @@ pub fn disable_skill_for_tool(skill_name: &str, tool_id: &str) -> Result<(), Str
     let ext_id = format!("skill-{}", skill_name);
     if crate::database::is_tool_resident(tool_id, &ext_id) {
         return Err(format!(
-            "skill {} 是 {} 的常驻资源，先关闭常驻再停用",
+            "SKILL_RESIDENT_CONFLICT: skill {} 是 {} 的常驻资源，先关闭常驻再停用",
             skill_name, tool_id
         ));
     }
@@ -167,7 +173,10 @@ pub fn disable_skill_for_tool(skill_name: &str, tool_id: &str) -> Result<(), Str
             && !tool_target.is_symlink()
             && crate::adapter::is_builtin_native_skill(tool_id, skill_name, &tool_target)
         {
-            return Err(format!("工具内建技能，不可操作: {}", tool_target.display()));
+            return Err(format!(
+                "SKILL_BUILTIN_READONLY: 工具内建技能，不可操作: {}",
+                tool_target.display()
+            ));
         }
     }
     if let Some(tool_skill_dir) = get_tool_skill_dir(tool_id) {
@@ -199,13 +208,13 @@ pub fn assign_skill_to_subagent(
 ) -> Result<(), String> {
     if !is_skill_in_tool_range(skill_name, tool_id) {
         return Err(format!(
-            "Skill {} 未在 {} 的工具级分配中启用，无法分配给子 Agent",
+            "SKILL_NOT_TOOL_ENABLED: Skill {} 未在 {} 的工具级分配中启用，无法分配给子 Agent",
             skill_name, tool_id
         ));
     }
 
-    let adapter =
-        crate::adapter::adapter_by_id(tool_id).ok_or_else(|| format!("未知工具: {}", tool_id))?;
+    let adapter = crate::adapter::adapter_by_id(tool_id)
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
 
     let has_subagent_dir = adapter.subagent_dir().is_some();
 

@@ -119,7 +119,9 @@ const rust = rustCrateVersions();
 const npm = npmDirectDeps();
 
 const npmNameFor = (crate) =>
-  crate === "tauri" ? `${NPM_SCOPE}api` : `${NPM_SCOPE}plugin-${crate.slice("tauri-plugin-".length)}`;
+  crate === "tauri"
+    ? `${NPM_SCOPE}api`
+    : `${NPM_SCOPE}plugin-${crate.slice("tauri-plugin-".length)}`;
 
 const pairs = [];
 const rustOnly = [];
@@ -137,7 +139,7 @@ for (const [crate, crateVersion] of [...rust].sort()) {
 const npmOnly = [...npm]
   .filter(
     ([name]) =>
-      (name === `${NPM_SCOPE}api` || name.startsWith(`${NPM_SCOPE}plugin-`)) && !pairedNpm.has(name),
+      (name === `${NPM_SCOPE}api` || name.startsWith(`${NPM_SCOPE}plugin-`)) && !pairedNpm.has(name)
   )
   .map(([name, version]) => `${name} ${version}`);
 
@@ -147,7 +149,7 @@ console.log(`tauri 版本对齐检查（Rust crate ↔ ${NPM_SCOPE}* NPM 包，�
 for (const p of pairs) {
   const ok = majorMinor(p.crateVersion) === majorMinor(p.npmVersion);
   console.log(
-    `  ${ok ? "✓" : "✗"} ${p.crate.padEnd(30)} ${p.crateVersion.padEnd(10)} ${ok ? "=" : "≠"}  ${p.pkg.padEnd(34)} ${p.npmVersion}`,
+    `  ${ok ? "✓" : "✗"} ${p.crate.padEnd(30)} ${p.crateVersion.padEnd(10)} ${ok ? "=" : "≠"}  ${p.pkg.padEnd(34)} ${p.npmVersion}`
   );
 }
 if (rustOnly.length) console.log(`  · 仅 Rust 侧存在（不判定）：${rustOnly.join(", ")}`);
@@ -158,7 +160,9 @@ if (mismatched.length) {
   console.error(`✗ tauri 版本未对齐：${mismatched.length} 对 major.minor 不一致`);
   console.error("  修复：tauri 系依赖必须同批升级，Rust crate 与 NPM 包的 major.minor 必须相等。");
   console.error("  最常见场景：dependabot 的 npm 分组 PR 与 cargo 分组 PR 是同一批升级的两半，");
-  console.error("  单独合任何一个都必红——把两者放进同一次变更（或把 NPM 侧锁回与 Rust 相同的 minor）再合。");
+  console.error(
+    "  单独合任何一个都必红——把两者放进同一次变更（或把 NPM 侧锁回与 Rust 相同的 minor）再合。"
+  );
   console.error("  另注意 `^2` 这类松范围：rebase 重新解析锁文件时 NPM 侧会漂到更新的 minor。");
   process.exit(1);
 }

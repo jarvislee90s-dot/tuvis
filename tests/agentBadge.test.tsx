@@ -60,10 +60,7 @@ describe("AGENT_BADGE", () => {
       const badge = AGENT_BADGE[key];
       expect(badge, `missing badge for ${key}`).toBeDefined();
       const { container } = render(<badge.Icon className="h-4 w-4" />);
-      expect(
-        container.querySelector("svg, img"),
-        `no icon rendered for ${key}`,
-      ).toBeTruthy();
+      expect(container.querySelector("svg, img"), `no icon rendered for ${key}`).toBeTruthy();
     }
   });
 

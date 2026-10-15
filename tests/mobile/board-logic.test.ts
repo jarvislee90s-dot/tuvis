@@ -13,7 +13,6 @@ import {
   formatTransition,
   sortChipsByActivity,
   sortSessions,
-  type ToolFilter,
 } from "@/mobile/board-logic";
 import type { Session, SessionStatus, TransitionEvent } from "@/types/session";
 

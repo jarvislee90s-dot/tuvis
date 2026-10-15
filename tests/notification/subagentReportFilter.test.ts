@@ -28,12 +28,23 @@ import { useNotification, GREEN_STABLE_MS } from "@/hooks/useNotification";
 
 function session(id: string, report: boolean) {
   return {
-    id, agentType: "claude", form: "cli" as const, projectName: "Demo", title: "T",
-    gitBranch: null, githubUrl: null, status: "idle",
+    id,
+    agentType: "claude",
+    form: "cli" as const,
+    projectName: "Demo",
+    title: "T",
+    gitBranch: null,
+    githubUrl: null,
+    status: "idle",
     lastMessage: report ? "Another Claude session sent a message: <teammate-message …" : "ok",
     lastMessageSubagentReport: report,
-    lastMessageRole: null, lastActivityAt: new Date().toISOString(),
-    pid: 1, cpuUsage: 0, activeSubagentCount: 0, jumpSupported: true, unread: true,
+    lastMessageRole: null,
+    lastActivityAt: new Date().toISOString(),
+    pid: 1,
+    cpuUsage: 0,
+    activeSubagentCount: 0,
+    jumpSupported: true,
+    unread: true,
   };
 }
 
@@ -72,7 +83,9 @@ describe("子 Agent 回报提醒开关（观察台 §四）", () => {
     act(() => {
       useSessionStore.setState({ sessions: [session("s-report", true), session("s-own", false)] });
     });
-    await act(async () => { await vi.advanceTimersByTimeAsync(GREEN_STABLE_MS + 100); });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(GREEN_STABLE_MS + 100);
+    });
     // show_notification_window 失败 → 降级系统通知（可观测断言点）：
     // 仅 s-own 到达，s-report 被滤
     const targets = sendNotificationMock.mock.calls.map((c) => JSON.stringify(c[0].extra));
@@ -91,7 +104,9 @@ describe("子 Agent 回报提醒开关（观察台 §四）", () => {
     act(() => {
       useSessionStore.setState({ sessions: [session("s-report", true)] });
     });
-    await act(async () => { await vi.advanceTimersByTimeAsync(GREEN_STABLE_MS + 100); });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(GREEN_STABLE_MS + 100);
+    });
     expect(sendNotificationMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -314,7 +314,7 @@ pub(crate) fn try_flush_with(
             .and_then(|()| {
                 st.injector
                     .locate_and_send_key_spec(session.pid, "tab", &spec)
-                    .map_err(|e| format!("Tab 入队失败（草稿已入 composer，请人工检查终端）：{e}"))
+                    .map_err(|e| format!("QUEUE_ENQUEUE_FAIL: Tab 入队失败（草稿已入 composer，请人工检查终端）：{e}"))
             })
             .and_then(|()| {
                 st.injector
@@ -552,7 +552,7 @@ pub(crate) fn settle(
                 if jump { "jump" } else { "flush" },
                 &format!("aborted:{reason}"),
             );
-            Err(format!("未投递：{reason}，请人工确认"))
+            Err(format!("QUEUE_NOT_DELIVERED: 未投递：{reason}，请人工确认"))
         }
     }
 }

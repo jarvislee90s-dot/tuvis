@@ -460,7 +460,7 @@ pub fn dashboard(
         let d = dashboard_with_conn(&conn, range, group_by, now_ms)?;
         return Ok(d);
     }
-    Err(UsageError::new("usage-db-failed", "DB 锁中毒"))
+    Err(UsageError::new("usage-db-failed", "db poisoned lock"))
 }
 
 /// 连接注入版（单测直连内存库）
@@ -623,7 +623,7 @@ pub fn records(
 ) -> Result<UsageRecords, UsageError> {
     let conn = DB
         .lock()
-        .map_err(|_| UsageError::new("usage-db-failed", "DB 锁中毒"))?;
+        .map_err(|_| UsageError::new("usage-db-failed", "db poisoned lock"))?;
     records_with_conn(&conn, range, group_by, filters, now_ms)
 }
 
@@ -640,7 +640,7 @@ pub fn records_with_conn(
     if !matches!(group_by, UsageGroupBy::Tool | UsageGroupBy::Project) {
         return Err(UsageError::new(
             "usage-groupby-invalid",
-            format!("记录页的 groupBy 只接受 tool | project，收到 {group_by:?}"),
+            format!("records groupBy accepts tool | project only, got {group_by:?}"),
         ));
     }
     // **A-2（契约 §2 `UsageFilters` 通用条款 / §3 要点 4，错误码第 9 个）**：筛选条件在
@@ -652,8 +652,8 @@ pub fn records_with_conn(
     if let Some(code) = filter_unavailable_code(range.preset, filters) {
         return Err(UsageError::new(
             code,
-            "日档（last7d / last30d / custom）的行来自日聚合表、不带 session_id，\
-             无法判断会话身份 ⇒ subagentMode=\"parentsOnly\" 算不出，不得当作「没有子代理」放行"
+            "daily buckets (last7d/last30d/custom) lack session_id; \
+             subagentMode=\"parentsOnly\" cannot be evaluated"
                 .to_string(),
         ));
     }
@@ -773,7 +773,7 @@ pub fn export_csv(
 ) -> Result<String, UsageError> {
     let conn = DB
         .lock()
-        .map_err(|_| UsageError::new("usage-db-failed", "DB 锁中毒"))?;
+        .map_err(|_| UsageError::new("usage-db-failed", "db poisoned lock"))?;
     csv_with_conn(&conn, range, group_by, filters, now_ms)
 }
 
@@ -796,8 +796,8 @@ pub fn csv_with_conn(
     if let Some(code) = filter_unavailable_code(range.preset, filters) {
         return Err(UsageError::new(
             code,
-            "日档（last7d / last30d / custom）的行来自日聚合表、不带 session_id，\
-             无法判断会话身份 ⇒ subagentMode=\"parentsOnly\" 算不出，不得当作「没有子代理」导出"
+            "daily buckets (last7d/last30d/custom) lack session_id; \
+             subagentMode=\"parentsOnly\" cannot be evaluated"
                 .to_string(),
         ));
     }

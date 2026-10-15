@@ -127,7 +127,7 @@ export const mockLedgerDrift = [
 ];
 
 export const mockPresetHealthIssues = {
-  invariants: ["codex：快照存在但无激活预设"],
+  invariants: ["PRESET_SNAPSHOT_ORPHAN:codex: codex：快照存在但无激活预设"],
   stashPending: [
     {
       id: 1,
@@ -310,12 +310,14 @@ export const tauriInvokeMock = vi.fn((cmd: string, args?: unknown) => {
     case "update_preset":
     case "delete_preset":
     // deactivate_preset 前端路径已退役（T8），case 移除；子 Agent 变体保留
+    // falls through：这些空 case 共用下方的成功返回
     case "apply_preset_to_subagent":
     case "deactivate_preset_from_subagent":
     case "set_resource_binding":
     case "delete_resource_binding":
     case "set_tool_resident":
     // 暂存回移（T15 体检卡片 ③）：真实命令返回 Result<(), String>，mock 视为成功
+    // falls through：这些空 case 共用下方的成功返回
     case "restore_stash_entry":
       return Promise.resolve();
     // 空目录清理（wave33 Item D）：真实命令返回 Result<usize>，mock 删无可删返回 0

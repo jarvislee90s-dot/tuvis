@@ -110,7 +110,7 @@ describe("PlanFeedbackBar：计划反馈条（2026-10-04）", () => {
     // 无内容无暂存：发送/覆盖写入/清空都禁用
     expect((screen.getByTestId("plan-feedback-send") as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByTestId("plan-feedback-overwrite") as HTMLButtonElement).disabled).toBe(
-      true,
+      true
     );
     expect((screen.getByTestId("plan-feedback-clear") as HTMLButtonElement).disabled).toBe(true);
     fireEvent.change(screen.getByTestId("plan-feedback-input"), { target: { value: "x" } });
@@ -119,7 +119,7 @@ describe("PlanFeedbackBar：计划反馈条（2026-10-04）", () => {
       await screen
         .findByTestId("plan-feedback-error")
         .then((el) => el.textContent)
-        .then((t) => t?.includes("反馈编辑行不在场")),
+        .then((t) => t?.includes("反馈编辑行不在场"))
     ).toBe(true);
   });
 });

@@ -9,8 +9,13 @@ import type { ArchivedSession } from "@/mobile/api";
 vi.mock("sonner", () => ({ toast: vi.fn() }));
 
 const card: ArchivedSession = {
-  sessionId: "dead-1", agentType: "codex", projectPath: "/tmp/p1", projectName: "proj-1",
-  title: "标题", lastStatus: "idle", lastSeenAt: new Date().toISOString(),
+  sessionId: "dead-1",
+  agentType: "codex",
+  projectPath: "/tmp/p1",
+  projectName: "proj-1",
+  title: "标题",
+  lastStatus: "idle",
+  lastSeenAt: new Date().toISOString(),
 };
 
 const DEFAULT_PAGE = {
@@ -21,10 +26,10 @@ const DEFAULT_PAGE = {
 function installFetch(routes: Record<string, unknown>) {
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
       const url = String(input);
       if (url.includes("/session-open")) {
-        const body = (routes["sessionOpen"]) as Record<string, string> | undefined;
+        const body = routes["sessionOpen"] as Record<string, string> | undefined;
         const status = routes["sessionOpenStatus"] as number | undefined;
         return new Response(JSON.stringify(body ?? { status: "opening" }), {
           status: status ?? 200,
@@ -32,23 +37,29 @@ function installFetch(routes: Record<string, unknown>) {
         });
       }
       if (url.includes("/session-messages")) {
-        const page = (routes["messagesPage"] as Record<string, unknown> | undefined) ?? DEFAULT_PAGE;
+        const page =
+          (routes["messagesPage"] as Record<string, unknown> | undefined) ?? DEFAULT_PAGE;
         return new Response(JSON.stringify(page), {
           headers: { "content-type": "application/json" },
         });
       }
       if (url.includes("/sessions-archived")) {
-        return new Response(JSON.stringify({ deleted: 1 }), { headers: { "content-type": "application/json" } });
+        return new Response(JSON.stringify({ deleted: 1 }), {
+          headers: { "content-type": "application/json" },
+        });
       }
       return new Response("{}", { status: 404 });
-    }),
+    })
   );
 }
 
 describe("ArchiveDetail：归档详情与激活", () => {
   beforeEach(() => installFetch({}));
   beforeEach(() => vi.mocked(toast).mockClear());
-  afterEach(() => { vi.unstubAllGlobals(); cleanup(); });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    cleanup();
+  });
 
   it("渲染历史消息内容 + 在桌面端打开按钮存在", async () => {
     render(<ArchiveDetail session={card} onBack={() => {}} onActivated={() => {}} />);
@@ -72,7 +83,7 @@ describe("ArchiveDetail：归档详情与激活", () => {
     fireEvent.click(screen.getByTestId("session-open"));
     await screen.findByText("正在电脑上打开终端…");
     expect(toast).toHaveBeenCalledWith(
-      "重开的会话所在目录未做信任确认，请在主机终端应答信任提示，否则会话将挂起",
+      "重开的会话所在目录未做信任确认，请在主机终端应答信任提示，否则会话将挂起"
     );
   });
 
@@ -97,7 +108,7 @@ describe("ArchiveDetail：归档详情与激活", () => {
     render(<ArchiveDetail session={card} onBack={() => {}} onActivated={() => {}} />);
     fireEvent.click(screen.getByTestId("session-open"));
     expect(
-      await screen.findByText("打开失败：该工具 resume 命令待查证，暂不支持一键打开"),
+      await screen.findByText("打开失败：该工具 resume 命令待查证，暂不支持一键打开")
     ).toBeTruthy();
   });
 
@@ -113,7 +124,7 @@ describe("ArchiveDetail：归档详情与激活", () => {
         session={{ ...card, agentType: "workbuddy" }}
         onBack={() => {}}
         onActivated={() => {}}
-      />,
+      />
     );
     const btn = screen.getByTestId("session-open") as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
@@ -145,8 +156,8 @@ describe("ArchiveDetail：归档详情与激活", () => {
         () =>
           new Promise<Response>((res) => {
             resolveFetch = res;
-          }),
-      ),
+          })
+      )
     );
     render(<ArchiveDetail session={card} onBack={() => {}} onActivated={() => {}} />);
     const area = screen.getByTestId("message-area");
@@ -163,8 +174,8 @@ describe("ArchiveDetail：归档详情与激活", () => {
             ],
             truncated: false,
           }),
-          { headers: { "content-type": "application/json" } },
-        ),
+          { headers: { "content-type": "application/json" } }
+        )
       );
     });
     await waitFor(() => expect(area.scrollTop).toBe(5000));
@@ -174,7 +185,11 @@ describe("ArchiveDetail：归档详情与激活", () => {
     installFetch({
       messagesPage: {
         messages: Array.from({ length: 10 }, (_, i) => ({
-          seq: i + 1, role: "user", content: `第 ${i + 1} 条`, kind: "text", ts: i + 1,
+          seq: i + 1,
+          role: "user",
+          content: `第 ${i + 1} 条`,
+          kind: "text",
+          ts: i + 1,
         })),
         truncated: false,
       },
@@ -205,10 +220,39 @@ describe("ArchiveDetail：归档详情与激活", () => {
       messagesPage: {
         messages: [
           { seq: 1, role: "user", content: "帮我查下", kind: "text", ts: 1 },
-          { seq: 2, role: "assistant", content: "thinking 过程内容", kind: "thinking", ts: 2, collapsed: true },
-          { seq: 3, role: "assistant", content: "tool-call 过程内容", kind: "tool-call", ts: 3, toolName: "grep", collapsed: true },
-          { seq: 4, role: "assistant", content: "早先回复", kind: "assistant", ts: 4, collapsed: false },
-          { seq: 5, role: "assistant", content: "最终总结回复", kind: "assistant", ts: 5, collapsed: false },
+          {
+            seq: 2,
+            role: "assistant",
+            content: "thinking 过程内容",
+            kind: "thinking",
+            ts: 2,
+            collapsed: true,
+          },
+          {
+            seq: 3,
+            role: "assistant",
+            content: "tool-call 过程内容",
+            kind: "tool-call",
+            ts: 3,
+            toolName: "grep",
+            collapsed: true,
+          },
+          {
+            seq: 4,
+            role: "assistant",
+            content: "早先回复",
+            kind: "assistant",
+            ts: 4,
+            collapsed: false,
+          },
+          {
+            seq: 5,
+            role: "assistant",
+            content: "最终总结回复",
+            kind: "assistant",
+            ts: 5,
+            collapsed: false,
+          },
         ],
         truncated: false,
       },
@@ -269,7 +313,11 @@ describe("ArchiveDetail 软归档与加载更早（体验批二）", () => {
       })
     );
     render(
-      <ArchiveDetail session={{ ...card, hiddenAlive: true }} onBack={back} onActivated={() => {}} />
+      <ArchiveDetail
+        session={{ ...card, hiddenAlive: true }}
+        onBack={back}
+        onActivated={() => {}}
+      />
     );
     expect(await screen.findByTestId("hidden-alive-badge")).toBeTruthy();
     expect(screen.queryByTestId("session-open")).toBeNull();
@@ -288,14 +336,16 @@ describe("ArchiveDetail 软归档与加载更早（体验批二）", () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
         if (url.includes("/session-messages")) {
-          const limit = Number(
-            new URL(url, "http://localhost").searchParams.get("limit") ?? "0"
-          );
+          const limit = Number(new URL(url, "http://localhost").searchParams.get("limit") ?? "0");
           requested.push(limit);
           return new Response(
             JSON.stringify({
               messages: Array.from({ length: limit }, (_, i) => ({
-                seq: i + 1, role: "user", content: `m${i + 1}`, kind: "text", ts: i + 1,
+                seq: i + 1,
+                role: "user",
+                content: `m${i + 1}`,
+                kind: "text",
+                ts: i + 1,
               })),
               truncated: false,
             }),
@@ -314,8 +364,8 @@ describe("ArchiveDetail 软归档与加载更早（体验批二）", () => {
     // 锚定在被动 effect 里调度（useEffect [messages]），而 findByText 走 MutationObserver
     // 微任务可先于 effect flush 解析——同步断言是竞态（CI 慢机红过：run 36207251281）。
     // 条件等待（同 SessionDetail bookmark-jump 的先例）：等被动 effect 落地再断言。
-    await waitFor(() =>
-      expect(Element.prototype.scrollIntoView).toHaveBeenCalled() // 锚定原顶部消息
+    await waitFor(
+      () => expect(Element.prototype.scrollIntoView).toHaveBeenCalled() // 锚定原顶部消息
     );
   });
 });

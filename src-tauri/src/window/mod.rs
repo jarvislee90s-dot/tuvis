@@ -45,7 +45,7 @@ pub fn focus_terminal_for_pid(pid: u32) -> Result<(), String> {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = pid;
-        Err("当前平台不支持终端跳转".to_string())
+        Err("FOCUS_PLATFORM_UNSUPPORTED: 当前平台不支持终端跳转".to_string())
     }
 }
 
@@ -75,7 +75,7 @@ pub(crate) fn get_tty_for_pid(pid: u32) -> Result<String, String> {
     if output.status.success() {
         let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if tty.is_empty() || tty == "??" {
-            Err("Process has no TTY (可能是桌面 APP)".to_string())
+            Err("FOCUS_NO_TTY: Process has no TTY (可能是桌面 APP)".to_string())
         } else {
             Ok(tty)
         }

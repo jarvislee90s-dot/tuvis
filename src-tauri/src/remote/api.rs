@@ -1322,7 +1322,9 @@ pub async fn session_send(
         .await
         .unwrap_or_else(|e| {
             log::error!("session-send 直发任务异常: {e}");
-            crate::inject::queue::FlushOutcome::Failed("内部任务异常".to_string())
+            crate::inject::queue::FlushOutcome::Failed(
+                "RAPI_INTERNAL_TASK: 内部任务异常".to_string(),
+            )
         });
         // P1-4 五态精确映射（D7/T3 增 Submitted）：Sent/Submitted/Failed/
         // Deferred/Suspended → delivered/submitted/failed/queued/queued；守卫忙
@@ -1399,7 +1401,7 @@ pub async fn session_send(
                     StatusCode::OK,
                     serde_json::json!({
                         "status": "failed",
-                        "error": format!("未投递：{reason}，请人工确认"),
+                        "error": format!("QUEUE_NOT_DELIVERED: 未投递：{reason}，请人工确认"),
                     }),
                 )
             }
@@ -1634,7 +1636,9 @@ pub async fn session_queue_jump(
         Ok(v) => v,
         Err(e) => {
             log::error!("session-queue/jump 任务异常: {e}");
-            crate::inject::queue::FlushOutcome::Failed("内部任务异常".to_string())
+            crate::inject::queue::FlushOutcome::Failed(
+                "RAPI_INTERNAL_TASK: 内部任务异常".to_string(),
+            )
         }
     };
     match outcome {
@@ -1651,7 +1655,7 @@ pub async fn session_queue_jump(
         // 「未投递：<原因>，请人工确认」（前端 handleJump 对非 delivered 走对账，
         // 行不在队 → 中性 gone 收敛；原因文案在 failed 回执可见）
         crate::inject::queue::FlushOutcome::NotDelivered(reason) => {
-            failed_body(format!("未投递：{reason}，请人工确认"))
+            failed_body(format!("QUEUE_NOT_DELIVERED: 未投递：{reason}，请人工确认"))
         }
         crate::inject::queue::FlushOutcome::Failed(e) => failed_body(e),
         // Deferred/Suspended（含守卫忙让位/已被他方消费）：行保持 pending 或已退出，
@@ -1708,7 +1712,7 @@ pub async fn session_queue_retract(
     };
     // P2-6 共守卫（与 flush 循环/直发/插队互斥）：投递进行中 → 撤回让位，短回执提示重试
     let Some(_guard) = crate::inject::queue::try_acquire_inflight(&sid) else {
-        return failed_body("投递进行中，请稍后重试".to_string());
+        return failed_body("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试".to_string());
     };
     // 前查：拿条目供审计（agent_type / 已 compose 的 content），同时完成归属校验
     let target = st.store.with(|c| {
@@ -3297,13 +3301,13 @@ pub async fn session_approve(
                 StatusCode::OK,
                 serde_json::json!({
                     "status": "failed",
-                    "error": "投递进行中，请稍后重试"
+                    "error": "RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"
                 }),
             );
         }
         Err(e) => {
             log::error!("session-approve 投递任务异常: {e}");
-            Err("内部任务异常".to_string())
+            Err("RAPI_INTERNAL_TASK: 内部任务异常".to_string())
         }
     };
     // 审计 action 词表（W5 词表 send|queue|flush|jump|retract|approve|reject|fail|key|open；
@@ -3465,7 +3469,10 @@ pub(crate) fn run_plan_feedback_stages<T: PlanFeedbackTerminal>(
             }
             if *submit {
                 if text.is_empty() && len == 0 {
-                    return Err("没有可提交的内容（输入为空且终端行无暂存）".to_string());
+                    return Err(
+                        "RAPI_NOTHING_TO_SUBMIT: 没有可提交的内容（输入为空且终端行无暂存）"
+                            .to_string(),
+                    );
                 }
                 t.send_enter()?;
                 t.settle();
@@ -3583,13 +3590,13 @@ pub async fn session_plan_feedback(
                 StatusCode::OK,
                 serde_json::json!({
                     "status": "failed",
-                    "error": "投递进行中，请稍后重试"
+                    "error": "RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"
                 }),
             );
         }
         Err(e) => {
             log::error!("session-plan-feedback 投递任务异常: {e}");
-            Err("内部任务异常".to_string())
+            Err("RAPI_INTERNAL_TASK: 内部任务异常".to_string())
         }
     };
     let audit_content = match &op_for_audit {
@@ -4955,13 +4962,13 @@ pub async fn session_question_answer(
                 StatusCode::OK,
                 serde_json::json!({
                     "status": "failed",
-                    "error": "投递进行中，请稍后重试"
+                    "error": "RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"
                 }),
             );
         }
         Err(e) => {
             log::error!("session-question/answer 投递任务异常: {e}");
-            QuestionDispatch::Internal("内部任务异常".to_string())
+            QuestionDispatch::Internal("RAPI_INTERNAL_TASK: 内部任务异常".to_string())
         }
     };
     let audit_label = action.audit_label(req.index);
@@ -6403,7 +6410,7 @@ fn dispatch_question_action(
                         out
                     }
                     QuestionScreenPoll::NoScreen => Err(crate::inject::question::StageAbort::screen(
-                        "读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
+                        "INJECT_SCREEN_ABORT: 读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
                     )),
                     QuestionScreenPoll::Unparseable(last) => {
                         Err(crate::inject::question::StageAbort::screen(format!(
@@ -6448,7 +6455,7 @@ fn dispatch_question_action(
                         )
                     }
                     QuestionScreenPoll::NoScreen => Err(crate::inject::question::StageAbort::screen(
-                        "切题前读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
+                        "INJECT_SCREEN_ABORT: 切题前读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
                     )),
                     QuestionScreenPoll::Unparseable(last) => {
                         Err(crate::inject::question::StageAbort::screen(format!(
@@ -6864,6 +6871,17 @@ fn dispatch_abort(e: crate::inject::question::StageAbort) -> QuestionDispatch {
     }
 }
 
+/// 剥中止文案的错误码前缀（`INJECT_DELIVERY_FAIL: `/`INJECT_SCREEN_ABORT: `），
+/// 返回码后原文——段名判定的统一入口（见 [`stage_from_abort`] 头注释）。
+fn strip_inject_code(err: &str) -> &str {
+    for prefix in ["INJECT_DELIVERY_FAIL: ", "INJECT_SCREEN_ABORT: "] {
+        if let Some(rest) = err.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    err
+}
+
 /// **中止段名反推**（回执 `stage` 字段；纯函数，可测）。
 ///
 /// 依据 = 阶段机各段的中止文案里点名的**关键判据词**（那些文案是面向用户的，词面
@@ -6871,6 +6889,10 @@ fn dispatch_abort(e: crate::inject::question::StageAbort) -> QuestionDispatch {
 /// 区分不出来）。反推不出 → 用 `submit-row`/`free-row` 这类**最靠前的段**兜底
 /// （宁可粗，不编假精度）。
 fn stage_from_abort(err: &str) -> &'static str {
+    // 错误码迁移（#123/#158）后中止文案可能带 INJECT_* 码前缀——判定锚定的是
+    // 码后原文（本函数只做段名分类，回执 error 字段仍携码原样上屏）。先剥前缀，
+    // 带码与不带码两种输入统一走同一判据，后人补码/漏码都不再打断分类。
+    let err = strip_inject_code(err);
     // 身份核验中止（2026-09-26 评审 I1 回执面）：文案里的「手动切题」是在描述用户的
     // 操作、不是中止发生在切题段——必须先于切题臂匹配，否则切勾失败被误标 advance。
     if err.contains("手机卡片不一致") {
@@ -7072,7 +7094,9 @@ where
         if let Some(lines) = probe() {
             match crate::inject::question::probe_review_screen(&lines) {
                 ScreenStep::Ready(l) => return Ok(Some(l)),
-                ScreenStep::Fatal(why) => return Err(format!("{why}；请人工核对终端")),
+                ScreenStep::Fatal(why) => {
+                    return Err(format!("INJECT_MANUAL_CHECK: {why}；请人工核对终端"))
+                }
                 ScreenStep::NotYet(_) => {}
             }
         }
@@ -8021,7 +8045,7 @@ pub async fn session_mode_menu(
                     StatusCode::OK,
                     serde_json::json!({
                         "status": "failed",
-                        "error": "投递进行中，请稍后重试"
+                        "error": "RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"
                     }),
                 ),
             ),
@@ -8068,7 +8092,7 @@ pub async fn session_mode_menu(
     let pick_tool = tool.clone();
     let r = tokio::task::spawn_blocking(move || -> Result<PickOutcome, String> {
         let Some(_guard) = crate::inject::queue::try_acquire_inflight(&pick_sid) else {
-            return Err("投递进行中，请稍后重试".to_string());
+            return Err("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试".to_string());
         };
         let key_delay = || {
             std::thread::sleep(std::time::Duration::from_millis(
@@ -8819,7 +8843,7 @@ pub async fn session_mode_switch(
                 StatusCode::OK,
                 serde_json::json!({
                     "status": "failed",
-                    "error": "投递进行中，请稍后重试"
+                    "error": "RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"
                 }),
             );
         }
@@ -9141,7 +9165,10 @@ fn menu_stages(
         // 非 Windows 无屏读 → 菜单路径无法定位（数字直达与闭环导航都必须屏读）。
         // **如实回执**：不盲发（猜错会选到别的档——与导航的保守面同源）。
         let _ = (tool, group, target, open_cmd, pid, spec, injector);
-        Err("本平台无屏读，权限菜单无法定位（命令已发送，请在终端选择档位）".to_string())
+        Err(
+            "RAPI_NO_SCREENREAD: 本平台无屏读，权限菜单无法定位（命令已发送，请在终端选择档位）"
+                .to_string(),
+        )
     }
     #[cfg(windows)]
     {
@@ -9289,18 +9316,24 @@ fn poll_menu_digit(pid: u32, target: crate::inject::mode::MamMode) -> Result<Str
             Ok(lines) => match crate::inject::mode::codex_permission_digit_probe(&lines, target) {
                 PollStep::Ready(digit) => return Ok(digit),
                 PollStep::Fatal(why) => {
-                    return Err(format!("{why}；请人工核对终端（命令已发送，档位未切）"))
+                    return Err(format!(
+                        "INJECT_MANUAL_CHECK: {why}；请人工核对终端（命令已发送，档位未切）"
+                    ))
                 }
                 PollStep::NotYet(why) => last = Some(why),
             },
-            Err(e) => last = Some(format!("权限菜单屏读失败（{e}）")),
+            Err(e) => {
+                last = Some(format!(
+                    "RAPI_PERMISSION_MENU_FAIL: 权限菜单屏读失败（{e}）"
+                ))
+            }
         }
         if i + 1 < rounds {
             std::thread::sleep(std::time::Duration::from_millis(POLL_STEP_MS));
         }
     }
     Err(format!(
-        "{}；请人工核对终端（命令已发送，档位未切）",
+        "INJECT_MANUAL_CHECK: {}；请人工核对终端（命令已发送，档位未切）",
         last.unwrap_or_else(|| "权限菜单窗内未读屏".to_string())
     ))
 }
@@ -9328,12 +9361,14 @@ fn poll_confirm_cluster(
                 ) {
                     PollStep::Ready((cluster, _)) => return Ok(Some(cluster)),
                     PollStep::Fatal(why) => {
-                        return Err(format!("{why}；请人工核对终端（Full Access 可能未生效）"))
+                        return Err(format!(
+                            "INJECT_MANUAL_CHECK: {why}；请人工核对终端（Full Access 可能未生效）"
+                        ))
                     }
                     PollStep::NotYet(why) => last = Some(why),
                 }
             }
-            Err(e) => last = Some(format!("确认框屏读失败（{e}）")),
+            Err(e) => last = Some(format!("RAPI_CONFIRM_SCREEN_FAIL: 确认框屏读失败（{e}）")),
         }
         if i + 1 < rounds {
             std::thread::sleep(std::time::Duration::from_millis(POLL_STEP_MS));
@@ -9353,7 +9388,7 @@ fn poll_confirm_cluster(
 fn poll_confirm_cluster(
     _pid: u32,
 ) -> Result<Option<Vec<crate::inject::dialog::DialogOption>>, String> {
-    Err("确认框屏读簇仅 Windows 支持".to_string())
+    Err("RAPI_CONFIRM_WINDOWS_ONLY: 确认框屏读簇仅 Windows 支持".to_string())
 }
 
 /// **平台中立读屏缝**（丁T3 同思路）：仅 Windows 有屏读实现；非 Windows 一律
@@ -9406,10 +9441,19 @@ fn poll_menu_stage(
         match crate::inject::windows_console::read_screen_window(pid) {
             Ok(lines) => match plan.probe(&lines) {
                 PollStep::Ready(_) => return Ok(Some(lines)),
-                PollStep::Fatal(why) => return Err(format!("{why}；请人工核对终端（{advice}）")),
+                PollStep::Fatal(why) => {
+                    return Err(format!(
+                        "RAPI_POLL_FATAL: {why}；请人工核对终端（{advice}）"
+                    ))
+                }
                 PollStep::NotYet(why) => last = Some(why),
             },
-            Err(e) => last = Some(format!("{}屏读失败（{e}）", plan.stage())),
+            Err(e) => {
+                last = Some(format!(
+                    "RAPI_SCREEN_READ_FAIL: {}屏读失败（{e}）",
+                    plan.stage()
+                ))
+            }
         }
         if i + 1 < rounds {
             std::thread::sleep(std::time::Duration::from_millis(POLL_STEP_MS));
@@ -9424,7 +9468,9 @@ fn poll_menu_stage(
         log::debug!("{}：窗内未出现（{last}）→ 按回执核验", plan.stage());
         return Ok(None);
     }
-    Err(format!("{last}；请人工核对终端（{advice}）"))
+    Err(format!(
+        "RAPI_SCREEN_FATAL_RETRY: {last}；请人工核对终端（{advice}）"
+    ))
 }
 
 /// 轮询屏读**工具自己的成功回执行**（`receipt_seen`）。
@@ -11429,13 +11475,28 @@ mod tests {
     #[test]
     fn stage_from_abort_maps_each_orchestrator_literal() {
         let cases: &[(&str, &str)] = &[
+            // 【码前缀统一入口回归锁（评审 C2）】生产真串带 INJECT_SCREEN_ABORT 码
+            // （question.rs 1466/1577/1582/1917 四处）——strip 后必须仍命中原段名臂，
+            // 不得落到「理论上不可达」的 submit-row 兜底。用手抄码前缀锁形态。
+            (
+                "INJECT_SCREEN_ABORT: codex 备注：读不到屏幕——已中止，未发任何键；请人工核对终端",
+                QUESTION_STAGE_FREE_ROW,
+            ),
+            (
+                "INJECT_SCREEN_ABORT: codex：读不到屏——已中止，未发任何键；请人工核对终端",
+                "select",
+            ),
+            (
+                "INJECT_DELIVERY_FAIL: 走位键 down 投递失败（注入通道拒绝）",
+                QUESTION_STAGE_SUBMIT_ROW,
+            ),
             // 切勾（toggle）——含身份核验（文案带「切题」但在描述用户行为，不是切题段）
             (
                 "屏幕上的题目与手机卡片不一致（可能已在终端手动切题）——已中止，未发任何键；请在终端回到当前题目后重试",
                 QUESTION_STAGE_TOGGLE,
             ),
             (
-                "读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
+                "INJECT_SCREEN_ABORT: 读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
                 QUESTION_STAGE_TOGGLE,
             ),
             (
@@ -11453,7 +11514,7 @@ mod tests {
             // 切题（advance）——「切题前读不到问答屏」同时含「问答屏」（切勾臂词）与
             // 「切题」（切题臂词）：切题臂在前是**有意的段归属**（切题编排的中止归切题段）
             (
-                "切题前读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
+                "INJECT_SCREEN_ABORT: 切题前读不到问答屏（屏读窗尽或不可用）——已中止，未发任何键；请人工核对终端",
                 QUESTION_STAGE_ADVANCE,
             ),
             (
@@ -11470,11 +11531,11 @@ mod tests {
             ),
             // 2026-10-02 ←/→ 双向导航（走位+回车路径退役，其文案随之删除）
             (
-                "切题：←/→ 后读不到屏幕——无法确认是否切题；请人工核对终端",
+                "INJECT_SCREEN_ABORT: 切题：←/→ 后读不到屏幕——无法确认是否切题；请人工核对终端",
                 QUESTION_STAGE_ADVANCE,
             ),
             (
-                "切题：↑ 后读不到屏幕——已中止，未发 ←/→；请人工核对终端",
+                "INJECT_SCREEN_ABORT: 切题：↑ 后读不到屏幕——已中止，未发 ←/→；请人工核对终端",
                 QUESTION_STAGE_ADVANCE,
             ),
             (
@@ -11517,7 +11578,7 @@ mod tests {
             // codex select 链（评审 P2-7）——含「空格」的末题归零闸文案必须归
             // select 而非 toggle-row（codex 臂先于通用切勾臂的有意排序）
             (
-                "codex：读不到屏——已中止，未发任何键；请人工核对终端",
+                "INJECT_SCREEN_ABORT: codex：读不到屏——已中止，未发任何键；请人工核对终端",
                 "select",
             ),
             (
@@ -11574,7 +11635,7 @@ mod tests {
             ),
             // codex 切题链
             (
-                "codex 切题：读不到面板——已中止，未发任何键；请核对终端",
+                "INJECT_SCREEN_ABORT: codex 切题：读不到面板——已中止，未发任何键；请核对终端",
                 QUESTION_STAGE_ADVANCE,
             ),
             (

@@ -252,7 +252,10 @@ pub fn migrate_legacy_agents_links(
     mode: String,
 ) -> Result<Vec<crate::services::resource::migration::MigrationItemReport>, String> {
     if mode != "migrate" && mode != "keep" {
-        return Err(format!("未知模式: {}（仅支持 migrate | keep）", mode));
+        return Err(format!(
+            "RESOURCE_UNKNOWN_MODE: 未知模式: {}（仅支持 migrate | keep）",
+            mode
+        ));
     }
     Ok(crate::services::resource::migration::migrate_legacy_links(
         &migration_paths(),
@@ -677,7 +680,7 @@ pub fn cleanup_duplicate_skills(tool_id: String, names: Vec<String>) -> Result<(
         .join(".tuvis")
         .join("skills");
     let tool_skill_dir = crate::adapter::primary_skill_dir(&tool_id)
-        .ok_or_else(|| format!("未知工具: {}", tool_id))?;
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
 
     let mut cleaned = 0;
     let mut errors = Vec::new();
@@ -750,7 +753,7 @@ fn remove_skill_target(target: &std::path::Path) -> Result<String, String> {
     if target_type == "symlink" {
         crate::linker::remove_link(target)?;
     } else {
-        trash::delete(target).map_err(|e| format!("移入回收站失败: {}", e))?;
+        trash::delete(target).map_err(|e| format!("RESOURCE_TRASH_FAIL: 移入回收站失败: {}", e))?;
     }
     Ok(target_type.to_string())
 }
@@ -761,7 +764,7 @@ pub fn disable_skill_for_tool(tool_id: String, skill_name: String) -> Result<Str
     // W5：未勾选工具的资源管理操作直接拒绝（数据保留在 DB）
     crate::services::tool_settings::ensure_tool_enabled(&tool_id)?;
     let tool_skill_dir = crate::adapter::primary_skill_dir(&tool_id)
-        .ok_or_else(|| format!("未知工具: {}", tool_id))?;
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
     // skill_name 由前端从 list_*/detect 的展示名回传，可能是 Windows 原生 `\` → 入口
     // 归一（spec §8.1，2026-10-13 评审跟进二批）：下面的拍平派发、Layer2/3 解链、账本 id
     // 三处都要求斜杠口径，否则解错路径（嵌套路径 vs 拍平链接）并留下反斜杠无主账本行
@@ -769,7 +772,7 @@ pub fn disable_skill_for_tool(tool_id: String, skill_name: String) -> Result<Str
     // 工具目录目标按拍平名定位（派发拍平，2026-09-17 裁决）
     let target = crate::linker::dispatch_target(&tool_skill_dir, &slashed);
     if !target.exists() && !target.is_symlink() {
-        return Err("目标路径不存在".to_string());
+        return Err("RESOURCE_TARGET_MISSING: 目标路径不存在".to_string());
     }
 
     let target_type = remove_skill_target(&target)?;
@@ -864,7 +867,10 @@ pub fn import_mcp_to_ssot(mcp_name: String) -> Result<(), String> {
         }
     }
 
-    Err(format!("未在任何工具配置中找到 MCP: {}", mcp_name))
+    Err(format!(
+        "RESOURCE_MCP_NOT_FOUND: 未在任何工具配置中找到 MCP: {}",
+        mcp_name
+    ))
 }
 
 /// 创建/更新 MCP 配置到 SSOT 仓库
@@ -919,11 +925,11 @@ fn resolve_tool_resource_path(
     match kind {
         "skill" => crate::adapter::primary_skill_dir(tool_id)
             .map(|p| (p, false))
-            .ok_or_else(|| format!("未知工具: {}", tool_id)),
+            .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id)),
         "mcp" => crate::services::mcp::tool_mcp_config_path(tool_id).map(|p| (p, true)),
         "plugin" => {
             let adapter = crate::adapter::adapter_by_id(tool_id)
-                .ok_or_else(|| format!("未知工具: {}", tool_id))?;
+                .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
             let dir = adapter
                 .plugin_dirs()
                 .first()
@@ -931,7 +937,7 @@ fn resolve_tool_resource_path(
                 .clone();
             Ok((dir, false))
         }
-        _ => Err(format!("未知资源类型: {}", kind)),
+        _ => Err(format!("RESOURCE_UNKNOWN_KIND: 未知资源类型: {}", kind)),
     }
 }
 
@@ -948,21 +954,21 @@ fn open_dir_in_system(path: &std::path::Path) -> Result<(), String> {
         let mut cmd = std::process::Command::new("explorer");
         cmd.arg(path);
         spawn_detached(&mut cmd, ConsoleMode::Detached)
-            .map_err(|e| format!("打开目录失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_DIR_FAIL: 打开目录失败: {}", e))?;
     }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
             .arg(path)
             .spawn()
-            .map_err(|e| format!("打开目录失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_DIR_FAIL: 打开目录失败: {}", e))?;
     }
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open")
             .arg(path)
             .spawn()
-            .map_err(|e| format!("打开目录失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_DIR_FAIL: 打开目录失败: {}", e))?;
     }
     let _ = path;
     Ok(())
@@ -979,21 +985,21 @@ fn open_file_in_system(path: &std::path::Path) -> Result<(), String> {
         let mut cmd = std::process::Command::new("cmd");
         cmd.args(["/C", "start", "", &path.to_string_lossy()]);
         spawn_detached(&mut cmd, ConsoleMode::Detached)
-            .map_err(|e| format!("打开文件失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_FILE_FAIL: 打开文件失败: {}", e))?;
     }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
             .arg(path)
             .spawn()
-            .map_err(|e| format!("打开文件失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_FILE_FAIL: 打开文件失败: {}", e))?;
     }
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open")
             .arg(path)
             .spawn()
-            .map_err(|e| format!("打开文件失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_FILE_FAIL: 打开文件失败: {}", e))?;
     }
     let _ = path;
     Ok(())
@@ -1010,11 +1016,15 @@ pub async fn open_tool_resource(tool_id: String, kind: String) -> Result<String,
     let (path, is_file) = resolve_tool_resource_path(&tool_id, &kind)?;
     if is_file {
         if !path.exists() {
-            return Err(format!("配置文件尚未创建: {}", path.display()));
+            return Err(format!(
+                "RESOURCE_CONFIG_NOT_CREATED: 配置文件尚未创建: {}",
+                path.display()
+            ));
         }
         open_file_in_system(&path)?;
     } else {
-        std::fs::create_dir_all(&path).map_err(|e| format!("创建目录失败: {}", e))?;
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("RESOURCE_MKDIR_FAIL: 创建目录失败: {}", e))?;
         open_dir_in_system(&path)?;
     }
     Ok(path.to_string_lossy().to_string())
@@ -1049,7 +1059,8 @@ pub fn ensure_reveal_allowed(path: &str) -> Result<std::path::PathBuf, String> {
     let p = std::path::Path::new(path);
     let lexically_allowed = raw_roots.iter().any(|r| p.starts_with(r));
     // canonicalize 对不存在路径失败 → 明确报不存在（而非静默放行/误报越界）
-    let canonical = std::fs::canonicalize(p).map_err(|_| format!("路径不存在: {}", path))?;
+    let canonical = std::fs::canonicalize(p)
+        .map_err(|_| format!("RESOURCE_PATH_NOT_FOUND: 路径不存在: {}", path))?;
     let root_canons: Vec<std::path::PathBuf> = raw_roots
         .iter()
         .filter_map(|r| std::fs::canonicalize(r).ok())

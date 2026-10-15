@@ -92,7 +92,7 @@ describe("computePetStatus", () => {
       const a = computePetStatus([mk(i, "thinking")], null, 0);
       return computePetStatus([mk(i, "idle")], a.state, 10).state;
     };
-    let state = { ...mkDone("d1"), ...mkDone("d2") };
+    const state = { ...mkDone("d1"), ...mkDone("d2") };
     const sess = [
       mk("w", "waiting"),
       mk("r1", "processing"),

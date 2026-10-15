@@ -43,19 +43,22 @@ const MAX_NAME_LEN: usize = 128;
 pub fn sanitize_export_name(name: &str) -> Result<String, String> {
     let n = name.trim();
     if n.is_empty() {
-        return Err("导出文件名不得为空".into());
+        return Err("EXPORT_NAME_EMPTY: 导出文件名不得为空".into());
     }
     if n.len() > MAX_NAME_LEN {
-        return Err(format!("导出文件名过长（>{} 字符）", MAX_NAME_LEN));
+        return Err(format!(
+            "EXPORT_NAME_TOO_LONG: 导出文件名过长（>{} 字符）",
+            MAX_NAME_LEN
+        ));
     }
     if n.starts_with('.') || n.contains("..") {
-        return Err("导出文件名不得以点开头或包含 ..".into());
+        return Err("EXPORT_NAME_DOT: 导出文件名不得以点开头或包含 ..".into());
     }
     if !n
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     {
-        return Err("导出文件名只允许字母、数字、点、下划线、连字符".into());
+        return Err("EXPORT_NAME_CHARSET: 导出文件名只允许字母、数字、点、下划线、连字符".into());
     }
     Ok(n.to_string())
 }
@@ -116,7 +119,7 @@ pub fn decode_base64_loose(s: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
     base64::engine::general_purpose::STANDARD
         .decode(cleaned.as_bytes())
-        .map_err(|e| format!("base64 解码失败: {e}"))
+        .map_err(|e| format!("EXPORT_B64_DECODE: base64 解码失败: {e}"))
 }
 
 /// base64 **载荷长度**（剥掉 `data:*;base64,` 前缀与全部空白后的字符数）。
@@ -153,9 +156,11 @@ pub fn save_text_file_in(
 ) -> Result<String, String> {
     let safe = sanitize_export_name(name)?;
     check_text_size(content)?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("创建导出目录失败: {e}"))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("EXPORT_MKDIR_FAIL: 创建导出目录失败: {e}"))?;
     let path = dir.join(&safe);
-    std::fs::write(&path, with_bom_if_csv(&safe, content)).map_err(|e| format!("写入失败: {e}"))?;
+    std::fs::write(&path, with_bom_if_csv(&safe, content))
+        .map_err(|e| format!("EXPORT_WRITE_FAIL: 写入失败: {e}"))?;
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -172,9 +177,10 @@ pub fn save_bytes_file_in(
             MAX_BINARY_BYTES
         ));
     }
-    std::fs::create_dir_all(dir).map_err(|e| format!("创建导出目录失败: {e}"))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("EXPORT_MKDIR_FAIL: 创建导出目录失败: {e}"))?;
     let path = dir.join(&safe);
-    std::fs::write(&path, bytes).map_err(|e| format!("写入失败: {e}"))?;
+    std::fs::write(&path, bytes).map_err(|e| format!("EXPORT_WRITE_FAIL: 写入失败: {e}"))?;
     Ok(path.to_string_lossy().to_string())
 }
 

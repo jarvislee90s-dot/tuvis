@@ -507,7 +507,9 @@ fn navigation_anchors(
     for (i, o) in options.iter().enumerate() {
         if o.highlighted {
             if hl.is_some() {
-                return Err("对话框有多行高亮标记，形态异常，不出手".to_string());
+                return Err(
+                    "INJECT_DIALOG_MALFORMED: 对话框有多行高亮标记，形态异常，不出手".to_string(),
+                );
             }
             hl = Some(i);
         }

@@ -8,7 +8,13 @@ export default tseslint.config(
     ignores: ["dist", "src-tauri", "node_modules"],
   },
   {
-    files: ["src/**/*.{ts,tsx}", "vite.config.ts", "vite.config.mobile.ts"],
+    files: [
+      "src/**/*.{ts,tsx}",
+      "tests/**/*.{ts,tsx}",
+      "scripts/*.mjs",
+      "vite.config.ts",
+      "vite.config.mobile.ts",
+    ],
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
     languageOptions: {
       ecmaVersion: 2020,
@@ -31,5 +37,5 @@ export default tseslint.config(
         { argsIgnorePattern: "^_", varsIgnorePattern: "^_", caughtErrorsIgnorePattern: "^_" },
       ],
     },
-  },
+  }
 );

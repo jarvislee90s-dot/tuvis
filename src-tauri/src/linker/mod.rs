@@ -108,16 +108,18 @@ pub fn create_link(source: &Path, target: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(source, target)
-            .map_err(|e| format!("创建 symlink 失败: {}", e))?;
+            .map_err(|e| format!("LINKER_SYMLINK_FAIL: 创建 symlink 失败: {}", e))?;
     }
 
     #[cfg(windows)]
     {
         // Windows: 目录用 Junction（纯 API 调用，不走 cmd，避免闪控制台窗口），文件用 copy
         if source.is_dir() {
-            junction::create(source, target).map_err(|e| format!("创建 Junction 失败: {}", e))?;
+            junction::create(source, target)
+                .map_err(|e| format!("LINKER_JUNCTION_FAIL: 创建 Junction 失败: {}", e))?;
         } else {
-            fs::copy(source, target).map_err(|e| format!("复制文件失败: {}", e))?;
+            fs::copy(source, target)
+                .map_err(|e| format!("LINKER_COPY_FAIL: 复制文件失败: {}", e))?;
         }
     }
 
@@ -148,16 +150,20 @@ pub fn remove_link(target: &Path) -> Result<(), String> {
             .map(|m| m.file_type().is_dir())
             .unwrap_or(false);
         if link_is_dir {
-            fs::remove_dir_all(target).map_err(|e| format!("移除目录链接失败: {}", e))?;
+            fs::remove_dir_all(target)
+                .map_err(|e| format!("LINKER_REMOVE_DIRLINK_FAIL: 移除目录链接失败: {}", e))?;
         } else {
-            fs::remove_file(target).map_err(|e| format!("移除 symlink 失败: {}", e))?;
+            fs::remove_file(target)
+                .map_err(|e| format!("LINKER_REMOVE_SYMLINK_FAIL: 移除 symlink 失败: {}", e))?;
         }
     } else if target.exists() {
         // 普通文件用 remove_file，目录 / Junction 用 remove_dir_all
         if target.is_dir() {
-            fs::remove_dir_all(target).map_err(|e| format!("移除目录失败: {}", e))?;
+            fs::remove_dir_all(target)
+                .map_err(|e| format!("LINKER_REMOVE_DIR_FAIL: 移除目录失败: {}", e))?;
         } else {
-            fs::remove_file(target).map_err(|e| format!("移除文件失败: {}", e))?;
+            fs::remove_file(target)
+                .map_err(|e| format!("LINKER_REMOVE_FILE_FAIL: 移除文件失败: {}", e))?;
         }
     }
     Ok(())
@@ -169,20 +175,31 @@ pub fn remove_link(target: &Path) -> Result<(), String> {
 /// 操作流程：删除 target 目录 → 创建符号链接 target → source
 pub fn replace_with_symlink(source: &Path, target: &Path) -> Result<(), String> {
     if !target.exists() {
-        return Err(format!("目标路径不存在: {}", target.display()));
+        return Err(format!(
+            "LINKER_TARGET_MISSING: 目标路径不存在: {}",
+            target.display()
+        ));
     }
     if target.is_symlink() {
-        return Err(format!("目标已是符号链接，无需清理: {}", target.display()));
+        return Err(format!(
+            "LINKER_ALREADY_LINK: 目标已是符号链接，无需清理: {}",
+            target.display()
+        ));
     }
     if !source.exists() {
-        return Err(format!("源路径不存在: {}", source.display()));
+        return Err(format!(
+            "LINKER_SOURCE_MISSING: 源路径不存在: {}",
+            source.display()
+        ));
     }
 
     // 删除原始目录
     if target.is_dir() {
-        std::fs::remove_dir_all(target).map_err(|e| format!("删除原始目录失败: {}", e))?;
+        std::fs::remove_dir_all(target)
+            .map_err(|e| format!("LINKER_DELETE_DIR_FAIL: 删除原始目录失败: {}", e))?;
     } else {
-        std::fs::remove_file(target).map_err(|e| format!("删除原始文件失败: {}", e))?;
+        std::fs::remove_file(target)
+            .map_err(|e| format!("LINKER_DELETE_FILE_FAIL: 删除原始文件失败: {}", e))?;
     }
 
     // 创建符号链接
@@ -196,7 +213,7 @@ pub fn install_to_repo(source: &Path, name: &str, overwrite: bool) -> Result<(),
     // 路径穿越检查：解析源路径，验证不在敏感目录内
     let canonical = source
         .canonicalize()
-        .map_err(|e| format!("路径解析失败: {}", e))?;
+        .map_err(|e| format!("LINKER_RESOLVE_FAIL: 路径解析失败: {}", e))?;
     let sensitive_paths = [
         ".ssh",
         ".gnupg",
@@ -212,12 +229,15 @@ pub fn install_to_repo(source: &Path, name: &str, overwrite: bool) -> Result<(),
     for sensitive in &sensitive_paths {
         let sensitive_path = home.join(sensitive);
         if canonical.starts_with(&sensitive_path) {
-            return Err(format!("安全检查失败：源路径在敏感目录内: {}", sensitive));
+            return Err(format!(
+                "LINKER_SENSITIVE_PATH: 安全检查失败：源路径在敏感目录内: {}",
+                sensitive
+            ));
         }
     }
     // 验证目标名称不含路径穿越字符
     if name.contains("..") || name.contains('\\') {
-        return Err("Skill 名称包含非法字符".to_string());
+        return Err("LINKER_NAME_INVALID: Skill 名称包含非法字符".to_string());
     }
 
     let repo = ensure_repo_dir();
@@ -225,13 +245,15 @@ pub fn install_to_repo(source: &Path, name: &str, overwrite: bool) -> Result<(),
 
     if dest.exists() {
         if !overwrite {
-            return Err(format!("已存在同名资源: {}", name));
+            return Err(format!("LINKER_NAME_TAKEN: 已存在同名资源: {}", name));
         }
         // 按 dest 类型清理：目录用 remove_dir_all，文件用 remove_file
         if dest.is_dir() {
-            fs::remove_dir_all(&dest).map_err(|e| format!("清理旧目录失败: {}", e))?;
+            fs::remove_dir_all(&dest)
+                .map_err(|e| format!("LINKER_CLEAN_DIR_FAIL: 清理旧目录失败: {}", e))?;
         } else {
-            fs::remove_file(&dest).map_err(|e| format!("清理旧文件失败: {}", e))?;
+            fs::remove_file(&dest)
+                .map_err(|e| format!("LINKER_CLEAN_FILE_FAIL: 清理旧文件失败: {}", e))?;
         }
     }
 
@@ -243,15 +265,17 @@ pub fn install_to_repo(source: &Path, name: &str, overwrite: bool) -> Result<(),
 /// 原子写入文件（write-to-temp + rename）
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     let temp = path.with_extension("tmp");
-    fs::write(&temp, content).map_err(|e| format!("写入临时文件失败: {}", e))?;
-    fs::rename(&temp, path).map_err(|e| format!("重命名失败: {}", e))?;
+    fs::write(&temp, content)
+        .map_err(|e| format!("LINKER_WRITE_TEMP_FAIL: 写入临时文件失败: {}", e))?;
+    fs::rename(&temp, path).map_err(|e| format!("LINKER_RENAME_FAIL: 重命名失败: {}", e))?;
     Ok(())
 }
 
 /// 对配置文件加排他锁后执行原子写入，防止多个 兔维斯 实例并发写同一配置
 pub fn write_config_locked(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("RESOURCE_MKDIR_FAIL: 创建目录失败: {}", e))?;
     }
     let file = fs::OpenOptions::new()
         .create(true)
@@ -259,13 +283,14 @@ pub fn write_config_locked(path: &Path, content: &str) -> Result<(), String> {
         .write(true)
         .read(true)
         .open(path)
-        .map_err(|e| format!("打开配置文件失败: {}", e))?;
+        .map_err(|e| format!("LINKER_OPEN_CONFIG_FAIL: 打开配置文件失败: {}", e))?;
     file.lock_exclusive()
-        .map_err(|e| format!("获取文件锁失败: {}", e))?;
+        .map_err(|e| format!("LINKER_FILE_LOCK_FAIL: 获取文件锁失败: {}", e))?;
     let result = (|| {
         let temp = path.with_extension("tmp");
-        fs::write(&temp, content).map_err(|e| format!("写入临时文件失败: {}", e))?;
-        fs::rename(&temp, path).map_err(|e| format!("重命名失败: {}", e))?;
+        fs::write(&temp, content)
+            .map_err(|e| format!("LINKER_WRITE_TEMP_FAIL: 写入临时文件失败: {}", e))?;
+        fs::rename(&temp, path).map_err(|e| format!("LINKER_RENAME_FAIL: 重命名失败: {}", e))?;
         Ok(())
     })();
     let _ = file.unlock();

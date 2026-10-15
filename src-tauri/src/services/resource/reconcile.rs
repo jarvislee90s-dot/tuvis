@@ -344,7 +344,7 @@ fn needs_manual(item: &DriftItem, message: String) -> ReconcileOutcome {
 fn from_result(res: Result<(), String>, item: &DriftItem, ok_message: String) -> ReconcileOutcome {
     match res {
         Ok(()) => fixed_do(item, ok_message),
-        Err(e) => failed(item, format!("处置失败: {}", e)),
+        Err(e) => failed(item, format!("RECONCILE_FAIL: 处置失败: {}", e)),
     }
 }
 
@@ -382,7 +382,7 @@ pub fn reconcile_one(item: &DriftItem, mode: &str) -> ReconcileOutcome {
                     where_at, e
                 ),
             ),
-            Err(e) => failed(item, format!("处置失败: {}", e)),
+            Err(e) => failed(item, format!("RECONCILE_FAIL: 处置失败: {}", e)),
         },
         ("L2", "b") => from_result(
             crate::database::upsert_assignment(&item.extension_id, &item.tool_id, false, "missing"),

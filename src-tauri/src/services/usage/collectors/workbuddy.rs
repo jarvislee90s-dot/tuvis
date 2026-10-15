@@ -295,7 +295,7 @@ pub fn collect_with_home(
         if db.exists() {
             return Err(UsageError::new(
                 "usage-source-io",
-                format!("打开 {} 失败（库文件存在但不可读）", db.display()),
+                format!("open {} failed (db exists but unreadable)", db.display()),
             ));
         }
         return Ok(SourceDelta::default()); // 未安装 WorkBuddy：零产物不算失败
@@ -328,7 +328,7 @@ pub fn collect_with_home(
                 }
                 return Err(UsageError::new(
                     "usage-source-io",
-                    format!("读取 {} 失败: {e}", jsonl.display()),
+                    format!("read {} failed: {e}", jsonl.display()),
                 ));
             }
         };
@@ -466,7 +466,7 @@ fn load_sessions(
     let io_err = |e: &dyn std::fmt::Display| {
         UsageError::new(
             "usage-source-io",
-            format!("读取 {} 的 sessions 失败: {e}", db.display()),
+            format!("read sessions from {} failed: {e}", db.display()),
         )
     };
     let mut stmt = conn

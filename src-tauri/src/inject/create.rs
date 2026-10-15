@@ -226,7 +226,7 @@ pub fn find_tui_pid(
         }
         if t0.elapsed() >= timeout {
             return Err(format!(
-                "起窗后 {timeout:?} 内未发现 {tool} 进程（目录 {}）；\
+                "CREATE_WINDOW_TIMEOUT: 起窗后 {timeout:?} 内未发现 {tool} 进程（目录 {}）；\
                  若终端窗口确已弹出且进程在跑，疑似被 start_time 新鲜度过滤\
                  （见函数 doc 调用方契约）",
                 dir.display()

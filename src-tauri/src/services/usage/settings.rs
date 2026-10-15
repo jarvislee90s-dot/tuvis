@@ -27,7 +27,7 @@ pub fn merge_patch(
         if !(1..=7).contains(&v) {
             return Err(UsageError::new(
                 "usage-settings-invalid",
-                "浮窗分工具条数须在 1–7",
+                "floating bar tool count must be 1-7",
             ));
         }
         next.mini_bar_tool_rows = v;
@@ -36,7 +36,7 @@ pub fn merge_patch(
         if !(1..=3650).contains(&v) {
             return Err(UsageError::new(
                 "usage-settings-invalid",
-                "明细保留期须在 1–3650 天",
+                "detail retention must be 1-3650 days",
             ));
         }
         next.detail_retention_days = v;
@@ -45,7 +45,7 @@ pub fn merge_patch(
         if !(1..=1440).contains(&v) {
             return Err(UsageError::new(
                 "usage-settings-invalid",
-                "采集兜底间隔须在 1–1440 分钟",
+                "fallback collect interval must be 1-1440 min",
             ));
         }
         next.collect_interval_min = v;
@@ -54,7 +54,7 @@ pub fn merge_patch(
         if !v.trim().is_empty() && parse_provider_rules(v).is_empty() {
             return Err(UsageError::new(
                 "usage-settings-invalid",
-                "供应商映射规则必须是 {\"rules\":[{\"prefix\":…,\"provider\":…}]} 形态的 JSON",
+                "provider map must be JSON {\"rules\":[{\"prefix\":…,\"provider\":…}]}",
             ));
         }
         next.provider_map_rules = v.clone();
@@ -66,7 +66,7 @@ pub fn merge_patch(
         if v.trim().is_empty() {
             return Err(UsageError::new(
                 "usage-settings-invalid",
-                "分享图姿态不得为空串（随机请用 random）",
+                "share pose must be non-empty (use random)",
             ));
         }
         next.export_pose = v.clone();
@@ -115,13 +115,14 @@ pub fn load_from_conn(conn: &rusqlite::Connection) -> UsageSettings {
 /// 锁：`usage_ipc_test::set_settings_reports_persist_failure_instead_of_success`
 /// （用 `settings` 表上的 RAISE(ABORT) 触发器造真实写失败）。
 pub fn save(s: &UsageSettings) -> Result<(), UsageError> {
-    let json = serde_json::to_string(s)
-        .map_err(|e| UsageError::new("usage-db-failed", format!("用量设置序列化失败: {e}")))?;
+    let json = serde_json::to_string(s).map_err(|e| {
+        UsageError::new("usage-db-failed", format!("usage settings serialize: {e}"))
+    })?;
     set_setting(SETTINGS_KEY, &json);
     if get_setting(SETTINGS_KEY).as_deref() != Some(json.as_str()) {
         return Err(UsageError::new(
             "usage-db-failed",
-            format!("用量设置未能落库（写后回读不一致）：key={SETTINGS_KEY}"),
+            format!("usage settings write did not persist (readback mismatch): key={SETTINGS_KEY}"),
         ));
     }
     Ok(())

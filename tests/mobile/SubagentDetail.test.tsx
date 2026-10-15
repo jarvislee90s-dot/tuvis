@@ -9,10 +9,23 @@ import type { Session } from "@/types/session";
 // `await act(async () => {})` 冲刷初始加载的微任务链后改用同步 getBy* 断言。
 
 const baseSession: Session = {
-  id: "s1", agentType: "claude", projectName: "p", projectPath: "p", title: null,
-  gitBranch: null, githubUrl: null, status: "processing", lastMessage: null,
-  lastMessageRole: null, lastActivityAt: "2026-10-08T07:00:00Z", pid: 1, cpuUsage: 0,
-  activeSubagentCount: 0, form: "cli", jumpSupported: false, unread: false,
+  id: "s1",
+  agentType: "claude",
+  projectName: "p",
+  projectPath: "p",
+  title: null,
+  gitBranch: null,
+  githubUrl: null,
+  status: "processing",
+  lastMessage: null,
+  lastMessageRole: null,
+  lastActivityAt: "2026-10-08T07:00:00Z",
+  pid: 1,
+  cpuUsage: 0,
+  activeSubagentCount: 0,
+  form: "cli",
+  jumpSupported: false,
+  unread: false,
 };
 
 let fetchMock: ReturnType<typeof vi.fn>;
@@ -27,8 +40,7 @@ beforeEach(() => {
     "fetch",
     (fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (!url.includes("/session-subagent-messages"))
-        throw new Error(`unexpected fetch: ${url}`);
+      if (!url.includes("/session-subagent-messages")) throw new Error(`unexpected fetch: ${url}`);
       if (routes.fail) throw new TypeError("network down");
       return new Response(
         JSON.stringify({
@@ -49,8 +61,12 @@ afterEach(() => {
 
 function msg(p: Partial<Record<string, unknown>> & { seq: number; kind: string; content: string }) {
   return {
-    role: "assistant", ts: null, toolName: null, toolArgs: null,
-    collapsed: p.kind === "thinking" || p.kind === "tool-call", ...p,
+    role: "assistant",
+    ts: null,
+    toolName: null,
+    toolArgs: null,
+    collapsed: p.kind === "thinking" || p.kind === "tool-call",
+    ...p,
   };
 }
 
@@ -67,8 +83,13 @@ describe("SubagentDetail（实时预览对话框）", () => {
   it("supported=false → 明确「暂不支持查看详情」态，不渲染消息区（§三.6）", async () => {
     routes.body = { messages: [], supported: false };
     render(
-      <SubagentDetail session={baseSession} subagentId="x1" subagentName="Explore"
-        running={false} openFile={() => {}} />
+      <SubagentDetail
+        session={baseSession}
+        subagentId="x1"
+        subagentName="Explore"
+        running={false}
+        openFile={() => {}}
+      />
     );
     expect(await screen.findByTestId("subagent-detail-unsupported")).toBeTruthy();
     // 不渲染消息区：unsupported 时无任何消息条目（subagent-messages 容器是
@@ -79,15 +100,30 @@ describe("SubagentDetail（实时预览对话框）", () => {
   it("任务原文 + 消息渲染复用（thinking 默认折叠、点击展开）+ 工具行折叠（§三.2/§三.5）", async () => {
     routes.body = {
       messages: [
-        msg({ seq: 0, kind: "user", content: "<teammate-message teammate_id=\"team-lead\">设计新方案</teammate-message>" }),
+        msg({
+          seq: 0,
+          kind: "user",
+          content: '<teammate-message teammate_id="team-lead">设计新方案</teammate-message>',
+        }),
         msg({ seq: 1, kind: "thinking", content: "先看目录" }),
-        msg({ seq: 2, kind: "tool-call", content: "", toolName: "Bash", toolArgs: "{\"command\":\"ls\"}" }),
+        msg({
+          seq: 2,
+          kind: "tool-call",
+          content: "",
+          toolName: "Bash",
+          toolArgs: '{"command":"ls"}',
+        }),
         msg({ seq: 3, kind: "assistant", content: "已完成" }),
       ],
     };
     render(
-      <SubagentDetail session={baseSession} subagentId="a1" subagentName="Plan"
-        running={true} openFile={() => {}} />
+      <SubagentDetail
+        session={baseSession}
+        subagentId="a1"
+        subagentName="Plan"
+        running={true}
+        openFile={() => {}}
+      />
     );
     // 任务原文：首条 user 剥 teammate-message 壳（§三.2「任务原文=首条指令」）
     // （实施订正：await 须括住 findBy* 再取 textContent——计划稿写法先取
@@ -112,8 +148,13 @@ describe("SubagentDetail（实时预览对话框）", () => {
     vi.useFakeTimers();
     routes.body = { messages: [msg({ seq: 0, kind: "assistant", content: "步骤 1" })] };
     render(
-      <SubagentDetail session={baseSession} subagentId="a1" subagentName="Plan"
-        running={true} openFile={() => {}} />
+      <SubagentDetail
+        session={baseSession}
+        subagentId="a1"
+        subagentName="Plan"
+        running={true}
+        openFile={() => {}}
+      />
     );
     // findBy* 不推进 fake timers：act 冲刷初始加载，再同步断言
     await act(async () => {});
@@ -136,8 +177,13 @@ describe("SubagentDetail（实时预览对话框）", () => {
     vi.useFakeTimers();
     routes.body = { messages: [msg({ seq: 0, kind: "assistant", content: "终稿" })] };
     const { unmount } = render(
-      <SubagentDetail session={baseSession} subagentId="a1" subagentName="Plan"
-        running={false} openFile={() => {}} />
+      <SubagentDetail
+        session={baseSession}
+        subagentId="a1"
+        subagentName="Plan"
+        running={false}
+        openFile={() => {}}
+      />
     );
     // findBy* 不推进 fake timers：act 冲刷初始加载，再同步断言
     await act(async () => {});
@@ -157,8 +203,13 @@ describe("SubagentDetail（实时预览对话框）", () => {
   it("加载失败 → 错误文案 + 手动重试（M3 评审修复：定格快照的临时失败不再死局）", async () => {
     routes.fail = true;
     render(
-      <SubagentDetail session={baseSession} subagentId="a1" subagentName="Plan"
-        running={false} openFile={() => {}} />
+      <SubagentDetail
+        session={baseSession}
+        subagentId="a1"
+        subagentName="Plan"
+        running={false}
+        openFile={() => {}}
+      />
     );
     expect(await screen.findByTestId("subagent-detail-error")).toBeTruthy();
     expect(screen.getByTestId("subagent-detail-retry")).toBeTruthy();

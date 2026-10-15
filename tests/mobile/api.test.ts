@@ -99,10 +99,10 @@ describe("mobile api", () => {
   it("fetchArchivedSessions 携带 days 且解析载荷", async () => {
     const f = vi.fn(
       async () =>
-        new Response(
-          JSON.stringify({ archived: [], projects: ["p1"] }),
-          { status: 200, headers: { "content-type": "application/json" } }
-        )
+        new Response(JSON.stringify({ archived: [], projects: ["p1"] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        })
     );
     vi.stubGlobal("fetch", f);
     const p = await fetchArchivedSessions(7);
@@ -111,7 +111,10 @@ describe("mobile api", () => {
   });
 
   it("fetchArchivedSessions 403 → null（回配对页口径与 fetchSessions 一致）", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status: 403 })));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("", { status: 403 }))
+    );
     expect(await fetchArchivedSessions(1)).toBeNull();
   });
 

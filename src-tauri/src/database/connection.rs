@@ -101,7 +101,7 @@ pub fn init() {
 /// 打开新连接（少数场景使用）
 pub fn open() -> Result<Connection, String> {
     let db_path = app_data_home().join(".tuvis").join("tuvis.db");
-    Connection::open(&db_path).map_err(|e| format!("打开数据库失败: {}", e))
+    Connection::open(&db_path).map_err(|e| format!("DB_OPEN_FAIL: 打开数据库失败: {}", e))
 }
 
 /// **Task 16 Step 2 的锁（锁表第 1 条「路径隔离」）**：`cfg(test)` 下解析出的 app 数据
