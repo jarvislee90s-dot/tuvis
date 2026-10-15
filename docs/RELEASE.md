@@ -21,6 +21,8 @@ pnpm tauri signer generate -w ~/.tuvis/tauri.key   # 密码直接回车留空
 
 ## 每次发版步骤
 
+0. **中英对照检查**：按 `AGENTS.md`「发版中英对照纪律」核对全部双语资产（前端 locale、双语
+   README、用户手册 zh/en），本轮中文改动的英文侧未对齐先补齐，再进入下面步骤
 1. 写更新说明：`docs/release-notes/vX.Y.Z.md`（只写更新内容）
 2. 提交：`git add docs/release-notes/vX.Y.Z.md && git commit -m "docs: add release notes vX.Y.Z"`
 3. 发版：`pnpm release:version` → 选择同一版本号 → 确认后自动提交版本文件、打 tag、push

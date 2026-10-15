@@ -14,6 +14,22 @@
 - 代码标识符使用英文，代码注释尽量使用中文
 - Git commit message 可使用英文
 
+## 发版中英对照纪律（2026-10-16 用户裁决）
+
+**每次发布正式版前，至少完整做一轮中英对照检查**，覆盖全部双语资产；本轮带中文改动的条目，
+英文侧必须同步刷新（经用户确认后可由代理翻译），未对齐不得打 tag：
+
+| 双语资产 | 中文侧 | 英文侧 | 说明 |
+| --- | --- | --- | --- |
+| 前端页面文案 | `src/i18n/locales/zh.json` | `src/i18n/locales/en.json` | `pnpm check:i18n` 只保**键集**一致，键下的英文值漂移不报，须逐键比对 |
+| 项目 README | `README.md` | `README.en.md` | 无门禁，人工/代理核对 |
+| 用户手册（官网 `/docs` 挂载） | `docs/user-manual/zh/`（13 章） | `docs/user-manual/en/` | 无门禁；en 曾为骨架，至少核对本版有变动的章节 |
+
+检查方法：对上一版 tag 执行 `git diff vX.Y.Z..HEAD -- <上述路径>`，列出本轮全部中文改动逐条核对。
+配套的发版同步义务（单语，不涉对照）：`docs/capabilities.json` 与 README「多终端能力矩阵」
+**两处随发版同步更新**（官网拉取前者渲染兼容矩阵）；`CHANGELOG.md` 与
+`docs/release-notes/vX.Y.Z.md` 为纯中文产物，不要求英文对照。
+
 ## 技术栈
 - Tauri 2 + Rust + React 19 + TypeScript + shadcn/ui + Tailwind CSS v4
 
