@@ -403,7 +403,7 @@ describe("MessageComposer：发送与回执（W4）", () => {
     fireEvent.change(input, { target: { value: "再来一次" } });
     fireEvent.click(screen.getByTestId("composer-send"));
     const chip = await screen.findByTestId("send-receipt-failed");
-    expect(chip.textContent).toContain("发送失败");
+    expect(chip.textContent).toContain("Send failed");
     expect(chip.textContent).toContain("定位终端失败：tmux 会话不存在");
     // 失败不清空输入（保留原文供重试）
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("再来一次");
@@ -912,9 +912,9 @@ describe("直发确认分诊回执（D7/T3）", () => {
     fireEvent.change(input, { target: { value: "滞留真失败" } });
     fireEvent.click(screen.getByTestId("composer-send"));
     const chip = await screen.findByTestId("send-receipt-failed");
-    expect(chip.textContent).toContain("发送失败");
+    expect(chip.textContent).toContain("Send failed");
     expect(chip.textContent).toContain("已注入未确认（未见会话记录），请检查终端后重试");
-    expect(chip.textContent).toContain("（可重试）");
+    expect(chip.textContent).toContain("(retry available)");
     // 分诊两态不混淆：failed 不得渲染成 submitted 中性 chip
     expect(screen.queryByTestId("send-receipt-submitted")).toBeNull();
   });

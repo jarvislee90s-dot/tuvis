@@ -44,7 +44,9 @@ function cleanStaleDepCache() {
     .filter((d) => d.at > cacheAt);
   if (deps.length === 0) return;
   rmSync(VITE_CACHE, { recursive: true, force: true });
-  say(`依赖已变更（${deps.map((d) => d.f).join(" / ")} 比预打包缓存新）→ 已清理 node_modules/.vite`);
+  say(
+    `依赖已变更（${deps.map((d) => d.f).join(" / ")} 比预打包缓存新）→ 已清理 node_modules/.vite`
+  );
 }
 
 /** 这个 PID 是不是**本仓自己的** vite（按命令行判断，避免误杀别人的软件） */
@@ -65,10 +67,9 @@ function killStaleDevApp() {
   if (process.platform === "win32") return;
   let pids = "";
   try {
-    pids = execSync(
-      `pgrep -f "${ROOT}/src-tauri/target/debug/(multi-agents-manager|tuvis)"`,
-      { encoding: "utf8" }
-    ).trim();
+    pids = execSync(`pgrep -f "${ROOT}/src-tauri/target/debug/(multi-agents-manager|tuvis)"`, {
+      encoding: "utf8",
+    }).trim();
   } catch {
     return; // pgrep 无命中即退出码 1
   }
@@ -109,7 +110,9 @@ async function takeOverPort() {
   if (v4 === "free" && v6 === "free") return; // 端口没人占，直接开
 
   if (process.platform === "win32") {
-    say(`${PORT} 已被占用（${alive ? "有应答" : "无应答"}）；Windows 请手动结束它（任务管理器找 node.exe）`);
+    say(
+      `${PORT} 已被占用（${alive ? "有应答" : "无应答"}）；Windows 请手动结束它（任务管理器找 node.exe）`
+    );
     return;
   }
   let pids = "";
@@ -127,7 +130,10 @@ async function takeOverPort() {
   // 现在：本仓 vite ⇒ 结束它并继续（`pnpm tauri:dev` 的语义变成「总是给你一个干净的新会话」）；
   //       不是本仓的进程 ⇒ **不动手**，打印清楚原因并让启动停下来。
   const ours = pids.split("\n").filter(Boolean).filter(isOurVite);
-  const others = pids.split("\n").filter(Boolean).filter((p) => !isOurVite(p));
+  const others = pids
+    .split("\n")
+    .filter(Boolean)
+    .filter((p) => !isOurVite(p));
   if (ours.length === 0) {
     say(`${PORT} 被**别的程序**占着（PID ${others.join(", ")}），不是本仓的 dev server ⇒ 不接管。`);
     say(`请先结束它，或改端口后再跑 pnpm tauri:dev。`);
@@ -136,7 +142,9 @@ async function takeOverPort() {
   for (const pid of ours) {
     try {
       process.kill(Number(pid), "SIGKILL");
-      say(`接管 ${PORT}：结束上一次会话的 vite（PID ${pid}）${alive ? "（它还在应答）" : "（已无应答）"}`);
+      say(
+        `接管 ${PORT}：结束上一次会话的 vite（PID ${pid}）${alive ? "（它还在应答）" : "（已无应答）"}`
+      );
     } catch (e) {
       say(`结束 PID ${pid} 失败：${e.message}`);
     }

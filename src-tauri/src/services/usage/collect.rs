@@ -1410,7 +1410,7 @@ mod tests {
                 UsageSourceId::Codex
             }
             fn collect(&self, _ctx: &CollectContext<'_>) -> Result<SourceDelta, UsageError> {
-                Err(UsageError::new("usage-source-io", "毒行"))
+                Err(UsageError::new("usage-source-io", "poisoned row"))
             }
         }
         struct ApplyFails;
@@ -1855,7 +1855,7 @@ mod tests {
     /// 日聚合由 `ledger::daily_rows_of` 从明细行折叠，落库路径不需要跟着改。
     ///
     /// **第 15 轮同步（2026-10-13 集成测试采集读源缝 `TUVIS_USAGE_FIXTURE_ROOT`）**：
-    /// 7234/156289 → **7239/156516**（**+5 行 / +227 字符**）。变化**只来自 `collect.rs`
+    /// 7234/156289 → **7239/156516** → 7239/156596 → 7238/156598（PR #158 N5 detail 机器化 +80 字符；cargo fmt 合并多行 format! −1 行/+2 字符）。变化**只来自 `collect.rs`
     /// 生产半边**的 `run_collection` 扫描根解析块——`#[cfg(not(test))]` 单臂换成三分支
     /// cfg（test 保持 lib 拒绝闸半边原样 / ¬test∧debug_assertions 读环境变量覆盖 /
     /// 其余构建原样 `dirs::home_dir()`）；函数其余逐字未改，无新增文件、排除区标记未动、
@@ -1872,7 +1872,7 @@ mod tests {
         }
         assert_eq!(
             (lines, chars),
-            (7239, 156516),
+            (7238, 156598),
             "判据面尺寸变了（实测 {lines} 行 / {chars} 字符）：本用例是**声明 = 实际**的钉子——\
              先弄清面为什么变（新增文件？改了排除区标记？动了生产代码？），再同步本常量、\
              `no_source_timezone_is_fed_into_any_key_function` 的锁注释、`KNOWN-PLAN-DEFECTS.md` \

@@ -680,7 +680,7 @@ pub fn cleanup_duplicate_skills(tool_id: String, names: Vec<String>) -> Result<(
         .join(".tuvis")
         .join("skills");
     let tool_skill_dir = crate::adapter::primary_skill_dir(&tool_id)
-        .ok_or_else(|| format!("未知工具: {}", tool_id))?;
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
 
     let mut cleaned = 0;
     let mut errors = Vec::new();
@@ -764,7 +764,7 @@ pub fn disable_skill_for_tool(tool_id: String, skill_name: String) -> Result<Str
     // W5：未勾选工具的资源管理操作直接拒绝（数据保留在 DB）
     crate::services::tool_settings::ensure_tool_enabled(&tool_id)?;
     let tool_skill_dir = crate::adapter::primary_skill_dir(&tool_id)
-        .ok_or_else(|| format!("未知工具: {}", tool_id))?;
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
     // skill_name 由前端从 list_*/detect 的展示名回传，可能是 Windows 原生 `\` → 入口
     // 归一（spec §8.1，2026-10-13 评审跟进二批）：下面的拍平派发、Layer2/3 解链、账本 id
     // 三处都要求斜杠口径，否则解错路径（嵌套路径 vs 拍平链接）并留下反斜杠无主账本行
@@ -925,11 +925,11 @@ fn resolve_tool_resource_path(
     match kind {
         "skill" => crate::adapter::primary_skill_dir(tool_id)
             .map(|p| (p, false))
-            .ok_or_else(|| format!("未知工具: {}", tool_id)),
+            .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id)),
         "mcp" => crate::services::mcp::tool_mcp_config_path(tool_id).map(|p| (p, true)),
         "plugin" => {
             let adapter = crate::adapter::adapter_by_id(tool_id)
-                .ok_or_else(|| format!("未知工具: {}", tool_id))?;
+                .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
             let dir = adapter
                 .plugin_dirs()
                 .first()

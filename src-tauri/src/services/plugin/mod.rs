@@ -67,8 +67,8 @@ pub fn enable_file_plugin(plugin_name: &str, tool_id: &str) -> Result<(), String
         ));
     }
 
-    let adapter =
-        crate::adapter::adapter_by_id(tool_id).ok_or_else(|| format!("未知工具: {}", tool_id))?;
+    let adapter = crate::adapter::adapter_by_id(tool_id)
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
 
     let plugin_dirs = adapter.plugin_dirs();
     if plugin_dirs.is_empty() {
@@ -91,8 +91,8 @@ pub fn enable_file_plugin(plugin_name: &str, tool_id: &str) -> Result<(), String
 
 /// 为工具禁用文件型插件（移除 symlink）
 pub fn disable_file_plugin(plugin_name: &str, tool_id: &str) -> Result<(), String> {
-    let adapter =
-        crate::adapter::adapter_by_id(tool_id).ok_or_else(|| format!("未知工具: {}", tool_id))?;
+    let adapter = crate::adapter::adapter_by_id(tool_id)
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
 
     let plugin_dirs = adapter.plugin_dirs();
     if plugin_dirs.is_empty() {
@@ -118,8 +118,8 @@ pub fn enable_config_plugin(
     tool_id: &str,
     entries: &BTreeMap<String, serde_json::Value>,
 ) -> Result<(), String> {
-    let adapter =
-        crate::adapter::adapter_by_id(tool_id).ok_or_else(|| format!("未知工具: {}", tool_id))?;
+    let adapter = crate::adapter::adapter_by_id(tool_id)
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
 
     let config_paths = adapter.plugin_config_paths();
     if config_paths.is_empty() {
@@ -214,8 +214,8 @@ pub fn enable_config_plugin(
 
 /// 为工具禁用配置型插件（从配置文件中移除 plugins 段）
 pub fn disable_config_plugin(plugin_name: &str, tool_id: &str) -> Result<(), String> {
-    let adapter =
-        crate::adapter::adapter_by_id(tool_id).ok_or_else(|| format!("未知工具: {}", tool_id))?;
+    let adapter = crate::adapter::adapter_by_id(tool_id)
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
 
     let config_paths = adapter.plugin_config_paths();
     if config_paths.is_empty() {

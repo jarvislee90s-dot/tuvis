@@ -90,8 +90,7 @@ const macProbe = (over: Record<string, unknown> = {}) => ({
 const windowsProbe = (over: Record<string, unknown> = {}) =>
   macProbe({ platform: "windows", windowsVerifiedFrom: "detect", ...over });
 
-const stepRow = (id: string) =>
-  document.querySelector(`[data-step="${id}"]`) as HTMLElement;
+const stepRow = (id: string) => document.querySelector(`[data-step="${id}"]`) as HTMLElement;
 
 beforeEach(() => {
   invokeMock.mockReset();
@@ -121,9 +120,7 @@ describe("TailscaleWizard 步骤渲染与三态（§C2）", () => {
 
   it("需要人的步骤突出动作文案（后端 humanActionKey 下发 → 前端翻译上墙）", async () => {
     render(<TailscaleWizard />);
-    expect(
-      await screen.findByText(/prompt for the admin password/i)
-    ).toBeTruthy();
+    expect(await screen.findByText(/prompt for the admin password/i)).toBeTruthy();
     expect(screen.getByText(/approve the Tailscale system extension/i)).toBeTruthy();
     expect(screen.getByText(/complete Tailscale login in your browser/i)).toBeTruthy();
     expect(screen.getByText(/approve it once in your browser/i)).toBeTruthy();
@@ -768,9 +765,7 @@ describe("TailscaleWizard 单步触发（remote_ts_run_step）", () => {
   it("可执行步出「Run」按钮，点击调 remote_ts_run_step 并在回执后重探一次", async () => {
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
-    const probesBefore = invokeMock.mock.calls.filter(
-      (c) => c[0] === "remote_ts_probe"
-    ).length;
+    const probesBefore = invokeMock.mock.calls.filter((c) => c[0] === "remote_ts_probe").length;
     fireEvent.click(within(stepRow("shields_up")).getByRole("button", { name: /run/i }));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("remote_ts_run_step", { step: "shields_up" })
@@ -798,9 +793,7 @@ describe("TailscaleWizard 单步触发（remote_ts_run_step）", () => {
     const link = within(stepRow("login")).getByTestId("ts-auth-link") as HTMLAnchorElement;
     expect(link.getAttribute("href")).toBe("https://login.tailscale.com/a/abc123");
     // 链接不是触发命令的按钮——login 步零 invoke
-    expect(
-      invokeMock.mock.calls.filter((c) => c[0] === "remote_ts_run_step").length
-    ).toBe(0);
+    expect(invokeMock.mock.calls.filter((c) => c[0] === "remote_ts_run_step").length).toBe(0);
   });
 
   it("funnel 回执带批准链接 → 展示批准提示与链接（兔维斯 只递不代点）", async () => {
@@ -820,7 +813,7 @@ describe("TailscaleWizard 单步触发（remote_ts_run_step）", () => {
 });
 
 describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () => {
-  it("reach=failed：verify 行显示「固定地址尚未生效」+ reason + 重试按钮；点重试调 remote_ts_run_step(\"verify\")", async () => {
+  it('reach=failed：verify 行显示「固定地址尚未生效」+ reason + 重试按钮；点重试调 remote_ts_run_step("verify")', async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "remote_ts_probe")
         return macProbe({
@@ -859,7 +852,8 @@ describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () =
   // 2026-10-13 真机定位：连不通类失败 = 公网链路瞬时抖动（60s 轮询自愈），重试门槛
   // 与安抚文案跟上——reason 前缀「地址已解析但连不通」锚定（与 reach.rs 格式串同步）
   it("reach=failed 且连不通类 reason → 「尚未生效」下挂瞬时抖动引导（ts-transient-hint）", async () => {
-    const unreachable = "REACH_ADDR_UNREACHABLE: 地址已解析但连不通（试了 2 条）: 103.84.155.153: error sending request";
+    const unreachable =
+      "REACH_ADDR_UNREACHABLE: 地址已解析但连不通（试了 2 条）: 103.84.155.153: error sending request";
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "remote_ts_probe")
         return macProbe({
@@ -1069,8 +1063,9 @@ describe("tailscale 卡展开区集成（Task 9 收敛：向导挂进卡片详�
   // detect 未完成 = 未安装态（卡面出「Set up in one click」入口）；autostart 恒完成
   const notInstalledProbe = () =>
     macProbe({
-      states: macProbe().states.map((s: { id: string; done: boolean; blockedReason: string | null }) =>
-        s.id === "autostart" ? s : { ...s, done: false }
+      states: macProbe().states.map(
+        (s: { id: string; done: boolean; blockedReason: string | null }) =>
+          s.id === "autostart" ? s : { ...s, done: false }
       ),
     });
 
@@ -1083,9 +1078,7 @@ describe("tailscale 卡展开区集成（Task 9 收敛：向导挂进卡片详�
       return null;
     });
     render(<RemoteSection />);
-    expect(
-      invokeMock.mock.calls.filter((c) => c[0] === "remote_ts_probe").length
-    ).toBe(0);
+    expect(invokeMock.mock.calls.filter((c) => c[0] === "remote_ts_probe").length).toBe(0);
     fireEvent.click(document.querySelector('[data-card="tailscale"]')!);
     await waitFor(() =>
       expect(invokeMock.mock.calls.some((c) => c[0] === "remote_ts_probe")).toBe(true)

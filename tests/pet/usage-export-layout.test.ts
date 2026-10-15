@@ -32,7 +32,14 @@ import {
 const measure: MeasureText = (text) => text.length * 10;
 
 /** 版式钉死值：任何一个变了都要先回改 brief，不是「顺手调一下」 */
-const LAYOUT_CONSTANTS = { EXPORT_W: 720, M: 24, PAD: 32, CW: 608, EXPORT_PET_H: 360, EXPORT_MIN_H: 1560 };
+const LAYOUT_CONSTANTS = {
+  EXPORT_W: 720,
+  M: 24,
+  PAD: 32,
+  CW: 608,
+  EXPORT_PET_H: 360,
+  EXPORT_MIN_H: 1560,
+};
 
 /** 固定浅色版的三个钉死取值（分享图不读 CSS 变量；气泡底色不是「忘了走 token」） */
 const LAYOUT_COLORS = { PAGE: "#f5f6f8", CARD: "#ffffff", BUBBLE_BG: "#fffdf9" };
@@ -85,7 +92,10 @@ function baseInput(over: Partial<ExportInput> = {}): ExportInput {
   };
 }
 
-const stepsOf = (l: ExportLayout, kind: ExportStep["kind"]): Extract<ExportStep, { kind: typeof kind }>[] =>
+const stepsOf = (
+  l: ExportLayout,
+  kind: ExportStep["kind"]
+): Extract<ExportStep, { kind: typeof kind }>[] =>
   l.steps.filter((s): s is Extract<ExportStep, { kind: typeof kind }> => s.kind === kind);
 
 const textsOf = (l: ExportLayout): string[] => stepsOf(l, "text").map((s) => s.text);
@@ -102,7 +112,9 @@ function inBounds(step: ExportStep, height: number): boolean {
     case "trend":
       return (
         fitsBox(step.x, step.y, step.w, step.h) &&
-        step.pts.every((p) => p.x >= step.x && p.x <= step.x + step.w && p.y >= step.y && p.y <= step.y + step.h)
+        step.pts.every(
+          (p) => p.x >= step.x && p.x <= step.x + step.w && p.y >= step.y && p.y <= step.y + step.h
+        )
       );
     case "line":
       return step.x1 >= 0 && step.x2 <= EXPORT_W && step.y1 >= 0 && step.y2 <= height;
@@ -137,7 +149,8 @@ describe("exportLayout（计划② Task 12：分享图版式纯层）", () => {
       "footer",
     ]);
     const ys = l.anchors.map((a) => a.y);
-    for (let i = 1; i < ys.length; i++) expect(ys[i], `锚点 ${i} 的 y 未递增`).toBeGreaterThan(ys[i - 1]);
+    for (let i = 1; i < ys.length; i++)
+      expect(ys[i], `锚点 ${i} 的 y 未递增`).toBeGreaterThan(ys[i - 1]);
 
     expect(l.height).toBeGreaterThanOrEqual(EXPORT_MIN_H);
     expect(l.height).toBe(Math.max(EXPORT_MIN_H, Math.ceil(l.contentBottom + 34)));
@@ -174,7 +187,8 @@ describe("exportLayout（计划② Task 12：分享图版式纯层）", () => {
       "工具调用",
       "纯 token · 含子代理 · 本地聚合",
     ].map((t) => texts.indexOf(t));
-    for (let i = 1; i < order.length; i++) expect(order[i], "锚点文案次序不对").toBeGreaterThan(order[i - 1]);
+    for (let i = 1; i < order.length; i++)
+      expect(order[i], "锚点文案次序不对").toBeGreaterThan(order[i - 1]);
     // 全图恰好一次：hero 段小标题用 trendTitle 会让这里变 2
     expect(texts.filter((t) => t === "用量趋势")).toHaveLength(1);
   });
@@ -254,7 +268,10 @@ describe("exportLayout（计划② Task 12：分享图版式纯层）", () => {
     // 9 行图集没有 look 行 → 回落第 0 行（空白格是硬伤）
     const [fallback] = stepsOf(
       layoutExport(
-        baseInput({ pose: "look", sheet: { rows: 9, geometry: { frameW: 192, frameH: 208, matchesConstants: true } } }),
+        baseInput({
+          pose: "look",
+          sheet: { rows: 9, geometry: { frameW: 192, frameH: 208, matchesConstants: true } },
+        }),
         measure
       ),
       "sprite"
@@ -331,7 +348,9 @@ describe("exportLayout（计划② Task 12：分享图版式纯层）", () => {
     const [bubble] = stepsOf(l, "rect").filter((r) => r.color === "#fffdf9");
     const petX = EXPORT_W - PAD; // 没有立绘 → 公式里的 petX 退化成内容右缘
     const quoteTextW = baseInput().quote.length * 10;
-    expect(bubble.w).toBe(Math.min(340, Math.max(150, quoteTextW + 44), Math.max(150, petX - 18 - PAD)));
+    expect(bubble.w).toBe(
+      Math.min(340, Math.max(150, quoteTextW + 44), Math.max(150, petX - 18 - PAD))
+    );
     expect(bubble.x).toBe(Math.max(PAD, petX - 18 - bubble.w));
     // 段锚点照旧、总高仍走同一条公式、步骤仍不出界
     expect(l.anchors.map((a) => a.id)).toEqual([
@@ -373,7 +392,9 @@ describe("exportLayout（计划② Task 12：分享图版式纯层）", () => {
     const ticks = stepsOf(l, "text").filter((t) => t.font.startsWith("400 11px"));
     expect(ticks.map((t) => t.text)).toEqual(["09/27", "09/28", "10/03"]);
     const many = layoutExport(
-      baseInput({ points: Array.from({ length: 30 }, (_, i) => ({ label: `d${i}`, value: i + 1 })) }),
+      baseInput({
+        points: Array.from({ length: 30 }, (_, i) => ({ label: `d${i}`, value: i + 1 })),
+      }),
       measure
     );
     const manyTicks = stepsOf(many, "text").filter((t) => t.font.startsWith("400 11px"));

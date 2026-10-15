@@ -460,7 +460,7 @@ pub fn dashboard(
         let d = dashboard_with_conn(&conn, range, group_by, now_ms)?;
         return Ok(d);
     }
-    Err(UsageError::new("usage-db-failed", "DB 锁中毒"))
+    Err(UsageError::new("usage-db-failed", "db poisoned lock"))
 }
 
 /// 连接注入版（单测直连内存库）
@@ -623,7 +623,7 @@ pub fn records(
 ) -> Result<UsageRecords, UsageError> {
     let conn = DB
         .lock()
-        .map_err(|_| UsageError::new("usage-db-failed", "DB 锁中毒"))?;
+        .map_err(|_| UsageError::new("usage-db-failed", "db poisoned lock"))?;
     records_with_conn(&conn, range, group_by, filters, now_ms)
 }
 
@@ -773,7 +773,7 @@ pub fn export_csv(
 ) -> Result<String, UsageError> {
     let conn = DB
         .lock()
-        .map_err(|_| UsageError::new("usage-db-failed", "DB 锁中毒"))?;
+        .map_err(|_| UsageError::new("usage-db-failed", "db poisoned lock"))?;
     csv_with_conn(&conn, range, group_by, filters, now_ms)
 }
 

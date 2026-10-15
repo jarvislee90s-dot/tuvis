@@ -27,10 +27,7 @@ vi.mock("@/components/pet/petConfig", () => ({
 
 import { useSessionStore } from "@/stores/sessionStore";
 import { useNotification, GREEN_STABLE_MS } from "@/hooks/useNotification";
-import {
-  SAME_DIRECTION_NOTIFY_MS,
-  isSameDirectionThrottled,
-} from "@/lib/notification-throttle";
+import { SAME_DIRECTION_NOTIFY_MS, isSameDirectionThrottled } from "@/lib/notification-throttle";
 
 const mkSession = (id: string, status: string) => ({
   id,

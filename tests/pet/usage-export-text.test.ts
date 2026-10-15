@@ -198,8 +198,10 @@ describe("buildTextSummary（计划② Task 11：复制文本摘要）", () => {
 
     // **另一支：`userEst === null` → `—`**（不可得才空；与「没量到 token」互不相干）。
     // 同一个 noTokens 夹具上把 userEst 置 null，证明置空**只**由「不可得」触发。
-    const nullEst = buildTextSummary({ ...noTokens, totals: { ...noTokens.totals, userEst: null } }, t)
-      .split("\n");
+    const nullEst = buildTextSummary(
+      { ...noTokens, totals: { ...noTokens.totals, userEst: null } },
+      t
+    ).split("\n");
     expect(nullEst[6]).toBe(`用户输入(估) · 含子代理: ${EM_DASH}`);
 
     // **反断言**：正常窗口照旧印数字（不得把正常路径也置空）——`userEst` 逐字不变

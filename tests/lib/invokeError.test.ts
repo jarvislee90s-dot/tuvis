@@ -24,21 +24,21 @@ describe("formatInvokeError（错误码解析）", () => {
     expect(formatInvokeError("W5_TOOL_DISABLED:claude", t)).toBe("工具 claude 未启用");
     expect(formatInvokeError("W5_APPLY_IN_PROGRESS: task", t)).toBe("保存中");
     expect(formatInvokeError("PRESET_ACTIVE:p1", t)).toBe("预设 p1 正在激活");
-    expect(
-      formatInvokeError("PRESET_NATIVE_IN_UNIVERSAL:skill-x", t)
-    ).toBe("通用预设不得含原生技能 skill-x");
+    expect(formatInvokeError("PRESET_NATIVE_IN_UNIVERSAL:skill-x", t)).toBe(
+      "通用预设不得含原生技能 skill-x"
+    );
   });
 
   it("形态 A：已知码整句替换（en 语义句）", () => {
-    expect(
-      formatInvokeError("REMOTE_NO_TUNNEL_TOKEN: 自有域名缺少 Tunnel Token", t)
-    ).toBe("Custom domain needs a Tunnel Token");
+    expect(formatInvokeError("REMOTE_NO_TUNNEL_TOKEN: 自有域名缺少 Tunnel Token", t)).toBe(
+      "Custom domain needs a Tunnel Token"
+    );
   });
 
   it("形态 B：机器参数经 {{param}} 插值", () => {
-    expect(
-      formatInvokeError("SESSION_PID_GONE:12345: 进程 12345 不存在", t)
-    ).toBe("Process 12345 no longer exists");
+    expect(formatInvokeError("SESSION_PID_GONE:12345: 进程 12345 不存在", t)).toBe(
+      "Process 12345 no longer exists"
+    );
   });
 
   it("未知码 / 无码 / 纯英文错误一律原文回退（不静默吞）", () => {
@@ -55,7 +55,7 @@ describe("formatInvokeError（错误码解析）", () => {
   });
 
   it("非字符串输入先 String 化再判定", () => {
-    expect(formatInvokeError({ msg: "x" } as unknown, t)).toBe('[object Object]');
+    expect(formatInvokeError({ msg: "x" } as unknown, t)).toBe("[object Object]");
     expect(formatInvokeError(42, t)).toBe("42");
   });
 });

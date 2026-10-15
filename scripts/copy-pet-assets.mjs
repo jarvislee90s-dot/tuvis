@@ -22,7 +22,12 @@ for (const group of GROUPS) {
     .sort((a, b) => a.localeCompare(b, "zh"));
   for (const f of files) {
     cpSync(join(dir, f), join(DEST, "voice", group, f));
-    manifest.push({ index: index++, group, name: f.replace(/\.(m4a|mp4)$/i, ""), file: `${group}/${f}` });
+    manifest.push({
+      index: index++,
+      group,
+      name: f.replace(/\.(m4a|mp4)$/i, ""),
+      file: `${group}/${f}`,
+    });
   }
 }
 writeFileSync(join(DEST, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");

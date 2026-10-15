@@ -115,8 +115,9 @@ pub fn load_from_conn(conn: &rusqlite::Connection) -> UsageSettings {
 /// 锁：`usage_ipc_test::set_settings_reports_persist_failure_instead_of_success`
 /// （用 `settings` 表上的 RAISE(ABORT) 触发器造真实写失败）。
 pub fn save(s: &UsageSettings) -> Result<(), UsageError> {
-    let json = serde_json::to_string(s)
-        .map_err(|e| UsageError::new("usage-db-failed", format!("用量设置序列化失败: {e}")))?;
+    let json = serde_json::to_string(s).map_err(|e| {
+        UsageError::new("usage-db-failed", format!("usage settings serialize: {e}"))
+    })?;
     set_setting(SETTINGS_KEY, &json);
     if get_setting(SETTINGS_KEY).as_deref() != Some(json.as_str()) {
         return Err(UsageError::new(

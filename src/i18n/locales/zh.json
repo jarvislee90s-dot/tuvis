@@ -1485,7 +1485,7 @@
     "injectTmuxKeyFail": "tmux 按键失败——详见日志",
     "injectTmuxSpawnFail": "tmux 执行失败——详见日志",
     "injectPlatformUnsupported": "平台不支持",
-    "injectManualCheck": "请人工核对终端（命令已发送但状态未确认，详见日志）",
+    "injectManualCheck": "请人工核对终端（命令已发送但状态未确认）",
     "injectNoScreen": "读不到终端屏面——零投递（请人工核对终端；或点「重新读取」）",
     "injectMenuTableMissing": "codex 的权限菜单未出现或读不到档位表（不盲发数字键）",
     "injectDialogMalformed": "对话框有多行高亮标记，形态异常，不出手",
@@ -1501,5 +1501,10 @@
     "injectMenuTableMalformed": "权限菜单档位表不自洽——不猜位置，请在终端选择",
     "mobileNetworkFail": "{{param}} 网络异常——详见日志",
     "httpClientBuildFail": "HTTP 客户端构建失败——详见日志"
+  },
+  "mobile": {
+    "composer": {
+      "sendFailedRetry": "发送失败：{{error}}（可重试）"
+    }
   }
 }

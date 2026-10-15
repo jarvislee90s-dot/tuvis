@@ -84,13 +84,7 @@ const WORK_SUMMARY_SIX = [
  * **没有 `skip_serializing_if`** ⇒ 同样必须显式在场（`null` 是值，不是缺键）。brief 只要求六个，
  * 这里一并钉住：把「不可得」误写成「缺键」是同一类漂移。
  */
-const WORK_SUMMARY_REST = [
-  "toolCalls",
-  "toolAvgMs",
-  "topTool",
-  "topToolMs",
-  "longestTurnPerTool",
-];
+const WORK_SUMMARY_REST = ["toolCalls", "toolAvgMs", "topTool", "topToolMs", "longestTurnPerTool"];
 const SOURCE_STATUS_KEYS = ["sourceId", "ok", "parsedFiles", "newRecords"];
 
 /** fixture 目录与四个文件名（抓取方式见同目录 README.md） */
@@ -178,10 +172,9 @@ function assertRow(row: unknown, what: string, dayTier: boolean): void {
     // 写 `false` = 谎称「不含子代理」（与 userEst 的「不可得 ≠ 0」同一逻辑）。
     expect(sub, `${what}.isSubagent：日档必须 null（不得回落 false）`).toBeNull();
   } else {
-    expect(
-      typeof sub,
-      `${what}.isSubagent：小时档必须是真布尔（真值才承载 D17 分层语义）`
-    ).toBe("boolean");
+    expect(typeof sub, `${what}.isSubagent：小时档必须是真布尔（真值才承载 D17 分层语义）`).toBe(
+      "boolean"
+    );
   }
 }
 
@@ -199,10 +192,9 @@ function assertAvailability(list: unknown, what: string): void {
       expect(typeof av.reason, `${what}[${i}].reason 给了就必须是字符串`).toBe("string");
     }
     if (av.perSource !== undefined) {
-      expect(
-        typeof av.perSource,
-        `${what}[${i}].perSource 给了就必须是「源 → 布尔」映射`
-      ).toBe("object");
+      expect(typeof av.perSource, `${what}[${i}].perSource 给了就必须是「源 → 布尔」映射`).toBe(
+        "object"
+      );
       for (const v of Object.values(av.perSource as Record<string, unknown>)) {
         expect(typeof v, `${what}[${i}].perSource 的值必须是布尔`).toBe("boolean");
       }
@@ -221,14 +213,23 @@ function assertWorkSummary(ws: unknown, what: string): void {
     expect(k in w, `${what} 缺 key \`${k}\`（Rust 侧无 skip_serializing_if）`).toBe(true);
   }
   // 值域：不可得一律 `null`，不得缺键、不得填 0 冒充
-  for (const k of ["sessions", "errorModel", "errorTurn", "errorTool", "interrupted", "toolCalls", "toolAvgMs"]) {
+  for (const k of [
+    "sessions",
+    "errorModel",
+    "errorTurn",
+    "errorTool",
+    "interrupted",
+    "toolCalls",
+    "toolAvgMs",
+  ]) {
     expect(isNumOrNull(w[k]), `${what}.${k} 必须是 number | null`).toBe(true);
   }
   expect(typeof w.turnsPerTool, `${what}.turnsPerTool 是「工具 → number|null」映射`).toBe("object");
   for (const [tool, v] of Object.entries(w.turnsPerTool as Record<string, unknown>)) {
-    expect(isNumOrNull(v), `${what}.turnsPerTool.${tool} 必须是 number | null（无回合概念 = null）`).toBe(
-      true
-    );
+    expect(
+      isNumOrNull(v),
+      `${what}.turnsPerTool.${tool} 必须是 number | null（无回合概念 = null）`
+    ).toBe(true);
   }
   expect(typeof w.longestTurnPerTool, `${what}.longestTurnPerTool 是「工具 → p50·max|null」`).toBe(
     "object"
@@ -298,10 +299,9 @@ function assertDashboard(d: UsageDashboard, what: string): void {
     expectExactKeys(d.recentSession, RECENT_KEYS, `${what}.recentSession`);
     assertBuckets(d.recentSession.buckets, `${what}.recentSession.buckets`);
     assertMetrics(d.recentSession.metrics, `${what}.recentSession.metrics`);
-    expect(
-      "title" in d.recentSession,
-      `${what}.recentSession.title 必须在场（值可为 null）`
-    ).toBe(true);
+    expect("title" in d.recentSession, `${what}.recentSession.title 必须在场（值可为 null）`).toBe(
+      true
+    );
   }
   assertWorkSummary(d.workSummary, `${what}.workSummary`);
   assertAvailability(d.availability, `${what}.availability`);
@@ -355,10 +355,18 @@ function assertSettings(s: UsageSettings, what: string): void {
   for (const [k, lo, hi] of bounds) {
     const v = s[k] as unknown;
     expect(isInt(v), `${what}.${k} 必须是整数`).toBe(true);
-    expect(v as number, `${what}.${k} 必须落在 ${lo}–${hi}（与 Rust 校验同边界）`).toBeGreaterThanOrEqual(lo);
-    expect(v as number, `${what}.${k} 必须落在 ${lo}–${hi}（与 Rust 校验同边界）`).toBeLessThanOrEqual(hi);
+    expect(
+      v as number,
+      `${what}.${k} 必须落在 ${lo}–${hi}（与 Rust 校验同边界）`
+    ).toBeGreaterThanOrEqual(lo);
+    expect(
+      v as number,
+      `${what}.${k} 必须落在 ${lo}–${hi}（与 Rust 校验同边界）`
+    ).toBeLessThanOrEqual(hi);
   }
-  expect(typeof s.providerMapRules, `${what}.providerMapRules 必须是字符串（JSON 文本）`).toBe("string");
+  expect(typeof s.providerMapRules, `${what}.providerMapRules 必须是字符串（JSON 文本）`).toBe(
+    "string"
+  );
   expect(typeof s.exportQuote, `${what}.exportQuote 必须是字符串（可为空串）`).toBe("string");
   expect(typeof s.exportPose, `${what}.exportPose 必须是字符串`).toBe("string");
   expect(
@@ -393,10 +401,9 @@ function assertCollect(c: UsageCollectResult, what: string): void {
         `${at} 是成功源，不得带 errorCode 键（Rust 侧 skip_serializing_if）`
       ).toEqual([...SOURCE_STATUS_KEYS].sort());
     } else {
-      expect(
-        typeof st.errorCode,
-        `${at} 是失败源，必须有 errorCode（不得静默失败）`
-      ).toBe("string");
+      expect(typeof st.errorCode, `${at} 是失败源，必须有 errorCode（不得静默失败）`).toBe(
+        "string"
+      );
     }
     sum += st.newRecords;
   }
@@ -520,10 +527,7 @@ describe.skipIf(HAS_ALL_FIXTURES)(
       // ③ 抓取机具在位：README 是「怎么抓 / 抓到哪 / 禁止写什么」的唯一出处；
       //    它必须点出四个文件名与四条隐私禁令，否则人类无从下手（本组的价值就在于联调前就守住它）。
       const readmePath = path.join(FIXTURE_DIR, "README.md");
-      expect(
-        existsSync(readmePath),
-        `${readmePath} 不存在：抓取方式的唯一出处，不能删`
-      ).toBe(true);
+      expect(existsSync(readmePath), `${readmePath} 不存在：抓取方式的唯一出处，不能删`).toBe(true);
       const readme = readFileSync(readmePath, "utf8");
       for (const f of Object.values(FIXTURE_FILES)) {
         expect(readme, `README 必须写清 fixture 文件名 \`${f}\``).toContain(f);

@@ -135,7 +135,8 @@ pub(crate) fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), String> 
 pub(crate) fn verify_sha256_file(path: &Path, expected: &str) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    let mut f = std::fs::File::open(path).map_err(|e| format!("打开文件失败: {e}"))?;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("RESOURCE_OPEN_FILE_FAIL: 打开文件失败: {e}"))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {

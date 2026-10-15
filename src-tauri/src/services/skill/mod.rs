@@ -213,8 +213,8 @@ pub fn assign_skill_to_subagent(
         ));
     }
 
-    let adapter =
-        crate::adapter::adapter_by_id(tool_id).ok_or_else(|| format!("未知工具: {}", tool_id))?;
+    let adapter = crate::adapter::adapter_by_id(tool_id)
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
 
     let has_subagent_dir = adapter.subagent_dir().is_some();
 

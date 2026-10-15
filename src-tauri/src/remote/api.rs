@@ -11531,11 +11531,11 @@ mod tests {
             ),
             // 2026-10-02 ←/→ 双向导航（走位+回车路径退役，其文案随之删除）
             (
-                "切题：←/→ 后读不到屏幕——无法确认是否切题；请人工核对终端",
+                "INJECT_SCREEN_ABORT: 切题：←/→ 后读不到屏幕——无法确认是否切题；请人工核对终端",
                 QUESTION_STAGE_ADVANCE,
             ),
             (
-                "切题：↑ 后读不到屏幕——已中止，未发 ←/→；请人工核对终端",
+                "INJECT_SCREEN_ABORT: 切题：↑ 后读不到屏幕——已中止，未发 ←/→；请人工核对终端",
                 QUESTION_STAGE_ADVANCE,
             ),
             (
@@ -11578,7 +11578,7 @@ mod tests {
             // codex select 链（评审 P2-7）——含「空格」的末题归零闸文案必须归
             // select 而非 toggle-row（codex 臂先于通用切勾臂的有意排序）
             (
-                "codex：读不到屏——已中止，未发任何键；请人工核对终端",
+                "INJECT_SCREEN_ABORT: codex：读不到屏——已中止，未发任何键；请人工核对终端",
                 "select",
             ),
             (
@@ -11635,7 +11635,7 @@ mod tests {
             ),
             // codex 切题链
             (
-                "codex 切题：读不到面板——已中止，未发任何键；请核对终端",
+                "INJECT_SCREEN_ABORT: codex 切题：读不到面板——已中止，未发任何键；请核对终端",
                 QUESTION_STAGE_ADVANCE,
             ),
             (

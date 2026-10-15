@@ -1159,8 +1159,11 @@ describe("Board 卡片关闭/归档开关", () => {
   it("APP 绿态卡片显示归档钮：确认后调 session-hide", async () => {
     await renderWithCard(
       chipSession({
-        id: "a1", agentType: "codex", lastActivityAt: "2026-09-20T10:00:00Z",
-        form: "app", status: "idle",
+        id: "a1",
+        agentType: "codex",
+        lastActivityAt: "2026-09-20T10:00:00Z",
+        form: "app",
+        status: "idle",
       })
     );
     const hideCalls: string[] = [];
@@ -1185,8 +1188,11 @@ describe("Board 卡片关闭/归档开关", () => {
   it("APP 非绿态卡片同样显示归档钮且可归档（叉不挑颜色）", async () => {
     await renderWithCard(
       chipSession({
-        id: "a2", agentType: "codex", lastActivityAt: "2026-09-20T10:00:00Z",
-        form: "app", status: "processing",
+        id: "a2",
+        agentType: "codex",
+        lastActivityAt: "2026-09-20T10:00:00Z",
+        form: "app",
+        status: "processing",
       })
     );
     const hideCalls: string[] = [];

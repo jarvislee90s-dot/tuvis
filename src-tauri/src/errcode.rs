@@ -38,10 +38,10 @@
 //! # 迁移实操口径
 //! 字面量直写为主：`"CODE: 原句"` / `"CODE:param: 原句"` 直接进
 //! `Err(format!(...))`——不设 helper（曾提供 coded()/coded_param()，零采用已删，
+//! 避免后人误以为必经 helper）。门禁 `scripts/check-error-codes.mjs` 与本文件
+//! 互为镜像，其 EXCLUDE_CODES（TUVIS marker 前缀）与 LEGACY 码表以脚本为单一出处。
 //! * 部分码标注**仅日志可见**（如 Q_SUBMIT_MULTI_ONLY 的 BadParameter 文案在
 //!   api.rs 映射层被换成 bad_index/tool_readonly 后只进 log::debug）——码仍登记，
 //!   前端键备而不用。
 //! * **审计行格式变更**（2026-10-15）：审计 `result` 字段自此带码前缀
 //!   （`failed:RAPI_DELIVERY_BUSY: …`），外部按纯中文 grep 审计日志的脚本需知悉。
-//!   避免后人误以为必经 helper）。门禁 `scripts/check-error-codes.mjs` 与本文件
-//!   互为镜像，其 EXCLUDE_CODES（TUVIS marker 前缀）与 LEGACY 码表以脚本为单一出处。

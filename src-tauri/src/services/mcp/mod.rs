@@ -24,7 +24,8 @@ pub struct McpConfig {
 
 /// 写入 MCP 配置到工具
 pub fn write_mcp(tool_id: &str, mcp_name: &str, config: &McpConfig) -> Result<(), String> {
-    let adapter = adapter_by_id(tool_id).ok_or_else(|| format!("未知工具: {}", tool_id))?;
+    let adapter = adapter_by_id(tool_id)
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
     let config_path = adapter.mcp_config_path().ok_or("工具不支持 MCP 配置")?;
     match adapter.mcp_format() {
         McpFormat::Json => {
@@ -39,7 +40,8 @@ pub fn write_mcp(tool_id: &str, mcp_name: &str, config: &McpConfig) -> Result<()
 
 /// 移除 MCP 配置
 pub fn remove_mcp(tool_id: &str, mcp_name: &str) -> Result<(), String> {
-    let adapter = adapter_by_id(tool_id).ok_or_else(|| format!("未知工具: {}", tool_id))?;
+    let adapter = adapter_by_id(tool_id)
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
     let config_path = adapter.mcp_config_path().ok_or("工具不支持 MCP 配置")?;
     match adapter.mcp_format() {
         McpFormat::Json => remove_mcp_json(&config_path, adapter.mcp_json_section(), mcp_name),
@@ -50,7 +52,8 @@ pub fn remove_mcp(tool_id: &str, mcp_name: &str) -> Result<(), String> {
 
 /// 工具的 MCP 配置文件路径（供"打开配置文件"等入口使用）
 pub fn tool_mcp_config_path(tool_id: &str) -> Result<std::path::PathBuf, String> {
-    let adapter = adapter_by_id(tool_id).ok_or_else(|| format!("未知工具: {}", tool_id))?;
+    let adapter = adapter_by_id(tool_id)
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
     adapter
         .mcp_config_path()
         .ok_or_else(|| "工具不支持 MCP 配置".to_string())

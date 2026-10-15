@@ -52,9 +52,10 @@ describe("quotes（计划② Task 12：评语池 + 填充 + 语言判定）", ()
       for (const entry of pool) {
         expect(typeof entry.when, `${lang} 谓词`).toBe("function");
         for (const name of placeholdersOf(entry.text)) {
-          expect(["range", "tokens", "hitPct", "models"], `${lang} 池出现越界占位符 {${name}}`).toContain(
-            name
-          );
+          expect(
+            ["range", "tokens", "hitPct", "models"],
+            `${lang} 池出现越界占位符 {${name}}`
+          ).toContain(name);
         }
       }
       const used = new Set(pool.flatMap((e) => placeholdersOf(e.text)));
@@ -138,7 +139,9 @@ describe("quotes（计划② Task 12：评语池 + 填充 + 语言判定）", ()
     );
     // 纯空白 = 没填 → 回落预制池
     expect(pickQuote(agg, "zh", "   ", VARS)).toBe(zh[0].text.split("{hitPct}").join(VARS.hitPct));
-    expect(pickQuote(agg, "zh", undefined, VARS)).toBe(zh[0].text.split("{hitPct}").join(VARS.hitPct));
+    expect(pickQuote(agg, "zh", undefined, VARS)).toBe(
+      zh[0].text.split("{hitPct}").join(VARS.hitPct)
+    );
     // 不给 vars：池文案按空串填充，不留 `{…}` 残骸
     const noVars = pickQuote({ ...BASE, hitPct: 0.99 }, "zh");
     expect(placeholdersOf(noVars)).toEqual([]);

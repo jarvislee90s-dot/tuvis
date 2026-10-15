@@ -437,7 +437,8 @@ describe("RemoteSection lan 开关 P7 TLS Dialog 流（M5 A6）", () => {
       if (cmd === "remote_status") return lanOffStatus();
       if (cmd === "remote_toggle_channel" && args?.channel === "lan" && args?.on === true) {
         lanTries += 1;
-        if (lanTries === 1) throw "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
+        if (lanTries === 1)
+          throw "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
         return; // 重试成功
       }
       if (cmd === "get_setting") return null;
@@ -810,14 +811,23 @@ describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的
     platform: "windows" as const,
     windowsVerified: true,
     writePathVerified: true,
-    steps: ["detect", "download", "install", "login", "shields_up", "funnel", "verify", "autostart"].map(
-      (id) => ({ id, needsHuman: false, humanOptional: false, humanActionKey: "" })
-    ),
-    states: ["detect", "download", "install", "login", "shields_up", "funnel", "autostart"].map((id) => ({
-      id,
-      done: true,
-      blockedReason: null,
-    })).concat([{ id: "verify", done: false, blockedReason: null }]),
+    steps: [
+      "detect",
+      "download",
+      "install",
+      "login",
+      "shields_up",
+      "funnel",
+      "verify",
+      "autostart",
+    ].map((id) => ({ id, needsHuman: false, humanOptional: false, humanActionKey: "" })),
+    states: ["detect", "download", "install", "login", "shields_up", "funnel", "autostart"]
+      .map((id) => ({
+        id,
+        done: true,
+        blockedReason: null,
+      }))
+      .concat([{ id: "verify", done: false, blockedReason: null }]),
     authUrl: "",
     running: false,
     boardUrl: null,
@@ -1357,7 +1367,9 @@ describe("RemoteSection B1：撤销 tailscale 前先预览「会连带清掉哪�
     });
   };
   const runStepCalls = (step: string) =>
-    invokeMock.mock.calls.filter((c) => c[0] === "remote_ts_run_step" && (c[1] as { step?: string })?.step === step);
+    invokeMock.mock.calls.filter(
+      (c) => c[0] === "remote_ts_run_step" && (c[1] as { step?: string })?.step === step
+    );
   // 开关在 status 到达前是 disabled（受控态），故先等它可用再点
   const renderAndToggleTsOff = async () => {
     render(<RemoteSection />);
@@ -1460,7 +1472,12 @@ describe("RemoteSection B1：撤销 tailscale 前先预览「会连带清掉哪�
   it("无额外条目（wouldClear=0 ∧ !foreign）：不弹框，走**普通 disable**（非 force）并消费回执", async () => {
     // M-1：不弹框那条路也必须经向导步消费回执——走 remote_toggle_channel 的话
     // stop_channel() 会把 ServeResetReport 丢掉，窗口内配置变了用户只看到日志
-    mockWithPreview({ ok: true, foreign: false, wouldClear: 0, entries: [{ ours: true, label: "ours" }] });
+    mockWithPreview({
+      ok: true,
+      foreign: false,
+      wouldClear: 0,
+      entries: [{ ours: true, label: "ours" }],
+    });
     await renderAndToggleTsOff();
     await waitFor(() => expect(runStepCalls("disable").length).toBe(1));
     expect(runStepCalls("disable_force").length).toBe(0);
@@ -1475,7 +1492,12 @@ describe("RemoteSection B1：撤销 tailscale 前先预览「会连带清掉哪�
       if (cmd === "remote_devices") return [];
       if (cmd === "remote_ts_probe") return null;
       if (cmd === "remote_ts_run_step" && args?.step === "disable_preview")
-        return { ok: true, foreign: false, wouldClear: 0, entries: [{ ours: true, label: "ours" }] };
+        return {
+          ok: true,
+          foreign: false,
+          wouldClear: 0,
+          entries: [{ ours: true, label: "ours" }],
+        };
       if (cmd === "remote_ts_run_step" && args?.step === "disable")
         return {
           ok: true,

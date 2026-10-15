@@ -6,23 +6,25 @@
 import { renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-const { handlers, listenMock, sendNotificationMock, toastSuccessMock, toastErrorMock } = vi.hoisted(() => {
-  const handlers = new Map<string, (e: { payload: unknown }) => void | Promise<void>>();
-  return {
-    handlers,
-    listenMock: vi.fn(
-      async (event: string, handler: (e: { payload: unknown }) => void | Promise<void>) => {
-        handlers.set(event, handler);
-        return () => {
-          handlers.delete(event);
-        };
-      }
-    ),
-    sendNotificationMock: vi.fn(),
-    toastSuccessMock: vi.fn(),
-    toastErrorMock: vi.fn(),
-  };
-});
+const { handlers, listenMock, sendNotificationMock, toastSuccessMock, toastErrorMock } = vi.hoisted(
+  () => {
+    const handlers = new Map<string, (e: { payload: unknown }) => void | Promise<void>>();
+    return {
+      handlers,
+      listenMock: vi.fn(
+        async (event: string, handler: (e: { payload: unknown }) => void | Promise<void>) => {
+          handlers.set(event, handler);
+          return () => {
+            handlers.delete(event);
+          };
+        }
+      ),
+      sendNotificationMock: vi.fn(),
+      toastSuccessMock: vi.fn(),
+      toastErrorMock: vi.fn(),
+    };
+  }
+);
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock, emit: vi.fn(async () => {}) }));
 vi.mock("@tauri-apps/plugin-notification", () => ({
@@ -31,7 +33,11 @@ vi.mock("@tauri-apps/plugin-notification", () => ({
   requestPermission: vi.fn(async () => "granted"),
 }));
 vi.mock("sonner", () => ({
-  toast: Object.assign(vi.fn(), { info: vi.fn(), success: toastSuccessMock, error: toastErrorMock }),
+  toast: Object.assign(vi.fn(), {
+    info: vi.fn(),
+    success: toastSuccessMock,
+    error: toastErrorMock,
+  }),
 }));
 
 // tests/setup.ts 未初始化 i18n，显式引入并按默认英文断言（jsdom navigator.language=en）
@@ -66,7 +72,10 @@ describe("useRemoteEvents 全局远程事件（M5 A6）", () => {
     const handler = handlers.get("remote-toggle-failed");
     if (!handler) throw new Error("remote-toggle-failed handler not registered");
     await handler({
-      payload: { error: "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）" },
+      payload: {
+        error:
+          "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）",
+      },
     });
     await waitFor(() => expect(toastErrorMock).toHaveBeenCalled());
     const msg = String(toastErrorMock.mock.calls[0][0]);

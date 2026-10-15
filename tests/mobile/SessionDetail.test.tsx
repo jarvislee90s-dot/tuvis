@@ -220,10 +220,9 @@ function installFetch() {
     if (url.includes("/session-subagent-messages")) {
       // 观察台 T6：SubagentDetail 详情载荷桩（本页既有用例不开详情对话框，
       // 缺省空载荷即可——防御 SubagentDetail 挂载时的意外请求）
-      return new Response(
-        JSON.stringify({ messages: [], truncated: false, supported: true }),
-        { status: 200 }
-      );
+      return new Response(JSON.stringify({ messages: [], truncated: false, supported: true }), {
+        status: 200,
+      });
     }
     throw new Error(`unexpected fetch: ${url}`);
   });
@@ -1215,10 +1214,9 @@ describe("书签跨加载窗口跳转（M5 P3-c）", () => {
       }
       if (url.includes("/session-subagent-messages")) {
         // 观察台 T6：详情载荷桩（同 installFetch，缺省空载荷）
-        return new Response(
-          JSON.stringify({ messages: [], truncated: false, supported: true }),
-          { status: 200 }
-        );
+        return new Response(JSON.stringify({ messages: [], truncated: false, supported: true }), {
+          status: 200,
+        });
       }
       throw new Error(`unexpected fetch: ${url}`);
     });
@@ -1971,10 +1969,9 @@ describe("SessionDetail：活状态流（T1）", () => {
         }
         if (url.includes("/session-subagent-messages")) {
           // 观察台 T6：详情载荷桩（同 installFetch，缺省空载荷）
-          return new Response(
-            JSON.stringify({ messages: [], truncated: false, supported: true }),
-            { status: 200 }
-          );
+          return new Response(JSON.stringify({ messages: [], truncated: false, supported: true }), {
+            status: 200,
+          });
         }
         throw new Error(`unexpected fetch: ${url}`);
       })
@@ -2798,7 +2795,9 @@ describe("SessionDetail：预览区 sheet 化（T1）", () => {
     // sheet=subagents + open=subagent + mode=split-h（两层级导航：chip 直达落详情级，返回钮回清单）
     await vi.waitFor(() => {
       expect(
-        document.querySelector('[data-sheet="subagents"][data-open="subagent"][data-mode="split-h"]')
+        document.querySelector(
+          '[data-sheet="subagents"][data-open="subagent"][data-mode="split-h"]'
+        )
       ).toBeTruthy();
     });
     expect(screen.getByTestId("subagent-detail")).toBeTruthy();

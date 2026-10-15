@@ -926,7 +926,7 @@ export default function MessageComposer({ session }: MessageComposerProps) {
               data-testid="send-receipt-failed"
               className="rounded-full bg-rose-500/10 px-2 py-0.5 text-xs text-rose-700 dark:bg-rose-400/10 dark:text-rose-400"
             >
-              {`发送失败：${receipt.error}（可重试）`}
+              {i18n.t("mobile.composer.sendFailedRetry", { error: receipt.error })}
             </span>
           )}
           {receipt.kind === "gone" && (

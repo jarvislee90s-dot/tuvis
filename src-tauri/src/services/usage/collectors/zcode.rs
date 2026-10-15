@@ -580,7 +580,7 @@ fn load_sessions(conn: &Connection) -> Result<Vec<SessionRow>, UsageError> {
                     .filter(|p| !p.trim().is_empty()),
             })
         })
-        .map_err(|e| UsageError::new("usage-source-io", format!("zcode session 读取失败: {e}")))?;
+        .map_err(|e| UsageError::new("usage-source-io", format!("zcode session read: {e}")))?;
     let mut out = Vec::new();
     let mut bad = 0usize;
     let mut first: Option<rusqlite::Error> = None;
@@ -726,9 +726,7 @@ fn load_turn_usage(
                 })
             },
         )
-        .map_err(|e| {
-            UsageError::new("usage-source-io", format!("zcode turn_usage 读取失败: {e}"))
-        })?;
+        .map_err(|e| UsageError::new("usage-source-io", format!("zcode turn_usage read: {e}")))?;
     let mut out = Vec::new();
     let mut bad = 0usize;
     let mut first: Option<rusqlite::Error> = None;
@@ -794,9 +792,7 @@ fn load_tool_usage(
                 })
             },
         )
-        .map_err(|e| {
-            UsageError::new("usage-source-io", format!("zcode tool_usage 读取失败: {e}"))
-        })?;
+        .map_err(|e| UsageError::new("usage-source-io", format!("zcode tool_usage read: {e}")))?;
     let mut out = Vec::new();
     let mut bad = 0usize;
     let mut first: Option<rusqlite::Error> = None;

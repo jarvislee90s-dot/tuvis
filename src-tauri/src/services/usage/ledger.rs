@@ -100,9 +100,9 @@ pub fn apply_delta(
         let started = Instant::now();
         {
             // 只在事务期间持有全局 DB 锁——这段就是 3 秒轮询可能被挡住的最坏窗口
-            let mut conn = DB
-                .lock()
-                .map_err(|e| UsageError::new("usage-db-failed", format!("DB 锁中毒: {e}")))?;
+            let mut conn = DB.lock().map_err(|e| {
+                UsageError::new("usage-db-failed", format!("db poisoned lock: {e}"))
+            })?;
             write_one_batch(&mut conn, &b, sid)?;
         } // ← 锁在此释放，随后主动让出
         record_batch(&mut stats, rows, started);
@@ -168,10 +168,10 @@ fn write_one_batch(
 ) -> Result<(), UsageError> {
     let tx = conn
         .transaction()
-        .map_err(|e| UsageError::new("usage-db-failed", format!("开启事务失败: {e}")))?;
+        .map_err(|e| UsageError::new("usage-db-failed", format!("begin tx: {e}")))?;
     write_batch(&tx, b, source_id, crate::services::usage::now_ms())?;
     tx.commit()
-        .map_err(|e| UsageError::new("usage-db-failed", format!("提交失败: {e}")))?;
+        .map_err(|e| UsageError::new("usage-db-failed", format!("commit tx: {e}")))?;
     Ok(())
 }
 
@@ -376,7 +376,7 @@ pub fn purge_expired(retention_days: i64, now_ms: i64) -> Result<usize, UsageErr
     let cutoff = cutoff_day(retention_days, now_ms);
     let conn = DB
         .lock()
-        .map_err(|e| UsageError::new("usage-db-failed", format!("DB 锁中毒: {e}")))?;
+        .map_err(|e| UsageError::new("usage-db-failed", format!("db poisoned lock: {e}")))?;
     Ok(dao::purge_detail_before_conn(&conn, &cutoff))
 }
 

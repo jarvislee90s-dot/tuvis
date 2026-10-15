@@ -210,15 +210,17 @@ pub fn resolve_range(range: &UsageRange, now_ms: i64) -> Result<ResolvedRange, U
                 .as_deref()
                 .and_then(|s| chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok())
                 .ok_or_else(|| {
-                    UsageError::new("usage-range-invalid", "自定义区间缺少合法的 from")
+                    UsageError::new("usage-range-invalid", "custom range: from missing")
                 })?;
             let to = range
                 .to
                 .as_deref()
                 .and_then(|s| chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok())
-                .ok_or_else(|| UsageError::new("usage-range-invalid", "自定义区间缺少合法的 to"))?;
+                .ok_or_else(|| {
+                    UsageError::new("usage-range-invalid", "custom range: to missing")
+                })?;
             if to < from {
-                return Err(UsageError::new("usage-range-invalid", "from 晚于 to"));
+                return Err(UsageError::new("usage-range-invalid", "from > to"));
             }
             let span = (to - from).num_days() + 1;
             let truncated = span > MAX_CUSTOM_SPAN_DAYS;

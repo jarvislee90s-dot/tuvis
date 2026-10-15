@@ -1485,7 +1485,7 @@
     "injectTmuxKeyFail": "tmux key send failed — see logs",
     "injectTmuxSpawnFail": "Failed to run tmux — see logs",
     "injectPlatformUnsupported": "Platform not supported",
-    "injectManualCheck": "Please verify the terminal manually (command sent, state unconfirmed — see logs)",
+    "injectManualCheck": "Please verify the terminal manually (command sent, state unconfirmed)",
     "injectNoScreen": "Terminal screen unreadable — nothing sent; verify the terminal or press \"Re-read\"",
     "injectMenuTableMissing": "codex permission menu or tier table not visible — no blind digit keys",
     "injectDialogMalformed": "Dialog has multiple highlight markers — refusing to act",
@@ -1501,5 +1501,10 @@
     "injectMenuTableMalformed": "Permission menu tier table is inconsistent — refusing to guess; pick in the terminal",
     "mobileNetworkFail": "Network error on {{param}} — see logs",
     "httpClientBuildFail": "Failed to build the HTTP client — see logs"
+  },
+  "mobile": {
+    "composer": {
+      "sendFailedRetry": "Send failed: {{error}} (retry available)"
+    }
   }
 }
