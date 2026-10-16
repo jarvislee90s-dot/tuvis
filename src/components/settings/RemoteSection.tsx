@@ -213,8 +213,10 @@ export function RemoteSection() {
   // 访问密码：首拍 status.pin 回填一次，轮询不回读（保留编辑中值）
   const [pinInput, setPinInput] = useState("");
   const pinInitRef = useRef(false);
-  // 隧道 Token：进面板回填已存值
+  // 隧道 Token：进面板回填已存值；savedToken 记「库里当前值」——值未变时保存
+  // 不折腾在跑的连接器（见 saveToken）
   const [token, setToken] = useState("");
+  const [savedToken, setSavedToken] = useState("");
   // 教程 popover（线稿 .help：点击展开/收起，可保持展开边看边操作）
   const [helpOpen, setHelpOpen] = useState(false);
   // 唯一展开的通道详情卡（线稿 pick()：同时只显示一个，点其它卡切换）。默认局域网
@@ -299,7 +301,11 @@ export function RemoteSection() {
 
   // Token 回填：进面板读已存值，后续刷新不回读
   useEffect(() => {
-    void (async () => setToken((await getSetting(TUNNEL_TOKEN_KEY)) ?? ""))();
+    void (async () => {
+      const saved = (await getSetting(TUNNEL_TOKEN_KEY)) ?? "";
+      setToken(saved);
+      setSavedToken(saved);
+    })();
   }, []);
 
   // PIN 回填：首个非空 status.pin 填一次（ref 闸），轮询不覆盖编辑中值
@@ -599,10 +605,24 @@ export function RemoteSection() {
   };
 
   // Token 保存（A6 落点：通用 set_setting）；开关由自有域名卡片开关驱动，后端
-  // start_channel 对空 Token 拒启并写快照错误（「自有域名缺少 Tunnel Token」）
+  // start_channel 对空 Token 拒启并写快照错误（「自有域名缺少 Tunnel Token」）。
+  // 2026-10-16 补：连接器 spawn 时才读 token，cloudflared 对注册失败只会无限重试、
+  // 不会自行退出——通道在跑时旧进程永远带着旧 token，值有变化时须走唯一启停入口
+  // （remote_toggle_channel）关-开 recycle，重连后 stderr 才解析出新地址；值未变
+  // 则不折腾在跑的连接器（避免无谓踢掉远程会话）
   const saveToken = async () => {
     try {
+      if (token === savedToken) {
+        toast.success(t("settings.remote.tokenSaved"));
+        return;
+      }
       await setSetting(TUNNEL_TOKEN_KEY, token);
+      setSavedToken(token);
+      if (chanRunning("named")) {
+        await toggleChannel("named", false);
+        await toggleChannel("named", true);
+        await refreshStatus();
+      }
       toast.success(t("settings.remote.tokenSaved"));
     } catch (e) {
       toast.error(formatInvokeError(e, t));
