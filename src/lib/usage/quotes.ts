@@ -9,7 +9,7 @@
 //    `split/join` 而不是 `replace` 正则——替换串里的 `$&` / `$1` 是另一套转义，日期与文本里带 `$`
 //    时会炸出非预期结果（split/join 对替换内容零解释）。
 import { QUOTE_POOL, type QuoteAgg } from "@/lib/usage/quotePool";
-import type { QuoteLang } from "@/lib/usage/lang";
+import type { Lang } from "@/lib/usage/lang";
 
 /** 4 个占位符的取值（键名与占位符同名同义，不留第二套命名） */
 export interface QuoteVars {
@@ -43,12 +43,7 @@ export function fillQuote(tpl: string, vars: QuoteVars): string {
  * 否则按序**首命中**预制池，一条都不命中时返回兜底条（池的末条恒真，兜底不可能落空）。
  * `vars` 缺省 → 4 个占位符按空串填（调用方永远该给 vars；给了就等于给了具体数字）。
  */
-export function pickQuote(
-  agg: QuoteAgg,
-  lang: QuoteLang,
-  custom?: string,
-  vars?: QuoteVars
-): string {
+export function pickQuote(agg: QuoteAgg, lang: Lang, custom?: string, vars?: QuoteVars): string {
   const v = vars ?? EMPTY_VARS;
   const trimmed = custom?.trim() ?? "";
   if (trimmed) return fillQuote(trimmed, v);
