@@ -1719,6 +1719,60 @@
   "mobile": {
     "composer": {
       "sendFailedRetry": "Send failed: {{error}} (retry available)"
+    },
+    "codex": {
+      "availability": {
+        "controllable": "Controllable",
+        "send_only": "Send-only (no interactive control)",
+        "compat_only": "Compatibility mode only",
+        "unavailable": "Not controllable right now"
+      },
+      "staleBanner": "Desktop connection interrupted — showing the last known view; remote actions are disabled for now",
+      "projection": {
+        "truncated": "Content too long — showing the latest portion only (see Desktop for full history)",
+        "empty": "No messages yet"
+      },
+      "pending": {
+        "titleCommand": "Command approval request",
+        "titlePermissions": "Permission request",
+        "titleInput": "Waiting for your answer",
+        "titleUnsupported": "Pending request",
+        "unsupported": "This request cannot be handled remotely yet",
+        "unverified": "The current Desktop build has not verified this action",
+        "approve": "Approve",
+        "reject": "Reject",
+        "submit": "Submit answer",
+        "freePlaceholder": "Other (free text)",
+        "freeAria": "Free-form answer",
+        "incomplete": "{{n}} question(s) unanswered — answer all before submitting",
+        "unknownDelivery": "Delivery result unknown — please verify on Desktop",
+        "accepted": "Accepted — Desktop is processing (does not mean the turn finished)",
+        "rejectedReceipt": "Rejected (Desktop acknowledged)",
+        "notSent": "Not sent — nothing was delivered; you can try again",
+        "staleContext": "This request is stale (Desktop state changed) — wait for the latest view",
+        "failed": "Response failed: {{message}}",
+        "writeLocked": "Desktop connection interrupted — answering is disabled for now"
+      },
+      "queue": {
+        "title": "Outgoing queue",
+        "position": "#{{n}} in queue",
+        "stateQueued": "Queued",
+        "stateReserved": "Dispatching",
+        "stateAccepted": "Accepted",
+        "stateRejected": "Failed",
+        "stateUnknown": "Outcome unknown",
+        "stateCancelled": "Cancelled",
+        "retract": "Retract",
+        "retractBusy": "Already dispatched — cannot retract (verify on Desktop)",
+        "retractFailed": "Retract failed: {{message}}",
+        "blockedCompat": "A compatibility-mode send is still outstanding — queue dispatch is paused; verify on Desktop first"
+      },
+      "composer": {
+        "codexAccepted": "Accepted — Desktop is running it",
+        "codexUnknown": "Delivery result unknown — please verify on Desktop",
+        "codexNotDelivered": "Not delivered: {{reason}}",
+        "codexQueued": "Queued on Desktop, position {{position}}"
+      }
     }
   }
 }

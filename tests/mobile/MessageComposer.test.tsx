@@ -2124,3 +2124,119 @@ describe("卡片在场分流：审批拦截 / 问答转向自由作答 / 不可�
     expect(screen.queryByTestId("composer-card-presence")).toBeNull();
   });
 });
+
+// ==== Task 9：Codex APP 原生发送（Desktop IPC）====
+// 契约：Codex APP（headless_codex_* 通道）的 session-send body 必带 actionId
+// （UUID，一次用户动作生成一次，失败保留同 ID 重试）；回执新增 desktop_ipc /
+// codex_queued 两态。native_send_with_h3_off 是计划 Step 1 点名用例：真实渲染
+// MessageComposer、mock send-info 为 A 能力（A 可用时 send-info 不再受 H3 门——
+// injectable=true），H3=false 只影响服务端 compat 分支；发送按钮可用且只发一次。
+describe("MessageComposer：Codex APP 原生发送（Task 9）", () => {
+  /** Codex APP 可注入态（A 可用：Desktop IPC 投影可写；通道 = H8 wire 词） */
+  function codexAppSendInfo(): SendInfo {
+    return {
+      injectable: true,
+      channels: ["headless_codex_queue"],
+      visibility: "tuvis_only",
+    };
+  }
+
+  function desktopIpcReceipt(delivery: string) {
+    return {
+      actionId: "act-1",
+      delivery,
+      route: "desktop_ipc",
+      turnId: "turn-1",
+      envelopeId: "env-1",
+      reasonCode: null,
+    };
+  }
+
+  it("native_send_with_h3_off：A 能力 + H3=false → 按钮可用且只发一次（body 带 actionId）", async () => {
+    installFetch();
+    routes.info = codexAppSendInfo();
+    routes.send = {
+      status: "desktop_ipc",
+      receipt: desktopIpcReceipt("accepted"),
+    };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "原生 start-turn 的普通消息" } });
+    // H3 关闭不再禁用 composer：send-info 由 A 投影下发 injectable=true
+    // （空文案禁用是 canSend 的正文闸与本用例无关——输入后即测可用性）
+    const sendBtn = screen.getByTestId("composer-send") as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(false);
+    // 双击：sending 闸保证只发一次
+    fireEvent.click(sendBtn);
+    fireEvent.click(sendBtn);
+    await screen.findByTestId("send-receipt-codex-accepted");
+    expect(sendCalls()).toHaveLength(1);
+    const body = JSON.parse(String((sendCalls()[0][1] as RequestInit).body));
+    expect(body.sessionId).toBe("sess-1");
+    expect(body.text).toBe("原生 start-turn 的普通消息");
+    // Codex APP 必带 actionId（UUID v4 形态）；CLI 的 queueOnly 语义不随行
+    expect(body.actionId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    );
+    expect(body).not.toHaveProperty("queueOnly");
+    // 消息已离开客户端 → 输入清空
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("action_id_reused_after_failure：网络失败保留正文与同一 actionId（重试不换 ID）", async () => {
+    installFetch();
+    routes.info = codexAppSendInfo();
+    routes.sendStatus = 500;
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "失败也要沿同 ID" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("send-receipt-failed");
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe(
+      "失败也要沿同 ID"
+    );
+    routes.sendStatus = undefined;
+    routes.send = {
+      status: "desktop_ipc",
+      receipt: desktopIpcReceipt("unknown_delivery"),
+    };
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(await screen.findByTestId("send-receipt-codex-unknown")).toBeTruthy();
+    expect(sendCalls()).toHaveLength(2);
+    const id1 = JSON.parse(String((sendCalls()[0][1] as RequestInit).body)).actionId;
+    const id2 = JSON.parse(String((sendCalls()[1][1] as RequestInit).body)).actionId;
+    expect(id1).toBe(id2); // 同一用户动作沿同一 actionId（服务端按 action 去重的锚）
+    // UNKNOWN：结果未知 → 输入清空（防重复发送），绝不出现「重试」按钮
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+    expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+  });
+
+  it("codex_queued_receipt：忙 Thread 留队回执 → 中性 chip 带队位（输入清空）", async () => {
+    installFetch();
+    routes.info = codexAppSendInfo();
+    routes.send = { status: "codex_queued", actionId: "act-2", position: 3 };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "排队消息" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    const chip = await screen.findByTestId("send-receipt-codex-queued");
+    expect(chip.textContent).toContain("3");
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("cli_send_keeps_old_body：CLI 通道（tmux）不携带 actionId（旧合同零漂移）", async () => {
+    installFetch();
+    routes.info = sendInfo();
+    routes.send = { status: "delivered" };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "终端直发" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("send-receipt-delivered");
+    expect(sendCalls()).toHaveLength(1);
+    expect(JSON.parse(String((sendCalls()[0][1] as RequestInit).body))).toEqual({
+      sessionId: "sess-1",
+      text: "终端直发",
+    });
+  });
+});
