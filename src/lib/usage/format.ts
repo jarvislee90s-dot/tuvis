@@ -3,6 +3,7 @@
 // 纪律：零 DOM API、零新增依赖；数字口径逐字取自 spec P8「显示规范与状态」的格式化表；
 // 纯函数测试不进 jsdom 专属 API（计划 §3 第 33/34 条）。
 import { AGENT_BADGE } from "@/lib/agentBadge";
+import type { Lang } from "@/lib/usage/lang";
 
 /**
  * 「不可得」占位（值本身为 `null` / 算不出）。**② 新增文件内共用**，各组件不得自造。
@@ -32,9 +33,19 @@ export const UNKNOWN_TOKEN = "?";
  * ⇒ 相对 spec P8 旧表的两处变化：**万档 1 位 → 2 位**、**两档一律不再剥尾零**（旧：万剥 `.0`、亿去尾零）。
  * 负数与非有限值归 `"0"`（绝不显示 `NaN`）。
  * ⚠️ 与 `fmtInt` 刻意区分：hero 大数字与所有 hover「精确值」不走本函数（那是完整千分位）。
+ *
+ * en 档（issue #160 决策 1）：`<1K` 整数 / `<1M` X.XXK / `<1B` X.XXM / `≥1B` X.XXB；
+ * en 时长单位词见 `fmtDur` / `fmtLongest`（`X.X min` / `X.X s` / `N ms`）。
+ * 「档内进位不跨档」两个钉死用例：999_999 → `1000.00K`（不翻 M）、999_999_999 → `1000.00M`（不翻 B）。
  */
-export function fmtTokens(n: number): string {
+export function fmtTokens(n: number, locale: Lang = "zh"): string {
   if (!Number.isFinite(n) || n <= 0) return "0";
+  if (locale === "en") {
+    if (n < 1_000) return String(Math.round(n));
+    if (n < 1_000_000) return (n / 1_000).toFixed(2) + "K";
+    if (n < 1_000_000_000) return (n / 1_000_000).toFixed(2) + "M";
+    return (n / 1_000_000_000).toFixed(2) + "B";
+  }
   if (n < 10_000) return String(Math.round(n));
   if (n < 100_000_000) return (n / 10_000).toFixed(2) + "万";
   return (n / 100_000_000).toFixed(2) + "亿";
@@ -57,17 +68,19 @@ export function fmtPct(x: number): string {
   return (x * 100).toFixed(1) + "%";
 }
 
-/** 时长三档（spec P8）：≥60 秒 → 分钟（1 位小数）；≥1 秒 → 秒（1 位小数）；否则毫秒（取整）。 */
-export function fmtDur(ms: number): string {
-  if (ms >= 60_000) return (ms / 60_000).toFixed(1) + " 分钟";
-  if (ms >= 1_000) return (ms / 1_000).toFixed(1) + " 秒";
-  return Math.round(ms) + " 毫秒";
+/** 时长三档（spec P8）：≥60 秒 → 分钟（1 位小数）；≥1 秒 → 秒（1 位小数）；否则毫秒（取整）。
+ *  en（issue #160）：数值口径不变，仅换单位词 —— `X.X min` / `X.X s` / `N ms`。 */
+export function fmtDur(ms: number, locale: Lang = "zh"): string {
+  if (ms >= 60_000) return (ms / 60_000).toFixed(1) + (locale === "en" ? " min" : " 分钟");
+  if (ms >= 1_000) return (ms / 1_000).toFixed(1) + (locale === "en" ? " s" : " 秒");
+  return Math.round(ms) + (locale === "en" ? " ms" : " 毫秒");
 }
 
-/** 最长单 turn 两档（spec P8 / D19）：≥60 秒 → 分钟（1 位小数）；否则整秒（0 ms 落「0 秒」）。 */
-export function fmtLongest(ms: number): string {
-  if (ms >= 60_000) return (ms / 60_000).toFixed(1) + " 分钟";
-  return Math.round(ms / 1_000) + " 秒";
+/** 最长单 turn 两档（spec P8 / D19）：≥60 秒 → 分钟（1 位小数）；否则整秒（0 ms 落「0 秒」）。
+ *  en（issue #160）：数值口径不变，仅换单位词 —— `X.X min` / `N s`。 */
+export function fmtLongest(ms: number, locale: Lang = "zh"): string {
+  if (ms >= 60_000) return (ms / 60_000).toFixed(1) + (locale === "en" ? " min" : " 分钟");
+  return Math.round(ms / 1_000) + (locale === "en" ? " s" : " 秒");
 }
 
 /**

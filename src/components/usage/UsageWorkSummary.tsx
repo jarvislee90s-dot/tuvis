@@ -27,6 +27,7 @@ import {
   toolReason,
 } from "@/lib/usage/availability";
 import { EM_DASH, fmtDur, fmtInt, fmtLongest, usageAgentLabel } from "@/lib/usage/format";
+import { getLang } from "@/lib/usage/lang";
 import type { TFn } from "@/lib/usage/range";
 import type { UsageAvailability, WorkSummary } from "@/types/usage";
 
@@ -70,6 +71,8 @@ function ValueRow({
 }
 
 export function UsageWorkSummary({ work, availability, t }: UsageWorkSummaryProps) {
+  // 格式化语言（issue #160）：时长单位词（分钟/秒/毫秒 vs min/s/ms）随界面语言走，组件体取一次。
+  const lang = getLang();
   const sessions = work?.sessions ?? null;
   const turns = work?.turnsPerTool ?? {};
   const longest = work?.longestTurnPerTool ?? {};
@@ -130,7 +133,7 @@ export function UsageWorkSummary({ work, availability, t }: UsageWorkSummaryProp
       : null;
   const topMsText =
     topToolMs !== null && isMetricAvailable(topToolMsAv)
-      ? `${topToolMs.name} · ${fmtDur(topToolMs.ms)}`
+      ? `${topToolMs.name} · ${fmtDur(topToolMs.ms, lang)}`
       : null;
 
   /** 段头（`title` 承载该段的全局口径提示） */
@@ -251,10 +254,10 @@ export function UsageWorkSummary({ work, availability, t }: UsageWorkSummaryProp
                     <span>{usageAgentLabel(toolId)}</span>
                     <span className="tabular-nums">
                       <span className="text-muted-foreground">{t("usage.work.p50")}</span>{" "}
-                      {usable === null ? EM_DASH : fmtDur(usable.p50)}
+                      {usable === null ? EM_DASH : fmtDur(usable.p50, lang)}
                       {" · "}
                       <span className="text-muted-foreground">{t("usage.work.max")}</span>{" "}
-                      {usable === null ? EM_DASH : fmtLongest(usable.max)}
+                      {usable === null ? EM_DASH : fmtLongest(usable.max, lang)}
                     </span>
                   </li>
                 );
@@ -283,7 +286,7 @@ export function UsageWorkSummary({ work, availability, t }: UsageWorkSummaryProp
             text={
               work?.toolAvgMs == null || !isMetricAvailable(toolAvgAv)
                 ? null
-                : fmtDur(work.toolAvgMs)
+                : fmtDur(work.toolAvgMs, lang)
             }
             unavailableTitle={metricReason(t, toolAvgAv)}
           />

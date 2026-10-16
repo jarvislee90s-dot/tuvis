@@ -30,6 +30,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { DIST_MIN_BAR_PCT, distributionRows, type DistRow } from "@/lib/usage/distribution";
 import { fmtInt, fmtTokens, usageAgentLabel } from "@/lib/usage/format";
+import { getLang } from "@/lib/usage/lang";
 import type { TFn } from "@/lib/usage/range";
 import type { UsageGroupBy, UsageRow } from "@/types/usage";
 
@@ -79,6 +80,8 @@ export function UsageDistributionCard({
   onGroupByChange,
   t,
 }: UsageDistributionCardProps) {
+  // 格式化语言（issue #160）：数值单位（万/亿 vs K/M/B）随界面语言走，组件体取一次。
+  const lang = getLang();
   const { rows: distRows, moreCount } = distributionRows(rows);
   const isEmpty = distRows.length === 0;
 
@@ -142,7 +145,7 @@ export function UsageDistributionCard({
                     title={t("usage.exact", { value: fmtInt(row.value) })}
                     className="text-right font-medium whitespace-nowrap tabular-nums"
                   >
-                    {fmtTokens(row.value)}
+                    {fmtTokens(row.value, lang)}
                   </span>
                   <span
                     data-testid={`usage-dist-bar-${row.key}`}

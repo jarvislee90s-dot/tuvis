@@ -1,10 +1,17 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import SubagentList from "@/mobile/SubagentList";
 import type { SubagentView } from "@/mobile/api";
+import i18n from "@/i18n";
 
 // 观察台 §二：单一列表派发序（服务端序即派发序）/ 绿灰点 / 冻结值 /
 // 点击回调 / 空（null/[]）整体不渲染。
+
+// `7.09万` 断言隐含 zh 前提（issue #160）：渲染链经 SubagentList.tsx:71 → chipTokenText
+// 缺省读 i18n 单例，jsdom 默认 en-US 会出 `70.88K`——显式钉 zh，断言行零改动。
+beforeAll(async () => {
+  await i18n.changeLanguage("zh");
+});
 
 function sa(
   id: string,

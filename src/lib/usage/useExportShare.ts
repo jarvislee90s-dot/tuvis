@@ -75,14 +75,19 @@ function toolCells(dash: UsageDashboard, t: TFn): [string, string][] {
   const work = dash.workSummary;
   return [
     [t("usage.work.toolCallsTotal"), work.toolCalls === null ? EM_DASH : fmtInt(work.toolCalls)],
-    [t("usage.work.toolAvg"), work.toolAvgMs === null ? EM_DASH : fmtDur(work.toolAvgMs)],
+    [
+      t("usage.work.toolAvg"),
+      work.toolAvgMs === null ? EM_DASH : fmtDur(work.toolAvgMs, getLang()),
+    ],
     [
       t("usage.work.topToolCount"),
       work.topTool === null ? EM_DASH : `${work.topTool.name} · ${fmtInt(work.topTool.count)}`,
     ],
     [
       t("usage.work.topToolMs"),
-      work.topToolMs === null ? EM_DASH : `${work.topToolMs.name} · ${fmtDur(work.topToolMs.ms)}`,
+      work.topToolMs === null
+        ? EM_DASH
+        : `${work.topToolMs.name} · ${fmtDur(work.topToolMs.ms, getLang())}`,
     ],
   ];
 }

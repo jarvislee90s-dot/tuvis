@@ -1,14 +1,21 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import SubagentChips, {
   chipTokenText,
   formatElapsed,
   subagentElapsedMs,
 } from "@/mobile/SubagentChips";
 import type { SubagentView } from "@/mobile/api";
+import i18n from "@/i18n";
 
 // 观察台 T5：chip 改纯展示（拉取上提 SessionDetail）——本文件测
 // running 过滤 / 时长自走（tick 不出组件）/ 点击直达 / 空不渲染。
+
+// `7.09万` 断言隐含 zh 前提（issue #160）：chipTokenText 缺省读 i18n 单例，
+// jsdom 默认 en-US 会出 `70.88K`——显式钉 zh，断言行零改动。
+beforeAll(async () => {
+  await i18n.changeLanguage("zh");
+});
 
 function sa(id: string, status: "running" | "idle", spawnTs: string | null): SubagentView {
   return {
@@ -87,5 +94,15 @@ describe("subagentElapsedMs（冻结锚共享口径）", () => {
     expect(chipTokenText({ input: 5124, cacheRead: 56448, cacheCreation: 0, output: 9312 })).toBe(
       "7.09万"
     );
+  });
+});
+
+describe("chipTokenText locale（issue #160）", () => {
+  it("en：K/M/B（jsdom 默认 en-US，此处置显式钉 en）", async () => {
+    await i18n.changeLanguage("en");
+    expect(chipTokenText({ input: 5124, cacheRead: 56448, cacheCreation: 0, output: 9312 })).toBe(
+      "70.88K"
+    );
+    await i18n.changeLanguage("zh"); // 还原，不污染本文件其余 zh 前提用例
   });
 });
