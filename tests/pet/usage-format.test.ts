@@ -123,3 +123,51 @@ describe("format.ts（spec P8 显示规范）", () => {
     expect(UNKNOWN_TOKEN).toBe("?");
   });
 });
+
+describe("format.ts en 档（issue #160 决策 1：K/M/B + min/s/ms）", () => {
+  it("14. fmtTokens en：<1K 纯整数（含进位同构 zh 9999.6→10000）", () => {
+    expect(fmtTokens(999, "en")).toBe("999");
+    expect(fmtTokens(999.6, "en")).toBe("1000");
+    expect(fmtTokens(0, "en")).toBe("0");
+    expect(fmtTokens(-1, "en")).toBe("0");
+    expect(fmtTokens(Number.NaN, "en")).toBe("0");
+    expect(fmtTokens(Number.POSITIVE_INFINITY, "en")).toBe("0");
+  });
+  it("15. fmtTokens en：K 档恒 2 位小数不剥尾零；档内进位钉死", () => {
+    expect(fmtTokens(1_000, "en")).toBe("1.00K");
+    expect(fmtTokens(12_500, "en")).toBe("12.50K");
+    expect(fmtTokens(999_999, "en")).toBe("1000.00K"); // 999.999→toFixed(2)→1000.00，不跨档翻 M
+  });
+  it("16. fmtTokens en：M / B 档", () => {
+    expect(fmtTokens(1_000_000, "en")).toBe("1.00M");
+    expect(fmtTokens(1_234_567, "en")).toBe("1.23M");
+    expect(fmtTokens(17_950_000, "en")).toBe("17.95M");
+    expect(fmtTokens(123_456_789, "en")).toBe("123.46M");
+    expect(fmtTokens(999_999_999, "en")).toBe("1000.00M"); // M 档内进位，不跨档翻 B
+    expect(fmtTokens(1_000_000_000, "en")).toBe("1.00B");
+    expect(fmtTokens(4_370_000_000, "en")).toBe("4.37B");
+  });
+  it("17. fmtDur en：数值口径不变，仅换单位词", () => {
+    expect(fmtDur(60_000, "en")).toBe("1.0 min");
+    expect(fmtDur(310_607, "en")).toBe("5.2 min");
+    expect(fmtDur(1_864_000, "en")).toBe("31.1 min");
+    expect(fmtDur(1_000, "en")).toBe("1.0 s");
+    expect(fmtDur(4_500, "en")).toBe("4.5 s");
+    expect(fmtDur(59_999, "en")).toBe("60.0 s");
+    expect(fmtDur(0, "en")).toBe("0 ms");
+    expect(fmtDur(250.6, "en")).toBe("251 ms");
+    expect(fmtDur(999, "en")).toBe("999 ms");
+  });
+  it("18. fmtLongest en：两档", () => {
+    expect(fmtLongest(50_311_958, "en")).toBe("838.5 min");
+    expect(fmtLongest(60_000, "en")).toBe("1.0 min");
+    expect(fmtLongest(59_000, "en")).toBe("59 s");
+    expect(fmtLongest(1_000, "en")).toBe("1 s");
+    expect(fmtLongest(0, "en")).toBe("0 s");
+  });
+  it("19. 缺省 locale = zh（漏传兜底：迁移遗漏不破坏中文界面）", () => {
+    expect(fmtTokens(12_500)).toBe("1.25万");
+    expect(fmtDur(60_000)).toBe("1.0 分钟");
+    expect(fmtLongest(59_000)).toBe("59 秒");
+  });
+});
