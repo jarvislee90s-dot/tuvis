@@ -96,3 +96,13 @@ describe("subagentElapsedMs（冻结锚共享口径）", () => {
     );
   });
 });
+
+describe("chipTokenText locale（issue #160）", () => {
+  it("en：K/M/B（jsdom 默认 en-US，此处置显式钉 en）", async () => {
+    await i18n.changeLanguage("en");
+    expect(chipTokenText({ input: 5124, cacheRead: 56448, cacheCreation: 0, output: 9312 })).toBe(
+      "70.88K"
+    );
+    await i18n.changeLanguage("zh"); // 还原，不污染本文件其余 zh 前提用例
+  });
+});
