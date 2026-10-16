@@ -1,5 +1,9 @@
 # Changelog
 
+<!-- 新条目书写契约（自 v0.5.9 起）：中文条目（含缩进续行）写完后，紧跟一行
+     `EN: …` —— 半角冒号、冒号前无空格、行首允许缩进；`- EN:` 列表项形态无效。
+     契约全文见 tuvis-website 仓库 scripts/split-changelog.mjs 头注释。 -->
+
 ## [0.5.8] - 2026-10-16
 
 ### Added
@@ -8,43 +12,104 @@
   并排在内置列表第一位；内置宠物目录结构与描述符收敛为统一注册表（`public/pet/<目录名>/`
   同构布局，新增内置宠物 = 建目录 + 注册表追加一行）。旧版无前缀激活指针读取时自动归一，
   升级用户既有选择保留，旧导入的同名外部宠物仍可管理。
+  EN: Added a built-in 3D tech-rabbit desktop pet as the new default, with a fresh 3D asset
+    set and four voice groups of four original lines each; it is pre-selected on first use
+    and sorted first in the built-in list. Built-in pet directories and descriptors were
+    consolidated into a single registry (a uniform `public/pet/<dir>/` layout — adding a
+    built-in pet now means creating a directory and appending one registry row). Legacy
+    unprefixed activation pointers are normalized on read, upgraded installs keep their
+    existing selection, and previously imported external pets with clashing names remain
+    manageable.
 - **报错全面带错误码**：Rust 全域（remote / commands / services / inject 等）与移动端网络层
   的错误统一为「错误码 + 中英文案」，新增上屏中文硬编码扫描门禁防复发（#123/#150/#157）；
   反馈问题时附上错误码即可精确定位。
+  EN: Errors now carry error codes across the board: failures in the Rust layer (remote,
+    commands, services, inject, etc.) and the mobile network layer are unified as "error
+    code + bilingual message", with a new CI gate that scans for hardcoded on-screen
+    Chinese strings to prevent regressions (#123/#150/#157). Quote the error code in a bug
+    report and the failure can be pinpointed.
 - **文件面板第四来源「会话产物」**：从会话正文扫描产物链接与行内文件引用（代码围栏内外双
   形态），桌面与移动端同源接入；可预览扩展白名单、存在性过滤、rank 兜底合并，codex 会话
   透传工作目录作为相对路径解析基准。
+  EN: Added "session artifacts" as a fourth source for the file panel: artifact links and
+    inline file references are scanned from session bodies (both inside and outside code
+    fences) and wired into desktop and mobile from one shared implementation; preview
+    honors an extension whitelist, existence filtering and rank-based fallback merging,
+    and Codex sessions pass their working directory through as the base for resolving
+    relative paths.
 - **codex 信任门改应用内常驻操作卡**：注册后的一次性系统通知升级为常驻应用内操作卡（弹卡
   ≠销账，销账只在「复制命令」/「不再提醒」；卡面自带 `/hooks` 命令文本兜底剪贴板不可用）；
   Hook 未注册原因如实标注（macOS 上 kimi 显示「本平台暂不分发 Hook 通道，无需处理」）；
   信号健康度分区挪至设置页「工具与体检」块。
+  EN: The Codex trust gate became a persistent in-app action card instead of a one-shot
+    system notification after registration (showing the card is not the same as clearing
+    it — only "Copy command" or "Don't remind me again" dismisses it, and the card carries
+    the `/hooks` command text as a fallback when the clipboard is unavailable). The reason
+    a hook is not registered is stated as-is (on macOS Kimi shows "this platform does not
+    ship a Hook channel yet — nothing to do"), and the signal-health section moved into
+    the "Tools & Health" block in Settings.
 - 工具徽标官方化：DSH / Kimi / OpenClaw / WorkBuddy 等按官方源重绘，全端统一设计语言
   （#149/#153/#154/#156）。
+  EN: Tool badges refreshed to official artwork: DSH, Kimi, OpenClaw, WorkBuddy and others
+    were redrawn from official sources, unifying the design language across all platforms
+    (#149/#153/#154/#156).
 
 ### Changed
 
 - **宠物物理坠落改为每次应用重启默认关**（会话内可开、跨窗口同步不变；2026-10-13 用户裁决）。
+  EN: Pet physics-based falling now defaults to off after every app restart (it can still
+    be turned on within a session and cross-window sync is unchanged; per the user ruling
+    of 2026-10-13).
 - **看板筛选移除 openclaw 档**：不支持消息提醒；卡片徽章保留，残留的 openclaw 筛选自动回落
   「全部」。
+  EN: Dropped the OpenClaw option from board filters since message notifications are not
+    supported for it; the card badge remains, and any leftover OpenClaw filter falls back
+    to "All" automatically.
 
 ### Fixed
 
 - 预设 L4 外链别名误报根修：symlink HOME、macOS `/var→/private/var` 别名下不再把自建链接
   误报为外链；附带 universal+native 防御（#64）。
+  EN: Root-cause fix for false external-link reports on preset L4: with a symlinked HOME or the
+    macOS `/var→/private/var` alias in play, self-created links are no longer misreported
+    as external; ships with both universal and native defenses (#64).
 - 注入键黑名单上提 Injector 引擎入口：macOS 传统三通道同受检，封住绕过缺口（#79）。
+  EN: The injection key blacklist is now enforced at the Injector engine entry point, so
+    all three legacy macOS channels go through the same check, closing the bypass gap
+    (#79).
 - cloudflared macOS `.tgz` sha256 期望值更正：修「外部域名（免域名）安装包校验失败」。
+  EN: Corrected the expected sha256 of the cloudflared macOS `.tgz`, fixing "External
+    domain (no domain required): installer checksum verification failed".
 - 远程「连不通类」失败不再自动重置 Funnel：瞬时抖动 1–2 分钟自愈，不再把完好配置清掉；
   引导文案与诊断日志同步补齐。
+  EN: Remote "cannot connect" failures no longer auto-reset the Funnel: transient glitches
+    now self-heal within a minute or two instead of wiping a perfectly good configuration;
+    onboarding copy and diagnostic logs were updated to match.
 - Windows 嵌套 skill 全链路修复：skill id/name 斜杠口径统一，存量反斜杠 id 按 DB 清单自动
   迁移，无需手动处理。
+  EN: End-to-end fix for nested skills on Windows: skill id/name slash conventions are now
+    uniform, and existing backslash ids are migrated automatically from the DB inventory —
+    no manual action required.
 - Windows 全量回归 11+1 条存量红灯修齐；win32 纯消歧逻辑提取重构、身份标记单一出处（#57）。
+  EN: Cleared all pre-existing failures in the full Windows regression suite (11 + 1);
+    win32 disambiguation logic was extracted and refactored, and identity markers now
+    come from a single source of truth (#57).
 
 ### 工程
 
 - 本机门禁脚本 `ci-backend-local.sh`（与 CI backend job 同口径）入库（#127/#128）。
+  EN: Checked the local gate script `ci-backend-local.sh` into the repository, mirroring
+    the CI backend job (#127/#128).
 - 官网联动触发器换 `peter-evans/repository-dispatch`（原引用在官方组织下不存在，静默失败）。
+  EN: Switched the website-sync trigger to `peter-evans/repository-dispatch` (the
+    previously referenced action does not exist under its official organization and failed
+    silently).
 - 历史文档失效口径标注（#131）、tokens_used 防误用护栏与 wait_child_bounded 失效条件登记
   （#97/#126）、设置排版锁按值放行 + QR/行文/提示三档立档（#124/#125）、休眠 API 删除（#64）。
+  EN: Annotated stale claims in historical docs (#131); added misuse guards around
+    `tokens_used` and documented the invalidation conditions of `wait_child_bounded`
+    (#97/#126); the settings layout lock now allowlists by value, with QR, copy and hint
+    tiers put on record (#124/#125); removed the dormant API (#64).
 
 ## [0.5.7] - 2026-10-13
 
@@ -58,15 +123,42 @@
   自启启动时带 `--tuvis-autostart` 参数，主窗口静默进托盘、桌宠照常跟出。
   **卸载清理面有限定**：NSIS 钩子只清**执行卸载的那个用户**的 HKCU 条目（HKLM 提权残留
   由应用内开关的写后验证兜底）；macOS 无卸载钩子面，需手动移除 LaunchAgent plist。
+  EN: Launch at login: a new "Launch at login" card in the Settings "Notifications & Pet"
+    block, with a matching checkbox under the tray's "Show window" item — both share one
+    read/write path (the `flip_and_sync` single point), so the checkbox state stays
+    consistent in both places. The source of truth is a live read of the OS-side state
+    (the Windows registry Run key across both HKLM/HKCU hives, plus the
+    `Explorer\StartupApproved\Run` enable/disable markers written by Task Manager; macOS
+    LaunchAgents) rather than local KV storage, so the UI cannot drift from reality;
+    failures roll back and are reported honestly instead of claiming success. Autostart
+    passes `--tuvis-autostart`, the main window slips quietly into the tray, and the pet
+    still follows along. Uninstall cleanup has known limits: the NSIS hook only clears the
+    HKCU entries of the user who ran the uninstall (leftover elevated HKLM entries are
+    backstopped by write-after verification of the in-app switch); macOS has no uninstall
+    hook, so the LaunchAgent plist must be removed by hand.
 - **桌面看板按工具筛选**：桌面看板标签栏下方新增「全部」+ 8 工具 chips 单选；**图标与
   文案**与卡片徽章同源（chip 底色/选中态走主题 primary，与徽章底色并非同值），筛选口径
   与移动端看板既有的 `filterByAgent` 同一语义（移动端此前已有筛选，本次为桌面端补齐）。
   选择记忆在 localStorage（脏值/异常回落「全部」），计数条保持全量，筛空时如实报出
   工具名而非给空板。
+  EN: Filter the desktop board by tool: an "All" chip plus eight single-select tool chips
+    were added under the board tab bar; their icons and labels come from the same source
+    as the card badges (chip background and selected state use the theme primary, which is
+    not the same value as the badge background), and the filter semantics match the
+    existing mobile `filterByAgent` (mobile already had filtering; this closes the gap on
+    desktop). The choice is remembered in localStorage (dirty or invalid values fall back
+    to "All"), the count bar always reflects all sessions, and an empty result names the
+    tool honestly instead of showing a blank board.
 - **桌宠「启动时跟出」开关**：默认开启，随 petConfig 存档 sanitize 兼容旧配置（旧存档
   无该键 ⇒ 取默认 true）。**这是相对 v0.5.6 的行为反转**：旧版启动可见性读 `loadVisible()`
   （上次收起就保持收起），现改由本开关决定，故此前收纳过桌宠的用户升级后会发现它每次
   启动都跟出。
+  EN: A "Show pet on startup" switch for the desktop pet, on by default and backward
+    compatible via petConfig save sanitization (older saves without the key get the
+    default true). This reverses the v0.5.6 behavior: startup visibility used to read
+    `loadVisible()` (staying hidden if it was hidden last time) and is now decided by this
+    switch, so users who had stashed the pet will find it showing up on every launch after
+    upgrading.
 
 ### Changed
 
@@ -74,6 +166,12 @@
   块序重派为 通知与桌宠 → 外观与皮肤 → 远程接入 → 用量统计 → 工具与体检 → 数据管理，
   默认块改为「通知与桌宠」；远程端外观卡改为常展开，桌面端外观卡标题补明「桌面端外观」
   以消歧。
+  EN: Settings page reorganized: top-level section titles gained a primary color bar and
+    larger type, and all 13 settings cards were unified with a gray header strip; the
+    sections were reordered to Notifications & Pet → Appearance & Skins → Remote Access →
+    Usage Stats → Tools & Health → Data Management, with Notifications & Pet as the
+    default; on the remote end the appearance card is now always expanded, and on desktop
+    its title was clarified to "Desktop appearance" to avoid ambiguity.
 
 ### Fixed
 
@@ -84,6 +182,18 @@
   文档列了两条候选机制且明写「explorer 那次命中哪一条仍未解释」，需真机句柄槽位取证）；
   一键 resume 起窗路径走 `ConsoleMode::OwnConsole` 空臂，stdio 继承语义与
   `CREATE_NEW_CONSOLE` 均逐字未变（属同形加固，本轮未真机复验）。
+  EN: Opening directories/files failed with `os error 6` in the installed build: a GUI
+    process built with `windows_subsystem = "windows"` has no console, so child processes
+    spawned for system actions such as "open directory / open MCP config file" reported
+    an invalid handle. stdio is now explicitly nulled before spawning, and a
+    `spawn_detached` single point consolidates every such spawn (directory/file opening,
+    the deep-link `cmd /C start` fallback, and the window-marker helper exe). The root
+    cause remains unconfirmed (the `detached` module docs list two candidate mechanisms
+    and state plainly that "which one the explorer incident hit is still unexplained";
+    real-machine handle-slot evidence is still needed); the one-click resume window path
+    goes through the empty `ConsoleMode::OwnConsole` arm with stdio inheritance semantics
+    and `CREATE_NEW_CONSOLE` unchanged verbatim (same-shape hardening, not re-verified on
+    a real machine this round).
 - **codex APP 会话的写动作走错通道**：APP 形态（ChatGPT 桌面 GUI）没有控制台，模式/
   权限切换与问答作答所依赖的 CLI 键序通道对它无效（真机实证 `AttachConsole
   0x80070006`、屏读零投递、问答 `aborted:select`）。协议臂落地前，`session-mode/switch`、
@@ -95,24 +205,70 @@
   `inject/routing.rs` 对 APP 形态 403 `app_form` 拦截，不在本次新开口之列。配套在设置页
   「工具管理」卡下补了一行常驻提示（`settings.tools.boardRemoteNote`，中英双语）：
   「取消勾选的工具不会出现在看板，也无法远程发送」。
+  EN: Write actions on Codex APP sessions went down the wrong channel: the APP form (the
+    ChatGPT desktop GUI) has no console, so the CLI keystroke-sequence channel that
+    mode/permission switching and Q&A answering rely on simply does not work for it
+    (confirmed on a real machine: `AttachConsole 0x80070006`, zero screen-read deliveries,
+    Q&A `aborted:select`). Until the protocol arm lands, the four write endpoints
+    `session-mode/switch`, `session-mode/menu`, `session-question/answer` and
+    `session-approve` return 409 `app_form_pending` for sessions with
+    `form=App ∧ tool=codex` before any terminal screen read or injection, and write an
+    audit line (through the `audit_app_form_pending` single point); the mobile client then
+    shows "APP sessions must take the protocol channel for this action — under
+    development, please operate inside the APP" to guide users back to the APP. The CLI
+    form is untouched and read-only endpoints are not gated. Note: `/session-send` and its
+    queued insertion are a separate pre-existing path, already blocked for the APP form by
+    `inject/routing.rs` with 403 `app_form`, and are not part of this new gating. A
+    permanent hint was added under the Settings "Tool management" card
+    (`settings.tools.boardRemoteNote`, bilingual): "Unchecked tools never appear on the
+    board and cannot be messaged remotely".
 - **开机自启注册项在路径含空格时静默失效**：上游插件写入的 Run 值不带引号，路径含空格
   时启用会失败而查询却为真。现于 enable 后原位改写为带引号形态（`quoted_run_command`
   纯函数 + 边界单测），失败撤条目回滚；另补 HKLM/HKCU 双 hive 扫描、disable 写后验证、
   NSIS 卸载钩子清理 `Run\Tuvis` 与 `StartupApproved\Run\Tuvis`。（本项系同版功能开发期
   加固，v0.5.6 及更早版本无此功能。）
+  EN: The launch-at-login registry entry silently failed when the path contained spaces:
+    the Run value written by the upstream plugin is unquoted, so enabling failed on spaced
+    paths while the status query still reported enabled. The value is now rewritten in
+    place to a quoted form after enable (the pure `quoted_run_command` function plus
+    boundary unit tests), rolling the entry back on failure; also added HKLM/HKCU
+    dual-hive scanning, write-after verification on disable, and NSIS uninstall-hook
+    cleanup of `Run\Tuvis` and `StartupApproved\Run\Tuvis`. (This item is hardening done
+    while the same-release feature was being built; the feature does not exist in v0.5.6
+    or earlier.)
 - **收起桌宠后过一段时间又自己冒出**：v0.5.6 建窗即 `.visible(true)`，界面按
   `loadVisible()` 收起后，5 秒启动兜底分不清「界面还没显示」与「用户就是要隐藏」，
   于是重新 `show()` 且此后再无人收回。现由 `PET_PAGE_SPOKE` 显隐权威标记登记行使
   （`set_pet_visible` 置位、新建成功复位、复用不复位、启动兜底先查标记），跟随关闭时的
   启动隐藏不再被强制弹回，死锁救援路径保留。已知限定：托盘臂不经 `set_pet_visible`
   （窗口级直 show/hide），约 5.8s 窄窗内不被兜底尊重。
+  EN: The desktop pet popped back up on its own a while after being stashed: v0.5.6
+    created the window with `.visible(true)` right away, so once the UI had hidden it via
+    `loadVisible()`, the 5-second startup fallback could not tell "not shown yet" from
+    "the user wants it hidden" and called `show()` again, with nothing to hide it
+    afterwards. Visibility is now governed by the authoritative `PET_PAGE_SPOKE` marker
+    (`set_pet_visible` sets it, successful creation clears it, reuse keeps it, and the
+    startup fallback checks it first), so a hide triggered by closing the follower is no
+    longer forced back open, while the deadlock rescue path is preserved. Known
+    limitation: the tray arm bypasses `set_pet_visible` (window-level direct show/hide),
+    so within the roughly 5.8s narrow window the fallback may not respect a tray-initiated
+    hide.
 
 ### Docs
 
 - **用户手册 13 章真值重写**（中文全量 + 英文骨架，其中 en/06-presets 由原成文回落为
   骨架，其余英文章原为占位模板），实机截图入册、截图占位清零，挂载官网 `/docs`。
+  EN: Truth-first rewrite of all 13 chapters of the user manual (full Chinese plus English
+    skeletons — en/06-presets actually fell back from finished prose to a skeleton, while
+    the other English chapters had been placeholder templates all along), with real-machine
+    screenshots added, screenshot placeholders eliminated, and the manual mounted at the
+    website's `/docs`.
 - 新增 `docs/capabilities.json` 作为与官网同步的能力矩阵结构化源；README 多终端能力
   矩阵中 OpenClaw 的「手机查看」「文件预览」两列按实测改为 ❌。
+  EN: Added `docs/capabilities.json` as the structured source of the capability matrix
+    synced with the website; in the README's multi-device capability matrix, OpenClaw's
+    "view from phone" and "file preview" columns were corrected to ❌ based on real
+    testing.
 
 ## [0.5.6] - 2026-10-11
 
