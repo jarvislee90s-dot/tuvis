@@ -1714,7 +1714,8 @@
     "rapiModeSwitchVerified": "已切换（屏读核验命中）",
     "rapiModeSwitchIneffective": "切换未生效（屏面无变化/读不到）——可重试",
     "rapiProjectPathResolveFailed": "路径真值解析失败（{dir}）：{e}",
-    "rapiTerminalSpawnFailed": "终端启动失败：{e}"
+    "rapiTerminalSpawnFailed": "终端启动失败：{e}",
+    "codexIpcNativeOnly": "该 Codex 会话已支持原生远程控制，问答与审批请使用原生卡片（自然语言补投不再受理）"
   },
   "mobile": {
     "composer": {

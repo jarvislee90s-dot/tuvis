@@ -1714,7 +1714,8 @@
     "rapiModeSwitchVerified": "Switched — verified by screen read",
     "rapiModeSwitchIneffective": "The switch did not take effect (screen unchanged or unreadable) — you can retry",
     "rapiProjectPathResolveFailed": "Failed to resolve the real path of the project directory",
-    "rapiTerminalSpawnFailed": "Failed to launch the terminal"
+    "rapiTerminalSpawnFailed": "Failed to launch the terminal",
+    "codexIpcNativeOnly": "This Codex session now supports native remote control — use the native card for questions and approvals (text repost is no longer accepted)"
   },
   "mobile": {
     "composer": {

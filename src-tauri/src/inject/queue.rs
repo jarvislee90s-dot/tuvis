@@ -1294,6 +1294,8 @@ mod tests {
             create_hub: std::sync::Arc::new(crate::remote::server::CreateTaskHub::stub()),
             archive_source: Box::new(Vec::new),
             archive_delete: std::sync::Arc::new(|_: Option<&str>| 0usize),
+            // Codex Desktop IPC（计划 Task 8）：fixture 显式 disabled hub
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         }
     }
 

@@ -5,6 +5,7 @@ pub mod api;
 #[cfg(test)]
 pub mod attachment_fixtures;
 pub mod attachments;
+pub mod codex_ipc;
 pub mod content;
 pub mod events;
 pub mod files;
@@ -648,6 +649,13 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         // M5 P2-a 追记：敏感黑名单的主目录基准（真实 home；取不到时 read_file_safe
         // 走全段保守匹配分支）
         home_source: Box::new(real_home_dir),
+        // Codex Desktop IPC 控制面（计划 Task 8）：生产 hub——全局 DeviceStore 上的
+        // ActionStore + AdapterDispatch + 生产 adapter（endpoint/Desktop build 门按本机
+        // 事实判定；未识别 build → 能力全关）。调度循环只在 remote 开启（server::serve）
+        // 时装配；关闭/热重启不重放未派发项。
+        codex_control: std::sync::Arc::new(codex_ipc::CodexControlHub::production(
+            pairing::DeviceStore::Global,
+        )),
     })
 });
 
@@ -984,6 +992,7 @@ fn stop_server_with(revoke: bool, stop_channels: impl FnOnce()) {
     let handle = SERVER_HANDLE.lock().unwrap().take();
     let st_reg = STATE.clone();
     let st_store = STATE.clone();
+    let st_hub = STATE.clone();
     stop_server_core(
         handle,
         revoke,
@@ -997,6 +1006,10 @@ fn stop_server_with(revoke: bool, stop_channels: impl FnOnce()) {
         // M4 T3：电源锁随远程关闭释放（caffeinate kill / 执行状态清除 + 磁盘代设还原）
         power::release,
     );
+    // Codex Desktop IPC（计划 Task 8）：停掉 hub 调度循环（不订阅/不调度未派发项）。
+    // 已派发任务（IPC 在途 RPC / detached 兜底回合）不取消——留至落账或 unknown；
+    // 热重启路径经再次 start 重新装配，不重放。
+    st_hub.codex_control.stop();
 }
 
 /// 停止远程服务（通用停机）：revoke 按调用方语义 + 对外通道全停（M5 A5 双隧道

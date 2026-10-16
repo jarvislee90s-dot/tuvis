@@ -230,6 +230,27 @@ impl DesktopIpcAdapter {
         }
     }
 
+    /// 同步忙快照（Codex Desktop IPC Task 8 加性接口：`DesktopDispatch::thread_busy`
+    /// 的 R2.3 忙判定消费；不跨 await）。active/unknown（含快照缺字段）按「忙」保守
+    /// ——消息留队等 idle 边沿接力；idle/failed 不忙；锁被占（镜像正在写）也按忙保守。
+    /// 无镜像（未跟随）= 不忙（派发路径 ensure_thread 先行，正常不可达此态）。
+    pub fn busy_snapshot(&self, key: &ThreadKey) -> bool {
+        match self.inner.mirrors.try_lock() {
+            Ok(mirrors) => mirrors
+                .get(key)
+                .map(|m| {
+                    matches!(
+                        m.project(self.inner.profile.capabilities)
+                            .runtime_status
+                            .as_str(),
+                        "active" | "unknown"
+                    )
+                })
+                .unwrap_or(false),
+            Err(_) => true,
+        }
+    }
+
     /// 退出跟随（详情卸载；释放名额，镜像保留为 stale 只读）。
     pub async fn unfollow(&self, key: &ThreadKey) {
         self.inner.followings.lock().await.unfollow(key);

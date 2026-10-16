@@ -917,6 +917,7 @@ async fn e2e_create_http_full_chain() {
     //    - host_source 必须给 enabledTools（session-create 工具门第二道），故非 m9r
     //      的 Null 桩；其余缝照 m9r 最小假体（本链不触归档/看板隐藏/未读/硬杀）。
     let state = Arc::new(RemoteState {
+        codex_control: multi_agents_manager_lib::remote::codex_ipc::CodexControlHub::disabled_arc(),
         // L13 靶向证据缝：E2E 不构造同 cwd 多实例 → 空证据 = 无候选 = 放行
         target_evidence: Box::new(|_, _| {
             multi_agents_manager_lib::window::tty_map::TargetEvidence::default()
