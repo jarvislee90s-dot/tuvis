@@ -20,11 +20,11 @@ Tuvis supports eight AI coding tools today. Each tool differs in how open it is,
 | Desktop notifications | ✅          | ✅        | ✅       | ✅       | ✅        | ✅        | ✅           | ✅    |
 | Skill management      | ✅          | ✅        | ✅       | ✅       | ✅        | ✅        | ✅           | ◐ read-only |
 | MCP management        | ✅ JSON     | ✅ TOML   | ✅ JSONC | ✅ JSON  | ✅ JSON   | ✅ JSON   | ✅ JSON subtree | ❌    |
-| Mobile · View messages | ✅          | ✅        | ✅       | ✅       | ✅        | ✅        | ✅           | ✅    |
-| Mobile · Preview files | ✅          | ✅        | ✅       | ✅       | ✅        | ✅        | ✅           | ✅    |
-| Mobile · Send messages (injection) | 🧪          | 🧪        | 🧪       | ❌       | 🧪        | ❌        | ❌           | ❌    |
-| Token usage           | ✅          | ✅        | ✅       | ❌       | ✅        | ✅        | ✅           | ✅    |
+| Mobile · message viewing | ✅          | ✅        | ✅       | ❌       | ✅        | ✅        | ✅           | ✅    |
+| Mobile · file preview | ✅          | ✅        | ✅       | ❌       | ✅        | ✅        | ✅           | ✅    |
+| Mobile · message injection | 🧪          | 🧪        | 🧪       | ❌       | 🧪        | ❌        | ❌           | ❌    |
+| Token usage collection | ✅          | ✅        | ✅       | ❌       | ✅        | ✅        | ✅           | ✅    |
 
-> 💡 🧪 in the table marks an experimental capability: phone injection (sending messages / creating sessions) is currently open to four tools only — Claude Code, Codex CLI, OpenCode and Kimi Code. OpenClaw / WorkBuddy are black-box forms with no external write channel, so they can be watched but not written to — a real difference in how open each tool is, not a malfunction; OpenClaw does not support token-usage collection yet.
+> 💡 🧪 in the table marks an experimental capability: phone injection (sending messages / creating sessions) is currently open to four tools only — Claude Code, Codex CLI, OpenCode and Kimi Code. OpenClaw / WorkBuddy are black-box forms with no external write channel, so they can be watched but not written to (OpenClaw cannot be viewed remotely from the phone, only on the desktop board) — a real difference in how open each tool is, not a malfunction; OpenClaw does not support token-usage collection yet.
 
 Want to try the interactions first? Open the [interactive demo](/demo) — no install needed to get a feel for the board and the phone-side flows.
