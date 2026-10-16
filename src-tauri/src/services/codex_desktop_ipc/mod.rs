@@ -10,6 +10,7 @@
 //! 由服务端发现，原始 IPC 参数不落远程 API；远程边界在 Tuvis 设备门禁，IPC 自身
 //! 不提供认证。
 
+pub mod adapter;
 pub mod codec;
 pub mod connection;
 pub mod mirror;

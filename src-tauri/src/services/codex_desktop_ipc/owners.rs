@@ -180,14 +180,11 @@ impl FollowingSet {
     }
 }
 
-/// 发现 owner 并声明 following，等到首帧 snapshot 才算完成（无 following 不允许
-/// 假装同步完成；重连恢复 = 重新 discovery → 重新 following → 等 snapshot）。
-pub async fn discover_and_follow(
+/// Step 1：owner discovery → handledByClientId（owner 身份来源）。
+pub async fn discover_owner(
     conn: &super::connection::ConnectionHandle,
-    owners: &mut OwnerRegistry,
     key: &ThreadKey,
-) -> Result<OwnerLease, ProtocolError> {
-    // 1) owner discovery（params 携带 hostId:"local"；envelope 不发 hostId → 基值版本）
+) -> Result<String, ProtocolError> {
     let version = conn.version_of("thread-owner-discovery")?;
     let outcome = conn
         .request(super::connection::RpcRequest {
@@ -222,14 +219,26 @@ pub async fn discover_and_follow(
             ));
         }
     }
-    let owner_id = outcome.handled_by.ok_or_else(|| {
+    outcome.handled_by.ok_or_else(|| {
         ProtocolError::InvalidState("owner discovery missing handledByClientId".into())
-    })?;
+    })
+}
 
-    // 2) 绑定 lease（connection epoch = 本连接代际）
-    let lease = owners.bind(key.clone(), owner_id, conn.epoch());
+/// Step 2：绑定 lease（同步、短临界区；调用方持锁调用）。
+pub fn bind_lease(
+    owners: &mut OwnerRegistry,
+    key: &ThreadKey,
+    owner_client_id: String,
+    epoch: u64,
+) -> OwnerLease {
+    owners.bind(key.clone(), owner_client_id, epoch)
+}
 
-    // 3) 声明 following（broadcast v1；probe 定案：已跟随再声明会触发新 snapshot）
+/// Step 3：声明 following（broadcast v1；已跟随再声明会触发新 snapshot）。
+pub async fn declare_following(
+    conn: &super::connection::ConnectionHandle,
+    key: &ThreadKey,
+) -> Result<(), ProtocolError> {
     let version = conn.version_of("thread-stream-following-changed")?;
     conn.broadcast(
         "thread-stream-following-changed",
@@ -240,9 +249,14 @@ pub async fn discover_and_follow(
             "following": true,
         }),
     )
-    .await?;
+    .await
+}
 
-    // 4) 等 owner 下发的 targeted snapshot（thread-stream-state-changed v11）
+/// Step 4：等 owner 下发的 targeted snapshot（v11）。
+pub async fn wait_first_snapshot(
+    conn: &super::connection::ConnectionHandle,
+    key: &ThreadKey,
+) -> Result<(), ProtocolError> {
     let mut rx = conn.subscribe();
     loop {
         match tokio::time::timeout(super::connection::RPC_TIMEOUT, rx.recv()).await {
@@ -252,13 +266,11 @@ pub async fn discover_and_follow(
                     && frame["params"]["conversationId"]
                         == serde_json::Value::String(key.thread_id.clone())
                 {
-                    return Ok(lease);
+                    return Ok(());
                 }
             }
             Ok(Ok(_)) => continue,
-            Ok(Err(_)) => {
-                return Err(ProtocolError::Disconnected("event channel closed".into()));
-            }
+            Ok(Err(_)) => return Err(ProtocolError::Disconnected("event channel closed".into())),
             Err(_) => {
                 return Err(ProtocolError::Timeout(
                     "no snapshot after following declaration".into(),
@@ -266,6 +278,21 @@ pub async fn discover_and_follow(
             }
         }
     }
+}
+
+/// 发现 owner 并声明 following，等到首帧 snapshot 才算完成（无 following 不允许
+/// 假装同步完成；重连恢复 = 重新 discovery → 重新 following → 等 snapshot）。
+/// adapter 等需要分步控制的调用方直接使用四个原语。
+pub async fn discover_and_follow(
+    conn: &super::connection::ConnectionHandle,
+    owners: &mut OwnerRegistry,
+    key: &ThreadKey,
+) -> Result<OwnerLease, ProtocolError> {
+    let owner_id = discover_owner(conn, key).await?;
+    let lease = bind_lease(owners, key, owner_id, conn.epoch());
+    declare_following(conn, key).await?;
+    wait_first_snapshot(conn, key).await?;
+    Ok(lease)
 }
 
 #[cfg(test)]

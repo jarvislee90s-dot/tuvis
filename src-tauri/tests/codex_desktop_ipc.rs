@@ -672,3 +672,553 @@ async fn owner_rebind_invalidates_old_lease_end_to_end() {
     assert_eq!(outcome.delivery, Delivery::NotSent);
     conn.shutdown().await;
 }
+
+// ---------------- Task 6：原生 Start Turn / 两类审批 / 阻塞问答（native_*） ----------------
+
+use multi_agents_manager_lib::services::codex_desktop_ipc::adapter::{
+    Connector, DesktopIpcAdapter,
+};
+use multi_agents_manager_lib::services::codex_desktop_ipc::transport::BoxIo;
+use multi_agents_manager_lib::services::codex_desktop_ipc::types::{CapabilitySet, PendingAction};
+use std::sync::Mutex as StdMutex;
+
+/// 注入单个 io 的测试连接器（adapter 只连一次）。
+struct StaticConnector {
+    io: StdMutex<
+        Option<Box<dyn multi_agents_manager_lib::services::codex_desktop_ipc::transport::IpcIo>>,
+    >,
+}
+
+impl StaticConnector {
+    fn new(
+        io: Box<dyn multi_agents_manager_lib::services::codex_desktop_ipc::transport::IpcIo>,
+    ) -> Self {
+        Self {
+            io: StdMutex::new(Some(io)),
+        }
+    }
+}
+
+impl Connector for StaticConnector {
+    fn connect(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        BoxIo,
+                        multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            self.io
+                .lock()
+                .expect("lock")
+                .take()
+                .ok_or_else(|| multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError::Disconnected("no io".into()))
+        })
+    }
+}
+
+use std::pin::Pin;
+
+/// 全能力测试 profile（macOS 已验证 build + 全 flag：只测构造器，不改生产 profile）。
+fn caps_open_profile(
+) -> multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile {
+    let mut p = profile_for("macos", "26.1013.31256").unwrap();
+    p.capabilities = CapabilitySet {
+        send: true,
+        state: true,
+        command: true,
+        permissions: true,
+        blocking_input: true,
+    };
+    p
+}
+
+/// 建 harness：驱动 ensure_thread 的握手/discovery/following/snapshot，
+/// 返回（adapter、peer、快照后的投影）。
+async fn harness(
+    profile: multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile,
+    requests: Vec<serde_json::Value>,
+) -> (
+    DesktopIpcAdapter,
+    ScriptedPeer,
+    multi_agents_manager_lib::services::codex_desktop_ipc::types::ThreadProjection,
+    ThreadKey,
+) {
+    let (io, peer) = ScriptedPeer::new();
+    let adapter = DesktopIpcAdapter::new(std::sync::Arc::new(StaticConnector::new(io)), profile);
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "00000000-0000-4000-8000-0000000000m1".into(),
+    };
+    let task = {
+        let a = adapter.clone();
+        let key = key.clone();
+        tokio::spawn(async move { a.ensure_thread(&key).await })
+    };
+    let mut peer = peer;
+    // 握手
+    let init = peer.recv().await;
+    assert_eq!(init["method"], "initialize");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": init["requestId"],
+        "resultType": "success", "method": "initialize",
+        "handledByClientId": "owner-1", "result": { "clientId": "owner-1" }
+    }))
+    .await;
+    // discovery
+    let disc = peer.recv().await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    // following
+    let follow = peer.recv().await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    // snapshot（带 pending requests）
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": {
+            "conversationId": key.thread_id, "hostId": "local",
+            "change": {
+                "type": "snapshot", "revision": 209,
+                "conversationState": {
+                    "turns": [], "requests": requests,
+                    "threadRuntimeStatus": { "type": "active" },
+                    "turnHistory": { "isComplete": true, "history": {
+                        "entitiesByKey": {
+                            "t1": { "id": "t1", "type": "turn", "status": "inProgress", "items": ["u1"] },
+                            "u1": { "id": "u1", "type": "user_message", "text": "跑测试", "ts": 1 }
+                        },
+                        "islands": [{ "entries": ["t1"] }]
+                    }}
+                }
+            }
+        }
+    })).await;
+    let projection = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("ensure_thread in time")
+        .expect("join")
+        .expect("projection");
+    (adapter, peer, projection, key)
+}
+
+#[tokio::test]
+async fn native_start_turn_targets_original_thread() {
+    let (adapter, mut peer, _projection, key) = harness(caps_open_profile(), vec![]).await;
+    let client_message_id =
+        multi_agents_manager_lib::services::codex_desktop_ipc::types::new_uuid();
+    let task = {
+        let a = adapter.clone();
+        let key = key.clone();
+        let cmid = client_message_id.clone();
+        tokio::spawn(async move { a.start_turn(&key, "act-1", "帮我跑测试", &cmid).await })
+    };
+    let frame = peer.recv().await;
+    // 逐字段断言：start-turn v2、target=当前 owner、会话自洽、无任何覆盖字段
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    assert_eq!(frame["version"], serde_json::json!(2));
+    assert_eq!(frame["targetClientId"], "owner-1");
+    assert_eq!(frame["params"]["conversationId"], key.thread_id);
+    let req = &frame["params"]["turnStart"]["request"];
+    assert_eq!(
+        req["threadId"], key.thread_id,
+        "turnStart.request.threadId == conversationId"
+    );
+    assert_eq!(req["input"][0]["type"], "text");
+    assert_eq!(req["input"][0]["text"], "帮我跑测试");
+    assert_eq!(req["input"][0]["text_elements"], serde_json::json!([]));
+    assert_eq!(req["clientUserMessageId"], client_message_id);
+    assert_eq!(
+        frame["params"]["turnStart"]["context"],
+        serde_json::json!({}),
+        "context 空对象"
+    );
+    // 严格键集：无 model / 权限 / collaboration 覆盖
+    let req_keys: Vec<String> = req.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(req_keys, vec!["threadId", "input", "clientUserMessageId"]);
+    let ts_keys: Vec<String> = frame["params"]["turnStart"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(ts_keys, vec!["request", "context"]);
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-9", "status": "inProgress" } }
+    }))
+    .await;
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(outcome.delivery, Delivery::Accepted);
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_approval_variants_never_share_wire_payload() {
+    // 快照带 command（整数 id 18）与 permissions（整数 id 12）两条 pending
+    let (adapter, mut peer, projection, key) = harness(
+        caps_open_profile(),
+        vec![
+            serde_json::json!({
+                "id": 18, "method": "item/commandExecution/requestApproval",
+                "params": { "command": "pnpm test", "cwd": "/w", "reason": "r" }
+            }),
+            serde_json::json!({
+                "id": 12, "method": "item/permissions/requestApproval",
+                "params": { "cwd": "/tmp/x", "permissions": {
+                    "network": serde_json::Value::Null,
+                    "fileSystem": { "read": serde_json::Value::Null, "write": ["/tmp/x"], "entries": [] }
+                } }
+            }),
+        ],
+    )
+    .await;
+    let cmd_key = projection
+        .pending
+        .iter()
+        .find(|p| p.kind == multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind::CommandApproval)
+        .expect("command pending")
+        .clone();
+    let perm_key = projection
+        .pending
+        .iter()
+        .find(|p| p.kind == multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind::PermissionsApproval)
+        .expect("permissions pending")
+        .clone();
+
+    // command approve：thread-follower-command-approval-decision + decision:"accept"
+    let t = {
+        let a = adapter.clone();
+        let key = key.clone();
+        let rk = cmd_key.request_key.clone();
+        let tk = cmd_key.context_token.clone();
+        tokio::spawn(async move { a.respond(&key, &rk, &tk, PendingAction::Approve).await })
+    };
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-command-approval-decision");
+    assert_eq!(frame["version"], serde_json::json!(1));
+    assert_eq!(
+        frame["params"]["requestId"],
+        serde_json::json!(18),
+        "整数 id 无损"
+    );
+    assert_eq!(frame["params"]["decision"], "accept");
+    assert!(
+        frame["params"].get("permissions").is_none(),
+        "command 变体绝不带 permissions"
+    );
+    assert!(
+        frame["params"].get("response").is_none(),
+        "command 变体绝不用 permissions 回执形态"
+    );
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-command-approval-decision",
+        "result": { "ok": true }
+    }))
+    .await;
+    let o = tokio::time::timeout(Duration::from_secs(5), t)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(o.delivery, Delivery::Accepted);
+
+    // permissions approve：回显服务端保存的原 permissions + scope=turn
+    let t = {
+        let a = adapter.clone();
+        let key = key.clone();
+        let rk = perm_key.request_key.clone();
+        let tk = perm_key.context_token.clone();
+        tokio::spawn(async move { a.respond(&key, &rk, &tk, PendingAction::Approve).await })
+    };
+    let frame = peer.recv().await;
+    assert_eq!(
+        frame["method"],
+        "thread-follower-permissions-request-approval-response"
+    );
+    assert_eq!(frame["params"]["requestId"], serde_json::json!(12));
+    assert!(
+        frame["params"].get("decision").is_none(),
+        "permissions 变体不用 decision 词"
+    );
+    let resp = &frame["params"]["response"];
+    assert_eq!(resp["scope"], "turn");
+    assert_eq!(
+        resp["permissions"],
+        serde_json::json!({
+            "network": serde_json::Value::Null,
+            "fileSystem": { "read": serde_json::Value::Null, "write": ["/tmp/x"], "entries": [] }
+        }),
+        "原 permissions 对象回显"
+    );
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-permissions-request-approval-response",
+        "result": { "ok": true }
+    }))
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), t)
+        .await
+        .expect("in time")
+        .expect("join");
+
+    // permissions reject：permissions = {}
+    let t = {
+        let a = adapter.clone();
+        let key = key.clone();
+        let rk = perm_key.request_key.clone();
+        let tk = perm_key.context_token.clone();
+        tokio::spawn(async move { a.respond(&key, &rk, &tk, PendingAction::Reject).await })
+    };
+    let frame = peer.recv().await;
+    assert_eq!(
+        frame["params"]["response"]["permissions"],
+        serde_json::json!({})
+    );
+    assert_eq!(frame["params"]["response"]["scope"], "turn");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-permissions-request-approval-response",
+        "result": { "ok": true }
+    }))
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), t)
+        .await
+        .expect("in time")
+        .expect("join");
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_answer_binds_current_pending() {
+    // user-input 夹具：q-1（isOther）+ q-2（isSecret）
+    let ui: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!(
+            "{}/tests/fixtures/codex-desktop-ipc/user-input.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap(),
+    )
+    .expect("fixture json");
+    let (adapter, mut peer, projection, key) = harness(caps_open_profile(), vec![ui]).await;
+    let pending = projection
+        .pending
+        .iter()
+        .find(|p| p.kind == multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind::UserInput)
+        .expect("user input pending")
+        .clone();
+
+    // 未知 qid → 拒绝且零投递
+    let bad = PendingAction::Answer(
+        [
+            ("q-1", vec!["alpha".to_string()]),
+            ("q-ghost", vec!["x".to_string()]),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+    );
+    let o = adapter
+        .respond(&key, &pending.request_key, &pending.context_token, bad)
+        .await;
+    assert_eq!(o.delivery, Delivery::NotSent);
+    assert_eq!(o.reason_code.as_deref(), Some("answers_mismatch"));
+
+    // 漏答 → 拒绝
+    let missing = PendingAction::Answer(
+        [("q-1", vec!["alpha".to_string()])]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+    );
+    let o = adapter
+        .respond(&key, &pending.request_key, &pending.context_token, missing)
+        .await;
+    assert_eq!(o.delivery, Delivery::NotSent);
+
+    // token 错 → 拒绝（过期卡）
+    let ok_answer = PendingAction::Answer(
+        [
+            ("q-1", vec!["alpha".to_string()]),
+            ("q-2", vec!["口令".to_string()]),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+    );
+    let o = adapter
+        .respond(&key, &pending.request_key, "wrong-token", ok_answer.clone())
+        .await;
+    assert_eq!(o.delivery, Delivery::NotSent);
+    assert_eq!(o.reason_code.as_deref(), Some("stale_context"));
+    let no_frame = tokio::time::timeout(Duration::from_millis(200), peer.recv()).await;
+    assert!(no_frame.is_err(), "被拒动作不得写出帧");
+
+    // 正确作答：原 qid 映射、isSecret 在 wire 上出现但不回显于错误/日志
+    let t = {
+        let a = adapter.clone();
+        let key = key.clone();
+        let rk = pending.request_key.clone();
+        let tk = pending.context_token.clone();
+        let ans = ok_answer.clone();
+        tokio::spawn(async move { a.respond(&key, &rk, &tk, ans).await })
+    };
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-submit-user-input");
+    assert_eq!(frame["version"], serde_json::json!(1));
+    assert_eq!(
+        frame["params"]["requestId"],
+        serde_json::json!("req-str-9007199254740993"),
+        "字符串 id 无损"
+    );
+    assert_eq!(
+        frame["params"]["response"]["answers"],
+        serde_json::json!({
+            "q-1": { "answers": ["alpha"] },
+            "q-2": { "answers": ["口令"] }
+        })
+    );
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-submit-user-input",
+        "result": { "ok": true }
+    }))
+    .await;
+    let o = tokio::time::timeout(Duration::from_secs(5), t)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(o.delivery, Delivery::Accepted);
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_is_other_false_rejects_free_text() {
+    let req = serde_json::json!({
+        "id": "req-fixed", "method": "item/tool/requestUserInput",
+        "params": { "isBlocking": true, "questions": [
+            { "id": "q1", "header": "h", "question": "?", "isOther": false, "isSecret": false,
+              "options": [ { "label": "alpha", "description": "" } ] }
+        ]}
+    });
+    let (adapter, mut peer, projection, key) = harness(caps_open_profile(), vec![req]).await;
+    let pending = projection.pending[0].clone();
+    // isOther=false：自由文本拒绝
+    let free_text = PendingAction::Answer(
+        [("q1", vec!["自拟答案".to_string()])]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+    );
+    let o = adapter
+        .respond(
+            &key,
+            &pending.request_key,
+            &pending.context_token,
+            free_text,
+        )
+        .await;
+    assert_eq!(o.delivery, Delivery::NotSent);
+    assert_eq!(o.reason_code.as_deref(), Some("answer_not_option"));
+    // 选项 label 接受
+    let t = {
+        let a = adapter.clone();
+        let key = key.clone();
+        let rk = pending.request_key.clone();
+        let tk = pending.context_token.clone();
+        tokio::spawn(async move {
+            a.respond(
+                &key,
+                &rk,
+                &tk,
+                PendingAction::Answer(
+                    [("q1", vec!["alpha".to_string()])]
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                ),
+            )
+            .await
+        })
+    };
+    let frame = peer.recv().await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-submit-user-input",
+        "result": { "ok": true }
+    }))
+    .await;
+    let o = tokio::time::timeout(Duration::from_secs(5), t)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(o.delivery, Delivery::Accepted);
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_capability_gated_and_unsupported_requests_never_send() {
+    // macOS 生产 profile：blocking_input=false → user-input 可见但不可答
+    let mac = profile_for("macos", "26.1013.31256").unwrap();
+    let req = serde_json::json!({
+        "id": 7, "method": "item/tool/requestUserInput",
+        "params": { "isBlocking": true, "questions": [
+            { "id": "q1", "header": "h", "question": "?", "isOther": true, "isSecret": false, "options": [] }
+        ]}
+    });
+    let (adapter, mut peer, projection, key) = harness(mac, vec![req]).await;
+    let pending = &projection.pending[0];
+    assert_eq!(
+        pending.kind,
+        multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind::UserInput
+    );
+    assert!(!pending.actionable, "能力未验证 → 不可操作");
+    assert_eq!(
+        pending.disabled_reason_code.as_deref(),
+        Some("capability_unavailable")
+    );
+    let o = adapter
+        .respond(
+            &key,
+            &pending.request_key,
+            &pending.context_token,
+            PendingAction::Answer(
+                [("q1", vec!["x".to_string()])]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            ),
+        )
+        .await;
+    assert_eq!(o.delivery, Delivery::NotSent);
+    assert_eq!(o.reason_code.as_deref(), Some("capability_unavailable"));
+    let no_frame = tokio::time::timeout(Duration::from_millis(200), peer.recv()).await;
+    assert!(no_frame.is_err(), "能力门拒绝不得写出帧");
+
+    // 未知 method：Unsupported 卡
+    let o = adapter
+        .respond(&key, "n:1", "t", PendingAction::Approve)
+        .await;
+    assert_eq!(o.delivery, Delivery::NotSent);
+    assert_eq!(
+        o.reason_code.as_deref(),
+        Some("stale_context"),
+        "未知 request 无卡可答"
+    );
+    adapter.shutdown().await;
+}

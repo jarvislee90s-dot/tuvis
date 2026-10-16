@@ -81,6 +81,16 @@ impl ThreadMirror {
         self.history_complete
     }
 
+    /// 原始 change 根（pending permissions 回显等只读用途；不进远程 API）。
+    pub fn raw_state(&self) -> Option<&Value> {
+        self.state.as_ref()
+    }
+
+    /// 校验 pending context_token（委托 pending 投影器）。
+    pub fn token_valid(&self, request_key: &str, context_token: &str) -> bool {
+        self.pending.token_valid(request_key, context_token)
+    }
+
     /// 标记过期（连接断开/缺口/预算超限）。保留最后视图但禁写（adapter 侧门）。
     pub fn mark_stale(&mut self) {
         self.stale = true;

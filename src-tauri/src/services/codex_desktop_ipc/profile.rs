@@ -8,6 +8,7 @@ use crate::services::codex_desktop_ipc::types::{CapabilitySet, ProtocolError};
 use std::collections::BTreeMap;
 
 /// 已验证 Desktop build 的能力/版本基线；未识别 build 返回 `None`（能力全关）。
+#[derive(Clone)]
 pub struct ProtocolProfile {
     pub platform: String,
     pub build: String,
