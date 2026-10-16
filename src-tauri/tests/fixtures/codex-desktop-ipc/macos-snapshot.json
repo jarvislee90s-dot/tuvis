@@ -1,0 +1,71 @@
+{
+  "_source": "OBSERVED 骨架（thread-stream-state-changed v11 broadcast，targeted at follower；Mac 探针 POC-2 实测 turns=[] 而 turnHistory 持有全部内容）+ SYNTHETIC 占位内容",
+  "type": "broadcast",
+  "method": "thread-stream-state-changed",
+  "version": 11,
+  "sourceClientId": "00000000-0000-4000-8000-00000000000a",
+  "targetClientIds": ["00000000-0000-4000-8000-0000000000t1"],
+  "params": {
+    "conversationId": "00000000-0000-4000-8000-0000000000m1",
+    "hostId": "local",
+    "change": {
+      "type": "snapshot",
+      "revision": 209,
+      "conversationState": {
+        "turns": [],
+        "threadRuntimeStatus": { "type": "idle", "duration_ms": 99771 },
+        "requests": [
+          {
+            "id": 12,
+            "method": "item/permissions/requestApproval",
+            "params": {
+              "threadId": "00000000-0000-4000-8000-0000000000m1",
+              "turnId": "00000000-0000-4000-8000-0000000000tu1",
+              "itemId": "00000000-0000-4000-8000-0000000000it1",
+              "environmentId": "00000000-0000-4000-8000-0000000000en1",
+              "startedAtMs": 1760000000000,
+              "cwd": "/tmp/mac-ipc-probe",
+              "reason": "合成：写入探测目录",
+              "permissions": {
+                "network": null,
+                "fileSystem": {
+                  "read": null,
+                  "write": ["/tmp/mac-ipc-probe"],
+                  "entries": [{ "type": "write", "path": "/tmp/mac-ipc-probe" }]
+                }
+              }
+            }
+          }
+        ],
+        "turnHistory": {
+          "isComplete": true,
+          "history": {
+            "entitiesByKey": {
+              "turn-1": {
+                "id": "turn-1",
+                "type": "turn",
+                "status": "completed",
+                "items": ["itm-u1", "itm-a1"]
+              },
+              "itm-u1": {
+                "id": "itm-u1",
+                "type": "user_message",
+                "text": "合成：请回复 TUVis macOS IPC probe OK",
+                "ts": 1760000000000
+              },
+              "itm-a1": {
+                "id": "itm-a1",
+                "type": "agent_message",
+                "text": "TUVis macOS IPC probe OK",
+                "ts": 1760000010000
+              }
+            },
+            "islands": [
+              { "entries": ["turn-1"], "exhausted": true }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

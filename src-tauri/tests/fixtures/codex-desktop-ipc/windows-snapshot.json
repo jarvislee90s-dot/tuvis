@@ -1,0 +1,56 @@
+{
+  "_source": "SYNTHETIC/NOT_TRIGGERED：Windows 侧同构 snapshot（双端共用协议，Mac 探针证实帧/envelope/正史同构）；pending 为 command 审批（Windows probe 观察到 command approval PASS，字段按计划记录合成）",
+  "type": "broadcast",
+  "method": "thread-stream-state-changed",
+  "version": 11,
+  "sourceClientId": "00000000-0000-4000-8000-00000000000w",
+  "targetClientIds": ["00000000-0000-4000-8000-0000000000t1"],
+  "params": {
+    "conversationId": "00000000-0000-4000-8000-0000000000w1",
+    "hostId": "local",
+    "change": {
+      "type": "snapshot",
+      "revision": 12,
+      "conversationState": {
+        "turns": [],
+        "threadRuntimeStatus": { "type": "active" },
+        "requests": [
+          {
+            "id": 41,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+              "threadId": "00000000-0000-4000-8000-0000000000w1",
+              "turnId": "00000000-0000-4000-8000-0000000000tw1",
+              "itemId": "00000000-0000-4000-8000-0000000000iw1",
+              "command": "cargo test",
+              "cwd": "C:\\ws\\demo",
+              "reason": "合成：运行项目测试"
+            }
+          }
+        ],
+        "turnHistory": {
+          "isComplete": true,
+          "history": {
+            "entitiesByKey": {
+              "turn-w1": {
+                "id": "turn-w1",
+                "type": "turn",
+                "status": "inProgress",
+                "items": ["itm-wu1"]
+              },
+              "itm-wu1": {
+                "id": "itm-wu1",
+                "type": "user_message",
+                "text": "合成：把测试跑一遍",
+                "ts": 1760000000000
+              }
+            },
+            "islands": [
+              { "entries": ["turn-w1"], "exhausted": true }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

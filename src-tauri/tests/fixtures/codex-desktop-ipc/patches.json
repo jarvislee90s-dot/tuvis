@@ -1,0 +1,82 @@
+{
+  "_source": "OBSERVED 结构（Mac 探针 POC-2：patches 携带 {baseRevision,revision,patches:[{op,path[],value?}]}，数组路径；具体 op 取值为协议表面合成）",
+  "batches": [
+    {
+      "_note": "流式 agent_message 同 item replace（不得产生重复气泡，Task 5 断言）",
+      "baseRevision": 209,
+      "revision": 210,
+      "patches": [
+        {
+          "op": "replace",
+          "path": ["conversationState", "turnHistory", "history", "entitiesByKey", "itm-a1", "text"],
+          "value": "TUVis macOS IPC probe OK（流式追加）"
+        }
+      ]
+    },
+    {
+      "_note": "新增一 turn：数组 add 插入 + 实体新增",
+      "baseRevision": 210,
+      "revision": 211,
+      "patches": [
+        {
+          "op": "replace",
+          "path": ["conversationState", "turnHistory", "history", "entitiesByKey"],
+          "value": {
+            "turn-1": {
+              "id": "turn-1",
+              "type": "turn",
+              "status": "completed",
+              "items": ["itm-u1", "itm-a1"]
+            },
+            "itm-u1": {
+              "id": "itm-u1",
+              "type": "user_message",
+              "text": "合成：请回复 TUVis macOS IPC probe OK",
+              "ts": 1760000000000
+            },
+            "itm-a1": {
+              "id": "itm-a1",
+              "type": "agent_message",
+              "text": "TUVis macOS IPC probe OK（流式追加）",
+              "ts": 1760000010000
+            },
+            "turn-2": {
+              "id": "turn-2",
+              "type": "turn",
+              "status": "inProgress",
+              "items": ["itm-u2"]
+            },
+            "itm-u2": {
+              "id": "itm-u2",
+              "type": "user_message",
+              "text": "合成：第二条",
+              "ts": 1760000020000
+            }
+          }
+        },
+        {
+          "op": "add",
+          "path": ["conversationState", "turnHistory", "history", "islands", 0, "entries", 1],
+          "value": "turn-2"
+        }
+      ]
+    },
+    {
+      "_note": "revision 空洞样本（baseRevision 与镜像当前不符 → 原子拒绝并要求 snapshot）",
+      "baseRevision": 6,
+      "revision": 8,
+      "patches": []
+    },
+    {
+      "_note": "移除 pending 请求（数组 remove）",
+      "baseRevision": 211,
+      "revision": 212,
+      "patches": [
+        {
+          "op": "remove",
+          "path": ["conversationState", "requests", 0]
+        }
+      ]
+    }
+  ]
+}
