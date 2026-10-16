@@ -12,7 +12,9 @@
 
 pub mod codec;
 pub mod connection;
+pub mod mirror;
 pub mod owners;
+pub mod pending;
 pub mod profile;
 pub mod transport;
 pub mod types;

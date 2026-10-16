@@ -3,30 +3,47 @@
   "batches": [
     {
       "_note": "流式 agent_message 同 item replace（不得产生重复气泡，Task 5 断言）",
+      "type": "patches",
       "baseRevision": 209,
       "revision": 210,
       "patches": [
         {
           "op": "replace",
-          "path": ["conversationState", "turnHistory", "history", "entitiesByKey", "itm-a1", "text"],
+          "path": [
+            "conversationState",
+            "turnHistory",
+            "history",
+            "entitiesByKey",
+            "itm-a1",
+            "text"
+          ],
           "value": "TUVis macOS IPC probe OK（流式追加）"
         }
       ]
     },
     {
       "_note": "新增一 turn：数组 add 插入 + 实体新增",
+      "type": "patches",
       "baseRevision": 210,
       "revision": 211,
       "patches": [
         {
           "op": "replace",
-          "path": ["conversationState", "turnHistory", "history", "entitiesByKey"],
+          "path": [
+            "conversationState",
+            "turnHistory",
+            "history",
+            "entitiesByKey"
+          ],
           "value": {
             "turn-1": {
               "id": "turn-1",
               "type": "turn",
               "status": "completed",
-              "items": ["itm-u1", "itm-a1"]
+              "items": [
+                "itm-u1",
+                "itm-a1"
+              ]
             },
             "itm-u1": {
               "id": "itm-u1",
@@ -44,7 +61,9 @@
               "id": "turn-2",
               "type": "turn",
               "status": "inProgress",
-              "items": ["itm-u2"]
+              "items": [
+                "itm-u2"
+              ]
             },
             "itm-u2": {
               "id": "itm-u2",
@@ -56,25 +75,39 @@
         },
         {
           "op": "add",
-          "path": ["conversationState", "turnHistory", "history", "islands", 0, "entries", 1],
+          "path": [
+            "conversationState",
+            "turnHistory",
+            "history",
+            "islands",
+            0,
+            "entries",
+            1
+          ],
           "value": "turn-2"
         }
       ]
     },
     {
       "_note": "revision 空洞样本（baseRevision 与镜像当前不符 → 原子拒绝并要求 snapshot）",
+      "type": "patches",
       "baseRevision": 6,
       "revision": 8,
       "patches": []
     },
     {
       "_note": "移除 pending 请求（数组 remove）",
+      "type": "patches",
       "baseRevision": 211,
       "revision": 212,
       "patches": [
         {
           "op": "remove",
-          "path": ["conversationState", "requests", 0]
+          "path": [
+            "conversationState",
+            "requests",
+            0
+          ]
         }
       ]
     }
