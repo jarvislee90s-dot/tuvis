@@ -1,0 +1,1213 @@
+//! Codex Control（Task 7）账本/路由集成测试：持久动作账本、普通消息 FIFO 与安全路由。
+//!
+//! 全部走内存库（`DeviceStore::Owned(Arc<Mutex<Connection>>)`）与假派发器
+//! （[`FakeDispatch`]），绝不接触真实 `~/.tuvis` / `~/.codex`，绝不启动真实 Tuvis
+//! 进程或官方 Desktop。进程重启用「同一连接句柄 + 新建 Router/Store」模拟。
+
+use multi_agents_manager_lib::inject::headless::codex::QueueEvidence;
+use multi_agents_manager_lib::remote::pairing::{
+    persist_device, revoke_device, DeviceStore, NewDevice,
+};
+use multi_agents_manager_lib::services::codex_control::{
+    payload_hash, reconcile_compat_fence_with, wire_text_hash, ActionContext, ActionKind,
+    ActionPayload, ActionState, ActionStore, CodexControlRouter, CompatFence, ControlRoute,
+    Delivery, DesktopDispatch, DispatchOutcome, PendingAction, RouterOutcome, StoreError,
+};
+use multi_agents_manager_lib::services::codex_desktop_ipc::types::{
+    ActionReceipt, CodexActionView, ProtocolError, ThreadKey, ThreadProjection,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+// ============================================================
+// 测试基建：内存库 + 设备 + 假派发器
+// ============================================================
+
+type SharedConn = Arc<Mutex<rusqlite::Connection>>;
+
+/// 打开共享内存库（schema::init → migration::migrate，与 DeviceStore::memory 同序，
+/// 但保留 Arc 以便模拟「进程重启仍在同一 DB 上」）。
+fn shared_conn() -> SharedConn {
+    let conn = rusqlite::Connection::open_in_memory().expect("open memory db");
+    multi_agents_manager_lib::database::schema::init(&conn);
+    multi_agents_manager_lib::database::migration::migrate(&conn).expect("migrate");
+    Arc::new(Mutex::new(conn))
+}
+
+fn seed_device(conn: &SharedConn, id: &str, name: &str) {
+    let dev = NewDevice {
+        id: id.to_string(),
+        name: name.to_string(),
+        ua: format!("ua-{id}"),
+        origin_ip: format!("127.0.0.1#{id}"),
+        via: "lan".into(),
+        // 恒用当前时刻：device_valid 按 180 天 TTL 判活，固定旧时间会被判吊销
+        paired_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0),
+    };
+    let store = DeviceStore::Owned(conn.clone());
+    store.with(|c| persist_device(c, &dev).expect("seed device"));
+}
+
+#[derive(Clone, Debug)]
+struct SendRecord {
+    action_id: String,
+    composed: String,
+    client_message_id: String,
+}
+
+/// 假派发器：记录 A 路派发输入（组合后的文本），返回预设 Rpc 结果。
+struct FakeDispatch {
+    busy: AtomicBool,
+    send_outcome: Mutex<DispatchOutcome>,
+    respond_outcome: Mutex<DispatchOutcome>,
+    sends: Mutex<Vec<SendRecord>>,
+    responds: Mutex<Vec<(ThreadKey, String, String)>>,
+}
+
+impl FakeDispatch {
+    fn new(outcome: DispatchOutcome) -> Self {
+        Self {
+            busy: AtomicBool::new(false),
+            send_outcome: Mutex::new(outcome.clone()),
+            respond_outcome: Mutex::new(outcome),
+            sends: Mutex::new(Vec::new()),
+            responds: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn accepted() -> Self {
+        Self::new(DispatchOutcome {
+            delivery: Delivery::Accepted,
+            envelope_id: Some("env-1".into()),
+            turn_id: Some("turn-1".into()),
+            reason_code: None,
+        })
+    }
+
+    fn not_sent(reason: &str) -> Self {
+        Self::new(DispatchOutcome {
+            delivery: Delivery::NotSent,
+            envelope_id: Some("env-2".into()),
+            turn_id: None,
+            reason_code: Some(reason.into()),
+        })
+    }
+
+    fn set_busy(&self, b: bool) {
+        self.busy.store(b, Ordering::SeqCst);
+    }
+
+    fn send_count(&self) -> usize {
+        self.sends.lock().unwrap().len()
+    }
+
+    fn respond_count(&self) -> usize {
+        self.responds.lock().unwrap().len()
+    }
+
+    fn recorded_composed(&self) -> Vec<String> {
+        self.sends
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.composed.clone())
+            .collect()
+    }
+}
+
+impl DesktopDispatch for FakeDispatch {
+    fn thread_busy(&self, _key: &ThreadKey) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
+    fn send_text(
+        &self,
+        _key: &ThreadKey,
+        action_id: &str,
+        composed: &str,
+        client_message_id: &str,
+    ) -> multi_agents_manager_lib::services::codex_control::BoxDispatchFut {
+        self.sends.lock().unwrap().push(SendRecord {
+            action_id: action_id.to_string(),
+            composed: composed.to_string(),
+            client_message_id: client_message_id.to_string(),
+        });
+        let out = self.send_outcome.lock().unwrap().clone();
+        Box::pin(async move { out })
+    }
+
+    fn respond(
+        &self,
+        key: &ThreadKey,
+        request_key: &str,
+        context_token: &str,
+        _action: &PendingAction,
+    ) -> multi_agents_manager_lib::services::codex_control::BoxDispatchFut {
+        self.responds.lock().unwrap().push((
+            key.clone(),
+            request_key.to_string(),
+            context_token.to_string(),
+        ));
+        let out = self.respond_outcome.lock().unwrap().clone();
+        Box::pin(async move { out })
+    }
+}
+
+struct Harness {
+    conn: SharedConn,
+    store: Arc<ActionStore>,
+    dispatch: Arc<FakeDispatch>,
+    router: CodexControlRouter,
+    key: ThreadKey,
+}
+
+const THREAD: &str = "0f1e2d3c-1111-4222-8333-444455556666";
+
+fn harness() -> Harness {
+    harness_with(FakeDispatch::accepted())
+}
+
+fn harness_with(dispatch: FakeDispatch) -> Harness {
+    let conn = shared_conn();
+    seed_device(&conn, "dev-1", "iPhone");
+    let store = Arc::new(ActionStore::new(DeviceStore::Owned(conn.clone())));
+    let dispatch = Arc::new(dispatch);
+    let router = CodexControlRouter::new(store.clone(), dispatch.clone());
+    Harness {
+        conn,
+        store,
+        dispatch,
+        router,
+        key: ThreadKey {
+            host_id: "local".into(),
+            thread_id: THREAD.into(),
+        },
+    }
+}
+
+fn not_sent_receipt(action_id: &str, route: ControlRoute, reason: &str) -> ActionReceipt {
+    ActionReceipt {
+        action_id: action_id.to_string(),
+        delivery: Delivery::NotSent,
+        route,
+        turn_id: None,
+        envelope_id: None,
+        reason_code: Some(reason.to_string()),
+    }
+}
+
+fn accepted_compat_receipt(action_id: &str) -> ActionReceipt {
+    ActionReceipt {
+        action_id: action_id.to_string(),
+        delivery: Delivery::Accepted,
+        route: ControlRoute::HeadlessCompat,
+        turn_id: Some("compat-turn".into()),
+        envelope_id: None,
+        reason_code: None,
+    }
+}
+
+impl Harness {
+    /// 模拟进程重启：同一 DB 连接上重建 Store/Router（recover_reserved 在 Store 构造时执行）。
+    fn restart(&mut self) {
+        self.store = Arc::new(ActionStore::new(DeviceStore::Owned(self.conn.clone())));
+        self.dispatch = Arc::new(FakeDispatch::accepted());
+        self.router = CodexControlRouter::new(self.store.clone(), self.dispatch.clone());
+    }
+
+    /// 同上，但替换派发器（重启后 A 路行为变化）。
+    fn restart_with(&mut self, dispatch: FakeDispatch) {
+        self.store = Arc::new(ActionStore::new(DeviceStore::Owned(self.conn.clone())));
+        self.dispatch = Arc::new(dispatch);
+        self.router = CodexControlRouter::new(self.store.clone(), self.dispatch.clone());
+    }
+
+    fn ctx(&self, action_id: &str, kind: ActionKind) -> ActionContext {
+        ActionContext {
+            action_id: action_id.to_string(),
+            device_id: "dev-1".into(),
+            device_name: "iPhone".into(),
+            kind,
+            key: self.key.clone(),
+        }
+    }
+
+    /// 直读动作行状态（绕过 router，观察账本真值）。
+    fn state_of(&self, action_id: &str) -> ActionState {
+        self.view_of(action_id).state
+    }
+
+    fn view_of(&self, action_id: &str) -> CodexActionView {
+        self.store
+            .get_for_device(action_id, "dev-1")
+            .expect("store query")
+            .expect("row exists")
+    }
+
+    /// 直读动作行 route 列。
+    fn route_of(&self, action_id: &str) -> String {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT route FROM codex_actions WHERE action_id = ?1",
+            [action_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+}
+
+fn queued(view: RouterOutcome) -> (String, usize) {
+    match view {
+        RouterOutcome::Queued {
+            action_id,
+            position,
+        } => (action_id, position),
+        other => panic!("expected Queued, got {other:?}"),
+    }
+}
+
+fn completed(view: RouterOutcome) -> ActionReceipt {
+    match view {
+        RouterOutcome::Completed(r) => r,
+        RouterOutcome::UseFallback { .. } => panic!("unexpected UseFallback"),
+        RouterOutcome::Queued { .. } => panic!("unexpected Queued"),
+    }
+}
+
+fn use_fallback(
+    view: RouterOutcome,
+) -> multi_agents_manager_lib::services::codex_control::FallbackPermit {
+    match view {
+        RouterOutcome::UseFallback { permit, .. } => permit,
+        other => panic!("expected UseFallback, got {other:?}"),
+    }
+}
+
+fn minimal_projection(thread_id: &str, status: &str) -> ThreadProjection {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::types::{
+        CapabilitySet, ControlAvailability, ProjectedMessage,
+    };
+    ThreadProjection {
+        thread_id: thread_id.to_string(),
+        revision: Some(1),
+        stale: false,
+        availability: ControlAvailability::Controllable,
+        capabilities: CapabilitySet {
+            send: true,
+            state: true,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+        },
+        runtime_status: status.to_string(),
+        messages: vec![ProjectedMessage {
+            id: "m1".into(),
+            role: "user".into(),
+            kind: "message".into(),
+            text: "seed".into(),
+            ts: None,
+        }],
+        truncated: false,
+        pending: Vec::new(),
+    }
+}
+
+// ============================================================
+// 计划场景 1：同 action 幂等 / 冲突
+// ============================================================
+
+/// 同 device/thread/action/payload 返回原状态，RPC write 计数恒 1；
+/// queue_only 重复提交同样只入队一次；终端态重复提交不重派发。
+#[tokio::test]
+async fn same_action_never_sends_twice() {
+    let h = harness();
+    let ctx = h.ctx("act-1", ActionKind::Send);
+
+    let r1 = completed(h.router.send(ctx.clone(), "你好".into(), false).await);
+    assert_eq!(r1.delivery, Delivery::Accepted);
+    assert_eq!(h.dispatch.send_count(), 1, "首次派发恰好一次");
+
+    // 同 action_id + 同载荷重放：返回原状态，不再写
+    let r2 = completed(h.router.send(ctx.clone(), "你好".into(), false).await);
+    assert_eq!(r2.delivery, Delivery::Accepted);
+    assert_eq!(r2, r1, "幂等重放返回同一回执");
+    assert_eq!(h.dispatch.send_count(), 1, "重放零新增写入");
+
+    // queue_only 重复：仍 Queued 原位，不派发
+    let ctx2 = h.ctx("act-2", ActionKind::Send);
+    let (id, pos) = queued(h.router.send(ctx2.clone(), "第二条".into(), true).await);
+    assert_eq!(id, "act-2");
+    assert_eq!(pos, 1);
+    let (id2, pos2) = queued(h.router.send(ctx2, "第二条".into(), true).await);
+    assert_eq!(id2, "act-2");
+    assert_eq!(pos2, 1, "重复入队不产生第二个队列条目");
+    assert_eq!(h.dispatch.send_count(), 1);
+}
+
+/// 相同 action_id 换正文/设备/thread 返回 conflict 且零新增写入。
+#[tokio::test]
+async fn conflicting_action_id_reuse_is_conflict_and_zero_writes() {
+    let h = harness();
+    let ctx = h.ctx("act-c", ActionKind::Send);
+    let r = completed(h.router.send(ctx.clone(), "原文".into(), false).await);
+    assert_eq!(r.delivery, Delivery::Accepted);
+
+    // 换正文
+    let rc = completed(
+        h.router
+            .send(ctx.clone(), "换成别的正文".into(), false)
+            .await,
+    );
+    assert_eq!(rc.delivery, Delivery::Rejected);
+    assert_eq!(rc.reason_code.as_deref(), Some("action_conflict"));
+    assert_eq!(h.dispatch.send_count(), 1, "冲突零新增写入");
+
+    // 换 thread（同 action_id）
+    let mut ctx_other_thread = ctx.clone();
+    ctx_other_thread.key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "99994444-1111-4222-8333-444455556666".into(),
+    };
+    let rt = completed(h.router.send(ctx_other_thread, "原文".into(), false).await);
+    assert_eq!(rt.reason_code.as_deref(), Some("action_conflict"));
+    assert_eq!(h.dispatch.send_count(), 1);
+
+    // 换设备（同 action_id）
+    let mut ctx_other_dev = h.ctx("act-c", ActionKind::Send);
+    ctx_other_dev.device_id = "dev-2".into();
+    ctx_other_dev.device_name = "iPad".into();
+    let rd = completed(h.router.send(ctx_other_dev, "原文".into(), false).await);
+    assert_eq!(rd.reason_code.as_deref(), Some("action_conflict"));
+    assert_eq!(h.dispatch.send_count(), 1);
+}
+
+// ============================================================
+// 计划场景 2：重启恢复
+// ============================================================
+
+/// writer 执行前先 queued→reserved，进程重启将 reserved→unknown，不能回 queued；
+/// queued 恢复仍可按序发送（原文/设备/原 client_message_id 保留）。
+#[tokio::test]
+async fn restart_reserved_becomes_unknown() {
+    let mut h = harness();
+    // a 排队后手工置 reserved（模拟 writer 已接手、进程崩溃前）
+    let a = h.ctx("act-a", ActionKind::Send);
+    let (id, _) = queued(h.router.send(a, "第一条".into(), true).await);
+    assert_eq!(id, "act-a");
+    assert!(h.store.reserve("act-a", ControlRoute::DesktopIpc).unwrap());
+    assert_eq!(h.state_of("act-a"), ActionState::Reserved);
+
+    // 同线程还有一条 queued
+    let b = h.ctx("act-b", ActionKind::Send);
+    assert!(matches!(
+        h.router.send(b, "第二条".into(), true).await,
+        RouterOutcome::Queued { .. }
+    ));
+
+    // —— 进程重启 ——
+    h.restart();
+
+    assert_eq!(
+        h.state_of("act-a"),
+        ActionState::Unknown,
+        "reserved 重启即 unknown"
+    );
+    let va = h.view_of("act-a");
+    let receipt = va.receipt.expect("unknown 动作带回执");
+    assert_eq!(receipt.delivery, Delivery::UnknownDelivery);
+
+    // queued 不受影响，按序发送且保留原输入
+    let head = h
+        .store
+        .next_queued(&h.key)
+        .expect("query")
+        .expect("b still queued");
+    assert_eq!(head.ctx.action_id, "act-b");
+    assert_eq!(head.raw_text, "第二条");
+    assert_eq!(head.ctx.device_name, "iPhone");
+    let rb = completed(h.router.flush_thread(&h.key).await.expect("b dispatchable"));
+    assert_eq!(rb.delivery, Delivery::Accepted);
+    let sends = h.dispatch.sends.lock().unwrap();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(
+        sends[0].client_message_id, head.client_message_id,
+        "恢复沿用原 client_message_id"
+    );
+    assert_eq!(sends[0].composed, "第二条 [mobile iPhone]");
+}
+
+// ============================================================
+// 计划场景 3：忙态 FIFO + 审批不堵
+// ============================================================
+
+/// active 时连续 a/b 两条消息落 SQLite FIFO，idle 后只发 a，等它终态再发 b；
+/// 期间审批能取得短 action 锁响应原 Turn（不等待 Turn 结束）。
+#[tokio::test]
+async fn busy_fifo_allows_pending_response() {
+    let h = harness();
+    h.dispatch.set_busy(true);
+
+    let a = h.ctx("fifo-a", ActionKind::Send);
+    let b = h.ctx("fifo-b", ActionKind::Send);
+    let (ida, posa) = queued(h.router.send(a, "消息甲".into(), false).await);
+    let (idb, posb) = queued(h.router.send(b, "消息乙".into(), false).await);
+    assert_eq!(ida, "fifo-a");
+    assert_eq!(idb, "fifo-b");
+    assert_eq!(posa, 1);
+    assert_eq!(posb, 2, "FIFO 位置按入队序");
+    assert_eq!(h.dispatch.send_count(), 0, "忙态不派发");
+
+    // 忙态期间审批：短 action 锁响应，不被消息队列堵住
+    let actx = h.ctx("appr-1", ActionKind::CommandApproval);
+    let rappr = completed(
+        h.router
+            .respond(actx, "n:12".into(), "tok-1".into(), PendingAction::Approve)
+            .await,
+    );
+    assert_eq!(rappr.delivery, Delivery::Accepted);
+    assert_eq!(h.dispatch.respond_count(), 1, "审批不等待 Turn/队列");
+
+    // idle 后只发 a
+    h.dispatch.set_busy(false);
+    let out_a = h.router.flush_thread(&h.key).await.expect("a dispatchable");
+    assert_eq!(completed(out_a).delivery, Delivery::Accepted);
+    {
+        let sends = h.dispatch.sends.lock().unwrap();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].action_id, "fifo-a");
+    }
+    // b 仍在队列（turn a 未终态）
+    assert_eq!(h.state_of("fifo-b"), ActionState::Queued);
+
+    // turn a 终态后 flush 接力发 b
+    let out_b = h.router.flush_thread(&h.key).await.expect("b dispatchable");
+    assert_eq!(completed(out_b).delivery, Delivery::Accepted);
+    let sends = h.dispatch.sends.lock().unwrap();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[1].action_id, "fifo-b", "FIFO 接力按序");
+}
+
+// ============================================================
+// 计划场景 4：fallback 只在派发前
+// ============================================================
+
+/// IPC NotSent 且仍未尝试写可 UseFallback；Accepted/Rejected/UnknownDelivery 不得触发
+/// fallback；审批永不降级（NotSent 如实回执）。
+#[tokio::test]
+async fn fallback_only_before_dispatch() {
+    // NotSent → UseFallback
+    let h = harness_with(FakeDispatch::not_sent("ipc_disconnected"));
+    let permit = use_fallback(
+        h.router
+            .send(h.ctx("fb-1", ActionKind::Send), "降级消息".into(), false)
+            .await,
+    );
+    assert_eq!(permit.action_id(), "fb-1");
+    assert_eq!(permit.raw_text(), "降级消息", "permit 携带原文");
+    assert_eq!(permit.context().device_name, "iPhone");
+    permit
+        .finish(accepted_compat_receipt("fb-1"))
+        .expect("finish");
+    assert_eq!(h.state_of("fb-1"), ActionState::Accepted);
+
+    // Accepted/Rejected/Unknown 不触发 fallback
+    for name in ["accepted", "rejected", "unknown"] {
+        let delivery = match name {
+            "accepted" => Delivery::Accepted,
+            "rejected" => Delivery::Rejected,
+            _ => Delivery::UnknownDelivery,
+        };
+        let h = harness_with(FakeDispatch::new(DispatchOutcome {
+            delivery,
+            envelope_id: Some("env".into()),
+            turn_id: None,
+            reason_code: None,
+        }));
+        let ctx = h.ctx(&format!("nf-{name}"), ActionKind::Send);
+        let out = h.router.send(ctx, "普通消息".into(), false).await;
+        assert!(
+            matches!(out, RouterOutcome::Completed(_)),
+            "{name} 不得触发 fallback"
+        );
+        assert_eq!(h.dispatch.send_count(), 1);
+    }
+
+    // 审批 NotSent 也不降级
+    let h = harness_with(FakeDispatch::not_sent("ipc_disconnected"));
+    let actx = h.ctx("appr-nf", ActionKind::PermissionsApproval);
+    let r = completed(
+        h.router
+            .respond(
+                actx,
+                "s:req-9".into(),
+                "tok-2".into(),
+                PendingAction::Reject,
+            )
+            .await,
+    );
+    assert_eq!(r.delivery, Delivery::NotSent, "审批失败如实回执，不降级");
+    assert_eq!(h.dispatch.respond_count(), 1);
+}
+
+/// version/profile 不匹配（capability 关闭）允许普通消息兼容——同样走
+/// NotSent → UseFallback，但 reason 是能力码，不能解释成「旧 RPC 未投递」。
+#[tokio::test]
+async fn profile_mismatch_send_falls_back_with_capability_reason() {
+    let h = harness_with(FakeDispatch::not_sent("capability_unavailable"));
+    let ctx = h.ctx("fb-prof", ActionKind::Send);
+    match h.router.send(ctx, "兼容消息".into(), false).await {
+        RouterOutcome::UseFallback {
+            permit,
+            reason_code,
+        } => {
+            assert_eq!(reason_code, "capability_unavailable");
+            assert_eq!(permit.raw_text(), "兼容消息");
+            permit
+                .finish(not_sent_receipt(
+                    "fb-prof",
+                    ControlRoute::HeadlessCompat,
+                    "helper_refused",
+                ))
+                .expect("finish");
+            assert_eq!(h.state_of("fb-prof"), ActionState::Rejected);
+        }
+        other => panic!("expected UseFallback, got {other:?}"),
+    }
+}
+
+// ============================================================
+// 计划场景 5：相同毫秒按 seq
+// ============================================================
+
+/// 相同毫秒 a/b 仍按 seq（FIFO 按 seq 不按时间戳；相同 ts 的 DAO 级钉死在 lib 单测）。
+#[tokio::test]
+async fn same_millisecond_fifo_orders_by_seq() {
+    let h = harness();
+    let (ida, pa) = queued(
+        h.router
+            .send(h.ctx("seq-a", ActionKind::Send), "甲".into(), true)
+            .await,
+    );
+    let (idb, pb) = queued(
+        h.router
+            .send(h.ctx("seq-b", ActionKind::Send), "乙".into(), true)
+            .await,
+    );
+    assert_eq!(ida, "seq-a");
+    assert_eq!(idb, "seq-b");
+    assert_eq!(pa, 1);
+    assert_eq!(pb, 2);
+    // 队首 = 先注册者（seq 升序，与时间戳无关）
+    let head = h.store.next_queued(&h.key).expect("query").expect("head");
+    assert_eq!(head.ctx.action_id, "seq-a");
+}
+
+// ============================================================
+// 计划场景 6：撤回竞态与已撤 actionId 重放
+// ============================================================
+
+/// 撤回与 reserve 竞态只有一个 CAS 成功；已撤 actionId 再提交不会重发；
+/// 撤回保留 actionId 墓碑、清正文。
+#[tokio::test]
+async fn retract_reserve_race_single_winner_and_no_redispatch() {
+    let h = harness();
+
+    // 顺序一：reserve 先赢 → retract 失败（reserved 不可撤）
+    h.router
+        .send(h.ctx("race-a", ActionKind::Send), "竞态甲".into(), true)
+        .await;
+    assert!(h.store.reserve("race-a", ControlRoute::DesktopIpc).unwrap());
+    assert!(
+        !h.store.retract("race-a", "dev-1").unwrap(),
+        "reserved 不可撤"
+    );
+    assert_eq!(h.state_of("race-a"), ActionState::Reserved);
+
+    // 顺序二：retract 先赢 → reserve 失败；保留墓碑、清正文
+    h.router
+        .send(h.ctx("race-b", ActionKind::Send), "竞态乙".into(), true)
+        .await;
+    assert!(h.store.retract("race-b", "dev-1").unwrap(), "queued 可撤");
+    assert!(
+        !h.store.reserve("race-b", ControlRoute::DesktopIpc).unwrap(),
+        "CAS 失败"
+    );
+    assert_eq!(h.state_of("race-b"), ActionState::Cancelled);
+    let queued_text: Option<String> = {
+        let conn = h.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT queued_text FROM codex_actions WHERE action_id = 'race-b'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(queued_text, None, "撤回清正文，墓碑保留");
+
+    // 已撤 actionId 再提交：不重发、不再入队
+    let rr = completed(
+        h.router
+            .send(h.ctx("race-b", ActionKind::Send), "竞态乙".into(), false)
+            .await,
+    );
+    assert_eq!(rr.delivery, Delivery::NotSent);
+    assert_eq!(rr.reason_code.as_deref(), Some("action_cancelled"));
+    assert_eq!(h.dispatch.send_count(), 0);
+}
+
+// ============================================================
+// 计划场景 7：吊销设备
+// ============================================================
+
+/// 设备被吊销后的 queued 动作拒绝而不派发（零写入），拒绝后队列不永久卡死。
+#[tokio::test]
+async fn revoked_device_queued_action_refused_not_dispatched() {
+    let h = harness();
+    let q = h
+        .router
+        .send(h.ctx("rv-a", ActionKind::Send), "吊销前排队".into(), true)
+        .await;
+    assert!(matches!(q, RouterOutcome::Queued { .. }));
+
+    // 吊销设备（走同一连接，模拟服务端吊销）
+    DeviceStore::Owned(h.conn.clone()).with(|c| {
+        revoke_device(c, "dev-1").expect("revoke");
+    });
+
+    // flush：队首动作设备已吊销 → 拒绝落账、不派发
+    let out = h.router.flush_thread(&h.key).await;
+    assert!(out.is_none(), "无可派发队首（唯一动作被拒）");
+    assert_eq!(h.dispatch.send_count(), 0, "吊销设备动作零派发");
+    let v = h.view_of("rv-a");
+    assert_eq!(v.state, ActionState::Rejected);
+    let receipt = v.receipt.expect("refusal receipt");
+    assert_eq!(receipt.delivery, Delivery::NotSent);
+    assert_eq!(receipt.reason_code.as_deref(), Some("device_revoked"));
+}
+
+// ============================================================
+// 计划场景 8：三条路径单一 [mobile] 标记
+// ============================================================
+
+/// 立即发送、FIFO 重启恢复、fallback 三条路径逐一断言正文只有一个 `[mobile <设备名>]`；
+/// 持久队列存原文（hash 基于原文）；恢复后仍只组装一次；fallback 由 bridge 用原文组装。
+#[tokio::test]
+async fn three_paths_compose_marker_exactly_once() {
+    let raw = "带签名正文";
+
+    // 路径一：立即发送
+    {
+        let h = harness();
+        completed(
+            h.router
+                .send(h.ctx("mk-1", ActionKind::Send), raw.into(), false)
+                .await,
+        );
+        let composed = h.dispatch.recorded_composed();
+        assert_eq!(composed.len(), 1);
+        assert_eq!(composed[0], format!("{raw} [mobile iPhone]"));
+        assert_eq!(
+            composed[0].matches("[mobile iPhone]").count(),
+            1,
+            "恰好一次标记"
+        );
+        // 账本 hash 基于原文而非组合文本
+        let stored_hash: String = {
+            let conn = h.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT payload_hash FROM codex_actions WHERE action_id = 'mk-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            stored_hash,
+            payload_hash(
+                ActionKind::Send,
+                &h.key,
+                None,
+                None,
+                &ActionPayload::Text(raw.into())
+            ),
+            "hash 基于原文"
+        );
+    }
+
+    // 路径二：FIFO + 重启恢复（仍只组装一次）
+    {
+        let mut h = harness();
+        h.router
+            .send(h.ctx("mk-2", ActionKind::Send), raw.into(), true)
+            .await;
+        h.restart();
+        h.router.flush_thread(&h.key).await.expect("dispatch");
+        let composed = h.dispatch.recorded_composed();
+        assert_eq!(composed.len(), 1);
+        assert_eq!(composed[0], format!("{raw} [mobile iPhone]"));
+        assert_eq!(composed[0].matches("[mobile iPhone]").count(), 1);
+    }
+
+    // 路径三：fallback（permit 携带原文，由 Task 8 bridge 组装恰好一次）
+    {
+        let h = harness_with(FakeDispatch::not_sent("ipc_disconnected"));
+        let permit = use_fallback(
+            h.router
+                .send(h.ctx("mk-3", ActionKind::Send), raw.into(), false)
+                .await,
+        );
+        assert_eq!(permit.raw_text(), raw, "permit 存原文");
+        // 模拟 bridge：用原文组装恰好一次，并记录 wire hash
+        let composed = multi_agents_manager_lib::inject::normalize::compose_injection(
+            "iPhone",
+            permit.raw_text(),
+        )
+        .expect("compose");
+        assert_eq!(composed.matches("[mobile iPhone]").count(), 1);
+        h.store
+            .set_compat_fence("mk-3", Some("compat-msg-3"), Some("compat-turn-3"))
+            .expect("set fence");
+        h.store
+            .set_compat_evidence(
+                "mk-3",
+                Some("/tmp/rollout.jsonl"),
+                Some(64),
+                Some(&wire_text_hash(&composed)),
+            )
+            .expect("set evidence");
+        let fences = h.store.compat_fences(&h.key).expect("fences");
+        assert_eq!(fences.len(), 1);
+        assert_eq!(
+            fences[0].wire_hash.as_deref(),
+            Some(wire_text_hash(&composed)).as_deref()
+        );
+        permit
+            .finish(accepted_compat_receipt("mk-3"))
+            .expect("finish");
+        assert_eq!(h.state_of("mk-3"), ActionState::Accepted);
+    }
+}
+
+// ============================================================
+// 计划场景 9：审计 trigger 回滚
+// ============================================================
+
+/// 审计表安装拒绝 INSERT 的 SQLite trigger → reserve 回滚、仍 queued、IPC 与 fallback 写入均 0。
+#[tokio::test]
+async fn audit_insert_rejection_rolls_back_reserve_and_keeps_queued() {
+    let h = harness();
+    {
+        let conn = h.conn.lock().unwrap();
+        conn.execute(
+            "CREATE TRIGGER audit_reject_t7 BEFORE INSERT ON write_audit
+             BEGIN SELECT RAISE(ABORT, 'audit rejected by test trigger'); END",
+            [],
+        )
+        .unwrap();
+    }
+
+    // queue_only 入队（不经审计路径）后 flush：reserve 与审计起始行同事务 → 整体回滚
+    h.router
+        .send(h.ctx("aud-1", ActionKind::Send), "审计回滚".into(), true)
+        .await;
+    let out = h.router.flush_thread(&h.key).await;
+    assert!(out.is_none(), "DB 失败零投递（flush 无产出）");
+    assert_eq!(h.dispatch.send_count(), 0, "IPC 写入 0");
+    assert_eq!(
+        h.state_of("aud-1"),
+        ActionState::Queued,
+        "reserve 回滚后仍 queued"
+    );
+
+    // 活动发送路径同样零投递（DB 失败零投递；队首 aud-1 未解锁，FIFO 如实拦住后来者）
+    let q = h
+        .router
+        .send(h.ctx("aud-2", ActionKind::Send), "活动发送".into(), false)
+        .await;
+    assert!(
+        matches!(q, RouterOutcome::Queued { .. }),
+        "队首卡住时后来者只排队"
+    );
+    assert_eq!(h.dispatch.send_count(), 0);
+    assert_eq!(h.state_of("aud-2"), ActionState::Queued);
+}
+
+// ============================================================
+// 计划场景 10：fallback 恰好一次交接 + 交接时崩溃恢复 unknown
+// ============================================================
+
+/// IPC 已 reserved、writer 前 NotSent → handoff → fallback 恰好一次；交接时崩溃
+/// （进程消失，permit 无 Drop）恢复为 unknown，绝不回 queued，不自动重试。
+#[tokio::test]
+async fn fallback_handoff_exactly_once_then_crash_is_unknown() {
+    let mut h = harness_with(FakeDispatch::not_sent("ipc_disconnected"));
+    let permit = use_fallback(
+        h.router
+            .send(h.ctx("ho-1", ActionKind::Send), "交接消息".into(), false)
+            .await,
+    );
+    assert_eq!(h.view_of("ho-1").state, ActionState::Reserved);
+    assert_eq!(h.route_of("ho-1"), "headless_compat", "handoff 已切路由");
+
+    // handoff CAS 只能成功一次（router 已 handoff，再来一次必 false）
+    assert!(
+        !h.store.handoff_not_sent("ho-1").expect("handoff"),
+        "恰好一次交接"
+    );
+
+    // —— 交接时崩溃：进程消失，permit 不走 Drop（forget 模拟）——
+    std::mem::forget(permit);
+    h.restart();
+    assert_eq!(
+        h.state_of("ho-1"),
+        ActionState::Unknown,
+        "交接后崩溃恢复为 unknown"
+    );
+    assert_eq!(h.route_of("ho-1"), "headless_compat", "路由保留供核对");
+    // 未知动作不自动重试：flush 无产出、零写入
+    assert!(h.router.flush_thread(&h.key).await.is_none());
+    assert_eq!(h.dispatch.send_count(), 0, "unknown 不自动重试");
+}
+
+/// 未 finish 的 permit 被 drop → reserved 记 unknown（Drop 守卫），不自动回 queued。
+#[tokio::test]
+async fn dropped_permit_marks_unknown_never_requeued() {
+    let h = harness_with(FakeDispatch::not_sent("ipc_disconnected"));
+    let permit = use_fallback(
+        h.router
+            .send(h.ctx("dp-1", ActionKind::Send), "将被丢弃".into(), false)
+            .await,
+    );
+    assert_eq!(h.view_of("dp-1").state, ActionState::Reserved);
+    drop(permit);
+    let v = h.view_of("dp-1");
+    assert_eq!(
+        v.state,
+        ActionState::Unknown,
+        "丢弃未完成 permit 记 unknown"
+    );
+    let receipt = v.receipt.expect("unknown receipt");
+    assert_eq!(receipt.delivery, Delivery::UnknownDelivery);
+    // 原始派发尝试（NotSent 那次）计数 1；之后任何 flush/查询不得再派发
+    assert!(
+        h.store.next_queued(&h.key).expect("query").is_none(),
+        "unknown 不回 queued"
+    );
+    assert!(h.router.flush_thread(&h.key).await.is_none());
+    assert_eq!(h.dispatch.send_count(), 1, "无新增派发");
+}
+
+// ============================================================
+// 计划场景 11：NotSent 清 fence 与队列解锁
+// ============================================================
+
+/// 明确零投递（CLI 缺失 / 探针拒绝等 spawn/write 前失败）→ finish 与清 fence 同事务；
+/// A 恢复后下一条正常发送；fence 在册时队列被闸住。
+#[tokio::test]
+async fn finish_not_sent_clears_fence_and_unblocks_next() {
+    let mut h = harness_with(FakeDispatch::not_sent("ipc_disconnected"));
+    // 第一条走 fallback，bridge 设 fence 后 helper 明确拒发 → NotSent finish
+    let permit = use_fallback(
+        h.router
+            .send(h.ctx("fence-1", ActionKind::Send), "第一条".into(), false)
+            .await,
+    );
+    h.store
+        .set_compat_fence("fence-1", Some("compat-msg-1"), Some("compat-turn-1"))
+        .expect("set fence");
+    assert!(h.store.has_compat_fence(&h.key).expect("has fence"));
+
+    // fence 在册时后续消息仍可排队，但不接力
+    let qb = h
+        .router
+        .send(h.ctx("fence-2", ActionKind::Send), "第二条".into(), true)
+        .await;
+    assert!(matches!(qb, RouterOutcome::Queued { .. }));
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "fence 在册不接力"
+    );
+
+    // helper 明确拒发 → NotSent → fence 同事务清除
+    permit
+        .finish(not_sent_receipt(
+            "fence-1",
+            ControlRoute::HeadlessCompat,
+            "cli_missing",
+        ))
+        .expect("finish");
+    assert!(
+        !h.store.has_compat_fence(&h.key).expect("fence cleared"),
+        "NotSent 同事务清 fence"
+    );
+
+    // A 恢复（可用）后下一条正常发送
+    h.restart_with(FakeDispatch::accepted());
+    let out = h
+        .router
+        .flush_thread(&h.key)
+        .await
+        .expect("next dispatchable");
+    assert_eq!(completed(out).delivery, Delivery::Accepted);
+    let sends = h.dispatch.sends.lock().unwrap();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].action_id, "fence-2", "下一条正常发送");
+}
+
+/// crash 残留 fence（动作 reserved）→ 重启恢复 unknown；reserved 态 clear 被 Conflict
+/// 拒绝；终态后允许 clear；清 fence 前队列保持闸住。
+#[tokio::test]
+async fn compat_fence_blocks_and_clear_requires_terminal_state() {
+    let mut h = harness();
+    h.router
+        .send(h.ctx("cf-1", ActionKind::Send), "被闸消息".into(), true)
+        .await;
+    // 模拟 bridge：reserve + fence 在册（crash 前状态）
+    h.store
+        .reserve("cf-1", ControlRoute::HeadlessCompat)
+        .unwrap();
+    h.store
+        .set_compat_fence("cf-1", Some("cm"), Some("ct"))
+        .expect("set fence");
+
+    // reserved（未终态）直接 clear 被 Conflict 拒绝
+    assert!(matches!(
+        h.store.clear_compat_fence("cf-1"),
+        Err(StoreError::Conflict)
+    ));
+
+    // —— crash 重启：recover → unknown，fence 残留仍闸住队列 ——
+    h.restart();
+    assert_eq!(h.state_of("cf-1"), ActionState::Unknown);
+    assert!(h.store.has_compat_fence(&h.key).expect("fence kept"));
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "证据不足保持留队"
+    );
+    assert_eq!(h.dispatch.send_count(), 0);
+
+    // 终态后 clear 可用（真实核对在 Task 8 经 reconcile 只读证据决定）
+    h.store
+        .clear_compat_fence("cf-1")
+        .expect("unknown 终态允许 clear");
+    assert!(!h.store.has_compat_fence(&h.key).expect("query"));
+}
+
+// ============================================================
+// 计划场景 12：unknown 阻止重放
+// ============================================================
+
+/// 未知操作阻止相同 action 重放：unknown 后同 action_id 再提交返回原 unknown，零写入。
+#[tokio::test]
+async fn unknown_replay_blocked() {
+    let h = harness_with(FakeDispatch::new(DispatchOutcome {
+        delivery: Delivery::UnknownDelivery,
+        envelope_id: Some("env-u".into()),
+        turn_id: None,
+        reason_code: None,
+    }));
+    let ctx = h.ctx("unk-1", ActionKind::Send);
+    let r1 = completed(
+        h.router
+            .send(ctx.clone(), "未知结果消息".into(), false)
+            .await,
+    );
+    assert_eq!(r1.delivery, Delivery::UnknownDelivery);
+    assert_eq!(h.dispatch.send_count(), 1);
+
+    // 重放：原状态、零写入
+    let r2 = completed(h.router.send(ctx, "未知结果消息".into(), false).await);
+    assert_eq!(r2, r1);
+    assert_eq!(h.dispatch.send_count(), 1);
+    assert_eq!(h.state_of("unk-1"), ActionState::Unknown);
+}
+
+// ============================================================
+// 计划场景 13：reconcile 只读核对
+// ============================================================
+
+/// 只给 idle 证据不解锁；给原消息对应完成证据（唯一 user-input hash + 对应 Turn 终态）
+/// 才解锁；队列副本仍在 → 不解锁。
+#[tokio::test]
+async fn reconcile_requires_completion_evidence_not_idle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // rollout 文件名形态（thread_id_of 权威：rollout* 前缀 + .jsonl + 内嵌 thread UUID）
+    let rollout = dir
+        .path()
+        .join(format!("rollout-2026-10-16T00-00-00-{THREAD}.jsonl"));
+    let composed = "第一条 [mobile iPhone]";
+    // 基线段：历史旧输入（不同文本）+ 旧 turn 终态
+    let base = concat!(
+        r#"{"timestamp":"2026-10-16T00:00:00Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"旧输入"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-10-16T00:00:01Z","ordinal":2,"type":"event_msg","payload":{"type":"task_complete","turn_id":"old"}}"#,
+        "\n",
+    );
+    std::fs::write(&rollout, base).unwrap();
+    let baseline = std::fs::metadata(&rollout).unwrap().len();
+
+    let fence = CompatFence {
+        action_id: "rc-1".into(),
+        queued_message_id: Some("msg-1".into()),
+        turn_id: Some("t9".into()),
+        rollout_path: Some(rollout.to_string_lossy().to_string()),
+        rollout_baseline: Some(baseline),
+        wire_hash: Some(wire_text_hash(composed)),
+    };
+    let idle = minimal_projection(THREAD, "idle");
+    let no_queue = |_t: &str, _m: &str| -> Option<QueueEvidence> { None };
+    assert!(
+        !reconcile_compat_fence_with(&fence, &idle, &no_queue).unwrap(),
+        "仅 idle 投影、无追加段 → 不解锁"
+    );
+
+    // 追加段：我们的输入 + 对应 turn 完成 → 解锁
+    let appended = format!(
+        concat!(
+            r#"{{"timestamp":"2026-10-16T00:01:00Z","ordinal":3,"type":"event_msg","payload":{{"type":"task_started","turn_id":"t9"}}}}"#,
+            "\n",
+            r#"{{"timestamp":"2026-10-16T00:01:01Z","ordinal":4,"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{composed}"}}]}}}}"#,
+            "\n",
+            r#"{{"timestamp":"2026-10-16T00:01:05Z","ordinal":5,"type":"event_msg","payload":{{"type":"task_complete","turn_id":"t9"}}}}"#,
+            "\n",
+        ),
+        composed = composed
+    );
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout)
+            .unwrap();
+        f.write_all(appended.as_bytes()).unwrap();
+    }
+    assert!(
+        reconcile_compat_fence_with(&fence, &idle, &no_queue).unwrap(),
+        "唯一匹配输入 + 对应 Turn 终态 → 解锁"
+    );
+
+    // 队列副本仍在（我们的消息未消费）→ 不解锁
+    let still_queued = |_t: &str, m: &str| -> Option<QueueEvidence> {
+        (m == "msg-1").then_some(QueueEvidence::Ours)
+    };
+    assert!(!reconcile_compat_fence_with(&fence, &idle, &still_queued).unwrap());
+}
+
+/// 读失败、多义（重复文本）、已被尾窗截断、投影归属不一致均返回 false。
+#[tokio::test]
+async fn reconcile_false_on_ambiguous_truncated_or_read_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let composed = "第二条 [mobile iPhone]";
+    let proj = minimal_projection(THREAD, "idle");
+    let no_queue = |_t: &str, _m: &str| -> Option<QueueEvidence> { None };
+
+    // 读失败：路径不存在（文件名形态合法但文件缺失）
+    let fence_missing = CompatFence {
+        action_id: "rc-x".into(),
+        queued_message_id: None,
+        turn_id: None,
+        rollout_path: Some(
+            dir.path()
+                .join(format!("rollout-2026-10-16T00-00-00-{THREAD}.jsonl"))
+                .to_string_lossy()
+                .to_string(),
+        ),
+        rollout_baseline: Some(0),
+        wire_hash: Some(wire_text_hash(composed)),
+    };
+    assert!(!reconcile_compat_fence_with(&fence_missing, &proj, &no_queue).unwrap());
+
+    // 多义：基线之后同一文本出现两次
+    let rollout = dir
+        .path()
+        .join(format!("rollout-2026-10-16T00-01-00-{THREAD}.jsonl"));
+    let line = |o: u32, turn: &str| {
+        format!(
+            concat!(
+                r#"{{"timestamp":"2026-10-16T00:00:{o:02}Z","ordinal":{o},"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{composed}"}}]}}}}"#,
+                "\n",
+                r#"{{"timestamp":"2026-10-16T00:01:{o:02}Z","ordinal":{o},"type":"event_msg","payload":{{"type":"task_complete","turn_id":"{turn}"}}}}"#,
+                "\n",
+            ),
+            o = o,
+            composed = composed,
+            turn = turn,
+        )
+    };
+    std::fs::write(&rollout, line(1, "t1")).unwrap();
+    let baseline = std::fs::metadata(&rollout).unwrap().len();
+    let fence_dup = CompatFence {
+        action_id: "rc-d".into(),
+        queued_message_id: None,
+        turn_id: None,
+        rollout_path: Some(rollout.to_string_lossy().to_string()),
+        rollout_baseline: Some(baseline),
+        wire_hash: Some(wire_text_hash(composed)),
+    };
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout)
+            .unwrap();
+        f.write_all(line(3, "t3").as_bytes()).unwrap();
+        f.write_all(line(4, "t4").as_bytes()).unwrap();
+    }
+    assert!(
+        !reconcile_compat_fence_with(&fence_dup, &proj, &no_queue).unwrap(),
+        "多义匹配返回 false"
+    );
+
+    // 截断：追加段超过 2 MiB 尾窗 → 无法证明唯一性 → false
+    let big = dir
+        .path()
+        .join(format!("rollout-2026-10-16T00-02-00-{THREAD}.jsonl"));
+    std::fs::write(&big, "").unwrap();
+    let fence_big = CompatFence {
+        action_id: "rc-b".into(),
+        queued_message_id: None,
+        turn_id: None,
+        rollout_path: Some(big.to_string_lossy().to_string()),
+        rollout_baseline: Some(0),
+        wire_hash: Some(wire_text_hash(composed)),
+    };
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&big).unwrap();
+        let filler = "x".repeat(1024);
+        for _ in 0..(2 * 1024 * 1024 / 1025 + 2) {
+            f.write_all(format!("{filler}\n").as_bytes()).unwrap();
+        }
+    }
+    assert!(
+        !reconcile_compat_fence_with(&fence_big, &proj, &no_queue).unwrap(),
+        "已被尾窗截断返回 false"
+    );
+
+    // 投影归属不一致：rollout 文件名 UUID 与投影 thread 不符 → false
+    let other_rollout = dir
+        .path()
+        .join("rollout-2026-10-16T00-03-00-aaaaaaaa-bbbb-4ccc-8ddd-eeeeffff0000.jsonl");
+    std::fs::write(&other_rollout, "").unwrap();
+    let fence_mismatch = CompatFence {
+        action_id: "rc-m".into(),
+        queued_message_id: None,
+        turn_id: None,
+        rollout_path: Some(other_rollout.to_string_lossy().to_string()),
+        rollout_baseline: Some(0),
+        wire_hash: Some(wire_text_hash(composed)),
+    };
+    assert!(
+        !reconcile_compat_fence_with(&fence_mismatch, &proj, &no_queue).unwrap(),
+        "投影与 rollout 归属不一致返回 false"
+    );
+}
+
+// 保持 ProtocolError 类型可达（reconcile 错误面在 Task 8 接线；锁定 re-export 存在）
+#[allow(dead_code)]
+fn _protocol_error_reachable(e: ProtocolError) -> ProtocolError {
+    e
+}

@@ -38,12 +38,45 @@ pub fn record_conn(
     summary: &str,
     result: &str,
 ) {
-    if let Err(e) = conn.execute(
-        "INSERT INTO write_audit (ts, device_id, device_name, agent_type, session_id, channel, action, summary, result) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![ts, device_id, device_name, agent_type, session_id, channel, action, summary, result],
+    if let Err(e) = record_conn_checked(
+        conn,
+        ts,
+        device_id,
+        device_name,
+        agent_type,
+        session_id,
+        channel,
+        action,
+        summary,
+        result,
     ) {
         log::error!("write_audit 记录失败: {e}");
     }
+}
+
+/// [`record_conn`] 的 **checked 变体**（Codex Desktop IPC Task 7）：参数完全相同，
+/// 但把写入错误作为 `Result` 返回给调用方——供需要「审计与业务写入同事务」的调用方
+/// （`services::codex_control` 的 ActionStore：reserve 与审计起始行同事务，DB 失败
+/// 零投递）在事务内传播失败并整体回滚。原 [`record_conn`] 的吞错兼容行为由它实现后
+/// 保留（旧调用方语义不变）。
+#[allow(clippy::too_many_arguments)]
+pub fn record_conn_checked(
+    conn: &Connection,
+    ts: i64,
+    device_id: &str,
+    device_name: &str,
+    agent_type: &str,
+    session_id: &str,
+    channel: &str,
+    action: &str,
+    summary: &str,
+    result: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO write_audit (ts, device_id, device_name, agent_type, session_id, channel, action, summary, result) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![ts, device_id, device_name, agent_type, session_id, channel, action, summary, result],
+    )
+    .map(|_| ())
 }
 
 /// 最近 limit 条审计，最新在前（id 单调递增，按 id 倒序）
@@ -150,5 +183,58 @@ mod tests {
         assert!(recent_conn(&c, 0).is_empty());
         let empty = mem();
         assert!(recent_conn(&empty, 10).is_empty());
+    }
+
+    /// checked 变体（Task 7）：写入成功返回 Ok；INSERT 被拒（触发器）返回 Err 且
+    /// 不吞错——同事务调用方据此整体回滚
+    #[test]
+    fn record_conn_checked_propagates_errors() {
+        let c = mem();
+        assert!(record_conn_checked(
+            &c,
+            1,
+            "d1",
+            "iPhone",
+            "codex",
+            "s1",
+            "codex_desktop_ipc",
+            "codex_send",
+            "{}",
+            "reserved"
+        )
+        .is_ok());
+        // 拒绝 INSERT 的触发器 → Err 传播
+        c.execute(
+            "CREATE TRIGGER audit_reject_checked BEFORE INSERT ON write_audit
+             BEGIN SELECT RAISE(ABORT, 'rejected'); END",
+            [],
+        )
+        .unwrap();
+        let err = record_conn_checked(
+            &c,
+            2,
+            "d1",
+            "iPhone",
+            "codex",
+            "s1",
+            "codex_desktop_ipc",
+            "codex_send",
+            "{}",
+            "reserved",
+        );
+        assert!(err.is_err(), "checked 写口必须把失败交给事务");
+        // 吞错兼容行为保留：旧 record_conn 不 panic
+        record_conn(
+            &c,
+            3,
+            "d1",
+            "iPhone",
+            "codex",
+            "s1",
+            "codex_desktop_ipc",
+            "codex_send",
+            "{}",
+            "reserved",
+        );
     }
 }

@@ -173,6 +173,41 @@ pub fn init(conn: &Connection) {
             failed_reason TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_inject_queue_session ON inject_queue(session_id, id);
+        -- ===== Codex Desktop IPC Task 7：持久动作账本 =====
+        -- 每个远程控制动作（普通消息/两类审批/阻塞问答）一行，FIFO 按 seq（AUTOINCREMENT，
+        -- 不按毫秒时间戳/随机 UUID）；state ∈ queued/reserved/accepted/rejected/unknown/cancelled。
+        -- queued_text 仅普通待发消息保存**原文**（派发后清空；来源标记在派发时恰好组装一次）；
+        -- 审批答案只存 payload_hash，不存答案原文。receipt_json 是 ActionReceipt 的 camelCase
+        -- JSON。compat_* 三列是 PR #117 兼容兜底的持久 fence（compat_outstanding=1 期间该
+        -- Thread 队列不接力）；compat_rollout_path/compat_rollout_baseline/compat_wire_hash 是
+        -- 只读核对（reconcile）的证据字段，随 fence 持久保存、跨热重启与应用重启有效。
+        -- 撤回 = CAS queued→cancelled，**保留行作墓碑**（已撤 actionId 重放据此拒绝，不重发）。
+        CREATE TABLE IF NOT EXISTS codex_actions (
+            seq                     INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id               TEXT UNIQUE NOT NULL,
+            device_id               TEXT NOT NULL,
+            device_name             TEXT NOT NULL,
+            thread_id               TEXT NOT NULL,
+            kind                    TEXT NOT NULL,
+            request_key             TEXT,
+            context_token           TEXT,
+            payload_hash            TEXT NOT NULL,
+            client_message_id       TEXT NOT NULL,
+            state                   TEXT NOT NULL,
+            route                   TEXT NOT NULL DEFAULT 'none',
+            queued_text             TEXT,
+            created_at              INTEGER NOT NULL,
+            updated_at              INTEGER NOT NULL,
+            receipt_json            TEXT,
+            compat_outstanding      INTEGER NOT NULL DEFAULT 0,
+            compat_message_id       TEXT,
+            compat_turn_id          TEXT,
+            compat_rollout_path     TEXT,
+            compat_rollout_baseline INTEGER,
+            compat_wire_hash        TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_actions_thread_state_seq
+            ON codex_actions(thread_id, state, seq);
         CREATE TABLE IF NOT EXISTS write_audit (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          INTEGER NOT NULL,
