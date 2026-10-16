@@ -1,6 +1,6 @@
 {
   "$comment": "Tuvis 多终端能力矩阵单一数据源。README「多终端能力矩阵（总表）」的结构化版本，两处随发版同步更新；tuvis-website 官网经 api.github.com 拉取本文件渲染兼容矩阵。",
-  "updated": "2026-10-12",
+  "updated": "2026-10-16",
   "legend": {
     "yes": "✅ 支持",
     "partial": "◐ 部分",
@@ -21,9 +21,11 @@
     {
       "key": "desktop",
       "name": "桌面提醒",
+      "nameEn": "Desktop Alerts",
       "rows": [
         {
           "name": "会话监控（红绿灯）",
+          "nameEn": "Session monitoring (status lights)",
           "key": "monitor",
           "support": {
             "claude": "yes",
@@ -38,6 +40,7 @@
         },
         {
           "name": "本机桌面通知",
+          "nameEn": "Desktop notifications",
           "key": "notify",
           "support": {
             "claude": "yes",
@@ -55,9 +58,11 @@
     {
       "key": "skillmcp",
       "name": "Skill · MCP 管理",
+      "nameEn": "Skill & MCP Management",
       "rows": [
         {
           "name": "Skill 管理",
+          "nameEn": "Skill management",
           "key": "skill",
           "support": {
             "claude": "yes",
@@ -73,6 +78,7 @@
         },
         {
           "name": "MCP 管理",
+          "nameEn": "MCP management",
           "key": "mcp",
           "support": {
             "claude": "yes",
@@ -88,6 +94,7 @@
         },
         {
           "name": "插件管理",
+          "nameEn": "Plugin management",
           "key": "plugin",
           "support": {
             "claude": "yes",
@@ -103,6 +110,7 @@
         },
         {
           "name": "状态 Hook",
+          "nameEn": "Status hooks",
           "key": "hook",
           "support": {
             "claude": "yes",
@@ -120,9 +128,11 @@
     {
       "key": "remote",
       "name": "远程操控",
+      "nameEn": "Remote Access",
       "rows": [
         {
           "name": "手机 · 消息查看",
+          "nameEn": "Mobile · message viewing",
           "key": "messages",
           "support": {
             "claude": "yes",
@@ -137,6 +147,7 @@
         },
         {
           "name": "手机 · 文件预览",
+          "nameEn": "Mobile · file preview",
           "key": "files",
           "support": {
             "claude": "yes",
@@ -151,6 +162,7 @@
         },
         {
           "name": "手机 · 发消息（注入）",
+          "nameEn": "Mobile · message injection",
           "key": "inject",
           "support": {
             "claude": "experimental",
@@ -166,6 +178,7 @@
         },
         {
           "name": "手机 · 新建会话",
+          "nameEn": "Mobile · session creation",
           "key": "newsession",
           "support": {
             "claude": "experimental",
@@ -180,6 +193,7 @@
         },
         {
           "name": "Token 用量采集",
+          "nameEn": "Token usage collection",
           "key": "usage",
           "support": {
             "claude": "yes",
@@ -194,6 +208,7 @@
         },
         {
           "name": "手机 · 子 Agent 观察台",
+          "nameEn": "Mobile · sub-agent observatory",
           "key": "subagents",
           "support": {
             "claude": "yes",
