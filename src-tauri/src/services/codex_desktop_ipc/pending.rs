@@ -204,12 +204,12 @@ fn permissions_summary(permissions: Option<&serde_json::Value>) -> String {
     if let Some(fs) = p.get("fileSystem") {
         if let Some(read) = fs.get("read").and_then(|r| r.as_array()) {
             if !read.is_empty() {
-                parts.push(format!("fs.read({} 项)", read.len()));
+                parts.push(format!("fs.read: {}", read.len()));
             }
         }
         if let Some(write) = fs.get("write").and_then(|w| w.as_array()) {
             if !write.is_empty() {
-                parts.push(format!("fs.write({} 项)", write.len()));
+                parts.push(format!("fs.write: {}", write.len()));
             }
         }
     }

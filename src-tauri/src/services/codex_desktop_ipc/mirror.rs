@@ -408,7 +408,7 @@ fn project_item(id: &str, item: &Value) -> Option<ProjectedMessage> {
         "user_message" => ("user", raw.to_string()),
         "agent_message" => ("assistant", raw.to_string()),
         // 未知 kind 只投影安全文字摘要，不下发原始工具参数
-        other => ("system", format!("[非文本项：{other}]")),
+        other => ("system", format!("[unsupported item: {other}]")),
     };
     Some(ProjectedMessage {
         id: id.to_string(),
