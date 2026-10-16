@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { fmtTokens } from "@/lib/usage/format";
+import { getLang, type Lang } from "@/lib/usage/lang";
 import type { SubagentView } from "./api";
 
 /** 运行中子 agent chip 区（v1 自拉 → 观察台 T5 改纯展示：list 由 SessionDetail
@@ -73,7 +74,8 @@ export function formatElapsed(ms: number): string {
   return h > 0 ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
 }
 
-/** chip 的 token 文案：四桶求和走既有 fmtTokens 口径（reasoning 类桶已在后端排除） */
-export function chipTokenText(t: SubagentView["tokens"]): string {
-  return fmtTokens(t.input + t.cacheRead + t.cacheCreation + t.output);
+/** chip 的 token 文案：四桶求和走 fmtTokens 的当前语言口径（locale 缺省读 i18n 单例——
+ *  lang.ts 内持单例，与 ModeBar.tsx:3 直引 i18n 同法；显式参数留给测试钉语言） */
+export function chipTokenText(t: SubagentView["tokens"], locale: Lang = getLang()): string {
+  return fmtTokens(t.input + t.cacheRead + t.cacheCreation + t.output, locale);
 }

@@ -39,6 +39,7 @@ import {
   miniBarToolLine,
   miniBarToolRowText,
 } from "@/lib/usage/miniBar";
+import { getLang } from "@/lib/usage/lang";
 import { isDashboardEmpty, tokenUnmeasured } from "@/lib/usage/range";
 import type { TFn } from "@/lib/usage/range";
 import type { UsageDashboard, UsageRange } from "@/types/usage";
@@ -75,6 +76,9 @@ export function UsageMiniBarView({
   onDetail,
   t,
 }: UsageMiniBarViewProps) {
+  // 格式化语言（issue #160）：本组件收 `t` prop 而非 useTranslation，语言切换由父层
+  // 触发重渲染，故函数体开头取一次即可；数值单位（万/亿 vs K/M/B）随界面语言走。
+  const lang = getLang();
   const px = (v: number) => Math.round(v * scale);
 
   // 数据是否可用：三态非 ready / 无数据 / 尚未采集哨兵 / **本期窗口为空** ⇒ 一律空态
@@ -106,7 +110,7 @@ export function UsageMiniBarView({
     : emptyWindow
       ? t("usage.empty")
       : tokenShown
-        ? fmtTokens(dash.totals.requestTotal)
+        ? fmtTokens(dash.totals.requestTotal, lang)
         : EM_DASH;
   const row1 =
     status === "loading"
@@ -119,15 +123,15 @@ export function UsageMiniBarView({
 
   // 行②：缓存命中 + 产出（四桶口径，与 hero 同源）
   const row2 = `${t("usage.mini.cacheHit")} ${
-    tokenShown ? fmtTokens(dash.totalsBuckets.cacheRead) : EM_DASH
-  } · ${t("usage.mini.output")} ${tokenShown ? fmtTokens(dash.totalsBuckets.output) : EM_DASH}`;
+    tokenShown ? fmtTokens(dash.totalsBuckets.cacheRead, lang) : EM_DASH
+  } · ${t("usage.mini.output")} ${tokenShown ? fmtTokens(dash.totalsBuckets.output, lang) : EM_DASH}`;
 
   // 行③：分工具汇总**一**行（纯层过滤/排序/折叠 + 行首口径标签；全零 → 空串 → 空态）
   // `!noTokens` 与纯层的 `requestTotal > 0` 过滤是**同一结论**（四桶全零 ⇒ 每行 requestTotal 也必为 0），
   // 这里显式写出来是纵深防御：用户可见的「不许印 0」不该只依赖另一层的算式蕴含。
   const tool =
     live && !noTokens
-      ? miniBarToolLine(dash.rows, toolLimit, fmtTokens)
+      ? miniBarToolLine(dash.rows, toolLimit, (n: number) => fmtTokens(n, lang))
       : { text: "", moreCount: 0 };
   const toolText = miniBarToolRowText(tool, t("usage.mini.toolsBasis"), (n) =>
     t("usage.moreN", { n })
@@ -152,7 +156,8 @@ export function UsageMiniBarView({
   const session = live ? dash.recentSession : null;
   const row4 = session
     ? `${t("usage.mini.session")} ${usageAgentLabel(session.sourceId)} ${fmtTokens(
-        session.metrics.requestTotal
+        session.metrics.requestTotal,
+        lang
       )} · ${session.title ?? t("usage.mini.untitled")}`
     : `${t("usage.mini.session")} ${EM_DASH} · ${t("usage.mini.noSession")}`;
   const row4Title = session ? t("usage.mini.sessionHint") : t("usage.mini.sessionEmptyHint"); // 两种空态原因（范围内没有 / 日档算不出）都在这一条里

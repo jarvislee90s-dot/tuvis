@@ -27,6 +27,7 @@
 // 无 `prev` prop：环比只此一处数据源（`dash.compare`），多一个入参就会有两套口径。
 import { Card, CardContent } from "@/components/ui/card";
 import { EM_DASH, fmtInt, fmtPct, fmtTokens } from "@/lib/usage/format";
+import { getLang } from "@/lib/usage/lang";
 import {
   asOfText,
   compareSuffix,
@@ -69,6 +70,8 @@ export function UsageSummary({
   retentionDays: number | null;
   t: TFn;
 }) {
+  // 格式化语言（issue #160）：数值单位（万/亿 vs K/M/B）随界面语言走，组件体取一次。
+  const lang = getLang();
   // 环比：上一周期聚合 → 各指标差值（`compare === null` → `null` → 各项对比段整段不渲染）
   const prev = prevOf(dash.compare);
 
@@ -105,7 +108,7 @@ export function UsageSummary({
       ? blankRow(key) // 没量到 token ⇒ 不显示数值，也不拿 0 去算环比
       : {
           key,
-          value: prefix + fmtTokens(cur),
+          value: prefix + fmtTokens(cur, lang),
           exact: prefix + fmtInt(cur),
           // prev 为 0 → compareSuffix 出「新增」；prev 为 null/非有限 → 空串（只显示当前值）
           compare: prevValue == null ? "" : compareSuffix(cur, prevValue, t),
