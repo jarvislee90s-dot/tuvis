@@ -36,6 +36,7 @@ import { usageErrMsg } from "@/components/usage/usageErrors";
 import { useUsageRecordsQuery } from "@/lib/query/queries/usage";
 import { distValue } from "@/lib/usage/distribution";
 import { EM_DASH, fmtInt, fmtTokens, usageAgentLabel } from "@/lib/usage/format";
+import { getLang } from "@/lib/usage/lang";
 import { cardTokenUnmeasured } from "@/lib/usage/range";
 import { FILTER_TOOL_IDS, RECORD_DIMS } from "@/lib/usage/useRecordsFilters";
 import type { RecordsFiltersState } from "@/lib/usage/useRecordsFilters";
@@ -89,6 +90,8 @@ function RecordCard({
   onToggle(key: string): void;
   t: TFn;
 }) {
+  // 格式化语言（issue #160）：数值单位（万/亿 vs K/M/B）随界面语言走，组件体取一次。
+  const lang = getLang();
   // 标题分派（见文件头 ③）：真机 tool 维度的 `toolLabel` 是工具 id，展示名只由 `usageAgentLabel` 解析
   const title = cardDim === "tool" ? usageAgentLabel(card.toolId) : card.toolLabel;
   // 卡片 testid 用的是**契约 key**：按项目分组时它是小写规范化键（D21），标题才是 label 原文
@@ -108,7 +111,7 @@ function RecordCard({
             className="text-muted-foreground text-xs tabular-nums"
             title={noTokens ? undefined : fmtInt(total)}
           >
-            {t("usage.records.cardTotal", { v: noTokens ? EM_DASH : fmtTokens(total) })}
+            {t("usage.records.cardTotal", { v: noTokens ? EM_DASH : fmtTokens(total, lang) })}
           </span>
         </CardAction>
       </CardHeader>
@@ -131,7 +134,7 @@ function RecordCard({
                 className="font-medium tabular-nums"
                 title={rowNoTokens ? undefined : fmtInt(distValue(row))}
               >
-                {rowNoTokens ? EM_DASH : fmtTokens(distValue(row))}
+                {rowNoTokens ? EM_DASH : fmtTokens(distValue(row), lang)}
               </span>
             </div>
           );

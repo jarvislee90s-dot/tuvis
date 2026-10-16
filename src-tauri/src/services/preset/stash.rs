@@ -21,13 +21,19 @@ pub fn stash_native_skill(
     original_path: &Path,
 ) -> Result<(), String> {
     if !original_path.is_dir() {
-        return Err(format!("原生技能目录不存在: {}", original_path.display()));
+        return Err(format!(
+            "STASH_NATIVE_DIR_MISSING: 原生技能目录不存在: {}",
+            original_path.display()
+        ));
     }
     let dir = stash_dir(tool_id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let stashed = dir.join(skill_name);
     if stashed.exists() {
-        return Err(format!("暂存区已有同名项: {}", stashed.display()));
+        return Err(format!(
+            "STASH_NAME_TAKEN: 暂存区已有同名项: {}",
+            stashed.display()
+        ));
     }
     std::fs::rename(original_path, &stashed).map_err(|e| e.to_string())?;
     if let Err(e) = database::record_stash(
@@ -38,7 +44,7 @@ pub fn stash_native_skill(
     ) {
         // 回滚移动，宁可不暂存也不留无账目录
         let _ = std::fs::rename(&stashed, original_path);
-        return Err(format!("暂存记账失败已回滚: {}", e));
+        return Err(format!("STASH_JOURNAL_FAIL: 暂存记账失败已回滚: {}", e));
     }
     log::info!("原生技能 {} 已暂存: {}", skill_name, stashed.display());
     Ok(())
@@ -49,10 +55,16 @@ pub fn restore_stashed_skill(entry: &StashEntryRecord) -> Result<(), String> {
     let stashed = Path::new(&entry.stashed_path);
     let original = Path::new(&entry.original_path);
     if !stashed.exists() {
-        return Err(format!("暂存区已无此项: {}", stashed.display()));
+        return Err(format!(
+            "STASH_ITEM_MISSING: 暂存区已无此项: {}",
+            stashed.display()
+        ));
     }
     if original.exists() {
-        return Err(format!("原位已被占用: {}", original.display()));
+        return Err(format!(
+            "STASH_SLOT_TAKEN: 原位已被占用: {}",
+            original.display()
+        ));
     }
     if let Some(parent) = original.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;

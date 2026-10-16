@@ -367,7 +367,7 @@ fn drain_to(handle: HANDLE, deadline: Instant, watch: &mut OccWatch) -> Result<(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err("注入超时（总预算耗尽），请重试".into());
+            return Err("INJECT_TIMEOUT: 注入超时（总预算耗尽），请重试".into());
         }
         sleep(DRAIN_POLL_GAP);
     }
@@ -376,7 +376,7 @@ fn drain_to(handle: HANDLE, deadline: Instant, watch: &mut OccWatch) -> Result<(
 /// 分片写入主循环（M9R §8.1 配方，取代旧 M6 消费墙保守实现）：
 /// - 每块 `families::CHUNK_CHARS * 2` 事件（80 字符 = 160 事件单次写入单元）；
 /// - **每轮循环顶部查 deadline**（P2-1 真总预算：写入/回车/122 重试/背压轮询共享）
-///   耗尽 → `Err("注入超时（总预算耗尽），请重试")`；
+///   耗尽 → `Err("INJECT_TIMEOUT: 注入超时（总预算耗尽），请重试")`；
 /// - M6R 纪律：实写 < 分片长 → **从偏移续写**（续写不睡眠）；`Ok(0)` 不应发生
 ///   （防御），按 122 同款可重试处理；
 /// - Err(122) → 100ms 重试同块（受 deadline）；其他错误 → 带错误码中文错误；
@@ -399,7 +399,7 @@ fn paced_write(
     while sent < records.len() {
         // P2-1：真总预算检查（写入/重试/轮询全走这里，一处收口）
         if Instant::now() >= deadline {
-            return Err("注入超时（总预算耗尽），请重试".into());
+            return Err("INJECT_TIMEOUT: 注入超时（总预算耗尽），请重试".into());
         }
         let end = (sent + chunk_events).min(records.len());
         let chunk: Vec<FlatKeyRecord> =
@@ -596,14 +596,17 @@ fn key_records_for(key: &str, spec: &FamilySpec) -> Option<Vec<KeyRecordSpec>> {
 /// `pub` 仅服务 `super::e2e_support` 测试支撑面（缘由同 [`InjectStats`] 注）。
 pub fn inject_key_spec(pid: u32, key: &str, spec: &FamilySpec) -> Result<(), String> {
     // 键黑名单（批次戊 E1⑤，裁19）：先于域校验——ctrl+c 无论域内域外一律拒绝
-    // （opencode 按下即退出应用；单点拒绝防日后域扩展回归）
+    // （opencode 按下即退出应用；单点拒绝防日后域扩展回归）。
+    // 【#79 上提后本处是**纵深第二道**】：第一道已在 Injector 引擎入口
+    // （engine.rs `locate_and_send_key` 默认实现，macOS 三通道同受检）；黑名单
+    // 本体单点 = engine::forbidden_key_reason。此处保留防本文件被绕过直调。
     if let Some(reason) = super::engine::forbidden_key_reason(key) {
         return Err(reason);
     }
     // P2-2：域校验先行——必须在取锁/附加之前快速失败（不触任何控制台 API）
     let Some(records) = key_records_for(key, spec) else {
         return Err(format!(
-            "不支持的按键：{key}（域：enter/esc/tab/backspace/space/shift+tab/单字符字母数字/方向键）"
+            "INJECT_BAD_KEY: 不支持的按键：{key}（域：enter/esc/tab/backspace/space/shift+tab/单字符字母数字/方向键）"
         ));
     };
     let _lock = CONSOLE_OP.lock().unwrap_or_else(|e| e.into_inner());

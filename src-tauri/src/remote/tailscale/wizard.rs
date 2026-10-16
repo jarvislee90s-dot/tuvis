@@ -337,7 +337,7 @@ pub(super) fn ts_expected_sha256(asset: &str) -> Result<&'static str, String> {
         TS_ASSET_WIN_AMD64 => Ok(SHA_WIN_AMD64),
         TS_ASSET_WIN_ARM64 => Ok(SHA_WIN_ARM64),
         TS_ASSET_WIN_X86 => Ok(SHA_WIN_X86),
-        other => Err(format!("未知安装包资产: {other}")),
+        other => Err(format!("TSWIZ_ASSET_UNKNOWN: 未知安装包资产: {other}")),
     }
 }
 
@@ -374,7 +374,7 @@ pub(super) fn run_installer(pkg: &std::path::Path) -> Result<(), String> {
                 .arg("-target")
                 .arg("/")
                 .output()
-                .map_err(|e| format!("调用 installer 失败: {e}"))?;
+                .map_err(|e| format!("TSWIZ_INSTALLER_FAIL: 调用 installer 失败: {e}"))?;
             if !out.status.success() {
                 return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
             }
@@ -390,13 +390,16 @@ pub(super) fn run_installer(pkg: &std::path::Path) -> Result<(), String> {
                 .arg("/i")
                 .arg(pkg)
                 .output()
-                .map_err(|e| format!("调用 msiexec 失败: {e}"))?;
+                .map_err(|e| format!("TSWIZ_MSIEXEC_FAIL: 调用 msiexec 失败: {e}"))?;
             if !out.status.success() {
-                return Err(format!("msiexec 退出码 {:?}", out.status.code()));
+                return Err(format!(
+                    "TSWIZ_MSIEXEC_EXIT: msiexec 退出码 {:?}",
+                    out.status.code()
+                ));
             }
             Ok(())
         }
-        Platform::Other => Err("当前平台暂不支持一键配置".into()),
+        Platform::Other => Err("TSWIZ_PLATFORM_UNSUPPORTED: 当前平台暂不支持一键配置".into()),
     }
 }
 
@@ -414,10 +417,10 @@ pub(super) fn install_step_with(
     // B-M6②：平台门在 sha 门之前——Other 平台没有资产（资产名是空串），旧顺序会先落到
     // 「sha256 校验失败」的误导文案；如实说「当前平台不支持一键配置」
     if ts_asset_name(p).is_empty() {
-        return Err("当前平台暂不支持一键配置".into());
+        return Err("TSWIZ_PLATFORM_UNSUPPORTED: 当前平台暂不支持一键配置".into());
     }
     if !path.exists() {
-        return Err("安装包未就位——请先执行「下载安装包」一步".into());
+        return Err("TSWIZ_INSTALLER_NOT_READY: 安装包未就位——请先执行「下载安装包」一步".into());
     }
     if !installer_file_ok(p, path) {
         return Err(
@@ -785,7 +788,7 @@ pub(super) fn spawn_login_attempt() -> Result<(), String> {
     let mut cmd = login_command(&bin);
     let child = cmd
         .spawn()
-        .map_err(|e| format!("启动 `tailscale login` 失败: {e}"))?;
+        .map_err(|e| format!("TSWIZ_LOGIN_FAIL: 启动 `tailscale login` 失败: {e}"))?;
     adopt_login_child_locked(&mut slot, child);
     Ok(())
 }
@@ -967,7 +970,10 @@ pub(super) fn probe_steps_from(port: u16, installed: bool, r: &CliReadings) -> V
                 }
                 "shields_up" => match shields {
                     Some(false) => StepState::done(ws.id),
-                    None => StepState::blocked(ws.id, "读不到 Tailscale 偏好（shields-up）".into()),
+                    None => StepState::blocked(
+                        ws.id,
+                        "TSWIZ_PREFS_UNREADABLE: 读不到 Tailscale 偏好（shields-up）".into(),
+                    ),
                     Some(true) => StepState::pending(ws.id),
                 },
                 // **W-A**：后端仍在初始化时 `funnel status --json` 会短暂为 `{}`——
@@ -992,7 +998,10 @@ pub(super) fn probe_steps_from(port: u16, installed: bool, r: &CliReadings) -> V
                     )
                 }
                 "funnel" => match &funnel_json {
-                    Err(e) => StepState::blocked(ws.id, format!("读不到 Funnel 状态: {e}")),
+                    Err(e) => StepState::blocked(
+                        ws.id,
+                        format!("TSWIZ_FUNNEL_STATUS_FAIL: 读不到 Funnel 状态: {e}"),
+                    ),
                     Ok(j) if !funnel_active(j) => StepState::pending(ws.id),
                     Ok(j) if foreign_serve_config(j, port) => StepState::blocked(
                         ws.id,
@@ -1016,7 +1025,9 @@ pub(super) fn probe_steps_from(port: u16, installed: bool, r: &CliReadings) -> V
                     }
                 }
                 "autostart" => StepState::done(ws.id),
-                other => StepState::blocked(other, format!("未知步骤: {other}")),
+                other => {
+                    StepState::blocked(other, format!("TSWIZ_STEP_UNKNOWN: 未知步骤: {other}"))
+                }
             };
             st
         })
@@ -1226,7 +1237,7 @@ pub(crate) fn run_step(step: &str, port: u16) -> Result<serde_json::Value, Strin
         "download" => {
             let p = current_platform();
             if p == Platform::Other {
-                return Err("当前平台暂不支持一键配置".into());
+                return Err("TSWIZ_PLATFORM_UNSUPPORTED: 当前平台暂不支持一键配置".into());
             }
             if find_cli().is_some() {
                 return Ok(serde_json::json!({ "ok": true, "skipped": "已安装，无需下载" }));
@@ -1243,7 +1254,7 @@ pub(crate) fn run_step(step: &str, port: u16) -> Result<serde_json::Value, Strin
             // 半截/被篡改的包在这里拦下，绝不带病进安装步。**流式**读回（B-M6）——
             // 不把数十 MB 整包读进内存
             let expected = ts_expected_sha256(ts_asset_name(p))
-                .map_err(|e| format!("安装包无校验值，拒绝使用: {e}"))?;
+                .map_err(|e| format!("TSWIZ_CHECKSUM_MISSING: 安装包无校验值，拒绝使用: {e}"))?;
             crate::remote::tunnel::verify_sha256_file(&dest, expected)?;
             Ok(serde_json::json!({
                 "ok": true,
@@ -1378,7 +1389,7 @@ pub(crate) fn run_step(step: &str, port: u16) -> Result<serde_json::Value, Strin
             let st = run_cli(&["status", "--json"])
                 .and_then(|j| parse_status(&j))
                 .map_err(|e| {
-                    format!("读不到 Tailscale 状态，拒绝预览撤销（无法确认会清掉什么）: {e}")
+                    format!("TSWIZ_PREVIEW_RESET_UNREADABLE: 读不到 Tailscale 状态，拒绝预览撤销（无法确认会清掉什么）: {e}")
                 })?;
             if backend_initializing(&st.backend_state) {
                 // **本 `note` 的消费方（2026-10-07 核实）**：前端**不读**本字段——撤销

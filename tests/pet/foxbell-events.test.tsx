@@ -28,7 +28,7 @@ const manifest = [
   { index: 0, group: "done", name: "搞定咯", file: "done/x.m4a" },
   { index: 1, group: "approval", name: "快批快批", file: "approval/y.m4a" },
 ];
-const fetchMock = vi.fn(async () => ({ json: async () => manifest }));
+const fetchMock = vi.fn(async () => ({ ok: true, json: async () => manifest }));
 vi.stubGlobal("fetch", fetchMock);
 
 let data: unknown = undefined;

@@ -163,12 +163,26 @@ pub async fn hook_signal_health() -> Vec<crate::monitor::hooks::ToolSignalHealth
             .iter()
             .map(|(id, label)| (id.as_str(), label.as_str()))
             .collect();
-        crate::monitor::hooks::compute_tool_signal_health(
+        let mut health = crate::monitor::hooks::compute_tool_signal_health(
             &tools_ref,
             &registered_of,
             &crate::monitor::hooks::read_hook_events(),
             &response.sessions,
-        )
+        );
+        // 1A 未注册原因在命令层后处理（而非塞进 compute 纯函数），两个理由：
+        // ① compute_tool_signal_health 的签名/注入口径不动，既有 signal_health_tests
+        // 零改动（测试面最小）；② reason 的输入 helper 探测依赖 current_exe/home，
+        // 属环境敏感信息，不宜混进 tempdir/内存可测的纯函数——探测单独跑一次，
+        // 结论经 unregistered_reason_for 纯函数（hooks.rs 侧可测）落到行上
+        let helper_present = crate::monitor::hooks::probe_hook_listener_helper();
+        for h in &mut health {
+            h.unregistered_reason = crate::monitor::hooks::unregistered_reason_for(
+                &h.tool_id,
+                h.registered,
+                helper_present,
+            );
+        }
+        health
     })
     .await
     .unwrap_or_else(|e| {

@@ -36,7 +36,7 @@ describe("PetStartupGuard（EP2 启动弹窗）", () => {
     tauriInvokeMock.mockClear();
   });
 
-  it("foxbell 激活时不弹窗", async () => {
+  it("旧版无前缀 foxbell 指针（读取归一为内置）不弹窗", async () => {
     localStorage.setItem("mam-pet-active", "foxbell");
     const { container } = render(<PetStartupGuard />);
     await waitFor(() => expect(tauriInvokeMock).not.toHaveBeenCalled());
@@ -75,7 +75,7 @@ describe("PetStartupGuard（EP2 启动弹窗）", () => {
     await screen.findByTestId("pet-startup-dialog");
     expect(screen.queryByTestId("pet-startup-update")).toBeNull();
     fireEvent.click(screen.getByTestId("pet-startup-foxbell"));
-    await waitFor(() => expect(localStorage.getItem("mam-pet-active")).toBe("foxbell"));
+    await waitFor(() => expect(localStorage.getItem("mam-pet-active")).toBe("builtin-tuvis-3d"));
   });
 
   it("pet_scan reject（结构化 RpcError）→ 致命弹窗走 pet.rpc 映射文案（第六轮）", async () => {

@@ -165,7 +165,10 @@ pub fn create_pet_window(app: &AppHandle) -> Result<(), String> {
         clear_pet_window(app);
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
-    Err(format!("桌宠窗口创建失败（已重试 5 次）: {}", last_err))
+    Err(format!(
+        "PET_WINDOW_RETRY_FAIL: 桌宠窗口创建失败（已重试 5 次）: {}",
+        last_err
+    ))
 }
 
 fn build_pet_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
@@ -236,7 +239,7 @@ fn build_pet_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
             });
         })
         .build()
-        .map_err(|e| format!("创建桌宠窗口失败: {}", e))?;
+        .map_err(|e| format!("PET_WINDOW_FAIL: 创建桌宠窗口失败: {}", e))?;
     // dev 模式下 WebView2 可能给 webview 自动附加 DevTools 独立窗口，显式关闭
     #[cfg(debug_assertions)]
     w.close_devtools();
@@ -440,7 +443,7 @@ mod tests {
 
     /// P0-1 参数化恶意 id 样本：穿越（两种分隔符）、绝对路径（POSIX/Windows）、
     /// 空串、点、点前缀、保留名及其大小写变体
-    const BAD_IDS: [&str; 9] = [
+    const BAD_IDS: [&str; 13] = [
         "",
         ".",
         "..",
@@ -450,6 +453,10 @@ mod tests {
         r"C:\Windows",
         ".hidden",
         "foxbell",
+        "builtin-foxbell",
+        "Builtin-FoxBell",
+        "builtin-tuvis-3d",
+        "Builtin-Tuvis-3D",
     ];
 
     fn dummy_manifest(id: &str) -> manifest::PetManifest {

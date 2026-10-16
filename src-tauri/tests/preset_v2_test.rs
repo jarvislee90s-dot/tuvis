@@ -57,6 +57,46 @@ use std::sync::{Mutex, OnceLock};
 /// 区分；基底快照与工具 skill 目录同为共享态），并行跑会互相踩踏 —— 用互斥锁强制串行
 static PRESET_V2_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// 按类型分派删除「链接或残留项」（③④ Windows 红灯修复）：
+/// - **目录型链接**（Windows junction / symlink_dir）必须 `remove_dir`——只删链接
+///   本身不删目标，Windows/Linux 语义一致；对目录链接调 `std::fs::remove_file`
+///   在 Windows 返回 os error 5（PermissionDenied）；
+/// - Unix 符号链接（不论指向目录还是文件）一律 `remove_file`；
+/// - 残留真目录（上次红跑中断遗留）`remove_dir_all` 整删，现场可重排。
+///
+/// 幂等：目标不在场时直接返回。
+///
+/// Windows 判定细节：junction 的 `symlink_metadata().file_type().is_dir()` 被
+/// `is_symlink` 短路恒 false，**目录型**必须看跟随后的 `metadata().is_dir()`；
+/// 删除 API 本身（remove_dir）只作用于链接路径，不会跟随删目标。
+fn remove_link_or_leftover(p: &std::path::Path) {
+    let Ok(md) = std::fs::symlink_metadata(p) else {
+        return; // 不在场即幂等通过
+    };
+    #[cfg(windows)]
+    {
+        if md.file_type().is_symlink() {
+            if std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false) {
+                std::fs::remove_dir(p).unwrap();
+            } else {
+                std::fs::remove_file(p).unwrap();
+            }
+        } else if md.is_dir() {
+            std::fs::remove_dir_all(p).unwrap();
+        } else {
+            std::fs::remove_file(p).unwrap();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if md.file_type().is_symlink() || md.is_file() {
+            std::fs::remove_file(p).unwrap();
+        } else {
+            std::fs::remove_dir_all(p).unwrap();
+        }
+    }
+}
+
 /// 暂存往返：真目录移入 ~/.tuvis/stash/<tool>/skills 再移回；账本同步
 #[test]
 fn stash_and_restore_roundtrip() {
@@ -673,14 +713,29 @@ fn mcp_import_and_backfill_register_rows() {
     use multi_agents_manager_lib::database;
     use multi_agents_manager_lib::services::resource::backfill_registry;
 
-    // 手工放一个 MCP 配置文件（历史上 toggle_mcp 只写 assignment 不写表）
     let repo = dirs::home_dir().unwrap().join(".tuvis/mcp");
-    std::fs::create_dir_all(&repo).unwrap();
-    std::fs::write(repo.join("v2m1-backfill-mcp.json"), r#"{"command":"x"}"#).unwrap();
-    // 手工放一个无行的 skill 目录（历史残留/手工放置）
     let skill = dirs::home_dir()
         .unwrap()
         .join(".tuvis/skills/v2m1-backfill-skill");
+
+    // 场地自复位（⑧ flake 根因）：Windows 下 HOME 重定向对 dirs::home_dir()
+    // 无效（dirs-sys 0.5 走 SHGetKnownFolderPath，不读环境变量）⇒ 本用例的
+    // SSOT 文件落在**真实 home** 且原先从不清理，跨运行残留。而互斥锁只串行
+    // 化执行、不串行化**顺序**（多线程同时阻塞在锁上，唤醒顺序不定）：整包
+    // 并行跑时，别的 backfill 用例若先拿锁，会把残留文件登记进共享库，击穿
+    // 下方「前置：表里无行」断言（单跑无别的用例 ⇒ 恒过）。故先清残留（文件
+    // + 目录 + 库行，全部幂等），使断言与执行顺序无关。
+    let _ = std::fs::remove_file(repo.join("v2m1-backfill-mcp.json"));
+    let _ = std::fs::remove_file(repo.join("v2m1-direct-mcp.json"));
+    let _ = std::fs::remove_dir_all(&skill);
+    let _ = database::delete_extension("mcp-v2m1-backfill-mcp");
+    let _ = database::delete_extension("skill-v2m1-backfill-skill");
+    let _ = database::delete_extension("mcp-v2m1-direct-mcp");
+
+    // 手工放一个 MCP 配置文件（历史上 toggle_mcp 只写 assignment 不写表）
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("v2m1-backfill-mcp.json"), r#"{"command":"x"}"#).unwrap();
+    // 手工放一个无行的 skill 目录（历史残留/手工放置）
     std::fs::create_dir_all(&skill).unwrap();
     std::fs::write(skill.join("SKILL.md"), "x").unwrap();
 
@@ -724,6 +779,14 @@ fn mcp_import_and_backfill_register_rows() {
             .any(|e| e.id == "mcp-v2m1-direct-mcp"),
         "save_mcp_config 应写 extensions 行"
     );
+
+    // 清场（真实 home 路径 + 库行，不留下一轮的「表里已有行」陷阱）
+    let _ = std::fs::remove_file(repo.join("v2m1-backfill-mcp.json"));
+    let _ = std::fs::remove_file(repo.join("v2m1-direct-mcp.json"));
+    let _ = std::fs::remove_dir_all(&skill);
+    let _ = database::delete_extension("mcp-v2m1-backfill-mcp");
+    let _ = database::delete_extension("skill-v2m1-backfill-skill");
+    let _ = database::delete_extension("mcp-v2m1-direct-mcp");
 }
 
 /// P2① 嵌套套件口径（M2）：回填与资源视图同用递归扫描——嵌套套件技能
@@ -766,9 +829,11 @@ fn backfill_registry_covers_nested_suite_skills() {
     assert_eq!(nested.name, "v2m2-suite-x/inner", "name = 相对路径");
     assert_eq!(nested.kind, "skill");
     assert!(!nested.is_native);
-    assert!(nested
-        .source_path
-        .ends_with(".tuvis/skills/v2m2-suite-x/inner"));
+    // source_path 断言用 Path 的**组件级** ends_with：backfill 登记的 source_path
+    // 是原生分隔符（Windows 反斜杠），字符串后缀 ".tuvis/skills/..." 在 Windows
+    // 恒不匹配；Path::ends_with 按组件比较，跨分隔符成立
+    assert!(std::path::Path::new(&nested.source_path)
+        .ends_with(std::path::Path::new(".tuvis/skills/v2m2-suite-x/inner")));
 
     // 套件目录本身（无 SKILL.md）不得被误登记为名为 v2m2-suite-x 的技能
     assert!(
@@ -915,14 +980,28 @@ fn recover_orphans_reclaims_unledgered_stash_dirs() {
     use multi_agents_manager_lib::database;
     use multi_agents_manager_lib::services::preset::stash;
 
-    // 无账孤儿 A（原位空闲）与无账孤儿 B（原位被占）
+    // 场地自复位（⑥ Windows 红灯根因）：support::setup 的 HOME 重定向对
+    // dirs::home_dir() 在 Windows 无效（dirs-sys 0.5 走 SHGetKnownFolderPath，
+    // 不读任何环境变量）⇒ stash_dir 与 recover_orphans 的回移目标
+    // （primary_skill_dir → 真实 ~/.codex/skills）都落在**真实 home**。本用例
+    // 成功路径会把 ghost-a 移回 ~/.codex/skills 且从不清理——上一轮遗留即占了
+    // 本轮的回移目标，孤儿被判「原位被占」留在暂存区，击穿「暂存区应清空」。
+    // 故开跑前清掉两侧四个历史路径 + 销掉可能残留的 codex 快照（会话守卫会
+    // 跳过整段无账对账），保证「原位空闲」前置成立且与执行顺序无关。
+    let codex_dir = dirs::home_dir().unwrap().join(".codex/skills");
     let ghost_a = stash::stash_dir("codex").join("v2m1-ghost-a");
+    let ghost_b = stash::stash_dir("codex").join("v2m1-ghost-b");
+    let _ = std::fs::remove_dir_all(&ghost_a);
+    let _ = std::fs::remove_dir_all(&ghost_b);
+    let _ = std::fs::remove_dir_all(codex_dir.join("v2m1-ghost-a"));
+    let _ = std::fs::remove_dir_all(codex_dir.join("v2m1-ghost-b"));
+    let _ = database::destroy_base_snapshot("codex");
+
+    // 无账孤儿 A（原位空闲）与无账孤儿 B（原位被占）
     std::fs::create_dir_all(&ghost_a).unwrap();
     std::fs::write(ghost_a.join("SKILL.md"), "g").unwrap();
-    let ghost_b = stash::stash_dir("codex").join("v2m1-ghost-b");
     std::fs::create_dir_all(&ghost_b).unwrap();
     std::fs::write(ghost_b.join("SKILL.md"), "g").unwrap();
-    let codex_dir = dirs::home_dir().unwrap().join(".codex/skills");
     std::fs::create_dir_all(codex_dir.join("v2m1-ghost-b")).unwrap();
     std::fs::write(codex_dir.join("v2m1-ghost-b/SKILL.md"), "intruder").unwrap();
 
@@ -947,6 +1026,11 @@ fn recover_orphans_reclaims_unledgered_stash_dirs() {
         "intruder",
         "原位内容不得被覆盖"
     );
+
+    // 清场（真实 home 路径，不给下一轮留占用）：A 的回移落点 + B 的两侧
+    let _ = std::fs::remove_dir_all(codex_dir.join("v2m1-ghost-a"));
+    let _ = std::fs::remove_dir_all(&ghost_b);
+    let _ = std::fs::remove_dir_all(codex_dir.join("v2m1-ghost-b"));
 }
 
 /// Patch 2（评审裁决 2）：取消勾选时前置恢复失败（Err）→ 不清理、不落 disabled，
@@ -1176,7 +1260,7 @@ fn scan_tool_state_dedups_drifted_ledger_entry_to_native() {
     let drift = dirs::home_dir()
         .unwrap()
         .join(".claude/skills/v2m1-drift-x");
-    std::fs::remove_file(&drift).unwrap();
+    remove_link_or_leftover(&drift);
     std::fs::create_dir_all(&drift).unwrap();
     std::fs::write(drift.join("SKILL.md"), "real").unwrap();
 
@@ -1283,7 +1367,7 @@ fn restore_roundtrip_preserves_drifted_real_dir() {
     .unwrap();
     enable_skill_for_tool("v2m1-dl-x", "claude").unwrap();
     let drift_dir = dirs::home_dir().unwrap().join(".claude/skills/v2m1-dl-x");
-    std::fs::remove_file(&drift_dir).unwrap();
+    remove_link_or_leftover(&drift_dir);
     std::fs::create_dir_all(&drift_dir).unwrap();
     std::fs::write(drift_dir.join("SKILL.md"), "用户的真实内容").unwrap();
 
@@ -2252,12 +2336,22 @@ fn reveal_dir_whitelist_validation_v2m2() {
     let ok = ensure_reveal_allowed(&allowed);
     assert!(ok.is_ok(), "白名单内路径应放行: {:?}", ok.err());
 
-    // 越界（/tmp 下，存在）→ 拒绝并点名范围
-    let err = ensure_reveal_allowed("/tmp").unwrap_err();
+    // 越界且存在 → 拒绝并点名范围。用 temp 目录做平台无关的越界样本：白名单 =
+    // ~/.tuvis、~/.agents 与导出目录（系统下载目录），temp 不落在任何一个之下
+    // （Windows 上 temp 虽在用户 profile 内，但在 home\.tuvis / home\.agents /
+    // Downloads 之外）；原先硬编码 Unix 路径 /tmp，Windows 上 canonicalize 直接
+    // 报「路径不存在」走不进越界分支
+    let out_of_bounds = std::env::temp_dir().to_string_lossy().to_string();
+    let err = ensure_reveal_allowed(&out_of_bounds).unwrap_err();
     assert!(err.contains("范围"), "越界应报范围错误: {}", err);
 
     // 越界且不存在 → 同样拒绝（不静默放行）
-    let err = ensure_reveal_allowed("/tmp/v2m2-reveal-out").unwrap_err();
+    let err = ensure_reveal_allowed(
+        &std::env::temp_dir()
+            .join("tuvis-nonexistent-dir-for-reveal-test")
+            .to_string_lossy(),
+    )
+    .unwrap_err();
     assert!(!err.is_empty(), "不存在的越界路径必须拒绝");
 
     // 白名单内但不存在 → 拒绝（路径不存在）
@@ -2513,4 +2607,93 @@ fn restore_exempts_post_snapshot_resident_v2m2() {
     let _ = database::delete_extension("skill-v2m2-rx-x");
     let _ = std::fs::remove_dir_all(home.join(".tuvis/skills/v2m2-rx-a"));
     let _ = std::fs::remove_dir_all(home.join(".tuvis/skills/v2m2-rx-x"));
+}
+
+/// #64-3 悬空键防御（2026-10-14）：universal 预设含 is_native=1 行 → 命令层直接
+/// 拒绝（create 与 update 两口都拦）；工具私有预设含原生项合法（原生项只属于
+/// 工具预设）；未登记 id 不拦（前瞻引用既有行为）。
+/// 还原动作（变异）：删掉 reject_native_items_in_universal 调用 → 前两段断言红。
+#[test]
+fn preset_commands_reject_native_items_in_universal() {
+    let _guard = PRESET_V2_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    support::setup();
+    use multi_agents_manager_lib::commands::preset as preset_cmd;
+    use multi_agents_manager_lib::database;
+
+    // 播种：一个原生 skill（is_native=1 + source_tool）+ 一个普通 skill
+    for (id, native) in [("skill-v2m3-native-x", true), ("skill-v2m3-plain-x", false)] {
+        database::insert_extension(&database::ExtensionRecord {
+            id: id.into(),
+            kind: "skill".into(),
+            name: id.trim_start_matches("skill-").into(),
+            description: None,
+            source_path: format!("/tmp/{id}"),
+            source_url: None,
+            version: None,
+            tags: None,
+            suite: None,
+            source_tool: (id.ends_with("native-x")).then(|| "claude".to_string()),
+            is_native: native,
+        })
+        .unwrap();
+    }
+
+    // ① create：universal + 原生项 → Err（结构化码可检索）
+    let err = preset_cmd::create_preset(
+        "v2m3-def-native".into(),
+        vec![("skill-v2m3-native-x".into(), "skill".into())],
+        None,
+        Some("universal".into()),
+        None,
+    )
+    .expect_err("universal 预设含原生项必须被命令层拒绝");
+    assert!(
+        err.contains("PRESET_NATIVE_IN_UNIVERSAL:skill-v2m3-native-x"),
+        "错误应携带结构化码与违规项 id：{err}"
+    );
+
+    // ② create：universal + 普通项（含未登记 id）→ Ok（前瞻引用不拦）
+    let ok_pid = preset_cmd::create_preset(
+        "v2m3-def-ok".into(),
+        vec![
+            ("skill-v2m3-plain-x".into(), "skill".into()),
+            ("skill-v2m3-unregistered".into(), "skill".into()),
+        ],
+        None,
+        Some("universal".into()),
+        None,
+    )
+    .expect("universal + 普通项/未登记项不得误拦");
+
+    // ③ create：工具私有 + 原生项 → Ok（原生项只属于工具预设）
+    let tool_pid = preset_cmd::create_preset(
+        "v2m3-def-tool".into(),
+        vec![("skill-v2m3-native-x".into(), "skill".into())],
+        None,
+        Some("tool".into()),
+        Some("claude".into()),
+    )
+    .expect("工具私有预设含原生项是合法的");
+
+    // ④ update：把已存在的通用预设改成含原生项 → 同样拒绝
+    let err = preset_cmd::update_preset(
+        ok_pid.clone(),
+        "v2m3-def-ok".into(),
+        String::new(),
+        "universal".into(),
+        None,
+        vec![("skill-v2m3-native-x".into(), "skill".into())],
+    )
+    .expect_err("update 口同样必须拒绝原生项入通用预设");
+    assert!(err.contains("PRESET_NATIVE_IN_UNIVERSAL"));
+
+    // 清场
+    for pid in [ok_pid, tool_pid] {
+        let _ = database::delete_preset(&pid);
+    }
+    let _ = database::delete_extension("skill-v2m3-native-x");
+    let _ = database::delete_extension("skill-v2m3-plain-x");
 }

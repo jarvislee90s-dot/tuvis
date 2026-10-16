@@ -716,7 +716,10 @@ fn open_macos_with(
             Err(e) => errs.push(format!("{name}: {e}")),
         }
     }
-    Err(format!("全部 resume 通道失败：{}", errs.join("；")))
+    Err(format!(
+        "RESUME_ALL_CHANNELS_FAIL: 全部 resume 通道失败：{}",
+        errs.join("；")
+    ))
 }
 
 /// 生产 spawner（RemoteState 生产装配 / Tauri 命令共用），按变体 cfg 分派：
@@ -814,10 +817,12 @@ pub fn spawn_terminal(spec: &SpawnSpec) -> Result<(), String> {
                 crate::window::detached::ConsoleMode::OwnConsole,
             )
             .map(|_| ())
-            .map_err(|e| format!("终端启动失败（{program}）：{e}"))
+            .map_err(|e| format!("RESUME_SPAWN_FAIL: 终端启动失败（{program}）：{e}"))
         }
         #[cfg(not(windows))]
-        SpawnSpec::Windows { program, .. } => Err(format!("当前平台不支持终端 spawn（{program}）")),
+        SpawnSpec::Windows { program, .. } => Err(format!(
+            "RESUME_SPAWN_UNSUPPORTED: 当前平台不支持终端 spawn（{program}）"
+        )),
         #[cfg(target_os = "macos")]
         SpawnSpec::MacosApplescript { script } => run_osascript_wait(script),
         #[cfg(not(target_os = "macos"))]
@@ -851,7 +856,7 @@ pub fn open_session_terminal_with(session: &Session, spawner: &SpawnFn) -> Resul
         // 效果回查（死窗→转次选；双败 failed 回执+审计）。open_macos_with 跨平台
         // 可测（回查缝注入假体）；实机验证归 Mac 回传清单
         "macos" => open_macos_with(cwd, &resume, spawner, &macos_effect_probe),
-        _ => Err("当前平台不支持一键恢复会话".to_string()),
+        _ => Err("RESUME_UNSUPPORTED: 当前平台不支持一键恢复会话".to_string()),
     }
 }
 

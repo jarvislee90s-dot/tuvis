@@ -26,12 +26,15 @@ pnpm tauri:dev
 > 流程、`Tauri version parity` 门禁的含义、以及各类红灯的处置表。
 
 1. Fork 并创建分支: `git checkout -b feat/your-feature`
-2. 确保测试通过: `cargo test && pnpm test`
+2. 确保测试通过: `bash scripts/ci-backend-local.sh && pnpm test`
 3. 提交 PR，填写 PR 模板
 
 ## 本地测试
 ```bash
 pnpm check          # format + lint + build
 pnpm test           # vitest
-cd src-tauri && cargo check && cargo test && cargo clippy -- -D warnings
+bash scripts/ci-backend-local.sh   # 后端门禁：与 CI backend job 同口径（含 --features
+                                   # marker-helper 与 Windows 交叉编译覆盖，见 #127/#128
+                                   # ——本机 `cargo check && cargo test && cargo clippy`
+                                   # 不带 feature，全绿推不出 CI 会绿）
 ```

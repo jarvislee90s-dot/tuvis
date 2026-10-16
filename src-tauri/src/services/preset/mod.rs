@@ -47,7 +47,7 @@ fn toggle_ext(ext_id: &str, kind: &str, tool_id: &str, on: bool) -> Result<(), S
                 .unwrap_or_else(|| "file".to_string());
             crate::services::plugin::toggle_plugin(name, tool_id, on, &plugin_kind)
         }
-        _ => Err(format!("未知类型: {}", kind)),
+        _ => Err(format!("PRESET_KIND_UNKNOWN: 未知类型: {}", kind)),
     }
 }
 
@@ -78,9 +78,10 @@ pub fn apply_preset(preset_id: &str, tool_id: &str) -> Result<ApplyResult, Strin
                 .find(|e| &e.id == ext_id)
                 .map(|e| e.name.clone())
                 .unwrap_or_else(|| ext_id.clone());
-            result
-                .conflicts
-                .push(format!("{}（{}）：专属绑定不兼容 {}", name, kind, tool_id));
+            result.conflicts.push(format!(
+                "PRESET_EXCLUSIVE_CONFLICT: {}（{}）：专属绑定不兼容 {}",
+                name, kind, tool_id
+            ));
         }
     }
 
@@ -191,8 +192,10 @@ pub fn preview_apply(preset_id: &str, tool_id: &str) -> Result<ApplyPreview, Str
         if database::tool_allowed(&ext_id, tool_id) {
             apply_items.push((ext_id, kind));
         } else {
-            out.filtered
-                .push(format!("{}: 专属绑定不兼容 {}", ext_id, tool_id));
+            out.filtered.push(format!(
+                "PRESET_EXCLUSIVE_CONFLICT: {}: 专属绑定不兼容 {}",
+                ext_id, tool_id
+            ));
         }
     }
     let plan = sweep::plan_sweep(tool_id, &apply_items);
@@ -262,7 +265,9 @@ pub fn restore_tool(tool_id: &str) -> Result<RestoreResult, String> {
         if !current.iter().any(|(cid, _)| cid == id) {
             match enable_one(id, kind) {
                 Ok(()) => out.restored_mam.push(id.clone()),
-                Err(e) => out.conflicts.push(format!("{}: 重建失败 {}", id, e)),
+                Err(e) => out
+                    .conflicts
+                    .push(format!("PRESET_REBUILD_FAIL: {}: 重建失败 {}", id, e)),
             }
         }
     }
@@ -292,7 +297,8 @@ pub fn restore_tool(tool_id: &str) -> Result<RestoreResult, String> {
             continue;
         }
         if let Err(e) = disable_one(id, kind) {
-            out.conflicts.push(format!("{}: 停用失败 {}", id, e));
+            out.conflicts
+                .push(format!("PRESET_DISABLE_FAIL: {}: 停用失败 {}", id, e));
         }
     }
 
@@ -331,7 +337,10 @@ pub fn restore_tool(tool_id: &str) -> Result<RestoreResult, String> {
 pub fn deactivate_preset(preset_id: &str, tool_id: &str) -> Result<(), String> {
     match database::get_base_snapshot(tool_id) {
         Some((Some(active), _)) if active != preset_id => {
-            return Err(format!("工具 {} 当前激活的是其他预设", tool_id));
+            return Err(format!(
+                "PRESET_OTHER_ACTIVE: 工具 {} 当前激活的是其他预设",
+                tool_id
+            ));
         }
         _ => {}
     }
@@ -348,14 +357,20 @@ pub fn apply_preset_to_subagent(preset_id: &str, tool_id: &str, sub_agent_id: &s
     for (ext_id, kind) in &items {
         // 子 Agent 级只支持 skill（MCP 和 Plugin 是工具级配置）
         if kind != "skill" {
-            conflicts.push(format!("{} 类型 {} 不支持子 Agent 级分配", ext_id, kind));
+            conflicts.push(format!(
+                "PRESET_SUBAGENT_UNSUPPORTED: {} 类型 {} 不支持子 Agent 级分配",
+                ext_id, kind
+            ));
             continue;
         }
 
         // 检查是否在工具级范围内
         let name = ext_id.strip_prefix("skill-").unwrap_or(ext_id);
         if !crate::services::is_skill_in_tool_range(name, tool_id) {
-            failures.push(format!("{}: 该 skill 未在工具级启用", ext_id));
+            failures.push(format!(
+                "PRESET_SKILL_NOT_ENABLED: {}: 该 skill 未在工具级启用",
+                ext_id
+            ));
             continue;
         }
 
@@ -490,7 +505,9 @@ pub fn check_snapshot_invariants() -> Vec<String> {
     for tool in crate::adapter::TOOL_IDS {
         // clippy::single_match：等价 match 改写为 if let（Some((Some(_),_)) | None 臂为空）
         if let Some((None, _)) = database::get_base_snapshot(tool) {
-            broken.push(format!("{}：快照存在但无激活预设", tool));
+            broken.push(format!(
+                "PRESET_SNAPSHOT_ORPHAN:{tool}: {tool}：快照存在但无激活预设"
+            ));
         }
     }
     broken

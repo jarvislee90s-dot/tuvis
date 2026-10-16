@@ -36,6 +36,7 @@ import { UsageTrendCard } from "@/components/usage/UsageTrendCard";
 import { UsageWorkSummary } from "@/components/usage/UsageWorkSummary";
 import { usageErrMsg } from "@/components/usage/usageErrors";
 import { fmtTokens } from "@/lib/usage/format";
+import { getLang } from "@/lib/usage/lang";
 import {
   useUsageCollect,
   useUsageDashboardQuery,
@@ -59,6 +60,8 @@ type UsageTab = "board" | "records";
 
 export default function UsageDashboardPage() {
   const { t } = useTranslation();
+  // 格式化语言（issue #160）：趋势卡峰值的数值单位（万/亿 vs K/M/B）随界面语言走。
+  const lang = getLang();
   const [preset, setPreset] = useState<UsageRangePreset>(DEFAULT_PRESET);
   const [custom, setCustom] = useState(() => defaultCustomRange(new Date()));
   const [clamped, setClamped] = useState(false);
@@ -149,7 +152,7 @@ export default function UsageDashboardPage() {
           // 页面**不再**用 `peakLabel = —` 去打补丁（整卡不渲染，「峰值 —」这个怪值就不该存在）。
           unmeasured={unmeasured}
           peakLabel={t("usage.card.peak", {
-            v: fmtTokens(Math.max(0, ...points.map((p) => p.value))),
+            v: fmtTokens(Math.max(0, ...points.map((p) => p.value)), lang),
           })}
           compareLabel={trendCompareLabel}
           title={t("usage.card.trend")}

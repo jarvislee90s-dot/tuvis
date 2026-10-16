@@ -418,7 +418,7 @@ pub(super) fn cli_error(args: &[&str], stderr: &str, code: Option<i32>) -> Strin
         return s.to_string();
     }
     format!(
-        "Tailscale CLI 失败（tailscale {}），退出码 {}，且无 stderr 输出",
+        "TS_CLI_FAIL_NO_STDERR: Tailscale CLI 失败（tailscale {}），退出码 {}，且无 stderr 输出",
         args.join(" "),
         code.map(|c| c.to_string()).unwrap_or_else(|| "未知".into())
     )
@@ -474,6 +474,15 @@ pub(super) fn wait_child_bounded(
     let out = child.stdout.take().map(drain_pipe);
     let err = child.stderr.take().map(drain_pipe);
     // 正常退出：直接子进程已结束、自己的输出必然写完 ⇒ 无条件收，**不截断**大输出
+    //
+    // 【上条论断的失效条件（issue #126 登记，2026-10-14）——任一成立，本分支重回无界等待】
+    //  1. `run_cli_with_timeout` 的 spawn 形态从「直接可执行文件」改为经 shell
+    //     （`sh -c` / `cmd /c`）或改调可能 fork 的包装命令（脚本 / `sudo` / 代理进程）——
+    //     孙进程继承管道写端时，EOF 只在全部写端持有者退出后才来（同上第 3 条纪律的机制）；
+    //  2. 后果会放大：本路径在轮询线程上（`ensure_poller` 见旧线程未退出就不新起），
+    //     一次悬挂 = 轮询永久失去自愈/重验。
+    //  若将来确需给本分支加界：用「宽限内收满已知字节数即返回，否则继续无界等」的降级，
+    //  **不要**直接套超时分支的 [`collect_bounded`]——500ms 宽限会截断本要解析的大输出。
     let collect = |rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>| {
         rx.map(|rx| rx.recv().unwrap_or_default())
             .unwrap_or_default()
@@ -490,11 +499,11 @@ pub(super) fn wait_child_bounded(
             let _ = collect_bounded(out);
             let _ = collect_bounded(err);
             Err(format!(
-                "调用 Tailscale 超时（{} 秒未返回，已终止该子进程；该命令可能正在等待人工确认）",
+                "TS_CLI_TIMEOUT: 调用 Tailscale 超时（{} 秒未返回，已终止该子进程；该命令可能正在等待人工确认）",
                 dur.as_secs()
             ))
         }
-        Err(e) => Err(format!("等待 Tailscale 进程失败: {e}")),
+        Err(e) => Err(format!("TS_WAIT_FAIL: 等待 Tailscale 进程失败: {e}")),
     }
 }
 
@@ -557,7 +566,7 @@ pub(super) fn run_cli_with_timeout(
     cmd.env("TAILSCALE_BE_CLI", "1");
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("调用 Tailscale 失败: {e}"))?;
+        .map_err(|e| format!("TS_CLI_FAIL: 调用 Tailscale 失败: {e}"))?;
     let (status, stdout, stderr) = wait_child_bounded(&mut child, dur)?;
     if !status.success() {
         return Err(cli_error(args, &stderr, status.code()));
@@ -855,7 +864,7 @@ pub(super) fn map_status(
     };
     let st = match status {
         Ok(s) => s,
-        Err(e) => return failed(format!("读取 Tailscale 状态失败: {e}")),
+        Err(e) => return failed(format!("TS_STATUS_READ_FAIL: 读取 Tailscale 状态失败: {e}")),
     };
     match backend_phase(&st) {
         // W-A（2026-10-07 真机重启实测）：后端仍在初始化 = **开机恢复窗口**，
@@ -877,7 +886,7 @@ pub(super) fn map_status(
     }
     let funnel_json = match funnel {
         Ok(f) => f,
-        Err(e) => return failed(format!("读取 Funnel 状态失败: {e}")),
+        Err(e) => return failed(format!("TS_FUNNEL_READ_FAIL: 读取 Funnel 状态失败: {e}")),
     };
     if !funnel_active(&funnel_json) {
         // 已登录但 Funnel 未开通：引导态而非故障态（error 留空，向导据此引导）
@@ -1144,7 +1153,7 @@ pub(super) fn poller_tick(
                         // 失败必须上墙且留痕（sticky——否则只闪一个轮询窗，用户看到"没反应"）
                         record_deferred_open_failure(
                             port,
-                            format!("开机后自动补开通 Funnel 失败: {e}"),
+                            format!("TS_DEFERRED_OPEN_FAIL: 开机后自动补开通 Funnel 失败: {e}"),
                         );
                         log::warn!("tailscale 延迟补开通失败: {e}");
                     }
@@ -1369,7 +1378,7 @@ pub(super) fn foreign_serve_error(action: &str, others: usize) -> String {
         String::new()
     };
     format!(
-        "检测到非 兔维斯 的 Tailscale serve/Funnel 配置{detail}，为避免覆盖已中止{action}；\
+        "TS_FOREIGN_SERVE: 检测到非 兔维斯 的 Tailscale serve/Funnel 配置{detail}，为避免覆盖已中止{action}；\
          如确认可放弃该配置，请在终端执行 `tailscale funnel reset` 后重试，\
          或在向导中确认后执行强制撤销（向导步 disable_force）"
     )
@@ -1381,7 +1390,7 @@ pub(super) fn foreign_serve_error(action: &str, others: usize) -> String {
 /// 自建配置，与本模块自己的 fail-closed 纪律（`map_status` / 步骤判据表都
 /// 「读不到就报错」）自相矛盾
 pub(super) fn funnel_status_unreadable(action: &str, e: &str) -> String {
-    format!("读不到 Funnel 状态，拒绝{action}（无法确认是否会覆盖他人的 serve 配置）: {e}")
+    format!("TS_FUNNEL_STATUS_UNREADABLE: 读不到 Funnel 状态，拒绝{action}（无法确认是否会覆盖他人的 serve 配置）: {e}")
 }
 
 /// 停止内核（start/stop 对称的唯一实现，stop_channel / stop_all / run_step("disable")

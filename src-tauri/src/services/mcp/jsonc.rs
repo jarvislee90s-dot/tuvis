@@ -206,7 +206,7 @@ fn parse_root(content: &str) -> Result<(Span, Vec<Entry>), String> {
     let mut cur = Cursor::new(content);
     cur.skip_trivia();
     if cur.pos >= cur.b.len() || cur.b[cur.pos] != b'{' {
-        return Err("无法安全编辑该 JSONC 文件：根节点不是对象".to_string());
+        return Err("MCPC_EDIT_ROOT: 无法安全编辑该 JSONC 文件：根节点不是对象".to_string());
     }
     walk_object(&mut cur).ok_or_else(|| "无法安全编辑该 JSONC 文件：对象结构不完整".to_string())
 }
@@ -226,10 +226,17 @@ pub fn upsert_entry(
             let mut cur = Cursor::new(content);
             cur.pos = se.value.start;
             if cur.b[cur.pos] != b'{' {
-                return Err(format!("无法安全编辑：section \"{}\" 不是对象", section));
+                return Err(format!(
+                    "MCPC_EDIT_SECTION_NOT_OBJ: 无法安全编辑：section \"{}\" 不是对象",
+                    section
+                ));
             }
-            let (_, entries) = walk_object(&mut cur)
-                .ok_or_else(|| format!("无法安全编辑：section \"{}\" 结构不完整", section))?;
+            let (_, entries) = walk_object(&mut cur).ok_or_else(|| {
+                format!(
+                    "MCPC_EDIT_SECTION_INCOMPLETE: 无法安全编辑：section \"{}\" 结构不完整",
+                    section
+                )
+            })?;
             if let Some(existing) = entries.iter().find(|e| e.key == key) {
                 // 覆盖：只替换 value span
                 out.push_str(&content[..existing.value.start]);
@@ -272,7 +279,10 @@ pub fn remove_entry(content: &str, section: &str, key: &str) -> Result<String, S
     let mut cur = Cursor::new(content);
     cur.pos = se.value.start;
     let Some((_, entries)) = walk_object(&mut cur) else {
-        return Err(format!("无法安全编辑：section \"{}\" 结构不完整", section));
+        return Err(format!(
+            "MCPC_EDIT_SECTION_INCOMPLETE: 无法安全编辑：section \"{}\" 结构不完整",
+            section
+        ));
     };
     let Some(target) = entries.iter().find(|e| e.key == key) else {
         return Ok(content.to_string());

@@ -1,0 +1,28 @@
+# 网站联动（P20）：主仓发 release、或手册/日志/矩阵文档变更 → 通知 tuvis-website 仓自动重建部署。
+# 前置：本仓 Actions secret `SITE_DISPATCH_PAT` = 一个对 jarvislee90s-dot/tuvis-website 有
+# Actions: Write 权限的 fine-grained PAT。未配置时本 workflow 红叉，但不影响网站仓的每日兜底。
+name: Notify website on release / docs change
+
+on:
+  release:
+    types: [published]
+  push:
+    branches: [main]
+    paths:
+      - "docs/user-manual/**"
+      - "CHANGELOG.md"
+      - "docs/capabilities.json"
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send repository_dispatch to tuvis-website
+        continue-on-error: true # PAT 未配置时不让主仓 Actions 挂红
+        # 注意：官方 actions 组织没有 repository-dispatch 这个 action（2026-10-13 核实）——
+        # 社区标准实现是 peter-evans/repository-dispatch，入参 token/repository/event-type 同义
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.SITE_DISPATCH_PAT }}
+          repository: jarvislee90s-dot/tuvis-website
+          event-type: tuvis-docs-update

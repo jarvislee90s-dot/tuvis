@@ -11,7 +11,13 @@ import { useSessionsQuery } from "@/lib/query/queries/sessions";
 import { sessionTitleOrUndefined } from "@/lib/sessionTitle";
 import { setupSessionReadListener } from "@/lib/query/sessionReadSync";
 import { ANIM, frameStyle, FRAME_H, FRAME_W, type PetAnimKey } from "./petAnimations";
-import { FOXBELL, resolveActivePet, type ActivePet } from "./petRuntime";
+import {
+  DEFAULT_PET,
+  builtinPet,
+  loadActiveId,
+  resolveActivePet,
+  type ActivePet,
+} from "./petRuntime";
 import {
   loadConfig,
   loadVisible,
@@ -57,7 +63,7 @@ export function FoxbellPet() {
   useEffect(() => subscribeConfig(() => setCfg(loadConfig())), []);
 
   // ---- 激活宠物（外部宠物热切换，spec §12）----
-  const [active, setActive] = useState<ActivePet>(FOXBELL);
+  const [active, setActive] = useState<ActivePet>(() => builtinPet(loadActiveId()) ?? DEFAULT_PET);
   const activeRef = useRef(active);
   const rowsRef = useRef<9 | 11>(11);
   // 上一个 ActivePet（blob 快照防泄漏，FIX-2）：切换时 revoke 旧快照；
@@ -187,7 +193,7 @@ export function FoxbellPet() {
           applyActive(p);
         })
         .catch(() => {
-          if (!disposed && gen === refreshGen.current) applyActive(FOXBELL);
+          if (!disposed && gen === refreshGen.current) applyActive(DEFAULT_PET);
         });
     };
     refresh();

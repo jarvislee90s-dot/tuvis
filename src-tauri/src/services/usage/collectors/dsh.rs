@@ -306,7 +306,10 @@ impl DshCollector {
             Err(e) => {
                 return Err(UsageError::new(
                     "usage-source-io",
-                    format!("dsh 投影缓存目录 {} 读取失败: {e}", dir.display()),
+                    format!(
+                        "dsh projection cache dir {} read failed: {e}",
+                        dir.display()
+                    ),
                 ))
             }
         };
@@ -357,7 +360,7 @@ impl DshCollector {
                     }
                     return Err(UsageError::new(
                         "usage-source-io",
-                        format!("dsh 投影缓存 {} 读取失败: {err}", path.display()),
+                        format!("dsh projection cache {} read failed: {err}", path.display()),
                     ));
                 }
             };
@@ -660,7 +663,7 @@ fn scan_raw_logs(
             return Err(UsageError::new(
                 "usage-source-io",
                 format!(
-                    "dsh 会话日志根目录 {} 读取失败: {e}",
+                    "dsh session log root {} read failed: {e}",
                     sessions_root.display()
                 ),
             ))

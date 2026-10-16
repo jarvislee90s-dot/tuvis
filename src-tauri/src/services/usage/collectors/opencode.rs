@@ -60,7 +60,7 @@ impl OpenCodeCollector {
         let Some(conn) = crate::monitor::sqlite::open_usage_db(db_path) else {
             return Err(UsageError::new(
                 "usage-source-db-open",
-                "opencode.db 打不开（ro 与 immutable 均失败）",
+                "opencode.db open failed (ro and immutable)",
             ));
         };
         // **供应商规则从 ctx 注入**（§3.2.3 FIX-6）：lib 单测构建注入空规则 → 零 DB；

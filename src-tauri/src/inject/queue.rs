@@ -461,7 +461,7 @@ pub(crate) fn try_flush_with(
             .and_then(|()| {
                 st.injector
                     .locate_and_send_key_spec(session.pid, "tab", &spec)
-                    .map_err(|e| format!("Tab 入队失败（草稿已入 composer，请人工检查终端）：{e}"))
+                    .map_err(|e| format!("QUEUE_ENQUEUE_FAIL: Tab 入队失败（草稿已入 composer，请人工检查终端）：{e}"))
             })
             .and_then(|()| {
                 st.injector
@@ -676,7 +676,7 @@ pub(crate) fn settle(
                 if jump { "jump" } else { "flush" },
                 &format!("aborted:{reason}"),
             );
-            Err(format!("未投递：{reason}，请人工确认"))
+            Err(format!("QUEUE_NOT_DELIVERED: 未投递：{reason}，请人工确认"))
         }
         FlushOutcome::AmbiguousTarget(n) => {
             // L13 靶向歧义拒绝落账（C0-③）：**零注入**（不猜），行 mark_failed 退出
@@ -1193,7 +1193,7 @@ mod tests {
                 None => Ok(()),
             }
         }
-        fn locate_and_send_key(&self, _pid: u32, key: &str) -> Result<(), String> {
+        fn locate_and_send_key_inner(&self, _pid: u32, key: &str) -> Result<(), String> {
             self.ops.lock().unwrap().push(format!("key:{key}"));
             match self.key_fail {
                 Some(e) => Err(e.to_string()),

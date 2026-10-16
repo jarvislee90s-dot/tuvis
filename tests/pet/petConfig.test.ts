@@ -2,6 +2,9 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+// resetGravityPerRun 走 invoke 取后端 run id——hoisted mock 拦截（同 healthCheckCard 手法）
+const invokeMock = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 import {
   loadConfig,
   saveConfig,
@@ -12,6 +15,8 @@ import {
   petSoundTakeover,
   petSuppressPopup,
   subscribeConfig,
+  resetGravityPerRun,
+  GRAVITY_RUN_KEY,
 } from "@/components/pet/petConfig";
 import { saveActiveId, loadActiveName } from "@/components/pet/petRuntime";
 
@@ -120,7 +125,59 @@ describe("petConfig 激活指针订阅（P1-6）", () => {
     window.dispatchEvent(new StorageEvent("storage", { key: "mam-pet-active-name" }));
     expect(fn).toHaveBeenCalledTimes(3);
     unsub();
-    saveActiveId("foxbell", true);
+    saveActiveId("builtin-foxbell", true);
     expect(fn).toHaveBeenCalledTimes(3); // 退订后不再触达
+  });
+});
+
+describe("物理坠落按应用重启归位（2026-10-13 用户裁决）", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    invokeMock.mockReset();
+  });
+
+  it("标记不一致（新一轮运行）→ 开着的 gravity 被重置为关，标记落新 run id", async () => {
+    saveConfig({ gravity: true });
+    invokeMock.mockResolvedValue("run-1");
+    await resetGravityPerRun();
+    expect(loadConfig().gravity).toBe(false);
+    expect(localStorage.getItem(GRAVITY_RUN_KEY)).toBe("run-1");
+  });
+
+  it("标记一致（同进程窗口重开/幂等重调）→ 不动会话内手动开启的选择", async () => {
+    invokeMock.mockResolvedValue("run-1");
+    await resetGravityPerRun(); // 首次：落标记（默认 gravity 本就 true → 一并归关）
+    saveConfig({ gravity: true }); // 会话内手动再开
+    await resetGravityPerRun(); // 同 run id 再跑（窗口后开/重复调用的路径）
+    expect(loadConfig().gravity).toBe(true); // 不被覆盖
+  });
+
+  it("gravity 已为关时只落标记、不写配置（无谓 storage 事件不打扰订阅方）", async () => {
+    saveConfig({ gravity: false });
+    const fn = vi.fn();
+    const unsub = subscribeConfig(fn);
+    invokeMock.mockResolvedValue("run-2");
+    await resetGravityPerRun();
+    expect(localStorage.getItem(GRAVITY_RUN_KEY)).toBe("run-2");
+    expect(loadConfig().gravity).toBe(false);
+    expect(fn).not.toHaveBeenCalled();
+    unsub();
+  });
+
+  it("后端不可用（invoke 失败）→ 保持现状且不抛（不阻塞启动）", async () => {
+    saveConfig({ gravity: true });
+    invokeMock.mockRejectedValue(new Error("no backend"));
+    await expect(resetGravityPerRun()).resolves.toBeUndefined();
+    expect(loadConfig().gravity).toBe(true);
+    expect(localStorage.getItem(GRAVITY_RUN_KEY)).toBeNull();
+  });
+
+  it("main.tsx 启动接线源码锁：所有窗口入口模块顶层统一前置触发（幂等）", () => {
+    const boot = readFileSync(path.join(process.cwd(), "src/main.tsx"), "utf8");
+    expect(boot).toContain("resetGravityPerRun");
+    // Rust 侧命令注册锁（漏注册 invoke 恒走 catch → 重置静默失效，界面看不出）
+    const lib = readFileSync(path.join(process.cwd(), "src-tauri/src/lib.rs"), "utf8");
+    expect(lib).toContain("fn app_run_id()");
+    expect(lib).toContain("app_run_id,");
   });
 });

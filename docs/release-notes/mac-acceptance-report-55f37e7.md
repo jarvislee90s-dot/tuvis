@@ -1,5 +1,7 @@
 # macOS 实机验收报告（基准 55f37e7 · 2026-09-19 · jarvisdeMac-mini）
 
+<!-- 历史标注（2026-10-14 · #131）：本文档成文于「命名隧道 → 自有域名」改名前；文中旧卡名「命名隧道」即现行「自有域名」卡，属历史记录，按裁决不改原文。 -->
+
 > 执行人：MAM macOS 实机验收 agent（ZCode）。基准：独立 worktree `/tmp/mam-mac-accept/repo`，`git rev-parse --short HEAD` = **55f37e7**（已校验）。
 > 测试会话全部位于 `/tmp/mam-mac-accept/`（proj-tmux / proj-iterm2 / proj-terminal / proj-codex / proj-kimi / proj-opencode），未触碰用户本人会话。
 > 证据（截图/日志/终端留痕）统一存 `/tmp/mam-mac-accept/evidence/`，报告内以 `evidence/…` 相对路径引用。

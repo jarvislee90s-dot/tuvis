@@ -31,7 +31,13 @@ const collectResult = () => ({
     { sourceId: "kimi", ok: true, parsedFiles: 82, newRecords: 12 },
     { sourceId: "opencode", ok: true, parsedFiles: 21, newRecords: 8 },
     { sourceId: "workbuddy", ok: true, parsedFiles: 3, newRecords: 2 },
-    { sourceId: "zcode", ok: false, parsedFiles: 0, newRecords: 0, errorCode: "usage-source-db-open" },
+    {
+      sourceId: "zcode",
+      ok: false,
+      parsedFiles: 0,
+      newRecords: 0,
+      errorCode: "usage-source-db-open",
+    },
     { sourceId: "dsh", ok: true, parsedFiles: 99, newRecords: 3 },
   ],
 });
@@ -69,7 +75,11 @@ const dashboard = (over?: Record<string, unknown>) => ({
     { metric: "interrupted", available: true, perSource: { kimi: false } },
     { metric: "longestTurn", available: true, perSource: {} },
     { metric: "toolCalls", available: true, perSource: {} },
-    { metric: "userEst", available: true, perSource: { zcode: false, opencode: false, dsh: false } },
+    {
+      metric: "userEst",
+      available: true,
+      perSource: { zcode: false, opencode: false, dsh: false },
+    },
   ],
   collectedAt: 1_700_000_000_000,
   ...over,
@@ -143,11 +153,10 @@ describe("UsageStatusSection 验收面（Task 24）", () => {
     release(collectResult());
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("usage_collect", { force: true }));
     // 采集成功后自动刷新今日口径（dashboard 至少第二次）
-    await waitFor(
-      () =>
-        expect(
-          invokeMock.mock.calls.filter((c) => c[0] === "usage_dashboard").length
-        ).toBeGreaterThanOrEqual(2)
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.filter((c) => c[0] === "usage_dashboard").length
+      ).toBeGreaterThanOrEqual(2)
     );
     // 采集结束后按钮恢复可点、采集中钩子消失
     await waitFor(() => expect(screen.getByTestId("usage-status-collect")).not.toBeDisabled());
@@ -272,7 +281,11 @@ describe("UsageStatusSection 总开关关闭 / 不可得（Task 24）", () => {
   // M4：上游漏序列化 `userEst` 键（`undefined`）时不得抛（否则整段分区白屏）
   it("userEst 键缺失（undefined）→ 仍显示「—」且分区不崩", async () => {
     invokeMock.mockImplementation(async (cmd: string) =>
-      cmd === "usage_dashboard" ? dashboard({ totals: { requestTotal: 1, cacheHitRate: 0.5, userEst: undefined, requests: 1 } }) : null
+      cmd === "usage_dashboard"
+        ? dashboard({
+            totals: { requestTotal: 1, cacheHitRate: 0.5, userEst: undefined, requests: 1 },
+          })
+        : null
     );
     render(<UsageStatusSection />);
     const row = await screen.findByTestId("usage-today-user-est");

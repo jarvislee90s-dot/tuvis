@@ -6,8 +6,13 @@ import type { ArchivedPayload } from "@/mobile/api";
 const payload: ArchivedPayload = {
   archived: [
     {
-      sessionId: "a1", agentType: "codex", projectPath: "/tmp/p1", projectName: "proj-1",
-      title: "修复登录", lastStatus: "idle", lastSeenAt: new Date(Date.now() - 3600_000).toISOString(),
+      sessionId: "a1",
+      agentType: "codex",
+      projectPath: "/tmp/p1",
+      projectName: "proj-1",
+      title: "修复登录",
+      lastStatus: "idle",
+      lastSeenAt: new Date(Date.now() - 3600_000).toISOString(),
     },
   ],
   projects: ["proj-1"],
@@ -20,23 +25,33 @@ function installFetch(ok = true) {
       const url = String(input);
       if (url.includes("/sessions-archived") && !url.includes("DELETE")) {
         if (!ok) return new Response("boom", { status: 500 });
-        return new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } });
+        return new Response(JSON.stringify(payload), {
+          headers: { "content-type": "application/json" },
+        });
       }
       return new Response("{}", { status: 404 });
-    }),
+    })
   );
 }
 
 describe("ArchiveBoard：历史页", () => {
   beforeEach(() => installFetch());
-  afterEach(() => { vi.unstubAllGlobals(); cleanup(); });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    cleanup();
+  });
 
   it("默认 1 天拉取并渲染卡片；卡片上无任何打开按钮", async () => {
     const calls: string[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (i: RequestInfo | URL) => {
-      calls.push(String(i));
-      return new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } });
-    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (i: RequestInfo | URL) => {
+        calls.push(String(i));
+        return new Response(JSON.stringify(payload), {
+          headers: { "content-type": "application/json" },
+        });
+      })
+    );
     render(<ArchiveBoard onBack={() => {}} onOpenCard={() => {}} onUnpaired={() => {}} />);
     // selector 收窄到卡片 span：项目下拉 <option> 同文本，findByText 多匹配会抛错
     expect(await screen.findByText("proj-1", { selector: "span" })).toBeTruthy();
@@ -46,10 +61,15 @@ describe("ArchiveBoard：历史页", () => {
 
   it("切 7 天 → 重新拉取（URL 带 days=7）", async () => {
     const calls: string[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (i: RequestInfo | URL) => {
-      calls.push(String(i));
-      return new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } });
-    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (i: RequestInfo | URL) => {
+        calls.push(String(i));
+        return new Response(JSON.stringify(payload), {
+          headers: { "content-type": "application/json" },
+        });
+      })
+    );
     render(<ArchiveBoard onBack={() => {}} onOpenCard={() => {}} onUnpaired={() => {}} />);
     await screen.findByText("proj-1", { selector: "span" });
     fireEvent.click(screen.getByTestId("archive-days-7"));
@@ -63,20 +83,25 @@ describe("ArchiveBoard：历史页", () => {
   });
 
   it("首载中显示「加载中…」", () => {
-    vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {}))); // 永不 resolve
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => new Promise(() => {}))
+    ); // 永不 resolve
     render(<ArchiveBoard onBack={() => {}} onOpenCard={() => {}} onUnpaired={() => {}} />);
     expect(screen.getByText("加载中…")).toBeTruthy();
   });
 
   it("有筛选时空态改显「当前筛选无匹配会话」，不误导扩窗", async () => {
-    vi.stubGlobal("fetch", vi.fn(async (i: RequestInfo | URL) => {
-      const url = String(i);
-      const empty = url.includes("days=7");
-      return new Response(
-        JSON.stringify(empty ? { archived: [], projects: [] } : payload),
-        { headers: { "content-type": "application/json" } },
-      );
-    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (i: RequestInfo | URL) => {
+        const url = String(i);
+        const empty = url.includes("days=7");
+        return new Response(JSON.stringify(empty ? { archived: [], projects: [] } : payload), {
+          headers: { "content-type": "application/json" },
+        });
+      })
+    );
     render(<ArchiveBoard onBack={() => {}} onOpenCard={() => {}} onUnpaired={() => {}} />);
     expect(await screen.findByText("proj-1", { selector: "span" })).toBeTruthy();
     // 真实路径构造「有筛选 + 空」组合：选定项目后切小窗，新窗口不含该项目
@@ -102,10 +127,11 @@ describe("ArchiveBoard 软归档徽标（体验批二）", () => {
     };
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () =>
-        new Response(JSON.stringify(alivePayload), {
-          headers: { "content-type": "application/json" },
-        })
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify(alivePayload), {
+            headers: { "content-type": "application/json" },
+          })
       )
     );
     render(<ArchiveBoard onBack={() => {}} onOpenCard={() => {}} onUnpaired={() => {}} />);

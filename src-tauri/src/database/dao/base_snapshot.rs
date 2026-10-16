@@ -23,26 +23,26 @@ pub fn save_base_snapshot(
     // 事务包裹删除+插入：保证基底账不出现半截态，中断/失败即整体回滚
     let tx = conn
         .unchecked_transaction()
-        .map_err(|e| format!("保存基底快照失败: {}", e))?;
+        .map_err(|e| format!("DB_SNAPSHOT_SAVE_FAIL: 保存基底快照失败: {}", e))?;
     tx.execute(
         "DELETE FROM tool_base_snapshot_items WHERE tool_id = ?1",
         [tool_id],
     )
-    .map_err(|e| format!("保存基底快照失败: {}", e))?;
+    .map_err(|e| format!("DB_SNAPSHOT_SAVE_FAIL: 保存基底快照失败: {}", e))?;
     tx.execute(
         "INSERT OR REPLACE INTO tool_base_snapshots (tool_id, active_preset_id, created_at) VALUES (?1, ?2, ?3)",
         params![tool_id, active_preset_id, now],
     )
-    .map_err(|e| format!("保存基底快照失败: {}", e))?;
+    .map_err(|e| format!("DB_SNAPSHOT_SAVE_FAIL: 保存基底快照失败: {}", e))?;
     for it in items {
         tx.execute(
             "INSERT INTO tool_base_snapshot_items (tool_id, extension_id, kind, origin) VALUES (?1, ?2, ?3, ?4)",
             params![tool_id, it.extension_id, it.kind, it.origin],
         )
-        .map_err(|e| format!("保存基底快照失败: {}", e))?;
+        .map_err(|e| format!("DB_SNAPSHOT_SAVE_FAIL: 保存基底快照失败: {}", e))?;
     }
     tx.commit()
-        .map_err(|e| format!("保存基底快照失败: {}", e))?;
+        .map_err(|e| format!("DB_SNAPSHOT_SAVE_FAIL: 保存基底快照失败: {}", e))?;
     Ok(())
 }
 
@@ -91,18 +91,18 @@ pub fn destroy_base_snapshot(tool_id: &str) -> Result<(), String> {
     // target 当空集把工具全停用——与 save 对称包事务
     let tx = conn
         .unchecked_transaction()
-        .map_err(|e| format!("销毁基底快照失败: {}", e))?;
+        .map_err(|e| format!("DB_SNAPSHOT_DESTROY_FAIL: 销毁基底快照失败: {}", e))?;
     tx.execute(
         "DELETE FROM tool_base_snapshot_items WHERE tool_id = ?1",
         [tool_id],
     )
-    .map_err(|e| format!("销毁基底快照失败: {}", e))?;
+    .map_err(|e| format!("DB_SNAPSHOT_DESTROY_FAIL: 销毁基底快照失败: {}", e))?;
     tx.execute(
         "DELETE FROM tool_base_snapshots WHERE tool_id = ?1",
         [tool_id],
     )
-    .map_err(|e| format!("销毁基底快照失败: {}", e))?;
+    .map_err(|e| format!("DB_SNAPSHOT_DESTROY_FAIL: 销毁基底快照失败: {}", e))?;
     tx.commit()
-        .map_err(|e| format!("销毁基底快照失败: {}", e))?;
+        .map_err(|e| format!("DB_SNAPSHOT_DESTROY_FAIL: 销毁基底快照失败: {}", e))?;
     Ok(())
 }

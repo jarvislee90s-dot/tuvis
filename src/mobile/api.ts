@@ -28,7 +28,7 @@ export async function pairWithPin(pin: string): Promise<{ ok: boolean }> {
       body: JSON.stringify({ pin }),
     });
   } catch (e) {
-    throw new ApiError(null, `pair/pin 网络异常: ${String(e)}`);
+    throw new ApiError(null, `MOBILE_NETWORK_FAIL:pair/pin: pair/pin 网络异常: ${String(e)}`);
   }
   if (!r.ok) {
     let data: Record<string, unknown> | null = null;
@@ -130,7 +130,7 @@ export async function fetchUiConfig(): Promise<UiConfig | null> {
   try {
     r = await fetch("/m/api/v1/ui-config");
   } catch (e) {
-    throw new ApiError(null, `ui-config 网络异常: ${String(e)}`);
+    throw new ApiError(null, `MOBILE_NETWORK_FAIL:ui-config: ui-config 网络异常: ${String(e)}`);
   }
   if (r.status === 403) return null;
   if (!r.ok) throw new ApiError(r.status, `ui-config ${r.status}`);
@@ -189,7 +189,10 @@ export async function fetchSessionMessages(
   try {
     r = await fetch(`/m/api/v1/session-messages?${q}`);
   } catch (e) {
-    throw new ApiError(null, `session-messages 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-messages: session-messages 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) throw new ApiError(r.status, `session-messages ${r.status}`);
   const j = (await r.json()) as { messages?: SessionMessage[]; truncated?: boolean };
@@ -207,14 +210,15 @@ export async function fetchSessionMessages(
  *  modified = 是否被写类工具（Edit/Write…）改写触达（2026-09-16 用户裁决：
  *  前端据此把「仅读过」的文件名渲成常规色，与「动过手」的区分），
  *  origin = 来源三池（M5 B2）：user=我上传的 / tool_read=工具读取 / tool_write=
- *  工具读写；旧载荷无此键 → undefined（来源筛选按「全部来源」处理，行上不渲染徽标） */
+ *  工具读写；session_artifact = 会话产物（正文链接/反引号路径 + 存在性校验，2026-10-13）。
+ *  旧载荷无此键 → undefined（来源筛选按「全部来源」处理，行上不渲染徽标） */
 export interface SessionFileEntry {
   path: string;
   lastSeq: number;
   lastTs: number | null;
   hits: number;
   modified: boolean;
-  origin?: "user" | "tool_read" | "tool_write";
+  origin?: "user" | "tool_read" | "tool_write" | "session_artifact";
 }
 
 /** 拉取该会话涉及的文件表（/session-files，泛化提取）。一份数据两用：正文
@@ -267,7 +271,7 @@ export async function fetchFile(
   try {
     r = await fetch(`/m/api/v1/file?${q}`);
   } catch (e) {
-    throw new ApiError(null, `file 网络异常: ${String(e)}`);
+    throw new ApiError(null, `MOBILE_NETWORK_FAIL:file: file 网络异常: ${String(e)}`);
   }
   if (!r.ok) {
     // M5 P2-a：403 响应体带结构化原因码（sensitive/too_large/not_found/not_file/io），
@@ -622,7 +626,10 @@ export async function fetchSendInfo(sessionId: string): Promise<SendInfo | null>
   try {
     r = await fetch(`/m/api/v1/session-send-info?${q}`);
   } catch (e) {
-    throw new ApiError(null, `session-send-info 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-send-info: session-send-info 网络异常: ${String(e)}`
+    );
   }
   if (r.status === 403) return null; // 设备失效 → 回配对页
   if (!r.ok) throw new ApiError(r.status, `session-send-info ${r.status}`);
@@ -671,7 +678,10 @@ export async function sessionSend(
       body: JSON.stringify({ sessionId, text, ...(queueOnly ? { queueOnly: true } : {}) }),
     });
   } catch (e) {
-    throw new ApiError(null, `session-send 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-send: session-send 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) {
     // 403 not_injectable{reason,reasonCode}（如挂载后会话漂移为 APP/黑盒形态）——
@@ -799,7 +809,10 @@ export async function fetchQueue(sessionId: string): Promise<QueueItemView[]> {
   try {
     r = await fetch(`/m/api/v1/session-queue?${q}`);
   } catch (e) {
-    throw new ApiError(null, `session-queue 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-queue: session-queue 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) throw new ApiError(r.status, `session-queue ${r.status}`);
   const j = (await r.json()) as { items?: QueueItemView[] };
@@ -830,7 +843,10 @@ export async function queueJump(sessionId: string, itemId: number): Promise<Queu
       body: JSON.stringify({ sessionId, itemId }),
     });
   } catch (e) {
-    throw new ApiError(null, `session-queue/jump 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-queue/jump: session-queue/jump 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) throw new ApiError(r.status, `session-queue/jump ${r.status}`);
   return (await r.json()) as QueueJumpResult;
@@ -852,7 +868,10 @@ export async function queueRetract(
       body: JSON.stringify({ sessionId, itemId }),
     });
   } catch (e) {
-    throw new ApiError(null, `session-queue/retract 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-queue/retract: session-queue/retract 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) throw new ApiError(r.status, `session-queue/retract ${r.status}`);
   return (await r.json()) as { ok: true } | { status: "failed"; error: string };
@@ -909,7 +928,10 @@ export async function fetchApproveOptions(sessionId: string): Promise<ApproveOpt
   try {
     r = await fetch(`/m/api/v1/session-approve-options?${q}`);
   } catch (e) {
-    throw new ApiError(null, `session-approve-options 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-approve-options: session-approve-options 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) throw new ApiError(r.status, `session-approve-options ${r.status}`);
   return (await r.json()) as ApproveOptionsView;
@@ -933,7 +955,10 @@ export async function sessionApprove(sessionId: string, optionId: string): Promi
       body: JSON.stringify({ sessionId, optionId }),
     });
   } catch (e) {
-    throw new ApiError(null, `session-approve 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-approve: session-approve 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) {
     // 409/404 错误码在响应体 data.error——解析进 data 供调用方分診（对齐 sessionSend 惯例）
@@ -978,7 +1003,10 @@ export async function sessionPlanFeedback(
       body: JSON.stringify({ sessionId, action, text: opts.text, submit: opts.submit }),
     });
   } catch (e) {
-    throw new ApiError(null, `session-plan-feedback 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-plan-feedback: session-plan-feedback 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) {
     let data: Record<string, unknown> | null = null;
@@ -1082,7 +1110,10 @@ export async function fetchSessionQuestion(sessionId: string): Promise<QuestionI
   try {
     r = await fetch(`/m/api/v1/session-question?${q}`);
   } catch (e) {
-    throw new ApiError(null, `session-question 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-question: session-question 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) throw new ApiError(r.status, `session-question ${r.status}`);
   return (await r.json()) as QuestionInfoView;
@@ -1289,7 +1320,10 @@ async function sessionQuestionAnswerRaw(
       body: JSON.stringify({ sessionId, action, index, text, questionIndex, direction, overwrite }),
     });
   } catch (e) {
-    throw new ApiError(null, `session-question/answer 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-question/answer: session-question/answer 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) {
     // 409/400 错误码在响应体 data.error——解析进 data 供调用方分診（sessionApprove 惯例）
@@ -1460,7 +1494,10 @@ export async function fetchSessionMode(sessionId: string): Promise<SessionModeVi
   try {
     r = await fetch(`/m/api/v1/session-mode?${q}`);
   } catch (e) {
-    throw new ApiError(null, `session-mode 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-mode: session-mode 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) throw new ApiError(r.status, `session-mode ${r.status}`);
   return (await r.json()) as SessionModeView;
@@ -1500,7 +1537,10 @@ async function sessionModeSwitchRaw(
       ),
     });
   } catch (e) {
-    throw new ApiError(null, `session-mode/switch 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-mode/switch: session-mode/switch 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) {
     let data: Record<string, unknown> | null = null;
@@ -1607,7 +1647,10 @@ async function modeMenuFetch(init: RequestInit, path: string): Promise<ModeMenuR
   try {
     r = await fetch(path, init);
   } catch (e) {
-    throw new ApiError(null, `session-mode/menu 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-mode/menu: session-mode/menu 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) {
     let data: Record<string, unknown> | null = null;
@@ -1679,7 +1722,10 @@ export async function sessionOpen(sessionId: string): Promise<SessionOpenResult>
       body: JSON.stringify({ sessionId }),
     });
   } catch (e) {
-    throw new ApiError(null, `session-open 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-open: session-open 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) {
     // 404 错误码在响应体 data.error——解析进 data 供调用方分診（对齐 sessionApprove 惯例）
@@ -1801,7 +1847,10 @@ export async function fetchCreateProjects(days = 7): Promise<CreateProjectsPaylo
   try {
     r = await fetch(`/m/api/v1/create-projects?days=${days}`);
   } catch (e) {
-    throw new ApiError(null, `create-projects 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:create-projects: create-projects 网络异常: ${String(e)}`
+    );
   }
   if (r.status === 403) return null; // 设备失效 → 回配对页
   if (!r.ok) throw new ApiError(r.status, `create-projects ${r.status}`);
@@ -1846,7 +1895,10 @@ export async function createSession(body: {
       body: JSON.stringify(body),
     });
   } catch (e) {
-    throw new ApiError(null, `session-create 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-create: session-create 网络异常: ${String(e)}`
+    );
   }
   if (r.status === 400) {
     // reasonCode 是 400 的分診依据（工具门/路径码/mkdir）——解析失败则缺省，
@@ -2009,7 +2061,10 @@ export async function fetchCreateStatus(
   try {
     r = await fetch(`/m/api/v1/session-create/status?taskId=${taskId}`);
   } catch (e) {
-    throw new ApiError(null, `session-create/status 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-create/status: session-create/status 网络异常: ${String(e)}`
+    );
   }
   if (r.status === 404) return { kind: "no_task" };
   if (!r.ok) throw new ApiError(r.status, `session-create/status ${r.status}`);
@@ -2045,7 +2100,10 @@ export async function fetchSessionSubagents(
   try {
     r = await fetch(`/m/api/v1/session-subagents?${q}`);
   } catch (e) {
-    throw new ApiError(null, `session-subagents 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-subagents: session-subagents 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) throw new ApiError(r.status, `session-subagents ${r.status}`);
   const data = (await r.json()) as { subagents: SubagentView[] };
@@ -2081,7 +2139,10 @@ export async function fetchSubagentMessages(
   try {
     r = await fetch(`/m/api/v1/session-subagent-messages?${q}`);
   } catch (e) {
-    throw new ApiError(null, `session-subagent-messages 网络异常: ${String(e)}`);
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-subagent-messages: session-subagent-messages 网络异常: ${String(e)}`
+    );
   }
   if (!r.ok) throw new ApiError(r.status, `session-subagent-messages ${r.status}`);
   return (await r.json()) as SubagentMessagesPage;

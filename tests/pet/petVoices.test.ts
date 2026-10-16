@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   parseManifest,
   pickIndex,
@@ -54,11 +54,24 @@ describe("VoicePlayer resolveUrl（外部宠物 blob 快照，spec EP6）", () =
     expect(e?.file).toBe("voice/general/a.m4a");
     player.dispose();
   });
-  it("默认解析器保持 foxbell 内置路径", () => {
-    const player = new VoicePlayer();
-    expect(() =>
-      player.load([{ index: 0, group: "general", name: "a", file: "x.m4a" }])
-    ).not.toThrow();
-    player.dispose();
+  it("load 必须注入解析器：预载 Audio 的 src 由注入值决定", () => {
+    const made: string[] = [];
+    class FakeAudio {
+      preload = "";
+      pause() {}
+      load() {}
+      constructor(src: string) {
+        made.push(src);
+      }
+    }
+    vi.stubGlobal("Audio", FakeAudio);
+    try {
+      const player = new VoicePlayer();
+      player.load([{ index: 0, group: "general", name: "a", file: "x.m4a" }], (f) => `blob://${f}`);
+      expect(made).toEqual(["blob://x.m4a"]);
+      player.dispose();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

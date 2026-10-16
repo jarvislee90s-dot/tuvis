@@ -20,6 +20,8 @@ English · [中文](README.md)
 
 ## Features
 
+> Since v0.5.8 every in-app error carries a stable **error code** with localized (EN/中文) wording — include the code when reporting an issue for precise diagnosis.
+
 ### Session Monitoring Dashboard
 
 Real-time traffic-light status board for all active AI coding tool sessions.
@@ -34,7 +36,7 @@ Real-time traffic-light status board for all active AI coding tool sessions.
 - Distinguishes CLI vs. desktop APP form: APP sessions support session-level deep-link jumps (`workbuddy://chat/<id>`, `codex://threads/<id>`, with APP-foreground fallback) and persistent unread cards (kept across restarts, cleared when the host exits); dsh (web-hosted) jumps focus/open the dsh tab in your browser (macOS)
 - Shows project name, git branch, last message preview, CPU usage, runtime
 - Sorts by priority: waiting → running → idle
-- **Tool filter chips** ("All" + 8 tools) below the tab bar — icons/colors share one source with the card badges; the choice is remembered locally, the counter stays global, and an empty result names the tool instead of showing a blank board
+- **Tool filter chips** ("All" + 7 tools) below the tab bar — icons/colors share one source with the card badges; the choice is remembered locally, the counter stays global, and an empty result names the tool instead of showing a blank board. OpenClaw is not filterable (no message alerts) though its badge remains; a stale OpenClaw filter falls back to "All" automatically
 - System tray icon reflects aggregate status (🔴/🟡/🟢)
 
 ### Remote Access & Mobile Board (LAN / Quick Tunnel / Own Domain / External Domain)
@@ -50,9 +52,7 @@ Open the same eight-tool session board from your phone browser. Settings → Rem
 
 **The access PIN applies to this computer too**: loopback access is **no longer PIN-free** — opening the board from this machine's own browser is treated exactly like a remote device (enter the PIN once, then remembered for 180 days). "This machine" is **no longer a channel card**: it is just one way to connect, using the address shown on the "LAN" card.
 
-![Remote Access · desktop settings page](docs/images/remote-settings-v0.5.0.png)
-
-> The screenshot above shows the old four-card UI from before this branch (Local / LAN / Quick tunnel / Named tunnel); its "Local · no PIN" note has since been overturned by the zero-exemption gate — a new screenshot is pending.
+![Remote Access · desktop settings page](docs/images/remote-settings-v0.6.0.png)
 
 How to connect: turn on "Enable Remote Access" → enable the channel you want → click its card to reveal the address / QR code (**the link already contains the PIN, so scanning fills it in automatically**) → open it on your phone (**the URL must end with `/m`**). **The first run of "External domain (no domain needed)" goes through the card's wizard**: click "One-click setup" and it walks through detect → download from the official source with checksum verification → install (one admin prompt from the system) → sign in to Tailscale (Tuvis turns the authorization link into a button; you finish in the browser) → turn off "block incoming connections" → enable Funnel → **reachability verification** — no command line at any point; on macOS you also approve Tailscale's system extension once in System Settings, and the first Funnel enablement may additionally need one browser approval (or none at all).
 
@@ -68,7 +68,7 @@ The PIN applies to **all four channels** (**including access from this computer*
 
 - Expand details while running (thinking / tool calls are collapsible), auto-collapse to the final summary once a turn completes
 - Markdown rendering (headings / lists / tables / code highlighting); project file paths in the text become clickable links
-- **File panel**: aggregates the files a session touched, newest first, with document/image filters and a **200 / 500 / 1000 message** look-back range; **modified** files are highlighted and **read-only** ones are neutral (both previewable), and tapping the secondary line reveals the full path
+- **File panel**: aggregates the files a session touched, newest first, with document/image filters and a **200 / 500 / 1000 message** look-back range; **modified** files are highlighted and **read-only** ones are neutral (both previewable), and tapping the secondary line reveals the full path. Since v0.5.8 a fourth source, **Session artifacts**, scans the conversation body for artifact links and inline file references (both inside and outside code fences) into the same list; whitelisted formats preview on tap (desktop and mobile alike)
 - **File preview**: markdown / syntax highlighting / inline images; three switchable layouts — side-by-side (chat left, file right), stacked, and fullscreen overlay — with a draggable splitter; readable scope is the session project directory plus your home directory (sensitive directories such as keys are always refused)
 - **Transfer progress and honest bandwidth disclosure**: uploads and downloads both show a **progress bar** (bytes transferred / percentage / instantaneous rate / ETA); **when the rate or the total size is unknown it shows bytes transferred only and never invents a percentage**. On a bandwidth-limited tunnel channel the file panel and the attachment area say **in place** that this is a channel limit, not a malfunction, with time estimates based on this channel's measured rate (about 1.5 minutes to download and 3.3 minutes to upload a 20 MB attachment) and a **full-speed upgrade path** (install Tailscale on your phone and join the tailnet to connect directly, 1–2 orders of magnitude faster)
 - **Message bookmarks**: mark a spot to revisit with a colored dot (up to 10, one per color), jump back by tapping it, delete individually or clear all; stored in the browser — refresh-proof, cleared when Tuvis restarts or the tab is closed
@@ -104,22 +104,23 @@ Not just looking — you can **act**: send messages, approve tool calls, answer 
 7. **"Own domain" shows running but the domain won't open** — check whether **Public Hostname** is configured on the Cloudflare side (subdomain + domain + Service `HTTP://localhost:9420`); without that step the tunnel may look Healthy while the domain has no DNS record and won't open (the in-app "tutorial" has the step-by-step).
 8. **The "External domain (no domain needed)" card keeps saying "taking effect"** — after the first setup the public DNS record takes about 5–6 minutes to be published: direct access from this machine works right away while outside access has to wait for the record, so the card withholding the address is **honest reporting, not a malfunction**; if it stays that way for long, use "open the wizard to retry" inside the card — Tuvis also resets and re-enables Funnel to self-heal. If you see "recovering" after a boot, the Tailscale backend is reconnecting (usually 1–2 minutes): the configuration and the address are unchanged and nothing is required from you.
 
-### Foxbell Desktop Pet
+### Built-in Pets (tuvis-3D / Foxbell)
 
-A talking fox companion that lives in the corner of your screen and watches every session in real time.
+Built-in companions live in a corner of your screen and watch every session in real time: **tuvis-3D** (a 3D tech rabbit, the default since v0.5.8) and **Foxbell** (a fox with 31 voice clips).
 
-![Foxbell Desktop Pet](docs/images/foxbell-pet.png)
+![Built-in desktop pet](docs/images/foxbell-pet.png)
 
 - Status cards above the pet mirror the dashboard: 🔴 waiting / 🟡 running / 🟢 finished — click a card to jump to its terminal
-- Voice alerts (31 built-in clips): playful nudges on waiting approvals, cheers on completion, small talk on double-click, subtitles synced to audio length
-- Drag physics: pinned-to-cursor dragging, gravity fall on release, throw inertia, squash-and-bounce landing (optional)
+- Voice alerts (each pet ships its own clips: tuvis-3D 16 / Foxbell 31): playful nudges on waiting approvals, cheers on completion, small talk on double-click, subtitles synced to audio length
+- Drag physics: pinned-to-cursor dragging, gravity fall on release, throw inertia, squash-and-bounce landing (optional; **defaults to off after every app restart** since v0.5.8 — re-enable per session)
 - Single-click waves, double-click talks, right-click menu: sound / subtitles / physics / always-on-top / size / per-scene action binding / hide
 - Dashboard integration: takes over completion chimes, suppresses toast popups while always-on-top; toggle from the dashboard 🦊 button, system tray, or settings
 - **"Launch with the app" switch** (Settings → "Notifications & Pet" block, on by default): decides whether the pet follows Tuvis at startup; once turned off it stays off and is no longer overridden by the startup fallback logic
+- **Switch built-in pets**: Settings → "Notifications & Pet" → "Switch pet" lists tuvis-3D first and Foxbell second; hot swap, no restart. Choices from earlier versions carry over automatically (legacy `foxbell` activation records are recognized)
 
 #### External Pets
 
-Since v0.3.0 the pet format is open — Foxbell is no longer the only companion:
+Since v0.3.0 the pet format is open — beyond the two built-ins:
 
 - **Import custom pets**: from a local zip / directory, or download from the Petdex online repository; manifest structure, frame rate, dimensions and voice manifests are fully validated
 - **Manage panel**: import / edit description / rename / delete / one-click hot swap — no app restart needed; the active pet is auto-restored after deletion or switching
@@ -238,6 +239,15 @@ A dedicated settings section to decide which tools Tuvis monitors and manages:
 - Row-style toggle list: icon + name + installed badge; changes are staged locally and batch-saved, with a confirmation dialog listing restore/rollback items and an unsaved-changes leave guard
 - Unchecking = full restore: symlinks become real files, MCP entries are removed from tool configs, unread cards are cleared; the SSOT repository and DB assignments are kept, and re-checking rebuilds everything per the original assignments (partial failures auto-rollback — re-saving retries idempotently)
 - Unchecked tools are fully hidden: session scanning skips them, notifications are muted, resource/preset UIs hide them, and guarded commands return structured, localized errors
+
+### Signal Health (Hook trust-gate self-check)
+
+A settings section under the "Tools & Health Check" block to verify each tool's Hook channel is actually working:
+
+- Every Hook-capable tool shows registration status, last event time, and pending prompts (data comes from the existing Hook event directory and session-scan snapshots, fetched on open/manual refresh — no background polling)
+- Criterion: registered + an active session exists for the tool + zero events within a 30-second window → shows "enter /hooks in the tool's terminal and trust the Tuvis entry (one-time)" with a one-click copy of the `/hooks` command
+- Unregistered tools get an honest reason (e.g. kimi on macOS shows "the Hook channel is not distributed on this platform; nothing to do") instead of a bare "unregistered"
+- codex has an extra trust gate: Tuvis being registered ≠ events firing — you must run `/hooks` inside the Codex TUI and trust it once (the trust hash lands in your user-level config). After registration Tuvis raises a **persistent in-app action card** instead of a one-shot desktop notification: raising the card ≠ dismissing it; only "Copy command" or "Don't remind me again" clears it, and the card carries the command text as a clipboard fallback
 
 ---
 
@@ -449,7 +459,7 @@ The app stores its data in `~/.tuvis/`:
 - [x] Token usage dashboard (phase 1 collection substrate & ledger + phase 2 settings section / pet mini-bar; see the "Token Usage Dashboard" section for the exact accounting rules)
 - [x] Mobile sub-agent observatory (running-session chip + sub-agent board + execution detail)
 - [x] Launch at login (Settings + tray entries; source of truth = live OS-side state, no local cache)
-- [x] Board filtering by tool (desktop 8-tool chips + local memory, same semantics as mobile)
+- [x] Board filtering by tool (desktop 7-tool chips + local memory, same semantics as mobile)
 - [ ] Linux support
 - [ ] Kitty & WezTerm terminal jump support
 

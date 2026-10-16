@@ -99,7 +99,8 @@ function fakeCtx(canvas: FakeCanvas): CanvasRenderingContext2D {
     (m: string) =>
     (...args: unknown[]) => {
       if (m === "beginPath") path = [];
-      if (m === "moveTo" || m === "lineTo") path.push({ x: args[0] as number, y: args[1] as number });
+      if (m === "moveTo" || m === "lineTo")
+        path.push({ x: args[0] as number, y: args[1] as number });
       if (m === "arcTo") {
         path.push({ x: args[0] as number, y: args[1] as number });
         path.push({ x: args[2] as number, y: args[3] as number });
@@ -224,7 +225,10 @@ describe("exportImage（计划② Task 12：分享图执行层）", () => {
     expect(textYs(canvases[1])).toEqual(layoutTextYs(layout.steps));
 
     // 立绘：drawImage 的源框/目标框 = 布局 sprite 步骤（(col×fw, row×fh, fw, fh) → (petX, petY, petW, 360)）
-    const sprite = layout.steps.find((s) => s.kind === "sprite") as Extract<ExportStep, { kind: "sprite" }>;
+    const sprite = layout.steps.find((s) => s.kind === "sprite") as Extract<
+      ExportStep,
+      { kind: "sprite" }
+    >;
     const drawn = canvases[1].calls.filter((c) => c.m === "drawImage");
     expect(drawn).toHaveLength(1);
     expect(drawn[0].args).toEqual([

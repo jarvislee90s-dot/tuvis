@@ -1,4 +1,4 @@
-// PetManageDialog — 修改宠物：重命名/展示名/音频/字幕/删除/打开文件夹（spec §10；激活中先切回 foxbell，EP5）
+// PetManageDialog — 修改宠物：重命名/展示名/音频/字幕/删除/打开文件夹（spec §10；激活中先切回默认宠物，EP5）
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -9,6 +9,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import {
+  DEFAULT_PET,
+  RESERVED_PET_IDS,
   clearFlashSwitched,
   loadActiveId,
   loadFlashSwitched,
@@ -54,7 +56,7 @@ export function PetManageDialog(props: { open: boolean; onOpenChange: (v: boolea
   const [petDir, setPetDir] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [busy, setBusy] = useState(false);
-  // 闪切持久标记（localStorage，跨对话框关闭/重开仍生效）：增删音频闪切回 foxbell 时记录
+  // 闪切持久标记（localStorage，跨对话框关闭/重开仍生效）：增删音频闪切回默认宠物时记录
   // 原宠物 id；保存成功/重命名成功/对话框关闭三个出口统一消费并清除（回环修复，P1-4 修订）
 
   const reload = useCallback(async () => {
@@ -117,13 +119,13 @@ export function PetManageDialog(props: { open: boolean; onOpenChange: (v: boolea
   // 徽标可点击重测（返回的 reprobe 清除该行记账重新探测，#2）
   const reprobe = useVoiceDurationProbe(voiceRows, setVoiceRows, petDir);
 
-  /** 激活中宠物先自动切回 foxbell（EP5），返回是否执行了切换 */
+  /** 激活中宠物先自动切回默认宠物（EP5），返回是否执行了切换 */
   const ensureNotActive = (): boolean => {
     if (loadActiveId() !== selected?.id) return false;
-    saveActiveId("foxbell", true, "Foxbell");
+    saveActiveId(DEFAULT_PET.id, DEFAULT_PET.hasVoice, DEFAULT_PET.displayName);
     emit("pet-active-changed", {}).catch(() => {});
     saveFlashSwitched(selected.id); // 持久标记：随后的保存/重命名/关对话框据此自动切回（回环修复）
-    toast.info(t("pet.manage.activeSwitchNotice"));
+    toast.info(t("pet.manage.activeSwitchNotice", { pet: DEFAULT_PET.displayName }));
     return true;
   };
 
@@ -171,7 +173,7 @@ export function PetManageDialog(props: { open: boolean; onOpenChange: (v: boolea
       setPetDir(null);
     } catch (e) {
       toast.error(petErrMsg(e, t));
-      // 失败出口：指针仍停在 foxbell 时按标记恢复原宠物（回环修复）
+      // 失败出口：指针仍停在默认宠物时按标记恢复原宠物（回环修复）
       if (wasActive) restoreFlashSwitched();
     } finally {
       setBusy(false);
@@ -214,7 +216,7 @@ export function PetManageDialog(props: { open: boolean; onOpenChange: (v: boolea
       const manifest = { ...base, displayName, hasSubtitle: base.hasVoice && subtitle };
       await invoke("pet_update_manifest", { id: selected.id, manifest, backup: true });
       if (wasActive) {
-        // 保存完成自动切回原宠物（经 foxbell 闪切 + 热重载同宠物的全新素材快照）
+        // 保存完成自动切回原宠物（经默认宠物 闪切 + 热重载同宠物的全新素材快照）
         saveActiveId(selected.id, manifest.hasVoice, displayName);
         emit("pet-active-changed", {}).catch(() => {});
       }
@@ -223,7 +225,7 @@ export function PetManageDialog(props: { open: boolean; onOpenChange: (v: boolea
       await reload();
     } catch (e) {
       toast.error(petErrMsg(e, t));
-      // 失败出口：指针仍停在 foxbell 时按标记恢复原宠物（回环修复）
+      // 失败出口：指针仍停在默认宠物时按标记恢复原宠物（回环修复）
       if (wasActive) restoreFlashSwitched();
     } finally {
       setBusy(false);
@@ -254,7 +256,7 @@ export function PetManageDialog(props: { open: boolean; onOpenChange: (v: boolea
   const renameProblem =
     selected && renameTo
       ? petNameProblem(renameTo, {
-          existingIds: [...pets.map((p) => p.id), "foxbell"],
+          existingIds: [...pets.map((p) => p.id), ...RESERVED_PET_IDS],
           selfId: selected.id,
         })
       : null;

@@ -30,7 +30,10 @@ pub fn link_skill_to_layer2(skill_name: &str, tool_id: &str) -> Result<PathBuf, 
     let repo = super::ensure_repo_dir();
     let source = repo.join(skill_name);
     if !source.exists() {
-        return Err(format!("Skill 不在全局仓库: {}", skill_name));
+        return Err(format!(
+            "LINKER_SKILL_NOT_IN_REPO: Skill 不在全局仓库: {}",
+            skill_name
+        ));
     }
     let layer2_dir = ensure_tool_active_dir(tool_id);
     let target = super::dispatch_target(&layer2_dir, skill_name);

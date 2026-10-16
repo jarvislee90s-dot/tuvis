@@ -11,7 +11,7 @@
 //
 // 占位符**只认 4 个**：`{range}` `{tokens}` `{hitPct}` `{models}`（`fillQuote` 逐字替换；
 // `{tool}` 是被禁的第 5 个——工具名不进评语，`agg.topTool` 只作形态信息给将来的文案用）。
-import type { QuoteLang } from "@/lib/usage/lang";
+import type { Lang } from "@/lib/usage/lang";
 
 /**
  * 评语聚合输入（由 `useExportShare.ts` 从当前看板数据现场推导，**不为此另发查询**）。
@@ -37,7 +37,7 @@ export interface QuoteEntry {
 }
 
 /** 双语池：顺序即优先级（**不是**按匹配度打分） */
-export const QUOTE_POOL: Record<QuoteLang, readonly QuoteEntry[]> = {
+export const QUOTE_POOL: Record<Lang, readonly QuoteEntry[]> = {
   zh: [
     { when: (a) => a.hitPct >= 0.9, text: "缓存吃得干干净净（命中率 {hitPct}），省钱小能手！" },
     {

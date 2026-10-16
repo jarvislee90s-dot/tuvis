@@ -1,8 +1,12 @@
 // 资源管理命令
 
 // 递归技能扫描（深度 4 / SKILL.md 判定 / 跳软链点目录 / 结果排序）已上收至
-// services::resource 与回填共用（预设编辑弹窗与资源视图同源口径）
-use crate::services::resource::scan_skill_dirs;
+// services::resource 与回填共用（预设编辑弹窗与资源视图同源口径）；
+// slash_rel 同源共用——凡由目录相对路径铸 **skill** id / 写 name、把名字交给拍平派发
+// （linker::dispatch_target，只认 `/`），或从前端回传名的命令入口（enable/disable/
+// check_skill_target_type），一律先过它（spec §8.1）。mcp/plugin 的 id 取顶层目录名
+// （read_dir 的 file_name），无嵌套分隔符问题，不过它
+use crate::services::resource::{scan_skill_dirs, slash_rel};
 
 /// 原生（未纳管）资源的扫描结果 DTO
 #[derive(Debug, Clone, serde::Serialize)]
@@ -86,7 +90,11 @@ pub fn scan_native_resources(tool_id: String) -> Result<Vec<NativeExtensionRecor
             let skill_names = scan_skill_dirs(&dir);
             for name in skill_names {
                 let path = dir.join(&name);
-                let ext_id = format!("skill-{}", name);
+                // id 口径恒为斜杠（spec §8.1，2026-10-13 评审跟进 2）：Windows 下
+                // scan_skill_dirs 产出原生 `\`，不归一时 `skill-a\b` 与已登记行
+                // `skill-a/b` 永远不等 → 已注册技能被重复列为「可导入」。
+                // 只有 id 归一：source_path 仍是原生路径（文件系统层）
+                let ext_id = format!("skill-{}", slash_rel(&name));
                 let exists = existing.iter().any(|e| e.id == ext_id);
                 if !exists {
                     results.push(NativeExtensionRecord {
@@ -129,15 +137,28 @@ pub fn import_native_resources(
             skipped += 1;
             continue;
         }
-        if let Err(e) = crate::linker::install_to_repo(path, &name, false) {
+        // Windows 下调用方给来的 name 是原生 `\` 相对路径（scan_native_resources
+        // 的 source_path/name 取自同一份目录扫描），这里统一取斜杠形态作
+        // **唯一的登记/派发口径**（spec §8.1，2026-10-13 评审跟进 2）：
+        // ① `install_to_repo` 显式拒绝含 `\` 的名字（linker/mod.rs 非法字符守卫）——
+        //    不归一的话 Windows 上嵌套 native 技能整条导入失败（macOS 侧因原生分隔符
+        //    就是 `/` 反而一直正常）；仓库侧落点 `repo/<suite>/<skill>` 与
+        //    backfill_registry 扫出的嵌套 SSOT 布局同形
+        // ② `enable_skill_for_tool` 内部铸 `skill-{name}` 账本 id，且按 `/` 拍平派发名：
+        //    反斜杠名会被当成「无嵌套」→ 工具目录里派出嵌套路径而非拍平链接，
+        //    账本 id 也与 extensions 登记行对不上
+        // ③ DB 的 id/name 同用斜杠，`list_registered_native_names` 一侧才与登记行同口径
+        //    （顶层原生目录名不含分隔符，归一对其无影响）
+        let slashed = slash_rel(&name);
+        if let Err(e) = crate::linker::install_to_repo(path, &slashed, false) {
             log::warn!("导入 {} 失败: {}", name, e);
             skipped += 1;
             continue;
         }
         let ext = crate::database::ExtensionRecord {
-            id: format!("skill-{}", name),
+            id: format!("skill-{}", slashed),
             kind: "skill".to_string(),
-            name: name.clone(),
+            name: slashed.clone(),
             description: None,
             source_path: source_path.clone(),
             source_url: None,
@@ -152,14 +173,16 @@ pub fn import_native_resources(
         }
         // 默认按来源工具自动创建工具目录链接，让 harness 立即读取 SSOT 中的 skill
         // 用户主动导入时，按来源工具自动把原生目录替换为 兔维斯 软链接
-        if let Err(e) = crate::services::enable_skill_for_tool(&name, &source_tool) {
+        if let Err(e) = crate::services::enable_skill_for_tool(&slashed, &source_tool) {
             log::warn!("导入 {} 后为 {} 创建链接失败: {}", name, source_tool, e);
         }
         imported += 1;
         // SSOT 内容已落位（install_to_repo 成功），读 SKILL.md 判定；
-        // 判定失败（非技能/IO 错误）→ None，不阻断导入
+        // 判定失败（非技能/IO 错误）→ None，不阻断导入。
+        // 建议的 extension_id 属 DB 口径（要与 resource_bindings.extension_id 比对），
+        // 同样传斜杠名；仓库侧读取走 `repo.join(name)`，两平台对 `/` 等价，不影响读盘
         if suggestion.is_none() {
-            suggestion = crate::services::resource::frontmatter::suggest_for_skill(&name);
+            suggestion = crate::services::resource::frontmatter::suggest_for_skill(&slashed);
         }
     }
     Ok(crate::services::ImportStats {
@@ -229,7 +252,10 @@ pub fn migrate_legacy_agents_links(
     mode: String,
 ) -> Result<Vec<crate::services::resource::migration::MigrationItemReport>, String> {
     if mode != "migrate" && mode != "keep" {
-        return Err(format!("未知模式: {}（仅支持 migrate | keep）", mode));
+        return Err(format!(
+            "RESOURCE_UNKNOWN_MODE: 未知模式: {}（仅支持 migrate | keep）",
+            mode
+        ));
     }
     Ok(crate::services::resource::migration::migrate_legacy_links(
         &migration_paths(),
@@ -275,7 +301,12 @@ pub fn list_tool_resources(tool_id: String) -> serde_json::Value {
 
     // 补充 SSOT 中的 skill（不在 DB extensions 里的）
     for name in &ssot_skill_names {
-        let ext_id = format!("skill-{}", name);
+        // 口径归一（spec §8.1，2026-10-13 评审跟进二批）：Windows 下 scan_skill_dirs
+        // 产出原生 `\`，不归一则 ext_id 对不上库里的斜杠登记行 → 同一资源推两张卡片
+        //（下面 `exists` 判断按 id 去重，永远判不出已在表里的那条）。name 是回传给
+        // 前端的展示名，前端会把它原样交给 enable/disable 命令，同样取斜杠口径
+        let slashed = slash_rel(name);
+        let ext_id = format!("skill-{}", slashed);
         if !global_with_status
             .iter()
             .any(|g| g["id"].as_str() == Some(&ext_id))
@@ -284,8 +315,9 @@ pub fn list_tool_resources(tool_id: String) -> serde_json::Value {
             global_with_status.push(serde_json::json!({
                 "id": ext_id,
                 "kind": "skill",
-                "name": name,
+                "name": slashed,
                 "description": null,
+                // sourcePath 是文件系统层：保持原生相对路径 join
                 "sourcePath": mam_skills.join(name).to_string_lossy(),
                 "sourceTool": null,
                 "suite": null,
@@ -400,7 +432,12 @@ pub fn list_ssot_resources() -> SsotResources {
         names
             .into_iter()
             .map(|name| {
-                let ext_id = format!("skill-{}", name);
+                // 口径归一（spec §8.1，2026-10-13 评审跟进二批）：Windows 下
+                // scan_skill_dirs 产出原生 `\`，不归一则 ext_id 对不上账本行
+                //（enabled/broken 工具列恒空）；下面的拍平探测（dispatch_target）
+                // 也只认 `/`——反斜杠名会拼出嵌套路径而非拍平链接，漏报「原生目录已生效」
+                let slashed = slash_rel(&name);
+                let ext_id = format!("skill-{}", slashed);
                 // 1) DB 中有 enabled=true 的记录（仅已勾选工具的列）
                 let mut enabled_tools: Vec<String> = assignments
                     .iter()
@@ -414,7 +451,7 @@ pub fn list_ssot_resources() -> SsotResources {
                     if enabled_tools.iter().any(|t| t == tool_id) {
                         continue;
                     }
-                    if crate::linker::dispatch_target(tool_dir, &name).exists() {
+                    if crate::linker::dispatch_target(tool_dir, &slashed).exists() {
                         enabled_tools.push(tool_id.to_string());
                     }
                 }
@@ -428,7 +465,7 @@ pub fn list_ssot_resources() -> SsotResources {
                     .map(|a| a.agent_tool_id.clone())
                     .collect();
                 SsotResource {
-                    name,
+                    name: slashed,
                     kind: "skill".to_string(),
                     enabled_tools,
                     broken_tools,
@@ -620,10 +657,15 @@ pub fn detect_duplicate_skills(tool_id: String) -> Vec<String> {
     let mut duplicates = Vec::new();
     let ssot_skills = scan_skill_dirs(&repo);
     for name in ssot_skills {
-        // 工具目录侧按拍平名探测（派发拍平，2026-09-17 裁决：嵌套名的派发落点）
-        let tool_path = crate::linker::dispatch_target(&tool_skill_dir, &name);
+        // 工具目录侧按拍平名探测（派发拍平，2026-09-17 裁决：嵌套名的派发落点）——
+        // 拍平只认 `/`，先归一（2026-10-13 评审跟进二批）：Windows 下原生 `\` 名会拼出
+        // 嵌套路径而非拍平链接，嵌套技能的重复检测恒不命中
+        let slashed = slash_rel(&name);
+        let tool_path = crate::linker::dispatch_target(&tool_skill_dir, &slashed);
         if tool_path.exists() && !tool_path.is_symlink() {
-            duplicates.push(name);
+            // 回传名同取斜杠口径：前端把它原样交给 cleanup_duplicate_skills
+            //（那里按同口径铸账本 id 并做拍平派发）
+            duplicates.push(slashed);
         }
     }
     duplicates.sort();
@@ -638,19 +680,25 @@ pub fn cleanup_duplicate_skills(tool_id: String, names: Vec<String>) -> Result<(
         .join(".tuvis")
         .join("skills");
     let tool_skill_dir = crate::adapter::primary_skill_dir(&tool_id)
-        .ok_or_else(|| format!("未知工具: {}", tool_id))?;
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
 
     let mut cleaned = 0;
     let mut errors = Vec::new();
 
     for name in &names {
-        // ssot 侧保持嵌套原路径；工具目录目标按拍平名（派发拍平，2026-09-17 裁决）
-        let ssot_path = repo.join(name);
-        let tool_path = crate::linker::dispatch_target(&tool_skill_dir, name);
+        // 口径归一（spec §8.1，2026-10-13 评审跟进二批）：调用方给来的 name 可能是原生
+        // `\`（detect_duplicate_skills / list_* 的展示名原样回传），不归一的话两处皆错——
+        // ① `dispatch_target` 拍平失效：探/建的是嵌套路径而非拍平链接；
+        // ② `format!("skill-{}", name)` 铸出反斜杠 assignment 行，与 extensions 表的斜杠
+        //    登记行对不上，成为**无主账本行**（DB 清单式迁移只扫 extensions 表，救不回）。
+        // ssot 落点保持嵌套原路径；`repo.join` 对 `/` 与 `\` 等价，斜杠形态两平台通用
+        let slashed = slash_rel(name);
+        let ssot_path = repo.join(&slashed);
+        let tool_path = crate::linker::dispatch_target(&tool_skill_dir, &slashed);
 
         match crate::linker::replace_with_symlink(&ssot_path, &tool_path) {
             Ok(()) => {
-                let ext_id = format!("skill-{}", name);
+                let ext_id = format!("skill-{}", slashed);
                 let _ = crate::database::upsert_assignment(&ext_id, &tool_id, true, "symlinked");
                 cleaned += 1;
             }
@@ -679,8 +727,12 @@ pub fn check_skill_target_type(tool_id: String, skill_name: String) -> String {
     let Some(tool_skill_dir) = crate::adapter::primary_skill_dir(&tool_id) else {
         return "missing".to_string();
     };
-    // 工具目录目标按拍平名定位（派发拍平，2026-09-17 裁决）
-    let target = crate::linker::dispatch_target(&tool_skill_dir, &skill_name);
+    // 工具目录目标按拍平名定位（派发拍平，2026-09-17 裁决）。skill_name 由前端从
+    // list_*/detect 的展示名回传，可能是 Windows 原生 `\` → 入口归一，与 enable/disable
+    // 同口径（2026-10-13 评审跟进二批）：拍平只认 `/`，反斜杠名会探成嵌套路径 → 恒报
+    // missing（前端据此误判类型，亮→灰的停用确认卡拿不到真实类型）
+    let slashed = slash_rel(&skill_name);
+    let target = crate::linker::dispatch_target(&tool_skill_dir, &slashed);
     if !target.exists() {
         "missing".to_string()
     } else if target.is_symlink() {
@@ -701,7 +753,7 @@ fn remove_skill_target(target: &std::path::Path) -> Result<String, String> {
     if target_type == "symlink" {
         crate::linker::remove_link(target)?;
     } else {
-        trash::delete(target).map_err(|e| format!("移入回收站失败: {}", e))?;
+        trash::delete(target).map_err(|e| format!("RESOURCE_TRASH_FAIL: 移入回收站失败: {}", e))?;
     }
     Ok(target_type.to_string())
 }
@@ -712,17 +764,21 @@ pub fn disable_skill_for_tool(tool_id: String, skill_name: String) -> Result<Str
     // W5：未勾选工具的资源管理操作直接拒绝（数据保留在 DB）
     crate::services::tool_settings::ensure_tool_enabled(&tool_id)?;
     let tool_skill_dir = crate::adapter::primary_skill_dir(&tool_id)
-        .ok_or_else(|| format!("未知工具: {}", tool_id))?;
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
+    // skill_name 由前端从 list_*/detect 的展示名回传，可能是 Windows 原生 `\` → 入口
+    // 归一（spec §8.1，2026-10-13 评审跟进二批）：下面的拍平派发、Layer2/3 解链、账本 id
+    // 三处都要求斜杠口径，否则解错路径（嵌套路径 vs 拍平链接）并留下反斜杠无主账本行
+    let slashed = slash_rel(&skill_name);
     // 工具目录目标按拍平名定位（派发拍平，2026-09-17 裁决）
-    let target = crate::linker::dispatch_target(&tool_skill_dir, &skill_name);
+    let target = crate::linker::dispatch_target(&tool_skill_dir, &slashed);
     if !target.exists() && !target.is_symlink() {
-        return Err("目标路径不存在".to_string());
+        return Err("RESOURCE_TARGET_MISSING: 目标路径不存在".to_string());
     }
 
     let target_type = remove_skill_target(&target)?;
-    let _ = crate::linker::layer3::cleanup_layer3_on_tool_disable(&skill_name, &tool_id);
-    let _ = crate::linker::layer2::unlink_skill_from_layer2(&skill_name, &tool_id);
-    let ext_id = format!("skill-{}", skill_name);
+    let _ = crate::linker::layer3::cleanup_layer3_on_tool_disable(&slashed, &tool_id);
+    let _ = crate::linker::layer2::unlink_skill_from_layer2(&slashed, &tool_id);
+    let ext_id = format!("skill-{}", slashed);
     let _ = crate::database::upsert_assignment(&ext_id, &tool_id, false, "missing");
     Ok(target_type)
 }
@@ -732,7 +788,9 @@ pub fn disable_skill_for_tool(tool_id: String, skill_name: String) -> Result<Str
 pub fn enable_skill_for_tool_cmd(skill_name: String, tool_id: String) -> Result<(), String> {
     // W5：未勾选工具的资源管理操作直接拒绝（数据保留在 DB）
     crate::services::tool_settings::ensure_tool_enabled(&tool_id)?;
-    crate::services::enable_skill_for_tool(&skill_name, &tool_id)
+    // 入口归一（理由同 disable_skill_for_tool）：enable_skill_for_tool 内部既铸
+    // `skill-{name}` 账本 id，又按 `/` 拍平派发名并做拍平碰撞守卫，反斜杠名三处全错
+    crate::services::enable_skill_for_tool(&slash_rel(&skill_name), &tool_id)
 }
 
 /// 从任意工具配置文件中提取 MCP 配置并保存到 SSOT 仓库
@@ -809,7 +867,10 @@ pub fn import_mcp_to_ssot(mcp_name: String) -> Result<(), String> {
         }
     }
 
-    Err(format!("未在任何工具配置中找到 MCP: {}", mcp_name))
+    Err(format!(
+        "RESOURCE_MCP_NOT_FOUND: 未在任何工具配置中找到 MCP: {}",
+        mcp_name
+    ))
 }
 
 /// 创建/更新 MCP 配置到 SSOT 仓库
@@ -864,11 +925,11 @@ fn resolve_tool_resource_path(
     match kind {
         "skill" => crate::adapter::primary_skill_dir(tool_id)
             .map(|p| (p, false))
-            .ok_or_else(|| format!("未知工具: {}", tool_id)),
+            .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id)),
         "mcp" => crate::services::mcp::tool_mcp_config_path(tool_id).map(|p| (p, true)),
         "plugin" => {
             let adapter = crate::adapter::adapter_by_id(tool_id)
-                .ok_or_else(|| format!("未知工具: {}", tool_id))?;
+                .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
             let dir = adapter
                 .plugin_dirs()
                 .first()
@@ -876,7 +937,7 @@ fn resolve_tool_resource_path(
                 .clone();
             Ok((dir, false))
         }
-        _ => Err(format!("未知资源类型: {}", kind)),
+        _ => Err(format!("RESOURCE_UNKNOWN_KIND: 未知资源类型: {}", kind)),
     }
 }
 
@@ -893,21 +954,21 @@ fn open_dir_in_system(path: &std::path::Path) -> Result<(), String> {
         let mut cmd = std::process::Command::new("explorer");
         cmd.arg(path);
         spawn_detached(&mut cmd, ConsoleMode::Detached)
-            .map_err(|e| format!("打开目录失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_DIR_FAIL: 打开目录失败: {}", e))?;
     }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
             .arg(path)
             .spawn()
-            .map_err(|e| format!("打开目录失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_DIR_FAIL: 打开目录失败: {}", e))?;
     }
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open")
             .arg(path)
             .spawn()
-            .map_err(|e| format!("打开目录失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_DIR_FAIL: 打开目录失败: {}", e))?;
     }
     let _ = path;
     Ok(())
@@ -924,21 +985,21 @@ fn open_file_in_system(path: &std::path::Path) -> Result<(), String> {
         let mut cmd = std::process::Command::new("cmd");
         cmd.args(["/C", "start", "", &path.to_string_lossy()]);
         spawn_detached(&mut cmd, ConsoleMode::Detached)
-            .map_err(|e| format!("打开文件失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_FILE_FAIL: 打开文件失败: {}", e))?;
     }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
             .arg(path)
             .spawn()
-            .map_err(|e| format!("打开文件失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_FILE_FAIL: 打开文件失败: {}", e))?;
     }
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open")
             .arg(path)
             .spawn()
-            .map_err(|e| format!("打开文件失败: {}", e))?;
+            .map_err(|e| format!("RESOURCE_OPEN_FILE_FAIL: 打开文件失败: {}", e))?;
     }
     let _ = path;
     Ok(())
@@ -955,11 +1016,15 @@ pub async fn open_tool_resource(tool_id: String, kind: String) -> Result<String,
     let (path, is_file) = resolve_tool_resource_path(&tool_id, &kind)?;
     if is_file {
         if !path.exists() {
-            return Err(format!("配置文件尚未创建: {}", path.display()));
+            return Err(format!(
+                "RESOURCE_CONFIG_NOT_CREATED: 配置文件尚未创建: {}",
+                path.display()
+            ));
         }
         open_file_in_system(&path)?;
     } else {
-        std::fs::create_dir_all(&path).map_err(|e| format!("创建目录失败: {}", e))?;
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("RESOURCE_MKDIR_FAIL: 创建目录失败: {}", e))?;
         open_dir_in_system(&path)?;
     }
     Ok(path.to_string_lossy().to_string())
@@ -994,7 +1059,8 @@ pub fn ensure_reveal_allowed(path: &str) -> Result<std::path::PathBuf, String> {
     let p = std::path::Path::new(path);
     let lexically_allowed = raw_roots.iter().any(|r| p.starts_with(r));
     // canonicalize 对不存在路径失败 → 明确报不存在（而非静默放行/误报越界）
-    let canonical = std::fs::canonicalize(p).map_err(|_| format!("路径不存在: {}", path))?;
+    let canonical = std::fs::canonicalize(p)
+        .map_err(|_| format!("RESOURCE_PATH_NOT_FOUND: 路径不存在: {}", path))?;
     let root_canons: Vec<std::path::PathBuf> = raw_roots
         .iter()
         .filter_map(|r| std::fs::canonicalize(r).ok())

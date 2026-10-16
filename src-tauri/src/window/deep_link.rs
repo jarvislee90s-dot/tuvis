@@ -16,7 +16,7 @@ fn open_url_macos(url: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "open url 退出码非零（可能无 handler）：{}",
+            "DEEPLINK_OPEN_EXIT: open url 退出码非零（可能无 handler）：{}",
             output.status
         ))
     }
@@ -69,7 +69,10 @@ fn shell_execute_open(url: &str) -> Result<(), String> {
     if code > 32 {
         Ok(())
     } else {
-        Err(format!("ShellExecuteW 失败，错误码 {}", code))
+        Err(format!(
+            "DEEPLINK_SHELLEXECUTE_FAIL: ShellExecuteW 失败，错误码 {}",
+            code
+        ))
     }
 }
 
@@ -82,7 +85,7 @@ pub fn open_url(url: &str) -> Result<(), String> {
     #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = url;
-        Err("当前平台不支持 URL 打开".to_string())
+        Err("DEEPLINK_PLATFORM_UNSUPPORTED: 当前平台不支持 URL 打开".to_string())
     }
 }
 

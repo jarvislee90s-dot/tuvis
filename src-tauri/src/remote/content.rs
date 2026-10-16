@@ -261,6 +261,11 @@ impl SessionMessage {
 pub struct MessagesPage {
     pub messages: Vec<SessionMessage>,
     pub truncated: bool,
+    /// 会话工作目录（可选，2026-10-13 会话产物批）：codex rollout（首行
+    /// session_meta.payload.cwd）已填；其余工具暂 None——文件面板「会话产物」
+    /// 相对路径的存在性校验基准。skip 序列化：/session-messages 载荷零变化
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// 会话内容源函数形态（RemoteState 注入缝的类型别名，生产 = read_session_messages）
@@ -327,10 +332,12 @@ pub(crate) fn read_session_messages_impl(
     // 定位是 `目录.join(format!("{sid}.jsonl"))`，穿越字符会逃出项目根（端点在
     // 设备门禁之后，但内容层自身 fail-closed）；limit 夹取 [1, 1000]
     if session_id.trim().is_empty() {
-        return Err("session_id 为空".to_string());
+        return Err("CONTENT_SESSION_ID_EMPTY: session_id 为空".to_string());
     }
     if session_id.contains(['/', '\\', '\0']) || session_id.contains("..") {
-        return Err(format!("session_id 含非法字符: {session_id}"));
+        return Err(format!(
+            "CONTENT_SESSION_ID_INVALID: session_id 含非法字符: {session_id}"
+        ));
     }
     let limit = limit.clamp(1, 1000);
     match agent_type {
@@ -342,7 +349,7 @@ pub(crate) fn read_session_messages_impl(
         "workbuddy" => read_workbuddy_messages_with(home, session_id, limit),
         "opencode" => read_opencode_messages_with(home, session_id, limit),
         "openclaw" => read_openclaw_messages_with(home, session_id, limit),
-        _ => Err(format!("未知工具: {agent_type}")),
+        _ => Err(format!("CONTENT_UNKNOWN_TOOL: 未知工具: {agent_type}")),
     }
 }
 
@@ -367,6 +374,7 @@ fn page(msgs: Vec<SessionMessage>, limit: usize, truncated: bool) -> MessagesPag
     MessagesPage {
         messages: finalize(msgs, limit),
         truncated,
+        cwd: None,
     }
 }
 
@@ -457,7 +465,9 @@ fn find_jsonl_in_projects(
 ) -> Result<std::path::PathBuf, String> {
     let projects = home.join(tool_dir).join("projects");
     let Ok(entries) = std::fs::read_dir(&projects) else {
-        return Err(format!("{tool_dir} projects 目录不存在"));
+        return Err(format!(
+            "CONTENT_PROJECTS_DIR_MISSING: {tool_dir} projects 目录不存在"
+        ));
     };
     for dir in entries.flatten() {
         let candidate = dir.path().join(format!("{session_id}.jsonl"));
@@ -465,7 +475,9 @@ fn find_jsonl_in_projects(
             return Ok(candidate);
         }
     }
-    Err(format!("会话文件不存在: {session_id}"))
+    Err(format!(
+        "CONTENT_SESSION_FILE_MISSING: 会话文件不存在: {session_id}"
+    ))
 }
 
 fn read_zcode_messages_with(
@@ -488,7 +500,7 @@ fn read_zcode_messages_with(
     {
         "time_created"
     } else {
-        return Err("ZCode message 表缺顺序列".to_string());
+        return Err("CONTENT_ZCODE_ORDER_COLUMN_MISSING: ZCode message 表缺顺序列".to_string());
     };
     // LIMIT 为 usize 格式化（无注入面），session_id 走 ?1 参数化
     let sql = format!(
@@ -497,7 +509,7 @@ fn read_zcode_messages_with(
     );
     let mut stmt = conn
         .prepare(&sql)
-        .map_err(|e| format!("ZCode 查询失败: {e}"))?;
+        .map_err(|e| format!("CONTENT_ZCODE_QUERY_FAIL: ZCode 查询失败: {e}"))?;
     let rows = stmt
         .query_map([session_id], |row| {
             Ok((
@@ -506,13 +518,15 @@ fn read_zcode_messages_with(
                 row.get::<_, Option<i64>>(2)?,
             ))
         })
-        .map_err(|e| format!("ZCode 查询失败: {e}"))?;
+        .map_err(|e| format!("CONTENT_ZCODE_QUERY_FAIL: ZCode 查询失败: {e}"))?;
     // 查询取「最新在前」，反转为文件序（旧 → 新）
     let mut messages: Vec<(String, String, Option<i64>)> = rows.filter_map(|r| r.ok()).collect();
     messages.reverse();
     // 会话不存在（0 行）→ Err（404 语义），与「存在但无消息条目」区分
     if messages.is_empty() {
-        return Err(format!("ZCode 会话不存在: {session_id}"));
+        return Err(format!(
+            "CONTENT_ZCODE_SESSION_MISSING: ZCode 会话不存在: {session_id}"
+        ));
     }
 
     // parts 按 message_id 分组（IN 子句单查询，保序同 load_parts_for_messages）
@@ -696,7 +710,7 @@ fn zcode_parts_by_message(
     );
     let mut stmt = conn
         .prepare(&sql)
-        .map_err(|e| format!("ZCode parts 查询失败: {e}"))?;
+        .map_err(|e| format!("CONTENT_ZCODE_PARTS_QUERY_FAIL: ZCode parts 查询失败: {e}"))?;
     let ids: Vec<&str> = messages.iter().map(|(id, _, _)| id.as_str()).collect();
     let params: Vec<&dyn rusqlite::types::ToSql> = ids
         .iter()
@@ -706,7 +720,7 @@ fn zcode_parts_by_message(
         .query_map(params.as_slice(), |row| {
             Ok((sqlite_text(row, 0)?, sqlite_text(row, 1)?))
         })
-        .map_err(|e| format!("ZCode parts 查询失败: {e}"))?;
+        .map_err(|e| format!("CONTENT_ZCODE_PARTS_QUERY_FAIL: ZCode parts 查询失败: {e}"))?;
     for row in rows.filter_map(|r| r.ok()) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&row.1) {
             map.entry(row.0).or_default().push(v);
@@ -746,7 +760,7 @@ fn read_dsh_messages_with(
     };
     let sessions_root = dsh_root.join("sessions");
     let Ok(entries) = std::fs::read_dir(&sessions_root) else {
-        return Err("dsh sessions 目录不存在".to_string());
+        return Err("CONTENT_DSH_DIR_MISSING: dsh sessions 目录不存在".to_string());
     };
     // 目录名是转义形态不可反解 id（M0 评审漏项 #3）——必须逐会话读 header 匹配
     for project_dir in entries.flatten() {
@@ -783,7 +797,9 @@ fn read_dsh_messages_with(
             return Ok(page(map_dsh_events(&events), limit, false));
         }
     }
-    Err(format!("dsh 会话不存在或日志不可读: {session_id}"))
+    Err(format!(
+        "CONTENT_DSH_SESSION_MISSING: dsh 会话不存在或日志不可读: {session_id}"
+    ))
 }
 
 /// dsh 事件流 → 统一条目（纯函数）。跳过注入与记账事件（M0 F8：user/message 仅
@@ -1051,11 +1067,13 @@ pub(crate) fn read_claude_subagent_messages_with(
     let Some((_parent_jsonl, subagents_dir)) =
         crate::monitor::subagents::claude::locate(&projects, session_id)
     else {
-        return Err(format!("会话不存在: {session_id}"));
+        return Err(format!("CONTENT_SESSION_MISSING: 会话不存在: {session_id}"));
     };
     let path = subagents_dir.join(format!("agent-{subagent_id}.jsonl"));
     if !path.is_file() {
-        return Err(format!("子 agent 转写不存在: {subagent_id}"));
+        return Err(format!(
+            "CONTENT_SUBAGENT_MISSING: 子 agent 转写不存在: {subagent_id}"
+        ));
     }
     let (lines, truncated) = crate::monitor::jsonl::read_recent_lines_with_budget(
         &path,
@@ -1121,6 +1139,21 @@ fn rollout_session_id(path: &Path) -> Option<String> {
         .map(String::from)
 }
 
+/// rollout 首行 session_meta → 会话工作目录（payload.cwd；缺失/损坏 None）。
+/// 解析口径与 rollout_session_id 同款（同读首行 + 同指针取法）。**代价如实申报**：
+/// 本批为最小改动**再读一次首行**（rollout_session_id 已读过一次，两次各自开文件
+/// 读 1 行）；每请求 1 次、微秒级，代价可忽略
+fn rollout_session_cwd(path: &Path) -> Option<String> {
+    let first = crate::monitor::jsonl::read_first_lines(path, 1)
+        .into_iter()
+        .next()?;
+    let v: serde_json::Value = serde_json::from_str(&first).ok()?;
+    v.pointer("/payload/cwd")
+        .and_then(|c| c.as_str())
+        .map(String::from)
+        .filter(|s| !s.is_empty())
+}
+
 fn read_codex_rollout_with(
     home: &Path,
     session_id: &str,
@@ -1130,7 +1163,7 @@ fn read_codex_rollout_with(
     let mut files = Vec::new();
     collect_rollout_files(&sessions_dir, &mut files);
     if files.is_empty() {
-        return Err("codex rollout 目录为空".to_string());
+        return Err("CONTENT_CODEX_ROLLOUT_EMPTY: codex rollout 目录为空".to_string());
     }
     // 快路径：rollout 文件名内嵌 session id（rollout-<ts>-<uuid>.jsonl，实测命名）；
     // 命中后仍读首行校验 payload.id，防同名巧合。快路径未中 → 全量首行匹配兜底
@@ -1155,7 +1188,9 @@ fn read_codex_rollout_with(
         }
     }
     let Some(f) = hit else {
-        return Err(format!("codex rollout 未命中: {session_id}"));
+        return Err(format!(
+            "CONTENT_CODEX_ROLLOUT_MISSING: codex rollout 未命中: {session_id}"
+        ));
     };
     // Bug 1：字节窗随 limit 放大，头部截断经 truncated 上报
     let (lines, truncated) = crate::monitor::jsonl::read_recent_lines_with_budget(
@@ -1163,7 +1198,11 @@ fn read_codex_rollout_with(
         line_budget(limit),
         byte_budget(limit),
     );
-    Ok(page(map_codex_lines(&lines), limit, truncated))
+    let mut pg = page(map_codex_lines(&lines), limit, truncated);
+    // 会话产物批（2026-10-13）：cwd 作相对路径产物的解析基准。这里会**再读一次**
+    // rollout 首行（rollout_session_id 已读过一次）——每请求 1 次、微秒级，代价可忽略
+    pg.cwd = rollout_session_cwd(&f);
+    Ok(pg)
 }
 
 /// Codex rollout 行 → 统一条目（纯函数；codex_entry_kind 的内容版映射）。
@@ -1324,7 +1363,7 @@ fn read_codex_thread_with(
         line_budget(limit)
     );
     let Ok(mut stmt) = conn.prepare(&sql) else {
-        return Err("codex thread_items 表不可查".to_string());
+        return Err("CONTENT_CODEX_THREAD_ITEMS_FAIL: codex thread_items 表不可查".to_string());
     };
     let rows = stmt.query_map([session_id], |row| {
         Ok((
@@ -1334,11 +1373,15 @@ fn read_codex_thread_with(
         ))
     });
     let Ok(rows) = rows else {
-        return Err(format!("codex thread 未命中: {session_id}"));
+        return Err(format!(
+            "CONTENT_CODEX_THREAD_MISSING: codex thread 未命中: {session_id}"
+        ));
     };
     let mut items: Vec<(String, String, Option<i64>)> = rows.filter_map(|r| r.ok()).collect();
     if items.is_empty() {
-        return Err(format!("codex thread 未命中: {session_id}"));
+        return Err(format!(
+            "CONTENT_CODEX_THREAD_MISSING: codex thread 未命中: {session_id}"
+        ));
     }
     items.reverse(); // 「最新在前」→ 文件序
     let mut out = Vec::new();
@@ -1442,18 +1485,22 @@ fn read_kimi_messages_with(
     // resolve_data_root（双参注入，kimi_parser 自用同款），生产薄壳读 env、
     // 测试传 None——内容层自身不读真实进程 env，与并行 env 测试无互斥交集
     let Some(root) = resolve_data_root(env_home, home) else {
-        return Err("kimi 数据根不存在".to_string());
+        return Err("CONTENT_KIMI_ROOT_MISSING: kimi 数据根不存在".to_string());
     };
     let Some(entry) = parse_session_index(&root)
         .into_iter()
         .find(|e| e.session_id == session_id)
     else {
-        return Err(format!("kimi 会话不在索引中: {session_id}"));
+        return Err(format!(
+            "CONTENT_KIMI_NOT_INDEXED: kimi 会话不在索引中: {session_id}"
+        ));
     };
     let session_dir = resolve_session_dir(&root, &entry.session_dir);
     // 信任边界（stat_index_entry 同款）：sessionDir 必须落在 sessions 根之下
     if !session_dir.starts_with(&root.sessions) {
-        return Err(format!("kimi sessionDir 越界: {session_id}"));
+        return Err(format!(
+            "CONTENT_KIMI_SESSIONDIR_ESCAPE: kimi sessionDir 越界: {session_id}"
+        ));
     }
     let wire = session_dir.join("agents").join("main").join("wire.jsonl");
     // Bug 1：字节窗随 limit 放大，头部截断经 truncated 上报（kimi 实测 854KB 胖
@@ -1464,7 +1511,9 @@ fn read_kimi_messages_with(
         byte_budget(limit),
     );
     if lines.is_empty() {
-        return Err(format!("kimi wire.jsonl 不可读: {session_id}"));
+        return Err(format!(
+            "CONTENT_KIMI_WIRE_UNREADABLE: kimi wire.jsonl 不可读: {session_id}"
+        ));
     }
     let msgs = map_kimi_lines(&lines);
     Ok(page(msgs, limit, truncated))
@@ -1873,7 +1922,7 @@ fn read_opencode_messages_with(
          ORDER BY time_created DESC LIMIT {limit}"
     );
     let Ok(mut stmt) = conn.prepare(&sql) else {
-        return Err("opencode message 表不可查".to_string());
+        return Err("CONTENT_OPENCODE_MESSAGE_TABLE_FAIL: opencode message 表不可查".to_string());
     };
     let rows = stmt.query_map([session_id], |row| {
         Ok((
@@ -1883,11 +1932,15 @@ fn read_opencode_messages_with(
         ))
     });
     let Ok(rows) = rows else {
-        return Err(format!("opencode 查询失败: {session_id}"));
+        return Err(format!(
+            "CONTENT_OPENCODE_QUERY_FAIL: opencode 查询失败: {session_id}"
+        ));
     };
     let mut messages: Vec<(String, String, Option<i64>)> = rows.filter_map(|r| r.ok()).collect();
     if messages.is_empty() {
-        return Err(format!("opencode 会话不存在: {session_id}"));
+        return Err(format!(
+            "CONTENT_OPENCODE_SESSION_MISSING: opencode 会话不存在: {session_id}"
+        ));
     }
     messages.reverse(); // 文件序
     let mut out = Vec::new();
@@ -2006,7 +2059,7 @@ fn read_opencode_messages_v2(
          ORDER BY seq DESC LIMIT {limit}"
     );
     let Ok(mut stmt) = conn.prepare(&sql) else {
-        return Err("opencode message 表不可查".to_string());
+        return Err("CONTENT_OPENCODE_MESSAGE_TABLE_FAIL: opencode message 表不可查".to_string());
     };
     let rows = stmt.query_map([session_id], |row| {
         Ok((
@@ -2016,11 +2069,15 @@ fn read_opencode_messages_v2(
         ))
     });
     let Ok(rows) = rows else {
-        return Err(format!("opencode 查询失败: {session_id}"));
+        return Err(format!(
+            "CONTENT_OPENCODE_QUERY_FAIL: opencode 查询失败: {session_id}"
+        ));
     };
     let mut messages: Vec<(String, String, Option<i64>)> = rows.filter_map(|r| r.ok()).collect();
     if messages.is_empty() {
-        return Err(format!("opencode 会话不存在: {session_id}"));
+        return Err(format!(
+            "CONTENT_OPENCODE_SESSION_MISSING: opencode 会话不存在: {session_id}"
+        ));
     }
     messages.reverse(); // seq 升序（文件序）
     let mut out = Vec::new();
@@ -2222,9 +2279,11 @@ mod tests {
     fn dispatch_rejects_unknown_tool_and_empty_session_id() {
         let tmp = tempfile::tempdir().unwrap();
         let r = read_session_messages_with(tmp.path(), "not-a-tool", SID, 200);
-        assert!(r.unwrap_err().contains("未知工具"));
+        assert!(r.unwrap_err().contains("CONTENT_UNKNOWN_TOOL: 未知工具"));
         let r = read_session_messages_with(tmp.path(), "zcode", "  ", 200);
-        assert!(r.unwrap_err().contains("session_id 为空"));
+        assert!(r
+            .unwrap_err()
+            .contains("CONTENT_SESSION_ID_EMPTY: session_id 为空"));
         // 路径穿越防御：claude/workbuddy 文件定位按 id 拼 `.jsonl` 文件名，
         // 分隔符 / .. / NUL 必须在内容层入口 fail-closed
         for evil in ["../../etc/passwd", "a/b", "a\\b", "..", "x\\0y"] {
@@ -2256,6 +2315,32 @@ mod tests {
         assert!(!SessionMessage::text("user", "x", None).collapsed);
         assert!(!SessionMessage::text("assistant", "x", None).collapsed);
         assert!(!SessionMessage::text("tool-result", "x", None).collapsed);
+    }
+
+    /// 序列化面锁（2026-10-13 会话产物批）：cwd=None（其余七工具）时 /session-messages
+    /// 载荷零变化——不得凭空多出 cwd 键；codex 有基准时按 camelCase 透出
+    #[test]
+    fn messages_page_serializes_cwd_only_when_present() {
+        let none_page = MessagesPage {
+            messages: vec![],
+            truncated: false,
+            cwd: None,
+        };
+        let obj = serde_json::to_value(&none_page).unwrap();
+        let obj = obj.as_object().unwrap();
+        assert!(
+            !obj.contains_key("cwd"),
+            "cwd=None 必须 skip 序列化：{obj:?}"
+        );
+        assert_eq!(obj.len(), 2, "载荷恒为 messages + truncated 两键");
+
+        let some_page = MessagesPage {
+            messages: vec![],
+            truncated: false,
+            cwd: Some("/w".to_string()),
+        };
+        let v = serde_json::to_value(&some_page).unwrap();
+        assert_eq!(v["cwd"], serde_json::json!("/w"), "cwd 按原样透出");
     }
 
     // ==== ZCode（tmp sqlite：message + part 表）====
@@ -3246,10 +3331,13 @@ mod tests {
         )
         .unwrap();
         // rollout 只有 meta（无内容条目）→ 应继续落空但不炸
-        let r = read_session_messages_with(tmp.path(), "codex", UUID, 200)
-            .unwrap()
-            .messages;
-        assert!(r.is_empty(), "仅 meta 的 rollout 映射为空");
+        let pg = read_session_messages_with(tmp.path(), "codex", UUID, 200).unwrap();
+        assert!(pg.messages.is_empty(), "仅 meta 的 rollout 映射为空");
+        assert_eq!(
+            pg.cwd.as_deref(),
+            Some("/w"),
+            "rollout 首行 session_meta.payload.cwd 必须透传（会话产物相对路径的解析基准）"
+        );
 
         // (b) APP 线路回退：thread_history sqlite（无 rollout 文件时）
         std::fs::remove_file(&rollout).unwrap();
@@ -3329,6 +3417,43 @@ mod tests {
             200
         )
         .is_err());
+    }
+
+    /// rollout_session_cwd：payload.cwd 透传；缺失/空串/损坏/文件不存在一律 None
+    #[test]
+    fn rollout_session_cwd_reads_payload_cwd_and_tolerates_absent_forms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let with_cwd = write(
+            "a.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"x\",\"cwd\":\"/w\"}}\n",
+        );
+        assert_eq!(rollout_session_cwd(&with_cwd).as_deref(), Some("/w"));
+        let no_cwd = write(
+            "b.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"x\"}}\n",
+        );
+        assert_eq!(
+            rollout_session_cwd(&no_cwd),
+            None,
+            "payload.cwd 缺失 → None"
+        );
+        let empty_cwd = write(
+            "c.jsonl",
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"\"}}\n",
+        );
+        assert_eq!(rollout_session_cwd(&empty_cwd), None, "空串 cwd 视同缺失");
+        let garbage = write("d.jsonl", "not json\n");
+        assert_eq!(rollout_session_cwd(&garbage), None, "损坏首行 → None");
+        assert_eq!(
+            rollout_session_cwd(&tmp.path().join("nope.jsonl")),
+            None,
+            "文件不存在 → None"
+        );
     }
 
     // ==== Kimi（合成 wire 行 + tmp home session_index）====

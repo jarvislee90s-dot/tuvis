@@ -440,6 +440,54 @@ fn reconcile_l4_any_mode_needs_manual() {
     let _ = std::fs::remove_dir_all(&outside);
 }
 
+/// #64-1 别名回归：HOME 路径经 symlink 别名（symlink home / macOS `/var →
+/// /private/var` 同族）而链接目标以真实拼写落在 ~/.tuvis 之下——字面
+/// `starts_with` 两侧拼写不同会把这个 兔维斯 自建链接误报成 L4 外链；修复后
+/// 两侧 canonicalize 归一到真实落点，正确识别为 L3（多链，账本无行）。
+/// 还原动作（变异）：L4 判定改回字面比较 → 本测试红（hit.kind 变 "L4"）。
+#[test]
+fn reconcile_scan_alias_home_no_false_l4() {
+    let _guard = acquire_lock();
+    support::setup();
+    use multi_agents_manager_lib::database;
+    use multi_agents_manager_lib::services::resource::reconcile::scan_drift;
+
+    let tool = "codex";
+    database::set_tool_enabled(tool, true);
+    let real_home = dirs::home_dir().unwrap();
+    let tool_dir = multi_agents_manager_lib::adapter::primary_skill_dir(tool).unwrap();
+    std::fs::create_dir_all(&tool_dir).unwrap();
+    let ssot = real_home.join(".tuvis/skills/v2m2-rc-al4");
+    std::fs::create_dir_all(&ssot).unwrap();
+    let link = tool_dir.join("v2m2-rc-al4");
+    std::os::unix::fs::symlink(&ssot, &link).unwrap(); // 目标用真实拼写（无 assignment 行）
+
+    // 别名 home：alias → 真实 home；HOME 指到别名后 mam_root 按别名词法派生，
+    // 与链接目标的真实拼写形成「拼写不同、落点相同」的误报形态
+    let alias = std::env::temp_dir().join("v2m2-rc-al4-home");
+    let _ = std::fs::remove_file(&alias);
+    std::os::unix::fs::symlink(&real_home, &alias).unwrap();
+    let prev_home = std::env::var("HOME").unwrap_or_default();
+    std::env::set_var("HOME", &alias);
+
+    let items = scan_drift();
+    let hit = items
+        .iter()
+        .find(|d| d.extension_id == "skill-v2m2-rc-al4")
+        .expect("账本无行 + 磁盘 兔维斯 链接 → 应报 L3 多链");
+    assert_eq!(
+        hit.kind, "L3",
+        "别名 home 下 兔维斯 链接应识别为 L3（多链），不得误报 L4 外链: {:?}",
+        hit
+    );
+
+    // 还原 HOME（本文件测试串行，后续用例不受别名影响）+ 现场清理
+    std::env::set_var("HOME", &prev_home);
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_dir_all(&ssot);
+    let _ = std::fs::remove_file(&alias);
+}
+
 /// 批量：reconcile_tool_batch 过滤该工具逐条处置；单条失败不中断；L4 恒 needs_manual
 #[test]
 fn reconcile_batch_filters_tool_and_l4_manual() {

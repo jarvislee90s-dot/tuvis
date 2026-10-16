@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod commands;
 pub mod database;
+pub mod errcode;
 pub mod inject;
 pub mod linker;
 pub mod monitor;
@@ -18,6 +19,21 @@ use tauri::Manager;
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+/// 应用进程本次运行的稳定标识（进程内恒定、跨进程重启必变；首调时刻的纳秒时间戳）。
+/// 桌宠「物理坠落」按应用重启归位（2026-10-13 用户裁决）：前端启动时拿它比对
+/// localStorage 的运行标记，不一致 ⇒ 新一轮运行 ⇒ gravity 重置为关（会话内可再开）。
+/// 纯进程内时间戳，不落盘。
+#[tauri::command]
+fn app_run_id() -> String {
+    static RUN_ID: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_string())
+            .unwrap_or_default()
+    });
+    RUN_ID.clone()
 }
 
 #[tauri::command]
@@ -179,9 +195,10 @@ pub fn run() {
             });
             // M4：全局句柄落位（先于 restore_on_launch——隧道自启即可发通知）
             let _ = crate::remote::events::APP_HANDLE.set(app.handle().clone());
-            // T5：codex 信任门一次性桌面通知——register_all_hooks 在 run() 早期
-            // 执行（彼时 builder 未构建、AppHandle 不可得）只置 pending KV，此处
-            // 句柄就绪后消费：pending 在场才发，一次落地 shown 后永不再弹
+            // T5（2A 改操作卡）：codex 信任门常驻操作卡——register_all_hooks 在
+            // run() 早期执行（彼时 builder 未构建、AppHandle 不可得）只置 pending
+            // KV，此处句柄就绪后消费：pending 且未销账（shown）才弹；销账只发生在
+            // 用户点「复制命令」/「不再提醒」（codex_trust_notice_ack 命令）
             monitor::hooks::consume_codex_trust_notice(app.handle());
             // M2 远程接入：按设置恢复远程服务器（开机自启语义；内部用
             // tauri::async_runtime，无 runtime 上下文的主线程可安全调用）
@@ -209,6 +226,8 @@ pub fn run() {
         .plugin(plugins::system_tray::init());
     let builder = builder.invoke_handler(tauri::generate_handler![
         greet,
+        // 物理坠落按应用重启归位的前端运行标记源（见上方 app_run_id 注释）
+        app_run_id,
         update_tray_menu,
         refresh_tray,
         commands::session::get_all_sessions,
@@ -219,6 +238,8 @@ pub fn run() {
         // M6R–M9R Task 11：R5 一键 resume（桌面卡「在电脑上打开」）
         commands::session::session_open,
         commands::notification::show_notification_window,
+        // 2A：codex 信任门操作卡销账（前端操作卡按钮 ack）
+        commands::notification::codex_trust_notice_ack,
         commands::pet::set_pet_visible,
         commands::pet::set_pet_always_on_top,
         commands::pet::pet_list_pets,

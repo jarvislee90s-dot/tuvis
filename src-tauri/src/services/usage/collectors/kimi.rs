@@ -262,7 +262,7 @@ impl UsageCollector for KimiCollector {
                         }
                         return Err(UsageError::new(
                             "usage-source-io",
-                            format!("读取 {} 失败: {e}", wire.display()),
+                            format!("read {} failed: {e}", wire.display()),
                         ));
                     }
                 };

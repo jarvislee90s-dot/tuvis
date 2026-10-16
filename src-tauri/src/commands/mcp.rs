@@ -12,8 +12,8 @@ pub fn read_mcp_servers(tool_id: String) -> Result<serde_json::Value, String> {
     // 债修复（ZCode 接入轮）：原实现硬编码 claude/codex/opencode 三工具清单，
     // openclaw/kimi/workbuddy 的 MCP 读取全部落「未知工具」错误分支——改走
     // adapter 注册表统一分发（新工具登记后自动纳入，不再逐个补 arm）
-    let adapter =
-        crate::adapter::adapter_by_id(&tool_id).ok_or_else(|| format!("未知工具: {}", tool_id))?;
+    let adapter = crate::adapter::adapter_by_id(&tool_id)
+        .ok_or_else(|| format!("CONTENT_UNKNOWN_TOOL: 未知工具: {}", tool_id))?;
     let path = adapter.mcp_config_path().ok_or("工具不支持 MCP")?;
     let content = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".to_string());
     let raw: serde_json::Value = match adapter.mcp_format() {
@@ -75,7 +75,7 @@ mod read_mcp_servers_registry_tests {
     #[test]
     fn unknown_tool_rejected_via_registry() {
         let err = read_mcp_servers("ghost-tool".to_string()).unwrap_err();
-        assert_eq!(err, "未知工具: ghost-tool");
+        assert_eq!(err, "CONTENT_UNKNOWN_TOOL: 未知工具: ghost-tool");
     }
 
     /// 注册表可达性：TOOL_IDS 全部工具（含 zcode）都能经 adapter_by_id 解析——

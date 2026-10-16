@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
 import { SETTINGS_CARD_TITLE } from "@/components/settings/typography";
+import { TOOL_BRAND_COLORS, TOOL_BRAND_COLORS_DARK } from "@/mobile/board-logic";
+import type { AgentType } from "@/types/session";
 
 // 远程端外观配置器（2026-10-05 UI 改版，spec §5；参考稿
 // docs/design/remote-ui/04-外观配置-设置节-定稿.html）：桌面端保存 → settings KV
@@ -186,26 +188,31 @@ export default function RemoteAppearanceSection() {
 
   const day = SKINS[config.daySkin] ?? SKINS.lpaper;
   const night = SKINS[config.nightSkin] ?? SKINS.npaper;
-  const edgeOf = (tool: string) =>
-    tool === "codex" ? "#10A37F" : tool === "claude" ? "#D97757" : "#8A94A6";
 
-  /** 看板预览卡（边缘点缀四式与移动端 Board 同构） */
+  /** 看板预览卡（边缘点缀四式与移动端 Board 同构）。檐色 = board-logic 台账表
+   *  TOOL_BRAND_COLORS(_DARK)，与移动看板真实渲染**同源**——2026-10-14 评审修正：
+   *  旧硬编码按显示名（"Codex"）比对 tool id，大小写失配从未命中，预览檐色一直
+   *  落灰；本批顺带修活并按台账对标（预览什么色，移动端就是什么色） */
   const BoardCard = ({
     skin,
-    tool,
+    night,
+    toolId,
+    toolLabel,
     title,
     msg,
     badge,
     badgeCls,
   }: {
     skin: typeof day;
-    tool: string;
+    night: boolean;
+    toolId: AgentType;
+    toolLabel: string;
     title: string;
     msg: string;
     badge: string;
     badgeCls: string;
   }) => {
-    const edge = edgeOf(tool);
+    const edge = (night ? TOOL_BRAND_COLORS_DARK[toolId] : TOOL_BRAND_COLORS[toolId]) ?? "#8A94A6";
     return (
       <div
         className="relative overflow-hidden border p-2.5"
@@ -228,7 +235,7 @@ export default function RemoteAppearanceSection() {
         <div className="flex items-center gap-1.5">
           <span className="h-3 w-3 shrink-0 rounded" style={{ background: edge }} />
           <span className="text-[11px] font-semibold" style={{ color: skin.tx }}>
-            {tool}
+            {toolLabel}
           </span>
           <span className="ml-auto font-mono text-[9px]" style={{ color: skin.mut }}>
             2 min
@@ -275,7 +282,9 @@ export default function RemoteAppearanceSection() {
         </div>
         <BoardCard
           skin={skin}
-          tool="Codex"
+          night={mode === "night"}
+          toolId="codex"
+          toolLabel="Codex"
           title={t("settings.remoteAppearance.demoTitle")}
           msg={t("settings.remoteAppearance.demoMsg")}
           badge={t("settings.remoteAppearance.statusWaiting")}

@@ -26,7 +26,7 @@ fn frame_offsets(bytes: &[u8]) -> Vec<usize> {
 pub fn decode_zstd_frames(bytes: &[u8]) -> Result<DecodedFrames, String> {
     let offsets = frame_offsets(bytes);
     if offsets.is_empty() {
-        return Err("dsh log: 未找到 zstd frame 魔数".into());
+        return Err("DSH_LOG_MAGIC_MISSING: dsh log: 未找到 zstd frame 魔数".into());
     }
     let mut text = String::new();
     let mut torn = 0usize;

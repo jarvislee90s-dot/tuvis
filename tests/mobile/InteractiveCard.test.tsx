@@ -82,9 +82,7 @@ describe("InteractiveCard：四套界面共用同一设计语言（T10 验收）
     // 除非再抄一遍容器，那正是本任务要消除的重复）
     const props: InteractiveCardTone[] = ["approve", "question", "plan", "mode"];
     for (const tone of props) {
-      const { unmount } = render(
-        <InteractiveCard tone={tone} testId={`t-${tone}`} title={tone} />
-      );
+      const { unmount } = render(<InteractiveCard tone={tone} testId={`t-${tone}`} title={tone} />);
       expect(screen.getByTestId(`t-${tone}`).getAttribute("data-tone")).toBe(tone);
       unmount();
     }

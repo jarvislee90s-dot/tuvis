@@ -27,6 +27,7 @@ import {
   toolReason,
 } from "@/lib/usage/availability";
 import { EM_DASH, fmtDur, fmtInt, fmtLongest, usageAgentLabel } from "@/lib/usage/format";
+import { getLang } from "@/lib/usage/lang";
 import type { TFn } from "@/lib/usage/range";
 import type { UsageAvailability, WorkSummary } from "@/types/usage";
 
@@ -70,6 +71,8 @@ function ValueRow({
 }
 
 export function UsageWorkSummary({ work, availability, t }: UsageWorkSummaryProps) {
+  // 格式化语言（issue #160）：时长单位词（分钟/秒/毫秒 vs min/s/ms）随界面语言走，组件体取一次。
+  const lang = getLang();
   const sessions = work?.sessions ?? null;
   const turns = work?.turnsPerTool ?? {};
   const longest = work?.longestTurnPerTool ?? {};
@@ -101,7 +104,7 @@ export function UsageWorkSummary({ work, availability, t }: UsageWorkSummaryProp
    * `opencode.error_tool` / `kimi.interrupted` 均为 `false`，且 `availability_table()`
    * 对**每个**指标都挂 7 源全量映射）——**不得**按「哪几行看起来有缺口」写死，也不得一律加。
    * 源一律用**原始源 id** 呈现（① 的 `UsageStatusSection.tsx:239` 先例），**不得**走
-   * `usageAgentLabel`（`AGENT_BADGE` 无 `opencode`，会印成 `?`）。
+   * `usageAgentLabel`（这里是能力缺口诊断，要的是可对账的源 id 而非显示名）。
    * 值本身不可得时这条让位给「不可得原因」（见 `ValueRow` 的 title 取舍）。
    */
   const partialSourcesOf = (av: UsageAvailability | null): string | undefined => {
@@ -130,7 +133,7 @@ export function UsageWorkSummary({ work, availability, t }: UsageWorkSummaryProp
       : null;
   const topMsText =
     topToolMs !== null && isMetricAvailable(topToolMsAv)
-      ? `${topToolMs.name} · ${fmtDur(topToolMs.ms)}`
+      ? `${topToolMs.name} · ${fmtDur(topToolMs.ms, lang)}`
       : null;
 
   /** 段头（`title` 承载该段的全局口径提示） */
@@ -251,10 +254,10 @@ export function UsageWorkSummary({ work, availability, t }: UsageWorkSummaryProp
                     <span>{usageAgentLabel(toolId)}</span>
                     <span className="tabular-nums">
                       <span className="text-muted-foreground">{t("usage.work.p50")}</span>{" "}
-                      {usable === null ? EM_DASH : fmtDur(usable.p50)}
+                      {usable === null ? EM_DASH : fmtDur(usable.p50, lang)}
                       {" · "}
                       <span className="text-muted-foreground">{t("usage.work.max")}</span>{" "}
-                      {usable === null ? EM_DASH : fmtLongest(usable.max)}
+                      {usable === null ? EM_DASH : fmtLongest(usable.max, lang)}
                     </span>
                   </li>
                 );
@@ -283,7 +286,7 @@ export function UsageWorkSummary({ work, availability, t }: UsageWorkSummaryProp
             text={
               work?.toolAvgMs == null || !isMetricAvailable(toolAvgAv)
                 ? null
-                : fmtDur(work.toolAvgMs)
+                : fmtDur(work.toolAvgMs, lang)
             }
             unavailableTitle={metricReason(t, toolAvgAv)}
           />

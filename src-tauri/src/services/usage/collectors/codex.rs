@@ -228,7 +228,7 @@ impl CodexCollector {
                 }
                 return Err(UsageError::new(
                     "usage-source-io",
-                    format!("读取 {} 失败: {e}", path.display()),
+                    format!("read {} failed: {e}", path.display()),
                 ));
             }
         };

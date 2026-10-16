@@ -40,7 +40,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
              DROP TABLE IF EXISTS usage_cursor;
              DROP TABLE IF EXISTS usage_session;",
         )
-        .map_err(|e| format!("重建预览版用量账本失败: {}", e))?;
+        .map_err(|e| format!("MIGRATE_PREVIEW_LEDGER_FAIL: 重建预览版用量账本失败: {}", e))?;
         log::warn!("usage: 检测到预览版账本形状，已重建（四表清空，下次采集重算）");
     }
 
@@ -52,32 +52,32 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     // 检查 extension 表是否有 manifest_path 列
     if !column_exists(conn, "extensions", "manifest_path") {
         conn.execute("ALTER TABLE extensions ADD COLUMN manifest_path TEXT", [])
-            .map_err(|e| format!("迁移失败: {}", e))?;
+            .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
     }
     if !column_exists(conn, "extensions", "permissions") {
         conn.execute("ALTER TABLE extensions ADD COLUMN permissions TEXT", [])
-            .map_err(|e| format!("迁移失败: {}", e))?;
+            .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
     }
     if !column_exists(conn, "extensions", "min_runtime") {
         conn.execute("ALTER TABLE extensions ADD COLUMN min_runtime TEXT", [])
-            .map_err(|e| format!("迁移失败: {}", e))?;
+            .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
     }
 
     // 旧版 extensions 表没有 suite/source_tool/is_native，会导致资源列表和补链读不到历史数据
     if !column_exists(conn, "extensions", "suite") {
         conn.execute("ALTER TABLE extensions ADD COLUMN suite TEXT", [])
-            .map_err(|e| format!("迁移扩展资源字段失败: {}", e))?;
+            .map_err(|e| format!("MIGRATE_EXT_FIELDS_FAIL: 迁移扩展资源字段失败: {}", e))?;
     }
     if !column_exists(conn, "extensions", "source_tool") {
         conn.execute("ALTER TABLE extensions ADD COLUMN source_tool TEXT", [])
-            .map_err(|e| format!("迁移扩展资源字段失败: {}", e))?;
+            .map_err(|e| format!("MIGRATE_EXT_FIELDS_FAIL: 迁移扩展资源字段失败: {}", e))?;
     }
     if !column_exists(conn, "extensions", "is_native") {
         conn.execute(
             "ALTER TABLE extensions ADD COLUMN is_native INTEGER NOT NULL DEFAULT 0",
             [],
         )
-        .map_err(|e| format!("迁移扩展资源字段失败: {}", e))?;
+        .map_err(|e| format!("MIGRATE_EXT_FIELDS_FAIL: 迁移扩展资源字段失败: {}", e))?;
     }
 
     // 预设 v2（spec §4）：presets 补描述/类型/绑定工具三列（新表由 schema.rs IF NOT EXISTS 覆盖）
@@ -96,8 +96,9 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         ),
     ] {
         if !column_exists(conn, "presets", col) {
-            conn.execute(ddl, [])
-                .map_err(|e| format!("迁移 presets.{} 失败: {}", col, e))?;
+            conn.execute(ddl, []).map_err(|e| {
+                format!("MIGRATE_PRESET_COL_FAIL: 迁移 presets.{} 失败: {}", col, e)
+            })?;
         }
     }
 
@@ -118,11 +119,16 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             WHERE kind = 'skill' AND source_tool IS NULL
               AND (source_path LIKE '%/.openclaw/skills/%' OR tags = 'openclaw');",
     )
-    .map_err(|e| format!("回填来源工具失败: {}", e))?;
+    .map_err(|e| format!("MIGRATE_SOURCE_TOOL_FAIL: 回填来源工具失败: {}", e))?;
 
     // 015：native_extensions 表从未被业务写入，移除（历史库中 DROP）
     conn.execute_batch("DROP TABLE IF EXISTS native_extensions;")
-        .map_err(|e| format!("移除 native_extensions 失败: {}", e))?;
+        .map_err(|e| {
+            format!(
+                "MIGRATE_DROP_NATIVE_EXT_FAIL: 移除 native_extensions 失败: {}",
+                e
+            )
+        })?;
 
     // M2（远程接入）：已配对设备表（cookie deviceId 跨重启持久）
     conn.execute_batch(
@@ -138,7 +144,7 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
              revoked INTEGER NOT NULL DEFAULT 0
          );",
     )
-    .map_err(|e| format!("建 remote_devices 失败: {}", e))?;
+    .map_err(|e| format!("MIGRATE_REMOTE_DEVICES_FAIL: 建 remote_devices 失败: {}", e))?;
 
     // M5 A1：设备指纹（sha256(UA|"|"|origin_ip) hex 小写，同浏览器重绑 upsert 的去重键）
     // 与接入通道（ASCII 枚举 "local"|"lan"|"quick"|"named"）两列——
@@ -150,14 +156,14 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             "ALTER TABLE remote_devices ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''",
             [],
         )
-        .map_err(|e| format!("迁移设备指纹列失败: {}", e))?;
+        .map_err(|e| format!("MIGRATE_DEVICE_FINGERPRINT_FAIL: 迁移设备指纹列失败: {}", e))?;
     }
     if !column_exists(conn, "remote_devices", "via") {
         conn.execute(
             "ALTER TABLE remote_devices ADD COLUMN via TEXT NOT NULL DEFAULT ''",
             [],
         )
-        .map_err(|e| format!("迁移设备 via 列失败: {}", e))?;
+        .map_err(|e| format!("MIGRATE_DEVICE_VIA_FAIL: 迁移设备 via 列失败: {}", e))?;
     }
 
     // ---- 用量账本（计划①）②：其余列逐列补齐 ----
@@ -214,8 +220,9 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         ),
     ] {
         if !column_exists(conn, table, col) {
-            conn.execute(ddl, [])
-                .map_err(|e| format!("迁移 {}.{} 失败: {}", table, col, e))?;
+            conn.execute(ddl, []).map_err(|e| {
+                format!("MIGRATE_TABLE_COL_FAIL: 迁移 {}.{} 失败: {}", table, col, e)
+            })?;
         }
     }
     // 老库 day_key 空串回填（派生列口径：strftime 不可用于 'YYYY-MM-DDTHH' 形态，用 substr）
@@ -223,7 +230,12 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         "UPDATE usage_detail SET day_key = substr(hour_key, 1, 10) WHERE day_key = ''",
         [],
     )
-    .map_err(|e| format!("回填 usage_detail.day_key 失败: {}", e))?;
+    .map_err(|e| {
+        format!(
+            "MIGRATE_USAGE_DAYKEY_FAIL: 回填 usage_detail.day_key 失败: {}",
+            e
+        )
+    })?;
 
     Ok(())
 }

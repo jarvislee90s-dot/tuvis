@@ -1458,15 +1458,18 @@ mod tests {
     /// 除 verify（Task 7 占位）外全 done；CLI 读不到时 fail-closed + blocked_reason
     /// 如实说明，绝不把读不到伪装成完成或卡死
     ///
-    /// **平台门控（2026-10-07 存量债清理，Linux CI 门禁）**：本用例的期望建立在
-    /// **macOS/Windows 的步骤表**上——它按 id 取 `sys_ext` 步（一键配置特有），而
-    /// `current_platform()` 在 Linux 返回 `Platform::Other`，步骤表里没有该步 ⇒ 以
-    /// 「缺步骤 sys_ext」失败。一键配置向导只对 macOS/Windows 实现（产品只发这两个平台），
-    /// 故按平台门控。**不是静默跳过**：Linux 上它在 `cargo test` 里以 "N ignored" 可见，
-    /// 并可用 `--ignored` 显式跑（会如实失败，那正是本门控要记在案的那件事）。
+    /// **平台门控（2026-10-07 存量债清理，Linux CI 门禁）**：本用例的期望步骤表
+    /// **平台感知地取自 `wizard_steps(current_platform())`**——2026-10-13 修：原硬编码
+    /// 期望清单无条件含 `sys_ext`（macOS 独有步），与「Windows 步骤表恰少该步」相矛盾
+    /// （Windows 上必以「缺步骤 sys_ext」失败）；现与生产及
+    /// `windows_has_exactly_one_fewer_step_than_macos` 用例同源，不再另立第三份清单。
+    /// 一键配置向导只对 macOS/Windows 实现（产品只发这两个平台），而
+    /// `current_platform()` 在 Linux 返回 `Platform::Other`，不在支持面内，故按平台门控。
+    /// **不是静默跳过**：Linux 上它在 `cargo test` 里以 "N ignored" 可见，
+    /// 并可用 `--ignored` 显式跑。
     #[cfg_attr(
         not(any(target_os = "macos", target_os = "windows")),
-        ignore = "平台不适用：步骤表按平台给，sys_ext 只对 macOS/Windows 存在（current_platform() 在 Linux = Platform::Other）"
+        ignore = "平台不适用：步骤表按平台给，sys_ext 只对 macOS 存在（current_platform() 在 Linux = Platform::Other）"
     )]
     #[test]
     fn probe_steps_marks_each_criterion_honestly() {
@@ -1525,7 +1528,16 @@ mod tests {
             assert!(!s.done, "{id} 未装不得判完成");
             assert_eq!(s.blocked_reason, None, "{id} 是待做不是卡住: {s:?}");
         }
-        for id in ["sys_ext", "login", "shields_up", "funnel"] {
+        // 读不到须如实报「卡住 + 原因」的候选步里，期望清单按平台从 wizard_steps 取
+        // （单一事实源）：Windows 比 macOS 恰少 sys_ext 一步（与
+        // windows_has_exactly_one_fewer_step_than_macos 锁死的平台差异一致），不在此
+        // 再立第三份硬编码清单
+        let cli_blind: Vec<&str> = wizard_steps(current_platform())
+            .iter()
+            .map(|s| s.id)
+            .filter(|id| ["sys_ext", "login", "shields_up", "funnel"].contains(id))
+            .collect();
+        for id in cli_blind {
             let s = state_of(&v, id);
             assert!(!s.done, "{id} 读不到状态不得判完成");
             assert!(
@@ -2565,6 +2577,145 @@ mod tests {
             calls.lock().unwrap()
         );
         teardown_globals();
+    }
+
+    /// 连不通类失败**不自愈**（2026-10-13 用户裁决）：「地址已解析但连不通」说明 DNS
+    /// 记录在、配置在，成因是到公网中继入口的链路瞬时抖动（真机实测 60s 轮询自愈）——
+    /// reset 只会把完好配置清掉再重发布 30–49 秒。verify 步必须原样返回该 Failed、
+    /// 一个写动作都不发。
+    /// 变异锚点：删掉 verify_with_heal 的 ADDR_UNREACHABLE_PREFIX 拦截分支 → ②③必红。
+    #[test]
+    fn run_step_verify_unreachable_class_does_not_heal() {
+        let _g = test_lock();
+        *DESIRED.lock().unwrap() = Some(9420); // 通道开着——旧实现正是在这态才自愈
+        let calls = spy_cli(|args: &[&str]| match args {
+            ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+            other => Err(format!("测试未应答的 CLI 调用: {other:?}")),
+        });
+        // 解析得到记录 + 钉 IP 逐条连不通 → 「地址已解析但连不通」类 Failed
+        set_verify_probe_override(Some(Box::new(|_h: &str| {
+            Ok(vec!["203.0.113.1".into(), "203.0.113.2".into()])
+        })));
+        set_http_probe_override(Some(Box::new(|_h, _ip| {
+            Err("error sending request for url (https://a.ts.net/m)".into())
+        })));
+
+        run_step("verify", 9420).expect("verify 应 Ok");
+        // ① 结果如实是连不通类 Failed（前缀 + 逐条失败明细）
+        match reachability() {
+            Reachability::Failed { reason } => {
+                assert!(
+                    reason.starts_with(ADDR_UNREACHABLE_PREFIX) && reason.contains("203.0.113.1"),
+                    "{reason}"
+                );
+            }
+            other => panic!("应 Failed: {other:?}"),
+        }
+        // ②③ 一个写动作都不发：不 reset、不重开、连自愈守卫读数都不该有
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == &["funnel".to_string(), "reset".to_string()]),
+            "连不通类不得 funnel reset: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with(&["funnel".to_string(), "--bg".to_string()])),
+            "连不通类不得重开 Funnel: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c
+                == &[
+                    "funnel".to_string(),
+                    "status".to_string(),
+                    "--json".to_string()
+                ]),
+            "连不通类不得进入自愈（守卫读数都不发生）: {calls:?}"
+        );
+        teardown_globals();
+    }
+
+    /// 对照上一条：**其他**失败（DoH 全挂 → 无法验证）仍走自愈——reset+重开的意义在
+    /// 「真故障时触发记录重发布」（2026-10-06 实测机理），2026-10-13 裁决只收窄连不通类。
+    #[test]
+    fn run_step_verify_other_failure_still_heals() {
+        let _g = test_lock();
+        *DESIRED.lock().unwrap() = Some(9420);
+        let calls = spy_cli(|args: &[&str]| match args {
+            ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+            ["funnel", "status", "--json"] => Ok("{}".into()),
+            ["funnel", "reset"] => Ok(String::new()),
+            ["set", "--shields-up=false"] => Ok(String::new()),
+            ["get", "--json"] => Ok(r#"{"shields-up": false}"#.into()),
+            ["funnel", "--bg", "9420"] => Ok(String::new()),
+            ["funnel", "status"] => Ok(String::new()),
+            other => Err(format!("测试未应答的 CLI 调用: {other:?}")),
+        });
+        // DoH 全挂 → Failed「无法验证地址…」（不是连不通类）
+        set_verify_probe_override(Some(Box::new(|_h: &str| {
+            Err("3 个 DoH 源均无有效应答: 223.5.5.5、223.6.6.6、1.12.12.12".into())
+        })));
+
+        run_step("verify", 9420).expect("verify 应 Ok");
+        assert!(
+            matches!(reachability(), Reachability::Failed { ref reason } if reason.contains("无法验证")),
+            "自愈后仍验不过 → 如实 Failed: {:?}",
+            reachability()
+        );
+        let calls = calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &["funnel".to_string(), "reset".to_string()]),
+            "其他失败仍须 funnel reset（自愈正路）: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &["funnel".to_string(), "--bg".to_string(), "9420".to_string()]),
+            "其他失败仍须重开 Funnel: {calls:?}"
+        );
+        teardown_globals();
+    }
+
+    /// [`reach::error_with_source`]：reqwest 顶层 Display 只给「error sending request」，
+    /// source 链首层才是真实成因（tcp 超时 / TLS / 重置）——2026-10-13 实机定位的
+    /// 盲区补齐。纯函数：有 source 拼「（底层: …）」，无 source 原样返回。
+    #[test]
+    fn error_with_source_appends_first_source_layer() {
+        #[derive(Debug)]
+        struct Inner(&'static str);
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for Inner {}
+        #[derive(Debug)]
+        struct Outer(&'static str, Option<Inner>);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_ref().map(|i| i as _)
+            }
+        }
+        assert_eq!(
+            error_with_source(&Outer(
+                "error sending request",
+                Some(Inner("tcp connect timeout"))
+            )),
+            "error sending request（底层: tcp connect timeout）"
+        );
+        assert_eq!(
+            error_with_source(&Outer("error sending request", None)),
+            "error sending request"
+        );
     }
 
     /// **I1（2026-10-07 评审）自愈的 `funnel reset` 必须记账**：自愈动作就是
@@ -4191,7 +4342,7 @@ mod tests {
         );
         let e = r.unwrap_err();
         assert!(
-            e.contains("当前平台暂不支持一键配置"),
+            e.contains("TSWIZ_PLATFORM_UNSUPPORTED: 当前平台暂不支持一键配置"),
             "Other 平台必须如实说「不支持」而不是「sha256 校验失败」: {e}"
         );
         assert!(!e.contains("sha256"), "不得落到误导文案: {e}");

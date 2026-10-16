@@ -72,13 +72,22 @@ pub fn validate_pet_id(id: &str) -> Result<(), PetRpcError> {
             "宠物名与 Windows 保留设备名冲突",
         ));
     }
-    if id.eq_ignore_ascii_case("foxbell") {
+    if is_builtin_pet(id) {
         return Err(PetRpcError::new(
             "pet-name-reserved",
-            "foxbell 为内置宠物保留名",
+            "该名称为内置宠物保留名",
         ));
     }
     Ok(())
+}
+
+/// 内置名称由静态资源提供，不允许外部目录覆盖（大小写不敏感）。
+/// 与前端注册表对齐：src/components/pet/petRuntime.ts 的 BUILTIN_PET_DEFS
+/// （id 形如 builtin-<目录名>）；"foxbell" 是 0.5.x 无前缀旧 id，保留禁用防旧目录冲突。
+pub fn is_builtin_pet(id: &str) -> bool {
+    ["builtin-foxbell", "builtin-tuvis-3d", "foxbell"]
+        .iter()
+        .any(|builtin| id.eq_ignore_ascii_case(builtin))
 }
 
 /// 启动清扫 .import-staging 残留（崩溃/强杀留下的半截导入与 petdex 解压中间产物，
@@ -250,6 +259,10 @@ mod tests {
             ("a/b", "pet-name-illegal"),
             ("foxbell", "pet-name-reserved"),
             ("FoxBell", "pet-name-reserved"),
+            ("builtin-foxbell", "pet-name-reserved"),
+            ("Builtin-FoxBell", "pet-name-reserved"),
+            ("builtin-tuvis-3d", "pet-name-reserved"),
+            ("Builtin-Tuvis-3D", "pet-name-reserved"),
         ];
         for (id, code) in cases {
             match validate_pet_id(id) {
@@ -257,7 +270,7 @@ mod tests {
                 Ok(()) => panic!("id {id:?} 应被拒绝"),
             }
         }
-        for ok in ["starry-dew", "abc_123-X", "A9"] {
+        for ok in ["starry-dew", "abc_123-X", "A9", "tuvis-3d"] {
             validate_pet_id(ok).unwrap_or_else(|e| panic!("合法 id {ok:?} 被误拒: {:?}", e.code));
         }
     }

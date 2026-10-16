@@ -463,6 +463,23 @@ pub(crate) fn record_pending_hint(republish: bool) -> &'static str {
 pub(crate) const RECOVERING_HINT: &str =
     "Tailscale 后端正在重连（开机后通常 1–2 分钟）——配置与地址都不会变，无需任何操作";
 
+/// 「地址已解析但连不通」类失败的 reason 前缀（[`verify_reachability`] 尾部格式串）。
+/// **2026-10-13 用户裁决**：这类失败**不再触发 funnel reset 自愈**——它说明 DNS 记录在、
+/// 配置在，成因是到公网中继入口的链路瞬时抖动（真机实测：两个入口同设施、常一起失败，
+/// 60s 轮询复验自愈），reset 只会把完好配置清掉再重发布 30–49 秒。前端
+/// tsTransientHint 引导文案锚定同一前缀（reason 恒中文），两处需同步维护。
+pub(super) const ADDR_UNREACHABLE_PREFIX: &str = "REACH_ADDR_UNREACHABLE: 地址已解析但连不通";
+
+/// 每轮校验结论落一行日志——2026-10-13 真机定位的盲区：remote 模块原先不写任何日志，
+/// 可达性失败没有时间线留痕，故障窗口只能事后观测反推。INFO 记常态、Failed 用 WARN
+/// 突出（测试构建无 logger，log 宏为 no-op，不产生测试噪音）。
+fn log_reach(cycle: &str, host: &str, r: &Reachability) {
+    match r {
+        Reachability::Failed { reason } => log::warn!("{cycle}（{host}）: failed —— {reason}"),
+        other => log::info!("{cycle}（{host}）: {other:?}"),
+    }
+}
+
 /// 尾网之外的可达性校验：**先看公网有没有记录，再试着接通**。
 /// 两者缺一即失败——只有记录但连不通，说明上游还没ready。
 /// 解析层三态各有各的成因（A3 + W-B 分档）：全源不可用 → 「无法验证」（不是"记录未发布"）；
@@ -505,7 +522,7 @@ pub(super) fn verify_reachability(host: &str, probe: &ProbeFn) -> Reachability {
     }
     Reachability::Failed {
         reason: format!(
-            "地址已解析但连不通（试了 {} 条）: {}",
+            "{ADDR_UNREACHABLE_PREFIX}（试了 {} 条）: {}",
             errs.len(),
             errs.join("; ")
         ),
@@ -540,6 +557,16 @@ pub(super) fn mam_response_ok(status: u16, marker: Option<&str>) -> Result<(), S
     }
 }
 
+/// 错误串 + source 链首层（纯函数，可测）。reqwest 的 `error sending request for url (…)`
+/// 顶层 Display 压着 hyper/rustls 的真实成因（tcp 连接超时 / TLS 握手失败 / 连接被重置），
+/// 只留顶层就无法区分「超时」与「被掐」——2026-10-13 实机定位时正是这个盲区。
+pub(super) fn error_with_source(e: &dyn std::error::Error) -> String {
+    match e.source() {
+        Some(src) => format!("{e}（底层: {src}）"),
+        None => e.to_string(),
+    }
+}
+
 /// 用解析到的公网地址**钉住 IP** 去请求 兔维斯 看板入口（绕过本机 DNS 与本地代理），
 /// 并要求响应带 **兔维斯 特征**（[`mam_response_ok`]）——「链路通了」不等于「兔维斯 答了」。
 /// **不校验响应体内容**（那是前端产物的事，且会随构建漂移）；判据只用服务端写死的特征头
@@ -556,13 +583,13 @@ fn probe_http(host: &str, ip: &str) -> Result<(), String> {
         .resolve(host, std::net::SocketAddr::new(addr, 443))
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| error_with_source(&e))?;
     // 请求**看板地址**（`/m`）而不是根路径：特征头由 entry_response 写在那里，
     // 而根路径在 兔维斯 侧本就没有入口（非 /m 前缀 → 404）
     let resp = client
         .get(format!("https://{host}/m"))
         .send()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| error_with_source(&e))?;
     let status = resp.status().as_u16();
     let marker = resp
         .headers()
@@ -686,9 +713,13 @@ pub(super) fn probe_addresses(
 fn do_verify(host: &str) -> Reachability {
     #[cfg(test)]
     if let Some(f) = VERIFY_PROBE_OVERRIDE.lock().unwrap().as_ref() {
-        return verify_reachability(host, f);
+        let r = verify_reachability(host, f);
+        log_reach("手动校验", host, &r);
+        return r;
     }
-    verify_reachability(host, real_probe())
+    let r = verify_reachability(host, real_probe());
+    log_reach("手动校验", host, &r);
+    r
 }
 
 /// 钉 IP 探测的行为替身类型（clippy type_complexity 收敛别名）
@@ -756,11 +787,21 @@ pub(super) fn verify_with_heal(port: u16) -> Reachability {
     {
         return r;
     }
+    // 连不通类同样**不自愈**（2026-10-13 用户裁决，判据见 [`ADDR_UNREACHABLE_PREFIX`]）：
+    // 记录在、配置在，成因是公网链路瞬时抖动——reset 只会把好配置清掉再重发布 30–49 秒；
+    // 60s 轮询复验自会恢复（前端同场景挂 tsTransientHint 引导，重试不再变成配置重置）。
+    if matches!(&r, Reachability::Failed { reason } if reason.starts_with(ADDR_UNREACHABLE_PREFIX))
+    {
+        return r;
+    }
     heal_and_reverify(port)
 }
 
 /// 失败时自动尝试自愈：**重置 Funnel 后重新开启**——2026-10-06 实测这一招能
 /// 触发解析记录重新发布。仍失败才报错（§C3 要求 3）。
+/// **2026-10-13 收窄**：连不通类失败（记录在、配置在，成因是公网链路抖动）已被
+/// [`verify_with_heal`] 拦在门外——能走到这里的失败 = 记录缺失 / 读不到域名 /
+/// 后端就绪后的其他真故障，reset 才有意义。
 /// **守卫先行（与 stop_inner 同红线）**：配置是外来的绝不 `funnel reset`——它清
 /// 整份 serve 配置；拒绝时如实报错，不掩盖（简报草稿里 reset 在守卫前，此处修正：
 /// 否则 reset 先把外来配置清掉，守卫形同虚设）。
@@ -871,6 +912,7 @@ pub(super) fn failure_event_reason(prev: &Reachability, next: &Reachability) -> 
 pub(super) fn reverify_with(host: &str, probe: &ProbeFn) -> Reachability {
     let prev = reachability();
     let r = verify_reachability(host, probe);
+    log_reach("轮询复验", host, &r);
     set_reachability(r.clone());
     if let Some(reason) = failure_event_reason(&prev, &r) {
         crate::remote::events::emit_ui(

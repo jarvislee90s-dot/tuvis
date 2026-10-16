@@ -14,6 +14,35 @@
 - 代码标识符使用英文，代码注释尽量使用中文
 - Git commit message 可使用英文
 
+## 发版文档纪律（2026-10-16 用户裁决）
+
+**每次发布正式版前，两轮检查缺一不可；未过关不得打 tag。**
+
+### ① 变更覆盖检查（diff 驱动，先做）
+
+对上一版 tag 执行 `git log vX.Y.Z..HEAD` / `git diff vX.Y.Z..HEAD`，梳理本版**全部变更**
+（逐 commit 归类，先交用户确认无遗漏），再逐项核对三份发版文档是否覆盖：
+
+- `CHANGELOG.md` 本版小节：全部变更入库（工程质量类可合并叙述，但不漏项）
+- `docs/release-notes/vX.Y.Z.md`：用户可感知变更全覆盖；行为变更（默认值变化、设置迁移、
+  快捷键/入口变化等）必须写进「升级须知」
+- `README.md`：功能概览与受影响的功能章节反映最新行为（新功能补入概览、行为变更就地更新）
+
+### ② 中英对照检查
+
+覆盖全部双语资产；本轮带中文改动的条目，英文侧必须同步刷新（经用户确认后可由代理翻译）：
+
+| 双语资产 | 中文侧 | 英文侧 | 说明 |
+| --- | --- | --- | --- |
+| 前端页面文案 | `src/i18n/locales/zh.json` | `src/i18n/locales/en.json` | `pnpm check:i18n` 只保**键集**一致，键下的英文值漂移不报，须逐键比对 |
+| 项目 README | `README.md` | `README.en.md` | 无门禁，人工/代理核对 |
+| 用户手册（官网 `/docs` 挂载） | `docs/user-manual/zh/`（13 章） | `docs/user-manual/en/` | 无门禁；en 曾为骨架，至少核对本版有变动的章节 |
+
+检查方法：对上一版 tag 执行 `git diff vX.Y.Z..HEAD -- <上述路径>`，列出本轮全部中文改动逐条核对。
+配套的发版同步义务（单语，不涉对照）：`docs/capabilities.json` 与 README「多终端能力矩阵」
+**两处随发版同步更新**（官网拉取前者渲染兼容矩阵）；`CHANGELOG.md` 与
+`docs/release-notes/vX.Y.Z.md` 为纯中文产物，不要求英文对照。
+
 ## 技术栈
 - Tauri 2 + Rust + React 19 + TypeScript + shadcn/ui + Tailwind CSS v4
 

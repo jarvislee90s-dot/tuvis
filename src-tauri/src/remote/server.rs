@@ -776,7 +776,7 @@ pub fn router_with_static(state: Arc<RemoteState>) -> Router {
 pub async fn serve(bind: &str, port: u16, state: Arc<RemoteState>) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind((bind, port))
         .await
-        .map_err(|e| format!("绑定 {bind}:{port} 失败: {e}"))?;
+        .map_err(|e| format!("RSERVER_BIND_FAIL: 绑定 {bind}:{port} 失败: {e}"))?;
     // M3 Task 5：事件桥在**绑定成功后**启动（幂等——全局 Once 保证扫描循环全进程只
     // spawn 一次）。放在 bind 之后：端口被占等启动失败不遗留 2s 会话扫描（扫描是重活，
     // 见 adapter::get_all_sessions 的单飞护栏注释）；watcher 生命周期随进程结束，
@@ -1387,12 +1387,15 @@ mod tests {
             body.contains("<!doctype html>"),
             "/m 应返回入口 HTML，实际 {body:?}"
         );
+        // 锚「远程」而非具体品牌词：移动端标题现为「Tuvis 远程」（df5a7fec 品牌切换），
+        // 桌面 index 标题「Tuvis」不含「远程」——防串台判据不依赖品牌字样，下次微调不脆断
         assert!(
-            body.contains("tuvis"),
-            "入口应是 mobile.html 产物（含品牌标识；标题文案随品牌批在「兔维斯远程/Tuvis 远程」间合法变动，不写死）"
+            body.contains("远程"),
+            "入口应是 mobile.html 产物（含移动端标题）"
         );
 
-        // (2) PWA manifest → 200 + application/json（文件名随品牌批 manifest-mam → manifest）
+        // (2) PWA manifest → 200 + application/json（df5a7fec 品牌切换已把
+        // manifest-mam.json 改名 manifest.json，测试 URL 随产物对齐）
         let r = app
             .clone()
             .oneshot(req("GET", "/m/manifest.json", None, None))
@@ -2059,6 +2062,7 @@ mod tests {
                             },
                         ],
                         truncated: false,
+                        cwd: None,
                     })
                 } else {
                     Err("内部路径细节不应出现在响应里".to_string())
@@ -4176,7 +4180,7 @@ mod tests {
                 None => Ok(()),
             }
         }
-        fn locate_and_send_key(&self, pid: u32, key: &str) -> Result<(), String> {
+        fn locate_and_send_key_inner(&self, pid: u32, key: &str) -> Result<(), String> {
             self.key_calls.lock().unwrap().push((pid, key.to_string()));
             match self.fail {
                 Some(e) => Err(e.to_string()),
@@ -4666,6 +4670,7 @@ mod tests {
                 Some(p) => Ok(crate::remote::content::MessagesPage {
                     messages: p.clone(),
                     truncated: false,
+                    cwd: None,
                 }),
                 None => Err("测试桩：未注入内容源".to_string()),
             }),
@@ -5734,7 +5739,8 @@ mod tests {
         assert_eq!(r.status(), 200);
         let body = body_string(r).await;
         assert!(
-            body.contains("\"status\":\"failed\"") && body.contains("投递进行中，请稍后重试"),
+            body.contains("\"status\":\"failed\"")
+                && body.contains("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"),
             "in-flight 占用时撤回应 200 failed 短回执：{body}"
         );
         assert_eq!(fake.recorded().len(), 0, "占用期间不得注入");
@@ -7152,7 +7158,8 @@ mod tests {
         assert_eq!(r.status(), 200);
         let body = body_string(r).await;
         assert!(
-            body.contains("\"status\":\"failed\"") && body.contains("投递进行中，请稍后重试"),
+            body.contains("\"status\":\"failed\"")
+                && body.contains("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"),
             "in-flight 占用时 approve 应 200 failed 让位：{body}"
         );
         assert!(
@@ -10907,7 +10914,7 @@ mod tests {
             }
             r
         }
-        fn locate_and_send_key(&self, pid: u32, key: &str) -> Result<(), String> {
+        fn locate_and_send_key_inner(&self, pid: u32, key: &str) -> Result<(), String> {
             let r = self.inner.locate_and_send_key(pid, key);
             if r.is_ok() && !self.failing {
                 self.script.advance();
@@ -11381,7 +11388,7 @@ mod tests {
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].action, "answer");
         assert_eq!(
-            audits[0].result, "failed:方向键 down 投递失败（注入通道拒绝）",
+            audits[0].result, "failed:INJECT_DELIVERY_FAIL: 方向键 down 投递失败（注入通道拒绝）",
             "审计 result = failed:错误文案（与批次丙同前缀口径；2026-09-24 走位方向感知后文案带键名）"
         );
         assert_eq!(audits[0].summary, "submit", "投递失败不追加段名");
@@ -11996,7 +12003,8 @@ mod tests {
         assert_eq!(r.status(), 200);
         let body = body_string(r).await;
         assert!(
-            body.contains("\"status\":\"failed\"") && body.contains("投递进行中，请稍后重试"),
+            body.contains("\"status\":\"failed\"")
+                && body.contains("RAPI_DELIVERY_BUSY: 投递进行中，请稍后重试"),
             "in-flight 占用时问答应 200 failed 让位：{body}"
         );
         assert!(
@@ -12027,11 +12035,13 @@ mod tests {
                 "sess_ay" => Ok(crate::remote::content::MessagesPage {
                     messages: vec![auq_tool_call(0, Q_TWO_QUESTIONS_PAYLOAD)],
                     truncated: false,
+                    cwd: None,
                 }),
                 // kimi：同形（本机 wire 的 3 问题实录缩录为 2 题）
                 "sess_az" => Ok(crate::remote::content::MessagesPage {
                     messages: vec![auq_tool_call(0, KIMI_TWO_Q_PAYLOAD)],
                     truncated: false,
+                    cwd: None,
                 }),
                 _ => Err("无消息".to_string()),
             }),
@@ -12725,7 +12735,7 @@ mod tests {
         // INFLIGHT 守卫按裸 id 全局占用（守卫 id 立规注）：并行测试偶尔让位 →
         // 「投递进行中」是良性可重试态（2026-10-05 起连续全量命中的已知 flaky
         // 根治——仅测试侧重试，生产语义零改动）
-        if body.contains("投递进行中") {
+        if body.contains("RAPI_DELIVERY_BUSY: 投递进行中") {
             let r = app
                 .clone()
                 .oneshot(req(
@@ -13185,6 +13195,7 @@ mod tests {
         let page = crate::remote::content::MessagesPage {
             messages: vec![user_msg(0), auq_tool_call(1, Q_SINGLE_PAYLOAD)],
             truncated: false,
+            cwd: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -13256,6 +13267,7 @@ mod tests {
                 tool_result_msg(1, "Your questions have been answered: \"q\"=\"Tool demo\"."),
             ],
             truncated: false,
+            cwd: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -13321,6 +13333,7 @@ mod tests {
         let page = crate::remote::content::MessagesPage {
             messages: vec![auq_tool_call(0, Q_SINGLE_PAYLOAD)],
             truncated: false,
+            cwd: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -13366,6 +13379,7 @@ mod tests {
         let page = crate::remote::content::MessagesPage {
             messages: vec![user_msg(0), auq_tool_call(1, Q_SINGLE_PAYLOAD)],
             truncated: false,
+            cwd: None,
         };
         // 2026-10-03：select 走焦点守卫编排 → 需要屏读缝（焦点在选项行 → 守卫不触发）
         let probe_screen = screen_fixtures::multi_option_focus();
@@ -13429,6 +13443,7 @@ mod tests {
                 tool_result_msg(1, "Your questions have been answered: \"q\"=\"Tool demo\"."),
             ],
             truncated: false,
+            cwd: None,
         };
         let state = question_state_with_msgs(
             fake.clone(),
@@ -13512,6 +13527,7 @@ mod tests {
                 plan_msg(1, "# 《末班车》情感救赎版改写方案\n\n## Summary\n改写重点…"),
             ],
             truncated: false,
+            cwd: None,
         }
     }
 
@@ -13520,6 +13536,7 @@ mod tests {
         crate::remote::content::MessagesPage {
             messages: vec![user_msg(0), plan_msg(1, "# 计划"), user_msg(2), user_msg(3)],
             truncated: false,
+            cwd: None,
         }
     }
 
@@ -13543,6 +13560,7 @@ mod tests {
                 tool_result_msg(4, "Exited plan mode."),
             ],
             truncated: false,
+            cwd: None,
         }
     }
 
@@ -13645,6 +13663,7 @@ mod tests {
                         ),
                     ],
                     truncated: false,
+                    cwd: None,
                 }),
                 "sess_av" => Ok(plan_then_tool_event_page()),
                 _ => Err("无消息".to_string()),
@@ -13746,6 +13765,7 @@ mod tests {
                         },
                     ],
                     truncated: false,
+                    cwd: None,
                 }),
                 _ => Err("无消息".to_string()),
             }),
@@ -13952,6 +13972,7 @@ mod tests {
                 "sess_bh" => Ok(crate::remote::content::MessagesPage {
                     messages: vec![user_msg(0), plan_msg(1, "# 执行计划")],
                     truncated: false,
+                    cwd: None,
                 }),
                 _ => Err("无消息".to_string()),
             }),
@@ -14147,6 +14168,7 @@ mod tests {
                         plan_msg(3, "# 新版计划（审批中）"),
                     ],
                     truncated: false,
+                    cwd: None,
                 }),
                 // 审批已关：计划之后有工具事件（ExitPlanMode 回执）→ 预期态清除
                 "sess_ax" => Ok(plan_then_tool_event_page()),
@@ -19263,6 +19285,7 @@ mod tests {
                         collapsed: false,
                     }],
                     truncated: false,
+                    cwd: None,
                 })
             }),
         );

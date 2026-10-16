@@ -10,6 +10,7 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { toast } from "sonner";
 import { useAppTranslation } from "@/hooks/use-app-translation";
+import { formatInvokeError } from "@/lib/invokeError";
 
 export function useRemoteEvents() {
   const { t } = useAppTranslation();
@@ -33,8 +34,13 @@ export function useRemoteEvents() {
       unlisten.push(
         await listen<{ error: string }>("remote-tunnel-error", async (e) => {
           // spec T1b：守护放弃时桌面通知报错（toast 在窗口隐藏时不可见——双通道）
-          await notify(t("settings.remote.tunnelErrorTitle"), e.payload.error);
-          toast.error(t("settings.remote.tunnelErrorToast", { error: e.payload.error }));
+          await notify(
+            t("settings.remote.tunnelErrorTitle"),
+            formatInvokeError(e.payload.error, t)
+          );
+          toast.error(
+            t("settings.remote.tunnelErrorToast", { error: formatInvokeError(e.payload.error, t) })
+          );
         })
       );
       unlisten.push(
@@ -47,8 +53,15 @@ export function useRemoteEvents() {
       unlisten.push(
         await listen<{ error: string }>("remote-toggle-failed", async (e) => {
           // spec T4：托盘开关失败「桌面通知报错」——toast + 系统通知双通道
-          await notify(t("settings.remote.toggleFailedTitle"), e.payload.error);
-          toast.error(t("settings.remote.toggleFailedToast", { error: e.payload.error }));
+          await notify(
+            t("settings.remote.toggleFailedTitle"),
+            formatInvokeError(e.payload.error, t)
+          );
+          toast.error(
+            t("settings.remote.toggleFailedToast", {
+              error: formatInvokeError(e.payload.error, t),
+            })
+          );
         })
       );
     })();

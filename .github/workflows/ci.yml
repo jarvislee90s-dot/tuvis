@@ -33,6 +33,10 @@ jobs:
           filters: |
             frontend:
               - "src/**"
+              # 错误码门禁在 frontend job 同时消费 Rust/TS 源；后端独改也必须触发。
+              - "src-tauri/src/**"
+              - "scripts/**"
+              - "eslint.config.js"
               - "tests/**"
               - "index.html"
               - "mobile.html"
@@ -84,6 +88,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm format:check
+      - run: pnpm check:i18n
+      - run: node scripts/check-error-codes.mjs
       - run: pnpm build
       - run: pnpm test
 

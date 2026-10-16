@@ -1,7 +1,13 @@
-// 品牌图标 — path 取自 assets/icons/*.svg（simple-icons / opencode 官网），currentColor 随文字色
+// 品牌图标 — 全部 8 工具 canonical 标的唯一出处（2026-10-14 统一批定案）：
+// 桌面 chips/会话卡/通知、资源/预设/设置（经 ToolIcon 委托）、移动看板卡片
+// 全部消费本文件。claude/codex/kimi 沿用官方单色 path（currentColor 随文字色）；
+// opencode/zcode/dsh/workbuddy 按用户提供的官方参考图重绘（2026-10-14）；
+// openclaw 自 ToolIcon 实物搬迁为固定色。
+// workbuddy 为官方 app 图标位图（img 引入）、dsh 为 simple-icons 官方 path
+// （2026-10-14 定案：均弃手绘，权威矢量/位图源）。
 
 // 兔维斯品牌标（扁平几何版吉祥物：兔耳 + 白框蓝片目镜 + 下巴绿色状态灯）
-// 固定品牌色（同 OpenCodeIcon 做法）；单色场合可把填充全部换成 currentColor
+// 固定品牌色；单色场合可把填充全部换成 currentColor
 export function TuvisLogoMark({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" role="img" aria-label="Tuvis">
@@ -63,36 +69,151 @@ export function OpenAIIcon({ className }: { className?: string }) {
   );
 }
 
+// OpenCode — 官方标（2026-10-14 用户对照官网参考图定案）：近直角黑方 + 白方膛 +
+// 膛内两段竖矩形（上黑 / 下中灰）。白底板四周溢出细白边（≈0.7px @14px chip）：
+// 近黑底（选中 chip、深色徽章底）勾出轮廓，白底上不可见
 export function OpenCodeIcon({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 512 512" role="img" aria-label="OpenCode">
-      {/* 自带配色（灰块+白环），徽标底为深色故两色均可见 */}
-      <path d="M320 224V352H192V224H320Z" fill="#5A5858" />
+      {/* 细白边底板 */}
+      <rect x="30" y="30" width="452" height="452" fill="#FFFFFF" />
+      {/* 黑方主体 */}
+      <rect x="56" y="56" width="400" height="400" fill="#1A1A1A" />
+      {/* 白方膛 */}
+      <rect x="148" y="140" width="216" height="232" fill="#FFFFFF" />
+      {/* 膛内两段芯：上黑 ~34% / 下中灰 ~66%（比例/色值按参考图实测校准） */}
+      <rect x="198" y="180" width="116" height="50" fill="#1A1A1A" />
+      <rect x="198" y="230" width="116" height="102" fill="#5A5858" />
+    </svg>
+  );
+}
+
+// OpenClaw — 官方吉祥物（2026-10-14 定案：selfhst 收录的官方多色版，弃红方
+// 机器人占位）：红渐变圆身 + 触角 + 双爪 + 深瞳青点。渐变 id 前缀 oc- 防同页
+// 多实例冲突；多色固定填充，iconClass 不消费
+export function OpenClawIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 512 512" role="img" aria-label="OpenClaw">
+      <linearGradient
+        id="oc-body"
+        x1="-694.696"
+        x2="-690.195"
+        y1="793.943"
+        y2="789.442"
+        gradientTransform="matrix(90 0 0 -100 62582 79427)"
+        gradientUnits="userSpaceOnUse"
+      >
+        <stop offset="0" stopColor="#ff4d4d" />
+        <stop offset="1" stopColor="#991b1b" />
+      </linearGradient>
+      <linearGradient
+        id="oc-claw-l"
+        x1="-672.565"
+        x2="-668.064"
+        y1="777.351"
+        y2="772.849"
+        gradientTransform="matrix(23.0719 0 0 -21.7808 15519.697 17119.95)"
+        gradientUnits="userSpaceOnUse"
+      >
+        <stop offset="0" stopColor="#ff4d4d" />
+        <stop offset="1" stopColor="#991b1b" />
+      </linearGradient>
+      <linearGradient
+        id="oc-claw-r"
+        x1="-658.669"
+        x2="-654.168"
+        y1="777.486"
+        y2="772.985"
+        gradientTransform="matrix(23.0719 0 0 -21.7808 15610.38 17119.95)"
+        gradientUnits="userSpaceOnUse"
+      >
+        <stop offset="0" stopColor="#ff4d4d" />
+        <stop offset="1" stopColor="#991b1b" />
+      </linearGradient>
       <path
-        fillRule="evenodd"
-        clipRule="evenodd"
-        d="M384 416H128V96H384V416ZM320 160H192V352H320V160Z"
-        fill="white"
+        fill="url(#oc-body)"
+        d="M256 39.3c-135 0-202.5 112.5-202.5 202.5s67.5 180 135 202.5v45h45v-45s22.5 9 45 0v45h45v-45c67.5-22.5 135-112.5 135-202.5S391 39.3 256 39.3"
+      />
+      <path
+        fill="url(#oc-claw-l)"
+        d="M76 196.8c-67.5-22.5-90 22.5-67.5 67.5s67.5 22.5 90-22.5c13.5-31.5 0-45-22.5-45"
+      />
+      <path
+        fill="url(#oc-claw-r)"
+        d="M436 196.8c67.5-22.5 90 22.5 67.5 67.5s-67.5 22.5-90-22.5c-13.5-31.5 0-45 22.5-45"
+      />
+      <path
+        fill="#ff4d4d"
+        d="M188.5 66.3c-1.2 0-2.3-.4-3.2-1.3c-27.8-27.8-49.3-38.5-62-30.8c-2.1 1.3-4.9.6-6.2-1.5s-.6-4.9 1.5-6.2c17.2-10.3 41.1.2 73 32.2c1.8 1.8 1.8 4.6 0 6.4c-.8.7-2 1.2-3.1 1.2M326.7 65c27.8-27.8 49.3-38.5 62-30.8c2.1 1.3 4.9.6 6.2-1.5s.6-4.9-1.5-6.2c-17.2-10.3-41.1.2-73 32.2c-1.8 1.8-1.8 4.6 0 6.4c.9.9 2 1.3 3.2 1.3s2.2-.6 3.1-1.4"
+      />
+      <path
+        fill="#050810"
+        d="M188.5 124.8c14.9 0 27 12.1 27 27s-12.1 27-27 27s-27-12.1-27-27s12.1-27 27-27m135 0c14.9 0 27 12.1 27 27s-12.1 27-27 27s-27-12.1-27-27s12.1-27 27-27"
+      />
+      <path
+        fill="#00e5cc"
+        d="M193 138.3c5 0 9 4 9 9s-4 9-9 9s-9-4-9-9s4-9 9-9m135 0c5 0 9 4 9 9s-4 9-9 9s-9-4-9-9s4-9 9-9"
       />
     </svg>
   );
 }
 
+// Kimi — 官方 K 字标（simple-icons），黑白配色（2026-10-14 用户裁决：Kimi Code
+// 官方即黑白）：蓝黑方底（台账 #0B0E1A，官方取样）+ 白 K，任意 chip 底上均可辨。
+// 弃弦月 currentColor 旧绘
 export function KimiIcon({ className }: { className?: string }) {
   return (
-    <svg
-      className={className}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      role="img"
-      aria-label="Kimi Code"
-    >
-      {/* 弦月（Feather moon）：Moonshot/Kimi 品牌意象 */}
-      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    <svg className={className} viewBox="-1.2 -1.2 26.4 26.4" role="img" aria-label="Kimi Code">
+      {/* 细白边底板：暗色 chip/卡底上隔离蓝黑方标（浅底不可见，opencode/zcode 同款） */}
+      <rect x="-1.2" y="-1.2" width="26.4" height="26.4" rx="6.2" fill="#FFFFFF" />
+      <rect width="24" height="24" rx="5" fill="#0B0E1A" />
+      <g transform="translate(3.36 3.36) scale(0.72)">
+        <path
+          d="M21.765.351C22.998.351 24 1.353 24 2.586S22.998 4.82 21.765 4.82h-1.974c-.15 0-.26-.12-.26-.26V2.586A2.237 2.237 0 0 1 21.765.35M9.41 13.388l8.447-8.377c.16-.16.07-.471-.14-.471h-4.55s-.1.02-.14.06l-9.099 9.029c-.14.14-.35.02-.35-.21V4.81c0-.15-.1-.27-.221-.27H.22c-.12 0-.22.12-.22.27v18.57c0 .15.1.27.22.27h3.137c.12 0 .22-.12.22-.27v-3.79c0-.08.03-.16.08-.21l2.826-2.796c.07-.07.16-.08.241-.03l7.546 5.551a8.9 8.9 0 0 0 4.018 1.493c.12.01.23-.11.23-.27V19.76c0-.14-.08-.25-.19-.26a5.8 5.8 0 0 1-2.355-.942l-6.533-4.73c-.14-.09-.15-.32-.03-.441"
+          fill="#FFFFFF"
+        />
+      </g>
+    </svg>
+  );
+}
+
+// WorkBuddy — 官方 app 图标位图（2026-10-14 定案）：从本机安装的
+// WorkBuddy.exe PE 资源提取 256×256 官方原版（SHDefExtractIcon），弃手绘 SVG
+// （与 DSH 弃手绘同根因：手绘近似无法收敛到官方标）。位图经 Vite 资产管线引入，
+// src/vite-env.d.ts 的 vite/client 类型提供 png import 声明
+import workbuddyIconUrl from "@/assets/workbuddy-icon.png";
+
+export function WorkBuddyIcon({ className }: { className?: string }) {
+  return <img src={workbuddyIconUrl} className={className} alt="" draggable={false} />;
+}
+
+// ZCode — 官方标重绘（2026-10-14 用户参考图定案）：炭灰大圆角方 + 白色斜切 Z
+// （横杠带楔形斜切 + 粗斜杠，微倾速度感）。白底板细白边防深底融入（浅底不可见）；
+// 图标随官方炭灰，卡片檐色台账 #141413 不受影响
+export function ZCodeIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 512 512" role="img" aria-label="ZCode">
+      {/* 细白边底板 */}
+      <rect width="512" height="512" rx="90" fill="#FFFFFF" />
+      {/* 炭灰圆角方 */}
+      <rect x="24" y="24" width="464" height="464" rx="76" fill="#2D2D2D" />
+      {/* 斜切 Z：斜杠横向厚度 ~130（参考图实测 28% Z 宽量级，ui-worker 首轮验收校准） */}
+      <path d="M96 114 H418 L260 348 H418 V398 H96 L260 156 H96 Z" fill="#FFFFFF" />
+    </svg>
+  );
+}
+
+// dsh（DeepSeek）— 官方蓝鲸 glyph（2026-10-14 根因修复定案）：手绘近似八轮均
+// 不可辨认可用，弃手绘、改用 simple-icons 官方 path（与 Claude/Codex 同源做法）。
+// 嘴部白区/杏仁眼以 evenodd 挖空表达（透明底），品牌蓝 #4D6BFE 固定填充
+export function DshIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" role="img" aria-label="DSH">
+      {/* 细白边：只描外轮廓子路径（嘴/眼挖空边不加白），暗色底上隔离蓝鲸标 */}
+      <path
+        d="M23.748 4.651c-.254-.124-.364.113-.512.233-.051.04-.094.09-.137.137-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.155-.708-.311-.955-.65-.172-.24-.219-.509-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.094.172.187.129.323-.082.28-.18.553-.266.833-.055.179-.137.218-.328.14a5.5 5.5 0 0 1-1.737-1.179c-.857-.828-1.631-1.743-2.597-2.46a12 12 0 0 0-.689-.47c-.985-.957.13-1.743.387-1.836.27-.098.094-.433-.778-.428-.872.003-1.67.295-2.687.685a3 3 0 0 1-.465.136 9.6 9.6 0 0 0-2.883-.101c-1.885.21-3.39 1.1-4.497 2.622C.082 8.776-.231 10.854.152 13.02c.403 2.284 1.568 4.175 3.36 5.653 1.857 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.132-.284 4.994-1.86.47.234.962.328 1.78.398.629.058 1.235-.031 1.705-.129.735-.155.684-.836.418-.961-2.155-1.004-1.682-.595-2.112-.926 1.095-1.295 2.768-3.598 3.284-6.733.05-.346.115-.834.108-1.114-.004-.171.035-.238.23-.257a4.2 4.2 0 0 0 1.545-.475c1.397-.763 1.96-2.016 2.093-3.517.02-.23-.004-.467-.247-.588M11.58 18.168c-2.088-1.642-3.101-2.183-3.52-2.16-.39.024-.32.472-.234.763.09.288.207.487.371.74.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.168-1.361-.801-2.5-1.86-3.301-3.306-.775-1.393-1.225-2.888-1.299-4.482-.02-.385.094-.522.477-.592a4.7 4.7 0 0 1 1.53-.038c2.131.311 3.946 1.264 5.467 2.774.868.86 1.525 1.887 2.202 2.89.72 1.066 1.494 2.082 2.48 2.915.348.291.626.513.892.677-.802.09-2.14.109-3.055-.615zm1.001-6.44a.306.306 0 0 1 .415-.287.3.3 0 0 1 .113.074.3.3 0 0 1 .086.214c0 .17-.136.307-.308.307a.303.303 0 0 1-.306-.307m3.11 1.596c-.2.081-.4.151-.591.16a1.25 1.25 0 0 1-.798-.254c-.274-.23-.47-.358-.551-.758a1.7 1.7 0 0 1 .015-.588c.07-.327-.007-.537-.238-.727-.188-.156-.426-.199-.689-.199a.6.6 0 0 1-.254-.078.253.253 0 0 1-.114-.358 1 1 0 0 1 .192-.21c.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.392.451.462.576.685.915.176.264.336.536.446.848.066.194-.02.353-.25.45"
+        fill="#4D6BFE"
+      />
     </svg>
   );
 }

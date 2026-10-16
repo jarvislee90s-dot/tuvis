@@ -55,23 +55,6 @@
   --usage-accent-a: #3b82f6;
   --usage-accent-b: #8b5cf6;
   --usage-track: oklch(0.922 0 0);
-
-  /* 工具品牌图标双态变量（2026-10-05 台账重映射，docs/design/tool-color-ledger.md）：
-   * ToolIcon SVG 经 style var() 引用，桌面+移动共用一份语义 */
-  --tool-claude-bg: #d97757;
-  --tool-codex-bg: #ffffff;
-  --tool-codex-fg: #111111;
-  --tool-codex-rim: #1a1a1a;
-  --tool-opencode-bg: #ffffff;
-  --tool-opencode-fg: #111111;
-  --tool-opencode-rim: #2b2b28;
-  --tool-openclaw-bg: #d2453c;
-  --tool-kimi-bg: #0b0e1a;
-  --tool-kimi-fg: #ffffff;
-  --tool-workbuddy-bg: #4ad06a;
-  --tool-zcode-bg: #141413;
-  --tool-zcode-rim: transparent;
-  --tool-dsh-bg: #4d6bfe;
 }
 
 .dark {
@@ -100,23 +83,6 @@
   --usage-accent-a: #60a5fa;
   --usage-accent-b: #a78bfa;
   --usage-track: oklch(0.269 0 0);
-
-  /* 工具品牌图标夜间表（2026-10-05 台账夜间规则）：黑系图标反形/亮描边，
-   * 彩色系提亮至夜卡底对比达标；数值与 mobile.css 同源 */
-  --tool-claude-bg: #e08a66;
-  --tool-codex-bg: #1a1a1a;
-  --tool-codex-fg: #f5f5f5;
-  --tool-codex-rim: #ece9e2;
-  --tool-opencode-bg: #1a1a1a;
-  --tool-opencode-fg: #ffffff;
-  --tool-opencode-rim: #ece9e2;
-  --tool-openclaw-bg: #e06a5e;
-  --tool-kimi-bg: #e8edf8;
-  --tool-kimi-fg: #0b0e1a;
-  --tool-workbuddy-bg: #4ad06a;
-  --tool-zcode-bg: #141413;
-  --tool-zcode-rim: #ece9e2;
-  --tool-dsh-bg: #4d6bfe;
 }
 
 @layer base {

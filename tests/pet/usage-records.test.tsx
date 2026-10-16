@@ -210,7 +210,8 @@ describe("usage-records（计划② Task 9：页签壳 + 用量记录页）", ()
     openRecords();
     await screen.findByTestId("usage-record-card-claude");
 
-    // 不是夹具那 4 个工具、也不是 SUPPORTED_TOOLS（含 openclaw）：恰为 7 个采集源，顺序 = D1
+    // 不是夹具那 4 个工具：恰为 7 个采集源，顺序 = D1。SUPPORTED_TOOLS 是看板
+    // 筛选清单（7 工具），与用量 7 源仅是巧合同成员（位次不同），语义不同源
     expect(
       screen.getAllByTestId(/^usage-records-tool-/).map((el) => el.getAttribute("data-testid"))
     ).toEqual([

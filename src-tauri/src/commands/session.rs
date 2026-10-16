@@ -92,7 +92,11 @@ pub fn focus_session(
                         mark_read_on_jump(&app, &session_id, &agent_type);
                         return Ok(serde_json::json!({ "via": "dsh-desktop" }));
                     }
-                    Err(e) => return Err(format!("无法聚焦 DeepSeek Harness 窗口：{e}")),
+                    Err(e) => {
+                        return Err(format!(
+                            "SESSION_FOCUS_FAIL: 无法聚焦 DeepSeek Harness 窗口：{e}"
+                        ))
+                    }
                 }
             }
             #[cfg(target_os = "macos")]
@@ -169,19 +173,12 @@ pub fn focus_session(
             }
         }
         // marker 与按需注入 helper 贴的标题标记一致：TUVIS:<session_id 剥连字符后
-        // 前 12 位>。口径两处互引（改动须同步）：本处（匹配侧）/ tuvis-marker
-        // helper（src/bin/tuvis-marker.rs，注入侧）。8 位对 codex UUIDv7 只编码
-        // 65.5s 粒度、同分钟双开撞车（实测 2026-09-08），12 位不撞；必须先剥
-        // 连字符——UUID 第 9 位即 '-'，直接 take(12) 会切进分隔符
-        let marker = session_id.as_deref().map(|id| {
-            format!(
-                "TUVIS:{}",
-                id.chars()
-                    .filter(|c| *c != '-')
-                    .take(12)
-                    .collect::<String>()
-            )
-        });
+        // 前 12 位>。口径单一出处 = window::disambig::marker_from_session_id（#57
+        // 漂移封口：本处（匹配侧）与 tuvis-marker helper（注入侧）走同一函数，
+        // 两端各有字面向量测试；12 位理由与剥连字符的口径见该函数文档）
+        let marker = session_id
+            .as_deref()
+            .map(crate::window::disambig::marker_from_session_id);
         // 面板反推：当前所有运行会话的 (工具id, 项目名)，用于排除其他工具的终端窗口
         // （codex 终端标题=项目名，无 "codex" 关键词可静态认领）。进程扫描即可，无文件解析开销
         let running_projects = running_projects_from_processes(&system);
@@ -277,7 +274,11 @@ pub fn focus_session(
                     out["via"] = serde_json::Value::String("dsh".into());
                     return Ok(out);
                 }
-                Err(e) => return Err(format!("无法聚焦 dsh 页面：{e}（请手动打开 dsh web）")),
+                Err(e) => {
+                    return Err(format!(
+                        "SESSION_DSH_FOCUS_FAIL: 无法聚焦 dsh 页面：{e}（请手动打开 dsh web）"
+                    ))
+                }
             }
         }
         // CLI 形态：TTY 链路（tmux/iTerm2/Terminal.app）
@@ -349,7 +350,7 @@ pub fn focus_hwnd(hwnd: isize) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = hwnd;
-        Err("当前平台不支持".to_string())
+        Err("SESSION_PLATFORM_UNSUPPORTED: 当前平台不支持".to_string())
     }
 }
 
@@ -379,7 +380,7 @@ pub fn dismiss_session_card(agent_type: String, session_id: String, status: Stri
 pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
     let sid = session_id.trim().to_string();
     if sid.is_empty() {
-        return Err("缺少 session_id".to_string());
+        return Err("SESSION_ID_MISSING: 缺少 session_id".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
         // mut：T3 信任归一在 spawn 前原地改写 project_path（claude 专属，只读
@@ -418,7 +419,7 @@ pub async fn session_open(app: tauri::AppHandle, session_id: String) -> Result<(
         r
     })
     .await
-    .map_err(|e| format!("会话扫描任务异常: {e}"))?
+    .map_err(|e| format!("SESSION_SCAN_FAIL: 会话扫描任务异常: {e}"))?
     .map_err(|e| match e.as_str() {
         // 哨兵串转译（前端 toast 直展；与移动端禁用原因文案同义）
         "no_resume_command" => "该工具 resume 命令待查证，暂不支持一键打开".to_string(),
@@ -466,7 +467,7 @@ pub fn kill_pid(pid: u32) -> Result<(), String> {
         }
         Ok(())
     } else {
-        Err(format!("进程 {} 不存在", pid))
+        Err(format!("SESSION_PID_GONE:{pid}: 进程 {} 不存在", pid))
     }
 }
 

@@ -337,7 +337,7 @@ impl ChannelKind {
             "named" => Ok(Self::Named),
             "tailscale" => Ok(Self::Tailscale),
             other => Err(format!(
-                "通道值非法: {other}（仅 lan/quick/named/tailscale）"
+                "REMOTE_BAD_CHANNEL: 通道值非法: {other}（仅 lan/quick/named/tailscale）"
             )),
         }
     }
@@ -807,13 +807,13 @@ fn validate_bind(raw: &str) -> Result<&str, String> {
     // 静默把空串当 127.0.0.1 会掩盖写坏设置的真实故障
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("远程绑定地址为空（设置键存在但值为空串）".to_string());
+        return Err("REMOTE_BIND_EMPTY: 远程绑定地址为空（设置键存在但值为空串）".to_string());
     }
     if trimmed.eq_ignore_ascii_case("localhost") || trimmed.parse::<std::net::IpAddr>().is_ok() {
         Ok(trimmed)
     } else {
         Err(format!(
-            "远程绑定地址非法: {raw:?}（仅支持 127.0.0.1 / localhost / ::1 / 合法 IP 地址）"
+            "REMOTE_BIND_INVALID: 远程绑定地址非法: {raw:?}（仅支持 127.0.0.1 / localhost / ::1 / 合法 IP 地址）"
         ))
     }
 }
@@ -837,7 +837,7 @@ fn is_external_bind(bind: &str) -> bool {
 /// 开关 Dialog 同判据）据此识别「需先确认 TLS 反代」——文案含 remote_confirm_public
 /// 指引。start_server_core 内联门与 ensure_public_ack_if_external 共用，防两处漂移
 const PUBLIC_ACK_REQUIRED_MSG: &str =
-    "对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
+    "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
 
 /// P7 门检查内核（纯函数）：对外绑定 + 未确认 TLS 前置 → Err 特征文案（沿用
 /// start_server_core 口径）；内环绑定或已确认 → Ok。remote_toggle_channel("lan", true)
@@ -1595,7 +1595,7 @@ fn set_pin_core(
 ) -> Result<PinSetOutcome, String> {
     let new = new_pin.trim();
     if !pin::validate_pin(new) {
-        return Err("访问密码必须为 4 位数字".to_string());
+        return Err("REMOTE_PASSCODE_INVALID: 访问密码必须为 4 位数字".to_string());
     }
     match old.as_deref().map(str::trim) {
         None => {
@@ -1645,7 +1645,7 @@ fn rename_device_core(
 ) -> Result<(), String> {
     let name = name_raw.trim();
     if name.is_empty() {
-        return Err("设备名称不能为空".to_string());
+        return Err("REMOTE_DEVICE_NAME_EMPTY: 设备名称不能为空".to_string());
     }
     // 花名白名单（裁决 24b 判据的**第三落点**；裁决 26 收口上一轮「改名不加门」的取舍）：
     // **在触 DAO 之前**拒，错误码/原因文案与配对登记点共用（同一判据、同一句话）；
@@ -1659,7 +1659,9 @@ fn rename_device_core(
     if rename(name)? {
         Ok(())
     } else {
-        Err(format!("设备不存在: {device_id}"))
+        Err(format!(
+            "REMOTE_DEVICE_NOT_FOUND:{device_id}: 设备不存在: {device_id}"
+        ))
     }
 }
 
@@ -1879,7 +1881,7 @@ pub async fn remote_ts_run_step(step: String) -> Result<serde_json::Value, Strin
     let (_, port) = bind_and_port().unwrap_or(("127.0.0.1".into(), DEFAULT_PORT));
     tauri::async_runtime::spawn_blocking(move || tailscale::run_step(&step, port))
         .await
-        .map_err(|e| format!("执行向导步骤失败: {e}"))?
+        .map_err(|e| format!("REMOTE_WIZARD_STEP_FAIL: 执行向导步骤失败: {e}"))?
 }
 
 // ============================================================

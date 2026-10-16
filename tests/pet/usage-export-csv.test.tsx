@@ -70,7 +70,6 @@ function installClipboardImage(write: (items: unknown[]) => Promise<void>): void
   });
 }
 
-
 type InvokeCall = [string, Record<string, unknown> | undefined];
 
 /** setup.ts 把 invoke 接到了这个 vi.fn 上（每用例后清空调用记录） */
@@ -437,9 +436,7 @@ describe("UsageExportActions（计划② Task 11：复制文本 + CSV 导出）"
     await waitFor(() => expect(renderShareImageMock).toHaveBeenCalledTimes(1));
     const okInput = renderShareImageMock.mock.calls[0][0] as Record<string, unknown>;
     expect(okInput.hero).toBe("2,036,981");
-    expect((okInput.metrics as [string, string][]).find(([l]) => l === "产出")?.[1]).toBe(
-      "82,713"
-    );
+    expect((okInput.metrics as [string, string][]).find(([l]) => l === "产出")?.[1]).toBe("82,713");
     expect(
       (okInput.metrics as [string, string][]).find(([l]) => l === "用户输入(估) · 含子代理")?.[1]
     ).toBe("~18,023"); // 正常窗口逐字不变（防过度置空的反向）

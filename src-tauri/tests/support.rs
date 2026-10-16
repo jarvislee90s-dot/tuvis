@@ -57,3 +57,20 @@ fn unique_home(tag: &str) -> PathBuf {
     std::mem::forget(temp); // 与 setup() 同款：用例存活期间目录不得被清理
     home
 }
+
+/// 集成测试专用**采集读源根**（`TUVIS_USAGE_FIXTURE_ROOT` 的落点，collect.rs 缝）：
+/// 泄漏保活的一次性 tempdir，同一个测试二进制共用一份（env 是进程全局的，
+/// `serial()` 里幂等设成它）。Windows 下 `dirs::home_dir()` 不认 HOME 重定向，
+/// 采集器只看这个根才不会去扫开发机真实 profile（2026-10-07 事故族）。
+#[allow(dead_code)]
+pub fn usage_fixture_root() -> &'static PathBuf {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let temp = tempfile::tempdir().expect("创建采集 fixture 根 tempdir 失败");
+        let root = temp.path().join("usage-fixture-root");
+        std::fs::create_dir_all(&root).expect("创建采集 fixture 根目录失败");
+        std::mem::forget(temp); // 与 setup() 同款：测试存活期间目录不得被清理
+        root
+    })
+}

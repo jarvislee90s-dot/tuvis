@@ -56,10 +56,15 @@ describe("localStorage 记忆（重启保持上次选择）", () => {
     expect(loadToolFilter()).toBe("kimi");
   });
 
-  it("脏值防御：超出八工具清单/损坏的残留值一律回落 all（AgentType 增删值后不卡死）", () => {
+  it("脏值防御：超出工具清单/损坏的残留值一律回落 all（AgentType 增删值后不卡死）", () => {
     localStorage.setItem("board.toolFilter", "future-tool");
     expect(loadToolFilter()).toBe("all");
     localStorage.setItem("board.toolFilter", "{oops");
+    expect(loadToolFilter()).toBe("all");
+  });
+
+  it('openclaw 存量残留自动回落 all（2026-10-14 统一批：openclaw 移出 SUPPORTED_TOOLS 后，用户机上旧的 board.toolFilter="openclaw" 不把筛选卡死）', () => {
+    localStorage.setItem("board.toolFilter", "openclaw");
     expect(loadToolFilter()).toBe("all");
   });
 

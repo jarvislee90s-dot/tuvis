@@ -101,7 +101,7 @@ export function ApplyConfirmDialog({
           </div>
         ) : error ? (
           // 拉取失败：展示错误（本地化透出），仅保留取消入口
-          <p className="text-destructive py-2 text-xs">{error}</p>
+          <p className="text-destructive py-2 text-xs">{formatInvokeError(error, t)}</p>
         ) : preview ? (
           <div className="space-y-3">
             {/* 白板强警示：顶部 destructive 块 */}

@@ -74,12 +74,12 @@ end run
         .arg("-e")
         .arg(&script)
         .output()
-        .map_err(|e| format!("osascript 执行失败: {e}"))?;
+        .map_err(|e| format!("FOCUS_OSASCRIPT_FAIL: osascript 执行失败: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if stdout.starts_with("found:") {
         Ok(stdout)
     } else {
-        Err("未找到 dsh 标签页".into())
+        Err("FOCUS_DSH_TAB_MISSING: 未找到 dsh 标签页".into())
     }
 }
 
@@ -93,7 +93,7 @@ pub fn focus_dsh_tab() -> Result<serde_json::Value, String> {
             std::process::Command::new("open")
                 .arg(&url)
                 .spawn()
-                .map_err(|e| format!("打开 dsh 失败: {e}"))?;
+                .map_err(|e| format!("FOCUS_DSH_OPEN_FAIL: 打开 dsh 失败: {e}"))?;
             Ok(serde_json::json!({ "type": "focused", "via": "dsh-open" }))
         }
     }

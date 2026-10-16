@@ -57,7 +57,6 @@ import i18n from "@/i18n";
 import SettingsPage from "@/pages/settings";
 import { UsageSection } from "@/components/settings/UsageSection";
 import { saveActiveId } from "@/components/pet/petRuntime";
-import { poseKeysFor } from "@/lib/usage/sheet";
 import type { UsageSettings, UsageSettingsPatch } from "@/types/usage";
 
 /** 与 Rust `UsageSettings::default()` 同值（spec §P7）：开 / 今日 / 3 条 / 90 天 / 10 分钟 / 空 / 空 / 随机 */
@@ -270,7 +269,6 @@ describe("设置页「用量统计」分组（计划② Task 14）", () => {
       expect(patch.detailRetentionDays).toBeLessThanOrEqual(3650);
     }
   });
-
 
   it("8. 保存失败原因可见（usage-set-error，不静默）——载体随界面变动更换", async () => {
     // ⚠️ **2026-10-07 B1：换载体、不换断言。** 本条原先拿「分享图评语」输入框当载体，而评语已搬到

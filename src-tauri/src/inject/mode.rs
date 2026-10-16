@@ -2009,7 +2009,8 @@ pub(crate) fn codex_permission_digit_probe(lines: &[String], target: MamMode) ->
     let lowered: Vec<String> = lines.iter().map(|l| l.to_lowercase()).collect();
     let Some(options) = codex_menu_options(lines, &lowered) else {
         return PollStep::NotYet(
-            "codex 的权限菜单未出现或读不到档位表（不盲发数字键）".to_string(),
+            "INJECT_MENU_TABLE_MISSING: codex 的权限菜单未出现或读不到档位表（不盲发数字键）"
+                .to_string(),
         );
     };
     let target_lower = target_label.to_lowercase();
@@ -2451,12 +2452,12 @@ impl MenuNavPlan<'_> {
                 };
                 let Some(raw) = locate_menu_items(lines, menu_labels(tool)) else {
                     return PollStep::NotYet(format!(
-                        "{tool} 的权限菜单未出现或读不到档位表（不盲发方向键）"
+                        "INJECT_MENU_TABLE_MISSING: {tool} 的权限菜单未出现或读不到档位表（不盲发方向键）"
                     ));
                 };
                 if !menu_items_coherent(&raw, tool) {
                     return PollStep::Fatal(format!(
-                        "{tool} 的权限菜单档位表不自洽（混入了正文行或被遮挡）——不猜位置，请在终端选择"
+                        "INJECT_MENU_TABLE_MALFORMED: {tool} 的权限菜单档位表不自洽（混入了正文行或被遮挡）——不猜位置，请在终端选择"
                     ));
                 }
                 // `规范标签|屏上原文` → 取规范标签（屏上原文仍留在 `locate_menu_items`
@@ -2794,8 +2795,9 @@ where
     poll(&menu_plan, false)?.ok_or_else(|| {
         format!("{tool} 的权限菜单未出现或读不到档位表（不盲发方向键）；请人工核对终端")
     })?;
-    let menu_keys = navigate_until_highlighted(terminal, &menu_plan)
-        .map_err(|why| format!("{why}；请人工核对终端（命令已发送，档位未切）"))?;
+    let menu_keys = navigate_until_highlighted(terminal, &menu_plan).map_err(|why| {
+        format!("INJECT_MANUAL_CHECK: {why}；请人工核对终端（命令已发送，档位未切）")
+    })?;
     // ===== 第三段：Full Access 二次确认框（仅 codex × 权限组 × Full Access）=====
     let mut confirm_done = false;
     if needs_full_access_confirm(tool, group, target) {
@@ -2805,8 +2807,9 @@ where
         };
         // `true` = 「可出现」（窗尽未出现 → Ok(None)，**不当作失败**）
         if poll(&confirm_plan, true)?.is_some() {
-            navigate_until_highlighted(terminal, &confirm_plan)
-                .map_err(|why| format!("{why}；请人工核对终端（Full Access 可能未生效）"))?;
+            navigate_until_highlighted(terminal, &confirm_plan).map_err(|why| {
+                format!("INJECT_MANUAL_CHECK: {why}；请人工核对终端（Full Access 可能未生效）")
+            })?;
             confirm_done = true;
         } else {
             log::debug!("模式菜单：未出现 Full Access 二次确认框（可能用户已关闭该警告）");
@@ -3219,7 +3222,10 @@ where
     }
     // 硬前置：屏上确有 overlay 才动手
     let Some(lines) = read_screen() else {
-        return Err("读不到终端屏面——零投递（请人工核对终端；或点「重新读取」）".to_string());
+        return Err(
+            "INJECT_NO_SCREEN: 读不到终端屏面——零投递（请人工核对终端；或点「重新读取」）"
+                .to_string(),
+        );
     };
     let lowered: Vec<String> = lines.iter().map(|l| l.to_lowercase()).collect();
     let Some(kind) = codex_overlay_kind(&lowered) else {
@@ -6558,7 +6564,9 @@ mod tests {
                 loop {
                     match plan.probe(&cur()) {
                         PollStep::Ready(_) => return Ok(Some(cur())),
-                        PollStep::Fatal(why) => return Err(format!("{why}；请人工核对终端")),
+                        PollStep::Fatal(why) => {
+                            return Err(format!("INJECT_MANUAL_CHECK: {why}；请人工核对终端"))
+                        }
                         PollStep::NotYet(_) => {
                             if !advance(&cursor, n) {
                                 // 窗尽：菜单（optional=false）→ Err；确认框（true）→ None
@@ -6639,7 +6647,9 @@ mod tests {
             || loop {
                 match codex_permission_digit_probe(&cur(), target) {
                     PollStep::Ready(d) => return Ok(d),
-                    PollStep::Fatal(why) => return Err(format!("{why}；请人工核对终端")),
+                    PollStep::Fatal(why) => {
+                        return Err(format!("INJECT_MANUAL_CHECK: {why}；请人工核对终端"))
+                    }
                     PollStep::NotYet(_) => {
                         if !advance(&cursor, n) {
                             return Err(
@@ -6653,7 +6663,9 @@ mod tests {
             || loop {
                 match confirm_box_probe(&cur(), "codex", FULL_ACCESS_AFFIRMATIVE_KEYWORD) {
                     PollStep::Ready((c, _)) => return Ok(Some(c)),
-                    PollStep::Fatal(why) => return Err(format!("{why}；请人工核对终端")),
+                    PollStep::Fatal(why) => {
+                        return Err(format!("INJECT_MANUAL_CHECK: {why}；请人工核对终端"))
+                    }
                     PollStep::NotYet(_) => {
                         if !advance(&cursor, n) {
                             return Ok(None); // 窗尽：确认框缺席不当作失败
@@ -7373,7 +7385,7 @@ mod tests {
             || {
                 if digit_calls.get() == 0 {
                     digit_calls.set(1);
-                    Err("codex 的权限菜单未出现或读不到档位表（不盲发数字键）".to_string())
+                    Err("INJECT_MENU_TABLE_MISSING: codex 的权限菜单未出现或读不到档位表（不盲发数字键）".to_string())
                 } else {
                     Ok("1".to_string())
                 }

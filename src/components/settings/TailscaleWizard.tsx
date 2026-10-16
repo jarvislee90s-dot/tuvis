@@ -16,8 +16,14 @@
 // 两级键由本文件承担（本目录 tailscaleWizard.test.tsx 以两级感知扫描把关双语言键齐备）。
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { SETTINGS_NOTE, SETTINGS_REMOTE_BADGE } from "@/components/settings/typography";
+import {
+  SETTINGS_NOTE,
+  SETTINGS_REMOTE_BADGE,
+  SETTINGS_REMOTE_HINT,
+  SETTINGS_REMOTE_ROW,
+} from "@/components/settings/typography";
 import { useAppTranslation } from "@/hooks/use-app-translation";
+import { formatInvokeError } from "@/lib/invokeError";
 import { cn } from "@/lib/utils";
 import {
   remoteTsProbe,
@@ -229,7 +235,7 @@ export function TailscaleWizard() {
       )}
       {loadError !== null && (
         <p data-testid="ts-load-error" className="mt-1 text-xs text-rose-500">
-          {t("settings.remote.tsWizard.loadFailed")}: {loadError}
+          {t("settings.remote.tsWizard.loadFailed")}: {formatInvokeError(loadError, t)}
         </p>
       )}
       {probe === null && loadError === null && (
@@ -242,7 +248,7 @@ export function TailscaleWizard() {
           <span className="mr-1 inline-block h-2 w-2 rounded-full bg-emerald-500 align-middle" />
           {t("settings.remote.tsWizard.runningBadge")} ·{" "}
           {t("settings.remote.tsWizard.boardUrlLabel")}:{" "}
-          <code className="bg-muted rounded-md px-1.5 py-0.5 font-mono text-[12px]">
+          <code className={`bg-muted rounded-md px-1.5 py-0.5 font-mono ${SETTINGS_REMOTE_HINT}`}>
             {probe.boardUrl}
           </code>
         </p>
@@ -328,7 +334,7 @@ export function TailscaleWizard() {
               />
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className={cn("text-[13px]", done && "text-muted-foreground")}>
+                  <span className={cn(SETTINGS_REMOTE_ROW, done && "text-muted-foreground")}>
                     {stepLabel(t, step.id)}
                   </span>
                   <span className={SETTINGS_NOTE}>
@@ -488,14 +494,26 @@ export function TailscaleWizard() {
                   >
                     {(st?.blockedTone ?? "rose") === "rose" &&
                       `${t("settings.remote.tsWizard.blockedTitle")} `}
-                    {blocked}
+                    {formatInvokeError(blocked, t)}
                   </p>
                 )}
                 {/* verify §C3：校验失败 = 固定地址尚未生效——点名口径 + reason，
                     不显示成可用地址让用户干等 */}
                 {step.id === "verify" && blocked && (
                   <p data-testid="ts-not-live" className="mt-0.5 text-xs text-rose-500">
-                    {t("settings.remote.tsWizard.tsNotLive")}：{blocked}
+                    {t("settings.remote.tsWizard.tsNotLive")}：{formatInvokeError(blocked, t)}
+                  </p>
+                )}
+                {/* 瞬时抖动引导（2026-10-13 真机定位）：「地址已解析但连不通」类失败多为
+                    公网入口瞬时抖动，60s 轮询会自愈——先安抚 + 给重试门槛，避免恢复窗口内
+                    狂点重试（重试在旧版还会触发 funnel reset 误伤配置）。前缀判定与
+                    reach.rs 的连不通类格式串同步（reason 恒中文，不随 UI 语言漂移） */}
+                {step.id === "verify" && blocked?.startsWith("REACH_ADDR_UNREACHABLE") && (
+                  <p
+                    data-testid="ts-transient-hint"
+                    className="text-xs text-amber-600 dark:text-amber-400"
+                  >
+                    {t("settings.remote.tsWizard.tsTransientHint")}
                   </p>
                 )}
                 {/* 动作失败落行内错误位（Task 6 移交指针：不再吞错误零反馈） */}

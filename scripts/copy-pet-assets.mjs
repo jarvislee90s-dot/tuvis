@@ -1,6 +1,6 @@
 // scripts/copy-pet-assets.mjs — 从原插件仓库搬运素材并生成 manifest（一次性，spec §6.1）
 // 用法: node scripts/copy-pet-assets.mjs <源assets目录>
-import { cpSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
 const SRC = resolve(process.argv[2] ?? "");
@@ -22,7 +22,12 @@ for (const group of GROUPS) {
     .sort((a, b) => a.localeCompare(b, "zh"));
   for (const f of files) {
     cpSync(join(dir, f), join(DEST, "voice", group, f));
-    manifest.push({ index: index++, group, name: f.replace(/\.(m4a|mp4)$/i, ""), file: `${group}/${f}` });
+    manifest.push({
+      index: index++,
+      group,
+      name: f.replace(/\.(m4a|mp4)$/i, ""),
+      file: `${group}/${f}`,
+    });
   }
 }
 writeFileSync(join(DEST, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");

@@ -665,7 +665,7 @@ describe("ModeBar：codex toggle chips 与完全信任二次确认（2026-09-23 
     render(<ModeBar session={{ id: "mc-chips" }} />);
     fireEvent.click(await screen.findByTestId("mode-switch-permission-readOnly"));
     await flushAsync();
-    let call = fetchMock.mock.calls.find((c: unknown[]) =>
+    const call = fetchMock.mock.calls.find((c: unknown[]) =>
       String(c[0]).includes("/session-mode/switch")
     );
     const body = JSON.parse(String((call![1] as RequestInit).body));

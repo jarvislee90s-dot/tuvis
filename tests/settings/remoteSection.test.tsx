@@ -624,7 +624,7 @@ describe("RemoteSection lan 开关 P7 TLS Dialog 流（M5 A6）", () => {
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "remote_status") return lanOffStatus();
       if (cmd === "remote_toggle_channel" && args?.channel === "lan" && args?.on === true) {
-        throw "对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
+        throw "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
       }
       if (cmd === "get_setting") return null;
       if (cmd === "remote_devices") return [];
@@ -646,7 +646,8 @@ describe("RemoteSection lan 开关 P7 TLS Dialog 流（M5 A6）", () => {
       if (cmd === "remote_status") return lanOffStatus();
       if (cmd === "remote_toggle_channel" && args?.channel === "lan" && args?.on === true) {
         lanTries += 1;
-        if (lanTries === 1) throw "对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
+        if (lanTries === 1)
+          throw "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
         return; // 重试成功
       }
       if (cmd === "get_setting") return null;
@@ -672,7 +673,7 @@ describe("RemoteSection lan 开关 P7 TLS Dialog 流（M5 A6）", () => {
       if (cmd === "remote_status") return lanOffStatus();
       if (cmd === "remote_toggle_channel" && args?.channel === "lan" && args?.on === true) {
         lanTries += 1;
-        throw "对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
+        throw "REMOTE_PUBLIC_ACK_REQUIRED: 对外绑定需先确认已配置 TLS 反向代理（remote_confirm_public）";
       }
       if (cmd === "get_setting") return null;
       if (cmd === "remote_devices") return [];
@@ -1019,14 +1020,23 @@ describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的
     platform: "windows" as const,
     windowsVerified: true,
     writePathVerified: true,
-    steps: ["detect", "download", "install", "login", "shields_up", "funnel", "verify", "autostart"].map(
-      (id) => ({ id, needsHuman: false, humanOptional: false, humanActionKey: "" })
-    ),
-    states: ["detect", "download", "install", "login", "shields_up", "funnel", "autostart"].map((id) => ({
-      id,
-      done: true,
-      blockedReason: null,
-    })).concat([{ id: "verify", done: false, blockedReason: null }]),
+    steps: [
+      "detect",
+      "download",
+      "install",
+      "login",
+      "shields_up",
+      "funnel",
+      "verify",
+      "autostart",
+    ].map((id) => ({ id, needsHuman: false, humanOptional: false, humanActionKey: "" })),
+    states: ["detect", "download", "install", "login", "shields_up", "funnel", "autostart"]
+      .map((id) => ({
+        id,
+        done: true,
+        blockedReason: null,
+      }))
+      .concat([{ id: "verify", done: false, blockedReason: null }]),
     authUrl: "",
     running: false,
     boardUrl: null,
@@ -1177,6 +1187,34 @@ describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的
     expect(screen.queryByTestId("ts-wizard")).toBeNull();
     fireEvent.click(screen.getByTestId("ts-wizard-retry-entry"));
     expect(await screen.findByTestId("ts-wizard")).toBeTruthy();
+    // 非连不通类失败 → 不挂瞬时抖动引导（那条只属于「地址已解析但连不通」）
+    expect(screen.queryByTestId("ts-transient-hint")).toBeNull();
+  });
+
+  // 2026-10-13 真机定位：连不通类失败（瞬时抖动、60s 轮询自愈）在「已配置·未运行」卡面
+  // 也挂引导——error 前缀「地址已解析但连不通」锚定（与 reach.rs 格式串同步）
+  it("连不通类失败 → configuredIdle 卡面 error 行挂瞬时抖动引导（ts-transient-hint）", async () => {
+    const unreachable =
+      "REACH_ADDR_UNREACHABLE: 地址已解析但连不通（试了 2 条）: 103.84.155.153: error sending request; 103.84.155.217: error sending request";
+    mock({
+      channels: channelsOf({
+        tailscale: {
+          enabled: true,
+          running: false,
+          address: null,
+          error: unreachable,
+          reach: { state: "failed", reason: unreachable },
+        },
+      }),
+    });
+    render(<RemoteSection />);
+    fireEvent.click(card("tailscale"));
+    await waitFor(() => expect(phaseEl().getAttribute("data-phase")).toBe("configuredIdle"));
+    // 错误 span 现经 formatInvokeError 渲染（码→英文模板，jsdom 默认英文语言）
+    expect(screen.getByText(/Address resolves but unreachable/)).toBeTruthy();
+    const hint = screen.getByTestId("ts-transient-hint");
+    expect(hint.textContent).toMatch(/transient jitter/i);
+    expect(hint.textContent).toMatch(/1[–-]2 minutes/i);
   });
 
   it("外部域名卡 running=false ∧ 总开关开着：落到「已配置·未运行」态，成因是「服务没在监听」，不是笼统的「开关已关」", async () => {
@@ -1382,7 +1420,7 @@ describe("RemoteSection 已接入设备列表（M5 A6）", () => {
   ];
 
   beforeEach(() => {
-    invokeMock.mockImplementation(async (cmd: string, args?: { key?: string }) => {
+    invokeMock.mockImplementation(async (cmd: string, _args?: { key?: string }) => {
       if (cmd === "remote_status") return statusOf();
       if (cmd === "get_setting") return null;
       if (cmd === "remote_devices") return devicesOf();
@@ -1538,7 +1576,9 @@ describe("RemoteSection B1：撤销 tailscale 前先预览「会连带清掉哪�
     });
   };
   const runStepCalls = (step: string) =>
-    invokeMock.mock.calls.filter((c) => c[0] === "remote_ts_run_step" && (c[1] as { step?: string })?.step === step);
+    invokeMock.mock.calls.filter(
+      (c) => c[0] === "remote_ts_run_step" && (c[1] as { step?: string })?.step === step
+    );
   // 开关在 status 到达前是 disabled（受控态），故先等它可用再点
   const renderAndToggleTsOff = async () => {
     render(<RemoteSection />);
@@ -1641,7 +1681,12 @@ describe("RemoteSection B1：撤销 tailscale 前先预览「会连带清掉哪�
   it("无额外条目（wouldClear=0 ∧ !foreign）：不弹框，走**普通 disable**（非 force）并消费回执", async () => {
     // M-1：不弹框那条路也必须经向导步消费回执——走 remote_toggle_channel 的话
     // stop_channel() 会把 ServeResetReport 丢掉，窗口内配置变了用户只看到日志
-    mockWithPreview({ ok: true, foreign: false, wouldClear: 0, entries: [{ ours: true, label: "ours" }] });
+    mockWithPreview({
+      ok: true,
+      foreign: false,
+      wouldClear: 0,
+      entries: [{ ours: true, label: "ours" }],
+    });
     await renderAndToggleTsOff();
     await waitFor(() => expect(runStepCalls("disable").length).toBe(1));
     expect(runStepCalls("disable_force").length).toBe(0);
@@ -1656,7 +1701,12 @@ describe("RemoteSection B1：撤销 tailscale 前先预览「会连带清掉哪�
       if (cmd === "remote_devices") return [];
       if (cmd === "remote_ts_probe") return null;
       if (cmd === "remote_ts_run_step" && args?.step === "disable_preview")
-        return { ok: true, foreign: false, wouldClear: 0, entries: [{ ours: true, label: "ours" }] };
+        return {
+          ok: true,
+          foreign: false,
+          wouldClear: 0,
+          entries: [{ ours: true, label: "ours" }],
+        };
       if (cmd === "remote_ts_run_step" && args?.step === "disable")
         return {
           ok: true,
@@ -1829,7 +1879,9 @@ describe("RemoteSection i18n zh/en 无缺键（M5 A6）", () => {
     const used = new Set<string>();
     for (const f of sources) {
       const text = readFileSync(f, "utf8");
-      for (const m of text.matchAll(/settings\.remote\.([A-Za-z0-9_]+)/g)) {
+      // 含点号：嵌套键（如 settings.remote.tsWizard.tsTransientHint，2026-10-13 连不通
+      // 引导首例）也必须整键在册——正则不认点号会把嵌套键截成不存在的段名
+      for (const m of text.matchAll(/settings\.remote\.([A-Za-z0-9_.]+)/g)) {
         used.add(m[0]);
       }
     }

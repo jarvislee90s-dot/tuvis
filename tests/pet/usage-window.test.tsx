@@ -120,9 +120,7 @@ describe("usage-window（计划② Task 6：大看板窗口与两个入口）", 
 
     // 步骤 10：插在主菜单**第一个分隔线之前**（第一个分隔线的下一条是「📏 大小」行）
     const sizeRow = screen.getByText(i18n.t("pet.menu.size"));
-    expect(
-      item.compareDocumentPosition(sizeRow) & Node.DOCUMENT_POSITION_FOLLOWING
-    ).toBeTruthy();
+    expect(item.compareDocumentPosition(sizeRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
     fireEvent.click(item);
     expect(onClose).toHaveBeenCalledTimes(1);
