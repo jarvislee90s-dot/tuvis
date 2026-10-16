@@ -1,0 +1,357 @@
+//! Owner Registry：`(hostId, threadId) → current ownerClientId` 的双向索引与恢复代际。
+//!
+//! owner 是临时身份（spec F6/3.2）：断开、Desktop 重启、`client-status-changed`
+//! (disconnected) 都使映射全部失效并触发重新 discovery；旧 owner 的迟到数据不得
+//! 复用（epoch/generation 双代际拒绝）。
+//!
+//! 同步结构、无 await：跟随管理属于上层单 actor（adapter），不在持锁期间等待。
+
+use super::types::{OwnerLease, ProtocolError, ThreadKey};
+use std::collections::{HashMap, HashSet};
+use tokio::sync::watch;
+
+/// 单连接可跟随 Thread 上限（计划「有界资源」）。
+pub const MAX_FOLLOWINGS: usize = 64;
+
+struct LeaseEntry {
+    client_id: String,
+    epoch: u64,
+    generation: u64,
+    validity_tx: watch::Sender<bool>,
+}
+
+/// owner 租约登记表。generation 按 Thread 单调增加；reset 后 epoch 增加。
+#[derive(Default)]
+pub struct OwnerRegistry {
+    epoch: u64,
+    threads: HashMap<ThreadKey, LeaseEntry>,
+    by_client: HashMap<String, HashSet<ThreadKey>>,
+    gens: HashMap<ThreadKey, u64>,
+}
+
+impl OwnerRegistry {
+    /// 绑定 owner（发现成功后调用）。旧绑定（同 thread 或同 client 旧映射）全部
+    /// 失效并向其 validity 信号发 false；generation 单调 +1。epoch 只前进不后退：
+    /// 低于当前 epoch 的 bind（旧连接迟到）存档但不成为 current。
+    pub fn bind(&mut self, key: ThreadKey, client_id: String, epoch: u64) -> OwnerLease {
+        if epoch > self.epoch {
+            self.epoch = epoch;
+        }
+        // 旧绑定失效（换代）
+        if let Some(old) = self.threads.remove(&key) {
+            let _ = old.validity_tx.send(false);
+            if let Some(set) = self.by_client.get_mut(&old.client_id) {
+                set.remove(&key);
+                if set.is_empty() {
+                    self.by_client.remove(&old.client_id);
+                }
+            }
+        }
+        let generation = {
+            let g = self.gens.entry(key.clone()).or_insert(0);
+            *g += 1;
+            *g
+        };
+        let (validity_tx, _) = watch::channel(true);
+        self.threads.insert(
+            key.clone(),
+            LeaseEntry {
+                client_id: client_id.clone(),
+                epoch,
+                generation,
+                validity_tx,
+            },
+        );
+        self.by_client
+            .entry(client_id.clone())
+            .or_default()
+            .insert(key.clone());
+        OwnerLease {
+            key,
+            client_id,
+            epoch,
+            generation,
+        }
+    }
+
+    /// `client-status-changed(disconnected)`：清该 client 的全部映射。
+    pub fn invalidate_client(&mut self, client_id: &str) {
+        let Some(keys) = self.by_client.remove(client_id) else {
+            return;
+        };
+        for key in keys {
+            if let Some(entry) = self.threads.remove(&key) {
+                let _ = entry.validity_tx.send(false);
+            }
+        }
+    }
+
+    /// 重连/Desktop 重启：清全部 lease（epoch 由 supervisor 递增），generation
+    /// 记忆保留（跨 reset 仍单调）。
+    pub fn reset(&mut self, new_epoch: u64) {
+        self.epoch = new_epoch;
+        for (_, entry) in self.threads.drain() {
+            let _ = entry.validity_tx.send(false);
+        }
+        self.by_client.clear();
+    }
+
+    /// 当前绑定（epoch 不符视为无绑定）。
+    pub fn current(&self, key: &ThreadKey) -> Option<OwnerLease> {
+        let entry = self.threads.get(key)?;
+        if entry.epoch != self.epoch {
+            return None;
+        }
+        Some(OwnerLease {
+            key: key.clone(),
+            client_id: entry.client_id.clone(),
+            epoch: entry.epoch,
+            generation: entry.generation,
+        })
+    }
+
+    /// lease 是否仍是当前绑定（client/epoch/generation 三者全匹配）。
+    pub fn is_current(&self, lease: &OwnerLease) -> bool {
+        match self.threads.get(&lease.key) {
+            Some(entry) => {
+                entry.client_id == lease.client_id
+                    && entry.epoch == lease.epoch
+                    && entry.generation == lease.generation
+                    && entry.epoch == self.epoch
+            }
+            None => false,
+        }
+    }
+
+    /// lease 的活性信号：失效/换代时收到 false（adapter 将它传给写请求）。
+    /// 传入旧 lease（已非当前绑定）返回已为 false 的信号。
+    pub fn validity(&self, lease: &OwnerLease) -> watch::Receiver<bool> {
+        if let Some(entry) = self.threads.get(&lease.key) {
+            if entry.client_id == lease.client_id
+                && entry.epoch == lease.epoch
+                && entry.generation == lease.generation
+            {
+                return entry.validity_tx.subscribe();
+            }
+        }
+        // 旧 lease：永久失活信号
+        let (tx, rx) = watch::channel(false);
+        let _ = tx; // 无发送端也可订阅（closed 即读 false？——watch 关闭后 borrow 返回最后值）
+        rx
+    }
+}
+
+/// 跟随集合（有界 64；adapter 消费——看板/详情/有待发消息的 Thread 才跟随）。
+#[derive(Default)]
+pub struct FollowingSet {
+    keys: Vec<ThreadKey>,
+}
+
+impl FollowingSet {
+    pub fn is_following(&self, key: &ThreadKey) -> bool {
+        self.keys.contains(key)
+    }
+
+    /// 满员返回 false（不挤掉既有跟随）。
+    pub fn follow(&mut self, key: ThreadKey) -> bool {
+        if self.keys.contains(&key) {
+            return true;
+        }
+        if self.keys.len() >= MAX_FOLLOWINGS {
+            return false;
+        }
+        self.keys.push(key);
+        true
+    }
+
+    /// 退出跟随（释放名额）。
+    pub fn unfollow(&mut self, key: &ThreadKey) -> bool {
+        let before = self.keys.len();
+        self.keys.retain(|k| k != key);
+        self.keys.len() != before
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+/// 发现 owner 并声明 following，等到首帧 snapshot 才算完成（无 following 不允许
+/// 假装同步完成；重连恢复 = 重新 discovery → 重新 following → 等 snapshot）。
+pub async fn discover_and_follow(
+    conn: &super::connection::ConnectionHandle,
+    owners: &mut OwnerRegistry,
+    key: &ThreadKey,
+) -> Result<OwnerLease, ProtocolError> {
+    // 1) owner discovery（params 携带 hostId:"local"；envelope 不发 hostId → 基值版本）
+    let version = conn.version_of("thread-owner-discovery")?;
+    let outcome = conn
+        .request(super::connection::RpcRequest {
+            method: "thread-owner-discovery".into(),
+            params: serde_json::json!({
+                "hostId": key.host_id,
+                "conversationId": key.thread_id,
+            }),
+            version: Some(version),
+            target: None,
+            mutating: false,
+            validity: None,
+        })
+        .await;
+    match outcome.delivery {
+        super::types::Delivery::Accepted => {}
+        super::types::Delivery::Rejected => {
+            // no-client-found 等：不能以此判定 A 写请求没送达；此处按发现失败处理
+            return Err(ProtocolError::InvalidState(format!(
+                "owner discovery rejected: {:?}",
+                outcome.result
+            )));
+        }
+        super::types::Delivery::NotSent => {
+            return Err(ProtocolError::Disconnected(
+                "owner discovery not sent".into(),
+            ));
+        }
+        super::types::Delivery::UnknownDelivery => {
+            return Err(ProtocolError::Timeout(
+                "owner discovery outcome unknown".into(),
+            ));
+        }
+    }
+    let owner_id = outcome.handled_by.ok_or_else(|| {
+        ProtocolError::InvalidState("owner discovery missing handledByClientId".into())
+    })?;
+
+    // 2) 绑定 lease（connection epoch = 本连接代际）
+    let lease = owners.bind(key.clone(), owner_id, conn.epoch());
+
+    // 3) 声明 following（broadcast v1；probe 定案：已跟随再声明会触发新 snapshot）
+    let version = conn.version_of("thread-stream-following-changed")?;
+    conn.broadcast(
+        "thread-stream-following-changed",
+        version,
+        serde_json::json!({
+            "conversationId": key.thread_id,
+            "hostId": key.host_id,
+            "following": true,
+        }),
+    )
+    .await?;
+
+    // 4) 等 owner 下发的 targeted snapshot（thread-stream-state-changed v11）
+    let mut rx = conn.subscribe();
+    loop {
+        match tokio::time::timeout(super::connection::RPC_TIMEOUT, rx.recv()).await {
+            Ok(Ok(super::connection::ConnectionEvent::Broadcast { frame, .. })) => {
+                if frame.get("method").and_then(|m| m.as_str())
+                    == Some("thread-stream-state-changed")
+                    && frame["params"]["conversationId"]
+                        == serde_json::Value::String(key.thread_id.clone())
+                {
+                    return Ok(lease);
+                }
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) => {
+                return Err(ProtocolError::Disconnected("event channel closed".into()));
+            }
+            Err(_) => {
+                return Err(ProtocolError::Timeout(
+                    "no snapshot after following declaration".into(),
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(id: &str) -> ThreadKey {
+        ThreadKey {
+            host_id: "local".into(),
+            thread_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn disconnect_invalidates_every_thread_of_owner() {
+        let mut r = OwnerRegistry::default();
+        let a = r.bind(key("t1"), "owner-a".into(), 1);
+        let b = r.bind(key("t2"), "owner-a".into(), 1);
+        r.invalidate_client("owner-a");
+        assert!(!r.is_current(&a));
+        assert!(!r.is_current(&b));
+        assert!(r.current(&key("t1")).is_none());
+        assert!(r.current(&key("t2")).is_none());
+        // 无关 owner 不受影响
+        let c = r.bind(key("t3"), "owner-c".into(), 1);
+        assert!(r.is_current(&c));
+    }
+
+    #[test]
+    fn old_epoch_never_becomes_current() {
+        let mut r = OwnerRegistry::default();
+        let a = r.bind(key("t1"), "owner-a".into(), 1);
+        assert!(r.is_current(&a));
+        r.reset(2);
+        assert!(!r.is_current(&a), "reset 后旧 epoch lease 一律失效");
+        assert!(r.current(&key("t1")).is_none());
+        // 旧 epoch 的 bind 不能通过 current 复活
+        let b = r.bind(key("t2"), "owner-b".into(), 1); // 旧 epoch 再次 bind
+        assert!(!r.is_current(&b), "epoch=1 ≠ registry.epoch=2");
+        assert!(r.current(&key("t2")).is_none());
+    }
+
+    #[test]
+    fn generation_is_monotonic_per_thread() {
+        let mut r = OwnerRegistry::default();
+        let a = r.bind(key("t1"), "owner-a".into(), 1);
+        assert_eq!(a.generation, 1);
+        let a2 = r.bind(key("t1"), "owner-b".into(), 1);
+        assert_eq!(a2.generation, 2, "换代 generation 单调 +1");
+        assert!(!r.is_current(&a), "旧 generation 失效");
+        r.reset(2);
+        let a3 = r.bind(key("t1"), "owner-c".into(), 2);
+        assert_eq!(a3.generation, 3, "跨 reset 仍单调");
+    }
+
+    #[test]
+    fn validity_signal_fires_false_on_invalidate_and_rebind() {
+        let mut r = OwnerRegistry::default();
+        let a = r.bind(key("t1"), "owner-a".into(), 1);
+        let mut v = r.validity(&a);
+        assert!(*v.borrow_and_update());
+        r.invalidate_client("owner-a");
+        assert!(!*v.borrow_and_update(), "invalidate 后信号转 false");
+
+        let a2 = r.bind(key("t1"), "owner-b".into(), 1);
+        let mut v_old = r.validity(&a); // 旧 lease 查询
+        assert!(!*v_old.borrow_and_update());
+        let mut v2 = r.validity(&a2);
+        assert!(*v2.borrow_and_update());
+        let _ = r.bind(key("t1"), "owner-c".into(), 1); // 换代
+        assert!(!*v2.borrow_and_update(), "换代后旧 lease 信号 false");
+    }
+
+    #[test]
+    fn following_set_is_bounded_and_releases_slots() {
+        let mut s = FollowingSet::default();
+        for i in 0..MAX_FOLLOWINGS {
+            assert!(s.follow(key(&format!("t{i}"))));
+        }
+        assert!(!s.follow(key("overflow")), "满员拒绝，不挤既有跟随");
+        assert_eq!(s.len(), MAX_FOLLOWINGS);
+        assert!(s.is_following(&key("t0")));
+        assert!(s.unfollow(&key("t0")), "退出释放名额");
+        assert!(s.follow(key("overflow")), "释放后可再跟随");
+        assert_eq!(s.len(), MAX_FOLLOWINGS);
+        assert!(!s.unfollow(&key("不存在的")), "移除不存在的键返回 false");
+        assert_eq!(s.len(), MAX_FOLLOWINGS);
+    }
+}

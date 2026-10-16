@@ -10,8 +10,11 @@ use multi_agents_manager_lib::services::codex_desktop_ipc::codec::encode_frame;
 use multi_agents_manager_lib::services::codex_desktop_ipc::connection::{
     spawn, ConnectionEvent, ConnectionHandle, RpcOutcome, RpcRequest, RPC_TIMEOUT,
 };
+use multi_agents_manager_lib::services::codex_desktop_ipc::owners::{
+    discover_and_follow, OwnerRegistry,
+};
 use multi_agents_manager_lib::services::codex_desktop_ipc::profile::profile_for;
-use multi_agents_manager_lib::services::codex_desktop_ipc::types::Delivery;
+use multi_agents_manager_lib::services::codex_desktop_ipc::types::{Delivery, ThreadKey};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -406,5 +409,266 @@ async fn pending_capacity_rejects_before_enqueue() {
             .expect("task ok");
         assert_eq!(o.delivery, Delivery::Accepted);
     }
+    conn.shutdown().await;
+}
+
+// ---------------- Task 4：Owner Registry / following / 恢复代际（集成） ----------------
+
+/// discovery 响应帧。
+fn discovery_response(request_id: &str, owner: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "response",
+        "requestId": request_id,
+        "resultType": "success",
+        "method": "thread-owner-discovery",
+        "handledByClientId": owner,
+        "result": { "supportsUntrustedAppInput": true }
+    })
+}
+
+#[tokio::test]
+async fn discover_and_follow_declares_and_waits_snapshot() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let owners = OwnerRegistry::default();
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "thread-9".into(),
+    };
+    let task = {
+        let c = conn.clone();
+        let mut owners = owners;
+        let key = key.clone();
+        tokio::spawn(async move { discover_and_follow(&c, &mut owners, &key).await })
+    };
+
+    // 逐字段断言 discovery params（hostId 放 params；envelope 不发 hostId，version=1 基值）
+    let disc = peer.recv().await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    assert_eq!(disc["version"], serde_json::json!(1));
+    assert!(disc.get("hostId").is_none(), "envelope 不发 hostId");
+    assert_eq!(disc["params"]["hostId"], "local");
+    assert_eq!(disc["params"]["conversationId"], "thread-9");
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+
+    // following 声明 = broadcast v1，params 带 following:true + hostId
+    let follow = peer.recv().await;
+    assert_eq!(follow["type"], "broadcast");
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    assert_eq!(follow["version"], serde_json::json!(1));
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    assert_eq!(follow["params"]["conversationId"], "thread-9");
+    assert_eq!(follow["params"]["hostId"], "local");
+
+    // 无 following 不允许假装同步完成：snapshot 到达前不返回
+    // （此处先回 snapshot，任务随即完成）
+    peer.send(&serde_json::json!({
+        "type": "broadcast",
+        "method": "thread-stream-state-changed",
+        "version": 11,
+        "sourceClientId": "owner-1",
+        "targetClientIds": ["tuvis"],
+        "params": {
+            "conversationId": "thread-9",
+            "hostId": "local",
+            "change": { "type": "snapshot", "revision": 1, "conversationState": {} }
+        }
+    }))
+    .await;
+    let lease = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("in time")
+        .expect("task ok")
+        .expect("lease");
+    assert_eq!(lease.client_id, "owner-1");
+    assert_eq!(lease.key.thread_id, "thread-9");
+    assert_eq!(lease.epoch, 1);
+    conn.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_snapshot_after_following_is_timeout_not_fake_success() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let task = {
+        let c = conn.clone();
+        tokio::spawn(async move {
+            let mut owners = OwnerRegistry::default();
+            let key = ThreadKey {
+                host_id: "local".into(),
+                thread_id: "thread-9".into(),
+            };
+            discover_and_follow(&c, &mut owners, &key).await
+        })
+    };
+    let disc = peer.recv().await;
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let _follow = peer.recv().await; // 声明后永不回 snapshot
+    let result = tokio::time::timeout(RPC_TIMEOUT + Duration::from_secs(1), task)
+        .await
+        .expect("virtual time fires")
+        .expect("task ok");
+    assert!(matches!(
+        result,
+        Err(
+            multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError::Timeout(_)
+        )
+    ));
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn discovery_no_client_found_is_error_not_owner() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let task = {
+        let c = conn.clone();
+        tokio::spawn(async move {
+            let mut owners = OwnerRegistry::default();
+            let key = ThreadKey {
+                host_id: "local".into(),
+                thread_id: "ghost".into(),
+            };
+            discover_and_follow(&c, &mut owners, &key).await
+        })
+    };
+    let disc = peer.recv().await;
+    peer.send(&serde_json::json!({
+        "type": "response",
+        "requestId": disc["requestId"],
+        "resultType": "error",
+        "method": "thread-owner-discovery",
+        "error": { "code": "no-client-found" }
+    }))
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("in time")
+        .expect("task ok");
+    assert!(result.is_err(), "no-client-found 不能伪装成发现成功");
+    conn.shutdown().await;
+}
+
+#[tokio::test]
+async fn owner_rebind_invalidates_old_lease_end_to_end() {
+    use std::sync::Arc;
+    use tokio::sync::Mutex as AsyncMutex;
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let owners = Arc::new(AsyncMutex::new(OwnerRegistry::default()));
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "thread-9".into(),
+    };
+    let follow_once = {
+        let c = conn.clone();
+        let owners = owners.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            let mut g = owners.lock().await;
+            discover_and_follow(&c, &mut g, &key).await
+        })
+    };
+    let disc = peer.recv().await;
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let _ = peer.recv().await; // following
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "params": { "conversationId": "thread-9", "hostId": "local",
+                    "change": { "type": "snapshot", "revision": 1, "conversationState": {} } }
+    }))
+    .await;
+    let lease_a = tokio::time::timeout(Duration::from_secs(5), follow_once)
+        .await
+        .expect("in time")
+        .expect("task ok")
+        .expect("lease");
+
+    // owner A → B（Desktop 重启换代语义）：重新 discovery 命中新 owner
+    let follow_again = {
+        let c = conn.clone();
+        let owners = owners.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            let mut g = owners.lock().await;
+            discover_and_follow(&c, &mut g, &key).await
+        })
+    };
+    let disc2 = peer.recv().await;
+    peer.send(&discovery_response(
+        disc2["requestId"].as_str().unwrap(),
+        "owner-2",
+    ))
+    .await;
+    let _ = peer.recv().await;
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "params": { "conversationId": "thread-9", "hostId": "local",
+                    "change": { "type": "snapshot", "revision": 2, "conversationState": {} } }
+    }))
+    .await;
+    let lease_b = tokio::time::timeout(Duration::from_secs(5), follow_again)
+        .await
+        .expect("in time")
+        .expect("task ok")
+        .expect("lease");
+
+    assert_eq!(lease_b.client_id, "owner-2");
+    assert_eq!(
+        lease_b.generation,
+        lease_a.generation + 1,
+        "换代 generation 单调"
+    );
+    {
+        // 旧 lease 在 registry 里已非当前绑定；其真实活性信号为 false
+        let g = owners.lock().await;
+        assert!(!g.is_current(&lease_a));
+        let mut v = g.validity(&lease_a);
+        assert!(!*v.borrow_and_update(), "旧 lease validity = false");
+    }
+    // 旧 lease 的写请求（带真实失活信号）被拒为 NotSent，且不写帧
+    let validity = {
+        let g = owners.lock().await;
+        g.validity(&lease_a)
+    };
+    let outcome = conn
+        .request(RpcRequest {
+            method: "thread-follower-start-turn".into(),
+            params: serde_json::json!({}),
+            version: Some(2),
+            target: Some(lease_a.clone()),
+            mutating: true,
+            validity: Some(validity),
+        })
+        .await;
+    assert_eq!(outcome.delivery, Delivery::NotSent);
     conn.shutdown().await;
 }
