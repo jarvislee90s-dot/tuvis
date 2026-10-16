@@ -213,7 +213,7 @@ pub fn version_gate_receipt(session_id: &str, verdict: &ProbeVerdict) -> Option<
         ProbeVerdict::Fail { hint, .. } => Some(
             Receipt::failed(
                 Stage::VersionGate,
-                &format!("版本门控未通过（拒发，不盲发）；{hint}"),
+                &format!("GATE_VERSION_REFUSED: 版本门控未通过（拒发，不盲发）；{hint}"),
             )
             .with_session(session_id)
             // Task 2 duration 透传：审计行出真实耗时（旧态是回执默认值的「· 0ms」）
@@ -234,13 +234,14 @@ pub fn zcode_verdict(stdout: &str, stderr_tail: &str, exit: Option<i32>, os: &st
     );
     let mac_hint = if os == "macos" {
         format!(
-            "Mac 打包布局下须设 {ZCODE_PROVIDER_CONFIG_ENV}=<Resources>/config/provider/zcode-builtin.json（不设则 --prompt 静默无 JSON）"
+            "GATE_MAC_PROVIDER_HINT: Mac 打包布局下须设 {ZCODE_PROVIDER_CONFIG_ENV}=<Resources>/config/provider/zcode-builtin.json（不设则 --prompt 静默无 JSON）"
         )
     } else {
-        "检查 ZCode 安装与 provider 配置（--prompt 干跑无 JSON 输出）".to_string()
+        "GATE_GENERIC_PROVIDER_HINT: 检查 ZCode 安装与 provider 配置（--prompt 干跑无 JSON 输出）"
+            .to_string()
     };
     ProbeVerdict::fail(format!(
-        "zcode --prompt 干跑未出 JSON（exit={exit:?}）{mac_hint}；stderr={detail}"
+        "GATE_ZCODE_NO_JSON: zcode --prompt 干跑未出 JSON（exit={exit:?}）{mac_hint}；stderr={detail}"
     ))
 }
 
@@ -254,7 +255,7 @@ pub fn codex_verdict(stdout: &str, stderr_tail: &str, exit: Option<i32>) -> Prob
         crate::inject::normalize::AUDIT_SUMMARY_CHARS,
     );
     ProbeVerdict::fail(format!(
-        "codex queue 子命令不在场（experimental 面，升级可能消失；exit={exit:?}）；stderr={detail}"
+        "GATE_CODEX_QUEUE_MISSING: codex queue 子命令不在场（experimental 面，升级可能消失；exit={exit:?}）；stderr={detail}"
     ))
 }
 
@@ -282,7 +283,7 @@ fn timeout_verdict(captured_stdout: &str) -> ProbeVerdict {
 /// 两通道共用同一份文案生成，禁止各自维护副本漂移。
 pub(crate) fn timeout_zero_output_hint() -> String {
     format!(
-        "探针回合超时（本机实测最小回合 15–19s，阈值已放宽至 {}s）——反复超时请检查网络/模型服务",
+        "GATE_PROBE_TIMEOUT: 探针回合超时（本机实测最小回合 15–19s，阈值已放宽至 {}s）——反复超时请检查网络/模型服务",
         PROBE_TIMEOUT_MS / 1000
     )
 }
@@ -321,7 +322,7 @@ fn provider_config_present(cjs: &str, os: &str) -> bool {
 fn l0_stat_verdict(spec: &ProbeSpec, os: &str) -> Option<ProbeVerdict> {
     if !std::path::Path::new(spec.exe()).is_file() {
         return Some(ProbeVerdict::fail(format!(
-            "L0 结构检查：可执行不在场（不 spawn）：{}",
+            "GATE_L0_EXE_MISSING: L0 结构检查：可执行不在场（不 spawn）：{}",
             spec.exe()
         )));
     }
@@ -331,13 +332,13 @@ fn l0_stat_verdict(spec: &ProbeSpec, os: &str) -> Option<ProbeVerdict> {
         ProbeSpec::Zcode { cjs, .. } => {
             if !std::path::Path::new(cjs).is_file() {
                 return Some(ProbeVerdict::fail(format!(
-                    "L0 结构检查：zcode.cjs 缺失（resources/glm 布局损坏）：{cjs}"
+                    "GATE_L0_CJS_MISSING: L0 结构检查：zcode.cjs 缺失（resources/glm 布局损坏）：{cjs}"
                 )));
             }
             if !provider_config_present(cjs, os) {
                 let expected = zcode_provider_config_path(cjs).unwrap_or_default();
                 return Some(ProbeVerdict::fail(format!(
-                    "L0 结构检查：provider config 缺失（预期 {expected} 或 <resources>/glm/provider/zcode-builtin.json；修复/重装 ZCode 后自动重探）"
+                    "GATE_L0_PROVIDER_CONFIG_MISSING: L0 结构检查：provider config 缺失（预期 {expected} 或 <resources>/glm/provider/zcode-builtin.json；修复/重装 ZCode 后自动重探）"
                 )));
             }
             None
@@ -385,11 +386,13 @@ fn l0_help_verdict(
     exe: &str,
 ) -> ProbeVerdict {
     if stage == Some(Stage::Spawn) {
-        return ProbeVerdict::fail(format!("L0 --help spawn 失败：{exe}"));
+        return ProbeVerdict::fail(format!(
+            "GATE_L0_HELP_SPAWN_FAIL: L0 --help spawn 失败：{exe}"
+        ));
     }
     if stage == Some(Stage::Timeout) {
         return ProbeVerdict::fail(format!(
-            "L0 --help 超时（{}s 内未起未印——CLI 起动面已坏，不烧真回合）",
+            "GATE_L0_HELP_TIMEOUT: L0 --help 超时（{}s 内未起未印——CLI 起动面已坏，不烧真回合）",
             L0_HELP_TIMEOUT_MS / 1000
         ));
     }
@@ -400,7 +403,7 @@ fn l0_help_verdict(
     let detail =
         crate::inject::normalize::summarize(stderr, crate::inject::normalize::AUDIT_SUMMARY_CHARS);
     ProbeVerdict::fail(format!(
-        "L0 --help 未能起能印（exit={exit:?}，stdout {} 字节）；stderr={detail}",
+        "GATE_L0_HELP_SILENT: L0 --help 未能起能印（exit={exit:?}，stdout {} 字节）；stderr={detail}",
         stdout.len()
     ))
 }
@@ -457,7 +460,7 @@ async fn probe_round(spec: &ProbeSpec, os: &str) -> ProbeVerdict {
             ProbeSpec::Codex { .. } => ProbeVerdict::fail(timeout_zero_output_hint()),
         }
     } else if receipt.stage == Some(Stage::Spawn) {
-        ProbeVerdict::fail(format!("探针 spawn 失败：{}", spec.exe()))
+        ProbeVerdict::fail(format!("PROBE_SPAWN_FAIL: 探针 spawn 失败：{}", spec.exe()))
     } else {
         let stdout = r.captured_stdout().join("\n");
         let stderr = r.captured_stderr();
@@ -650,7 +653,10 @@ where
     let verdict = if key.exe_present {
         run()
     } else {
-        ProbeVerdict::fail(format!("可执行文件不在场（不 spawn）：{}", key.exe))
+        ProbeVerdict::fail(format!(
+            "PROBE_EXE_MISSING: 可执行文件不在场（不 spawn）：{}",
+            key.exe
+        ))
     };
     cache.put_at(key, verdict.clone(), now);
     verdict
@@ -702,7 +708,10 @@ where
         run().await
     } else {
         // 缺席即拒发（不 spawn 一个不存在的程序）——同样入缓存、同样被后到者复用
-        ProbeVerdict::fail(format!("可执行文件不在场（不 spawn）：{}", key.exe))
+        ProbeVerdict::fail(format!(
+            "PROBE_EXE_MISSING: 可执行文件不在场（不 spawn）：{}",
+            key.exe
+        ))
     };
     cache.put(key, verdict.clone());
     verdict

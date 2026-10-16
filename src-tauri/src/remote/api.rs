@@ -2545,7 +2545,7 @@ async fn run_wb_turn(
             log::error!("workbuddy 无头回合任务异常: {e}");
             let receipt = crate::inject::headless::receipt::Receipt::failed(
                 crate::inject::headless::receipt::Stage::ChannelError,
-                "回合内部任务异常终止（结果未知，请在 WorkBuddy 应用内确认）",
+                "RAPI_WB_TURN_TASK_ABORTED: 回合内部任务异常终止（结果未知，请在 WorkBuddy 应用内确认）",
             )
             .with_session(&sid);
             // **本臂也必须落账**（R10）：不落 = 这条回合「起跑了但从未入账」，审计页上凭空
@@ -2685,7 +2685,7 @@ pub(crate) async fn wb_headless_dispatch(
             return ctx.refuse(
                 st,
                 Stage::ChannelError,
-                "回合内部任务异常终止（结果未知，请在 WorkBuddy 应用内确认）",
+                "RAPI_WB_TURN_TASK_ABORTED: 回合内部任务异常终止（结果未知，请在 WorkBuddy 应用内确认）",
             );
         }
     };
@@ -2819,7 +2819,7 @@ async fn run_dsh_turn(
             DshTurnOut {
                 receipt: Receipt::failed(
                     Stage::ChannelError,
-                    "回合内部任务异常终止（结果未知，请打开 dsh 桌面端确认）",
+                    "RAPI_DSH_TURN_TASK_ABORTED: 回合内部任务异常终止（结果未知，请打开 dsh 桌面端确认）",
                 )
                 .with_session(&sid),
                 permission_notes: Vec::new(),
@@ -2884,7 +2884,7 @@ pub(crate) async fn dsh_acp_headless_dispatch(
             st,
             Stage::Refused,
             &format!(
-                "会话项目路径非绝对形态（{}）——dsh resume 的 cwd 必填且须绝对，投递前拒",
+                "RAPI_DSH_CWD_NOT_ABSOLUTE: 会话项目路径非绝对形态（{}）——dsh resume 的 cwd 必填且须绝对，投递前拒",
                 session.project_path
             ),
         );
@@ -2952,7 +2952,7 @@ pub(crate) async fn dsh_acp_headless_dispatch(
             return ctx.refuse(
                 st,
                 Stage::ChannelError,
-                "回合内部任务异常终止（结果未知，请打开 dsh 桌面端确认）",
+                "RAPI_DSH_TURN_TASK_ABORTED: 回合内部任务异常终止（结果未知，请打开 dsh 桌面端确认）",
             );
         }
     };
@@ -3875,7 +3875,7 @@ pub(crate) async fn cli_headless_dispatch(
             st,
             Stage::Spawn,
             &format!(
-                "{program} CLI 不可达（PATH 上未找到 {program} / {program}.exe / {program}.cmd）"
+                "RAPI_CLI_NOT_FOUND: {program} CLI 不可达（PATH 上未找到 {program} / {program}.exe / {program}.cmd）"
             ),
         );
     };
@@ -4063,7 +4063,7 @@ async fn claude_turn_in_task(
             runner_cfg.disarm_cancel();
             return Receipt::failed(
                 crate::inject::headless::receipt::Stage::Spawn,
-                &format!("claude 进程 spawn 失败：{e}"),
+                &format!("RAPI_CLAUDE_SPAWN_FAILED: claude 进程 spawn 失败：{e}"),
             )
             .with_session(&session.id);
         }
@@ -4229,7 +4229,7 @@ pub async fn session_headless_approve(
             StatusCode::OK,
             serde_json::json!({
                 "delivered": false,
-                "reason": "没有待答的审批/问答请求（回合可能已终结、被取消或已超时）",
+                "reason": "HEADLESS_NO_PENDING: 没有待答的审批/问答请求（回合可能已终结、被取消或已超时）",
             }),
         );
     };
@@ -4247,7 +4247,7 @@ pub async fn session_headless_approve(
                     StatusCode::BAD_REQUEST,
                     serde_json::json!({
                         "error": "bad_request",
-                        "reason": "answers 里存在空题面（question 字段缺失或全为空白）——\
+                        "reason": "RAPI_EMPTY_QUESTION_FIELD: answers 里存在空题面（question 字段缺失或全为空白）——\
                                    题面必须是登记题集里的题干原文",
                     }),
                 );
@@ -4261,7 +4261,7 @@ pub async fn session_headless_approve(
                     StatusCode::BAD_REQUEST,
                     serde_json::json!({
                         "error": "bad_request",
-                        "reason": "answer 决策必须携带 answers（问答卡未提交任何答案）",
+                        "reason": "RAPI_ANSWERS_REQUIRED: answer 决策必须携带 answers（问答卡未提交任何答案）",
                     }),
                 );
             }
@@ -4288,7 +4288,7 @@ pub async fn session_headless_approve(
                     StatusCode::BAD_REQUEST,
                     serde_json::json!({
                         "error": "bad_request",
-                        "reason": format!("未知决策词 {other:?}（合法值：allow / deny / answer）"),
+                        "reason": format!("RAPI_UNKNOWN_DECISION_WORD: 未知决策词 {other:?}（合法值：allow / deny / answer）"),
                     }),
                 )
             }
@@ -4461,7 +4461,7 @@ pub async fn session_headless_cancel(
             StatusCode::OK,
             serde_json::json!({
                 "cancelled": false,
-                "reason": "该会话没有在飞的无头回合",
+                "reason": "RAPI_NO_INFLIGHT_TURN: 该会话没有在飞的无头回合",
             }),
         );
     };
@@ -4496,7 +4496,7 @@ pub async fn session_headless_cancel(
                         serde_json::json!({
                             "cancelled": false,
                             "reason": format!(
-                                "{}——中止请求未送达（在飞回合的协议中止依赖 turn/interrupt）",
+                                "RAPI_INTERRUPT_NOT_DELIVERED: {}——中止请求未送达（在飞回合的协议中止依赖 turn/interrupt）",
                                 probe_degraded_reason(hint)
                             ),
                         }),
@@ -4510,7 +4510,7 @@ pub async fn session_headless_cancel(
                     StatusCode::OK,
                     serde_json::json!({
                         "cancelled": false,
-                        "reason": "协议面状态未知（探测任务异常）——本次未取消，请重试",
+                        "reason": "RAPI_PROBE_STATE_UNKNOWN: 协议面状态未知（探测任务异常）——本次未取消，请重试",
                     }),
                 );
             }
@@ -4565,7 +4565,7 @@ pub async fn session_headless_cancel(
             StatusCode::OK,
             serde_json::json!({
                 "cancelled": false,
-                "reason": "取消未送达（回合已终结或已取消——先到者生效）",
+                "reason": "RAPI_CANCEL_NOT_DELIVERED: 取消未送达（回合已终结或已取消——先到者生效）",
             }),
         ),
     }
@@ -5939,9 +5939,9 @@ pub async fn session_approve_options(
 /// 「模式」组标题一致）；其余组按组屏显标签出「切换{组}至 X」（如「切换权限至 只读」）。
 fn mode_audit_content(group: crate::inject::mode::ModeGroupId, label: &str) -> String {
     if group == crate::inject::mode::ModeGroupId::Mode {
-        format!("切换模式至 {label}")
+        format!("RAPI_MODE_SWITCH_AUDIT: 切换模式至 {label}")
     } else {
-        format!("切换{}至 {label}", group.label())
+        format!("RAPI_GROUP_SWITCH_AUDIT: 切换{}至 {label}", group.label())
     }
 }
 
@@ -12023,7 +12023,7 @@ async fn codex_app_mode_switch_arm(
             &device_id,
             &device_name,
             &sid,
-            &format!("切换权限至 {target}"),
+            &format!("RAPI_POLICY_SWITCH_AUDIT: 切换权限至 {target}"),
             "refused:no_mechanism",
             0,
         );
@@ -12031,12 +12031,12 @@ async fn codex_app_mode_switch_arm(
             StatusCode::CONFLICT,
             serde_json::json!({
                 "error": "no_mechanism",
-                "reason": "APP 会话切档走协议通道，仅支持 全自动(never) / 默认(on-request) / 安全(untrusted) 三档",
+                "reason": "RAPI_POLICY_TARGET_UNSUPPORTED: APP 会话切档走协议通道，仅支持 全自动(never) / 默认(on-request) / 安全(untrusted) 三档",
             }),
         );
     };
     let label = codex_app_policy_label(policy);
-    let audit_content = format!("切换权限至 {label}");
+    let audit_content = format!("RAPI_POLICY_SWITCH_AUDIT: 切换权限至 {label}");
     // 0') Task 7 可用性探测门（设计 §3.5 版本门行 + §10 风险 2）：协议面动作前置
     //     探测（spawn + initialize + 方法在场性——缓存纪律：成功长缓存/失败 5min
     //     TTL/键含 exe mtime，防版本漂移时每动作都付一次失败 spawn）。门在串行锁
@@ -12115,7 +12115,7 @@ async fn codex_app_mode_switch_arm(
             StatusCode::OK,
             serde_json::json!({
                 "status": "failed",
-                "error": "该会话已有在飞的无头回合（MAM 串行锁）——本条未投递，请等回执后再发",
+                "error": "RAPI_SERIAL_LOCK_BUSY: 该会话已有在飞的无头回合（MAM 串行锁）——本条未投递，请等回执后再发",
                 "code": "busy",
             }),
         );
@@ -12212,7 +12212,7 @@ async fn codex_app_mode_switch_arm(
                 StatusCode::OK,
                 serde_json::json!({
                     "status": "failed",
-                    "error": "无法确定 codex thread UUID（rollout 文件名与会话号都无 UUID）——不按会话名投递",
+                    "error": "RAPI_THREAD_UUID_UNRESOLVED: 无法确定 codex thread UUID（rollout 文件名与会话号都无 UUID）——不按会话名投递",
                     "code": "invalid_target",
                 }),
             );
@@ -12231,7 +12231,7 @@ async fn codex_app_mode_switch_arm(
                 StatusCode::OK,
                 serde_json::json!({
                     "status": "failed",
-                    "error": "codex CLI 不可达（PATH 上未找到 codex）——协议面不可用",
+                    "error": "RAPI_CODEX_CLI_UNREACHABLE: codex CLI 不可达（PATH 上未找到 codex）——协议面不可用",
                     "code": "cli_unreachable",
                 }),
             );
@@ -12262,7 +12262,7 @@ async fn codex_app_mode_switch_arm(
                     "hit",
                     true,
                     serde_json::Value::Null,
-                    format!("已切换至 {label}（协议读回核对一致）"),
+                    format!("RAPI_POLICY_SWITCHED: 已切换至 {label}（协议读回核对一致）"),
                     "ok".to_string(),
                 ),
                 PolicyVerify::Mismatch { readback } => (
@@ -12270,7 +12270,7 @@ async fn codex_app_mode_switch_arm(
                     false,
                     serde_json::json!(readback),
                     format!(
-                        "档位读回为「{readback}」，与目标 {label} 不符——请以 APP 实况为准后重试"
+                        "RAPI_POLICY_READBACK_MISMATCH: 档位读回为「{readback}」，与目标 {label} 不符——请以 APP 实况为准后重试"
                     ),
                     format!("mismatch:{readback}"),
                 ),
@@ -12306,7 +12306,9 @@ async fn codex_app_mode_switch_arm(
             // 跳过，避免同一句事实写两遍（也避免把「未做核对」说成「仍可能补上」）
             let unobserved = !r.turn_completion.observed && r.carrier != PolicyCarrier::ResumeOnly;
             let hint = if unobserved && r.verify != PolicyVerify::Ineffective {
-                format!("{hint}；回合完成通知未观测到（可能仍在途）")
+                format!(
+                    "RAPI_TURN_COMPLETION_UNOBSERVED: {hint}；回合完成通知未观测到（可能仍在途）"
+                )
             } else {
                 hint
             };
@@ -12576,7 +12578,7 @@ pub async fn session_mode_switch(
                 StatusCode::CONFLICT,
                 serde_json::json!({
                     "error": "blocked_by_question",
-                    "reason": "终端正有待答的问题——切权限/模式的命令会误选答案，请先在问答卡作答",
+                    "reason": "RAPI_QUESTION_PENDING_BLOCK: 终端正有待答的问题——切权限/模式的命令会误选答案，请先在问答卡作答",
                 }),
             );
         }
@@ -12589,7 +12591,7 @@ pub async fn session_mode_switch(
                 StatusCode::OK,
                 serde_json::json!({
                     "status": "failed",
-                    "error": "codex 运行中不接受模式切换（shift+tab），请等回合结束后重试",
+                    "error": "RAPI_MODE_SWITCH_BUSY: codex 运行中不接受模式切换（shift+tab），请等回合结束后重试",
                 }),
             );
         }
@@ -12606,9 +12608,9 @@ pub async fn session_mode_switch(
         resolve_session_target(&st, &mut session)
     {
         let audit_content = if group == crate::inject::mode::ModeGroupId::Mode {
-            format!("切换模式至 {label}")
+            format!("RAPI_MODE_SWITCH_AUDIT: 切换模式至 {label}")
         } else {
-            format!("切换{}至 {label}", group.label())
+            format!("RAPI_GROUP_SWITCH_AUDIT: 切换{}至 {label}", group.label())
         };
         let msg = ambiguous_target_refusal(
             &st,
@@ -12958,7 +12960,7 @@ fn codex_mode_toggle_hint(
         .map(|m| format!("前读=终端当前 {}", m.label()))
         .unwrap_or_default();
     let body = if out.verified {
-        "已切换（屏读核验命中）".to_string()
+        "RAPI_MODE_SWITCH_VERIFIED: 已切换（屏读核验命中）".to_string()
     } else {
         match out.observed {
             // 变了但不是目标档：报出两边（不假装成功）
@@ -12966,7 +12968,9 @@ fn codex_mode_toggle_hint(
                 format!("屏已切换至 {}（预期 {label}）——请人工核对终端", o.label())
             }
             // 未生效/读不到：可重试
-            _ => "切换未生效（屏面无变化/读不到）——可重试".to_string(),
+            _ => {
+                "RAPI_MODE_SWITCH_INEFFECTIVE: 切换未生效（屏面无变化/读不到）——可重试".to_string()
+            }
         }
     };
     if pre.is_empty() {
@@ -13614,7 +13618,7 @@ fn has_active_session_for(st: &Arc<RemoteState>, tool: &str, dir: &str) -> bool 
 fn revalidate_canonical_dir(dir: &str) -> Result<String, crate::inject::create_path::PathReject> {
     let canon = std::fs::canonicalize(dir).map_err(|e| crate::inject::create_path::PathReject {
         code: "mkdir_failed",
-        message: format!("路径真值解析失败（{dir}）：{e}"),
+        message: format!("RAPI_PROJECT_PATH_RESOLVE_FAILED: 路径真值解析失败（{dir}）：{e}"),
     })?;
     let canon = canon
         .to_string_lossy()
@@ -13886,7 +13890,7 @@ fn run_create_pipeline(st: Arc<RemoteState>, run: CreateRun) {
             &st,
             &run,
             "spawn_failed",
-            format!("终端启动失败：{e}"),
+            format!("RAPI_TERMINAL_SPAWN_FAILED: 终端启动失败：{e}"),
             false,
             None,
         );
@@ -14384,12 +14388,12 @@ mod tests {
         // Mode 组沿用历史措辞「切换模式至 X」（空档名也照原样拼装，不特判）
         assert_eq!(
             mode_audit_content(ModeGroupId::Mode, "计划"),
-            "切换模式至 计划"
+            "RAPI_MODE_SWITCH_AUDIT: 切换模式至 计划"
         );
         // 其余组按组屏显标签出「切换{组}至 X」
         assert_eq!(
             mode_audit_content(ModeGroupId::Permission, "只读"),
-            "切换权限至 只读"
+            "RAPI_GROUP_SWITCH_AUDIT: 切换权限至 只读"
         );
     }
 

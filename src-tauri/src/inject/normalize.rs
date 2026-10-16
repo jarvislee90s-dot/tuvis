@@ -225,7 +225,10 @@ pub fn summarize(text: &str, max_chars: usize) -> String {
 /// （如 `cli_three::APPROVAL_INPUT_DISPLAY_CHARS`）。
 pub fn truncate_with_size_marker(text: &str, max_chars: usize) -> String {
     match cut_over_limit(text, max_chars) {
-        Some(cut) => format!("{cut}…已截断，共 {} 字符", text.chars().count()),
+        Some(cut) => format!(
+            "DISPLAY_TRUNCATED: {cut}…已截断，共 {} 字符",
+            text.chars().count()
+        ),
         None => text.to_string(),
     }
 }
@@ -446,7 +449,7 @@ mod tests {
     fn truncate_with_size_marker_names_the_true_total() {
         assert_eq!(
             truncate_with_size_marker("abcdef", 4),
-            "abcd…已截断，共 6 字符",
+            "DISPLAY_TRUNCATED: abcd…已截断，共 6 字符",
             "标记里的数字必须是**原文**长度（6），不是保留长度（4）"
         );
         assert_eq!(truncate_with_size_marker("abc", 4), "abc", "恰在上限：逐字");
@@ -457,7 +460,7 @@ mod tests {
         );
         assert_eq!(
             truncate_with_size_marker("一二三四五", 4),
-            "一二三四…已截断，共 5 字符",
+            "DISPLAY_TRUNCATED: 一二三四…已截断，共 5 字符",
             "多字节按 chars 计总长（5），不按字节"
         );
         // 两条口径**不可互换**：审计摘要不会出现长度文案

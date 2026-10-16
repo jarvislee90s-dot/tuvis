@@ -456,7 +456,9 @@ pub fn writer_lock_evidence(stdout_head: &str, stderr_head: &str) -> Option<Stri
         if find_ascii_ci(hay, WRITER_LOCK_RPC_CODE).is_some()
             && find_ascii_ci(hay, "writer").is_some()
         {
-            return Some(format!("{WRITER_LOCK_RPC_CODE} + writer（单写者锁）"));
+            return Some(format!(
+                "CODEX_WRITER_LOCK_EVIDENCE: {WRITER_LOCK_RPC_CODE} + writer（单写者锁）"
+            ));
         }
     }
     None
@@ -966,7 +968,7 @@ pub async fn run_turn(
 /// 改道说明（如实注明：原路径被谁拒、改到哪里、未静默降级）
 fn divert_note(evidence: &str) -> String {
     format!(
-        "原计划 exec resume 被会话**单写者锁**拒绝（{evidence}；APP 在场时 exec 不可用，\
+        "CODEX_DIVERT_WRITER_LOCK: 原计划 exec resume 被会话**单写者锁**拒绝（{evidence}；APP 在场时 exec 不可用，\
          issue #47193 跟踪）→ 已**自动改道 queue**（如实注明，未静默降级）；改道结果："
     )
 }
@@ -998,7 +1000,7 @@ fn exec_receipt(sid: &str, att: &Attempt, total_ms: u64) -> (Receipt, ReceiptSou
         None => (
             Receipt::failed(
                 Stage::ChannelError,
-                "exec resume 正常退出（exit 0）但 stdout 无任何输出——无法确认末条回复；\
+                "CODEX_EXEC_NO_OUTPUT: exec resume 正常退出（exit 0）但 stdout 无任何输出——无法确认末条回复；\
                  请在会话内容中确认后再决定是否重发",
             )
             .with_session(sid)
@@ -1043,12 +1045,14 @@ async fn run_queue_turn(
     }
     let Some(msg_id) = queued_message_id(&att.stdout, &att.stderr) else {
         // exit 0 但没拿到入队回执 = 通道跑过了但没拿到有效回执（channel_error 语义）
-        let reason = format!(
-            "{}queue 进程正常退出（exit 0）但未拿到 `{QUEUE_RECEIPT_MARKER} <id>` 回执——\
+        let reason = prefixed(
+            divert,
+            &format!(
+                "CODEX_QUEUE_NO_RECEIPT: queue 进程正常退出（exit 0）但未拿到 `{QUEUE_RECEIPT_MARKER} <id>` 回执——\
              无法证明入队，按通道异常如实上报；stdout 头={}；stderr={}",
-            prefixed(divert, ""),
-            normalize::summarize(&head_of(&att.stdout), normalize::AUDIT_SUMMARY_CHARS),
-            normalize::summarize(&att.stderr, normalize::AUDIT_SUMMARY_CHARS),
+                normalize::summarize(&head_of(&att.stdout), normalize::AUDIT_SUMMARY_CHARS),
+                normalize::summarize(&att.stderr, normalize::AUDIT_SUMMARY_CHARS),
+            ),
         );
         return out(
             Receipt::failed(Stage::ChannelError, &reason)
@@ -1086,7 +1090,10 @@ async fn consume_and_report(
         receipt: {
             let mut r = Receipt::ok(sid, total_ms());
             r.status = ReceiptStatus::Queued;
-            r.reason = Some(prefixed(divert, &format!("{tail}（入队回执 id={msg_id}）")));
+            r.reason = Some(prefixed(
+                divert,
+                &format!("CODEX_ENQUEUE_RECEIPT_ID: {tail}（入队回执 id={msg_id}）"),
+            ));
             r
         },
         plan_used: PlanKind::Queue,
@@ -1151,7 +1158,7 @@ async fn consume_and_report(
         r.reason = Some(prefixed(
             divert,
             &format!(
-                "APP 已消费该消息（目标 rollout 追加命中消息文本；入队回执 id={msg_id}）——\
+                "CODEX_CONSUMED_BY_APP: APP 已消费该消息（目标 rollout 追加命中消息文本；入队回执 id={msg_id}）——\
                  回合执行与回复由 codex APP 自身完成，请在 APP 内或看板刷新后查看"
             ),
         ));
@@ -1166,14 +1173,14 @@ async fn consume_and_report(
     let waited = deps.consume_budget_secs();
     let mut tail = match (deps.queue_holds)(plan.thread(), msg_id) {
         Some(QueueEvidence::Ours) => format!(
-            "已入队未消费：等待 {waited}s 未观测到目标 rollout 追加，且入队回执 id={msg_id} 的条目\
+            "CODEX_QUEUED_NOT_CONSUMED: 已入队未消费：等待 {waited}s 未观测到目标 rollout 追加，且入队回执 id={msg_id} 的条目\
              **仍在 codex 队列**（queue_1.sqlite 副本的 queued_items 命中该 id）——截至此刻本条\
              尚未被 APP 消费；**最可能的原因**是该 thread 未在 APP 打开（Mac 实测可滞留 19.2 分钟，\
              Windows 抽验消费约 55s，本回合等待 {waited}s 只是刚过该量级），也可能是 APP 忙碌或\
              落盘滞后——建议在 APP 打开该会话，或改走 exec resume"
         ),
         Some(QueueEvidence::ThreadStalled { rows }) => format!(
-            "已入队未消费：等待 {waited}s 未观测到目标 rollout 追加；该 thread 队列里仍有 {rows} 条\
+            "CODEX_QUEUED_STALLED_UNVERIFIED: 已入队未消费：等待 {waited}s 未观测到目标 rollout 追加；该 thread 队列里仍有 {rows} 条\
              滞留项，但**未能确认含本条**（副本里没有命中入队回执 id={msg_id} 的行）——建议在 APP \
              打开该会话确认，或改走 exec resume"
         ),
@@ -1187,7 +1194,7 @@ async fn consume_and_report(
     };
     if unreadable > 0 {
         tail.push_str(&format!(
-            "（期间 {unreadable} 次追加段读取不完整/失败——未据此判否）"
+            "CODEX_APPEND_READ_INCOMPLETE: （期间 {unreadable} 次追加段读取不完整/失败——未据此判否）"
         ));
     }
     queued(tail)
@@ -1198,7 +1205,7 @@ fn cancelled_outcome(sid: &str, msg_id: &str, divert: Option<&str>, total_ms: u6
     let r = Receipt::cancelled(&prefixed(
         divert,
         &format!(
-            "已取消（移动端请求）——消费等待中止；消息**仍在 codex 队列中、无法撤回**\
+            "CODEX_CANCELLED_QUEUED_UNRECALLABLE: 已取消（移动端请求）——消费等待中止；消息**仍在 codex 队列中、无法撤回**\
              （入队回执 id={msg_id}）：请在 APP 打开该 thread 后查看，或自行在队列中清理"
         ),
     ))
@@ -1356,7 +1363,9 @@ pub async fn probe_cli(exe: &str, cache: &ProbeCache, os: &str) -> ProbeVerdict 
         return hit;
     }
     if !key.exe_present {
-        let v = ProbeVerdict::fail(format!("可执行文件不在场（不 spawn）：{exe}"));
+        let v = ProbeVerdict::fail(format!(
+            "PROBE_EXE_MISSING: 可执行文件不在场（不 spawn）：{exe}"
+        ));
         cache.put(key, v.clone());
         return v;
     }
@@ -1409,7 +1418,7 @@ fn probe_cli_verdict(receipt: &Receipt, cfg: &RunnerCfg, exe: &str) -> ProbeVerd
         return ProbeVerdict::fail(super::gate::timeout_zero_output_hint());
     }
     if receipt.stage == Some(Stage::Spawn) {
-        return ProbeVerdict::fail(format!("探针 spawn 失败：{exe}"));
+        return ProbeVerdict::fail(format!("PROBE_SPAWN_FAIL: 探针 spawn 失败：{exe}"));
     }
     super::gate::codex_verdict(
         &cfg.captured_stdout().join("\n"),

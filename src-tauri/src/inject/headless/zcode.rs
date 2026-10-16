@@ -310,7 +310,7 @@ pub fn classify_exit(obs: &ExitObs<'_>) -> ExitClass {
             stage: Some(Stage::WorkspaceBusy),
             retryable: true,
             evidence: Some(format!(
-                "{WORKSPACE_BUSY_MARKER}（{}ms 退出；ZCode 应用在该工作区活跃，争用型拒绝）",
+                "ZCODE_BUSY_EVIDENCE: {WORKSPACE_BUSY_MARKER}（{}ms 退出；ZCode 应用在该工作区活跃，争用型拒绝）",
                 obs.duration_ms
             )),
         };
@@ -770,7 +770,7 @@ fn channel_error_reason(
              请在会话内容中确认后再决定是否重发"
         }
     };
-    format!("进程正常退出（exit 0）但未拿到回执：stdout 无可解析 JSON 帧，且{tail}；stdout 头={out}；stderr={err}")
+    format!("ZCODE_NO_RECEIPT_FRAME: 进程正常退出（exit 0）但未拿到回执：stdout 无可解析 JSON 帧，且{tail}；stdout 头={out}；stderr={err}")
 }
 
 // ============================================================
@@ -1062,10 +1062,9 @@ async fn finalize(
     // 文案逐字沿用 [`Receipt::concurrency_full`] 的单点措辞（不另写一份）。
     // `queued` 状态词从此只表示「已进下游队列、待确认消费」（codex 入队语义）。
     if r.status == ReceiptStatus::Queued {
-        let reason = r
-            .reason
-            .clone()
-            .unwrap_or_else(|| "无头并发已满：本条未执行、未投递——请稍后重发".to_string());
+        let reason = r.reason.clone().unwrap_or_else(|| {
+            "HEADLESS_CONCURRENCY_FULL: 无头并发已满：本条未执行、未投递——请稍后重发".to_string()
+        });
         return (
             Receipt::failed(Stage::Refused, &reason)
                 .with_session(session_id)
@@ -1160,7 +1159,7 @@ fn busy_receipt(
         &format!(
             // **归因中性化（评审 I3）**：争用锁的持有者既可能是 ZCode 应用，也可能是
             // **另一条 MAM 无头回合**（探活已排除自家子进程，不再假装知道是哪一方）
-            "工作区忙：工作区 {project} 被 ZCode 应用或另一无头回合占用，\
+            "ZCODE_WORKSPACE_BUSY: 工作区忙：工作区 {project} 被 ZCode 应用或另一无头回合占用，\
              无头回合被应用层争用锁拒绝（{ev}）；\
              已重试 {retries} 次（每次间隔 {}s）仍失败——请在该工作区空闲后重发",
             spacing.as_secs()

@@ -704,8 +704,10 @@ impl PermissionRequest {
                 .join(" / ")
         };
         format!(
-            "dsh 请求权限：toolCallId={}，选项：{opts}",
-            self.tool_call_id.as_deref().unwrap_or("未知")
+            "DSH_ACP_PERMISSION_PROMPT: dsh 请求权限：toolCallId={}，选项：{opts}",
+            self.tool_call_id
+                .as_deref()
+                .unwrap_or("DSH_ACP_UNKNOWN_ID: （未知）")
         )
     }
 }
@@ -774,7 +776,9 @@ impl DshAcpSession {
                     }
                 }),
             )
-            .map_err(|e| DshAcpError::Channel(format!("initialize 失败：{e}")))?;
+            .map_err(|e| {
+                DshAcpError::Channel(format!("ACP_INITIALIZE_FAIL: initialize 失败：{e}"))
+            })?;
         s.agent_name = result
             .get("agentInfo")
             .and_then(|a| a.get("name"))
@@ -787,8 +791,9 @@ impl DshAcpSession {
             .and_then(|p| p.get("image"))
             .and_then(serde_json::Value::as_bool);
         // authenticate（恒成功免鉴权——源码直读；失败即通道异常面，谈不上方法语义）
-        s.call("authenticate", serde_json::json!({}))
-            .map_err(|e| DshAcpError::Channel(format!("authenticate 失败：{e}")))?;
+        s.call("authenticate", serde_json::json!({})).map_err(|e| {
+            DshAcpError::Channel(format!("ACP_AUTHENTICATE_FAIL: authenticate 失败：{e}"))
+        })?;
         Ok(s)
     }
 
@@ -809,8 +814,9 @@ impl DshAcpSession {
         // 请求帧带 jsonrpc:"2.0"（标准 ACP 方言）；解析侧宽松不依赖（见 parse_frame）
         let frame =
             serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let line = serde_json::to_string(&frame)
-            .map_err(|e| DshAcpError::Channel(format!("请求序列化失败：{e}")))?;
+        let line = serde_json::to_string(&frame).map_err(|e| {
+            DshAcpError::Channel(format!("ACP_REQUEST_SERIALIZE_FAIL: 请求序列化失败：{e}"))
+        })?;
         self.io.send(&line).map_err(DshAcpError::Channel)
     }
 
@@ -819,10 +825,10 @@ impl DshAcpSession {
         match self.io.recv() {
             Some(Ok(l)) => Ok(l),
             Some(Err(e)) => Err(DshAcpError::Channel(format!(
-                "{ctx}(id={id}) 读取失败：{e}"
+                "ACP_RESPONSE_READ_FAIL: {ctx}(id={id}) 读取失败：{e}"
             ))),
             None => Err(DshAcpError::Channel(format!(
-                "连接在 {ctx}(id={id}) 响应前关闭（EOF）"
+                "ACP_EOF_BEFORE_RESPONSE: 连接在 {ctx}(id={id}) 响应前关闭（EOF）"
             ))),
         }
     }
@@ -875,8 +881,9 @@ impl DshAcpSession {
     fn notify(&mut self, method: &str, params: serde_json::Value) -> Result<(), DshAcpError> {
         // notification 帧：无 id（cancel 专用形态——无响应帧可核对）
         let frame = serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params});
-        let line = serde_json::to_string(&frame)
-            .map_err(|e| DshAcpError::Channel(format!("通知序列化失败：{e}")))?;
+        let line = serde_json::to_string(&frame).map_err(|e| {
+            DshAcpError::Channel(format!("ACP_NOTIFY_SERIALIZE_FAIL: 通知序列化失败：{e}"))
+        })?;
         self.io.send(&line).map_err(DshAcpError::Channel)
     }
 
@@ -885,7 +892,7 @@ impl DshAcpSession {
         // 探测定案（T0.4 §2.2）：相对路径被服务端 -32602 拒——MAM 侧投递前先拒（零协议副作用）
         if !std::path::Path::new(cwd).is_absolute() {
             return Err(DshAcpError::InvalidTarget(format!(
-                "cwd 必须是绝对路径（相对路径会被服务端拒绝——投递前拒）：{cwd}"
+                "DSH_ACP_CWD_NOT_ABSOLUTE: cwd 必须是绝对路径（相对路径会被服务端拒绝——投递前拒）：{cwd}"
             )));
         }
         Ok(())
@@ -938,7 +945,7 @@ impl DshAcpSession {
             }
         }
         Err(DshAcpError::Channel(format!(
-            "session/list 分页护栏触发（> {max_pages} 页）——服务端页大小疑似失控，如实报不静默截断"
+            "DSH_ACP_PAGINATION_GUARD: session/list 分页护栏触发（> {max_pages} 页）——服务端页大小疑似失控，如实报不静默截断"
         )))
     }
 
@@ -953,7 +960,8 @@ impl DshAcpSession {
     ) -> Result<serde_json::Value, DshAcpError> {
         if session_id.trim().is_empty() {
             return Err(DshAcpError::InvalidTarget(
-                "resume 需要非空 sessionId（sessionId 二象性按原样回传——见模块头）".to_string(),
+                "DSH_ACP_RESUME_SID_REQUIRED: resume 需要非空 sessionId（sessionId 二象性按原样回传——见模块头）"
+                    .to_string(),
             ));
         }
         Self::ensure_absolute_cwd(cwd)?;
@@ -1037,7 +1045,7 @@ impl DshAcpSession {
     pub fn cancel(&mut self, session_id: &str) -> Result<CancelNotice, DshAcpError> {
         if session_id.trim().is_empty() {
             return Err(DshAcpError::InvalidTarget(
-                "cancel 需要非空 sessionId（未知 sessionId 为空操作——也须是显式选择，不猜）"
+                "DSH_ACP_CANCEL_SID_REQUIRED: cancel 需要非空 sessionId（未知 sessionId 为空操作——也须是显式选择，不猜）"
                     .to_string(),
             ));
         }
@@ -1130,7 +1138,7 @@ pub fn delivered_session_note(delivered_sid: &str, card_sid: &str) -> Option<Str
         return None;
     }
     Some(format!(
-        "{TARGETING_PREFIX}（sessionId={delivered_sid}）；注意：{MISMATCH_CLAUSE}"
+        "DSH_ACP_TARGETING_NOTE: {TARGETING_PREFIX}（sessionId={delivered_sid}）；注意：{MISMATCH_CLAUSE}"
     ))
 }
 
@@ -1221,7 +1229,7 @@ impl DshAcpClient {
         // 投递前拒（零 spawn——空文本/非绝对 cwd 不烧协议面）
         if text.trim().is_empty() {
             return Err(DshAcpError::InvalidTarget(
-                "投递文本为空——投递前拒（零协议副作用）".to_string(),
+                "DSH_ACP_EMPTY_TEXT: 投递文本为空——投递前拒（零协议副作用）".to_string(),
             ));
         }
         DshAcpSession::ensure_absolute_cwd(cwd)?;
@@ -1309,7 +1317,7 @@ impl DshAcpClient {
                 Ok(DshSendReceipt {
                     receipt: Receipt::failed(
                         Stage::ChannelError,
-                        &format!("回合失败（协议错误 {code}）：{message}"),
+                        &format!("DSH_ACP_TURN_RPC_FAIL: 回合失败（协议错误 {code}）：{message}"),
                     )
                     .with_session(&sid)
                     .with_duration_ms(t0.elapsed().as_millis() as u64),
@@ -1405,8 +1413,8 @@ pub fn ensure_extracted(
     // 中毒锁也照常进入（poison 只说明持锁线程 panic 过——目录状态由幂等判据自愈）
     let _extract_guard = EXTRACT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let asar = asar_path(install_dir);
-    let fingerprint =
-        asar_fingerprint(&asar).ok_or_else(|| format!("asar 不可读：{}", asar.display()))?;
+    let fingerprint = asar_fingerprint(&asar)
+        .ok_or_else(|| format!("DSH_ACP_ASAR_UNREADABLE: asar 不可读：{}", asar.display()))?;
     let dest_root = cache_root.join(sanitize_version(desktop_version));
     let bin = {
         // 布局单点 = EXTRACT_SUBTREE_REL（与纯核 bin_js_path 同一真相源）
@@ -1422,17 +1430,23 @@ pub fn ensure_extracted(
         ExtractDecision::Skip if bin.exists() => {}
         _ => {
             // 首启/指纹漂移（asar 升级）→ 解包 \dsh 子树 + 写标记（重跑同版本即 Skip）
-            std::fs::create_dir_all(&dest_root).map_err(|e| format!("建缓存目录失败：{e}"))?;
-            asar_extract::extract_subtree(&asar, &dest_root, "dsh")
-                .map_err(|e| format!("asar 解包失败（{}）：{e}", asar.display()))?;
+            std::fs::create_dir_all(&dest_root)
+                .map_err(|e| format!("DSH_ACP_CACHE_DIR_FAIL: 建缓存目录失败：{e}"))?;
+            asar_extract::extract_subtree(&asar, &dest_root, "dsh").map_err(|e| {
+                format!(
+                    "DSH_ACP_ASAR_EXTRACT_FAIL: asar 解包失败（{}）：{e}",
+                    asar.display()
+                )
+            })?;
             if !bin.exists() {
                 return Err(format!(
-                    "解包后 bin.js 不在场（子树形状漂移，不猜）：{}",
+                    "DSH_ACP_BIN_JS_MISSING: 解包后 bin.js 不在场（子树形状漂移，不猜）：{}",
                     bin.display()
                 ));
             }
-            std::fs::write(&marker, &fingerprint)
-                .map_err(|e| format!("写 digest 标记失败：{e}"))?;
+            std::fs::write(&marker, &fingerprint).map_err(|e| {
+                format!("DSH_ACP_DIGEST_MARKER_WRITE_FAIL: 写 digest 标记失败：{e}")
+            })?;
         }
     }
     Ok(bin)
@@ -1468,7 +1482,7 @@ pub fn production_spawn_seam() -> SpawnSeam {
         }
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("spawn {program} 失败：{e}"))?;
+            .map_err(|e| format!("ACP_SPAWN_FAIL: spawn {program} 失败：{e}"))?;
         let stdin = child
             .stdin
             .take()
@@ -1514,13 +1528,14 @@ impl ProcIo {
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(format!("读 stdout 失败：{e}")));
+                            let _ =
+                                tx.send(Err(format!("ACP_STDOUT_READ_FAIL: 读 stdout 失败：{e}")));
                             break;
                         }
                     }
                 }
             })
-            .map_err(|e| format!("起读线程失败：{e}"))?;
+            .map_err(|e| format!("ACP_READ_THREAD_SPAWN_FAIL: 起读线程失败：{e}"))?;
         Ok(Self {
             child,
             stdin: Some(stdin),
@@ -1540,7 +1555,7 @@ impl AcpIo for ProcIo {
             .write_all(line.as_bytes())
             .and_then(|_| stdin.write_all(b"\n"))
             .and_then(|_| stdin.flush())
-            .map_err(|e| format!("写 stdin 失败：{e}"))
+            .map_err(|e| format!("HEADLESS_STDIN_WRITE_FAIL: 写 stdin 失败：{e}"))
     }
 
     fn recv(&mut self) -> Option<Result<String, String>> {
@@ -1557,7 +1572,7 @@ impl AcpIo for ProcIo {
             Err(RecvTimeoutError::Disconnected) => None,
             // 超时 ≠ EOF：如实报超时（调用方按通道错误面处理，不冒充 EOF）
             Err(RecvTimeoutError::Timeout) => Some(Err(format!(
-                "dsh-acp {}ms 无输出（读取超时）",
+                "DSH_ACP_READ_TIMEOUT: dsh-acp {}ms 无输出（读取超时）",
                 PROC_READ_TIMEOUT_MS
             ))),
         }
@@ -1613,17 +1628,18 @@ mod asar_extract {
 
     /// 解包 asar 内某个顶层子树（如 `dsh`）到 `<dest_root>/<top>/`
     pub fn extract_subtree(asar: &Path, dest_root: &Path, top: &str) -> Result<(), String> {
-        let mut f = std::fs::File::open(asar).map_err(|e| format!("打开 asar 失败：{e}"))?;
+        let mut f = std::fs::File::open(asar)
+            .map_err(|e| format!("DSH_ACP_ASAR_OPEN_FAIL: 打开 asar 失败：{e}"))?;
         // 头部布局：[8 字节 size-pickle（4B 载荷长=4 + 4B 头块长 H）][H 字节头块
         // （4B JSON 串长 L + L 字节 JSON + padding）][连续文件 blob]——文件绝对偏移 =
         // 8 + H + entry.offset（offset 为十进制字符串，相对 data 区起点）
         let mut head8 = [0u8; 8];
         f.read_exact(&mut head8)
-            .map_err(|e| format!("读 asar 头失败：{e}"))?;
+            .map_err(|e| format!("DSH_ACP_ASAR_HEADER_READ_FAIL: 读 asar 头失败：{e}"))?;
         let payload_len = u32::from_le_bytes(head8[0..4].try_into().unwrap());
         if payload_len != 4 {
             return Err(format!(
-                "asar 头形状异常（size-pickle 载荷长 {payload_len} != 4）：{}",
+                "DSH_ACP_ASAR_HEADER_SHAPE: asar 头形状异常（size-pickle 载荷长 {payload_len} != 4）：{}",
                 asar.display()
             ));
         }
@@ -1631,28 +1647,28 @@ mod asar_extract {
         // spec M1：分配前核对——头块长必须落在文件内（防伪造/损坏头部的越界分配）
         let file_len = f
             .metadata()
-            .map_err(|e| format!("读 asar 元数据失败：{e}"))?
+            .map_err(|e| format!("DSH_ACP_ASAR_STAT_FAIL: 读 asar 元数据失败：{e}"))?
             .len();
         if 8 + header_size > file_len {
             return Err(format!(
-                "asar 头块长越界（8+{header_size} > 文件长 {file_len}）：{}",
+                "DSH_ACP_ASAR_HEADER_SIZE_RANGE: asar 头块长越界（8+{header_size} > 文件长 {file_len}）：{}",
                 asar.display()
             ));
         }
         let mut header_buf = vec![0u8; header_size as usize];
         f.read_exact(&mut header_buf)
-            .map_err(|e| format!("读 asar 头块失败：{e}"))?;
+            .map_err(|e| format!("DSH_ACP_ASAR_HEADER_BLOCK_READ_FAIL: 读 asar 头块失败：{e}"))?;
         let json_len = u32::from_le_bytes(header_buf[0..4].try_into().unwrap()) as usize;
         if 4 + json_len > header_buf.len() {
-            return Err("asar 头 JSON 长度越界".to_string());
+            return Err("DSH_ACP_ASAR_JSON_LEN_RANGE: asar 头 JSON 长度越界".to_string());
         }
         let header: serde_json::Value = serde_json::from_slice(&header_buf[4..4 + json_len])
-            .map_err(|e| format!("asar 头 JSON 解析失败：{e}"))?;
+            .map_err(|e| format!("DSH_ACP_ASAR_JSON_PARSE_FAIL: asar 头 JSON 解析失败：{e}"))?;
         let top_files = header
             .get("files")
             .and_then(|fs| fs.get(top))
             .and_then(|t| t.get("files"))
-            .ok_or_else(|| format!("asar 无 {top} 目录子树"))?;
+            .ok_or_else(|| format!("DSH_ACP_ASAR_SUBTREE_MISSING: asar 无 {top} 目录子树"))?;
         let data_base = 8 + header_size;
         walk(
             &mut f,
@@ -1677,10 +1693,10 @@ mod asar_extract {
     ) -> Result<(), String> {
         use serde_json::Value;
         std::fs::create_dir_all(dir_dest)
-            .map_err(|e| format!("建目录失败 {}: {e}", dir_dest.display()))?;
+            .map_err(|e| format!("DSH_ACP_MKDIR_FAIL: 建目录失败 {}: {e}", dir_dest.display()))?;
         let obj = files
             .as_object()
-            .ok_or_else(|| "asar files 节非对象".to_string())?;
+            .ok_or_else(|| "DSH_ACP_ASAR_FILES_NOT_OBJECT: asar files 节非对象".to_string())?;
         for (name, entry) in obj {
             // 防路径穿越（spec m1 补全）：条目名必须是纯文件名——`/`、`\`、
             // `:`（盘符/NTFS 流分隔）、`.`/`..`（当前/父目录）一律拒——不猜
@@ -1690,7 +1706,9 @@ mod asar_extract {
                 || name == "."
                 || name == ".."
             {
-                return Err(format!("asar 条目名异常（疑似路径注入）：{name}"));
+                return Err(format!(
+                    "DSH_ACP_ASAR_ENTRY_NAME_UNSAFE: asar 条目名异常（疑似路径注入）：{name}"
+                ));
             }
             let child_dest = dir_dest.join(name);
             let child_rel = format!("{rel}/{name}");
@@ -1709,38 +1727,44 @@ mod asar_extract {
                 // 静默跳过 = 运行期缺依赖难诊断；如实报「暂不支持 + 指向」
                 if let Some(target) = entry.get("link").and_then(Value::as_str) {
                     return Err(format!(
-                        "symlink 条目暂不支持（M25 真机核对后定夺）：{child_rel} -> {target}"
+                        "DSH_ACP_SYMLINK_UNSUPPORTED: symlink 条目暂不支持（M25 真机核对后定夺）：{child_rel} -> {target}"
                     ));
                 }
-                let size = entry
-                    .get("size")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| format!("asar 文件条目缺 size：{child_rel}"))?;
+                let size = entry.get("size").and_then(Value::as_u64).ok_or_else(|| {
+                    format!("DSH_ACP_ASAR_SIZE_MISSING: asar 文件条目缺 size：{child_rel}")
+                })?;
                 if entry.get("unpacked").and_then(Value::as_bool) == Some(true) {
                     // unpacked 条目：内容不在 asar 内，在 <asar>.unpacked/<rel> 伴生树
                     let src = unpacked_root.join(&child_rel);
-                    std::fs::copy(&src, &child_dest)
-                        .map_err(|e| format!("拷 unpacked 条目失败 {child_rel}：{e}"))?;
+                    std::fs::copy(&src, &child_dest).map_err(|e| {
+                        format!("DSH_ACP_UNPACKED_COPY_FAIL: 拷 unpacked 条目失败 {child_rel}：{e}")
+                    })?;
                 } else {
                     let off = entry
                         .get("offset")
                         .and_then(Value::as_str)
                         .and_then(|x| x.parse::<u64>().ok())
-                        .ok_or_else(|| format!("asar 文件条目缺 offset：{child_rel}"))?;
+                        .ok_or_else(|| {
+                            format!(
+                                "DSH_ACP_ASAR_OFFSET_MISSING: asar 文件条目缺 offset：{child_rel}"
+                            )
+                        })?;
                     // spec M1：分配前核对——data_base + off + size 必须落在文件内
                     //（防伪造/损坏条目的巨型分配或越界读）
                     if data_base + off + size > file_len {
                         return Err(format!(
-                            "asar 条目区间越界（data_base={data_base} off={off} size={size} > 文件长 {file_len}）：{child_rel}"
+                            "DSH_ACP_ASAR_RANGE_OUT_OF_BOUNDS: asar 条目区间越界（data_base={data_base} off={off} size={size} > 文件长 {file_len}）：{child_rel}"
                         ));
                     }
                     let mut buf = vec![0u8; size as usize];
                     f.seek(SeekFrom::Start(data_base + off))
-                        .map_err(|e| format!("seek 失败 {child_rel}：{e}"))?;
-                    f.read_exact(&mut buf)
-                        .map_err(|e| format!("读条目失败 {child_rel}：{e}"))?;
-                    std::fs::write(&child_dest, &buf)
-                        .map_err(|e| format!("写条目失败 {child_rel}：{e}"))?;
+                        .map_err(|e| format!("DSH_ACP_SEEK_FAIL: seek 失败 {child_rel}：{e}"))?;
+                    f.read_exact(&mut buf).map_err(|e| {
+                        format!("DSH_ACP_ENTRY_READ_FAIL: 读条目失败 {child_rel}：{e}")
+                    })?;
+                    std::fs::write(&child_dest, &buf).map_err(|e| {
+                        format!("DSH_ACP_ENTRY_WRITE_FAIL: 写条目失败 {child_rel}：{e}")
+                    })?;
                 }
                 // 可执行位（unix 面；探测为 Windows 桌面形态——Windows 无此面）
                 #[cfg(unix)]
@@ -1807,7 +1831,7 @@ fn production_assemble(home: Option<std::path::PathBuf>) -> Result<DshAcpClient,
     let node = runtime_node_exe(&dsh_home);
     if !node.exists() {
         return Err(format!(
-            "dsh runtime node 不可达（{}）——请先安装并启动一次 DeepSeek Harness 桌面端",
+            "DSH_ACP_RUNTIME_NODE_MISSING: dsh runtime node 不可达（{}）——请先安装并启动一次 DeepSeek Harness 桌面端",
             node.display()
         ));
     }
@@ -1819,13 +1843,15 @@ fn production_assemble(home: Option<std::path::PathBuf>) -> Result<DshAcpClient,
         .join("runtime.json");
     let version = read_desktop_version(&runtime_json).ok_or_else(|| {
         format!(
-            "读不到 desktopVersion（{}）——无法定位 dsh-acp 解包缓存键",
+            "DSH_ACP_DESKTOP_VERSION_UNREADABLE: 读不到 desktopVersion（{}）——无法定位 dsh-acp 解包缓存键",
             runtime_json.display()
         )
     })?;
     // 4) 缓存根（home 缺席即如实拒——缓存与 MAM 数据目录同源）
     let Some(home) = home else {
-        return Err("用户主目录不可用——无法定位 dsh-asar 解包缓存".to_string());
+        return Err(
+            "DSH_ACP_HOME_UNAVAILABLE: 用户主目录不可用——无法定位 dsh-asar 解包缓存".to_string(),
+        );
     };
     let cache_root = home.join(".tuvis").join("dsh-asar");
     // 5) bin.js：缓存优先（幂等解包后常驻；此时无需安装目录在场）。未命中 → 安装发现

@@ -835,12 +835,17 @@ pub fn discover_endpoint(
         let host = if pids.is_empty() {
             "WB 宿主进程不在场"
         } else {
-            "WB 宿主在场"
+            "WB_HOST_PRESENT: WB 宿主在场"
         };
-        detail = format!("{detail}；端口指纹路：{host}，候选 {tried} 个端口双确认 0 命中");
+        let port_note = format!(
+            "WB_PORT_FINGERPRINT_NO_HIT: 端口指纹路：{host}，候选 {tried} 个端口双确认 0 命中"
+        );
+        detail = format!("{detail}；{port_note}");
     }
     EndpointDiscovery::Unavailable {
-        reason: format!("{ENDPOINT_UNAVAILABLE_REASON}；本次探测：{detail}"),
+        reason: format!(
+            "WB_ACP_ENDPOINT_DISABLED: {ENDPOINT_UNAVAILABLE_REASON}；本次探测：{detail}"
+        ),
     }
 }
 
@@ -1015,7 +1020,9 @@ impl AcpClient {
             stream: policy,
         });
         if let Some(e) = &resp.error {
-            return Err(format!("{method} 请求未送达：{e}"));
+            return Err(format!(
+                "WB_ACP_REQUEST_NOT_DELIVERED: {method} 请求未送达：{e}"
+            ));
         }
         Ok(resp)
     }
@@ -1031,18 +1038,18 @@ impl AcpClient {
             stream: StreamPolicy::whole(SHORT_TIMEOUT_MS),
         });
         if let Some(e) = &resp.error {
-            return Err(format!("建连请求未送达：{e}"));
+            return Err(format!("WB_ACP_CONNECT_NOT_DELIVERED: 建连请求未送达：{e}"));
         }
         if !(200..300).contains(&resp.status) {
             return Err(format!(
-                "建连 HTTP {}：{}",
+                "WB_ACP_CONNECT_HTTP_STATUS: 建连 HTTP {}：{}",
                 resp.status,
                 normalize::summarize(&resp.body, normalize::AUDIT_SUMMARY_CHARS)
             ));
         }
         let v: serde_json::Value = serde_json::from_str(resp.body.trim()).map_err(|e| {
             format!(
-                "建连响应不是 JSON：{e}；体={}",
+                "WB_ACP_CONNECT_NOT_JSON: 建连响应不是 JSON：{e}；体={}",
                 normalize::summarize(&resp.body, normalize::AUDIT_SUMMARY_CHARS)
             )
         })?;
@@ -1081,9 +1088,10 @@ impl AcpClient {
         };
         let resp = self.acp_post(sess, id, "initialize", params, policy)?;
         let result = rpc_result(id, &resp)
-            .map_err(|e| format!("initialize 被服务端拒绝：{e}"))?
+            .map_err(|e| format!("WB_ACP_INITIALIZE_REJECTED: initialize 被服务端拒绝：{e}"))?
             .ok_or_else(|| {
-                "initialize 未拿到响应帧（探测定案：缺 Accept 头即 -32000）".to_string()
+                "WB_ACP_INITIALIZE_NO_RESPONSE: initialize 未拿到响应帧（探测定案：缺 Accept 头即 -32000）"
+                    .to_string()
             })?;
         Ok(Capabilities {
             protocol_version: result
@@ -1106,7 +1114,7 @@ impl AcpClient {
             SessionSel::Active { session_id, cwd } => {
                 if !caps.load_session {
                     return Err(
-                        "服务端 agentCapabilities.loadSession=false：活跃会话不可 session/load\
+                        "WB_ACP_LOAD_SESSION_UNSUPPORTED: 服务端 agentCapabilities.loadSession=false：活跃会话不可 session/load\
                          （API 逆向所得，WorkBuddy 升级可能漂移）"
                             .to_string(),
                     );
@@ -1124,8 +1132,8 @@ impl AcpClient {
                     stop_on_id: Some(id),
                 };
                 let resp = self.acp_post(sess, id, "session/load", params, policy)?;
-                let result =
-                    rpc_result(id, &resp).map_err(|e| format!("session/load 被拒：{e}"))?;
+                let result = rpc_result(id, &resp)
+                    .map_err(|e| format!("WB_ACP_LOAD_REJECTED: session/load 被拒：{e}"))?;
                 let ev = read_stream(&resp.body);
                 // 无响应帧但**有回放证据**：属 best-effort（load 只作诊断，投递判定归 prompt）
                 if result.is_none()
@@ -1133,7 +1141,10 @@ impl AcpClient {
                     && ev.permission_mode.is_none()
                     && ev.frames == 0
                 {
-                    return Err("session/load 未拿到响应帧也无回放证据".to_string());
+                    return Err(
+                        "WB_ACP_LOAD_NO_EVIDENCE: session/load 未拿到响应帧也无回放证据"
+                            .to_string(),
+                    );
                 }
                 Ok(Target {
                     session_id: (*session_id).to_string(),
@@ -1156,8 +1167,10 @@ impl AcpClient {
                 };
                 let resp = self.acp_post(sess, id, "session/new", params, policy)?;
                 let result = rpc_result(id, &resp)
-                    .map_err(|e| format!("session/new 被拒：{e}"))?
-                    .ok_or_else(|| "session/new 未拿到响应帧".to_string())?;
+                    .map_err(|e| format!("WB_ACP_NEW_REJECTED: session/new 被拒：{e}"))?
+                    .ok_or_else(|| {
+                        "WB_ACP_NEW_NO_RESPONSE: session/new 未拿到响应帧".to_string()
+                    })?;
                 let new_sid = result
                     .get("sessionId")
                     .and_then(|x| x.as_str())
@@ -1197,7 +1210,8 @@ impl AcpClient {
             stop_on_id: Some(id),
         };
         let resp = self.acp_post(sess, id, "session/prompt", params, policy)?;
-        rpc_result(id, &resp).map_err(|e| format!("session/prompt 被拒：{e}"))?;
+        rpc_result(id, &resp)
+            .map_err(|e| format!("WB_ACP_PROMPT_REJECTED: session/prompt 被拒：{e}"))?;
         let ev = read_stream(&resp.body);
         Ok(PromptOutcome {
             session_id: target.session_id.clone(),
@@ -1281,7 +1295,7 @@ pub fn delivered_session_note(delivered_sid: &str, card_sid: &str) -> TargetingN
     let mut full = format!("{TARGETING_PREFIX}（sessionId={delivered_sid}）");
     let mismatch = (delivered_sid != card_sid).then_some(MISMATCH_CLAUSE);
     if let Some(m) = mismatch {
-        full.push_str(&format!("；注意：{m}"));
+        full.push_str(&format!("WB_ACP_MISMATCH_NOTE: ；注意：{m}"));
     }
     TargetingNote { full, mismatch }
 }
@@ -1446,10 +1460,10 @@ pub fn receipt_for(
                 let why = if targeting.and_then(|t| t.mismatch).is_some() {
                     "投递至他会话，转写沿其项目目录另查"
                 } else {
-                    "转写落盘可能滞后"
+                    "WB_TRANSCRIPT_LAG: 转写落盘可能滞后"
                 };
                 notes.push(format!(
-                    "ACP 回合已结束（stopReason={stop_reason}），但 projects/ 转写佐证未命中\
+                    "WB_ACP_NO_TRANSCRIPT_CORROBORATION: ACP 回合已结束（stopReason={stop_reason}），但 projects/ 转写佐证未命中\
                      （{why}）——请在 WorkBuddy 应用内确认结果"
                 ));
             }
@@ -1460,14 +1474,14 @@ pub fn receipt_for(
         }
         PromptVerdict::Advanced { phase, stop } => {
             let (stage, how) = match stop {
-                StreamStop::Watchdog => (Stage::Timeout, "watchdog 到点掐断"),
-                _ => (Stage::ChannelError, "流已结束"),
+                StreamStop::Watchdog => (Stage::Timeout, "WB_HOW_WATCHDOG: watchdog 到点掐断"),
+                _ => (Stage::ChannelError, "WB_HOW_STREAM_ENDED: 流已结束"),
             };
-            let mut reason = format!("{UNCONFIRMED_REASON}（{how}；已见 agentPhase={phase}）");
+            let mut reason = format!("WB_ACP_ADVANCED_UNCONFIRMED: {UNCONFIRMED_REASON}（{how}；已见 agentPhase={phase}）");
             // M28 三态可达（spec 审 Major 1）：不一致明示语追加在失败成因之后（失败成因
             // 为主，不稀释；不带成功全文标注）
             if let Some(m) = targeting.and_then(|t| t.mismatch) {
-                reason.push_str(&format!("；注意：{m}"));
+                reason.push_str(&format!("WB_ACP_MISMATCH_NOTE: ；注意：{m}"));
             }
             Receipt::failed(stage, &reason)
                 .with_session(used)
@@ -1481,12 +1495,14 @@ pub fn receipt_for(
             };
             let prev = load
                 .and_then(|l| l.last_stop_reason.as_deref())
-                .map(|s| format!("；load 回放显示末回合 stopReason={s}"))
+                .map(|s| {
+                    format!("WB_LOAD_REPLAY_STOP_REASON: ；load 回放显示末回合 stopReason={s}")
+                })
                 .unwrap_or_default();
             let mut reason = format!("{obs}{prev}；{REVIVAL_REASON}");
             // M28 三态可达（spec 审 Major 1）：不一致明示语追加在失败成因之后（同上）
             if let Some(m) = targeting.and_then(|t| t.mismatch) {
-                reason.push_str(&format!("；注意：{m}"));
+                reason.push_str(&format!("WB_ACP_MISMATCH_NOTE: ；注意：{m}"));
             }
             Receipt::failed(Stage::ChannelError, &reason)
                 .with_session(used)
@@ -1494,7 +1510,7 @@ pub fn receipt_for(
         }
         PromptVerdict::Failed { detail } => Receipt::failed(
             Stage::ChannelError,
-            &format!("WorkBuddy ACP 投递失败：{detail}"),
+            &format!("WB_ACP_DELIVERY_FAIL: WorkBuddy ACP 投递失败：{detail}"),
         )
         .with_session(used)
         .with_duration_ms(duration_ms),
@@ -1620,7 +1636,7 @@ pub fn run_turn(args: &WbTurnArgs, deps: &WbDeps) -> WbTurnOutcome {
             return failed_outcome(
                 &args.sid,
                 &discovery,
-                format!("WorkBuddy ACP 建连失败（{url}）：{e}"),
+                format!("WB_ACP_CONNECT_FAIL: WorkBuddy ACP 建连失败（{url}）：{e}"),
                 elapsed(&started),
             )
         }
@@ -1650,7 +1666,10 @@ pub fn run_turn(args: &WbTurnArgs, deps: &WbDeps) -> WbTurnOutcome {
             return failed_outcome(
                 &args.sid,
                 &discovery,
-                format!("WorkBuddy ACP 目标定位失败（会话 {}）：{e}", args.sid),
+                format!(
+                    "WB_ACP_TARGET_LOCATE_FAIL: WorkBuddy ACP 目标定位失败（会话 {}）：{e}",
+                    args.sid
+                ),
                 elapsed(&started),
             )
         }
@@ -1663,7 +1682,10 @@ pub fn run_turn(args: &WbTurnArgs, deps: &WbDeps) -> WbTurnOutcome {
             return failed_outcome(
                 &args.sid,
                 &discovery,
-                format!("WorkBuddy ACP 投递失败（会话 {}）：{e}", target.session_id),
+                format!(
+                    "WB_ACP_DELIVERY_FAIL: WorkBuddy ACP 投递失败（会话 {}）：{e}",
+                    target.session_id
+                ),
                 elapsed(&started),
             )
         }
@@ -2045,7 +2067,7 @@ fn acp_http_client() -> &'static Result<reqwest::Client, String> {
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(std::time::Duration::from_millis(CLIENT_CONNECT_TIMEOUT_MS))
                 .build()
-                .map_err(|e| format!("HTTP 客户端构建失败: {e}"))
+                .map_err(|e| format!("HTTP_CLIENT_BUILD_FAIL: HTTP 客户端构建失败: {e}"))
         });
     &CLIENT
 }
@@ -2096,7 +2118,9 @@ pub fn production_http_seam() -> HttpSeam {
                         stop: StreamStop::Complete,
                         error: None,
                     },
-                    Err(e) => HttpResp::transport_error(&format!("读响应体失败: {e}")),
+                    Err(e) => HttpResp::transport_error(&format!(
+                        "WB_ACP_BODY_READ_FAIL: 读响应体失败: {e}"
+                    )),
                 };
             }
             let mut scanner = StreamScanner::new(req.stream, now_ms());
@@ -2122,7 +2146,11 @@ pub fn production_http_seam() -> HttpSeam {
                             break;
                         }
                     }
-                    Ok(Err(e)) => return HttpResp::transport_error(&format!("流读取失败: {e}")),
+                    Ok(Err(e)) => {
+                        return HttpResp::transport_error(&format!(
+                            "WB_ACP_STREAM_READ_FAIL: 流读取失败: {e}"
+                        ))
+                    }
                 }
             }
             // 收尾：残留的半行/真被截断的尾字节一次性结算（**如实 lossy**，不假装修齐）——

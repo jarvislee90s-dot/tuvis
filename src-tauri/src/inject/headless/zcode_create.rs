@@ -378,7 +378,7 @@ pub fn create_hints(
         visibility_note: visibility.note().to_string(),
         warning: (n > 0).then(|| {
             format!(
-                "同一项目已有 {n} 个在册 zcode 会话（同项目多开）——新建会话可能与既有卡片混淆，\
+                "ZCODE_CREATE_MULTI_SESSION_WARN: 同一项目已有 {n} 个在册 zcode 会话（同项目多开）——新建会话可能与既有卡片混淆，\
                  且 ZCode 应用正在该项目活动时无头回合会撞工作区争用锁；本提示**不拦截**本次创建"
             )
         }),
@@ -496,7 +496,7 @@ pub async fn run_create(
                 receipt: Receipt::failed(
                     Stage::Refused,
                     &format!(
-                        "项目目录创建失败（{project}）：{e}——本功能不递归创建目录，\
+                        "ZCODE_CREATE_DIR_FAIL: 项目目录创建失败（{project}）：{e}——本功能不递归创建目录，\
                          请先在磁盘上建好上级目录或改选已存在的目录"
                     ),
                 ),
@@ -536,7 +536,7 @@ pub async fn run_create(
             receipt: unconfirmed_receipt(
                 turn.receipt,
                 turn.receipt_source,
-                &format!("stdout 帧给出的会话号形态不合规（{id}）——未确认新会话"),
+                &format!("ZCODE_CREATE_FRAME_ID_MALFORMED: stdout 帧给出的会话号形态不合规（{id}）——未确认新会话"),
             ),
             confirmation: NewSessionConfirmation::Unconfirmed,
             attempts: turn.attempts,
@@ -652,7 +652,7 @@ fn confirmed_receipt(
         .or_else(|| text.map(|t| super::turn::assistant_summary(&t)));
     r.tokens = tokens;
     r.reason = Some(format!(
-        "{base}｜会话库已确认新会话 {id}（项目里已建出该会话，但本轮未正常结束——首句是否送达请在会话内容中核实）"
+        "ZCODE_CREATE_CONFIRMED_TURN_FAILED: {base}｜会话库已确认新会话 {id}（项目里已建出该会话，但本轮未正常结束——首句是否送达请在会话内容中核实）"
     ));
     r
 }
@@ -725,7 +725,7 @@ fn unconfirmed_receipt(turn_receipt: Receipt, source: zcode::ReceiptSource, note
     let inherited = r.reason.clone();
     r.reason = Some(match (source, inherited) {
         (zcode::ReceiptSource::Unconfirmed, Some(diagnosis)) => format!(
-            "{CREATE_UNCONFIRMED_BASE}｜{note}｜\
+            "ZCODE_CREATE_UNCONFIRMED_H7: {CREATE_UNCONFIRMED_BASE}｜{note}｜\
              原诊断（H7 按**锁键**读库，键不是会话号）：{}",
             create_evidence(&diagnosis)
         ),
@@ -733,7 +733,7 @@ fn unconfirmed_receipt(turn_receipt: Receipt, source: zcode::ReceiptSource, note
             format!("{CREATE_UNCONFIRMED_BASE}｜{note}")
         }
         (_, Some(diagnosis)) => format!("{diagnosis}｜{note}"),
-        (_, None) => format!("新建回合未确认新会话｜{note}"),
+        (_, None) => format!("ZCODE_CREATE_UNCONFIRMED: 新建回合未确认新会话｜{note}"),
     });
     r
 }
@@ -746,14 +746,18 @@ const BASELINE_UNAVAILABLE_NOTE: &str =
 /// 发现结论 → 如实文案（未确认也要说清为什么）
 fn discovery_note(v: &NewSessionVerdict) -> String {
     match v {
-        NewSessionVerdict::None => "会话库中该项目未出现新会话——未确认新会话（未确认即不报会话号；\
+        NewSessionVerdict::None => {
+            "ZCODE_CREATE_DISCOVERY_NONE: 会话库中该项目未出现新会话——未确认新会话（未确认即不报会话号；\
              请在上板会话列表中核实，勿盲目重发：重发会再建一个会话）"
-            .to_string(),
+                .to_string()
+        }
         NewSessionVerdict::Ambiguous(n) => format!(
-            "会话库中该项目出现了 {n} 个新会话——归属不可判定，未确认新会话\
+            "ZCODE_CREATE_DISCOVERY_AMBIGUOUS: 会话库中该项目出现了 {n} 个新会话——归属不可判定，未确认新会话\
              （请人工核实，勿盲目重发：重发会再建一个会话）"
         ),
-        NewSessionVerdict::Single(id) => format!("会话库已确认新会话 {id}"),
+        NewSessionVerdict::Single(id) => {
+            format!("ZCODE_CREATE_DISCOVERY_SINGLE: 会话库已确认新会话 {id}")
+        }
     }
 }
 
@@ -1718,7 +1722,9 @@ mod tests {
         assert_eq!(out.receipt.stage, Some(Stage::ChannelError));
         let reason = out.receipt.reason.clone().unwrap_or_default();
         assert!(
-            reason.starts_with("新建回合未确认到本轮新的 assistant 回复"),
+            reason.starts_with(
+                "ZCODE_CREATE_UNCONFIRMED_H7: 新建回合未确认到本轮新的 assistant 回复"
+            ),
             "create 文案必须在前：{reason}"
         );
         assert!(

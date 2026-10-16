@@ -195,7 +195,7 @@ pub fn decide_target(
 /// 拒绝文案（plan 定形，N = 候选数）：单一措辞出口——写侧落账与端点回执同源。
 pub fn ambiguous_target_error(n: usize) -> String {
     format!(
-        "同目录存在 {n} 个候选会话，无法确定投递目标（已知缺口 L13 修复）：请关闭多余窗口或改用无头通道"
+        "TTY_TARGET_AMBIGUOUS: 同目录存在 {n} 个候选会话，无法确定投递目标（已知缺口 L13 修复）：请关闭多余窗口或改用无头通道"
     )
 }
 
@@ -688,7 +688,7 @@ mod tests {
         let msg = super::ambiguous_target_error(3);
         assert_eq!(
             msg,
-            "同目录存在 3 个候选会话，无法确定投递目标（已知缺口 L13 修复）：请关闭多余窗口或改用无头通道"
+            "TTY_TARGET_AMBIGUOUS: 同目录存在 3 个候选会话，无法确定投递目标（已知缺口 L13 修复）：请关闭多余窗口或改用无头通道"
         );
     }
 

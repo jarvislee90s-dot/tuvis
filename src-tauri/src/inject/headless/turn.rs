@@ -177,7 +177,7 @@ pub fn cmd_shim_refusal(
     // 文案风格同斜杠命令拒绝（spec H7 / remote::api）：**显式告知**为什么 + 怎么办，
     // 绝不静默改写载荷（改写了用户就不知道 CLI 实际收到了什么）
     Some(format!(
-        "{subject}含 cmd 元字符（{hits}）：本机 CLI 是 npm 垫片（.cmd/.bat，经 `cmd /c` 启动），\
+        "TURN_CMD_SHIM_UNSAFE: {subject}含 cmd 元字符（{hits}）：本机 CLI 是 npm 垫片（.cmd/.bat，经 `cmd /c` 启动），\
          cmd 会重解析整条命令行（串联/重定向/转义/变量展开，引号配对规则也与 CRT 不同）——\
          {subject}可能被截断、改写或串联执行。本条**未投递**（零字节投递）：请改用直装 CLI（.exe）\
          或去掉这些字符后重发",
@@ -280,12 +280,12 @@ pub fn device_name_refusal(name: &str) -> Option<String> {
         .map(|c| device_name_char_label(*c))
         .collect();
     let more = if hit.len() > 3 {
-        format!(" 等 {} 种", hit.len())
+        format!("TURN_ETC_KINDS:  等 {} 种", hit.len())
     } else {
         String::new()
     };
     Some(format!(
-        "设备花名含命令行不安全字符（{}{more}）：花名会作为 `[mobile <花名>]` 签名拼进无头 \
+        "TURN_DEVICE_NAME_UNSAFE: 设备花名含命令行不安全字符（{}{more}）：花名会作为 `[mobile <花名>]` 签名拼进无头 \
          CLI 的命令行，而 Windows 上这些 CLI 常是 npm 垫片（.cmd/.bat 经 `cmd /c` 启动）——\
          cmd 会重解析整条命令行（串联/重定向/转义/变量展开，引号配对规则也与 CRT 不同），\
          签名可能被截断、改写或串联执行。白名单 = **Unicode 字母数字 + 空格 `-` `_` `.` `·`**；\
@@ -802,16 +802,22 @@ mod tests {
         let shim = spawn_shape(r"C:\npm\codex.cmd", "windows");
         let body =
             cmd_shim_refusal(CmdShimSubject::Body, "a & b", &shim, true).expect("正文命中必拒");
-        assert!(body.starts_with("正文含 cmd 元字符"), "{body}");
+        assert!(
+            body.starts_with("TURN_CMD_SHIM_UNSAFE: 正文含 cmd 元字符"),
+            "{body}"
+        );
         let path = cmd_shim_refusal(CmdShimSubject::ProjectPath, "E:/A&B", &shim, true)
             .expect("项目路径命中必拒");
         assert!(
-            path.starts_with("项目路径（-C 取值）含 cmd 元字符"),
+            path.starts_with("TURN_CMD_SHIM_UNSAFE: 项目路径（-C 取值）含 cmd 元字符"),
             "{path}"
         );
         let seg = cmd_shim_refusal(CmdShimSubject::ArgvSegment, "hi %PATH%", &shim, true)
             .expect("argv 分段命中必拒");
-        assert!(seg.starts_with("命令行分段含 cmd 元字符"), "{seg}");
+        assert!(
+            seg.starts_with("TURN_CMD_SHIM_UNSAFE: 命令行分段含 cmd 元字符"),
+            "{seg}"
+        );
         // 三个主语各自只出现自己那一段（词表单点，不串味）
         for (reason, mine, others) in [
             (&body, "正文", ["项目路径", "命令行分段"]),

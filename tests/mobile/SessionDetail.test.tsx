@@ -5,7 +5,6 @@ import SessionDetail, {
   HEADLESS_APPROVE_POLL_MS,
   HEADLESS_CLAUDE_CHANNEL,
   HEADLESS_STAGE_TRIAGE,
-  HeadlessReceiptCard,
   headlessAnswerLabels,
   headlessStageText,
   headlessUnanswered,

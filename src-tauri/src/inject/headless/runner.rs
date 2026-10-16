@@ -206,8 +206,10 @@ pub fn kill_tree(pid: u32) -> KillOutcome {
             .status()
         {
             Ok(s) if s.success() => KillOutcome::Taskkill,
-            Ok(s) => KillOutcome::Failed(format!("taskkill 退出码 {s}")),
-            Err(e) => KillOutcome::Failed(format!("taskkill 启动失败: {e}")),
+            Ok(s) => KillOutcome::Failed(format!("RUNNER_TASKKILL_EXIT: taskkill 退出码 {s}")),
+            Err(e) => KillOutcome::Failed(format!(
+                "RUNNER_TASKKILL_START_FAIL: taskkill 启动失败: {e}"
+            )),
         }
     }
     #[cfg(not(windows))]
@@ -237,8 +239,10 @@ pub fn kill_tree(pid: u32) -> KillOutcome {
             .status();
         match single {
             Ok(s) if s.success() => KillOutcome::SinglePid,
-            Ok(s) => KillOutcome::Failed(format!("kill 组与单 pid 均失败（单 pid 退出码 {s}）")),
-            Err(e) => KillOutcome::Failed(format!("kill 启动失败: {e}")),
+            Ok(s) => KillOutcome::Failed(format!(
+                "RUNNER_KILL_GROUP_AND_SINGLE_FAIL: kill 组与单 pid 均失败（单 pid 退出码 {s}）"
+            )),
+            Err(e) => KillOutcome::Failed(format!("RUNNER_KILL_START_FAIL: kill 启动失败: {e}")),
         }
     }
 }
@@ -821,7 +825,7 @@ impl RunnerCfg {
             RunEvent::CancelRequested => {
                 let killed = self.kill(pid);
                 Receipt::cancelled(&format!(
-                    "已取消（移动端请求，先到者生效）；kill 进程树 = {}",
+                    "HEADLESS_CANCELLED: 已取消（移动端请求，先到者生效）；kill 进程树 = {}",
                     killed.describe()
                 ))
                 .with_session(&self.session_id)
@@ -832,7 +836,7 @@ impl RunnerCfg {
                 Receipt::failed(
                     Stage::Timeout,
                     &format!(
-                        "watchdog {}s 到点，已 kill 进程树 = {}（可重试）",
+                        "RUNNER_WATCHDOG_KILLED: watchdog {}s 到点，已 kill 进程树 = {}（可重试）",
                         self.timeout.as_secs(),
                         killed.describe()
                     ),
@@ -845,7 +849,7 @@ impl RunnerCfg {
                 Receipt::failed(
                     Stage::Crash,
                     &format!(
-                        "进程监视失败（wait 侧异常退出）；kill 进程树 = {}",
+                        "RUNNER_WATCHER_GONE_SYNC: 进程监视失败（wait 侧异常退出）；kill 进程树 = {}",
                         killed.describe()
                     ),
                 )
@@ -880,8 +884,11 @@ impl RunnerCfg {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                return Receipt::failed(Stage::Spawn, &format!("spawn 失败: {e}"))
-                    .with_session(&self.session_id)
+                return Receipt::failed(
+                    Stage::Spawn,
+                    &format!("RUNNER_SPAWN_FAIL: spawn 失败: {e}"),
+                )
+                .with_session(&self.session_id)
             }
         };
         let pid = child.id().unwrap_or(0);
@@ -967,7 +974,7 @@ impl RunnerCfg {
                 finish_exit(&acc, &self.session_id, &exit, duration_ms)
             }
             RunEvent::CancelRequested => Receipt::cancelled(&format!(
-                "已取消（移动端请求，先到者生效）；kill 进程树 = {}",
+                "HEADLESS_CANCELLED: 已取消（移动端请求，先到者生效）；kill 进程树 = {}",
                 killed.map(|k| k.describe()).unwrap_or_else(|| "-".into())
             ))
             .with_session(&self.session_id)
@@ -975,7 +982,7 @@ impl RunnerCfg {
             RunEvent::TimedOut => Receipt::failed(
                 Stage::Timeout,
                 &format!(
-                    "watchdog {}s 到点，已 kill 进程树 = {}（可重试）",
+                    "RUNNER_WATCHDOG_KILLED: watchdog {}s 到点，已 kill 进程树 = {}（可重试）",
                     timeout.as_secs(),
                     killed.map(|k| k.describe()).unwrap_or_else(|| "-".into())
                 ),
@@ -985,7 +992,7 @@ impl RunnerCfg {
             RunEvent::WatcherGone => Receipt::failed(
                 Stage::Crash,
                 &format!(
-                    "进程监视失败；kill 进程树 = {}",
+                    "RUNNER_WATCHER_GONE: 进程监视失败；kill 进程树 = {}",
                     killed.map(|k| k.describe()).unwrap_or_else(|| "-".into())
                 ),
             )
@@ -1011,7 +1018,10 @@ fn finish_exit(
                 Some(Stage::Crash),
                 duration_ms,
             );
-            r.reason = Some(format!("退出码 {code}{}", stderr_suffix(&exit.stderr_tail)));
+            r.reason = Some(format!(
+                "RUNNER_EXIT_CODE: 退出码 {code}{}",
+                stderr_suffix(&exit.stderr_tail)
+            ));
             r
         }
         None => {
@@ -1022,7 +1032,7 @@ fn finish_exit(
                 duration_ms,
             );
             r.reason = Some(format!(
-                "进程被信号终止（无退出码）{}",
+                "RUNNER_SIGNAL_KILLED: 进程被信号终止（无退出码）{}",
                 stderr_suffix(&exit.stderr_tail)
             ));
             r
@@ -1036,7 +1046,7 @@ fn stderr_suffix(tail: &str) -> String {
         String::new()
     } else {
         format!(
-            "；stderr 尾行：{}",
+            "RUNNER_STDERR_SUFFIX: ；stderr 尾行：{}",
             crate::inject::normalize::summarize(t, crate::inject::normalize::AUDIT_SUMMARY_CHARS)
         )
     }

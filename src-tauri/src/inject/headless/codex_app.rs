@@ -447,9 +447,9 @@ impl AppServerSession {
             }
         });
         // initialize 失败一律通道面（EOF / 错误帧——握手没成，谈不上方法语义）
-        let result = s
-            .call("initialize", params)
-            .map_err(|e| AppServerError::Channel(format!("initialize 失败：{e}")))?;
+        let result = s.call("initialize", params).map_err(|e| {
+            AppServerError::Channel(format!("ACP_INITIALIZE_FAIL: initialize 失败：{e}"))
+        })?;
         s.server_user_agent = result
             .get("userAgent")
             .and_then(serde_json::Value::as_str)
@@ -467,20 +467,21 @@ impl AppServerSession {
         self.next_id += 1;
         // 裸方言请求帧（探测 §1.1）：{"id":N,"method":"…","params":{…}}——同样不带 jsonrpc
         let frame = serde_json::json!({"id": id, "method": method, "params": params});
-        let line = serde_json::to_string(&frame)
-            .map_err(|e| AppServerError::Channel(format!("请求序列化失败：{e}")))?;
+        let line = serde_json::to_string(&frame).map_err(|e| {
+            AppServerError::Channel(format!("ACP_REQUEST_SERIALIZE_FAIL: 请求序列化失败：{e}"))
+        })?;
         self.io.send(&line).map_err(AppServerError::Channel)?;
         loop {
             let line = match self.io.recv() {
                 Some(Ok(l)) => l,
                 Some(Err(e)) => {
                     return Err(AppServerError::Channel(format!(
-                        "{method}(id={id}) 读取失败：{e}"
+                        "ACP_RESPONSE_READ_FAIL: {method}(id={id}) 读取失败：{e}"
                     )))
                 }
                 None => {
                     return Err(AppServerError::Channel(format!(
-                        "连接在 {method}(id={id}) 响应前关闭（EOF）"
+                        "ACP_EOF_BEFORE_RESPONSE: 连接在 {method}(id={id}) 响应前关闭（EOF）"
                     )))
                 }
             };
@@ -514,7 +515,8 @@ impl AppServerSession {
         let result = self.call("thread/read", serde_json::json!({"threadId": thread_id}))?;
         let thread = result.get("thread").ok_or_else(|| {
             AppServerError::Channel(
-                "thread/read 响应缺 thread 键（协议形状漂移，不猜）".to_string(),
+                "CODEX_APP_THREAD_KEY_MISSING: thread/read 响应缺 thread 键（协议形状漂移，不猜）"
+                    .to_string(),
             )
         })?;
         Ok(ThreadMeta::from_json(thread))
@@ -656,7 +658,8 @@ impl AppServerSession {
     ) -> Result<InterruptReceipt, AppServerError> {
         if thread_id.trim().is_empty() || turn_id.trim().is_empty() {
             return Err(AppServerError::InvalidTarget(
-                "turn/interrupt 需要 threadId 与 turnId（空值投递前拒——不猜目标）".to_string(),
+                "CODEX_APP_INTERRUPT_TARGET_REQUIRED: turn/interrupt 需要 threadId 与 turnId（空值投递前拒——不猜目标）"
+                    .to_string(),
             ));
         }
         let result = self.call(
@@ -825,7 +828,7 @@ impl CodexAppClient {
     ) -> Result<ThreadMeta, AppServerError> {
         let tref = resolve_thread(rollout_path, session_id).ok_or_else(|| {
             AppServerError::InvalidTarget(format!(
-                "无法解析 codex thread id（rollout 路径与会话号都无 UUID）：{session_id}"
+                "CODEX_APP_THREAD_ID_UNRESOLVED: 无法解析 codex thread id（rollout 路径与会话号都无 UUID）：{session_id}"
             ))
         })?;
         let mut s = self.session()?;
@@ -869,12 +872,14 @@ impl CodexAppClient {
         // ②' ResumeOnly 不起回合 ⇒ 不要求 input（review I1：无回合就无必填可言）
         if thread_id.trim().is_empty() {
             return Err(AppServerError::InvalidTarget(
-                "档位写需要 threadId（空值投递前拒）".to_string(),
+                "CODEX_APP_POLICY_THREAD_ID_REQUIRED: 档位写需要 threadId（空值投递前拒）"
+                    .to_string(),
             ));
         }
         if carrier != PolicyCarrier::ResumeOnly && input_text.trim().is_empty() {
             return Err(AppServerError::InvalidTarget(
-                "档位切换需附极小输入（协议回合 input 必填，会起回合的载体同规）".to_string(),
+                "CODEX_APP_POLICY_INPUT_REQUIRED: 档位切换需附极小输入（协议回合 input 必填，会起回合的载体同规）"
+                    .to_string(),
             ));
         }
         let mut s = self.session()?;
@@ -1049,7 +1054,7 @@ pub fn production_spawn_seam() -> SpawnSeam {
         }
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("spawn {program} 失败：{e}"))?;
+            .map_err(|e| format!("ACP_SPAWN_FAIL: spawn {program} 失败：{e}"))?;
         let stdin = child
             .stdin
             .take()
@@ -1101,13 +1106,14 @@ impl ProcIo {
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(format!("读 stdout 失败：{e}")));
+                            let _ =
+                                tx.send(Err(format!("ACP_STDOUT_READ_FAIL: 读 stdout 失败：{e}")));
                             break;
                         }
                     }
                 }
             })
-            .map_err(|e| format!("起读线程失败：{e}"))?;
+            .map_err(|e| format!("ACP_READ_THREAD_SPAWN_FAIL: 起读线程失败：{e}"))?;
         // stderr drain 线程（spec 审 Major 1）：不读会死锁，读了不截断会无界——
         // 环形缓冲只留尾行（诊断面保留）
         let stderr_tail = Arc::new(std::sync::Mutex::new(StderrTail::with_cap(
@@ -1128,7 +1134,7 @@ impl ProcIo {
                     }
                 }
             })
-            .map_err(|e| format!("起 stderr drain 线程失败：{e}"))?;
+            .map_err(|e| format!("ACP_STDERR_DRAIN_SPAWN_FAIL: 起 stderr drain 线程失败：{e}"))?;
         Ok(Self {
             program,
             child,
@@ -1149,7 +1155,7 @@ impl AppServerIo for ProcIo {
             .write_all(line.as_bytes())
             .and_then(|_| stdin.write_all(b"\n"))
             .and_then(|_| stdin.flush())
-            .map_err(|e| format!("写 stdin 失败：{e}"))
+            .map_err(|e| format!("HEADLESS_STDIN_WRITE_FAIL: 写 stdin 失败：{e}"))
     }
 
     fn recv(&mut self) -> Option<Result<String, String>> {
@@ -1166,7 +1172,7 @@ impl AppServerIo for ProcIo {
             Err(RecvTimeoutError::Disconnected) => None,
             // 超时 ≠ EOF：如实报超时（调用方按通道错误面处理，不冒充 EOF）
             Err(RecvTimeoutError::Timeout) => Some(Err(format!(
-                "app-server {}ms 无输出（读取超时）",
+                "ACP_READ_TIMEOUT: app-server {}ms 无输出（读取超时）",
                 PROC_READ_TIMEOUT_MS
             ))),
         }
@@ -1357,9 +1363,15 @@ fn probe_body(spawn: &SpawnSeam, spec: &SpawnSpec, client: &ClientInfo) -> Probe
     let mut s = match AppServerSession::start(spawn, spec, client) {
         Ok(s) => s,
         Err(AppServerError::Channel(m)) => {
-            return ProbeVerdict::fail(format!("app-server 通道不可用（spawn/initialize）：{m}"))
+            return ProbeVerdict::fail(format!(
+                "ACP_CHANNEL_UNAVAILABLE_INIT: app-server 通道不可用（spawn/initialize）：{m}"
+            ))
         }
-        Err(e) => return ProbeVerdict::fail(format!("app-server 通道不可用：{e}")),
+        Err(e) => {
+            return ProbeVerdict::fail(format!(
+                "ACP_CHANNEL_UNAVAILABLE: app-server 通道不可用：{e}"
+            ))
+        }
     };
     for method in PROBE_PRESENCE_METHODS {
         match s.call(method, serde_json::json!({})) {
@@ -1368,14 +1380,14 @@ fn probe_body(spawn: &SpawnSeam, spec: &SpawnSpec, client: &ClientInfo) -> Probe
                 s.close();
                 // hint 不带降级前缀（组合点统一加——见 PROBE_UNAVAILABLE_PREFIX doc）
                 return ProbeVerdict::fail(format!(
-                    "app-server 方法缺席：{method}（{message}）——版本漂移"
+                    "ACP_METHOD_MISSING: app-server 方法缺席：{method}（{message}）——版本漂移"
                 ));
             }
             // 通道面错误（EOF/IO）：探测中断，如实 fail
             Err(AppServerError::Channel(m)) => {
                 s.close();
                 return ProbeVerdict::fail(format!(
-                    "app-server 探测中断（{method} 通道错误）：{m}"
+                    "ACP_PROBE_INTERRUPTED: app-server 探测中断（{method} 通道错误）：{m}"
                 ));
             }
             // 其余一切（Ok / -32600 writer 锁 / -32602 参数面 / 其他 Rpc）= 在场：
@@ -1387,10 +1399,10 @@ fn probe_body(spawn: &SpawnSeam, spec: &SpawnSpec, client: &ClientInfo) -> Probe
     s.close();
     let ver = ua
         .as_deref()
-        .map(|u| format!("；服务端 {u}"))
+        .map(|u| format!("ACP_SERVER_VERSION_SUFFIX: ；服务端 {u}"))
         .unwrap_or_default();
     ProbeVerdict::pass(format!(
-        "app-server 探测通过（initialize + {} 方法在场{ver}）",
+        "ACP_PROBE_PASS: app-server 探测通过（initialize + {} 方法在场{ver}）",
         PROBE_PRESENCE_METHODS.len()
     ))
 }
@@ -2459,7 +2471,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "目标不可用：档位切换需附极小输入（协议回合 input 必填，会起回合的载体同规）"
+            "目标不可用：CODEX_APP_POLICY_INPUT_REQUIRED: 档位切换需附极小输入（协议回合 input 必填，会起回合的载体同规）"
         );
     }
 

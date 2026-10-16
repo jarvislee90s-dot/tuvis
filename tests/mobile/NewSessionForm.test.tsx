@@ -305,9 +305,7 @@ describe("新建入口（H10 → D1 汇流：CreateSessionSheet 内的 zcode 选
 
   it("看板新建按钮打开唯一入口壳；工具区含 zcode（无头）选项，选中内嵌 NewSessionForm", async () => {
     installBoardStubs();
-    render(
-      <Board onPaired={vi.fn()} onUnpaired={vi.fn()} onOpenHistory={vi.fn()} />
-    );
+    render(<Board onPaired={vi.fn()} onUnpaired={vi.fn()} onOpenHistory={vi.fn()} />);
     // D1：main 的 create-open 是唯一「新建会话」入口（我们原独立入口已并入）
     fireEvent.click(await screen.findByTestId("create-open"));
     const sheet = await screen.findByTestId("create-sheet");

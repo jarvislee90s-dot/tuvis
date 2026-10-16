@@ -486,7 +486,7 @@ impl AskIncomplete {
     /// 供移动端 / 回执直接展示的中文原因（后端给文案、前端只渲染）
     pub fn reason(&self) -> String {
         format!(
-            "问答未答全，不允许提交（防静默丢题）：仍有 {} 题未作答——{}",
+            "CLI_QA_INCOMPLETE: 问答未答全，不允许提交（防静默丢题）：仍有 {} 题未作答——{}",
             self.missing.len(),
             self.missing.join("；")
         )
@@ -515,7 +515,7 @@ impl AnswerSet {
         } else {
             Err(AskIncomplete {
                 missing: if missing.is_empty() {
-                    vec!["（题集为空）".to_string()]
+                    vec!["CLI_QA_EMPTY_SET: （题集为空）".to_string()]
                 } else {
                     missing
                 },
@@ -587,7 +587,7 @@ pub fn answer_set_from_entries(
             .find(|q| q.get("question").and_then(|v| v.as_str()) == Some(text.as_str()))
         else {
             return Err(AnswerReject::other(format!(
-                "答案里的题面不在本回合的题集里（陈旧页面或串话）：{text}"
+                "CLI_QA_STALE_QUESTION: 答案里的题面不在本回合的题集里（陈旧页面或串话）：{text}"
             )));
         };
         let multi = reg
@@ -596,7 +596,7 @@ pub fn answer_set_from_entries(
             .unwrap_or(false);
         if !multi && labels.len() > 1 {
             return Err(AnswerReject::other(format!(
-                "单选题只允许一个答案（收到 {} 个：{}）——请重新选择：{text}",
+                "CLI_QA_SINGLE_ANSWER_ONLY: 单选题只允许一个答案（收到 {} 个：{}）——请重新选择：{text}",
                 labels.len(),
                 labels.join(" / ")
             )));
@@ -988,12 +988,13 @@ impl PendingRegistry {
             match g.get(session_id) {
                 None => {
                     return Err(
-                        "没有待答的审批/问答请求（回合可能已终结、被取消或已超时）".to_string()
+                        "HEADLESS_NO_PENDING: 没有待答的审批/问答请求（回合可能已终结、被取消或已超时）"
+                            .to_string(),
                     )
                 }
                 Some(p) if p.request_id != request_id => {
                     return Err(
-                        "请求标识不符（该审批请求已被新的请求替换或页面已陈旧）——请刷新后重试"
+                        "HEADLESS_REQUEST_ID_MISMATCH: 请求标识不符（该审批请求已被新的请求替换或页面已陈旧）——请刷新后重试"
                             .to_string(),
                     )
                 }
@@ -1009,7 +1010,10 @@ impl PendingRegistry {
                 Ok(())
             }
             // 回合侧接收端已 drop（取消/超时竞态）：如实报未送达，不谎报已答
-            Err(_) => Err("回合已不再等待该应答（取消/超时竞态）——本次应答未送达".to_string()),
+            Err(_) => Err(
+                "HEADLESS_ANSWER_RACE_LOST: 回合已不再等待该应答（取消/超时竞态）——本次应答未送达"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -1294,24 +1298,30 @@ impl ClaudeAcc {
     /// 回合小结（回执 `reason` 的诊断面：工具/审批/证据帧计数——**不编因果**）
     fn digest(&self) -> String {
         let mut parts = vec![format!(
-            "控制请求 {}（批准 {}/拒绝 {}/问答 {}）",
+            "CLI_DIGEST_CONTROLS: 控制请求 {}（批准 {}/拒绝 {}/问答 {}）",
             self.controls, self.allowed, self.denied, self.answered
         )];
         if self.deferred > 0 {
             parts.push(format!(
-                "其中 {} 项因前一项待答而排队上卡（未丢）",
+                "CLI_DIGEST_DEFERRED: 其中 {} 项因前一项待答而排队上卡（未丢）",
                 self.deferred
             ));
         }
         if !self.tool_names.is_empty() {
-            parts.push(format!("工具调用 [{}]", self.tool_names.join(", ")));
+            parts.push(format!(
+                "CLI_DIGEST_TOOLS: 工具调用 [{}]",
+                self.tool_names.join(", ")
+            ));
         }
         if self.tool_results > 0 {
             parts.push(format!(
-                "工具结果 {}{}",
+                "CLI_DIGEST_RESULTS: 工具结果 {}{}",
                 self.tool_results,
                 if self.tool_errors > 0 {
-                    format!("（其中 {} 个工具自身报错）", self.tool_errors)
+                    format!(
+                        "CLI_DIGEST_TOOL_ERRORS: （其中 {} 个工具自身报错）",
+                        self.tool_errors
+                    )
                 } else {
                     String::new()
                 }
@@ -1349,7 +1359,7 @@ pub async fn run_claude_turn(
         return ClaudeTurnOutcome {
             receipt: Receipt::failed(
                 Stage::ChannelError,
-                &format!("写 stdin（user 帧）失败：{e}——回合未起跑；kill 进程树 = {killed}"),
+                &format!("CLI_USER_FRAME_WRITE_FAIL: 写 stdin（user 帧）失败：{e}——回合未起跑；kill 进程树 = {killed}"),
             )
             .with_session(&input.session_id),
             controls: 0,
@@ -1574,7 +1584,7 @@ pub async fn run_claude_turn(
             let mut notes = vec![acc.digest()];
             if acc.denied > 0 {
                 notes.push(format!(
-                    "其中 {} 项工具/问答请求**已被用户拒绝**（deny）——模型收到的是拒绝，不是失败",
+                    "CLI_DIGEST_DENIED: 其中 {} 项工具/问答请求**已被用户拒绝**（deny）——模型收到的是拒绝，不是失败",
                     acc.denied
                 ));
             }
@@ -1582,14 +1592,14 @@ pub async fn run_claude_turn(
             r
         }
         EndWhy::Cancelled => Receipt::cancelled(&format!(
-            "已取消（移动端请求，先到者生效）；kill 进程树 = {killed}"
+            "HEADLESS_CANCELLED: 已取消（移动端请求，先到者生效）；kill 进程树 = {killed}"
         ))
         .with_session(&input.session_id)
         .with_duration_ms(duration_ms),
         EndWhy::Timeout => Receipt::failed(
             Stage::Timeout,
             &format!(
-                "watchdog {}s 到点{}；kill 进程树 = {killed}（可重试）",
+                "CLI_WATCHDOG_TIMEOUT: watchdog {}s 到点{}；kill 进程树 = {killed}（可重试）",
                 input.timeout_ms / 1000,
                 if waiting {
                     "（回合当时**正在等待审批/问答应答**——移动端未在时限内作答）"
@@ -1603,8 +1613,8 @@ pub async fn run_claude_turn(
         EndWhy::WriteFailed => Receipt::failed(
             Stage::ChannelError,
             &format!(
-                "审批应答写 stdin 失败（{}）——回合无法继续，已终止；kill 进程树 = {killed}",
-                write_fail.unwrap_or_else(|| "未知写错误".to_string())
+                "CLI_APPROVAL_STDIN_WRITE_FAIL: 审批应答写 stdin 失败（{}）——回合无法继续，已终止；kill 进程树 = {killed}",
+                write_fail.unwrap_or_else(|| "CLI_UNKNOWN_WRITE_ERROR: 未知写错误".to_string())
             ),
         )
         .with_session(&input.session_id)
@@ -1614,7 +1624,7 @@ pub async fn run_claude_turn(
         EndWhy::NoPermit => Receipt::failed(
             Stage::ChannelError,
             &format!(
-                "全局并发名额已被占满（上限 {}）：审批/问答应答**未能送达**本回合\
+                "CLI_PERMIT_FULL: 全局并发名额已被占满（上限 {}）：审批/问答应答**未能送达**本回合\
                  （等待期本回合不占名额，此刻名额被其他无头回合取走）——回合无法继续，\
                  已终止，请稍后重发本条消息；kill 进程树 = {killed}",
                 permit.as_ref().map(PermitParking::cap).unwrap_or(0)
@@ -1629,14 +1639,14 @@ pub async fn run_claude_turn(
                 crate::inject::normalize::AUDIT_SUMMARY_CHARS,
             );
             let how = if why == EndWhy::Exit {
-                "进程退出"
+                "CLI_HOW_PROC_EXIT: 进程退出"
             } else {
-                "stdout 关闭"
+                "CLI_HOW_STDOUT_CLOSED: stdout 关闭"
             };
             Receipt::failed(
                 Stage::ChannelError,
                 &format!(
-                    "{how}（exit={}）但**未命中 turn 终点判据**（未见到 \
+                    "CLI_TURN_END_UNVERIFIED: {how}（exit={}）但**未命中 turn 终点判据**（未见到 \
                      stream_event{{message_delta{{stop_reason}}}} 的终结值——附录 E-①，勿等 result 帧）：\
                      本轮结果未知，请在会话内容中确认后再决定是否重发；证据：{ev}；kill 进程树 = {killed}",
                     exit_code.map_or("-".to_string(), |c| c.to_string())
@@ -1660,10 +1670,10 @@ pub async fn run_claude_turn(
 /// 失败回执的证据串（帧统计 + 末条 assistant 摘要 + stderr 尾）——**不编因果**
 fn stdout_digest(acc: &ClaudeAcc, stderr_tail: &str) -> Vec<String> {
     let mut v = vec![format!(
-        "帧统计：{}",
+        "CLI_EVIDENCE_FRAMES: 帧统计：{}",
         if acc.last_stop_reason.is_some() {
             format!(
-                "最后 stop_reason={:?}（非终结值）",
+                "CLI_EVIDENCE_LAST_STOP_REASON: 最后 stop_reason={:?}（非终结值）",
                 acc.last_stop_reason.as_deref().unwrap_or("-")
             )
         } else {
@@ -1672,13 +1682,18 @@ fn stdout_digest(acc: &ClaudeAcc, stderr_tail: &str) -> Vec<String> {
     )];
     v.push(acc.digest());
     if let Some(t) = &acc.last_assistant {
-        v.push(format!("末条 assistant 摘要={t}"));
+        v.push(format!(
+            "CLI_EVIDENCE_LAST_ASSISTANT: 末条 assistant 摘要={t}"
+        ));
     }
     if acc.noise > 0 {
-        v.push(format!("无法解析的行 {} 条", acc.noise));
+        v.push(format!(
+            "CLI_EVIDENCE_UNPARSED_LINES: 无法解析的行 {} 条",
+            acc.noise
+        ));
     }
     if !stderr_tail.trim().is_empty() {
-        v.push(format!("stderr 尾={stderr_tail}"));
+        v.push(format!("CLI_EVIDENCE_STDERR_TAIL: stderr 尾={stderr_tail}"));
     }
     v
 }
@@ -1796,7 +1811,7 @@ pub fn parse_opencode_receipt(stdout: &[String]) -> CliReceipt {
                     .get("error")
                     .and_then(|e| e.get("message"))
                     .and_then(|m| m.as_str())
-                    .unwrap_or("CLI 报了未带 message 的错误帧");
+                    .unwrap_or("CLI_ERROR_FRAME_NO_MESSAGE: CLI 报了未带 message 的错误帧");
                 out.error = Some(msg.to_string());
                 out.frames += 1;
             }
@@ -1853,9 +1868,12 @@ fn finish_oneshot(
     }
     // 以下只处理 Ok（runner 眼里进程自然退出 0）
     if let Some(err) = &parsed.error {
-        return Receipt::failed(Stage::ChannelError, &format!("CLI 报错：{err}"))
-            .with_session(session_id)
-            .with_duration_ms(receipt.duration_ms);
+        return Receipt::failed(
+            Stage::ChannelError,
+            &format!("CLI_REPORTED_ERROR: CLI 报错：{err}"),
+        )
+        .with_session(session_id)
+        .with_duration_ms(receipt.duration_ms);
     }
     if let Some(text) = &parsed.last_assistant {
         return super::turn::ok_receipt_with_assistant(
@@ -1874,7 +1892,7 @@ fn finish_oneshot(
     Receipt::failed(
         Stage::ChannelError,
         &format!(
-            "CLI 正常退出但未拿到回执（exit={}）：stdout 无可解析回复帧={out}；stderr={err}",
+            "CLI_NO_RECEIPT_FRAME: CLI 正常退出但未拿到回执（exit={}）：stdout 无可解析回复帧={out}；stderr={err}",
             exit.map_or("-".to_string(), |c| c.to_string())
         ),
     )
@@ -1892,11 +1910,11 @@ fn append_evidence(
 ) -> Receipt {
     let mut extra: Vec<String> = Vec::new();
     if let Some(err) = &parsed.error {
-        extra.push(format!("CLI 报错帧：{err}"));
+        extra.push(format!("CLI_EVIDENCE_ERROR_FRAME: CLI 报错帧：{err}"));
     }
     if !stderr.trim().is_empty() {
         extra.push(format!(
-            "stderr 尾={}",
+            "CLI_EVIDENCE_STDERR_TAIL: stderr 尾={}",
             crate::inject::normalize::summarize(
                 stderr,
                 crate::inject::normalize::AUDIT_SUMMARY_CHARS
@@ -2007,7 +2025,7 @@ pub async fn spawn_claude(sp: &ClaudeSpawn) -> Result<ClaudeProcess, String> {
     cmd.process_group(0);
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("spawn 失败（{}）：{e}", sp.shape.program))?;
+        .map_err(|e| format!("CLI_SPAWN_FAIL: spawn 失败（{}）：{e}", sp.shape.program))?;
     let pid = child.id().unwrap_or(0);
     let tree = super::runner::TreeGuard::adopt(pid);
     // 在飞登记走 RAII 票据（评审 I14）：stdin 失败早退在票据 Drop 中一并注销，无须手工配对
@@ -2016,7 +2034,9 @@ pub async fn spawn_claude(sp: &ClaudeSpawn) -> Result<ClaudeProcess, String> {
     let Some(stdin) = child.stdin.take() else {
         // 早退路径：tree 显式终止；inflight 票据随本 return 的 Drop 自动注销
         let _ = tree.kill();
-        return Err("claude stdin 管道不可用（spawn 配置异常）".to_string());
+        return Err(
+            "CLI_STDIN_PIPE_UNAVAILABLE: claude stdin 管道不可用（spawn 配置异常）".to_string(),
+        );
     };
     let stdin = Arc::new(tokio::sync::Mutex::new(stdin));
     let write: Box<ClaudeWrite> = Box::new(move |line: String| {
@@ -2026,14 +2046,14 @@ pub async fn spawn_claude(sp: &ClaudeSpawn) -> Result<ClaudeProcess, String> {
             let mut g = stdin.lock().await;
             g.write_all(line.as_bytes())
                 .await
-                .map_err(|e| format!("写 stdin 失败：{e}"))?;
+                .map_err(|e| format!("HEADLESS_STDIN_WRITE_FAIL: 写 stdin 失败：{e}"))?;
             // NDJSON：单行 + 换行 + flush（附录 E-② 的同一条写入规则）
             g.write_all(b"\n")
                 .await
-                .map_err(|e| format!("写 stdin 换行失败：{e}"))?;
+                .map_err(|e| format!("CLI_STDIN_NEWLINE_WRITE_FAIL: 写 stdin 换行失败：{e}"))?;
             g.flush()
                 .await
-                .map_err(|e| format!("flush stdin 失败：{e}"))
+                .map_err(|e| format!("CLI_STDIN_FLUSH_FAIL: flush stdin 失败：{e}"))
         })
     });
 
@@ -2326,7 +2346,7 @@ mod tests {
         let prefix = "c".repeat(APPROVAL_INPUT_DISPLAY_CHARS);
         assert_eq!(
             shown,
-            format!("{prefix}…已截断，共 {n} 字符"),
+            format!("DISPLAY_TRUNCATED: {prefix}…已截断，共 {n} 字符"),
             "必须保留前 {APPROVAL_INPUT_DISPLAY_CHARS} 字 + 显式报真实总长 {n}"
         );
     }
@@ -2360,7 +2380,10 @@ mod tests {
         let prefix: String = raw.chars().take(APPROVAL_INPUT_DISPLAY_CHARS).collect();
         assert_eq!(
             shown,
-            format!("{prefix}…已截断，共 {} 字符", raw.chars().count()),
+            format!(
+                "DISPLAY_TRUNCATED: {prefix}…已截断，共 {} 字符",
+                raw.chars().count()
+            ),
             "非命令分支必须与命令分支同一口径（含真实总长）"
         );
     }

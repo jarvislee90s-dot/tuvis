@@ -104,7 +104,7 @@ impl Receipt {
     pub fn concurrency_full(cap: usize) -> Self {
         let mut r = Self::base(ReceiptStatus::Queued, "", 0);
         r.reason = Some(format!(
-            "无头并发已满（上限 {cap}）：本条未执行、未投递——请稍后重发"
+            "HEADLESS_CONCURRENCY_FULL: 无头并发已满（上限 {cap}）：本条未执行、未投递——请稍后重发"
         ));
         r
     }
@@ -354,7 +354,9 @@ mod tests {
         assert_eq!(full.terminator(), Terminator::NotStarted);
         assert_eq!(
             full.reason.as_deref(),
-            Some("无头并发已满（上限 2）：本条未执行、未投递——请稍后重发")
+            Some(
+                "HEADLESS_CONCURRENCY_FULL: 无头并发已满（上限 2）：本条未执行、未投递——请稍后重发"
+            )
         );
     }
 
