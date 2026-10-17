@@ -562,6 +562,104 @@ describe("RemoteSection 自有域名：Token 保存与教程 popover（M5 A6）"
     await waitFor(() => expect(toastSuccessMock).toHaveBeenCalled());
   });
 
+  // 2026-10-17 加固（Fix 1/3）：saveToken busy 互斥 + recycle 判据改 chanEnabled
+  it("Token 值未变时保存：toast 提示但不写库、不触发 toggle（不折腾连接器）", async () => {
+    render(<RemoteSection />);
+    fireEvent.click(card("named"));
+    const input = (await screen.findByLabelText("Tunnel Token")) as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe("eyJh-saved-token"));
+    // 值未变直接保存：不发起 set_setting，也不发起任何 remote_toggle_channel
+    fireEvent.click(within(input.closest("div")!).getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(toastSuccessMock).toHaveBeenCalled());
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "set_setting",
+      expect.objectContaining({ key: "remote.tunnel_token" })
+    );
+    expect(invokeMock.mock.calls.filter((c) => c[0] === "remote_toggle_channel")).toHaveLength(0);
+  });
+
+  it("Token 值变化且 named 开关开着（running=false 陈旧快照形态）→ 仍走关-开 recycle（chanEnabled 判据）", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: { key?: string }) => {
+      if (cmd === "remote_status")
+        // enabled=true 而 running=false：旧 chanRunning 判据会漏掉 recycle，
+        // 连接器继续拿旧 token 跑（#163 修的 bug 借 3s 轮询陈旧还魂）
+        return statusOf({
+          channels: channelsOf({
+            named: { enabled: true, running: false, address: null, error: null },
+          }),
+        });
+      if (cmd === "get_setting") {
+        if (args?.key === "remote.tunnel_token") return "eyJh-saved-token";
+        return null;
+      }
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    fireEvent.click(card("named"));
+    const input = (await screen.findByLabelText("Tunnel Token")) as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe("eyJh-saved-token"));
+    fireEvent.change(input, { target: { value: "eyJh-new-token" } });
+    fireEvent.click(within(input.closest("div")!).getByRole("button", { name: /^save$/i }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_setting", {
+        key: "remote.tunnel_token",
+        value: "eyJh-new-token",
+      })
+    );
+    // 关-开 recycle 依序发出（启停唯一入口 remote_toggle_channel）
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_toggle_channel", {
+        channel: "named",
+        on: false,
+      })
+    );
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_toggle_channel", {
+        channel: "named",
+        on: true,
+      })
+    );
+  });
+
+  it("保存进行中（busy）保存按钮置灰且再点直接返回——不并发第二轮 set_setting", async () => {
+    let release!: () => void;
+    invokeMock.mockImplementation(async (cmd: string, args?: { key?: string }) => {
+      if (cmd === "set_setting" && args?.key === "remote.tunnel_token") {
+        await new Promise<void>((r) => (release = r)); // 挂起第一次保存，制造 busy 窗口
+        return;
+      }
+      if (cmd === "remote_status") return statusOf();
+      if (cmd === "get_setting") {
+        if (args?.key === "remote.tunnel_token") return "eyJh-saved-token";
+        return null;
+      }
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    fireEvent.click(card("named"));
+    const input = (await screen.findByLabelText("Tunnel Token")) as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe("eyJh-saved-token"));
+    const saveBtn = within(input.closest("div")!).getByRole("button", {
+      name: /^save$/i,
+    }) as HTMLButtonElement;
+    fireEvent.change(input, { target: { value: "eyJh-new-token" } });
+    fireEvent.click(saveBtn);
+    // busy 窗口：按钮置灰（连点不能排队）；disabled 挡不住的事件派发由 busy 闸兜底
+    await waitFor(() => expect(saveBtn.disabled).toBe(true));
+    fireEvent.click(saveBtn);
+    release();
+    await waitFor(() => expect(saveBtn.disabled).toBe(false));
+    // set_setting(remote.tunnel_token) 只发生一次（第二次点击被 busy 闸吞掉）
+    expect(
+      invokeMock.mock.calls.filter(
+        (c) => c[0] === "set_setting" && (c[1] as { key?: string })?.key === "remote.tunnel_token"
+      )
+    ).toHaveLength(1);
+    await waitFor(() => expect(toastSuccessMock).toHaveBeenCalled());
+  });
+
   it("教程 popover：点击展开六步教程，再点收起（可保持展开边看边操作）", async () => {
     render(<RemoteSection />);
     fireEvent.click(card("named"));
