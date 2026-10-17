@@ -8,6 +8,8 @@
 //!   为正史，按 islands[].entries 顺序取（不遍历无序 map 当时间序）；
 //! * patch 严格校验（数组 add=插入 / remove=删除 / replace=只替换现有索引），
 //!   一批中任一 op 非法 → 整批原子拒绝 → stale + 重拉 snapshot；
+//!   path 直接对 `conversationState` 本体寻址（R1：真实形状无前缀，
+//!   来源 reviewer 2026-10-17 实读 Windows 原始日志，脱敏夹具同步）；
 //! * 低 revision 重放忽略；revision 缺口 → stale + need_snapshot；
 //!   新 epoch（换代后）不与旧 revision 比大小（状态已清）；
 //! * 预算：单 Thread 镜像 16 MiB；投影正文尾窗 1 MiB / 500 条并标 truncated。
@@ -45,7 +47,9 @@ pub struct ThreadMirror {
     lease: Option<OwnerLease>,
     revision: Option<u64>,
     stale: bool,
-    /// change 根（含 conversationState）；patch 相对该根寻址
+    /// conversationState 本体（R1：snapshot 存 `change["conversationState"]`；
+    /// patch 直接对该本体寻址——reviewer 2026-10-17 实读 Windows 原始日志定案，
+    /// 真实形状无 `conversationState` 路径前缀）
     state: Option<Value>,
     pending: PendingProjector,
     /// turnHistory.isComplete（不完整时 adapter 决定是否调 load-complete-history）
@@ -81,7 +85,7 @@ impl ThreadMirror {
         self.history_complete
     }
 
-    /// 原始 change 根（pending permissions 回显等只读用途；不进远程 API）。
+    /// 原始 conversationState 本体（pending permissions 回显等只读用途；不进远程 API）。
     pub fn raw_state(&self) -> Option<&Value> {
         self.state.as_ref()
     }
@@ -94,6 +98,13 @@ impl ThreadMirror {
     /// 标记过期（连接断开/缺口/预算超限）。保留最后视图但禁写（adapter 侧门）。
     pub fn mark_stale(&mut self) {
         self.stale = true;
+    }
+
+    /// owner 失效（`client-status-changed(disconnected)` 等）：清状态 + 全部 pending
+    /// token 失效（区别于 [`mark_stale`](Self::mark_stale) 的保视图只读）。之后只能
+    /// 由换代 lease 的新 snapshot 重建。
+    pub fn invalidate(&mut self) {
+        self.clear_state();
     }
 
     fn clear_state(&mut self) {
@@ -150,10 +161,11 @@ impl ThreadMirror {
                 return Ok(MirrorEffect::QUIET);
             }
         }
-        // 存整个 change 根：patch 路径以 conversationState 起头（change 根寻址）
+        // 只存 conversationState 本体：patch 相对该本体寻址（R1 真实根路径）
         let state = change
             .get("conversationState")
-            .map_or(Value::Null, |_| change.clone());
+            .cloned()
+            .unwrap_or(Value::Null);
         self.adopt(rev, state, is_complete(change))?;
         Ok(MirrorEffect {
             changed: true,
@@ -245,11 +257,8 @@ impl ThreadMirror {
     /// 统一状态投影（远程 API / SSE / 移动端唯一消费形态）。
     /// token 缓存存于 PendingProjector 内部互斥锁，`&self` 即可投影。
     pub fn project(&self, caps: CapabilitySet) -> ThreadProjection {
-        let root = self.state.clone().unwrap_or(Value::Null);
-        let state = root
-            .get("conversationState")
-            .cloned()
-            .unwrap_or(Value::Null);
+        // R1：state 即 conversationState 本体，按根直读
+        let state = self.state.clone().unwrap_or(Value::Null);
         let messages = project_messages(&state);
         let requests = state
             .get("requests")
@@ -632,20 +641,44 @@ mod tests {
     }
 
     #[test]
+    fn real_root_path_patch_updates_mirror() {
+        // reviewer 2026-10-17 复现形状：patch 直接对 conversationState 本体寻址
+        //（path 无 conversationState 前缀），snapshot 后 replace threadRuntimeStatus.type。
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &macos_change()).unwrap();
+        assert_eq!(m.project(caps()).runtime_status, "idle");
+        // 先推进到 batch[4] 的基线（revision 212），再应用真实根路径 replace
+        let batches = fixture("patches.json")["batches"].clone();
+        let batches = batches.as_array().unwrap().clone();
+        for idx in [0usize, 1, 3] {
+            m.apply(&lease(), &batches[idx]).unwrap();
+        }
+        let eff = m.apply(&lease(), &batches[4]).unwrap();
+        assert!(eff.changed, "真实根路径增量必须可应用");
+        assert!(!eff.need_snapshot);
+        let p = m.project(caps());
+        assert_eq!(p.runtime_status, "active", "runtime_status 增量生效");
+        assert!(!p.stale);
+        assert!(!m.is_stale());
+        assert_eq!(p.revision, Some(213));
+    }
+
+    #[test]
     fn patch_batch_is_atomic() {
         let mut m = ThreadMirror::new(key());
         m.apply(&lease(), &macos_change()).unwrap();
         // 一批：第一条合法（replace 文本）+ 第二条非法（replace 不存在的键）
+        // （R1：path 直接对 conversationState 本体寻址，无前缀）
         let batch = serde_json::json!({
             "type": "patches",
             "baseRevision": 209,
             "revision": 210,
             "patches": [
                 { "op": "replace",
-                  "path": ["conversationState", "turnHistory", "history", "entitiesByKey", "itm-a1", "text"],
+                  "path": ["turnHistory", "history", "entitiesByKey", "itm-a1", "text"],
                   "value": "更新" },
                 { "op": "replace",
-                  "path": ["conversationState", "noSuchKey"],
+                  "path": ["noSuchKey"],
                   "value": 1 }
             ]
         });

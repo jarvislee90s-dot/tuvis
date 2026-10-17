@@ -182,7 +182,7 @@ mod tests {
     // 真实假服务端 named pipe 往返测试只在 Windows 原生运行（CI windows job）；
     // macOS/Linux 上该测试不存在也不谎报执行。
     #[cfg(windows)]
-    use super::{DesktopEndpoint, EndpointResolver, WindowsEndpointResolver, PIPE_NAME};
+    use super::DesktopEndpoint;
 
     #[cfg(windows)]
     #[tokio::test]
@@ -204,7 +204,7 @@ mod tests {
             path: test_pipe.clone(),
             build: None,
         };
-        let _ = PIPE_NAME; // 生产常量仅编译面引用
+
 
         let sv = tokio::spawn(async move {
             server.connect().await?;

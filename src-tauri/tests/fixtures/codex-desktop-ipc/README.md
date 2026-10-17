@@ -15,7 +15,7 @@
 | --- | --- | --- |
 | `macos-snapshot.json` | OBSERVED 骨架 + SYNTHETIC 内容 | `thread-stream-state-changed` v11 snapshot：`turns=[]`（实机事实）+ `turnHistory.history.entitiesByKey/islands` 正史 + permissions pending（整数 request id，OBSERVED id=12 形态） |
 | `windows-snapshot.json` | NOT_TRIGGERED/合成 | Windows 侧同构 snapshot（双端共用协议）；pending 为 command 审批（整数 id） |
-| `patches.json` | OBSERVED 结构 | `{baseRevision,revision,patches[]}`，数组路径，含 add/replace/remove 与流式同 item replace 样本 |
+| `patches.json` | OBSERVED 结构（reviewer 2026-10-17 实读 Windows 原始日志，脱敏） | `{baseRevision,revision,patches[]}`，数组路径，**path 直接对 conversationState 本体寻址（无 `conversationState` 前缀——真实形状，R1 返工定案）**；含 add/replace/remove、流式同 item replace 与 `path=["threadRuntimeStatus","type"]` 的 reviewer 复现样本 |
 | `command.json` | SYNTHETIC（Mac NOT_TRIGGERED；表面 `thread-follower-command-approval-decision` 来自 CODE） | `item/commandExecution/requestApproval` 请求项 |
 | `permissions.json` | OBSERVED（Mac POC-5，无 `availableDecisions`） | `item/permissions/requestApproval` 请求项 |
 | `user-input.json` | CODE + SYNTHETIC | blocking `item/tool/requestUserInput` 请求项（含 isOther/isSecret 双问题；request id 字符串形态为 SYNTHETIC——Mac 实测 requestId 为整数） |

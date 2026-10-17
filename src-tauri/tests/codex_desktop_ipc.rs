@@ -679,70 +679,82 @@ use multi_agents_manager_lib::services::codex_desktop_ipc::adapter::{
     Connector, DesktopIpcAdapter,
 };
 use multi_agents_manager_lib::services::codex_desktop_ipc::transport::BoxIo;
-use multi_agents_manager_lib::services::codex_desktop_ipc::types::{CapabilitySet, PendingAction};
+use multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingAction;
 use std::sync::Mutex as StdMutex;
 
-/// 注入单个 io 的测试连接器（adapter 只连一次）。
-struct StaticConnector {
+use std::pin::Pin;
+
+/// 已验证 build（生产 profile 精确匹配键；R3 后能力一律由 resolver 链的 endpoint 派生）。
+const MACOS_BUILD: &str = "26.1013.31256";
+const WINDOWS_BUILD: &str = "26.1013.3656.0";
+
+fn test_endpoint(
+    platform: &str,
+    build: &str,
+) -> multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint {
+    multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint {
+        platform: platform.into(),
+        path: "test-endpoint".into(),
+        build: Some(build.into()),
+    }
+}
+
+/// 测试连接器：endpoint 身份 + 单个 io（R3：连接必须携带 endpoint，能力由
+/// 生产 `profile_for(platform, build)` 派生——不注入固定 profile）。
+struct TestConnector {
+    endpoint: multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint,
     io: StdMutex<
         Option<Box<dyn multi_agents_manager_lib::services::codex_desktop_ipc::transport::IpcIo>>,
     >,
 }
 
-impl StaticConnector {
+impl TestConnector {
     fn new(
+        endpoint: multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint,
         io: Box<dyn multi_agents_manager_lib::services::codex_desktop_ipc::transport::IpcIo>,
     ) -> Self {
         Self {
+            endpoint,
             io: StdMutex::new(Some(io)),
         }
     }
 }
 
-impl Connector for StaticConnector {
-    fn connect(
+impl Connector for TestConnector {
+    fn connect_endpoint(
         &self,
     ) -> Pin<
         Box<
             dyn std::future::Future<
                     Output = Result<
-                        BoxIo,
+                        (
+                            BoxIo,
+                            multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint,
+                        ),
                         multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError,
                     >,
                 > + Send
                 + '_,
         >,
-    > {
+    >{
         Box::pin(async move {
-            self.io
+            let io = self
+                .io
                 .lock()
                 .expect("lock")
                 .take()
-                .ok_or_else(|| multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError::Disconnected("no io".into()))
+                .ok_or_else(|| multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError::Disconnected("no io".into()))?;
+            Ok((io, self.endpoint.clone()))
         })
     }
 }
 
-use std::pin::Pin;
-
-/// 全能力测试 profile（macOS 已验证 build + 全 flag：只测构造器，不改生产 profile）。
-fn caps_open_profile(
-) -> multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile {
-    let mut p = profile_for("macos", "26.1013.31256").unwrap();
-    p.capabilities = CapabilitySet {
-        send: true,
-        state: true,
-        command: true,
-        permissions: true,
-        blocking_input: true,
-    };
-    p
-}
-
 /// 建 harness：驱动 ensure_thread 的握手/discovery/following/snapshot，
-/// 返回（adapter、peer、快照后的投影）。
-async fn harness(
-    profile: multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile,
+/// 返回（adapter、peer、快照后的投影）。能力由 endpoint（platform+build）经生产
+/// profile 表派生：macos=permissions 开、windows=command/blocking_input 开。
+async fn harness_for(
+    platform: &str,
+    build: &str,
     requests: Vec<serde_json::Value>,
 ) -> (
     DesktopIpcAdapter,
@@ -751,7 +763,14 @@ async fn harness(
     ThreadKey,
 ) {
     let (io, peer) = ScriptedPeer::new();
-    let adapter = DesktopIpcAdapter::new(std::sync::Arc::new(StaticConnector::new(io)), profile);
+    let adapter = DesktopIpcAdapter::new(
+        std::sync::Arc::new(TestConnector::new(test_endpoint(platform, build), io)),
+        // R3 前：构造 profile 即连接期 profile；R3 后：仅为首个连接前的基线，
+        // 连接后按 endpoint 重算（同值）。
+        profile_for(platform, build).unwrap_or_else(
+            multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile::closed,
+        ),
+    );
     let key = ThreadKey {
         host_id: "local".into(),
         thread_id: "00000000-0000-4000-8000-0000000000m1".into(),
@@ -812,9 +831,21 @@ async fn harness(
     (adapter, peer, projection, key)
 }
 
+/// macOS 已验证 build harness（permissions 开；command/blocking_input 关）。
+async fn harness(
+    requests: Vec<serde_json::Value>,
+) -> (
+    DesktopIpcAdapter,
+    ScriptedPeer,
+    multi_agents_manager_lib::services::codex_desktop_ipc::types::ThreadProjection,
+    ThreadKey,
+) {
+    harness_for("macos", MACOS_BUILD, requests).await
+}
+
 #[tokio::test]
 async fn native_start_turn_targets_original_thread() {
-    let (adapter, mut peer, _projection, key) = harness(caps_open_profile(), vec![]).await;
+    let (adapter, mut peer, _projection, key) = harness(vec![]).await;
     let client_message_id =
         multi_agents_manager_lib::services::codex_desktop_ipc::types::new_uuid();
     let task = {
@@ -869,23 +900,15 @@ async fn native_start_turn_targets_original_thread() {
 }
 
 #[tokio::test]
-async fn native_approval_variants_never_share_wire_payload() {
-    // 快照带 command（整数 id 18）与 permissions（整数 id 12）两条 pending
-    let (adapter, mut peer, projection, key) = harness(
-        caps_open_profile(),
-        vec![
-            serde_json::json!({
-                "id": 18, "method": "item/commandExecution/requestApproval",
-                "params": { "command": "pnpm test", "cwd": "/w", "reason": "r" }
-            }),
-            serde_json::json!({
-                "id": 12, "method": "item/permissions/requestApproval",
-                "params": { "cwd": "/tmp/x", "permissions": {
-                    "network": serde_json::Value::Null,
-                    "fileSystem": { "read": serde_json::Value::Null, "write": ["/tmp/x"], "entries": [] }
-                } }
-            }),
-        ],
+async fn native_command_approval_uses_decision_wire() {
+    // R3 后能力由生产 profile 派生：command 已验证 = Windows build（permissions 未验证）
+    let (adapter, mut peer, projection, key) = harness_for(
+        "windows",
+        WINDOWS_BUILD,
+        vec![serde_json::json!({
+            "id": 18, "method": "item/commandExecution/requestApproval",
+            "params": { "command": "pnpm test", "cwd": "/w", "reason": "r" }
+        })],
     )
     .await;
     let cmd_key = projection
@@ -893,12 +916,6 @@ async fn native_approval_variants_never_share_wire_payload() {
         .iter()
         .find(|p| p.kind == multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind::CommandApproval)
         .expect("command pending")
-        .clone();
-    let perm_key = projection
-        .pending
-        .iter()
-        .find(|p| p.kind == multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind::PermissionsApproval)
-        .expect("permissions pending")
         .clone();
 
     // command approve：thread-follower-command-approval-decision + decision:"accept"
@@ -937,6 +954,30 @@ async fn native_approval_variants_never_share_wire_payload() {
         .expect("in time")
         .expect("join");
     assert_eq!(o.delivery, Delivery::Accepted);
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_permissions_approval_echoes_saved_permissions() {
+    // R3 后能力由生产 profile 派生：permissions 已验证 = macOS build（command 未验证）
+    let (adapter, mut peer, projection, key) = harness_for(
+        "macos",
+        MACOS_BUILD,
+        vec![serde_json::json!({
+            "id": 12, "method": "item/permissions/requestApproval",
+            "params": { "cwd": "/tmp/x", "permissions": {
+                "network": serde_json::Value::Null,
+                "fileSystem": { "read": serde_json::Value::Null, "write": ["/tmp/x"], "entries": [] }
+            } }
+        })],
+    )
+    .await;
+    let perm_key = projection
+        .pending
+        .iter()
+        .find(|p| p.kind == multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind::PermissionsApproval)
+        .expect("permissions pending")
+        .clone();
 
     // permissions approve：回显服务端保存的原 permissions + scope=turn
     let t = {
@@ -1015,7 +1056,9 @@ async fn native_answer_binds_current_pending() {
         .unwrap(),
     )
     .expect("fixture json");
-    let (adapter, mut peer, projection, key) = harness(caps_open_profile(), vec![ui]).await;
+    // R3 后能力由生产 profile 派生：blocking_input 已验证 = Windows build
+    let (adapter, mut peer, projection, key) =
+        harness_for("windows", WINDOWS_BUILD, vec![ui]).await;
     let pending = projection
         .pending
         .iter()
@@ -1116,7 +1159,9 @@ async fn native_is_other_false_rejects_free_text() {
               "options": [ { "label": "alpha", "description": "" } ] }
         ]}
     });
-    let (adapter, mut peer, projection, key) = harness(caps_open_profile(), vec![req]).await;
+    // R3 后能力由生产 profile 派生：blocking_input 已验证 = Windows build
+    let (adapter, mut peer, projection, key) =
+        harness_for("windows", WINDOWS_BUILD, vec![req]).await;
     let pending = projection.pending[0].clone();
     // isOther=false：自由文本拒绝
     let free_text = PendingAction::Answer(
@@ -1173,15 +1218,14 @@ async fn native_is_other_false_rejects_free_text() {
 
 #[tokio::test]
 async fn native_capability_gated_and_unsupported_requests_never_send() {
-    // macOS 生产 profile：blocking_input=false → user-input 可见但不可答
-    let mac = profile_for("macos", "26.1013.31256").unwrap();
+    // macOS 生产 profile（endpoint 派生）：blocking_input=false → user-input 可见但不可答
     let req = serde_json::json!({
         "id": 7, "method": "item/tool/requestUserInput",
         "params": { "isBlocking": true, "questions": [
             { "id": "q1", "header": "h", "question": "?", "isOther": true, "isSecret": false, "options": [] }
         ]}
     });
-    let (adapter, mut peer, projection, key) = harness(mac, vec![req]).await;
+    let (adapter, mut peer, projection, key) = harness(vec![req]).await;
     let pending = &projection.pending[0];
     assert_eq!(
         pending.kind,
@@ -1220,5 +1264,1036 @@ async fn native_capability_gated_and_unsupported_requests_never_send() {
         Some("stale_context"),
         "未知 request 无卡可答"
     );
+    adapter.shutdown().await;
+}
+
+// ================= R1–R5 返工回归（2026-10-17 审计；TDD 先红后绿） =================
+
+use multi_agents_manager_lib::services::codex_desktop_ipc::transport::EndpointResolver;
+use multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError;
+use tokio::sync::broadcast;
+
+fn tkey(id: &str) -> ThreadKey {
+    ThreadKey {
+        host_id: "local".into(),
+        thread_id: id.into(),
+    }
+}
+
+/// permissions 审批 pending（整数 id 12；macos verified build 下 actionable）。
+fn permissions_request() -> serde_json::Value {
+    serde_json::json!({
+        "id": 12, "method": "item/permissions/requestApproval",
+        "params": { "cwd": "/tmp/x", "permissions": {
+            "network": serde_json::Value::Null,
+            "fileSystem": { "read": serde_json::Value::Null, "write": ["/tmp/x"], "entries": [] }
+        } }
+    })
+}
+
+/// 标准 snapshot change（单条用户消息 + idle runtime；可带 pending / 历史完整性）。
+fn snapshot_change(
+    rev: u64,
+    requests: Vec<serde_json::Value>,
+    history_complete: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "snapshot", "revision": rev,
+        "conversationState": {
+            "turns": [], "requests": requests,
+            "threadRuntimeStatus": { "type": "idle" },
+            "turnHistory": { "isComplete": history_complete, "history": {
+                "entitiesByKey": {
+                    "t1": { "id": "t1", "type": "turn", "status": "completed", "items": ["u1"] },
+                    "u1": { "id": "u1", "type": "user_message", "text": "hello", "ts": 1 }
+                },
+                "islands": [ { "entries": ["t1"] } ]
+            }}
+        }
+    })
+}
+
+fn state_frame(thread_id: &str, source: &str, change: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": source, "targetClientIds": ["tuvis"],
+        "params": { "conversationId": thread_id, "hostId": "local", "change": change }
+    })
+}
+
+/// 限时收帧（防测试悬挂）。
+async fn recv_frame(peer: &mut ScriptedPeer, secs: u64) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(secs), peer.recv())
+        .await
+        .expect("帧超时")
+}
+
+/// 驱动一次完整 follow（可含 init），并在 following 声明后下发 snapshot。
+/// 严格按 discovery→following 顺序（测试自身无并发帧时使用）。
+async fn drive_follow(
+    peer: &mut ScriptedPeer,
+    thread_id: &str,
+    owner: &str,
+    snapshot: serde_json::Value,
+    with_init: bool,
+) {
+    drive_follow_collecting(peer, thread_id, owner, snapshot, with_init).await;
+}
+
+/// 宽容版 follow 驱动：按 method 分拣帧，混入的无关请求帧（如并发 respond）原样
+/// 返回给调用方处置；following 声明后下发 snapshot。
+async fn drive_follow_collecting(
+    peer: &mut ScriptedPeer,
+    thread_id: &str,
+    owner: &str,
+    snapshot: serde_json::Value,
+    with_init: bool,
+) -> Vec<serde_json::Value> {
+    let mut others = Vec::new();
+    if with_init {
+        let init = recv_frame(peer, 10).await;
+        assert_eq!(init["method"], "initialize");
+        peer.send(&serde_json::json!({
+            "type": "response", "requestId": init["requestId"],
+            "resultType": "success", "method": "initialize",
+            "handledByClientId": owner, "result": { "clientId": owner }
+        }))
+        .await;
+    }
+    loop {
+        let frame = recv_frame(peer, 10).await;
+        match frame["method"].as_str().unwrap_or("") {
+            "thread-owner-discovery" => {
+                assert_eq!(frame["params"]["conversationId"], thread_id);
+                peer.send(&discovery_response(
+                    frame["requestId"].as_str().unwrap(),
+                    owner,
+                ))
+                .await;
+            }
+            "thread-stream-following-changed" => {
+                assert_eq!(frame["params"]["conversationId"], thread_id);
+                break;
+            }
+            _ => others.push(frame),
+        }
+    }
+    peer.send(&state_frame(thread_id, owner, snapshot)).await;
+    others
+}
+
+/// 等 SSE 里某 thread 的下一个投影（可选 stale 过滤）。
+async fn wait_projection(
+    rx: &mut broadcast::Receiver<
+        multi_agents_manager_lib::services::codex_desktop_ipc::types::ThreadProjection,
+    >,
+    thread_id: &str,
+    stale_only: bool,
+    secs: u64,
+) -> multi_agents_manager_lib::services::codex_desktop_ipc::types::ThreadProjection {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待 thread {thread_id} 投影超时"
+        );
+        let p = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        let Ok(Ok(p)) = p else { continue };
+        if p.thread_id == thread_id && (!stale_only || p.stale) {
+            return p;
+        }
+    }
+}
+
+/// 轮询直到镜像推进到目标 revision（projection 只读，不触发连接）。
+async fn wait_revision(
+    adapter: &DesktopIpcAdapter,
+    key: &ThreadKey,
+    rev: u64,
+) -> multi_agents_manager_lib::services::codex_desktop_ipc::types::ThreadProjection {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let p = adapter.projection(key).await;
+        if p.revision == Some(rev) {
+            return p;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待 revision {rev} 超时（当前 {:?}）",
+            p.revision
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 帧断言：对端（超时）无新帧。
+async fn assert_no_frame(peer: &mut ScriptedPeer, ms: u64) {
+    let got = tokio::time::timeout(Duration::from_millis(ms), peer.recv()).await;
+    assert!(
+        got.is_err(),
+        "不应有新帧：{:?}",
+        got.ok().map(|f| f["method"].clone())
+    );
+}
+
+/// R3 resolver 链：endpoint 由 resolver 产（生产 profile_for 消费 build），io 由脚本队列供。
+struct FakeResolver(std::sync::Mutex<FakeEndpointState>);
+
+enum FakeEndpointState {
+    Absent,
+    Endpoint(multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint),
+}
+
+impl FakeResolver {
+    fn absent() -> Self {
+        Self(std::sync::Mutex::new(FakeEndpointState::Absent))
+    }
+    fn set_endpoint(
+        &self,
+        ep: multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint,
+    ) {
+        *self.0.lock().expect("lock") = FakeEndpointState::Endpoint(ep);
+    }
+}
+
+impl EndpointResolver for FakeResolver {
+    fn resolve(
+        &self,
+    ) -> Result<
+        multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint,
+        ProtocolError,
+    > {
+        match &*self.0.lock().expect("lock") {
+            FakeEndpointState::Absent => Err(ProtocolError::Disconnected(
+                "desktop endpoint absent".into(),
+            )),
+            FakeEndpointState::Endpoint(ep) => Ok(ep.clone()),
+        }
+    }
+}
+
+/// 脚本连接器：每次连接 = resolver.resolve() + 弹出一个预排队的 io（R3 测试 6 用）。
+struct ScriptedConnector {
+    resolver: std::sync::Arc<FakeResolver>,
+    ios: StdMutex<std::collections::VecDeque<BoxIo>>,
+}
+
+impl Connector for ScriptedConnector {
+    fn connect_endpoint(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(BoxIo, multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint), ProtocolError>,
+                > + Send
+                + '_,
+        >,
+    >{
+        Box::pin(async move {
+            let endpoint = self.resolver.resolve()?;
+            let io = self
+                .ios
+                .lock()
+                .expect("lock")
+                .pop_front()
+                .ok_or_else(|| ProtocolError::Disconnected("no scripted io".into()))?;
+            Ok((io, endpoint))
+        })
+    }
+}
+
+#[tokio::test]
+async fn revision_gap_republishes_stale_and_refollows() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = DesktopIpcAdapter::new(
+        std::sync::Arc::new(TestConnector::new(test_endpoint("macos", MACOS_BUILD), io)),
+        profile_for("macos", MACOS_BUILD).unwrap(),
+    );
+    let key = tkey("gap-thread");
+    let mut sse = adapter.subscribe();
+    let task = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    drive_follow(
+        &mut peer,
+        "gap-thread",
+        "owner-1",
+        snapshot_change(209, vec![permissions_request()], true),
+        true,
+    )
+    .await;
+    let proj = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("ensure in time")
+        .expect("join")
+        .expect("fresh");
+    assert!(!proj.stale);
+    assert_eq!(proj.pending.len(), 1);
+
+    // 故意 revision 缺口（当前 209；帧声称 base=210/rev=211——中间缺 210，乱序缺口）
+    let gap = serde_json::json!({ "type": "patches", "baseRevision": 210, "revision": 211, "patches": [] });
+    peer.send(&state_frame("gap-thread", "owner-1", gap)).await;
+    // SSE 收到 stale 投影（不能停在旧视图）
+    let stale = wait_projection(&mut sse, "gap-thread", true, 5).await;
+    assert!(stale.stale);
+
+    // 有界重拉：re-declare following（probe 定案：再声明即得新 snapshot）
+    let follow = recv_frame(&mut peer, 5).await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    assert_eq!(follow["params"]["conversationId"], "gap-thread");
+
+    // 新 snapshot 恢复，无重复气泡
+    peer.send(&state_frame(
+        "gap-thread",
+        "owner-1",
+        snapshot_change(210, vec![permissions_request()], true),
+    ))
+    .await;
+    let fresh = wait_projection(&mut sse, "gap-thread", false, 5).await;
+    assert!(!fresh.stale);
+    assert_eq!(fresh.revision, Some(210));
+    assert_eq!(
+        fresh.messages.len(),
+        proj.messages.len(),
+        "新 snapshot 恢复后不得产生重复气泡"
+    );
+
+    // 恢复成功即停止重试：不再有 following 帧
+    assert_no_frame(&mut peer, 900).await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn history_incomplete_triggers_read_only_load() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = DesktopIpcAdapter::new(
+        std::sync::Arc::new(TestConnector::new(test_endpoint("macos", MACOS_BUILD), io)),
+        profile_for("macos", MACOS_BUILD).unwrap(),
+    );
+    let key = tkey("hist-thread");
+    let task = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    drive_follow(
+        &mut peer,
+        "hist-thread",
+        "owner-1",
+        snapshot_change(100, vec![], false),
+        true,
+    )
+    .await;
+    let proj = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("ensure in time")
+        .expect("join")
+        .expect("fresh");
+    assert!(!proj.stale);
+
+    // 快照不完整 → v1 只读 load-complete-history（params 带 conversationId + hostId:"local"）
+    let load = recv_frame(&mut peer, 5).await;
+    assert_eq!(load["type"], "request");
+    assert_eq!(load["method"], "thread-follower-load-complete-history");
+    assert_eq!(load["version"], serde_json::json!(1));
+    assert_eq!(load["params"]["conversationId"], "hist-thread");
+    assert_eq!(load["params"]["hostId"], "local");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": load["requestId"],
+        "resultType": "success", "method": "thread-follower-load-complete-history",
+        "result": {}
+    }))
+    .await;
+
+    // 每 follow 至多一次：后续仍不完整的 snapshot 不再发起
+    peer.send(&state_frame(
+        "hist-thread",
+        "owner-1",
+        snapshot_change(101, vec![], false),
+    ))
+    .await;
+    let _ = wait_revision(&adapter, &key, 101).await;
+    assert_no_frame(&mut peer, 900).await;
+
+    // 完整 snapshot 后同样不再发起
+    peer.send(&state_frame(
+        "hist-thread",
+        "owner-1",
+        snapshot_change(102, vec![], true),
+    ))
+    .await;
+    let _ = wait_revision(&adapter, &key, 102).await;
+    assert_no_frame(&mut peer, 900).await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn client_status_changed_invalidates_all_threads_of_owner() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = DesktopIpcAdapter::new(
+        std::sync::Arc::new(TestConnector::new(test_endpoint("macos", MACOS_BUILD), io)),
+        profile_for("macos", MACOS_BUILD).unwrap(),
+    );
+    let mut sse = adapter.subscribe();
+    let k1 = tkey("own-t1");
+    let k2 = tkey("own-t2");
+    // 两 thread 共 owner-1
+    let t1 = {
+        let a = adapter.clone();
+        let k = k1.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    drive_follow(
+        &mut peer,
+        "own-t1",
+        "owner-1",
+        snapshot_change(1, vec![permissions_request()], true),
+        true,
+    )
+    .await;
+    let p1 = tokio::time::timeout(Duration::from_secs(10), t1)
+        .await
+        .expect("in time")
+        .expect("join")
+        .expect("fresh");
+    let t2 = {
+        let a = adapter.clone();
+        let k = k2.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    drive_follow(
+        &mut peer,
+        "own-t2",
+        "owner-1",
+        snapshot_change(2, vec![], true),
+        false,
+    )
+    .await;
+    let _p2 = tokio::time::timeout(Duration::from_secs(10), t2)
+        .await
+        .expect("in time")
+        .expect("join")
+        .expect("fresh");
+
+    // owner 广播 disconnected
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 0,
+        "sourceClientId": "owner-1",
+        "params": { "clientId": "owner-1", "status": "disconnected" }
+    }))
+    .await;
+
+    // SSE 收到两 thread 的 stale 投影
+    let s1 = wait_projection(&mut sse, "own-t1", true, 5).await;
+    assert!(s1.stale);
+    let s2 = wait_projection(&mut sse, "own-t2", true, 5).await;
+    assert!(s2.stale);
+
+    // 旧卡 respond 零写（旧 lease/token 全失效）
+    let rk = p1.pending[0].request_key.clone();
+    let tk = p1.pending[0].context_token.clone();
+    let o = adapter.respond(&k1, &rk, &tk, PendingAction::Approve).await;
+    assert_eq!(o.delivery, Delivery::NotSent);
+    assert_eq!(o.reason_code.as_deref(), Some("stale_context"));
+    assert_no_frame(&mut peer, 300).await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn late_frame_from_old_owner_is_dropped() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = DesktopIpcAdapter::new(
+        std::sync::Arc::new(TestConnector::new(test_endpoint("macos", MACOS_BUILD), io)),
+        profile_for("macos", MACOS_BUILD).unwrap(),
+    );
+    let mut sse = adapter.subscribe();
+    let key = tkey("late-thread");
+    let task = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    drive_follow(
+        &mut peer,
+        "late-thread",
+        "owner-1",
+        snapshot_change(5, vec![], true),
+        true,
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("in time")
+        .expect("join")
+        .expect("fresh");
+
+    // owner A → B：disconnected + 重新 ensure（新 owner 接管）
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 0,
+        "sourceClientId": "owner-1",
+        "params": { "clientId": "owner-1", "status": "disconnected" }
+    }))
+    .await;
+    let _stale = wait_projection(&mut sse, "late-thread", true, 5).await;
+    let task = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    drive_follow(
+        &mut peer,
+        "late-thread",
+        "owner-2",
+        snapshot_change(6, vec![], true),
+        false,
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("in time")
+        .expect("join")
+        .expect("fresh");
+    let now = adapter.projection(&key).await;
+    assert_eq!(now.revision, Some(6));
+
+    // 旧 owner 的迟到帧（rev 7）：必须丢弃——镜像 revision/内容不变
+    peer.send(&state_frame(
+        "late-thread",
+        "owner-1",
+        snapshot_change(7, vec![], true),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let now = adapter.projection(&key).await;
+    assert_eq!(now.revision, Some(6), "迟到帧不得推进 revision/污染镜像");
+    assert_eq!(now.messages[0].text, "hello", "内容不被迟到帧覆盖");
+
+    // 现行 owner 的同一帧：正常应用
+    peer.send(&state_frame(
+        "late-thread",
+        "owner-2",
+        snapshot_change(7, vec![], true),
+    ))
+    .await;
+    let p7 = wait_revision(&adapter, &key, 7).await;
+    assert_eq!(p7.revision, Some(7));
+    assert_eq!(
+        p7.messages[0].text, "hello",
+        "同一帧换现行 owner 来源后生效"
+    );
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_build_closes_and_verified_reopens() {
+    // resolver 链：无 Desktop → verified build → unknown build → verified；
+    // 每步断言能力动态变化与零/有 IPC 写（不注入固定 profile）。
+    let resolver = std::sync::Arc::new(FakeResolver::absent());
+    let (io_b, mut peer_b) = ScriptedPeer::new();
+    let (io_c, mut peer_c) = ScriptedPeer::new();
+    let (io_d, mut peer_d) = ScriptedPeer::new();
+    let adapter = DesktopIpcAdapter::new(
+        std::sync::Arc::new(ScriptedConnector {
+            resolver: resolver.clone(),
+            ios: StdMutex::new([io_b, io_c, io_d].into_iter().collect()),
+        }),
+        multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile::closed(),
+    );
+    let key = tkey("dyn-thread");
+
+    // Step A：无 Desktop（resolver 失败）→ closed 投影 + start_turn 零写
+    {
+        let a = adapter.clone();
+        let k = key.clone();
+        let joined = tokio::time::timeout(Duration::from_secs(10), a.ensure_thread(&k))
+            .await
+            .expect("ensure returns in time");
+        assert!(joined.is_err(), "无 endpoint 时 ensure 失败");
+    }
+    assert!(
+        !adapter.capabilities().send,
+        "无连接/无 endpoint → closed 能力"
+    );
+    let o = adapter.start_turn(&key, "act-a", "x", "cmid-a").await;
+    assert_eq!(o.delivery, Delivery::NotSent);
+    assert_eq!(o.reason_code.as_deref(), Some("capability_unavailable"));
+
+    // Step B：verified build → 能力开、可写
+    resolver.set_endpoint(test_endpoint("macos", MACOS_BUILD));
+    let t = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    drive_follow(
+        &mut peer_b,
+        "dyn-thread",
+        "owner-1",
+        snapshot_change(1, vec![], true),
+        true,
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), t)
+        .await
+        .expect("in time")
+        .expect("join")
+        .expect("fresh");
+    assert!(adapter.capabilities().send, "verified build → 能力开");
+    let wt = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.start_turn(&k, "act-b", "帮我", "cmid-b").await })
+    };
+    let frame = recv_frame(&mut peer_b, 5).await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    peer_b
+        .send(&serde_json::json!({
+            "type": "response", "requestId": frame["requestId"],
+            "resultType": "success", "method": "thread-follower-start-turn",
+            "result": { "turn": { "id": "turn-1", "status": "inProgress" } }
+        }))
+        .await;
+    let o = tokio::time::timeout(Duration::from_secs(5), wt)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(o.delivery, Delivery::Accepted);
+
+    // Step C：unknown build（先切 resolver 再断开）→ 重连后立即关 A 写、start_turn 零写
+    resolver.set_endpoint(test_endpoint("macos", "9.9.9-unknown"));
+    peer_b.close();
+    drive_follow(
+        &mut peer_c,
+        "dyn-thread",
+        "owner-2",
+        snapshot_change(2, vec![], true),
+        true,
+    )
+    .await;
+    let _ = wait_revision(&adapter, &key, 2).await;
+    assert!(!adapter.capabilities().send, "unknown build → 能力立即关闭");
+    let o = adapter.start_turn(&key, "act-c", "x", "cmid-c").await;
+    assert_eq!(o.delivery, Delivery::NotSent);
+    assert_eq!(o.reason_code.as_deref(), Some("capability_unavailable"));
+    assert_no_frame(&mut peer_c, 500).await;
+
+    // Step D：verified 重开（无需重启 Tuvis）
+    resolver.set_endpoint(test_endpoint("macos", MACOS_BUILD));
+    peer_c.close();
+    drive_follow(
+        &mut peer_d,
+        "dyn-thread",
+        "owner-3",
+        snapshot_change(3, vec![], true),
+        true,
+    )
+    .await;
+    let _ = wait_revision(&adapter, &key, 3).await;
+    assert!(
+        adapter.capabilities().send,
+        "verified build 恢复 → 能力重开"
+    );
+    let wt = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.start_turn(&k, "act-d", "帮我", "cmid-d").await })
+    };
+    let frame = recv_frame(&mut peer_d, 5).await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    peer_d
+        .send(&serde_json::json!({
+            "type": "response", "requestId": frame["requestId"],
+            "resultType": "success", "method": "thread-follower-start-turn",
+            "result": { "turn": { "id": "turn-2", "status": "inProgress" } }
+        }))
+        .await;
+    let o = tokio::time::timeout(Duration::from_secs(5), wt)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(o.delivery, Delivery::Accepted);
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn follow_and_respond_do_not_deadlock() {
+    let (adapter, mut peer, projection, key1) = harness(vec![permissions_request()]).await;
+    let mut sse = adapter.subscribe();
+    let key2 = tkey("deadlock-t2");
+    let rk = projection.pending[0].request_key.clone();
+    let tk = projection.pending[0].context_token.clone();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+    // 两条路径同时出发：ensure_thread(t2) 与 respond(t1)（R5 反向锁序死锁回归）
+    let t_follow = {
+        let a = adapter.clone();
+        let k = key2.clone();
+        let b = barrier.clone();
+        tokio::spawn(async move {
+            b.wait().await;
+            a.ensure_thread(&k).await
+        })
+    };
+    let t_respond = {
+        let a = adapter.clone();
+        let k = key1.clone();
+        let rk = rk.clone();
+        let tk = tk.clone();
+        let b = barrier.clone();
+        tokio::spawn(async move {
+            b.wait().await;
+            a.respond(&k, &rk, &tk, PendingAction::Approve).await
+        })
+    };
+    // 对端按 method 分拣驱动（两任务的帧任意交错）
+    let others = drive_follow_collecting(
+        &mut peer,
+        "deadlock-t2",
+        "owner-1",
+        snapshot_change(300, vec![], true),
+        false,
+    )
+    .await;
+    // respond 帧（可能与其他帧交错到达）逐一回执
+    for frame in others {
+        peer.send(&serde_json::json!({
+            "type": "response", "requestId": frame["requestId"],
+            "resultType": "success", "method": frame["method"],
+            "result": { "ok": true }
+        }))
+        .await;
+    }
+    let p = tokio::time::timeout(Duration::from_secs(5), t_follow)
+        .await
+        .expect("follow 必须限时完成（不得互等死锁）")
+        .expect("join")
+        .expect("fresh");
+    assert!(!p.stale);
+    let o = tokio::time::timeout(Duration::from_secs(5), t_respond)
+        .await
+        .expect("respond 必须限时完成（不得互等死锁）")
+        .expect("join");
+    assert_eq!(o.delivery, Delivery::Accepted);
+
+    // lease 最终复核仍在：owner 失效后旧卡仍拒（先等 stale 投影落地再复核，免竞态）
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 0,
+        "sourceClientId": "owner-1",
+        "params": { "clientId": "owner-1", "status": "disconnected" }
+    }))
+    .await;
+    let stale = wait_projection(&mut sse, &key1.thread_id, true, 5).await;
+    assert!(stale.stale);
+    let o2 = adapter
+        .respond(&key1, &rk, &tk, PendingAction::Approve)
+        .await;
+    assert_eq!(o2.delivery, Delivery::NotSent);
+    assert_eq!(o2.reason_code.as_deref(), Some("stale_context"));
+    assert_no_frame(&mut peer, 300).await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn vanished_pending_revokes_token() {
+    let (adapter, mut peer, projection, key) = harness(vec![permissions_request()]).await;
+    let rk = projection.pending[0].request_key.clone();
+    let old_token = projection.pending[0].context_token.clone();
+    // [r] → []
+    peer.send(&state_frame(
+        "00000000-0000-4000-8000-0000000000m1",
+        "owner-1",
+        serde_json::json!({ "type": "patches", "baseRevision": 209, "revision": 210,
+            "patches": [ { "op": "replace", "path": ["requests"], "value": [] } ] }),
+    ))
+    .await;
+    // [] → [r]（重现）
+    peer.send(&state_frame(
+        "00000000-0000-4000-8000-0000000000m1",
+        "owner-1",
+        serde_json::json!({ "type": "patches", "baseRevision": 210, "revision": 211,
+            "patches": [ { "op": "replace", "path": ["requests"], "value": [permissions_request()] } ] }),
+    ))
+    .await;
+    let now = wait_revision(&adapter, &key, 211).await;
+    assert_eq!(now.pending.len(), 1);
+    let new_token = now.pending[0].context_token.clone();
+    assert_ne!(new_token, old_token, "重现后必须换新 token");
+
+    // 旧 token respond → 409/stale_context 零写
+    let o = adapter
+        .respond(&key, &rk, &old_token, PendingAction::Approve)
+        .await;
+    assert_eq!(o.delivery, Delivery::NotSent);
+    assert_eq!(o.reason_code.as_deref(), Some("stale_context"));
+    assert_no_frame(&mut peer, 300).await;
+
+    // 新 token 可用
+    let t = {
+        let a = adapter.clone();
+        let k = key.clone();
+        let rk = rk.clone();
+        let tk = new_token.clone();
+        tokio::spawn(async move { a.respond(&k, &rk, &tk, PendingAction::Approve).await })
+    };
+    let frame = recv_frame(&mut peer, 5).await;
+    assert_eq!(
+        frame["method"],
+        "thread-follower-permissions-request-approval-response"
+    );
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-permissions-request-approval-response",
+        "result": { "ok": true }
+    }))
+    .await;
+    let o = tokio::time::timeout(Duration::from_secs(5), t)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(o.delivery, Delivery::Accepted);
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_mirror_rejects_respond() {
+    let (adapter, mut peer, projection, key) = harness(vec![permissions_request()]).await;
+    let rk = projection.pending[0].request_key.clone();
+    let tk = projection.pending[0].context_token.clone();
+    // revision 缺口（当前 209；帧声称 base=210/rev=211——缺口不应用，mirror stale）
+    peer.send(&state_frame(
+        "00000000-0000-4000-8000-0000000000m1",
+        "owner-1",
+        serde_json::json!({ "type": "patches", "baseRevision": 210, "revision": 211, "patches": [] }),
+    ))
+    .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let p = adapter.projection(&key).await;
+        if p.stale {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "缺口后应 stale");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // 缺口后旧卡批准 → stale_context、零写（following 声明属 R1 有界重拉，允许）
+    let o = adapter
+        .respond(&key, &rk, &tk, PendingAction::Approve)
+        .await;
+    assert_eq!(o.delivery, Delivery::NotSent);
+    assert_eq!(o.reason_code.as_deref(), Some("stale_context"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "不得有 mutating 帧写出"
+        );
+        match tokio::time::timeout(Duration::from_millis(200), peer.recv()).await {
+            Err(_) => break,
+            Ok(frame) => assert!(
+                frame["method"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("thread-stream"),
+                "缺口后不得有交互写帧：{frame}"
+            ),
+        }
+    }
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_submit_same_pending_writes_once() {
+    let (adapter, mut peer, projection, key) = harness(vec![permissions_request()]).await;
+    let rk = projection.pending[0].request_key.clone();
+    let tk = projection.pending[0].context_token.clone();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    // 两个不同 actionId（两次 respond）并发提交同一 pending
+    let ta = {
+        let a = adapter.clone();
+        let k = key.clone();
+        let rk = rk.clone();
+        let tk = tk.clone();
+        let b = barrier.clone();
+        tokio::spawn(async move {
+            b.wait().await;
+            a.respond(&k, &rk, &tk, PendingAction::Approve).await
+        })
+    };
+    let tb = {
+        let a = adapter.clone();
+        let k = key.clone();
+        let rk = rk.clone();
+        let tk = tk.clone();
+        let b = barrier.clone();
+        tokio::spawn(async move {
+            b.wait().await;
+            a.respond(&k, &rk, &tk, PendingAction::Approve).await
+        })
+    };
+    // 恰一个 wire 帧
+    let frame = recv_frame(&mut peer, 5).await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": frame["method"],
+        "result": { "ok": true }
+    }))
+    .await;
+    let oa = tokio::time::timeout(Duration::from_secs(5), ta)
+        .await
+        .expect("in time")
+        .expect("join");
+    let ob = tokio::time::timeout(Duration::from_secs(5), tb)
+        .await
+        .expect("in time")
+        .expect("join");
+    let outcomes = [oa, ob];
+    let accepted = outcomes
+        .iter()
+        .filter(|o| o.delivery == Delivery::Accepted)
+        .count();
+    let blocked = outcomes
+        .iter()
+        .filter(|o| {
+            o.delivery == Delivery::NotSent
+                && o.reason_code.as_deref() == Some("pending_submit_in_progress")
+        })
+        .count();
+    assert_eq!(accepted, 1, "并发提交恰一次写");
+    assert_eq!(blocked, 1, "另一提交被 pending_submit_in_progress 拒绝");
+    assert_no_frame(&mut peer, 300).await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn unknown_delivery_blocks_retry_same_pending() {
+    let (adapter, mut peer, projection, key) = harness(vec![permissions_request()]).await;
+    let rk = projection.pending[0].request_key.clone();
+    let tk = projection.pending[0].context_token.clone();
+    // 第一次提交：帧到达后对端不回执 → 虚拟时间推进到 RPC 超时 = UnknownDelivery
+    let t1 = {
+        let a = adapter.clone();
+        let k = key.clone();
+        let rk = rk.clone();
+        let tk = tk.clone();
+        tokio::spawn(async move { a.respond(&k, &rk, &tk, PendingAction::Approve).await })
+    };
+    let frame = recv_frame(&mut peer, 5).await;
+    let _ = frame;
+    let o1 = tokio::time::timeout(RPC_TIMEOUT + Duration::from_secs(5), t1)
+        .await
+        .expect("timeout fires")
+        .expect("join");
+    assert_eq!(o1.delivery, Delivery::UnknownDelivery);
+
+    // 新 actionId 再 respond 同一 pending → 拒（未知结果不能借新 actionId 重发）
+    let o2 = adapter
+        .respond(&key, &rk, &tk, PendingAction::Approve)
+        .await;
+    assert_eq!(o2.delivery, Delivery::NotSent);
+    assert_eq!(
+        o2.reason_code.as_deref(),
+        Some("pending_submit_in_progress")
+    );
+    assert_no_frame(&mut peer, 300).await;
+
+    // pending 消失 → 阻塞解除；再 respond 是 stale_context（卡没了），不再是 submit_in_progress
+    peer.send(&state_frame(
+        "00000000-0000-4000-8000-0000000000m1",
+        "owner-1",
+        serde_json::json!({ "type": "patches", "baseRevision": 209, "revision": 210,
+            "patches": [ { "op": "replace", "path": ["requests"], "value": [] } ] }),
+    ))
+    .await;
+    let _ = wait_revision(&adapter, &key, 210).await;
+    let o3 = adapter
+        .respond(&key, &rk, &tk, PendingAction::Approve)
+        .await;
+    assert_eq!(o3.delivery, Delivery::NotSent);
+    assert_eq!(
+        o3.reason_code.as_deref(),
+        Some("stale_context"),
+        "阻塞已随 pending 消失解除"
+    );
+
+    // [r] 重现（新 token）→ 恢复可提交（证明阻塞彻底解除而非永久卡死）
+    peer.send(&state_frame(
+        "00000000-0000-4000-8000-0000000000m1",
+        "owner-1",
+        serde_json::json!({ "type": "patches", "baseRevision": 210, "revision": 211,
+            "patches": [ { "op": "replace", "path": ["requests"], "value": [permissions_request()] } ] }),
+    ))
+    .await;
+    let now = wait_revision(&adapter, &key, 211).await;
+    let fresh_token = now.pending[0].context_token.clone();
+    let t4 = {
+        let a = adapter.clone();
+        let k = key.clone();
+        let rk = rk.clone();
+        tokio::spawn(async move {
+            a.respond(&k, &rk, &fresh_token, PendingAction::Approve)
+                .await
+        })
+    };
+    let frame = recv_frame(&mut peer, 5).await;
+    assert_eq!(
+        frame["method"],
+        "thread-follower-permissions-request-approval-response"
+    );
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-permissions-request-approval-response",
+        "result": { "ok": true }
+    }))
+    .await;
+    let o4 = tokio::time::timeout(Duration::from_secs(5), t4)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(o4.delivery, Delivery::Accepted);
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn following_status_request_gets_reply_from_following_set() {
+    let (adapter, mut peer, _projection, key) = harness(vec![]).await;
+    // owner 问「谁在跟随」：当前关注集内的 thread 立即回 following:true
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-following-status-requested", "version": 1,
+        "sourceClientId": "owner-1",
+        "params": { "conversationId": key.thread_id }
+    }))
+    .await;
+    let reply = recv_frame(&mut peer, 5).await;
+    assert_eq!(reply["method"], "thread-stream-following-changed");
+    assert_eq!(reply["version"], serde_json::json!(1));
+    assert_eq!(reply["params"]["following"], serde_json::json!(true));
+    assert_eq!(reply["params"]["conversationId"], key.thread_id);
+    assert_eq!(reply["params"]["hostId"], "local");
+
+    // 非关注 thread 不回
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-following-status-requested", "version": 1,
+        "sourceClientId": "owner-1",
+        "params": { "conversationId": "ghost-thread" }
+    }))
+    .await;
+    assert_no_frame(&mut peer, 500).await;
+    adapter.shutdown().await;
+}
+
+#[tokio::test]
+async fn connection_reset_marks_all_stale() {
+    let (adapter, mut peer, _projection, key) = harness(vec![]).await;
+    let mut sse = adapter.subscribe();
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "ipc-connection-reset", "version": 1,
+        "sourceClientId": "owner-1", "params": {}
+    }))
+    .await;
+    let s = wait_projection(&mut sse, &key.thread_id, true, 5).await;
+    assert!(s.stale, "连接级 reset → 全部 mirror stale 并发布");
     adapter.shutdown().await;
 }

@@ -1,5 +1,6 @@
 {
-  "_source": "OBSERVED 结构（Mac 探针 POC-2：patches 携带 {baseRevision,revision,patches:[{op,path[],value?}]}，数组路径；具体 op 取值为协议表面合成）",
+  "_source": "OBSERVED 结构（reviewer 2026-10-17 实读 Windows 原始日志（脱敏）：patches 携带 {baseRevision,revision,patches:[{op,path[],value?}]}，数组路径，path 直接对 conversationState 本体寻址——无 conversationState 前缀；具体 op 取值为协议表面合成）",
+  "_note": "R1 返工：旧夹具人为多包一层 conversationState 前缀，遮住了合同偏差，已全部去除",
   "batches": [
     {
       "_note": "流式 agent_message 同 item replace（不得产生重复气泡，Task 5 断言）",
@@ -10,7 +11,6 @@
         {
           "op": "replace",
           "path": [
-            "conversationState",
             "turnHistory",
             "history",
             "entitiesByKey",
@@ -30,7 +30,6 @@
         {
           "op": "replace",
           "path": [
-            "conversationState",
             "turnHistory",
             "history",
             "entitiesByKey"
@@ -76,7 +75,6 @@
         {
           "op": "add",
           "path": [
-            "conversationState",
             "turnHistory",
             "history",
             "islands",
@@ -104,10 +102,25 @@
         {
           "op": "remove",
           "path": [
-            "conversationState",
             "requests",
             0
           ]
+        }
+      ]
+    },
+    {
+      "_note": "reviewer 复现形状：对 threadRuntimeStatus 本体的 replace（真实根路径增量）",
+      "type": "patches",
+      "baseRevision": 212,
+      "revision": 213,
+      "patches": [
+        {
+          "op": "replace",
+          "path": [
+            "threadRuntimeStatus",
+            "type"
+          ],
+          "value": "active"
         }
       ]
     }

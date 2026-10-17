@@ -17,6 +17,23 @@ pub struct ProtocolProfile {
 }
 
 impl ProtocolProfile {
+    /// 能力全关的诚实缺省（R3 定案）：未识别 build / 无 endpoint / 连接失败时使用。
+    /// caps 全 false（A 写全关、投影 CompatOnly），但保留标准方法表——只读同步仍可。
+    pub fn closed() -> Self {
+        Self {
+            platform: std::env::consts::OS.to_string(),
+            build: String::new(),
+            capabilities: CapabilitySet {
+                send: false,
+                state: false,
+                command: false,
+                permissions: false,
+                blocking_input: false,
+            },
+            method_versions: method_table(),
+        }
+    }
+
     /// 按方法取版本。`envelope_host` 为 `Some` 时仅 `thread-follower-*` 基值 +1
     /// （本地 follower request envelope 不发 hostId，走基值——两种位置都要钉住）。
     pub fn version(&self, method: &str, envelope_host: Option<&str>) -> Result<u32, ProtocolError> {
@@ -101,6 +118,24 @@ pub fn profile_for(platform: &str, build: &str) -> Option<ProtocolProfile> {
 mod tests {
     use super::*;
     use crate::services::codex_desktop_ipc::types::PendingRequestId;
+
+    #[test]
+    fn closed_profile_has_zero_caps_but_standard_method_table() {
+        let c = ProtocolProfile::closed();
+        assert!(!c.capabilities.send, "closed：A 写全关");
+        assert!(!c.capabilities.state);
+        assert!(!c.capabilities.command);
+        assert!(!c.capabilities.permissions);
+        assert!(!c.capabilities.blocking_input);
+        // 只读同步仍可：标准方法表在场
+        assert_eq!(c.version("thread-owner-discovery", None).unwrap(), 1);
+        assert_eq!(c.version("thread-stream-state-changed", None).unwrap(), 11);
+        assert_eq!(
+            c.version("thread-follower-load-complete-history", None)
+                .unwrap(),
+            1
+        );
+    }
 
     #[test]
     fn unverified_or_unknown_builds_are_none() {

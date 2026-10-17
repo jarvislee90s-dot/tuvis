@@ -40,12 +40,23 @@ impl PendingProjector {
     }
 
     /// 把 `requests[]` 投影为 `PendingView` 列表（输入数组顺序即输出顺序）。
+    /// 投影后清除已消失请求的 token（R4：`[r]→[]→[r]` 重现时生成新 token，
+    /// 旧卡不可复活）。
     pub fn project(
         &self,
         requests: &[serde_json::Value],
         caps: &CapabilitySet,
     ) -> Vec<PendingView> {
         let mut tokens = self.tokens.lock().expect("token lock");
+        // R4：本轮仍在场的 request_key 之外的缓存条目一律清除
+        let live: std::collections::HashSet<String> = requests
+            .iter()
+            .filter_map(|req| {
+                let id: PendingRequestId = serde_json::from_value(req.get("id")?.clone()).ok()?;
+                Some(id.to_key())
+            })
+            .collect();
+        tokens.retain(|key, _| live.contains(key));
         requests
             .iter()
             .filter_map(|req| project_one(req, caps, &mut tokens))
@@ -62,9 +73,13 @@ impl PendingProjector {
     }
 }
 
-fn fingerprint(value: &serde_json::Value) -> u64 {
-    // 规范化序列化指纹：内容变化即可检出（无需密码学强度）
-    let canonical = serde_json::to_string(value).unwrap_or_default();
+fn fingerprint(method: &str, value: &serde_json::Value) -> u64 {
+    // 规范化序列化指纹（R4：含 method——同 params 不同 method 必须视为不同上下文）：
+    // `method + "\n" + canonical params`；内容变化即可检出（无需密码学强度）
+    let canonical = format!(
+        "{method}\n{}",
+        serde_json::to_string(value).unwrap_or_default()
+    );
     canonical.bytes().fold(0xcbf29ce484222325u64, |acc, b| {
         (acc ^ u64::from(b)).wrapping_mul(0x100000001b3)
     })
@@ -161,8 +176,8 @@ fn project_one(
             ),
         };
 
-    // token：同 request 同内容 → 复用；内容变化/重现 → 换新
-    let fp = fingerprint(&params);
+    // token：同 request 同 method 同内容 → 复用；内容/方法变化、重现 → 换新
+    let fp = fingerprint(method, &params);
     let token = match tokens.get(&request_key) {
         Some(entry) if entry.fingerprint == fp => entry.token.clone(),
         _ => {
@@ -370,5 +385,49 @@ mod tests {
             "method": "item/permissions/requestApproval",
             "params": { "cwd": "/w", "permissions": { "fileSystem": { "write": ["/tmp/y"] } } }
         })
+    }
+
+    #[test]
+    fn vanished_request_revokes_token_and_reappear_mints_new() {
+        // R4：[r]→[]→[r] 重现时必须生成新 token（消失即撤销，旧卡不可复用）
+        let p = PendingProjector::new();
+        let caps = caps_all();
+        let req = serde_json::json!({
+            "id": 12, "method": "item/permissions/requestApproval", "params": { "cwd": "/w" }
+        });
+        let v1 = p.project(std::slice::from_ref(&req), &caps).remove(0);
+        // 消失
+        let gone = p.project(&[], &caps);
+        assert!(gone.is_empty());
+        assert!(
+            !p.token_valid(&v1.request_key, &v1.context_token),
+            "请求消失即撤销 token"
+        );
+        // 重现：新 token
+        let v2 = p.project(&[req], &caps).remove(0);
+        assert_ne!(
+            v1.context_token, v2.context_token,
+            "重现生成新 token，不复活旧 token"
+        );
+        assert!(p.token_valid(&v2.request_key, &v2.context_token));
+    }
+
+    #[test]
+    fn fingerprint_includes_method() {
+        // R4：指纹 = method + canonical params——同 params 不同 method 的 token 必须不同
+        let p = PendingProjector::new();
+        let caps = caps_all();
+        let a = serde_json::json!({
+            "id": 7, "method": "item/permissions/requestApproval", "params": { "cwd": "/w" }
+        });
+        let b = serde_json::json!({
+            "id": 7, "method": "item/commandExecution/requestApproval", "params": { "cwd": "/w" }
+        });
+        let va = p.project(&[a], &caps).remove(0);
+        let vb = p.project(&[b], &caps).remove(0);
+        assert_ne!(
+            va.context_token, vb.context_token,
+            "指纹含 method：同 params 不同 method 换 token"
+        );
     }
 }
