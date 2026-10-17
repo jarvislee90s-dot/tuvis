@@ -134,15 +134,24 @@ pub async fn connect(endpoint: &DesktopEndpoint) -> Result<Box<dyn super::IpcIo>
     use tokio::net::windows::named_pipe::ClientOptions;
     let path = endpoint.path.clone();
     let open = async move {
-        // 命名管道实例忙时轮询重试（ERROR_PIPE_BUSY = 2231 / 0x8B7）
-        for _ in 0..50 {
-            match ClientOptions::new().open(&path) {
-                Ok(client) => return Ok(client),
-                Err(e) if e.raw_os_error() == Some(2231) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // 命名管道实例忙时轮询重试（ERROR_PIPE_BUSY = Win32 SDK 常量 231，
+        // windows-rs `Win32::Foundation::ERROR_PIPE_BUSY`；禁手写数字防漂移）
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::ERROR_PIPE_BUSY;
+            for _ in 0..50 {
+                match ClientOptions::new().open(&path) {
+                    Ok(client) => return Ok(client),
+                    Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = &path;
         }
         Err(std::io::Error::other("pipe busy retry budget exhausted"))
     };
@@ -173,7 +182,7 @@ mod tests {
     // 真实假服务端 named pipe 往返测试只在 Windows 原生运行（CI windows job）；
     // macOS/Linux 上该测试不存在也不谎报执行。
     #[cfg(windows)]
-    use super::{EndpointResolver, WindowsEndpointResolver, PIPE_NAME};
+    use super::{DesktopEndpoint, EndpointResolver, WindowsEndpointResolver, PIPE_NAME};
 
     #[cfg(windows)]
     #[tokio::test]
@@ -181,12 +190,21 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::windows::named_pipe::ServerOptions;
 
+        // 随机专属 pipe 名：绝不占用生产 `\\.\pipe\codex-ipc`（Desktop 在场时也安全）
+        let test_pipe = format!(
+            "\\\\.\\pipe\\codex-ipc-test-{}",
+            crate::services::codex_desktop_ipc::types::new_uuid()
+        );
         let server = ServerOptions::new()
             .first_pipe_instance(true)
-            .create(PIPE_NAME)?;
-        let resolver = WindowsEndpointResolver;
-        let ep = resolver.resolve()?;
-        assert_eq!(ep.path, PIPE_NAME);
+            .create(&test_pipe)?;
+        // endpoint 注入测试 pipe 名（不经生产 resolver——resolver 只解析真实 endpoint）
+        let ep = DesktopEndpoint {
+            platform: "windows".into(),
+            path: test_pipe.clone(),
+            build: None,
+        };
+        let _ = PIPE_NAME; // 生产常量仅编译面引用
 
         let sv = tokio::spawn(async move {
             server.connect().await?;
