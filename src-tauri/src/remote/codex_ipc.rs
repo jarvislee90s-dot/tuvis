@@ -612,6 +612,11 @@ impl DesktopDispatch for AdapterDispatch {
         // R2.3 忙判定：从镜像投影读（快照加性接口 busy_snapshot）；锁不可得按「忙」保守
         self.adapter.busy_snapshot(key)
     }
+    /// 2026-10-17 复审 C1：绑定 Turn 的终态证据——绑定 turnId 的实体在当前镜像中
+    /// 以终态在场才放行顺序限制释放（另一个 Turn 完成/泛 idle 不是证据）。
+    fn turn_evidence_terminal(&self, key: &ThreadKey, turn_id: &str) -> bool {
+        self.adapter.turn_evidence_terminal(key, turn_id)
+    }
     fn busy_fresh(&self, key: &ThreadKey) -> crate::services::codex_control::BoxBusyFut {
         let this = self.clone();
         let key = key.clone();

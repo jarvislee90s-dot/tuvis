@@ -453,6 +453,34 @@ pub(crate) fn finish_conn(
     Ok(())
 }
 
+/// 落账回执**与** Turn 顺序屏障同一 UPDATE 原子持久化（2026-10-17 复审 C1.3）：
+/// A 路独立派发任务的唯一落账点——Accepted 绑 turn 身份（None = 保守屏障），
+/// UnknownDelivery 存未知关联的保守屏障。单语句原子性确保「已接受/未知但无屏障」
+/// 窗口不存在（等待者取消/进程退出均不再丢屏障）。仅 reserved 可落账。
+pub(crate) fn finish_with_turn_barrier_conn(
+    conn: &Connection,
+    receipt: &ActionReceipt,
+    turn_id: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    let Some(row) = get_row(conn, &receipt.action_id)? else {
+        return Err(rusqlite::Error::InvalidQuery);
+    };
+    if row.state != ActionState::Reserved {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let receipt_json = serde_json::to_string(receipt)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let state = state_to_str(delivery_to_state(receipt.delivery));
+    conn.execute(
+        "UPDATE codex_actions SET state = ?2, receipt_json = ?3, updated_at = ?4, \
+             compat_outstanding = 1, compat_message_id = NULL, compat_turn_id = ?5 \
+         WHERE action_id = ?1 AND state = 'reserved'",
+        params![receipt.action_id, state, receipt_json, now_ms, turn_id],
+    )?;
+    Ok(())
+}
+
 /// 撤回：CAS queued→cancelled（仅属主设备），保留 actionId 墓碑、清正文并审计。
 /// reserved/accepted/unknown 不可撤（返回 false）。
 pub(crate) fn retract_conn(
@@ -605,16 +633,16 @@ pub(crate) fn thread_has_pending_work_conn(
     Ok(n > 0)
 }
 
-/// R6.3 Turn 顺序绑定行（重启后路由器内存重建的输入）：A 路（desktop_ipc）已接受、
-/// 屏障在册且**绑定了 turn 身份**的动作——`compat_outstanding=1 ∧ route='desktop_ipc'
-/// ∧ state='accepted' ∧ compat_turn_id IS NOT NULL`。`compat_turn_id` 复用为本次 Turn
-/// 身份的持久槽位（计划允许复用该列）；缺 turn 身份的残留屏障不算绑定（队列由屏障
-/// 检查保守闸住，缺 turnId 不视为可完成）。
+/// R6.3 + 2026-10-17 复审 C1：Turn 顺序绑定行（重启后路由器内存重建的输入）：A 路
+///（desktop_ipc）已落终态且**保守屏障在册**的动作——`compat_outstanding = 1 ∧
+/// route='desktop_ipc' ∧ state IN ('accepted','unknown')`。`compat_turn_id` 复用为
+/// 本次 Turn 身份的持久槽位（计划允许复用该列）；None = 保守屏障（unknown/缺
+/// turnId——重启后同样保留限制，保守不释放）。
 pub(crate) fn turn_binding_rows_conn(conn: &Connection) -> rusqlite::Result<Vec<ActionRow>> {
     let sql = format!(
         "SELECT {COLS} FROM codex_actions \
-         WHERE compat_outstanding = 1 AND route = 'desktop_ipc' AND state = 'accepted' \
-           AND compat_turn_id IS NOT NULL \
+         WHERE compat_outstanding = 1 AND route = 'desktop_ipc' \
+           AND state IN ('accepted', 'unknown') \
          ORDER BY seq ASC"
     );
     let mut stmt = conn.prepare(&sql)?;

@@ -82,6 +82,13 @@ pub trait DesktopDispatch: Send + Sync {
         context_token: &str,
         action: &PendingAction,
     ) -> BoxDispatchFut;
+    /// 2026-10-17 复审 C1：绑定 Turn 的终态证据——该 turnId 的实体在**当前镜像**中
+    /// 以终态（completed/failed）出现才 true。缺省实现恒 false（保守不释放）：泛
+    /// idle/另一个 Turn 完成都不是本 Turn 的完成证据。
+    fn turn_evidence_terminal(&self, key: &ThreadKey, turn_id: &str) -> bool {
+        let _ = (key, turn_id);
+        false
+    }
 }
 
 /// 路由结果：完成（含明确零投递/未知投递回执）、排队（FIFO 位置）或获得兼容兜底
@@ -338,8 +345,9 @@ impl CodexControlRouter {
     /// mark_active/bind_turn/clear_active 可能随 future 丢弃，内存限制停在
     /// turn_id=None 而账本已终态 → 本线程队列进程内永久卡死。对账规则（重启
     /// 等价语义）：accepted 且未绑 turnId → 从账本回执补绑（无 turnId 保守保留）；
-    /// rejected/cancelled → 解除；unknown 且无 turnId → 解除（不跨进程存活的
-    /// 保守限制；unknown 有 turnId → 保留按终态释放）。
+    /// rejected/cancelled → 解除；**unknown 一律保留**（2026-10-17 复审 C1.2：
+    /// Unknown 不是完成，对账不是解除屏障的定时器条件——屏障已在派发任务内
+    /// 原子持久化，重启后仍受限，解除只可能来自对应 Turn 的明确终态证据）。
     pub fn converge_with_ledger(&self) {
         let snapshot: Vec<(ThreadKey, String, Option<String>)> = {
             let turns = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
@@ -372,9 +380,11 @@ impl CodexControlRouter {
                 S::Rejected | S::Cancelled => {
                     self.clear_active(&key);
                 }
-                S::Unknown if memory_turn.is_none() => {
-                    self.clear_active(&key);
-                }
+                // 2026-10-17 复审 C1.2：Unknown **不是完成**——Original Turn 可能已收到
+                //（只是 ack/落账丢失），周期对账不得因「到点了」解除顺序限制。Unknown
+                // 的保守屏障已在派发任务内原子持久化（重启仍受限），此处内存限制同步
+                // 保留；解除只可能来自对应 Turn 的明确终态证据（无 turnId 即永不自动）。
+                S::Unknown => {}
                 _ => {}
             }
         }
@@ -382,8 +392,11 @@ impl CodexControlRouter {
 
     /// R6.3：把接受回执的 Turn 身份绑定到在飞限制，并持久化（复用 codex_actions 的
     /// compat 屏障槽位：`compat_outstanding=1 + compat_turn_id`——重启后由
-    /// `Router::new` 重建，队列视图以 blockedReason 如实说明）。缺 turnId 只保留内存
-    /// 限制（保守不释放、不虚称可核对）。
+    /// [`Self::new`] 重建，队列视图以 blockedReason 如实说明）。
+    /// 2026-10-17 复审 C1.3：主持久化点已移入派发独立任务（落账与屏障同一 UPDATE
+    /// 原子写）；本函数的持久化保留为幂等补写（收敛路径从账本回执补绑时兜底旧数据
+    /// 形态）。缺 turnId 只保留内存限制（保守不释放、不虚称可核对——但 Unknown/
+    /// 无 turnId 的保守屏障已随落账持久化，重启仍受限）。
     fn bind_turn(&self, key: &ThreadKey, receipt: &ActionReceipt, baseline: Option<u64>) {
         {
             let mut turns = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
@@ -418,11 +431,14 @@ impl CodexControlRouter {
         }
     }
 
-    /// R6.3：投影驱动的 Turn 终态释放。完成证据（全部满足才 clear）：
+    /// R6.3 + 2026-10-17 复审 C1：投影驱动的 Turn 终态释放。完成证据（全部满足才
+    /// clear）：
     /// ① 投影新鲜（非 stale——断线/owner 换代的 stale 投影不释放，限制保留）；
     /// ② 绑定了 turnId（缺 turnId 保守不释放）；
-    /// ③ runtime 归 idle/failed（Turn 终态）；
-    /// ④ revision 严格大于接受回执时的基线（Accepted 前后的旧 idle 更新不放行；
+    /// ③ **目标 Turn 终态证据**（C1.1：绑定 turnId 的实体在当前镜像中以
+    ///    completed/failed 在场——另一个 Turn 完成/泛 idle 都不是本 Turn 的证据）；
+    /// ④ runtime 归 idle/failed（Turn 终态）；
+    /// ⑤ revision 严格大于接受回执时的基线（Accepted 前后的旧 idle 更新不放行；
     ///    重启重建 baseline=None → 首个新鲜投影即当前真值）。
     /// 返回是否发生了释放（调用方据此接力 flush）。
     pub fn release_turn_if_complete(&self, key: &ThreadKey, p: &ThreadProjection) -> bool {
@@ -438,7 +454,12 @@ impl CodexControlRouter {
         if p.stale {
             return false;
         }
-        if t.turn_id.is_none() {
+        let Some(turn_id) = t.turn_id.as_deref() else {
+            return false;
+        };
+        // C1.1：目标 Turn 的终态证据（镜像中该 turnId 实体以终态在场）——先于
+        // revision/runtime 判定，缺失即保守保留
+        if !self.dispatch.turn_evidence_terminal(key, turn_id) {
             return false;
         }
         let Some(rev) = p.revision else {
@@ -770,8 +791,18 @@ impl CodexControlRouter {
                 reason_code: outcome.reason_code,
             };
             // NotSent = writer 未尝试写（保守零投递）：留给 router 走交接判定，不落账
+            // 2026-10-17 复审 C1.3：Accepted/Unknown 的落账与 Turn 顺序屏障（有 turnId
+            // 绑身份；无 turnId/未知投递存保守屏障）在**同一 UPDATE 内原子持久化**——
+            // 本独立任务是唯一落账点，等待者取消/进程退出不再产生「已接受但无屏障」窗口
             let persisted = if receipt.delivery == Delivery::NotSent {
                 true
+            } else if matches!(
+                receipt.delivery,
+                Delivery::Accepted | Delivery::UnknownDelivery
+            ) {
+                store
+                    .finish_with_turn_barrier(&receipt, receipt.turn_id.as_deref())
+                    .is_ok()
             } else {
                 store.finish(&receipt).is_ok()
             };
@@ -831,13 +862,14 @@ impl CodexControlRouter {
                     )));
                 }
                 match receipt.delivery {
-                    // R6.3：Accepted 绑定并持久化本 Turn 身份（缺 turnId 保守不释放）
+                    // R6.3：Accepted 绑定并持久化本 Turn 身份（缺 turnId 保守不释放；
+                    // 屏障已随落账在任务内原子持久）
                     Delivery::Accepted => {
                         self.bind_turn(&head.ctx.key, &receipt, revision);
                     }
-                    // Rejected = 明确拒绝（无 Turn 产生）；Unknown = 结果未知——
-                    // 限制按保守语义处理：Rejected 解除；Unknown 保留（无 turnId
-                    // 证据，不自动放行第二条，避免双跑 Turn）
+                    // Rejected = 明确拒绝（无 Turn 产生）→ 解除；Unknown = 结果未知——
+                    // 2026-10-17 复审 C1.2：**不是完成**，保守屏障已在任务内随落账原子
+                    // 持久（重启仍受限），内存限制保留；不因对账/超时自动解除
                     Delivery::Rejected => self.clear_active(&head.ctx.key),
                     Delivery::UnknownDelivery => {}
                     Delivery::NotSent => unreachable!("NotSent 已在上方处理"),

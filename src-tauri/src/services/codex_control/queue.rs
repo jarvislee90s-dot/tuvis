@@ -241,6 +241,19 @@ impl ActionStore {
         self.with(|c| dao::finish_conn(c, receipt, now_ms()).map_err(db_err))
     }
 
+    /// 落账回执**与** Turn 顺序屏障同一 UPDATE 原子持久化（2026-10-17 复审 C1.3）：
+    /// A 路独立派发任务对 Accepted/UnknownDelivery 的唯一落账点——`turn_id` 有值绑
+    /// Turn 身份，None 存保守屏障（unknown/缺 turnId），重启后限制同样保留。
+    pub fn finish_with_turn_barrier(
+        &self,
+        receipt: &ActionReceipt,
+        turn_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.with(|c| {
+            dao::finish_with_turn_barrier_conn(c, receipt, turn_id, now_ms()).map_err(db_err)
+        })
+    }
+
     /// 本设备的动作视图（其他设备 / 不存在 → None；HTTP 层 404 语义）。
     pub fn get_for_device(
         &self,

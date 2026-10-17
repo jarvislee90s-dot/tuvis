@@ -378,6 +378,19 @@ impl DesktopIpcAdapter {
         }
     }
 
+    /// 2026-10-17 复审 C1：绑定 Turn 的终态证据——该 turnId 的实体在当前镜像中以
+    /// 终态（completed/failed）出现才 true。无镜像/镜像 stale/锁被占（镜像正在写）
+    /// → false（保守不释放：屏障宁可多留一拍，绝不因证据缺失放行第二条）。
+    pub fn turn_evidence_terminal(&self, key: &ThreadKey, turn_id: &str) -> bool {
+        match self.inner.mirrors.try_lock() {
+            Ok(mirrors) => mirrors
+                .get(key)
+                .map(|m| m.turn_is_terminal(turn_id))
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// 退出跟随（详情卸载；释放名额，镜像保留为 stale 只读）。
     pub async fn unfollow(&self, key: &ThreadKey) {
         self.inner.followings.lock().await.unfollow(key);

@@ -59,12 +59,15 @@ struct SendRecord {
 }
 
 /// 假派发器：记录 A 路派发输入（组合后的文本），返回预设 Rpc 结果。
+/// `terminal_turns` = 2026-10-17 复审 C1 的 Turn 终态证据面（镜像中哪些 turnId 已以
+/// 终态在场）——release 判定必须先经此证据，缺省空集 = 无证据（保守不释放）。
 struct FakeDispatch {
     busy: AtomicBool,
     send_outcome: Mutex<DispatchOutcome>,
     respond_outcome: Mutex<DispatchOutcome>,
     sends: Mutex<Vec<SendRecord>>,
     responds: Mutex<Vec<(ThreadKey, String, String)>>,
+    terminal_turns: Mutex<std::collections::HashSet<String>>,
 }
 
 impl FakeDispatch {
@@ -75,6 +78,7 @@ impl FakeDispatch {
             respond_outcome: Mutex::new(outcome),
             sends: Mutex::new(Vec::new()),
             responds: Mutex::new(Vec::new()),
+            terminal_turns: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -113,6 +117,19 @@ impl FakeDispatch {
         self.busy.store(b, Ordering::SeqCst);
     }
 
+    /// C1：登记一个已以终态在场的 turnId（镜像侧完成证据）
+    fn set_terminal_turn(&self, turn_id: &str) {
+        self.terminal_turns
+            .lock()
+            .unwrap()
+            .insert(turn_id.to_string());
+    }
+
+    /// C1：撤销终态证据（turn 回到 inProgress / 不在场）
+    fn unset_terminal_turn(&self, turn_id: &str) {
+        self.terminal_turns.lock().unwrap().remove(turn_id);
+    }
+
     fn send_count(&self) -> usize {
         self.sends.lock().unwrap().len()
     }
@@ -134,6 +151,11 @@ impl FakeDispatch {
 impl DesktopDispatch for FakeDispatch {
     fn thread_busy(&self, _key: &ThreadKey) -> bool {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    /// C1：绑定 turnId 的终态证据（测试显式登记；未登记 = 无证据 = 不释放）
+    fn turn_evidence_terminal(&self, _key: &ThreadKey, turn_id: &str) -> bool {
+        self.terminal_turns.lock().unwrap().contains(turn_id)
     }
 
     fn send_text(
@@ -503,12 +525,14 @@ async fn busy_fifo_allows_pending_response() {
         "Turn 顺序限制未释放前不接力"
     );
 
-    // turn a 终态（fresh idle 投影事件）→ 释放顺序限制 → flush 接力发 b
-    //（R6.3：释放由完成证据驱动，不再靠手工 flush 清位）
+    // turn a 终态（fresh idle 投影事件 + 绑定 turn 终态证据）→ 释放顺序限制 → flush
+    // 接力发 b（R6.3：释放由完成证据驱动，不再靠手工 flush 清位；C1：证据 = 绑定
+    // turnId 本身以终态在场）
+    h.dispatch.set_terminal_turn("turn-1");
     assert!(
         h.router
             .release_turn_if_complete(&h.key, &minimal_projection(THREAD, "idle")),
-        "fresh idle 投影应释放顺序限制"
+        "fresh idle 投影 + 绑定 turn 终态证据应释放顺序限制"
     );
     let out_b = h.router.flush_thread(&h.key).await.expect("b dispatchable");
     assert_eq!(completed(out_b).delivery, Delivery::Accepted);
@@ -1324,9 +1348,10 @@ async fn interaction_row_left_queued_never_becomes_send_head() {
 // Turn 终态。
 // ============================================================
 
-/// 回执 turnId + 基线 revision 绑定后：旧 idle（revision ≤ 基线）、active、stale
-/// 一律不释放；严格更新的 fresh idle 才释放并解锁接力；绑定期间队列视图如实
-/// 显示屏障在册。
+/// 回执 turnId + 基线 revision 绑定后：旧 idle（revision ≤ 基线）、active、stale、
+/// **绑定 turn 缺终态证据（另一 turn 完成/本 turn inProgress/不在场）**一律不释放；
+/// 「投影新鲜 + 目标 turn 终态在场 + revision 严格更新」齐备才释放并解锁接力；
+/// 绑定期间队列视图如实显示屏障在册。（2026-10-17 复审 C1：泛 idle 不再是证据）
 #[tokio::test]
 async fn turn_restriction_needs_matching_completion_evidence() {
     let h = harness_with(FakeDispatch::accepted_turn("turn-9", Some(7)));
@@ -1348,6 +1373,7 @@ async fn turn_restriction_needs_matching_completion_evidence() {
     );
 
     // 旧 idle（revision == 基线）：不释放
+    h.dispatch.set_terminal_turn("turn-9");
     assert!(
         !h.router
             .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 7)),
@@ -1368,11 +1394,28 @@ async fn turn_restriction_needs_matching_completion_evidence() {
     );
     assert!(h.router.flush_thread(&h.key).await.is_none());
 
-    // 严格更新的 fresh idle：释放 + 清持久屏障 + 接力发下一条
+    // C1.1 反证面：泛 idle（即使 revision 更新）但**绑定 turn 未以终态在场**——
+    // 另一个 turn 已完成 / 本 turn inProgress / 实体不在场，均不释放
+    h.dispatch.unset_terminal_turn("turn-9");
+    assert!(
+        !h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9)),
+        "另一个 Turn 完成 + 泛 idle 不释放（C1：目标身份与终态证据不能省略）"
+    );
+    h.dispatch.set_terminal_turn("turn-other");
+    assert!(
+        !h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9)),
+        "别的 turnId 有证据也救不了本绑定（按绑定 turnId 精确核对）"
+    );
+
+    // 绑定 turn 自身以终态在场 + fresh idle + revision 严格更新：释放 + 清持久屏障
+    // + 接力发下一条
+    h.dispatch.set_terminal_turn("turn-9");
     assert!(
         h.router
             .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9)),
-        "idle 且 revision 严格大于基线 → 释放"
+        "idle 且 revision 严格大于基线 + 目标 turn 终态证据 → 释放"
     );
     assert!(
         !h.store.has_compat_fence(&h.key).expect("query"),
@@ -1412,11 +1455,18 @@ async fn turn_restriction_survives_restart_until_completion() {
         h.router.flush_thread(&h.key).await.is_none(),
         "重启后仍等待原 Turn 终态（绑定从账本重建）"
     );
-    // 完成证据到达：释放并按序接力
+    // 泛 idle 不再是证据（C1）：绑定 turn-p 未以终态在场不释放
+    assert!(
+        !h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 100)),
+        "重启重建 baseline=None：仍需目标 turn 终态证据，泛 idle 不释放"
+    );
+    // 完成证据到达（绑定 turn-p 以终态在场）：释放并按序接力
+    h.dispatch.set_terminal_turn("turn-p");
     assert!(
         h.router
             .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 100)),
-        "重启重建 baseline=None：首个新鲜 idle 即当前真值"
+        "重启重建 baseline=None：首个新鲜 idle + 目标 turn 终态证据即当前真值"
     );
     let out = h
         .router
@@ -1464,6 +1514,124 @@ async fn receipt_without_turn_id_keeps_restriction() {
     assert!(
         h.router.flush_thread(&h.key).await.is_none(),
         "缺 turnId 保持留队"
+    );
+}
+
+/// 2026-10-17 复审 C1.2：Unknown 不是完成——多轮周期对账（converge_with_ledger）
+/// 不得解除顺序限制，同 thread 后续消息只排队、零新增派发；任何投影（含严格更新
+/// 的 fresh idle）都不释放。Original Turn 可能已收到（ack/落账丢失），「到点了」
+/// 不是解除屏障的定时器条件。
+#[tokio::test]
+async fn unknown_delivery_never_unlocks_turn_restriction() {
+    let h = harness_with(FakeDispatch::new(DispatchOutcome {
+        delivery: Delivery::UnknownDelivery,
+        envelope_id: Some("env-uk".into()),
+        turn_id: None,
+        reason_code: None,
+        revision: None,
+    }));
+    let r = completed(
+        h.router
+            .send(h.ctx("unk-a", ActionKind::Send), "未知投递".into(), false)
+            .await,
+    );
+    assert_eq!(r.delivery, Delivery::UnknownDelivery);
+    assert_eq!(h.state_of("unk-a"), ActionState::Unknown);
+    assert!(
+        h.store.has_compat_fence(&h.key).expect("query"),
+        "Unknown 的保守屏障随落账在册"
+    );
+
+    // 多轮对账 + 严格更新的 fresh idle 投影：一律不解锁、不派发
+    for round in 0..3 {
+        h.router.converge_with_ledger();
+        assert!(
+            h.router.flush_thread(&h.key).await.is_none(),
+            "第 {round} 轮对账不得解除 Unknown 的顺序限制"
+        );
+        assert!(
+            !h.router
+                .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 999)),
+            "Unknown 无目标 Turn 身份，任何投影都不构成完成证据"
+        );
+    }
+    // 后续消息只排队（顺序限制在册）
+    let q = h
+        .router
+        .send(h.ctx("unk-b", ActionKind::Send), "后续消息".into(), false)
+        .await;
+    assert!(
+        matches!(q, RouterOutcome::Queued { .. }),
+        "Unknown 后续消息留队"
+    );
+    assert_eq!(h.dispatch.send_count(), 1, "零新增派发（不重发不越队）");
+}
+
+/// 2026-10-17 复审 C1.3：Accepted（缺 turnId）与 UnknownDelivery 的落账与 Turn
+/// 顺序屏障在派发独立任务内**同一 UPDATE** 原子持久化——等待者取消/进程退出不再
+/// 产生「已接受但无屏障」窗口；重启重建后保守屏障仍在册，flush 闸住、任何投影
+/// 都不释放。
+#[tokio::test]
+async fn accepted_and_unknown_persist_turn_barrier_atomically() {
+    let mut h = harness_with(FakeDispatch::new(DispatchOutcome {
+        delivery: Delivery::Accepted,
+        envelope_id: Some("env-nt".into()),
+        turn_id: None,
+        reason_code: None,
+        revision: Some(7),
+    }));
+    // ① Accepted 缺 turnId：屏障随落账持久化（TDD 红：旧实现只留内存限制）
+    let _ = completed(
+        h.router
+            .send(h.ctx("bar-a", ActionKind::Send), "缺ID已发".into(), false)
+            .await,
+    );
+    assert_eq!(h.state_of("bar-a"), ActionState::Accepted);
+    assert!(
+        h.store.has_compat_fence(&h.key).expect("query"),
+        "Accepted 缺 turnId 也存保守屏障"
+    );
+
+    // ② UnknownDelivery（另一 thread，避免①的内存限制拦住派发）：保守屏障同样持久
+    let key2 = ThreadKey {
+        host_id: "local".into(),
+        thread_id: format!("{THREAD}2"),
+    };
+    let ctx2 = ActionContext {
+        action_id: "bar-u".into(),
+        device_id: "dev-1".into(),
+        device_name: "iPhone".into(),
+        kind: ActionKind::Send,
+        key: key2.clone(),
+    };
+    h.restart_with(FakeDispatch::new(DispatchOutcome {
+        delivery: Delivery::UnknownDelivery,
+        envelope_id: Some("env-u2".into()),
+        turn_id: None,
+        reason_code: None,
+        revision: None,
+    }));
+    let r2 = completed(h.router.send(ctx2, "未知投递".into(), false).await);
+    assert_eq!(r2.delivery, Delivery::UnknownDelivery);
+    assert!(
+        h.store.has_compat_fence(&key2).expect("query"),
+        "Unknown 存保守屏障"
+    );
+
+    // —— 重启：两道保守屏障都从账本重建，flush 闸住、任何投影都不释放 ——
+    h.restart();
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "重启后 Accepted-缺ID 的保守屏障仍闸住队列"
+    );
+    assert!(
+        !h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 999)),
+        "无 turnId 的保守屏障不因任何投影释放（缺身份不算完成）"
+    );
+    assert!(
+        h.router.flush_thread(&key2).await.is_none(),
+        "重启后 Unknown 的保守屏障仍闸住队列"
     );
 }
 

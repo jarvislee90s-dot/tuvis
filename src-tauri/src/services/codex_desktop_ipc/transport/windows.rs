@@ -180,9 +180,9 @@ pub async fn connect(endpoint: &DesktopEndpoint) -> Result<Box<dyn super::IpcIo>
 mod tests {
     // 真实假服务端 named pipe 往返测试只在 Windows 原生运行（CI windows job）；
     // macOS/Linux 上该测试不存在也不谎报执行。
-    use super::*;
     #[cfg(windows)]
     use super::DesktopEndpoint;
+    use super::*;
 
     /// F1 回归（2026-10-17 Windows 验证批）：包清单 `Identity/@Version` 解析。
     /// 形状取自实机 `AppxManifest.xml`（该机器包版本 `26.1013.4894.0`）。
@@ -196,7 +196,8 @@ mod tests {
         assert_eq!(identity_version(text).as_deref(), Some("26.1013.4894.0"));
         // 属性顺序不同、标签自闭合形态都要取到（不假设 Version 紧跟 Identity 名）
         assert_eq!(
-            identity_version(r#"<Identity Publisher="CN=x" Version="26.1013.3656.0" />"#).as_deref(),
+            identity_version(r#"<Identity Publisher="CN=x" Version="26.1013.3656.0" />"#)
+                .as_deref(),
             Some("26.1013.3656.0")
         );
     }

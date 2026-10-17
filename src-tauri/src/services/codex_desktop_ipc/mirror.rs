@@ -95,6 +95,35 @@ impl ThreadMirror {
         self.pending.token_valid(request_key, context_token)
     }
 
+    /// 指定 Turn 实体的状态（2026-10-17 复审 C1：Turn 顺序屏障的目标终态证据来源）。
+    /// 只认 `type=turn` 的实体；实体不在场 / 无镜像 → None（调用方按「无证据」保守）。
+    pub fn turn_status(&self, turn_id: &str) -> Option<String> {
+        let entity = self
+            .state
+            .as_ref()?
+            .get("turnHistory")?
+            .get("history")?
+            .get("entitiesByKey")?
+            .get(turn_id)?;
+        if entity.get("type").and_then(|t| t.as_str()) != Some("turn") {
+            return None;
+        }
+        entity
+            .get("status")
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+    }
+
+    /// 指定 Turn 是否已以终态出现在当前镜像（completed/failed）。
+    /// 不在场 / inProgress / 未知状态 / stale / 无镜像 → false（保守不释放）。
+    pub fn turn_is_terminal(&self, turn_id: &str) -> bool {
+        !self.stale
+            && matches!(
+                self.turn_status(turn_id).as_deref(),
+                Some("completed") | Some("failed")
+            )
+    }
+
     /// 标记过期（连接断开/缺口/预算超限）。保留最后视图但禁写（adapter 侧门）。
     pub fn mark_stale(&mut self) {
         self.stale = true;
@@ -818,6 +847,60 @@ mod tests {
         let err = m.apply(&lease(), &change).unwrap_err();
         assert!(matches!(err, ProtocolError::Capacity(_)));
         assert!(m.is_stale());
+    }
+
+    #[test]
+    fn turn_terminal_evidence_requires_the_bound_turn_itself() {
+        // 2026-10-17 复审 C1：终态证据按 **turnId 精确查询**——本 turn inProgress、
+        // 实体不在场、镜像 stale 一律不是证据；跨 turn「完成不互为证据」的负例在
+        // router 层钉死（release 只查绑定 id，见 codex_control_remote 的
+        // turn_restriction_needs_matching_completion_evidence）。
+        let mut m = ThreadMirror::new(key());
+        let change = serde_json::json!({
+            "type": "snapshot", "revision": 1,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "threadRuntimeStatus": { "type": "idle" },
+                "turnHistory": { "isComplete": true, "history": {
+                    "entitiesByKey": {
+                        "turn-mine": { "id": "turn-mine", "type": "turn",
+                                       "status": "inProgress", "items": [] },
+                        "turn-other": { "id": "turn-other", "type": "turn",
+                                        "status": "completed", "items": [] }
+                    },
+                    "islands": [{ "entries": ["turn-mine", "turn-other"] }]
+                } }
+            }
+        });
+        m.apply(&lease(), &change).unwrap();
+        assert!(
+            !m.turn_is_terminal("turn-mine"),
+            "本 turn inProgress 不是证据"
+        );
+        assert!(
+            m.turn_is_terminal("turn-other"),
+            "turn-other 自身已终态（对它自己的绑定就是证据——精确按 id，不模糊）"
+        );
+        assert!(!m.turn_is_terminal("turn-absent"), "实体不在场不是证据");
+        // 本 turn 转 completed → 证据成立
+        let done = serde_json::json!({
+            "type": "patches", "baseRevision": 1, "revision": 2,
+            "patches": [
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn-mine", "status"],
+                  "value": "completed" }
+            ]
+        });
+        m.apply(&lease(), &done).unwrap();
+        assert!(
+            m.turn_is_terminal("turn-mine"),
+            "绑定 turn 以终态在场 = 证据"
+        );
+        // failed 也是终态
+        assert_eq!(m.turn_status("turn-mine").as_deref(), Some("completed"));
+        // stale 镜像一律无证据
+        m.mark_stale();
+        assert!(!m.turn_is_terminal("turn-mine"), "stale 镜像不出证据");
     }
 
     #[test]

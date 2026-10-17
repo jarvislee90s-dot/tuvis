@@ -2652,10 +2652,11 @@ async fn production_chain_send_busy_queue_then_idle_relay() {
                     "threadRuntimeStatus": { "type": "idle" },
                     "turnHistory": { "isComplete": true, "history": {
                         "entitiesByKey": {
+                            "turn-chain-1": { "id": "turn-chain-1", "type": "turn", "status": "completed", "items": ["u9"] },
                             "t9": { "id": "t9", "type": "turn", "status": "completed", "items": ["u9"] },
                             "u9": { "id": "u9", "type": "user_message", "text": "全链第一条 [mobile iPhone]", "ts": 9 }
                         },
-                        "islands": [{ "entries": ["t9"] }]
+                        "islands": [{ "entries": ["turn-chain-1", "t9"] }]
                     }}
                 }
             }
@@ -2707,10 +2708,12 @@ async fn production_chain_send_busy_queue_then_idle_relay() {
     f.state.codex_control.stop();
 }
 
-/// R9 复审 P2-2 回归：HTTP 等待者被取消后，Turn 簿记与账本收敛——同 thread
-/// 第二条消息必须仍能派发（不得因 turn_id=None 的孤儿限制在进程内永久卡死）。
+/// 2026-10-17 复审 C1：等待者被取消后的收敛仍以「**绑定 Turn** 的终态证据」为准。
+/// Accepted(turn-cvrg-1) 后：泛 idle（另一 turn t6 完成、绑定 turn 不在场）经多轮
+/// 对账也**不得**接力第二条（修正旧预期「另一 turn 完成 + 泛 idle 即成功」的 PASS）；
+/// 绑定 turn 以终态在场（snapshot rev 7）才恢复接力。
 #[tokio::test]
-async fn aborted_waiter_convergence_unblocks_queue() {
+async fn aborted_waiter_convergence_requires_bound_turn_terminal_evidence() {
     let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
     let mut peer = f.peer.take().unwrap();
     let app = f.app.clone();
@@ -2736,7 +2739,7 @@ async fn aborted_waiter_convergence_unblocks_queue() {
     assert_eq!(frame["method"], "thread-follower-start-turn");
     task1.abort();
 
-    // ② Desktop 正常应答：独立派发任务落账 accepted（含 turnId）
+    // ② Desktop 正常应答：独立派发任务原子落账 accepted + Turn 屏障（含 turnId）
     peer.send(&serde_json::json!({
         "type": "response", "requestId": frame["requestId"],
         "resultType": "success", "method": "thread-follower-start-turn",
@@ -2760,15 +2763,25 @@ async fn aborted_waiter_convergence_unblocks_queue() {
     .await
     .expect("dispatch task settles");
     assert_eq!(view.state, ActionState::Accepted);
+    assert_eq!(
+        view.receipt.as_ref().unwrap().turn_id.as_deref(),
+        Some("turn-cvrg-1")
+    );
+    assert!(
+        f.hub_store().has_compat_fence(&f.thread_key()).unwrap(),
+        "accepted 屏障已随落账原子持久（C1.3）"
+    );
 
-    // ③ idle snapshot（revision 前进）→ 对账收敛（账本补绑 turnId → 限制释放）
+    // ③ 泛 idle snapshot（rev 8 > ensure 基线 7）：只有**另一 turn t6** 完成、绑定
+    //    turn-cvrg-1 不在场 → 多轮对账（≥3 tick）也不得接力第二条（C1.1：目标身份
+    //    与终态证据不能省略）
     peer.send(&serde_json::json!({
         "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
         "sourceClientId": "owner-1",
         "params": {
             "conversationId": THREAD, "hostId": "local",
             "change": {
-                "type": "snapshot", "revision": 6,
+                "type": "snapshot", "revision": 8,
                 "conversationState": {
                     "turns": [], "requests": [],
                     "threadRuntimeStatus": { "type": "idle" },
@@ -2784,10 +2797,38 @@ async fn aborted_waiter_convergence_unblocks_queue() {
         }
     }))
     .await;
+    // 负窗口覆盖 ≥5 个对账 tick（200ms 周期）：期间零 start-turn
+    let neg = tokio::time::timeout(Duration::from_millis(1200), peer.recv()).await;
+    assert!(
+        neg.is_err(),
+        "泛 idle + 另一 turn 完成：绑定 turn 无终态证据不得接力（旧预期在此错误 PASS）"
+    );
 
-    // ④ 第二条消息必须照常派发（队列不得永久卡死）：POST 可能忙态入队（收敛
-    // 前的窗口），但收敛 + idle 释放后 flush 接力必须把队首真正发出去——
-    // 证据 = 第二个 start-turn 帧到达（孤儿限制未释放时它永远不来）
+    // ④ 绑定 turn 终态证据到位（turn-cvrg-1 completed，rev 9 > 8，runtime idle）
+    //    → 收敛补绑 + 释放 → flush 接力第二条
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": {
+            "conversationId": THREAD, "hostId": "local",
+            "change": {
+                "type": "snapshot", "revision": 9,
+                "conversationState": {
+                    "turns": [], "requests": [],
+                    "threadRuntimeStatus": { "type": "idle" },
+                    "turnHistory": { "isComplete": true, "history": {
+                        "entitiesByKey": {
+                            "turn-cvrg-1": { "id": "turn-cvrg-1", "type": "turn", "status": "completed", "items": ["u6"] },
+                            "t6": { "id": "t6", "type": "turn", "status": "completed", "items": ["u6"] },
+                            "u6": { "id": "u6", "type": "user_message", "text": "被弃消息 [mobile iPhone]", "ts": 6 }
+                        },
+                        "islands": [{ "entries": ["turn-cvrg-1", "t6"] }]
+                    }}
+                }
+            }
+        }
+    }))
+    .await;
     let _ = f
         .app
         .clone()
@@ -2801,7 +2842,7 @@ async fn aborted_waiter_convergence_unblocks_queue() {
         .unwrap();
     let frame2 = tokio::time::timeout(Duration::from_secs(5), peer.recv())
         .await
-        .expect("收敛后队列必须流动（第二个 start-turn 帧）");
+        .expect("绑定 turn 终态证据到位后队列必须流动（第二个 start-turn 帧）");
     assert_eq!(frame2["method"], "thread-follower-start-turn");
     peer.send(&serde_json::json!({
         "type": "response", "requestId": frame2["requestId"],
