@@ -271,7 +271,7 @@ pub(crate) fn mark_stale_reserved_unknown_conn(
     let mut converged = Vec::new();
     for (seq, action_id, thread_id) in rows {
         let tx = conn.unchecked_transaction()?;
-        conn.execute(
+        tx.execute(
             "UPDATE codex_actions SET state='unknown', queued_text=NULL, updated_at=?2,
              receipt_json=?3 WHERE seq=?1 AND state='reserved'",
             rusqlite::params![
@@ -287,7 +287,7 @@ pub(crate) fn mark_stale_reserved_unknown_conn(
             ],
         )?;
         crate::database::dao::write_audit::record_conn_checked(
-            conn,
+            &tx,
             now_ms,
             "system",
             "system",
@@ -842,6 +842,100 @@ mod tests {
         assert_eq!(b.queued_text.as_deref(), Some("乙"), "queued 保留原文");
         // 二次恢复：无 reserved，0 条
         assert_eq!(recover_reserved_conn(&c, 3100).unwrap(), 0);
+    }
+
+    /// R9 复审 P3：清扫臂的四个过滤维度 + 龄界——只收敛「超龄的 reserved/desktop_ipc/
+    /// send/无屏障」行，绝不误伤在飞（新）、兼容路由、屏障在册、交互与非 send 行
+    #[test]
+    fn stale_reserved_sweep_filters_dimension_and_age() {
+        let c = mem();
+        let insert_of_kind = |id: &str, kind: &str, now: i64| -> ActionRow {
+            insert_action_conn(
+                &c,
+                id,
+                "dev-1",
+                "iPhone",
+                THREAD,
+                kind,
+                None,
+                None,
+                "hash",
+                Some("x"),
+                "cm-1",
+                now,
+            )
+            .unwrap()
+        };
+        // ① 超龄 reserved/desktop_ipc/send：被收敛为 unknown + 审计
+        //（时间线：cutoff = 61_000 - 60_000 = 1_000，updated_at ≤ 1_000 才收敛）
+        insert(&c, "old-send", Some("甲"), 100);
+        reserve_conn(&c, "old-send", ControlRoute::DesktopIpc, 200).unwrap();
+        // ② 新（龄界内）reserved：在飞派发，不误伤
+        insert(&c, "fresh-send", Some("乙"), 1000);
+        reserve_conn(&c, "fresh-send", ControlRoute::DesktopIpc, 60_500).unwrap();
+        // ③ 兼容路由 reserved：屏障语义，不归本清扫
+        insert(&c, "compat-route", Some("丙"), 100);
+        reserve_conn(&c, "compat-route", ControlRoute::HeadlessCompat, 200).unwrap();
+        // ④ 屏障在册（A Turn 绑定复用槽位）：不清扫
+        insert(&c, "barrier-row", Some("丁"), 100);
+        reserve_conn(&c, "barrier-row", ControlRoute::DesktopIpc, 200).unwrap();
+        set_compat_dispatch_barrier_conn(
+            &c,
+            "barrier-row",
+            None,
+            Some("turn-9"),
+            None,
+            None,
+            None,
+            300,
+        )
+        .unwrap();
+        // ⑤ 非 send 行（交互动作）：不在普通消息清扫范围
+        insert_of_kind("respond-row", "user_input", 100);
+        reserve_conn(&c, "respond-row", ControlRoute::DesktopIpc, 200).unwrap();
+        // ⑥ queued：任何情况不受影响
+        insert(&c, "queued-row", Some("戊"), 1000);
+
+        let swept = mark_stale_reserved_unknown_conn(&c, 60_000, 61_000).unwrap();
+        assert_eq!(
+            swept.len(),
+            1,
+            "只收敛超龄 reserved/desktop_ipc/send：{swept:?}"
+        );
+        assert_eq!(swept[0].0, "old-send");
+
+        let old = get_row(&c, "old-send").unwrap().unwrap();
+        assert_eq!(old.state, ActionState::Unknown);
+        assert_eq!(
+            old.receipt.unwrap().reason_code.as_deref(),
+            Some("aborted_dispatch_unknown")
+        );
+        for id in ["fresh-send", "compat-route", "barrier-row", "respond-row"] {
+            assert_eq!(
+                get_row(&c, id).unwrap().unwrap().state,
+                ActionState::Reserved,
+                "{id} 不得被误清扫"
+            );
+        }
+        assert_eq!(
+            get_row(&c, "queued-row").unwrap().unwrap().state,
+            ActionState::Queued
+        );
+        // 超龄行上应有 unknown 审计（system 落账，诚实不虚称完成）
+        let audits = crate::database::dao::write_audit::recent_conn(&c, 50);
+        assert!(
+            audits
+                .iter()
+                .any(|a| a.action == "codex_send" && a.result.contains("aborted_dispatch_unknown")),
+            "清扫必须留审计"
+        );
+        // 二次清扫：无超龄残留，0 条
+        assert_eq!(
+            mark_stale_reserved_unknown_conn(&c, 60_000, 62_000)
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     /// retract：CAS queued→cancelled + 清正文 + 审计；reserved/其他设备不可撤；墓碑保留

@@ -1401,11 +1401,6 @@ async fn wait_projections_multi(
     let mut skipped: Vec<
         multi_agents_manager_lib::services::codex_desktop_ipc::types::ThreadProjection,
     > = Vec::new();
-    for p in skipped.drain(..) {
-        if thread_ids.contains(&p.thread_id.as_str()) {
-            got.insert(p.thread_id.clone(), p);
-        }
-    }
     while got.len() < thread_ids.len() {
         assert!(
             std::time::Instant::now() < deadline,
