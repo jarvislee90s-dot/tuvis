@@ -34,16 +34,22 @@ interface Routes {
   queue?: CodexQueueView[];
   /** GET /codex/queue 的逐次响应（操作后重拉断言用） */
   retractStatus?: number;
+  /** R11：GET 挂起不响应（手动放行——乱序防护用例的在途响应） */
+  queueHang?: boolean;
 }
 
 let routes: Routes;
 let fetchMock: ReturnType<typeof vi.fn>;
+/** queueHang 挂起请求的放行器（测试中手动 resolve 模拟旧会话迟到响应） */
+let releaseQueue: ((v: CodexQueueView) => void) | null = null;
 
 beforeEach(() => {
   routes = {};
+  releaseQueue = null;
 });
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -68,6 +74,14 @@ function installFetch() {
       );
     }
     if (url.includes("/codex/queue")) {
+      if (routes.queueHang) {
+        // 只挂起**第一发**（会话切换后新会话的拉取照常返回——迟到的只有旧会话那份）
+        routes.queueHang = false;
+        return new Promise<Response>((resolve) => {
+          releaseQueue = (v: CodexQueueView) =>
+            resolve(new Response(JSON.stringify(v), { status: 200 }));
+        });
+      }
       const next = routes.queue?.shift();
       return new Response(JSON.stringify(next ?? queueView([])), { status: 200 });
     }
@@ -180,5 +194,56 @@ describe("CodexQueuePanel（Task 9）", () => {
     render(<CodexQueuePanel sessionId="s1" />);
     await act(async () => {});
     expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
+  });
+
+  // ==== R11：外部触发联动 + 乱序防护 ====
+  it("external_refresh_signal_refetches：外部触发（投影跃迁/发送回执）→ 去抖重拉，新入队条目不离页可见", async () => {
+    installFetch();
+    routes.queue = [queueView([])];
+    const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
+    await act(async () => {});
+    expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
+    // 发送入队回执/投影跃迁 → 父级 bump refreshSignal → 面板重拉到新条目
+    routes.queue = [queueView([action({ actionId: "a9", position: 1 })])];
+    rerender(<CodexQueuePanel sessionId="s1" refreshSignal={1} />);
+    const row = await screen.findByTestId("codex-queue-row-a9", undefined, { timeout: 3000 });
+    expect(row.textContent).toContain("第1位");
+  });
+
+  it("stale_session_response_not_applied：旧会话在途响应迟到 → 不回灌新会话", async () => {
+    installFetch();
+    routes.queueHang = true; // s1 的拉取挂起（响应迟到）
+    const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
+    await act(async () => {});
+    expect(releaseQueue).toBeTruthy();
+    // 切换会话：s2 立即拉取（空队列）
+    rerender(<CodexQueuePanel sessionId="s2" />);
+    await act(async () => {});
+    // s1 的迟到响应到达（含 a1）——旧会话响应不得回灌 s2
+    await act(async () => {
+      releaseQueue?.(queueView([action({ actionId: "a1", position: 1 })]));
+      await Promise.resolve();
+    });
+    expect(screen.queryByTestId("codex-queue-row-a1")).toBeNull();
+    expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
+  });
+
+  it("rapid_refresh_signals_coalesce：同会话密集触发去抖合并为一次重拉", async () => {
+    installFetch();
+    routes.queue = [queueView([]), queueView([action({ actionId: "a1", position: 1 })])];
+    const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
+    await act(async () => {});
+    expect(queueGetCalls()).toBe(1); // 挂载拉取
+    // 密集两次触发（发送回执 + 投影跃迁几乎同时，同步连发）
+    await act(async () => {
+      rerender(<CodexQueuePanel sessionId="s1" refreshSignal={1} />);
+      rerender(<CodexQueuePanel sessionId="s1" refreshSignal={2} />);
+    });
+    // 去抖窗口内不发请求：两次触发尚未合并落地
+    expect(queueGetCalls()).toBe(1);
+    // 窗口过后恰好一次合并重拉（去抖尾部定时器）
+    const row = await screen.findByTestId("codex-queue-row-a1", undefined, { timeout: 3000 });
+    expect(row.textContent).toContain("第1位");
+    expect(queueGetCalls()).toBe(2);
   });
 });

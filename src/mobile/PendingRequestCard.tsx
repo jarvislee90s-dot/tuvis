@@ -10,14 +10,21 @@
 // - Accepted 只表示已受理，**不标 Turn 完成**；
 // - requestKey/token 变化（owner 换代 / 请求重发）→ 清旧草稿与旧回执，绝不把
 //   旧上下文的答案灌进新请求（不误答）；
-// - 请求消失以新投影为准（父组件按 requestKey 挂载/卸载，本组件不自行判断）。
+// - 请求消失以新投影为准（父组件按 requestKey 挂载/卸载，本组件不自行判断）；
+// - **提交 ID 生命周期（R12）**：提交生成的 actionId 保持到「结果核对完成」——
+//   网络异常（丢回执）不换 ID、不解锁重投，改用 fetchCodexAction 只读核对原
+//   action（同 request 借新 ID 再次提交 = 双投窗口，服务端 R4 同款防线）；
+// - **响应代际守卫（R12）**：以 {requestKey, contextToken} 为代际，token 轮换后
+//   旧 Promise 的 resolve/异常/核对结果一律作废——不回写 receipt、不清新草稿、
+//   不覆盖新卡状态、不上行 onReceipt。
 //
 // isSecret 的问题用 password 输入（不回显）；提交成功后立即清草稿——投影刷新
 // 换卡之前秘密也不残留在 DOM。
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import InteractiveCard from "./InteractiveCard";
 import i18n from "@/i18n";
 import {
+  fetchCodexAction,
   newActionId,
   respondCodexPending,
   type ActionReceipt,
@@ -88,6 +95,36 @@ function receiptCopy(r: ActionReceipt): string {
   return i18n.t("mobile.codex.pending.notSent");
 }
 
+/** R12：账本查询终态 → 明确回执（网络异常后的只读核对结果）。accepted = 已受理；
+ *  rejected = 明确拒绝；cancelled/queued/reserved/unknown = 未终态或已撤 → null
+ *  （保持「投递结果未知」）。 */
+function actionViewToReceipt(
+  actionId: string,
+  view: { state: string; receipt: ActionReceipt | null }
+): ActionReceipt | null {
+  if (view.state === "accepted") {
+    return {
+      actionId,
+      delivery: "accepted",
+      route: view.receipt?.route ?? "desktop_ipc",
+      turnId: view.receipt?.turnId ?? null,
+      envelopeId: view.receipt?.envelopeId ?? null,
+      reasonCode: view.receipt?.reasonCode ?? null,
+    };
+  }
+  if (view.state === "rejected") {
+    return {
+      actionId,
+      delivery: "rejected",
+      route: view.receipt?.route ?? "desktop_ipc",
+      turnId: null,
+      envelopeId: null,
+      reasonCode: view.receipt?.reasonCode ?? null,
+    };
+  }
+  return null;
+}
+
 /** 一题的已答标签：勾选的选项 + 「其他」自由文本（isOther 才有输入框） */
 function answerLabels(q: QuestionView, picked: string[], free: string): string[] {
   const labels = [...picked];
@@ -108,17 +145,33 @@ export default function PendingRequestCard({
   /** 逐题作答态（qid → 已勾选项 / 自由文本草稿） */
   const [picked, setPicked] = useState<Record<string, string[]>>({});
   const [freeTexts, setFreeTexts] = useState<Record<string, string>>({});
+  /** R12：结果核对中（提交网络异常后的只读核对在途）——动作锁定，防借新 ID 双投 */
+  const [verifying, setVerifying] = useState(false);
+  /** R12：核对完成但结果未知（查不到/未终态）——保持锁定（S5：绝不自动重试），
+   *  等新投影换代（token 轮换）重置 */
+  const [outcomeUnknown, setOutcomeUnknown] = useState(false);
+  /** R12：本次提交的 actionId——从「提交发出」保持到「结果核对完成」。网络异常
+   *  后不换 ID 不解锁重投，改用 fetchCodexAction 只读核对原 action。 */
+  const submitActionIdRef = useRef<string | null>(null);
+  /** R12：上下文代际守卫——{requestKey, contextToken} 换代即 +1。旧代际的在途
+   *  Promise（resolve/异常/核对结果）落地时比对代际，过期一律丢弃。 */
+  const generationRef = useRef(0);
 
   // **上下文换代防线**：requestKey 不变但 contextToken 变化（owner 换代 / 请求
   // 消失重现）= 服务端判定旧上下文作废——旧草稿、旧回执、旧错误一律清空，
   // 绝不把旧态灌进新 token 的应答里（不误答）。requestKey 变化由父组件换 key
-  // 重挂兜底，这里覆盖「同 key 新 token」的路径。
+  // 重挂兜底，这里覆盖「同 key 新 token」的路径。R12：换代同时推进代际并作废
+  // 旧提交 ID（旧代际在途响应此后不得回写新卡）。
   useEffect(() => {
+    generationRef.current += 1;
+    submitActionIdRef.current = null;
     setPicked({});
     setFreeTexts({});
     setReceipt(null);
     setError(null);
     setBusy(false);
+    setVerifying(false);
+    setOutcomeUnknown(false);
   }, [request.requestKey, request.contextToken]);
 
   const isInput = request.kind === "user_input";
@@ -136,19 +189,29 @@ export default function PendingRequestCard({
 
   // 已回执锁定：unknown/accepted/rejected 后动作全部禁用（防双答——unknown 绝不
   // 重发原动作）。not_sent 是保守判定的零投递：保留按钮（再按 = 新 actionId，
-  // 零投递基础上重试安全）。
+  // 零投递基础上重试安全）。R12：核对中/结果未知同样锁定（提交结果没核对清楚
+  // 之前，任何再次提交都是双投窗口）。
   const locked = receipt !== null && receipt.delivery !== "not_sent";
-  const disabled = busy || locked || writeLocked || !operable;
+  const disabled = busy || locked || verifying || outcomeUnknown || writeLocked || !operable;
 
   const respond = async (action: "approve" | "reject" | "answer") => {
+    // R12：核对中/结果未知/已回执锁定一律拦截（answer 也不例外——锁定就是锁定，
+    // 提交按钮自身的 disabled 只剩 UX 层意义）
+    if (busy || verifying || outcomeUnknown || locked) return;
     if (disabled && action !== "answer") return;
-    if (busy) return;
     setBusy(true);
     setError(null);
+    const myGen = generationRef.current;
+    const stale = () => generationRef.current !== myGen;
+    // R12：一次用户动作一个 ID；网络异常后**沿同 ID**核对（不换 ID 重发）
+    if (submitActionIdRef.current === null) {
+      submitActionIdRef.current = newActionId();
+    }
+    const actionId = submitActionIdRef.current;
     try {
       const r = await respondCodexPending({
         sessionId,
-        actionId: newActionId(), // 一次用户动作一个 ID（每次点击独立）
+        actionId,
         requestKey: request.requestKey,
         contextToken: request.contextToken,
         action,
@@ -164,16 +227,26 @@ export default function PendingRequestCard({
             }
           : {}),
       });
+      if (stale()) return; // 旧 token 的响应：不回写 receipt、不清新草稿、不上行
+      // 明确回执 = 结果核对完成 → ID 让位（下一次用户动作 = 新 ID）
+      submitActionIdRef.current = null;
       setReceipt(r);
       // 提交成功即清草稿：isSecret 的回答不残留在 DOM（换卡前也不残留）
       setPicked({});
       setFreeTexts({});
       onReceipt?.(r);
     } catch (e) {
+      if (stale()) return; // 旧 token 的异常：不覆盖新卡状态
       if (e instanceof ApiError && e.status === 409) {
-        // 过期上下文：token/owner 已换代——如实提示，等新投影换 token（不自动重试）
+        // 过期上下文：token/owner 已换代——如实提示，等新投影换 token（不自动重试）。
+        // 提交已被明确拒绝（未派发）→ ID 让位，新上下文的新动作生成新 ID。
+        submitActionIdRef.current = null;
         setError(i18n.t("mobile.codex.pending.staleContext"));
-      } else {
+        return;
+      }
+      if (e instanceof ApiError && e.status !== null) {
+        // 其他 4xx/5xx：服务端明确拒绝（未派发）——如实提示，解锁可再按（新动作新 ID）
+        submitActionIdRef.current = null;
         const reason =
           e instanceof ApiError && typeof e.data?.reason === "string"
             ? e.data.reason
@@ -181,9 +254,37 @@ export default function PendingRequestCard({
               ? e.message
               : String(e);
         setError(i18n.t("mobile.codex.pending.failed", { message: reason }));
+        return;
+      }
+      // **网络异常（无响应可读）= 提交结果未知**：不换 ID、不解锁重投——改用
+      // fetchCodexAction 只读核对原 action，按查询结果呈现（R12）。
+      setVerifying(true);
+      try {
+        const view = await fetchCodexAction(actionId);
+        if (stale()) return;
+        const confirmed = actionViewToReceipt(actionId, view);
+        if (confirmed !== null) {
+          // 账本终态（accepted/rejected）= 结果核对完成：按查询结果呈现（与 200
+          // 回执同口径），ID 让位
+          submitActionIdRef.current = null;
+          setReceipt(confirmed);
+          setPicked({});
+          setFreeTexts({});
+          onReceipt?.(confirmed);
+        } else {
+          // 未终态（queued/reserved/unknown）/已取消：结果未知——保持锁定（绝不
+          // 自动重试），等新投影换代重置
+          setOutcomeUnknown(true);
+        }
+      } catch {
+        if (stale()) return;
+        // 查不到/核对查询自身失败：结果未知——保持锁定（ID 保留，核对未完成）
+        setOutcomeUnknown(true);
+      } finally {
+        if (!stale()) setVerifying(false);
       }
     } finally {
-      setBusy(false);
+      if (!stale()) setBusy(false);
     }
   };
 
@@ -203,7 +304,7 @@ export default function PendingRequestCard({
       tone={tone}
       testId="codex-pending-card"
       mode={request.kind}
-      pulsing={operable && !locked && !writeLocked}
+      pulsing={operable && !locked && !verifying && !outcomeUnknown && !writeLocked}
       title={i18n.t(titleKey)}
       titleSuffix={
         <span data-testid="codex-pending-request-key" className="text-xs text-[var(--mut)]">
@@ -368,19 +469,26 @@ export default function PendingRequestCard({
       )}
 
       {/* 底注：回执分诊 / 错误。unknown 文案指向 Desktop 核对——本组件**没有**
-          任何「重试」按钮（S5 红线，PendingRequestCard.test 逐字锁定） */}
-      {(receipt !== null || error !== null) && (
+          任何「重试」按钮（S5 红线，PendingRequestCard.test 逐字锁定）。
+          R12：核对中/结果未知（网络异常后的只读核对）也在此如实呈现 */}
+      {(receipt !== null || error !== null || verifying || outcomeUnknown) && (
         <p
           data-testid="codex-pending-note"
           className={`mt-1 text-xs ${
             error !== null
               ? "text-rose-700 dark:text-rose-300"
-              : receipt?.delivery === "unknown_delivery"
+              : receipt?.delivery === "unknown_delivery" || verifying || outcomeUnknown
                 ? "text-amber-700 dark:text-amber-400"
                 : "text-slate-600 dark:text-slate-300"
           }`}
         >
-          {error !== null ? error : receipt !== null ? receiptCopy(receipt) : null}
+          {error !== null
+            ? error
+            : receipt !== null
+              ? receiptCopy(receipt)
+              : verifying
+                ? i18n.t("mobile.codex.pending.verifying")
+                : i18n.t("mobile.codex.pending.unknownDelivery")}
         </p>
       )}
     </InteractiveCard>

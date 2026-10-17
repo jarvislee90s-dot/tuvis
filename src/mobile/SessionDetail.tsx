@@ -884,6 +884,29 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const codexWritable =
     codexState !== null &&
     (codexState.availability === "controllable" || codexState.availability === "send_only");
+  // ===== R11：Codex 队列刷新统一源 =====
+  // 队列面板除挂载/换会话外必须随状态跃迁刷新，否则「空队列时发送 codex_queued」
+  // 后面板仍自隐、SSE 推进后队位不刷新（新入队消息在当前详情页不可见不可撤——
+  // 宪法 F2.2）。三个触发源汇聚为同一个 tick 下发给 CodexQueuePanel：
+  // a) 投影跃迁（下方 effect：revision/stale/availability/runtimeStatus 变化）；
+  // b) MessageComposer 发送得到 codex_queued / desktop_ipc / headless(compat) 回执；
+  // c) 面板自身撤回完成（面板内部直接重拉，不经此 tick）。
+  const [codexQueueTick, setCodexQueueTick] = useState(0);
+  const bumpCodexQueue = useCallback(() => setCodexQueueTick((t) => t + 1), []);
+  const codexProjSigRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (codexState === null) {
+      codexProjSigRef.current = null;
+      return;
+    }
+    // 只对**状态跃迁**刷新（revision/stale/能力档/runtime 变化）；同一 revision 内的
+    // 流式文本增量不触发（流式期间每帧重拉队列是浪费，队列由服务端账本单独维护）
+    const sig = `${codexState.revision}|${codexState.stale}|${codexState.availability}|${codexState.runtimeStatus}`;
+    if (codexProjSigRef.current !== sig) {
+      codexProjSigRef.current = sig;
+      bumpCodexQueue();
+    }
+  }, [codexState, bumpCodexQueue]);
   // 该会话涉及的文件（/session-files 提取结果，M3+）：一份数据两用——
   // fileEntries 驱动文件面板列表，派生 Set 驱动正文路径链接化
   const [fileEntries, setFileEntries] = useState<SessionFileEntry[]>([]);
@@ -1543,19 +1566,23 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                 availability={codexState.availability}
                 stale={codexState.stale}
               />
-              {codexWritable && (
-                <>
-                  {codexState.pending.map((p) => (
-                    <PendingRequestCard
-                      key={`codex-pending-${session.id}-${p.requestKey}`}
-                      sessionId={session.id}
-                      request={p}
-                      writeLocked={codexState.stale}
-                    />
-                  ))}
-                  <CodexQueuePanel key={`codex-queue-${session.id}`} sessionId={session.id} />
-                </>
-              )}
+              {codexWritable &&
+                codexState.pending.map((p) => (
+                  <PendingRequestCard
+                    key={`codex-pending-${session.id}-${p.requestKey}`}
+                    sessionId={session.id}
+                    request={p}
+                    writeLocked={codexState.stale}
+                  />
+                ))}
+              {/* R11：队列面板按服务端 CodexQueueView 数据渲染，不按 A 能力档自隐——
+                  compat_only/unavailable 档已持久待发项同样可见可撤（空队列仍自隐，
+                  不渲染空壳）；refreshSignal = 投影跃迁/发送回执汇聚的统一刷新源 */}
+              <CodexQueuePanel
+                key={`codex-queue-${session.id}`}
+                sessionId={session.id}
+                refreshSignal={codexQueueTick}
+              />
               {/* 不可写档（compat_only/unavailable）：原生卡不出（无 IPC 交互面），
                   旧补投路径保持——能力横幅照出，不装作原生可用 */}
               {!codexWritable && (
@@ -2068,6 +2095,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               key={`composer-${session.id}`}
               session={session}
               onHeadlessTurn={setHeadlessTurn}
+              onCodexQueueMutated={bumpCodexQueue}
             />
           </div>
           <SplitHandle
@@ -2148,6 +2176,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             key={`composer-${session.id}`}
             session={session}
             onHeadlessTurn={setHeadlessTurn}
+            onCodexQueueMutated={bumpCodexQueue}
           />
         </div>
       )}

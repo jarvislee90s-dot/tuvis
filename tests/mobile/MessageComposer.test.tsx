@@ -48,6 +48,10 @@ interface Routes {
   answerBody?: Record<string, unknown>;
   send?: Record<string, unknown>;
   sendStatus?: number;
+  /** R12：POST /session-send 网络层异常（fetch 直接 reject——原生发送丢回执场景） */
+  sendReject?: boolean;
+  /** R12：GET /codex/action 只读核对载荷；"missing"=404；"reject"=网络异常 */
+  codexAction?: Record<string, unknown> | "missing" | "reject";
   /** 非 2xx 时响应体 JSON（403 not_injectable{reason,reasonCode} 等，P2-10） */
   sendBody?: Record<string, unknown>;
   /** 发送请求挂起不响应（灰3：投递中 chip 的慢消费者场景） */
@@ -175,12 +179,31 @@ function installFetch() {
           releaseSend = resolve;
         });
       }
+      if (routes.sendReject) throw new TypeError("send 网络断开（模拟丢回执）");
       if (routes.sendStatus) {
         return new Response(JSON.stringify(routes.sendBody ?? { error: "internal" }), {
           status: routes.sendStatus,
         });
       }
       return new Response(JSON.stringify(routes.send ?? { status: "delivered" }), { status: 200 });
+    }
+    if (url.includes("/codex/action")) {
+      // R12：fetchCodexAction 只读核对（缺省未终态 queued；"missing"=404 查不到）
+      if (routes.codexAction === "reject") throw new TypeError("codex/action 网络断开");
+      if (routes.codexAction === "missing") {
+        return new Response(JSON.stringify({ error: "not_found" }), { status: 404 });
+      }
+      return new Response(
+        JSON.stringify(
+          routes.codexAction ?? {
+            actionId: "act-1",
+            state: "queued",
+            position: null,
+            receipt: null,
+          }
+        ),
+        { status: 200 }
+      );
     }
     if (url.includes("/session-queue")) {
       if (routes.queueHang) {
@@ -257,6 +280,17 @@ class FakeXHR {
 /** POST /session-send 的调用（URL 精确到 /session-send 结尾，排除 -info 前缀） */
 function sendCalls(): Array<Array<unknown>> {
   return fetchMock.mock.calls.filter((c: unknown[]) => /\/session-send$/.test(String(c[0])));
+}
+
+/** GET /codex/action 的 action_id 查询参数序列（R12：只读核对断言用） */
+function codexActionCalls(): string[] {
+  return fetchMock.mock.calls
+    .filter((c: unknown[]) => String(c[0]).includes("/codex/action"))
+    .map((c: unknown[]) => {
+      const u = String(c[0]);
+      const m = u.match(/action_id=([^&]+)/);
+      return m ? decodeURIComponent(m[1]) : "";
+    });
 }
 
 /** GET /session-queue（列表）调用数（列表带 ?session_id= 查询串，排除 jump/retract） */
@@ -2183,30 +2217,36 @@ describe("MessageComposer：Codex APP 原生发送（Task 9）", () => {
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
   });
 
-  it("action_id_reused_after_failure：网络失败保留正文与同一 actionId（重试不换 ID）", async () => {
+  it("post_failure_keeps_action_id_and_verifies：原生发送请求失败（500）→ 同 ID 恰一次只读核对，不换 ID 重投（R12 语义改写）", async () => {
+    // **R12 语义变更说明**（原用例名 action_id_reused_after_failure，断言「失败保留
+    // 正文沿同 ID 重试」）：审计裁定该语义是错误状态机——请求失败（网络异常/5xx）=
+    // 投递结果未知，重按发送沿同 ID 会被服务端回放旧回执或 action_conflict，换新 ID
+    // 则有双投风险。新契约：保留 actionId 作核对锚 + 输入清空（防双投）+ 恰一次
+    // fetchCodexAction 只读核对、按查询结果呈现、绝不自动重发。
     installFetch();
     routes.info = codexAppSendInfo();
     routes.sendStatus = 500;
+    // 核对查询：账本终态 accepted → 「投递结果未知」升级为已受理呈现
+    routes.codexAction = {
+      actionId: "act-1",
+      state: "accepted",
+      position: null,
+      receipt: desktopIpcReceipt("accepted"),
+    };
     render(<MessageComposer session={{ id: "sess-1" }} />);
     const input = await screen.findByTestId("composer-input");
-    fireEvent.change(input, { target: { value: "失败也要沿同 ID" } });
+    fireEvent.change(input, { target: { value: "失败也要核对" } });
     fireEvent.click(screen.getByTestId("composer-send"));
-    await screen.findByTestId("send-receipt-failed");
-    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe(
-      "失败也要沿同 ID"
-    );
-    routes.sendStatus = undefined;
-    routes.send = {
-      status: "desktop_ipc",
-      receipt: desktopIpcReceipt("unknown_delivery"),
-    };
-    fireEvent.click(screen.getByTestId("composer-send"));
-    expect(await screen.findByTestId("send-receipt-codex-unknown")).toBeTruthy();
-    expect(sendCalls()).toHaveLength(2);
-    const id1 = JSON.parse(String((sendCalls()[0][1] as RequestInit).body)).actionId;
-    const id2 = JSON.parse(String((sendCalls()[1][1] as RequestInit).body)).actionId;
-    expect(id1).toBe(id2); // 同一用户动作沿同一 actionId（服务端按 action 去重的锚）
-    // UNKNOWN：结果未知 → 输入清空（防重复发送），绝不出现「重试」按钮
+    // 查询结果 accepted → 升级为已受理 chip（不是「发送失败（可重试）」）
+    await screen.findByTestId("send-receipt-codex-accepted");
+    await flushAsync();
+    // 只发了一次 POST，不自动重投
+    expect(sendCalls()).toHaveLength(1);
+    // 恰一次只读核对，且核对的是 POST 携带的同一个 actionId
+    expect(codexActionCalls()).toHaveLength(1);
+    const postedId = JSON.parse(String((sendCalls()[0][1] as RequestInit).body)).actionId;
+    expect(codexActionCalls()[0]).toBe(postedId);
+    // 结果未知期间消息可能已离开客户端 → 输入清空（防双投），无「重试」按钮
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
   });
@@ -2238,5 +2278,164 @@ describe("MessageComposer：Codex APP 原生发送（Task 9）", () => {
       sessionId: "sess-1",
       text: "终端直发",
     });
+  });
+});
+
+// ==== R12：原生动作的回执状态机 ====
+// 审计返工点：
+// - native 与 headless 回执分别管理：desktop_ipc/codex_queued 分支不得进入无头回合
+//   态（不残留 running 卡/取消钮）；headless 状态只在真正走 compat headless 分支时进入；
+// - not_sent/rejected = 明确零投递/明确拒绝 → 终态处理并清空 actionId（下一次动作新 ID）；
+// - unknown_delivery / 请求失败 = 结果未知 → 保留 ID、恰一次 fetchCodexAction 只读核对、
+//   绝不自动重发；编辑正文（文本变化检测）后允许新动作。
+describe("MessageComposer：Codex 原生回执状态机（R12）", () => {
+  /** Codex APP 可注入态（与 Task 9 describe 的同名夹具同形——块级作用域独立副本） */
+  function codexAppSendInfo(): SendInfo {
+    return {
+      injectable: true,
+      channels: ["headless_codex_queue"],
+      visibility: "tuvis_only",
+    };
+  }
+
+  function desktopIpcReceipt(delivery: string, actionId = "act-1") {
+    return {
+      actionId,
+      delivery,
+      route: "desktop_ipc",
+      turnId: "turn-1",
+      envelopeId: "env-1",
+      reasonCode: null,
+    };
+  }
+
+  function postedActionIds(): string[] {
+    return sendCalls().map((c) => JSON.parse(String((c[1] as RequestInit).body)).actionId);
+  }
+
+  it("native_receipts_never_report_headless_sending：desktop_ipc/codex_queued 原生回执不进无头回合态；compat headless 封套仍如实上报", async () => {
+    // desktop_ipc accepted：不得有 sending 上报（无头 running 卡的数据源）
+    installFetch();
+    routes.info = codexAppSendInfo();
+    routes.send = { status: "desktop_ipc", receipt: desktopIpcReceipt("accepted", "act-a") };
+    const onHeadlessTurn = vi.fn();
+    const onCodexQueueMutated = vi.fn();
+    render(
+      <MessageComposer
+        session={{ id: "sess-1" }}
+        onHeadlessTurn={onHeadlessTurn}
+        onCodexQueueMutated={onCodexQueueMutated}
+      />
+    );
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "原生直发" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("send-receipt-codex-accepted");
+    await flushAsync();
+    expect(onHeadlessTurn).not.toHaveBeenCalled();
+    // 入队/受理回执级联队列刷新（R11 联动源）
+    expect(onCodexQueueMutated).toHaveBeenCalled();
+
+    // codex_queued 同理
+    cleanup();
+    installFetch();
+    routes.info = codexAppSendInfo();
+    routes.send = { status: "codex_queued", actionId: "act-b", position: 2 };
+    const onHeadlessTurn2 = vi.fn();
+    render(<MessageComposer session={{ id: "sess-1" }} onHeadlessTurn={onHeadlessTurn2} />);
+    const input2 = await screen.findByTestId("composer-input");
+    fireEvent.change(input2, { target: { value: "排队消息" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("send-receipt-codex-queued");
+    await flushAsync();
+    expect(onHeadlessTurn2).not.toHaveBeenCalled();
+
+    // compat headless 封套（H3 兜底路径）：终态回执仍如实上报 done（H8 既有语义）
+    cleanup();
+    installFetch();
+    routes.info = codexAppSendInfo();
+    routes.send = {
+      status: "headless",
+      channel: "headless_codex_queue",
+      receipt: { status: "queued", sessionId: "sess-1", durationMs: 5, reason: "未消费" },
+    };
+    const onHeadlessTurn3 = vi.fn();
+    render(<MessageComposer session={{ id: "sess-1" }} onHeadlessTurn={onHeadlessTurn3} />);
+    const input3 = await screen.findByTestId("composer-input");
+    fireEvent.change(input3, { target: { value: "补投" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await flushAsync();
+    expect(onHeadlessTurn3).toHaveBeenCalledWith(
+      expect.objectContaining({
+        phase: "done",
+        receipt: expect.objectContaining({ status: "queued" }),
+      })
+    );
+  });
+
+  it("not_sent_then_recover_new_action_succeeds：not_sent → 恢复后重按发送用新 actionId 成功（无 action_conflict）", async () => {
+    installFetch();
+    routes.info = codexAppSendInfo();
+    routes.send = { status: "desktop_ipc", receipt: desktopIpcReceipt("not_sent", "act-f1") };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "重发这条" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("send-receipt-codex-failed");
+    // 明确零投递：消息未离开客户端 → 正文保留
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("重发这条");
+    // 条件恢复：服务端改为 accepted
+    routes.send = { status: "desktop_ipc", receipt: desktopIpcReceipt("accepted", "act-f1") };
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("send-receipt-codex-accepted");
+    expect(sendCalls()).toHaveLength(2);
+    const ids = postedActionIds();
+    // **新动作 = 新 ID**：旧 ID 重发会被服务端回放旧失败回执/action_conflict（审计点名）
+    expect(ids[1]).not.toBe(ids[0]);
+    // 第二次成功 → 输入清空
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("unknown_delivery_queries_action_once：POST 网络异常 → 恰一次 fetchCodexAction(同 ID)，不重发 POST", async () => {
+    installFetch();
+    routes.info = codexAppSendInfo();
+    routes.sendReject = true;
+    routes.codexAction = { actionId: "act-u1", state: "queued", position: 1, receipt: null };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "丢回执的消息" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    // 结果未知呈现（查询未终态 → 保持「投递结果未知」）
+    await screen.findByTestId("send-receipt-codex-unknown");
+    await flushAsync();
+    // 只发了一次 POST，绝不自动重发
+    expect(sendCalls()).toHaveLength(1);
+    // 恰一次只读核对，核对的是 POST 携带的同一个 actionId（ID 保留作核对锚）
+    expect(codexActionCalls()).toHaveLength(1);
+    expect(codexActionCalls()[0]).toBe(postedActionIds()[0]);
+    // 结果未知 → 输入清空（防双投）、无「重试」按钮
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+    expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+  });
+
+  it("unknown_text_change_then_send_uses_new_action_id：unknown 保留 ID 核对；编辑正文后发送生成新 ID", async () => {
+    installFetch();
+    routes.info = codexAppSendInfo();
+    routes.sendReject = true; // 第一次：丢回执（结果未知，ID 保留）
+    routes.codexAction = { actionId: "act-x", state: "queued", position: null, receipt: null };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "第一条" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("send-receipt-codex-unknown");
+    // 用户开始新消息（文本变化检测）→ 遗留 unknown ID 必须让位
+    routes.sendReject = false;
+    routes.send = { status: "desktop_ipc", receipt: desktopIpcReceipt("accepted", "act-new") };
+    fireEvent.change(input, { target: { value: "第二条新消息" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("send-receipt-codex-accepted");
+    const ids = postedActionIds();
+    // 新正文 = 新动作：若沿旧 unknown ID 发送，服务端会去重/回放旧回执（新消息永远发不出）
+    expect(ids[1]).not.toBe(ids[0]);
   });
 });

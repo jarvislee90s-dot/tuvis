@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import PendingRequestCard, { CodexAvailabilityBanner } from "@/mobile/PendingRequestCard";
@@ -95,13 +95,22 @@ interface Routes {
   respond?: ActionReceipt;
   respondStatus?: number;
   respondBody?: Record<string, unknown>;
+  /** R12：POST 挂起不响应（手动放行——「提交在飞时 token 轮换」窗口） */
+  respondHang?: boolean;
+  /** R12：POST 网络层异常（fetch 直接 reject——丢回执场景） */
+  respondReject?: boolean;
+  /** R12：GET /codex/action 只读核对载荷；"missing"=404；"reject"=网络异常 */
+  codexAction?: Record<string, unknown> | "missing" | "reject";
 }
 
 let routes: Routes;
 let fetchMock: ReturnType<typeof vi.fn>;
+/** respondHang 挂起请求的放行器（测试中手动 resolve 模拟旧响应迟到） */
+let releaseRespond: ((r: Response) => void) | null = null;
 
 beforeEach(() => {
   routes = {};
+  releaseRespond = null;
 });
 afterEach(() => {
   cleanup();
@@ -112,12 +121,36 @@ function installFetch() {
   fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.includes("/codex/pending-response")) {
+      if (routes.respondHang) {
+        return new Promise<Response>((resolve) => {
+          releaseRespond = resolve;
+        });
+      }
+      if (routes.respondReject) throw new TypeError("pending-response 网络断开（模拟丢回执）");
       if (routes.respondStatus) {
         return new Response(JSON.stringify(routes.respondBody ?? { error: "stale_context" }), {
           status: routes.respondStatus,
         });
       }
       return new Response(JSON.stringify(routes.respond ?? receipt("accepted")), { status: 200 });
+    }
+    if (url.includes("/codex/action")) {
+      // R12：fetchCodexAction 只读核对（缺省未终态 queued；"missing"=404 查不到）
+      if (routes.codexAction === "reject") throw new TypeError("codex/action 网络断开");
+      if (routes.codexAction === "missing") {
+        return new Response(JSON.stringify({ error: "not_found" }), { status: 404 });
+      }
+      return new Response(
+        JSON.stringify(
+          routes.codexAction ?? {
+            actionId: "act-1",
+            state: "queued",
+            position: null,
+            receipt: null,
+          }
+        ),
+        { status: 200 }
+      );
     }
     throw new Error(`unexpected fetch: ${url}`);
   });
@@ -382,5 +415,99 @@ describe("CodexAvailabilityBanner：四档能力按服务端渲染", () => {
   it("stale_note：stale → 保留视图说明条（禁写提示）", () => {
     render(<CodexAvailabilityBanner availability="controllable" stale={true} />);
     expect(screen.getByTestId("codex-stale-note").textContent).toContain("不能");
+  });
+});
+
+// ============================================================
+// R12：提交 ID 生命周期与响应守卫
+// - 提交生成的 actionId 保持到「结果核对完成」：网络异常不换 ID 不解锁重投，
+//   改用 fetchCodexAction 只读核对原 action（防同 request 借新 ID 双投）；
+// - {requestKey, contextToken} 代际守卫：token 轮换后旧 Promise 的 resolve 不再
+//   回写 receipt、不清新草稿、不覆盖新卡状态。
+// ============================================================
+describe("PendingRequestCard：提交 ID 与响应守卫（R12）", () => {
+  async function flushAsync() {
+    for (let i = 0; i < 6; i += 1) {
+      await act(async () => {
+        await Promise.resolve();
+      });
+    }
+  }
+
+  function respondBodies(): Record<string, unknown>[] {
+    return fetchMock.mock.calls
+      .filter(([u]) => String(u).includes("/codex/pending-response"))
+      .map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>);
+  }
+
+  function actionQueryUrls(): string[] {
+    return fetchMock.mock.calls
+      .filter(([u]) => String(u).includes("/codex/action"))
+      .map(([u]) => String(u));
+  }
+
+  it("pending_stale_response_discarded_after_token_rotation：提交在飞时 token 轮换 → 旧 resolve 不回写、不清新草稿、新卡可操作", async () => {
+    installFetch();
+    routes.respondHang = true;
+    routes.respond = receipt("accepted");
+    const onReceipt = vi.fn();
+    const { rerender } = render(
+      <PendingRequestCard
+        sessionId="s1"
+        request={userInputPending([question({ id: "q1" })])}
+        onReceipt={onReceipt}
+      />
+    );
+    // 提交在飞（旧 token tok-3）
+    fireEvent.click(screen.getByTestId(`codex-q-q1-opt-0`));
+    fireEvent.click(screen.getByTestId("codex-pending-submit"));
+    await waitFor(() => expect(releaseRespond).toBeTruthy());
+    // owner 换代：同 requestKey 新 token（新投影），草稿重置属正常换代防线
+    rerender(
+      <PendingRequestCard
+        sessionId="s1"
+        request={userInputPending([question({ id: "q1" })], { contextToken: "tok-ROTATED" })}
+        onReceipt={onReceipt}
+      />
+    );
+    // 新上下文重新作答（新草稿）
+    fireEvent.click(screen.getByTestId(`codex-q-q1-opt-0`));
+    const submit = screen.getByTestId("codex-pending-submit") as HTMLButtonElement;
+    expect(submit.disabled).toBe(false);
+    // 旧 Promise 迟到（accepted 回执）
+    await act(async () => {
+      releaseRespond?.(new Response(JSON.stringify(receipt("accepted")), { status: 200 }));
+      await Promise.resolve();
+    });
+    await flushAsync();
+    // 旧响应不得回写新卡：无回执底注、新草稿未被清、按钮仍可操作、onReceipt 不上行
+    expect(screen.queryByTestId("codex-pending-note")).toBeNull();
+    expect((screen.getByTestId(`codex-q-q1-opt-0`) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId("codex-pending-submit") as HTMLButtonElement).disabled).toBe(false);
+    expect(onReceipt).not.toHaveBeenCalled();
+  });
+
+  it("pending_network_failure_keeps_action_id_and_polls：POST 网络失败 → 保留同 ID 恰一次查询核对，不自动重投", async () => {
+    installFetch();
+    routes.respondReject = true;
+    // 核对查询：未终态（queued）→ 如实显示「投递结果未知」
+    routes.codexAction = { actionId: "act-9", state: "queued", position: null, receipt: null };
+    render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    fireEvent.click(screen.getByTestId("codex-pending-approve"));
+    await flushAsync();
+    // 恰一次 POST、恰一次只读核对，且核对的是 POST 携带的同一个 actionId
+    const bodies = respondBodies();
+    expect(bodies).toHaveLength(1);
+    const queries = actionQueryUrls();
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toContain(String(bodies[0].actionId));
+    // 未终态 → 结果未知底注 + 动作锁定（绝不借新 ID 重投）
+    const note = screen.getByTestId("codex-pending-note");
+    expect(note.textContent).toContain("投递结果未知");
+    expect((screen.getByTestId("codex-pending-approve") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId("codex-pending-reject") as HTMLButtonElement).disabled).toBe(true);
+    // 再等若干微任务也绝不自动重投
+    await flushAsync();
+    expect(respondBodies()).toHaveLength(1);
   });
 });

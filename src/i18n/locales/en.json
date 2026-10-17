@@ -1752,7 +1752,8 @@
         "notSent": "Not sent — nothing was delivered; you can try again",
         "staleContext": "This request is stale (Desktop state changed) — wait for the latest view",
         "failed": "Response failed: {{message}}",
-        "writeLocked": "Desktop connection interrupted — answering is disabled for now"
+        "writeLocked": "Desktop connection interrupted — answering is disabled for now",
+        "verifying": "Verifying the previous submission — actions are paused to prevent duplicates"
       },
       "queue": {
         "title": "Outgoing queue",

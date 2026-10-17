@@ -135,6 +135,11 @@ interface Routes {
    *  （后端未启用 IPC / 无 A 投影 → hook 保持 null，旧 QuestionCardApp 路径） */
   codexThread?: Record<string, unknown>;
   codexThreadStatus?: number;
+  /** R11：GET /m/api/v1/codex/queue 载荷（CodexQueuePanel 拉取）；缺省空队列（面板自隐）。
+   *  给函数 → 每次拉取现算（用例内改队列世界后由刷新联动取新值） */
+  codexQueue?: unknown;
+  /** R12：GET /m/api/v1/codex/action 载荷（fetchCodexAction 只读核对；防御桩） */
+  codexAction?: unknown;
 }
 
 /** 手动闸：`routes.sessionSend === "pending"` 时由用例自行 resolve（零真实等待） */
@@ -175,7 +180,7 @@ afterEach(() => {
 
 /** 按 URL 分路的 fetch stub，返回 mock 供断言调用参数 */
 function installFetch() {
-  fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.includes("/session-messages")) {
       if (routes.messagesNetworkFail) throw new TypeError("network down");
@@ -334,9 +339,41 @@ function installFetch() {
       if (routes.codexThreadStatus) return new Response("no", { status: routes.codexThreadStatus });
       return new Response(JSON.stringify(routes.codexThread ?? {}), { status: 200 });
     }
+    if (url.includes("/codex/queue/retract")) {
+      // R11：CodexQueuePanel 撤回 POST（判序在 /codex/queue 之前——前缀包含关系；
+      // 缺省成功 → cancelled 的 CodexActionView）
+      let body: { actionId?: string } = {};
+      try {
+        body = JSON.parse(String(init?.body)) as { actionId?: string };
+      } catch {
+        /* 无体/非 JSON：actionId 兜底 */
+      }
+      return new Response(
+        JSON.stringify({
+          actionId: body.actionId ?? "act-1",
+          state: "cancelled",
+          position: null,
+          receipt: null,
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.includes("/codex/action")) {
+      // R12：fetchCodexAction 只读核对（详情页用例不点原生卡按钮；防御桩）
+      const view =
+        typeof routes.codexAction === "function" ? routes.codexAction() : routes.codexAction;
+      return new Response(
+        JSON.stringify(
+          view ?? { actionId: "act-1", state: "queued", position: null, receipt: null }
+        ),
+        { status: 200 }
+      );
+    }
     if (url.includes("/codex/queue")) {
-      // Task 9：CodexQueuePanel 挂载拉取（缺省空队列 → 面板自隐）
-      return new Response(JSON.stringify({ actions: [], blockedReasonCode: null }), {
+      // Task 9/R11：CodexQueuePanel 挂载/触发拉取（缺省空队列 → 面板自隐）；
+      // 函数形态 = 每次拉取现算（R11 联动刷新用例驱动「队列推进」）
+      const qv = typeof routes.codexQueue === "function" ? routes.codexQueue() : routes.codexQueue;
+      return new Response(JSON.stringify(qv ?? { actions: [], blockedReasonCode: null }), {
         status: 200,
       });
     }
@@ -4214,5 +4251,302 @@ describe("SessionDetail：Codex Desktop IPC 投影（Task 9）", () => {
     expect(screen.queryByTestId("codex-projection")).toBeNull();
     expect(screen.getByText("无投影时的 rollout 消息")).toBeTruthy();
     expect(await screen.findByTestId("question-card-app")).toBeTruthy();
+  });
+});
+
+// ============================================================
+// R11：Codex 队列联动刷新（真实渲染 SessionDetail）——入队（发送回执）、派发/撤回
+// （投影跃迁）必须级联到队列视图；compat_only 档按服务端 CodexQueueView 数据渲染；
+// 乱序响应不回灌。
+// ============================================================
+describe("SessionDetail：Codex 队列联动刷新（R11）", () => {
+  /** codex APP 面 GET /session-mode 载荷（surface:"app"；与 Task 9 describe 的同名
+   *  夹具同形——describe 块级作用域不可跨引用，独立副本） */
+  function codexAppMode(): Record<string, unknown> {
+    return {
+      tool: "codex",
+      current: null,
+      currentLabel: null,
+      readback: false,
+      switchKind: "slashCommand",
+      structure: "twoAxis",
+      surface: "app",
+      degraded: null,
+      groups: [],
+    };
+  }
+
+  /** ThreadProjection 夹具（camelCase 契约） */
+  function codexProjection(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      threadId: "th-1",
+      revision: 7,
+      stale: false,
+      availability: "controllable",
+      capabilities: {
+        send: true,
+        state: true,
+        command: true,
+        permissions: true,
+        blockingInput: true,
+      },
+      runtimeStatus: "idle",
+      messages: [
+        { id: "m-1", role: "user", kind: "user_input", text: "投影里的用户消息", ts: 1000 },
+      ],
+      truncated: false,
+      pending: [],
+      ...over,
+    };
+  }
+
+  function queueAction(
+    actionId: string,
+    position: number | null,
+    state = "queued"
+  ): Record<string, unknown> {
+    return { actionId, state, position, receipt: null };
+  }
+
+  /** 旧补投入口的问答载荷（compat_only 路径保持的数据源） */
+  function appQuestionPayload(): Record<string, unknown> {
+    return {
+      available: true,
+      answerable: true,
+      freeText: true,
+      multiQuestion: false,
+      screen: null,
+      questions: [
+        {
+          header: "Next step",
+          question: "下一步做什么？",
+          multiSelect: false,
+          options: [{ label: "Tool demo", description: "跑一遍工具演示" }],
+        },
+      ],
+      source: "scan",
+    };
+  }
+
+  function codexSendInfo() {
+    return {
+      injectable: true,
+      channels: ["headless_codex_queue", "headless_codex_exec"],
+      visibility: "realtime",
+    };
+  }
+
+  function queueGetCount(): number {
+    return fetchMock.mock.calls.filter(([u]) => String(u).includes("/codex/queue?")).length;
+  }
+
+  beforeEach(() => {
+    MockEventSource.reset();
+    vi.stubGlobal("EventSource", MockEventSource);
+  });
+
+  it("empty_queue_then_send_codex_queued_panel_visible_and_retractable：空队列 → 发送 codex_queued → 不离页面板出现该条且可撤回", async () => {
+    installFetch();
+    routes.sessionMode = codexAppMode();
+    routes.sendInfo = codexSendInfo();
+    routes.sessionSend = { status: "codex_queued", actionId: "act-q1", position: 1 };
+    let queueNow: unknown = { actions: [], blockedReasonCode: null };
+    routes.codexQueue = () => queueNow;
+    render(
+      <SessionDetail
+        session={makeSession({
+          id: "sess-r11a",
+          agentType: "codex",
+          form: "app",
+          status: "processing",
+        })}
+        onBack={() => {}}
+      />
+    );
+    await screen.findByTestId("mode-bar-app");
+    MockEventSource.latest().emit("snapshot", codexProjection());
+    await screen.findByTestId("codex-projection");
+    // 初始空队列：至少一次队列拉取已落地且面板自隐
+    await waitFor(() => expect(queueGetCount()).toBeGreaterThan(0));
+    expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
+    // 发送 → codex_queued 回执 → 服务端账本入账
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "排队消息" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("send-receipt-codex-queued");
+    queueNow = { actions: [queueAction("act-q1", 1)], blockedReasonCode: null };
+    // 不离页面板出现该条且可撤回（审计 F2.2：新入队消息在当前详情页可见）
+    await screen.findByTestId("codex-queue-row-act-q1", undefined, { timeout: 3000 });
+    // 本文件不固定 i18n 语言：队位断言走位置节点数字（zh「第1位」/ en "#1 in queue" 通吃）
+    expect(screen.getByTestId("codex-queue-position-act-q1").textContent).toContain("1");
+    expect(screen.getByTestId("codex-queue-retract-act-q1")).toBeTruthy();
+    // 撤回 → cancelled → 条目随权威列表消失
+    queueNow = { actions: [], blockedReasonCode: null };
+    fireEvent.click(screen.getByTestId("codex-queue-retract-act-q1"));
+    await waitFor(() => expect(screen.queryByTestId("codex-queue-row-act-q1")).toBeNull());
+  });
+
+  it("sse_projection_advances_queue_position：SSE 推进投影后面板队列位置刷新（推进 → 条目消失）", async () => {
+    installFetch();
+    routes.sessionMode = codexAppMode();
+    routes.sendInfo = codexSendInfo();
+    let queueNow: unknown = { actions: [queueAction("act-p1", 1)], blockedReasonCode: null };
+    routes.codexQueue = () => queueNow;
+    render(
+      <SessionDetail
+        session={makeSession({
+          id: "sess-r11b",
+          agentType: "codex",
+          form: "app",
+          status: "processing",
+        })}
+        onBack={() => {}}
+      />
+    );
+    await screen.findByTestId("mode-bar-app");
+    MockEventSource.latest().emit("snapshot", codexProjection());
+    await screen.findByTestId("codex-queue-row-act-p1");
+    expect(screen.getByTestId("codex-queue-position-act-p1").textContent).toContain("1");
+    // SSE 推进（revision/runtimeStatus 跃迁）→ 队位刷新为第2位
+    queueNow = { actions: [queueAction("act-p1", 2)], blockedReasonCode: null };
+    MockEventSource.latest().emit(
+      "state",
+      codexProjection({ revision: 8, runtimeStatus: "running" })
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("codex-queue-position-act-p1").textContent).toContain("2")
+    );
+    // 派发完成 → 条目消失，队列全空面板自隐
+    queueNow = { actions: [], blockedReasonCode: null };
+    MockEventSource.latest().emit("state", codexProjection({ revision: 9, runtimeStatus: "idle" }));
+    await waitFor(() => expect(screen.queryByTestId("codex-queue-row-act-p1")).toBeNull());
+    await waitFor(() => expect(screen.queryByTestId("codex-queue-panel")).toBeNull());
+  });
+
+  it("compat_only_still_lists_persistent_queue：compat-only 投影下已入队条目仍显示且撤回可用", async () => {
+    installFetch();
+    routes.sessionMode = codexAppMode();
+    routes.questionInfo = appQuestionPayload();
+    routes.codexThread = codexProjection({ availability: "compat_only" });
+    let queueNow: unknown = {
+      actions: [queueAction("act-c1", 1)],
+      blockedReasonCode: "compat_outstanding",
+    };
+    routes.codexQueue = () => queueNow;
+    render(
+      <SessionDetail
+        session={makeSession({
+          id: "sess-r11c",
+          agentType: "codex",
+          form: "app",
+          status: "processing",
+        })}
+        onBack={() => {}}
+      />
+    );
+    await screen.findByTestId("mode-bar-app");
+    MockEventSource.latest().emit("snapshot", codexProjection({ availability: "compat_only" }));
+    expect(await screen.findByTestId("codex-availability-banner")).toBeTruthy();
+    expect(screen.getByTestId("codex-availability-banner").getAttribute("data-availability")).toBe(
+      "compat_only"
+    );
+    // 旧补投路径保持（compat 档不出原生卡——R8 范围，本包不动）
+    expect(await screen.findByTestId("question-card-app")).toBeTruthy();
+    expect(screen.queryByTestId("codex-pending-card")).toBeNull();
+    // 队列面板按服务端 CodexQueueView 数据渲染（不按 A 能力档自隐）：条目可见、撤回可用
+    await screen.findByTestId("codex-queue-row-act-c1");
+    expect(screen.getByTestId("codex-queue-position-act-c1").textContent).toContain("1");
+    const retract = screen.getByTestId("codex-queue-retract-act-c1") as HTMLButtonElement;
+    expect(retract.disabled).toBe(false);
+    // 撤回 → 服务端账本 cancelled → 权威列表空
+    queueNow = { actions: [], blockedReasonCode: null };
+    fireEvent.click(retract);
+    await waitFor(() => expect(screen.queryByTestId("codex-queue-row-act-c1")).toBeNull());
+  });
+});
+
+// ============================================================
+// R12：原生动作回执状态机（SessionDetail 级）——native 回执不得残留 headless
+// running 卡/取消钮（native 与 headless 回执分别管理）。
+// ============================================================
+describe("SessionDetail：Codex 原生回执不残留无头卡（R12）", () => {
+  function codexAppMode(): Record<string, unknown> {
+    return {
+      tool: "codex",
+      current: null,
+      currentLabel: null,
+      readback: false,
+      switchKind: "slashCommand",
+      structure: "twoAxis",
+      surface: "app",
+      degraded: null,
+      groups: [],
+    };
+  }
+
+  function codexProjection(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      threadId: "th-1",
+      revision: 7,
+      stale: false,
+      availability: "controllable",
+      capabilities: {
+        send: true,
+        state: true,
+        command: true,
+        permissions: true,
+        blockingInput: true,
+      },
+      runtimeStatus: "idle",
+      messages: [
+        { id: "m-1", role: "user", kind: "user_input", text: "投影里的用户消息", ts: 1000 },
+      ],
+      truncated: false,
+      pending: [],
+      ...over,
+    };
+  }
+
+  beforeEach(() => {
+    MockEventSource.reset();
+    vi.stubGlobal("EventSource", MockEventSource);
+  });
+
+  it("native_desktop_ipc_receipt_no_headless_card：desktop_ipc accepted 回执后无 headless running 卡/取消钮", async () => {
+    installFetch();
+    routes.sessionMode = codexAppMode();
+    routes.sendInfo = {
+      injectable: true,
+      channels: ["headless_codex_queue", "headless_codex_exec"],
+      visibility: "realtime",
+    };
+    routes.sessionSend = {
+      status: "desktop_ipc",
+      receipt: {
+        actionId: "act-n1",
+        delivery: "accepted",
+        route: "desktop_ipc",
+        turnId: "t1",
+        envelopeId: "e1",
+        reasonCode: null,
+      },
+    };
+    render(
+      <SessionDetail
+        session={makeSession({ id: "sess-r12a", agentType: "codex", form: "app", status: "idle" })}
+        onBack={() => {}}
+      />
+    );
+    await screen.findByTestId("mode-bar-app");
+    MockEventSource.latest().emit("snapshot", codexProjection());
+    await screen.findByTestId("codex-projection");
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "原生直发" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("send-receipt-codex-accepted");
+    // 原生回执不是无头回合：running 卡、取消钮、发送中徽章一律不得残留
+    expect(screen.queryByTestId("headless-receipt-card")).toBeNull();
+    expect(screen.queryByTestId("headless-sending")).toBeNull();
+    expect(screen.queryByTestId("headless-cancel")).toBeNull();
   });
 });

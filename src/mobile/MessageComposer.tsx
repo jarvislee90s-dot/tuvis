@@ -85,15 +85,23 @@ import {
 import { ChannelBwNote } from "./FilePanel";
 import { etaRemainingText, formatBytes, transferRateBps, type TransferSample } from "./board-logic";
 // Task 9：Codex APP 原生发送（Desktop IPC）——actionId 生成与回执 DTO
-import { newActionId, type ActionReceipt } from "./codexIpcApi";
+// R12：fetchCodexAction（unknown 结果的只读核对）与 CodexActionView（核对结果）
+import { fetchCodexAction, newActionId, type ActionReceipt } from "./codexIpcApi";
 
 interface MessageComposerProps {
   /** 会话（本组件只消费 id；结构化类型，完整 Session 可直接传入） */
   session: { id: string };
   /** **无头回合上报**（Task 8 / H7）：无头通道（zcode）的发送是**回合级**动作——请求要在飞
    *  整个无头进程的生命周期（实测 8–23s），回执卡与取消钮因此挂在 SessionDetail（页面级），
-   *  本组件只上报「发送中 / 终态回执」两个翻转点。**终端通道不调用**（零回归）。 */
+   *  本组件只上报「发送中 / 终态回执」两个翻转点。**终端通道不调用**（零回归）。
+   *  R12：Codex APP 通道（headless_codex_*）**不在其列**——native 回执（desktop_ipc/
+   *  codex_queued）不是无头回合，先上报 sending 再直接 return 会给父级留下永久
+   *  「无头回合进行中」卡与不适用的取消钮；无头状态只在真正走 compat headless 分支时进入。 */
   onHeadlessTurn?: (turn: HeadlessTurn) => void;
+  /** **R11：Codex 队列变化信号**——发送得到 desktop_ipc / codex_queued /
+   *  headless（compat）回执后调用（动作已入服务端账本）。SessionDetail 据此触发
+   *  CodexQueuePanel 同源重拉：新入队条目不离页即可见可撤（宪法 F2.2）。 */
+  onCodexQueueMutated?: () => void;
 }
 
 /** 待发附件条目（组件内态）：status=uploading → ready/failed；
@@ -317,7 +325,54 @@ function upsertQueueItem(items: QueueItemView[], item: QueueItemView): QueueItem
   return next;
 }
 
-export default function MessageComposer({ session, onHeadlessTurn }: MessageComposerProps) {
+/** R12：本地合成的 unknown_delivery 回执（POST 本身失败、无服务端回执可读）——
+ *  仅携带本地事实（actionId + 结果未知），不编 turnId/envelopeId/reason */
+function unknownDeliveryReceipt(actionId: string): ActionReceipt {
+  return {
+    actionId,
+    delivery: "unknown_delivery",
+    route: "desktop_ipc",
+    turnId: null,
+    envelopeId: null,
+    reasonCode: null,
+  };
+}
+
+/** R12：fetchCodexAction 的账本终态 → 明确回执（unknown 结果核对的升级呈现）。
+ *  accepted = 已受理；rejected/cancelled = 明确未投递（终态）；其余（queued/
+ *  reserved/unknown）未终态 → null（保持「投递结果未知」）。 */
+function actionViewToReceipt(
+  actionId: string,
+  view: { state: string; receipt: ActionReceipt | null }
+): ActionReceipt | null {
+  if (view.state === "accepted") {
+    return {
+      actionId,
+      delivery: "accepted",
+      route: view.receipt?.route ?? "desktop_ipc",
+      turnId: view.receipt?.turnId ?? null,
+      envelopeId: view.receipt?.envelopeId ?? null,
+      reasonCode: view.receipt?.reasonCode ?? null,
+    };
+  }
+  if (view.state === "rejected" || view.state === "cancelled") {
+    return {
+      actionId,
+      delivery: "rejected",
+      route: view.receipt?.route ?? "desktop_ipc",
+      turnId: null,
+      envelopeId: null,
+      reasonCode: view.receipt?.reasonCode ?? view.state,
+    };
+  }
+  return null;
+}
+
+export default function MessageComposer({
+  session,
+  onHeadlessTurn,
+  onCodexQueueMutated,
+}: MessageComposerProps) {
   // 可用性：sendInfo=null 且未就绪 → 不渲染（加载中 / 拉取失败 / 403）
   const [sendInfo, setSendInfo] = useState<SendInfo | null>(null);
   const [infoReady, setInfoReady] = useState(false);
@@ -359,14 +414,19 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
   const [receipt, setReceipt] = useState<Receipt>(null);
   /** Task 9：**本次用户动作的 actionId**（Codex APP 原生发送的账本锚）。
    *
-   *  计划钉句「一次用户动作生成一次，双击沿同 ID，网络失败不换 ID 重发」——
-   *  用 ref 而非 useState 的原因：双击在**同一渲染帧**内会两次进入 handleSend，
-   *  useState 闭包里的旧值还是 null，两次各生成一个 ID；ref 是同步读写，第二次
-   *  点击必然命中第一次写入的同一个 ID（服务端按 actionId 去重 = 不双投）。
-   *  生命周期：首次 Codex 发送懒生成 → 终态成功（消息确认离开客户端）即清空
-   *  （下一条消息 = 新动作 = 新 ID）→ 失败/未知前失败**保留**（重试沿同 ID）→
-   *  换会话清空（动作不跨会话）。 */
+   *  计划钉句「一次用户动作生成一次，双击沿同 ID」——用 ref 而非 useState 的原因：
+   *  双击在**同一渲染帧**内会两次进入 handleSend，useState 闭包里的旧值还是 null，
+   *  两次各生成一个 ID；ref 是同步读写，第二次点击必然命中第一次写入的同一个 ID
+   *  （服务端按 actionId 去重 = 不双投）。
+   *  生命周期（R12 收口）：首次 Codex 发送懒生成 → 明确终态（accepted/codex_queued
+   *  消息确认离开客户端、not_sent/rejected 明确零投递/明确拒绝）即清空（下一条消息
+   *  = 新动作 = 新 ID；零投递沿旧 ID 重发会被服务端回放旧回执或 action_conflict）→
+   *  **unknown_delivery / 请求失败保留**（结果未知的核对锚，绝不换 ID 重投）→
+   *  正文变化（用户开始新消息）即让位 → 换会话清空（动作不跨会话）。 */
   const codexActionIdRef = useRef<string | null>(null);
+  /** R12：发送代际——每次 handleSend 开始 +1。unknown 结果的只读核对在途期间若
+   *  用户又发起新发送，旧核对结果到货时代际已过期，不再回写回执槽（不覆盖新状态） */
+  const codexSendGenRef = useRef(0);
   /** D8 完整队列表（/session-queue 的 items）：逐条渲染的数据源——不限本端发送
    *  的条目（桌面端/他端排的队同样可见可操作）。乐观行（发送即时反馈/复核保守
    *  恢复）与权威列表（挂载拉取/3s 轮询）都收敛到这里 */
@@ -535,6 +595,25 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
 
   const injectable = sendInfo !== null && sendInfo.injectable;
 
+  /** R12：unknown 结果的只读核对（**恰一次**；绝不重发 POST）。按账本查询结果呈现：
+   *  accepted → 升级「已受理」；rejected/cancelled（明确终态）→「未送达」并让位 ID；
+   *  查不到/未终态/查询失败 → 保持「投递结果未知」，actionId 保留作下一次核对锚。
+   *  代守卫：核对在途期间用户又发起发送（代际 +1）→ 迟到的核对结果作废，不覆盖新回执。 */
+  const verifyCodexDelivery = useCallback(async (actionId: string) => {
+    const gen = codexSendGenRef.current;
+    let view: Awaited<ReturnType<typeof fetchCodexAction>>;
+    try {
+      view = await fetchCodexAction(actionId);
+    } catch {
+      return; // 查询失败：保持「投递结果未知」呈现（不重发、不清 ID——下次触发再核对）
+    }
+    if (gen !== codexSendGenRef.current) return; // 已有更新的发送，旧核对结果作废
+    const r = actionViewToReceipt(actionId, view);
+    if (r === null) return; // 未终态（queued/reserved/unknown）：保持未知呈现
+    codexActionIdRef.current = null; // 核对完成（明确终态）→ ID 让位，下一条消息 = 新动作
+    setReceipt({ kind: "codex", receipt: r });
+  }, []);
+
   const handleSend = useCallback(async () => {
     const body = text.trim();
     if (!body || sending || busy || sendInfo === null || !sendInfo.injectable) return;
@@ -551,13 +630,17 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
     // actionId——旧合同逐字保持（后端对非 Codex 通道的多余键零容忍面最窄）。
     const codexApp =
       headlessChannel === "headless_codex_queue" || headlessChannel === "headless_codex_exec";
-    // 一次用户动作一个 actionId：首次发送懒生成，失败保留沿同 ID（ref 同步语义
-    // 防双击双 ID——见 codexActionIdRef 声明处注释）
+    // 一次用户动作一个 actionId：首次发送懒生成（ref 同步语义防双击双 ID——见
+    // codexActionIdRef 声明处注释）。本次发送全程使用快照 `myActionId`：分支与异常
+    // 处理都以它为锚，不受正文编辑清空 ref 的影响
     if (codexApp && codexActionIdRef.current === null) {
       codexActionIdRef.current = newActionId();
     }
+    const myActionId = codexApp ? (codexActionIdRef.current ?? undefined) : undefined;
     const startedAt = Date.now();
     setSending(true);
+    // R12：代际 +1 —— 在途的 unknown 核对结果自此作废（不覆盖本次发送的回执）
+    codexSendGenRef.current += 1;
     try {
       // ===== 丁T3 接入②：发送时刻**复探**卡片在场（§2.4 裁3 的安全面）=====
       // 挂载时探到的是快照；对话框可能在挂载之后才出现（模型提问/请求批准是回合
@@ -681,7 +764,10 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
       // 回合级发送——请求要等整个无头进程跑完。上报「发送中」给页面级回执卡（取消钮随之
       // 出现），回执到达后上报终态。判据与后端 `HeadlessKind::wire_name` 同源（单一词表）。
       // `headless` 在 try **之前**就定下来（catch 也要用——见下），起点时刻用于本地计时。
-      if (headless) {
+      // R12：**Codex APP 通道除外**——native 发送（desktop_ipc/codex_queued）不是无头
+      // 回合，若先上报 sending 而分支直接 return，父级会永久显示「无头回合进行中」+
+      // 不适用的取消钮；无头状态只在真正走 compat headless 分支时进入（终态 done 照报）。
+      if (headless && !codexApp) {
         // 无头回合的入队标志无意义（每回合 spawn，无 MAM 队列）：不随请求上送
         onHeadlessTurn?.({ phase: "sending", channel: headlessChannel });
       }
@@ -692,21 +778,35 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
         session.id,
         fullText,
         forceQueue && !headless ? true : undefined,
-        codexApp ? (codexActionIdRef.current ?? undefined) : undefined
+        myActionId
       );
       if (res.status === "desktop_ipc") {
-        // **Desktop IPC 原生回执分诊**（Task 9，S5 纪律）：
-        // - accepted：已受理——不代表 Turn 完成（Turn 终态以投影为准）；
-        // - unknown_delivery：结果未知——输入清空（消息已离开客户端，重发=双投
-        //   风险），**绝不提供重试入口**，引导回 Desktop 核对；
-        // - not_sent / rejected：保守判定零投递 / 明确拒绝——**保留正文与同一
-        //   actionId**（重试沿同 ID，服务端按 action 去重，双投不可能）。
-        if (res.receipt.delivery === "accepted" || res.receipt.delivery === "unknown_delivery") {
+        // **Desktop IPC 原生回执分诊**（Task 9，S5 纪律；R12 生命周期收口）：
+        // - accepted：已受理——不代表 Turn 完成（Turn 终态以投影为准）；消息已离开
+        //   客户端 → 输入清空 + ID 终态让位（下一条消息 = 新动作）；
+        // - unknown_delivery：结果未知——输入清空（消息可能已离开客户端，重发=双投
+        //   风险），**保留 actionId 作核对锚**并恰一次 fetchCodexAction 只读核对，
+        //   按查询结果呈现；**绝不提供重试入口、绝不自动重发**；
+        // - not_sent / rejected：明确零投递 / 明确拒绝（终态）——**清空当前 actionId**
+        //   （下一次用户动作生成新 ID：可重发且服务端不冲突——沿旧 ID 重发会被服务端
+        //   回放旧失败回执或 action_conflict，需离页才恢复的正是这个坑）；正文保留
+        //   （消息未离开客户端，重按发送即新动作）。
+        if (res.receipt.delivery === "accepted") {
           setText("");
           setAttachments([]);
           codexActionIdRef.current = null; // 终态：下一条消息 = 新动作
+        } else if (res.receipt.delivery === "unknown_delivery") {
+          setText("");
+          setAttachments([]);
+          // ID 保留（res.receipt.actionId 即本次动作）；核对结果到货后按终态升级呈现
+          void verifyCodexDelivery(res.receipt.actionId);
+        } else {
+          // not_sent / rejected：终态处理——ID 让位（明确零投递/明确拒绝后新动作不冲突）
+          codexActionIdRef.current = null;
         }
         setReceipt({ kind: "codex", receipt: res.receipt });
+        // 动作已入服务端账本（受理/未知/零投递都登记）→ 队列视图联动刷新（R11）
+        onCodexQueueMutated?.();
         return;
       }
       if (res.status === "codex_queued") {
@@ -715,6 +815,8 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
         setAttachments([]);
         codexActionIdRef.current = null; // 已入账本队列 = 离开客户端
         setReceipt({ kind: "codexQueued", position: res.position });
+        // 入队即账本变化 → 队列面板联动刷新（R11：空队列发送后不离页即可见）
+        onCodexQueueMutated?.();
         return;
       }
       if (res.status === "headless") {
@@ -734,6 +836,8 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
           receipt: res.receipt,
           visibilityNote: res.visibilityNote ?? null,
         });
+        // compat 分支的入队/消费同样是账本变化 → 队列视图联动刷新（R11）
+        if (codexApp) onCodexQueueMutated?.();
         return;
       }
       if (res.status === "delivered") {
@@ -779,12 +883,26 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
             ? e.data.reason
             : e.message
           : String(e);
+      // **R12：Codex 原生发送的请求级失败 = 投递结果未知**（网络断/500——POST 可能
+      // 已到达服务端）。绝不自动重发（换 ID 双投 / 沿同 ID 被回放旧回执都不成立）：
+      // 保留 actionId 作核对锚 + 输入清空（消息可能已离开客户端，防双投）+ 恰一次
+      // fetchCodexAction 只读核对，按查询结果呈现（查不到/未终态 = 「投递结果未知」，
+      // 引导回 Desktop 核对）。
+      if (codexApp && myActionId !== undefined) {
+        setText("");
+        setAttachments([]);
+        setReceipt({ kind: "codex", receipt: unknownDeliveryReceipt(myActionId) });
+        void verifyCodexDelivery(myActionId);
+        return;
+      }
       // **无头发送的异常必须收敛为失败终态**（复审 Important 1）：请求本身抛（网络断/
       // 开关中途关闭/500）时若只落 composer chip，页面级回执卡会永远停在「无头回合进行中…」
       // 并挂着取消钮 —— 那是一个**编造的在飞回合**（本批最要不得的那种不诚实）。
       // 回执按本地事实构造：status=failed + stage=channel_error（请求未拿到有效回执，
       // 语义与后端 channel_error 一致）+ 本地计时；**不编 tokens/assistant**。
-      if (headless) {
+      // R12：Codex APP 通道不进无头状态（见 sending 分流处）——异常以 composer 的
+      // failed chip 收敛，不构造无头回合回执。
+      if (headless && !codexApp) {
         onHeadlessTurn?.({
           phase: "done",
           receipt: {
@@ -811,6 +929,8 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
     queueOnlyNext,
     probeCardPresence,
     onHeadlessTurn,
+    onCodexQueueMutated,
+    verifyCodexDelivery,
   ]);
 
   // P2-7 失败对账（插队/撤回/修改共用）：失败后复核 /session-queue——
@@ -1452,7 +1572,15 @@ export default function MessageComposer({ session, onHeadlessTurn }: MessageComp
           aria-label="消息输入"
           value={text}
           maxLength={MAX_SEND_CHARS}
-          onChange={(e) => setText(e.target.value.slice(0, MAX_SEND_CHARS))}
+          onChange={(e) => {
+            const next = e.target.value.slice(0, MAX_SEND_CHARS);
+            setText(next);
+            // R12：正文变化检测——遗留 actionId（unknown 待核对）已不属于新正文：
+            // 用户开始的是**新消息/新动作**，旧 ID 必须让位（否则新发送沿旧 ID 被服务端
+            // 去重/回放旧回执——审计点名的 action_conflict 场景）。发送中不清（在途
+            // 动作仍属同一次用户动作，锚由本次发送的快照持有）。
+            if (next.trim().length > 0 && !sending) codexActionIdRef.current = null;
+          }}
           onPaste={handlePaste}
           rows={2}
           disabled={!injectable}
