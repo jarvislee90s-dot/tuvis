@@ -28,6 +28,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use crate::inject::normalize::compose_injection;
 use crate::services::codex_desktop_ipc::types::{
     ActionKind, ActionReceipt, ActionState, ControlRoute, Delivery, PendingAction, ThreadKey,
+    ThreadProjection,
 };
 
 use super::queue::{payload_hash, ActionPayload, ActionStore, QueuedAction, StoreError};
@@ -37,21 +38,35 @@ use super::ActionContext;
 // 派发缝与输出类型
 // ============================================================
 
-/// A 路（Desktop IPC）派发结果（[`DesktopDispatch`] 返回；生产端由 RpcOutcome 映射）
+/// A 路（Desktop IPC）派发结果（[`DesktopDispatch`] 返回；生产端由 RpcOutcome 映射）。
+/// `revision` = 回执时该 Thread 投影基线（R6.3：Turn 完成证据的严格后续判定基准；
+/// 假体/不可得为 None——释放退化为「任意新鲜 idle」口径，仅重启重建路径使用）。
 #[derive(Debug, Clone)]
 pub struct DispatchOutcome {
     pub delivery: Delivery,
     pub envelope_id: Option<String>,
     pub turn_id: Option<String>,
     pub reason_code: Option<String>,
+    pub revision: Option<u64>,
 }
 
 pub type BoxDispatchFut = Pin<Box<dyn Future<Output = DispatchOutcome> + Send>>;
+
+/// 忙态复核 future（R6.2）：实现方先取得新鲜投影（ensure 等到 snapshot）再判定。
+pub type BoxBusyFut = Pin<Box<dyn Future<Output = bool> + Send>>;
 
 /// A 路派发缝：普通消息与审批/作答共用。`thread_busy` 供路由判定「一 Thread 一
 /// active Turn」（实现方从 owner snapshot / mirror 读取，router 不持有 IPC 状态）。
 pub trait DesktopDispatch: Send + Sync {
     fn thread_busy(&self, key: &ThreadKey) -> bool;
+    /// R6.2（2026-10-17 审计）：**忙态首 snapshot**——无镜像时 `thread_busy` 恒 false
+    /// 会把首 snapshot 即 active 的 Thread 直接放行 start-turn。本方法先 ensure 新鲜
+    /// 投影（有界等待 snapshot）再复核；缺省实现退化为同步快照（假体/测试）。
+    fn busy_fresh(&self, key: &ThreadKey) -> BoxBusyFut {
+        let key = key.clone();
+        let busy = self.thread_busy(&key);
+        Box::pin(async move { busy })
+    }
     /// `composed_text` = 已组装文本（来源标记已由 router 恰好追加一次）
     fn send_text(
         &self,
@@ -204,33 +219,75 @@ impl Drop for FallbackPermit {
 // CodexControlRouter
 // ============================================================
 
+/// 本 Thread 在飞的 Turn 顺序限制（R6.3）：自 start-turn 派发起生效，绑定本动作的
+/// Turn 身份后才可能释放。`turn_id = None`（回执缺 turnId / 派发在途 / Unknown）→
+/// **保守永不自动释放**（缺 turnId 不能视为完成）。
+#[derive(Debug, Clone)]
+struct ActiveTurn {
+    action_id: String,
+    turn_id: Option<String>,
+    /// 接受回执时的投影 revision 基线：完成证据 = 新鲜投影 revision **严格大于**本基线
+    /// 且 runtime 归 idle/failed（Accepted 前后的旧 idle 更新 revision ≤ 基线，不放行）。
+    /// 重启重建时为 None → 首个新鲜投影即当前真值。
+    baseline_revision: Option<u64>,
+}
+
 /// 安全路由器。`store` 承担持久化与串行化；`dispatch` 是 A 路注入缝。
 pub struct CodexControlRouter {
     store: Arc<ActionStore>,
     dispatch: Arc<dyn DesktopDispatch>,
     /// 每 Thread 一把派发锁：send 的决策+派发串行化；permit 落账前由 guard 占住
     thread_locks: Mutex<HashMap<ThreadKey, Arc<AsyncMutex<()>>>>,
-    /// 本路由器已派发 start-turn 的 Thread（A 回执 Accepted 后 Turn 仍在跑；
-    /// flush_thread 在空闲事件时清位接力。真正 busy 判定以 dispatch.thread_busy 为准）
-    active_turns: Mutex<HashMap<ThreadKey, ()>>,
+    /// R6.3：本路由器在飞的 Turn 顺序限制（构造时从账本持久绑定重建——重启后仍等待
+    /// 原 Turn 终态；释放只由「对应 turnId 的完成证据」驱动）
+    active_turns: Mutex<HashMap<ThreadKey, ActiveTurn>>,
 }
 
 /// 队首派发结果（内部）。`FallbackReady` = 已 handoff，由调用方把 guard 装进 permit。
 enum HeadOutcome {
     Terminal(RouterOutcome),
-    FallbackReady { reason_code: String },
+    FallbackReady {
+        reason_code: String,
+    },
     Refused(ActionReceipt),
     Lost(ActionReceipt),
     DbBlocked,
+    /// R6.2：ensure 后的新鲜状态仍是忙 → 只排队（零 reserve 零派发）
+    Busy,
 }
 
 impl CodexControlRouter {
     pub fn new(store: Arc<ActionStore>, dispatch: Arc<dyn DesktopDispatch>) -> Self {
+        // R6.3：重启重建——A 路已接受且持久绑定 turn 身份的动作恢复为在飞限制
+        //（baseline None：重启后首个新鲜投影即当前真值；原 Turn 已完成 → 该投影
+        // runtime idle → 立即释放接力；仍在跑 → active 投影不放行）
+        let mut active_turns = HashMap::new();
+        match store.turn_bindings() {
+            Ok(bindings) => {
+                for b in bindings {
+                    active_turns.insert(
+                        b.key,
+                        ActiveTurn {
+                            action_id: b.action_id,
+                            turn_id: b.turn_id,
+                            baseline_revision: None,
+                        },
+                    );
+                }
+            }
+            Err(e) => log::error!("codex_control: Turn 绑定重建失败（保守按无限制）: {e}"),
+        }
+        if !active_turns.is_empty() {
+            log::info!(
+                "codex_control: 重建 {} 个 Thread 的 Turn 顺序限制",
+                active_turns.len()
+            );
+        }
         Self {
             store,
             dispatch,
             thread_locks: Mutex::new(HashMap::new()),
-            active_turns: Mutex::new(HashMap::new()),
+            active_turns: Mutex::new(active_turns),
         }
     }
 
@@ -247,11 +304,20 @@ impl CodexControlRouter {
             .clone()
     }
 
-    fn mark_active(&self, key: &ThreadKey) {
+    /// 派发起即登记顺序限制（turn 身份未知——回执 Accepted 后经 [`Self::bind_turn`]
+    /// 补绑；此间 flush 一律不放行）。
+    fn mark_active(&self, key: &ThreadKey, action_id: &str) {
         self.active_turns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), ());
+            .insert(
+                key.clone(),
+                ActiveTurn {
+                    action_id: action_id.to_string(),
+                    turn_id: None,
+                    baseline_revision: None,
+                },
+            );
     }
 
     fn clear_active(&self, key: &ThreadKey) {
@@ -261,11 +327,99 @@ impl CodexControlRouter {
             .remove(key);
     }
 
-    fn is_active(&self, key: &ThreadKey) -> bool {
+    fn is_turn_active(&self, key: &ThreadKey) -> bool {
         self.active_turns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(key)
+    }
+
+    /// R6.3：把接受回执的 Turn 身份绑定到在飞限制，并持久化（复用 codex_actions 的
+    /// compat 屏障槽位：`compat_outstanding=1 + compat_turn_id`——重启后由
+    /// `Router::new` 重建，队列视图以 blockedReason 如实说明）。缺 turnId 只保留内存
+    /// 限制（保守不释放、不虚称可核对）。
+    fn bind_turn(&self, key: &ThreadKey, receipt: &ActionReceipt, baseline: Option<u64>) {
+        {
+            let mut turns = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+            match turns.get_mut(key) {
+                Some(t) if t.action_id == receipt.action_id => {
+                    t.turn_id = receipt.turn_id.clone();
+                    t.baseline_revision = baseline;
+                }
+                _ => {
+                    turns.insert(
+                        key.clone(),
+                        ActiveTurn {
+                            action_id: receipt.action_id.clone(),
+                            turn_id: receipt.turn_id.clone(),
+                            baseline_revision: baseline,
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(turn_id) = receipt.turn_id.as_deref() {
+            if let Err(e) = self
+                .store
+                .set_compat_fence(&receipt.action_id, None, Some(turn_id))
+            {
+                // 持久化失败：内存限制仍在（本进程内不放行）；重启后限制丢失——如实记录
+                log::error!(
+                    "codex_control: Turn 绑定持久化失败 action={} turn={turn_id} err={e}",
+                    receipt.action_id
+                );
+            }
+        }
+    }
+
+    /// R6.3：投影驱动的 Turn 终态释放。完成证据（全部满足才 clear）：
+    /// ① 投影新鲜（非 stale——断线/owner 换代的 stale 投影不释放，限制保留）；
+    /// ② 绑定了 turnId（缺 turnId 保守不释放）；
+    /// ③ runtime 归 idle/failed（Turn 终态）；
+    /// ④ revision 严格大于接受回执时的基线（Accepted 前后的旧 idle 更新不放行；
+    ///    重启重建 baseline=None → 首个新鲜投影即当前真值）。
+    /// 返回是否发生了释放（调用方据此接力 flush）。
+    pub fn release_turn_if_complete(&self, key: &ThreadKey, p: &ThreadProjection) -> bool {
+        let Some(t) = self
+            .active_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+        else {
+            return false;
+        };
+        if p.stale {
+            return false;
+        }
+        if t.turn_id.is_none() {
+            return false;
+        }
+        let Some(rev) = p.revision else {
+            return false;
+        };
+        let after_start = match t.baseline_revision {
+            Some(base) => rev > base,
+            None => true,
+        };
+        if !(after_start && matches!(p.runtime_status.as_str(), "idle" | "failed")) {
+            return false;
+        }
+        // 清持久屏障（Accepted 终态允许；失败保守保留限制）
+        if let Err(e) = self.store.clear_compat_fence(&t.action_id) {
+            log::error!(
+                "codex_control: Turn 完成后清屏障失败 action={} err={e}",
+                t.action_id
+            );
+            return false;
+        }
+        self.clear_active(key);
+        log::info!(
+            "codex_control: Turn 终态证据齐备，释放顺序限制 action={} turn={:?}",
+            t.action_id,
+            t.turn_id
+        );
+        true
     }
 
     /// 普通消息。`queue_only` 持久排队不派发。
@@ -302,12 +456,12 @@ impl CodexControlRouter {
             return queued_outcome(&ctx.action_id, &view);
         }
         let guard = self.lock_arc(&ctx.key).lock_owned().await;
-        // 兼容 fence 在册（前一条兜底未核对完成）→ 只排队
+        // 兼容 fence 在册（前一条兜底未核对完成 / R6.3 Turn 顺序绑定持久槽）→ 只排队
         if self.store.has_compat_fence(&ctx.key).unwrap_or(true) {
             return queued_outcome(&ctx.action_id, &view);
         }
-        // 忙 Thread 留队（不抢占正在运行的 Turn）
-        if self.dispatch.thread_busy(&ctx.key) || self.is_active(&ctx.key) {
+        // R6.3：在飞 Turn 顺序限制在册 → 只排队（释放只由完成证据驱动）
+        if self.is_turn_active(&ctx.key) {
             return queued_outcome(&ctx.action_id, &view);
         }
         // FIFO：只有队首才能派发（新消息不得越过既有排队）
@@ -322,6 +476,11 @@ impl CodexControlRouter {
         if head.ctx.action_id != ctx.action_id {
             return queued_outcome(&ctx.action_id, &view);
         }
+        // R6.2：派发前先取新鲜投影复核忙态（busy_fresh 内部 ensure 等 snapshot——
+        // 无镜像/未跟随不再误判空闲）
+        if self.dispatch.busy_fresh(&ctx.key).await {
+            return queued_outcome(&ctx.action_id, &view);
+        }
         match self.dispatch_head(&head).await {
             HeadOutcome::Terminal(o) => o,
             HeadOutcome::FallbackReady { reason_code } => RouterOutcome::UseFallback {
@@ -330,6 +489,8 @@ impl CodexControlRouter {
             },
             HeadOutcome::Refused(r) | HeadOutcome::Lost(r) => RouterOutcome::Completed(r),
             HeadOutcome::DbBlocked => not_sent_completed(&ctx.action_id, "store_error"),
+            // 最终复核仍忙：只排队（reserve 尚未发生，账本无残留）
+            HeadOutcome::Busy => queued_outcome(&ctx.action_id, &view),
         }
     }
 
@@ -396,34 +557,65 @@ impl CodexControlRouter {
             let _ = self.store.finish(&receipt);
             return RouterOutcome::Completed(receipt);
         }
-        let outcome = self
-            .dispatch
-            .respond(&ctx.key, &request_key, &context_token, &action)
-            .await;
-        let receipt = ActionReceipt {
-            action_id: ctx.action_id.clone(),
-            delivery: outcome.delivery,
-            route: ControlRoute::DesktopIpc,
-            turn_id: outcome.turn_id,
-            envelope_id: outcome.envelope_id,
-            reason_code: outcome.reason_code,
+        // R9.2（2026-10-17 审计）：A 路派发交**独立 tokio 任务**持有至结果落账——
+        // HTTP 等待者断开/中止不影响落账（任务自身 finish，绝不永久 Reserved）。
+        let dispatch = self.dispatch.clone();
+        let store = self.store.clone();
+        let key = ctx.key.clone();
+        let request_key2 = request_key.clone();
+        let context_token2 = context_token.clone();
+        let action2 = action.clone();
+        let action_id = ctx.action_id.clone();
+        let task = tokio::spawn(async move {
+            let outcome = dispatch
+                .respond(&key, &request_key2, &context_token2, &action2)
+                .await;
+            let receipt = ActionReceipt {
+                action_id: action_id.clone(),
+                delivery: outcome.delivery,
+                route: ControlRoute::DesktopIpc,
+                turn_id: outcome.turn_id,
+                envelope_id: outcome.envelope_id,
+                reason_code: outcome.reason_code,
+            };
+            // R9.3：终态持久化失败不对外虚称完成——保持 reserved（重启 recover 成
+            // unknown），回执以 unknown 口径如实上报。
+            let persisted = store.finish(&receipt).is_ok();
+            (receipt, persisted)
+        });
+        let (receipt, persisted) = match task.await {
+            Ok(v) => v,
+            Err(e) => {
+                // 派发任务被 runtime 丢弃：结果未知、状态停在 reserved（重启恢复 unknown）
+                log::error!(
+                    "codex_control: 审批派发任务异常（结果未知）action={} err={e}",
+                    ctx.action_id
+                );
+                return not_sent_completed(&ctx.action_id, "dispatch_task_lost");
+            }
         };
-        if let Err(e) = self.store.finish(&receipt) {
+        if !persisted {
             log::error!(
-                "codex_control: 审批落账失败 action={} err={e}",
+                "codex_control: 审批落账失败（保持 reserved，重启恢复 unknown）action={}",
                 ctx.action_id
             );
+            return RouterOutcome::Completed(unpersisted_unknown(&receipt));
         }
         RouterOutcome::Completed(receipt)
     }
 
     /// 空闲接力（hub 在空闲事件 / 周期对账时调用；HTTP 路径同样消费其 UseFallback）。
-    /// 未取得可派发队首返回 None：忙态、fence 在册、队列空、permit 在外（try-lock
-    /// 让路不等待）、队首被拒/被撤时跳过继续。
+    /// 未取得可派发队首返回 None：Turn 顺序限制在册、忙态、fence 在册、队列空、
+    /// permit 在外（try-lock 让路不等待）、队首被拒/被撤时跳过继续。
+    /// **R6.3：本方法不再无条件清顺序限制**——释放只经 [`Self::release_turn_if_complete`]
+    /// （hub 在投影/对账驱动时先调用它）。
     pub async fn flush_thread(&self, key: &ThreadKey) -> Option<RouterOutcome> {
         // try-lock：前一条兜底 permit 未落账（guard 在外）时直接让路
         let guard = self.lock_arc(key).try_lock_owned().ok()?;
-        self.clear_active(key);
+        // R6.3：Turn 顺序限制在册（含重启重建）→ 不接力
+        if self.is_turn_active(key) {
+            return None;
+        }
         if self.store.has_compat_fence(key).unwrap_or(true) {
             return None;
         }
@@ -452,12 +644,21 @@ impl CodexControlRouter {
                 // 并发撤回赢者已处理：跳过
                 HeadOutcome::Lost(_) => continue,
                 HeadOutcome::DbBlocked => return None,
+                // 最终复核仍忙：留队等下一事件
+                HeadOutcome::Busy => return None,
             }
         }
     }
 
-    /// 队首派发（reserve → 设备复核 → compose 恰好一次 → A 路派发 → 落账/交接）。
+    /// 队首派发（busy 复核 → reserve → 设备复核 → compose 恰好一次 → A 路独立任务
+    /// 派发 → 落账/交接）。R9.2：派发在独立 tokio 任务内持有至落账，HTTP 等待者
+    /// 断开不影响落账。
     async fn dispatch_head(&self, head: &QueuedAction) -> HeadOutcome {
+        // R6.2：最后派发前以 ensure 后的新鲜状态复核 busy（不是旧快照）；busy →
+        // 入队（reserve 尚未发生，账本零残留）
+        if self.dispatch.busy_fresh(&head.ctx.key).await {
+            return HeadOutcome::Busy;
+        }
         // reserve CAS（与审计起始行同事务；DB 失败零投递）
         match self
             .store
@@ -496,58 +697,121 @@ impl CodexControlRouter {
                 return HeadOutcome::Refused(receipt);
             }
         };
-        self.mark_active(&head.ctx.key);
-        let outcome = self
-            .dispatch
-            .send_text(
-                &head.ctx.key,
-                &head.ctx.action_id,
-                &composed,
-                &head.client_message_id,
-            )
-            .await;
-        let reason = outcome
+        // R6.3：顺序限制自派发起生效（turn 身份回执后补绑；此间 flush 不放行）
+        self.mark_active(&head.ctx.key, &head.ctx.action_id);
+        // R9.2：独立任务持有派发至结果——终态在本任务内落账（R9.3：持久化失败不虚称
+        // 完成，保持 reserved→重启 recover 成 unknown）；NotSent 的交接判定留在调用方
+        //（permit/guard 语义在 router）。
+        let dispatch = self.dispatch.clone();
+        let store = self.store.clone();
+        let head2 = head.clone();
+        let composed2 = composed;
+        let task = tokio::spawn(async move {
+            let outcome = dispatch
+                .send_text(
+                    &head2.ctx.key,
+                    &head2.ctx.action_id,
+                    &composed2,
+                    &head2.client_message_id,
+                )
+                .await;
+            let receipt = ActionReceipt {
+                action_id: head2.ctx.action_id.clone(),
+                delivery: outcome.delivery,
+                route: ControlRoute::DesktopIpc,
+                turn_id: outcome.turn_id,
+                envelope_id: outcome.envelope_id,
+                reason_code: outcome.reason_code,
+            };
+            // NotSent = writer 未尝试写（保守零投递）：留给 router 走交接判定，不落账
+            let persisted = if receipt.delivery == Delivery::NotSent {
+                true
+            } else {
+                store.finish(&receipt).is_ok()
+            };
+            (head2, receipt, outcome.revision, persisted)
+        });
+        let (head, receipt, revision, persisted) = match task.await {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!(
+                    "codex_control: 派发任务异常（结果未知）action={} err={e}",
+                    head.ctx.action_id
+                );
+                return HeadOutcome::DbBlocked;
+            }
+        };
+        let reason = receipt
             .reason_code
             .clone()
             .unwrap_or_else(|| "ipc_unavailable".to_string());
-        let receipt = ActionReceipt {
-            action_id: head.ctx.action_id.clone(),
-            delivery: outcome.delivery,
-            route: ControlRoute::DesktopIpc,
-            turn_id: outcome.turn_id,
-            envelope_id: outcome.envelope_id,
-            reason_code: outcome.reason_code,
-        };
         match receipt.delivery {
             // writer 未尝试写（保守零投递）→ 允许兼容兜底：CAS 交接恰好一次
-            Delivery::NotSent => match self.store.handoff_not_sent(&head.ctx.action_id) {
-                Ok(true) => HeadOutcome::FallbackReady {
-                    reason_code: reason,
-                },
-                handoff => {
-                    if let Err(e) = handoff {
-                        log::error!(
-                            "codex_control: 交接失败 action={} err={e}",
-                            head.ctx.action_id
+            Delivery::NotSent => {
+                // 无 Turn 产生：顺序限制解除（permit/交接后的闸由 fence 承担）
+                self.clear_active(&head.ctx.key);
+                match self.store.handoff_not_sent(&head.ctx.action_id) {
+                    Ok(true) => HeadOutcome::FallbackReady {
+                        reason_code: reason,
+                    },
+                    handoff => {
+                        if let Err(e) = handoff {
+                            log::error!(
+                                "codex_control: 交接失败 action={} err={e}",
+                                head.ctx.action_id
+                            );
+                        }
+                        let receipt = not_sent_receipt(
+                            &head.ctx.action_id,
+                            ControlRoute::DesktopIpc,
+                            &reason,
                         );
+                        let _ = self.store.finish(&receipt);
+                        HeadOutcome::Terminal(RouterOutcome::Completed(receipt))
                     }
-                    let receipt =
-                        not_sent_receipt(&head.ctx.action_id, ControlRoute::DesktopIpc, &reason);
-                    let _ = self.store.finish(&receipt);
-                    HeadOutcome::Terminal(RouterOutcome::Completed(receipt))
                 }
-            },
-            // Accepted / Rejected / UnknownDelivery：落账、绝不触发 fallback
+            }
+            // Accepted / Rejected / UnknownDelivery：任务内已落账（R9.2）
             _ => {
-                if let Err(e) = self.store.finish(&receipt) {
+                if !persisted {
+                    // R9.3：终态持久化失败——不对外虚称完成，保持 reserved（下次
+                    // recover 成 unknown），顺序限制**不释放**
                     log::error!(
-                        "codex_control: 落账失败 action={} err={e}",
+                        "codex_control: 落账失败（保持 reserved）action={}",
                         head.ctx.action_id
                     );
+                    return HeadOutcome::Terminal(RouterOutcome::Completed(unpersisted_unknown(
+                        &receipt,
+                    )));
+                }
+                match receipt.delivery {
+                    // R6.3：Accepted 绑定并持久化本 Turn 身份（缺 turnId 保守不释放）
+                    Delivery::Accepted => {
+                        self.bind_turn(&head.ctx.key, &receipt, revision);
+                    }
+                    // Rejected = 明确拒绝（无 Turn 产生）；Unknown = 结果未知——
+                    // 限制按保守语义处理：Rejected 解除；Unknown 保留（无 turnId
+                    // 证据，不自动放行第二条，避免双跑 Turn）
+                    Delivery::Rejected => self.clear_active(&head.ctx.key),
+                    Delivery::UnknownDelivery => {}
+                    Delivery::NotSent => unreachable!("NotSent 已在上方处理"),
                 }
                 HeadOutcome::Terminal(RouterOutcome::Completed(receipt))
             }
         }
+    }
+}
+
+/// R9.3：终态持久化失败的如实回执——账本仍是 reserved，回执按 unknown_delivery 口径
+/// 上报（绝不虚称 accepted/rejected），重启后 recover 成 unknown。
+fn unpersisted_unknown(persisted_attempt: &ActionReceipt) -> ActionReceipt {
+    ActionReceipt {
+        action_id: persisted_attempt.action_id.clone(),
+        delivery: Delivery::UnknownDelivery,
+        route: persisted_attempt.route,
+        turn_id: persisted_attempt.turn_id.clone(),
+        envelope_id: persisted_attempt.envelope_id.clone(),
+        reason_code: Some("finish_persist_failed".to_string()),
     }
 }
 

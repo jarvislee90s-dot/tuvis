@@ -1134,10 +1134,6 @@ const APP_FORM_NO_REPOST_REASON: &str =
 /// 上项审计 result（拒绝行照落——与 L13 投递路拒绝同族，对账本可查）
 const APP_FORM_NO_REPOST_AUDIT_RESULT: &str = "refused:app_form_no_repost";
 
-/// 问答补投的引导文案（Task 6b，裁决 28b）：补投只证明「消息已投出」，不证明
-/// 「已作答」——题面勾选态以 APP 实况为准（设计 §3.6 卡面权威源），永不声称已作答
-const CODEX_APP_REPOST_NOTE: &str = "已补投为消息，请回 APP 核对题面";
-
 /// **Task 8：A 可写投影下阻断旧补投的引导文案**（码前缀走主错误码机制，locale
 /// 键 `errors.codexIpcNativeOnly` zh/en 双键；消费方经 formatInvokeError 按码替换）。
 const CODEX_IPC_NATIVE_ONLY_REASON: &str = "CODEX_IPC_NATIVE_ONLY: 该 Codex 会话已支持原生远程控制，问答与审批请使用原生卡片（自然语言补投不再受理）";
@@ -3197,13 +3193,14 @@ pub async fn session_send(
     };
     // ④ Codex APP → Desktop IPC control hub（Task 8）：**必须在 H3 门之前交给
     //    hub——只有兼容分支受 H3**（A 可用时 H3 关闭不挡 IPC）。判据：codex APP 形态
-    //    ∧ hub 生产可用（build 能力已验证）∧ thread 可解析。hub 分支内自管 actionId
-    //    契约 / desktop_ipc/codex_queued 回执 / 兜底交接（兜底分支内部再受 H3）。
-    //    非Codex APP、hub 不可用（disabled / build 未验证）或 thread 不可解析的会话
-    //    走既有 ④⑤ 路径（H3 门 + 兼容分派），CLI 与其他工具合同零改动。
-    let hub_route = codex_app_form(&session)
-        && st.codex_control.ipc_available()
-        && super::codex_ipc::resolve_session_thread(&st, &session).is_some();
+    //    ∧ thread 可解析。hub 分支内自管 actionId 契约 / desktop_ipc/codex_queued 回执
+    //    / 兜底交接（兜底分支内部再受 H3）。
+    //    **R8（2026-10-17 审计，spec F7/S5）：所有 Codex APP 普通消息一律进统一
+    //    router，不论 A 可用与否**——未知 build/未跟随/桌面不可达也先经
+    //    登记→reserve→NotSent→UseFallback→compat，不得绕过持久去重与 compat fence
+    //    直调旧 helper；仅普通消息可经 H3 兜底。非 Codex APP 或 thread 不可解析的
+    //    会话走既有 ④⑤ 路径，CLI 与其他工具合同零改动。
+    let hub_route = codex_app_form(&session);
     if hub_route {
         let action_id = req
             .action_id
@@ -7540,13 +7537,11 @@ pub async fn session_question(
     };
     let (questions, source, tool_id, session_pid) = match scan {
         Some((session, hit)) => {
-            // **Task 8：A 可写投影的 Codex APP 会话不再把陈旧 rollout 问题广告为可处理
-            // 原生卡**——rollout 读侧天然滞后于 owner 实况，有 A 投影时返回不支持态
-            //（questions 空 + answerable:false + nativeOnly 标记）；移动端有投影时本就
-            // 渲染原生卡，此态是旧客户端/降级路径的能力诚实面。无投影/不可写档照旧。
-            if codex_app_form(&session)
-                && super::codex_ipc::native_projection_live(&st, &session).await
-            {
+            // **R8（2026-10-17 审计，spec F7/S5）：Codex APP 的 rollout 问答 GET 广告
+            // 无条件 native_only**——stale/无 owner/未知 build 也不再把陈旧 rollout
+            // 问题广告为可补投（旧问答文本补投已无条件阻断，广告必须与投递面同口径）；
+            // 原生端点（/codex/pending-response）是唯一正路。CLI/其他工具照旧。
+            if codex_app_form(&session) {
                 return json_no_store(
                     StatusCode::OK,
                     serde_json::json!({
@@ -7910,8 +7905,11 @@ pub use crate::inject::timing::QUESTION_STAGE_POLL_TOTAL_MS;
 
 /// `session_question_answer` 会话定位 + 双通道复核的分支产物（Task 6b 双臂）：
 /// [`AnswerLookup::Terminal`] = CLI 键序面（固化不动——会话 + 静态/阶段机序列）；
-/// [`AnswerLookup::AppRepost`] = codex APP 补投臂（模板三型组装完的作答文本，分派
-/// 经 H8 queue 通道——**不走协议面，无 Task 7 探测门**）。端点契约见 fn 文档
+/// [`AnswerLookup::AppRepost`] = codex APP 补投臂（R8 起补投**无条件阻断**，本变体
+/// 仅承载拒绝面要引用的作答文本）。端点契约见 fn 文档
+// allow：Terminal 臂载荷为既有固化面（会话+序列+载荷原文），AppRepost 臂 R8 后只剩
+// 文本——尺寸差是设计结果，短命栈值不值得装箱引入跨臂所有权摩擦。
+#[allow(clippy::large_enum_variant)]
 enum AnswerLookup {
     /// CLI 键序面（固化不动）：会话 + 静态/阶段机序列与既有载荷
     Terminal {
@@ -7925,11 +7923,9 @@ enum AnswerLookup {
         expected_idx: Option<usize>,
         q_idx: usize,
     },
-    /// codex APP 补投臂：模板三型组装完的作答文本（分派经 H8 queue 通道）
-    AppRepost {
-        session: crate::session::Session,
-        text: String,
-    },
+    /// codex APP 补投臂：模板三型组装完的作答文本（R8：补投已无条件阻断——
+    /// 503 capability_unavailable + 审计留痕，本变体仅承载拒绝面要引用的文本）
+    AppRepost { text: String },
 }
 
 /// POST /m/api/v1/session-question/answer（T8 问答应答；**丁T5 起提交/自由作答走阶段机**）：
@@ -8065,7 +8061,7 @@ pub async fn session_question_answer(
                 free_text_for_lookup.as_deref(),
                 q,
             )?;
-            return Ok(AnswerLookup::AppRepost { session, text });
+            return Ok(AnswerLookup::AppRepost { text });
         }
         let tool_id = session.agent_type.tool_id();
         // 「结论不超证据」→ 批次戊 E4-E6 + 2026-09-24 更新：kimi（K-5 数字直选+自动
@@ -8218,58 +8214,31 @@ pub async fn session_question_answer(
         expected_idx,
         q_idx,
     ) = match lookup {
-        Ok(AnswerLookup::AppRepost { session, text }) => {
-            // **Task 8：A 可写投影的 Codex APP 会话阻断补投**（能力诚实：原生问答绝不
-            // 走 queue 文本补投）——原生端点（/codex/pending-response）是唯一正路，
-            // 503 + 引导码；无投影 / 不可写档（compat 场景）保持既有补投路径不重构。
-            if super::codex_ipc::native_projection_live(&st, &session).await {
-                endpoint_audit(
-                    &st,
-                    &device_id,
-                    &device_name,
-                    "codex",
-                    &sid,
-                    &text,
-                    "answer",
-                    "refused:native_only",
-                );
-                return json_no_store(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    serde_json::json!({
-                        "error": "capability_unavailable",
-                        "reasonCode": "native_only",
-                        "reason": CODEX_IPC_NATIVE_ONLY_REASON,
-                    }),
-                );
-            }
-            // H3 同门（Task 6b：question 写路径与 session_send 同码同文案；CLI 问答
-            // 不受门——helper 内判 codex_app_form）
-            if let Some(resp) = codex_app_protocol_h3_blocked(&st, &session) {
-                return resp;
-            }
-            // 经 H8 queue 通道补投（复用 codex 分派全套：thread UUID 单点/花名白名单/
-            // 串行锁/版本门/审计——action=answer、channel=实际走向）。回执在封套上
-            // 追加 `screen:null`（与 6a GET 臂 surface/degraded 同族的**显式 null**
-            // 载荷——补投不产屏读快照，前端不得显示已翻转）+ 引导文案（只对消息
-            // 确实投出去的回执附——failed/refused 自带原因，不叠加「已补投」字样
-            // 免得谎报送达）
-            let mut envelope = codex_headless_dispatch_envelope(
+        Ok(AnswerLookup::AppRepost { text }) => {
+            // **R8（2026-10-17 审计，spec F7/S5）：Codex APP 旧问答文本补投无条件阻断**
+            // ——stale/无 owner/未知 build 一律拒绝（capability_unavailable 语义），
+            // 不再退回 AppRepost 通道（那会绕过统一 router 的持久去重与 compat 纪律，
+            // 且补投「答案文本」会被 APP 当新消息）；原生端点（/codex/pending-response）
+            // 是唯一正路。拒绝臂留审计（与既有投递前拒绝同族）；**零 IPC 写、零
+            // queue/exec 投递**。CLI/其他工具的问答键序面（Terminal 臂）零改动。
+            endpoint_audit(
                 &st,
                 &device_id,
                 &device_name,
-                &session,
+                "codex",
+                &sid,
                 &text,
                 "answer",
-            )
-            .await;
-            envelope["screen"] = serde_json::Value::Null;
-            if matches!(
-                envelope["receipt"]["status"].as_str(),
-                Some("ok") | Some("queued")
-            ) {
-                envelope["note"] = serde_json::json!(CODEX_APP_REPOST_NOTE);
-            }
-            return json_no_store(StatusCode::OK, envelope);
+                "refused:native_only",
+            );
+            return json_no_store(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "error": "capability_unavailable",
+                    "reasonCode": "native_only",
+                    "reason": CODEX_IPC_NATIVE_ONLY_REASON,
+                }),
+            );
         }
         Ok(AnswerLookup::Terminal {
             session,

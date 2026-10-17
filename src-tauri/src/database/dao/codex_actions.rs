@@ -215,25 +215,31 @@ pub(crate) fn insert_action_conn(
     get_row(conn, action_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
-/// 某会话 FIFO 队首（seq 升序第一条 queued；**按 seq 不按时间戳**）
+/// 某会话 FIFO 队首（seq 升序第一条 queued；**按 seq 不按时间戳**）。
+/// R6.1（2026-10-17 审计）：普通消息 FIFO **只收 `kind='send'`**——审批/回答在
+/// register→reserve 之间（或审计 INSERT 失败回滚后）残留 queued 的交互行不得被
+/// 调度器当普通消息取走（交互有自己的失败/提交生命周期）。
 pub(crate) fn next_queued_conn(
     conn: &Connection,
     thread_id: &str,
 ) -> rusqlite::Result<Option<ActionRow>> {
     let sql = format!(
         "SELECT {COLS} FROM codex_actions WHERE thread_id = ?1 AND state = 'queued' \
+         AND kind = 'send' \
          ORDER BY seq ASC LIMIT 1"
     );
     conn.query_row(&sql, [thread_id], row_action).optional()
 }
 
-/// 某会话全部 queued（seq 升序；position 计算与 list_queued 共用本函数）
+/// 某会话全部 queued **普通消息**（seq 升序；position 计算与 list_queued 共用本函数；
+/// R6.1 同 `next_queued_conn` 只收 `kind='send'`，队列位置视图与调度器同源）。
 pub(crate) fn queued_for_thread_conn(
     conn: &Connection,
     thread_id: &str,
 ) -> rusqlite::Result<Vec<ActionRow>> {
     let sql = format!(
         "SELECT {COLS} FROM codex_actions WHERE thread_id = ?1 AND state = 'queued' \
+         AND kind = 'send' \
          ORDER BY seq ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -481,6 +487,84 @@ pub(crate) fn has_compat_fence_conn(conn: &Connection, thread_id: &str) -> rusql
         |r| r.get(0),
     )?;
     Ok(n > 0)
+}
+
+/// **原子** compat 派发屏障（R9.1，2026-10-17 审计）：fence 与只读核对证据在**同一条
+/// UPDATE** 内持久化（单语句原子性）——持久化成功是 compat bridge 调用真实 helper 的
+/// 前提；写失败时 helper 不被调用，动作如实落账。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn set_compat_dispatch_barrier_conn(
+    conn: &Connection,
+    action_id: &str,
+    message_id: Option<&str>,
+    turn_id: Option<&str>,
+    rollout_path: Option<&str>,
+    rollout_baseline: Option<u64>,
+    wire_hash: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE codex_actions SET compat_outstanding = 1, compat_message_id = ?2, \
+             compat_turn_id = ?3, compat_rollout_path = ?4, compat_rollout_baseline = ?5, \
+             compat_wire_hash = ?6, updated_at = ?7 \
+         WHERE action_id = ?1",
+        params![
+            action_id,
+            message_id,
+            turn_id,
+            rollout_path,
+            rollout_baseline.map(|v| v as i64),
+            wire_hash,
+            now_ms
+        ],
+    )?;
+    Ok(())
+}
+
+/// 有待发工作的 thread（hub 启动恢复 / 周期对账的枚举输入，R7.1/R7.2）：
+/// 有 queued 普通消息 **或** 未清 compat 屏障（含 R6.3 的 Turn 顺序绑定）的 thread。
+/// 空集合 = 单条 EXISTS 查询，零额外开销。
+pub(crate) fn threads_with_pending_work_conn(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT thread_id FROM codex_actions \
+         WHERE compat_outstanding = 1 \
+            OR (state = 'queued' AND kind = 'send') \
+         ORDER BY thread_id ASC",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// 某 thread 是否有待发工作（引用计数挤出保护，R7.3：有 queued 待发/在册屏障的
+/// thread 永不被 unfollow 挤出）。
+pub(crate) fn thread_has_pending_work_conn(
+    conn: &Connection,
+    thread_id: &str,
+) -> rusqlite::Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM codex_actions WHERE thread_id = ?1 \
+         AND (compat_outstanding = 1 OR (state = 'queued' AND kind = 'send'))",
+        [thread_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// R6.3 Turn 顺序绑定行（重启后路由器内存重建的输入）：A 路（desktop_ipc）已接受、
+/// 屏障在册且**绑定了 turn 身份**的动作——`compat_outstanding=1 ∧ route='desktop_ipc'
+/// ∧ state='accepted' ∧ compat_turn_id IS NOT NULL`。`compat_turn_id` 复用为本次 Turn
+/// 身份的持久槽位（计划允许复用该列）；缺 turn 身份的残留屏障不算绑定（队列由屏障
+/// 检查保守闸住，缺 turnId 不视为可完成）。
+pub(crate) fn turn_binding_rows_conn(conn: &Connection) -> rusqlite::Result<Vec<ActionRow>> {
+    let sql = format!(
+        "SELECT {COLS} FROM codex_actions \
+         WHERE compat_outstanding = 1 AND route = 'desktop_ipc' AND state = 'accepted' \
+           AND compat_turn_id IS NOT NULL \
+         ORDER BY seq ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_action)?;
+    rows.collect()
 }
 
 /// 读取该 Thread 全部在册 fence（seq 序；reconcile 只读核对的输入）
@@ -793,5 +877,108 @@ mod tests {
         assert_eq!(fences[0].rollout_path.as_deref(), Some("/tmp/r.jsonl"));
         assert_eq!(fences[0].rollout_baseline, Some(4096));
         assert_eq!(fences[0].wire_hash.as_deref(), Some("deadbeef"));
+    }
+
+    /// R6.1：next_queued/queued_for_thread 只收 kind='send'——交互行（user_input）
+    /// 残留 queued 不被调度查询取走。
+    #[test]
+    fn dequeue_queries_only_take_send_rows() {
+        let c = mem();
+        // 交互行在先（seq 更小）：register→reserve 之间 / 审计回滚后的残留形态
+        insert_action_conn(
+            &c,
+            "i-1",
+            "dev-1",
+            "iPhone",
+            THREAD,
+            "user_input",
+            Some("n:7"),
+            Some("t"),
+            "h",
+            None,
+            "cm-i",
+            1000,
+        )
+        .unwrap();
+        insert(&c, "s-1", Some("甲"), 1001);
+        let head = next_queued_conn(&c, THREAD).unwrap().unwrap();
+        assert_eq!(head.action_id, "s-1", "队首跳过交互行");
+        let ids: Vec<String> = queued_for_thread_conn(&c, THREAD)
+            .unwrap()
+            .iter()
+            .map(|r| r.action_id.clone())
+            .collect();
+        assert_eq!(ids, vec!["s-1"], "队列列表只含普通消息");
+    }
+
+    /// R9.1：原子派发屏障单语句写全 fence+证据；pending-work / turn-binding 枚举。
+    #[test]
+    fn atomic_barrier_and_pending_work_enumeration() {
+        let c = mem();
+        insert(&c, "a", Some("甲"), 1000);
+        assert!(
+            !threads_with_pending_work_conn(&c).unwrap().is_empty(),
+            "queued send 即待发工作"
+        );
+        assert!(thread_has_pending_work_conn(&c, THREAD).unwrap());
+        reserve_conn(&c, "a", ControlRoute::DesktopIpc, 2000).unwrap();
+        // reserved 后无 queued：无屏障 → 无待发工作
+        assert!(!thread_has_pending_work_conn(&c, THREAD).unwrap());
+        // 原子屏障：fence+证据一条 UPDATE
+        set_compat_dispatch_barrier_conn(
+            &c,
+            "a",
+            Some("m1"),
+            None,
+            Some("/tmp/r.jsonl"),
+            Some(64),
+            Some("wh"),
+            2100,
+        )
+        .unwrap();
+        let row = get_row(&c, "a").unwrap().unwrap();
+        assert!(row.compat_outstanding);
+        assert_eq!(row.compat_message_id.as_deref(), Some("m1"));
+        assert_eq!(row.compat_rollout_baseline, Some(64));
+        assert!(
+            thread_has_pending_work_conn(&c, THREAD).unwrap(),
+            "屏障在册即待发工作"
+        );
+        // 派发屏障 ≠ Turn 绑定（route=desktop_ipc 且 accepted 才算）
+        assert!(turn_binding_rows_conn(&c).unwrap().is_empty());
+        let receipt = ActionReceipt {
+            action_id: "a".into(),
+            delivery: Delivery::Accepted,
+            route: ControlRoute::DesktopIpc,
+            turn_id: Some("t-1".into()),
+            envelope_id: None,
+            reason_code: None,
+        };
+        finish_conn(&c, &receipt, 3000).unwrap();
+        // Accepted 不清屏障（Turn 未证完成）→ 仍待发工作；route/状态合turn绑定形
+        assert!(thread_has_pending_work_conn(&c, THREAD).unwrap());
+        let bindings = turn_binding_rows_conn(&c).unwrap();
+        assert_eq!(bindings.len(), 0, "fence 未绑定 turn id 不算 Turn 绑定");
+        // 绑定 turn id（复用 compat_turn_id 槽位）→ turn binding 枚举命中
+        set_compat_dispatch_barrier_conn(
+            &c,
+            "a",
+            Some("m1"),
+            Some("t-1"),
+            Some("/tmp/r.jsonl"),
+            Some(64),
+            Some("wh"),
+            3100,
+        )
+        .unwrap();
+        let bindings = turn_binding_rows_conn(&c).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].action_id, "a");
+        assert_eq!(bindings[0].compat_turn_id.as_deref(), Some("t-1"));
+        // 清屏障后不再枚举
+        clear_compat_fence_conn(&c, "a", 3200).unwrap();
+        assert!(turn_binding_rows_conn(&c).unwrap().is_empty());
+        assert!(!thread_has_pending_work_conn(&c, THREAD).unwrap());
+        assert!(threads_with_pending_work_conn(&c).unwrap().is_empty());
     }
 }

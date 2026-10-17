@@ -205,7 +205,6 @@ mod tests {
             build: None,
         };
 
-
         let sv = tokio::spawn(async move {
             server.connect().await?;
             let (mut r, mut w) = tokio::io::split(server);

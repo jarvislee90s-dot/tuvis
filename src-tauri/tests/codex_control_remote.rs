@@ -84,6 +84,18 @@ impl FakeDispatch {
             envelope_id: Some("env-1".into()),
             turn_id: Some("turn-1".into()),
             reason_code: None,
+            revision: None,
+        })
+    }
+
+    /// Accepted + 指定回执 turnId 与投影 revision 基线（R6.3 完成证据判定用）。
+    fn accepted_turn(turn_id: &str, revision: Option<u64>) -> Self {
+        Self::new(DispatchOutcome {
+            delivery: Delivery::Accepted,
+            envelope_id: Some("env-1".into()),
+            turn_id: Some(turn_id.into()),
+            reason_code: None,
+            revision,
         })
     }
 
@@ -93,6 +105,7 @@ impl FakeDispatch {
             envelope_id: Some("env-2".into()),
             turn_id: None,
             reason_code: Some(reason.into()),
+            revision: None,
         })
     }
 
@@ -287,12 +300,16 @@ fn use_fallback(
 }
 
 fn minimal_projection(thread_id: &str, status: &str) -> ThreadProjection {
+    projection_with_rev(thread_id, status, 1)
+}
+
+fn projection_with_rev(thread_id: &str, status: &str, revision: u64) -> ThreadProjection {
     use multi_agents_manager_lib::services::codex_desktop_ipc::types::{
         CapabilitySet, ControlAvailability, ProjectedMessage,
     };
     ThreadProjection {
         thread_id: thread_id.to_string(),
-        revision: Some(1),
+        revision: Some(revision),
         stale: false,
         availability: ControlAvailability::Controllable,
         capabilities: CapabilitySet {
@@ -479,10 +496,20 @@ async fn busy_fifo_allows_pending_response() {
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].action_id, "fifo-a");
     }
-    // b 仍在队列（turn a 未终态）
+    // b 仍在队列（turn a 未终态）——R6.3：顺序限制在册，flush 不再无条件接力
     assert_eq!(h.state_of("fifo-b"), ActionState::Queued);
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "Turn 顺序限制未释放前不接力"
+    );
 
-    // turn a 终态后 flush 接力发 b
+    // turn a 终态（fresh idle 投影事件）→ 释放顺序限制 → flush 接力发 b
+    //（R6.3：释放由完成证据驱动，不再靠手工 flush 清位）
+    assert!(
+        h.router
+            .release_turn_if_complete(&h.key, &minimal_projection(THREAD, "idle")),
+        "fresh idle 投影应释放顺序限制"
+    );
     let out_b = h.router.flush_thread(&h.key).await.expect("b dispatchable");
     assert_eq!(completed(out_b).delivery, Delivery::Accepted);
     let sends = h.dispatch.sends.lock().unwrap();
@@ -525,6 +552,7 @@ async fn fallback_only_before_dispatch() {
             envelope_id: Some("env".into()),
             turn_id: None,
             reason_code: None,
+            revision: None,
         }));
         let ctx = h.ctx(&format!("nf-{name}"), ActionKind::Send);
         let out = h.router.send(ctx, "普通消息".into(), false).await;
@@ -1008,6 +1036,7 @@ async fn unknown_replay_blocked() {
         envelope_id: Some("env-u".into()),
         turn_id: None,
         reason_code: None,
+        revision: None,
     }));
     let ctx = h.ctx("unk-1", ActionKind::Send);
     let r1 = completed(
@@ -1210,4 +1239,278 @@ async fn reconcile_false_on_ambiguous_truncated_or_read_failure() {
 #[allow(dead_code)]
 fn _protocol_error_reachable(e: ProtocolError) -> ProtocolError {
     e
+}
+
+// ============================================================
+// R6.1：普通 FIFO 只收 send——交互行（审批/回答 register→reserve 之间，或审计
+// INSERT 失败回滚后）残留 queued 时，不得被调度器当普通消息取走。
+// ============================================================
+
+/// 登记一个 UserInput 交互行（模拟 register→reserve 之间 / 审计回滚后残留 queued），
+/// flush 取出的队首必须是 send 行；交互行原样留队、零派发。
+#[tokio::test]
+async fn interaction_row_left_queued_never_becomes_send_head() {
+    let h = harness();
+
+    // 交互行：UserInput 登记（payload hash 真实形态；queued_text 恒空——账本只存 send 原文）
+    let ictx = h.ctx("act-inter-1", ActionKind::UserInput);
+    let ih = payload_hash(
+        ActionKind::UserInput,
+        &h.key,
+        Some("n:7"),
+        Some("tok"),
+        &ActionPayload::Text("approve".into()),
+    );
+    let iv = h
+        .store
+        .register(
+            &ictx,
+            ActionKind::UserInput,
+            Some("n:7"),
+            Some("tok"),
+            &ih,
+            None,
+        )
+        .expect("register interaction row");
+    assert_eq!(iv.state, ActionState::Queued, "交互行残留 queued");
+
+    // 后到的普通消息（seq 更大）
+    let q = h
+        .router
+        .send(
+            h.ctx("act-send-1", ActionKind::Send),
+            "普通消息".into(),
+            true,
+        )
+        .await;
+    assert!(matches!(q, RouterOutcome::Queued { .. }));
+
+    // 队首必须是 send 行，不是交互行
+    let head = h.store.next_queued(&h.key).expect("query").expect("head");
+    assert_eq!(
+        head.ctx.action_id, "act-send-1",
+        "普通 FIFO 队首不得取交互行（R6.1）"
+    );
+    assert_eq!(head.ctx.kind, ActionKind::Send);
+
+    // flush 只派 send 行；交互行原样留队
+    let out = h
+        .router
+        .flush_thread(&h.key)
+        .await
+        .expect("send dispatchable");
+    assert_eq!(completed(out).delivery, Delivery::Accepted);
+    let sends = h.dispatch.sends.lock().unwrap();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].action_id, "act-send-1", "派发的必须是普通消息");
+    drop(sends);
+    assert_eq!(
+        h.state_of("act-inter-1"),
+        ActionState::Queued,
+        "交互行不得被当普通消息派发/落账"
+    );
+
+    // 交互行也不出现在队列位置视图（position 只对 send 计）
+    let mine = h.store.list_queued(&h.key, "dev-1").expect("list");
+    assert!(
+        !mine.iter().any(|v| v.action_id == "act-inter-1"),
+        "队列视图只收普通消息：{mine:?}"
+    );
+}
+
+// ============================================================
+// R6.3：Turn 终态绑定顺序限制——flush/释放必须以「对应 turnId 的完成证据」为
+// 条件；Accepted 前后的旧 idle 更新不释放；缺 turnId 保守留队；重启后仍等待原
+// Turn 终态。
+// ============================================================
+
+/// 回执 turnId + 基线 revision 绑定后：旧 idle（revision ≤ 基线）、active、stale
+/// 一律不释放；严格更新的 fresh idle 才释放并解锁接力；绑定期间队列视图如实
+/// 显示屏障在册。
+#[tokio::test]
+async fn turn_restriction_needs_matching_completion_evidence() {
+    let h = harness_with(FakeDispatch::accepted_turn("turn-9", Some(7)));
+    let a = h.ctx("trn-a", ActionKind::Send);
+    let _ = completed(h.router.send(a, "第一条".into(), false).await);
+    assert_eq!(h.dispatch.send_count(), 1);
+
+    // 绑定在册：flush 不接力；持久屏障在册（队列视图 blockedReason 同源）
+    h.router
+        .send(h.ctx("trn-b", ActionKind::Send), "第二条".into(), true)
+        .await;
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "Turn 顺序限制在册不接力"
+    );
+    assert!(
+        h.store.has_compat_fence(&h.key).expect("query"),
+        "Turn 绑定以持久屏障在册"
+    );
+
+    // 旧 idle（revision == 基线）：不释放
+    assert!(
+        !h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 7)),
+        "Accepted 时的旧 idle 更新不得释放"
+    );
+    // active（revision 更新）：不释放
+    assert!(
+        !h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "active", 8)),
+        "runtime 未归 idle 不释放"
+    );
+    // stale idle（断线/owner 换代）：不释放，限制保留
+    let mut stale = projection_with_rev(THREAD, "idle", 9);
+    stale.stale = true;
+    assert!(
+        !h.router.release_turn_if_complete(&h.key, &stale),
+        "stale 投影不释放（owner 换代/断线限制保留）"
+    );
+    assert!(h.router.flush_thread(&h.key).await.is_none());
+
+    // 严格更新的 fresh idle：释放 + 清持久屏障 + 接力发下一条
+    assert!(
+        h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9)),
+        "idle 且 revision 严格大于基线 → 释放"
+    );
+    assert!(
+        !h.store.has_compat_fence(&h.key).expect("query"),
+        "释放同事务清持久屏障"
+    );
+    let out = h.router.flush_thread(&h.key).await.expect("b dispatchable");
+    assert_eq!(completed(out).delivery, Delivery::Accepted);
+    assert_eq!(h.dispatch.send_count(), 2);
+}
+
+/// 重启后仍等待原 Turn 终态：绑定持久化在账本，重建 Router 后 flush 依旧不放行；
+/// 完成证据（fresh idle）到达即恢复接力。
+#[tokio::test]
+async fn turn_restriction_survives_restart_until_completion() {
+    let mut h = harness_with(FakeDispatch::accepted_turn("turn-p", Some(7)));
+    let _ = completed(
+        h.router
+            .send(
+                h.ctx("trn-r-a", ActionKind::Send),
+                "重启前已发".into(),
+                false,
+            )
+            .await,
+    );
+    h.router
+        .send(
+            h.ctx("trn-r-b", ActionKind::Send),
+            "重启后排队".into(),
+            true,
+        )
+        .await;
+    assert!(h.store.has_compat_fence(&h.key).expect("binding fence"));
+
+    // —— 进程重启（同一 DB 重建 Store/Router）——
+    h.restart_with(FakeDispatch::accepted());
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "重启后仍等待原 Turn 终态（绑定从账本重建）"
+    );
+    // 完成证据到达：释放并按序接力
+    assert!(
+        h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 100)),
+        "重启重建 baseline=None：首个新鲜 idle 即当前真值"
+    );
+    let out = h
+        .router
+        .flush_thread(&h.key)
+        .await
+        .expect("queued row dispatchable");
+    assert_eq!(completed(out).delivery, Delivery::Accepted);
+    let sends = h.dispatch.sends.lock().unwrap();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].action_id, "trn-r-b");
+}
+
+/// 回执缺 turnId（真实回执可能拿不到）→ 保守保留顺序限制，回执如实携带 None；
+/// 任何投影都不释放。
+#[tokio::test]
+async fn receipt_without_turn_id_keeps_restriction() {
+    let h = harness_with(FakeDispatch::new(DispatchOutcome {
+        delivery: Delivery::Accepted,
+        envelope_id: Some("env-nt".into()),
+        turn_id: None,
+        reason_code: None,
+        revision: Some(7),
+    }));
+    let _ = completed(
+        h.router
+            .send(
+                h.ctx("trn-nt", ActionKind::Send),
+                "无回执消息".into(),
+                false,
+            )
+            .await,
+    );
+    let v = h.view_of("trn-nt");
+    assert_eq!(v.state, ActionState::Accepted);
+    assert!(v.receipt.unwrap().turn_id.is_none(), "缺 turnId 如实回执");
+    h.router
+        .send(h.ctx("trn-nt-2", ActionKind::Send), "后续消息".into(), true)
+        .await;
+    // 缺 turnId：任何投影（含更新的 fresh idle）都不视为完成
+    assert!(
+        !h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 99)),
+        "缺 turnId 保守不释放"
+    );
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "缺 turnId 保持留队"
+    );
+}
+
+/// R9.3：终态持久化失败（trigger 拒绝 accepted 落账）→ 不对外虚称完成（unknown
+/// 口径回执）、保持 reserved、顺序限制不释放；重启 recover 成 unknown。
+#[tokio::test]
+async fn finish_persist_failure_keeps_reserved_reports_unknown() {
+    let mut h = harness();
+    {
+        let conn = h.conn.lock().unwrap();
+        conn.execute(
+            "CREATE TRIGGER accepted_reject BEFORE UPDATE ON codex_actions
+             WHEN NEW.state = 'accepted'
+             BEGIN SELECT RAISE(ABORT, 'accepted rejected by test trigger'); END",
+            [],
+        )
+        .unwrap();
+    }
+    h.router
+        .send(h.ctx("pf-a", ActionKind::Send), "落账失败消息".into(), true)
+        .await;
+    let out = h.router.flush_thread(&h.key).await.expect("dispatchable");
+    let receipt = completed(out);
+    assert_eq!(
+        receipt.delivery,
+        Delivery::UnknownDelivery,
+        "不对外虚称完成"
+    );
+    assert_eq!(
+        receipt.reason_code.as_deref(),
+        Some("finish_persist_failed")
+    );
+    assert_eq!(
+        h.state_of("pf-a"),
+        ActionState::Reserved,
+        "保持 reserved（下次 recover 成 unknown）"
+    );
+    // 顺序限制不释放：队列闸住
+    h.router
+        .send(h.ctx("pf-b", ActionKind::Send), "后续消息".into(), true)
+        .await;
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "持久化失败不释放顺序限制"
+    );
+
+    // —— 重启：reserved → unknown ——
+    h.restart();
+    assert_eq!(h.state_of("pf-a"), ActionState::Unknown);
 }

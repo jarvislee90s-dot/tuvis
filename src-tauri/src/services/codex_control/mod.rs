@@ -18,11 +18,11 @@ pub use crate::services::codex_desktop_ipc::types::{
 };
 pub use queue::{
     payload_hash, reconcile_compat_fence, reconcile_compat_fence_with, wire_text_hash,
-    ActionPayload, ActionStore, CompatFence, QueuedAction, StoreError,
+    ActionPayload, ActionStore, CompatFence, QueuedAction, StoreError, TurnBinding,
 };
 pub use router::{
-    BoxDispatchFut, CodexControlRouter, DesktopDispatch, DispatchOutcome, FallbackPermit,
-    RouterOutcome,
+    BoxBusyFut, BoxDispatchFut, CodexControlRouter, DesktopDispatch, DispatchOutcome,
+    FallbackPermit, RouterOutcome,
 };
 
 /// 一次远程控制动作的调用方上下文（计划 Task 7 `ActionContext`）。

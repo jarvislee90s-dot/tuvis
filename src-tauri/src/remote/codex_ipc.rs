@@ -15,7 +15,7 @@
 //   有界关注集合（adapter 已跟随的 Thread）工作。
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::rejection::JsonRejection;
@@ -115,7 +115,9 @@ pub(crate) enum HubEvent {
 ///
 /// **`disabled()` 契约**（既有全部测试 fixture 显式填 disabled hub——编译即暴露）：
 /// 一切能力关闭——`ipc_available()` 恒 false（closed profile 能力全 false → 投影恒
-/// `compat_only`）、动作一律拒绝、`start()` 不装配调度循环（不订阅/不恢复/不调度）。
+/// `compat_only`）、审批一律拒绝、`start()` 不装配调度循环（不订阅/不恢复/不调度）。
+/// R8 起普通消息**仍经 router**（登记→reserve→NotSent→兜底资格，账本纪律不因 hub
+/// 不可用绕过）。
 pub struct CodexControlHub {
     /// 动作账本 + 安全路由（Task 7；`store()` 供动作/队列端点读取）
     pub router: Arc<CodexControlRouter>,
@@ -123,6 +125,8 @@ pub struct CodexControlHub {
     pub adapter: Arc<DesktopIpcAdapter>,
     /// 内部事件（`ThreadSettled` 接力）
     events: tokio::sync::broadcast::Sender<HubEvent>,
+    /// R7.3：关注引用闸（与 AdapterDispatch 共享；SSE 详情订阅 +1/结束 -1）
+    gate: Arc<FollowGate>,
     /// 生产能力标志：`disabled()` 恒 false——`start()/stop()/ipc_available()` 全部短路与拒绝
     capable: bool,
     /// 调度循环在跑标志（幂等启停）
@@ -130,15 +134,29 @@ pub struct CodexControlHub {
     /// 调度循环句柄（stop 时 abort；循环只是「接力调度器」——已派发任务在自己的
     /// detached 任务里跑至落账或 unknown，不随本句柄消失）
     sched: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// R7.2：周期对账间隔（默认 30s；测试可收窄——首个 tick 立即触发，兼作 R7.1
+    /// 启动恢复：枚举 queued/屏障在册的 thread → ensure 重新 following → 事件驱动
+    /// 调度，不打开详情、不手工 flush 也能恢复发送）
+    reconcile_period_ms: AtomicU64,
 }
+
+/// 周期对账默认间隔（R7.2：有界定时器；空待发集合时只有一条 EXISTS 级查询）。
+pub(crate) const RECONCILE_PERIOD_MS: u64 = 30_000;
 
 impl CodexControlHub {
     /// 测试/关闭态装配（计划 Task 8 接口）：一切能力关闭、恒 CompatOnly/拒绝。
     /// adapter 用 closed profile（能力全 false，投影 `compat_only`、写入恒拒）；router
     /// 挂在**内存库**上（fixture 不接触真实 ~/.tuvis）配空派发器（零写入）。
     pub fn disabled() -> Self {
+        Self::disabled_with_store(DeviceStore::memory())
+    }
+
+    /// [`disabled`](Self::disabled) 的注入存储变体（R8 起普通消息经 router——设备
+    /// 复核须与 RemoteState 同库，测试夹具才能走通「派发→NotSent→兜底拒发」全臂）。
+    #[doc(hidden)]
+    pub fn disabled_with_store(store: DeviceStore) -> Self {
         Self::with_parts(
-            DeviceStore::memory(),
+            store,
             Arc::new(DesktopIpcAdapter::new(
                 Arc::new(NullConnector),
                 closed_profile(),
@@ -187,6 +205,7 @@ impl CodexControlHub {
             adapter.clone(),
             Arc::new(AdapterDispatch {
                 adapter: adapter.clone(),
+                gate: Arc::default(),
             }),
             true,
         )
@@ -208,24 +227,30 @@ impl CodexControlHub {
             router,
             adapter,
             events: tokio::sync::broadcast::channel(64).0,
+            gate: Arc::default(),
             capable,
             running: AtomicBool::new(false),
             sched: Mutex::new(None),
+            reconcile_period_ms: AtomicU64::new(RECONCILE_PERIOD_MS),
         }
     }
 
     /// 测试装配变体：注入 adapter 并以生产形态装配派发缝（AdapterDispatch 包住注入的
-    /// adapter——HTTP 集成测试经 ScriptedPeer 驱动完整 IPC 语义）。
+    /// adapter——HTTP 集成测试经 ScriptedPeer 驱动完整 IPC 语义；R7.3 引用闸同源共享）。
     #[doc(hidden)]
     pub fn with_adapter(
         store: DeviceStore,
         adapter: Arc<DesktopIpcAdapter>,
         capable: bool,
     ) -> Self {
+        let gate: Arc<FollowGate> = Arc::default();
         let dispatch = Arc::new(AdapterDispatch {
             adapter: adapter.clone(),
+            gate: gate.clone(),
         });
-        Self::with_parts(store, adapter, dispatch, capable)
+        let mut hub = Self::with_parts(store, adapter, dispatch, capable);
+        hub.gate = gate;
+        hub
     }
 
     /// hub 事件发送端（兜底落账后接力用）。
@@ -243,12 +268,47 @@ impl CodexControlHub {
         }
     }
 
-    /// 生产生命周期：装配调度循环（idle 投影 / 落账事件 → fence 只读核对 → 接力
-    /// flush → 兜底 bridge）。幂等；disabled hub 短路（不订阅/不恢复/不调度——
+    /// R7.3：详情订阅引用 +1（SSE thread/events 建流前调用）。
+    pub fn follow_ref_acquire(&self, key: &ThreadKey) {
+        self.gate.acquire(key);
+    }
+
+    /// R7.3：详情订阅结束 -1；归零且**无本地待发**（queued 普通消息 / 在册屏障——
+    /// 有待发工作的 thread 永不被引用计数挤出）→ unfollow 释放 following 名额。
+    pub async fn maybe_release_follow(&self, key: &ThreadKey) {
+        let remaining = self.gate.release(key);
+        if remaining > 0 {
+            return;
+        }
+        let has_work = self
+            .router
+            .store()
+            .thread_has_pending_work(key)
+            .unwrap_or(true);
+        if has_work {
+            return;
+        }
+        self.adapter.unfollow(key).await;
+    }
+
+    /// R7.2：周期对账间隔（测试收窄用；仅影响本 hub 的调度循环）。
+    #[doc(hidden)]
+    pub fn set_reconcile_period_ms(&self, ms: u64) {
+        self.reconcile_period_ms
+            .store(ms.max(1), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn reconcile_period(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.reconcile_period_ms
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// 生产生命周期：装配调度循环（首个 tick 即启动恢复 R7.1：枚举 queued/屏障在册
+    /// 的 thread → ensure 重新 following → settle 接力；此后每周期对账 R7.2；idle
+    /// 投影 / 落账事件同样驱动）。幂等；disabled hub 短路（不订阅/不恢复/不调度——
     /// 「remote 关闭时不再订阅/恢复/调度未派发项」）。
-    ///
-    /// **热重启不重放**：本函数只装事件循环，绝不主动扫队/重放 queued——接力只由
-    /// 「idle 投影」「落账事件」两类边沿触发。
     pub fn start(self: &Arc<Self>, st: Arc<RemoteState>) {
         if !self.capable {
             return;
@@ -261,8 +321,9 @@ impl CodexControlHub {
         *self.sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
-    /// 停止调度循环（remote 关闭/热重启）：只停「接力调度器」；已派发任务（IPC 在途
-    /// RPC、detached 兜底回合）不取消——留至落账或 unknown（permit Drop 守卫兜底）。
+    /// 停止调度循环（remote 关闭/热重启；R7.5：调度器 + 启动恢复/周期对账 + 事件
+    /// 订阅一并关闭——它们同住本循环；已派发任务（IPC 在途 RPC、detached 兜底回合）
+    /// 不取消——留至落账或 unknown（permit Drop 守卫兜底）。
     pub fn stop(&self) {
         if !self.capable {
             return;
@@ -274,36 +335,59 @@ impl CodexControlHub {
     }
 }
 
-/// 调度循环主体：adapter 投影广播 + hub 落账事件双路输入，逐 Thread 结算。
+/// 调度循环主体：adapter 投影广播 + hub 落账事件 + 周期对账三路输入，逐 Thread 结算。
+/// 首个 tick 立即到点 = R7.1 启动恢复（枚举待发 thread → ensure 重新 following →
+/// settle 接力 flush；不打开详情、不手工 flush 也能恢复发送）。
 async fn scheduler_loop(hub: Arc<CodexControlHub>, st: Arc<RemoteState>) {
     let mut proj_rx = hub.adapter.subscribe();
     let mut evt_rx = hub.events.subscribe();
+    let mut tick = tokio::time::interval(hub.reconcile_period());
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let key: ThreadKey = tokio::select! {
+        tokio::select! {
             proj = proj_rx.recv() => match proj {
                 // 只对非 stale 投影接力（stale = 连接断了，派发只会白试）
-                Ok(p) if !p.stale => local_key(&p.thread_id),
+                Ok(p) if !p.stale => {
+                    let key = local_key(&p.thread_id);
+                    settle_thread(&hub, &st, &key).await;
+                }
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             evt = evt_rx.recv() => match evt {
-                Ok(HubEvent::ThreadSettled(key)) => key,
+                Ok(HubEvent::ThreadSettled(key)) => settle_thread(&hub, &st, &key).await,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
-        };
-        settle_thread(&hub, &st, &key).await;
+            _ = tick.tick() => {
+                // R7.1 启动恢复（首 tick 即到点）/ R7.2 周期对账：枚举全部待发 thread
+                //（queued 普通消息 / 在册屏障；空集合零开销），逐线程 ensure 重新
+                // following → settle 接力（内部 try-lock 让路，不与在途派发互等）
+                let keys = hub
+                    .router
+                    .store()
+                    .threads_with_pending_work()
+                    .unwrap_or_default();
+                for key in keys {
+                    settle_thread(&hub, &st, &key).await;
+                }
+            },
+        }
     }
 }
 
-/// 单 Thread 结算：① fence 只读核对（有对应 Turn 完成证据才 clear——Task 7 reconcile
-/// 纪律：仅 idle/「已消费」都不算完成）；② 接力 flush（UseFallback → 兼容 bridge）。
+/// 单 Thread 结算：① R6.3 Turn 终态释放（新鲜 idle/failed 投影 + 绑定 turnId +
+/// revision 严格后于基线 → 清持久屏障与内存限制）；② fence 只读核对（有对应 Turn
+/// 完成证据才 clear——Task 7 reconcile 纪律：仅 idle/「已消费」都不算完成）；
+/// ③ 接力 flush（UseFallback → 兼容 bridge）。
 async fn settle_thread(hub: &Arc<CodexControlHub>, st: &Arc<RemoteState>, key: &ThreadKey) {
-    // ① fence reconcile（只读，不改 Codex 数据文件；失败/证据不足保持 fence 在册）
+    let projection = hub.adapter.projection(key).await;
+    // ① R6.3：投影驱动的顺序限制释放（idle 边沿 / 周期对账都经此处，不只靠手工 flush）
+    hub.router.release_turn_if_complete(key, &projection);
+    // ② fence reconcile（只读，不改 Codex 数据文件；失败/证据不足保持 fence 在册）
     if let Ok(fences) = hub.router.store().compat_fences(key) {
         for fence in fences {
-            let projection = hub.adapter.projection(key).await;
             if matches!(reconcile_compat_fence(&fence, &projection).await, Ok(true)) {
                 match hub.router.store().clear_compat_fence(&fence.action_id) {
                     Ok(()) => log::info!(
@@ -320,7 +404,7 @@ async fn settle_thread(hub: &Arc<CodexControlHub>, st: &Arc<RemoteState>, key: &
             }
         }
     }
-    // ② 接力下一条（try-lock 让路：兜底 permit 在外时本函数直接 no-op）
+    // ③ 接力下一条（try-lock 让路：兜底 permit 在外时本函数直接 no-op）
     if let Some(outcome) = hub.router.flush_thread(key).await {
         consume_fallback(st, outcome, &key.thread_id).await;
     }
@@ -398,21 +482,36 @@ fn not_sent_receipt(action_id: &str, route: ControlRoute, reason: &str) -> Actio
     }
 }
 
-/// RpcOutcome → DispatchOutcome（turnId 从 start-turn 响应 `result.turn.id` 提取）。
+/// RpcOutcome → DispatchOutcome（R6.3a：turnId 按**真实封套**解包——`result.turn.id`
+/// 之外，Mac Probe 记录的是嵌套两层 `result.result.turn`；缺 turnId 如实回 None，
+/// 不视为可完成）。`revision` 由调用方附（回执时投影基线）。
 fn outcome_of(out: crate::services::codex_desktop_ipc::connection::RpcOutcome) -> DispatchOutcome {
-    let turn_id = out
-        .result
-        .as_ref()
-        .and_then(|r| r.get("turn"))
-        .and_then(|t| t.get("id"))
-        .and_then(|i| i.as_str())
-        .map(str::to_string);
+    let turn_id = out.result.as_ref().and_then(turn_id_of_result);
     DispatchOutcome {
         delivery: out.delivery,
         envelope_id: Some(out.envelope_id),
         turn_id,
         reason_code: out.reason_code,
+        revision: None,
     }
+}
+
+/// start-turn 回执的 turnId 解包：`result.turn.id`（两层）优先，嵌套两层
+/// `result.result.turn.id`（Mac Probe 实录形态）兜底；都不是 → None。
+fn turn_id_of_result(result: &serde_json::Value) -> Option<String> {
+    if let Some(id) = result
+        .get("turn")
+        .and_then(|t| t.get("id"))
+        .and_then(|i| i.as_str())
+    {
+        return Some(id.to_string());
+    }
+    result
+        .get("result")
+        .and_then(|t| t.get("turn"))
+        .and_then(|t| t.get("id"))
+        .and_then(|i| i.as_str())
+        .map(str::to_string)
 }
 
 fn not_sent_outcome(reason: &str) -> DispatchOutcome {
@@ -421,20 +520,85 @@ fn not_sent_outcome(reason: &str) -> DispatchOutcome {
         envelope_id: Some(crate::services::codex_desktop_ipc::types::new_uuid()),
         turn_id: None,
         reason_code: Some(reason.to_string()),
+        revision: None,
+    }
+}
+
+/// R7.3 关注引用闸：详情订阅（SSE thread/events）持有限额内的引用； AdapterDispatch
+/// 与 hub 共享同一份（ensure 失败的名额回滚只在零引用时执行——有订阅者的 thread 由
+/// adapter 恢复循环重建跟随，不能被回滚挤出）。
+#[derive(Default)]
+pub(crate) struct FollowGate {
+    refs: Mutex<std::collections::HashMap<ThreadKey, usize>>,
+}
+
+impl FollowGate {
+    fn acquire(&self, key: &ThreadKey) -> usize {
+        let mut refs = self.refs.lock().unwrap_or_else(|e| e.into_inner());
+        let n = refs.entry(key.clone()).or_insert(0);
+        *n += 1;
+        *n
+    }
+
+    fn release(&self, key: &ThreadKey) -> usize {
+        let mut refs = self.refs.lock().unwrap_or_else(|e| e.into_inner());
+        let n = refs.entry(key.clone()).or_insert(0);
+        *n = n.saturating_sub(1);
+        let remaining = *n;
+        if remaining == 0 {
+            refs.remove(key);
+        }
+        remaining
+    }
+
+    fn is_held(&self, key: &ThreadKey) -> bool {
+        self.refs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key)
     }
 }
 
 /// 生产 A 路派发：普通消息 ensure_thread 先行（owner/following/snapshot 就位——
 /// start_turn 需要现行 lease），失败 = 写前零投递 `NotSent`（router 据此取得兜底资格，
 /// 「不确定已送达绝不自动切换」的边界在 writer 尝试之前，语义安全）。
+#[derive(Clone)]
 struct AdapterDispatch {
     adapter: Arc<DesktopIpcAdapter>,
+    /// R7.3：与 hub 共享的关注引用闸（ensure 失败回滚名额的判断依据）
+    gate: Arc<FollowGate>,
+}
+
+impl AdapterDispatch {
+    /// R6.2 忙态首 snapshot + R7.3 失败回滚：ensure 取新鲜投影后读忙态；ensure 失败
+    /// 且无详情订阅者 → unfollow 回滚 following 名额（discovery 失败不耗尽 64 名额），
+    /// 返回「不忙」让派发继续（send_text 内的 ensure 会如实 NotSent → 兜底资格）。
+    async fn ensure_and_busy(&self, key: &ThreadKey) -> bool {
+        let ensured = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            self.adapter.ensure_thread(key).await
+        })
+        .await;
+        match ensured {
+            Ok(Ok(_)) => self.adapter.busy_snapshot(key),
+            Ok(Err(_)) | Err(_) => {
+                if !self.gate.is_held(key) {
+                    self.adapter.unfollow(key).await;
+                }
+                false
+            }
+        }
+    }
 }
 
 impl DesktopDispatch for AdapterDispatch {
     fn thread_busy(&self, key: &ThreadKey) -> bool {
         // R2.3 忙判定：从镜像投影读（快照加性接口 busy_snapshot）；锁不可得按「忙」保守
         self.adapter.busy_snapshot(key)
+    }
+    fn busy_fresh(&self, key: &ThreadKey) -> crate::services::codex_control::BoxBusyFut {
+        let this = self.clone();
+        let key = key.clone();
+        Box::pin(async move { this.ensure_and_busy(&key).await })
     }
     fn send_text(
         &self,
@@ -460,7 +624,12 @@ impl DesktopDispatch for AdapterDispatch {
                 Ok(Err(e)) => return not_sent_outcome(e.code()),
                 Err(_) => return not_sent_outcome("timeout"),
             }
-            outcome_of(adapter.start_turn(&key, &action_id, &composed, &cmid).await)
+            let outcome = adapter.start_turn(&key, &action_id, &composed, &cmid).await;
+            // R6.3：回执时投影 revision 基线（完成证据的严格后续判定基准）
+            let revision = adapter.projection(&key).await.revision;
+            let mut out = outcome_of(outcome);
+            out.revision = revision;
+            out
         })
     }
     fn respond(
@@ -484,12 +653,14 @@ impl DesktopDispatch for AdapterDispatch {
     }
 }
 
-/// 空派发器（disabled hub）：恒 NotSent（零写入）且恒「忙」（router 侧永不派发）。
+/// 空派发器（disabled hub）：**恒「不忙」**（R8：未知 build/不可用 hub 的普通消息也要
+/// 经 router 登记→reserve→NotSent→兜底资格——恒忙会把消息困死队列）、写恒 NotSent
+///（零写入）。
 struct NullDispatch;
 
 impl DesktopDispatch for NullDispatch {
     fn thread_busy(&self, _key: &ThreadKey) -> bool {
-        true
+        false
     }
     fn send_text(
         &self,
@@ -746,19 +917,47 @@ pub(crate) async fn run_compat(st: Arc<RemoteState>, permit: FallbackPermit) -> 
         );
         return refused_envelope(&action_id, "compat_session_missing");
     };
-    // 发送前持久 fence 与核对证据（rollout 基线 + 组装文本 hash；组装失败 = helper
-    // 也会拒发，此处不设证据）
+    // **发送前原子持久 fence 与核对证据**（R9.1，2026-10-17 审计：fence/证据持久化
+    // 成功是调用真实 helper 的前提——单条 UPDATE 原子写；写失败 → 零 helper 调用、
+    // 动作如实落账 NotSent，杜绝「发送后崩溃恢复时没有顺序屏障」）。组装失败（花名
+    // 面拒绝 / rollout 不可定位）不设屏障：helper 对同一事实亦必拒发，按既有语义执行。
     let home = (st.home_source)().map(std::path::PathBuf::from);
     let rollout = production_rollout_path(home.as_deref(), &session.id);
     let baseline = rollout.as_deref().and_then(baseline_len);
-    if let Ok(composed) = crate::inject::normalize::compose_injection(&ctx.device_name, &raw) {
-        let _ = permit.store().set_compat_fence(&action_id, None, None);
-        let _ = permit.store().set_compat_evidence(
-            &action_id,
-            rollout.as_deref(),
-            baseline,
-            Some(&wire_text_hash(&composed)),
-        );
+    match crate::inject::normalize::compose_injection(&ctx.device_name, &raw) {
+        Ok(composed) => {
+            if let Err(e) = permit.store().set_compat_dispatch_barrier(
+                &action_id,
+                None,
+                None,
+                rollout.as_deref(),
+                baseline,
+                Some(&wire_text_hash(&composed)),
+            ) {
+                log::error!(
+                    "codex_ipc: 兼容派发屏障持久化失败（零 helper 调用）action={action_id} err={e}"
+                );
+                let receipt = not_sent_receipt(
+                    &action_id,
+                    ControlRoute::HeadlessCompat,
+                    "compat_barrier_persist_failed",
+                );
+                let _ = permit.finish(receipt);
+                codex_fallback_audit(
+                    &st,
+                    &ctx,
+                    &session.id,
+                    "",
+                    None,
+                    None,
+                    "refused:compat_barrier_persist_failed",
+                );
+                return refused_envelope(&action_id, "compat_barrier_persist_failed");
+            }
+        }
+        Err(reason) => {
+            log::warn!("codex_ipc: 兜底组装失败（不设屏障，helper 亦必拒发）action={action_id} reason={reason}");
+        }
     }
     // 既有 helper（旧 headless 封套语义全套；action 词保持 `headless`——既有行保留，
     // 本动作以 codex_fallback 行按 actionId 另行关联）
@@ -771,12 +970,16 @@ pub(crate) async fn run_compat(st: Arc<RemoteState>, permit: FallbackPermit) -> 
         crate::inject::headless::ACTION_HEADLESS,
     )
     .await;
-    // fence 补记入队回执 id（reconcile 关联消费的钥匙；evidence 无证据时不覆盖）
+    // fence 补记入队回执 id（reconcile 关联消费的钥匙；屏障已在发送前原子持久，此处
+    // 是补充键——失败不回滚投递，只记日志如实暴露核对钥匙缺失）
     if let Some(msg_id) = evidence.queued_message_id.as_deref() {
-        let _ =
+        if let Err(e) =
             permit
                 .store()
-                .set_compat_fence(&action_id, Some(msg_id), evidence.turn_id.as_deref());
+                .set_compat_fence(&action_id, Some(msg_id), evidence.turn_id.as_deref())
+        {
+            log::error!("codex_ipc: fence 入队回执 id 补记失败 action={action_id} err={e}");
+        }
     }
     let channel = envelope["channel"]
         .as_str()
@@ -979,29 +1182,6 @@ fn audit_result_of_receipt(r: &ActionReceipt) -> String {
     }
 }
 
-/// **A 可写投影判据**（旧 APP 补投/键位面阻断单点）：hub 生产可用 ∧ thread 可解析 ∧
-/// 投影新鲜（非 stale）∧ 档位可写（controllable/send_only）。满足 = 原生端点是唯一
-/// 正路——`session-question/answer` 补投与 `session-approve` 键位面如实拒 503；不满足
-/// （无投影 / compat_only / unavailable）保持旧路径（那是 compat 场景的唯一交互面）。
-pub(crate) async fn native_projection_live(
-    st: &Arc<RemoteState>,
-    session: &crate::session::Session,
-) -> bool {
-    if !st.codex_control.ipc_available() {
-        return false;
-    }
-    let Some(key) = resolve_session_thread(st, session) else {
-        return false;
-    };
-    let p = st.codex_control.adapter.projection(&key).await;
-    !p.stale
-        && matches!(
-            p.availability,
-            crate::services::codex_desktop_ipc::types::ControlAvailability::Controllable
-                | crate::services::codex_desktop_ipc::types::ControlAvailability::SendOnly
-        )
-}
-
 // ============================================================
 // 端点：GET /codex/thread
 // ============================================================
@@ -1052,6 +1232,8 @@ pub async fn thread_state(
 /// 活投影：ensure_thread（有界 10s）成功 → 新鲜投影；失败/超时 → 当前投影（stale）。
 /// ensure 的连接副作用建立 owner/following——SSE 与后续写入都依赖它，GET 是首个
 /// 关注点注册入口（有界关注集合，不扫全历史）。
+/// R7.3：ensure 失败且**无详情订阅者**时 unfollow 回滚 following 名额（64 次失败
+/// discovery 不耗尽名额；有订阅者的 thread 交给 adapter 恢复循环重建，不回滚）。
 async fn live_projection(hub: &CodexControlHub, key: &ThreadKey) -> ThreadProjection {
     let adapter = hub.adapter.clone();
     let key2 = key.clone();
@@ -1061,7 +1243,12 @@ async fn live_projection(hub: &CodexControlHub, key: &ThreadKey) -> ThreadProjec
     .await
     {
         Ok(Ok(p)) => p,
-        _ => hub.adapter.projection(key).await,
+        _ => {
+            if !hub.gate.is_held(key) {
+                hub.adapter.unfollow(key).await;
+            }
+            hub.adapter.projection(key).await
+        }
     }
 }
 
@@ -1109,11 +1296,19 @@ pub async fn thread_events(
     let (conn_id, close_rx) = st.sse_registry.register(&device);
     let registry = st.sse_registry.clone();
     let adapter = hub.adapter.clone();
+    // R7.3：详情订阅引用计数（挂载 +1；流结束 -1；归零且无本地待发 → unfollow）
+    hub.follow_ref_acquire(&key);
     let first = live_projection(hub, &key).await;
     let rx = adapter.subscribe();
-    let stream = projection_stream(adapter, key, first, rx).take_until(close_rx);
+    let guarded = GuardedStream {
+        inner: projection_stream(adapter, key.clone(), first, rx).take_until(close_rx),
+        _guard: Some(FollowReleaseGuard {
+            hub: st.codex_control.clone(),
+            key,
+        }),
+    };
     let cleaned = super::server::CleanupStream {
-        inner: stream,
+        inner: guarded,
         reg: registry,
         device,
         conn_id,
@@ -1123,6 +1318,41 @@ pub async fn thread_events(
         Sse::new(cleaned).keep_alive(sse::KeepAlive::default()),
     )
         .into_response()
+}
+
+/// R7.3：SSE 详情订阅的关注引用守卫——流结束（自然断开/吊销/服务端关闭同一时机）
+/// 引用 -1，归零且无本地待发 → unfollow 释放 following 名额（Drop 不能 await →
+/// spawn 后台释放）。
+struct FollowReleaseGuard {
+    hub: Arc<CodexControlHub>,
+    key: ThreadKey,
+}
+
+impl Drop for FollowReleaseGuard {
+    fn drop(&mut self) {
+        let hub = self.hub.clone();
+        let key = self.key.clone();
+        // Drop 不能 await：后台释放引用（任务自持；进程退出未跑完的残额随进程消失，
+        // following 名额由 Desktop 侧连接生命周期兜底）
+        tokio::spawn(async move { hub.maybe_release_follow(&key).await });
+    }
+}
+
+/// 持守卫的流包装：守卫随流一起 drop。
+struct GuardedStream<S> {
+    inner: S,
+    _guard: Option<FollowReleaseGuard>,
+}
+
+impl<S: Stream> Stream for GuardedStream<S> {
+    type Item = S::Item;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // Safety: 无 Unpin 约束需求经字段投影转发（inner 已被 take_until 包装为 Unpin 流链）
+        unsafe { self.map_unchecked_mut(|s| &mut s.inner).poll_next(cx) }
+    }
 }
 
 /// 投影事件流：首帧 snapshot，后续 state；Lagged（广播槽落后）→ 重发 snapshot。

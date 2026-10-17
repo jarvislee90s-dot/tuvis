@@ -355,6 +355,81 @@ impl ActionStore {
     pub fn compat_fences(&self, key: &ThreadKey) -> Result<Vec<CompatFence>, StoreError> {
         self.with(|c| dao::compat_fences_conn(c, &key.thread_id).map_err(db_err))
     }
+
+    /// **原子** compat 派发屏障（R9.1）：fence + 只读核对证据在单条 UPDATE 内持久化
+    /// ——成功是 compat bridge 调用真实 helper 的前提；失败（DB 拒绝）时零 helper 调用。
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_compat_dispatch_barrier(
+        &self,
+        action_id: &str,
+        message_id: Option<&str>,
+        turn_id: Option<&str>,
+        rollout_path: Option<&str>,
+        rollout_baseline: Option<u64>,
+        wire_hash: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.with(|c| {
+            dao::set_compat_dispatch_barrier_conn(
+                c,
+                action_id,
+                message_id,
+                turn_id,
+                rollout_path,
+                rollout_baseline,
+                wire_hash,
+                now_ms(),
+            )
+            .map_err(db_err)
+        })
+    }
+
+    /// 有待发工作（queued 普通消息 / 在册屏障）的 thread 全集（hub 启动恢复与周期
+    /// 对账的枚举输入，R7.1/R7.2；空集合零开销）。
+    pub fn threads_with_pending_work(&self) -> Result<Vec<ThreadKey>, StoreError> {
+        self.with(|c| {
+            dao::threads_with_pending_work_conn(c)
+                .map_err(db_err)
+                .map(|v| v.into_iter().map(|t| local_thread_key(&t)).collect())
+        })
+    }
+
+    /// 某 thread 是否有待发工作（R7.3 引用计数挤出保护：有待发工作的 thread 永不被
+    /// unfollow 挤出）。
+    pub fn thread_has_pending_work(&self, key: &ThreadKey) -> Result<bool, StoreError> {
+        self.with(|c| dao::thread_has_pending_work_conn(c, &key.thread_id).map_err(db_err))
+    }
+
+    /// R6.3：全部 Turn 顺序绑定行（`Router::new` 重启重建内存限制的输入）。
+    pub fn turn_bindings(&self) -> Result<Vec<TurnBinding>, StoreError> {
+        self.with(|c| {
+            dao::turn_binding_rows_conn(c).map_err(db_err).map(|rows| {
+                rows.into_iter()
+                    .map(|r| TurnBinding {
+                        action_id: r.action_id,
+                        key: local_thread_key(&r.thread_id),
+                        turn_id: r.compat_turn_id,
+                    })
+                    .collect()
+            })
+        })
+    }
+}
+
+/// 服务端 ThreadKey 只构造 local（计划公共类型约定）。
+fn local_thread_key(thread_id: &str) -> ThreadKey {
+    ThreadKey {
+        host_id: "local".into(),
+        thread_id: thread_id.to_string(),
+    }
+}
+
+/// R6.3 Turn 顺序绑定（重启后路由器内存重建的输入）：A 路已接受且持久绑定了 turn
+/// 身份的动作。
+#[derive(Debug, Clone)]
+pub struct TurnBinding {
+    pub action_id: String,
+    pub key: ThreadKey,
+    pub turn_id: Option<String>,
 }
 
 fn view_of(c: &Connection, row: dao::ActionRow) -> rusqlite::Result<CodexActionView> {
