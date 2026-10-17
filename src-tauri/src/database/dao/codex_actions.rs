@@ -271,9 +271,15 @@ pub(crate) fn mark_stale_reserved_unknown_conn(
     let mut converged = Vec::new();
     for (seq, action_id, thread_id) in rows {
         let tx = conn.unchecked_transaction()?;
+        // 2026-10-17 复审 P3-3：desktop_ipc 普通消息的 unknown 收敛同时存**保守
+        // 屏障**（compat_outstanding=1、无 turn 身份）——Original Turn 可能已收到
+        //（ack/落账丢失），重启后顺序限制同样保守在册（无身份不自动释放；与
+        // finish_with_turn_barrier 的 Unknown 口径一致）。kind='send' 限定普通
+        // 消息（审批行无 Turn 顺序语义）。
         tx.execute(
             "UPDATE codex_actions SET state='unknown', queued_text=NULL, updated_at=?2,
-             receipt_json=?3 WHERE seq=?1 AND state='reserved'",
+             receipt_json=?3, compat_outstanding=1, compat_turn_id=NULL
+             WHERE seq=?1 AND state='reserved'",
             rusqlite::params![
                 seq,
                 now_ms,
@@ -333,8 +339,14 @@ fn recover_one_conn(conn: &Connection, action_id: &str, now_ms: i64) -> rusqlite
     };
     let receipt_json = serde_json::to_string(&receipt)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    // 2026-10-17 复审 P3-3：desktop_ipc 普通消息的启动恢复同样存保守屏障
+    //（RPC 可能已到达 Desktop、落账前崩溃——重启后顺序限制保守在册）
     conn.execute(
-        "UPDATE codex_actions SET state = 'unknown', receipt_json = ?2, updated_at = ?3 \
+        "UPDATE codex_actions SET state = 'unknown', receipt_json = ?2, updated_at = ?3,
+             compat_outstanding = CASE WHEN route = 'desktop_ipc' AND kind = 'send'
+                 THEN 1 ELSE compat_outstanding END,
+             compat_turn_id = CASE WHEN route = 'desktop_ipc' AND kind = 'send'
+                 THEN NULL ELSE compat_turn_id END
          WHERE action_id = ?1 AND state = 'reserved'",
         params![action_id, receipt_json, now_ms],
     )

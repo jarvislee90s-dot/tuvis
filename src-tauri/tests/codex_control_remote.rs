@@ -55,7 +55,6 @@ fn seed_device(conn: &SharedConn, id: &str, name: &str) {
 struct SendRecord {
     action_id: String,
     composed: String,
-    client_message_id: String,
 }
 
 /// 假派发器：记录 A 路派发输入（组合后的文本），返回预设 Rpc 结果。
@@ -165,10 +164,10 @@ impl DesktopDispatch for FakeDispatch {
         composed: &str,
         client_message_id: &str,
     ) -> multi_agents_manager_lib::services::codex_control::BoxDispatchFut {
+        let _ = client_message_id; // P3-3 后恢复行派发被闸，无对照读者；保留参数形
         self.sends.lock().unwrap().push(SendRecord {
             action_id: action_id.to_string(),
             composed: composed.to_string(),
-            client_message_id: client_message_id.to_string(),
         });
         let out = self.send_outcome.lock().unwrap().clone();
         Box::pin(async move { out })
@@ -458,7 +457,16 @@ async fn restart_reserved_becomes_unknown() {
     let receipt = va.receipt.expect("unknown 动作带回执");
     assert_eq!(receipt.delivery, Delivery::UnknownDelivery);
 
-    // queued 不受影响，按序发送且保留原输入
+    // 2026-10-17 复审 P3-3：desktop_ipc 普通消息的恢复同时存**保守屏障**——
+    // 原 Turn 可能已收到（RPC 已发出、ack/落账丢失），重启后顺序限制保守在册
+    //（无 turn 身份不自动释放；与 finish_with_turn_barrier 的 Unknown 口径一致）
+    assert!(
+        h.store.has_compat_fence(&h.key).expect("query"),
+        "unknown 恢复行存保守屏障"
+    );
+
+    // queued 行不受影响（仍可查、原文/设备/原 client_message_id 保留），
+    // 但派发被保守屏障闸住：未知结果的动作后不得自动越队
     let head = h
         .store
         .next_queued(&h.key)
@@ -467,15 +475,26 @@ async fn restart_reserved_becomes_unknown() {
     assert_eq!(head.ctx.action_id, "act-b");
     assert_eq!(head.raw_text, "第二条");
     assert_eq!(head.ctx.device_name, "iPhone");
-    let rb = completed(h.router.flush_thread(&h.key).await.expect("b dispatchable"));
-    assert_eq!(rb.delivery, Delivery::Accepted);
-    let sends = h.dispatch.sends.lock().unwrap();
-    assert_eq!(sends.len(), 1);
-    assert_eq!(
-        sends[0].client_message_id, head.client_message_id,
-        "恢复沿用原 client_message_id"
+    assert!(
+        !head.client_message_id.is_empty(),
+        "恢复保留账本持久化的原 client_message_id"
     );
-    assert_eq!(sends[0].composed, "第二条 [mobile iPhone]");
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "保守屏障闸住接力（队列视图 blockedReason 如实说明）"
+    );
+    assert_eq!(h.dispatch.send_count(), 0, "屏障在册零派发");
+
+    // 多轮对账也不解锁（C1.2：Unknown 不是完成，对账不是定时器条件）
+    for _ in 0..3 {
+        h.router.converge_with_ledger();
+        assert!(h.router.flush_thread(&h.key).await.is_none());
+    }
+    assert!(
+        !h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 999)),
+        "无 turn 身份的保守屏障不因任何投影释放"
+    );
 }
 
 // ============================================================

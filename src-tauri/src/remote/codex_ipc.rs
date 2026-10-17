@@ -377,8 +377,8 @@ async fn scheduler_loop(hub: Arc<CodexControlHub>, st: Arc<RemoteState>) {
             _ = tick.tick() => {
                 // R9 复审 P2-2：先收敛被取消等待者的残留状态——超龄 reserved →
                 // unknown（重启 recover 同语义），内存 Turn 簿记与账本终态对齐
-                //（accepted 补绑 turnId / rejected、无证据 unknown 解除限制），
-                // 否则该 thread 队列在进程内永久卡死
+                //（accepted 补绑 turnId / rejected、cancelled 解除限制；**Unknown
+                // 一律保留**——2026-10-17 复审 C1.2：对账不是解除屏障的定时器条件）
                 let recovered = hub.router.store().mark_stale_reserved_unknown(STUCK_DISPATCH_MS);
                 hub.router.converge_with_ledger();
                 // R7.1 启动恢复（首 tick 即到点）/ R7.2 周期对账：枚举全部待发 thread

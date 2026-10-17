@@ -260,11 +260,20 @@ export default function PendingRequestCard({
       onReceipt?.(r);
     } catch (e) {
       if (stale()) return; // 旧 token 的异常：不覆盖新卡状态
-      if (e instanceof ApiError && e.status === 409) {
-        // 过期上下文：token/owner 已换代——如实提示，等新投影换 token（不自动重试）。
-        // 提交已被明确拒绝（未派发）→ ID 让位，新上下文的新动作生成新 ID。
+      // 409 的两臂（复审 P3-5）：stale_context = 过期上下文（等新投影换 token）；
+      // action_conflict = 同 actionId 重放不同载荷。两者都是投递前明确拒绝——
+      // ID 让位（新上下文/新动作生成新 ID），文案按错误码精确区分不串。
+      if (
+        e instanceof ApiError &&
+        e.status === 409 &&
+        (e.data?.error === "stale_context" || e.data?.error === "action_conflict")
+      ) {
         submitActionIdRef.current = null;
-        setError(i18n.t("mobile.codex.pending.staleContext"));
+        setError(
+          e.data?.error === "stale_context"
+            ? i18n.t("mobile.codex.pending.staleContext")
+            : i18n.t("mobile.codex.pending.failed", { message: "action_conflict" })
+        );
         return;
       }
       if (e instanceof ApiError && isPreDeliveryRefusal(e)) {
