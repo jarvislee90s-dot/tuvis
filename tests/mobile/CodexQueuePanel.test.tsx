@@ -246,4 +246,29 @@ describe("CodexQueuePanel（Task 9）", () => {
     expect(row.textContent).toContain("第1位");
     expect(queueGetCalls()).toBe(2);
   });
+
+  it("streaming_revisions_do_not_starve_enqueue_refresh：流式 revision 每 100ms 推进不断重置去抖——入队刷新仍在 maxWait 上限内落地（C6）", async () => {
+    vi.useFakeTimers();
+    installFetch();
+    routes.queue = [queueView([])];
+    const { rerender } = render(<CodexQueuePanel sessionId="s1" />);
+    const advance = async (ms: number) => {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ms);
+      });
+    };
+    await advance(10);
+    expect(queueGetCalls()).toBe(1); // 挂载拉取
+    // 入队完成 + 此后流式输出每 100ms 推进一次 revision（refreshSignal 持续递增，
+    // 每次都重置 250ms 去抖——旧实现在此被无限饿死）
+    routes.queue = [queueView([action({ actionId: "a1", position: 1 })])];
+    for (let i = 1; i <= 25; i += 1) {
+      rerender(<CodexQueuePanel sessionId="s1" refreshSignal={i} />);
+      await advance(100);
+    }
+    // 2.5s > maxWait(2s)：刷新必然已落地（条目可见可撤），不是等流式停歇
+    expect(queueGetCalls()).toBeGreaterThanOrEqual(2);
+    expect(screen.getByTestId("codex-queue-row-a1")).toBeTruthy();
+    vi.useRealTimers();
+  });
 });

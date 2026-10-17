@@ -1031,6 +1031,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       const el = messageAreaRef.current;
       pollFollowRef.current = el === null || isNearBottom(el);
       setRefreshTick((t) => t + 1);
+      // C6：队列账本的有界对账——compat-only（无 IPC 投影事件）下后台清屏障/
+      // 接力派发只改服务端账本，没有可靠通知源；借既有 10s 可见轮询对账队列
+      // 视图（仅 codex 会话 bump；面板未挂载时只是空 tick，零请求）
+      if (session.agentType === "codex") {
+        setCodexQueueTick((t) => t + 1);
+      }
     };
     let timer: ReturnType<typeof setInterval> | null = null;
     const stop = () => {

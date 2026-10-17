@@ -28,6 +28,10 @@ import { ApiError } from "./api";
 /** 外部触发的去抖窗口（毫秒）：同一会话内的密集触发（发送回执 + 投影跃迁几乎
  *  同时到达）合并为一次重拉；拉取本身是会话级短查询，延迟一拍无感 */
 const QUEUE_REFRESH_DEBOUNCE_MS = 250;
+/** C6：去抖**上限等待**（毫秒）：流式输出每 ~100ms 推进一次 revision，若每次
+ *  都重置去抖，入队回执触发的刷新会被无限推后（条目直到输出暂停才可见/可撤）。
+ *  自首个未处理触发起超过本上限即立即重拉——合并与及时性两头保住。 */
+const QUEUE_REFRESH_MAX_WAIT_MS = 2000;
 
 /** 动作状态 → 展示词（snake_case wire 词 → 用户可读；unknown 如实「结果未知」） */
 function stateLabel(s: CodexActionState): string {
@@ -66,6 +70,8 @@ export default function CodexQueuePanel({
   /** 乱序防护：会话哨兵——响应落地时会话已切换即作废（旧 session 结果不回灌） */
   const sessionRef = useRef(sessionId);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** C6：首个未处理触发的时刻（maxWait 基准；重拉完成即清） */
+  const firstPendingAtRef = useRef<number | null>(null);
 
   const load = useCallback(async () => {
     const sid = sessionId;
@@ -83,6 +89,7 @@ export default function CodexQueuePanel({
   // 挂载/换会话拉取；换会话先清（防串台），并作废在途的去抖定时器与旧响应
   useEffect(() => {
     sessionRef.current = sessionId;
+    firstPendingAtRef.current = null;
     setView(null);
     setNote(null);
     void load();
@@ -94,14 +101,25 @@ export default function CodexQueuePanel({
     };
   }, [sessionId, load]);
 
-  // R11：外部触发 → 去抖合并重拉（信号为 0 = 尚无外部触发，不拉）
+  // R11 + C6：外部触发 → 去抖合并重拉（信号为 0 = 尚无外部触发，不拉）。
+  // 去抖带 maxWait 上限：流式 revision 每 ~100ms 推进会不断重置去抖——自首个
+  // 未处理触发起超过 QUEUE_REFRESH_MAX_WAIT_MS 即立即重拉（入队条目在明确上限
+  // 内可见/可撤，不被流式输出饿死）。
   useEffect(() => {
     if (refreshSignal <= 0) return;
     if (debounceRef.current !== null) clearTimeout(debounceRef.current);
+    const now = Date.now();
+    if (firstPendingAtRef.current === null) firstPendingAtRef.current = now;
+    const elapsed = now - firstPendingAtRef.current;
+    const delay = Math.max(
+      0,
+      Math.min(QUEUE_REFRESH_DEBOUNCE_MS, QUEUE_REFRESH_MAX_WAIT_MS - elapsed)
+    );
     debounceRef.current = setTimeout(() => {
       debounceRef.current = null;
+      firstPendingAtRef.current = null;
       void load();
-    }, QUEUE_REFRESH_DEBOUNCE_MS);
+    }, delay);
   }, [refreshSignal, load]);
 
   const retract = useCallback(

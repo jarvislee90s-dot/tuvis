@@ -510,4 +510,77 @@ describe("PendingRequestCard：提交 ID 与响应守卫（R12）", () => {
     await flushAsync();
     expect(respondBodies()).toHaveLength(1);
   });
+
+  it("proxy_504_keeps_same_id_and_reconciles_accepted：POST 504（代理在服务端处理后返回）→ 不解锁重按，沿同 ID 只读核对到 accepted", async () => {
+    installFetch();
+    // 504 + 非我方机器码错误体 → 不可判零投递（C5：与无响应同——结果未知）
+    routes.respondStatus = 504;
+    routes.respondBody = { error: "gateway_timeout" };
+    // 核对：账本已 accepted（服务端确实处理了）
+    routes.codexAction = {
+      actionId: "act-504",
+      state: "accepted",
+      position: null,
+      receipt: {
+        actionId: "act-504",
+        delivery: "accepted",
+        route: "desktop_ipc",
+        turnId: "t1",
+        envelopeId: "e1",
+        reasonCode: null,
+      },
+    };
+    render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    fireEvent.click(screen.getByTestId("codex-pending-approve"));
+    await flushAsync();
+    // 恰一次 POST；沿同 ID 恰一次只读核对
+    const bodies = respondBodies();
+    expect(bodies).toHaveLength(1);
+    const queries = actionQueryUrls();
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toContain(String(bodies[0].actionId));
+    // 核对到 accepted → 按 accepted 呈现 + 锁卡（绝不借新 ID 重投——IPC write 恒 1）
+    expect(screen.getByTestId("codex-pending-note").textContent).toContain("已受理");
+    expect((screen.getByTestId("codex-pending-approve") as HTMLButtonElement).disabled).toBe(true);
+    await flushAsync();
+    expect(respondBodies()).toHaveLength(1);
+  });
+
+  it("reconciled_not_sent_unlocks_new_action：核对到 not_sent（明确零投递）→ 底注「未发送」、按钮恢复（再按=新 actionId），绝不按 rejected 锁死", async () => {
+    installFetch();
+    routes.respondStatus = 504;
+    routes.respondBody = {};
+    // 账本：state=rejected 但原始回执 delivery=not_sent（DAO 同状态承载两语义）
+    routes.codexAction = {
+      actionId: "act-ns",
+      state: "rejected",
+      position: null,
+      receipt: {
+        actionId: "act-ns",
+        delivery: "not_sent",
+        route: "desktop_ipc",
+        turnId: null,
+        envelopeId: null,
+        reasonCode: "stale_context",
+      },
+    };
+    const onReceipt = vi.fn();
+    render(<PendingRequestCard sessionId="s1" request={commandPending()} onReceipt={onReceipt} />);
+    fireEvent.click(screen.getByTestId("codex-pending-approve"));
+    await flushAsync();
+    expect(respondBodies()).toHaveLength(1);
+    // C5：尊重原始回执语义——not_sent 不是 rejected，不锁卡
+    expect(screen.getByTestId("codex-pending-note").textContent).toContain("未发送");
+    const approve = screen.getByTestId("codex-pending-approve") as HTMLButtonElement;
+    expect(approve.disabled).toBe(false);
+    // 再按 = 新动作新 ID（零投递上重试安全）
+    routes.respondStatus = undefined;
+    routes.respondBody = undefined;
+    routes.respond = receipt("accepted");
+    fireEvent.click(approve);
+    await flushAsync();
+    const bodies = respondBodies();
+    expect(bodies).toHaveLength(2);
+    expect(String(bodies[1].actionId)).not.toBe(String(bodies[0].actionId));
+  });
 });

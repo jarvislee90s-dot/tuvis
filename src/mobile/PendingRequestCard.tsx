@@ -96,8 +96,11 @@ function receiptCopy(r: ActionReceipt): string {
 }
 
 /** R12：账本查询终态 → 明确回执（网络异常后的只读核对结果）。accepted = 已受理；
- *  rejected = 明确拒绝；cancelled/queued/reserved/unknown = 未终态或已撤 → null
- *  （保持「投递结果未知」）。 */
+ *  rejected 分支**尊重原始回执语义**（2026-10-17 复审 C5）：DAO 用 rejected 状态
+ *  同时承载 NotSent/Rejected，区别以 receipt.delivery 为准——not_sent = 明确零
+ *  投递（底注「未发送」，按钮保留：再按 = 新 actionId，零投递上重试安全）；
+ *  rejected = 明确拒绝（锁卡）。绝不按粗粒度 state 重造不同语义。
+ *  cancelled/queued/reserved/unknown = 未终态或已撤 → null（保持「投递结果未知」）。 */
 function actionViewToReceipt(
   actionId: string,
   view: { state: string; receipt: ActionReceipt | null }
@@ -115,14 +118,34 @@ function actionViewToReceipt(
   if (view.state === "rejected") {
     return {
       actionId,
-      delivery: "rejected",
+      delivery: view.receipt?.delivery ?? "rejected",
       route: view.receipt?.route ?? "desktop_ipc",
-      turnId: null,
-      envelopeId: null,
+      turnId: view.receipt?.turnId ?? null,
+      envelopeId: view.receipt?.envelopeId ?? null,
       reasonCode: view.receipt?.reasonCode ?? null,
     };
   }
   return null;
+}
+
+/** C5：**可靠的投递前拒绝**判定——只有我方机器码错误体能认定零投递、ID 让位
+ *  解锁再按（新动作）；其余一切（5xx/代理错误/畸形响应体）与无响应同：提交结果
+ *  未知，保留同 ID 只读核对（S5：代理可在服务端已处理后返回 504，新 ID 重按 =
+ *  双投窗口）。 */
+const PRE_DELIVERY_ERROR_CODES = new Set([
+  "bad_request", // malformed / deny_unknown_fields（登记前拒绝）
+  "answers_mismatch", // 答案限额校验（登记前拒绝）
+  "answer_not_option",
+  "invalid_id",
+  "forbidden", // 设备门禁（gate 层，登记前拒绝）
+  "no_session", // 会话不在快照（无任何投递）
+  "no_action", // 动作不存在（他人/已清除）
+]);
+
+function isPreDeliveryRefusal(e: ApiError): boolean {
+  if (e.status === null) return false;
+  const code = typeof e.data?.error === "string" ? e.data.error : null;
+  return code !== null && PRE_DELIVERY_ERROR_CODES.has(code);
 }
 
 /** 一题的已答标签：勾选的选项 + 「其他」自由文本（isOther 才有输入框） */
@@ -244,20 +267,17 @@ export default function PendingRequestCard({
         setError(i18n.t("mobile.codex.pending.staleContext"));
         return;
       }
-      if (e instanceof ApiError && e.status !== null) {
-        // 其他 4xx/5xx：服务端明确拒绝（未派发）——如实提示，解锁可再按（新动作新 ID）
+      if (e instanceof ApiError && isPreDeliveryRefusal(e)) {
+        // C5：**可靠的投递前拒绝**（我方机器码错误体：400 校验 / 403 设备门 /
+        // 404 会话或动作不存在）——零投递可判，ID 让位，解锁可再按（新动作新 ID）。
         submitActionIdRef.current = null;
-        const reason =
-          e instanceof ApiError && typeof e.data?.reason === "string"
-            ? e.data.reason
-            : e instanceof ApiError
-              ? e.message
-              : String(e);
+        const reason = typeof e.data?.reason === "string" ? e.data.reason : e.message;
         setError(i18n.t("mobile.codex.pending.failed", { message: reason }));
         return;
       }
-      // **网络异常（无响应可读）= 提交结果未知**：不换 ID、不解锁重投——改用
-      // fetchCodexAction 只读核对原 action，按查询结果呈现（R12）。
+      // 其余一切（5xx/代理错误/无响应可读）= **提交结果未知**：代理可在服务端已
+      // 处理后返回 504——不换 ID、不解锁重投（新 ID 重按 = 双投窗口，S5），改用
+      // fetchCodexAction 只读核对原 action，按查询结果呈现（R12/C5）。
       setVerifying(true);
       try {
         const view = await fetchCodexAction(actionId);

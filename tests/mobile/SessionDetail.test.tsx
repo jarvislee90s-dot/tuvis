@@ -4463,6 +4463,52 @@ describe("SessionDetail：Codex 队列联动刷新（R11）", () => {
     fireEvent.click(retract);
     await waitFor(() => expect(screen.queryByTestId("codex-queue-row-act-c1")).toBeNull());
   });
+
+  it("compat_only_background_queue_change_converges_without_user_action：compat-only 后台清屏障推进队列 → 无用户操作/SSE 页面自行收敛（C6 有界对账）", async () => {
+    vi.useFakeTimers();
+    installFetch();
+    routes.sessionMode = codexAppMode();
+    routes.codexThread = codexProjection({ availability: "compat_only" });
+    let queueNow: unknown = {
+      actions: [queueAction("act-c2", 1)],
+      blockedReasonCode: "compat_outstanding",
+    };
+    routes.codexQueue = () => queueNow;
+    const advance = async (ms: number) => {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ms);
+      });
+    };
+    render(
+      <SessionDetail
+        session={makeSession({
+          id: "sess-c6",
+          agentType: "codex",
+          form: "app",
+          status: "processing",
+        })}
+        onBack={() => {}}
+      />
+    );
+    await advance(100);
+    expect(screen.getByTestId("mode-bar-app")).toBeTruthy();
+    MockEventSource.latest().emit("snapshot", codexProjection({ availability: "compat_only" }));
+    await advance(600); // 覆盖入队刷新的去抖窗口
+    expect(screen.getByTestId("codex-queue-row-act-c2")).toBeTruthy();
+    expect(screen.getByTestId("codex-queue-blocked")).toBeTruthy();
+    const n0 = queueGetCount();
+    // 后台清屏障（服务端调度完成）——期间零用户操作、零 SSE 推进
+    //（projection 停在旧 snapshot；compat-only 无 IPC 事件源）
+    queueNow = { actions: [queueAction("act-c2", 1)], blockedReasonCode: null };
+    await advance(11_000); // ≥ 一个对账周期（10s 有界轮询）
+    expect(screen.queryByTestId("codex-queue-blocked")).toBeNull();
+    expect(queueGetCount()).toBeGreaterThan(n0);
+    // 队首派发完成 → 条目随有界对账消失，面板自隐
+    queueNow = { actions: [], blockedReasonCode: null };
+    await advance(11_000);
+    expect(screen.queryByTestId("codex-queue-panel")).toBeNull();
+    vi.useRealTimers();
+  }, 30_000);
 });
 
 // ============================================================

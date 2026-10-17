@@ -340,7 +340,10 @@ function unknownDeliveryReceipt(actionId: string): ActionReceipt {
 
 /** R12：fetchCodexAction 的账本终态 → 明确回执（unknown 结果核对的升级呈现）。
  *  accepted = 已受理；rejected/cancelled = 明确未投递（终态）；其余（queued/
- *  reserved/unknown）未终态 → null（保持「投递结果未知」）。 */
+ *  reserved/unknown）未终态 → null（保持「投递结果未知」）。
+ *  2026-10-17 复审 C5：**尊重原始回执语义**——DAO 用 rejected 状态同时承载
+ *  NotSent/Rejected，区别以 receipt.delivery 为准（not_sent 保持 not_sent：
+ *  明确零投递，chip「未发送」且草稿可恢复；绝不按粗粒度 state 重造语义）。 */
 function actionViewToReceipt(
   actionId: string,
   view: { state: string; receipt: ActionReceipt | null }
@@ -358,14 +361,32 @@ function actionViewToReceipt(
   if (view.state === "rejected" || view.state === "cancelled") {
     return {
       actionId,
-      delivery: "rejected",
+      delivery: view.receipt?.delivery ?? "rejected",
       route: view.receipt?.route ?? "desktop_ipc",
-      turnId: null,
-      envelopeId: null,
+      turnId: view.receipt?.turnId ?? null,
+      envelopeId: view.receipt?.envelopeId ?? null,
       reasonCode: view.receipt?.reasonCode ?? view.state,
     };
   }
   return null;
+}
+
+/** 2026-10-17 复审 C5（非阻塞项）：**可靠的投递前拒绝**——只有我方机器码错误体
+ *  能认定零投递（草稿完整保留：消息未离开客户端，条件恢复后重按 = 新动作）；
+ *  其余（网络断/5xx）仍走 unknown 核对路径（POST 可能已到达服务端）。 */
+const SESSION_SEND_PRE_DELIVERY_CODES = new Set([
+  "bad_request",
+  "action_id_required",
+  "action_conflict",
+  "headless_disabled",
+  "forbidden",
+  "no_session",
+]);
+
+function isSessionSendPreDeliveryRefusal(e: unknown): e is ApiError {
+  if (!(e instanceof ApiError) || e.status === null) return false;
+  const code = typeof e.data?.error === "string" ? e.data.error : null;
+  return code !== null && SESSION_SEND_PRE_DELIVERY_CODES.has(code);
 }
 
 export default function MessageComposer({
@@ -598,21 +619,32 @@ export default function MessageComposer({
   /** R12：unknown 结果的只读核对（**恰一次**；绝不重发 POST）。按账本查询结果呈现：
    *  accepted → 升级「已受理」；rejected/cancelled（明确终态）→「未送达」并让位 ID；
    *  查不到/未终态/查询失败 → 保持「投递结果未知」，actionId 保留作下一次核对锚。
-   *  代守卫：核对在途期间用户又发起发送（代际 +1）→ 迟到的核对结果作废，不覆盖新回执。 */
-  const verifyCodexDelivery = useCallback(async (actionId: string) => {
-    const gen = codexSendGenRef.current;
-    let view: Awaited<ReturnType<typeof fetchCodexAction>>;
-    try {
-      view = await fetchCodexAction(actionId);
-    } catch {
-      return; // 查询失败：保持「投递结果未知」呈现（不重发、不清 ID——下次触发再核对）
-    }
-    if (gen !== codexSendGenRef.current) return; // 已有更新的发送，旧核对结果作废
-    const r = actionViewToReceipt(actionId, view);
-    if (r === null) return; // 未终态（queued/reserved/unknown）：保持未知呈现
-    codexActionIdRef.current = null; // 核对完成（明确终态）→ ID 让位，下一条消息 = 新动作
-    setReceipt({ kind: "codex", receipt: r });
-  }, []);
+   *  代守卫：核对在途期间用户又发起发送（代际 +1）→ 迟到的核对结果作废，不覆盖新回执。
+   *  C5（非阻塞项）：`draft` = unknown 路径清空前的原文/附件——核对到 **not_sent
+   *  （明确零投递）** 时恢复草稿（消息确认未离开客户端；输入框已被新输入占用则
+   *  不覆盖，只更新回执）。 */
+  const verifyCodexDelivery = useCallback(
+    async (actionId: string, draft?: { text: string; attachments: PendingAttachment[] }) => {
+      const gen = codexSendGenRef.current;
+      let view: Awaited<ReturnType<typeof fetchCodexAction>>;
+      try {
+        view = await fetchCodexAction(actionId);
+      } catch {
+        return; // 查询失败：保持「投递结果未知」呈现（不重发、不清 ID——下次触发再核对）
+      }
+      if (gen !== codexSendGenRef.current) return; // 已有更新的发送，旧核对结果作废
+      const r = actionViewToReceipt(actionId, view);
+      if (r === null) return; // 未终态（queued/reserved/unknown）：保持未知呈现
+      codexActionIdRef.current = null; // 核对完成（明确终态）→ ID 让位，下一条消息 = 新动作
+      setReceipt({ kind: "codex", receipt: r });
+      if (r.delivery === "not_sent" && draft !== undefined) {
+        // 明确零投递：恢复原文/附件（输入框未被新输入占用才恢复，绝不覆盖新草稿）
+        setText((prev) => (prev === "" ? draft.text : prev));
+        setAttachments((prev) => (prev.length === 0 ? draft.attachments : prev));
+      }
+    },
+    []
+  );
 
   const handleSend = useCallback(async () => {
     const body = text.trim();
@@ -799,7 +831,11 @@ export default function MessageComposer({
           setText("");
           setAttachments([]);
           // ID 保留（res.receipt.actionId 即本次动作）；核对结果到货后按终态升级呈现
-          void verifyCodexDelivery(res.receipt.actionId);
+          //（C5：携带被清空的原文/附件——核对到明确零投递时恢复草稿）
+          void verifyCodexDelivery(res.receipt.actionId, {
+            text,
+            attachments: attachments.filter((a) => a.status === "ready"),
+          });
         } else {
           // not_sent / rejected：终态处理——ID 让位（明确零投递/明确拒绝后新动作不冲突）
           codexActionIdRef.current = null;
@@ -889,10 +925,22 @@ export default function MessageComposer({
       // fetchCodexAction 只读核对，按查询结果呈现（查不到/未终态 = 「投递结果未知」，
       // 引导回 Desktop 核对）。
       if (codexApp && myActionId !== undefined) {
+        if (isSessionSendPreDeliveryRefusal(e)) {
+          // C5（非阻塞项）：**可靠的投递前拒绝**（403 headless_disabled/设备门、
+          // 400 契约面、404 会话不在、409 冲突）——零投递可判：草稿完整保留
+          //（消息未离开客户端，条件恢复后重按 = 新动作），ID 让位
+          codexActionIdRef.current = null;
+          setReceipt({ kind: "failed", error: errorCopy });
+          return;
+        }
         setText("");
         setAttachments([]);
         setReceipt({ kind: "codex", receipt: unknownDeliveryReceipt(myActionId) });
-        void verifyCodexDelivery(myActionId);
+        // C5：携带被清空的原文/附件——核对到明确零投递（not_sent）时恢复草稿
+        void verifyCodexDelivery(myActionId, {
+          text,
+          attachments: attachments.filter((a) => a.status === "ready"),
+        });
         return;
       }
       // **无头发送的异常必须收敛为失败终态**（复审 Important 1）：请求本身抛（网络断/
