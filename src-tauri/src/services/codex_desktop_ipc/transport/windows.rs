@@ -276,4 +276,129 @@ mod tests {
         sv.await??;
         Ok(())
     }
+
+    /// F3（2026-10-17 复审）：忙态第二客户端 → ERROR_PIPE_BUSY 重试 → 服务端
+    /// accept 后生产 `connect()` 成功（探针 P2 的仓内自动化形态）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn busy_pipe_retries_then_connects() -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let test_pipe = format!(
+            "\\\\.\\pipe\\codex-ipc-test-{}",
+            crate::services::codex_desktop_ipc::types::new_uuid()
+        );
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&test_pipe)?;
+        let ep = DesktopEndpoint {
+            platform: "windows".into(),
+            path: test_pipe.clone(),
+            build: None,
+        };
+        // 客户端先发起（实例忙 → BUSY 重试）；200ms 后服务端 accept
+        let sv = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            server.connect().await?;
+            let (mut r, mut w) = tokio::io::split(server);
+            let mut buf = vec![0u8; 16];
+            let n = r.read(&mut buf).await?;
+            w.write_all(&buf[..n]).await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let mut io = tokio::time::timeout(std::time::Duration::from_secs(10), super::connect(&ep))
+            .await
+            .expect("busy 重试必须限时成功")
+            .expect("connect after busy");
+        io.write_all(b"busy").await?;
+        let mut buf = vec![0u8; 16];
+        let n = io.read(&mut buf).await?;
+        assert_eq!(&buf[..n], b"busy");
+        sv.await??;
+        Ok(())
+    }
+
+    /// F3：持续忙 → 外层预算耗尽诚实 `Timeout`（绝不误判成功；探针 P3 形态）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn sustained_busy_times_out_honestly() -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let test_pipe = format!(
+            "\\\\.\\pipe\\codex-ipc-test-{}",
+            crate::services::codex_desktop_ipc::types::new_uuid()
+        );
+        // 服务端实例存在但**永不** accept：客户端重试预算耗尽
+        let _server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&test_pipe)?;
+        let ep = DesktopEndpoint {
+            platform: "windows".into(),
+            path: test_pipe,
+            build: None,
+        };
+        let started = std::time::Instant::now();
+        let r = super::connect(&ep).await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(r, Err(ProtocolError::Timeout(_))),
+            "持续忙必须诚实超时，实际 {}",
+            match &r {
+                Err(e) => e.to_string(),
+                Ok(_) => "unexpectedly connected".into(),
+            }
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2),
+            "超时必须耗尽外层预算（实际 {elapsed:?}）"
+        );
+        Ok(())
+    }
+
+    /// F3：读挂起不阻塞写（全双工；探针 P4 形态）——服务端延迟读，客户端写
+    /// 仍即时完成。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn read_blocked_does_not_block_write() -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let test_pipe = format!(
+            "\\\\.\\pipe\\codex-ipc-test-{}",
+            crate::services::codex_desktop_ipc::types::new_uuid()
+        );
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&test_pipe)?;
+        let ep = DesktopEndpoint {
+            platform: "windows".into(),
+            path: test_pipe,
+            build: None,
+        };
+        // 服务端 connect 后先睡 300ms 再读（读挂起窗口）
+        let sv = tokio::spawn(async move {
+            server.connect().await?;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let (mut r, mut w) = tokio::io::split(server);
+            let mut buf = vec![0u8; 4096];
+            let n = r.read(&mut buf).await?;
+            w.write_all(&buf[..n]).await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let io = super::connect(&ep).await?;
+        // split 读写半：写在独立任务完成（读挂起窗口内，不互相阻塞）
+        let (mut r_half, mut w_half) = tokio::io::split(io);
+        let write = tokio::spawn(async move {
+            w_half.write_all(&[0u8; 4096]).await?;
+            Ok::<(), std::io::Error>(())
+        });
+        tokio::time::timeout(std::time::Duration::from_millis(250), write)
+            .await
+            .expect("写必须在读挂起窗口内完成（全双工）")
+            .expect("write task join")
+            .expect("write io");
+        let mut buf = vec![0u8; 4096];
+        let n = r_half.read(&mut buf).await?;
+        assert_eq!(n, 4096);
+        sv.await??;
+        Ok(())
+    }
 }

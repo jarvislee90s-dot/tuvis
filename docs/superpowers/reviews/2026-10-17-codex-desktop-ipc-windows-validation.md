@@ -18,7 +18,7 @@
 ```text
 pnpm install --frozen-lockfile
 pnpm build:mobile
-pnpm test            # 预期 152 文件 / 1635 passed / 5 skipped
+pnpm test            # 预期 152 文件（数量随批增长，以分支 HEAD 实际为准；本轮 1639 passed / 5 skipped）
 pnpm check           # 含 format/lint/i18n/error-codes/build
 
 # 以下在src-tauri目录执行
@@ -27,7 +27,7 @@ cargo clippy --all-targets --features marker-helper -- -D warnings
 cargo test --lib --features marker-helper codex_desktop_ipc::transport::windows::tests:: -- --nocapture
 cargo test --features marker-helper --test codex_desktop_ipc --test codex_control_remote --test codex_ipc_remote
 # 预期：29 / 23 / 36 全绿（若个别红：单跑复现并留存日志，不在本批修码——回传主聊天裁决）
-cargo test --lib --features marker-helper          # 预期 2854 passed / 0 failed
+cargo test --lib --features marker-helper          # 预期 0 failed；**passed 数按平台/feature 各自记录**（macOS 与 Windows 的 cfg 差异 + 修复提交都会改变总数，不写死跨平台相同数字——2026-10-17 F6 教训）
 ```
 
 已知非阻塞（复审登记，遇到勿当新回归）：`client_status_changed_invalidates_all_threads_of_owner` 与 `session_open_endpoint_reuses_trusted_casing_silently` 满载下曾 flaky，修复后单跑/全量均绿；再红则单跑复现并回传。
@@ -78,7 +78,7 @@ cargo test --lib --features marker-helper          # 预期 2854 passed / 0 fail
 
 返工已包含：ERROR_PIPE_BUSY 用 SDK 常量 231、假pipe随机专属名、ci.yml windows-native job、mirror 真实形状寻址（无 conversationState 前缀）、owner 失效/断线恢复闭环、profile 按连接动态解析、pending 提交互斥、FIFO 只收 send、Turn 终态绑定（嵌套回执解包）、hub 启动恢复与周期对账、所有 Codex APP 消息统一经账本、fence 先持久、派发独立任务落账与超龄收敛。你的职责是**在原生 Windows 上验证这些合同**，不是再修一遍；发现红先单跑复现并留存日志回传，不在验证分支上改码。
 
-先完成本文第一批自动/只读验证：跑列出的 pnpm/cargo 命令（预期数：前端 152 文件/1635 绿；集成 29/23/36 绿；lib 2854 绿），明确非零退出与实际测试数；交叉check不等价于原生运行。再逐行过场景矩阵（含〔返工新增/改口〕行）：真实named-pipe往返、busy 231重试、全双工、分块帧、未知投递与收敛、owner A/B 与恢复、动态profile三段、FIFO、认证与统一账本。全程使用假Desktop与memory DB/tempdir，不控制用户真实Thread、不重启Desktop、不启动写真实账本的Tuvis。
+先完成本文第一批自动/只读验证：跑列出的 pnpm/cargo 命令（预期数以分支 HEAD 实际为准并**按平台/feature 分别记录**——集成套件 codex_ipc_remote/codex_control_remote/codex_desktop_ipc 的用例数随返工批增长），明确非零退出与实际测试数；交叉check不等价于原生运行。另：前端 `SessionDetail` 满载滚动用例存在已知 flake（Windows 报告 F5：满载偶发红、隔离单跑恒绿）——首轮全量出现该红时**先隔离复跑再定性**，不直接当回归。再逐行过场景矩阵（含〔返工新增/改口〕行）：真实named-pipe往返、busy 231重试、全双工、分块帧、未知投递与收敛、owner A/B 与恢复、动态profile三段、FIFO、认证与统一账本。全程使用假Desktop与memory DB/tempdir，不控制用户真实Thread、不重启Desktop、不启动写真实账本的Tuvis。
 
 真实发送、两类审批、Plan问答和重启恢复属于第二批，待用户开启手工测验再执行。版本不匹配和NOT_TRIGGERED如实记录，不能强开生产flag。
 

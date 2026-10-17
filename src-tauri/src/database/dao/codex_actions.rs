@@ -1134,9 +1134,17 @@ mod tests {
         finish_conn(&c, &receipt, 3000).unwrap();
         // Accepted 不清屏障（Turn 未证完成）→ 仍待发工作；route/状态合turn绑定形
         assert!(thread_has_pending_work_conn(&c, THREAD).unwrap());
+        // 2026-10-17 复审 C1/C4：accepted（desktop_ipc）+ 屏障在册 = **保守 Turn
+        // 绑定**（缺 turnId 也算——未知/缺身份的保守限制重启后同样保留）
         let bindings = turn_binding_rows_conn(&c).unwrap();
-        assert_eq!(bindings.len(), 0, "fence 未绑定 turn id 不算 Turn 绑定");
-        // 绑定 turn id（复用 compat_turn_id 槽位）→ turn binding 枚举命中
+        assert_eq!(
+            bindings.len(),
+            1,
+            "accepted+屏障即保守 Turn 绑定（缺 turnId 也算）"
+        );
+        assert_eq!(bindings[0].action_id, "a");
+        assert!(bindings[0].compat_turn_id.is_none());
+        // 绑定 turn id（复用 compat_turn_id 槽位）→ 同一行补上身份
         set_compat_dispatch_barrier_conn(
             &c,
             "a",

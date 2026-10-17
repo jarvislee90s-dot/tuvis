@@ -1493,6 +1493,10 @@ impl FakeResolver {
     ) {
         *self.0.lock().expect("lock") = FakeEndpointState::Endpoint(ep);
     }
+    /// F4（2026-10-17 复审）：恢复轮失败注入（Desktop 缺席语义）。
+    fn set_absent(&self) {
+        *self.0.lock().expect("lock") = FakeEndpointState::Absent;
+    }
 }
 
 impl EndpointResolver for FakeResolver {
@@ -2350,6 +2354,94 @@ async fn unknown_delivery_blocks_retry_same_pending() {
         .expect("in time")
         .expect("join");
     assert_eq!(o4.delivery, Delivery::Accepted);
+    adapter.shutdown().await;
+}
+
+/// 2026-10-17 复审 C2/F4：断线恢复闭环——peer 掉线 → stale 发布 → 恢复循环第一
+/// 轮失败（Desktop 缺席）→ 退避后第二轮自动重连 + 重跟随（无 GET/无手工 ensure），
+/// 新 snapshot 落进镜像、视图自动复活。
+#[tokio::test]
+async fn recovery_loop_reconnects_with_backoff_after_peer_drop() {
+    let resolver = std::sync::Arc::new(FakeResolver::absent());
+    let (io_a, mut peer_a) = ScriptedPeer::new();
+    let (io_b, mut peer_b) = ScriptedPeer::new();
+    let adapter = DesktopIpcAdapter::new(
+        std::sync::Arc::new(ScriptedConnector {
+            resolver: resolver.clone(),
+            ios: StdMutex::new([io_a, io_b].into_iter().collect()),
+        }),
+        multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile::closed(),
+    );
+    let key = tkey("rec-thread");
+    let mut sse = adapter.subscribe();
+    // 首连成功（io_a）
+    resolver.set_endpoint(test_endpoint("macos", MACOS_BUILD));
+    let t = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    drive_follow(
+        &mut peer_a,
+        "rec-thread",
+        "owner-1",
+        snapshot_change(1, vec![], true),
+        true,
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), t)
+        .await
+        .expect("in time")
+        .expect("join")
+        .expect("fresh");
+
+    // 掐断对端 → stale 发布 → 恢复循环启动；第一轮注入失败（Desktop 缺席）
+    resolver.set_absent();
+    peer_a.close();
+    let _ = wait_projection(&mut sse, "rec-thread", true, 5).await;
+
+    // 退避窗口内恢复 endpoint → 第二轮自动重连（io_b）+ 重跟随（无 GET）
+    resolver.set_endpoint(test_endpoint("macos", MACOS_BUILD));
+    // 新连接先握手（initialize），随后才是恢复性的 discovery/following
+    {
+        let init = recv_frame(&mut peer_b, 15).await;
+        assert_eq!(init["method"], "initialize");
+        peer_b
+            .send(&serde_json::json!({
+                "type": "response", "requestId": init["requestId"],
+                "resultType": "success", "method": "initialize",
+                "handledByClientId": "owner-1", "result": { "clientId": "owner-1" }
+            }))
+            .await;
+    }
+    let disc = recv_frame(&mut peer_b, 15).await;
+    assert_eq!(
+        disc["method"], "thread-owner-discovery",
+        "恢复循环必须自动重发现（无 GET/无手工 ensure）"
+    );
+    reply_discovery(&mut peer_b, &disc, "owner-1").await;
+    let follow = recv_frame(&mut peer_b, 5).await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    peer_b
+        .send(&state_frame(
+            "rec-thread",
+            "owner-1",
+            snapshot_change(2, vec![], true),
+        ))
+        .await;
+    // 新 snapshot 落进镜像：视图自动复活（revision 前进到 2）
+    let now = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let p = adapter.projection(&key).await;
+            if !p.stale && p.revision == Some(2) {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("恢复后视图必须自动复活");
+    assert_eq!(now.runtime_status, "idle");
     adapter.shutdown().await;
 }
 
