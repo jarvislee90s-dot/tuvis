@@ -2730,3 +2730,105 @@ async fn unfollow_after_following_declared_stays_dead() {
     assert!(p.stale && p.revision.is_none(), "owner 帧不复活镜像");
     adapter.shutdown().await;
 }
+
+/// 第四轮复审 B3 回归 1：bind 与 declare 之间的卸载（gate 缝固定交错）——
+/// unfollow 的 following:false 之后的重试窗口内**不得出现迟到 true**；镜像/
+/// lease 无残留；旧实现在此直接 declare（true-after-false，红）。
+#[tokio::test]
+async fn unfollow_between_bind_and_declare_never_sends_late_true() {
+    let (adapter, mut peer, _projection, key) = harness(vec![]).await;
+    // 注入 bind/declare 间等待门（恢复任务会停在 bind 之后）
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    adapter.set_follow_gate(gate.clone());
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 0,
+        "sourceClientId": "owner-1",
+        "params": { "clientId": "owner-1", "status": "disconnected" }
+    }))
+    .await;
+    let disc = recv_frame(&mut peer, 5).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    reply_discovery(&mut peer, &disc, "owner-1").await;
+    // 等任务到达 gate（lease 已 bind、尚未 declare）
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if adapter.follow_gate_reached() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("任务必须到达 bind/declare 间的 gate");
+    // bind/declare 间卸载（lease 已 bind → 释放回包 following:false 必发）
+    adapter.unfollow(&key).await;
+    let off = recv_frame(&mut peer, 5).await;
+    assert_eq!(off["method"], "thread-stream-following-changed");
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+    // 放行任务：declare 前核验必须拦下——重试窗口内 following 声明不得再有 true
+    gate.notify_one();
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(300), peer.recv()).await {
+            Err(_) => continue,
+            Ok(frame) => assert_ne!(
+                frame.get("method").and_then(|m| m.as_str()),
+                Some("thread-stream-following-changed"),
+                "false 之后不得出现迟到 true（B3）：{frame}"
+            ),
+        }
+    }
+    let p = adapter.projection(&key).await;
+    assert!(p.stale && p.revision.is_none(), "镜像不得复活");
+    adapter.shutdown().await;
+}
+
+/// 第四轮复审 B3 回归 2：bind/declare 间卸载走错误收尾后——推进重试仍不复活，
+/// 卸载后的 owner 帧（无 lease 可套）也不复活。
+#[tokio::test]
+async fn unfollow_between_bind_and_declare_recovery_retry_stays_dead() {
+    let (adapter, mut peer, _projection, key) = harness(vec![]).await;
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    adapter.set_follow_gate(gate.clone());
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 0,
+        "sourceClientId": "owner-1",
+        "params": { "clientId": "owner-1", "status": "disconnected" }
+    }))
+    .await;
+    let disc = recv_frame(&mut peer, 5).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    reply_discovery(&mut peer, &disc, "owner-1").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if adapter.follow_gate_reached() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("到 gate");
+    adapter.unfollow(&key).await;
+    let off = recv_frame(&mut peer, 5).await;
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+    gate.notify_one();
+    // 错误收尾后：重试轮前置核验跳过——推进超过退避/预算窗口仍无任何订阅声明
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    tokio::time::timeout(Duration::from_millis(400), peer.recv())
+        .await
+        .expect_err("错误收尾后推进重试不得有任何新帧（B3 回归 2）");
+    let p = adapter.projection(&key).await;
+    assert!(p.stale && p.revision.is_none(), "重试后镜像仍不复活");
+    // 卸载后的 owner 帧也不复活（lease 已被收尾回收）
+    peer.send(&state_frame(
+        &key.thread_id,
+        "owner-1",
+        snapshot_change(2, vec![], true),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let p = adapter.projection(&key).await;
+    assert!(p.stale && p.revision.is_none(), "owner 帧不复活镜像");
+    adapter.shutdown().await;
+}

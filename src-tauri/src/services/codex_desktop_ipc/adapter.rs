@@ -150,18 +150,20 @@ struct AdapterInner {
     forward_alive: AtomicBool,
     /// 重连恢复循环单飞标志（R2.5）。
     recovering: AtomicBool,
-    /// 同 socket 恢复单飞标志（2026-10-17 复审 C2：owner 失效/连接重置后重跟随，
-    /// 连接本身不断——与连接级 `recovering` 互不影响，各管各的触发面）。
-    same_socket_recovering: AtomicBool,
-    /// 同 socket 恢复待办集合（第三轮复审 B2）：后到失效事件的 keys 在**同一把
-    /// 锁内**并入在飞任务的待办——单飞只避免重复工作，绝不丢恢复工作；任务退出
-    ///（清单飞标志）也在该锁内，消除「退出判定 vs 并发入队」竞态。
-    recovery_pending: std::sync::Mutex<Vec<ThreadKey>>,
+    /// 同 socket 恢复的工作队列与消费者资格（第四轮复审 B2 结构化）：pending 与
+    /// running 同锁——「取空待办」与「释放消费者资格」在**同一临界区**完成，
+    /// 退出判定与并发入队之间不存在窗口。
+    recovery_queue: std::sync::Mutex<RecoveryQueue>,
     /// shutdown 信号（恢复循环/重拉循环的退出条件）。
     stopping: AtomicBool,
     /// C3 测试缝：respond 两阶段间的可注入等待（生产恒 None → 零开销直通）；
     /// 回归测试用它固定「阶段 1 读镜像之后、阶段 3 取 lease 之前」的 owner 换代。
     interphase_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// 第四轮复审 B3 测试缝：follow 的 bind 与 declare 之间的可注入等待
+    /// （生产恒 None → 零开销直通）；回归固定「bind/declare 间卸载」交错。
+    follow_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// B3 测试缝探针：任务已到达 follow gate。
+    follow_gate_reached: AtomicBool,
     epoch: AtomicU64,
     events: broadcast::Sender<ThreadProjection>,
 }
@@ -192,10 +194,11 @@ impl DesktopIpcAdapter {
                 history_requested: Mutex::new(HashSet::new()),
                 forward_alive: AtomicBool::new(false),
                 recovering: AtomicBool::new(false),
-                same_socket_recovering: AtomicBool::new(false),
-                recovery_pending: std::sync::Mutex::new(Vec::new()),
+                recovery_queue: std::sync::Mutex::new(RecoveryQueue::default()),
                 stopping: AtomicBool::new(false),
                 interphase_gate: std::sync::Mutex::new(None),
+                follow_gate: std::sync::Mutex::new(None),
+                follow_gate_reached: AtomicBool::new(false),
                 epoch: AtomicU64::new(0),
                 events: broadcast::channel(256).0,
             }),
@@ -341,13 +344,14 @@ impl DesktopIpcAdapter {
                 return Ok(()); // 已卸载：跳过（不重新订阅、不复活镜像）
             }
         }
-        self.follow_thread(conn, key).await?;
+        // 第四轮复审 B3：成功/错误/取消**所有出口都过统一收尾**——本任务可能已
+        // declare(true) 而本地关注已被撤销；错误出口不得 `?` 早退跳过撤销核验
+        let result = self.follow_thread(conn, key).await;
         if !self.inner.followings.lock().await.is_following(key) {
-            // 在途期间退出关注：回收（unfollow 幂等重定义后会对无 following 的
-            // 复活 lease/mirror 执行回收并发 following:false）
+            // unfollow 幂等重定义版：有复活 lease/mirror 即回收（含补偿 false）
             self.unfollow(key).await;
         }
-        Ok(())
+        result
     }
 
     /// 可复用的 follow 流程（R2.5：ensure_thread 与重连恢复共用）：
@@ -387,11 +391,55 @@ impl DesktopIpcAdapter {
         };
         // 新 follow（owner 换代）：load-complete-history 每 follow 至多一次（R1）
         self.inner.history_requested.lock().await.remove(key);
+        // B3 测试缝：bind 与 declare 之间的可注入等待（生产恒 None 直通）
+        let gate = self.inner.follow_gate.lock().expect("gate lock").clone();
+        if let Some(gate) = gate {
+            self.inner.follow_gate_reached.store(true, Ordering::SeqCst);
+            gate.notified().await;
+            self.inner
+                .follow_gate_reached
+                .store(false, Ordering::SeqCst);
+        }
+        // 第四轮复审 B3：declare **之前**最后核验——bind/declare 窗口内已卸载则
+        // 不声明（清刚 bind 的复活 lease 与镜像，bail 交调用方退避/跳过）
+        if !self.inner.followings.lock().await.is_following(key) {
+            self.inner.owners.lock().await.release(key);
+            let removed = self.inner.mirrors.lock().await.remove(key);
+            drop(removed);
+            return Err(ProtocolError::StaleContext(
+                "unfollowed before declare".into(),
+            ));
+        }
         let mut validity = {
             let owners = self.inner.owners.lock().await;
             owners.validity(&lease)
         };
         declare_following(conn, key).await?;
+        // 第四轮复审 B3：declare **之后**复查——declare 前已发生的 unfollow 把
+        // following:false 发上了 wire，本任务刚发出的 true 就是「false 之后的
+        // 迟到 true」，必须由本任务**直接向 wire** 补偿撤销（不依赖本地 lease/
+        // mirror 是否还在——它们可能已被 unfollow 清空），随后清本地并按失败退出
+        if !self.inner.followings.lock().await.is_following(key) {
+            if let Ok(version) = conn.version_of("thread-stream-following-changed") {
+                let _ = conn
+                    .broadcast(
+                        "thread-stream-following-changed",
+                        version,
+                        serde_json::json!({
+                            "conversationId": key.thread_id,
+                            "hostId": key.host_id,
+                            "following": false,
+                        }),
+                    )
+                    .await;
+            }
+            self.inner.owners.lock().await.release(key);
+            let removed = self.inner.mirrors.lock().await.remove(key);
+            drop(removed);
+            return Err(ProtocolError::StaleContext(
+                "unfollowed around declare".into(),
+            ));
+        }
         // 换代兜底：following 声明后 lease 失效（如 Desktop 断开）则失败重试
         if !*validity.borrow_and_update() {
             return Err(ProtocolError::StaleContext(
@@ -764,6 +812,18 @@ impl DesktopIpcAdapter {
         *self.inner.interphase_gate.lock().expect("gate lock") = Some(gate);
     }
 
+    /// B3 测试缝：注入 follow 的 bind/declare 间等待门（生产不调用——恒直通）。
+    #[doc(hidden)]
+    pub fn set_follow_gate(&self, gate: Arc<tokio::sync::Notify>) {
+        *self.inner.follow_gate.lock().expect("gate lock") = Some(gate);
+    }
+
+    /// B3 测试缝：任务是否已到达 follow gate。
+    #[doc(hidden)]
+    pub fn follow_gate_reached(&self) -> bool {
+        self.inner.follow_gate_reached.load(Ordering::SeqCst)
+    }
+
     /// C3 测试缝：该 (thread, request_key) 是否已抢占提交权（回归测试固定
     /// 「respond 已过阶段 2、停在测试缝」的时序用）。
     #[doc(hidden)]
@@ -1023,6 +1083,48 @@ fn spawn_recovery_task(adapter: DesktopIpcAdapter) {
     });
 }
 
+/// 同 socket 恢复的工作队列与消费者资格（第四轮复审 B2）：pending 与 running
+/// 同锁。「取空待办」与「释放消费者资格」在 [`Self::take_or_release`] 的**同一
+/// 临界区**内完成——任务退出判定与并发入队之间不存在可插入窗口：take 空 ⇒
+/// 资格已原子释放，其后到达的 [`Self::enqueue`] 必然拿到资格并启动新任务
+///（`pending=[B], running=false` 无消费者的状态不可能出现）。
+#[derive(Default)]
+struct RecoveryQueue {
+    pending: Vec<ThreadKey>,
+    running: bool,
+}
+
+impl RecoveryQueue {
+    /// spawn 侧：并入 keys 并竞争消费者资格；`true` = 本调用者须启动任务。
+    fn enqueue(&mut self, keys: impl IntoIterator<Item = ThreadKey>) -> bool {
+        self.pending.extend(keys);
+        if self.running {
+            // 在飞任务会在下一轮 take_or_release 消费（同锁，绝不丢）
+            return false;
+        }
+        self.running = true;
+        true
+    }
+
+    /// 任务侧：原子取走全部待办；**为空时同时释放消费者资格**（B2 不变量）。
+    fn take_or_release(&mut self) -> Option<Vec<ThreadKey>> {
+        let keys = std::mem::take(&mut self.pending);
+        if keys.is_empty() {
+            self.running = false;
+            None
+        } else {
+            Some(keys)
+        }
+    }
+
+    /// 任务侧中途退出（连接断/停机）：keys 放回待办并释放资格（同一临界区；
+    /// 其后的 enqueue 拿到资格即成为新消费者，keys 不丢）。
+    fn requeue_and_release(&mut self, keys: impl IntoIterator<Item = ThreadKey>) {
+        self.pending.extend(keys);
+        self.running = false;
+    }
+}
+
 /// 2026-10-17 复审 C2 / 第三轮复审 B2：**同 socket 恢复**——owner 失效
 ///（client-status-changed disconnected）或 `ipc-connection-reset` 后，连接本身
 /// 仍活着，连接级恢复循环（由断线驱动）不会触发；若无人重新 discovery/follow，
@@ -1032,95 +1134,91 @@ fn spawn_same_socket_recovery(adapter: DesktopIpcAdapter, keys: Vec<ThreadKey>) 
     if keys.is_empty() || adapter.inner.stopping.load(Ordering::SeqCst) {
         return;
     }
-    // B2：keys 先并入待办（与任务 take/退出清标志同一把锁）——在飞任务存在时
-    // 直接返回，后到事件（含退出边界瞬间入队的）由它或继任任务消费
-    {
-        let mut pending = adapter.inner.recovery_pending.lock().expect("pending lock");
-        pending.extend(keys);
-        if adapter
-            .inner
-            .same_socket_recovering
-            .swap(true, Ordering::SeqCst)
-        {
-            return;
-        }
+    // B2：入队并竞争消费者资格（同锁原子）——在飞任务存在时直接返回，后到
+    // 事件由它继续消费；退出边界瞬间入队的由继任任务接管（RecoveryQueue 契约）
+    let start = {
+        let mut queue = adapter.inner.recovery_queue.lock().expect("queue lock");
+        queue.enqueue(keys)
+    };
+    if start {
+        tokio::spawn(run_same_socket_recovery(adapter));
     }
-    tokio::spawn(run_same_socket_recovery(adapter));
 }
 
-/// 同 socket 恢复主循环（B2 重构）：每轮取走全部待办逐个重跟随（已卸载的 key
-/// 由 [`DesktopIpcAdapter::follow_if_following`] 跳过/回收，B3）；失败的 key 放
-/// 回待办退避重试（预算 3 轮，超限放弃——等下次事件/ensure 救活，与旧约定一致）；
-/// 连接断开时 keys 留在待办并让位连接级恢复。每轮开头与退出都在待办锁内操作，
-/// 「任务准备退出时再来事件」不会丢失。
+/// 同 socket 恢复主循环（第四轮复审 B2 重构）：每轮 `take_or_release` 取走全部
+/// 待办为**一批**；批内失败的 keys 就地退避重试（预算 3 轮，只约束本批——预算
+/// 耗尽仅放弃本批，**绝不 clear 共享待办**，等待期间后到的 keys 由下一轮
+/// take 消费）；已卸载的 key 由 [`DesktopIpcAdapter::follow_if_following`] 跳过/
+/// 回收（B3）。连接断开/停机时未完成 keys 放回队列并释放资格（同临界区）。
 async fn run_same_socket_recovery(adapter: DesktopIpcAdapter) {
-    let mut failed_rounds = 0u32;
     loop {
         if adapter.inner.stopping.load(Ordering::SeqCst) {
-            break;
-        }
-        let keys: Vec<ThreadKey> = {
-            let mut pending = adapter.inner.recovery_pending.lock().expect("pending lock");
-            std::mem::take(&mut *pending)
-        };
-        if keys.is_empty() {
-            break;
-        }
-        let Some(conn) = current_conn(&adapter).await else {
-            // 连接已断：keys 留在待办（后续事件/重连后的任务继续消费），让位
-            // 连接级恢复循环
-            adapter
-                .inner
-                .recovery_pending
-                .lock()
-                .expect("pending lock")
-                .extend(keys);
-            break;
-        };
-        let mut all_ok = true;
-        for key in keys {
-            if adapter.follow_if_following(&conn, &key).await.is_err() {
-                adapter
-                    .inner
-                    .recovery_pending
-                    .lock()
-                    .expect("pending lock")
-                    .push(key);
-                all_ok = false;
+            // 停机：待办放回（进程退出即随进程消失），资格原子释放
+            let mut queue = adapter.inner.recovery_queue.lock().expect("queue lock");
+            let leftover = queue.take_or_release();
+            if let Some(keys) = leftover {
+                queue.requeue_and_release(keys);
             }
+            return;
         }
-        if !all_ok {
-            failed_rounds += 1;
-            if failed_rounds >= 3 {
-                // 预算耗尽：放弃本轮失败 keys（有界资源，与旧约定一致）
-                adapter
-                    .inner
-                    .recovery_pending
-                    .lock()
-                    .expect("pending lock")
-                    .clear();
+        // 唯一取待办点：空 ⇒ 资格已在同一临界区释放 ⇒ 退出（其后 enqueue 必有
+        // 新消费者——B2 原子交接不变量）
+        let Some(keys) = ({
+            let mut queue = adapter.inner.recovery_queue.lock().expect("queue lock");
+            queue.take_or_release()
+        }) else {
+            break;
+        };
+        let Some(conn) = current_conn(&adapter).await else {
+            // 连接已断：keys 放回待办 + 资格释放（同临界区），让位连接级恢复；
+            // 后续事件 enqueue 拿到资格即继续消费
+            let mut queue = adapter.inner.recovery_queue.lock().expect("queue lock");
+            queue.requeue_and_release(keys);
+            return;
+        };
+        // —— 本批：批内退避重试，预算只约束本批 keys ——
+        let mut batch: Vec<ThreadKey> = keys;
+        let mut rounds = 0u32;
+        loop {
+            let mut still_failed: Vec<ThreadKey> = Vec::new();
+            for key in &batch {
+                if adapter.follow_if_following(&conn, key).await.is_err() {
+                    still_failed.push(key.clone());
+                }
+            }
+            if still_failed.is_empty() {
+                break;
+            }
+            rounds += 1;
+            if rounds >= 3 {
+                // 本批预算耗尽：仅放弃本批失败 keys（与旧约定一致的有界资源）。
+                // **共享待办不 clear**——本批等待响应期间后到的 keys 一次都未被
+                // 尝试，由循环头 take_or_release 继续消费（B2 回归 2）
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if adapter.inner.stopping.load(Ordering::SeqCst) {
+                let mut queue = adapter.inner.recovery_queue.lock().expect("queue lock");
+                queue.requeue_and_release(still_failed);
+                return;
+            }
+            let Some(conn2) = current_conn(&adapter).await else {
+                // 连接断：失败 keys 放回待办 + 资格释放，让位连接级恢复
+                let mut queue = adapter.inner.recovery_queue.lock().expect("queue lock");
+                queue.requeue_and_release(still_failed);
+                return;
+            };
+            let _ = conn2;
+            batch = still_failed;
         }
-    }
-    // 退出清标志必须在待办锁内（与 spawn 的 extend+swap 同锁串行）：待办非空时
-    // 不可能走到这里在循环头 take 到空之后；持锁清标志与并发 extend 排序，退出
-    // 瞬间的入队事件要么被本任务继续循环消费、要么由拿到单飞权的继任任务接管
-    {
-        // 持待办锁清标志：与 spawn 的 extend+swap 同锁串行（见上注释）
-        let _pending_guard = adapter.inner.recovery_pending.lock().expect("pending lock");
-        adapter
-            .inner
-            .same_socket_recovering
-            .store(false, Ordering::SeqCst);
     }
 }
 
 /// R2.5 重连恢复循环：退避 1/2/4/8/16/30s（成功归零——本函数成功即返回）；
 /// 每轮 ensure_connection → 新连接的事件转发先行就位（swap 幂等防重复）→
-/// 对关注集中每个 thread 重新 discover→bind→declare→等 snapshot（复用
-/// follow_thread）。仅退出于 shutdown（None）或恢复成功（Some）。
+/// 对关注集中每个 thread 重新 discover→bind→declare→等 snapshot（B3：经
+/// follow_if_following 统一入口——在途退出关注的 key 跳过/回收）。仅退出于
+/// shutdown（None）或恢复成功（Some）。
 async fn recovery_loop(adapter: &DesktopIpcAdapter) -> Option<ConnectionHandle> {
     let backoffs = [1u64, 2, 4, 8, 16, 30];
     let mut round = 0usize;
@@ -1493,4 +1591,160 @@ async fn followed_keys(adapter: &DesktopIpcAdapter) -> Vec<ThreadKey> {
         .into_iter()
         .filter(|k| followings.is_following(k))
         .collect()
+}
+
+#[cfg(test)]
+mod recovery_queue_tests {
+    //! 第四轮复审 B2：RecoveryQueue 交接契约——「取空待办」与「释放消费者资格」
+    //! 原子性（同一临界区）与多生产者零丢失。
+
+    use super::*;
+
+    fn key(id: &str) -> ThreadKey {
+        ThreadKey {
+            host_id: "local".into(),
+            thread_id: id.into(),
+        }
+    }
+
+    /// B2 契约：take 空 = 资格原子释放；随后 enqueue 必然获得新消费者资格，
+    /// `pending=[B], running=false`（无消费者）的状态不可能出现。
+    #[test]
+    fn take_empty_releases_running_atomically_and_later_enqueue_gets_consumer() {
+        let mut q = RecoveryQueue::default();
+        assert!(q.enqueue([key("A")]), "首个入队者获得消费者资格");
+        assert_eq!(q.take_or_release(), Some(vec![key("A")]));
+        // 任务处理完（批为空）再 take：空 ⇒ 原子释放资格
+        assert_eq!(q.take_or_release(), None);
+        assert!(!q.running, "资格已随 take 空原子释放");
+        // 退出边界瞬间入队 B：必然拿到资格（新消费者接管），不出现无消费者状态
+        assert!(q.enqueue([key("B")]), "资格释放后的入队必须获得新消费者");
+        assert_eq!(q.take_or_release(), Some(vec![key("B")]));
+        assert_eq!(q.take_or_release(), None);
+        assert!(!q.running);
+    }
+
+    /// B2 契约：在飞期间入队不获资格（单飞），但 keys 必在待办中等待消费
+    ///（任务已把首批 take 走，后到的 B 单独等下一轮）。
+    #[test]
+    fn enqueue_while_running_waits_in_pending() {
+        let mut q = RecoveryQueue::default();
+        assert!(q.enqueue([key("A")]));
+        assert_eq!(q.take_or_release(), Some(vec![key("A")]), "首批被任务取走");
+        assert!(!q.enqueue([key("B")]), "在飞期间入队不获资格");
+        assert_eq!(q.pending.len(), 1, "B 必在待办等待消费");
+        assert_eq!(q.take_or_release(), Some(vec![key("B")]));
+    }
+
+    /// B2 契约：中途退出（连接断/停机）= keys 放回 + 资格释放（同临界区）。
+    #[test]
+    fn requeue_and_release_keeps_keys_and_frees_consumer() {
+        let mut q = RecoveryQueue::default();
+        assert!(q.enqueue([key("A")]));
+        q.requeue_and_release([key("A"), key("B")]);
+        assert!(!q.running);
+        assert_eq!(q.pending.len(), 3, "原 A（未消费）+ 放回的 A/B 都在待办");
+        assert!(q.enqueue([key("C")]), "资格已释放：后来者接管");
+        let taken = q.take_or_release().expect("keys");
+        assert_eq!(
+            taken.len(),
+            4,
+            "放回的 keys（原A+放回A/B）与新入队 C 都被一并消费"
+        );
+    }
+
+    /// B2 压力：多生产者并发入队、单消费者循环 take_or_release——零丢失、零重复、
+    /// 终态 running=false 且 pending 空（真实线程交错打在交接窗口上）。
+    #[test]
+    fn concurrent_producers_single_consumer_lose_nothing() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        const PRODUCERS: usize = 4;
+        const PER_PRODUCER: usize = 500;
+        let queue = Arc::new(std::sync::Mutex::new(RecoveryQueue::default()));
+        let consumed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let produced_total = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for p in 0..PRODUCERS {
+            let queue = queue.clone();
+            let consumed = consumed.clone();
+            let produced_total = produced_total.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_PRODUCER {
+                    let k = key(&format!("p{p}-i{i}"));
+                    let start = {
+                        let mut q = queue.lock().unwrap();
+                        q.enqueue([k])
+                    };
+                    produced_total.fetch_add(1, Ordering::SeqCst);
+                    if start {
+                        // 本线程获得消费者资格：驱动消费循环至 take 空（原子释放）
+                        loop {
+                            let consumed_now = {
+                                let mut q = queue.lock().unwrap();
+                                q.take_or_release()
+                            };
+                            match consumed_now {
+                                Some(keys) => {
+                                    let mut c = consumed.lock().unwrap();
+                                    c.extend(keys.into_iter().map(|k| k.thread_id));
+                                }
+                                None => break, // 资格已原子释放；由后续 enqueue 接管
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        // 独立常驻消费者（任意时刻拿到资格就消费）
+        let consumer_queue = queue.clone();
+        let consumer_consumed = consumed.clone();
+        let consumer_done = done.clone();
+        let consumer = std::thread::spawn(move || loop {
+            if consumer_done.load(Ordering::SeqCst) {
+                break;
+            }
+            let consumed_now = {
+                let mut q = consumer_queue.lock().unwrap();
+                q.take_or_release()
+            };
+            match consumed_now {
+                Some(keys) => {
+                    let mut c = consumer_consumed.lock().unwrap();
+                    c.extend(keys.into_iter().map(|k| k.thread_id));
+                }
+                None => std::thread::sleep(std::time::Duration::from_micros(50)),
+            }
+        });
+        for h in handles {
+            h.join().unwrap();
+        }
+        // 全部生产完成后等消费者排空，再停
+        loop {
+            let consumed_now = {
+                let mut q = queue.lock().unwrap();
+                q.take_or_release()
+            };
+            match consumed_now {
+                Some(keys) => {
+                    let mut c = consumed.lock().unwrap();
+                    c.extend(keys.into_iter().map(|k| k.thread_id));
+                }
+                None => break,
+            }
+        }
+        done.store(true, Ordering::SeqCst);
+        consumer.join().unwrap();
+
+        let produced = produced_total.load(Ordering::SeqCst);
+        let mut c = consumed.lock().unwrap();
+        assert_eq!(c.len(), produced, "零丢失（含资格交接窗口）");
+        c.sort();
+        c.dedup();
+        assert_eq!(c.len(), produced, "零重复消费");
+        let q = queue.lock().unwrap();
+        assert!(q.pending.is_empty() && !q.running, "终态无残留无消费者");
+    }
 }

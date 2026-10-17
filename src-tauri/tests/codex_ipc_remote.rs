@@ -3622,3 +3622,143 @@ async fn interleaved_owner_failures_both_recover_without_get() {
     .await
     .expect("边界事件恢复 fresh");
 }
+
+/// 第四轮复审 B2 回归 2：预算耗尽**只放弃本批失败工作**，不得 clear 掉本轮
+/// 「等待 A 响应期间刚加入」的后到 keys——tB 未尝试就被删除 = B 永不恢复。
+/// 确定时序：第 3 轮 disc(A) 帧到达后，先令 tB 失效（入待办），再回 A 的
+/// discovery 错误——旧实现在此 clear 整个共享待办（A+tB 一起丢），tB 的
+/// discovery 帧永不出现；修复后 tB 必须被实际尝试并恢复。
+#[tokio::test]
+async fn budget_exhaustion_does_not_drop_later_keys() {
+    let id_a = "00000000-0000-4000-8000-0000000000a1";
+    let id_b = "00000000-0000-4000-8000-0000000000b2";
+    let mut f = fixture_ipc(vec![codex_app_session(id_a), codex_app_session(id_b)]);
+    let mut peer = f.peer.take().unwrap();
+    let key_b = ThreadKey {
+        host_id: "local".into(),
+        thread_id: id_b.into(),
+    };
+    let adapter = f.state.codex_control.adapter.clone();
+    // ① 两 Thread 分别 follow
+    for (id, owner) in [(id_a, "owner-a"), (id_b, "owner-b")] {
+        let key = ThreadKey {
+            host_id: "local".into(),
+            thread_id: id.into(),
+        };
+        let a = adapter.clone();
+        let k = key.clone();
+        let task = tokio::spawn(async move { a.ensure_thread(&k).await });
+        if id == id_a {
+            handshake(&mut peer, "owner-a").await;
+        }
+        let disc = peer.recv().await;
+        assert_eq!(disc["method"], "thread-owner-discovery");
+        peer.send(&discovery_response(
+            disc["requestId"].as_str().unwrap(),
+            owner,
+        ))
+        .await;
+        let follow = peer.recv().await;
+        assert_eq!(follow["method"], "thread-stream-following-changed");
+        let entities = serde_json::json!({
+            "t1": { "id": "t1", "type": "turn", "status": "completed", "items": ["u1"] },
+            "u1": { "id": "u1", "type": "user_message", "text": "seed", "ts": 1 }
+        });
+        peer.send(&snapshot_frame(
+            id,
+            owner,
+            1,
+            "idle",
+            entities,
+            serde_json::json!(["t1"]),
+        ))
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("in time")
+            .expect("join")
+            .expect("fresh");
+    }
+
+    // ② owner-a 失效：恢复任务 take{A}，discovery 回**错误**（follow 失败 → 重试）
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 1,
+        "sourceClientId": "owner-a",
+        "params": { "clientId": "owner-a", "status": "disconnected" }
+    }))
+    .await;
+    let mut a_failures = 0usize;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+            .await
+            .expect("A 的重试 discovery 帧必须到来");
+        assert_eq!(frame["method"], "thread-owner-discovery");
+        assert_eq!(frame["params"]["conversationId"], serde_json::json!(id_a));
+        a_failures += 1;
+        if a_failures == 3 {
+            // 第三轮「等待 A 响应期间」：tB 失效入待办（B 尚未被尝试）
+            peer.send(&serde_json::json!({
+                "type": "broadcast", "method": "client-status-changed", "version": 1,
+                "sourceClientId": "owner-b",
+                "params": { "clientId": "owner-b", "status": "disconnected" }
+            }))
+            .await;
+        }
+        peer.send(&serde_json::json!({
+            "type": "response", "resultType": "error",
+            "requestId": frame["requestId"],
+            "method": "thread-owner-discovery",
+            "handledByClientId": "owner-a",
+            "error": { "message": "no-client-found" }
+        }))
+        .await;
+        if a_failures >= 3 {
+            break;
+        }
+    }
+    // 任务对本批 A 的重试预算耗尽：**tB 不得被连带放弃**——它的 discovery 帧必须
+    // 出现（旧实现 clear 掉共享待办，此帧永不出现）
+    let disc_b = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let frame = peer.recv().await;
+            if frame["method"] == "thread-owner-discovery"
+                && frame["params"]["conversationId"] == serde_json::json!(id_b)
+            {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("预算耗尽不得丢弃后到的 tB（B2 回归 2）");
+    peer.send(&discovery_response(
+        disc_b["requestId"].as_str().unwrap(),
+        "owner-b",
+    ))
+    .await;
+    let follow_b = peer.recv().await;
+    assert_eq!(follow_b["method"], "thread-stream-following-changed");
+    let entities = serde_json::json!({
+        "t2": { "id": "t2", "type": "turn", "status": "completed", "items": ["u2"] },
+        "u2": { "id": "u2", "type": "user_message", "text": "B 恢复世界", "ts": 2 }
+    });
+    peer.send(&snapshot_frame(
+        id_b,
+        "owner-b",
+        2,
+        "idle",
+        entities,
+        serde_json::json!(["t2"]),
+    ))
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let p = adapter.projection(&key_b).await;
+            if !p.stale && p.revision == Some(2) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("tB 必须被实际尝试并恢复 fresh");
+}
