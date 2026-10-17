@@ -1566,7 +1566,11 @@ async fn release_turn_after_owner_generation_with_lower_revision() {
     let a = h.ctx("b1-gen", ActionKind::Send);
     let _ = completed(h.router.send(a, "换代前已发".into(), false).await);
     h.router
-        .send(h.ctx("b1-gen-2", ActionKind::Send), "换代后排队".into(), true)
+        .send(
+            h.ctx("b1-gen-2", ActionKind::Send),
+            "换代后排队".into(),
+            true,
+        )
         .await;
     // 新 owner 世界：镜像换代重置后 revision 1，目标 Turn 已 completed
     h.dispatch.set_terminal_turn("turn-gen");

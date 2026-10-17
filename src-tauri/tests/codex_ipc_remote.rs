@@ -3279,8 +3279,15 @@ async fn completed_snapshot_before_ack_still_relays() {
         "turn-chain-1": { "id": "turn-chain-1", "type": "turn", "status": "completed", "items": ["u7"] },
         "u7": { "id": "u7", "type": "user_message", "text": "基线前已发 [mobile iPhone]", "ts": 7 }
     });
-    peer.send(&snapshot_frame(THREAD, "owner-1", 8, "idle", entities, serde_json::json!(["turn-chain-1"])))
-        .await;
+    peer.send(&snapshot_frame(
+        THREAD,
+        "owner-1",
+        8,
+        "idle",
+        entities,
+        serde_json::json!(["turn-chain-1"]),
+    ))
+    .await;
     // ACK（send_text 回执后采集的基线 == 已在场的 rev 8）
     peer.send(&serde_json::json!({
         "type": "response", "requestId": frame["requestId"],
@@ -3371,16 +3378,26 @@ async fn lower_revision_from_new_owner_still_releases() {
     .await;
     let disc = peer.recv().await;
     assert_eq!(disc["method"], "thread-owner-discovery");
-    peer.send(&discovery_response(disc["requestId"].as_str().unwrap(), "owner-2"))
-        .await;
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-2",
+    ))
+    .await;
     let follow = peer.recv().await;
     assert_eq!(follow["method"], "thread-stream-following-changed");
     let entities = serde_json::json!({
         "turn-gen-1": { "id": "turn-gen-1", "type": "turn", "status": "completed", "items": ["u6"] },
         "u6": { "id": "u6", "type": "user_message", "text": "换代前已发 [mobile iPhone]", "ts": 6 }
     });
-    peer.send(&snapshot_frame(THREAD, "owner-2", 1, "idle", entities, serde_json::json!(["turn-gen-1"])))
-        .await;
+    peer.send(&snapshot_frame(
+        THREAD,
+        "owner-2",
+        1,
+        "idle",
+        entities,
+        serde_json::json!(["turn-gen-1"]),
+    ))
+    .await;
     // 后继入队（换代窗口内顺序限制仍在 → codex_queued 或直接派发都可）
     let _ = f
         .app
@@ -3405,4 +3422,203 @@ async fn lower_revision_from_new_owner_still_releases() {
     }))
     .await;
     f.state.codex_control.stop();
+}
+
+/// 第三轮复审 B2：同 socket 恢复单飞**不丢后到失效事件**——tA/tB 分属 owner
+/// A/B，A 失效恢复在途（卡在 tA snapshot 等待）时 B 失效，B 的 keys 必须并入
+/// 在飞任务的待办（任务退出边界的第三事件同样被消费）。全程同 socket、无 GET、
+/// 无手工 ensure/flush，两 Thread 均自动发现新 owner 并发布 fresh snapshot。
+#[tokio::test]
+async fn interleaved_owner_failures_both_recover_without_get() {
+    let id_a = "00000000-0000-4000-8000-0000000000a1";
+    let id_b = "00000000-0000-4000-8000-0000000000b2";
+    let mut f = fixture_ipc(vec![codex_app_session(id_a), codex_app_session(id_b)]);
+    let mut peer = f.peer.take().unwrap();
+    let key_a = ThreadKey {
+        host_id: "local".into(),
+        thread_id: id_a.into(),
+    };
+    let key_b = ThreadKey {
+        host_id: "local".into(),
+        thread_id: id_b.into(),
+    };
+    let adapter = f.state.codex_control.adapter.clone();
+    // ① 两 Thread 分别 follow 到不同 owner（同一条连接）
+    for (key, id, owner) in [(&key_a, id_a, "owner-a"), (&key_b, id_b, "owner-b")] {
+        let a = adapter.clone();
+        let k = key.clone();
+        let task = tokio::spawn(async move { a.ensure_thread(&k).await });
+        if key == &key_a {
+            handshake(&mut peer, "owner-a").await;
+        }
+        let disc = peer.recv().await;
+        assert_eq!(disc["method"], "thread-owner-discovery");
+        peer.send(&discovery_response(
+            disc["requestId"].as_str().unwrap(),
+            owner,
+        ))
+        .await;
+        let follow = peer.recv().await;
+        assert_eq!(follow["method"], "thread-stream-following-changed");
+        let entities = serde_json::json!({
+            "t1": { "id": "t1", "type": "turn", "status": "completed", "items": ["u1"] },
+            "u1": { "id": "u1", "type": "user_message", "text": "seed", "ts": 1 }
+        });
+        peer.send(&snapshot_frame(
+            id,
+            owner,
+            1,
+            "idle",
+            entities,
+            serde_json::json!(["t1"]),
+        ))
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("in time")
+            .expect("join")
+            .expect("fresh");
+    }
+
+    // ② owner-a 失效：恢复任务启动，卡在 tA 的 snapshot 等待（受控在途）
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 1,
+        "sourceClientId": "owner-a",
+        "params": { "clientId": "owner-a", "status": "disconnected" }
+    }))
+    .await;
+    let disc_a = peer.recv().await;
+    assert_eq!(disc_a["method"], "thread-owner-discovery");
+    peer.send(&discovery_response(
+        disc_a["requestId"].as_str().unwrap(),
+        "owner-a",
+    ))
+    .await;
+    let follow_a = peer.recv().await;
+    assert_eq!(follow_a["method"], "thread-stream-following-changed");
+
+    // ③ owner-b 失效（恢复在途）：B 的 keys 必须并入待办而非被单飞丢弃
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 1,
+        "sourceClientId": "owner-b",
+        "params": { "clientId": "owner-b", "status": "disconnected" }
+    }))
+    .await;
+
+    // ④ tA snapshot 到达：tA 恢复 → 任务继续消费待办 {tB}
+    let entities = serde_json::json!({
+        "t2": { "id": "t2", "type": "turn", "status": "completed", "items": ["u2"] },
+        "u2": { "id": "u2", "type": "user_message", "text": "A 恢复世界", "ts": 2 }
+    });
+    peer.send(&snapshot_frame(
+        id_a,
+        "owner-a",
+        2,
+        "idle",
+        entities,
+        serde_json::json!(["t2"]),
+    ))
+    .await;
+    let disc_b = tokio::time::timeout(Duration::from_secs(8), peer.recv())
+        .await
+        .expect("B 的失效事件不得被单飞丢弃（旧实现 tB 永不重发现）");
+    assert_eq!(
+        disc_b["method"], "thread-owner-discovery",
+        "tB 必须自动重发现"
+    );
+    assert_eq!(
+        disc_b["params"]["conversationId"],
+        serde_json::json!(id_b),
+        "消费的正是后到事件的 tB"
+    );
+    peer.send(&discovery_response(
+        disc_b["requestId"].as_str().unwrap(),
+        "owner-b",
+    ))
+    .await;
+    let follow_b = peer.recv().await;
+    assert_eq!(follow_b["method"], "thread-stream-following-changed");
+    let entities = serde_json::json!({
+        "t2": { "id": "t2", "type": "turn", "status": "completed", "items": ["u2"] },
+        "u2": { "id": "u2", "type": "user_message", "text": "B 恢复世界", "ts": 2 }
+    });
+    peer.send(&snapshot_frame(
+        id_b,
+        "owner-b",
+        2,
+        "idle",
+        entities,
+        serde_json::json!(["t2"]),
+    ))
+    .await;
+
+    // ⑤ 两 Thread 均自动恢复新鲜（无 GET/无手工 ensure）
+    for (key, _id, owner, text) in [
+        (&key_a, id_a, "owner-a", "A 恢复世界"),
+        (&key_b, id_b, "owner-b", "B 恢复世界"),
+    ] {
+        let p = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let p = adapter.projection(key).await;
+                if !p.stale && p.revision == Some(2) {
+                    return p;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("视图必须自动恢复新鲜");
+        assert!(
+            p.messages.iter().any(|m| m.text == text),
+            "{owner} 世界生效"
+        );
+    }
+
+    // ⑥ 退出边界：任务刚收尾时再来一个失效事件（tA）——事件必须被消费
+    //（mirror 已被事件 invalidate → 恢复任务重发现可观察）
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 1,
+        "sourceClientId": "owner-a",
+        "params": { "clientId": "owner-a", "status": "disconnected" }
+    }))
+    .await;
+    let disc_a2 = tokio::time::timeout(Duration::from_secs(8), peer.recv())
+        .await
+        .expect("任务退出边界的事件不得丢失（第三事件被新任务消费）");
+    assert_eq!(
+        disc_a2["params"]["conversationId"],
+        serde_json::json!(id_a),
+        "重发现的是再次失效的 tA"
+    );
+    peer.send(&discovery_response(
+        disc_a2["requestId"].as_str().unwrap(),
+        "owner-a",
+    ))
+    .await;
+    let follow_a2 = peer.recv().await;
+    assert_eq!(follow_a2["method"], "thread-stream-following-changed");
+    let entities = serde_json::json!({
+        "t3": { "id": "t3", "type": "turn", "status": "completed", "items": ["u3"] },
+        "u3": { "id": "u3", "type": "user_message", "text": "边界恢复世界", "ts": 3 }
+    });
+    peer.send(&snapshot_frame(
+        id_a,
+        "owner-a",
+        3,
+        "idle",
+        entities,
+        serde_json::json!(["t3"]),
+    ))
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let p = adapter.projection(&key_a).await;
+            if !p.stale && p.revision == Some(3) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("边界事件恢复 fresh");
 }

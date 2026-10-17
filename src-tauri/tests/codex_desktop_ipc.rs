@@ -2634,3 +2634,99 @@ async fn connection_reset_marks_all_stale() {
     assert!(s.stale, "连接级 reset → 全部 mirror stale 并发布");
     adapter.shutdown().await;
 }
+
+/// 第三轮复审 B3 · 窗口 1（复审原文交错）：discovery **在途**时退出最后引用——
+/// 回包后不得 bind lease、不得再次 following:true、无镜像复活；推进重试时间仍
+/// 不复活。
+#[tokio::test]
+async fn unfollow_during_discovery_prevents_resubscribe() {
+    let (adapter, mut peer, _projection, key) = harness(vec![]).await;
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 0,
+        "sourceClientId": "owner-1",
+        "params": { "clientId": "owner-1", "status": "disconnected" }
+    }))
+    .await;
+    let disc = recv_frame(&mut peer, 5).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    // discovery 在途（回包未给）→ 退出最后引用。
+    // 此刻 lease 未绑定、尚未向现行世界 declare following——按 C4 噪声条款不发
+    // following:false（无「释放回包」可期待）；唯一硬要求：回包后不得 bind/declare
+    adapter.unfollow(&key).await;
+    // 旧 discovery 回包到达：恢复任务必须取消资格（不 bind、不 declare）
+    reply_discovery(&mut peer, &disc, "owner-1").await;
+    // 推进重试窗口：期间不得出现 following:true（发现 true 即失败）
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), peer.recv()).await {
+            Err(_) => continue,
+            Ok(frame) => assert_ne!(
+                frame.get("method").and_then(|m| m.as_str()),
+                Some("thread-stream-following-changed"),
+                "卸载后不得重新订阅：{frame}"
+            ),
+        }
+    }
+    let p = adapter.projection(&key).await;
+    assert!(p.stale && p.revision.is_none(), "镜像不得复活");
+    adapter.shutdown().await;
+}
+
+/// 第三轮复审 B3 · 窗口 2：following:true 已声明（恢复任务停在 snapshot 等待）
+/// 时退出——释放回包后对端不得再收到 true；snapshot 回包/owner 帧/重试推进都
+/// 不复活镜像。
+#[tokio::test]
+async fn unfollow_after_following_declared_stays_dead() {
+    let (adapter, mut peer, _projection, key) = harness(vec![]).await;
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 0,
+        "sourceClientId": "owner-1",
+        "params": { "clientId": "owner-1", "status": "disconnected" }
+    }))
+    .await;
+    let disc = recv_frame(&mut peer, 5).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    reply_discovery(&mut peer, &disc, "owner-1").await;
+    let follow = recv_frame(&mut peer, 5).await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+
+    // 任务停在 snapshot 等待时退出最后引用
+    adapter.unfollow(&key).await;
+    let off = recv_frame(&mut peer, 5).await;
+    assert_eq!(off["method"], "thread-stream-following-changed");
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+
+    // snapshot 回包到达：任务不得再次订阅；镜像保持不存在
+    peer.send(&state_frame(
+        &key.thread_id,
+        "owner-1",
+        snapshot_change(2, vec![], true),
+    ))
+    .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(300), peer.recv()).await {
+            Err(_) => continue,
+            Ok(frame) => assert_ne!(
+                frame.get("method").and_then(|m| m.as_str()),
+                Some("thread-stream-following-changed"),
+                "释放回包后不得再次 following:true（B3）：{frame}"
+            ),
+        }
+    }
+    let p = adapter.projection(&key).await;
+    assert!(p.stale && p.revision.is_none(), "镜像不得复活");
+    // 再推进 + owner 帧也不复活
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    peer.send(&state_frame(
+        &key.thread_id,
+        "owner-1",
+        snapshot_change(3, vec![], true),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let p = adapter.projection(&key).await;
+    assert!(p.stale && p.revision.is_none(), "owner 帧不复活镜像");
+    adapter.shutdown().await;
+}

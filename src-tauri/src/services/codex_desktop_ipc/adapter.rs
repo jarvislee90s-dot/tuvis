@@ -153,6 +153,10 @@ struct AdapterInner {
     /// 同 socket 恢复单飞标志（2026-10-17 复审 C2：owner 失效/连接重置后重跟随，
     /// 连接本身不断——与连接级 `recovering` 互不影响，各管各的触发面）。
     same_socket_recovering: AtomicBool,
+    /// 同 socket 恢复待办集合（第三轮复审 B2）：后到失效事件的 keys 在**同一把
+    /// 锁内**并入在飞任务的待办——单飞只避免重复工作，绝不丢恢复工作；任务退出
+    ///（清单飞标志）也在该锁内，消除「退出判定 vs 并发入队」竞态。
+    recovery_pending: std::sync::Mutex<Vec<ThreadKey>>,
     /// shutdown 信号（恢复循环/重拉循环的退出条件）。
     stopping: AtomicBool,
     /// C3 测试缝：respond 两阶段间的可注入等待（生产恒 None → 零开销直通）；
@@ -189,6 +193,7 @@ impl DesktopIpcAdapter {
                 forward_alive: AtomicBool::new(false),
                 recovering: AtomicBool::new(false),
                 same_socket_recovering: AtomicBool::new(false),
+                recovery_pending: std::sync::Mutex::new(Vec::new()),
                 stopping: AtomicBool::new(false),
                 interphase_gate: std::sync::Mutex::new(None),
                 epoch: AtomicU64::new(0),
@@ -320,6 +325,31 @@ impl DesktopIpcAdapter {
             .map(|m| m.project(self.current_caps()))
     }
 
+    /// 恢复任务的 follow 统一入口（第三轮复审 B3）：**前置核验**仍有关注（已卸载
+    /// 的 key——含 B2 待办合并进来的——直接跳过，不 discovery、不重建镜像）；
+    /// follow 完成后**事后复查**，途中被退出关注的（discovery/following 已在途）
+    /// 立即回收复活物（following:false + lease + 镜像）——撤销使旧恢复工作失效，
+    /// 不只在任务开始时查一次。
+    async fn follow_if_following(
+        &self,
+        conn: &ConnectionHandle,
+        key: &ThreadKey,
+    ) -> Result<(), ProtocolError> {
+        {
+            let f = self.inner.followings.lock().await;
+            if !f.is_following(key) {
+                return Ok(()); // 已卸载：跳过（不重新订阅、不复活镜像）
+            }
+        }
+        self.follow_thread(conn, key).await?;
+        if !self.inner.followings.lock().await.is_following(key) {
+            // 在途期间退出关注：回收（unfollow 幂等重定义后会对无 following 的
+            // 复活 lease/mirror 执行回收并发 following:false）
+            self.unfollow(key).await;
+        }
+        Ok(())
+    }
+
     /// 可复用的 follow 流程（R2.5：ensure_thread 与重连恢复共用）：
     /// 建镜像（接 snapshot）→ discovery → 绑定 → following → 等 snapshot。
     /// 锁序纪律（R5）：mirrors → owners，各自短临界区，绝不嵌套、不跨 await 持锁。
@@ -336,8 +366,21 @@ impl DesktopIpcAdapter {
                 ThreadMirror::with_ledger(key.clone(), self.inner.mirror_ledger.clone())
             });
         }
-        // discovery（await 不持锁）→ 绑定（短锁）
+        // discovery（await 不持锁）→ 绑定（短锁）。
+        // 第三轮复审 B3：discovery 在途期间关注可能已被撤销——回包后**bind/declare
+        // 之前**核验，已卸载则清除为接 snapshot 而建的空镜像并 bail（不绑定 lease、
+        // 不声明 following:true）。调用方按失败退避，下一轮前置核验跳过。
         let owner_id = discover_owner(conn, key).await?;
+        {
+            let f = self.inner.followings.lock().await;
+            if !f.is_following(key) {
+                let removed = self.inner.mirrors.lock().await.remove(key);
+                drop(removed);
+                return Err(ProtocolError::StaleContext(
+                    "unfollowed during discovery".into(),
+                ));
+            }
+        }
         let lease = {
             let mut owners = self.inner.owners.lock().await;
             bind_lease(&mut owners, key, owner_id, conn.epoch())
@@ -440,12 +483,16 @@ impl DesktopIpcAdapter {
     /// 未在跟随（幂等）→ 零副作用。
     pub async fn unfollow(&self, key: &ThreadKey) {
         let was_following = self.inner.followings.lock().await.unfollow(key);
-        if !was_following {
-            return;
-        }
         // C4：只对**真正声明过 following**（有现行 lease）的 thread 发 following:false
         //——ensure 失败回滚（discovery 未成功、从未声明）只回收名额，不发噪声帧
         let had_lease = self.inner.owners.lock().await.current(key).is_some();
+        let had_mirror = self.inner.mirrors.lock().await.contains_key(key);
+        // 第三轮复审 B3：幂等 = 「真的无物可回收」——following 集合、lease、镜像
+        // 三者皆无才早退。在途恢复任务复活出的 lease/镜像（following 已被撤销）
+        // 必须同样被回收，不能因 was_following=false 提前返回而滞留。
+        if !was_following && !had_lease && !had_mirror {
+            return;
+        }
         if had_lease && !self.inner.stopping.load(Ordering::SeqCst) {
             if let Some(conn) = current_conn(self).await {
                 if let Ok(version) = conn.version_of("thread-stream-following-changed") {
@@ -976,52 +1023,98 @@ fn spawn_recovery_task(adapter: DesktopIpcAdapter) {
     });
 }
 
-/// 2026-10-17 复审 C2：**同 socket 恢复**——owner 失效（client-status-changed
-/// disconnected）或 `ipc-connection-reset` 后，连接本身仍活着，连接级恢复循环
-///（由断线驱动）不会触发；若无人重新 discovery/follow，重新接管的 owner 帧因
-/// 无 lease 被丢、视图永久 stale（有 SSE 无待发时手机不会主动 GET）。本任务对
-/// 受影响 keys 重新走 follow_thread（discovery→bind→following→等 snapshot），
-/// 单飞 + 有界 3 次（间隔 500ms）；连接已断时直接退出（连接级恢复接管）。
+/// 2026-10-17 复审 C2 / 第三轮复审 B2：**同 socket 恢复**——owner 失效
+///（client-status-changed disconnected）或 `ipc-connection-reset` 后，连接本身
+/// 仍活着，连接级恢复循环（由断线驱动）不会触发；若无人重新 discovery/follow，
+/// 重新接管的 owner 帧因无 lease 被丢、视图永久 stale。单飞只避免重复工作：
+/// 后到失效事件的 keys 在待办锁内并入（绝不丢弃），由在飞任务继续消费。
 fn spawn_same_socket_recovery(adapter: DesktopIpcAdapter, keys: Vec<ThreadKey>) {
     if keys.is_empty() || adapter.inner.stopping.load(Ordering::SeqCst) {
         return;
     }
-    if adapter
-        .inner
-        .same_socket_recovering
-        .swap(true, Ordering::SeqCst)
+    // B2：keys 先并入待办（与任务 take/退出清标志同一把锁）——在飞任务存在时
+    // 直接返回，后到事件（含退出边界瞬间入队的）由它或继任任务消费
     {
-        return;
+        let mut pending = adapter.inner.recovery_pending.lock().expect("pending lock");
+        pending.extend(keys);
+        if adapter
+            .inner
+            .same_socket_recovering
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
     }
-    tokio::spawn(async move {
-        for attempt in 0..3u32 {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            if adapter.inner.stopping.load(Ordering::SeqCst) {
-                break;
-            }
-            let Some(conn) = current_conn(&adapter).await else {
-                break; // 连接已断：连接级恢复循环接管
-            };
-            let mut all_ok = true;
-            for key in &keys {
-                if is_fresh(&adapter, key).await {
-                    continue; // 已被并发恢复救活
-                }
-                if adapter.follow_thread(&conn, key).await.is_err() {
-                    all_ok = false;
-                }
-            }
-            if all_ok {
-                break;
+    tokio::spawn(run_same_socket_recovery(adapter));
+}
+
+/// 同 socket 恢复主循环（B2 重构）：每轮取走全部待办逐个重跟随（已卸载的 key
+/// 由 [`DesktopIpcAdapter::follow_if_following`] 跳过/回收，B3）；失败的 key 放
+/// 回待办退避重试（预算 3 轮，超限放弃——等下次事件/ensure 救活，与旧约定一致）；
+/// 连接断开时 keys 留在待办并让位连接级恢复。每轮开头与退出都在待办锁内操作，
+/// 「任务准备退出时再来事件」不会丢失。
+async fn run_same_socket_recovery(adapter: DesktopIpcAdapter) {
+    let mut failed_rounds = 0u32;
+    loop {
+        if adapter.inner.stopping.load(Ordering::SeqCst) {
+            break;
+        }
+        let keys: Vec<ThreadKey> = {
+            let mut pending = adapter.inner.recovery_pending.lock().expect("pending lock");
+            std::mem::take(&mut *pending)
+        };
+        if keys.is_empty() {
+            break;
+        }
+        let Some(conn) = current_conn(&adapter).await else {
+            // 连接已断：keys 留在待办（后续事件/重连后的任务继续消费），让位
+            // 连接级恢复循环
+            adapter
+                .inner
+                .recovery_pending
+                .lock()
+                .expect("pending lock")
+                .extend(keys);
+            break;
+        };
+        let mut all_ok = true;
+        for key in keys {
+            if adapter.follow_if_following(&conn, &key).await.is_err() {
+                adapter
+                    .inner
+                    .recovery_pending
+                    .lock()
+                    .expect("pending lock")
+                    .push(key);
+                all_ok = false;
             }
         }
+        if !all_ok {
+            failed_rounds += 1;
+            if failed_rounds >= 3 {
+                // 预算耗尽：放弃本轮失败 keys（有界资源，与旧约定一致）
+                adapter
+                    .inner
+                    .recovery_pending
+                    .lock()
+                    .expect("pending lock")
+                    .clear();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+    // 退出清标志必须在待办锁内（与 spawn 的 extend+swap 同锁串行）：待办非空时
+    // 不可能走到这里在循环头 take 到空之后；持锁清标志与并发 extend 排序，退出
+    // 瞬间的入队事件要么被本任务继续循环消费、要么由拿到单飞权的继任任务接管
+    {
+        // 持待办锁清标志：与 spawn 的 extend+swap 同锁串行（见上注释）
+        let _pending_guard = adapter.inner.recovery_pending.lock().expect("pending lock");
         adapter
             .inner
             .same_socket_recovering
             .store(false, Ordering::SeqCst);
-    });
+    }
 }
 
 /// R2.5 重连恢复循环：退避 1/2/4/8/16/30s（成功归零——本函数成功即返回）；
@@ -1043,7 +1136,8 @@ async fn recovery_loop(adapter: &DesktopIpcAdapter) -> Option<ConnectionHandle> 
             let keys = followed_keys(adapter).await;
             let mut all_ok = true;
             for key in &keys {
-                if adapter.follow_thread(&conn, key).await.is_err() {
+                // B3：恢复统一入口——在途退出关注的 key 跳过/回收，不复活订阅
+                if adapter.follow_if_following(&conn, key).await.is_err() {
                     all_ok = false;
                     break;
                 }

@@ -801,7 +801,8 @@ impl CodexControlRouter {
             };
             (head2, receipt, outcome.revision, persisted)
         });
-        let (head, receipt, revision, persisted) = match task.await {
+        // B1：DispatchOutcome.revision 不再作释放基线（保留字段供回执/日志语义）
+        let (head, receipt, _revision, persisted) = match task.await {
             Ok(v) => v,
             Err(e) => {
                 log::error!(
