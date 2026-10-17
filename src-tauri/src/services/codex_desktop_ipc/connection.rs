@@ -159,6 +159,10 @@ struct ConnectionShared {
     /// initialize 完成的信号（Some = 我方 clientId）；请求在握手成功前不得写出。
     init: watch::Receiver<Option<String>>,
     init_tx: watch::Sender<Option<String>>,
+    /// 2026-10-17 复审 C4：writer 收尾信号——reader 随之退出、io 整体 drop
+    ///（split 的两半共享底层 io，只丢 WriteHalf 对端看不到 EOF）。
+    teardown_tx: watch::Sender<bool>,
+    teardown_rx: watch::Receiver<bool>,
 }
 
 /// 从 pending 表取出并完成一个 RPC（先到先得）。
@@ -410,6 +414,7 @@ pub fn spawn(
     let (main_tx, main_rx) = mpsc::channel::<FrameCmd>(64);
     let (disc_tx, disc_rx) = mpsc::channel::<FrameCmd>(8);
     let (init_tx, init_rx) = watch::channel(None::<String>);
+    let (teardown_tx, teardown_rx) = watch::channel(false);
     let shared = Arc::new(ConnectionShared {
         epoch,
         profile,
@@ -420,6 +425,8 @@ pub fn spawn(
         client_id: std::sync::Mutex::new(None),
         init: init_rx,
         init_tx,
+        teardown_tx,
+        teardown_rx,
     });
     let handle = ConnectionHandle {
         shared: shared.clone(),
@@ -508,6 +515,8 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     // 已写出等待回执的 waiter：连接失败 → Unknown（不冒充 NotSent）
     release_pending_as_unknown(&shared).await;
     shared.closed.store(true, Ordering::SeqCst);
+    // C4：唤醒 reader 退出（io 整体 drop，对端见 EOF）
+    let _ = shared.teardown_tx.send(true);
     let _ = shared.events.send(ConnectionEvent::Disconnected {
         epoch: shared.epoch,
     });
@@ -529,19 +538,30 @@ async fn reader_task<R: tokio::io::AsyncRead + Unpin + Send>(
 ) {
     let mut decoder = super::codec::FrameDecoder::new();
     let mut buf = vec![0u8; 64 * 1024];
+    let mut teardown = shared.teardown_rx.clone();
     loop {
-        match io.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let frames = match decoder.push(&buf[..n]) {
-                    Ok(f) => f,
-                    Err(_) => break, // 帧违规：关闭连接（不重放）
-                };
-                for frame in frames {
-                    handle_frame(&shared, frame, &disc_tx).await;
+        tokio::select! {
+            read = io.read(&mut buf) => {
+                match read {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let frames = match decoder.push(&buf[..n]) {
+                            Ok(f) => f,
+                            Err(_) => break, // 帧违规：关闭连接（不重放）
+                        };
+                        for frame in frames {
+                            handle_frame(&shared, frame, &disc_tx).await;
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
-            Err(_) => break,
+            // C4：writer 已收尾（shutdown/write-fail）→ reader 退出、io 整体 drop
+            _ = teardown.changed() => {
+                if *teardown.borrow_and_update() {
+                    break;
+                }
+            }
         }
     }
     // reader 断开：唤醒 writer 收尾（writer 排空未尝试帧并广播 Disconnected）

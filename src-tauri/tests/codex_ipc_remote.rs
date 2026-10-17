@@ -2465,8 +2465,15 @@ async fn sse_mount_unmount_cycles_do_not_exhaust_following() {
             "第 {cycle} 次挂载必须拿到新鲜投影（名额未耗尽）：{text}"
         );
         drop(body);
-        // 引用归零 → unfollow 释放名额（Drop 内 spawn；给调度一点时间）
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // 引用归零 → unfollow 释放名额（Drop 内 spawn）：C4 起 unfollow 会真正发
+        // following:false——消费它再进入下一轮（下一轮 discovery 之前必达）
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let off = peer.recv().await;
+        assert_eq!(
+            off["method"], "thread-stream-following-changed",
+            "第 {cycle} 次卸载必须声明 following:false"
+        );
+        assert_eq!(off["params"]["following"], serde_json::json!(false));
     }
 }
 
@@ -3184,4 +3191,55 @@ async fn hub_restart_with_turn_barrier_recovers_without_details() {
     .await
     .expect("act-bar-2 accepted（重启恢复闭环）");
     f2.state.codex_control.stop();
+}
+
+/// 2026-10-17 复审 C4：hub.stop = 完整停机——adapter 进入 stopping、连接关闭
+/// （peer 见 EOF）、ensure 不再新建连接（推进退避时间也不再有新 connect/follow）；
+/// 重新 start 解除停机（io 耗尽时诚实快败，不悬挂）。
+#[tokio::test]
+async fn hub_stop_closes_connection_and_blocks_reconnect_until_start() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let key = f.thread_key();
+    // 建连 + 跟随
+    {
+        let adapter = f.state.codex_control.adapter.clone();
+        let k2 = key.clone();
+        let ensure_task = tokio::spawn(async move { adapter.ensure_thread(&k2).await });
+        drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+        tokio::time::timeout(Duration::from_secs(5), ensure_task)
+            .await
+            .expect("in time")
+            .expect("join")
+            .expect("fresh");
+    }
+    // stop：停机 + 连接关闭
+    f.state.codex_control.stop();
+    assert!(
+        f.state.codex_control.adapter.is_stopping(),
+        "stop 后 adapter 必须进入停机态"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut buf = vec![0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), peer.io.read(&mut buf))
+        .await
+        .expect("eof in time")
+        .expect("read ok");
+    assert_eq!(n, 0, "stop 后对端必须看到 EOF（连接已关闭）");
+    // 停机态 ensure 拒绝：无新 connect/follow
+    let r = f.state.codex_control.adapter.ensure_thread(&key).await;
+    assert!(r.is_err(), "停机后 ensure 不再新建连接");
+    // 重新 start：解除停机；connector io 已耗尽 → 诚实快败（不悬挂）
+    f.state.codex_control.start(f.state.clone());
+    assert!(
+        !f.state.codex_control.adapter.is_stopping(),
+        "start 解除停机"
+    );
+    let r2 = tokio::time::timeout(
+        Duration::from_secs(5),
+        f.state.codex_control.adapter.ensure_thread(&key),
+    )
+    .await
+    .expect("no hang after restart");
+    assert!(r2.is_err(), "io 耗尽诚实快败");
 }

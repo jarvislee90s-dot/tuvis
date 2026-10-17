@@ -20,13 +20,76 @@ use super::types::{
     ThreadProjection,
 };
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// 单 Thread 镜像字节预算。
 pub const MIRROR_BUDGET: usize = 16 * 1024 * 1024;
+/// 全体镜像总字节预算（2026-10-17 复审 C4）：所有 ThreadMirror 保留状态的合计上限
+///——64 个关注名额不是镜像字节数上界（64 × 16MiB ≫ 64MiB）。adopt 前原子预留；
+/// patch 原子应用的 clone 是暂态（逐 Thread ≤ 16MiB 上界，不并入长期账目）。
+pub const GLOBAL_MIRROR_BUDGET: usize = 64 * 1024 * 1024;
 /// 投影正文最大条数。
 pub const PROJECTION_MAX_MESSAGES: usize = 500;
 /// 投影正文尾窗字节预算。
 pub const PROJECTION_TAIL_BYTES: usize = 1024 * 1024;
+
+/// 全体镜像字节账本：claim(key, old, new) 原子预留，超总预算返回 false（镜像转
+/// stale + Capacity 拒绝，等内存释放后由下次 ensure/事件救活）；mirror 卸载/
+/// 清态时释放。
+#[derive(Default)]
+pub struct MirrorLedger {
+    total: usize,
+    per_key: HashMap<ThreadKey, usize>,
+    cap: usize,
+}
+
+impl MirrorLedger {
+    /// 生产账本（全局 64MiB）。
+    pub fn global() -> Self {
+        Self {
+            total: 0,
+            per_key: HashMap::new(),
+            cap: GLOBAL_MIRROR_BUDGET,
+        }
+    }
+
+    /// 测试账本（自定义上限）。
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            total: 0,
+            per_key: HashMap::new(),
+            cap,
+        }
+    }
+
+    /// 原子预留：把 key 的占用从 old 换成 new；合计超上限 → false（不做部分生效）。
+    pub fn claim(&mut self, key: &ThreadKey, old: usize, new: usize) -> bool {
+        let delta = new as i64 - old as i64;
+        let projected = self.total as i64 + delta;
+        if projected < 0 || projected as usize > self.cap {
+            return false;
+        }
+        self.total = projected as usize;
+        self.per_key.insert(key.clone(), new);
+        true
+    }
+
+    /// 退场释放。
+    pub fn release(&mut self, key: &ThreadKey, size: usize) {
+        self.total = self.total.saturating_sub(size);
+        self.per_key.remove(key);
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// 账本上限（拒绝原因文案用）。
+    pub fn cap_of(&self) -> usize {
+        self.cap
+    }
+}
 
 /// apply 的效果：`changed` 是否产生新状态；`need_snapshot` 是否需要重拉快照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +117,21 @@ pub struct ThreadMirror {
     pending: PendingProjector,
     /// turnHistory.isComplete（不完整时 adapter 决定是否调 load-complete-history）
     history_complete: bool,
+    /// C4：全体镜像字节账本（生产挂全局账本；None = 独立镜像只受单 Thread 预算）
+    ledger: Option<Arc<std::sync::Mutex<MirrorLedger>>>,
+    /// 本镜像当前保留字节数（账本对账依据）
+    size: usize,
+}
+
+impl Drop for ThreadMirror {
+    fn drop(&mut self) {
+        if let Some(ledger) = &self.ledger {
+            ledger
+                .lock()
+                .expect("ledger lock")
+                .release(&self.key, self.size);
+        }
+    }
 }
 
 impl ThreadMirror {
@@ -66,7 +144,16 @@ impl ThreadMirror {
             state: None,
             pending: PendingProjector::new(),
             history_complete: true,
+            ledger: None,
+            size: 0,
         }
+    }
+
+    /// 挂全局字节账本（adapter 构造镜像的唯一生产入口）。
+    pub fn with_ledger(key: ThreadKey, ledger: Arc<std::sync::Mutex<MirrorLedger>>) -> Self {
+        let mut m = Self::new(key);
+        m.ledger = Some(ledger);
+        m
     }
 
     pub fn key(&self) -> &ThreadKey {
@@ -143,6 +230,13 @@ impl ThreadMirror {
     }
 
     fn clear_state(&mut self) {
+        if let Some(ledger) = &self.ledger {
+            ledger
+                .lock()
+                .expect("ledger lock")
+                .release(&self.key, self.size);
+        }
+        self.size = 0;
         self.revision = None;
         self.state = None;
         self.stale = true;
@@ -266,7 +360,8 @@ impl ThreadMirror {
         })
     }
 
-    /// 提交新状态（预算校验；超限 stale + 拒绝，不冒充无 owner）。
+    /// 提交新状态（预算校验：单 Thread 16MiB + 全体 64MiB；超限 stale + 拒绝，
+    /// 不冒充无 owner）。
     fn adopt(
         &mut self,
         rev: u64,
@@ -282,6 +377,18 @@ impl ThreadMirror {
                 "mirror exceeds per-thread budget: {size} > {MIRROR_BUDGET}"
             )));
         }
+        // C4：全体总预算——原子预留（old→new 换占），超限整批作废转 stale
+        if let Some(ledger) = &self.ledger {
+            let mut l = ledger.lock().expect("ledger lock");
+            if !l.claim(&self.key, self.size, size) {
+                self.stale = true;
+                return Err(ProtocolError::Capacity(format!(
+                    "mirror exceeds global budget: total would exceed {} bytes",
+                    l.cap_of()
+                )));
+            }
+        }
+        self.size = size;
         self.revision = Some(rev);
         self.state = Some(state);
         self.history_complete = history_complete;
@@ -840,6 +947,43 @@ mod tests {
         assert!(p.truncated);
         assert_eq!(p.messages[0].id, "i100", "保留尾窗（最新 500 条）");
         assert_eq!(p.messages[499].id, "i599");
+    }
+
+    #[test]
+    fn global_mirror_budget_bounds_all_mirrors() {
+        // C4：全体总预算——两镜像合计超上限 → 后到者 Capacity + stale；内存释放后
+        // 可再收（不靠 OOM 证明有界）
+        let ledger = Arc::new(std::sync::Mutex::new(MirrorLedger::with_cap(300)));
+        let mut a = ThreadMirror::with_ledger(key(), ledger.clone());
+        let mut b = ThreadMirror::with_ledger(
+            ThreadKey {
+                host_id: "local".into(),
+                thread_id: "00000000-0000-4000-8000-0000000000m2".into(),
+            },
+            ledger.clone(),
+        );
+        let snap = |rev: u64, blob: &str| {
+            serde_json::json!({
+                "type": "snapshot", "revision": rev,
+                "conversationState": { "turns": [], "requests": [], "big": blob }
+            })
+        };
+        a.apply(&lease(), &snap(1, &"x".repeat(200))).unwrap();
+        let after_a = ledger.lock().unwrap().total();
+        // B 的 200B 会让合计超 300 → 拒绝（账目不变）
+        let err = b.apply(&lease(), &snap(1, &"y".repeat(200))).unwrap_err();
+        assert!(matches!(err, ProtocolError::Capacity(_)));
+        assert!(b.is_stale());
+        assert_eq!(ledger.lock().unwrap().total(), after_a, "拒绝不部分生效");
+        // A 缩小 → B 可再收（合计仍 < 上限）
+        a.apply(&lease(), &snap(2, "small")).unwrap();
+        b.apply(&lease(), &snap(2, &"y".repeat(200))).unwrap();
+        let after_b = ledger.lock().unwrap().total();
+        assert!(after_b < 300 && after_b > 200, "合计有界：{after_b}");
+        // Drop 释放占用（账目只减不增）
+        drop(a);
+        let after_drop = ledger.lock().unwrap().total();
+        assert!(after_drop < after_b, "Drop 释放：{after_drop} < {after_b}");
     }
 
     #[test]

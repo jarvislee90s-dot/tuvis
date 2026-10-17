@@ -86,6 +86,20 @@ impl OwnerRegistry {
         }
     }
 
+    /// 单 thread 主动退场（2026-10-17 复审 C4：unfollow 最后一引用退出时回收——
+    /// lease 移除 + validity false，后续该 owner 的帧不再有授权可套）。
+    pub fn release(&mut self, key: &ThreadKey) {
+        if let Some(old) = self.threads.remove(key) {
+            let _ = old.validity_tx.send(false);
+            if let Some(set) = self.by_client.get_mut(&old.client_id) {
+                set.remove(key);
+                if set.is_empty() {
+                    self.by_client.remove(&old.client_id);
+                }
+            }
+        }
+    }
+
     /// 重连/Desktop 重启：清全部 lease（epoch 由 supervisor 递增），generation
     /// 记忆保留（跨 reset 仍单调）。
     pub fn reset(&mut self, new_epoch: u64) {

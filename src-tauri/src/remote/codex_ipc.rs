@@ -318,6 +318,8 @@ impl CodexControlHub {
         if self.running.swap(true, Ordering::SeqCst) {
             return; // 运行中：幂等
         }
+        // C4：热重启统一入口——解除停机态（stop 后 ensure 拒连），装配前恢复可连
+        self.adapter.resume();
         let hub = self.clone();
         let handle = tokio::spawn(async move { scheduler_loop(hub, st).await });
         *self.sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
@@ -326,14 +328,21 @@ impl CodexControlHub {
     /// 停止调度循环（remote 关闭/热重启；R7.5：调度器 + 启动恢复/周期对账 + 事件
     /// 订阅一并关闭——它们同住本循环；已派发任务（IPC 在途 RPC、detached 兜底回合）
     /// 不取消——留至落账或 unknown（permit Drop 守卫兜底）。
+    /// 2026-10-17 复审 C4：adapter 一并进入停机（恢复循环/重拉/转发不再重启、
+    /// ensure 不再新建连接）并关闭连接（对端见 EOF）——stop 后推进退避时间也不
+    /// 再有新 connect/follow；重新 start（resume）后仅装配一套任务。
     pub fn stop(&self) {
         if !self.capable {
             return;
         }
+        self.adapter.begin_shutdown();
         self.running.store(false, Ordering::SeqCst);
         if let Some(h) = self.sched.lock().unwrap_or_else(|e| e.into_inner()).take() {
             h.abort();
         }
+        // 连接关闭是异步收尾（conn 锁）：后台执行，peer 侧看到 EOF
+        let adapter = self.adapter.clone();
+        tokio::spawn(async move { adapter.shutdown().await });
     }
 }
 

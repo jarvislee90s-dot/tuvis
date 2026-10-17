@@ -2353,6 +2353,83 @@ async fn unknown_delivery_blocks_retry_same_pending() {
     adapter.shutdown().await;
 }
 
+/// discovery 帧的应答（C4 测试用）。
+async fn reply_discovery(peer: &mut ScriptedPeer, disc: &serde_json::Value, owner: &str) {
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": disc["requestId"],
+        "resultType": "success", "method": "thread-owner-discovery",
+        "handledByClientId": owner,
+        "result": { "supportsUntrustedAppInput": true }
+    }))
+    .await;
+}
+
+/// 2026-10-17 复审 C4：unfollow = 真正退场——following:false 必达、owner lease
+/// 回收（卸载后的 owner 帧不复活镜像）、幂等重入零副作用。
+#[tokio::test]
+async fn unfollow_sends_false_releases_lease_and_frames_do_not_revive() {
+    let (adapter, mut peer, _projection, key) = harness(vec![permissions_request()]).await;
+    adapter.unfollow(&key).await;
+    let off = recv_frame(&mut peer, 5).await;
+    assert_eq!(off["method"], "thread-stream-following-changed");
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+    assert_eq!(
+        off["params"]["conversationId"],
+        serde_json::json!(key.thread_id)
+    );
+
+    // 卸载后的 owner 帧：无 lease 可套、无镜像可落 → 不复活
+    peer.send(&state_frame(
+        &key.thread_id,
+        "owner-1",
+        snapshot_change(999, vec![permissions_request()], true),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let p = adapter.projection(&key).await;
+    assert!(p.stale && p.revision.is_none(), "卸载后帧不复活镜像");
+
+    // 幂等：再次 unfollow 零副作用（不再发 following:false）
+    adapter.unfollow(&key).await;
+    assert_no_frame(&mut peer, 300).await;
+    adapter.shutdown().await;
+}
+
+/// C4：连续 65 次挂载/卸载——逐次 following:false、名额逐次释放，第 65 次照常
+/// 完整 follow（名额不因历史挂载耗尽）。
+#[tokio::test]
+async fn mount_unmount_cycles_never_exhaust_following() {
+    let (adapter, mut peer, _p, _k) = harness(vec![]).await;
+    for i in 0..65u32 {
+        let key = tkey(&format!("cycle-{i}"));
+        let a = adapter.clone();
+        let k = key.clone();
+        let task = tokio::spawn(async move { a.ensure_thread(&k).await });
+        let disc = recv_frame(&mut peer, 5).await;
+        assert_eq!(disc["method"], "thread-owner-discovery", "第 {i} 次挂载");
+        reply_discovery(&mut peer, &disc, "owner-1").await;
+        let follow = recv_frame(&mut peer, 5).await;
+        assert_eq!(follow["method"], "thread-stream-following-changed");
+        peer.send(&state_frame(
+            &key.thread_id,
+            "owner-1",
+            snapshot_change(1, vec![], true),
+        ))
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("in time")
+            .expect("join")
+            .expect("fresh");
+        // 卸载：following:false 必达
+        adapter.unfollow(&key).await;
+        let off = recv_frame(&mut peer, 5).await;
+        assert_eq!(off["method"], "thread-stream-following-changed");
+        assert_eq!(off["params"]["following"], serde_json::json!(false));
+    }
+    adapter.shutdown().await;
+}
+
 /// 2026-10-17 复审 C3：respond 两阶段之间的 owner 换代——旧 A 的镜像载荷不得套
 /// 新 B 的有效 lease 写出。测试缝固定「阶段 1 读镜像 → owner 失效/接管 → 阶段 3
 /// 取 lease」的交错；阶段 3 同代复核（现行 lease ≠ 阶段 1 镜像 lease）→ 零写入。

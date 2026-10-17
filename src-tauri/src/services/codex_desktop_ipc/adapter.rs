@@ -132,8 +132,14 @@ struct AdapterInner {
     /// 同步短临界区读写，绝不跨 await 持有、不与其他锁嵌套。
     profile: std::sync::Mutex<ProtocolProfile>,
     conn: Mutex<Option<ConnectionHandle>>,
+    /// follow 互斥（C2）：settle 对账与派发路径可能并发 ensure 同一 thread——
+    /// 冷启动竞跑会产生重复 discovery/绑定（lease 翻代）。持锁串行化 follow 段；
+    /// 后到者在锁内重查新鲜镜像即短路。
+    ensure_lock: tokio::sync::Mutex<()>,
     owners: Mutex<OwnerRegistry>,
     mirrors: Mutex<HashMap<ThreadKey, ThreadMirror>>,
+    /// C4：全体镜像字节账本（生产 64MiB；所有镜像共用一份）
+    mirror_ledger: Arc<std::sync::Mutex<super::mirror::MirrorLedger>>,
     followings: Mutex<FollowingSet>,
     /// (thread_id, request_key) → 提交互斥（R4；独立短锁，不与 mirrors/owners 嵌套）。
     inflight: Mutex<HashMap<(String, String), InflightEntry>>,
@@ -171,8 +177,12 @@ impl DesktopIpcAdapter {
                 connector,
                 profile: std::sync::Mutex::new(profile),
                 conn: Mutex::new(None),
+                ensure_lock: tokio::sync::Mutex::new(()),
                 owners: Mutex::new(OwnerRegistry::default()),
                 mirrors: Mutex::new(HashMap::new()),
+                mirror_ledger: Arc::new(std::sync::Mutex::new(
+                    super::mirror::MirrorLedger::global(),
+                )),
                 followings: Mutex::new(FollowingSet::default()),
                 inflight: Mutex::new(HashMap::new()),
                 history_requested: Mutex::new(HashSet::new()),
@@ -217,6 +227,10 @@ impl DesktopIpcAdapter {
     /// 连接失败同样落到 closed——Desktop 晚启动不需要重启 Tuvis，投影照常给出
     /// stale/CompatOnly。R5：全程单锁短临界区，不嵌套。
     async fn ensure_connection(&self) -> Result<ConnectionHandle, ProtocolError> {
+        if self.inner.stopping.load(Ordering::SeqCst) {
+            // C4：shutdown 后不再新建连接（恢复循环/热重启统一由 stop/resume 管理）
+            return Err(ProtocolError::Disconnected("adapter shutting down".into()));
+        }
         {
             let conn = self.inner.conn.lock().await;
             if let Some(c) = conn.as_ref() {
@@ -273,16 +287,18 @@ impl DesktopIpcAdapter {
     }
 
     /// 确保线程已发现 owner、声明 following 并收到 snapshot；返回投影。
+    /// C2：follow 段经 ensure_lock 串行化——settle 对账与派发路径并发 ensure 时，
+    /// 后到者持锁后重查新鲜镜像即短路（不产生第二次 discovery/绑定）。
     pub async fn ensure_thread(&self, key: &ThreadKey) -> Result<ThreadProjection, ProtocolError> {
         let conn = self.ensure_connection().await?;
-        // 已跟随且新鲜：直接投影（短锁）
-        {
-            let mirrors = self.inner.mirrors.lock().await;
-            if let Some(m) = mirrors.get(key) {
-                if !m.is_stale() && m.revision().is_some() {
-                    return Ok(m.project(self.current_caps()));
-                }
-            }
+        // 快路径：已跟随且新鲜（短锁）
+        if let Some(p) = self.fresh_projection(key).await {
+            return Ok(p);
+        }
+        let _ensure = self.inner.ensure_lock.lock().await;
+        // 持锁重查：并发 ensure 可能已完成 follow
+        if let Some(p) = self.fresh_projection(key).await {
+            return Ok(p);
         }
         // 名额（短锁）
         {
@@ -295,6 +311,15 @@ impl DesktopIpcAdapter {
         Ok(self.projection(key).await)
     }
 
+    /// 已跟随且新鲜的投影（短锁；None = 需要 follow）。
+    async fn fresh_projection(&self, key: &ThreadKey) -> Option<ThreadProjection> {
+        let mirrors = self.inner.mirrors.lock().await;
+        mirrors
+            .get(key)
+            .filter(|m| !m.is_stale() && m.revision().is_some())
+            .map(|m| m.project(self.current_caps()))
+    }
+
     /// 可复用的 follow 流程（R2.5：ensure_thread 与重连恢复共用）：
     /// 建镜像（接 snapshot）→ discovery → 绑定 → following → 等 snapshot。
     /// 锁序纪律（R5）：mirrors → owners，各自短临界区，绝不嵌套、不跨 await 持锁。
@@ -303,12 +328,13 @@ impl DesktopIpcAdapter {
         conn: &ConnectionHandle,
         key: &ThreadKey,
     ) -> Result<(), ProtocolError> {
-        // mirror 必须在 following 声明前就位（snapshot 由事件转发落进来）
+        // mirror 必须在 following 声明前就位（snapshot 由事件转发落进来；
+        // C4：镜像挂全体字节账本）
         {
             let mut mirrors = self.inner.mirrors.lock().await;
-            mirrors
-                .entry(key.clone())
-                .or_insert_with(|| ThreadMirror::new(key.clone()));
+            mirrors.entry(key.clone()).or_insert_with(|| {
+                ThreadMirror::with_ledger(key.clone(), self.inner.mirror_ledger.clone())
+            });
         }
         // discovery（await 不持锁）→ 绑定（短锁）
         let owner_id = discover_owner(conn, key).await?;
@@ -408,12 +434,55 @@ impl DesktopIpcAdapter {
         }
     }
 
-    /// 退出跟随（详情卸载；释放名额，镜像保留为 stale 只读）。
+    /// 退出跟随（2026-10-17 复审 C4 收口：最后一引用退出 = 真正退场）——
+    /// 向 Desktop 声明 `following:false`、回收 owner lease（后续该 owner 的帧无
+    /// 授权可套）、删除镜像（字节账本随 Drop 释放；卸载后的帧**不复活镜像**）。
+    /// 未在跟随（幂等）→ 零副作用。
     pub async fn unfollow(&self, key: &ThreadKey) {
-        self.inner.followings.lock().await.unfollow(key);
-        if let Some(m) = self.inner.mirrors.lock().await.get_mut(key) {
-            m.mark_stale();
+        let was_following = self.inner.followings.lock().await.unfollow(key);
+        if !was_following {
+            return;
         }
+        // C4：只对**真正声明过 following**（有现行 lease）的 thread 发 following:false
+        //——ensure 失败回滚（discovery 未成功、从未声明）只回收名额，不发噪声帧
+        let had_lease = self.inner.owners.lock().await.current(key).is_some();
+        if had_lease && !self.inner.stopping.load(Ordering::SeqCst) {
+            if let Some(conn) = current_conn(self).await {
+                if let Ok(version) = conn.version_of("thread-stream-following-changed") {
+                    let _ = conn
+                        .broadcast(
+                            "thread-stream-following-changed",
+                            version,
+                            serde_json::json!({
+                                "conversationId": key.thread_id,
+                                "hostId": key.host_id,
+                                "following": false,
+                            }),
+                        )
+                        .await;
+                }
+            }
+        }
+        self.inner.owners.lock().await.release(key);
+        let removed = self.inner.mirrors.lock().await.remove(key);
+        drop(removed); // Drop 释放字节账本占用
+    }
+
+    /// C4：进入停机——恢复循环/重拉/转发不再重启，ensure 不再新建连接；
+    /// 已派发动作的独立落账任务不受影响（只经 store/conn 完成落账）。
+    pub fn begin_shutdown(&self) {
+        self.inner.stopping.store(true, Ordering::SeqCst);
+    }
+
+    /// C4：从停机恢复（hub.start 热重启路径）——重新允许连接。
+    pub fn resume(&self) {
+        self.inner.stopping.store(false, Ordering::SeqCst);
+    }
+
+    /// C4 探针：是否处于停机态。
+    #[doc(hidden)]
+    pub fn is_stopping(&self) -> bool {
+        self.inner.stopping.load(Ordering::SeqCst)
     }
 
     /// 原生 start turn（text 为已组装文本——来源标记由 router 恰好组装一次）。
