@@ -334,6 +334,52 @@ impl CodexControlRouter {
             .contains_key(key)
     }
 
+    /// R9 复审 P2-2：内存 Turn 簿记与账本终态收敛——派发等待者被取消后，
+    /// mark_active/bind_turn/clear_active 可能随 future 丢弃，内存限制停在
+    /// turn_id=None 而账本已终态 → 本线程队列进程内永久卡死。对账规则（重启
+    /// 等价语义）：accepted 且未绑 turnId → 从账本回执补绑（无 turnId 保守保留）；
+    /// rejected/cancelled → 解除；unknown 且无 turnId → 解除（不跨进程存活的
+    /// 保守限制；unknown 有 turnId → 保留按终态释放）。
+    pub fn converge_with_ledger(&self) {
+        let snapshot: Vec<(ThreadKey, String, Option<String>)> = {
+            let turns = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+            turns
+                .iter()
+                .map(|(k, t)| (k.clone(), t.action_id.clone(), t.turn_id.clone()))
+                .collect()
+        };
+        for (key, action_id, memory_turn) in snapshot {
+            let Some((state, ledger_turn)) = self.store.action_terminal_state(&action_id) else {
+                continue;
+            };
+            use crate::services::codex_desktop_ipc::types::ActionState as S;
+            match state {
+                S::Accepted => {
+                    if memory_turn.is_none() {
+                        if let Some(turn_id) = ledger_turn {
+                            let receipt = ActionReceipt {
+                                action_id: action_id.clone(),
+                                delivery: Delivery::Accepted,
+                                route: ControlRoute::DesktopIpc,
+                                turn_id: Some(turn_id),
+                                envelope_id: None,
+                                reason_code: None,
+                            };
+                            self.bind_turn(&key, &receipt, None);
+                        }
+                    }
+                }
+                S::Rejected | S::Cancelled => {
+                    self.clear_active(&key);
+                }
+                S::Unknown if memory_turn.is_none() => {
+                    self.clear_active(&key);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// R6.3：把接受回执的 Turn 身份绑定到在飞限制，并持久化（复用 codex_actions 的
     /// compat 屏障槽位：`compat_outstanding=1 + compat_turn_id`——重启后由
     /// `Router::new` 重建，队列视图以 blockedReason 如实说明）。缺 turnId 只保留内存

@@ -2706,3 +2706,109 @@ async fn production_chain_send_busy_queue_then_idle_relay() {
     );
     f.state.codex_control.stop();
 }
+
+/// R9 复审 P2-2 回归：HTTP 等待者被取消后，Turn 簿记与账本收敛——同 thread
+/// 第二条消息必须仍能派发（不得因 turn_id=None 的孤儿限制在进程内永久卡死）。
+#[tokio::test]
+async fn aborted_waiter_convergence_unblocks_queue() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    f.state
+        .codex_control
+        .set_reconcile_period_ms(std::time::Duration::from_millis(200).as_millis() as u64);
+    f.state.codex_control.start(f.state.clone());
+
+    // ① send#1：ensure → start-turn 发出 → 中止 HTTP 等待者
+    let body1 = send_body("被弃消息", Some("act-cvrg-1"), false);
+    let task1 = tokio::spawn(async move {
+        let _ = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some(COOKIE),
+                Some(body1),
+            ))
+            .await;
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    task1.abort();
+
+    // ② Desktop 正常应答：独立派发任务落账 accepted（含 turnId）
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-cvrg-1", "status": "inProgress" } }
+    }))
+    .await;
+    let view = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let v = f
+                .hub_store()
+                .get_for_device("act-cvrg-1", "dev-1")
+                .unwrap()
+                .unwrap();
+            if v.state != ActionState::Reserved {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("dispatch task settles");
+    assert_eq!(view.state, ActionState::Accepted);
+
+    // ③ idle snapshot（revision 前进）→ 对账收敛（账本补绑 turnId → 限制释放）
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": {
+            "conversationId": THREAD, "hostId": "local",
+            "change": {
+                "type": "snapshot", "revision": 6,
+                "conversationState": {
+                    "turns": [], "requests": [],
+                    "threadRuntimeStatus": { "type": "idle" },
+                    "turnHistory": { "isComplete": true, "history": {
+                        "entitiesByKey": {
+                            "t6": { "id": "t6", "type": "turn", "status": "completed", "items": ["u6"] },
+                            "u6": { "id": "u6", "type": "user_message", "text": "被弃消息 [mobile iPhone]", "ts": 6 }
+                        },
+                        "islands": [{ "entries": ["t6"] }]
+                    }}
+                }
+            }
+        }
+    }))
+    .await;
+
+    // ④ 第二条消息必须照常派发（队列不得永久卡死）：POST 可能忙态入队（收敛
+    // 前的窗口），但收敛 + idle 释放后 flush 接力必须把队首真正发出去——
+    // 证据 = 第二个 start-turn 帧到达（孤儿限制未释放时它永远不来）
+    let _ = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("收敛后第二条", Some("act-cvrg-2"), false)),
+        ))
+        .await
+        .unwrap();
+    let frame2 = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .expect("收敛后队列必须流动（第二个 start-turn 帧）");
+    assert_eq!(frame2["method"], "thread-follower-start-turn");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame2["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-cvrg-2", "status": "inProgress" } }
+    }))
+    .await;
+    f.state.codex_control.stop();
+}

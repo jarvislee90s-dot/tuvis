@@ -385,6 +385,54 @@ impl ActionStore {
 
     /// 有待发工作（queued 普通消息 / 在册屏障）的 thread 全集（hub 启动恢复与周期
     /// 对账的枚举输入，R7.1/R7.2；空集合零开销）。
+    /// R9 复审 P2-2：运行期把超龄 reserved 行收敛为 unknown（等待者取消后账本
+    /// 不再永久 Reserved；与启动 recover 同语义）。返回 (action_id, thread_id)。
+    pub fn mark_stale_reserved_unknown(&self, max_age_ms: i64) -> Vec<(String, String)> {
+        self.with(|c| {
+            dao::mark_stale_reserved_unknown_conn(c, max_age_ms, now_ms())
+                .map_err(|e| StoreError::Database(e.to_string()))
+        })
+        .unwrap_or_default()
+    }
+
+    /// 读取动作的账本终态与回执 turnId（converge 用；不走设备隔离）。
+    pub fn action_terminal_state(
+        &self,
+        action_id: &str,
+    ) -> Option<(
+        crate::services::codex_desktop_ipc::types::ActionState,
+        Option<String>,
+    )> {
+        self.with(|c| {
+            let Ok(mut stmt) =
+                c.prepare("SELECT state, receipt_json FROM codex_actions WHERE action_id = ?1")
+            else {
+                return Ok(None);
+            };
+            let (state, receipt): (String, Option<String>) =
+                match stmt.query_row([action_id], |r| Ok((r.get(0)?, r.get(1)?))) {
+                    Ok(v) => v,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                    Err(_) => return Ok(None),
+                };
+            let turn_id = receipt.and_then(|json| {
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .ok()
+                    .and_then(|v| v.get("turnId").and_then(|t| t.as_str()).map(str::to_string))
+            });
+            let state = match state.as_str() {
+                "queued" => crate::services::codex_desktop_ipc::types::ActionState::Queued,
+                "reserved" => crate::services::codex_desktop_ipc::types::ActionState::Reserved,
+                "accepted" => crate::services::codex_desktop_ipc::types::ActionState::Accepted,
+                "rejected" => crate::services::codex_desktop_ipc::types::ActionState::Rejected,
+                "unknown" => crate::services::codex_desktop_ipc::types::ActionState::Unknown,
+                _ => crate::services::codex_desktop_ipc::types::ActionState::Cancelled,
+            };
+            Ok(Some((state, turn_id)))
+        })
+        .unwrap_or(None)
+    }
+
     pub fn threads_with_pending_work(&self) -> Result<Vec<ThreadKey>, StoreError> {
         self.with(|c| {
             dao::threads_with_pending_work_conn(c)

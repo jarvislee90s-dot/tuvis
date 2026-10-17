@@ -200,15 +200,17 @@ impl CodexControlHub {
             Arc::new(ProductionConnector { resolver }),
             profile,
         ));
-        Self::with_parts(
-            store,
-            adapter.clone(),
-            Arc::new(AdapterDispatch {
-                adapter: adapter.clone(),
-                gate: Arc::default(),
-            }),
-            true,
-        )
+        // FollowGate 单实例同源（R7 复审 P2-1）：AdapterDispatch（ensure 失败回滚判定）
+        // 与 hub（SSE 引用计数）必须看同一份关注引用——双实例会让派发侧误判零引用，
+        // 把有活跃订阅的 thread 挤出 following 且恢复循环不再重建
+        let gate: Arc<FollowGate> = Arc::default();
+        let dispatch = Arc::new(AdapterDispatch {
+            adapter: adapter.clone(),
+            gate: gate.clone(),
+        });
+        let mut hub = Self::with_parts(store, adapter, dispatch, true);
+        hub.gate = gate;
+        hub
     }
 
     /// 测试假体构造（计划「测试假体构造」）：注入内存库/adapter/派发器，`capable`
@@ -338,6 +340,9 @@ impl CodexControlHub {
 /// 调度循环主体：adapter 投影广播 + hub 落账事件 + 周期对账三路输入，逐 Thread 结算。
 /// 首个 tick 立即到点 = R7.1 启动恢复（枚举待发 thread → ensure 重新 following →
 /// settle 接力 flush；不打开详情、不手工 flush 也能恢复发送）。
+/// 派发结果收敛时限：远超 RPC 15s 超时——超过即视为等待者已丢、结果无人认领。
+const STUCK_DISPATCH_MS: i64 = 60_000;
+
 async fn scheduler_loop(hub: Arc<CodexControlHub>, st: Arc<RemoteState>) {
     let mut proj_rx = hub.adapter.subscribe();
     let mut evt_rx = hub.events.subscribe();
@@ -361,14 +366,26 @@ async fn scheduler_loop(hub: Arc<CodexControlHub>, st: Arc<RemoteState>) {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             _ = tick.tick() => {
+                // R9 复审 P2-2：先收敛被取消等待者的残留状态——超龄 reserved →
+                // unknown（重启 recover 同语义），内存 Turn 簿记与账本终态对齐
+                //（accepted 补绑 turnId / rejected、无证据 unknown 解除限制），
+                // 否则该 thread 队列在进程内永久卡死
+                let recovered = hub.router.store().mark_stale_reserved_unknown(STUCK_DISPATCH_MS);
+                hub.router.converge_with_ledger();
                 // R7.1 启动恢复（首 tick 即到点）/ R7.2 周期对账：枚举全部待发 thread
-                //（queued 普通消息 / 在册屏障；空集合零开销），逐线程 ensure 重新
-                // following → settle 接力（内部 try-lock 让路，不与在途派发互等）
-                let keys = hub
+                //（queued 普通消息 / 在册屏障 / 刚收敛的行；空集合零开销），逐线程
+                // ensure 重新 following → settle 接力（内部 try-lock 让路）
+                let mut keys = hub
                     .router
                     .store()
                     .threads_with_pending_work()
                     .unwrap_or_default();
+                for (_, tid) in &recovered {
+                    let k = local_key(tid);
+                    if !keys.contains(&k) {
+                        keys.push(k);
+                    }
+                }
                 for key in keys {
                     settle_thread(&hub, &st, &key).await;
                 }

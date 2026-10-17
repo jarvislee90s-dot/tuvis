@@ -249,6 +249,61 @@ pub(crate) fn queued_for_thread_conn(
 
 /// 启动恢复：reserved → unknown（writer 已接手但进程消失 = 投递结果未知；绝不回
 /// queued）。queued 行不受影响，仍按序可发。返回恢复条数。
+/// R9 复审 P2-2：运行期收敛——派发等待者被取消后，reserved 行可能永远停留在
+/// 账本上（落账路径已随 future 丢弃）。与启动 `recover_reserved` 同语义（reserved
+/// → unknown，不回 queued）：仅收敛 route=desktop_ipc、无 compat 屏障、超龄（远超
+/// RPC 15s 超时）的行；同事务写审计（result=unknown，诚实不虚称完成）。
+pub(crate) fn mark_stale_reserved_unknown_conn(
+    conn: &Connection,
+    max_age_ms: i64,
+    now_ms: i64,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let cutoff = now_ms - max_age_ms;
+    let mut stmt = conn.prepare(
+        "SELECT seq, action_id, thread_id FROM codex_actions
+         WHERE state = 'reserved' AND route = 'desktop_ipc' AND kind = 'send'
+           AND (compat_outstanding IS NULL OR compat_outstanding = 0)
+           AND updated_at <= ?1",
+    )?;
+    let rows: Vec<(i64, String, String)> = stmt
+        .query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut converged = Vec::new();
+    for (seq, action_id, thread_id) in rows {
+        let tx = conn.unchecked_transaction()?;
+        conn.execute(
+            "UPDATE codex_actions SET state='unknown', queued_text=NULL, updated_at=?2,
+             receipt_json=?3 WHERE seq=?1 AND state='reserved'",
+            rusqlite::params![
+                seq,
+                now_ms,
+                serde_json::json!({
+                    "actionId": action_id,
+                    "delivery": "unknown_delivery",
+                    "route": "desktop_ipc",
+                    "reasonCode": "aborted_dispatch_unknown"
+                })
+                .to_string()
+            ],
+        )?;
+        crate::database::dao::write_audit::record_conn_checked(
+            conn,
+            now_ms,
+            "system",
+            "system",
+            "codex",
+            thread_id.as_str(),
+            "codex_desktop_ipc",
+            "codex_send",
+            &format!("{{\"actionId\":\"{action_id}\"}}"),
+            "unknown:aborted_dispatch_unknown",
+        )?;
+        tx.commit()?;
+        converged.push((action_id, thread_id));
+    }
+    Ok(converged)
+}
+
 pub(crate) fn recover_reserved_conn(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
     let reserved: Vec<String> = {
         let mut stmt = conn.prepare(

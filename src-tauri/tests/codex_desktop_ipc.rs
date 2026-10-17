@@ -1382,6 +1382,50 @@ async fn drive_follow_collecting(
     others
 }
 
+/// 等**多个** thread 各自的下一个投影（收集式：非目标帧缓存复用，不丢弃——
+/// 双线程失效测试的帧到达顺序随机，逐个过滤会吞掉另一线程的帧，满载下
+/// ~50% 假红；R9 复审 P3-1）
+async fn wait_projections_multi(
+    rx: &mut tokio::sync::broadcast::Receiver<
+        multi_agents_manager_lib::services::codex_desktop_ipc::types::ThreadProjection,
+    >,
+    thread_ids: &[&str],
+    stale_only: bool,
+    secs: u64,
+) -> std::collections::HashMap<
+    String,
+    multi_agents_manager_lib::services::codex_desktop_ipc::types::ThreadProjection,
+> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    let mut got = std::collections::HashMap::new();
+    let mut skipped: Vec<
+        multi_agents_manager_lib::services::codex_desktop_ipc::types::ThreadProjection,
+    > = Vec::new();
+    for p in skipped.drain(..) {
+        if thread_ids.contains(&p.thread_id.as_str()) {
+            got.insert(p.thread_id.clone(), p);
+        }
+    }
+    while got.len() < thread_ids.len() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待 threads {thread_ids:?} 投影超时（已得 {:?}）",
+            got.keys().collect::<Vec<_>>()
+        );
+        let p = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        let Ok(Ok(p)) = p else { continue };
+        if stale_only && !p.stale {
+            continue;
+        }
+        if thread_ids.contains(&p.thread_id.as_str()) {
+            got.insert(p.thread_id.clone(), p);
+        } else {
+            skipped.push(p); // 非目标帧保留回灌，不吞
+        }
+    }
+    got
+}
+
 /// 等 SSE 里某 thread 的下一个投影（可选 stale 过滤）。
 async fn wait_projection(
     rx: &mut broadcast::Receiver<
@@ -1686,11 +1730,10 @@ async fn client_status_changed_invalidates_all_threads_of_owner() {
     }))
     .await;
 
-    // SSE 收到两 thread 的 stale 投影
-    let s1 = wait_projection(&mut sse, "own-t1", true, 5).await;
-    assert!(s1.stale);
-    let s2 = wait_projection(&mut sse, "own-t2", true, 5).await;
-    assert!(s2.stale);
+    // SSE 收到两 thread 的 stale 投影（收集式：帧序随机，不逐个过滤吞帧）
+    let got = wait_projections_multi(&mut sse, &["own-t1", "own-t2"], true, 5).await;
+    assert!(got["own-t1"].stale);
+    assert!(got["own-t2"].stale);
 
     // 旧卡 respond 零写（旧 lease/token 全失效）
     let rk = p1.pending[0].request_key.clone();
