@@ -37,11 +37,12 @@
 | 前端页面文案 | `src/i18n/locales/zh.json` | `src/i18n/locales/en.json` | `pnpm check:i18n` 只保**键集**一致，键下的英文值漂移不报，须逐键比对 |
 | 项目 README | `README.md` | `README.en.md` | 无门禁，人工/代理核对 |
 | 用户手册（官网 `/docs` 挂载） | `docs/user-manual/zh/`（13 章） | `docs/user-manual/en/` | 无门禁；en 曾为骨架，至少核对本版有变动的章节 |
+| 更新日志（官网 `/changelog` 挂载） | `CHANGELOG.md`（纯中文） | `CHANGELOG.en.md`（纯英文） | 2026-10-17 拆分（此前「同文件内嵌 `EN:` 行」契约作废）：两份各自单语、版本/日期/分区逐条对齐，未译条目只写中文版 |
 
 检查方法：对上一版 tag 执行 `git diff vX.Y.Z..HEAD -- <上述路径>`，列出本轮全部中文改动逐条核对。
 配套的发版同步义务（单语，不涉对照）：`docs/capabilities.json` 与 README「多终端能力矩阵」
-**两处随发版同步更新**（官网拉取前者渲染兼容矩阵）；`CHANGELOG.md` 与
-`docs/release-notes/vX.Y.Z.md` 为纯中文产物，不要求英文对照。
+**两处随发版同步更新**（官网拉取前者渲染兼容矩阵）；`docs/release-notes/vX.Y.Z.md`
+为纯中文产物，不要求英文对照（更新日志已入上表双语对照面）。
 
 ## 技术栈
 - Tauri 2 + Rust + React 19 + TypeScript + shadcn/ui + Tailwind CSS v4
