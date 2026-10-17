@@ -616,13 +616,33 @@ export default function MessageComposer({
 
   const injectable = sendInfo !== null && sendInfo.injectable;
 
+  /** C5（第三轮复审非阻塞项）：待恢复草稿槽位。not_sent 核对只「申请」恢复；
+   *  是否恢复由下方 effect 在**当前输入态**下统一裁决——整份恢复或整份放弃。 */
+  const [draftRestore, setDraftRestore] = useState<{
+    text: string;
+    attachments: PendingAttachment[];
+  } | null>(null);
+  useEffect(() => {
+    if (draftRestore === null) return;
+    if (text === "" && attachments.length === 0) {
+      // 草稿整份未被触碰：一起回填
+      setText(draftRestore.text);
+      setAttachments(draftRestore.attachments);
+    }
+    // 否则整份放弃（用户已开始新输入——绝不把旧附件接到新正文上）；无论恢复
+    // 与否都消费掉槽位（放弃后不再复活）
+    setDraftRestore(null);
+  }, [draftRestore, text, attachments]);
+
   /** R12：unknown 结果的只读核对（**恰一次**；绝不重发 POST）。按账本查询结果呈现：
    *  accepted → 升级「已受理」；rejected/cancelled（明确终态）→「未送达」并让位 ID；
    *  查不到/未终态/查询失败 → 保持「投递结果未知」，actionId 保留作下一次核对锚。
    *  代守卫：核对在途期间用户又发起发送（代际 +1）→ 迟到的核对结果作废，不覆盖新回执。
    *  C5（非阻塞项）：`draft` = unknown 路径清空前的原文/附件——核对到 **not_sent
-   *  （明确零投递）** 时恢复草稿（消息确认未离开客户端；输入框已被新输入占用则
-   *  不覆盖，只更新回执）。 */
+   *  （明确零投递）** 时申请恢复草稿。恢复经 `draftRestore` 槽位由 effect 统一
+   *  评估（第三轮复审非阻塞项）：**整份恢复或整份放弃**——正文与附件是同一份
+   *  草稿，只在「两者都仍是清空后的空态」时一起回填；旧查询迟到时用户已输入
+   *  新正文（哪怕附件还是空的）→ 整份放弃，绝不把旧附件接到新正文上。 */
   const verifyCodexDelivery = useCallback(
     async (actionId: string, draft?: { text: string; attachments: PendingAttachment[] }) => {
       const gen = codexSendGenRef.current;
@@ -638,9 +658,7 @@ export default function MessageComposer({
       codexActionIdRef.current = null; // 核对完成（明确终态）→ ID 让位，下一条消息 = 新动作
       setReceipt({ kind: "codex", receipt: r });
       if (r.delivery === "not_sent" && draft !== undefined) {
-        // 明确零投递：恢复原文/附件（输入框未被新输入占用才恢复，绝不覆盖新草稿）
-        setText((prev) => (prev === "" ? draft.text : prev));
-        setAttachments((prev) => (prev.length === 0 ? draft.attachments : prev));
+        setDraftRestore(draft); // 恢复与否由下方 effect 按「草稿整份未被触碰」评估
       }
     },
     []

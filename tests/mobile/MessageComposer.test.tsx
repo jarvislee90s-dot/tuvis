@@ -52,6 +52,8 @@ interface Routes {
   sendReject?: boolean;
   /** R12：GET /codex/action 只读核对载荷；"missing"=404；"reject"=网络异常 */
   codexAction?: Record<string, unknown> | "missing" | "reject";
+  /** C5 非阻塞：核对挂起不响应（手动放行——固定「迟到 NotSent vs 用户新输入」时序） */
+  codexActionHang?: boolean;
   /** 非 2xx 时响应体 JSON（403 not_injectable{reason,reasonCode} 等，P2-10） */
   sendBody?: Record<string, unknown>;
   /** 发送请求挂起不响应（灰3：投递中 chip 的慢消费者场景） */
@@ -84,6 +86,23 @@ interface Routes {
 
 let routes: Routes;
 let fetchMock: ReturnType<typeof vi.fn>;
+/** codexActionHang 挂起请求的放行器 */
+let releaseCodexAction: ((v: unknown) => void) | null = null;
+
+/** jsdom 的 Blob 可能缺 arrayBuffer——兜底补齐（与附件 describe 内的同名 helper 同实现） */
+function ensureFileArrayBufferCompat(file: File) {
+  const proto = Object.getPrototypeOf(file) as { arrayBuffer?: unknown };
+  if (typeof proto.arrayBuffer !== "function") {
+    (Object.getPrototypeOf(file) as { arrayBuffer: () => Promise<ArrayBuffer> }).arrayBuffer =
+      async () => new TextEncoder().encode("x").buffer as ArrayBuffer;
+  }
+}
+
+function pngFileCompat(name = "shot.png"): File {
+  const f = new File([new Uint8Array([0x89, 0x50])], name, { type: "image/png" });
+  ensureFileArrayBufferCompat(f);
+  return f;
+}
 /** sendHang 挂起请求的放行器（测试中手动 resolve 模拟响应到达） */
 let releaseSend: ((r: Response) => void) | null = null;
 /** attachHang 挂起请求的放行器（上传中禁发测试用；XHR 后改为对挂起 FakeXHR respond） */
@@ -93,6 +112,7 @@ let releaseQueue: ((r: Response) => void) | null = null;
 
 beforeEach(() => {
   routes = {};
+  releaseCodexAction = null;
   releaseSend = null;
   releaseAttach = null;
   releaseQueue = null;
@@ -189,6 +209,11 @@ function installFetch() {
     }
     if (url.includes("/codex/action")) {
       // R12：fetchCodexAction 只读核对（缺省未终态 queued；"missing"=404 查不到）
+      if (routes.codexActionHang) {
+        return new Promise<Response>((resolve) => {
+          releaseCodexAction = resolve;
+        });
+      }
       if (routes.codexAction === "reject") throw new TypeError("codex/action 网络断开");
       if (routes.codexAction === "missing") {
         return new Response(JSON.stringify({ error: "not_found" }), { status: 404 });
@@ -1006,7 +1031,7 @@ describe("移动端附件上传（2026-09-20）", () => {
     const input = await screen.findByTestId("composer-input");
     fireEvent.change(input, { target: { value: "看这张图" } });
     fireEvent.change(screen.getByTestId("attach-file-input"), {
-      target: { files: [pngFile()] },
+      target: { files: [pngFileCompat()] },
     });
     // 上传完成 → ready chip 出现（名字显示）
     await screen.findByText("shot.png");
@@ -2437,5 +2462,104 @@ describe("MessageComposer：Codex 原生回执状态机（R12）", () => {
     const ids = postedActionIds();
     // 新正文 = 新动作：若沿旧 unknown ID 发送，服务端会去重/回放旧回执（新消息永远发不出）
     expect(ids[1]).not.toBe(ids[0]);
+  });
+
+  it("not_sent_draft_restore_is_whole_or_dropped：迟到 NotSent 的草稿回填整份恢复或整份放弃（C5 非阻塞）——用户已输入新正文时旧附件绝不接到新正文上", async () => {
+    // —— 场景 1：用户已输入新正文 B → 整份放弃 ——
+    installFetch();
+    routes.info = codexAppSendInfo();
+    routes.attach = { path: "E:/proj/.tuvis-attachments/s-1/1-shot.png", size: 2 };
+    routes.sendReject = true; // 丢回执 → unknown
+    routes.codexActionHang = true;
+    routes.codexAction = {
+      actionId: "act-ns",
+      state: "rejected",
+      position: null,
+      receipt: {
+        actionId: "act-ns",
+        delivery: "not_sent",
+        route: "desktop_ipc",
+        turnId: null,
+        envelopeId: null,
+        reasonCode: "headless_disabled",
+      },
+    };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "旧消息A" } });
+    fireEvent.change(screen.getByTestId("attach-file-input"), {
+      target: { files: [pngFileCompat()] },
+    });
+    await screen.findByText("shot.png");
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await screen.findByTestId("send-receipt-codex-unknown");
+    // 输入已清空（防双投），核对挂起（releaseCodexAction 就绪）
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
+    expect(releaseCodexAction).toBeTruthy();
+    // 用户开始输入**新正文 B**（附件区保持空）
+    fireEvent.change(input, { target: { value: "新正文B" } });
+    // 迟到的核对结果：NotSent（明确零投递）
+    await act(async () => {
+      releaseCodexAction?.(
+        new Response(
+          JSON.stringify({
+            actionId: "act-ns",
+            state: "rejected",
+            position: null,
+            receipt: {
+              actionId: "act-ns",
+              delivery: "not_sent",
+              route: "desktop_ipc",
+              turnId: null,
+              envelopeId: null,
+              reasonCode: "headless_disabled",
+            },
+          }),
+          { status: 200 }
+        )
+      );
+      await Promise.resolve();
+    });
+    await flushAsync();
+    // 整份放弃：新正文原样保留，旧附件绝不接到新正文上
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("新正文B");
+    expect(screen.queryByText("shot.png")).toBeNull();
+    expect(screen.getByTestId("send-receipt-codex-failed")).toBeTruthy();
+  });
+
+  it("not_sent_draft_restore_when_untouched：核对 NotSent 且输入未动 → 整份恢复原文与附件", async () => {
+    installFetch();
+    routes.info = codexAppSendInfo();
+    routes.attach = { path: "E:/proj/.tuvis-attachments/s-1/1-shot.png", size: 2 };
+    routes.sendReject = true;
+    routes.codexAction = {
+      actionId: "act-ns2",
+      state: "rejected",
+      position: null,
+      receipt: {
+        actionId: "act-ns2",
+        delivery: "not_sent",
+        route: "desktop_ipc",
+        turnId: null,
+        envelopeId: null,
+        reasonCode: "headless_disabled",
+      },
+    };
+    render(<MessageComposer session={{ id: "sess-2" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "旧消息A" } });
+    fireEvent.change(screen.getByTestId("attach-file-input"), {
+      target: { files: [pngFileCompat()] },
+    });
+    await screen.findByText("shot.png");
+    fireEvent.click(screen.getByTestId("composer-send"));
+    // 核对立即返回（无挂起）：unknown → not_sent 终态一拍内落地
+    await screen.findByTestId("send-receipt-codex-failed");
+    // 输入未动 → 明确零投递 → 整份恢复（原文 + 附件一起回来）
+    await waitFor(() => {
+      expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("旧消息A");
+    });
+    expect(screen.getByText("shot.png")).toBeTruthy();
+    expect(screen.getByTestId("send-receipt-codex-failed")).toBeTruthy();
   });
 });
