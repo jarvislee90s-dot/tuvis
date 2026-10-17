@@ -73,6 +73,12 @@ impl ThreadMirror {
         &self.key
     }
 
+    /// 镜像当前绑定的 owner lease（2026-10-17 复审 C3：respond 三阶段同代复核锚——
+    /// 阶段 1 记录、阶段 3 与现行 lease 全同比较；换代后旧载荷零写入）。
+    pub fn lease(&self) -> Option<&OwnerLease> {
+        self.lease.as_ref()
+    }
+
     pub fn revision(&self) -> Option<u64> {
         self.revision
     }

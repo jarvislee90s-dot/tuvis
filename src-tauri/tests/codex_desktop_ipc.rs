@@ -1736,6 +1736,32 @@ async fn client_status_changed_invalidates_all_threads_of_owner() {
     let o = adapter.respond(&k1, &rk, &tk, PendingAction::Approve).await;
     assert_eq!(o.delivery, Delivery::NotSent);
     assert_eq!(o.reason_code.as_deref(), Some("stale_context"));
+    // C2：owner 失效但 socket 仍活着 → 自动重跟随两 thread（发现顺序不固定，按帧分拣）
+    for _ in 0..2 {
+        let disc = recv_frame(&mut peer, 5).await;
+        assert_eq!(disc["method"], "thread-owner-discovery", "C2 自动重发现");
+        let tid = disc["params"]["conversationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        peer.send(&serde_json::json!({
+            "type": "response", "requestId": disc["requestId"],
+            "resultType": "success", "method": "thread-owner-discovery",
+            "handledByClientId": "owner-1",
+            "result": { "supportsUntrustedAppInput": true }
+        }))
+        .await;
+        let follow = recv_frame(&mut peer, 5).await;
+        assert_eq!(follow["method"], "thread-stream-following-changed");
+        assert_eq!(follow["params"]["conversationId"], serde_json::json!(tid));
+        // 新世界 snapshot（换代重理 token；失效卡不复活）
+        peer.send(&state_frame(
+            &tid,
+            "owner-1",
+            snapshot_change(50, vec![], true),
+        ))
+        .await;
+    }
     assert_no_frame(&mut peer, 300).await;
     adapter.shutdown().await;
 }
@@ -1776,25 +1802,25 @@ async fn late_frame_from_old_owner_is_dropped() {
     }))
     .await;
     let _stale = wait_projection(&mut sse, "late-thread", true, 5).await;
-    let task = {
-        let a = adapter.clone();
-        let k = key.clone();
-        tokio::spawn(async move { a.ensure_thread(&k).await })
-    };
-    drive_follow(
-        &mut peer,
+    // C2：owner A→B 接管走**自动重跟随**（生产路径；不再手工 ensure）
+    let disc = recv_frame(&mut peer, 5).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": disc["requestId"],
+        "resultType": "success", "method": "thread-owner-discovery",
+        "handledByClientId": "owner-2",
+        "result": { "supportsUntrustedAppInput": true }
+    }))
+    .await;
+    let follow = recv_frame(&mut peer, 5).await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    peer.send(&state_frame(
         "late-thread",
         "owner-2",
         snapshot_change(6, vec![], true),
-        false,
-    )
+    ))
     .await;
-    let _ = tokio::time::timeout(Duration::from_secs(10), task)
-        .await
-        .expect("in time")
-        .expect("join")
-        .expect("fresh");
-    let now = adapter.projection(&key).await;
+    let now = wait_revision(&adapter, &key, 6).await;
     assert_eq!(now.revision, Some(6));
 
     // 旧 owner 的迟到帧（rev 7）：必须丢弃——镜像 revision/内容不变
@@ -2016,7 +2042,8 @@ async fn follow_and_respond_do_not_deadlock() {
         .expect("join");
     assert_eq!(o.delivery, Delivery::Accepted);
 
-    // lease 最终复核仍在：owner 失效后旧卡仍拒（先等 stale 投影落地再复核，免竞态）
+    // lease/token 最终复核仍在：owner 失效 → C2 自动重跟随两 thread（顺序不按序分拣）
+    // → 换代后旧 token 作废，旧卡 respond 零写
     peer.send(&serde_json::json!({
         "type": "broadcast", "method": "client-status-changed", "version": 0,
         "sourceClientId": "owner-1",
@@ -2025,11 +2052,39 @@ async fn follow_and_respond_do_not_deadlock() {
     .await;
     let stale = wait_projection(&mut sse, &key1.thread_id, true, 5).await;
     assert!(stale.stale);
+    for _ in 0..2 {
+        let disc = recv_frame(&mut peer, 5).await;
+        assert_eq!(disc["method"], "thread-owner-discovery");
+        let tid = disc["params"]["conversationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        peer.send(&serde_json::json!({
+            "type": "response", "requestId": disc["requestId"],
+            "resultType": "success", "method": "thread-owner-discovery",
+            "handledByClientId": "owner-1",
+            "result": { "supportsUntrustedAppInput": true }
+        }))
+        .await;
+        let follow = recv_frame(&mut peer, 5).await;
+        assert_eq!(follow["method"], "thread-stream-following-changed");
+        // key1 的世界带原 pending（新 token）；key2 空世界——按 tid 区分
+        let change = if tid == key1.thread_id {
+            snapshot_change(301, vec![permissions_request()], true)
+        } else {
+            snapshot_change(301, vec![], true)
+        };
+        peer.send(&state_frame(&tid, "owner-1", change)).await;
+    }
     let o2 = adapter
         .respond(&key1, &rk, &tk, PendingAction::Approve)
         .await;
     assert_eq!(o2.delivery, Delivery::NotSent);
-    assert_eq!(o2.reason_code.as_deref(), Some("stale_context"));
+    assert_eq!(
+        o2.reason_code.as_deref(),
+        Some("stale_context"),
+        "换代后旧 token 作废"
+    );
     assert_no_frame(&mut peer, 300).await;
     adapter.shutdown().await;
 }
@@ -2237,7 +2292,8 @@ async fn unknown_delivery_blocks_retry_same_pending() {
     );
     assert_no_frame(&mut peer, 300).await;
 
-    // pending 消失 → 阻塞解除；再 respond 是 stale_context（卡没了），不再是 submit_in_progress
+    // pending 消失：**状态应用驱动清理屏障**（2026-10-17 复审 C3——期间没有任何
+    // respond 调用，旧实现靠这里的额外 respond 替生产清屏障，遮住常态）
     peer.send(&state_frame(
         "00000000-0000-4000-8000-0000000000m1",
         "owner-1",
@@ -2246,17 +2302,9 @@ async fn unknown_delivery_blocks_retry_same_pending() {
     ))
     .await;
     let _ = wait_revision(&adapter, &key, 210).await;
-    let o3 = adapter
-        .respond(&key, &rk, &tk, PendingAction::Approve)
-        .await;
-    assert_eq!(o3.delivery, Delivery::NotSent);
-    assert_eq!(
-        o3.reason_code.as_deref(),
-        Some("stale_context"),
-        "阻塞已随 pending 消失解除"
-    );
 
-    // [r] 重现（新 token）→ 恢复可提交（证明阻塞彻底解除而非永久卡死）
+    // [r] 重现（新 token）：旧 Unknown 不挡新卡——新 token 可提交、旧 token 仍拒
+    //（证明屏障按完整上下文分代解除，而非永久卡死）
     peer.send(&state_frame(
         "00000000-0000-4000-8000-0000000000m1",
         "owner-1",
@@ -2266,6 +2314,17 @@ async fn unknown_delivery_blocks_retry_same_pending() {
     .await;
     let now = wait_revision(&adapter, &key, 211).await;
     let fresh_token = now.pending[0].context_token.clone();
+    assert_ne!(fresh_token, tk, "重现必须换 token（新世界）");
+    let o_old = adapter
+        .respond(&key, &rk, &tk, PendingAction::Approve)
+        .await;
+    assert_eq!(o_old.delivery, Delivery::NotSent);
+    assert_eq!(
+        o_old.reason_code.as_deref(),
+        Some("stale_context"),
+        "旧 token 仍被拒（换代上下文不作废提交语义）"
+    );
+    assert_no_frame(&mut peer, 300).await;
     let t4 = {
         let a = adapter.clone();
         let k = key.clone();
@@ -2291,6 +2350,77 @@ async fn unknown_delivery_blocks_retry_same_pending() {
         .expect("in time")
         .expect("join");
     assert_eq!(o4.delivery, Delivery::Accepted);
+    adapter.shutdown().await;
+}
+
+/// 2026-10-17 复审 C3：respond 两阶段之间的 owner 换代——旧 A 的镜像载荷不得套
+/// 新 B 的有效 lease 写出。测试缝固定「阶段 1 读镜像 → owner 失效/接管 → 阶段 3
+/// 取 lease」的交错；阶段 3 同代复核（现行 lease ≠ 阶段 1 镜像 lease）→ 零写入。
+#[tokio::test]
+async fn respond_rejects_payload_when_owner_changes_between_phases() {
+    let (adapter, mut peer, projection, key) = harness(vec![permissions_request()]).await;
+    let rk = projection.pending[0].request_key.clone();
+    let tk = projection.pending[0].context_token.clone();
+    // 注入两阶段等待门；等 respond 抢到提交权（已过阶段 2、停在缝上）
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    adapter.set_respond_interphase_gate(gate.clone());
+    let t = {
+        let a = adapter.clone();
+        let k = key.clone();
+        let rk = rk.clone();
+        let tk = tk.clone();
+        tokio::spawn(async move { a.respond(&k, &rk, &tk, PendingAction::Approve).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if adapter.inflight_claimed(&key.thread_id, &rk) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("respond 必须在测试缝处就位");
+
+    // 两阶段间 owner 换代：owner-1 失效 → C2 同 socket 恢复自动重跟随 owner-2
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 0,
+        "sourceClientId": "owner-1",
+        "params": { "clientId": "owner-1", "status": "disconnected" }
+    }))
+    .await;
+    let disc = recv_frame(&mut peer, 5).await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": disc["requestId"],
+        "resultType": "success", "method": "thread-owner-discovery",
+        "handledByClientId": "owner-2",
+        "result": { "supportsUntrustedAppInput": true }
+    }))
+    .await;
+    let follow = recv_frame(&mut peer, 5).await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    peer.send(&state_frame(
+        &key.thread_id,
+        "owner-2",
+        snapshot_change(300, vec![permissions_request()], true),
+    ))
+    .await;
+
+    // 放行 respond：阶段 3 现行 lease（owner-2）≠ 阶段 1 镜像 lease（owner-1）
+    // → 旧 A 载荷零写入
+    gate.notify_one();
+    let o = tokio::time::timeout(Duration::from_secs(5), t)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(o.delivery, Delivery::NotSent);
+    assert_eq!(
+        o.reason_code.as_deref(),
+        Some("stale_context"),
+        "跨代载荷必须拒绝（阶段 1 镜像属 owner-1，现行 lease 已是 owner-2）"
+    );
+    assert_no_frame(&mut peer, 300).await;
     adapter.shutdown().await;
 }
 

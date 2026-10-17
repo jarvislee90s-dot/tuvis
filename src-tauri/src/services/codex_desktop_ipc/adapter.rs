@@ -107,9 +107,18 @@ impl Connector for ProductionConnector {
     }
 }
 
-/// 交互提交互斥条目（R4）：`Dispatching` = 已派发待回执；`BlockedUnknown` =
-/// 未知投递——同 (thread, request_key) 不得借新 actionId 再发，直到该 pending
-/// 从当前投影消失（build 入口清理）。
+/// 交互提交互斥条目（R4 + 2026-10-17 复审 C3）：`Dispatching` = 已派发待回执；
+/// `BlockedUnknown` = 未知投递——同 (thread, request_key) 不得借新 actionId 再发。
+/// **屏障按完整上下文分代**：`token` 记录 Unknown 提交所用的 contextToken——该
+/// pending 消失或重现换 token（服务端新世界）即由状态应用驱动清理，旧 Unknown
+/// 不再挡新卡；旧 token 本身仍被 pending 投影器拒绝。
+#[derive(Debug, Clone)]
+struct InflightEntry {
+    state: InflightState,
+    /// BlockedUnknown 时的提交上下文 token（Dispatching 为 None）
+    token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InflightState {
     Dispatching,
@@ -127,7 +136,7 @@ struct AdapterInner {
     mirrors: Mutex<HashMap<ThreadKey, ThreadMirror>>,
     followings: Mutex<FollowingSet>,
     /// (thread_id, request_key) → 提交互斥（R4；独立短锁，不与 mirrors/owners 嵌套）。
-    inflight: Mutex<HashMap<(String, String), InflightState>>,
+    inflight: Mutex<HashMap<(String, String), InflightEntry>>,
     /// 本 follow 已发起过 load-complete-history 的 thread（R1：bind 即清——每 follow
     /// 至多一次；owner 换代/重跟随自动可再发起）。
     history_requested: Mutex<HashSet<ThreadKey>>,
@@ -140,6 +149,9 @@ struct AdapterInner {
     same_socket_recovering: AtomicBool,
     /// shutdown 信号（恢复循环/重拉循环的退出条件）。
     stopping: AtomicBool,
+    /// C3 测试缝：respond 两阶段间的可注入等待（生产恒 None → 零开销直通）；
+    /// 回归测试用它固定「阶段 1 读镜像之后、阶段 3 取 lease 之前」的 owner 换代。
+    interphase_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     epoch: AtomicU64,
     events: broadcast::Sender<ThreadProjection>,
 }
@@ -168,6 +180,7 @@ impl DesktopIpcAdapter {
                 recovering: AtomicBool::new(false),
                 same_socket_recovering: AtomicBool::new(false),
                 stopping: AtomicBool::new(false),
+                interphase_gate: std::sync::Mutex::new(None),
                 epoch: AtomicU64::new(0),
                 events: broadcast::channel(256).0,
             }),
@@ -459,6 +472,10 @@ impl DesktopIpcAdapter {
 
     /// 审批/作答。requestKey/contextToken 回显校验；服务端保存的 pending 上下文是
     /// 唯一事实源（远端不上送 owner/permissions/raw method）。
+    /// 2026-10-17 复审 C3：拆锁后的最终复核携带**完整上下文代际**——阶段 1 记录镜像
+    /// 绑定的 owner lease；阶段 3 的现行 lease 必须与其同代（client/epoch/generation
+    /// 全同），并在 owners 复核后以短锁重验镜像非 stale 且 token 仍有效（卡内容/存在
+    /// 未变）。两阶段间 owner 换代/参数变化 → 旧载荷零写入（stale_context）。
     pub async fn respond(
         &self,
         key: &ThreadKey,
@@ -469,7 +486,8 @@ impl DesktopIpcAdapter {
         let envelope_id = super::types::new_uuid();
         let caps = self.current_caps();
         let inflight_key = (key.thread_id.clone(), request_key.to_string());
-        // 阶段 1（R5 短锁：只持 mirrors）：stale 门（R4.1）+ 全部 mirror 读
+        // 阶段 1（R5 短锁：只持 mirrors）：stale 门（R4.1）+ 全部 mirror 读 + 镜像
+        // 绑定的 owner lease（C3 同代复核锚）
         let snap = {
             let mirrors = self.inner.mirrors.lock().await;
             let Some(mirror) = mirrors.get(key) else {
@@ -480,22 +498,38 @@ impl DesktopIpcAdapter {
             }
             RespondSnapshot::collect(mirror, caps, request_key, context_token)
         };
-        // 阶段 2（R5 短锁：只持 inflight）：清理已消失 pending 的 Blocked + 抢占提交权
+        // 阶段 2（R5 短锁：只持 inflight）：清理已消失/换 token 的 Blocked + 抢占提交权
         {
             let mut inflight = self.inner.inflight.lock().await;
-            let live: std::collections::HashSet<&str> =
-                snap.pending_keys.iter().map(String::as_str).collect();
-            inflight.retain(|(tid, rk), state| {
+            let live: std::collections::HashMap<&str, &str> = snap
+                .live_pendings
+                .iter()
+                .map(|(rk, tk)| (rk.as_str(), tk.as_str()))
+                .collect();
+            inflight.retain(|(tid, rk), entry| {
                 !(tid == &key.thread_id
-                    && *state == InflightState::BlockedUnknown
-                    && !live.contains(rk.as_str()))
+                    && entry.state == InflightState::BlockedUnknown
+                    && match live.get(rk.as_str()) {
+                        // pending 消失 → 屏障解除
+                        None => true,
+                        // 重现但换 token（新世界）→ 旧 Unknown 不挡新卡
+                        Some(cur) => Some(*cur) != entry.token.as_deref(),
+                    })
             });
             if inflight.contains_key(&inflight_key) {
                 return not_sent(&envelope_id, "pending_submit_in_progress");
             }
-            inflight.insert(inflight_key.clone(), InflightState::Dispatching);
+            inflight.insert(
+                inflight_key.clone(),
+                InflightEntry {
+                    state: InflightState::Dispatching,
+                    token: None,
+                },
+            );
         }
-        // 校验 + wire 组装（不持任何锁；失败必须退掉提交权）
+        // 校验 + wire 组装（不持任何锁；失败必须退掉提交权）。
+        // C3 同代复核锚在 snap 被消耗前取出
+        let mirror_lease = snap.mirror_lease.clone();
         let prepared = match snap.into_prepared(key, request_key, context_token, &action) {
             Ok(p) => p,
             Err(reason) => {
@@ -503,13 +537,29 @@ impl DesktopIpcAdapter {
                 return not_sent(&envelope_id, &reason);
             }
         };
-        // 阶段 3（R5 短锁：只持 owners）：lease 最后复核（响应前读到的过期 lease 不算授权）
+        // C3 测试缝：阶段 1/2 与阶段 3 之间可注入等待（生产恒直通）
+        //（先绑定 clone 再判——if let 暂存的 MutexGuard 会跨 await，破坏 Send）
+        let gate = self
+            .inner
+            .interphase_gate
+            .lock()
+            .expect("gate lock")
+            .clone();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
+        // 阶段 3（R5 短锁：只持 owners）：lease 最后复核（响应前读到的过期 lease 不算
+        // 授权）+ C3 同代复核——现行 lease 必须就是阶段 1 镜像所绑定的那一代
         let lease_valid = {
             let owners = self.inner.owners.lock().await;
-            current_lease(&owners, key).map(|l| {
-                let v = owners.validity(&l);
-                (l, v)
-            })
+            match current_lease(&owners, key) {
+                Some(l) if Some(&l) == mirror_lease.as_ref() => {
+                    let v = owners.validity(&l);
+                    Some((l, v))
+                }
+                // 无 lease / 已换代（阶段 1 之后 owner 失效或被接管）：旧载荷零写入
+                _ => None,
+            }
         };
         let (lease, validity) = match lease_valid {
             Some(v) => v,
@@ -518,6 +568,18 @@ impl DesktopIpcAdapter {
                 return not_sent(&envelope_id, "stale_context");
             }
         };
+        // 阶段 3.5（C3 短锁：只持 mirrors）：镜像复核——非 stale 且 token 仍绑定当前
+        // 上下文（卡还在场、内容/方法未变；流式 revision 前进不影响同 token）
+        let reverified = {
+            let mirrors = self.inner.mirrors.lock().await;
+            mirrors
+                .get(key)
+                .is_some_and(|m| !m.is_stale() && m.token_valid(request_key, context_token))
+        };
+        if !reverified {
+            self.inner.inflight.lock().await.remove(&inflight_key);
+            return not_sent(&envelope_id, "stale_context");
+        }
         let outcome = self
             .dispatch(
                 &prepared.method,
@@ -527,12 +589,18 @@ impl DesktopIpcAdapter {
                 validity,
             )
             .await;
-        // R4.3：Accepted/Rejected/NotSent（保守零投递，可重试）释放提交权；
-        // UnknownDelivery → 保留为 Blocked（未知结果不得借新 actionId 再发）。
+        // R4.3 + C3：Accepted/Rejected/NotSent（保守零投递，可重试）释放提交权；
+        // UnknownDelivery → 保留为 Blocked（记提交所用 token 分代，状态应用驱动清理）。
         {
             let mut inflight = self.inner.inflight.lock().await;
             if outcome.delivery == Delivery::UnknownDelivery {
-                inflight.insert(inflight_key, InflightState::BlockedUnknown);
+                inflight.insert(
+                    inflight_key,
+                    InflightEntry {
+                        state: InflightState::BlockedUnknown,
+                        token: Some(context_token.to_string()),
+                    },
+                );
             } else {
                 inflight.remove(&inflight_key);
             }
@@ -573,6 +641,23 @@ impl DesktopIpcAdapter {
             }
         })
     }
+
+    /// C3 测试缝：注入 respond 两阶段间的等待门（生产不调用——恒直通）。
+    #[doc(hidden)]
+    pub fn set_respond_interphase_gate(&self, gate: Arc<tokio::sync::Notify>) {
+        *self.inner.interphase_gate.lock().expect("gate lock") = Some(gate);
+    }
+
+    /// C3 测试缝：该 (thread, request_key) 是否已抢占提交权（回归测试固定
+    /// 「respond 已过阶段 2、停在测试缝」的时序用）。
+    #[doc(hidden)]
+    pub fn inflight_claimed(&self, thread_id: &str, request_key: &str) -> bool {
+        self.inner
+            .inflight
+            .try_lock()
+            .map(|g| g.contains_key(&(thread_id.to_string(), request_key.to_string())))
+            .unwrap_or(false)
+    }
 }
 
 fn not_sent(envelope_id: &str, reason: &str) -> RpcOutcome {
@@ -594,12 +679,15 @@ fn current_lease(owners: &OwnerRegistry, key: &ThreadKey) -> Option<OwnerLease> 
 struct RespondSnapshot {
     /// 能力基线（阶段 1 取自当前动态 profile）
     caps: CapabilitySet,
-    /// 当前投影中的 pending key 全集（R4 Blocked 清理依据）
-    pending_keys: Vec<String>,
+    /// 当前投影中的 (request_key, context_token) 全集（R4/C3 Blocked 清理依据——
+    /// 屏障按完整上下文分代，重现换 token 即解除）
+    live_pendings: Vec<(String, String)>,
     /// 当前投影中的本请求卡（存在性 + kind + questions）
     pending: Option<PendingView>,
     /// token 是否绑定当前上下文
     token_valid: bool,
+    /// 阶段 1 镜像绑定的 owner lease（C3 同代复核锚：阶段 3 现行 lease 必须与之全同）
+    mirror_lease: Option<OwnerLease>,
     /// 服务端保存的原 permissions 回显源（requests[].params.permissions）
     raw_requests: Option<Value>,
     request_id: Option<Value>,
@@ -614,10 +702,10 @@ impl RespondSnapshot {
         _token: &str,
     ) -> Self {
         let projection = mirror.project(caps);
-        let pending_keys = projection
+        let live_pendings = projection
             .pending
             .iter()
-            .map(|p| p.request_key.clone())
+            .map(|p| (p.request_key.clone(), p.context_token.clone()))
             .collect();
         let pending = projection
             .pending
@@ -634,9 +722,10 @@ impl RespondSnapshot {
             .and_then(|raw| raw.get("requests").cloned());
         Self {
             caps,
-            pending_keys,
+            live_pendings,
             pending,
             token_valid: mirror.token_valid(request_key, _token),
+            mirror_lease: mirror.lease().cloned(),
             raw_requests,
             request_id,
         }
@@ -976,11 +1065,36 @@ async fn handle_state_changed(adapter: &DesktopIpcAdapter, frame: Value) {
         spawn_stale_refollow(adapter.clone(), key.clone(), current_conn(adapter).await);
     }
     if let Some(p) = fresh {
+        // C3：状态应用驱动的提交屏障清理——pending 消失或重现换 token 即解除旧
+        // Unknown 屏障（不等下一次 respond 入口），新卡立即可答
+        cleanup_inflight_for(adapter, &key.thread_id, &p.pending).await;
         let _ = adapter.inner.events.send(p);
         if history_needed {
             maybe_request_complete_history(adapter, &key).await;
         }
     }
+}
+
+/// C3：把该 thread 的 BlockedUnknown 提交屏障与当前投影对齐——(request_key, token)
+/// 仍与在场卡完全一致才保留；消失/换 token 的旧屏障解除（Dispatching 不动）。
+async fn cleanup_inflight_for(
+    adapter: &DesktopIpcAdapter,
+    thread_id: &str,
+    pending: &[PendingView],
+) {
+    let live: std::collections::HashMap<&str, &str> = pending
+        .iter()
+        .map(|p| (p.request_key.as_str(), p.context_token.as_str()))
+        .collect();
+    let mut inflight = adapter.inner.inflight.lock().await;
+    inflight.retain(|(tid, rk), entry| {
+        !(tid == thread_id
+            && entry.state == InflightState::BlockedUnknown
+            && match live.get(rk.as_str()) {
+                None => true,
+                Some(cur) => Some(*cur) != entry.token.as_deref(),
+            })
+    });
 }
 
 /// R1：消费 need_snapshot/apply error 的有界重拉——复用 probe 定案
@@ -1141,7 +1255,6 @@ async fn handle_client_status_changed(adapter: &DesktopIpcAdapter, frame: &Value
     // 不依赖手机下次 GET
     spawn_same_socket_recovery(adapter.clone(), affected);
 }
-
 /// R2.3：owner 问「谁在跟随」——当前关注集包含该 conversation 才回
 /// broadcast thread-stream-following-changed {following:true}（version 按表）。
 async fn handle_following_status(
