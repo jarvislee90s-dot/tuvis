@@ -2901,10 +2901,11 @@ async fn owner_lost_on_live_socket_auto_refollows() {
         let k2 = key.clone();
         let ensure_task = tokio::spawn(async move { adapter.ensure_thread(&k2).await });
         drive_ensure(&mut peer, THREAD, vec![], "idle").await;
-        tokio::time::timeout(Duration::from_secs(5), ensure_task)
+        let initial = tokio::time::timeout(Duration::from_secs(5), ensure_task)
             .await
             .expect("initial follow in time")
             .expect("initial follow ok");
+        let _ = initial;
     }
 
     // owner-1 失效广播（连接不断）
@@ -2974,10 +2975,11 @@ async fn ipc_connection_reset_auto_refollows() {
         let k2 = key.clone();
         let ensure_task = tokio::spawn(async move { adapter.ensure_thread(&k2).await });
         drive_ensure(&mut peer, THREAD, vec![], "idle").await;
-        tokio::time::timeout(Duration::from_secs(5), ensure_task)
+        let initial = tokio::time::timeout(Duration::from_secs(5), ensure_task)
             .await
             .expect("initial follow in time")
             .expect("initial follow ok");
+        let _ = initial;
     }
 
     peer.send(&serde_json::json!({
@@ -3070,7 +3072,7 @@ async fn hub_restart_with_turn_barrier_recovers_without_details() {
             .await
             .expect("send#1 in time")
             .unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(Some(v)) = f1.hub_store().get_for_device("act-bar-1", "dev-1") {
                     if v.state == ActionState::Accepted {
@@ -3169,7 +3171,7 @@ async fn hub_restart_with_turn_barrier_recovers_without_details() {
         }))
         .await;
     }
-    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Ok(Some(v)) = f2.hub_store().get_for_device("act-bar-2", "dev-1") {
                 if v.state == ActionState::Accepted {

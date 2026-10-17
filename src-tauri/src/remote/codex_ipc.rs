@@ -411,15 +411,14 @@ async fn settle_thread(hub: &Arc<CodexControlHub>, st: &Arc<RemoteState>, key: &
             .thread_has_pending_work(key)
             .unwrap_or(false)
     {
-        match tokio::time::timeout(
+        if let Ok(Ok(p)) = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             hub.adapter.ensure_thread(key),
         )
         .await
         {
-            Ok(Ok(p)) => projection = p,
+            projection = p;
             // Desktop 不在/超时：保持 stale 投影照常结算（派发只会白试，闸照常）
-            _ => {}
         }
     }
     let projection = projection;
