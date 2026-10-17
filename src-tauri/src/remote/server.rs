@@ -8173,6 +8173,11 @@ mod tests {
     ///
     /// 另钉住**顺序**：探针钩子装的是 `probe_pass = false`——拒绝发生在**版本探针之前**，
     /// 故回执必须是 `refused` 而不是版本门档（谁把顺序改成「先探针后拒绝」，本用例即红）。
+    ///
+    /// **2026-10-17 Windows 验证批修正**：Codex APP 普通消息在 R8 后**必须带 `actionId`**
+    /// （`api.rs` 的 `action_id_required`，缺失 400）——本用例是 R8 之前的旧用例，原先未带，
+    /// 在 Windows 上恒得 400（macOS 因 `cfg(windows)` 看不见，故一直未暴）。此处补上
+    /// `actionId`，判据面（cmd 垫片元字符拒绝）不变。
     #[cfg(windows)]
     #[tokio::test]
     async fn codex_cmd_shim_metachar_body_is_refused_before_probe_and_spawn() {
@@ -8193,7 +8198,7 @@ mod tests {
                 "/m/api/v1/session-send",
                 Some("mam_device=mm"),
                 Some(&format!(
-                    r#"{{"sessionId":"{SID}","text":"hi & whoami %PATH%"}}"#
+                    r#"{{"sessionId":"{SID}","text":"hi & whoami %PATH%","actionId":"act-cmdshim-refuse"}}"#
                 )),
             ))
             .await
@@ -8227,7 +8232,9 @@ mod tests {
                 "POST",
                 "/m/api/v1/session-send",
                 Some("mam_device=mm"),
-                Some(&format!(r#"{{"sessionId":"{SID}","text":"hi"}}"#)),
+                Some(&format!(
+                    r#"{{"sessionId":"{SID}","text":"hi","actionId":"act-cmdshim-control"}}"#
+                )),
             ))
             .await
             .unwrap();

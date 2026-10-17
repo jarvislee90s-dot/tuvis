@@ -2,9 +2,16 @@
 //! Overlapped——不得同步单 handle 一读一写）。**Windows 原生测试必须在 Windows 真机
 //! 运行**；非 Windows 平台只保留编译面（交叉 check 覆盖），不谎报运行证据。
 //!
-//! 身份：build 从运行中的 ChatGPT.exe 版本资源读取（Win32 VerQueryValue 固定信息块，
-//! 四段版本号与 Windows probe 记录的 `26.1013.3656.0` 同形）；来源缺失/多义 →
-//! `build=None` → profile 不命中 → A 写能力关闭（spec F8，不伪装已验证）。
+//! 身份：build 取运行中官方 Desktop 的 **MSIX 包版本**（包根 `AppxManifest.xml` 的
+//! `Identity/@Version`；四段版本号与 Windows probe 记录的 `26.1013.3656.0` 同形）；
+//! 来源缺失/多义 → `build=None` → profile 不命中 → A 写能力关闭（spec F8，不伪装已验证）。
+//!
+//! **2026-10-17 Windows 实机取证（验证批 F1）**：本文件旧版读 `ChatGPT.exe` 的
+//! `VS_FIXEDFILEINFO`，实测拿到的是 **Chromium/Electron 版本** `155.0.8059.80`
+//! （app 目录内含 `chrome.dll`(329 MB) 与 `155.0.8059.80.manifest`），与 app 包 build
+//! `26.1013.4894.0` 不同源 ⇒ `profile_for` **永不命中**、A 写能力在任何真实 Desktop 上
+//! 结构性关闭（连已验证 build 也打不开）。故改读 MSIX 包清单；旁证：`app\Codex.exe`
+//! 与 CLI `codex.exe` 都**没有**版本资源，不能当来源。
 
 use super::{DesktopEndpoint, EndpointResolver};
 #[allow(unused_imports)]
@@ -39,7 +46,7 @@ impl EndpointResolver for WindowsEndpointResolver {
     }
 }
 
-/// 运行中官方 Desktop 的 exe 版本（多义 → None；缺失 → None）。
+/// 运行中官方 Desktop 的 **app 包版本**（多义 → None；缺失 → None）。
 #[cfg(windows)]
 fn desktop_build() -> Option<String> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -60,7 +67,7 @@ fn desktop_build() -> Option<String> {
         {
             continue;
         }
-        if let Some(v) = exe_file_version(&exe) {
+        if let Some(v) = package_version_for_exe(&exe) {
             versions.push(v);
         }
     }
@@ -73,57 +80,49 @@ fn desktop_build() -> Option<String> {
     }
 }
 
-/// 读 exe 版本资源固定信息块（VS_FIXEDFILEINFO 四段版本号）。
-#[cfg(windows)]
-fn exe_file_version(exe: &std::path::Path) -> Option<String> {
-    use windows::core::PCWSTR;
-    use windows::Win32::Storage::FileSystem::{
-        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+/// MSIX 包版本：从 exe 路径向上找包根（含 `AppxManifest.xml`），取 `Identity/@Version`。
+///
+/// 为什么不是 exe 版本资源：2026-10-17 Windows 实机实测 `ChatGPT.exe` 的
+/// `VS_FIXEDFILEINFO` = `155.0.8059.80`（Chromium/Electron 版本），与 app 包 build
+/// （`26.1013.x.y`）不同源；app 版本的真源 = 包清单 `Identity/@Version`
+/// （非管理员亦可读，实测已取到 `26.1013.4894.0`）。
+/// 读不到 / 形状不符 → `None`（调用方据此关能力，不伪装已验证）。
+pub fn package_version_for_exe(exe: &std::path::Path) -> Option<String> {
+    let mut dir = exe.parent()?;
+    for _ in 0..3 {
+        let manifest = dir.join("AppxManifest.xml");
+        if manifest.is_file() {
+            let text = std::fs::read_to_string(&manifest).ok()?;
+            return identity_version(&text);
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// 解析 `<Identity … Version="x.y.z.w" …>` 的版本串（纯字符串，无 XML 依赖）。
+/// 形状校验：≥3 段、每段非空且全数字——防把别的属性误当版本。
+fn identity_version(text: &str) -> Option<String> {
+    let ident = text.find("<Identity")?;
+    let rest = &text[ident..];
+    let tag = match rest.find('>') {
+        Some(end) => &rest[..end],
+        None => rest,
     };
-    unsafe {
-        let wide: Vec<u16> = exe
-            .as_os_str()
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let filename = PCWSTR::from_raw(wide.as_ptr());
-        let mut handle = 0u32;
-        let size = GetFileVersionInfoSizeW(filename, Some(&mut handle));
-        if size == 0 {
-            return None;
-        }
-        let mut data = vec![0u8; size as usize];
-        if GetFileVersionInfoW(filename, Some(handle), size, data.as_mut_ptr().cast()).is_err() {
-            return None;
-        }
-        let mut info_ptr: *mut VS_FIXEDFILEINFO = std::ptr::null_mut();
-        let mut len = 0u32;
-        let root: Vec<u16> = "\\".encode_utf16().chain(std::iter::once(0)).collect();
-        if !VerQueryValueW(
-            data.as_ptr().cast(),
-            PCWSTR::from_raw(root.as_ptr()),
-            std::ptr::addr_of_mut!(info_ptr).cast::<std::ffi::c_void>()
-                as *mut *mut std::ffi::c_void,
-            &mut len,
-        )
-        .as_bool()
-        {
-            return None;
-        }
-        if info_ptr.is_null() || len == 0 {
-            return None;
-        }
-        let info = &*info_ptr;
-        let ms = info.dwFileVersionMS;
-        let ls = info.dwFileVersionLS;
-        Some(format!(
-            "{}.{}.{}.{}",
-            ms >> 16,
-            ms & 0xffff,
-            ls >> 16,
-            ls & 0xffff
-        ))
+    let key = "Version=\"";
+    let start = tag.find(key)? + key.len();
+    let tail = &tag[start..];
+    let end = tail.find('"')?;
+    let ver = &tail[..end];
+    let parts: Vec<&str> = ver.split('.').collect();
+    let shaped = parts.len() >= 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    if shaped {
+        Some(ver.to_string())
+    } else {
+        None
     }
 }
 
@@ -181,8 +180,62 @@ pub async fn connect(endpoint: &DesktopEndpoint) -> Result<Box<dyn super::IpcIo>
 mod tests {
     // 真实假服务端 named pipe 往返测试只在 Windows 原生运行（CI windows job）；
     // macOS/Linux 上该测试不存在也不谎报执行。
+    use super::*;
     #[cfg(windows)]
     use super::DesktopEndpoint;
+
+    /// F1 回归（2026-10-17 Windows 验证批）：包清单 `Identity/@Version` 解析。
+    /// 形状取自实机 `AppxManifest.xml`（该机器包版本 `26.1013.4894.0`）。
+    #[test]
+    fn identity_version_parses_real_manifest_shape() {
+        let text = r#"<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest">
+  <Identity Name="OpenAI.Codex" ProcessorArchitecture="x64" Version="26.1013.4894.0" Publisher="CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B" />
+  <Properties><DisplayName>Codex</DisplayName></Properties>
+</Package>"#;
+        assert_eq!(identity_version(text).as_deref(), Some("26.1013.4894.0"));
+        // 属性顺序不同、标签自闭合形态都要取到（不假设 Version 紧跟 Identity 名）
+        assert_eq!(
+            identity_version(r#"<Identity Publisher="CN=x" Version="26.1013.3656.0" />"#).as_deref(),
+            Some("26.1013.3656.0")
+        );
+    }
+
+    /// 形状守卫：缺 Identity / 非四段数字 / 段数不足 → None（宁可关能力，不伪装已验证）。
+    #[test]
+    fn identity_version_rejects_wrong_shape_or_missing() {
+        assert!(identity_version("<Package/>").is_none());
+        assert!(identity_version(r#"<Identity Name="x"/>"#).is_none());
+        assert!(identity_version(r#"<Identity Name="x" Version="abc"/>"#).is_none());
+        assert!(identity_version(r#"<Identity Name="x" Version="1.0"/>"#).is_none());
+        assert!(identity_version(r#"<Identity Name="x" Version="1.0.0"/>"#).is_some());
+    }
+
+    /// 包根定位：exe 在 `<pkg>\app\ChatGPT.exe`，清单在 `<pkg>\AppxManifest.xml`
+    /// （两级上溯）；无清单 → None。
+    #[test]
+    fn package_version_walks_up_to_manifest() {
+        let root = std::env::temp_dir().join(format!("tuvis-pkgver-{}", std::process::id()));
+        let app = root.join("app");
+        std::fs::create_dir_all(&app).expect("mkdir");
+        let exe = app.join("ChatGPT.exe");
+        std::fs::write(&exe, b"stub").expect("write exe");
+        std::fs::write(
+            root.join("AppxManifest.xml"),
+            r#"<Identity Name="OpenAI.Codex" Version="26.1013.3656.0" />"#,
+        )
+        .expect("write manifest");
+        assert_eq!(
+            package_version_for_exe(&exe).as_deref(),
+            Some("26.1013.3656.0")
+        );
+        assert!(package_version_for_exe(std::path::Path::new("C:/nonexistent/x.exe")).is_none());
+        // 收尾：逐个删（不用递归删除）
+        let _ = std::fs::remove_file(root.join("AppxManifest.xml"));
+        let _ = std::fs::remove_file(&exe);
+        let _ = std::fs::remove_dir(&app);
+        let _ = std::fs::remove_dir(&root);
+    }
 
     #[cfg(windows)]
     #[tokio::test]
