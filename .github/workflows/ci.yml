@@ -146,6 +146,31 @@ jobs:
       - run: cd src-tauri && cargo check --target x86_64-pc-windows-gnu --all-targets --features marker-helper
       - run: cd src-tauri && cargo clippy --target x86_64-pc-windows-gnu --all-targets --features marker-helper -- -D warnings
 
+  # codex-desktop-ipc（R10）：Windows 原生 named pipe 运行 job——交叉编译只保证
+  # 编译面，`transport::windows` 的真实 pipe 往返/忙重试（ERROR_PIPE_BUSY=231）
+  # 必须在 windows runner 上运行；Desktop 不在 runner 上，假 server 用随机专属 pipe
+  windows-native:
+    name: Windows native IPC tests
+    runs-on: windows-latest
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.backend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      # rust-embed 前置：与 ubuntu backend job 同因（fresh checkout 缺 dist-mobile 必红）
+      - run: pnpm install --frozen-lockfile && pnpm build:mobile
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Windows-native transport tests
+        working-directory: src-tauri
+        run: cargo test --features marker-helper --lib codex_desktop_ipc::transport::windows:: -- --nocapture
+
   build:
     name: Build verification
     runs-on: ubuntu-latest

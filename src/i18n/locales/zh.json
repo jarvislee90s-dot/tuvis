@@ -1714,11 +1714,67 @@
     "rapiModeSwitchVerified": "已切换（屏读核验命中）",
     "rapiModeSwitchIneffective": "切换未生效（屏面无变化/读不到）——可重试",
     "rapiProjectPathResolveFailed": "路径真值解析失败（{dir}）：{e}",
-    "rapiTerminalSpawnFailed": "终端启动失败：{e}"
+    "rapiTerminalSpawnFailed": "终端启动失败：{e}",
+    "codexIpcNativeOnly": "该 Codex 会话已支持原生远程控制，问答与审批请使用原生卡片（自然语言补投不再受理）"
   },
   "mobile": {
     "composer": {
       "sendFailedRetry": "发送失败：{{error}}（可重试）"
+    },
+    "codex": {
+      "availability": {
+        "controllable": "可控制",
+        "send_only": "可发送但不支持交互",
+        "compat_only": "仅可使用兼容模式",
+        "unavailable": "当前不可控制"
+      },
+      "staleBanner": "桌面端连接中断，已保留最后视图，暂时不能远程操作",
+      "projection": {
+        "truncated": "内容过长，仅显示最近片段（完整历史请回 Desktop 查看）",
+        "empty": "暂无消息"
+      },
+      "pending": {
+        "titleCommand": "命令执行请求",
+        "titlePermissions": "权限请求",
+        "titleInput": "等待回答",
+        "titleUnsupported": "待处理请求",
+        "unsupported": "此请求暂不支持远程处理",
+        "unverified": "当前 Desktop 版本未验证该操作",
+        "approve": "批准",
+        "reject": "拒绝",
+        "submit": "提交回答",
+        "freePlaceholder": "其他（自由作答）",
+        "freeAria": "自由作答内容",
+        "incomplete": "还有 {{n}} 题未作答，答全后才能提交",
+        "unknownDelivery": "投递结果未知，请在 Desktop 核对",
+        "accepted": "已受理，Desktop 正在处理（不代表回合已完成）",
+        "rejectedReceipt": "已拒绝（Desktop 已收到）",
+        "notSent": "未投出——本次未发送任何内容，可再按一次",
+        "staleContext": "该请求已过期（桌面端状态已变化），请等待最新状态",
+        "failed": "应答失败：{{message}}",
+        "writeLocked": "桌面端连接中断，暂时不能应答",
+        "verifying": "上次提交的结果核对中——已暂停操作，防止重复提交"
+      },
+      "queue": {
+        "title": "待发队列",
+        "position": "第{{n}}位",
+        "stateQueued": "待发送",
+        "stateReserved": "派发中",
+        "stateAccepted": "已接受",
+        "stateRejected": "已失败",
+        "stateUnknown": "结果未知",
+        "stateCancelled": "已取消",
+        "retract": "撤回",
+        "retractBusy": "该条已派发，无法撤回（请回 Desktop 核对）",
+        "retractFailed": "撤回失败：{{message}}",
+        "blockedCompat": "存在兼容模式未完成的发送，队列已暂停派发——请回 Desktop 核对后继续"
+      },
+      "composer": {
+        "codexAccepted": "已受理，Desktop 正在执行",
+        "codexUnknown": "投递结果未知，请在 Desktop 核对",
+        "codexNotDelivered": "未送达：{{reason}}",
+        "codexQueued": "已进入桌面队列，第{{position}}位"
+      }
     }
   }
 }

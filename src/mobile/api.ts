@@ -1,5 +1,7 @@
 // 移动端 API：纯 fetch，零 Tauri 依赖（PWA/浏览器同构）
 import type { SessionsResponse, TransitionEvent } from "@/types/session";
+// Task 9：SendResult 的 desktop_ipc 分支引用 ActionReceipt（type-only，无运行时环）
+import type { ActionReceipt } from "./codexIpcApi";
 
 /** 带 HTTP 状态的请求失败（status=null 表示网络层异常，无响应可读）。
  *  详情页/预览按 status 分流错误文案（404 → 会话不可读，403 → 文件不可预览）；
@@ -650,32 +652,52 @@ export type SendResult =
   /** **无头回合回执**（Task 8 / H7）：`receipt` 是后端 Task 6 归一产物原样透出
    *  （ok|queued|failed|cancelled + stage/reason），`visibilityNote` 是可见性提示逐字文案
    *  （未信任/失败时缺省）。**与终端四态分列**：无头回合没有「入队」概念（每回合 spawn），
-   *  故不合成 queued{itemId}/delivered 语义。 */
+   *  故不合成 queued{itemId}/delivered 语义。Task 9：fallback 分支附 `actionId`
+   *  （Codex APP 兼容发送的账本锚，与 desktop_ipc 回执同 ID 体系）。 */
   | {
       status: "headless";
       channel?: string;
       receipt: HeadlessReceipt;
       visibility?: SendInfo["visibility"];
       visibilityNote?: string;
-    };
+      /** Codex APP 兼容分支附带的动作 ID（请求里传的那个原样回显；其他通道无此键） */
+      actionId?: string;
+    }
+  /** **Desktop IPC 原生回执**（Task 9）：Codex APP 经 Desktop IPC 直发的明确回执。
+   *  `receipt.delivery` 分诊：accepted=已受理（不代表 Turn 完成）；unknown_delivery=
+   *  投递结果未知（**绝不自动重试**，提示回 Desktop 核对）；not_sent=零投递（沿同
+   *  actionId 重试安全）；rejected=明确拒绝。 */
+  | { status: "desktop_ipc"; receipt: ActionReceipt }
+  /** **忙 Thread 留队**（Task 9 / 宪法 R2.3）：Desktop 忙时普通消息进 codex_actions
+   *  FIFO，空闲按序自动派发；actionId 供队列查看/撤回，不提供插队。 */
+  | { status: "codex_queued"; actionId: string; position: number };
 
 /** 发送消息（W4 直发/入队分派，后端按输入态路由；多行原样上行，归一在服务端
  *  入队时一次完成）。非 2xx（400 参数非法 / 404 会话消失 / 403 不可注入）→
  *  抛 ApiError。
  *  queueOnly（D6 修改重发，可选）：true = 只入队（后端跳过直发尝试，即使快照显示
  *  可输入也强制入队，防变相插队）；入队后 flush 循环对其与普通队列项同权（转闲
- *  按序自动放行）。**缺省不带该键**——保持既有请求体形态不变（普通发送路径零漂移） */
+ *  按序自动放行）。**缺省不带该键**——保持既有请求体形态不变（普通发送路径零漂移）。
+ *  actionId（Task 9，可选）：**Codex APP 专用**（headless_codex_* 通道）——Desktop
+ *  IPC 的必填动作锚（UUID，一次用户动作生成一次，失败重试沿同 ID）；CLI 与其他
+ *  工具**不传**（body 零漂移，旧合同逐字保持）。 */
 export async function sessionSend(
   sessionId: string,
   text: string,
-  queueOnly?: boolean
+  queueOnly?: boolean,
+  actionId?: string
 ): Promise<SendResult> {
   let r: Response;
   try {
     r = await fetch("/m/api/v1/session-send", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionId, text, ...(queueOnly ? { queueOnly: true } : {}) }),
+      body: JSON.stringify({
+        sessionId,
+        text,
+        ...(queueOnly ? { queueOnly: true } : {}),
+        ...(actionId !== undefined ? { actionId } : {}),
+      }),
     });
   } catch (e) {
     throw new ApiError(

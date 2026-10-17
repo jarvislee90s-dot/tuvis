@@ -850,6 +850,21 @@ pub enum ReceiptSource {
     NotApplicable,
 }
 
+/// 兼容兜底 bridge 的内部证据（Codex Desktop IPC Task 8）：`codex_headless_dispatch_envelope`
+/// 公开 wrapper 行为不变，证据随内部 [`TurnOutcome`] 透出——`run_compat` 据此登记
+/// compat fence（`queued_message_id` 供 reconcile 关联消费）与映射 Delivery。
+/// `turn_completed` 只有直接 Turn 终态证据才为 true（本通道的消费命中只证「已消费」，
+/// 不证「Turn 完成」——无证据恒 false，完成核对权威在 `reconcile_compat_fence` 只读链）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompatEvidence {
+    /// `codex queue` 入队回执 id（`Queued message <id>`）；未拿到回执 = None
+    pub queued_message_id: Option<String>,
+    /// 对应 Turn id（本通道无逐 Turn 回执，恒 None——完成证据由 rollout 只读核对供给）
+    pub turn_id: Option<String>,
+    /// 直接 Turn 终态证据（无证据恒 false）
+    pub turn_completed: bool,
+}
+
 /// 回合结局
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
@@ -857,6 +872,8 @@ pub struct TurnOutcome {
     pub plan_used: PlanKind,
     pub diverted: bool,
     pub receipt_source: ReceiptSource,
+    /// 兼容兜底证据（公开 wrapper 不消费；Task 8 bridge 专用）
+    pub compat_evidence: CompatEvidence,
 }
 
 /// 一次尝试的观测（回执 + 原始流供退出分类与入队回执解析消费）
@@ -960,6 +977,7 @@ pub async fn run_turn(
                 plan_used: PlanKind::ExecResume,
                 diverted: false,
                 receipt_source: source,
+                compat_evidence: CompatEvidence::default(),
             }
         }
     }
@@ -1026,11 +1044,12 @@ async fn run_queue_turn(
     // 基线（消费确认的对照点）：必须在**入队之前**取，否则新追加段会被算进基线
     let baseline = args.rollout.and_then(|p| (deps.rollout.baseline)(p));
     let att = attempt(sid, plan, make_runner, run).await;
-    let out = |receipt: Receipt, source: ReceiptSource| TurnOutcome {
+    let out = |receipt: Receipt, source: ReceiptSource, evidence: CompatEvidence| TurnOutcome {
         receipt,
         plan_used: PlanKind::Queue,
         diverted: divert.is_some(),
         receipt_source: source,
+        compat_evidence: evidence,
     };
     if att.receipt.status != ReceiptStatus::Ok {
         // 非 0 退出 / 超时 / 取消：沿用 runner 的如实结论（不改道、不重发）——
@@ -1041,7 +1060,7 @@ async fn run_queue_turn(
             let tail = r.reason.take().unwrap_or_default();
             r.reason = Some(format!("{note}{tail}"));
         }
-        return out(r, ReceiptSource::NotApplicable);
+        return out(r, ReceiptSource::NotApplicable, CompatEvidence::default());
     }
     let Some(msg_id) = queued_message_id(&att.stdout, &att.stderr) else {
         // exit 0 但没拿到入队回执 = 通道跑过了但没拿到有效回执（channel_error 语义）
@@ -1059,6 +1078,7 @@ async fn run_queue_turn(
                 .with_session(sid)
                 .with_duration_ms(total_ms()),
             ReceiptSource::Unconfirmed,
+            CompatEvidence::default(),
         );
     };
     consume_and_report(args, plan, deps, sid, &msg_id, divert, baseline, started).await
@@ -1099,6 +1119,11 @@ async fn consume_and_report(
         plan_used: PlanKind::Queue,
         diverted: divert.is_some(),
         receipt_source: ReceiptSource::Enqueue,
+        compat_evidence: CompatEvidence {
+            queued_message_id: Some(msg_id.to_string()),
+            turn_id: None,
+            turn_completed: false,
+        },
     };
     let Some(rollout) = args.rollout else {
         return queued(
@@ -1167,6 +1192,12 @@ async fn consume_and_report(
             plan_used: PlanKind::Queue,
             diverted: divert.is_some(),
             receipt_source: ReceiptSource::RolloutAppend,
+            compat_evidence: CompatEvidence {
+                queued_message_id: Some(msg_id.to_string()),
+                turn_id: None,
+                // rollout 追加命中只证「已消费」，不证 Turn 终态——完成核对权威在 reconcile
+                turn_completed: false,
+            },
         };
     }
     // 交叉验证队列副本（**按入队回执 id 认领本条目**；三态各自如实，绝不编结论）
@@ -1216,6 +1247,11 @@ fn cancelled_outcome(sid: &str, msg_id: &str, divert: Option<&str>, total_ms: u6
         plan_used: PlanKind::Queue,
         diverted: divert.is_some(),
         receipt_source: ReceiptSource::NotApplicable,
+        compat_evidence: CompatEvidence {
+            queued_message_id: Some(msg_id.to_string()),
+            turn_id: None,
+            turn_completed: false,
+        },
     }
 }
 

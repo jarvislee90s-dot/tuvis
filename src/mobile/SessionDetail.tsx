@@ -16,6 +16,7 @@
 //   （P2-B 评审修复）；首次加载与手动刷新仍无条件落底。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, Ref } from "react";
+import i18n from "@/i18n";
 import {
   ArrowDownToLine,
   ArrowLeft,
@@ -37,6 +38,10 @@ import SubagentDetail from "./SubagentDetail";
 import SubagentList from "./SubagentList";
 import QuestionCardApp from "./QuestionCardApp";
 import QuestionCardCli from "./QuestionCardCli";
+// Task 9：Desktop IPC 原生投影——A snapshot 接管 Codex APP 实时内容源与交互卡
+import CodexQueuePanel from "./CodexQueuePanel";
+import PendingRequestCard, { CodexAvailabilityBanner } from "./PendingRequestCard";
+import useCodexThread from "./useCodexThread";
 import BookmarkBar from "./BookmarkBar";
 import FilePanel from "./FilePanel";
 import FilePreview from "./FilePreview";
@@ -864,6 +869,44 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   }, [session.id, session.form]);
   /** App 套在场位（ModeBarApp / QuestionCardApp + ApproveCard/PlanFeedbackBar 排除） */
   const appSuite = modeSurface === "app";
+  // ===== Task 9：Desktop IPC 投影（A snapshot）=====
+  // 仅 App 套订阅（CLI 会话无 Desktop IPC，enabled=false 零开销）。可用性四档按
+  // 服务端数据渲染：
+  // - controllable / send_only：投影**替换** Codex APP 实时内容源（不与 rollout
+  //   简单 concat——同一历史两份源各说各话是骗人），原生 pending 出卡、队列面板
+  //   挂载，旧 QuestionCardApp 补投入口退场（有 A 投影时原生端点才是正路）；
+  // - compat_only / unavailable：不出投影正文与原生卡——保持旧 QuestionCardApp
+  //   路径（不重构其内部），能力横幅仍按服务端档位诚实展示；
+  // - state=null（无 IPC / 拉取中）：旧路径照旧，零回归。
+  // stale：保留最后视图但禁写（卡片 writeLocked）。
+  const codex = useCodexThread(session.id, appSuite);
+  const codexState = codex.state;
+  const codexWritable =
+    codexState !== null &&
+    (codexState.availability === "controllable" || codexState.availability === "send_only");
+  // ===== R11：Codex 队列刷新统一源 =====
+  // 队列面板除挂载/换会话外必须随状态跃迁刷新，否则「空队列时发送 codex_queued」
+  // 后面板仍自隐、SSE 推进后队位不刷新（新入队消息在当前详情页不可见不可撤——
+  // 宪法 F2.2）。三个触发源汇聚为同一个 tick 下发给 CodexQueuePanel：
+  // a) 投影跃迁（下方 effect：revision/stale/availability/runtimeStatus 变化）；
+  // b) MessageComposer 发送得到 codex_queued / desktop_ipc / headless(compat) 回执；
+  // c) 面板自身撤回完成（面板内部直接重拉，不经此 tick）。
+  const [codexQueueTick, setCodexQueueTick] = useState(0);
+  const bumpCodexQueue = useCallback(() => setCodexQueueTick((t) => t + 1), []);
+  const codexProjSigRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (codexState === null) {
+      codexProjSigRef.current = null;
+      return;
+    }
+    // 只对**状态跃迁**刷新（revision/stale/能力档/runtime 变化）；同一 revision 内的
+    // 流式文本增量不触发（流式期间每帧重拉队列是浪费，队列由服务端账本单独维护）
+    const sig = `${codexState.revision}|${codexState.stale}|${codexState.availability}|${codexState.runtimeStatus}`;
+    if (codexProjSigRef.current !== sig) {
+      codexProjSigRef.current = sig;
+      bumpCodexQueue();
+    }
+  }, [codexState, bumpCodexQueue]);
   // 该会话涉及的文件（/session-files 提取结果，M3+）：一份数据两用——
   // fileEntries 驱动文件面板列表，派生 Set 驱动正文路径链接化
   const [fileEntries, setFileEntries] = useState<SessionFileEntry[]>([]);
@@ -1507,10 +1550,48 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       {/* Task 8：QuestionCard 按 surface 选套（缺 surface 旧后端已在上方兜底进
           appSuite 判定）——读侧同源（GET /session-question），写侧 CLI=键序闭环 /
           APP=补投作答，两套互斥挂载。**三态**（spec 审 M-1）：未决帧（null）两套都
-          不挂（防「先 CLI 后 APP」闪烁 + 防未决帧白发 GET） */}
+          不挂（防「先 CLI 后 APP」闪烁 + 防未决帧白发 GET）。
+          Task 9：App 套内再按 Desktop IPC 投影分叉——可写档（controllable/send_only）
+          出原生 pending 卡 + 队列面板（QuestionCardApp 补投入口退场：有 A 投影时
+          原生端点才是正路，自然语言补投不再渲染）；无投影 / compat_only /
+          unavailable 保持旧 QuestionCardApp 路径（能力横幅照出——四档诚实）。
+          key = requestKey（+会话号）：请求消失（新投影无此 key）即换实例清态；
+          token/owner 变化由卡内 effect 清草稿（不误答）。 */}
       {!isSummary &&
         (modeSurface === null ? null : appSuite ? (
-          <QuestionCardApp key={`question-app-${session.id}`} session={session} />
+          codexState !== null ? (
+            <>
+              <CodexAvailabilityBanner
+                key={`codex-banner-${session.id}`}
+                availability={codexState.availability}
+                stale={codexState.stale}
+              />
+              {codexWritable &&
+                codexState.pending.map((p) => (
+                  <PendingRequestCard
+                    key={`codex-pending-${session.id}-${p.requestKey}`}
+                    sessionId={session.id}
+                    request={p}
+                    writeLocked={codexState.stale}
+                  />
+                ))}
+              {/* R11：队列面板按服务端 CodexQueueView 数据渲染，不按 A 能力档自隐——
+                  compat_only/unavailable 档已持久待发项同样可见可撤（空队列仍自隐，
+                  不渲染空壳）；refreshSignal = 投影跃迁/发送回执汇聚的统一刷新源 */}
+              <CodexQueuePanel
+                key={`codex-queue-${session.id}`}
+                sessionId={session.id}
+                refreshSignal={codexQueueTick}
+              />
+              {/* 不可写档（compat_only/unavailable）：原生卡不出（无 IPC 交互面），
+                  旧补投路径保持——能力横幅照出，不装作原生可用 */}
+              {!codexWritable && (
+                <QuestionCardApp key={`question-app-${session.id}`} session={session} />
+              )}
+            </>
+          ) : (
+            <QuestionCardApp key={`question-app-${session.id}`} session={session} />
+          )
         ) : (
           <QuestionCardCli key={`question-${session.id}`} session={session} />
         ))}
@@ -1539,157 +1620,224 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     </div>
   );
 
-  // 消息区（split 布局复用同一份 JSX）
-  const messageArea = (
-    <>
-      {/* 总结模式提示行（Bug 8）：仅总结模式且有可折叠过程消息时出现 */}
-      {isSummary && toggleableMessages.length > 0 && (
-        <div
-          data-testid="summary-banner"
-          className="mb-2 flex items-center gap-2 rounded-lg bg-[var(--btnp)]/10 px-3 py-2 text-xs text-[var(--tx)]"
-        >
-          <span>总结模式 · 已折叠 {collapsedCount} 条过程消息</span>
-          <span className="ml-auto flex shrink-0 gap-1">
-            {collapsedCount > 0 && (
-              <button
-                type="button"
-                data-testid="expand-all"
-                onClick={expandAll}
-                className="rounded-full bg-[var(--btnp)]/20 px-2 py-0.5 text-xs text-[var(--tx)]"
-              >
-                展开全部
-              </button>
-            )}
-            {collapsedCount < toggleableMessages.length && (
-              <button
-                type="button"
-                data-testid="collapse-all"
-                onClick={collapseAll}
-                className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--mut)]"
-              >
-                收起全部
-              </button>
-            )}
-          </span>
-        </div>
-      )}
-      {loading && messages === null && (
-        <p className="py-16 text-center text-sm text-[var(--mut)]">加载中…</p>
-      )}
-      {error && (
-        <div className="py-16 text-center">
-          <p data-testid="detail-error" className="mb-3 text-sm text-rose-600 dark:text-rose-400">
-            {error.status === 404 ? "无法读取该会话内容" : "加载失败，请检查网络后重试"}
+  // 消息区（split 布局复用同一份 JSX）。
+  // Task 9：可写档投影（controllable/send_only）在场的 A snapshot **替换** Codex APP
+  // 实时内容源——只渲染投影 messages（不与 rollout concat：同一历史两份源混排会让
+  // 用户无法分辨哪份权威；rollout 拉取照旧但此态下不上墙）。stale 时仍渲染最后
+  // 投影（保留视图），写侧禁用在 cardDock 的卡上。能力横幅单点在 cardDock
+  // （四档同位，可写/不可写都诚实可见），此处不重复渲染。
+  const messageArea =
+    codexWritable && codexState !== null ? (
+      <div
+        data-testid="codex-projection"
+        data-availability={codexState.availability}
+        data-stale={codexState.stale ? "true" : "false"}
+      >
+        {codexState.truncated && (
+          <p
+            data-testid="codex-projection-truncated"
+            className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
+          >
+            {i18n.t("mobile.codex.projection.truncated")}
           </p>
-          <button
-            type="button"
-            data-testid="detail-retry"
-            onClick={retry}
-            className="rounded-full bg-[var(--cb)] px-4 py-1.5 text-sm text-[var(--tx)]"
+        )}
+        {codexState.messages.length === 0 ? (
+          <p
+            data-testid="codex-projection-empty"
+            className="py-16 text-center text-sm text-[var(--mut)]"
           >
-            重试
-          </button>
-        </div>
-      )}
-      {messages !== null && !error && messages.length === 0 && (
-        <p className="py-16 text-center text-sm text-[var(--mut)]">暂无消息</p>
-      )}
-      {/* 书签跳转：自动加载中提示（M5 P3-c）与到顶未命中 miss 提示（M3+） */}
-      {jumpLoading && (
-        <p
-          data-testid="bookmark-jump-loading"
-          className="mb-2 rounded-lg bg-[var(--btnp)]/10 px-3 py-2 text-xs text-[var(--tx)]"
-        >
-          正在加载更早消息以定位书签…
-        </p>
-      )}
-      {bookmarkJumpMiss && !jumpLoading && (
-        <p
-          data-testid="bookmark-jump-miss"
-          className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
-        >
-          已到最早消息，未找到该书签目标
-        </p>
-      )}
-      {/* 「加载更早消息」置于列表**最上方**（2026-09-16 用户裁决）：语义是
-          「往前翻到头再加一段更早的」，与阅读方向一致；此前放在列表末尾，
-          与「更早」的空间直觉相反 */}
-      {hasLoadMore && (
-        <div className="pt-1 pb-3 text-center">
-          <button
-            type="button"
-            data-testid="load-more"
-            onClick={() => {
-              const el = messageAreaRef.current;
-              if (el) {
-                pendingScrollRef.current = { prevHeight: el.scrollHeight, prevTop: el.scrollTop };
-              }
-              setLimit((l) => Math.min(l + PAGE_LIMIT, MAX_LIMIT));
-            }}
-            className="rounded-full bg-[var(--cb)] px-4 py-1.5 text-xs text-[var(--tx)]"
-          >
-            {loading ? "加载中…" : "加载更早消息"}
-          </button>
-        </div>
-      )}
-      {messages !== null && messages.length > 0 && (
-        <ul className="space-y-2 pb-4">
-          {messages.map((m) => {
-            const collapsed = isCollapsed(m);
-            const toggleable = isToggleable(m);
-            const isUser = m.kind === "user";
-            const msgBookmark = bookmarkByAnchor.get(messageAnchor(m));
-            return (
-              <li
-                key={m.seq}
-                data-testid={`msg-${m.seq}`}
-                data-kind={m.kind}
-                data-seq={m.seq}
-                className={
-                  isUser ? "relative flex flex-col items-end" : "relative flex flex-col items-start"
-                }
-              >
-                {/* 书签角标（M3+）：该消息命中书签时在气泡左上显示色点 */}
-                {msgBookmark && (
-                  <span
-                    data-testid={`msg-bookmark-${m.seq}`}
-                    title={`书签：${msgBookmark.preview}`}
-                    className="absolute -top-1 -left-1 h-2.5 w-2.5 rounded-full ring-2 ring-[var(--pg)]"
-                    style={{ backgroundColor: msgBookmark.color }}
-                  />
-                )}
-                <div
+            {i18n.t("mobile.codex.projection.empty")}
+          </p>
+        ) : (
+          <ul className="space-y-2 pb-4">
+            {codexState.messages.map((m) => {
+              const isUser = m.role === "user";
+              return (
+                <li
+                  key={m.id}
+                  data-testid={`codex-msg-${m.id}`}
+                  data-role={m.role}
+                  data-kind={m.kind}
                   className={
                     isUser
-                      ? "max-w-[85%] rounded-2xl rounded-br-sm border border-[var(--cb)] bg-[var(--bub)] px-3 py-2"
-                      : "w-full rounded-2xl rounded-bl-sm border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2"
+                      ? "relative flex flex-col items-end"
+                      : "relative flex flex-col items-start"
                   }
                 >
-                  {toggleable ? (
-                    <>
-                      <button
-                        type="button"
-                        data-testid={`msg-${m.seq}-toggle`}
-                        aria-expanded={!collapsed}
-                        onClick={() => toggleCollapsed(m)}
-                        className="-mx-1 flex w-[calc(100%+8px)] items-center gap-1 rounded-lg px-1 py-0.5 text-left text-xs text-[var(--mut)] hover:bg-[var(--cb)]/60 dark:hover:bg-[var(--btnp)]"
-                      >
-                        {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
-                        <span className="truncate">{collapsedLabel(m)}</span>
-                      </button>
-                      {!collapsed && <div className="mt-1">{renderBody(m)}</div>}
-                    </>
-                  ) : (
-                    renderBody(m)
+                  <div
+                    className={
+                      isUser
+                        ? "max-w-[85%] rounded-2xl rounded-br-sm border border-[var(--cb)] bg-[var(--bub)] px-3 py-2"
+                        : "w-full rounded-2xl rounded-bl-sm border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2"
+                    }
+                  >
+                    {/* 投影正文：安全文字原样呈现（不 markdown 渲染、不链化——
+                        原生条目不是 rollout 文件池，路径无文件面板对应物） */}
+                    <div
+                      data-font-scale={fontScale}
+                      className="text-sm break-words whitespace-pre-wrap text-[var(--tx)]"
+                    >
+                      {m.text}
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    ) : (
+      <>
+        {/* 总结模式提示行（Bug 8）：仅总结模式且有可折叠过程消息时出现 */}
+        {isSummary && toggleableMessages.length > 0 && (
+          <div
+            data-testid="summary-banner"
+            className="mb-2 flex items-center gap-2 rounded-lg bg-[var(--btnp)]/10 px-3 py-2 text-xs text-[var(--tx)]"
+          >
+            <span>总结模式 · 已折叠 {collapsedCount} 条过程消息</span>
+            <span className="ml-auto flex shrink-0 gap-1">
+              {collapsedCount > 0 && (
+                <button
+                  type="button"
+                  data-testid="expand-all"
+                  onClick={expandAll}
+                  className="rounded-full bg-[var(--btnp)]/20 px-2 py-0.5 text-xs text-[var(--tx)]"
+                >
+                  展开全部
+                </button>
+              )}
+              {collapsedCount < toggleableMessages.length && (
+                <button
+                  type="button"
+                  data-testid="collapse-all"
+                  onClick={collapseAll}
+                  className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--mut)]"
+                >
+                  收起全部
+                </button>
+              )}
+            </span>
+          </div>
+        )}
+        {loading && messages === null && (
+          <p className="py-16 text-center text-sm text-[var(--mut)]">加载中…</p>
+        )}
+        {error && (
+          <div className="py-16 text-center">
+            <p data-testid="detail-error" className="mb-3 text-sm text-rose-600 dark:text-rose-400">
+              {error.status === 404 ? "无法读取该会话内容" : "加载失败，请检查网络后重试"}
+            </p>
+            <button
+              type="button"
+              data-testid="detail-retry"
+              onClick={retry}
+              className="rounded-full bg-[var(--cb)] px-4 py-1.5 text-sm text-[var(--tx)]"
+            >
+              重试
+            </button>
+          </div>
+        )}
+        {messages !== null && !error && messages.length === 0 && (
+          <p className="py-16 text-center text-sm text-[var(--mut)]">暂无消息</p>
+        )}
+        {/* 书签跳转：自动加载中提示（M5 P3-c）与到顶未命中 miss 提示（M3+） */}
+        {jumpLoading && (
+          <p
+            data-testid="bookmark-jump-loading"
+            className="mb-2 rounded-lg bg-[var(--btnp)]/10 px-3 py-2 text-xs text-[var(--tx)]"
+          >
+            正在加载更早消息以定位书签…
+          </p>
+        )}
+        {bookmarkJumpMiss && !jumpLoading && (
+          <p
+            data-testid="bookmark-jump-miss"
+            className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
+          >
+            已到最早消息，未找到该书签目标
+          </p>
+        )}
+        {/* 「加载更早消息」置于列表**最上方**（2026-09-16 用户裁决）：语义是
+          「往前翻到头再加一段更早的」，与阅读方向一致；此前放在列表末尾，
+          与「更早」的空间直觉相反 */}
+        {hasLoadMore && (
+          <div className="pt-1 pb-3 text-center">
+            <button
+              type="button"
+              data-testid="load-more"
+              onClick={() => {
+                const el = messageAreaRef.current;
+                if (el) {
+                  pendingScrollRef.current = { prevHeight: el.scrollHeight, prevTop: el.scrollTop };
+                }
+                setLimit((l) => Math.min(l + PAGE_LIMIT, MAX_LIMIT));
+              }}
+              className="rounded-full bg-[var(--cb)] px-4 py-1.5 text-xs text-[var(--tx)]"
+            >
+              {loading ? "加载中…" : "加载更早消息"}
+            </button>
+          </div>
+        )}
+        {messages !== null && messages.length > 0 && (
+          <ul className="space-y-2 pb-4">
+            {messages.map((m) => {
+              const collapsed = isCollapsed(m);
+              const toggleable = isToggleable(m);
+              const isUser = m.kind === "user";
+              const msgBookmark = bookmarkByAnchor.get(messageAnchor(m));
+              return (
+                <li
+                  key={m.seq}
+                  data-testid={`msg-${m.seq}`}
+                  data-kind={m.kind}
+                  data-seq={m.seq}
+                  className={
+                    isUser
+                      ? "relative flex flex-col items-end"
+                      : "relative flex flex-col items-start"
+                  }
+                >
+                  {/* 书签角标（M3+）：该消息命中书签时在气泡左上显示色点 */}
+                  {msgBookmark && (
+                    <span
+                      data-testid={`msg-bookmark-${m.seq}`}
+                      title={`书签：${msgBookmark.preview}`}
+                      className="absolute -top-1 -left-1 h-2.5 w-2.5 rounded-full ring-2 ring-[var(--pg)]"
+                      style={{ backgroundColor: msgBookmark.color }}
+                    />
                   )}
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </>
-  );
+                  <div
+                    className={
+                      isUser
+                        ? "max-w-[85%] rounded-2xl rounded-br-sm border border-[var(--cb)] bg-[var(--bub)] px-3 py-2"
+                        : "w-full rounded-2xl rounded-bl-sm border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2"
+                    }
+                  >
+                    {toggleable ? (
+                      <>
+                        <button
+                          type="button"
+                          data-testid={`msg-${m.seq}-toggle`}
+                          aria-expanded={!collapsed}
+                          onClick={() => toggleCollapsed(m)}
+                          className="-mx-1 flex w-[calc(100%+8px)] items-center gap-1 rounded-lg px-1 py-0.5 text-left text-xs text-[var(--mut)] hover:bg-[var(--cb)]/60 dark:hover:bg-[var(--btnp)]"
+                        >
+                          {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                          <span className="truncate">{collapsedLabel(m)}</span>
+                        </button>
+                        {!collapsed && <div className="mt-1">{renderBody(m)}</div>}
+                      </>
+                    ) : (
+                      renderBody(m)
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </>
+    );
 
   // ===== 预览区 sheet 化（T1，2026-10-09）=====
   // 子 Agent sheet 钮的挂载门（决策 7）：名单为 null/空 → 钮不渲染（sheet 不可达）
@@ -1947,6 +2095,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               key={`composer-${session.id}`}
               session={session}
               onHeadlessTurn={setHeadlessTurn}
+              onCodexQueueMutated={bumpCodexQueue}
             />
           </div>
           <SplitHandle
@@ -2027,6 +2176,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             key={`composer-${session.id}`}
             session={session}
             onHeadlessTurn={setHeadlessTurn}
+            onCodexQueueMutated={bumpCodexQueue}
           />
         </div>
       )}

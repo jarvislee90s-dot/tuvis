@@ -163,7 +163,7 @@ enum PendingAction { Approve, Reject, Answer(std::collections::BTreeMap<String, 
 
 **Interfaces:** Produces 公共类型；`PendingRequestId::{to_key(&self)->String,from_key(&str)->Result<Self,ProtocolError>}`；`profile_for(platform:&str, build:&str)->Option<ProtocolProfile>`；`ProtocolProfile { platform:String, build:String, capabilities:CapabilitySet, method_versions:BTreeMap<String,u32> }`、`ProtocolProfile::version(&self,method:&str,envelope_host:Option<&str>)->Result<u32,ProtocolError>`；`new_uuid()->String`。`ProtocolError` 定义 `UnsupportedMethod/InvalidId/InvalidFrame/InvalidState/StaleContext/Capacity/Timeout/Disconnected`。
 
-- [ ] **Step 1：先写 profile/ID 失败测试**，核心断言：
+- [x] **Step 1：先写 profile/ID 失败测试**，核心断言：
   ```rust
   assert!(profile_for("macos", "26.1013.31257").is_none());
   let p = profile_for("macos", "26.1013.31256").unwrap();
@@ -173,10 +173,10 @@ enum PendingAction { Approve, Reject, Answer(std::collections::BTreeMap<String, 
   assert_ne!(PendingRequestId::from_key("n:12").unwrap(), PendingRequestId::from_key("s:12").unwrap());
   ```
   增加 `profiles_keep_unverified_methods_disabled`，逐格断言协议表中的初始 capability；三类 UUID 连续生成不相等且满足现有 `codex::is_uuid`。
-- [ ] **Step 2：运行失败测试**：`cd src-tauri && cargo test codex_desktop_ipc::profile`；新接口缺失导致失败，先排除环境缺依赖。
-- [ ] **Step 3：实现 types/profile 并建立脱敏夹具**。README 区分 OBSERVED / CODE / 未实测；fixture 中保留 `turnHistory.history.entitiesByKey/islands`、array path、整数 request id，另补字符串 ID 合同样本并标为合成。不得把原日志中的开发提示词/凭据/真实会话整包入库。
-- [ ] **Step 4：运行 profile + types 测试**：`cargo test codex_desktop_ipc::`（在 `src-tauri`），全部 PASS。
-- [ ] **Step 5：显式 add 本 Task 文件并提交**：`feat: define desktop ipc protocol profiles`。
+- [x] **Step 2：运行失败测试**：`cd src-tauri && cargo test codex_desktop_ipc::profile`；新接口缺失导致失败，先排除环境缺依赖。
+- [x] **Step 3：实现 types/profile 并建立脱敏夹具**。README 区分 OBSERVED / CODE / 未实测；fixture 中保留 `turnHistory.history.entitiesByKey/islands`、array path、整数 request id，另补字符串 ID 合同样本并标为合成。不得把原日志中的开发提示词/凭据/真实会话整包入库。
+- [x] **Step 4：运行 profile + types 测试**：`cargo test codex_desktop_ipc::`（在 `src-tauri`），全部 PASS。
+- [x] **Step 5：显式 add 本 Task 文件并提交**：`feat: define desktop ipc protocol profiles`。
 
 ## Task 2：有界帧与双平台全双工 Transport
 
@@ -184,7 +184,7 @@ enum PendingAction { Approve, Reject, Answer(std::collections::BTreeMap<String, 
 
 **Interfaces:** Consumes Task 1；Produces `FrameDecoder::{new()->Self,push(&mut self,bytes:&[u8])->Result<Vec<serde_json::Value>,ProtocolError>}`、`encode_frame(&Value)->Result<Vec<u8>,ProtocolError>`；`trait IpcIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send`；`type BoxIo=Box<dyn IpcIo>`；`EndpointResolver::resolve(&self)->Result<DesktopEndpoint,ProtocolError>`、`async fn connect(endpoint:&DesktopEndpoint)->Result<BoxIo,ProtocolError>`。`DesktopEndpoint` 包含本机路径、平台和已核对 build，不接收 HTTP 输入。
 
-- [ ] **Step 1：写 `fragmented_and_coalesced_frames`、`reject_length_before_allocation`、`duplex_does_not_block_write` 失败测试**：
+- [x] **Step 1：写 `fragmented_and_coalesced_frames`、`reject_length_before_allocation`、`duplex_does_not_block_write` 失败测试**：
   ```rust
   assert!(FrameDecoder::new().push(&0u32.to_le_bytes()).is_err());
   assert!(FrameDecoder::new().push(&268435457u32.to_le_bytes()).is_err());
@@ -194,10 +194,10 @@ enum PendingAction { Approve, Reject, Answer(std::collections::BTreeMap<String, 
   assert_eq!(d.push(&frame[3..]).unwrap()[0]["text"], "你好🐇");
   ```
   另用同一连接 reader 等待期间 writer 仍能在 1s 内写出完整帧；Unix socket tempdir 测试优先路径、旧路径回退、错误 uid/权限/非 socket 拒绝；Windows 原生测试真实假服务端 named pipe，非 Windows 不谎报该测试已执行。
-- [ ] **Step 2：运行 `cargo test codex_desktop_ipc::codec` 和本机 transport 测试，确认缺接口/未实现导致 FAIL**。
-- [ ] **Step 3：实现 codec 与 transport**。帧按字节计长，UTF-8/JSON 错误关闭连接；Windows 使用 Tokio `ClientOptions`；Mac 默认路径来自实际 CODEX_HOME，旧路径仅本机 tmpdir/uid 推导。未识别/多义 build 不能伪装成已验证版本。
-- [ ] **Step 4：运行本机测试及 Windows 编译门**：`cargo test codex_desktop_ipc::`；`cargo check --target x86_64-pc-windows-gnu --all-targets --features marker-helper`。都成功才标对应自动检查 PASS。
-- [ ] **Step 5：提交** `feat: add cross-platform desktop ipc transport`。
+- [x] **Step 2：运行 `cargo test codex_desktop_ipc::codec` 和本机 transport 测试，确认缺接口/未实现导致 FAIL**。
+- [x] **Step 3：实现 codec 与 transport**。帧按字节计长，UTF-8/JSON 错误关闭连接；Windows 使用 Tokio `ClientOptions`；Mac 默认路径来自实际 CODEX_HOME，旧路径仅本机 tmpdir/uid 推导。未识别/多义 build 不能伪装成已验证版本。
+- [x] **Step 4：运行本机测试及 Windows 编译门**：`cargo test codex_desktop_ipc::`；`cargo check --target x86_64-pc-windows-gnu --all-targets --features marker-helper`。都成功才标对应自动检查 PASS。
+- [x] **Step 5：提交** `feat: add cross-platform desktop ipc transport`。
 
 ## Task 3：单连接 Actor、RPC 关联与未知投递
 
@@ -207,12 +207,12 @@ enum PendingAction { Approve, Reject, Answer(std::collections::BTreeMap<String, 
 
 连接 epoch 由同一 supervisor 每次重连递增，不能每次新 actor 重置为 0。writer 在真正写帧之前检查 epoch 与 validity 活性信号，避免请求排队期间 owner 换代后仍写出。
 
-- [ ] **Step 1：写 `rpc_matches_id_and_method`、`partial_write_is_unknown`、`discovery_is_answered_while_write_waits` 失败测试**。假 peer：先读 initialize→回 clientId；收到写请求后断线，断言 `outcome.delivery == Delivery::UnknownDelivery` 且只收到一个 mutating frame。队列满/排队时取消且尚未交给 writer 为 `NotSent`；超时后读/写均未知。
+- [x] **Step 1：写 `rpc_matches_id_and_method`、`partial_write_is_unknown`、`discovery_is_answered_while_write_waits` 失败测试**。假 peer：先读 initialize→回 clientId；收到写请求后断线，断言 `outcome.delivery == Delivery::UnknownDelivery` 且只收到一个 mutating frame。队列满/排队时取消且尚未交给 writer 为 `NotSent`；超时后读/写均未知。
       `client-discovery-request {requestId,request:{...}}` 必须立即回 `{type:"client-discovery-response",requestId,response:{canHandle:false}}`；等待一个慢 RPC 不得堵住该回包。该控制回包有预留发送容量，不因普通 outbound 64帧已满而丢失。迟到响应 ID 不命中、method 不符不误唤醒其他请求；错误/拒绝的目标和 request ID 不可混淆。
-- [ ] **Step 2：运行 `cargo test --test codex_desktop_ipc`，确认新增测试 FAIL 且实际执行新增用例，不能接受过滤为 0 tests**。
-- [ ] **Step 3：实现 connection actor**。reader、single writer、RPC waiter 分离；写入交给 writer 前检查 lease epoch；writer 一旦开始尝试写帧即跨越保守投递边界，部分写/取消/timeout/EOF 都不能返回 NotSent。只在 response 明确成功且 handler 一致时 Accepted；收到明确 error 为 Rejected。连接失败释放全部 waiter；不重放 outbound。
-- [ ] **Step 4：运行集成测试和 `cargo test codex_desktop_ipc::`，PASS**。增加 65 个同时 RPC 的容量测试，断言第 65 个入队前拒绝、不增加写入次数。
-- [ ] **Step 5：提交** `feat: manage desktop ipc requests and delivery outcomes`。
+- [x] **Step 2：运行 `cargo test --test codex_desktop_ipc`，确认新增测试 FAIL 且实际执行新增用例，不能接受过滤为 0 tests**。
+- [x] **Step 3：实现 connection actor**。reader、single writer、RPC waiter 分离；写入交给 writer 前检查 lease epoch；writer 一旦开始尝试写帧即跨越保守投递边界，部分写/取消/timeout/EOF 都不能返回 NotSent。只在 response 明确成功且 handler 一致时 Accepted；收到明确 error 为 Rejected。连接失败释放全部 waiter；不重放 outbound。
+- [x] **Step 4：运行集成测试和 `cargo test codex_desktop_ipc::`，PASS**。增加 65 个同时 RPC 的容量测试，断言第 65 个入队前拒绝、不增加写入次数。
+- [x] **Step 5：提交** `feat: manage desktop ipc requests and delivery outcomes`。
 
 ## Task 4：Owner Registry、following 与恢复代际
 
@@ -222,7 +222,7 @@ enum PendingAction { Approve, Reject, Answer(std::collections::BTreeMap<String, 
 
 Registry 另产出 `validity(&self,lease:&OwnerLease)->tokio::sync::watch::Receiver<bool>`；失效/换代向旧 lease 信号发 false，adapter 将它传入 Task 3 的写请求。测试请求排队后 invalidate、writer 恢复时结果 NotSent 且未写帧；开始写后再 invalidate 只能 UnknownDelivery。
 
-- [ ] **Step 1：写 `disconnect_invalidates_every_thread_of_owner` 与 `old_epoch_never_becomes_current` 失败测试**：
+- [x] **Step 1：写 `disconnect_invalidates_every_thread_of_owner` 与 `old_epoch_never_becomes_current` 失败测试**：
   ```rust
   let mut r = OwnerRegistry::default();
   let a = r.bind(ThreadKey{host_id:"local".into(),thread_id:"t1".into()}, "owner-a".into(), 1);
@@ -231,10 +231,10 @@ Registry 另产出 `validity(&self,lease:&OwnerLease)->tokio::sync::watch::Recei
   assert!(!r.is_current(&a)); assert!(!r.is_current(&b));
   ```
   集成测试精确验证 discovery params `{hostId:"local",conversationId}`、owner 取 response.handledByClientId、随后 following broadcast v1；无 following 不允许假装同步完成。
-- [ ] **Step 2：运行 `cargo test codex_desktop_ipc::owners`，FAIL**。
-- [ ] **Step 3：实现 owners 与 follower 生命周期**。`client-status-changed(disconnected)` 清该 client 全部映射；reset/EOF 清全部 lease。重连后 initialize→重新 discovery→following→等 snapshot，不仅恢复 socket。收到 following-status-requested 对真实订阅回复 following；退出订阅发 false。发现 no-client-found 先核 profile 和 envelope host 规则，不以此证明 A 写请求没送达。
-- [ ] **Step 4：运行 owner 单测和集成测试**；模拟 A→B 后 A 的迟到 response/state 均被拒；最多 64 跟随、移除一条释放名额，PASS。
-- [ ] **Step 5：提交** `feat: track desktop owners and recover subscriptions`。
+- [x] **Step 2：运行 `cargo test codex_desktop_ipc::owners`，FAIL**。
+- [x] **Step 3：实现 owners 与 follower 生命周期**。`client-status-changed(disconnected)` 清该 client 全部映射；reset/EOF 清全部 lease。重连后 initialize→重新 discovery→following→等 snapshot，不仅恢复 socket。收到 following-status-requested 对真实订阅回复 following；退出订阅发 false。发现 no-client-found 先核 profile 和 envelope host 规则，不以此证明 A 写请求没送达。
+- [x] **Step 4：运行 owner 单测和集成测试**；模拟 A→B 后 A 的迟到 response/state 均被拒；最多 64 跟随、移除一条释放名额，PASS。
+- [x] **Step 5：提交** `feat: track desktop owners and recover subscriptions`。
 
 ## Task 5：Revision Mirror 与统一状态投影
 
@@ -242,17 +242,17 @@ Registry 另产出 `validity(&self,lease:&OwnerLease)->tokio::sync::watch::Recei
 
 **Interfaces:** Produces `ThreadMirror::{new(key:ThreadKey)->Self,apply(&mut self,lease:&OwnerLease,change:&Value)->Result<MirrorEffect,ProtocolError>,mark_stale(&mut self),project(&self,caps:CapabilitySet)->ThreadProjection}`；`MirrorEffect { changed:bool, need_snapshot:bool }`。mirror 绑定当前 lease，换 owner 先清状态，禁止仅由调用方口头保证。
 
-- [ ] **Step 1：写 `empty_turns_uses_canonical_history`、`patch_batch_is_atomic`、`revision_gap_requires_snapshot` 失败测试**。加载两平台 fixture，断言 `turns=[]` 仍投影出其 `turnHistory.history` 的用户与助手消息、稳定 item ID 以及完整 pending；同一 streaming item replace 不能追加重复气泡。
+- [x] **Step 1：写 `empty_turns_uses_canonical_history`、`patch_batch_is_atomic`、`revision_gap_requires_snapshot` 失败测试**。加载两平台 fixture，断言 `turns=[]` 仍投影出其 `turnHistory.history` 的用户与助手消息、稳定 item ID 以及完整 pending；同一 streaming item replace 不能追加重复气泡。
   ```rust
   // 在相同 lease 的 revision=7 快照上，baseRevision=6 的增量不应用。
   assert!(mirror.apply(&lease, &serde_json::json!({"type":"patches","baseRevision":6,"revision":8,"patches":[]})).unwrap().need_snapshot);
   assert!(mirror.project(caps.clone()).stale);
   ```
   数组 add 是插入、remove 删除、replace 只替换现有索引；一批中第二条非法时第一条也不生效。低 revision 重复 snapshot/patch 忽略；新 epoch 不比较旧 revision 大小。
-- [ ] **Step 2：运行 `cargo test codex_desktop_ipc::mirror`，FAIL**。
-- [ ] **Step 3：实现 mirror 与 projection**。按 `islands[].entries` 顺序取 entitiesByKey，不遍历无序 map 当时间顺序；Windows/Mac 的 `turnHistory` wrapper 由 fixture 决定，不能只看 `turns`。从 runtime status 与 turn history 得到 active/idle/failed，缺字段为 unknown；unknown/stale 不准写。未知 item kind 只投影安全文字摘要，不下发原始工具参数。缺口重新 following 取 snapshot；只读 history 不完整时调 v1 load-complete-history 并等相应 snapshot。
-- [ ] **Step 4：运行 mirror 与集成测试**；正文超过 1 MiB / 500 条明确 truncated，镜像超过 16 MiB 或总预算 64 MiB 拒绝且 stale，无界旧历史不被全量扫描，PASS。
-- [ ] **Step 5：提交** `feat: mirror desktop thread state and project remote views`。
+- [x] **Step 2：运行 `cargo test codex_desktop_ipc::mirror`，FAIL**。
+- [x] **Step 3：实现 mirror 与 projection**。按 `islands[].entries` 顺序取 entitiesByKey，不遍历无序 map 当时间顺序；Windows/Mac 的 `turnHistory` wrapper 由 fixture 决定，不能只看 `turns`。从 runtime status 与 turn history 得到 active/idle/failed，缺字段为 unknown；unknown/stale 不准写。未知 item kind 只投影安全文字摘要，不下发原始工具参数。缺口重新 following 取 snapshot；只读 history 不完整时调 v1 load-complete-history 并等相应 snapshot。
+- [x] **Step 4：运行 mirror 与集成测试**；正文超过 1 MiB / 500 条明确 truncated，镜像超过 16 MiB 或总预算 64 MiB 拒绝且 stale，无界旧历史不被全量扫描，PASS。
+- [x] **Step 5：提交** `feat: mirror desktop thread state and project remote views`。
 
 ## Task 6：原生 Start Turn、两类审批及阻塞式问答
 
@@ -262,13 +262,13 @@ Registry 另产出 `validity(&self,lease:&OwnerLease)->tokio::sync::watch::Recei
 
 另提供 `async unfollow(&self,key:&ThreadKey)` 和 `subscribe(&self)->broadcast::Receiver<ThreadProjection>`，供详情卸载、队列调度和 REST/SSE 共用。启动和重连由该 adapter supervisor 统一管理，watcher 只消费投影事件。
 
-- [ ] **Step 1：写 `start_turn_targets_original_thread`、`approval_variants_never_share_wire_payload`、`answer_binds_current_pending` 失败测试**。假 owner 逐字段断言：start-turn v2、target=当前 owner、`conversationId == turnStart.request.threadId`、input text、text_elements=[]、clientUserMessageId，context={}；不发送 model/权限/collaboration 覆盖。
+- [x] **Step 1：写 `start_turn_targets_original_thread`、`approval_variants_never_share_wire_payload`、`answer_binds_current_pending` 失败测试**。假 owner 逐字段断言：start-turn v2、target=当前 owner、`conversationId == turnStart.request.threadId`、input text、text_elements=[]、clientUserMessageId，context={}；不发送 model/权限/collaboration 覆盖。
       command 用 `thread-follower-command-approval-decision` / 原始整数或字符串 id / accept 或 decline；permissions 用 `thread-follower-permissions-request-approval-response` / 服务端原权限对象或 `{}` / scope=turn。
       input 用 `thread-follower-submit-user-input`，两个问题以原 qid 映射，不能漏答或混入未知 qid；`isOther=false` 禁任意文本，`isOther=true` 接受自由文本，`isSecret=true` 不在审计、日志和错误文本泄漏回答。
-- [ ] **Step 2：运行 `cargo test --test codex_desktop_ipc native_`，FAIL**（本 Task 新增测试名称统一以 `native_` 开头）。
-- [ ] **Step 3：实现 adapter/pending 映射**。request key/token 变更规则见公共约定；同 request 正在提交时第二次响应拒绝。owner 失效、pending 消失或参数变更拒绝旧卡；profile capability=false 拒绝而不是试发。不要根据 `availableDecisions` 生成任意决策；只提供产品批准/拒绝。
-- [ ] **Step 4：运行全部 native 测试**，断言无 `availableDecisions` 仍两按钮、未知 request method 仅显示不支持、Default async 消息不生成 pending 卡。测试 profile 注入可打开未实测方法以测构造器，但不得改生产 profile，PASS。
-- [ ] **Step 5：提交** `feat: control native desktop turns approvals and user input`。
+- [x] **Step 2：运行 `cargo test --test codex_desktop_ipc native_`，FAIL**（本 Task 新增测试名称统一以 `native_` 开头）。
+- [x] **Step 3：实现 adapter/pending 映射**。request key/token 变更规则见公共约定；同 request 正在提交时第二次响应拒绝。owner 失效、pending 消失或参数变更拒绝旧卡；profile capability=false 拒绝而不是试发。不要根据 `availableDecisions` 生成任意决策；只提供产品批准/拒绝。
+- [x] **Step 4：运行全部 native 测试**，断言无 `availableDecisions` 仍两按钮、未知 request method 仅显示不支持、Default async 消息不生成 pending 卡。测试 profile 注入可打开未实测方法以测构造器，但不得改生产 profile，PASS。
+- [x] **Step 5：提交** `feat: control native desktop turns approvals and user input`。
 
 ## Task 7：持久动作账本、普通消息 FIFO 与安全路由
 
@@ -289,7 +289,7 @@ Registry 另产出 `validity(&self,lease:&OwnerLease)->tokio::sync::watch::Recei
 
 `StoreError=Conflict|Database(String)`。payload hash 用现有 sha2 对 kind/thread/requestKey/contextToken/原始文本或有序答案做规范化序列化；不能只 hash 文本。新增 `write_audit::record_conn_checked`：参数与原 record_conn 完全相同，返回 `rusqlite::Result<()>`，由 ActionStore 事务调用并传播错误；原 record_conn 用 checked 实现后保留原来的记录错误兼容行为。
 
-- [ ] **Step 1：写 `same_action_never_sends_twice`、`restart_reserved_becomes_unknown`、`busy_fifo_allows_pending_response`、`fallback_only_before_dispatch` 失败测试**：
+- [x] **Step 1：写 `same_action_never_sends_twice`、`restart_reserved_becomes_unknown`、`busy_fifo_allows_pending_response`、`fallback_only_before_dispatch` 失败测试**：
   - 同 device/thread/action/payload 返回原状态，RPC write 计数恒 1；相同 action_id 换正文/设备/thread 返回 conflict 且零新增写入。
   - writer 执行前先 `queued→reserved`，进程重启将 reserved→unknown，不能回 queued；queued 恢复仍可按序发送。
   - active 时连续 a/b 两条消息落 SQLite FIFO，idle 后只发 a，等它终态再发 b；期间审批能取得短 action 锁响应原 Turn。
@@ -297,15 +297,15 @@ Registry 另产出 `validity(&self,lease:&OwnerLease)->tokio::sync::watch::Recei
   - 相同毫秒 a/b 仍按 seq；关闭进程、丢弃内存、重建 hub 后能读到原文/设备/原 client_message_id 并发送；撤回与 reserve 竞态只有一个 CAS 成功，已撤 actionId 再提交不会重发；设备被吊销后的 queued 动作拒绝而不派发。
   - 立即发送、FIFO重启恢复、fallback 三条路径逐一断言正文只有一个 `[mobile <设备名>]`；A adapter不再自行追加标记，hash始终基于原文。
   - IPC已 reserved、writer前 NotSent→handoff→fallback 恰好一次；交接时崩溃恢复为 unknown。审计表安装拒绝 INSERT 的 SQLite trigger→reserve回滚、仍queued、IPC与fallback写入均0。
-- [ ] **Step 2：运行 `cargo test --test codex_control_remote`，FAIL**。
-- [ ] **Step 3：实现 action store/router/queue**。取 lease 与 mirror 后短串行锁复核；普通发送一 Thread 一 active Turn；pending 响应只锁 dispatch/ack，不持整个 Turn 等待期。queueOnly 持久排队；空闲事件和周期对账接力；每次真正派发前再核设备在册/远程开关。compat 仅由 remote bridge 在 H3 打开时执行；UseFallback 不等于投递成功。
+- [x] **Step 2：运行 `cargo test --test codex_control_remote`，FAIL**。
+- [x] **Step 3：实现 action store/router/queue**。取 lease 与 mirror 后短串行锁复核；普通发送一 Thread 一 active Turn；pending 响应只锁 dispatch/ack，不持整个 Turn 等待期。queueOnly 持久排队；空闲事件和周期对账接力；每次真正派发前再核设备在册/远程开关。compat 仅由 remote bridge 在 H3 打开时执行；UseFallback 不等于投递成功。
       来源标记按宪法 F2.2 和现有 H8 Codex APP 行为保留：A 分支派发前调用 `normalize::compose_injection(device_name,raw_text)` 恰好一次（保留其中文/换行归一及花名拒绝面）；native adapter 接收已组装文本。持久队列/hash 存原始文本，恢复后仍只组装一次；fallback 给既有 helper 原文，由它组装，禁止传已加签名文本造成双标记。不在本期改全局签名开关的历史语义。
       compat 发送前持久 reserved 和 compat fence，bridge 持 permit 直到落账，不复用 H8 内部 TurnGuard。投递终态与 Turn 调度终态分开：H8 `queued` 只证明进原生队列，`ok` 只证明已消费；两者都不能据此清 fence 或发下一条。使用 bridge 暴露的 queued message ID/turn ID、既有只读 queue evidence 和新 owner snapshot核对：原生队列已无该消息且对应 Turn 明确完成，才 clear fence；仅 idle snapshot 或 helper 返回不够。证据不足保持 fence/后续消息留队，界面说明需回 Desktop 核对，不猜完成。fence 跨热重启与应用重启保存，A恢复不得绕过；新 pending 交互仍可继续。
       零投递例外：CLI缺失、UUID/花名/探针等明确在 spawn/write 前拒绝得到 NotSent，finish 与清 fence 同事务；这类动作没有 Turn，不等待 Turn 结束。原生 A 的调度也必须等回执中对应 turnId 的终态，而非收到任意 idle 就释放；若成功回执缺 turnId 且无法核对，按未知处理并保留顺序限制。
       为兼容 fence 提供 `CompatFence { action_id:String,queued_message_id:Option<String>,turn_id:Option<String>,rollout_path:Option<String>,rollout_baseline:Option<u64>,wire_hash:Option<String> }`（服务端内部类型）；DAO `compat_fences(&self,key:&ThreadKey)->Result<Vec<CompatFence>,StoreError>` 读取，新增证据字段随 fence 持久保存。桥接前记录 rollout基线和已组装文本hash；只读 `async fn reconcile_compat_fence(fence:&CompatFence,projection:&ThreadProjection)->Result<bool,ProtocolError>` 复用现有 queue副本查询和有界 rollout解析（最多追加尾窗2 MiB），按基线之后唯一匹配的用户输入hash关联 Turn，再核其完成。读失败、多义、已被尾窗截断均返回 false，不能用“队列没找到”单独证明执行完成；无原生owner时也可由 rollout 的明确对应Turn终态提供完成证据。只读核对不修改 Codex 数据文件。
-- [ ] **Step 4：运行账本/路由测试**，补 DB 写失败、HTTP client drop 后任务继续落账、启动 reserved 标 unknown、关远程时未派发仍 queued、未知操作阻止相同 action 重放，PASS。再测 fallback滞留→helper返回→IPC恢复→应用重启，第二条仍不越序；只给 idle 证据不解锁，给原消息对应完成证据才解锁。`unknown` 只由只读核对提供证据，不自动改回 queued。
+- [x] **Step 4：运行账本/路由测试**，补 DB 写失败、HTTP client drop 后任务继续落账、启动 reserved 标 unknown、关远程时未派发仍 queued、未知操作阻止相同 action 重放，PASS。再测 fallback滞留→helper返回→IPC恢复→应用重启，第二条仍不越序；只给 idle 证据不解锁，给原消息对应完成证据才解锁。`unknown` 只由只读核对提供证据，不自动改回 queued。
       增加 CLI缺失/探针拒绝→NotSent→fence已清→A恢复后下一条正常发送；A ack 之前遗留 idle snapshot 不触发第二次 start-turn。
-- [ ] **Step 5：提交** `feat: route codex control with durable delivery tracking`。
+- [x] **Step 5：提交** `feat: route codex control with durable delivery tracking`。
 
 ## Task 8：Remote API、生命周期、安全与审计接线
 
@@ -326,16 +326,16 @@ Registry 另产出 `validity(&self,lease:&OwnerLease)->tokio::sync::watch::Recei
 
 普通消息仍限制 `MAX_SEND_CHARS=10_000`，原生回答每题最多 10_000 字符，最多 32 题、每题 32 个答案项、总正文 64 KiB；选项必须属于当前请求，空答案拒绝。所有读写 no-store；错误状态 400 malformed、403 unauthorized/headless_disabled、404 missing、409 stale_context/action_conflict、503 capability_unavailable；未知投递是 200 的明确 receipt，不能用可安全重试的普通错误替代。
 
-- [ ] **Step 1：写 HTTP 集成失败测试**，用 `DeviceStore::memory`、假 session source/adapter/fallback，不接触真实 ~/.tuvis。对上述每条新路由测无 cookie/过期 cookie/吊销=403，回环同样拒绝；POST 带 ownerClientId/targetClientId/raw method=400。过期 token/跨 thread requestKey=409 且 IPC write=0。
+- [x] **Step 1：写 HTTP 集成失败测试**，用 `DeviceStore::memory`、假 session source/adapter/fallback，不接触真实 ~/.tuvis。对上述每条新路由测无 cookie/过期 cookie/吊销=403，回环同样拒绝；POST 带 ownerClientId/targetClientId/raw method=400。过期 token/跨 thread requestKey=409 且 IPC write=0。
       再测试 H3=false 且 A可用→IPC正常；A不可用且 H3=false→compat拒绝；unknown/accepted 不调用 fallback；手机断开 POST 后不取消已派发写动作；SSE 被吊销即时关闭。
       对新 queue GET/撤回补认证、其他设备404、撤回竞态409与 cancelled actionId 不重发测试；H3=false 的 send-info 必须 injectable=true，不能只测绕过 composer 的 POST。
-- [ ] **Step 2：运行 `cargo test --test codex_control_remote`，FAIL**。
-- [ ] **Step 3：实现 HTTP bridge 与生产启停**。注册在现有 gated nest 内；start_server 装配 hub，remote 关闭取消订阅/恢复循环和未派发调度，已派发任务留至落账或 unknown；hot restart 不重放。旧 server fixture 全部显式填 disabled hub。不要在 `get_all_sessions` 三秒扫描里逐条连接 IPC；只按请求和有界关注集合工作。
+- [x] **Step 2：运行 `cargo test --test codex_control_remote`，FAIL**。
+- [x] **Step 3：实现 HTTP bridge 与生产启停**。注册在现有 gated nest 内；start_server 装配 hub，remote 关闭取消订阅/恢复循环和未派发调度，已派发任务留至落账或 unknown；hot restart 不重放。旧 server fixture 全部显式填 disabled hub。不要在 `get_all_sessions` 三秒扫描里逐条连接 IPC；只按请求和有界关注集合工作。
       Codex APP `session-send` 和 `session-send-info` 都必须在旧 `headless_blocked` / 静态 route 之前交给 control hub，**只有兼容分支受 H3**。原生 busy 消息用 codex_actions，不入旧 inject_queue。旧 `try_flush_with` 已通过 `routing::route` 拦截 headless（含 Codex APP），普通 flush 与 jump 共同走这道门，复用该判据并测二者零终端注入；存量 APP pending 可由用户经旧队列撤回，不自动导入新账本重投。
       fallback bridge 固定入口 `async fn run_compat(st:Arc<RemoteState>,permit:FallbackPermit)->serde_json::Value`：permit 内部取原文/设备/会话映射，经现有 `codex_headless_dispatch_envelope` 执行，生成对应 ActionReceipt 与 progress证据后 `finish`。复用 helper 的回执正文，但扩展内部 evidence 返回（保留公开旧 helper wrapper）：`CompatEvidence { queued_message_id:Option<String>,turn_id:Option<String>,turn_completed:bool }`。没有证据时 turn_completed=false。旧 receipt queued/ok 映射 Delivery::Accepted；投递前明确 refusal 映射 NotSent；执行后超时/取消/不确定失败一律 UnknownDelivery，不能泛化为可安全重试的失败。
       Codex APP 的旧 `session-question/answer` 补投与 `session-approve` 键位面一律回 capability_unavailable / 引导原生端点；GET 不再把陈旧 rollout 问题广告为可处理原生卡。模式、CLI 和其他工具合同不扩权、不重构。
-- [ ] **Step 4：补审计并运行集成测试**。动作 action=`codex_send/codex_approve/codex_reject/codex_answer/codex_fallback`，channel=`codex_desktop_ipc` 或实际 headless；summary 是 JSON `{actionId,threadId,requestKey?,envelopeId?,result}`，device 使用服务端设备身份。测试 send/两类审批/回答/降级/未知每项都有可追踪记录，原 permissions、答案、cookie、API key 哨兵不出现在审计或事件中；fallback 既有 headless 行保留，以 actionId 另行关联。所有新 error 经 main 错误码机制。
-- [ ] **Step 5：提交** `feat: expose authenticated desktop control api`。
+- [x] **Step 4：补审计并运行集成测试**。动作 action=`codex_send/codex_approve/codex_reject/codex_answer/codex_fallback`，channel=`codex_desktop_ipc` 或实际 headless；summary 是 JSON `{actionId,threadId,requestKey?,envelopeId?,result}`，device 使用服务端设备身份。测试 send/两类审批/回答/降级/未知每项都有可追踪记录，原 permissions、答案、cookie、API key 哨兵不出现在审计或事件中；fallback 既有 headless 行保留，以 actionId 另行关联。所有新 error 经 main 错误码机制。
+- [x] **Step 5：提交** `feat: expose authenticated desktop control api`。
 
 ## Task 9：移动端能力、实时投影与原生 Pending 卡
 
@@ -345,7 +345,7 @@ Registry 另产出 `validity(&self,lease:&OwnerLease)->tokio::sync::watch::Recei
 
 另提供 `fetchCodexQueue(sessionId:string):Promise<CodexQueueView>`、`retractCodexAction(actionId:string):Promise<CodexActionView>`、`CodexQueuePanel({sessionId})`，显示本设备待发与实际 FIFO 位置、撤回按钮及 compat_outstanding 说明；面板挂载/状态跃迁/操作后重拉，禁提供插队或撤回已派发动作。
 
-- [ ] **Step 1：写以下失败测试**：
+- [x] **Step 1：写以下失败测试**：
   ```tsx
   expect(screen.getByText("仅可使用兼容模式")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "重试" })).not.toBeInTheDocument(); // UNKNOWN_DELIVERY
@@ -354,12 +354,12 @@ Registry 另产出 `validity(&self,lease:&OwnerLease)->tokio::sync::watch::Recei
   ```
   fixtures 分别验证 command/permissions 两按钮、isOther 自由作答、isSecret password 输入且完成换卡清草稿、两个问题全答后提交，owner 换代或 requestKey/token 变化清旧状态。Default async 消息不渲染阻塞卡；unsupported request 可见但不可操作。
   补 `native_send_with_h3_off`：真实渲染 MessageComposer、mock send-info 为A能力、H3=false，按钮仍可发送且只发一次；不能只测试 hook。queue 面板撤回后条目消失、409保留并刷新、cancelled action 不出现重试。
-- [ ] **Step 2：运行 `pnpm test -- tests/mobile/PendingRequestCard.test.tsx tests/mobile/useCodexThread.test.tsx tests/mobile/codexIpcApi.test.tsx tests/mobile/CodexQueuePanel.test.tsx tests/mobile/MessageComposer.test.tsx`，FAIL**。
-- [ ] **Step 3：实现 API/hook/卡及详情接线**。有 A snapshot 时用投影替换当前 Codex APP 的实时内容源，不把同一历史再与 rollout 简单 concat；stale 标记保留最后视图但禁写。四档能力按服务端数据渲染；compat 的消息回执沿旧组件，原生操作不展示“已补投为消息”。
+- [x] **Step 2：运行 `pnpm test -- tests/mobile/PendingRequestCard.test.tsx tests/mobile/useCodexThread.test.tsx tests/mobile/codexIpcApi.test.tsx tests/mobile/CodexQueuePanel.test.tsx tests/mobile/MessageComposer.test.tsx`，FAIL**。
+- [x] **Step 3：实现 API/hook/卡及详情接线**。有 A snapshot 时用投影替换当前 Codex APP 的实时内容源，不把同一历史再与 rollout 简单 concat；stale 标记保留最后视图但禁写。四档能力按服务端数据渲染；compat 的消息回执沿旧组件，原生操作不展示“已补投为消息”。
       一次用户动作生成 actionId，双击沿同 ID，网络失败不自动换 ID/重发；用只读 action 查询核对，UNKNOWN 显示“投递结果未知，请在 Desktop 核对”，不出现自动重试按钮。Accepted 只表示已受理，不提前标 Turn 完成；pending 消失以新投影为准。
       SSE 首帧/增量同 DTO；失败按现有订阅节奏退避，连续 3 次失败降为 3s GET，仅当前详情订阅，不打开全历史；卸载 abort fetch/关闭 stream，过时响应不盖新 session。
-- [ ] **Step 4：运行本 Task 和既有 `SessionDetail/MessageComposer/QuestionCardApp/QuestionCardCli` 测试**，验证 CLI 无回归、APP 不落旧补投；中英文文案齐备。`pnpm check` 与 `pnpm build:mobile` PASS。
-- [ ] **Step 5：提交** `feat: render native codex desktop control on mobile`。
+- [x] **Step 4：运行本 Task 和既有 `SessionDetail/MessageComposer/QuestionCardApp/QuestionCardCli` 测试**，验证 CLI 无回归、APP 不落旧补投；中英文文案齐备。`pnpm check` 与 `pnpm build:mobile` PASS。
+- [x] **Step 5：提交** `feat: render native codex desktop control on mobile`。
 
 ## Task 10：双平台 E2E、恢复/兜底回归与验收交接
 
@@ -411,6 +411,19 @@ Registry 另产出 `validity(&self,lease:&OwnerLease)->tokio::sync::watch::Recei
 已进行 writing-plans 五项自审：覆盖表无缺项；每个编码任务均有失败测试→实现→验证→提交；公共类型集中定义；五项 Review Focus 已分配测试；没有把方法实现体抄成计划。Task 0 是可单独验收的依赖集成，Task 1–10 为同一原生控制纵向能力，不拆成互不相干的产品子项目。后续独立子代理另做 spec/完整性审查，意见处理记录追加于本文件末尾。
 
 ### 2026-10-16 Task 0 执行追记（集成适配记录）
+
+### 2026-10-16 Task 1-9 执行追记
+
+- T1-T6 由主控直接实现（ae08618→28a26e9 六提交）；T7/T9/T8 由三个并行子代理实现
+  （77077b5 / 7bb2cb8 / 3be5560），主控逐项核对报告与门禁。
+- 偏差裁决（均已核对采纳）：T7 加 ActionContext.kind / set_compat_evidence /
+  reconcile seam / DesktopDispatch 缝；T9 fetchCodex* 返回 null on 403、actionId 用
+  useRef 防双击双 ID；T8 加 busy_snapshot、hub 静态可用性判定（保守关）、
+  CompatEvidence.turn_completed 恒 false（完成核对权威在 reconcile 只读链）。
+- TDD 偏差如实申报：Task 1 的实现与测试同稿完成（红灯证据缺失，以 9 例非空跑代替）；
+  Task 2 起恢复 todo!() 红灯先行；三个子代理均按 TDD 执行并有失败证据。
+- 计划勾选曾因并行子代理的 stash 对照操作丢失一次，本批重新勾选（内容无变化）。
+
 
 - merge `289b20d` + `origin/main@d3fef5f` → 冲突仅 `tests/mobile/SessionDetail.test.tsx`（与 merge-tree 预演一致：#117 新增 /session-queue、/session-mode 路由桩 vs main 纯 prettier 重排，保留 #117 侧）。merge commit `a777c5a`。
 - 错误码迁移：#117 新增裸串 222 处全量上码（inject/headless 13 文件 196 处 + remote/api.rs 24 处 + 顺带迁移基线串），共引入 176+28 个新码，locale zh/en 各 +204 键；remote/api.rs 棘轮 61→29 ≤ 35。2 条 api.rs 串按 errcode.rs「原文锚定族」规则保持裸串（QuestionCardApp 前端逐字镜像 + 补投协议载荷）。

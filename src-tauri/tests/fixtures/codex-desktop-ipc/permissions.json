@@ -1,0 +1,27 @@
+{
+  "_source": "OBSERVED（Mac 探针 POC-5：integer request id、无 availableDecisions 字段、permissions 结构实测；占位值替换）",
+  "id": 12,
+  "method": "item/permissions/requestApproval",
+  "params": {
+    "threadId": "00000000-0000-4000-8000-0000000000m1",
+    "turnId": "00000000-0000-4000-8000-0000000000tu1",
+    "itemId": "00000000-0000-4000-8000-0000000000it1",
+    "environmentId": "00000000-0000-4000-8000-0000000000en1",
+    "startedAtMs": 1760000000000,
+    "cwd": "/tmp/mac-ipc-probe",
+    "reason": "合成：写入探测目录",
+    "permissions": {
+      "network": null,
+      "fileSystem": {
+        "read": null,
+        "write": ["/tmp/mac-ipc-probe"],
+        "entries": [{ "type": "write", "path": "/tmp/mac-ipc-probe" }]
+      }
+    }
+  },
+  "_notes": [
+    "无 availableDecisions（Mac bundle 0 命中）；决策集合是客户端固定联合，绝不从载荷推导。",
+    "批准 = 回显当前 pending 的原 permissions 对象 + scope:\"turn\"；拒绝 = permissions:{} + scope:\"turn\"。",
+    "决定面：thread-follower-permissions-request-approval-response v1。"
+  ]
+}

@@ -3,6 +3,7 @@ pub mod approval_wait;
 pub mod archive;
 pub mod base_snapshot;
 pub mod board_hidden;
+pub mod codex_actions;
 pub mod extension;
 pub mod heartbeat_seen;
 pub mod inject_queue;

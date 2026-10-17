@@ -610,6 +610,11 @@ pub struct RemoteState {
     /// 空表 = 一切工具 supported:false（测试缺省）
     pub subagent_message_source:
         std::collections::HashMap<&'static str, Box<SubagentMessageSourceFn>>,
+    /// **Codex Desktop IPC 控制面字段束**（计划 Task 8）：router（持久动作账本 + FIFO
+    /// + 安全路由）+ DesktopIpcAdapter（投影/写入）+ 事件与生命周期。测试 fixture 一律
+    ///   [`CodexControlHub::disabled_arc`]（一切能力关闭、恒 CompatOnly/拒绝、不装配
+    ///   调度循环）；生产 = `remote/mod.rs` STATE 的 [`CodexControlHub::production`]。
+    pub codex_control: std::sync::Arc<super::codex_ipc::CodexControlHub>,
 }
 
 /// API 子路由：业务端点 + /pair/pin + 内层 fallback（未知 API 路径直接 403）+ gate 内层 layer。
@@ -699,6 +704,21 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // （POST）+ 纯屏读重同步（GET，零注入）
         .route("/session-mode/menu", post(api::session_mode_menu))
         .route("/session-mode/menu", get(api::session_mode_menu_read))
+        // Codex Desktop IPC 远程控制（计划 Task 8）：原生投影 / SSE / 动作查询 / 队列
+        // 查看撤回 / 原生审批与阻塞问答应答。**全部走既有 gated nest**——PIN 门禁内层
+        // gate 结构性覆盖，新端点不需要各自鉴权代码；所有响应 no-store。
+        .route("/codex/thread", get(super::codex_ipc::thread_state))
+        .route("/codex/thread/events", get(super::codex_ipc::thread_events))
+        .route("/codex/action", get(super::codex_ipc::action_status))
+        .route("/codex/queue", get(super::codex_ipc::queue_view))
+        .route(
+            "/codex/queue/retract",
+            post(super::codex_ipc::queue_retract),
+        )
+        .route(
+            "/codex/pending-response",
+            post(super::codex_ipc::pending_response),
+        )
         // 2026-09-20：移动端附件上传（落盘会话工作目录 .tuvis-attachments/<会话>/，
         // 路径随消息内联标记注入；PIN 门禁内层 gate 结构性覆盖；20MB 显式上限——
         // axum 默认 2MB；超限时 handler 先按 Content-Length 预检给结构化 413）
@@ -787,6 +807,11 @@ pub async fn serve(bind: &str, port: u16, state: Arc<RemoteState>) -> Result<(),
     // 会话回到可输入态时逐条投递该会话的待发队列；与 session-send 直发共用
     // in-flight 守卫（同会话并发双投防护）
     crate::inject::queue::spawn_flush_loop(state.clone());
+    // Codex Desktop IPC（计划 Task 8）：remote 开启 → 装配 hub 调度循环（fence 只读
+    // 核对 + 接力 flush + 兜底 bridge 消费）。幂等；热重启（stop→start）不重放未派发
+    // 项——接力只由 idle 投影/落账事件两类边沿触发。已派发任务（IPC 在途 RPC / detached
+    // 兜底回合）留至落账或 unknown，不随监听停止而取消。
+    state.codex_control.start(state.clone());
     // M5 A3：来源 IP 记录——into_make_service_with_connect_info 注入 ConnectInfo
     // extension。**消费方只有 pair_pin**（限速分桶键 + 落库来源），且**不参与放行判定**
     // （不变量 G1：来源地址/请求头/进程归属不得影响鉴权；原 gate 本机豁免已整块删除，
@@ -905,6 +930,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -1552,6 +1578,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         // 预置有效设备，令 gate 放行（否则不会走到 session_source，测试失去意义）
         let now = chrono::Utc::now().timestamp_millis();
@@ -1949,6 +1976,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         let app = router(state.clone());
         let now = chrono::Utc::now().timestamp_millis();
@@ -2091,6 +2119,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         let app = router(state.clone());
         let now = chrono::Utc::now().timestamp_millis();
@@ -2292,6 +2321,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         let app = router(state.clone());
         persist_device(&state, "fe");
@@ -2581,6 +2611,7 @@ mod tests {
             }),
             // C7：配对计数缝缺省空表（本用例不触配对打标）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         let app = router(state.clone());
         persist_device(&state, "fe");
@@ -2764,6 +2795,7 @@ mod tests {
                 home_source: Box::new(|| None),
                 // C7：配对计数缝缺省空表（A3 用例不触配对打标）
                 pairing_counter: Box::new(Vec::new),
+                codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             }),
             t,
         )
@@ -4044,6 +4076,7 @@ mod tests {
                     home_source: Box::new(|| None),
                     // C7：配对计数缝缺省空表（限速用例不触配对打标）
                     pairing_counter: Box::new(Vec::new),
+                    codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
                 }),
                 t,
             )
@@ -4255,6 +4288,16 @@ mod tests {
     /// inject_state 变体：confirm_probe 可注入（D7/T3 直发未确认端点测试用——
     /// probe 恒 false + Windows 屏读假 pid 无滞留草稿 → Submitted 中性回执）。
     ///
+    /// dsh/ACP 夹具 cwd 的平台绝对形态（#117 夹具写死 `E:/t2`，非 Windows 被 cwd 门拒
+    /// ——本机/CI 恒红的平台债，platform-aware 化；与 `dsh_new_session_delivery` 先例同口径）
+    fn fixture_cwd() -> &'static str {
+        if cfg!(windows) {
+            "E:/t2"
+        } else {
+            "/tmp/t2"
+        }
+    }
+
     /// Task 6 专用夹具会话（sess_a Waiting / sess_b Processing / sess_c workbuddy
     /// 黑盒 / sess_d zcode headless / sess_e Waiting 供失败回执测试与直发测试错开会话 /
     /// sess_f Processing 备用 / sess_i Waiting 独占——busy 直发测试专用 / sess_t3
@@ -4377,6 +4420,13 @@ mod tests {
                 crate::session::SessionStatus::Waiting,
             ),
         ];
+        // R8（2026-10-17 审计）：普通消息一律经 router——disabled hub 的动作账本/设备
+        // 复核必须与 state.store 同库（否则兜底臂在设备复核处被内存空表拦死）。
+        let hub_store = crate::remote::pairing::DeviceStore::memory();
+        let hub_store_arc = match &hub_store {
+            crate::remote::pairing::DeviceStore::Owned(a) => a.clone(),
+            crate::remote::pairing::DeviceStore::Global => unreachable!("memory store"),
+        };
         Arc::new(RemoteState {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
@@ -4388,7 +4438,7 @@ mod tests {
                 total_count: sessions.len(),
                 waiting_count: 0,
             }),
-            store: crate::remote::pairing::DeviceStore::memory(),
+            store: hub_store,
             injector,
             // R5 一键 resume spawn 缝（Task 11）：本夹具不触 session-open，注 no-op 桩
             resume_spawner: std::sync::Arc::new(|_: &crate::inject::resume::SpawnSpec| Ok(())),
@@ -4423,6 +4473,11 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: std::sync::Arc::new(
+                crate::remote::codex_ipc::CodexControlHub::disabled_with_store(
+                    crate::remote::pairing::DeviceStore::Owned(hub_store_arc),
+                ),
+            ),
         })
     }
 
@@ -4692,6 +4747,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -5605,19 +5661,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 200);
-        assert!(body_string(r).await.contains("\"status\":\"delivered\""));
+        // 平台语义（inject L14 注释）：Windows 有排空/屏读确认面 → delivered；
+        // macOS/Linux 无确认面 → 恒中性 submitted（不冒充 delivered）
+        let jump_body = body_string(r).await;
+        if cfg!(windows) {
+            assert!(
+                jump_body.contains("\"status\":\"delivered\""),
+                "{jump_body}"
+            );
+        } else {
+            assert!(
+                jump_body.contains("\"status\":\"submitted\""),
+                "{jump_body}"
+            );
+        }
         // 注入器收到的是插队目标（第二条）的 compose 产物
         assert_eq!(
             fake.recorded(),
             vec![(12u32, "第二条".to_string())],
             "插队必须照发目标条目（运行中 TUI 把消息放进自身输入缓冲）"
         );
-        // 审计 action=jump（settle 落账写入；此刻 retract 尚未发生，最新一条即 jump）
+        // 审计 action=jump（settle 落账写入；此刻 retract 尚未发生，最新一条即 jump）；
+        // result 按平台回执语义（同上：非 Windows 恒 submitted）
         let audits = state
             .store
             .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
         assert_eq!(audits[0].action, "jump");
-        assert_eq!(audits[0].result, "ok");
+        if cfg!(windows) {
+            assert_eq!(audits[0].result, "ok");
+        } else {
+            // macOS 实测词：unconfirmed（确认面缺席的跳队审计词）
+            assert_eq!(audits[0].result, "unconfirmed");
+        }
 
         // retract 第一条 → ok:true
         let payload = serde_json::json!({ "sessionId": "sess_b", "itemId": id1 }).to_string();
@@ -7403,8 +7478,15 @@ mod tests {
             "未确认时不得承诺可见性（什么都没落到工作区）：{v}"
         );
 
-        // ③ 敏感目录（同源文件预览黑名单；home 读不到 → fail-closed 全段匹配）
-        let r = post(r#"{"project":"C:/Users/me/.ssh/proj"}"#.to_string()).await;
+        // ③ 敏感目录（同源文件预览黑名单；home 读不到 → fail-closed 全段匹配）。
+        // 输入必须是**当前平台的绝对路径**（Windows 盘符路径在 unix 相对 → 会被
+        // 前置的绝对路径门拦下，黑名单分支不可达——平台化夹具）
+        let sensitive = if cfg!(windows) {
+            "C:/Users/me/.ssh/proj"
+        } else {
+            "/Users/me/.ssh/proj"
+        };
+        let r = post(format!(r#"{{"project":"{sensitive}"}}"#)).await;
         let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
         assert_eq!(v["receipt"]["stage"], "refused", "{v}");
         assert!(
@@ -7667,10 +7749,12 @@ mod tests {
         s
     }
 
-    /// H8 分派链（开关开启 → 真分派臂，**不再是 `headless_pending`**）：
+    /// H8 分派链（R8 起 codex APP 普通消息**经统一 router**：登记→reserve→A 路
+    /// NotSent→handoff→兜底真分派，**不再是 `headless_pending`**）：
     /// ① HTTP 200 + `headless` 封套 + 通道 = 兜底 `headless_codex_exec`（测试构建 APP 判不在场）；
     /// ② CLI 不可达 = 如实的 `spawn` 失败（**不冒充成功、不落终端注入臂、不入队**）；
-    /// ③ 落 `headless` 审计行（通道列 = 实际走向）+ 拒绝后串行锁已注销；
+    /// ③ 动作账本行（reserved/handoff/终态）+ `headless` 审计行（通道列 = 实际走向）
+    ///    + 拒绝后串行锁已注销；
     /// ④ `session-send-info` 对同会话报 `injectable:true` + 路由表候选（queue 首选）——
     ///    输入区可用与实发口径同源，不再置灰。
     #[tokio::test]
@@ -7715,7 +7799,7 @@ mod tests {
                 "/m/api/v1/session-send",
                 Some("mam_device=mm"),
                 Some(&format!(
-                    r#"{{"sessionId":"{CODEX_THREAD_UUID}","text":"hi [mobile]"}}"#
+                    r#"{{"sessionId":"{CODEX_THREAD_UUID}","text":"hi [mobile]","actionId":"act-h8-1"}}"#
                 )),
             ))
             .await
@@ -7723,6 +7807,10 @@ mod tests {
         assert_eq!(r.status(), 200, "无头分派：HTTP 200 + 语义在 body");
         let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
         assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(
+            v["actionId"], "act-h8-1",
+            "兜底封套附 actionId（R8 统一 router 回执）"
+        );
         assert_eq!(
             v["channel"], "headless_codex_exec",
             "测试构建 APP 判不在场 ⇒ 兜底计划 exec resume：{v}"
@@ -7745,17 +7833,37 @@ mod tests {
             0,
             "无头路由会话零终端注入（不落终端注入臂）"
         );
+        // 动作账本行（R8 统一 router）+ 既有 W5 headless 行并存
         let audits = state
             .store
             .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
-        assert_eq!(audits.len(), 1, "无头回合必须落既有 W5 单账本：{audits:?}");
-        assert_eq!(audits[0].action, "headless");
         assert_eq!(
-            audits[0].channel, "headless_codex_exec",
+            audits.len(),
+            5,
+            "reserved + handoff + headless + 兜底终态 + handed_off 五行：{audits:?}"
+        );
+        let headless_row = audits
+            .iter()
+            .find(|a| a.action == "headless")
+            .expect("headless 行在场");
+        assert_eq!(
+            headless_row.channel, "headless_codex_exec",
             "通道列 = 实际走向"
         );
-        assert_eq!(audits[0].session_id, CODEX_THREAD_UUID);
-        assert_eq!(audits[0].result, "failed(spawn) · 0ms");
+        assert_eq!(headless_row.session_id, CODEX_THREAD_UUID);
+        assert_eq!(headless_row.result, "failed(spawn) · 0ms");
+        assert!(
+            audits.iter().any(|a| a.action == "codex_send"
+                && a.result == "reserved"
+                && a.summary.contains("act-h8-1")),
+            "router 登记的 reserved 起始行：{audits:?}"
+        );
+        assert!(
+            audits
+                .iter()
+                .any(|a| a.action == "codex_fallback" && a.result == "handoff"),
+            "NotSent 交接降级行：{audits:?}"
+        );
         assert!(
             !crate::inject::headless::codex::registry().in_flight(CODEX_THREAD_UUID),
             "拒绝臂必须注销串行锁（否则该会话被自己的锁永久挡死）"
@@ -7766,8 +7874,10 @@ mod tests {
         assert!(pending.is_empty(), "无头回合绝不入队（裁决 8）");
     }
 
-    /// thread id 解析不出（会话号不是 UUID 形态、rollout 路径在测试构建不可得）⇒ **投递前
-    /// 拒绝**（`refused`：零字节投递）——**绝不按会话名投递**（spec H8：只认 UUID）
+    /// thread id 解析不出（会话号不是 UUID 形态、rollout 路径在测试构建不可得）⇒ hub
+    /// 分支 404 `no_session`（R8：所有 codex APP 普通消息进统一 router——thread 无法
+    /// 靶向时如实拒绝，**绝不按会话名投递**（spec H8：只认 UUID），也不伪装成
+    /// headless 回执）
     #[tokio::test]
     async fn codex_app_send_without_uuid_thread_id_is_refused() {
         let fake = FakeInjector::ok();
@@ -7779,23 +7889,13 @@ mod tests {
                 "POST",
                 "/m/api/v1/session-send",
                 Some("mam_device=mm"),
-                Some(r#"{"sessionId":"sess_h8_named","text":"hi"}"#),
+                Some(r#"{"sessionId":"sess_h8_named","text":"hi","actionId":"act-h8-named"}"#),
             ))
             .await
             .unwrap();
-        assert_eq!(r.status(), 200);
+        assert_eq!(r.status(), 404);
         let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
-        assert_eq!(v["status"], "headless", "{v}");
-        assert_eq!(
-            v["receipt"]["stage"], "refused",
-            "投递前拒绝（未起跑、零字节投递）：{v}"
-        );
-        assert!(
-            v["receipt"]["reason"]
-                .as_str()
-                .is_some_and(|s| s.contains("thread UUID") && s.contains("不按会话名投递")),
-            "必须说清为何拒（会话名有重名歧义）：{v}"
-        );
+        assert_eq!(v["error"], "no_session", "{v}");
         assert_eq!(fake.recorded().len(), 0, "拒绝臂零终端注入");
         let pending = state.store.with(|c| {
             crate::database::dao::inject_queue::pending_for_session_conn(c, "sess_h8_named")
@@ -8073,6 +8173,11 @@ mod tests {
     ///
     /// 另钉住**顺序**：探针钩子装的是 `probe_pass = false`——拒绝发生在**版本探针之前**，
     /// 故回执必须是 `refused` 而不是版本门档（谁把顺序改成「先探针后拒绝」，本用例即红）。
+    ///
+    /// **2026-10-17 Windows 验证批修正**：Codex APP 普通消息在 R8 后**必须带 `actionId`**
+    /// （`api.rs` 的 `action_id_required`，缺失 400）——本用例是 R8 之前的旧用例，原先未带，
+    /// 在 Windows 上恒得 400（macOS 因 `cfg(windows)` 看不见，故一直未暴）。此处补上
+    /// `actionId`，判据面（cmd 垫片元字符拒绝）不变。
     #[cfg(windows)]
     #[tokio::test]
     async fn codex_cmd_shim_metachar_body_is_refused_before_probe_and_spawn() {
@@ -8093,7 +8198,7 @@ mod tests {
                 "/m/api/v1/session-send",
                 Some("mam_device=mm"),
                 Some(&format!(
-                    r#"{{"sessionId":"{SID}","text":"hi & whoami %PATH%"}}"#
+                    r#"{{"sessionId":"{SID}","text":"hi & whoami %PATH%","actionId":"act-cmdshim-refuse"}}"#
                 )),
             ))
             .await
@@ -8127,7 +8232,9 @@ mod tests {
                 "POST",
                 "/m/api/v1/session-send",
                 Some("mam_device=mm"),
-                Some(&format!(r#"{{"sessionId":"{SID}","text":"hi"}}"#)),
+                Some(&format!(
+                    r#"{{"sessionId":"{SID}","text":"hi","actionId":"act-cmdshim-control"}}"#
+                )),
             ))
             .await
             .unwrap();
@@ -8197,7 +8304,9 @@ mod tests {
         assert_eq!(fake.recorded().len(), 0, "拒绝臂零终端注入");
     }
 
-    /// **codex 臂**（`queue --message` / `exec resume` 都把载荷放 argv；本机常是 npm 垫片）
+    /// **codex 臂**（R8：codex APP 普通消息经统一 router——花名拒绝面在 router 的
+    /// compose 单点，回执 = desktop_ipc 明确拒收回执而非旧 headless 封套；kimi/opencode
+    /// 臂（CLI 会话）不走 hub，仍走旧封套）
     #[tokio::test]
     async fn codex_legacy_unsafe_device_name_is_refused_with_zero_delivery() {
         // 合法 UUID（过 dispatch 的 thread UUID 步）；独占字符串（守卫 id 立规②）
@@ -8210,13 +8319,40 @@ mod tests {
                 "POST",
                 "/m/api/v1/session-send",
                 Some("mam_device=legacy"),
-                Some(&format!(r#"{{"sessionId":"{SID}","text":"hi"}}"#)),
+                Some(&format!(
+                    r#"{{"sessionId":"{SID}","text":"hi","actionId":"act-r12-codex"}}"#
+                )),
             ))
             .await
             .unwrap();
         assert_eq!(r.status(), 200, "HTTP 200 + 语义在 body");
         let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
-        assert_unsafe_name_refused(&v, SID, '&', &state, &fake);
+        assert_eq!(v["status"], "desktop_ipc", "router 明确拒收回执：{v}");
+        assert_eq!(v["receipt"]["delivery"], "not_sent", "{v}");
+        let reason = v["receipt"]["reasonCode"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains('&'),
+            "拒绝原因必须**点名具体字符**（用户据此改名）: {v}"
+        );
+        assert!(
+            reason.contains("cmd") && reason.contains("未投递") && reason.contains("改名"),
+            "拒绝原因必须说清 cmd 重解析面 + 零字节投递 + 给出路（改名）: {v}"
+        );
+        // 账本如实落账（明确拒发 = rejected，零投递）
+        let state_str: String = state.store.with(|c| {
+            c.query_row(
+                "SELECT state FROM codex_actions WHERE action_id = 'act-r12-codex'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query ledger row")
+        });
+        assert_eq!(state_str, "rejected", "花名拒绝如实落账：{state_str}");
+        let pending = state
+            .store
+            .with(|c| crate::database::dao::inject_queue::pending_for_session_conn(c, SID));
+        assert!(pending.is_empty(), "拒绝臂不入队（零字节投递）");
+        assert_eq!(fake.recorded().len(), 0, "拒绝臂零终端注入");
     }
 
     /// **kimi 臂**（`kimi --prompt <载荷>`：签名进 argv）
@@ -9346,7 +9482,7 @@ mod tests {
             crate::session::SessionStatus::Idle,
         );
         s.form = crate::session::ProcessForm::App;
-        s.project_path = "E:/t2".to_string();
+        s.project_path = fixture_cwd().to_string();
         s
     }
 
@@ -9424,7 +9560,7 @@ mod tests {
                 "protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"image":false}}}})),
             frame(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{}})),
             frame(serde_json::json!({"jsonrpc":"2.0","id":3,"result":{
-                "sessions":[{"sessionId":DSH_SID,"cwd":"E:/t2"}]}})),
+                "sessions":[{"sessionId":DSH_SID,"cwd":fixture_cwd()}]}})),
             frame(serde_json::json!({"jsonrpc":"2.0","id":4,"result":{}})),
             frame(
                 serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
@@ -9696,7 +9832,7 @@ mod tests {
                 "protocolVersion":1,"agentCapabilities":{}}})),
             frame(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{}})),
             frame(serde_json::json!({"jsonrpc":"2.0","id":3,"result":{
-                "sessions":[{"sessionId":DSH_SID,"cwd":"E:/t2"}]}})),
+                "sessions":[{"sessionId":DSH_SID,"cwd":fixture_cwd()}]}})),
             frame(
                 serde_json::json!({"jsonrpc":"2.0","id":4,"error":{"code":-32603,
                 "message":"Internal error, data.details: \"session-9f14 is already owned by an active write handle\""}}),
@@ -10017,7 +10153,7 @@ mod tests {
                 "/m/api/v1/session-send",
                 Some("mam_device=mm"),
                 Some(&format!(
-                    r#"{{"sessionId":"{CODEX_THREAD_UUID_2}","text":"hi"}}"#
+                    r#"{{"sessionId":"{CODEX_THREAD_UUID_2}","text":"hi","actionId":"act-divert-1"}}"#
                 )),
             ))
             .await
@@ -10025,6 +10161,7 @@ mod tests {
         assert_eq!(r.status(), 200);
         let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
         assert_eq!(v["status"], "headless", "{v}");
+        assert_eq!(v["actionId"], "act-divert-1", "兜底封套附 actionId（R8）");
         assert_eq!(
             v["channel"], "headless_codex_queue",
             "改道后封套通道必须是**实际走向**（不是原计划 exec）：{v}"
@@ -10046,20 +10183,35 @@ mod tests {
             reason.contains("消费确认不可用"),
             "消费确认给不出时必须如实声明：{reason}"
         );
+        // 动作账本行（R8 统一 router：reserved/handoff/兜底终态/handed_off）+ 既有 headless 行
         let audits = state
             .store
             .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
-        assert_eq!(audits.len(), 1, "无头回合落一行账：{audits:?}");
         assert_eq!(
-            audits[0].channel, "headless_codex_queue",
+            audits.len(),
+            5,
+            "reserved + handoff + headless + 兜底终态 + handed_off 五行：{audits:?}"
+        );
+        let headless_row = audits
+            .iter()
+            .find(|a| a.action == "headless")
+            .expect("headless 行在场");
+        assert_eq!(
+            headless_row.channel, "headless_codex_queue",
             "审计通道列 = 实际走向（改道不得记成原计划）"
         );
         assert!(
-            audits[0].result.starts_with("queued"),
+            headless_row.result.starts_with("queued"),
             "终态 = 已入队未消费（queued · Nms）：{}",
-            audits[0].result
+            headless_row.result
         );
-        assert_eq!(audits[0].session_id, CODEX_THREAD_UUID_2);
+        assert_eq!(headless_row.session_id, CODEX_THREAD_UUID_2);
+        assert!(
+            audits.iter().any(|a| a.action == "codex_fallback"
+                && a.result == "handoff"
+                && a.summary.contains("act-divert-1")),
+            "NotSent 交接降级行：{audits:?}"
+        );
         assert_eq!(fake.recorded().len(), 0, "无头回合零终端注入");
         assert!(
             !crate::inject::headless::codex::registry().in_flight(CODEX_THREAD_UUID_2),
@@ -10587,6 +10739,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -11624,6 +11777,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         persist_named_device(&state, "mm", "测试设备");
         (state, inner, script)
@@ -14776,6 +14930,7 @@ mod tests {
             home_source: Box::new(move || home.as_ref().map(|p| p.to_string_lossy().to_string())),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -15904,6 +16059,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -16187,6 +16343,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         persist_named_device(&state2, "mm", "测试设备");
         let app = router(state2.clone());
@@ -16671,6 +16828,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         (state, sid_out)
     }
@@ -16727,6 +16885,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         (state, sid_out)
     }
@@ -16813,6 +16972,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         (state, sid_out)
     }
@@ -18131,6 +18291,7 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
@@ -19099,6 +19260,7 @@ mod tests {
             rate_bucket_channels_source: Box::new(Vec::new),
             home_source: Box::new(|| None),
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -19261,6 +19423,7 @@ mod tests {
             rate_bucket_channels_source: Box::new(Vec::new),
             home_source: Box::new(|| None),
             pairing_counter: Box::new(Vec::new),
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -20789,10 +20952,9 @@ mod tests {
         crate::inject::headless::codex_app::test_hooks::clear();
     }
 
-    /// 审计如实（Task 3 原版随 6a/6b 翻转改写）：switch（协议臂 ok）/ menu（无菜单通道拒）
-    /// 两行 channel=`codex_appserver`；question 行经 6b 补投臂入 H8 queue 通道
-    /// （channel=`headless_codex_queue`、result=queued——实际走向如实）——三行 action
-    /// 沿用既有词（mode/mode/answer）。补投需 codex CLI 执行缝 → 双钩子串行。
+    /// 审计如实（R8 起：question 行 = **无条件阻断**的拒绝审计 refused:native_only；
+    /// switch（协议臂 ok）/ menu（无菜单通道拒）两行 channel=`codex_appserver` 沿用）
+    /// ——三行 action 沿用既有词（mode/mode/answer）。
     #[tokio::test]
     async fn codex_app_rejections_are_audited() {
         let _hooks = crate::inject::headless::codex_app::test_hooks::LOCK
@@ -20829,16 +20991,6 @@ mod tests {
             vec![app_switch_script()],
             Some("never".to_string()),
         );
-        // 补投腿的 CLI 执行缝脚本：exec 被单写者锁拒（测试构建 APP 判不在场）→ 改道
-        // queue 入队成功——审计通道列按**实际走向**记 headless_codex_queue
-        crate::inject::headless::codex::test_hooks::set(
-            Some("C:/fake/codex.cmd"),
-            true,
-            vec![
-                codex_obs(1, &[], "Error: -32600 already has an active writer"),
-                codex_obs(0, &["Queued message m-6b-audit"], ""),
-            ],
-        );
         let _clear = CodexHookClear; // panic 也清钩子
         let app = router(state.clone());
         let posts = [
@@ -20852,10 +21004,11 @@ mod tests {
                 r#"{"sessionId":"01a61002-0000-4000-8000-000000000002","action":"open"}"#,
                 409,
             ),
+            // R8：Codex APP 旧问答补投无条件阻断（H3 开也不放行）
             (
                 "/m/api/v1/session-question/answer",
                 r#"{"sessionId":"01a61003-0000-4000-8000-000000000003","action":"select","index":0}"#,
-                200,
+                503,
             ),
         ];
         for (uri, payload, expect) in posts {
@@ -20874,7 +21027,7 @@ mod tests {
         assert_eq!(audits[2].action, "mode", "切档审计 action 沿用既有词");
         assert_eq!(audits[1].action, "mode", "菜单审计 action 沿用既有词");
         assert_eq!(audits[0].action, "answer", "问答审计 action 沿用既有词");
-        // 模式两行 = 协议臂词；question 行 = 6b 补投臂（H8 queue 实际走向）
+        // 模式两行 = 协议臂词；question 行 = R8 无条件阻断的拒绝审计
         assert_eq!(audits[2].channel, "codex_appserver");
         assert!(audits[2].result.starts_with("ok"), "{}", audits[2].result);
         assert_eq!(audits[1].channel, "codex_appserver");
@@ -20883,13 +21036,9 @@ mod tests {
             "{}",
             audits[1].result
         );
-        assert_eq!(
-            audits[0].channel, "headless_codex_queue",
-            "补投行通道 = 实际走向（H8 queue）"
-        );
         assert!(
-            audits[0].result.starts_with("queued"),
-            "补投终态 = 已入队未消费：{}",
+            audits[0].result.starts_with("refused:native_only"),
+            "补投行 = R8 无条件阻断（native_only）：{}",
             audits[0].result
         );
         for a in &audits {
@@ -20967,25 +21116,24 @@ mod tests {
         assert_eq!(r.status(), 200, "GET /session-question 读侧正常");
         let body = body_string(r).await;
         assert!(!body.contains("app_form_pending"), "{body}");
-        assert!(
-            body.contains("\"available\":true"),
-            "问答载荷照常下发（读侧完整链路不受门）：{body}"
-        );
+        // R8（2026-10-17 审计）：Codex APP 的问答 GET 广告**无条件** native_only——
+        // 不再把陈旧 rollout 问题广告为可补投（补投已无条件阻断，广告与投递同口径）
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["answerable"], serde_json::json!(false), "{v}");
+        assert_eq!(v["questions"], serde_json::json!([]), "{v}");
+        assert_eq!(v["reasonCode"], "native_only", "{v}");
     }
 
     // ============================================================
     // Task 6b：问答补投臂 + 中止 interrupt 臂（四分叉） + H3 同门
     // ============================================================
 
-    /// ① 问答补投（裁决 28b）：有作答文本的动作经 H8 queue 通道补投——模板三型
-    /// （单选「选择第 N 项：<文本>」/ 多选逐项「勾选第 N 项：<文本>」/ 自由作答原文）
-    /// 逐字进补投正文；回执 = headless 封套（channel=实际走向）+ **显式 `screen:null`**
-    /// （与 6a GET 臂 surface/degraded 同族的 null 语义——补投不产屏读快照，前端不得
-    /// 显示已翻转）+ 引导文案「已补投为消息，请回 APP 核对题面」——**永不声称已作答**。
-    /// 测试构建 APP 判不在场 ⇒ exec 起手被单写者锁拒 → 改道 queue 入队（与改道用例
-    /// 同款两段脚本）；三个动作各消耗一对脚本。
+    /// ①（R8 改写）问答补投**无条件阻断**：Codex APP 的 session-question/answer
+    /// 一律 503 `capability_unavailable`（stale/无 owner/未知 build 同拒；H3 开也
+    /// 不放行）——模板三型不再组装补投正文，零 CLI 执行、零 queue/exec 投递、
+    /// 零终端键序；每动作各落一行 `refused:native_only` 拒绝审计。
     #[tokio::test]
-    async fn question_answer_app_routes_to_queue_repost_with_null_screen() {
+    async fn question_answer_app_repost_unconditionally_blocked() {
         let _serial = crate::inject::headless::codex::test_hooks::LOCK
             .lock()
             .await;
@@ -21009,34 +21157,20 @@ mod tests {
             crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
         });
         persist_named_device(&state, "mm", "测试设备");
-        // 三动作 × 两段脚本（exec 锁拒 → queue 入队）
-        let mut scripts = Vec::new();
-        for i in 0..3 {
-            scripts.push(codex_obs(
-                1,
-                &[],
-                "Error: -32600 already has an active writer",
-            ));
-            scripts.push(codex_obs(0, &[&format!("Queued message m-6b-{i}")], ""));
-        }
-        crate::inject::headless::codex::test_hooks::set(Some("C:/fake/codex.cmd"), true, scripts);
+        // 若阻断失效退回补投，这些脚本会被消耗——断言其未被触达
+        crate::inject::headless::codex::test_hooks::set(
+            Some("C:/fake/codex.cmd"),
+            true,
+            vec![codex_obs(0, &["Queued message m-must-not-run"], "")],
+        );
         let _clear = CodexHookClear;
         let app = router(state.clone());
         let posts = [
-            (
-                r#"{"sessionId":"01a62001-0000-4000-8000-000000000001","action":"select","index":0}"#,
-                "选择第 1 项：Tool demo",
-            ),
-            (
-                r#"{"sessionId":"01a62001-0000-4000-8000-000000000001","action":"toggle","index":1}"#,
-                "勾选第 2 项：Start a task",
-            ),
-            (
-                r#"{"sessionId":"01a62001-0000-4000-8000-000000000001","action":"freeText","text":"我的自由作答"}"#,
-                "我的自由作答",
-            ),
+            r#"{"sessionId":"01a62001-0000-4000-8000-000000000001","action":"select","index":0}"#,
+            r#"{"sessionId":"01a62001-0000-4000-8000-000000000001","action":"toggle","index":1}"#,
+            r#"{"sessionId":"01a62001-0000-4000-8000-000000000001","action":"freeText","text":"我的自由作答"}"#,
         ];
-        for (payload, template) in posts {
+        for payload in posts {
             let r = app
                 .clone()
                 .oneshot(req(
@@ -21047,35 +21181,21 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            assert_eq!(r.status(), 200, "补投臂回执（{template}）：{payload}");
+            assert_eq!(r.status(), 503, "无条件阻断（{payload}）");
             let body = body_string(r).await;
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["error"], "capability_unavailable", "{v}");
+            assert_eq!(v["reasonCode"], "native_only", "{v}");
             assert!(
-                body.contains("\"screen\":null"),
-                "screen 显式 null（不产快照、不显示已翻转——{template}）：{body}"
-            );
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&body).unwrap()["channel"],
-                "headless_codex_queue",
-                "封套通道 = 实际走向（{template}）：{body}"
-            );
-            assert!(
-                body.contains("\"status\":\"queued\""),
-                "补投终态 = 已入队未消费（{template}）：{body}"
-            );
-            assert!(
-                body.contains("已补投为消息，请回 APP 核对题面"),
-                "引导文案在场（{template}）：{body}"
-            );
-            assert!(
-                !body.contains("key_sent"),
-                "永不声称已作答（{template}）：{body}"
+                !body.contains("已补投为消息"),
+                "补投引导文案不得出现（{payload}）：{body}"
             );
         }
-        // 模板三型逐字进补投正文（审计摘要与回合正文同源）
+        // 三动作各落一行拒绝审计（模板正文进摘要可对账）
         let audits = state
             .store
             .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
-        assert_eq!(audits.len(), 3, "三动作各落一行账：{audits:?}");
+        assert_eq!(audits.len(), 3, "三动作各落一行拒绝账：{audits:?}");
         // recent_conn 最新在前：投递序 select → toggle → freeText
         for (row, template) in [
             (0, "我的自由作答"),
@@ -21084,23 +21204,25 @@ mod tests {
         ] {
             assert!(
                 audits[row].summary.contains(template),
-                "模板逐字进补投正文（row={row}）：{}",
+                "模板逐字进审计摘要（row={row}）：{}",
                 audits[row].summary
+            );
+            assert!(
+                audits[row].result.starts_with("refused:native_only"),
+                "拒绝审计（row={row}）：{}",
+                audits[row].result
             );
         }
         assert!(
             fake.recorded().is_empty() && fake.recorded_keys().is_empty(),
-            "补投零终端键序（APP 无控制台，键序是错误通道）"
+            "零终端键序（APP 无控制台，键序是错误通道）"
         );
     }
 
-    /// ② 补投审计词（6b 口径定案）：action=`answer`（沿用既有问答词——计划书 §6b 写
-    /// question 系笔误）+ channel=`headless_codex_queue`（实际走向）。
+    /// ② 补投拒绝审计词（R8 口径）：action=`answer`（沿用既有问答词）+
+    /// result=`refused:native_only`（无条件阻断的拒绝审计）。
     #[tokio::test]
     async fn question_answer_audit_word_is_headless_codex_queue() {
-        let _serial = crate::inject::headless::codex::test_hooks::LOCK
-            .lock()
-            .await;
         let state = codex_form_state(
             FakeInjector::ok(),
             crate::session::ProcessForm::App,
@@ -21120,15 +21242,6 @@ mod tests {
             crate::database::dao::settings::set_setting_conn(c, "remote.headless_enabled", "true")
         });
         persist_named_device(&state, "mm", "测试设备");
-        crate::inject::headless::codex::test_hooks::set(
-            Some("C:/fake/codex.cmd"),
-            true,
-            vec![
-                codex_obs(1, &[], "Error: -32600 already has an active writer"),
-                codex_obs(0, &["Queued message m-6b-word"], ""),
-            ],
-        );
-        let _clear = CodexHookClear;
         let app = router(state.clone());
         let r = app
             .oneshot(req(
@@ -21139,21 +21252,23 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(r.status(), 200, "{}", body_string(r).await);
+        assert_eq!(r.status(), 503, "{}", body_string(r).await);
         let audits = state
             .store
             .with(|c| crate::database::dao::write_audit::recent_conn(c, 5));
-        assert_eq!(audits.len(), 1, "补投落一行账：{audits:?}");
+        assert_eq!(audits.len(), 1, "拒绝面落一行账：{audits:?}");
         assert_eq!(audits[0].action, "answer", "action 沿用既有问答词");
-        assert_eq!(
-            audits[0].channel, "headless_codex_queue",
-            "channel = 实际走向（H8 queue）"
+        assert!(
+            audits[0].result.starts_with("refused:native_only"),
+            "R8 无条件阻断的拒绝审计：{}",
+            audits[0].result
         );
         assert_eq!(audits[0].agent_type, "codex");
     }
 
-    /// ③ H3 同门（Task 6b 扩展）：开关关 → question/cancel 403 `headless_disabled`
-    /// （与 session_send 同码同文案）；CLI codex 问答**不受门**（现状不变——M24 回归面）。
+    /// ③ R8 修订：Codex APP 问答补投**无条件阻断**（503 `capability_unavailable`，
+    /// **先于 H3 门**——H3 关/开都拒）；APP 中止（cancel 写路径）仍受 H3 门 403；
+    /// CLI codex 问答**不受门**（现状不变——M24 回归面）。
     #[tokio::test]
     async fn h3_gate_blocks_question_and_cancel() {
         let fake = FakeInjector::ok();
@@ -21188,7 +21303,7 @@ mod tests {
         persist_named_device(&state, "mm", "测试设备");
         persist_named_device(&cli_state, "mm", "测试设备");
         let app = router(state);
-        // 关（缺省）→ APP 问答 403 同码同文案；零补投零键序
+        // R8：APP 问答无条件阻断（先于 H3 门，503 同族拒绝语义）；零补投零键序
         let r = app
             .clone()
             .oneshot(req(
@@ -21199,9 +21314,12 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(r.status(), 403);
+        assert_eq!(r.status(), 503);
         let body = body_string(r).await;
-        assert!(body.contains("\"error\":\"headless_disabled\""), "{body}");
+        assert!(
+            body.contains("\"error\":\"capability_unavailable\"") && body.contains("native_only"),
+            "{body}"
+        );
         // 关 → APP 中止 403（cancel 也是写路径）
         let r = app
             .clone()

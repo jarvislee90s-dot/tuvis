@@ -1025,6 +1025,7 @@ async fn e2e_http_full_chain() {
     let sessions = vec![session];
     let total = sessions.len();
     let state = Arc::new(RemoteState {
+        codex_control: multi_agents_manager_lib::remote::codex_ipc::CodexControlHub::disabled_arc(),
         ui_config_source: Box::new(|| None),
         subagent_source: std::collections::HashMap::new(),
         subagent_message_source: std::collections::HashMap::new(),

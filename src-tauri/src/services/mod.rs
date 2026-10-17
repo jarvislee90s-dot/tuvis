@@ -1,5 +1,7 @@
 // Services 统一入口 - 业务逻辑按功能域拆分到子目录
 
+pub mod codex_control;
+pub mod codex_desktop_ipc;
 pub mod manifest;
 pub mod mcp;
 pub mod pet;
