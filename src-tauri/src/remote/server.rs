@@ -4288,6 +4288,16 @@ mod tests {
     /// inject_state 变体：confirm_probe 可注入（D7/T3 直发未确认端点测试用——
     /// probe 恒 false + Windows 屏读假 pid 无滞留草稿 → Submitted 中性回执）。
     ///
+    /// dsh/ACP 夹具 cwd 的平台绝对形态（#117 夹具写死 `E:/t2`，非 Windows 被 cwd 门拒
+    /// ——本机/CI 恒红的平台债，platform-aware 化；与 `dsh_new_session_delivery` 先例同口径）
+    fn fixture_cwd() -> &'static str {
+        if cfg!(windows) {
+            "E:/t2"
+        } else {
+            "/tmp/t2"
+        }
+    }
+
     /// Task 6 专用夹具会话（sess_a Waiting / sess_b Processing / sess_c workbuddy
     /// 黑盒 / sess_d zcode headless / sess_e Waiting 供失败回执测试与直发测试错开会话 /
     /// sess_f Processing 备用 / sess_i Waiting 独占——busy 直发测试专用 / sess_t3
@@ -5640,19 +5650,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 200);
-        assert!(body_string(r).await.contains("\"status\":\"delivered\""));
+        // 平台语义（inject L14 注释）：Windows 有排空/屏读确认面 → delivered；
+        // macOS/Linux 无确认面 → 恒中性 submitted（不冒充 delivered）
+        let jump_body = body_string(r).await;
+        if cfg!(windows) {
+            assert!(
+                jump_body.contains("\"status\":\"delivered\""),
+                "{jump_body}"
+            );
+        } else {
+            assert!(
+                jump_body.contains("\"status\":\"submitted\""),
+                "{jump_body}"
+            );
+        }
         // 注入器收到的是插队目标（第二条）的 compose 产物
         assert_eq!(
             fake.recorded(),
             vec![(12u32, "第二条".to_string())],
             "插队必须照发目标条目（运行中 TUI 把消息放进自身输入缓冲）"
         );
-        // 审计 action=jump（settle 落账写入；此刻 retract 尚未发生，最新一条即 jump）
+        // 审计 action=jump（settle 落账写入；此刻 retract 尚未发生，最新一条即 jump）；
+        // result 按平台回执语义（同上：非 Windows 恒 submitted）
         let audits = state
             .store
             .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
         assert_eq!(audits[0].action, "jump");
-        assert_eq!(audits[0].result, "ok");
+        if cfg!(windows) {
+            assert_eq!(audits[0].result, "ok");
+        } else {
+            // macOS 实测词：unconfirmed（确认面缺席的跳队审计词）
+            assert_eq!(audits[0].result, "unconfirmed");
+        }
 
         // retract 第一条 → ok:true
         let payload = serde_json::json!({ "sessionId": "sess_b", "itemId": id1 }).to_string();
@@ -7438,8 +7467,15 @@ mod tests {
             "未确认时不得承诺可见性（什么都没落到工作区）：{v}"
         );
 
-        // ③ 敏感目录（同源文件预览黑名单；home 读不到 → fail-closed 全段匹配）
-        let r = post(r#"{"project":"C:/Users/me/.ssh/proj"}"#.to_string()).await;
+        // ③ 敏感目录（同源文件预览黑名单；home 读不到 → fail-closed 全段匹配）。
+        // 输入必须是**当前平台的绝对路径**（Windows 盘符路径在 unix 相对 → 会被
+        // 前置的绝对路径门拦下，黑名单分支不可达——平台化夹具）
+        let sensitive = if cfg!(windows) {
+            "C:/Users/me/.ssh/proj"
+        } else {
+            "/Users/me/.ssh/proj"
+        };
+        let r = post(format!(r#"{{"project":"{sensitive}"}}"#)).await;
         let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
         assert_eq!(v["receipt"]["stage"], "refused", "{v}");
         assert!(
@@ -9381,7 +9417,7 @@ mod tests {
             crate::session::SessionStatus::Idle,
         );
         s.form = crate::session::ProcessForm::App;
-        s.project_path = "E:/t2".to_string();
+        s.project_path = fixture_cwd().to_string();
         s
     }
 
@@ -9459,7 +9495,7 @@ mod tests {
                 "protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"image":false}}}})),
             frame(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{}})),
             frame(serde_json::json!({"jsonrpc":"2.0","id":3,"result":{
-                "sessions":[{"sessionId":DSH_SID,"cwd":"E:/t2"}]}})),
+                "sessions":[{"sessionId":DSH_SID,"cwd":fixture_cwd()}]}})),
             frame(serde_json::json!({"jsonrpc":"2.0","id":4,"result":{}})),
             frame(
                 serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
@@ -9731,7 +9767,7 @@ mod tests {
                 "protocolVersion":1,"agentCapabilities":{}}})),
             frame(serde_json::json!({"jsonrpc":"2.0","id":2,"result":{}})),
             frame(serde_json::json!({"jsonrpc":"2.0","id":3,"result":{
-                "sessions":[{"sessionId":DSH_SID,"cwd":"E:/t2"}]}})),
+                "sessions":[{"sessionId":DSH_SID,"cwd":fixture_cwd()}]}})),
             frame(
                 serde_json::json!({"jsonrpc":"2.0","id":4,"error":{"code":-32603,
                 "message":"Internal error, data.details: \"session-9f14 is already owned by an active write handle\""}}),

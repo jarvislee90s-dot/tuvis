@@ -891,9 +891,19 @@ mod tests {
     /// （从 cjs 路径反推 Resources 根——不设则 --prompt 静默无 JSON）
     #[test]
     fn probe_env_sets_electron_flag_and_mac_provider_config() {
+        // tempdir 夹具驱动（与下方 provider_config 用例同口径）：**不触真机安装路径**——
+        // 旧版写死 /Applications/ZCode.app，本机装有 ZCode 时「Windows 且不在场」的
+        // 前提被真机文件破坏，测试随环境漂移（平台债，2026-10-17 返工）
+        let dir = tempfile::tempdir().unwrap();
+        let app_root = dir.path().join("ZCode.app").join("Contents");
+        let cjs = app_root.join("Resources").join("glm").join("zcode.cjs");
         let spec = ProbeSpec::Zcode {
-            exe: "/Applications/ZCode.app/Contents/MacOS/ZCode".into(),
-            cjs: "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs".into(),
+            exe: app_root
+                .join("MacOS")
+                .join("ZCode")
+                .to_string_lossy()
+                .into_owned(),
+            cjs: cjs.to_string_lossy().into_owned(),
         };
         let win = probe_env(&spec, "windows");
         assert_eq!(
@@ -901,6 +911,7 @@ mod tests {
             vec![("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string())],
             "Windows 且推导路径不在场：只设 Electron 当 node 跑的开关（不指向不存在的文件）"
         );
+        // macOS：provider config 恒设（os=="macos" 短路；path 按 cjs 反推 Resources 根）
         let mac = probe_env(&spec, "macos");
         assert!(mac.contains(&("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string())));
         let (k, path) = mac
@@ -909,7 +920,8 @@ mod tests {
             .expect("macOS 必须设 provider config 环境变量");
         assert_eq!(k, "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE");
         // 期望值按平台分隔符构造（本函数是路径推导，不负责分隔符风格）
-        let expected = std::path::Path::new("/Applications/ZCode.app/Contents/Resources")
+        let expected = app_root
+            .join("Resources")
             .join("config")
             .join("provider")
             .join("zcode-builtin.json")
