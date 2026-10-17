@@ -135,6 +135,9 @@ struct AdapterInner {
     forward_alive: AtomicBool,
     /// 重连恢复循环单飞标志（R2.5）。
     recovering: AtomicBool,
+    /// 同 socket 恢复单飞标志（2026-10-17 复审 C2：owner 失效/连接重置后重跟随，
+    /// 连接本身不断——与连接级 `recovering` 互不影响，各管各的触发面）。
+    same_socket_recovering: AtomicBool,
     /// shutdown 信号（恢复循环/重拉循环的退出条件）。
     stopping: AtomicBool,
     epoch: AtomicU64,
@@ -163,6 +166,7 @@ impl DesktopIpcAdapter {
                 history_requested: Mutex::new(HashSet::new()),
                 forward_alive: AtomicBool::new(false),
                 recovering: AtomicBool::new(false),
+                same_socket_recovering: AtomicBool::new(false),
                 stopping: AtomicBool::new(false),
                 epoch: AtomicU64::new(0),
                 events: broadcast::channel(256).0,
@@ -814,6 +818,54 @@ fn spawn_recovery_task(adapter: DesktopIpcAdapter) {
     });
 }
 
+/// 2026-10-17 复审 C2：**同 socket 恢复**——owner 失效（client-status-changed
+/// disconnected）或 `ipc-connection-reset` 后，连接本身仍活着，连接级恢复循环
+///（由断线驱动）不会触发；若无人重新 discovery/follow，重新接管的 owner 帧因
+/// 无 lease 被丢、视图永久 stale（有 SSE 无待发时手机不会主动 GET）。本任务对
+/// 受影响 keys 重新走 follow_thread（discovery→bind→following→等 snapshot），
+/// 单飞 + 有界 3 次（间隔 500ms）；连接已断时直接退出（连接级恢复接管）。
+fn spawn_same_socket_recovery(adapter: DesktopIpcAdapter, keys: Vec<ThreadKey>) {
+    if keys.is_empty() || adapter.inner.stopping.load(Ordering::SeqCst) {
+        return;
+    }
+    if adapter
+        .inner
+        .same_socket_recovering
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            if adapter.inner.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            let Some(conn) = current_conn(&adapter).await else {
+                break; // 连接已断：连接级恢复循环接管
+            };
+            let mut all_ok = true;
+            for key in &keys {
+                if is_fresh(&adapter, key).await {
+                    continue; // 已被并发恢复救活
+                }
+                if adapter.follow_thread(&conn, key).await.is_err() {
+                    all_ok = false;
+                }
+            }
+            if all_ok {
+                break;
+            }
+        }
+        adapter
+            .inner
+            .same_socket_recovering
+            .store(false, Ordering::SeqCst);
+    });
+}
+
 /// R2.5 重连恢复循环：退避 1/2/4/8/16/30s（成功归零——本函数成功即返回）；
 /// 每轮 ensure_connection → 新连接的事件转发先行就位（swap 幂等防重复）→
 /// 对关注集中每个 thread 重新 discover→bind→declare→等 snapshot（复用
@@ -853,8 +905,13 @@ async fn handle_broadcast(adapter: &DesktopIpcAdapter, conn: &ConnectionHandle, 
     match frame.get("method").and_then(|m| m.as_str()) {
         Some("thread-stream-state-changed") => handle_state_changed(adapter, frame).await,
         Some("client-status-changed") => handle_client_status_changed(adapter, &frame).await,
-        // 连接级信号：全体 stale + 发布，等待重连（不主动重拉）
-        Some("ipc-connection-reset") => mark_all_mirrors_stale(adapter, false).await,
+        // 连接级信号：全体 stale + 发布，并**同 socket 重跟随**（C2：Desktop 侧要求
+        // 重置状态时连接未断——只 stale 不重跟随会让视图永久停在旧世界）
+        Some("ipc-connection-reset") => {
+            mark_all_mirrors_stale(adapter, false).await;
+            let keys = followed_keys(adapter).await;
+            spawn_same_socket_recovery(adapter.clone(), keys);
+        }
         Some("thread-stream-following-status-requested") => {
             handle_following_status(adapter, conn, &frame).await;
         }
@@ -1079,6 +1136,10 @@ async fn handle_client_status_changed(adapter: &DesktopIpcAdapter, frame: &Value
     for p in projections {
         let _ = adapter.inner.events.send(p);
     }
+    // 2026-10-17 复审 C2：owner 失效但 socket 仍活着——连接级恢复循环不会触发；
+    // 主动重新 discovery/follow 让新 owner 接管（重新接管的帧才能落进镜像），
+    // 不依赖手机下次 GET
+    spawn_same_socket_recovery(adapter.clone(), affected);
 }
 
 /// R2.3：owner 问「谁在跟随」——当前关注集包含该 conversation 才回

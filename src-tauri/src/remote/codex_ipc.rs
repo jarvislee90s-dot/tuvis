@@ -398,8 +398,31 @@ async fn scheduler_loop(hub: Arc<CodexControlHub>, st: Arc<RemoteState>) {
 /// revision 严格后于基线 → 清持久屏障与内存限制）；② fence 只读核对（有对应 Turn
 /// 完成证据才 clear——Task 7 reconcile 纪律：仅 idle/「已消费」都不算完成）；
 /// ③ 接力 flush（UseFallback → 兼容 bridge）。
+/// 2026-10-17 复审 C2：有待发工作的 Thread 投影源为空/stale（完整重启后无镜像、
+/// 同 socket 失效后视图过期）时**主动 ensure 重建**（connect→discovery→following→
+/// snapshot，有界 10s）——不能只读空镜像等用户打开详情；释放/接力/屏障核对都
+/// 依赖这份新鲜投影。
 async fn settle_thread(hub: &Arc<CodexControlHub>, st: &Arc<RemoteState>, key: &ThreadKey) {
-    let projection = hub.adapter.projection(key).await;
+    let mut projection = hub.adapter.projection(key).await;
+    if (projection.stale || projection.revision.is_none())
+        && hub
+            .router
+            .store()
+            .thread_has_pending_work(key)
+            .unwrap_or(false)
+    {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            hub.adapter.ensure_thread(key),
+        )
+        .await
+        {
+            Ok(Ok(p)) => projection = p,
+            // Desktop 不在/超时：保持 stale 投影照常结算（派发只会白试，闸照常）
+            _ => {}
+        }
+    }
+    let projection = projection;
     // ① R6.3：投影驱动的顺序限制释放（idle 边沿 / 周期对账都经此处，不只靠手工 flush）
     hub.router.release_turn_if_complete(key, &projection);
     // ② fence reconcile（只读，不改 Codex 数据文件；失败/证据不足保持 fence 在册）

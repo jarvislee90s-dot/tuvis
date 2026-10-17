@@ -2853,3 +2853,333 @@ async fn aborted_waiter_convergence_requires_bound_turn_terminal_evidence() {
     .await;
     f.state.codex_control.stop();
 }
+
+// ============================================================
+// 18. 2026-10-17 复审 C2：自动恢复两条生产断路——同 socket owner 失效/reset 的
+// 重跟随（不依赖 GET），以及持久屏障 Thread 完整重启后自动重建投影源。
+// ============================================================
+
+/// 构造一帧 state-changed snapshot（C2 测试用：实体表自定）。
+fn snapshot_frame(
+    thread: &str,
+    owner: &str,
+    revision: u64,
+    runtime: &str,
+    entities: serde_json::Value,
+    turn_ids: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": owner,
+        "params": {
+            "conversationId": thread, "hostId": "local",
+            "change": {
+                "type": "snapshot", "revision": revision,
+                "conversationState": {
+                    "turns": [], "requests": [],
+                    "threadRuntimeStatus": { "type": runtime },
+                    "turnHistory": { "isComplete": true, "history": {
+                        "entitiesByKey": entities,
+                        "islands": [{ "entries": turn_ids }]
+                    }}
+                }
+            }
+        }
+    })
+}
+
+/// C2.1：owner 失效（socket 仍活着）→ 必须**自动**重新 discovery/follow（无 GET、
+/// 无待发工作），新 owner 的 snapshot 落进镜像、视图自动复活——不再永久 stale。
+#[tokio::test]
+async fn owner_lost_on_live_socket_auto_refollows() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let key = f.thread_key();
+    // 先建立连接与跟随（本测试无 GET/POST 触发面）：并发 ensure + 协议驱动
+    {
+        let adapter = f.state.codex_control.adapter.clone();
+        let k2 = key.clone();
+        let ensure_task = tokio::spawn(async move { adapter.ensure_thread(&k2).await });
+        drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+        tokio::time::timeout(Duration::from_secs(5), ensure_task)
+            .await
+            .expect("initial follow in time")
+            .expect("initial follow ok");
+    }
+
+    // owner-1 失效广播（连接不断）
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 1,
+        "sourceClientId": "owner-1",
+        "params": { "clientId": "owner-1", "status": "disconnected" }
+    }))
+    .await;
+
+    // C2：自动重恢复——discovery 帧**不经任何 GET/ensure** 到来
+    let disc = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .expect("owner 失效后必须自动重发现（同 socket 恢复）");
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-2",
+    ))
+    .await;
+    let follow = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .expect("自动重声明 following");
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+
+    // 新 owner 的 snapshot：sourceClientId 与新 lease 一致 → 落进镜像
+    let entities = serde_json::json!({
+        "t8": { "id": "t8", "type": "turn", "status": "completed", "items": ["u8"] },
+        "u8": { "id": "u8", "type": "user_message", "text": "新 owner 世界", "ts": 8 }
+    });
+    peer.send(&snapshot_frame(
+        THREAD,
+        "owner-2",
+        8,
+        "idle",
+        entities,
+        serde_json::json!(["t8"]),
+    ))
+    .await;
+
+    // 视图自动复活（新鲜、rev 8、新 owner 世界）
+    let p = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let p = f.state.codex_control.adapter.projection(&key).await;
+            if !p.stale && p.revision == Some(8) {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("视图必须在无 GET 的情况下自动恢复新鲜（C2：不再永久 stale）");
+    assert_eq!(p.runtime_status, "idle");
+}
+
+/// C2.1：`ipc-connection-reset`（Desktop 要求重置状态，连接不断）→ 全体 stale 后
+/// 自动重跟随，重新拿到 snapshot——视图不停在旧世界。
+#[tokio::test]
+async fn ipc_connection_reset_auto_refollows() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let key = f.thread_key();
+    // 先建立连接与跟随（本测试无 GET/POST 触发面）：并发 ensure + 协议驱动
+    {
+        let adapter = f.state.codex_control.adapter.clone();
+        let k2 = key.clone();
+        let ensure_task = tokio::spawn(async move { adapter.ensure_thread(&k2).await });
+        drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+        tokio::time::timeout(Duration::from_secs(5), ensure_task)
+            .await
+            .expect("initial follow in time")
+            .expect("initial follow ok");
+    }
+
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "ipc-connection-reset", "version": 1,
+        "sourceClientId": "owner-1"
+    }))
+    .await;
+
+    let disc = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .expect("reset 后必须自动重发现（同 socket 恢复）");
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let follow = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .expect("自动重声明 following");
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+
+    let entities = serde_json::json!({
+        "t9": { "id": "t9", "type": "turn", "status": "completed", "items": ["u9"] },
+        "u9": { "id": "u9", "type": "user_message", "text": "重置后世界", "ts": 9 }
+    });
+    peer.send(&snapshot_frame(
+        THREAD,
+        "owner-1",
+        9,
+        "idle",
+        entities,
+        serde_json::json!(["t9"]),
+    ))
+    .await;
+
+    let p = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let p = f.state.codex_control.adapter.projection(&key).await;
+            if !p.stale && p.revision == Some(9) {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reset 后视图必须自动恢复新鲜");
+    assert_eq!(p.runtime_status, "idle");
+}
+
+/// C2.2：持久屏障 Thread 完整重启——丢弃全部内存重建 hub，**不打开详情、不手工
+/// flush**：settle 主动 ensure 重建投影源，绑定 Turn 终态证据到位后自动接力队首。
+#[tokio::test]
+async fn hub_restart_with_turn_barrier_recovers_without_details() {
+    let conn = shared_conn();
+    seed_device(&conn, "dev-1", "iPhone");
+    // —— 阶段一：accepted#1（屏障在册）→ active 排队 send#2 → 丢弃全部内存 ——
+    {
+        let (adapter, p1) = make_adapter_peer();
+        let mut f1 = fixture_on(
+            conn.clone(),
+            vec![codex_app_session(THREAD)],
+            move |store| Arc::new(CodexControlHub::with_adapter(store, adapter, true)),
+            Some(p1),
+        );
+        let mut peer1 = f1.peer.take().unwrap();
+        let app1 = f1.app.clone();
+        let task1 = tokio::spawn(async move {
+            app1.oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some(COOKIE),
+                Some(send_body("屏障前已发", Some("act-bar-1"), false)),
+            ))
+            .await
+            .unwrap()
+        });
+        drive_ensure(&mut peer1, THREAD, vec![], "idle").await;
+        let frame = peer1.recv().await;
+        assert_eq!(frame["method"], "thread-follower-start-turn");
+        peer1
+            .send(&serde_json::json!({
+                "type": "response", "requestId": frame["requestId"],
+                "resultType": "success", "method": "thread-follower-start-turn",
+                "handledByClientId": "owner-1",
+                "result": { "turn": { "id": "turn-b1", "status": "inProgress" } }
+            }))
+            .await;
+        tokio::time::timeout(Duration::from_secs(10), task1)
+            .await
+            .expect("send#1 in time")
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(Some(v)) = f1.hub_store().get_for_device("act-bar-1", "dev-1") {
+                    if v.state == ActionState::Accepted {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("act-bar-1 accepted");
+        // 转入 active（turn-b1 inProgress）→ send#2 忙态/顺序限制入队
+        let entities = serde_json::json!({
+            "turn-b1": { "id": "turn-b1", "type": "turn", "status": "inProgress", "items": ["u7"] },
+            "u7": { "id": "u7", "type": "user_message", "text": "屏障前已发 [mobile iPhone]", "ts": 7 }
+        });
+        peer1
+            .send(&snapshot_frame(
+                THREAD,
+                "owner-1",
+                8,
+                "active",
+                entities,
+                serde_json::json!(["turn-b1"]),
+            ))
+            .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let r2 = f1
+            .app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some(COOKIE),
+                Some(send_body("屏障后排队", Some("act-bar-2"), false)),
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r2).await).unwrap();
+        assert_eq!(v["status"], "codex_queued", "屏障+忙态：send#2 入队");
+        // f1 drop：hub/adapter/调度器全部丢弃，仅持久账本留存
+    }
+    // —— 阶段二：重建 hub，start 后不打开详情、不手工 flush ——
+    let (adapter2, p2) = make_adapter_peer();
+    let mut f2 = fixture_on(
+        conn.clone(),
+        vec![codex_app_session(THREAD)],
+        move |store| Arc::new(CodexControlHub::with_adapter(store, adapter2, true)),
+        Some(p2),
+    );
+    // 对账周期放宽：冷启动只有首 tick 的 settle 会 ensure（避免并发 ensure 打乱协议序）
+    f2.state
+        .codex_control
+        .set_reconcile_period_ms(std::time::Duration::from_secs(10).as_millis() as u64);
+    f2.state.codex_control.start(f2.state.clone());
+    {
+        let mut peer = f2.peer.take().unwrap();
+        // C2：settle 主动 ensure（无 GET）——handshake → discovery → following
+        handshake(&mut peer, "owner-1").await;
+        let disc = peer.recv().await;
+        assert_eq!(disc["method"], "thread-owner-discovery");
+        peer.send(&discovery_response(
+            disc["requestId"].as_str().unwrap(),
+            "owner-1",
+        ))
+        .await;
+        let follow = peer.recv().await;
+        assert_eq!(follow["method"], "thread-stream-following-changed");
+        // snapshot rev 9：turn-b1 completed + idle → 屏障释放 → flush 自动接力 send#2
+        let entities = serde_json::json!({
+            "turn-b1": { "id": "turn-b1", "type": "turn", "status": "completed", "items": ["u7"] },
+            "u7": { "id": "u7", "type": "user_message", "text": "屏障前已发 [mobile iPhone]", "ts": 7 }
+        });
+        peer.send(&snapshot_frame(
+            THREAD,
+            "owner-1",
+            9,
+            "idle",
+            entities,
+            serde_json::json!(["turn-b1"]),
+        ))
+        .await;
+        let frame2 = tokio::time::timeout(Duration::from_secs(10), peer.recv())
+            .await
+            .expect("重启后屏障 Thread 自动恢复接力（第二个 start-turn 帧）");
+        assert_eq!(frame2["method"], "thread-follower-start-turn");
+        assert_eq!(
+            frame2["params"]["turnStart"]["request"]["input"][0]["text"],
+            "屏障后排队 [mobile iPhone]"
+        );
+        peer.send(&serde_json::json!({
+            "type": "response", "requestId": frame2["requestId"],
+            "resultType": "success", "method": "thread-follower-start-turn",
+            "handledByClientId": "owner-1",
+            "result": { "turn": { "id": "turn-b2", "status": "inProgress" } }
+        }))
+        .await;
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(Some(v)) = f2.hub_store().get_for_device("act-bar-2", "dev-1") {
+                if v.state == ActionState::Accepted {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("act-bar-2 accepted（重启恢复闭环）");
+    f2.state.codex_control.stop();
+}
