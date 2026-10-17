@@ -671,12 +671,16 @@ pub fn parse_named_url(line: &str) -> Option<String> {
         }
     }
     // token 模式：配置 JSON 的 ingress hostname（无 scheme；一行可能含多条 ingress，
-    // 取第一条合法者）
+    // 取第一条合法者）。cloudflared 2026.9.1 实测把配置 JSON **转义**打印
+    // （config="{\"ingress\":[{\"hostname\":\"…\"…）——裸 KEY 恒失配（旧单测用的
+    // 未转义行掩盖了这一点，真机表现为「隧道已连接但地址恒空」），先归一 \"
+    // 再扫；对未转义行归一是恒等变换，新旧形态共存
     const KEY: &str = "\"hostname\":\"";
+    let flat = line.replace("\\\"", "\"");
     let mut from = 0;
-    while let Some(rel) = line[from..].find(KEY) {
+    while let Some(rel) = flat[from..].find(KEY) {
         let start = from + rel + KEY.len();
-        let rest = &line[start..];
+        let rest = &flat[start..];
         let host = &rest[..rest.find('"').unwrap_or(rest.len())];
         if let Some(h) = named_host_ok(host) {
             return Some(format!("https://{h}"));
@@ -1159,6 +1163,17 @@ mod tests {
         assert_eq!(
             parsed_board_url(line, false),
             Some("https://mam-win.bondtoolbox.asia/m".to_string())
+        );
+        // 真机形态（2026-10-16 Mac 实测，cloudflared 2026.9.1）：配置 JSON 整体
+        // **转义**打印（\" 而非 "），裸 KEY 恒失配 → 修复=归一后再扫
+        let escaped = r#"2026-10-16T15:08:52Z INF Updated to new configuration config="{\"ingress\":[{\"hostname\":\"mam-mac.bondtoolbox.asia\", \"service\":\"HTTP://localhost:9420\"}, {\"service\":\"http_status:404\"}], \"warp-routing\":{\"enabled\":false}}" version=1"#;
+        assert_eq!(
+            parse_named_url(escaped),
+            Some("https://mam-mac.bondtoolbox.asia".to_string())
+        );
+        assert_eq!(
+            parsed_board_url(escaped, false),
+            Some("https://mam-mac.bondtoolbox.asia/m".to_string())
         );
         // Registered tunnel connection 行内嵌的隧道域（cfargotunnel.com）不得误报
         assert_eq!(
