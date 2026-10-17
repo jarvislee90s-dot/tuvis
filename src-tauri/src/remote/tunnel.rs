@@ -656,36 +656,51 @@ async fn supervise(mode: String, port: u16, stop: Arc<AtomicBool>) {
 /// ② token 模式（远程托管）形态：`"hostname":"<host>"` 配置行——token 启动
 ///    **不打印** https:// 横幅，M4 只认①导致快照 url 恒 None（设置页无地址显示，
 ///    且在 M5 豁免语义下演化为穿透，见 mod.rs 豁免名单内核注释）。
-/// cloudflare.com / cfargotunnel.com（Registered tunnel connection 行内嵌的
-/// 隧道域）一律排除。解析不到留 None（via 装饰标注侧自动回落 lan），设置页提示
+/// 优先级（2026-10-17 加固）：**配置行（归一后含 KEY）形态②优先且不回退①**——
+/// 配置 JSON 里内嵌的 https:// 是 ingress 的 service 反代目标（不是看板地址），
+/// 形态①先扫会把它连着 JSON 标点一起当地址产出脏值；②无合法 ingress 则整行
+/// None。非配置行（banner）保持形态①优先，其 host 与 quick 解析器同口径按 URL
+/// 字符集（字母数字/点/横杠）连续截取——JSON 标点（" \ { } [ ] ,）永不混入返回
+/// 地址（2026-09-20 quick 事故族同型的纵深防御）。cloudflare.com /
+/// cfargotunnel.com（Registered tunnel connection 行内嵌的隧道域）一律排除。
+/// 解析不到留 None（via 装饰标注侧自动回落 lan），设置页提示
 /// 「地址以 Cloudflare 面板为准」
 pub fn parse_named_url(line: &str) -> Option<String> {
-    if let Some(pos) = line.find("https://") {
-        // 只取 origin（scheme 后到第一个 `/` 为止）——**剥掉一切路径**：cloudflared
-        // 的错误日志行会携带带路径的完整 URL（实测：…/m/api/v1/events 被当成地址，
-        // 经 board_url 归一后变成 …/events/m 的脏值）。看板地址 = origin + /m
-        let url = line[pos..].split_whitespace().next()?;
-        let host = url.trim_start_matches("https://").split('/').next()?;
-        if let Some(h) = named_host_ok(host) {
-            return Some(format!("https://{h}"));
-        }
-    }
-    // token 模式：配置 JSON 的 ingress hostname（无 scheme；一行可能含多条 ingress，
-    // 取第一条合法者）。cloudflared 2026.9.1 实测把配置 JSON **转义**打印
+    // 形态②（配置行）优先：cloudflared 2026.9.1 实测把配置 JSON **转义**打印
     // （config="{\"ingress\":[{\"hostname\":\"…\"…）——裸 KEY 恒失配（旧单测用的
     // 未转义行掩盖了这一点，真机表现为「隧道已连接但地址恒空」），先归一 \"
-    // 再扫；对未转义行归一是恒等变换，新旧形态共存
+    // 再扫；对未转义行归一是恒等变换，新旧形态共存。一行可能含多条 ingress，
+    // 取第一条合法者；全部不合法则**不回退形态①**——配置行内的 https:// 只可能是
+    // service 反代目标，回退必产出带 JSON 标点的脏地址
     const KEY: &str = "\"hostname\":\"";
     let flat = line.replace("\\\"", "\"");
-    let mut from = 0;
-    while let Some(rel) = flat[from..].find(KEY) {
-        let start = from + rel + KEY.len();
-        let rest = &flat[start..];
-        let host = &rest[..rest.find('"').unwrap_or(rest.len())];
-        if let Some(h) = named_host_ok(host) {
+    if flat.contains(KEY) {
+        let mut from = 0;
+        while let Some(rel) = flat[from..].find(KEY) {
+            let start = from + rel + KEY.len();
+            let rest = &flat[start..];
+            let host = &rest[..rest.find('"').unwrap_or(rest.len())];
+            if let Some(h) = named_host_ok(host) {
+                return Some(format!("https://{h}"));
+            }
+            from = start;
+        }
+        return None;
+    }
+    // 形态①（banner 形态，仅非配置行）：只取 origin（scheme 后到第一个 `/` 为止）
+    // ——**剥掉一切路径**：cloudflared 的错误日志行会携带带路径的完整 URL（实测：
+    // …/m/api/v1/events 被当成地址，经 board_url 归一后变成 …/events/m 的脏值）。
+    // host 按 URL 字符集连续截取（quick 解析器同口径）：URL 后黏连的 JSON 标点
+    // （无空白分隔）在截取处断开，绝不混入返回地址
+    if let Some(pos) = line.find("https://") {
+        const SCHEME: &str = "https://";
+        let host: String = line[pos + SCHEME.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+            .collect();
+        if let Some(h) = named_host_ok(&host) {
             return Some(format!("https://{h}"));
         }
-        from = start;
     }
     None
 }
@@ -1194,6 +1209,47 @@ mod tests {
         assert_eq!(
             parse_named_url(multi),
             Some("https://mam-two.example.org".to_string())
+        );
+    }
+
+    /// 配置行形态②优先 + 形态①字符集截取（2026-10-17 加固回归锁）：配置 JSON 内嵌
+    /// **小写 https** service（反代目标）时，旧实现形态①先扫命中 service URL，产出
+    /// 连着 JSON 标点的脏地址（如 `https://backend.example.com\"}],`）。现规则：
+    /// 配置行（归一后含 KEY）恒走形态②取 ingress hostname，②无合法项则 None
+    /// （service URL 不是看板地址，绝不回退）；非配置行的 URL 黏连标点（无空白
+    /// 分隔）由字符集截取剥净
+    #[test]
+    fn parse_named_url_config_line_priority_and_charset() {
+        // 转义配置行（真机形态）+ 小写 https service：形态②优先取 ingress hostname，
+        // service URL 连标点一起被跳过
+        let escaped_lower = r#"2026-10-17T00:00:00Z INF Updated to new configuration config="{\"ingress\":[{\"hostname\":\"mam-mac.bondtoolbox.asia\", \"service\":\"https://backend.example.com\"}, {\"service\":\"http_status:404\"}], \"warp-routing\":{\"enabled\":false}}" version=1"#;
+        assert_eq!(
+            parse_named_url(escaped_lower),
+            Some("https://mam-mac.bondtoolbox.asia".to_string())
+        );
+        assert_eq!(
+            parsed_board_url(escaped_lower, false),
+            Some("https://mam-mac.bondtoolbox.asia/m".to_string())
+        );
+        // 未转义配置行（plain " JSON）：同一形态——形态②优先，service URL 不上墙
+        let unescaped_lower = r#"2026-10-17T00:00:00Z INF Updated to new configuration {"config":{"ingress":[{"hostname":"mam-mac.bondtoolbox.asia", "service":"https://backend.example.com"}, {"service":"http_status:404"}], "warp-routing":{"enabled":false}}}"#;
+        assert_eq!(
+            parse_named_url(unescaped_lower),
+            Some("https://mam-mac.bondtoolbox.asia".to_string())
+        );
+        assert_eq!(
+            parsed_board_url(unescaped_lower, false),
+            Some("https://mam-mac.bondtoolbox.asia/m".to_string())
+        );
+        // 配置行全部 ingress 不合法（cfargotunnel.com 隧道域）+ 小写 https service：
+        // 整行 None——配置行不回退形态①（service URL 不是看板地址）
+        let all_invalid = r#"2026-10-17T00:00:00Z INF Updated to new configuration config="{\"ingress\":[{\"hostname\":\"a.cfargotunnel.com\", \"service\":\"https://backend.example.com\"}], \"warp-routing\":{\"enabled\":false}}" version=1"#;
+        assert_eq!(parse_named_url(all_invalid), None);
+        // 非配置行（无 KEY）：URL 与 JSON 标点黏连（无空白分隔）——字符集截取剥净
+        // 标点（旧实现会产出 `https://mam.example.org"}]` 脏 host）
+        assert_eq!(
+            parse_named_url(r#"INF route config="hostname=https://mam.example.org"}] updated"#),
+            Some("https://mam.example.org".to_string())
         );
     }
 

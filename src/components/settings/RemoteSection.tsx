@@ -609,8 +609,15 @@ export function RemoteSection() {
   // 2026-10-16 补：连接器 spawn 时才读 token，cloudflared 对注册失败只会无限重试、
   // 不会自行退出——通道在跑时旧进程永远带着旧 token，值有变化时须走唯一启停入口
   // （remote_toggle_channel）关-开 recycle，重连后 stderr 才解析出新地址；值未变
-  // 则不折腾在跑的连接器（避免无谓踢掉远程会话）
+  // 则不折腾在跑的连接器（避免无谓踢掉远程会话）。
+  // 2026-10-17 补：①busy 在途互斥（与 changeChannel 同款）——双击保存会并发跑
+  // 两轮关-开 recycle，保存按钮同步 disabled；②recycle 判据用 chanEnabled 而非
+  // chanRunning——running 来自 3s 轮询快照最多陈旧 3s（刚启动的通道会被漏掉、
+  // 旧进程继续拿旧 token 跑），enabled 是通道开关 KV 真值无陈旧，还顺带救活
+  // 「开关开着但连接器已死」的形态（总开关关时多一次无害的关-开空转）
   const saveToken = async () => {
+    if (busy) return;
+    setBusy(true);
     try {
       if (token === savedToken) {
         toast.success(t("settings.remote.tokenSaved"));
@@ -618,7 +625,7 @@ export function RemoteSection() {
       }
       await setSetting(TUNNEL_TOKEN_KEY, token);
       setSavedToken(token);
-      if (chanRunning("named")) {
+      if (chanEnabled("named")) {
         await toggleChannel("named", false);
         await toggleChannel("named", true);
         await refreshStatus();
@@ -626,6 +633,8 @@ export function RemoteSection() {
       toast.success(t("settings.remote.tokenSaved"));
     } catch (e) {
       toast.error(formatInvokeError(e, t));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -1025,7 +1034,7 @@ export function RemoteSection() {
                       className="flex-1"
                       onChange={(e) => setToken(e.target.value)}
                     />
-                    <Button size="sm" onClick={() => void saveToken()}>
+                    <Button size="sm" disabled={busy} onClick={() => void saveToken()}>
                       {t("settings.remote.save")}
                     </Button>
                   </div>
