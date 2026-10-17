@@ -1391,20 +1391,19 @@ async fn turn_restriction_needs_matching_completion_evidence() {
         "Turn 绑定以持久屏障在册"
     );
 
-    // 旧 idle（revision == 基线）：不释放
-    h.dispatch.set_terminal_turn("turn-9");
+    // 负例面（**证据未登记**）：任何投影都不释放——旧 idle（rev == 基线）、active、
+    // stale、实体不在场、别的 turnId 有证据，全部保守保留（第三轮复审 B1：负例
+    // 语义现在完全由证据门承载）
     assert!(
         !h.router
             .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 7)),
-        "Accepted 时的旧 idle 更新不得释放"
+        "证据未登记：旧 idle 更新不得释放"
     );
-    // active（revision 更新）：不释放
     assert!(
         !h.router
             .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "active", 8)),
         "runtime 未归 idle 不释放"
     );
-    // stale idle（断线/owner 换代）：不释放，限制保留
     let mut stale = projection_with_rev(THREAD, "idle", 9);
     stale.stale = true;
     assert!(
@@ -1412,14 +1411,10 @@ async fn turn_restriction_needs_matching_completion_evidence() {
         "stale 投影不释放（owner 换代/断线限制保留）"
     );
     assert!(h.router.flush_thread(&h.key).await.is_none());
-
-    // C1.1 反证面：泛 idle（即使 revision 更新）但**绑定 turn 未以终态在场**——
-    // 另一个 turn 已完成 / 本 turn inProgress / 实体不在场，均不释放
-    h.dispatch.unset_terminal_turn("turn-9");
     assert!(
         !h.router
             .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9)),
-        "另一个 Turn 完成 + 泛 idle 不释放（C1：目标身份与终态证据不能省略）"
+        "证据未登记：泛 idle（即使 revision 更新）不释放（C1：目标身份与终态证据不能省略）"
     );
     h.dispatch.set_terminal_turn("turn-other");
     assert!(
@@ -1427,14 +1422,16 @@ async fn turn_restriction_needs_matching_completion_evidence() {
             .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9)),
         "别的 turnId 有证据也救不了本绑定（按绑定 turnId 精确核对）"
     );
+    h.dispatch.unset_terminal_turn("turn-other");
 
-    // 绑定 turn 自身以终态在场 + fresh idle + revision 严格更新：释放 + 清持久屏障
-    // + 接力发下一条
+    // 绑定 turn 自身以终态在场（完成快照已先于 ACK 在场，rev == 基线）+ fresh
+    // idle：释放 + 清持久屏障 + 接力发下一条（第三轮复审 B1 场景 1：revision
+    // 基线门不得阻止合法完成）
     h.dispatch.set_terminal_turn("turn-9");
     assert!(
         h.router
-            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9)),
-        "idle 且 revision 严格大于基线 + 目标 turn 终态证据 → 释放"
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 7)),
+        "目标 turn 终态证据成立：rev == 基线（完成快照先到）也必须释放"
     );
     assert!(
         !h.store.has_compat_fence(&h.key).expect("query"),
@@ -1534,6 +1531,56 @@ async fn receipt_without_turn_id_keeps_restriction() {
         h.router.flush_thread(&h.key).await.is_none(),
         "缺 turnId 保持留队"
     );
+}
+
+/// 第三轮复审 B1 场景 1：目标 Turn 的 completed snapshot **先于 ACK** 在场（基线
+/// == 完成快照 revision，之后无新增量）——精确终态证据成立即必须释放，revision
+/// 不得阻止合法完成（旧实现 7 > 7 恒假 → 永久堵队）。
+#[tokio::test]
+async fn release_turn_on_completion_snapshot_already_before_ack() {
+    let h = harness_with(FakeDispatch::accepted_turn("turn-9", Some(7)));
+    let a = h.ctx("b1-a", ActionKind::Send);
+    let _ = completed(h.router.send(a, "第一条".into(), false).await);
+    assert_eq!(h.dispatch.send_count(), 1);
+    // 完成快照先于 ACK 落镜像（证据已成立），ACK 采集的基线 == 同一 revision
+    h.dispatch.set_terminal_turn("turn-9");
+    h.router
+        .send(h.ctx("b1-b", ActionKind::Send), "第二条".into(), true)
+        .await;
+    assert!(
+        h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 7)),
+        "证据成立 + rev == 基线：完成快照先到也必须释放（B1 场景 1）"
+    );
+    let out = h.router.flush_thread(&h.key).await.expect("b dispatchable");
+    assert_eq!(completed(out).delivery, Delivery::Accepted);
+    assert_eq!(h.dispatch.send_count(), 2);
+}
+
+/// 第三轮复审 B1 场景 2：Desktop 重启/owner 换代——旧基线 300，新 owner 重新从
+/// revision 1 发布 snapshot 且目标 Turn 已 completed。跨世代比较 1 > 300 恒假，
+/// 精确证据成立即必须释放（禁止「任意 idle 即放行」——证据仍是必要条件）。
+#[tokio::test]
+async fn release_turn_after_owner_generation_with_lower_revision() {
+    let h = harness_with(FakeDispatch::accepted_turn("turn-gen", Some(300)));
+    let a = h.ctx("b1-gen", ActionKind::Send);
+    let _ = completed(h.router.send(a, "换代前已发".into(), false).await);
+    h.router
+        .send(h.ctx("b1-gen-2", ActionKind::Send), "换代后排队".into(), true)
+        .await;
+    // 新 owner 世界：镜像换代重置后 revision 1，目标 Turn 已 completed
+    h.dispatch.set_terminal_turn("turn-gen");
+    assert!(
+        h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 1)),
+        "新 owner revision 1 < 旧基线 300：精确证据成立必须释放（B1 场景 2）"
+    );
+    let out = h
+        .router
+        .flush_thread(&h.key)
+        .await
+        .expect("queued dispatchable");
+    assert_eq!(completed(out).delivery, Delivery::Accepted);
 }
 
 /// 2026-10-17 复审 C1.2：Unknown 不是完成——多轮周期对账（converge_with_ledger）

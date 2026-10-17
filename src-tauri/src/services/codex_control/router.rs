@@ -226,17 +226,16 @@ impl Drop for FallbackPermit {
 // CodexControlRouter
 // ============================================================
 
-/// 本 Thread 在飞的 Turn 顺序限制（R6.3）：自 start-turn 派发起生效，绑定本动作的
-/// Turn 身份后才可能释放。`turn_id = None`（回执缺 turnId / 派发在途 / Unknown）→
-/// **保守永不自动释放**（缺 turnId 不能视为完成）。
+/// 本 Thread 在飞的 Turn 顺序限制（R6.3 + 第三轮复审 B1）：自 start-turn 派发起
+/// 生效，绑定本动作的 Turn 身份后才可能释放。`turn_id = None`（回执缺 turnId /
+/// 派发在途 / Unknown）→ **保守永不自动释放**（缺 turnId 不能视为完成）。
+/// B1：不再持有「ACK 后采集、且未绑定 owner 世代」的 revision 基线——完成快照
+/// 先于 ACK 在场（基线 == 完成快照 revision）与换代后低 revision 新世界都会被
+/// 「严格大于」永久堵死；释放的唯一证据门 = 绑定 turnId 本体以终态在场的镜像。
 #[derive(Debug, Clone)]
 struct ActiveTurn {
     action_id: String,
     turn_id: Option<String>,
-    /// 接受回执时的投影 revision 基线：完成证据 = 新鲜投影 revision **严格大于**本基线
-    /// 且 runtime 归 idle/failed（Accepted 前后的旧 idle 更新 revision ≤ 基线，不放行）。
-    /// 重启重建时为 None → 首个新鲜投影即当前真值。
-    baseline_revision: Option<u64>,
 }
 
 /// 安全路由器。`store` 承担持久化与串行化；`dispatch` 是 A 路注入缝。
@@ -266,8 +265,7 @@ enum HeadOutcome {
 impl CodexControlRouter {
     pub fn new(store: Arc<ActionStore>, dispatch: Arc<dyn DesktopDispatch>) -> Self {
         // R6.3：重启重建——A 路已接受且持久绑定 turn 身份的动作恢复为在飞限制
-        //（baseline None：重启后首个新鲜投影即当前真值；原 Turn 已完成 → 该投影
-        // runtime idle → 立即释放接力；仍在跑 → active 投影不放行）
+        //（释放只看绑定 turn 的终态证据；B1：无 revision 基线门）
         let mut active_turns = HashMap::new();
         match store.turn_bindings() {
             Ok(bindings) => {
@@ -277,7 +275,6 @@ impl CodexControlRouter {
                         ActiveTurn {
                             action_id: b.action_id,
                             turn_id: b.turn_id,
-                            baseline_revision: None,
                         },
                     );
                 }
@@ -322,7 +319,6 @@ impl CodexControlRouter {
                 ActiveTurn {
                     action_id: action_id.to_string(),
                     turn_id: None,
-                    baseline_revision: None,
                 },
             );
     }
@@ -373,7 +369,7 @@ impl CodexControlRouter {
                                 envelope_id: None,
                                 reason_code: None,
                             };
-                            self.bind_turn(&key, &receipt, None);
+                            self.bind_turn(&key, &receipt);
                         }
                     }
                 }
@@ -397,13 +393,12 @@ impl CodexControlRouter {
     /// 原子写）；本函数的持久化保留为幂等补写（收敛路径从账本回执补绑时兜底旧数据
     /// 形态）。缺 turnId 只保留内存限制（保守不释放、不虚称可核对——但 Unknown/
     /// 无 turnId 的保守屏障已随落账持久化，重启仍受限）。
-    fn bind_turn(&self, key: &ThreadKey, receipt: &ActionReceipt, baseline: Option<u64>) {
+    fn bind_turn(&self, key: &ThreadKey, receipt: &ActionReceipt) {
         {
             let mut turns = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
             match turns.get_mut(key) {
                 Some(t) if t.action_id == receipt.action_id => {
                     t.turn_id = receipt.turn_id.clone();
-                    t.baseline_revision = baseline;
                 }
                 _ => {
                     turns.insert(
@@ -411,7 +406,6 @@ impl CodexControlRouter {
                         ActiveTurn {
                             action_id: receipt.action_id.clone(),
                             turn_id: receipt.turn_id.clone(),
-                            baseline_revision: baseline,
                         },
                     );
                 }
@@ -431,15 +425,18 @@ impl CodexControlRouter {
         }
     }
 
-    /// R6.3 + 2026-10-17 复审 C1：投影驱动的 Turn 终态释放。完成证据（全部满足才
-    /// clear）：
+    /// R6.3 + 2026-10-17 复审 C1 / 第三轮复审 B1：投影驱动的 Turn 终态释放。
+    /// 完成证据（全部满足才 clear）：
     /// ① 投影新鲜（非 stale——断线/owner 换代的 stale 投影不释放，限制保留）；
     /// ② 绑定了 turnId（缺 turnId 保守不释放）；
-    /// ③ **目标 Turn 终态证据**（C1.1：绑定 turnId 的实体在当前镜像中以
-    ///    completed/failed 在场——另一个 Turn 完成/泛 idle 都不是本 Turn 的证据）；
-    /// ④ runtime 归 idle/failed（Turn 终态）；
-    /// ⑤ revision 严格大于接受回执时的基线（Accepted 前后的旧 idle 更新不放行；
-    ///    重启重建 baseline=None → 首个新鲜投影即当前真值）。
+    /// ③ **目标 Turn 终态证据**（唯一放行门：绑定 turnId 的实体在当前镜像中以
+    ///    completed/failed 在场——另一个 Turn 完成/泛 idle 都不是本 Turn 的证据，
+    ///    该门同时排除「ACK 前后的旧 idle 误判」——旧 idle 不可能把绑定 turn 实体
+    ///    变成终态，若在场即真完成）；
+    /// ④ runtime 归 idle/failed（Turn 终态）。
+    /// B1：**无 revision 基线门**——基线在 ACK 之后采集且未绑定 owner 世代：
+    /// 完成快照先于 ACK（rev == 基线）与换代后低 revision 新世界都会被「严格
+    /// 大于」永久堵死。禁止退回「任意 idle 即放行」（证据门仍在）。
     /// 返回是否发生了释放（调用方据此接力 flush）。
     pub fn release_turn_if_complete(&self, key: &ThreadKey, p: &ThreadProjection) -> bool {
         let Some(t) = self
@@ -457,19 +454,15 @@ impl CodexControlRouter {
         let Some(turn_id) = t.turn_id.as_deref() else {
             return false;
         };
-        // C1.1：目标 Turn 的终态证据（镜像中该 turnId 实体以终态在场）——先于
-        // revision/runtime 判定，缺失即保守保留
+        // C1.1：目标 Turn 的终态证据（镜像中该 turnId 实体以终态在场）——缺失即
+        // 保守保留
         if !self.dispatch.turn_evidence_terminal(key, turn_id) {
             return false;
         }
-        let Some(rev) = p.revision else {
+        let Some(_rev) = p.revision else {
             return false;
         };
-        let after_start = match t.baseline_revision {
-            Some(base) => rev > base,
-            None => true,
-        };
-        if !(after_start && matches!(p.runtime_status.as_str(), "idle" | "failed")) {
+        if !matches!(p.runtime_status.as_str(), "idle" | "failed") {
             return false;
         }
         // 清持久屏障（Accepted 终态允许；失败保守保留限制）
@@ -865,7 +858,7 @@ impl CodexControlRouter {
                     // R6.3：Accepted 绑定并持久化本 Turn 身份（缺 turnId 保守不释放；
                     // 屏障已随落账在任务内原子持久）
                     Delivery::Accepted => {
-                        self.bind_turn(&head.ctx.key, &receipt, revision);
+                        self.bind_turn(&head.ctx.key, &receipt);
                     }
                     // Rejected = 明确拒绝（无 Turn 产生）→ 解除；Unknown = 结果未知——
                     // 2026-10-17 复审 C1.2：**不是完成**，保守屏障已在任务内随落账原子

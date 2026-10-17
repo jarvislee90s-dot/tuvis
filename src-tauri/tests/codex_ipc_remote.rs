@@ -3243,3 +3243,166 @@ async fn hub_stop_closes_connection_and_blocks_reconnect_until_start() {
     .expect("no hang after restart");
     assert!(r2.is_err(), "io 耗尽诚实快败");
 }
+
+// ============================================================
+// 19. 第三轮复审 B1：revision 基线门不得阻止合法 Turn 完成（生产链）——
+// 完成快照先于 ACK 在场、换代后低 revision 新世界，都必须自动接力。
+// ============================================================
+
+/// B1 场景 1（生产链）：completed snapshot 先于 ACK 落镜像（之后零新增量）——
+/// ACK 后后继消息必须自动接力，不得因「rev == 基线」永久堵队。
+#[tokio::test]
+async fn completed_snapshot_before_ack_still_relays() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    f.state
+        .codex_control
+        .set_reconcile_period_ms(std::time::Duration::from_millis(200).as_millis() as u64);
+    f.state.codex_control.start(f.state.clone());
+    let body1 = send_body("基线前已发", Some("act-b1-1"), false);
+    let task1 = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body1),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    // 完成快照**先于 ACK** 落镜像（rev 8，turn-chain-1 completed，idle）
+    let entities = serde_json::json!({
+        "turn-chain-1": { "id": "turn-chain-1", "type": "turn", "status": "completed", "items": ["u7"] },
+        "u7": { "id": "u7", "type": "user_message", "text": "基线前已发 [mobile iPhone]", "ts": 7 }
+    });
+    peer.send(&snapshot_frame(THREAD, "owner-1", 8, "idle", entities, serde_json::json!(["turn-chain-1"])))
+        .await;
+    // ACK（send_text 回执后采集的基线 == 已在场的 rev 8）
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-chain-1", "status": "inProgress" } }
+    }))
+    .await;
+    tokio::time::timeout(Duration::from_secs(15), task1)
+        .await
+        .expect("send#1 in time")
+        .unwrap();
+    // 后继入队；**不再发任何新 snapshot**——释放只能靠既有镜像中的完成证据
+    let r2 = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("基线后排队", Some("act-b1-2"), false)),
+        ))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r2).await).unwrap();
+    assert!(
+        v["status"] == "codex_queued" || v["status"] == "desktop_ipc",
+        "后继入队或直接派发：{v}"
+    );
+    let frame2 = tokio::time::timeout(Duration::from_secs(8), peer.recv())
+        .await
+        .expect("完成快照先于 ACK：后继必须自动接力（零新增量）");
+    assert_eq!(frame2["method"], "thread-follower-start-turn");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame2["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-b1-2", "status": "inProgress" } }
+    }))
+    .await;
+    f.state.codex_control.stop();
+}
+
+/// B1 场景 2（生产链）：同进程 owner 换代（Desktop 重启语义）——旧基线 rev 7，
+/// 新 owner 从 revision 1 重新发布 snapshot 且目标 Turn 已 completed → 顺序限制
+/// 必须释放并自动接力（走 C2 自动恢复，无 GET）。
+#[tokio::test]
+async fn lower_revision_from_new_owner_still_releases() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    f.state
+        .codex_control
+        .set_reconcile_period_ms(std::time::Duration::from_millis(200).as_millis() as u64);
+    f.state.codex_control.start(f.state.clone());
+    let body1 = send_body("换代前已发", Some("act-gen-1"), false);
+    let task1 = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body1),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-gen-1", "status": "inProgress" } }
+    }))
+    .await;
+    tokio::time::timeout(Duration::from_secs(15), task1)
+        .await
+        .expect("send#1 in time")
+        .unwrap();
+    // owner-1 失效（同 socket 恢复）→ 新 owner-2 从 revision 1 重新发布：
+    // 镜像换代重置后 rev 1 < 旧基线 7，且目标 Turn 已 completed
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "client-status-changed", "version": 1,
+        "sourceClientId": "owner-1",
+        "params": { "clientId": "owner-1", "status": "disconnected" }
+    }))
+    .await;
+    let disc = peer.recv().await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&discovery_response(disc["requestId"].as_str().unwrap(), "owner-2"))
+        .await;
+    let follow = peer.recv().await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    let entities = serde_json::json!({
+        "turn-gen-1": { "id": "turn-gen-1", "type": "turn", "status": "completed", "items": ["u6"] },
+        "u6": { "id": "u6", "type": "user_message", "text": "换代前已发 [mobile iPhone]", "ts": 6 }
+    });
+    peer.send(&snapshot_frame(THREAD, "owner-2", 1, "idle", entities, serde_json::json!(["turn-gen-1"])))
+        .await;
+    // 后继入队（换代窗口内顺序限制仍在 → codex_queued 或直接派发都可）
+    let _ = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("换代后排队", Some("act-gen-2"), false)),
+        ))
+        .await
+        .unwrap();
+    let frame2 = tokio::time::timeout(Duration::from_secs(8), peer.recv())
+        .await
+        .expect("换代后低 revision 完成世界：后继必须自动接力");
+    assert_eq!(frame2["method"], "thread-follower-start-turn");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame2["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-2",
+        "result": { "turn": { "id": "turn-gen-2", "status": "inProgress" } }
+    }))
+    .await;
+    f.state.codex_control.stop();
+}
