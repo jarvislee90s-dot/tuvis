@@ -24,8 +24,8 @@
 | 池 | `FileOrigin::User`（rank=1） | 语义合身（用户带入的图片）；零前端改动（新池需 files.rs/api.ts/FilePanel.tsx 四处同步，无用户可见收益）；artifact 兜底命中已存在条目时跳过不覆盖 |
 | 窗口预算 | `read_recent_lines_with_budget(&f, line_budget(limit), byte_budget(limit))` | 与 `read_codex_messages_with` 同刻度（条数窗 / 512KB×⌈limit/200⌉ 封顶 4MB） |
 | rollout 定位 | 提取共享 `locate_codex_rollout`（文件名快路径 + 首行 `payload.id` 校验兜底，未排序取首个含 id） | 与既有提取链同口径；同 id 多 rollout 的「提取侧首个 vs monitor 侧 mtime 最新」分叉为 `files.rs` ⚠ 既有登记问题，本源沿用提取侧口径、不扩面修 |
-| seq 刻度 | 窗口内行序（单调计数） | codex event_msg 行不在 `pg.messages` 条目集内（被 map_codex_lines 过滤），取行序作单调代理；merger 只消费大小关系，排序语义一致 |
-| 路径卫生（函数内前置） | URI 判别（冒号前缀 >1 字符跳过，Windows 盘符单字符不误伤）+ `path.exists()` 不存在跳过 | 与 files.rs:983-987 既有判别同款；不可预览条目无展示价值（照 zcode artifact 解析不到降级跳过先例） |
+| seq 刻度 | 与消息条目同一标尺：event_msg 行 seq = 窗口内其之前已映射消息条目数（复用 map_codex_lines 单行分派计数）− finalize 头部丢弃数（total − min(total, limit)，max(0) 截零）；落入被丢弃段取 −1 哨兵 | PR #168 评审 I-1 修正：merger 的 finish() 按 last_seq 全局排序、同路径合并 last-write-wins——行序刻度 [0, line_budget) 与消息刻度（finalize 后 [0, limit)）不同标尺，行号 ≥ limit 的图片会无论时间先后恒钉面板顶 |
+| 路径卫生（函数内前置） | URI 判别（冒号前缀 >1 字符跳过，Windows 盘符单字符不误伤）+ 非绝对路径跳过 + `path.exists()` 不存在跳过 | 与 files.rs:983-987 既有判别同款；实测 210 条全绝对路径；不可预览条目无展示价值（照 zcode artifact 解析不到降级跳过先例） |
 | 失败语义 | 任何失败（定位不到/读不了）→ 空 Vec | 附件是增强能力，不阻塞详情页（与整管线 `(Vec::new(), false)` 口径一致） |
 
 ## 三、证据状态申报（如实）
@@ -51,5 +51,7 @@
 ## 五、关联
 
 - 上游裁决：issue #69（文件池附件来源逐工具）；批次 spec
-  `docs/superpowers/specs/2026-10-18-tracking-batches-design.md` §3。
+  `docs/superpowers/specs/2026-10-18-tracking-batches-design.md` §3（在
+  `fix/tracking-batch-1-subagent-ui` 分支——**合并依赖**：该批 PR 需先合入，
+  本档引用的相对路径才在 main 上成立）。
 - 兄弟档：`2026-10-18-claude-opencode-不入池结论.md`（同批降级落档）。

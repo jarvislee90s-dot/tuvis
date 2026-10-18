@@ -12,10 +12,11 @@ content 块内），**没有独立文件路径**可提取——文件池按路�
 
 ## 二、opencode：part 无 file 类型
 
-opencode 的消息部件（part 表）**没有 file 类型**——B1 调研（2026-09-17）已
-确认并登记于 `src-tauri/src/remote/attachment_fixtures.rs:1-11` 代码注释
-（kimi 内联标记 / zcode part type=file 两先例同处登记），本档为该结论的
-文档面落档（此前仅在代码注释）。
+opencode 的消息部件（part 表）**没有 file 类型**——B1 调研（2026-09-17）
+结论；登记面：`src-tauri/src/remote/attachment_fixtures.rs` 头注释
+（kimi / zcode / claude / opencode 四家同处登记，claude 与 opencode 两行
+为 2026-10-18 随本档补登——原文档初稿误引「:1-11 即含 opencode」，评审
+I-2 抓获后补登使引用成立）。本档为该结论的文档面落档。
 
 ## 三、重开条件
 

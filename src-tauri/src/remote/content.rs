@@ -1190,11 +1190,7 @@ fn locate_codex_rollout(
             }
         }
     }
-    hit.ok_or_else(|| {
-        format!(
-            "CONTENT_CODEX_ROLLOUT_MISSING: codex rollout 未命中: {session_id}"
-        )
-    })
+    hit.ok_or_else(|| format!("CONTENT_CODEX_ROLLOUT_MISSING: codex rollout 未命中: {session_id}"))
 }
 
 fn read_codex_rollout_with(
@@ -1222,14 +1218,15 @@ fn read_codex_rollout_with(
 /// 不接）。形态照 [`read_zcode_attachment_refs_with`]：同 limit 同窗口刻度
 /// （条数窗 + 字节窗与 `read_codex_messages_with` 完全同参），任何失败返回
 /// 空 Vec（附件是增强能力，不阻塞详情页）。判据层级：`payload.local_images`
-/// 主判据（与 event_msg 既有消费先例 `subagents::codex::apply_rollout_line` 的
+/// 主判据（与 event_msg 既有消费先例 `monitor::subagents::codex::apply_rollout_line` 的
 /// payload 层同构）+ 顶层 `local_images` 兜底（形态漂移容忍，命中任一即收）；
 /// 条目双形态：字符串路径 / 对象 `path` 字段。路径卫生前置：URI 判别（冒号
 /// 前缀 >1 字符即协议名，Windows 盘符恒单字符不误伤——同 files.rs 内联标记
 /// 判别）跳过；非绝对路径 / 不存在跳过（实测 210 条全绝对路径；不可预览条目
-/// 无展示价值，照 zcode artifact 解析不到降级先例）。seq = 窗口内行序单调
-/// 计数（event_msg 行不在 pg.messages 条目集内，取行序作单调代理；merger 只
-/// 消费大小关系）。底料档：docs/superpowers/specs/2026-10-18-codex-local-images-file-pool-底料.md
+/// 无展示价值，照 zcode artifact 解析不到降级先例）。seq 与消息条目同一
+/// 标尺（PR #168 评审 I-1 修正）：event_msg 行的 seq = 窗口内其之前已映射的
+/// 消息条目数 − finalize 头部丢弃数（详见函数体内注释）。底料档：
+/// docs/superpowers/specs/2026-10-18-codex-local-images-file-pool-底料.md
 pub(crate) fn read_codex_local_images_refs_with(
     home: &Path,
     session_id: &str,
@@ -1244,42 +1241,57 @@ pub(crate) fn read_codex_local_images_refs_with(
         line_budget(limit),
         byte_budget(limit),
     );
-    let mut out = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if v["type"].as_str() != Some("event_msg") {
-            continue;
-        }
-        let Some(images) = v
-            .pointer("/payload/local_images")
-            .or_else(|| v.get("local_images"))
-            .and_then(|x| x.as_array())
-        else {
-            continue;
-        };
-        let ts = v["timestamp"].as_str().and_then(iso_to_ms);
-        for img in images {
-            let Some(path_str) = img
-                .as_str()
-                .or_else(|| img.get("path").and_then(|p| p.as_str()))
-            else {
-                continue;
-            };
-            if let Some(colon) = path_str.find(':') {
-                if colon > 1 {
-                    continue; // URI（协议名 >1 字符）不入池
+    // seq 刻度对齐（PR #168 评审 I-1）：merger 的 finish() 按 last_seq 全局
+    // 排序、同路径合并 last-write-wins——行序刻度 [0, line_budget) 与消息条目
+    // 刻度（finalize 后 [0, limit)）不同标尺，行号 ≥ limit 的图片会无论时间
+    // 先后恒钉面板顶。故每个 event_msg 行取「窗口内其之前已映射的消息条目数」
+    // （复用 map_codex_lines 单行分派，判定零复制），再减去 finalize 的头部
+    // 丢弃数（total − min(total, limit)），与 pg.messages 的 seq 同一标尺；
+    // 落入被丢弃段的图片取 -1 哨兵（严格早于一切保留条目，宁低不高）。
+    let mut staged: Vec<(i64, String, Option<i64>)> = Vec::new();
+    let mut ordinal: i64 = 0; // 当前行之前已映射的消息条目数（窗口内累计）
+    let mut total: i64 = 0;
+    for line in &lines {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v["type"].as_str() == Some("event_msg") {
+                let images = v
+                    .pointer("/payload/local_images")
+                    .or_else(|| v.get("local_images"))
+                    .and_then(|x| x.as_array());
+                if let Some(images) = images {
+                    let ts = v["timestamp"].as_str().and_then(iso_to_ms);
+                    for img in images {
+                        let Some(path_str) = img
+                            .as_str()
+                            .or_else(|| img.get("path").and_then(|p| p.as_str()))
+                        else {
+                            continue;
+                        };
+                        if let Some(colon) = path_str.find(':') {
+                            if colon > 1 {
+                                continue; // URI（协议名 >1 字符）不入池
+                            }
+                        }
+                        let p = std::path::PathBuf::from(path_str);
+                        if !p.is_absolute() || !p.exists() {
+                            continue;
+                        }
+                        staged.push((ordinal, path_str.to_string(), ts));
+                    }
                 }
             }
-            let p = std::path::PathBuf::from(path_str);
-            if !p.is_absolute() || !p.exists() {
-                continue;
-            }
-            out.push((idx as i64, path_str.to_string(), ts));
         }
+        let mapped = map_codex_lines(std::slice::from_ref(line)).len() as i64;
+        total += mapped;
+        ordinal += mapped;
     }
-    out
+    // 头部丢弃数（有符号 saturating_sub 不截零——2−200=−198 会反向抬高 seq，
+    // 评审复测中实际抓获；必须 max(0)）
+    let dropped = (total - limit as i64).max(0);
+    staged
+        .into_iter()
+        .map(|(o, path, ts)| (if o - dropped < 0 { -1 } else { o - dropped }, path, ts))
+        .collect()
 }
 
 /// Codex rollout 行 → 统一条目（纯函数；codex_entry_kind 的内容版映射）。
@@ -3624,7 +3636,7 @@ mod tests {
     /// 顶层 local_images 兜底（无 payload 层形态漂移行）、路径卫生（URI / 相对
     /// 路径 / 绝对但不存在 / 对象无 path 字段全跳过）、非 event_msg 行不收
     /// （type 闸门在字段探测之前——response_item 顶层同名字段是陷阱）、
-    /// seq=窗口行序、ts=行 timestamp
+    /// seq=消息条目刻度、ts=行 timestamp
     #[test]
     fn codex_local_images_refs_collects_both_forms_and_filters_paths() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3642,7 +3654,11 @@ mod tests {
             shot2.to_string_lossy().into_owned(),
             shot3.to_string_lossy().into_owned(),
         );
-        let ghost = tmp.path().join("shots/ghost.png").to_string_lossy().into_owned(); // 不创建
+        let ghost = tmp
+            .path()
+            .join("shots/ghost.png")
+            .to_string_lossy()
+            .into_owned(); // 不创建
         let lines = [
             serde_json::json!({
                 "timestamp": "2026-10-18T00:00:00.000Z",
@@ -3707,17 +3723,19 @@ mod tests {
         assert_eq!(
             refs,
             vec![
-                (2, p1.clone(), t5),
-                (2, p2.clone(), t5),
-                (4, p3.clone(), t6),
+                (1, p1.clone(), t5),
+                (1, p2.clone(), t5),
+                (1, p3.clone(), t6),
             ],
             "仅 event_msg 行的 payload/顶层 local_images 入池；双形态条目都收；\
-             URI/相对/不存在/无 path 字段跳过；response_item 顶层同名字段不收"
+             URI/相对/不存在/无 path 字段跳过；response_item 顶层同名字段不收；\
+             seq = event_msg 前已映射消息条目数（与消息刻度同标尺，评审 I-1）"
         );
     }
 
-    /// seq 单调性（#69）：多行命中时输出按窗口行序递增；无 timestamp 行 ts=None
-    /// 逐行透传（不借邻行、不臆造时刻）
+    /// seq 刻度（#69 + 评审 I-1）：event_msg 的 seq 与消息条目同一标尺（前驱
+    /// 已映射条目数 − finalize 丢弃偏移）；无 timestamp 行 ts=None 逐行透传（不借
+    /// 邻行、不臆造时刻）
     #[test]
     fn codex_local_images_refs_seq_monotonic_and_ts_none_propagates() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3729,6 +3747,15 @@ mod tests {
         std::fs::write(&q1, b"1").unwrap();
         std::fs::write(&q2, b"2").unwrap();
         std::fs::write(&q3, b"3").unwrap();
+        let msg = |ts: &str, role: &str| {
+            serde_json::json!({
+                "timestamp": ts,
+                "type": "response_item",
+                "payload": { "type": "message", "role": role,
+                    "content": [{ "type": "input_text", "text": "话" }] },
+            })
+            .to_string()
+        };
         let lines = [
             serde_json::json!({
                 "timestamp": "2026-10-18T00:00:00.000Z",
@@ -3736,20 +3763,24 @@ mod tests {
                 "payload": { "id": UUID, "cwd": "/w" },
             })
             .to_string(),
+            // q1 出现在任何消息条目之前 → seq 0
             serde_json::json!({
                 "timestamp": "2026-10-18T00:00:01.000Z",
                 "type": "event_msg",
                 "payload": { "local_images": [q1.to_string_lossy()] },
             })
             .to_string(),
-            // 无 timestamp：ts=None 必须原样透传
+            msg("2026-10-18T00:00:02.000Z", "user"),
+            // 无 timestamp：ts=None 必须原样透传；前有 1 条映射条目 → seq 1
             serde_json::json!({
                 "type": "event_msg",
                 "payload": { "local_images": [q2.to_string_lossy()] },
             })
             .to_string(),
+            msg("2026-10-18T00:00:04.000Z", "assistant"),
+            // 前有 2 条映射条目 → seq 2
             serde_json::json!({
-                "timestamp": "2026-10-18T00:00:03.000Z",
+                "timestamp": "2026-10-18T00:00:05.000Z",
                 "type": "event_msg",
                 "payload": { "local_images": [q3.to_string_lossy()] },
             })
@@ -3760,15 +3791,36 @@ mod tests {
 
         let refs = read_codex_local_images_refs_with(tmp.path(), UUID, 200);
         let seqs: Vec<i64> = refs.iter().map(|(s, _, _)| *s).collect();
-        assert_eq!(seqs, vec![1, 2, 3], "行序严格递增（输出顺序=文件行序）");
+        assert_eq!(
+            seqs,
+            vec![0, 1, 2],
+            "seq = 前驱已映射消息条目数（同刻度递增）"
+        );
         assert_eq!(
             refs,
             vec![
-                (1, q1.to_string_lossy().into_owned(), iso_to_ms("2026-10-18T00:00:01.000Z")),
-                (2, q2.to_string_lossy().into_owned(), None),
-                (3, q3.to_string_lossy().into_owned(), iso_to_ms("2026-10-18T00:00:03.000Z")),
+                (
+                    0,
+                    q1.to_string_lossy().into_owned(),
+                    iso_to_ms("2026-10-18T00:00:01.000Z")
+                ),
+                (1, q2.to_string_lossy().into_owned(), None),
+                (
+                    2,
+                    q3.to_string_lossy().into_owned(),
+                    iso_to_ms("2026-10-18T00:00:05.000Z")
+                ),
             ],
             "无 timestamp 行 ts=None（不借邻行时刻）"
+        );
+        // finalize 丢弃偏移（评审 I-1）：limit=1 → 消息条目只留尾部 1 条（dropped=1），
+        // 图片 seq 整体前移 1；落入被丢弃段的 q1 取 -1 哨兵（严格早于一切保留条目）
+        let refs1 = read_codex_local_images_refs_with(tmp.path(), UUID, 1);
+        let seqs1: Vec<i64> = refs1.iter().map(|(s, _, _)| *s).collect();
+        assert_eq!(
+            seqs1,
+            vec![-1, 0, 1],
+            "丢弃偏移 + 头部哨兵（与 finalize 同标尺）"
         );
     }
 

@@ -2880,7 +2880,10 @@ mod tests {
             .timestamp_millis();
         for e in &entries {
             assert_eq!(e.origin, FileOrigin::User, "local_images 附件属用户池");
-            assert_eq!(e.last_seq, 2, "seq=窗口行序（event_msg 是窗口第 2 行）");
+            assert_eq!(
+                e.last_seq, 1,
+                "seq=event_msg 前已映射消息条目数（与消息刻度同标尺，评审 I-1）"
+            );
             assert_eq!(e.last_ts, Some(ts), "ts 取 event_msg 行 timestamp");
             assert_eq!(e.hits, 1);
             assert!(!e.modified, "用户附件不是工具改写");
@@ -2930,11 +2933,7 @@ mod tests {
                 "content": [{ "type": "output_text",
                     "text": format!("用户截图见 ![原图]({})", shot.to_string_lossy()) }] },
         });
-        std::fs::write(
-            &rollout,
-            format!("{meta}\n{user}\n{ev}\n{assistant}\n"),
-        )
-        .unwrap();
+        std::fs::write(&rollout, format!("{meta}\n{user}\n{ev}\n{assistant}\n")).unwrap();
 
         let entries = extract_file_paths_with_env(tmp.path(), None, None, "codex", T9_UUID, 200).0;
         assert_eq!(
@@ -2949,7 +2948,10 @@ mod tests {
             e.hits, 1,
             "兜底命中既有键整体跳过（hits 不涨——臂挪到兜底之后则此处=2 变红）"
         );
-        assert_eq!(e.last_seq, 2, "lastSeq 保持 local_images 行序（不被兜底挪走）");
+        assert_eq!(
+            e.last_seq, 1,
+            "lastSeq 保持 local_images 的消息刻度 seq（不被兜底挪走）"
+        );
         let ts = chrono::DateTime::parse_from_rfc3339("2026-10-18T00:00:05.000Z")
             .unwrap()
             .timestamp_millis();
@@ -3011,8 +3013,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let entries =
-            extract_file_paths_with_env(tmp.path(), None, None, "codex", T9_UUID, 200).0;
+        let entries = extract_file_paths_with_env(tmp.path(), None, None, "codex", T9_UUID, 200).0;
         let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
         assert_eq!(
             paths,
@@ -3028,7 +3029,10 @@ mod tests {
         std::fs::write(&shot_d, b"d").unwrap();
         let dir2 = tmp2.path().join(".codex/sessions/2026/10/18");
         std::fs::create_dir_all(&dir2).unwrap();
-        for (name, img) in [("rollout-alpha.jsonl", &shot_c), ("rollout-beta.jsonl", &shot_d)] {
+        for (name, img) in [
+            ("rollout-alpha.jsonl", &shot_c),
+            ("rollout-beta.jsonl", &shot_d),
+        ] {
             std::fs::write(
                 dir2.join(name),
                 format!(
@@ -3039,8 +3043,7 @@ mod tests {
             )
             .unwrap();
         }
-        let entries =
-            extract_file_paths_with_env(tmp2.path(), None, None, "codex", T9_UUID, 200).0;
+        let entries = extract_file_paths_with_env(tmp2.path(), None, None, "codex", T9_UUID, 200).0;
         assert_eq!(
             entries.len(),
             1,

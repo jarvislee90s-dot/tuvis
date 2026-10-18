@@ -9,6 +9,11 @@
 //   `source.path` = 原始落盘路径（可直接预览）；无 source 的粘贴截图走
 //   `zcode-artifact://<session>/<tool-result-<uuid>>`，落盘于
 //   `~/.zcode/cli/artifacts/<session>/*<tool-result-<uuid>>*`（尾段 glob 可解析）。
+// - claude（transcript JSONL，#69 补登 2026-10-18）：图片附件以 base64 内嵌于
+//   消息体，无独立文件路径可提取 → 不入文件池（结论落档
+//   docs/superpowers/specs/2026-10-18-claude-opencode-不入池结论.md）。
+// - opencode（opencode.db，#69 补登 2026-10-18）：part 表无 file 类型 → 不入
+//   文件池（同上档）。重开条件：任一工具引入带路径的附件形态时重评。
 //
 // 本模块只产出夹具与形状冒烟断言；抽取逻辑属 B2（files.rs）。
 
