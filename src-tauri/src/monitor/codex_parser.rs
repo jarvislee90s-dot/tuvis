@@ -686,16 +686,18 @@ fn session_from_digest(
         .collect::<String>();
     // #151 回报打标（时间关联，全工具化）：仅绿会话且末条非空才付锚收集成本。
     // codex 锚 = 子 rollout task_complete 行 ts（事件驱动、无 90s 滞后，走
-    // collect 视图即可——与 kimi/opencode 的原始毫秒锚差异见 subagents/mod.rs）
-    let session_id_for_report = digest.session_id.clone().unwrap_or_default();
+    // collect 视图即可——与 kimi/opencode 的原始毫秒锚差异见 subagents/mod.rs）。
+    // session_id 缺席直接不打标（N-2：免得绿+末条非空但无 id 时白付一次
+    // collect 的目录 walk）
     let last_message_subagent_report = matches!(status, SessionStatus::Idle | SessionStatus::Finished)
+        && digest.session_id.is_some()
         && digest.last_message.as_deref().is_some_and(|m| !m.is_empty())
         && digest
             .last_timestamp
             .as_deref()
             .and_then(iso_to_ms)
             .is_some_and(|last_ms| {
-                crate::monitor::subagents::codex::collect(&session_id_for_report)
+                crate::monitor::subagents::codex::collect(digest.session_id.as_deref().unwrap_or(""))
                     .iter()
                     .filter(|v| v.status == SubagentStatus::Idle)
                     .filter_map(|v| v.end_ts.as_deref().and_then(iso_to_ms))

@@ -195,6 +195,9 @@ pub(crate) fn collect_with(projects_root: &Path, session_id: &str) -> Vec<Subage
 /// 免 locate 的 projects 根遍历——无子代理会话（绝大多数）一次 is_dir stat 即止。
 /// 布局推导与 locate 同一规则（等价性测试锁定）；缓存键仍为 ("claude", session_id)
 /// ——与 remote chips 端点共用同一增量缓存条目，看板徽标与面板计数机制性一致。
+/// 重复 sid 边角（理论上不可达，sid 为 UUID）：locate 取 readdir 首个命中项目，
+/// collect_at 以本转写自身的父目录为准——此边角两路分叉且 collect_at 更正确，
+/// 不是 bug，勿「修」。
 pub(crate) fn collect_at(parent_jsonl: &Path, session_id: &str) -> Vec<SubagentView> {
     // 信任边界同 locate：session_id 是 UUID，入口拒绝路径分量（防 ../ 逃逸）
     if session_id == ".." || session_id.contains('/') || session_id.contains('\\') {

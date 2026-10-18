@@ -112,7 +112,7 @@ pub(crate) const SUBAGENT_REPORT_SKEW_MS: i64 = 2_000;
 /// 比 last_msg 而不比「当前时刻」：digest-now 随轮询推进会打标翻转（flappy），
 /// last_msg 锚使打标是会话内容的稳定函数（与 L2「纯内容产物」纪律同构）。
 pub(crate) fn report_anchor_near_last(anchor_ms: i64, last_msg_ms: i64) -> bool {
-    anchor_ms <= last_msg_ms + SUBAGENT_REPORT_SKEW_MS
+    anchor_ms <= last_msg_ms.saturating_add(SUBAGENT_REPORT_SKEW_MS)
         && last_msg_ms.saturating_sub(anchor_ms) <= SUBAGENT_REPORT_WINDOW_MS
 }
 
@@ -286,6 +286,7 @@ pub(crate) fn sort_views(v: &mut [SubagentView]) {
 #[cfg(test)]
 pub(crate) fn reset_cache_for_tests() {
     registry().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    codex::reset_walk_cache_for_tests();
 }
 
 #[cfg(test)]
@@ -452,6 +453,12 @@ mod tests {
         assert!(
             !report_anchor_near_last(i64::MAX, i64::MIN),
             "极值不 panic，远超容差拒（saturating_sub 饱和到 i64::MAX > window）"
+        );
+        // 加法支路极值（评审 N-1）：last 接近 i64::MAX 时 +skew 曾可溢出——
+        // saturating_add 后远晚于锚，仍正确拒且不 panic
+        assert!(
+            !report_anchor_near_last(i64::MIN, i64::MAX),
+            "last=i64::MAX 不因 +skew 溢出（saturating_add），锚远早于 last 拒"
         );
     }
 

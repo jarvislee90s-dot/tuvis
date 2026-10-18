@@ -75,7 +75,7 @@ pub fn detect_subagents(tool_id: &str) -> SubagentDetection
 | 场景 | supported | agents | 前端呈现 |
 |---|---|---|---|
 | 未知工具 id | false | [] | 不支持文案 |
-| `subagent_dir()=None`（kimi / workbuddy / zcode / dsh） | false | [] | 不支持文案（复用既有键 `presets.presetSubagentUnsupported`，zh.json:1395） |
+| `subagent_dir()=None`（kimi / workbuddy / zcode / dsh） | false | [] | 不支持文案（复用既有键 `errors.presetSubagentUnsupported`，zh.json:1396——原稿误写 presets 命名空间，实现按实际位置修正） |
 | 目录不存在（支持但从未 spawn） | true | [] | 空态文案（新键 `presets.presetSubagentEmpty`） |
 | `read_dir` 失败 | true | [] | 空态文案（如实：目录在但读不了，与「无」同呈现） |
 | 目录存在有子代理 | true | [...] | 既有列表行为不变 |
@@ -86,14 +86,14 @@ pub fn detect_subagents(tool_id: &str) -> SubagentDetection
 
 - 状态改三态：`useState<string[] | null>(null)`（`null` = 未加载）+ 既有 `expanded`；
 - 删除 `:495 if (subAgents.length === 0) return null` —— 入口**恒渲染**折叠态文字按钮（形态沿用本组件自身 expanded 按钮 + 既有键 `presets.expandSubAgents` / `collapseSubAgents`，zh.json:728-729；无 radix Collapsible，不引入）；
-- 展开时 `loadSubAgents()`；结果分诊：`supported=false` → `presets.presetSubagentUnsupported`；`agents.length===0` → `presets.presetSubagentEmpty`；非空 → 既有 per-agent 应用/停用按钮行为不变（:505-543）；
+- 展开时 `loadSubAgents()`；结果分诊：`supported=false` → `errors.presetSubagentUnsupported`（键在 errors 命名空间，实现修正稿）；`agents.length===0` → `presets.presetSubagentEmpty`；非空 → 既有 per-agent 应用/停用按钮行为不变（:505-543）；
 - **整段包一层 `onClick={(e) => e.stopPropagation()}` 容器**（照 :394-396 开关区先例）——修复后入口恒在，必须防误触整卡点击（onEdit 编辑弹窗）；这是修复引入的新风险点，不是可选项；
 - `catch` 分支：`console.error` + 置空列表显示空态文案（后端永不 Err，仅 IPC 层故障可达；如实呈现为空态）。
 
 **③ i18n 新键（zh/en 双侧，过 check-i18n 门禁）**
 
 - `presets.presetSubagentEmpty`：zh「未检测到子 Agent」/ en「No sub-agents detected」；
-- `presets.presetSubagentUnsupported` 既有键复用，不新增。
+- `errors.presetSubagentUnsupported` 既有键复用，不新增（命名空间按实际位置）。
 
 **④ tauri-mock.ts**
 
@@ -467,7 +467,7 @@ zcode 特例块（:575-591）之后、`merge_artifact_fallback`（:593）之前�
 
 | PR | 分支 | 内容（commit 按项拆） |
 |---|---|---|
-| PR-1 | `fix/tracking-batch-1-subagent-ui` | ① `fix(preset): 子 Agent 级操作入口复活并区分空态与不支持态——#66`；② `fix(board): 父卡子代理徽标改用 monitor::subagents 同源重算——#134`；③ `fix(notify): 子代理回报提醒开关扩展至 codex/kimi/opencode——#151` |
+| PR-1 | `fix/tracking-batch-1-subagent-ui` | ① `fix(preset): 子 Agent 级操作入口复活并区分空态与不支持态——#66`；② `fix(board): 父卡子代理徽标改用 monitor::subagents 同源重算——#134`；③ `fix(notify): 子代理回报提醒开关扩展至 codex/kimi/opencode——#152`（该子项挂在 #152 新特性账本） |
 | PR-2 | `fix/80-codex-cancel-esc` | `fix(inject): codex 问答取消放开 Esc 中断并标注破坏性文案——#80` |
 | PR-3 | `feat/69-codex-local-images-file-pool` | ① `feat(files): codex 文件池新增 event_msg local_images 用户图片抽取源——#69`；② `docs(specs): codex local_images 抽取底料与 claude/opencode 不入池结论落档——#69` |
 | #61 | `fix/61-subagent-completion-signal`（阶段分支） | 阶段 A→D 各自 PR；追记随阶段 A 首 PR 或独立 docs commit：`docs(plan): 子代理完成信号修复计划追加 2026-10-18 适配追记——#61` |
@@ -487,6 +487,7 @@ zcode 特例块（:575-591）之后、`merge_artifact_fallback`（:593）之前�
 5. **#69 local_images 字段层级待实机定案**：payload 层为主判据（与既有 event_msg 消费先例同构）+ 顶层兜底双探；夹具先行，用户实机样本复核后回填底料档（不伪造原始底料）。同 id 多 rollout 分叉为 files.rs ⚠ 既有登记，新源沿用提取侧口径不修。thread_history 单例车道不接（1/2290）。
 6. **#61 Task 2 推迟风险**：判据沿用计划内既有证据，若实现中发现失配 → 停下报告纪律（追记已写入）。
 7. **#66 契约变更**：`detect_subagents` 返回结构体，前后端 + tauri-mock 同 PR 同步（单体应用同构建，无兼容负担）；入口恒渲染增加卡片视觉密度（ruling 预期行为）。
+8. **codex 锚收集的目录 walk 预算收口（评审 I-1 处置，2026-10-18 已实施）**：回报打标把 `subagents::codex::collect` 搬进桌面 3s 轮询热路径，而其目录 walk（SessionFileScan::collect 递归 readdir 整棵 ~/.codex/sessions）无窗——已加进程级 TTL 备忘（CHILD_WALK_TTL=10s，按 sessions_dir 键控，reset_cache_for_tests 联动清理）：walk 频率从「每绿会话每 3s」降为「全进程每 10s 至多一次」。代价如实申报：新 spawn 的子 rollout 最晚 10s 后才被 chips 面板/回报打标发现（与移动端详情轮询节奏同量级）。
 
 ---
 

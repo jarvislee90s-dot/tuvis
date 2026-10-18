@@ -109,22 +109,62 @@ fn read_child_meta(path: &Path) -> Option<ChildMeta> {
 /// codex_index_window_allows_cached_stale_entries 锁定）：fresh → parse（含负缓存
 /// 命中跳过）；stale → peek（仅缓存命中参与，未缓存 = 历史首行不碰）。
 /// **不手搓 stat 比对 / retain 收敛**——门控与孤儿清理全在 SessionFileScan 内。
+///
+/// 目录 walk TTL 备忘（PR #167 评审 I-1 预算收口）：回报打标（#151 全工具化）
+/// 把 collect() 搬进了桌面 3s 轮询热路径——collect 的内容读取虽有 (mtime,size)
+/// 门控，但 SessionFileScan::collect 的**目录 walk 本身无窗**（session_scan.rs
+/// 「刻意不做窗口过滤」），每调用一次全量递归 readdir 整棵 ~/.codex/sessions，
+/// 在历史堆积机型上随历史线性增长且绿会话常驻不停。TTL=10s 与移动端详情轮询
+/// 节奏同量级：新 spawn 的子 rollout 最晚 10s 后可被发现（chips 面板与回报
+/// 打标同受此滞后，如实申报）；walk 频率从「每绿会话每 3s」降为「全进程每
+/// 10s 至多一次」，同轮多会话共享。缓存按 sessions_dir 键控（测试 tempdir
+/// 各自独立），reset_walk_cache_for_tests 随 reset_cache_for_tests 一并清。
+const CHILD_WALK_TTL_SECS: u64 = 10;
+
+/// walk 备忘缓存体：sessions_dir → (备忘时刻, 发现的 (rollout 路径, mtime) 清单)
+type ChildWalkCache = HashMap<PathBuf, (std::time::Instant, Arc<Vec<(PathBuf, SystemTime)>>)>;
+static CHILD_WALK_CACHE: std::sync::Mutex<Option<ChildWalkCache>> = std::sync::Mutex::new(None);
+
+fn child_rollout_files(sessions_dir: &Path) -> Arc<Vec<(PathBuf, SystemTime)>> {
+    let mut guard = CHILD_WALK_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hit = guard
+        .as_mut()
+        .and_then(|m| m.get_mut(sessions_dir))
+        .filter(|(at, _)| at.elapsed().as_secs() < CHILD_WALK_TTL_SECS);
+    if let Some((_, files)) = hit {
+        return Arc::clone(files);
+    }
+    let files = Arc::new(CODEX_IDX_SCAN.collect(sessions_dir, is_rollout_file));
+    let m = guard.get_or_insert_with(HashMap::new);
+    m.insert(sessions_dir.to_path_buf(), (std::time::Instant::now(), Arc::clone(&files)));
+    files
+}
+
+/// 测试隔离：清空 walk TTL 备忘（mod.rs reset_cache_for_tests 联动调用）
+#[cfg(test)]
+pub(crate) fn reset_walk_cache_for_tests() {
+    if let Ok(mut guard) = CHILD_WALK_CACHE.try_lock() {
+        *guard = None;
+    }
+}
+
 fn scan_child_metas(
     sessions_dir: &Path,
     now: SystemTime,
 ) -> Vec<(PathBuf, Arc<Option<ChildMeta>>)> {
-    CODEX_IDX_SCAN
-        .collect(sessions_dir, is_rollout_file)
-        .into_iter()
+    child_rollout_files(sessions_dir)
+        .iter()
         .map(|(path, mtime)| {
-            let meta = if fresh_within(mtime, now) {
-                CODEX_IDX_SCAN.parse(&path, read_child_meta)
+            let meta = if fresh_within(*mtime, now) {
+                CODEX_IDX_SCAN.parse(path, read_child_meta)
             } else {
                 CODEX_IDX_SCAN
-                    .peek::<Option<ChildMeta>>(&path)
+                    .peek::<Option<ChildMeta>>(path)
                     .unwrap_or_else(|| Arc::new(None))
             };
-            (path, meta)
+            (path.clone(), meta)
         })
         .collect()
 }
