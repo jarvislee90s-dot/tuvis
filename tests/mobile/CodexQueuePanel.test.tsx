@@ -188,6 +188,17 @@ describe("CodexQueuePanel（Task 9）", () => {
     expect(banner.textContent).toContain("暂停");
   });
 
+  it("native_delivery_unknown_banner：原生 Unknown 屏障 → 如实说无自动恢复（不得承诺自动继续）", async () => {
+    installFetch();
+    routes.queue = [queueView([action({ actionId: "a3" })], "native_delivery_unknown")];
+    render(<CodexQueuePanel sessionId="s1" />);
+    const banner = await screen.findByTestId("codex-queue-blocked");
+    expect(banner.getAttribute("data-reason")).toBe("native_delivery_unknown");
+    expect(banner.textContent).toContain("未知");
+    expect(banner.textContent).toContain("无自动恢复");
+    expect(banner.textContent).not.toContain("自动继续");
+  });
+
   it("native_turn_pending_banner：原生 Turn 屏障 → 分文案（不得说成兼容模式/回 Desktop 手工解除）", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a2" })], "native_turn_pending")];

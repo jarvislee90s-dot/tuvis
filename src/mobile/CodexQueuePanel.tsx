@@ -171,7 +171,9 @@ export default function CodexQueuePanel({
         >
           {view.blockedReasonCode === "native_turn_pending"
             ? i18n.t("mobile.codex.queue.blockedNativeTurn")
-            : i18n.t("mobile.codex.queue.blockedCompat")}
+            : view.blockedReasonCode === "native_delivery_unknown"
+              ? i18n.t("mobile.codex.queue.blockedNativeUnknown")
+              : i18n.t("mobile.codex.queue.blockedCompat")}
         </p>
       )}
       <ul className="mt-1 space-y-1">

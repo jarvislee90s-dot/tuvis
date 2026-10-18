@@ -1771,7 +1771,8 @@
         "retractBusy": "该条已派发，无法撤回（请回 Desktop 核对）",
         "retractFailed": "撤回失败：{{message}}",
         "blockedCompat": "存在兼容模式未完成的发送，队列已暂停派发——请回 Desktop 核对后继续",
-        "blockedNativeTurn": "原生回合未确认完成，队列已暂停派发——等待 Turn 完成后自动继续"
+        "blockedNativeTurn": "原生回合未确认完成，队列已暂停派发——等待 Turn 完成后自动继续",
+        "blockedNativeUnknown": "原生投递结果未知，队列已暂停派发——该屏障无自动恢复路径（保守保留，不自动重发）"
       },
       "composer": {
         "codexAccepted": "已受理，Desktop 正在执行",
