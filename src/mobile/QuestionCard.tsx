@@ -1214,7 +1214,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                 onClick={() => handleAnswer("cancel")}
                 className="w-full rounded-full bg-[var(--cb)] px-3 py-1.5 text-xs text-[var(--mut)] hover:bg-[var(--cb)] disabled:opacity-40"
               >
-                取消回答
+                {i18n.t("mobile.question.cancelInterrupt")}
               </button>
             </div>
           )}
@@ -1494,7 +1494,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             onClick={() => handleAnswer("cancel")}
             className="mt-1.5 w-full rounded-full bg-[var(--cb)] px-3 py-1.5 text-sm text-[var(--mut)] disabled:opacity-40"
           >
-            取消回答
+            {i18n.t("mobile.question.cancelInterrupt")}
           </button>
           {/* ===== 丁T5 §2.4：卡内自由作答输入框（入口 1；仅单题卡，本分支恒单题）===== */}
           {info.screen?.noteText != null && info.screen.noteText !== "" && (

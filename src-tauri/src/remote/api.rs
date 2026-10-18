@@ -6218,8 +6218,9 @@ fn dispatch_question_action(
             }
         }
         StagePlan::SingleKey => {
-            // **codex 备注编辑器守卫**（2026-10-05）：codex 的 SingleKey 只剩单选
-            // select（数字直选即交）——备注编辑器开启时数字会写进备注，检出即拒。
+            // **codex 备注编辑器守卫**（2026-10-05；#80 收口）：codex 的 SingleKey
+            // 承载单选 select（数字直选即交）与 cancel（esc 中断回合）——备注编辑器
+            // 开启时数字会写进备注，检出即拒（esc 同守卫拦截，保守不发）。
             if tool == "codex" {
                 let probe = question_probe(st, tool, pid);
                 if let Err(e) = crate::inject::question::codex_ensure_notes_closed(probe("guard")) {

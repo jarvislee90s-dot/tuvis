@@ -1505,6 +1505,9 @@
   "mobile": {
     "composer": {
       "sendFailedRetry": "Send failed: {{error}} (retry available)"
+    },
+    "question": {
+      "cancelInterrupt": "Interrupt turn (destructive)"
     }
   }
 }
