@@ -56,7 +56,9 @@ pub enum DescendantActivity {
     /// 存在**已派发但未结算**的后台工作（子代理 / 后台 bash / 后台任务）：
     /// 与 Active 的本质区别——Active 依赖"最近有写入"，长思考期会被误判 Stale；
     /// Pending 依赖"派发事件已见、结算事件未见"，语义是"账没结清"，与静默无关。
-    /// 判定优先级（各 parser 的映射函数负责）：Pending > Active > Stale > Absent
+    /// 语义优先级 Pending > Active > Stale > Absent——各 parser 在**调用点**按
+    /// 此优先条件映射（不改 descendant_activity 映射函数本身，Task 5/7/8 的
+    /// 接入形态：已有后代活跃信号之上，未结算证据在场时改调完成仲裁）
     Pending,
 }
 

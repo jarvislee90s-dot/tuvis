@@ -1532,6 +1532,8 @@ teammate 完成信号（甲.5 主判据）已随移动端子代理观察台独�
 
 Task 2（实机探测 5 项：WorkBuddy/OpenCode 注入落尾占比、dsh `parent_session` 可靠性、Codex 子代理抢占、Kimi v1.5+swarm、OpenClaw CPU 判据）**本轮推迟**。各 Task 判据沿用计划内既有实测证据（附录 A）。纪律：实现中若发现判据与 main 现状失配（形态漂移 / 字段改名 / 布局变更），**停下报告**，由用户裁决补探或改判据——不猜、不抄旧档。
 
+**补探清单追加（2026-10-18 阶段 A 评审 Nit2/Nit3）**：① `subagent_notification`（审计 7 条）是否携带 `metadata.originMeta.workId` 且语义确为「完成」——结算侧判据现无 kind 门，若其 workId 语义非完成会提前核销（假绿回归）；② 派发 part 的 `state.time.start` 是否随版本系统性缺失——`unwrap_or(now)` 缺失按新鲜处理，会让 24h 僵尸保护静默失效（未结算派发可长期劫持状态直至核销或滑出卡窗）。
+
 ### 其他现状对齐
 
 - `codex_parser.rs` 已部分预占 Task 6（`<turn_aborted>` 判 TurnEnd、developer→Other 已落地）；剩余未做：environment_context 等 6 个前缀白名单 + 子代理 rollout 排除。

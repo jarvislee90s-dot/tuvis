@@ -656,8 +656,17 @@ pub(crate) fn message_origin(v: &serde_json::Value) -> EntryOrigin {
         .pointer("/semantics/kind")
         .and_then(|k| k.as_str())
         .unwrap_or_default();
-    // 已知记账 kind 兜底（标记缺失场景）；新增 kind 时在此追加
-    if matches!(kind, "todo_reminder" | "timeline_event" | "system_reminder") {
+    // 已知记账 kind 兜底（标记缺失场景）；新增 kind 时在此追加。
+    // background/subagent_notification 一并纳入（评审 Nit1：by-construction 是
+    // 工具注入，兜底纳入零误伤——恰是 Z-P2 缺陷的主载体 157+7 条）
+    if matches!(
+        kind,
+        "todo_reminder"
+            | "timeline_event"
+            | "system_reminder"
+            | "background_notification"
+            | "subagent_notification"
+    ) {
         return EntryOrigin::Synthetic;
     }
     EntryOrigin::Human
@@ -1089,15 +1098,26 @@ mod tests {
         assert_eq!(role.as_deref(), Some("user"));
     }
 
-    /// 纵深防御：标记缺失但 kind 已知 → 仍跳过
+    /// 纵深防御：标记缺失但 kind 已知 → 仍跳过（含 Z-P2 主载体两 kind，评审 Nit1）
     #[test]
     fn known_kind_skipped_without_synthetic_flag() {
-        let old = r#"{"role":"user","semantics":{"kind":"todo_reminder"}}"#.to_string();
-        let msgs = vec![MessageRow {
-            id: "m1".into(),
-            data: old,
-        }];
-        assert!(flatten_entries(&msgs, &HashMap::new()).is_empty());
+        for kind in [
+            "todo_reminder",
+            "timeline_event",
+            "system_reminder",
+            "background_notification",
+            "subagent_notification",
+        ] {
+            let data = format!(r#"{{"role":"user","semantics":{{"kind":"{kind}"}}}}"#);
+            let msgs = vec![MessageRow {
+                id: "m1".into(),
+                data,
+            }];
+            assert!(
+                flatten_entries(&msgs, &HashMap::new()).is_empty(),
+                "标记缺失的已知记账 kind（{kind}）仍须跳过"
+            );
+        }
     }
 
     // ===== Z-P1：未结算后台工作仲裁（2026-09-15 修复，Task 4）=====
