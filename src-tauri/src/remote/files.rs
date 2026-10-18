@@ -588,6 +588,19 @@ pub(crate) fn extract_file_paths_with_env(
                     merger.merge(&path, seq, ts, FileOrigin::User);
                 }
             }
+            // #69：codex 用户图片第二抽取源——rollout event_msg 行 local_images
+            // （实测 2289/2290 承载车道在 rollout JSONL；map_codex_lines 只收
+            // response_item 触及不到，故独立第二源，照 zcode 先例形态）。进
+            // User 池（用户带入的图片，语义合身 + 零前端改动；artifact 兜底命中
+            // 已存在条目时跳过不覆盖）。必须在 merge_artifact_fallback 之前
+            // （:906 调用顺序契约）。底料档：specs/2026-10-18-codex-local-images-file-pool-底料.md
+            if agent_type == "codex" {
+                for (seq, path, ts) in
+                    super::content::read_codex_local_images_refs_with(home, session_id, limit)
+                {
+                    merger.merge(&path, seq, ts, FileOrigin::User);
+                }
+            }
             // 会话产物兜底（2026-10-13）：正文链接/行内反引号路径，命中既有池跳过；
             // 去重键按会话 cwd 绝对化（工具绝对路径 + 正文相对链接不重复上墙）
             merger.merge_artifact_fallback(
@@ -2807,6 +2820,238 @@ mod tests {
             report.to_string_lossy(),
             "展示保留工具侧绝对原文（相对形态不上墙）"
         );
+    }
+
+    // ==== #69：codex 用户图片附件（rollout event_msg local_images → User 池）====
+
+    /// 端到端牙齿（#69）：codex rollout event_msg 行 local_images → User 池条目
+    /// （照 zcode 先例形态）。tempdir home 造 rollout + 真实存在的图片；URI 与
+    /// 不存在条目不入池；path/lastSeq/lastTs/origin/hits 全字段锁——seq 取窗口
+    /// 行序（event_msg 不在 pg.messages 条目集内，行序是单调代理）
+    #[test]
+    fn codex_local_images_enter_user_pool_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let shot_a = cwd.join("user-shot-a.png");
+        let shot_b = cwd.join("user-shot-b.png");
+        std::fs::write(&shot_a, b"a").unwrap();
+        std::fs::write(&shot_b, b"b").unwrap();
+        let dir = tmp.path().join(".codex/sessions/2026/10/18");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join(format!("rollout-2026-10-18T00-00-00-{T9_UUID}.jsonl"));
+        let meta = serde_json::json!({
+            "timestamp": "2026-10-18T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": { "id": T9_UUID, "cwd": cwd.to_string_lossy() },
+        });
+        // 纯文本 user 行（无内联附件标记）：User 池条目只能来自 local_images 第二源
+        let user = serde_json::json!({
+            "timestamp": "2026-10-18T00:00:01.000Z",
+            "type": "response_item",
+            "payload": { "type": "message", "role": "user",
+                "content": [{ "type": "input_text", "text": "帮我看这两张截图" }] },
+        });
+        let ev = serde_json::json!({
+            "timestamp": "2026-10-18T00:00:05.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_images",
+                "local_images": [
+                    shot_a.to_string_lossy(),             // 字符串条目（存在）→ 收
+                    { "path": shot_b.to_string_lossy() }, // 对象 path 条目（存在）→ 收
+                    "https://x/y.png",                    // URI → 跳过
+                    cwd.join("ghost.png").to_string_lossy(), // 不存在 → 跳过
+                ],
+            },
+        });
+        std::fs::write(&rollout, format!("{meta}\n{user}\n{ev}\n")).unwrap();
+
+        let (entries, truncated) =
+            extract_file_paths_with_env(tmp.path(), None, None, "codex", T9_UUID, 200);
+        assert!(!truncated);
+        assert_eq!(
+            entries.len(),
+            2,
+            "恰两条 User 附件（URI/不存在不入池）：{entries:?}"
+        );
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-10-18T00:00:05.000Z")
+            .unwrap()
+            .timestamp_millis();
+        for e in &entries {
+            assert_eq!(e.origin, FileOrigin::User, "local_images 附件属用户池");
+            assert_eq!(e.last_seq, 2, "seq=窗口行序（event_msg 是窗口第 2 行）");
+            assert_eq!(e.last_ts, Some(ts), "ts 取 event_msg 行 timestamp");
+            assert_eq!(e.hits, 1);
+            assert!(!e.modified, "用户附件不是工具改写");
+        }
+        let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        assert!(paths.contains(&shot_a.to_string_lossy().into_owned()));
+        assert!(paths.contains(&shot_b.to_string_lossy().into_owned()));
+    }
+
+    /// 顺序契约 + 兜底不覆盖锁（#69；先例 merge_artifact_fallback_skips_existing_
+    /// keys_and_fills_new_ones :2334）：同一路径既是 local_images 又是 assistant
+    /// 正文 markdown 链接 → 单条 User。codex 臂在 merge_artifact_fallback 之前
+    /// （调用顺序契约），故兜底命中既有键整体跳过（hits 不涨 / lastSeq 不挪 /
+    /// origin 不落 session_artifact）——若臂被挪到兜底之后，本测试以 hits=2 变红
+    #[test]
+    fn codex_local_images_wins_over_artifact_fallback_single_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let shot = cwd.join("shot.png");
+        std::fs::write(&shot, b"x").unwrap();
+        let dir = tmp.path().join(".codex/sessions/2026/10/18");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rollout = dir.join(format!("rollout-2026-10-18T00-00-00-{T9_UUID}.jsonl"));
+        let meta = serde_json::json!({
+            "timestamp": "2026-10-18T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": { "id": T9_UUID, "cwd": cwd.to_string_lossy() },
+        });
+        let user = serde_json::json!({
+            "timestamp": "2026-10-18T00:00:01.000Z",
+            "type": "response_item",
+            "payload": { "type": "message", "role": "user",
+                "content": [{ "type": "input_text", "text": "看这张" }] },
+        });
+        // 窗口第 2 行：local_images 命中（User 池先落行）
+        let ev = serde_json::json!({
+            "timestamp": "2026-10-18T00:00:05.000Z",
+            "type": "event_msg",
+            "payload": { "local_images": [shot.to_string_lossy()] },
+        });
+        // 窗口第 3 行：assistant 正文 markdown 链接指向**同一物理文件**（兜底候选）
+        let assistant = serde_json::json!({
+            "timestamp": "2026-10-18T00:00:06.000Z",
+            "type": "response_item",
+            "payload": { "type": "message", "role": "assistant",
+                "content": [{ "type": "output_text",
+                    "text": format!("用户截图见 ![原图]({})", shot.to_string_lossy()) }] },
+        });
+        std::fs::write(
+            &rollout,
+            format!("{meta}\n{user}\n{ev}\n{assistant}\n"),
+        )
+        .unwrap();
+
+        let entries = extract_file_paths_with_env(tmp.path(), None, None, "codex", T9_UUID, 200).0;
+        assert_eq!(
+            entries.len(),
+            1,
+            "同一物理文件只出一行（User 池 + 兜底候选不双行）：{entries:?}"
+        );
+        let e = &entries[0];
+        assert_eq!(e.path, shot.to_string_lossy(), "展示保留绝对原文");
+        assert_eq!(e.origin, FileOrigin::User, "User 池条目不被兜底改标");
+        assert_eq!(
+            e.hits, 1,
+            "兜底命中既有键整体跳过（hits 不涨——臂挪到兜底之后则此处=2 变红）"
+        );
+        assert_eq!(e.last_seq, 2, "lastSeq 保持 local_images 行序（不被兜底挪走）");
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-10-18T00:00:05.000Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(e.last_ts, Some(ts), "lastTs 保持 event_msg 行 timestamp");
+        assert!(!e.modified);
+    }
+
+    /// 同 id 双 rollout（#69 底料档 ⚠ 既有登记问题沿用提取侧口径，不扩面修）：
+    /// 场景一——恰一份文件名内嵌 id → 快路径**确定性**命中该份（与 readdir 序
+    /// 无关），另一份的同 id 兜底文件不读；场景二——两份文件名都不含 id → 全量
+    /// 首行兜底命中其中之一。files.iter().find 依赖 collect_rollout_files 的
+    /// readdir 序（平台差异如实申报）：场景二只锁「单文件口径、不跨文件混叠」，
+    /// 不锁具体命中哪份
+    #[test]
+    fn codex_same_id_dual_rollouts_single_file_no_mixing() {
+        // ---- 场景一：快路径确定性（唯一含 id 的文件名胜出）----
+        let tmp = tempfile::tempdir().unwrap();
+        let shot_a = tmp.path().join("a.png");
+        let shot_b = tmp.path().join("b.png");
+        std::fs::write(&shot_a, b"a").unwrap();
+        std::fs::write(&shot_b, b"b").unwrap();
+        let meta_line = |ts: &str| {
+            serde_json::json!({
+                "timestamp": ts,
+                "type": "session_meta",
+                "payload": { "id": T9_UUID, "cwd": "/w" },
+            })
+            .to_string()
+        };
+        let ev_line = |ts: &str, img: &std::path::Path| {
+            serde_json::json!({
+                "timestamp": ts,
+                "type": "event_msg",
+                "payload": { "local_images": [img.to_string_lossy()] },
+            })
+            .to_string()
+        };
+        let d_new = tmp.path().join(".codex/sessions/2026/10/18");
+        let d_old = tmp.path().join(".codex/sessions/2026/10/17");
+        std::fs::create_dir_all(&d_new).unwrap();
+        std::fs::create_dir_all(&d_old).unwrap();
+        // 文件名内嵌 id（快路径命中）→ local_images 指向 a.png
+        std::fs::write(
+            d_new.join(format!("rollout-2026-10-18T00-00-00-{T9_UUID}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                meta_line("2026-10-18T00:00:00.000Z"),
+                ev_line("2026-10-18T00:00:01.000Z", &shot_a)
+            ),
+        )
+        .unwrap();
+        // 同 id 但文件名未含（旧形态，兜底候选）→ local_images 指向 b.png
+        std::fs::write(
+            d_old.join("rollout-2026-10-17T00-00-00-legacy.jsonl"),
+            format!(
+                "{}\n{}\n",
+                meta_line("2026-10-17T00:00:00.000Z"),
+                ev_line("2026-10-17T00:00:01.000Z", &shot_b)
+            ),
+        )
+        .unwrap();
+        let entries =
+            extract_file_paths_with_env(tmp.path(), None, None, "codex", T9_UUID, 200).0;
+        let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![shot_a.to_string_lossy().into_owned()],
+            "快路径文件确定性命中（readdir 序无关），兜底同 id 文件不读"
+        );
+
+        // ---- 场景二：均不含 id → 兜底命中其中之一（readdir 序平台差异，不锁具体份）----
+        let tmp2 = tempfile::tempdir().unwrap();
+        let shot_c = tmp2.path().join("c.png");
+        let shot_d = tmp2.path().join("d.png");
+        std::fs::write(&shot_c, b"c").unwrap();
+        std::fs::write(&shot_d, b"d").unwrap();
+        let dir2 = tmp2.path().join(".codex/sessions/2026/10/18");
+        std::fs::create_dir_all(&dir2).unwrap();
+        for (name, img) in [("rollout-alpha.jsonl", &shot_c), ("rollout-beta.jsonl", &shot_d)] {
+            std::fs::write(
+                dir2.join(name),
+                format!(
+                    "{}\n{}\n",
+                    meta_line("2026-10-18T00:00:00.000Z"),
+                    ev_line("2026-10-18T00:00:01.000Z", img)
+                ),
+            )
+            .unwrap();
+        }
+        let entries =
+            extract_file_paths_with_env(tmp2.path(), None, None, "codex", T9_UUID, 200).0;
+        assert_eq!(
+            entries.len(),
+            1,
+            "同 id 双 rollout 单文件口径：只读定位到的一份，不跨文件混叠：{entries:?}"
+        );
+        let hit = entries[0].path.clone();
+        assert!(
+            hit == shot_c.to_string_lossy() || hit == shot_d.to_string_lossy(),
+            "命中其中之一（具体哪份取决于 readdir 序，平台差异不锁）：{hit:?}"
+        );
+        assert_eq!(entries[0].origin, FileOrigin::User);
     }
 
     /// kimi 黄金夹具全链：wire 行 → map_kimi_lines → 抽取 → user 来源条目
