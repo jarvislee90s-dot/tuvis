@@ -370,7 +370,7 @@ pub(crate) fn read_codex_local_images_refs_with(
 ) -> Vec<(i64 /*窗口行序*/, String /*绝对路径*/, Option<i64> /*ts 毫秒*/)>
 ```
 
-- **rollout 定位**：从 `read_codex_rollout_with`（:1157-1207）提取共享 helper `locate_codex_rollout(sessions_dir, session_id) -> Option<PathBuf>`（文件名快路径 + 首行 `payload.id` 校验兜底；**未排序取首个含 id**——与既有提取链同口径）。`read_codex_rollout_with` 改调该 helper（行为不变，既有测试锁）。同 id 多份 rollout 的「提取侧首个 vs monitor 侧 mtime 最新」分叉是 `files.rs:597-605` ⚠ 已登记既有问题，**新源沿用提取侧口径、不扩面修**（落档申报）。
+- **rollout 定位**：从 `read_codex_rollout_with`（:1157-1207）提取共享 helper `locate_codex_rollout(sessions_dir, session_id) -> Result<PathBuf, String>`（文件名快路径 + 首行 `payload.id` 校验兜底，**两 Err 语义原样保留**：目录为空 / 未命中——read_codex_rollout_with 既有测试锁行为不变；**未排序取首个含 id**——与既有提取链同口径）。`read_codex_rollout_with` 改调该 helper（行为不变，既有测试锁）。同 id 多份 rollout 的「提取侧首个 vs monitor 侧 mtime 最新」分叉是 `files.rs:597-605` ⚠ 已登记既有问题，**新源沿用提取侧口径、不扩面修**（落档申报）。
 - **窗口预算**：复用 `read_recent_lines_with_budget(&f, line_budget(limit), byte_budget(limit))`——与 `read_codex_messages_with` 同刻度（条数窗 / 字节窗 512KB×⌈limit/200⌉ 封顶 4MB 机制照抄）。
 - **行判据**：`type=="event_msg"` 且 local_images 非空；local_images 取 `payload.local_images`（主判据——与 event_msg 既有消费先例 `subagents/codex.rs apply_rollout_line` 的 payload 层同构）+ 顶层 `local_images` 兜底探一层（形态漂移容忍，命中任一即收）。条目形态：字符串路径 或 对象 `path` 字段；其余跳过。
 - **路径卫生**（函数内前置，不依赖下游）：URI 判别（冒号前缀 >1 字符跳过，同 `files.rs:983-987` 判别——Windows 盘符单字符不误伤）；`path.exists()` 不存在跳过（照 zcode 先例「实体已清理 → 降级跳过，不可预览条目无展示价值」）。
