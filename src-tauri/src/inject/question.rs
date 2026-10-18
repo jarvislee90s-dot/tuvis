@@ -348,7 +348,8 @@ pub fn question_key_profile(tool: &str) -> QuestionKeyProfile {
 /// 才提交——故 select 序列是 `[数字, "1"]`（两键）。取消键 kimi 未测 → 走只读
 /// （返回 Err，端点 409，前端只读卡）。
 ///
-/// **codex ReadOnly**：任何动作都 Err（端点据此拒注入，前端只读卡）——「未验不出键」。
+/// **codex**：未验动作不出键（多选 submit 拒；toggle 走 CodexToggle 臂、cancel =
+/// esc 中断回合〔#80 放开〕）——已验面见上方 profile 表。
 pub fn answer_key_sequence_for(
     tool: &str,
     action: AnswerAction,
@@ -6318,6 +6319,11 @@ mod tests {
         );
         // 门级回归锁：`action_supported` 的 Cancel 走兜底臂直查键序档——防将来
         // 门被单独收紧（不经过键序层）时 codex cancel 再被拦（409 tool_readonly）
+        assert_eq!(
+            answer_key_sequence_for("codex", AnswerAction::Cancel, None, &multi()).unwrap(),
+            vec!["esc"],
+            "multi_select 载荷下 cancel 同一兜底臂（与 claude Cancel 无形态分支先例一致）"
+        );
         assert!(
             action_supported("codex", AnswerAction::Cancel, None, &q).is_ok(),
             "门与键序层必须同面：键序放行而门拒 = 用户必撞 409"
