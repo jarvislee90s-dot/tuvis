@@ -21,6 +21,7 @@
 // 测试约束（宪法级）：一律 tempdir / tmp sqlite / 黄金夹具，绝不触真实 ~/.zcode ~/.dsh 等；
 // 生产薄壳只做 dirs::home_dir() → `*_with(home)` 注入核的转发（zcode_home_with 先例）。
 
+use crate::monitor::app_status::EntryOrigin;
 use serde::Serialize;
 use std::path::Path;
 
@@ -538,15 +539,14 @@ fn read_zcode_messages_with(
             continue; // data 损坏 → 跳过该消息（防御）
         };
         let role = v.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-        let semantic = v
-            .pointer("/semantics/kind")
-            .and_then(|k| k.as_str())
-            .unwrap_or_default();
-        if matches!(
-            (role, semantic),
-            ("user", "todo_reminder") | ("user", "timeline_event")
-        ) {
-            continue; // 记账消息整条跳过（zcode_parser flatten_entries 同口径）
+        // 合成注入整条跳过（Z-P2 新口径，2026-10-18 适配追记③同步）：判据单点
+        // 复用 zcode_parser::message_origin（标记优先 + kind 兜底）——parser 改
+        // 口径后此处必须同批同步，否则看板状态与远程内容视图口径漂移
+        // （合成消息从卡片消失但仍出现在内容接口里）
+        if role == "user"
+            && crate::monitor::zcode_parser::message_origin(&v) == EntryOrigin::Synthetic
+        {
+            continue;
         }
         let msg_parts = parts.get(id);
         match role {
@@ -2381,6 +2381,50 @@ mod tests {
             rusqlite::params![id, mid, seq, data],
         )
         .unwrap();
+    }
+
+    /// 适配追记③同步点锁（Z-P2，2026-10-18）：synthetic 标记的注入消息
+    /// （background_notification 等）整条不进远程内容视图——parser 改口径后
+    /// content.rs 必须同批同步，本测试钉住两端口径一致
+    #[test]
+    fn zcode_synthetic_notifications_skipped_in_content_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = zcode_db(&tmp.path().join(".zcode/cli/db/db.sqlite"));
+        // 真实用户消息
+        zcode_msg(&conn, "m1", 1, 1000, "user", "user_prompt");
+        zcode_part(&conn, "p1", "m1", 1, r#"{"type":"text","text":"继续"}"#);
+        // synthetic 注入（标记命中，kind 是白名单外的 background_notification）
+        conn.execute(
+            "INSERT INTO message (id, session_id, sequence, time_created, data) VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![
+                "m2",
+                SID,
+                2,
+                1100,
+                r#"{"role":"user","synthetic":true,"semantics":{"kind":"background_notification","uiVisibility":"hidden"}}"#
+            ],
+        )
+        .unwrap();
+        zcode_part(
+            &conn,
+            "p2",
+            "m2",
+            1,
+            r#"{"type":"text","text":"<task-notification>原文</task-notification>"}"#,
+        );
+        drop(conn);
+        let pg = read_session_messages_with(tmp.path(), "zcode", SID, 50).unwrap();
+        let texts: Vec<&str> = pg
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["继续"],
+            "synthetic 注入（标记命中）不得进入内容视图（口径与 parser 同源）"
+        );
     }
 
     /// 全 kind 映射 + 记账消息跳过（todo_reminder / timeline_event 整条丢弃）；
