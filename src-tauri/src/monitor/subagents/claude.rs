@@ -188,6 +188,30 @@ pub(crate) fn collect_with(projects_root: &Path, session_id: &str) -> Vec<Subage
     let Some((parent_jsonl, subagents_dir)) = locate(projects_root, session_id) else {
         return Vec::new();
     };
+    collect_paths(parent_jsonl, subagents_dir, session_id)
+}
+
+/// 桌面看板热路径入口（#134）：父转写路径已知（claude_parser 手里就是它），
+/// 免 locate 的 projects 根遍历——无子代理会话（绝大多数）一次 is_dir stat 即止。
+/// 布局推导与 locate 同一规则（等价性测试锁定）；缓存键仍为 ("claude", session_id)
+/// ——与 remote chips 端点共用同一增量缓存条目，看板徽标与面板计数机制性一致。
+pub(crate) fn collect_at(parent_jsonl: &Path, session_id: &str) -> Vec<SubagentView> {
+    // 信任边界同 locate：session_id 是 UUID，入口拒绝路径分量（防 ../ 逃逸）
+    if session_id == ".." || session_id.contains('/') || session_id.contains('\\') {
+        return Vec::new();
+    }
+    let Some(project_dir) = parent_jsonl.parent() else {
+        return Vec::new();
+    };
+    let subagents_dir = project_dir.join(session_id).join("subagents");
+    if !subagents_dir.is_dir() {
+        return Vec::new();
+    }
+    collect_paths(parent_jsonl.to_path_buf(), subagents_dir, session_id)
+}
+
+/// 判据/缓存/状态机共享核：locate（或 collect_at 的路径推导）之后的所有工作
+fn collect_paths(parent_jsonl: PathBuf, subagents_dir: PathBuf, session_id: &str) -> Vec<SubagentView> {
     let reg = registered_agents(&subagents_dir);
     // 闭包 move parent_jsonl + subagents_dir + reg（发现结果一次取齐，step 不再反推路径）
     update_entry("claude", session_id, move |cur| {
@@ -1234,6 +1258,93 @@ mod tests {
         let v = collect_with(&f.root, "st-1");
         assert_eq!(v[0].status, SubagentStatus::Running);
         assert_eq!(v[0].end_ts, None);
+        super::super::reset_cache_for_tests();
+    }
+
+    // ==== #134：桌面看板热路径入口 collect_at（与 locate 等价性锁定）====
+
+    /// 视图比较键（SubagentView 无 PartialEq——不改生产 derive，取判据相关四元组）
+    fn view_key(v: &SubagentView) -> (String, String, SubagentStatus, Option<String>) {
+        (v.id.clone(), v.name.clone(), v.status, v.end_ts.clone())
+    }
+
+    /// 等价性锁定（#134 设计要求）：collect_at（parser 手里的父转写路径直接推导）
+    /// 与 collect_with+locate（projects 根遍历发现）对同一布局必须同出。
+    /// 两次调用之间清缓存——同键 ("claude", sid) 二次进入会直接命中缓存条目，
+    /// 那样 locate 路径根本没跑，等价性断言就失真了。
+    #[test]
+    fn collect_at_equivalent_to_locate_discovery() {
+        super::super::reset_cache_for_tests();
+        let f = claude_fixture("badge-1");
+        // r1：有停止通知 → Idle（endTs=子转写末行 ts）；r2：无事件 → spawn 态 Running
+        f.add_agent(
+            "badge-1",
+            "r1",
+            r#"{"agentType":"Plan"}"#,
+            &(agent_line("2026-10-08T07:00:00Z", 1, 0, 0, 1) + "\n"
+                + &agent_line("2026-10-08T07:05:00Z", 1, 0, 0, 1) + "\n"),
+        );
+        f.add_agent("badge-1", "r2", r#"{"agentType":"Explore"}"#, "");
+        f.append(&f.parent("badge-1"), &(notify("r1") + "\n"));
+
+        let via_locate: Vec<_> = collect_with(&f.root, "badge-1").iter().map(view_key).collect();
+        super::super::reset_cache_for_tests();
+        let via_at: Vec<_> = collect_at(&f.parent("badge-1"), "badge-1")
+            .iter()
+            .map(view_key)
+            .collect();
+        assert_eq!(
+            via_at, via_locate,
+            "同布局两路同出（布局推导规则不得漂移出第二份语义）"
+        );
+        assert_eq!(via_at.len(), 2);
+        assert!(via_at.iter().any(|(id, _, st, _)| id == "r2" && *st == SubagentStatus::Running));
+        assert!(via_at.iter().any(|(id, _, st, ts)| id == "r1"
+            && *st == SubagentStatus::Idle
+            && ts.as_deref() == Some("2026-10-08T07:05:00Z")));
+        super::super::reset_cache_for_tests();
+    }
+
+    /// 旧平铺布局（项目目录内无 <sid>/subagents/）→ collect_at 空态
+    /// （spec §1.2 定案：旧布局徽标归零为可接受收窄，此处锁定既定空态）
+    #[test]
+    fn collect_at_old_flat_layout_is_empty() {
+        super::super::reset_cache_for_tests();
+        let f = claude_fixture("badge-2");
+        // 旧布局形态：项目目录里只有平铺的 agent-*.jsonl（无会话目录/subagents）
+        std::fs::write(
+            f.root.join("proj--e--demo").join("agent-old.jsonl"),
+            agent_line("2026-10-08T07:00:00Z", 1, 0, 0, 1) + "\n",
+        )
+        .unwrap();
+        assert!(
+            collect_at(&f.parent("badge-2"), "badge-2").is_empty(),
+            "旧布局（无 <sid>/subagents/）→ 空态"
+        );
+        super::super::reset_cache_for_tests();
+    }
+
+    /// 信任边界同 locate：恶意 session_id（../ 逃逸 / 路径分隔符）→ 空态
+    #[test]
+    fn collect_at_rejects_traversal_session_id() {
+        super::super::reset_cache_for_tests();
+        let f = claude_fixture("badge-3");
+        f.add_agent("badge-3", "ok1", r#"{"agentType":"Plan"}"#, "");
+        // 逃逸目标真实存在（root/escape/subagents/ 有登记源）——无守卫时
+        // project_dir/../escape 布局推导会命中它
+        let escape = f.root.join("escape");
+        std::fs::create_dir_all(escape.join("subagents")).unwrap();
+        std::fs::write(
+            escape.join("subagents").join("agent-esc.meta.json"),
+            r#"{"agentType":"Plan"}"#,
+        )
+        .unwrap();
+        assert!(collect_at(&f.parent("badge-3"), "../escape").is_empty());
+        assert!(collect_at(&f.parent("badge-3"), "..").is_empty());
+        assert!(collect_at(&f.parent("badge-3"), "a/b").is_empty());
+        assert!(collect_at(&f.parent("badge-3"), "a\\b").is_empty());
+        // 正常 session_id 不受影响（守卫只拦路径形态）
+        assert_eq!(collect_at(&f.parent("badge-3"), "badge-3").len(), 1);
         super::super::reset_cache_for_tests();
     }
 }
