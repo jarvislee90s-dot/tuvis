@@ -397,13 +397,14 @@ fn build_session_from_row(
     // opencode 锚 = 子会话 time_updated（原始活动毫秒，不走 collect 视图——90s
     // 活跃窗滞后会漏掉「刚完成」的子代理）；父侧 = 本行 time_updated（与
     // last_activity_at 同源）。SQLite 查询即最新（豁免 L2/L3），绿会话闸住成本。
-    let last_message_subagent_report = matches!(status, SessionStatus::Idle | SessionStatus::Finished)
-        && display_message.as_deref().is_some_and(|m| !m.is_empty())
-        && crate::monitor::subagents::opencode::child_updated_anchors(session_id)
-            .iter()
-            .any(|&anchor| {
-                crate::monitor::subagents::report_anchor_near_last(anchor, time_updated)
-            });
+    let last_message_subagent_report =
+        matches!(status, SessionStatus::Idle | SessionStatus::Finished)
+            && display_message.as_deref().is_some_and(|m| !m.is_empty())
+            && crate::monitor::subagents::opencode::child_updated_anchors(session_id)
+                .iter()
+                .any(|&anchor| {
+                    crate::monitor::subagents::report_anchor_near_last(anchor, time_updated)
+                });
 
     Some(Session {
         id: session_id.to_string(),
@@ -2116,7 +2117,11 @@ mod v2_tests {
         });
         drop(guard);
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].status, SessionStatus::Idle, "前置：finish=stop → 绿");
+        assert_eq!(
+            sessions[0].status,
+            SessionStatus::Idle,
+            "前置：finish=stop → 绿"
+        );
         assert!(
             sessions[0].last_message_subagent_report,
             "子会话 time_updated 距父末条 5s（<90s 窗）→ 打标"
@@ -2457,7 +2462,6 @@ mod matching_tests {
             );
         }
     }
-
 }
 /// 复评 M-2：**实机验证占位**（`#[ignore]`——常规门禁只编译不跑）。
 ///

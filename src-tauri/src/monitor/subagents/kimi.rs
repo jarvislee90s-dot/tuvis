@@ -409,10 +409,10 @@ mod tests {
         let (_td, root) = kimi_fixture(
             "ks-anch",
             &[
-                ("main", "{}\n"),     // main 排除
-                ("agent-0", "{}\n"),  // 收
-                ("agent-1", "{}\n"),  // 收
-                ("empty-dir", ""),    // 无 wire.jsonl → 跳过（构造后删 wire）
+                ("main", "{}\n"),    // main 排除
+                ("agent-0", "{}\n"), // 收
+                ("agent-1", "{}\n"), // 收
+                ("empty-dir", ""),   // 无 wire.jsonl → 跳过（构造后删 wire）
             ],
         );
         std::fs::remove_file(
@@ -428,17 +428,32 @@ mod tests {
         let t0 = filetime::FileTime::from_unix_time(1_760_000_000, 123_000_000);
         let t1 = filetime::FileTime::from_unix_time(1_760_000_050, 0);
         std::fs::write(
-            root.sessions.join("wd-1").join("ks-anch").join("agents").join("agent-0").join("wire.jsonl"),
+            root.sessions
+                .join("wd-1")
+                .join("ks-anch")
+                .join("agents")
+                .join("agent-0")
+                .join("wire.jsonl"),
             "{}\n",
         )
         .unwrap();
         filetime::set_file_mtime(
-            root.sessions.join("wd-1").join("ks-anch").join("agents").join("agent-0").join("wire.jsonl"),
+            root.sessions
+                .join("wd-1")
+                .join("ks-anch")
+                .join("agents")
+                .join("agent-0")
+                .join("wire.jsonl"),
             t0,
         )
         .unwrap();
         filetime::set_file_mtime(
-            root.sessions.join("wd-1").join("ks-anch").join("agents").join("agent-1").join("wire.jsonl"),
+            root.sessions
+                .join("wd-1")
+                .join("ks-anch")
+                .join("agents")
+                .join("agent-1")
+                .join("wire.jsonl"),
             t1,
         )
         .unwrap();

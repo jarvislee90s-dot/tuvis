@@ -126,9 +126,7 @@ type ChildWalkCache = HashMap<PathBuf, (std::time::Instant, Arc<Vec<(PathBuf, Sy
 static CHILD_WALK_CACHE: std::sync::Mutex<Option<ChildWalkCache>> = std::sync::Mutex::new(None);
 
 fn child_rollout_files(sessions_dir: &Path) -> Arc<Vec<(PathBuf, SystemTime)>> {
-    let mut guard = CHILD_WALK_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut guard = CHILD_WALK_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let hit = guard
         .as_mut()
         .and_then(|m| m.get_mut(sessions_dir))
@@ -138,7 +136,10 @@ fn child_rollout_files(sessions_dir: &Path) -> Arc<Vec<(PathBuf, SystemTime)>> {
     }
     let files = Arc::new(CODEX_IDX_SCAN.collect(sessions_dir, is_rollout_file));
     let m = guard.get_or_insert_with(HashMap::new);
-    m.insert(sessions_dir.to_path_buf(), (std::time::Instant::now(), Arc::clone(&files)));
+    m.insert(
+        sessions_dir.to_path_buf(),
+        (std::time::Instant::now(), Arc::clone(&files)),
+    );
     files
 }
 

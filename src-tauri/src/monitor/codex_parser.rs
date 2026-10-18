@@ -11,9 +11,7 @@ use super::jsonl::{read_first_lines, read_recent_lines};
 use super::project::project_name_from_path;
 use super::session_scan::{fresh_within, SessionFileScan};
 use crate::adapter::AgentProcess;
-use crate::monitor::subagents::{
-    iso_to_ms, report_anchor_near_last, SubagentStatus,
-};
+use crate::monitor::subagents::{iso_to_ms, report_anchor_near_last, SubagentStatus};
 use crate::session::{jump_supported_for, AgentType, ProcessForm, Session, SessionStatus};
 use log::{debug, info};
 use serde::Deserialize;
@@ -689,20 +687,26 @@ fn session_from_digest(
     // collect 视图即可——与 kimi/opencode 的原始毫秒锚差异见 subagents/mod.rs）。
     // session_id 缺席直接不打标（N-2：免得绿+末条非空但无 id 时白付一次
     // collect 的目录 walk）
-    let last_message_subagent_report = matches!(status, SessionStatus::Idle | SessionStatus::Finished)
-        && digest.session_id.is_some()
-        && digest.last_message.as_deref().is_some_and(|m| !m.is_empty())
-        && digest
-            .last_timestamp
-            .as_deref()
-            .and_then(iso_to_ms)
-            .is_some_and(|last_ms| {
-                crate::monitor::subagents::codex::collect(digest.session_id.as_deref().unwrap_or(""))
+    let last_message_subagent_report =
+        matches!(status, SessionStatus::Idle | SessionStatus::Finished)
+            && digest.session_id.is_some()
+            && digest
+                .last_message
+                .as_deref()
+                .is_some_and(|m| !m.is_empty())
+            && digest
+                .last_timestamp
+                .as_deref()
+                .and_then(iso_to_ms)
+                .is_some_and(|last_ms| {
+                    crate::monitor::subagents::codex::collect(
+                        digest.session_id.as_deref().unwrap_or(""),
+                    )
                     .iter()
                     .filter(|v| v.status == SubagentStatus::Idle)
                     .filter_map(|v| v.end_ts.as_deref().and_then(iso_to_ms))
                     .any(|anchor| report_anchor_near_last(anchor, last_ms))
-            });
+                });
     Some(Session {
         id: digest.session_id.clone()?,
         agent_type: AgentType::Codex,
@@ -1668,7 +1672,12 @@ mod report_flag_tests {
 
     /// 在 `home/.codex/sessions/...` 下造一个子 rollout（parent_thread_id 指回父会话）
     fn child_rollout(home: &Path, parent_sid: &str, child_id: &str, complete_ts: &str) {
-        let d = home.join(".codex").join("sessions").join("2026").join("10").join("18");
+        let d = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("18");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join(format!("rollout-2026-10-18T08-00-01-{child_id}.jsonl")),
@@ -1703,8 +1712,12 @@ mod report_flag_tests {
         );
         let guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let s = with_home(tmp.path(), || {
-            session_from_digest(&report_digest(sid, &now.to_rfc3339()), ProcessForm::Cli, None)
-                .unwrap()
+            session_from_digest(
+                &report_digest(sid, &now.to_rfc3339()),
+                ProcessForm::Cli,
+                None,
+            )
+            .unwrap()
         });
         drop(guard);
         assert!(
@@ -1729,11 +1742,18 @@ mod report_flag_tests {
         );
         let guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let s = with_home(tmp.path(), || {
-            session_from_digest(&report_digest(sid, &now.to_rfc3339()), ProcessForm::Cli, None)
-                .unwrap()
+            session_from_digest(
+                &report_digest(sid, &now.to_rfc3339()),
+                ProcessForm::Cli,
+                None,
+            )
+            .unwrap()
         });
         drop(guard);
-        assert!(!s.last_message_subagent_report, "10 分钟前的完成事件不构成回报");
+        assert!(
+            !s.last_message_subagent_report,
+            "10 分钟前的完成事件不构成回报"
+        );
         crate::monitor::subagents::reset_cache_for_tests();
     }
 
@@ -1769,7 +1789,10 @@ mod report_flag_tests {
         });
         drop(guard);
         assert_eq!(s.status, SessionStatus::Processing);
-        assert!(!s.last_message_subagent_report, "非绿会话不触发锚收集（预算闸）");
+        assert!(
+            !s.last_message_subagent_report,
+            "非绿会话不触发锚收集（预算闸）"
+        );
         crate::monitor::subagents::reset_cache_for_tests();
     }
 }

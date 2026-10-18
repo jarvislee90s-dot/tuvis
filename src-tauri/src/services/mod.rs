@@ -166,7 +166,10 @@ mod subagent_detection_tests {
             detect_subagents("claude") // tempdir 下无 ~/.claude/agents
         });
         drop(guard);
-        assert!(d.supported, "目录不存在 = 支持但从未 spawn → supported=true");
+        assert!(
+            d.supported,
+            "目录不存在 = 支持但从未 spawn → supported=true"
+        );
         assert!(d.agents.is_empty(), "空列表（可区分「不支持」的新契约点）");
     }
 

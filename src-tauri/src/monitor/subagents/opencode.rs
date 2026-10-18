@@ -379,11 +379,66 @@ mod tests {
         let db = td.path().join("opencode.db");
         let conn = make_db(&db);
         let now = 2_000_000_000_000i64;
-        ins(&conn, "main-1", None, None, 0, 0, 0, 0, now - 9_000_000, now);
-        ins(&conn, "child-1", Some("main-1"), Some("a"), 0, 0, 0, 0, now - 60_000, now - 30_000);
-        ins(&conn, "child-2", Some("main-1"), Some("b"), 0, 0, 0, 0, now - 50_000, now - 10_000);
-        ins(&conn, "orphan", None, Some("a"), 0, 0, 0, 0, now - 1000, now); // parent NULL → 非子
-        ins(&conn, "other-child", Some("main-2"), Some("a"), 0, 0, 0, 0, now - 1000, now);
+        ins(
+            &conn,
+            "main-1",
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            now - 9_000_000,
+            now,
+        );
+        ins(
+            &conn,
+            "child-1",
+            Some("main-1"),
+            Some("a"),
+            0,
+            0,
+            0,
+            0,
+            now - 60_000,
+            now - 30_000,
+        );
+        ins(
+            &conn,
+            "child-2",
+            Some("main-1"),
+            Some("b"),
+            0,
+            0,
+            0,
+            0,
+            now - 50_000,
+            now - 10_000,
+        );
+        ins(
+            &conn,
+            "orphan",
+            None,
+            Some("a"),
+            0,
+            0,
+            0,
+            0,
+            now - 1000,
+            now,
+        ); // parent NULL → 非子
+        ins(
+            &conn,
+            "other-child",
+            Some("main-2"),
+            Some("a"),
+            0,
+            0,
+            0,
+            0,
+            now - 1000,
+            now,
+        );
         drop(conn);
         let mut anchors = child_updated_anchors_with(&db, "main-1");
         anchors.sort_unstable();

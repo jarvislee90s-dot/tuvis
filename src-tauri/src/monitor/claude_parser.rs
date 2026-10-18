@@ -484,7 +484,10 @@ mod title_tests {
             .iter()
             .filter(|v| v.status == crate::monitor::subagents::SubagentStatus::Running)
             .count();
-        assert_eq!(count, 1, "新布局下徽标恢复真实值：1 Running（旧实现扫不到恒 0）");
+        assert_eq!(
+            count, 1,
+            "新布局下徽标恢复真实值：1 Running（旧实现扫不到恒 0）"
+        );
         crate::monitor::subagents::reset_cache_for_tests();
     }
 
@@ -516,7 +519,10 @@ mod title_tests {
             .iter()
             .filter(|v| v.status == crate::monitor::subagents::SubagentStatus::Running)
             .count();
-        assert_eq!(count, 0, "无子代理会话一次 is_dir 即止（预算契约 L3 不扩面）");
+        assert_eq!(
+            count, 0,
+            "无子代理会话一次 is_dir 即止（预算契约 L3 不扩面）"
+        );
         crate::monitor::subagents::reset_cache_for_tests();
     }
 
@@ -538,11 +544,14 @@ mod title_tests {
         let guard = crate::monitor::test_env::HOME_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let sessions = crate::monitor::test_env::with_home(&home, || {
-            get_claude_sessions(&[fake_process(1)])
-        });
+        let sessions =
+            crate::monitor::test_env::with_home(&home, || get_claude_sessions(&[fake_process(1)]));
         drop(guard);
-        assert_eq!(sessions.len(), 1, "进程 cwd=/work/demo 匹配 -work-demo 项目目录出卡");
+        assert_eq!(
+            sessions.len(),
+            1,
+            "进程 cwd=/work/demo 匹配 -work-demo 项目目录出卡"
+        );
         assert_eq!(
             sessions[0].active_subagent_count, 1,
             "新布局端到端：徽标 = Running 数（旧 count_active_subagents 扫项目目录一层恒 0）"

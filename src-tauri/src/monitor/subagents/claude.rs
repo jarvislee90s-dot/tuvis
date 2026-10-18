@@ -214,7 +214,11 @@ pub(crate) fn collect_at(parent_jsonl: &Path, session_id: &str) -> Vec<SubagentV
 }
 
 /// 判据/缓存/状态机共享核：locate（或 collect_at 的路径推导）之后的所有工作
-fn collect_paths(parent_jsonl: PathBuf, subagents_dir: PathBuf, session_id: &str) -> Vec<SubagentView> {
+fn collect_paths(
+    parent_jsonl: PathBuf,
+    subagents_dir: PathBuf,
+    session_id: &str,
+) -> Vec<SubagentView> {
     let reg = registered_agents(&subagents_dir);
     // 闭包 move parent_jsonl + subagents_dir + reg（发现结果一次取齐，step 不再反推路径）
     update_entry("claude", session_id, move |cur| {
@@ -1284,13 +1288,18 @@ mod tests {
             "badge-1",
             "r1",
             r#"{"agentType":"Plan"}"#,
-            &(agent_line("2026-10-08T07:00:00Z", 1, 0, 0, 1) + "\n"
-                + &agent_line("2026-10-08T07:05:00Z", 1, 0, 0, 1) + "\n"),
+            &(agent_line("2026-10-08T07:00:00Z", 1, 0, 0, 1)
+                + "\n"
+                + &agent_line("2026-10-08T07:05:00Z", 1, 0, 0, 1)
+                + "\n"),
         );
         f.add_agent("badge-1", "r2", r#"{"agentType":"Explore"}"#, "");
         f.append(&f.parent("badge-1"), &(notify("r1") + "\n"));
 
-        let via_locate: Vec<_> = collect_with(&f.root, "badge-1").iter().map(view_key).collect();
+        let via_locate: Vec<_> = collect_with(&f.root, "badge-1")
+            .iter()
+            .map(view_key)
+            .collect();
         super::super::reset_cache_for_tests();
         let via_at: Vec<_> = collect_at(&f.parent("badge-1"), "badge-1")
             .iter()
@@ -1301,7 +1310,9 @@ mod tests {
             "同布局两路同出（布局推导规则不得漂移出第二份语义）"
         );
         assert_eq!(via_at.len(), 2);
-        assert!(via_at.iter().any(|(id, _, st, _)| id == "r2" && *st == SubagentStatus::Running));
+        assert!(via_at
+            .iter()
+            .any(|(id, _, st, _)| id == "r2" && *st == SubagentStatus::Running));
         assert!(via_at.iter().any(|(id, _, st, ts)| id == "r1"
             && *st == SubagentStatus::Idle
             && ts.as_deref() == Some("2026-10-08T07:05:00Z")));

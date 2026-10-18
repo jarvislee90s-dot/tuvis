@@ -439,14 +439,32 @@ mod tests {
     fn report_anchor_near_last_boundaries() {
         let last = 1_000_000_000_000i64;
         // 窗内：回报距父末条 89_999 → 命中
-        assert!(report_anchor_near_last(last - 89_999, last), "窗内 89_999 命中");
+        assert!(
+            report_anchor_near_last(last - 89_999, last),
+            "窗内 89_999 命中"
+        );
         // 窗外：90_001 → 不命中（90_000 恰在窗沿也命中——≤ window）
-        assert!(!report_anchor_near_last(last - 90_001, last), "窗外 90_001 拒");
-        assert!(report_anchor_near_last(last - 90_000, last), "窗沿 90_000 命中（≤）");
+        assert!(
+            !report_anchor_near_last(last - 90_001, last),
+            "窗外 90_001 拒"
+        );
+        assert!(
+            report_anchor_near_last(last - 90_000, last),
+            "窗沿 90_000 命中（≤）"
+        );
         // 锚晚于 last：容差内（≤ skew）命中、超容差拒
-        assert!(report_anchor_near_last(last + 2_000, last), "锚=last+skew 命中（≤）");
-        assert!(!report_anchor_near_last(last + 2_001, last), "锚>last+skew 拒");
-        assert!(!report_anchor_near_last(last + 100_000, last), "锚远晚于 last 拒");
+        assert!(
+            report_anchor_near_last(last + 2_000, last),
+            "锚=last+skew 命中（≤）"
+        );
+        assert!(
+            !report_anchor_near_last(last + 2_001, last),
+            "锚>last+skew 拒"
+        );
+        assert!(
+            !report_anchor_near_last(last + 100_000, last),
+            "锚远晚于 last 拒"
+        );
         // 锚==last → 命中
         assert!(report_anchor_near_last(last, last), "锚==last 命中");
         // last 早于锚的极远端（i64 域无溢出 panic；saturating 语义下仍拒）
@@ -466,13 +484,21 @@ mod tests {
     #[test]
     fn iso_to_ms_valid_and_invalid() {
         assert_eq!(iso_to_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(iso_to_ms("1969-12-31T23:59:59Z"), Some(-1_000), "纪元前为负毫秒");
+        assert_eq!(
+            iso_to_ms("1969-12-31T23:59:59Z"),
+            Some(-1_000),
+            "纪元前为负毫秒"
+        );
         assert_eq!(iso_to_ms("2026-10-18T00:00:00Z"), Some(1_792_281_600_000));
         // ms_to_iso 的逆（round-trip，顺带锁时区偏移形态）
         let ms = 1_760_000_000_123i64;
         assert_eq!(ms_to_iso(ms).as_deref().and_then(iso_to_ms), Some(ms));
         assert_eq!(iso_to_ms("not a timestamp"), None);
         assert_eq!(iso_to_ms(""), None);
-        assert_eq!(iso_to_ms("2026-10-18"), None, "缺时间部分的日期不算 rfc3339");
+        assert_eq!(
+            iso_to_ms("2026-10-18"),
+            None,
+            "缺时间部分的日期不算 rfc3339"
+        );
     }
 }
