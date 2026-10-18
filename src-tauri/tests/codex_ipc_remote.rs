@@ -2874,6 +2874,221 @@ fn snapshot_frame(
     })
 }
 
+/// 2026-10-19 复审 P1：多义终态证据（同 turnId 多副本：缺 status 在前 / 状态
+/// 冲突）**顺序无关地**不清持久屏障、不派发下一条；多副本同 completed 才放行。
+/// 证据门本体（router）未被放宽——本测试走完整 hub 生产装配。
+#[tokio::test]
+async fn multi_copy_ambiguous_turn_evidence_never_clears_barrier() {
+    fn two_copy_snapshot(
+        rev: u64,
+        a: (&str, Option<&str>),
+        b: (&str, Option<&str>),
+    ) -> serde_json::Value {
+        let ent = |status: Option<&str>| {
+            let mut e = serde_json::json!({
+                "turnId": "turn-mc-1",
+                "items": []
+            });
+            if let Some(st) = status {
+                e["status"] = serde_json::json!(st);
+            }
+            e
+        };
+        serde_json::json!({
+            "type": "snapshot", "revision": rev,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "threadRuntimeStatus": { "type": "idle" },
+                "turnHistory": { "kind": "canonical", "history": {
+                    "generation": 0, "isComplete": true,
+                    "entitiesByKey": {
+                        a.0: ent(a.1),
+                        b.0: ent(b.1),
+                    },
+                    "islands": [ { "entries": [
+                        { "key": a.0, "value": a.0 },
+                        { "key": b.0, "value": b.0 }
+                    ] } ]
+                } }
+            }
+        })
+    }
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    f.state
+        .codex_control
+        .set_reconcile_period_ms(std::time::Duration::from_millis(200).as_millis() as u64);
+    f.state.codex_control.start(f.state.clone());
+
+    // ① send#1：ensure → start-turn → 应答 accepted（绑定 turn-mc-1，屏障在册）
+    let body1 = send_body("多义甲", Some("act-mc-1"), false);
+    let task1 = tokio::spawn(async move {
+        let _ = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some(COOKIE),
+                Some(body1),
+            ))
+            .await;
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    task1.abort();
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-mc-1", "status": "inProgress" } }
+    }))
+    .await;
+    let view = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let v = f
+                .hub_store()
+                .get_for_device("act-mc-1", "dev-1")
+                .unwrap()
+                .unwrap();
+            if v.state != ActionState::Reserved {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("dispatch settles");
+    assert_eq!(view.state, ActionState::Accepted);
+    assert!(f.hub_store().has_compat_fence(&f.thread_key()).unwrap());
+
+    // ② 第二条入队（被屏障挡住）
+    let _ = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("多义乙", Some("act-mc-2"), false)),
+        ))
+        .await
+        .unwrap();
+
+    // ③ 缺 status 副本在**前**、completed 在后 → 顺序无关多义：不清屏障、不派发
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": { "conversationId": THREAD, "hostId": "local",
+                    "change": two_copy_snapshot(8, ("turn:a", None),
+                                                ("turn:b", Some("completed"))) }
+    }))
+    .await;
+    let neg = tokio::time::timeout(Duration::from_millis(1200), peer.recv()).await;
+    assert!(neg.is_err(), "缺 status 副本在前：多义不得放行/接力");
+
+    // ④ 状态冲突（completed 在前、inProgress 在后）→ 仍不放行
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": { "conversationId": THREAD, "hostId": "local",
+                    "change": two_copy_snapshot(9, ("turn:b", Some("completed")),
+                                                ("turn:c", Some("inProgress"))) }
+    }))
+    .await;
+    let neg2 = tokio::time::timeout(Duration::from_millis(1200), peer.recv()).await;
+    assert!(neg2.is_err(), "状态冲突不得放行/接力");
+
+    // ⑤ 多副本同 completed → 证据成立：清屏障并只接力下一条
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": { "conversationId": THREAD, "hostId": "local",
+                    "change": two_copy_snapshot(10, ("turn:b", Some("completed")),
+                                                 ("turn:c", Some("completed"))) }
+    }))
+    .await;
+    let frame2 = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .expect("多副本同 completed 后队列必须接力");
+    assert_eq!(frame2["method"], "thread-follower-start-turn");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame2["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-mc-2", "status": "inProgress" } }
+    }))
+    .await;
+    f.state.codex_control.stop();
+}
+
+/// 2026-10-19 复审 P2-3：结构错误（非法 entries）经 HTTP 投影必须 Unsupported，
+/// 不得 Ready + 0 条冒充真空会话。
+#[tokio::test]
+async fn invalid_structure_projects_unsupported_over_http() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let key = f.thread_key();
+    let adapter = f.state.codex_control.adapter.clone();
+    let task = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("ensure in time");
+    // 坏结构快照（rev 100 > ensure 基线 7）：非法 entries
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": {
+            "conversationId": THREAD, "hostId": "local",
+            "change": {
+                "type": "snapshot", "revision": 100,
+                "conversationState": {
+                    "turns": [], "requests": [],
+                    "threadRuntimeStatus": { "type": "idle" },
+                    "turnHistory": { "kind": "canonical", "history": {
+                        "generation": 0, "isComplete": true,
+                        "entitiesByKey": {},
+                        "islands": [ { "entries": ["not-an-object"] } ]
+                    } }
+                }
+            }
+        }
+    }))
+    .await;
+    // 等镜像吃到坏帧（projection 只读轮询）
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if adapter.projection(&key).await.revision == Some(100) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待坏结构快照应用超时"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["contentState"], "unsupported", "坏结构不得 Ready：{v}");
+    assert_eq!(v["messages"].as_array().map(|a| a.len()), Some(0));
+    f.state.codex_control.stop();
+}
+
 /// C2.1：owner 失效（socket 仍活着）→ 必须**自动**重新 discovery/follow（无 GET、
 /// 无待发工作），新 owner 的 snapshot 落进镜像、视图自动复活——不再永久 stale。
 #[tokio::test]

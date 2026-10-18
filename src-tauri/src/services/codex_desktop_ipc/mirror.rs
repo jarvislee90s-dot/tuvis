@@ -180,6 +180,17 @@ impl ThreadMirror {
         self.history_complete
     }
 
+    /// 只读 hydrate 触发判据（2026-10-19 复审 P2-2）：**列表完整性不够**——Turn
+    /// 列表完整但某个 turn 的 items 分页未载完/淘汰/明确未加载（itemsView）时同样
+    /// 需要 load-complete-history；结构不可读也做有界只读重载尝试（可能是坏快照）。
+    /// 无快照不触发（follow 首帧随后到达再判）。目标 Turn 终态证据不走本判据。
+    pub fn needs_hydration(&self) -> bool {
+        match self.state.as_ref() {
+            None => false,
+            Some(state) => HistoryView::new(state).needs_hydration(),
+        }
+    }
+
     /// 原始 conversationState 本体（pending permissions 回显等只读用途；不进远程 API）。
     pub fn raw_state(&self) -> Option<&Value> {
         self.state.as_ref()
@@ -431,7 +442,9 @@ fn content_state_of(state: Option<&Value>) -> ContentState {
         return ContentState::Loading;
     };
     let view = HistoryView::new(state);
-    if !view.readable() {
+    if !view.readable() || view.health() != super::history_view::ViewHealth::Ok {
+        // 结构不可读 ≠ 真空会话（2026-10-19 复审 P2-3：非法 entries/items 类型/
+        // 悬空引用不得 Ready+0 条）
         ContentState::Unsupported
     } else if !view.turn_list_complete() {
         ContentState::Loading
@@ -1349,25 +1362,53 @@ mod tests {
         );
     }
 
+    /// 在 observed 金样上为目标 Turn 追加一个副本（同 turnId，可指定 status/items；
+    /// `prepend` 把副本引用插到 canonical 序列最前——顺序敏感性回归用）。
+    fn with_target_copy(prepend: bool, status: Option<&str>, items: Value) -> Value {
+        let mut change = observed_change("canonical-before-load.sanitized.json");
+        let hist = &mut change["conversationState"]["turnHistory"]["history"];
+        {
+            let entities = hist["entitiesByKey"].as_object_mut().unwrap();
+            let mut entity = serde_json::json!({
+                "turnId": "00000000-0000-4000-8000-000000000006",
+                "items": items,
+            });
+            if let Some(st) = status {
+                entity["status"] = serde_json::json!(st);
+            }
+            entities.insert("tail:9:local:dupref".into(), entity);
+        }
+        let entries = hist["islands"][0]["entries"].as_array_mut().unwrap();
+        let reference = serde_json::json!({
+            "key": "tail:9:local:dupref", "value": "tail:9:local:dupref"
+        });
+        if prepend {
+            entries.insert(0, reference);
+        } else {
+            entries.push(reference);
+        }
+        change
+    }
+
     #[test]
     fn observed_derived_duplicate_turn_reference_dedup_and_ambiguity() {
-        // P2-2（复审）：键迁移双引用窗口——同 turnId 两个被引用实体
+        // 报告 §4：两个被引用实体**都携带同一个 item ID**——只有生产去重逻辑
+        // 在场才能通过本条（旧断言只在副本里放 dup-item，删掉 seen_ids 也能绿）
+        let shared = serde_json::json!([{ "type": "agentMessage", "id": "dup-item",
+                                          "text": "重复气泡候选" }]);
         let mut change = observed_change("canonical-before-load.sanitized.json");
         {
             let hist = &mut change["conversationState"]["turnHistory"]["history"];
             let entities = hist["entitiesByKey"].as_object_mut().unwrap();
-            // 复制一份目标 turn 实体到 tail 合成键（同 turnId、同 status）
-            let target = entities["turn:00000000-0000-4000-8000-000000000006"].clone();
+            entities["turn:00000000-0000-4000-8000-000000000006"]["items"] = shared.clone();
             entities.insert(
                 "tail:9:local:dupref".into(),
                 serde_json::json!({
                     "turnId": "00000000-0000-4000-8000-000000000006",
                     "status": "completed",
-                    "items": [ { "type": "agentMessage", "id": "dup-item",
-                                 "text": "重复气泡候选" } ]
+                    "items": shared,
                 }),
             );
-            let _ = target;
             let entries = hist["islands"][0]["entries"].as_array_mut().unwrap();
             entries.push(serde_json::json!({
                 "key": "tail:9:local:dupref", "value": "tail:9:local:dupref"
@@ -1375,9 +1416,7 @@ mod tests {
         }
         let mut m = ThreadMirror::new(key());
         m.apply(&lease(), &change).unwrap();
-        // 状态一致 → 证据成立（多义仅在不一致时保守）
         assert!(m.turn_is_terminal("00000000-0000-4000-8000-000000000006"));
-        // 投影去重：dup-item 只出现一次
         let p = m.project(caps());
         let dup: Vec<_> = p
             .messages
@@ -1386,25 +1425,148 @@ mod tests {
             .collect();
         assert_eq!(dup.len(), 1, "双引用重叠 items 按去重，不追加重复气泡");
 
-        // 状态冲突（旧副本 completed、现行 inProgress）→ 多义，保守无证据
-        let mut conflict = observed_change("canonical-before-load.sanitized.json");
+        // 空占位副本在前 + 原体正文在后：去重不得吞掉原体已加载的正文（顺序断言）
+        let mut ordered = observed_change("canonical-before-load.sanitized.json");
         {
-            let hist = &mut conflict["conversationState"]["turnHistory"]["history"];
+            let hist = &mut ordered["conversationState"]["turnHistory"]["history"];
             let entities = hist["entitiesByKey"].as_object_mut().unwrap();
-            let mut entity = entities["turn:00000000-0000-4000-8000-000000000006"].clone();
-            entity["status"] = serde_json::json!("inProgress");
-            entities.insert("tail:9:local:dupref".into(), entity);
+            entities.insert(
+                "tail:9:local:emptycopy".into(),
+                serde_json::json!({
+                    "turnId": "00000000-0000-4000-8000-000000000011",
+                    "items": []
+                }),
+            );
             let entries = hist["islands"][0]["entries"].as_array_mut().unwrap();
-            entries.push(serde_json::json!({
-                "key": "tail:9:local:dupref", "value": "tail:9:local:dupref"
-            }));
+            let pos = entries
+                .iter()
+                .position(|e| e["value"] == "tail:0:local:00000000-0000-4000-8000-000000000021")
+                .expect("tail turn entry");
+            entries.insert(
+                pos,
+                serde_json::json!({
+                    "key": "tail:9:local:emptycopy", "value": "tail:9:local:emptycopy"
+                }),
+            );
         }
-        let mut m2 = ThreadMirror::new(key());
-        m2.apply(&lease(), &conflict).unwrap();
-        assert!(
-            !m2.turn_is_terminal("00000000-0000-4000-8000-000000000006"),
-            "同 turnId 多实体状态冲突 = 多义，不得按首个放行"
+        let mut m_ordered = ThreadMirror::new(key());
+        m_ordered.apply(&lease(), &ordered).unwrap();
+        let p2 = m_ordered.project(caps());
+        assert_eq!(
+            p2.messages
+                .iter()
+                .filter(|msg| msg.id == "00000000-0000-4000-8000-000000000012")
+                .count(),
+            1,
+            "空占位副本在前不得遮蔽/重复原体已加载正文"
         );
+    }
+
+    #[test]
+    fn observed_derived_multi_copy_status_is_order_independent() {
+        // 报告 2.1（P1）：缺 status 副本出现在前/后必须同判——多义一律无证据
+        for prepend in [true, false] {
+            let mut m = ThreadMirror::new(key());
+            m.apply(
+                &lease(),
+                &with_target_copy(prepend, None, serde_json::json!([])),
+            )
+            .unwrap();
+            assert!(
+                !m.turn_is_terminal("00000000-0000-4000-8000-000000000006"),
+                "缺 status 副本（prepend={prepend}）在场即多义，不得按另一副本放行"
+            );
+            let mut m2 = ThreadMirror::new(key());
+            m2.apply(
+                &lease(),
+                &with_target_copy(prepend, Some("inProgress"), serde_json::json!([])),
+            )
+            .unwrap();
+            assert!(
+                !m2.turn_is_terminal("00000000-0000-4000-8000-000000000006"),
+                "状态冲突（prepend={prepend}）不得放行"
+            );
+            let mut m3 = ThreadMirror::new(key());
+            m3.apply(
+                &lease(),
+                &with_target_copy(prepend, Some("completed"), serde_json::json!([])),
+            )
+            .unwrap();
+            assert!(
+                m3.turn_is_terminal("00000000-0000-4000-8000-000000000006"),
+                "多副本同 completed 可认定终态（prepend={prepend}）"
+            );
+        }
+    }
+
+    #[test]
+    fn observed_derived_structure_errors_are_not_ready_empty() {
+        // 报告 2.3：结构错误不得 Ready + 0 条（不冒充真空会话）
+        let mut bad_entries = observed_change("canonical-before-load.sanitized.json");
+        bad_entries["conversationState"]["turnHistory"]["history"]["islands"][0]["entries"] =
+            serde_json::json!(["not-an-object"]);
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &bad_entries).unwrap();
+        assert_eq!(
+            m.project(caps()).content_state,
+            ContentState::Unsupported,
+            "非法 entries 必须 Unsupported，不得 Ready+0 条"
+        );
+        let mut bad_items = observed_change("canonical-before-load.sanitized.json");
+        bad_items["conversationState"]["turnHistory"]["history"]["entitiesByKey"]
+            ["turn:00000000-0000-4000-8000-000000000002"]["items"] =
+            serde_json::json!("not-an-array");
+        let mut m2 = ThreadMirror::new(key());
+        m2.apply(&lease(), &bad_items).unwrap();
+        assert_eq!(m2.project(caps()).content_state, ContentState::Unsupported);
+        let mut dangling = observed_change("canonical-before-load.sanitized.json");
+        dangling["conversationState"]["turnHistory"]["history"]["islands"][0]["entries"][0]
+            ["value"] = serde_json::json!("no-such-entity");
+        let mut m3 = ThreadMirror::new(key());
+        m3.apply(&lease(), &dangling).unwrap();
+        assert_eq!(m3.project(caps()).content_state, ContentState::Unsupported);
+        let mut not_loaded = observed_change("canonical-before-load.sanitized.json");
+        not_loaded["conversationState"]["turnHistory"]["history"]["entitiesByKey"]
+            ["turn:00000000-0000-4000-8000-000000000002"]["itemsView"] =
+            serde_json::json!("notLoaded");
+        let mut m4 = ThreadMirror::new(key());
+        m4.apply(&lease(), &not_loaded).unwrap();
+        assert_eq!(m4.project(caps()).content_state, ContentState::Partial);
+        // 合法空 canonical 历史（真空会话）仍 Ready
+        let empty = serde_json::json!({
+            "type": "snapshot", "revision": 1,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "threadRuntimeStatus": { "type": "idle" },
+                "turnHistory": { "kind": "canonical", "history": {
+                    "generation": 0, "isComplete": true,
+                    "entitiesByKey": {}, "islands": [{ "entries": [] }]
+                } }
+            }
+        });
+        let mut m5 = ThreadMirror::new(key());
+        m5.apply(&lease(), &empty).unwrap();
+        let p = m5.project(caps());
+        assert_eq!(p.content_state, ContentState::Ready, "合法空历史=Ready");
+        assert!(p.messages.is_empty());
+    }
+
+    #[test]
+    fn observed_derived_items_incomplete_needs_hydration() {
+        // 报告 2.2：列表完整 + items 未加载 → needs_hydration 必须为真
+        let mut change = observed_change("canonical-before-load.sanitized.json");
+        change["conversationState"]["turnHistory"]["history"]["entitiesByKey"]
+            ["turn:00000000-0000-4000-8000-000000000002"]["itemsPagination"] =
+            serde_json::json!({ "hasLoadedOldest": false, "isLoadingOlder": false });
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &change).unwrap();
+        assert!(m.is_history_complete(), "列表完整性不变");
+        assert!(
+            m.needs_hydration(),
+            "items 未加载必须触发只读 hydrate（旧判据只看列表完整性）"
+        );
+        // 目标终态证据不受其他 Turn 正文缺口影响
+        assert!(m.turn_is_terminal("00000000-0000-4000-8000-000000000006"));
     }
 
     #[test]

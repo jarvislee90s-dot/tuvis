@@ -1308,7 +1308,10 @@ async fn handle_state_changed(adapter: &DesktopIpcAdapter, frame: Value) {
             Ok(eff) => {
                 if eff.changed {
                     fresh = Some(mirror.project(caps));
-                    if !mirror.is_history_complete() {
+                    // 2026-10-19 复审 P2-2：触发判据 = 列表不完整 **或** items 未加载/
+                    // 淘汰（itemsView）——列表完整不代表正文完整，不能等 Desktop
+                    // 自己打开才补全
+                    if mirror.needs_hydration() {
                         history_needed = true;
                     }
                 } else if eff.need_snapshot {

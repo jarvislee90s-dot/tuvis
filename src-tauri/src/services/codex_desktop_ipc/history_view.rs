@@ -103,6 +103,7 @@ impl<'a> HistoryView<'a> {
                         .map(Vec::as_slice)
                         .unwrap_or(&[]),
                     pagination: entity.get("itemsPagination"),
+                    items_view: entity.get("itemsView").and_then(Value::as_str),
                 })
             })
             .collect()
@@ -112,25 +113,106 @@ impl<'a> HistoryView<'a> {
     /// 孤立实体不作为任何判定依据；引用失效（key 命中 / value 悬空）同样无证据。
     /// **多义不猜**（2026-10-18 复审 P2-2）：同一 turnId 被多个被引用实体认领
     /// （键迁移双引用窗口）且状态不一致时返回 None——不按 canonical 首个放行。
+    /// 2026-10-19 复审 P1：**顺序无关**的多义判据——`seen` 与 `status` 分开记录；
+    /// 任一目标副本缺 status 即保守无证据（旧实现把「未见目标」与「见过但缺
+    /// status」都记成 None，缺 status 副本在前时会被后到的 completed 放行）。
     pub fn turn_status(&self, turn_id: &str) -> Option<&'a str> {
-        let mut found: Option<&'a str> = None;
+        let mut seen = false;
+        let mut status: Option<&'a str> = None;
         for turn in self.turns() {
             if turn.turn_id != turn_id {
                 continue;
             }
-            match (found, turn.status) {
-                (None, s) => found = s,
-                (Some(prev), Some(s)) if prev == s => {}
-                (Some(_), _) => return None, // 状态冲突（含一方无状态）：多义，保守无证据
+            seen = true;
+            // 任一目标副本缺 status：多义，顺序无关
+            let s = turn.status?;
+            match status {
+                None => status = Some(s),
+                Some(prev) if prev == s => {}
+                Some(_) => return None, // 状态冲突：多义
             }
         }
-        found
+        if seen {
+            status
+        } else {
+            None
+        }
     }
 
-    /// items 覆盖：任一被引用 turn 的分页标记未载完 / 在载 / 淘汰 → 不完整。
+    /// items 覆盖：任一被引用 turn 的分页标记未载完 / 在载 / 淘汰 / 明确未加载
+    /// 标记 → 不完整。
     pub fn items_incomplete(&self) -> bool {
         self.turns().iter().any(TurnRef::items_incomplete)
     }
+
+    /// 结构健康（2026-10-19 复审 P2-3）：区分「合法空历史」与「非法结构」。只对
+    /// **内容健康**（contentState）负责——目标终态证据不因无关 Turn 的内容异常
+    /// 被整体拒绝（`turn_status` 不受本方法影响）。
+    pub fn health(&self) -> ViewHealth {
+        let Some(history) = self.history().and_then(Value::as_object) else {
+            return ViewHealth::StructuralError;
+        };
+        let entities = history.get("entitiesByKey").and_then(Value::as_object);
+        match history.get("islands") {
+            None => {
+                // 无 islands：仅当实体表缺失/为空才是合法空历史；有实体却无可引用
+                // 结构 → 无法读取，不冒充空会话
+                match entities {
+                    None => ViewHealth::Ok,
+                    Some(m) if m.is_empty() => ViewHealth::Ok,
+                    Some(_) => ViewHealth::StructuralError,
+                }
+            }
+            Some(Value::Array(islands)) => {
+                for island in islands {
+                    let Some(entries) = island.get("entries") else {
+                        continue;
+                    };
+                    let Some(entries) = entries.as_array() else {
+                        return ViewHealth::StructuralError; // entries 非数组
+                    };
+                    for entry in entries {
+                        let Some(value) = entry.get("value").and_then(Value::as_str) else {
+                            return ViewHealth::StructuralError; // 条目形态非法
+                        };
+                        let Some(entities) = entities else {
+                            return ViewHealth::StructuralError;
+                        };
+                        let Some(entity) = entities.get(value) else {
+                            return ViewHealth::StructuralError; // 悬空引用
+                        };
+                        if !entity.get("turnId").is_some_and(Value::is_string) {
+                            return ViewHealth::StructuralError; // 无法认领的实体
+                        }
+                        match entity.get("items") {
+                            None => {}
+                            Some(v) if v.is_array() => {}
+                            Some(_) => return ViewHealth::StructuralError, // items 非数组
+                        }
+                    }
+                }
+                ViewHealth::Ok
+            }
+            Some(_) => ViewHealth::StructuralError, // islands 非数组
+        }
+    }
+
+    /// 内容缺口判据（adapter 只读 hydrate 触发源，单一判据）：列表不完整、任一
+    /// turn 的 items 未加载/淘汰，或结构不可读 → 需要只读 load-complete-history。
+    /// 不包含「目标 Turn 终态证据」语义——完成核对独立于正文加载。
+    pub fn needs_hydration(&self) -> bool {
+        !self.turn_list_complete() || self.items_incomplete() || self.health() != ViewHealth::Ok
+    }
+}
+
+/// 只读视图的结构健康（供 contentState 派生）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewHealth {
+    /// 合法（含合法空历史：islands=[] / entries=[] / 无实体表）
+    Ok,
+    /// 结构不可读（entries/items 非预期、悬空引用、无法认领的实体）——显示
+    /// Unsupported，不冒充真空会话
+    StructuralError,
 }
 
 /// canonical 引用链上的单个 turn 实体（借用视图）。
@@ -140,6 +222,8 @@ pub struct TurnRef<'a> {
     /// 内联 item 对象数组（真实形态：正文在 items 上，不是字符串 id 表）。
     pub items: &'a [Value],
     pagination: Option<&'a Value>,
+    /// 明确未加载标记（金样实证：start-turn 回执的 `itemsView:"notLoaded"`）
+    items_view: Option<&'a str>,
 }
 
 impl<'a> TurnRef<'a> {
@@ -147,6 +231,10 @@ impl<'a> TurnRef<'a> {
     /// `itemsPagination` 缺省（流式尾部常态，金样如实记录）不作不完整论——
     /// 不完整必须有正信号，不靠缺字段猜。
     fn items_incomplete(&self) -> bool {
+        // 明确未加载标记（不因缺分页字段就当正文完整）
+        if matches!(self.items_view, Some("notLoaded") | Some("summary")) {
+            return true;
+        }
         let Some(p) = self.pagination else {
             return false;
         };

@@ -1712,6 +1712,94 @@ async fn history_incomplete_triggers_read_only_load() {
     adapter.shutdown().await;
 }
 
+/// 2026-10-19 复审 P2-2：Turn 列表完整（isComplete=true）但某 Turn 的 items 分页
+/// 未载完 → **生产事件路径**必须发起只读 load-complete-history（旧判据只看列表
+/// 完整性 → 恒不发起，产品永远等 Desktop 自己打开才补全）；成功后后续 snapshot
+/// 收敛 Ready 且不再发起。target 终态证据不受其他 Turn 正文缺口影响（单测已钉）。
+#[tokio::test]
+async fn items_incomplete_triggers_read_only_hydrate() {
+    fn items_snapshot(rev: u64, loaded_oldest: bool) -> serde_json::Value {
+        serde_json::json!({
+            "type": "snapshot", "revision": rev,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "threadRuntimeStatus": { "type": "idle" },
+                "turnHistory": { "kind": "canonical", "history": {
+                    "generation": 0, "isComplete": true,
+                    "entitiesByKey": {
+                        "turn:ti1": {
+                            "turnId": "ti1", "status": "completed",
+                            "items": [
+                                { "type": "userMessage", "id": "ti1-u",
+                                  "content": [ { "type": "text", "text": "正文" } ] }
+                            ],
+                            "itemsPagination": { "hasLoadedOldest": loaded_oldest,
+                                                 "isLoadingOlder": false }
+                        }
+                    },
+                    "islands": [ { "entries": [
+                        { "key": "turn:ti1", "value": "turn:ti1" }
+                    ] } ]
+                } }
+            }
+        })
+    }
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = DesktopIpcAdapter::new(
+        std::sync::Arc::new(TestConnector::new(test_endpoint("macos", MACOS_BUILD), io)),
+        profile_for("macos", MACOS_BUILD).unwrap(),
+    );
+    let key = tkey("items-thread");
+    let task = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    drive_follow(
+        &mut peer,
+        "items-thread",
+        "owner-1",
+        items_snapshot(100, false),
+        true,
+    )
+    .await;
+    let proj = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("ensure in time")
+        .expect("join")
+        .expect("fresh");
+    assert_eq!(
+        proj.content_state,
+        multi_agents_manager_lib::services::codex_desktop_ipc::types::ContentState::Partial,
+        "列表完整 + items 未载入 = Partial（诚实标记）"
+    );
+    // 生产事件路径：实际发出只读加载请求
+    let load = recv_frame(&mut peer, 5).await;
+    assert_eq!(load["type"], "request");
+    assert_eq!(load["method"], "thread-follower-load-complete-history");
+    assert_eq!(load["params"]["conversationId"], "items-thread");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": load["requestId"],
+        "resultType": "success", "method": "thread-follower-load-complete-history",
+        "result": {}
+    }))
+    .await;
+    // 后续 snapshot：items 已载完 → Ready 收敛，且不再发起加载
+    peer.send(&state_frame(
+        "items-thread",
+        "owner-1",
+        items_snapshot(101, true),
+    ))
+    .await;
+    let p = wait_revision(&adapter, &key, 101).await;
+    assert_eq!(
+        p.content_state,
+        multi_agents_manager_lib::services::codex_desktop_ipc::types::ContentState::Ready
+    );
+    assert_no_frame(&mut peer, 900).await;
+    adapter.shutdown().await;
+}
+
 #[tokio::test]
 async fn client_status_changed_invalidates_all_threads_of_owner() {
     let (io, mut peer) = ScriptedPeer::new();
