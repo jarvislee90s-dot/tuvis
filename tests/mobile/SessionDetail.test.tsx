@@ -4055,6 +4055,7 @@ describe("SessionDetail：Codex Desktop IPC 投影（Task 9）", () => {
         blockingInput: true,
       },
       runtimeStatus: "idle",
+      contentState: "ready",
       messages: [
         { id: "m-1", role: "user", kind: "user_input", text: "投影里的用户消息", ts: 1000 },
         { id: "m-2", role: "assistant", kind: "agent_message", text: "投影里的回复", ts: 1001 },
@@ -4079,6 +4080,8 @@ describe("SessionDetail：Codex Desktop IPC 投影（Task 9）", () => {
       questions: [],
     };
   }
+
+  const unmount = (view: { unmount: () => void }) => view.unmount();
 
   beforeEach(() => {
     MockEventSource.reset();
@@ -4251,6 +4254,60 @@ describe("SessionDetail：Codex Desktop IPC 投影（Task 9）", () => {
     expect(screen.queryByTestId("codex-projection")).toBeNull();
     expect(screen.getByText("无投影时的 rollout 消息")).toBeTruthy();
     expect(await screen.findByTestId("question-card-app")).toBeTruthy();
+  });
+
+  // ===== 2026-10-18 形态适配：内容健康状态与写能力正交 =====
+  it("codex_content_health_states：loading/partial 出健康条、unsupported 不冒充空历史；ready 且真实 0 条才显示「暂无消息」", async () => {
+    installFetch();
+    routes.sessionMode = codexAppMode();
+
+    const renderWith = async (over: Record<string, unknown>) => {
+      routes.codexThread = codexProjection(over);
+      const view = render(
+        <SessionDetail
+          session={makeSession({ agentType: "codex", form: "app", status: "processing" })}
+          onBack={() => {}}
+        />
+      );
+      await screen.findByTestId("mode-bar-app");
+      MockEventSource.latest().emit("snapshot", routes.codexThread);
+      await screen.findByTestId("codex-projection");
+      return view;
+    };
+
+    // ready + 2 条 → 无健康条，消息上墙
+    let view = await renderWith({ contentState: "ready" });
+    expect(screen.queryByTestId("codex-projection-health")).toBeNull();
+    expect(screen.getByText("投影里的用户消息")).toBeTruthy();
+    unmount(view);
+
+    // ready + 真实 0 条 → 暂无消息（唯一合法空态）
+    view = await renderWith({ contentState: "ready", messages: [] });
+    expect(screen.getByTestId("codex-projection-empty")).toBeTruthy();
+    unmount(view);
+
+    // loading + 0 条 → 健康条 loading，不出「暂无消息」
+    view = await renderWith({ contentState: "loading", messages: [] });
+    const loading = screen.getByTestId("codex-projection-health");
+    expect(loading.getAttribute("data-state")).toBe("loading");
+    expect(screen.queryByTestId("codex-projection-empty")).toBeNull();
+    unmount(view);
+
+    // partial + 正文 → 健康条 partial，正文照常上墙
+    view = await renderWith({ contentState: "partial" });
+    expect(screen.getByTestId("codex-projection-health").getAttribute("data-state")).toBe(
+      "partial"
+    );
+    expect(screen.getByText("投影里的回复")).toBeTruthy();
+    unmount(view);
+
+    // unsupported → 健康条 unsupported（读取异常，不冒充空历史）
+    view = await renderWith({ contentState: "unsupported", messages: [] });
+    expect(screen.getByTestId("codex-projection-health").getAttribute("data-state")).toBe(
+      "unsupported"
+    );
+    expect(screen.queryByTestId("codex-projection-empty")).toBeNull();
+    unmount(view);
   });
 });
 

@@ -1647,13 +1647,26 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             {i18n.t("mobile.codex.projection.truncated")}
           </p>
         )}
-        {codexState.messages.length === 0 ? (
+        {/* 内容健康（2026-10-18 形态适配）：与写能力分开——loading/partial 标记未全
+            载入，unsupported 是读取异常；只有 ready 且真实 0 条才是「暂无消息」 */}
+        {codexState.contentState !== "ready" && (
           <p
-            data-testid="codex-projection-empty"
-            className="py-16 text-center text-sm text-[var(--mut)]"
+            data-testid="codex-projection-health"
+            data-state={codexState.contentState}
+            className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
           >
-            {i18n.t("mobile.codex.projection.empty")}
+            {i18n.t(`mobile.codex.projection.content_${codexState.contentState}`)}
           </p>
+        )}
+        {codexState.messages.length === 0 ? (
+          codexState.contentState === "ready" ? (
+            <p
+              data-testid="codex-projection-empty"
+              className="py-16 text-center text-sm text-[var(--mut)]"
+            >
+              {i18n.t("mobile.codex.projection.empty")}
+            </p>
+          ) : null
         ) : (
           <ul className="space-y-2 pb-4">
             {codexState.messages.map((m) => {

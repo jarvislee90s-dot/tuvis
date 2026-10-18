@@ -105,6 +105,11 @@ export interface PendingView {
   questions: QuestionView[];
 }
 
+/** 内容健康状态（2026-10-18 形态适配）：与写能力（availability）正交——
+ *  能发送不代表历史已载入；读取出错（unsupported）不得呈现为真空会话。
+ *  ready 且真实 0 条才显示「暂无消息」。 */
+export type ContentState = "loading" | "ready" | "partial" | "unsupported";
+
 /** Thread 状态投影（SSE / REST 同一 Tuvis 投影，IPC 原始 state 不出远程 API）。 */
 export interface ThreadProjection {
   threadId: string;
@@ -113,6 +118,7 @@ export interface ThreadProjection {
   availability: ControlAvailability;
   capabilities: CapabilitySet;
   runtimeStatus: string;
+  contentState: ContentState;
   messages: ProjectedMessage[];
   truncated: boolean;
   pending: PendingView[];

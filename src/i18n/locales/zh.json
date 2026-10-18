@@ -1731,7 +1731,10 @@
       "staleBanner": "桌面端连接中断，已保留最后视图，暂时不能远程操作",
       "projection": {
         "truncated": "内容过长，仅显示最近片段（完整历史请回 Desktop 查看）",
-        "empty": "暂无消息"
+        "empty": "暂无消息",
+        "content_loading": "历史加载中——内容尚未完全载入",
+        "content_partial": "历史未完全载入，仅显示已载入部分",
+        "content_unsupported": "会话内容读取异常（待核对）——请刷新或稍后重试"
       },
       "pending": {
         "titleCommand": "命令执行请求",
@@ -1767,7 +1770,8 @@
         "retract": "撤回",
         "retractBusy": "该条已派发，无法撤回（请回 Desktop 核对）",
         "retractFailed": "撤回失败：{{message}}",
-        "blockedCompat": "存在兼容模式未完成的发送，队列已暂停派发——请回 Desktop 核对后继续"
+        "blockedCompat": "存在兼容模式未完成的发送，队列已暂停派发——请回 Desktop 核对后继续",
+        "blockedNativeTurn": "原生回合未确认完成，队列已暂停派发——等待 Turn 完成后自动继续"
       },
       "composer": {
         "codexAccepted": "已受理，Desktop 正在执行",

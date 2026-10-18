@@ -166,9 +166,12 @@ export default function CodexQueuePanel({
       {view.blockedReasonCode !== null && (
         <p
           data-testid="codex-queue-blocked"
+          data-reason={view.blockedReasonCode}
           className="mt-1 text-xs text-amber-700 dark:text-amber-400"
         >
-          {i18n.t("mobile.codex.queue.blockedCompat")}
+          {view.blockedReasonCode === "native_turn_pending"
+            ? i18n.t("mobile.codex.queue.blockedNativeTurn")
+            : i18n.t("mobile.codex.queue.blockedCompat")}
         </p>
       )}
       <ul className="mt-1 space-y-1">
