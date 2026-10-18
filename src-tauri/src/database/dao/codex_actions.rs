@@ -584,22 +584,30 @@ pub(crate) fn has_compat_fence_conn(conn: &Connection, thread_id: &str) -> rusql
     Ok(n > 0)
 }
 
-/// 在册 fence 的**去重 route 集**（2026-10-18 形态适配配套）：原生 Accepted 动作的
-/// Turn 屏障与兼容路径 fence 共用 compat_outstanding 槽位，但阻塞原因不同——
-/// UI 不得把原生回合等待说成「兼容模式未完成」。空集 = 无在册 fence。
-pub(crate) fn outstanding_fence_routes_conn(
+/// 在册 fence 摘要（2026-10-18 形态适配配套；复审 P2-3 三态化）：(route, state,
+/// 绑定 turnId 非空)。原生 Accepted 动作的 Turn 屏障与兼容路径 fence 共用
+/// compat_outstanding 槽位，但阻塞语义不同——Unknown/缺 turnId 的保守屏障
+/// **没有自动恢复路径**，不得与「等待 Turn 完成」同文案。空集 = 无在册 fence。
+pub(crate) fn outstanding_fence_summary_conn(
     conn: &Connection,
     thread_id: &str,
-) -> rusqlite::Result<Vec<String>> {
+) -> rusqlite::Result<Vec<(String, String, bool)>> {
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT route FROM codex_actions WHERE thread_id = ?1 AND compat_outstanding = 1",
+        "SELECT DISTINCT route, state, (compat_turn_id IS NOT NULL) FROM codex_actions \
+         WHERE thread_id = ?1 AND compat_outstanding = 1",
     )?;
-    let rows = stmt.query_map([thread_id], |r| r.get::<_, String>(0))?;
-    let mut routes = Vec::new();
+    let rows = stmt.query_map([thread_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)? != 0,
+        ))
+    })?;
+    let mut out = Vec::new();
     for r in rows {
-        routes.push(r?);
+        out.push(r?);
     }
-    Ok(routes)
+    Ok(out)
 }
 
 /// **原子** compat 派发屏障（R9.1，2026-10-17 审计）：fence 与只读核对证据在**同一条
@@ -1116,6 +1124,82 @@ mod tests {
             .map(|r| r.action_id.clone())
             .collect();
         assert_eq!(ids, vec!["s-1"], "队列列表只含普通消息");
+    }
+
+    /// P2-3（复审）：fence 摘要三态——accepted+turnId（自动对账）/ accepted 缺
+    /// turnId 或 unknown（保守无自动恢复）/ compat 路由，派生判据逐态钉死。
+    #[test]
+    fn outstanding_fence_summary_distinguishes_native_states() {
+        let c = mem();
+        insert(&c, "n-ok", Some("甲"), 1000);
+        reserve_conn(&c, "n-ok", ControlRoute::DesktopIpc, 2000).unwrap();
+        set_compat_dispatch_barrier_conn(
+            &c,
+            "n-ok",
+            Some("m1"),
+            Some("t-ok"),
+            Some("/tmp/r.jsonl"),
+            Some(64),
+            Some("wh"),
+            2100,
+        )
+        .unwrap();
+        finish_conn(
+            &c,
+            &ActionReceipt {
+                action_id: "n-ok".into(),
+                delivery: Delivery::Accepted,
+                route: ControlRoute::DesktopIpc,
+                turn_id: Some("t-ok".into()),
+                envelope_id: None,
+                reason_code: None,
+            },
+            3000,
+        )
+        .unwrap();
+        // unknown + 无 turnId（重启恢复/Unknown 落账形态：reserved 超龄收敛 +
+        // 保守屏障同事务写入）
+        insert(&c, "n-unk", Some("乙"), 1100);
+        reserve_conn(&c, "n-unk", ControlRoute::DesktopIpc, 2100).unwrap();
+        mark_stale_reserved_unknown_conn(&c, 1000, 5000).unwrap();
+        // compat 路由 fence
+        insert(&c, "c-1", Some("丙"), 1200);
+        reserve_conn(&c, "c-1", ControlRoute::HeadlessCompat, 2200).unwrap();
+        set_compat_dispatch_barrier_conn(
+            &c,
+            "c-1",
+            Some("m2"),
+            None,
+            Some("/tmp/r.jsonl"),
+            Some(64),
+            Some("wh"),
+            2300,
+        )
+        .unwrap();
+
+        let mut rows = outstanding_fence_summary_conn(&c, THREAD).unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("desktop_ipc".into(), "accepted".into(), true),
+                ("desktop_ipc".into(), "unknown".into(), false),
+                ("headless_compat".into(), "reserved".into(), false),
+            ],
+            "三态摘要逐行命中（native pending / native unknown / compat）"
+        );
+        // 派生判据（与 codex_ipc 派生同序）：unknown/缺 turnId 优先于 accepted+turnId
+        let native_unknown = rows
+            .iter()
+            .any(|(r, s, tid)| r == "desktop_ipc" && (*s != "accepted" || !*tid));
+        let native_pending = rows
+            .iter()
+            .any(|(r, s, tid)| r == "desktop_ipc" && s == "accepted" && *tid);
+        assert!(native_unknown && native_pending);
+        assert!(
+            native_unknown,
+            "并存时 Unknown 优先展示（无自动恢复路径，不得承诺自动继续）"
+        );
     }
 
     /// R9.1：原子派发屏障单语句写全 fence+证据；pending-work / turn-binding 枚举。

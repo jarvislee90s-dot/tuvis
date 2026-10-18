@@ -116,7 +116,8 @@ pub struct ThreadMirror {
     /// 真实形状无 `conversationState` 路径前缀）
     state: Option<Value>,
     pending: PendingProjector,
-    /// turnHistory.isComplete（不完整时 adapter 决定是否调 load-complete-history）
+    /// Turn 列表完整性（`turnHistory.history.isComplete`；不完整时 adapter 决定
+    /// 是否调只读 load-complete-history）
     history_complete: bool,
     /// C4：全体镜像字节账本（生产挂全局账本；None = 独立镜像只受单 Thread 预算）
     ledger: Option<Arc<std::sync::Mutex<MirrorLedger>>>,
@@ -499,6 +500,9 @@ fn runtime_status(state: &Value) -> String {
 fn project_messages(state: &Value) -> (Vec<ProjectedMessage>, bool) {
     let view = HistoryView::new(state);
     let mut all: Vec<ProjectedMessage> = Vec::new();
+    // P2-2（复审）：键迁移双引用窗口（同 turnId 两个被引用实体）下 items 可能
+    // 重叠——按 item id 跨 turn 去重，绝不追加重复气泡
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for turn in view.turns() {
         for (idx, item) in turn.items.iter().enumerate() {
             let Some(obj) = item.as_object() else {
@@ -511,6 +515,9 @@ fn project_messages(state: &Value) -> (Vec<ProjectedMessage>, bool) {
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{}/{}", turn.turn_id, idx));
+            if !seen_ids.insert(id.clone()) {
+                continue;
+            }
             let (role, text) = match kind {
                 "userMessage" => {
                     let Some(text) = user_message_text(item) else {
@@ -1339,6 +1346,64 @@ mod tests {
         assert!(
             !m.turn_is_terminal("00000000-0000-4000-8000-000000000006"),
             "未被 canonical 引用的孤立实体不得作为完成证据"
+        );
+    }
+
+    #[test]
+    fn observed_derived_duplicate_turn_reference_dedup_and_ambiguity() {
+        // P2-2（复审）：键迁移双引用窗口——同 turnId 两个被引用实体
+        let mut change = observed_change("canonical-before-load.sanitized.json");
+        {
+            let hist = &mut change["conversationState"]["turnHistory"]["history"];
+            let entities = hist["entitiesByKey"].as_object_mut().unwrap();
+            // 复制一份目标 turn 实体到 tail 合成键（同 turnId、同 status）
+            let target = entities["turn:00000000-0000-4000-8000-000000000006"].clone();
+            entities.insert(
+                "tail:9:local:dupref".into(),
+                serde_json::json!({
+                    "turnId": "00000000-0000-4000-8000-000000000006",
+                    "status": "completed",
+                    "items": [ { "type": "agentMessage", "id": "dup-item",
+                                 "text": "重复气泡候选" } ]
+                }),
+            );
+            let _ = target;
+            let entries = hist["islands"][0]["entries"].as_array_mut().unwrap();
+            entries.push(serde_json::json!({
+                "key": "tail:9:local:dupref", "value": "tail:9:local:dupref"
+            }));
+        }
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &change).unwrap();
+        // 状态一致 → 证据成立（多义仅在不一致时保守）
+        assert!(m.turn_is_terminal("00000000-0000-4000-8000-000000000006"));
+        // 投影去重：dup-item 只出现一次
+        let p = m.project(caps());
+        let dup: Vec<_> = p
+            .messages
+            .iter()
+            .filter(|msg| msg.id == "dup-item")
+            .collect();
+        assert_eq!(dup.len(), 1, "双引用重叠 items 按去重，不追加重复气泡");
+
+        // 状态冲突（旧副本 completed、现行 inProgress）→ 多义，保守无证据
+        let mut conflict = observed_change("canonical-before-load.sanitized.json");
+        {
+            let hist = &mut conflict["conversationState"]["turnHistory"]["history"];
+            let entities = hist["entitiesByKey"].as_object_mut().unwrap();
+            let mut entity = entities["turn:00000000-0000-4000-8000-000000000006"].clone();
+            entity["status"] = serde_json::json!("inProgress");
+            entities.insert("tail:9:local:dupref".into(), entity);
+            let entries = hist["islands"][0]["entries"].as_array_mut().unwrap();
+            entries.push(serde_json::json!({
+                "key": "tail:9:local:dupref", "value": "tail:9:local:dupref"
+            }));
+        }
+        let mut m2 = ThreadMirror::new(key());
+        m2.apply(&lease(), &conflict).unwrap();
+        assert!(
+            !m2.turn_is_terminal("00000000-0000-4000-8000-000000000006"),
+            "同 turnId 多实体状态冲突 = 多义，不得按首个放行"
         );
     }
 

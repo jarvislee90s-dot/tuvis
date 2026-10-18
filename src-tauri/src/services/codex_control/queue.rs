@@ -352,9 +352,12 @@ impl ActionStore {
         self.with(|c| dao::has_compat_fence_conn(c, &key.thread_id).map_err(db_err))
     }
 
-    /// 在册 fence 的去重 route 集（原生 Turn 屏障 vs 兼容 fence 分文案的判据）。
-    pub fn outstanding_fence_routes(&self, key: &ThreadKey) -> Result<Vec<String>, StoreError> {
-        self.with(|c| dao::outstanding_fence_routes_conn(c, &key.thread_id).map_err(db_err))
+    /// 在册 fence 摘要（(route, state, 有绑定 turnId) 三元组）——阻塞原因三态派生。
+    pub fn outstanding_fence_summary(
+        &self,
+        key: &ThreadKey,
+    ) -> Result<Vec<(String, String, bool)>, StoreError> {
+        self.with(|c| dao::outstanding_fence_summary_conn(c, &key.thread_id).map_err(db_err))
     }
 
     /// 清 fence：仅终态动作允许（queued/reserved → `Conflict`）。Accepted/Unknown 必须

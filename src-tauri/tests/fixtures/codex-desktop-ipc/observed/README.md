@@ -31,3 +31,10 @@
    （实体键 `turn:<该ID>`，`status:"completed"`）。
 
 脱敏约定与旧夹具相同：ID 为占位 UUID、文本为 Synthetic 占位，不含真实提示词/会话内容。
+
+## start-turn 写方法实证（40934）
+
+`start-turn-40934.sanitized.json`：2026-10-18 23:58 实现侧 harness 对该 build 的
+**写方法实证回执**（turn 成功创建 inProgress）——profile 表 `("macos","26.1013.40934")`
+的 send=true 证据链（state=true 由复审只读探针 + 本仓集成闭环背书）；
+permissions/command/blocking_input 未实测保持 false。

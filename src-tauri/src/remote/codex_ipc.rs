@@ -53,6 +53,9 @@ pub(crate) const BLOCKED_COMPAT_OUTSTANDING: &str = "compat_outstanding";
 /// 原生 Turn 屏障的在册码（2026-10-18 形态适配配套）：route=desktop_ipc 的
 /// Accepted 动作在等精确 Turn 终态证据——不是「兼容模式」，UI 分文案。
 pub(crate) const BLOCKED_NATIVE_TURN_PENDING: &str = "native_turn_pending";
+/// 原生 Unknown/缺 turnId 保守屏障的在册码（复审 P2-3）：**没有自动恢复路径**
+/// （释放门要求精确 turnId 终态证据）——文案必须与「等待后自动继续」区分。
+pub(crate) const BLOCKED_NATIVE_DELIVERY_UNKNOWN: &str = "native_delivery_unknown";
 
 /// 本机 ThreadKey（服务端只构造 local——计划公共类型约定）。
 fn local_key(thread_id: &str) -> ThreadKey {
@@ -1555,21 +1558,33 @@ pub async fn queue_view(
             );
         }
     };
-    // 阻塞原因按实际 route 派生（2026-10-18 形态适配配套）：原生 Accepted 的 Turn
-    // 屏障 ≠ 兼容路径 fence——两词都表示「队列暂停派发」，但语义/文案不同；原生等待
-    // 是自动对账（Turn 终态证据驱动），不存在「回 Desktop 手工解除」的操作。
-    let blocked_reason_code = match store.outstanding_fence_routes(&key) {
-        Ok(routes) => {
-            if routes.iter().any(|r| r == "desktop_ipc") {
+    // 阻塞原因三态派生（复审 P2-3）：native_turn_pending = Accepted 且绑定 turnId
+    //（终态证据驱动自动对账，等待后自动继续）；native_delivery_unknown = 原生
+    // Unknown/缺 turnId 保守屏障（**无自动恢复路径**，如实说）；compat_outstanding =
+    // 兼容路径 fence。都不提示不存在的「回 Desktop 手工解除」。
+    let blocked_reason_code = match store.outstanding_fence_summary(&key) {
+        Ok(rows) => {
+            // 优先级：unknown/缺 turnId（**永不自动解除**）> accepted+turnId（等待
+            // 后自动继续）> compat。若两者并存，队列最终仍会停在 Unknown 屏障上，
+            // 「自动继续」就是失实承诺——如实优先展示无自动恢复路径。
+            let native_unknown = rows
+                .iter()
+                .any(|(r, s, tid)| r == "desktop_ipc" && (*s != "accepted" || !*tid));
+            let native_pending = rows
+                .iter()
+                .any(|(r, s, tid)| r == "desktop_ipc" && s == "accepted" && *tid);
+            if native_unknown {
+                Some(BLOCKED_NATIVE_DELIVERY_UNKNOWN.to_string())
+            } else if native_pending {
                 Some(BLOCKED_NATIVE_TURN_PENDING.to_string())
-            } else if !routes.is_empty() {
+            } else if !rows.is_empty() {
                 Some(BLOCKED_COMPAT_OUTSTANDING.to_string())
             } else {
                 None
             }
         }
         Err(e) => {
-            log::error!("codex/queue fence route 读取失败: {e}");
+            log::error!("codex/queue fence 摘要读取失败: {e}");
             None
         }
     };

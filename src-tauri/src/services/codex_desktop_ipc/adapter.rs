@@ -1437,8 +1437,8 @@ struct Hydration {
 const HYDRATE_MAX_ATTEMPTS: u32 = 3;
 /// 重试间隔（有界退避，非风暴）。
 const HYDRATE_RETRY_MS: u64 = 1_000;
-/// 成功后等镜像吃到对应 snapshot 的预算（revision 核对；超时按已收敛处理——
-/// snapshot 由事件流推进，这里只做「目标 revision 已达成」的核对）。
+/// 成功后等镜像吃到对应 snapshot 的预算（revision 核对；**超时按未收敛处理**
+/// ——走有界重试，不虚称收敛；无 revision 载荷的回执才按事件流推进直接收敛）。
 const HYDRATE_SETTLE_MS: u64 = 5_000;
 
 /// R1.4 + 2026-10-18 形态适配：Turn 列表不完整（history.isComplete ≠ true）→ v1
@@ -1491,14 +1491,19 @@ async fn maybe_request_complete_history(adapter: &DesktopIpcAdapter, key: &Threa
     }
     let Some(conn) = current_conn(adapter).await else {
         // 连接缺位：清在飞（下一次事件可再触发）
+        // P3-1（复审）：清位须同代——旧触发不得误清新世代的在飞占位
         if let Some(h) = adapter.inner.history_hydrations.lock().await.get_mut(key) {
-            h.in_flight = false;
+            if h.generation == generation {
+                h.in_flight = false;
+            }
         }
         return;
     };
     let Ok(version) = conn.version_of("thread-follower-load-complete-history") else {
         if let Some(h) = adapter.inner.history_hydrations.lock().await.get_mut(key) {
-            h.in_flight = false;
+            if h.generation == generation {
+                h.in_flight = false;
+            }
         }
         return;
     };
@@ -1508,9 +1513,15 @@ async fn maybe_request_complete_history(adapter: &DesktopIpcAdapter, key: &Threa
     tokio::spawn(async move {
         let mut attempt = {
             let mut hydrations = adapter.inner.history_hydrations.lock().await;
-            let h = hydrations.get_mut(&k).expect("占位已建");
-            h.attempts += 1;
-            h.attempts
+            // P2-1（复审）：占位可能在 spawn 前的 await 点被 follow 重绑清态——
+            // 已被清除 = 本次加载本就作废（新世代自己会发起），直接退出不 panic
+            match hydrations.get_mut(&k) {
+                Some(h) if h.generation == generation => {
+                    h.attempts += 1;
+                    h.attempts
+                }
+                _ => return,
+            }
         };
         loop {
             // 换代守卫：owner 已换代 → 本次加载作废（状态已随 follow 重绑清除）

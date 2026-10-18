@@ -7,6 +7,9 @@
 //! 用例必须把请求放 tokio::task（用克隆句柄拿到 'static），否则 recv 会永远等不到帧。
 
 use multi_agents_manager_lib::services::codex_desktop_ipc::codec::encode_frame;
+
+#[path = "support/codex_fixture.rs"]
+mod codex_fixture;
 use multi_agents_manager_lib::services::codex_desktop_ipc::connection::{
     spawn, ConnectionEvent, ConnectionHandle, RpcOutcome, RpcRequest, RPC_TIMEOUT,
 };
@@ -812,13 +815,10 @@ async fn harness_for(
                 "conversationState": {
                     "turns": [], "requests": requests,
                     "threadRuntimeStatus": { "type": "active" },
-                    "turnHistory": { "isComplete": true, "history": {
-                        "entitiesByKey": {
+                    "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
                             "t1": { "id": "t1", "type": "turn", "status": "inProgress", "items": ["u1"] },
                             "u1": { "id": "u1", "type": "user_message", "text": "跑测试", "ts": 1 }
-                        },
-                        "islands": [{ "entries": ["t1"] }]
-                    }}
+                        }), serde_json::json!([{ "entries": ["t1"] }]))
                 }
             }
         }
@@ -1297,20 +1297,27 @@ fn snapshot_change(
     requests: Vec<serde_json::Value>,
     history_complete: bool,
 ) -> serde_json::Value {
-    serde_json::json!({
+    // 2026-10-18 形态适配：isComplete 在 **history 层**（真机金样），实体走
+    // canonical 真实形态（合成键 + turnId 字段 + 内联 camelCase items）
+    let mut change = serde_json::json!({
         "type": "snapshot", "revision": rev,
         "conversationState": {
             "turns": [], "requests": requests,
             "threadRuntimeStatus": { "type": "idle" },
-            "turnHistory": { "isComplete": history_complete, "history": {
-                "entitiesByKey": {
+            "turnHistory": codex_fixture::canonical_turn_history(
+                serde_json::json!({
                     "t1": { "id": "t1", "type": "turn", "status": "completed", "items": ["u1"] },
                     "u1": { "id": "u1", "type": "user_message", "text": "hello", "ts": 1 }
-                },
-                "islands": [ { "entries": ["t1"] } ]
-            }}
+                }),
+                serde_json::json!(["t1"])
+            )
         }
-    })
+    });
+    if !history_complete {
+        change["conversationState"]["turnHistory"]["history"]["isComplete"] =
+            serde_json::json!(false);
+    }
+    change
 }
 
 fn state_frame(thread_id: &str, source: &str, change: serde_json::Value) -> serde_json::Value {
@@ -1637,7 +1644,8 @@ async fn history_incomplete_triggers_read_only_load() {
         .expect("fresh");
     assert!(!proj.stale);
 
-    // 快照不完整 → v1 只读 load-complete-history（params 带 conversationId + hostId:"local"）
+    // 快照不完整 → v1 只读 load-complete-history（params 带 conversationId + hostId:"local"；
+    // result 带 revision——成功回执核对的面）
     let load = recv_frame(&mut peer, 5).await;
     assert_eq!(load["type"], "request");
     assert_eq!(load["method"], "thread-follower-load-complete-history");
@@ -1647,11 +1655,25 @@ async fn history_incomplete_triggers_read_only_load() {
     peer.send(&serde_json::json!({
         "type": "response", "requestId": load["requestId"],
         "resultType": "success", "method": "thread-follower-load-complete-history",
+        "result": { "revision": 101 }
+    }))
+    .await;
+    // 结果核对：回执带目标 revision → 等镜像吃到对应 snapshot 才收敛；本测试不发
+    // 后续 snapshot → 加载状态停留（允许下一轮重试，见下）
+
+    // 有界重试（2026-10-18 形态适配：不再是「每 follow 至多一次」——失败/未收敛
+    // 允许退避重试，上限 3 次）。第一次回执 revision=101 未达成 → 重试发第二发
+    // （第一轮回执的 revision 核对窗 5s + 退避 1s → 第二发最晚 ~6s 后到）
+    let load2 = recv_frame(&mut peer, 12).await;
+    assert_eq!(load2["method"], "thread-follower-load-complete-history");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": load2["requestId"],
+        "resultType": "success", "method": "thread-follower-load-complete-history",
         "result": {}
     }))
     .await;
-
-    // 每 follow 至多一次：后续仍不完整的 snapshot 不再发起
+    // 无 revision 载荷 → 直接收敛（snapshot 由事件流推进）；后续仍不完整的
+    // snapshot 是**新触发**（attempts=2 < 上限）→ 第三发
     peer.send(&state_frame(
         "hist-thread",
         "owner-1",
@@ -1659,16 +1681,33 @@ async fn history_incomplete_triggers_read_only_load() {
     ))
     .await;
     let _ = wait_revision(&adapter, &key, 101).await;
-    assert_no_frame(&mut peer, 900).await;
+    let load3 = recv_frame(&mut peer, 5).await;
+    assert_eq!(load3["method"], "thread-follower-load-complete-history");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": load3["requestId"],
+        "resultType": "success", "method": "thread-follower-load-complete-history",
+        "result": {}
+    }))
+    .await;
 
-    // 完整 snapshot 后同样不再发起
+    // 第三发之后（attempt=3 = 上限）不再自动发起：仍不完整的 snapshot 不再触发
     peer.send(&state_frame(
         "hist-thread",
         "owner-1",
-        snapshot_change(102, vec![], true),
+        snapshot_change(102, vec![], false),
     ))
     .await;
     let _ = wait_revision(&adapter, &key, 102).await;
+    assert_no_frame(&mut peer, 900).await;
+
+    // 完整 snapshot 后同样没有加载帧
+    peer.send(&state_frame(
+        "hist-thread",
+        "owner-1",
+        snapshot_change(103, vec![], true),
+    ))
+    .await;
+    let _ = wait_revision(&adapter, &key, 103).await;
     assert_no_frame(&mut peer, 900).await;
     adapter.shutdown().await;
 }

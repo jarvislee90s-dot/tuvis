@@ -8,6 +8,9 @@
 //! 隔离（**绝不 spawn 真 codex**）。
 
 use multi_agents_manager_lib::remote::codex_ipc::CodexControlHub;
+
+#[path = "support/codex_fixture.rs"]
+mod codex_fixture;
 use multi_agents_manager_lib::remote::pairing::{
     persist_device, revoke_device, DeviceStore, NewDevice,
 };
@@ -191,13 +194,10 @@ async fn drive_ensure(
                 "conversationState": {
                     "turns": [], "requests": requests,
                     "threadRuntimeStatus": { "type": runtime },
-                    "turnHistory": { "isComplete": true, "history": {
-                        "entitiesByKey": {
+                    "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
                             "t1": { "id": "t1", "type": "turn", "status": "completed", "items": ["u1"] },
                             "u1": { "id": "u1", "type": "user_message", "text": "seed", "ts": 1 }
-                        },
-                        "islands": [{ "entries": ["t1"] }]
-                    }}
+                        }), serde_json::json!([{ "entries": ["t1"] }]))
                 }
             }
         }
@@ -729,13 +729,10 @@ async fn send_busy_thread_queues_with_position() {
                 "conversationState": {
                     "turns": [], "requests": [],
                     "threadRuntimeStatus": { "type": "active" },
-                    "turnHistory": { "isComplete": true, "history": {
-                        "entitiesByKey": {
+                    "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
                             "t2": { "id": "t2", "type": "turn", "status": "inProgress", "items": ["u2"] },
                             "u2": { "id": "u2", "type": "user_message", "text": "running", "ts": 2 }
-                        },
-                        "islands": [{ "entries": ["t2"] }]
-                    }}
+                        }), serde_json::json!([{ "entries": ["t2"] }]))
                 }
             }
         }
@@ -2412,13 +2409,10 @@ async fn drive_ensure_rev(
                 "conversationState": {
                     "turns": [], "requests": requests,
                     "threadRuntimeStatus": { "type": runtime },
-                    "turnHistory": { "isComplete": true, "history": {
-                        "entitiesByKey": {
+                    "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
                             "t1": { "id": "t1", "type": "turn", "status": "completed", "items": ["u1"] },
                             "u1": { "id": "u1", "type": "user_message", "text": "seed", "ts": 1 }
-                        },
-                        "islands": [{ "entries": ["t1"] }]
-                    }}
+                        }), serde_json::json!([{ "entries": ["t1"] }]))
                 }
             }
         }
@@ -2611,13 +2605,10 @@ async fn production_chain_send_busy_queue_then_idle_relay() {
                 "conversationState": {
                     "turns": [], "requests": [],
                     "threadRuntimeStatus": { "type": "active" },
-                    "turnHistory": { "isComplete": true, "history": {
-                        "entitiesByKey": {
+                    "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
                             "t9": { "id": "t9", "type": "turn", "status": "inProgress", "items": ["u9"] },
                             "u9": { "id": "u9", "type": "user_message", "text": "全链第一条 [mobile iPhone]", "ts": 9 }
-                        },
-                        "islands": [{ "entries": ["t9"] }]
-                    }}
+                        }), serde_json::json!([{ "entries": ["t9"] }]))
                 }
             }
         }
@@ -2657,14 +2648,11 @@ async fn production_chain_send_busy_queue_then_idle_relay() {
                 "conversationState": {
                     "turns": [], "requests": [],
                     "threadRuntimeStatus": { "type": "idle" },
-                    "turnHistory": { "isComplete": true, "history": {
-                        "entitiesByKey": {
+                    "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
                             "turn-chain-1": { "id": "turn-chain-1", "type": "turn", "status": "completed", "items": ["u9"] },
                             "t9": { "id": "t9", "type": "turn", "status": "completed", "items": ["u9"] },
                             "u9": { "id": "u9", "type": "user_message", "text": "全链第一条 [mobile iPhone]", "ts": 9 }
-                        },
-                        "islands": [{ "entries": ["turn-chain-1", "t9"] }]
-                    }}
+                        }), serde_json::json!([{ "entries": ["turn-chain-1", "t9"] }]))
                 }
             }
         }
@@ -2792,13 +2780,10 @@ async fn aborted_waiter_convergence_requires_bound_turn_terminal_evidence() {
                 "conversationState": {
                     "turns": [], "requests": [],
                     "threadRuntimeStatus": { "type": "idle" },
-                    "turnHistory": { "isComplete": true, "history": {
-                        "entitiesByKey": {
+                    "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
                             "t6": { "id": "t6", "type": "turn", "status": "completed", "items": ["u6"] },
                             "u6": { "id": "u6", "type": "user_message", "text": "被弃消息 [mobile iPhone]", "ts": 6 }
-                        },
-                        "islands": [{ "entries": ["t6"] }]
-                    }}
+                        }), serde_json::json!([{ "entries": ["t6"] }]))
                 }
             }
         }
@@ -2823,14 +2808,11 @@ async fn aborted_waiter_convergence_requires_bound_turn_terminal_evidence() {
                 "conversationState": {
                     "turns": [], "requests": [],
                     "threadRuntimeStatus": { "type": "idle" },
-                    "turnHistory": { "isComplete": true, "history": {
-                        "entitiesByKey": {
+                    "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
                             "turn-cvrg-1": { "id": "turn-cvrg-1", "type": "turn", "status": "completed", "items": ["u6"] },
                             "t6": { "id": "t6", "type": "turn", "status": "completed", "items": ["u6"] },
                             "u6": { "id": "u6", "type": "user_message", "text": "被弃消息 [mobile iPhone]", "ts": 6 }
-                        },
-                        "islands": [{ "entries": ["turn-cvrg-1", "t6"] }]
-                    }}
+                        }), serde_json::json!([{ "entries": ["turn-cvrg-1", "t6"] }]))
                 }
             }
         }
@@ -2885,10 +2867,7 @@ fn snapshot_frame(
                 "conversationState": {
                     "turns": [], "requests": [],
                     "threadRuntimeStatus": { "type": runtime },
-                    "turnHistory": { "isComplete": true, "history": {
-                        "entitiesByKey": entities,
-                        "islands": [{ "entries": turn_ids }]
-                    }}
+                    "turnHistory": codex_fixture::canonical_turn_history(entities, turn_ids)
                 }
             }
         }

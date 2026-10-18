@@ -110,11 +110,21 @@ impl<'a> HistoryView<'a> {
 
     /// 目标 turnId 的状态。只认 canonical 引用链上的实体——未被任何 island 引用的
     /// 孤立实体不作为任何判定依据；引用失效（key 命中 / value 悬空）同样无证据。
+    /// **多义不猜**（2026-10-18 复审 P2-2）：同一 turnId 被多个被引用实体认领
+    /// （键迁移双引用窗口）且状态不一致时返回 None——不按 canonical 首个放行。
     pub fn turn_status(&self, turn_id: &str) -> Option<&'a str> {
-        self.turns()
-            .into_iter()
-            .find(|turn| turn.turn_id == turn_id)?
-            .status
+        let mut found: Option<&'a str> = None;
+        for turn in self.turns() {
+            if turn.turn_id != turn_id {
+                continue;
+            }
+            match (found, turn.status) {
+                (None, s) => found = s,
+                (Some(prev), Some(s)) if prev == s => {}
+                (Some(_), _) => return None, // 状态冲突（含一方无状态）：多义，保守无证据
+            }
+        }
+        found
     }
 
     /// items 覆盖：任一被引用 turn 的分页标记未载完 / 在载 / 淘汰 → 不完整。
