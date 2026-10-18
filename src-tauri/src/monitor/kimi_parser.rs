@@ -19,6 +19,7 @@ use super::jsonl::read_recent_lines;
 use super::project::project_name_from_path;
 use super::session_scan::SessionFileScan;
 use crate::adapter::AgentProcess;
+use crate::monitor::subagents::report_anchor_near_last;
 use crate::session::{jump_supported_for, AgentType, Session, SessionStatus};
 use log::{debug, info};
 use serde::Deserialize;
@@ -371,6 +372,17 @@ fn parse_kimi_session(entry: &IndexedSession, process: &AgentProcess) -> Option<
         })
         .unwrap_or_else(|| "Unknown".to_string());
 
+    // #151 回报打标（时间关联，全工具化）：仅绿会话且末条非空才付锚收集成本。
+    // kimi 锚 = agents/<dir>/wire.jsonl 的 mtime（原始活动毫秒，不走 collect 视图
+    // ——90s 活跃窗滞后会漏掉「刚完成」的子代理）；父侧 = d.last_ts（既有毫秒）
+    let last_message_subagent_report = matches!(status, SessionStatus::Idle | SessionStatus::Finished)
+        && d.last_message.as_deref().is_some_and(|m| !m.is_empty())
+        && d.last_ts.is_some_and(|last_ms| {
+            crate::monitor::subagents::kimi::wire_activity_anchors(&entry.session_id)
+                .iter()
+                .any(|&anchor| report_anchor_near_last(anchor, last_ms))
+        });
+
     Some(Session {
         id: entry.session_id.clone(),
         agent_type: AgentType::Kimi,
@@ -381,7 +393,7 @@ fn parse_kimi_session(entry: &IndexedSession, process: &AgentProcess) -> Option<
         status,
         last_message: d.last_message.clone(),
         last_message_role: d.last_role.clone(),
-        last_message_subagent_report: false,
+        last_message_subagent_report,
         flap_from_subagent_activity: false,
         last_activity_at,
         pid: process.pid,
@@ -1321,5 +1333,110 @@ mod tests {
                 "移除后 mcpServers 段不应再含该服务器"
             );
         });
+    }
+
+    // ==== #151 回报打标（时间关联，全工具化）：parse_kimi_session 内联打标直测 ====
+    // 注入缝：打标调 wire_activity_anchors → kimi_data_root()（KIMI_CODE_HOME 优先）
+    // ——沿用本模块 run_with_home + HOME_LOCK 既有基建，真/假两态均可注入。
+
+    /// Kimi 打标夹具：sessions/<wd>/<sid>/agents/main/wire.jsonl（末条 assistant 纯文本
+    /// → Idle + last_message 非空 + last_ts）+ agents/agent-0/wire.jsonl（mtime 即锚）
+    fn report_fixture(home: &Path, sid: &str, last_ts_ms: i64) -> PathBuf {
+        let session_dir = home.join("sessions").join("wd-1").join(sid);
+        std::fs::create_dir_all(session_dir.join("agents").join("main")).unwrap();
+        std::fs::create_dir_all(session_dir.join("agents").join("agent-0")).unwrap();
+        // main wire 末条 = assistant 纯文本（倒扫即得 Idle + last_message + last_ts）
+        std::fs::write(
+            session_dir.join("agents").join("main").join("wire.jsonl"),
+            format!(
+                r#"{{"type":"turn.prompt","input":[{{"type":"text","text":"hi"}}],"time":{}}}
+{{"type":"context.append_message","message":{{"role":"assistant","content":[{{"type":"text","text":"回报完成"}}]}},"time":{}}}
+"#,
+                last_ts_ms - 60_000,
+                last_ts_ms
+            ),
+        )
+        .unwrap();
+        std::fs::write(session_dir.join("agents").join("agent-0").join("wire.jsonl"), "{}\n").unwrap();
+        std::fs::create_dir_all(home).unwrap();
+        std::fs::write(
+            home.join("session_index.jsonl"),
+            format!(
+                "{}\n",
+                index_line(sid, &session_dir, "/work/demo")
+            ),
+        )
+        .unwrap();
+        session_dir
+    }
+
+    /// 子 wire mtime 距父末条（d.last_ts）窗内 → 打标 true
+    #[test]
+    fn kimi_report_flag_true_when_wire_mtime_within_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("khome");
+        let now = chrono::Utc::now().timestamp_millis();
+        let sid = "session_51515151-1515-1515-1515-151515151515";
+        let session_dir = report_fixture(&home, sid, now - 1_000);
+        // 锚 = agent wire mtime，设在父末条 +500ms（skew 容差内）
+        filetime::set_file_mtime(
+            session_dir.join("agents").join("agent-0").join("wire.jsonl"),
+            filetime::FileTime::from_unix_time((now + 500) / 1000, (((now + 500) % 1000) * 1_000_000) as u32),
+        )
+        .unwrap();
+        let sessions = run_with_home(&home, || {
+            let entry = IndexedSession {
+                session_id: sid.to_string(),
+                work_dir: "/work/demo".to_string(),
+                session_dir: session_dir.clone(),
+                wire_mtime: std::time::SystemTime::now(),
+            };
+            vec![parse_kimi_session(&entry, &fake_process(1, "/work/demo")).unwrap()]
+        });
+        assert_eq!(sessions[0].status, SessionStatus::Idle, "前置：末条 assistant 纯文本 → 绿");
+        assert!(
+            sessions[0].last_message_subagent_report,
+            "子 wire mtime 距父末条 1.5s（窗内）→ 打标"
+        );
+    }
+
+    /// 子 wire mtime 距父末条 10 分钟（窗外）→ false；无子 wire（仅 main）→ false
+    #[test]
+    fn kimi_report_flag_false_when_stale_or_no_agent_wires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("khome");
+        let now = chrono::Utc::now().timestamp_millis();
+        // 窗外锚：mtime = 父末条 - 600s
+        let sid_stale = "session_61616161-1616-1616-1616-161616161616";
+        let dir_stale = report_fixture(&home, sid_stale, now);
+        filetime::set_file_mtime(
+            dir_stale.join("agents").join("agent-0").join("wire.jsonl"),
+            filetime::FileTime::from_unix_time((now - 600_000) / 1000, 0),
+        )
+        .unwrap();
+        // 无子 wire：索引里另一会话只有 main agent
+        let sid_none = "session_71717171-1717-1717-1717-171717171717";
+        let dir_none = report_fixture(&home, sid_none, now);
+        std::fs::remove_dir_all(dir_none.join("agents").join("agent-0")).unwrap();
+        let out = run_with_home(&home, || {
+            [sid_stale, sid_none]
+                .iter()
+                .map(|sid| {
+                    let dir = if *sid == sid_stale { dir_stale.clone() } else { dir_none.clone() };
+                    parse_kimi_session(
+                        &IndexedSession {
+                            session_id: sid.to_string(),
+                            work_dir: "/work/demo".to_string(),
+                            session_dir: dir,
+                            wire_mtime: std::time::SystemTime::now(),
+                        },
+                        &fake_process(1, "/work/demo"),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(!out[0].last_message_subagent_report, "10 分钟前的 wire 活动（窗外）→ false");
+        assert!(!out[1].last_message_subagent_report, "无子 wire（仅 main）→ false");
     }
 }

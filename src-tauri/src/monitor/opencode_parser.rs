@@ -393,6 +393,18 @@ fn build_session_from_row(
         }),
     };
 
+    // #151 回报打标（时间关联，全工具化）：仅绿会话且末条非空才付锚收集成本。
+    // opencode 锚 = 子会话 time_updated（原始活动毫秒，不走 collect 视图——90s
+    // 活跃窗滞后会漏掉「刚完成」的子代理）；父侧 = 本行 time_updated（与
+    // last_activity_at 同源）。SQLite 查询即最新（豁免 L2/L3），绿会话闸住成本。
+    let last_message_subagent_report = matches!(status, SessionStatus::Idle | SessionStatus::Finished)
+        && display_message.as_deref().is_some_and(|m| !m.is_empty())
+        && crate::monitor::subagents::opencode::child_updated_anchors(session_id)
+            .iter()
+            .any(|&anchor| {
+                crate::monitor::subagents::report_anchor_near_last(anchor, time_updated)
+            });
+
     Some(Session {
         id: session_id.to_string(),
         agent_type: AgentType::OpenCode,
@@ -403,7 +415,7 @@ fn build_session_from_row(
         status,
         last_message: display_message,
         last_message_role: last_role,
-        last_message_subagent_report: false,
+        last_message_subagent_report,
         flap_from_subagent_activity: false,
         last_activity_at,
         pid: process.pid,
@@ -2037,6 +2049,115 @@ mod v2_tests {
         assert_eq!(sessions[0].status, crate::session::SessionStatus::Idle);
         assert_eq!(sessions[0].last_message.as_deref(), Some("旧回复"));
     }
+
+    // ==== #151 回报打标（时间关联，全工具化）：build_session_from_row 内联打标 ====
+    // 注入缝申报：主库有 get_opencode_sessions_with_db（db 路径注入），但打标调
+    // 生产入口 child_updated_anchors（dirs::home_dir() 硬编码 ~/.local/share/
+    // opencode/opencode.db）——测试经 HOME 重定向把锚库指到 tempdir
+    // （Unix 下 dirs 优先读 $HOME；见 monitor::test_env 注释）。
+
+    /// 锚库（HOME 下的 ~/.local/share/opencode/opencode.db）：v2 schema + 子行
+    fn anchor_db_at(home: &std::path::Path, parent: &str, child_updated: i64) {
+        let db = home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("opencode.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, directory TEXT, title TEXT,
+                 parent_id TEXT, agent TEXT, tokens_input INTEGER DEFAULT 0, tokens_output INTEGER DEFAULT 0,
+                 tokens_reasoning INTEGER DEFAULT 0, tokens_cache_read INTEGER DEFAULT 0,
+                 tokens_cache_write INTEGER DEFAULT 0, time_created INTEGER, time_updated INTEGER,
+                 time_idle INTEGER, idle_outcome TEXT, version TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, parent_id, agent, time_created, time_updated)
+             VALUES ('child-1', ?1, 'explore', ?2, ?3)",
+            rusqlite::params![parent, child_updated - 1_000, child_updated],
+        )
+        .unwrap();
+    }
+
+    /// 主库绿会话（末条 assistant finish=stop → Idle + 非空消息），cwd=E:/proj/r
+    fn green_main_db(path: &std::path::Path, sid: &str, ts: i64) {
+        v2_db(path);
+        let conn = Connection::open(path).unwrap();
+        ins_session(&conn, sid, "E:/proj/r", "打标会话", ts);
+        ins_msg(
+            &conn,
+            "m1",
+            sid,
+            "assistant",
+            1,
+            ts,
+            &assistant_data(r#"[{"type":"text","text":"回报完成"}]"#, Some("stop")),
+        );
+        drop(conn);
+    }
+
+    /// 子会话 time_updated 距父末条 5s（窗内）→ 打标 true
+    #[test]
+    fn report_flag_true_when_child_updated_within_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let sid = "ses_oc_report_true_5f3a";
+        let main = tmp.path().join("main.db");
+        green_main_db(&main, sid, now);
+        let anchor_home = tmp.path().join("anchorhome");
+        anchor_db_at(&anchor_home, sid, now - 5_000);
+        let guard = crate::monitor::test_env::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sessions = crate::monitor::test_env::with_home(&anchor_home, || {
+            get_opencode_sessions_with_db(&main, &[fake_process(11, "E:/proj/r")])
+        });
+        drop(guard);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Idle, "前置：finish=stop → 绿");
+        assert!(
+            sessions[0].last_message_subagent_report,
+            "子会话 time_updated 距父末条 5s（<90s 窗）→ 打标"
+        );
+    }
+
+    /// 锚窗外（10 分钟前）/ 无锚库（HOME 下无 opencode.db）→ false
+    #[test]
+    fn report_flag_false_when_stale_or_no_anchor_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let sid = "ses_oc_report_false_5f3b";
+        let main = tmp.path().join("main.db");
+        green_main_db(&main, sid, now);
+        // 窗外锚
+        let stale_home = tmp.path().join("stalehome");
+        anchor_db_at(&stale_home, sid, now - 600_000);
+        let guard = crate::monitor::test_env::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stale = crate::monitor::test_env::with_home(&stale_home, || {
+            get_opencode_sessions_with_db(&main, &[fake_process(11, "E:/proj/r")])
+        });
+        // 无锚库（空 HOME）
+        let empty_home = tmp.path().join("emptyhome");
+        std::fs::create_dir_all(&empty_home).unwrap();
+        let none = crate::monitor::test_env::with_home(&empty_home, || {
+            get_opencode_sessions_with_db(&main, &[fake_process(11, "E:/proj/r")])
+        });
+        drop(guard);
+        assert_eq!(stale.len(), 1);
+        assert!(
+            !stale[0].last_message_subagent_report,
+            "子会话 time_updated 距父末条 10 分钟（窗外）→ false"
+        );
+        assert_eq!(none.len(), 1);
+        assert!(
+            !none[0].last_message_subagent_report,
+            "锚库缺失（child_updated_anchors 空态）→ false"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2336,8 +2457,8 @@ mod matching_tests {
             );
         }
     }
-}
 
+}
 /// 复评 M-2：**实机验证占位**（`#[ignore]`——常规门禁只编译不跑）。
 ///
 /// 验证目标：opencode 问答待决窗口内 `pending_question_part` 判据**真实可达**，

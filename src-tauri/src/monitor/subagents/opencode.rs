@@ -80,6 +80,41 @@ pub(crate) fn collect_with(db_path: &Path, session_id: &str, now_ms: i64) -> Vec
     views
 }
 
+/// 回报提醒打标锚（#151 全工具化）：子会话 time_updated 毫秒列表。取原始活动
+/// 毫秒、不经 Running/Idle 分诊——90s 活跃窗滞后会让「刚完成 10s」的子代理
+/// 在视图里还是 Running，恰是打标最需要的时刻。SQLite 查询即最新（豁免
+/// L2/L3 预算纪律），绿会话闸住成本（一次 readonly 连接 + parent_id 等值查询）。
+pub fn child_updated_anchors(session_id: &str) -> Vec<i64> {
+    let Some(db) = dirs::home_dir().map(|h| {
+        h.join(".local")
+            .join("share")
+            .join("opencode")
+            .join("opencode.db")
+    }) else {
+        return Vec::new();
+    };
+    child_updated_anchors_with(&db, session_id)
+}
+
+/// 可注入核心（db 路径注入；测试 tempdir）
+pub(crate) fn child_updated_anchors_with(db_path: &Path, session_id: &str) -> Vec<i64> {
+    let Some(conn) = crate::monitor::sqlite::open_readonly_with_timeout(db_path) else {
+        return Vec::new();
+    };
+    // 2.x 判据单点（同 collect_with）
+    if !crate::monitor::opencode_parser::schema_is_v2(&conn) {
+        return Vec::new();
+    }
+    let sql = "SELECT time_updated FROM session_v2 \
+               WHERE parent_id IS NOT NULL AND parent_id = ?1";
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return Vec::new();
+    };
+    stmt.query_map([session_id], |row| row.get::<_, i64>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +367,41 @@ mod tests {
             360,
             "reasoning 9999 不计入（100+50+10+200）"
         );
+    }
+
+    // ==== #151：回报打标锚 child_updated_anchors_with（time_updated 毫秒列表）====
+
+    /// 锚收集：parent_id 等值过滤收 time_updated；孤儿行（parent NULL）不入、
+    /// 别的父会话子行不入、v1 库（无 session_v2）空、缺库空
+    #[test]
+    fn child_updated_anchors_collect_by_parent() {
+        let td = tempfile::tempdir().unwrap();
+        let db = td.path().join("opencode.db");
+        let conn = make_db(&db);
+        let now = 2_000_000_000_000i64;
+        ins(&conn, "main-1", None, None, 0, 0, 0, 0, now - 9_000_000, now);
+        ins(&conn, "child-1", Some("main-1"), Some("a"), 0, 0, 0, 0, now - 60_000, now - 30_000);
+        ins(&conn, "child-2", Some("main-1"), Some("b"), 0, 0, 0, 0, now - 50_000, now - 10_000);
+        ins(&conn, "orphan", None, Some("a"), 0, 0, 0, 0, now - 1000, now); // parent NULL → 非子
+        ins(&conn, "other-child", Some("main-2"), Some("a"), 0, 0, 0, 0, now - 1000, now);
+        drop(conn);
+        let mut anchors = child_updated_anchors_with(&db, "main-1");
+        anchors.sort_unstable();
+        assert_eq!(
+            anchors,
+            [now - 30_000, now - 10_000],
+            "仅本父会话子行的 time_updated（原始毫秒，不经 Running/Idle 分诊）"
+        );
+        assert!(child_updated_anchors_with(&db, "main-2-no-kids").is_empty());
+        // v1 库（无 session_v2）→ 空（schema_is_v2 门）+ 库缺失 → 空
+        let v1db = td.path().join("v1.db");
+        let c1 = Connection::open(&v1db).unwrap();
+        c1.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_updated INTEGER);",
+        )
+        .unwrap();
+        drop(c1);
+        assert!(child_updated_anchors_with(&v1db, "main-1").is_empty());
+        assert!(child_updated_anchors_with(&td.path().join("missing.db"), "main-1").is_empty());
     }
 }

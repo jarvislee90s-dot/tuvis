@@ -99,6 +99,31 @@ pub(crate) fn json_time_to_iso(v: &serde_json::Value) -> Option<String> {
 }
 
 // ============================================================
+// 回报提醒打标（#151 全工具化）：时间关联判据共享核
+// ============================================================
+
+/// 回报关联系数窗：与 ACTIVE_SECS=90 同值、独立常量——两语义可分别调参
+/// （活跃窗是「还在跑」分诊；回报窗是「子代理完成/最后活动落在父末条多久内」）。
+pub(crate) const SUBAGENT_REPORT_WINDOW_MS: i64 = 90_000;
+/// 时钟/秒级取整容差（锚可略晚于父末条落盘）
+pub(crate) const SUBAGENT_REPORT_SKEW_MS: i64 = 2_000;
+
+/// 锚 ≤ last+skew ∧ last−anchor ≤ window（回报发生在父末条之前不久）。
+/// 比 last_msg 而不比「当前时刻」：digest-now 随轮询推进会打标翻转（flappy），
+/// last_msg 锚使打标是会话内容的稳定函数（与 L2「纯内容产物」纪律同构）。
+pub(crate) fn report_anchor_near_last(anchor_ms: i64, last_msg_ms: i64) -> bool {
+    anchor_ms <= last_msg_ms + SUBAGENT_REPORT_SKEW_MS
+        && last_msg_ms.saturating_sub(anchor_ms) <= SUBAGENT_REPORT_WINDOW_MS
+}
+
+/// rfc3339 → 毫秒（ms_to_iso 的逆）；解析失败 None（该锚放弃，保守不打标）
+pub(crate) fn iso_to_ms(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|d| d.timestamp_millis())
+}
+
+// ============================================================
 // 增量读：offset 只跨过完整行；尾部半行留待下轮；stat 门控；护栏作废重建
 // ============================================================
 
@@ -404,5 +429,43 @@ mod tests {
             serde_json::to_string(&SubagentStatus::Idle).unwrap(),
             "\"idle\""
         );
+    }
+
+    // ==== #151：回报打标时间关联判据（边界表）====
+
+    /// report_anchor_near_last 边界：锚 ≤ last+skew ∧ last−anchor ≤ window
+    #[test]
+    fn report_anchor_near_last_boundaries() {
+        let last = 1_000_000_000_000i64;
+        // 窗内：回报距父末条 89_999 → 命中
+        assert!(report_anchor_near_last(last - 89_999, last), "窗内 89_999 命中");
+        // 窗外：90_001 → 不命中（90_000 恰在窗沿也命中——≤ window）
+        assert!(!report_anchor_near_last(last - 90_001, last), "窗外 90_001 拒");
+        assert!(report_anchor_near_last(last - 90_000, last), "窗沿 90_000 命中（≤）");
+        // 锚晚于 last：容差内（≤ skew）命中、超容差拒
+        assert!(report_anchor_near_last(last + 2_000, last), "锚=last+skew 命中（≤）");
+        assert!(!report_anchor_near_last(last + 2_001, last), "锚>last+skew 拒");
+        assert!(!report_anchor_near_last(last + 100_000, last), "锚远晚于 last 拒");
+        // 锚==last → 命中
+        assert!(report_anchor_near_last(last, last), "锚==last 命中");
+        // last 早于锚的极远端（i64 域无溢出 panic；saturating 语义下仍拒）
+        assert!(
+            !report_anchor_near_last(i64::MAX, i64::MIN),
+            "极值不 panic，远超容差拒（saturating_sub 饱和到 i64::MAX > window）"
+        );
+    }
+
+    /// iso_to_ms：合法 rfc3339 → 毫秒；非法形态 → None（保守不打标）
+    #[test]
+    fn iso_to_ms_valid_and_invalid() {
+        assert_eq!(iso_to_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso_to_ms("1969-12-31T23:59:59Z"), Some(-1_000), "纪元前为负毫秒");
+        assert_eq!(iso_to_ms("2026-10-18T00:00:00Z"), Some(1_792_281_600_000));
+        // ms_to_iso 的逆（round-trip，顺带锁时区偏移形态）
+        let ms = 1_760_000_000_123i64;
+        assert_eq!(ms_to_iso(ms).as_deref().and_then(iso_to_ms), Some(ms));
+        assert_eq!(iso_to_ms("not a timestamp"), None);
+        assert_eq!(iso_to_ms(""), None);
+        assert_eq!(iso_to_ms("2026-10-18"), None, "缺时间部分的日期不算 rfc3339");
     }
 }

@@ -11,6 +11,9 @@ use super::jsonl::{read_first_lines, read_recent_lines};
 use super::project::project_name_from_path;
 use super::session_scan::{fresh_within, SessionFileScan};
 use crate::adapter::AgentProcess;
+use crate::monitor::subagents::{
+    iso_to_ms, report_anchor_near_last, SubagentStatus,
+};
 use crate::session::{jump_supported_for, AgentType, ProcessForm, Session, SessionStatus};
 use log::{debug, info};
 use serde::Deserialize;
@@ -681,6 +684,23 @@ fn session_from_digest(
         .filter(|c| *c != '-')
         .take(12)
         .collect::<String>();
+    // #151 回报打标（时间关联，全工具化）：仅绿会话且末条非空才付锚收集成本。
+    // codex 锚 = 子 rollout task_complete 行 ts（事件驱动、无 90s 滞后，走
+    // collect 视图即可——与 kimi/opencode 的原始毫秒锚差异见 subagents/mod.rs）
+    let session_id_for_report = digest.session_id.clone().unwrap_or_default();
+    let last_message_subagent_report = matches!(status, SessionStatus::Idle | SessionStatus::Finished)
+        && digest.last_message.as_deref().is_some_and(|m| !m.is_empty())
+        && digest
+            .last_timestamp
+            .as_deref()
+            .and_then(iso_to_ms)
+            .is_some_and(|last_ms| {
+                crate::monitor::subagents::codex::collect(&session_id_for_report)
+                    .iter()
+                    .filter(|v| v.status == SubagentStatus::Idle)
+                    .filter_map(|v| v.end_ts.as_deref().and_then(iso_to_ms))
+                    .any(|anchor| report_anchor_near_last(anchor, last_ms))
+            });
     Some(Session {
         id: digest.session_id.clone()?,
         agent_type: AgentType::Codex,
@@ -691,7 +711,7 @@ fn session_from_digest(
         status,
         last_message: digest.last_message.clone(),
         last_message_role: digest.last_role.clone(),
-        last_message_subagent_report: false,
+        last_message_subagent_report,
         flap_from_subagent_activity: false,
         last_activity_at: digest
             .last_timestamp
@@ -1621,5 +1641,133 @@ mod scan_budget_tests {
         assert_eq!(second.len(), 1);
         assert_eq!(first[0].id, second[0].id);
         assert_eq!(first[0].project_path, second[0].project_path);
+    }
+}
+
+/// #151 回报打标（时间关联，全工具化）：session_from_digest 内联打标的直测。
+/// 注入缝申报：打标调 `subagents::codex::collect`（生产入口，`dirs::home_dir()`
+/// 硬编码 `.codex/sessions`）——无 path/env 参数缝，测试经 HOME 重定向控制数据根
+/// （Unix 下 dirs 优先读 $HOME；见 monitor::test_env 注释）。
+#[cfg(test)]
+mod report_flag_tests {
+    use super::*;
+    use crate::monitor::test_env::{with_home, HOME_ENV_LOCK};
+
+    fn report_digest(sid: &str, last_ts: &str) -> CodexFileDigest {
+        CodexFileDigest {
+            session_id: Some(sid.to_string()),
+            project_path: "/work/demo".to_string(),
+            kinds: vec![], // 无语义条目 + file_age None → 兜底 Idle（绿会话闸通过）
+            last_message: Some("回合完成".to_string()),
+            last_role: Some("assistant".to_string()),
+            last_timestamp: Some(last_ts.to_string()),
+        }
+    }
+
+    /// 在 `home/.codex/sessions/...` 下造一个子 rollout（parent_thread_id 指回父会话）
+    fn child_rollout(home: &Path, parent_sid: &str, child_id: &str, complete_ts: &str) {
+        let d = home.join(".codex").join("sessions").join("2026").join("10").join("18");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join(format!("rollout-2026-10-18T08-00-01-{child_id}.jsonl")),
+            format!(
+                concat!(
+                    r#"{{"timestamp":"2026-10-18T07:59:00Z","type":"session_meta","payload":{{"id":"{child_id}","cwd":"/work/demo","parent_thread_id":"{parent}"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"{complete_ts}","type":"event_msg","payload":{{"type":"task_complete","turn_id":"t1"}}}}"#,
+                    "\n",
+                ),
+                child_id = child_id,
+                parent = parent_sid,
+                complete_ts = complete_ts,
+            ),
+        )
+        .unwrap();
+    }
+
+    /// 锚距父末条 5s（窗内）→ 打标 true；无子代理的会话 id 唯一化，不与真实
+    /// ~/.codex 数据撞车
+    #[test]
+    fn report_flag_true_when_task_complete_within_window() {
+        crate::monitor::subagents::reset_cache_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let sid = "codex-report-parent-6f2a-true";
+        child_rollout(
+            tmp.path(),
+            sid,
+            "child-9abc",
+            &(now - chrono::Duration::seconds(5)).to_rfc3339(),
+        );
+        let guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let s = with_home(tmp.path(), || {
+            session_from_digest(&report_digest(sid, &now.to_rfc3339()), ProcessForm::Cli, None)
+                .unwrap()
+        });
+        drop(guard);
+        assert!(
+            s.last_message_subagent_report,
+            "子 rollout task_complete 距父末条 5s（<90s 窗）→ 打标"
+        );
+        crate::monitor::subagents::reset_cache_for_tests();
+    }
+
+    /// 锚距父末条 10 分钟（窗外）→ false
+    #[test]
+    fn report_flag_false_when_task_complete_stale() {
+        crate::monitor::subagents::reset_cache_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let sid = "codex-report-parent-6f2b-stale";
+        child_rollout(
+            tmp.path(),
+            sid,
+            "child-1",
+            &(now - chrono::Duration::seconds(600)).to_rfc3339(),
+        );
+        let guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let s = with_home(tmp.path(), || {
+            session_from_digest(&report_digest(sid, &now.to_rfc3339()), ProcessForm::Cli, None)
+                .unwrap()
+        });
+        drop(guard);
+        assert!(!s.last_message_subagent_report, "10 分钟前的完成事件不构成回报");
+        crate::monitor::subagents::reset_cache_for_tests();
+    }
+
+    /// 无子代理 / 非绿会话（Processing）→ false（预算闸：非绿不收集锚）
+    #[test]
+    fn report_flag_false_without_children_or_when_not_green() {
+        crate::monitor::subagents::reset_cache_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        let guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 无子代理（空 HOME，collect 必空）
+        let s = with_home(tmp.path(), || {
+            session_from_digest(
+                &report_digest("codex-report-parent-6f2c-none", &now.to_rfc3339()),
+                ProcessForm::Cli,
+                None,
+            )
+            .unwrap()
+        });
+        assert!(!s.last_message_subagent_report, "无子代理 → false");
+        // 非绿会话（尾部工具调用 → Processing）：即便锚在窗内也不打标（绿会话闸）
+        let sid = "codex-report-parent-6f2d-busy";
+        child_rollout(
+            tmp.path(),
+            sid,
+            "child-2",
+            &(now - chrono::Duration::seconds(5)).to_rfc3339(),
+        );
+        let mut d = report_digest(sid, &now.to_rfc3339());
+        d.kinds = vec![AppEntryKind::ToolCall];
+        let s = with_home(tmp.path(), || {
+            session_from_digest(&d, ProcessForm::Cli, None).unwrap()
+        });
+        drop(guard);
+        assert_eq!(s.status, SessionStatus::Processing);
+        assert!(!s.last_message_subagent_report, "非绿会话不触发锚收集（预算闸）");
+        crate::monitor::subagents::reset_cache_for_tests();
     }
 }

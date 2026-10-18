@@ -26,10 +26,10 @@ vi.mock("@/components/pet/petConfig", () => ({
 import { useSessionStore } from "@/stores/sessionStore";
 import { useNotification, GREEN_STABLE_MS } from "@/hooks/useNotification";
 
-function session(id: string, report: boolean) {
+function session(id: string, report: boolean, agentType: string = "claude") {
   return {
     id,
-    agentType: "claude",
+    agentType,
     form: "cli" as const,
     projectName: "Demo",
     title: "T",
@@ -108,5 +108,35 @@ describe("子 Agent 回报提醒开关（观察台 §四）", () => {
       await vi.advanceTimersByTimeAsync(GREEN_STABLE_MS + 100);
     });
     expect(sendNotificationMock).toHaveBeenCalledTimes(1);
+  });
+
+  // ==== #151 全工具化：gate 按 Session 字段工作，三家 payload 与 claude 同构 ====
+  // 回归锁：开关关时 codex/kimi/opencode 的打标转绿被静默，未打标的主会话完成照常提醒
+  describe.each(["codex", "kimi", "opencode"])("%s payload（#151 全工具化）", (agent) => {
+    it("开关关闭：flag=true 静默、flag=false 主会话照常提醒（同构回归锁）", async () => {
+      vi.useFakeTimers();
+      renderHook(() => useNotification());
+      await flushInit();
+      act(() => {
+        useSessionStore.setState({
+          sessions: [
+            session(`${agent}-report`, true, agent),
+            session(`${agent}-own`, false, agent),
+          ],
+        });
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(GREEN_STABLE_MS + 100);
+      });
+      const targets = sendNotificationMock.mock.calls.map((c) => JSON.stringify(c[0].extra));
+      expect(
+        targets.some((t) => t.includes(`${agent}-own`)),
+        `${agent}：主会话自身完成照常提醒`
+      ).toBe(true);
+      expect(
+        targets.some((t) => t.includes(`${agent}-report`)),
+        `${agent}：子 agent 回报被滤`
+      ).toBe(false);
+    });
   });
 });
