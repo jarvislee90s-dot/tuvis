@@ -16,8 +16,13 @@
 //   顺序（sequence）倒扫，不得按时间戳；子代理执行期间主会话零写入（尾部停留在
 //   「工具调用已发出、结果未回」），子代理会话自身持续落库（parent_id 关联）——
 //   经共享层后代活跃度仲裁（D5，monitor::app_status）保持运行中；
-// - ZCode 会在回合中途以 user 角色注入 todo_reminder 等记账消息——按 semantics.kind
-//   识别并跳过，不按用户消息处理；
+// - 后台派发与结算的配对判据（Z-P1，2026-09-15）：派发 = part 的
+//   state.input.run_in_background=true 且 output 含 workId（agentId:/ID:）；
+//   结算 = background_notification 的 metadata.originMeta.workId。派发已见、
+//   结算未见 ⇒ Pending（完成仲裁拦截绿态）；派发超 24h 视为僵尸不劫持；
+// - ZCode 会在回合中途以 user 角色注入合成消息（通知/提醒/上下文）——按合成标记
+//   （synthetic / semantics.uiVisibility）识别并跳过，kind 枚举作纵深兜底（Z-P2，
+//   2026-09-15）：标记缺失的已知记账 kind 仍跳过，语义标记优先于枚举；
 // - 会话 id：`sess_` + 标准 UUID（8-4-4-4-12）；子代理 id `sess_subagent_agent_<uuid>`；
 // - 路径：macOS 正斜杠；Windows 反斜杠 + 大写盘符——展示/比对前归一化，原生形态保留。
 //
@@ -25,7 +30,8 @@
 // 为空，绝不 panic、不影响其他工具的监控。测试一律使用构造 fixture 与临时目录。
 
 use super::app_status::{
-    derive_app_status, overlay_stale_with_descendants, AppEntryKind, DescendantActivity,
+    derive_app_status, entry_origin_from_flags, overlay_completion_with_pending,
+    overlay_stale_with_descendants, AppEntryKind, DescendantActivity, EntryOrigin,
     APP_STATUS_STALE_MS,
 };
 use super::git::get_github_url;
@@ -35,7 +41,7 @@ use crate::adapter::AgentProcess;
 use crate::session::{jump_supported_for, AgentType, ProcessForm, Session, SessionStatus};
 use log::debug;
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// 出卡窗口：session.time_updated 距今 24h 内（与未读池 24h 兜底过期同窗）
@@ -493,6 +499,16 @@ fn build_one_session(
         status = SessionStatus::Finished;
     }
 
+    // Z-P1：完成仲裁——存在未结算后台工作时，回合收尾不得报绿。
+    // 位置必须在 error 覆盖之后（否则 error 转绿会绕过）；本函数的转绿路径共
+    // 三条（尾部推导 Idle / 无信号停更兜底 Idle / error 覆盖 Finished），这一处
+    // 调用同时覆盖三者。实测 65% 的转绿发生在子代理仍在跑时（提示音/通知/
+    // 未读卡均由此误触发）。非绿态由 overlay_completion_with_pending 内部透传，
+    // 无需条件前置（尾窗 JSON 解析微秒级）
+    if load_pending_background(&messages, &parts, now) {
+        status = overlay_completion_with_pending(status, DescendantActivity::Pending);
+    }
+
     let title = resolve_title(task, row, &messages, &parts);
     let (last_message, last_message_role) = last_message_summary(&messages, &parts);
 
@@ -617,8 +633,144 @@ fn load_parts_for_messages(
 }
 
 /// 消息 + parts → 归一化 APP 条目（共享判定核的 ZCode 格式翻译适配器）。
-/// 记账消息（todo_reminder / timeline_event，ZCode 以 user 角色回合中途注入）整条跳过；
-/// user_prompt → UserMessage；assistant 消息按 parts 顺序展开：
+/// 消息来源判定（Z-P2）：工具侧显式合成标记优先，kind 枚举作纵深防御。
+/// 消费方：本 parser 三处（flatten/last_message_summary/first_user_text）+
+/// remote::content 的 zcode 读取（适配追记③同步点，口径必须同源）。
+/// 实测（2026-09-14，451 会话）：synthetic=1 或 uiVisibility=hidden 恰好覆盖
+/// 全部 1051 条注入消息（todo_reminder 815 / background_notification 157 /
+/// system_reminder 72 / subagent_notification 7），629 条 user_prompt 零误伤。
+/// 保留 kind 判断：私有格式升级可能丢标记，双保险方向与既有白名单一致
+pub(crate) fn message_origin(v: &serde_json::Value) -> EntryOrigin {
+    let synthetic = v
+        .get("synthetic")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let ui_hidden = v
+        .pointer("/semantics/uiVisibility")
+        .and_then(|s| s.as_str())
+        == Some("hidden");
+    if entry_origin_from_flags(synthetic, ui_hidden) == EntryOrigin::Synthetic {
+        return EntryOrigin::Synthetic;
+    }
+    let kind = v
+        .pointer("/semantics/kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or_default();
+    // 已知记账 kind 兜底（标记缺失场景）；新增 kind 时在此追加。
+    // background/subagent_notification 一并纳入（评审 Nit1：by-construction 是
+    // 工具注入，兜底纳入零误伤——恰是 Z-P2 缺陷的主载体 157+7 条）
+    if matches!(
+        kind,
+        "todo_reminder"
+            | "timeline_event"
+            | "system_reminder"
+            | "background_notification"
+            | "subagent_notification"
+    ) {
+        return EntryOrigin::Synthetic;
+    }
+    EntryOrigin::Human
+}
+
+/// 未结算后台工作探测（Z-P1）：从**已加载的尾部数据**提取"派发已见、结算未见"
+/// 的后台工作 id 集合，返回该会话是否仍有未结算工作。
+///
+/// 判据（实机验证，2026-09-14）：派发 = part.state.input.run_in_background == true
+/// 且 output 含 workId（agentId/exec ID）；结算 = background_notification 的
+/// metadata.originMeta.workId 出现在尾部。111 条派发 / 155 条结算，闭环率 99%。
+///
+/// 扫描预算：**零新增查询**——只读 load_tail_messages 已取的尾窗消息与
+/// load_parts_for_messages 已取的 parts。代价 = O(尾窗条目数) 的 JSON 解析
+/// （微秒级）。已知边界：派发早于尾窗时不可见（实测 sess_35bb3c94 最老派发
+/// 距尾 253 条会漏）——由超龄保护与结算侧共同兜底（见下）。
+///
+/// 超龄保护：派发时刻早于 CARD_WINDOW_MS（24h）的视为僵尸（实测存在 1 例
+/// 28882 分钟前的未结算派发），不参与判定——防止"某次异常中断的派发"
+/// 永久劫持该会话的状态。
+fn load_pending_background(
+    tail: &[MessageRow],
+    parts: &HashMap<String, Vec<PartRow>>,
+    now: i64,
+) -> bool {
+    let mut dispatched: HashSet<String> = HashSet::new();
+    let mut settled: HashSet<String> = HashSet::new();
+    for msg in tail {
+        // 结算侧
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg.data) {
+            if let Some(w) = v
+                .pointer("/metadata/originMeta/workId")
+                .and_then(|s| s.as_str())
+            {
+                settled.insert(w.to_string());
+            }
+        }
+        // 派发侧
+        for part in parts.get(&msg.id).map(|v| v.as_slice()).unwrap_or_default() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&part.data) else {
+                continue;
+            };
+            if v.get("type").and_then(|t| t.as_str()) != Some("tool") {
+                continue;
+            }
+            if v.pointer("/state/input/run_in_background")
+                .and_then(|b| b.as_bool())
+                != Some(true)
+            {
+                continue;
+            }
+            // 超龄保护：派发时刻早于 24h 卡片窗的视为僵尸（实测 1 例 28882 分钟前的
+            // 未结算派发），不参与判定——防止异常中断的派发永久劫持会话状态。
+            // 时间戳来自 part 的 state.time.start（毫秒，实测形态
+            // {"start":1789049908662,"end":1789049908924}）；缺失按新鲜处理
+            // （防御方向 = 保持 Pending，宁可晚一轮报绿，不可漏报未完成）
+            let started = v
+                .pointer("/state/time/start")
+                .and_then(|t| t.as_i64())
+                .unwrap_or(now);
+            if now.saturating_sub(started) > CARD_WINDOW_MS {
+                continue;
+            }
+            let out = v
+                .pointer("/state/output")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            let Some(w) = extract_work_id(out) else {
+                continue;
+            };
+            dispatched.insert(w);
+        }
+    }
+    // 未结算 = 派发集合 − 结算集合（差额非空）
+    dispatched.iter().any(|w| !settled.contains(w))
+}
+
+/// 从派发 output 提取 workId：`agentId: agent_<uuid>` 或 `ID: exec_<uuid>`
+/// （111/111 实测可提取；格式变化时返回 None → 该派发不参与判定，降级为修复前行为）
+fn extract_work_id(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("agentId: ") {
+            let id = rest.split_whitespace().next().unwrap_or("");
+            // 形态校验复用既有严格 UUID 判定（agent_ 后为 36 字符 UUID）
+            if let Some(uuid) = id.strip_prefix("agent_") {
+                if super::workbuddy_parser::is_strict_uuid_form(uuid) {
+                    return Some(id.to_string());
+                }
+            }
+        } else if let Some(rest) = line.split("ID: ").nth(1) {
+            let id = rest.split_whitespace().next().unwrap_or("");
+            if let Some(uuid) = id.strip_prefix("exec_") {
+                if super::workbuddy_parser::is_strict_uuid_form(uuid) {
+                    return Some(id.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 合成注入（通知/提醒/上下文）整条跳过；user_prompt → UserMessage；
+/// assistant 消息按 parts 顺序展开：
 /// tool → ToolCall（调用已发出）、step-start → TurnStart、
 /// step-finish(reason=tool-calls) → ToolCall（本步以工具调用收尾、后续还有动作）、
 /// step-finish(其余) → TurnEnd（回合收尾；懒落库但顺序可靠，永远排在所属消息尾部）、
@@ -633,19 +785,17 @@ fn flatten_entries(
             continue; // data 损坏 → 跳过该消息（防御）
         };
         let role = v.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-        let kind = v
-            .pointer("/semantics/kind")
-            .and_then(|k| k.as_str())
-            .unwrap_or_default();
-        match (role, kind) {
-            // 记账消息：按用户消息处理会误判状态，识别并跳过（继续倒扫）
-            ("user", "todo_reminder") | ("user", "timeline_event") => continue,
-            ("user", _) => {
+        match role {
+            // Z-P2：合成注入（通知/提醒/上下文）不参与状态判定——
+            // 判成 UserMessage 会让"子代理返回"看起来像"用户提问"（假黄），
+            // 且其正文会污染预览（用户通知历史实测出现 3 条 <task-notification> 原文）
+            "user" if message_origin(&v) == EntryOrigin::Synthetic => continue,
+            "user" => {
                 // user_prompt 与 kind 缺失的真实用户消息都按 UserMessage（防御：
-                // 已知记账 kind 已在上一臂排除，未知 kind 保守按用户消息处理）
+                // 合成消息已在前一臂排除，未知 kind 保守按用户消息处理）
                 entries.push(AppEntryKind::UserMessage);
             }
-            ("assistant", _) => {
+            "assistant" => {
                 let Some(parts) = parts.get(&msg.id) else {
                     continue;
                 };
@@ -703,16 +853,10 @@ fn last_message_summary(
             continue;
         };
         let role = v.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-        // 记账消息（todo_reminder / timeline_event）以 user 角色注入且带真实
-        // text part（如 <todo>…</todo> 提醒）——不作最后消息展示，倒扫继续
-        let kind = v
-            .pointer("/semantics/kind")
-            .and_then(|k| k.as_str())
-            .unwrap_or_default();
-        if matches!(
-            (role, kind),
-            ("user", "todo_reminder") | ("user", "timeline_event")
-        ) {
+        // 合成注入（Z-P2：通知/提醒/上下文，标记优先 + kind 兜底）以 user 角色
+        // 注入且带真实 text part（如 <task-notification> 原文）——不作最后消息
+        // 展示，倒扫继续
+        if role == "user" && message_origin(&v) == EntryOrigin::Synthetic {
             continue;
         }
         let Some(msg_parts) = parts.get(&msg.id) else {
@@ -744,11 +888,7 @@ fn first_user_text(
             continue; // 单条消息 data 损坏 → 跳过继续找（防御）
         };
         let role = v.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-        let kind = v
-            .pointer("/semantics/kind")
-            .and_then(|k| k.as_str())
-            .unwrap_or_default();
-        if role != "user" || matches!(kind, "todo_reminder" | "timeline_event") {
+        if role != "user" || message_origin(&v) == EntryOrigin::Synthetic {
             continue;
         }
         if let Some(text) = parts
@@ -892,6 +1032,333 @@ mod tests {
     /// 消息 data 构造（role + semantics.kind）
     fn msg_data(role: &str, kind: &str) -> String {
         format!(r#"{{"role":"{role}","semantics":{{"kind":"{kind}"}}}}"#)
+    }
+
+    // ===== Z-P2：合成注入识别（2026-09-15 修复，Task 3）=====
+
+    /// Z-P2 回归锁：合成通知消息不参与状态判定、不上预览（2026-09-15）
+    #[test]
+    fn synthetic_notifications_are_skipped() {
+        // 通知消息（synthetic=true，带 <task-notification> 正文）
+        let notif = r#"{"role":"user","synthetic":true,
+            "semantics":{"kind":"background_notification","uiVisibility":"hidden"},
+            "metadata":{"originMeta":{"backgroundSource":"subagent","workId":"agent_x"}}}"#
+            .to_string();
+        // 真实用户输入
+        let human =
+            r#"{"role":"user","semantics":{"kind":"user_prompt"},"synthetic":false}"#.to_string();
+        let msgs = vec![
+            MessageRow {
+                id: "m1".into(),
+                data: msg_data("assistant", ""),
+            },
+            MessageRow {
+                id: "m2".into(),
+                data: notif,
+            },
+            MessageRow {
+                id: "m3".into(),
+                data: human,
+            },
+        ];
+        // m1 配 text part 才会展开出条目（assistant 无 parts 时本就不参与判定）
+        let mut parts = HashMap::new();
+        parts.insert(
+            "m1".into(),
+            vec![PartRow {
+                data: r#"{"type":"text","text":"好的"}"#.into(),
+            }],
+        );
+        let entries = flatten_entries(&msgs, &parts);
+        // 通知不产生 UserMessage：只应有 m1(assistant) 与 m3(user) 两条
+        assert_eq!(entries.len(), 2, "合成通知不得进入判定条目");
+        assert_eq!(
+            entries[1],
+            AppEntryKind::UserMessage,
+            "真实用户输入仍判 UserMessage"
+        );
+
+        // 末条消息：跳过后应取真实用户输入，而非 <task-notification> 正文
+        let mut parts2 = HashMap::new();
+        parts2.insert(
+            "m2".into(),
+            vec![PartRow {
+                data: r#"{"type":"text","text":"<task-notification>\n<task-id>agent_x</task-id>"}"#
+                    .into(),
+            }],
+        );
+        parts2.insert(
+            "m3".into(),
+            vec![PartRow {
+                data: r#"{"type":"text","text":"继续"}"#.into(),
+            }],
+        );
+        let (last, role) = last_message_summary(&msgs, &parts2);
+        assert_eq!(last.as_deref(), Some("继续"), "不得把通知原文当末条展示");
+        assert_eq!(role.as_deref(), Some("user"));
+    }
+
+    /// 纵深防御：标记缺失但 kind 已知 → 仍跳过（含 Z-P2 主载体两 kind，评审 Nit1）
+    #[test]
+    fn known_kind_skipped_without_synthetic_flag() {
+        for kind in [
+            "todo_reminder",
+            "timeline_event",
+            "system_reminder",
+            "background_notification",
+            "subagent_notification",
+        ] {
+            let data = format!(r#"{{"role":"user","semantics":{{"kind":"{kind}"}}}}"#);
+            let msgs = vec![MessageRow {
+                id: "m1".into(),
+                data,
+            }];
+            assert!(
+                flatten_entries(&msgs, &HashMap::new()).is_empty(),
+                "标记缺失的已知记账 kind（{kind}）仍须跳过"
+            );
+        }
+    }
+
+    // ===== Z-P1：未结算后台工作仲裁（2026-09-15 修复，Task 4）=====
+
+    /// Z-P1 回归锁：回合收尾 + 未结算后台工作 ⇒ 不判绿
+    #[test]
+    fn pending_background_blocks_green() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        let cli = build_cli_db(&roots.cli_db);
+        let now = now_ms();
+        let past = now - 60_000;
+        insert_session(&cli, SID_A, None, "/proj/a", "interactive", None, past);
+        // 派发：后台 Agent（part completed，output 含 agentId）
+        insert_message(
+            &cli,
+            "m1",
+            SID_A,
+            1,
+            past,
+            &msg_data("assistant", "assistant_response"),
+        );
+        insert_part(
+            &cli,
+            "p1",
+            "m1",
+            0,
+            r#"{"type":"tool","tool":"Agent",
+            "state":{"status":"completed","input":{"run_in_background":true},
+                     "output":"Async agent launched successfully.\nagentId: agent_beef0000-1111-2222-3333-444455556666 (internal ID)"}}"#,
+        );
+        // 回合收尾 → 推导 Idle（绿）
+        insert_message(
+            &cli,
+            "m2",
+            SID_A,
+            2,
+            past,
+            &msg_data("assistant", "assistant_response"),
+        );
+        insert_part(
+            &cli,
+            "p2",
+            "m2",
+            0,
+            r#"{"type":"step-finish","reason":"stop"}"#,
+        );
+        // 注意：无 background_notification ⇒ 未结算
+        drop(cli);
+
+        let sessions = build_sessions(&roots, &fake_host(), now);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].status,
+            SessionStatus::Waiting,
+            "后台子代理未返回，父会话不得报完成（Z-P1 根因）"
+        );
+    }
+
+    /// 结算后恢复绿（回归锁：不误伤正常完成）
+    #[test]
+    fn settled_background_allows_green() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        let cli = build_cli_db(&roots.cli_db);
+        let now = now_ms();
+        let past = now - 60_000;
+        insert_session(&cli, SID_A, None, "/proj/a", "interactive", None, past);
+        insert_message(
+            &cli,
+            "m1",
+            SID_A,
+            1,
+            past,
+            &msg_data("assistant", "assistant_response"),
+        );
+        insert_part(
+            &cli,
+            "p1",
+            "m1",
+            0,
+            r#"{"type":"tool","tool":"Agent",
+            "state":{"status":"completed","input":{"run_in_background":true},
+                     "output":"agentId: agent_beef0000-1111-2222-3333-444455556666"}}"#,
+        );
+        insert_message(
+            &cli,
+            "m2",
+            SID_A,
+            2,
+            past,
+            &msg_data("assistant", "assistant_response"),
+        );
+        insert_part(
+            &cli,
+            "p2",
+            "m2",
+            0,
+            r#"{"type":"step-finish","reason":"stop"}"#,
+        );
+        // 结算：background_notification（Z-P2 已让它不参与判定/不上预览，但
+        // metadata.originMeta.workId 参与配对核销）
+        insert_message(
+            &cli,
+            "m3",
+            SID_A,
+            3,
+            past,
+            r#"{"role":"user","synthetic":true,
+            "semantics":{"kind":"background_notification"},
+            "metadata":{"originMeta":{"workId":"agent_beef0000-1111-2222-3333-444455556666"}}}"#,
+        );
+        drop(cli);
+
+        let sessions = build_sessions(&roots, &fake_host(), now);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].status,
+            SessionStatus::Idle,
+            "结算核销后正常报完成（派发 − 结算 = 空）"
+        );
+    }
+
+    /// 超龄保护：派发在卡片窗外、且无结算证据 → 不永久劫持（防僵尸派发）
+    #[test]
+    fn stale_pending_does_not_hijack_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        let cli = build_cli_db(&roots.cli_db);
+        let now = now_ms();
+        let past = now - 60_000;
+        let started_25h_ago = now - 25 * 3600 * 1000;
+        insert_session(&cli, SID_A, None, "/proj/a", "interactive", None, past);
+        insert_message(
+            &cli,
+            "m1",
+            SID_A,
+            1,
+            past,
+            &msg_data("assistant", "assistant_response"),
+        );
+        // part 表无时间列——超龄写进 part JSON 的 state.time.start（适配追记①：
+        // 与生产判据 load_pending_background 的同一读取位置）
+        let part = format!(
+            r#"{{"type":"tool","tool":"Agent","state":{{"status":"completed","input":{{"run_in_background":true}},"time":{{"start":{started_25h_ago},"end":{started_25h_ago}}},"output":"agentId: agent_beef0000-1111-2222-3333-444455556666"}}}}"#
+        );
+        insert_part(&cli, "p1", "m1", 0, &part);
+        insert_message(
+            &cli,
+            "m2",
+            SID_A,
+            2,
+            past,
+            &msg_data("assistant", "assistant_response"),
+        );
+        insert_part(
+            &cli,
+            "p2",
+            "m2",
+            0,
+            r#"{"type":"step-finish","reason":"stop"}"#,
+        );
+        drop(cli);
+
+        let sessions = build_sessions(&roots, &fake_host(), now);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].status,
+            SessionStatus::Idle,
+            "超龄（>24h）僵尸派发不参与 Pending 判定，回合收尾照常报绿"
+        );
+    }
+
+    /// 前台派发不受影响（run_in_background 缺失 → 不产生 Pending）
+    #[test]
+    fn foreground_dispatch_unaffected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = fixture_roots(tmp.path());
+        let cli = build_cli_db(&roots.cli_db);
+        let now = now_ms();
+        let past = now - 60_000;
+        insert_session(&cli, SID_A, None, "/proj/a", "interactive", None, past);
+        insert_message(
+            &cli,
+            "m1",
+            SID_A,
+            1,
+            past,
+            &msg_data("assistant", "assistant_response"),
+        );
+        insert_part(
+            &cli,
+            "p1",
+            "m1",
+            0,
+            r#"{"type":"tool","tool":"Agent",
+            "state":{"status":"completed","output":"agentId: agent_beef0000-1111-2222-3333-444455556666"}}"#,
+        );
+        insert_message(
+            &cli,
+            "m2",
+            SID_A,
+            2,
+            past,
+            &msg_data("assistant", "assistant_response"),
+        );
+        insert_part(
+            &cli,
+            "p2",
+            "m2",
+            0,
+            r#"{"type":"step-finish","reason":"stop"}"#,
+        );
+        drop(cli);
+
+        let sessions = build_sessions(&roots, &fake_host(), now);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].status,
+            SessionStatus::Idle,
+            "前台派发（无 run_in_background）不触发 Pending，收尾照常报绿"
+        );
+    }
+
+    /// extract_work_id 三形态（计划实现注意项：单独单测）
+    #[test]
+    fn extract_work_id_agent_exec_and_malformed() {
+        // Agent 形态
+        assert_eq!(
+            extract_work_id("Async agent launched successfully.\nagentId: agent_beef0000-1111-2222-3333-444455556666 (internal ID)"),
+            Some("agent_beef0000-1111-2222-3333-444455556666".to_string())
+        );
+        // Bash 后台形态
+        assert_eq!(
+            extract_work_id("[bg] shell started\nID: exec_cafe0000-1111-2222-3333-444455556666"),
+            Some("exec_cafe0000-1111-2222-3333-444455556666".to_string())
+        );
+        // 畸形：非 UUID 尾串 / 无标记 → None（降级为修复前行为）
+        assert_eq!(extract_work_id("agentId: agent_not-a-uuid"), None);
+        assert_eq!(extract_work_id("ID: exec_not-a-uuid"), None);
+        assert_eq!(extract_work_id("普通输出，无派发标记"), None);
     }
 
     // ===== 会话 id 合规判定 =====

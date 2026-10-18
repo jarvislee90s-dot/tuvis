@@ -53,14 +53,23 @@ pub enum DescendantActivity {
     Stale,
     /// 无后代会话（既有工具的空后代语义 = 现状行为不变）
     Absent,
+    /// 存在**已派发但未结算**的后台工作（子代理 / 后台 bash / 后台任务）：
+    /// 与 Active 的本质区别——Active 依赖"最近有写入"，长思考期会被误判 Stale；
+    /// Pending 依赖"派发事件已见、结算事件未见"，语义是"账没结清"，与静默无关。
+    /// 语义优先级 Pending > Active > Stale > Absent——各 parser 在**调用点**按
+    /// 此优先条件映射（不改 descendant_activity 映射函数本身，Task 5/7/8 的
+    /// 接入形态：已有后代活跃信号之上，未结算证据在场时改调完成仲裁）
+    Pending,
 }
 
 /// 停更降级 + 后代活跃度仲裁（D5，判定核纯函数）：
 /// - 非 Processing：透传（与 overlay_mtime_stale 一致）；
 /// - Processing 且停更 < 阈值：透传；
 /// - Processing 且停更 >= 阈值：
-///   - 后代活跃 → 保持 Processing（「主会话静默 = 健康等待子代理」，
-///     实测 ZCode 子代理执行期间主会话 17 分钟零写入，不得降级）；
+///   - 后代活跃 / 后台未结算 → 保持 Processing（「主会话静默 = 健康等待子代理」，
+///     实测 ZCode 子代理执行期间主会话 17 分钟零写入，不得降级；Pending 与
+///     Active 同映射——账未结清时静默同样是健康等待，绿态拦截由
+///     [`overlay_completion_with_pending`] 单独负责）；
 ///   - 后代停更 / 无后代 → 降级 Waiting（疑似卡住）。
 ///
 /// Absent 分支即 overlay_mtime_stale 原语义——既有工具（Codex/WorkBuddy）行为零变化
@@ -71,10 +80,58 @@ pub fn overlay_stale_with_descendants(
 ) -> SessionStatus {
     match status {
         SessionStatus::Processing if mtime_age_ms >= APP_STATUS_STALE_MS => match descendants {
-            DescendantActivity::Active => SessionStatus::Processing,
+            DescendantActivity::Active | DescendantActivity::Pending => SessionStatus::Processing,
             DescendantActivity::Stale | DescendantActivity::Absent => SessionStatus::Waiting,
         },
         other => other,
+    }
+}
+
+/// 完成态仲裁（2026-09-15 子代理完成信号修复）：
+/// 回合收尾推导出的绿（Idle/Finished）在**存在未结算后台工作**时不成立——
+/// 真实场景：主会话派发后台子代理后结束本回合（ZCode step-finish(stop) /
+/// Claude assistant 尾部 / dsh turn/end completed），子代理仍在跑，MAM 却报完成
+/// 并播提示音、发通知、插未读卡。实测 ZCode 392 次转绿中 256 次（65%）属此类。
+///
+/// 非 Pending 一律透传：Active/Stale/Absent 保持既有语义（既有工具零变化，
+/// 见 non_pending_keeps_green 回归锁）。黄/红态不受影响——Pending 只拦"报完成"。
+pub fn overlay_completion_with_pending(
+    status: SessionStatus,
+    descendants: DescendantActivity,
+) -> SessionStatus {
+    match (status, descendants) {
+        (SessionStatus::Idle | SessionStatus::Finished, DescendantActivity::Pending) => {
+            SessionStatus::Waiting
+        }
+        (other, _) => other,
+    }
+}
+
+/// 归一化条目来源（各 parser 格式翻译层产出，P2 修复的共享判据）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryOrigin {
+    /// 真人输入
+    Human,
+    /// 工具注入的合成条目（子代理/后台任务通知、系统提醒、上下文注入、摘要）
+    Synthetic,
+    /// 无法判定
+    Unknown,
+}
+
+/// 合成标记 → 条目来源（各 parser 共享的判据）：
+/// 工具侧显式的 synthetic 标记或"UI 不可见"标记任一命中即视为注入。
+/// 两标记实测对真实用户输入零误伤（ZCode：1051 条合成全部命中，629 条
+/// user_prompt 全部不命中）。
+///
+/// 为何不用 kind 枚举白名单：kind 取值随工具版本改名（ZCode 已有
+/// background_notification / subagent_notification / system_reminder /
+/// todo_reminder / compact_summary 五种），枚举法必然随版本失效——这正是
+/// 本轮缺陷的成因（现有白名单只列了两种）。**语义标记优先于枚举。**
+pub fn entry_origin_from_flags(is_synthetic: bool, ui_hidden: bool) -> EntryOrigin {
+    if is_synthetic || ui_hidden {
+        EntryOrigin::Synthetic
+    } else {
+        EntryOrigin::Human
     }
 }
 
@@ -537,5 +594,108 @@ mod tests {
         // 窗口内无任何边界事件 → None（调用方回退现状，不仲裁）
         assert_eq!(turn_window_open(&[UserMessage, AssistantMessage]), None);
         assert_eq!(turn_window_open(&[]), None);
+    }
+
+    // ---- P1：绿态仲裁（2026-09-15 子代理完成信号修复，Task 1）----
+
+    /// 核心回归锁：回合收尾判绿 + 后台工作未结算 ⇒ 不判绿
+    #[test]
+    fn pending_descendants_block_green() {
+        assert_eq!(
+            overlay_completion_with_pending(SessionStatus::Idle, DescendantActivity::Pending),
+            SessionStatus::Waiting,
+            "后台工作未结算时不得报完成（Z-P1/C-P1/D-P1 根因）"
+        );
+        assert_eq!(
+            overlay_completion_with_pending(SessionStatus::Finished, DescendantActivity::Pending),
+            SessionStatus::Waiting,
+            "error 提示转绿同样受仲裁约束"
+        );
+    }
+
+    /// 无未结算工作 → 绿态透传（既有行为零变化）
+    #[test]
+    fn non_pending_keeps_green() {
+        for status in [SessionStatus::Idle, SessionStatus::Finished] {
+            for desc in [
+                DescendantActivity::Active,
+                DescendantActivity::Stale,
+                DescendantActivity::Absent,
+            ] {
+                assert_eq!(
+                    overlay_completion_with_pending(status.clone(), desc),
+                    status,
+                    "只有 Pending 拦截绿态；Active/Stale/Absent 不得改变既有语义"
+                );
+            }
+        }
+    }
+
+    /// 非绿态不受影响（黄/红语义不变）
+    #[test]
+    fn non_green_statuses_ignore_pending() {
+        for status in [
+            SessionStatus::Processing,
+            SessionStatus::Thinking,
+            SessionStatus::Waiting,
+            SessionStatus::Compacting,
+        ] {
+            assert_eq!(
+                overlay_completion_with_pending(status.clone(), DescendantActivity::Pending),
+                status
+            );
+        }
+    }
+
+    /// 组合序锁：先停更仲裁、后完成仲裁，两级互不吞没
+    #[test]
+    fn overlays_compose_in_order() {
+        // 停更的 Processing + 后代活跃 → 保持 Processing；再经完成仲裁仍是 Processing
+        let s1 = overlay_stale_with_descendants(
+            SessionStatus::Processing,
+            APP_STATUS_STALE_MS * 2,
+            DescendantActivity::Active,
+        );
+        assert_eq!(s1, SessionStatus::Processing);
+        assert_eq!(
+            overlay_completion_with_pending(s1, DescendantActivity::Pending),
+            SessionStatus::Processing
+        );
+        // 停更的 Processing + 无后代 → Waiting；完成仲裁不动 Waiting
+        let s2 = overlay_stale_with_descendants(
+            SessionStatus::Processing,
+            APP_STATUS_STALE_MS * 2,
+            DescendantActivity::Absent,
+        );
+        assert_eq!(s2, SessionStatus::Waiting);
+    }
+
+    /// Pending 在停更仲裁里与 Active 同映射（账未结清时静默 = 健康等待，
+    /// 不降级；绿态拦截归 overlay_completion_with_pending 单独负责）
+    #[test]
+    fn pending_maps_like_active_in_stale_overlay() {
+        assert_eq!(
+            overlay_stale_with_descendants(
+                SessionStatus::Processing,
+                APP_STATUS_STALE_MS * 2,
+                DescendantActivity::Pending
+            ),
+            SessionStatus::Processing,
+            "未结算后台工作在跑 → 主会话静默不降级（与 Active 同理）"
+        );
+    }
+
+    // ---- P2：注入识别口径（Task 1）----
+
+    #[test]
+    fn synthetic_flags_map_to_synthetic_origin() {
+        assert_eq!(entry_origin_from_flags(true, false), EntryOrigin::Synthetic);
+        assert_eq!(entry_origin_from_flags(false, true), EntryOrigin::Synthetic);
+        assert_eq!(entry_origin_from_flags(true, true), EntryOrigin::Synthetic);
+    }
+
+    #[test]
+    fn clean_flags_map_to_human_origin() {
+        assert_eq!(entry_origin_from_flags(false, false), EntryOrigin::Human);
     }
 }
