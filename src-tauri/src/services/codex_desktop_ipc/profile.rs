@@ -105,11 +105,32 @@ fn macos_profile(build: &str) -> ProtocolProfile {
     }
 }
 
+/// macOS `26.1013.40934`（2026-10-18 实机登记）：**只读方法 + start-turn v2 已受控
+/// harness 实证**（initialize/discovery/following/snapshot/load-complete-history 由
+/// 复审探针验证；start-turn 由实现侧探针实证——turn 成功创建 inProgress，23:58）。
+/// **permissions/command/blocking_input 在该 build 未实测，flag 保持 false**——
+/// 旧 build 的 PASS 不跨 build 迁移；审批/问答按证据逐项解锁。
+fn macos_40934_profile(build: &str) -> ProtocolProfile {
+    ProtocolProfile {
+        platform: "macos".to_string(),
+        build: build.to_string(),
+        capabilities: CapabilitySet {
+            send: true,
+            state: true,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+        },
+        method_versions: method_table(),
+    }
+}
+
 /// 精确 build 匹配（不是版本下限——升级后的 build 未经验证必须重新门控）。
 pub fn profile_for(platform: &str, build: &str) -> Option<ProtocolProfile> {
     match (platform, build) {
         ("windows", "26.1013.3656.0") => Some(windows_profile(build)),
         ("macos", "26.1013.31256") => Some(macos_profile(build)),
+        ("macos", "26.1013.40934") => Some(macos_40934_profile(build)),
         _ => None,
     }
 }
@@ -140,6 +161,13 @@ mod tests {
     #[test]
     fn unverified_or_unknown_builds_are_none() {
         assert!(profile_for("macos", "26.1013.31257").is_none());
+        assert!(profile_for("macos", "26.1013.40935").is_none());
+        // 40934 精确命中：send/state 开（harness 实证），审批/问答关（未实测）
+        let p = profile_for("macos", "26.1013.40934").expect("registered");
+        assert!(p.capabilities.send && p.capabilities.state);
+        assert!(!p.capabilities.permissions);
+        assert!(!p.capabilities.command);
+        assert!(!p.capabilities.blocking_input);
         assert!(profile_for("windows", "26.1013.3655.0").is_none());
         assert!(profile_for("linux", "26.1013.31256").is_none());
         assert!(profile_for("macos", "").is_none());
