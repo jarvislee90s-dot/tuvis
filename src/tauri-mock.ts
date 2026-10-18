@@ -656,6 +656,11 @@ if (!isTauri) {
           { id: "sub-2", name: "backend-dev", tool_id: "claude", skills: ["systematic-debugging"] },
         ]);
 
+      // #66：SubAgentPresetActions 入口复活后浏览器/Playwright 渲染会真实 invoke——
+      // 与 Rust SubagentDetection（serde camelCase）同构；空态走「支持但没有」分支
+      case "detect_subagents":
+        return Promise.resolve({ supported: true, agents: [] });
+
       // 写审计样例（M7 W5 桌面查看入口）：与 Rust AuditRow（serde camelCase）同构，
       // 最新在前；无 device_id 字段（与后端对外载荷一致，设备标识不外泄）
       case "inject_list_audit":

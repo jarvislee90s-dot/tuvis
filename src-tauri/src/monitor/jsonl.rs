@@ -1,4 +1,4 @@
-// JSONL 会话文件读取公共件 — 尾部读取、cwd 提取、子 agent 计数、文件枚举
+// JSONL 会话文件读取公共件 — 尾部读取、cwd 提取、文件枚举
 // 各工具 JSONL 解析器（claude/codex/kimi）共用；不包含任何工具协议判定逻辑
 
 use crate::session::model::JsonlMessage;
@@ -80,40 +80,6 @@ pub(crate) fn is_subagent_file(path: &Path) -> bool {
         .and_then(|n| n.to_str())
         .map(|name| name.starts_with("agent-") && name.ends_with(".jsonl"))
         .unwrap_or(false)
-}
-
-/// 统计项目目录内 30 秒内有写入、且首条消息 session_id 匹配父会话的子 agent 文件数
-pub(crate) fn count_active_subagents(project_dir: &Path, parent_session_id: &str) -> usize {
-    use std::time::{Duration, SystemTime};
-    let threshold = Duration::from_secs(30);
-    let now = SystemTime::now();
-    fs::read_dir(project_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| is_subagent_file(&e.path()))
-        .filter(|e| {
-            e.metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| now.duration_since(m).ok())
-                .map(|d| d < threshold)
-                .unwrap_or(false)
-        })
-        .filter(|e| {
-            let file = File::open(e.path()).ok();
-            file.and_then(|f| {
-                BufReader::new(f)
-                    .lines()
-                    .take(5)
-                    .flatten()
-                    .find_map(|line| serde_json::from_str::<JsonlMessage>(&line).ok())
-                    .and_then(|m| m.session_id)
-                    .map(|id| id == parent_session_id)
-            })
-            .unwrap_or(false)
-        })
-        .count()
 }
 
 /// 枚举目录内最近修改的会话 JSONL 文件（排除子 agent 文件，按 mtime 倒序）

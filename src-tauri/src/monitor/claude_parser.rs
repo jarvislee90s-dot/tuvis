@@ -4,9 +4,7 @@
 
 use super::cwd::normalize_cwd_for_match;
 use super::git::get_github_url;
-use super::jsonl::{
-    count_active_subagents, extract_cwd_from_jsonl, get_recent_jsonl_files, read_recent_lines,
-};
+use super::jsonl::{extract_cwd_from_jsonl, get_recent_jsonl_files, read_recent_lines};
 use super::path_codec::{convert_dir_name_to_path, convert_path_to_dir_name};
 use super::project::project_name_from_path;
 use super::session_scan::SessionFileScan;
@@ -90,8 +88,16 @@ pub fn get_claude_sessions(processes: &[AgentProcess]) -> Vec<Session> {
                     for (idx, proc) in procs.iter().enumerate() {
                         if let Some(f) = files.get(idx) {
                             if let Some(mut session) = parse_claude_jsonl(f, project_path, proc) {
-                                session.active_subagent_count =
-                                    count_active_subagents(&path, &session.id);
+                                // #134：徽标改用与子代理面板（chips）同源的
+                                // monitor::subagents 重算——旧 count_active_subagents
+                                // 只扫项目目录一层（旧平铺布局），新布局
+                                // <sid>/subagents/ 扫不到恒 0。计数口径 = Running
+                                // 过滤数（chips 前端同口径）；缓存键同
+                                // ("claude", session_id)，与 remote 端点共用增量缓存。
+                                session.active_subagent_count = crate::monitor::subagents::claude::collect_at(f, &session.id)
+                                    .iter()
+                                    .filter(|v| v.status == crate::monitor::subagents::SubagentStatus::Running)
+                                    .count();
                                 sessions.push(session);
                             }
                         }
@@ -414,5 +420,142 @@ mod title_tests {
             !d.last_is_subagent_report,
             "主会话自身动作不打标（乙.3.4 23:09:43 案例）"
         );
+    }
+
+    // ==== #134：看板父卡徽标（active_subagent_count 同源重算组合）====
+    // 取舍申报：赋值点在 get_claude_sessions 循环内（读真实 ~/.claude/projects，
+    // 无 home/path 注入缝，测试不可达）；此处按赋值点同组合直测
+    // 「parse_claude_jsonl 出 id → collect_at → Running 过滤计数」，
+    // 布局推导的等价性由 subagents/claude.rs collect_at_equivalent_to_locate_discovery 锁定。
+
+    /// 徽标组合夹具：新布局（项目目录/<sid>.jsonl 父转写 + <sid>/subagents/ 登记）。
+    /// running_agents：无停止事件的子代理 id；idle_agents：父转写追加停止通知的 id
+    fn badge_fixture(
+        dir: &std::path::Path,
+        sid: &str,
+        running_agents: &[&str],
+        idle_agents: &[&str],
+    ) -> std::path::PathBuf {
+        let proj = dir.join("proj--work--demo");
+        let subagents = proj.join(sid).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let parent = proj.join(format!("{sid}.jsonl"));
+        let mut parent_body = format!(
+            concat!(
+                r#"{{"sessionId":"{sid}","cwd":"/work/demo","timestamp":"2026-10-08T07:00:00Z","#,
+                r#""type":"user","message":{{"role":"user","content":"hi"}}}}"#,
+                "\n"
+            ),
+            sid = sid
+        );
+        for id in running_agents.iter().chain(idle_agents) {
+            std::fs::write(
+                subagents.join(format!("agent-{id}.meta.json")),
+                r#"{"agentType":"Plan"}"#,
+            )
+            .unwrap();
+            std::fs::write(subagents.join(format!("agent-{id}.jsonl")), "").unwrap();
+        }
+        for id in idle_agents {
+            // 停止通知（task-id 块）→ 该子代理转 Idle
+            parent_body.push_str(&format!(
+                concat!(
+                    r#"{{"type":"user","timestamp":"2026-10-08T07:40:00Z","message":{{"role":"user","#,
+                    r#""content":"<task-notification><task-id>{id}</task-id><summary>Agent stopped</summary></task-notification>"}}}}"#,
+                    "\n"
+                ),
+                id = id
+            ));
+        }
+        std::fs::write(&parent, parent_body).unwrap();
+        parent
+    }
+
+    /// 徽标计数 = Running 过滤数（chips 前端同口径）：1 Running + 1 Idle → 1
+    #[test]
+    fn active_subagent_count_counts_running_via_collect_at() {
+        crate::monitor::subagents::reset_cache_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = badge_fixture(dir.path(), "sess-badge-1", &["run1"], &["idle1"]);
+        let session =
+            parse_claude_jsonl(&parent, "/work/demo", &fake_process(1)).expect("应解析出会话");
+        // 赋值点同组合（get_claude_sessions 内三行的等价直测）
+        let count = crate::monitor::subagents::claude::collect_at(&parent, &session.id)
+            .iter()
+            .filter(|v| v.status == crate::monitor::subagents::SubagentStatus::Running)
+            .count();
+        assert_eq!(
+            count, 1,
+            "新布局下徽标恢复真实值：1 Running（旧实现扫不到恒 0）"
+        );
+        crate::monitor::subagents::reset_cache_for_tests();
+    }
+
+    /// 全 Idle → 0（徽标不显示的渲染条件来源）
+    #[test]
+    fn active_subagent_count_zero_when_all_idle() {
+        crate::monitor::subagents::reset_cache_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = badge_fixture(dir.path(), "sess-badge-2", &[], &["i1", "i2"]);
+        let session =
+            parse_claude_jsonl(&parent, "/work/demo", &fake_process(1)).expect("应解析出会话");
+        let count = crate::monitor::subagents::claude::collect_at(&parent, &session.id)
+            .iter()
+            .filter(|v| v.status == crate::monitor::subagents::SubagentStatus::Running)
+            .count();
+        assert_eq!(count, 0, "全 Idle → 0（无子代理徽标不显示）");
+        crate::monitor::subagents::reset_cache_for_tests();
+    }
+
+    /// 无 subagents 目录（旧平铺布局 / 无子代理会话）→ 0
+    #[test]
+    fn active_subagent_count_zero_without_subagents_dir() {
+        crate::monitor::subagents::reset_cache_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let parent = badge_fixture(dir.path(), "sess-badge-3", &[], &[]);
+        let session =
+            parse_claude_jsonl(&parent, "/work/demo", &fake_process(1)).expect("应解析出会话");
+        let count = crate::monitor::subagents::claude::collect_at(&parent, &session.id)
+            .iter()
+            .filter(|v| v.status == crate::monitor::subagents::SubagentStatus::Running)
+            .count();
+        assert_eq!(
+            count, 0,
+            "无子代理会话一次 is_dir 即止（预算契约 L3 不扩面）"
+        );
+        crate::monitor::subagents::reset_cache_for_tests();
+    }
+
+    /// 端到端（#134 验收主路径）：HOME 重定向走 get_claude_sessions 全链路——
+    /// 新布局会话 1 Running + 1 Idle 子代理 → 徽标 = 1。旧实现
+    /// count_active_subagents 只扫项目目录一层平铺 agent-*.jsonl，新布局扫不到
+    /// → 本用例对旧实现必红（RED 验证锚）。
+    #[test]
+    fn get_claude_sessions_badge_end_to_end_new_layout() {
+        crate::monitor::subagents::reset_cache_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        // 夹具造 <home>/proj--work--demo/<sid>…，整目录搬进 HOME/.claude/projects/
+        // 并按 cwd 编码重命名（convert_path_to_dir_name("/work/demo") = "-work-demo"）
+        badge_fixture(&home, "sess-e2e-badge", &["run1"], &["idle1"]);
+        let projects = home.join(".claude").join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::rename(home.join("proj--work--demo"), projects.join("-work-demo")).unwrap();
+        let guard = crate::monitor::test_env::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sessions =
+            crate::monitor::test_env::with_home(&home, || get_claude_sessions(&[fake_process(1)]));
+        drop(guard);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "进程 cwd=/work/demo 匹配 -work-demo 项目目录出卡"
+        );
+        assert_eq!(
+            sessions[0].active_subagent_count, 1,
+            "新布局端到端：徽标 = Running 数（旧 count_active_subagents 扫项目目录一层恒 0）"
+        );
+        crate::monitor::subagents::reset_cache_for_tests();
     }
 }
