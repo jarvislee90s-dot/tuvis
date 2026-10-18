@@ -50,6 +50,9 @@ use super::server::RemoteState;
 
 /// 队列视图的兼容在册阻塞码（计划 Task 8 端点表：fence 在场 → blockedReasonCode）。
 pub(crate) const BLOCKED_COMPAT_OUTSTANDING: &str = "compat_outstanding";
+/// 原生 Turn 屏障的在册码（2026-10-18 形态适配配套）：route=desktop_ipc 的
+/// Accepted 动作在等精确 Turn 终态证据——不是「兼容模式」，UI 分文案。
+pub(crate) const BLOCKED_NATIVE_TURN_PENDING: &str = "native_turn_pending";
 
 /// 本机 ThreadKey（服务端只构造 local——计划公共类型约定）。
 fn local_key(thread_id: &str) -> ThreadKey {
@@ -1552,10 +1555,27 @@ pub async fn queue_view(
             );
         }
     };
-    let blocked = matches!(store.has_compat_fence(&key), Ok(true));
+    // 阻塞原因按实际 route 派生（2026-10-18 形态适配配套）：原生 Accepted 的 Turn
+    // 屏障 ≠ 兼容路径 fence——两词都表示「队列暂停派发」，但语义/文案不同；原生等待
+    // 是自动对账（Turn 终态证据驱动），不存在「回 Desktop 手工解除」的操作。
+    let blocked_reason_code = match store.outstanding_fence_routes(&key) {
+        Ok(routes) => {
+            if routes.iter().any(|r| r == "desktop_ipc") {
+                Some(BLOCKED_NATIVE_TURN_PENDING.to_string())
+            } else if !routes.is_empty() {
+                Some(BLOCKED_COMPAT_OUTSTANDING.to_string())
+            } else {
+                None
+            }
+        }
+        Err(e) => {
+            log::error!("codex/queue fence route 读取失败: {e}");
+            None
+        }
+    };
     let view = CodexQueueView {
         actions,
-        blocked_reason_code: blocked.then(|| BLOCKED_COMPAT_OUTSTANDING.to_string()),
+        blocked_reason_code,
     };
     json_no_store(
         StatusCode::OK,

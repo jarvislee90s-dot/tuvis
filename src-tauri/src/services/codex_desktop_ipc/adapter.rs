@@ -22,11 +22,11 @@ use super::owners::{
 use super::pending::parse_request_key;
 use super::profile::ProtocolProfile;
 use super::types::{
-    CapabilitySet, ControlAvailability, Delivery, OwnerLease, PendingAction, PendingKind,
-    PendingView, ProtocolError, ThreadKey, ThreadProjection,
+    CapabilitySet, ContentState, ControlAvailability, Delivery, OwnerLease, PendingAction,
+    PendingKind, PendingView, ProtocolError, ThreadKey, ThreadProjection,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -143,9 +143,10 @@ struct AdapterInner {
     followings: Mutex<FollowingSet>,
     /// (thread_id, request_key) → 提交互斥（R4；独立短锁，不与 mirrors/owners 嵌套）。
     inflight: Mutex<HashMap<(String, String), InflightEntry>>,
-    /// 本 follow 已发起过 load-complete-history 的 thread（R1：bind 即清——每 follow
-    /// 至多一次；owner 换代/重跟随自动可再发起）。
-    history_requested: Mutex<HashSet<ThreadKey>>,
+    /// 只读 hydrate（load-complete-history）状态机（2026-10-18 形态适配，替代旧
+    /// 「曾请求」HashSet）：per-thread 记 owner 世代 / 已试次数 / 在飞——在飞去重、
+    /// 失败有界重试（不是「曾请求即永久锁死」）、换代即重置（旧世代回执不污染）。
+    history_hydrations: Mutex<HashMap<ThreadKey, Hydration>>,
     /// 事件转发任务单飞标志（每 adapter 生命周期至多一个 forward_events）。
     forward_alive: AtomicBool,
     /// 重连恢复循环单飞标志（R2.5）。
@@ -191,7 +192,7 @@ impl DesktopIpcAdapter {
                 )),
                 followings: Mutex::new(FollowingSet::default()),
                 inflight: Mutex::new(HashMap::new()),
-                history_requested: Mutex::new(HashSet::new()),
+                history_hydrations: Mutex::new(HashMap::new()),
                 forward_alive: AtomicBool::new(false),
                 recovering: AtomicBool::new(false),
                 recovery_queue: std::sync::Mutex::new(RecoveryQueue::default()),
@@ -390,7 +391,7 @@ impl DesktopIpcAdapter {
             bind_lease(&mut owners, key, owner_id, conn.epoch())
         };
         // 新 follow（owner 换代）：load-complete-history 每 follow 至多一次（R1）
-        self.inner.history_requested.lock().await.remove(key);
+        self.inner.history_hydrations.lock().await.remove(key);
         // B3 测试缝：bind 与 declare 之间的可注入等待（生产恒 None 直通）
         let gate = self.inner.follow_gate.lock().expect("gate lock").clone();
         if let Some(gate) = gate {
@@ -486,6 +487,7 @@ impl DesktopIpcAdapter {
             availability: ControlAvailability::CompatOnly,
             capabilities: caps,
             runtime_status: "unknown".into(),
+            content_state: ContentState::Loading,
             messages: Vec::new(),
             truncated: false,
             pending: Vec::new(),
@@ -1421,42 +1423,186 @@ async fn current_conn(adapter: &DesktopIpcAdapter) -> Option<ConnectionHandle> {
     conn.as_ref().filter(|c| !c.is_closed()).cloned()
 }
 
-/// R1.4：snapshot 后历史不完整 → v1 只读 load-complete-history（mutating=false，
-/// params 带 conversationId 与 hostId），每 follow 至多一次（bind 即清）。
+/// 只读 hydrate 状态（per thread）：owner 世代隔离 + 有界重试。
+#[derive(Clone, Copy)]
+struct Hydration {
+    /// 发起时的 owner generation（换代即重置，旧世代回执一律不收敛新世代）
+    generation: u64,
+    attempts: u32,
+    in_flight: bool,
+}
+
+/// 每 (thread, owner 世代) 的只读加载尝试上限（超过即本 follow 放弃自动加载，
+/// 等待重跟随/换代重置；只读加载绝不自动重试写操作）。
+const HYDRATE_MAX_ATTEMPTS: u32 = 3;
+/// 重试间隔（有界退避，非风暴）。
+const HYDRATE_RETRY_MS: u64 = 1_000;
+/// 成功后等镜像吃到对应 snapshot 的预算（revision 核对；超时按已收敛处理——
+/// snapshot 由事件流推进，这里只做「目标 revision 已达成」的核对）。
+const HYDRATE_SETTLE_MS: u64 = 5_000;
+
+/// R1.4 + 2026-10-18 形态适配：Turn 列表不完整（history.isComplete ≠ true）→ v1
+/// **只读** load-complete-history（mutating=false，params 带 conversationId 与
+/// hostId）。状态机语义：
+/// * **在飞去重**：同 thread 已有在飞加载 → 本次触发直接返回；
+/// * **换代隔离**：记录发起时的 owner generation——换代（follow 重绑即清）后旧
+///   状态作废，旧连接的迟到回执不收敛新世代；
+/// * **有界重试**：失败/超时不再「曾请求即永久锁死」——attempts < 上限时退避重试；
+/// * **结果核对**：RPC Accepted 且返回目标 revision → 等镜像 revision 追平才算
+///   收敛（无 revision 载荷按事件流推进处理，直接收敛）。
 async fn maybe_request_complete_history(adapter: &DesktopIpcAdapter, key: &ThreadKey) {
-    let first = {
-        let mut requested = adapter.inner.history_requested.lock().await;
-        if requested.contains(key) {
-            false
-        } else {
-            requested.insert(key.clone());
-            true
-        }
+    // 当前 lease 世代（无 lease = 不该有镜像触发，防御返回）
+    let generation = match adapter.inner.owners.lock().await.current(key) {
+        Some(lease) => lease.generation,
+        None => return,
     };
-    if !first {
-        return;
+    // 短锁：在飞去重 + 占位（占位在任务收尾统一清）
+    {
+        let mut hydrations = adapter.inner.history_hydrations.lock().await;
+        match hydrations.get_mut(key) {
+            Some(h) if h.generation == generation => {
+                if h.in_flight {
+                    return; // 在飞：去重
+                }
+                if h.attempts >= HYDRATE_MAX_ATTEMPTS {
+                    return; // 本 follow 放弃（重跟随/换代后重置）
+                }
+                h.in_flight = true;
+            }
+            Some(_) => {
+                // 换代残留：重置计数
+                *hydrations.get_mut(key).unwrap() = Hydration {
+                    generation,
+                    attempts: 0,
+                    in_flight: true,
+                };
+            }
+            None => {
+                hydrations.insert(
+                    key.clone(),
+                    Hydration {
+                        generation,
+                        attempts: 0,
+                        in_flight: true,
+                    },
+                );
+            }
+        }
     }
     let Some(conn) = current_conn(adapter).await else {
-        adapter.inner.history_requested.lock().await.remove(key);
+        // 连接缺位：清在飞（下一次事件可再触发）
+        if let Some(h) = adapter.inner.history_hydrations.lock().await.get_mut(key) {
+            h.in_flight = false;
+        }
         return;
     };
     let Ok(version) = conn.version_of("thread-follower-load-complete-history") else {
+        if let Some(h) = adapter.inner.history_hydrations.lock().await.get_mut(key) {
+            h.in_flight = false;
+        }
         return;
     };
     let c = conn.clone();
     let k = key.clone();
+    let adapter = adapter.clone();
     tokio::spawn(async move {
-        // 只读：mutating=false、不携带 target/validity（结果只影响后续 snapshot）
-        let _ = c
-            .request(RpcRequest {
-                method: "thread-follower-load-complete-history".into(),
-                params: json!({ "conversationId": k.thread_id, "hostId": k.host_id }),
-                version: Some(version),
-                target: None,
-                mutating: false,
-                validity: None,
-            })
-            .await;
+        let mut attempt = {
+            let mut hydrations = adapter.inner.history_hydrations.lock().await;
+            let h = hydrations.get_mut(&k).expect("占位已建");
+            h.attempts += 1;
+            h.attempts
+        };
+        loop {
+            // 换代守卫：owner 已换代 → 本次加载作废（状态已随 follow 重绑清除）
+            let current_generation = adapter
+                .inner
+                .owners
+                .lock()
+                .await
+                .current(&k)
+                .map(|l| l.generation);
+            if current_generation != Some(generation) {
+                break;
+            }
+            // 只读：mutating=false、不携带 target/validity（结果只影响后续 snapshot；
+            // 调用形态与复审探针实测成功形态一致——broadcast 定位 owner）
+            let outcome = c
+                .request(RpcRequest {
+                    method: "thread-follower-load-complete-history".into(),
+                    params: json!({ "conversationId": k.thread_id, "hostId": k.host_id }),
+                    version: Some(version),
+                    target: None,
+                    mutating: false,
+                    validity: None,
+                })
+                .await;
+            let accepted = matches!(outcome.delivery, super::types::Delivery::Accepted);
+            let target_rev = outcome
+                .result
+                .as_ref()
+                .and_then(|r| r.get("revision"))
+                .and_then(Value::as_u64);
+            if accepted {
+                // 结果核对：有目标 revision → 等镜像追平（有界）；无 → snapshot 由
+                // 事件流推进，直接收敛
+                let settled = match target_rev {
+                    Some(target) => {
+                        let deadline = tokio::time::Instant::now()
+                            + std::time::Duration::from_millis(HYDRATE_SETTLE_MS);
+                        loop {
+                            let current = {
+                                let mirrors = adapter.inner.mirrors.lock().await;
+                                mirrors.get(&k).and_then(|m| m.revision())
+                            };
+                            if current.is_some_and(|rev| rev >= target) {
+                                break true;
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                break false; // 目标 revision 未达成 = 未收敛（走有界重试）
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                    }
+                    None => true,
+                };
+                if settled {
+                    break;
+                }
+                // revision 未追平：按失败走有界重试
+            }
+            if attempt >= HYDRATE_MAX_ATTEMPTS {
+                break; // 有界：本 follow 放弃（重跟随/换代后可再发起）
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(HYDRATE_RETRY_MS)).await;
+            // 退避后再验世代（睡眠期间可能已换代/断开）
+            let still_same = adapter
+                .inner
+                .owners
+                .lock()
+                .await
+                .current(&k)
+                .map(|l| l.generation)
+                == Some(generation);
+            if !still_same {
+                break;
+            }
+            let mut hydrations = adapter.inner.history_hydrations.lock().await;
+            match hydrations.get_mut(&k) {
+                Some(h) if h.generation == generation => {
+                    h.attempts += 1;
+                    attempt = h.attempts;
+                }
+                _ => break, // 已被重跟随清态：让新世代自己发起
+            }
+        }
+        // 收口：本世代在飞标志清位（成功收敛 / 放弃都一样——放弃态由 attempts 上限
+        // 挡住后续触发）
+        let mut hydrations = adapter.inner.history_hydrations.lock().await;
+        if let Some(h) = hydrations.get_mut(&k) {
+            if h.generation == generation {
+                h.in_flight = false;
+            }
+        }
     });
 }
 

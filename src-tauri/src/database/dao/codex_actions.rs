@@ -584,6 +584,24 @@ pub(crate) fn has_compat_fence_conn(conn: &Connection, thread_id: &str) -> rusql
     Ok(n > 0)
 }
 
+/// 在册 fence 的**去重 route 集**（2026-10-18 形态适配配套）：原生 Accepted 动作的
+/// Turn 屏障与兼容路径 fence 共用 compat_outstanding 槽位，但阻塞原因不同——
+/// UI 不得把原生回合等待说成「兼容模式未完成」。空集 = 无在册 fence。
+pub(crate) fn outstanding_fence_routes_conn(
+    conn: &Connection,
+    thread_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT route FROM codex_actions WHERE thread_id = ?1 AND compat_outstanding = 1",
+    )?;
+    let rows = stmt.query_map([thread_id], |r| r.get::<_, String>(0))?;
+    let mut routes = Vec::new();
+    for r in rows {
+        routes.push(r?);
+    }
+    Ok(routes)
+}
+
 /// **原子** compat 派发屏障（R9.1，2026-10-17 审计）：fence 与只读核对证据在**同一条
 /// UPDATE** 内持久化（单语句原子性）——持久化成功是 compat bridge 调用真实 helper 的
 /// 前提；写失败时 helper 不被调用，动作如实落账。

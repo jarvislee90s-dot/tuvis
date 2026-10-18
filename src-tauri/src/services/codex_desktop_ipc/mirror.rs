@@ -14,10 +14,11 @@
 //!   新 epoch（换代后）不与旧 revision 比大小（状态已清）；
 //! * 预算：单 Thread 镜像 16 MiB；投影正文尾窗 1 MiB / 500 条并标 truncated。
 
+use super::history_view::HistoryView;
 use super::pending::PendingProjector;
 use super::types::{
-    CapabilitySet, ControlAvailability, OwnerLease, ProjectedMessage, ProtocolError, ThreadKey,
-    ThreadProjection,
+    CapabilitySet, ContentState, ControlAvailability, OwnerLease, ProjectedMessage, ProtocolError,
+    ThreadKey, ThreadProjection,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -189,21 +190,14 @@ impl ThreadMirror {
     }
 
     /// 指定 Turn 实体的状态（2026-10-17 复审 C1：Turn 顺序屏障的目标终态证据来源）。
-    /// 只认 `type=turn` 的实体；实体不在场 / 无镜像 → None（调用方按「无证据」保守）。
+    /// 2026-10-18 真机形态适配：证据经统一读层（[`HistoryView`]）——按 canonical
+    /// 引用链（islands entries.value → 实体）并以实体 `turnId` 字段认领目标；
+    /// 实体 map key（`turn:`/`tail:` 合成键）不是 id，无 `type` 字段是正常形态，
+    /// 未被引用的孤立实体不作数。不在场 / 无镜像 → None（调用方按「无证据」保守）。
     pub fn turn_status(&self, turn_id: &str) -> Option<String> {
-        let entity = self
-            .state
-            .as_ref()?
-            .get("turnHistory")?
-            .get("history")?
-            .get("entitiesByKey")?
-            .get(turn_id)?;
-        if entity.get("type").and_then(|t| t.as_str()) != Some("turn") {
-            return None;
-        }
-        entity
-            .get("status")
-            .and_then(|s| s.as_str())
+        let state = self.state.as_ref()?;
+        HistoryView::new(state)
+            .turn_status(turn_id)
             .map(str::to_string)
     }
 
@@ -295,7 +289,7 @@ impl ThreadMirror {
             .get("conversationState")
             .cloned()
             .unwrap_or(Value::Null);
-        self.adopt(rev, state, is_complete(change))?;
+        self.adopt(rev, state)?;
         Ok(MirrorEffect {
             changed: true,
             need_snapshot: false,
@@ -353,7 +347,9 @@ impl ThreadMirror {
                 });
             }
         }
-        self.adopt(rev, next, self.history_complete)?;
+        // 2026-10-18 形态适配：完整性从**新 state** 派生（snapshot/patch 同一判定
+        // 单点），不再沿用上一状态的缓存 bool
+        self.adopt(rev, next)?;
         Ok(MirrorEffect {
             changed: true,
             need_snapshot: false,
@@ -361,13 +357,10 @@ impl ThreadMirror {
     }
 
     /// 提交新状态（预算校验：单 Thread 16MiB + 全体 64MiB；超限 stale + 拒绝，
-    /// 不冒充无 owner）。
-    fn adopt(
-        &mut self,
-        rev: u64,
-        state: Value,
-        history_complete: bool,
-    ) -> Result<(), ProtocolError> {
+    /// 不冒充无 owner）。完整性在此**单点派生**：`turnHistory.history.isComplete ===
+    /// true` 才算 Turn 列表完整（真机形态在 history 层；缺字段 ≠ 完整——hydrate
+    /// 触发判据不能缺省当完整）。
+    fn adopt(&mut self, rev: u64, state: Value) -> Result<(), ProtocolError> {
         let size = serde_json::to_vec(&state)
             .map(|b| b.len())
             .unwrap_or(usize::MAX);
@@ -390,8 +383,8 @@ impl ThreadMirror {
         }
         self.size = size;
         self.revision = Some(rev);
+        self.history_complete = HistoryView::new(&state).turn_list_complete();
         self.state = Some(state);
-        self.history_complete = history_complete;
         self.stale = false;
         Ok(())
     }
@@ -402,6 +395,7 @@ impl ThreadMirror {
         // R1：state 即 conversationState 本体，按根直读
         let state = self.state.clone().unwrap_or(Value::Null);
         let messages = project_messages(&state);
+        let content_state = content_state_of(self.state.as_ref());
         let requests = state
             .get("requests")
             .and_then(|r| r.as_array())
@@ -415,10 +409,35 @@ impl ThreadMirror {
             availability: availability_of(&caps),
             capabilities: caps,
             runtime_status: runtime_status(&state),
+            content_state,
             truncated: messages.1,
             messages: messages.0,
             pending,
         }
+    }
+}
+
+/// 内容健康状态（与写能力正交——能发送不代表历史已载入；读取出错不得呈现为
+/// 「真实空会话」）：
+/// * 无状态（尚未收到首帧 snapshot）→ Loading；
+/// * `turnHistory.history` 形态不可读 → Unsupported（不伪造 0 条空历史）；
+/// * Turn 列表不完整（history.isComplete ≠ true）→ Loading（hydrate 判据同源）；
+/// * Turn 列表完整但任一 turn 的 items 分页未载完 → Partial；
+/// * 其余 → Ready（此时真实 0 条才允许显示「暂无消息」）。stale 只影响写侧，
+///   不改内容健康语义（保留最后视图照常展示）。
+fn content_state_of(state: Option<&Value>) -> ContentState {
+    let Some(state) = state else {
+        return ContentState::Loading;
+    };
+    let view = HistoryView::new(state);
+    if !view.readable() {
+        ContentState::Unsupported
+    } else if !view.turn_list_complete() {
+        ContentState::Loading
+    } else if view.items_incomplete() {
+        ContentState::Partial
+    } else {
+        ContentState::Ready
     }
 }
 
@@ -447,18 +466,20 @@ fn runtime_status(state: &Value) -> String {
         None => {}
     }
     // idle/缺省时看 turn 历史：有 inProgress → active；有 failed → failed
-    if let Some(entities) = state
-        .get("turnHistory")
-        .and_then(|h| h.get("history"))
-        .and_then(|h| h.get("entitiesByKey"))
-        .and_then(|e| e.as_object())
+    // 2026-10-18 形态适配：经统一读层（canonical 引用链 + turnId 字段认领），
+    // 不再要求实体 type=="turn"（真机 turn 实体无该字段）
     {
-        for entity in entities.values() {
-            if entity.get("type").and_then(|t| t.as_str()) == Some("turn")
-                && entity.get("status").and_then(|s| s.as_str()) == Some("inProgress")
-            {
-                return "active".into();
+        let view = HistoryView::new(state);
+        let mut saw_failed = false;
+        for turn in view.turns() {
+            match turn.status {
+                Some("inProgress") => return "active".into(),
+                Some("failed") => saw_failed = true,
+                _ => {}
             }
+        }
+        if saw_failed {
+            return "failed".into();
         }
     }
     if declared == Some("idle") {
@@ -468,63 +489,59 @@ fn runtime_status(state: &Value) -> String {
     }
 }
 
-fn is_complete(change: &Value) -> bool {
-    change
-        .get("conversationState")
-        .and_then(|s| s.get("turnHistory"))
-        .and_then(|h| h.get("isComplete"))
-        .and_then(|b| b.as_bool())
-        .unwrap_or(true)
-}
-
 /// 按正史顺序投影消息，尾窗 1 MiB / 500 条，超出标 truncated。
 /// 返回 (消息, 是否截断)。
+/// 2026-10-18 真机形态适配：经统一读层走 canonical 引用链（entries.value → 实体，
+/// turnId 字段认领），正文取 `turn.items[]` **内联对象**（camelCase）——
+/// `userMessage.content[]` 的 text 块、`agentMessage.text`；`error.message` 走系统
+/// 安全摘要；`reasoning` 按产品语义过滤；未知 kind 保留 `[unsupported item]` 摘要，
+/// 绝不静默滤成 0 条。
 fn project_messages(state: &Value) -> (Vec<ProjectedMessage>, bool) {
-    let entities = state
-        .get("turnHistory")
-        .and_then(|h| h.get("history"))
-        .and_then(|h| h.get("entitiesByKey"));
-    let Some(entities) = entities else {
-        return (Vec::new(), false);
-    };
-    let islands = state
-        .get("turnHistory")
-        .and_then(|h| h.get("history"))
-        .and_then(|h| h.get("islands"))
-        .and_then(|i| i.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    // 按 islands[].entries 顺序取 turn id（不遍历无序 map 当时间序）
+    let view = HistoryView::new(state);
     let mut all: Vec<ProjectedMessage> = Vec::new();
-    for island in &islands {
-        let Some(entries) = island.get("entries").and_then(|e| e.as_array()) else {
-            continue;
-        };
-        for turn_id in entries {
-            let Some(turn_id) = turn_id.as_str() else {
-                continue;
+    for turn in view.turns() {
+        for (idx, item) in turn.items.iter().enumerate() {
+            let Some(obj) = item.as_object() else {
+                continue; // 非对象 item：无可读形态，保守跳过（不猜）
             };
-            let Some(turn) = entities.get(turn_id) else {
-                continue; // 严格：缺实体跳过，不猜
-            };
-            if turn.get("type").and_then(|t| t.as_str()) != Some("turn") {
-                continue;
-            }
-            let Some(item_ids) = turn.get("items").and_then(|i| i.as_array()) else {
-                continue;
-            };
-            for item_id in item_ids {
-                let Some(item_id) = item_id.as_str() else {
-                    continue;
-                };
-                let Some(item) = entities.get(item_id) else {
-                    continue;
-                };
-                if let Some(msg) = project_item(item_id, item) {
-                    all.push(msg);
+            let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
+            // 稳定标识 = item.id；缺 id 的兜底拼接不作长期标识（仅保序去重可用）
+            let id = obj
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}/{}", turn.turn_id, idx));
+            let (role, text) = match kind {
+                "userMessage" => {
+                    let Some(text) = user_message_text(item) else {
+                        continue; // 无可渲染正文（content 缺/空）不造空泡
+                    };
+                    ("user", text)
                 }
-            }
+                "agentMessage" => {
+                    let text = obj
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if text.is_empty() {
+                        continue; // 流式空文本占位不造空泡（文本经 replace 原位出现）
+                    }
+                    ("assistant", text)
+                }
+                // 推理过程不上墙（复审裁决：允许按产品语义过滤 reasoning）
+                "reasoning" => continue,
+                "error" => ("system", error_item_summary(item)),
+                "" => continue, // 无 type 的 item：形态不明，保守跳过
+                other => ("system", format!("[unsupported item: {other}]")),
+            };
+            all.push(ProjectedMessage {
+                id,
+                role: role.to_string(),
+                kind: kind.to_string(),
+                text,
+                ts: obj.get("ts").and_then(Value::as_i64),
+            });
         }
     }
 
@@ -550,24 +567,39 @@ fn project_messages(state: &Value) -> (Vec<ProjectedMessage>, bool) {
     (all, truncated)
 }
 
-/// 单条 item → 投影消息。已知文本类（user_message/agent_message）直出；
-/// 未知 kind 只给安全文字摘要，不下发原始参数。
-fn project_item(id: &str, item: &Value) -> Option<ProjectedMessage> {
-    let kind = item.get("type").and_then(|t| t.as_str())?;
-    let raw = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
-    let (role, text) = match kind {
-        "user_message" => ("user", raw.to_string()),
-        "agent_message" => ("assistant", raw.to_string()),
-        // 未知 kind 只投影安全文字摘要，不下发原始工具参数
-        other => ("system", format!("[unsupported item: {other}]")),
-    };
-    Some(ProjectedMessage {
-        id: id.to_string(),
-        role: role.to_string(),
-        kind: kind.to_string(),
-        text,
-        ts: item.get("ts").and_then(|t| t.as_i64()),
-    })
+/// userMessage 正文：`content[]` 中 `type=="text"` 块的 `text` 拼接（真机形态；
+/// 块级包装字段如 text_elements 不下发）。无可渲染正文 → None。
+fn user_message_text(item: &Value) -> Option<String> {
+    let blocks = item.get("content")?.as_array()?;
+    let text = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+/// error item 的系统摘要：`message` 为桌面侧给用户看的错误文案（截断到 240 字符，
+/// 不透传 errorInfo/additionalDetails 等内部结构）；缺 message → 固定占位。
+fn error_item_summary(item: &Value) -> String {
+    const CAP: usize = 240;
+    let raw = item
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    match raw {
+        Some(m) if m.len() <= CAP => format!("[error] {m}"),
+        Some(m) => {
+            let mut cut = CAP;
+            while !m.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("[error] {}…", &m[..cut])
+        }
+        None => "[error]".to_string(),
+    }
 }
 
 /// 单个 patch op（严格形态）：add=数组插入/对象新增，replace=只替换现有，
@@ -766,11 +798,11 @@ mod tests {
         assert!(eff.changed);
         assert!(!eff.need_snapshot);
         let p = m.project(caps());
-        // turns=[] 是常态：正文来自 turnHistory 正史（用户+助手两条，稳定 item ID）
+        // turns=[] 是常态：正文来自 turnHistory 正史（内联 items，稳定 item ID）
         assert_eq!(p.messages.len(), 2);
-        assert_eq!(p.messages[0].id, "itm-u1");
+        assert_eq!(p.messages[0].id, "00000000-0000-4000-8000-0000000000it1");
         assert_eq!(p.messages[0].role, "user");
-        assert_eq!(p.messages[1].id, "itm-a1");
+        assert_eq!(p.messages[1].id, "00000000-0000-4000-8000-0000000000it2");
         assert_eq!(p.messages[1].role, "assistant");
         // 完整 pending：permissions 请求（macOS profile permissions=true → actionable）
         assert_eq!(p.pending.len(), 1);
@@ -809,15 +841,16 @@ mod tests {
     fn patch_batch_is_atomic() {
         let mut m = ThreadMirror::new(key());
         m.apply(&lease(), &macos_change()).unwrap();
-        // 一批：第一条合法（replace 文本）+ 第二条非法（replace 不存在的键）
-        // （R1：path 直接对 conversationState 本体寻址，无前缀）
+        // 一批：第一条合法（replace 内联 agentMessage 文本）+ 第二条非法（replace
+        // 不存在的键）（R1：path 直接对 conversationState 本体寻址，无前缀）
         let batch = serde_json::json!({
             "type": "patches",
             "baseRevision": 209,
             "revision": 210,
             "patches": [
                 { "op": "replace",
-                  "path": ["turnHistory", "history", "entitiesByKey", "itm-a1", "text"],
+                  "path": ["turnHistory", "history", "entitiesByKey",
+                           "turn:00000000-0000-4000-8000-0000000000tu1", "items", 1, "text"],
                   "value": "更新" },
                 { "op": "replace",
                   "path": ["noSuchKey"],
@@ -898,7 +931,10 @@ mod tests {
         let p = m.project(caps());
         assert_eq!(p.messages.len(), 2, "流式 replace 不追加重复气泡");
         assert_eq!(p.messages[1].text, "TUVis macOS IPC probe OK（流式追加）");
-        assert_eq!(p.messages[1].id, "itm-a1", "item ID 稳定");
+        assert_eq!(
+            p.messages[1].id, "00000000-0000-4000-8000-0000000000it2",
+            "item ID 稳定"
+        );
         // batch[1]：新增 turn；batch[3]：remove pending（跳过 batch[2] 缺口样本）
         let batches = fixture("patches.json")["batches"].clone();
         let batches = batches.as_array().unwrap().clone();
@@ -908,26 +944,24 @@ mod tests {
         }
         let p = m.project(caps());
         assert!(p.pending.is_empty(), "remove 后 pending 消失");
+        assert_eq!(p.messages.len(), 4, "新 turn 的内联 items 入墙（无重复）");
         assert_eq!(p.revision, Some(212));
     }
 
     #[test]
     fn projection_tail_window_marks_truncated() {
-        // 构造 600 条消息的快照：截到 500 条并标 truncated
+        // 构造 600 条消息的快照：截到 500 条并标 truncated（真实内联 items 形态）
         let mut entities = serde_json::Map::new();
         let mut entries = Vec::new();
         for i in 0..600 {
             let turn_id = format!("t{i}");
             let item_id = format!("i{i}");
-            entries.push(serde_json::json!(turn_id));
+            entries.push(serde_json::json!({ "key": turn_id, "value": turn_id }));
             entities.insert(
                 turn_id.clone(),
-                serde_json::json!({ "id": turn_id, "type": "turn", "status": "completed",
-                                    "items": [item_id] }),
-            );
-            entities.insert(
-                item_id.clone(),
-                serde_json::json!({ "id": item_id, "type": "user_message", "text": "m", "ts": i }),
+                serde_json::json!({ "turnId": turn_id, "status": "completed",
+                                    "items": [ { "type": "userMessage", "id": item_id,
+                                        "content": [ { "type": "text", "text": "m" } ] } ] }),
             );
         }
         let change = serde_json::json!({
@@ -935,8 +969,8 @@ mod tests {
             "conversationState": {
                 "turns": [],
                 "requests": [],
-                "turnHistory": { "isComplete": true,
-                    "history": { "entitiesByKey": Value::Object(entities),
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true, "entitiesByKey": Value::Object(entities),
                                  "islands": [{ "entries": entries }] } }
             }
         });
@@ -1005,20 +1039,26 @@ mod tests {
         // 实体不在场、镜像 stale 一律不是证据；跨 turn「完成不互为证据」的负例在
         // router 层钉死（release 只查绑定 id，见 codex_control_remote 的
         // turn_restriction_needs_matching_completion_evidence）。
+        // 2026-10-18 形态适配：实体按真实形态（无 type、turnId 字段、entries.value
+        // 引用、键与 id 解耦）。
         let mut m = ThreadMirror::new(key());
         let change = serde_json::json!({
             "type": "snapshot", "revision": 1,
             "conversationState": {
                 "turns": [], "requests": [],
                 "threadRuntimeStatus": { "type": "idle" },
-                "turnHistory": { "isComplete": true, "history": {
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true,
                     "entitiesByKey": {
-                        "turn-mine": { "id": "turn-mine", "type": "turn",
+                        "turn:mine": { "turnId": "turn-mine",
                                        "status": "inProgress", "items": [] },
-                        "turn-other": { "id": "turn-other", "type": "turn",
+                        "turn:other": { "turnId": "turn-other",
                                         "status": "completed", "items": [] }
                     },
-                    "islands": [{ "entries": ["turn-mine", "turn-other"] }]
+                    "islands": [{ "entries": [
+                        { "key": "turn:mine", "value": "turn:mine" },
+                        { "key": "turn:other", "value": "turn:other" }
+                    ] }]
                 } }
             }
         });
@@ -1037,7 +1077,7 @@ mod tests {
             "type": "patches", "baseRevision": 1, "revision": 2,
             "patches": [
                 { "op": "replace",
-                  "path": ["turnHistory", "history", "entitiesByKey", "turn-mine", "status"],
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:mine", "status"],
                   "value": "completed" }
             ]
         });
@@ -1060,15 +1100,14 @@ mod tests {
             "conversationState": {
                 "turns": [],
                 "requests": [],
-                "turnHistory": { "isComplete": true,
-                    "history": {
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true,
                         "entitiesByKey": {
-                            "t1": { "id": "t1", "type": "turn", "status": "completed",
-                                    "items": ["raw1"] },
-                            "raw1": { "id": "raw1", "type": "mcp_tool_call",
-                                      "arguments": { "cmd": "secret-cmd", "token": "TKN" } }
+                            "turn:t1": { "turnId": "t1", "status": "completed",
+                                    "items": [ { "type": "mcp_tool_call", "id": "raw1",
+                                        "arguments": { "cmd": "secret-cmd", "token": "TKN" } } ] }
                         },
-                        "islands": [{ "entries": ["t1"] }]
+                        "islands": [{ "entries": [ { "key": "turn:t1", "value": "turn:t1" } ] }]
                     } }
             }
         });
@@ -1081,5 +1120,265 @@ mod tests {
         let rendered = serde_json::to_string(&p.messages[0]).unwrap();
         assert!(!rendered.contains("secret-cmd"), "原始参数不下发");
         assert!(!rendered.contains("TKN"), "参数值不下发");
+    }
+
+    // ===== contentState（内容健康状态，与写能力正交）=====
+
+    #[test]
+    fn content_state_ready_only_when_turns_and_items_complete() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(
+            &lease(),
+            &observed_change("canonical-before-load.sanitized.json"),
+        )
+        .unwrap();
+        assert_eq!(m.project(caps()).content_state, ContentState::Ready);
+        // history.isComplete=false → Loading（hydrate 判据同源）
+        let mut incomplete = observed_change("canonical-before-load.sanitized.json");
+        incomplete["conversationState"]["turnHistory"]["history"]["isComplete"] =
+            serde_json::json!(false);
+        let mut m2 = ThreadMirror::new(key());
+        m2.apply(&lease(), &incomplete).unwrap();
+        assert_eq!(m2.project(caps()).content_state, ContentState::Loading);
+        // Turn 列表完整但 items 分页未载完 → Partial
+        let mut partial = observed_change("canonical-before-load.sanitized.json");
+        partial["conversationState"]["turnHistory"]["history"]["entitiesByKey"]
+            ["turn:00000000-0000-4000-8000-000000000002"]["itemsPagination"] =
+            serde_json::json!({ "hasLoadedOldest": false, "isLoadingOlder": false });
+        let mut m3 = ThreadMirror::new(key());
+        m3.apply(&lease(), &partial).unwrap();
+        assert_eq!(m3.project(caps()).content_state, ContentState::Partial);
+        // 无 turnHistory.history（形态不可读）→ Unsupported（不冒充空历史）
+        let mut broken = observed_change("canonical-before-load.sanitized.json");
+        broken["conversationState"]
+            .as_object_mut()
+            .unwrap()
+            .remove("turnHistory");
+        let mut m4 = ThreadMirror::new(key());
+        m4.apply(&lease(), &broken).unwrap();
+        assert_eq!(m4.project(caps()).content_state, ContentState::Unsupported);
+        // 尚无任何 snapshot → Loading
+        let empty = ThreadMirror::new(key());
+        assert_eq!(empty.project(caps()).content_state, ContentState::Loading);
+    }
+
+    // ===== 2026-10-18 真机金样（observed/）：canonical 实体形态适配 =====
+    // 证据来源与形态事实见 observed/README.md。以下红→绿基线针对本轮修复：
+    // 实体按合成键索引（turn:/tail: 前缀）、turn 实体无 type 以 turnId 字段标识、
+    // islands.entries 为 {key,value} 对象、items 为内联 camelCase 对象、
+    // isComplete 在 history 层。派生负例（改字段构造）在测试名以 derived 标注。
+
+    fn observed_change(name: &str) -> Value {
+        fixture(&format!("observed/{name}"))
+    }
+
+    #[test]
+    fn observed_golden_target_turn_terminal_evidence() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(
+            &lease(),
+            &observed_change("canonical-before-load.sanitized.json"),
+        )
+        .unwrap();
+        // 目标 turn 实体键是 turn:<uuid>：证据按实体 turnId 字段认领（键不是 id）
+        assert_eq!(
+            m.turn_status("00000000-0000-4000-8000-000000000006")
+                .as_deref(),
+            Some("completed"),
+            "真实形态下必须能按 turnId 字段读到终态（旧读者查键恒 None）"
+        );
+        assert!(
+            m.turn_is_terminal("00000000-0000-4000-8000-000000000006"),
+            "屏障放行的完成证据在真机形态下必须成立"
+        );
+        // tail 合成键实体：键尾 UUID(…0021) ≠ turnId(…0011)——只能按字段认领
+        assert_eq!(
+            m.turn_status("00000000-0000-4000-8000-000000000011")
+                .as_deref(),
+            Some("completed"),
+            "从键尾猜业务 ID 必然失配，按字段必中"
+        );
+        assert!(!m.turn_is_terminal("00000000-0000-4000-8000-000000000099"));
+    }
+
+    #[test]
+    fn observed_golden_projection_inline_camelcase_items() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(
+            &lease(),
+            &observed_change("canonical-before-load.sanitized.json"),
+        )
+        .unwrap();
+        let p = m.project(caps());
+        let conversation: Vec<(String, String, String)> = p
+            .messages
+            .iter()
+            .filter(|msg| msg.role != "system")
+            .map(|msg| (msg.id.clone(), msg.role.clone(), msg.text.clone()))
+            .collect();
+        assert_eq!(
+            conversation.len(),
+            6,
+            "6 条用户/助手正文（reasoning 过滤；error 走系统摘要不计正文）"
+        );
+        let ids: Vec<&str> = p.messages.iter().map(|msg| msg.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "00000000-0000-4000-8000-000000000003",
+                "00000000-0000-4000-8000-000000000004",
+                "00000000-0000-4000-8000-000000000007",
+                "00000000-0000-4000-8000-000000000009",
+                "00000000-0000-4000-8000-000000000012",
+                "00000000-0000-4000-8000-000000000013",
+                "00000000-0000-4000-8000-000000000014",
+                "00000000-0000-4000-8000-000000000015",
+                "00000000-0000-4000-8000-000000000016",
+                "00000000-0000-4000-8000-000000000017",
+            ],
+            "item.id 为稳定标识，canonical 顺序（error 保留为系统摘要，不静默滤成 0 条）"
+        );
+        assert_eq!(conversation[0].1, "user");
+        assert_eq!(conversation[0].2, "Synthetic user 1");
+        assert_eq!(conversation[1].1, "assistant");
+        assert_eq!(conversation[1].2, "Synthetic reply 1");
+        assert_eq!(conversation[5].2, "Synthetic reply 3");
+        assert!(p.messages[5].kind == "error" && p.messages[5].role == "system");
+        let rendered = serde_json::to_string(&p).unwrap();
+        assert!(!rendered.contains("text_elements"), "块级包装字段不下发");
+    }
+
+    #[test]
+    fn observed_golden_reload_snapshot_keeps_ids_stable() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(
+            &lease(),
+            &observed_change("canonical-before-load.sanitized.json"),
+        )
+        .unwrap();
+        let first = m.project(caps());
+        // load-complete-history 后的重放 snapshot（rev 4）：同内容不得追加重复气泡
+        m.apply(
+            &lease(),
+            &observed_change("canonical-after-load.sanitized.json"),
+        )
+        .unwrap();
+        let second = m.project(caps());
+        assert_eq!(second.messages.len(), first.messages.len(), "reload 不追加");
+        assert_eq!(second.messages, first.messages, "id 与顺序稳定");
+    }
+
+    #[test]
+    fn observed_derived_busy_fallback_sees_real_inprogress_turn() {
+        // 派生负例：真实结构 + turn 0011 置 inProgress（SYNTHETIC derived）
+        let mut change = observed_change("canonical-before-load.sanitized.json");
+        change["conversationState"]["turnHistory"]["history"]["entitiesByKey"]
+            ["tail:0:local:00000000-0000-4000-8000-000000000021"]["status"] =
+            serde_json::json!("inProgress");
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &change).unwrap();
+        let p = m.project(caps());
+        assert_eq!(
+            p.runtime_status, "active",
+            "真实 inProgress turn 必须计入忙态（旧读者要求 type=turn 恒漏）"
+        );
+    }
+
+    #[test]
+    fn observed_derived_patch_recomputes_completeness() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(
+            &lease(),
+            &observed_change("canonical-before-load.sanitized.json"),
+        )
+        .unwrap();
+        assert!(m.is_history_complete());
+        // 派生 patch：history.isComplete → false；采用后必须按新 state 重算
+        let patch = serde_json::json!({
+            "type": "patches", "baseRevision": 3, "revision": 4,
+            "patches": [
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "isComplete"],
+                  "value": false }
+            ]
+        });
+        m.apply(&lease(), &patch).unwrap();
+        assert!(
+            !m.is_history_complete(),
+            "patch 采用后完整性必须从新 state 重算（不得沿用旧缓存 true）"
+        );
+    }
+
+    #[test]
+    fn observed_derived_missing_iscomplete_is_not_complete() {
+        // 派生：删去 history.isComplete——缺字段 ≠ 完整
+        let mut change = observed_change("canonical-before-load.sanitized.json");
+        change["conversationState"]["turnHistory"]["history"]
+            .as_object_mut()
+            .unwrap()
+            .remove("isComplete");
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &change).unwrap();
+        assert!(
+            !m.is_history_complete(),
+            "缺 isComplete 不得默认完整（ hydrate 触发判据）"
+        );
+    }
+
+    #[test]
+    fn observed_derived_unreferenced_entity_is_not_evidence() {
+        // 派生：目标 turnId 只出现在未被 islands 引用的孤立实体上——不放行
+        let mut change = observed_change("canonical-before-load.sanitized.json");
+        let hist = &mut change["conversationState"]["turnHistory"]["history"];
+        let entities = hist["entitiesByKey"].as_object_mut().unwrap();
+        let target = entities["turn:00000000-0000-4000-8000-000000000006"].clone();
+        entities.remove("turn:00000000-0000-4000-8000-000000000006");
+        entities.insert("orphan".into(), target);
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &change).unwrap();
+        assert!(
+            !m.turn_is_terminal("00000000-0000-4000-8000-000000000006"),
+            "未被 canonical 引用的孤立实体不得作为完成证据"
+        );
+    }
+
+    #[test]
+    fn observed_derived_entry_reference_is_value_not_key() {
+        // CODE 派生（Desktop 自身读法）：引用取 entry.value；key 不参与查找
+        let mut change = observed_change("canonical-before-load.sanitized.json");
+        {
+            let entries = change["conversationState"]["turnHistory"]["history"]["islands"][0]
+                ["entries"]
+                .as_array_mut()
+                .unwrap();
+            let target = entries.remove(1); // turn:…006
+            assert_eq!(target["value"], "turn:00000000-0000-4000-8000-000000000006");
+            // key 改成无关值、value 不变 → 仍按 value 引用
+            entries.insert(
+                1,
+                serde_json::json!({ "key": "unrelated-ref", "value": target["value"] }),
+            );
+        }
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &change).unwrap();
+        assert!(
+            m.turn_is_terminal("00000000-0000-4000-8000-000000000006"),
+            "entry.key 与 value 不同时按 value 引用（Desktop 同款读法）"
+        );
+        // value 指向不存在的实体 → 无证据（key 命中也不算）
+        {
+            let entries = change["conversationState"]["turnHistory"]["history"]["islands"][0]
+                ["entries"]
+                .as_array_mut()
+                .unwrap();
+            entries[1] = serde_json::json!({ "key": "turn:00000000-0000-4000-8000-000000000006",
+                                             "value": "no-such-entity" });
+        }
+        let mut m2 = ThreadMirror::new(key());
+        m2.apply(&lease(), &change).unwrap();
+        assert!(
+            !m2.turn_is_terminal("00000000-0000-4000-8000-000000000006"),
+            "引用失效 = 无证据；key 不兜底"
+        );
     }
 }

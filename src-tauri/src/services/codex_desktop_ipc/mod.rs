@@ -13,6 +13,7 @@
 pub mod adapter;
 pub mod codec;
 pub mod connection;
+pub mod history_view;
 pub mod mirror;
 pub mod owners;
 pub mod pending;

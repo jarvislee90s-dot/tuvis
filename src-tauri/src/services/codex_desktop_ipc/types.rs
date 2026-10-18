@@ -145,9 +145,27 @@ pub struct ThreadProjection {
     pub capabilities: CapabilitySet,
     /// idle / active / failed / unknown（由 runtime status 与 turn history 推得）
     pub runtime_status: String,
+    /// 内容健康状态（2026-10-18 形态适配）：与写能力正交——能发送不代表历史已
+    /// 载入；读取出错（unsupported）不得呈现为「真实空会话」
+    pub content_state: ContentState,
     pub messages: Vec<ProjectedMessage>,
     pub truncated: bool,
     pub pending: Vec<PendingView>,
+}
+
+/// 内容健康状态（`contentState`）：ready 且真实 0 条才允许显示「暂无消息」；
+/// loading/partial 必须标记未全载入；unsupported 表示读取异常待核对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentState {
+    /// 首帧 snapshot 未到 / Turn 列表未载完（history.isComplete ≠ true）
+    Loading,
+    /// Turn 列表与各 turn items 均完整（此时真实 0 条 = 真空会话）
+    Ready,
+    /// Turn 列表完整但部分 turn 的 items 未载完（itemsPagination 标记）
+    Partial,
+    /// `turnHistory.history` 形态不可读——读取异常，不冒充空历史
+    Unsupported,
 }
 
 /// 投影消息（正文条目）。
