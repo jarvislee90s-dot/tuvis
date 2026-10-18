@@ -16,8 +16,9 @@
 //   顺序（sequence）倒扫，不得按时间戳；子代理执行期间主会话零写入（尾部停留在
 //   「工具调用已发出、结果未回」），子代理会话自身持续落库（parent_id 关联）——
 //   经共享层后代活跃度仲裁（D5，monitor::app_status）保持运行中；
-// - ZCode 会在回合中途以 user 角色注入 todo_reminder 等记账消息——按 semantics.kind
-//   识别并跳过，不按用户消息处理；
+// - ZCode 会在回合中途以 user 角色注入合成消息（通知/提醒/上下文）——按合成标记
+//   （synthetic / semantics.uiVisibility）识别并跳过，kind 枚举作纵深兜底（Z-P2，
+//   2026-09-15）：标记缺失的已知记账 kind 仍跳过，语义标记优先于枚举；
 // - 会话 id：`sess_` + 标准 UUID（8-4-4-4-12）；子代理 id `sess_subagent_agent_<uuid>`；
 // - 路径：macOS 正斜杠；Windows 反斜杠 + 大写盘符——展示/比对前归一化，原生形态保留。
 //
@@ -25,8 +26,8 @@
 // 为空，绝不 panic、不影响其他工具的监控。测试一律使用构造 fixture 与临时目录。
 
 use super::app_status::{
-    derive_app_status, overlay_stale_with_descendants, AppEntryKind, DescendantActivity,
-    APP_STATUS_STALE_MS,
+    derive_app_status, entry_origin_from_flags, overlay_stale_with_descendants, AppEntryKind,
+    DescendantActivity, EntryOrigin, APP_STATUS_STALE_MS,
 };
 use super::git::get_github_url;
 use super::project::project_name_from_path;
@@ -617,8 +618,36 @@ fn load_parts_for_messages(
 }
 
 /// 消息 + parts → 归一化 APP 条目（共享判定核的 ZCode 格式翻译适配器）。
-/// 记账消息（todo_reminder / timeline_event，ZCode 以 user 角色回合中途注入）整条跳过；
-/// user_prompt → UserMessage；assistant 消息按 parts 顺序展开：
+/// 消息来源判定（Z-P2）：工具侧显式合成标记优先，kind 枚举作纵深防御。
+/// 实测（2026-09-14，451 会话）：synthetic=1 或 uiVisibility=hidden 恰好覆盖
+/// 全部 1051 条注入消息（todo_reminder 815 / background_notification 157 /
+/// system_reminder 72 / subagent_notification 7），629 条 user_prompt 零误伤。
+/// 保留 kind 判断：私有格式升级可能丢标记，双保险方向与既有白名单一致
+fn message_origin(v: &serde_json::Value) -> EntryOrigin {
+    let synthetic = v
+        .get("synthetic")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let ui_hidden = v
+        .pointer("/semantics/uiVisibility")
+        .and_then(|s| s.as_str())
+        == Some("hidden");
+    if entry_origin_from_flags(synthetic, ui_hidden) == EntryOrigin::Synthetic {
+        return EntryOrigin::Synthetic;
+    }
+    let kind = v
+        .pointer("/semantics/kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or_default();
+    // 已知记账 kind 兜底（标记缺失场景）；新增 kind 时在此追加
+    if matches!(kind, "todo_reminder" | "timeline_event" | "system_reminder") {
+        return EntryOrigin::Synthetic;
+    }
+    EntryOrigin::Human
+}
+
+/// 合成注入（通知/提醒/上下文）整条跳过；user_prompt → UserMessage；
+/// assistant 消息按 parts 顺序展开：
 /// tool → ToolCall（调用已发出）、step-start → TurnStart、
 /// step-finish(reason=tool-calls) → ToolCall（本步以工具调用收尾、后续还有动作）、
 /// step-finish(其余) → TurnEnd（回合收尾；懒落库但顺序可靠，永远排在所属消息尾部）、
@@ -633,19 +662,17 @@ fn flatten_entries(
             continue; // data 损坏 → 跳过该消息（防御）
         };
         let role = v.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-        let kind = v
-            .pointer("/semantics/kind")
-            .and_then(|k| k.as_str())
-            .unwrap_or_default();
-        match (role, kind) {
-            // 记账消息：按用户消息处理会误判状态，识别并跳过（继续倒扫）
-            ("user", "todo_reminder") | ("user", "timeline_event") => continue,
-            ("user", _) => {
+        match role {
+            // Z-P2：合成注入（通知/提醒/上下文）不参与状态判定——
+            // 判成 UserMessage 会让"子代理返回"看起来像"用户提问"（假黄），
+            // 且其正文会污染预览（用户通知历史实测出现 3 条 <task-notification> 原文）
+            "user" if message_origin(&v) == EntryOrigin::Synthetic => continue,
+            "user" => {
                 // user_prompt 与 kind 缺失的真实用户消息都按 UserMessage（防御：
-                // 已知记账 kind 已在上一臂排除，未知 kind 保守按用户消息处理）
+                // 合成消息已在前一臂排除，未知 kind 保守按用户消息处理）
                 entries.push(AppEntryKind::UserMessage);
             }
-            ("assistant", _) => {
+            "assistant" => {
                 let Some(parts) = parts.get(&msg.id) else {
                     continue;
                 };
@@ -703,16 +730,10 @@ fn last_message_summary(
             continue;
         };
         let role = v.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-        // 记账消息（todo_reminder / timeline_event）以 user 角色注入且带真实
-        // text part（如 <todo>…</todo> 提醒）——不作最后消息展示，倒扫继续
-        let kind = v
-            .pointer("/semantics/kind")
-            .and_then(|k| k.as_str())
-            .unwrap_or_default();
-        if matches!(
-            (role, kind),
-            ("user", "todo_reminder") | ("user", "timeline_event")
-        ) {
+        // 合成注入（Z-P2：通知/提醒/上下文，标记优先 + kind 兜底）以 user 角色
+        // 注入且带真实 text part（如 <task-notification> 原文）——不作最后消息
+        // 展示，倒扫继续
+        if role == "user" && message_origin(&v) == EntryOrigin::Synthetic {
             continue;
         }
         let Some(msg_parts) = parts.get(&msg.id) else {
@@ -744,11 +765,7 @@ fn first_user_text(
             continue; // 单条消息 data 损坏 → 跳过继续找（防御）
         };
         let role = v.get("role").and_then(|r| r.as_str()).unwrap_or_default();
-        let kind = v
-            .pointer("/semantics/kind")
-            .and_then(|k| k.as_str())
-            .unwrap_or_default();
-        if role != "user" || matches!(kind, "todo_reminder" | "timeline_event") {
+        if role != "user" || message_origin(&v) == EntryOrigin::Synthetic {
             continue;
         }
         if let Some(text) = parts
@@ -892,6 +909,81 @@ mod tests {
     /// 消息 data 构造（role + semantics.kind）
     fn msg_data(role: &str, kind: &str) -> String {
         format!(r#"{{"role":"{role}","semantics":{{"kind":"{kind}"}}}}"#)
+    }
+
+    // ===== Z-P2：合成注入识别（2026-09-15 修复，Task 3）=====
+
+    /// Z-P2 回归锁：合成通知消息不参与状态判定、不上预览（2026-09-15）
+    #[test]
+    fn synthetic_notifications_are_skipped() {
+        // 通知消息（synthetic=true，带 <task-notification> 正文）
+        let notif = r#"{"role":"user","synthetic":true,
+            "semantics":{"kind":"background_notification","uiVisibility":"hidden"},
+            "metadata":{"originMeta":{"backgroundSource":"subagent","workId":"agent_x"}}}"#
+            .to_string();
+        // 真实用户输入
+        let human =
+            r#"{"role":"user","semantics":{"kind":"user_prompt"},"synthetic":false}"#.to_string();
+        let msgs = vec![
+            MessageRow {
+                id: "m1".into(),
+                data: msg_data("assistant", ""),
+            },
+            MessageRow {
+                id: "m2".into(),
+                data: notif,
+            },
+            MessageRow {
+                id: "m3".into(),
+                data: human,
+            },
+        ];
+        // m1 配 text part 才会展开出条目（assistant 无 parts 时本就不参与判定）
+        let mut parts = HashMap::new();
+        parts.insert(
+            "m1".into(),
+            vec![PartRow {
+                data: r#"{"type":"text","text":"好的"}"#.into(),
+            }],
+        );
+        let entries = flatten_entries(&msgs, &parts);
+        // 通知不产生 UserMessage：只应有 m1(assistant) 与 m3(user) 两条
+        assert_eq!(entries.len(), 2, "合成通知不得进入判定条目");
+        assert_eq!(
+            entries[1],
+            AppEntryKind::UserMessage,
+            "真实用户输入仍判 UserMessage"
+        );
+
+        // 末条消息：跳过后应取真实用户输入，而非 <task-notification> 正文
+        let mut parts2 = HashMap::new();
+        parts2.insert(
+            "m2".into(),
+            vec![PartRow {
+                data: r#"{"type":"text","text":"<task-notification>\n<task-id>agent_x</task-id>"}"#
+                    .into(),
+            }],
+        );
+        parts2.insert(
+            "m3".into(),
+            vec![PartRow {
+                data: r#"{"type":"text","text":"继续"}"#.into(),
+            }],
+        );
+        let (last, role) = last_message_summary(&msgs, &parts2);
+        assert_eq!(last.as_deref(), Some("继续"), "不得把通知原文当末条展示");
+        assert_eq!(role.as_deref(), Some("user"));
+    }
+
+    /// 纵深防御：标记缺失但 kind 已知 → 仍跳过
+    #[test]
+    fn known_kind_skipped_without_synthetic_flag() {
+        let old = r#"{"role":"user","semantics":{"kind":"todo_reminder"}}"#.to_string();
+        let msgs = vec![MessageRow {
+            id: "m1".into(),
+            data: old,
+        }];
+        assert!(flatten_entries(&msgs, &HashMap::new()).is_empty());
     }
 
     // ===== 会话 id 合规判定 =====
