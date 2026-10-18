@@ -296,3 +296,67 @@ describe("PresetCard 👁/✏️（UI 改版 B5）", () => {
     expect(await screen.findByText("编辑预设组")).toBeInTheDocument();
   });
 });
+
+// ==== #66 SubAgentPresetActions 复活：折叠入口恒渲染 + supported/agents 分诊 ====
+describe("SubAgentPresetActions 入口复活（#66）", () => {
+  /** 挂载单工具卡，mock detect_subagents 返回指定载荷（新契约 SubagentDetection） */
+  async function renderWithDetection(detection: unknown) {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_enabled_tools") return [TOOL_CLAUDE];
+      if (cmd === "list_presets") return [UNIVERSAL_PRESET];
+      if (cmd === "list_active_presets") return [];
+      if (cmd === "detect_subagents") return detection;
+      return [];
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <PresetList extensions={[]} />
+      </QueryClientProvider>
+    );
+    await screen.findByText("通用组合");
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("list_active_presets"));
+  }
+  /** 折叠入口按钮（zh 词条 presets.expandSubAgents） */
+  function expandButton(): HTMLElement {
+    return screen.getByRole("button", { name: "子 Agent ▼" });
+  }
+
+  it("无子代理工具（supported+空列表）：折叠入口恒渲染（死 UI 回归锁——旧版 length===0 return null 在按钮之前，此断言必红）+ 展开显示空态文案", async () => {
+    await renderWithDetection({ supported: true, agents: [] });
+    // 死 UI 回归锁：旧版初始空列表直接 return null，按钮永不渲染
+    expect(expandButton()).toBeInTheDocument();
+    fireEvent.click(expandButton());
+    expect(await screen.findByText("未检测到子 Agent")).toBeInTheDocument();
+  });
+
+  it("工具不支持子 Agent（supported:false）：展开走「不支持」分支而非空态/列表", async () => {
+    await renderWithDetection({ supported: false, agents: [] });
+    expect(expandButton()).toBeInTheDocument();
+    fireEvent.click(expandButton());
+    // 键路径已修（errors.presetSubagentUnsupported，zh 值在 errors 命名空间）——
+    // 纯文案断言，缺键/键路径渲染会直接红
+    const hint = await screen.findByText("该类型不支持子 Agent 级分配");
+    expect(hint).toBeInTheDocument();
+    // 不得误走空态分支（supported=false 优先于 agents 空列表分诊）
+    expect(screen.queryByText("未检测到子 Agent")).not.toBeInTheDocument();
+  });
+
+  it("有子代理：展开列出 agents + 应用/停用按钮在（既有列表行为回归锁）", async () => {
+    await renderWithDetection({ supported: true, agents: ["frontend-dev"] });
+    fireEvent.click(expandButton());
+    const row = (await screen.findByText("frontend-dev")).closest("div")!;
+    // 应用按钮（zh「应用」+ Play 图标）在行内；停用按钮（X 图标）也在
+    expect(within(row).getByRole("button", { name: "应用" })).toBeInTheDocument();
+    expect(within(row).getAllByRole("button")).toHaveLength(2);
+  });
+
+  it("新契约形态同步锁：展开时以 {toolId} 调 detect_subagents，返回结构体（非旧数组契约）驱动分诊", async () => {
+    await renderWithDetection({ supported: true, agents: [] });
+    fireEvent.click(expandButton());
+    await screen.findByText("未检测到子 Agent");
+    expect(invokeMock).toHaveBeenCalledWith("detect_subagents", { toolId: "claude" });
+  });
+});

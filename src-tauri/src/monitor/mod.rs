@@ -181,3 +181,34 @@ mod dismissed_filter_tests {
         );
     }
 }
+
+/// HOME 环境变量注入基建（#66/#151 测试用）：部分生产入口硬编码
+/// `dirs::home_dir()`（services::detect_subagents / subagents::opencode::
+/// child_updated_anchors / subagents::codex::collect），无 path/env 参数缝——
+/// Unix 下 `dirs::home_dir` 优先读 `$HOME`，重定向 HOME 即可控数据根。
+///
+/// 串行化纪律（家族先例：`kimi_parser::HOME_LOCK`，见其模块注释的实测教训）：
+/// HOME 是**进程级**量，并行测试线程共享——所有 set HOME 的用例必须共用
+/// **同一把锁**（services / codex_parser / opencode_parser 三处），各自持私有锁
+/// 等于没锁。窗口内其余读 HOME 的并行路径（各家 collect 生产入口）均期待
+/// 「无数据 → 空态」，tempdir home 同样返回空，语义安全。
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    pub(crate) static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 临时把 HOME 指到 `home` 执行 `f`，结束后恢复原值（原本未设则移除）。
+    /// 必须持 HOME_ENV_LOCK 调用（锁在调用方拿，便于一个用例内多次切换）
+    pub(crate) fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        let old = std::env::var_os("HOME");
+        std::env::set_var("HOME", home);
+        let r = f();
+        match old {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        r
+    }
+}

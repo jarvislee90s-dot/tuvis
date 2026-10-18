@@ -79,25 +79,115 @@ pub fn toggle_mcp(mcp_name: &str, tool_id: &str, enabled: bool) -> Result<(), St
     Ok(())
 }
 
+/// 子 Agent 检测结果（#66）：区分「工具不支持子 Agent」与「支持但没有」。
+/// 空数组无法区分这两种成因（kimi swarm 会话内 / 未覆盖工具均返回空），
+/// 前端需要不同文案（不支持 vs 空态）——判定口径表见 PresetList 消费侧。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentDetection {
+    /// adapter.subagent_dir().is_some()（未知工具 id 也为 false）
+    pub supported: bool,
+    /// 既有口径不变：目录存在则全收 file_stem
+    pub agents: Vec<String>,
+}
+
 /// 检测工具的子 Agent 列表
-pub fn detect_subagents(tool_id: &str) -> Vec<String> {
+pub fn detect_subagents(tool_id: &str) -> SubagentDetection {
     let Some(adapter) = crate::adapter::adapter_by_id(tool_id) else {
-        return Vec::new();
+        return SubagentDetection {
+            supported: false,
+            agents: Vec::new(),
+        };
     };
     if let Some(dir) = adapter.subagent_dir() {
+        // 目录不存在 = 支持但从未 spawn 过子 Agent → supported=true + 空列表；
+        // read_dir 失败（目录在但读不了）与「无」同呈现，如实不报错
         if dir.exists() {
             if let Ok(entries) = std::fs::read_dir(&dir) {
-                return entries
-                    .flatten()
-                    .filter_map(|e| {
-                        e.path()
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .map(String::from)
-                    })
-                    .collect();
+                return SubagentDetection {
+                    supported: true,
+                    agents: entries
+                        .flatten()
+                        .filter_map(|e| {
+                            e.path()
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .map(String::from)
+                        })
+                        .collect(),
+                };
             }
         }
+        return SubagentDetection {
+            supported: true,
+            agents: Vec::new(),
+        };
     }
-    Vec::new()
+    SubagentDetection {
+        supported: false,
+        agents: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod subagent_detection_tests {
+    use super::*;
+
+    /// #66 判定口径定案表逐行断言（spec §1.1）：
+    /// | 场景 | supported | agents |
+    /// | 未知工具 id | false | [] |
+    /// | subagent_dir()=None（kimi 代表） | false | [] |
+    /// | 目录不存在（支持但从未 spawn） | true | [] |
+    /// | 目录存在 | true | [...] |
+    /// 前两行零文件系统依赖直接断言；后两行经 HOME 重定向控制 `~/.claude/agents`
+    /// （claude 的 subagent_dir 硬编码 home，无 path 缝——见 monitor::test_env 注释）。
+    #[test]
+    fn detect_subagents_unknown_tool_is_unsupported() {
+        let d = detect_subagents("no-such-tool-id");
+        assert!(!d.supported, "未知工具 id → 不支持");
+        assert!(d.agents.is_empty());
+    }
+
+    #[test]
+    fn detect_subagents_none_dir_tool_is_unsupported() {
+        // kimi：子 agent 为会话内 swarm，subagent_dir()=None → 不支持（非空态）
+        let d = detect_subagents("kimi");
+        assert!(!d.supported, "subagent_dir()=None → 不支持");
+        assert!(d.agents.is_empty());
+    }
+
+    #[test]
+    fn detect_subagents_missing_dir_is_supported_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = crate::monitor::test_env::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let d = crate::monitor::test_env::with_home(tmp.path(), || {
+            detect_subagents("claude") // tempdir 下无 ~/.claude/agents
+        });
+        drop(guard);
+        assert!(
+            d.supported,
+            "目录不存在 = 支持但从未 spawn → supported=true"
+        );
+        assert!(d.agents.is_empty(), "空列表（可区分「不支持」的新契约点）");
+    }
+
+    #[test]
+    fn detect_subagents_existing_dir_lists_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_dir = tmp.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("frontend-dev.md"), "").unwrap();
+        std::fs::write(agents_dir.join("backend-dev.md"), "").unwrap();
+        let guard = crate::monitor::test_env::HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let d = crate::monitor::test_env::with_home(tmp.path(), || detect_subagents("claude"));
+        drop(guard);
+        assert!(d.supported, "目录存在 → 支持");
+        let mut names = d.agents.clone();
+        names.sort(); // read_dir 顺序不保证，排序后比较
+        assert_eq!(names, ["backend-dev", "frontend-dev"], "全收 file_stem");
+    }
 }

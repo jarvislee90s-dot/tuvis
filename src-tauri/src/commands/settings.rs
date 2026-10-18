@@ -29,7 +29,7 @@ pub fn detect_tools() -> Vec<crate::linker::detector::ToolDetection> {
 }
 
 #[tauri::command]
-pub fn detect_subagents(tool_id: String) -> Vec<String> {
+pub fn detect_subagents(tool_id: String) -> crate::services::SubagentDetection {
     crate::services::detect_subagents(&tool_id)
 }
 

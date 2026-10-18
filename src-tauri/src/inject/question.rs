@@ -270,7 +270,7 @@ pub fn answer_key_sequence(
 /// | claude | 2026-09-21 按键语义探测 K1–K11（本机实机，三重证据） | 全支持（单/多选 + cancel） |
 /// | opencode | 2026-09-20 跨工具矩阵 §2.2（本机实机 ×2：数字单键即选即交；↓+Enter） | 单选 select；多选/取消**未测** → 拒 |
 /// | kimi | 同上 §2.3（本机实机 ×2：数字 → Review 屏 → 数字确认的**两段式**） | 单选 select 两段式；多选/取消未测 → 拒 |
-/// | codex | **2026-09-21 实机补测**（T3 条件项，见下） | 单选 select 数字即选即交；多选/取消 → 拒 |
+/// | codex | **2026-09-21 实机补测**（T3 条件项，见下） | 单选 select 数字即选即交；多选 toggle/submit 拒；cancel=esc 中断回合（2026-10-18 放开） |
 ///
 /// **codex 2026-09-21 实机补测（矩阵遗留条件项已补齐）**：档案
 /// `research/refs/phase2-消息注入/2026-09-21-codex-request_user_input-键位实机补测.md`
@@ -283,14 +283,15 @@ pub fn answer_key_sequence(
 /// - 确认屏（未答完提交时弹）**数字无效**、只认 Enter/Esc——与源码级记载背离，
 ///   以实测为准（本档不出手该屏，仅记录）。
 ///
-/// **cancel 不代按**：codex 的 Esc 是「中断整个回合」（`function_call_output` 是纯
-/// 字符串 "aborted by user…" + `turn_aborted` 事件，**不是** claude 那种 is_error
-/// 拒答回执）——语义破坏性远大于 claude K3（会打断模型正在做的事），故不出手。
+/// **cancel = esc 中断回合（2026-10-18 裁决放开，#80）**：codex 的 Esc 是「中断整个
+/// 回合」（`function_call_output` 是纯字符串 "aborted by user…" + `turn_aborted` 事件，
+/// **不是** claude 那种 is_error 拒答回执）——语义破坏性大于 claude K3（会打断模型
+/// 正在做的事），故前端按钮文案前置警示「中断回合（破坏性）」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuestionKeyProfile {
     /// 全键序已验：单选直选、多选 toggle+三段式提交、esc 取消
     ClaudeFull,
-    /// 单选已验（数字即选即交）；多选/提交/取消未测 → 这些动作拒绝
+    /// 单选已验（数字即选即交）；多选/提交未测 → 拒；cancel 例外（见各工具臂）
     SingleDigitSubmit,
     /// 单选两段式（数字选中 → Review 屏 → 数字确认）；多选未测
     TwoPhaseSelect,
@@ -334,7 +335,7 @@ pub fn question_key_profile(tool: &str) -> QuestionKeyProfile {
         // 确认屏（[1] Submit / [2] Cancel）→ 数字 '1' 提交。**两段式**
         "kimi" => QuestionKeyProfile::TwoPhaseSelect,
         // T3 实机补测（2026-09-21）：数字单键即选即交（三取样），与 opencode 同档；
-        // cancel 因 Esc=中断回合而拒（见上方表格注释）
+        // cancel = esc 中断回合（2026-10-18 放开，见上方表格注释）
         "codex" => QuestionKeyProfile::SingleDigitSubmit,
         _ => QuestionKeyProfile::ReadOnly,
     }
@@ -347,7 +348,8 @@ pub fn question_key_profile(tool: &str) -> QuestionKeyProfile {
 /// 才提交——故 select 序列是 `[数字, "1"]`（两键）。取消键 kimi 未测 → 走只读
 /// （返回 Err，端点 409，前端只读卡）。
 ///
-/// **codex ReadOnly**：任何动作都 Err（端点据此拒注入，前端只读卡）——「未验不出键」。
+/// **codex**：未验动作不出键（多选 submit 拒；toggle 走 CodexToggle 臂、cancel =
+/// esc 中断回合〔#80 放开〕）——已验面见上方 profile 表。
 pub fn answer_key_sequence_for(
     tool: &str,
     action: AnswerAction,
@@ -398,9 +400,11 @@ pub fn answer_key_sequence_for(
             // E6：esc = 单次 dismiss（state.status=error + dismissed 落账，戊探A
             // E-A4）——与其他家「esc=中断回合」不同构
             AnswerAction::Cancel if tool == "opencode" => Ok(vec!["esc".to_string()]),
-            // codex 取消未实测 → 不出键（Esc=「中断整个回合」，语义破坏性大于
-            // opencode 的 dismiss——工具名如实，勿写成别家）
-            AnswerAction::Cancel => Err("Q_UNVERIFIED_CODEX: codex 取消未实测，不出键".to_string()),
+            // codex cancel = esc 中断整个回合（2026-10-18 裁决放开，#80）——破坏性：
+            // function_call_output 为 "aborted by user…" + turn_aborted 事件，非
+            // claude K3 的 is_error 拒答回执、亦非 opencode 的 dismiss。前端按钮
+            // 文案如实标注「中断回合（破坏性）」（mobile.question.cancelInterrupt）
+            AnswerAction::Cancel => Ok(vec!["esc".to_string()]),
             // opencode 自由作答走阶段机（own answer 开行守卫，E6）
             AnswerAction::FreeText if tool == "opencode" => {
                 Err("Q_STAGE_MACHINE_REQUIRED: opencode 自由作答必须经阶段机（run_opencode_own_answer_stages）".to_string())
@@ -6282,7 +6286,7 @@ mod tests {
     }
 
     /// T3 · codex 档（2026-09-21 实机补测后）→ 单选 select 数字即选即交；
-    /// 多选（toggle/submit）与 cancel 仍拒（未验 / Esc=中断回合语义破坏性）
+    /// 多选（toggle/submit）仍拒；cancel = esc 中断回合（2026-10-18 裁决放开，#80）
     #[test]
     fn codex_profile_digit_select_only() {
         let q = single();
@@ -6305,11 +6309,24 @@ mod tests {
             vec!["space"]
         );
         assert!(answer_key_sequence_for("codex", AnswerAction::Submit, None, &multi()).is_err());
-        // cancel 拒：Esc 在 codex 是**中断整个回合**（实录 "aborted by user…" +
-        // turn_aborted），非 claude 的 is_error 拒答——不出手
+        // cancel = esc（2026-10-18 裁决放开，#80）：Esc 在 codex 是**中断整个回合**
+        // （实录 "aborted by user…" + turn_aborted），非 claude 的 is_error 拒答——
+        // 破坏性语义以前端按钮文案警示（mobile.question.cancelInterrupt），不再门拒
+        assert_eq!(
+            answer_key_sequence_for("codex", AnswerAction::Cancel, None, &q).unwrap(),
+            vec!["esc"],
+            "#80 放开：codex cancel = esc 中断回合（原 Q_UNVERIFIED_CODEX 门拒废止）"
+        );
+        // 门级回归锁：`action_supported` 的 Cancel 走兜底臂直查键序档——防将来
+        // 门被单独收紧（不经过键序层）时 codex cancel 再被拦（409 tool_readonly）
+        assert_eq!(
+            answer_key_sequence_for("codex", AnswerAction::Cancel, None, &multi()).unwrap(),
+            vec!["esc"],
+            "multi_select 载荷下 cancel 同一兜底臂（与 claude Cancel 无形态分支先例一致）"
+        );
         assert!(
-            answer_key_sequence_for("codex", AnswerAction::Cancel, None, &q).is_err(),
-            "Esc=中断回合，语义破坏性 → 不代按"
+            action_supported("codex", AnswerAction::Cancel, None, &q).is_ok(),
+            "门与键序层必须同面：键序放行而门拒 = 用户必撞 409"
         );
     }
 

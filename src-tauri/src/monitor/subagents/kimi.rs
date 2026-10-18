@@ -156,6 +156,52 @@ pub(crate) fn collect_with(
     })
 }
 
+/// 回报提醒打标锚（#151 全工具化）：agents/<dir>/wire.jsonl 的 mtime 毫秒列表
+/// （最后写时刻 ≈ 回报写完）。stat-only 不进增量缓存——打标由「绿会话」闸住
+/// 成本。为什么不复用 collect 的 endTs：kimi 的 Idle 分诊有 90s 活动窗滞后，
+/// 「刚完成 10s」的子代理视图里还是 Running（endTs=None），恰是打标最需要的
+/// 时刻——取原始活动毫秒，不经视图分诊。
+pub fn wire_activity_anchors(session_id: &str) -> Vec<i64> {
+    // 数据根判定复用 kimi_parser 单点（同 collect）
+    let Some(root) = crate::monitor::kimi_parser::kimi_data_root() else {
+        return Vec::new();
+    };
+    wire_activity_anchors_with(root, session_id)
+}
+
+/// 可注入核心（root 注入；测试 tempdir）
+pub(crate) fn wire_activity_anchors_with(root: KimiDataRoot, session_id: &str) -> Vec<i64> {
+    let Some(dir) = parse_session_index(&root)
+        .into_iter()
+        .find(|e| e.session_id == session_id)
+        .map(|e| resolve_session_dir(&root, &e.session_dir))
+    else {
+        return Vec::new();
+    };
+    // 信任边界同 collect_with：越界（含 ../ 逃逸）跳过
+    if !dir.starts_with(&root.sessions) {
+        return Vec::new();
+    }
+    let agents_dir = dir.join("agents");
+    let mut anchors = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+        for e in entries.flatten() {
+            if e.file_name() == "main" || !e.path().is_dir() {
+                continue;
+            }
+            let wire = e.path().join("wire.jsonl");
+            if let Some(ms) = std::fs::metadata(&wire)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            {
+                anchors.push(ms.as_millis() as i64);
+            }
+        }
+    }
+    anchors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +399,90 @@ mod tests {
         let (_td, root) = kimi_fixture("ks-3", &[("agent-0", &wire(&usage(1, 1, 1, 1)))]);
         assert!(collect_with(root, "nope", std::time::SystemTime::now()).is_empty());
         super::super::reset_cache_for_tests();
+    }
+
+    // ==== #151：回报打标锚 wire_activity_anchors_with（stat-only，不进增量缓存）====
+
+    /// 锚收集：agent wire 的 mtime 毫秒；main 排除、无 wire 跳过、不在索引空态
+    #[test]
+    fn wire_activity_anchors_collect_mtime_ms() {
+        let (_td, root) = kimi_fixture(
+            "ks-anch",
+            &[
+                ("main", "{}\n"),    // main 排除
+                ("agent-0", "{}\n"), // 收
+                ("agent-1", "{}\n"), // 收
+                ("empty-dir", ""),   // 无 wire.jsonl → 跳过（构造后删 wire）
+            ],
+        );
+        std::fs::remove_file(
+            root.sessions
+                .join("wd-1")
+                .join("ks-anch")
+                .join("agents")
+                .join("empty-dir")
+                .join("wire.jsonl"),
+        )
+        .unwrap();
+        // 精确设 mtime：锚的可控值（回报窗判定在 report_anchor_near_last，已单测边界）
+        let t0 = filetime::FileTime::from_unix_time(1_760_000_000, 123_000_000);
+        let t1 = filetime::FileTime::from_unix_time(1_760_000_050, 0);
+        std::fs::write(
+            root.sessions
+                .join("wd-1")
+                .join("ks-anch")
+                .join("agents")
+                .join("agent-0")
+                .join("wire.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            root.sessions
+                .join("wd-1")
+                .join("ks-anch")
+                .join("agents")
+                .join("agent-0")
+                .join("wire.jsonl"),
+            t0,
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            root.sessions
+                .join("wd-1")
+                .join("ks-anch")
+                .join("agents")
+                .join("agent-1")
+                .join("wire.jsonl"),
+            t1,
+        )
+        .unwrap();
+        let mut anchors = wire_activity_anchors_with(root.clone(), "ks-anch");
+        anchors.sort_unstable();
+        assert_eq!(
+            anchors,
+            [1_760_000_000_123, 1_760_000_050_000],
+            "收集各 agent wire mtime 毫秒（main 排除、无 wire 跳过）"
+        );
+        // 不在索引 / 越界 sessionDir → 空态（信任边界同 collect_with）
+        assert!(wire_activity_anchors_with(root.clone(), "nope").is_empty());
+    }
+
+    /// 越界 sessionDir（../../ 逃逸）→ 空锚（P1-2 信任边界同样适用于锚收集）
+    #[test]
+    fn wire_activity_anchors_reject_out_of_root_session_dir() {
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path().join("khome");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::write(
+            home.join("session_index.jsonl"),
+            concat!(
+                r#"{"sessionId":"bad1","sessionDir":"../../escape","workDir":"E:/x"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let root = resolve_data_root(Some(home.to_str().unwrap()), td.path()).unwrap();
+        assert!(wire_activity_anchors_with(root, "bad1").is_empty());
     }
 }

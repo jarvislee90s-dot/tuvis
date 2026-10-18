@@ -8,8 +8,12 @@ export async function setSetting(key: string, value: string) {
 export async function detectTools() {
   return await invoke("detect_tools");
 }
+export interface SubagentDetection {
+  supported: boolean;
+  agents: string[];
+}
 export async function detectSubagents(toolId: string) {
-  return await invoke("detect_subagents", { toolId });
+  return await invoke<SubagentDetection>("detect_subagents", { toolId });
 }
 export async function listSubAgents(toolId: string) {
   return await invoke("list_sub_agents", { toolId });

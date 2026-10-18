@@ -40,6 +40,7 @@ import {
   deletePreset,
   restorePreset,
 } from "@/lib/api/preset";
+import type { SubagentDetection } from "@/lib/api/settings";
 
 export function PresetList({
   // extensions 透传给 T7 编辑弹窗作套件列表数据源（props 契约不变）
@@ -448,15 +449,21 @@ function SubAgentPresetActions({
   toolId: string;
 }) {
   const { t } = useTranslation();
-  const [subAgents, setSubAgents] = useState<string[]>([]);
+  // #66 复活：null = 未加载。旧版初始 [] + length===0 return null 在展开按钮之前
+  // ——入口永不渲染 → 检测永不触发 → 永远空，自锁死 UI。现在折叠入口恒渲染，
+  // 展开时才检测，并按 supported / agents 分诊「不支持」与「空态」两种文案。
+  const [detection, setDetection] = useState<SubagentDetection | null>(null);
   const [expanded, setExpanded] = useState(false);
 
   const loadSubAgents = async () => {
     try {
-      const data = await invoke<string[]>("detect_subagents", { toolId });
-      setSubAgents(data);
+      const data = await invoke<SubagentDetection>("detect_subagents", { toolId });
+      setDetection(data);
     } catch (e) {
+      // 后端判定口径：不支持 / 无 / 目录读失败均返回空表而非 Err——这里仅
+      // IPC 层故障可达，如实按空态呈现（不假报「不支持」）
       console.error("Failed to load subagents:", e);
+      setDetection({ supported: true, agents: [] });
     }
   };
 
@@ -492,10 +499,10 @@ function SubAgentPresetActions({
     }
   };
 
-  if (subAgents.length === 0) return null;
-
   return (
-    <div>
+    // 整段阻断冒泡（照上方开关区先例）：入口恒渲染后，子 Agent 行内按钮
+    // 不得冒泡到整卡点击（onEdit 编辑弹窗）
+    <div onClick={(e) => e.stopPropagation()}>
       <button
         onClick={() => {
           setExpanded(!expanded);
@@ -507,28 +514,38 @@ function SubAgentPresetActions({
       </button>
       {expanded && (
         <div className="ml-2 space-y-0.5 border-l pl-2">
-          {subAgents.map((sa) => (
-            <div key={sa} className="flex items-center gap-1 text-[10px]">
-              <span className="text-muted-foreground">{sa}</span>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-4 px-1 text-[9px]"
-                onClick={() => handleApplyToSubagent(sa)}
-              >
-                <Play className="mr-0.5 h-2 w-2" />
-                {t("presets.apply")}
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-4 w-4 p-0 text-[9px]"
-                onClick={() => handleDeactivateFromSubagent(sa)}
-              >
-                <X className="h-2 w-2" />
-              </Button>
-            </div>
-          ))}
+          {detection !== null && !detection.supported ? (
+            <span className="text-muted-foreground text-[10px]">
+              {t("errors.presetSubagentUnsupported")}
+            </span>
+          ) : detection !== null && detection.agents.length === 0 ? (
+            <span className="text-muted-foreground text-[10px]">
+              {t("presets.presetSubagentEmpty")}
+            </span>
+          ) : (
+            detection?.agents.map((sa) => (
+              <div key={sa} className="flex items-center gap-1 text-[10px]">
+                <span className="text-muted-foreground">{sa}</span>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-4 px-1 text-[9px]"
+                  onClick={() => handleApplyToSubagent(sa)}
+                >
+                  <Play className="mr-0.5 h-2 w-2" />
+                  {t("presets.apply")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-4 w-4 p-0 text-[9px]"
+                  onClick={() => handleDeactivateFromSubagent(sa)}
+                >
+                  <X className="h-2 w-2" />
+                </Button>
+              </div>
+            ))
+          )}
         </div>
       )}
     </div>

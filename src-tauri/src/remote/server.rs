@@ -8048,6 +8048,68 @@ mod tests {
         assert_eq!(audits[0].summary, "cancel");
     }
 
+    /// 问答应答（取消，codex）：sess_cli_qcx（form=Cli——APP 形态会被止血门
+    /// `app_form_pending` 拦，见 `question_answer_rejects_codex_app_form_with_409`）
+    /// → 200 key_sent + (pid=75, "esc") 恰一键 + 审计 answer/cancel/ok。
+    ///
+    /// **#80（2026-10-18 裁决放开）**：codex cancel 原为 409 tool_readonly
+    /// （Q_UNVERIFIED_CODEX 键序拒绝）——放开后 esc=中断整个回合（破坏性语义由
+    /// 前端按钮文案警示，见 mobile.question.cancelInterrupt）。端点链路：门
+    /// `action_supported` 兜底臂 → 键序 `answer_key_sequence_for` → SingleKey
+    /// 投递（屏读缝缺省 None：备注守卫/前后读屏均走盲发兜底，不误报）。
+    #[tokio::test]
+    async fn question_answer_cancel_codex_cli_sends_esc() {
+        let fake = FakeInjector::ok();
+        let state = codex_form_state(
+            fake.clone(),
+            crate::session::ProcessForm::Cli,
+            &[("sess_cli_qcx", 75)],
+        );
+        state.store.with(|conn| {
+            crate::database::dao::question_wait::mark(
+                conn,
+                "codex",
+                "sess_cli_qcx",
+                1_000,
+                "等待回答",
+                Some(Q_SINGLE_PAYLOAD),
+            )
+        });
+        persist_named_device(&state, "mm", "测试设备");
+        let app = router(state.clone());
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-question/answer",
+                Some("mam_device=mm"),
+                Some(r#"{"sessionId":"sess_cli_qcx","action":"cancel"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            200,
+            "#80 放开：codex CLI cancel 不再 409 tool_readonly"
+        );
+        let body = body_string(r).await;
+        assert!(
+            body.contains("\"status\":\"key_sent\""),
+            "cancel 单键成功回执：{body}"
+        );
+        assert_eq!(
+            fake.recorded_keys(),
+            vec![(75u32, "esc".to_string())],
+            "codex cancel = 单键 esc（恰一键，无多余导航/确认键）：{:?}",
+            fake.recorded_keys()
+        );
+        let audits = state
+            .store
+            .with(|c| crate::database::dao::write_audit::recent_conn(c, 10));
+        assert_eq!(audits[0].action, "answer");
+        assert_eq!(audits[0].summary, "cancel");
+        assert_eq!(audits[0].result, "ok", "key_sent 成功臂审计 result=ok");
+    }
+
     /// guard-busy 回归（F1 同款）：问答应答遇 in-flight 占用 → 200 failed{「投递进行中，
     /// 请稍后重试」} + 零注入 + 不落审计。sess_z 独占（守卫持到测尾，守卫 id 立规）。
     #[tokio::test]

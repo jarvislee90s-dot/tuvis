@@ -1,8 +1,12 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import ApproveCard from "@/mobile/ApproveCard";
 import QuestionCard from "@/mobile/QuestionCard";
 import type { QuestionInfoView } from "@/mobile/api";
+
+// tests/setup.ts 未初始化 i18n，显式引入并固定中文（#80：取消钮文案改走
+// i18n.t("mobile.question.cancelInterrupt")，按 zh 断言——applyConfirmDialog 同款）
+import i18n from "@/i18n";
 
 // 批次乙 T8：移动端问答卡（AskUserQuestion）。fetch 全量 stub（盖过 setup.ts 的
 // msw），按 URL 分路到 session-question / session-question/answer 两族端点（注意
@@ -65,6 +69,10 @@ interface Routes {
 
 let routes: Routes;
 let fetchMock: ReturnType<typeof vi.fn>;
+
+beforeAll(async () => {
+  await i18n.changeLanguage("zh");
+});
 
 beforeEach(() => {
   routes = {};
@@ -261,12 +269,17 @@ describe("QuestionCard：问答卡渲染与应答（批次乙 T8）", () => {
     expect(screen.getByTestId("question-option-0").textContent).toContain("[ ]");
   });
 
-  it("取消钮：POST cancel →「已发送按键」终态", async () => {
+  it("取消钮：文案如实警示「中断回合（破坏性）」(#80) + POST cancel →「已发送按键」终态", async () => {
     installFetch();
     routes.question = singleQuestionInfo();
     routes.answer = { status: "key_sent" };
     render(<QuestionCard session={{ id: "sess-3" }} />);
-    fireEvent.click(await screen.findByTestId("question-cancel"));
+    const cancel = await screen.findByTestId("question-cancel");
+    // #80（2026-10-18 裁决放开）：codex cancel = esc 中断整个回合（破坏性语义，
+    // 非 claude 的 is_error 拒答）——按钮文案前置警示（mobile.question.cancelInterrupt），
+    // 不再是中性的「取消回答」。锁文案 = 锁「破坏性」如实申报给用户。
+    expect(cancel.textContent).toBe("中断回合（破坏性）");
+    fireEvent.click(cancel);
     expect(await screen.findByTestId("question-sent")).toBeTruthy();
     expect(JSON.parse(String((answerCalls()[0][1] as RequestInit).body))).toEqual({
       sessionId: "sess-3",

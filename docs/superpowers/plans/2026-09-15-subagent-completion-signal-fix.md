@@ -1480,3 +1480,63 @@ OpenCode：5 条 "## New Messages" 合成消息（窗口 91ms）
 | WorkBuddy | 无子代理概念 | ✅ 14322 字符注入 | Task 10 |
 | OpenCode | 无子代理概念 | ✅ 5 条（窗口短） | Task 10 |
 | OpenClaw | 待探测（CPU 判据） | ⚪ 不读 transcript | Task 2 探测 |
+
+---
+
+## 2026-10-18 适配追记
+
+> 背景：本计划制定于 2026-09-15（基准为当时 main）。2026-10-18 用户裁定按本计划推进 #61（tracking 批次，见 `docs/superpowers/specs/2026-10-18-tracking-batches-design.md` §4），实施前对齐 origin/main（d14aa8c）现状，落四条适配 + 一条推迟裁定 + 阶段顺序确认。**本追记不改动上方计划原文**；与原文冲突处以本追记为准（均为「计划写 X / main 现状是 Y」的对齐，不改变任何验收语义）。
+
+### 适配① Task 4 测试脚手架——按 main 真实签名对齐
+
+计划中的 zcode 测试脚手架名与 main 现状（`src-tauri/src/monitor/zcode_parser.rs` tests 模块）不符，实现时按下表替换：
+
+| 计划写法 | main 现状（行号基于 d14aa8c） |
+|---|---|
+| `setup_schema` | 不存在；用 `build_cli_db(path: &Path) -> Connection`（zcode_parser.rs:784） |
+| `insert_session` 6 形参 | 实为 **7 形参**（:821：`conn, id, parent_id: Option<&str>, dir, task_type, title: Option<&str>, time_updated: i64`） |
+| `insert_part` 带时间参 | 实为 **5 形参、无时间参**（:854：`conn, id, message_id, seq, data`）；超龄场景把时间写进 part JSON 的 `state.time.start`（按计划原意图落 part data，不改夹具签名） |
+
+测试基数修正：`app_status.rs` 现有 **26** 个 `#[test]`（计划写 18）、`zcode_parser.rs` 现有 **35** 个（计划写 20+）。计划 Step 若按「新增后总数」断言，按实际数修正基线。
+
+### 适配② Task 10（opencode）——按双 schema 重设计
+
+`src-tauri/src/monitor/opencode_parser.rs` 已从计划制定时的 523 行增长到 2495 行，单文件承载 v1/v2 双 schema：
+
+- `schema_is_v2`（:87）双 schema 分派是判据单点；消息读取 v1 走 `message`+`part`、v2 走 `session_message` 内联 `content[]`；
+- `get_last_message_info`（:430）仅覆盖 v1 路径；v2 路径是 `get_last_message_info_v2`（:544）；
+- 计划制定后新增的 TailSignal / 问答卡层：`get_session_tail_part`（:503）、`tail_signal_v2`（:728）、`pending_question_part`（:876）、`determine_opencode_status`（:992）；
+- 计划引用的「## New Messages」判据在 main 全文件**零命中**——v2 库形态必须在实现时以夹具定案，**不得照抄 1.x 判据**。
+
+**Task 10 需按双 schema 重写**：注入识别（O-P2）与截断判据的取证、夹具、断言均分 v1 / v2 两条路径分别落（v1 夹具照 `get_last_message_info` 既有测试形态，v2 照 `get_last_message_info_v2` / `tail_signal_v2` 既有测试形态）。
+
+### 适配③ 各 parser Task 的 remote/content.rs 同步点（映射表）
+
+`src-tauri/src/remote/content.rs`（4103 行）内有与各 parser 判据同口径的**复制品**。凡本计划改动下列 parser 判据（message_origin / 注入识别口径）的 Task，**必须同批同步 content.rs 对应点**，否则详情页与看板口径漂移：
+
+| Task | parser 改动 | content.rs 同步点（d14aa8c 行号） |
+|---|---|---|
+| Task 3（zcode 注入识别） | `zcode_parser::flatten_entries` kind 白名单 | :536-550（user + todo_reminder/timeline_event 两 kind 跳过复制品，与 flatten_entries 同口径） |
+| Task 5（claude isMeta / 注入识别） | `claude_parser` | :950-958（isMeta 行跳过） |
+| Task 6（codex developer / 记账跳过） | `codex_parser` | :1210-1239（developer / 记账行跳过） |
+| Task 8（dsh 注入过滤） | dsh 模块 | :805-821、:922（source.kind=="user" 过滤，agent-instructions / plugin / skill-catalog 注入） |
+| Task 9（kimi skill 注入） | `kimi_parser` | :1527-1571（is_kimi_skill_injection：`<skill-loaded` 等标记跳过） |
+
+每个 Task 的「Files」清单执行时追加对应 content.rs 同步点 + 同口径测试。
+
+### 适配④ 并入项现状——teammate 完成信号已独立落地
+
+teammate 完成信号（甲.5 主判据）已随移动端子代理观察台独立落地：`src-tauri/src/monitor/subagents/claude.rs:383 teammate_idle_from`（`idle_notification` 标记 + `from` 提取，teammate_id 属性辅助）。该实现与本计划 Task 5 的注入识别 / 子代理活跃度链路**互补不冲突**：Task 5 执行时**不再重做** teammate 完成信号，只做计划内的 isMeta / 注入识别部分。
+
+### Task 2 推迟裁定（2026-10-18 用户裁定）
+
+Task 2（实机探测 5 项：WorkBuddy/OpenCode 注入落尾占比、dsh `parent_session` 可靠性、Codex 子代理抢占、Kimi v1.5+swarm、OpenClaw CPU 判据）**本轮推迟**。各 Task 判据沿用计划内既有实测证据（附录 A）。纪律：实现中若发现判据与 main 现状失配（形态漂移 / 字段改名 / 布局变更），**停下报告**，由用户裁决补探或改判据——不猜、不抄旧档。
+
+### 其他现状对齐
+
+- `codex_parser.rs` 已部分预占 Task 6（`<turn_aborted>` 判 TurnEnd、developer→Other 已落地）；剩余未做：environment_context 等 6 个前缀白名单 + 子代理 rollout 排除。
+- `app_status.rs` 已被 PR #70 加过 `tail_semantic_kind` / `turn_window_open`；Task 1 给 `DescendantActivity` 加 `Pending` 成员时，不得破坏既有 26 个测试。
+
+### 阶段执行顺序确认
+
+**A（Task 1-4）→ B（Task 5-7）→ C（Task 8-9）→ D（Task 10-11）**，每阶段独立 PR、可独立合并；后续阶段依赖 Task 1 共享层接口。与 2026-10-18 tracking 三批（PR-1/2/3）存在 `monitor/` 与 `remote/content.rs` 弱文件交集，建议三批先合、阶段 A 随后 rebase 起步。
