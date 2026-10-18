@@ -727,6 +727,7 @@
     "deactivatedFromSubagent": "Deactivated {{name}} from {{tool}}:{{subAgent}}",
     "collapseSubAgents": "Collapse sub-agents",
     "expandSubAgents": "Sub-agents ▼",
+    "presetSubagentEmpty": "No sub-agents detected",
     "apply": "Apply",
     "applyTo": "Apply preset to {{tool}}",
     "compatibleCount": "Compatible ({{n}})",

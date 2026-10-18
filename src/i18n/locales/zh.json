@@ -727,6 +727,7 @@
     "deactivatedFromSubagent": "已从 {{tool}}:{{subAgent}} 取消应用 {{name}}",
     "collapseSubAgents": "收起子 Agent",
     "expandSubAgents": "子 Agent ▼",
+    "presetSubagentEmpty": "未检测到子 Agent",
     "apply": "应用",
     "applyTo": "应用预设组到 {{tool}}",
     "compatibleCount": "兼容的资源 ({{n}})",
