@@ -1,71 +1,99 @@
 {
-  "_source": "OBSERVED 骨架（thread-stream-state-changed v11 broadcast，targeted at follower；Mac 探针 POC-2 实测 turns=[] 而 turnHistory 持有全部内容）+ SYNTHETIC 占位内容",
-  "type": "broadcast",
-  "method": "thread-stream-state-changed",
-  "version": 11,
-  "sourceClientId": "00000000-0000-4000-8000-00000000000a",
-  "targetClientIds": ["00000000-0000-4000-8000-0000000000t1"],
-  "params": {
-    "conversationId": "00000000-0000-4000-8000-0000000000m1",
-    "hostId": "local",
-    "change": {
-      "type": "snapshot",
-      "revision": 209,
-      "conversationState": {
-        "turns": [],
-        "threadRuntimeStatus": { "type": "idle", "duration_ms": 99771 },
-        "requests": [
+ "_source": "OBSERVED 形态（2026-10-18 金样 observed/：entries.value 引用、turnId 字段认领、无 type 字段、内联 camelCase items、isComplete 在 history 层）+ SYNTHETIC 占位内容；requests/threadRuntimeStatus 骨架沿用 Mac 探针 POC-2/POC-5 实测",
+ "type": "broadcast",
+ "method": "thread-stream-state-changed",
+ "version": 11,
+ "sourceClientId": "00000000-0000-4000-8000-00000000000a",
+ "targetClientIds": [
+  "00000000-0000-4000-8000-0000000000t1"
+ ],
+ "params": {
+  "conversationId": "00000000-0000-4000-8000-0000000000m1",
+  "hostId": "local",
+  "change": {
+   "type": "snapshot",
+   "revision": 209,
+   "conversationState": {
+    "turns": [],
+    "threadRuntimeStatus": {
+     "type": "idle",
+     "duration_ms": 99771
+    },
+    "requests": [
+     {
+      "id": 12,
+      "method": "item/permissions/requestApproval",
+      "params": {
+       "threadId": "00000000-0000-4000-8000-0000000000m1",
+       "turnId": "00000000-0000-4000-8000-0000000000tu1",
+       "itemId": "00000000-0000-4000-8000-0000000000it1",
+       "environmentId": "00000000-0000-4000-8000-0000000000en1",
+       "startedAtMs": 1760000000000,
+       "cwd": "/tmp/mac-ipc-probe",
+       "reason": "合成：写入探测目录",
+       "permissions": {
+        "network": null,
+        "fileSystem": {
+         "read": null,
+         "write": [
+          "/tmp/mac-ipc-probe"
+         ],
+         "entries": [
           {
-            "id": 12,
-            "method": "item/permissions/requestApproval",
-            "params": {
-              "threadId": "00000000-0000-4000-8000-0000000000m1",
-              "turnId": "00000000-0000-4000-8000-0000000000tu1",
-              "itemId": "00000000-0000-4000-8000-0000000000it1",
-              "environmentId": "00000000-0000-4000-8000-0000000000en1",
-              "startedAtMs": 1760000000000,
-              "cwd": "/tmp/mac-ipc-probe",
-              "reason": "合成：写入探测目录",
-              "permissions": {
-                "network": null,
-                "fileSystem": {
-                  "read": null,
-                  "write": ["/tmp/mac-ipc-probe"],
-                  "entries": [{ "type": "write", "path": "/tmp/mac-ipc-probe" }]
-                }
-              }
-            }
+           "type": "write",
+           "path": "/tmp/mac-ipc-probe"
           }
-        ],
-        "turnHistory": {
-          "isComplete": true,
-          "history": {
-            "entitiesByKey": {
-              "turn-1": {
-                "id": "turn-1",
-                "type": "turn",
-                "status": "completed",
-                "items": ["itm-u1", "itm-a1"]
-              },
-              "itm-u1": {
-                "id": "itm-u1",
-                "type": "user_message",
-                "text": "合成：请回复 TUVis macOS IPC probe OK",
-                "ts": 1760000000000
-              },
-              "itm-a1": {
-                "id": "itm-a1",
-                "type": "agent_message",
-                "text": "TUVis macOS IPC probe OK",
-                "ts": 1760000010000
-              }
-            },
-            "islands": [
-              { "entries": ["turn-1"], "exhausted": true }
-            ]
-          }
+         ]
         }
+       }
       }
+     }
+    ],
+    "turnHistory": {
+     "kind": "canonical",
+     "history": {
+      "generation": 0,
+      "isComplete": true,
+      "entitiesByKey": {
+       "turn:00000000-0000-4000-8000-0000000000tu1": {
+        "turnId": "00000000-0000-4000-8000-0000000000tu1",
+        "status": "completed",
+        "rootTurnId": "00000000-0000-4000-8000-0000000000tu1",
+        "items": [
+         {
+          "type": "userMessage",
+          "id": "00000000-0000-4000-8000-0000000000it1",
+          "content": [
+           {
+            "type": "text",
+            "text": "合成：请回复 TUVis macOS IPC probe OK",
+            "text_elements": []
+           }
+          ]
+         },
+         {
+          "type": "agentMessage",
+          "id": "00000000-0000-4000-8000-0000000000it2",
+          "text": "TUVis macOS IPC probe OK"
+         }
+        ]
+       }
+      },
+      "islands": [
+       {
+        "id": "isl-tu1",
+        "exhausted": true,
+        "entries": [
+         {
+          "key": "turn:00000000-0000-4000-8000-0000000000tu1",
+          "value": "turn:00000000-0000-4000-8000-0000000000tu1"
+         }
+        ]
+       }
+      ]
+     }
     }
+   }
   }
+ }
 }
