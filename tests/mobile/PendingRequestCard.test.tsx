@@ -395,6 +395,68 @@ describe("PendingRequestCard：unsupported / 禁写 / 回执分诊", () => {
   });
 });
 
+// ============================================================
+// C5 白名单补口（2026-10-19 复审）：POST /codex/pending-response **登记前**的
+// 确定性拒绝码（答案限额五码 + action_mismatch）必须落「可重试错误」臂——
+// 显示错误、ID 让位解锁、**绝不**进 unknown 核对臂（fetchCodexAction 必 404，
+// 误入即永久锁卡）。
+// ============================================================
+describe("PendingRequestCard：投递前确定性拒绝（C5 白名单）", () => {
+  async function flushAsync() {
+    for (let i = 0; i < 6; i += 1) {
+      await act(async () => {
+        await Promise.resolve();
+      });
+    }
+  }
+
+  function postBodies(): Record<string, unknown>[] {
+    return fetchMock.mock.calls
+      .filter(([u]) => String(u).includes("/codex/pending-response"))
+      .map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>);
+  }
+
+  function actionQueryCount(): number {
+    return fetchMock.mock.calls.filter(([u]) => String(u).includes("/codex/action")).length;
+  }
+
+  it("validate_answers_400_is_retryable_error_not_unknown_lock：empty_answers 400 → 错误底注 + 解锁，不进核对臂", async () => {
+    installFetch();
+    routes.respondStatus = 400;
+    routes.respondBody = { error: "empty_answers" };
+    render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    fireEvent.click(screen.getByTestId("codex-pending-approve"));
+    const note = await screen.findByTestId("codex-pending-note");
+    // 确定性拒绝 = 可重试错误（不是「投递结果未知」）
+    expect(note.textContent).toContain("应答失败");
+    expect(note.textContent).not.toContain("投递结果未知");
+    // ID 让位：按钮解锁（再按 = 新 actionId，零投递上重试安全）
+    expect((screen.getByTestId("codex-pending-approve") as HTMLButtonElement).disabled).toBe(false);
+    // 绝不进 unknown 核对臂：零次 GET /codex/action，且再等微任务也不补查
+    expect(actionQueryCount()).toBe(0);
+    await flushAsync();
+    expect(actionQueryCount()).toBe(0);
+    expect(postBodies()).toHaveLength(1);
+  });
+
+  it("action_mismatch_409_falls_through_to_pre_delivery_arm：409 action_mismatch → 同走投递前拒绝臂", async () => {
+    installFetch();
+    // 409 但不是 stale_context/action_conflict（那两码由专用臂处理）——
+    // action_mismatch 必须穿过 409 臂落进 C5 白名单臂
+    routes.respondStatus = 409;
+    routes.respondBody = { error: "action_mismatch" };
+    render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    fireEvent.click(screen.getByTestId("codex-pending-approve"));
+    const note = await screen.findByTestId("codex-pending-note");
+    expect(note.textContent).toContain("应答失败");
+    expect(note.textContent).not.toContain("投递结果未知");
+    expect((screen.getByTestId("codex-pending-reject") as HTMLButtonElement).disabled).toBe(false);
+    expect(actionQueryCount()).toBe(0);
+    await flushAsync();
+    expect(actionQueryCount()).toBe(0);
+  });
+});
+
 describe("CodexAvailabilityBanner：四档能力按服务端渲染", () => {
   it("availability_labels_zh：四档各自渲染服务端下发的档位文案", () => {
     const { container } = render(

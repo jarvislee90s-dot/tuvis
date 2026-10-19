@@ -131,7 +131,21 @@ function actionViewToReceipt(
 /** C5：**可靠的投递前拒绝**判定——只有我方机器码错误体能认定零投递、ID 让位
  *  解锁再按（新动作）；其余一切（5xx/代理错误/畸形响应体）与无响应同：提交结果
  *  未知，保留同 ID 只读核对（S5：代理可在服务端已处理后返回 504，新 ID 重按 =
- *  双投窗口）。 */
+ *  双投窗口）。
+ *
+ *  码单来源 = POST /codex/pending-response **登记前**的确定性拒绝（零投递）：
+ *  - 请求体 malformed / deny_unknown_fields / 必填字段缺失（400 bad_request）；
+ *  - 答案限额校验（validate_answers：empty_answers / too_many_questions /
+ *    too_many_answers / answer_too_long / answers_too_large——全在登记前拒绝，
+ *    2026-10-19 复审补入：缺了会被误归「结果未知」→ fetchCodexAction 必 404 →
+ *    永久锁卡，而真实语义是「可重试的确定性拒绝」）；
+ *  - 动作词与 pending 类别不相容（409 action_mismatch——登记前复核，同上补入）；
+ *  - 登记后、派发前的校验拒绝（answers_mismatch / answer_not_option / invalid_id）；
+ *  - 设备门禁（403）/ 会话不在快照（404）。
+ *
+ *  `no_action` 是防御位：该码只有 GET /codex/action（查询面）会发，
+ *  POST /codex/pending-response 不会——留着防未来端点复用该码时静默漏进
+ *  「结果未知」臂（多算一位只多一次解锁误判面，漏算才是锁卡事故）。 */
 const PRE_DELIVERY_ERROR_CODES = new Set([
   "bad_request", // malformed / deny_unknown_fields（登记前拒绝）
   "answers_mismatch", // 答案限额校验（登记前拒绝）
@@ -139,7 +153,13 @@ const PRE_DELIVERY_ERROR_CODES = new Set([
   "invalid_id",
   "forbidden", // 设备门禁（gate 层，登记前拒绝）
   "no_session", // 会话不在快照（无任何投递）
-  "no_action", // 动作不存在（他人/已清除）
+  "no_action", // 防御位：仅 GET /codex/action 会发（见上方块注释）
+  "empty_answers", // ↓ validate_answers 五码：答案限额（登记前拒绝）
+  "too_many_questions",
+  "too_many_answers",
+  "answer_too_long",
+  "answers_too_large",
+  "action_mismatch", // 动作词与 pending 类别不相容（409，登记前复核）
 ]);
 
 function isPreDeliveryRefusal(e: ApiError): boolean {
