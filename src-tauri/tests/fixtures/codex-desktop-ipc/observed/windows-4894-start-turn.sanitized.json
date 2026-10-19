@@ -1,0 +1,49 @@
+{
+  "_source": "2026-10-19 Windows 26.1013.4894.0 实机 thread-follower-start-turn v2（ID/正文已占位化）",
+  "request": {
+    "type": "request",
+    "requestId": "00000000-0000-4000-8000-000000000001",
+    "method": "thread-follower-start-turn",
+    "params": {
+      "conversationId": "00000000-0000-4000-8000-000000000002",
+      "turnStart": {
+        "request": {
+          "threadId": "00000000-0000-4000-8000-000000000002",
+          "input": [
+            {
+              "type": "text",
+              "text": "Synthetic user prompt",
+              "text_elements": []
+            }
+          ],
+          "clientUserMessageId": "00000000-0000-4000-8000-000000000003"
+        },
+        "context": {}
+      }
+    },
+    "version": 2,
+    "targetClientId": "00000000-0000-4000-8000-000000000004"
+  },
+  "response": {
+    "type": "response",
+    "requestId": "00000000-0000-4000-8000-000000000001",
+    "resultType": "success",
+    "method": "thread-follower-start-turn",
+    "handledByClientId": "00000000-0000-4000-8000-000000000004",
+    "result": {
+      "result": {
+        "turn": {
+          "id": "00000000-0000-4000-8000-000000000005",
+          "rootTurnId": "00000000-0000-4000-8000-000000000005",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": null,
+          "completedAt": null,
+          "durationMs": null
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "_source": "2026-10-19 Windows 26.1013.4894.0 实机 thread-follower-command-approval-decision（ID/正文已占位化）",
+  "pendingRequest": {
+    "method": "item/commandExecution/requestApproval",
+    "id": 62,
+    "params": {
+      "kind": "command",
+      "threadId": "00000000-0000-4000-8000-000000000001",
+      "turnId": "00000000-0000-4000-8000-000000000002",
+      "itemId": "exec-000000000003",
+      "startedAtMs": 1792408634972,
+      "environmentId": "local",
+      "reason": "<redacted>",
+      "command": "<synthetic command>",
+      "cwd": "C:\\Temp\\probe-project",
+      "commandActions": [
+        {
+          "type": "unknown",
+          "command": "<synthetic command>"
+        }
+      ],
+      "proposedExecpolicyAmendment": [
+        "<synthetic command>",
+        "<synthetic command>",
+        "<synthetic command>"
+      ],
+      "availableDecisions": [
+        "accept",
+        {
+          "acceptWithExecpolicyAmendment": {
+            "execpolicy_amendment": [
+              "<synthetic command>",
+              "<synthetic command>",
+              "<synthetic command>"
+            ]
+          }
+        },
+        "cancel"
+      ]
+    }
+  },
+  "request": {
+    "type": "request",
+    "requestId": "00000000-0000-4000-8000-000000000004",
+    "method": "thread-follower-command-approval-decision",
+    "params": {
+      "conversationId": "00000000-0000-4000-8000-000000000001",
+      "requestId": 62,
+      "decision": "decline"
+    },
+    "version": 1,
+    "targetClientId": "00000000-0000-4000-8000-000000000005"
+  },
+  "response": {
+    "type": "response",
+    "requestId": "00000000-0000-4000-8000-000000000006",
+    "resultType": "success",
+    "method": "thread-follower-command-approval-decision",
+    "handledByClientId": "00000000-0000-4000-8000-000000000005",
+    "result": {
+      "ok": true
+    }
+  }
+}

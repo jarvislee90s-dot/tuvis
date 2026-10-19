@@ -38,3 +38,21 @@
 **写方法实证回执**（turn 成功创建 inProgress）——profile 表 `("macos","26.1013.40934")`
 的 send=true 证据链（state=true 由复审只读探针 + 本仓集成闭环背书）；
 permissions/command/blocking_input 未实测保持 false。
+
+## Windows 4894.0 实机金样（2026-10-19 探测批）
+
+来源：受控探针 prodprobe3 直连 `\.\pipe\codex-ipc`（真实 ChatGPT.exe 管道服务端）。与
+macOS 金样 5 条事实**同构**（T2 逐项核对全 ✓，含 `tail:0:local:` 键尾 UUID ≠ 实体 turnId
+的活体样本）。采集与脱敏报告：仓外 `tuvis-verify-logs/2026-10-19-4894/results.md`。
+
+| 文件 | 说明 |
+| --- | --- |
+| `windows-4894-snapshot.sanitized.json` | rev3 全量 snapshot：10 turn（`turn:` 键）/ 28 msg，item 含 userMessage/agentMessage/commandExecution/reasoning；`history.isComplete` 在 history 层、`itemsPagination` 逐 turn 在场 |
+| `windows-4894-start-turn.sanitized.json` | start-turn v2 请求 + success 回执（`turn.itemsView:"notLoaded"`）；请求侧 `input` 数组被接受，Desktop 侧补写 cwd/approvalPolicy/sandboxPolicy/collaborationMode/model 等 |
+| `windows-4894-command-approval-accept.sanitized.json` | `item/commandExecution/requestApproval` + decision `accept` + `{"ok":true}`；`availableDecisions` 不含 `decline` 字面量（decision:"decline" 仍被接受并生效） |
+| `windows-4894-command-approval-decline.sanitized.json` | decline 轮，同构 |
+| `windows-4894-plan-input.sanitized.json` | `/plan` 会话的 `item/tool/requestUserInput`（**整数 id**）+ `thread-follower-submit-user-input` 作答 + `{"ok":true}` |
+
+同批已知边界（如实登记）：permissions 请求在该 build 的读场景 NOT_TRIGGERED（外部读取升权
+走 command approval）；空会话不落 session（真空首帧无样本）；忙态 start-turn 返回 success
+但新 prompt 不落 Turn（生产忙态屏障必需，不能把写回执当投递成功）。

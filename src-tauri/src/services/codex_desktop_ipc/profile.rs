@@ -75,14 +75,8 @@ fn method_table() -> BTreeMap<String, u32> {
 /// Windows 基线（精确 build `26.1013.3656.0`）：command accept/decline 与 Plan
 /// blocking input 在 **Windows Probe**（2026-10-16 探测批；spec「已验证版本」表登记
 /// 的 Windows build 正是 3656.0）实测 PASS，permissions 未实测 → false。
-///
-/// **`26.1013.4894.0` 有意不登记**（fail-closed）：2026-10-17 实机取证
-/// （`docs/superpowers/reviews/2026-10-17-codex-desktop-ipc-windows-validation-results.md`
-/// §2/§5-F1）真机 MSIX 包版本为 4894.0——transport/windows.rs 改读 MSIX 后装该包的
-/// 机器 `resolve()` 取到 4894.0，`profile_for` **不命中** → closed()（该机器 A 写保守
-/// 关闭）。该 build 的真机闭环属「第二批」，至今 NOT_TRIGGERED，仓内**没有任何
-/// 4894.0 的 PASS 证据**，故只修正注释、不补登记；如何验证新 build 待用户裁决，
-/// 绝不因证据链对齐而顺手放宽版本门。
+/// `26.1013.4894.0` 已于 2026-10-19 真机探测批凭自有证据单独登记（见
+/// [`windows_4894_profile`]），不与 3656.0 共用证据链。
 fn windows_profile(build: &str) -> ProtocolProfile {
     ProtocolProfile {
         platform: "windows".to_string(),
@@ -135,10 +129,36 @@ fn macos_40934_profile(build: &str) -> ProtocolProfile {
     }
 }
 
+/// Windows `26.1013.4894.0`（2026-10-19 真机探测批登记）：受控探针 prodprobe3 直连
+/// 真实 ChatGPT.exe 管道全链取证——只读协议往返（T1）、start-turn v2 创建 Turn 至
+/// completed（T4）、command approval accept/decline 双臂 + 文件落盘/未落盘（T6）、
+/// `/plan` 阻塞 requestUserInput 原 id 作答（T8）、Desktop 重启恢复（T9，owner 换代、
+/// 旧 epoch 帧未复用）；金样 5 条事实与 macOS 同构（T2）。**permissions 保持 false**：
+/// T7 NOT_AVAILABLE——本 build 的读升权实际走 command approval，未出现
+/// `item/permissions/requestApproval`，无证据不开。`method_versions` 无漂移。
+/// 证据：脱敏夹具 `tests/fixtures/codex-desktop-ipc/observed/windows-4894-*.sanitized.json`
+/// 与仓外报告 `tuvis-verify-logs/2026-10-19-4894/results.md`（能力×证据矩阵 §3、
+/// 版本核对表 §3）。
+fn windows_4894_profile(build: &str) -> ProtocolProfile {
+    ProtocolProfile {
+        platform: "windows".to_string(),
+        build: build.to_string(),
+        capabilities: CapabilitySet {
+            send: true,
+            state: true,
+            command: true,
+            permissions: false,
+            blocking_input: true,
+        },
+        method_versions: method_table(),
+    }
+}
+
 /// 精确 build 匹配（不是版本下限——升级后的 build 未经验证必须重新门控）。
 pub fn profile_for(platform: &str, build: &str) -> Option<ProtocolProfile> {
     match (platform, build) {
         ("windows", "26.1013.3656.0") => Some(windows_profile(build)),
+        ("windows", "26.1013.4894.0") => Some(windows_4894_profile(build)),
         ("macos", "26.1013.31256") => Some(macos_profile(build)),
         ("macos", "26.1013.40934") => Some(macos_40934_profile(build)),
         _ => None,
@@ -179,9 +199,14 @@ mod tests {
         assert!(!p.capabilities.command);
         assert!(!p.capabilities.blocking_input);
         assert!(profile_for("windows", "26.1013.3655.0").is_none());
-        // 4894.0 = 2026-10-17 实机 MSIX 取证值（见 windows_profile 文档）：
-        // 无真机闭环 PASS 证据，fail-closed 不登记——钉死「不因证据链对齐而顺手放宽」
-        assert!(profile_for("windows", "26.1013.4894.0").is_none());
+        // 4894.0 = 2026-10-19 真机探测批登记（T1/T4/T6/T8/T9 PASS + T2 同构；证据 =
+        // observed/windows-4894-*.sanitized.json）：caps 逐项钉死，permissions 无证据保持关
+        let p4894 = profile_for("windows", "26.1013.4894.0").expect("registered");
+        assert!(p4894.capabilities.send && p4894.capabilities.state);
+        assert!(p4894.capabilities.command && p4894.capabilities.blocking_input);
+        assert!(!p4894.capabilities.permissions);
+        // 未探测的相邻 build 仍然 fail-closed（精确门，不是版本下限）
+        assert!(profile_for("windows", "26.1013.4895.0").is_none());
         assert!(profile_for("linux", "26.1013.31256").is_none());
         assert!(profile_for("macos", "").is_none());
         // 已验证 build 精确命中
@@ -233,6 +258,13 @@ mod tests {
         assert!(win.capabilities.command);
         assert!(win.capabilities.blocking_input);
         assert!(!win.capabilities.permissions);
+
+        let win4894 = profile_for("windows", "26.1013.4894.0").unwrap();
+        assert!(win4894.capabilities.send);
+        assert!(win4894.capabilities.state);
+        assert!(win4894.capabilities.command);
+        assert!(win4894.capabilities.blocking_input);
+        assert!(!win4894.capabilities.permissions);
     }
 
     #[test]
