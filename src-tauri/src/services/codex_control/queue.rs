@@ -165,12 +165,18 @@ fn db_err(e: rusqlite::Error) -> StoreError {
 impl ActionStore {
     /// 构造并执行启动恢复：reserved → unknown（writer 已接手而进程消失 = 投递结果
     /// 未知，绝不回 queued）；queued 行不受影响，仍按序可发。
+    /// PR #165 复审 Important：启动恢复时同跑一轮终态行保留清理（墓碑化，批量分批，
+    /// 快 SQL；超期存量由后续周期对账逐轮收敛）。
     pub fn new(store: DeviceStore) -> Self {
         let s = Self { store };
         match s.recover_reserved() {
             Ok(0) => {}
             Ok(n) => log::warn!("codex_actions: 启动恢复 {n} 条 reserved 动作为 unknown"),
             Err(e) => log::error!("codex_actions: 启动恢复失败: {e}"),
+        }
+        let tombstoned = s.tombstone_expired_terminal();
+        if tombstoned > 0 {
+            log::info!("codex_actions: 启动墓碑化 {tombstoned} 条超期终态行（行保留，重载荷清空）");
         }
         s
     }
@@ -525,6 +531,34 @@ impl ActionStore {
     /// unfollow 挤出）。
     pub fn thread_has_pending_work(&self, key: &ThreadKey) -> Result<bool, StoreError> {
         self.with(|c| dao::thread_has_pending_work_conn(c, &key.thread_id).map_err(db_err))
+    }
+
+    /// 终态行保留期（PR #165 复审 Important）：超过此时长的终态行（accepted/rejected/
+    /// cancelled 且无屏障在册）在下一轮清理中被墓碑化（重载荷置 NULL、**绝不删行**，
+    /// actionId 重放幂等由 payload_hash/状态列保全）。state='unknown' 行持有屏障
+    /// 语义，永不清理。
+    pub(crate) const TERMINAL_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+    /// 墓碑化单批上限（周期对账每轮一批，快 SQL 不阻塞；超期存量逐轮收敛）。
+    const TOMBSTONE_BATCH: i64 = 500;
+
+    /// 墓碑化超期终态行（启动恢复 + 周期对账各触发一轮；语义见
+    /// [`dao::tombstone_expired_terminal_conn`]）。维护性质尽力而为：失败只记日志
+    /// 返回 0，绝不阻塞调用方。
+    pub fn tombstone_expired_terminal(&self) -> usize {
+        self.with(|c| {
+            dao::tombstone_expired_terminal_conn(
+                c,
+                Self::TERMINAL_RETENTION_MS,
+                now_ms(),
+                Self::TOMBSTONE_BATCH,
+            )
+            .map_err(db_err)
+        })
+        .unwrap_or_else(|e| {
+            log::error!("codex_actions: 终态行墓碑化失败（原样保留，下轮再试）: {e}");
+            0
+        })
     }
 
     /// R6.3：全部 Turn 顺序绑定行（`Router::new` 重启重建内存限制的输入）。

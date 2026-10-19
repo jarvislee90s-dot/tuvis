@@ -2057,3 +2057,65 @@ async fn send_returns_queued_while_fallback_permit_outstanding() {
     assert_eq!(h.route_of("f2"), "headless_compat");
     assert!(h.store.next_queued(&h.key).unwrap().is_none(), "队列已空");
 }
+
+/// 事项②（复审 Important）：超期终态行被启动墓碑化——重载荷置 NULL 但**行保留**；
+/// actionId 重放（同载荷）经 payload_hash 幂等比对命中既有终态：如实返回 accepted
+///（receipt_missing 合成口径），绝不回 queued、绝不重派发。
+#[tokio::test]
+async fn tombstoned_terminal_replay_stays_terminal() {
+    let h = harness();
+    // 真实生命周期造 accepted 行（finish_with_turn_barrier 在册屏障 → 终态证据释放清屏障）
+    let outcome = h
+        .router
+        .send(h.ctx("t-old", ActionKind::Send), "老消息".into(), false)
+        .await;
+    assert_eq!(completed(outcome).delivery, Delivery::Accepted);
+    h.dispatch.set_terminal_turn("turn-1");
+    assert!(h
+        .router
+        .release_turn_if_complete(&h.key, &minimal_projection(THREAD, "idle")));
+    // 手工把行推到保留期之外（updated_at 改老）
+    {
+        let conn = h.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE codex_actions SET updated_at = 1000 WHERE action_id = 't-old'",
+            [],
+        )
+        .unwrap();
+    }
+    // 新一轮「启动」：ActionStore::new 构造即墓碑化
+    let store2 = Arc::new(ActionStore::new(DeviceStore::Owned(h.conn.clone())));
+    {
+        let conn = h.conn.lock().unwrap();
+        let receipt: Option<String> = conn
+            .query_row(
+                "SELECT receipt_json FROM codex_actions WHERE action_id = 't-old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt, None, "回执重载荷已被墓碑化");
+    }
+    assert_eq!(
+        store2
+            .get_for_device("t-old", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Accepted,
+        "墓碑行保留（不删行，状态列保全）"
+    );
+    // 重放：同 actionId 同载荷 → 幂等命中既有终态，不回 queued、不重派发
+    let router2 = CodexControlRouter::new(store2, h.dispatch.clone());
+    let outcome = router2
+        .send(h.ctx("t-old", ActionKind::Send), "老消息".into(), false)
+        .await;
+    let receipt = completed(outcome);
+    assert_eq!(
+        receipt.delivery,
+        Delivery::Accepted,
+        "墓碑行重放仍返回既有终态"
+    );
+    assert_eq!(receipt.reason_code.as_deref(), Some("receipt_missing"));
+    assert_eq!(h.dispatch.send_count(), 1, "绝不重派发");
+}
