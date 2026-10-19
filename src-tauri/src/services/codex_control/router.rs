@@ -529,7 +529,15 @@ impl CodexControlRouter {
         if queue_only {
             return queued_outcome(&ctx.action_id, &view);
         }
-        let guard = self.lock_arc(&ctx.key).lock_owned().await;
+        // PR #165 复审 Important：新 send 撞上**在飞派发/兜底**（guard 由 FallbackPermit
+        // 持到兜底回合落账（分钟级）/ A 路落账（RPC 15s 级））→ try-lock 拿不到立即返回
+        // Queued，不再挂起本 thread 新 send 的 HTTP 响应。消息此刻已 register 成 queued
+        //（持久在账，position 用既有队列视图），接力交给调度循环（事件 + 周期 tick 已兜住，
+        // 与 flush_thread 的 try-lock 让路口径一致）。仅改「新 send 撞在飞派发」这一条
+        // 路径；上方在途重放（Reserved 态）的处理逻辑不动。
+        let Ok(guard) = self.lock_arc(&ctx.key).try_lock_owned() else {
+            return queued_outcome(&ctx.action_id, &view);
+        };
         // 兼容 fence 在册（前一条兜底未核对完成 / R6.3 Turn 顺序绑定持久槽）→ 只排队
         if self.store.has_compat_fence(&ctx.key).unwrap_or(true) {
             return queued_outcome(&ctx.action_id, &view);
@@ -927,7 +935,9 @@ fn conflict_completed(action_id: &str) -> RouterOutcome {
     RouterOutcome::Completed(r)
 }
 
-/// 终态重放：账本既有回执（cancelled 无回执 → 合成取消回执）
+/// 终态重放：账本既有回执（cancelled 无回执 → 合成取消回执；墓碑行——保留清理已把
+/// receipt_json 置 NULL——按既有 state 如实合成对应投递，仍返回**既有终态**，绝不回
+/// queued、绝不重派发）
 fn completed_stored(action_id: &str, view: &super::CodexActionView) -> RouterOutcome {
     if let Some(receipt) = &view.receipt {
         return RouterOutcome::Completed(receipt.clone());
@@ -935,10 +945,16 @@ fn completed_stored(action_id: &str, view: &super::CodexActionView) -> RouterOut
     if view.state == ActionState::Cancelled {
         return not_sent_completed(action_id, "action_cancelled");
     }
-    // 防御：无回执的非取消终态（不应出现）按 unknown 口径如实返回
+    // 墓碑行 / 防御形态（非取消终态但无回执）：按既有终态合成投递口径——accepted/
+    // rejected 如实保留，unknown 保持 unknown；reason 标记 receipt_missing 供区分
+    let delivery = match view.state {
+        ActionState::Accepted => Delivery::Accepted,
+        ActionState::Rejected => Delivery::Rejected,
+        _ => Delivery::UnknownDelivery,
+    };
     RouterOutcome::Completed(ActionReceipt {
         action_id: action_id.to_string(),
-        delivery: Delivery::UnknownDelivery,
+        delivery,
         route: ControlRoute::None,
         turn_id: None,
         envelope_id: None,

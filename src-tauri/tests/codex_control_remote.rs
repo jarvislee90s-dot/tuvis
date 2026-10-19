@@ -68,6 +68,9 @@ struct FakeDispatch {
     sends: Mutex<Vec<SendRecord>>,
     responds: Mutex<Vec<(ThreadKey, String, String)>>,
     terminal_turns: Mutex<std::collections::HashSet<String>>,
+    /// 派发门（PR #165 事项①测试）：Some = send_text 在门打开前挂起（模拟分钟级/
+    /// RPC 级在飞派发，guard 由其持有），None = 立即返回。
+    send_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl FakeDispatch {
@@ -79,6 +82,7 @@ impl FakeDispatch {
             sends: Mutex::new(Vec::new()),
             responds: Mutex::new(Vec::new()),
             terminal_turns: Mutex::new(std::collections::HashSet::new()),
+            send_gate: Mutex::new(None),
         }
     }
 
@@ -111,6 +115,27 @@ impl FakeDispatch {
             reason_code: Some(reason.into()),
             revision: None,
         })
+    }
+
+    /// Accepted + 派发门：send_text 在 [`Self::release_send`] 前挂起——模拟「A 路派发
+    /// 在飞（guard 由 T1 的 send 持到落账）」的慢派发形态（PR #165 事项①）。
+    fn accepted_gated(gate: Arc<tokio::sync::Notify>) -> Self {
+        let d = Self::accepted();
+        *d.send_gate.lock().unwrap() = Some(gate);
+        d
+    }
+
+    /// 开门放行所有挂起中的 send_text
+    fn release_send(&self) {
+        if let Some(g) = self.send_gate.lock().unwrap().as_ref() {
+            g.notify_one();
+        }
+    }
+
+    /// 撤门：后续 send_text 立即返回（接力阶段恢复正常派发——门只模拟第一次在飞，
+    /// 否则接力的第二个派发会再次撞门挂起）
+    fn disarm_send(&self) {
+        *self.send_gate.lock().unwrap() = None;
     }
 
     fn set_busy(&self, b: bool) {
@@ -171,7 +196,13 @@ impl DesktopDispatch for FakeDispatch {
             composed: composed.to_string(),
         });
         let out = self.send_outcome.lock().unwrap().clone();
-        Box::pin(async move { out })
+        let gate = self.send_gate.lock().unwrap().clone();
+        Box::pin(async move {
+            if let Some(g) = gate {
+                g.notified().await;
+            }
+            out
+        })
     }
 
     fn respond(
@@ -1881,4 +1912,148 @@ async fn force_release_rejects_queued_rows() {
     }
     // 动作保持 queued 可撤（撤回路径不受影响）
     assert!(h.store.retract("fc-q", "dev-1").expect("retract"));
+}
+
+// ============================================================
+// PR #165 复审三项修复
+// ============================================================
+
+/// 事项①（复审 Important）：T1 派发在飞（慢派发挂起，Thread guard 由 T1 持到落账）
+/// 时，同 thread 新 send（T2）**立即**返回 Queued（HTTP 响应不阻塞），行在账排队；
+/// T1 落账并释放 Turn 屏障后 T2 被调度循环同款流程（release → flush_thread）接力。
+/// 改前 T2 会挂在 `lock_owned().await` 直到 T1 落账（分钟级）。
+#[tokio::test]
+async fn send_returns_queued_immediately_while_dispatch_in_flight() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let h = harness_with(FakeDispatch::accepted_gated(gate.clone()));
+    let Harness {
+        store,
+        dispatch,
+        router,
+        key,
+        ..
+    } = h;
+    let router = Arc::new(router);
+
+    // T1：队首 send——进入 A 路独立派发任务后在慢派发内挂起
+    let ctx1 = ActionContext {
+        action_id: "t1".into(),
+        device_id: "dev-1".into(),
+        device_name: "iPhone".into(),
+        kind: ActionKind::Send,
+        key: key.clone(),
+    };
+    let r1 = {
+        let router = router.clone();
+        tokio::spawn(async move { router.send(ctx1, "first".into(), false).await })
+    };
+    wait_for_state_for(&store, "t1", ActionState::Reserved).await;
+
+    // T2：新 send 撞在飞派发——必须立即返回 Queued，不等待 T1 落账
+    let ctx2 = ActionContext {
+        action_id: "t2".into(),
+        device_id: "dev-1".into(),
+        device_name: "iPhone".into(),
+        kind: ActionKind::Send,
+        key: key.clone(),
+    };
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        router.send(ctx2, "second".into(), false),
+    )
+    .await
+    .expect("T2 send 不得被在飞派发阻塞（改前此处超时）");
+    let (aid2, pos) = queued(outcome);
+    assert_eq!(aid2, "t2");
+    assert_eq!(
+        pos, 1,
+        "position 用既有队列视图（T1 已 reserved 出队，T2 是唯一 queued 行）"
+    );
+    assert_eq!(
+        store.get_for_device("t2", "dev-1").unwrap().unwrap().state,
+        ActionState::Queued,
+        "T2 行在账排队"
+    );
+
+    // 开门放行 T1 → A 路落账 accepted（guard 随 send 返回释放）
+    dispatch.release_send();
+    let receipt1 = completed(r1.await.unwrap());
+    assert_eq!(receipt1.delivery, Delivery::Accepted);
+    assert_eq!(
+        store.get_for_device("t1", "dev-1").unwrap().unwrap().state,
+        ActionState::Accepted
+    );
+
+    // 接力（调度循环同款流程）：Turn 终态证据 → release → flush_thread 派 T2
+    dispatch.set_terminal_turn("turn-1");
+    dispatch.disarm_send();
+    assert!(
+        router.release_turn_if_complete(&key, &minimal_projection(THREAD, "idle")),
+        "T1 的 Turn 屏障经终态证据释放"
+    );
+    let receipt2 = completed(router.flush_thread(&key).await.expect("T2 被接力"));
+    assert_eq!(receipt2.delivery, Delivery::Accepted);
+    assert_eq!(
+        store.get_for_device("t2", "dev-1").unwrap().unwrap().state,
+        ActionState::Accepted
+    );
+    assert_eq!(dispatch.send_count(), 2, "T2 恰好一次真派发");
+}
+
+/// 轮询等待动作到达指定状态（当前线程运行时下，await 让 spawned 任务推进）。
+async fn wait_for_state_for(store: &Arc<ActionStore>, action_id: &str, want: ActionState) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if store
+            .get_for_device(action_id, "dev-1")
+            .unwrap()
+            .is_some_and(|v| v.state == want)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待 {action_id} → {want:?} 超时"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// 事项①（兜底形态）：兜底 permit 在外（guard 随 permit 移入 detached bridge，
+/// 分钟级）时，同 thread 新 send 同样立即返回 Queued；兜底落账后 flush_thread 接力。
+#[tokio::test]
+async fn send_returns_queued_while_fallback_permit_outstanding() {
+    let h = harness_with(FakeDispatch::not_sent("ipc_disconnected"));
+    // f1 走兜底：permit 在外（guard 被其持有）
+    let permit = use_fallback(
+        h.router
+            .send(h.ctx("f1", ActionKind::Send), "first".into(), false)
+            .await,
+    );
+    // f2：新 send 立即排队（改前挂在 lock_owned().await 直到 permit 落账）
+    let started = std::time::Instant::now();
+    let outcome = h
+        .router
+        .send(h.ctx("f2", ActionKind::Send), "second".into(), false)
+        .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "f2 send 不得被在飞兜底阻塞"
+    );
+    let (aid, pos) = queued(outcome);
+    assert_eq!(aid, "f2");
+    assert_eq!(pos, 1, "f1 已 handoff 出队，f2 是唯一 queued 行");
+    assert_eq!(h.state_of("f2"), ActionState::Queued, "f2 行在账排队");
+
+    // 兜底落账（guard 释放）→ flush_thread 接力 f2
+    permit
+        .finish(accepted_compat_receipt("f1"))
+        .expect("兜底落账");
+    assert_eq!(h.state_of("f1"), ActionState::Accepted);
+    let out = h.router.flush_thread(&h.key).await.expect("f2 被接力");
+    // f2 走到兜底交接（A 路仍 not_sent）= 已被取走派发，不再留队
+    let _permit2 = use_fallback(out);
+    assert_eq!(h.state_of("f2"), ActionState::Reserved);
+    assert_eq!(h.route_of("f2"), "headless_compat");
+    assert!(h.store.next_queued(&h.key).unwrap().is_none(), "队列已空");
 }
