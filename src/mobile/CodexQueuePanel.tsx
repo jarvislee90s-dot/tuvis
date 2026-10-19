@@ -7,6 +7,11 @@
 //   撤回成功；404（不存在/他人动作）→ 重拉对账；
 // - blockedReasonCode 非空（如 compat_outstanding）= 队列暂停派发：说明条可见，
 //  不让用户盲等（types.rs CodexQueueView 的字段注释即本条契约）；
+// - **人工解除无出口屏障（2026-10-19 复审 Important）**：native_delivery_unknown /
+//   compat_outstanding 两类无自动恢复路径的屏障，提供「已到桌面端核对，继续队列」
+//   按钮——**两步确认**（未确认不发任何请求；文案如实披露重复内容风险）后逐个
+//   解除 blockedActionIds 并重拉；失败显示错误不静默。native_turn_pending 有自动
+//   恢复路径（Turn 终态证据驱动），不提供该按钮；
 // - **不提供插队**：本面板没有「立即发送/跳到队首」语义（宪法 R2.3 忙态留队、
 //   FIFO 按序，任何插队入口都是越权）——cancelled/终态条目也不出现重试按钮
 //   （重投 = 同 actionId 双投风险，绝不自动）；
@@ -19,6 +24,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import i18n from "@/i18n";
 import {
   fetchCodexQueue,
+  forceContinueCodexAction,
   retractCodexAction,
   type CodexActionState,
   type CodexQueueView,
@@ -64,6 +70,10 @@ export default function CodexQueuePanel({
   const [view, setView] = useState<CodexQueueView | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  /** 人工解除的二次确认臂（未确认不发任何请求——与 ModeBarCli 同款前端防线） */
+  const [forceArmed, setForceArmed] = useState(false);
+  /** 人工解除进行中（逐个解除 blockedActionIds 期间禁用全部按钮） */
+  const [forceBusy, setForceBusy] = useState(false);
   /** 乱序防护（R11）：请求序号——每次发起 +1，响应落地时不再是最新序号即作废
    *  （先发后至的响应不得覆盖后发请求的结果） */
   const seqRef = useRef(0);
@@ -92,6 +102,8 @@ export default function CodexQueuePanel({
     firstPendingAtRef.current = null;
     setView(null);
     setNote(null);
+    setForceArmed(false);
+    setForceBusy(false);
     void load();
     return () => {
       if (debounceRef.current !== null) {
@@ -124,7 +136,7 @@ export default function CodexQueuePanel({
 
   const retract = useCallback(
     async (actionId: string) => {
-      if (busyId !== null) return;
+      if (busyId !== null || forceBusy) return;
       setBusyId(actionId);
       setNote(null);
       try {
@@ -146,12 +158,43 @@ export default function CodexQueuePanel({
         await load();
       }
     },
-    [busyId, load]
+    [busyId, forceBusy, load]
   );
+
+  // 人工解除无出口屏障（确认后调用）：逐个解除在册屏障并重拉；任一失败 →
+  // 显示错误不静默（已成功的保留——重拉以服务端账本为权威）。
+  const forceContinue = useCallback(async () => {
+    if (busyId !== null || forceBusy) return;
+    const ids = view?.blockedActionIds ?? [];
+    setForceArmed(false);
+    if (ids.length === 0) return;
+    setForceBusy(true);
+    setNote(null);
+    try {
+      for (const id of ids) {
+        await forceContinueCodexAction(id);
+      }
+    } catch (e) {
+      setNote(
+        e instanceof ApiError
+          ? i18n.t("mobile.codex.queue.forceContinueFailed", { message: e.message })
+          : i18n.t("mobile.codex.queue.forceContinueFailed", { message: String(e) })
+      );
+    } finally {
+      setForceBusy(false);
+      await load();
+    }
+  }, [busyId, forceBusy, view, load]);
 
   if (view === null) return null;
   // 全空且无暂停原因：面板自隐（不渲染空壳）
   if (view.actions.length === 0 && view.blockedReasonCode === null) return null;
+  // 人工解除按钮仅两类**无自动恢复路径**的阻塞态可见（native_turn_pending 等待
+  // Turn 终态自动继续，不提供）；靶向清单来自服务端 blockedActionIds
+  const canForceContinue =
+    (view.blockedReasonCode === "native_delivery_unknown" ||
+      view.blockedReasonCode === "compat_outstanding") &&
+    (view.blockedActionIds?.length ?? 0) > 0;
 
   return (
     <div
@@ -176,6 +219,53 @@ export default function CodexQueuePanel({
               : i18n.t("mobile.codex.queue.blockedCompat")}
         </p>
       )}
+      {/* 人工解除（无出口屏障复审 Important）：两步确认——未确认不发任何请求；
+          文案如实说明风险（消息可能实际已投出，继续后续消息可能造成重复内容）。
+          人工解除是显式覆盖，「无自动恢复路径」的说明语义不变。 */}
+      {canForceContinue && !forceArmed && (
+        <button
+          type="button"
+          data-testid="codex-queue-force-continue"
+          disabled={busyId !== null || forceBusy}
+          onClick={() => {
+            setNote(null);
+            setForceArmed(true);
+          }}
+          className="mt-1 rounded-full border border-amber-500/50 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:text-amber-300"
+        >
+          {i18n.t("mobile.codex.queue.forceContinue")}
+        </button>
+      )}
+      {canForceContinue && forceArmed && (
+        <span
+          data-testid="codex-queue-force-confirm"
+          className="mt-1 flex w-full flex-wrap items-center gap-2 rounded-lg bg-amber-500/10 px-2 py-1 text-[11px] text-amber-700 dark:text-amber-300"
+        >
+          <span>{i18n.t("mobile.codex.queue.forceContinueRisk")}</span>
+          <button
+            type="button"
+            data-testid="codex-queue-force-yes"
+            disabled={busyId !== null || forceBusy}
+            onClick={() => {
+              void forceContinue();
+            }}
+            className="rounded-full bg-amber-600 px-2 py-0.5 font-semibold text-white disabled:opacity-40 dark:bg-amber-500"
+          >
+            {i18n.t("mobile.codex.queue.forceContinueYes")}
+          </button>
+          <button
+            type="button"
+            data-testid="codex-queue-force-no"
+            disabled={busyId !== null || forceBusy}
+            onClick={() => {
+              setForceArmed(false);
+            }}
+            className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-[var(--tx)] disabled:opacity-40"
+          >
+            {i18n.t("mobile.codex.queue.forceContinueCancel")}
+          </button>
+        </span>
+      )}
       <ul className="mt-1 space-y-1">
         {view.actions.map((a) => (
           <li
@@ -198,7 +288,7 @@ export default function CodexQueuePanel({
               <button
                 type="button"
                 data-testid={`codex-queue-retract-${a.actionId}`}
-                disabled={busyId !== null}
+                disabled={busyId !== null || forceBusy}
                 onClick={() => {
                   void retract(a.actionId);
                 }}

@@ -50,10 +50,12 @@ export interface CodexActionView {
   receipt: ActionReceipt | null;
 }
 
-/** 队列视图。blockedReasonCode 非空（如 compat_outstanding）= 暂停派发，必须展示说明。 */
+/** 队列视图。blockedReasonCode 非空（如 compat_outstanding）= 暂停派发，必须展示说明。
+ *  blockedActionIds = 在册屏障的动作清单（人工解除端点的靶向依据；旧后端载荷缺省）。 */
 export interface CodexQueueView {
   actions: CodexActionView[];
   blockedReasonCode: string | null;
+  blockedActionIds?: string[];
 }
 
 /** 平台能力集。false = 该 build 尚未活体验证，不表示协议实现不存在。 */
@@ -132,6 +134,7 @@ export const CODEX_PENDING_RESPONSE_PATH = "/m/api/v1/codex/pending-response";
 export const CODEX_ACTION_PATH = "/m/api/v1/codex/action";
 export const CODEX_QUEUE_PATH = "/m/api/v1/codex/queue";
 export const CODEX_QUEUE_RETRACT_PATH = "/m/api/v1/codex/queue/retract";
+export const CODEX_QUEUE_FORCE_CONTINUE_PATH = "/m/api/v1/codex/queue/force-continue";
 
 // ==== fetch 基建 ====
 
@@ -367,6 +370,26 @@ export async function retractCodexAction(actionId: string): Promise<CodexActionV
     throw networkFail("codex/queue/retract", e);
   }
   if (!r.ok) throw await toApiError("codex/queue/retract", r);
+  return (await r.json()) as CodexActionView;
+}
+
+/** 人工解除「无出口保守屏障」（2026-10-19 复审 Important：native 投递结果未知的
+ *  队列屏障没有自动恢复路径）——用户已在桌面端核对该消息实际去向后的**显式覆盖**，
+ *  调用方必须先经二次确认（重复内容风险）。
+ *  200 → 解除后的 CodexActionView（状态不改写，只清屏障）；409 = queued（应走撤回）
+ *  或屏障不在册；404 = 不存在/他人动作。重复调用幂等（返回当前状态，不重复解除）。 */
+export async function forceContinueCodexAction(actionId: string): Promise<CodexActionView> {
+  let r: Response;
+  try {
+    r = await fetch(CODEX_QUEUE_FORCE_CONTINUE_PATH, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actionId }),
+    });
+  } catch (e) {
+    throw networkFail("codex/queue/force-continue", e);
+  }
+  if (!r.ok) throw await toApiError("codex/queue/force-continue", r);
   return (await r.json()) as CodexActionView;
 }
 

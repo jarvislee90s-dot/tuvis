@@ -237,6 +237,21 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         )
     })?;
 
+    // Codex 动作账本：人工解除屏障标记列（2026-10-19 无出口屏障修复）——additive
+    // 幂等迁移；可空、无默认（存量行全 NULL = 从未人工解除，无回填需求）。
+    if !column_exists(conn, "codex_actions", "barrier_force_released_at") {
+        conn.execute(
+            "ALTER TABLE codex_actions ADD COLUMN barrier_force_released_at INTEGER",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_CODEX_BARRIER_RELEASE_FAIL: 迁移 codex_actions.barrier_force_released_at 失败: {}",
+                e
+            )
+        })?;
+    }
+
     Ok(())
 }
 
@@ -378,6 +393,62 @@ mod tests {
             "缺 fingerprint 列: {cols:?}"
         );
         assert!(cols.contains(&"via".to_string()), "缺 via 列: {cols:?}");
+    }
+
+    /// 2026-10-19 无出口屏障修复：旧结构 codex_actions（无 barrier_force_released_at）
+    /// 经迁移补列（可空、存量行全 NULL = 从未人工解除），幂等两遍不报错、数据不丢。
+    #[test]
+    fn migrate_adds_codex_barrier_force_released_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 旧结构表：故意不含新列，并预置一行存量数据（含在册屏障形态）
+        conn.execute_batch(
+            "CREATE TABLE extensions (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, description TEXT,
+                source_path TEXT NOT NULL, source_url TEXT, version TEXT, tags TEXT,
+                installed_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE codex_actions (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_id TEXT UNIQUE NOT NULL,
+                device_id TEXT NOT NULL,
+                device_name TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                request_key TEXT,
+                context_token TEXT,
+                payload_hash TEXT NOT NULL,
+                client_message_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                route TEXT NOT NULL DEFAULT 'none',
+                queued_text TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                receipt_json TEXT,
+                compat_outstanding INTEGER NOT NULL DEFAULT 0,
+                compat_message_id TEXT,
+                compat_turn_id TEXT,
+                compat_rollout_path TEXT,
+                compat_rollout_baseline INTEGER,
+                compat_wire_hash TEXT
+            );
+            INSERT INTO codex_actions (action_id, device_id, device_name, thread_id, kind, \
+                 payload_hash, client_message_id, state, created_at, updated_at, compat_outstanding) \
+             VALUES ('legacy-a', 'd', 'iPhone', 't', 'send', 'h', 'cm', 'unknown', 1, 1, 1);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        // 新列存在且可空，存量行全 NULL（无回填需求）
+        let (flag, ts): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT compat_outstanding, barrier_force_released_at \
+                 FROM codex_actions WHERE action_id = 'legacy-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((flag, ts), (1, None), "存量屏障行保留，解除标记为 NULL");
+        // 幂等：迁移两遍不报错
+        migrate(&conn).unwrap();
     }
 
     #[test]

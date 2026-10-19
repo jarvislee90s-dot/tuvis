@@ -32,7 +32,7 @@ use crate::services::codex_desktop_ipc::types::{
 const COLS: &str = "seq, action_id, device_id, device_name, thread_id, kind, request_key, \
      context_token, payload_hash, client_message_id, state, route, queued_text, created_at, \
      updated_at, receipt_json, compat_outstanding, compat_message_id, compat_turn_id, \
-     compat_rollout_path, compat_rollout_baseline, compat_wire_hash";
+     compat_rollout_path, compat_rollout_baseline, compat_wire_hash, barrier_force_released_at";
 // ============================================================
 // 枚举 ⇄ 存储串（serde snake_case 同形；手工映射保证坏值显式报错不静默）
 // ============================================================
@@ -113,6 +113,10 @@ pub(crate) struct ActionRow {
     pub compat_rollout_path: Option<String>,
     pub compat_rollout_baseline: Option<u64>,
     pub compat_wire_hash: Option<String>,
+    /// 人工解除屏障的时间戳（2026-10-19 无出口屏障修复）：非 NULL = 该行屏障已被
+    /// 人工解除——所有置 `compat_outstanding=1` 的写点带同名单调性守卫，解除后
+    /// 任何路径不得把屏障置回（老库经迁移补列，存量行全 NULL = 从未人工解除）。
+    pub barrier_force_released_at: Option<i64>,
 }
 
 /// PR #117 兼容兜底 fence（服务端内部类型，计划 Task 7 明文）：桥接前记录 rollout
@@ -165,6 +169,7 @@ fn row_action(row: &rusqlite::Row) -> rusqlite::Result<ActionRow> {
         // rusqlite 0.40 无 u64 FromSql/ToSql：经 i64 存取（基线是文件字节数，恒 ≥ 0）
         compat_rollout_baseline: row.get::<_, Option<i64>>(20)?.map(|v| v.max(0) as u64),
         compat_wire_hash: row.get(21)?,
+        barrier_force_released_at: row.get(22)?,
     })
 }
 
@@ -263,6 +268,7 @@ pub(crate) fn mark_stale_reserved_unknown_conn(
         "SELECT seq, action_id, thread_id FROM codex_actions
          WHERE state = 'reserved' AND route = 'desktop_ipc' AND kind = 'send'
            AND (compat_outstanding IS NULL OR compat_outstanding = 0)
+           AND barrier_force_released_at IS NULL
            AND updated_at <= ?1",
     )?;
     let rows: Vec<(i64, String, String)> = stmt
@@ -341,13 +347,16 @@ fn recover_one_conn(conn: &Connection, action_id: &str, now_ms: i64) -> rusqlite
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     // 2026-10-17 复审 P3-3：desktop_ipc 普通消息的启动恢复同样存保守屏障
     //（RPC 可能已到达 Desktop、落账前崩溃——重启后顺序限制保守在册）
+    // `barrier_force_released_at IS NULL` 守卫（2026-10-19）：人工解除过的行不回置
+    // 屏障（单调性；解除行必为终态，正常不可达，守卫使不变量结构化）。
     conn.execute(
         "UPDATE codex_actions SET state = 'unknown', receipt_json = ?2, updated_at = ?3,
              compat_outstanding = CASE WHEN route = 'desktop_ipc' AND kind = 'send'
                  THEN 1 ELSE compat_outstanding END,
              compat_turn_id = CASE WHEN route = 'desktop_ipc' AND kind = 'send'
                  THEN NULL ELSE compat_turn_id END
-         WHERE action_id = ?1 AND state = 'reserved'",
+         WHERE action_id = ?1 AND state = 'reserved'
+           AND barrier_force_released_at IS NULL",
         params![action_id, receipt_json, now_ms],
     )
 }
@@ -469,6 +478,8 @@ pub(crate) fn finish_conn(
 /// A 路独立派发任务的唯一落账点——Accepted 绑 turn 身份（None = 保守屏障），
 /// UnknownDelivery 存未知关联的保守屏障。单语句原子性确保「已接受/未知但无屏障」
 /// 窗口不存在（等待者取消/进程退出均不再丢屏障）。仅 reserved 可落账。
+/// `barrier_force_released_at IS NULL` 守卫（2026-10-19）：人工解除过的行不再回置
+/// 屏障（单调性；该行必为终态，正常不可达，守卫使不变量结构化）。
 pub(crate) fn finish_with_turn_barrier_conn(
     conn: &Connection,
     receipt: &ActionReceipt,
@@ -487,7 +498,8 @@ pub(crate) fn finish_with_turn_barrier_conn(
     conn.execute(
         "UPDATE codex_actions SET state = ?2, receipt_json = ?3, updated_at = ?4, \
              compat_outstanding = 1, compat_message_id = NULL, compat_turn_id = ?5 \
-         WHERE action_id = ?1 AND state = 'reserved'",
+         WHERE action_id = ?1 AND state = 'reserved' \
+           AND barrier_force_released_at IS NULL",
         params![receipt.action_id, state, receipt_json, now_ms, turn_id],
     )?;
     Ok(())
@@ -533,7 +545,9 @@ pub(crate) fn retract_conn(
 // PR #117 兼容 fence
 // ============================================================
 
-/// 置 fence（bridge 在 compat 发送前调用：持久 reserved + fence）
+/// 置 fence（bridge 在 compat 发送前调用：持久 reserved + fence）。
+/// `barrier_force_released_at IS NULL` 守卫（2026-10-19）：人工解除过的行不回置
+/// 屏障（单调性——解除后任何路径不得再置 1）。
 pub(crate) fn set_compat_fence_conn(
     conn: &Connection,
     action_id: &str,
@@ -544,7 +558,7 @@ pub(crate) fn set_compat_fence_conn(
     conn.execute(
         "UPDATE codex_actions SET compat_outstanding = 1, compat_message_id = ?2, \
              compat_turn_id = ?3, updated_at = ?4 \
-         WHERE action_id = ?1",
+         WHERE action_id = ?1 AND barrier_force_released_at IS NULL",
         params![action_id, message_id, turn_id, now_ms],
     )?;
     Ok(())
@@ -613,6 +627,7 @@ pub(crate) fn outstanding_fence_summary_conn(
 /// **原子** compat 派发屏障（R9.1，2026-10-17 审计）：fence 与只读核对证据在**同一条
 /// UPDATE** 内持久化（单语句原子性）——持久化成功是 compat bridge 调用真实 helper 的
 /// 前提；写失败时 helper 不被调用，动作如实落账。
+/// `barrier_force_released_at IS NULL` 守卫（2026-10-19）：人工解除过的行不回置屏障。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn set_compat_dispatch_barrier_conn(
     conn: &Connection,
@@ -628,7 +643,7 @@ pub(crate) fn set_compat_dispatch_barrier_conn(
         "UPDATE codex_actions SET compat_outstanding = 1, compat_message_id = ?2, \
              compat_turn_id = ?3, compat_rollout_path = ?4, compat_rollout_baseline = ?5, \
              compat_wire_hash = ?6, updated_at = ?7 \
-         WHERE action_id = ?1",
+         WHERE action_id = ?1 AND barrier_force_released_at IS NULL",
         params![
             action_id,
             message_id,
@@ -738,6 +753,93 @@ pub(crate) fn clear_compat_fence_conn(
         params![action_id, now_ms],
     )?;
     Ok(true)
+}
+
+// ============================================================
+// 人工解除屏障（2026-10-19 无出口屏障修复，PR #165 复审 Important）
+// ============================================================
+
+/// [`force_release_barrier_conn`] 的结果（内部类型；HTTP 映射在 remote::codex_ipc）。
+#[derive(Debug)]
+pub(crate) enum ForceReleaseRow {
+    /// 不存在 / 非属主设备（HTTP 404——不给存在性预言机）
+    NotFound,
+    /// 本次 CAS 解除成功（解除后的行；同事务已写审计）
+    Released(ActionRow),
+    /// 幂等命中：此前已人工解除过（返回当前行；零新写入零审计）
+    AlreadyReleased(ActionRow),
+    /// 屏障不在册（queued 应走既有撤回 / 屏障已被自动路径解除 / 从未在册）→ HTTP 409
+    NotEligible(ActionRow),
+}
+
+/// 人工解除保守屏障（复审 Important：native 投递 unknown 的队列屏障无出口）：
+/// **原子 CAS UPDATE**——仅属主设备、仅「屏障在册且已终态」的行（state IN
+/// ('unknown','accepted')；queued 走既有撤回，reserved 在飞行有自动路径不在此列），
+/// 同事务写审计；重复调用幂等（已解除过的行返回 [`ForceReleaseRow::AlreadyReleased`]，
+/// 绝不重复写审计）。解除同时落 `barrier_force_released_at` 标记——全部置屏障写点
+/// 带同名单调性守卫，解除后任何路径不得把 `compat_outstanding` 置回 1。
+pub(crate) fn force_release_barrier_conn(
+    conn: &Connection,
+    action_id: &str,
+    device_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<ForceReleaseRow> {
+    let Some(row) = get_row(conn, action_id)? else {
+        return Ok(ForceReleaseRow::NotFound);
+    };
+    if row.device_id != device_id {
+        return Ok(ForceReleaseRow::NotFound);
+    }
+    if row.barrier_force_released_at.is_some() {
+        return Ok(ForceReleaseRow::AlreadyReleased(row));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let n = tx.execute(
+        "UPDATE codex_actions SET compat_outstanding = 0, compat_message_id = NULL, \
+             compat_turn_id = NULL, compat_rollout_path = NULL, \
+             compat_rollout_baseline = NULL, compat_wire_hash = NULL, \
+             barrier_force_released_at = ?3, updated_at = ?3 \
+         WHERE action_id = ?1 AND device_id = ?2 AND compat_outstanding = 1 \
+           AND state IN ('unknown', 'accepted') \
+           AND barrier_force_released_at IS NULL",
+        params![action_id, device_id, now_ms],
+    )?;
+    if n == 0 {
+        // CAS 未命中：屏障不在册（queued / reserved 在飞 / 已被自动路径解除）。
+        // 事务零写入，直接丢弃；返回当前行供上层区分 409 文案。
+        drop(tx);
+        let cur = get_row(conn, action_id)?.unwrap_or(row);
+        return Ok(ForceReleaseRow::NotEligible(cur));
+    }
+    super::write_audit::record_conn_checked(
+        &tx,
+        now_ms,
+        &row.device_id,
+        &row.device_name,
+        "codex",
+        &row.thread_id,
+        "codex_desktop_ipc",
+        "force_continue",
+        &audit_summary(&row),
+        "barrier_force_released",
+    )?;
+    tx.commit()?;
+    let released = get_row(conn, action_id)?.unwrap_or(row);
+    Ok(ForceReleaseRow::Released(released))
+}
+
+/// 该 Thread 全部在册屏障的 action_id（seq 序；队列视图 `blockedActionIds`——
+/// 人工解除端点的靶向清单，前端按钮据此逐个解除）。
+pub(crate) fn barrier_action_ids_conn(
+    conn: &Connection,
+    thread_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT action_id FROM codex_actions WHERE thread_id = ?1 AND compat_outstanding = 1 \
+         ORDER BY seq ASC",
+    )?;
+    let rows = stmt.query_map([thread_id], |r| r.get::<_, String>(0))?;
+    rows.collect()
 }
 
 // ============================================================
@@ -1279,5 +1381,190 @@ mod tests {
         assert!(turn_binding_rows_conn(&c).unwrap().is_empty());
         assert!(!thread_has_pending_work_conn(&c, THREAD).unwrap());
         assert!(threads_with_pending_work_conn(&c).unwrap().is_empty());
+    }
+
+    /// 造「屏障在册终态行」：register→reserve→finish_with_turn_barrier（Unknown 无
+    /// turnId = 保守屏障；Accepted 带 turnId = Turn 绑定）。返回落账前回执。
+    fn finish_with_barrier(
+        conn: &Connection,
+        action_id: &str,
+        delivery: Delivery,
+        turn_id: Option<&str>,
+        now: i64,
+    ) {
+        insert(conn, action_id, Some("甲"), now);
+        reserve_conn(conn, action_id, ControlRoute::DesktopIpc, now + 1).unwrap();
+        finish_with_turn_barrier_conn(
+            conn,
+            &ActionReceipt {
+                action_id: action_id.to_string(),
+                delivery,
+                route: ControlRoute::DesktopIpc,
+                turn_id: turn_id.map(str::to_string),
+                envelope_id: None,
+                reason_code: None,
+            },
+            turn_id,
+            now + 2,
+        )
+        .unwrap();
+    }
+
+    fn audit_count_of(conn: &Connection, action: &str) -> usize {
+        super::super::write_audit::recent_conn(conn, 100)
+            .iter()
+            .filter(|a| a.action == action)
+            .count()
+    }
+
+    /// force-release CAS：unknown/accepted+屏障可解；queued/reserved/无屏障 409 形态；
+    /// 属主隔离；幂等（第二次 AlreadyReleased 零重复审计）；解除落时间戳标记。
+    #[test]
+    fn force_release_barrier_cas_idempotent_and_owner_scoped() {
+        let c = mem();
+        // ① unknown+保守屏障（成因①②③的终态）：解除成功 + 审计
+        finish_with_barrier(&c, "u-1", Delivery::UnknownDelivery, None, 1000);
+        assert!(has_compat_fence_conn(&c, THREAD).unwrap());
+        match force_release_barrier_conn(&c, "u-1", "dev-1", 5000).unwrap() {
+            ForceReleaseRow::Released(row) => {
+                assert!(!row.compat_outstanding, "屏障已清");
+                assert_eq!(row.barrier_force_released_at, Some(5000), "解除标记在册");
+            }
+            other => panic!("unknown+屏障应 Released：{other:?}"),
+        }
+        assert!(!has_compat_fence_conn(&c, THREAD).unwrap());
+        assert_eq!(audit_count_of(&c, "force_continue"), 1, "解除写一条审计");
+
+        // ② 幂等：重复调用 AlreadyReleased，当前状态返回、零重复审计
+        match force_release_barrier_conn(&c, "u-1", "dev-1", 6000).unwrap() {
+            ForceReleaseRow::AlreadyReleased(row) => {
+                assert!(!row.compat_outstanding);
+                assert_eq!(
+                    row.barrier_force_released_at,
+                    Some(5000),
+                    "首次解除时间戳不被覆盖"
+                );
+            }
+            other => panic!("重复调用应 AlreadyReleased：{other:?}"),
+        }
+        assert_eq!(audit_count_of(&c, "force_continue"), 1, "绝不重复写审计");
+
+        // ③ 非属主设备 → NotFound（不给存在性预言机）
+        assert!(matches!(
+            force_release_barrier_conn(&c, "u-1", "dev-9", 6001).unwrap(),
+            ForceReleaseRow::NotFound
+        ));
+        // 不存在的 action → NotFound
+        assert!(matches!(
+            force_release_barrier_conn(&c, "no-such", "dev-1", 6002).unwrap(),
+            ForceReleaseRow::NotFound
+        ));
+
+        // ④ queued → NotEligible（应走既有撤回）
+        insert(&c, "q-1", Some("乙"), 1001);
+        assert!(matches!(
+            force_release_barrier_conn(&c, "q-1", "dev-1", 6003).unwrap(),
+            ForceReleaseRow::NotEligible(_)
+        ));
+
+        // ⑤ reserved+屏障（compat 在飞 fence）→ NotEligible（在飞行有自动路径）
+        insert(&c, "r-1", Some("丙"), 1002);
+        reserve_conn(&c, "r-1", ControlRoute::HeadlessCompat, 1003).unwrap();
+        set_compat_dispatch_barrier_conn(
+            &c,
+            "r-1",
+            None,
+            None,
+            Some("/p"),
+            Some(1),
+            Some("w"),
+            1004,
+        )
+        .unwrap();
+        assert!(matches!(
+            force_release_barrier_conn(&c, "r-1", "dev-1", 6004).unwrap(),
+            ForceReleaseRow::NotEligible(_)
+        ));
+        assert!(
+            has_compat_fence_conn(&c, THREAD).unwrap(),
+            "在飞行屏障不被人工解除触碰"
+        );
+
+        // ⑥ accepted+turnId 绑定屏障（native_turn_pending）：显式覆盖允许解除
+        finish_with_barrier(&c, "a-ok", Delivery::Accepted, Some("t-1"), 1100);
+        assert!(matches!(
+            force_release_barrier_conn(&c, "a-ok", "dev-1", 6100).unwrap(),
+            ForceReleaseRow::Released(_)
+        ));
+        let a_ok = get_row(&c, "a-ok").unwrap().unwrap();
+        assert!(!a_ok.compat_outstanding, "accepted 绑定屏障同样可显式解除");
+    }
+
+    /// 单调性：解除后所有置屏障写点（set_compat_fence / set_compat_dispatch_barrier /
+    /// mark_stale 清扫 / 启动恢复）不得把 compat_outstanding 置回 1。
+    #[test]
+    fn force_release_monotonic_no_rebarrier() {
+        let c = mem();
+        finish_with_barrier(&c, "u-1", Delivery::UnknownDelivery, None, 1000);
+        assert!(matches!(
+            force_release_barrier_conn(&c, "u-1", "dev-1", 5000).unwrap(),
+            ForceReleaseRow::Released(_)
+        ));
+        // ① bind_turn 补绑（set_compat_fence）不再回置屏障
+        set_compat_fence_conn(&c, "u-1", Some("m"), Some("t"), 5100).unwrap();
+        assert!(
+            !has_compat_fence_conn(&c, THREAD).unwrap(),
+            "解除后 set_fence 不回置"
+        );
+        // ② 原子派发屏障写点同样被守卫
+        set_compat_dispatch_barrier_conn(
+            &c,
+            "u-1",
+            Some("m"),
+            Some("t"),
+            Some("/p"),
+            Some(1),
+            Some("w"),
+            5200,
+        )
+        .unwrap();
+        assert!(
+            !has_compat_fence_conn(&c, THREAD).unwrap(),
+            "解除后派发屏障不回置"
+        );
+        // ③ 启动恢复/超龄清扫（只触 reserved）不复活终态行的屏障
+        recover_reserved_conn(&c, 5300).unwrap();
+        mark_stale_reserved_unknown_conn(&c, 0, 5400).unwrap();
+        assert!(
+            !has_compat_fence_conn(&c, THREAD).unwrap(),
+            "恢复/清扫不回置屏障"
+        );
+        // 证据列一并清理（核对钥匙不再可用）
+        let row = get_row(&c, "u-1").unwrap().unwrap();
+        assert!(row.compat_message_id.is_none() && row.compat_wire_hash.is_none());
+        // 对照组：未解除过的行，set_fence 正常置 1（守卫不误伤）
+        insert(&c, "keep", Some("乙"), 1200);
+        set_compat_fence_conn(&c, "keep", Some("m2"), None, 5150).unwrap();
+        assert!(get_row(&c, "keep").unwrap().unwrap().compat_outstanding);
+    }
+
+    /// barrier_action_ids：在册屏障动作清单（seq 序），解除后退出清单。
+    #[test]
+    fn barrier_action_ids_track_outstanding_fences() {
+        let c = mem();
+        assert!(barrier_action_ids_conn(&c, THREAD).unwrap().is_empty());
+        finish_with_barrier(&c, "u-1", Delivery::UnknownDelivery, None, 1000);
+        finish_with_barrier(&c, "u-2", Delivery::UnknownDelivery, None, 1050);
+        assert_eq!(
+            barrier_action_ids_conn(&c, THREAD).unwrap(),
+            vec!["u-1".to_string(), "u-2".to_string()],
+            "seq 序列出全部在册屏障"
+        );
+        force_release_barrier_conn(&c, "u-1", "dev-1", 5000).unwrap();
+        assert_eq!(
+            barrier_action_ids_conn(&c, THREAD).unwrap(),
+            vec!["u-2".to_string()],
+            "解除后退出清单"
+        );
     }
 }

@@ -18,7 +18,7 @@ pub use crate::services::codex_desktop_ipc::types::{
 };
 pub use queue::{
     payload_hash, reconcile_compat_fence, reconcile_compat_fence_with, wire_text_hash,
-    ActionPayload, ActionStore, CompatFence, QueuedAction, StoreError, TurnBinding,
+    ActionPayload, ActionStore, BarrierRelease, CompatFence, QueuedAction, StoreError, TurnBinding,
 };
 pub use router::{
     BoxBusyFut, BoxDispatchFut, CodexControlRouter, DesktopDispatch, DispatchOutcome,

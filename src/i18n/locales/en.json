@@ -1772,7 +1772,12 @@
         "retractFailed": "Retract failed: {{message}}",
         "blockedCompat": "A compatibility-mode send is still outstanding — queue dispatch is paused; verify on Desktop first",
         "blockedNativeTurn": "Native turn not yet confirmed complete — queue paused; resumes automatically once the turn completes",
-        "blockedNativeUnknown": "Native delivery outcome unknown — queue paused; this barrier has no auto-recovery path (conservatively held, never auto-resent)"
+        "blockedNativeUnknown": "Native delivery outcome unknown — queue paused; this barrier has no auto-recovery path (conservatively held, never auto-resent)",
+        "forceContinue": "Verified on Desktop — continue queue",
+        "forceContinueRisk": "Confirm you have verified this message's actual delivery on Desktop. If it was already delivered, continuing later messages may cause duplicated content.",
+        "forceContinueYes": "Confirm & continue",
+        "forceContinueCancel": "Cancel",
+        "forceContinueFailed": "Continue queue failed: {{message}}"
       },
       "composer": {
         "codexAccepted": "Accepted — Desktop is running it",
