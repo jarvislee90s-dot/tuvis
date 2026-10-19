@@ -10,8 +10,9 @@ use multi_agents_manager_lib::remote::pairing::{
 };
 use multi_agents_manager_lib::services::codex_control::{
     payload_hash, reconcile_compat_fence_with, wire_text_hash, ActionContext, ActionKind,
-    ActionPayload, ActionState, ActionStore, CodexControlRouter, CompatFence, ControlRoute,
-    Delivery, DesktopDispatch, DispatchOutcome, PendingAction, RouterOutcome, StoreError,
+    ActionPayload, ActionState, ActionStore, BarrierRelease, CodexControlRouter, CompatFence,
+    ControlRoute, Delivery, DesktopDispatch, DispatchOutcome, PendingAction, RouterOutcome,
+    StoreError,
 };
 use multi_agents_manager_lib::services::codex_desktop_ipc::types::{
     ActionReceipt, CodexActionView, ProtocolError, ThreadKey, ThreadProjection,
@@ -1752,4 +1753,132 @@ async fn finish_persist_failure_keeps_reserved_reports_unknown() {
     // —— 重启：reserved → unknown ——
     h.restart();
     assert_eq!(h.state_of("pf-a"), ActionState::Unknown);
+}
+
+// ============================================================
+// 人工解除保守屏障（2026-10-19 无出口屏障修复，PR #165 复审 Important）：
+// route=desktop_ipc 且 state=unknown（尤其缺 turnId）的屏障在 release_turn_if_complete
+//（要求 turnId 绑定）与 reconcile（要求 rollout 三证据）两处自动出口都到不了——
+// 人工解除端点 = store CAS 清屏障 + router 清内存顺序限制 + 接力 flush。
+// ============================================================
+
+/// 无出口屏障的人工解除端到端（router/store 面）：Unknown 屏障闸住队列 →
+/// force_release_barrier（CAS 清持久屏障）+ force_clear_turn_limit（清内存限制）
+/// → flush 接力下一条；重启后限制不复活（turn_bindings 不再枚举该行）；
+/// 幂等（重复解除 AlreadyReleased、零重复审计）；非属主 NotFound。
+#[tokio::test]
+async fn force_release_unlocks_unknown_barrier_and_queue_resumes() {
+    let mut h = harness_with(FakeDispatch::new(DispatchOutcome {
+        delivery: Delivery::UnknownDelivery,
+        envelope_id: Some("env-fc".into()),
+        turn_id: None,
+        reason_code: None,
+        revision: None,
+    }));
+    let _ = completed(
+        h.router
+            .send(h.ctx("fc-a", ActionKind::Send), "未知投递".into(), false)
+            .await,
+    );
+    assert_eq!(h.state_of("fc-a"), ActionState::Unknown);
+    assert!(
+        h.store.has_compat_fence(&h.key).expect("query"),
+        "保守屏障在册"
+    );
+    h.router
+        .send(h.ctx("fc-b", ActionKind::Send), "被困后续".into(), true)
+        .await;
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "解除前队列闸住（无出口屏障）"
+    );
+
+    // 非属主：NotFound（不给存在性预言机）
+    assert!(matches!(
+        h.store
+            .force_release_barrier("fc-a", "dev-9")
+            .expect("query"),
+        BarrierRelease::NotFound
+    ));
+
+    // 人工解除：CAS 清持久屏障 + 清内存顺序限制
+    match h
+        .store
+        .force_release_barrier("fc-a", "dev-1")
+        .expect("release")
+    {
+        BarrierRelease::Released { view, .. } => {
+            assert_eq!(view.state, ActionState::Unknown, "状态不被改写（只清屏障）");
+        }
+        other => panic!("应 Released：{other:?}"),
+    }
+    assert!(
+        h.router.force_clear_turn_limit(&h.key, "fc-a"),
+        "内存顺序限制被清"
+    );
+    assert!(
+        !h.store.has_compat_fence(&h.key).expect("query"),
+        "持久屏障已清"
+    );
+    // 接力恢复：被困后续立即派发
+    let out = h.router.flush_thread(&h.key).await.expect("unblocked");
+    assert_eq!(completed(out).delivery, Delivery::UnknownDelivery);
+    assert_eq!(h.dispatch.send_count(), 2, "fc-b 被接力派发");
+
+    // 幂等：重复解除 AlreadyReleased（零新写入），审计恰一条
+    assert!(matches!(
+        h.store
+            .force_release_barrier("fc-a", "dev-1")
+            .expect("again"),
+        BarrierRelease::AlreadyReleased { .. }
+    ));
+    let audits = {
+        let conn = h.conn.lock().unwrap();
+        multi_agents_manager_lib::database::dao::write_audit::recent_conn(&conn, 100)
+    };
+    let force_audits = audits
+        .iter()
+        .filter(|a| a.action == "force_continue")
+        .count();
+    assert_eq!(force_audits, 1, "解除审计恰好一条（重复调用不重复写）");
+    assert!(
+        audits.iter().any(|a| a.action == "force_continue"
+            && a.result == "barrier_force_released"
+            && a.summary.contains("fc-a")),
+        "审计行携带动作与结果词"
+    );
+
+    // 重启：解除过的行不再进 turn_bindings，限制不复活（fc-b 接力派发后按 Unknown
+    // 口径存的是**它自己的新**保守屏障——不是 fc-a 的回置）
+    h.restart();
+    let ids = h.store.barrier_action_ids(&h.key).expect("query");
+    assert!(
+        !ids.contains(&"fc-a".to_string()),
+        "解除过的行屏障不复活（单调性）：{ids:?}"
+    );
+    assert!(
+        ids.contains(&"fc-b".to_string()),
+        "fc-b 派发后自己的保守屏障在册（新屏障，非回置）：{ids:?}"
+    );
+}
+
+/// queued 行走既有撤回：人工解除端点语义拒绝（NotEligible），屏障与队列不被误触。
+#[tokio::test]
+async fn force_release_rejects_queued_rows() {
+    let h = harness();
+    h.router
+        .send(h.ctx("fc-q", ActionKind::Send), "仍在排队".into(), true)
+        .await;
+    match h
+        .store
+        .force_release_barrier("fc-q", "dev-1")
+        .expect("query")
+    {
+        BarrierRelease::NotEligible(view) => {
+            assert_eq!(view.state, ActionState::Queued, "409 指引走撤回的判据");
+        }
+        other => panic!("queued 应 NotEligible：{other:?}"),
+    }
+    // 动作保持 queued 可撤（撤回路径不受影响）
+    assert!(h.store.retract("fc-q", "dev-1").expect("retract"));
 }

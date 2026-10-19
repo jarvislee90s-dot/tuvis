@@ -137,6 +137,27 @@ pub struct ActionStore {
     store: DeviceStore,
 }
 
+/// 人工解除保守屏障的结果（2026-10-19 无出口屏障修复；HTTP 映射在 remote::codex_ipc：
+/// NotFound→404，Released/AlreadyReleased→200，NotEligible→409）。
+#[derive(Debug)]
+pub enum BarrierRelease {
+    /// 不存在 / 非属主设备（不给存在性预言机）
+    NotFound,
+    /// 本次解除成功（解除后的动作视图 + thread 标识——调用方据此清内存 Turn
+    /// 顺序限制并接力 flush）
+    Released {
+        view: CodexActionView,
+        thread_id: String,
+    },
+    /// 幂等命中：此前已人工解除（返回当前视图；零新写入零审计）
+    AlreadyReleased {
+        view: CodexActionView,
+        thread_id: String,
+    },
+    /// 屏障不在册（queued 应走既有撤回 / 在飞行 / 已被自动路径解除）→ 409
+    NotEligible(CodexActionView),
+}
+
 fn db_err(e: rusqlite::Error) -> StoreError {
     StoreError::Database(e.to_string())
 }
@@ -370,6 +391,44 @@ impl ActionStore {
                 false => Err(StoreError::Conflict),
             }
         })
+    }
+
+    /// 人工解除保守屏障（仅属主设备；CAS 安全 + 幂等 + 单调，DAO 侧同事务审计）。
+    pub fn force_release_barrier(
+        &self,
+        action_id: &str,
+        device_id: &str,
+    ) -> Result<BarrierRelease, StoreError> {
+        self.with(|c| {
+            match dao::force_release_barrier_conn(c, action_id, device_id, now_ms())
+                .map_err(db_err)?
+            {
+                dao::ForceReleaseRow::NotFound => Ok(BarrierRelease::NotFound),
+                dao::ForceReleaseRow::Released(row) => {
+                    let thread_id = row.thread_id.clone();
+                    Ok(BarrierRelease::Released {
+                        view: view_of(c, row).map_err(db_err)?,
+                        thread_id,
+                    })
+                }
+                dao::ForceReleaseRow::AlreadyReleased(row) => {
+                    let thread_id = row.thread_id.clone();
+                    Ok(BarrierRelease::AlreadyReleased {
+                        view: view_of(c, row).map_err(db_err)?,
+                        thread_id,
+                    })
+                }
+                dao::ForceReleaseRow::NotEligible(row) => Ok(BarrierRelease::NotEligible(
+                    view_of(c, row).map_err(db_err)?,
+                )),
+            }
+        })
+    }
+
+    /// 该 Thread 全部在册屏障的 action_id（队列视图 `blockedActionIds`——人工解除
+    /// 端点的靶向清单，前端按钮据此逐个解除）。
+    pub fn barrier_action_ids(&self, key: &ThreadKey) -> Result<Vec<String>, StoreError> {
+        self.with(|c| dao::barrier_action_ids_conn(c, &key.thread_id).map_err(db_err))
     }
 
     /// 读取该 Thread 全部在册 fence（seq 序；reconcile 迭代输入）。

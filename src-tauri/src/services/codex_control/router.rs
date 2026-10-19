@@ -330,6 +330,20 @@ impl CodexControlRouter {
             .remove(key);
     }
 
+    /// 人工解除屏障配套（2026-10-19 无出口屏障修复）：清该 Thread 上绑定指定 action
+    /// 的**内存** Turn 顺序限制——持久屏障已由端点 CAS 清除，内存限制若不清，本进程内
+    /// 队列仍被 `is_turn_active` 挡住（flush/send 都会让路）。仅精确匹配 action 才清
+    ///（防误清同 Thread 上新一轮派发的限制）。返回是否清除。
+    pub fn force_clear_turn_limit(&self, key: &ThreadKey, action_id: &str) -> bool {
+        let mut turns = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+        if turns.get(key).is_some_and(|t| t.action_id == action_id) {
+            turns.remove(key);
+            true
+        } else {
+            false
+        }
+    }
+
     fn is_turn_active(&self, key: &ThreadKey) -> bool {
         self.active_turns
             .lock()

@@ -181,6 +181,8 @@ pub fn init(conn: &Connection) {
         -- JSON。compat_* 三列是 PR #117 兼容兜底的持久 fence（compat_outstanding=1 期间该
         -- Thread 队列不接力）；compat_rollout_path/compat_rollout_baseline/compat_wire_hash 是
         -- 只读核对（reconcile）的证据字段，随 fence 持久保存、跨热重启与应用重启有效。
+        -- barrier_force_released_at 是人工解除屏障的时间戳（2026-10-19 无出口屏障修复，
+        -- 可空）：非 NULL = 屏障已被人工解除，全部置屏障写点带同名单调性守卫不回置。
         -- 撤回 = CAS queued→cancelled，**保留行作墓碑**（已撤 actionId 重放据此拒绝，不重发）。
         CREATE TABLE IF NOT EXISTS codex_actions (
             seq                     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -204,7 +206,8 @@ pub fn init(conn: &Connection) {
             compat_turn_id          TEXT,
             compat_rollout_path     TEXT,
             compat_rollout_baseline INTEGER,
-            compat_wire_hash        TEXT
+            compat_wire_hash        TEXT,
+            barrier_force_released_at INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_codex_actions_thread_state_seq
             ON codex_actions(thread_id, state, seq);
