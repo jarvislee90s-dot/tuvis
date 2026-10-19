@@ -1232,9 +1232,11 @@ async fn native_capability_gated_and_unsupported_requests_never_send() {
         multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind::UserInput
     );
     assert!(!pending.actionable, "能力未验证 → 不可操作");
+    // 拆码契约：方法已知（user_input）但能力未验证 → capability_unverified
+    //（下一行回执的 capability_unavailable 是投递面 reason_code，与投影拆码无关）
     assert_eq!(
         pending.disabled_reason_code.as_deref(),
-        Some("capability_unavailable")
+        Some("capability_unverified")
     );
     let o = adapter
         .respond(

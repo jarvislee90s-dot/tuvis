@@ -155,13 +155,19 @@ async function toApiError(path: string, r: Response): Promise<ApiError> {
 
 /** 投影载荷的最小形状守卫（纵深防御）：缺 availability/messages/pending 的残缺
  *  载荷（旧后端/代理注入页）按错误处理——调用方保留 null 态走旧路径，绝不拿残缺
- *  DTO 渲染出「四档全空」的假界面。 */
+ *  DTO 渲染出「四档全空」的假界面。contentState 同校验（2026-10-19 复审补入：
+ *  服务端恒序列化该字段，缺省/枚举外取值 = 残缺载荷——「暂无消息」的判定依赖它，
+ *  拿不到真值宁可报错也不把 loading/unsupported 冒充成 ready 空会话）。 */
+const CONTENT_STATES = new Set(["loading", "ready", "partial", "unsupported"]);
+
 function asThreadProjection(v: unknown): ThreadProjection {
   const p = v as ThreadProjection | null;
   if (
     p === null ||
     typeof p !== "object" ||
     typeof p.availability !== "string" ||
+    typeof p.contentState !== "string" ||
+    !CONTENT_STATES.has(p.contentState) ||
     !Array.isArray(p.messages) ||
     !Array.isArray(p.pending)
   ) {

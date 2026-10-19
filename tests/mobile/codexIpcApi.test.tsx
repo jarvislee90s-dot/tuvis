@@ -43,6 +43,7 @@ function projection(over: Partial<ThreadProjection> = {}): ThreadProjection {
     availability: "controllable",
     capabilities: caps(),
     runtimeStatus: "idle",
+    contentState: "ready",
     messages: [{ id: "m-1", role: "user", kind: "user_input", text: "你好", ts: 1000 }],
     truncated: false,
     pending: [],
@@ -176,6 +177,26 @@ describe("codexIpcApi：Thread 投影拉取", () => {
     const err = await fetchCodexThread("s1").catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ApiError);
     expect((err as ApiError).status).toBe(404);
+  });
+
+  it("fetch_codex_thread_malformed_content_state_throws：缺 contentState / 枚举外取值 → 残缺载荷报错（不渲染假界面）", async () => {
+    installFetch();
+    // 旧后端/残缺载荷：服务端恒序列化 contentState——缺字段即残缺（2026-10-19 复审）
+    routes.thread = { ...projection() } as unknown as ThreadProjection;
+    delete (routes.thread as Record<string, unknown>).contentState;
+    await expect(fetchCodexThread("s1")).rejects.toBeInstanceOf(ApiError);
+
+    // 枚举外取值（loading/ready/partial/unsupported 四态之外）同样拒绝
+    routes.thread = projection({
+      contentState: "ok" as unknown as ThreadProjection["contentState"],
+    });
+    await expect(fetchCodexThread("s1")).rejects.toThrow("malformed projection payload");
+
+    // 四态之内照常透传（守卫只做形状校验，不做语义改写）
+    for (const cs of ["loading", "ready", "partial", "unsupported"] as const) {
+      routes.thread = projection({ contentState: cs });
+      await expect(fetchCodexThread("s1")).resolves.toMatchObject({ contentState: cs });
+    }
   });
 });
 
