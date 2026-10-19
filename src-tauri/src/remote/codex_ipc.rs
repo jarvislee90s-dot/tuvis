@@ -30,16 +30,17 @@ use crate::database::dao::write_audit::record_conn;
 use crate::inject::headless::codex::{baseline_len, production_rollout_path, resolve_thread};
 use crate::remote::pairing::DeviceStore;
 use crate::services::codex_control::{
-    reconcile_compat_fence, wire_text_hash, ActionContext, ActionKind, CodexControlRouter,
-    Delivery, DesktopDispatch, DispatchOutcome, FallbackPermit, PendingAction, RouterOutcome,
+    reconcile_compat_fence, wire_text_hash, ActionContext, ActionKind, BarrierRelease,
+    CodexControlRouter, Delivery, DesktopDispatch, DispatchOutcome, FallbackPermit, PendingAction,
+    RouterOutcome,
 };
 use crate::services::codex_desktop_ipc::adapter::{
     Connector, DesktopIpcAdapter, ProductionConnector,
 };
 use crate::services::codex_desktop_ipc::profile::profile_for;
 use crate::services::codex_desktop_ipc::types::{
-    ActionReceipt, CodexActionView, CodexQueueView, ControlRoute, PendingKind, ProtocolError,
-    ThreadKey, ThreadProjection,
+    ActionReceipt, ActionState, CodexActionView, CodexQueueView, ControlRoute, PendingKind,
+    ProtocolError, ThreadKey, ThreadProjection,
 };
 
 use super::server::RemoteState;
@@ -1588,9 +1589,20 @@ pub async fn queue_view(
             None
         }
     };
+    // 在册屏障动作清单（2026-10-19 无出口屏障修复）：人工解除端点的靶向依据——
+    // 前端按钮据此逐个 force-continue。读取失败如实降级为空清单（阻塞码派生同上，
+    // 两者独立读取互不牵连）。
+    let barrier_action_ids = match store.barrier_action_ids(&key) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("codex/queue 屏障动作清单读取失败: {e}");
+            Vec::new()
+        }
+    };
     let view = CodexQueueView {
         actions,
         blocked_reason_code,
+        barrier_action_ids,
     };
     json_no_store(
         StatusCode::OK,
@@ -1662,6 +1674,101 @@ pub async fn queue_retract(
             )
         }
     }
+}
+
+// ============================================================
+// 端点：POST /codex/queue/force-continue（2026-10-19 无出口屏障修复）
+// ============================================================
+
+/// POST /codex/queue/force-continue 请求体（camelCase）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceContinueReq {
+    #[serde(default)]
+    pub action_id: String,
+}
+
+/// POST /m/api/v1/codex/queue/force-continue：`{actionId}`——**人工解除「无出口保守
+/// 屏障」**（PR #165 复审 Important：native 投递 unknown 的队列屏障只有两处自动出口
+/// （turn 终态证据 / reconcile 三证据），route=desktop_ipc 且 state=unknown（尤其缺
+/// turnId）的屏障两处都到不了，队列永久阻塞）。语义：用户确认该消息实际去向已由其
+/// 在桌面端核对，显式解除队列屏障（copy 保持诚实——`native_delivery_unknown` 的
+/// 「无自动恢复路径」语义不变，人工解除是显式覆盖，前端二次确认披露重复投递风险）。
+///
+/// - 鉴权：gated nest 内层 gate 结构性覆盖 + 属主设备隔离（`get_for_device` 同款——
+///   非属主/不存在一律 404，不给存在性预言机）；
+/// - 状态机（CAS 安全）：仅解除「屏障在册且已终态」的行（unknown/accepted）；
+///   queued → 409 `queued_use_retract`（指引走既有撤回）；reserved 在飞行有自动路径
+///   （bridge 落账 / 对账）不在本端点范围；屏障已被自动路径解除/从未在册 → 409
+///   `no_barrier`；
+/// - 幂等：重复调用返回当前状态（200），绝不重复写审计；
+/// - 单调：解除写 `barrier_force_released_at` 标记，全部置屏障写点带同名单调性守卫；
+/// - 审计：解除成功单条 write_audit（action=`force_continue`）；
+/// - 解除后清该 Thread 的内存 Turn 顺序限制并接力 flush（本进程内队列立即恢复）。
+pub async fn queue_force_continue(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    body: Result<Json<ForceContinueReq>, JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(v) => v,
+        Err(_) => return bad_request(),
+    };
+    let action_id = req.action_id.trim().to_string();
+    if action_id.is_empty() {
+        return bad_request();
+    }
+    let Some((device_id, _)) = device_identity(st.as_ref(), &headers) else {
+        return forbidden_defense();
+    };
+    let store = st.codex_control.router.store();
+    let release = match store.force_release_barrier(&action_id, &device_id) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("codex/queue/force-continue 解除失败: {e}");
+            return json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal" }),
+            );
+        }
+    };
+    match release {
+        BarrierRelease::NotFound => error_body(StatusCode::NOT_FOUND, "no_action", None),
+        BarrierRelease::Released { view, thread_id } => {
+            // 持久屏障已清：同步清内存 Turn 顺序限制并接力下一条（否则本进程内队列
+            // 仍被 is_turn_active / flush 让路逻辑挡住，人工解除只在重启后生效）
+            let key = local_key(&thread_id);
+            st.codex_control
+                .router
+                .force_clear_turn_limit(&key, &action_id);
+            st.codex_control.notify_settled(&key);
+            log::info!(
+                "codex_ipc: 人工解除队列屏障（桌面端核对后显式覆盖）action={action_id} thread={thread_id}"
+            );
+            action_view_response(view)
+        }
+        // 幂等命中：直接返回当前状态（200），零新写入零审计
+        BarrierRelease::AlreadyReleased { view, .. } => action_view_response(view),
+        BarrierRelease::NotEligible(view) => {
+            if view.state == ActionState::Queued {
+                error_body(
+                    StatusCode::CONFLICT,
+                    "queued_use_retract",
+                    Some("该消息仍在排队，请使用撤回"),
+                )
+            } else {
+                error_body(StatusCode::CONFLICT, "no_barrier", None)
+            }
+        }
+    }
+}
+
+/// 动作视图 → 200 no-store 响应。
+fn action_view_response(view: CodexActionView) -> Response {
+    json_no_store(
+        StatusCode::OK,
+        serde_json::to_value(&view).unwrap_or_else(|_| serde_json::json!({})),
+    )
 }
 
 // ============================================================

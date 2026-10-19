@@ -16,8 +16,8 @@ use multi_agents_manager_lib::remote::pairing::{
 };
 use multi_agents_manager_lib::remote::server::{router, RemoteState};
 use multi_agents_manager_lib::services::codex_control::{
-    payload_hash, ActionContext, ActionKind, ActionPayload, ActionState, ActionStore, ControlRoute,
-    Delivery, ThreadKey,
+    payload_hash, ActionContext, ActionKind, ActionPayload, ActionReceipt, ActionState,
+    ActionStore, ControlRoute, Delivery, ThreadKey,
 };
 use multi_agents_manager_lib::services::codex_desktop_ipc::adapter::{
     Connector, DesktopIpcAdapter,
@@ -537,6 +537,7 @@ async fn new_routes_require_device_cookie() {
     }
     for uri in [
         "/m/api/v1/codex/queue/retract",
+        "/m/api/v1/codex/queue/force-continue",
         "/m/api/v1/codex/pending-response",
     ] {
         let r = app
@@ -1593,6 +1594,307 @@ async fn queue_retract_ownership_race_and_tombstone() {
         .await
         .unwrap();
     assert_eq!(r.status(), 409, "已派发不可撤");
+}
+
+// ============================================================
+// 人工解除「无出口保守屏障」（2026-10-19 复审 Important）：POST /codex/queue/force-continue
+// ============================================================
+
+/// 造「unknown + 保守屏障」账本行（复审列出的四条成因收敛后的统一终态）：
+/// register → reserve → finish_with_turn_barrier（UnknownDelivery，缺 turnId）。
+fn seed_unknown_barrier(store: &ActionStore, action_id: &str) {
+    let ctx = ActionContext {
+        action_id: action_id.to_string(),
+        device_id: "dev-1".into(),
+        device_name: "iPhone".into(),
+        kind: ActionKind::Send,
+        key: ThreadKey {
+            host_id: "local".into(),
+            thread_id: THREAD.into(),
+        },
+    };
+    store
+        .register(&ctx, ActionKind::Send, None, None, "h", Some("未知投递"))
+        .unwrap();
+    assert!(store.reserve(action_id, ControlRoute::DesktopIpc).unwrap());
+    store
+        .finish_with_turn_barrier(
+            &ActionReceipt {
+                action_id: action_id.to_string(),
+                delivery: Delivery::UnknownDelivery,
+                route: ControlRoute::DesktopIpc,
+                turn_id: None,
+                envelope_id: None,
+                reason_code: Some("rpc_timeout".into()),
+            },
+            None,
+        )
+        .unwrap();
+}
+
+async fn force_continue(
+    f: &Fixture,
+    cookie: Option<&str>,
+    action_id: &str,
+) -> axum::http::Response<axum::body::Body> {
+    f.app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/force-continue",
+            cookie,
+            Some(serde_json::json!({ "actionId": action_id }).to_string()),
+        ))
+        .await
+        .unwrap()
+}
+
+async fn queue_view_json(f: &Fixture) -> serde_json::Value {
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/queue?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    serde_json::from_str(&body_string(r).await).unwrap()
+}
+
+/// 成功路径：清屏障 + 队列视图解除（blockedReasonCode/barrierActionIds 双清）+
+/// 审计在册；解除断言不带存在性预言机。
+#[tokio::test]
+async fn force_continue_releases_unknown_barrier_and_updates_queue_view() {
+    let f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    seed_unknown_barrier(&f.hub_store(), "act-unk-1");
+
+    // 解除前：队列视图报 native_delivery_unknown + 屏障动作清单
+    let v = queue_view_json(&f).await;
+    assert_eq!(v["blockedReasonCode"], "native_delivery_unknown");
+    assert_eq!(v["barrierActionIds"], serde_json::json!(["act-unk-1"]));
+    assert!(
+        f.hub_store().has_compat_fence(&f.thread_key()).unwrap(),
+        "屏障在册"
+    );
+
+    // 解除：200 + 视图原状态（unknown）返回
+    let r = force_continue(&f, Some(COOKIE), "act-unk-1").await;
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["actionId"], "act-unk-1");
+    assert_eq!(v["state"], "unknown", "状态不被改写（只清屏障）");
+
+    // 持久屏障清 + 队列视图解除（三态派生不再报阻塞）
+    assert!(
+        !f.hub_store().has_compat_fence(&f.thread_key()).unwrap(),
+        "屏障已清"
+    );
+    let v = queue_view_json(&f).await;
+    assert!(
+        v["blockedReasonCode"].is_null(),
+        "解除后队列视图不再报阻塞：{v}"
+    );
+    assert_eq!(v["barrierActionIds"], serde_json::json!([]));
+
+    // 审计在册：恰好一条 force_continue（谁/哪个 action/何时）
+    let conn = f.conn.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT device_id, ts, summary, result FROM write_audit \
+             WHERE action = 'force_continue'",
+        )
+        .unwrap();
+    let rows: Vec<(String, i64, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "解除写恰好一条审计");
+    assert_eq!(rows[0].0, "dev-1", "谁");
+    assert!(rows[0].1 > 0, "何时（ts 在册）");
+    assert!(
+        rows[0].2.contains("act-unk-1"),
+        "哪个 action：{}",
+        rows[0].2
+    );
+    assert_eq!(rows[0].3, "barrier_force_released", "结果词");
+}
+
+/// 鉴权与隔离矩阵：非属主设备 404；不存在 404；queued 态 409 queued_use_retract
+/// （指引走既有撤回）；reserved 在飞 409 no_barrier；缺 actionId 400。
+#[tokio::test]
+async fn force_continue_ownership_and_state_machine_matrix() {
+    let f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    seed_device(&f.conn, "dev-2", "iPad");
+    let store = f.hub_store();
+    seed_unknown_barrier(&store, "act-own-1");
+
+    // 非属主设备 → 404（不给存在性预言机）
+    let r = force_continue(&f, Some("mam_device=dev-2"), "act-own-1").await;
+    assert_eq!(r.status(), 404, "非属主 404");
+    assert!(
+        f.hub_store().has_compat_fence(&f.thread_key()).unwrap(),
+        "非属主请求不触碰屏障"
+    );
+
+    // 不存在 → 404
+    let r = force_continue(&f, Some(COOKIE), "no-such-action").await;
+    assert_eq!(r.status(), 404, "不存在 404");
+
+    // queued 态 → 409 + queued_use_retract（指引走既有撤回）
+    let ctx = ActionContext {
+        action_id: "act-q-1".into(),
+        device_id: "dev-1".into(),
+        device_name: "iPhone".into(),
+        kind: ActionKind::Send,
+        key: f.thread_key(),
+    };
+    store
+        .register(&ctx, ActionKind::Send, None, None, "h", Some("排队中"))
+        .unwrap();
+    let r = force_continue(&f, Some(COOKIE), "act-q-1").await;
+    assert_eq!(r.status(), 409, "queued 走撤回不走解除");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "queued_use_retract");
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-q-1", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Queued,
+        "queued 行不被触碰（仍可撤）"
+    );
+
+    // reserved 在飞（无屏障）→ 409 no_barrier（在飞行有自动路径）
+    assert!(store.reserve("act-q-1", ControlRoute::DesktopIpc).unwrap());
+    let r = force_continue(&f, Some(COOKIE), "act-q-1").await;
+    assert_eq!(r.status(), 409);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "no_barrier");
+
+    // 缺 actionId → 400
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/queue/force-continue",
+            Some(COOKIE),
+            Some(serde_json::json!({}).to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    // 屏障行仍完好（上述 4xx 全部零写入）
+    assert!(
+        f.hub_store().has_compat_fence(&f.thread_key()).unwrap(),
+        "4xx 不触碰屏障"
+    );
+}
+
+/// 幂等：重复调用返回当前状态（200），审计不重复；解除后其他路径不回置屏障
+/// （启动恢复 / 超龄清扫 / bind_turn 补绑的守卫面）。
+#[tokio::test]
+async fn force_continue_idempotent_and_monotonic() {
+    let f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let store = f.hub_store();
+    seed_unknown_barrier(&store, "act-idem-1");
+
+    let r = force_continue(&f, Some(COOKIE), "act-idem-1").await;
+    assert_eq!(r.status(), 200, "首次解除成功");
+
+    // 重复调用：幂等 200（当前状态），审计仍是一条
+    let r = force_continue(&f, Some(COOKIE), "act-idem-1").await;
+    assert_eq!(r.status(), 200, "重复调用幂等返回当前状态");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["state"], "unknown");
+
+    // 解除后其他路径不回置屏障：
+    // ① 启动恢复（recover_reserved 只触 reserved）与超龄清扫不复活
+    store.recover_reserved().unwrap();
+    store.mark_stale_reserved_unknown(0);
+    // ② bind_turn 补绑（set_compat_fence 写点）带单调性守卫
+    store
+        .set_compat_fence("act-idem-1", Some("m"), Some("t"))
+        .unwrap();
+    // ③ 原子派发屏障写点同样被守卫
+    store
+        .set_compat_dispatch_barrier(
+            "act-idem-1",
+            Some("m"),
+            Some("t"),
+            Some("/p"),
+            Some(1),
+            Some("w"),
+        )
+        .unwrap();
+    assert!(
+        !store.has_compat_fence(&f.thread_key()).unwrap(),
+        "解除后任何路径不回置屏障（单调性）"
+    );
+
+    // 审计仍恰好一条（幂等调用零新增）
+    let conn = f.conn.lock().unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM write_audit WHERE action = 'force_continue'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "绝不重复写审计");
+}
+
+/// accepted+turnId 绑定屏障（native_turn_pending，有自动路径）同样允许显式覆盖：
+/// 队列视图报 native_turn_pending 时，人工解除也有效（用户核对后的越权出口统一面）。
+#[tokio::test]
+async fn force_continue_also_releases_accepted_turn_binding_barrier() {
+    let f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let store = f.hub_store();
+    let ctx = ActionContext {
+        action_id: "act-acc-1".into(),
+        device_id: "dev-1".into(),
+        device_name: "iPhone".into(),
+        kind: ActionKind::Send,
+        key: f.thread_key(),
+    };
+    store
+        .register(&ctx, ActionKind::Send, None, None, "h", Some("已接受"))
+        .unwrap();
+    assert!(store
+        .reserve("act-acc-1", ControlRoute::DesktopIpc)
+        .unwrap());
+    store
+        .finish_with_turn_barrier(
+            &ActionReceipt {
+                action_id: "act-acc-1".into(),
+                delivery: Delivery::Accepted,
+                route: ControlRoute::DesktopIpc,
+                turn_id: Some("turn-stuck".into()),
+                envelope_id: None,
+                reason_code: None,
+            },
+            Some("turn-stuck"),
+        )
+        .unwrap();
+
+    let v = queue_view_json(&f).await;
+    assert_eq!(v["blockedReasonCode"], "native_turn_pending");
+
+    let r = force_continue(&f, Some(COOKIE), "act-acc-1").await;
+    assert_eq!(r.status(), 200, "绑定屏障允许桌面端核对后的显式覆盖");
+    assert!(
+        !store.has_compat_fence(&f.thread_key()).unwrap(),
+        "绑定屏障已清"
+    );
+    let v = queue_view_json(&f).await;
+    assert!(v["blockedReasonCode"].is_null());
 }
 
 /// queueOnly 发送 → codex_queued（只排队不派发）；hub.stop() 后未派发项仍 queued。

@@ -110,13 +110,17 @@ pub struct CodexActionView {
 }
 
 /// 队列视图。`blocked_reason_code` 非 None（如 `compat_outstanding`）时排队不派发，
-/// 前端必须展示说明而不是让用户盲等。
+/// 前端必须展示说明而不是让用户盲等。`barrier_action_ids` 是在册屏障的动作清单
+///（2026-10-19 无出口屏障修复）：人工解除端点（POST /codex/queue/force-continue）
+/// 的靶向清单；`#[serde(default)]` 兼容旧载荷消费方。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexQueueView {
     pub actions: Vec<CodexActionView>,
     #[serde(rename = "blockedReasonCode")]
     pub blocked_reason_code: Option<String>,
+    #[serde(default)]
+    pub barrier_action_ids: Vec<String>,
 }
 
 /// 官方 Desktop 持有租约：owner 身份随连接生命周期变化（spec F6），epoch 由
@@ -490,6 +494,7 @@ mod tests {
                 receipt: None,
             }],
             blocked_reason_code: None,
+            barrier_action_ids: Vec::new(),
         };
         let v = serde_json::to_value(&view).unwrap();
         assert!(v["actions"][0]["actionId"].is_string());

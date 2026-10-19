@@ -715,6 +715,12 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
             "/codex/queue/retract",
             post(super::codex_ipc::queue_retract),
         )
+        // 人工解除「无出口保守屏障」（2026-10-19 复审 Important）：桌面端核对后的
+        // 显式覆盖。PIN 门禁内层 gate 结构性覆盖（同上述端点，零额外鉴权代码）。
+        .route(
+            "/codex/queue/force-continue",
+            post(super::codex_ipc::queue_force_continue),
+        )
         .route(
             "/codex/pending-response",
             post(super::codex_ipc::pending_response),
