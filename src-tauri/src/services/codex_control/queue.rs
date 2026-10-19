@@ -154,9 +154,10 @@ pub enum BarrierRelease {
         view: CodexActionView,
         thread_id: String,
     },
-    /// 不在人工解除范围 → 409。`barrier_in_register` = 保守屏障仍在册（reserved
-    /// 在飞 fence 等）——与「屏障已被自动路径解除/从未在册」（false）区分开：
-    /// PR #165 复审 Minor，屏障在册却回 `no_barrier` 会误导排障。
+    /// 不在人工解除范围 → 409。`barrier_in_register` = 派发在飞且将有/已有自动落账
+    /// 路径（保守屏障在册，或 compat 兜底回合在飞——handoff 与 fence 武装之间 fence
+    /// 尚未落库的瞬态窗口也算，PR #165 终审 Minor：该窗口回 `no_barrier` 会误导排障）；
+    /// false = 屏障已被自动路径解除/从未在册。
     NotEligible {
         view: CodexActionView,
         barrier_in_register: bool,
@@ -430,7 +431,11 @@ impl ActionStore {
                     })
                 }
                 dao::ForceReleaseRow::NotEligible(row) => {
-                    let barrier_in_register = row.compat_outstanding;
+                    // 屏障在册，或 compat 兜底回合在飞（fence 尚未武装的瞬态窗口也算
+                    // ——该行即将走自动落账，报 no_barrier 会误导用户与排障）
+                    let barrier_in_register = row.compat_outstanding
+                        || (matches!(row.state, ActionState::Reserved)
+                            && row.route == ControlRoute::HeadlessCompat);
                     Ok(BarrierRelease::NotEligible {
                         view: view_of(c, row).map_err(db_err)?,
                         barrier_in_register,

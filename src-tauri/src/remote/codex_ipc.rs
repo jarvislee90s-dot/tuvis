@@ -502,11 +502,9 @@ async fn settle_thread(hub: &Arc<CodexControlHub>, st: &Arc<RemoteState>, key: &
 /// 接力由周期对账兜底），permit 随 unwind Drop 守卫落账 unknown 并记日志。进程退出
 /// 时在飞任务随 runtime 丢弃（行为与现状对齐：Drop 守卫记 unknown，无 join 句柄）。
 pub(crate) fn consume_fallback(st: &Arc<RemoteState>, outcome: RouterOutcome, audit_session: &str) {
-    let (permit, reason_code) = match outcome {
-        RouterOutcome::UseFallback {
-            permit,
-            reason_code,
-        } => (permit, reason_code),
+    // reason_code 仅 HTTP 内联路径消费；调度路径的兜底回执由 run_compat 落账给出
+    let permit = match outcome {
+        RouterOutcome::UseFallback { permit, .. } => permit,
         other => {
             log::debug!("codex_ipc: 非兜底结果不经 bridge（{other:?}）");
             return;
@@ -533,7 +531,6 @@ pub(crate) fn consume_fallback(st: &Arc<RemoteState>, outcome: RouterOutcome, au
         );
         return;
     }
-    let _ = reason_code;
     let st_task = st.clone();
     let hub = st.codex_control.clone();
     let key = permit.context().key.clone();
@@ -1726,10 +1723,11 @@ pub struct ForceContinueReq {
 /// - 鉴权：gated nest 内层 gate 结构性覆盖 + 属主设备隔离（`get_for_device` 同款——
 ///   非属主/不存在一律 404，不给存在性预言机）；
 /// - 状态机（CAS 安全）：仅解除「屏障在册且已终态」的行（unknown/accepted）；
-///   queued → 409 `queued_use_retract`（指引走既有撤回）；屏障仍在册但不在本端点
-///   范围（reserved 在飞 fence——bridge 落账 / 对账有自动路径）→ 409
-///   `barrier_in_flight`（复审 Minor：不得谎报 `no_barrier` 误导排障）；屏障已被
-///   自动路径解除/从未在册 → 409 `no_barrier`；
+///   queued → 409 `queued_use_retract`（指引走既有撤回）；屏障在册但不在本端点
+///   范围（reserved 在飞 fence），或 compat 兜底回合在飞（fence 尚未武装的瞬态
+///   窗口）——bridge 落账 / 对账有自动路径 → 409 `barrier_in_flight`（终审 Minor：
+///   不得谎报 `no_barrier` 误导排障）；屏障已被自动路径解除/从未在册 → 409
+///   `no_barrier`；
 /// - 幂等：重复调用返回当前状态（200），绝不重复写审计；
 /// - 单调：解除写 `barrier_force_released_at` 标记，全部置屏障写点带同名单调性守卫；
 /// - 审计：解除成功单条 write_audit（action=`force_continue`）；
@@ -1778,8 +1776,9 @@ pub async fn queue_force_continue(
         }
         // 幂等命中：直接返回当前状态（200），零新写入零审计
         BarrierRelease::AlreadyReleased { view, .. } => action_view_response(view),
-        // 不在人工解除范围：按「屏障是否仍在册」区分——在册（reserved 在飞 fence）
-        // 回 barrier_in_flight 如实说明「在册但不在范围」；不在册才是 no_barrier
+        // 不在人工解除范围：按「是否将有/已有自动落账路径」区分——屏障在册，或
+        // compat 兜底回合在飞（fence 尚未武装的瞬态窗口），都回 barrier_in_flight
+        // 如实说明；真正无屏障可解才是 no_barrier
         BarrierRelease::NotEligible {
             view,
             barrier_in_register,
@@ -1794,7 +1793,7 @@ pub async fn queue_force_continue(
                 error_body(
                     StatusCode::CONFLICT,
                     "barrier_in_flight",
-                    Some("屏障在册但该消息派发在飞（有自动落账路径），不在人工解除范围"),
+                    Some("该消息派发在飞（有自动落账路径），不在人工解除范围"),
                 )
             } else {
                 error_body(StatusCode::CONFLICT, "no_barrier", None)

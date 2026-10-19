@@ -1725,8 +1725,9 @@ async fn force_continue_releases_unknown_barrier_and_updates_queue_view() {
 }
 
 /// 鉴权与隔离矩阵：非属主设备 404；不存在 404；queued 态 409 queued_use_retract
-/// （指引走既有撤回）；reserved 无屏障 409 no_barrier；reserved + 在飞 fence
-/// 409 barrier_in_flight（复审 Minor：屏障在册不得谎报 no_barrier）；缺 actionId 400。
+/// （指引走既有撤回）；reserved+A 路无屏障 409 no_barrier；reserved+compat 兜底在飞
+///（fence 未武装瞬态窗口）与 reserved+在飞 fence 均 409 barrier_in_flight（终审
+/// Minor：有自动落账路径不得谎报 no_barrier）；缺 actionId 400。
 #[tokio::test]
 async fn force_continue_ownership_and_state_machine_matrix() {
     let f = fixture_ipc(vec![codex_app_session(THREAD)]);
@@ -1771,12 +1772,34 @@ async fn force_continue_ownership_and_state_machine_matrix() {
         "queued 行不被触碰（仍可撤）"
     );
 
-    // reserved 无屏障（未武装在飞 fence）→ 409 no_barrier（无屏障可解）
+    // reserved + A 路无屏障 → 409 no_barrier（A 路在飞无自动兜底交接路径语义的
+    // 屏障可解性口径不变：真正无屏障可解才报 no_barrier）
     assert!(store.reserve("act-q-1", ControlRoute::DesktopIpc).unwrap());
     let r = force_continue(&f, Some(COOKIE), "act-q-1").await;
     assert_eq!(r.status(), 409);
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
     assert_eq!(v["error"], "no_barrier");
+
+    // reserved + compat 兜底回合在飞（handoff 已落、fence 未武装的瞬态窗口）→
+    // 409 barrier_in_flight（终审 Minor：该行即将走自动落账，谎报 no_barrier 会
+    // 让前端误判「无需解除」、排障者误判状态）
+    let ctx_fb = ActionContext {
+        action_id: "act-fb-1".into(),
+        device_id: "dev-1".into(),
+        device_name: "iPhone".into(),
+        kind: ActionKind::Send,
+        key: f.thread_key(),
+    };
+    store
+        .register(&ctx_fb, ActionKind::Send, None, None, "h", Some("排队中"))
+        .unwrap();
+    assert!(store
+        .reserve("act-fb-1", ControlRoute::HeadlessCompat)
+        .unwrap());
+    let r = force_continue(&f, Some(COOKIE), "act-fb-1").await;
+    assert_eq!(r.status(), 409, "兜底在飞瞬态窗口");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "barrier_in_flight");
 
     // reserved + 在飞 fence（屏障在册但不在解除范围）→ 409 barrier_in_flight
     // （复审 Minor：屏障明明在册，回 no_barrier 会误导排障；reason 说明真实状态）

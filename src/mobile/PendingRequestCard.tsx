@@ -146,10 +146,10 @@ function actionViewToReceipt(
  *  - 设备门禁（403）/ 会话不在快照（404）。
  *
  *  `no_action` 是防御位：POST /codex/pending-response 不会发该码；但既有端点里
- *  GET /codex/action（查询面）与 POST /codex/queue/force-continue（人工解除面，
- *  404 = 不存在/他人动作）都会发（2026-10-19 复审修正：原注释称「只有 GET 会发」
- *  已漂移）。留着防未来端点复用该码时静默漏进「结果未知」臂（多算一位只多一次
- *  解锁误判面，漏算才是锁卡事故）。 */
+ *  GET /codex/action（查询面）、POST /codex/queue/retract（撤回面）与
+ *  POST /codex/queue/force-continue（人工解除面，404 = 不存在/他人动作）都会发
+ *  （2026-10-19 复审修正：原注释称「只有 GET 会发」已漂移）。留着防未来端点复用
+ *  该码时静默漏进「结果未知」臂（多算一位只多一次解锁误判面，漏算才是锁卡事故）。 */
 const PRE_DELIVERY_ERROR_CODES = new Set([
   "bad_request", // malformed / deny_unknown_fields（登记前拒绝）
   "answers_mismatch", // 答案限额校验（登记前拒绝）

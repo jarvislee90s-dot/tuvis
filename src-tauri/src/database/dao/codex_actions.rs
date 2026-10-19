@@ -703,12 +703,18 @@ pub(crate) fn thread_has_pending_work_conn(
 const TURN_BINDING_PREDICATE: &str = "compat_outstanding = 1 AND route = 'desktop_ipc' \
      AND state IN ('accepted', 'unknown')";
 
-pub(crate) fn turn_binding_rows_conn(conn: &Connection) -> rusqlite::Result<Vec<ActionRow>> {
-    let sql = format!(
+/// 真实查询文本（COLS 全列投影）：`turn_binding_rows_conn` 与 EXPLAIN 回归测试共用
+/// 同一份文本——终审 Minor：测试若钉简化投影，列集变化导致真实计划漂移时测试不红。
+fn turn_binding_sql() -> String {
+    format!(
         "SELECT {COLS} FROM codex_actions \
          WHERE {TURN_BINDING_PREDICATE} \
          ORDER BY seq ASC"
-    );
+    )
+}
+
+pub(crate) fn turn_binding_rows_conn(conn: &Connection) -> rusqlite::Result<Vec<ActionRow>> {
+    let sql = turn_binding_sql();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], row_action)?;
     rows.collect()
@@ -1760,10 +1766,9 @@ mod tests {
             "queued 分支未走 partial index: {p:?}"
         );
 
-        // ② Turn 绑定枚举：SEARCH USING INDEX（(route,state,seq) 列序）
-        let p = plan(&format!(
-            "SELECT seq FROM codex_actions WHERE {TURN_BINDING_PREDICATE} ORDER BY seq ASC"
-        ));
+        // ② Turn 绑定枚举：SEARCH USING INDEX（(route,state,seq) 列序）——
+        // 钉真实查询全文（COLS 全列投影），列集变化导致计划漂移时本测试必须红
+        let p = plan(&turn_binding_sql());
         no_bare_table_scan(&p);
         assert!(
             p.iter()
