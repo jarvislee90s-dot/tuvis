@@ -1,9 +1,12 @@
 //! 本机 endpoint 解析 / 平台身份 / 连接（platform-specific 实现见 `unix` / `windows`）。
 //!
 //! 安全纪律（spec S1）：endpoint 解析只读本机文件系统与运行进程，不接受任何 HTTP
-//! 输入；连接前校验 socket 归属与权限（拒绝非同 uid、非 socket、宽权限），**不更改
-//! 用户权限**。身份纪律：Desktop build 从运行中的官方进程 bundle 读取；来源缺失或
-//! 多义 → `build=None` → 对应 profile 不命中 → A 写能力关闭（不能伪装成已验证版本）。
+//! 输入；连接前校验对端身份——Unix socket 核验归属与权限（拒绝非同 uid、非 socket、
+//! 宽权限），Windows named pipe 在连接成功后核验**服务端进程身份**
+//! （`GetNamedPipeServerProcessId` → 服务端 exe 白名单，防同名管道抢注；查证失败
+//! 一律断开 = fail-closed），**不更改用户权限**。身份纪律：Desktop build 从运行中的
+//! 官方进程 bundle 读取；来源缺失或多义 → `build=None` → 对应 profile 不命中 →
+//! A 写能力关闭（不能伪装成已验证版本）。
 //!
 //! 两个平台模块**全平台编译**（交叉 check 覆盖对面语法），非本机平台的方法返回
 //! 诚实错误——不假装可用。
