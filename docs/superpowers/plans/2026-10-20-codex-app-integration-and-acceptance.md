@@ -178,6 +178,7 @@ git log --reverse --oneline d5cc28b1..42cac262fd80d4a8e679fe138df75b6b4d48357e
 - [x] 保留每次写前的 owner generation、context token、目标 Request ID 原类型；Unknown 不回 queued，审批不降级，不暴露原始协议对象。
 - [x] Windows 4894 permissions=false、Mac 40934 command/permissions/blocking_input=false；保留其他精确 profile 的原有证据，不全局清零或放宽版本。
 - [x] 移动端只接 Codex IPC 投影、审批/问答卡和队列；旧模式/权限/interrupt APP 控件不注册。加载/不完整/Unsupported 与真空会话语义分开。
+- [x] 移动端 4 个 IPC 测试已从冻结源补回（70 例）：actionId 生命周期、unknown 锁死、not_sent 重试、SSE 降级、队列撤回/强制继续。
 - [x] 分别运行 `cargo test --test codex_desktop_ipc`、`cargo test --test codex_ipc_remote`、`cargo test --test codex_control_remote`，以及 `pnpm exec vitest run tests/mobile/codexIpcApi.test.tsx tests/mobile/useCodexThread.test.tsx tests/mobile/SessionDetail.test.tsx`。预期全部适用用例通过；不得接真实 Desktop 来满足假 IPC 测试。
 - [x] 提交 `feat: integrate Codex Desktop IPC control on main`。
 
@@ -319,11 +320,11 @@ Mac 正常 GUI/Finder 启动另列启动子格：核实该 Tuvis 实际 PATH；�
 
 **文件：**来源清单、复审报告、产品验收报告、受影响 README/手册/能力矩阵；新 PR 描述。
 
-- [ ] 推送前检查当前分支的授权与项目纪律；当前任务只写计划，不在本会话推送。执行阶段按用户已确定的新交付 PR 路线创建 PR，base=main，提交层次可审阅。
-- [ ] PR 描述重写为最终交付边界：共用底座+Codex、两种兼容前置、精确 build 能力、permissions 关闭、空首帧缺口、exec 权限语义、真实验证层级。链接来源 #117/#165，不沿用旧“包含四家 APP 全部可用”的文案。
-- [ ] 新 PR 创建后附着到执行聊天；#117/#165 保留供来源追溯，注明替代关系与未交付范围，不把旧 PR 对齐 main 当作本轮整合路线。
+- [x] 推送前检查当前分支的授权与项目纪律；当前任务只写计划，不在本会话推送。执行阶段按用户已确定的新交付 PR 路线创建 PR，base=main，提交层次可审阅。
+- [x] PR 描述重写为最终交付边界：共用底座+Codex、两种兼容前置、精确 build 能力、permissions 关闭、空首帧缺口、exec 权限语义、真实验证层级。链接来源 #117/#165，不沿用旧“包含四家 APP 全部可用”的文案。
+- [x] 新 PR 创建后附着到执行聊天；#117/#165 保留供来源追溯，注明替代关系与未交付范围，不把旧 PR 对齐 main 当作本轮整合路线。
 - [ ] 主分支发生新变化时按最新 main 解决冲突、复核语义和真实 diff，重跑受影响检查与必要验收；新 PR 再评审通过、所有适用产品格满足后才合入。
-- [ ] 更新项目功能文档/能力矩阵反映实际交付；本阶段不打 tag、不开独立正式版。发布文档最终版本小节和全量覆盖检查放在下一常规版本的 Task 13。
+- [x] 更新项目功能文档/能力矩阵反映实际交付；本阶段不打 tag、不开独立正式版。发布文档最终版本小节和全量覆盖检查放在下一常规版本的 Task 13。
 
 ### Task 12：整理 #117 剩余续作分支
 
@@ -363,7 +364,7 @@ Mac 正常 GUI/Finder 启动另列启动子格：核实该 Tuvis 实际 PATH；�
   `d6d2d348`（Task 5 IPC+移动端+Task 6–8 修正）、后续 `docs:` 提交（Task 9/10/12）。
 - 门禁：`cargo fmt --check`、`cargo clippy --all-targets --features marker-helper -- -D warnings`、
   `cargo test --features marker-helper`（2631 passed / 5 例为 main 基线既有 HOME 隔离失败，
-  已在 pristine main 复核）、三组 Codex 集成 42/50/34 全绿、`pnpm test`（146 文件/1519 例）、
+  已在 pristine main 复核）、三组 Codex 集成 42/50/34 全绿、`pnpm test`（150 文件/1589 例）、
   `pnpm check`、`pnpm build:mobile`、`pnpm check:i18n`、`check-error-codes` 全绿。
 - Task 6：`TurnRef.params` + `opening_input` + 两遍投影；4 个具名用例 + 2 个 observed DERIVED 样本。
 - Task 7：`useDelayedUnsupported`（500ms）+ 5 个 fake-timer 用例 + 详情页健康提示接线。
@@ -373,3 +374,4 @@ Mac 正常 GUI/Finder 启动另列启动子格：核实该 Tuvis 实际 PATH；�
   也无真实手机），按纪律不冒充通过；交接顺序见 `2026-10-20-codex-app-product-acceptance.md` §4。
 - Task 11：PR 在独立复审与修复后创建；本阶段不打 tag、不发版。
 - Task 12：续作 handoff 已入库（`2026-10-20-codex-app-remaining-handoff.md`）；#117/#165 原分支保留。
+- PR：https://github.com/jarvislee90s-dot/tuvis/pull/171（base main；复审后创建）。

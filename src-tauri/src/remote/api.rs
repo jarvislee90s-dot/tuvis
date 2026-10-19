@@ -1298,7 +1298,10 @@ pub async fn session_send(
     if headless_blocked(&st, &tool, session.form, session.pid).is_some() {
         return json_no_store(
             StatusCode::FORBIDDEN,
-            serde_json::json!({ "error": "headless_disabled" }),
+            serde_json::json!({
+                "error": "headless_disabled",
+                "reason": crate::remote::HEADLESS_DISABLED_REASON,
+            }),
         );
     }
     // C7 配对不确定提示（spec §5）：同工具同项目 ≥2 运行进程 → 成功回执附
@@ -1321,20 +1324,9 @@ pub async fn session_send(
             }),
         );
     }
-    // ⑤b Codex 兼容无头分派点：路由判出无头候选而**无终端候选** = 本条只能经兼容
-    //     通道投递（每回合 spawn、绝不入队——裁决 8）。各臂都在唯一生产 INSERT 之前：
-    //     无头条目进不了队列。
-    if let Some(kind) = crate::inject::routing::headless_kind_of(&outcome) {
-        if !crate::inject::routing::has_terminal_candidate(&outcome) {
-            use crate::inject::routing::HeadlessKind as K;
-            return match kind {
-                K::CodexQueue | K::CodexExec => {
-                    codex_headless_dispatch(&st, &device_id, &device_name, &session, &req.text)
-                        .await
-                }
-            };
-        }
-    }
+    // 说明：Codex APP 会话在函数入口已由 `codex_app_form` + hub 分支全部截走
+    // （见上方「Codex Desktop IPC 发送」），此处**不再保留**兼容直连臂——否则未来一旦
+    // 收窄 hub 条件，它会绕过 actionId 账本与持久去重，形成双投面（复审 G-1）。
     // ⑤ 组装（裁决 6 归一在入队时一次完成）+ 入队（FIFO 保序）。
     //
     // 丁T3 裁2：compose_injection 内部**按内容分流**——普通消息 = `{正文} [mobile 设备名]`
@@ -1723,74 +1715,6 @@ async fn run_codex_turn(
     );
     // 串行锁在审计行之后由守卫 Drop 释放（旧 `end(&ctx.sid)` 同一时序；评审 I14）
     out
-}
-
-/// **codex 无头分派**（H8 / Task 9；`session_send` ⑤b 的
-/// `Headless(CodexQueue | CodexExec)` 臂）。
-///
-/// 顺序与理由（每步都有判据依赖，勿随意改）：
-/// 1. **APP 在场**（[`crate::inject::headless::codex::production_presence`]：会话宿主进程
-///    存活 ∪ APP 主进程在场）→ 走向：开 ⇒ `queue`（首选，APP 原生排队可见）；关 ⇒
-///    `exec resume`（兜底）；
-/// 2. **thread UUID**（rollout 文件名 UUID **唯一**来源；解析不出即如实拒绝——**绝不按
-///    会话名投递**：Mac 普查 202 thread 中「hi」重名 ×5，且 `queue --thread` 自认收名字）；
-/// 3. **命令形态**（正文经 W4 单点 [`crate::inject::normalize::compose_injection`] 组装 +
-///    [`crate::inject::headless::codex::dispatch`]）；此后审计 `content` = 最终载荷；
-///    **花名白名单（裁决 24b）**：拼签名前判花名（判据本体在共享组装单点内，本臂只收 `Err`）
-///    ⇒ 不安全即 `refused`（零字节投递，原因点名字符）——此步在串行锁 4) 之前，无需注销槽位；
-/// 4. **会话串行锁**（占位；与取消靶子共表——取消端点只认 Task 8 那一份进程级登记表）；
-/// 5. **CLI 发现 + 版本门控**（`queue --help` 子命令在场；经
-///    [`crate::inject::headless::codex::probe_cli`]——Windows npm 垫片经 cmd 转一手，
-///    判定/缓存/键全部复用 Task 6 单点，**不触模型、不占无头回合名额**）；
-///    5a. **cmd 垫片正文拒绝**（R3）：形态 = 垫片 + 用户正文含 `cmd` 元字符 ⇒ `refused`
-///    （**排在版本探针之前**——探针也要起进程，能早拒就早拒）。`.exe` 直装放行；
-/// 6. **回合**（detached task，与 zcode 同口径：正文已进 codex，丢回执可以、丢用户消息
-///    不行；回执/审计/注销都在任务内完成）——queue 路径内含**消费确认自建**；
-/// 7. 回执封套 + 路由表可见性档（**单源** = Task 7 路由表，本任务不改可见性口径；
-///    `channel` 取**实际走向**，改道后如实记 queue）。
-pub(crate) async fn codex_headless_dispatch(
-    st: &Arc<RemoteState>,
-    device_id: &str,
-    device_name: &str,
-    session: &crate::session::Session,
-    text: &str,
-) -> Response {
-    json_no_store(
-        StatusCode::OK,
-        codex_headless_dispatch_envelope(
-            st,
-            device_id,
-            device_name,
-            session,
-            text,
-            crate::inject::headless::ACTION_HEADLESS,
-        )
-        .await,
-    )
-}
-
-/// [`codex_headless_dispatch`] 的封套变体（Task 6b）：返回 headless 封套 JSON（不包
-/// Response）——问答补投臂在封套上追加 `screen:null` 与引导文案后再包 200；审计
-/// action 词由调用方传（发送走 `headless` 既有词，补投走既有问答词 `answer`）。
-/// 其余语义（判据依赖序/串行锁/版本门/审计 channel=实际走向）与发送臂完全共用
-pub(crate) async fn codex_headless_dispatch_envelope(
-    st: &Arc<RemoteState>,
-    device_id: &str,
-    device_name: &str,
-    session: &crate::session::Session,
-    text: &str,
-    action: &str,
-) -> serde_json::Value {
-    codex_headless_dispatch_envelope_with_evidence(
-        st,
-        device_id,
-        device_name,
-        session,
-        text,
-        action,
-    )
-    .await
-    .0
 }
 
 /// [`codex_headless_dispatch_envelope`] 的证据透出变体（Task 8）：公开旧 wrapper

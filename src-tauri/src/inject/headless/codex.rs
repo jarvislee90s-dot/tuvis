@@ -850,7 +850,7 @@ pub enum ReceiptSource {
     NotApplicable,
 }
 
-/// 兼容兜底 bridge 的内部证据（Codex Desktop IPC Task 8）：`codex_headless_dispatch_envelope`
+/// 兼容兜底 bridge 的内部证据（Codex Desktop IPC Task 8）：`codex_headless_dispatch_envelope_with_evidence`
 /// 公开 wrapper 行为不变，证据随内部 [`TurnOutcome`] 透出——`run_compat` 据此登记
 /// compat fence（`queued_message_id` 供 reconcile 关联消费）与映射 Delivery。
 /// `turn_completed` 只有直接 Turn 终态证据才为 true（本通道的消费命中只证「已消费」，

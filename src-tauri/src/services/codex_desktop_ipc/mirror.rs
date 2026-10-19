@@ -703,7 +703,7 @@ fn error_item_summary(item: &Value) -> String {
 }
 
 /// 正文截头（字节上限，按字符边界回退）+ 显式截断标记（自报原文总字符数）。
-/// 形态对齐 normalize 的展示截断纪律（`DISPLAY_TRUNCATED: ` 前缀 + 原文总字符数）——
+/// 展示截断纪律（`DISPLAY_TRUNCATED: ` 前缀 + 原文总字符数）——
 /// 绝不静默砍；未超限逐字原文。
 fn truncate_text_head(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
@@ -1134,8 +1134,8 @@ mod tests {
         );
         assert!(p.truncated, "截头分支必须置位 truncated");
         let text = &p.messages[0].text;
-        // 展示截断标记沿用 `DISPLAY_TRUNCATED: ` 前缀（与 normalize 同款口径，
-        // 错误码对账门禁要求自报码）；头部原文紧随其后。
+        // 展示截断标记沿用 `DISPLAY_TRUNCATED: ` 前缀（错误码对账门禁要求自报码）；
+        // 头部原文紧随其后。
         const MARK: &str = "DISPLAY_TRUNCATED: ";
         assert!(text.starts_with(MARK), "截断标记前缀: {text}");
         assert!(text.contains('汉'), "保留头部原文");

@@ -133,5 +133,5 @@ PR 对齐 main 的合并，只从 main 正向抽取。
 - 编译：`cargo check --lib`、`cargo check --tests`
 - 三组集成测试：`cargo test --test codex_desktop_ipc`（42）、`--test codex_ipc_remote`（50）、
   `--test codex_control_remote`（34）
-- 移动端：`pnpm exec vitest run tests/mobile/{codexIpcApi,useCodexThread,SessionDetail,MessageComposer,PendingRequestCard,CodexQueuePanel,useDelayedUnsupported}.test.tsx`
+- 移动端：`pnpm exec vitest run tests/mobile/{codexIpcApi,useCodexThread,PendingRequestCard,CodexQueuePanel,SessionDetail,MessageComposer,useDelayedUnsupported}.test.tsx`（前四个 IPC 测试共 70 例已随本轮从冻结源补回）
 - 完整门禁与逐项结果见 `2026-10-20-codex-app-integration-review.md`。

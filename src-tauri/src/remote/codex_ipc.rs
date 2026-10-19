@@ -955,7 +955,7 @@ fn find_session_by_thread(
 // ============================================================
 
 /// **兜底 bridge 固定入口**（计划 Task 8 接口）：permit 内取原文/设备/会话映射 →
-/// 既有 `codex_headless_dispatch_envelope`（旧 headless 封套语义全套保留：thread
+/// 既有 `codex_headless_dispatch_envelope_with_evidence`（旧 headless 封套语义全套保留：thread
 /// 解析、花名白名单、串行锁、版本门、消费确认、审计）→ 按结果 `store.finish`：
 /// - 旧回执 `queued`/`ok` → [`Delivery::Accepted`]（入队/已消费都是「明确受理」——
 ///   fence 完成核对交由 reconcile 只读证据，不在此谎报 Turn 完成）；

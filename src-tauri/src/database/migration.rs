@@ -814,4 +814,53 @@ mod tests {
             "补列不得清空游标（清了会重采，与重建路径的取舍不同）"
         );
     }
+
+    /// Codex 动作账本：旧结构（无 barrier_force_released_at）经迁移补列——
+    /// 可空、存量行保留为 NULL；幂等两遍不报错。
+    #[test]
+    fn migrate_adds_codex_barrier_force_released_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE codex_actions (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_id TEXT UNIQUE NOT NULL,
+                device_id TEXT NOT NULL,
+                device_name TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                request_key TEXT,
+                context_token TEXT,
+                payload_hash TEXT NOT NULL,
+                client_message_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                route TEXT NOT NULL DEFAULT 'none',
+                queued_text TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                receipt_json TEXT,
+                compat_outstanding INTEGER NOT NULL DEFAULT 0,
+                compat_message_id TEXT,
+                compat_turn_id TEXT,
+                compat_rollout_path TEXT,
+                compat_rollout_baseline INTEGER,
+                compat_wire_hash TEXT
+            );
+            INSERT INTO codex_actions (action_id, device_id, device_name, thread_id, kind,
+                 payload_hash, client_message_id, state, created_at, updated_at, compat_outstanding)
+             VALUES ('legacy-a', 'd', 'iPhone', 't', 'send', 'h', 'cm', 'unknown', 1, 1, 1);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let (flag, ts): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT compat_outstanding, barrier_force_released_at \
+                 FROM codex_actions WHERE action_id = 'legacy-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((flag, ts), (1, None), "存量屏障行保留，解除标记为 NULL");
+        // 幂等：迁移两遍不报错
+        migrate(&conn).unwrap();
+    }
 }

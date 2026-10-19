@@ -9,8 +9,8 @@
 | 项 | 值 |
 | --- | --- |
 | base | `origin/main` `77fcdb487e8bd32eb4109cf8a274e7663a0ef43c` |
-| head | `8d3e237b`（本文档之前的交付提交：`67b01a13`/`d7d1d732`/`d6d2d348`/`8d3e237b`） |
-| diff 规模 | 83 文件、约 +40.6k/−0.1k（含夹具与文档） |
+| head | 本轮最终提交（`67b01a13`/`d7d1d732`/`d6d2d348`/`8d3e237b`/`bf9b2949` + 复审修复提交） |
+| diff 规模 | 83+ 文件、约 +40.6k/−0.1k（含夹具与文档） |
 | 独立复审 | 独立 reviewer 子代理（只读，禁改代码），对本 diff 逐项核对；主线另做自查与门禁复跑 |
 | 复审材料 | 本文件 + `2026-10-20-codex-app-extraction-ledger.md` + `2026-10-20-codex-app-preflight-results.md` |
 
@@ -27,7 +27,7 @@
 | 7 | `cargo test --test codex_control_remote` | PASS 34 | 账本/FIFO/屏障/Unknown/撤回 |
 | 8 | `cargo test --test headless_e2e -- --list` | 1 例（ignored） | `codex_queue_consumed` 未执行、零配额 |
 | 9 | `cargo check --release --features codex-ipc-e2e-stop` | **按预期编译失败** | `compile_error!`：只允许 debug 证据构建 |
-| 10 | `pnpm test` | PASS 146 文件 / 1519 例 / 5 skipped | 前端全量 |
+| 10 | `pnpm test` | PASS 150 文件 / 1589 例 / 5 skipped | 前端全量（含补回的 4 个 IPC 测试） |
 | 11 | `pnpm check`（format/lint/i18n/error-codes/build） | PASS | 构建产物正常 |
 | 12 | `pnpm build:mobile` | PASS | `dist-mobile/` |
 | 13 | `pnpm check:i18n` | PASS 1417 键 | zh/en 键集一致 |
@@ -118,6 +118,25 @@ tty_map 文件）；Windows permissions=false；不发版。
 | Q1 | Codex 两条发送路径（A 路 router 与兼容路）都调 `compose_injection`（恒带 `[mobile 花名]`），**忽略** main 的 `remote_message_signature` 开关；终端路径按开关 | 保留 #117 设计与「来源标记单点组装」决定；在验收报告 §8 登记为**通道差异**，是否改为受开关约束留待用户裁决（不影响投递安全，只影响 token 与溯源形态） |
 | Q2 | compose 的花名白名单对终端四家同样生效，轻微改变 main 终端发送行为（拒绝不安全花名） | 保留（安全优先，且只在花名含 cmd 元字符时触发）；在验收报告 §8 登记为**有意偏差**，不视为功能回归 |
 
+### D–G 复审（第二轮，HEAD 前进后复核）
+
+| # | 发现 | 处置 |
+| --- | --- | --- |
+| I-2 | 账本/计划把 `tests/mobile/codexIpcApi.test.tsx`、`useCodexThread.test.tsx` 列为验证入口，但仓内不存在；`codexIpcApi.ts`/`useCodexThread.ts`/`PendingRequestCard.tsx`/`CodexQueuePanel.tsx` 零测试 | **从冻结源补回 4 个测试文件**（70 例全绿）：actionId 生命周期、403 保持旧视图、SSE 三连失败降级、unknown 锁死 / not_sent 才重试 / verifying 防双答、队列撤回/强制继续。`SessionDetail` 的 Codex 投影分支仍无组件级测试（见 §8 残余缺口），账本已改为如实描述 |
+| D-1 | `let _ = migrate()` 吞错；「表在但缺列」的 ALTER 分支无回归 | 迁移失败改 `log::error!`；新增 `migrate_adds_codex_barrier_force_released_column`（旧表 → 迁移 → 列在 + 存量行保留 + 两遍幂等） |
+| E-1 | `mobile.codex.projection.*` 5 键无人消费（详情页硬编码中文） | 删除键；详情页整体未 i18n 化，部分接线会造成中英混排，登记为后续整体迁移（§8） |
+| E-2 | zh `headlessConcurrencyHint` 含字面 `**` | 去掉 Markdown 标记，zh/en 值对齐 |
+| E-3 | en `turnDeviceNameUnsafe` 仍写 "MAM roster" | 改 "Tuvis device roster" |
+| E-4 | zh `displayTruncated` 缺「原文更长」限定 | 改为「内容已截断（原文更长）」 |
+| F-1 | stage 夹具声称前端 `HEADLESS_STAGE_TRIAGE` 对账，实际无此符号 | 注释改为只声明 Rust 侧单边钉死，删除跨语言承诺 |
+| F-2 | observed README 对 busy 夹具的描述与实际派生不符 | README 改为「替换 params 的 clientUserMessageId/input、items 保留首条真实消息」 |
+| F-3 | 集成测试的 `#[cfg(test)]` 缝不生效，`production_presence` 真扫进程表（channel 随本机 Desktop 状态漂移） | 如实登记为**确定性缺口**（§8）；测试未断言 channel，PATH 已隔离不会真 spawn，暂不改生产代码 |
+| F-4 | 忙态矩阵缺「两次 busy 检查间转忙」与「start-turn success 返回已完成旧 turnId」两例 | 登记为**已知缺口**（§8）；现安全依赖下一发前 busy 复检（可能丢一条、不会双投），补测列入续作 |
+| G-1 | ⑤b 兼容直连臂今日不可达，未来收窄 hub 条件会变成绕过 actionId 账本的双投面 | **删除 ⑤b 与两个只被它调用的 wrapper**（`codex_headless_dispatch`/`_envelope`）；保留 `_with_evidence` 供 hub 兜底。加注释说明 Codex APP 一律走 hub |
+| G-2 | 403 `headless_disabled` 无 `reason`，Composer 只读 `reason` | 403 响应补 `reason: HEADLESS_DISABLED_REASON` |
+| G-3 | `audit_headless` 仍称「没有生产调用者」；mirror 注释引用已删函数 | 改为「`audit_headless_ctx` 每回合调用」；删掉对 `truncate_with_size_marker` 的引用 |
+| G-4 | 复审文档 head 落后 | 本节按最终 HEAD 更新（见 §1） |
+
 ### 复审已核对无问题（摘要）
 
 - 抽取边界：无 zcode/wb/dsh/cli_three/codex_app/tty_map/旧 APP 控制文件；路由枚举仅 Codex。
@@ -126,6 +145,27 @@ tty_map 文件）；Windows permissions=false；不发版。
   handoff；撤回 CAS + 墓碑；屏障只认精确 turnId 终态；FIFO 按 seq；compat fence 跨重启。
 - 迁移：新表 + partial index；`barrier_force_released_at` 幂等加列。
 
-## 8. 结论
+## 8. 残余缺口（如实登记）
 
-（待回填）
+1. **`SessionDetail` 的 Codex 投影分支无组件级测试**：补回的 4 个上游测试覆盖
+   `codexIpcApi`/`useCodexThread`/`PendingRequestCard`/`CodexQueuePanel`（70 例），但
+   详情页把投影替换消息列表的那段 JSX 仍靠 `tsc` 与手测；建议续作补一个 mock
+   `useCodexThread` 的挂载用例（空/loading/partial/unsupported/ready 五态）。
+2. **F-3 确定性**：`codex_ipc_remote` 的 presence 走真实进程扫描；测试不断言 channel，
+   故不会红，但「本机是否开着 Desktop」会影响内部走向。建议续作把 presence 注入
+   `RemoteState` 测试缝，或在 fixture 固定 channel。
+3. **F-4 忙态两格**：「两次 busy 检查之间转忙」「旧 Turn success」无回归用例；当前安全
+   依赖下一发前 busy 复检（最坏丢一条、不会双投）。
+4. **PRODUCT / Mac / 真机**：见 `2026-10-20-codex-app-product-acceptance.md`；未执行即未执行。
+
+## 9. 结论
+
+独立复审两轮结论均为 **PASS_WITH_FINDINGS（无 Critical）**；1 条 Important（测试入口
+不存在）与 D–G 的 12 条 Minor 已全部处置或如实登记。修复后重跑：
+
+- `cargo fmt --check` / `cargo clippy --all-targets --features marker-helper -- -D warnings`：PASS
+- `cargo test --features marker-helper`：2631 passed / 5 failed（均为 main 基线 HOME 隔离失败）
+- `cargo test --test codex_desktop_ipc / codex_ipc_remote / codex_control_remote`：42 / 50 / 34 PASS
+- `pnpm test`：150 文件 / 1589 例 / 5 skipped 全绿；`pnpm check`、`pnpm check:i18n`、`check-error-codes` PASS
+- 残余缺口与未测格见 §8 与验收报告，不以自动化层冒充产品验收。
+

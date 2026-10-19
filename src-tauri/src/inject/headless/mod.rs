@@ -110,9 +110,8 @@ pub fn audit_result(result: &str, duration_ms: u64) -> String {
 /// 两处调用；runner 不落账（它没有设备身份，也没有连接）。
 /// `duration_ms` 由 `Receipt::duration_ms` 原样传入（耗时口径见 [`audit_result`]）。
 ///
-/// **登记（Task 6 现状）**：本函数**目前没有生产调用者**——Task 6 只交付底座，接线在
-/// Task 8/9/11/13 的端点（`pub fn` 不触发 dead_code，未接线既不会编译报错也不会测试红，
-/// 故在此显式登记，别让它被漏掉）。
+/// **生产调用者**：`remote::api::headless_envelope` 的 `audit_headless_ctx` 在
+/// 每个兼容回合终结/取消时调用（本轮 Codex 通道已接线）。
 pub fn audit_headless(
     conn: &rusqlite::Connection,
     ctx: &HeadlessAuditCtx,

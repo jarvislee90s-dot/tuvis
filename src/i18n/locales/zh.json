@@ -415,7 +415,7 @@
       "headlessTimeoutLabel": "无头超时（毫秒）",
       "headlessTimeoutHint": "单次无头 turn 的看门狗上限：到点杀进程树并回执 stage=timeout（可重试）。默认 600000（10 分钟）。",
       "headlessConcurrencyLabel": "无头并发上限",
-      "headlessConcurrencyHint": "同时进行的无头 turn 数上限（1–8）：超额请求**即时返回「未执行」回执**（不排队、不自动补跑，请稍后重发）。默认 2。"
+      "headlessConcurrencyHint": "同时进行的无头 turn 数上限（1–8）：超额请求即时返回「未执行」回执（不排队、不自动补跑，请稍后重发）。默认 2。"
     },
     "audit": {
       "title": "注入审计",
@@ -1520,7 +1520,7 @@
     "codexQueuedNotConsumed": "已入队未消费：未观测到目标 rollout 追加，且入队条目仍在 codex 队列——建议在 APP 打开该会话，或改走 exec resume",
     "codexQueuedStalledUnverified": "已入队未消费：未观测到目标 rollout 追加，队列滞留项未能确认含本条——建议在 APP 打开该会话确认，或改走 exec resume",
     "codexWriterLockEvidence": "JSON-RPC -32600 + writer（单写者锁）",
-    "displayTruncated": "内容已截断",
+    "displayTruncated": "内容已截断（原文更长）",
     "gateCodexQueueMissing": "codex queue 子命令不在场（experimental 面，升级可能消失）",
     "gateProbeTimeout": "探针回合超时——反复超时请检查网络/模型服务",
     "gateVersionRefused": "版本门控未通过（拒发，不盲发）",
@@ -1560,13 +1560,6 @@
         "unavailable": "当前不可控制"
       },
       "staleBanner": "桌面端连接中断，已保留最后视图，暂时不能远程操作",
-      "projection": {
-        "truncated": "内容过长，仅显示最近片段（完整历史请回 Desktop 查看）",
-        "empty": "暂无消息",
-        "content_loading": "历史加载中——内容尚未完全载入",
-        "content_partial": "历史未完全载入，仅显示已载入部分",
-        "content_unsupported": "会话内容读取异常（待核对）——请刷新或稍后重试"
-      },
       "pending": {
         "titleCommand": "命令执行请求",
         "titlePermissions": "权限请求",

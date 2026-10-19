@@ -1540,7 +1540,7 @@
     "runnerWatcherGone": "Process supervision failed; the process tree was killed",
     "runnerWatcherGoneSync": "Process supervision failed (the wait side exited unexpectedly); the process tree was killed",
     "turnCmdShimUnsafe": "The command contains cmd metacharacters — the local CLI is an npm shim relaunched via cmd, which re-parses the whole command line; nothing was delivered. Install the CLI directly (.exe) or remove those characters and resend",
-    "turnDeviceNameUnsafe": "The device alias contains command-line-unsafe characters (the `[mobile <alias>]` signature would be re-parsed by cmd on Windows). Nothing was delivered — rename the device in the MAM roster and resend",
+    "turnDeviceNameUnsafe": "The device alias contains command-line-unsafe characters (the `[mobile <alias>]` signature would be re-parsed by cmd on Windows). Nothing was delivered — rename the device in the Tuvis device roster and resend",
     "migrateCodexBarrierReleaseFail": "Failed to migrate codex_actions.barrier_force_released_at: {error}",
     "codexQueueRetractPending": "This message is still queued; use retract instead",
     "codexQueueForceInFlight": "This message is in-flight (auto-settled), out of force-release scope"
@@ -1560,13 +1560,6 @@
         "unavailable": "Not controllable right now"
       },
       "staleBanner": "Desktop connection interrupted — showing the last known view; remote actions are disabled for now",
-      "projection": {
-        "truncated": "Content too long — showing the latest portion only (see Desktop for full history)",
-        "empty": "No messages yet",
-        "content_loading": "History loading — content not fully loaded yet",
-        "content_partial": "History partially loaded — showing loaded content only",
-        "content_unsupported": "Session content read error (pending review) — refresh or retry later"
-      },
       "pending": {
         "titleCommand": "Command approval request",
         "titlePermissions": "Permission request",

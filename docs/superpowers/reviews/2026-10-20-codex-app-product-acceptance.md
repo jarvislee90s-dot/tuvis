@@ -49,7 +49,7 @@ E6/E10/E11 需要桌面端有人在场按 §4 的点击顺序操作。
 | IPC HTTP | `cargo test --test codex_ipc_remote` | 50 passed |
 | 控制面 | `cargo test --test codex_control_remote` | 34 passed |
 | Codex E2E（ignored） | `cargo test --test headless_e2e -- --list` | 1 例 `codex_queue_consumed`（未实机执行，零配额） |
-| 前端 | `pnpm test` | 146 files / 1519 passed / 5 skipped |
+| 前端 | `pnpm test` | 150 files / 1589 passed / 5 skipped |
 | 错误码/双语 | `pnpm check:i18n`、`node scripts/check-error-codes.mjs` | PASS（1417 键；284 码 / 285 键 / legacy 5） |
 
 ## 4. 未执行步骤的交接顺序（Windows，需用户在场）
