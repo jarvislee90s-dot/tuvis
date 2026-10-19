@@ -106,7 +106,9 @@ fn project_one(
                 (
                     PendingKind::CommandApproval,
                     cap_ok,
-                    (!cap_ok).then(|| "capability_unavailable".to_string()),
+                    // 方法已知、该 build 能力未验证 → unverified（与「方法未知」拆码，
+                    // 前端文案可区分：「当前 Desktop 版本未验证该操作」）
+                    (!cap_ok).then(|| "capability_unverified".to_string()),
                     Some(
                         params
                             .get("command")
@@ -131,7 +133,8 @@ fn project_one(
                 (
                     PendingKind::PermissionsApproval,
                     cap_ok,
-                    (!cap_ok).then(|| "capability_unavailable".to_string()),
+                    // 同上：已知方法的未验证能力 → unverified
+                    (!cap_ok).then(|| "capability_unverified".to_string()),
                     None,
                     params
                         .get("cwd")
@@ -155,7 +158,8 @@ fn project_one(
                 (
                     PendingKind::UserInput,
                     cap_ok,
-                    (!cap_ok).then(|| "capability_unavailable".to_string()),
+                    // 同上：已知方法的未验证能力 → unverified
+                    (!cap_ok).then(|| "capability_unverified".to_string()),
                     None,
                     None,
                     None,
@@ -165,6 +169,7 @@ fn project_one(
             }
             _ => (
                 // 未知 method：只显示「此请求暂不支持远程处理」，不暴露 raw method/参数
+                // （保持 capability_unavailable——与「已知但未验证」的 unverified 拆分）
                 PendingKind::Unsupported,
                 false,
                 Some("capability_unavailable".to_string()),
@@ -337,9 +342,11 @@ mod tests {
         let v = &views[0];
         assert_eq!(v.kind, PendingKind::CommandApproval);
         assert!(!v.actionable);
+        // 拆码契约：方法已知但能力未验证 → capability_unverified（非 unavailable——
+        // 那是「方法未知」的码；前端据此显示「当前 Desktop 版本未验证该操作」）
         assert_eq!(
             v.disabled_reason_code.as_deref(),
-            Some("capability_unavailable")
+            Some("capability_unverified")
         );
         assert_eq!(v.request_key, "s:s-9");
         assert_eq!(v.command.as_deref(), Some("cargo test"));
