@@ -1,0 +1,1091 @@
+{
+  "_source": "Derived from windows-4894-snapshot.sanitized.json (raw/t7-1.jsonl busy negative: second start-turn returned the same turn id and produced no new userMessage). Only change: params.clientUserMessageId/input replaced with a synthetic second prompt; items keep the first (real) userMessage.",
+  "type": "snapshot",
+  "revision": 4,
+  "conversationState": {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "forkedFromId": null,
+    "hostId": "local",
+    "turns": [],
+    "requests": [],
+    "createdAt": 1792138562000,
+    "updatedAt": 1792403374000,
+    "recencyAt": 1792141074000,
+    "title": "Synthetic thread",
+    "originator": "codex_work_desktop",
+    "source": "vscode",
+    "agentNickname": null,
+    "threadSource": "user",
+    "historyMode": "paginated",
+    "canonicalVoiceHistory": true,
+    "parentThreadId": null,
+    "mode": "default",
+    "threadStartKind": "default",
+    "modelProvider": "openai",
+    "daybreakEnabled": null,
+    "latestModel": "gpt-6-luna",
+    "latestReasoningEffort": "low",
+    "previousTurnModel": null,
+    "latestCollaborationMode": {
+      "mode": "default",
+      "settings": {
+        "model": "gpt-6-luna",
+        "reasoning_effort": "low",
+        "developer_instructions": null
+      }
+    },
+    "hasUnreadTurn": false,
+    "threadGoal": null,
+    "threadRuntimeStatus": {
+      "type": "idle"
+    },
+    "rolloutPath": "\\\\?\\C:\\Users\\<user>\\.codex\\sessions\\2026\\10\\16\\rollout-2026-10-16T16-16-02-00000000-0000-4000-8000-000000000001.jsonl",
+    "gitInfo": {
+      "sha": "e6d2a4cf5e9b5d1001ffa06a3b491337e05801f3",
+      "branch": "master",
+      "originUrl": null
+    },
+    "resumeState": "resumed",
+    "latestTokenUsageInfo": {
+      "total": {
+        "totalTokens": 682210,
+        "inputTokens": 680911,
+        "cachedInputTokens": 620416,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 1299,
+        "reasoningOutputTokens": 20
+      },
+      "last": {
+        "totalTokens": 40410,
+        "inputTokens": 40384,
+        "cachedInputTokens": 40064,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 26,
+        "reasoningOutputTokens": 20
+      },
+      "modelContextWindow": 258400
+    },
+    "workspaceKind": "project",
+    "cwd": "C:\\Temp\\probe-project",
+    "environments": [
+      {
+        "environmentId": "local",
+        "cwd": "C:\\Temp\\probe-project",
+        "runtimeWorkspaceRoots": [
+          "C:\\Temp\\probe-project"
+        ]
+      }
+    ],
+    "environmentSelectionEvidence": {
+      "source": "live",
+      "updatedAt": 1792403374
+    },
+    "turnsPagination": {
+      "olderCursor": null,
+      "oldestLoadedTurnId": "00000000-0000-4000-8000-000000000002",
+      "isLoadingOlder": false,
+      "hasLoadedOldest": true
+    },
+    "workspaceBrowserRoot": null,
+    "projectlessOutputDirectory": null,
+    "sessionId": "00000000-0000-4000-8000-000000000001",
+    "boundedCloudHistory": false,
+    "turnHistory": {
+      "kind": "canonical",
+      "history": {
+        "entitiesByKey": {
+          "turn:00000000-0000-4000-8000-000000000003": {
+            "params": {
+              "threadId": "00000000-0000-4000-8000-000000000001",
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic undelivered busy prompt"
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-0000000000ff",
+              "approvalPolicy": "on-request",
+              "approvalsReviewer": "user",
+              "permissions": ":workspace",
+              "runtimeWorkspaceRoots": [
+                "C:\\Temp\\probe-project"
+              ],
+              "model": "gpt-6-luna",
+              "cwd": "C:\\Temp\\probe-project",
+              "effort": "low",
+              "summary": "none",
+              "personality": null,
+              "outputSchema": null,
+              "collaborationMode": null,
+              "attachments": [],
+              "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+              }
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-000000000003",
+            "rootTurnId": "00000000-0000-4000-8000-000000000003",
+            "turnStartedAtMs": 1792139983000,
+            "durationMs": 15013,
+            "finalAssistantStartedAtMs": 1792139998000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-000000000005",
+                "clientId": "00000000-0000-4000-8000-000000000004",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 1",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_000000000006",
+                "text": "Synthetic reply 1",
+                "phase": "commentary",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              },
+              {
+                "type": "commandExecution",
+                "id": "exec-000000000007",
+                "pluginId": null,
+                "scriptPath": null,
+                "command": "<synthetic command>",
+                "cwd": "C:\\Temp\\probe-project",
+                "processId": "52672",
+                "source": "unifiedExecStartup",
+                "status": "completed",
+                "commandActions": [
+                  {
+                    "type": "unknown",
+                    "command": "<synthetic command>"
+                  }
+                ],
+                "aggregatedOutput": null,
+                "exitCode": 0,
+                "durationMs": 584
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_000000000008",
+                "text": "Synthetic reply 2",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "completedItemIds": {
+              "msg_08fd99df059c2846016ad1e2ddbc508196a5d2c2e4b9690f18": true,
+              "exec-00000000-0000-4000-8000-000000000009": true,
+              "msg_08fd99df059c2846016ad1e2d85cd481969a44b02f71dc4ef0": true,
+              "00000000-0000-4000-8000-000000000005": true
+            },
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "msg_000000000008"
+            }
+          },
+          "turn:00000000-0000-4000-8000-00000000000a": {
+            "params": {
+              "threadId": "00000000-0000-4000-8000-000000000001",
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user prompt",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-00000000000b",
+              "approvalPolicy": "on-request",
+              "approvalsReviewer": "user",
+              "permissions": ":workspace",
+              "runtimeWorkspaceRoots": [
+                "C:\\Temp\\probe-project"
+              ],
+              "model": "gpt-6-luna",
+              "cwd": "C:\\Temp\\probe-project",
+              "effort": "low",
+              "summary": "none",
+              "personality": null,
+              "outputSchema": null,
+              "collaborationMode": null,
+              "attachments": [],
+              "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+              }
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-00000000000a",
+            "rootTurnId": "00000000-0000-4000-8000-00000000000a",
+            "turnStartedAtMs": 1792140210000,
+            "durationMs": 12134,
+            "finalAssistantStartedAtMs": 1792140222000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-00000000000c",
+                "clientId": "00000000-0000-4000-8000-00000000000b",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 2",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_00000000000d",
+                "text": "Synthetic reply 3",
+                "phase": "commentary",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              },
+              {
+                "type": "commandExecution",
+                "id": "exec-00000000000e",
+                "pluginId": null,
+                "scriptPath": null,
+                "command": "<synthetic command>",
+                "cwd": "C:\\Temp\\probe-project",
+                "processId": "61225",
+                "source": "unifiedExecStartup",
+                "status": "failed",
+                "commandActions": [
+                  {
+                    "type": "unknown",
+                    "command": "<synthetic command>"
+                  }
+                ],
+                "aggregatedOutput": "<redacted>",
+                "exitCode": 1,
+                "durationMs": 961
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_00000000000f",
+                "text": "Synthetic reply 4",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "completedItemIds": {
+              "msg_08fd99df059c2846016ad1e3bd51c08196a2322f1c96d056ce": true,
+              "exec-00000000-0000-4000-8000-000000000010": true,
+              "msg_08fd99df059c2846016ad1e3b6b34c81969f6b1ebd48abe31e": true,
+              "00000000-0000-4000-8000-00000000000c": true
+            },
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "msg_00000000000f"
+            }
+          },
+          "turn:00000000-0000-4000-8000-000000000011": {
+            "params": {
+              "threadId": "00000000-0000-4000-8000-000000000001",
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user prompt",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-000000000012",
+              "approvalPolicy": "on-request",
+              "approvalsReviewer": "user",
+              "permissions": ":workspace",
+              "runtimeWorkspaceRoots": [
+                "C:\\Temp\\probe-project"
+              ],
+              "model": "gpt-6-luna",
+              "cwd": "C:\\Temp\\probe-project",
+              "effort": "low",
+              "summary": "none",
+              "personality": null,
+              "outputSchema": null,
+              "collaborationMode": null,
+              "attachments": [],
+              "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+              }
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-000000000011",
+            "rootTurnId": "00000000-0000-4000-8000-000000000011",
+            "turnStartedAtMs": 1792140576000,
+            "durationMs": 15300,
+            "finalAssistantStartedAtMs": 1792140592000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-000000000013",
+                "clientId": "00000000-0000-4000-8000-000000000012",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 3",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_000000000014",
+                "text": "Synthetic reply 5",
+                "phase": "commentary",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_000000000015",
+                "text": "Synthetic reply 6",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "completedItemIds": {
+              "msg_08fd99df059c2846016ad1e52f391081969e5895c633d0dcbf": true,
+              "msg_08fd99df059c2846016ad1e5260d588196beab6dca8ea54aa7": true,
+              "00000000-0000-4000-8000-000000000013": true
+            },
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "msg_000000000015"
+            }
+          },
+          "turn:00000000-0000-4000-8000-000000000016": {
+            "params": {
+              "threadId": "00000000-0000-4000-8000-000000000001",
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user prompt",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-000000000017",
+              "approvalPolicy": "on-request",
+              "approvalsReviewer": "user",
+              "permissions": ":workspace",
+              "runtimeWorkspaceRoots": [
+                "C:\\Temp\\probe-project"
+              ],
+              "model": "gpt-6-luna",
+              "cwd": "C:\\Temp\\probe-project",
+              "effort": "low",
+              "summary": "none",
+              "personality": null,
+              "outputSchema": null,
+              "collaborationMode": null,
+              "attachments": [],
+              "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+              }
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-000000000016",
+            "rootTurnId": "00000000-0000-4000-8000-000000000016",
+            "turnStartedAtMs": 1792140652000,
+            "durationMs": 27951,
+            "finalAssistantStartedAtMs": 1792140680000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-000000000018",
+                "clientId": "00000000-0000-4000-8000-000000000017",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 4",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_000000000019",
+                "text": "Synthetic reply 7",
+                "phase": "commentary",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              },
+              {
+                "type": "commandExecution",
+                "id": "exec-00000000001a",
+                "pluginId": null,
+                "scriptPath": null,
+                "command": "<synthetic command>",
+                "cwd": "C:\\Temp\\probe-project",
+                "processId": "38574",
+                "source": "unifiedExecStartup",
+                "status": "failed",
+                "commandActions": [
+                  {
+                    "type": "unknown",
+                    "command": "<synthetic command>"
+                  }
+                ],
+                "aggregatedOutput": "<redacted>",
+                "exitCode": 1,
+                "durationMs": 837
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_00000000001b",
+                "text": "Synthetic reply 8",
+                "phase": "commentary",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              },
+              {
+                "type": "commandExecution",
+                "id": "exec-00000000001c",
+                "pluginId": null,
+                "scriptPath": null,
+                "command": "<synthetic command>",
+                "cwd": "C:\\Temp\\probe-project",
+                "processId": "19883",
+                "source": "unifiedExecStartup",
+                "status": "completed",
+                "commandActions": [
+                  {
+                    "type": "unknown",
+                    "command": "<synthetic command>"
+                  }
+                ],
+                "aggregatedOutput": null,
+                "exitCode": 0,
+                "durationMs": 328
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_00000000001d",
+                "text": "Synthetic reply 9",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "completedItemIds": {
+              "msg_08fd99df059c2846016ad1e58753148196a5ebe564cdbf5c4c": true,
+              "exec-00000000-0000-4000-8000-00000000001e": true,
+              "msg_08fd99df059c2846016ad1e57b99388196a87080a9cb0dbb00": true,
+              "exec-00000000-0000-4000-8000-00000000001f": true,
+              "msg_08fd99df059c2846016ad1e572d4a08196973de4a2e96fd70f": true,
+              "00000000-0000-4000-8000-000000000018": true
+            },
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "msg_00000000001d"
+            }
+          },
+          "turn:00000000-0000-4000-8000-000000000020": {
+            "params": {
+              "threadId": "00000000-0000-4000-8000-000000000001",
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user prompt",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-000000000021",
+              "approvalPolicy": "on-request",
+              "approvalsReviewer": "user",
+              "permissions": ":workspace",
+              "runtimeWorkspaceRoots": [
+                "C:\\Temp\\probe-project"
+              ],
+              "model": "gpt-6-luna",
+              "cwd": "C:\\Temp\\probe-project",
+              "effort": "low",
+              "summary": "none",
+              "personality": null,
+              "outputSchema": null,
+              "collaborationMode": null,
+              "attachments": [],
+              "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+              }
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-000000000020",
+            "rootTurnId": "00000000-0000-4000-8000-000000000020",
+            "turnStartedAtMs": 1792141074000,
+            "durationMs": 5347,
+            "finalAssistantStartedAtMs": 1792141080000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-000000000022",
+                "clientId": "00000000-0000-4000-8000-000000000021",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 5",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "reasoning",
+                "id": "rs_000000000023",
+                "summary": [],
+                "content": []
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_000000000024",
+                "text": "Synthetic reply 10",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "completedItemIds": {
+              "msg_08fd99df059c2846016ad1e716b3708196ad00cacc76f46b4c": true,
+              "rs_08fd99df059c2846016ad1e71683348196a58948b7317bec83": true,
+              "00000000-0000-4000-8000-000000000022": true
+            },
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "msg_000000000024"
+            }
+          },
+          "turn:00000000-0000-4000-8000-000000000002": {
+            "params": {
+              "threadId": "00000000-0000-4000-8000-000000000001",
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user prompt",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-000000000025",
+              "approvalPolicy": "on-request",
+              "approvalsReviewer": "user",
+              "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+              },
+              "model": "gpt-6-luna",
+              "cwd": "C:\\Temp\\probe-project",
+              "effort": "low",
+              "summary": "none",
+              "personality": null,
+              "outputSchema": null,
+              "collaborationMode": null,
+              "attachments": []
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-000000000002",
+            "rootTurnId": "00000000-0000-4000-8000-000000000002",
+            "turnStartedAtMs": 1792138565000,
+            "durationMs": 113771,
+            "finalAssistantStartedAtMs": 1792138679000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-000000000026",
+                "clientId": "00000000-0000-4000-8000-000000000025",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 6",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_000000000027",
+                "text": "Synthetic reply 11",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "completedItemIds": {
+              "msg_08fd99df059c2846016ad1ddb6557c819691e1ecd87d5f2b7d": true,
+              "00000000-0000-4000-8000-000000000026": true
+            },
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "msg_000000000027"
+            }
+          },
+          "turn:00000000-0000-4000-8000-000000000028": {
+            "params": {
+              "threadId": "00000000-0000-4000-8000-000000000001",
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user prompt",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-000000000029",
+              "approvalPolicy": "on-request",
+              "approvalsReviewer": "user",
+              "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+              },
+              "model": "gpt-6-luna",
+              "cwd": "C:\\Temp\\probe-project",
+              "effort": "low",
+              "summary": "none",
+              "personality": null,
+              "outputSchema": null,
+              "collaborationMode": null,
+              "attachments": []
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-000000000028",
+            "rootTurnId": "00000000-0000-4000-8000-000000000028",
+            "turnStartedAtMs": 1792138864000,
+            "durationMs": 4560,
+            "finalAssistantStartedAtMs": 1792138869000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-00000000002a",
+                "clientId": "00000000-0000-4000-8000-000000000029",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 7",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_00000000002b",
+                "text": "Synthetic reply 12",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "completedItemIds": {
+              "msg_08fd99df059c2846016ad1de73e04481968996726f7a14658e": true,
+              "00000000-0000-4000-8000-00000000002a": true
+            },
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "msg_00000000002b"
+            }
+          },
+          "turn:00000000-0000-4000-8000-00000000002c": {
+            "params": {
+              "threadId": "00000000-0000-4000-8000-000000000001",
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user prompt",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-00000000002d",
+              "approvalPolicy": "on-request",
+              "approvalsReviewer": "user",
+              "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+              },
+              "model": "gpt-6-luna",
+              "cwd": "C:\\Temp\\probe-project",
+              "effort": "low",
+              "summary": "none",
+              "personality": null,
+              "outputSchema": null,
+              "collaborationMode": null,
+              "attachments": []
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-00000000002c",
+            "rootTurnId": "00000000-0000-4000-8000-00000000002c",
+            "turnStartedAtMs": 1792138992000,
+            "durationMs": 12020,
+            "finalAssistantStartedAtMs": 1792139004000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-00000000002e",
+                "clientId": "00000000-0000-4000-8000-00000000002d",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 8",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_00000000002f",
+                "text": "Synthetic reply 13",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "completedItemIds": {
+              "msg_08fd99df059c2846016ad1defaf850819682aaa3dd464e70af": true,
+              "00000000-0000-4000-8000-00000000002e": true
+            },
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "msg_00000000002f"
+            }
+          },
+          "turn:00000000-0000-4000-8000-000000000030": {
+            "params": {
+              "threadId": "00000000-0000-4000-8000-000000000001",
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user prompt",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-000000000031",
+              "approvalPolicy": "on-request",
+              "approvalsReviewer": "user",
+              "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+              },
+              "model": "gpt-6-luna",
+              "cwd": "C:\\Temp\\probe-project",
+              "effort": "low",
+              "summary": "none",
+              "personality": null,
+              "outputSchema": null,
+              "collaborationMode": null,
+              "attachments": []
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-000000000030",
+            "rootTurnId": "00000000-0000-4000-8000-000000000030",
+            "turnStartedAtMs": 1792139777000,
+            "durationMs": 8279,
+            "finalAssistantStartedAtMs": 1792139785000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-000000000032",
+                "clientId": "00000000-0000-4000-8000-000000000031",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 9",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_000000000033",
+                "text": "Synthetic reply 14",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "completedItemIds": {
+              "msg_08fd99df059c2846016ad1e208e1d08196a0697518ffca1dc8": true,
+              "00000000-0000-4000-8000-000000000032": true
+            },
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "msg_000000000033"
+            }
+          },
+          "turn:00000000-0000-4000-8000-000000000034": {
+            "params": {
+              "threadId": "00000000-0000-4000-8000-000000000001",
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user prompt",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-000000000035",
+              "approvalPolicy": "on-request",
+              "approvalsReviewer": "user",
+              "sandboxPolicy": {
+                "type": "workspaceWrite",
+                "writableRoots": [],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false
+              },
+              "model": "gpt-6-luna",
+              "cwd": "C:\\Temp\\probe-project",
+              "effort": "low",
+              "summary": "none",
+              "personality": null,
+              "outputSchema": null,
+              "collaborationMode": null,
+              "attachments": []
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-000000000034",
+            "rootTurnId": "00000000-0000-4000-8000-000000000034",
+            "turnStartedAtMs": 1792139879000,
+            "durationMs": 8667,
+            "finalAssistantStartedAtMs": 1792139888000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-000000000036",
+                "clientId": "00000000-0000-4000-8000-000000000035",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 10",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "agentMessage",
+                "id": "msg_000000000037",
+                "text": "Synthetic reply 15",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "completedItemIds": {
+              "msg_08fd99df059c2846016ad1e26f4a488196bd4d498cdae98aeb": true,
+              "00000000-0000-4000-8000-000000000036": true
+            },
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "msg_000000000037"
+            }
+          }
+        },
+        "generation": 0,
+        "isComplete": true,
+        "islands": [
+          {
+            "id": "tail:0",
+            "entries": [
+              {
+                "key": "turn:00000000-0000-4000-8000-000000000002",
+                "value": "turn:00000000-0000-4000-8000-000000000002"
+              },
+              {
+                "key": "turn:00000000-0000-4000-8000-000000000028",
+                "value": "turn:00000000-0000-4000-8000-000000000028"
+              },
+              {
+                "key": "turn:00000000-0000-4000-8000-00000000002c",
+                "value": "turn:00000000-0000-4000-8000-00000000002c"
+              },
+              {
+                "key": "turn:00000000-0000-4000-8000-000000000030",
+                "value": "turn:00000000-0000-4000-8000-000000000030"
+              },
+              {
+                "key": "turn:00000000-0000-4000-8000-000000000034",
+                "value": "turn:00000000-0000-4000-8000-000000000034"
+              },
+              {
+                "key": "turn:00000000-0000-4000-8000-000000000003",
+                "value": "turn:00000000-0000-4000-8000-000000000003"
+              },
+              {
+                "key": "turn:00000000-0000-4000-8000-00000000000a",
+                "value": "turn:00000000-0000-4000-8000-00000000000a"
+              },
+              {
+                "key": "turn:00000000-0000-4000-8000-000000000011",
+                "value": "turn:00000000-0000-4000-8000-000000000011"
+              },
+              {
+                "key": "turn:00000000-0000-4000-8000-000000000016",
+                "value": "turn:00000000-0000-4000-8000-000000000016"
+              },
+              {
+                "key": "turn:00000000-0000-4000-8000-000000000020",
+                "value": "turn:00000000-0000-4000-8000-000000000020"
+              }
+            ],
+            "olderBoundary": {
+              "boundaryId": "tail:0:older",
+              "status": "exhausted"
+            },
+            "newerBoundary": {
+              "status": "exhausted",
+              "boundaryId": "tail:0:newer"
+            }
+          }
+        ]
+      }
+    },
+    "shellEnvironmentPolicy": null,
+    "paginatedHistory": {
+      "itemsBackwardsCursor": "{\"requestedThreadId\":\"00000000-0000-4000-8000-000000000001\",\"rolloutOrdinal\":164,\"includeAnchor\":true,\"scope\":{\"kind\":\"itemsByCreatedAtOrdinal\"}}"
+    },
+    "currentPermissions": {
+      "activePermissionProfile": {
+        "id": ":workspace",
+        "extends": null
+      },
+      "runtimeWorkspaceRoots": [
+        "C:\\Temp\\probe-project"
+      ],
+      "approvalPolicy": "on-request",
+      "approvalsReviewer": "user",
+      "sandboxPolicy": {
+        "type": "workspaceWrite",
+        "writableRoots": [],
+        "networkAccess": false,
+        "excludeTmpdirEnvVar": false,
+        "excludeSlashTmp": false
+      }
+    },
+    "latestThreadSettings": {
+      "disabledPluginIds": [],
+      "cwd": "C:\\Temp\\probe-project",
+      "approvalPolicy": "on-request",
+      "approvalsReviewer": "user",
+      "activePermissionProfile": {
+        "id": ":workspace",
+        "extends": null
+      },
+      "sandboxPolicy": {
+        "type": "workspaceWrite",
+        "writableRoots": [],
+        "networkAccess": false,
+        "excludeTmpdirEnvVar": false,
+        "excludeSlashTmp": false
+      },
+      "permissions": ":workspace",
+      "model": "gpt-6-luna",
+      "serviceTier": "default",
+      "effort": "low",
+      "multiAgentMode": "explicitRequestOnly",
+      "collaborationMode": {
+        "mode": "default",
+        "settings": {
+          "model": "gpt-6-luna",
+          "reasoning_effort": "low",
+          "developer_instructions": null
+        }
+      }
+    },
+    "threadGoalResumeConfirmation": null
+  }
+}
