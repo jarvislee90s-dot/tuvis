@@ -180,6 +180,10 @@ async fn complete_pending(shared: &ConnectionShared, envelope_id: &str, outcome:
 /// `changed()` 上的等待者（其 `changed()` 以 Err 返回 → 按断开零投递）。
 /// 幂等：握手已成功发值后再调用无害（等待者早已离开等待循环）。
 fn fail_init_waiters(shared: &ConnectionShared) {
+    // 已知取舍（PR #165 复审 Nit）：mutex 中毒（持有方曾在锁内 panic）时静默跳过
+    // 不唤醒——本函数只在断开/收尾路径上调用，中毒属极端场景；漏掉的等待者由
+    // 请求侧 `RPC_TIMEOUT` deadline 兜底苏醒（按 initialize_pending 零投递），
+    // 不值得为此引入 panic 传播或写恢复逻辑。
     if let Ok(mut slot) = shared.init_tx.lock() {
         *slot = None;
     }
