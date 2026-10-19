@@ -29,6 +29,9 @@ default-run = "tuvis"
 # 声明 [[bin]] 后 bin 自动发现关闭，三个 bin 均显式声明
 hook-listener = []
 marker-helper = ["hook-listener"]
+# E11 测试专用确定性停点（默认关）：只允许 debug 证据构建启用（编译门在
+# codex_control/mod.rs，release 构建显式拒绝）。
+codex-ipc-e2e-stop = []
 
 [[bin]]
 name = "tuvis"
@@ -119,7 +122,7 @@ junction = "2.1"
 # Win32_UI_Input_KeyboardAndMouse（M9R：VkKeyScanW/MapVirtualKeyW 真实键位布局）；
 # Win32_UI_WindowsAndMessaging：win32（窗口枚举）/ tuvis-marker（跳转 marker）/
 # deep_link（深链）
-windows = { version = "0.62", features = ["Win32_Security", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Threading", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Power", "Win32_System_Registry", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+windows = { version = "0.62", features = ["Win32_Security", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_System_Com", "Win32_System_Threading", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Power", "Win32_System_Registry", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_JobObjects", "Win32_System_Pipes"] }
 winreg = "0.55"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
@@ -144,3 +147,5 @@ dirs = "7.0"
 # M2 axum 集成测试：tower ServiceExt::oneshot + http-body-util 读响应体
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# codex_desktop_ipc 集成测试：start_paused 虚拟时间（RPC 超时用例不真等 15s）
+tokio = { version = "1", features = ["test-util"] }

@@ -34,6 +34,10 @@ pub mod create_path;
 pub mod dialog;
 pub mod engine;
 pub mod families;
+// 无头注入底座 + Codex 兼容通道：runner（并发/超时/取消/kill 树）+ receipt 归一 +
+// 版本门控探针 + 回合件 + `codex`（queue/exec 分派、消费确认、诚实回执）。
+// **本轮只交付 Codex 一家**——其他驱动留在 PR #117 续作。
+pub mod headless;
 // 模式切换内核（批次丙 T6）：统一模式枚举 + 各工具切换机制映射 + 屏读回显解析
 pub mod mode;
 pub mod normalize;
@@ -104,19 +108,22 @@ pub fn inject_list_audit(limit: Option<usize>) -> serde_json::Value {
 /// 参数；终端不留痕是可接受的，溯源走审计页：action=slash + device_name 列。
 /// 判据与实际注入形态同源单点：`normalize::is_slash_message`，见 session_send 的
 /// action 选择处）。
+/// **无头追加 `headless` / `headless_cancel`**：词表常量与落账出口单点在
+/// `inject::headless`——`ACTION_HEADLESS` / `ACTION_HEADLESS_CANCEL` +
+/// `headless::audit_headless`。该表 `action` 列为 TEXT NOT NULL、**无 CHECK 约束**
+/// （`database/schema.rs`），扩词**不需要 migration**。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn audit_write(
+pub(crate) fn audit_write_channel(
     conn: &rusqlite::Connection,
-    st: &crate::remote::server::RemoteState,
     device_id: &str,
     device_name: &str,
     agent_type: &str,
     session_id: &str,
+    channel: &str,
     content: &str,
     action: &str,
     result: &str,
 ) {
-    let channel = st.injector.name();
     let summary = normalize::summarize(content, normalize::AUDIT_SUMMARY_CHARS);
     crate::database::dao::write_audit::record_conn(
         conn,
@@ -134,5 +141,33 @@ pub(crate) fn audit_write(
     crate::remote::events::audit(
         action,
         &format!("sid={session_id} channel={channel} result={result}"),
+    );
+}
+
+/// 审计写口薄壳（**既有调用方零改动**）：channel = 终端注入器名。无头动作不走这里
+/// ——无头通道名不是终端注入器名，其落账出口 = [`headless::audit_headless`]（同表同
+/// 摘要口径，只把 channel 显式传入）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn audit_write(
+    conn: &rusqlite::Connection,
+    st: &crate::remote::server::RemoteState,
+    device_id: &str,
+    device_name: &str,
+    agent_type: &str,
+    session_id: &str,
+    content: &str,
+    action: &str,
+    result: &str,
+) {
+    audit_write_channel(
+        conn,
+        device_id,
+        device_name,
+        agent_type,
+        session_id,
+        st.injector.name(),
+        content,
+        action,
+        result,
     );
 }

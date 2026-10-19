@@ -407,7 +407,17 @@
       "tsClearedNotice": "已撤销；另有 {{count}} 条非 兔维斯 条目被一并清除：",
       "tsClearedToast": "已撤销：另有 {{count}} 条非 兔维斯 条目被一并清除",
       "namedRunningHint": "隧道已连接；地址永久有效",
-      "namedOffHint": "开关未打开——公网地址暂不可达；打开开关后恢复（地址不变，无需重配）。"
+      "namedOffHint": "开关未打开——公网地址暂不可达；打开开关后恢复（地址不变，无需重配）。",
+      "groupHeadless": "④ 无头注入（绕过终端可视确认）",
+      "headlessTitle": "无头注入",
+      "headlessHint": "默认关闭。关闭时，手机端无法向无头通道会话（ZCode / Codex APP / WorkBuddy）发消息；终端注入四家不受影响。",
+      "headlessConfirm": "无头注入将在不经过终端可视确认的情况下直接驱动 Agent 执行消息（含工具调用）。zcode 通道默认 yolo 档（不弹审批）。开启即表示知悉。",
+      "headlessLimitsSave": "保存无头配置",
+      "headlessTimeoutLabel": "无头超时（毫秒）",
+      "headlessTimeoutHint": "单次无头 turn 的看门狗上限：到点杀进程树并回执 stage=timeout（可重试）。默认 600000（10 分钟）。",
+      "headlessConcurrencyLabel": "无头并发上限",
+      "headlessConcurrencyHint": "同时进行的无头 turn 数上限（1–8）：超额请求**即时返回「未执行」回执**（不排队、不自动补跑，请稍后重发）。默认 2。",
+      "headlessApprovalLive": "claude 无头通道的审批卡已启用：回合等待工具批准或提问时，手机端会话详情页会弹出审批卡（允许 / 拒绝 / 提交答案），弃卡按拒绝处理。"
     },
     "audit": {
       "title": "注入审计",
@@ -1501,7 +1511,42 @@
     "createWindowTimeout": "起窗后超时未发现目标工具进程",
     "injectMenuTableMalformed": "权限菜单档位表不自洽——不猜位置，请在终端选择",
     "mobileNetworkFail": "{{param}} 网络异常——详见日志",
-    "httpClientBuildFail": "HTTP 客户端构建失败——详见日志"
+    "httpClientBuildFail": "HTTP 客户端构建失败——详见日志",
+    "codexAppendReadIncomplete": "（期间有追加段读取不完整/失败——未据此判否）",
+    "codexCancelledQueuedUnrecallable": "已取消（移动端请求）——消费等待中止；消息仍在 codex 队列中、无法撤回：请在 APP 打开该 thread 后查看，或自行在队列中清理",
+    "codexConsumedByApp": "APP 已消费该消息——回合执行与回复由 codex APP 自身完成，请在 APP 内或看板刷新后查看",
+    "codexDivertWriterLock": "原计划 exec resume 被会话单写者锁拒绝——已自动改道 queue（如实注明，未静默降级）",
+    "codexEnqueueReceiptId": "已入队（入队回执 id 见原文）",
+    "codexExecNoOutput": "exec resume 正常退出但 stdout 无任何输出——无法确认末条回复；请在会话内容中确认后再决定是否重发",
+    "codexQueueNoReceipt": "queue 进程正常退出（exit 0）但未拿到入队回执——无法证明入队，按通道异常如实上报",
+    "codexQueuedNotConsumed": "已入队未消费：未观测到目标 rollout 追加，且入队条目仍在 codex 队列——建议在 APP 打开该会话，或改走 exec resume",
+    "codexQueuedStalledUnverified": "已入队未消费：未观测到目标 rollout 追加，队列滞留项未能确认含本条——建议在 APP 打开该会话确认，或改走 exec resume",
+    "codexWriterLockEvidence": "JSON-RPC -32600 + writer（单写者锁）",
+    "displayTruncated": "内容已截断",
+    "gateCodexQueueMissing": "codex queue 子命令不在场（experimental 面，升级可能消失）",
+    "gateProbeTimeout": "探针回合超时——反复超时请检查网络/模型服务",
+    "gateVersionRefused": "版本门控未通过（拒发，不盲发）",
+    "headlessCancelled": "已取消（移动端请求，先到者生效）",
+    "headlessConcurrencyFull": "无头并发已满：本条未执行、未投递——请稍后重发",
+    "probeExeMissing": "可执行文件不在场（不 spawn）",
+    "probeSpawnFail": "探针 spawn 失败",
+    "runnerExitCode": "进程以非零退出码结束",
+    "runnerKillGroupAndSingleFail": "kill 组与单 pid 均失败",
+    "runnerKillStartFail": "kill 启动失败",
+    "runnerSignalKilled": "进程被信号终止（无退出码）",
+    "runnerSpawnFail": "spawn 失败",
+    "runnerStderrSuffix": "stderr 尾行见原文",
+    "runnerTaskkillExit": "taskkill 退出码非零",
+    "runnerTaskkillStartFail": "taskkill 启动失败",
+    "runnerWatchdogKilled": "watchdog 到点，已 kill 进程树（可重试）",
+    "runnerWatcherGone": "进程监视失败；已 kill 进程树",
+    "runnerWatcherGoneSync": "进程监视失败（wait 侧异常退出）；已 kill 进程树",
+    "turnCmdShimUnsafe": "命令含 cmd 元字符——本机 CLI 是 npm 垫片，cmd 会重解析整条命令行，可能被截断、改写或串联执行；本条未投递（零字节投递），请改用直装 CLI 或去掉这些字符后重发",
+    "turnDeviceNameUnsafe": "设备花名含命令行不安全字符：花名会作为 `[mobile <花名>]` 签名进无头 CLI 的命令行，Windows 上的 npm 垫片会经 cmd 重解析；本条未投递（零字节投递），请在设备花名册改名后重发",
+    "turnEtcKinds": "等多种不安全字符",
+    "migrateCodexBarrierReleaseFail": "迁移 codex_actions.barrier_force_released_at 失败：{error}",
+    "codexQueueRetractPending": "该消息仍在排队，请使用撤回",
+    "codexQueueForceInFlight": "该消息派发在飞（有自动落账路径），不在人工解除范围"
   },
   "mobile": {
     "composer": {
@@ -1509,6 +1554,75 @@
     },
     "question": {
       "cancelInterrupt": "中断回合（破坏性）"
+    },
+    "codex": {
+      "availability": {
+        "controllable": "可控制",
+        "send_only": "可发送但不支持交互",
+        "compat_only": "仅可使用兼容模式",
+        "unavailable": "当前不可控制"
+      },
+      "staleBanner": "桌面端连接中断，已保留最后视图，暂时不能远程操作",
+      "projection": {
+        "truncated": "内容过长，仅显示最近片段（完整历史请回 Desktop 查看）",
+        "empty": "暂无消息",
+        "content_loading": "历史加载中——内容尚未完全载入",
+        "content_partial": "历史未完全载入，仅显示已载入部分",
+        "content_unsupported": "会话内容读取异常（待核对）——请刷新或稍后重试"
+      },
+      "pending": {
+        "titleCommand": "命令执行请求",
+        "titlePermissions": "权限请求",
+        "titleInput": "等待回答",
+        "titleUnsupported": "待处理请求",
+        "unsupported": "此请求暂不支持远程处理",
+        "unverified": "当前 Desktop 版本未验证该操作",
+        "approve": "批准",
+        "reject": "拒绝",
+        "submit": "提交回答",
+        "freePlaceholder": "其他（自由作答）",
+        "freeAria": "自由作答内容",
+        "incomplete": "还有 {{n}} 题未作答，答全后才能提交",
+        "unknownDelivery": "投递结果未知，请在 Desktop 核对",
+        "accepted": "已受理，Desktop 正在处理（不代表回合已完成）",
+        "rejectedReceipt": "已拒绝（Desktop 已收到）",
+        "notSent": "未投出——本次未发送任何内容，可再按一次",
+        "staleContext": "该请求已过期（桌面端状态已变化），请等待最新状态",
+        "failed": "应答失败：{{message}}",
+        "writeLocked": "桌面端连接中断，暂时不能应答",
+        "verifying": "上次提交的结果核对中——已暂停操作，防止重复提交"
+      },
+      "queue": {
+        "title": "待发队列",
+        "position": "第{{n}}位",
+        "stateQueued": "待发送",
+        "stateReserved": "派发中",
+        "stateAccepted": "已接受",
+        "stateRejected": "已失败",
+        "stateUnknown": "结果未知",
+        "stateCancelled": "已取消",
+        "retract": "撤回",
+        "retractBusy": "该条已派发，无法撤回（请回 Desktop 核对）",
+        "retractFailed": "撤回失败：{{message}}",
+        "blockedCompat": "存在兼容模式未完成的发送，队列已暂停派发——请回 Desktop 核对后继续",
+        "blockedNativeTurn": "原生回合未确认完成，队列已暂停派发——等待 Turn 完成后自动继续",
+        "blockedNativeUnknown": "原生投递结果未知，队列已暂停派发——该屏障无自动恢复路径（保守保留，不自动重发）",
+        "forceContinue": "已到桌面端核对，继续队列",
+        "forceContinueRisk": "请确认该消息的实际去向已在 Desktop 端核对：若它实际已投出，继续后续消息可能造成重复内容。若清单包含仍在等待 Turn 完成的条目，确认后将提前解除其 Turn 顺序限制。",
+        "forceContinueYes": "确认继续",
+        "forceContinueCancel": "取消",
+        "forceContinueFailed": "继续队列失败：{{message}}"
+      },
+      "composer": {
+        "codexAccepted": "已受理，Desktop 正在执行",
+        "codexUnknown": "投递结果未知，请在 Desktop 核对",
+        "codexNotDelivered": "未送达：{{reason}}",
+        "codexQueued": "已进入桌面队列，第{{position}}位",
+        "headless_ok": "兼容通道已受理（CLI 回合已入队）",
+        "headless_queued": "兼容通道已入队",
+        "headless_failed": "兼容通道未送达：{{reason}}",
+        "headless_cancelled": "兼容通道已取消：{{reason}}"
+      }
     }
   }
 }

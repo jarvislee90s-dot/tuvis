@@ -407,7 +407,17 @@
       "tsClearedNotice": "Revoked; {{count}} non-Tuvis entr(y/ies) were cleared along with it:",
       "tsClearedToast": "Revoked: {{count}} non-Tuvis entr(y/ies) were cleared along with it",
       "namedRunningHint": "Tunnel connected; the address is permanent",
-      "namedOffHint": "Switch is off — the public address is unreachable; turn it on to restore it (the address never changes)."
+      "namedOffHint": "Switch is off — the public address is unreachable; turn it on to restore it (the address never changes).",
+      "groupHeadless": "4. Headless injection (bypasses terminal confirmation)",
+      "headlessTitle": "Headless injection",
+      "headlessHint": "Off by default. While off, headless-channel sessions (ZCode / Codex APP / WorkBuddy) cannot be messaged from the phone; the four terminal-injection tools are unaffected.",
+      "headlessConfirm": "Headless injection drives the Agent to execute messages (including tool calls) without visible confirmation in the terminal. The zcode channel defaults to yolo mode (no approval prompt). Enabling means you acknowledge this.",
+      "headlessLimitsSave": "Save headless settings",
+      "headlessTimeoutLabel": "Headless timeout (ms)",
+      "headlessTimeoutHint": "Watchdog limit for a single headless turn; on expiry the process tree is killed and the receipt reports stage=timeout (retryable). Default 600000 (10 minutes).",
+      "headlessConcurrencyLabel": "Headless concurrency cap",
+      "headlessConcurrencyHint": "Maximum number of concurrent headless turns (1-8); excess requests immediately get a 'not executed' receipt (no queueing, no auto-retry; resend later). Default 2.",
+      "headlessApprovalLive": "Approval cards for the claude headless channel are live: while a turn waits for a tool approval or an answer, the mobile session detail page shows an approval card (allow / deny / submit answers); dismissing a card counts as deny."
     },
     "audit": {
       "title": "Injection Audit",
@@ -1501,7 +1511,42 @@
     "createWindowTimeout": "Tool process not found after launch within the timeout",
     "injectMenuTableMalformed": "Permission menu tier table is inconsistent — refusing to guess; pick in the terminal",
     "mobileNetworkFail": "Network error on {{param}} — see logs",
-    "httpClientBuildFail": "Failed to build the HTTP client — see logs"
+    "httpClientBuildFail": "Failed to build the HTTP client — see logs",
+    "codexAppendReadIncomplete": "(some appended segments could not be read fully during the wait — not used to judge against)",
+    "codexCancelledQueuedUnrecallable": "Cancelled (requested from mobile) — the consumption wait stopped; the message remains in the codex queue and cannot be recalled: open the thread in the APP or clear the queue manually",
+    "codexConsumedByApp": "The APP consumed this message — the turn and reply are handled by the codex APP itself; check the APP or refresh the board",
+    "codexDivertWriterLock": "The planned exec resume was refused by the session's single-writer lock — automatically diverted to queue (honestly noted, not a silent downgrade)",
+    "codexEnqueueReceiptId": "Enqueued (enqueue receipt id in the original text)",
+    "codexExecNoOutput": "exec resume exited normally but stdout had no output — the last reply cannot be confirmed; check the session content before resending",
+    "codexQueueNoReceipt": "The queue process exited normally (exit 0) but no enqueue receipt was obtained — delivery cannot be proven; reported as a channel error",
+    "codexQueuedNotConsumed": "Enqueued but not consumed: no rollout append was observed and the enqueued item is still in the codex queue — open the session in the APP or switch to exec resume",
+    "codexQueuedStalledUnverified": "Enqueued but not consumed: no rollout append was observed and the stalled queue items could not be confirmed to include this one — open the session in the APP or switch to exec resume",
+    "codexWriterLockEvidence": "JSON-RPC -32600 + writer (single-writer lock)",
+    "displayTruncated": "Content truncated (original was longer)",
+    "gateCodexQueueMissing": "The codex queue subcommand is missing (experimental surface; may disappear on upgrade)",
+    "gateProbeTimeout": "The probe turn timed out — for repeated timeouts check the network/model service",
+    "gateVersionRefused": "Version gate not passed — refusing to send rather than sending blindly",
+    "headlessCancelled": "Cancelled (requested from mobile; first requester wins)",
+    "headlessConcurrencyFull": "Headless concurrency is full: this message was not executed or delivered — please resend later",
+    "probeExeMissing": "Executable not present — nothing will be spawned",
+    "probeSpawnFail": "Probe spawn failed",
+    "runnerExitCode": "The process exited with a non-zero code",
+    "runnerKillGroupAndSingleFail": "Both the process-group kill and the single-pid kill failed",
+    "runnerKillStartFail": "Failed to launch kill",
+    "runnerSignalKilled": "The process was terminated by a signal (no exit code)",
+    "runnerSpawnFail": "Failed to spawn the process",
+    "runnerStderrSuffix": "stderr tail lines in the original text",
+    "runnerTaskkillExit": "taskkill exited with a non-zero code",
+    "runnerTaskkillStartFail": "Failed to launch taskkill",
+    "runnerWatchdogKilled": "Watchdog fired and killed the process tree (retryable)",
+    "runnerWatcherGone": "Process supervision failed; the process tree was killed",
+    "runnerWatcherGoneSync": "Process supervision failed (the wait side exited unexpectedly); the process tree was killed",
+    "turnCmdShimUnsafe": "The command contains cmd metacharacters — the local CLI is an npm shim relaunched via cmd, which re-parses the whole command line; nothing was delivered. Install the CLI directly (.exe) or remove those characters and resend",
+    "turnDeviceNameUnsafe": "The device alias contains command-line-unsafe characters (the `[mobile <alias>]` signature would be re-parsed by cmd on Windows). Nothing was delivered — rename the device in the MAM roster and resend",
+    "turnEtcKinds": "and more unsafe character kinds",
+    "migrateCodexBarrierReleaseFail": "Failed to migrate codex_actions.barrier_force_released_at: {error}",
+    "codexQueueRetractPending": "This message is still queued; use retract instead",
+    "codexQueueForceInFlight": "This message is in-flight (auto-settled), out of force-release scope"
   },
   "mobile": {
     "composer": {
@@ -1509,6 +1554,75 @@
     },
     "question": {
       "cancelInterrupt": "Interrupt turn (destructive)"
+    },
+    "codex": {
+      "availability": {
+        "controllable": "Controllable",
+        "send_only": "Send-only (no interactive control)",
+        "compat_only": "Compatibility mode only",
+        "unavailable": "Not controllable right now"
+      },
+      "staleBanner": "Desktop connection interrupted — showing the last known view; remote actions are disabled for now",
+      "projection": {
+        "truncated": "Content too long — showing the latest portion only (see Desktop for full history)",
+        "empty": "No messages yet",
+        "content_loading": "History loading — content not fully loaded yet",
+        "content_partial": "History partially loaded — showing loaded content only",
+        "content_unsupported": "Session content read error (pending review) — refresh or retry later"
+      },
+      "pending": {
+        "titleCommand": "Command approval request",
+        "titlePermissions": "Permission request",
+        "titleInput": "Waiting for your answer",
+        "titleUnsupported": "Pending request",
+        "unsupported": "This request cannot be handled remotely yet",
+        "unverified": "The current Desktop build has not verified this action",
+        "approve": "Approve",
+        "reject": "Reject",
+        "submit": "Submit answer",
+        "freePlaceholder": "Other (free text)",
+        "freeAria": "Free-form answer",
+        "incomplete": "{{n}} question(s) unanswered — answer all before submitting",
+        "unknownDelivery": "Delivery result unknown — please verify on Desktop",
+        "accepted": "Accepted — Desktop is processing (does not mean the turn finished)",
+        "rejectedReceipt": "Rejected (Desktop acknowledged)",
+        "notSent": "Not sent — nothing was delivered; you can try again",
+        "staleContext": "This request is stale (Desktop state changed) — wait for the latest view",
+        "failed": "Response failed: {{message}}",
+        "writeLocked": "Desktop connection interrupted — answering is disabled for now",
+        "verifying": "Verifying the previous submission — actions are paused to prevent duplicates"
+      },
+      "queue": {
+        "title": "Outgoing queue",
+        "position": "#{{n}} in queue",
+        "stateQueued": "Queued",
+        "stateReserved": "Dispatching",
+        "stateAccepted": "Accepted",
+        "stateRejected": "Failed",
+        "stateUnknown": "Outcome unknown",
+        "stateCancelled": "Cancelled",
+        "retract": "Retract",
+        "retractBusy": "Already dispatched — cannot retract (verify on Desktop)",
+        "retractFailed": "Retract failed: {{message}}",
+        "blockedCompat": "A compatibility-mode send is still outstanding — queue dispatch is paused; verify on Desktop first",
+        "blockedNativeTurn": "Native turn not yet confirmed complete — queue paused; resumes automatically once the turn completes",
+        "blockedNativeUnknown": "Native delivery outcome unknown — queue paused; this barrier has no auto-recovery path (conservatively held, never auto-resent)",
+        "forceContinue": "Verified on Desktop — continue queue",
+        "forceContinueRisk": "Confirm you have verified this message's actual delivery on Desktop. If it was already delivered, continuing later messages may cause duplicated content. If the list includes entries still waiting for their turn to complete, confirming will release their turn-ordering restriction early.",
+        "forceContinueYes": "Confirm & continue",
+        "forceContinueCancel": "Cancel",
+        "forceContinueFailed": "Continue queue failed: {{message}}"
+      },
+      "composer": {
+        "codexAccepted": "Accepted — Desktop is running it",
+        "codexUnknown": "Delivery result unknown — please verify on Desktop",
+        "codexNotDelivered": "Not delivered: {{reason}}",
+        "codexQueued": "Queued on Desktop, position {{position}}",
+        "headless_ok": "Compatibility channel accepted (CLI turn queued)",
+        "headless_queued": "Compatibility channel queued",
+        "headless_failed": "Compatibility channel not delivered: {{reason}}",
+        "headless_cancelled": "Compatibility channel cancelled: {{reason}}"
+      }
     }
   }
 }
