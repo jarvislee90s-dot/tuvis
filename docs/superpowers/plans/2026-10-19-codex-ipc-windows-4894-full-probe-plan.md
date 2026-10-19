@@ -33,15 +33,20 @@
 
 ## 1. 用户已提供 / 执行前必须确认的前提
 
-| # | 前提 | 未满足时的降级 |
-| --- | --- | --- |
-| P1 | Codex Desktop 可运行、已登录，探测时段内允许关闭/重启 | T9 记 NOT_TRIGGERED，其余照常 |
-| P2 | 一个**专用测试会话**（新建，可污染），不用真实工作会话 | 无降级——没有测试会话不得开工 |
-| P3 | APP 内该会话的审批设置为「执行命令需批准」 | T6 记 NOT_AVAILABLE + 截图证据 |
-| P4 | 一个测试目录（建议 `C:\Users\bunny\tuvis-probe\`，内放 1 个文本文件）供权限审批场景 | T7 记 NOT_AVAILABLE |
-| P5 | 测试会话可切 **Plan collaboration mode**（APP 内手动切，远程切换不在本期） | T8 记 NOT_AVAILABLE + 证据，禁止伪造 |
-| P6 | tuvis 远程端已配对（已有 matebook-chrome）+ 本机浏览器可开远程 UI | 波次 B 的移动端格改用本机 Chrome，如实标注 |
-| P7 | 磁盘 ≥ 2 GB（探针构建 + 捕获日志） | 先清理再开工 |
+| # | 前提 | 状态 | 未满足时的降级 |
+| --- | --- | --- | --- |
+| P1 | Codex Desktop 可运行、已登录，探测时段内允许关闭/重启 | ✅ 用户已授权 | T9 记 NOT_TRIGGERED，其余照常 |
+| P2 | 一个**专用测试项目**（可污染），不用真实工作会话 | ✅ 已备：Desktop 项目 **「tuvis-codex-ipc-probe」**（用户预检建好；其下会话「hi」是人工预检记录，探测**不复用**） | 无降级——没有测试项目不得开工 |
+| P3 | 审批场景素材 | ✅ 已备：升权 prompt 已人工预检可用（附录 A3）；测试文件 `C:\Temp\tuvis-ipc-probe-approval\approval-test.txt` 已存在（内容 `tuvis ipc approval probe`） | T6 记 NOT_AVAILABLE + 截图证据 |
+| P4 | 权限审批场景 | ✅ 同上（读取 P3 的测试文件触发读取授权） | T7 记 NOT_AVAILABLE |
+| P5 | 测试会话可切 **Plan collaboration mode**（APP 内手动/自动切，远程切换不在本期） | ⚠️ 唯一待定项，见附录 A6 | T8 记 NOT_AVAILABLE + 证据，禁止伪造 |
+| P6 | tuvis 远程端已配对 | ✅ 已配对设备 `matebook-chrome`（本机 Chrome） | 波次 B 用本机 Chrome 已配对会话，如实标注 |
+| P7 | 磁盘 ≥ 2 GB（探针构建 + 捕获日志） | 开工前 `Get-PSDrive E,C` 自查 | 先清理再开工 |
+
+**中断纪律（最高优先）**：本计划已把全部操作细节预置（附录 A）。执行全程**禁止中途向用户提问**——
+一切不确定按「如实记录 + 降级 NOT_AVAILABLE/偏差 + 写入报告遗留节」处理，由主 Agent 审计时统一裁决。
+唯一可能的人工点是 A6 的 Plan 模式切换，且优先由执行者自助完成；启动硬前提不满足（Desktop 无法
+启动/未登录）才允许终止并报告。
 
 ---
 
@@ -77,11 +82,11 @@
 | **T1 只读协议往返** | initialize → thread-owner-discovery → `following:true` → 收 targeted snapshot → 只读 `load-complete-history` → `following:false` → 关闭（照 observed/README 记载的 mac 探针同序） | 全程帧 | 快照可被生产 `HistoryView` 解析；`contentState` 判定 = Ready；discovery/following 无版本错误 |
 | **T2 形态一致性** | 对 T1 snapshot 逐项核对金样 5 条事实（observed/README）：entries.value 引用 / turnId 认领 / 实体无 type / 内联 camelCase items / 完整性分层（history 层 isComplete + itemsPagination） | 核对表 + 差异帧 | 与 macOS 金样**同构**；任何不符 → **停止 T4 以后全部写侧任务**，完整上报（Critical 发现：Windows 不同构） |
 | **T3 空 Thread 首帧** | 在 Desktop 新建一个会话，切到该会话，capture 首帧 snapshot | 帧 + contentState 判定 | 空历史判定为 Ready（真实 0 条），不是 Loading/Unsupported；若首帧不是该形态，如实记录实际形态与判定 |
-| **T4 start-turn 写实证** | `thread-follower-start-turn` v2（userMessage，正文用 `tuvis-probe <随机串>`）→ 轮询 snapshot 至该 Turn 终态 | 请求帧 + 回执帧 + 终态帧 | Turn 创建 inProgress → completed；turnId 在投影可认领；**顺带记录请求体里 `params.input` 是否可带开场输入及其实况形态**（为「开场补齐」留底料；若请求键集被 4894 拒绝见 §3.3） |
+| **T4 start-turn 写实证** | `thread-follower-start-turn` v2（prompt 见附录 A3）→ 轮询 snapshot 至该 Turn 终态 | 请求帧 + 回执帧 + 终态帧 | Turn 创建 inProgress → completed；turnId 在投影可认领；**顺带记录请求体里 `params.input` 是否可带开场输入及其实况形态**（为「开场补齐」留底料；若请求键集被 4894 拒绝见 §3.3） |
 | **T5 streaming 投影** | T4 执行期间不停车持续收 `thread-stream-state-changed` | 全部增量帧 | 能看到 revision 递增 + 同气泡 replace/追加；喂给生产 mirror 得到投影 0→N 条、Loading→Ready |
-| **T6 command approval** | 发一条会触发命令审批的 prompt（命令限白名单 `echo tuvis-probe-ok` / `dir`）→ 捕获 `item/commandExecution/requestApproval` → **accept** → 观察命令真执行、Turn 继续 → 再触发一次 → **decline** → 命令不执行 | 两类决定各自的请求/应答/后续帧 | 原 pending 消失；accept 后命令执行、decline 后不执行；应答 wire 与 `thread-follower-command-approval-decision` 表一致 |
-| **T7 permissions approval** | 发一条触发权限请求的任务（读取 P4 目录内文件 / 打开该目录）→ 捕获 permissions 请求 → approve → 再触发 → reject | 同上 | 原权限对象回显、scope=turn；reject 后动作未执行 |
-| **T8 Plan 阻塞问答** | 用户在 APP 把测试会话切 **Plan** 模式 → 发会触发阻塞提问的 prompt → 捕获 `request_user_input`（原 request id）→ `thread-follower-submit-user-input` 作答 → Turn 继续 | 请求/作答/继续帧 | 捕获原 request id 并成功作答；Default 模式异步问题**不算数**（不产生 pending request） |
+| **T6 command approval** | 在 `probe-t6` 发 A3 的 accept 轮 prompt → 捕获 `item/commandExecution/requestApproval` → **探针 accept** → 观察命令真执行、Turn 继续 → 再发 decline 轮 → **探针 decline** → 命令不执行 | 两类决定各自的请求/应答/后续帧 | accept 后 `accept-*.txt` 真实存在；decline 后 `decline-*.txt` **不存在**；原 pending 消失；应答 wire 与 `thread-follower-command-approval-decision` 表一致 |
+| **T7 permissions approval** | 在 `probe-t7` 发 A3 的 approve 轮 prompt（读取测试文件触发读取授权）→ 捕获 permissions 请求 → **探针 approve** → 再发一轮 → **探针 reject** | 同上 | approve 轮拿到文件内容回答；reject 轮拿不到/如实拒绝；原权限对象回显、scope=turn |
+| **T8 Plan 阻塞问答** | `probe-t8` 切 Plan 模式（附录 A5）→ 发 A3 的 T8 prompt → 捕获 `request_user_input`（原 request id）→ `thread-follower-submit-user-input` 作答 → Turn 继续 | 请求/作答/继续帧 | 捕获原 request id 并成功作答；Default 模式异步问题**不算数**（不产生 pending request） |
 | **T9 重启恢复** | following 在场 → 用户关闭 Desktop → 观察断开与 stale → 重开 Desktop → 自动重连/重发现/重 following/新 snapshot | 断开→恢复全程帧 + 时间线 | 旧 owner 身份失效（旧 epoch 帧不得复用）；恢复后 stale=false；记录各步耗时 |
 | **T10 多 Thread 共 owner** | Desktop 开第二个会话 → discovery → 两 Thread 分别 following/snapshot | discovery 帧 ×2 | 一个 ownerClientId 映射多 Thread 成立（F1） |
 
@@ -167,3 +172,64 @@ E:\LLMproject\Github\tuvis-verify-logs\2026-10-19-4894\
 - interrupt / steer、update-thread-settings、file approval、多窗口高级协同（spec §5）；
 - `params.input` 开场补齐的**实现**（本批只采底料）；
 - 修改 `docs/MASTER-PLAN.md`、spec、既有测试基线。
+
+---
+
+## 附录 A · 预置操作细节（执行者自助，全程不找用户）
+
+### A1 测试资产与分会话布局（用户已备，照用即可）
+
+- Desktop 项目：**「tuvis-codex-ipc-probe」**。探测在**该项目下新建 5 个会话**（APP UI 新建，命名严格如下，便于 discovery 后绑定）：
+  - `probe-t3`（T3 空 Thread：**新建后不发任何消息**，保持空态）
+  - `probe-t4`（T4/T5 发送与 streaming）
+  - `probe-t6`（T6 命令审批）
+  - `probe-t7`（T7 权限审批）
+  - `probe-t8`（T8 Plan 问答）
+- 会话「hi」是用户人工预检记录，**只读参考，探测不写入**。
+- 已存在文件：`C:\Temp\tuvis-ipc-probe-approval\approval-test.txt`（内容一行 `tuvis ipc approval probe`）——T6/T7 的目标文件，不要删。
+- 用户预检已证明：升权（escalated permissions）流程在该机可用（先拒后准各演练过一次）。
+
+### A2 会话绑定（threadId 识别，防绑错）
+
+每个 `probe-*` 会话先在 APP 输入框发一条 marker 消息：`tuvis-probe-marker-<任务名>`（如 `tuvis-probe-marker-t4`，各会话唯一）。随后 `thread-owner-discovery` 会返回 Desktop 持有的多个 thread——逐个 following→读 snapshot，**用 marker 文本定位 threadId**，把 `<任务名> → threadId` 记入报告（脱敏后）。**禁止按 discovery 列表顺序猜测 threadId。**
+
+### A3 逐字 prompt（直接复制；注意每次运行的随机后缀/文件名区分）
+
+| 任务 | prompt（原样发送） |
+| --- | --- |
+| T4 发送 | `tuvis-probe-start-turn-<8位随机小写字母数字>`（仅此一句，避免触发任何工具） |
+| T6 accept 轮 | `请用 shell 命令完成下面这件事（目标目录在当前项目沙箱的可写范围之外）：1. 新建目录 C:\Temp\tuvis-ipc-probe-approval\ 2. 在该目录下新建文件 accept-<随机后缀>.txt，内容为一行文本：tuvis ipc approval probe accept。要求：只用 shell 命令完成（例如 PowerShell 的 New-Item / Set-Content）；如果沙箱拒绝了这次写入，请按 Codex 的升权流程发起授权请求（escalated permissions）并等待授权结果，不要放弃、也不要改用其它绕过沙箱的方式；不要做任何其它操作、不要联网、不要安装依赖` |
+| T6 decline 轮 | 同上，但文件名换 `decline-<随机后缀>.txt`（decline 后该文件**必须不存在**——这是 PASS 判据） |
+| T7 approve 轮 | `请读取 C:\Temp\tuvis-ipc-probe-approval\approval-test.txt 的内容，并用一句话告诉我里面写了什么。如果沙箱拒绝读取，请按升权流程发起授权请求并等待授权结果，不要改用其它方式绕过；不要联网、不要做其它操作` |
+| T7 reject 轮 | 同上 prompt 再发一次（探针 reject；预期拿不到文件内容/收到拒绝后的如实回答） |
+| T8 Plan 问答 | `请给我一个把桌面文件按月份归档的极简方案。先给出 2 个可选方案让我选择，在我选择之前不要开始执行任何操作` |
+
+- 所有 prompt 红线：不联网、不安装、不碰测试目录以外的路径。
+- **审批应答纪律**：T6/T7 的审批决定由**探针经 IPC 应答**（`thread-follower-command-approval-decision` / `thread-follower-permissions-request-approval-response`）。APP 内同时弹出的审批 UI **不要人工点击**——探针应答后卡片自行消解；超 60s 未消解截图留证（`raw\approval-stuck-<任务>.png`）。
+- **审批强度前置检查**：当前 APP 底部显示「完全访问」。若 T6 发出后命令**未经审批直接执行**（探针没等到 requestApproval），用 UI 把输入框旁的审批强度切到「每次都要确认」（或等效项）后重试，切换前后各截一张图存 `raw\approval-mode-*.png`。这是本地 UI 设置，允许自助切换。
+
+### A4 T9 重启恢复的具体操作（已预授权）
+
+1. following 在场后：`taskkill /IM ChatGPT.exe /F`（测试时段专用，允许强杀）；轮询进程数=0，记录时间线。
+2. 等待 10s，观察探针侧断开事件与投影 stale。
+3. 重启：`explorer shell:AppsFolder\OpenAI.Codex_26.1013.4894.0_x64__2p2nqsd0c76g0\ChatGPT`（或开始菜单手动启动）；等进程就绪。
+4. 观察自动重连/重发现/重 following/新 snapshot 全程帧；登录态持久，**无需用户重新登录**。
+
+### A5 T8 Plan 模式切换（唯一可能的灰色点，优先自助）
+
+1. 在 `probe-t8` 会话内找**协作/会话模式**选择器（注意不是审批强度选择器——「完全访问」那个是审批强度）。
+2. 若存在 Plan/规划 项：切换 → 截图 `raw\plan-mode-on.png` → 发 A3 的 T8 prompt。
+3. 若找不到 Plan 项或切换后不产生阻塞提问（Default 的异步提问**不算数**）：截图 `raw\plan-mode-missing.png`，T8 记 NOT_AVAILABLE + 实际观察描述，**不要为此找用户**。
+
+### A6 波次 B 自助细节（E2E）
+
+1. 构建：`git -C E:\LLMproject\Github\tuvis-pr165-review switch probe/4894-e2e` → 根目录 `pnpm install --frozen-lockfile` → `pnpm build:mobile` → `pnpm tauri:dev`（dev 即可；E2E 会写真实 `~/.tuvis` 账本/审计——这是应用正常行为，测试动作的审计行允许存在）。
+2. 远程 UI：用**本机 Chrome 已配对设备 `matebook-chrome`** 的既有会话访问（地址按 tuvis 设置页「远程访问」显示的固定地址）。不要重置门禁、不要删除/重配设备、不要找用户要凭据。
+3. H3 开关在 tuvis 设置页（无头兜底）。E10 顺序：先记录当前状态 → H3 开 + 关 Desktop 发消息（预期走 #117 兼容）→ H3 关重试（预期诚实拒绝）→ 恢复原状态。
+4. tuvis 里只操作 `probe-*` 会话；不碰任何真实工作会话。
+5. E11 强杀 tuvis：`taskkill` 掉 dev 进程即可（Vite/tauri dev 子进程一并清理），重启后先查该动作账本行（reserved→unknown、不重发），再用队列面板 force-continue 解除屏障（顺带验收新端点）。
+
+### A7 产物补充约定
+
+- 每个任务的 APP 侧关键状态（新建会话、审批卡出现/消解、Plan 切换、重启前后）截图存 `raw\`（PNG，命名 `<任务>-<步骤>.png`）。
+- 报告「环境事实表」需附：Desktop 进程启动方式、审批强度设置值、Plan 模式有无的结论。
