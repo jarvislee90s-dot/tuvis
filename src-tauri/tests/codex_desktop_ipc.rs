@@ -415,6 +415,92 @@ async fn pending_capacity_rejects_before_enqueue() {
     conn.shutdown().await;
 }
 
+// ---------------- 连接生命周期回归（PR #165 审查三缺陷） ----------------
+
+/// 缺陷1回归：请求先于握手失败进入握手等待 → 对端回 error 后必须**有限时间**
+/// 返回 NotSent。原实现挂在 `init.changed()` 上永不唤醒（握手失败路径从不向
+/// init 发值、closed 置位不唤醒 watch 等待者），future 自持 handle 泄漏并拖死
+/// 下游 router 派发任务；外层 timeout 断言防回归成挂死。
+#[tokio::test(start_paused = true)]
+async fn request_parked_on_handshake_wakes_when_handshake_fails() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+
+    // t=0：请求进入握手等待（此刻 init=None、closed=false、未入队）
+    let task = request_in_task(&conn, simple_request("thread-owner-discovery"));
+    let init = peer.recv().await;
+    assert_eq!(init["method"], "initialize");
+    // 对端明确拒绝握手 → initialize_handshake 走失败收尾
+    peer.send(&serde_json::json!({
+        "type": "response",
+        "requestId": init["requestId"],
+        "resultType": "error",
+        "method": "initialize",
+        "error": { "code": "refused", "message": "no" }
+    }))
+    .await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(8), task)
+        .await
+        .expect("握手失败后请求必须被唤醒，不得挂死")
+        .expect("task ok");
+    assert_eq!(outcome.delivery, Delivery::NotSent);
+    assert!(conn.is_closed());
+}
+
+/// 缺陷1回归（握手超时路径）：对端收下 initialize 后装聋 → 3s INIT_TIMEOUT
+/// 失败收尾 → 等待中的请求必须有限时间返回 NotSent（原实现永久挂起）。
+/// 虚拟时钟：start_paused 下运行时空闲时自动推进，无需真实等待 3s。
+#[tokio::test(start_paused = true)]
+async fn request_parked_on_handshake_wakes_on_init_timeout() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+
+    let task = request_in_task(&conn, simple_request("thread-owner-discovery"));
+    let init = peer.recv().await;
+    assert_eq!(init["method"], "initialize");
+    // 对端不回执：虚拟时间自动推进触发 INIT_TIMEOUT（3s）失败收尾
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("握手超时后请求必须被唤醒，不得挂死")
+        .expect("task ok");
+    assert_eq!(outcome.delivery, Delivery::NotSent);
+    assert!(conn.is_closed());
+}
+
+/// 缺陷2回归：在飞请求遭遇断线清场时，回执 envelope_id 必须是**原 envelope
+/// UUID**（= 写出的 requestId），不得被 "released" 占位串顶替——占位串违反
+/// RpcOutcome 契约（envelope_id 恒为本次生成的 UUID）并随持久账本入库。
+#[tokio::test]
+async fn disconnect_unknown_outcome_keeps_original_envelope_id() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let task = request_in_task(&conn, simple_request("thread-owner-discovery"));
+    let frame = peer.recv().await;
+    let rid = frame["requestId"]
+        .as_str()
+        .expect("uuid requestId")
+        .to_string();
+    // 在飞（帧已写出、回执未达）期间对端断线 → writer 收尾清场
+    peer.close();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("outcome in time")
+        .expect("task ok");
+    assert_eq!(outcome.delivery, Delivery::UnknownDelivery);
+    assert_eq!(
+        outcome.envelope_id, rid,
+        "断线清场回执必须携带原 envelope UUID"
+    );
+}
+
 // ---------------- Task 4：Owner Registry / following / 恢复代际（集成） ----------------
 
 /// discovery 响应帧。
