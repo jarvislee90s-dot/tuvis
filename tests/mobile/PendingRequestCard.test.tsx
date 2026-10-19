@@ -455,6 +455,26 @@ describe("PendingRequestCard：投递前确定性拒绝（C5 白名单）", () =
     await flushAsync();
     expect(actionQueryCount()).toBe(0);
   });
+
+  it("capability_unavailable_503_is_pre_delivery_refusal：503 capability_unavailable（IPC 能力关，登记前零投递）→ 错误底注 + 解锁，不进 unknown 核对臂", async () => {
+    installFetch();
+    // 后端 `!hub.ipc_available()` → 503（登记之前即拒绝、零投递）——不进
+    // 「结果未知」臂（否则 fetchCodexAction 必 404 → 锁卡到 token 轮换）
+    routes.respondStatus = 503;
+    routes.respondBody = { error: "capability_unavailable" };
+    render(<PendingRequestCard sessionId="s1" request={commandPending()} />);
+    fireEvent.click(screen.getByTestId("codex-pending-approve"));
+    const note = await screen.findByTestId("codex-pending-note");
+    expect(note.textContent).toContain("应答失败");
+    expect(note.textContent).not.toContain("投递结果未知");
+    // ID 让位：按钮解锁（再按 = 新 actionId，零投递上重试安全）
+    expect((screen.getByTestId("codex-pending-approve") as HTMLButtonElement).disabled).toBe(false);
+    // 绝不进 unknown 核对臂：零次 GET /codex/action，且再等微任务也不补查
+    expect(actionQueryCount()).toBe(0);
+    await flushAsync();
+    expect(actionQueryCount()).toBe(0);
+    expect(postBodies()).toHaveLength(1);
+  });
 });
 
 describe("CodexAvailabilityBanner：四档能力按服务端渲染", () => {

@@ -140,12 +140,16 @@ function actionViewToReceipt(
  *    2026-10-19 复审补入：缺了会被误归「结果未知」→ fetchCodexAction 必 404 →
  *    永久锁卡，而真实语义是「可重试的确定性拒绝」）；
  *  - 动作词与 pending 类别不相容（409 action_mismatch——登记前复核，同上补入）；
+ *  - IPC 能力关（503 capability_unavailable——`!hub.ipc_available()`，登记之前
+ *    即拒绝、零投递，2026-10-19 复审补入：缺了会被误归「结果未知」→ 同上锁卡）；
  *  - 登记后、派发前的校验拒绝（answers_mismatch / answer_not_option / invalid_id）；
  *  - 设备门禁（403）/ 会话不在快照（404）。
  *
- *  `no_action` 是防御位：该码只有 GET /codex/action（查询面）会发，
- *  POST /codex/pending-response 不会——留着防未来端点复用该码时静默漏进
- *  「结果未知」臂（多算一位只多一次解锁误判面，漏算才是锁卡事故）。 */
+ *  `no_action` 是防御位：POST /codex/pending-response 不会发该码；但既有端点里
+ *  GET /codex/action（查询面）与 POST /codex/queue/force-continue（人工解除面，
+ *  404 = 不存在/他人动作）都会发（2026-10-19 复审修正：原注释称「只有 GET 会发」
+ *  已漂移）。留着防未来端点复用该码时静默漏进「结果未知」臂（多算一位只多一次
+ *  解锁误判面，漏算才是锁卡事故）。 */
 const PRE_DELIVERY_ERROR_CODES = new Set([
   "bad_request", // malformed / deny_unknown_fields（登记前拒绝）
   "answers_mismatch", // 答案限额校验（登记前拒绝）
@@ -153,7 +157,8 @@ const PRE_DELIVERY_ERROR_CODES = new Set([
   "invalid_id",
   "forbidden", // 设备门禁（gate 层，登记前拒绝）
   "no_session", // 会话不在快照（无任何投递）
-  "no_action", // 防御位：仅 GET /codex/action 会发（见上方块注释）
+  "no_action", // 防御位：pending-response 不发；查询/人工解除端点会发（见上方块注释）
+  "capability_unavailable", // IPC 能力关（503，登记前确定性零投递）
   "empty_answers", // ↓ validate_answers 五码：答案限额（登记前拒绝）
   "too_many_questions",
   "too_many_answers",
