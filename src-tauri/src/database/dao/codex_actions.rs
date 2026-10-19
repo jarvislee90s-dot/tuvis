@@ -841,12 +841,19 @@ pub(crate) fn force_release_barrier_conn(
 
 /// 该 Thread 全部在册屏障的 action_id（seq 序；队列视图 `blockedActionIds`——
 /// 人工解除端点的靶向清单，前端按钮据此逐个解除）。
+///
+/// PR #165 复审（Minor）：仅列**人工可解除**的行——`state IN ('unknown','accepted')`
+/// 与 [`force_release_barrier_conn`] 的 CAS 谓词一致。reserved 在飞行（compat
+/// 兜底在飞 fence）虽有 compat_outstanding=1，但有自动落账路径且端点会 409，
+/// 不进清单（否则前端「继续队列」按钮必踩 409）。
 pub(crate) fn barrier_action_ids_conn(
     conn: &Connection,
     thread_id: &str,
 ) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT action_id FROM codex_actions WHERE thread_id = ?1 AND compat_outstanding = 1 \
+        "SELECT action_id FROM codex_actions \
+         WHERE thread_id = ?1 AND compat_outstanding = 1 \
+           AND state IN ('unknown', 'accepted') \
          ORDER BY seq ASC",
     )?;
     let rows = stmt.query_map([thread_id], |r| r.get::<_, String>(0))?;
@@ -1999,5 +2006,35 @@ mod tests {
             tombstone_expired_terminal_conn(&c2, RETENTION, now, 2).unwrap(),
             0
         );
+    }
+
+    /// barrier 清单过滤（PR #165 事项③，复审 Minor）：reserved 在飞行（compat 兜底
+    /// fence 在册）**不进**人工解除靶向清单（端点会 409）；unknown/accepted 屏障在列。
+    #[test]
+    fn barrier_action_ids_exclude_reserved_in_flight() {
+        let c = mem();
+        finish_with_barrier(&c, "u-1", Delivery::UnknownDelivery, None, 1000);
+        finish_with_barrier(&c, "a-ok", Delivery::Accepted, Some("t-9"), 1100);
+        // reserved 在飞（compat 兜底 fence）：compat_outstanding=1 但有自动落账路径
+        insert(&c, "r-fly", Some("丙"), 1200);
+        reserve_conn(&c, "r-fly", ControlRoute::HeadlessCompat, 1201).unwrap();
+        set_compat_dispatch_barrier_conn(
+            &c,
+            "r-fly",
+            None,
+            None,
+            Some("/p"),
+            Some(1),
+            Some("w"),
+            1202,
+        )
+        .unwrap();
+        assert_eq!(
+            barrier_action_ids_conn(&c, THREAD).unwrap(),
+            vec!["u-1".to_string(), "a-ok".to_string()],
+            "reserved 在飞行不进清单（与 force-release CAS 谓词一致）"
+        );
+        // 对照：在飞行屏障确实在册（fence 查询可见），只是不进人工解除清单
+        assert!(has_compat_fence_conn(&c, THREAD).unwrap());
     }
 }
