@@ -310,6 +310,10 @@ pub async fn wait_first_snapshot(
 /// 发现 owner 并声明 following，等到首帧 snapshot 才算完成（无 following 不允许
 /// 假装同步完成；重连恢复 = 重新 discovery → 重新 following → 等 snapshot）。
 /// adapter 等需要分步控制的调用方直接使用四个原语。
+///
+/// declare 后核验 lease 活性（与 adapter `follow_thread` 的「declare 后复查」同款）：
+/// 旧 epoch 连接的 discovery 迟到回执会让 [`bind_lease`] 返回永不生效的死 lease
+/// （generation=0），不得把它当成功返回——失效 → `StaleContext`，调用方按失败重试。
 pub async fn discover_and_follow(
     conn: &super::connection::ConnectionHandle,
     owners: &mut OwnerRegistry,
@@ -318,6 +322,13 @@ pub async fn discover_and_follow(
     let owner_id = discover_owner(conn, key).await?;
     let lease = bind_lease(owners, key, owner_id, conn.epoch());
     declare_following(conn, key).await?;
+    // 死 lease 复查：bind 即死的 lease（旧 epoch 迟到回执）与 declare 窗口内失活的
+    // lease 都在此拦下，杜绝 Ok(死 lease)——调用方拿到它做写授权会全军覆没。
+    if !owners.is_current(&lease) {
+        return Err(ProtocolError::StaleContext(
+            "lease lost during follow (old epoch late receipt?)".into(),
+        ));
+    }
     wait_first_snapshot(conn, key).await?;
     Ok(lease)
 }
