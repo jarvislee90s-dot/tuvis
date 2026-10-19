@@ -27,6 +27,7 @@ function projection(over: Partial<ThreadProjection> = {}): ThreadProjection {
     availability: "controllable",
     capabilities: caps(),
     runtimeStatus: "idle",
+    contentState: "ready",
     messages: [],
     truncated: false,
     pending: [],

@@ -4348,6 +4348,7 @@ describe("SessionDetail：Codex 队列联动刷新（R11）", () => {
         blockingInput: true,
       },
       runtimeStatus: "idle",
+      contentState: "ready",
       messages: [
         { id: "m-1", role: "user", kind: "user_input", text: "投影里的用户消息", ts: 1000 },
       ],
@@ -4601,6 +4602,7 @@ describe("SessionDetail：Codex 原生回执不残留无头卡（R12）", () => 
         blockingInput: true,
       },
       runtimeStatus: "idle",
+      contentState: "ready",
       messages: [
         { id: "m-1", role: "user", kind: "user_input", text: "投影里的用户消息", ts: 1000 },
       ],
