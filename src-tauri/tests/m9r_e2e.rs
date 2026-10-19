@@ -1105,6 +1105,8 @@ async fn e2e_http_full_chain() {
                 Arc::new(|_sid: &str, _pid: u32| None)
             }
         },
+
+        codex_control: multi_agents_manager_lib::remote::codex_ipc::CodexControlHub::disabled_arc(),
     });
 
     // 配对设备（server.rs 既有 persist_named_device 先例）：cookie 直指内存库设备行
@@ -1175,7 +1177,7 @@ async fn e2e_http_full_chain() {
     // 剥尾签名后取正文尾 24 字符——本处直接喂 composed 即验证了那条适配在真实
     // 会话文件上成立（假命中防护见 inject::confirm 的
     // stamp_never_false_hits_across_same_device_messages）
-    let composed = compose_injection("E2E手机", &text);
+    let composed = compose_injection("E2E手机", &text).expect("花名在册（E2E 设备名）");
     let stamp = stamp_of(&composed).to_string();
     let hit = poll_stamp(
         &ev,

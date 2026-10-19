@@ -1,0 +1,19 @@
+{
+  "_source": "SYNTHETIC（Mac build 未触发该变体 = NOT_TRIGGERED，非不支持；决定面 thread-follower-command-approval-decision {conversationId,requestId,decision} 为 CODE——Mac 报告 §4）",
+  "id": 18,
+  "method": "item/commandExecution/requestApproval",
+  "params": {
+    "threadId": "00000000-0000-4000-8000-0000000000w1",
+    "turnId": "00000000-0000-4000-8000-0000000000tw1",
+    "itemId": "00000000-0000-4000-8000-0000000000iw1",
+    "command": "pnpm test",
+    "cwd": "/tmp/ws-demo",
+    "reason": "合成：需要执行测试命令"
+  },
+  "_decision_surface": {
+    "method": "thread-follower-command-approval-decision",
+    "version": 1,
+    "params_approve": { "conversationId": "<threadId>", "requestId": 18, "decision": "accept" },
+    "params_reject": { "conversationId": "<threadId>", "requestId": 18, "decision": "decline" }
+  }
+}

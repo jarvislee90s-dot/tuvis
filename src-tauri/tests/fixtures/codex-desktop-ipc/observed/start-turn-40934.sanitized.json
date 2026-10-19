@@ -1,0 +1,40 @@
+{
+  "_source": "2026-10-18 23:58（本地时间）受控 harness 实证：直连 ~/.codex/ipc/ipc.sock，initialize → thread-owner-discovery → thread-stream-following-changed {following:true} → **thread-follower-start-turn v2（targeted、mutating）** → 收 success 回执；未审批、未切设置。请求参数与 mirror/adapter 生产构造同形（conversationId + turnStart.request{threadId,input[text],clientUserMessageId} + context）。采集时安装包 CFBundleShortVersionString=26.1013.40934；ID 已占位化。",
+  "request": {
+    "type": "request",
+    "method": "thread-follower-start-turn",
+    "version": 2,
+    "params": {
+      "conversationId": "00000000-0000-4000-8000-0000000000cv",
+      "turnStart": {
+        "request": {
+          "threadId": "00000000-0000-4000-8000-0000000000cv",
+          "input": [{ "type": "text", "text": "[harness-40934-profile-probe] …占位…", "text_elements": [] }],
+          "clientUserMessageId": "00000000-0000-4000-8000-0000000000cm"
+        },
+        "context": {}
+      }
+    }
+  },
+  "response": {
+    "type": "response",
+    "resultType": "success",
+    "method": "thread-follower-start-turn",
+    "handledByClientId": "00000000-0000-4000-8000-0000000000ow",
+    "result": {
+      "result": {
+        "turn": {
+          "id": "00000000-0000-4000-8000-0000000000tn",
+          "rootTurnId": "00000000-0000-4000-8000-0000000000tn",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": null,
+          "completedAt": null,
+          "durationMs": null
+        }
+      }
+    }
+  }
+}

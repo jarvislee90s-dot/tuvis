@@ -173,6 +173,58 @@ pub fn init(conn: &Connection) {
             failed_reason TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_inject_queue_session ON inject_queue(session_id, id);
+        -- ===== Codex Desktop IPC：持久动作账本 =====
+        -- 每个远程控制动作（普通消息/两类审批/阻塞问答）一行，FIFO 按 seq（AUTOINCREMENT，
+        -- 不按毫秒时间戳/随机 UUID）；state ∈ queued/reserved/accepted/rejected/unknown/cancelled。
+        -- queued_text 仅普通待发消息保存**原文**（派发后清空；来源标记在派发时恰好组装一次）；
+        -- 审批答案只存 payload_hash，不存答案原文。receipt_json 是 ActionReceipt 的 camelCase
+        -- JSON。compat_* 三列是 PR #117 兼容兜底的持久 fence（compat_outstanding=1 期间该
+        -- Thread 队列不接力）；compat_rollout_path/compat_rollout_baseline/compat_wire_hash 是
+        -- 只读核对（reconcile）的证据字段，随 fence 持久保存、跨热重启与应用重启有效。
+        -- barrier_force_released_at 是人工解除屏障的时间戳（可空）：非 NULL = 已被人工解除，
+        -- 全部置屏障写点带同名单调性守卫不回置。
+        -- 撤回 = CAS queued→cancelled，**保留行作墓碑**（已撤 actionId 重放据此拒绝，不重发）。
+        CREATE TABLE IF NOT EXISTS codex_actions (
+            seq                     INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_id               TEXT UNIQUE NOT NULL,
+            device_id               TEXT NOT NULL,
+            device_name             TEXT NOT NULL,
+            thread_id               TEXT NOT NULL,
+            kind                    TEXT NOT NULL,
+            request_key             TEXT,
+            context_token           TEXT,
+            payload_hash            TEXT NOT NULL,
+            client_message_id       TEXT NOT NULL,
+            state                   TEXT NOT NULL,
+            route                   TEXT NOT NULL DEFAULT 'none',
+            queued_text             TEXT,
+            created_at              INTEGER NOT NULL,
+            updated_at              INTEGER NOT NULL,
+            receipt_json            TEXT,
+            compat_outstanding      INTEGER NOT NULL DEFAULT 0,
+            compat_message_id       TEXT,
+            compat_turn_id          TEXT,
+            compat_rollout_path     TEXT,
+            compat_rollout_baseline INTEGER,
+            compat_wire_hash        TEXT,
+            barrier_force_released_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_codex_actions_thread_state_seq
+            ON codex_actions(thread_id, state, seq);
+        -- partial index 只收「调度/对账关心的行」，随 migrate 幂等重放补建到老库。
+        -- ① 兼容屏障/Turn 绑定在册行（周期对账枚举 + thread 内屏障/fence 查询共用）
+        CREATE INDEX IF NOT EXISTS idx_codex_actions_compat_outstanding
+            ON codex_actions(thread_id, seq) WHERE compat_outstanding = 1;
+        -- ② queued 普通消息（对账枚举的第二分支；与 thread_state_seq 索引互补）
+        CREATE INDEX IF NOT EXISTS idx_codex_actions_queued_send
+            ON codex_actions(thread_id, seq) WHERE state = 'queued' AND kind = 'send';
+        -- ③ Turn 顺序绑定行（路由器重启重建输入）
+        CREATE INDEX IF NOT EXISTS idx_codex_actions_turn_binding
+            ON codex_actions(route, state, seq) WHERE compat_outstanding = 1;
+        -- ④ 终态行墓碑化候选（保留清理的批量分批选择：updated_at 范围 SEEK + LIMIT 早停）
+        CREATE INDEX IF NOT EXISTS idx_codex_actions_terminal_retention
+            ON codex_actions(updated_at)
+            WHERE state IN ('accepted', 'rejected', 'cancelled') AND compat_outstanding = 0;
         CREATE TABLE IF NOT EXISTS write_audit (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          INTEGER NOT NULL,

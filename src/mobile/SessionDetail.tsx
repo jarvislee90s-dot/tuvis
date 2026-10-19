@@ -35,6 +35,11 @@ import SubagentChips from "./SubagentChips";
 import SubagentDetail from "./SubagentDetail";
 import SubagentList from "./SubagentList";
 import QuestionCard from "./QuestionCard";
+// Codex Desktop IPC：原生投影接管内容源与交互卡（Codex APP 会话）
+import CodexQueuePanel from "./CodexQueuePanel";
+import PendingRequestCard, { CodexAvailabilityBanner } from "./PendingRequestCard";
+import useCodexThread from "./useCodexThread";
+import useDelayedUnsupported from "./useDelayedUnsupported";
 import BookmarkBar from "./BookmarkBar";
 import FilePanel from "./FilePanel";
 import FilePreview from "./FilePreview";
@@ -254,6 +259,25 @@ export function isPlanPending(
 
 export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
+  // ===== Codex Desktop IPC 投影（A snapshot）=====
+  // 仅 Codex 会话订阅（其余工具 enabled=false 零开销）。可用性四档按服务端数据渲染：
+  // - controllable / send_only：投影**替换** Codex 会话实时内容源（不与本地读取简单
+  //   混排——同一历史两份源各说各话是骗人），原生 pending 出卡、队列面板挂载；
+  // - compat_only / unavailable：不出投影正文与原生卡——保持旧 QuestionCard 路径，
+  //   能力横幅仍按服务端档位诚实展示；
+  // - state=null（无 IPC / 拉取中）：旧路径照旧，零回归。
+  // stale：保留最后视图但禁写。
+  const codex = useCodexThread(session.id, session.agentType === "codex");
+  const codexState = codex.state;
+  const codexProjectionActive =
+    codexState !== null &&
+    (codexState.availability === "controllable" || codexState.availability === "send_only");
+  // Task 7：瞬态 Unsupported 只延迟**前端错误提示**（后端 contentState 即时、禁写/
+  // stale/屏障不去抖）——过渡 164–382ms 不闪烁，持续异常 500ms 后如实显示。
+  const showUnsupported = useDelayedUnsupported(
+    session.id,
+    codexProjectionActive && codexState?.contentState === "unsupported"
+  );
   // 头部截断标记（Bug 1，M3 验收）：后端字节窗切掉文件头时为 true——
   // 即使本页条数 < limit 也存在更早内容，按钮必须可见
   const [truncated, setTruncated] = useState(false);
@@ -907,7 +931,35 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           onDismiss={() => setPlanFeedbackActive(false)}
         />
       )}
-      {!isSummary && <QuestionCard key={`question-${session.id}`} session={session} />}
+      {!isSummary &&
+        (codexState !== null ? (
+          <>
+            <CodexAvailabilityBanner
+              key={`codex-banner-${session.id}`}
+              availability={codexState.availability}
+              stale={codexState.stale}
+            />
+            {codexProjectionActive &&
+              codexState.pending.map((p) => (
+                <PendingRequestCard
+                  key={`codex-pending-${session.id}-${p.requestKey}`}
+                  sessionId={session.id}
+                  request={p}
+                  writeLocked={codexState.stale}
+                />
+              ))}
+            <CodexQueuePanel
+              key={`codex-queue-${session.id}`}
+              sessionId={session.id}
+              refreshSignal={codexState.revision ?? 0}
+            />
+            {!codexProjectionActive && (
+              <QuestionCard key={`question-${session.id}`} session={session} />
+            )}
+          </>
+        ) : (
+          <QuestionCard key={`question-${session.id}`} session={session} />
+        ))}
       {/* 2026-10-08 子 agent chip：与 ModeBar 同一行（flex-wrap 兄弟），生命周期
           解耦——mode 视图失败/unsupported 时 chip 仍活，反之亦然（spec §6）。
           finished 不挂载（idle 不拦：claude 后台 agent 可在主会话 idle 时仍在跑）；
@@ -930,6 +982,65 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // 消息区（split 布局复用同一份 JSX）
   const messageArea = (
     <>
+      {codexProjectionActive && codexState !== null && (
+        <div
+          data-testid="codex-projection"
+          data-availability={codexState.availability}
+          data-stale={codexState.stale ? "true" : "false"}
+        >
+          {codexState.truncated && (
+            <p
+              data-testid="codex-projection-truncated"
+              className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
+            >
+              投影超过展示上限，仅显示最近的消息
+            </p>
+          )}
+          {codexState.contentState !== "ready" &&
+            (codexState.contentState !== "unsupported" || showUnsupported) && (
+              <p
+                data-testid="codex-projection-health"
+                data-state={codexState.contentState}
+                className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
+              >
+                {codexState.contentState === "loading"
+                  ? "正在载入完整历史…"
+                  : codexState.contentState === "partial"
+                    ? "历史不完整（按需继续载入）"
+                    : "读取异常（内容状态不受支持）"}
+              </p>
+            )}
+          {codexState.messages.length === 0 ? (
+            codexState.contentState === "ready" ? (
+              <p className="py-16 text-center text-sm text-[var(--mut)]">暂无消息</p>
+            ) : null
+          ) : (
+            <ul className="space-y-2 pb-4">
+              {codexState.messages.map((m) => (
+                <li
+                  key={m.id}
+                  data-testid={`codex-msg-${m.id}`}
+                  data-role={m.role}
+                  data-kind={m.kind}
+                  className={
+                    m.role === "user" ? "flex flex-col items-end" : "flex flex-col items-start"
+                  }
+                >
+                  <div
+                    className={
+                      m.role === "user"
+                        ? "max-w-[85%] rounded-2xl bg-[var(--btnp)]/15 px-3 py-2 text-sm whitespace-pre-wrap text-[var(--tx)]"
+                        : "max-w-[85%] rounded-2xl bg-[var(--cb)]/60 px-3 py-2 text-sm whitespace-pre-wrap text-[var(--tx)]"
+                    }
+                  >
+                    {m.text}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
       {/* 总结模式提示行（Bug 8）：仅总结模式且有可折叠过程消息时出现 */}
       {isSummary && toggleableMessages.length > 0 && (
         <div
@@ -979,7 +1090,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           </button>
         </div>
       )}
-      {messages !== null && !error && messages.length === 0 && (
+      {!codexProjectionActive && messages !== null && !error && messages.length === 0 && (
         <p className="py-16 text-center text-sm text-[var(--mut)]">暂无消息</p>
       )}
       {/* 书签跳转：自动加载中提示（M5 P3-c）与到顶未命中 miss 提示（M3+） */}
@@ -1020,7 +1131,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           </button>
         </div>
       )}
-      {messages !== null && messages.length > 0 && (
+      {!codexProjectionActive && messages !== null && messages.length > 0 && (
         <ul className="space-y-2 pb-4">
           {messages.map((m) => {
             const collapsed = isCollapsed(m);

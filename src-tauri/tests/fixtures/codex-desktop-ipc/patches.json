@@ -1,0 +1,144 @@
+{
+ "_source": "OBSERVED 结构（reviewer 2026-10-17 实读 Windows 原始日志（脱敏）：patches 携带 {baseRevision,revision,patches:[{op,path[],value?}]}，数组路径，path 直接对 conversationState 本体寻址——无 conversationState 前缀；具体 op 取值为协议表面合成）",
+ "_note": "R1 返工：旧夹具人为多包一层 conversationState 前缀，遮住了合同偏差，已全部去除",
+ "batches": [
+  {
+   "_note": "流式 agent_message 同 item replace（不得产生重复气泡，Task 5 断言）",
+   "type": "patches",
+   "baseRevision": 209,
+   "revision": 210,
+   "patches": [
+    {
+     "op": "replace",
+     "path": [
+      "turnHistory",
+      "history",
+      "entitiesByKey",
+      "turn:00000000-0000-4000-8000-0000000000tu1",
+      "items",
+      1,
+      "text"
+     ],
+     "value": "TUVis macOS IPC probe OK（流式追加）"
+    }
+   ]
+  },
+  {
+   "_note": "新增一 turn：数组 add 插入 + 实体新增",
+   "type": "patches",
+   "baseRevision": 210,
+   "revision": 211,
+   "patches": [
+    {
+     "op": "replace",
+     "path": [
+      "turnHistory",
+      "history",
+      "entitiesByKey"
+     ],
+     "value": {
+      "turn:00000000-0000-4000-8000-0000000000tu1": {
+       "turnId": "00000000-0000-4000-8000-0000000000tu1",
+       "status": "completed",
+       "rootTurnId": "00000000-0000-4000-8000-0000000000tu1",
+       "items": [
+        {
+         "type": "userMessage",
+         "id": "00000000-0000-4000-8000-0000000000it1",
+         "content": [
+          {
+           "type": "text",
+           "text": "合成：请回复 TUVis macOS IPC probe OK",
+           "text_elements": []
+          }
+         ]
+        },
+        {
+         "type": "agentMessage",
+         "id": "00000000-0000-4000-8000-0000000000it2",
+         "text": "TUVis macOS IPC probe OK（流式追加）"
+        }
+       ]
+      },
+      "turn:00000000-0000-4000-8000-0000000000tu2": {
+       "turnId": "00000000-0000-4000-8000-0000000000tu2",
+       "status": "completed",
+       "rootTurnId": "00000000-0000-4000-8000-0000000000tu2",
+       "items": [
+        {
+         "type": "userMessage",
+         "id": "00000000-0000-4000-8000-0000000000it3",
+         "content": [
+          {
+           "type": "text",
+           "text": "合成：第二条",
+           "text_elements": []
+          }
+         ]
+        },
+        {
+         "type": "agentMessage",
+         "id": "00000000-0000-4000-8000-0000000000it4",
+         "text": "第二批回复"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "op": "add",
+     "path": [
+      "turnHistory",
+      "history",
+      "islands",
+      0,
+      "entries",
+      1
+     ],
+     "value": {
+      "key": "turn:00000000-0000-4000-8000-0000000000tu2",
+      "value": "turn:00000000-0000-4000-8000-0000000000tu2"
+     }
+    }
+   ]
+  },
+  {
+   "_note": "revision 空洞样本（baseRevision 与镜像当前不符 → 原子拒绝并要求 snapshot）",
+   "type": "patches",
+   "baseRevision": 6,
+   "revision": 8,
+   "patches": []
+  },
+  {
+   "_note": "移除 pending 请求（数组 remove）",
+   "type": "patches",
+   "baseRevision": 211,
+   "revision": 212,
+   "patches": [
+    {
+     "op": "remove",
+     "path": [
+      "requests",
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "_note": "reviewer 复现形状：对 threadRuntimeStatus 本体的 replace（真实根路径增量）",
+   "type": "patches",
+   "baseRevision": 212,
+   "revision": 213,
+   "patches": [
+    {
+     "op": "replace",
+     "path": [
+      "threadRuntimeStatus",
+      "type"
+     ],
+     "value": "active"
+    }
+   ]
+  }
+ ]
+}

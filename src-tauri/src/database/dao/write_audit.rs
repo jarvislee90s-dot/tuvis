@@ -3,6 +3,10 @@
 //（由调用方约束，本层不校验；answer = 批次乙 T8 问答应答；mode = 批次丙 T6 模式切换；
 //  **slash = 丁T3 斜杠命令裸注入**——裁2：`/` 开头消息不带签名（前后缀都会破坏命令与
 //  参数），终端不留痕是可接受的，溯源只此一处：本表 action=slash + device_name 列）
+// Task 6（H4/H6）追加 **headless | headless_cancel**：无头 turn 落账与移动端取消
+//（词表常量与落账出口单点在 `inject::headless`；channel 列记无头通道名而非终端注入器名）。
+// **action 列是 TEXT NOT NULL、无 CHECK 约束**（见 database/schema.rs）——扩词只需改本
+// 注释与调用方，**不需要 migration**。
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
@@ -34,12 +38,45 @@ pub fn record_conn(
     summary: &str,
     result: &str,
 ) {
-    if let Err(e) = conn.execute(
-        "INSERT INTO write_audit (ts, device_id, device_name, agent_type, session_id, channel, action, summary, result) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![ts, device_id, device_name, agent_type, session_id, channel, action, summary, result],
+    if let Err(e) = record_conn_checked(
+        conn,
+        ts,
+        device_id,
+        device_name,
+        agent_type,
+        session_id,
+        channel,
+        action,
+        summary,
+        result,
     ) {
         log::error!("write_audit 记录失败: {e}");
     }
+}
+
+/// [`record_conn`] 的 **checked 变体**（Codex Desktop IPC Task 7）：参数完全相同，
+/// 但把写入错误作为 `Result` 返回给调用方——供需要「审计与业务写入同事务」的调用方
+/// （`services::codex_control` 的 ActionStore：reserve 与审计起始行同事务，DB 失败
+/// 零投递）在事务内传播失败并整体回滚。原 [`record_conn`] 的吞错兼容行为由它实现后
+/// 保留（旧调用方语义不变）。
+#[allow(clippy::too_many_arguments)]
+pub fn record_conn_checked(
+    conn: &Connection,
+    ts: i64,
+    device_id: &str,
+    device_name: &str,
+    agent_type: &str,
+    session_id: &str,
+    channel: &str,
+    action: &str,
+    summary: &str,
+    result: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO write_audit (ts, device_id, device_name, agent_type, session_id, channel, action, summary, result) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![ts, device_id, device_name, agent_type, session_id, channel, action, summary, result],
+    )
+    .map(|_| ())
 }
 
 /// 最近 limit 条审计，最新在前（id 单调递增，按 id 倒序）
@@ -146,5 +183,58 @@ mod tests {
         assert!(recent_conn(&c, 0).is_empty());
         let empty = mem();
         assert!(recent_conn(&empty, 10).is_empty());
+    }
+
+    /// checked 变体（Task 7）：写入成功返回 Ok；INSERT 被拒（触发器）返回 Err 且
+    /// 不吞错——同事务调用方据此整体回滚
+    #[test]
+    fn record_conn_checked_propagates_errors() {
+        let c = mem();
+        assert!(record_conn_checked(
+            &c,
+            1,
+            "d1",
+            "iPhone",
+            "codex",
+            "s1",
+            "codex_desktop_ipc",
+            "codex_send",
+            "{}",
+            "reserved"
+        )
+        .is_ok());
+        // 拒绝 INSERT 的触发器 → Err 传播
+        c.execute(
+            "CREATE TRIGGER audit_reject_checked BEFORE INSERT ON write_audit
+             BEGIN SELECT RAISE(ABORT, 'rejected'); END",
+            [],
+        )
+        .unwrap();
+        let err = record_conn_checked(
+            &c,
+            2,
+            "d1",
+            "iPhone",
+            "codex",
+            "s1",
+            "codex_desktop_ipc",
+            "codex_send",
+            "{}",
+            "reserved",
+        );
+        assert!(err.is_err(), "checked 写口必须把失败交给事务");
+        // 吞错兼容行为保留：旧 record_conn 不 panic
+        record_conn(
+            &c,
+            3,
+            "d1",
+            "iPhone",
+            "codex",
+            "s1",
+            "codex_desktop_ipc",
+            "codex_send",
+            "{}",
+            "reserved",
+        );
     }
 }

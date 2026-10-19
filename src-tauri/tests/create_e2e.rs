@@ -478,7 +478,7 @@ fn run_create_leg(ev: &Ev, tool: &'static str) -> Result<LegSummary, String> {
         send_key: &send_key,
         send_text: &send_text,
     };
-    let composed = compose_injection(DEVICE_NAME, FIRST_MESSAGE);
+    let composed = compose_injection(DEVICE_NAME, FIRST_MESSAGE).expect("花名在册（E2E 设备名）");
     ev.log(tool, &format!("composed={composed:?}"));
     let params = Params {
         tool: tool.to_string(),
@@ -955,6 +955,8 @@ async fn e2e_create_http_full_chain() {
             multi_agents_manager_lib::inject::dialog::probe_screen_dialog(pid)
         }),
         screen_probe: Arc::new(|_sid: &str, pid: u32| read_screen_lines(pid)),
+
+        codex_control: multi_agents_manager_lib::remote::codex_ipc::CodexControlHub::disabled_arc(),
     });
 
     // ② 预置配对设备（内存库直插设备行；cookie 名 mam_device——m9r 先例）
@@ -1183,7 +1185,7 @@ async fn e2e_create_http_full_chain() {
         "c9-http",
         &format!(
             "session-send 响应：{status} {payload}（composed={:?}）",
-            compose_injection(C9_DEVICE_NAME, C9_SECOND_MESSAGE)
+            compose_injection(C9_DEVICE_NAME, C9_SECOND_MESSAGE).expect("花名在册")
         ),
     );
     assert_eq!(status, 200, "session-send 应 200：{payload}");

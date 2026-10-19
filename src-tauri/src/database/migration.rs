@@ -225,6 +225,21 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             })?;
         }
     }
+    // Codex 动作账本：人工解除屏障标记列——additive 幂等迁移；可空、无默认
+    // （存量行全 NULL = 从未人工解除，无回填需求）。
+    if !column_exists(conn, "codex_actions", "barrier_force_released_at") {
+        conn.execute(
+            "ALTER TABLE codex_actions ADD COLUMN barrier_force_released_at INTEGER",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_CODEX_BARRIER_RELEASE_FAIL: 迁移 codex_actions.barrier_force_released_at 失败: {}",
+                e
+            )
+        })?;
+    }
+
     // 老库 day_key 空串回填（派生列口径：strftime 不可用于 'YYYY-MM-DDTHH' 形态，用 substr）
     conn.execute(
         "UPDATE usage_detail SET day_key = substr(hour_key, 1, 10) WHERE day_key = ''",
