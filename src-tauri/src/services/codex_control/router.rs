@@ -942,7 +942,7 @@ fn not_sent_completed(action_id: &str, reason: &str) -> RouterOutcome {
     RouterOutcome::Completed(not_sent_receipt(action_id, ControlRoute::None, reason))
 }
 
-/// 相同 action_id 重放不同载荷/设备/会话：明确冲突（HTTP 层 409 action_conflict）
+/// 相同 action_id 重放不同载荷/设备/会话：明确冲突（HTTP 层 200 rejected 回执（同 ID 异载荷））
 fn conflict_completed(action_id: &str) -> RouterOutcome {
     let mut r = not_sent_receipt(action_id, ControlRoute::None, "action_conflict");
     r.delivery = Delivery::Rejected;

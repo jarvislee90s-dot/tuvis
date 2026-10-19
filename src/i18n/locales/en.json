@@ -410,14 +410,12 @@
       "namedOffHint": "Switch is off — the public address is unreachable; turn it on to restore it (the address never changes).",
       "groupHeadless": "4. Headless injection (bypasses terminal confirmation)",
       "headlessTitle": "Headless injection",
-      "headlessHint": "Off by default. While off, headless-channel sessions (ZCode / Codex APP / WorkBuddy) cannot be messaged from the phone; the four terminal-injection tools are unaffected.",
-      "headlessConfirm": "Headless injection drives the Agent to execute messages (including tool calls) without visible confirmation in the terminal. The zcode channel defaults to yolo mode (no approval prompt). Enabling means you acknowledge this.",
+      "headlessHint": "Off by default. When off, the mobile client cannot send to Codex APP compatibility-channel sessions; terminal injection is unaffected.",
       "headlessLimitsSave": "Save headless settings",
       "headlessTimeoutLabel": "Headless timeout (ms)",
       "headlessTimeoutHint": "Watchdog limit for a single headless turn; on expiry the process tree is killed and the receipt reports stage=timeout (retryable). Default 600000 (10 minutes).",
       "headlessConcurrencyLabel": "Headless concurrency cap",
-      "headlessConcurrencyHint": "Maximum number of concurrent headless turns (1-8); excess requests immediately get a 'not executed' receipt (no queueing, no auto-retry; resend later). Default 2.",
-      "headlessApprovalLive": "Approval cards for the claude headless channel are live: while a turn waits for a tool approval or an answer, the mobile session detail page shows an approval card (allow / deny / submit answers); dismissing a card counts as deny."
+      "headlessConcurrencyHint": "Maximum number of concurrent headless turns (1-8); excess requests immediately get a 'not executed' receipt (no queueing, no auto-retry; resend later). Default 2."
     },
     "audit": {
       "title": "Injection Audit",
@@ -1543,7 +1541,6 @@
     "runnerWatcherGoneSync": "Process supervision failed (the wait side exited unexpectedly); the process tree was killed",
     "turnCmdShimUnsafe": "The command contains cmd metacharacters — the local CLI is an npm shim relaunched via cmd, which re-parses the whole command line; nothing was delivered. Install the CLI directly (.exe) or remove those characters and resend",
     "turnDeviceNameUnsafe": "The device alias contains command-line-unsafe characters (the `[mobile <alias>]` signature would be re-parsed by cmd on Windows). Nothing was delivered — rename the device in the MAM roster and resend",
-    "turnEtcKinds": "and more unsafe character kinds",
     "migrateCodexBarrierReleaseFail": "Failed to migrate codex_actions.barrier_force_released_at: {error}",
     "codexQueueRetractPending": "This message is still queued; use retract instead",
     "codexQueueForceInFlight": "This message is in-flight (auto-settled), out of force-release scope"

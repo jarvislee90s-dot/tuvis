@@ -28,12 +28,6 @@ pub const ACTION_HEADLESS: &str = "headless";
 /// 无头取消审计词（H4/H6）：移动端主动取消（**先到者生效**——watchdog 先到则记
 /// `headless` 且 stage=timeout，不落本词）
 pub const ACTION_HEADLESS_CANCEL: &str = "headless_cancel";
-/// 无头审批应答审计词（Task 13/C4）：移动端在审批/问答卡上按下决策（allow/deny/answer）。
-/// 与取消行同规——**只有真的送达才落账**（未送达不落：没有应答动作发生）；
-/// 正文列 = `工具名: 入参展示原文`（这一行回答「谁批准了什么」），
-/// 耗时列 = **待答时长**（请求登记 → 应答送达的墙钟；与回合耗时口径不同，勿混读）。
-pub const ACTION_HEADLESS_APPROVE: &str = "headless_approve";
-
 /// watchdog 默认超时（H4 / 裁决 15：600s；两端实测 turn 仅 8–23s，留足余量）
 pub const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 /// 超时下界（1s；0 会让 watchdog 即刻到点）
@@ -92,7 +86,7 @@ pub struct HeadlessAuditCtx {
     pub device_name: String,
     pub agent_type: String,
     pub session_id: String,
-    /// 无头通道名（Task 7/8 的 HeadlessKind 展示名，如 `headless_zcode`）——
+    /// 无头通道名（HeadlessKind 展示名，如 `headless_codex_queue`）——
     /// **不是**终端注入器名（那对无头动作是假值）
     pub channel: String,
     /// 命令形态/消息原文：摘要按 W5 口径在 [`crate::inject::audit_write_channel`] 内现算
@@ -349,10 +343,6 @@ mod tests {
     fn audit_actions_are_pinned() {
         assert_eq!(ACTION_HEADLESS, "headless");
         assert_eq!(ACTION_HEADLESS_CANCEL, "headless_cancel");
-        assert_eq!(
-            ACTION_HEADLESS_APPROVE, "headless_approve",
-            "Task 13/C4：审批应答行的动作词（送达才落账）"
-        );
     }
 
     /// 评审 Important 3：H4「可配」必须**真生效**——设置值落到全局名额，

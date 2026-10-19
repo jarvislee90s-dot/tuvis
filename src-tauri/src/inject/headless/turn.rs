@@ -220,11 +220,6 @@ fn device_name_char_label(c: char) -> String {
     }
 }
 
-/// 花名不安全的**错误码单点**（裁决 26 的对称性要求）：配对登记点回
-/// `{"error": <本码>, "reason": 原因}`，桌面改名命令回 `<本码>: 原因`——两处**同码同文案**
-/// （判据与原因文案都出自 [`device_name_refusal`]，故用户在移动端与桌面端看到的是同一句话）。
-pub const DEVICE_NAME_UNSAFE_CODE: &str = "device_name_unsafe";
-
 /// **花名（设备名）白名单判定 —— 本判据的唯一决策点**（`Some(reason)` = 不安全，须拒）。
 ///
 /// # 为什么是白名单，不是黑名单（裁决 24b；R3 签名面收口）
@@ -247,18 +242,17 @@ pub const DEVICE_NAME_UNSAFE_CODE: &str = "device_name_unsafe";
 /// 故**不要**因为「这个字符看起来没有 `cmd` 语义」而放宽本判据：本判据是**字符类白名单**，
 /// 不是威胁面清单（改判据前先读本条）。
 ///
-/// # 调用点（**三处**，见各自文档——这是「一层判据」的纪律）
+/// # 调用点（**本轮只有一处**；勿在文档里写成三处）
 /// ① **签名组装单点** [`crate::inject::normalize::compose_injection`]：**拼接之前**判，
-///    不安全即 `Err(reason)`，调用方按 `refused` 档 fail closed（零字节投递）；
-/// ② **设备名注册点**（`remote::api::persist_and_cookie`）：配对登记危险花名直接拒
-///    （HTTP 400 `{"error":`[`DEVICE_NAME_UNSAFE_CODE`]`, "reason": 本判据的原因}`）；
-/// ③ **设备改名内核**（`remote::rename_device_core` ← `remote_rename_device`；**裁决 26 收口**）：
-///    危险花名在**改名当下**就拒（同码 [`DEVICE_NAME_UNSAFE_CODE`] + 同一句原因文案），
-///    且在**触 DAO 之前**返回 `Err`（旧名原样，不存在半写）。
-/// **不做 migration**：存量已登记的危险花名由 ① 在**投递时**兜住（这是有意的纵深防御——
-/// 注册点/改名点只挡新的与被改的，旧的靠投递点，故各处都不能省）。
-/// **改名路径的取舍已关闭**（上一轮有意不加门、登记在案；裁决 26 要求错误在改名时浮出，
-/// 不拖到投递时）。
+///    不安全即 `Err(reason)`，调用方按 `refused` 档 fail closed（零字节投递）。
+///
+/// **未接线的两处（如实登记，属 #117 续作）**：配对登记点
+/// （`remote::api::persist_and_cookie`）与设备改名内核（`remote::rename_device_core`）
+/// 当前**没有**调用本判据——危险花名仍可登记/改名成功，直到首次投递时由 ① 拒绝（零投递，
+/// 不会误投，但用户要到发送时才知道）。这是本轮「不扩 main 既有配对/改名行为」的取舍；
+/// 若续作要补「注册即拒」，需要在两处接同一判据并补 HTTP 400 错误码。
+///
+/// **不做 migration**：存量已登记的危险花名由 ① 在**投递时**兜住。
 pub fn device_name_refusal(name: &str) -> Option<String> {
     let mut hit: Vec<char> = Vec::new();
     for c in name.chars() {
@@ -280,7 +274,7 @@ pub fn device_name_refusal(name: &str) -> Option<String> {
         .map(|c| device_name_char_label(*c))
         .collect();
     let more = if hit.len() > 3 {
-        format!("TURN_ETC_KINDS:  等 {} 种", hit.len())
+        format!(" (+{})", hit.len())
     } else {
         String::new()
     };

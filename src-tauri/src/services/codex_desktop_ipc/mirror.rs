@@ -703,7 +703,7 @@ fn error_item_summary(item: &Value) -> String {
 }
 
 /// 正文截头（字节上限，按字符边界回退）+ 显式截断标记（自报原文总字符数）。
-/// 形态对齐 `inject::normalize::truncate_with_size_marker` 的展示截断纪律——
+/// 形态对齐 normalize 的展示截断纪律（`DISPLAY_TRUNCATED: ` 前缀 + 原文总字符数）——
 /// 绝不静默砍；未超限逐字原文。
 fn truncate_text_head(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {

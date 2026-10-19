@@ -213,26 +213,6 @@ pub fn summarize(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// **展示用**截断（P0 安全：超限必须**显式**报出真实总长，不得静默砍）。
-///
-/// 用于**面向用户**的展示面（审批卡的「将要执行的命令」）：用户要据此点「批准」，
-/// 静默截断 = 让人批准一条自己读不全的命令。故超限时产物 =
-/// 前 `max_chars` 个字符 + 「…已截断，共 N 字符」（N = 原文**真实**字符数）。
-/// 未超限时**逐字原文**（没有隐藏任何内容，就无需声明长度）。
-///
-/// **与 [`summarize`] 的区别（勿合并）**：`summarize` 是审计摘要（只存摘要、防库膨胀），
-/// 本函数是用户展示（保真 + 自报长度）；两者语义不同、阈值也各自由调用方给常数
-/// （如 `cli_three::APPROVAL_INPUT_DISPLAY_CHARS`）。
-pub fn truncate_with_size_marker(text: &str, max_chars: usize) -> String {
-    match cut_over_limit(text, max_chars) {
-        Some(cut) => format!(
-            "DISPLAY_TRUNCATED: {cut}…已截断，共 {} 字符",
-            text.chars().count()
-        ),
-        None => text.to_string(),
-    }
-}
-
 /// 审计摘要截断长度（W5 只存摘要）
 pub const AUDIT_SUMMARY_CHARS: usize = 80;
 
@@ -441,30 +421,6 @@ mod tests {
         assert_eq!(summarize("abcdef", 4), "abcd…");
         assert_eq!(summarize("abc", 4), "abc");
         assert_eq!(summarize("一二三四五", 4), "一二三四…"); // 多字节按 chars 计
-    }
-
-    /// **R2 展示截断**：超限必须报**真实总长**（不是保留长度）；未超限逐字原文。
-    /// 与 [`summarize`] 的差别正在这里——那个只有一个 `…`（审计面不需要长度）。
-    #[test]
-    fn truncate_with_size_marker_names_the_true_total() {
-        assert_eq!(
-            truncate_with_size_marker("abcdef", 4),
-            "DISPLAY_TRUNCATED: abcd…已截断，共 6 字符",
-            "标记里的数字必须是**原文**长度（6），不是保留长度（4）"
-        );
-        assert_eq!(truncate_with_size_marker("abc", 4), "abc", "恰在上限：逐字");
-        assert_eq!(
-            truncate_with_size_marker("abcd", 4),
-            "abcd",
-            "等于上限：逐字"
-        );
-        assert_eq!(
-            truncate_with_size_marker("一二三四五", 4),
-            "DISPLAY_TRUNCATED: 一二三四…已截断，共 5 字符",
-            "多字节按 chars 计总长（5），不按字节"
-        );
-        // 两条口径**不可互换**：审计摘要不会出现长度文案
-        assert!(!summarize("abcdef", 4).contains("字符"));
     }
 
     /// 裸 CR（奇异客户端）也归一
