@@ -9,9 +9,13 @@
 //  不让用户盲等（types.rs CodexQueueView 的字段注释即本条契约）；
 // - **人工解除无出口屏障（2026-10-19 复审 Important）**：native_delivery_unknown /
 //   compat_outstanding 两类无自动恢复路径的屏障，提供「已到桌面端核对，继续队列」
-//   按钮——**两步确认**（未确认不发任何请求；文案如实披露重复内容风险）后逐个
-//   解除 blockedActionIds 并重拉；失败显示错误不静默。native_turn_pending 有自动
-//   恢复路径（Turn 终态证据驱动），不提供该按钮；
+//   按钮——**两步确认**（未确认不发任何请求；文案如实披露重复内容风险，并披露
+//   混合屏障面：清单含等待 Turn 完成的条目时将提前解除其顺序限制——行清单不带
+//   state，前端无从逐行甄别，只能文案如实）后逐个解除 blockedActionIds 并重拉；
+//   单个 id 的确定性「无需解除」回执（409 no_barrier——屏障已被自动路径解除/
+//   从未在册）只收尾该 id 不中断剩余；真失败显示错误不静默（note 走 reason →
+//   机器码 → message 可读化回退链）。native_turn_pending 有自动恢复路径（Turn
+//   终态证据驱动），不提供该按钮；
 // - **不提供插队**：本面板没有「立即发送/跳到队首」语义（宪法 R2.3 忙态留队、
 //   FIFO 按序，任何插队入口都是越权）——cancelled/终态条目也不出现重试按钮
 //   （重投 = 同 actionId 双投风险，绝不自动）；
@@ -55,6 +59,27 @@ function stateLabel(s: CodexActionState): string {
     case "cancelled":
       return i18n.t("mobile.codex.queue.stateCancelled");
   }
+}
+
+/** ApiError → 可读分诊片段：后端 reason（人类可读，如「该消息仍在排队，请使用
+ *  撤回」）优先，其次机器码 error（如 no_barrier / queued_use_retract），最后兜底
+ *  e.message——对齐 PendingRequestCard C5 臂的回退链，不把「路径 + 状态码」裸示人 */
+function apiErrorReason(e: ApiError): string {
+  if (typeof e.data?.reason === "string" && e.data.reason !== "") return e.data.reason;
+  if (typeof e.data?.error === "string" && e.data.error !== "") return e.data.error;
+  return e.message;
+}
+
+/** 该次 force-continue 失败是否「该 id 无需解除」的确定性收尾（2026-10-19 复审
+ *  Minor：一败全停修复）——409 no_barrier = 屏障已被自动路径解除/从未在册
+ *  （典型：视图与确认之间屏障被自动路径清掉），剩余未解除 id 与该 id 无关，
+ *  循环继续逐个解除；仅真失败（网络异常 / 5xx / 403 门禁等）才中断（此时剩余
+ *  屏障状态不可知，重拉后由用户再试）。200（含 AlreadyReleased 幂等回执，HTTP
+ *  层与普通解除不可分）天然继续。409 queued_use_retract 不在此列：它指引「走
+ *  撤回」，按真失败中断并由 note 可读化转述（且屏障在册清单不含 queued 行，
+ *  本面板实际到不了该臂）。 */
+function isPerIdSettledRefusal(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 409 && e.data?.error === "no_barrier";
 }
 
 export default function CodexQueuePanel({
@@ -161,8 +186,11 @@ export default function CodexQueuePanel({
     [busyId, forceBusy, load]
   );
 
-  // 人工解除无出口屏障（确认后调用）：逐个解除在册屏障并重拉；任一失败 →
-  // 显示错误不静默（已成功的保留——重拉以服务端账本为权威）。
+  // 人工解除无出口屏障（确认后调用）：逐个解除在册屏障并重拉。单个 id 的确定性
+  // 「无需解除」回执（409 no_barrier / queued_use_retract——视图与确认之间屏障被
+  // 自动路径清除、该行本就在册外等）只收尾该 id，**不中断**剩余 id（2026-10-19
+  // 复审 Minor：一败全停修复）；仅真失败（网络/5xx/403 等）→ 显示错误不静默
+  // （已成功的保留——重拉以服务端账本为权威）。
   const forceContinue = useCallback(async () => {
     if (busyId !== null || forceBusy) return;
     const ids = view?.blockedActionIds ?? [];
@@ -172,14 +200,15 @@ export default function CodexQueuePanel({
     setNote(null);
     try {
       for (const id of ids) {
-        await forceContinueCodexAction(id);
+        try {
+          await forceContinueCodexAction(id);
+        } catch (e) {
+          if (!isPerIdSettledRefusal(e)) throw e; // 真失败：中断，剩余未解除
+        }
       }
     } catch (e) {
-      setNote(
-        e instanceof ApiError
-          ? i18n.t("mobile.codex.queue.forceContinueFailed", { message: e.message })
-          : i18n.t("mobile.codex.queue.forceContinueFailed", { message: String(e) })
-      );
+      const message = e instanceof ApiError ? apiErrorReason(e) : String(e);
+      setNote(i18n.t("mobile.codex.queue.forceContinueFailed", { message }));
     } finally {
       setForceBusy(false);
       await load();

@@ -1774,7 +1774,7 @@
         "blockedNativeTurn": "原生回合未确认完成，队列已暂停派发——等待 Turn 完成后自动继续",
         "blockedNativeUnknown": "原生投递结果未知，队列已暂停派发——该屏障无自动恢复路径（保守保留，不自动重发）",
         "forceContinue": "已到桌面端核对，继续队列",
-        "forceContinueRisk": "请确认该消息的实际去向已在 Desktop 端核对：若它实际已投出，继续后续消息可能造成重复内容。",
+        "forceContinueRisk": "请确认该消息的实际去向已在 Desktop 端核对：若它实际已投出，继续后续消息可能造成重复内容。若清单包含仍在等待 Turn 完成的条目，确认后将提前解除其 Turn 顺序限制。",
         "forceContinueYes": "确认继续",
         "forceContinueCancel": "取消",
         "forceContinueFailed": "继续队列失败：{{message}}"

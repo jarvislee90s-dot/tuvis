@@ -37,8 +37,10 @@ interface Routes {
   queue?: CodexQueueView[];
   /** GET /codex/queue 的逐次响应（操作后重拉断言用） */
   retractStatus?: number;
-  /** POST /codex/queue/force-continue 的失败状态码（缺省 200） */
+  /** POST /codex/queue/force-continue 的失败状态码（缺省 200；作用于全部 id） */
   forceContinueStatus?: number;
+  /** POST /codex/queue/force-continue 按 actionId 定向的失败体（一败全停/可读化用例） */
+  forceContinueFailures?: Record<string, { status: number; body: Record<string, unknown> }>;
   /** R11：GET 挂起不响应（手动放行——乱序防护用例的在途响应） */
   queueHang?: boolean;
 }
@@ -62,12 +64,16 @@ function installFetch() {
   fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.includes("/codex/queue/force-continue")) {
+      const body = JSON.parse(String(init?.body)) as { actionId: string };
+      const failure = routes.forceContinueFailures?.[body.actionId];
+      if (failure) {
+        return new Response(JSON.stringify(failure.body), { status: failure.status });
+      }
       if (routes.forceContinueStatus) {
         return new Response(JSON.stringify({ error: "internal" }), {
           status: routes.forceContinueStatus,
         });
       }
-      const body = JSON.parse(String(init?.body)) as { actionId: string };
       return new Response(
         JSON.stringify({
           actionId: body.actionId,
@@ -402,6 +408,93 @@ describe("CodexQueuePanel（Task 9）", () => {
     expect(screen.getByTestId("codex-queue-note").textContent).toContain("继续队列失败");
     // 失败后仍重拉权威列表
     expect(queueGetCalls()).toBe(2);
+  });
+
+  it("force_continue_no_barrier_settles_and_continues：第一个 id 409 no_barrier（视图与确认之间屏障被自动路径清除）→ 该 id 收尾继续，第二个 id 仍被请求，零错误 note", async () => {
+    installFetch();
+    routes.forceContinueFailures = {
+      "u-1": { status: 409, body: { error: "no_barrier" } },
+    };
+    routes.queue = [
+      queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
+      queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
+    fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
+    // 一败（no_barrier）不停：两个 id 都被逐个请求（面板保持可见，note 断言才有效）
+    await waitFor(() =>
+      expect(forceContinueBodies()).toEqual(['{"actionId":"u-1"}', '{"actionId":"u-2"}'])
+    );
+    // no_barrier = 确定性「无需解除」，不是错误：不出错误 note
+    expect(screen.queryByTestId("codex-queue-note")).toBeNull();
+    // 操作后重拉（挂载 1 次 + 循环后 1 次）
+    expect(queueGetCalls()).toBe(2);
+  });
+
+  it("force_continue_real_failure_interrupts：第二个 id 真失败（500 internal）→ 中断剩余 + note 带机器码可读化（不裸示「路径 + 状态码」）", async () => {
+    installFetch();
+    routes.forceContinueFailures = {
+      "u-2": { status: 500, body: { error: "internal" } },
+    };
+    routes.queue = [
+      queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2", "u-3"]),
+      queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2", "u-3"]),
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
+    fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
+    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
+    // note 走 reason → 机器码 → message 回退链：500 无 reason，退到机器码 internal，
+    // 不再把「codex/queue/force-continue 500」裸示人
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain("继续队列失败");
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain("internal");
+    expect(screen.getByTestId("codex-queue-note").textContent).not.toContain(
+      "codex/queue/force-continue"
+    );
+    // 真失败中断：u-3 不再请求（重拉后由用户再试）
+    expect(forceContinueBodies()).toEqual(['{"actionId":"u-1"}', '{"actionId":"u-2"}']);
+    expect(queueGetCalls()).toBe(2);
+  });
+
+  it("force_continue_note_prefers_backend_reason：失败体带 reason（queued_use_retract）→ note 显示后端 reason 原文，不裸示 message", async () => {
+    installFetch();
+    routes.forceContinueFailures = {
+      "u-1": {
+        status: 409,
+        body: { error: "queued_use_retract", reason: "该消息仍在排队，请使用撤回" },
+      },
+    };
+    routes.queue = [
+      queueView([action({ actionId: "a1" })], "compat_outstanding", ["u-1"]),
+      queueView([action({ actionId: "a1" })], "compat_outstanding", ["u-1"]),
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
+    fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
+    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain(
+      "该消息仍在排队，请使用撤回"
+    );
+    expect(screen.getByTestId("codex-queue-note").textContent).not.toContain(
+      "codex/queue/force-continue"
+    );
+  });
+
+  it("force_continue_risk_discloses_mixed_turn_entries：清单含等待 Turn 完成的条目时，确认文案如实披露提前解除顺序限制（混合屏障面——行清单不带 state 无从逐行甄别）", async () => {
+    installFetch();
+    // 混合在册屏障：unknown（无自动恢复）+ accepted+turnId（等 Turn 完成）并存时，
+    // 后端 blockedReasonCode 取优先级更高的 native_delivery_unknown，清单两者都在
+    routes.queue = [
+      queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "t-1"]),
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
+    const strip = screen.getByTestId("codex-queue-force-confirm");
+    expect(strip.textContent).toContain("Turn");
+    expect(strip.textContent).toContain("顺序限制");
+    // 确认前零请求（两步确认纪律不变）
+    expect(forceContinueBodies()).toEqual([]);
   });
 
   it("force_continue_i18n_keys_exist：新键两侧（zh 取用文案；键集对齐由 check:i18n 保证）", async () => {
