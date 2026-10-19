@@ -158,7 +158,10 @@ struct ConnectionShared {
     client_id: std::sync::Mutex<Option<String>>,
     /// initialize 完成的信号（Some = 我方 clientId）；请求在握手成功前不得写出。
     init: watch::Receiver<Option<String>>,
-    init_tx: watch::Sender<Option<String>>,
+    /// 缺陷1：init sender 可收尾——握手失败 / writer 收尾时取走并丢弃，让所有
+    /// 挂在 `changed()` 上的等待者立即以「断开」唤醒。sender 若被 shared 永久
+    /// 持有，握手失败后等待者会永久挂起（closed 置位不唤醒 watch 等待者）。
+    init_tx: std::sync::Mutex<Option<watch::Sender<Option<String>>>>,
     /// 2026-10-17 复审 C4：writer 收尾信号——reader 随之退出、io 整体 drop
     ///（split 的两半共享底层 io，只丢 WriteHalf 对端看不到 EOF）。
     teardown_tx: watch::Sender<bool>,
@@ -170,6 +173,15 @@ async fn complete_pending(shared: &ConnectionShared, envelope_id: &str, outcome:
     let p = shared.pending.lock().await.remove(envelope_id);
     if let Some(p) = p {
         let _ = p.tx.send(outcome);
+    }
+}
+
+/// 缺陷1：让 init 等待不可恢复地失败——取走并丢弃 sender，唤醒所有仍挂在
+/// `changed()` 上的等待者（其 `changed()` 以 Err 返回 → 按断开零投递）。
+/// 幂等：握手已成功发值后再调用无害（等待者早已离开等待循环）。
+fn fail_init_waiters(shared: &ConnectionShared) {
+    if let Ok(mut slot) = shared.init_tx.lock() {
+        *slot = None;
     }
 }
 
@@ -225,6 +237,7 @@ impl ConnectionHandle {
             if !this.shared.budget.try_reserve(frame.len()) {
                 return Err(ProtocolError::Capacity("outbound budget full".into()));
             }
+            let frame_len = frame.len();
             let cmd = FrameCmd {
                 envelope_id: String::new(),
                 frame,
@@ -232,7 +245,13 @@ impl ConnectionHandle {
             };
             match this.main_tx.try_send(cmd) {
                 Ok(()) => Ok(()),
-                Err(_) => Err(ProtocolError::Disconnected("connection closed".into())),
+                Err(_) => {
+                    // 缺陷3：帧未进入 writer 队列，writer 不会替我们退预算——
+                    // 这里退回，否则每次失败泄漏一帧字节，outbound 预算慢性
+                    // 耗尽后整条连接瘫痪（不关闭、不触发重连）
+                    this.shared.budget.release(frame_len);
+                    Err(ProtocolError::Disconnected("connection closed".into()))
+                }
             }
         })
     }
@@ -259,11 +278,16 @@ impl ConnectionHandle {
             if self.shared.closed.load(Ordering::SeqCst) {
                 return RpcOutcome::not_sent(envelope_id, "disconnected");
             }
-            if tokio::time::Instant::now() >= deadline {
-                return RpcOutcome::not_sent(envelope_id, "initialize_pending");
-            }
-            if init.changed().await.is_err() {
-                return RpcOutcome::not_sent(envelope_id, "disconnected");
+            // 缺陷1：changed() 用 deadline 包裹——握手失败路径从不向 init 发值
+            //（closed 置位也不唤醒 watch 等待者），裸 changed() 会永久挂起并
+            // 自持 handle 形成泄漏；超时按握手挂起保守零投递。
+            match tokio::time::timeout_at(deadline, init.changed()).await {
+                Err(_elapsed) => {
+                    return RpcOutcome::not_sent(envelope_id, "initialize_pending");
+                }
+                // init sender 已被收尾取走：连接已死
+                Ok(Err(_)) => return RpcOutcome::not_sent(envelope_id, "disconnected"),
+                Ok(Ok(())) => {}
             }
         }
         // 排队前复核：owner 换代 / 失活 / 已关闭 → 零投递
@@ -424,7 +448,7 @@ pub fn spawn(
         closed: AtomicBool::new(false),
         client_id: std::sync::Mutex::new(None),
         init: init_rx,
-        init_tx,
+        init_tx: std::sync::Mutex::new(Some(init_tx)),
         teardown_tx,
         teardown_rx,
     });
@@ -514,6 +538,9 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
     }
     // 已写出等待回执的 waiter：连接失败 → Unknown（不冒充 NotSent）
     release_pending_as_unknown(&shared).await;
+    // 缺陷1第二道保险：丢弃 init sender，握手等待者立即按断开唤醒
+    //（不依赖请求侧超时兜底）
+    fail_init_waiters(&shared);
     shared.closed.store(true, Ordering::SeqCst);
     // C4：唤醒 reader 退出（io 整体 drop，对端见 EOF）
     let _ = shared.teardown_tx.send(true);
@@ -525,9 +552,10 @@ async fn writer_task<W: tokio::io::AsyncWrite + Unpin + Send>(
 /// 已写出等待回执的 waiter：连接失败 → Unknown（结果未知）。
 async fn release_pending_as_unknown(shared: &ConnectionShared) {
     let mut pending = shared.pending.lock().await;
-    for (_, p) in pending.drain() {
-        let _ =
-            p.tx.send(RpcOutcome::unknown("released".into(), "disconnected"));
+    for (eid, p) in pending.drain() {
+        // 缺陷2：回执必须携带原 envelope UUID（契约见 RpcOutcome——envelope_id
+        // 恒为本次生成的 envelope UUID），不得用 "released" 占位串顶替
+        let _ = p.tx.send(RpcOutcome::unknown(eid, "disconnected"));
     }
 }
 
@@ -654,11 +682,17 @@ async fn initialize_handshake(handle: ConnectionHandle, shared: Arc<ConnectionSh
     });
     let bytes = match super::codec::encode_frame(&frame) {
         Ok(b) => b,
-        Err(_) => return,
+        // 握手早退也是失败路径：收尾 init（等待者按断开唤醒，不靠 15s 超时兜底）
+        Err(_) => {
+            fail_init_waiters(&shared);
+            return;
+        }
     };
     if !shared.budget.try_reserve(bytes.len()) {
+        fail_init_waiters(&shared);
         return;
     }
+    let bytes_len = bytes.len();
     let (otx, orx) = oneshot::channel();
     {
         let mut pending = shared.pending.lock().await;
@@ -680,7 +714,10 @@ async fn initialize_handshake(handle: ConnectionHandle, shared: Arc<ConnectionSh
         .is_err()
     {
         shared.pending.lock().await.remove(&envelope_id);
-        shared.budget.release(0);
+        // 缺陷3：预留在先，入队失败退回全额（原 release(0) 泄漏握手帧预算）
+        shared.budget.release(bytes_len);
+        // 握手已不可恢复失败：唤醒等待者（第二道保险，writer 收尾也会做）
+        fail_init_waiters(&shared);
         return;
     }
     let outcome = match tokio::time::timeout(INIT_TIMEOUT, orx).await {
@@ -689,6 +726,9 @@ async fn initialize_handshake(handle: ConnectionHandle, shared: Arc<ConnectionSh
             shared.pending.lock().await.remove(&envelope_id);
             // 握手失败：等同连接不可用（唤醒 writer 收尾；请求门控随 closed 生效）
             let _ = handle.main_tx.send(FrameCmd::shutdown()).await;
+            // 缺陷1：握手失败路径必须让 init 等待者可唤醒（writer 收尾兜底之外
+            // 的直接保险；幂等）
+            fail_init_waiters(&shared);
             return;
         }
     };
@@ -700,6 +740,8 @@ async fn initialize_handshake(handle: ConnectionHandle, shared: Arc<ConnectionSh
         .map(str::to_string);
     if outcome.delivery != Delivery::Accepted || client_id.is_none() {
         let _ = handle.main_tx.send(FrameCmd::shutdown()).await;
+        // 缺陷1：同上——握手失败路径唤醒 init 等待者
+        fail_init_waiters(&shared);
         return;
     }
     if let Ok(mut slot) = shared.client_id.lock() {
@@ -709,5 +751,97 @@ async fn initialize_handshake(handle: ConnectionHandle, shared: Arc<ConnectionSh
         client_id: client_id.clone().unwrap(),
         epoch: shared.epoch,
     });
-    let _ = shared.init_tx.send(Some(client_id.unwrap()));
+    if let Ok(tx) = shared.init_tx.lock() {
+        if let Some(tx) = tx.as_ref() {
+            let _ = tx.send(Some(client_id.unwrap()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 缺陷3回归：入队失败路径必须全额退回字节预算。不 spawn writer——
+    //! 手工搭最小连接环境，main 队列接收端预先丢弃 → try_send 必 Closed，
+    //! 确定性地命中失败分支（经 spawn 走队列打满是竞态）。
+
+    use super::*;
+
+    /// 最小连接环境：返回 (shared, main 发送端)；main 接收端已丢弃。
+    fn test_shared() -> (Arc<ConnectionShared>, mpsc::Sender<FrameCmd>) {
+        let (events, _) = broadcast::channel(16);
+        let (init_tx, init_rx) = watch::channel(None::<String>);
+        let (teardown_tx, teardown_rx) = watch::channel(false);
+        let profile =
+            crate::services::codex_desktop_ipc::profile::profile_for("macos", "26.1013.31256")
+                .expect("测试 profile 必须命中");
+        let shared = Arc::new(ConnectionShared {
+            epoch: 1,
+            profile,
+            events,
+            pending: Mutex::new(HashMap::new()),
+            budget: Budget::default(),
+            closed: AtomicBool::new(false),
+            client_id: std::sync::Mutex::new(None),
+            init: init_rx,
+            init_tx: std::sync::Mutex::new(Some(init_tx)),
+            teardown_tx,
+            teardown_rx,
+        });
+        let (main_tx, main_rx) = mpsc::channel::<FrameCmd>(64);
+        drop(main_rx);
+        (shared, main_tx)
+    }
+
+    /// 缺陷3回归：broadcast 入队失败（Closed）必须退回预留字节——原实现直接
+    /// 返回 Err，每次失败泄漏一帧预算，1MiB outbound 预算慢性耗尽后整条
+    /// 连接瘫痪（不关闭、不触发重连）。
+    #[tokio::test]
+    async fn broadcast_enqueue_failure_releases_budget() {
+        let (shared, main_tx) = test_shared();
+        let handle = ConnectionHandle {
+            shared: shared.clone(),
+            main_tx,
+            disc_tx: mpsc::channel(1).0,
+        };
+
+        let params = serde_json::json!({ "blob": "x".repeat(4096) });
+        let result = handle
+            .broadcast("thread-stream-following-changed", 1, params)
+            .await;
+        assert!(result.is_err(), "接收端已关：broadcast 必须报错");
+
+        // 预算必须全额退回：失败后仍能一次性预留整段 OUTBOUND_BYTES
+        assert!(
+            shared.budget.try_reserve(OUTBOUND_BYTES),
+            "入队失败的帧必须退回字节预算（否则 outbound 慢性耗尽）"
+        );
+    }
+
+    /// 缺陷3回归：initialize 握手入队失败必须退回握手帧全额预留
+    /// （原 release(0) 等于不退）；同时 pending 表不留残条、init sender
+    /// 已收尾（等待者可唤醒）。
+    #[tokio::test]
+    async fn handshake_enqueue_failure_releases_budget() {
+        let (shared, main_tx) = test_shared();
+        let handle = ConnectionHandle {
+            shared: shared.clone(),
+            main_tx,
+            disc_tx: mpsc::channel(1).0,
+        };
+
+        initialize_handshake(handle, shared.clone()).await;
+
+        assert!(
+            shared.budget.try_reserve(OUTBOUND_BYTES),
+            "握手入队失败必须退回全额预留（原 release(0) 泄漏握手帧）"
+        );
+        assert!(
+            shared.pending.try_lock().unwrap().is_empty(),
+            "失败路径不得在 pending 表留残条"
+        );
+        assert!(
+            shared.init_tx.lock().unwrap().is_none(),
+            "握手不可恢复失败后 init sender 必须已收尾（等待者可唤醒）"
+        );
+    }
 }
