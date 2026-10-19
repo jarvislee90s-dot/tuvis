@@ -12,7 +12,8 @@
 //!   来源 reviewer 2026-10-17 实读 Windows 原始日志，脱敏夹具同步）；
 //! * 低 revision 重放忽略；revision 缺口 → stale + need_snapshot；
 //!   新 epoch（换代后）不与旧 revision 比大小（状态已清）；
-//! * 预算：单 Thread 镜像 16 MiB；投影正文尾窗 1 MiB / 500 条并标 truncated。
+//! * 预算：单 Thread 镜像 16 MiB；投影正文尾窗 1 MiB / 500 条并标 truncated；
+//!   最新一条自身超窗时截头保底保留（绝不把整份投影清成 0 条）。
 
 use super::history_view::HistoryView;
 use super::pending::PendingProjector;
@@ -34,6 +35,9 @@ pub const GLOBAL_MIRROR_BUDGET: usize = 64 * 1024 * 1024;
 pub const PROJECTION_MAX_MESSAGES: usize = 500;
 /// 投影正文尾窗字节预算。
 pub const PROJECTION_TAIL_BYTES: usize = 1024 * 1024;
+/// 单条正文尾窗保底上限：最新一条自身超 [`PROJECTION_TAIL_BYTES`] 时该条不整条
+/// 裁掉，正文截头到该字节数（字符边界对齐）加显式截断标记。
+pub const PROJECTION_HEAD_BYTES: usize = 64 * 1024;
 
 /// 全体镜像字节账本：claim(key, old, new) 原子预留，超总预算返回 false（镜像转
 /// stale + Capacity 拒绝，等内存释放后由下次 ensure/事件救活）；mirror 卸载/
@@ -505,6 +509,9 @@ fn runtime_status(state: &Value) -> String {
 
 /// 按正史顺序投影消息，尾窗 1 MiB / 500 条，超出标 truncated。
 /// 返回 (消息, 是否截断)。
+/// 字节尾窗**绝不把最新一条整条裁掉**：单条自身超 1 MiB（agentMessage 贴大日志/
+/// 大代码块真实可达）→ 保底保留该 1 条，正文截头（[`PROJECTION_HEAD_BYTES`]）+
+/// 显式标记，truncated 置位；多条累计超限才丢弃较旧条目（维持既有逻辑）。
 /// 2026-10-18 真机形态适配：经统一读层走 canonical 引用链（entries.value → 实体，
 /// turnId 字段认领），正文取 `turn.items[]` **内联对象**（camelCase）——
 /// `userMessage.content[]` 的 text 块、`agentMessage.text`；`error.message` 走系统
@@ -582,7 +589,16 @@ fn project_messages(state: &Value) -> (Vec<ProjectedMessage>, bool) {
         }
     }
     if cut > 0 {
-        all = all.split_off(cut);
+        if cut >= all.len() {
+            // 最新一条自身超字节预算（倒序首轮 i == 0 → cut == all.len()）：不得
+            // 整条裁成 0 条投影——移动端会把有内容的会话显示成「暂无消息」，与
+            // 本文件「未知 kind 绝不静默滤成 0 条」同纪律。保底保留该条，正文
+            // 单独截头 + 显式标记；truncated 已在循环内置位。
+            let last = all.last_mut().expect("cut == all.len() 蕴含非空");
+            last.text = truncate_text_head(&last.text, PROJECTION_HEAD_BYTES);
+        } else {
+            all = all.split_off(cut);
+        }
     }
     (all, truncated)
 }
@@ -620,6 +636,24 @@ fn error_item_summary(item: &Value) -> String {
         }
         None => "[error]".to_string(),
     }
+}
+
+/// 正文截头（字节上限，按字符边界回退）+ 显式截断标记（自报原文总字符数）。
+/// 形态对齐 `inject::normalize::truncate_with_size_marker` 的展示截断纪律——
+/// 绝不静默砍；未超限逐字原文。
+fn truncate_text_head(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut cut = max_bytes;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}…已截断，原文共 {} 字符",
+        &text[..cut],
+        text.chars().count()
+    )
 }
 
 /// 单个 patch op（严格形态）：add=数组插入/对象新增，replace=只替换现有，
@@ -1001,6 +1035,86 @@ mod tests {
         assert!(p.truncated);
         assert_eq!(p.messages[0].id, "i100", "保留尾窗（最新 500 条）");
         assert_eq!(p.messages[499].id, "i599");
+    }
+
+    #[test]
+    fn oversized_newest_message_is_head_truncated_not_dropped() {
+        // 单条正文自身超 1 MiB（agentMessage 贴大日志/大代码块真实可达）：投影
+        // 不得清成 0 条——保底保留最新 1 条，正文截头 + 显式标记，truncated 置位
+        let original_chars = PROJECTION_TAIL_BYTES / 3 + 1000;
+        let body = "汉".repeat(original_chars); // 3 B/char → 字节数 > 1 MiB
+        assert!(body.len() > PROJECTION_TAIL_BYTES);
+        let change = serde_json::json!({
+            "type": "snapshot", "revision": 1,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true,
+                        "entitiesByKey": {
+                            "turn:t1": { "turnId": "t1", "status": "completed",
+                                "items": [ { "type": "agentMessage", "id": "big1",
+                                             "text": body } ] }
+                        },
+                        "islands": [{ "entries": [ { "key": "turn:t1",
+                                                     "value": "turn:t1" } ] }]
+                    } }
+            }
+        });
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &change).unwrap();
+        let p = m.project(caps());
+        assert_eq!(
+            p.messages.len(),
+            1,
+            "超窗最新条必须保底保留，不得投影成 0 条"
+        );
+        assert!(p.truncated, "截头分支必须置位 truncated");
+        let text = &p.messages[0].text;
+        assert!(text.starts_with("汉"), "保留头部原文");
+        assert!(text.len() < body.len(), "正文确实被截短");
+        assert!(text.len() < PROJECTION_TAIL_BYTES, "截头后落回尾窗预算内");
+        let expected_tail = format!("…已截断，原文共 {original_chars} 字符");
+        assert!(text.ends_with(&expected_tail), "显式自报原文总字符数");
+        // 64 KiB 切点不在 3 B 字符边界 → 回退对齐后头部必须是整字符（无半个字符）
+        let head_len = text.len() - expected_tail.len();
+        assert_eq!(head_len % 3, 0, "切点落在字符边界");
+    }
+
+    #[test]
+    fn byte_tail_window_drops_only_older_messages() {
+        // 多条累计超 1 MiB：旧条被裁、最新条整条保留（维持既有丢弃逻辑，
+        // 不触发单条截头——3×400 KB 才破窗，最新 2 条 < 1 MiB）
+        let body = "a".repeat(400_000);
+        let mut entities = serde_json::Map::new();
+        let mut entries = Vec::new();
+        for i in 0..5 {
+            let turn_id = format!("t{i}");
+            entries.push(serde_json::json!({ "key": turn_id, "value": turn_id }));
+            entities.insert(
+                turn_id.clone(),
+                serde_json::json!({ "turnId": turn_id, "status": "completed",
+                                    "items": [ { "type": "agentMessage",
+                                        "id": format!("m{i}"), "text": body } ] }),
+            );
+        }
+        let change = serde_json::json!({
+            "type": "snapshot", "revision": 1,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true, "entitiesByKey": entities,
+                                 "islands": [{ "entries": entries }] } }
+            }
+        });
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &change).unwrap();
+        let p = m.project(caps());
+        assert_eq!(p.messages.len(), 2, "累计超窗只裁旧条：保留最新 2 条");
+        assert_eq!(p.messages[0].id, "m3");
+        assert_eq!(p.messages[1].id, "m4");
+        assert_eq!(p.messages[1].text.len(), 400_000, "最新条整条保留不截头");
+        assert!(!p.messages[1].text.contains("已截断"), "无单条截断标记");
+        assert!(p.truncated, "裁旧条必须置位 truncated");
     }
 
     #[test]
