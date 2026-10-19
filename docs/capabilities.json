@@ -1,6 +1,6 @@
 {
   "$comment": "Tuvis 多终端能力矩阵单一数据源。README「多终端能力矩阵（总表）」的结构化版本，两处随发版同步更新；tuvis-website 官网经 api.github.com 拉取本文件渲染兼容矩阵。",
-  "updated": "2026-10-16",
+  "updated": "2026-10-20",
   "legend": {
     "yes": "✅ 支持",
     "partial": "◐ 部分",
@@ -219,6 +219,21 @@
             "workbuddy": "no",
             "zcode": "no",
             "dsh": "no"
+          }
+        },
+        {
+          "name": "Codex APP 会话远程控制（Desktop IPC）",
+          "nameEn": "Codex APP remote control (Desktop IPC)",
+          "key": "codex_app_control",
+          "support": {
+            "claude": "no",
+            "codex": "experimental",
+            "opencode": "no",
+            "kimi": "no",
+            "workbuddy": "no",
+            "zcode": "no",
+            "dsh": "no",
+            "openclaw": "no"
           }
         }
       ]

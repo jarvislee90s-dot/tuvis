@@ -541,6 +541,10 @@ Kimi Code 支持 `KIMI_CODE_HOME` 环境变量重定向数据根（默认 `~/.ki
 | 手机 · 新建会话        | 🧪          | 🧪        | 🧪       | ❌       | 🧪        | ❌        | ❌           | ❌     |
 | Token 用量采集         | ✅          | ✅        | ✅       | ❌       | ✅        | ✅        | ✅           | ✅     |
 | 手机 · 子 Agent 观察台 | ✅          | ❌        | ❌       | ❌       | ❌        | ❌        | ❌           | ❌     |
+| 手机 · Codex APP 远程控制（Desktop IPC） | ❌ | 🧪 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+**Codex APP 远程控制（实验性）**：仅 Codex 一家、按精确 Desktop build 解锁（Windows 26.1013.4894.0：发送/状态/command 审批/Plan 阻塞问答；permissions 关闭；macOS 26.1013.40934：发送/状态）。未解锁能力如实拒绝，不伪造审批或空会话。
+
 
 **手机操控**：消息查看与文件预览覆盖 7 家（OpenClaw 为黑盒形态暂不支持远程查看）；**发消息（注入）与新建会话处于试验阶段**，目前支持 Claude Code / Codex CLI / OpenCode / Kimi Code 四家。OpenClaw / WorkBuddy 为黑盒形态（无外部写通道）、ZCode 预留无头通道、dsh 写通道另评——工具差异如实呈现，不假装统一。
 

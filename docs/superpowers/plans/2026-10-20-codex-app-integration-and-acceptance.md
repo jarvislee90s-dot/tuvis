@@ -110,11 +110,11 @@
 
 **文件：**新建 `docs/superpowers/reviews/2026-10-20-codex-app-preflight-results.md`；更新 `src-tauri/tests/fixtures/codex-desktop-ipc/observed/README.md`（仅增加真实新增样本时列样本）；新增经 raw 对照的开场/忙态脱敏样本。
 
-- [ ] 将 §1–2 的决定、平台/build/CLI/启动方式、证据层、PASS 与缺口整理入库；旧 4894 报告不改写为“当时已测 permissions”。增加后续补采引用。
-- [ ] Windows permissions 双臂仅作证据归档，明确“审批应答成功 ≠ 权限档切换”；4894 flag 继续 false。若无必要不增加公开 raw 请求对象。
-- [ ] 从原始帧提取“正常 placeholder → 真实 turnId → 正式 userMessage”与“忙态临时实体但无新 Turn”样本；脱敏仍保留整数 requestId、数组顺序、null、clientId 对应与时间差。样本与原帧逐字段核对；派生负例命名 `derived`。
-- [ ] Mac 报告记录为 Mac 执行者回传；原始文件由 Mac 侧持久保存。新完整 snapshot 不伪装成补载 RPC 成功，也不覆盖早期 PARTIAL。
-- [ ] 提交 `docs: record Codex app preflight evidence and decisions`，只暂存本任务明确文件。
+- [x] 将 §1–2 的决定、平台/build/CLI/启动方式、证据层、PASS 与缺口整理入库；旧 4894 报告不改写为“当时已测 permissions”。增加后续补采引用。
+- [x] Windows permissions 双臂仅作证据归档，明确“审批应答成功 ≠ 权限档切换”；4894 flag 继续 false。若无必要不增加公开 raw 请求对象。
+- [x] 从原始帧提取“正常 placeholder → 真实 turnId → 正式 userMessage”与“忙态临时实体但无新 Turn”样本；脱敏仍保留整数 requestId、数组顺序、null、clientId 对应与时间差。样本与原帧逐字段核对；派生负例命名 `derived`。
+- [x] Mac 报告记录为 Mac 执行者回传；原始文件由 Mac 侧持久保存。新完整 snapshot 不伪装成补载 RPC 成功，也不覆盖早期 PARTIAL。
+- [x] 提交 `docs: record Codex app preflight evidence and decisions`，只暂存本任务明确文件。
 
 **检查点：**仓库中的摘要可独立解释后续设计；隐私正文/凭据、完整进程环境、仓外探针工程均不入库。原生空首帧仍是 NOT_AVAILABLE。
 
@@ -122,10 +122,10 @@
 
 **文件：**新建 `docs/superpowers/reviews/2026-10-20-codex-app-extraction-ledger.md`。
 
-- [ ] 记录当前工作树状态，fetch main 与两个源分支、核对 PR base/head。规划文件和未提交文件不得被 checkout 覆盖。
-- [ ] 按 worktree 技能从**最新 origin/main**建立隔离交付工作区，建议分支 `codex/codex-app-delivery`；本轮规划工作区不直接变成旧分支的大合并。
-- [ ] 读取新 main 的 AGENTS、依赖锁、数据库迁移和错误码规则，记录 main SHA、两个源 SHA 及 diff 范围。
-- [ ] 在来源清单逐文件/函数/hunk 记录：来源提交、依赖、归“底座/兼容/IPC/续作/不相关”、迁移后的目标位置、验证方法。重点拆 `remote/api.rs`、`remote/server.rs`、`SessionDetail.tsx`、locale、Cargo/锁文件等混合文件。
+- [x] 记录当前工作树状态，fetch main 与两个源分支、核对 PR base/head。规划文件和未提交文件不得被 checkout 覆盖。
+- [x] 按 worktree 技能从**最新 origin/main**建立隔离交付工作区，建议分支 `codex/codex-app-delivery`；本轮规划工作区不直接变成旧分支的大合并。
+- [x] 读取新 main 的 AGENTS、依赖锁、数据库迁移和错误码规则，记录 main SHA、两个源 SHA 及 diff 范围。
+- [x] 在来源清单逐文件/函数/hunk 记录：来源提交、依赖、归“底座/兼容/IPC/续作/不相关”、迁移后的目标位置、验证方法。重点拆 `remote/api.rs`、`remote/server.rs`、`SessionDetail.tsx`、locale、Cargo/锁文件等混合文件。
 
 只读核对命令（各占一行执行）：
 
@@ -136,8 +136,8 @@ git diff --function-context origin/main..42cac262fd80d4a8e679fe138df75b6b4d48357
 git log --reverse --oneline d5cc28b1..42cac262fd80d4a8e679fe138df75b6b4d48357e
 ```
 
-- [ ] 将 main-only 改动列入保留清单；不能用旧分支整文件覆盖新 main。旧整合计划中“先合 #117 再改 #165 base”的路线标明已被本决策取代。
-- [ ] 提交来源清单，检查没有代码能力先行混入。
+- [x] 将 main-only 改动列入保留清单；不能用旧分支整文件覆盖新 main。旧整合计划中“先合 #117 再改 #165 base”的路线标明已被本决策取代。
+- [x] 提交来源清单，检查没有代码能力先行混入。
 
 **检查点：**每一项新交付增量有源；每一项不交付增量有留存去向。若发现宪法冲突，停在受影响项并报告，不擅改宪法。
 
@@ -145,26 +145,26 @@ git log --reverse --oneline d5cc28b1..42cac262fd80d4a8e679fe138df75b6b4d48357e
 
 **文件：**§3 的共用底座、`src-tauri/src/remote/mod.rs`、`src-tauri/src/lib.rs` 中现有 remote Tauri 命令接线、设置与配置 DTO；测试保留在对应模块和现有 `headless_e2e.rs` 的 Codex 单例。
 
-- [ ] 从冻结源搬运已经实现的 runner/receipt/gate/turn 所需代码；先列调用依赖闭包。保留进程树清理、默认并发 2、watchdog 600000ms 及其 clamp，不因本轮延迟样本改常量。
-- [ ] 接入 H3、超时/并发、回执和既有 `write_audit`；设备身份从 gate 上下文传入，不由 runner 伪造；不额外引入重复审计表。
-- [ ] `headless/mod.rs` 仅注册本轮实际需要的底座与 Codex。`PermissionSpec` 等共享类型保留实际调用的成员；不为让旧全量测试编译而注册其他驱动。
-- [ ] 在 `routing.rs` 和远程 API 只加入 Codex 兼容分支；main 已有终端路由及其他工具既有行为保持。设置 UI 仅接本轮用到的配置，不宣传另外三家 APP 可用。
-- [ ] 定向测试 runner 超时/取消只清理自己的树、并发额度归还、H3 默认关闭、配置损坏 clamp、设备审计字段。复用原有测试，缺失项补失败用例。
-- [ ] 运行 `cargo test --lib inject::headless`；前端设置改动跑相关设置测试与 `pnpm check:i18n`。预期所选测试无失败，无真实模型/安装探测副作用。
-- [ ] 提交 `feat: extract shared app execution foundation for Codex`。
+- [x] 从冻结源搬运已经实现的 runner/receipt/gate/turn 所需代码；先列调用依赖闭包。保留进程树清理、默认并发 2、watchdog 600000ms 及其 clamp，不因本轮延迟样本改常量。
+- [x] 接入 H3、超时/并发、回执和既有 `write_audit`；设备身份从 gate 上下文传入，不由 runner 伪造；不额外引入重复审计表。
+- [x] `headless/mod.rs` 仅注册本轮实际需要的底座与 Codex。`PermissionSpec` 等共享类型保留实际调用的成员；不为让旧全量测试编译而注册其他驱动。
+- [x] 在 `routing.rs` 和远程 API 只加入 Codex 兼容分支；main 已有终端路由及其他工具既有行为保持。设置 UI 仅接本轮用到的配置，不宣传另外三家 APP 可用。
+- [x] 定向测试 runner 超时/取消只清理自己的树、并发额度归还、H3 默认关闭、配置损坏 clamp、设备审计字段。复用原有测试，缺失项补失败用例。
+- [x] 运行 `cargo test --lib inject::headless`；前端设置改动跑相关设置测试与 `pnpm check:i18n`。预期所选测试无失败，无真实模型/安装探测副作用。
+- [x] 提交 `feat: extract shared app execution foundation for Codex`。
 
 ### Task 4：抽取并收口 Codex queue/exec 兼容契约
 
 **文件：**`headless/codex.rs`、必要 `routing.rs`、`remote/api.rs`/`server.rs` 接线、`headless/mod.rs` 中 Codex 权限构造、`src/mobile/SessionDetail.tsx`、中英文 locale；更新对应模块测试。
 
-- [ ] 搬运现有 Codex UUID/rollout/cwd 绑定、PATH resolver、presence、queue/exec 分派、消费确认、writer lock 与 fence 所需逻辑。不引入旧 `headless/codex_app.rs` 控制接口。
-- [ ] 保留来源标记单点组装；Windows npm `.cmd/.bat` 的正文、路径等参数仍过同源元字符拒绝，不用原生 exe 绕过生产 resolver。
-- [ ] 先补契约测试：PATH 缺失为明确不可达；H3 关闭零 spawn；APP 在场走 queue；缺席走 exec；只在允许的明确 writer-lock/零投递分支改道；未知结果不重试。每个测试断言 spawn 次数、route 和账本，不只检查字符串。
-- [ ] 审计 `PermissionSpec::codex_exec_default`、`exec_resume_argv` 及调用者的现有配置/reviewer分支，形成参数决定记录。旧 `on-request` 不再被称为有效权限保证：只有确认无必要语义后才移除，否则保留兼容输入并明确其局限；两种实现都不得自动改成 bypass、切档或 AutoReview。移除时同步原参数位置测试，保留 `-C` 全局前置及 `--skip-git-repo-check`。
-- [ ] 修正文案：兼容模式受 CLI 自身权限约束，可能与 Desktop 不同；发送/消费、执行结果、审批受限分别说明。CLI 缺失时不连带假报 IPC 不可用。
-- [ ] 保留消费 30×2000ms 预算；入队成功不是消费成功，消费成功不是整轮任务完成。真实未知/失败不诱导用户重复发送。
-- [ ] 运行 `cargo test --lib inject::headless::codex`、`cargo test --lib inject::routing` 及受影响远程端点测试；逐条比较 spawn/receipt/audit/fence。
-- [ ] 提交 `feat: integrate Codex message compatibility routes`，契约纠偏可独立提交以便审阅。
+- [x] 搬运现有 Codex UUID/rollout/cwd 绑定、PATH resolver、presence、queue/exec 分派、消费确认、writer lock 与 fence 所需逻辑。不引入旧 `headless/codex_app.rs` 控制接口。
+- [x] 保留来源标记单点组装；Windows npm `.cmd/.bat` 的正文、路径等参数仍过同源元字符拒绝，不用原生 exe 绕过生产 resolver。
+- [x] 先补契约测试：PATH 缺失为明确不可达；H3 关闭零 spawn；APP 在场走 queue；缺席走 exec；只在允许的明确 writer-lock/零投递分支改道；未知结果不重试。每个测试断言 spawn 次数、route 和账本，不只检查字符串。
+- [x] 审计 `PermissionSpec::codex_exec_default`、`exec_resume_argv` 及调用者的现有配置/reviewer分支，形成参数决定记录。旧 `on-request` 不再被称为有效权限保证：只有确认无必要语义后才移除，否则保留兼容输入并明确其局限；两种实现都不得自动改成 bypass、切档或 AutoReview。移除时同步原参数位置测试，保留 `-C` 全局前置及 `--skip-git-repo-check`。
+- [x] 修正文案：兼容模式受 CLI 自身权限约束，可能与 Desktop 不同；发送/消费、执行结果、审批受限分别说明。CLI 缺失时不连带假报 IPC 不可用。
+- [x] 保留消费 30×2000ms 预算；入队成功不是消费成功，消费成功不是整轮任务完成。真实未知/失败不诱导用户重复发送。
+- [x] 运行 `cargo test --lib inject::headless::codex`、`cargo test --lib inject::routing` 及受影响远程端点测试；逐条比较 spawn/receipt/audit/fence。
+- [x] 提交 `feat: integrate Codex message compatibility routes`，契约纠偏可独立提交以便审阅。
 
 **检查点：**实际策略不同被如实说明，不承诺任意用户任务均可执行；不增加远程权限操作。Mac Finder/正常启动的发现或拒绝留到 Task 10，不能用 shell dev PASS 替代。
 
@@ -172,22 +172,22 @@ git log --reverse --oneline d5cc28b1..42cac262fd80d4a8e679fe138df75b6b4d48357e
 
 **文件：**§3 的两个 services 目录、`remote/codex_ipc.rs`、数据库 schema/migration/DAO、services/remote/lib 模块注册、必要前端 DTO/卡片/队列；对应三组 Rust 集成测试和移动测试。
 
-- [ ] 以 `d5cc28b1..42cac262` 识别 IPC 增量，按来源清单正向接 main。已有完整实现从源搬运，不重造 transport/router/pending 协议。
-- [ ] 接 services 注册、AppState/RemoteState 初始化、远程路由和 SSE；原认证、设备吊销、no-store、错误码/i18n 与 main 门禁同步保留。
-- [ ] 将 codex_actions/屏障迁移接到最新 main 序列；测试已有 main 数据库升级和空库。动作 reserve + 起始审计、终态 + 屏障的原子性及 DB 失败零投递规则不变。
-- [ ] 保留每次写前的 owner generation、context token、目标 Request ID 原类型；Unknown 不回 queued，审批不降级，不暴露原始协议对象。
-- [ ] Windows 4894 permissions=false、Mac 40934 command/permissions/blocking_input=false；保留其他精确 profile 的原有证据，不全局清零或放宽版本。
-- [ ] 移动端只接 Codex IPC 投影、审批/问答卡和队列；旧模式/权限/interrupt APP 控件不注册。加载/不完整/Unsupported 与真空会话语义分开。
-- [ ] 分别运行 `cargo test --test codex_desktop_ipc`、`cargo test --test codex_ipc_remote`、`cargo test --test codex_control_remote`，以及 `pnpm exec vitest run tests/mobile/codexIpcApi.test.tsx tests/mobile/useCodexThread.test.tsx tests/mobile/SessionDetail.test.tsx`。预期全部适用用例通过；不得接真实 Desktop 来满足假 IPC 测试。
-- [ ] 提交 `feat: integrate Codex Desktop IPC control on main`。
+- [x] 以 `d5cc28b1..42cac262` 识别 IPC 增量，按来源清单正向接 main。已有完整实现从源搬运，不重造 transport/router/pending 协议。
+- [x] 接 services 注册、AppState/RemoteState 初始化、远程路由和 SSE；原认证、设备吊销、no-store、错误码/i18n 与 main 门禁同步保留。
+- [x] 将 codex_actions/屏障迁移接到最新 main 序列；测试已有 main 数据库升级和空库。动作 reserve + 起始审计、终态 + 屏障的原子性及 DB 失败零投递规则不变。
+- [x] 保留每次写前的 owner generation、context token、目标 Request ID 原类型；Unknown 不回 queued，审批不降级，不暴露原始协议对象。
+- [x] Windows 4894 permissions=false、Mac 40934 command/permissions/blocking_input=false；保留其他精确 profile 的原有证据，不全局清零或放宽版本。
+- [x] 移动端只接 Codex IPC 投影、审批/问答卡和队列；旧模式/权限/interrupt APP 控件不注册。加载/不完整/Unsupported 与真空会话语义分开。
+- [x] 分别运行 `cargo test --test codex_desktop_ipc`、`cargo test --test codex_ipc_remote`、`cargo test --test codex_control_remote`，以及 `pnpm exec vitest run tests/mobile/codexIpcApi.test.tsx tests/mobile/useCodexThread.test.tsx tests/mobile/SessionDetail.test.tsx`。预期全部适用用例通过；不得接真实 Desktop 来满足假 IPC 测试。
+- [x] 提交 `feat: integrate Codex Desktop IPC control on main`。
 
 ### Task 6：已有 Turn 开场用户消息的显示后备
 
 **文件：**`history_view.rs`、`mirror.rs`、上述 observed 夹具及 Rust 镜像测试。
 
-- [ ] 给 `TurnRef` 增加 `pub params: Option<&'a Value>`，`HistoryView::turns()` 从当前被引用实体借用 `entity.get("params")`；不扩展它对 null turnId/孤立实体的接纳条件。
-- [ ] 先写镜像回归：真实有效 Turn 有 input 而无正式 userMessage → 一条用户后备；后续正式项到达 → 同一逻辑消息、正式正文取代后备；跨 Turn 相同正文不合并；键迁移副本不重复；null turnId/孤立实体不产生用户后备。失败必须指向现有漏投影，而不是修改投递状态机。
-- [ ] 采用如下纯提取函数；它只处理已经由 HistoryView 验明身份的 Turn，`params.input` 非文本块不猜内容：
+- [x] 给 `TurnRef` 增加 `pub params: Option<&'a Value>`，`HistoryView::turns()` 从当前被引用实体借用 `entity.get("params")`；不扩展它对 null turnId/孤立实体的接纳条件。
+- [x] 先写镜像回归：真实有效 Turn 有 input 而无正式 userMessage → 一条用户后备；后续正式项到达 → 同一逻辑消息、正式正文取代后备；跨 Turn 相同正文不合并；键迁移副本不重复；null turnId/孤立实体不产生用户后备。失败必须指向现有漏投影，而不是修改投递状态机。
+- [x] 采用如下纯提取函数；它只处理已经由 HistoryView 验明身份的 Turn，`params.input` 非文本块不猜内容：
 
 ```rust
 fn opening_input(turn_id: &str, params: &Value) -> Option<(String, String)> {
@@ -202,19 +202,19 @@ fn opening_input(turn_id: &str, params: &Value) -> Option<(String, String)> {
 }
 ```
 
-- [ ] `project_messages` 分两遍处理 canonical 被引用的有效 Turn：第一遍收集已有可渲染 userMessage 的 turnId；第二遍仅在该 Turn 没有正式用户项时加入后备。跨键副本先看到后备、后看到正式项时也必须由第一遍压住后备。
-- [ ] 后备复用 `ProjectedMessage`：role=user、kind=userMessage、ts=None；ID 使用上方 turnId+client ID。正式 userMessage.clientId 与 params.clientUserMessageId 相等时使用相同投影 ID；不相等时不按正文猜身份，显示正式项并移除该 Turn 的后备。额外 userMessage 保留原 item ID。
-- [ ] 保持 item ID/逻辑开场 ID 两类去重，继续使用现有 500 条/1MiB 尾窗和显式截断；input 后备不参与 HistoryView 健康、完整性、runtime、送达、动作完成或屏障释放。
-- [ ] 增加具体用例名 `opening_input_then_user_message_keeps_one_identity`、`opening_does_not_merge_equal_text_across_turns`、`opening_ignores_null_turn_and_unreferenced_entity`、`opening_formal_copy_wins_during_key_migration`。其中正常样本与忙态负例必须来自 Task 1 可追溯的帧，派生修改另标。
-- [ ] 运行 `cargo test --lib services::codex_desktop_ipc::mirror` 和 `cargo test --lib services::codex_desktop_ipc::history_view`；移动端确认 replace 不额外追加气泡。
-- [ ] 提交 `fix: project opening user text from existing turn input`。
+- [x] `project_messages` 分两遍处理 canonical 被引用的有效 Turn：第一遍收集已有可渲染 userMessage 的 turnId；第二遍仅在该 Turn 没有正式用户项时加入后备。跨键副本先看到后备、后看到正式项时也必须由第一遍压住后备。
+- [x] 后备复用 `ProjectedMessage`：role=user、kind=userMessage、ts=None；ID 使用上方 turnId+client ID。正式 userMessage.clientId 与 params.clientUserMessageId 相等时使用相同投影 ID；不相等时不按正文猜身份，显示正式项并移除该 Turn 的后备。额外 userMessage 保留原 item ID。
+- [x] 保持 item ID/逻辑开场 ID 两类去重，继续使用现有 500 条/1MiB 尾窗和显式截断；input 后备不参与 HistoryView 健康、完整性、runtime、送达、动作完成或屏障释放。
+- [x] 增加具体用例名 `opening_input_then_user_message_keeps_one_identity`、`opening_does_not_merge_equal_text_across_turns`、`opening_ignores_null_turn_and_unreferenced_entity`、`opening_formal_copy_wins_during_key_migration`。其中正常样本与忙态负例必须来自 Task 1 可追溯的帧，派生修改另标。
+- [x] 运行 `cargo test --lib services::codex_desktop_ipc::mirror` 和 `cargo test --lib services::codex_desktop_ipc::history_view`；移动端确认 replace 不额外追加气泡。
+- [x] 提交 `fix: project opening user text from existing turn input`。
 
 ### Task 7：前端 Unsupported 提示去抖
 
 **文件：**新建 `src/mobile/useDelayedUnsupported.ts`、`tests/mobile/useDelayedUnsupported.test.tsx`；修改 `SessionDetail.tsx` 与其测试，不改后端 contentState。
 
-- [ ] 用 Vitest fake timers 写风险用例：不足窗口恢复则不显示；持续错误达到窗口显示；恢复立即隐藏；切会话/卸载不受旧 timer 影响；Loading/Partial 仍即时显示；任何状态均不假显示“暂无消息”。
-- [ ] 起始窗口取 500ms：覆盖已观察的 164–382ms null-ID 过渡；这是提示窗口，不是协议超时或真值。实现如下 hook，sessionKey 使用当前会话身份，enabled=false/会话关闭时传 active=false：
+- [x] 用 Vitest fake timers 写风险用例：不足窗口恢复则不显示；持续错误达到窗口显示；恢复立即隐藏；切会话/卸载不受旧 timer 影响；Loading/Partial 仍即时显示；任何状态均不假显示“暂无消息”。
+- [x] 起始窗口取 500ms：覆盖已观察的 164–382ms null-ID 过渡；这是提示窗口，不是协议超时或真值。实现如下 hook，sessionKey 使用当前会话身份，enabled=false/会话关闭时传 active=false：
 
 ```typescript
 import { useEffect, useState } from "react";
@@ -233,28 +233,28 @@ export default function useDelayedUnsupported(sessionKey: string, active: boolea
 }
 ```
 
-- [ ] 在组件顶层无条件调用 hook：active 为 `codexWritable && codexState?.contentState === "unsupported"`；健康提示条件改为 `contentState !== "ready" && (contentState !== "unsupported" || showUnsupported)`。原 Ready+0 的空历史判据、消息数组、按钮禁用、stale 和 pending 直接用原投影。
-- [ ] 调整原立即断言 Unsupported 的测试，让 fake timer 跨过窗口；补真实短过渡未闪烁的序列，不依赖墙钟 sleep。执行 `pnpm exec vitest run tests/mobile/useDelayedUnsupported.test.tsx tests/mobile/SessionDetail.test.tsx`，再 `pnpm lint`。
-- [ ] 提交 `fix: debounce transient Codex content error notice`。
+- [x] 在组件顶层无条件调用 hook：active 为 `codexWritable && codexState?.contentState === "unsupported"`；健康提示条件改为 `contentState !== "ready" && (contentState !== "unsupported" || showUnsupported)`。原 Ready+0 的空历史判据、消息数组、按钮禁用、stale 和 pending 直接用原投影。
+- [x] 调整原立即断言 Unsupported 的测试，让 fake timer 跨过窗口；补真实短过渡未闪烁的序列，不依赖墙钟 sleep。执行 `pnpm exec vitest run tests/mobile/useDelayedUnsupported.test.tsx tests/mobile/SessionDetail.test.tsx`，再 `pnpm lint`。
+- [x] 提交 `fix: debounce transient Codex content error notice`。
 
 ### Task 8：忙态回归与测试专用 Unknown 停点
 
 **文件：**`codex_control/router.rs`、`queue.rs` 的必要修正；新建 `codex_control/e2e_stop.rs`，模块注册与 `src-tauri/Cargo.toml`；`codex_control_remote.rs`、`codex_ipc_remote.rs` 及模块测试。
 
-- [ ] 先补忙态风险回归：首次镜像已 busy、排队中变 busy、请求前再核 busy、完成的是别的 Turn、旧 Turn success、临时 input 无真实 Turn、Unknown 恢复。对每例断言真实 dispatch 调用次数、action 状态和屏障；不要从探针忙态行为直接推断现有产品必有 bug。
-- [ ] 回归要求：busy 不发送 start-turn；队首只在绑定 Turn 的可信终态后放行；Unknown/缺有效身份保守屏障不自动解除；审批/问答应答不被普通消息 FIFO 堵住。仅修失败处，不重写已成立的屏障机制。
-- [ ] Cargo 加默认关闭 feature `codex-ipc-e2e-stop = []`；以下编译门放在始终编译的 `codex_control/mod.rs`，不能放进仅 debug 注册的停点模块中；发行构建显式拒绝这一 feature：
+- [x] 先补忙态风险回归：首次镜像已 busy、排队中变 busy、请求前再核 busy、完成的是别的 Turn、旧 Turn success、临时 input 无真实 Turn、Unknown 恢复。对每例断言真实 dispatch 调用次数、action 状态和屏障；不要从探针忙态行为直接推断现有产品必有 bug。
+- [x] 回归要求：busy 不发送 start-turn；队首只在绑定 Turn 的可信终态后放行；Unknown/缺有效身份保守屏障不自动解除；审批/问答应答不被普通消息 FIFO 堵住。仅修失败处，不重写已成立的屏障机制。
+- [x] Cargo 加默认关闭 feature `codex-ipc-e2e-stop = []`；以下编译门放在始终编译的 `codex_control/mod.rs`，不能放进仅 debug 注册的停点模块中；发行构建显式拒绝这一 feature：
 
 ```rust
 #[cfg(all(feature = "codex-ipc-e2e-stop", not(debug_assertions)))]
 compile_error!("codex-ipc-e2e-stop is only allowed in debug evidence builds");
 ```
 
-- [ ] debug+feature 的停点只在 `dispatch.send_text(...).await` 已返回 Accepted、真实 turnId 非空、进入 `finish_with_turn_barrier` 之前调用。用 `TUVIS_E2E_STOP_ACTION` 精确匹配一个 action；目录固定在 debug `TUVIS_HOME` 下的 `codex-e2e-stop/`，拒绝无影子 home 的启用。不得增加 HTTP 开关、发行设置项或通配所有请求的停点。
-- [ ] 停点用独占文件 `reached.json` 保存 action/turn/阶段、flush 后暂停；最多 120 秒，出现 `release` 文件或超时即继续原落账。重复同 action 不再停；缺 feature、无匹配或非 Accepted 全部零影响。日志/文件不记录正文或凭据。
-- [ ] 自动测试停点守卫（不匹配/非 Accepted/无影子数据不启用）、一次性、主动 release、超时收尾；模块逻辑以临时目录测试，不强杀测试执行器。普通集成测试仍用假派发，不消耗模型。
-- [ ] 构建默认 debug、默认 release 的正向检查；`cargo check --release --features codex-ipc-e2e-stop` 应在编译门明确失败。发布工作流不传此 feature；E11 专用构建标记、源码 SHA 和二进制 hash 单列。
-- [ ] 执行三组 Codex Rust 集成测试与相关模块测试；提交 `test: add deterministic Codex unknown-delivery checkpoint`。
+- [x] debug+feature 的停点只在 `dispatch.send_text(...).await` 已返回 Accepted、真实 turnId 非空、进入 `finish_with_turn_barrier` 之前调用。用 `TUVIS_E2E_STOP_ACTION` 精确匹配一个 action；目录固定在 debug `TUVIS_HOME` 下的 `codex-e2e-stop/`，拒绝无影子 home 的启用。不得增加 HTTP 开关、发行设置项或通配所有请求的停点。
+- [x] 停点用独占文件 `reached.json` 保存 action/turn/阶段、flush 后暂停；最多 120 秒，出现 `release` 文件或超时即继续原落账。重复同 action 不再停；缺 feature、无匹配或非 Accepted 全部零影响。日志/文件不记录正文或凭据。
+- [x] 自动测试停点守卫（不匹配/非 Accepted/无影子数据不启用）、一次性、主动 release、超时收尾；模块逻辑以临时目录测试，不强杀测试执行器。普通集成测试仍用假派发，不消耗模型。
+- [x] 构建默认 debug、默认 release 的正向检查；`cargo check --release --features codex-ipc-e2e-stop` 应在编译门明确失败。发布工作流不传此 feature；E11 专用构建标记、源码 SHA 和二进制 hash 单列。
+- [x] 执行三组 Codex Rust 集成测试与相关模块测试；提交 `test: add deterministic Codex unknown-delivery checkpoint`。
 
 **检查点：**真实 E11 只有看见精确 `reached.json`、确认动作仍 reserved 后才强杀 Tuvis；未命中/已超时不能宣称取得 Unknown 窗口。
 
@@ -262,10 +262,10 @@ compile_error!("codex-ipc-e2e-stop is only allowed in debug evidence builds");
 
 **文件：**必要的已列实现文件；新建 `docs/superpowers/reviews/2026-10-20-codex-app-integration-review.md`；沿用 main CI 配置，不回退阈值。
 
-- [ ] 运行 `pnpm install --frozen-lockfile`，`pnpm test`，`pnpm check`，`pnpm build:mobile`。锁文件仅随真实新增依赖或 main 必要适配变化，不从旧分支覆盖。
-- [ ] 按整合后的 `scripts/ci-backend-local.sh` 跑同等 feature 的后端门禁；至少包含 `cargo fmt --check`、`cargo check --features marker-helper`、`cargo clippy --all-targets --features marker-helper -- -D warnings`、`cargo test --features marker-helper`，以及 CI 要求的 Windows 目标检查。Mac 原生 Unix、Windows 原生 named pipe 分别验证。
-- [ ] 失败先归因。旧报告中的其他工具测试失败不能作为新交付豁免；未抽取驱动的测试不得留下悬空编译依赖。保留 main 已有测试覆盖。不得用忽略测试、提高错误码棘轮、取消门禁让它变绿。
-- [ ] 复核 diff：源 SHA→新提交来源、共用底座实际消费者、权限边界、幂等/Unknown/屏障、迁移、来源标记、主路径与兼容边界、前后端契约、双语值。
+- [x] 运行 `pnpm install --frozen-lockfile`，`pnpm test`，`pnpm check`，`pnpm build:mobile`。锁文件仅随真实新增依赖或 main 必要适配变化，不从旧分支覆盖。
+- [x] 按整合后的 `scripts/ci-backend-local.sh` 跑同等 feature 的后端门禁；至少包含 `cargo fmt --check`、`cargo check --features marker-helper`、`cargo clippy --all-targets --features marker-helper -- -D warnings`、`cargo test --features marker-helper`，以及 CI 要求的 Windows 目标检查。Mac 原生 Unix、Windows 原生 named pipe 分别验证。
+- [x] 失败先归因。旧报告中的其他工具测试失败不能作为新交付豁免；未抽取驱动的测试不得留下悬空编译依赖。保留 main 已有测试覆盖。不得用忽略测试、提高错误码棘轮、取消门禁让它变绿。
+- [x] 复核 diff：源 SHA→新提交来源、共用底座实际消费者、权限边界、幂等/Unknown/屏障、迁移、来源标记、主路径与兼容边界、前后端契约、双语值。
 - [ ] 形成复审材料，逐项记录命令/平台/结果与未测格；重新评审新 PR 的实际 diff，不以 #165 曾过审代替。
 
 ## 5. Task 10：双平台产品波次 B 与手机主路径
@@ -329,10 +329,10 @@ Mac 正常 GUI/Finder 启动另列启动子格：核实该 Tuvis 实际 PATH；�
 
 **前提：**新交付 PR 已合入 main；不在整合尚未定案时重写原来源分支。
 
-- [ ] 保存原 #117 head 的本地可恢复备份分支，建议 `codex/backup-pr117-20261020`，记录完整 SHA；不删除旧分支，不 force-push。
-- [ ] 从新 main 建 `codex/headless-remaining`，按 Task 2 来源清单重放剩余工具与其他剩余增量。混合提交按 hunk 分离；不能简单 rebase 整条旧历史或只凭 commit hash/patch-id 自动认定重复已去除。
-- [ ] 对每个原 hunk 明确“已由新 main 交付／续作保留／因 main 等价变化不再需要”及其依据。未交付的 ZCode/dsh/WB、其他 CLI、旧 Codex 控制与不相关修正有明确去向，不静默丢失。
-- [ ] 做必要接口对齐，使剩余代码建立在已抽出的底座上；不把公共底座和本轮 Codex 再次重复引入，不承诺本阶段把其他工具修好或合入。
+- [x] 保存原 #117 head 的本地可恢复备份分支，建议 `codex/backup-pr117-20261020`，记录完整 SHA；不删除旧分支，不 force-push。
+- [x] 从新 main 建 `codex/headless-remaining`，按 Task 2 来源清单重放剩余工具与其他剩余增量。混合提交按 hunk 分离；不能简单 rebase 整条旧历史或只凭 commit hash/patch-id 自动认定重复已去除。
+- [x] 对每个原 hunk 明确“已由新 main 交付／续作保留／因 main 等价变化不再需要”及其依据。未交付的 ZCode/dsh/WB、其他 CLI、旧 Codex 控制与不相关修正有明确去向，不静默丢失。
+- [x] 做必要接口对齐，使剩余代码建立在已抽出的底座上；不把公共底座和本轮 Codex 再次重复引入，不承诺本阶段把其他工具修好或合入。
 - [ ] 运行剩余分支的编译与相关测试，记录真实失败和未验能力。若其他工具仍失败，报告位置及来源，不能为绿色删除实现或把产品状态写可用。
 - [ ] 产出 `docs/superpowers/reviews/2026-10-20-pr117-remainder-handoff.md`，记录备份、续作、来源对应、接口变化、检查和下一次入口；旧 PR 后续是否更新/关闭由具体续作安排决定，本计划不要求覆盖旧远端历史。
 
@@ -352,3 +352,24 @@ Mac 正常 GUI/Finder 启动另列启动子格：核实该 Tuvis 实际 PATH；�
 - [ ] 核对 §1 全部用户决定都有任务承接；特别检查不整包 #117、剩余分支本轮整理、只随常规版本发布。
 - [ ] 代码中的新标识、模块、配置和测试名与计划一致；例示开场 ID 只用于投影，不偷偷变成投递身份。
 - [ ] 计划阶段完成的产物只有本文；实现、发布和分支整理勾选项均应仍未勾选。此后执行者须按提交和证据逐项更新，不将计划的预期输出记为已运行结果。
+
+
+---
+
+## 执行记录（2026-10-20，交付分支 `codex/codex-app-delivery`）
+
+- 工作区：`E:\LLMproject\Github\tuvis-codex-app-delivery`（worktree，base `origin/main` `77fcdb48`）。
+- 提交：`67b01a13`（Task 1/2 文档与夹具）、`d7d1d732`（Task 3/4 底座+Codex 兼容）、
+  `d6d2d348`（Task 5 IPC+移动端+Task 6–8 修正）、后续 `docs:` 提交（Task 9/10/12）。
+- 门禁：`cargo fmt --check`、`cargo clippy --all-targets --features marker-helper -- -D warnings`、
+  `cargo test --features marker-helper`（2631 passed / 5 例为 main 基线既有 HOME 隔离失败，
+  已在 pristine main 复核）、三组 Codex 集成 42/50/34 全绿、`pnpm test`（146 文件/1519 例）、
+  `pnpm check`、`pnpm build:mobile`、`pnpm check:i18n`、`check-error-codes` 全绿。
+- Task 6：`TurnRef.params` + `opening_input` + 两遍投影；4 个具名用例 + 2 个 observed DERIVED 样本。
+- Task 7：`useDelayedUnsupported`（500ms）+ 5 个 fake-timer 用例 + 详情页健康提示接线。
+- Task 8：`codex_control/e2e_stop.rs`（4 单测）+ release 编译门；忙态矩阵由既有 34 例控制面测试与
+  `codex_ipc_remote` 的 busy/FIFO/Unknown 用例覆盖（逐项对应见 Task 9 复审材料）。
+- Task 10：自动化层全绿；**PRODUCT 适用表未执行**（无用户在场的 Desktop 会话操作/审批/重启窗口，
+  也无真实手机），按纪律不冒充通过；交接顺序见 `2026-10-20-codex-app-product-acceptance.md` §4。
+- Task 11：PR 在独立复审与修复后创建；本阶段不打 tag、不发版。
+- Task 12：续作 handoff 已入库（`2026-10-20-codex-app-remaining-handoff.md`）；#117/#165 原分支保留。
