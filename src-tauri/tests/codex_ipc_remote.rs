@@ -4258,3 +4258,274 @@ async fn budget_exhaustion_does_not_drop_later_keys() {
     .await
     .expect("tB 必须被实际尝试并恢复 fresh");
 }
+
+// ============================================================
+// 调度解耦回归（PR #165 审查 Important）：单 thread 的兜底（compat）回合是分钟级
+// headless 执行，调度循环只触发不执行——一个 thread 的兜底在飞，其他 thread 的
+// settle/接力/对账照常推进；同 thread 的重复触发在 permit 的 Thread guard
+//（flush_thread try-lock）上排队，不并发第二个兜底。
+// ============================================================
+
+/// 假派发器（FakeDispatch 模式）：thread_busy 恒 false、A 路写恒 NotSent——
+/// 「派发 → NotSent → 兜底资格」确定成立，不依赖 adapter/连接状态。
+#[derive(Default)]
+struct DeadIpcDispatch;
+
+impl multi_agents_manager_lib::services::codex_control::DesktopDispatch for DeadIpcDispatch {
+    fn thread_busy(&self, _key: &ThreadKey) -> bool {
+        false
+    }
+    fn send_text(
+        &self,
+        _key: &ThreadKey,
+        _action_id: &str,
+        _composed: &str,
+        _client_message_id: &str,
+    ) -> multi_agents_manager_lib::services::codex_control::BoxDispatchFut {
+        Box::pin(async move {
+            multi_agents_manager_lib::services::codex_control::DispatchOutcome {
+                delivery: Delivery::NotSent,
+                envelope_id: Some("env-dead".into()),
+                turn_id: None,
+                reason_code: Some("ipc_disconnected".into()),
+                revision: None,
+            }
+        })
+    }
+    fn respond(
+        &self,
+        _key: &ThreadKey,
+        _request_key: &str,
+        _context_token: &str,
+        _action: &multi_agents_manager_lib::services::codex_control::PendingAction,
+    ) -> multi_agents_manager_lib::services::codex_control::BoxDispatchFut {
+        Box::pin(async move {
+            multi_agents_manager_lib::services::codex_control::DispatchOutcome {
+                delivery: Delivery::NotSent,
+                envelope_id: Some("env-dead".into()),
+                turn_id: None,
+                reason_code: Some("ipc_disconnected".into()),
+                revision: None,
+            }
+        })
+    }
+}
+
+/// 死 IPC fixture：A 路派发经假派发器恒 NotSent（兜底资格成立）；hub capable=true
+/// 装配真实调度循环。兜底的实际执行时长由 `set_compat_min_duration_ms` 测试缝完全
+/// 控制（IsolatedPath 令 CLI 发现秒拒，绝不 spawn 真 codex）。
+fn fixture_dead_ipc(sessions: Vec<Session>) -> Fixture {
+    let (io, peer) = ScriptedPeer::new();
+    drop(peer);
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    fixture_with(
+        sessions,
+        move |store| {
+            Arc::new(CodexControlHub::with_parts(
+                store,
+                adapter,
+                Arc::new(DeadIpcDispatch),
+                true,
+            ))
+        },
+        None,
+    )
+}
+
+/// 死 IPC 测试的启动序：start 后立即 begin_shutdown——ensure 秒败（不建镜像、
+/// 不等 3s 握手超时），调度只走假派发器的 NotSent → 兜底交接链。
+fn start_dead_ipc(f: &Fixture) {
+    f.state.codex_control.start(f.state.clone());
+    f.state.codex_control.adapter.begin_shutdown();
+}
+
+/// 直读动作行 route 列（交接态观测：reserved + headless_compat = 兜底已交接在飞）。
+fn route_of_conn(f: &Fixture, action_id: &str) -> String {
+    let conn = f.conn.lock().unwrap();
+    conn.query_row(
+        "SELECT route FROM codex_actions WHERE action_id = ?1",
+        [action_id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// 直接向 hub 账本登记一条 queued 普通消息（不经 HTTP；调度循环对账接力的输入）。
+fn register_queued(f: &Fixture, action_id: &str, thread_id: &str, text: &str) {
+    let ctx = ActionContext {
+        action_id: action_id.into(),
+        device_id: "dev-1".into(),
+        device_name: "iPhone".into(),
+        kind: ActionKind::Send,
+        key: ThreadKey {
+            host_id: "local".into(),
+            thread_id: thread_id.into(),
+        },
+    };
+    let hash = payload_hash(
+        ActionKind::Send,
+        &ctx.key,
+        None,
+        None,
+        &ActionPayload::Text(text.into()),
+    );
+    f.hub_store()
+        .register(&ctx, ActionKind::Send, None, None, &hash, Some(text))
+        .unwrap();
+}
+
+/// 轮询到动作达到 reserved + headless_compat（兜底交接完成、兜底执行在飞）。
+async fn wait_handoff(f: &Fixture, action_id: &str, budget: Duration) {
+    tokio::time::timeout(budget, async {
+        loop {
+            if let Ok(Some(v)) = f.hub_store().get_for_device(action_id, "dev-1") {
+                if v.state == ActionState::Reserved
+                    && route_of_conn(f, action_id) == "headless_compat"
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let state = f
+            .hub_store()
+            .get_for_device(action_id, "dev-1")
+            .ok()
+            .flatten()
+            .map(|v| format!("{:?}", v.state))
+            .unwrap_or_else(|| "no-row".into());
+        panic!(
+            "{action_id} 兜底交接超时（state={state} route={}）",
+            route_of_conn(f, action_id)
+        );
+    });
+}
+
+/// 回归 1（跨 thread 不阻塞）：T1 的慢兜底在飞期间，T2 的新入队消息仍能在预算内
+/// 走完 settle → A 路 NotSent → 兜底交接。缺陷态（调度循环 await 兜底）下 T2 的
+/// 交接必须等 T1 兜底结束（缝 5s ≫ 预算 2s），本用例必然超时。
+#[tokio::test]
+async fn slow_compat_fallback_does_not_block_other_thread_scheduling() {
+    let _path = IsolatedPath::lock_empty();
+    let t1 = THREAD;
+    let t2 = "0f1e2d3c-2222-4222-8333-444455556666";
+    let f = fixture_dead_ipc(vec![codex_app_session(t1), codex_app_session(t2)]);
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.headless_enabled', 'true')",
+            [],
+        )
+        .unwrap();
+    });
+    f.state.codex_control.set_reconcile_period_ms(100);
+    // 测试缝：兜底回合最短 5s（模拟分钟级兜底；T2 推进预算 2s ≪ 5s）
+    f.state
+        .codex_control
+        .set_compat_min_duration_ms(std::time::Duration::from_secs(5).as_millis() as u64);
+    start_dead_ipc(&f);
+
+    // T1：入队 → 派发 NotSent → 交接 → detached 兜底入睡
+    register_queued(&f, "act-blk-1", t1, "T1 慢兜底");
+    wait_handoff(&f, "act-blk-1", Duration::from_secs(5)).await;
+
+    // T1 兜底入睡期间：T2 入队 → settle/接力/对账必须照常推进到兜底交接
+    register_queued(&f, "act-blk-2", t2, "T2 不被阻塞");
+    wait_handoff(&f, "act-blk-2", Duration::from_secs(2)).await;
+    assert_eq!(
+        f.hub_store()
+            .get_for_device("act-blk-1", "dev-1")
+            .unwrap()
+            .unwrap()
+            .state,
+        ActionState::Reserved,
+        "T1 兜底仍在飞（慢兜底未结束）——T2 的推进发生在其执行期间"
+    );
+
+    // detached 兜底最终自行落账（空 PATH CLI 缺失 → NotSent → rejected），不依赖调度循环
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(Some(v)) = f.hub_store().get_for_device("act-blk-1", "dev-1") {
+                if v.state == ActionState::Rejected {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("T1 detached 兜底落账");
+    f.state.codex_control.stop();
+}
+
+/// 回归 2（同 thread 串行化）：T1 的兜底在飞期间，同 thread 的重复触发（每周期
+/// 对账 settle）在 permit 的 Thread guard 上排队——第二条消息留在 queued，绝不
+/// 并发第二个兜底；第一条落账后 notify_settled 接力才放行第二条。
+#[tokio::test]
+async fn same_thread_retrigger_queues_behind_in_flight_compat() {
+    let _path = IsolatedPath::lock_empty();
+    let f = fixture_dead_ipc(vec![codex_app_session(THREAD)]);
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.headless_enabled', 'true')",
+            [],
+        )
+        .unwrap();
+    });
+    f.state.codex_control.set_reconcile_period_ms(100);
+    // 测试缝：兜底回合最短 3s——在飞窗口 1.5s 内反复触发也只此一个兜底
+    f.state
+        .codex_control
+        .set_compat_min_duration_ms(std::time::Duration::from_secs(3).as_millis() as u64);
+    start_dead_ipc(&f);
+
+    // 同 thread 两条 FIFO：队首 act-ser-1 交接兜底入睡，act-ser-2 留队
+    register_queued(&f, "act-ser-1", THREAD, "串行第一条");
+    register_queued(&f, "act-ser-2", THREAD, "串行第二条");
+    wait_handoff(&f, "act-ser-1", Duration::from_secs(5)).await;
+
+    // 在飞窗口：周期对账反复 settle 本 thread（≈10 次），第二条必须留在 queued
+    //（flush_thread try-lock 让路——permit guard 在兜底任务手里），绝不二次派发
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            f.hub_store()
+                .get_for_device("act-ser-2", "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Queued,
+            "兜底在飞期间同 thread 不得并发第二个兜底"
+        );
+        assert_eq!(
+            f.hub_store()
+                .get_for_device("act-ser-1", "dev-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Reserved,
+            "窗口内第一条兜底持续在飞"
+        );
+    }
+
+    // 第一条落账（NotSent → rejected）→ 任务尾部 notify_settled → 第二条才接力交接
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Ok(Some(v)) = f.hub_store().get_for_device("act-ser-1", "dev-1") {
+                if v.state == ActionState::Rejected {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("第一条兜底落账");
+    wait_handoff(&f, "act-ser-2", Duration::from_secs(5)).await;
+    f.state.codex_control.stop();
+}

@@ -145,6 +145,9 @@ pub struct CodexControlHub {
     /// 启动恢复：枚举 queued/屏障在册的 thread → ensure 重新 following → 事件驱动
     /// 调度，不打开详情、不手工 flush 也能恢复发送）
     reconcile_period_ms: AtomicU64,
+    /// 测试缝：兜底回合最短执行时长（毫秒；生产恒 0 = 不延迟）——回归测试注入
+    /// 「分钟级兜底」，验证调度循环与单 thread 兜底执行解耦（PR #165 审查 Important）
+    compat_min_duration_ms: AtomicU64,
 }
 
 /// 周期对账默认间隔（R7.2：有界定时器；空待发集合时只有一条 EXISTS 级查询）。
@@ -241,6 +244,7 @@ impl CodexControlHub {
             running: AtomicBool::new(false),
             sched: Mutex::new(None),
             reconcile_period_ms: AtomicU64::new(RECONCILE_PERIOD_MS),
+            compat_min_duration_ms: AtomicU64::new(0),
         }
     }
 
@@ -312,6 +316,20 @@ impl CodexControlHub {
             self.reconcile_period_ms
                 .load(std::sync::atomic::Ordering::SeqCst),
         )
+    }
+
+    /// 测试缝：兜底回合最短执行时长（毫秒；生产恒 0）。回归测试用它模拟分钟级
+    /// headless 兜底，验证「一个 thread 的兜底在飞，其他 thread 的调度照常推进」
+    /// 与「同 thread 重复触发不并发第二个兜底」。
+    #[doc(hidden)]
+    pub fn set_compat_min_duration_ms(&self, ms: u64) {
+        self.compat_min_duration_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn compat_min_duration_ms(&self) -> u64 {
+        self.compat_min_duration_ms
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 生产生命周期：装配调度循环（首个 tick 即启动恢复 R7.1：枚举 queued/屏障在册
@@ -461,7 +479,7 @@ async fn settle_thread(hub: &Arc<CodexControlHub>, st: &Arc<RemoteState>, key: &
     }
     // ③ 接力下一条（try-lock 让路：兜底 permit 在外时本函数直接 no-op）
     if let Some(outcome) = hub.router.flush_thread(key).await {
-        consume_fallback(st, outcome, &key.thread_id).await;
+        consume_fallback(st, outcome, &key.thread_id);
     }
 }
 
@@ -469,11 +487,17 @@ async fn settle_thread(hub: &Arc<CodexControlHub>, st: &Arc<RemoteState>, key: &
 /// 同一判据以回执封套）：兼容分支**唯一**受 H3 门——开关关闭 → permit 以 NotSent
 /// 落账（零投递，同事务清 fence）并记降级审计（session_id 列以 thread 标识如实占位，
 /// 调度路径无 HTTP 会话号）；开启 → detached bridge 执行到落账。
-pub(crate) async fn consume_fallback(
-    st: &Arc<RemoteState>,
-    outcome: RouterOutcome,
-    audit_session: &str,
-) -> Option<serde_json::Value> {
+///
+/// **detached（PR #165 审查 Important，调度解耦）**：兜底回合是分钟级 headless 执行，
+/// 本函数 spawn 后**不等待**——调度循环只触发不执行，一个 thread 的兜底不再阻塞
+/// 其他 thread 的投影接力 / Turn 屏障释放 / 周期对账 / mark_stale。串行化仍由 permit
+/// 自身的 Thread guard 保证（guard 在 `flush_thread` 取得、随 permit 移入任务）：
+/// 同 thread 的重复触发在 `flush_thread` 的 try-lock 处让路（在 permit 上排队而非
+/// 并发第二个兜底），不同 thread 的锁各自独立。`notify_settled` 移入任务尾部——
+/// 完成与如实拒绝封套都通知，接力不因解耦丢失；panic 路径不通知（与既有语义一致，
+/// 接力由周期对账兜底），permit 随 unwind Drop 守卫落账 unknown 并记日志。进程退出
+/// 时在飞任务随 runtime 丢弃（行为与现状对齐：Drop 守卫记 unknown，无 join 句柄）。
+pub(crate) fn consume_fallback(st: &Arc<RemoteState>, outcome: RouterOutcome, audit_session: &str) {
     let (permit, reason_code) = match outcome {
         RouterOutcome::UseFallback {
             permit,
@@ -481,7 +505,7 @@ pub(crate) async fn consume_fallback(
         } => (permit, reason_code),
         other => {
             log::debug!("codex_ipc: 非兜底结果不经 bridge（{other:?}）");
-            return None;
+            return;
         }
     };
     if !st.store.with(super::headless_enabled_conn) {
@@ -503,23 +527,17 @@ pub(crate) async fn consume_fallback(
             None,
             "refused:headless_disabled",
         );
-        return None;
+        return;
     }
     let _ = reason_code;
-    let st2 = st.clone();
+    let st_task = st.clone();
+    let hub = st.codex_control.clone();
     let key = permit.context().key.clone();
-    let task = tokio::spawn(async move { run_compat(st2, permit).await });
-    match task.await {
-        Ok(envelope) => {
-            st.codex_control.notify_settled(&key);
-            Some(envelope)
-        }
-        Err(e) => {
-            // 任务 panic：permit 已随任务 Drop → 账本记 unknown（Drop 守卫），不自动重试
-            log::error!("codex_ipc: 兼容兜底任务异常（结果未知）: {e}");
-            None
-        }
-    }
+    tokio::spawn(async move {
+        let _envelope = run_compat(st_task, permit).await;
+        // 任务尾部通知接力（完成/如实拒绝都到；panic 不到——周期对账兜底）
+        hub.notify_settled(&key);
+    });
 }
 
 // ============================================================
@@ -948,6 +966,12 @@ fn find_session_by_thread(
 /// `notify_settled` 由调用方接力下一条。返回旧 headless 封套（HTTP 路径附 actionId
 /// 回执；调度路径丢弃）。
 pub(crate) async fn run_compat(st: Arc<RemoteState>, permit: FallbackPermit) -> serde_json::Value {
+    // 测试缝（生产恒 0）：模拟分钟级兜底回合——回归测试验证调度循环不被单个
+    // thread 的兜底执行阻塞（调度解耦，PR #165 审查 Important）
+    let min_ms = st.codex_control.compat_min_duration_ms();
+    if min_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(min_ms)).await;
+    }
     let ctx = permit.context().clone();
     let raw = permit.raw_text().to_string();
     let action_id = permit.action_id().to_string();
