@@ -395,6 +395,46 @@ describe("codexIpcApi：subscribeCodexThread（SSE 订阅）", () => {
     stop();
   });
 
+  it("残缺帧跳过：合法 JSON 但缺 contentState 的帧不进 onState（与 GET 同形状守卫），后续好帧照常透传", () => {
+    installFetch();
+    const onState = vi.fn();
+    const onUnavailable = vi.fn();
+    const stop = subscribeCodexThread("s1", onState, onUnavailable);
+    const es = MockEventSource.latest();
+    // 合法 JSON 但残缺（缺 contentState——2026-10-19 复审 Minor：SSE 面同受形状
+    // 守卫覆盖，残缺 DTO 不直入 onState 渲染假界面）
+    es.emit(
+      "snapshot",
+      JSON.stringify({ availability: "controllable", messages: [], pending: [] })
+    );
+    // contentState 枚举外取值同样按残缺跳过
+    es.emit("state", JSON.stringify({ ...projection(), contentState: "bogus" }));
+    // 非 JSON 帧（代理注入页）照旧跳过
+    es.emit("state", "<html>proxy page</html>");
+    expect(onState).not.toHaveBeenCalled();
+    // 好帧照常透传，流未降级（坏帧跳过语义不变）
+    es.emit("state", projection({ revision: 9 }));
+    expect(onState).toHaveBeenCalledTimes(1);
+    expect(onState.mock.calls[0][0].revision).toBe(9);
+    expect(onUnavailable).not.toHaveBeenCalled();
+    stop();
+  });
+
+  it(`残缺帧不清零失败计数：${CODEX_SSE_DEGRADE_AFTER - 1} 次失败后投坏帧再失败一次即达降级阈值`, async () => {
+    installFetch();
+    const onUnavailable = vi.fn();
+    const stop = subscribeCodexThread("s1", vi.fn(), onUnavailable);
+    MockEventSource.latest().fail(); // 第 1 次
+    await vi.advanceTimersByTimeAsync(CODEX_SSE_RECONNECT_BASE_MS);
+    MockEventSource.latest().fail(); // 第 2 次
+    await vi.advanceTimersByTimeAsync(CODEX_SSE_RECONNECT_BASE_MS * 2);
+    // 残缺帧：字节到了但解析不出完整投影——不清零（能收字节 ≠ 链路健康）
+    MockEventSource.latest().emit("snapshot", '{"availability":"controllable"}');
+    MockEventSource.latest().fail(); // 第 3 次 → 达阈值
+    expect(onUnavailable).toHaveBeenCalledTimes(1);
+    stop();
+  });
+
   it(`连续 ${CODEX_SSE_DEGRADE_AFTER} 次失败降级：onUnavailable 一次且不再建连；成功帧清零计数`, async () => {
     installFetch();
     const onUnavailable = vi.fn();
