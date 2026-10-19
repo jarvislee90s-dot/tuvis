@@ -216,7 +216,9 @@ export const CODEX_SSE_DEGRADE_AFTER = 3;
  *
  * 断线策略与 api.ts connectEvents 同构（可数失败语义）：onerror 显式 close() +
  * 手动线性退避重连；连续 CODEX_SSE_DEGRADE_AFTER 次失败 → onUnavailable() 一次，
- * 由调用方接管轮询。坏帧（截断/代理注入）跳过该帧不断流。
+ * 由调用方接管轮询。坏帧（截断/代理注入/合法 JSON 但缺字段的残缺载荷）跳过该帧
+ * 不断流——与 GET 通道同一形状守卫（asThreadProjection），残缺 DTO 绝不直入
+ * onState 渲染出「四档全空」的假界面。
  */
 export function subscribeCodexThread(
   sessionId: string,
@@ -238,10 +240,13 @@ export function subscribeCodexThread(
     onUnavailable();
   }
 
-  /** 解析帧并转交回调；坏帧跳过（不断流），成功帧清零失败计数 */
+  /** 解析帧并转交回调；坏帧跳过（不断流），成功帧清零失败计数。
+   *  形状守卫与 GET 同一（asThreadProjection）：合法 JSON 但残缺的帧（缺
+   *  contentState / messages / pending 或枚举外取值）同样按坏帧跳过——
+   *  能收字节但解析不出完整投影不足以证明链路健康（不清零失败计数）。 */
   function dispatch(e: Event) {
     try {
-      const parsed = JSON.parse((e as MessageEvent).data) as ThreadProjection;
+      const parsed = asThreadProjection(JSON.parse((e as MessageEvent).data));
       failures = 0;
       onState(parsed);
     } catch {
