@@ -318,7 +318,17 @@ mod tests {
         Ok(())
     }
 
-    /// F3：持续忙 → 外层预算耗尽诚实 `Timeout`（绝不误判成功；探针 P3 形态）。
+    /// F3：持续忙 → 重试预算耗尽诚实失败（绝不误判成功；探针 P3 形态）。
+    ///
+    /// Win32 语义勘正（2026-10-19，复审确定性红修复）：`CreateNamedPipe` 后实例即处于
+    /// listening 态，客户端**无需**服务端 `ConnectNamedPipe` 就能连上——旧构造
+    /// 「永不 accept 的服务端」根本不忙，客户端直接连成功（该测试因此恒红）。
+    /// 真 BUSY 构造：单实例服务端的唯一实例被客户端 A 占住、服务端从不
+    /// `DisconnectNamedPipe` → 客户端 B 每次 open 都得 `ERROR_PIPE_BUSY` →
+    /// 50×50ms 重试预算耗尽。耗时断言贴预算下限（~2.5s）；错误形态：内层预算先
+    /// 耗尽 → `Disconnected("…budget exhausted")`，计时抖动令外层 3s 先到 →
+    /// `Timeout`（probe P3 实测 3.005s 即外层先到的形态）——两者都是预算耗尽的
+    /// 诚实失败，由计时器抖动决定哪层先报。
     #[cfg(windows)]
     #[tokio::test]
     async fn sustained_busy_times_out_honestly() -> Result<(), Box<dyn std::error::Error>> {
@@ -327,30 +337,38 @@ mod tests {
             "\\\\.\\pipe\\codex-ipc-test-{}",
             crate::services::codex_desktop_ipc::types::new_uuid()
         );
-        // 服务端实例存在但**永不** accept：客户端重试预算耗尽
-        let _server = ServerOptions::new()
+        // 单实例服务端：唯一实例被占后，后续 open 全部 BUSY
+        let server = ServerOptions::new()
             .first_pipe_instance(true)
             .create(&test_pipe)?;
         let ep = DesktopEndpoint {
             platform: "windows".into(),
-            path: test_pipe,
+            path: test_pipe.clone(),
             build: None,
         };
+        // 客户端 A 占住唯一实例（持有到测试结束，服务端从不 DisconnectNamedPipe）
+        let _occupant = super::connect(&ep).await?;
+        // 客户端 B：真 BUSY → 重试预算耗尽
         let started = std::time::Instant::now();
         let r = super::connect(&ep).await;
         let elapsed = started.elapsed();
-        assert!(
-            matches!(r, Err(ProtocolError::Timeout(_))),
-            "持续忙必须诚实超时，实际 {}",
-            match &r {
-                Err(e) => e.to_string(),
-                Ok(_) => "unexpectedly connected".into(),
+        match &r {
+            Err(ProtocolError::Timeout(m)) => assert!(m.contains("timed out"), "{m}"),
+            Err(ProtocolError::Disconnected(m)) => {
+                assert!(
+                    m.contains("budget exhausted"),
+                    "诚实失败必须是预算耗尽，实际 {m}"
+                )
             }
-        );
+            Err(e) => panic!("持续忙的诚实失败只能是预算耗尽/超时，实际 {e}"),
+            Ok(_) => panic!("持续忙绝不许误判成功"),
+        }
         assert!(
-            elapsed >= std::time::Duration::from_secs(2),
-            "超时必须耗尽外层预算（实际 {elapsed:?}）"
+            elapsed >= std::time::Duration::from_millis(2400),
+            "必须耗尽 50×50ms 重试预算（下限 ~2.5s，实际 {elapsed:?}）"
         );
+        drop(_occupant);
+        drop(server);
         Ok(())
     }
 
