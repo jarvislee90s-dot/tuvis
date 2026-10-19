@@ -211,6 +211,24 @@ pub fn init(conn: &Connection) {
         );
         CREATE INDEX IF NOT EXISTS idx_codex_actions_thread_state_seq
             ON codex_actions(thread_id, state, seq);
+        -- ===== PR #165 复审 Important：codex_actions 周期查询无索引全表扫 =====
+        -- 以下 partial index 只收「调度/对账关心的行」（存量极小），随 migrate 幂等重放
+        -- 补建到老库。EXPLAIN QUERY PLAN 回归测试见 dao::codex_actions::tests
+        -- pending_work_and_binding_queries_use_partial_indexes。
+        -- ① 兼容屏障/Turn 绑定在册行（周期对账枚举 + thread 内屏障/fence 查询共用）
+        CREATE INDEX IF NOT EXISTS idx_codex_actions_compat_outstanding
+            ON codex_actions(thread_id, seq) WHERE compat_outstanding = 1;
+        -- ② queued 普通消息（对账枚举的第二分支；与既有 thread_state_seq 索引互补）
+        CREATE INDEX IF NOT EXISTS idx_codex_actions_queued_send
+            ON codex_actions(thread_id, seq) WHERE state = 'queued' AND kind = 'send';
+        -- ③ Turn 顺序绑定行（路由器重启重建输入；(route,state,seq) 列序使 planner
+        --    出 SEARCH（route=? AND state=?），而非对整个 partial index 的 SCAN）
+        CREATE INDEX IF NOT EXISTS idx_codex_actions_turn_binding
+            ON codex_actions(route, state, seq) WHERE compat_outstanding = 1;
+        -- ④ 终态行墓碑化候选（保留清理的批量分批选择：updated_at 范围 SEEK + LIMIT 早停）
+        CREATE INDEX IF NOT EXISTS idx_codex_actions_terminal_retention
+            ON codex_actions(updated_at)
+            WHERE state IN ('accepted', 'rejected', 'cancelled') AND compat_outstanding = 0;
         CREATE TABLE IF NOT EXISTS write_audit (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          INTEGER NOT NULL,

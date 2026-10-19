@@ -406,6 +406,10 @@ async fn scheduler_loop(hub: Arc<CodexControlHub>, st: Arc<RemoteState>) {
                 // 一律保留**——2026-10-17 复审 C1.2：对账不是解除屏障的定时器条件）
                 let recovered = hub.router.store().mark_stale_reserved_unknown(STUCK_DISPATCH_MS);
                 hub.router.converge_with_ledger();
+                // PR #165 复审 Important：终态行保留清理（墓碑化）随周期对账触发——
+                // 快 SQL（partial index 范围 SEEK + LIMIT 分批），不构成新的串行阻塞点；
+                // 调度循环本体已是解耦风格，本调用与 mark_stale 同层同性质。
+                hub.router.store().tombstone_expired_terminal();
                 // R7.1 启动恢复（首 tick 即到点）/ R7.2 周期对账：枚举全部待发 thread
                 //（queued 普通消息 / 在册屏障 / 刚收敛的行；空集合零开销），逐线程
                 // ensure 重新 following → settle 接力（内部 try-lock 让路）

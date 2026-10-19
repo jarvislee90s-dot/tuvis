@@ -660,13 +660,20 @@ pub(crate) fn set_compat_dispatch_barrier_conn(
 /// 有待发工作的 thread（hub 启动恢复 / 周期对账的枚举输入，R7.1/R7.2）：
 /// 有 queued 普通消息 **或** 未清 compat 屏障（含 R6.3 的 Turn 顺序绑定）的 thread。
 /// 空集合 = 单条 EXISTS 查询，零额外开销。
+///
+/// 性能（PR #165 复审 Important）：原 OR 形态谓词 planner 不认 partial index
+///（实测 EXPLAIN 仍 `SCAN codex_actions` 全表）——改写为两个 partial index 子查询的
+/// UNION（UNION 自带去重 ≡ 原 DISTINCT；ORDER BY 对并集生效，语义等价，等价性回归
+/// 见 pending_work_union_equivalent_to_legacy_or）。每分支各自走
+/// idx_codex_actions_compat_outstanding / idx_codex_actions_queued_send 的 partial
+/// index 扫描（只触关心的行）。
+const SQL_PENDING_WORK: &str = "SELECT thread_id FROM codex_actions WHERE compat_outstanding = 1 \
+     UNION \
+     SELECT thread_id FROM codex_actions WHERE state = 'queued' AND kind = 'send' \
+     ORDER BY thread_id ASC";
+
 pub(crate) fn threads_with_pending_work_conn(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT thread_id FROM codex_actions \
-         WHERE compat_outstanding = 1 \
-            OR (state = 'queued' AND kind = 'send') \
-         ORDER BY thread_id ASC",
-    )?;
+    let mut stmt = conn.prepare(SQL_PENDING_WORK)?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     rows.collect()
 }
@@ -691,11 +698,15 @@ pub(crate) fn thread_has_pending_work_conn(
 /// route='desktop_ipc' ∧ state IN ('accepted','unknown')`。`compat_turn_id` 复用为
 /// 本次 Turn 身份的持久槽位（计划允许复用该列）；None = 保守屏障（unknown/缺
 /// turnId——重启后同样保留限制，保守不释放）。
+/// 谓词常量：与 idx_codex_actions_turn_binding partial index 同源（EXPLAIN 回归测试
+/// 用同一文本，防谓词与索引漂移）。
+const TURN_BINDING_PREDICATE: &str = "compat_outstanding = 1 AND route = 'desktop_ipc' \
+     AND state IN ('accepted', 'unknown')";
+
 pub(crate) fn turn_binding_rows_conn(conn: &Connection) -> rusqlite::Result<Vec<ActionRow>> {
     let sql = format!(
         "SELECT {COLS} FROM codex_actions \
-         WHERE compat_outstanding = 1 AND route = 'desktop_ipc' \
-           AND state IN ('accepted', 'unknown') \
+         WHERE {TURN_BINDING_PREDICATE} \
          ORDER BY seq ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -830,16 +841,62 @@ pub(crate) fn force_release_barrier_conn(
 
 /// 该 Thread 全部在册屏障的 action_id（seq 序；队列视图 `blockedActionIds`——
 /// 人工解除端点的靶向清单，前端按钮据此逐个解除）。
+///
+/// PR #165 复审（Minor）：仅列**人工可解除**的行——`state IN ('unknown','accepted')`
+/// 与 [`force_release_barrier_conn`] 的 CAS 谓词一致。reserved 在飞行（compat
+/// 兜底在飞 fence）虽有 compat_outstanding=1，但有自动落账路径且端点会 409，
+/// 不进清单（否则前端「继续队列」按钮必踩 409）。
 pub(crate) fn barrier_action_ids_conn(
     conn: &Connection,
     thread_id: &str,
 ) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT action_id FROM codex_actions WHERE thread_id = ?1 AND compat_outstanding = 1 \
+        "SELECT action_id FROM codex_actions \
+         WHERE thread_id = ?1 AND compat_outstanding = 1 \
+           AND state IN ('unknown', 'accepted') \
          ORDER BY seq ASC",
     )?;
     let rows = stmt.query_map([thread_id], |r| r.get::<_, String>(0))?;
     rows.collect()
+}
+
+// ============================================================
+// 终态行保留清理（PR #165 复审 Important：表只增无清理）
+// ============================================================
+
+/// 墓碑化候选行选取（与 idx_codex_actions_terminal_retention partial index 同源，
+/// EXPLAIN 回归测试用同一文本）：仅「无屏障在册的终态行」，按 updated_at 范围 SEEK
+/// + LIMIT 早停。
+const SQL_TOMBSTONE_CANDIDATES: &str = "SELECT seq FROM codex_actions \
+     WHERE state IN ('accepted', 'rejected', 'cancelled') \
+       AND compat_outstanding = 0 AND updated_at <= ?1 LIMIT ?2";
+
+/// 终态行墓碑化（保留清理）：超过保留期的终态行**置空重载荷列**（queued_text 原文 /
+/// receipt_json 回执 / compat_* 屏障与证据列），**绝不删行**——保留 actionId 重放
+/// 幂等（墓碑行重放仍返回既有终态，见 router::completed_stored 的合成口径，绝不回
+/// queued）。保留列：action_id/thread_id/kind/state/route/payload_hash（重放载荷
+/// 比对靠它，清了会把幂等重放误判 Conflict）/设备/时间戳；`updated_at` 刷新为墓碑
+/// 时刻（清扫收敛：同一行只实际写一次，周期触发无重复写放大）。
+///
+/// 两类豁免：① state='unknown' 行持有屏障语义，**永不**清理；② compat_outstanding=1
+/// 的行（含 A 路 accepted 的 Turn 绑定——清 compat_turn_id 会断掉重启重建依据），
+/// 屏障解除（reconcile / 人工）后自然进入下一轮清理范围。批量 LIMIT 分批，单次
+/// 快 SQL，调用方（启动恢复 / 周期对账）不为此阻塞。返回本次墓碑化行数。
+pub(crate) fn tombstone_expired_terminal_conn(
+    conn: &Connection,
+    retention_ms: i64,
+    now_ms: i64,
+    batch_limit: i64,
+) -> rusqlite::Result<usize> {
+    let cutoff = now_ms - retention_ms;
+    let sql = format!(
+        "UPDATE codex_actions SET \
+             queued_text = NULL, receipt_json = NULL, \
+             compat_message_id = NULL, compat_turn_id = NULL, compat_rollout_path = NULL, \
+             compat_rollout_baseline = NULL, compat_wire_hash = NULL, updated_at = ?3 \
+         WHERE seq IN ({SQL_TOMBSTONE_CANDIDATES})"
+    );
+    conn.execute(&sql, params![cutoff, batch_limit, now_ms])
 }
 
 // ============================================================
@@ -1566,5 +1623,418 @@ mod tests {
             vec!["u-2".to_string()],
             "解除后退出清单"
         );
+    }
+
+    // ============================================================
+    // PR #165 复审三项修复
+    // ============================================================
+
+    /// 指定 thread 的 send 行登记（多 thread 夹具用；`insert` 固定本文件 THREAD）。
+    fn insert_on(c: &Connection, thread: &str, action_id: &str, text: Option<&str>, now: i64) {
+        insert_action_conn(
+            c, action_id, "dev-1", "iPhone", thread, "send", None, None, "h", text, "cm-1", now,
+        )
+        .unwrap();
+    }
+
+    /// 混合形态夹具（EXPLAIN 与 UNION 等价性测试共用）：多 thread × 各状态行。
+    /// 期望的待发工作 thread 集 = 本文件 THREAD（queued send）+ th-b（accepted+屏障）
+    /// + th-d（unknown+屏障）；th-c（仅 cancelled）/ th-e（reserved 无屏障）排除。
+    fn mixed_shape_fixture(c: &Connection) -> Vec<String> {
+        // THREAD：queued 普通消息（计入）+ queued 交互行（R6.1：不计入）
+        insert(c, "t-send", Some("甲"), 1000);
+        insert_action_conn(
+            c,
+            "t-input",
+            "dev-1",
+            "iPhone",
+            THREAD,
+            "user_input",
+            Some("n:1"),
+            Some("tok"),
+            "h",
+            None,
+            "cm-i",
+            1001,
+        )
+        .unwrap();
+        // th-b：accepted + 屏障在册
+        insert_on(c, "th-b", "b-acc", Some("x"), 1100);
+        reserve_conn(c, "b-acc", ControlRoute::DesktopIpc, 1101).unwrap();
+        finish_with_turn_barrier_conn(
+            c,
+            &ActionReceipt {
+                action_id: "b-acc".into(),
+                delivery: Delivery::Accepted,
+                route: ControlRoute::DesktopIpc,
+                turn_id: Some("tb-1".into()),
+                envelope_id: None,
+                reason_code: None,
+            },
+            Some("tb-1"),
+            1102,
+        )
+        .unwrap();
+        // th-c：仅 cancelled（排除）
+        insert_on(c, "th-c", "c-1", Some("x"), 1200);
+        retract_conn(c, "c-1", "dev-1", 1201).unwrap();
+        // th-d：unknown + 保守屏障（计入）
+        insert_on(c, "th-d", "d-1", Some("x"), 1300);
+        reserve_conn(c, "d-1", ControlRoute::DesktopIpc, 1301).unwrap();
+        finish_with_turn_barrier_conn(
+            c,
+            &ActionReceipt {
+                action_id: "d-1".into(),
+                delivery: Delivery::UnknownDelivery,
+                route: ControlRoute::DesktopIpc,
+                turn_id: None,
+                envelope_id: None,
+                reason_code: None,
+            },
+            None,
+            1302,
+        )
+        .unwrap();
+        // th-e：reserved 在飞（无屏障，排除）
+        insert_on(c, "th-e", "e-1", Some("x"), 1400);
+        reserve_conn(c, "e-1", ControlRoute::DesktopIpc, 1401).unwrap();
+        vec![THREAD.to_string(), "th-b".to_string(), "th-d".to_string()]
+    }
+
+    fn query_thread_ids(c: &Connection, sql: &str) -> Vec<String> {
+        let mut stmt = c.prepare(sql).unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// UNION 改写语义等价（PR #165 事项②）：新 SQL_PENDING_WORK 与旧 OR 形态
+    ///（DISTINCT + ORDER BY）在混合形态夹具上逐行一致。
+    #[test]
+    fn pending_work_union_equivalent_to_legacy_or() {
+        let c = mem();
+        let expected = mixed_shape_fixture(&c);
+        let new_ids = query_thread_ids(&c, SQL_PENDING_WORK);
+        let legacy = "SELECT DISTINCT thread_id FROM codex_actions \
+                      WHERE compat_outstanding = 1 \
+                         OR (state = 'queued' AND kind = 'send') \
+                      ORDER BY thread_id ASC";
+        let legacy_ids = query_thread_ids(&c, legacy);
+        assert_eq!(new_ids, expected, "新 UNION 结果与期望形态一致");
+        assert_eq!(new_ids, legacy_ids, "UNION 改写与旧 OR 形态逐行等价");
+    }
+
+    /// EXPLAIN QUERY PLAN 回归（PR #165 事项②）：三个周期查询必须走 partial index，
+    /// 绝不允许裸表扫描（`SCAN codex_actions` 不带 USING 后缀 = 全表扫）。
+    /// 实证结论（SQLite 3.50）：OR 形态谓词不认 partial index（仍全表扫）→ 对账枚举
+    /// 已改写 UNION；Turn 绑定经 (route,state,seq) 列序拿到 SEARCH；墓碑化候选走
+    /// updated_at 范围 SEEK + LIMIT 早停。
+    #[test]
+    fn pending_work_and_binding_queries_use_partial_indexes() {
+        let c = mem();
+        mixed_shape_fixture(&c);
+        let plan = |sql: &str| -> Vec<String> {
+            let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(3)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        // 裸表扫描判定：detail 恰为 "SCAN codex_actions"（带 USING 的 partial index
+        // 扫描只触索引内收集的「关心的行」，正是本改造的目标形态）
+        let no_bare_table_scan = |p: &[String]| {
+            assert!(
+                !p.iter().any(|d| d == "SCAN codex_actions"),
+                "出现全表扫描: {p:?}"
+            );
+        };
+
+        // ① 对账枚举（UNION 两分支各自走对应 partial index）
+        let p = plan(SQL_PENDING_WORK);
+        no_bare_table_scan(&p);
+        assert!(
+            p.iter()
+                .any(|d| d.contains("idx_codex_actions_compat_outstanding")),
+            "屏障分支未走 partial index: {p:?}"
+        );
+        assert!(
+            p.iter()
+                .any(|d| d.contains("idx_codex_actions_queued_send")),
+            "queued 分支未走 partial index: {p:?}"
+        );
+
+        // ② Turn 绑定枚举：SEARCH USING INDEX（(route,state,seq) 列序）
+        let p = plan(&format!(
+            "SELECT seq FROM codex_actions WHERE {TURN_BINDING_PREDICATE} ORDER BY seq ASC"
+        ));
+        no_bare_table_scan(&p);
+        assert!(
+            p.iter()
+                .any(|d| { d.contains("idx_codex_actions_turn_binding") && d.contains("SEARCH") }),
+            "Turn 绑定未走 SEARCH + partial index: {p:?}"
+        );
+
+        // ③ 墓碑化候选：updated_at 范围 SEEK（LIMIT 早停）。（候选 SQL 带 ? 占位符
+        //——计划与绑定值无关，EXPLAIN 处用字面量替位）
+        let p = plan(
+            &SQL_TOMBSTONE_CANDIDATES
+                .replace("?1", "123")
+                .replace("?2", "500"),
+        );
+        no_bare_table_scan(&p);
+        assert!(
+            p.iter()
+                .any(|d| d.contains("idx_codex_actions_terminal_retention")),
+            "墓碑化候选未走 partial index: {p:?}"
+        );
+    }
+
+    /// 墓碑化行为（PR #165 事项②）：超期**无屏障终态行**重载荷置 NULL、行保留、
+    /// 状态/载荷指纹列保全；新行、unknown 行（含无屏障形态）、屏障在册行、非终态行
+    /// 一律不动；updated_at 刷新使重复跑幂等收敛（0 增量）；LIMIT 分批安全。
+    #[test]
+    fn tombstone_expired_terminal_tombstones_old_terminal_rows_only() {
+        const DAY: i64 = 86_400_000;
+        const RETENTION: i64 = 30 * DAY;
+        let c = mem();
+        let t0 = 1_000_000i64;
+        let now = t0 + 40 * DAY;
+        // ① 超期 accepted（屏障释放后）：墓碑化目标
+        insert(&c, "old-acc", Some("甲"), t0);
+        reserve_conn(&c, "old-acc", ControlRoute::DesktopIpc, t0 + 1).unwrap();
+        finish_with_turn_barrier_conn(
+            &c,
+            &ActionReceipt {
+                action_id: "old-acc".into(),
+                delivery: Delivery::Accepted,
+                route: ControlRoute::DesktopIpc,
+                turn_id: Some("t1".into()),
+                envelope_id: None,
+                reason_code: None,
+            },
+            Some("t1"),
+            t0 + 2,
+        )
+        .unwrap();
+        clear_compat_fence_conn(&c, "old-acc", t0 + 3).unwrap();
+        // ② 超期 rejected：目标
+        insert(&c, "old-rej", Some("乙"), t0);
+        reserve_conn(&c, "old-rej", ControlRoute::DesktopIpc, t0 + 1).unwrap();
+        finish_conn(
+            &c,
+            &ActionReceipt {
+                action_id: "old-rej".into(),
+                delivery: Delivery::Rejected,
+                route: ControlRoute::DesktopIpc,
+                turn_id: None,
+                envelope_id: None,
+                reason_code: Some("writer_refused".into()),
+            },
+            t0 + 2,
+        )
+        .unwrap();
+        // ③ 超期 cancelled：目标
+        insert(&c, "old-cancel", Some("丙"), t0);
+        retract_conn(&c, "old-cancel", "dev-1", t0 + 2).unwrap();
+        // ④ 老库直插形态：终态 + 无屏障 + 重载荷列全在（墓碑化必须清干净）
+        c.execute(
+            "INSERT INTO codex_actions (action_id, device_id, device_name, thread_id, kind, \
+                 payload_hash, client_message_id, state, route, queued_text, created_at, updated_at, \
+                 receipt_json, compat_message_id, compat_rollout_path, compat_rollout_baseline, \
+                 compat_wire_hash) \
+             VALUES ('old-raw', 'd', 'n', ?1, 'send', 'h', 'cm', 'accepted', 'none', \
+                 '机密原文', ?2, ?2, '{\"x\":1}', 'm-1', '/p', 1, 'wh')",
+            [THREAD, &t0.to_string()],
+        )
+        .unwrap();
+        // ⑤ 保留期内 accepted：不动
+        insert(&c, "new-acc", Some("丁"), now - DAY);
+        reserve_conn(&c, "new-acc", ControlRoute::DesktopIpc, now - DAY + 1).unwrap();
+        finish_conn(
+            &c,
+            &ActionReceipt {
+                action_id: "new-acc".into(),
+                delivery: Delivery::Accepted,
+                route: ControlRoute::DesktopIpc,
+                turn_id: None,
+                envelope_id: None,
+                reason_code: None,
+            },
+            now - DAY + 2,
+        )
+        .unwrap();
+        // ⑥ unknown + 屏障：**永不**清理
+        finish_with_barrier(&c, "old-unk-barrier", Delivery::UnknownDelivery, None, t0);
+        // ⑦ unknown 无屏障（交互动作形态）：state 豁免，不动
+        insert_action_conn(
+            &c,
+            "old-unk-nobarrier",
+            "dev-1",
+            "iPhone",
+            THREAD,
+            "user_input",
+            Some("n:9"),
+            Some("tok"),
+            "h",
+            None,
+            "cm-i",
+            t0,
+        )
+        .unwrap();
+        reserve_conn(&c, "old-unk-nobarrier", ControlRoute::DesktopIpc, t0 + 1).unwrap();
+        finish_conn(
+            &c,
+            &ActionReceipt {
+                action_id: "old-unk-nobarrier".into(),
+                delivery: Delivery::UnknownDelivery,
+                route: ControlRoute::DesktopIpc,
+                turn_id: None,
+                envelope_id: None,
+                reason_code: Some("aborted".into()),
+            },
+            t0 + 2,
+        )
+        .unwrap();
+        // ⑧ accepted + 屏障在册（Turn 绑定依据）：屏障豁免，不动
+        finish_with_barrier(&c, "old-acc-barrier", Delivery::Accepted, Some("t3"), t0);
+        // ⑨ queued 非终态：不动（原文保留）
+        insert(&c, "old-queued", Some("排队原文"), t0);
+
+        let swept = tombstone_expired_terminal_conn(&c, RETENTION, now, 500).unwrap();
+        assert_eq!(swept, 4, "恰好墓碑化 4 个目标行（old-acc/rej/cancel/raw）");
+
+        // 目标行：重载荷清空，行与状态/指纹列保全（重放幂等的全部依据）
+        let raw = |id: &str, col: &str| -> Option<String> {
+            c.query_row(
+                &format!("SELECT {col} FROM codex_actions WHERE action_id = '{id}'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        for (id, want_state) in [
+            ("old-acc", "accepted"),
+            ("old-rej", "rejected"),
+            ("old-cancel", "cancelled"),
+        ] {
+            let row = get_row(&c, id).unwrap().unwrap();
+            assert_eq!(state_to_str(row.state), want_state, "{id} 状态保全");
+            assert_eq!(row.receipt, None, "{id} 回执已清");
+            assert!(row.compat_message_id.is_none() && row.compat_wire_hash.is_none());
+            assert_eq!(
+                row.payload_hash, "hash",
+                "{id} 载荷指纹保全（重放幂等依据）"
+            );
+            assert_eq!(row.action_id, id, "{id} 墓碑行保留");
+        }
+        assert_eq!(raw("old-raw", "queued_text"), None);
+        assert_eq!(raw("old-raw", "receipt_json"), None);
+        assert_eq!(raw("old-raw", "compat_message_id"), None);
+        assert_eq!(raw("old-raw", "compat_rollout_path"), None);
+        let baseline: Option<i64> = c
+            .query_row(
+                "SELECT compat_rollout_baseline FROM codex_actions WHERE action_id = 'old-raw'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(baseline, None, "整数证据列同样清空");
+        assert_eq!(raw("old-raw", "compat_wire_hash"), None);
+        assert_eq!(
+            state_to_str(get_row(&c, "old-raw").unwrap().unwrap().state),
+            "accepted"
+        );
+
+        // 豁免行：一律原样
+        assert!(
+            get_row(&c, "new-acc").unwrap().unwrap().receipt.is_some(),
+            "保留期内不动"
+        );
+        assert!(
+            get_row(&c, "old-unk-barrier")
+                .unwrap()
+                .unwrap()
+                .receipt
+                .is_some(),
+            "unknown+屏障永不清理"
+        );
+        assert!(
+            get_row(&c, "old-unk-nobarrier")
+                .unwrap()
+                .unwrap()
+                .receipt
+                .is_some(),
+            "unknown 无屏障同样豁免（state 判据）"
+        );
+        assert!(
+            get_row(&c, "old-acc-barrier")
+                .unwrap()
+                .unwrap()
+                .receipt
+                .is_some(),
+            "屏障在册行不动（Turn 绑定依据）"
+        );
+        assert_eq!(
+            get_row(&c, "old-queued").unwrap().unwrap().queued_text,
+            Some("排队原文".into()),
+            "queued 非终态不动"
+        );
+
+        // 幂等收敛：updated_at 已刷新为墓碑时刻 → 同 now 重跑 0 增量
+        assert_eq!(
+            tombstone_expired_terminal_conn(&c, RETENTION, now, 500).unwrap(),
+            0,
+            "重复跑安全（0 增量，无写放大）"
+        );
+        // LIMIT 分批：3 个新目标分两批跑完
+        let c2 = mem();
+        for id in ["x1", "x2", "x3"] {
+            insert(&c2, id, Some("x"), t0);
+            retract_conn(&c2, id, "dev-1", t0 + 1).unwrap();
+            c2.execute(
+                "UPDATE codex_actions SET updated_at = 1000 WHERE action_id = ?1",
+                [id],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            tombstone_expired_terminal_conn(&c2, RETENTION, now, 2).unwrap(),
+            2
+        );
+        assert_eq!(
+            tombstone_expired_terminal_conn(&c2, RETENTION, now, 2).unwrap(),
+            1
+        );
+        assert_eq!(
+            tombstone_expired_terminal_conn(&c2, RETENTION, now, 2).unwrap(),
+            0
+        );
+    }
+
+    /// barrier 清单过滤（PR #165 事项③，复审 Minor）：reserved 在飞行（compat 兜底
+    /// fence 在册）**不进**人工解除靶向清单（端点会 409）；unknown/accepted 屏障在列。
+    #[test]
+    fn barrier_action_ids_exclude_reserved_in_flight() {
+        let c = mem();
+        finish_with_barrier(&c, "u-1", Delivery::UnknownDelivery, None, 1000);
+        finish_with_barrier(&c, "a-ok", Delivery::Accepted, Some("t-9"), 1100);
+        // reserved 在飞（compat 兜底 fence）：compat_outstanding=1 但有自动落账路径
+        insert(&c, "r-fly", Some("丙"), 1200);
+        reserve_conn(&c, "r-fly", ControlRoute::HeadlessCompat, 1201).unwrap();
+        set_compat_dispatch_barrier_conn(
+            &c,
+            "r-fly",
+            None,
+            None,
+            Some("/p"),
+            Some(1),
+            Some("w"),
+            1202,
+        )
+        .unwrap();
+        assert_eq!(
+            barrier_action_ids_conn(&c, THREAD).unwrap(),
+            vec!["u-1".to_string(), "a-ok".to_string()],
+            "reserved 在飞行不进清单（与 force-release CAS 谓词一致）"
+        );
+        // 对照：在飞行屏障确实在册（fence 查询可见），只是不进人工解除清单
+        assert!(has_compat_fence_conn(&c, THREAD).unwrap());
     }
 }
