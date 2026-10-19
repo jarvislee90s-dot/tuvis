@@ -13,7 +13,8 @@
 //   混合屏障面：清单含等待 Turn 完成的条目时将提前解除其顺序限制——行清单不带
 //   state，前端无从逐行甄别，只能文案如实）后逐个解除 blockedActionIds 并重拉；
 //   单个 id 的确定性「无需解除」回执（409 no_barrier——屏障已被自动路径解除/
-//   从未在册）只收尾该 id 不中断剩余；真失败显示错误不静默（note 走 reason →
+//   从未在册；409 barrier_in_flight——屏障在册但派发在飞有自动路径）只收尾该 id
+//   不中断剩余；真失败显示错误不静默（note 走 reason →
 //   机器码 → message 可读化回退链）。native_turn_pending 有自动恢复路径（Turn
 //   终态证据驱动），不提供该按钮；
 // - **不提供插队**：本面板没有「立即发送/跳到队首」语义（宪法 R2.3 忙态留队、
@@ -71,15 +72,20 @@ function apiErrorReason(e: ApiError): string {
 }
 
 /** 该次 force-continue 失败是否「该 id 无需解除」的确定性收尾（2026-10-19 复审
- *  Minor：一败全停修复）——409 no_barrier = 屏障已被自动路径解除/从未在册
- *  （典型：视图与确认之间屏障被自动路径清掉），剩余未解除 id 与该 id 无关，
- *  循环继续逐个解除；仅真失败（网络异常 / 5xx / 403 门禁等）才中断（此时剩余
- *  屏障状态不可知，重拉后由用户再试）。200（含 AlreadyReleased 幂等回执，HTTP
- *  层与普通解除不可分）天然继续。409 queued_use_retract 不在此列：它指引「走
- *  撤回」，按真失败中断并由 note 可读化转述（且屏障在册清单不含 queued 行，
- *  本面板实际到不了该臂）。 */
+ *  Minor：一败全停修复）——两个确定性「无需人工解除」机器码都收尾该 id 不中断：
+ *  409 no_barrier = 屏障已被自动路径解除/从未在册（典型：视图与确认之间屏障被
+ *  自动路径清掉）；409 barrier_in_flight = 屏障在册但该 id 派发在飞（有自动落账
+ *  路径，天然不需要人工解除）。两者剩余未解除 id 都与该 id 无关，循环继续逐个
+ *  解除；仅真失败（网络异常 / 5xx / 403 门禁等）才中断（此时剩余屏障状态不可知，
+ *  重拉后由用户再试）。200（含 AlreadyReleased 幂等回执，HTTP 层与普通解除不可分）
+ *  天然继续。409 queued_use_retract 不在此列：它指引「走撤回」，按真失败中断并由
+ *  note 可读化转述（且屏障在册清单不含 queued 行，本面板实际到不了该臂）。 */
 function isPerIdSettledRefusal(e: unknown): boolean {
-  return e instanceof ApiError && e.status === 409 && e.data?.error === "no_barrier";
+  return (
+    e instanceof ApiError &&
+    e.status === 409 &&
+    (e.data?.error === "no_barrier" || e.data?.error === "barrier_in_flight")
+  );
 }
 
 export default function CodexQueuePanel({
@@ -187,10 +193,10 @@ export default function CodexQueuePanel({
   );
 
   // 人工解除无出口屏障（确认后调用）：逐个解除在册屏障并重拉。单个 id 的确定性
-  // 「无需解除」回执（409 no_barrier / queued_use_retract——视图与确认之间屏障被
-  // 自动路径清除、该行本就在册外等）只收尾该 id，**不中断**剩余 id（2026-10-19
-  // 复审 Minor：一败全停修复）；仅真失败（网络/5xx/403 等）→ 显示错误不静默
-  // （已成功的保留——重拉以服务端账本为权威）。
+  // 「无需解除」回执（409 no_barrier / barrier_in_flight——视图与确认之间屏障被
+  // 自动路径清除、该行派发在飞有自动路径等）只收尾该 id，**不中断**剩余 id
+  // （2026-10-19 复审 Minor：一败全停修复）；仅真失败（网络/5xx/403 等）→
+  // 显示错误不静默（已成功的保留——重拉以服务端账本为权威）。
   const forceContinue = useCallback(async () => {
     if (busyId !== null || forceBusy) return;
     const ids = view?.blockedActionIds ?? [];

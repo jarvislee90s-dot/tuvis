@@ -658,6 +658,51 @@ async fn discovery_no_client_found_is_error_not_owner() {
     conn.shutdown().await;
 }
 
+/// 死 lease 复查（PR #165 复审 Minor）：registry 已换代到新 epoch 后，旧 epoch 连接
+/// 的迟到 discovery 回执会 bind 出 generation=0 的死 lease——`discover_and_follow`
+/// 不得把它当成功 Ok 返回，应在 declare 后以 StaleContext 失败（调用方按失败重试）。
+#[tokio::test]
+async fn discover_and_follow_rejects_dead_lease_from_old_epoch() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let task = {
+        let c = conn.clone();
+        tokio::spawn(async move {
+            let mut owners = OwnerRegistry::default();
+            owners.reset(2); // registry 已随新连接（epoch=2）换代：本连接 epoch=1 迟到
+            let key = ThreadKey {
+                host_id: "local".into(),
+                thread_id: "thread-9".into(),
+            };
+            discover_and_follow(&c, &mut owners, &key).await
+        })
+    };
+    // 旧连接的 discovery 照常得到回执（旧 epoch 迟到回执场景）
+    let disc = peer.recv().await;
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let _follow = peer.recv().await; // following 声明照发（wire 已见 true）
+    let result = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("in time")
+        .expect("task ok");
+    assert!(
+        matches!(
+            result,
+            Err(multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError::StaleContext(_))
+        ),
+        "死 lease 必须报错而非 Ok 返回：{result:?}"
+    );
+    conn.shutdown().await;
+}
+
 #[tokio::test]
 async fn owner_rebind_invalidates_old_lease_end_to_end() {
     use std::sync::Arc;

@@ -432,6 +432,34 @@ describe("CodexQueuePanel（Task 9）", () => {
     expect(queueGetCalls()).toBe(2);
   });
 
+  it("force_continue_barrier_in_flight_settles_and_continues：第一个 id 409 barrier_in_flight（屏障在册但派发在飞有自动路径）→ 该 id 收尾继续，第二个 id 仍被请求，零错误 note", async () => {
+    installFetch();
+    routes.forceContinueFailures = {
+      "u-1": {
+        status: 409,
+        body: {
+          error: "barrier_in_flight",
+          reason: "屏障在册但该消息派发在飞（有自动落账路径），不在人工解除范围",
+        },
+      },
+    };
+    routes.queue = [
+      queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
+      queueView([action({ actionId: "a1" })], "native_delivery_unknown", ["u-1", "u-2"]),
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-force-continue"));
+    fireEvent.click(screen.getByTestId("codex-queue-force-yes"));
+    // 一败（barrier_in_flight）不停：两个 id 都被逐个请求
+    await waitFor(() =>
+      expect(forceContinueBodies()).toEqual(['{"actionId":"u-1"}', '{"actionId":"u-2"}'])
+    );
+    // barrier_in_flight = 确定性「无需人工解除」（自动路径负责），不是错误：不出错误 note
+    expect(screen.queryByTestId("codex-queue-note")).toBeNull();
+    // 操作后重拉（挂载 1 次 + 循环后 1 次）
+    expect(queueGetCalls()).toBe(2);
+  });
+
   it("force_continue_real_failure_interrupts：第二个 id 真失败（500 internal）→ 中断剩余 + note 带机器码可读化（不裸示「路径 + 状态码」）", async () => {
     installFetch();
     routes.forceContinueFailures = {

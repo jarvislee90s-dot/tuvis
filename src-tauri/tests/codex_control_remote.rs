@@ -1894,6 +1894,8 @@ async fn force_release_unlocks_unknown_barrier_and_queue_resumes() {
 }
 
 /// queued 行走既有撤回：人工解除端点语义拒绝（NotEligible），屏障与队列不被误触。
+/// queued 行屏障不在册 → `barrier_in_register=false`（HTTP 层回 no_barrier 之前的
+/// 撤回指引臂，不涉 barrier_in_flight）。
 #[tokio::test]
 async fn force_release_rejects_queued_rows() {
     let h = harness();
@@ -1905,13 +1907,100 @@ async fn force_release_rejects_queued_rows() {
         .force_release_barrier("fc-q", "dev-1")
         .expect("query")
     {
-        BarrierRelease::NotEligible(view) => {
+        BarrierRelease::NotEligible {
+            view,
+            barrier_in_register,
+        } => {
             assert_eq!(view.state, ActionState::Queued, "409 指引走撤回的判据");
+            assert!(!barrier_in_register, "queued 行屏障不在册");
         }
         other => panic!("queued 应 NotEligible：{other:?}"),
     }
     // 动作保持 queued 可撤（撤回路径不受影响）
     assert!(h.store.retract("fc-q", "dev-1").expect("retract"));
+}
+
+/// reserved 在飞 fence（PR #165 复审 Minor）：屏障在册但不在人工解除范围——
+/// NotEligible 带 `barrier_in_register=true`（HTTP 层据此回 `barrier_in_flight`
+/// 而非误导性的 `no_barrier`），屏障不被触碰（自动落账路径负责）。
+#[tokio::test]
+async fn force_release_rejects_reserved_in_flight_fence() {
+    let h = harness();
+    h.router
+        .send(h.ctx("fc-r", ActionKind::Send), "派发在飞".into(), true)
+        .await;
+    // CAS queued → reserved 并武装在飞 fence（不经派发任务，直摆中间态）
+    assert!(
+        h.store
+            .reserve("fc-r", ControlRoute::DesktopIpc)
+            .expect("reserve"),
+        "queued → reserved CAS 命中"
+    );
+    h.store.set_compat_fence("fc-r", None, None).expect("fence");
+    match h
+        .store
+        .force_release_barrier("fc-r", "dev-1")
+        .expect("query")
+    {
+        BarrierRelease::NotEligible {
+            view,
+            barrier_in_register,
+        } => {
+            assert_eq!(view.state, ActionState::Reserved);
+            assert!(
+                barrier_in_register,
+                "屏障在册：HTTP 层应回 barrier_in_flight"
+            );
+        }
+        other => panic!("reserved+fence 应 NotEligible：{other:?}"),
+    }
+    assert!(
+        h.store.has_compat_fence(&h.key).expect("query"),
+        "在飞 fence 不被人工解除触碰（有自动路径）"
+    );
+}
+
+/// force_clear_turn_limit 精确匹配负例（PR #165 复审 Minor）：传入不同 action_id
+/// 不清除、返回 false——防误清同 Thread 上新一轮派发的顺序限制。观察法：先清持久
+/// 屏障（端点两步之间的中间态），此时唯一闸 = 内存顺序限制——负例调用后 fcx-b 仍
+/// 接不上 = 限制确实未被误清；精确匹配调用后立即接力。
+#[tokio::test]
+async fn force_clear_turn_limit_requires_exact_action_match() {
+    let h = harness_with(FakeDispatch::new(DispatchOutcome {
+        delivery: Delivery::UnknownDelivery,
+        envelope_id: Some("env-fcx".into()),
+        turn_id: None,
+        reason_code: None,
+        revision: None,
+    }));
+    let _ = completed(
+        h.router
+            .send(h.ctx("fcx-a", ActionKind::Send), "未知投递".into(), false)
+            .await,
+    );
+    h.router
+        .send(h.ctx("fcx-b", ActionKind::Send), "被困后续".into(), true)
+        .await;
+    // 只清持久屏障、不动内存限制（模拟解除端点 CAS 步与清内存步之间的中间态）
+    assert!(matches!(
+        h.store
+            .force_release_barrier("fcx-a", "dev-1")
+            .expect("release"),
+        BarrierRelease::Released { .. }
+    ));
+    // 负例：不同 action_id → 返回 false（返回值即「是否清除」契约）
+    assert!(
+        !h.router.force_clear_turn_limit(&h.key, "fcx-other"),
+        "非精确匹配必须返回 false"
+    );
+    assert!(
+        h.router.flush_thread(&h.key).await.is_none(),
+        "限制未被误清：fcx-b 仍被 fcx-a 的内存顺序限制闸住"
+    );
+    // 精确匹配 → true，被困的 fcx-b 立即接力
+    assert!(h.router.force_clear_turn_limit(&h.key, "fcx-a"));
+    let out = h.router.flush_thread(&h.key).await.expect("unblocked");
+    assert_eq!(completed(out).action_id, "fcx-b");
 }
 
 // ============================================================
