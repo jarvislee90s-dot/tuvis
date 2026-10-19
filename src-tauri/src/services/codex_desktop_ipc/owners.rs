@@ -32,10 +32,23 @@ pub struct OwnerRegistry {
 impl OwnerRegistry {
     /// 绑定 owner（发现成功后调用）。旧绑定（同 thread 或同 client 旧映射）全部
     /// 失效并向其 validity 信号发 false；generation 单调 +1。epoch 只前进不后退：
-    /// 低于当前 epoch 的 bind（旧连接迟到）存档但不成为 current。
+    /// 低于当前 epoch 的 bind（旧连接迟到）**直接拒绝**——不驱逐现有绑定、不触碰
+    /// 既有 validity 信号、registry epoch 不回退，返回永不生效的死 lease
+    /// （generation=0，过不了任何 current/is_current/validity 校验），调用方经
+    /// adapter 的「换代兜底」按失败重试。（表内没有「存档」条目的读者，存档无意义。）
     pub fn bind(&mut self, key: ThreadKey, client_id: String, epoch: u64) -> OwnerLease {
         if epoch > self.epoch {
             self.epoch = epoch;
+        }
+        if epoch < self.epoch {
+            // 旧连接迟到：保持 current 不变（回归测试
+            // old_epoch_bind_does_not_evict_current_binding 防此路径回潮）。
+            return OwnerLease {
+                key,
+                client_id,
+                epoch,
+                generation: 0,
+            };
         }
         // 旧绑定失效（换代）
         if let Some(old) = self.threads.remove(&key) {
@@ -347,6 +360,39 @@ mod tests {
         let b = r.bind(key("t2"), "owner-b".into(), 1); // 旧 epoch 再次 bind
         assert!(!r.is_current(&b), "epoch=1 ≠ registry.epoch=2");
         assert!(r.current(&key("t2")).is_none());
+    }
+
+    #[test]
+    fn old_epoch_bind_does_not_evict_current_binding() {
+        let mut r = OwnerRegistry::default();
+        // 新连接（epoch=2）先完成 discovery 并绑定
+        r.reset(2);
+        let fresh = r.bind(key("t1"), "owner-a".into(), 2);
+        assert!(r.is_current(&fresh));
+        let mut v = r.validity(&fresh);
+        assert!(*v.borrow_and_update());
+
+        // 旧连接（epoch=1）的迟到 discovery 回执晚于上面的 bind 到达：不得驱逐
+        let stale = r.bind(key("t1"), "owner-a".into(), 1);
+        assert!(!r.is_current(&stale), "拒绝返回的死 lease 永不生效");
+        assert!(
+            !*r.validity(&stale).borrow_and_update(),
+            "死 lease 的 validity 恒 false"
+        );
+        assert_eq!(
+            r.current(&key("t1")),
+            Some(fresh.clone()),
+            "current 仍返回新 epoch 绑定，registry 状态无 epoch 回退"
+        );
+        assert!(
+            *v.borrow_and_update(),
+            "新 lease 的 validity 不得被旧 epoch bind 置 false"
+        );
+        assert_eq!(stale.generation, 0, "拒绝的 bind 不占用 generation");
+
+        // 佐证 registry epoch 仍停在 2：同 epoch 的后续绑定照常生效
+        let other = r.bind(key("t2"), "owner-a".into(), 2);
+        assert!(r.is_current(&other));
     }
 
     #[test]
