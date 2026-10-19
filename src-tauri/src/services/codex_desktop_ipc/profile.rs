@@ -72,7 +72,17 @@ fn method_table() -> BTreeMap<String, u32> {
     ])
 }
 
-/// Windows 基线：command / blocking-input 已实测 PASS，permissions 未实测。
+/// Windows 基线（精确 build `26.1013.3656.0`）：command accept/decline 与 Plan
+/// blocking input 在 **Windows Probe**（2026-10-16 探测批；spec「已验证版本」表登记
+/// 的 Windows build 正是 3656.0）实测 PASS，permissions 未实测 → false。
+///
+/// **`26.1013.4894.0` 有意不登记**（fail-closed）：2026-10-17 实机取证
+/// （`docs/superpowers/reviews/2026-10-17-codex-desktop-ipc-windows-validation-results.md`
+/// §2/§5-F1）真机 MSIX 包版本为 4894.0——transport/windows.rs 改读 MSIX 后装该包的
+/// 机器 `resolve()` 取到 4894.0，`profile_for` **不命中** → closed()（该机器 A 写保守
+/// 关闭）。该 build 的真机闭环属「第二批」，至今 NOT_TRIGGERED，仓内**没有任何
+/// 4894.0 的 PASS 证据**，故只修正注释、不补登记；如何验证新 build 待用户裁决，
+/// 绝不因证据链对齐而顺手放宽版本门。
 fn windows_profile(build: &str) -> ProtocolProfile {
     ProtocolProfile {
         platform: "windows".to_string(),
@@ -169,6 +179,9 @@ mod tests {
         assert!(!p.capabilities.command);
         assert!(!p.capabilities.blocking_input);
         assert!(profile_for("windows", "26.1013.3655.0").is_none());
+        // 4894.0 = 2026-10-17 实机 MSIX 取证值（见 windows_profile 文档）：
+        // 无真机闭环 PASS 证据，fail-closed 不登记——钉死「不因证据链对齐而顺手放宽」
+        assert!(profile_for("windows", "26.1013.4894.0").is_none());
         assert!(profile_for("linux", "26.1013.31256").is_none());
         assert!(profile_for("macos", "").is_none());
         // 已验证 build 精确命中
