@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import QuestionCardApp from "@/mobile/QuestionCardApp";
 import type { QuestionInfoView } from "@/mobile/api";
 
@@ -24,6 +25,10 @@ interface Routes {
 
 let routes: Routes;
 let fetchMock: ReturnType<typeof vi.fn>;
+
+beforeAll(async () => {
+  await i18n.changeLanguage("zh");
+});
 
 beforeEach(() => {
   routes = {};
@@ -209,6 +214,29 @@ describe("QuestionCardApp：APP 形态问答卡（Task 8 · 补投作答）", ()
       "codex 协议通道不可达"
     );
     expect(screen.queryByTestId("question-app-note")).toBeNull();
+  });
+
+  // ===== R8 native_only 接线（2026-10-19 复审：i18n 孤儿键 errors.codexIpcNativeOnly
+  // 的消费点）——后端对 APP 旧问答文本补投无条件 503 阻断，卡内必须显示引导文案
+  // 而不是带机器前缀的 reason 原文 =====
+  it("question_card_app_native_only_refusal_shows_i18n_guidance：503 native_only → 引导文案，不带 CODEX_IPC_NATIVE_ONLY 机器前缀", async () => {
+    installFetch();
+    routes.answerStatus = 503;
+    // 后端 api.rs AppRepost 拒绝臂的真实载荷形状（error/reasonCode/reason 三件套）
+    routes.answer = {
+      error: "capability_unavailable",
+      reasonCode: "native_only",
+      reason:
+        "CODEX_IPC_NATIVE_ONLY: 该 Codex 会话已支持原生远程控制，问答与审批请使用原生卡片（自然语言补投不再受理）",
+    };
+    render(<QuestionCardApp session={{ id: "s1" }} />);
+    fireEvent.click(await screen.findByTestId("question-app-option-0-0"));
+    const err = await screen.findByTestId("question-app-error");
+    // i18n 单点文案（zh 逐字 = errors.codexIpcNativeOnly），机器前缀不直出
+    expect(err.textContent).toBe(
+      "该 Codex 会话已支持原生远程控制，问答与审批请使用原生卡片（自然语言补投不再受理）"
+    );
+    expect(err.textContent).not.toContain("CODEX_IPC_NATIVE_ONLY:");
   });
 
   // ===== 收口 I-1：换题指纹重置（与 CLI 套 F2-1 同款判据）=====

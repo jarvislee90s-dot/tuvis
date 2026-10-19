@@ -13,6 +13,7 @@
 // **APP 词汇表**（设计 §3.7(a)）：渲染输出禁「终端/屏读/按键」。
 import { useCallback, useEffect, useRef, useState } from "react";
 import InteractiveCard from "./InteractiveCard";
+import i18n from "@/i18n";
 // 换题指纹判据与 CLI 套**同源**（收口 I-1）：questionFingerprint 是纯函数
 //（题干 + 选项摘要），抽共享不复制第二份（两处各抄一份迟早漂移——CLI 套的
 // 同款注释引 rollout-2026-09-21 实机事故）
@@ -150,11 +151,17 @@ export default function QuestionCardApp({
         }
       } catch (e) {
         if (e instanceof ApiError) {
-          // app_form_no_repost：无作答文本动作的如实拒（reason 含「清空作答」口径，
-          // 单点来自后端）；其余错误码走与 CLI 套同一份 questionAnswerErrorCopy
-          const reason = e.data?.reason;
-          if (typeof reason === "string") {
-            setError(reason);
+          // R8 native_only（2026-10-17 审计）：Codex APP 旧问答文本补投被后端无条件
+          // 阻断（503 capability_unavailable + reasonCode:native_only）——确定性拒绝，
+          // 重试无意义。展示 i18n 引导文案（errors.codexIpcNativeOnly，与后端
+          // CODEX_IPC_NATIVE_ONLY_REASON 同口径）；不走下方 reason 原文臂——那会
+          // 把「CODEX_IPC_NATIVE_ONLY:」机器前缀直出到用户屏幕。
+          if (e.data?.reasonCode === "native_only") {
+            setError(i18n.t("errors.codexIpcNativeOnly"));
+          } else if (typeof e.data?.reason === "string") {
+            // app_form_no_repost：无作答文本动作的如实拒（reason 含「清空作答」口径，
+            // 单点来自后端）；其余错误码走与 CLI 套同一份 questionAnswerErrorCopy
+            setError(e.data.reason);
           } else {
             setError(questionAnswerErrorCopy(e));
           }
