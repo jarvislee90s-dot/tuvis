@@ -1726,9 +1726,10 @@ pub struct ForceContinueReq {
 /// - 鉴权：gated nest 内层 gate 结构性覆盖 + 属主设备隔离（`get_for_device` 同款——
 ///   非属主/不存在一律 404，不给存在性预言机）；
 /// - 状态机（CAS 安全）：仅解除「屏障在册且已终态」的行（unknown/accepted）；
-///   queued → 409 `queued_use_retract`（指引走既有撤回）；reserved 在飞行有自动路径
-///   （bridge 落账 / 对账）不在本端点范围；屏障已被自动路径解除/从未在册 → 409
-///   `no_barrier`；
+///   queued → 409 `queued_use_retract`（指引走既有撤回）；屏障仍在册但不在本端点
+///   范围（reserved 在飞 fence——bridge 落账 / 对账有自动路径）→ 409
+///   `barrier_in_flight`（复审 Minor：不得谎报 `no_barrier` 误导排障）；屏障已被
+///   自动路径解除/从未在册 → 409 `no_barrier`；
 /// - 幂等：重复调用返回当前状态（200），绝不重复写审计；
 /// - 单调：解除写 `barrier_force_released_at` 标记，全部置屏障写点带同名单调性守卫；
 /// - 审计：解除成功单条 write_audit（action=`force_continue`）；
@@ -1777,12 +1778,23 @@ pub async fn queue_force_continue(
         }
         // 幂等命中：直接返回当前状态（200），零新写入零审计
         BarrierRelease::AlreadyReleased { view, .. } => action_view_response(view),
-        BarrierRelease::NotEligible(view) => {
+        // 不在人工解除范围：按「屏障是否仍在册」区分——在册（reserved 在飞 fence）
+        // 回 barrier_in_flight 如实说明「在册但不在范围」；不在册才是 no_barrier
+        BarrierRelease::NotEligible {
+            view,
+            barrier_in_register,
+        } => {
             if view.state == ActionState::Queued {
                 error_body(
                     StatusCode::CONFLICT,
                     "queued_use_retract",
                     Some("该消息仍在排队，请使用撤回"),
+                )
+            } else if barrier_in_register {
+                error_body(
+                    StatusCode::CONFLICT,
+                    "barrier_in_flight",
+                    Some("屏障在册但该消息派发在飞（有自动落账路径），不在人工解除范围"),
                 )
             } else {
                 error_body(StatusCode::CONFLICT, "no_barrier", None)

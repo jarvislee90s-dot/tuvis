@@ -1725,7 +1725,8 @@ async fn force_continue_releases_unknown_barrier_and_updates_queue_view() {
 }
 
 /// 鉴权与隔离矩阵：非属主设备 404；不存在 404；queued 态 409 queued_use_retract
-/// （指引走既有撤回）；reserved 在飞 409 no_barrier；缺 actionId 400。
+/// （指引走既有撤回）；reserved 无屏障 409 no_barrier；reserved + 在飞 fence
+/// 409 barrier_in_flight（复审 Minor：屏障在册不得谎报 no_barrier）；缺 actionId 400。
 #[tokio::test]
 async fn force_continue_ownership_and_state_machine_matrix() {
     let f = fixture_ipc(vec![codex_app_session(THREAD)]);
@@ -1770,12 +1771,24 @@ async fn force_continue_ownership_and_state_machine_matrix() {
         "queued 行不被触碰（仍可撤）"
     );
 
-    // reserved 在飞（无屏障）→ 409 no_barrier（在飞行有自动路径）
+    // reserved 无屏障（未武装在飞 fence）→ 409 no_barrier（无屏障可解）
     assert!(store.reserve("act-q-1", ControlRoute::DesktopIpc).unwrap());
     let r = force_continue(&f, Some(COOKIE), "act-q-1").await;
     assert_eq!(r.status(), 409);
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
     assert_eq!(v["error"], "no_barrier");
+
+    // reserved + 在飞 fence（屏障在册但不在解除范围）→ 409 barrier_in_flight
+    // （复审 Minor：屏障明明在册，回 no_barrier 会误导排障；reason 说明真实状态）
+    store.set_compat_fence("act-q-1", None, None).unwrap();
+    let r = force_continue(&f, Some(COOKIE), "act-q-1").await;
+    assert_eq!(r.status(), 409);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "barrier_in_flight");
+    assert!(
+        v["reason"].as_str().is_some_and(|s| !s.is_empty()),
+        "barrier_in_flight 携带可读 reason"
+    );
 
     // 缺 actionId → 400
     let r = f

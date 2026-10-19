@@ -154,8 +154,13 @@ pub enum BarrierRelease {
         view: CodexActionView,
         thread_id: String,
     },
-    /// 屏障不在册（queued 应走既有撤回 / 在飞行 / 已被自动路径解除）→ 409
-    NotEligible(CodexActionView),
+    /// 不在人工解除范围 → 409。`barrier_in_register` = 保守屏障仍在册（reserved
+    /// 在飞 fence 等）——与「屏障已被自动路径解除/从未在册」（false）区分开：
+    /// PR #165 复审 Minor，屏障在册却回 `no_barrier` 会误导排障。
+    NotEligible {
+        view: CodexActionView,
+        barrier_in_register: bool,
+    },
 }
 
 fn db_err(e: rusqlite::Error) -> StoreError {
@@ -424,9 +429,13 @@ impl ActionStore {
                         thread_id,
                     })
                 }
-                dao::ForceReleaseRow::NotEligible(row) => Ok(BarrierRelease::NotEligible(
-                    view_of(c, row).map_err(db_err)?,
-                )),
+                dao::ForceReleaseRow::NotEligible(row) => {
+                    let barrier_in_register = row.compat_outstanding;
+                    Ok(BarrierRelease::NotEligible {
+                        view: view_of(c, row).map_err(db_err)?,
+                        barrier_in_register,
+                    })
+                }
             }
         })
     }
