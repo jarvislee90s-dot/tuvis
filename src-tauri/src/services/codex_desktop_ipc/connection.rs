@@ -139,11 +139,19 @@ impl Budget {
         }
     }
     fn release(&self, n: usize) {
-        let _ = self
-            .bytes
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |b| {
-                Some(b.saturating_sub(n))
-            });
+        // 不用 Atomic::fetch_update：新版 Rust 已把它标记为 deprecated，CI 的
+        // `-D warnings` 会直接失败。CAS 循环语义相同，且不依赖版本。
+        let mut cur = self.bytes.load(Ordering::SeqCst);
+        loop {
+            let next = cur.saturating_sub(n);
+            match self
+                .bytes
+                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return,
+                Err(v) => cur = v,
+            }
+        }
     }
 }
 
