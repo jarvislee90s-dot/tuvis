@@ -861,6 +861,47 @@ async fn accepted_when_new_turn_contains_client_message_identity() {
     assert_eq!(v["receipt"]["turnId"], "t-ok");
 }
 
+/// P1 正向延迟路径：正式 userMessage 在回执后 600ms 才进镜像（预检实测
+/// 515–544ms）→ 2s 窗口内仍 Accepted，不得误判 Unknown。
+#[tokio::test]
+async fn delayed_client_identity_within_window_is_accepted() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("延迟身份", Some("act-delay"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "result": { "turn": { "id": "turn-delayed", "status": "inProgress" } } }
+    }))
+    .await;
+    // 超过旧 500ms 窗口、但仍在新 2s 窗口内
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    confirm_client_message_identity(&mut peer, &frame, "turn-delayed", "延迟身份", 8, "owner-1")
+        .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("send in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["receipt"]["delivery"], "accepted");
+    assert_eq!(v["receipt"]["turnId"], "turn-delayed");
+}
+
 /// 忙 Thread（快照 active）→ codex_queued + position（宪法 R2.3 留队）。
 #[tokio::test]
 async fn send_busy_thread_queues_with_position() {

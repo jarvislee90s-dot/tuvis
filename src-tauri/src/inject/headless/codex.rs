@@ -942,9 +942,13 @@ pub async fn run_turn(
     let started = Instant::now();
     // 入口复核：每次真实派发都重新核授权（不是只在 HTTP 入口核一次）
     if let Some(reason) = args.gate.and_then(|g| g()) {
+        let planned = match plan {
+            Plan::Queue { .. } => PlanKind::Queue,
+            Plan::ExecResume { .. } => PlanKind::ExecResume,
+        };
         return TurnOutcome {
             receipt: Receipt::failed(Stage::Refused, &reason).with_session(args.sid),
-            plan_used: PlanKind::Queue,
+            plan_used: planned,
             diverted: false,
             receipt_source: ReceiptSource::NotApplicable,
             compat_evidence: CompatEvidence::default(),

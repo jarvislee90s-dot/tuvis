@@ -761,9 +761,10 @@ impl DesktopDispatch for AdapterDispatch {
                     // 出现，忙态回显它时 ID 同样「新」。必须等该 Turn 里出现
                     // `userMessage.clientId == 本次 cmid` 的正式消息；`params.input`
                     // 是请求回显，不作送达证据。有界等待状态帧（正常路径通常先于
-                    // 回执到达）；等不到就按 Unknown 保守处理。
+                    // 回执到达；预检实测正式 userMessage 后到 515–544ms，窗口取 2s，
+                    // 避免正常发送成批误判 Unknown）；等不到才按 Unknown 保守处理。
                     let mut verified = false;
-                    for _ in 0..21 {
+                    for _ in 0..81 {
                         if adapter.turn_has_client_message(&key, &turn_id, &cmid).await {
                             verified = true;
                             break;
@@ -1549,14 +1550,11 @@ fn supersedes(buffered: &ThreadProjection, snap: &ThreadProjection) -> bool {
     }
     if buffered.stale != snap.stale {
         if buffered.stale {
-            // stale = 当前视图**失效**（断线/丢帧）——相同 revision 也必须送达，
-            // 否则手机停在旧的可控状态（2026-10-20 复审 P2）。更旧 revision 的
-            // stale 仍是旧事件，不能覆盖更新鲜的快照。
-            return match (buffered.revision, snap.revision) {
-                (Some(b), Some(s)) => b >= s,
-                (Some(_), None) => true,
-                _ => false,
-            };
+            // stale = 当前视图**失效**（断线/丢帧/invalidate）——必须送达，否则
+            // 手机停在旧的可控状态（2026-10-20 复审 P2）。含 revision=None 的
+            // invalidate（无旧内容，只把下游标成 stale，保守优先于假可控）；
+            // 后续更高 revision 恢复。
+            return true;
         }
         // 恢复：只有更高 revision（或快照无 revision）证明世界已更新才允许清除
         // stale；同 revision 的「非 stale」不能证明任何新数据。
@@ -2339,13 +2337,14 @@ mod startup_merge_tests {
 
     /// stale 事件不得覆盖新鲜快照；无 revision 的 stale 也不得排在其后。
     #[test]
-    fn stale_buffered_does_not_override_fresh_snapshot() {
+    fn stale_buffered_is_delivered_not_dropped() {
         let snap = p("t", 1, 1, Some(5), false);
-        // 2026-10-20 复审 P2：stale 是**失效信号**——更高/同 revision 必须送达；
-        // 只有更旧 revision（或无 revision）的 stale 不能覆盖新鲜快照。
+        // 2026-10-20 复审 P2：stale 是**失效信号**——同/更高 revision 必达；
+        // revision=None 的 invalidate 同样必达（无内容，只把下游标成 stale）。
         assert!(supersedes(&p("t", 1, 1, Some(6), true), &snap));
         let merged = merge_startup_buffer(&k("t"), snap, vec![p("t", 1, 1, None, true)]);
-        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.len(), 2, "不能丢弃断线/invalidate 事件");
+        assert!(merged[1].stale);
     }
 
     /// P1：回执 Turn 关联判定——派发前已存在的旧 Turn 必须拒绝；缺 turnId 保守拒绝。
