@@ -379,6 +379,131 @@ pub fn init(conn: &Connection) {
             last_seen_at      INTEGER NOT NULL,
             PRIMARY KEY (source_id, session_id)
         );
+        -- 计费配置 v2（用量看板 V2 Task 3）：当前有效配置 + 每次提交的历史快照。
+        -- 撤销不删除历史，而是以新 revision 再追加一条快照；state 只保留 singleton=1 的当前版本。
+        CREATE TABLE IF NOT EXISTS usage_billing_state (
+            singleton   INTEGER PRIMARY KEY CHECK(singleton=1),
+            revision    INTEGER NOT NULL,
+            config_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS usage_billing_revision (
+            revision     INTEGER PRIMARY KEY,
+            committed_at INTEGER NOT NULL,
+            config_json  TEXT NOT NULL
+        );
+        -- 公开价格快照（Task 8）：active 指针 + 内容/获取时间；关闭仍保留最后有效快照。
+        -- 价格只落在 tuvis.db，不创建临时价格文件。
+        CREATE TABLE IF NOT EXISTS usage_pricing_state (
+            singleton          INTEGER PRIMARY KEY CHECK(singleton=1),
+            enabled            INTEGER NOT NULL DEFAULT 0,
+            active_snapshot_id TEXT,
+            last_error         TEXT
+        );
+        CREATE TABLE IF NOT EXISTS usage_pricing_snapshot (
+            id           TEXT PRIMARY KEY,
+            source_url   TEXT NOT NULL,
+            fetched_at   INTEGER NOT NULL,
+            payload_json TEXT NOT NULL
+        );
+        -- 原生人民币价格（2026-10-20 用户裁决）：刷新时从 models.dev 源 TOML 的
+        -- `# List price: CNY …` / `# CNY per 1M tokens …` / `# input ¥…` 注释解析。
+        -- 一条 = 某快照下某目录条目的人民币四价；`*_scaled` 单位 10^-9 CNY / 百万 Token。
+        -- 只存**明确写出的**人民币价；没有的人民币价由费用查询按当日汇率换算并标 converted。
+        CREATE TABLE IF NOT EXISTS usage_pricing_native (
+            snapshot_id         TEXT NOT NULL,
+            provider_id         TEXT NOT NULL,
+            model_id            TEXT NOT NULL,
+            normalized_model_id TEXT NOT NULL,
+            currency            TEXT NOT NULL CHECK(currency = 'CNY'),
+            input_scaled        INTEGER,
+            cache_read_scaled   INTEGER,
+            cache_write_scaled  INTEGER,
+            output_scaled       INTEGER,
+            source_url          TEXT NOT NULL,
+            fetched_at          INTEGER NOT NULL,
+            PRIMARY KEY (snapshot_id, provider_id, model_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_pricing_native_normalized
+            ON usage_pricing_native(snapshot_id, normalized_model_id);
+        -- 当日汇率（2026-10-20 用户裁决）：与价格快照同生命周期保存 USD→CNY；
+        -- `rate_scaled` 单位 10^-9 CNY / USD。缺失时费用层回退 cached/default 并标注。
+        CREATE TABLE IF NOT EXISTS usage_pricing_fx (
+            snapshot_id TEXT PRIMARY KEY,
+            rate_scaled INTEGER NOT NULL,
+            fetched_at  INTEGER NOT NULL,
+            source_url  TEXT NOT NULL
+        );
+        -- Provider 别名（用量看板 V2 Task 2）：非空 provider 按原始串精确映射；
+        -- 空 provider 按「工具 + 原始模型」逐条指派（model_id 可为空串 = 该工具的未知模型）。
+        -- 别名只影响展示/分组，绝不回写账本 observedProvider，也不参与 billing revision。
+        CREATE TABLE IF NOT EXISTS usage_provider_alias (
+            id           TEXT PRIMARY KEY,
+            kind         TEXT NOT NULL CHECK(kind IN ('provider','toolModel')),
+            provider_raw TEXT,
+            source_id    TEXT,
+            model_id     TEXT,
+            display_name TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            CHECK (
+                (kind = 'provider' AND provider_raw IS NOT NULL AND provider_raw <> ''
+                 AND source_id IS NULL AND model_id IS NULL)
+                OR
+                (kind = 'toolModel' AND provider_raw IS NULL
+                 AND source_id IS NOT NULL AND model_id IS NOT NULL)
+            )
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_provider_alias_provider
+            ON usage_provider_alias(provider_raw) WHERE provider_raw IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_provider_alias_tool_model
+            ON usage_provider_alias(source_id, model_id) WHERE provider_raw IS NULL;
+        -- 手动覆盖价（V2 Task 3 / 2026-10-20 增加币种）：按归一化模型 ID 全局生效，
+        -- 四价逐项可空（至少一项）。`*_scaled` 单位 = 10^-9 `currency` / 百万 Token；
+        -- 刷新流程只写快照/状态表，绝不触碰本表。
+        CREATE TABLE IF NOT EXISTS usage_price_override (
+            normalized_model_id TEXT PRIMARY KEY,
+            currency            TEXT NOT NULL DEFAULT 'USD' CHECK(currency IN ('USD','CNY')),
+            input_scaled        INTEGER,
+            cache_read_scaled   INTEGER,
+            cache_write_scaled  INTEGER,
+            output_scaled       INTEGER,
+            updated_at          INTEGER NOT NULL,
+            CHECK (
+                input_scaled IS NOT NULL OR cache_read_scaled IS NOT NULL
+                OR cache_write_scaled IS NOT NULL OR output_scaled IS NOT NULL
+            ),
+            CHECK (
+                (input_scaled IS NULL OR input_scaled >= 0)
+                AND (cache_read_scaled IS NULL OR cache_read_scaled >= 0)
+                AND (cache_write_scaled IS NULL OR cache_write_scaled >= 0)
+                AND (output_scaled IS NULL OR output_scaled >= 0)
+            )
+        );
+        -- 模型条目配置（2026-10-20 计划 §2.1）：自定义模型显示名 + 计价身份覆盖。
+        -- 按**观测身份**存储：非空 provider 用 (provider_raw, model_raw)（source_id 为 NULL，跨工具生效）；
+        -- 空 provider 条目用 (source_id, model_raw)（provider_raw 为空串）。展示键（显示供应商, 原始模型）
+        -- 在读取时经 usage_provider_alias 解析派生——别名改名/删除不需要迁移本表。
+        -- display_name 为 NULL = 未自定义（显示原始模型名）；pricing_* 成对为 NULL = 未覆盖
+        -- （走高级规则/自动匹配）。id 由服务层按身份确定性派生（主键冲突 = 身份冲突）。
+        CREATE TABLE IF NOT EXISTS usage_model_config (
+            id               TEXT PRIMARY KEY,
+            provider_raw     TEXT NOT NULL,
+            source_id        TEXT,
+            model_raw        TEXT NOT NULL,
+            display_name     TEXT,
+            pricing_provider TEXT,
+            pricing_model    TEXT,
+            updated_at       INTEGER NOT NULL,
+            CHECK (
+                (provider_raw <> '' AND source_id IS NULL)
+                OR (provider_raw = '' AND source_id IS NOT NULL)
+            ),
+            CHECK ((pricing_provider IS NULL) = (pricing_model IS NULL)),
+            CHECK (pricing_provider IS NULL OR (pricing_provider <> '' AND pricing_model <> ''))
+        );
+        -- SQLite 表级 PRIMARY KEY 不折叠 NULL：必须用表达式唯一索引锁身份键。
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_model_config_identity
+            ON usage_model_config(provider_raw, COALESCE(source_id, ''), model_raw);
         "#,
     )
     .expect("Failed to initialize database schema");

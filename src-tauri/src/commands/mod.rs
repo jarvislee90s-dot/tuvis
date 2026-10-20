@@ -18,6 +18,8 @@ pub mod settings;
 pub mod skill;
 // 用量域（计划① Task 20）：6 条查询/设置命令（按字母序排在 skill 之后）
 pub mod usage;
+// 用量看板 V2（Task 5）：身份 / Token / 计费配置命令
+pub mod usage_v2;
 // 升级检查（prerelease 渠道）：GitHub 发现层 + 动态端点安装 + 临时残留清理
 pub mod updater;
 

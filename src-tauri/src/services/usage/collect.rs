@@ -1532,11 +1532,13 @@ mod tests {
     /// 历史与完整理由见 `crate::services::usage::self_lock` 的模块文档；这里只留**本锁**要用的：
     /// * 判据面 = `self_lock::scan_face(文件名, 源码)` = 文件头 → **排除区 BEGIN** 之前，
     ///   **加上** END 之后 → 文件尾（去行内空白、剥**整行** `//` 注释）；
-    /// * 24 个文件**每个都必须恰好一对标记**：**20 个有测试模块**的文件把标记**包住测试模块**
-    ///   （BEGIN 在 `#[cfg(test)]` 前一行、END 在测试模块收口 `}` 之后）；**4 个无测试模块**的文件
-    ///   （`caps.rs` / `delta.rs` / `model.rs` / `settings.rs`）把两行**相邻**放在文件
-    ///   末尾 ⇒ 排除区为空、**整文件都在面内**（第 6 轮：`mod.rs` 因新增 `self_lock_tests`
-    ///   由空区转为测试模块区）；**分类由 `usage_source_scan_covers_every_file_on_disk` 机械钉住（20/4）**；
+    /// * 34 个文件**每个都必须恰好一对标记**：**28 个有测试模块**的文件把标记**包住测试模块**
+    ///   （BEGIN 在 `#[cfg(test)]` 前一行、END 在测试模块收口 `}` 之后）；**6 个无测试模块**的文件
+    ///   （`caps.rs` / `delta.rs` / `model.rs` / `settings.rs` / `v2/model.rs` / `v2/mod.rs`）
+    ///   把两行**相邻**放在文件末尾 ⇒ 排除区为空、**整文件都在面内**（第 6 轮：`mod.rs` 因新增
+    ///   `self_lock_tests` 由空区转为测试模块区；第 42 轮：`v2/model_config.rs` 以**测试模块区**
+    ///   形态入面）；**分类由
+    ///   `usage_source_scan_covers_every_file_on_disk` 机械钉住（28/6）**；
     /// * 标记缺失 / 重复 / 顺序反了 / 面为空 ⇒ `scan_face` **panic**（响亮失败，不许静默退化）。
     ///
     /// **为什么不再用「锚点 + 大括号配平到 EOF」**：那是**用文本启发式推断 Rust 结构**，五轮里
@@ -1568,14 +1570,20 @@ mod tests {
     ///
     /// **扫描面 / 判据层级 / 反例**（台账 C-【Important-1】的登记原文，此处为权威副本；
     /// **第 5 轮按「显式哨兵」口径重写**）：
-    /// * **扫描面** = `USAGE_SOURCES` 全部 **24** 个文件（与磁盘**逐一相等**见
+    /// * **扫描面** = `USAGE_SOURCES` 全部 **34** 个文件（与磁盘**逐一相等**见
     ///   `usage_source_scan_covers_every_file_on_disk`）的**判据面**（`self_lock::scan_face`：
     ///   文件头 → BEGIN 之前 **∪** END 之后 → 文件尾；去行内空白、剥**整行** `//` 注释）。
-    ///   **实测（24 个文件逐一对账）**：20 个有测试模块的文件 = **生产半边**（标记包住测试模块）、
-    ///   4 个无测试模块的文件 = **整文件**（两行标记相邻于末尾 ⇒ 排除区为空）；
-    ///   判据面合计 = **7241 行 / 156998 字符**（PR #158 四轮同步，见 `scan_face_size_is_pinned`；
+    ///   **实测（34 个文件逐一对账）**：28 个有测试模块的文件 = **生产半边**（标记包住测试模块）、
+    ///   6 个无测试模块的文件 = **整文件**（两行标记相邻于末尾 ⇒ 排除区为空）；
+    ///   判据面合计 = **11506 行 / 255773 字符**（第 40 轮手工测试回归，见
+    ///   `scan_face_size_is_pinned`；相对第 39 轮 +20 行 / +446 字符，变化来自
+    ///   `v2/cost.rs` 的 `safe_components_output_only` 与 `v2/cost_query.rs` 的 dsh 日档
+    ///   output-only 分支；文件数与 27/6 分类未变、排除区标记未动。第 39 轮为
+    ///   11486 行 / 255327 字符（+12 行 / +263 字符：`parse_catalog_rate` 目录坏费率逐条
+    ///   降级），第 38 轮为 11474 行 / 255064 字符（+65 行 / +1743 字符：
+    ///   `PricingCatalogEntry`、下载超时与目录搜索入口），第 37 轮 11409/253321。
     ///   第 4 轮口径曾报 191434 字符：那 8 个「整文件扫描」
-    ///   的文件把测试代码也算进去了。本轮的"面"更小但**更准**——20 个文件 = 生产半边、4 个无测试
+    ///   的文件把测试代码也算进去了。本轮的"面"更小但**更准**——26 个文件 = 生产半边、6 个无测试
     ///   模块的文件 = 整文件，且 **END 之后追加的生产代码也在面内**。数字同步写进本批 commit
     ///   message 与 `FINAL-FIX-report.md`，并由 `scan_face_size_is_pinned` **逐字钉住**）。
     /// * **枚举口径**（B-1）：`usage_source_scan_covers_every_file_on_disk` 递归枚举该目录下的
@@ -1584,7 +1592,7 @@ mod tests {
     ///   把生产代码挂到 `services/usage/**` 之外**（B-2：与 `include!` 同族，**只登记不解析**——
     ///   真去解析 `#[path]` 会引出无穷的逃逸面）。
     /// * **判据层级** = **名字级**（针是 API 名 / 函数名形态，**不是行为性质**）。
-    /// * **正向断言的作用域 = 24 个文件判据面的拼接串（并集语义，B-4）**：`hour_key_of_host(` /
+    /// * **正向断言的作用域 = 33 个文件判据面的拼接串（并集语义，B-4）**：`hour_key_of_host(` /
     ///   `day_key_of_host(` / `tz_name` 只要**任一**文件面内有即过 ⇒「删掉某个文件的全部调用点」
     ///   **不会变红**（单文件级存在性没有被钉住；要钉得分文件断言——本批按现状**只登记不改**）。
     /// * **反例（抓不到的回归）** = ①换名字重造带 tz 的键函数（如 `bucket_of(ts, tz)`）；
@@ -1732,9 +1740,9 @@ mod tests {
         );
     }
 
-    /// 自省锁的**扫描面**：`services/usage/**/*.rs` **全部 24 个文件**。
-    /// 与磁盘**逐一对账**见 `usage_source_scan_covers_every_file_on_disk`（防第 25 个文件静默逃逸）。
-    const USAGE_SOURCES: [(&str, &str); 24] = [
+    /// 自省锁的**扫描面**：`services/usage/**/*.rs` **全部 36 个文件**。
+    /// 与磁盘**逐一对账**见 `usage_source_scan_covers_every_file_on_disk`（防第 37 个文件静默逃逸）。
+    const USAGE_SOURCES: [(&str, &str); 36] = [
         ("caps.rs", include_str!("caps.rs")),
         ("collect.rs", include_str!("collect.rs")),
         ("collectors/claude.rs", include_str!("collectors/claude.rs")),
@@ -1765,6 +1773,18 @@ mod tests {
         ("semantics.rs", include_str!("semantics.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("stream.rs", include_str!("stream.rs")),
+        ("v2/billing.rs", include_str!("v2/billing.rs")),
+        ("v2/channel.rs", include_str!("v2/channel.rs")),
+        ("v2/cost.rs", include_str!("v2/cost.rs")),
+        ("v2/cost_query.rs", include_str!("v2/cost_query.rs")),
+        ("v2/currency.rs", include_str!("v2/currency.rs")),
+        ("v2/identity.rs", include_str!("v2/identity.rs")),
+        ("v2/model.rs", include_str!("v2/model.rs")),
+        ("v2/model_config.rs", include_str!("v2/model_config.rs")),
+        ("v2/mod.rs", include_str!("v2/mod.rs")),
+        ("v2/native_price.rs", include_str!("v2/native_price.rs")),
+        ("v2/pricing.rs", include_str!("v2/pricing.rs")),
+        ("v2/query.rs", include_str!("v2/query.rs")),
     ];
 
     /// **面尺寸钉子（第 7 轮 C-1）**：把「判据面 = N 行 / M 字符」这个数字**逐字钉住**。
@@ -1773,6 +1793,18 @@ mod tests {
     /// `self_lock` 就陈旧了，且**没有任何用例会发现**）。数字变了 = **判据面变了**，
     /// 必须同步本常量、锁注释、台账与报告 —— 这是「**声明 = 实际**」的机械版。
     /// 口径：`chars().count()`（**Unicode 标量 / 字符**，不是字节；与历次报告口径一致）。
+    ///
+    /// **第 46 轮同步（2026-10-20 原生人民币价/当日汇率）**：12422/277406 →
+    /// **13447/301286**（+1025 行 / +23880 字符）。变化来自新增 `v2/native_price.rs`、
+    /// `v2/currency.rs` 与 `v2/{model,cost_query,pricing,mod}.rs` 的生产半边；两个新文件
+    /// 都有测试模块 ⇒ 分类 28/6 → **30/6**，扫描面 34 → **36** 文件。后续 clippy 修正
+    /// （`#[allow(too_many_arguments)]`、`needless_range_loop`、`needless_question_mark`）
+    /// 与「单分量 FX 溢出降级」修复已并入该轮钉子。
+    ///
+    /// **第 47 轮同步（2026-10-20 第三轮配置内嵌化）**：13447/301286 →
+    /// **13451/301445**（+4 行 / +159 字符）。变化全部来自
+    /// `v2/model.rs` 的 `ObservedModelEntry.normalized_model_id` 字段与
+    /// `v2/model_config.rs` 的 `normalize_model_id` 填充；新增测试在排除区内 ⇒ 不进面。
     ///
     /// **第 8 轮同步（Task 16 Step 3，2026-10-03 真机数据隔离守卫）**：6870/148415 →
     /// **6896/149006**（+26 行 / +591 字符）。变化**全部来自 `collect()` 与 `run_collection()`
@@ -1865,6 +1897,170 @@ mod tests {
     ///
     /// **PR #158 四轮同步**：7238/156598 → **7241/156998**。用量固定 detail 英文化
     /// （含 ledger::internal）；dsh 的 format! 经 rustfmt 展开增加 3 行，排除区未移动。
+    ///
+    /// **第 26 轮同步（2026-10-18 V2 定价引用校验）**：9972/218543 →
+    /// **10014/219561**。`billing.rs` 新增 candidate pricingRules 的 active catalog 校验
+    /// （文件数与 26/6 分类不变）。
+    ///
+    /// **第 27 轮同步（2026-10-19 PR #170 评审修复）**：10014/219561 →
+    /// **10078/220847**。`v2/pricing.rs` 新增进程级目录缓存与 `RawValue` 费率解析
+    /// （去掉 crate 级 `arbitrary_precision`），`v2/cost_query.rs` 目录类型改为 `Arc`；
+    /// 文件数与 26/6 分类不变，排除区标记未动。
+    ///
+    /// **第 28 轮同步（2026-10-19 PR #170 评审修复二批）**：10078/220847 →
+    /// **10120/221775**。`v2/pricing.rs` 刷新链路重构为共享内核 `run_refresh` +
+    /// `RefreshHost` trait（测试内核与生产入口共享，fetch 与 emit 注入）；
+    /// 文件数与 26/6 分类不变，排除区标记未动。
+    ///
+    /// **第 29 轮同步（2026-10-19 Task 1 wire 契约扩展）**：10120/221775 →
+    /// **10213/224043**（+93 行 / +2268 字符）。变化**只来自 `v2/model.rs`**（空排除区 ⇒
+    /// 整文件在判据面内）：新增 `ChannelKind` / `ProviderAliasKind` / `ProviderAliasRule` /
+    /// `ProviderAliasConfig` / `ChannelOption` / `PriceOverrideRequest` / `PriceOverrideView`，
+    /// 扩展 `DistributionRow` 的渠道/模型字段与 `CostRow` 的渠道/覆盖价字段，并追加
+    /// `PricingBasis::UserOverride`。文件数仍为 32、26/6 分类不变，排除区标记未动。
+    ///
+    /// **第 30 轮同步（2026-10-19 Task 2 provider 别名与渠道解析）**：10213/224043 →
+    /// **10506/230806**（+293 行 / +6763 字符）。变化来自：
+    ///   * 新增 `v2/channel.rs` 的生产半边（`ChannelResolver` / `resolve_channel` /
+    ///     `join_key` / 校验与配置服务）——测试模块落在排除区内，不进面；
+    ///   * `v2/mod.rs` 新增 `pub mod channel;` 与模块文档；
+    ///   * `services/usage/mod.rs` 自省锁文档的 32→33、26/6→27/6 同步（该文件的面在
+    ///     BEGIN 之前，文档改动会进面）。
+    ///     文件数 32→33（`USAGE_SOURCES`）、分类 26/6→**27/6**；排除区标记未动。
+    ///
+    /// **第 31 轮同步（2026-10-19 Task 3 定价归一化、目录去重与手动覆盖）**：
+    /// 10506/230806 → **11024/241840**（+518 行 / +11034 字符）。变化**只来自 `v2/pricing.rs`
+    /// 生产半边**：`normalize_model_id` 与尾部剥离辅助、`NormalizedQuote` / `normalized` 索引、
+    /// release_date 去重比较、`match_model` 前缀回退、`apply_override`、覆盖价 DAO 服务入口与
+    /// `rate_string`；新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面。文件数仍为 33、
+    /// 27/6 分类与排除区标记均未动。
+    ///
+    /// **第 32 轮同步（2026-10-19 Task 4 Token 查询层接入显示渠道）**：
+    /// 11024/241840 → **11115/244751**（+91 行 / +2911 字符）。变化来自：
+    ///   * `v2/query.rs` 生产半边：分布改用解析后的显示渠道（`ChannelResolver` /
+    ///     `resolve_channel`）、模型维度按渠道键/工具拆行、趋势筛选改渠道键、
+    ///     新增 `channel_options_with_conn` 与生产入口；
+    ///   * `v2/channel.rs` 删除 Task 2 遗留的 `#[allow(dead_code)]` 豁免（解析器已接入）。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 33、
+    ///     27/6 分类与排除区标记均未动。
+    ///
+    /// **第 33 轮同步（2026-10-19 Task 5 费用查询接入自动定价与渠道行）**：
+    /// 11115/244751 → **11310/250553**（+195 行 / +5802 字符）。变化来自：
+    ///   * `v2/cost_query.rs` 生产半边：按显示渠道/原始模型拆分费用行、渠道解析接入、
+    ///     手动覆盖 > 用户规则 > 归一化自动匹配（含前缀歧义 reason）、行键扩展、
+    ///     CSV 追加渠道/来源/覆盖列；
+    ///   * `v2/pricing.rs` 新增 `load_effective_overrides_with_conn`（覆盖价一次性加载）。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 33、
+    ///     27/6 分类与排除区标记均未动。
+    ///
+    /// **第 34 轮同步（2026-10-19 Task 6 IPC/前端数据层）**：
+    /// 11310/250553 → **11333/251182**（+23 行 / +629 字符）。变化仅来自
+    /// `v2/pricing.rs` 新增覆盖价生产入口（`overrides` / `set_override` / `delete_override`
+    /// 及 `db_lock_failed` 辅助）——命令层仍不取锁；文件数仍为 33、
+    /// 27/6 分类与排除区标记均未动。
+    ///
+    /// **第 35 轮同步（2026-10-19 PR #170 增量复审修复）**：11333/251182 →
+    /// **11390/252622**（+57 行 / +1440 字符）。变化来自本批生产代码：
+    ///   * `v2/model.rs`：`DistributionRow` / `CostRow` 各新增 `observed_providers` 字段，
+    ///     `observed_provider` 语义收紧（空区文件 ⇒ 整文件在面内）；
+    ///   * `v2/query.rs`：分布分组累计空 provider 标记并按「唯一且无空行」收紧兼容字段；
+    ///   * `v2/cost_query.rs`：费用分组累计去重原始 provider 并写入行；
+    ///   * `v2/pricing.rs`：`is_noise_token` 移除裸数字、`is_noise_suffix` 保留日期/版本形态，
+    ///     前缀同价判定纳入 `conditional`；
+    ///   * `v2/channel.rs`：upsert 服务边界 trim `provider` / `displayName`。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 33、
+    ///     27/6 分类与排除区标记均未动。
+    ///
+    /// **第 36 轮同步（2026-10-19 PR #170 残留 P2-R1 修复）**：11390/252622 →
+    /// **11407/253250**（+17 行 / +628 字符）。变化来自：
+    ///   * `v2/model.rs`：`CostRow` 新增 `has_empty_provider`；
+    ///   * `v2/cost_query.rs`：费用分组累计空 provider 标记、按「唯一且无空行」收紧
+    ///     `identity.observed_provider`、CSV 单值列留空规则；
+    ///   * `v2/pricing.rs`：`is_date_noise` 的月/日范围与 `parse_release_date` 对齐。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 33、
+    ///     27/6 分类与排除区标记均未动。
+    ///
+    /// **第 37 轮同步（2026-10-19 最终复核 P2：C 卡未标注来源提示）**：11407/253250 →
+    /// **11409/253321**（+2 行 / +71 字符）。变化**只来自生产半边**：
+    ///   * `v2/model.rs`：`DistributionRow` 新增 `has_empty_provider`（空排除区 ⇒ 整文件在面内）；
+    ///   * `v2/query.rs`：分布分组标记写入 wire 行。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 33、
+    ///     27/6 分类与排除区标记均未动。
+    ///
+    /// **第 38 轮同步（2026-10-19 手工测试回归：定价下载超时 + 目录搜索）**：
+    /// 11409/253321 → **11474/255064**（+65 行 / +1743 字符）。变化**只来自生产半边**：
+    ///   * `v2/model.rs`：新增 `PricingCatalogEntry`（参考 API 模型下拉搜索的 wire 类型）；
+    ///   * `v2/pricing.rs`：下载超时拆成 `connect_timeout(10s)` + 总 `timeout(120s)`、
+    ///     上限判据抽成 `ensure_payload_within_limit`，并新增
+    ///     `catalog_entries_with_conn` / `catalog_entries` 搜索入口。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 33、
+    ///     27/6 分类与排除区标记均未动。
+    ///
+    /// **第 39 轮同步（2026-10-19 手工测试回归：目录坏费率逐条降级）**：
+    /// 11474/255064 → **11486/255327**（+12 行 / +263 字符）。变化**只来自生产半边**：
+    ///   * `v2/pricing.rs`：新增 `parse_catalog_rate`（>9 位小数的上游 f64 噪声截断到
+    ///     9 位，其余非法形态返回 None），`parse_catalog` 遇单条坏费率只将该分量标为
+    ///     未估价并记录 warning，不再拒绝整个目录。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 33、
+    ///     27/6 分类与排除区标记均未动。
+    ///
+    /// **第 40 轮同步（2026-10-19 手工测试回归：dsh 日档 output-only 计价）**：
+    /// 11486/255327 → **11506/255773**（+20 行 / +446 字符）。变化**只来自生产半边**：
+    ///   * `v2/cost.rs`：新增 `safe_components_output_only`（dsh 日档只给 output，
+    ///     输入/缓存桶保持未估价），并更新模块/`basis_trusted` 的安全依据注释；
+    ///   * `v2/cost_query.rs`：`calculate_row` 增加 dsh 日档 output-only 的 safe 分量选择，
+    ///     并对该形态追加 `untrustedInputBuckets` reason。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 33、
+    ///     27/6 分类与排除区标记均未动。
+    ///
+    /// **第 41 轮同步（2026-10-20 配置与费用表重构 Task 1 wire 契约）**：
+    /// 11506/255773 → **11570/257450**（+64 行 / +1677 字符）。变化**只来自生产半边**：
+    ///   * `v2/model.rs`（空排除区 ⇒ 整文件在面内）：新增 `ObservedModelEntry` /
+    ///     `ModelDisplayNameRequest` / `PricingIdentityRequest` / `PricingCatalogSearch` /
+    ///     `PricingQuotePreview` / `PricingAutoMatch`，`PricingCatalogEntry` 追加
+    ///     `curated_kind`、`CostRow` 追加 `display_model_name`；
+    ///   * `v2/pricing.rs`：`catalog_entries_with_conn` 的条目构造补 `curated_kind: None`
+    ///     （T3 作用域搜索接管分类）；
+    ///   * `v2/cost_query.rs`：`CostRow` 构造补 `display_model_name: None`
+    ///     （T4 分组阶段接管解析）。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 33、
+    ///     27/6 分类与排除区标记均未动。
+    ///
+    /// **第 42 轮同步（2026-10-20 配置与费用表重构 Task 2 模型配置服务）**：
+    /// 11570/257450 → **11917/265531**（+347 行 / +8081 字符）。变化来自：
+    ///   * **新文件 `v2/model_config.rs`**（生产半边进面，测试模块在排除区内）：
+    ///     观测身份、观察条目聚合、别名解析接入、显示名/计价身份的校验与读改写；
+    ///   * `v2/channel.rs`：新增 `display_provider_of`（观察条目的别名解析，
+    ///     不触 billing attribution）。
+    ///     文件数 33→**34**（`USAGE_SOURCES` 新增 `("v2/model_config.rs", …)`）、
+    ///     分类 27/6→**28/6**（新文件带测试模块区）；排除区标记未动。
+    ///
+    /// **第 45 轮同步（2026-10-20 配置与费用表重构 Task 5 IPC 服务入口）**：
+    /// 12393/276678 → **12422/277406**（+29 行 / +728 字符）。变化**只来自
+    /// `v2/pricing.rs` 生产半边**：精选目录/价格预览/自动匹配的生产入口
+    /// （`catalog_search_scoped` / `quote_preview` / `auto_match`，短锁形态与
+    /// 覆盖价入口同款）。新增测试落在集成文件 ⇒ 不进面；文件数仍为 34、
+    /// 28/6 分类与排除区标记均未动。
+    ///
+    /// **第 44 轮同步（2026-10-20 配置与费用表重构 Task 4 明细聚合计费）**：
+    /// 12126/270560 → **12393/276678**（+270 行 / +6119 字符）。变化**只来自生产半边**：
+    ///   * `v2/cost_query.rs`：`CostBucketProvenance` / `cost_snapshot_with_conn`
+    ///     （Detail/Daily 覆盖检测与整段回退）、`load_detail_daily_rows`（明细按日聚合）、
+    ///     `calculate_row` 的 provenance 可信判据、`resolve_row_pricing` 第 3 级计价身份
+    ///     覆盖、`GroupAcc.display_model_names` 与 `CostRow.display_model_name` 解析；
+    ///   * `v2/model_config.rs`：新增 `RowConfigIndex`（行级配置一次性加载）。
+    ///     新增测试全部落在 BEGIN..END 排除区内/集成文件 ⇒ 不进面；文件数仍为 34、
+    ///     28/6 分类与排除区标记均未动。
+    ///
+    /// **第 43 轮同步（2026-10-20 配置与费用表重构 Task 3 精选来源）**：
+    /// 11917/265531 → **12126/270560**（+208 行 / +5029 字符）。变化**只来自生产半边**：
+    ///   * `v2/pricing.rs`：精选常量与 `curated_kind_of` / `is_curated`、`MatchScope`、
+    ///     `PriceCatalog.normalized_curated` / `provider_count`（解析期精选索引）、
+    ///     `match_model_scoped`（原 `match_model` 重构为索引参数化）、
+    ///     `catalog_search_scoped_with_conn` / `quote_preview_with_conn` / `auto_match_with_conn`；
+    ///   * `v2/cost_query.rs`：自动匹配固定 `MatchScope::Curated`。
+    ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 34、
+    ///     28/6 分类与排除区标记均未动。
     #[test]
     fn scan_face_size_is_pinned() {
         let (mut lines, mut chars) = (0usize, 0usize);
@@ -1875,7 +2071,7 @@ mod tests {
         }
         assert_eq!(
             (lines, chars),
-            (7241, 156998),
+            (13451, 301445),
             "判据面尺寸变了（实测 {lines} 行 / {chars} 字符）：本用例是**声明 = 实际**的钉子——\
              先弄清面为什么变（新增文件？改了排除区标记？动了生产代码？），再同步本常量、\
              `no_source_timezone_is_fed_into_any_key_function` 的锁注释、`KNOWN-PLAN-DEFECTS.md` \
@@ -1884,7 +2080,7 @@ mod tests {
     }
 
     /// **A 段第 2 条（P1-1 收尾）**：硬编码的扫描面数组必须与磁盘**逐一对账**——
-    /// 防第 25 个 `.rs` 文件（新增模块 / 新增子目录）静默逃逸自省锁。
+    /// 防第 34 个 `.rs` 文件（新增模块 / 新增子目录）静默逃逸自省锁。
     ///
     /// 判据：`CARGO_MANIFEST_DIR/src/services/usage` 下递归枚举全部 `.rs`，与 `USAGE_SOURCES`
     /// 的**名字集合必须相等**（不是包含关系）。**能变红**：往该目录放一个新 `.rs`（不改任何
@@ -1922,7 +2118,7 @@ mod tests {
             .map(|(name, _)| (*name).to_string())
             .collect();
         listed.sort();
-        // **B-3（第 6 轮）**：把「20 个测试模块区 / 4 个空区」这个分类**机械钉住**——
+        // **B-3（第 6 轮）**：把「28 个测试模块区 / 6 个空区」这个分类**机械钉住**——
         // 只在注释/文档里写分类会静默失真（给空区文件加个测试模块 ⇒ 文档过期而用例全绿）。
         let empty = USAGE_SOURCES
             .iter()
@@ -1930,15 +2126,16 @@ mod tests {
             .count();
         assert_eq!(
             (USAGE_SOURCES.len() - empty, empty),
-            (20, 4),
-            "排除区分类应为 **20 个测试模块区 / 4 个空区**（空区 = `caps.rs` / `delta.rs` / \
-             `model.rs` / `settings.rs`）。改动某文件的排除区形态（加测试模块 / 改成空区）时，\
-             必须**同步**本断言、`self_lock` 的文档与两处锁的声明"
+            (30, 6),
+            "排除区分类应为 **30 个测试模块区 / 6 个空区**（空区 = `caps.rs` / `delta.rs` / \
+             `model.rs` / `settings.rs` / `v2/model.rs` / `v2/mod.rs`）。改动某文件的\
+             排除区形态（加测试模块 / 改成空区）时，必须**同步**本断言、`self_lock` 的文档与\
+             两处锁的声明"
         );
         assert_eq!(
             listed, on_disk,
             "自省锁的扫描面必须与磁盘**逐一相等**：`services/usage/**/*.rs` 新增文件后必须同时\
-             加进 `USAGE_SOURCES`（并确认新文件的生产半边不含禁项），否则第 25 个文件会静默\
+             加进 `USAGE_SOURCES`（并确认新文件的生产半边不含禁项），否则第 35 个文件会静默\
              逃逸反向锁——这正是 P1-1 抓到的「覆盖声明 > 实际判据」同族"
         );
     }
