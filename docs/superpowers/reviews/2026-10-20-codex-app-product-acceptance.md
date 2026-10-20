@@ -44,12 +44,12 @@ E6/E10/E11 需要桌面端有人在场按 §4 的点击顺序操作。
 
 | 套件 | 命令 | 结果 |
 | --- | --- | --- |
-| Rust lib | `cargo test --lib`（第三轮修复后） | 2635 passed / **5 failed（均为 main 基线既有失败，见 §5）** |
+| Rust lib | `cargo test --lib`（第四轮修复后） | 2641 passed / **5 failed（均为 main 基线既有失败，见 §5）** |
 | IPC 协议 | `cargo test --test codex_desktop_ipc` | 42 passed |
-| IPC HTTP | `cargo test --test codex_ipc_remote` | 52 passed |
+| IPC HTTP | `cargo test --test codex_ipc_remote` | 54 passed |
 | 控制面 | `cargo test --test codex_control_remote` | 36 passed |
 | Codex E2E（ignored） | `cargo test --test headless_e2e -- --list` | 1 例 `codex_queue_consumed`（未实机执行，零配额） |
-| 前端 | `pnpm test` | 151 文件 / 1598 passed / 5 skipped |
+| 前端 | `pnpm test` | 151 文件 / 1599 passed / 5 skipped |
 | 错误码/双语 | `pnpm check:i18n`、`node scripts/check-error-codes.mjs` | PASS（1417 键；284 码 / 285 键 / legacy 5） |
 
 ## 4. 未执行步骤的交接顺序（Windows，需用户在场）
@@ -105,6 +105,6 @@ E6/E10/E11 需要桌面端有人在场按 §4 的点击顺序操作。
 ## 8. 结论
 
 本轮交付的**自动化层**（IPC 协议 / HTTP 集成 / 控制面 / 前端接线 / 双语与错误码门禁）
-全部通过；第三轮审查的 7 项缺陷已修复并有确定性回归（见复审 §7.1）。**PRODUCT 层双平台
+全部通过；第三轮 7 项与第四轮 1×P1 + 3×P2 已修复并有确定性回归（见复审 §7.1 / §7.2）。**PRODUCT 层双平台
 适用表仍未完成**，Windows 需用户在场按 §4 操作、Mac 需实际执行者按交接清单跑。按计划
 纪律，不把本次交付宣称为「冻结 spec F1–F8 双平台真机验收完成」。
