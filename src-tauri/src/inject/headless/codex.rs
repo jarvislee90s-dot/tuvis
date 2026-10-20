@@ -831,6 +831,10 @@ pub struct TurnArgs<'a> {
     pub sid: &'a str,
     pub project: &'a str,
     pub rollout: Option<&'a str>,
+    /// **每次真实派发前的授权复核**（2026-10-20 复审 P2）：返回 `Some(reason)` =
+    /// 拒绝本次派发（零 spawn）。exec→queue 改道是第二次真实派发，必须在 queue
+    /// 启动前再核（设备吊销 / H3 关闭都可能在 exec 等待期间发生）。
+    pub gate: Option<&'a (dyn Fn() -> Option<String> + Sync)>,
 }
 
 /// 回执来源（可观测面：测试与审计据此分辨证据链）
@@ -936,6 +940,16 @@ pub async fn run_turn(
     run: &RunSeam,
 ) -> TurnOutcome {
     let started = Instant::now();
+    // 入口复核：每次真实派发都重新核授权（不是只在 HTTP 入口核一次）
+    if let Some(reason) = args.gate.and_then(|g| g()) {
+        return TurnOutcome {
+            receipt: Receipt::failed(Stage::Refused, &reason).with_session(args.sid),
+            plan_used: PlanKind::Queue,
+            diverted: false,
+            receipt_source: ReceiptSource::NotApplicable,
+            compat_evidence: CompatEvidence::default(),
+        };
+    }
     match plan {
         Plan::Queue { .. } => {
             run_queue_turn(args, plan, make_runner, deps, run, started, None).await
@@ -956,6 +970,17 @@ pub async fn run_turn(
                 && att.receipt.stage != Some(Stage::Timeout)
                 && evidence.is_some();
             if divertible {
+                // **改道 = 第二次真实派发**：设备可能在 exec 等待期间被吊销，
+                // 或 H3 被关闭——queue 启动前必须再核一次；拒绝则零新派发。
+                if let Some(reason) = args.gate.and_then(|g| g()) {
+                    return TurnOutcome {
+                        receipt: Receipt::failed(Stage::Refused, &reason).with_session(args.sid),
+                        plan_used: PlanKind::ExecResume,
+                        diverted: false,
+                        receipt_source: ReceiptSource::NotApplicable,
+                        compat_evidence: CompatEvidence::default(),
+                    };
+                }
                 let qplan = dispatch(
                     AppPresence::Open,
                     plan.thread(),
@@ -2482,6 +2507,7 @@ mod tests {
             sid,
             project: "E:/t2",
             rollout,
+            gate: None,
         }
     }
 
@@ -3015,6 +3041,52 @@ mod tests {
             reason.contains(WRITER_LOCK_MARKER),
             "原错误证据必须在场：{reason}"
         );
+    }
+
+    /// 2026-10-20 复审 P2：exec→queue 改道是**第二次真实派发**。exec 等待期间
+    /// 设备被吊销（gate 第二次返回拒绝）→ queue 必须零启动，回执如实拒绝。
+    #[tokio::test]
+    async fn revoked_device_before_diverted_queue_blocks_second_dispatch() {
+        let plan = dispatch(AppPresence::Closed, UUID, "E:/t2", "hi");
+        let (run, calls) = scripted_run(vec![obs_exit(
+            1,
+            &[],
+            "Error: -32600 already has an active writer",
+        )]);
+        let (_argv_seen, make) = recording_runner();
+        let deps = deps_with(vec![Some(true)], Some(QueueEvidence::ThreadClear));
+        let gate_calls = std::sync::atomic::AtomicUsize::new(0);
+        let gate = || {
+            if gate_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                None
+            } else {
+                Some("设备已在派发等待期间被吊销——本条未投递（零 spawn）".to_string())
+            }
+        };
+        let args = TurnArgs {
+            sid: "sess_gate_revoke",
+            project: "E:/t2",
+            rollout: Some(ROLLOUT),
+            gate: Some(&gate),
+        };
+        let out = run_turn(&args, &plan, &make, &deps, &*run).await;
+        assert_eq!(
+            *calls.lock().unwrap(),
+            1,
+            "只允许已经写出的 exec；queue 零启动"
+        );
+        assert_eq!(out.receipt.status, ReceiptStatus::Failed);
+        assert_eq!(out.receipt.stage, Some(Stage::Refused));
+        assert!(
+            out.receipt
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("吊销"),
+            "拒绝原因必须如实：{:?}",
+            out.receipt.reason
+        );
+        assert!(!out.diverted, "未发生第二次派发，不得虚称已改道");
     }
 
     /// 改道**不是**无条件：watchdog 超时（我们自己杀的）不触发改道——如实报超时

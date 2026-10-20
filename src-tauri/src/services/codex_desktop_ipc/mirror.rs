@@ -232,6 +232,23 @@ impl ThreadMirror {
             .unwrap_or_default()
     }
 
+    /// **本次请求的正式消息身份是否已在该 Turn 中落地**（2026-10-20 复审 P1）：
+    /// 只认 `userMessage` item 的 `clientId == client_message_id`（正式消息身份）。
+    /// `params.input` / `params.clientUserMessageId` 都是请求侧回显，不能作为送达
+    /// 证据；Turn ID 新也不够（本地新建的 Turn 会抢先出现）。
+    pub fn turn_has_client_message(&self, turn_id: &str, client_message_id: &str) -> bool {
+        let Some(state) = self.state.as_ref() else {
+            return false;
+        };
+        HistoryView::new(state).turns().iter().any(|t| {
+            t.turn_id == turn_id
+                && t.items.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("userMessage")
+                        && item.get("clientId").and_then(Value::as_str) == Some(client_message_id)
+                })
+        })
+    }
+
     /// 指定 Turn 是否已以终态出现在当前镜像（completed/failed）。
     /// 不在场 / inProgress / 未知状态 / stale / 无镜像 → false（保守不释放）。
     pub fn turn_is_terminal(&self, turn_id: &str) -> bool {

@@ -649,6 +649,8 @@ async fn send_h3_off_ipc_available_uses_ipc() {
     });
     drive_ensure(&mut peer, THREAD, vec![], "idle").await;
     let frame = peer.recv().await;
+    confirm_client_message_identity(&mut peer, &frame, "turn-9", "通过 IPC 发送", 8, "owner-1")
+        .await;
     assert_eq!(frame["method"], "thread-follower-start-turn");
     assert_eq!(
         frame["params"]["turnStart"]["request"]["input"][0]["text"],
@@ -715,6 +717,7 @@ async fn signature_on_ipc_start_turn_appends_exactly_once() {
     });
     drive_ensure(&mut peer, THREAD, vec![], "idle").await;
     let frame = peer.recv().await;
+    confirm_client_message_identity(&mut peer, &frame, "turn-sign", "签名路径", 8, "owner-1").await;
     assert_eq!(frame["method"], "thread-follower-start-turn");
     let text = frame["params"]["turnStart"]["request"]["input"][0]["text"]
         .as_str()
@@ -736,6 +739,126 @@ async fn signature_on_ipc_start_turn_appends_exactly_once() {
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
     assert_eq!(v["status"], "desktop_ipc");
     assert_eq!(v["receipt"]["delivery"], "accepted");
+}
+
+/// 2026-10-20 复审 P1：快照之后本地新建 T1、忙态回显 T1（新 ID、无本次消息
+/// 身份）→ 不得 Accepted；必须 Unknown、保留屏障、不派发下一条。
+#[tokio::test]
+async fn busy_race_new_turn_without_client_identity_is_unknown() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("竞态窗口消息", Some("act-race"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    let req_id = frame["requestId"].as_str().unwrap().to_string();
+    // 本地新建 T1（不同 clientMessageId）：发生在写前快照之后
+    peer.send(&snapshot_frame(
+        THREAD,
+        "owner-1",
+        8,
+        "active",
+        serde_json::json!({
+            "t-local": { "id": "t-local", "type": "turn", "status": "inProgress", "items": ["u-local"] },
+            "u-local": { "id": "u-local", "type": "userMessage", "clientId": "local-other", "content": [{"type":"text","text":"local"}], "ts": 2 }
+        }),
+        serde_json::json!(["t-local"]),
+    ))
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": req_id,
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "result": { "turn": { "id": "t-local", "status": "inProgress" } } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("send in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["status"], "desktop_ipc");
+    assert_ne!(
+        v["receipt"]["delivery"], "accepted",
+        "新 Turn ID 不算送达证据"
+    );
+    assert_eq!(v["receipt"]["delivery"], "unknown_delivery");
+    assert_eq!(v["receipt"]["reasonCode"], "client_message_unverified");
+    let view = f
+        .hub_store()
+        .get_for_device("act-race", "dev-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.state, ActionState::Unknown);
+    assert!(
+        f.hub_store().has_compat_fence(&f.thread_key()).unwrap(),
+        "关联无法确认必须留保守屏障"
+    );
+}
+
+/// 正向：快照之后新建 T1，且 T1 中已有本次 clientMessageId 的正式 userMessage
+/// → 正常 Accepted（身份核验通过）。
+#[tokio::test]
+async fn accepted_when_new_turn_contains_client_message_identity() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("身份可核验", Some("act-id-ok"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    let req_id = frame["requestId"].as_str().unwrap().to_string();
+    let cmid = frame["params"]["turnStart"]["request"]["clientUserMessageId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    peer.send(&snapshot_frame(
+        THREAD,
+        "owner-1",
+        8,
+        "active",
+        serde_json::json!({
+            "t-ok": { "id": "t-ok", "type": "turn", "status": "inProgress", "items": ["u-ok"] },
+            "u-ok": { "id": "u-ok", "type": "userMessage", "clientId": cmid, "content": [{"type":"text","text":"身份可核验"}], "ts": 2 }
+        }),
+        serde_json::json!(["t-ok"]),
+    ))
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": req_id,
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "result": { "turn": { "id": "t-ok", "status": "inProgress" } } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("send in time")
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["receipt"]["delivery"], "accepted");
+    assert_eq!(v["receipt"]["turnId"], "t-ok");
 }
 
 /// 忙 Thread（快照 active）→ codex_queued + position（宪法 R2.3 留队）。
@@ -1041,6 +1164,7 @@ async fn aborted_http_waiter_does_not_lose_dispatched_write() {
     });
     drive_ensure(&mut peer, THREAD, vec![], "idle").await;
     let frame = peer.recv().await;
+    confirm_client_message_identity(&mut peer, &frame, "turn-d", "断连消息", 8, "owner-1").await;
     assert_eq!(
         frame["method"], "thread-follower-start-turn",
         "写动作已发出"
@@ -2222,6 +2346,8 @@ async fn nested_turn_receipt_yields_turn_id() {
     });
     drive_ensure(&mut peer, THREAD, vec![], "idle").await;
     let frame = peer.recv().await;
+    confirm_client_message_identity(&mut peer, &frame, "turn-nested", "嵌套回执", 8, "owner-1")
+        .await;
     assert_eq!(frame["method"], "thread-follower-start-turn");
     // Mac Probe 实录形态：turn 嵌套两层
     peer.send(&serde_json::json!({
@@ -2512,6 +2638,8 @@ async fn hub_restart_recovery_replays_queued_without_details() {
         // 启动恢复经 ensure 重新 following（事件驱动调度），队首按序发出
         drive_ensure(&mut peer, THREAD, vec![], "idle").await;
         let frame = peer.recv().await;
+        confirm_client_message_identity(&mut peer, &frame, "turn-rec", "重启前排队", 8, "owner-1")
+            .await;
         assert_eq!(
             frame["method"], "thread-follower-start-turn",
             "恢复后旧 queued 行自动发出"
@@ -2584,6 +2712,8 @@ async fn periodic_reconcile_dispatches_newly_queued() {
         let mut peer = peer;
         drive_ensure(&mut peer, THREAD, vec![], "idle").await;
         let frame = peer.recv().await;
+        confirm_client_message_identity(&mut peer, &frame, "turn-tick", "对账接力", 8, "owner-1")
+            .await;
         assert_eq!(frame["method"], "thread-follower-start-turn");
         peer.send(&serde_json::json!({
             "type": "response", "requestId": frame["requestId"],
@@ -2814,6 +2944,15 @@ async fn production_chain_send_busy_queue_then_idle_relay() {
     drive_ensure(&mut peer, THREAD, vec![], "idle").await;
     let frame = peer.recv().await;
     assert_eq!(frame["method"], "thread-follower-start-turn");
+    confirm_client_message_identity(
+        &mut peer,
+        &frame,
+        "turn-chain-1",
+        "全链第一条",
+        8,
+        "owner-1",
+    )
+    .await;
     peer.send(&serde_json::json!({
         "type": "response", "requestId": frame["requestId"],
         "resultType": "success", "method": "thread-follower-start-turn",
@@ -2836,7 +2975,7 @@ async fn production_chain_send_busy_queue_then_idle_relay() {
         "params": {
             "conversationId": THREAD, "hostId": "local",
             "change": {
-                "type": "snapshot", "revision": 8,
+                "type": "snapshot", "revision": 9,
                 "conversationState": {
                     "turns": [], "requests": [],
                     "threadRuntimeStatus": { "type": "active" },
@@ -2879,7 +3018,7 @@ async fn production_chain_send_busy_queue_then_idle_relay() {
         "params": {
             "conversationId": THREAD, "hostId": "local",
             "change": {
-                "type": "snapshot", "revision": 9,
+                "type": "snapshot", "revision": 10,
                 "conversationState": {
                     "turns": [], "requests": [],
                     "threadRuntimeStatus": { "type": "idle" },
@@ -2905,6 +3044,15 @@ async fn production_chain_send_busy_queue_then_idle_relay() {
         frame2["params"]["turnStart"]["request"]["input"][0]["text"],
         "全链第二条"
     );
+    confirm_client_message_identity(
+        &mut peer,
+        &frame2,
+        "turn-chain-2",
+        "全链第二条",
+        11,
+        "owner-1",
+    )
+    .await;
     peer.send(&serde_json::json!({
         "type": "response", "requestId": frame2["requestId"],
         "resultType": "success", "method": "thread-follower-start-turn",
@@ -2967,6 +3115,8 @@ async fn aborted_waiter_convergence_requires_bound_turn_terminal_evidence() {
     drive_ensure(&mut peer, THREAD, vec![], "idle").await;
     let frame = peer.recv().await;
     assert_eq!(frame["method"], "thread-follower-start-turn");
+    confirm_client_message_identity(&mut peer, &frame, "turn-cvrg-1", "被弃消息", 8, "owner-1")
+        .await;
     task1.abort();
 
     // ② Desktop 正常应答：独立派发任务原子落账 accepted + Turn 屏障（含 turnId）
@@ -3011,7 +3161,7 @@ async fn aborted_waiter_convergence_requires_bound_turn_terminal_evidence() {
         "params": {
             "conversationId": THREAD, "hostId": "local",
             "change": {
-                "type": "snapshot", "revision": 8,
+                "type": "snapshot", "revision": 9,
                 "conversationState": {
                     "turns": [], "requests": [],
                     "threadRuntimeStatus": { "type": "idle" },
@@ -3039,7 +3189,7 @@ async fn aborted_waiter_convergence_requires_bound_turn_terminal_evidence() {
         "params": {
             "conversationId": THREAD, "hostId": "local",
             "change": {
-                "type": "snapshot", "revision": 9,
+                "type": "snapshot", "revision": 10,
                 "conversationState": {
                     "turns": [], "requests": [],
                     "threadRuntimeStatus": { "type": "idle" },
@@ -3082,6 +3232,47 @@ async fn aborted_waiter_convergence_requires_bound_turn_terminal_evidence() {
 // 18. 2026-10-17 复审 C2：自动恢复两条生产断路——同 socket owner 失效/reset 的
 // 重跟随（不依赖 GET），以及持久屏障 Thread 完整重启后自动重建投影源。
 // ============================================================
+
+/// 发送「本次消息身份已落地」状态帧（2026-10-20 复审 P1）：真实 Desktop 会在
+/// start-turn 回执前广播含 `userMessage.clientId` 的 Turn；既有 accepted 用例补此帧，
+/// 避免把「新 Turn ID」当成唯一边界证据。
+async fn confirm_client_message_identity(
+    peer: &mut ScriptedPeer,
+    frame: &serde_json::Value,
+    turn_id: &str,
+    text: &str,
+    revision: u64,
+    owner: &str,
+) {
+    let cmid = frame["params"]["turnStart"]["request"]["clientUserMessageId"]
+        .as_str()
+        .expect("start-turn 请求带 clientUserMessageId");
+    let uid = format!("u-{turn_id}");
+    let mut entities = serde_json::Map::new();
+    entities.insert(
+        turn_id.to_string(),
+        serde_json::json!({
+            "id": turn_id, "type": "turn", "status": "inProgress",
+            "items": [uid.clone()]
+        }),
+    );
+    entities.insert(
+        uid.clone(),
+        serde_json::json!({
+            "id": uid, "type": "user_message", "clientId": cmid,
+            "text": text, "ts": 2
+        }),
+    );
+    peer.send(&snapshot_frame(
+        THREAD,
+        owner,
+        revision,
+        "active",
+        serde_json::Value::Object(entities),
+        serde_json::json!([turn_id]),
+    ))
+    .await;
+}
 
 /// 构造一帧 state-changed snapshot（C2 测试用：实体表自定）。
 fn snapshot_frame(
@@ -3171,6 +3362,7 @@ async fn multi_copy_ambiguous_turn_evidence_never_clears_barrier() {
     drive_ensure(&mut peer, THREAD, vec![], "idle").await;
     let frame = peer.recv().await;
     assert_eq!(frame["method"], "thread-follower-start-turn");
+    confirm_client_message_identity(&mut peer, &frame, "turn-mc-1", "多义甲", 8, "owner-1").await;
     task1.abort();
     peer.send(&serde_json::json!({
         "type": "response", "requestId": frame["requestId"],
@@ -3215,7 +3407,7 @@ async fn multi_copy_ambiguous_turn_evidence_never_clears_barrier() {
         "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
         "sourceClientId": "owner-1",
         "params": { "conversationId": THREAD, "hostId": "local",
-                    "change": two_copy_snapshot(8, ("turn:a", None),
+                    "change": two_copy_snapshot(9, ("turn:a", None),
                                                 ("turn:b", Some("completed"))) }
     }))
     .await;
@@ -3227,7 +3419,7 @@ async fn multi_copy_ambiguous_turn_evidence_never_clears_barrier() {
         "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
         "sourceClientId": "owner-1",
         "params": { "conversationId": THREAD, "hostId": "local",
-                    "change": two_copy_snapshot(9, ("turn:b", Some("completed")),
+                    "change": two_copy_snapshot(10, ("turn:b", Some("completed")),
                                                 ("turn:c", Some("inProgress"))) }
     }))
     .await;
@@ -3239,7 +3431,7 @@ async fn multi_copy_ambiguous_turn_evidence_never_clears_barrier() {
         "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
         "sourceClientId": "owner-1",
         "params": { "conversationId": THREAD, "hostId": "local",
-                    "change": two_copy_snapshot(10, ("turn:b", Some("completed")),
+                    "change": two_copy_snapshot(11, ("turn:b", Some("completed")),
                                                  ("turn:c", Some("completed"))) }
     }))
     .await;
@@ -3496,6 +3688,8 @@ async fn hub_restart_with_turn_barrier_recovers_without_details() {
         drive_ensure(&mut peer1, THREAD, vec![], "idle").await;
         let frame = peer1.recv().await;
         assert_eq!(frame["method"], "thread-follower-start-turn");
+        confirm_client_message_identity(&mut peer1, &frame, "turn-b1", "屏障前已发", 8, "owner-1")
+            .await;
         peer1
             .send(&serde_json::json!({
                 "type": "response", "requestId": frame["requestId"],
@@ -3529,7 +3723,7 @@ async fn hub_restart_with_turn_barrier_recovers_without_details() {
             .send(&snapshot_frame(
                 THREAD,
                 "owner-1",
-                8,
+                10,
                 "active",
                 entities,
                 serde_json::json!(["turn-b1"]),
@@ -3595,6 +3789,8 @@ async fn hub_restart_with_turn_barrier_recovers_without_details() {
             .await
             .expect("重启后屏障 Thread 自动恢复接力（第二个 start-turn 帧）");
         assert_eq!(frame2["method"], "thread-follower-start-turn");
+        confirm_client_message_identity(&mut peer, &frame2, "turn-b2", "屏障后排队", 11, "owner-1")
+            .await;
         assert_eq!(
             frame2["params"]["turnStart"]["request"]["input"][0]["text"],
             "屏障后排队"
@@ -3703,10 +3899,14 @@ async fn completed_snapshot_before_ack_still_relays() {
     drive_ensure(&mut peer, THREAD, vec![], "idle").await;
     let frame = peer.recv().await;
     assert_eq!(frame["method"], "thread-follower-start-turn");
+    let cmid = frame["params"]["turnStart"]["request"]["clientUserMessageId"]
+        .as_str()
+        .unwrap()
+        .to_string();
     // 完成快照**先于 ACK** 落镜像（rev 8，turn-chain-1 completed，idle）
     let entities = serde_json::json!({
         "turn-chain-1": { "id": "turn-chain-1", "type": "turn", "status": "completed", "items": ["u7"] },
-        "u7": { "id": "u7", "type": "user_message", "text": "基线前已发 [mobile iPhone]", "ts": 7 }
+        "u7": { "id": "u7", "type": "user_message", "clientId": cmid, "text": "基线前已发 [mobile iPhone]", "ts": 7 }
     });
     peer.send(&snapshot_frame(
         THREAD,
@@ -3750,6 +3950,8 @@ async fn completed_snapshot_before_ack_still_relays() {
         .await
         .expect("完成快照先于 ACK：后继必须自动接力（零新增量）");
     assert_eq!(frame2["method"], "thread-follower-start-turn");
+    confirm_client_message_identity(&mut peer, &frame2, "turn-b1-2", "基线后排队", 9, "owner-1")
+        .await;
     peer.send(&serde_json::json!({
         "type": "response", "requestId": frame2["requestId"],
         "resultType": "success", "method": "thread-follower-start-turn",
@@ -3786,6 +3988,8 @@ async fn lower_revision_from_new_owner_still_releases() {
     drive_ensure(&mut peer, THREAD, vec![], "idle").await;
     let frame = peer.recv().await;
     assert_eq!(frame["method"], "thread-follower-start-turn");
+    confirm_client_message_identity(&mut peer, &frame, "turn-gen-1", "换代前已发", 8, "owner-1")
+        .await;
     peer.send(&serde_json::json!({
         "type": "response", "requestId": frame["requestId"],
         "resultType": "success", "method": "thread-follower-start-turn",
@@ -3843,6 +4047,8 @@ async fn lower_revision_from_new_owner_still_releases() {
         .await
         .expect("换代后低 revision 完成世界：后继必须自动接力");
     assert_eq!(frame2["method"], "thread-follower-start-turn");
+    confirm_client_message_identity(&mut peer, &frame2, "turn-gen-2", "换代后排队", 2, "owner-2")
+        .await;
     peer.send(&serde_json::json!({
         "type": "response", "requestId": frame2["requestId"],
         "resultType": "success", "method": "thread-follower-start-turn",

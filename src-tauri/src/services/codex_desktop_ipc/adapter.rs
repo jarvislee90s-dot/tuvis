@@ -523,6 +523,20 @@ impl DesktopIpcAdapter {
         }
     }
 
+    /// 正式消息身份核验（2026-10-20 复审 P1）：该 Turn 中是否已有本次请求的
+    /// `userMessage.clientId`。仅用于 A 路 start-turn 回执关联，不参与展示。
+    pub async fn turn_has_client_message(
+        &self,
+        key: &ThreadKey,
+        turn_id: &str,
+        client_message_id: &str,
+    ) -> bool {
+        let mirrors = self.inner.mirrors.lock().await;
+        mirrors
+            .get(key)
+            .is_some_and(|m| m.turn_has_client_message(turn_id, client_message_id))
+    }
+
     /// **派发边界快照**（2026-10-20 复审 P1）：ensure 之后、start-turn 之前的忙态与
     /// 已存在 Turn 集合，**同一把镜像锁**取出（保证两判据来自同一时刻状态）。
     /// 忙 = active/unknown；无镜像 = 不忙（ensure 失败路径另由 start_turn 如实 NotSent）；

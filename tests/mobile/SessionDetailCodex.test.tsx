@@ -57,6 +57,9 @@ let queueResponse: unknown;
 let queueCalls: string[];
 let retractBodies: string[];
 let sendCalls: string[];
+let nextSend: unknown;
+let afterSendQueue: unknown;
+let compatSent = false;
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status });
@@ -67,6 +70,9 @@ function installFetch() {
   queueCalls = [];
   retractBodies = [];
   sendCalls = [];
+  nextSend = null;
+  afterSendQueue = null;
+  compatSent = false;
   const fn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.includes("/codex/queue/retract")) {
@@ -75,7 +81,7 @@ function installFetch() {
     }
     if (url.includes("/codex/queue")) {
       queueCalls.push(url);
-      return json(queueResponse);
+      return json(compatSent && afterSendQueue ? afterSendQueue : queueResponse);
     }
     if (url.includes("/codex/thread/events")) return new Response("", { status: 200 });
     if (url.includes("/codex/thread")) return json(projection());
@@ -85,6 +91,10 @@ function installFetch() {
     }
     if (url.includes("/session-send")) {
       sendCalls.push(String(init?.body ?? ""));
+      if (nextSend) {
+        compatSent = true;
+        return json(nextSend);
+      }
       return json({ status: "codex_queued", actionId: "act-q", position: 1 });
     }
     if (url.includes("/session-messages")) return json({ messages: [], truncated: false });
@@ -211,6 +221,29 @@ describe("SessionDetail × Codex IPC：恢复入口与队列刷新", () => {
     expect(await screen.findByTestId("codex-queue-row-compat-a")).toBeTruthy();
     expect(screen.getByTestId("codex-queue-retract-compat-a")).toBeTruthy();
     expect(screen.getByTestId("codex-stale-note")).toBeTruthy();
+  });
+
+  it("F：revision=null 兼容超时 → 不离开页面也能看到屏障与恢复入口", async () => {
+    installFetch();
+    nextSend = {
+      status: "headless",
+      receipt: { status: "timeout", reason: "compat 回合超时（结果未知）" },
+    };
+    afterSendQueue = {
+      actions: [{ actionId: "act-to", state: "unknown", position: null, receipt: null }],
+      blockedReasonCode: "native_delivery_unknown",
+      blockedActionIds: ["act-to"],
+    };
+    render(<SessionDetail session={makeSession({ status: "idle" })} onBack={() => {}} />);
+    const es = await waitFor(() => MockEventSource.latest());
+    emit(es, "snapshot", projection({ revision: null, stale: true, availability: "compat_only" }));
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "兼容超时消息" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(await screen.findByTestId("send-receipt-headless")).toBeTruthy();
+    // 没有任何新投影帧：队列刷新由 headless 回执独立触发
+    expect(await screen.findByTestId("codex-queue-panel")).toBeTruthy();
+    expect(await screen.findByTestId("codex-queue-force-continue")).toBeTruthy();
   });
 
   it("E：切会话后旧队列/旧投影不串入新会话", async () => {

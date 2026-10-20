@@ -274,6 +274,7 @@ async fn codex_queue_consumed() {
         sid: &probe.thread,
         project: &probe.project,
         rollout: probe.rollout.as_deref(),
+        gate: None,
     };
     let out = codex::run_turn(&args, &plan, &build, &deps, &*seam).await;
     eprintln!(

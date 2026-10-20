@@ -755,6 +755,29 @@ impl DesktopDispatch for AdapterDispatch {
                     out.delivery = Delivery::UnknownDelivery;
                     out.reason_code = Some(reason.to_string());
                     out.turn_id = None;
+                } else if let Some(turn_id) = out.turn_id.clone() {
+                    // **正式消息身份核验**（2026-10-20 复审 P1）：Turn ID 新不足以
+                    // 证明本条消息进了该 Turn——本地新建的 Turn 会抢在两次快照之间
+                    // 出现，忙态回显它时 ID 同样「新」。必须等该 Turn 里出现
+                    // `userMessage.clientId == 本次 cmid` 的正式消息；`params.input`
+                    // 是请求回显，不作送达证据。有界等待状态帧（正常路径通常先于
+                    // 回执到达）；等不到就按 Unknown 保守处理。
+                    let mut verified = false;
+                    for _ in 0..21 {
+                        if adapter.turn_has_client_message(&key, &turn_id, &cmid).await {
+                            verified = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                    if !verified {
+                        log::warn!(
+                            "codex/thread send: start-turn Accepted 但未观测到本次消息身份（action={action_id} turn={turn_id}）——按未知投递保守处理"
+                        );
+                        out.delivery = Delivery::UnknownDelivery;
+                        out.reason_code = Some("client_message_unverified".to_string());
+                        out.turn_id = None;
+                    }
                 }
             }
             out
@@ -1524,8 +1547,24 @@ fn supersedes(buffered: &ThreadProjection, snap: &ThreadProjection) -> bool {
     if buffered.owner_generation != snap.owner_generation {
         return buffered.owner_generation > snap.owner_generation;
     }
-    if buffered.stale && !snap.stale {
-        return false;
+    if buffered.stale != snap.stale {
+        if buffered.stale {
+            // stale = 当前视图**失效**（断线/丢帧）——相同 revision 也必须送达，
+            // 否则手机停在旧的可控状态（2026-10-20 复审 P2）。更旧 revision 的
+            // stale 仍是旧事件，不能覆盖更新鲜的快照。
+            return match (buffered.revision, snap.revision) {
+                (Some(b), Some(s)) => b >= s,
+                (Some(_), None) => true,
+                _ => false,
+            };
+        }
+        // 恢复：只有更高 revision（或快照无 revision）证明世界已更新才允许清除
+        // stale；同 revision 的「非 stale」不能证明任何新数据。
+        return match (buffered.revision, snap.revision) {
+            (Some(b), Some(s)) => b > s,
+            (Some(_), None) => true,
+            _ => false,
+        };
     }
     match (buffered.revision, snap.revision) {
         (Some(b), Some(s)) => b > s,
@@ -1608,23 +1647,28 @@ fn projection_stream(
         adapter,
         key,
         rx,
+        last: first.clone(),
         pending_snapshot: Some(first),
         pending_events: buffered.into(),
     };
     futures::stream::unfold(state, |mut s| async move {
         loop {
             if let Some(first) = s.pending_snapshot.take() {
+                s.last = first.clone();
                 return Some((Ok(projection_event("snapshot", &first)), s));
             }
             if let Some(p) = s.pending_events.pop_front() {
+                s.last = p.clone();
                 return Some((Ok(projection_event("state", &p)), s));
             }
             match s.rx.recv().await {
                 Ok(p) => {
-                    if p.thread_id == s.key.thread_id {
+                    if p.thread_id == s.key.thread_id && supersedes(&p, &s.last) {
+                        s.last = p.clone();
                         return Some((Ok(projection_event("state", &p)), s));
                     }
-                    // 其他 Thread 的投影：跳过（单会话订阅，不打开全历史）
+                    // 其他 Thread / 不比已发送状态更新的事件：跳过（单会话订阅；
+                    // 旧事件不得在新快照后补发造成回退）
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     // 丢帧 = 下游可能与真实状态脱节：先把已排队的事件抽干（它们
@@ -1639,6 +1683,7 @@ fn projection_stream(
                         }
                     }
                     let snap = s.adapter.projection(&s.key).await;
+                    s.last = snap.clone();
                     return Some((Ok(projection_event("snapshot", &snap)), s));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
@@ -1652,6 +1697,8 @@ struct StreamState {
     key: ThreadKey,
     rx: tokio::sync::broadcast::Receiver<ThreadProjection>,
     pending_snapshot: Option<ThreadProjection>,
+    /// 最近一次已发送给下游的投影（流式阶段的顺序基线，2026-10-20 复审 P2）
+    last: ThreadProjection,
     /// 启动缓冲合并结果（快照之后、订阅转实时之前必须补发的事件）
     pending_events: std::collections::VecDeque<ThreadProjection>,
 }
@@ -2294,7 +2341,9 @@ mod startup_merge_tests {
     #[test]
     fn stale_buffered_does_not_override_fresh_snapshot() {
         let snap = p("t", 1, 1, Some(5), false);
-        assert!(!supersedes(&p("t", 1, 1, Some(6), true), &snap));
+        // 2026-10-20 复审 P2：stale 是**失效信号**——更高/同 revision 必须送达；
+        // 只有更旧 revision（或无 revision）的 stale 不能覆盖新鲜快照。
+        assert!(supersedes(&p("t", 1, 1, Some(6), true), &snap));
         let merged = merge_startup_buffer(&k("t"), snap, vec![p("t", 1, 1, None, true)]);
         assert_eq!(merged.len(), 1);
     }
@@ -2318,6 +2367,51 @@ mod startup_merge_tests {
             turn_association_refusal(&existing, None),
             Some("turn_unconfirmed"),
             "缺 turnId 无法确认关联 → 保守 Unknown"
+        );
+    }
+
+    /// P2：首快照后唯一断线事件（同代际、同 revision、stale=true）必须送达，
+    /// 不得被 `supersedes` 的「stale 不覆盖新鲜」规则丢弃。
+    #[test]
+    fn stale_disconnect_event_at_same_revision_is_delivered() {
+        let key = k("t");
+        let merged = merge_startup_buffer(
+            &key,
+            p("t", 1, 1, Some(7), false),
+            vec![p("t", 1, 1, Some(7), true)],
+        );
+        assert_eq!(merged.len(), 2, "断线无效化事件必须送达");
+        assert!(merged[1].stale);
+    }
+
+    /// P2：Lagged 恢复期间收到的多帧按统一顺序判据合并——旧 revision 丢弃、
+    /// 新 revision 保留，最终状态不回退。
+    #[test]
+    fn lagged_recovery_frames_do_not_regress_snapshot() {
+        let key = k("t");
+        let merged = merge_startup_buffer(
+            &key,
+            p("t", 1, 1, Some(7), false),
+            vec![
+                p("t", 1, 1, Some(6), false),
+                p("t", 1, 1, Some(8), false),
+                p("t", 1, 1, Some(7), false),
+            ],
+        );
+        assert_eq!(merged.len(), 2, "只保留真正更新的一帧");
+        assert_eq!(merged.last().unwrap().revision, Some(8));
+    }
+
+    /// P2：stale 快照只能由更高 revision（或新 owner）清除，同 revision 的
+    /// 非 stale 不能空口恢复。
+    #[test]
+    fn stale_snapshot_cleared_only_by_newer_revision() {
+        let stale = p("t", 1, 1, Some(7), true);
+        assert!(!supersedes(&p("t", 1, 1, Some(7), false), &stale));
+        assert!(supersedes(&p("t", 1, 1, Some(8), false), &stale));
+        assert!(
+            supersedes(&p("t", 2, 0, Some(1), false), &stale),
+            "换 owner 新世代"
         );
     }
 

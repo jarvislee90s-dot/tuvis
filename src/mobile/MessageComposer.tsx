@@ -638,6 +638,10 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           status: res.receipt.status,
           reason: res.receipt.reason,
         });
+        // 2026-10-20 复审 P2：兼容回执（含超时/失败）同样可能留下 Unknown 与
+        // 屏障；revision=null 时没有新帧，必须主动刷新恢复面板，否则用户看不到
+        // 「核对后继续」。
+        onQueueChanged?.();
       } else {
         setReceipt({ kind: "failed", error: formatInvokeError(res.error, i18n.t) });
       }

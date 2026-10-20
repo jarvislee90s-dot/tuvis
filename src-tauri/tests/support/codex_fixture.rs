@@ -74,6 +74,12 @@ pub fn to_canonical(entities: Value, turn_ids: Value) -> (Value, Value) {
                                     "content".into(),
                                     json!([{ "type": "text", "text": text }]),
                                 );
+                                // 正式消息身份（2026-10-20 复审 P1 测试需要）：
+                                // 夹具显式带的 clientId 必须保留，否则无法模拟
+                                // 「该 Turn 里是否已有本次 cmid」。
+                                if let Some(cid) = obj.get("clientId") {
+                                    m.insert("clientId".into(), cid.clone());
+                                }
                                 Value::Object(m)
                             }
                             "agent_message" => {

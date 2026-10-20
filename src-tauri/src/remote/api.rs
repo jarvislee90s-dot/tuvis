@@ -1655,6 +1655,7 @@ impl CodexTurnCtx {
 /// [`crate::inject::headless::runner_from_conn`] 读设置（不自建 `GlobalSem`）、执行缝复用
 /// Task 8 的 [`crate::inject::headless::turn::production_run_seam`]（通道无关：跑一个
 /// `RunnerCfg` 并把回执 + 原始流交回），回合终结后落 `headless` 审计行并注销串行锁。
+#[allow(clippy::too_many_arguments)]
 async fn run_codex_turn(
     st: Arc<RemoteState>,
     mut ctx: CodexTurnCtx,
@@ -1664,6 +1665,9 @@ async fn run_codex_turn(
     project: String,
     // **串行锁守卫（评审 I14）**：随回合任务移动，任务收尾随 Drop 注销
     _slot: crate::inject::headless::turn::TurnGuard<'static>,
+    // 设备吊销/H3 的派发前复核（2026-10-20 复审 P2）：run_turn 内每次真实派发
+    // （含 exec→queue 改道）都要再核，不能只信 HTTP 入口。
+    device_id: String,
 ) -> crate::inject::headless::codex::TurnOutcome {
     use crate::inject::headless::codex;
     let deps = codex::TurnDeps::production();
@@ -1685,10 +1689,30 @@ async fn run_codex_turn(
         cfg
     };
     let seam = codex::run_seam();
+    // 每次真实派发前的授权复核（2026-10-20 复审 P2）：兼容路 exec→queue 改道
+    // 是第二次派发——入口授权不能覆盖 exec 等待期间的设备吊销 / H3 关闭。
+    let gate_st = st.clone();
+    let gate_device = device_id.to_string();
+    let gate = move || -> Option<String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let device_ok = gate_st
+            .store
+            .with(|c| crate::remote::pairing::device_valid(c, &gate_device, now));
+        if !device_ok {
+            return Some(
+                "设备已在派发等待期间被吊销——本条未投递（零 spawn），请重新配对后再发".to_string(),
+            );
+        }
+        if !gate_st.store.with(super::headless_enabled_conn) {
+            return Some("无头通道已关闭——本条未投递（零 spawn）".to_string());
+        }
+        None
+    };
     let args = codex::TurnArgs {
         sid: &ctx.sid,
         project: &project,
         rollout: tref.rollout_path.as_deref(),
+        gate: Some(&gate),
     };
     let out = codex::run_turn(&args, &plan, &build, &deps, &*seam).await;
     // 审计 channel 列 = **实际走向**（改道后如实记 queue）
@@ -1862,6 +1886,7 @@ pub(crate) async fn codex_headless_dispatch_envelope_with_evidence(
         tref,
         project,
         slot,
+        device_id.to_string(),
     ));
     let out = match task.await {
         Ok(o) => o,
