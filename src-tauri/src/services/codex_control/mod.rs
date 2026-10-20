@@ -31,7 +31,7 @@ pub use queue::{
 };
 pub use router::{
     BoxBusyFut, BoxDispatchFut, CodexControlRouter, DesktopDispatch, DispatchOutcome,
-    FallbackPermit, RouterOutcome,
+    FallbackPermit, RouterOutcome, BUSY_BEFORE_WRITE_REASON,
 };
 
 /// 一次远程控制动作的调用方上下文（计划 Task 7 `ActionContext`）。

@@ -652,7 +652,7 @@ async fn send_h3_off_ipc_available_uses_ipc() {
     assert_eq!(frame["method"], "thread-follower-start-turn");
     assert_eq!(
         frame["params"]["turnStart"]["request"]["input"][0]["text"],
-        "通过 IPC 发送 [mobile iPhone]"
+        "通过 IPC 发送"
     );
     peer.send(&serde_json::json!({
         "type": "response", "requestId": frame["requestId"],
@@ -686,6 +686,56 @@ async fn send_h3_off_ipc_available_uses_ipc() {
         "send 有可追踪审计行：{:?}",
         audits
     );
+}
+
+/// 签名开关开启（2026-10-20 复审 P2）：真实 IPC start-turn 恰好一次
+/// `[mobile 花名]`，且与账本/审计同一份 wire（不再恒加、也不重复加）。
+#[tokio::test]
+async fn signature_on_ipc_start_turn_appends_exactly_once() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote_message_signature', 'on')",
+            [],
+        )
+        .unwrap();
+    });
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("签名路径", Some("act-sign-1"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    let text = frame["params"]["turnStart"]["request"]["input"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(text, "签名路径 [mobile iPhone]", "开关开 = 恰好一次签名");
+    assert_eq!(text.matches("[mobile iPhone]").count(), 1);
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-sign", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("send in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["status"], "desktop_ipc");
+    assert_eq!(v["receipt"]["delivery"], "accepted");
 }
 
 /// 忙 Thread（快照 active）→ codex_queued + position（宪法 R2.3 留队）。
@@ -808,6 +858,12 @@ async fn send_h3_off_ipc_unavailable_compat_refuses() {
     assert_eq!(r.status(), 403);
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
     assert_eq!(v["error"], "headless_disabled");
+    assert_eq!(v["reasonCode"], "headless_disabled");
+    let reason = v["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("无头通道未开启"),
+        "403 必须带可理解原因（手机端只读 reason 展示）: {v}"
+    );
 }
 
 /// IPC 明确拒绝（peer 回 error）→ Rejected 回执 200，**不触发 fallback**（H3 开着
@@ -2462,7 +2518,7 @@ async fn hub_restart_recovery_replays_queued_without_details() {
         );
         assert_eq!(
             frame["params"]["turnStart"]["request"]["input"][0]["text"],
-            "重启前排队 [mobile iPhone]"
+            "重启前排队"
         );
         peer.send(&serde_json::json!({
             "type": "response", "requestId": frame["requestId"],
@@ -2847,7 +2903,7 @@ async fn production_chain_send_busy_queue_then_idle_relay() {
     );
     assert_eq!(
         frame2["params"]["turnStart"]["request"]["input"][0]["text"],
-        "全链第二条 [mobile iPhone]"
+        "全链第二条"
     );
     peer.send(&serde_json::json!({
         "type": "response", "requestId": frame2["requestId"],
@@ -3541,7 +3597,7 @@ async fn hub_restart_with_turn_barrier_recovers_without_details() {
         assert_eq!(frame2["method"], "thread-follower-start-turn");
         assert_eq!(
             frame2["params"]["turnStart"]["request"]["input"][0]["text"],
-            "屏障后排队 [mobile iPhone]"
+            "屏障后排队"
         );
         peer.send(&serde_json::json!({
             "type": "response", "requestId": frame2["requestId"],
@@ -4337,6 +4393,73 @@ async fn slow_compat_fallback_does_not_block_other_thread_scheduling() {
     })
     .await
     .expect("T1 detached 兜底落账");
+    f.state.codex_control.stop();
+}
+
+/// 2026-10-20 复审 P2：IPC 明确 NotSent → 兼容交接是**一次新的真实派发**。
+/// 交接/等待期间设备被吊销 → 兼容 CLI 零启动、动作 rejected(device_revoked)、
+/// fence 同事务清除、审计留因。
+#[tokio::test]
+async fn compat_refuses_when_device_revoked_during_ipc_handoff() {
+    let _path = IsolatedPath::lock_empty();
+    let f = fixture_dead_ipc(vec![codex_app_session(THREAD)]);
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.headless_enabled', 'true')",
+            [],
+        )
+        .unwrap();
+    });
+    f.state.codex_control.set_reconcile_period_ms(100);
+    // 兜底最短 1.5s：交接完成后先入睡，睡醒才做设备复核（吊销发生在这段窗口）
+    f.state.codex_control.set_compat_min_duration_ms(1500);
+    start_dead_ipc(&f);
+
+    register_queued(&f, "act-rev-1", THREAD, "吊销窗口内排队");
+    wait_handoff(&f, "act-rev-1", Duration::from_secs(5)).await;
+    // 交接在飞（compat 尚未真正派发）时吊销设备
+    DeviceStore::Owned(f.conn.clone()).with(|c| revoke_device(c, "dev-1").unwrap());
+
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Ok(Some(v)) = f.hub_store().get_for_device("act-rev-1", "dev-1") {
+                if v.state != ActionState::Reserved {
+                    return v;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("吊销后动作必须尽快落终态");
+    let view = f
+        .hub_store()
+        .get_for_device("act-rev-1", "dev-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.state, ActionState::Rejected, "明确零投递 = rejected");
+    assert_eq!(
+        view.receipt.as_ref().and_then(|r| r.reason_code.as_deref()),
+        Some("device_revoked"),
+        "回执原因如实"
+    );
+    let key = f.thread_key();
+    assert!(
+        !f.hub_store().has_compat_fence(&key).unwrap(),
+        "零投递必须同事务清 fence（不遗留屏障）"
+    );
+    assert!(
+        f.codex_audits()
+            .iter()
+            .any(|a| a.result.contains("refused:device_revoked")),
+        "审计留拒绝原因"
+    );
+    // 兼容路未进入 helper：没有 headless 回合审计行（零 spawn）
+    assert!(
+        !f.codex_audits().iter().any(|a| a.action == "headless"),
+        "设备吊销后不得启动兼容 CLI：{:?}",
+        f.codex_audits()
+    );
     f.state.codex_control.stop();
 }
 

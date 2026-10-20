@@ -1177,7 +1177,7 @@ async fn e2e_http_full_chain() {
     // 剥尾签名后取正文尾 24 字符——本处直接喂 composed 即验证了那条适配在真实
     // 会话文件上成立（假命中防护见 inject::confirm 的
     // stamp_never_false_hits_across_same_device_messages）
-    let composed = compose_injection("E2E手机", &text).expect("花名在册（E2E 设备名）");
+    let composed = compose_injection("E2E手机", &text);
     let stamp = stamp_of(&composed).to_string();
     let hit = poll_stamp(
         &ev,

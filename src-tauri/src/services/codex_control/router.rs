@@ -12,8 +12,10 @@
 //!   Accepted/Rejected/UnknownDelivery 绝不触发；审批绝不降级；
 //! * `FallbackPermit` 字段私有、不可 Clone：唯一派发权 + Thread guard（guard 在
 //!   permit 落账前锁住该 Thread 的派发），丢弃未完成 permit 记 unknown，绝不回 queued；
-//! * 来源标记（宪法 F2.2）：A 分支派发前 `normalize::compose_injection(device_name,
-//!   raw_text)` **恰好一次**；账本/permit 存原文，恢复后仍只组装一次；
+//! * 来源标记（宪法 F2.2）：**登记动作时**按 `remote_message_signature` 设置组装一次
+//!   并冻结（`signature_applied` 列 + 最终 wire 文本入 `queued_text`）；排队期间改设置、
+//!   重启、同 actionId 重试都不改变既定正文。旧行（列为 NULL）按升级前语义（恒带签名）
+//!   在派发前组装一次；
 //! * 每次真正派发前复核设备在册（吊销即拒发，零写入）。
 //!
 //! 本模块不 import remote 模块；A 路派发经 [`DesktopDispatch`] 注入缝（生产实现 =
@@ -25,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-use crate::inject::normalize::compose_injection;
+use crate::inject::normalize::compose_injection_flagged;
 use crate::services::codex_desktop_ipc::types::{
     ActionKind, ActionReceipt, ActionState, ControlRoute, Delivery, PendingAction, ThreadKey,
     ThreadProjection,
@@ -33,6 +35,10 @@ use crate::services::codex_desktop_ipc::types::{
 
 use super::queue::{payload_hash, ActionPayload, ActionStore, QueuedAction, StoreError};
 use super::ActionContext;
+
+/// 写前忙的机器原因码（adapter 在 ensure 后的最新状态仍 active/unknown 时返回）。
+/// router 见到该码一律**回队**（不 fallback、不换 actionId、不消耗正文）。
+pub const BUSY_BEFORE_WRITE_REASON: &str = "busy_before_write";
 
 // ============================================================
 // 派发缝与输出类型
@@ -137,15 +143,23 @@ impl std::fmt::Debug for RouterOutcome {
 /// unknown（绝不回 queued、绝不自动重试）。
 pub struct FallbackPermit {
     head: QueuedAction,
+    /// 已冻结的最终 wire 文本（与 A 路/IPC/CLI/`wire_text_hash` 同一份内容）
+    wire_text: String,
     store: Arc<ActionStore>,
     _thread_guard: Option<OwnedMutexGuard<()>>,
     finished: bool,
 }
 
 impl FallbackPermit {
-    fn new(head: QueuedAction, store: Arc<ActionStore>, guard: OwnedMutexGuard<()>) -> Self {
+    fn new(
+        head: QueuedAction,
+        wire_text: String,
+        store: Arc<ActionStore>,
+        guard: OwnedMutexGuard<()>,
+    ) -> Self {
         Self {
             head,
+            wire_text,
             store,
             _thread_guard: Some(guard),
             finished: false,
@@ -161,9 +175,9 @@ impl FallbackPermit {
         &self.head.ctx
     }
 
-    /// 原文（未加来源标记）——由 bridge 侧既有 helper 组装，禁止传已签名文本造成双标记
-    pub fn raw_text(&self) -> &str {
-        &self.head.raw_text
+    /// 已冻结的最终 wire 文本（bridge 直接投递，**不得再组装**，避免双标记或换正文）
+    pub fn wire_text(&self) -> &str {
+        &self.wire_text
     }
 
     /// 原始 clientUserMessageId（重试同 action 不换新 id）
@@ -254,6 +268,7 @@ enum HeadOutcome {
     Terminal(RouterOutcome),
     FallbackReady {
         reason_code: String,
+        wire_text: String,
     },
     Refused(ActionReceipt),
     Lost(ActionReceipt),
@@ -498,6 +513,7 @@ impl CodexControlRouter {
 
     /// 普通消息。`queue_only` 持久排队不派发。
     pub async fn send(&self, ctx: ActionContext, text: String, queue_only: bool) -> RouterOutcome {
+        // 幂等指纹仍按**原文**算：设置变化不得让同 actionId 重试变成 action_conflict
         let hash = payload_hash(
             ActionKind::Send,
             &ctx.key,
@@ -505,10 +521,19 @@ impl CodexControlRouter {
             None,
             &ActionPayload::Text(text.clone()),
         );
-        let view = match self
-            .store
-            .register(&ctx, ActionKind::Send, None, None, &hash, Some(&text))
-        {
+        // 签名开关在**登记时**读一次并冻结：排队期间设置变化/重启都不得改写本动作正文。
+        // 缺省关闭（与既有终端默认一致）；store 读失败按关闭处理（诚实降级，不冒签）。
+        let signed = self.store.message_signature_enabled();
+        let wire = compose_injection_flagged(&ctx.device_name, &text, signed);
+        let view = match self.store.register_signed(
+            &ctx,
+            ActionKind::Send,
+            None,
+            None,
+            &hash,
+            Some(&wire),
+            Some(signed),
+        ) {
             Ok(v) => v,
             Err(StoreError::Conflict) => return conflict_completed(&ctx.action_id),
             Err(e) => {
@@ -565,8 +590,11 @@ impl CodexControlRouter {
         }
         match self.dispatch_head(&head).await {
             HeadOutcome::Terminal(o) => o,
-            HeadOutcome::FallbackReady { reason_code } => RouterOutcome::UseFallback {
-                permit: FallbackPermit::new(head, self.store.clone(), guard),
+            HeadOutcome::FallbackReady {
+                reason_code,
+                wire_text,
+            } => RouterOutcome::UseFallback {
+                permit: FallbackPermit::new(head, wire_text, self.store.clone(), guard),
                 reason_code,
             },
             HeadOutcome::Refused(r) | HeadOutcome::Lost(r) => RouterOutcome::Completed(r),
@@ -715,9 +743,12 @@ impl CodexControlRouter {
             };
             match self.dispatch_head(&head).await {
                 HeadOutcome::Terminal(o) => return Some(o),
-                HeadOutcome::FallbackReady { reason_code } => {
+                HeadOutcome::FallbackReady {
+                    reason_code,
+                    wire_text,
+                } => {
                     return Some(RouterOutcome::UseFallback {
-                        permit: FallbackPermit::new(head, self.store.clone(), guard),
+                        permit: FallbackPermit::new(head, wire_text, self.store.clone(), guard),
                         reason_code,
                     });
                 }
@@ -770,14 +801,12 @@ impl CodexControlRouter {
             let _ = self.store.finish(&receipt);
             return HeadOutcome::Refused(receipt);
         }
-        // 来源标记（宪法 F2.2 / H8 行为）：派发前组装恰好一次；花名拒绝面 = 明确拒发
-        let composed = match compose_injection(&head.ctx.device_name, &head.raw_text) {
-            Ok(c) => c,
-            Err(reason) => {
-                let receipt = not_sent_receipt(&head.ctx.action_id, ControlRoute::None, &reason);
-                let _ = self.store.finish(&receipt);
-                return HeadOutcome::Refused(receipt);
-            }
+        // 最终 wire 文本：新行在登记时已冻结（`raw_text` 即 wire）；旧行按升级前
+        // 语义（恒带签名）在此组装一次。两条路径都把同一份 wire 交给 A 路/兜底/CLI
+        // 与 `wire_text_hash`，不在多个异步阶段各自重读设置或二次拼接。
+        let wire = match head.signature_applied {
+            Some(_) => head.raw_text.clone(),
+            None => compose_injection_flagged(&head.ctx.device_name, &head.raw_text, true),
         };
         // R6.3：顺序限制自派发起生效（turn 身份回执后补绑；此间 flush 不放行）
         self.mark_active(&head.ctx.key, &head.ctx.action_id);
@@ -787,7 +816,7 @@ impl CodexControlRouter {
         let dispatch = self.dispatch.clone();
         let store = self.store.clone();
         let head2 = head.clone();
-        let composed2 = composed;
+        let composed2 = wire.clone();
         let task = tokio::spawn(async move {
             let outcome = dispatch
                 .send_text(
@@ -853,6 +882,31 @@ impl CodexControlRouter {
             .clone()
             .unwrap_or_else(|| "ipc_unavailable".to_string());
         match receipt.delivery {
+            // 写前忙（ensure 后的最新状态 active/unknown）：**不消耗正文、不 fallback、
+            // 不换 actionId**——按原排队语义放回队首（restore wire 文本、清 reserved）。
+            Delivery::NotSent
+                if receipt.reason_code.as_deref() == Some(BUSY_BEFORE_WRITE_REASON) =>
+            {
+                self.clear_active(&head.ctx.key);
+                match self.store.requeue_after_busy(&head.ctx.action_id, &wire) {
+                    Ok(true) => HeadOutcome::Busy,
+                    Ok(false) => {
+                        // CAS 失败（并发撤回/已离开 reserved）：保持既有终态，不重投
+                        HeadOutcome::Terminal(RouterOutcome::Completed(not_sent_receipt(
+                            &head.ctx.action_id,
+                            ControlRoute::None,
+                            "busy_requeue_lost",
+                        )))
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "codex_control: 写前忙回队失败 action={} err={e}",
+                            head.ctx.action_id
+                        );
+                        HeadOutcome::DbBlocked
+                    }
+                }
+            }
             // writer 未尝试写（保守零投递）→ 允许兼容兜底：CAS 交接恰好一次
             Delivery::NotSent => {
                 // 无 Turn 产生：顺序限制解除（permit/交接后的闸由 fence 承担）
@@ -860,6 +914,7 @@ impl CodexControlRouter {
                 match self.store.handoff_not_sent(&head.ctx.action_id) {
                     Ok(true) => HeadOutcome::FallbackReady {
                         reason_code: reason,
+                        wire_text: wire,
                     },
                     handoff => {
                         if let Err(e) = handoff {

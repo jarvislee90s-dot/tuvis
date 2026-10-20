@@ -128,7 +128,11 @@ fn now_ms() -> i64 {
 pub struct QueuedAction {
     pub seq: i64,
     pub ctx: ActionContext,
+    /// 登记时冻结的最终 wire 文本（`signature_applied=Some(_)` 的行）；
+    /// 旧行（None）为原文，派发时按升级前语义（恒带签名）组装一次。
     pub raw_text: String,
+    /// 签名冻结值：Some(true)=已签名，Some(false)=裸正文，None=旧行。
+    pub signature_applied: Option<bool>,
     pub client_message_id: String,
 }
 
@@ -198,7 +202,6 @@ impl ActionStore {
     /// 登记动作（幂等）：同 action_id 且 device/thread/kind/requestKey/token/payload
     /// 全同 → 返回既有视图（原状态）；任一不同 → `Conflict`（零新增写入）。同时生成
     /// 并持久化 client_message_id（重试同 action 不换新 id）。
-    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         ctx: &ActionContext,
@@ -207,6 +210,29 @@ impl ActionStore {
         context_token: Option<&str>,
         payload_hash: &str,
         raw_text: Option<&str>,
+    ) -> Result<CodexActionView, StoreError> {
+        self.register_signed(
+            ctx,
+            kind,
+            request_key,
+            context_token,
+            payload_hash,
+            raw_text,
+            None,
+        )
+    }
+
+    /// 带签名冻结值的登记（生产 router 使用；旧 6 参入口保留给既有测试）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_signed(
+        &self,
+        ctx: &ActionContext,
+        kind: ActionKind,
+        request_key: Option<&str>,
+        context_token: Option<&str>,
+        payload_hash: &str,
+        raw_text: Option<&str>,
+        signature_applied: Option<bool>,
     ) -> Result<CodexActionView, StoreError> {
         let client_message_id = new_uuid();
         let thread_id = ctx.key.thread_id.clone();
@@ -227,7 +253,7 @@ impl ActionStore {
                 }
                 return view_of(c, existing).map_err(db_err);
             }
-            let row = dao::insert_action_conn(
+            let row = dao::insert_action_conn_signed(
                 c,
                 &action_id,
                 &device_id,
@@ -238,6 +264,7 @@ impl ActionStore {
                 context_token,
                 payload_hash,
                 raw_text,
+                signature_applied,
                 &client_message_id,
                 now_ms(),
             )
@@ -272,6 +299,13 @@ impl ActionStore {
     /// compat fence（零投递动作没有 Turn，不等待 Turn 结束）。
     pub fn finish(&self, receipt: &ActionReceipt) -> Result<(), StoreError> {
         self.with(|c| dao::finish_conn(c, receipt, now_ms()).map_err(db_err))
+    }
+
+    /// 写前忙回队（reserved→queued，恢复 wire 文本；CAS 失败返回 false）。
+    pub fn requeue_after_busy(&self, action_id: &str, wire_text: &str) -> Result<bool, StoreError> {
+        self.with(|c| {
+            dao::requeue_after_busy_conn(c, action_id, wire_text, now_ms()).map_err(db_err)
+        })
     }
 
     /// 落账回执**与** Turn 顺序屏障同一 UPDATE 原子持久化（2026-10-17 复审 C1.3）：
@@ -336,6 +370,16 @@ impl ActionStore {
     /// reserved/accepted/unknown 不可撤（false）。
     pub fn retract(&self, action_id: &str, device_id: &str) -> Result<bool, StoreError> {
         self.with(|c| dao::retract_conn(c, action_id, device_id, now_ms()).map_err(db_err))
+    }
+
+    /// 「远程消息带设备签名」设置（缺省关）。登记动作时读一次并冻结，
+    /// 之后排队/重启/重试都不再读——保证同一 actionId 的 wire 文本恒定。
+    pub fn message_signature_enabled(&self) -> bool {
+        self.store
+            .with(|c| {
+                Ok::<_, StoreError>(crate::inject::normalize::message_signature_enabled_conn(c))
+            })
+            .unwrap_or(false)
     }
 
     /// 派发前复核设备在册（吊销即拒发——「每次真正派发前再核设备在册」）。
@@ -642,6 +686,7 @@ fn queued_action_of(row: dao::ActionRow) -> Result<QueuedAction, StoreError> {
             },
         },
         raw_text: row.queued_text.unwrap_or_default(),
+        signature_applied: row.signature_applied,
         client_message_id: row.client_message_id,
     })
 }

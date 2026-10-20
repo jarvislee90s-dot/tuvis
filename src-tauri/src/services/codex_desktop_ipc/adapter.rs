@@ -227,6 +227,29 @@ impl DesktopIpcAdapter {
     }
 
     /// 订阅投影事件（REST/SSE/队列调度共用）。
+    /// 给投影盖上当前 owner 代际（epoch, generation）。**不序列化**，只用于 SSE
+    /// 首快照与订阅缓冲事件的先后判定：跨 owner 时 revision 可能回退，不能只比
+    /// revision 大小。锁不可得（owner 表正被改）→ 保持 (0,0)，调用方按同代际
+    /// revision 规则保守处理。
+    pub fn stamp_generation(&self, p: &mut ThreadProjection) {
+        let key = ThreadKey {
+            host_id: "local".to_string(),
+            thread_id: p.thread_id.clone(),
+        };
+        if let Ok(owners) = self.inner.owners.try_lock() {
+            if let Some(lease) = owners.current(&key) {
+                p.owner_epoch = lease.epoch;
+                p.owner_generation = lease.generation;
+            }
+        }
+    }
+
+    /// 广播一份投影（统一盖代际；SSE 订阅者据此排序启动缓冲）。
+    async fn publish_event(&self, mut p: ThreadProjection) {
+        self.stamp_generation(&mut p);
+        let _ = self.inner.events.send(p);
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<ThreadProjection> {
         self.inner.events.subscribe()
     }
@@ -491,6 +514,8 @@ impl DesktopIpcAdapter {
             messages: Vec::new(),
             truncated: false,
             pending: Vec::new(),
+            owner_epoch: 0,
+            owner_generation: 0,
         }
     }
 
@@ -511,6 +536,25 @@ impl DesktopIpcAdapter {
                 })
                 .unwrap_or(false),
             Err(_) => true,
+        }
+    }
+
+    /// **派发边界快照**（2026-10-20 复审 P1）：ensure 之后、start-turn 之前的忙态与
+    /// 已存在 Turn 集合，**同一把镜像锁**取出（保证两判据来自同一时刻状态）。
+    /// 忙 = active/unknown；无镜像 = 不忙（ensure 失败路径另由 start_turn 如实 NotSent）；
+    /// 锁被占（镜像正在写）= 忙（保守留队）。
+    pub fn pre_write_snapshot(&self, key: &ThreadKey) -> (bool, std::collections::HashSet<String>) {
+        let caps = self.current_caps();
+        match self.inner.mirrors.try_lock() {
+            Ok(mirrors) => match mirrors.get(key) {
+                Some(m) => {
+                    let p = m.project(caps);
+                    let busy = matches!(p.runtime_status.as_str(), "active" | "unknown");
+                    (busy, m.turn_ids())
+                }
+                None => (false, std::collections::HashSet::new()),
+            },
+            Err(_) => (true, std::collections::HashSet::new()),
         }
     }
 
@@ -1334,7 +1378,7 @@ async fn handle_state_changed(adapter: &DesktopIpcAdapter, frame: Value) {
         // C3：状态应用驱动的提交屏障清理——pending 消失或重现换 token 即解除旧
         // Unknown 屏障（不等下一次 respond 入口），新卡立即可答
         cleanup_inflight_for(adapter, &key.thread_id, &p.pending).await;
-        let _ = adapter.inner.events.send(p);
+        adapter.publish_event(p).await;
         if history_needed {
             maybe_request_complete_history(adapter, &key).await;
         }
@@ -1417,7 +1461,7 @@ async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {
         mirrors.get(key).map(|m| m.project(caps))
     };
     if let Some(p) = projection {
-        let _ = adapter.inner.events.send(p);
+        adapter.publish_event(p).await;
     }
 }
 
@@ -1669,7 +1713,7 @@ async fn handle_client_status_changed(adapter: &DesktopIpcAdapter, frame: &Value
         inflight.retain(|(tid, _), _| !affected.iter().any(|k| &k.thread_id == tid));
     }
     for p in projections {
-        let _ = adapter.inner.events.send(p);
+        adapter.publish_event(p).await;
     }
     // 2026-10-17 复审 C2：owner 失效但 socket 仍活着——连接级恢复循环不会触发；
     // 主动重新 discovery/follow 让新 owner 接管（重新接管的帧才能落进镜像），
@@ -1736,7 +1780,7 @@ async fn mark_all_mirrors_stale(adapter: &DesktopIpcAdapter, invalidate: bool) {
         }
     }
     for p in projections {
-        let _ = adapter.inner.events.send(p);
+        adapter.publish_event(p).await;
     }
 }
 

@@ -74,7 +74,7 @@ fn probe_text() -> String {
 
 /// 最终载荷（W4 单点组装：换行归一字面化 + 尾签名 + 花名白名单）
 fn payload() -> String {
-    normalize::compose_injection(E2E_DEVICE, &probe_text()).expect("E2E 花名 `e2e` 在白名单内")
+    normalize::compose_injection(E2E_DEVICE, &probe_text())
 }
 
 /// codex 探针目标（thread UUID / rollout 路径 / 项目目录）

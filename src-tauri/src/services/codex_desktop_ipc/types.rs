@@ -155,6 +155,12 @@ pub struct ThreadProjection {
     pub messages: Vec<ProjectedMessage>,
     pub truncated: bool,
     pub pending: Vec<PendingView>,
+    /// Owner 代际（epoch, generation）：**不序列化给前端**，只用于 SSE 首快照与
+    /// 订阅缓冲事件的先后判定（跨 owner revision 可能回退，不能只比 revision）。
+    #[serde(skip)]
+    pub owner_epoch: u64,
+    #[serde(skip)]
+    pub owner_generation: u64,
 }
 
 /// 内容健康状态（`contentState`）：ready 且真实 0 条才允许显示「暂无消息」；

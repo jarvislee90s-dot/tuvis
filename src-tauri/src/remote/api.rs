@@ -1340,24 +1340,10 @@ pub async fn session_send(
     let signature_on = st
         .store
         .with(crate::inject::normalize::message_signature_enabled_conn);
-    // **花名白名单（裁决 24b）**：组装单点返回 `Result`，本臂收 `Err` 即
-    // **不入队、不投递**，如实回 `{status:"failed", error:<原因>}`（与 ⑥ 的
-    // FlushOutcome::Failed 回执同形态；原因由移动端原样展示，用户据此改名）。
-    // 此处不落审计行：与端点其余**投递前**拒绝（403 not_injectable / headless_disabled）
-    // 同规——没有投递动作发生，回执已如实透出原因。
-    let content = match crate::inject::normalize::compose_injection_flagged(
-        &device_name,
-        &req.text,
-        signature_on,
-    ) {
-        Ok(c) => c,
-        Err(reason) => {
-            return json_no_store(
-                StatusCode::OK,
-                serde_json::json!({ "status": "failed", "error": reason }),
-            )
-        }
-    };
+    // 组装单点：只做归一 + 按设置签名（**不再按花名拒绝**——花名安全门在 Windows
+    // cmd 垫片的真实 argv 边界，见 `headless::codex::argv_shim_refusal`）。
+    let content =
+        crate::inject::normalize::compose_injection_flagged(&device_name, &req.text, signature_on);
     // D6 修改重发：queueOnly=true 只跳过 ⑥ 的直发尝试（语义见 SessionSendReq::queue_only
     // 注释），入队与 ⑦ 运行中留队完全同路径同审计口径（action=queue）——flush 循环对
     // queueOnly 项与普通队列项同权（转闲按序自动放行），队列存储不携带该标志
@@ -1774,18 +1760,11 @@ pub(crate) async fn codex_headless_dispatch_envelope_with_evidence(
             no_evidence(),
         );
     };
-    // 3) 命令形态（W4 单点组装：正文归一 + 移动端尾签名 + **花名白名单**，裁决 24b）
-    //    花名含 cmd 不安全字符 ⇒ `refused`（拼签名前 fail closed）：此处在串行锁 4) **之前**，
-    //    故**无需注销槽位**（还没占位）；判据本体在共享组装单点内，本臂只是 `Err` 的收口。
-    let payload = match crate::inject::normalize::compose_injection(device_name, text) {
-        Ok(p) => p,
-        Err(reason) => {
-            return (
-                ctx.refuse_envelope(st, Stage::Refused, &reason),
-                no_evidence(),
-            )
-        }
-    };
+    // 3) wire 文本：调用方（router/兜底 bridge）已按登记时冻结的签名形态组装好，
+    //    本函数**不再二次组装**（否则排队期间改设置会换正文/出双标记）。花名安全
+    //    门不在这里——它在真实 argv 边界（`argv_shim_refusal`），只对 Windows cmd
+    //    垫片形态生效。
+    let payload = text.to_string();
     let plan = codex::dispatch(presence, &tref.id, &session.project_path, &payload);
     ctx.content = payload;
     // 4) 会话串行锁（占位后每条失败路径都由守卫 Drop 注销——评审 I14 起不再逐臂
@@ -1821,14 +1800,16 @@ pub(crate) async fn codex_headless_dispatch_envelope_with_evidence(
             no_evidence(),
         );
     };
-    // 5a) **cmd 垫片正文拒绝**（P0 安全：本机 codex 常是 npm 垫片 `codex.cmd` ⇒ `cmd /c`
-    //     重解析命令行；见 `turn::cmd_shim_body_refusal`）。判据 = **用户正文**（`text`，
-    //     不是已组装的 `ctx.content`：`[mobile <花名>]` 签名是我们自己拼的）+ 已解析形态。
-    //     `.exe` 直装 ⇒ 放行。**排在版本探针之前**：探针本身也要起进程——能早拒就早拒，
-    //     拒绝臂零进程、零字节投递（回执档 = `refused`，不是版本门/通道错）。
-    //     codex 的正文进 argv（`plan.argv` 的 message），故 `body_travels_in_argv = true`。
+    // 5a) **cmd 垫片载荷拒绝**（P0 安全：本机 codex 常是 npm 垫片 `codex.cmd` ⇒
+    //     `cmd /c` 重解析命令行）。判据 = **最终 wire 载荷**（正文 +（若开）签名）
+    //     + 已解析形态：只有真正会进 argv 的分段才算，`.exe` 直装/签名关闭不受影响。
+    //     **排在版本探针之前**：探针本身也要起进程——能早拒就早拒，拒绝臂零进程、
+    //     零字节投递（回执档 = `refused`，不是版本门/通道错）。spawn 前的
+    //     `argv_shim_refusal` 仍按真实 argv 再逐段复核（纵深防御）。
     let shape = codex::spawn_shape(&exe, os);
-    if let Some(reason) = crate::inject::headless::turn::cmd_shim_body_refusal(text, &shape, true) {
+    if let Some(reason) =
+        crate::inject::headless::turn::cmd_shim_body_refusal(&ctx.content, &shape, true)
+    {
         return (
             ctx.refuse_envelope(st, Stage::Refused, &reason),
             no_evidence(),
@@ -1849,6 +1830,24 @@ pub(crate) async fn codex_headless_dispatch_envelope_with_evidence(
         );
         return (
             headless_envelope(planned_kind, &receipt, None),
+            no_evidence(),
+        );
+    }
+    // 5c) **探针等待后的设备复核**（2026-10-20 复审 P2）：版本探针是本函数里唯一的
+    //     长等待（有界 45s）；等待期间设备可能被吊销。兼容路是一次新的真实派发，
+    //     不能在探针结束后沿用入口授权——此处再核一次设备在册，吊销即零 spawn。
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let device_ok = st
+        .store
+        .with(|c| crate::remote::pairing::device_valid(c, device_id, now_ms));
+    if !device_ok {
+        slot.release();
+        return (
+            ctx.refuse_envelope(
+                st,
+                Stage::Refused,
+                "设备已在派发等待期间被吊销——本条未投递（零 spawn），请重新配对后再发",
+            ),
             no_evidence(),
         );
     }
@@ -10250,19 +10249,8 @@ pub async fn session_create(
     let signature_on = st
         .store
         .with(crate::inject::normalize::message_signature_enabled_conn);
-    let composed = match crate::inject::normalize::compose_injection_flagged(
-        &device_name,
-        &text,
-        signature_on,
-    ) {
-        Ok(c) => c,
-        Err(reason) => {
-            return json_no_store(
-                StatusCode::OK,
-                serde_json::json!({ "status": "failed", "error": reason }),
-            )
-        }
-    };
+    let composed =
+        crate::inject::normalize::compose_injection_flagged(&device_name, &text, signature_on);
     let run = CreateRun {
         task_id,
         tool,

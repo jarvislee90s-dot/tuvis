@@ -207,7 +207,10 @@ pub fn init(conn: &Connection) {
             compat_rollout_path     TEXT,
             compat_rollout_baseline INTEGER,
             compat_wire_hash        TEXT,
-            barrier_force_released_at INTEGER
+            barrier_force_released_at INTEGER,
+            -- 签名开关的登记时冻结值（1 = 正文已带 `[mobile 花名]` 签名）。
+            -- NULL = 本列上线前登记的旧行：按升级前语义（恒带签名）派发。
+            signature_applied       INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_codex_actions_thread_state_seq
             ON codex_actions(thread_id, state, seq);

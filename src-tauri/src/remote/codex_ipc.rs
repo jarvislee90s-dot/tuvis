@@ -703,11 +703,49 @@ impl DesktopDispatch for AdapterDispatch {
                 Ok(Err(e)) => return not_sent_outcome(e.code()),
                 Err(_) => return not_sent_outcome("timeout"),
             }
+            // **真正写出前的最后一道忙态复核**：router 判定 idle 到 ensure 返回之间
+            // Desktop 可能已转 active（R6.2 的 busy_fresh 只是派发前快照）。此刻按
+            // ensure 后的最新镜像状态判定；忙 → 明确「写前零投递」原因码，router 会把
+            // 动作放回队首（不消耗正文、不 fallback、不换 actionId）。
+            let (busy, existing_turns) = adapter.pre_write_snapshot(&key);
+            if busy {
+                return DispatchOutcome {
+                    delivery: Delivery::NotSent,
+                    envelope_id: None,
+                    turn_id: None,
+                    reason_code: Some(
+                        crate::services::codex_control::BUSY_BEFORE_WRITE_REASON.to_string(),
+                    ),
+                    revision: adapter.projection(&key).await.revision,
+                };
+            }
             let outcome = adapter.start_turn(&key, &action_id, &composed, &cmid).await;
             // R6.3：回执时投影 revision 基线（完成证据的严格后续判定基准）
             let revision = adapter.projection(&key).await.revision;
             let mut out = outcome_of(outcome);
             out.revision = revision;
+            // **Turn 关联有效性**（2026-10-20 复审 P1）：Windows 证据表明忙态
+            // start-turn 可能返回 success + 旧 Turn ID，而本次消息并未落进新 Turn。
+            // - 回执 turnId ∈ 派发前已存在集合 = 旧 Turn 回显 → 不 Accepted、不绑定、
+            //   进保守 Unknown（屏障保留，禁止自动重发/fallback）；
+            // - Accepted 却无 turnId = 无法确认关联 → 同样保守 Unknown。
+            if out.delivery == Delivery::Accepted {
+                match out.turn_id.as_deref() {
+                    Some(tid) if existing_turns.contains(tid) => {
+                        log::warn!(
+                            "codex/thread send: start-turn 回执为派发前旧 Turn（action={action_id} turn={tid}）——按未知投递保守处理"
+                        );
+                        out.delivery = Delivery::UnknownDelivery;
+                        out.reason_code = Some("stale_turn_echo".to_string());
+                        out.turn_id = None;
+                    }
+                    Some(_) => {}
+                    None => {
+                        out.delivery = Delivery::UnknownDelivery;
+                        out.reason_code = Some("turn_unconfirmed".to_string());
+                    }
+                }
+            }
             out
         })
     }
@@ -974,7 +1012,9 @@ pub(crate) async fn run_compat(st: Arc<RemoteState>, permit: FallbackPermit) -> 
         tokio::time::sleep(std::time::Duration::from_millis(min_ms)).await;
     }
     let ctx = permit.context().clone();
-    let raw = permit.raw_text().to_string();
+    // 最终 wire 文本在登记时已冻结（与 A 路/CLI/`wire_text_hash` 同一份），此处不得
+    // 再组装（排队期间设置变化不得改写正文）。
+    let wire = permit.wire_text().to_string();
     let action_id = permit.action_id().to_string();
     let thread_id = ctx.key.thread_id.clone();
     // thread → 会话反查（permit 只带 ThreadKey；快照扫描是重活，spawn_blocking）
@@ -1002,6 +1042,23 @@ pub(crate) async fn run_compat(st: Arc<RemoteState>, permit: FallbackPermit) -> 
         );
         return refused_envelope(&action_id, "compat_session_missing");
     };
+    // 真实兼容派发前复核设备在册：A 路等待/IPC 预写期间设备可能被吊销——兼容路是
+    // 一次新的真实派发，不能沿用等待前的授权判断。吊销 → 明确拒绝、零 spawn、
+    // 同事务清 fence 并审计。
+    if !permit.store().device_valid(&ctx.device_id) {
+        let receipt = not_sent_receipt(&action_id, ControlRoute::HeadlessCompat, "device_revoked");
+        let _ = permit.finish(receipt);
+        codex_fallback_audit(
+            &st,
+            &ctx,
+            &session.id,
+            "",
+            None,
+            None,
+            "refused:device_revoked",
+        );
+        return refused_envelope(&action_id, "device_revoked");
+    }
     // **发送前原子持久 fence 与核对证据**（R9.1，2026-10-17 审计：fence/证据持久化
     // 成功是调用真实 helper 的前提——单条 UPDATE 原子写；写失败 → 零 helper 调用、
     // 动作如实落账 NotSent，杜绝「发送后崩溃恢复时没有顺序屏障」）。组装失败（花名
@@ -1009,49 +1066,43 @@ pub(crate) async fn run_compat(st: Arc<RemoteState>, permit: FallbackPermit) -> 
     let home = (st.home_source)().map(std::path::PathBuf::from);
     let rollout = production_rollout_path(home.as_deref(), &session.id);
     let baseline = rollout.as_deref().and_then(baseline_len);
-    match crate::inject::normalize::compose_injection(&ctx.device_name, &raw) {
-        Ok(composed) => {
-            if let Err(e) = permit.store().set_compat_dispatch_barrier(
-                &action_id,
-                None,
-                None,
-                rollout.as_deref(),
-                baseline,
-                Some(&wire_text_hash(&composed)),
-            ) {
-                log::error!(
-                    "codex_ipc: 兼容派发屏障持久化失败（零 helper 调用）action={action_id} err={e}"
-                );
-                let receipt = not_sent_receipt(
-                    &action_id,
-                    ControlRoute::HeadlessCompat,
-                    "compat_barrier_persist_failed",
-                );
-                let _ = permit.finish(receipt);
-                codex_fallback_audit(
-                    &st,
-                    &ctx,
-                    &session.id,
-                    "",
-                    None,
-                    None,
-                    "refused:compat_barrier_persist_failed",
-                );
-                return refused_envelope(&action_id, "compat_barrier_persist_failed");
-            }
-        }
-        Err(reason) => {
-            log::warn!("codex_ipc: 兜底组装失败（不设屏障，helper 亦必拒发）action={action_id} reason={reason}");
-        }
+    if let Err(e) = permit.store().set_compat_dispatch_barrier(
+        &action_id,
+        None,
+        None,
+        rollout.as_deref(),
+        baseline,
+        Some(&wire_text_hash(&wire)),
+    ) {
+        log::error!(
+            "codex_ipc: 兼容派发屏障持久化失败（零 helper 调用）action={action_id} err={e}"
+        );
+        let receipt = not_sent_receipt(
+            &action_id,
+            ControlRoute::HeadlessCompat,
+            "compat_barrier_persist_failed",
+        );
+        let _ = permit.finish(receipt);
+        codex_fallback_audit(
+            &st,
+            &ctx,
+            &session.id,
+            "",
+            None,
+            None,
+            "refused:compat_barrier_persist_failed",
+        );
+        return refused_envelope(&action_id, "compat_barrier_persist_failed");
     }
     // 既有 helper（旧 headless 封套语义全套；action 词保持 `headless`——既有行保留，
-    // 本动作以 codex_fallback 行按 actionId 另行关联）
+    // 本动作以 codex_fallback 行按 actionId 另行关联）。传入**已冻结的最终 wire**，
+    // helper 不再组装。
     let (envelope, evidence) = super::api::codex_headless_dispatch_envelope_with_evidence(
         &st,
         &ctx.device_id,
         &ctx.device_name,
         &session,
-        &raw,
+        &wire,
         crate::inject::headless::ACTION_HEADLESS,
     )
     .await;
@@ -1251,9 +1302,15 @@ pub(crate) async fn session_send_via_hub(
                 None,
                 "refused:headless_disabled",
             );
+            // 手机端 MessageComposer 只读 `data.reason` 展示可理解原因；只回 error
+            // 会退化成「session-send 403」。reasonCode 供程序分诊，reason 为用户文案。
             json_no_store(
                 StatusCode::FORBIDDEN,
-                serde_json::json!({ "error": "headless_disabled" }),
+                serde_json::json!({
+                    "error": "headless_disabled",
+                    "reasonCode": "headless_disabled",
+                    "reason": crate::remote::HEADLESS_DISABLED_REASON,
+                }),
             )
         }
     }
@@ -1383,10 +1440,14 @@ pub async fn thread_events(
     let adapter = hub.adapter.clone();
     // R7.3：详情订阅引用计数（挂载 +1；流结束 -1；归零且无本地待发 → unfollow）
     hub.follow_ref_acquire(&key);
+    // **先订阅、后取快照**（2026-10-20 复审 P2）：消除「快照 → subscribe」之间唯一
+    // 更新永久漏掉的窗口。订阅缓冲里的事件在快照之后按 owner 代际 + revision 合并，
+    // 旧事件不得覆盖较新的首快照（见 `merge_startup_buffer`）。
+    let mut rx = adapter.subscribe();
     let first = live_projection(hub, &key).await;
-    let rx = adapter.subscribe();
+    let (first, buffered) = drain_startup_buffer(adapter.clone(), &key, &mut rx, first).await;
     let guarded = GuardedStream {
-        inner: projection_stream(adapter, key.clone(), first, rx).take_until(close_rx),
+        inner: projection_stream(adapter, key.clone(), first, buffered, rx).take_until(close_rx),
         _guard: Some(FollowReleaseGuard {
             hub: st.codex_control.clone(),
             key,
@@ -1440,12 +1501,89 @@ impl<S: Stream> Stream for GuardedStream<S> {
     }
 }
 
-/// 投影事件流：首帧 snapshot，后续 state；Lagged（广播槽落后）→ 重发 snapshot。
+/// 启动缓冲是否比当前快照更新（**不用单一 revision**：跨 owner 会回退）。
+/// 顺序：epoch > generation > revision；stale 事件不得覆盖新鲜快照。
+fn supersedes(buffered: &ThreadProjection, snap: &ThreadProjection) -> bool {
+    if buffered.thread_id != snap.thread_id {
+        return false;
+    }
+    if buffered.owner_epoch != snap.owner_epoch {
+        return buffered.owner_epoch > snap.owner_epoch;
+    }
+    if buffered.owner_generation != snap.owner_generation {
+        return buffered.owner_generation > snap.owner_generation;
+    }
+    if buffered.stale && !snap.stale {
+        return false;
+    }
+    match (buffered.revision, snap.revision) {
+        (Some(b), Some(s)) => b > s,
+        (Some(_), None) => true,
+        // 无 revision 的事件（stale/未知）不能证明比快照新
+        (None, _) => false,
+    }
+}
+
+/// 首快照 + 启动缓冲合并：快照在前，缓冲里**仍然更新**的事件按到达顺序追加；
+/// 与已接受链尾比较（单调），旧事件既不覆盖快照也不回退。
+fn merge_startup_buffer(
+    key: &ThreadKey,
+    first: ThreadProjection,
+    buffered: Vec<ThreadProjection>,
+) -> Vec<ThreadProjection> {
+    let mut out = vec![first];
+    for p in buffered {
+        if p.thread_id != key.thread_id {
+            continue;
+        }
+        if let Some(last) = out.last() {
+            if supersedes(&p, last) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// 取快照后把订阅缓冲抽干并合并；启动期发生 Lagged（丢帧）→ 重新取一次快照并清空
+/// 缓冲（有界：最多重取一次，避免高频循环）。
+async fn drain_startup_buffer(
+    adapter: Arc<DesktopIpcAdapter>,
+    key: &ThreadKey,
+    rx: &mut tokio::sync::broadcast::Receiver<ThreadProjection>,
+    first: ThreadProjection,
+) -> (ThreadProjection, Vec<ThreadProjection>) {
+    let mut buffered = Vec::new();
+    let mut lagged = false;
+    loop {
+        match rx.try_recv() {
+            Ok(p) => buffered.push(p),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                lagged = true;
+                break;
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    if lagged {
+        buffered.clear();
+        return (adapter.projection(key).await, buffered);
+    }
+    let merged = merge_startup_buffer(key, first, buffered);
+    let mut it = merged.into_iter();
+    let head = it.next().expect("merge 至少保留首快照");
+    (head, it.collect())
+}
+
+/// 投影事件流：首帧 snapshot（含启动缓冲合并出的后续 state），后续 state；Lagged →
+/// 重发 snapshot（下游基线自愈）。
 #[allow(clippy::type_complexity)]
 fn projection_stream(
     adapter: Arc<DesktopIpcAdapter>,
     key: ThreadKey,
     first: ThreadProjection,
+    buffered: Vec<ThreadProjection>,
     rx: tokio::sync::broadcast::Receiver<ThreadProjection>,
 ) -> impl Stream<Item = Result<sse::Event, Infallible>> {
     let state = StreamState {
@@ -1453,11 +1591,15 @@ fn projection_stream(
         key,
         rx,
         pending_snapshot: Some(first),
+        pending_events: buffered.into(),
     };
     futures::stream::unfold(state, |mut s| async move {
         loop {
             if let Some(first) = s.pending_snapshot.take() {
                 return Some((Ok(projection_event("snapshot", &first)), s));
+            }
+            if let Some(p) = s.pending_events.pop_front() {
+                return Some((Ok(projection_event("state", &p)), s));
             }
             match s.rx.recv().await {
                 Ok(p) => {
@@ -1482,6 +1624,8 @@ struct StreamState {
     key: ThreadKey,
     rx: tokio::sync::broadcast::Receiver<ThreadProjection>,
     pending_snapshot: Option<ThreadProjection>,
+    /// 启动缓冲合并结果（快照之后、订阅转实时之前必须补发的事件）
+    pending_events: std::collections::VecDeque<ThreadProjection>,
 }
 
 fn projection_event(name: &str, p: &ThreadProjection) -> sse::Event {
@@ -2032,4 +2176,110 @@ fn device_identity(st: &RemoteState, headers: &HeaderMap) -> Option<(String, Str
         .store
         .with(|c| super::pairing::device_name(c, &device_id));
     Some((device_id, device_name))
+}
+
+#[cfg(test)]
+mod startup_merge_tests {
+    //! 2026-10-20 复审 P2：SSE 首快照与订阅缓冲的合并语义（纯函数层，确定性覆盖
+    //! 「快照与建流交界处发布最终态」「旧缓冲不得覆盖较新快照」「owner 换代」）。
+
+    use super::{merge_startup_buffer, supersedes};
+    use crate::services::codex_desktop_ipc::types::{
+        CapabilitySet, ContentState, ControlAvailability, ThreadKey, ThreadProjection,
+    };
+
+    fn k(thread: &str) -> ThreadKey {
+        ThreadKey {
+            host_id: "local".into(),
+            thread_id: thread.into(),
+        }
+    }
+
+    fn p(thread: &str, epoch: u64, gen: u64, rev: Option<u64>, stale: bool) -> ThreadProjection {
+        ThreadProjection {
+            thread_id: thread.into(),
+            revision: rev,
+            stale,
+            availability: ControlAvailability::Controllable,
+            capabilities: CapabilitySet {
+                send: true,
+                state: true,
+                command: true,
+                permissions: false,
+                blocking_input: true,
+            },
+            runtime_status: "idle".into(),
+            content_state: ContentState::Ready,
+            messages: Vec::new(),
+            truncated: false,
+            pending: Vec::new(),
+            owner_epoch: epoch,
+            owner_generation: gen,
+        }
+    }
+
+    /// 交界处发布最终态：缓冲里更新的 state 必须排在快照之后被补发。
+    #[test]
+    fn buffered_final_state_survives_after_snapshot() {
+        let key = k("t");
+        let merged = merge_startup_buffer(
+            &key,
+            p("t", 1, 1, Some(5), false),
+            vec![p("t", 1, 1, Some(6), false)],
+        );
+        let revs: Vec<_> = merged.iter().map(|x| x.revision).collect();
+        assert_eq!(revs, vec![Some(5), Some(6)], "快照在前，新事件补发");
+    }
+
+    /// 旧缓冲不得覆盖较新首快照。
+    #[test]
+    fn older_buffered_does_not_override_snapshot() {
+        let key = k("t");
+        let merged = merge_startup_buffer(
+            &key,
+            p("t", 1, 1, Some(9), false),
+            vec![p("t", 1, 1, Some(8), false)],
+        );
+        assert_eq!(merged.len(), 1, "旧事件丢弃");
+        assert_eq!(merged[0].revision, Some(9));
+    }
+
+    /// owner 换代：generation 更高的低 revision 必须接受；旧 epoch 的高 revision 必须拒。
+    #[test]
+    fn owner_generation_wins_over_revision() {
+        let snap = p("t", 2, 3, Some(50), false);
+        assert!(
+            !supersedes(&p("t", 1, 9, Some(99), false), &snap),
+            "旧 epoch 的高 revision 不是新世界"
+        );
+        assert!(
+            supersedes(&p("t", 2, 4, Some(1), false), &snap),
+            "同 epoch 新一代 generation 即使 revision 更低也是合法新状态"
+        );
+        assert!(
+            supersedes(&p("t", 3, 0, None, false), &snap),
+            "新 epoch 本身更新"
+        );
+    }
+
+    /// stale 事件不得覆盖新鲜快照；无 revision 的 stale 也不得排在其后。
+    #[test]
+    fn stale_buffered_does_not_override_fresh_snapshot() {
+        let snap = p("t", 1, 1, Some(5), false);
+        assert!(!supersedes(&p("t", 1, 1, Some(6), true), &snap));
+        let merged = merge_startup_buffer(&k("t"), snap, vec![p("t", 1, 1, None, true)]);
+        assert_eq!(merged.len(), 1);
+    }
+
+    /// 别的 Thread 的缓冲事件一律忽略（单会话订阅不串台）。
+    #[test]
+    fn other_thread_events_are_ignored() {
+        let merged = merge_startup_buffer(
+            &k("mine"),
+            p("mine", 1, 1, Some(1), false),
+            vec![p("other", 2, 2, Some(9), false)],
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].thread_id, "mine");
+    }
 }

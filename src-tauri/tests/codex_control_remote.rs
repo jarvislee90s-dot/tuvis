@@ -35,6 +35,18 @@ fn shared_conn() -> SharedConn {
     Arc::new(Mutex::new(conn))
 }
 
+/// 设置「远程消息带设备签名」（settings KV；缺省关）。
+fn set_signature(conn: &SharedConn, on: bool) {
+    conn.lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO settings (key, value) VALUES ('remote_message_signature', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [if on { "on" } else { "off" }],
+        )
+        .expect("set signature");
+}
+
 fn seed_device(conn: &SharedConn, id: &str, name: &str) {
     let dev = NewDevice {
         id: id.to_string(),
@@ -71,6 +83,11 @@ struct FakeDispatch {
     /// 派发门（PR #165 事项①测试）：Some = send_text 在门打开前挂起（模拟分钟级/
     /// RPC 级在飞派发，guard 由其持有），None = 立即返回。
     send_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// 写前忙（模拟 adapter 在 ensure 后、真正 start-turn 前判定 busy）：send_text
+    /// **不记录** start-turn 调用，只返回 `NotSent(busy_before_write)`。
+    busy_before_write: AtomicBool,
+    /// 写前忙检查次数（对应 adapter 的 pre_write_snapshot 调用）。
+    pre_write_checks: Mutex<usize>,
 }
 
 impl FakeDispatch {
@@ -83,6 +100,8 @@ impl FakeDispatch {
             responds: Mutex::new(Vec::new()),
             terminal_turns: Mutex::new(std::collections::HashSet::new()),
             send_gate: Mutex::new(None),
+            busy_before_write: AtomicBool::new(false),
+            pre_write_checks: Mutex::new(0),
         }
     }
 
@@ -142,6 +161,16 @@ impl FakeDispatch {
         self.busy.store(b, Ordering::SeqCst);
     }
 
+    /// 模拟「router 判 idle 后、send_text 的 ensure 返回 active」：写前检查返回忙，
+    /// 本次不产生任何 start-turn 调用。
+    fn set_busy_before_write(&self, b: bool) {
+        self.busy_before_write.store(b, Ordering::SeqCst);
+    }
+
+    fn pre_write_check_count(&self) -> usize {
+        *self.pre_write_checks.lock().unwrap()
+    }
+
     /// C1：登记一个已以终态在场的 turnId（镜像侧完成证据）
     fn set_terminal_turn(&self, turn_id: &str) {
         self.terminal_turns
@@ -153,6 +182,11 @@ impl FakeDispatch {
     /// C1：撤销终态证据（turn 回到 inProgress / 不在场）
     fn unset_terminal_turn(&self, turn_id: &str) {
         self.terminal_turns.lock().unwrap().remove(turn_id);
+    }
+
+    /// 运行期替换 A 路派发结果（构造器已有初始值；本方法供分阶段用例切换）。
+    fn set_outcome(&self, out: DispatchOutcome) {
+        *self.send_outcome.lock().unwrap() = out;
     }
 
     fn send_count(&self) -> usize {
@@ -191,6 +225,22 @@ impl DesktopDispatch for FakeDispatch {
         client_message_id: &str,
     ) -> multi_agents_manager_lib::services::codex_control::BoxDispatchFut {
         let _ = client_message_id; // P3-3 后恢复行派发被闸，无对照读者；保留参数形
+        *self.pre_write_checks.lock().unwrap() += 1;
+        if self.busy_before_write.load(Ordering::SeqCst) {
+            // 生产语义：忙时**没有** start-turn 调用（sends 不记录）
+            return Box::pin(async {
+                DispatchOutcome {
+                    delivery: Delivery::NotSent,
+                    envelope_id: None,
+                    turn_id: None,
+                    reason_code: Some(
+                        multi_agents_manager_lib::services::codex_control::BUSY_BEFORE_WRITE_REASON
+                            .to_string(),
+                    ),
+                    revision: None,
+                }
+            });
+        }
         self.sends.lock().unwrap().push(SendRecord {
             action_id: action_id.to_string(),
             composed: composed.to_string(),
@@ -383,6 +433,8 @@ fn projection_with_rev(thread_id: &str, status: &str, revision: u64) -> ThreadPr
         }],
         truncated: false,
         pending: Vec::new(),
+        owner_epoch: 0,
+        owner_generation: 0,
     }
 }
 
@@ -609,7 +661,7 @@ async fn fallback_only_before_dispatch() {
             .await,
     );
     assert_eq!(permit.action_id(), "fb-1");
-    assert_eq!(permit.raw_text(), "降级消息", "permit 携带原文");
+    assert_eq!(permit.wire_text(), "降级消息", "permit 携带原文");
     assert_eq!(permit.context().device_name, "iPhone");
     permit
         .finish(accepted_compat_receipt("fb-1"))
@@ -668,7 +720,7 @@ async fn profile_mismatch_send_falls_back_with_capability_reason() {
             reason_code,
         } => {
             assert_eq!(reason_code, "capability_unavailable");
-            assert_eq!(permit.raw_text(), "兼容消息");
+            assert_eq!(permit.wire_text(), "兼容消息");
             permit
                 .finish(not_sent_receipt(
                     "fb-prof",
@@ -793,36 +845,30 @@ async fn revoked_device_queued_action_refused_not_dispatched() {
 }
 
 // ============================================================
-// 计划场景 8：三条路径单一 [mobile] 标记
+// 2026-10-20 复审 P2：签名设置在登记时冻结
 // ============================================================
 
-/// 立即发送、FIFO 重启恢复、fallback 三条路径逐一断言正文只有一个 `[mobile <设备名>]`；
-/// 持久队列存原文（hash 基于原文）；恢复后仍只组装一次；fallback 由 bridge 用原文组装。
+/// 关（默认）＝三条路径都裸正文；开＝恰好一次 `[mobile 花名]`；入队后切设置/重启
+/// 不改变既定正文；fallback permit 携带同一份冻结 wire（hash 同源）。
 #[tokio::test]
-async fn three_paths_compose_marker_exactly_once() {
+async fn signature_setting_is_frozen_at_registration() {
     let raw = "带签名正文";
 
-    // 路径一：立即发送
+    // 默认关：立即派发 → 裸正文（不再恒加标记）
     {
         let h = harness();
         completed(
             h.router
-                .send(h.ctx("mk-1", ActionKind::Send), raw.into(), false)
+                .send(h.ctx("sig-off", ActionKind::Send), raw.into(), false)
                 .await,
         );
-        let composed = h.dispatch.recorded_composed();
-        assert_eq!(composed.len(), 1);
-        assert_eq!(composed[0], format!("{raw} [mobile iPhone]"));
-        assert_eq!(
-            composed[0].matches("[mobile iPhone]").count(),
-            1,
-            "恰好一次标记"
-        );
-        // 账本 hash 基于原文而非组合文本
+        assert_eq!(h.dispatch.recorded_composed(), vec![raw.to_string()]);
+        assert!(!h.dispatch.recorded_composed()[0].contains("[mobile"));
+        // 幂等指纹仍按原文（设置变化不产生 action_conflict）
         let stored_hash: String = {
             let conn = h.conn.lock().unwrap();
             conn.query_row(
-                "SELECT payload_hash FROM codex_actions WHERE action_id = 'mk-1'",
+                "SELECT payload_hash FROM codex_actions WHERE action_id = 'sig-off'",
                 [],
                 |r| r.get(0),
             )
@@ -836,64 +882,200 @@ async fn three_paths_compose_marker_exactly_once() {
                 None,
                 None,
                 &ActionPayload::Text(raw.into())
-            ),
-            "hash 基于原文"
+            )
         );
     }
 
-    // 路径二：FIFO + 重启恢复（仍只组装一次）
+    // 开启：立即派发 → 恰好一次签名
     {
-        let mut h = harness();
-        h.router
-            .send(h.ctx("mk-2", ActionKind::Send), raw.into(), true)
-            .await;
-        h.restart();
-        h.router.flush_thread(&h.key).await.expect("dispatch");
+        let h = harness();
+        set_signature(&h.conn, true);
+        completed(
+            h.router
+                .send(h.ctx("sig-on", ActionKind::Send), raw.into(), false)
+                .await,
+        );
         let composed = h.dispatch.recorded_composed();
-        assert_eq!(composed.len(), 1);
-        assert_eq!(composed[0], format!("{raw} [mobile iPhone]"));
+        assert_eq!(composed, vec![format!("{raw} [mobile iPhone]")]);
         assert_eq!(composed[0].matches("[mobile iPhone]").count(), 1);
     }
 
-    // 路径三：fallback（permit 携带原文，由 Task 8 bridge 组装恰好一次）
+    // 入队后切设置 + 重启恢复：仍按**登记时**的签名形态派发（不是重启时设置）
+    {
+        let mut h = harness();
+        set_signature(&h.conn, true);
+        h.router
+            .send(h.ctx("sig-queued", ActionKind::Send), raw.into(), true)
+            .await;
+        set_signature(&h.conn, false);
+        h.restart();
+        h.router.flush_thread(&h.key).await.expect("dispatch");
+        assert_eq!(
+            h.dispatch.recorded_composed(),
+            vec![format!("{raw} [mobile iPhone]")],
+            "排队期间切设置不得改写已登记动作的正文"
+        );
+    }
+
+    // 旧行升级语义：signature_applied=NULL 的存量 queued 行 = 升级前恒签名
+    {
+        let h = harness();
+        h.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO codex_actions (action_id, device_id, device_name, thread_id, kind, \
+                     payload_hash, client_message_id, state, route, queued_text, created_at, updated_at) \
+                 VALUES ('sig-legacy', 'dev-1', 'iPhone', ?1, 'send', 'h', 'cm', 'queued', 'none', ?2, 1, 1)",
+                rusqlite::params![THREAD, raw],
+            )
+            .unwrap();
+        h.router.flush_thread(&h.key).await.expect("dispatch");
+        assert_eq!(
+            h.dispatch.recorded_composed(),
+            vec![format!("{raw} [mobile iPhone]")],
+            "旧行保持升级前语义（恒带签名）"
+        );
+    }
+
+    // fallback：permit 携带冻结 wire；wire hash 与 fence 证据同源
     {
         let h = harness_with(FakeDispatch::not_sent("ipc_disconnected"));
+        set_signature(&h.conn, true);
         let permit = use_fallback(
             h.router
-                .send(h.ctx("mk-3", ActionKind::Send), raw.into(), false)
+                .send(h.ctx("sig-fb", ActionKind::Send), raw.into(), false)
                 .await,
         );
-        assert_eq!(permit.raw_text(), raw, "permit 存原文");
-        // 模拟 bridge：用原文组装恰好一次，并记录 wire hash
-        let composed = multi_agents_manager_lib::inject::normalize::compose_injection(
-            "iPhone",
-            permit.raw_text(),
-        )
-        .expect("compose");
-        assert_eq!(composed.matches("[mobile iPhone]").count(), 1);
+        let wire = permit.wire_text().to_string();
+        assert_eq!(wire, format!("{raw} [mobile iPhone]"));
         h.store
-            .set_compat_fence("mk-3", Some("compat-msg-3"), Some("compat-turn-3"))
+            .set_compat_fence("sig-fb", Some("compat-msg"), Some("compat-turn"))
             .expect("set fence");
         h.store
             .set_compat_evidence(
-                "mk-3",
+                "sig-fb",
                 Some("/tmp/rollout.jsonl"),
                 Some(64),
-                Some(&wire_text_hash(&composed)),
+                Some(&wire_text_hash(&wire)),
             )
             .expect("set evidence");
         let fences = h.store.compat_fences(&h.key).expect("fences");
-        assert_eq!(fences.len(), 1);
         assert_eq!(
             fences[0].wire_hash.as_deref(),
-            Some(wire_text_hash(&composed)).as_deref()
+            Some(wire_text_hash(&wire)).as_deref(),
+            "fence 证据 hash 与 permit wire 同一份"
         );
         permit
-            .finish(accepted_compat_receipt("mk-3"))
+            .finish(accepted_compat_receipt("sig-fb"))
             .expect("finish");
-        assert_eq!(h.state_of("mk-3"), ActionState::Accepted);
     }
 }
+
+// ============================================================
+// 2026-10-20 复审 P1：写前忙回队 / 旧 Turn 回显
+// ============================================================
+
+/// A：router 判 idle 后、send_text 的 ensure 返回 active →
+/// start-turn 调用数 0；动作仍排队、正文未丢、兼容派发 0；转闲后仍按原 actionId/正文派发。
+#[tokio::test]
+async fn busy_after_idle_check_requeues_without_start_turn() {
+    let h = harness_with(FakeDispatch::accepted());
+    h.dispatch.set_busy_before_write(true);
+    let raw = "写前忙的消息";
+    let out = h
+        .router
+        .send(h.ctx("busy-1", ActionKind::Send), raw.into(), false)
+        .await;
+    match out {
+        RouterOutcome::Queued { action_id, .. } => assert_eq!(action_id, "busy-1"),
+        other => panic!("写前忙必须保持排队：{other:?}"),
+    }
+    assert_eq!(h.dispatch.send_count(), 0, "零 start-turn 调用");
+    assert_eq!(h.dispatch.pre_write_check_count(), 1, "写前复核发生过");
+    let (state, text): (String, Option<String>) = {
+        let conn = h.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT state, queued_text FROM codex_actions WHERE action_id = 'busy-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(state, "queued", "动作回到 queued（不消耗）");
+    assert_eq!(text.as_deref(), Some(raw), "正文未丢");
+    assert!(
+        !h.store.has_compat_fence(&h.key).unwrap(),
+        "写前忙不得制造兼容 fence/兜底"
+    );
+
+    // 转闲后按原 actionId/正文派发
+    h.dispatch.set_busy_before_write(false);
+    let flushed = h.router.flush_thread(&h.key).await.expect("flush");
+    let receipt = completed(flushed);
+    assert_eq!(receipt.delivery, Delivery::Accepted);
+    assert_eq!(
+        h.dispatch.recorded_composed(),
+        vec![raw.to_string()],
+        "同一 actionId 重派，正文未变"
+    );
+    assert_eq!(h.state_of("busy-1"), ActionState::Accepted);
+}
+
+/// B：start-turn success 返回派发前已存在的旧 Turn ID → 不落 Accepted、不绑定完成
+/// Turn、进保守 Unknown 并保持屏障；旧 Turn 完成后仍不派发下一条；fallback 0。
+#[tokio::test]
+async fn stale_turn_echo_is_unknown_and_keeps_barrier() {
+    let h = harness_with(FakeDispatch::accepted());
+    h.dispatch.set_outcome(DispatchOutcome {
+        delivery: Delivery::UnknownDelivery,
+        envelope_id: Some("env-stale".into()),
+        turn_id: None,
+        reason_code: Some("stale_turn_echo".into()),
+        revision: None,
+    });
+    let raw = "忙态伪成功";
+    let receipt = completed(
+        h.router
+            .send(h.ctx("stale-1", ActionKind::Send), raw.into(), false)
+            .await,
+    );
+    assert_eq!(
+        receipt.delivery,
+        Delivery::UnknownDelivery,
+        "旧 Turn 回显不得记为 Accepted"
+    );
+    assert_eq!(h.state_of("stale-1"), ActionState::Unknown);
+    assert!(
+        h.store.has_compat_fence(&h.key).unwrap(),
+        "保守屏障必须保留"
+    );
+
+    // 旧 Turn 以终态在场 + 投影 idle：证据门不认（没有绑定 turnId），不得释放
+    h.dispatch.set_terminal_turn("turn-old");
+    assert!(
+        !h.router
+            .release_turn_if_complete(&h.key, &projection_with_rev(THREAD, "idle", 9)),
+        "旧 Turn 完成不是本动作的证据"
+    );
+    // 下一条仍只能排队；零新派发、零兼容
+    let out = h
+        .router
+        .send(h.ctx("stale-2", ActionKind::Send), "下一条".into(), false)
+        .await;
+    assert!(
+        matches!(out, RouterOutcome::Queued { .. }),
+        "下一条必须排队"
+    );
+    assert_eq!(h.dispatch.send_count(), 1, "零新派发");
+    assert!(h
+        .store
+        .get_for_device("stale-1", "dev-1")
+        .unwrap()
+        .is_some());
+}
+
+// ============================================================
 
 // ============================================================
 // 计划场景 9：审计 trigger 回滚

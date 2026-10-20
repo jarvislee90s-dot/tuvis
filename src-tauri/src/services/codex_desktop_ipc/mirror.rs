@@ -217,6 +217,21 @@ impl ThreadMirror {
             .map(str::to_string)
     }
 
+    /// 当前镜像中已存在的全部 Turn ID（派发边界快照用）：回执 turnId 若落在此集合
+    /// 中，说明它是**派发前就存在**的旧 Turn 回显，不是本动作产生的新 Turn。
+    pub fn turn_ids(&self) -> std::collections::HashSet<String> {
+        self.state
+            .as_ref()
+            .map(|s| {
+                HistoryView::new(s)
+                    .turns()
+                    .iter()
+                    .map(|t| t.turn_id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// 指定 Turn 是否已以终态出现在当前镜像（completed/failed）。
     /// 不在场 / inProgress / 未知状态 / stale / 无镜像 → false（保守不释放）。
     pub fn turn_is_terminal(&self, turn_id: &str) -> bool {
@@ -429,6 +444,9 @@ impl ThreadMirror {
             truncated: messages.1,
             messages: messages.0,
             pending,
+            // 代际由 adapter 在广播/GET 前统一盖章（mirror 不持有 owner 表）
+            owner_epoch: 0,
+            owner_generation: 0,
         }
     }
 }

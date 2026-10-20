@@ -51,70 +51,35 @@ fn is_strippable_control(c: char) -> bool {
 ///
 /// 设备花名同样归一：昵称来自手机端用户输入，可能含换行，不得破坏单行不变量。
 ///
-/// # `Result` 的原因（裁决 24b：花名的 cmd 安全白名单，就在本单点判）
+/// # 花名不在这里判（2026-10-20 复审 P2 收窄）
 ///
-/// 签名 `[mobile <花名>]` 会随载荷进**无头 CLI 的命令行**（`codex queue --message` /
-/// `kimi --prompt` / `opencode run` / `zcode.cjs --prompt`），Windows 上这些 CLI 常是 npm
-/// 垫片（`.cmd` ⇒ `cmd /c` 重解析整条命令行）⇒ 花名与用户正文**同一条重解析面**。R3 当时
-/// 只判了正文（[`crate::inject::headless::turn::cmd_shim_body_refusal`]），签名面**登记为敞口**；
-/// 本函数在**拼接之前**过白名单判据
-/// （[`crate::inject::headless::turn::device_name_refusal`]），不安全即 `Err(reason)`。
-///
-/// **判据落在这一层（共享组装单点），不在各通道的 argv 构造器**：本函数是注入文本的
-/// **唯一组装出口**（见上），把门设在这里，后来新增的通道**没有绕开的路径**（若设在
-/// 各通道 argv 构造器，新通道忘接一次就是敞口）。调用方收到 `Err` 一律 fail closed
-/// （回执档 `refused`、零字节投递，原因点名字符），**不静默改写花名**。
-///
-/// **不按通道分岔**（与正文判据的形态条件不同）：花名是**注册期的值**、用户改一次名即可，
-/// 而「正文走 stdin / `.exe` 直装」这类例外对花名并不成立（同一个花名进任意 argv 通道都
-/// 有风险）——故这里无条件判：终端注入路径同样拒（终端打字没有 shell 重解析面，但按通道
-/// 分岔会给未来的通道留缺口，不值得）。存量已登记的危险花名由本判据在**投递时**兜住
-/// （**不做 migration**：注册点只挡新的，旧的靠这里，见 `device_name_refusal` 的调用点节）。
-///
-/// **有意从严（裁决 25，2026-10-05 用户裁决——勿改为按威胁面放宽）**：本单点放行的是
-/// **字符类白名单**（Unicode 字母数字 + 空格 `-` `_` `.` `·`）——自定义花名用常规字符即可，
-/// **emoji / 未列举符号一律拒**；**即便**某符号未必真能构成 `cmd` 语义，也**不按威胁面放宽**
-/// （用户理由：余量留在威胁面之上，不做「该字符看起来无害」的减法论证）。判据本体与理由
-/// 全文见 [`crate::inject::headless::turn::device_name_refusal`] 的「有意从严」节。
-///
-/// **斜杠消息不判花名**：`/` 开头走**裸注入**（无签名，见下），花名根本不进载荷——
-/// 判它就成了「与风险无关的拒绝」（同 claude 的 stdin 例外面）。审计侧的设备名另走
-/// `endpoint_audit`，与本判据无关。
-pub fn compose_injection(device_name: &str, text: &str) -> Result<String, String> {
+/// 曾有一版在拼接前对花名过「Unicode 字母数字 + 空格 - _ . ·」白名单，拒绝 emoji、
+/// 撇号、冒号、组合音标——它误伤了**所有**终端注入路径与 macOS，而真正的威胁面只有
+/// 「Windows npm 垫片（.cmd/.bat → `cmd /c`）重解析最终命令行」。现约定：
+/// - 本函数只负责归一 + 可选签名，**不因花名拒绝**（斜杠消息照旧裸注入）；
+/// - 真正的最后一道门在**实际派发参数**上：`headless::codex::argv_shim_refusal`
+///   在 spawn 前逐段检查最终 argv（含正文、签名、项目路径），只有 `via_cmd_shim`
+///   形态且载荷确实进 argv 时才拒绝（字符表 = `CMD_SHIM_METACHARS`）。
+/// - 因此签名关闭、Desktop IPC（Named Pipe/Unix socket）、原生 `.exe` 直装等不经过
+///   cmd 重解析面的路径，不会仅因花名含 emoji/撇号/冒号而失败。
+pub fn compose_injection(device_name: &str, text: &str) -> String {
     compose_injection_flagged(device_name, text, true)
 }
 
 /// 带**签名开关**的组装变体（2026-10-05 用户裁决）：`signature=false`（设置
 /// 「远程消息带设备签名」关闭）→ 普通消息也**裸注入**——签名是纯溯源便利，
-/// 每条都吃 token；溯源真源在注入审计页（设备名逐条在账），终端不留痕可接受
-/// （与斜杠命令的裸注入同一裁决口径）。队列存的是 compose 产物 → 开关在入队
-/// 时刻生效（已入队消息维持入队时形态，语义自洽）。**花名白名单与签名开关
-/// 正交**（裁决 24b：花名是注册期的值，不按载荷形态分岔——`signature=false`
-/// 时花名虽不进载荷，仍过门；斜杠消息例外见上）。`Result` 语义同上。
-pub fn compose_injection_flagged(
-    device_name: &str,
-    text: &str,
-    signature: bool,
-) -> Result<String, String> {
+/// 每条都吃 token；溯源真源在注入审计页（设备名逐条在账，终端不留痕可接受）。
+/// 队列存的是 compose 产物 → 开关在入队时刻生效（已入队消息维持入队时形态）。
+pub fn compose_injection_flagged(device_name: &str, text: &str, signature: bool) -> String {
     let body = normalize_newlines(text);
     if is_slash_message(text) {
-        // 裸注入：不加签名（斜杠命令的任何附加文本都会使其失效）——花名不进载荷，故不判花名
-        return Ok(body);
-    }
-    // 花名白名单（裁决 24b）：拼接之前判（安全理由见上）；与签名开关正交，
-    // 不按「signature=false ⇒ 花名不进载荷」分岔——按通道/形态分岔会给新通道留缺口
-    if let Some(reason) = crate::inject::headless::turn::device_name_refusal(device_name) {
-        return Err(reason);
+        // 裸注入：不加签名（斜杠命令的任何附加文本都会使其失效）
+        return body;
     }
     if !signature {
-        // 签名关：裸正文（花名门已在上方无条件通过——纵深防御，拒绝面保持一致）
-        return Ok(body);
+        return body;
     }
-    Ok(format!(
-        "{} [mobile {}]",
-        body,
-        normalize_newlines(device_name)
-    ))
+    format!("{} [mobile {}]", body, normalize_newlines(device_name))
 }
 /// 「远程消息带设备签名」设置的**读取单点**（api.rs 两处 compose 调用共用）：
 /// settings KV `remote_message_signature`，缺省 **off**（2026-10-05 用户裁决——
@@ -233,8 +198,7 @@ mod tests {
     #[test]
     fn compose_suffixes_and_normalizes() {
         assert_eq!(
-            compose_injection("iPhone", "改一下\n继续")
-                .expect("测试花名在册（白名单内，见 turn::device_name_refusal）"),
+            compose_injection("iPhone", "改一下\n继续"),
             "改一下\\n继续 [mobile iPhone]"
         );
     }
@@ -243,44 +207,28 @@ mod tests {
     /// `/permissons` 被前缀毁掉）。判据落在**归一后**正文（控制字符先滤再判）
     #[test]
     fn slash_messages_are_bare() {
+        assert_eq!(compose_injection("iPhone", "/permissions"), "/permissions");
+        assert_eq!(compose_injection("iPhone", "/plan"), "/plan");
         assert_eq!(
-            compose_injection("iPhone", "/permissions")
-                .expect("测试花名在册（白名单内，见 turn::device_name_refusal）"),
-            "/permissions"
-        );
-        assert_eq!(
-            compose_injection("iPhone", "/plan")
-                .expect("测试花名在册（白名单内，见 turn::device_name_refusal）"),
-            "/plan"
-        );
-        assert_eq!(
-            compose_injection("iPhone", "/permissions  申请写入")
-                .expect("测试花名在册（白名单内，见 turn::device_name_refusal）"),
+            compose_injection("iPhone", "/permissions  申请写入"),
             "/permissions  申请写入",
             "斜杠命令后的参数原样保留（签名会破坏参数解析）"
         );
         // 归一先行：裸 ESC 前缀的「斜杠命令」归一后才是 `/permissions`，必须以归一
         // 产物判（否则控制字符脏输入会被当普通消息并追加签名=问题 8 形态复发）
         assert_eq!(
-            compose_injection("iPhone", "\x1b/permissions")
-                .expect("测试花名在册（白名单内，见 turn::device_name_refusal）"),
+            compose_injection("iPhone", "\x1b/permissions"),
             "/permissions"
         );
         // 多行归一同样生效
-        assert_eq!(
-            compose_injection("iPhone", "/plan\n额外")
-                .expect("测试花名在册（白名单内，见 turn::device_name_refusal）"),
-            "/plan\\n额外"
-        );
+        assert_eq!(compose_injection("iPhone", "/plan\n额外"), "/plan\\n额外");
         // 非行首斜杠不是命令（TUI 的斜杠命令要求行首即 `/`）→ 走普通消息带签名
         assert_eq!(
-            compose_injection("iPhone", "价格 /permissions 是多少")
-                .expect("测试花名在册（白名单内，见 turn::device_name_refusal）"),
+            compose_injection("iPhone", "价格 /permissions 是多少"),
             "价格 /permissions 是多少 [mobile iPhone]"
         );
         assert_eq!(
-            compose_injection("iPhone", " /permissions")
-                .expect("测试花名在册（白名单内，见 turn::device_name_refusal）"),
+            compose_injection("iPhone", " /permissions"),
             " /permissions [mobile iPhone]",
             "前导空白不跳过（带空格的输入本就无法触发命令）"
         );
@@ -294,16 +242,16 @@ mod tests {
         use super::compose_injection_flagged as compose;
         assert_eq!(
             compose("iPhone", "帮我看看这个文件", false),
-            Ok("帮我看看这个文件".to_string())
+            "帮我看看这个文件"
         );
         assert_eq!(
             compose("iPhone", "帮我看看这个文件", true),
-            Ok("帮我看看这个文件 [mobile iPhone]".to_string()),
+            "帮我看看这个文件 [mobile iPhone]",
             "开关开 = 既有签名形态（compose_injection 兼容壳同款）"
         );
         // 斜杠命令两态都裸（签名开关不得给命令追加任何文本）
-        assert_eq!(compose("iPhone", "/plan", false), Ok("/plan".to_string()));
-        assert_eq!(compose("iPhone", "/plan", true), Ok("/plan".to_string()));
+        assert_eq!(compose("iPhone", "/plan", false), "/plan");
+        assert_eq!(compose("iPhone", "/plan", true), "/plan");
     }
 
     /// `is_slash_message` 与 compose 的裸注入判据同源（单点判据的自锁）：
@@ -320,8 +268,7 @@ mod tests {
             ("", false),
         ] {
             assert_eq!(is_slash_message(text), is_slash, "判据格：{text:?}");
-            let composed = compose_injection("iPhone", text)
-                .expect("测试花名在册（白名单内，见 turn::device_name_refusal）");
+            let composed = compose_injection("iPhone", text);
             assert_eq!(
                 composed.contains("[mobile iPhone]"),
                 !is_slash,
@@ -405,8 +352,7 @@ mod tests {
     /// `stamp_of` 输入的等价性（两函数组合的端到端锁，防未来只改一侧）
     #[test]
     fn strip_then_stamp_matches_stamp_of_directly() {
-        let composed = compose_injection("iPhone", "请帮我检查一下这个文件")
-            .expect("测试花名在册（白名单内，见 turn::device_name_refusal）");
+        let composed = compose_injection("iPhone", "请帮我检查一下这个文件");
         let manual = strip_mobile_signature(&composed);
         assert_eq!(
             super::super::confirm::stamp_of(&composed),
@@ -431,20 +377,29 @@ mod tests {
 
     /// 设备花名同样归一（用户可设昵称，堵单行不变量缺口）——丁T3 起签名在**尾部**。
     ///
-    /// **R12-S2 改判（裁决 24b）**：本用例原断言「含换行的花名归一成字面 `\n` 后照常进签名」
-    /// （`"hi [mobile iPhone\n15]"`）。白名单落地后，**含换行的花名在拼接前就被拒**——
-    /// 换行本身不是白名单字符（`\` 也不是），归一只发生在**已放行**的花名上。故本用例改钉
-    /// 「归一仍是花名的必经步，但危险字符根本到不了归一」：把原断言移到
-    /// [`compose_refuses_cmd_unsafe_device_name`]，此处只留**放行花名**的归一行为。
+    /// 2026-10-20 复审 P2：组装单点**不再按花名拒绝**（花名安全门收窄到 Windows cmd
+    /// 垫片的真实 argv 边界），故含换行的花名照旧归一成字面 `\n` 后进签名。
     #[test]
     fn compose_normalizes_device_name_too() {
-        // 放行花名里的多字节/空格原样进签名（归一不吞正常字符）
+        // 多字节/空格原样进签名（归一不吞正常字符）
         assert_eq!(
-            compose_injection("小明的 iPhone", "hi").unwrap(),
+            compose_injection("小明的 iPhone", "hi"),
             "hi [mobile 小明的 iPhone]"
         );
-        // 危险花名（换行 + 反斜杠形态）在拼接前被拒——不是归一后照进
-        assert!(compose_injection("iPhone\n15", "hi").is_err());
+        // 换行归一成字面 `\n`（单行不变量仍成立，只是不再拒绝花名）
+        assert_eq!(
+            compose_injection("iPhone\n15", "hi"),
+            "hi [mobile iPhone\\n15]"
+        );
+        // emoji / 撇号 / 冒号 / 组合音标原样（不属于 cmd 元字符，交给 argv 边界判）
+        for name in [
+            "小明的手机📱",
+            "Alice's iPhone",
+            "iPhone:工作",
+            "e\u{301}quipe",
+        ] {
+            assert_eq!(compose_injection(name, "hi"), format!("hi [mobile {name}]"));
+        }
     }
 
     /// F7⑩：C0 控制字符滤除——B 族把裸 ESC 当按键吃（M6R F3 实证），正文控制字符
@@ -465,8 +420,7 @@ mod tests {
         // DEL (0x7F) 不属 C0 区——其滤除依据（B 族退格）与 C0 不同源，单独断言见
         // del_is_stripped（收尾批 P1：便于未来对 DEL/C1 单独回退）
         // 端到端锁：compose_injection 输出同样零 C0（注入通道唯一出口）
-        let composed = compose_injection("iPhone", "文本\x1b[0m\x07收尾")
-            .expect("测试花名在册（白名单内，见 turn::device_name_refusal）");
+        let composed = compose_injection("iPhone", "文本\x1b[0m\x07收尾");
         assert!(composed.chars().all(|c| (c as u32) > 0x1F));
     }
 
@@ -482,8 +436,7 @@ mod tests {
             "零残留：产物不含 DEL"
         );
         // 端到端锁：compose_injection 同样零 DEL（注入通道唯一出口）
-        let composed = compose_injection("iPhone", "a\u{7f}b")
-            .expect("测试花名在册（白名单内，见 turn::device_name_refusal）");
+        let composed = compose_injection("iPhone", "a\u{7f}b");
         assert!(!composed.chars().any(|c| (c as u32) == 0x7F));
     }
 
@@ -525,51 +478,5 @@ mod tests {
             }),
             "零残留：产物不含 C0/DEL/C1 任何字符"
         );
-    }
-
-    /// **R12-S2 先红用例（裁决 24b：花名 cmd 安全白名单）**：花名含 `cmd` 元字符时
-    /// **不得**进载荷——签名是**我们自己拼**的（`[mobile <花名>]`），而载荷在无头通道会进
-    /// argv（Windows npm 垫片经 `cmd /c` 重解析命令行，同 [`super::headless::turn`] 的
-    /// `CMD_SHIM_METACHARS` 依据）。R3 只判了**用户正文**，签名面当时**登记为敞口**
-    /// （`inject/headless/codex.rs` 模块头「残留（如实登记）」）——本用例钉住收口。
-    ///
-    /// 先红证据（实现前跑）：`compose_injection("a&b", "hi")` 当时返回
-    /// `"hi [mobile a&b]"`（断言 `!composed.contains("a&b")` 失败）。
-    ///
-    /// 期望形态：**拼接之前** fail closed（`compose_injection` 回 `Err(原因)`，调用方
-    /// 按 `refused` 档零字节投递），**不是**静默改写花名（改写了用户就不知道实际发的是什么）。
-    #[test]
-    fn compose_refuses_cmd_unsafe_device_name() {
-        for name in [
-            "a&b",
-            "手机%1",
-            "say\"hi",
-            "小明(工作)",
-            "小明的手机📱",
-            "iPhone\n15",
-            "a|b",
-            "x^y",
-        ] {
-            let err = compose_injection(name, "hi")
-                .expect_err("危险花名必须在拼接前被拒（不得产出载荷）");
-            assert!(
-                err.contains("cmd") && err.contains("未投递"),
-                "拒绝文案必须说清 cmd 重解析面 + 零字节投递: {err}"
-            );
-        }
-        // 点名具体字符（用户能据此改名）
-        let e = compose_injection("a&b", "hi").unwrap_err();
-        assert!(e.contains('&'), "必须点名是哪个字符: {e}");
-        // 正常中文/英文花名必须放行（白名单不得误伤中文——票面点名的回归面）
-        assert_eq!(
-            compose_injection("小明的手机", "hi").unwrap(),
-            "hi [mobile 小明的手机]"
-        );
-        assert_eq!(
-            compose_injection("iPad Pro", "hi").unwrap(),
-            "hi [mobile iPad Pro]"
-        );
-        // 斜杠消息 = 裸注入（无签名）：花名不进载荷 ⇒ 不判花名（不是「与风险无关的拒绝」）
-        assert_eq!(compose_injection("a&b", "/plan").unwrap(), "/plan");
     }
 }

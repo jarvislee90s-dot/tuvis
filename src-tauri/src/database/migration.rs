@@ -239,6 +239,21 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             )
         })?;
     }
+    // 签名开关冻结值（2026-10-20 复审）：登记时固定该动作的签名形态，排队期间
+    // 改设置/重启/同 actionId 重试都不改变既定正文。旧行补列后保持 NULL = 升级前
+    // 语义（恒带签名），不误改已完成动作。
+    if !column_exists(conn, "codex_actions", "signature_applied") {
+        conn.execute(
+            "ALTER TABLE codex_actions ADD COLUMN signature_applied INTEGER",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_SIGNATURE_APPLIED_FAIL: 迁移 codex_actions.signature_applied 失败: {}",
+                e
+            )
+        })?;
+    }
 
     // 老库 day_key 空串回填（派生列口径：strftime 不可用于 'YYYY-MM-DDTHH' 形态，用 substr）
     conn.execute(
@@ -843,7 +858,8 @@ mod tests {
                 compat_turn_id TEXT,
                 compat_rollout_path TEXT,
                 compat_rollout_baseline INTEGER,
-                compat_wire_hash TEXT
+                compat_wire_hash TEXT,
+                barrier_force_released_at INTEGER
             );
             INSERT INTO codex_actions (action_id, device_id, device_name, thread_id, kind,
                  payload_hash, client_message_id, state, created_at, updated_at, compat_outstanding)

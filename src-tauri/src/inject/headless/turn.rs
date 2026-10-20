@@ -200,94 +200,6 @@ pub fn cmd_shim_body_refusal(
 // 花名 / 设备名的 cmd 安全白名单（裁决 24b：R3 的**签名面**收口）
 // ============================================================
 
-/// 白名单中**除 Unicode 字母数字外**的允许字符（判据 = [`char::is_alphanumeric`] ∪ 本表）。
-///
-/// 只放命令行里常见、且**无 `cmd` 语义**的五个：空格（花名里的自然词界）、`-` `_` `.` `·`
-/// （中英文名常见的分隔与点缀）。**其余一律不安全**——含 ASCII 标点 `& | ^ < > " % ! ( )`
-/// 等（`cmd` 重解析面，依据同 [`CMD_SHIM_METACHARS`] / [`cmd_shim_body_refusal`]），
-/// 也含一切符号与控制字符（emoji、换行、反斜杠）。
-///
-/// 为什么允许「空格」：花名里的空格不会构成 `cmd` 语义（`cmd /c` 下空格只分词，不改写
-/// 命令行结构；CRT/cmd 的引号规则差异只对 `"` 生效），而「小明的 iPhone」这类花名很常见。
-pub const DEVICE_NAME_EXTRA_ALLOWED: &[char] = &[' ', '-', '_', '.', '·'];
-
-/// 危险字符的**展示**形态：控制字符打转义（别把裸换行/ESC 打进给用户看的文案），其余原样
-fn device_name_char_label(c: char) -> String {
-    if c.is_control() || c == '\u{7f}' {
-        format!("\\u{{{:X}}}", c as u32)
-    } else {
-        c.to_string()
-    }
-}
-
-/// **花名（设备名）白名单判定 —— 本判据的唯一决策点**（`Some(reason)` = 不安全，须拒）。
-///
-/// # 为什么是白名单，不是黑名单（裁决 24b；R3 签名面收口）
-/// R3 只判了**用户正文**（[`cmd_shim_body_refusal`]），而 ` [mobile <花名>]` 这个签名是
-/// **我们自己拼上去的**——它同样会进无头 CLI 的 argv（`codex queue --message` /
-/// `kimi --prompt` / `opencode run <位置参数>` / `zcode.cjs --prompt`），Windows 上这些 CLI
-/// 常是 npm 垫片（`.cmd` ⇒ `cmd /c`）⇒ **签名也会被 `cmd` 重解析**。黑名单永远补不全
-/// （`cmd` 的解析面随上下文变化、还有转义与引号配对规则差异），白名单把「能进命令行的字符」
-/// 钉死成可枚举的一类。
-///
-/// # 判据（字符类，不是字节）
-/// [`char::is_alphanumeric`] ∪ [`DEVICE_NAME_EXTRA_ALLOWED`]——`is_alphanumeric` 覆盖全部
-/// Unicode 字母/数字，故**中文花名天然通过**（「小明的手机」）；emoji、ASCII 标点、控制
-/// 字符一律不安全。
-///
-/// # 有意从严（裁决 25；2026-10-05 用户裁决——**勿改为按威胁面放宽**）
-/// 白名单是**故意收窄**的：自定义花名用**常规字符**（字母/数字/空格/`-` `_` `.` `·`）即可，
-/// **emoji 与未列举符号一律拒**——**即便**某个符号在 `cmd` 下未必真能被解析成动作。
-/// 用户理由：要在 `cmd` 威胁面**之上留余量**，不做「逐个字符论证无害」的减法。
-/// 故**不要**因为「这个字符看起来没有 `cmd` 语义」而放宽本判据：本判据是**字符类白名单**，
-/// 不是威胁面清单（改判据前先读本条）。
-///
-/// # 调用点（**本轮只有一处**；勿在文档里写成三处）
-/// ① **签名组装单点** [`crate::inject::normalize::compose_injection`]：**拼接之前**判，
-///    不安全即 `Err(reason)`，调用方按 `refused` 档 fail closed（零字节投递）。
-///
-/// **未接线的两处（如实登记，属 #117 续作）**：配对登记点
-/// （`remote::api::persist_and_cookie`）与设备改名内核（`remote::rename_device_core`）
-/// 当前**没有**调用本判据——危险花名仍可登记/改名成功，直到首次投递时由 ① 拒绝（零投递，
-/// 不会误投，但用户要到发送时才知道）。这是本轮「不扩 main 既有配对/改名行为」的取舍；
-/// 若续作要补「注册即拒」，需要在两处接同一判据并补 HTTP 400 错误码。
-///
-/// **不做 migration**：存量已登记的危险花名由 ① 在**投递时**兜住。
-pub fn device_name_refusal(name: &str) -> Option<String> {
-    let mut hit: Vec<char> = Vec::new();
-    for c in name.chars() {
-        if c.is_alphanumeric() || DEVICE_NAME_EXTRA_ALLOWED.contains(&c) {
-            continue;
-        }
-        if !hit.contains(&c) {
-            hit.push(c);
-        }
-    }
-    if hit.is_empty() {
-        return None;
-    }
-    // 文案风格同 [`cmd_shim_body_refusal`]：**显式告知**是哪个字符 + 为什么 + 怎么办，
-    // 绝不静默改写花名（改写了用户就不知道 CLI 实际收到的是什么签名）
-    let shown: Vec<String> = hit
-        .iter()
-        .take(3)
-        .map(|c| device_name_char_label(*c))
-        .collect();
-    let more = if hit.len() > 3 {
-        format!(" (+{})", hit.len())
-    } else {
-        String::new()
-    };
-    Some(format!(
-        "TURN_DEVICE_NAME_UNSAFE: 设备花名含命令行不安全字符（{}{more}）：花名会作为 `[mobile <花名>]` 签名拼进无头 \
-         CLI 的命令行，而 Windows 上这些 CLI 常是 npm 垫片（.cmd/.bat 经 `cmd /c` 启动）——\
-         cmd 会重解析整条命令行（串联/重定向/转义/变量展开，引号配对规则也与 CRT 不同），\
-         签名可能被截断、改写或串联执行。白名单 = **Unicode 字母数字 + 空格 `-` `_` `.` `·`**；\
-         本条**未投递**（零字节投递）：请在 MAM 设备花名册把该设备改名（去掉这些字符）后重发",
-        shown.join(" ")
-    ))
-}
-
 /// 证据头（生产/测试共用）：前 [`EVIDENCE_HEAD_LINES`] 行拼接（判定为子串匹配）
 pub fn head_of(lines: &[String]) -> String {
     lines
@@ -876,65 +788,46 @@ mod tests {
         assert_eq!(cmd_shim_body_refusal("a & b %PATH%", &shim, false), None);
     }
 
-    // ===== R12-S2 / 裁决 24b：花名 cmd 安全白名单（签名面收口）=====
+    // ===== 2026-10-20 复审 P2：花名不在组装单点拒绝 =====
+    //
+    // 花名安全门收窄到**真实 cmd 重解析边界**（`argv_shim_refusal` 对最终 argv 逐段
+    // 判定）。组装单点不再按花名拒绝——emoji/撇号/冒号/组合音标在终端、Desktop IPC、
+    // 原生 exe 等不经过 cmd 的路径都必须可用。
 
-    /// 票面：危险花名**逐个字符**都拒（`&` / `%` / `"` 三个点名 + 其余 ASCII 标点），
-    /// 且文案**点名具体字符** + 说清「零字节投递」+ 给出路（改名）。
+    /// `compose_injection` 不因花名含 emoji/撇号/冒号/组合音标而失败；签名开启时原样
+    /// 进入尾部签名（归一后），关闭时裸正文。
     #[test]
-    fn device_name_with_cmd_metachars_is_refused() {
-        for c in [
-            '&', '%', '"', '|', '^', '<', '>', '!', '(', ')', '\\', '\'', '`', '$', ';',
+    fn compose_does_not_reject_unusual_device_names() {
+        for name in [
+            "小明的手机📱",
+            "Alice's iPhone",
+            "iPhone:工作",
+            "e\u{301}quipe", // e + 组合音标
         ] {
-            let name = format!("小明{c}的手机");
-            let reason = device_name_refusal(&name)
-                .unwrap_or_else(|| panic!("危险花名 {name:?} 必须拒（{c:?} 在 cmd 里有语义）"));
-            assert!(
-                reason.contains(&device_name_char_label(c)) && reason.contains("cmd"),
-                "拒绝文案必须点名具体字符 + 说清 cmd 重解析面: {reason}"
-            );
-            assert!(
-                reason.contains("未投递"),
-                "必须说清零字节投递（拒绝 ≠ 尝试后失败）: {reason}"
-            );
-            assert!(
-                reason.contains("改名"),
-                "必须给出路（花名是注册期的值，改一次名即可）: {reason}"
-            );
+            let signed = crate::inject::normalize::compose_injection(name, "hi");
+            assert!(signed.ends_with(&format!("[mobile {name}]")), "{signed}");
+            let bare = crate::inject::normalize::compose_injection_flagged(name, "hi", false);
+            assert_eq!(bare, "hi", "签名关闭 = 裸正文: {bare}");
         }
-        // 控制字符：换行会被归一成字面 `\n`（两个字符），但反斜杠本身就不是白名单字符；
-        // 裸换行/ESC/DEL 同拒，且**展示形态打转义**（不把裸控制字符打进用户文案）
-        let nl = device_name_refusal("iPhone\n15").expect("裸换行花名必须拒");
-        assert!(nl.contains("\\u{A}"), "控制字符必须打转义展示: {nl}");
-        assert!(device_name_refusal("a\u{7f}b").is_some(), "DEL 同拒");
-        // emoji（非字母数字、非白名单标点）同拒
-        assert!(
-            device_name_refusal("小明的手机📱").is_some(),
-            "emoji 不在白名单"
-        );
     }
 
-    /// 票面：**中文/正常花名必须放行**（白名单是字符类判据，不是 ASCII 白名单）——
-    /// 「中文花名要能过」是本判据最容易误伤的一面，单独钉住。
+    /// 真正的 cmd 重解析面仍拒：最终载荷（正文 + 签名）进 argv 且形态是 `.cmd/.bat`
+    /// 垫片 → 写出前拒绝，零派发。
     #[test]
-    fn ordinary_chinese_and_english_device_names_are_allowed() {
-        for name in [
-            "小明的手机",
-            "测试设备",
-            "iPhone",
-            "iPad Pro",
-            "Pixel 9",
-            "mate-60_pro",
-            "设备·二号",
-            "新设备",
-            "Galaxy S24 Ultra 1",
-        ] {
-            assert_eq!(
-                device_name_refusal(name),
-                None,
-                "正常花名必须放行（白名单 = Unicode 字母数字 + 空格 - _ . ·）: {name:?}"
-            );
-        }
-        // 空花名不在本判据职责内（注册点另行回落默认名，见 persist_and_cookie）
-        assert_eq!(device_name_refusal(""), None);
+    fn cmd_shim_still_refuses_final_payload_with_metachars() {
+        let shim = spawn_shape(r"C:\npm\codex.cmd", "windows");
+        assert!(shim.via_cmd_shim(), "前提：垫片形态");
+        let final_wire = crate::inject::normalize::compose_injection("A&B", "hello");
+        assert!(
+            cmd_shim_body_refusal(&final_wire, &shim, true).is_some(),
+            "最终载荷含 cmd 元字符（来自花名签名）必须在写出前拒绝"
+        );
+        // 非 cmd 形态 / 不进 argv：不拒（Desktop IPC、原生 exe、stdin 通道）
+        let direct = spawn_shape("codex", "windows");
+        assert_eq!(cmd_shim_body_refusal(&final_wire, &direct, true), None);
+        assert_eq!(cmd_shim_body_refusal(&final_wire, &shim, false), None);
+        // 普通花名（emoji/撇号）的最终载荷在垫片上也放行——不是元字符
+        let benign = crate::inject::normalize::compose_injection("小明的手机📱", "hello");
+        assert_eq!(cmd_shim_body_refusal(&benign, &shim, true), None);
     }
 }

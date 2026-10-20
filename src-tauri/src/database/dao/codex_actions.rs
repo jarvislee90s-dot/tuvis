@@ -32,7 +32,8 @@ use crate::services::codex_desktop_ipc::types::{
 const COLS: &str = "seq, action_id, device_id, device_name, thread_id, kind, request_key, \
      context_token, payload_hash, client_message_id, state, route, queued_text, created_at, \
      updated_at, receipt_json, compat_outstanding, compat_message_id, compat_turn_id, \
-     compat_rollout_path, compat_rollout_baseline, compat_wire_hash, barrier_force_released_at";
+     compat_rollout_path, compat_rollout_baseline, compat_wire_hash, barrier_force_released_at, \
+     signature_applied";
 // ============================================================
 // 枚举 ⇄ 存储串（serde snake_case 同形；手工映射保证坏值显式报错不静默）
 // ============================================================
@@ -117,6 +118,9 @@ pub(crate) struct ActionRow {
     /// 人工解除——所有置 `compat_outstanding=1` 的写点带同名单调性守卫，解除后
     /// 任何路径不得把屏障置回（老库经迁移补列，存量行全 NULL = 从未人工解除）。
     pub barrier_force_released_at: Option<i64>,
+    /// 签名开关冻结值：Some(true)=正文已带签名，Some(false)=裸正文，
+    /// None=本列上线前的旧行（按升级前语义恒带签名派发）。
+    pub signature_applied: Option<bool>,
 }
 
 /// PR #117 兼容兜底 fence（服务端内部类型，计划 Task 7 明文）：桥接前记录 rollout
@@ -170,6 +174,7 @@ fn row_action(row: &rusqlite::Row) -> rusqlite::Result<ActionRow> {
         compat_rollout_baseline: row.get::<_, Option<i64>>(20)?.map(|v| v.max(0) as u64),
         compat_wire_hash: row.get(21)?,
         barrier_force_released_at: row.get(22)?,
+        signature_applied: row.get::<_, Option<i64>>(23)?.map(|v| v != 0),
     })
 }
 
@@ -183,6 +188,7 @@ pub(crate) fn get_row(conn: &Connection, action_id: &str) -> rusqlite::Result<Op
 // ============================================================
 
 /// 登记新动作（UNIQUE(action_id) 冲突由调用方 [`get_row`] 复查做幂等/冲突判定）
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_action_conn(
     conn: &Connection,
@@ -198,11 +204,45 @@ pub(crate) fn insert_action_conn(
     client_message_id: &str,
     now_ms: i64,
 ) -> rusqlite::Result<ActionRow> {
+    insert_action_conn_signed(
+        conn,
+        action_id,
+        device_id,
+        device_name,
+        thread_id,
+        kind,
+        request_key,
+        context_token,
+        payload_hash,
+        raw_text,
+        None,
+        client_message_id,
+        now_ms,
+    )
+}
+
+/// 带签名冻结值的登记变体（生产 queue register 使用；旧 12 参入口保留给既有测试）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_action_conn_signed(
+    conn: &Connection,
+    action_id: &str,
+    device_id: &str,
+    device_name: &str,
+    thread_id: &str,
+    kind: &str,
+    request_key: Option<&str>,
+    context_token: Option<&str>,
+    payload_hash: &str,
+    raw_text: Option<&str>,
+    signature_applied: Option<bool>,
+    client_message_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<ActionRow> {
     conn.execute(
         "INSERT INTO codex_actions (action_id, device_id, device_name, thread_id, kind, \
              request_key, context_token, payload_hash, client_message_id, state, route, \
-             queued_text, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', 'none', ?10, ?11, ?11)",
+             queued_text, signature_applied, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', 'none', ?10, ?11, ?12, ?12)",
         params![
             action_id,
             device_id,
@@ -214,6 +254,7 @@ pub(crate) fn insert_action_conn(
             payload_hash,
             client_message_id,
             raw_text,
+            signature_applied.map(|b| b as i64),
             now_ms
         ],
     )?;
@@ -397,6 +438,44 @@ pub(crate) fn reserve_conn(
         audit_action_of(&row.kind),
         &audit_summary(&row),
         "reserved",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// 写前忙回队（2026-10-20 复审 P1）：reserved → queued，恢复最终 wire 文本。
+/// 只用于 adapter 在 ensure 后、**真正写出之前**判定仍忙的明确零投递；CAS 失败
+/// （并发撤回/已终态）返回 false，绝不覆盖既有终态。记 `requeued_busy` 审计。
+pub(crate) fn requeue_after_busy_conn(
+    conn: &Connection,
+    action_id: &str,
+    wire_text: &str,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let n = tx.execute(
+        "UPDATE codex_actions SET state = 'queued', route = 'none', queued_text = ?2, \
+             updated_at = ?3 \
+         WHERE action_id = ?1 AND state = 'reserved'",
+        params![action_id, wire_text, now_ms],
+    )?;
+    if n == 0 {
+        return Ok(false);
+    }
+    let Some(row) = get_row(&tx, action_id)? else {
+        return Ok(false);
+    };
+    super::write_audit::record_conn_checked(
+        &tx,
+        now_ms,
+        &row.device_id,
+        &row.device_name,
+        "codex",
+        &row.thread_id,
+        "codex_desktop_ipc",
+        audit_action_of(&row.kind),
+        &audit_summary(&row),
+        "requeued_busy",
     )?;
     tx.commit()?;
     Ok(true)

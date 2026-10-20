@@ -1540,10 +1540,10 @@
     "runnerWatcherGone": "进程监视失败；已 kill 进程树",
     "runnerWatcherGoneSync": "进程监视失败（wait 侧异常退出）；已 kill 进程树",
     "turnCmdShimUnsafe": "命令含 cmd 元字符——本机 CLI 是 npm 垫片，cmd 会重解析整条命令行，可能被截断、改写或串联执行；本条未投递（零字节投递），请改用直装 CLI 或去掉这些字符后重发",
-    "turnDeviceNameUnsafe": "设备花名含命令行不安全字符：花名会作为 `[mobile <花名>]` 签名进无头 CLI 的命令行，Windows 上的 npm 垫片会经 cmd 重解析；本条未投递（零字节投递），请在设备花名册改名后重发",
     "migrateCodexBarrierReleaseFail": "迁移 codex_actions.barrier_force_released_at 失败：{error}",
     "codexQueueRetractPending": "该消息仍在排队，请使用撤回",
-    "codexQueueForceInFlight": "该消息派发在飞（有自动落账路径），不在人工解除范围"
+    "codexQueueForceInFlight": "该消息派发在飞（有自动落账路径），不在人工解除范围",
+    "migrateSignatureAppliedFail": "迁移 codex_actions.signature_applied 失败：{error}"
   },
   "mobile": {
     "composer": {
