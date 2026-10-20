@@ -147,7 +147,7 @@ tty_map 文件）；Windows permissions=false；不发版。
 | P3 | 昵称白名单误伤所有通道 | `compose_injection` 只归一 + 可选签名（不再按花名拒绝）；安全门 = `argv_shim_refusal`/`cmd_shim_body_refusal` 对**最终载荷**且仅 `via_cmd_shim` + 进 argv 时生效 | `compose_does_not_reject_unusual_device_names`、`cmd_shim_still_refuses_final_payload_with_metachars`、`compose_normalizes_device_name_too` |
 | P4 | 详情页 Codex 控件被 `!isSummary` 隐藏；队列不随发送刷新；Unknown 草稿复用旧 ID | Codex 能力/pending/队列按投影状态展示（QuestionCard 仍保留总结态门）；`queueTick` 由投影 revision 与发送回执共同驱动；Unknown 回执保留核对锚但清 actionId（新发送换新 ID） | `SessionDetailCodex.test.tsx` 5 例（idle+Unknown 屏障可恢复、idle pending、revision 固定发送 queued 后出现并可撤回、revision=null 兼容、换会话不串台）；MessageComposer 4 例（unknown 换 ID、queued/accepted 均触发 onQueueChanged、H3 403 本地化原因）；第四轮补 `F`（revision=null 兼容超时 → 屏障/恢复入口） |
 | P5 | 兼容派发前不复核设备 | `run_compat` 在真实兼容派发前（睡眠/交接后）复核设备在册；吊销 → NotSent(device_revoked)、零 spawn；清 fence 与终态同语句，审计随后另写（失败仅记日志）；helper 在版本探针后再核一次 | `compat_refuses_when_device_revoked_during_ipc_handoff`（dead IPC 交接窗口吊销 → rejected/device_revoked、fence 清除、无 headless 审计） |
-| P6 | SSE 首帧订阅竞态 | 先 `subscribe()` 再取快照；启动缓冲按 `(owner_epoch, owner_generation, revision)` 合并（stale 不覆盖新鲜快照；跨 owner 不靠 revision 大小）；Lagged 启动期重取一次快照 | `startup_merge_tests` 8 例（+ 同代际 stale 送达、Lagged 多帧不回退、stale 仅由更高 revision 清除）；首快照与广播同源盖 lease 代际（`turn_ids_collects_canonical_turns` 断言 epoch≠0）；流式阶段与 Lagged 共用 `supersedes` 顺序基线 |
+| P6 | SSE 首帧订阅竞态 | 先 `subscribe()` 再取快照；启动缓冲按 `(owner_epoch, owner_generation, revision)` 合并（stale 不覆盖新鲜快照；跨 owner 不靠 revision 大小）；Lagged 启动期重取一次快照 | `startup_merge_tests` 9 例（含分类器 1；+ 同代际 stale 送达、Lagged 多帧不回退、stale 仅由更高 revision 清除）；首快照与广播同源盖 lease 代际（`turn_ids_collects_canonical_turns` 断言 epoch≠0）；流式阶段与 Lagged 共用 `supersedes` 顺序基线 |
 | P7 | H3 拒绝原因未贯通 | hub 分支真实 403 补 `reason` + `reasonCode`；手机优先按 `reasonCode` 本地化（`mobile.composer.headlessDisabled`），`data.reason` 仅兜底 | `send_h3_off_ipc_unavailable_compat_refuses` 断言 reason；MessageComposer `403 headless_disabled 显示服务端 reason` |
 
 ### 7.2 第四轮审查修复（2026-10-20，用户二次审查 1×P1 + 3×P2）
@@ -156,7 +156,7 @@ tty_map 文件）；Windows permissions=false；不发版。
 | --- | --- | --- | --- |
 | P1b | 忙态伪成功仍有「快照后本地新建 Turn」竞态 | `send_text` 在 Accepted 后要求回执 Turn 中出现本次 `clientUserMessageId` 的**正式 userMessage**（`mirror.turn_has_client_message`；`params.input`/params 回显不算证据），有界等待 500ms（25ms×21），等不到 → `unknown_delivery(client_message_unverified)`，保留屏障、不 fallback | `busy_race_new_turn_without_client_identity_is_unknown`（ScriptedPeer 快照后建 T1、忙态回显 T1 → Unknown + 屏障）、`accepted_when_new_turn_contains_client_message_identity`（正向）；既有 accepted 用例补身份帧 |
 | P2b | exec→queue 改道漏设备/H3 复核 | `TurnArgs.gate` 在 `run_turn` 入口与**每次改道前**各调用一次；生产 gate 复核设备在册 + H3 开启，拒绝 → `Stage::Refused`、queue 零启动 | `revoked_device_before_diverted_queue_blocks_second_dispatch`（scripted exec 锁拒 + 第二次 gate 拒绝 → 只 1 次 exec、queue 0、refused） |
-| P6b | stale 事件被 `supersedes` 丢弃 / Lagged 抽干-重取窗口回退 | stale 视为**失效信号**：同/更高 revision 的 stale 必须送达；stale 恢复只由更高 revision 证明。流式阶段与 Lagged 重取共用 `last` 顺序基线，旧事件不再在新快照后补发 | `stale_disconnect_event_at_same_revision_is_delivered`、`lagged_recovery_frames_do_not_regress_snapshot`、`stale_snapshot_cleared_only_by_newer_revision`（startup 9 例） |
+| P6b | stale 事件被 `supersedes` 丢弃 / Lagged 抽干-重取窗口回退 | stale 视为**失效信号**：任何 stale（含 revision=None 的 invalidate）必须送达；stale 恢复只由更高 revision 证明。流式阶段与 Lagged 重取共用 `last` 顺序基线，旧事件不再在新快照后补发 | `stale_disconnect_event_at_same_revision_is_delivered`、`lagged_recovery_frames_do_not_regress_snapshot`、`stale_snapshot_cleared_only_by_newer_revision`（startup 9 例，含分类器 1） |
 | P4b | 兼容 headless 回执不刷新恢复面板 | `MessageComposer` 的 `headless` 回执（ok/queued/failed/timeout/cancelled）同样调用 `onQueueChanged`；revision=null 时无新帧也能显示屏障/「核对后继续」 | `SessionDetailCodex.test.tsx` F：revision=null 兼容超时 → 面板 + force-continue 可见（6 例） |
 
 ### 复审已核对无问题（摘要）
@@ -176,10 +176,10 @@ tty_map 文件）；Windows permissions=false；不发版。
 2. **F-3 确定性**：`codex_ipc_remote` 的 presence 走真实进程扫描；测试不断言 channel，
    故不会红，但「本机是否开着 Desktop」会影响内部走向。建议续作把 presence 注入
    `RemoteState` 测试缝，或在 fixture 固定 channel。
-3. **P1 身份核验窗口**：正常状态帧通常先于 start-turn 回执到达，但若 Desktop 的
-   `userMessage` 晚于 500ms 才进镜像，正常发送会被保守判 Unknown（安全但可能多一次人工
-   核对）。真实 Desktop 忙态未跑；探针后的设备复核（`api.rs` 5c）仍无法在测试构建到达
-   `production_exe` 分支。
+3. **P1 身份核验窗口**：预检实测正式 `userMessage` 后到 515–544ms；窗口已取 2s
+   （`delayed_client_identity_within_window_is_accepted` 覆盖 600ms 延迟），超出仍按
+   Unknown 保守处理。真实 Desktop 忙态未跑；探针后的设备复核（`api.rs` 5c）仍无法在
+   测试构建到达 `production_exe` 分支。
 4. **PRODUCT / Mac / 真机**：见 `2026-10-20-codex-app-product-acceptance.md`；未执行即未执行。
 
 ## 9. 结论

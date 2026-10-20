@@ -45,12 +45,12 @@ E6/E10/E11 需要桌面端有人在场按 §4 的点击顺序操作。
 | 套件 | 命令 | 结果 |
 | --- | --- | --- |
 | Rust lib | `cargo test --lib`（第四轮修复后） | 2641 passed / **5 failed（均为 main 基线既有失败，见 §5）** |
-| IPC 协议 | `cargo test --test codex_desktop_ipc` | 42 passed |
-| IPC HTTP | `cargo test --test codex_ipc_remote` | 54 passed |
+| IPC 协议 | `cargo test --test codex_desktop_ipc` | 43 passed |
+| IPC HTTP | `cargo test --test codex_ipc_remote` | 55 passed |
 | 控制面 | `cargo test --test codex_control_remote` | 36 passed |
 | Codex E2E（ignored） | `cargo test --test headless_e2e -- --list` | 1 例 `codex_queue_consumed`（未实机执行，零配额） |
 | 前端 | `pnpm test` | 151 文件 / 1599 passed / 5 skipped |
-| 错误码/双语 | `pnpm check:i18n`、`node scripts/check-error-codes.mjs` | PASS（1417 键；284 码 / 285 键 / legacy 5） |
+| 错误码/双语 | `pnpm check:i18n`、`node scripts/check-error-codes.mjs` | PASS（1445 键；283 码 / 284 键 / legacy 5） |
 
 ## 4. 未执行步骤的交接顺序（Windows，需用户在场）
 
