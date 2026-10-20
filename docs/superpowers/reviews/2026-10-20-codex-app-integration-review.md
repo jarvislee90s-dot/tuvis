@@ -22,8 +22,8 @@
 | 1 | `pnpm install --frozen-lockfile` | PASS | lockfile 未改 |
 | 2 | `cargo fmt --check` | PASS | 全仓 |
 | 3 | `cargo clippy --all-targets --features marker-helper -- -D warnings` | PASS | 零告警 |
-| 4 | `cargo test --lib`（第三轮修复后） | **2635 passed / 5 failed / 45 ignored** | 5 例为 main 基线既有（§3） |
-| 5 | `cargo test --test codex_desktop_ipc` | PASS 42 | 协议/连接/投影/重连 |
+| 4 | `cargo test --lib`（复审修复后） | **2637 passed / 5 failed / 45 ignored** | 5 例为 main 基线既有（§3） |
+| 5 | `cargo test --test codex_desktop_ipc` | PASS 43 | 协议/连接/投影/重连 |
 | 6 | `cargo test --test codex_ipc_remote` | PASS 52 | HTTP/SSE/审批/队列/审计（+签名/IPC、设备吊销交接） |
 | 7 | `cargo test --test codex_control_remote` | PASS 36 | 账本/FIFO/屏障/Unknown/撤回（+写前忙回队、旧 Turn 回显、签名冻结） |
 | 8 | `cargo test --test headless_e2e -- --list` | 1 例（ignored） | `codex_queue_consumed` 未执行、零配额 |
@@ -143,12 +143,12 @@ tty_map 文件）；Windows permissions=false；不发版。
 | # | 问题 | 修改位置 → 行为变化 | 测试证据 |
 | --- | --- | --- | --- |
 | P1 | 忙态竞态与旧 Turn 伪成功 | `AdapterDispatch::send_text` 在 ensure 后、start-turn 前用 `pre_write_snapshot`（同一把镜像锁取忙态 + 已存在 Turn 集合）；忙 → `NotSent(busy_before_write)`，router `requeue_after_busy` 恢复 wire 回队（不 fallback、不换 actionId、不消耗正文）；Accepted 回执 turnId ∈ 派发前集合 → 降级 `unknown_delivery(stale_turn_echo)`，无 turnId → `turn_unconfirmed`，均保留保守屏障 | **直接单测**：`pre_write_snapshot_reports_busy_and_known_turns`（ScriptedPeer：idle 不忙 + Turn 集合可用、active 报忙，desktop 43 例）、`turn_ids_collects_canonical_turns`（mirror 金样）、`turn_association_refusal_classifies_stale_and_unconfirmed`（分类器）。**组合覆盖**：`busy_after_idle_check_requeues_without_start_turn`、`stale_turn_echo_is_unknown_and_keeps_barrier`（router 对 NotSent/Unknown 的回队与屏障语义）。**仍缺**：`send_text` 端到端注入「start-turn 回同一旧 turnId」（构造函数私有），需真实 Desktop 忙态 PRODUCT 证据 |
-| P2 | Codex 不遵守全局签名设置 | 登记时读 `remote_message_signature` 一次并冻结：`queued_text` = 最终 wire、新列 `signature_applied`；router/fallback/CLI/`wire_text_hash` 同一份；旧行（NULL）按升级前恒签名；幂等 hash 仍按原文；忙回队同写标志（防旧行双签名） | `signature_setting_is_frozen_at_registration`（关/开/入队后切设置+重启/旧行/fallback 五段 + 同 actionId 重试）；`signature_on_ipc_start_turn_appends_exactly_once`（HTTP 真 IPC）；`legacy_row_busy_requeue_keeps_single_signature` |
+| P2 | Codex 不遵守全局签名设置 | 登记时读 `remote_message_signature` 一次并冻结：`queued_text` = 最终 wire、新列 `signature_applied`；router/fallback/CLI/`wire_text_hash` 同一份；旧行（NULL）按升级前恒签名；幂等 hash 仍按原文；忙回队同写标志（防旧行双签名） | `signature_setting_is_frozen_at_registration`（关/开/入队后切设置+重启/旧行/fallback 五段 + 同 actionId 重试）；`signature_on_ipc_start_turn_appends_exactly_once`（HTTP 真 IPC）；`signature_setting_is_frozen_at_registration` 的 `sig-legacy` 段（旧行写前忙回队 → flag=1、只一个签名） |
 | P3 | 昵称白名单误伤所有通道 | `compose_injection` 只归一 + 可选签名（不再按花名拒绝）；安全门 = `argv_shim_refusal`/`cmd_shim_body_refusal` 对**最终载荷**且仅 `via_cmd_shim` + 进 argv 时生效 | `compose_does_not_reject_unusual_device_names`、`cmd_shim_still_refuses_final_payload_with_metachars`、`compose_normalizes_device_name_too` |
 | P4 | 详情页 Codex 控件被 `!isSummary` 隐藏；队列不随发送刷新；Unknown 草稿复用旧 ID | Codex 能力/pending/队列按投影状态展示（QuestionCard 仍保留总结态门）；`queueTick` 由投影 revision 与发送回执共同驱动；Unknown 回执保留核对锚但清 actionId（新发送换新 ID） | `SessionDetailCodex.test.tsx` 5 例（idle+Unknown 屏障可恢复、idle pending、revision 固定发送 queued 后出现并可撤回、revision=null 兼容、换会话不串台）；MessageComposer 4 例（unknown 换 ID、queued/accepted 均触发 onQueueChanged、H3 403 本地化原因） |
-| P5 | 兼容派发前不复核设备 | `run_compat` 在真实兼容派发前（睡眠/交接后）复核设备在册；吊销 → NotSent(device_revoked)、零 spawn、同事务清 fence + 审计；helper 在版本探针后再核一次 | `compat_refuses_when_device_revoked_during_ipc_handoff`（dead IPC 交接窗口吊销 → rejected/device_revoked、fence 清除、无 headless 审计） |
-| P6 | SSE 首帧订阅竞态 | 先 `subscribe()` 再取快照；启动缓冲按 `(owner_epoch, owner_generation, revision)` 合并（stale 不覆盖新鲜快照；跨 owner 不靠 revision 大小）；Lagged 启动期重取一次快照 | `startup_merge_tests` 5 例（交界最终态保留、旧事件丢弃、owner 换代、stale、跨 thread）；首快照与广播同源盖 lease 代际（`mirror.project`），Lagged 先抽干再重取 |
-| P7 | H3 拒绝原因未贯通 | hub 分支真实 403 补 `reason` + `reasonCode`（手机只读 `data.reason`） | `send_h3_off_ipc_unavailable_compat_refuses` 断言 reason；MessageComposer `403 headless_disabled 显示服务端 reason` |
+| P5 | 兼容派发前不复核设备 | `run_compat` 在真实兼容派发前（睡眠/交接后）复核设备在册；吊销 → NotSent(device_revoked)、零 spawn；清 fence 与终态同语句，审计随后另写（失败仅记日志）；helper 在版本探针后再核一次 | `compat_refuses_when_device_revoked_during_ipc_handoff`（dead IPC 交接窗口吊销 → rejected/device_revoked、fence 清除、无 headless 审计） |
+| P6 | SSE 首帧订阅竞态 | 先 `subscribe()` 再取快照；启动缓冲按 `(owner_epoch, owner_generation, revision)` 合并（stale 不覆盖新鲜快照；跨 owner 不靠 revision 大小）；Lagged 启动期重取一次快照 | `startup_merge_tests` 5 例（交界最终态保留、旧事件丢弃、owner 换代、stale、跨 thread）；首快照与广播同源盖 lease 代际（`mirror.project`，`turn_ids_collects_canonical_turns` 断言 epoch≠0），Lagged 先抽干再重取；**Lagged 顺序仍无专门用例**（抽干与重取之间新发布事件会在快照后补发，窄窗口） |
+| P7 | H3 拒绝原因未贯通 | hub 分支真实 403 补 `reason` + `reasonCode`；手机优先按 `reasonCode` 本地化（`mobile.composer.headlessDisabled`），`data.reason` 仅兜底 | `send_h3_off_ipc_unavailable_compat_refuses` 断言 reason；MessageComposer `403 headless_disabled 显示服务端 reason` |
 
 ### 复审已核对无问题（摘要）
 
@@ -179,7 +179,7 @@ tty_map 文件）；Windows permissions=false；不发版。
 不存在）与 D–G 的 12 条 Minor 已全部处置或如实登记。修复后重跑：
 
 - `cargo fmt --check` / `cargo clippy --all-targets --features marker-helper -- -D warnings`：PASS
-- `cargo test --features marker-helper`：2631 passed / 5 failed（均为 main 基线 HOME 隔离失败）
+- `cargo test --features marker-helper`：2637 passed / 5 failed（均为 main 基线 HOME 隔离失败）
 - `cargo test --test codex_desktop_ipc / codex_ipc_remote / codex_control_remote`：43 / 52 / 36 PASS
 - `pnpm test`：全绿（第三轮新增 9 例接线/账本交互测试）；`pnpm check`、`pnpm check:i18n`、`check-error-codes` PASS
 - 残余缺口与未测格见 §8 与验收报告，不以自动化层冒充产品验收。
