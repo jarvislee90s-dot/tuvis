@@ -234,7 +234,9 @@
             "zcode": "no",
             "dsh": "no",
             "openclaw": "no"
-          }
+          },
+          "note": "实验性；仅 Windows 26.1013.4894.0 / macOS 26.1013.40934 按 build 解锁；permissions 关闭；生成图入会话产物",
+          "noteEn": "Experimental; only Windows 26.1013.4894.0 / macOS 26.1013.40934 per exact build; permissions off; generated images are session artifacts"
         }
       ]
     }

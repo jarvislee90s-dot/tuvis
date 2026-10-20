@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 English · [中文](CHANGELOG.md)
 
@@ -12,6 +12,55 @@ English · [中文](CHANGELOG.md)
 
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
+
+## [Unreleased]
+
+### Added
+
+- **Codex APP remote control (experimental, unlocked per exact Desktop build)**: Codex
+  desktop APP sessions can now be viewed and operated from the phone — message
+  projection and runtime status, send/queue, command approval, and Plan blocking Q&A.
+  When Desktop is absent and H3 is enabled, the compatible exec path is used; with H3
+  off the request is refused honestly. Windows `26.1013.4894.0` unlocks
+  send/status/command approval/Plan Q&A; macOS `26.1013.40934` unlocks send/status.
+  permissions stays disabled, and no other build is claimed (PR #171).
+- **Codex generated images in the file panel**: images under
+  `~/.codex/generated_images/<threadId>/` are pooled as session artifacts and use the
+  same preview path (`60beea0c` / PR #171).
+- **Codex file pool now extracts `event_msg.local_images`** so user-uploaded or
+  referenced local images can appear in the file panel (#69).
+
+### Changed
+
+- **Sub-agent completion-report toggle extended to codex / kimi / opencode** (#152).
+- **Codex APP message signature is off by default**: when the setting is off, Codex APP
+  paths no longer carry the `[mobile name]` source marker by default; enable it in
+  desktop Settings → Message signature. actionId idempotency is unchanged.
+- **Usage formatting follows the locale**: English UI uses K/M/B and min/s/ms instead
+  of Chinese number formats.
+
+### Fixed
+
+- **ZCode no longer reports completion while background work is unsettled**: synthetic
+  notification messages no longer affect status or preview (#61 Task 3/4, PR #169).
+- **Codex file-pool seq now aligns with message entries**, fixing ordering shifts
+  (PR #168).
+- **Sub-agent notifications / board / presets**: PR #167 cleanup; the parent card's
+  sub-agent badge is recomputed from the same source (#134); the sub-agent-level preset
+  entry is restored with distinct empty/unsupported states (#66).
+- **Codex Q&A cancel now supports Esc** with explicit destructive-action wording
+  (#80, PR #166).
+- **Remote hardening**: escaped ingress hostnames parse correctly; saveToken gains a
+  busy guard; named-parser config-line priority and charset handling are hardened.
+
+### Engineering
+
+- Split the bilingual changelog and backfilled v0.5.6–v0.5.8 English entries; added
+  `nameEn` to the capability matrix; translated the remaining 7 English manual
+  chapters; corrected the OpenClaw matrix cells.
+- Added `CHANGELOG.en.md` to the website-notification trigger paths; the post-0.5.8
+  change inventory (excluding PR #171) lives in
+  `docs/superpowers/reviews/2026-10-20-post-0.5.8-change-inventory.md`.
 
 ## [0.5.8] - 2026-10-16
 
