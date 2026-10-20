@@ -64,7 +64,9 @@ tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 # preserve_order（issue #36-5）：Map 用 IndexMap 保序——写回 ~/.claude.json 等
 # JSON 工具配置时不再把整个文件按字母序重排（TOML/JSONC 路径本就保序）
-serde_json = { version = "1", features = ["preserve_order"] }
+# raw_value 仅供定价目录保留费率原始十进制文本；不要改用 arbitrary_precision
+# （crate 级 feature 会改变全应用 Value::Number 的解析与内存行为）。
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 # 0.33+ 移除了 RefreshKind::new()/ProcessRefreshKind::new()（改用 nothing()），
 # 0.32 没有 nothing()，故代码迁移必须与本次 bump 同批（见 PR 说明）。
 sysinfo = "0.39"

@@ -110,9 +110,9 @@ describe("usage-records（计划② Task 9：页签壳 + 用量记录页）", ()
     expect(claude).toHaveTextContent("Claude");
     expect(screen.getByTestId("usage-record-card-workbuddy")).toHaveTextContent("WorkBuddy");
 
-    // 卡片合计 = requestTotal + output（与 hero 同口径），缩写 + hover 精确值
+    // 卡片合计 = requestTotal + output（与 hero 同口径），只显示万/亿缩写
     expect(claude).toHaveTextContent("129.22万");
-    expect(claude.querySelector("[title='1,292,245']")).toBeTruthy();
+    expect(claude.querySelector("[title='1,292,245']")).toBeNull();
 
     // 两页签共用同一 range：记录页首查 = 打开的当前档；看板查询仍在、采集恰一次（同一次打开窗口）
     expect(callsOf("usage_records")[0][1]).toEqual({
@@ -124,7 +124,7 @@ describe("usage-records（计划② Task 9：页签壳 + 用量记录页）", ()
     expect(callsOf("usage_collect")).toHaveLength(1);
   });
 
-  it("2. 卡内行恒为「供应商 / 模型」原文 + 缩写数值 + hover 精确值（前端不拼、不随卡片维度变）", async () => {
+  it("2. 卡内行恒为「供应商 / 模型」原文 + 万/亿缩写（前端不拼、不随卡片维度变）", async () => {
     openRecords();
     await screen.findByTestId("usage-record-card-claude");
 
@@ -137,9 +137,9 @@ describe("usage-records（计划② Task 9：页签壳 + 用量记录页）", ()
     // 行序 = 后端 rows 顺序（testid 的 index 与 row.key 一一对应）
     expect(screen.getByTestId("usage-record-row-claude:1")).toHaveTextContent("claude-opus-4-1");
 
-    // 数值口径与 hero 一致（`requestTotal + output`），缩写 + hover 精确值
+    // 数值口径与 hero 一致（`requestTotal + output`），只显示缩写，不挂原始值 tooltip
     expect(row0).toHaveTextContent("16.15万");
-    expect(row0.querySelector("[title='161,531']")).toBeTruthy();
+    expect(row0.querySelector("[title='161,531']")).toBeNull();
   });
 
   it("3. 供应商归因三态徽标逐行可见，且三态配色互不相同（深色档另有取值）", async () => {
@@ -459,9 +459,29 @@ describe("usage-records（计划② Task 9：页签壳 + 用量记录页）", ()
     openRecords();
     const ok = await screen.findByTestId("usage-record-card-claude");
     expect(ok).toHaveTextContent("合计 129.22万");
-    expect(ok.querySelector("[title='1,292,245']")).toBeTruthy();
+    expect(ok.querySelector("[title='1,292,245']")).toBeNull();
     expect(screen.getByTestId("usage-record-row-claude:0").lastElementChild?.textContent).toBe(
       "16.15万"
     );
+  });
+
+  it("12. 页脚「高级」入口打开计费归属与参考价规则管理器（旧逐行规则入口已收敛）", async () => {
+    openRecords();
+    await screen.findByTestId("usage-record-card-claude");
+
+    // 普通行不再有「指定渠道 / 修改关联 / 查看规则」入口
+    expect(screen.queryAllByTestId(/^usage-record-assign-/)).toHaveLength(0);
+    expect(screen.queryAllByTestId(/^usage-record-rules-/)).toHaveLength(0);
+    expect(screen.queryByText("查看规则")).toBeNull();
+
+    const advanced = screen.getByTestId("usage-records-billing-advanced");
+    expect(advanced).toHaveTextContent("高级：计费归属与参考价规则");
+    // 管理器未打开时其内容不渲染
+    expect(screen.queryByTestId("billing-revision")).toBeNull();
+
+    fireEvent.click(advanced);
+    expect(await screen.findByTestId("billing-revision")).toHaveTextContent("当前版本：0");
+    // 页脚入口与管理器标题同口径（「计费归属与参考价规则」）
+    expect(screen.getByText("计费归属与参考价规则")).toBeTruthy();
   });
 });

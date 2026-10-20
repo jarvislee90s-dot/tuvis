@@ -15,6 +15,7 @@ void initTheme();
 import { resetGravityPerRun } from "@/components/pet/petConfig";
 void resetGravityPerRun();
 import { QueryClientProvider } from "@tanstack/react-query";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { queryClient } from "@/lib/query/queryClient";
 import { setupToolsChangedListener } from "@/lib/query/toolsChangedSync";
 import { useRemoteEvents } from "@/hooks/useRemoteEvents";
@@ -74,9 +75,11 @@ function AppWrapper() {
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <Suspense fallback={null}>
-        <AppWrapper />
-      </Suspense>
+      <TooltipProvider delayDuration={200}>
+        <Suspense fallback={null}>
+          <AppWrapper />
+        </Suspense>
+      </TooltipProvider>
     </QueryClientProvider>
   </React.StrictMode>
 );

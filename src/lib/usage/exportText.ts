@@ -6,11 +6,11 @@
 //  ① 首行 = `usage.title` · `rangeLabelOf(dash.range)`；趋势首末键算得出跨度时追加**全角括号**
 //     `（09/27 – 10/03）`（半角是另一套口径）。标题键就用 `usage.title` —— **不新增** `summaryTitle`
 //     （同值，en 侧历史上还大小写分叉过）。
-//  ② 指标行顺序固定 `requestTotal → output → cacheRead → hitRate → requests → userEst → asOf`，
-//     标签一律取 `usage.grid.*`（与大看板首屏同一批键，不另造一套文案）。
+//  ② 指标行顺序固定 `requestInput → cacheRead → cacheMiss → output → hitRate → requests → asOf`，
+//     标签一律取 `usage.grid.*`（与 A 总览同一批键，不另造一套文案）；V2 已删除「用户输入(估)」。
 //  ③ 值一律**精确千分位**（`fmtInt`，含请求次数）：摘要没有列宽压力，**不用**万/亿缩写（那是看板网格的取舍）。
 //     命中率取 `fmtPct`（**0–1 分数**口径，全仓唯一一套，不得在此引入 0–100 的第二套）。
-//  ④ 不可得一律 `EM_DASH`、绝不填 0（§3 第 5 条）：`userEst === null` → `—`（`~` 前缀只在有值时加）；
+//  ④ 不可得一律 `EM_DASH`、绝不填 0（§3 第 5 条）；
 //     `collectedAt === 0` 是「尚未采集」哨兵（§3 第 8 条）→ 渲染 `usage.notCollected`，不是 `—`、更不是 1970 年。
 //  ⑤ 分组明细行全交 Task 2 的 `distributionRows`：行序（值降序）、零值行丢弃、≤10 行截断与 `moreCount`
 //     都是那一层的裁决，本文件**不重算**；值取 `DistRow.value`（= `requestTotal + output`，与 hero /
@@ -50,26 +50,23 @@ export function buildTextSummary(dash: UsageDashboard, t: TFn): string {
   const lines: string[] = [span ? `${head}（${span}）` : head];
 
   const { totals, totalsBuckets } = dash;
-  // **没量到 token** 的窗口（2026-10-06 用户裁决）：四个由 token 桶派生的行（请求输入 / 产出 /
-  // 缓存命中 / 命中率）一律 `—`、**绝不印 0**；**计数类（请求次数）照常出真值**。
-  // 判据只一处 = `range.ts::tokenUnmeasured`（**窗口级**）。
-  // ⚠️ **`用户输入(估)` 不置空**（2026-10-06 第三轮用户裁决）：它从**用户文本**估出来
-  // （`collectors/{claude,codex,kimi}.rs` 三源独立估），与四个 token 桶无关 ⇒「四桶全零」不蕴含
-  // 「用户没打字」（真机账本：`requests=1 | 四桶全零 | user_est = 7`）⇒ 只有「不可得」才出 `—`。
-  // ⚠️ **CSV 是例外**：那是数据文件（11 列原始整数、给 Excel / 脚本用），保留原始 0 —— 理由与落点
-  // 见 `UsageExportActions` 的 CSV 分支注释；本函数只管**给人看**的文本摘要。
+  // **没量到 token** 的窗口：由 token 桶派生的行一律 `—`、**绝不印 0**；**计数类（请求次数）照常出真值**。
+  // 判据只一处 = `range.ts::tokenUnmeasured`（**窗口级**）。V2 已删除「用户输入(估)」行。
+  // ⚠️ **CSV 是例外**：那是数据文件（11 列原始整数、给 Excel / 脚本用），保留原始 0 与 userEst 列。
+  // 本函数只管**给人看**的文本摘要。
   const unmeasured = tokenUnmeasured(dash);
   const token = (v: number) => (unmeasured ? EM_DASH : fmtInt(v));
-  lines.push(`${t("usage.grid.requestTotal")}: ${token(totals.requestTotal)}`);
-  lines.push(`${t("usage.grid.output")}: ${token(totalsBuckets.output)}`);
+  // 顺序与 A 总览一致：请求输入 → 缓存命中 → 未缓存命中 → 产出 → 命中率 → 请求次数。
+  lines.push(`${t("usage.grid.requestInput")}: ${token(totals.requestTotal)}`);
   lines.push(`${t("usage.grid.cacheRead")}: ${token(totalsBuckets.cacheRead)}`);
+  // cacheMiss 与 A 同公式（requestTotal - cacheRead），上期无需另算
+  lines.push(
+    `${t("usage.grid.cacheMiss")}: ${token(totals.requestTotal - totalsBuckets.cacheRead)}`
+  );
+  lines.push(`${t("usage.grid.output")}: ${token(totalsBuckets.output)}`);
   lines.push(`${t("usage.grid.hitRate")}: ${unmeasured ? EM_DASH : fmtPct(totals.cacheHitRate)}`);
   // **计数类**（请求次数）与采集时刻**不受影响**：它们是真值，不是 token 量
   lines.push(`${t("usage.grid.requests")}: ${fmtInt(totals.requests)}`);
-  lines.push(
-    // `userEst` 同属「不是 token 桶派生的真值」⇒ 只看 `=== null`（不可得才 `—`），不看 `unmeasured`
-    `${t("usage.grid.userEst")}: ${totals.userEst === null ? EM_DASH : `~${fmtInt(totals.userEst)}`}`
-  );
   // 采集时刻的唯一口径出处：`asOfText`（`collectedAt === 0` → `usage.notCollected`，见文件头 ④）
   lines.push(`${t("usage.grid.asOf")}: ${asOfText(dash.collectedAt, t)}`);
 

@@ -1,0 +1,58 @@
+{
+  "openai": {
+    "id": "openai",
+    "models": {
+      "gpt-curation": {
+        "id": "gpt-curation",
+        "release_date": "2025-01-01",
+        "cost": { "input": 1 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  },
+  "google": {
+    "id": "google",
+    "models": {
+      "gpt-curation-2025-02-01": {
+        "id": "gpt-curation-2025-02-01",
+        "release_date": "2025-02-01",
+        "cost": { "input": 3 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  },
+  "openrouter": {
+    "id": "openrouter",
+    "models": {
+      "gpt-curation": {
+        "id": "gpt-curation",
+        "release_date": "2025-06-01",
+        "cost": { "input": 2 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "or-only": {
+        "id": "or-only",
+        "release_date": "2025-03-01",
+        "cost": { "input": 4 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  },
+  "aggregator-x": {
+    "id": "aggregator-x",
+    "models": {
+      "gpt-curation": {
+        "id": "gpt-curation",
+        "release_date": "2025-12-01",
+        "cost": { "input": 99 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "agg-only": {
+        "id": "agg-only",
+        "release_date": "2025-12-01",
+        "cost": { "input": 50 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  }
+}

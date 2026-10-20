@@ -205,6 +205,8 @@ pub fn run() {
             crate::remote::restore_on_launch();
             // 用量账本：应用启动采集一次（按需路径，绝不进 3 秒轮询）
             crate::services::usage::collect::spawn_initial_collection();
+            // 公开价格：每 5 分钟检查一次 enabled && stale；未启用时零请求
+            crate::services::usage::v2::pricing::spawn_pricing_refresh_loop();
             // 升级残留清理：Windows 升级流把安装包留在 %TEMP% 的
             // `{app}-*-updater-*` 目录（插件装完 exit(0) 不回收），启动即扫除
             crate::commands::updater::cleanup_updater_temp_dirs(app.handle());
@@ -366,6 +368,34 @@ pub fn run() {
         commands::usage::usage_export_csv,
         commands::usage::usage_get_settings,
         commands::usage::usage_set_settings,
+        commands::usage_v2::usage_billing_get,
+        commands::usage_v2::usage_billing_preview,
+        commands::usage_v2::usage_billing_commit,
+        commands::usage_v2::usage_billing_undo,
+        commands::usage_v2::usage_identities,
+        commands::usage_v2::usage_trend,
+        commands::usage_v2::usage_distribution,
+        commands::usage_v2::usage_pricing_get,
+        commands::usage_v2::usage_pricing_set_enabled,
+        commands::usage_v2::usage_pricing_refresh,
+        commands::usage_v2::usage_pricing_catalog,
+        commands::usage_v2::usage_costs,
+        commands::usage_v2::usage_cost_export_csv,
+        // Task 6：供应商别名 / 渠道选项 / 手动覆盖价
+        commands::usage_v2::usage_provider_aliases_get,
+        commands::usage_v2::usage_provider_alias_upsert,
+        commands::usage_v2::usage_provider_alias_delete,
+        commands::usage_v2::usage_channel_options,
+        commands::usage_v2::usage_pricing_overrides_get,
+        commands::usage_v2::usage_pricing_override_set,
+        commands::usage_v2::usage_pricing_override_delete,
+        // 2026-10-20 计划 Task 5：观察条目 / 模型条目配置 / 精选价目目录
+        commands::usage_v2::usage_observed_entries_get,
+        commands::usage_v2::usage_model_display_name_set,
+        commands::usage_v2::usage_pricing_identity_set,
+        commands::usage_v2::usage_pricing_catalog_search,
+        commands::usage_v2::usage_pricing_auto_match,
+        commands::usage_v2::usage_pricing_quote_get,
         // 导出落盘（计划①，契约 §3 新增）：文本/二进制写导出目录（2026-10-07 A2 起 = 系统下载目录）
         commands::export::export_save_text,
         commands::export::export_save_bytes,

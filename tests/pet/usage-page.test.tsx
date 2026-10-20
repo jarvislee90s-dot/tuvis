@@ -13,7 +13,7 @@
 //    只验页面三态分支，重试策略不是本任务的产物。
 //  * `invoke` 走 tests/setup.ts 接进 `@tauri-apps/api/core` 的那个单例（① 的 mock case → ② 同源夹具），
 //    不另起 `vi.mock("@tauri-apps/api/core")`（那会绕开夹具）。
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
@@ -49,7 +49,7 @@ import i18n from "@/i18n";
 import UsageDashboardPage from "@/pages/usage-dashboard";
 import { UsageSummary } from "@/components/usage/UsageSummary";
 import { tauriInvokeMock } from "../msw/tauriMocks";
-import { EM_DASH } from "@/lib/usage/format";
+import { EM_DASH, fmtTokens } from "@/lib/usage/format";
 import { mockUsageDashboard } from "@/lib/usage/mockFixtures";
 
 type InvokeCall = [string, Record<string, unknown> | undefined];
@@ -87,27 +87,41 @@ beforeAll(async () => {
 describe("usage-page（计划② Task 6：大看板首屏）", () => {
   beforeEach(() => localStorage.clear());
 
-  it("1. hero 千分位 + 7 行固定顺序 + 命中率环比段 + asOf 时刻形态", async () => {
+  it("1. hero 万/亿缩写 + 7 行固定顺序 + 命中率环比段 + asOf 时刻形态", async () => {
     renderPage();
-    // 夹具四工具求和：ΣrequestTotal 1,954,268 + Σoutput 82,713 = 2,036,981（不得改断言口径）
-    expect(await screen.findByTestId("usage-hero")).toHaveTextContent("2,036,981");
+    // 夹具四工具求和：ΣrequestTotal 1,954,268 + Σoutput 82,713 = 2,036,981
+    // 新显示口径：hero 也用万/亿缩写（用户 2026-10-19 覆盖旧完整千分位约定）
+    expect(await screen.findByTestId("usage-hero")).toHaveTextContent("203.70万");
+    expect(screen.getByTestId("usage-hero")).not.toHaveTextContent("2,036,981");
 
     expect(
       screen.getAllByTestId(/^usage-grid-/).map((el) => el.getAttribute("data-testid"))
     ).toEqual([
-      "usage-grid-userEst",
-      "usage-grid-output",
-      "usage-grid-requestTotal",
+      "usage-grid-requestInput",
       "usage-grid-cacheRead",
+      "usage-grid-cacheMiss",
+      "usage-grid-output",
       "usage-grid-hitRate",
       "usage-grid-requests",
       "usage-grid-asOf",
     ]);
+    // V2 删除「用户输入(估)」；2026-10-20 Task 8 再删「缓存写入（解释）」details 块
+    expect(screen.queryByTestId("usage-grid-userEst")).toBeNull();
+    expect(screen.queryByTestId("usage-cache-write")).toBeNull();
 
-    // 常规 token 数值走「万」缩写 + hover 给精确值（spec P8 与 hero 的千分位刻意区分）
-    const reqRow = screen.getByTestId("usage-grid-requestTotal");
+    // 常规 token 数值走「万」缩写；不再挂完整千分位原始值 tooltip
+    const reqRow = screen.getByTestId("usage-grid-requestInput");
     expect(reqRow).toHaveTextContent("195.43万");
-    expect(reqRow.querySelector("[title='1,954,268']")).toBeTruthy();
+    expect(reqRow.querySelector("[title='1,954,268']")).toBeNull();
+
+    // 未缓存命中输入 = requestTotal - cacheRead（与 hero 同口径的派生行）
+    const cacheMiss = screen.getByTestId("usage-grid-cacheMiss");
+    expect(cacheMiss).toHaveTextContent(
+      fmtTokens(
+        mockUsageDashboard({ preset: "last7d" }, "tool").totals.requestTotal -
+          mockUsageDashboard({ preset: "last7d" }, "tool").totalsBuckets.cacheRead
+      )
+    );
 
     // 命中率行：当前值 1 位小数 + 环比段**只剩差值**（2026-10-06 用户裁决「同比冗余字太多」）
     const hitRow = screen.getByTestId("usage-grid-hitRate");
@@ -119,11 +133,8 @@ describe("usage-page（计划② Task 6：大看板首屏）", () => {
     expect(screen.getByTestId("usage-grid-asOf")).toHaveTextContent(/\d{2}:\d{2}:\d{2}/);
 
     // **趋势区也必须有环比**（spec P8：「指标网格各项**与趋势区**都显示对比值」）。
-    // 页面接线锁：口径 = 区间 hero（2,036,981）环比上一等长区间
-    // （夹具 prevBuckets.output 71,133 + prevMetrics.requestTotal 1,680,670 = 1,751,803）
-    // ⇒ 区间合计 +16.3%。主语（「区间合计」）不能省：这一行紧贴在「峰值 {{v}}」正下方，
-    // 没主语会被读成「峰值涨了 16.3%」（数字对、归属错）。
-    expect(screen.getByTestId("usage-trend-compare")).toHaveTextContent("区间合计 （+16.3%）");
+    // V2 的 B 来自新 `usage_trend`（hero=140 / 上期 hero=100）⇒ 区间合计 +40.0%。
+    expect(screen.getByTestId("usage-trend-compare")).toHaveTextContent("区间合计 （+40.0%）");
   });
 
   it("2. 默认档 last7d；切「近 30 天」只把 preset 交给后端重查（前端不自行推算窗口）", async () => {
@@ -203,7 +214,9 @@ describe("usage-page（计划② Task 6：大看板首屏）", () => {
     expect(screen.queryByTestId("usage-hero")).toBeNull();
 
     const before = callsOf("usage_dashboard").length;
-    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    // D 卡（API 等效费用）默认展开，错误档下它也有一个「重试」——点击限定在 A 卡错误体内，
+    // 本用例只验「旧 dashboard 查询失败可重试」（D 卡重试归 D 查询，见 v2-page 用例 11）
+    fireEvent.click(within(alert).getByRole("button", { name: "重试" }));
     await waitFor(() => expect(callsOf("usage_dashboard").length).toBeGreaterThan(before));
     warn.mockRestore();
   });
@@ -223,106 +236,34 @@ describe("usage-page（计划② Task 6：大看板首屏）", () => {
     // 与用例 5 的区别：这里 `isDashboardEmpty` 为**假**（有行）⇒ 页面照常出看板，拦 0 的是
     // `tokenUnmeasured`（只看四个 token 桶的和）。两者**不可互替**。
     localStorage.setItem("mam-mock-usage", "unmeasured");
-    const page = renderPage();
+    renderPage();
 
     // 看板照常在（不是整块「暂无数据」）；hero 是 token 合计 ⇒ 出 `—` 而不是 0
     expect(await screen.findByTestId("usage-hero")).toHaveTextContent(EM_DASH);
-    // 页面没走空态分支（空态分支只渲染 `UsageEmpty`，不会有 hero）：这里的两个 `usage-empty` 都是
-    // **卡片自己的**内容区标签——四桶全零 ⇒ `distributionRows` 把零值行丢光（分布卡）+
-    // 趋势点全零 ⇒ 整卡走空态（趋势卡，2026-10-06 第二轮）。两卡的空态机制**不同**：前者是被
-    // `distributionRows` 丢空、后者是判据 `unmeasured` 直接拦（页面级三态没变，hero 仍在）。
-    //
-    // ⚠️ **不能同步计数**（2026-10-06 第三轮防 flake）：趋势卡的空态出口是
-    // `busy ? UsageLoading : UsageEmpty`，而页面传的是 `busy={dashboard.isFetching}` ——
-    // 挂载期的采集 invalidate 会让趋势卡**先出一帧加载态**，那一刻 `usage-empty` 只有 1 个
-    // （分布卡那个）。故先 waitFor 等两个都稳定在场，再取快照计数（waitFor 会重试到稳定态）。
-    await waitFor(() => expect(screen.getAllByTestId("usage-empty")).toHaveLength(2));
-    const emptyNodes = screen.getAllByTestId("usage-empty");
-    expect(emptyNodes).toHaveLength(2);
-    for (const node of emptyNodes) {
-      expect(node).toHaveTextContent("暂无数据");
-      expect(node.textContent).not.toMatch(/\d/);
-    }
 
-    // **四个由 token 桶派生的行**一律 `—`（产出 / 请求输入(全文累计) / 缓存命中 / 命中率）；
-    // `用户输入(估)` **不在其中**（见下）
-    for (const key of ["output", "requestTotal", "cacheRead", "hitRate"]) {
+    // **四项 token 派生行 + 命中率**一律 `—`，且都不显示环比段
+    for (const key of ["requestInput", "cacheRead", "cacheMiss", "output", "hitRate"]) {
       const row = screen.getByTestId(`usage-grid-${key}`);
       expect(row).toHaveTextContent(EM_DASH);
       expect(row.textContent).not.toMatch(/\d/); // 一个数字都不许出现（0 / 0.0% 都不行）
-      // 没量到 ⇒ 也**不显示环比段**：`— ↑100.0%` 是自相矛盾的读数（夹具刻意保留非 null 的 compare）
       expect(row.textContent).not.toContain("上一周期");
     }
+    // cacheWrite 详情块已随 2026-10-20 计划删除（Task 8）——token 派生量的解释面不再存在
+    expect(screen.queryByTestId("usage-cache-write")).toBeNull();
 
-    // **`用户输入(估)` 恢复 KEEP**（2026-10-06 **第三轮**用户裁决）：它取自**用户打的字**
-    // （`collectors/{claude,codex,kimi}.rs` 三源独立估），**不是**四桶的派生量 ⇒「四桶全零」
-    // 不蕴含「用户没打字」（真机：`requests=1 | 四桶全零 | user_est = 7`）。夹具这一档刻意给
-    // **非零真值 7**（`mockFixtures.ts::zeroTokensOf`）⇒ 本断言**非空洞**：实现若把它一并抹成
-    // `—`，这里当场红。它的环比照常算（当前值与上一周期值都是真值）。
-    const estRow = screen.getByTestId("usage-grid-userEst");
-    expect(estRow).toHaveTextContent("~7");
-    expect(estRow.textContent).toMatch(/\d/);
-    expect(estRow.textContent).not.toContain(EM_DASH);
-
-    // **计数类真值照常显示**（用户裁决逐字点名：请求次数是量出来的真值，不得被置空）
+    // **计数类真值照常显示**（请求次数是量出来的真值，不得被置空）
     const requests = mockUsageDashboard({ preset: "last7d" }, "tool").totals.requests;
     expect(requests).toBeGreaterThan(0);
     expect(screen.getByTestId("usage-grid-requests")).toHaveTextContent(String(requests));
     expect(screen.getByTestId("usage-grid-requests")).not.toHaveTextContent(EM_DASH);
-    // **夹具保真锁**（2026-10-06 第二轮）：这一档 `recentSession` 必为 `null`——四桶全零 ⇒ 每行
-    // `request_total` 也是 0（`semantics.rs`：四桶之和 ≥ request_total）⇒ 后端候选集为空。
-    // 摆一个非 null 的会话会造出后端产生不了的形状，并让「行④不许印 0」变成不可达的空锁。
-    expect(mockUsageDashboard({ preset: "last7d" }, "tool").recentSession).toBeNull();
-
-    // 趋势卡：**整卡走空态**——全零趋势也是「没有数据」，`TrendChart` 在 `max === 0` 时会把所有点
-    // 画在底线上（一条贴着底边的零线 = 伪造的图）。故 `usage-trend-svg` 必须**不存在**，
-    // `usage-trend-peak` / `usage-trend-compare` 也随之不存在（「峰值 —」这种怪值不该存在）。
-    expect(screen.queryByTestId("usage-trend-svg")).toBeNull();
-    expect(screen.queryByTestId("usage-trend-peak")).toBeNull();
-    expect(screen.queryByTestId("usage-trend-compare")).toBeNull();
-    // 反向锚：空态文案确实**在**（不能靠"整块没渲染"蒙混过关）
-    expect(screen.getAllByTestId("usage-empty").map((n) => n.textContent)).toContain("暂无数据");
 
     // 页脚/截止时间不受影响：这一档是**采集过但没有 token**，不是「尚未采集」
     expect(screen.getByTestId("usage-grid-asOf")).toHaveTextContent(/\d{2}:\d{2}:\d{2}/);
 
-    // **另一支：`userEst === null` → `—`**（不可得才空；与「没量到 token」是**两条独立**的分支）。
-    // 这一支不出现在 mock 夹具的 unmeasured 档里（那一档给的是非零真值，用来证明「真值照常」），
-    // 故就地改一个字段直接渲染组件——**不**给夹具加第二套语义（免得同一个模式名有两种含义）。
-    // 先卸掉页面，否则同 testid 会命中两个节点（getByTestId 多匹配即抛）。
-    page.unmount();
-    const t = i18n.t.bind(i18n);
-    const base = mockUsageDashboard({ preset: "last7d" }, "tool");
-    const nullEst = render(
-      <UsageSummary
-        dash={{ ...base, totals: { ...base.totals, userEst: null } }}
-        retentionDays={null}
-        t={t}
-      />
-    );
-    const nullRow = screen.getByTestId("usage-grid-userEst");
-    expect(nullRow).toHaveTextContent(EM_DASH);
-    expect(nullRow.textContent).not.toMatch(/\d/);
-    expect(nullRow.textContent).not.toContain("上一周期"); // 当前值不可得 ⇒ 不做环比
-    nullEst.unmount();
-
-    // **反断言（正常窗口逐字不变）**：同一格在「真有 token」的窗口下重渲一次——`用户输入(估)` 的
-    // 缩写值与 hover 精确值都**不得**因本轮改动而漂（防「顺手一律置空」的反向；用例 1 只钉了网格
-    // 顺序与其它几行，没有单独钉过这一格）。**先摘掉 `unmeasured` 档**：`beforeEach` 只在用例之间
-    // 清 localStorage，本用例开头设的模式还在。
-    localStorage.removeItem("mam-mock-usage");
-    const okView = render(
-      <UsageSummary
-        dash={mockUsageDashboard({ preset: "last7d" }, "tool")}
-        retentionDays={null}
-        t={t}
-      />
-    );
-    const okRow = screen.getByTestId("usage-grid-userEst");
-    expect(okRow).toHaveTextContent("~1.80万"); // 18,023 → 万缩写必须 2 位小数（本轮未改口径）
-    expect(okRow.querySelector("[title='~18,023']")).toBeTruthy();
-    expect(okRow.textContent).not.toContain(EM_DASH);
-    okView.unmount();
+    // V2：B/C 是独立查询，不再被旧 dashboard 的「四桶全零」拖垮
+    await waitFor(() => expect(screen.getByTestId("usage-trend-svg")).toBeTruthy());
+    expect(screen.getByTestId("usage-trend-peak")).toBeTruthy();
+    expect(screen.getByTestId("usage-dist-expand")).toHaveTextContent("显示更多（2）");
   });
 
   it("6. 页脚口径常驻 + 环比基准声明一次 + 保留期由设置项驱动 + collectedAt===0 哨兵可见", async () => {

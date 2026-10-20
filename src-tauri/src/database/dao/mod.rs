@@ -16,4 +16,7 @@ pub mod stash;
 pub mod tool_resident;
 pub mod unread;
 pub mod usage;
+pub mod usage_alias;
+pub mod usage_billing;
+pub mod usage_model_config;
 pub mod write_audit;

@@ -32,7 +32,10 @@ export const UNKNOWN_TOKEN = "?";
  * ② 如果记录的单位是『万』或『亿』，则统一保持小数点后两位。**该规则对所有的工具都生效**。」
  * ⇒ 相对 spec P8 旧表的两处变化：**万档 1 位 → 2 位**、**两档一律不再剥尾零**（旧：万剥 `.0`、亿去尾零）。
  * 负数与非有限值归 `"0"`（绝不显示 `NaN`）。
- * ⚠️ 与 `fmtInt` 刻意区分：hero 大数字与所有 hover「精确值」不走本函数（那是完整千分位）。
+ * ⚠️ 与 `fmtInt` 刻意区分：Token 展示（hero / 网格 / 分布 / 趋势 tooltip / 费用行 /
+ *   Token 合计）一律走本函数；`fmtInt` 只留给请求次数、会话数、工具调用数等**非 Token 计数**，
+ *   以及「复制文本 / 导出」既有完整千分位契约（spec §2.7）。
+ *   2026-10-19 用户手工测试裁决：Token 数值不再显示完整千分位原始值 / tooltip。
  *
  * en 档（issue #160 决策 1）：`<1K` 整数 / `<1M` X.XXK / `<1B` X.XXM / `≥1B` X.XXB；
  * en 时长单位词见 `fmtDur` / `fmtLongest`（`X.X min` / `X.X s` / `N ms`）。
@@ -51,7 +54,8 @@ export function fmtTokens(n: number, locale: Lang = "zh"): string {
   return (n / 100_000_000).toFixed(2) + "亿";
 }
 
-/** hero 大数字（spec P8）：**完整千分位**、四舍五入，不用万/亿缩写。非有限值归 `"0"`。 */
+/** 完整千分位：用于请求次数 / 会话数 / 工具调用数等非 Token 计数，以及导出文本契约
+ * （Token 数值统一走 `fmtTokens` 的万/亿缩写；2026-10-19 用户裁决）。非有限值归 `"0"`。 */
 export function fmtInt(n: number): string {
   if (!Number.isFinite(n)) return "0";
   const rounded = Math.round(n);

@@ -1,3 +1,7 @@
+// 多集成测试二进制**共享**本辅助模块：每个二进制只使用其中一部分（例如只建私有账本库、
+// 不调 setup），未使用的共享辅助在 `--all-targets -D warnings` 下不应报 dead_code。
+#![allow(dead_code)]
+
 use std::sync::Once;
 
 static INIT: Once = Once::new();

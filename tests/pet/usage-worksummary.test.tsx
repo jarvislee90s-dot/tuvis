@@ -260,16 +260,18 @@ describe("usage-worksummary 组件（工作小结区）", () => {
     expect(screen.getByTestId("work-tool-calls")).toHaveTextContent("41,412");
     expect(screen.getByTestId("work-tool-avg")).toHaveTextContent("79 毫秒"); // fmtDur(79)
 
-    // Top 列表（spec【默认裁定】：只给「次数第一名」「耗时第一名」，不做 Top5）
+    // Top 列表：V2 把「耗时第一」移入高级统计，主区保留「次数第一」
     const list = screen.getByTestId("work-top-list");
     expect(list.tagName).toBe("UL");
-    expect(list.querySelectorAll("li")).toHaveLength(2);
+    expect(list.querySelectorAll("li")).toHaveLength(1);
 
     const byCount = screen.getByTestId("work-top-count");
     expect(byCount).toHaveTextContent(tf("usage.work.topToolCount"));
     expect(byCount).toHaveTextContent("Bash"); // 工具调用名原样渲染（不是采集源 id）
     expect(byCount).toHaveTextContent("12,004");
 
+    // 高级统计 details 内：平均耗时 / 耗时第一 / p50+最长
+    expect(screen.getByTestId("work-advanced")).toHaveTextContent(tf("usage.work.advanced"));
     const byMs = screen.getByTestId("work-top-ms");
     expect(byMs).toHaveTextContent(tf("usage.work.topToolMs"));
     expect(byMs).toHaveTextContent("31.1 分钟"); // fmtDur(1_864_000)
@@ -305,9 +307,11 @@ describe("usage-worksummary 组件（工作小结区）", () => {
       expect(cell.textContent).not.toContain("0");
     }
 
-    // 全卡零数字：不出现 0 / NaN / Infinity / undefined（填 0 在结构上不可能）
-    expect(view.container.textContent).not.toMatch(/\d/);
-    expect(view.container.textContent).not.toMatch(/NaN|Infinity|undefined|null/);
+    // 全卡零数字：不出现 0 / NaN / Infinity / undefined（填 0 在结构上不可能）。
+    // 「p50」是高级统计的段名（字母 p + 数字 50），不是指标值，比较前先剔除。
+    const text = (view.container.textContent ?? "").replace(/p50/g, "");
+    expect(text).not.toMatch(/\d/);
+    expect(text).not.toMatch(/NaN|Infinity|undefined|null/);
 
     view.unmount();
   });

@@ -1,0 +1,111 @@
+{
+  "provider-old": {
+    "id": "provider-old",
+    "models": {
+      "dup-date-2024-08-06": {
+        "id": "dup-date-2024-08-06",
+        "release_date": "2024-08-06",
+        "cost": { "input": 1 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-price-2024-08-06": {
+        "id": "dup-price-2024-08-06",
+        "release_date": "2024-08-06",
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-cond-2024-08-06": {
+        "id": "dup-cond-2024-08-06",
+        "release_date": "2024-08-06",
+        "cost": { "input": 4, "context_over_200k": { "input": 8 } },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-tie": {
+        "id": "dup-tie",
+        "release_date": "2024-08-06",
+        "cost": { "input": 5 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-free-2024-08-06": {
+        "id": "dup-free-2024-08-06",
+        "release_date": "2024-08-06",
+        "cost": { "input": 7 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-month": {
+        "id": "dup-month",
+        "release_date": "2024-08",
+        "cost": { "input": 8 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-year": {
+        "id": "dup-year",
+        "release_date": "2024",
+        "cost": { "input": 9 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-invalid-date": {
+        "id": "dup-invalid-date",
+        "release_date": "not-a-date",
+        "cost": { "input": 10 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  },
+  "provider-new": {
+    "id": "provider-new",
+    "models": {
+      "dup-date-2024-11-20": {
+        "id": "dup-date-2024-11-20",
+        "release_date": "2024-11-20",
+        "cost": { "input": 2 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-price": {
+        "id": "dup-price",
+        "release_date": "2024-08-06",
+        "cost": { "input": 3 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-cond": {
+        "id": "dup-cond",
+        "release_date": "2024-08-06",
+        "cost": { "input": 5 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-free-2025-01-01": {
+        "id": "dup-free-2025-01-01",
+        "release_date": "2025-01-01",
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-month": {
+        "id": "dup-month",
+        "release_date": "2024-09",
+        "cost": { "input": 6 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-year": {
+        "id": "dup-year",
+        "release_date": "2025",
+        "cost": { "input": 6 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "dup-invalid-date": {
+        "id": "dup-invalid-date",
+        "release_date": "2023-12",
+        "cost": { "input": 6 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  },
+  "provider-a": {
+    "id": "provider-a",
+    "models": {
+      "dup-tie": {
+        "id": "dup-tie",
+        "release_date": "2024-08-06",
+        "cost": { "input": 5 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  }
+}

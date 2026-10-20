@@ -267,6 +267,15 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         )
     })?;
 
+    // 手动覆盖价币种（2026-10-20）：存量行一律 USD（旧语义），新行由 UI 选择 USD/CNY。
+    if !column_exists(conn, "usage_price_override", "currency") {
+        conn.execute(
+            "ALTER TABLE usage_price_override ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD' CHECK(currency IN ('USD','CNY'))",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_OVERRIDE_CURRENCY_FAIL: 迁移覆盖价币种失败: {}", e))?;
+    }
+
     Ok(())
 }
 
@@ -828,6 +837,125 @@ mod tests {
             cursors, 1,
             "补列不得清空游标（清了会重采，与重建路径的取舍不同）"
         );
+    }
+
+    /// Task 3/8 + V2 Task 2/3 + 2026-10-20 计划 Task 2：**当前形状**的旧账本（尚未有
+    /// billing/pricing/provider-alias/price-override/model-config 七张新表）连续迁移两次，
+    /// 旧四表逐行 / 桶 / 游标逐值不变，且新表被幂等补齐。
+    ///
+    /// 该形状不满足 `preview_detail` 判定（有 hour_key/project_key 且 user_est 可空），
+    /// 因此**不得**触发预览版重建分支（那会清空四表）。
+    #[test]
+    fn migrate_twice_preserves_current_ledger_and_creates_v2_tables() {
+        use rusqlite::types::ValueRef;
+
+        fn render(value: ValueRef<'_>) -> String {
+            match value {
+                ValueRef::Null => "NULL".to_string(),
+                ValueRef::Integer(v) => v.to_string(),
+                ValueRef::Real(v) => format!("{v:?}"),
+                ValueRef::Text(v) => String::from_utf8_lossy(v).into_owned(),
+                ValueRef::Blob(v) => v.iter().map(|b| format!("{b:02x}")).collect(),
+            }
+        }
+
+        fn snapshot(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.query_map([], |row| {
+                let mut values = Vec::new();
+                for index in 0..row.as_ref().column_count() {
+                    values.push(render(row.get_ref(index)?));
+                }
+                Ok(values)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        // 模拟“当前形状的旧库”：用量四表已是新形状，但 billing/pricing/alias/override/
+        // model-config 七张新表尚未出现。
+        conn.execute_batch(
+            "DROP TABLE usage_billing_state;
+             DROP TABLE usage_billing_revision;
+             DROP TABLE usage_pricing_state;
+             DROP TABLE usage_pricing_snapshot;
+             DROP TABLE usage_provider_alias;
+             DROP TABLE usage_price_override;
+             DROP TABLE usage_model_config;",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO usage_detail
+                 (source_id, session_id, project_key, hour_key, day_key, model, provider,
+                  provider_kind, input_fresh, cache_read, cache_write, output,
+                  request_total, requests, user_est, first_seen_at, updated_at)
+                 VALUES ('codex','s1','proj','2026-10-17T10','2026-10-17','gpt-5','openai',
+                         'measured',10,2,3,4,12,1,5,100,200);
+             INSERT INTO usage_daily
+                 (day_key, source_id, project_key, provider, provider_kind, model,
+                  input_fresh, cache_read, cache_write, output, request_total, requests,
+                  user_est, updated_at)
+                 VALUES ('2026-10-17','codex','proj','openai','measured','gpt-5',
+                         10,2,3,4,12,1,5,200);
+             INSERT INTO usage_cursor
+                 (source_id, session_id, fingerprint, byte_offset, ordinal, last_cumulative,
+                  mtime_ms, file_size, state_json, updated_at)
+                 VALUES ('codex','s1','fp',42,3,99,123,456,'{\"k\":1}',789);
+             INSERT INTO usage_session
+                 (source_id, session_id, project_key, project_label, project_path_raw,
+                  project_realpath, title, is_subagent, parent_session_id, first_seen_at,
+                  last_seen_at)
+                 VALUES ('codex','s1','proj','Proj','/tmp/p','/tmp/p','T',0,NULL,100,200);",
+        )
+        .unwrap();
+
+        let detail_sql = "SELECT * FROM usage_detail
+             ORDER BY source_id, session_id, project_key, hour_key, model, provider";
+        let daily_sql = "SELECT * FROM usage_daily
+             ORDER BY day_key, source_id, project_key, provider, model";
+        let cursor_sql = "SELECT * FROM usage_cursor ORDER BY source_id, session_id";
+        let session_sql = "SELECT * FROM usage_session ORDER BY source_id, session_id";
+
+        let before = [
+            snapshot(&conn, detail_sql),
+            snapshot(&conn, daily_sql),
+            snapshot(&conn, cursor_sql),
+            snapshot(&conn, session_sql),
+        ];
+        assert!(
+            before.iter().all(|table| !table.is_empty()),
+            "前提：四张旧表都必须有数据"
+        );
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let after = [
+            snapshot(&conn, detail_sql),
+            snapshot(&conn, daily_sql),
+            snapshot(&conn, cursor_sql),
+            snapshot(&conn, session_sql),
+        ];
+        assert_eq!(before, after, "连续迁移两次不得改动旧账本任何行或游标");
+
+        for table in [
+            "usage_billing_state",
+            "usage_billing_revision",
+            "usage_pricing_state",
+            "usage_pricing_snapshot",
+            "usage_provider_alias",
+            "usage_price_override",
+            "usage_model_config",
+        ] {
+            assert!(
+                conn.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
+                    .is_ok(),
+                "迁移后必须存在新表 {table}"
+            );
+        }
     }
 
     /// Codex 动作账本：旧结构（**两列都不存在**）经迁移补列（barrier + signature）——

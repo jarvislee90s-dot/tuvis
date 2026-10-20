@@ -40,20 +40,22 @@ function zeroed(row: UsageRow): UsageRow {
 }
 
 describe("buildTextSummary（计划② Task 11：复制文本摘要）", () => {
-  it("1. 首行 = 看板名 · 范围（+ 全角括号跨度）+ 7 行指标 + 分组行 + 分布行（精确千分位）", () => {
+  it("1. 首行 = 看板名 · 范围（+ 全角括号跨度）+ 6 行指标 + 分组行 + 分布行（精确千分位）", () => {
     const text = buildTextSummary(mockUsageDashboard({ preset: "last7d" }, "tool"), t);
     const lines = text.split("\n");
 
     // 首行跨度用**全角括号**（半角是另一套口径，不得「顺手修正」）；跨度 = 趋势首末键（09/27 – 10/03）
     expect(lines[0]).toBe("用量看板 · 近 7 天（09/27 – 10/03）");
-    // 指标行顺序固定：requestTotal → output → cacheRead → hitRate → requests → userEst → asOf
-    expect(lines[1]).toBe("请求输入(全文累计): 1,954,268");
-    expect(lines[2]).toBe("产出: 82,713");
-    expect(lines[3]).toBe("缓存命中: 1,318,123");
+    // V2 指标行顺序（与 A 总览一致）：requestInput → cacheRead → cacheMiss → output → hitRate → requests → asOf
+    // 2026-10-20 Task 8：计量维度值统一——新增输入 / 输出（i18n 值变更，键与行序不变）
+    expect(lines[1]).toBe("新增输入: 1,954,268");
+    expect(lines[2]).toBe("缓存命中: 1,318,123");
+    // 未缓存命中 = requestTotal - cacheRead（与 A 同公式）
+    expect(lines[3]).toBe("未缓存命中输入: 636,145");
+    expect(lines[4]).toBe("输出: 82,713");
     // 命中率 = 1,318,123 ÷ 1,954,268 = 67.448…% → 一位小数（0–1 分数口径，全仓唯一）
-    expect(lines[4]).toBe("命中率: 67.4%");
-    expect(lines[5]).toBe("请求次数: 460");
-    expect(lines[6]).toBe("用户输入(估) · 含子代理: ~18,023");
+    expect(lines[5]).toBe("命中率: 67.4%");
+    expect(lines[6]).toBe("请求次数: 460");
     // 采集时刻只断**时刻形态**（brief：只断 /\d{2}:\d{2}:\d{2}/）：fmtDateTime 走宿主本地时区，
     // 钉死具体小时数会在别的时区红
     expect(lines[7]).toMatch(/\d{2}:\d{2}:\d{2}$/);
@@ -71,14 +73,10 @@ describe("buildTextSummary（计划② Task 11：复制文本摘要）", () => {
     for (const banned of ["lastMessage", "prompt", "apiKey"]) expect(text).not.toContain(banned);
   });
 
-  it("2. 不可得与哨兵：userEst null → —（不填 0）、collectedAt 0 → 尚未采集、空分布 → —、超 10 行 → 等 N", () => {
+  it("2. 哨兵与空态：collectedAt 0 → 尚未采集、空分布 → —、超 10 行 → 等 N", () => {
     const d = mockUsageDashboard({ preset: "last7d" }, "tool");
 
-    const dash = buildTextSummary(
-      { ...d, totals: { ...d.totals, userEst: null }, collectedAt: 0 },
-      t
-    );
-    expect(dash).toContain("用户输入(估) · 含子代理: —");
+    const dash = buildTextSummary({ ...d, collectedAt: 0 }, t);
     // `collectedAt === 0` 是「尚未采集」哨兵 ⇒ 渲染 usage.notCollected，不是 EM_DASH、更不是 1970 年
     expect(dash).toContain("数据截止时间: 尚未采集");
     expect(dash).not.toContain("1970-01-01");
@@ -153,7 +151,7 @@ describe("buildTextSummary（计划② Task 11：复制文本摘要）", () => {
     }
   });
 
-  it("5. **没量到 token 的窗口**：四桶派生的行一律 `—`、请求次数与用户输入(估)出真值、分组段落走空态（P8；2026-10-06 裁决）", () => {
+  it("5. **没量到 token 的窗口**：四桶派生的行一律 `—`、请求次数出真值、分组段落走空态（P8）", () => {
     // 真机形状：四桶全零但 requests ≥ 1（**真空回合**行）。用户裁决：「只有是真实的数值，你才能
     // 写它的数值。如果没有产生数值，就不显示了」⇒ 摘要里由四桶派生的行出 `—`；**计数类照常**。
     const d = mockUsageDashboard({ preset: "last7d" }, "tool");
@@ -178,16 +176,13 @@ describe("buildTextSummary（计划② Task 11：复制文本摘要）", () => {
       hero: 0,
     };
     const lines = buildTextSummary(noTokens, t).split("\n");
-    expect(lines[1]).toBe(`请求输入(全文累计): ${EM_DASH}`);
-    expect(lines[2]).toBe(`产出: ${EM_DASH}`);
-    expect(lines[3]).toBe(`缓存命中: ${EM_DASH}`);
-    expect(lines[4]).toBe(`命中率: ${EM_DASH}`);
+    expect(lines[1]).toBe(`新增输入: ${EM_DASH}`);
+    expect(lines[2]).toBe(`缓存命中: ${EM_DASH}`);
+    expect(lines[3]).toBe(`未缓存命中输入: ${EM_DASH}`);
+    expect(lines[4]).toBe(`输出: ${EM_DASH}`);
+    expect(lines[5]).toBe(`命中率: ${EM_DASH}`);
     // **计数类真值照常**（用户裁决逐字点名「请求次数」）：断**具体数字**而不是模板
-    expect(lines[5]).toBe("请求次数: 460");
-    expect(lines[5]).not.toContain(EM_DASH);
-    // **`用户输入(估)` 也照常**（2026-10-06 第三轮裁决）：它从用户文本估出来、与四桶无关 ⇒
-    // 本窗口没量到 token 也照印真值（只有 `=== null` 才 `—`）
-    expect(lines[6]).toBe("用户输入(估) · 含子代理: ~18,023");
+    expect(lines[6]).toBe("请求次数: 460");
     expect(lines[6]).not.toContain(EM_DASH);
     // 采集时刻不受影响：这一档是「采集过但没有 token」，不是「尚未采集」
     expect(lines[7]).toMatch(/\d{2}:\d{2}:\d{2}$/);
@@ -196,19 +191,21 @@ describe("buildTextSummary（计划② Task 11：复制文本摘要）", () => {
     expect(lines[9]).toBe(EM_DASH);
     expect(lines).toHaveLength(10);
 
-    // **另一支：`userEst === null` → `—`**（不可得才空；与「没量到 token」互不相干）。
-    // 同一个 noTokens 夹具上把 userEst 置 null，证明置空**只**由「不可得」触发。
-    const nullEst = buildTextSummary(
-      { ...noTokens, totals: { ...noTokens.totals, userEst: null } },
-      t
-    ).split("\n");
-    expect(nullEst[6]).toBe(`用户输入(估) · 含子代理: ${EM_DASH}`);
-
-    // **反断言**：正常窗口照旧印数字（不得把正常路径也置空）——`userEst` 逐字不变
+    // **反断言**：正常窗口照旧印数字（不得把正常路径也置空）
     const ok = buildTextSummary(d, t).split("\n");
-    expect(ok[1]).toBe("请求输入(全文累计): 1,954,268");
-    expect(ok[4]).toBe("命中率: 67.4%");
-    expect(ok[6]).toBe("用户输入(估) · 含子代理: ~18,023");
+    expect(ok[1]).toBe("新增输入: 1,954,268");
+    expect(ok[2]).toBe("缓存命中: 1,318,123");
+    expect(ok[3]).toBe("未缓存命中输入: 636,145");
+    expect(ok[4]).toBe("输出: 82,713");
+    expect(ok[5]).toBe("命中率: 67.4%");
     expect(ok[9]).toBe("Claude  1,292,245");
+  });
+
+  it("6. V2：userEst=999 不再进入文本摘要（不是 API Token）", () => {
+    const d = mockUsageDashboard({ preset: "last7d" }, "tool");
+    const text = buildTextSummary({ ...d, totals: { ...d.totals, userEst: 999 } }, t);
+    expect(text).not.toContain("用户输入");
+    expect(text).not.toContain("~999");
+    expect(text.split("\n").filter((l) => l.includes("用户输入"))).toHaveLength(0);
   });
 });

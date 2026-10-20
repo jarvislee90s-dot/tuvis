@@ -10,7 +10,8 @@
 // 请求输入取**后端给的** `metrics.requestTotal`，绝不用四桶相加反推——Subset 语义下
 // `cacheWrite` 可能与 `cacheRead` 重叠（`normalize` 里 request_total = input 原文），反推会重复计数。
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import i18n from "@/i18n";
 import {
   CHART_PAD,
   TrendChart,
@@ -21,6 +22,10 @@ import {
 } from "@/components/usage/TrendChart";
 import type { ChartPoint } from "@/components/usage/TrendChart";
 import type { TrendPoint } from "@/types/usage";
+
+beforeAll(async () => {
+  await i18n.changeLanguage("zh");
+});
 
 /** 造一个趋势点（buckets 与 metrics 可分别给值，用来钉「值口径」与「命中率分母」）。 */
 function tp(
@@ -228,7 +233,7 @@ describe("usage-trendchart（计划② Task 4：纯 SVG 趋势图）", () => {
   });
 
   describe("Tooltip", () => {
-    it("12. hover 命中层出 tooltip（精确值）、移出或换档后消失", () => {
+    it("12. hover 命中层出 tooltip（万/亿缩写）、移出或换档后消失", () => {
       const pts = trendPoints([
         tp("a", "09:00", 1_400, 20, { cacheHitRate: 0.5 }),
         tp("b", "10:00", 0, 0, { cacheHitRate: 0 }),
@@ -238,7 +243,7 @@ describe("usage-trendchart（计划② Task 4：纯 SVG 趋势图）", () => {
       expect(hits).toHaveLength(2);
       expect(screen.queryByTestId("usage-trend-tooltip")).toBeNull();
       fireEvent.mouseEnter(hits[0]);
-      expect(screen.getByTestId("usage-trend-tooltip").textContent).toBe("09:00 · 1,420 · 50.0%");
+      expect(screen.getByTestId("usage-trend-tooltip").textContent).toBe("09:00 · 1420 · 50.0%");
       // 第二个点分母为 0 → 命中率段整段省略（不得印 0.0%）
       fireEvent.mouseEnter(hits[1]);
       expect(screen.getByTestId("usage-trend-tooltip").textContent).toBe("10:00 · 0");
@@ -256,10 +261,10 @@ describe("usage-trendchart（计划② Task 4：纯 SVG 趋势图）", () => {
       short.unmount();
     });
 
-    it("13. trendTooltipText = 标签 + 完整千分位（hero 口径）+ 命中率（可省）", () => {
-      expect(trendTooltipText(cp("09:00", 2_036_981, 0.9269))).toBe("09:00 · 2,036,981 · 92.7%");
-      // 千分位而不是万/亿缩写；标签与数值两段不可省
-      expect(trendTooltipText(cp("X", 12_500, null))).toBe("X · 12,500");
+    it("13. trendTooltipText = 标签 + 万/亿缩写 + 命中率（可省）", () => {
+      expect(trendTooltipText(cp("09:00", 2_036_981, 0.9269))).toBe("09:00 · 203.70万 · 92.7%");
+      // 万/亿缩写而不是完整千分位；标签与数值两段不可省
+      expect(trendTooltipText(cp("X", 12_500, null))).toBe("X · 1.25万");
       expect(trendTooltipText(cp("10:00", 0, null))).toBe("10:00 · 0");
     });
   });

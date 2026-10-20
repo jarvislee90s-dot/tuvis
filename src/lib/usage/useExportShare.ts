@@ -6,9 +6,10 @@
 //  * **图集只 fetch 一次**：`activePetSheet()` 只回答「当前宠物是谁 + 行数」，`loadSheet()` 一次
 //    `fetch → blob → createImageBitmap` 同时产出**几何与位图**（同源，不可能一处新一处旧）；
 //    位图**不进布局层**（`ExportInput.sheet` 只吃 `{ rows, geometry }`）——这是刻意分层。
-//  * 6 行指标取 `usage.grid.*`（`userEst → output → requestTotal → cacheRead → hitRate → requests`，
-//    与首屏网格同序），值用**精确千分位**（与 hero 同口径：摘要有列宽压力才缩写，图片没有）；
+//  * 6 行指标取 `usage.grid.*`（`requestInput → cacheRead → cacheMiss → output → hitRate → requests`，
+//    与 A 总览同序），值用**精确千分位**（与 hero 同口径：摘要有列宽压力才缩写，图片没有）；
 //    `asOf` **不进**指标行——它归 `heroSub`（`collectedAt === 0` → `usage.notCollected`，§3 第 8 条）。
+//    V2 已删除「用户输入(估)」指标（不是 API Token）。
 //  * `heroLabel` 取 `usage.hero.label`（**不是** `usage.card.trend`：用了它全图会连着出现两次
 //    「用量趋势」）；品牌 = `` `兔维斯 · ${t("usage.title")}` ``（**不新造** `summaryTitle`）。
 //  * 不可得一律 `EM_DASH`，**绝不回退填 0**（`workSummary` 四条：`toolCalls` / `toolAvgMs` /
@@ -45,22 +46,18 @@ function trendUpOf(points: readonly { value: number }[]): boolean | null {
   return last > prev;
 }
 
-/** 指标 6 行：标签取 `usage.grid.*`，值精确千分位 / 百分号（`userEst` 不可得 → `EM_DASH`，不加 `~`） */
+/** 指标 6 行：顺序与 A 总览一致（请求输入 / 缓存命中 / 未缓存命中 / 产出 / 命中率 / 请求次数） */
 function metricRows(dash: UsageDashboard, t: TFn): [string, string][] {
   const label = (key: string) => t(`usage.grid.${key}`);
-  const userEst = dash.totals.userEst;
-  // **没量到 token** 的窗口（2026-10-06 用户裁决）：**四个由 token 桶派生的行**（产出 / 请求输入 /
-  // 缓存命中 / 命中率）一律 `—`、**绝不印 0**；**请求次数出真值**（它是量出来的）。分享图是
-  // **给外部看的静态图**，口径与看板一致。
-  // ⚠️ **`用户输入(估)` 不置空**（2026-10-06 第三轮用户裁决）：它从**用户文本**估出来
-  // （`collectors/{claude,codex,kimi}.rs`），不是 token 桶的派生量 ⇒ 只有「不可得」才出 `—`。
+  // **没量到 token** 的窗口：由 token 桶派生的行一律 `—`、**绝不印 0**；请求次数出真值。
   const unmeasured = tokenUnmeasured(dash);
   const token = (v: number) => (unmeasured ? EM_DASH : fmtInt(v));
   return [
-    [label("userEst"), userEst === null ? EM_DASH : `~${fmtInt(userEst)}`],
-    [label("output"), token(dash.totalsBuckets.output)],
-    [label("requestTotal"), token(dash.totals.requestTotal)],
+    [label("requestInput"), token(dash.totals.requestTotal)],
     [label("cacheRead"), token(dash.totalsBuckets.cacheRead)],
+    // 与 A 总览同公式
+    [label("cacheMiss"), token(dash.totals.requestTotal - dash.totalsBuckets.cacheRead)],
+    [label("output"), token(dash.totalsBuckets.output)],
     [label("hitRate"), unmeasured ? EM_DASH : fmtPct(dash.totals.cacheHitRate)],
     [label("requests"), fmtInt(dash.totals.requests)],
   ];

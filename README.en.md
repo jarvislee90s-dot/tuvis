@@ -136,19 +136,95 @@ lives in 4 tables in `~/.tuvis/tuvis.db` (hourly detail, permanently kept daily 
 session dimension); detail is kept for 90 days by default (configurable), and after expiry only the daily
 aggregates remain.
 
-**Phase ① scope**: the collection & storage foundation plus 8 IPC commands — 6 usage commands (`usage_collect` /
-`usage_dashboard` / `usage_records` / `usage_export_csv` / `usage_get_settings` / `usage_set_settings`) and
-2 export-to-disk commands (`export_save_text` / `export_save_bytes`). The user-facing dashboard / mini-bar
-surfaces are not implemented yet (upcoming work), so this version ships no UI entry point.
+**Dashboard V2**: A Token overview stays expanded (new input / cache hit / cache miss / output /
+hit rate / requests; the former "cache write (explained)" block is removed and meter labels are unified as
+new input / cache hit / output / total); B Usage trend
+filters locally inside the card by **All / By tool / By channel**, with peak and period comparison using the
+same scope and no effect on the global overview; **"channel" means the provider alias** (the provider display
+name; unedited = raw name;
+different raw strings can map to the same display name and merge across tools; an explicit billing binding wins;
+tools are not a channel dimension), and non-empty raw provider strings are used when no alias exists; C Usage
+distribution switches between **By channel / By tool / By project / By model**, shows Top 5 by default with "show
+more", and lists tokens, cache hit rate and a relative bar per row; the same display name merges across tools,
+identically named models no longer produce indistinguishable duplicate rows, an empty model shows "unknown
+model"; when an empty provider has no assignment, the channel view merges it into one "unassigned channel" row
+and the model view splits by tool; the channel view also has a "channel may be mixed" row for log identities
+that may mix multiple accounts and cannot be split, and neither "unassigned channel" nor "channel may be mixed"
+is offered as a trend filter option. Work activity is collapsed by default, with p50 / longest turn / tool
+duration inside its advanced stats. C and Work activity are collapsible; A/B are fixed. Records-page row names
+now prefer the **provider alias**: they show "alias / raw model" and fall back to the raw "provider / model" when
+no alias exists, while the raw identity stays in the title and the row data; **the channel / model dimensions of C and the D
+cost-row tooltips** show raw provider evidence — when multiple raw providers merge, the complete list is shown,
+and groups that contain a non-empty provider together with an unlabeled source are marked
+"includes unlabeled source" (the tool / project dimensions show no provider evidence). Ordinary rows no longer
+show "Assign channel / Edit assignment"; only ambiguous rows offer "Bind billing attribution", and the legacy
+billing attribution / reference rules live behind the "Advanced" entry in the Records footer; every row still
+has a "Provider display name" entry — a non-empty provider can map to a display name, and an empty provider's
+"tool + model" entry can be given an alias individually (applies retroactively once saved); the dialog also
+previews the rule's matching tools, models and total tokens over the last 30 days before saving. Known limitation:
+when two subscriptions log the exact same raw provider string, aliases cannot split them and the channels stay
+merged; only the ambiguous row's "Bind billing attribution" or the footer's advanced entry (explicit billing
+binding) can help, and tokens are never split proportionally. Settings → "Display & pricing config" (the same entry as the cost card's "Manage config") and
+"Advanced overrides" now live in **one shared dialog**: the settings page and the D card open the same dialog, and
+the D card's "Manage config" opens it directly; the upper part holds the provider/model entries and the lower part
+is a collapsible advanced overrides section (collapsed by default). Settings and the D card are separate WebViews;
+changes in Settings do not guarantee an immediate refresh of an already-open usage dashboard, and the in-dashboard config is the primary path. Entries default to the top 10 by usage in the last
+7 days, with "show all" and search at the bottom; each entry has three rows — raw identity (read-only) / provider
+name (editable, applied globally to the same raw provider; empty-provider entries write a toolModel alias and stay
+"unassigned channel" when unnamed) + model name (editable, applied per (display provider, raw model)) / pricing
+identity (dropdown / search selection only). The advanced area keeps only the **four-rate override** (USD/CNY
+denominated); legacy billing-attribution binding / reference rules moved to the Records page footer's "Advanced" entry. Every advanced
+option has an Info icon with a hover/focus explanation; each model entry also has an "Override this model's price /
+Edit price override" shortcut that pre-fills the raw model name (normalized on save) and shows a "Four-rate override applied" badge when
+present. The override applies globally by **normalized model name**: no provider needed, custom display names do
+not participate, and it is not selected in pricing identities or reference rules. Pricing is matched automatically from the public
+models.dev catalog, with curated sources ranked **direct official providers (including China-site variants) >
+Ollama Cloud > OpenRouter**: model IDs are mechanically normalized then matched exactly; within a tier, the
+latest `release_date` wins and the normalized model shares one price per currency. Prefix fallback is used only
+when the candidate is unique, or when multiple candidates match but all share exactly the same price; cross-family
+substitution still requires an explicitly chosen reference model. Models missing from the curated set stay
+unpriced by default — pick a catalog entry explicitly via the pricing identity (the catalog search is curated-only
+by default, with a "show all N sources" switch). Conditional quotes (multimodal input, context tiers, etc.) are no
+longer discarded: when base text rates exist, the estimate uses them and the caveat line says "estimated at base
+text rates"; missing prices still render `—`, never 0. **The D card is expanded by default** and renders one card
+per model (five columns: channel / model | estimate | total tokens | cache hit rate | billing detail), with the
+detail expanded inside the card as four rows (new input / cache hit / output / total) × four columns (item /
+tokens / amount / unit price). Main and detail headers use solid foreground text; the total row leaves the unit
+price blank, and cache write appears only when data exists. A "Sync prices" button in the card header force-refreshes
+models.dev + native RMB sources + the daily FX rate (loading / inline status), while daily/stale background refresh
+and first-enable refresh remain. The footnote keeps only the normalized model and snapshot fetch time — **a model
+release date is not a price date**; caveats join into one dot-separated line. **CNY prefers native RMB prices
+explicitly written in the models.dev source TOMLs and converts at the daily rate when missing; USD prefers the
+catalog's native USD price. Native-currency prices render normally; amounts/unit prices converted by FX carry a
+dashed underline (legend in the card header)**. The header keeps the USD / CNY quick switch; the ledger and cost
+CSV stay in USD. Cost granularity: the last 7 days / 30 days / custom spans (≤31 days) are priced from **hourly
+details aggregated per day**, so dsh is fully priced across input / cache hit / output; when lowered detail
+retention or cleanup leaves days without details, the whole span falls back to daily aggregation (dsh stays
+output-only, disclosed in the caveats); the last 5 hours / today are unchanged. "Pricing catalog status" stays in
+Settings and enables/refreshes the catalog (falling back to the last valid snapshot on failure); the override list
+also shows the catalog source provider/model, release date and snapshot date, and later syncs never overwrite user
+values.
+
+API-equivalent costs are estimated per channel / model row, with **no global cost total or channel subtotal**; the
+export bar has a separate **Cost CSV** (all cost rows for the current window, no totals, no BOM added by the
+frontend; six columns — channel key / channel kind / display name / normalized model / catalog release date /
+override flag — are appended after the existing 17, and the single-value `observed_provider` column is left empty
+when a row merges multiple raw providers or includes an unlabeled source, with the full evidence available in the
+UI tooltip).
 
 **How the numbers are defined (read this first)**
 
-- **Four buckets**: uncached input / cache read / cache write / output; **request input** and the
+- **Four buckets**: uncached input / cache read / cache write / output; **new input** (the ledger's request
+  total) and the
   **cache hit rate** are derived from the three cache-semantics modes (exclusive / subset / total-only).
   Sources disagree on semantics, and **records of the same tool can differ too** — Codex decides per record
   by arithmetic on `total_tokens` (measured on this machine: 92.69% with the correct rule; treating
   everything as "subset" yields absurd values above 100%). When in doubt we treat it as "exclusive"
   (a wrong call shows a lower hit rate instead of silently over-counting).
+- **Total processed tokens = new input + output**; **cache-miss input = new input − cache read**
+  (same formula for the current and previous windows). V2 removes "user input (est.)" from the dashboard and
+  shared summaries (it is not API tokens) and unifies meter labels as new input / cache hit / output / total;
+  the ledger field and the raw Token CSV column remain for compatibility.
 - **Sub-agents included**: token totals include sub-agent / sidechain usage; **session and turn counts are
   layered by parent/child** (one conversation is not counted as several).
 - **The sub-agent flag is only meaningful in the hourly tier**: `isSubagent` is `true` / `false` for hourly
@@ -158,11 +234,10 @@ surfaces are not implemented yet (upcoming work), so this version ships no UI en
   turn is reported per tool as p50 + max**, and **it includes idle time (idle is not excluded)**.
 - **Errors are split into three layers, plus a separate "user interrupted" column** (the three layers are
   mutually exclusive; adding them up is meaningless).
-- **Unavailable metrics show an empty state, never 0**: **user input (estimated) is only computed for
-  claude / codex / kimi — every other source shows an empty state in both the hourly and daily tiers**;
-  WorkBuddy has no turn concept, no duration field and no provider; OpenCode has no tool-level errors;
-  kimi has no user-interrupt rule; dsh errors and longest turns can only come from raw session logs
-  (only 19 of 99 sessions exist on this machine).
+- **Unavailable metrics show an empty state, never 0**: WorkBuddy has no turn concept, no duration field and
+  no provider; OpenCode has no tool-level errors; kimi has no user-interrupt rule; dsh errors and longest
+  turns can only come from raw session logs (only a subset of sessions still have raw logs — **no ratio is
+  hard-coded**, since coverage varies with the machine and cleanup policy; the earlier "19/99" is obsolete).
 - **Master switch (on by default)**: when it is off, **nothing is collected and nothing is written to the
   ledger** (retention cleanup is skipped as well) and dashboard / record queries return the off-state early;
   **CSV export is currently not gated by the master switch**, so existing ledger history can still be exported

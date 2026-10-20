@@ -31,6 +31,7 @@ import { Button } from "@/components/ui/button";
 import { UsageExportSettings } from "@/components/usage/UsageExportSettings";
 import { usageErrMsg } from "@/components/usage/usageErrors";
 import { usageExportCsv } from "@/lib/api/usage";
+import { usageCostExportCsv } from "@/lib/api/usageV2";
 import { buildTextSummary, csvFilename } from "@/lib/usage/exportText";
 import { copyText, openContainingDir, saveText } from "@/lib/usage/saveFile";
 import { useExportShare } from "@/lib/usage/useExportShare";
@@ -39,6 +40,19 @@ import type { UsageDashboard, UsageFilters, UsageGroupBy, UsageRange } from "@/t
 
 /** 页签：与页面同形的两个字面量（不 import 页面的私有类型，避免组件反向依赖页面） */
 type ExportTab = "board" | "records";
+
+/** 费用 CSV 文件名：`tuvis-api-equivalent-<window>-<YYYYMMDD-HHmmss>.csv`（稳定可排序） */
+function costCsvFilename(range: UsageRange, now: Date = new Date()): string {
+  const p = (v: number) => String(v).padStart(2, "0");
+  const stamp =
+    `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-` +
+    `${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
+  const base =
+    range.preset === "custom" && range.from && range.to
+      ? `${range.from}_${range.to}`
+      : range.preset;
+  return `tuvis-api-equivalent-${base}-${stamp}.csv`;
+}
 
 export function UsageExportActions(props: {
   /** 看板数据；`null` = 查询未就绪 / 记录页签（三个看板口径按钮据此禁用，CSV 不依赖它） */
@@ -117,6 +131,37 @@ export function UsageExportActions(props: {
       // 落盘命令：自由文本原因 → 原样透传（**不得**走 usageErrMsg）
       setSavedPath("");
       setNote(t("usage.export.saveFailed", { error: r.error }));
+    }
+  };
+
+  /** 费用 CSV：只导当前时间窗全部费用行，**不接收**记录页筛选 / B 局部筛选 / 旧 groupBy。 */
+  const onCostCsv = async () => {
+    let content: string;
+    try {
+      content = await usageCostExportCsv(range);
+    } catch (e) {
+      setSavedPath("");
+      setNote(t("usage.export.saveFailed", { error: usageErrMsg(e, t) }));
+      return;
+    }
+    // 前端不添加 BOM：`.csv` 的 UTF-8 BOM 由 Rust 落盘层统一处理，前置会变成双 BOM。
+    const r = await saveText(content, costCsvFilename(range));
+    if (!r.ok) {
+      setSavedPath("");
+      setNote(t("usage.export.saveFailed", { error: r.error }));
+      return;
+    }
+    // 文件已落盘 ⇒ 即使定位失败也保留绝对路径，不提示重新导出
+    setSavedPath(r.path);
+    setNote(t("usage.export.savedTo", { path: r.path }));
+    try {
+      await openContainingDir(r.path);
+    } catch (e) {
+      setNote(
+        `${t("usage.export.savedTo", { path: r.path })} · ${t("usage.export.revealFailed", {
+          error: String(e),
+        })}`
+      );
     }
   };
 
@@ -210,6 +255,18 @@ export function UsageExportActions(props: {
         onClick={() => void run(onCsv)}
       >
         {t("usage.export.csv")}
+      </Button>
+
+      {/* 费用 CSV 与 Token CSV 并列；只导当前时间窗全部费用行，不随记录页筛选/分组变化 */}
+      <Button
+        size="sm"
+        variant="outline"
+        data-testid="usage-export-cost-csv"
+        disabled={busy}
+        title={t("usage.cost.exportCsvUnit")}
+        onClick={() => void run(onCostCsv)}
+      >
+        {t("usage.cost.exportCsv")}
       </Button>
 
       {savedPath ? (

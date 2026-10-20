@@ -40,8 +40,9 @@ const DASH_DAY = mockUsageDashboard({ preset: "last7d" }, "tool");
 /**
  * 第 3 行的**口径标签**（i18n 键 `usage.mini.toolsBasis`）：本文件语言固定 zh（见文件头纪律），
  * 故这里逐字钉住 zh 值——标签是**用户裁决要求可见**的东西，不能因为改文案而悄悄消失。
+ * 2026-10-20 Task 8：计量维度值统一，键值由「按工具 请求输入：」改为「按工具 新增输入：」。
  */
-const TOOLS_BASIS = "按工具 请求输入：";
+const TOOLS_BASIS = "按工具 新增输入：";
 
 type ViewProps = ComponentProps<typeof UsageMiniBarView>;
 
@@ -96,29 +97,29 @@ describe("usage-minibar（计划② Task 13 步骤 3：浮窗展示层）", () =
     expect(box.style.overflowY).toBe("auto"); // 放不下就截断/滚动，而不是把窗口撑爆
   });
 
-  it("2. 行①请求输入 + 命中率：fmtTokens 全文口径、命中率是 0–1 分数（无二次换算）；已采集哨兵走 notCollected", () => {
+  it("2. 行①新增输入 + 命中率：fmtTokens 全文口径、命中率是 0–1 分数（无二次换算）；已采集哨兵走 notCollected", () => {
     renderView();
     // 夹具四工具求和：ΣrequestTotal 1,954,268 → 195.43万；命中率 1,318,123 / 1,954,268 = 0.6744…
-    expect(rowOf("request").textContent).toBe("请求输入 195.43万 · 命中率 67.4%");
+    expect(rowOf("request").textContent).toBe("新增输入 195.43万 · 命中率 67.4%");
     // collectedAt === 0 =「尚未采集」哨兵（§3 第 8 条）：显示 usage.notCollected，**不是** 0 也不是 —
     renderView({ dash: { ...DASH, collectedAt: 0 } });
     const notCollected = screen.getAllByTestId("usage-mini-row-request")[1];
     expect(notCollected.textContent).toBe(
-      `请求输入 ${tf("usage.notCollected")} · 命中率 ${EM_DASH}`
+      `新增输入 ${tf("usage.notCollected")} · 命中率 ${EM_DASH}`
     );
     expect(notCollected.textContent).not.toMatch(/\d/); // 一行数字都不许出现（更不许 0）
   });
 
-  it("3. 行②缓存命中 + 产出：两个数都走 fmtTokens（缓存命中 131.81万 · 产出 8.27万）", () => {
+  it("3. 行②缓存命中 + 输出：两个数都走 fmtTokens（缓存命中 131.81万 · 输出 8.27万）", () => {
     renderView();
-    expect(rowOf("cache").textContent).toBe("缓存命中 131.81万 · 产出 8.27万");
+    expect(rowOf("cache").textContent).toBe("缓存命中 131.81万 · 输出 8.27万");
   });
 
-  it("4. 行③分工具**汇总 1 行**：行首口径标签 + 按请求输入降序取前 limit 条，超出折「等 N」（不做每工具一行）", () => {
+  it("4. 行③分工具**汇总 1 行**：行首口径标签 + 按新增输入降序取前 limit 条，超出折「等 N」（不做每工具一行）", () => {
     renderView({ toolLimit: MINI_BAR_TOOL_LIMIT });
     // 夹具 4 工具：claude 1,246,567 > codex 460,789 > zcode 234,567 > workbuddy 12,345
-    // 行首标签是 2026-10-06 用户裁决新增的**口径说明**（本行显示的是「请求输入」，不是分布卡的
-    // 「请求输入 + 产出」）——数值口径本身**没变**。
+    // 行首标签是 2026-10-06 用户裁决新增的**口径说明**（本行显示的是「新增输入」，不是分布卡的
+    // 「新增输入 + 输出」）——数值口径本身**没变**（标签文字 2026-10-20 统一为「新增输入」）。
     expect(rowOf("tools").textContent).toBe(
       `${TOOLS_BASIS}Claude 124.66万 · Codex 46.08万 · ZCode 23.46万 · 等 1`
     );
@@ -137,7 +138,7 @@ describe("usage-minibar（计划② Task 13 步骤 3：浮窗展示层）", () =
     renderView({ dash: allZero });
     expect(rowOf("tools").textContent).toBe(EM_DASH);
     expect(rowOf("tools").textContent).not.toContain("0");
-    // 空态**不得**退化成「按工具 请求输入：」——那既不是空态占位，也读不出「没有数据」（P8）
+    // 空态**不得**退化成「按工具 新增输入：」——那既不是空态占位，也读不出「没有数据」（P8）
     expect(rowOf("tools").textContent).not.toContain(TOOLS_BASIS);
     renderView({ dash: { ...DASH, rows: [] } });
     const emptyTools = screen.getAllByTestId("usage-mini-row-tools")[1];
@@ -145,7 +146,7 @@ describe("usage-minibar（计划② Task 13 步骤 3：浮窗展示层）", () =
     expect(emptyTools.textContent).not.toContain(TOOLS_BASIS);
   });
 
-  it("6. 行④本会话：数据源是契约 recentSession —— 工具名走 usageAgentLabel + 请求输入 + 标题", () => {
+  it("6. 行④本会话：数据源是契约 recentSession —— 工具名走 usageAgentLabel + 新增输入 + 标题", () => {
     renderView();
     // 夹具 recentSession：sourceId claude、requestTotal 57,000、title 演示会话
     expect(rowOf("session").textContent).toBe("本会话 Claude 5.70万 · 演示会话");
@@ -227,7 +228,7 @@ describe("usage-minibar（计划② Task 13 步骤 3：浮窗展示层）", () =
       expect(rowOf("detail").textContent).toBe("详情 »"); // 「详情 »」在三态分支之外，错误态因此有恢复入口
       expect(rowOf("request").textContent).toBe(tf(`usage.mini.${status}`));
       // 其余三行保留行名与空态占位（行数恒 5 ⇒ 窗口高度不随三态抖动），**一个数字都不出现**
-      expect(rowOf("cache").textContent).toBe(`缓存命中 ${EM_DASH} · 产出 ${EM_DASH}`);
+      expect(rowOf("cache").textContent).toBe(`缓存命中 ${EM_DASH} · 输出 ${EM_DASH}`);
       expect(rowOf("tools").textContent).toBe(EM_DASH);
       expect(rowOf("session").textContent).toBe(`本会话 ${EM_DASH} · 暂无会话`);
       for (const id of ["request", "cache", "tools", "session"]) {
@@ -266,10 +267,10 @@ describe("usage-minibar（计划② Task 13 步骤 3：浮窗展示层）", () =
     expect(isDashboardEmpty(emptyWindow)).toBe(true);
     expect(tokenUnmeasured(emptyWindow)).toBe(true); // 同时为真 ⇒ 判别力只能来自文案
     // 判据**复用看板的** `isDashboardEmpty`（不另立第二套）：采集过 ⇒ 走 `usage.empty`，不是 notCollected
-    expect(rowOf("request").textContent).toBe(`请求输入 ${tf("usage.empty")} · 命中率 ${EM_DASH}`);
-    // 反向锚：这一档**不是**「没量到 token」的形态（那一档第①行的请求输入位是 `—`，不是 `usage.empty`）
-    expect(rowOf("request").textContent).not.toBe(`请求输入 ${EM_DASH} · 命中率 ${EM_DASH}`);
-    expect(rowOf("cache").textContent).toBe(`缓存命中 ${EM_DASH} · 产出 ${EM_DASH}`);
+    expect(rowOf("request").textContent).toBe(`新增输入 ${tf("usage.empty")} · 命中率 ${EM_DASH}`);
+    // 反向锚：这一档**不是**「没量到 token」的形态（那一档第①行的新增输入位是 `—`，不是 `usage.empty`）
+    expect(rowOf("request").textContent).not.toBe(`新增输入 ${EM_DASH} · 命中率 ${EM_DASH}`);
+    expect(rowOf("cache").textContent).toBe(`缓存命中 ${EM_DASH} · 输出 ${EM_DASH}`);
     expect(rowOf("tools").textContent).toBe(EM_DASH);
     expect(rowOf("session").textContent).toBe(`本会话 ${EM_DASH} · 暂无会话`);
     // 行数恒 5（D20：窗口高度由公式算 ⇒ 不随三态抖动）
@@ -281,14 +282,16 @@ describe("usage-minibar（计划② Task 13 步骤 3：浮窗展示层）", () =
   });
 
   it("12. 行③**行首口径标签**：zh/en 同父同键、标签自带分隔符且不得只身出现（2026-10-06 用户裁决）", () => {
-    // 用户裁决：第③行的数值口径**不变**（仍是「请求输入」，第①行的按工具拆解），
-    // 但**必须让用户看得出这一行的口径**——它旁边就是分布卡/文本摘要/分享图的「请求输入 + 产出」，
+    // 用户裁决：第③行的数值口径**不变**（仍是「新增输入」，第①行的按工具拆解），
+    // 但**必须让用户看得出这一行的口径**——它旁边就是分布卡/文本摘要/分享图的「新增输入 + 输出」，
     // 同一个工具在两个面上是两个数（这不是 bug，是两条被分别钉死的口径）。
     expect(tf("usage.mini.toolsBasis")).toBe(TOOLS_BASIS);
     // en 侧必须是**自己的**分隔符（半角冒号 + 空格），不能借 zh 的全角冒号 ⇒ 两语各读各的
     const tEn = i18n.getFixedT("en");
     expect(`${tEn("usage.mini.toolsBasis")}Claude`).toMatch(/[:：] ?Claude$/);
     expect(tEn("usage.mini.toolsBasis")).not.toBe(TOOLS_BASIS);
+    // 「标签 · 口径」的间隔点不得再丢（2026-10-20 复审 Nit：值统一时 en 曾丢成 "By tool New input: "）
+    expect(tEn("usage.mini.toolsBasis")).toContain("·");
 
     renderView();
     const tools = rowOf("tools");
@@ -330,8 +333,8 @@ describe("usage-minibar（计划② Task 13 步骤 3：浮窗展示层）", () =
     expect(noTokens.totals.requests).toBe(50);
     expect(noTokens.recentSession).toBeNull(); // 保真锁：不许用「非 null 会话 + 全零四桶」造空锁
     renderView({ dash: noTokens });
-    expect(rowOf("request").textContent).toBe(`请求输入 ${EM_DASH} · 命中率 ${EM_DASH}`);
-    expect(rowOf("cache").textContent).toBe(`缓存命中 ${EM_DASH} · 产出 ${EM_DASH}`);
+    expect(rowOf("request").textContent).toBe(`新增输入 ${EM_DASH} · 命中率 ${EM_DASH}`);
+    expect(rowOf("cache").textContent).toBe(`缓存命中 ${EM_DASH} · 输出 ${EM_DASH}`);
     expect(rowOf("tools").textContent).toBe(EM_DASH);
     // 行④走**空态**分支（真机形态）：这一档 `recentSession` 必为 null ⇒ 既没有会话名、也没有数字
     expect(rowOf("session").textContent).toBe(`本会话 ${EM_DASH} · 暂无会话`);

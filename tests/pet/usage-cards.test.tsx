@@ -23,6 +23,7 @@ import { DIST_MIN_BAR_PCT } from "@/lib/usage/distribution";
 import { fmtTokens } from "@/lib/usage/format";
 import { compareSuffix } from "@/lib/usage/range";
 import type { TrendPoint, UsageRow } from "@/types/usage";
+import type { DistributionRow } from "@/types/usageV2";
 
 /** i18next 的 `t` 直接作 `TFn` 传入（与 `usage-page.test.tsx` 同法） */
 const tf = i18n.t.bind(i18n);
@@ -52,6 +53,23 @@ function row(key: string, label: string, requestTotal: number, output = 0): Usag
     metrics: { requestTotal, cacheHitRate: 0, userEst: null, requests: 1 },
     sourceKind: "measured",
     isSubagent: null,
+  };
+}
+
+/** V2 分布行：在旧行形状上补齐身份字段 */
+function distRow(
+  key: string,
+  label: string,
+  requestTotal: number,
+  output = 0,
+  extra: Partial<DistributionRow> = {}
+): DistributionRow {
+  return {
+    ...row(key, label, requestTotal, output),
+    sourceIds: ["claude"],
+    billingProfileId: null,
+    attributionKind: "unknown",
+    ...extra,
   };
 }
 
@@ -113,9 +131,9 @@ describe("usage-cards（计划② Task 7：趋势卡 + 四维分布卡）", () =
     expect(screen.getByTestId("usage-trend-compare")).toHaveTextContent("（+8.4%）");
     expect(peak.textContent).not.toContain("上一周期");
 
-    // 内层直接用 Task 4 的 TrendChartWithTooltip：hover 出**精确值**（完整千分位）
+    // 内层直接用 Task 4 的 TrendChartWithTooltip：hover 也走万/亿缩写（不再印完整千分位）
     fireEvent.mouseEnter(screen.getAllByTestId("usage-trend-hit")[1]);
-    expect(screen.getByTestId("usage-trend-tooltip")).toHaveTextContent("10/2 · 115,765 · 50.0%");
+    expect(screen.getByTestId("usage-trend-tooltip")).toHaveTextContent("10/2 · 11.58万 · 50.0%");
 
     view.unmount();
   });
@@ -164,45 +182,110 @@ describe("usage-cards（计划② Task 7：趋势卡 + 四维分布卡）", () =
     busyChart.unmount();
   });
 
-  it("3. 分布卡：三维切换按钮（aria-pressed 反映当前维度）点击回调出分组键", () => {
+  it("2b. 非 busy 的空态 / 错误 / 不可用：卡头不出现「加载中」；busy 隐藏环比", () => {
+    const loadingLabel = "加载中…";
+    const base = {
+      peakLabel: peakOf(PTS),
+      compareLabel: "区间合计 （+8.4%）",
+      title: "用量趋势",
+      loadingLabel,
+      emptyLabel: "暂无数据",
+      unmeasured: false,
+    };
+
+    const empty = render(<UsageTrendCard {...base} points={[]} busy={false} />);
+    expect(screen.queryByText(loadingLabel)).toBeNull();
+    expect(screen.getByTestId("usage-empty")).toBeTruthy();
+    empty.unmount();
+
+    const error = render(
+      <UsageTrendCard
+        {...base}
+        points={[]}
+        busy={false}
+        errorMessage="boom"
+        retryLabel="重试"
+        onRetry={() => {}}
+      />
+    );
+    expect(screen.queryByText(loadingLabel)).toBeNull();
+    expect(screen.getByTestId("usage-trend-error")).toHaveTextContent("boom");
+    expect(screen.queryByTestId("usage-trend-peak")).toBeNull();
+    error.unmount();
+
+    const unavailable = render(
+      <UsageTrendCard {...base} points={[]} busy={false} unavailableHint="why" />
+    );
+    expect(screen.queryByText(loadingLabel)).toBeNull();
+    expect(screen.getByTestId("usage-trend-unavailable")).toHaveTextContent("why");
+    unavailable.unmount();
+
+    // busy 时峰值与环比都不显示（即使有图、compareLabel 非空）
+    const busy = render(<UsageTrendCard {...base} points={PTS} busy />);
+    expect(screen.queryByTestId("usage-trend-peak")).toBeNull();
+    expect(screen.queryByTestId("usage-trend-compare")).toBeNull();
+    expect(screen.getByText(loadingLabel)).toBeTruthy();
+    busy.unmount();
+  });
+
+  it("3. 分布卡：四维切换按钮（aria-pressed 反映当前维度）点击回调出分组键", () => {
     const onGroupByChange = vi.fn();
     const rows = [row("claude", "claude", 1_000)];
     render(
-      <UsageDistributionCard rows={rows} groupBy="tool" onGroupByChange={onGroupByChange} t={tf} />
+      <UsageDistributionCard
+        rows={rows as unknown as DistributionRow[]}
+        groupBy="tool"
+        onGroupByChange={onGroupByChange}
+        expanded={false}
+        onExpandedChange={vi.fn()}
+        t={tf}
+      />
     );
 
-    // 三维按钮文案走 usage.group.<dim>，当前维度 aria-pressed=true，其余 false。
-    // ⚠️ **供应商不再是独立维度**（2026-10-06 用户裁决：与模型合并成一个 sheet）⇒ 这里也**不得**
-    // 再断言 `usage-dist-group-provider` 存在（那正是本次要撤掉的按钮）；它仍是契约的合法取值、
-    // 仍供 CSV/内部查询使用，`usage.group.provider` 这个键也保留（`exportText.ts` 查表要用）。
+    // V2 四维：渠道 / 工具 / 项目 / 模型（provider 不再是按钮）
+    expect(screen.getByTestId("usage-dist-group-billingProfile")).toHaveTextContent("按渠道");
     expect(screen.getByTestId("usage-dist-group-tool")).toHaveTextContent("按工具");
     expect(screen.getByTestId("usage-dist-group-project")).toHaveTextContent("按项目");
-    expect(screen.getByTestId("usage-dist-group-model")).toHaveTextContent("按供应商/模型");
+    expect(screen.getByTestId("usage-dist-group-model")).toHaveTextContent("按模型");
     expect(screen.queryByTestId("usage-dist-group-provider")).toBeNull();
-    for (const dim of ["tool", "project", "model"]) {
+    for (const dim of ["billingProfile", "tool", "project", "model"]) {
       expect(screen.getByTestId(`usage-dist-group-${dim}`)).toHaveAttribute(
         "aria-pressed",
         String(dim === "tool")
       );
     }
 
-    fireEvent.click(screen.getByRole("button", { name: "按供应商/模型" }));
+    fireEvent.click(screen.getByRole("button", { name: "按模型" }));
     expect(onGroupByChange).toHaveBeenCalledTimes(1);
     expect(onGroupByChange).toHaveBeenCalledWith("model");
   });
 
-  it("4. 分布卡：供应商维度行名走 t(label)；不可得的 i18n 键不得原样印给用户", () => {
-    // 真机口径（W5）：供应商不可得时 `UsageRow.label` 是 i18n 键，不是 "unknown" 字面量
-    const rows = [row("p0", "anthropic", 900), row("p1", "usage.label.unknownProvider", 100)];
+  it("4. 分布卡：计费渠道维度；未指定渠道走 t(label)，渠道维度不追加工具后缀", () => {
+    const rows: DistributionRow[] = [
+      distRow("p0", "Team API", 900, 0, {
+        billingProfileId: "profile-a",
+        attributionKind: "userAssigned",
+      }),
+      distRow("p1", "usage.label.unassignedChannel", 100, 0, { sourceIds: ["codex"] }),
+    ];
     const view = render(
-      <UsageDistributionCard rows={rows} groupBy="provider" onGroupByChange={vi.fn()} t={tf} />
+      <UsageDistributionCard
+        rows={rows}
+        groupBy="billingProfile"
+        onGroupByChange={vi.fn()}
+        expanded={false}
+        onExpandedChange={vi.fn()}
+        t={tf}
+      />
     );
 
-    expect(screen.getByTestId("usage-dist-p0")).toHaveTextContent("anthropic");
+    expect(screen.getByTestId("usage-dist-p0")).toHaveTextContent("Team API");
 
+    // Task 9（2026-10-19）：渠道维度 = 显示渠道，未指定渠道全局一行，工具不再是渠道后缀；
+    // 工具上下文只在模型维度（`未指定渠道 · <工具>`）与费用行出现。
     const unknown = screen.getByTestId("usage-dist-p1");
-    expect(unknown).toHaveTextContent("未知");
-    expect(unknown.textContent).not.toContain("usage.label.unknownProvider");
+    expect(unknown.textContent).toBe("未指定渠道");
+    expect(unknown.textContent).not.toContain("usage.label.unassignedChannel");
 
     view.unmount();
   });
@@ -216,7 +299,14 @@ describe("usage-cards（计划② Task 7：趋势卡 + 四维分布卡）", () =
       row("workbuddy", "workbuddy", 10), // 长尾：占比远低于 4% ⇒ 走下限
     ];
     const view = render(
-      <UsageDistributionCard rows={rows} groupBy="tool" onGroupByChange={vi.fn()} t={tf} />
+      <UsageDistributionCard
+        rows={rows as unknown as DistributionRow[]}
+        groupBy="tool"
+        onGroupByChange={vi.fn()}
+        expanded={false}
+        onExpandedChange={vi.fn()}
+        t={tf}
+      />
     );
 
     // 名称（AGENT_BADGE 展示名，不是 id）落在 `usage-dist-<key>`；数值落在同一行的 `usage-val-<key>`
@@ -229,10 +319,9 @@ describe("usage-cards（计划② Task 7：趋势卡 + 四维分布卡）", () =
     expect(screen.getByTestId("usage-dist-codex")).toHaveTextContent("Codex");
     expect(screen.getByTestId("usage-val-codex")).toHaveTextContent("50.00万");
 
-    // hover 精确值（hero 口径的完整千分位，走 usage.exact）——挂在**数值格**上，
-    // 因为它说的就是这个被缩写过的数（spec P8「所有缩写数值都必须能在 hover 时读到精确值」）
-    expect(screen.getByTestId("usage-val-claude")).toHaveAttribute("title", "精确值 1,954,268");
-    expect(screen.getByTestId("usage-val-codex")).toHaveAttribute("title", "精确值 500,000");
+    // 数值格只显示万/亿缩写，不再挂完整千分位原始值 tooltip（新显示口径）
+    expect(screen.getByTestId("usage-val-claude")).not.toHaveAttribute("title");
+    expect(screen.getByTestId("usage-val-codex")).not.toHaveAttribute("title");
 
     // 占比条：按该组最大值归一；下限 DIST_MIN_BAR_PCT（4%）防短条不可见
     expect(DIST_MIN_BAR_PCT).toBe(4);
@@ -250,25 +339,53 @@ describe("usage-cards（计划② Task 7：趋势卡 + 四维分布卡）", () =
     view.unmount();
   });
 
-  it("6. 分布卡：超 10 行折「等 N」；零值行出空态、绝不显示 0", () => {
-    const many = Array.from({ length: 12 }, (_, i) => row(`k${i}`, `项目${i}`, 1_000 - i * 10));
-    const fold = render(
-      <UsageDistributionCard rows={many} groupBy="project" onGroupByChange={vi.fn()} t={tf} />
+  it("6. 分布卡：V2 默认 Top5 + 显示更多（7 行全出）+ 收起；零值行出空态、绝不显示 0", () => {
+    const many = Array.from({ length: 12 }, (_, i) =>
+      distRow(`k${i}`, `项目${i}`, 1_000 - i * 10, 0, { billingProfileId: null })
     );
-
-    // 恰 10 行 + 「等 2」（被折掉的是尾部小值）
-    expect(screen.getAllByTestId(/^usage-dist-k/)).toHaveLength(10);
-    expect(screen.getByTestId("usage-dist-more")).toHaveTextContent("等 2");
-    expect(screen.queryByTestId("usage-dist-k10")).toBeNull();
-    expect(screen.queryByTestId("usage-dist-k11")).toBeNull();
-    fold.unmount();
-
-    // 零值行被 distributionRows 丢掉 ⇒ 空态（不是一行 0）
-    const zero = render(
+    const onExpandedChange = vi.fn();
+    const fold = render(
       <UsageDistributionCard
-        rows={[row("z", "零值项目", 0)]}
+        rows={many}
         groupBy="project"
         onGroupByChange={vi.fn()}
+        expanded={false}
+        onExpandedChange={onExpandedChange}
+        t={tf}
+      />
+    );
+
+    // V2 看板默认只显示 Top5；按钮给出剩余行数（不修改固定分享的 DIST_MAX_ROWS=10）
+    expect(screen.getAllByTestId(/^usage-dist-k/)).toHaveLength(5);
+    expect(screen.getByTestId("usage-dist-expand")).toHaveTextContent("显示更多（7）");
+    expect(screen.queryByTestId("usage-dist-k5")).toBeNull();
+    fireEvent.click(screen.getByTestId("usage-dist-expand"));
+    expect(onExpandedChange).toHaveBeenCalledWith(true);
+    fold.unmount();
+
+    // 展开态：12 行 + 收起
+    const expanded = render(
+      <UsageDistributionCard
+        rows={many}
+        groupBy="project"
+        onGroupByChange={vi.fn()}
+        expanded
+        onExpandedChange={onExpandedChange}
+        t={tf}
+      />
+    );
+    expect(screen.getAllByTestId(/^usage-dist-k/)).toHaveLength(12);
+    expect(screen.getByTestId("usage-dist-expand")).toHaveTextContent("收起");
+    expanded.unmount();
+
+    // 零值行被丢弃 ⇒ 空态（不是一行 0）
+    const zero = render(
+      <UsageDistributionCard
+        rows={[distRow("z", "零值项目", 0)]}
+        groupBy="project"
+        onGroupByChange={vi.fn()}
+        expanded={false}
+        onExpandedChange={vi.fn()}
         t={tf}
       />
     );
@@ -278,56 +395,64 @@ describe("usage-cards（计划② Task 7：趋势卡 + 四维分布卡）", () =
     zero.unmount();
   });
 
-  it("7. 分布卡：模型名超 12 字符短化（前 10 + …），title 给全名", () => {
-    const rows = [row("m1", "claude-sonnet-4-5", 800), row("m2", "gpt-5", 200)];
+  it("7. 分布卡：模型名原文直出（不短化），title 给全名", () => {
+    const rows = [
+      distRow("m1", "claude-sonnet-4-5", 800, 0, { billingProfileId: "profile-a" }),
+      distRow("m2", "gpt-5", 200, 0, { billingProfileId: "profile-a" }),
+    ];
     const view = render(
-      <UsageDistributionCard rows={rows} groupBy="model" onGroupByChange={vi.fn()} t={tf} />
+      <UsageDistributionCard
+        rows={rows}
+        groupBy="model"
+        onGroupByChange={vi.fn()}
+        expanded={false}
+        onExpandedChange={vi.fn()}
+        t={tf}
+      />
     );
 
-    // 2026-10-06 用户裁决后（模型维度合并为「供应商 / 模型」）**不再短化**：以前 12 字符以上会被
-    // 砍成 `claude-son…`（再叠上 `w-28` 的 CSS 截断，真机两个模型名双双不可分辨），现在**原文直出**，
-    // 列宽由整列 `auto` 保证；名称仍常驻 `title`（真的被 CSS 压窄时 hover 可读全名）。
     const long = screen.getByTestId("usage-dist-m1");
     expect(long).toHaveTextContent("claude-sonnet-4-5");
     expect(long).not.toHaveTextContent("…");
     expect(long).toHaveAttribute("title", "claude-sonnet-4-5");
 
-    // 短名同样是原文（不再有「短名不挂 title」这条分支——全名 title 现在是恒挂的）
     const brief = screen.getByTestId("usage-dist-m2");
     expect(brief).toHaveTextContent("gpt-5");
 
     view.unmount();
   });
 
-  it("8. 分布卡空态：卡壳与三维按钮照常在位，空标签**恰好一个**（Task 7 空态修复）", () => {
-    // 真机可达路径 = **空窗口**（窗口内零行）⇒ 卡片不是「整卡换空态」，而是「卡壳 + 内容区空标签」。
-    // 旧写法 `return <UsageEmpty …/>` 会把这几个按钮一并抽掉——那是用户在空窗口里唯一还能做的事。
+  it("8. 分布卡空态：卡壳与四维按钮照常在位，空标签**恰好一个**（卡头在空态也保留）", () => {
     const onGroupByChange = vi.fn();
     const view = render(
-      <UsageDistributionCard rows={[]} groupBy="project" onGroupByChange={onGroupByChange} t={tf} />
+      <UsageDistributionCard
+        rows={[]}
+        groupBy="project"
+        onGroupByChange={onGroupByChange}
+        expanded={false}
+        onExpandedChange={vi.fn()}
+        t={tf}
+      />
     );
 
-    // ① 卡壳在位：标题 + 三个 usage-dist-group-* 按钮（当前维度 aria-pressed，可点回调）
     expect(screen.getByText("分组分布")).toBeTruthy();
-    for (const dim of ["tool", "project", "model"]) {
+    for (const dim of ["billingProfile", "tool", "project", "model"]) {
       const btn = screen.getByTestId(`usage-dist-group-${dim}`);
       expect(btn).toHaveAttribute("aria-pressed", String(dim === "project"));
     }
     fireEvent.click(screen.getByTestId("usage-dist-group-model"));
     expect(onGroupByChange).toHaveBeenCalledWith("model");
 
-    // ② 空标签**恰好一个**（不是「卡里再嵌一张空态卡」的第二个）
     const empties = screen.getAllByTestId("usage-empty");
     expect(empties).toHaveLength(1);
     expect(empties[0]).toHaveTextContent("暂无数据");
-    // 空态不得出 0（spec P8）且不得出行（`usage-dist-*` 只剩四个按钮，行 / 「等 N」一个都没有）
     expect(empties[0].closest("[data-slot='card-content']")?.textContent).not.toMatch(/\d/);
     expect(
       view.container.querySelectorAll(
-        "[data-testid^='usage-dist-']:not([data-testid^='usage-dist-group-'])"
+        "[data-testid^='usage-dist-']:not([data-testid^='usage-dist-group-']):not([data-testid^='usage-dist-bar-'])"
       )
     ).toHaveLength(0);
-    expect(screen.queryByTestId("usage-dist-more")).toBeNull();
+    expect(screen.queryByTestId("usage-dist-expand")).toBeNull();
 
     view.unmount();
   });
