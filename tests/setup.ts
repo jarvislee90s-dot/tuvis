@@ -24,6 +24,25 @@ vi.mock("@tauri-apps/api/event", () => ({
   emit: vi.fn(async () => {}),
 }));
 
+// Radix Tooltip/Popper 在 jsdom 里没有 ResizeObserver；补最小替身（仅测试）。
+if (!("ResizeObserver" in globalThis)) {
+  class ResizeObserverMock {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  (globalThis as unknown as { ResizeObserver: typeof ResizeObserverMock }).ResizeObserver =
+    ResizeObserverMock;
+}
+// 配置条目快捷覆盖在 jsdom 里调用 scrollIntoView；补空实现。
+if (typeof Element !== "undefined" && !Element.prototype.scrollIntoView) {
+  Object.defineProperty(Element.prototype, "scrollIntoView", {
+    configurable: true,
+    writable: true,
+    value: vi.fn(),
+  });
+}
+
 beforeAll(() => server.listen());
 afterEach(() => {
   server.resetHandlers();

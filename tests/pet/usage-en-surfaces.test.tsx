@@ -9,6 +9,7 @@ import { UsageMiniBarView } from "@/components/pet/UsageMiniBar";
 import { UsageSummary } from "@/components/usage/UsageSummary";
 import { UsageWorkSummary } from "@/components/usage/UsageWorkSummary";
 import { mockUsageDashboard } from "@/lib/usage/mockFixtures";
+import { fmtTokens } from "@/lib/usage/format";
 
 const tf = i18n.t.bind(i18n);
 const DASH = mockUsageDashboard({ preset: "today" }, "tool");
@@ -31,21 +32,30 @@ describe("en locale 用量面（issue #160 目标 4）", () => {
       />
     );
     const text = container.textContent ?? "";
-    expect(text).toContain("1.95M"); // 行① 请求输入（requestTotal 1,954,268）
+    expect(text).toContain("New input"); // 行① 新增输入（requestTotal 1,954,268；行③标签同词根）
+    expect(text).toContain("1.95M"); // 行① 新增输入（requestTotal 1,954,268）
     expect(text).toContain("1.32M"); // 行② 缓存命中（cacheRead 1,318,123）
-    expect(text).toContain("82.71K"); // 行② 产出（output 82,713）
+    expect(text).toContain("Output"); // 行② 输出（output 82,713）
+    expect(text).toContain("82.71K"); // 行② 输出（output 82,713）
     expect(text).toContain("1.25M"); // 行③ 分工具首行（claude 1,246,567）
     expect(text).not.toMatch(/万|亿|分钟|秒|毫秒/);
   });
 
-  it("首屏汇总：四桶 K/M 缩写，零中文单位", () => {
+  it("首屏汇总：四桶 K/M 缩写 + 2026-10-20 统一计量文案（New input / Output），零中文单位", () => {
     const { container } = render(<UsageSummary dash={DASH} retentionDays={30} t={tf} />);
     const text = container.textContent ?? "";
-    expect(text).toContain("1.95M"); // 请求输入
+    expect(text).toContain("New input"); // 新增输入
+    expect(text).toContain("1.95M"); // 新增输入
     expect(text).toContain("1.32M"); // 缓存命中
-    expect(text).toContain("82.71K"); // 产出
-    expect(text).toContain("~18.02K"); // 用户输入(估)（userEst 18,023；用户裁决：该行渲染 userEst，
-    // inputFresh 不在本组件渲染面——原拟 620.14K 已按现场裁决改为夹具实算值）
+    expect(text).toContain(
+      fmtTokens(DASH.totals.requestTotal - DASH.totalsBuckets.cacheRead, "en")
+    ); // 未缓存命中输入 = requestTotal - cacheRead
+    expect(text).toContain("Output"); // 输出
+    expect(text).toContain("82.71K"); // 输出
+    // 2026-10-20 Task 8：「缓存写入（解释）」整块删除——en 面同样不再有 details 块
+    expect(container.querySelector("details")).toBeNull();
+    // V2 已删除「用户输入(估)」行：userEst 不再出现在总览
+    expect(text).not.toContain("18.02K");
     expect(text).not.toMatch(/万|亿|分钟|秒|毫秒/);
   });
 

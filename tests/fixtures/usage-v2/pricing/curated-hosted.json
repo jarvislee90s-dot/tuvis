@@ -1,0 +1,58 @@
+{
+  "zhipuai": {
+    "id": "zhipuai",
+    "models": {
+      "glm-5.3": {
+        "id": "glm-5.3",
+        "release_date": "2025-01-01",
+        "cost": { "input": 1, "output": 8 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  },
+  "ollama-cloud": {
+    "id": "ollama-cloud",
+    "models": {
+      "glm-5.3": {
+        "id": "glm-5.3",
+        "release_date": "2025-09-01",
+        "cost": { "input": 5, "output": 20 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "deepseek-v4.1-flash": {
+        "id": "deepseek-v4.1-flash",
+        "release_date": "2025-09-01",
+        "cost": { "input": 1, "output": 2 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  },
+  "openrouter": {
+    "id": "openrouter",
+    "models": {
+      "glm-5.3": {
+        "id": "glm-5.3",
+        "release_date": "2025-12-01",
+        "cost": { "input": 9, "output": 90 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "deepseek-v4.1-flash": {
+        "id": "deepseek-v4.1-flash",
+        "release_date": "2025-12-01",
+        "cost": { "input": 7, "output": 70 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  },
+  "aggregator-x": {
+    "id": "aggregator-x",
+    "models": {
+      "glm-5.3": {
+        "id": "glm-5.3",
+        "release_date": "2025-12-15",
+        "cost": { "input": 99, "output": 999 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  }
+}

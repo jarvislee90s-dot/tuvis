@@ -36,10 +36,10 @@ function input(over: Partial<ExportInput> = {}): ExportInput {
     hero: "2,036,981",
     heroSub: "数据截止时间: 2026-10-03 12:00:00",
     metrics: [
-      ["用户输入(估) · 含子代理", "~1,000"],
-      ["产出", "82,713"],
-      ["请求输入(全文累计)", "1,954,268"],
+      ["请求输入", "1,954,268"],
       ["缓存命中", "1,200,000"],
+      ["未缓存命中输入", "754,268"],
+      ["产出", "82,713"],
       ["命中率", "91.2%"],
       ["请求次数", "320"],
     ],
@@ -209,6 +209,8 @@ afterEach(() => {
 describe("exportImage（计划② Task 12：分享图执行层）", () => {
   it("1. 度量遍 (720×10) + 绘制遍 (720×height)：尺寸、MIME、步骤序与布局逐条一致", async () => {
     const src = input();
+    // V2：分享图 layout 入参不得包含用户输入估值
+    expect(src.metrics.map(([label]) => label)).not.toContain("用户输入(估) · 含子代理");
     const layout = layoutExport(src, measure);
     const { deps, canvases } = fakeDeps({ blob: pngBlob, bitmap });
 

@@ -10,6 +10,11 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { tauriInvokeMock } from "../msw/tauriMocks";
 import { KNOWN_USAGE_CODES } from "@/components/usage/usageErrors";
+import {
+  mockPricingRefresh,
+  mockPricingSetEnabled,
+  resetUsageV2MockState,
+} from "@/lib/usage/mockFixtures";
 import type {
   UsageCard,
   UsageCollectResult,
@@ -23,6 +28,17 @@ import type {
   UsageBuckets,
   WorkSummary,
 } from "@/types/usage";
+import type {
+  ChannelOption,
+  ObservedModelEntry,
+  PriceOverrideView,
+  PricingAutoMatch,
+  PricingCatalogEntry,
+  PricingCatalogSearch,
+  PricingQuotePreview,
+  ProviderAliasConfig,
+  ProviderAliasRule,
+} from "@/types/usageV2";
 // 副作用导入：非 Tauri 环境（jsdom）下它会把 mock 装到 window.__TAURI_INTERNALS__ 上
 import "@/tauri-mock";
 
@@ -61,6 +77,34 @@ const USAGE_COMMANDS = [
   "usage_export_csv",
   "usage_get_settings",
   "usage_set_settings",
+  "usage_billing_get",
+  "usage_billing_preview",
+  "usage_billing_commit",
+  "usage_billing_undo",
+  "usage_identities",
+  "usage_trend",
+  "usage_distribution",
+  "usage_pricing_get",
+  "usage_pricing_set_enabled",
+  "usage_pricing_refresh",
+  "usage_pricing_catalog",
+  "usage_costs",
+  "usage_cost_export_csv",
+  // Task 6：别名 / 渠道选项 / 手动覆盖价
+  "usage_provider_aliases_get",
+  "usage_provider_alias_upsert",
+  "usage_provider_alias_delete",
+  "usage_channel_options",
+  "usage_pricing_overrides_get",
+  "usage_pricing_override_set",
+  "usage_pricing_override_delete",
+  // 2026-10-20 计划 Task 5：观察条目 / 模型条目配置 / 精选价目目录
+  "usage_observed_entries_get",
+  "usage_model_display_name_set",
+  "usage_pricing_identity_set",
+  "usage_pricing_catalog_search",
+  "usage_pricing_auto_match",
+  "usage_pricing_quote_get",
 ];
 
 /** 键名列表的**类型桥**：`keyof T` 逼 `src/types/usage.ts` 真有这些字段（镜像改名 → 编译错） */
@@ -291,6 +335,373 @@ async function assertUsageSettings(invoke: Invoke) {
   expect(merged.miniBarToolRows).toBe(s.miniBarToolRows); // patch 未提的字段不得被清空
 }
 
+/** 2026-10-20 计划 Task 5：观察条目 / 模型条目配置 / 精选目录命令的形状与语义。 */
+async function assertV2ModelConfigCommands(invoke: Invoke) {
+  const entryKeys = keysOf<ObservedModelEntry>([
+    "providerRaw",
+    "sourceId",
+    "modelId",
+    // 2026-10-20 第三轮：后端机械归一化键（`GLM-5.3` → `glm-5-3`；空模型 = 空串）
+    "normalizedModelId",
+    "displayProvider",
+    "displayModelName",
+    "pricingProvider",
+    "pricingModel",
+    "totalTokens",
+    "recentTokens7d",
+  ]);
+
+  resetUsageV2MockState();
+  const entries = (await invoke("usage_observed_entries_get")) as ObservedModelEntry[];
+  expect(entries, "usage_observed_entries_get 未 mock").toBeTruthy();
+  expect(entries.length).toBe(4);
+  for (const entry of entries) {
+    expect(actualKeys(entry)).toEqual(entryKeys);
+    // 空 provider 条目必有 sourceId；非空 provider 条目 sourceId 为 null。
+    if (entry.providerRaw === null) {
+      expect(entry.sourceId).not.toBeNull();
+    } else {
+      expect(entry.sourceId).toBeNull();
+    }
+    // 全历史与最近 7 天两个排序用量都必须是数字（Top10 排序键）
+    expect(typeof entry.totalTokens).toBe("number");
+    expect(typeof entry.recentTokens7d).toBe("number");
+    // 归一化键：非空模型必为非空字符串；空模型 = 空串（快捷覆盖入口按它 disabled）
+    if (entry.modelId === "") {
+      expect(entry.normalizedModelId).toBe("");
+    } else {
+      expect(entry.normalizedModelId.length).toBeGreaterThan(0);
+    }
+  }
+  // 归一化口径样例：`GLM-5.3` → `glm-5-3`（两端同一夹具，键集与值都要同形）
+  expect(entries.find((entry) => entry.providerRaw === "edenai")?.normalizedModelId).toBe(
+    "glm-5-3"
+  );
+
+  // 显示名写命令：写后返回刷新列表；幽灵身份 / 空白名固定 detail 拒绝。
+  const afterDisplay = (await invoke("usage_model_display_name_set", {
+    request: {
+      providerRaw: "openai",
+      sourceId: null,
+      modelId: "gpt-5",
+      displayName: "Parity GPT",
+    },
+  })) as ObservedModelEntry[];
+  expect(afterDisplay.find((entry) => entry.providerRaw === "openai")?.displayModelName).toBe(
+    "Parity GPT"
+  );
+  for (const entry of afterDisplay) expect(actualKeys(entry)).toEqual(entryKeys);
+  await expect(
+    invoke("usage_model_display_name_set", {
+      request: {
+        providerRaw: "ghost",
+        sourceId: null,
+        modelId: "m",
+        displayName: "X",
+      },
+    })
+  ).rejects.toMatchObject({
+    code: "usage-settings-invalid",
+    detail: "model config entry not observed",
+  });
+  await expect(
+    invoke("usage_model_display_name_set", {
+      request: {
+        providerRaw: "openai",
+        sourceId: null,
+        modelId: "gpt-5",
+        displayName: "   ",
+      },
+    })
+  ).rejects.toMatchObject({
+    code: "usage-settings-invalid",
+    detail: "model config display name is empty after trim",
+  });
+
+  // 计价身份写命令：成对写 / 清除（null = 清除，不报错）。
+  const afterIdentity = (await invoke("usage_pricing_identity_set", {
+    request: {
+      providerRaw: "openai",
+      sourceId: null,
+      modelId: "gpt-5",
+      reference: { providerId: "openai", modelId: "gpt-5" },
+    },
+  })) as ObservedModelEntry[];
+  expect(afterIdentity.find((entry) => entry.providerRaw === "openai")?.pricingProvider).toBe(
+    "openai"
+  );
+  const cleared = (await invoke("usage_pricing_identity_set", {
+    request: {
+      providerRaw: "openai",
+      sourceId: null,
+      modelId: "gpt-5",
+      reference: null,
+    },
+  })) as ObservedModelEntry[];
+  expect(cleared.find((entry) => entry.providerRaw === "openai")?.pricingProvider).toBeNull();
+
+  // 作用域目录搜索：缺省 curated 只含精选；all 含非精选；providerCount 基准 232；
+  // 非法 scope 固定 detail 拒绝。
+  const curated = (await invoke("usage_pricing_catalog_search", {
+    query: "",
+    limit: 50,
+  })) as PricingCatalogSearch;
+  expect(curated.providerCount).toBe(232);
+  expect(curated.entries.every((entry) => entry.curatedKind !== null)).toBe(true);
+  const all = (await invoke("usage_pricing_catalog_search", {
+    query: "",
+    limit: 50,
+    scope: "all",
+  })) as PricingCatalogSearch;
+  expect(all.providerCount).toBe(232, "providerCount 恒为全量目录 provider 数");
+  expect(all.entries.some((entry) => entry.curatedKind === null)).toBe(true);
+  await expect(
+    invoke("usage_pricing_catalog_search", { query: "", scope: "everything" })
+  ).rejects.toMatchObject({
+    code: "usage-settings-invalid",
+    detail: "pricing catalog scope is invalid",
+  });
+
+  // 自动匹配（固定精选：官方优先、OpenRouter 兜底）与价格预览。
+  // 与 `usage_pricing_quote_get` 同款快照门控：无 active 快照 = 目录为空（kind=none），不报错。
+  const gated = (await invoke("usage_pricing_auto_match", {
+    modelId: "gpt-5",
+  })) as PricingAutoMatch;
+  expect(gated.kind).toBe("none");
+  expect(gated.reference).toBeNull();
+  expect(gated.quote).toBeNull();
+
+  mockPricingSetEnabled(true);
+  mockPricingRefresh();
+  const matched = (await invoke("usage_pricing_auto_match", {
+    modelId: "gpt-5",
+  })) as PricingAutoMatch;
+  expect(actualKeys(matched)).toEqual(keysOf<PricingAutoMatch>(["kind", "quote", "reference"]));
+  expect(matched.kind).toBe("exact");
+  expect(matched.reference?.providerId).toBe("openai", "精选内官方优先");
+  // OpenRouter 精选条目的 exact 同样可命中（官方优先、OpenRouter 兜底）
+  const openrouterMatch = (await invoke("usage_pricing_auto_match", {
+    modelId: "claude-sonnet-4-5",
+  })) as PricingAutoMatch;
+  expect(openrouterMatch.kind).toBe("exact");
+  expect(openrouterMatch.reference?.providerId).toBe("openrouter");
+  expect(openrouterMatch.quote?.cacheRead).toBe("0.5");
+  const miss = (await invoke("usage_pricing_auto_match", {
+    modelId: "never-matches",
+  })) as PricingAutoMatch;
+  expect(miss.kind).toBe("none");
+  expect(miss.reference).toBeNull();
+
+  resetUsageV2MockState();
+  mockPricingSetEnabled(true);
+  mockPricingRefresh();
+  const quote = (await invoke("usage_pricing_quote_get", {
+    providerId: "openai",
+    modelId: "gpt-5",
+  })) as PricingQuotePreview;
+  expect(actualKeys(quote)).toEqual(
+    keysOf<PricingQuotePreview>([
+      "reference",
+      "input",
+      "cacheRead",
+      "cacheWrite",
+      "output",
+      "inputCny",
+      "cacheReadCny",
+      "cacheWriteCny",
+      "outputCny",
+      "cnyConverted",
+      "releaseDate",
+      "conditional",
+      "snapshotDate",
+      "fxRate",
+      "fxFetchedAt",
+      "fxFallback",
+    ])
+  );
+  expect(quote.input).toBe("1.25");
+  expect(quote.snapshotDate).not.toBeNull();
+  // 双币字段：CNY 四价与汇率三元组必须显式在场（null = 不可得，不省键）
+  for (const key of ["inputCny", "cacheReadCny", "cacheWriteCny", "outputCny"] as const) {
+    expect(quote[key] === null || typeof quote[key] === "string").toBe(true);
+  }
+  expect(typeof quote.cnyConverted).toBe("boolean");
+  expect(quote.fxRate === null || typeof quote.fxRate === "string").toBe(true);
+  expect(typeof quote.fxFallback).toBe("boolean");
+  const missQuote = (await invoke("usage_pricing_quote_get", {
+    providerId: "openai",
+    modelId: "not-a-model",
+  })) as PricingQuotePreview | null;
+  expect(missQuote).toBeNull();
+}
+
+async function assertV2AliasAndOverrideCommands(invoke: Invoke) {
+  const aliasKeys = keysOf<ProviderAliasRule>([
+    "id",
+    "kind",
+    "provider",
+    "sourceId",
+    "modelId",
+    "displayName",
+  ]);
+
+  resetUsageV2MockState();
+  const cfg = (await invoke("usage_provider_aliases_get")) as ProviderAliasConfig;
+  expect(cfg, "usage_provider_aliases_get 未 mock").toBeTruthy();
+  expect(actualKeys(cfg)).toEqual(keysOf<ProviderAliasConfig>(["aliases"]));
+  expect(cfg.aliases.length).toBeGreaterThan(0);
+  for (const rule of cfg.aliases) {
+    expect(actualKeys(rule)).toEqual(aliasKeys);
+    expect(["provider", "toolModel"]).toContain(rule.kind);
+    expect(typeof rule.id).toBe("string");
+    expect(typeof rule.displayName).toBe("string");
+  }
+
+  const added = (await invoke("usage_provider_alias_upsert", {
+    rule: {
+      id: "alias-openai",
+      kind: "provider",
+      provider: "openai",
+      sourceId: null,
+      modelId: null,
+      displayName: "OpenAI",
+    },
+  })) as ProviderAliasConfig;
+  expect(added.aliases.find((rule) => rule.id === "alias-openai")).toMatchObject({
+    kind: "provider",
+    provider: "openai",
+    sourceId: null,
+    modelId: null,
+    displayName: "OpenAI",
+  });
+  for (const rule of added.aliases) expect(actualKeys(rule)).toEqual(aliasKeys);
+
+  await expect(
+    invoke("usage_provider_alias_upsert", {
+      rule: {
+        id: "alias-openai-copy",
+        kind: "provider",
+        provider: "openai",
+        sourceId: null,
+        modelId: null,
+        displayName: "Copy",
+      },
+    })
+  ).rejects.toMatchObject({
+    code: "usage-settings-invalid",
+    detail: "provider alias key already exists: provider:openai",
+  });
+
+  const deleted = (await invoke("usage_provider_alias_delete", {
+    id: "alias-openai",
+  })) as ProviderAliasConfig;
+  expect(deleted.aliases.map((rule) => rule.id)).not.toContain("alias-openai");
+
+  const options = (await invoke("usage_channel_options", {
+    range: { preset: "last7d" },
+  })) as ChannelOption[];
+  expect(Array.isArray(options)).toBe(true);
+  expect(options.length).toBeGreaterThan(0);
+  for (const option of options) {
+    expect(actualKeys(option)).toEqual(
+      keysOf<ChannelOption>(["key", "label", "kind", "billingProfileId", "tokenUsage"])
+    );
+    expect(["billingProfile", "alias", "provider"]).toContain(option.kind);
+    expect(option.kind === "billingProfile" ? option.billingProfileId !== null : true).toBe(true);
+    expect(typeof option.tokenUsage).toBe("number");
+  }
+
+  const overrides = (await invoke("usage_pricing_overrides_get")) as PriceOverrideView[];
+  expect(Array.isArray(overrides)).toBe(true);
+  expect(overrides.length).toBeGreaterThan(0);
+  const overrideKeys = keysOf<PriceOverrideView>([
+    "normalizedModelId",
+    "currency",
+    "input",
+    "cacheRead",
+    "cacheWrite",
+    "output",
+    "updatedAt",
+    "sourceProvider",
+    "sourceModel",
+    "releaseDate",
+    "snapshotDate",
+  ]);
+  for (const view of overrides) {
+    expect(actualKeys(view)).toEqual(overrideKeys);
+    expect(typeof view.updatedAt).toBe("number");
+    expect(["USD", "CNY"]).toContain(view.currency);
+  }
+
+  const set = (await invoke("usage_pricing_override_set", {
+    request: {
+      normalizedModelId: "GPT-5",
+      currency: "CNY",
+      input: "2.5",
+      cacheRead: null,
+      cacheWrite: null,
+      output: null,
+    },
+  })) as PriceOverrideView[];
+  const updated = set.find((view) => view.normalizedModelId === "gpt-5");
+  expect(updated).toBeTruthy();
+  expect(updated).toMatchObject({
+    normalizedModelId: "gpt-5",
+    currency: "CNY",
+    input: "2.5",
+    cacheRead: null,
+    cacheWrite: null,
+    output: null,
+  });
+  for (const view of set) expect(actualKeys(view)).toEqual(overrideKeys);
+
+  await expect(
+    invoke("usage_pricing_override_set", {
+      request: {
+        normalizedModelId: "gpt-5",
+        input: null,
+        cacheRead: null,
+        cacheWrite: null,
+        output: null,
+      },
+    })
+  ).rejects.toMatchObject({
+    code: "usage-settings-invalid",
+    detail: "price override must set at least one rate",
+  });
+
+  const afterDelete = (await invoke("usage_pricing_override_delete", {
+    normalizedModelId: "gpt-5",
+  })) as PriceOverrideView[];
+  expect(afterDelete.map((view) => view.normalizedModelId)).not.toContain("gpt-5");
+  for (const view of afterDelete) expect(actualKeys(view)).toEqual(overrideKeys);
+
+  // 目录搜索需要 active 快照；两端共享同一份夹具状态。
+  mockPricingSetEnabled(true);
+  mockPricingRefresh();
+  const catalog = (await invoke("usage_pricing_catalog", {
+    query: "DEEP",
+    limit: 20,
+  })) as PricingCatalogEntry[];
+  expect(catalog.length).toBeGreaterThan(0);
+  const entryKeys = keysOf<PricingCatalogEntry>([
+    "providerId",
+    "modelId",
+    "releaseDate",
+    "hasRates",
+    "conditional",
+    "curatedKind",
+  ]);
+  for (const entry of catalog) {
+    expect(actualKeys(entry)).toEqual(entryKeys);
+    expect(typeof entry.hasRates).toBe("boolean");
+    expect(typeof entry.conditional).toBe("boolean");
+    expect(entry.releaseDate === null || typeof entry.releaseDate === "string").toBe(true);
+  }
+  expect(catalog.some((entry) => entry.providerId === "ollama-cloud")).toBe(true);
+  resetUsageV2MockState();
+}
+
 describe("usage 命令双端 mock 形状（同一份断言跑两端）", () => {
   it("src/tauri-mock.ts 在 jsdom 里真的自安装了", () => {
     expect(browserInternals).toBeTruthy();
@@ -313,6 +724,10 @@ describe("usage 命令双端 mock 形状（同一份断言跑两端）", () => {
       it("usage_export_csv：11 列表头", () => assertUsageExportCsv(invoke));
       it("usage_get_settings / usage_set_settings：8 字段 + patch 合并", () =>
         assertUsageSettings(invoke));
+      it("Task 6：别名 / 渠道选项 / 覆盖价命令形状与 CRUD 语义", () =>
+        assertV2AliasAndOverrideCommands(invoke));
+      it("Task 5（2026-10-20）：观察条目 / 模型配置 / 精选目录命令形状与语义", () =>
+        assertV2ModelConfigCommands(invoke));
     });
   }
 
@@ -324,15 +739,44 @@ describe("usage 命令双端 mock 形状（同一份断言跑两端）", () => {
       ["usage_export_csv", today()],
       ["usage_get_settings", undefined],
       ["usage_set_settings", { patch: { detailRetentionDays: 30 } }],
+      ["usage_provider_aliases_get", undefined],
+      ["usage_channel_options", { range: { preset: "last7d" } }],
+      ["usage_pricing_overrides_get", undefined],
+      ["usage_observed_entries_get", undefined],
     ] as const) {
+      // Task 6 的命令带可变状态：两端各从同一复位态取样，深比较才有意义。
+      resetUsageV2MockState();
       const a = await mswInvoke(cmd as string, args as Record<string, unknown> | undefined);
+      resetUsageV2MockState();
       const b = await browserInvoke(cmd as string, args as Record<string, unknown> | undefined);
+      resetUsageV2MockState();
       // **Minor 2**：`toEqual` 忽略值为 `undefined` 的属性 → 两端同步改成 undefined/漏写
       // `title: null` 时也会绿，而真机是**显式 null**。`toStrictEqual` 区分 undefined 与缺键。
       expect(stripTimestamps(b), `${cmd} 两端 mock 形状/样例不一致`).toStrictEqual(
         stripTimestamps(a)
       );
     }
+  });
+
+  it("目录搜索样例两端逐字同形（含排序 / limit / 标记）", async () => {
+    const sample = async (invoke: Invoke) => {
+      resetUsageV2MockState();
+      mockPricingSetEnabled(true);
+      mockPricingRefresh();
+      const result = (await invoke("usage_pricing_catalog", {
+        query: "",
+        limit: 2,
+      })) as PricingCatalogEntry[];
+      resetUsageV2MockState();
+      return result;
+    };
+    const a = await sample(mswInvoke);
+    const b = await sample(browserInvoke);
+    expect(a).toStrictEqual(b);
+    expect(a.map((entry) => `${entry.providerId}/${entry.modelId}`)).toEqual([
+      "ollama-cloud/deepseek-v4.1-flash",
+      "ollama-cloud/kimi-k2",
+    ]);
   });
 
   it("两个 mock 文件里每条用量命令**各只有一个 case**（switch 重复 case 会静默遮蔽前者）", () => {

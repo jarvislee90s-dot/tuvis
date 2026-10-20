@@ -138,6 +138,26 @@ describe("设置页「用量统计」分组（计划② Task 14）", () => {
     expect(screen.getByTestId("usage-minibar-tool-rows")).toBeTruthy();
     expect(screen.getByTestId("usage-detail-retention-days")).toBeTruthy();
     expect(screen.getByTestId("usage-collect-interval-min")).toBeTruthy();
+    // 2026-10-20 计划 Task 6 + 同日第三轮：显示与计价配置改为**设置页与 D 卡共用的弹窗**
+    //（usage-config-open-settings 按钮 → usage-config-dialog-settings），弹窗内容只在打开时挂载；
+    // 弹窗内高级覆盖默认再折叠一层；不恢复 providerMapRules JSON 编辑框
+    const configTrigger = screen.getByTestId("usage-config-open-settings");
+    expect(configTrigger).toHaveAttribute("aria-haspopup", "dialog");
+    // 初始（未点开）：无弹窗壳、无配置面板、无四价覆盖管理器
+    expect(screen.queryByTestId("usage-config-dialog-settings")).toBeNull();
+    expect(screen.queryByTestId("usage-config-panel-settings")).toBeNull();
+    expect(screen.queryByTestId("price-override-manager")).toBeNull();
+    // 点开：弹窗与面板挂载（内容门控在打开态）
+    fireEvent.click(configTrigger);
+    expect(await screen.findByTestId("usage-config-dialog-settings")).toBeTruthy();
+    expect(await screen.findByTestId("usage-config-panel-settings")).toBeTruthy();
+    // 高级覆盖默认收起：弹窗打开后 Manager 仍不挂载（展开才挂）
+    expect(screen.queryByTestId("price-override-manager")).toBeNull();
+    // 正向锁：billing 独立触发器与旧「供应商别名」触发器不得再出现在设置页
+    expect(screen.queryByTestId("billing-manager-open")).toBeNull();
+    expect(screen.queryByTestId("provider-alias-manager-open")).toBeNull();
+    // Task 17：定价目录状态入口与渠道管理器并存
+    expect(await screen.findByTestId("usage-pricing-toggle")).toBeTruthy();
     // **B1（2026-10-07）**：评语已搬到看板导出条 ⇒ 本页**不得**再有它。
     // 这条是**正向锁**（不是删掉了事）：将来谁把评语搬回来，两处入口就会各写各的、必然漂移。
     expect(screen.queryByTestId("usage-export-quote")).toBeNull();

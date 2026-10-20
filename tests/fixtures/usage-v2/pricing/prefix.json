@@ -1,0 +1,103 @@
+{
+  "provider": {
+    "id": "provider",
+    "models": {
+      "gpt-4o": {
+        "id": "gpt-4o",
+        "release_date": "2024-08-06",
+        "cost": { "input": 2 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "gpt-4": {
+        "id": "gpt-4",
+        "release_date": "2023-06-13",
+        "cost": { "input": 2 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "claude-2": {
+        "id": "claude-2",
+        "release_date": "2023-07-11",
+        "cost": { "input": 3 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "claude-3-5-sonnet": {
+        "id": "claude-3-5-sonnet",
+        "release_date": "2024-10-22",
+        "cost": { "input": 3 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "gemini": {
+        "id": "gemini",
+        "release_date": "2024-01-01",
+        "cost": { "input": 1 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "gemini-2": {
+        "id": "gemini-2",
+        "release_date": "2025-01-01",
+        "cost": { "input": 1 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "qwen": {
+        "id": "qwen",
+        "release_date": "2024-01-01",
+        "cost": { "input": 1 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "qwen-2": {
+        "id": "qwen-2",
+        "release_date": "2025-01-01",
+        "cost": { "input": 2 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "qwen-alpha": {
+        "id": "qwen-alpha",
+        "release_date": "2025-02-01",
+        "cost": { "input": 2 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "cond-a": {
+        "id": "cond-a",
+        "release_date": "2025-03-01",
+        "cost": { "input": 4 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "cond-a-alpha": {
+        "id": "cond-a-alpha",
+        "release_date": "2025-04-01",
+        "cost": { "input": 4, "context_over_200k": { "input": 8 } },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "long-a": {
+        "id": "long-a",
+        "release_date": "2025-05-01",
+        "cost": { "input": 5 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "long-a-alpha": {
+        "id": "long-a-alpha",
+        "release_date": "2025-06-01",
+        "cost": { "input": 5 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "codex": {
+        "id": "codex",
+        "release_date": "2024-01-01",
+        "cost": { "input": 1 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "abc": {
+        "id": "abc",
+        "release_date": "2024-01-01",
+        "cost": { "input": 1 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      },
+      "beta-model": {
+        "id": "beta-model",
+        "release_date": "2024-01-01",
+        "cost": { "input": 4 },
+        "modalities": { "input": ["text"], "output": ["text"] }
+      }
+    }
+  }
+}

@@ -117,7 +117,7 @@ describe("UsageExportActions（计划② Task 11：复制文本 + CSV 导出）"
     // `copyText` 收到的就是这份摘要（它的唯一动作是把它交给剪贴板）
     const copied = clipboardWrite.mock.calls[0][0] as unknown as string;
     expect(copied).toContain("用量看板 · 近 7 天（09/27 – 10/03）");
-    expect(copied).toContain("请求输入(全文累计): 1,954,268");
+    expect(copied).toContain("新增输入: 1,954,268");
 
     expect(screen.getByTestId("usage-export-toast")).toHaveTextContent("已复制");
     // §3 第 26 条：剪贴板只作**副本**入口，这条链不碰落盘、不碰查询（零 IPC）
@@ -142,8 +142,10 @@ describe("UsageExportActions（计划② Task 11：复制文本 + CSV 导出）"
     const [saveName, saveArgs] = callsOf("export_save_text")[0];
     expect(saveName).toBe("export_save_text");
     expect(saveArgs).toEqual({ name: "mam-usage-last7d.csv", content: csv });
-    // 表头由后端给（列序 = 契约 CSV_HEADER），前端不得自造
+    // 表头由后端给（列序 = 契约 CSV_HEADER），前端不得自造。
+    // V2 只改展示摘要；Token CSV 的原始列（含 userEst）不变。
     expect(csv.startsWith("groupKey,label,inputFresh,cacheRead,cacheWrite,output,")).toBe(true);
+    expect(csv.split("\n")[0]).toContain(",userEst,sourceKind");
 
     // §3 第 15 条：导出链只读账本，绝不触发扫描
     expect(callsOf("usage_collect")).toHaveLength(0);
@@ -247,7 +249,11 @@ describe("UsageExportActions（计划② Task 11：复制文本 + CSV 导出）"
     expect(input.footer).toBe("纯 token · 含子代理 · 本地聚合");
     expect(input.hero).toBe("2,036,981");
     expect(input.metrics as unknown[]).toHaveLength(6);
-    expect((input.metrics as string[][]).map(([label]) => label)).toContain("产出");
+    const metricLabels = (input.metrics as string[][]).map(([label]) => label);
+    expect(metricLabels).toContain("输出");
+    expect(metricLabels).toContain("未缓存命中输入");
+    // V2：用户输入估值不再进入分享图
+    expect(metricLabels).not.toContain("用户输入(估) · 含子代理");
     expect(input.groups as unknown[]).not.toHaveLength(0);
     expect(input.tools2x2 as unknown[]).toHaveLength(4);
     expect(input.pose).toBe("random"); // 设置缺省（夹具的 exportPose = random）
@@ -414,15 +420,16 @@ describe("UsageExportActions（计划② Task 11：复制文本 + CSV 导出）"
     // 头部 hero（`:160`）与评语气泡的 `{tokens}`（`:149`）都出 `—`
     expect(input.hero).toBe(EM_DASH);
     expect(input.quote as string).not.toContain("{"); // 4 个占位符都已填（tokens 位填的是 —）
-    // **四个由 token 桶派生的指标行**出 `—`（产出 / 请求输入 / 缓存命中 / 命中率）
-    for (const label of ["产出", "请求输入(全文累计)", "缓存命中", "命中率"]) {
+    // **四个由 token 桶派生的指标行**出 `—`（新增输入 / 缓存命中 / 未缓存命中 / 输出 / 命中率；
+    // 2026-10-20 Task 8：计量维度值统一——新增输入 / 输出）
+    for (const label of ["新增输入", "缓存命中", "未缓存命中输入", "输出", "命中率"]) {
       expect(valueOf(label)).toBe(EM_DASH);
     }
     // **请求次数出真值**：断**具体数字**（不是模板，也明确不许是 `—`）
     expect(valueOf("请求次数")).toBe("460");
     expect(valueOf("请求次数")).not.toBe(EM_DASH);
-    // **`用户输入(估)` 也出真值**（2026-10-06 第三轮裁决：它从用户文本估出来、与四桶无关）
-    expect(valueOf("用户输入(估) · 含子代理")).toBe("~18,023");
+    // V2：用户输入估值不在分享图指标里
+    expect(valueOf("用户输入(估) · 含子代理")).toBeUndefined();
     // 趋势：**不把全零点交给画布**（否则画成贴底零线）⇒ 空数组，交给布局层的空态分支
     expect(input.points as unknown[]).toHaveLength(0);
     // 分组：分布行值全为 0 ⇒ 丢光 ⇒ 交给布局层的空态分支（不是一行 0）
@@ -436,11 +443,30 @@ describe("UsageExportActions（计划② Task 11：复制文本 + CSV 导出）"
     await waitFor(() => expect(renderShareImageMock).toHaveBeenCalledTimes(1));
     const okInput = renderShareImageMock.mock.calls[0][0] as Record<string, unknown>;
     expect(okInput.hero).toBe("2,036,981");
-    expect((okInput.metrics as [string, string][]).find(([l]) => l === "产出")?.[1]).toBe("82,713");
-    expect(
-      (okInput.metrics as [string, string][]).find(([l]) => l === "用户输入(估) · 含子代理")?.[1]
-    ).toBe("~18,023"); // 正常窗口逐字不变（防过度置空的反向）
+    const okMetrics = okInput.metrics as [string, string][];
+    expect(okMetrics.find(([l]) => l === "输出")?.[1]).toBe("82,713");
+    expect(okMetrics.find(([l]) => l === "未缓存命中输入")?.[1]).toBe("636,145");
+    // V2：userEst=999 也不得进入分享图（不是 API Token）
+    expect(okMetrics.find(([l]) => l === "用户输入(估) · 含子代理")).toBeUndefined();
     expect(okInput.points as unknown[]).not.toHaveLength(0);
     okView.unmount();
+  });
+
+  it("9. userEst=999 夹具：分享图装配入参不含用户输入估值", async () => {
+    renderShareImageMock.mockResolvedValue(pngBlob);
+    const d = mockUsageDashboard({ preset: "last7d" }, "tool") as UsageDashboard;
+    const view = render(
+      <UsageExportActions
+        {...boardProps({ dash: { ...d, totals: { ...d.totals, userEst: 999 } } })}
+      />
+    );
+    fireEvent.click(screen.getByTestId("usage-export-image"));
+    await waitFor(() => expect(renderShareImageMock).toHaveBeenCalledTimes(1));
+
+    const input = renderShareImageMock.mock.calls[0][0] as Record<string, unknown>;
+    const metrics = input.metrics as [string, string][];
+    expect(metrics.map(([label]) => label)).not.toContain("用户输入(估) · 含子代理");
+    expect(JSON.stringify(input)).not.toContain("~999");
+    view.unmount();
   });
 });
