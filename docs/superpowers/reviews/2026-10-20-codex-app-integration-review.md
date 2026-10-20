@@ -28,7 +28,7 @@
 | 7 | `cargo test --test codex_control_remote` | PASS 36 | 账本/FIFO/屏障/Unknown/撤回（+写前忙回队、旧 Turn 回显、签名冻结） |
 | 8 | `cargo test --test headless_e2e -- --list` | 1 例（ignored） | `codex_queue_consumed` 未执行、零配额 |
 | 9 | `cargo check --release --features codex-ipc-e2e-stop` | **按预期编译失败** | `compile_error!`：只允许 debug 证据构建 |
-| 10 | `pnpm test` | PASS 151 文件 / 1598 例 / 5 skipped | 前端全量（第三轮新增 9 例接线/账本交互 + P7 本地化 1 例） |
+| 10 | `pnpm test` | PASS 151 文件 / 1598 例 / 5 skipped | 前端全量（第三轮新增 9 例：详情页 5 + MessageComposer 4，含 H3 本地化） |
 | 11 | `pnpm check`（format/lint/i18n/error-codes/build） | PASS | 构建产物正常 |
 | 12 | `pnpm build:mobile` | PASS | `dist-mobile/` |
 | 13 | `pnpm check:i18n` | PASS 1445 键 | zh/en 键集一致 |
