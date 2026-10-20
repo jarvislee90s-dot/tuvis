@@ -9,7 +9,7 @@ Built-in companions live in a corner of your screen, watching sessions for you �
 The default companion tuvis-3D is a 3D tech rabbit floating in a corner of your screen (Foxbell is the fox); their abilities are identical:
 
 - **Status card overhead**: same colors, same meaning as the dashboard (red = waiting for you / yellow = running / green = finished); click the card to jump to the matching terminal;
-- **Usage snippet**: hover for about half a second and a popup appears with a token-usage minibar on top of the status card (requests & hit rate / cache & output / per-tool totals); after the mouse leaves there is a 2-second grace period — plenty of time to click "Details »";
+- **Usage snippet**: hover for about half a second and a popup appears with a token-usage minibar on top of the status card (New input / Cache hit / Output / per-tool totals); after the mouse leaves there is a 2-second grace period — plenty of time to click "Details »";
 - **Voice reminders**: playful nudges while waiting, cheers on completion, subtitles synced to audio length; double-click for a little chat.
 
 ## Switching built-in pets
