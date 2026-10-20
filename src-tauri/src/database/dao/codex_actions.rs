@@ -450,14 +450,18 @@ pub(crate) fn requeue_after_busy_conn(
     conn: &Connection,
     action_id: &str,
     wire_text: &str,
+    signature_applied: bool,
     now_ms: i64,
 ) -> rusqlite::Result<bool> {
     let tx = conn.unchecked_transaction()?;
+    // `queued_text` 回填的是**已冻结的最终 wire**——必须同时把签名标志写成具体值，
+    // 否则旧行（NULL）下次派发会再按「恒签名」组装，造成双签名/换正文
+    // （2026-10-20 第三轮复审 Important）。
     let n = tx.execute(
         "UPDATE codex_actions SET state = 'queued', route = 'none', queued_text = ?2, \
-             updated_at = ?3 \
+             signature_applied = ?3, updated_at = ?4 \
          WHERE action_id = ?1 AND state = 'reserved'",
-        params![action_id, wire_text, now_ms],
+        params![action_id, wire_text, signature_applied as i64, now_ms],
     )?;
     if n == 0 {
         return Ok(false);

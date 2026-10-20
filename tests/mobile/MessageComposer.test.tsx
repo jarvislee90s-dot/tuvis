@@ -2058,7 +2058,9 @@ describe("MessageComposer：Codex 动作账本与队列刷新", () => {
     fireEvent.change(input, { target: { value: "兼容发送" } });
     fireEvent.click(screen.getByTestId("composer-send"));
     const chip = await screen.findByTestId("send-receipt-failed");
-    expect(chip.textContent).toContain("无头通道未开启");
+    // 测试环境默认 en：reasonCode 必须本地化（后端 reason 只有中文，不能原样透出）
+    expect(chip.textContent).toContain("Headless channel is off");
+    expect(chip.textContent).not.toContain("无头通道未开启");
     expect(chip.textContent).not.toContain("session-send 403");
   });
 

@@ -444,9 +444,11 @@ impl ThreadMirror {
             truncated: messages.1,
             messages: messages.0,
             pending,
-            // 代际由 adapter 在广播/GET 前统一盖章（mirror 不持有 owner 表）
-            owner_epoch: 0,
-            owner_generation: 0,
+            // 代际来自镜像**绑定的 lease**（广播事件与 GET/首快照同源）——首快照
+            // 不带 0，否则 SSE 启动缓冲的 `supersedes` 会把任何事件都判成更新
+            //（2026-10-20 第三轮复审 Important）。
+            owner_epoch: self.lease.as_ref().map(|l| l.epoch).unwrap_or(0),
+            owner_generation: self.lease.as_ref().map(|l| l.generation).unwrap_or(0),
         }
     }
 }
@@ -1986,6 +1988,23 @@ mod tests {
         assert_eq!(users.len(), 1, "跨键副本不重复: {users:?}");
         assert_eq!(users[0].id, "t1/opening/c1");
         assert_eq!(users[0].text, "hello");
+    }
+
+    /// 派发边界快照的 Turn 集合（2026-10-20 复审 P1）：canonical 引用链上的 Turn
+    /// 必须全部收进 `turn_ids`，供 adapter 判定「回执 turnId 是否为派发前旧 Turn」。
+    #[test]
+    fn turn_ids_collects_canonical_turns() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(
+            &lease(),
+            &observed_change("canonical-before-load.sanitized.json"),
+        )
+        .unwrap();
+        let ids = m.turn_ids();
+        assert!(ids.len() >= 3, "至少三条 canonical Turn：{ids:?}");
+        assert!(ids.iter().all(|id| !id.is_empty()), "不含空 id");
+        // 同一时刻的投影与集合同源（不引入第二套读取逻辑）
+        assert!(ids.contains("00000000-0000-4000-8000-000000000011"));
     }
 
     /// Task 6 真机可追溯样本（DERIVED，源 `raw/t4-1.jsonl` T4 rev3）：Turn 只有

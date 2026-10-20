@@ -643,8 +643,13 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
       }
     } catch (e) {
       if (e instanceof ApiError) {
+        // 2026-10-20 复审 P7：已知 reasonCode 走本地化文案（后端 reason 只有中文，
+        // en 界面不能原样显示）；未知码才回退服务端 reason/错误消息。
+        const code = typeof e.data?.reasonCode === "string" ? e.data.reasonCode : null;
+        const localized =
+          code === "headless_disabled" ? i18n.t("mobile.composer.headlessDisabled") : null;
         const reason = typeof e.data?.reason === "string" ? e.data.reason : null;
-        setReceipt({ kind: "failed", error: reason ?? e.message });
+        setReceipt({ kind: "failed", error: localized ?? reason ?? e.message });
       } else {
         setReceipt({ kind: "failed", error: String(e) });
       }

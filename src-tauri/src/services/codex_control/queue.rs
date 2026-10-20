@@ -302,9 +302,15 @@ impl ActionStore {
     }
 
     /// 写前忙回队（reserved→queued，恢复 wire 文本；CAS 失败返回 false）。
-    pub fn requeue_after_busy(&self, action_id: &str, wire_text: &str) -> Result<bool, StoreError> {
+    pub fn requeue_after_busy(
+        &self,
+        action_id: &str,
+        wire_text: &str,
+        signature_applied: bool,
+    ) -> Result<bool, StoreError> {
         self.with(|c| {
-            dao::requeue_after_busy_conn(c, action_id, wire_text, now_ms()).map_err(db_err)
+            dao::requeue_after_busy_conn(c, action_id, wire_text, signature_applied, now_ms())
+                .map_err(db_err)
         })
     }
 

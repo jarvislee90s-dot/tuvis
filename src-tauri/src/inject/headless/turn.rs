@@ -153,8 +153,9 @@ impl CmdShimSubject {
 /// - **正文走 stdin 的通道**（claude：`--input-format stream-json`）⇒ `in_argv = false`
 ///   ⇒ 放行（正文根本不经过命令行，垫片重解析面不存在——**别顺手把它也拒了**）。
 ///
-/// `text` 必须是**用户可控的那一段原文**（不含我们追加的 `[mobile <花名>]` 签名——签名是
-/// 我们自己拼的，不该由用户的判据代为背书）。判据是**纯函数**：零 I/O、零进程，故可单测；
+/// `text` 是**真正会进该 argv 段的那一段**——在 `codex::argv_shim_refusal` 的 spawn
+/// 边界上就是最终载荷（可含我们追加的 `[mobile <花名>]` 签名）：只有实际进 cmd 重解析面
+/// 的内容才该被拒，签名也是载荷的一部分。判据是**纯函数**：零 I/O、零进程，故可单测；
 /// 调用点的纪律见 `remote::api` 的分派点与 `codex::argv_shim_refusal`（拒绝 = `refused`，
 /// 未起跑、零字节投递）。
 pub fn cmd_shim_refusal(
@@ -195,10 +196,6 @@ pub fn cmd_shim_body_refusal(
 ) -> Option<String> {
     cmd_shim_refusal(CmdShimSubject::Body, text, shape, body_travels_in_argv)
 }
-
-// ============================================================
-// 花名 / 设备名的 cmd 安全白名单（裁决 24b：R3 的**签名面**收口）
-// ============================================================
 
 /// 证据头（生产/测试共用）：前 [`EVIDENCE_HEAD_LINES`] 行拼接（判定为子串匹配）
 pub fn head_of(lines: &[String]) -> String {

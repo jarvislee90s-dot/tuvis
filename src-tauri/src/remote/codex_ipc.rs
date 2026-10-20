@@ -633,6 +633,21 @@ impl FollowGate {
     }
 }
 
+/// 回执 Turn 关联判定（纯函数，2026-10-20 复审 P1）：`None` = 可以接受为本动作的
+/// Turn；`Some(reason)` = 必须按 Unknown 保守处理（不落 Accepted、不绑定完成证据）。
+/// - `stale_turn_echo`：回执 turnId 是**派发前已存在**的旧 Turn（Windows 忙态证据）；
+/// - `turn_unconfirmed`：success 但缺 turnId——无法确认关联。
+pub(crate) fn turn_association_refusal(
+    existing_turns: &std::collections::HashSet<String>,
+    turn_id: Option<&str>,
+) -> Option<&'static str> {
+    match turn_id {
+        Some(tid) if existing_turns.contains(tid) => Some("stale_turn_echo"),
+        Some(_) => None,
+        None => Some("turn_unconfirmed"),
+    }
+}
+
 /// 生产 A 路派发：普通消息 ensure_thread 先行（owner/following/snapshot 就位——
 /// start_turn 需要现行 lease），失败 = 写前零投递 `NotSent`（router 据此取得兜底资格，
 /// 「不确定已送达绝不自动切换」的边界在 writer 尝试之前，语义安全）。
@@ -730,20 +745,16 @@ impl DesktopDispatch for AdapterDispatch {
             //   进保守 Unknown（屏障保留，禁止自动重发/fallback）；
             // - Accepted 却无 turnId = 无法确认关联 → 同样保守 Unknown。
             if out.delivery == Delivery::Accepted {
-                match out.turn_id.as_deref() {
-                    Some(tid) if existing_turns.contains(tid) => {
-                        log::warn!(
-                            "codex/thread send: start-turn 回执为派发前旧 Turn（action={action_id} turn={tid}）——按未知投递保守处理"
-                        );
-                        out.delivery = Delivery::UnknownDelivery;
-                        out.reason_code = Some("stale_turn_echo".to_string());
-                        out.turn_id = None;
-                    }
-                    Some(_) => {}
-                    None => {
-                        out.delivery = Delivery::UnknownDelivery;
-                        out.reason_code = Some("turn_unconfirmed".to_string());
-                    }
+                if let Some(reason) =
+                    turn_association_refusal(&existing_turns, out.turn_id.as_deref())
+                {
+                    log::warn!(
+                        "codex/thread send: start-turn 回执无法确认为本动作新 Turn（action={action_id} turn={:?} reason={reason}）——按未知投递保守处理",
+                        out.turn_id
+                    );
+                    out.delivery = Delivery::UnknownDelivery;
+                    out.reason_code = Some(reason.to_string());
+                    out.turn_id = None;
                 }
             }
             out
@@ -1557,18 +1568,25 @@ async fn drain_startup_buffer(
     let mut lagged = false;
     loop {
         match rx.try_recv() {
-            Ok(p) => buffered.push(p),
+            Ok(p) => {
+                if lagged {
+                    // Lagged 后仍可能继续有可读事件：抽干但不收进缓冲（无法证明
+                    // 它们比快照新）；避免把它们留到流式阶段补发而回退。
+                    continue;
+                }
+                buffered.push(p);
+            }
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
                 lagged = true;
-                break;
+                buffered.clear();
             }
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
         }
     }
     if lagged {
-        buffered.clear();
-        return (adapter.projection(key).await, buffered);
+        // 重取快照；取到的是当前投影（若 stale/空则如实交给下游按 stale 处理）
+        return (adapter.projection(key).await, Vec::new());
     }
     let merged = merge_startup_buffer(key, first, buffered);
     let mut it = merged.into_iter();
@@ -1609,7 +1627,17 @@ fn projection_stream(
                     // 其他 Thread 的投影：跳过（单会话订阅，不打开全历史）
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // 丢帧 = 下游可能与真实状态脱节：重新 snapshot 校正（计划 Task 8 端点表）
+                    // 丢帧 = 下游可能与真实状态脱节：先把已排队的事件抽干（它们
+                    // 无法证明比即将重发的快照新，留着会在快照后补发而回退），
+                    // 再重发当前投影 snapshot 校正（计划 Task 8 端点表）。
+                    loop {
+                        match s.rx.try_recv() {
+                            Ok(_) => continue,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                        }
+                    }
                     let snap = s.adapter.projection(&s.key).await;
                     return Some((Ok(projection_event("snapshot", &snap)), s));
                 }
@@ -2183,7 +2211,7 @@ mod startup_merge_tests {
     //! 2026-10-20 复审 P2：SSE 首快照与订阅缓冲的合并语义（纯函数层，确定性覆盖
     //! 「快照与建流交界处发布最终态」「旧缓冲不得覆盖较新快照」「owner 换代」）。
 
-    use super::{merge_startup_buffer, supersedes};
+    use super::{merge_startup_buffer, supersedes, turn_association_refusal};
     use crate::services::codex_desktop_ipc::types::{
         CapabilitySet, ContentState, ControlAvailability, ThreadKey, ThreadProjection,
     };
@@ -2269,6 +2297,28 @@ mod startup_merge_tests {
         assert!(!supersedes(&p("t", 1, 1, Some(6), true), &snap));
         let merged = merge_startup_buffer(&k("t"), snap, vec![p("t", 1, 1, None, true)]);
         assert_eq!(merged.len(), 1);
+    }
+
+    /// P1：回执 Turn 关联判定——派发前已存在的旧 Turn 必须拒绝；缺 turnId 保守拒绝。
+    #[test]
+    fn turn_association_refusal_classifies_stale_and_unconfirmed() {
+        let mut existing = std::collections::HashSet::new();
+        existing.insert("turn-old".to_string());
+        assert_eq!(
+            turn_association_refusal(&existing, Some("turn-old")),
+            Some("stale_turn_echo"),
+            "旧 Turn 回显不得接受"
+        );
+        assert_eq!(
+            turn_association_refusal(&existing, Some("turn-new")),
+            None,
+            "新 Turn 正常接受"
+        );
+        assert_eq!(
+            turn_association_refusal(&existing, None),
+            Some("turn_unconfirmed"),
+            "缺 turnId 无法确认关联 → 保守 Unknown"
+        );
     }
 
     /// 别的 Thread 的缓冲事件一律忽略（单会话订阅不串台）。

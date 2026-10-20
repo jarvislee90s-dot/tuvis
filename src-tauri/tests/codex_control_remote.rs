@@ -908,6 +908,15 @@ async fn signature_setting_is_frozen_at_registration() {
             .send(h.ctx("sig-queued", ActionKind::Send), raw.into(), true)
             .await;
         set_signature(&h.conn, false);
+        // 同 actionId 重试（设置已变）：仍返回既有 queued、零新写入/零重复派发
+        let retry = h
+            .router
+            .send(h.ctx("sig-queued", ActionKind::Send), raw.into(), true)
+            .await;
+        assert!(
+            matches!(retry, RouterOutcome::Queued { ref action_id, .. } if action_id == "sig-queued"),
+            "同 actionId 重试不得换正文/重复投递：{retry:?}"
+        );
         h.restart();
         h.router.flush_thread(&h.key).await.expect("dispatch");
         assert_eq!(
@@ -930,11 +939,34 @@ async fn signature_setting_is_frozen_at_registration() {
                 rusqlite::params![THREAD, raw],
             )
             .unwrap();
+        // 旧行 + 写前忙回队：回填的是已签名 wire，标志必须同步钉住，
+        // 否则下次派发会再拼一次（双签名）——2026-10-20 复审 Important。
+        h.dispatch.set_busy_before_write(true);
+        // 写前忙：flush 返回 None（留在队列等下一事件），不得 panic
+        assert!(h.router.flush_thread(&h.key).await.is_none());
+        assert_eq!(h.dispatch.send_count(), 0, "写前忙零 start-turn");
+        let (text, signed): (Option<String>, Option<i64>) = {
+            let conn = h.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT queued_text, signature_applied FROM codex_actions WHERE action_id = 'sig-legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            text,
+            Some(format!("{raw} [mobile iPhone]")),
+            "回队保留最终 wire"
+        );
+        assert_eq!(signed, Some(1), "旧行回队后签名标志必须钉成 1（防双签名）");
+
+        h.dispatch.set_busy_before_write(false);
         h.router.flush_thread(&h.key).await.expect("dispatch");
         assert_eq!(
             h.dispatch.recorded_composed(),
             vec![format!("{raw} [mobile iPhone]")],
-            "旧行保持升级前语义（恒带签名）"
+            "旧行保持升级前语义（恒带签名且只一次）"
         );
     }
 

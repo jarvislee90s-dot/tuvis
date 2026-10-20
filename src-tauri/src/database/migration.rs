@@ -830,8 +830,9 @@ mod tests {
         );
     }
 
-    /// Codex 动作账本：旧结构（无 barrier_force_released_at）经迁移补列——
-    /// 可空、存量行保留为 NULL；幂等两遍不报错。
+    /// Codex 动作账本：旧结构（**两列都不存在**）经迁移补列——
+    /// `barrier_force_released_at` 与 `signature_applied` 都可空、存量行保留 NULL；
+    /// 幂等两遍不报错。
     #[test]
     fn migrate_adds_codex_barrier_force_released_column() {
         let conn = Connection::open_in_memory().unwrap();
@@ -858,8 +859,7 @@ mod tests {
                 compat_turn_id TEXT,
                 compat_rollout_path TEXT,
                 compat_rollout_baseline INTEGER,
-                compat_wire_hash TEXT,
-                barrier_force_released_at INTEGER
+                compat_wire_hash TEXT
             );
             INSERT INTO codex_actions (action_id, device_id, device_name, thread_id, kind,
                  payload_hash, client_message_id, state, created_at, updated_at, compat_outstanding)
@@ -867,15 +867,19 @@ mod tests {
         )
         .unwrap();
         migrate(&conn).unwrap();
-        let (flag, ts): (i64, Option<i64>) = conn
+        let (flag, ts, signed): (i64, Option<i64>, Option<i64>) = conn
             .query_row(
-                "SELECT compat_outstanding, barrier_force_released_at \
+                "SELECT compat_outstanding, barrier_force_released_at, signature_applied \
                  FROM codex_actions WHERE action_id = 'legacy-a'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!((flag, ts), (1, None), "存量屏障行保留，解除标记为 NULL");
+        assert_eq!(
+            (flag, ts, signed),
+            (1, None, None),
+            "存量行保留，两列均为 NULL（旧行签名语义 = 升级前恒签名）"
+        );
         // 幂等：迁移两遍不报错
         migrate(&conn).unwrap();
     }

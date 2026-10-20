@@ -1547,7 +1547,8 @@
   },
   "mobile": {
     "composer": {
-      "sendFailedRetry": "发送失败：{{error}}（可重试）"
+      "sendFailedRetry": "发送失败：{{error}}（可重试）",
+      "headlessDisabled": "无头通道未开启，请在电脑端 Tuvis 设置中开启"
     },
     "question": {
       "cancelInterrupt": "中断回合（破坏性）"

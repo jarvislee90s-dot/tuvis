@@ -421,6 +421,52 @@ async fn pending_capacity_rejects_before_enqueue() {
 /// 返回 NotSent。原实现挂在 `init.changed()` 上永不唤醒（握手失败路径从不向
 /// init 发值、closed 置位不唤醒 watch 等待者），future 自持 handle 泄漏并拖死
 /// 下游 router 派发任务；外层 timeout 断言防回归成挂死。
+/// 2026-10-20 复审 P1：写前边界快照 = ensure 后的忙态 + 已存在 Turn 集合，
+/// 供 adapter 在真正 start-turn 前拒绝「router 判 idle 后转 active」的竞态。
+#[tokio::test]
+async fn pre_write_snapshot_reports_busy_and_known_turns() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = DesktopIpcAdapter::new(
+        std::sync::Arc::new(TestConnector::new(test_endpoint("macos", MACOS_BUILD), io)),
+        profile_for("macos", MACOS_BUILD).unwrap(),
+    );
+    let key = tkey("prewrite-thread");
+
+    // idle 快照：不忙，但 Turn 集合已可用（用于旧 Turn 判定）
+    let task = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.ensure_thread(&k).await })
+    };
+    drive_follow(
+        &mut peer,
+        "prewrite-thread",
+        "owner-1",
+        snapshot_change(10, vec![], true),
+        true,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("ensure in time")
+        .expect("join")
+        .expect("fresh");
+    let (busy, ids) = adapter.pre_write_snapshot(&key);
+    assert!(!busy, "idle 快照不忙");
+    assert!(!ids.is_empty(), "已存在 Turn 集合可用：{ids:?}");
+
+    // active 增量（同一 owner）：写前快照必须报忙
+    let mut sse = adapter.subscribe();
+    let active = serde_json::json!({
+        "type": "patches", "baseRevision": 10, "revision": 11,
+        "patches": [{ "op": "replace", "path": ["threadRuntimeStatus"], "value": { "type": "active" } }]
+    });
+    peer.send(&state_frame("prewrite-thread", "owner-1", active))
+        .await;
+    let _ = wait_projection(&mut sse, "prewrite-thread", false, 5).await;
+    assert!(adapter.pre_write_snapshot(&key).0, "active 时必须报忙");
+}
+
 #[tokio::test(start_paused = true)]
 async fn request_parked_on_handshake_wakes_when_handshake_fails() {
     let (io, mut peer) = ScriptedPeer::new();

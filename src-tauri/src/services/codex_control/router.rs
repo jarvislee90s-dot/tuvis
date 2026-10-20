@@ -888,7 +888,13 @@ impl CodexControlRouter {
                 if receipt.reason_code.as_deref() == Some(BUSY_BEFORE_WRITE_REASON) =>
             {
                 self.clear_active(&head.ctx.key);
-                match self.store.requeue_after_busy(&head.ctx.action_id, &wire) {
+                // 旧行（NULL）在 dispatch_head 已按升级前语义组装为签名 wire——
+                // 回队时把标志钉成具体值，避免下次再组装（双签名）。
+                let signed = head.signature_applied.unwrap_or(true);
+                match self
+                    .store
+                    .requeue_after_busy(&head.ctx.action_id, &wire, signed)
+                {
                     Ok(true) => HeadOutcome::Busy,
                     Ok(false) => {
                         // CAS 失败（并发撤回/已离开 reserved）：保持既有终态，不重投

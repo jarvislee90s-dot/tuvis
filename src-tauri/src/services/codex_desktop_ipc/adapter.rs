@@ -227,26 +227,10 @@ impl DesktopIpcAdapter {
     }
 
     /// 订阅投影事件（REST/SSE/队列调度共用）。
-    /// 给投影盖上当前 owner 代际（epoch, generation）。**不序列化**，只用于 SSE
-    /// 首快照与订阅缓冲事件的先后判定：跨 owner 时 revision 可能回退，不能只比
-    /// revision 大小。锁不可得（owner 表正被改）→ 保持 (0,0)，调用方按同代际
-    /// revision 规则保守处理。
-    pub fn stamp_generation(&self, p: &mut ThreadProjection) {
-        let key = ThreadKey {
-            host_id: "local".to_string(),
-            thread_id: p.thread_id.clone(),
-        };
-        if let Ok(owners) = self.inner.owners.try_lock() {
-            if let Some(lease) = owners.current(&key) {
-                p.owner_epoch = lease.epoch;
-                p.owner_generation = lease.generation;
-            }
-        }
-    }
-
-    /// 广播一份投影（统一盖代际；SSE 订阅者据此排序启动缓冲）。
-    async fn publish_event(&self, mut p: ThreadProjection) {
-        self.stamp_generation(&mut p);
+    /// 广播一份投影：代际已由 `ThreadMirror::project` 从**绑定的 lease** 填好
+    ///（广播事件与 GET/SSE 首快照同源），此处不再二次盖章——否则会把「新 owner 的
+    /// 代际」盖到旧 owner 尚未清理的镜像上，制造虚假的新状态。
+    async fn publish_event(&self, p: ThreadProjection) {
         let _ = self.inner.events.send(p);
     }
 

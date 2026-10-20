@@ -1703,10 +1703,11 @@ async fn run_codex_turn(
     out
 }
 
-/// [`codex_headless_dispatch_envelope`] 的证据透出变体（Task 8）：公开旧 wrapper
-/// 行为不变（同参同回执），兼容兜底 bridge（remote::codex_ipc::run_compat）经本变体
-/// 额外取得内部 `CompatEvidence`（入队回执 id / Turn 完成证据——供 compat fence
-/// 登记与 Delivery 映射）。无证据时 `turn_completed=false`。
+/// Codex 兼容回合分派（唯一入口，兼容兜底 bridge `remote::codex_ipc::run_compat` 使用）。
+/// `text` 必须是**调用方已冻结的最终 wire 文本**（登记时组装，含/不含签名由登记时设置
+/// 决定）——本函数不再组装、不按花名拒绝；安全门在 `codex::dispatch` 的真实 argv
+/// （`argv_shim_refusal`）。额外返回内部 `CompatEvidence`（入队回执 id / Turn 完成证据
+/// ——供 compat fence 登记与 Delivery 映射）。无证据时 `turn_completed=false`。
 pub(crate) async fn codex_headless_dispatch_envelope_with_evidence(
     st: &Arc<RemoteState>,
     device_id: &str,

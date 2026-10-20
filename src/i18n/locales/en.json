@@ -1547,7 +1547,8 @@
   },
   "mobile": {
     "composer": {
-      "sendFailedRetry": "Send failed: {{error}} (retry available)"
+      "sendFailedRetry": "Send failed: {{error}} (retry available)",
+      "headlessDisabled": "Headless channel is off. Enable it in Tuvis settings on your computer."
     },
     "question": {
       "cancelInterrupt": "Interrupt turn (destructive)"
