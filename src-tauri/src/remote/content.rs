@@ -1205,6 +1205,70 @@ fn read_codex_rollout_with(
     Ok(pg)
 }
 
+/// Codex APP 生成图第二抽取源（2026-10-20 直接接入 PR165 分支）：Desktop IPC 的
+/// `imageGeneration.savedPath` 落在 `~/.codex/generated_images/<threadId>/`，
+/// 文件名 `exec-<uuid>.png`。该目录按会话隔离，故只扫当前 session_id 的直接子文件
+/// （不递归、只收图片扩展名）；图片没有消息 seq，调用方传 `start_seq` 把它们排到
+/// 当前窗口之后（file 面板按 seq 倒序，最新生成图在上）。
+///
+/// 安全：session_id 必须是单一路径段（拒绝分隔符 / `..` / NUL），目录固定在
+/// home 下的 `.codex/generated_images`，不跟随外部输入拼任意路径。失败一律空表
+/// （附件是增强能力，不阻塞详情页）。
+pub(crate) fn read_codex_generated_image_refs_with(
+    home: &Path,
+    session_id: &str,
+    limit: usize,
+    start_seq: i64,
+) -> Vec<(i64, String, Option<i64>)> {
+    if session_id.trim().is_empty()
+        || session_id.contains(['/', '\\', '\0'])
+        || session_id.contains("..")
+    {
+        return Vec::new();
+    }
+    let dir = home
+        .join(".codex")
+        .join("generated_images")
+        .join(session_id);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(std::path::PathBuf, Option<i64>, std::time::SystemTime)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if !matches!(
+            ext.as_deref(),
+            Some("png" | "jpg" | "jpeg" | "webp" | "gif")
+        ) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        let ts = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        rows.push((path, ts, modified));
+    }
+    // 生成先后按 mtime；同刻用文件名兜底（确定性）
+    rows.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    rows.truncate(limit);
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, (path, ts, _))| (start_seq + i as i64, path.to_string_lossy().to_string(), ts))
+        .collect()
+}
+
 /// Codex rollout 行 → 统一条目（纯函数；codex_entry_kind 的内容版映射）。
 /// response_item 外壳：message(user/assistant)、function_call、function_call_output、
 /// reasoning(summary)；session_meta / event_msg / turn_context 记账跳过
@@ -3454,6 +3518,56 @@ mod tests {
             None,
             "文件不存在 → None"
         );
+    }
+
+    // ==== 2026-10-20：Codex APP 生成图目录抽取 ====
+
+    #[test]
+    fn codex_generated_image_refs_scans_thread_dir_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".codex/generated_images").join(UUID);
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("exec-a.png"), b"a").unwrap();
+        std::fs::write(dir.join("exec-b.PNG"), b"b").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"no").unwrap();
+        std::fs::write(dir.join("nested/exec-c.png"), b"c").unwrap();
+
+        let refs = read_codex_generated_image_refs_with(tmp.path(), UUID, 10, 7);
+        assert_eq!(refs.len(), 2, "只收本会话直接子图片：{refs:?}");
+        assert_eq!(
+            refs.iter().map(|(seq, _, _)| *seq).collect::<Vec<_>>(),
+            vec![7, 8]
+        );
+        assert!(refs.iter().all(|(_, _, ts)| ts.is_some()));
+        let names: Vec<String> = refs
+            .iter()
+            .map(|(_, p, _)| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert!(names.contains(&"exec-a.png".to_string()));
+        assert!(names.contains(&"exec-b.PNG".to_string()));
+        assert!(!names.iter().any(|n| n == "notes.txt" || n == "exec-c.png"));
+    }
+
+    #[test]
+    fn codex_generated_image_refs_reject_traversal_and_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        for bad in ["..", "../x", "a/b", "a\\b", "a\0b", ""] {
+            assert!(
+                read_codex_generated_image_refs_with(tmp.path(), bad, 10, 0).is_empty(),
+                "非法 session_id 必须拒绝: {bad:?}"
+            );
+        }
+        assert!(read_codex_generated_image_refs_with(tmp.path(), UUID, 10, 0).is_empty());
+        let dir = tmp.path().join(".codex/generated_images").join(UUID);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("exec-a.png"), b"a").unwrap();
+        assert!(read_codex_generated_image_refs_with(tmp.path(), UUID, 0, 0).is_empty());
     }
 
     // ==== Kimi（合成 wire 行 + tmp home session_index）====

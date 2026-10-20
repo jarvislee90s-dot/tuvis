@@ -149,6 +149,9 @@ pub(crate) const SENSITIVE_DIRS: &[&str] = &[
 const EXEMPT_SUBPATHS: &[&str] = &[
     ".claude/plans",
     ".codex/plans",
+    // Codex APP 生成图（`~/.codex/generated_images/<thread>/exec-*.png`）是模型
+    // 产物，不是会话/凭据原始数据；不豁免则文件面板可列出但预览必 403。
+    ".codex/generated_images",
     // T7 第三例：kimi 计划文件（深路径，含会话 id 变量段 → 靠尾段序列匹配；
     // 实测样本 `~/.kimi-code/sessions/wd_test_.../session_<uuid>/agents/main/plans/
     // miss-martian-she-hulk-beast.md`）
@@ -625,6 +628,17 @@ pub(crate) fn extract_file_paths_with_env(
                     merger.merge(&path, seq, ts, FileOrigin::User);
                 }
             }
+            if agent_type == "codex" {
+                // APP 生成图落在 `~/.codex/generated_images/<session_id>/exec-*.png`，
+                // 与消息流不同源（无 seq），排到当前窗口之后；进「会话产物」池，
+                // 走既有文件面板 + /session-file 预览，不冒充用户上传。
+                let start = pg.messages.len() as i64;
+                for (seq, path, ts) in super::content::read_codex_generated_image_refs_with(
+                    home, session_id, limit, start,
+                ) {
+                    merger.merge(&path, seq, ts, FileOrigin::SessionArtifact);
+                }
+            }
             // 会话产物兜底（2026-10-13）：正文链接/行内反引号路径，命中既有池跳过；
             // 去重键按会话 cwd 绝对化（工具绝对路径 + 正文相对链接不重复上墙）
             merger.merge_artifact_fallback(
@@ -642,6 +656,19 @@ pub(crate) fn extract_file_paths_with_env(
             // 修法候选（未做）：提取期把相对产物解析为绝对路径随条目带出（展示仍原文）。
             filter_artifacts_by_existence(&mut out, pg.cwd.as_deref(), &|p| p.exists());
             (out, pg.truncated)
+        }
+        // 消息流读不到（APP 会话可能没有 CLI rollout/thread 库）时，生成图仍应
+        // 可用：只扫受控目录，不依赖消息条目；失败仍旧空表。
+        Err(_) if agent_type == "codex" => {
+            let mut merger = EntryMerger::new(cfg!(windows));
+            for (seq, path, ts) in
+                super::content::read_codex_generated_image_refs_with(home, session_id, limit, 0)
+            {
+                merger.merge(&path, seq, ts, FileOrigin::SessionArtifact);
+            }
+            let mut out = merger.finish();
+            filter_artifacts_by_existence(&mut out, None, &|p| p.exists());
+            (out, false)
         }
         Err(_) => (Vec::new(), false),
     }
@@ -1561,6 +1588,36 @@ mod tests {
     /// （黑名单命中但豁免），同工具其余路径（会话/凭据）照拦；段精确不误伤
     /// （`plans-x` 不吃 `plans` 的豁免）。组合判定：sensitive 命中 ∧ 豁免成立
     /// ⇒ 调用方放行（files.rs 主路径的 `&& !exempt` 形态）
+    /// 2026-10-20：消息流读不到时，Codex APP 生成图仍进「会话产物」池，且预览
+    /// 豁免 `.codex/generated_images`（否则列表可见但点击 403）。
+    #[test]
+    fn codex_generated_images_appear_in_file_pool_and_are_previewable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let dir = home.join(".codex/generated_images").join("thread-uuid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("exec-abc.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let (files, truncated) =
+            extract_file_paths_with_env(home, None, None, "codex", "thread-uuid", 200);
+        assert!(!truncated);
+        let hit = files
+            .iter()
+            .find(|f| f.path.ends_with("exec-abc.png"))
+            .unwrap_or_else(|| panic!("生成图必须进文件池：{files:?}"));
+        assert_eq!(hit.origin, FileOrigin::SessionArtifact, "不能冒充用户上传");
+
+        let (bytes, mime) = read_file_safe(
+            tmp.path().to_str().unwrap(),
+            hit.path.as_str(),
+            Some(home.to_str().unwrap()),
+        )
+        .expect("生成的 PNG 预览必须豁免 .codex 敏感目录");
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
+    }
+
     #[test]
     fn exempt_subpaths_allow_plan_artifacts_only() {
         let home = Path::new("/Users/u");
@@ -1568,6 +1625,7 @@ mod tests {
         for p in [
             "/Users/u/.claude/plans/shiny-words.md",
             "/Users/u/.codex/plans/turn-1/018f-uuid/PLAN.md", // 子树嵌套（T0 盘点形态）
+            "/Users/u/.codex/generated_images/01a1433f-b5cb-7450-98c8-ea40acc92288/exec-ad90a013-6d1e-4c38-a545-f3b098378e75.png",
         ] {
             assert!(
                 sensitive_under_home(Path::new(p), home, false),
@@ -1584,6 +1642,7 @@ mod tests {
             "/Users/u/.claude/credentials.yaml",
             "/Users/u/.codex/auth.json",
             "/Users/u/.codex/sessions/2026/09/20/rollout-x.jsonl",
+            "/Users/u/.codex/generated_images-x/a.png", // 段精确：不误伤
         ] {
             assert!(
                 sensitive_under_home(Path::new(p), home, false),
