@@ -1,5 +1,7 @@
 // 移动端 API：纯 fetch，零 Tauri 依赖（PWA/浏览器同构）
 import type { SessionsResponse, TransitionEvent } from "@/types/session";
+// Codex Desktop IPC：SendResult 的 desktop_ipc 分支引用 ActionReceipt（type-only，无运行时环）
+import type { ActionReceipt } from "./codexIpcApi";
 
 /** 带 HTTP 状态的请求失败（status=null 表示网络层异常，无响应可读）。
  *  详情页/预览按 status 分流错误文案（404 → 会话不可读，403 → 文件不可预览）；
@@ -457,11 +459,49 @@ export async function fetchSendInfo(sessionId: string): Promise<SendInfo | null>
  *  处理——中性态，非失败、**不提供重试**，重试 = 双发且 TUI 那份无法撤回）；
  *  queued=运行中留队（itemId+position 供插队/撤回/排队指示）；failed=注入失败回执
  *  （error 文案可直接展示；失败行已退出 pending，队列无残留，重按发送即重试） */
+/** 无头回合回执（与 Rust `inject::headless::receipt::Receipt` 逐字段对应，勿漂移）：
+ *  status ∈ ok|queued|failed|cancelled；stage 是分阶段失败档；可选键缺席即不上线。 */
+export interface HeadlessReceipt {
+  status: "ok" | "queued" | "failed" | "cancelled";
+  sessionId: string;
+  lastAssistant?: string;
+  tokens?: number;
+  durationMs: number;
+  stage?:
+    | "spawn"
+    | "version_gate"
+    | "timeout"
+    | "crash"
+    | "channel_error"
+    | "dialog"
+    | "workspace_busy"
+    /** 投递前拒绝（回合未起跑、零字节投递：串行锁/版本门/PATH 缺失） */
+    | "refused";
+  reason?: string;
+}
+
 export type SendResult =
   | { status: "delivered" }
   | { status: "submitted" }
   | { status: "queued"; itemId: number; position: number }
-  | { status: "failed"; error: string };
+  | { status: "failed"; error: string }
+  /** **兼容无头回执**：`receipt` 是后端归一产物原样透出；与终端四态分列
+   *  （无头回合没有「入队」概念——每回合 spawn）。`actionId` 只在 Codex APP
+   *  兼容分支出现（请求里传的那个原样回显）。 */
+  | {
+      status: "headless";
+      channel?: string;
+      receipt: HeadlessReceipt;
+      visibility?: "realtime" | "after_refresh";
+      visibilityNote?: string;
+      actionId?: string;
+    }
+  /** **Desktop IPC 原生回执**：delivery 分诊——accepted=已受理（不代表 Turn 完成）；
+   *  unknown_delivery=投递结果未知（**绝不自动重试**）；not_sent=零投递（同 actionId
+   *  重试安全）；rejected=明确拒绝。 */
+  | { status: "desktop_ipc"; receipt: ActionReceipt }
+  /** **忙 Thread 留队**：Desktop 忙时普通消息进 codex_actions FIFO，空闲按序自动派发。 */
+  | { status: "codex_queued"; actionId: string; position: number };
 
 /** 发送消息（W4 直发/入队分派，后端按输入态路由；多行原样上行，归一在服务端
  *  入队时一次完成）。非 2xx（400 参数非法 / 404 会话消失 / 403 不可注入）→
@@ -472,14 +512,20 @@ export type SendResult =
 export async function sessionSend(
   sessionId: string,
   text: string,
-  queueOnly?: boolean
+  queueOnly?: boolean,
+  actionId?: string
 ): Promise<SendResult> {
   let r: Response;
   try {
     r = await fetch("/m/api/v1/session-send", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionId, text, ...(queueOnly ? { queueOnly: true } : {}) }),
+      body: JSON.stringify({
+        sessionId,
+        text,
+        ...(queueOnly ? { queueOnly: true } : {}),
+        ...(actionId !== undefined ? { actionId } : {}),
+      }),
     });
   } catch (e) {
     throw new ApiError(

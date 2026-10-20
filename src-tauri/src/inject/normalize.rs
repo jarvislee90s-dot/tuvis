@@ -50,24 +50,37 @@ fn is_strippable_control(c: char) -> bool {
 /// （在 flush 层判就得从 composed 文本反推原始正文，那正是双重判定漂移的来源）。
 ///
 /// 设备花名同样归一：昵称来自手机端用户输入，可能含换行，不得破坏单行不变量。
+///
+/// # 花名不在这里判（2026-10-20 复审 P2 收窄）
+///
+/// 曾有一版在拼接前对花名过「Unicode 字母数字 + 空格 - _ . ·」白名单，拒绝 emoji、
+/// 撇号、冒号、组合音标——它误伤了**所有**终端注入路径与 macOS，而真正的威胁面只有
+/// 「Windows npm 垫片（.cmd/.bat → `cmd /c`）重解析最终命令行」。现约定：
+/// - 本函数只负责归一 + 可选签名，**不因花名拒绝**（斜杠消息照旧裸注入）；
+/// - 真正的最后一道门在**实际派发参数**上：`headless::codex::argv_shim_refusal`
+///   在 spawn 前逐段检查最终 argv（含正文、签名、项目路径），只有 `via_cmd_shim`
+///   形态且载荷确实进 argv 时才拒绝（字符表 = `CMD_SHIM_METACHARS`）。
+/// - 因此签名关闭、Desktop IPC（Named Pipe/Unix socket）、原生 `.exe` 直装等不经过
+///   cmd 重解析面的路径，不会仅因花名含 emoji/撇号/冒号而失败。
 pub fn compose_injection(device_name: &str, text: &str) -> String {
     compose_injection_flagged(device_name, text, true)
 }
 
 /// 带**签名开关**的组装变体（2026-10-05 用户裁决）：`signature=false`（设置
 /// 「远程消息带设备签名」关闭）→ 普通消息也**裸注入**——签名是纯溯源便利，
-/// 每条都吃 token；溯源真源在注入审计页（设备名逐条在账），终端不留痕可接受
-/// （与斜杠命令的裸注入同一裁决口径）。队列存的是 compose 产物 → 开关在入队
-/// 时刻生效（已入队消息维持入队时形态，语义自洽）。
+/// 每条都吃 token；溯源真源在注入审计页（设备名逐条在账，终端不留痕可接受）。
+/// 队列存的是 compose 产物 → 开关在入队时刻生效（已入队消息维持入队时形态）。
 pub fn compose_injection_flagged(device_name: &str, text: &str, signature: bool) -> String {
     let body = normalize_newlines(text);
-    if is_slash_message(text) || !signature {
-        // 裸注入：不加签名（斜杠命令的任何附加文本都会使其失效；签名关闭同理）
+    if is_slash_message(text) {
+        // 裸注入：不加签名（斜杠命令的任何附加文本都会使其失效）
+        return body;
+    }
+    if !signature {
         return body;
     }
     format!("{} [mobile {}]", body, normalize_newlines(device_name))
 }
-
 /// 「远程消息带设备签名」设置的**读取单点**（api.rs 两处 compose 调用共用）：
 /// settings KV `remote_message_signature`，缺省 **off**（2026-10-05 用户裁决——
 /// 默认省 token，想要溯源签名的用户在设置里打开）。**连接注入式**（调用方经
@@ -149,13 +162,19 @@ pub fn strip_mobile_signature(content: &str) -> &str {
     trimmed[..idx].trim_end()
 }
 
-/// 审计摘要（W5：只存摘要不入全文，防审计库膨胀）
+/// **截断核（私有单点）**：超限 → 前 `max_chars` 个字符；未超限 → `None`。
+/// [`summarize`] 与 [`truncate_with_size_marker`] 都只经此切一刀——**不各写一份
+/// `chars().take`**（两份写法改一处漏一处不会编译报错）。
+fn cut_over_limit(text: &str, max_chars: usize) -> Option<String> {
+    (text.chars().count() > max_chars).then(|| text.chars().take(max_chars).collect())
+}
+
+/// 审计摘要（W5：只存摘要不入全文，防审计库膨胀）——超限时以 `…` 收尾
+/// （尾巴即「还有内容」的约定，**不带长度**：审计面不需要，见 [`truncate_with_size_marker`]）。
 pub fn summarize(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_string()
-    } else {
-        let cut: String = text.chars().take(max_chars).collect();
-        format!("{cut}…")
+    match cut_over_limit(text, max_chars) {
+        Some(cut) => format!("{cut}…"),
+        None => text.to_string(),
     }
 }
 
@@ -356,13 +375,31 @@ mod tests {
         assert_eq!(normalize_newlines("a\rb"), "a\\nb");
     }
 
-    /// 设备花名同样归一（用户可设昵称，堵单行不变量缺口）——丁T3 起签名在**尾部**
+    /// 设备花名同样归一（用户可设昵称，堵单行不变量缺口）——丁T3 起签名在**尾部**。
+    ///
+    /// 2026-10-20 复审 P2：组装单点**不再按花名拒绝**（花名安全门收窄到 Windows cmd
+    /// 垫片的真实 argv 边界），故含换行的花名照旧归一成字面 `\n` 后进签名。
     #[test]
     fn compose_normalizes_device_name_too() {
+        // 多字节/空格原样进签名（归一不吞正常字符）
+        assert_eq!(
+            compose_injection("小明的 iPhone", "hi"),
+            "hi [mobile 小明的 iPhone]"
+        );
+        // 换行归一成字面 `\n`（单行不变量仍成立，只是不再拒绝花名）
         assert_eq!(
             compose_injection("iPhone\n15", "hi"),
             "hi [mobile iPhone\\n15]"
         );
+        // emoji / 撇号 / 冒号 / 组合音标原样（不属于 cmd 元字符，交给 argv 边界判）
+        for name in [
+            "小明的手机📱",
+            "Alice's iPhone",
+            "iPhone:工作",
+            "e\u{301}quipe",
+        ] {
+            assert_eq!(compose_injection(name, "hi"), format!("hi [mobile {name}]"));
+        }
     }
 
     /// F7⑩：C0 控制字符滤除——B 族把裸 ESC 当按键吃（M6R F3 实证），正文控制字符

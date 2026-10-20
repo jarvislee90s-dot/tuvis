@@ -81,8 +81,13 @@ import {
 } from "./api";
 import { ChannelBwNote } from "./FilePanel";
 import { etaRemainingText, formatBytes, transferRateBps, type TransferSample } from "./board-logic";
+// Codex APP 原生发送（Desktop IPC）：actionId 生成与回执 DTO
+import { newActionId, type ActionReceipt } from "./codexIpcApi";
 
 interface MessageComposerProps {
+  /** 发送回执触发的队列刷新信号（2026-10-20 复审 P2）：本地队列可见性不依赖
+   *  Desktop 必须产生新帧——queued / desktop_ipc 回执都会让队列视图变化。 */
+  onQueueChanged?: () => void;
   /** 会话（本组件只消费 id；结构化类型，完整 Session 可直接传入） */
   session: { id: string };
 }
@@ -131,6 +136,25 @@ type Receipt =
        *  渲染配色同 gone（中性 slate），避免红 chip 暗示「操作出错」。 */
       kind: "blocked";
       message: string;
+    }
+  | {
+      /** **Desktop IPC 原生回执**（Codex APP）：按 delivery 分诊渲染。
+       *  unknown_delivery 显示「投递结果未知，请在 Desktop 核对」，**无重试语义**
+       *  （S5：不确定结果绝不重试；文本已清空防双投）。 */
+      kind: "codex";
+      receipt: ActionReceipt;
+    }
+  | {
+      /** **兼容通道回执**（Codex APP 兼容发送）：后端 headless 封套原样透出。 */
+      kind: "headless";
+      status: "ok" | "queued" | "failed" | "cancelled";
+      reason?: string;
+    }
+  | {
+      /** **忙 Thread 留队**（宪法 R2.3）：中性回执带队位；队列查看/撤回由
+       *  CodexQueuePanel 承担（本组件不重复渲染队列，也无插队入口）。 */
+      kind: "codexQueued";
+      position: number;
     }
   | null;
 
@@ -231,7 +255,7 @@ function upsertQueueItem(items: QueueItemView[], item: QueueItemView): QueueItem
   return next;
 }
 
-export default function MessageComposer({ session }: MessageComposerProps) {
+export default function MessageComposer({ session, onQueueChanged }: MessageComposerProps) {
   // 可用性：sendInfo=null 且未就绪 → 不渲染（加载中 / 拉取失败 / 403）
   const [sendInfo, setSendInfo] = useState<SendInfo | null>(null);
   const [infoReady, setInfoReady] = useState(false);
@@ -271,6 +295,14 @@ export default function MessageComposer({ session }: MessageComposerProps) {
   // 插队/撤回进行中（与发送互斥，防连点）
   const [busy, setBusy] = useState(false);
   const [receipt, setReceipt] = useState<Receipt>(null);
+  /** **本次用户动作的 actionId**（Codex APP 原生发送的账本锚）。
+   *
+   *  一次用户动作生成一次：用 ref 而非 state——双击在同一渲染帧内会两次进入
+   *  handleSend，state 闭包里的旧值还是 null，两次各生成一个 ID；ref 同步读写，
+   *  第二次点击必然命中第一次写入的同一个 ID（服务端按 actionId 去重 = 不双投）。
+   *  生命周期：明确终态（delivered/submitted/queued/desktop_ipc/headless）即清空；
+   *  unknown_delivery / 网络异常保留（结果未知的核对锚，绝不换 ID 重投）；换会话清空。 */
+  const codexActionIdRef = useRef<string | null>(null);
   /** D8 完整队列表（/session-queue 的 items）：逐条渲染的数据源——不限本端发送
    *  的条目（桌面端/他端排的队同样可见可操作）。乐观行（发送即时反馈/复核保守
    *  恢复）与权威列表（挂载拉取/3s 轮询）都收敛到这里 */
@@ -338,6 +370,8 @@ export default function MessageComposer({ session }: MessageComposerProps) {
     // 换会话即弃修改重发标志（D6）：queueOnlyNext 是上一个会话「修改」的遗愿，
     // 不得泄漏到新会话的首发（保守方向虽无害，语义上仍属错位）
     setQueueOnlyNext(false);
+    // actionId 同理——一次用户动作不跨会话，切换即清（下一条消息是新动作）
+    codexActionIdRef.current = null;
     fetchSendInfo(session.id)
       .then((info) => {
         if (!alive) return;
@@ -528,7 +562,16 @@ export default function MessageComposer({ session }: MessageComposerProps) {
       const forceQueue = queueOnlyNext;
       setQueueOnlyNext(false);
       // 多行原样上行（trim 只用于判空，不改写正文——归一在服务端）
-      const res = await sessionSend(session.id, fullText, forceQueue ? true : undefined);
+      // **actionId**：仅 Codex APP 通道（`headless_codex_*`）携带——Desktop IPC 的
+      // 必填账本锚；同一动作复用（双击防双投）。CLI 与其他工具**不传**（请求体对旧
+      // 合同逐字保持：未修改不带该键）。
+      const needsActionId =
+        sendInfo?.channels?.some((c) => c.startsWith("headless_codex_")) ?? false;
+      const actionId = needsActionId ? (codexActionIdRef.current ?? newActionId()) : undefined;
+      if (actionId !== undefined) {
+        codexActionIdRef.current = actionId;
+      }
+      const res = await sessionSend(session.id, fullText, forceQueue ? true : undefined, actionId);
       if (res.status === "delivered") {
         setText("");
         setAttachments([]);
@@ -562,20 +605,72 @@ export default function MessageComposer({ session }: MessageComposerProps) {
             position: res.position,
           })
         );
+      } else if (res.status === "desktop_ipc") {
+        // **Desktop IPC 原生回执**：accepted = 已受理（≠ Turn 完成）；unknown =
+        // 投递结果未知（保留 actionId + 文本已清空，绝不重试）；not_sent/rejected
+        // = 明确零投递/拒绝——文本保留让用户自行决定（不自动重发）。
+        if (res.receipt.delivery === "accepted") {
+          setText("");
+          setAttachments([]);
+        }
+        // 2026-10-20 复审 P2：Unknown 的「待核对动作」与「下一条新草稿」生命周期
+        // 分离——保留回执里的 actionId 供核对，但**新一次发送必须生成新 ID**，
+        // 不得复用旧 ID 撞 action_conflict，也绝不自动重发。
+        codexActionIdRef.current = null;
+        setReceipt({ kind: "codex", receipt: res.receipt });
+        onQueueChanged?.();
+      } else if (res.status === "codex_queued") {
+        // 忙 Thread 留队：消息已进服务端 FIFO（账本锚 = actionId），由调度循环按序派发
+        setText("");
+        setAttachments([]);
+        codexActionIdRef.current = null;
+        setReceipt({ kind: "codexQueued", position: res.position });
+        onQueueChanged?.();
+      } else if (res.status === "headless") {
+        // 兼容通道回执（每回合 spawn）：ok/queued 即消息已交给 CLI；失败如实展示原因
+        if (res.receipt.status === "ok" || res.receipt.status === "queued") {
+          setText("");
+          setAttachments([]);
+          codexActionIdRef.current = null;
+        }
+        setReceipt({
+          kind: "headless",
+          status: res.receipt.status,
+          reason: res.receipt.reason,
+        });
+        // 2026-10-20 复审 P2：兼容回执（含超时/失败）同样可能留下 Unknown 与
+        // 屏障；revision=null 时没有新帧，必须主动刷新恢复面板，否则用户看不到
+        // 「核对后继续」。
+        onQueueChanged?.();
       } else {
         setReceipt({ kind: "failed", error: formatInvokeError(res.error, i18n.t) });
       }
     } catch (e) {
       if (e instanceof ApiError) {
+        // 2026-10-20 复审 P7：已知 reasonCode 走本地化文案（后端 reason 只有中文，
+        // en 界面不能原样显示）；未知码才回退服务端 reason/错误消息。
+        const code = typeof e.data?.reasonCode === "string" ? e.data.reasonCode : null;
+        const localized =
+          code === "headless_disabled" ? i18n.t("mobile.composer.headlessDisabled") : null;
         const reason = typeof e.data?.reason === "string" ? e.data.reason : null;
-        setReceipt({ kind: "failed", error: reason ?? e.message });
+        setReceipt({ kind: "failed", error: localized ?? reason ?? e.message });
       } else {
         setReceipt({ kind: "failed", error: String(e) });
       }
     } finally {
       setSending(false);
     }
-  }, [text, attachments, sending, busy, sendInfo, session.id, queueOnlyNext, probeCardPresence]);
+  }, [
+    text,
+    attachments,
+    sending,
+    busy,
+    sendInfo,
+    session.id,
+    queueOnlyNext,
+    probeCardPresence,
+    onQueueChanged,
+  ]);
 
   // P2-7 失败对账（插队/撤回/修改共用）：失败后复核 /session-queue——
   // - 条目仍在 pending → 恢复排队视图（刷新队位，行同步更新，「立即发送/修改/撤回」
@@ -948,6 +1043,60 @@ export default function MessageComposer({ session }: MessageComposerProps) {
               className="rounded-full bg-[var(--cb)]/70 px-2 py-0.5 text-xs text-[var(--mut)]"
             >
               {receipt.message}
+            </span>
+          )}
+          {receipt.kind === "codex" && receipt.receipt.delivery === "accepted" && (
+            // 已受理 ≠ Turn 完成（终态以投影为准）——措辞只说「正在执行」
+            <span
+              data-testid="send-receipt-codex-accepted"
+              className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-400"
+            >
+              {i18n.t("mobile.codex.composer.codexAccepted")}
+            </span>
+          )}
+          {receipt.kind === "codex" && receipt.receipt.delivery === "unknown_delivery" && (
+            // S5 红线：结果未知 → 指向 Desktop 核对；**无按钮、无「重试」语义**
+            <span
+              data-testid="send-receipt-codex-unknown"
+              className="rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-400/10 dark:text-amber-400"
+            >
+              {i18n.t("mobile.codex.composer.codexUnknown")}
+            </span>
+          )}
+          {receipt.kind === "codex" &&
+            (receipt.receipt.delivery === "not_sent" ||
+              receipt.receipt.delivery === "rejected") && (
+              <span
+                data-testid="send-receipt-codex-failed"
+                className="rounded-full bg-rose-500/10 px-2 py-0.5 text-xs text-rose-700 dark:bg-rose-400/10 dark:text-rose-400"
+              >
+                {i18n.t("mobile.codex.composer.codexNotDelivered", {
+                  reason: receipt.receipt.reasonCode ?? receipt.receipt.delivery,
+                })}
+              </span>
+            )}
+          {receipt.kind === "codexQueued" && (
+            // 忙 Thread 留队——中性 chip（队列查看/撤回在 CodexQueuePanel）
+            <span
+              data-testid="send-receipt-codex-queued"
+              className="rounded-full bg-[var(--cb)]/70 px-2 py-0.5 text-xs text-[var(--mut)]"
+            >
+              {i18n.t("mobile.codex.composer.codexQueued", { position: receipt.position })}
+            </span>
+          )}
+          {receipt.kind === "headless" && (
+            <span
+              data-testid="send-receipt-headless"
+              data-status={receipt.status}
+              className={
+                receipt.status === "failed" || receipt.status === "cancelled"
+                  ? "rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:bg-amber-400/10 dark:text-amber-400"
+                  : "rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-400"
+              }
+            >
+              {i18n.t(`mobile.codex.composer.headless_${receipt.status}`, {
+                reason: receipt.reason ?? "",
+              })}
             </span>
           )}
         </div>

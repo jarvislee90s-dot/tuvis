@@ -85,7 +85,7 @@ Not just looking — you can **act**: send messages, approve tool calls, answer 
 - **Remote Q&A**: single-choice, multi-select, and free-form answers (including **Other — overwrite & clear**: enter edit, backspace to empty, then type; an empty text is rejected honestly), per-question progression with a confirmation card; multi-select taps only toggle, "next question" advances explicitly (opencode/kimi also support ◀/▶ back and forth) — the phone and the terminal always stay on the same question. **Confirmation-card answers are sourced from the terminal's Review page via screen reading**: after a refresh or page reopen they match the terminal summary exactly; local memory is only a fallback
 - **Permission modes**: kimi's three tiers (`/permission` / `/yolo` / `/auto`) use a **two-step flow** — open the menu, screen-read the highlighted row, only then press Enter — plus a **mode/permission dual read-back** in the status bar (both the switch receipt and the current tier carry screen-read evidence); codex switches via the terminal menu single-select
 - **Guards**: while a dialog is pending, ordinary message injection is blocked (to avoid answering the default by accident); input-line residue is detected to prevent double sends; dangerous keys (such as Ctrl+C, which quits OpenCode) are blacklisted
-- **Write actions on codex desktop APP sessions are refused until the protocol channel lands**: APP sessions have no console, so the keystroke channel cannot reach them. Mode switching / permission menu / Q&A answers / approval responses now return a "work in progress" notice before touching the terminal and point you back to the APP (refusals are audited — see "Injection audit" in Settings). **CLI sessions are unaffected, and read-only features keep working**
+- **Codex desktop APP remote control (experimental, unlocked per exact Desktop build)**: Windows `26.1013.4894.0` supports message projection / sending / status / command approval / Plan blocking Q&A; macOS `26.1013.40934` supports sending / status. `permissions` stays disabled; other builds or unsupported capabilities are refused honestly as "not unlocked / work in progress" — no fake approvals or empty sessions. Codex APP generated images also appear in the file panel as session artifacts. See the capability matrix below.
 
 |                Session detail · messages                |              Send · queue & jump               |
 | :-----------------------------------------------------: | :--------------------------------------------: |
@@ -253,7 +253,7 @@ A settings section under the "Tools & Health Check" block to verify each tool's 
 
 ## Tool Support Matrix
 
-Capabilities across the 12 capability rows × 8 terminal-class AI coding tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported) — this is the master capability table, updated with every release (structured source: [`docs/capabilities.json`](docs/capabilities.json), shared with the website):
+Capabilities across the 13 capability rows × 8 terminal-class AI coding tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported) — this is the master capability table, updated with every release (structured source: [`docs/capabilities.json`](docs/capabilities.json), shared with the website):
 
 | Capability                         | Claude Code | Codex CLI | OpenCode | OpenClaw | Kimi Code    | WorkBuddy | ZCode           | dsh         |
 | ---------------------------------- | ----------- | --------- | -------- | -------- | ------------ | --------- | --------------- | ----------- |
@@ -269,6 +269,9 @@ Capabilities across the 12 capability rows × 8 terminal-class AI coding tools (
 | Mobile · create sessions           | 🧪          | 🧪        | 🧪       | ❌       | 🧪           | ❌        | ❌              | ❌          |
 | Token usage collection             | ✅          | ✅        | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
 | Mobile · sub-agent observatory     | ✅          | ❌        | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
+| Mobile · Codex APP control (Desktop IPC) | ❌    | 🧪        | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
+
+**Codex APP remote control (experimental)**: Codex only, unlocked per exact Desktop build (Windows `26.1013.4894.0`: send/status/command approval/Plan blocking Q&A, `permissions` off; macOS `26.1013.40934`: send/status). Unsupported capabilities are refused honestly — no fake approvals or empty sessions. Codex APP generated images and local images appear in the file panel as session artifacts. Real-phone PRODUCT acceptance is not fully executed yet; see `docs/superpowers/reviews/2026-10-20-codex-app-product-acceptance.md`.
 
 **Mobile remote control (v0.5.0, experimental)**: message viewing and file preview cover 7 of the 8 tools (OpenClaw's black-box build is not remotely readable yet); **sending messages to CLI sessions and creating sessions from your phone are experimental**, currently supporting Claude Code / Codex CLI / OpenCode / Kimi Code. Messages are injected as keystrokes into the terminal and verified by screen-reading receipts (no false "delivered"); queueing, interrupt-and-jump, remote approvals, question answering, permission-mode switching, and session creation are included. See the Chinese README for illustrated walkthroughs and per-tool limitations.
 

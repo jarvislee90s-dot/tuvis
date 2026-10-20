@@ -64,7 +64,11 @@ pub use dao::usage::{
 pub fn init() {
     connection::init();
     if let Ok(conn) = connection::open() {
-        let _ = migration::migrate(&conn);
+        if let Err(e) = migration::migrate(&conn) {
+            // 迁移失败会让新列查询全线报错（如 codex_actions 的屏障列）——
+            // 不能静默：至少留一条可诊断的错误日志。
+            log::error!("数据库迁移失败: {e}");
+        }
     }
     // 种子工具启用行（全部 enabled=1，幂等；缺行视为启用）
     dao::agent_tool::ensure_tool_rows();

@@ -225,6 +225,36 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
             })?;
         }
     }
+    // Codex 动作账本：人工解除屏障标记列——additive 幂等迁移；可空、无默认
+    // （存量行全 NULL = 从未人工解除，无回填需求）。
+    if !column_exists(conn, "codex_actions", "barrier_force_released_at") {
+        conn.execute(
+            "ALTER TABLE codex_actions ADD COLUMN barrier_force_released_at INTEGER",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_CODEX_BARRIER_RELEASE_FAIL: 迁移 codex_actions.barrier_force_released_at 失败: {}",
+                e
+            )
+        })?;
+    }
+    // 签名开关冻结值（2026-10-20 复审）：登记时固定该动作的签名形态，排队期间
+    // 改设置/重启/同 actionId 重试都不改变既定正文。旧行补列后保持 NULL = 升级前
+    // 语义（恒带签名），不误改已完成动作。
+    if !column_exists(conn, "codex_actions", "signature_applied") {
+        conn.execute(
+            "ALTER TABLE codex_actions ADD COLUMN signature_applied INTEGER",
+            [],
+        )
+        .map_err(|e| {
+            format!(
+                "MIGRATE_SIGNATURE_APPLIED_FAIL: 迁移 codex_actions.signature_applied 失败: {}",
+                e
+            )
+        })?;
+    }
+
     // 老库 day_key 空串回填（派生列口径：strftime 不可用于 'YYYY-MM-DDTHH' 形态，用 substr）
     conn.execute(
         "UPDATE usage_detail SET day_key = substr(hour_key, 1, 10) WHERE day_key = ''",
@@ -798,5 +828,59 @@ mod tests {
             cursors, 1,
             "补列不得清空游标（清了会重采，与重建路径的取舍不同）"
         );
+    }
+
+    /// Codex 动作账本：旧结构（**两列都不存在**）经迁移补列（barrier + signature）——
+    /// `barrier_force_released_at` 与 `signature_applied` 都可空、存量行保留 NULL；
+    /// 幂等两遍不报错。
+    #[test]
+    fn migrate_adds_codex_barrier_and_signature_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE codex_actions (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_id TEXT UNIQUE NOT NULL,
+                device_id TEXT NOT NULL,
+                device_name TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                request_key TEXT,
+                context_token TEXT,
+                payload_hash TEXT NOT NULL,
+                client_message_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                route TEXT NOT NULL DEFAULT 'none',
+                queued_text TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                receipt_json TEXT,
+                compat_outstanding INTEGER NOT NULL DEFAULT 0,
+                compat_message_id TEXT,
+                compat_turn_id TEXT,
+                compat_rollout_path TEXT,
+                compat_rollout_baseline INTEGER,
+                compat_wire_hash TEXT
+            );
+            INSERT INTO codex_actions (action_id, device_id, device_name, thread_id, kind,
+                 payload_hash, client_message_id, state, created_at, updated_at, compat_outstanding)
+             VALUES ('legacy-a', 'd', 'iPhone', 't', 'send', 'h', 'cm', 'unknown', 1, 1, 1);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let (flag, ts, signed): (i64, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT compat_outstanding, barrier_force_released_at, signature_applied \
+                 FROM codex_actions WHERE action_id = 'legacy-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (flag, ts, signed),
+            (1, None, None),
+            "存量行保留，两列均为 NULL（旧行签名语义 = 升级前恒签名）"
+        );
+        // 幂等：迁移两遍不报错
+        migrate(&conn).unwrap();
     }
 }

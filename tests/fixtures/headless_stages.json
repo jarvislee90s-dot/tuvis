@@ -1,0 +1,13 @@
+{
+  "_comment": "H 系无头回执 stage 的**跨语言唯一名单**（Task 8 复审追补）：Rust `inject::headless::receipt::Stage` 的 serde snake_case 名必须与它逐项相等（Rust 侧测试钉死）。前端目前没有同名的分诊表，本文件不声称跨语言约束；将来前端加表时再补对账。改名/新增请同时改两处（枚举、本文件）。",
+  "stages": [
+    "spawn",
+    "version_gate",
+    "timeout",
+    "crash",
+    "channel_error",
+    "dialog",
+    "workspace_busy",
+    "refused"
+  ]
+}

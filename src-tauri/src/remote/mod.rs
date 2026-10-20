@@ -5,6 +5,7 @@ pub mod api;
 #[cfg(test)]
 pub mod attachment_fixtures;
 pub mod attachments;
+pub mod codex_ipc;
 pub mod content;
 pub mod events;
 pub mod files;
@@ -47,6 +48,164 @@ pub const KEY_MAX_DEVICES: &str = "remote.max_devices";
 pub const KEY_NAMED_ADDR_LAST: &str = "remote.named_addr_last";
 /// 访问密码键（M5 A2）：4 位数字（validate_pin 唯一口径；A3 端点 / A4 命令消费）
 pub const KEY_ACCESS_PIN: &str = "remote.access_pin";
+
+/// **无头注入总开关键（H3）**：默认关（缺键 = 关），显式开启才放行无头通道；
+/// 值口径与 KEY_ENABLED 同（写侧恒 "true"/"false" 显式两值，读侧只认 "true"）。
+/// 消费方：session-send / session-send-info 的 H3 门（`headless_enabled_conn`）、
+/// `remote_status.headlessEnabled` 下发、设置页「无头注入」开关。
+pub const KEY_HEADLESS: &str = "remote.headless_enabled";
+/// H3 关闭态文案：移动端输入区置灰的原因——send-info 的 reason 原样透出
+pub const HEADLESS_DISABLED_REASON: &str = "无头通道未开启，请在电脑端 Tuvis 设置中开启";
+/// **无头 watchdog 超时键（H4）**：毫秒，默认 [`DEFAULT_HEADLESS_TIMEOUT_MS`]（600000）。
+/// 值口径与其余数值键同：写侧恒十进制字符串、读侧缺键/乱串回默认、越界 clamp
+/// （1_000..=3_600_000，数字单点在 `inject::headless`）。
+pub const KEY_HEADLESS_TIMEOUT_MS: &str = "remote.headless_timeout_ms";
+/// **无头全局并发上限键（H4）**：默认 [`DEFAULT_HEADLESS_CONCURRENCY`]（2），clamp 1..=8。
+/// 超额请求**即时如实回执**（本条未执行、未投递），不静默丢也不阻塞死等。
+pub const KEY_HEADLESS_CONCURRENCY: &str = "remote.headless_concurrency";
+/// watchdog 默认超时（数字单点在 `inject::headless`，此处只做别名导出防两处漂移）
+pub const DEFAULT_HEADLESS_TIMEOUT_MS: u64 = crate::inject::headless::DEFAULT_TIMEOUT_MS;
+/// 全局并发上限默认值（同上）
+pub const DEFAULT_HEADLESS_CONCURRENCY: usize = crate::inject::headless::DEFAULT_CONCURRENCY;
+
+/// 无头超时解析（纯函数）：缺键/乱串 → 默认 600000；越界 → clamp
+pub fn headless_timeout_ms_from(v: Option<&str>) -> u64 {
+    match v.map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
+        Some(n) => crate::inject::headless::clamp_timeout_ms(n),
+        None => DEFAULT_HEADLESS_TIMEOUT_MS,
+    }
+}
+
+/// 无头并发上限解析（纯函数）：缺键/乱串 → 默认 2；越界 → clamp 1..=8
+pub fn headless_concurrency_from(v: Option<&str>) -> usize {
+    match v.map(str::trim).and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) => crate::inject::headless::clamp_concurrency(n),
+        None => DEFAULT_HEADLESS_CONCURRENCY,
+    }
+}
+
+/// 无头超时读取（store 缝版本；runner 启动与状态下发共用）
+pub fn headless_timeout_ms_conn(conn: &rusqlite::Connection) -> u64 {
+    headless_timeout_ms_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_HEADLESS_TIMEOUT_MS).as_deref(),
+    )
+}
+
+/// 无头并发上限读取（store 缝版本；同上）
+pub fn headless_concurrency_conn(conn: &rusqlite::Connection) -> usize {
+    headless_concurrency_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_HEADLESS_CONCURRENCY).as_deref(),
+    )
+}
+
+/// 无头开关解析（纯函数）：仅 `"true"` 为开——缺键（未设置 = 默认关）/
+/// `"false"` / 乱串一律判关（与 KEY_ENABLED 的 `v == "true"` 同口径，不认第二真值）
+pub fn headless_enabled_from(v: Option<&str>) -> bool {
+    v == Some("true")
+}
+
+/// 无头开关读取（**store 缝版本**，两个 H3 门共用）：直用调用方 `DeviceStore.with`
+/// 短临界区传入的 conn（不自取任何锁，锁内只做这一条 SQL + 纯解析）。
+pub fn headless_enabled_conn(conn: &rusqlite::Connection) -> bool {
+    headless_enabled_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_HEADLESS).as_deref(),
+    )
+}
+
+/// **无头状态下发装配（可测缝）**：从注入的连接读开关 + H4 两项配置并写入 status
+/// 载荷——键名与取值口径的唯一落点（H3：开关状态持久化 settings 表并随
+/// `remote_status` 下发；H4：watchdog 超时与并发上限同住，三件套控件同一数据源）。
+pub fn apply_headless_status(st: &mut serde_json::Value, conn: &rusqlite::Connection) {
+    st["headlessEnabled"] = serde_json::json!(headless_enabled_conn(conn));
+    // H4：缺键也上线默认值（前端三件套控件不出现 undefined）
+    st["headlessTimeoutMs"] = serde_json::json!(headless_timeout_ms_conn(conn));
+    st["headlessConcurrency"] = serde_json::json!(headless_concurrency_conn(conn));
+}
+
+/// 无头开关内核（**可测核**；conn 与审计出口以参数注入）
+fn toggle_headless_core(
+    conn: &rusqlite::Connection,
+    enabled: bool,
+    audit: impl FnOnce(&str, &str),
+) {
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_HEADLESS,
+        if enabled { "true" } else { "false" },
+    );
+    audit("headless_toggled", &format!("headless={enabled}"));
+    events::emit_ui(
+        "remote-changed",
+        serde_json::json!({ "headlessEnabled": enabled }),
+    );
+}
+
+/// 无头注入总开关翻转（H3：默认关，显式开启；单一总开关，不做每工具分开关）。
+#[tauri::command]
+pub fn remote_toggle_headless(enabled: bool) -> Result<(), String> {
+    pairing::DeviceStore::global().with(|c| toggle_headless_core(c, enabled, events::audit));
+    Ok(())
+}
+
+/// 无头配置写入内核（**可测核**）：两键 clamp 后落 KV → 审计留痕 → 广播状态变更。
+/// 越界值**收进区间再落库**（runner 侧永不拿到 0/超界）。
+fn set_headless_limits_core(
+    conn: &rusqlite::Connection,
+    timeout_ms: u64,
+    concurrency: usize,
+    audit: impl FnOnce(&str, &str),
+) {
+    let timeout_ms = crate::inject::headless::clamp_timeout_ms(timeout_ms);
+    let concurrency = crate::inject::headless::clamp_concurrency(concurrency);
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_HEADLESS_TIMEOUT_MS,
+        &timeout_ms.to_string(),
+    );
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_HEADLESS_CONCURRENCY,
+        &concurrency.to_string(),
+    );
+    // **改设置即生效**：并发上限立刻落到全局名额（超时是回合属性，下一回合读设置）
+    crate::inject::headless::apply_limits_to(conn, &crate::inject::headless::runner::global_sem());
+    audit(
+        "headless_limits_set",
+        &format!("timeoutMs={timeout_ms} concurrency={concurrency}"),
+    );
+    events::emit_ui(
+        "remote-changed",
+        serde_json::json!({
+            "headlessTimeoutMs": timeout_ms,
+            "headlessConcurrency": concurrency,
+        }),
+    );
+}
+
+/// 无头配置写入（H4：设置页「无头」子区的超时 + 并发上限两件）。越界值不报错、
+/// 按区间 clamp 落库（前端输入框的 min/max 只是提示，后端是唯一口径）。
+#[tauri::command]
+pub fn remote_set_headless_limits(timeout_ms: u64, concurrency: usize) -> Result<(), String> {
+    pairing::DeviceStore::global()
+        .with(|c| set_headless_limits_core(c, timeout_ms, concurrency, events::audit));
+    Ok(())
+}
+
+/// **H4 配置启动装配**（`lib.rs` setup 调用一次）：把设置里的超时/并发落到运行期——
+/// 并发上限写进全局名额（`headless::runner::global_sem`），runner 每回合读超时。
+pub fn init_headless_limits() {
+    pairing::DeviceStore::global().with(|c| {
+        let limits = crate::inject::headless::apply_limits_to(
+            c,
+            &crate::inject::headless::runner::global_sem(),
+        );
+        log::info!(
+            "无头配置装配：watchdog={}ms 并发上限={}",
+            limits.timeout_ms,
+            limits.concurrency
+        );
+    });
+}
 
 /// 上限解析（纯函数）：None/乱串 → 10（M5 A5 用户裁决：默认 3 → 10；已存值不迁移）；
 /// clamp 1..=10 不变
@@ -310,6 +469,12 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
             }
         }),
         store: pairing::DeviceStore::global(),
+        // Codex Desktop IPC 控制面：生产 hub——全局 DeviceStore 上的 ActionStore +
+        // AdapterDispatch + 生产 adapter（endpoint/Desktop build 门按本机事实判定；
+        // 未识别 build → 能力全关）。调度循环只在 remote 开启时装配。
+        codex_control: std::sync::Arc::new(codex_ipc::CodexControlHub::production(
+            pairing::DeviceStore::Global,
+        )),
         // M7 Task 5（方案 A）：注入器生产装配——消费方 flush_one / session-send 直发；
         // Task 6 已接线：api_router 注册 session-send 等路由 + serve() 挂 spawn_flush_loop
         injector: std::sync::Arc::new(crate::inject::engine::RealInjector),
@@ -786,6 +951,7 @@ fn stop_server_with(revoke: bool, stop_channels: impl FnOnce()) {
     let handle = SERVER_HANDLE.lock().unwrap().take();
     let st_reg = STATE.clone();
     let st_store = STATE.clone();
+    let st_hub = STATE.clone();
     stop_server_core(
         handle,
         revoke,
@@ -799,6 +965,9 @@ fn stop_server_with(revoke: bool, stop_channels: impl FnOnce()) {
         // M4 T3：电源锁随远程关闭释放（caffeinate kill / 执行状态清除 + 磁盘代设还原）
         power::release,
     );
+    // Codex Desktop IPC：停掉 hub 调度循环（不订阅/不调度未派发项）。已派发任务
+    // （IPC 在途 RPC / detached 兜底回合）不取消——留至落账或 unknown。
+    st_hub.codex_control.stop();
 }
 
 /// 停止远程服务（通用停机）：revoke 按调用方语义 + 对外通道全停（M5 A5 双隧道
@@ -1020,6 +1189,9 @@ pub fn remote_status() -> serde_json::Value {
     st["enabled"] = serde_json::json!(enabled);
     // 设备上限（线稿「已接入设备 N / 上限」徽标；KV 可改，未设置默认 10——决策 #17）
     st["maxDevices"] = serde_json::json!(max_devices_from_kv());
+    // H3/H4：无头注入总开关 + watchdog 超时 + 并发上限（设置页初值 + 移动端置灰判据；
+    // 缺键 = 默认关 / 600000ms / 2）。经可测缝 apply_headless_status（与门同一条读取路径）
+    pairing::DeviceStore::global().with(|c| apply_headless_status(&mut st, c));
     // M5 A5：通道开关（read_channels 含惰性迁移）+ 隧道双通道快照 + tailscale 快照
     let chans = read_channels();
     let tun = tunnel::snapshot();

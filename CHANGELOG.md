@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 [English](CHANGELOG.en.md) · 中文
 
@@ -7,6 +7,45 @@
      分区顺序逐条对齐（分区名如「工程」对应英文版 `Engineering`）。未译条目只在中文版
      存在；新增版本时两份文件同批更新（发版文档纪律见 docs/RELEASE.md）。
      网站（tuvis-website）构建时按双源同步：本文件 → 中文站，CHANGELOG.en.md → 英文站。 -->
+
+## [Unreleased]
+
+### Added
+
+- **Codex APP 远程控制（实验性，按 Desktop build 精确解锁）**：桌面 APP 会话可在手机端
+  查看消息投影与运行状态、发送消息/排队、批准或拒绝 command 审批、回答 Plan 阻塞问答；
+  Desktop 缺席且 H3 开启时走兼容 exec，H3 关闭时如实拒绝。Windows `26.1013.4894.0` 解锁
+  发送/状态/command 审批/Plan 问答，macOS `26.1013.40934` 解锁发送/状态；permissions
+  保持关闭，其他 build 不宣称支持（PR #171）。
+- **Codex 生成图进入文件面板**：`~/.codex/generated_images/<threadId>/` 下的 Codex APP
+  生成图以「会话产物」入池，与普通产物同一预览链路（`60beea0c` / PR #171）。
+- **Codex 文件池新增 `event_msg.local_images` 用户图片抽取源**，用户上传/引用的本地图片
+  可进入文件池（#69）。
+
+### Changed
+
+- **子 Agent 完成回报提醒开关扩展到 codex / kimi / opencode**（#152）。
+- **Codex APP 消息签名默认关闭**：该开关默认关闭时，Codex APP 路径默认不带
+  `[mobile 花名]` 来源标记；需要时在电脑端「消息签名」中开启，幂等 actionId 语义不变。
+- **用量展示按 locale 格式化**：英文界面使用 K/M/B、min/s/ms，不再混用中文数字格式。
+
+### Fixed
+
+- **ZCode 未结算后台工作不再误判完成**：后台工作未结算时不会提前转绿；合成通知消息不参与
+  状态判定与预览（#61 Task 3/4、PR #169）。
+- **Codex 文件池 seq 对齐消息条目**：避免文件排序错位（PR #168）。
+- **子 Agent 提醒 / 看板 / 预设修复**：PR #167 收口；看板父卡子代理徽标同源重算（#134）；
+  子 Agent 级预设入口恢复并区分空态/不支持态（#66）。
+- **Codex 问答取消放开 Esc 中断**并标注破坏性文案（#80、PR #166）。
+- **远程接入加固**：转义 ingress hostname 可正确解析；saveToken 增加 busy guard；named
+  parser 配置行优先级与字符集加固。
+
+### 工程
+
+- CHANGELOG 中英拆分并回填 v0.5.6–v0.5.8 英文条目；能力矩阵补 `nameEn`；英文用户手册
+  补齐剩余 7 章；OpenClaw 矩阵单元格按实测修正。
+- 官网通知触发器 paths 补 `CHANGELOG.en.md`；v0.5.8 以来（不含 PR #171）变更统计见
+  `docs/superpowers/reviews/2026-10-20-post-0.5.8-change-inventory.md`。
 
 ## [0.5.8] - 2026-10-16
 

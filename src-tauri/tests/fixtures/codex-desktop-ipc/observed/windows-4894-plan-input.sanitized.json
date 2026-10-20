@@ -1,0 +1,63 @@
+{
+  "_source": "2026-10-19 Windows 26.1013.4894.0 实机 thread-follower-submit-user-input（ID/正文已占位化）",
+  "pendingRequest": {
+    "method": "item/tool/requestUserInput",
+    "id": 56,
+    "params": {
+      "threadId": "00000000-0000-4000-8000-000000000001",
+      "turnId": "00000000-0000-4000-8000-000000000002",
+      "itemId": "call_000000000003",
+      "questions": [
+        {
+          "id": "archive_method",
+          "header": "选择归档方式",
+          "question": "你希望按哪种方式把桌面文件按月份归档？",
+          "isOther": true,
+          "isSecret": false,
+          "options": [
+            {
+              "label": "按文件修改日期（推荐）",
+              "description": "创建“桌面\\YYYY-MM”文件夹，并按文件最后修改月份移动文件，规则直观稳定。"
+            },
+            {
+              "label": "按文件创建日期",
+              "description": "创建“桌面\\YYYY-MM”文件夹，并按文件创建月份移动文件，更接近文件最初产生时间。"
+            }
+          ]
+        }
+      ],
+      "isBlocking": true,
+      "autoResolutionMs": null
+    }
+  },
+  "request": {
+    "type": "request",
+    "requestId": "00000000-0000-4000-8000-000000000004",
+    "method": "thread-follower-submit-user-input",
+    "params": {
+      "conversationId": "00000000-0000-4000-8000-000000000001",
+      "requestId": 56,
+      "response": {
+        "answers": {
+          "archive_method": {
+            "answers": [
+              "按文件修改日期（推荐）"
+            ]
+          }
+        }
+      }
+    },
+    "version": 1,
+    "targetClientId": "00000000-0000-4000-8000-000000000005"
+  },
+  "response": {
+    "type": "response",
+    "requestId": "00000000-0000-4000-8000-000000000004",
+    "resultType": "success",
+    "method": "thread-follower-submit-user-input",
+    "handledByClientId": "00000000-0000-4000-8000-000000000005",
+    "result": {
+      "ok": true
+    }
+  }
+}

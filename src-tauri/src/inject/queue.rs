@@ -169,6 +169,31 @@ pub(crate) fn try_flush_with(
     if is_running(&session.status) && !jump {
         return FlushOutcome::Deferred;
     }
+    // ===== 无头**投递侧重判**（缺口收口点）=====
+    //
+    // 入队**之后**才变成无头绑定的条目（例如 Codex APP 会话在入队后 Desktop 打开、
+    // 会话形态变为 APP 托管）绝不能经终端注入器投递：无头回合由端点在兼容通道里
+    // 每回合 spawn，本循环既没有无头执行器，照投即「把正文打进一个不是终端宿主的 pid」。
+    //
+    // 判据**只从路由结论派生**（`routing::headless_kind_of`——不另立工具/形态表），
+    // 命中即 [`FlushOutcome::Deferred`]：**不投递、不消费队首**（行保持 pending，
+    // 等总开关开启后端点真分派，或会话回归终端通道）。
+    let headless_bound = crate::inject::routing::headless_kind_of(&crate::inject::routing::route(
+        session.agent_type.tool_id(),
+        session.form,
+        session.pid,
+        std::env::consts::OS,
+    ))
+    .is_some();
+    if headless_bound {
+        log::debug!(
+            "投递侧重判：会话 {} 已归无头通道（工具 {}，pid {}）——本轮不投递不消费队首",
+            item.session_id,
+            item.agent_type,
+            session.pid
+        );
+        return FlushOutcome::Deferred;
+    }
     let spec = crate::inject::families::family_for(&item.agent_type)
         .unwrap_or(crate::inject::families::FALLBACK_SPEC);
     let confirm_timeout = confirm_timeout_override.unwrap_or(spec.confirm_timeout_ms);
@@ -1146,6 +1171,8 @@ mod tests {
             create_hub: std::sync::Arc::new(crate::remote::server::CreateTaskHub::stub()),
             archive_source: Box::new(Vec::new),
             archive_delete: std::sync::Arc::new(|_: Option<&str>| 0usize),
+            // Codex Desktop IPC：fixture 显式 disabled hub（一切能力关闭）
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         }
     }
 

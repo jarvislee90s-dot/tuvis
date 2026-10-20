@@ -16,6 +16,12 @@ export type RemoteStatus = {
   // ——A6 本机名称输入框的默认值来源
   host?: { name: string; platform?: string; version?: string; bootId?: string };
   enabledTools?: string[];
+  /** H3 无头注入总开关（缺键 = 关；后端是唯一数据源） */
+  headlessEnabled?: boolean;
+  /** H4 watchdog 超时（毫秒；缺键 = 600000） */
+  headlessTimeoutMs?: number;
+  /** H4 全局并发上限（缺键 = 2） */
+  headlessConcurrency?: number;
 };
 
 // M5 A5 四通道状态载荷（Rust 端 channels_payload 注释即唯一契约）：
@@ -76,6 +82,14 @@ export async function remoteToggle(enabled: boolean): Promise<void> {
 // 绑定需先确认已配置 TLS 反向代理」），前端据此弹确认 Dialog；幂等（重复同向调用 no-op）
 export async function toggleChannel(channel: string, on: boolean): Promise<void> {
   return await invoke("remote_toggle_channel", { channel, on });
+}
+/** H3 无头注入总开关（默认关）：后端写 KV + 审计 + 广播 remote-changed。 */
+export async function toggleHeadless(enabled: boolean): Promise<void> {
+  return await invoke("remote_toggle_headless", { enabled });
+}
+/** H4 无头配置：watchdog 超时 + 全局并发上限（越界值后端 clamp 后落库）。 */
+export async function setHeadlessLimits(timeoutMs: number, concurrency: number): Promise<void> {
+  return await invoke("remote_set_headless_limits", { timeoutMs, concurrency });
 }
 // 设置访问密码（M5 A4）：首次只落库；改值 = 全部设备吊销 + 断连；非法 PIN Err
 export async function setPin(pin: string): Promise<void> {

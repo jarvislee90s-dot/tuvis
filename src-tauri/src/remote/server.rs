@@ -601,6 +601,12 @@ pub struct RemoteState {
     /// 空表 = 一切工具 supported:false（测试缺省）
     pub subagent_message_source:
         std::collections::HashMap<&'static str, Box<SubagentMessageSourceFn>>,
+    /// **Codex Desktop IPC 控制面字段束**：router（持久动作账本 + FIFO + 安全路由）+
+    /// DesktopIpcAdapter（投影/写入）+ 事件与生命周期。测试 fixture 一律
+    /// [`crate::remote::codex_ipc::CodexControlHub::disabled_arc`]（一切能力关闭、恒
+    /// CompatOnly/拒绝、不装配调度循环）；生产 = `remote/mod.rs` STATE 的
+    /// [`crate::remote::codex_ipc::CodexControlHub::production`]。
+    pub codex_control: std::sync::Arc<super::codex_ipc::CodexControlHub>,
 }
 
 /// API 子路由：业务端点 + /pair/pin + 内层 fallback（未知 API 路径直接 403）+ gate 内层 layer。
@@ -644,6 +650,27 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         .route("/session-queue", get(api::session_queue))
         .route("/session-queue/jump", post(api::session_queue_jump))
         .route("/session-queue/retract", post(api::session_queue_retract))
+        // Codex Desktop IPC 远程控制：原生投影 / SSE / 动作查询 / 队列查看撤回 /
+        // 原生审批与阻塞问答应答。**全部走既有 gated nest**——PIN 门禁内层 gate
+        // 结构性覆盖，新端点不需要各自鉴权代码；所有响应 no-store。
+        .route("/codex/thread", get(super::codex_ipc::thread_state))
+        .route("/codex/thread/events", get(super::codex_ipc::thread_events))
+        .route("/codex/action", get(super::codex_ipc::action_status))
+        .route("/codex/queue", get(super::codex_ipc::queue_view))
+        .route(
+            "/codex/queue/retract",
+            post(super::codex_ipc::queue_retract),
+        )
+        // 人工解除「无出口保守屏障」（桌面端核对后）：只解除对应屏障，不重发原动作
+        .route(
+            "/codex/queue/force-continue",
+            post(super::codex_ipc::queue_force_continue),
+        )
+        // 原生审批/阻塞问答应答（绑定 thread + requestId + current owner）
+        .route(
+            "/codex/pending-response",
+            post(super::codex_ipc::pending_response),
+        )
         // M8 Task 11：审批端点（红卡一键批准/拒绝——选项可用性 + 按键应答；PIN 门禁
         // 内层 gate 结构性覆盖，新端点不需要各自鉴权代码）
         .route(
@@ -755,6 +782,9 @@ pub async fn serve(bind: &str, port: u16, state: Arc<RemoteState>) -> Result<(),
     // 会话回到可输入态时逐条投递该会话的待发队列；与 session-send 直发共用
     // in-flight 守卫（同会话并发双投防护）
     crate::inject::queue::spawn_flush_loop(state.clone());
+    // Codex Desktop IPC：装配调度循环（启动恢复 + 周期对账 + 事件接力）。
+    // disabled hub（测试夹具）短路；stop（remote 关闭/热重启）后不再订阅/调度。
+    state.codex_control.start(state.clone());
     // M5 A3：来源 IP 记录——into_make_service_with_connect_info 注入 ConnectInfo
     // extension。**消费方只有 pair_pin**（限速分桶键 + 落库来源），且**不参与放行判定**
     // （不变量 G1：来源地址/请求头/进程归属不得影响鉴权；原 gate 本机豁免已整块删除，
@@ -836,6 +866,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -1482,6 +1514,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         // 预置有效设备，令 gate 放行（否则不会走到 session_source，测试失去意义）
         let now = chrono::Utc::now().timestamp_millis();
@@ -1878,6 +1912,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         let app = router(state.clone());
         let now = chrono::Utc::now().timestamp_millis();
@@ -2019,6 +2055,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         let app = router(state.clone());
         let now = chrono::Utc::now().timestamp_millis();
@@ -2219,6 +2257,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         let app = router(state.clone());
         persist_device(&state, "fe");
@@ -2507,6 +2547,8 @@ mod tests {
             }),
             // C7：配对计数缝缺省空表（本用例不触配对打标）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         let app = router(state.clone());
         persist_device(&state, "fe");
@@ -2689,6 +2731,8 @@ mod tests {
                 home_source: Box::new(|| None),
                 // C7：配对计数缝缺省空表（A3 用例不触配对打标）
                 pairing_counter: Box::new(Vec::new),
+
+                codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
             }),
             t,
         )
@@ -3904,6 +3948,8 @@ mod tests {
                     home_source: Box::new(|| None),
                     // C7：配对计数缝缺省空表（限速用例不触配对打标）
                     pairing_counter: Box::new(Vec::new),
+
+                    codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
                 }),
                 t,
             )
@@ -4256,6 +4302,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -4499,6 +4547,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -6665,6 +6715,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -7701,6 +7753,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         persist_named_device(&state, "mm", "测试设备");
         (state, inner, script)
@@ -10914,6 +10968,8 @@ mod tests {
             home_source: Box::new(move || home.as_ref().map(|p| p.to_string_lossy().to_string())),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -12041,6 +12097,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -12323,6 +12381,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         persist_named_device(&state2, "mm", "测试设备");
         let app = router(state2.clone());
@@ -12806,6 +12866,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         (state, sid_out)
     }
@@ -12861,6 +12923,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         (state, sid_out)
     }
@@ -12946,6 +13010,8 @@ mod tests {
             home_source: Box::new(|| None),
             // C7：配对计数缝缺省空表（既有用例零影响；配对打标/提示用例就地覆盖）
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         });
         (state, sid_out)
     }
@@ -14266,6 +14332,8 @@ mod tests {
             ui_config_source: Box::new(|| None),
             subagent_source: std::collections::HashMap::new(),
             subagent_message_source: std::collections::HashMap::new(),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -15230,6 +15298,8 @@ mod tests {
             rate_bucket_channels_source: Box::new(Vec::new),
             home_source: Box::new(|| None),
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 
@@ -15391,6 +15461,8 @@ mod tests {
             rate_bucket_channels_source: Box::new(Vec::new),
             home_source: Box::new(|| None),
             pairing_counter: Box::new(Vec::new),
+
+            codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
         })
     }
 

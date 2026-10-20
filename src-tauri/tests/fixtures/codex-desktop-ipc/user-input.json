@@ -1,0 +1,51 @@
+{
+  "_source": "CODE + SYNTHETIC：blocking item/tool/requestUserInput 请求项（Mac default mode 实测 NOT_TRIGGERED，结构来自 CODE；request id 字符串形态为 SYNTHETIC——Mac 实测 requestId 为整数 12/18，字符串样本验证 n:/s: 无损契约）",
+  "id": "req-str-9007199254740993",
+  "method": "item/tool/requestUserInput",
+  "params": {
+    "threadId": "00000000-0000-4000-8000-0000000000m1",
+    "turnId": "00000000-0000-4000-8000-0000000000tu2",
+    "itemId": "00000000-0000-4000-8000-0000000000it2",
+    "isBlocking": true,
+    "questions": [
+      {
+        "id": "q-1",
+        "header": "方案选择",
+        "question": "使用哪种探测选项？",
+        "isOther": true,
+        "isSecret": false,
+        "options": [
+          { "label": "alpha", "description": "合成：方案 A" },
+          { "label": "beta", "description": "合成：方案 B" }
+        ]
+      },
+      {
+        "id": "q-2",
+        "header": "凭据",
+        "question": "输入访问口令（不落审计）",
+        "isOther": true,
+        "isSecret": true,
+        "options": []
+      }
+    ]
+  },
+  "_decision_surface": {
+    "method": "thread-follower-submit-user-input",
+    "version": 1,
+    "params": {
+      "conversationId": "<threadId>",
+      "requestId": "req-str-9007199254740993",
+      "response": {
+        "answers": {
+          "q-1": { "answers": ["alpha"] },
+          "q-2": { "answers": ["<自由文本>"] }
+        }
+      }
+    }
+  },
+  "_notes": [
+    "只处理 blocking pending；答案以原问题 ID 为键，不按显示顺序当 ID。",
+    "isOther=false 禁止任意文本；isSecret=true 的回答不入审计/日志/错误文本。",
+    "Default 模式的 async 问题是一条消息（delivery:\"async\" 的 AgentMessage），不是 pending request，绝不渲染阻塞卡。"
+  ]
+}

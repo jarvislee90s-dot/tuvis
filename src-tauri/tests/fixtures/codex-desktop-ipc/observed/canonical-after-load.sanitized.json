@@ -1,0 +1,317 @@
+{
+  "type": "snapshot",
+  "revision": 4,
+  "conversationState": {
+    "turns": [],
+    "threadRuntimeStatus": {
+      "type": "idle"
+    },
+    "requests": [],
+    "turnHistory": {
+      "kind": "canonical",
+      "history": {
+        "generation": 0,
+        "isComplete": true,
+        "entitiesByKey": {
+          "turn:00000000-0000-4000-8000-000000000002": {
+            "params": {
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user 1",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-000000000001"
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-000000000002",
+            "rootTurnId": "00000000-0000-4000-8000-000000000002",
+            "turnStartedAtMs": 1792251473000,
+            "durationMs": 112317,
+            "finalAssistantStartedAtMs": 1792251585000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-000000000003",
+                "clientId": "00000000-0000-4000-8000-000000000001",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 1",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "agentMessage",
+                "id": "00000000-0000-4000-8000-000000000004",
+                "text": "Synthetic reply 1",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "00000000-0000-4000-8000-000000000004"
+            }
+          },
+          "turn:00000000-0000-4000-8000-000000000006": {
+            "params": {
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user 2",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-000000000005"
+            },
+            "permissionParamsSource": "<redacted>",
+            "turnId": "00000000-0000-4000-8000-000000000006",
+            "rootTurnId": "00000000-0000-4000-8000-000000000006",
+            "turnStartedAtMs": 1792254019000,
+            "durationMs": 3384,
+            "finalAssistantStartedAtMs": 1792254023000,
+            "status": "completed",
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-000000000007",
+                "clientId": "00000000-0000-4000-8000-000000000005",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 2",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "type": "reasoning",
+                "id": "00000000-0000-4000-8000-000000000008",
+                "summary": [],
+                "content": []
+              },
+              {
+                "type": "agentMessage",
+                "id": "00000000-0000-4000-8000-000000000009",
+                "text": "Synthetic reply 2",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "itemsPagination": {
+              "olderCursor": null,
+              "isLoadingOlder": false,
+              "hasLoadedOldest": true,
+              "newestSnapshotItemId": "00000000-0000-4000-8000-000000000009"
+            }
+          },
+          "tail:0:local:00000000-0000-4000-8000-000000000021": {
+            "params": {
+              "input": [
+                {
+                  "type": "text",
+                  "text": "Synthetic user 3",
+                  "text_elements": []
+                }
+              ],
+              "clientUserMessageId": "00000000-0000-4000-8000-000000000010"
+            },
+            "requestedReasoningEffort": "<redacted>",
+            "localMetadata": {
+              "fileAttachmentCount": 0
+            },
+            "mcpAppModelContextAttachments": [],
+            "turnId": "00000000-0000-4000-8000-000000000011",
+            "status": "completed",
+            "turnStartedAtMs": 1792333499955,
+            "durationMs": 100949,
+            "finalAssistantStartedAtMs": 1792333600856,
+            "error": null,
+            "diff": null,
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "00000000-0000-4000-8000-000000000012",
+                "clientId": "00000000-0000-4000-8000-000000000010",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Synthetic user 3",
+                    "text_elements": []
+                  }
+                ]
+              },
+              {
+                "id": "00000000-0000-4000-8000-000000000013",
+                "type": "error",
+                "message": "<redacted>",
+                "willRetry": true,
+                "errorInfo": {
+                  "responseStreamDisconnected": {
+                    "httpStatusCode": null
+                  }
+                },
+                "additionalDetails": "<redacted>"
+              },
+              {
+                "id": "00000000-0000-4000-8000-000000000014",
+                "type": "error",
+                "message": "<redacted>",
+                "willRetry": true,
+                "errorInfo": {
+                  "responseStreamDisconnected": {
+                    "httpStatusCode": null
+                  }
+                },
+                "additionalDetails": "<redacted>"
+              },
+              {
+                "id": "00000000-0000-4000-8000-000000000015",
+                "type": "error",
+                "message": "<redacted>",
+                "willRetry": true,
+                "errorInfo": {
+                  "responseStreamDisconnected": {
+                    "httpStatusCode": null
+                  }
+                },
+                "additionalDetails": "<redacted>"
+              },
+              {
+                "id": "00000000-0000-4000-8000-000000000016",
+                "type": "error",
+                "message": "<redacted>",
+                "willRetry": true,
+                "errorInfo": {
+                  "responseStreamDisconnected": {
+                    "httpStatusCode": null
+                  }
+                },
+                "additionalDetails": "<redacted>"
+              },
+              {
+                "type": "agentMessage",
+                "id": "00000000-0000-4000-8000-000000000017",
+                "text": "Synthetic reply 3",
+                "phase": "final_answer",
+                "memoryCitation": null,
+                "delivery": null,
+                "questions": null
+              }
+            ],
+            "rootTurnId": "00000000-0000-4000-8000-000000000011",
+            "hookRuns": [
+              {
+                "id": "00000000-0000-4000-8000-000000000018",
+                "run": {
+                  "id": "00000000-0000-4000-8000-000000000018",
+                  "eventName": "<redacted>",
+                  "handlerType": "<redacted>",
+                  "executionMode": "<redacted>",
+                  "scope": "thread",
+                  "sourcePath": "<redacted>",
+                  "source": "user",
+                  "displayOrder": 3,
+                  "status": "completed",
+                  "statusMessage": null,
+                  "startedAt": 1792333501,
+                  "completedAt": 1792333501,
+                  "durationMs": 34,
+                  "entries": []
+                }
+              },
+              {
+                "id": "00000000-0000-4000-8000-000000000019",
+                "run": {
+                  "id": "00000000-0000-4000-8000-000000000019",
+                  "eventName": "<redacted>",
+                  "handlerType": "<redacted>",
+                  "executionMode": "<redacted>",
+                  "scope": "turn",
+                  "sourcePath": "<redacted>",
+                  "source": "user",
+                  "displayOrder": 5,
+                  "status": "completed",
+                  "statusMessage": null,
+                  "startedAt": 1792333501,
+                  "completedAt": 1792333501,
+                  "durationMs": 27,
+                  "entries": []
+                }
+              },
+              {
+                "id": "00000000-0000-4000-8000-000000000020",
+                "run": {
+                  "id": "00000000-0000-4000-8000-000000000020",
+                  "eventName": "<redacted>",
+                  "handlerType": "<redacted>",
+                  "executionMode": "<redacted>",
+                  "scope": "turn",
+                  "sourcePath": "<redacted>",
+                  "source": "user",
+                  "displayOrder": 6,
+                  "status": "completed",
+                  "statusMessage": null,
+                  "startedAt": 1792333600,
+                  "completedAt": 1792333600,
+                  "durationMs": 27,
+                  "entries": []
+                }
+              }
+            ],
+            "aeonAssistantMessageStartedAtMsById": {
+              "msg_00f786b4c8cafacc016ad4d72036808193a73890e9a76a2fcc": 1792333600856
+            },
+            "firstTurnWorkItemStartedAtMs": 1792333600859,
+            "agentMessageCompletedAtMsById": {
+              "msg_00f786b4c8cafacc016ad4d72036808193a73890e9a76a2fcc": 1792333600915
+            },
+            "automationKind": null,
+            "automationNotificationDecision": null
+          }
+        },
+        "islands": [
+          {
+            "id": "00000000-0000-4000-8000-000000000022",
+            "entries": [
+              {
+                "key": "turn:00000000-0000-4000-8000-000000000002",
+                "value": "turn:00000000-0000-4000-8000-000000000002"
+              },
+              {
+                "key": "turn:00000000-0000-4000-8000-000000000006",
+                "value": "turn:00000000-0000-4000-8000-000000000006"
+              },
+              {
+                "key": "tail:0:local:00000000-0000-4000-8000-000000000021",
+                "value": "tail:0:local:00000000-0000-4000-8000-000000000021"
+              }
+            ],
+            "olderBoundary": {
+              "status": "exhausted",
+              "boundaryId": "00000000-0000-4000-8000-000000000023"
+            },
+            "newerBoundary": {
+              "status": "exhausted",
+              "boundaryId": "00000000-0000-4000-8000-000000000024"
+            }
+          }
+        ]
+      }
+    }
+  }
+}
