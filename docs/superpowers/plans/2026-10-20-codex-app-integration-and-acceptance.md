@@ -330,10 +330,10 @@ Mac 正常 GUI/Finder 启动另列启动子格：核实该 Tuvis 实际 PATH；�
 
 **前提：**新交付 PR 已合入 main；不在整合尚未定案时重写原来源分支。
 
-- [x] 保存原 #117 head 的本地可恢复备份分支，建议 `codex/backup-pr117-20261020`，记录完整 SHA；不删除旧分支，不 force-push。
-- [x] 从新 main 建 `codex/headless-remaining`，按 Task 2 来源清单重放剩余工具与其他剩余增量。混合提交按 hunk 分离；不能简单 rebase 整条旧历史或只凭 commit hash/patch-id 自动认定重复已去除。
-- [x] 对每个原 hunk 明确“已由新 main 交付／续作保留／因 main 等价变化不再需要”及其依据。未交付的 ZCode/dsh/WB、其他 CLI、旧 Codex 控制与不相关修正有明确去向，不静默丢失。
-- [x] 做必要接口对齐，使剩余代码建立在已抽出的底座上；不把公共底座和本轮 Codex 再次重复引入，不承诺本阶段把其他工具修好或合入。
+- [ ] 保存原 #117 head 的本地可恢复备份分支，建议 `codex/backup-pr117-20261020`，记录完整 SHA；不删除旧分支，不 force-push。
+- [ ] 从新 main 建 `codex/headless-remaining`，按 Task 2 来源清单重放剩余工具与其他剩余增量。混合提交按 hunk 分离；不能简单 rebase 整条旧历史或只凭 commit hash/patch-id 自动认定重复已去除。
+- [ ] 对每个原 hunk 明确“已由新 main 交付／续作保留／因 main 等价变化不再需要”及其依据。未交付的 ZCode/dsh/WB、其他 CLI、旧 Codex 控制与不相关修正有明确去向，不静默丢失。
+- [ ] 做必要接口对齐，使剩余代码建立在已抽出的底座上；不把公共底座和本轮 Codex 再次重复引入，不承诺本阶段把其他工具修好或合入。
 - [ ] 运行剩余分支的编译与相关测试，记录真实失败和未验能力。若其他工具仍失败，报告位置及来源，不能为绿色删除实现或把产品状态写可用。
 - [ ] 产出 `docs/superpowers/reviews/2026-10-20-pr117-remainder-handoff.md`，记录备份、续作、来源对应、接口变化、检查和下一次入口；旧 PR 后续是否更新/关闭由具体续作安排决定，本计划不要求覆盖旧远端历史。
 
@@ -375,3 +375,18 @@ Mac 正常 GUI/Finder 启动另列启动子格：核实该 Tuvis 实际 PATH；�
 - Task 11：PR 在独立复审与修复后创建；本阶段不打 tag、不发版。
 - Task 12：续作 handoff 已入库（`2026-10-20-codex-app-remaining-handoff.md`）；#117/#165 原分支保留。
 - PR：https://github.com/jarvislee90s-dot/tuvis/pull/171（base main；复审后创建）。
+
+### 第三轮审查修复记录（2026-10-20，用户审查七项）
+
+- P1 忙态竞态/旧 Turn 伪成功：adapter 写前边界复核 + router 回队 + 回执 Turn 关联校验；
+  `busy_after_idle_check_requeues_without_start_turn`、`stale_turn_echo_is_unknown_and_keeps_barrier`。
+- P2 签名设置：登记时冻结 `signature_applied` + 最终 wire；旧行按升级前恒签名；
+  `signature_setting_is_frozen_at_registration`、`signature_on_ipc_start_turn_appends_exactly_once`。
+- P3 昵称白名单收窄到 Windows cmd 最终 argv；`compose_does_not_reject_unusual_device_names` 等。
+- P4 详情页 Codex 控件不再被 `!isSummary` 隐藏；`queueTick` 独立刷新；Unknown 草稿换新 ID；
+  `SessionDetailCodex.test.tsx` 5 例 + MessageComposer 4 例。
+- P5 兼容派发前/探针后复核设备；`compat_refuses_when_device_revoked_during_ipc_handoff`。
+- P6 SSE 先订阅再快照 + 代际合并；`startup_merge_tests` 5 例。
+- P7 H3 403 贯通 reason；后端测试 + `403 headless_disabled` 前端用例。
+- Task 12 的分支备份/remaining 分支/逐 hunk 整理**未执行**（待新 PR 合入 main 后），已恢复待办。
+- PRODUCT 双平台验收仍未执行；本记录不冒充真机 PASS。

@@ -49,7 +49,7 @@
 | `send` | PASS | WIN-LIVE | 2026-10-19 报告 T4；`observed/windows-4894-start-turn.sanitized.json` |
 | `state` | PASS | WIN-LIVE | 报告 T1/T2；`observed/windows-4894-snapshot.sanitized.json` |
 | `command` | PASS（accept/decline 双臂） | WIN-LIVE | 报告 T6；`observed/windows-4894-command-approval-*.sanitized.json` |
-| `permissions` | **NOT_AVAILABLE**（请求未触发；读升权走 command approval） | WIN-LIVE | 报告 T7；profile 保持 false |
+| `permissions` | **能力档保持 false**：`item/permissions/requestApproval` 曾出现并完成 accept/decline 双臂（审批证据），但**未据此解锁权限档**；T7 的「读升权/请求未触发」只指读场景，不能写成「从未出现权限请求」 | WIN-LIVE | 报告 T7 + §3 双臂归档；profile 保持 false |
 | `blocking_input` | PASS（整数 requestId + 原 qid 作答） | WIN-LIVE | 报告 T8；`observed/windows-4894-plan-input.sanitized.json` |
 | 原生空首帧 | **NOT_AVAILABLE**（未发送的草稿不落 session） | WIN-LIVE + 产品行为 | 报告 T3；不伪造空会话 |
 | 重启恢复 | PASS（断开 0.94s → stale → 重启 → 用户打开会话后 ≤2s 恢复、owner 换代） | WIN-LIVE | 报告 T9（含补测） |

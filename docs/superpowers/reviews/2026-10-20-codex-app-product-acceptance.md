@@ -29,8 +29,8 @@
 | E5 | Plan 阻塞式问答远程作答 | **IPC-FIXTURE PASS**；PRODUCT 未执行 | `windows-4894-plan-input` 夹具（整数 requestId）；真实 `/plan` 回合需用户操作 |
 | E6 | Desktop 缺席时普通消息走兼容 exec | **NOT_EXECUTED**（PRODUCT） | 需关闭 Desktop 并对目标会话发消息；自动化只覆盖 dispatch 纯核与 H3 门 |
 | E7 | Desktop 在场走 queue 兼容；两臂 H3 关闭拒绝 | **HTTP-INTEGRATION PASS**（H3 拒绝）；PRODUCT 未执行 | `send_not_sent_hands_off_to_compat_when_h3_on`、H3 403 用例；E10 双臂见下 |
-| E8 | permissions 关闭时如实提示 | **PASS（实现）/ PRODUCT 未执行** | `ipc_available()` 与能力档四档；permissions 请求在 4894 未触发（报告 T7） |
-| E9 | Desktop 重启后重新发现 owner 并恢复 | **IPC-FIXTURE PASS**（重连/换代）；PRODUCT 未执行 | `recovery_loop_reconnects_with_backoff_after_peer_drop`、`unknown_build_closes_and_verified_reopens`；真机恢复证据见 2026-10-19 报告 T9（旧基线） |
+| E8 | permissions 关闭时如实提示 | **PASS（实现）/ PRODUCT 未执行** | `ipc_available()` 与能力档四档；4894 的 `permissions` 能力档保持 **false**——`item/permissions/requestApproval` 曾出现并完成 accept/decline 双臂（审批证据），但**从未据此解锁权限档**；「未触发」只适用于 T7 的读升权场景，不能写成从未出现请求 |
+| E9 | Desktop 重启后重新发现 owner 并恢复 | **IPC-FIXTURE PASS**（重连/换代）；PRODUCT 未执行 | `recovery_loop_reconnects_with_backoff_after_peer_drop`、`unknown_build_closes_and_verified_reopens`；**恢复时延按实际 backoff 与恢复条件描述**（首轮 0.94s 断开→stale 是单次实测，不是固定 ≤2s 承诺；重启后需用户在 Desktop 重新打开会话才恢复，见 2026-10-19 报告 T9 旧基线） |
 | E10 | queue 臂与 exec 臂各一次（Desktop 在/不在） | **NOT_EXECUTED**（PRODUCT） | 需真实打开/关闭 Desktop 两次并各发一条消息；H3 两臂拒绝已由集成测试覆盖 |
 | E11 | 未知投递恢复（Accepted 后强杀，重启为 unknown） | **NOT_EXECUTED**（PRODUCT） | 停点实现与单测 PASS；实机步骤需构建影子 Tuvis、真实 Accepted 后强杀（见 §4 交接） |
 | E12 | 同 Thread 连续三回合有序 | **HTTP-INTEGRATION PASS**；PRODUCT 未执行 | `turn_restriction_needs_matching_completion_evidence`、`turn_restriction_survives_restart_until_completion`、`receipt_without_turn_id_keeps_restriction` |
@@ -44,12 +44,12 @@ E6/E10/E11 需要桌面端有人在场按 §4 的点击顺序操作。
 
 | 套件 | 命令 | 结果 |
 | --- | --- | --- |
-| Rust lib | `cargo test --features marker-helper` | 2631 passed / **5 failed（均为 main 基线既有失败，见 §5）** |
+| Rust lib | `cargo test --lib`（第三轮修复后） | 2635 passed / **5 failed（均为 main 基线既有失败，见 §5）** |
 | IPC 协议 | `cargo test --test codex_desktop_ipc` | 42 passed |
-| IPC HTTP | `cargo test --test codex_ipc_remote` | 50 passed |
-| 控制面 | `cargo test --test codex_control_remote` | 34 passed |
+| IPC HTTP | `cargo test --test codex_ipc_remote` | 52 passed |
+| 控制面 | `cargo test --test codex_control_remote` | 36 passed |
 | Codex E2E（ignored） | `cargo test --test headless_e2e -- --list` | 1 例 `codex_queue_consumed`（未实机执行，零配额） |
-| 前端 | `pnpm test` | 150 files / 1589 passed / 5 skipped |
+| 前端 | `pnpm test` | 151 文件 / 1598 passed / 5 skipped |
 | 错误码/双语 | `pnpm check:i18n`、`node scripts/check-error-codes.mjs` | PASS（1417 键；284 码 / 285 键 / legacy 5） |
 
 ## 4. 未执行步骤的交接顺序（Windows，需用户在场）
@@ -95,13 +95,15 @@ E6/E10/E11 需要桌面端有人在场按 §4 的点击顺序操作。
    `remote_message_signature` 开关决定是否带签名。理由是 #117 的「来源标记单点组装」
    与 Desktop IPC 审计溯源；影响仅是 token 与终端可见文本，不影响投递安全。是否让
    Codex 路也受该开关约束，留待用户裁决（复审 Q1）。
-2. **花名白名单对终端四家同样生效**：`compose_injection` 是所有注入路径的唯一组装
-   出口，含 `&`/emoji 等的花名会被拒（零投递）。这是 #117 裁决 24b/25 的**有意从严**，
-   只在花名含 cmd 元字符时触发，正常中文/英文花名放行；与计划「保留 main 终端行为」有
-   轻微张力，按安全优先保留（复审 Q2）。注册/改名点尚未接同一判据，#117 续作登记。
+2. ~~花名白名单对终端四家同样生效~~ **第三轮复审已修复**：`compose_injection` 不再按
+   花名拒绝（emoji/撇号/冒号/组合音标在终端、Desktop IPC、原生 exe 均可发送）；安全门只
+   存在于 Windows cmd 垫片的**最终 argv**（`argv_shim_refusal` / `cmd_shim_body_refusal`，
+   只拒 `CMD_SHIM_METACHARS` 且仅 `via_cmd_shim` + 载荷进 argv 时）。注册/改名点不加限制，
+   也不存在「昵称仅拒绝 cmd 元字符」的全局规则——旧表述已删除。
 
 ## 7. 结论
 
-本轮交付的**自动化层**（IPC 协议 / HTTP 集成 / 控制面 / 前端 / 双语与错误码门禁）
-全部通过；**PRODUCT 层双平台适用表未完成**，Windows 需用户在场按 §4 操作、Mac 需实际
-执行者按交接清单跑。按计划纪律，不把本次交付宣称为「冻结 spec F1–F8 双平台真机验收完成」。
+本轮交付的**自动化层**（IPC 协议 / HTTP 集成 / 控制面 / 前端接线 / 双语与错误码门禁）
+全部通过；第三轮审查的 7 项缺陷已修复并有确定性回归（见复审 §10）。**PRODUCT 层双平台
+适用表仍未完成**，Windows 需用户在场按 §4 操作、Mac 需实际执行者按交接清单跑。按计划
+纪律，不把本次交付宣称为「冻结 spec F1–F8 双平台真机验收完成」。

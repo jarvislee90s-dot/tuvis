@@ -9,10 +9,11 @@
 | 项 | 值 |
 | --- | --- |
 | base | `origin/main` `77fcdb487e8bd32eb4109cf8a274e7663a0ef43c` |
-| head | 本轮最终提交（`67b01a13`/`d7d1d732`/`d6d2d348`/`8d3e237b`/`bf9b2949` + 复审修复提交） |
+| head | 本轮最终提交（`67b01a13`/`d7d1d732`/`d6d2d348`/`8d3e237b`/`bf9b2949` + 第三轮复审修复提交） |
 | diff 规模 | 83+ 文件、约 +40.6k/−0.1k（含夹具与文档） |
 | 独立复审 | 独立 reviewer 子代理（只读，禁改代码），对本 diff 逐项核对；主线另做自查与门禁复跑 |
 | 复审材料 | 本文件 + `2026-10-20-codex-app-extraction-ledger.md` + `2026-10-20-codex-app-preflight-results.md` |
+| 冻结 spec（权威原文，固定提交） | [2026-10-16-codex-desktop-ipc-remote-control-design.md @ d5cc28b1](https://github.com/jarvislee90s-dot/tuvis/blob/d5cc28b1eb20133ee37b788013c6d318e4731d46/docs/superpowers/specs/2026-10-16-codex-desktop-ipc-remote-control-design.md)（本分支未跟踪该文件，读的是未改动原文） |
 
 ## 2. 质量门禁（Windows 11 26200 / rustc 1.97.0 / Node 26.8.1 / pnpm 11.13.0）
 
@@ -21,13 +22,13 @@
 | 1 | `pnpm install --frozen-lockfile` | PASS | lockfile 未改 |
 | 2 | `cargo fmt --check` | PASS | 全仓 |
 | 3 | `cargo clippy --all-targets --features marker-helper -- -D warnings` | PASS | 零告警 |
-| 4 | `cargo test --features marker-helper --no-fail-fast` | **2631 passed / 5 failed / 45 ignored** | 5 例为 main 基线既有（§3） |
+| 4 | `cargo test --lib`（第三轮修复后） | **2635 passed / 5 failed / 45 ignored** | 5 例为 main 基线既有（§3） |
 | 5 | `cargo test --test codex_desktop_ipc` | PASS 42 | 协议/连接/投影/重连 |
-| 6 | `cargo test --test codex_ipc_remote` | PASS 50 | HTTP/SSE/审批/队列/审计 |
-| 7 | `cargo test --test codex_control_remote` | PASS 34 | 账本/FIFO/屏障/Unknown/撤回 |
+| 6 | `cargo test --test codex_ipc_remote` | PASS 52 | HTTP/SSE/审批/队列/审计（+签名/IPC、设备吊销交接） |
+| 7 | `cargo test --test codex_control_remote` | PASS 36 | 账本/FIFO/屏障/Unknown/撤回（+写前忙回队、旧 Turn 回显、签名冻结） |
 | 8 | `cargo test --test headless_e2e -- --list` | 1 例（ignored） | `codex_queue_consumed` 未执行、零配额 |
 | 9 | `cargo check --release --features codex-ipc-e2e-stop` | **按预期编译失败** | `compile_error!`：只允许 debug 证据构建 |
-| 10 | `pnpm test` | PASS 150 文件 / 1589 例 / 5 skipped | 前端全量（含补回的 4 个 IPC 测试） |
+| 10 | `pnpm test` | PASS 151 文件 / 1598 例 / 5 skipped | 前端全量（第三轮新增 9 例接线/账本交互） |
 | 11 | `pnpm check`（format/lint/i18n/error-codes/build） | PASS | 构建产物正常 |
 | 12 | `pnpm build:mobile` | PASS | `dist-mobile/` |
 | 13 | `pnpm check:i18n` | PASS 1417 键 | zh/en 键集一致 |
@@ -116,7 +117,7 @@ tty_map 文件）；Windows permissions=false；不发版。
 | # | 发现 | 处置 |
 | --- | --- | --- |
 | Q1 | Codex 两条发送路径（A 路 router 与兼容路）都调 `compose_injection`（恒带 `[mobile 花名]`），**忽略** main 的 `remote_message_signature` 开关；终端路径按开关 | 保留 #117 设计与「来源标记单点组装」决定；在验收报告 §8 登记为**通道差异**，是否改为受开关约束留待用户裁决（不影响投递安全，只影响 token 与溯源形态） |
-| Q2 | compose 的花名白名单对终端四家同样生效，轻微改变 main 终端发送行为（拒绝不安全花名） | 保留（安全优先，且只在花名含 cmd 元字符时触发）；在验收报告 §8 登记为**有意偏差**，不视为功能回归 |
+| Q2 | ~~compose 的花名白名单对终端四家同样生效~~ **已于第三轮复审修复**：全局花名白名单移除，安全门收窄到 Windows cmd 垫片的真实 argv（只拒实际进 argv 的 `CMD_SHIM_METACHARS`，签名关闭/Desktop IPC/原生 exe 不因昵称字符被拒） | 已修复；证据见 §10 的 S3 行 |
 
 ### D–G 复审（第二轮，HEAD 前进后复核）
 
@@ -137,6 +138,18 @@ tty_map 文件）；Windows permissions=false；不发版。
 | G-3 | `audit_headless` 仍称「没有生产调用者」；mirror 注释引用已删函数 | 改为「`audit_headless_ctx` 每回合调用」；删掉对 `truncate_with_size_marker` 的引用 |
 | G-4 | 复审文档 head 落后 | 本节按最终 HEAD 更新（见 §1） |
 
+### 第三轮复审修复（2026-10-20，用户审查七项）
+
+| # | 问题 | 修改位置 → 行为变化 | 测试证据 |
+| --- | --- | --- | --- |
+| P1 | 忙态竞态与旧 Turn 伪成功 | `AdapterDispatch::send_text` 在 ensure 后、start-turn 前用 `pre_write_snapshot`（同一把镜像锁取忙态 + 已存在 Turn 集合）；忙 → `NotSent(busy_before_write)`，router `requeue_after_busy` 恢复 wire 回队（不 fallback、不换 actionId、不消耗正文）；Accepted 回执 turnId ∈ 派发前集合 → 降级 `unknown_delivery(stale_turn_echo)`，无 turnId → `turn_unconfirmed`，均保留保守屏障 | `busy_after_idle_check_requeues_without_start_turn`、`stale_turn_echo_is_unknown_and_keeps_barrier`（control 36 例）；`pre_write_snapshot`/`turn_ids` 单测由 IPC 套件覆盖 |
+| P2 | Codex 不遵守全局签名设置 | 登记时读 `remote_message_signature` 一次并冻结：`queued_text` = 最终 wire、新列 `signature_applied`；router/fallback/CLI/`wire_text_hash` 同一份；旧行（NULL）按升级前恒签名；幂等 hash 仍按原文 | `signature_setting_is_frozen_at_registration`（关/开/入队后切设置+重启/旧行/fallback 五段）；`signature_on_ipc_start_turn_appends_exactly_once`（HTTP 真 IPC） |
+| P3 | 昵称白名单误伤所有通道 | `compose_injection` 只归一 + 可选签名（不再按花名拒绝）；安全门 = `argv_shim_refusal`/`cmd_shim_body_refusal` 对**最终载荷**且仅 `via_cmd_shim` + 进 argv 时生效 | `compose_does_not_reject_unusual_device_names`、`cmd_shim_still_refuses_final_payload_with_metachars`、`compose_normalizes_device_name_too` |
+| P4 | 详情页 Codex 控件被 `!isSummary` 隐藏；队列不随发送刷新；Unknown 草稿复用旧 ID | Codex 能力/pending/队列按投影状态展示（QuestionCard 仍保留总结态门）；`queueTick` 由投影 revision 与发送回执共同驱动；Unknown 回执保留核对锚但清 actionId（新发送换新 ID） | `SessionDetailCodex.test.tsx` 5 例（idle+Unknown 屏障可恢复、idle pending、revision 固定发送 queued 后出现并可撤回、revision=null 兼容、换会话不串台）；MessageComposer 3 例（unknown 换 ID、queued/accepted 均触发 onQueueChanged） |
+| P5 | 兼容派发前不复核设备 | `run_compat` 在真实兼容派发前（睡眠/交接后）复核设备在册；吊销 → NotSent(device_revoked)、零 spawn、同事务清 fence + 审计；helper 在版本探针后再核一次 | `compat_refuses_when_device_revoked_during_ipc_handoff`（dead IPC 交接窗口吊销 → rejected/device_revoked、fence 清除、无 headless 审计） |
+| P6 | SSE 首帧订阅竞态 | 先 `subscribe()` 再取快照；启动缓冲按 `(owner_epoch, owner_generation, revision)` 合并（stale 不覆盖新鲜快照；跨 owner 不靠 revision 大小）；Lagged 启动期重取一次快照 | `startup_merge_tests` 5 例（交界最终态保留、旧事件丢弃、owner 换代、stale、跨 thread） |
+| P7 | H3 拒绝原因未贯通 | hub 分支真实 403 补 `reason` + `reasonCode`（手机只读 `data.reason`） | `send_h3_off_ipc_unavailable_compat_refuses` 断言 reason；MessageComposer `403 headless_disabled 显示服务端 reason` |
+
 ### 复审已核对无问题（摘要）
 
 - 抽取边界：无 zcode/wb/dsh/cli_three/codex_app/tty_map/旧 APP 控制文件；路由枚举仅 Codex。
@@ -147,15 +160,16 @@ tty_map 文件）；Windows permissions=false；不发版。
 
 ## 8. 残余缺口（如实登记）
 
-1. **`SessionDetail` 的 Codex 投影分支无组件级测试**：补回的 4 个上游测试覆盖
-   `codexIpcApi`/`useCodexThread`/`PendingRequestCard`/`CodexQueuePanel`（70 例），但
-   详情页把投影替换消息列表的那段 JSX 仍靠 `tsc` 与手测；建议续作补一个 mock
-   `useCodexThread` 的挂载用例（空/loading/partial/unsupported/ready 五态）。
+1. **`SessionDetail` 投影五态覆盖不完整**：`SessionDetailCodex.test.tsx` 已覆盖
+   idle+屏障/pending/固定 revision 队列刷新/revision=null/换会话 5 条接线；空/loading/
+   partial/unsupported 四态的**视觉分支**仍无组件断言（逻辑在 useDelayedUnsupported 与
+   projection 渲染分支，建议续作补）。
 2. **F-3 确定性**：`codex_ipc_remote` 的 presence 走真实进程扫描；测试不断言 channel，
    故不会红，但「本机是否开着 Desktop」会影响内部走向。建议续作把 presence 注入
    `RemoteState` 测试缝，或在 fixture 固定 channel。
-3. **F-4 忙态两格**：「两次 busy 检查之间转忙」「旧 Turn success」无回归用例；当前安全
-   依赖下一发前 busy 复检（最坏丢一条、不会双投）。
+3. **F-4 忙态两格已补**：`busy_after_idle_check_...` 覆盖「router 判 idle 后 ensure 返回
+   active」，`stale_turn_echo_...` 覆盖「旧 Turn success」；后者在 adapter 层用纯判据 +
+   控制面回执语义覆盖，未跑真实 Desktop 忙态实机（PRODUCT 未执行）。
 4. **PRODUCT / Mac / 真机**：见 `2026-10-20-codex-app-product-acceptance.md`；未执行即未执行。
 
 ## 9. 结论
@@ -166,6 +180,6 @@ tty_map 文件）；Windows permissions=false；不发版。
 - `cargo fmt --check` / `cargo clippy --all-targets --features marker-helper -- -D warnings`：PASS
 - `cargo test --features marker-helper`：2631 passed / 5 failed（均为 main 基线 HOME 隔离失败）
 - `cargo test --test codex_desktop_ipc / codex_ipc_remote / codex_control_remote`：42 / 50 / 34 PASS
-- `pnpm test`：150 文件 / 1589 例 / 5 skipped 全绿；`pnpm check`、`pnpm check:i18n`、`check-error-codes` PASS
+- `pnpm test`：全绿（第三轮新增 9 例接线/账本交互测试）；`pnpm check`、`pnpm check:i18n`、`check-error-codes` PASS
 - 残余缺口与未测格见 §8 与验收报告，不以自动化层冒充产品验收。
 
