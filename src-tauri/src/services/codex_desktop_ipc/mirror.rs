@@ -2000,6 +2000,15 @@ mod tests {
             &observed_change("canonical-before-load.sanitized.json"),
         )
         .unwrap();
+        // 首快照/GET 的代际必须来自绑定 lease（不再恒 0），否则 SSE 启动缓冲
+        // 会把任何事件都判成更新（2026-10-20 复审 I4）。
+        let proj = m.project(caps());
+        assert_eq!(proj.owner_epoch, lease().epoch, "epoch 来自绑定 lease");
+        assert_eq!(
+            proj.owner_generation,
+            lease().generation,
+            "generation 来自绑定 lease"
+        );
         let ids = m.turn_ids();
         assert!(ids.len() >= 3, "至少三条 canonical Turn：{ids:?}");
         assert!(ids.iter().all(|id| !id.is_empty()), "不含空 id");

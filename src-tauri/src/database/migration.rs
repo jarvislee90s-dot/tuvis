@@ -830,11 +830,11 @@ mod tests {
         );
     }
 
-    /// Codex 动作账本：旧结构（**两列都不存在**）经迁移补列——
+    /// Codex 动作账本：旧结构（**两列都不存在**）经迁移补列（barrier + signature）——
     /// `barrier_force_released_at` 与 `signature_applied` 都可空、存量行保留 NULL；
     /// 幂等两遍不报错。
     #[test]
-    fn migrate_adds_codex_barrier_force_released_column() {
+    fn migrate_adds_codex_barrier_and_signature_columns() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE codex_actions (
