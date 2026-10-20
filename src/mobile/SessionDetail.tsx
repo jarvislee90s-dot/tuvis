@@ -268,6 +268,15 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // - state=null（无 IPC / 拉取中）：旧路径照旧，零回归。
   // stale：保留最后视图但禁写。
   const codex = useCodexThread(session.id, session.agentType === "codex");
+  /** 队列刷新独立信号（2026-10-20 复审 P2）：不依赖 Desktop 必须产生新帧——
+   *  投影 revision 变化与发送回执各推进一次；旧会话的回调随组件卸载丢弃。 */
+  const [queueTick, setQueueTick] = useState(0);
+  const bumpQueue = useCallback(() => setQueueTick((t) => t + 1), []);
+  const codexReady = codex.state !== null;
+  const codexRevision = codex.state?.revision ?? null;
+  useEffect(() => {
+    if (codexReady) bumpQueue();
+  }, [codexRevision, codexReady, bumpQueue]);
   const codexState = codex.state;
   const codexProjectionActive =
     codexState !== null &&
@@ -931,35 +940,37 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           onDismiss={() => setPlanFeedbackActive(false)}
         />
       )}
-      {!isSummary &&
-        (codexState !== null ? (
-          <>
-            <CodexAvailabilityBanner
-              key={`codex-banner-${session.id}`}
-              availability={codexState.availability}
-              stale={codexState.stale}
-            />
-            {codexProjectionActive &&
-              codexState.pending.map((p) => (
-                <PendingRequestCard
-                  key={`codex-pending-${session.id}-${p.requestKey}`}
-                  sessionId={session.id}
-                  request={p}
-                  writeLocked={codexState.stale}
-                />
-              ))}
-            <CodexQueuePanel
-              key={`codex-queue-${session.id}`}
-              sessionId={session.id}
-              refreshSignal={codexState.revision ?? 0}
-            />
-            {!codexProjectionActive && (
-              <QuestionCard key={`question-${session.id}`} session={session} />
-            )}
-          </>
-        ) : (
-          <QuestionCard key={`question-${session.id}`} session={session} />
-        ))}
+      {/* 2026-10-20 复审 P2：Codex 控件**不跟随**旧 `isSummary`（idle/finished 时
+          QuestionCard 的总结态隐藏条件）；能力、pending、屏障与队列按投影真实状态
+          展示。QuestionCard 仍保持原总结态门（终端卡行为不变）。 */}
+      {codexState !== null ? (
+        <>
+          <CodexAvailabilityBanner
+            key={`codex-banner-${session.id}`}
+            availability={codexState.availability}
+            stale={codexState.stale}
+          />
+          {codexProjectionActive &&
+            codexState.pending.map((p) => (
+              <PendingRequestCard
+                key={`codex-pending-${session.id}-${p.requestKey}`}
+                sessionId={session.id}
+                request={p}
+                writeLocked={codexState.stale}
+              />
+            ))}
+          <CodexQueuePanel
+            key={`codex-queue-${session.id}`}
+            sessionId={session.id}
+            refreshSignal={queueTick}
+          />
+          {!codexProjectionActive && !isSummary && (
+            <QuestionCard key={`question-${session.id}`} session={session} />
+          )}
+        </>
+      ) : (
+        !isSummary && <QuestionCard key={`question-${session.id}`} session={session} />
+      )}
       {/* 2026-10-08 子 agent chip：与 ModeBar 同一行（flex-wrap 兄弟），生命周期
           解耦——mode 视图失败/unsupported 时 chip 仍活，反之亦然（spec §6）。
           finished 不挂载（idle 不拦：claude 后台 agent 可在主会话 idle 时仍在跑）；
@@ -1434,7 +1445,11 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               {messageArea}
             </MessageScrollArea>
             {cardDock}
-            <MessageComposer key={`composer-${session.id}`} session={session} />
+            <MessageComposer
+              key={`composer-${session.id}`}
+              session={session}
+              onQueueChanged={bumpQueue}
+            />
           </div>
           <SplitHandle
             orientation={preview.mode === "split-h" ? "horizontal" : "vertical"}
@@ -1503,7 +1518,11 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           {/* 发送输入区（M7 Task 7，W4）：**全布局态挂载**（正文 / split / split-h，
               2026-09-19 用户裁决）——分屏时对话列同样可发消息；
               send-info 拉取失败时组件自静默，不影响对话渲染；钥匙口径同上 */}
-          <MessageComposer key={`composer-${session.id}`} session={session} />
+          <MessageComposer
+            key={`composer-${session.id}`}
+            session={session}
+            onQueueChanged={bumpQueue}
+          />
         </div>
       )}
 

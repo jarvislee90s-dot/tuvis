@@ -85,6 +85,9 @@ import { etaRemainingText, formatBytes, transferRateBps, type TransferSample } f
 import { newActionId, type ActionReceipt } from "./codexIpcApi";
 
 interface MessageComposerProps {
+  /** 发送回执触发的队列刷新信号（2026-10-20 复审 P2）：本地队列可见性不依赖
+   *  Desktop 必须产生新帧——queued / desktop_ipc 回执都会让队列视图变化。 */
+  onQueueChanged?: () => void;
   /** 会话（本组件只消费 id；结构化类型，完整 Session 可直接传入） */
   session: { id: string };
 }
@@ -252,7 +255,7 @@ function upsertQueueItem(items: QueueItemView[], item: QueueItemView): QueueItem
   return next;
 }
 
-export default function MessageComposer({ session }: MessageComposerProps) {
+export default function MessageComposer({ session, onQueueChanged }: MessageComposerProps) {
   // 可用性：sendInfo=null 且未就绪 → 不渲染（加载中 / 拉取失败 / 403）
   const [sendInfo, setSendInfo] = useState<SendInfo | null>(null);
   const [infoReady, setInfoReady] = useState(false);
@@ -609,17 +612,20 @@ export default function MessageComposer({ session }: MessageComposerProps) {
         if (res.receipt.delivery === "accepted") {
           setText("");
           setAttachments([]);
-          codexActionIdRef.current = null;
-        } else if (res.receipt.delivery !== "unknown_delivery") {
-          codexActionIdRef.current = null;
         }
+        // 2026-10-20 复审 P2：Unknown 的「待核对动作」与「下一条新草稿」生命周期
+        // 分离——保留回执里的 actionId 供核对，但**新一次发送必须生成新 ID**，
+        // 不得复用旧 ID 撞 action_conflict，也绝不自动重发。
+        codexActionIdRef.current = null;
         setReceipt({ kind: "codex", receipt: res.receipt });
+        onQueueChanged?.();
       } else if (res.status === "codex_queued") {
         // 忙 Thread 留队：消息已进服务端 FIFO（账本锚 = actionId），由调度循环按序派发
         setText("");
         setAttachments([]);
         codexActionIdRef.current = null;
         setReceipt({ kind: "codexQueued", position: res.position });
+        onQueueChanged?.();
       } else if (res.status === "headless") {
         // 兼容通道回执（每回合 spawn）：ok/queued 即消息已交给 CLI；失败如实展示原因
         if (res.receipt.status === "ok" || res.receipt.status === "queued") {
@@ -645,7 +651,17 @@ export default function MessageComposer({ session }: MessageComposerProps) {
     } finally {
       setSending(false);
     }
-  }, [text, attachments, sending, busy, sendInfo, session.id, queueOnlyNext, probeCardPresence]);
+  }, [
+    text,
+    attachments,
+    sending,
+    busy,
+    sendInfo,
+    session.id,
+    queueOnlyNext,
+    probeCardPresence,
+    onQueueChanged,
+  ]);
 
   // P2-7 失败对账（插队/撤回/修改共用）：失败后复核 /session-queue——
   // - 条目仍在 pending → 恢复排队视图（刷新队位，行同步更新，「立即发送/修改/撤回」

@@ -2004,3 +2004,97 @@ describe("卡片在场分流：审批拦截 / 问答转向自由作答 / 不可�
     expect(screen.queryByTestId("composer-card-presence")).toBeNull();
   });
 });
+
+// ============================================================
+// 2026-10-20 复审 P2：Codex actionId 生命周期 + 队列刷新信号
+// ============================================================
+
+describe("MessageComposer：Codex 动作账本与队列刷新", () => {
+  const unknownReceipt = {
+    status: "desktop_ipc",
+    receipt: {
+      actionId: "act-old",
+      delivery: "unknown_delivery",
+      route: "desktop_ipc",
+      turnId: null,
+      envelopeId: "env-1",
+      reasonCode: "ipc_timeout",
+    },
+  };
+
+  it("unknown 回执保留核对锚，但下一条新发送必须换新 actionId（不复用旧 ID）", async () => {
+    installFetch();
+    routes.info = sendInfo({ channels: ["headless_codex_queue"] });
+    routes.send = unknownReceipt;
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = (await screen.findByTestId("composer-input")) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "第一条" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(await screen.findByTestId("send-receipt-codex-unknown")).toBeTruthy();
+
+    // 用户明确再发一条新动作：正文没清空（unknown 不假清），actionId 必须换新
+    fireEvent.change(input, { target: { value: "第二条" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    await waitFor(() => expect(sendCalls()).toHaveLength(2));
+    const first = JSON.parse(String(sendCalls()[0][1]?.body));
+    const second = JSON.parse(String(sendCalls()[1][1]?.body));
+    expect(first.actionId).toBeTruthy();
+    expect(second.actionId).toBeTruthy();
+    expect(second.actionId).not.toBe(first.actionId);
+    expect(second.actionId).not.toBe("act-old");
+  });
+
+  it("403 headless_disabled 显示服务端 reason（不是裸 session-send 403）", async () => {
+    installFetch();
+    routes.info = sendInfo({ channels: ["headless_codex_queue"] });
+    routes.sendStatus = 403;
+    routes.sendBody = {
+      error: "headless_disabled",
+      reasonCode: "headless_disabled",
+      reason: "无头通道未开启，请在电脑端 Tuvis 设置中开启",
+    };
+    render(<MessageComposer session={{ id: "sess-1" }} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "兼容发送" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    const chip = await screen.findByTestId("send-receipt-failed");
+    expect(chip.textContent).toContain("无头通道未开启");
+    expect(chip.textContent).not.toContain("session-send 403");
+  });
+
+  it("codex_queued 回执触发 onQueueChanged（本地队列刷新不依赖 Desktop 新帧）", async () => {
+    installFetch();
+    routes.info = sendInfo({ channels: ["headless_codex_queue"] });
+    routes.send = { status: "codex_queued", actionId: "act-q", position: 2 };
+    const onQueueChanged = vi.fn();
+    render(<MessageComposer session={{ id: "sess-1" }} onQueueChanged={onQueueChanged} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "排队" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(await screen.findByTestId("send-receipt-codex-queued")).toBeTruthy();
+    await waitFor(() => expect(onQueueChanged).toHaveBeenCalled());
+  });
+
+  it("desktop_ipc 终态回执同样触发 onQueueChanged（条目出队）", async () => {
+    installFetch();
+    routes.info = sendInfo({ channels: ["headless_codex_queue"] });
+    routes.send = {
+      status: "desktop_ipc",
+      receipt: {
+        actionId: "act-ok",
+        delivery: "accepted",
+        route: "desktop_ipc",
+        turnId: "turn-1",
+        envelopeId: "env-2",
+        reasonCode: null,
+      },
+    };
+    const onQueueChanged = vi.fn();
+    render(<MessageComposer session={{ id: "sess-1" }} onQueueChanged={onQueueChanged} />);
+    const input = await screen.findByTestId("composer-input");
+    fireEvent.change(input, { target: { value: "直发" } });
+    fireEvent.click(screen.getByTestId("composer-send"));
+    expect(await screen.findByTestId("send-receipt-codex-accepted")).toBeTruthy();
+    await waitFor(() => expect(onQueueChanged).toHaveBeenCalled());
+  });
+});
