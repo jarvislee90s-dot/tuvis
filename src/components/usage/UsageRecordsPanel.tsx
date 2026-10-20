@@ -7,13 +7,14 @@
 //     `t` 与**受控的筛选状态**。读命令只读账本、绝不触发扫描（§3 第 15 条）；设置也只能经
 //     `useUsageSettingsQuery`（页面持有），本文件**不**直连设置命令。
 //  ② 行维度**不随卡片分组变**（D6）：`cardDim`（`tool` | `project`，默认 `tool`）只喂
-//     `usageRecords` 的 `groupBy`，卡内行一律直渲 `row.label` **原文** —— 真机这一行已是
-//     `format!("{} / {}", provider, model)`，前端**不拼**（供应商不可得时它只有模型名）。
+//     `usageRecords` 的 `groupBy`；2026-10-21 起行名经 `displayLabelOf` **供应商别名优先**
+//     （`别名 / 原始模型`；无别名回退真机 `row.label` 原文，供应商不可得时只有模型名），
+//     原始 label 始终保留在 `title` 与行数据中（spec §7.5）。
 //  ③ 卡片标题按 `groupBy` 分派（§3 第 13 条）：`tool → usageAgentLabel(card.toolId)`（真机在这个
 //     维度给的 `toolLabel` 是**小写工具 id**）、`project → card.toolLabel` **原文**（D21：key 小写、
 //     label 原样，不做 realpath / 不做大小写规范化 / 不用 `projectPath`）。
 //  ④ 值口径 = hero（`metrics.requestTotal + buckets.output`），唯一出处是 `distribution.ts` 的
-//     `distValue`；缩写走 `fmtTokens`、hover 精确值走 `fmtInt`（spec P8）。
+//     `distValue`；只显示 `fmtTokens` 万/亿缩写，不挂完整千分位原始值 tooltip（2026-10-19 裁决）。
 //  ⑤ **日档守卫三层**（契约 §3 要点 4 / 第 9 码，预防优于报错）：日档（非 `last5h` / `today`）下
 //     开关 `disabled` + **常驻**原因（第①层，本文件）；**复位（②）与 `filters` 双保险（③）已上提到
 //     `src/lib/usage/useRecordsFilters.ts`** —— 2026-10-06 用户裁决「CSV 要接收记录页筛选」之后，
@@ -27,21 +28,38 @@
 //  ⑦ 取色只认主题 token、按钮 / 卡片走 `ui/{button,card}` 原语（§3 第 19/40 条）；`TFn` /
 //     `usageAgentLabel` / `EM_DASH` 一律 import，**不重声明**（§3 第 22/13 条）。本面板**不轮询**：
 //     新数据由采集成功后的 `["usage"]` 前缀失效驱动（故此处不出现任何轮询标记，见 ① 的源码锁纪律）。
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
+import {
+  BillingAssignmentDialog,
+  identityDisplayName,
+} from "@/components/usage/BillingAssignmentDialog";
+import { BillingProfilesManager } from "@/components/usage/BillingProfilesManager";
+import { ProviderAliasDialog } from "@/components/usage/ProviderAliasDialog";
+import { displayIdentityLabel, findAliasForIdentity } from "@/components/usage/ProviderAliasFields";
 import { UsageEmpty, UsageError, UsageLoading } from "@/components/usage/UsageStates";
 import { usageErrMsg } from "@/components/usage/usageErrors";
 import { useUsageRecordsQuery } from "@/lib/query/queries/usage";
+import { useUsageIdentitiesQuery } from "@/lib/query/queries/usageV2";
+import { useUsageProviderAliasesQuery } from "@/lib/query/queries/usageV2";
 import { distValue } from "@/lib/usage/distribution";
-import { EM_DASH, fmtInt, fmtTokens, usageAgentLabel } from "@/lib/usage/format";
+import { EM_DASH, fmtTokens, usageAgentLabel } from "@/lib/usage/format";
 import { getLang } from "@/lib/usage/lang";
 import { cardTokenUnmeasured } from "@/lib/usage/range";
 import { FILTER_TOOL_IDS, RECORD_DIMS } from "@/lib/usage/useRecordsFilters";
 import type { RecordsFiltersState } from "@/lib/usage/useRecordsFilters";
 import type { TFn } from "@/lib/usage/range";
-import type { UsageCard, UsageRange, UsageRecordsGroupBy, UsageSourceKind } from "@/types/usage";
+import type {
+  UsageCard,
+  UsageFilters,
+  UsageRange,
+  UsageRecordsGroupBy,
+  UsageRow,
+  UsageSourceKind,
+} from "@/types/usage";
+import type { IdentityUsage } from "@/types/usageV2";
 
 /**
  * 卡内行上限：超出折「展开其余 N 行」（spec P3「按组合聚合后行数可控，前端分页即可」）。
@@ -76,18 +94,80 @@ function SourceBadge({ kind, t }: { kind: UsageSourceKind; t: TFn }) {
   );
 }
 
+/** 行归属状态（由 `usageIdentities` 聚合得出） */
+type RowAttribution =
+  | { kind: "assigned"; profileId: string }
+  | { kind: "observed"; profileId: string }
+  | { kind: "ambiguous"; profileId: string | null }
+  | { kind: "unassigned"; profileId: null };
+
+const UNASSIGNED: RowAttribution = { kind: "unassigned", profileId: null };
+
+/**
+ * 保守聚合（project 卡与同 source 多身份共用）：
+ *  * 任何 ambiguous / 跨 profile / 已归属与未归属混合 → ambiguous；
+ *  * 全部 unknown → unassigned；
+ *  * 全部 observed 且同 profile → observed；
+ *  * 全部 userAssigned 且同 profile → assigned；
+ *  * observed 与 userAssigned 混用 → ambiguous（不猜）。
+ */
+function aggregateAttribution(identities: readonly IdentityUsage[] | undefined): RowAttribution {
+  if (!identities || identities.length === 0) return UNASSIGNED;
+  const kinds = identities.map((identity) => identity.attribution.attributionKind);
+  const profiles = identities
+    .map((identity) => identity.attribution.billingProfileId)
+    .filter((id): id is string => id !== null);
+  const assignedish = identities.filter(
+    (identity) =>
+      identity.attribution.billingProfileId !== null &&
+      (identity.attribution.attributionKind === "userAssigned" ||
+        identity.attribution.attributionKind === "observed")
+  );
+  const distinctProfiles = new Set(profiles);
+
+  if (kinds.includes("ambiguous")) {
+    return { kind: "ambiguous", profileId: profiles[0] ?? null };
+  }
+  // 全部 unknown
+  if (kinds.every((kind) => kind === "unknown")) return UNASSIGNED;
+  // 未归属与已归属混合，或部分身份没有 profile ⇒ 含糊
+  if (assignedish.length !== identities.length || distinctProfiles.size > 1) {
+    return { kind: "ambiguous", profileId: profiles[0] ?? null };
+  }
+  const kindSet = new Set(kinds);
+  if (kindSet.size === 1 && kindSet.has("observed")) {
+    return { kind: "observed", profileId: profiles[0] };
+  }
+  if (kindSet.size === 1 && kindSet.has("userAssigned")) {
+    return { kind: "assigned", profileId: profiles[0] };
+  }
+  // observed + userAssigned 混用
+  return { kind: "ambiguous", profileId: profiles[0] ?? null };
+}
+
 /** 单张卡片：标题（按卡片维度分派）+ 合计 + 若干「供应商 / 模型」行（超限折叠） */
 function RecordCard({
   card,
   cardDim,
   expanded,
   onToggle,
+  onAssign,
+  onAlias,
+  displayLabelOf,
+  attributionOf,
+  hasAlias,
   t,
 }: {
   card: UsageCard;
   cardDim: UsageRecordsGroupBy;
   expanded: boolean;
   onToggle(key: string): void;
+  onAssign(card: UsageCard, row: UsageRow): void;
+  onAlias(card: UsageCard, row: UsageRow, explicitlyBound: boolean): void;
+  /** 行显示名：供应商别名优先，原始「供应商 / 模型」留在 tooltip */
+  displayLabelOf(card: UsageCard, row: UsageRow): string;
+  attributionOf(card: UsageCard, label: string): RowAttribution;
+  hasAlias(card: UsageCard, label: string): boolean;
   t: TFn;
 }) {
   // 格式化语言（issue #160）：数值单位（万/亿 vs K/M/B）随界面语言走，组件体取一次。
@@ -107,10 +187,7 @@ function RecordCard({
       <CardHeader>
         <CardTitle>{title}</CardTitle>
         <CardAction>
-          <span
-            className="text-muted-foreground text-xs tabular-nums"
-            title={noTokens ? undefined : fmtInt(total)}
-          >
+          <span className="text-muted-foreground text-xs tabular-nums">
             {t("usage.records.cardTotal", { v: noTokens ? EM_DASH : fmtTokens(total, lang) })}
           </span>
         </CardAction>
@@ -119,6 +196,8 @@ function RecordCard({
       <CardContent className="space-y-1.5">
         {rows.map((row, i) => {
           const rowNoTokens = cardTokenUnmeasured(row);
+          const attr = attributionOf(card, row.label);
+          const shownLabel = displayLabelOf(card, row);
           return (
             <div
               key={row.key}
@@ -126,14 +205,56 @@ function RecordCard({
               className="flex items-center gap-2 text-sm"
             >
               <SourceBadge kind={row.sourceKind} t={t} />
-              {/* 行名 = `row.label` 原文（真机已是「供应商 / 模型」）；全名由 title 给，前端不再拼一层 */}
+              {/* 行名 = 供应商别名优先；原始「供应商 / 模型」留在 title 与行数据里，作为证据 */}
               <span className="min-w-0 flex-1 truncate" title={row.label}>
-                {row.label}
+                {shownLabel}
               </span>
-              <span
-                className="font-medium tabular-nums"
-                title={rowNoTokens ? undefined : fmtInt(distValue(row))}
+              {attr.kind === "assigned" ? (
+                <span
+                  data-testid="usage-record-attr-assigned"
+                  className="border-primary/40 text-primary shrink-0 rounded-full border px-1.5 py-px text-[10px]"
+                >
+                  {t("usage.records.assigned")}
+                </span>
+              ) : attr.kind === "observed" ? (
+                <span
+                  data-testid="usage-record-attr-observed"
+                  className="border-border text-foreground shrink-0 rounded-full border px-1.5 py-px text-[10px]"
+                >
+                  {t("usage.records.observed")}
+                </span>
+              ) : attr.kind === "ambiguous" ? (
+                <span
+                  data-testid="usage-record-attr-ambiguous"
+                  className="border-muted-foreground/40 text-muted-foreground shrink-0 rounded-full border px-1.5 py-px text-[10px]"
+                >
+                  {t("usage.records.ambiguous")}
+                </span>
+              ) : null}
+
+              {/* 只有含糊行需要显式计费归属；普通行的渠道由供应商别名/原始 provider 决定，
+                  不再逐行要求「指定渠道」，避免与别名配置重复。 */}
+              {attr.kind === "ambiguous" ? (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  data-testid={`usage-record-assign-${card.toolId}:${i}`}
+                  onClick={() => onAssign(card, row)}
+                >
+                  {t("usage.records.assignChannel")}
+                </Button>
+              ) : null}
+              {/* 供应商别名：所有行都可编辑；保存后同一窗口内记录页行名与看板同步 */}
+              <Button
+                size="xs"
+                variant="ghost"
+                data-testid={`usage-record-alias-${card.toolId}:${i}`}
+                onClick={() => onAlias(card, row, attr.kind === "assigned")}
               >
+                {hasAlias(card, row.label) ? t("usage.alias.edit") : t("usage.records.aliasAction")}
+              </Button>
+
+              <span className="font-medium tabular-nums">
                 {rowNoTokens ? EM_DASH : fmtTokens(distValue(row), lang)}
               </span>
             </div>
@@ -152,6 +273,107 @@ function RecordCard({
         ) : null}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * 点击行后才挂载：按卡片限制查询 identities（tool 卡限 toolIds；project 卡限 projects，
+ * `card.toolId` 是项目键，绝不当 sourceId）。候选显示名与点击行 `row.label` 比较；
+ * 同名碰撞（多条匹配）全部交给 Dialog 让用户显式选择。
+ *
+ * Task 7 起同一 loader 以 `intent` 分派两个独立浮窗（计费绑定 / 供应商别名）：
+ * identities 查询与同名候选筛选只有这一套，禁止复制第二遍。
+ */
+function AssignmentLoader({
+  card,
+  row,
+  cardDim,
+  range,
+  filters,
+  intent,
+  explicitlyBound,
+  onClose,
+  t,
+}: {
+  card: UsageCard;
+  row: UsageRow;
+  cardDim: UsageRecordsGroupBy;
+  range: UsageRange;
+  filters: UsageFilters;
+  intent: "billing" | "alias";
+  explicitlyBound: boolean;
+  onClose(): void;
+  t: TFn;
+}) {
+  const scoped: UsageFilters =
+    cardDim === "tool"
+      ? { ...filters, toolIds: [card.toolId] }
+      : { ...filters, projects: [card.toolId] };
+  const identities = useUsageIdentitiesQuery(range, scoped);
+  // 别名浮窗需要当前规则（预填 / 复用 id）；与记录页行按钮共用同一查询缓存
+  const aliases = useUsageProviderAliasesQuery();
+
+  // useMemo 固化候选数组引用：后台 refetch（["usage"] 失效链）带来新 data 引用时，
+  // 不得连带触发 Dialog 的重置 effect（否则用户已选候选与预览会被清空）。
+  // 必须放在下方早退分支之前（hooks 不能条件调用）；pending/error 时结果是空数组，不参与渲染。
+  const candidates = useMemo(() => {
+    const all = identities.data ?? [];
+    const matched = all.filter((id: IdentityUsage) => identityDisplayName(id) === row.label);
+    return matched.length > 0 ? matched : all;
+  }, [identities.data, row.label]);
+
+  if (identities.isPending) {
+    return <p className="text-muted-foreground text-sm">{t("common.loading")}</p>;
+  }
+  if (identities.isError) {
+    return (
+      <div className="flex items-center gap-2" role="alert">
+        <p className="text-destructive text-sm">{usageErrMsg(identities.error, t)}</p>
+        <Button size="sm" variant="outline" onClick={() => void identities.refetch()}>
+          {t("common.retry")}
+        </Button>
+      </div>
+    );
+  }
+
+  if (intent === "alias") {
+    if (aliases.isPending) {
+      return <p className="text-muted-foreground text-sm">{t("common.loading")}</p>;
+    }
+    if (aliases.isError) {
+      return (
+        <div className="flex items-center gap-2" role="alert">
+          <p className="text-destructive text-sm">{usageErrMsg(aliases.error, t)}</p>
+          <Button size="sm" variant="outline" onClick={() => void aliases.refetch()}>
+            {t("common.retry")}
+          </Button>
+        </div>
+      );
+    }
+    return (
+      <ProviderAliasDialog
+        open
+        onOpenChange={(open) => {
+          if (!open) onClose();
+        }}
+        identities={candidates}
+        explicitlyBound={explicitlyBound}
+        currentAliases={aliases.data?.aliases ?? []}
+        t={t}
+      />
+    );
+  }
+
+  return (
+    <BillingAssignmentDialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+      identities={candidates}
+      range={range}
+      t={t}
+    />
   );
 }
 
@@ -178,6 +400,13 @@ export function UsageRecordsPanel({
 }: UsageRecordsPanelProps) {
   /** 已展开的超限卡片（逐卡独立；`toolId` 即卡片 key）——**纯视图态**，不上提（导出用不到它） */
   const [expandedKeys, setExpandedKeys] = useState<readonly string[]>([]);
+  /** 待处理的行（点击后才查询 identities；Dialog 关闭即清空）。`intent` 分派两个独立浮窗。 */
+  const [assign, setAssign] = useState<{
+    card: UsageCard;
+    row: UsageRow;
+    intent: "billing" | "alias";
+    explicitlyBound: boolean;
+  } | null>(null);
 
   // 筛选状态与三层日档守卫全部来自页面注入的**唯一出处**（`useRecordsFilters`）：
   // 「第一层」= `dayTier`（下面的 disabled + 常驻原因）；「第二层」复位与「第三层」filters 双保险
@@ -195,6 +424,56 @@ export function UsageRecordsPanel({
 
   const records = useUsageRecordsQuery(range, cardDim, filters);
   const cards = records.data?.cards ?? [];
+
+  /**
+   * 归属映射：
+   *  * tool 卡按 `${sourceId}|${label}` —— 不同工具的同一 label 不得互相覆盖；
+   *  * project 卡按 label 聚合**所有**同 label identity（identity 无 project 字段），保守判定。
+   */
+  const identities = useUsageIdentitiesQuery(range, filters);
+  const { byTool, byLabel } = useMemo(() => {
+    const toolMap = new Map<string, IdentityUsage[]>();
+    const labelMap = new Map<string, IdentityUsage[]>();
+    for (const identity of identities.data ?? []) {
+      const label = identityDisplayName(identity);
+      const toolKey = `${identity.identity.sourceId}|${label}`;
+      toolMap.set(toolKey, [...(toolMap.get(toolKey) ?? []), identity]);
+      labelMap.set(label, [...(labelMap.get(label) ?? []), identity]);
+    }
+    return { byTool: toolMap, byLabel: labelMap };
+  }, [identities.data]);
+
+  /** 同一行在 tool / project 卡下的身份集合：tool 卡按工具隔离，project 卡按 label 聚合。 */
+  const identitiesOf = (card: UsageCard, label: string) =>
+    cardDim === "tool" ? byTool.get(`${card.toolId}|${label}`) : byLabel.get(label);
+
+  const attributionOf = (card: UsageCard, label: string): RowAttribution =>
+    aggregateAttribution(identitiesOf(card, label));
+
+  const aliases = useUsageProviderAliasesQuery();
+  const aliasRules = aliases.data?.aliases ?? [];
+  /** 命中任一身份别名即视为可编辑（打开浮窗后由用户选择具体身份）。 */
+  const hasAlias = (card: UsageCard, label: string): boolean =>
+    (identitiesOf(card, label) ?? []).some((identity) =>
+      Boolean(findAliasForIdentity(aliasRules, identity))
+    );
+
+  /**
+   * 行显示名：供应商别名优先，原始模型名不变。
+   *  * 同一行只映射到一个显示名时采用（例如 `zhipuai / glm-5` → `智谱 / glm-5`）；
+   *  * project 卡把同名 label 跨工具聚合，若映射出多个显示名则保守回退原始 label；
+   *  * identities 缺失/为空时回退原始 label。
+   * 行数据与 tooltip 始终保留原始「供应商 / 模型」。
+   */
+  const displayLabelOf = (card: UsageCard, row: UsageRow): string => {
+    const list = identitiesOf(card, row.label);
+    if (!list || list.length === 0) return row.label;
+    const labels = new Set(list.map((identity) => displayIdentityLabel(aliasRules, identity)));
+    return labels.size === 1 ? [...labels][0] : row.label;
+  };
+
+  /** 旧版计费归属/参考价规则管理器：从记录页页脚的「高级」入口打开。 */
+  const [rulesOpen, setRulesOpen] = useState(false);
 
   const toggleExpanded = (key: string) =>
     setExpandedKeys((prev) =>
@@ -231,6 +510,15 @@ export function UsageRecordsPanel({
             cardDim={cardDim}
             expanded={expandedKeys.includes(c.toolId)}
             onToggle={toggleExpanded}
+            onAssign={(card, row) =>
+              setAssign({ card, row, intent: "billing", explicitlyBound: false })
+            }
+            onAlias={(card, row, explicitlyBound) =>
+              setAssign({ card, row, intent: "alias", explicitlyBound })
+            }
+            displayLabelOf={displayLabelOf}
+            attributionOf={attributionOf}
+            hasAlias={hasAlias}
             t={t}
           />
         ))}
@@ -307,7 +595,8 @@ export function UsageRecordsPanel({
 
       {body}
 
-      {/* 页脚口径：`parentsOnly` 时**同步**切「不含子代理」（spec §4.3 明文）；保留期由设置项给 */}
+      {/* 页脚口径：`parentsOnly` 时**同步**切「不含子代理」（spec §4.3 明文）；保留期由设置项给。
+          旧版计费归属/参考价规则不再逐行露出，收进这里的「高级」入口。 */}
       <footer data-testid="usage-records-caliber" className="text-muted-foreground text-xs">
         {parentsOnly ? t("usage.records.caliberParentsOnly") : t("usage.records.caliberInclude")}
         {retentionDays != null ? (
@@ -316,7 +605,33 @@ export function UsageRecordsPanel({
             {t("usage.records.retention", { days: retentionDays })}
           </span>
         ) : null}
+        {" · "}
+        <Button
+          size="xs"
+          variant="link"
+          className="h-auto p-0 text-xs"
+          data-testid="usage-records-billing-advanced"
+          onClick={() => setRulesOpen(true)}
+        >
+          {t("usage.records.billingRulesAdvanced")}
+        </Button>
       </footer>
+
+      {assign ? (
+        <AssignmentLoader
+          card={assign.card}
+          row={assign.row}
+          cardDim={cardDim}
+          range={range}
+          filters={filters}
+          intent={assign.intent}
+          explicitlyBound={assign.explicitlyBound}
+          onClose={() => setAssign(null)}
+          t={t}
+        />
+      ) : null}
+
+      <BillingProfilesManager t={t} open={rulesOpen} onOpenChange={setRulesOpen} hideTrigger />
     </div>
   );
 }

@@ -23,8 +23,11 @@ import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { useAppTranslation } from "@/hooks/use-app-translation";
 import { usageErrMsg } from "@/components/usage/usageErrors";
+import { PricingStatusPanel } from "@/components/usage/PricingStatusPanel";
+import { UsageConfigDialog } from "@/components/usage/UsageConfigDialog";
 import { USAGE_KEY, useUsageSettingsQuery } from "@/lib/query/queries/usage";
 import { usageSetSettings } from "@/lib/api/usage";
+import { useDisplayCurrency, type DisplayCurrency } from "@/lib/usage/displayCurrency";
 import { subscribeConfig } from "@/components/pet/petConfig";
 import { loadActiveId } from "@/components/pet/petRuntime";
 import type { UsageSettings, UsageSettingsPatch } from "@/types/usage";
@@ -84,6 +87,14 @@ export function UsageSection() {
   const [poseReset, setPoseReset] = useState(false);
   /** 写入序号：只让**最后一次**写入的合并对象回写本地态（连续改动时旧响应不得覆盖新值） */
   const seqRef = useRef(0);
+  /** 费用展示币种（USD/CNY）：只影响显示层，不改账本/价格源/导出 */
+  const { currency, rate, setCurrency, setRate } = useDisplayCurrency();
+  /** 汇率输入草稿：允许用户输入过程中出现无效串，只有合法值才落库 */
+  const [rateDraft, setRateDraft] = useState(rate);
+
+  useEffect(() => {
+    setRateDraft(rate);
+  }, [rate]);
 
   useEffect(() => {
     // 一次性落地：之后本地态由写入返回的合并对象驱动，查询重取（失效后）不再覆盖用户正在编辑的值
@@ -261,6 +272,75 @@ export function UsageSection() {
                 }
               />
             </SettingRow>
+            <div className="border-t" />
+
+            {/* 显示币种（V2 手工测试反馈）：只影响费用展示；价格源与 CSV 仍为 USD */}
+            <SettingRow
+              label={t("settings.usage.displayCurrency")}
+              hint={t("settings.usage.displayCurrencyHint")}
+              htmlFor="usage-display-currency"
+            >
+              <select
+                id="usage-display-currency"
+                data-testid="usage-display-currency"
+                className="bg-background h-8 rounded-md border px-2 text-sm"
+                value={currency}
+                onChange={(e) => setCurrency(e.currentTarget.value as DisplayCurrency)}
+              >
+                <option value="usd">USD</option>
+                <option value="cny">CNY</option>
+              </select>
+            </SettingRow>
+            {currency === "cny" ? (
+              <>
+                <div className="border-t" />
+                <SettingRow
+                  label={t("settings.usage.usdCnyRate")}
+                  hint={t("settings.usage.usdCnyRateHint")}
+                  htmlFor="usage-usd-cny-rate"
+                >
+                  <Input
+                    id="usage-usd-cny-rate"
+                    data-testid="usage-usd-cny-rate"
+                    inputMode="decimal"
+                    className="h-8 w-24 text-right font-mono text-sm tabular-nums"
+                    value={rateDraft}
+                    onChange={(e) => {
+                      setRateDraft(e.currentTarget.value);
+                      setRate(e.currentTarget.value);
+                    }}
+                    onBlur={() => setRateDraft(rate)}
+                  />
+                </SettingRow>
+              </>
+            ) : null}
+            <div className="border-t" />
+
+            {/* 显示与计价配置（2026-10-20 第三轮修订）：设置页与 D 卡共用一个弹窗；
+              弹窗内上半是模型条目，下半是可折叠的高级覆盖（只保留四价覆盖）。 */}
+            <div className="flex items-center justify-between gap-4 py-2.5">
+              <div className="min-w-0 flex-1">
+                <p className={SETTINGS_FIELD}>{t("usage.config.title")}</p>
+                <p className="text-muted-foreground mt-0.5 text-xs">{t("usage.config.desc")}</p>
+              </div>
+              <UsageConfigDialog
+                t={t}
+                instanceId="settings"
+                trigger={
+                  <Button size="sm" variant="outline" data-testid="usage-config-open-settings">
+                    {t("usage.config.open")}
+                  </Button>
+                }
+              />
+            </div>
+            <div className="border-t" />
+
+            {/* 定价目录状态（Task 17）：与「计费渠道与规则」并列；开关/刷新都需用户显式操作 */}
+            <div className="space-y-1 py-2.5">
+              <p className={SETTINGS_FIELD}>{t("settings.usage.pricingTitle")}</p>
+              <p className="text-muted-foreground text-xs">{t("settings.usage.pricingHint")}</p>
+              <PricingStatusPanel t={t} />
+            </div>
             <div className="border-t" />
 
             {/* 供应商映射规则（JSON）**已从界面撤下**（2026-10-07 用户裁决）：
