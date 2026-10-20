@@ -1,41 +1,33 @@
-// 大看板页（计划② Task 6 步骤 7 + Task 7 步骤 5 + Task 8 步骤 6 + Task 9 步骤 5）：范围条 + 页签壳
-// （看板 / 记录，共用同一 range）+ 看板三态 + 首屏概要 + 趋势卡 + 工作小结 + 分布卡。窗口与两个入口
-// 见 `src/lib/usage/openWindow.ts` / `main-title-bar.tsx` / `PetMenu.tsx`；Task 11 在本页范围条同行
-// 右侧插入导出行。
+// 大看板页（V2 Task 12）：A 总览 / B 趋势 / C 分布 / E 工作活动。
 //
-// 数据流（§3 第 15/16/17 条）：
-//  * 打开即 `useUsageCollect()` 按需采集**一次**（`force=false`；最小间隔与并发单飞由后端保证，
-//    前端不做二次节流）——采集成功后一次失效 `["usage"]` 前缀，读查询随之重取；
-//  * 三条读命令只读账本、**绝不触发扫描**；环比**不另发第二个查询**（差值由 `UsageSummary` 前端算）；
-//  * 设置走 `useUsageSettingsQuery`（**唯一**设置入口；直接调 `usageGetSettings` 会逃出 `["usage"]` 失效家族）。
+// 编排原则：
+//  * A/E 用旧 `useUsageDashboardQuery`（固定 tool 口径，仅供总览与工作活动）；
+//  * B 用 `useUsageTrendQuery(range, trendSelection)`（局部筛选不联动 A/C）；
+//  * C 用 `useUsageDistributionQuery(range, distributionGroup)`（默认按计费渠道）；
+//  * 渠道筛选选项用 `useUsageChannelOptionsQuery(range)`（显示渠道，非未指定/可能混合）；
+//  * 每个分区独立三态：某个查询失败只替换该卡体并可重试，不互相拖垮。
 //
-// 三态分支（spec P8）：`isPending → 加载` / `isError → 错误（可重试，message 走 usageErrMsg）` /
-// `isDashboardEmpty → 空态` / 否则 board。切档时 `custom` 走 `clampCustomRange` 并回写 `clamped`，
-// 其余档清 `clamped`。
-//
-// 分组维度（Task 7 步骤 5）：`groupBy` 由常量改为**可切换 state**（默认「按工具」），四维切换只改
-// 查询入参（`useUsageDashboardQuery(range, groupBy)` 的键含它）——分布卡是受控组件，切换回调进这里。
-//
-// 页签壳（Task 9 步骤 5）：`tab` 默认 `"board"`；**两页签共用同一 `range` 与同一次打开窗口**——
-// 记录页签只换渲染分支（`UsageRecordsPanel` 自带三态，**不复用** board 的 `body`），range / 设置 /
-// 采集仍是本页这一份；而**筛选状态与卡片维度由本页持有**（`useRecordsFilters`，2026-10-06 用户裁决
-// 「CSV 要接收记录页筛选」之后，屏幕与导出必须同一出处）。
+// 折叠状态与筛选状态**都在页面顶层**（不在 board 条件子树里）：切范围/页签不重置；
+// 重开窗口恢复默认（C 展开、E 收起、D 收起）。
 import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { TitleBar } from "@/components/common/title-bar";
 import { WindowFrame } from "@/components/common/window-frame";
 import { Button } from "@/components/ui/button";
 import { trendPoints } from "@/components/usage/TrendChart";
-import { UsageDistributionCard } from "@/components/usage/UsageDistributionCard";
+import { UsageCostCard } from "@/components/usage/UsageCostCard";
+import { UsageDistributionBody } from "@/components/usage/UsageDistributionCard";
 import { UsageExportActions } from "@/components/usage/UsageExportActions";
+import { UsageFold } from "@/components/usage/UsageFold";
 import { UsageRecordsPanel } from "@/components/usage/UsageRecordsPanel";
 import { UsageEmpty, UsageError, UsageLoading } from "@/components/usage/UsageStates";
 import { UsageRangeBar } from "@/components/usage/UsageRangeBar";
 import { UsageSummary } from "@/components/usage/UsageSummary";
 import { UsageTrendCard } from "@/components/usage/UsageTrendCard";
-import { UsageWorkSummary } from "@/components/usage/UsageWorkSummary";
+import { UsageTrendFilters } from "@/components/usage/UsageTrendFilters";
+import { UsageWorkSummaryBody, workHeaderCounts } from "@/components/usage/UsageWorkSummary";
 import { usageErrMsg } from "@/components/usage/usageErrors";
-import { fmtTokens } from "@/lib/usage/format";
+import { EM_DASH, fmtInt, fmtTokens } from "@/lib/usage/format";
 import { getLang } from "@/lib/usage/lang";
 import {
   useUsageCollect,
@@ -43,57 +35,114 @@ import {
   useUsageSettingsQuery,
 } from "@/lib/query/queries/usage";
 import {
+  useUsageChannelOptionsQuery,
+  useUsageDistributionQuery,
+  useUsageTrendQuery,
+} from "@/lib/query/queries/usageV2";
+import {
   clampCustomRange,
   compareSuffix,
   defaultCustomRange,
   DEFAULT_PRESET,
   isDashboardEmpty,
-  prevOf,
   rangeOf,
-  tokenUnmeasured,
+  type TFn,
 } from "@/lib/usage/range";
 import { useRecordsFilters } from "@/lib/usage/useRecordsFilters";
 import type { UsageGroupBy, UsageRangePreset } from "@/types/usage";
+import type { DistributionGroup, TrendSelection } from "@/types/usageV2";
 
-/** 窗口内的两个页签（spec P3「两者同一窗口、两个页签」）；数组顺序即页签条顺序 */
 type UsageTab = "board" | "records";
+
+/**
+ * 把 `UsageTrend.reason` 收敛成可展示文案：
+ *  * i18n 键（`usage.*`）→ `t(key)`；
+ *  * 错误码（`usage-*`）→ `usageErrMsg` 的本地化模板（不直接印码名）；
+ *  * 其他人话原样。
+ */
+function trendUnavailableText(reason: string | null, t: TFn): string {
+  if (!reason) return t("usage.trend.unavailable");
+  if (reason.startsWith("usage.")) return t(reason);
+  if (reason.startsWith("usage-")) {
+    return (
+      usageErrMsg({ code: reason, detail: "" }, t)
+        .replace(/[：:]\s*$/, "")
+        .trim() || t("usage.trend.unavailable")
+    );
+  }
+  return reason;
+}
+
+interface Folds {
+  distribution: boolean;
+  cost: boolean;
+  work: boolean;
+}
+
+/** 无 Card 的分区错误体（供折叠卡内容区使用，避免卡中卡） */
+function SectionError({
+  message,
+  retryLabel,
+  onRetry,
+}: {
+  message: string;
+  retryLabel: string;
+  onRetry(): void;
+}) {
+  return (
+    <div className="space-y-2" role="alert">
+      <p className="text-destructive text-sm">{message}</p>
+      <Button size="sm" variant="outline" onClick={onRetry}>
+        {retryLabel}
+      </Button>
+    </div>
+  );
+}
 
 export default function UsageDashboardPage() {
   const { t } = useTranslation();
-  // 格式化语言（issue #160）：趋势卡峰值的数值单位（万/亿 vs K/M/B）随界面语言走。
   const lang = getLang();
   const [preset, setPreset] = useState<UsageRangePreset>(DEFAULT_PRESET);
   const [custom, setCustom] = useState(() => defaultCustomRange(new Date()));
   const [clamped, setClamped] = useState(false);
-  /** 分布维度：默认「按工具」（spec P1 第 5 条的四维之一） */
-  const [groupBy, setGroupBy] = useState<UsageGroupBy>("tool");
-  /** 当前页签：默认看板；记录页签共用同一个 `range`（同一次打开窗口） */
   const [tab, setTab] = useState<UsageTab>("board");
+
+  // —— 顶层交互状态（切范围 / 页签不重置）——
+  // API 等效费用（D 卡）默认展开（2026-10-20 用户裁决）。
+  const [folds, setFolds] = useState<Folds>({
+    distribution: true,
+    cost: true,
+    work: false,
+  });
+  const [distributionGroup, setDistributionGroup] = useState<DistributionGroup>("billingProfile");
+  const [distributionExpanded, setDistributionExpanded] = useState(false);
+  const [trendSelection, setTrendSelection] = useState<TrendSelection>({ scope: "all" });
 
   const range = rangeOf(preset, custom);
   useUsageCollect();
   const settings = useUsageSettingsQuery();
-  const dashboard = useUsageDashboardQuery(range, groupBy);
-  /**
-   * 记录页筛选（工具 chips + 子代理开关）与**卡片维度**的**唯一出处**。
-   *
-   * **为什么由本页持有**（2026-10-06 用户裁决：「CSV 需要接收记录页的筛选条件……那最后导出的 CSV
-   * 应该也是这么一个口径」）：导出与屏幕若各持一份状态必然漂移，且漂移在界面上**看不出来**。
-   * 故屏幕（`UsageRecordsPanel`）与导出（`UsageExportActions`）读的是同一份；三层日档守卫
-   * （判据 / 复位 / filters 双保险）跟着状态一起搬进 `useRecordsFilters`，**没有**被落下。
-   */
+
+  // A/E 只看全局口径；旧 groupBy 不再驱动 C，固定 "tool" 也供固定分享/Token CSV 使用。
+  const boardGroupBy: UsageGroupBy = "tool";
+  const dashboard = useUsageDashboardQuery(range, boardGroupBy);
+  // B 的渠道选项 = 显示渠道（后端已排除 unassigned/ambiguous 与归档渠道）
+  const channelOptions = useUsageChannelOptionsQuery(range);
+  // 渠道模式但选项未就绪（selectedId 为空）时不发空键 trend 请求；加载/错误由筛选器就地展示。
+  const trendEnabled = !(
+    trendSelection.scope === "billingProfile" &&
+    (trendSelection.selectedId === "" || channelOptions.isPending)
+  );
+  const trendQuery = useUsageTrendQuery(range, trendSelection, { enabled: trendEnabled });
+  const distributionQuery = useUsageDistributionQuery(range, distributionGroup);
   const rec = useRecordsFilters(range);
 
-  /** 切档：预设四档只发 `preset`（窗口边界由后端裁定）；切到非自定义档即清「已截断」提示 */
+  const setFold = (key: keyof Folds) => (open: boolean) => setFolds((v) => ({ ...v, [key]: open }));
+
   const handleSelectPreset = (next: UsageRangePreset) => {
     setPreset(next);
     if (next !== "custom") setClamped(false);
   };
 
-  /**
-   * 自定义日期编辑：先 `clampCustomRange`（31 天含首尾）再回写——输入框显示的必须是**实际查询**的区间；
-   * `clamped` 只在真被上限截断时为真，常驻到用户下次编辑日期（状态归本页持有）。
-   */
   const handleCustomChange = (next: { from: string; to: string }) => {
     const fixed = clampCustomRange(next.from, next.to);
     setCustom({ from: fixed.from, to: fixed.to });
@@ -101,12 +150,15 @@ export default function UsageDashboardPage() {
   };
 
   const dash = dashboard.data;
-  let body: ReactNode;
+  const trend = trendQuery.data;
+  const dist = distributionQuery.data;
+
+  // —— A 总览（固定展开，不可折叠）——
+  let summary: ReactNode;
   if (dashboard.isPending) {
-    body = <UsageLoading label={t("common.loading")} />;
+    summary = <UsageLoading label={t("common.loading")} />;
   } else if (dashboard.isError) {
-    // 用量命令 reject 结构化 `{ code, detail }` → 一律 usageErrMsg（String(e) 会印 [object Object]）
-    body = (
+    summary = (
       <UsageError
         title={t("usage.error.title")}
         message={usageErrMsg(dashboard.error, t)}
@@ -115,82 +167,150 @@ export default function UsageDashboardPage() {
       />
     );
   } else if (!dash || isDashboardEmpty(dash)) {
-    // 空态：显示「暂无数据」而不是 0；`collectedAt === 0` 的哨兵文案在 board 的 asOf / 页脚
-    body = <UsageEmpty label={t("usage.empty")} />;
+    summary = <UsageEmpty label={t("usage.empty")} />;
   } else {
-    // 趋势点归一在 Task 4 的 `trendPoints` 里（值口径 = 请求输入 + 产出，与 hero 同源，不从四桶反推）；
-    // 峰值文案由本页生成（万/亿缩写），任务 7 的卡片在 `busy` 时自己不显示它（不拿上一档的数字糊弄）
-    const points = trendPoints(dash.trend);
-    // **没量到 token** 的窗口（2026-10-06 用户裁决）：趋势的**峰值**与**区间合计环比**都是 token 量
-    // ⇒ 交给卡片**整卡空态**（`unmeasured` prop）——全零趋势会被画成一条贴底零线，那是假图；
-    // 页面**不再**用「峰值 —」去打补丁（整卡不渲染，那个怪值就不该存在）。
-    const unmeasured = tokenUnmeasured(dash);
-    // 趋势区的**文字**环比（spec P8：「指标网格各项**与趋势区**都显示对比值」）。
-    // 口径 = 本区间 hero（= Σ 趋势点值 = `requestTotal + output`）环比上一等长区间；
-    // 不画上一周期的折线——契约只带上一周期的聚合值，没有序列（画线要改冻结契约）。
-    // ⚠️ **必须带主语**（2026-10-06 评审）：这一行在卡面上紧贴在「峰值 {{v}}」正下方，而它比的是
-    // **整窗合计**、不是峰值。不加主语就会读成「峰值 11.28万，上一周期 175.18万，还涨 16.3%」——
-    // 数字全对、归属全错。故前缀 `usage.card.compareSubject`（「区间合计」）。
-    // `compare === null` → `prevHero === null` → `compareSuffix` 返回空串 ⇒ 整段不渲染（不出 0% / NaN）。
-    const prevHero = (() => {
-      const p = prevOf(dash.compare);
-      return p ? p.metrics.requestTotal + p.buckets.output : null;
-    })();
-    const trendCompare = compareSuffix(dash.hero, prevHero, t);
-    const trendCompareLabel =
-      trendCompare === "" ? "" : `${t("usage.card.compareSubject")} ${trendCompare}`;
-    body = (
-      <>
-        <UsageSummary
-          dash={dash}
-          retentionDays={settings.data?.detailRetentionDays ?? null}
-          t={t}
-        />
-        <UsageTrendCard
-          points={points}
-          // 没量到 token ⇒ **整卡空态**（不给峰值、也不画零线）：判据只在卡片自己那一处生效，
-          // 页面**不再**用 `peakLabel = —` 去打补丁（整卡不渲染，「峰值 —」这个怪值就不该存在）。
-          unmeasured={unmeasured}
-          peakLabel={t("usage.card.peak", {
-            v: fmtTokens(Math.max(0, ...points.map((p) => p.value)), lang),
-          })}
-          compareLabel={trendCompareLabel}
-          title={t("usage.card.trend")}
-          loadingLabel={t("common.loading")}
-          emptyLabel={t("usage.empty")}
-          busy={dashboard.isFetching}
-        />
-        {/* Task 8 的工作小结区：趋势卡之后、分布卡之前（D15–D19，逐指标空态） */}
-        <UsageWorkSummary work={dash.workSummary} availability={dash.availability} t={t} />
-        <UsageDistributionCard
-          rows={dash.rows}
-          groupBy={groupBy}
-          onGroupByChange={setGroupBy}
-          t={t}
-        />
-      </>
+    summary = (
+      <UsageSummary dash={dash} retentionDays={settings.data?.detailRetentionDays ?? null} t={t} />
     );
   }
+
+  // —— B 趋势（固定展开）——
+  const points = trendPoints(trend?.trend);
+  const trendUnmeasured =
+    !trend ||
+    trend.trend.every((p) => {
+      const b = p.buckets;
+      return !(b.inputFresh + b.cacheRead + b.cacheWrite + b.output > 0);
+    });
+  const prevHero =
+    trend?.compare == null
+      ? null
+      : trend.compare.prevMetrics.requestTotal + trend.compare.prevBuckets.output;
+  const trendCompareSuffix =
+    trend && !trendQuery.isFetching ? compareSuffix(trend.hero, prevHero, t) : "";
+  const compareLabel =
+    trendCompareSuffix === "" ? "" : `${t("usage.card.compareSubject")} ${trendCompareSuffix}`;
+  const peakLabel = t("usage.card.peak", {
+    v: fmtTokens(Math.max(0, ...points.map((p) => p.value)), lang),
+  });
+  const trendUnavailable = trend && !trend.available ? trendUnavailableText(trend.reason, t) : null;
+
+  // —— E 卡头摘要（会话数 / 工具调用次数；不可得 => —）——
+  const workCounts = workHeaderCounts(dash?.workSummary, dash?.availability);
+  const workFoldSummary = t("usage.work.foldSummary", {
+    sessions: workCounts.sessions === null ? EM_DASH : fmtInt(workCounts.sessions),
+    toolCalls: workCounts.toolCalls === null ? EM_DASH : fmtInt(workCounts.toolCalls),
+  });
+
+  // —— 分区正文 ——
+  let workContent: ReactNode;
+  if (dashboard.isPending) {
+    workContent = <p className="text-muted-foreground text-sm">{t("common.loading")}</p>;
+  } else if (dashboard.isError) {
+    workContent = (
+      <SectionError
+        message={usageErrMsg(dashboard.error, t)}
+        retryLabel={t("common.retry")}
+        onRetry={() => void dashboard.refetch()}
+      />
+    );
+  } else {
+    workContent = (
+      <UsageWorkSummaryBody work={dash?.workSummary} availability={dash?.availability} t={t} />
+    );
+  }
+
+  let distributionContent: ReactNode;
+  if (distributionQuery.isPending) {
+    distributionContent = <p className="text-muted-foreground text-sm">{t("common.loading")}</p>;
+  } else if (distributionQuery.isError) {
+    distributionContent = (
+      <SectionError
+        message={usageErrMsg(distributionQuery.error, t)}
+        retryLabel={t("common.retry")}
+        onRetry={() => void distributionQuery.refetch()}
+      />
+    );
+  } else {
+    distributionContent = (
+      <UsageDistributionBody
+        rows={dist?.rows ?? []}
+        groupBy={distributionGroup}
+        onGroupByChange={setDistributionGroup}
+        expanded={distributionExpanded}
+        onExpandedChange={setDistributionExpanded}
+        t={t}
+      />
+    );
+  }
+
+  const board = (
+    <>
+      {summary}
+
+      <UsageTrendCard
+        points={points}
+        unmeasured={trendUnmeasured}
+        peakLabel={peakLabel}
+        compareLabel={compareLabel}
+        title={t("usage.card.trend")}
+        loadingLabel={t("common.loading")}
+        emptyLabel={t("usage.empty")}
+        busy={
+          trendQuery.isFetching ||
+          (trendSelection.scope === "billingProfile" && channelOptions.isPending)
+        }
+        filters={
+          <UsageTrendFilters
+            selection={trendSelection}
+            onChange={setTrendSelection}
+            channels={channelOptions.data ?? []}
+            channelsPending={channelOptions.isPending}
+            channelsError={channelOptions.isError ? usageErrMsg(channelOptions.error, t) : null}
+            onRetryChannels={() => void channelOptions.refetch()}
+            unavailable={trend?.available === false}
+            t={t}
+          />
+        }
+        unavailableHint={trendUnavailable}
+        errorMessage={trendQuery.isError ? usageErrMsg(trendQuery.error, t) : null}
+        retryLabel={t("common.retry")}
+        onRetry={() => void trendQuery.refetch()}
+      />
+
+      {/* C 用量分布：可折叠，默认展开；Top5 展开状态独立 */}
+      <UsageFold
+        id="distribution"
+        title={t("usage.card.distribution")}
+        open={folds.distribution}
+        onOpenChange={setFold("distribution")}
+      >
+        {distributionContent}
+      </UsageFold>
+
+      {/* D API 等效费用：位于 C 后、E 前；折叠状态与 C/E 一起放在页面顶层 */}
+      <UsageCostCard range={range} open={folds.cost} onOpenChange={setFold("cost")} t={t} />
+
+      {/* E 工作活动：默认折叠；卡头摘要常在，高级统计在展开后的第二个 details */}
+      <UsageFold
+        id="work"
+        title={t("usage.work.title")}
+        open={folds.work}
+        onOpenChange={setFold("work")}
+        summary={workFoldSummary}
+      >
+        {workContent}
+      </UsageFold>
+    </>
+  );
 
   return (
     <WindowFrame
       titleBar={<TitleBar title={t("usage.title")} showMinimize={false} />}
       contentClassName="flex-1 overflow-y-auto"
     >
-      <div className="space-y-4 p-5">
-        {/* 范围条 + 导出 + 页签条 = **吸顶头**（2026-10-06 排版修复）：看板窗 1040×720 而内容约
-            1700px ⇒ 范围条一滚就没了（真机截图顶部只剩页签条，五档范围与导出全在视口外）。
-            `-mx-5 px-5` 抵消外层 `p-5` 让底色铺满整宽；`bg-background/95` + `backdrop-blur`
-            保证滚过的内容不透出来；取色一律主题 token（零硬编码色值）。 */}
-        <div className="bg-background/95 sticky top-0 z-10 -mx-5 space-y-4 border-b px-5 pt-5 pb-3 backdrop-blur">
-          {/* 范围条与导出行**同行**：左侧五档 + 自定义区间，右侧导出动作条（Task 11 步骤 6）。
-            导出口径 = **当前页签那一份**（2026-10-06 用户裁决：CSV 要接收记录页的筛选条件）：
-            * 记录页签 → 记录页的 `filters`（工具 chips + 子代理模式，经三层日档守卫）与**卡片维度**
-              `cardDim` 作 `groupBy` —— 屏幕上按什么分组，导出就按什么分组；记录页的卡片维度控件
-              就在同一屏，用户看得见；
-            * 看板页签 → `filters: {}` + 看板的分布维度 `groupBy`（看板没有筛选控件，故不筛）。
-            `filters` 由 `useRecordsFilters` 产出（**已经是**第三层守卫的产物：日档不含
-            `subagentMode`），所以这里**不会**撞上「日档 + parentsOnly」的 `usage-filter-unavailable`。 */}
+      <div className="space-y-3 p-4">
+        <div className="bg-background/95 sticky top-0 z-10 -mx-4 space-y-3 border-b px-4 pt-4 pb-2 backdrop-blur">
           <div className="flex flex-wrap items-start justify-between gap-2">
             <UsageRangeBar
               preset={preset}
@@ -205,12 +325,12 @@ export default function UsageDashboardPage() {
               range={range}
               tab={tab}
               filters={tab === "records" ? rec.filters : {}}
-              groupBy={tab === "records" ? rec.cardDim : groupBy}
+              // 固定分享 / Token CSV 仍按工具口径；记录页用卡片维度。
+              groupBy={tab === "records" ? rec.cardDim : boardGroupBy}
               t={t}
             />
           </div>
 
-          {/* 页签条（范围条下方；Task 11 的导出行落在范围条同行右侧，与这里不争位） */}
           <div className="flex items-center gap-1.5">
             {(["board", "records"] as const).map((key) => (
               <Button
@@ -228,9 +348,8 @@ export default function UsageDashboardPage() {
         </div>
 
         {tab === "board" ? (
-          body
+          board
         ) : (
-          // 记录页：面板自带三态；筛选状态与卡片维度由本页注入（与导出行**同一份**，见上）
           <UsageRecordsPanel
             range={range}
             retentionDays={settings.data?.detailRetentionDays ?? null}

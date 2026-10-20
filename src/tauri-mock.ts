@@ -8,12 +8,38 @@
 // 用量域 case 体改用**同源夹具**（计划② Task 1）：与 tests/msw/tauriMocks.ts 共用
 // src/lib/usage/mockFixtures.ts，双端形状从源头一致（门禁 tests/usage/usageMockParity.test.ts）
 import {
+  mockBillingCommit,
+  mockBillingGet,
+  mockBillingPreview,
+  mockBillingUndo,
+  mockChannelOptions,
+  mockPricingCatalog,
+  mockPricingGet,
+  mockPricingOverrideDelete,
+  mockPricingOverridesGet,
+  mockPricingOverrideSet,
+  mockPricingRefresh,
+  mockPricingSetEnabled,
+  mockProviderAliasDelete,
+  mockProviderAliasesGet,
+  mockProviderAliasUpsert,
   mockUsageCollect,
+  mockUsageCostCsv,
+  mockUsageCosts,
   mockUsageCsv,
   mockUsageDashboard,
+  mockUsageDistribution,
+  mockUsageIdentities,
   mockUsageMode,
   mockUsageRecords,
   mockUsageSettings,
+  mockUsageTrend,
+  mockModelDisplayNameSet,
+  mockObservedEntriesGet,
+  mockPricingAutoMatch,
+  mockPricingCatalogSearch,
+  mockPricingIdentitySet,
+  mockPricingQuoteGet,
 } from "@/lib/usage/mockFixtures";
 import type {
   UsageFilters,
@@ -22,6 +48,16 @@ import type {
   UsageRecordsGroupBy,
   UsageSettingsPatch,
 } from "@/types/usage";
+import type {
+  BillingCommit,
+  BillingConfig,
+  DistributionGroup,
+  PriceOverrideRequest,
+  ProviderAliasRule,
+  TrendSelection,
+  ModelDisplayNameRequest,
+  PricingIdentityRequest,
+} from "@/types/usageV2";
 
 // Check if running in Tauri
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -938,6 +974,167 @@ if (!isTauri) {
         return mockUsageMode() === "error"
           ? Promise.reject({ code: "usage-db-failed", detail: "mam-mock-usage=error" })
           : Promise.resolve(mockUsageSettings(patch));
+      }
+
+      // —— V2 身份 / Token（Task 5）：与 tests/msw/tauriMocks.ts 共用 mockFixtures ——
+      case "usage_billing_get":
+        return Promise.resolve(mockBillingGet());
+      case "usage_billing_preview": {
+        const candidate =
+          (args as { candidate?: BillingConfig } | undefined)?.candidate ?? mockBillingGet();
+        const range = (args as { range?: UsageRange } | undefined)?.range ?? { preset: "today" };
+        return Promise.resolve(mockBillingPreview(candidate, range));
+      }
+      case "usage_billing_commit":
+        return mockBillingCommit(
+          (args as { request?: BillingCommit } | undefined)?.request ?? {
+            expectedRevision: -1,
+            candidate: mockBillingGet(),
+          }
+        );
+      case "usage_billing_undo": {
+        const a = args as { expectedRevision?: number; targetRevision?: number } | undefined;
+        return mockBillingUndo(a?.expectedRevision ?? -1, a?.targetRevision ?? 0);
+      }
+      case "usage_identities": {
+        const range = (args as { range?: UsageRange } | undefined)?.range ?? { preset: "today" };
+        const filters = (args as { filters?: UsageFilters } | undefined)?.filters ?? {};
+        return Promise.resolve(mockUsageIdentities(range, filters));
+      }
+      case "usage_trend": {
+        const range = (args as { range?: UsageRange } | undefined)?.range ?? { preset: "today" };
+        const selection = (args as { selection?: TrendSelection } | undefined)?.selection ?? {
+          scope: "all",
+        };
+        return Promise.resolve(mockUsageTrend(range, selection));
+      }
+      case "usage_distribution": {
+        const range = (args as { range?: UsageRange } | undefined)?.range ?? { preset: "today" };
+        const groupBy = (args as { groupBy?: DistributionGroup } | undefined)?.groupBy ?? "tool";
+        return Promise.resolve(mockUsageDistribution(range, groupBy));
+      }
+      case "usage_pricing_get":
+        return mockUsageMode() === "error"
+          ? Promise.reject({ code: "usage-db-failed", detail: "mam-mock-usage=error" })
+          : Promise.resolve(mockPricingGet());
+      case "usage_pricing_set_enabled":
+        return mockUsageMode() === "error"
+          ? Promise.reject({ code: "usage-db-failed", detail: "mam-mock-usage=error" })
+          : Promise.resolve(
+              mockPricingSetEnabled((args as { enabled?: boolean } | undefined)?.enabled ?? false)
+            );
+      case "usage_pricing_refresh":
+        return mockUsageMode() === "error"
+          ? Promise.reject({ code: "usage-db-failed", detail: "mam-mock-usage=error" })
+          : Promise.resolve(mockPricingRefresh());
+      case "usage_pricing_catalog": {
+        const catalogArgs = args as { query?: string | null; limit?: number } | undefined;
+        return mockUsageMode() === "error"
+          ? Promise.reject({ code: "usage-db-failed", detail: "mam-mock-usage=error" })
+          : Promise.resolve(mockPricingCatalog(catalogArgs?.query, catalogArgs?.limit));
+      }
+      case "usage_costs": {
+        const range = (args as { range?: UsageRange } | undefined)?.range ?? { preset: "today" };
+        return mockUsageMode() === "error"
+          ? Promise.reject({ code: "usage-db-failed", detail: "mam-mock-usage=error" })
+          : Promise.resolve(mockUsageCosts(range));
+      }
+      case "usage_cost_export_csv": {
+        const range = (args as { range?: UsageRange } | undefined)?.range ?? { preset: "today" };
+        return mockUsageMode() === "error"
+          ? Promise.reject({ code: "usage-db-failed", detail: "mam-mock-usage=error" })
+          : Promise.resolve(mockUsageCostCsv(range));
+      }
+
+      // —— Task 6：供应商别名 / 渠道选项 / 手动覆盖价 ——
+      case "usage_provider_aliases_get":
+        return Promise.resolve(mockProviderAliasesGet());
+      case "usage_provider_alias_upsert": {
+        const rule = (args as { rule?: ProviderAliasRule } | undefined)?.rule;
+        return rule
+          ? mockProviderAliasUpsert(rule)
+          : Promise.reject({
+              code: "usage-settings-invalid",
+              detail: "provider alias id is empty",
+            });
+      }
+      case "usage_provider_alias_delete": {
+        const id = (args as { id?: string } | undefined)?.id ?? "";
+        return mockProviderAliasDelete(id);
+      }
+      case "usage_channel_options": {
+        const range = (args as { range?: UsageRange } | undefined)?.range ?? { preset: "today" };
+        return Promise.resolve(mockChannelOptions(range));
+      }
+      case "usage_pricing_overrides_get":
+        return Promise.resolve(mockPricingOverridesGet());
+      case "usage_pricing_override_set": {
+        const request = (args as { request?: PriceOverrideRequest } | undefined)?.request;
+        return request
+          ? mockPricingOverrideSet(request)
+          : Promise.reject({
+              code: "usage-settings-invalid",
+              detail: "price override normalizedModelId is empty",
+            });
+      }
+      case "usage_pricing_override_delete": {
+        const normalizedModelId =
+          (args as { normalizedModelId?: string } | undefined)?.normalizedModelId ?? "";
+        return mockPricingOverrideDelete(normalizedModelId);
+      }
+
+      // —— 2026-10-20 计划 Task 5：观察条目 / 模型条目配置 / 精选价目目录 ——
+      case "usage_observed_entries_get":
+        return mockUsageMode() === "error"
+          ? Promise.reject({ code: "usage-db-failed", detail: "mam-mock-usage=error" })
+          : Promise.resolve(mockObservedEntriesGet());
+      case "usage_model_display_name_set": {
+        const displayRequest = (args as { request?: ModelDisplayNameRequest } | undefined)?.request;
+        return displayRequest
+          ? mockModelDisplayNameSet(displayRequest)
+          : Promise.reject({
+              code: "usage-settings-invalid",
+              detail: "model config identity is empty",
+            });
+      }
+      case "usage_pricing_identity_set": {
+        const identityRequest = (args as { request?: PricingIdentityRequest } | undefined)?.request;
+        return identityRequest
+          ? mockPricingIdentitySet(identityRequest)
+          : Promise.reject({
+              code: "usage-settings-invalid",
+              detail: "model config identity is empty",
+            });
+      }
+      case "usage_pricing_catalog_search": {
+        const searchArgs = args as
+          { query?: string | null; limit?: number; scope?: string | null } | undefined;
+        const scope = searchArgs?.scope ?? "curated";
+        if (scope !== "curated" && scope !== "all") {
+          return Promise.reject({
+            code: "usage-settings-invalid",
+            detail: "pricing catalog scope is invalid",
+          });
+        }
+        return Promise.resolve(
+          mockPricingCatalogSearch(searchArgs?.query, searchArgs?.limit, scope)
+        );
+      }
+      case "usage_pricing_auto_match": {
+        const matchArgs = args as { modelId?: string; fallbackRate?: string } | undefined;
+        const modelId = matchArgs?.modelId ?? "";
+        return Promise.resolve(mockPricingAutoMatch(modelId, matchArgs?.fallbackRate));
+      }
+      case "usage_pricing_quote_get": {
+        const quoteArgs = args as
+          { providerId?: string; modelId?: string; fallbackRate?: string } | undefined;
+        return Promise.resolve(
+          mockPricingQuoteGet(
+            quoteArgs?.providerId ?? "",
+            quoteArgs?.modelId ?? "",
+            quoteArgs?.fallbackRate
+          )
+        );
       }
 
       // Default: return empty success

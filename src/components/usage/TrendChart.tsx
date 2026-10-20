@@ -13,7 +13,8 @@
 //     `url(#id)` 全部解析到**首个**同 id 实例，撞了就把两张图画成同一个渐变。
 import { useId, useState } from "react";
 import type { ReactElement } from "react";
-import { fmtInt, fmtPct } from "@/lib/usage/format";
+import { fmtTokens, fmtPct } from "@/lib/usage/format";
+import { getLang, type Lang } from "@/lib/usage/lang";
 import type { TrendPoint } from "@/types/usage";
 
 /** 图表点：`trendPoints` 的产物，也是 `TrendChart` 与 tooltip 的唯一入参形状。 */
@@ -135,12 +136,13 @@ export function pathOf(pts: readonly Pt[]): string {
 }
 
 /**
- * tooltip 文案 = 标签 + **完整千分位**（hero 口径 `fmtInt`，不是 `fmtTokens` 的万/亿缩写）
- * + 命中率（1 位小数）。命中率 `null`（该桶算不出）时**整段省略**，绝不印 `0.0%`。
+ * tooltip 文案 = 标签 + **万/亿缩写**（`fmtTokens`，2026-10-19 用户裁决：
+ * Token 数值不再显示完整千分位原始值）+ 命中率（1 位小数）。
+ * 命中率 `null`（该桶算不出）时**整段省略**，绝不印 `0.0%`。
  * 只含结构化摘要（标签 / 数值 / 比率），不含任何会话正文（隐私白名单，spec P8）。
  */
-export function trendTooltipText(p: ChartPoint): string {
-  const head = `${p.label} · ${fmtInt(p.value)}`;
+export function trendTooltipText(p: ChartPoint, locale: Lang = "zh"): string {
+  const head = `${p.label} · ${fmtTokens(p.value, locale)}`;
   return typeof p.hitRate === "number" && Number.isFinite(p.hitRate)
     ? `${head} · ${fmtPct(p.hitRate)}`
     : head;
@@ -326,7 +328,7 @@ export function TrendChartWithTooltip({
           className="bg-popover text-popover-foreground border-border pointer-events-none absolute top-0 z-10 -translate-x-1/2 rounded-md border px-2 py-1 text-xs whitespace-nowrap shadow-md"
           style={{ left: `${pct}%` }}
         >
-          {trendTooltipText(points[active])}
+          {trendTooltipText(points[active], getLang())}
         </div>
       )}
     </div>
