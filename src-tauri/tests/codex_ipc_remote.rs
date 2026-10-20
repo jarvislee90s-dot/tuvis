@@ -2269,8 +2269,20 @@ async fn claude_session_send_ignores_action_id_key() {
         ))
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
-    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let status = r.status();
+    let body = body_string(r).await;
+    // Linux CI 没有终端注入通道（routing 明确返回 platform），该用例只应在
+    // Windows/macOS 上验证 CLI 零漂移；Linux 上如实断言平台拒绝，避免把
+    // “平台不支持”误判为 200 回归。
+    if !matches!(std::env::consts::OS, "windows" | "macos") {
+        assert_eq!(status, 403);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"], "not_injectable");
+        assert_eq!(v["reasonCode"], "platform");
+        return;
+    }
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["status"], "queued", "CLI 黄态照旧入 inject_queue");
     assert!(v.get("actionId").is_none(), "CLI 回执无 actionId 语义");
     assert!(f.codex_audits().is_empty(), "CLI 路径不写 codex_* 审计");
