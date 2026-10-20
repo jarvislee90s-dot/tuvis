@@ -67,7 +67,7 @@ PR 对齐 main 的合并，只从 main 正向抽取。
 | 目标 | 来源 | 处理 |
 | --- | --- | --- |
 | `inject/headless/codex.rs` | #117 H8 + 后续评审修正 | 逐字搬运（PATH/rollout UUID/presence/queue-exec/消费确认/writer lock/cmd 垫片拒绝） |
-| `inject/normalize.rs` | #117 裁决 24b | 逐字搬运（`compose_injection` → `Result`：花名白名单 + 展示截断） |
+| `inject/normalize.rs` | #117 裁决 24b | 逐字搬运（`compose_injection` → `String`：只归一并可选签名，不再按花名拒绝；截断辅助已删） |
 | `inject/routing.rs` | #117 路由表 | **重写为 Codex-only**：`HeadlessKind::{CodexQueue,CodexExec}`、`Channel::Headless`、`headless_kind_of`、`has_terminal_candidate`；其余工具门/终端行为逐字保留 |
 | `inject/queue.rs` | #117 Task 8 义务 2 | 只加「投递侧重判」（`headless_kind_of` → `Deferred`）；不搬 L13/L14 |
 | `monitor/codex_thread_parser.rs` | #117 | 仅 `latest_versioned` 提为 `pub(crate)` |

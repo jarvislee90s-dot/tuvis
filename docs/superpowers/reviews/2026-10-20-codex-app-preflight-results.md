@@ -52,7 +52,7 @@
 | `permissions` | **能力档保持 false**：`item/permissions/requestApproval` 曾出现并完成 accept/decline 双臂（审批证据），但**未据此解锁权限档**；T7 的「读升权/请求未触发」只指读场景，不能写成「从未出现权限请求」 | WIN-LIVE | 报告 T7 + §3 双臂归档；profile 保持 false |
 | `blocking_input` | PASS（整数 requestId + 原 qid 作答） | WIN-LIVE | 报告 T8；`observed/windows-4894-plan-input.sanitized.json` |
 | 原生空首帧 | **NOT_AVAILABLE**（未发送的草稿不落 session） | WIN-LIVE + 产品行为 | 报告 T3；不伪造空会话 |
-| 重启恢复 | PASS（断开 0.94s → stale → 重启 → 用户打开会话后 ≤2s 恢复、owner 换代） | WIN-LIVE | 报告 T9（含补测） |
+| 重启恢复 | PASS（断开 0.94s → stale → 重启 → 用户打开会话后恢复（0.94s 是单次样本，非固定 ≤2s 承诺；受 backoff/操作影响）、owner 换代） | WIN-LIVE | 报告 T9（含补测） |
 | 忙态 start-turn | **Important**：返回同一 turn id + success，但新 prompt 不落 Turn | WIN-LIVE | 报告 §6-2；Task 8 忙态矩阵 |
 | 开场过渡 | 过渡 164–382ms `turnId=null`；正式 userMessage 后到 515–544ms | FIXTURE | 既有 observed 金样；Task 6 后备 |
 | Mac 只读收敛 | 首 snapshot revision 3、10/10 completed、Ready/idle、`stale=false` | MAC-RELAY | 回传《macOS重开只读收敛回传报告》 |

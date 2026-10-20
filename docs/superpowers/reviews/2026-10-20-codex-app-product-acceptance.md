@@ -88,22 +88,23 @@ E6/E10/E11 需要桌面端有人在场按 §4 的点击顺序操作。
 - **交接清单**：`2026-10-20-codex-app-remaining-handoff.md` §3（命令、环境变量、
   验收表、证据回收目录）。Windows 侧结果不得复制为 Mac 的 PASS。
 
-## 8. 已登记的有意偏差（不视为回归，留待用户裁决 Q1/Q2）
+## 7. 已登记的有意偏差与行为变化（不视为回归）
 
-1. **签名开关不适用于 Codex 兼容/Desktop IPC 路**：两条 Codex 发送路径都经
-   `normalize::compose_injection` 恒带 `[mobile <花名>]`，而终端注入按
-   `remote_message_signature` 开关决定是否带签名。理由是 #117 的「来源标记单点组装」
-   与 Desktop IPC 审计溯源；影响仅是 token 与终端可见文本，不影响投递安全。是否让
-   Codex 路也受该开关约束，留待用户裁决（复审 Q1）。
+1. ~~签名开关不适用于 Codex 兼容/Desktop IPC 路~~ **第三轮复审已修复**：两条 Codex
+   路径都在登记时读取 `remote_message_signature` 一次并冻结（新列 `signature_applied` +
+   最终 wire），IPC/队列/兼容/CLI 用同一份；旧行按升级前恒签名。**升级须知（行为变化）**：
+   该开关**默认关闭** ⇒ Codex APP 从此默认**不带** `[mobile 花名]` 来源标记（与上一轮恒
+   签名不同）；需要溯源标记请在电脑端「消息签名」中开启。幂等 hash 仍按原文，开关变化
+   不会造成同 actionId 假冲突。
 2. ~~花名白名单对终端四家同样生效~~ **第三轮复审已修复**：`compose_injection` 不再按
    花名拒绝（emoji/撇号/冒号/组合音标在终端、Desktop IPC、原生 exe 均可发送）；安全门只
    存在于 Windows cmd 垫片的**最终 argv**（`argv_shim_refusal` / `cmd_shim_body_refusal`，
    只拒 `CMD_SHIM_METACHARS` 且仅 `via_cmd_shim` + 载荷进 argv 时）。注册/改名点不加限制，
    也不存在「昵称仅拒绝 cmd 元字符」的全局规则——旧表述已删除。
 
-## 7. 结论
+## 8. 结论
 
 本轮交付的**自动化层**（IPC 协议 / HTTP 集成 / 控制面 / 前端接线 / 双语与错误码门禁）
-全部通过；第三轮审查的 7 项缺陷已修复并有确定性回归（见复审 §10）。**PRODUCT 层双平台
+全部通过；第三轮审查的 7 项缺陷已修复并有确定性回归（见复审 §7.1）。**PRODUCT 层双平台
 适用表仍未完成**，Windows 需用户在场按 §4 操作、Mac 需实际执行者按交接清单跑。按计划
 纪律，不把本次交付宣称为「冻结 spec F1–F8 双平台真机验收完成」。

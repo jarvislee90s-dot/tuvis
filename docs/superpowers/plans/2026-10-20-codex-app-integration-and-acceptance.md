@@ -373,7 +373,7 @@ Mac 正常 GUI/Finder 启动另列启动子格：核实该 Tuvis 实际 PATH；�
 - Task 10：自动化层全绿；**PRODUCT 适用表未执行**（无用户在场的 Desktop 会话操作/审批/重启窗口，
   也无真实手机），按纪律不冒充通过；交接顺序见 `2026-10-20-codex-app-product-acceptance.md` §4。
 - Task 11：PR 在独立复审与修复后创建；本阶段不打 tag、不发版。
-- Task 12：续作 handoff 已入库（`2026-10-20-codex-app-remaining-handoff.md`）；#117/#165 原分支保留。
+- Task 12：续作 handoff 文档已入库（`2026-10-20-codex-app-remaining-handoff.md`）；#117/#165 原分支保留。分支备份/remaining 分支/逐 hunk 整理**未执行**（待新 PR 合入 main 后）。
 - PR：https://github.com/jarvislee90s-dot/tuvis/pull/171（base main；复审后创建）。
 
 ### 第三轮审查修复记录（2026-10-20，用户审查七项）
