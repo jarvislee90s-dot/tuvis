@@ -1007,16 +1007,6 @@ impl DesktopIpcAdapter {
                 None => return not_sent(&envelope_id, "stale_context"),
             }
         };
-        let version = {
-            let conn = self.inner.conn.lock().await;
-            match conn
-                .as_ref()
-                .map(|c| c.version_of("thread-follower-start-turn"))
-            {
-                Some(Ok(v)) => v,
-                _ => return not_sent(&envelope_id, "disconnected"),
-            }
-        };
         let params = json!({
             "conversationId": key.thread_id,
             "turnStart": {
@@ -1028,14 +1018,10 @@ impl DesktopIpcAdapter {
                 "context": {},
             }
         });
-        self.dispatch(
-            "thread-follower-start-turn",
-            version,
-            params,
-            lease,
-            validity,
-        )
-        .await
+        // 版本不在此解析：dispatch 统一按方法表查（无连接 → disconnected，
+        // 方法缺失 → unsupported_method，均为零投递）。
+        self.dispatch("thread-follower-start-turn", params, lease, validity)
+            .await
     }
 
     /// 审批/作答。requestKey/contextToken 回显校验；服务端保存的 pending 上下文是
@@ -1150,13 +1136,7 @@ impl DesktopIpcAdapter {
             return not_sent(&envelope_id, "stale_context");
         }
         let outcome = self
-            .dispatch(
-                &prepared.method,
-                prepared.version,
-                prepared.params,
-                lease,
-                validity,
-            )
+            .dispatch(prepared.method, prepared.params, lease, validity)
             .await;
         // R4.3 + C3：Accepted/Rejected/NotSent（保守零投递，可重试）释放提交权；
         // UnknownDelivery → 保留为 Blocked（记提交所用 token 分代，状态应用驱动清理）。
@@ -1178,17 +1158,27 @@ impl DesktopIpcAdapter {
     }
 
     /// 统一派发：mutating RPC（未知结果绝不自动重试——connection 语义保证）。
+    ///
+    /// **版本号唯一来源 = profile 方法表**：这里按方法名查表（`version_of`），任何调用
+    /// 点都不得自带版本——组装侧硬编码会绕过单一真相源。方法不在表里 = **明确方法
+    /// 缺失** → `NotSent`（零投递），绝不用猜测版本瞎发；**新增方法必须先有真机证据
+    /// 才能进表**（`profile::method_table` 注释）。
     async fn dispatch(
         &self,
         method: &str,
-        version: u32,
         params: Value,
         target: OwnerLease,
         validity: tokio::sync::watch::Receiver<bool>,
     ) -> RpcOutcome {
+        let envelope_id = super::types::new_uuid();
         let conn = self.inner.conn.lock().await.clone();
         let Some(conn) = conn else {
-            return not_sent(&super::types::new_uuid(), "disconnected");
+            return not_sent(&envelope_id, "disconnected");
+        };
+        // 方法缺失 = 明确协议错（unsupported_method）→ 零投递，保持既有 not_sent 语义
+        let version = match conn.version_of(method) {
+            Ok(v) => v,
+            Err(e) => return not_sent(&envelope_id, e.code()),
         };
         conn.request(RpcRequest {
             method: method.to_string(),
@@ -1256,6 +1246,28 @@ fn not_sent(envelope_id: &str, reason: &str) -> RpcOutcome {
 fn current_lease(owners: &OwnerRegistry, key: &ThreadKey) -> Option<OwnerLease> {
     let lease = owners.current(key)?;
     owners.is_current(&lease).then_some(lease)
+}
+
+/// 审批/作答类方法名（集中登记，避免散落在组装与派发两侧）。
+///
+/// **版本号唯一来源 = [`ProtocolProfile`] 方法表**（`profile::method_table`）：这些常量
+/// 只钉方法名，版本一律由 [`DesktopIpcAdapter::dispatch`] 用 `conn.version_of` 解析；
+/// 方法不在表里 = 明确方法缺失 → `NotSent`（零投递），绝不带猜测版本瞎发。
+/// **新增方法必须先有真机证据才能进表**（见 observed/README.md）。
+const METHOD_COMMAND_DECISION: &str = "thread-follower-command-approval-decision";
+const METHOD_FILE_DECISION: &str = "thread-follower-file-approval-decision";
+const METHOD_PERMISSIONS_RESPONSE: &str = "thread-follower-permissions-request-approval-response";
+const METHOD_SUBMIT_USER_INPUT: &str = "thread-follower-submit-user-input";
+
+/// 审批类 pending → 对应决策方法名（command / file 各用各的方法，绝不混用）。
+/// 非审批类（permissions / 问答 / 不支持）没有「决策词」方法，返回 `None`。
+fn decision_method(kind: &PendingKind) -> Option<&'static str> {
+    match kind {
+        PendingKind::CommandApproval => Some(METHOD_COMMAND_DECISION),
+        // 官方方法表 `26.1016.6573.0` 已核对：file 决策方法与 command 并列登记为 v1
+        PendingKind::FileChangeApproval => Some(METHOD_FILE_DECISION),
+        _ => None,
+    }
 }
 
 /// respond 的镜像侧快照（阶段 1 的产物；收集于 mirrors 短锁内，之后不持锁使用）。
@@ -1331,18 +1343,18 @@ impl RespondSnapshot {
         }
         let request_id_value = self.request_id.ok_or_else(|| "invalid_id".to_string())?;
         let caps = self.caps;
-        // (方法名, 决策词, 版本)；决策词只对 command/file 有意义，其余为空串
-        let (method, decision_word, version): (&str, &str, u32) = match (&pending.kind, action) {
+        // (方法名, 决策词)；决策词只对 command/file 有意义，其余为空串。
+        // **这里不写版本号**：版本唯一来源是方法表，由派发侧 `dispatch` 用
+        // `conn.version_of(method)` 解析（方法缺失 → NotSent，见 dispatch 注释）。
+        let (method, decision_word): (&'static str, &str) = match (&pending.kind, action) {
             // 命令 / 文件变更审批：**决策词由服务端策略给定的 allowedDecisions 决定**
             // （单一来源；未知 build 只有 accept/cancel，已知 build 有 accept/decline）
             (
                 PendingKind::CommandApproval | PendingKind::FileChangeApproval,
                 PendingAction::Approve | PendingAction::Reject,
             ) => {
-                let method = match pending.kind {
-                    PendingKind::CommandApproval => "thread-follower-command-approval-decision",
-                    _ => "thread-follower-file-approval-decision",
-                };
+                let method =
+                    decision_method(&pending.kind).ok_or_else(|| "unsupported".to_string())?;
                 let word = match action {
                     PendingAction::Approve => {
                         pick_decision(&pending.allowed_decisions, &[DECISION_ACCEPT])
@@ -1355,23 +1367,19 @@ impl RespondSnapshot {
                     ),
                 }
                 .ok_or_else(|| "capability_unavailable".to_string())?;
-                (method, word, 1)
+                (method, word)
             }
             (PendingKind::PermissionsApproval, PendingAction::Approve | PendingAction::Reject) => {
                 if !caps.permissions {
                     return Err("capability_unavailable".into());
                 }
-                (
-                    "thread-follower-permissions-request-approval-response",
-                    "",
-                    1,
-                )
+                (METHOD_PERMISSIONS_RESPONSE, "")
             }
             (PendingKind::UserInput, PendingAction::Answer(_)) => {
                 if !caps.blocking_input {
                     return Err("capability_unavailable".into());
                 }
-                ("thread-follower-submit-user-input", "", 1)
+                (METHOD_SUBMIT_USER_INPUT, "")
             }
             (PendingKind::Unsupported, _) => return Err("unsupported".into()),
             _ => return Err("action_mismatch".into()),
@@ -1449,18 +1457,17 @@ impl RespondSnapshot {
         };
         let _ = request_key;
         let _ = context_token;
-        Ok(PreparedRespond {
-            method: method.to_string(),
-            version,
-            params,
-        })
+        Ok(PreparedRespond { method, params })
     }
 }
 
 /// wire 组装完成后的派发载荷。
+///
+/// **不携带版本号**：版本唯一来源是 profile 方法表，由 [`DesktopIpcAdapter::dispatch`]
+/// 在真正派发前按方法名解析（方法不在表里 → NotSent）。组装侧若自带版本，等于绕过
+/// 单一真相源——这正是本结构此前硬编码 `version = 1` 的问题。
 struct PreparedRespond {
-    method: String,
-    version: u32,
+    method: &'static str,
     params: Value,
 }
 
@@ -2348,5 +2355,113 @@ mod recovery_queue_tests {
         assert_eq!(c.len(), produced, "零重复消费");
         let q = queue.lock().unwrap();
         assert!(q.pending.is_empty() && !q.running, "终态无残留无消费者");
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    //! T7-R3：派发版本号**只从方法表解析**——方法不在表里 = 明确方法缺失 →
+    //! `NotSent`（证明不再像旧实现那样在组装侧硬编码 `version = 1` 放行）。
+    //! 方法表新增项（file 决策方法）的取证见 profile.rs 单测与 observed/README.md。
+
+    use super::*;
+    use crate::services::codex_desktop_ipc::connection;
+
+    type ConnectFuture<'a> = Pin<
+        Box<
+            dyn std::future::Future<Output = Result<super::super::transport::BoxIo, ProtocolError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// 本模块不建真实连接：dispatch 在版本解析阶段即返回，连接只作为 `Some` 存在。
+    struct NoopConnector;
+
+    impl Connector for NoopConnector {
+        fn connect(&self) -> ConnectFuture<'_> {
+            Box::pin(async { Err(ProtocolError::Disconnected("test connector".into())) })
+        }
+    }
+
+    fn lease() -> OwnerLease {
+        OwnerLease {
+            key: ThreadKey {
+                host_id: "local".into(),
+                thread_id: "t-1".into(),
+            },
+            client_id: "owner-1".into(),
+            epoch: 1,
+            generation: 1,
+        }
+    }
+
+    /// 回归：未进表方法即便拿到一条活连接也只能 `NotSent`，reason 为方法缺失码
+    ///（旧硬编码路径会以 v1 发出 → 这里会变成非 NotSent，用例即变红）。
+    #[tokio::test]
+    async fn dispatch_rejects_method_missing_from_table() {
+        let (io, _peer) = tokio::io::duplex(64 * 1024);
+        let conn = connection::spawn(Box::new(io), ProtocolProfile::closed(), 1);
+        let adapter = DesktopIpcAdapter::new(Arc::new(NoopConnector), ProtocolProfile::closed());
+        *adapter.inner.conn.lock().await = Some(conn.clone());
+        let (_tx, validity) = tokio::sync::watch::channel(true);
+        //「形似官方方法但未进表」：正是硬编码时代会被放行的名字
+        let outcome = adapter
+            .dispatch(
+                "thread-follower-interrupt-turn",
+                json!({}),
+                lease(),
+                validity,
+            )
+            .await;
+        assert_eq!(outcome.delivery, Delivery::NotSent, "未进表方法必须零投递");
+        assert_eq!(
+            outcome.reason_code.as_deref(),
+            Some("unsupported_method"),
+            "reason = 方法缺失码（不是 disconnected / 放行）"
+        );
+        assert!(outcome.result.is_none());
+        conn.shutdown().await;
+    }
+
+    /// 方法名集中登记：command / file 各用各的决策方法，且两条都必须在方法表里
+    /// （版本唯一来源）；非决策类不伪造决策方法。
+    #[test]
+    fn decision_methods_resolve_from_method_table() {
+        let profile = ProtocolProfile::closed();
+        for kind in [
+            PendingKind::CommandApproval,
+            PendingKind::FileChangeApproval,
+        ] {
+            let method = decision_method(&kind).expect("审批类必须有决策方法");
+            assert_eq!(
+                profile.version(method, None),
+                Ok(1),
+                "{method} 必须登记在方法表且为 v1"
+            );
+        }
+        assert_eq!(
+            decision_method(&PendingKind::CommandApproval),
+            Some(METHOD_COMMAND_DECISION)
+        );
+        assert_eq!(
+            decision_method(&PendingKind::FileChangeApproval),
+            Some(METHOD_FILE_DECISION)
+        );
+        assert_ne!(
+            METHOD_COMMAND_DECISION, METHOD_FILE_DECISION,
+            "command / file 决策方法互不替代"
+        );
+        // 非决策类没有「决策词」方法
+        assert_eq!(decision_method(&PendingKind::PermissionsApproval), None);
+        assert_eq!(decision_method(&PendingKind::UserInput), None);
+        assert_eq!(decision_method(&PendingKind::Unsupported), None);
+        // 未登记方法 → UnsupportedMethod（单一真相源明确拒绝，不猜版本）
+        assert_eq!(
+            profile.version("thread-follower-interrupt-turn", None),
+            Err(ProtocolError::UnsupportedMethod(
+                "thread-follower-interrupt-turn".into()
+            ))
+        );
     }
 }

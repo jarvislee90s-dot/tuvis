@@ -100,6 +100,11 @@ impl ProtocolProfile {
 /// 协议方法版本表（与平台无关；探测定案 + 计划「协议与工程值」）。
 /// `load-complete-history` / command 变体 / Plan blocking input 在 Mac 未实测，
 /// 版本常量按表登记但能力 flag 保持 false——未验证不启用。
+///
+/// **本表是版本号的唯一来源**：派发侧（`adapter::dispatch`）只按方法名查表拿版本，
+/// 任何调用点都不得硬编码版本号；**新增方法必须先有真机证据**（官方方法表核对，
+/// 见 `tests/fixtures/codex-desktop-ipc/observed/README.md`）才能进表——未进表的方法
+/// 一律视为「明确方法缺失」，派发返回 `NotSent`，绝不带猜测版本瞎发。
 fn method_table() -> BTreeMap<String, u32> {
     BTreeMap::from([
         ("thread-owner-discovery".to_string(), 1),
@@ -109,6 +114,11 @@ fn method_table() -> BTreeMap<String, u32> {
         ("thread-follower-start-turn".to_string(), 2),
         ("thread-follower-load-complete-history".to_string(), 1),
         ("thread-follower-command-approval-decision".to_string(), 1),
+        // 依据 = build `26.1016.6573.0` 真机方法表（2026-10-21 探测批，
+        // observed/README.md「官方方法表与 26.1013.4894.0 完全一致」）：文件变更审批的
+        // 决策方法与 command 决策方法同为 v1，是官方基线方法——此前遗漏导致 file 审批
+        // 只能靠调用点硬编码版本，现纳入单一真相源。
+        ("thread-follower-file-approval-decision".to_string(), 1),
         (
             "thread-follower-permissions-request-approval-response".to_string(),
             1,
@@ -291,6 +301,30 @@ mod tests {
             Err(ProtocolError::UnsupportedMethod(
                 "thread-follower-interrupt-turn".to_string()
             ))
+        );
+    }
+
+    /// T7-R3：`26.1016.6573.0` 真机方法表取证——文件变更审批的决策方法必须进表
+    /// （与 command 决策方法并列，均为 v1）。此前漏登记，adapter 只能硬编码版本。
+    #[test]
+    fn method_table_registers_file_approval_decision_from_observed_build() {
+        let table = method_table();
+        assert_eq!(
+            table.get("thread-follower-file-approval-decision"),
+            Some(&1),
+            "官方方法表（26.1016.6573.0 真机核对）登记 file 决策方法 v1"
+        );
+        assert_eq!(
+            table.get("thread-follower-command-approval-decision"),
+            Some(&1),
+            "command 决策方法仍并列在表（两条决策方法互不替代）"
+        );
+        // 公开查表口径（envelope 不含 hostId → 基值）：file 决策方法可解析到 v1
+        let p = ProtocolProfile::closed();
+        assert_eq!(
+            p.version("thread-follower-file-approval-decision", None)
+                .unwrap(),
+            1
         );
     }
 
