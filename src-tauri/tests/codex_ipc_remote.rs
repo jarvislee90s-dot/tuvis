@@ -1004,10 +1004,121 @@ async fn send_missing_action_id_is_400_and_zero_writes() {
     );
 }
 
-/// A 不可用（disabled hub）且 H3=false → 旧兼容分支如实拒绝（403 headless_disabled）。
+/// 恒败连接器（#172 能力位取证用）：连接不可达，能力位只由注入的 profile 决定——
+/// 不依赖任何真实 Desktop。
+struct FailingConnector;
+
+impl Connector for FailingConnector {
+    fn connect(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        multi_agents_manager_lib::services::codex_desktop_ipc::transport::BoxIo,
+                        multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Err(
+                multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError::Disconnected(
+                    "fixture: no desktop".into(),
+                ),
+            )
+        })
+    }
+}
+
+/// #172 只读取证 fixture：`state` 已取证、`send` 未取证（旧实现在此档位落
+/// `compat_only` 并把整页读能力降级）。方法表沿用已验证 build，只改能力位与 build 号。
+fn fixture_state_only(sessions: Vec<Session>) -> Fixture {
+    let mut profile = caps_open_profile();
+    profile.build = "26.1013.9999.0".into();
+    profile.capabilities.send = false;
+    profile.capabilities.state = true;
+    let adapter = Arc::new(DesktopIpcAdapter::new(Arc::new(FailingConnector), profile));
+    fixture_with(
+        sessions,
+        move |store| Arc::new(CodexControlHub::with_adapter(store, adapter, true)),
+        None,
+    )
+}
+
+/// #172 裁决（设计 §10.1）：桌面归属会话的 A 路写能力未取证 → **如实失败**
+/// `capability_unverified`，**不得静默改走 headless**。
+///
+/// 旧行为：H3 关闭 → 403 headless_disabled（把「能力未验证」误报成「无头未开」）；
+/// H3 打开 → 静默走无头通道（用户点发送，消息落到另一个会话）。新行为：两档 H3
+/// 都拒发，permit 以 NotSent 落账（零投递），审计留 `refused:capability_unverified`。
 #[tokio::test]
-async fn send_h3_off_ipc_unavailable_compat_refuses() {
-    let f = fixture_disabled(vec![codex_app_session(THREAD)]);
+async fn send_desktop_owned_without_send_refuses_instead_of_headless() {
+    for h3_on in [false, true] {
+        let f = fixture_disabled(vec![codex_app_session(THREAD)]);
+        if h3_on {
+            f.state.store.with(|c| {
+                c.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.headless_enabled', 'true')",
+                    [],
+                )
+                .unwrap();
+            });
+        }
+        assert!(
+            !f.state.codex_control.send_available(),
+            "closed hub：写能力必须不可用"
+        );
+        let r = f
+            .app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/session-send",
+                Some(COOKIE),
+                Some(send_body("hi", Some("a1"), false)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403, "H3={h3_on}：写能力未取证 → 如实拒绝");
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["error"], "capability_unverified", "H3={h3_on}: {v}");
+        assert_eq!(v["reasonCode"], "capability_unverified");
+        let reason = v["reason"].as_str().unwrap_or("");
+        assert!(
+            !reason.is_empty(),
+            "403 必须带可理解原因（手机端只读 reason 展示）: {v}"
+        );
+        // 零降级：既有 codex_fallback 审计，但结果词必须是拒发而不是交接
+        let audits = f.codex_audits();
+        assert!(
+            !audits
+                .iter()
+                .any(|a| a.action == "codex_fallback" && a.result.contains("handed_off")),
+            "H3={h3_on}：桌面归属会话不得静默交给无头通道: {audits:?}"
+        );
+        assert!(
+            audits.iter().any(|a| a.action == "codex_fallback"
+                && a.result.contains("refused:capability_unverified")),
+            "H3={h3_on}：拒发必须留痕: {audits:?}"
+        );
+    }
+}
+
+/// #172 解耦：只读取证 build（state=true / send=false）——读能力可用、发送如实拒绝，
+/// 且拒绝理由**不是** headless_disabled（两者拆开归因）。
+#[tokio::test]
+async fn send_state_only_build_refuses_as_capability_unverified() {
+    let f = fixture_state_only(vec![codex_app_session(THREAD)]);
+    assert!(
+        f.state.codex_control.state_available(),
+        "读链已取证 → 详情投影可用"
+    );
+    assert!(
+        !f.state.codex_control.send_available(),
+        "写未取证 → 发送门必须关"
+    );
     let r = f
         .app
         .clone()
@@ -1015,19 +1126,41 @@ async fn send_h3_off_ipc_unavailable_compat_refuses() {
             "POST",
             "/m/api/v1/session-send",
             Some(COOKIE),
-            Some(send_body("hi", Some("a1"), false)),
+            Some(send_body("hi", Some("a-so-1"), false)),
         ))
         .await
         .unwrap();
     assert_eq!(r.status(), 403);
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
-    assert_eq!(v["error"], "headless_disabled");
-    assert_eq!(v["reasonCode"], "headless_disabled");
-    let reason = v["reason"].as_str().unwrap_or("");
-    assert!(
-        reason.contains("无头通道未开启"),
-        "403 必须带可理解原因（手机端只读 reason 展示）: {v}"
+    assert_eq!(v["error"], "capability_unverified", "{v}");
+    assert_ne!(
+        v["reasonCode"], "headless_disabled",
+        "只读档的拒发不得复用无头开关文案"
     );
+}
+
+/// #172 边界：headless-owned（codex CLI 形态）会话不经 hub 门——路由结论仍是
+/// `no_process`（不是 capability_unverified），证明新门只约束桌面归属会话。
+#[tokio::test]
+async fn send_headless_owned_session_unaffected_by_hub_send_gate() {
+    let mut cli = codex_app_session(THREAD);
+    cli.form = ProcessForm::Cli;
+    cli.pid = 0; // 进程不在：路由走 no_process 早退（零注入）
+    let f = fixture_disabled(vec![cli]);
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("hi", Some("a-cli-1"), false)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["reasonCode"], "no_process", "{v}");
 }
 
 /// IPC 明确拒绝（peer 回 error）→ Rejected 回执 200，**不触发 fallback**（H3 开着
@@ -2433,8 +2566,9 @@ async fn nested_turn_receipt_yields_turn_id() {
 }
 
 // ============================================================
-// 12. R8.1/R8.3：未知 build（disabled hub）+ H3 开 → 普通消息也先经统一 router
-//（登记→reserve→NotSent→compat），同 action 重放 / 重建 hub 重放均只投一次。
+// 12. R8.1/R8.3 + #172：未知 build（disabled hub，写能力未取证）+ H3 开 → 普通消息
+// 仍先经统一 router（登记→reserve→NotSent），但**如实拒发 capability_unverified**
+//（不再静默改走 compat）；同 action 重放 / 重建 hub 重放均只投一次。
 // ============================================================
 
 #[tokio::test]
@@ -2448,7 +2582,7 @@ async fn unknown_build_send_routes_through_ledger_dedup() {
         )
         .unwrap();
     });
-    // 首投：经 router 登记 → 兜底（空 PATH CLI 缺失 → 投递前明确拒）
+    // 首投：经 router 登记 → NotSent（能力未取证）→ 如实拒发，零兜底投递
     let r = f
         .app
         .clone()
@@ -2460,22 +2594,28 @@ async fn unknown_build_send_routes_through_ledger_dedup() {
         ))
         .await
         .unwrap();
-    assert_eq!(r.status(), 200);
+    assert_eq!(r.status(), 403, "未知 build 必须如实失败，不落无头通道");
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
-    assert_eq!(v["status"], "headless", "未知 build 走兜底封套");
+    assert_eq!(v["error"], "capability_unverified", "{v}");
+    let audits = f.codex_audits();
     assert!(
-        f.codex_audits()
-            .iter()
-            .any(|a| a.action == "codex_fallback" && a.summary.contains("act-ub-1")),
-        "经 router 有可追踪兜底审计"
+        audits.iter().any(|a| a.action == "codex_fallback"
+            && a.summary.contains("act-ub-1")
+            && a.result.contains("refused:capability_unverified")),
+        "经 router 的拒发必须留可追踪审计"
     );
-    let fallbacks_after_first = f
-        .codex_audits()
+    assert!(
+        !audits
+            .iter()
+            .any(|a| a.action == "codex_fallback" && a.result.contains("handed_off")),
+        "桌面归属会话零兜底交接: {audits:?}"
+    );
+    let fallbacks_after_first = audits
         .iter()
         .filter(|a| a.action == "codex_fallback")
         .count();
 
-    // 同 action 重放：原回执、零新增投递（持久去重不经 helper）
+    // 同 action 重放：原回执（NotSent 终态）、零新增投递（持久去重不经 helper）
     let r = f
         .app
         .clone()
@@ -2491,6 +2631,7 @@ async fn unknown_build_send_routes_through_ledger_dedup() {
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
     assert_eq!(v["status"], "desktop_ipc", "重放返回账本既有回执");
     assert_eq!(v["receipt"]["delivery"], "not_sent");
+    assert_eq!(v["receipt"]["reasonCode"], "capability_unverified");
 
     // 「进程重启」：丢弃全部内存，同库重建 hub 再重放 → 仍零新增投递
     let hub2 = CodexControlHub::disabled_with_store(DeviceStore::Owned(f.conn.clone()));

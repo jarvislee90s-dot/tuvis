@@ -1913,6 +1913,7 @@
       "availability": {
         "controllable": "可控制",
         "send_only": "可发送但不支持交互",
+        "read_only": "只读（可查看，暂不能远程发送）",
         "compat_only": "仅可使用兼容模式",
         "unavailable": "当前不可控制"
       },

@@ -1944,10 +1944,11 @@ pub async fn session_send_info(
     };
     let tool = session.agent_type.tool_id().to_string();
     // H3：无头总开关关闭 → 无头绑定会话 `injectable:false` + **标因**（移动端输入区
-    // 置灰 + 原因）。**Codex APP 先看 hub（Desktop IPC）**——A 可用时 `injectable:true`
-    // **不看 H3**（只有兼容分支受 H3）；hub 不可用（disabled / build 未验证）才落回
-    // 兼容分支并受 H3。判据与 session-send 的 H3 门**同一函数**。
-    let hub_route = codex_app_form(&session) && st.codex_control.ipc_available();
+    // 置灰 + 原因）。**Codex APP 先看 hub（Desktop IPC）**——A 可写时 `injectable:true`
+    // **不看 H3**（只有兼容分支受 H3）；hub 写能力不可用（disabled / build 未验证）
+    // 才落回兼容分支并受 H3。判据与 session-send 的 H3 门**同一函数**（#172 起只问
+    // `send_available`：输入区可用性只看「能不能发」，不再连坐只读能力）。
+    let hub_route = codex_app_form(&session) && st.codex_control.send_available();
     if !hub_route {
         if let Some(reason) = headless_blocked(&st, &tool, session.form, session.pid) {
             return json_no_store(

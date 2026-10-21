@@ -131,6 +131,15 @@ struct AdapterInner {
     /// 每次连接按 endpoint build 重算（未知 build/无 endpoint → `closed()`）。
     /// 同步短临界区读写，绝不跨 await 持有、不与其他锁嵌套。
     profile: std::sync::Mutex<ProtocolProfile>,
+    /// #172：**最近一次成功 resolve 的 Desktop build 是否带写能力证据**。
+    /// `None` = 本进程内还没成功解析过 build；`Some(false)` = 解析到了但不在 shipped
+    /// 证据表（未知 build）；`Some(true)` = 已验证 build。
+    ///
+    /// 为什么要与 [`profile`] 分开记：连接失败会把 profile 回落 `closed()`（R3 的
+    /// 「Desktop 缺席」诚实缺省），此时能力位不再回答「这台 build 支持什么」。兜底
+    /// 交接必须区分「build 没取证」（不得静默改走 headless）与「验证过的 build 断了」
+    /// （既有兜底契约不变），所以证据要单独留存、不被链路状态冲掉。
+    build_send_verified: std::sync::Mutex<Option<bool>>,
     conn: Mutex<Option<ConnectionHandle>>,
     /// follow 互斥（C2）：settle 对账与派发路径可能并发 ensure 同一 thread——
     /// 冷启动竞跑会产生重复 discovery/绑定（lease 翻代）。持锁串行化 follow 段；
@@ -182,7 +191,12 @@ impl DesktopIpcAdapter {
         Self {
             inner: Arc::new(AdapterInner {
                 connector,
-                profile: std::sync::Mutex::new(profile),
+                profile: std::sync::Mutex::new(profile.clone()),
+                // 构造期基线 profile 来自装配时 resolve 到的 build（生产）/ 注入基线
+                //（测试）：**有写能力证据才记 true**，无证据保持 None（按「未取证」处理）
+                build_send_verified: std::sync::Mutex::new(
+                    profile.capabilities.send.then_some(true),
+                ),
                 conn: Mutex::new(None),
                 ensure_lock: tokio::sync::Mutex::new(()),
                 owners: Mutex::new(OwnerRegistry::default()),
@@ -226,6 +240,17 @@ impl DesktopIpcAdapter {
         self.current_caps()
     }
 
+    /// #172：本机 Desktop build 是否**带写能力证据**（与当前连接是否活着解耦）。
+    /// `false` = 未知 build / 本进程还没解析过 build / 已验证但无写能力——这类桌面
+    /// 归属会话**不得静默改走 headless**（兜底交接门用它，见 `remote::codex_ipc`）。
+    pub fn build_send_verified(&self) -> bool {
+        self.inner
+            .build_send_verified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(false)
+    }
+
     /// 订阅投影事件（REST/SSE/队列调度共用）。
     /// 广播一份投影：代际已由 `ThreadMirror::project` 从**绑定的 lease** 填好
     ///（广播事件与 GET/SSE 首快照同源），此处不再二次盖章——否则会把「新 owner 的
@@ -265,11 +290,18 @@ impl DesktopIpcAdapter {
             }
         };
         // endpoint → profile（R3：精确 build 匹配；未知 build → closed，A 写全关）
-        let profile = super::profile::profile_for(
+        let resolved = super::profile::profile_for(
             &endpoint.platform,
             endpoint.build.as_deref().unwrap_or(""),
-        )
-        .unwrap_or_else(ProtocolProfile::closed);
+        );
+        // #172：把「build 的写能力证据」单独留存（不看连接存活；连接失败路径不覆盖）
+        *self
+            .inner
+            .build_send_verified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some(resolved.as_ref().is_some_and(|p| p.capabilities.send));
+        let profile = resolved.unwrap_or_else(ProtocolProfile::closed);
         // 双检：另一任务可能已重连（持 conn 锁期间不做其他锁操作）
         let (conn, epoch) = {
             let mut guard = self.inner.conn.lock().await;

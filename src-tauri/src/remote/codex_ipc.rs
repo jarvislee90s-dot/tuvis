@@ -121,8 +121,9 @@ pub(crate) enum HubEvent {
 /// 内部事件通道、生产生命周期句柄。
 ///
 /// **`disabled()` 契约**（既有全部测试 fixture 显式填 disabled hub——编译即暴露）：
-/// 一切能力关闭——`ipc_available()` 恒 false（closed profile 能力全 false → 投影恒
-/// `compat_only`）、审批一律拒绝、`start()` 不装配调度循环（不订阅/不恢复/不调度）。
+/// 一切能力关闭——`send_available()`/`state_available()` 恒 false（closed profile 能力
+/// 全 false → 投影恒 `compat_only`）、审批一律拒绝、`start()` 不装配调度循环（不订阅/
+/// 不恢复/不调度）。
 /// R8 起普通消息**仍经 router**（登记→reserve→NotSent→兜底资格，账本纪律不因 hub
 /// 不可用绕过）。
 pub struct CodexControlHub {
@@ -134,7 +135,8 @@ pub struct CodexControlHub {
     events: tokio::sync::broadcast::Sender<HubEvent>,
     /// R7.3：关注引用闸（与 AdapterDispatch 共享；SSE 详情订阅 +1/结束 -1）
     gate: Arc<FollowGate>,
-    /// 生产能力标志：`disabled()` 恒 false——`start()/stop()/ipc_available()` 全部短路与拒绝
+    /// 生产能力标志：`disabled()` 恒 false——`start()/stop()/send_available()/
+    /// state_available()` 全部短路与拒绝
     capable: bool,
     /// 调度循环在跑标志（幂等启停）
     running: AtomicBool,
@@ -271,14 +273,20 @@ impl CodexControlHub {
         let _ = self.events.send(HubEvent::ThreadSettled(key.clone()));
     }
 
-    /// **A 路可用判据**（session-send / send-info 的 hub 分派门）：生产 hub 且本 build
-    /// 能力已验证（send+state）。disabled hub 恒 false；未识别 Desktop build 同 false
-    /// （「未经验证的 Desktop 版本或方法不得盲目启用对应能力」）。
-    pub fn ipc_available(&self) -> bool {
-        self.capable && {
-            let caps = self.adapter.capabilities();
-            caps.send && caps.state
-        }
+    /// **A 路发送可用判据**（session-send / send-info 的 hub 分派门、兜底交接门）：
+    /// 生产 hub 且本 build 的 `send` 能力已由证据确认。disabled hub 恒 false；
+    /// 未识别 Desktop build 同 false（「未经验证的 Desktop 版本或方法不得盲目启用
+    /// 对应能力」）。与 [`state_available`](Self::state_available) **解耦**：写能不能开
+    /// 只看 `send`，不因为读链未取证而连坐。
+    pub fn send_available(&self) -> bool {
+        self.capable && self.adapter.capabilities().send
+    }
+
+    /// **A 路只读可用判据**（详情投影 / SSE / 审批待办读取）：只读链是否可用。
+    /// 由 `state` 独立决定（#172 解耦）——探测证明 `state` 可用即可看，不必等 `send`
+    /// 打开；旧实现 `send && state` 把只读取证结果绑死在写能力上。
+    pub fn state_available(&self) -> bool {
+        self.capable && self.adapter.capabilities().state
     }
 
     /// R7.3：详情订阅引用 +1（SSE thread/events 建流前调用）。
@@ -510,6 +518,25 @@ pub(crate) fn consume_fallback(st: &Arc<RemoteState>, outcome: RouterOutcome, au
             return;
         }
     };
+    // #172 裁决：桌面归属会话只允许「发到 A 或诚实失败」——**这个 build 没有写能力
+    // 证据**时不得静默改走无头通道（那会变成另一个会话）。本门在 H3 之前：H3 开着也
+    // 不许降级；headless 只服务 headless-owned 会话。
+    if !build_send_verified(&st.codex_control) {
+        let action_id = permit.action_id().to_string();
+        let ctx = permit.context().clone();
+        let receipt = not_sent_receipt(&action_id, ControlRoute::None, DESKTOP_SEND_UNVERIFIED);
+        let _ = permit.finish(receipt);
+        codex_audit(
+            st,
+            &ctx,
+            AUDIT_FALLBACK,
+            audit_session,
+            None,
+            None,
+            REFUSED_SEND_UNVERIFIED,
+        );
+        return;
+    }
     if !st.store.with(super::headless_enabled_conn) {
         // H3 关闭：兜底拒发（零投递）——finish 同事务清 fence，队列不为此卡死
         let action_id = permit.action_id().to_string();
@@ -899,6 +926,27 @@ const AUDIT_FALLBACK: &str = "codex_fallback";
 /// Desktop IPC 动作的审计 channel 词（兜底行记**实际 headless 通道名**——由封套取）。
 const AUDIT_CHANNEL: &str = "codex_desktop_ipc";
 
+/// #172 用户裁决（设计 §10.1）：**桌面归属会话不得静默改走 headless**——A 路写能力
+/// 未取证时只能「发到 A 或诚实失败」，headless 只服务 headless-owned 会话。
+/// 机器码沿用既有 `capability_unverified`（方法已知、能力未验证；与「方法未知」的
+/// `capability_unavailable` 拆码）。
+pub(crate) const DESKTOP_SEND_UNVERIFIED: &str = "capability_unverified";
+/// 同上门的用户可读文案（手机端只读 `reason` 展示；不暴露协议细节）。
+pub(crate) const DESKTOP_SEND_UNVERIFIED_REASON: &str =
+    "当前 Codex 桌面版本未验证远程发送能力，已拒绝以免消息落到别的会话；请到电脑端处理";
+/// 审计结果词（与 H3 拒发 `refused:headless_disabled` 同形，便于事后按码检索）。
+const REFUSED_SEND_UNVERIFIED: &str = "refused:capability_unverified";
+
+/// #172：**这个 build 是否带写能力证据**（桌面归属会话的兜底交接门）。
+///
+/// 为什么不用 `send_available()` 当判据：兜底只在 A 路没投递出去时发生，此刻连接多半
+/// 已断、adapter 的 profile 已回落 `closed()`——`send_available()` 对「已验证 build
+/// 瞬时断链」同样为 false，拿它当门会把 PR #165 的既有兜底契约一并挡死。判据必须是
+/// **build 的证据**（[`DesktopIpcAdapter::build_send_verified`]），与链路状态解耦。
+fn build_send_verified(hub: &CodexControlHub) -> bool {
+    hub.capable && hub.adapter.build_send_verified()
+}
+
 /// Codex 控制动作审计单点：`summary` = JSON
 /// `{actionId,threadId,requestKey?,envelopeId?,result}`。
 ///
@@ -1232,6 +1280,9 @@ fn refused_envelope(action_id: &str, reason: &str) -> serde_json::Value {
 /// - `Queued` → `{status:"codex_queued", actionId, position}`；
 /// - `UseFallback` → 兼容分支（受 H3）：关闭 → 403 `headless_disabled`（permit 以
 ///   NotSent 落账）；开启 → 旧 headless 封套 + 附 actionId。
+/// - **#172 裁决**：桌面归属会话的 A 路写能力未取证（`!send_available()`）→ 403
+///   `capability_unverified` 且 permit 以 NotSent 落账，**不进 headless**（即使 H3 开着）——
+///   否则用户点发送会静默改走无头通道，变成另一个会话。
 pub(crate) async fn session_send_via_hub(
     st: &Arc<RemoteState>,
     session: &crate::session::Session,
@@ -1290,6 +1341,34 @@ pub(crate) async fn session_send_via_hub(
             )
         }
         RouterOutcome::UseFallback { permit, .. } => {
+            // #172 裁决：桌面归属会话只允许「发到 A 或诚实失败」——**这个 build 没有
+            // 写能力证据**时不得静默改走无头通道（那会变成另一个会话）。本门在 H3
+            // 之前：H3 开着也不许降级；headless 只服务 headless-owned 会话。
+            if !build_send_verified(hub) {
+                let receipt = not_sent_receipt(
+                    permit.action_id(),
+                    ControlRoute::None,
+                    DESKTOP_SEND_UNVERIFIED,
+                );
+                let _ = permit.finish(receipt);
+                codex_fallback_audit(
+                    st,
+                    &ctx,
+                    &session.id,
+                    "",
+                    None,
+                    None,
+                    REFUSED_SEND_UNVERIFIED,
+                );
+                return json_no_store(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({
+                        "error": DESKTOP_SEND_UNVERIFIED,
+                        "reasonCode": DESKTOP_SEND_UNVERIFIED,
+                        "reason": DESKTOP_SEND_UNVERIFIED_REASON,
+                    }),
+                );
+            }
             // 兼容分支：唯一受 H3 的路径
             if st.store.with(super::headless_enabled_conn) {
                 let st2 = st.clone();
@@ -2070,7 +2149,10 @@ pub async fn pending_response(
         Err(_) => return bad_request(),
     };
     let hub = &st.codex_control;
-    if !hub.ipc_available() {
+    // #172 解耦：审批只要求**读链可用**（能在投影里看到 pending）——写决策的类别能力
+    // （command / permissions / blocking_input）由 adapter 按当前 profile 逐项门控，
+    // 不在端点入口用 `send` 连坐。disabled hub / 读链未取证 → 503 capability_unavailable。
+    if !hub.state_available() {
         return capability_unavailable();
     }
     let sid = req.session_id.trim().to_string();

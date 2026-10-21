@@ -1913,6 +1913,7 @@
       "availability": {
         "controllable": "Controllable",
         "send_only": "Send-only (no interactive control)",
+        "read_only": "Read-only (viewable, remote sending not available yet)",
         "compat_only": "Compatibility mode only",
         "unavailable": "Not controllable right now"
       },

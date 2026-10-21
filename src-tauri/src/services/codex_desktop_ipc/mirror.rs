@@ -496,13 +496,19 @@ fn content_state_of(state: Option<&Value>) -> ContentState {
     }
 }
 
+/// 能力档位投影（#172 解耦）：`state` 独立决定「能不能看」，`send` 独立决定
+/// 「能不能发」——
+/// * `send && state` → 可控制；
+/// * `send && !state` → 仅可发送（写可用、读链未取证）；
+/// * `!send && state` → **只读**（读链已取证、写未开放；旧实现落 CompatOnly，把
+///   只读取证结果连同界面一起降级）；
+/// * 两者皆无 → 兼容模式（不注入、不出原生卡）。
 fn availability_of(caps: &CapabilitySet) -> ControlAvailability {
-    if caps.send && caps.state {
-        ControlAvailability::Controllable
-    } else if caps.send {
-        ControlAvailability::SendOnly
-    } else {
-        ControlAvailability::CompatOnly
+    match (caps.send, caps.state) {
+        (true, true) => ControlAvailability::Controllable,
+        (true, false) => ControlAvailability::SendOnly,
+        (false, true) => ControlAvailability::ReadOnly,
+        (false, false) => ControlAvailability::CompatOnly,
     }
 }
 
@@ -944,6 +950,55 @@ mod tests {
     /// macos-snapshot.json 的 change 段（apply 的入参形态）。
     fn macos_change() -> Value {
         fixture("macos-snapshot.json")["params"]["change"].clone()
+    }
+
+    /// #172 解耦：档位矩阵由 (send, state) 两维独立决定——`state && !send` 是
+    /// **只读**档（旧实现落 CompatOnly，只读取证结果连界面一起降级）。
+    #[test]
+    fn availability_matrix_decouples_state_and_send() {
+        let mk = |send: bool, state: bool| CapabilitySet {
+            send,
+            state,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+        };
+        assert_eq!(
+            availability_of(&mk(true, true)),
+            ControlAvailability::Controllable
+        );
+        assert_eq!(
+            availability_of(&mk(true, false)),
+            ControlAvailability::SendOnly
+        );
+        assert_eq!(
+            availability_of(&mk(false, true)),
+            ControlAvailability::ReadOnly
+        );
+        assert_eq!(
+            availability_of(&mk(false, false)),
+            ControlAvailability::CompatOnly
+        );
+    }
+
+    /// #172：只读取证（state=true / send=false）必须仍出正文投影与原生卡（只是不可
+    /// 写），不能因为「还不能发」把整页读能力一起关掉。
+    #[test]
+    fn state_only_projection_keeps_content_but_not_actionable() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &macos_change()).unwrap();
+        let read_only = CapabilitySet {
+            send: false,
+            state: true,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+        };
+        let p = m.project(read_only);
+        assert_eq!(p.availability, ControlAvailability::ReadOnly);
+        assert_eq!(p.messages.len(), 2, "只读档仍要能看历史正文");
+        assert_eq!(p.pending.len(), 1, "pending 仍如实展示");
+        assert!(!p.pending[0].actionable, "只读档不给可操作卡");
     }
 
     #[test]

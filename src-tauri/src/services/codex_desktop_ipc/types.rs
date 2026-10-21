@@ -60,11 +60,15 @@ pub enum ControlRoute {
 }
 
 /// 能力四档（spec F8）：用户看到的是实际能力，不是「理论上支持」。
+/// `ReadOnly`（#172 解耦新增）：**只读链可用、写未开放**——`state` 独立决定「能不能
+/// 看」，`send` 独立决定「能不能发」；旧实现要求 `send && state` 才可看，把只读取证
+/// 结果绑死在发送能力上。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlAvailability {
     Controllable,
     SendOnly,
+    ReadOnly,
     CompatOnly,
     Unavailable,
 }
@@ -491,6 +495,11 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ControlAvailability::CompatOnly).unwrap(),
             serde_json::json!("compat_only")
+        );
+        // #172 解耦：只读档的线上词固定为 read_only（前端 TS 联合类型同源）
+        assert_eq!(
+            serde_json::to_value(ControlAvailability::ReadOnly).unwrap(),
+            serde_json::json!("read_only")
         );
         let view = CodexQueueView {
             actions: vec![CodexActionView {

@@ -25,8 +25,10 @@ export type CodexActionState =
 /** 控制路由。`headless_compat` 仅普通消息可降级；审批/回答绝不降级为普通消息。 */
 export type ControlRoute = "desktop_ipc" | "headless_compat" | "none";
 
-/** 能力四档（spec F8）：用户看到的是实际能力。 */
-export type ControlAvailability = "controllable" | "send_only" | "compat_only" | "unavailable";
+/** 能力档位（spec F8）：用户看到的是实际能力。`read_only` = #172 解耦新增的只读档
+ *  （读链已取证、写未开放；旧后端不会下发该值）。 */
+export type ControlAvailability =
+  "controllable" | "send_only" | "read_only" | "compat_only" | "unavailable";
 
 /** 待处理交互类别。未知 method → unsupported（actionable=false）。 */
 export type PendingKind =
