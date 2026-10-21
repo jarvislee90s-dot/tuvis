@@ -10,3 +10,4 @@
 //! 纪律：本模块**不发写帧**，也不解释「读不通」为「协议不存在」（见设计 §4.5）。
 
 pub mod fingerprint;
+pub mod runner;

@@ -3138,3 +3138,342 @@ async fn unfollow_between_bind_and_declare_recovery_retry_stays_dead() {
     assert!(p.stale && p.revision.is_none(), "owner 帧不复活镜像");
     adapter.shutdown().await;
 }
+
+// ============================================================
+// #172：只读探测执行器（probe::runner）——四场景 + 单飞
+// ============================================================
+
+use multi_agents_manager_lib::services::codex_desktop_ipc::probe::runner::{
+    probe_read_with_budget, ProbeBudget, ProbeOutcome, ProbeRunner, ProbeStage,
+};
+
+/// 收敛后的探测预算（毫秒级）：用例不必真等生产预算（2/3/3s）。
+fn probe_budget() -> ProbeBudget {
+    ProbeBudget {
+        p1: Duration::from_millis(500),
+        p2: Duration::from_millis(200),
+        p3: Duration::from_millis(150),
+    }
+}
+
+/// 本线程 snapshot 帧（Windows 4894 实测形态：`change.type=snapshot` + `revision` +
+/// `conversationState` 三容器；空线程也通过）。
+fn probe_snapshot(thread_id: &str, revision: u64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "broadcast",
+        "method": "thread-stream-state-changed",
+        "params": {
+            "conversationId": thread_id,
+            "change": {
+                "type": "snapshot",
+                "revision": revision,
+                "conversationState": {
+                    "id": thread_id,
+                    "turns": [],
+                    "requests": [],
+                    "turnHistory": { "kind": "canonical", "history": { "isComplete": true } }
+                }
+            }
+        }
+    })
+}
+
+fn probe_thread(thread_id: &str) -> ThreadKey {
+    ThreadKey {
+        host_id: "local".into(),
+        thread_id: thread_id.into(),
+    }
+}
+
+async fn expect_frame(peer: &mut ScriptedPeer, what: &str) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{what} 帧未在 5s 内到达"))
+}
+
+fn discovery_ok(request_id: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "response", "requestId": request_id,
+        "resultType": "success", "method": "thread-owner-discovery",
+        "handledByClientId": "owner-1",
+        "result": { "supportsUntrustedAppInput": true }
+    })
+}
+
+/// 场景 1（同构新 build）：P1 discovery（带 sourceClientId/timeoutMs）→ P2 following →
+/// P3 snapshot 判据通过 → Probed，并且**探完立即 unfollow**（临时引用，不占名额）。
+#[tokio::test]
+async fn probe_homomorphic_build_passes_then_unfollows() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let thread = "9f1e2d3c-1111-4222-8333-444455556666";
+    let key = probe_thread(thread);
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    // P1：镜像 Desktop 自己的 envelope（sourceClientId + timeoutMs）
+    let disc = expect_frame(&mut peer, "discovery").await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    assert_eq!(disc["params"]["sourceClientId"], "owner-1");
+    assert_eq!(disc["params"]["timeoutMs"], 2000);
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+
+    // P2：临时 follow（following:true）
+    let follow = expect_frame(&mut peer, "following").await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    assert_eq!(
+        follow["params"]["conversationId"],
+        serde_json::json!(thread)
+    );
+
+    // 声明之后到达的 snapshot 才算我方证据
+    peer.send(&probe_snapshot(thread, 5)).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Probed {
+            stage, revision, ..
+        } => {
+            assert_eq!(stage, ProbeStage::P3);
+            assert_eq!(revision, Some(5));
+        }
+        other => panic!("同构 build 必须 Probed，got {other:?}"),
+    }
+
+    // 探完即放：wire 上必须看到 following:false
+    let off = expect_frame(&mut peer, "unfollow").await;
+    assert_eq!(off["method"], "thread-stream-following-changed");
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+    conn.shutdown().await;
+}
+
+/// 场景 2（版本漂移 / 静默）：声明 following 后没有任何 snapshot → 补 status-requested
+/// 仍静默 → Inconclusive(P2, protocol_drift_suspected)；**不误判可用**。
+#[tokio::test]
+async fn probe_silent_after_following_is_inconclusive_drift() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let key = probe_thread("thread-drift");
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let follow = expect_frame(&mut peer, "following").await;
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    // P2 静默 → 补 status-requested
+    let status = expect_frame(&mut peer, "status-requested").await;
+    assert_eq!(
+        status["method"], "thread-stream-following-status-requested",
+        "静默时按 Desktop 自己的信封补一次状态请求"
+    );
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Inconclusive {
+            stage, error_code, ..
+        } => {
+            assert_eq!(stage, ProbeStage::P2);
+            assert_eq!(error_code, "protocol_drift_suspected");
+        }
+        other => panic!("静默必须是 inconclusive（不判死、不判可用），got {other:?}"),
+    }
+    // 静默路径也要释放临时 follow
+    let off = expect_frame(&mut peer, "unfollow").await;
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+    conn.shutdown().await;
+}
+
+/// 场景 3（字段缺失 / 改名）：snapshot 结构对不上 → Inconclusive(P3, snapshot_unreadable)，
+/// **不伪造空会话**，也不判死。
+#[tokio::test]
+async fn probe_missing_core_fields_is_inconclusive_p3() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let key = probe_thread("thread-fields");
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let _follow = expect_frame(&mut peer, "following").await;
+    // turnHistory 被改名成 turn_history（字段漂移的典型形态）
+    let mut frame = probe_snapshot("thread-fields", 7);
+    let cs = frame["params"]["change"]["conversationState"]
+        .as_object_mut()
+        .unwrap();
+    cs.insert("turn_history".into(), serde_json::json!({}));
+    cs.remove("turnHistory");
+    peer.send(&frame).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Inconclusive {
+            stage, error_code, ..
+        } => {
+            assert_eq!(stage, ProbeStage::P3);
+            assert_eq!(error_code, "snapshot_unreadable");
+        }
+        other => panic!("解析不出只能是 inconclusive，got {other:?}"),
+    }
+    conn.shutdown().await;
+}
+
+/// 场景 4（断链）：P2 等待期间连接结束 → Failed(P2, disconnected)（明确失败，不自动重试）。
+#[tokio::test]
+async fn probe_disconnect_during_follow_is_failed() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let key = probe_thread("thread-eof");
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let _follow = expect_frame(&mut peer, "following").await;
+    peer.close(); // EOF：探测期间断链
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Failed {
+            stage, error_code, ..
+        } => {
+            assert_eq!(stage, ProbeStage::P2);
+            assert_eq!(error_code, "disconnected");
+        }
+        other => panic!("断链必须是 failed，got {other:?}"),
+    }
+}
+
+/// 场景 5（无 owner）：router 级错误 `no-client-found`（**响应不带 method 字段**）→
+/// Inconclusive(P1, no-client-found)——不能当死亡判决（与版本不匹配同形）。
+#[tokio::test]
+async fn probe_no_client_found_is_inconclusive_not_fatal() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let key = probe_thread("thread-no-owner");
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": disc["requestId"],
+        "resultType": "error",
+        // 实测形态：router 级错误响应**没有** method 字段（T0 修复的正是它）
+        "error": "no-client-found"
+    }))
+    .await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Inconclusive {
+            stage, error_code, ..
+        } => {
+            assert_eq!(stage, ProbeStage::P1);
+            assert_eq!(error_code, "no-client-found");
+        }
+        other => panic!("no-client-found 只能记不确定，got {other:?}"),
+    }
+    conn.shutdown().await;
+}
+
+/// 单飞（wire 级）：同 key 并发两次探测只产生**一条** discovery 帧，两方拿同一结论。
+#[tokio::test]
+async fn probe_single_flight_emits_one_protocol_run() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let thread = "thread-single-flight";
+    let key = probe_thread(thread);
+    let runner = std::sync::Arc::new(ProbeRunner::new());
+    let probe_key = "windows|26.1013.9999.0|-|1";
+
+    let c1 = conn.clone();
+    let k1 = key.clone();
+    let r1 = runner.clone();
+    let first = tokio::spawn(async move {
+        r1.run(probe_key, probe_read_with_budget(&c1, &k1, probe_budget()))
+            .await
+    });
+
+    // leader 已在飞（discovery 已出帧），此刻再起第二个触发点
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let c2 = conn.clone();
+    let k2 = key.clone();
+    let r2 = runner.clone();
+    let second = tokio::spawn(async move {
+        r2.run(probe_key, probe_read_with_budget(&c2, &k2, probe_budget()))
+            .await
+    });
+
+    let follow = expect_frame(&mut peer, "following").await;
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    peer.send(&probe_snapshot(thread, 9)).await;
+
+    let o1 = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("leader in time")
+        .expect("task ok");
+    let o2 = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("follower in time")
+        .expect("task ok");
+    assert_eq!(o1, o2, "follower 必须拿到 leader 的同一结论");
+    assert!(matches!(o1, ProbeOutcome::Probed { .. }));
+
+    let off = expect_frame(&mut peer, "unfollow").await;
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+    // 单飞：不得有第二条探测的任何帧（第二条 discovery / 第二次 follow 都不许出现）
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), peer.recv())
+            .await
+            .is_err(),
+        "同一 probe_key 同刻只跑一条探测（不得产生第二条协议流）"
+    );
+    conn.shutdown().await;
+}
