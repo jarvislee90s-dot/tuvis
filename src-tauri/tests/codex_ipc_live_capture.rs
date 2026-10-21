@@ -25,16 +25,13 @@
 //!
 //! 纪律（施工单 §3/§7）：没有用户在场不得运行；不抓凭据；不点审批。
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use multi_agents_manager_lib::services::codex_desktop_ipc::adapter::{
     Connector, ProductionConnector,
 };
-use multi_agents_manager_lib::services::codex_desktop_ipc::connection::{
-    spawn, ConnectionEvent, ConnectionHandle,
-};
+use multi_agents_manager_lib::services::codex_desktop_ipc::connection::{spawn, ConnectionEvent};
 use multi_agents_manager_lib::services::codex_desktop_ipc::owners::{
     declare_following, discover_owner,
 };
@@ -44,131 +41,17 @@ use multi_agents_manager_lib::services::codex_desktop_ipc::profile::{
 use multi_agents_manager_lib::services::codex_desktop_ipc::transport::EndpointResolver;
 use multi_agents_manager_lib::services::codex_desktop_ipc::types::ThreadKey;
 
-/// 结构词白名单：这些字符串是**协议词汇**（方法名/类型/枚举），保留原值；其余字符串
-/// 一律脱敏成 `<redacted:len>`（命令正文、理由、路径等用户内容不落盘）。
-const KEEP_STRINGS: &[&str] = &[
-    "method",
-    "type",
-    "kind",
-    "status",
-    "role",
-    "decision",
-    "availableDecisions",
-    "approvalPolicy",
-    "sandboxPolicy",
-    "collaborationMode",
-    "clientId",
-    "hostId",
-    "requestId",
-    "conversationId",
-    "threadId",
-    "turnId",
-    "itemId",
-];
-
-const MAX_ARRAY: usize = 8;
-const MAX_OBJECT_KEYS: usize = 40;
+/// 真机探针共用件（脱敏口径 / 会话候选枚举 / following 助手）——与
+/// `codex_ipc_live_decision.rs` 共用同一份实现，避免两处夹具脱敏强度漂移。
+#[path = "support/codex_live.rs"]
+mod codex_live;
+use codex_live::{candidate_threads, sanitize, status_requested, unfollow, uuid_from_rollout_name};
 
 fn env_usize(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
-}
-
-/// 列候选会话 id（`~/.codex/sessions/**/rollout-*-<uuid>.jsonl` 的文件名尾 UUID，按
-/// mtime 倒序）。只读、不连 IPC——用于「用户不知道 thread id」时的提示。
-fn candidate_threads(limit: usize) -> Vec<String> {
-    let home = dirs::home_dir().unwrap_or_default();
-    let root = home.join(".codex").join("sessions");
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    collect_rollouts(&root, &mut files, 0);
-    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    files
-        .into_iter()
-        .filter_map(|(_, path)| {
-            let name = path.file_name()?.to_string_lossy().to_string();
-            uuid_from_rollout_name(&name)
-        })
-        .take(limit)
-        .collect()
-}
-
-/// 从 rollout 文件名取 thread UUID：文件名形如
-/// `rollout-2026-10-21T15-52-41-<uuid>.jsonl`——**UUID 自己也被 `-` 切碎**，所以只能
-/// 取「去掉 `.jsonl` 后的末 36 字符」再校验 UUID 形态（按 `-` 切段取尾会只剩 12 位 hex，
-/// 这正是 2026-10-21 子代理探测时候选列表为空的 bug）。
-fn uuid_from_rollout_name(name: &str) -> Option<String> {
-    let stem = name.strip_suffix(".jsonl")?;
-    if stem.len() < 36 {
-        return None;
-    }
-    let tail = &stem[stem.len() - 36..];
-    let bytes = tail.as_bytes();
-    let shaped = bytes.len() == 36
-        && bytes.iter().enumerate().all(|(i, b)| match i {
-            8 | 13 | 18 | 23 => *b == b'-',
-            _ => b.is_ascii_hexdigit(),
-        });
-    shaped.then(|| tail.to_string())
-}
-
-fn collect_rollouts(
-    dir: &std::path::Path,
-    out: &mut Vec<(std::time::SystemTime, PathBuf)>,
-    depth: usize,
-) {
-    if depth > 4 {
-        return;
-    }
-    let Ok(iter) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in iter.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_rollouts(&path, out, depth + 1);
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("rollout-") && name.ends_with(".jsonl") {
-            let modified = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            out.push((modified, path));
-        }
-    }
-}
-
-/// 脱敏：保留键与类型，字符串按白名单决定去留；数组/对象有界。
-fn sanitize(value: &serde_json::Value, key: Option<&str>) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(s) => {
-            if key.is_some_and(|k| KEEP_STRINGS.contains(&k)) {
-                serde_json::Value::String(s.clone())
-            } else {
-                serde_json::json!(format!("<redacted:{}>", s.chars().count()))
-            }
-        }
-        serde_json::Value::Number(n) => serde_json::Value::Number(n.clone()),
-        serde_json::Value::Bool(b) => serde_json::Value::Bool(*b),
-        serde_json::Value::Null => serde_json::Value::Null,
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items
-                .iter()
-                .take(MAX_ARRAY)
-                .map(|v| sanitize(v, key))
-                .collect(),
-        ),
-        serde_json::Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, v) in map.iter().take(MAX_OBJECT_KEYS) {
-                out.insert(k.clone(), sanitize(v, Some(k)));
-            }
-            serde_json::Value::Object(out)
-        }
-    }
 }
 
 /// 从一帧 snapshot 里派生「pending 请求 + 空会话骨架」的夹具（其余正文全部丢弃）。
@@ -343,36 +226,6 @@ async fn capture_pending_snapshot() {
             .collect::<Vec<_>>()
     );
     conn.shutdown().await;
-}
-
-async fn status_requested(conn: &ConnectionHandle, key: &ThreadKey) -> Result<(), String> {
-    let version = conn
-        .version_of("thread-stream-following-status-requested")
-        .map_err(|e| e.code().to_string())?;
-    conn.broadcast(
-        "thread-stream-following-status-requested",
-        version,
-        serde_json::json!({ "conversationId": key.thread_id, "hostId": key.host_id }),
-    )
-    .await
-    .map_err(|e| e.code().to_string())
-}
-
-async fn unfollow(conn: &ConnectionHandle, key: &ThreadKey) -> Result<(), String> {
-    let version = conn
-        .version_of("thread-stream-following-changed")
-        .map_err(|e| e.code().to_string())?;
-    conn.broadcast(
-        "thread-stream-following-changed",
-        version,
-        serde_json::json!({
-            "conversationId": key.thread_id,
-            "hostId": key.host_id,
-            "following": false,
-        }),
-    )
-    .await
-    .map_err(|e| e.code().to_string())
 }
 
 /// 文件名取 thread UUID 的回归（真机 rollout 名样例）：UUID 自身被 `-` 切碎，必须取
