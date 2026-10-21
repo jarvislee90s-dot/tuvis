@@ -177,47 +177,103 @@ fn read_decision_enum(path: &Path) -> Result<Vec<String>, String> {
     decision_enum(&json).ok_or_else(|| "unparsable_decision".to_string())
 }
 
-/// 找 decision 枚举：先按 `"decision"` 键定位（schema 的常规形态），找不到再退一步
-/// 找「含 `accept` 的字符串数组枚举」。两条都不可得 → `None`（不猜）。
+/// 找 decision 枚举。
+///
+/// **真实形态（2026-10-21 在 26.1013.4894.0 实测）**：`properties.decision` 不是直接
+/// `enum`，而是 `{"$ref": "#/definitions/CommandExecutionApprovalDecision"}`，被引用的
+/// 定义是 `oneOf: [ {enum:["accept"]}, {enum:["acceptForSession"]}, … ]`——每个词一个
+/// 分支。所以必须：定位 `decision` → 解 `$ref` → 把 `oneOf`/`anyOf`/`allOf` 里的单词
+/// 枚举**按序摊平**（旧实现只看 `decision.enum`，在真机上会只认出第一个词）。
+///
+/// 兜底顺序：`decision` 节点摊平 → 名字含 `Decision` 的定义摊平 → 「含 accept 的枚举」
+/// → `None`（不猜）。
 pub fn decision_enum(root: &Value) -> Option<Vec<String>> {
-    if let Some(found) = find_decision_key(root) {
-        return Some(found);
+    if let Some(node) = find_key_recursive(root, "decision") {
+        let words = collect_enum_words(root, node, 0);
+        if !words.is_empty() {
+            return Some(words);
+        }
+    }
+    if let Some(words) = find_decision_definition(root) {
+        return Some(words);
     }
     find_enum_containing(root, "accept")
 }
 
-/// 递归找 `"decision"` → `{ "enum": [...] }`（也兼容直接 `"decision": [ ... ]`）。
-fn find_decision_key(value: &Value) -> Option<Vec<String>> {
+/// 递归找某个键（任意深度；`properties.decision` 与扁平 `decision` 都能命中）。
+fn find_key_recursive<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     match value {
         Value::Object(map) => {
-            if let Some(dec) = map.get("decision") {
-                if let Some(list) = enum_strings(dec) {
-                    return Some(list);
-                }
+            if let Some(found) = map.get(key) {
+                return Some(found);
             }
-            for child in map.values() {
-                if let Some(found) = find_decision_key(child) {
-                    return Some(found);
-                }
-            }
-            None
+            map.values().find_map(|c| find_key_recursive(c, key))
         }
-        Value::Array(items) => items.iter().find_map(find_decision_key),
+        Value::Array(items) => items.iter().find_map(|c| find_key_recursive(c, key)),
         _ => None,
     }
 }
 
-fn enum_strings(value: &Value) -> Option<Vec<String>> {
-    let arr = match value {
-        Value::Array(items) => items,
-        Value::Object(map) => map.get("enum")?.as_array()?,
-        _ => return None,
-    };
-    let out: Vec<String> = arr
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect();
-    (!out.is_empty()).then_some(out)
+/// 解同文档内的 `$ref`（`#/definitions/X` 或 `#/$defs/X`；`~0`/`~1` 反转义）。
+fn resolve_ref<'a>(root: &'a Value, node: &'a Value) -> Option<&'a Value> {
+    let reference = node.get("$ref")?.as_str()?;
+    let path = reference.strip_prefix("#/")?;
+    let mut current = root;
+    for raw in path.split('/') {
+        let seg = raw.replace("~1", "/").replace("~0", "~");
+        current = current.get(&seg)?;
+    }
+    Some(current)
+}
+
+/// 摊平节点里的枚举词：`enum` 直接收；`oneOf`/`anyOf`/`allOf` 逐支递归（含 `$ref`）。
+/// 深度上限防病态 schema（循环引用在 JSON 里不可能，但嵌套可以很深）。
+fn collect_enum_words(root: &Value, node: &Value, depth: usize) -> Vec<String> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    if let Some(target) = resolve_ref(root, node) {
+        return collect_enum_words(root, target, depth + 1);
+    }
+    if let Some(list) = node.get("enum").and_then(|e| e.as_array()) {
+        return list
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+    }
+    let mut words: Vec<String> = Vec::new();
+    for combinator in ["oneOf", "anyOf", "allOf"] {
+        if let Some(branches) = node.get(combinator).and_then(|b| b.as_array()) {
+            for branch in branches {
+                for word in collect_enum_words(root, branch, depth + 1) {
+                    if !words.contains(&word) {
+                        words.push(word);
+                    }
+                }
+            }
+        }
+    }
+    words
+}
+
+/// 兜底：找名字含 `Decision`（且能摊出枚举）的定义——真实 schema 里决策定义就叫
+/// `CommandExecutionApprovalDecision` / `FileChangeApprovalDecision`。
+fn find_decision_definition(root: &Value) -> Option<Vec<String>> {
+    for container in ["definitions", "$defs"] {
+        let Some(defs) = root.get(container).and_then(|d| d.as_object()) else {
+            continue;
+        };
+        for (name, node) in defs {
+            if !name.contains("Decision") {
+                continue;
+            }
+            let words = collect_enum_words(root, node, 0);
+            if !words.is_empty() {
+                return Some(words);
+            }
+        }
+    }
+    None
 }
 
 /// 兜底：任意 `enum` 数组里含指定词。
@@ -313,33 +369,79 @@ impl Drop for TempDirGuard {
 mod tests {
     use super::*;
 
-    /// 固定样例：官方 schema 的常规形态（`properties.decision.enum`）。
-    const COMMAND_SCHEMA: &str = r#"{
+    /// command 审批样例：**真实 26.1013.4894.0 形态**（`properties.decision` 是
+    /// `$ref`，被引用的定义是 `oneOf` 单词语义分支）。
+    const COMMAND_SCHEMA: &str = r##"{
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "CommandExecutionRequestApprovalResponse",
         "type": "object",
-        "properties": {
-            "decision": {
-                "type": "string",
-                "enum": ["accept", "acceptForSession", "decline", "cancel"]
+        "definitions": {
+            "CommandExecutionApprovalDecision": {
+                "oneOf": [
+                    { "description": "User approved the command.", "enum": ["accept"], "type": "string" },
+                    { "description": "User approved for the session.", "enum": ["acceptForSession"], "type": "string" },
+                    { "description": "User denied the command. The agent will continue the turn.", "enum": ["decline"], "type": "string" },
+                    { "description": "User denied the command. The turn will also be immediately interrupted.", "enum": ["cancel"], "type": "string" }
+                ]
             }
         },
+        "properties": { "decision": { "$ref": "#/definitions/CommandExecutionApprovalDecision" } },
         "required": ["decision"]
-    }"#;
+    }"##;
 
-    /// file 审批样例：枚举挂在 `$defs` 下（另一种真实形态）。
+    /// file 审批样例：同构（`$defs` + `$ref` + `oneOf`；真实 schema 用 `definitions`，
+    /// 这里兼容 `$defs` 拼写）。
     const FILE_SCHEMA: &str = r##"{
         "title": "FileChangeRequestApprovalResponse",
         "type": "object",
         "$defs": {
-            "Decision": { "type": "string", "enum": ["accept", "cancel", "decline"] }
+            "FileChangeApprovalDecision": {
+                "oneOf": [
+                    { "enum": ["accept"], "type": "string" },
+                    { "enum": ["cancel"], "type": "string" },
+                    { "enum": ["decline"], "type": "string" }
+                ]
+            }
         },
-        "properties": { "decision": { "$ref": "#/$defs/Decision" } }
+        "properties": { "decision": { "$ref": "#/$defs/FileChangeApprovalDecision" } }
     }"##;
 
     fn write_sample(dir: &Path, command: &str, file: &str) {
         std::fs::write(dir.join(COMMAND_APPROVAL_FILE), command).unwrap();
         std::fs::write(dir.join(FILE_APPROVAL_FILE), file).unwrap();
+    }
+
+    /// **真机金样回归**（2026-10-21，Codex 26.1013.4894.0）：`properties.decision` 是
+    /// `$ref` → `definitions.*Decision.oneOf[4]`，每个词一个分支。旧实现（只看
+    /// `decision.enum`）在这里只会认出第一个词，本用例钉死「四个词按序摊平」。
+    #[test]
+    fn parses_real_4894_approval_schema_fixtures() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("codex-desktop-ipc")
+            .join("schema");
+        let evidence = match collect_evidence(&dir) {
+            SchemaProbeOutcome::Known(e) => e,
+            other => panic!("真机 schema 夹具必须解析成功，got {other:?}"),
+        };
+        assert_eq!(
+            evidence.command_decisions,
+            vec!["accept", "acceptForSession", "decline", "cancel"],
+            "command 审批：$ref → oneOf 四支必须按序摊平"
+        );
+        assert_eq!(
+            evidence.file_decisions,
+            vec!["accept", "acceptForSession", "decline", "cancel"],
+            "file 审批：同构"
+        );
+        // 只断言「schema 里有什么」；「本轮开哪几个词」是 T7 的策略（accept + cancel），
+        // 不在这里表达——`*_allows` 的语义是「schema 认识这个词」。
+        assert!(evidence.command_allows("accept") && evidence.command_allows("cancel"));
+        assert!(
+            evidence.file_allows("decline"),
+            "schema 里有 decline（策略层另判是否开放）"
+        );
     }
 
     /// 固定样例解析：两个文件的 decision 枚举都要认出来。
