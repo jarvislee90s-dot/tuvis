@@ -7,13 +7,20 @@
 //!   必须换 token；
 //! * 未知 method → `PendingKind::Unsupported`（actionable=false），不暴露 raw
 //!   method/参数对象；已知但 profile 能力未验证同样 actionable=false；
-//! * 不假设 `availableDecisions` 在场——产品语义只有批准/拒绝/作答。
+//! * 决策词只由**服务端策略**产出（单一来源），来源优先级：
+//!   `pending.params.availableDecisions`（**仅字符串词**）> schema 档 > 证据档；
+//!   对象形态的决策词（`acceptWithExecpolicyAmendment` / `applyNetworkPolicyAmendment`
+//!   等执行策略修订 = 权限扩大）**永不发**。
+//!   证据档（已知 build）固定 `accept` / `decline`，**不读** `availableDecisions`
+//!   （4894 真机已证实 `decision:"decline"` 被接受）；schema 档（未知 build）取
+//!   `availableDecisions` 字符串词与 schema 允许词的交集，缺失时才回退 schema 词；
+//!   权限/问答/未知类别永远空。
 
 use super::types::{
     CapabilitySet, PendingKind, PendingRequestId, PendingView, ProtocolError, QuestionOption,
     QuestionView,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// token 缓存条目：内容指纹 + 当前 token。
 #[derive(Clone)]
@@ -233,7 +240,23 @@ fn project_one(
 
     // 决策词由**服务端策略**决定（单一来源）：空 = 只能到桌面处理。
     // 卡片只按这个列表渲染按钮，前端不做策略判断。
-    let allowed_decisions = policy.for_kind(kind).to_vec();
+    //
+    // T7-R2：未知 build（schema 档）优先用 pending 自带的 `availableDecisions`
+    // **字符串词**（与策略词取交集）；schema 词只作兜底。证据档不读该字段
+    // （4894 真机已证实 `decision:"decline"` 被接受）。对象形态（执行策略修订 =
+    // 权限扩大）在 [`string_decision_words`] 里就被跳过，永不进入 allowed_decisions。
+    let allowed_decisions = match (policy.source(), kind) {
+        (PolicySource::Schema, PendingKind::CommandApproval | PendingKind::FileChangeApproval) => {
+            match string_decision_words(&params) {
+                Some(request_words) => {
+                    intersect_decision_words(policy.for_kind(kind), &request_words)
+                }
+                None => policy.for_kind(kind).to_vec(),
+            }
+        }
+        // 证据档 / 权限 / 问答 / 未知类别：沿用策略词，绝不因 availableDecisions 开放
+        _ => policy.for_kind(kind).to_vec(),
+    };
     let actionable = match kind {
         // 命令/文件审批：能给出决策词才算可操作（未知 build 未取证 = 不可操作）
         PendingKind::CommandApproval | PendingKind::FileChangeApproval => {
@@ -286,19 +309,70 @@ fn file_change_summary(params: &serde_json::Value) -> Option<String> {
     (n > 0).then(|| n.to_string())
 }
 
+/// 从 pending `params.availableDecisions` 里取**字符串词**（T7-R2）。
+///
+/// 真机形态（26.1016.6573.0）：`["accept", {acceptWithExecpolicyAmendment: {…}},
+/// "cancel"]`——字符串词与对象形态混排，且**没有** `decline` 字面量。对象形态属
+/// 执行策略修订（权限扩大），**一律跳过**；本函数只收 `Value::String`，保持原顺序
+/// 并去重。字段缺失 / 非数组 / 没有任何字符串词 → `None`（调用方回退策略词）。
+fn string_decision_words(params: &serde_json::Value) -> Option<Vec<String>> {
+    let available = params.get("availableDecisions")?.as_array()?;
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut words = Vec::new();
+    for value in available {
+        if let Some(word) = value.as_str() {
+            if seen.insert(word) {
+                words.push(word.to_string());
+            }
+        }
+    }
+    (!words.is_empty()).then_some(words)
+}
+
+/// 请求词 ∩ 策略词（保持**请求词顺序**）；交集为空 → 策略词兜底。
+///
+/// 交集保证 schema 档不会发出 schema 未取证的词，也保证 pending 没提供的词
+/// （例如命令侧的 `decline`）不会凭空出现。
+fn intersect_decision_words(policy_words: &[String], request_words: &[String]) -> Vec<String> {
+    let picked: Vec<String> = request_words
+        .iter()
+        .filter(|word| policy_words.contains(word))
+        .cloned()
+        .collect();
+    if picked.is_empty() {
+        policy_words.to_vec()
+    } else {
+        picked
+    }
+}
+
 /// **决策策略**（服务端单一来源）：每一类审批允许哪些决策词。
 ///
-/// 两档来源：
+/// 两档来源（[`DecisionPolicy::source`]）：
 /// * [`DecisionPolicy::evidence`]：该 build 有真机证据（`caps.command`）→ `accept` +
-///   `decline`（老行为，`decline` = 拒绝但回合继续）；
+///   `decline`（老行为，`decline` = 拒绝但回合继续）；**不读** `availableDecisions`；
 /// * [`DecisionPolicy::schema`]：未知 build 但官方 schema 里两个词都在 → `accept` +
-///   `cancel`（`cancel` = 拒绝并**立即中断本轮**）——#172 的「终止本轮」。
+///   `cancel`（`cancel` = 拒绝并**立即中断本轮**）——投影时优先采用 pending 自带的
+///   `availableDecisions` 字符串词（与本档词取交集），本档词只作兜底。
 ///
 /// 空策略 = 不可远程决策（卡片只显示「到桌面处理」）。**权限/问答永远是空**。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DecisionPolicy {
+    source: PolicySource,
     command: Vec<String>,
     file: Vec<String>,
+}
+
+/// 策略来源（T7-R2）：决定投影时能否用 pending 自带的 `availableDecisions` 修正决策词。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PolicySource {
+    /// 空策略：没有任何已授信的决策词（不可远程决策）。
+    #[default]
+    Empty,
+    /// 证据档：该 build 有真机证据（shipped `caps.command`）。
+    Evidence,
+    /// schema 档：未知 build，官方 schema 已取证。
+    Schema,
 }
 
 /// `accept`：允许执行。
@@ -321,6 +395,7 @@ impl DecisionPolicy {
     /// 证据档（已知 build）：`accept` + `decline`。
     pub fn evidence() -> Self {
         Self {
+            source: PolicySource::Evidence,
             command: vec![DECISION_ACCEPT.to_string(), DECISION_DECLINE.to_string()],
             file: vec![DECISION_ACCEPT.to_string(), DECISION_DECLINE.to_string()],
         }
@@ -332,9 +407,15 @@ impl DecisionPolicy {
     pub fn schema(command_ok: bool, file_ok: bool) -> Self {
         let words = || vec![DECISION_ACCEPT.to_string(), DECISION_CANCEL.to_string()];
         Self {
+            source: PolicySource::Schema,
             command: if command_ok { words() } else { Vec::new() },
             file: if file_ok { words() } else { Vec::new() },
         }
+    }
+
+    /// 策略来源（决定投影时是否采用 pending 的 `availableDecisions` 字符串词）。
+    pub fn source(&self) -> PolicySource {
+        self.source
     }
 
     /// 该类别允许的决策词（顺序即 UI 顺序）。
@@ -689,6 +770,228 @@ mod tests {
         assert_ne!(
             va.context_token, vb.context_token,
             "指纹含 method：同 params 不同 method 换 token"
+        );
+    }
+
+    // ===== T7-R2：未知 build 用 pending.availableDecisions 的**字符串词** =====
+
+    /// 未知 build（schema 档）优先取 pending 自带的字符串词，并与 schema 允许词取交集。
+    #[test]
+    fn available_decisions_strings_override_schema_words() {
+        let p = PendingProjector::new();
+        let views = p.project_with_policy(
+            &[
+                serde_json::json!({
+                    "id": 31,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "command": "echo hi",
+                        "cwd": "/w",
+                        "availableDecisions": [
+                            "accept",
+                            { "acceptWithExecpolicyAmendment": {
+                                "execpolicy_amendment": ["echo hi"]
+                            } },
+                            "cancel"
+                        ]
+                    }
+                }),
+                // 请求侧没有 cancel → schema 兜底的 cancel 不得凭空出现（证明取交集）
+                serde_json::json!({
+                    "id": 32,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": { "command": "echo hi", "availableDecisions": ["accept"] }
+                }),
+            ],
+            &caps_unknown_build(),
+            &DecisionPolicy::schema(true, true),
+        );
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].allowed_decisions, vec!["accept", "cancel"]);
+        assert!(views[0].actionable);
+        assert_eq!(views[1].allowed_decisions, vec!["accept"]);
+        let json = serde_json::to_string(&views[0]).expect("serialize");
+        assert!(
+            !json.contains("acceptWithExecpolicyAmendment") && !json.contains("execpolicy"),
+            "对象形态的决策词不得进入远端 DTO：{json}"
+        );
+    }
+
+    /// 未知 build 的 pending 只给 `accept` + `cancel`（无 `decline`）→ 前端不得出现
+    /// 「拒绝」（decline）按钮，但仍可批准/终止。
+    #[test]
+    fn unknown_build_without_decline_has_no_reject() {
+        let p = PendingProjector::new();
+        let views = p.project_with_policy(
+            &[serde_json::json!({
+                "id": 33,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "command": "echo hi",
+                    "availableDecisions": ["accept", "cancel"]
+                }
+            })],
+            &caps_unknown_build(),
+            &DecisionPolicy::schema(true, true),
+        );
+        let v = &views[0];
+        assert!(v.actionable);
+        assert_eq!(v.allowed_decisions, vec!["accept", "cancel"]);
+        assert!(
+            !v.allowed_decisions.iter().any(|w| w == "decline"),
+            "未知 build 不得向 UI 提供 decline：{:?}",
+            v.allowed_decisions
+        );
+    }
+
+    /// 对象形态（执行策略修订 = 权限扩大）一律忽略：既不入 allowedDecisions，也绝不
+    /// 会出现在序列化 DTO 里；字符串词照样可用（此例 schema 兜底会给出 accept+cancel，
+    /// 实际只剩请求侧的 cancel，证明请求词优先）。
+    #[test]
+    fn object_decision_words_are_never_propagated() {
+        let p = PendingProjector::new();
+        let views = p.project_with_policy(
+            &[serde_json::json!({
+                "id": 34,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "command": "echo hi",
+                    "availableDecisions": [
+                        { "acceptWithExecpolicyAmendment": {
+                            "execpolicy_amendment": ["echo hi"]
+                        } },
+                        "cancel"
+                    ]
+                }
+            })],
+            &caps_unknown_build(),
+            &DecisionPolicy::schema(true, true),
+        );
+        let v = &views[0];
+        assert_eq!(v.allowed_decisions, vec!["cancel"]);
+        assert!(v.actionable);
+        let json = serde_json::to_string(v).expect("serialize");
+        assert!(
+            !json.contains("acceptWithExecpolicyAmendment")
+                && !json.contains("execpolicy_amendment"),
+            "对象形态的决策词不得外泄：{json}"
+        );
+    }
+
+    /// pending 没带 `availableDecisions`（或没有字符串词）→ 回退 schema 档词。
+    #[test]
+    fn missing_available_decisions_falls_back_to_schema() {
+        let p = PendingProjector::new();
+        let views = p.project_with_policy(
+            &[serde_json::json!({
+                "id": 35,
+                "method": "item/fileChange/requestApproval",
+                "params": { "reason": "r", "changes": [{}] }
+            })],
+            &caps_unknown_build(),
+            &DecisionPolicy::schema(true, true),
+        );
+        let v = &views[0];
+        assert!(v.actionable);
+        assert_eq!(v.allowed_decisions, vec!["accept", "cancel"]);
+    }
+
+    /// 证据档（已知 build）**不读** `availableDecisions`：仍是 accept + decline
+    /// （`decline` 已在 4894 真机验证被接受）。
+    #[test]
+    fn evidence_policy_ignores_available_decisions() {
+        let p = PendingProjector::new();
+        let views = p.project_with_policy(
+            &[serde_json::json!({
+                "id": 36,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "command": "echo hi",
+                    "availableDecisions": ["accept", "cancel"]
+                }
+            })],
+            &caps_all(),
+            &DecisionPolicy::evidence(),
+        );
+        let v = &views[0];
+        assert!(v.actionable);
+        assert_eq!(
+            v.allowed_decisions,
+            vec!["accept", "decline"],
+            "证据档不得因 availableDecisions 把 reject 词换成 cancel"
+        );
+    }
+
+    /// `availableDecisions` 只影响命令/文件审批；权限/问答/未知类别仍然永远空。
+    #[test]
+    fn schema_policy_never_opens_other_kinds_via_available_decisions() {
+        let p = PendingProjector::new();
+        let views = p.project_with_policy(
+            &[
+                serde_json::json!({
+                    "id": 37,
+                    "method": "item/permissions/requestApproval",
+                    "params": {
+                        "cwd": "/w",
+                        "permissions": {},
+                        "availableDecisions": ["accept", "cancel"]
+                    }
+                }),
+                serde_json::json!({
+                    "id": 38,
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "questions": [],
+                        "availableDecisions": ["accept", "cancel"]
+                    }
+                }),
+                serde_json::json!({
+                    "id": 39,
+                    "method": "item/plan/requestImplementation",
+                    "params": {
+                        "planContent": "x",
+                        "availableDecisions": ["accept", "cancel"]
+                    }
+                }),
+            ],
+            &caps_unknown_build(),
+            &DecisionPolicy::schema(true, true),
+        );
+        for v in &views {
+            assert!(
+                v.allowed_decisions.is_empty(),
+                "{:?} 不得因 availableDecisions 开放决策词",
+                v.kind
+            );
+            assert!(!v.actionable);
+        }
+    }
+
+    /// 纯函数：只收字符串词、保序、去重；对象/空数组/缺失 → None。
+    #[test]
+    fn string_decision_words_keep_order_skip_objects_and_dedupe() {
+        let params = serde_json::json!({
+            "availableDecisions": [
+                "cancel",
+                { "acceptWithExecpolicyAmendment": {} },
+                "accept",
+                "cancel"
+            ]
+        });
+        assert_eq!(
+            string_decision_words(&params),
+            Some(vec!["cancel".to_string(), "accept".to_string()])
+        );
+        assert_eq!(string_decision_words(&serde_json::json!({})), None);
+        assert_eq!(
+            string_decision_words(&serde_json::json!({ "availableDecisions": [] })),
+            None
+        );
+        assert_eq!(
+            string_decision_words(&serde_json::json!({
+                "availableDecisions": [{ "acceptWithExecpolicyAmendment": {} }]
+            })),
+            None
         );
     }
 }
