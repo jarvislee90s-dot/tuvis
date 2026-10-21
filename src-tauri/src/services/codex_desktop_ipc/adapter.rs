@@ -20,6 +20,8 @@ use super::owners::{
     bind_lease, declare_following, discover_owner, wait_first_snapshot, FollowingSet,
 };
 use super::pending::parse_request_key;
+use super::probe::runner::{ProbeOutcome, ProbeRunner, ProbeStage};
+use super::probe::{ProbeLedger, CAP_STATE};
 use super::profile::ProtocolProfile;
 use super::types::{
     CapabilitySet, ContentState, ControlAvailability, Delivery, OwnerLease, PendingAction,
@@ -125,6 +127,27 @@ enum InflightState {
     BlockedUnknown,
 }
 
+/// #172：当前「尚无证据」档 build 的探测目标（键含 `cli_id`，算一次即缓存）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeTarget {
+    platform: String,
+    build: String,
+    /// 账本主键（`platform|build|cli_id|epoch`）；`None` = 尚未计算（算 `cli_id` 可能
+    /// 要跑一次 `codex.exe --version`，只在真正探测时按需算，不拖慢连接路径）。
+    key: Option<String>,
+}
+
+/// #172：debug 专用强制开关（`TUVIS_CODEX_IPC_FORCE_UNVERIFIED=1`）——把**已验证**
+/// build 也压到「尚无证据」档，好在真机上跑探测分支（本机 4894 已 shipped，否则永远
+/// 走不到未知 build 的路径）。**release 构建恒 false**：`cfg!(debug_assertions)` 是
+/// 编译期常量，发行包里这条分支被消掉，用户无法借此关掉能力门。
+fn force_unverified() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("TUVIS_CODEX_IPC_FORCE_UNVERIFIED")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+}
+
 struct AdapterInner {
     connector: Arc<dyn Connector>,
     /// 当前连接的 profile（R3：动态）。初始为构造入参（首个连接前的基线）；
@@ -140,6 +163,16 @@ struct AdapterInner {
     /// 交接必须区分「build 没取证」（不得静默改走 headless）与「验证过的 build 断了」
     /// （既有兜底契约不变），所以证据要单独留存、不被链路状态冲掉。
     build_send_verified: std::sync::Mutex<Option<bool>>,
+    /// #172：只读探测单飞器（同一 `probe_key` 同刻只有一条探测在飞）。
+    probe: Arc<ProbeRunner>,
+    /// #172：探测账本（remote 层注入 `DeviceStore` 实现；`None` = 不查不写账本，
+    /// 仍可探测——测试与「账本不可用」降级路径）。
+    probe_ledger: std::sync::Mutex<Option<Arc<dyn ProbeLedger>>>,
+    /// #172：当前「**尚无证据**」档 build 的探测目标（shipped build → `None`；
+    /// 连接失败回落 closed 时保留原目标，便于重连后复用同一键）。
+    probe_target: std::sync::Mutex<Option<ProbeTarget>>,
+    /// #172：探测预算（生产 = P1/P2/P3 2/3/3s；测试可收紧，免得真等 8s）。
+    probe_budget: std::sync::Mutex<super::probe::runner::ProbeBudget>,
     conn: Mutex<Option<ConnectionHandle>>,
     /// follow 互斥（C2）：settle 对账与派发路径可能并发 ensure 同一 thread——
     /// 冷启动竞跑会产生重复 discovery/绑定（lease 翻代）。持锁串行化 follow 段；
@@ -197,6 +230,18 @@ impl DesktopIpcAdapter {
                 build_send_verified: std::sync::Mutex::new(
                     profile.capabilities.send.then_some(true),
                 ),
+                probe: Arc::new(ProbeRunner::new()),
+                probe_ledger: std::sync::Mutex::new(None),
+                // 构造期基线 profile 若已是「尚无证据」档（生产装配时 resolve 到未知
+                // build / 测试注入），先把探测目标记下来：连接暂不可达也能查账本
+                probe_target: std::sync::Mutex::new(profile.is_probe_eligible().then(|| {
+                    ProbeTarget {
+                        platform: profile.platform.clone(),
+                        build: profile.build.clone(),
+                        key: None,
+                    }
+                })),
+                probe_budget: std::sync::Mutex::new(super::probe::runner::ProbeBudget::default()),
                 conn: Mutex::new(None),
                 ensure_lock: tokio::sync::Mutex::new(()),
                 owners: Mutex::new(OwnerRegistry::default()),
@@ -251,6 +296,206 @@ impl DesktopIpcAdapter {
             .unwrap_or(false)
     }
 
+    // ========================================================
+    // #172：能力探测（惰性只读；账本优先；单飞）
+    // ========================================================
+
+    /// 注入探测账本（生产 `DeviceStore` 实现；测试内存实现）。不注入 = 不查不写，
+    /// 仍可探测（降级路径：结论不跨重启复用）。
+    pub fn set_probe_ledger(&self, ledger: Arc<dyn ProbeLedger>) {
+        *self
+            .inner
+            .probe_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(ledger);
+    }
+
+    /// 是否正在跑只读探测（#172 的「探测中」信号；T9 用它渲染骨架态）。
+    pub fn probe_in_progress(&self) -> bool {
+        self.inner.probe.inflight() > 0
+    }
+
+    /// 测试缝：收紧探测预算（生产恒 2/3/3s；用例不必真等 8s）。
+    #[doc(hidden)]
+    pub fn set_probe_budget(&self, budget: super::probe::runner::ProbeBudget) {
+        *self
+            .inner
+            .probe_budget
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = budget;
+    }
+
+    fn probe_budget(&self) -> super::probe::runner::ProbeBudget {
+        *self
+            .inner
+            .probe_budget
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 当前是否处于「尚无证据、可探测」档（唯一允许探测的证据级别）。
+    pub fn probe_eligible(&self) -> bool {
+        self.current_profile().is_probe_eligible()
+    }
+
+    /// **首次 `state` 访问触发的只读探测**（#172）。
+    ///
+    /// 顺序（都不得阻断读路径）：
+    /// 1. 已有写/读证据（shipped 档、或本进程先前探测通过）→ 直接返回；
+    /// 2. 非「尚无证据」档（closed / 不可达）→ 不探；
+    /// 3. 算/取指纹键（同 build 只算一次）→ 查账本：
+    ///    * `probed`/`verified` → 提升本进程 profile 的 `state`，**零帧**复用；
+    ///    * `inconclusive` 且退避未到点 → 本轮不探；
+    /// 4. 探测（P0 `ensure_connection` + P1–P3）→ 落账本；通过才提升 `state`。
+    ///
+    /// 探测失败**不阻断**后续读路径（follow 照常尝试，读不通自有别的原因）。
+    pub async fn ensure_read_evidence(&self, key: &ThreadKey) {
+        if self.current_caps().state {
+            return; // 已有证据（shipped 或先前探测通过）
+        }
+        if !self.probe_eligible() {
+            return; // closed / 不可达：不探（判死档不因触发而复活）
+        }
+        // 已跟随该线程 = 生产读链在跑：探测会用临时 follow/unfollow 打扰它（wire 上
+        // 后到的 following:false 会撤掉生产跟随）——此时不探，交给后续触发点。
+        if self.inner.followings.lock().await.is_following(key) {
+            return;
+        }
+        let Some(target) = self.probe_target_snapshot() else {
+            return; // 还没 resolve 到 build：无法归因，不探（等下次连接）
+        };
+        let probe_key = self.resolve_probe_key(&target).await;
+        if self.reuse_ledger_evidence(&probe_key) {
+            return;
+        }
+        let conn = match self.ensure_connection().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                log::info!(
+                    "codex-ipc probe: P0 不可达（{}），本轮不探（key={probe_key}）",
+                    e.code()
+                );
+                if let Some(ledger) = self.probe_ledger() {
+                    ledger.record(
+                        &probe_key,
+                        CAP_STATE,
+                        &ProbeOutcome::Failed {
+                            stage: ProbeStage::P0,
+                            error_code: e.code().to_string(),
+                            duration_ms: 0,
+                        },
+                    );
+                }
+                return;
+            }
+        };
+        let outcome = self
+            .inner
+            .probe
+            .run(
+                &probe_key,
+                super::probe::runner::probe_read_with_budget(&conn, key, self.probe_budget()),
+            )
+            .await;
+        // §4.11 观测：结构化日志（不记正文；供排障与人工提升 shipped 表时检索）
+        log::info!(
+            "codex-ipc probe: key={probe_key} stage={} ok={} error={:?} durationMs={}",
+            outcome.stage().as_str(),
+            matches!(outcome, ProbeOutcome::Probed { .. }),
+            outcome.error_code(),
+            outcome.duration_ms()
+        );
+        if let Some(ledger) = self.probe_ledger() {
+            ledger.record(&probe_key, CAP_STATE, &outcome);
+        }
+        if matches!(outcome, ProbeOutcome::Probed { .. }) {
+            self.set_state_capability(true);
+        }
+    }
+
+    /// 账本复用（**账本命中必须零帧**）：命中 `probed`/`verified` → 提升 `state` 并
+    /// 返回 `true`；`inconclusive` 未到重试点 → 返回 `true`（本轮不探，但能力仍关）。
+    fn reuse_ledger_evidence(&self, probe_key: &str) -> bool {
+        let Some(ledger) = self.probe_ledger() else {
+            return false;
+        };
+        let Some(entry) = ledger.get(probe_key, CAP_STATE) else {
+            return false;
+        };
+        match entry.state {
+            crate::database::dao::codex_ipc_probe::ProbeState::Probed
+            | crate::database::dao::codex_ipc_probe::ProbeState::Verified => {
+                log::info!("codex-ipc probe: 账本命中，零帧复用（key={probe_key}）");
+                self.set_state_capability(true);
+                true
+            }
+            crate::database::dao::codex_ipc_probe::ProbeState::Inconclusive => {
+                let now = chrono::Utc::now().timestamp_millis();
+                entry.next_retry_at.is_some_and(|at| at > now)
+            }
+            _ => false,
+        }
+    }
+
+    fn probe_ledger(&self) -> Option<Arc<dyn ProbeLedger>> {
+        self.inner
+            .probe_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn probe_target_snapshot(&self) -> Option<ProbeTarget> {
+        self.inner
+            .probe_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 取（并缓存）该 build 的账本键：`cli_id` 可能要跑一次 `codex.exe --version`
+    /// （2s 上限），放阻塞线程池，避免卡住 async worker；同 build 只算一次。
+    async fn resolve_probe_key(&self, target: &ProbeTarget) -> String {
+        if let Some(key) = &target.key {
+            return key.clone();
+        }
+        let platform = target.platform.clone();
+        let build = target.build.clone();
+        let computed = tokio::task::spawn_blocking(move || {
+            super::probe::fingerprint::probe_key(&platform, Some(build.as_str())).to_key()
+        })
+        .await
+        .unwrap_or_else(|_| {
+            super::probe::fingerprint::ProbeKey::new(
+                &target.platform,
+                Some(target.build.as_str()),
+                None,
+            )
+            .to_key()
+        });
+        // 回填缓存（目标可能已换 build：只在仍匹配时写）
+        let mut slot = self
+            .inner
+            .probe_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(cur) = slot.as_mut() {
+            if cur.platform == target.platform && cur.build == target.build {
+                cur.key = Some(computed.clone());
+            }
+        }
+        computed
+    }
+
+    /// 提升本进程 profile 的 `state` 能力（探测通过 / 账本命中）。**只动 state**：
+    /// 写能力仍由 shipped 证据或后续 L2 开关决定。
+    fn set_state_capability(&self, on: bool) {
+        let mut profile = self.inner.profile.lock().expect("profile lock");
+        if profile.capabilities.state != on {
+            profile.capabilities.state = on;
+        }
+    }
+
     /// 订阅投影事件（REST/SSE/队列调度共用）。
     /// 广播一份投影：代际已由 `ThreadMirror::project` 从**绑定的 lease** 填好
     ///（广播事件与 GET/SSE 首快照同源），此处不再二次盖章——否则会把「新 owner 的
@@ -289,7 +534,7 @@ impl DesktopIpcAdapter {
                 return Err(e);
             }
         };
-        // endpoint → profile（R3：精确 build 匹配；未知 build → closed，A 写全关）
+        // endpoint → profile（R3：精确 build 匹配；未知 build → **尚无证据**档，可探测）
         let resolved = super::profile::profile_for(
             &endpoint.platform,
             endpoint.build.as_deref().unwrap_or(""),
@@ -301,7 +546,28 @@ impl DesktopIpcAdapter {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) =
             Some(resolved.as_ref().is_some_and(|p| p.capabilities.send));
-        let profile = resolved.unwrap_or_else(ProtocolProfile::closed);
+        // #172：未命中 shipped 表 → **「尚无证据」档**（不是「明确不可用」）：能力位全关，
+        // 但允许首次 state 访问时惰性探测 / 复用账本。debug 专用强制开关把已验证 build
+        // 也压到这一档（本机 4894 已 shipped，否则跑不到未知分支）。
+        let forced_unverified = force_unverified();
+        let build = endpoint.build.clone().unwrap_or_default();
+        let profile = match &resolved {
+            Some(p) if !forced_unverified => p.clone(),
+            _ => ProtocolProfile::unverified(&endpoint.platform, &build),
+        };
+        // 探测目标：只有「尚无证据」档才记（shipped → None，不再探测）
+        {
+            let mut target = self
+                .inner
+                .probe_target
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *target = profile.is_probe_eligible().then(|| ProbeTarget {
+                platform: endpoint.platform.clone(),
+                build,
+                key: None,
+            });
+        }
         // 双检：另一任务可能已重连（持 conn 锁期间不做其他锁操作）
         let (conn, epoch) = {
             let mut guard = self.inner.conn.lock().await;
@@ -339,6 +605,9 @@ impl DesktopIpcAdapter {
     /// 后到者持锁后重查新鲜镜像即短路（不产生第二次 discovery/绑定）。
     pub async fn ensure_thread(&self, key: &ThreadKey) -> Result<ThreadProjection, ProtocolError> {
         let conn = self.ensure_connection().await?;
+        // #172：首次 `state` 访问 → 惰性只读探测（账本优先；失败不阻断读路径——
+        // 读不通自有别的原因，探测只是给出「这台 build 的读能力有没有证据」）。
+        self.ensure_read_evidence(key).await;
         // 快路径：已跟随且新鲜（短锁）
         if let Some(p) = self.fresh_projection(key).await {
             return Ok(p);

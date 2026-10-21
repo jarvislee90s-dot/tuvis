@@ -37,7 +37,9 @@ use crate::services::codex_control::{
 use crate::services::codex_desktop_ipc::adapter::{
     Connector, DesktopIpcAdapter, ProductionConnector,
 };
-use crate::services::codex_desktop_ipc::profile::profile_for;
+use crate::services::codex_desktop_ipc::probe::runner::ProbeOutcome;
+use crate::services::codex_desktop_ipc::probe::{ProbeLedger, ProbeLedgerEntry};
+use crate::services::codex_desktop_ipc::profile::{profile_for, ProtocolProfile};
 use crate::services::codex_desktop_ipc::types::{
     ActionReceipt, ActionState, CodexActionView, CodexQueueView, ControlRoute, PendingKind,
     ProtocolError, ThreadKey, ThreadProjection,
@@ -203,15 +205,27 @@ impl CodexControlHub {
                 ),
                 _ => Arc::new(NullConnector),
             };
-        let profile = resolver
-            .resolve()
-            .ok()
-            .and_then(|ep| profile_for(&ep.platform, ep.build.as_deref().unwrap_or("")))
-            .unwrap_or_else(closed_profile);
+        // #172：profile 从「准入白名单」降级为「证据缓存」——resolve 到 build 但不在
+        // shipped 表时用「尚无证据」档（可惰性探测），resolve 失败才是「明确不可用」。
+        let profile = match resolver.resolve() {
+            Ok(ep) => {
+                let platform = ep.platform.clone();
+                let build = ep.build.clone().unwrap_or_default();
+                profile_for(&platform, &build)
+                    .unwrap_or_else(|| ProtocolProfile::unverified(&platform, &build))
+            }
+            Err(_) => closed_profile(),
+        };
         let adapter = Arc::new(DesktopIpcAdapter::new(
             Arc::new(ProductionConnector { resolver }),
             profile,
         ));
+        // #172：能力探测账本（`codex_ipc_probe`）——程序自用的证据缓存，与 hub 的
+        // ActionStore 同库（设备/动作/探测三类事实一处）。DeviceStore 只在内存库里
+        // 需要共享（生产 Global 是零成本的单位变体）。
+        adapter.set_probe_ledger(Arc::new(StoreProbeLedger {
+            store: store.clone(),
+        }));
         // FollowGate 单实例同源（R7 复审 P2-1）：AdapterDispatch（ensure 失败回滚判定）
         // 与 hub（SSE 引用计数）必须看同一份关注引用——双实例会让派发侧误判零引用，
         // 把有活跃订阅的 thread 挤出 following 且恢复循环不再重建
@@ -908,7 +922,76 @@ impl Connector for NullConnector {
     }
 }
 
-/// 能力全关的保守 profile（未识别平台/build 的诚实缺省——写入恒 `capability_unavailable`）。
+// ============================================================
+// #172：探测账本的存储实现（DeviceStore 上的 `codex_ipc_probe`）
+// ============================================================
+
+/// 生产账本：与 hub 的 ActionStore 同库（`~/.tuvis/tuvis.db`；测试注入内存库）。
+///
+/// 只做三件事：读一行、按结论 upsert 一行、退避字段由 DAO 单点算。**不**碰正文/
+/// 线程标识；`verified` 永不写（`probe::ProbeOutcome::as_state` 只出三种词）。
+pub(crate) struct StoreProbeLedger {
+    store: DeviceStore,
+}
+
+impl ProbeLedger for StoreProbeLedger {
+    fn get(&self, probe_key: &str, capability: &str) -> Option<ProbeLedgerEntry> {
+        self.store
+            .with(|conn| {
+                crate::database::dao::codex_ipc_probe::get_conn(conn, probe_key, capability)
+                    .ok()
+                    .flatten()
+            })
+            .map(|row| ProbeLedgerEntry {
+                state: row.state,
+                next_retry_at: row.next_retry_at,
+            })
+    }
+
+    fn record(&self, probe_key: &str, capability: &str, outcome: &ProbeOutcome) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let stage = Some(outcome.stage().as_str());
+        let recorded = self.store.with(|conn| match outcome {
+            ProbeOutcome::Probed { .. } => crate::database::dao::codex_ipc_probe::upsert_ok_conn(
+                conn,
+                probe_key,
+                capability,
+                stage,
+                Some(outcome.duration_ms()),
+                now,
+            ),
+            ProbeOutcome::Failed { error_code, .. } => {
+                crate::database::dao::codex_ipc_probe::upsert_fail_conn(
+                    conn,
+                    probe_key,
+                    capability,
+                    stage,
+                    error_code,
+                    Some(outcome.duration_ms()),
+                    now,
+                )
+            }
+            ProbeOutcome::Inconclusive { error_code, .. } => {
+                crate::database::dao::codex_ipc_probe::upsert_inconclusive_conn(
+                    conn,
+                    probe_key,
+                    capability,
+                    stage,
+                    error_code,
+                    Some(outcome.duration_ms()),
+                    now,
+                )
+            }
+        });
+        if let Err(e) = recorded {
+            // 账本写失败不影响本次探测结论（本进程内存 profile 已按结论提升）；
+            // 只失去「跨重启复用」，如实记日志。
+            log::warn!("codex-ipc probe: 账本落盘失败 key={probe_key} err={e}");
+        }
+    }
+}
+
+/// 能力全关的保守 profile（未识别平台/build 的诚实缺省——写入恒 `capability_unavailable`）。/// #172：`evidence = Closed` —— **不探测**（这是「明确不可用」档，不是「尚无证据」档）。
 fn closed_profile() -> crate::services::codex_desktop_ipc::profile::ProtocolProfile {
     crate::services::codex_desktop_ipc::profile::ProtocolProfile {
         platform: std::env::consts::OS.to_string(),
@@ -921,6 +1004,7 @@ fn closed_profile() -> crate::services::codex_desktop_ipc::profile::ProtocolProf
             blocking_input: false,
         },
         method_versions: Default::default(),
+        evidence: crate::services::codex_desktop_ipc::profile::EvidenceLevel::Closed,
     }
 }
 

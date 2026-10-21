@@ -245,6 +245,29 @@ pub async fn probe_read(conn: &ConnectionHandle, key: &ThreadKey) -> ProbeOutcom
     probe_read_with_budget(conn, key, ProbeBudget::default()).await
 }
 
+/// P0 收尾：等握手给出**我方 clientId**（`result.clientId`，不是顶层；每次握手都换新）。
+/// 这是 P1 envelope 里 `sourceClientId` 的来源，也是「连接真的建起来了」的判据——
+/// 不能拿「收到任意帧」当 P0 通过。
+pub async fn wait_initialized(conn: &ConnectionHandle, budget: Duration) -> Option<String> {
+    let deadline = Instant::now() + budget;
+    let mut rx = conn.subscribe();
+    loop {
+        if let Some(id) = conn.initialized_client() {
+            return Some(id);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(left.min(Duration::from_millis(50)), rx.recv()).await {
+            Ok(Ok(ConnectionEvent::Initialized { client_id, .. })) => return Some(client_id),
+            Ok(Ok(ConnectionEvent::Disconnected { .. })) | Ok(Err(_)) => return None,
+            Ok(Ok(_)) => continue,
+            Err(_) => continue, // 本轮没等到：下一轮先看状态口再等
+        }
+    }
+}
+
 /// 同 [`probe_read`]，预算可注入（测试用；生产不传）。
 pub async fn probe_read_with_budget(
     conn: &ConnectionHandle,
@@ -253,6 +276,15 @@ pub async fn probe_read_with_budget(
 ) -> ProbeOutcome {
     let started = Instant::now();
     let elapsed = || started.elapsed().as_millis() as u64;
+
+    // ---- P0 收尾：等握手（clientId 是 P1 envelope 的 sourceClientId 来源）----
+    if wait_initialized(conn, P0_BUDGET).await.is_none() {
+        return ProbeOutcome::Failed {
+            stage: ProbeStage::P0,
+            error_code: "initialize_timeout".into(),
+            duration_ms: elapsed(),
+        };
+    }
 
     // ---- P1：owner discovery（带 envelope 形态的 sourceClientId/timeoutMs）----
     match timed(conn_discovery(conn, key), budget.p1).await {

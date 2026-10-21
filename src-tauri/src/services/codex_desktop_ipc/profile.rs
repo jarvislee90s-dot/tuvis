@@ -3,17 +3,40 @@
 //!
 //! profile 常量是**当前协议基线**：`false` = 该 build 尚未活体验证，不是协议不存在；
 //! 只有 Task 10 真机闭环 PASS 才翻转对应 flag，测试可用注入 profile 测构造器。
+//!
+//! **#172 起语义变更（措辞变了，不变量不变）**：`profile_for` 从「准入白名单」降级为
+//! 「**证据缓存**」——版本号只做归因与缓存键，能力一律来自证据或探测。未命中 shipped
+//! 表不再等价于「能力全关」，而是 [`ProtocolProfile::unverified`]（尚无证据：可惰性
+//! 探测 / 可复用账本）；[`ProtocolProfile::closed`] 只留给**明确不可用**
+//! （连接不可达 / 平台不支持 / 探测明确失败）。
 
 use crate::services::codex_desktop_ipc::types::{CapabilitySet, ProtocolError};
 use std::collections::BTreeMap;
 
-/// 已验证 Desktop build 的能力/版本基线；未识别 build 返回 `None`（能力全关）。
+/// 已验证 Desktop build 的能力/版本基线；未命中 shipped 表由调用方按证据级别建
+/// [`ProtocolProfile::unverified`] 或 [`ProtocolProfile::closed`]。
 #[derive(Clone)]
 pub struct ProtocolProfile {
     pub platform: String,
     pub build: String,
     pub capabilities: CapabilitySet,
     pub method_versions: BTreeMap<String, u32>,
+    /// #172：这份 profile 是「**尚无证据**」（未知 build，可探测 / 可查账本）还是
+    /// 「**明确不可用**」（连接不可达 / 平台不支持 / 探测明确失败）。
+    /// 两者能力位都是全 false，但**能不能探**不同——这是从「准入白名单」降级为
+    /// 「证据缓存」后唯一必须保留的区分。
+    pub evidence: EvidenceLevel,
+}
+
+/// profile 的证据级别（不是用户可见档位；用户档位见 `ControlAvailability`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceLevel {
+    /// 精确 build 在 shipped 表里（真机证据，无需探测）。
+    Shipped,
+    /// 未知 build：**尚无证据**，首次触发时惰性探测（或复用账本）。
+    Unverified,
+    /// 明确不可用：连接不可达 / 平台不支持 / 探测明确失败——不再探测。
+    Closed,
 }
 
 impl ProtocolProfile {
@@ -31,7 +54,32 @@ impl ProtocolProfile {
                 blocking_input: false,
             },
             method_versions: method_table(),
+            evidence: EvidenceLevel::Closed,
         }
+    }
+
+    /// #172：**未知 build 的诚实缺省**——「尚无证据」不是「明确不可用」。
+    /// 能力位全 false（未取证前不启用任何能力），方法表沿用基线；与 [`closed`] 的
+    /// 区别只在 [`evidence`]：这一档**可以**惰性探测 / 复用账本，判死档不行。
+    pub fn unverified(platform: &str, build: &str) -> Self {
+        Self {
+            platform: platform.to_string(),
+            build: build.to_string(),
+            capabilities: CapabilitySet {
+                send: false,
+                state: false,
+                command: false,
+                permissions: false,
+                blocking_input: false,
+            },
+            method_versions: method_table(),
+            evidence: EvidenceLevel::Unverified,
+        }
+    }
+
+    /// 是否处于「尚无证据、可探测」档（只有这一档允许触发只读探测）。
+    pub fn is_probe_eligible(&self) -> bool {
+        self.evidence == EvidenceLevel::Unverified
     }
 
     /// 按方法取版本。`envelope_host` 为 `Some` 时仅 `thread-follower-*` 基值 +1
@@ -89,6 +137,7 @@ fn windows_profile(build: &str) -> ProtocolProfile {
             blocking_input: true,
         },
         method_versions: method_table(),
+        evidence: EvidenceLevel::Shipped,
     }
 }
 
@@ -106,6 +155,7 @@ fn macos_profile(build: &str) -> ProtocolProfile {
             blocking_input: false,
         },
         method_versions: method_table(),
+        evidence: EvidenceLevel::Shipped,
     }
 }
 
@@ -126,6 +176,7 @@ fn macos_40934_profile(build: &str) -> ProtocolProfile {
             blocking_input: false,
         },
         method_versions: method_table(),
+        evidence: EvidenceLevel::Shipped,
     }
 }
 
@@ -151,6 +202,7 @@ fn windows_4894_profile(build: &str) -> ProtocolProfile {
             blocking_input: true,
         },
         method_versions: method_table(),
+        evidence: EvidenceLevel::Shipped,
     }
 }
 

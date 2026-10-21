@@ -3477,3 +3477,280 @@ async fn probe_single_flight_emits_one_protocol_run() {
     );
     conn.shutdown().await;
 }
+
+// ============================================================
+// #172：adapter 探测接入（shipped 不探 / 账本命中零帧 / 断链不伪造）
+// ============================================================
+
+use multi_agents_manager_lib::database::dao::codex_ipc_probe::ProbeState;
+use multi_agents_manager_lib::services::codex_desktop_ipc::probe::{
+    ProbeLedger, ProbeLedgerEntry, CAP_STATE,
+};
+use multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile;
+use std::sync::Arc;
+
+/// 内存账本行：(state, next_retry_at)。
+type LedgerRow = (ProbeState, Option<i64>);
+type LedgerKey = (String, String);
+
+/// 内存账本（测试用）：记录读写次数，方便断言「零帧复用」「未探测」。
+#[derive(Default)]
+struct MemoryLedger {
+    rows: StdMutex<std::collections::HashMap<LedgerKey, LedgerRow>>,
+    gets: std::sync::atomic::AtomicUsize,
+    records: std::sync::atomic::AtomicUsize,
+}
+
+impl MemoryLedger {
+    fn seed(
+        &self,
+        probe_key: &str,
+        capability: &str,
+        state: ProbeState,
+        next_retry_at: Option<i64>,
+    ) {
+        self.rows.lock().unwrap().insert(
+            (probe_key.to_string(), capability.to_string()),
+            (state, next_retry_at),
+        );
+    }
+    fn gets(&self) -> usize {
+        self.gets.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn records(&self) -> usize {
+        self.records.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn row(&self, probe_key: &str, capability: &str) -> Option<(ProbeState, Option<i64>)> {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&(probe_key.to_string(), capability.to_string()))
+            .copied()
+    }
+}
+
+impl ProbeLedger for MemoryLedger {
+    fn get(&self, probe_key: &str, capability: &str) -> Option<ProbeLedgerEntry> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.row(probe_key, capability)
+            .map(|(state, next_retry_at)| ProbeLedgerEntry {
+                state,
+                next_retry_at,
+            })
+    }
+
+    fn record(&self, probe_key: &str, capability: &str, outcome: &ProbeOutcome) {
+        self.records
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // 与 DAO 同语义：inconclusive 带退避窗口（首探 30s），其余清空
+        let next_retry_at = (outcome.as_state() == ProbeState::Inconclusive).then(|| {
+            chrono::Utc::now().timestamp_millis()
+                + multi_agents_manager_lib::database::dao::codex_ipc_probe::retry_backoff_ms(1)
+        });
+        self.rows.lock().unwrap().insert(
+            (probe_key.to_string(), capability.to_string()),
+            (outcome.as_state(), next_retry_at),
+        );
+    }
+}
+
+/// 恒败连接器（记录尝试次数）：证明「账本命中不建连 → 零帧」。
+struct FailingConnector {
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl FailingConnector {
+    fn new() -> Self {
+        Self {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Connector for FailingConnector {
+    fn connect(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        BoxIo,
+                        multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            Err(
+                multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError::Disconnected(
+                    "fixture: no desktop".into(),
+                ),
+            )
+        })
+    }
+}
+
+/// 期望的账本键（与 adapter 内部同一函数算，避免测试重写键格式）。
+fn expected_probe_key(platform: &str, build: &str) -> String {
+    multi_agents_manager_lib::services::codex_desktop_ipc::probe::fingerprint::probe_key(
+        platform,
+        Some(build),
+    )
+    .to_key()
+}
+
+/// shipped build **不探测**：证据级别不是「尚无证据」档，连账本都不查。
+#[tokio::test]
+async fn shipped_build_never_probes() {
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        profile_for("windows", WINDOWS_BUILD).unwrap(),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    assert!(!adapter.probe_eligible(), "shipped 档不可探测");
+    adapter
+        .ensure_read_evidence(&probe_thread("t-shipped"))
+        .await;
+    assert_eq!(ledger.gets(), 0, "shipped 不查账本（不探测）");
+    assert_eq!(ledger.records(), 0, "shipped 不写账本");
+    assert_eq!(connector.attempts(), 0, "shipped 不建连");
+    assert!(adapter.capabilities().state, "shipped 读能力本来就开");
+}
+
+/// 账本命中 → **零帧**提升 `state`（同 build 不重探；连连接都不建）。
+#[tokio::test]
+async fn ledger_hit_upgrades_state_with_zero_frames() {
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    ledger.seed(
+        &expected_probe_key("macos", "26.9999.0"),
+        CAP_STATE,
+        ProbeState::Probed,
+        None,
+    );
+    adapter.set_probe_ledger(ledger.clone());
+    assert!(!adapter.capabilities().state, "未复用前能力关");
+    adapter
+        .ensure_read_evidence(&probe_thread("t-ledger"))
+        .await;
+    assert!(adapter.capabilities().state, "账本命中的结论直接生效");
+    assert_eq!(ledger.gets(), 1);
+    assert_eq!(ledger.records(), 0, "命中不重写账本");
+    assert_eq!(connector.attempts(), 0, "账本命中零帧（不建连、不探测）");
+}
+
+/// 未知 build 首次 state 访问 → 探测通过 → 内存 profile 提升 `state` + 账本落 probed。
+#[tokio::test]
+async fn unknown_build_probe_upgrades_state_and_records() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(TestConnector::new(test_endpoint("macos", "26.9999.0"), io)),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.set_probe_budget(probe_budget());
+
+    let thread = "thread-unknown";
+    let key = probe_thread(thread);
+    let key_in_task = key.clone();
+    let a = adapter.clone();
+    let probe = tokio::spawn(async move { a.ensure_read_evidence(&key_in_task).await });
+
+    handshake(&mut peer, "owner-1").await;
+    let disc = expect_frame(&mut peer, "discovery").await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let follow = expect_frame(&mut peer, "following").await;
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    peer.send(&probe_snapshot(thread, 3)).await;
+
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    assert!(
+        adapter.capabilities().state,
+        "探测通过 → 内存 profile 的 state 必须提升（投影转只读档）"
+    );
+    let row = ledger
+        .row(&expected_probe_key("macos", "26.9999.0"), CAP_STATE)
+        .expect("账本必须落一行");
+    assert_eq!(row.0, ProbeState::Probed);
+    assert_eq!(ledger.records(), 1);
+    // 探完即放
+    let off = expect_frame(&mut peer, "unfollow").await;
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+
+    // 二次触发：已有证据 → 零帧零账本访问
+    adapter.ensure_read_evidence(&key).await;
+    assert_eq!(ledger.gets(), 1, "二次触发不再查账本");
+    assert_eq!(ledger.records(), 1);
+    adapter.shutdown().await;
+}
+
+/// 未知 build 探测不确定（静默）→ **不伪造**读能力；账本记 inconclusive（可退避重试）。
+#[tokio::test]
+async fn unknown_build_probe_failure_does_not_fake_state() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(TestConnector::new(test_endpoint("macos", "26.9999.0"), io)),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.set_probe_budget(probe_budget());
+
+    let key = probe_thread("thread-unknown-fail");
+    let key_in_task = key.clone();
+    let a = adapter.clone();
+    let probe = tokio::spawn(async move { a.ensure_read_evidence(&key_in_task).await });
+
+    handshake(&mut peer, "owner-1").await;
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let _follow = expect_frame(&mut peer, "following").await;
+    // 之后保持静默：P2 静默 → status-requested → 仍静默 → inconclusive
+    let _status = expect_frame(&mut peer, "status-requested").await;
+
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    assert!(
+        !adapter.capabilities().state,
+        "没有证据就不得声称读能力可用（不伪造）"
+    );
+    assert!(!adapter.probe_in_progress(), "探测结束后不得留在飞");
+    let row = ledger
+        .row(&expected_probe_key("macos", "26.9999.0"), CAP_STATE)
+        .expect("账本必须如实落一行");
+    assert_eq!(row.0, ProbeState::Inconclusive);
+    assert!(row.1.is_some(), "inconclusive 必须带退避窗口");
+    // 失败路径同样释放临时 follow
+    let off = expect_frame(&mut peer, "unfollow").await;
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+
+    // 退避窗口内再触发：查账本但**不再探测**（不产生新帧、不重写账本）
+    adapter.ensure_read_evidence(&key).await;
+    assert_eq!(ledger.records(), 1, "窗口内不得重写账本");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), peer.recv())
+            .await
+            .is_err(),
+        "退避窗口内不得再发探测帧"
+    );
+    adapter.shutdown().await;
+}
