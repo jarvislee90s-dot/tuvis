@@ -79,6 +79,9 @@ pub struct CapabilitySet {
     pub command: bool,
     pub permissions: bool,
     pub blocking_input: bool,
+    /// 打断桌面当前回合（`thread-follower-interrupt-turn`）。`false` = 该 build
+    /// 尚未活体验证，**不代表协议不存在**（Desktop 侧方法表已登记该方法）。
+    pub interrupt: bool,
 }
 
 /// 完成的动作回执（持久化于 `codex_actions.receipt_json`，HTTP 原样返回）。
@@ -576,6 +579,7 @@ mod tests {
             command: false,
             permissions: false,
             blocking_input: false,
+            interrupt: false,
         };
         let v = serde_json::to_value(caps).unwrap();
         assert!(v.get("send").is_some());

@@ -29,6 +29,7 @@ impl ProtocolProfile {
                 command: false,
                 permissions: false,
                 blocking_input: false,
+                interrupt: false,
             },
             method_versions: method_table(),
         }
@@ -66,6 +67,11 @@ fn method_table() -> BTreeMap<String, u32> {
             1,
         ),
         ("thread-follower-submit-user-input".to_string(), 1),
+        // 打断桌面当前回合（2026-10-21 由 Desktop 侧方法表静态取证：方法名存在、
+        // 基值 4；params `{conversationId, mode, expectedTurnId}`；被打断的回合
+        // 状态置 `interrupted`）。**必须带 expectedTurnId**——Desktop 的版本协商
+        // 对「缺 expectedTurnId 的 interrupt」期望版本 3，带上则走基值 4。
+        ("thread-follower-interrupt-turn".to_string(), 4),
         // broadcast/信号面（接收为主）
         ("client-status-changed".to_string(), 0),
         ("ipc-connection-reset".to_string(), 1),
@@ -87,6 +93,7 @@ fn windows_profile(build: &str) -> ProtocolProfile {
             command: true,
             permissions: false,
             blocking_input: true,
+            interrupt: false,
         },
         method_versions: method_table(),
     }
@@ -104,6 +111,7 @@ fn macos_profile(build: &str) -> ProtocolProfile {
             command: false,
             permissions: true,
             blocking_input: false,
+            interrupt: false,
         },
         method_versions: method_table(),
     }
@@ -114,6 +122,12 @@ fn macos_profile(build: &str) -> ProtocolProfile {
 /// 复审探针验证；start-turn 由实现侧探针实证——turn 成功创建 inProgress，23:58）。
 /// **permissions/command/blocking_input 在该 build 未实测，flag 保持 false**——
 /// 旧 build 的 PASS 不跨 build 迁移；审批/问答按证据逐项解锁。
+///
+/// **interrupt（2026-10-21 开启）**：Desktop 侧方法表静态取证——该 build 的
+/// `thread-follower-interrupt-turn` 基值 **4**，params `{conversationId, mode,
+/// expectedTurnId}`，被打断的回合状态置 `interrupted`；配合本仓 `turn_is_terminal`
+/// 放开 `interrupted` 后，「远程停止桌面回合并继续」链路闭环（打断 → 回合终态 →
+/// 屏障释放 → 队列接力）。
 fn macos_40934_profile(build: &str) -> ProtocolProfile {
     ProtocolProfile {
         platform: "macos".to_string(),
@@ -124,6 +138,7 @@ fn macos_40934_profile(build: &str) -> ProtocolProfile {
             command: false,
             permissions: false,
             blocking_input: false,
+            interrupt: true,
         },
         method_versions: method_table(),
     }
@@ -149,6 +164,7 @@ fn windows_4894_profile(build: &str) -> ProtocolProfile {
             command: true,
             permissions: false,
             blocking_input: true,
+            interrupt: false,
         },
         method_versions: method_table(),
     }
@@ -185,6 +201,36 @@ mod tests {
             c.version("thread-follower-load-complete-history", None)
                 .unwrap(),
             1
+        );
+    }
+
+    /// 打断桌面当前回合（2026-10-21）：方法已登记且版本与 Desktop 侧方法表一致
+    /// （基值 4）；能力位**按 build 逐个门控**——未实测的 build 不开。
+    #[test]
+    fn interrupt_turn_registered_v4_and_capability_gated_per_build() {
+        // 方法已登记：本地 follower 请求（envelope 不发 hostId）→ 基值 4
+        let mac = profile_for("macos", "26.1013.40934").unwrap();
+        assert_eq!(
+            mac.version("thread-follower-interrupt-turn", None).unwrap(),
+            4,
+            "打断方法版本与 Desktop 侧方法表基值一致"
+        );
+        assert!(mac.capabilities.interrupt, "40934 build 已开启打断能力");
+        // 未实测的 build 一律不开（不盲发）
+        let mac_old = profile_for("macos", "26.1013.31256").unwrap();
+        assert!(!mac_old.capabilities.interrupt);
+        let win = profile_for("windows", "26.1013.4894.0").unwrap();
+        assert!(!win.capabilities.interrupt);
+        let win_base = profile_for("windows", "26.1013.3656.0").unwrap();
+        assert!(!win_base.capabilities.interrupt);
+        // closed profile：能力全关但方法表仍在（只读同步不受影响）
+        let closed = ProtocolProfile::closed();
+        assert!(!closed.capabilities.interrupt);
+        assert_eq!(
+            closed
+                .version("thread-follower-interrupt-turn", None)
+                .unwrap(),
+            4
         );
     }
 
@@ -233,11 +279,13 @@ mod tests {
             11
         );
         assert_eq!(p.version("client-status-changed", None).unwrap(), 0);
-        // 未登记方法拒绝，不盲发
+        // 未登记方法拒绝，不盲发。
+        // （反例名用**确实不存在**的方法——`thread-follower-interrupt-turn` 已于
+        //  2026-10-21 登记为打断方法（基值 4），不能再当未登记反例。）
         assert_eq!(
-            p.version("thread-follower-interrupt-turn", None),
+            p.version("thread-follower-not-a-real-method", None),
             Err(ProtocolError::UnsupportedMethod(
-                "thread-follower-interrupt-turn".to_string()
+                "thread-follower-not-a-real-method".to_string()
             ))
         );
     }

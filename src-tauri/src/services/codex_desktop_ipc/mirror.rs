@@ -362,13 +362,19 @@ impl ThreadMirror {
         })
     }
 
-    /// 指定 Turn 是否已以终态出现在当前镜像（completed/failed）。
+    /// 指定 Turn 是否已以终态出现在当前镜像（completed/failed/**interrupted**）。
     /// 不在场 / inProgress / 未知状态 / stale / 无镜像 → false（保守不释放）。
+    ///
+    /// **interrupted（2026-10-21）**：Desktop 侧打断当前回合后把该 Turn 的 status
+    /// 置 `interrupted`（打包产物中 `t.status = "interrupted"` 实证）。它**是**终态
+    /// ——回合已结束，不会再有后续输出。不认它的话：远程打断 → 回合变 interrupted →
+    /// 终态门不认 → 屏障永久在册 → 队列永远暂停（比打断前更糟：用户以为已解围）。
+    /// 认它之后链路闭环：打断 → 终态证据 → 屏障释放 → 队列接力下一条。
     pub fn turn_is_terminal(&self, turn_id: &str) -> bool {
         !self.stale
             && matches!(
                 self.turn_status(turn_id).as_deref(),
-                Some("completed") | Some("failed")
+                Some("completed") | Some("failed") | Some("interrupted")
             )
     }
 
@@ -1726,6 +1732,7 @@ mod tests {
             command: false,
             permissions: true,
             blocking_input: false,
+            interrupt: false,
         }
     }
 
@@ -2126,6 +2133,58 @@ mod tests {
         // stale 镜像一律无证据
         m.mark_stale();
         assert!(!m.turn_is_terminal("turn-mine"), "stale 镜像不出证据");
+    }
+
+    /// 打断后的回合（status=interrupted）**是终态**——2026-10-21 远程打断闭环的
+    /// 关键一环：打断 → Desktop 把回合状态置 `interrupted` → 终态门放行 → 屏障释放
+    /// → 队列接力。若不认它，打断后屏障永久在册（比打断前更糟：用户以为已解围）。
+    #[test]
+    fn interrupted_turn_counts_as_terminal_evidence() {
+        let mut m = ThreadMirror::new(key());
+        let change = serde_json::json!({
+            "type": "snapshot", "revision": 1,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "threadRuntimeStatus": { "type": "active" },
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true,
+                    "entitiesByKey": {
+                        "turn:mine": { "turnId": "turn-mine",
+                                       "status": "interrupted", "items": [] }
+                    },
+                    "islands": [{ "entries": [
+                        { "key": "turn:mine", "value": "turn:mine" }
+                    ] }]
+                } }
+            }
+        });
+        m.apply(&lease(), &change).unwrap();
+        assert_eq!(m.turn_status("turn-mine").as_deref(), Some("interrupted"));
+        assert!(
+            m.turn_is_terminal("turn-mine"),
+            "被打断的回合是终态——屏障据此释放"
+        );
+        // inProgress 仍不是终态（对照）
+        let mut m2 = ThreadMirror::new(key());
+        let running = serde_json::json!({
+            "type": "snapshot", "revision": 1,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "threadRuntimeStatus": { "type": "active" },
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true,
+                    "entitiesByKey": {
+                        "turn:mine": { "turnId": "turn-mine",
+                                       "status": "inProgress", "items": [] }
+                    },
+                    "islands": [{ "entries": [
+                        { "key": "turn:mine", "value": "turn:mine" }
+                    ] }]
+                } }
+            }
+        });
+        m2.apply(&lease(), &running).unwrap();
+        assert!(!m2.turn_is_terminal("turn-mine"), "进行中的回合不是终态");
     }
 
     #[test]

@@ -3188,6 +3188,7 @@ fn artifact_projection_turns(turns: Vec<(&str, serde_json::Value)>) -> serde_jso
         command: false,
         permissions: false,
         blocking_input: false,
+        interrupt: false,
     }))
     .unwrap()
 }
@@ -3882,6 +3883,7 @@ mod messages_page {
             command: false,
             permissions: false,
             blocking_input: false,
+            interrupt: false,
         }
     }
 

@@ -883,6 +883,7 @@ fn closed_profile() -> crate::services::codex_desktop_ipc::profile::ProtocolProf
             command: false,
             permissions: false,
             blocking_input: false,
+            interrupt: false,
         },
         method_versions: Default::default(),
     }
@@ -897,6 +898,8 @@ const AUDIT_APPROVE: &str = "codex_approve";
 const AUDIT_REJECT: &str = "codex_reject";
 const AUDIT_ANSWER: &str = "codex_answer";
 const AUDIT_FALLBACK: &str = "codex_fallback";
+/// 打断桌面当前回合（破坏性动作——审计必须留痕）。
+const AUDIT_INTERRUPT: &str = "codex_interrupt";
 /// Desktop IPC 动作的审计 channel 词（兜底行记**实际 headless 通道名**——由封套取）。
 const AUDIT_CHANNEL: &str = "codex_desktop_ipc";
 
@@ -2124,6 +2127,144 @@ fn action_view_response(view: CodexActionView) -> Response {
 }
 
 // ============================================================
+// 端点：POST /codex/turn/interrupt
+// ============================================================
+
+/// POST /codex/turn/interrupt 请求体（camelCase）。`turnId` 可选：缺省取**在册
+/// 原生屏障绑定的 turnId**（上一条被桌面受理的回合），作为 Desktop 侧
+/// `expectedTurnId` 安全阀——与当前活动回合不符时 Desktop 静默不动作（不误伤）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptTurnReq {
+    pub session_id: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+}
+
+/// POST /codex/turn/interrupt：**打断桌面 Codex 当前回合**（`thread-follower-interrupt-turn`
+/// v4）。打断后 Desktop 把该回合状态置 `interrupted`（终态）→ 镜像终态门放行 →
+/// 在册屏障释放 → 待发队列接力下一条（这就是「远程点掉那个卡」的闭环）。
+///
+/// 语义边界（必须如实，不美化）：
+/// - **破坏性**：被打断回合未完成的工作会丢失。端点只负责"发出打断"，不代用户
+///   判断该不该打断——那一层由前端两步确认 + 风险披露承担。
+/// - **不谎报**：回合已结束（不再 inProgress）时 Desktop 静默不动作，端点回
+///   `interruptedTurnId: null` + `ok: true`——不谎称打断成功，也不报错。
+/// - **能力门**：该 Desktop build 未活体验证 `interrupt` → 503 `capability_unavailable`。
+/// - 打断**不直接清屏障**：屏障由终态证据驱动释放（`release_turn_if_complete`），
+///   本端点只发打断并触发一次结算；回合终态帧到达时调度循环自动接力。
+pub async fn interrupt_turn(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    body: Result<Json<InterruptTurnReq>, JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(v) => v,
+        Err(_) => return bad_request(),
+    };
+    let session_id = req.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return bad_request();
+    }
+    let Some((device_id, device_name)) = device_identity(st.as_ref(), &headers) else {
+        return forbidden_defense();
+    };
+    let probe_st = st.clone();
+    let probe_sid = session_id.clone();
+    let session =
+        match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid)).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("codex/turn/interrupt 会话扫描任务异常: {e}");
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        };
+    let Some(session) = session else {
+        return not_found();
+    };
+    let Some(key) = resolve_session_thread(&st, &session) else {
+        return not_found();
+    };
+    // expectedTurnId：调用方给了就用；否则取在册原生屏障绑定的 turnId（安全阀）。
+    let expected_turn_id = match req.turn_id.as_deref().map(str::trim) {
+        Some(t) if !t.is_empty() => Some(t.to_string()),
+        _ => match st
+            .codex_control
+            .router
+            .store()
+            .outstanding_native_turn_id(&key)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("codex/turn/interrupt 读取在册 turnId 失败: {e}");
+                None
+            }
+        },
+    };
+    let outcome = st
+        .codex_control
+        .adapter
+        .interrupt_turn(&key, expected_turn_id.as_deref())
+        .await;
+    match outcome.delivery {
+        crate::services::codex_desktop_ipc::types::Delivery::Accepted => {
+            let interrupted_turn_id = outcome
+                .result
+                .as_ref()
+                .and_then(|r| r.get("interruptedTurnId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // 触发一次结算：等回合终态帧到达时由调度循环释放屏障并接力队列。
+            st.codex_control.notify_settled(&key);
+            let ctx = ActionContext {
+                action_id: format!(
+                    "interrupt-{}",
+                    interrupted_turn_id.as_deref().unwrap_or("none")
+                ),
+                device_id: device_id.clone(),
+                device_name: device_name.clone(),
+                kind: ActionKind::Send,
+                key: key.clone(),
+            };
+            codex_audit(
+                st.as_ref(),
+                &ctx,
+                AUDIT_INTERRUPT,
+                &session.id,
+                None,
+                Some(outcome.envelope_id.as_str()),
+                if interrupted_turn_id.is_some() {
+                    "interrupted"
+                } else {
+                    "no_active_turn"
+                },
+            );
+            json_no_store(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "interruptedTurnId": interrupted_turn_id,
+                    "expectedTurnId": expected_turn_id,
+                }),
+            )
+        }
+        _ => {
+            let reason = outcome
+                .reason_code
+                .unwrap_or_else(|| "not_sent".to_string());
+            let status = match reason.as_str() {
+                "stale_context" => StatusCode::CONFLICT,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            json_no_store(status, serde_json::json!({ "ok": false, "error": reason }))
+        }
+    }
+}
+
+// ============================================================
 // 端点：POST /codex/pending-response
 // ============================================================
 
@@ -2376,6 +2517,7 @@ mod startup_merge_tests {
                 command: true,
                 permissions: false,
                 blocking_input: true,
+                interrupt: false,
             },
             runtime_status: "idle".into(),
             content_state: ContentState::Ready,

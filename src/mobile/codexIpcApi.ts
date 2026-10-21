@@ -195,6 +195,7 @@ export const CODEX_ACTION_PATH = "/m/api/v1/codex/action";
 export const CODEX_QUEUE_PATH = "/m/api/v1/codex/queue";
 export const CODEX_QUEUE_RETRACT_PATH = "/m/api/v1/codex/queue/retract";
 export const CODEX_QUEUE_FORCE_CONTINUE_PATH = "/m/api/v1/codex/queue/force-continue";
+export const CODEX_TURN_INTERRUPT_PATH = "/m/api/v1/codex/turn/interrupt";
 
 // ==== fetch 基建 ====
 
@@ -558,6 +559,49 @@ export async function forceContinueCodexAction(actionId: string): Promise<CodexA
   }
   if (!r.ok) throw await toApiError("codex/queue/force-continue", r);
   return (await r.json()) as CodexActionView;
+}
+
+// ==== 打断桌面回合 ====
+
+/** 打断桌面当前回合的结果。
+ *  - `interruptedTurnId` 非空 = 确实打断了那个回合；
+ *  - `interruptedTurnId` 为 null = 桌面侧没有可打断的活动回合（**不谎报成功**，
+ *    也不当作错误——回合可能刚好自己结束了）。 */
+export interface InterruptTurnResult {
+  ok: boolean;
+  interruptedTurnId: string | null;
+  expectedTurnId: string | null;
+}
+
+/** 打断桌面 Codex 当前回合（2026-10-21 新增）。
+ *
+ * **破坏性动作**：被打断回合未完成的工作会丢失——调用方必须先经两步确认并向用户
+ * 披露该风险，不得静默触发。
+ *
+ * `turnId` 缺省时由服务端取**在册原生屏障绑定的 turnId** 作 `expectedTurnId` 安全阀
+ * （Desktop 侧「与当前活动回合不符 → 静默不动作」）。200 = 打断请求已受理；
+ * 409 = 上下文过期（会话已变）；503 = 该 Desktop 版本未验证打断能力 / 连接不可用。 */
+export async function interruptCodexTurn(
+  sessionId: string,
+  turnId?: string
+): Promise<InterruptTurnResult> {
+  let r: Response;
+  try {
+    r = await fetch(CODEX_TURN_INTERRUPT_PATH, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(turnId ? { sessionId, turnId } : { sessionId }),
+    });
+  } catch (e) {
+    throw networkFail("codex/turn/interrupt", e);
+  }
+  if (!r.ok) throw await toApiError("codex/turn/interrupt", r);
+  const raw = (await r.json()) as Partial<InterruptTurnResult>;
+  return {
+    ok: raw.ok === true,
+    interruptedTurnId: raw.interruptedTurnId ?? null,
+    expectedTurnId: raw.expectedTurnId ?? null,
+  };
 }
 
 // ==== actionId 生成 ====

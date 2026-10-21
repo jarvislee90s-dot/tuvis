@@ -43,6 +43,10 @@ interface Routes {
   forceContinueFailures?: Record<string, { status: number; body: Record<string, unknown> }>;
   /** R11：GET 挂起不响应（手动放行——乱序防护用例的在途响应） */
   queueHang?: boolean;
+  /** POST /codex/turn/interrupt 的失败状态码（缺省 200） */
+  interruptStatus?: number;
+  /** POST /codex/turn/interrupt 的回执体覆盖（null = 桌面无可打断回合） */
+  interruptBody?: Record<string, unknown>;
 }
 
 let routes: Routes;
@@ -81,6 +85,23 @@ function installFetch() {
           position: null,
           receipt: null,
         }),
+        { status: 200 }
+      );
+    }
+    if (url.includes("/codex/turn/interrupt")) {
+      if (routes.interruptStatus) {
+        return new Response(JSON.stringify({ error: "capability_unavailable" }), {
+          status: routes.interruptStatus,
+        });
+      }
+      return new Response(
+        JSON.stringify(
+          routes.interruptBody ?? {
+            ok: true,
+            interruptedTurnId: "t-live",
+            expectedTurnId: "t-live",
+          }
+        ),
         { status: 200 }
       );
     }
@@ -130,6 +151,12 @@ function queueGetCalls(): number {
 function forceContinueBodies(): string[] {
   return fetchMock.mock.calls
     .filter(([u]) => String(u).includes("/codex/queue/force-continue"))
+    .map(([, init]) => String((init as RequestInit)?.body));
+}
+
+function interruptBodies(): string[] {
+  return fetchMock.mock.calls
+    .filter(([u]) => String(u).includes("/codex/turn/interrupt"))
     .map(([, init]) => String((init as RequestInit)?.body));
 }
 
@@ -532,6 +559,103 @@ describe("CodexQueuePanel（Task 9）", () => {
       "forceContinueYes",
       "forceContinueCancel",
       "forceContinueFailed",
+    ]) {
+      const v = i18n.t(`mobile.codex.queue.${key}`);
+      expect(v, `键 mobile.codex.queue.${key} 必须存在`).not.toBe(`mobile.codex.queue.${key}`);
+      expect(v.length).toBeGreaterThan(0);
+    }
+  });
+
+  // ==== 打断桌面回合（2026-10-21 新增）====
+
+  it("interrupt_button_only_for_native_turn_pending：打断出口仅 native_turn_pending 可见（其余阻塞态走人工解除/无出口）", async () => {
+    installFetch();
+    routes.queue = [queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"])];
+    const { unmount } = render(<CodexQueuePanel sessionId="s1" />);
+    expect(await screen.findByTestId("codex-queue-interrupt")).toBeTruthy();
+    unmount();
+    // native_delivery_unknown / compat_outstanding：不提供打断（那是人工解除的活）
+    routes.queue = [queueView([action({ actionId: "a2" })], "native_delivery_unknown", ["u-1"])];
+    const r2 = render(<CodexQueuePanel sessionId="s1" />);
+    await screen.findByTestId("codex-queue-blocked");
+    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
+    r2.unmount();
+    routes.queue = [queueView([action({ actionId: "a3" })], "compat_outstanding", ["c-1"])];
+    const r3 = render(<CodexQueuePanel sessionId="s1" />);
+    await screen.findByTestId("codex-queue-blocked");
+    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
+    r3.unmount();
+  });
+
+  it("interrupt_requires_confirmation：点击先出确认条（含工作丢失风险披露），确认前零请求；取消零请求", async () => {
+    installFetch();
+    routes.queue = [queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"])];
+    render(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
+    const strip = screen.getByTestId("codex-queue-interrupt-confirm");
+    // 破坏性动作的风险必须如实披露：回合未完成的工作会丢失
+    expect(strip.textContent).toContain("未完成的工作会丢失");
+    // 确认前零请求（两步确认纪律）
+    expect(interruptBodies()).toEqual([]);
+    // 取消：收起确认条，仍零请求
+    fireEvent.click(screen.getByTestId("codex-queue-interrupt-no"));
+    expect(screen.queryByTestId("codex-queue-interrupt-confirm")).toBeNull();
+    expect(interruptBodies()).toEqual([]);
+  });
+
+  it("interrupt_success_reports_and_refreshes：确认后调用打断端点（带 sessionId）→ 如实回报并重拉队列", async () => {
+    installFetch();
+    routes.queue = [
+      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
+      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]), // 操作后重拉
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
+    fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
+    await waitFor(() => expect(interruptBodies()).toEqual(['{"sessionId":"s1"}']));
+    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain("已发出停止指令");
+    expect(queueGetCalls()).toBe(2);
+  });
+
+  it("interrupt_no_active_turn_is_not_faked_as_success：桌面无可打断回合 → 如实提示，不谎报成功", async () => {
+    installFetch();
+    routes.interruptBody = { ok: true, interruptedTurnId: null, expectedTurnId: null };
+    routes.queue = [
+      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
+      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
+    fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
+    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain("没有可停止的回合");
+  });
+
+  it("interrupt_failure_shows_error：失败显示错误不静默（仍重拉权威列表）", async () => {
+    installFetch();
+    routes.interruptStatus = 503;
+    routes.queue = [
+      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
+      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
+    fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
+    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain("停止失败");
+    expect(queueGetCalls()).toBe(2);
+  });
+
+  it("interrupt_i18n_keys_exist：新键两侧必须存在（键集对齐由 check:i18n 保证）", async () => {
+    for (const key of [
+      "interrupt",
+      "interruptRisk",
+      "interruptYes",
+      "interruptCancel",
+      "interruptDone",
+      "interruptNoTurn",
+      "interruptFailed",
     ]) {
       const v = i18n.t(`mobile.codex.queue.${key}`);
       expect(v, `键 mobile.codex.queue.${key} 必须存在`).not.toBe(`mobile.codex.queue.${key}`);

@@ -443,6 +443,15 @@ impl ActionStore {
         self.with(|c| dao::outstanding_fence_summary_conn(c, &key.thread_id).map_err(db_err))
     }
 
+    /// 在册**原生**屏障绑定的 turnId（打断端点的 `expectedTurnId` 安全阀来源）。
+    /// 无在册原生屏障 → None。
+    pub fn outstanding_native_turn_id(
+        &self,
+        key: &ThreadKey,
+    ) -> Result<Option<String>, StoreError> {
+        self.with(|c| dao::outstanding_native_turn_id_conn(c, &key.thread_id).map_err(db_err))
+    }
+
     /// 清 fence：仅终态动作允许（queued/reserved → `Conflict`）。Accepted/Unknown 必须
     /// 先经只读核对（[`reconcile_compat_fence`]）拿到对应 Turn 完成证据；helper
     /// 「已消费」回执不算证据。

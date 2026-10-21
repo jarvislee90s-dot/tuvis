@@ -677,6 +677,12 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
             "/codex/pending-response",
             post(super::codex_ipc::pending_response),
         )
+        // 打断桌面当前回合（破坏性：打断后回合未完成的工作丢失）。回合终态到达时
+        // 屏障释放、待发队列接力——「远程点掉那个卡」的闭环。
+        .route(
+            "/codex/turn/interrupt",
+            post(super::codex_ipc::interrupt_turn),
+        )
         // M8 Task 11：审批端点（红卡一键批准/拒绝——选项可用性 + 按键应答；PIN 门禁
         // 内层 gate 结构性覆盖，新端点不需要各自鉴权代码）
         .route(

@@ -708,6 +708,69 @@ impl DesktopIpcAdapter {
         .await
     }
 
+    /// 打断桌面当前回合（`thread-follower-interrupt-turn` v4，2026-10-21 新增）。
+    ///
+    /// 协议契约（由 Desktop 打包产物静态取证：`app.asar` 方法表 + handler + 打断
+    /// 状态机）：
+    /// - method `thread-follower-interrupt-turn`，基值版本 **4**；
+    /// - params `{conversationId, mode, expectedTurnId}`；`mode` 取 `user-stop`
+    ///   （等价用户手动按 Stop）或 `system`；`expectedTurnId` 是**安全阀**——与
+    ///   当前活动回合不一致时 Desktop 静默不动作（不误伤别的回合）；
+    /// - 返回 `{interruptedTurnId, ok}`（`goalPauseError` 只在 mode=user-stop 且
+    ///   goal 暂停失败时出现，且仍带 interruptedTurnId）。
+    ///
+    /// 版本纪律：Desktop 侧版本协商对「params 缺 `expectedTurnId` 的 interrupt」
+    /// 期望版本 **3**、带上则期望基值 **4**。本实现**始终带上 expectedTurnId**
+    /// （缺省由调用方给出在册屏障绑定的 turnId），故固定走基值 4。
+    ///
+    /// 打断后 Desktop 把该回合 status 置 `interrupted`——镜像终态门已认该状态
+    /// （`mirror.rs turn_is_terminal`），屏障随之释放、队列接力下一条。
+    pub async fn interrupt_turn(
+        &self,
+        key: &ThreadKey,
+        expected_turn_id: Option<&str>,
+    ) -> RpcOutcome {
+        let envelope_id = super::types::new_uuid();
+        if !self.current_caps().interrupt {
+            return not_sent(&envelope_id, "capability_unavailable");
+        }
+        let (lease, validity) = {
+            let owners = self.inner.owners.lock().await;
+            match current_lease(&owners, key) {
+                Some(l) => {
+                    let v = owners.validity(&l);
+                    (l, v)
+                }
+                None => return not_sent(&envelope_id, "stale_context"),
+            }
+        };
+        let version = {
+            let conn = self.inner.conn.lock().await;
+            match conn
+                .as_ref()
+                .map(|c| c.version_of("thread-follower-interrupt-turn"))
+            {
+                Some(Ok(v)) => v,
+                _ => return not_sent(&envelope_id, "disconnected"),
+            }
+        };
+        let mut params = json!({
+            "conversationId": key.thread_id,
+            "mode": "user-stop",
+        });
+        if let Some(t) = expected_turn_id {
+            params["expectedTurnId"] = json!(t);
+        }
+        self.dispatch(
+            "thread-follower-interrupt-turn",
+            version,
+            params,
+            lease,
+            validity,
+        )
+        .await
+    }
+
     /// 审批/作答。requestKey/contextToken 回显校验；服务端保存的 pending 上下文是
     /// 唯一事实源（远端不上送 owner/permissions/raw method）。
     /// 2026-10-17 复审 C3：拆锁后的最终复核携带**完整上下文代际**——阶段 1 记录镜像
