@@ -4,6 +4,7 @@ pub mod archive;
 pub mod base_snapshot;
 pub mod board_hidden;
 pub mod codex_actions;
+pub mod codex_ipc_probe;
 pub mod extension;
 pub mod heartbeat_seen;
 pub mod inject_queue;
