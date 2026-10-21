@@ -11,6 +11,7 @@
 
 pub mod fingerprint;
 pub mod runner;
+pub mod schema_probe;
 
 use crate::database::dao::codex_ipc_probe::ProbeState;
 

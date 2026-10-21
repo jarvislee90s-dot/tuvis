@@ -87,6 +87,66 @@ pub fn cli_id(platform: &str) -> Option<String> {
     }
 }
 
+/// **随包 CLI 的可执行路径**（#172 schema 探针要用它跑 `app-server generate-json-schema`）。
+///
+/// 与 [`cli_id`] 同一套定位逻辑，只是要的是「能执行的那个文件」而不是版本串：
+/// * Windows：运行中 `codex.exe`（唯一才取；多义 → `None`）；
+/// * macOS：bundle 内 `Contents/Resources/codex-cli/bin/codex`（328B 固定 shim，
+///   升级不变）优先，其次 `CodexCLI.app/Contents/MacOS/codex`。
+pub fn cli_executable() -> Option<PathBuf> {
+    cli_executable_for(std::env::consts::OS)
+}
+
+/// 平台可注入的定位入口（测试在非本平台上验证「无安装 → None」）。
+pub fn cli_executable_for(platform: &str) -> Option<PathBuf> {
+    match platform.trim().to_ascii_lowercase().as_str() {
+        "windows" => windows_cli_executable(),
+        "macos" => macos_cli_executable(),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn windows_cli_executable() -> Option<PathBuf> {
+    let exes = running_codex_exes();
+    (exes.len() == 1).then(|| exes[0].clone())
+}
+
+#[cfg(not(windows))]
+fn windows_cli_executable() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cli_executable() -> Option<PathBuf> {
+    let bundles = running_bundles();
+    if bundles.len() != 1 {
+        return None;
+    }
+    macos_cli_in_bundle(&bundles[0])
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_cli_executable() -> Option<PathBuf> {
+    None
+}
+
+/// macOS bundle 内随包 CLI 的路径（**纯函数**：不扫进程，测试可造临时 bundle 验证
+/// 优先级——328B 固定 shim 优先，其次 `CodexCLI.app` 主二进制；都不在 → `None`）。
+pub fn macos_cli_in_bundle(bundle: &Path) -> Option<PathBuf> {
+    let cli_dir = bundle.join("Contents").join("Resources").join("codex-cli");
+    let shim = cli_dir.join("bin").join("codex");
+    if shim.is_file() {
+        return Some(shim);
+    }
+    let app_bin = cli_dir
+        .join("CodexCLI.app")
+        .join("Contents")
+        .join("MacOS")
+        .join("codex");
+    app_bin.is_file().then_some(app_bin)
+}
+
 // ============================================================
 // Windows：--version → bin/<hash>
 // ============================================================
@@ -385,5 +445,29 @@ mod tests {
             None,
             "空平台不做推断（归一化后不匹配任何取法）"
         );
+    }
+
+    /// 随包 CLI 定位（纯函数部分）：shim 优先 → `CodexCLI.app` 主二进制 → 缺 → None。
+    #[test]
+    fn macos_cli_in_bundle_prefers_shim_then_app_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("Codex.app");
+        assert_eq!(macos_cli_in_bundle(&bundle), None, "空 bundle 没有 CLI");
+
+        let app_bin = bundle.join("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex");
+        std::fs::create_dir_all(app_bin.parent().unwrap()).unwrap();
+        std::fs::write(&app_bin, b"binary").unwrap();
+        assert_eq!(macos_cli_in_bundle(&bundle), Some(app_bin));
+
+        let shim = bundle.join("Contents/Resources/codex-cli/bin/codex");
+        std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        std::fs::write(&shim, b"shim").unwrap();
+        assert_eq!(
+            macos_cli_in_bundle(&bundle),
+            Some(shim),
+            "328B 固定 shim 优先（升级路径不变）"
+        );
+        // 未知平台不产路径
+        assert_eq!(cli_executable_for("linux"), None);
     }
 }
