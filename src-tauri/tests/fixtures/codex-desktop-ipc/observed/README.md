@@ -54,7 +54,7 @@ macOS 金样 5 条事实**同构**（T2 逐项核对全 ✓，含 `tail:0:local:
 | `windows-4894-plan-input.sanitized.json` | `/plan` 会话的 `item/tool/requestUserInput`（**整数 id**）+ `thread-follower-submit-user-input` 作答 + `{"ok":true}` |
 | `windows-4894-opening.derived.sanitized.json` | **DERIVED**（源：`raw/t4-1.jsonl` T4 rev3 snapshot）：删去某 Turn 的正式 userMessage，保留 `params.input`/`clientUserMessageId`——开场后备投影测试用；其余字节与原脱敏样本一致 |
 | `windows-4894-busy-negative.derived.sanitized.json` | **DERIVED**（源：`raw/t7-1.jsonl` 忙态负例）：某 Turn 的 `params.clientUserMessageId`/`input` 被替换为合成第二条 prompt（未落 Turn），`items` 保留第一条真实 userMessage——`opening_*` 幽灵气泡负例；只有这两处派生 |
-
+| `windows-4894-plan-request-implementation.sanitized.json` | **DERIVED**（源：2026-10-21 真机只读抓取 rev 146）：`conversationState.requests` 里的**计划实现审批** `item/plan/requestImplementation`（`params` = `planContent`；`id` 是 **string**，51 字符）——施工单 §3 明确不开放 plan，本夹具钉死「必须保持 `Unsupported`/到桌面处理」，并证明 string id 走 `s:` 前缀 |
 同批已知边界（如实登记）：permissions 请求在该 build 的读场景 NOT_TRIGGERED（外部读取升权
 走 command approval）；空会话不落 session（真空首帧无样本）；忙态 start-turn 返回 success
 但新 prompt 不落 Turn（生产忙态屏障必需，不能把写回执当投递成功）。

@@ -1,0 +1,28 @@
+{
+  "_source": "2026-10-21 Windows 26.1013.4894.0 真机只读抓取（DERIVED：只保留 pending 请求骨架；ID 占位、正文 synthetic）",
+  "_captured_from": "thread-stream-state-changed / conversationState.requests（revision 146，线程占位化）",
+  "_note": "计划实现审批 item/plan/requestImplementation：params 是 planContent，不是命令三元组；request id 是 string（51 字符）。施工单 §3 明确不探测/不开放 plan —— 本夹具钉死「必须保持 Unsupported、到桌面处理」。",
+  "type": "snapshot",
+  "revision": 146,
+  "conversationState": {
+    "id": "00000000-0000-4000-8000-0000000000a1",
+    "turns": [],
+    "requests": [
+      {
+        "method": "item/plan/requestImplementation",
+        "id": "synthetic-plan-request-000000000000000000000000000000",
+        "params": {
+          "threadId": "00000000-0000-4000-8000-0000000000a1",
+          "turnId": "00000000-0000-4000-8000-0000000000a2",
+          "planContent": "<synthetic plan content>"
+        }
+      }
+    ],
+    "turnHistory": {
+      "kind": "canonical",
+      "history": {
+        "isComplete": true
+      }
+    }
+  }
+}

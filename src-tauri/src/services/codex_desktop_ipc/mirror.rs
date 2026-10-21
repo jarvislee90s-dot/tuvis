@@ -1466,6 +1466,43 @@ mod tests {
         fixture(&format!("observed/{name}"))
     }
 
+    /// 2026-10-21 真机（rev 146）：`requests[]` 里除了命令/权限/问答，还有**计划实现审批**
+    /// `item/plan/requestImplementation`（`params` = `planContent`；`id` 是 **string**，
+    /// 不是整数）。施工单 §3 明确不探测/不开放 plan → 投影必须是 `Unsupported` +
+    /// 不可操作，且不得把 `planContent` 暴露到远端 DTO。
+    #[test]
+    fn observed_plan_request_implementation_stays_unsupported() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(
+            &lease(),
+            &observed_change("windows-4894-plan-request-implementation.sanitized.json"),
+        )
+        .unwrap();
+        let p = m.project(caps());
+        assert_eq!(
+            p.pending.len(),
+            1,
+            "plan 审批要作为 pending 出现（只是不可操作）"
+        );
+        let view = &p.pending[0];
+        assert_eq!(view.kind, PendingKind::Unsupported);
+        assert!(!view.actionable, "plan 一律不可远程决策");
+        assert_eq!(
+            view.disabled_reason_code.as_deref(),
+            Some("capability_unavailable")
+        );
+        assert!(
+            view.request_key.starts_with("s:"),
+            "string id 必须按 s: 前缀编码（整数 id 才是 n:）：{}",
+            view.request_key
+        );
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(
+            !json.contains("planContent") && !json.contains("synthetic plan content"),
+            "不得把 raw 参数/计划正文暴露给远端：{json}"
+        );
+    }
+
     #[test]
     fn observed_golden_target_turn_terminal_evidence() {
         let mut m = ThreadMirror::new(key());
