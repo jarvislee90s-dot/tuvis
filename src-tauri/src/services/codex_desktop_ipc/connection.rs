@@ -57,6 +57,12 @@ pub struct RpcRequest {
     pub target: Option<OwnerLease>,
     pub mutating: bool,
     pub validity: Option<watch::Receiver<bool>>,
+    /// #172：**信封级** `sourceClientId`（我方 clientId）。Desktop 自己的 `sendRequest`
+    /// 把它放在信封上（与 `build_broadcast_frame` 的 `sourceClientId` 同位置），
+    /// **不在 params 里**——探测的 owner discovery 按上游形态发，减少未知。
+    pub source_client_id: Option<String>,
+    /// #172：**信封级** `timeoutMs`（上游 `sendRequest` 同样带在信封上）。
+    pub timeout_ms: Option<u64>,
 }
 
 /// RPC 结果。`envelope_id` 恒为本次生成的 envelope UUID。
@@ -329,6 +335,8 @@ impl ConnectionHandle {
             &req.params,
             req.version,
             req.target.as_ref(),
+            req.source_client_id.as_deref(),
+            req.timeout_ms,
         ) {
             Ok(f) => f,
             Err(e) => return RpcOutcome::not_sent(envelope_id, e.code()),
@@ -404,6 +412,8 @@ fn build_request_frame(
     params: &Value,
     version: Option<u32>,
     target: Option<&OwnerLease>,
+    source_client_id: Option<&str>,
+    timeout_ms: Option<u64>,
 ) -> Result<Vec<u8>, ProtocolError> {
     let mut envelope = json!({
         "type": "request",
@@ -416,6 +426,14 @@ fn build_request_frame(
     }
     if let Some(lease) = target {
         envelope["targetClientId"] = json!(lease.client_id);
+    }
+    // #172：信封级 `sourceClientId` / `timeoutMs`（与 broadcast 的 sourceClientId 同位置；
+    // Desktop 自己的 `sendRequest` 就是这么发的——不进 params）
+    if let Some(source) = source_client_id {
+        envelope["sourceClientId"] = json!(source);
+    }
+    if let Some(ms) = timeout_ms {
+        envelope["timeoutMs"] = json!(ms);
     }
     super::codec::encode_frame(&envelope)
 }

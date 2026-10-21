@@ -129,6 +129,8 @@ fn simple_request(method: &str) -> RpcRequest {
         target: None,
         mutating: false,
         validity: None,
+        source_client_id: None,
+        timeout_ms: None,
     }
 }
 
@@ -847,6 +849,8 @@ async fn owner_rebind_invalidates_old_lease_end_to_end() {
             target: Some(lease_a.clone()),
             mutating: true,
             validity: Some(validity),
+            source_client_id: None,
+            timeout_ms: None,
         })
         .await;
     assert_eq!(outcome.delivery, Delivery::NotSent);
@@ -3216,11 +3220,16 @@ async fn probe_homomorphic_build_passes_then_unfollows() {
     let k = key.clone();
     let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
 
-    // P1：镜像 Desktop 自己的 envelope（sourceClientId + timeoutMs）
+    // P1：`sourceClientId` / `timeoutMs` 在**信封**上（与 Desktop 自己的 sendRequest
+    // 同形），不在 params 里
     let disc = expect_frame(&mut peer, "discovery").await;
     assert_eq!(disc["method"], "thread-owner-discovery");
-    assert_eq!(disc["params"]["sourceClientId"], "owner-1");
-    assert_eq!(disc["params"]["timeoutMs"], 2000);
+    assert_eq!(disc["sourceClientId"], "owner-1", "信封级 sourceClientId");
+    assert_eq!(disc["timeoutMs"], 2000, "信封级 timeoutMs");
+    assert!(
+        disc["params"].get("sourceClientId").is_none() && disc["params"].get("timeoutMs").is_none(),
+        "params 里不得再带这两个字段（那是信封字段）: {disc}"
+    );
     peer.send(&discovery_ok(&disc["requestId"])).await;
 
     // P2：临时 follow（following:true）
@@ -3344,9 +3353,10 @@ async fn probe_missing_core_fields_is_inconclusive_p3() {
     conn.shutdown().await;
 }
 
-/// 场景 4（断链）：P2 等待期间连接结束 → Failed(P2, disconnected)（明确失败，不自动重试）。
+/// 场景 4（断链）：P2 等待期间连接结束 → **Inconclusive**(P2, disconnected)——链路中断
+/// 只说明「没有证据」，不是协议被证伪；到退避点可重试。
 #[tokio::test]
-async fn probe_disconnect_during_follow_is_failed() {
+async fn probe_disconnect_during_follow_is_inconclusive() {
     let (io, mut peer) = ScriptedPeer::new();
     let profile = profile_for("macos", "26.1013.31256").unwrap();
     let conn = spawn(io, profile, 1);
@@ -3368,14 +3378,52 @@ async fn probe_disconnect_during_follow_is_failed() {
         .expect("探测在预算内结束")
         .expect("task ok");
     match outcome {
-        ProbeOutcome::Failed {
+        ProbeOutcome::Inconclusive {
             stage, error_code, ..
         } => {
             assert_eq!(stage, ProbeStage::P2);
             assert_eq!(error_code, "disconnected");
         }
-        other => panic!("断链必须是 failed，got {other:?}"),
+        other => panic!("断链只能记「没有证据」（inconclusive），got {other:?}"),
     }
+}
+
+/// 顺序回归：`subscribe → drain_stale → declare_following → wait_snapshot`。
+/// 声明之后**立刻**到达的 snapshot 必须留在等待窗口里——旧顺序（declare → drain）会把
+/// 它当成「声明前的被动广播」丢掉，白等到预算耗尽。
+#[tokio::test]
+async fn snapshot_arriving_right_after_declare_is_not_drained() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let thread = "thread-immediate-snapshot";
+    let key = probe_thread(thread);
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let follow = expect_frame(&mut peer, "following").await;
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    // 收到 following 声明后**不做任何等待**，立刻回 snapshot（模拟「声明即快照」）
+    peer.send(&probe_snapshot(thread, 42)).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Probed { revision, .. } => {
+            assert_eq!(revision, Some(42), "声明后立刻到达的 snapshot 不得被 drain")
+        }
+        other => panic!("紧跟在声明后的 snapshot 必须被采信，got {other:?}"),
+    }
+    let _off = expect_frame(&mut peer, "unfollow").await;
+    conn.shutdown().await;
 }
 
 /// 场景 5（无 owner）：router 级错误 `no-client-found`（**响应不带 method 字段**）→
@@ -3649,6 +3697,55 @@ async fn ledger_hit_upgrades_state_with_zero_frames() {
     assert_eq!(ledger.gets(), 1);
     assert_eq!(ledger.records(), 0, "命中不重写账本");
     assert_eq!(connector.attempts(), 0, "账本命中零帧（不建连、不探测）");
+}
+
+/// 账本 `failed`（明确协议错）= 本 build 已判死 → 本轮**不探**（不建连、不重写账本）。
+#[tokio::test]
+async fn ledger_failed_state_suppresses_probe() {
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    ledger.seed(
+        &expected_probe_key("macos", "26.9999.0"),
+        CAP_STATE,
+        ProbeState::Failed,
+        None,
+    );
+    adapter.set_probe_ledger(ledger.clone());
+    adapter
+        .ensure_read_evidence(&probe_thread("t-failed"))
+        .await;
+    assert!(!adapter.capabilities().state, "判死的 build 不提升能力");
+    assert_eq!(connector.attempts(), 0, "failed 账本不得再触发探测");
+    assert_eq!(ledger.records(), 0, "failed 账本不得被重写");
+    assert_eq!(ledger.gets(), 1);
+}
+
+/// P0 不可达（Desktop 没起）→ 记 **inconclusive**（不是 failed）：没证据 ≠ 判死。
+#[tokio::test]
+async fn p0_unreachable_records_inconclusive() {
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.ensure_read_evidence(&probe_thread("t-p0")).await;
+    assert_eq!(connector.attempts(), 1, "应尝试建连一次");
+    assert!(!adapter.capabilities().state);
+    let row = ledger
+        .row(&expected_probe_key("macos", "26.9999.0"), CAP_STATE)
+        .expect("P0 失败也要落账");
+    assert_eq!(
+        row.0,
+        ProbeState::Inconclusive,
+        "不可达只能记「没有证据」（Desktop 可能只是没起）"
+    );
+    assert!(row.1.is_some(), "带退避窗口");
 }
 
 /// 未知 build 首次 state 访问 → 探测通过 → 内存 profile 提升 `state` + 账本落 probed。

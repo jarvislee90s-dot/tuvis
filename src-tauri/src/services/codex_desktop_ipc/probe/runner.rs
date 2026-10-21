@@ -278,15 +278,16 @@ pub async fn probe_read_with_budget(
     let elapsed = || started.elapsed().as_millis() as u64;
 
     // ---- P0 收尾：等握手（clientId 是 P1 envelope 的 sourceClientId 来源）----
+    // 握手没回包 = 「不可达」= **没有证据**（不是明确失败：Desktop 可能只是慢/冷启动）。
     if wait_initialized(conn, P0_BUDGET).await.is_none() {
-        return ProbeOutcome::Failed {
+        return ProbeOutcome::Inconclusive {
             stage: ProbeStage::P0,
             error_code: "initialize_timeout".into(),
             duration_ms: elapsed(),
         };
     }
 
-    // ---- P1：owner discovery（带 envelope 形态的 sourceClientId/timeoutMs）----
+    // ---- P1：owner discovery（`sourceClientId`/`timeoutMs` 走**信封**，见 RpcRequest）----
     match timed(conn_discovery(conn, key), budget.p1).await {
         Ok(Ok(_owner)) => {}
         Ok(Err(stage_err)) => return stage_err.into_outcome(ProbeStage::P1, elapsed()),
@@ -299,18 +300,16 @@ pub async fn probe_read_with_budget(
         }
     }
 
-    // ---- P2：临时 follow → 等 snapshot（订阅先于声明，声明前的帧不算证据）----
+    // ---- P2：临时 follow → 等 snapshot ----
+    // 顺序固定为 **subscribe → drain_stale → declare_following → wait_snapshot**：
+    // 先把「声明之前」的被动广播丢掉，再把订阅窗口交给「声明之后」的帧——声明后立刻
+    // 到达的 snapshot 必须在窗口里（旧顺序 declare→drain 会把它当旧帧丢掉）。
     let mut rx = conn.subscribe();
-    if let Err(code) = declare_following(conn, key).await {
-        best_effort_unfollow(conn, key).await;
-        return ProbeOutcome::Failed {
-            stage: ProbeStage::P2,
-            error_code: code,
-            duration_ms: elapsed(),
-        };
-    }
-    // 声明之后才到的帧才算我方证据：先把订阅缓冲里「声明前」的旧帧丢掉
     drain_stale(&mut rx);
+    if let Err(stage_err) = declare_following(conn, key).await {
+        best_effort_unfollow(conn, key).await;
+        return stage_err.into_outcome(ProbeStage::P2, elapsed());
+    }
     let snapshot = match wait_snapshot(conn, &mut rx, key, budget.p2).await {
         Ok(frame) => frame,
         Err(SnapshotMiss::Drift) => {
@@ -329,7 +328,7 @@ pub async fn probe_read_with_budget(
                 }
                 Err(SnapshotMiss::Disconnected(code)) => {
                     best_effort_unfollow(conn, key).await;
-                    return ProbeOutcome::Failed {
+                    return ProbeOutcome::Inconclusive {
                         stage: ProbeStage::P2,
                         error_code: code,
                         duration_ms: elapsed(),
@@ -339,7 +338,8 @@ pub async fn probe_read_with_budget(
         }
         Err(SnapshotMiss::Disconnected(code)) => {
             best_effort_unfollow(conn, key).await;
-            return ProbeOutcome::Failed {
+            // 断链 = 链路中断（不是协议形态被证伪）→ 按「没有证据」记，可重试
+            return ProbeOutcome::Inconclusive {
                 stage: ProbeStage::P2,
                 error_code: code,
                 duration_ms: elapsed(),
@@ -395,15 +395,20 @@ where
     tokio::time::timeout(budget, fut).await.map_err(|_| ())
 }
 
-/// P1：`thread-owner-discovery`（带 `sourceClientId` + `timeoutMs`）。
+/// P1：`thread-owner-discovery`。`sourceClientId` / `timeoutMs` 走**信封**
+/// （与 Desktop 自己的 `sendRequest` 同形；见 [`RpcRequest`] 字段注释），不进 `params`。
 ///
-/// `no-client-found` 是**「不确定」不是死亡判决**（版本不匹配与无 owner 同形）。
+/// 失败分级：
+/// * `no-client-found`（含 router 级无 `method` 响应）→ **不确定**，不判死（版本不匹配
+///   与「无 owner」同形）；
+/// * 其它明确拒绝（协议错误）→ **失败**；
+/// * `NotSent` / `UnknownDelivery`（没送达 / 结果未知）→ **不确定**（链路问题，可重试）。
 async fn conn_discovery(conn: &ConnectionHandle, key: &ThreadKey) -> Result<String, StageError> {
     let version = conn
         .version_of("thread-owner-discovery")
         .map_err(|e| StageError {
             code: short_code(&e),
-            inconclusive: false,
+            inconclusive: false, // 方法不在方法表 = 明确协议错（UnsupportedMethod）
         })?;
     let source_client_id = conn.initialized_client().unwrap_or_default();
     let outcome = conn
@@ -412,14 +417,13 @@ async fn conn_discovery(conn: &ConnectionHandle, key: &ThreadKey) -> Result<Stri
             params: serde_json::json!({
                 "hostId": key.host_id,
                 "conversationId": key.thread_id,
-                // 镜像 Desktop 自己的 sendRequest envelope（实测带这两个字段时 11ms 返回）
-                "sourceClientId": source_client_id,
-                "timeoutMs": DISCOVERY_TIMEOUT_MS,
             }),
             version: Some(version),
             target: None,
             mutating: false,
             validity: None,
+            source_client_id: Some(source_client_id),
+            timeout_ms: Some(DISCOVERY_TIMEOUT_MS),
         })
         .await;
     match outcome.delivery {
@@ -443,9 +447,10 @@ async fn conn_discovery(conn: &ConnectionHandle, key: &ThreadKey) -> Result<Stri
                 inconclusive: text.contains("no-client-found") || text.is_empty(),
             })
         }
+        // 没送达 = 链路问题（不可达/断链）：**没有证据**，不是协议被证伪
         Delivery::NotSent => Err(StageError {
             code: "disconnected".into(),
-            inconclusive: false,
+            inconclusive: true,
         }),
         Delivery::UnknownDelivery => Err(StageError {
             code: "delivery_unknown".into(),
@@ -454,11 +459,15 @@ async fn conn_discovery(conn: &ConnectionHandle, key: &ThreadKey) -> Result<Stri
     }
 }
 
-/// 声明 following（broadcast v1）。
-async fn declare_following(conn: &ConnectionHandle, key: &ThreadKey) -> Result<(), String> {
+/// 声明 following（broadcast v1）。方法版本查表失败 = 明确协议错（Failed）；
+/// 写失败（断链/预算） = 没有证据（Inconclusive）。
+async fn declare_following(conn: &ConnectionHandle, key: &ThreadKey) -> Result<(), StageError> {
     let version = conn
         .version_of("thread-stream-following-changed")
-        .map_err(|e| short_code(&e))?;
+        .map_err(|e| StageError {
+            code: short_code(&e),
+            inconclusive: false,
+        })?;
     conn.broadcast(
         "thread-stream-following-changed",
         version,
@@ -469,7 +478,10 @@ async fn declare_following(conn: &ConnectionHandle, key: &ThreadKey) -> Result<(
         }),
     )
     .await
-    .map_err(|e| short_code(&e))
+    .map_err(|e| StageError {
+        code: short_code(&e),
+        inconclusive: true,
+    })
 }
 
 /// 立即撤销临时 follow（尽力而为：失败不影响探测结论，也不留本地状态）。

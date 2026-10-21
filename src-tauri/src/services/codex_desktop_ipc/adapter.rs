@@ -345,7 +345,9 @@ impl DesktopIpcAdapter {
     /// 2. 非「尚无证据」档（closed / 不可达）→ 不探；
     /// 3. 算/取指纹键（同 build 只算一次）→ 查账本：
     ///    * `probed`/`verified` → 提升本进程 profile 的 `state`，**零帧**复用；
-    ///    * `inconclusive` 且退避未到点 → 本轮不探；
+    ///    * `failed` → 本 build 已判死（明确协议错），**本轮不探**（换 build /
+    ///      `PROBE_EPOCH` 变更 / 用户显式重探才会再来）；
+    ///    * `inconclusive` 未到重试点 → 本轮不探（到点后才重试）；
     /// 4. 探测（P0 `ensure_connection` + P1–P3）→ 落账本；通过才提升 `state`。
     ///
     /// 探测失败**不阻断**后续读路径（follow 照常尝试，读不通自有别的原因）。
@@ -371,6 +373,8 @@ impl DesktopIpcAdapter {
         let conn = match self.ensure_connection().await {
             Ok(conn) => conn,
             Err(e) => {
+                // P0 不可达 = **没有证据**（Desktop 可能只是没起/冷启动），不是协议被
+                // 证伪——记 inconclusive（带错误码），到退避点后再试。
                 log::info!(
                     "codex-ipc probe: P0 不可达（{}），本轮不探（key={probe_key}）",
                     e.code()
@@ -379,7 +383,7 @@ impl DesktopIpcAdapter {
                     ledger.record(
                         &probe_key,
                         CAP_STATE,
-                        &ProbeOutcome::Failed {
+                        &ProbeOutcome::Inconclusive {
                             stage: ProbeStage::P0,
                             error_code: e.code().to_string(),
                             duration_ms: 0,
@@ -389,11 +393,14 @@ impl DesktopIpcAdapter {
                 return;
             }
         };
+        // 单飞键带上线程：同 build 的两个线程各自触发时，A 线程的「无 owner」不得
+        // 直接当成 B 线程的结论（账本键仍不含线程——那才是跨线程复用的粒度）。
+        let flight_key = format!("{probe_key}|{}", key.thread_id);
         let outcome = self
             .inner
             .probe
             .run(
-                &probe_key,
+                &flight_key,
                 super::probe::runner::probe_read_with_budget(&conn, key, self.probe_budget()),
             )
             .await;
@@ -414,7 +421,8 @@ impl DesktopIpcAdapter {
     }
 
     /// 账本复用（**账本命中必须零帧**）：命中 `probed`/`verified` → 提升 `state` 并
-    /// 返回 `true`；`inconclusive` 未到重试点 → 返回 `true`（本轮不探，但能力仍关）。
+    /// 返回 `true`；`failed` → 返回 `true`（本 build 已判死，本轮不探）；
+    /// `inconclusive` 未到重试点 → 返回 `true`（本轮不探，但能力仍关）。
     fn reuse_ledger_evidence(&self, probe_key: &str) -> bool {
         let Some(ledger) = self.probe_ledger() else {
             return false;
@@ -429,6 +437,10 @@ impl DesktopIpcAdapter {
                 self.set_state_capability(true);
                 true
             }
+            // 明确失败 = 这个 build 已经判死：本轮不探（换 build / epoch 变更 /
+            // 用户显式重探才会再来）——否则每次详情页访问都会白跑一遍 15s 探测。
+            crate::database::dao::codex_ipc_probe::ProbeState::Failed => true,
+            // 不确定：到退避点才重试；窗口内本轮不探
             crate::database::dao::codex_ipc_probe::ProbeState::Inconclusive => {
                 let now = chrono::Utc::now().timestamp_millis();
                 entry.next_retry_at.is_some_and(|at| at > now)
@@ -1137,6 +1149,8 @@ impl DesktopIpcAdapter {
             target: Some(target),
             mutating: true,
             validity: Some(validity),
+            source_client_id: None,
+            timeout_ms: None,
         })
         .await
     }
@@ -1891,6 +1905,8 @@ async fn maybe_request_complete_history(adapter: &DesktopIpcAdapter, key: &Threa
                     target: None,
                     mutating: false,
                     validity: None,
+                    source_client_id: None,
+                    timeout_ms: None,
                 })
                 .await;
             let accepted = matches!(outcome.delivery, super::types::Delivery::Accepted);

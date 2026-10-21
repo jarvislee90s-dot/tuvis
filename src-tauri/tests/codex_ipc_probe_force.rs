@@ -166,7 +166,14 @@ async fn force_unverified_env_makes_shipped_build_probe() {
         disc["method"], "thread-owner-discovery",
         "强制档必须走探测 P1"
     );
-    assert_eq!(disc["params"]["sourceClientId"], "owner-1");
+    assert_eq!(
+        disc["sourceClientId"], "owner-1",
+        "sourceClientId 在信封上（不在 params）"
+    );
+    assert!(
+        disc["params"].get("sourceClientId").is_none(),
+        "params 里不得再带信封字段: {disc}"
+    );
     peer.send(&serde_json::json!({
         "type": "response", "requestId": disc["requestId"],
         "resultType": "success", "method": "thread-owner-discovery",
