@@ -2016,6 +2016,66 @@
         "headless_failed": "Compatibility channel not delivered: {{reason}}",
         "headless_cancelled": "Compatibility channel cancelled: {{reason}}"
       }
+    },
+    "artifacts": {
+      "source": {
+        "image_generation": "Generated",
+        "local_image": "Uploaded",
+        "mention": "Uploaded",
+        "file_change": "Modified",
+        "image_view": "Viewed",
+        "image_url": "External image",
+        "unknown": "Unknown source"
+      },
+      "imageIndex": "Image {{n}}",
+      "imageAlt": "Attached image",
+      "imagePending": "Image loads when it enters view",
+      "imageLoading": "Loading image…",
+      "openImage": "Preview image {{name}}",
+      "imageOverflow": "This turn has {{total}} images; at most the first {{shown}} are shown",
+      "fileChangeOverflow": "{{count}} more file changes not shown",
+      "serverOmitted": "{{count}} more attachments were not delivered due to a server budget limit",
+      "openFilePanel": "Open file panel",
+      "sourceFallback": "Source: {{label}}",
+      "externalImage": "External image",
+      "reason": {
+        "missingPath": "No file path, cannot preview",
+        "unresolvedFileId": "Only a file ID is available; it cannot be opened on this device",
+        "dataUrl": "Embedded images cannot be previewed and are never turned into downloads",
+        "unsupportedScheme": "Unsupported link scheme; only HTTP(S) is allowed",
+        "pathTooLong": "File path is too long to preview",
+        "fileKeyTooLong": "File identity is too long to link",
+        "missingUrl": "No link address, cannot open",
+        "urlTooLong": "Link is too long to open",
+        "unreadable": "This file cannot be read",
+        "denied": "This path is protected by the security policy and cannot be previewed",
+        "removed": "The file does not exist or has moved",
+        "tooLarge": "The file exceeds the preview limit and cannot be shown",
+        "notFile": "This path is not a file",
+        "notImage": "This path is not a displayable image",
+        "decodeFailed": "The image could not be decoded",
+        "unknown": "This reference cannot be previewed"
+      },
+      "locate": {
+        "action": "Locate the latest reference in messages",
+        "aria": "Locate the latest reference to {{name}} in messages",
+        "short": "Locate",
+        "searching": "Locating the latest reference… ({{pages}} of {{max}} pages searched)",
+        "hit": "Located the latest reference (page {{page}})",
+        "miss": "No reference to this file was found in the latest five pages of messages",
+        "missHint": "The lookup does not load older messages; this does not mean the file was never referenced",
+        "end": "Reached the earliest message without finding a reference to this file",
+        "returnPreview": "Back to file preview",
+        "returnPanel": "Back to file panel",
+        "retry": "Retry",
+        "dismiss": "Dismiss locate message",
+        "failure": {
+          "historyIncomplete": "History is not fully loaded yet; the lookup stopped (you can retry)",
+          "loadFailed": "Loading earlier messages failed; the lookup stopped (you can retry)",
+          "cursorInvalid": "The history cursor is invalid (history may have changed); the lookup stopped (you can retry)",
+          "generationInvalid": "The history generation is invalid (the session changed); the lookup stopped (you can retry)"
+        }
+      }
     }
   }
 }

@@ -58,3 +58,13 @@ macOS 金样 5 条事实**同构**（T2 逐项核对全 ✓，含 `tail:0:local:
 同批已知边界（如实登记）：permissions 请求在该 build 的读场景 NOT_TRIGGERED（外部读取升权
 走 command approval）；空会话不落 session（真空首帧无样本）；忙态 start-turn 返回 success
 但新 prompt 不落 Turn（生产忙态屏障必需，不能把写回执当投递成功）。
+
+## 2026-10-21 附件任务取证状态
+
+现有 OBSERVED canonical 快照没有 `imageGeneration`、`localImage`、`mention`、
+`fileChange`、`imageView` 或用户图片 URL／fileId 分支。此次没有新增 OBSERVED
+附件文件：本机仅有已有私人会话可供 IPC 读取；在不读取私人对话且不触发真实
+会话动作的约束下，无法安全取得含附件的真实样本。字段名的 macOS 静态核验与
+未完成的 Windows 附件核验见
+`docs/superpowers/reviews/2026-10-20-codex-artifact-field-evidence.md`。
+独立合成回归输入位于同级 `artifacts/`，不得当作真实 canonical 形态。

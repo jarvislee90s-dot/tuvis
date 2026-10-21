@@ -154,6 +154,11 @@ pub struct ThreadProjection {
     pub content_state: ContentState,
     pub messages: Vec<ProjectedMessage>,
     pub truncated: bool,
+    /// 历史代际 token（同代分页锚点）：与消息页 `historyToken` **同构**——绑定线程、
+    /// owner 代际、镜像重建代与「尾窗之前消息的身份序」。客户端把尾窗最早一条当
+    /// `before_id` 时，必须原样回传本字段；旧载荷缺省为空串（不得据此分页）。
+    #[serde(default)]
+    pub history_token: String,
     pub pending: Vec<PendingView>,
     /// Owner 代际（epoch, generation）：**不序列化给前端**，只用于 SSE 首快照与
     /// 订阅缓冲事件的先后判定（跨 owner revision 可能回退，不能只比 revision）。
@@ -187,6 +192,97 @@ pub struct ProjectedMessage {
     pub kind: String,
     pub text: String,
     pub ts: Option<i64>,
+    /// 稳定回合身份；旧载荷缺省 → None（不参与消息去重/投递判定）。
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// 结构化附件（每消息 ≤128；省略见 `omitted_artifact_count`）。
+    #[serde(default)]
+    pub artifacts: Vec<ProjectedArtifact>,
+    /// 完整 canonical 回合的图片卡总数；尾窗裁剪与 UI 12 图限额都不改变它。
+    #[serde(default)]
+    pub turn_image_count: usize,
+    /// 仅服务端数量／字节预算省略；与 UI 展示限额分开，不保证已进入文件池。
+    #[serde(default)]
+    pub omitted_artifact_count: usize,
+}
+
+/// 只读历史消息页状态（计划任务 4 的五个值，逐字对齐；**非正常状态不得被当作
+/// 完整空页，也不得被解释为「没有更多」**——`reasonCode` 给出有界机器码）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessagesPageStatus {
+    /// 返回了一页更早消息（还可能继续往前翻）。
+    Ready,
+    /// 真正到头：游标之前没有任何消息（空历史同理）。
+    End,
+    /// 历史尚未完整取得（Turn 列表不完整或 items 分页未载完）——只读 hydrate 后重试。
+    Loading,
+    /// 当前无法提供历史页：无镜像 / 镜像预算拒绝 / 结构不可读 / 代际已失效。
+    Unavailable,
+    /// 游标或历史 token 不再有效：缺游标、游标不存在、token 畸形或前缀已改写。
+    CursorInvalid,
+}
+
+/// 同代只读消息页（`GET /m/api/v1/codex/thread/messages`）。`messages` 是**严格在
+/// 游标之前**的一页（canonical 顺序：旧 → 新，最多 50 条 / 1 MiB 序列化字节）；
+/// `historyToken` 是**下一页游标**对应的 token，客户端应原样回传。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesPage {
+    /// `ready`/`end` 之外恒为空数组（不返回半页）。
+    pub messages: Vec<ProjectedMessage>,
+    /// 下一页锚点（= 页内最早一条）的历史代际 token；不可继续分页时为空串。
+    #[serde(default)]
+    pub history_token: String,
+    /// 镜像 revision（只作展示/诊断，不参与 token）。
+    pub revision: Option<u64>,
+    /// 下一页游标（页内最早一条）；`ready` 之外为 null（含 `end`）。
+    pub next_before: Option<String>,
+    pub status: MessagesPageStatus,
+    /// 有界机器码（状态映射见 `mirror::messages_page` 文档）；正常页为 null。
+    pub reason_code: Option<String>,
+}
+
+/// 附件类别：本地图片卡 / 文档文件 chip / 外链（不经服务端代理下载）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Image,
+    Document,
+    ExternalImage,
+}
+
+/// 附件来源：五类结构化引用 + 用户 `image.url` 的独立外链分支。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactSource {
+    ImageGeneration,
+    LocalImage,
+    Mention,
+    FileChange,
+    ImageView,
+    ImageUrl,
+}
+
+/// 本项目附件契约（与 `src/mobile/codexIpcApi.ts` 的 `ProjectedArtifact` 逐字段
+/// 对齐）。`path` 是展示值、`file_key` 是文件池关联键；状态与变更类型只是有界
+/// 原始字符串，不代表写盘成功；`unavailable_reason` 只表达「该引用不可预览/
+/// 打开」，摘要/元数据的有界截断不写入该字段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectedArtifact {
+    pub artifact_id: String,
+    pub kind: ArtifactKind,
+    pub source: ArtifactSource,
+    pub path: Option<String>,
+    pub url: Option<String>,
+    pub file_key: Option<String>,
+    pub ordinal: usize,
+    pub image_index_in_turn: Option<usize>,
+    pub summary: Option<String>,
+    pub source_status: Option<String>,
+    pub change_kind: Option<String>,
+    pub unavailable_reason: Option<String>,
 }
 
 /// 待处理交互类别。未知 method → `Unsupported`（actionable=false，只显示

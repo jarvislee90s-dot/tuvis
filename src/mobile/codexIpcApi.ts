@@ -67,13 +67,53 @@ export interface CapabilitySet {
   blockingInput: boolean;
 }
 
-/** 投影消息（正文条目）。 */
+/** 附件类别（Rust `ArtifactKind` 的 snake_case 取值）。 */
+export type ArtifactKind = "image" | "document" | "external_image";
+
+/** 附件来源（Rust `ArtifactSource` 的 snake_case 取值）：五类结构化引用 +
+ *  用户 `image.url` 的独立外链分支。 */
+export type ArtifactSource =
+  "image_generation" | "local_image" | "mention" | "file_change" | "image_view" | "image_url";
+
+/** 投影附件（与 Rust `ProjectedArtifact` 逐字段对齐）。可缺省信息用 null；
+ *  `unavailableReason` 只表达「引用不可预览/打开」的机器码（展示文案由 UI 决定），
+ *  摘要/元数据的有界截断不写入该字段；`fileKey` 由服务端按文件池同一口径生成，
+ *  前端只用于关联，不自行推断宿主路径规则。 */
+export interface ProjectedArtifact {
+  artifactId: string;
+  kind: ArtifactKind;
+  source: ArtifactSource;
+  path: string | null;
+  url: string | null;
+  fileKey: string | null;
+  /** 来源内稳定序号（每个来源独立计数，先于尾窗裁剪统计）。 */
+  ordinal: number;
+  /** 回合内图片卡索引；只给可展示的本地图片，外链与文件 chip 为 null。 */
+  imageIndexInTurn: number | null;
+  summary: string | null;
+  /** 原始状态标量：不映射为「已完成/成功」。 */
+  sourceStatus: string | null;
+  /** 原始变更类型标量：不映射为 add/modify/delete。 */
+  changeKind: string | null;
+  unavailableReason: string | null;
+}
+
+/** 投影消息（正文条目）。附件字段为兼容扩展：旧载荷缺省时由
+ *  `asThreadProjection` 归一化为空数组/0/null，不崩溃。 */
 export interface ProjectedMessage {
   id: string;
   role: string;
   kind: string;
   text: string;
   ts: number | null;
+  /** 稳定回合身份；旧载荷缺省 → null。 */
+  turnId?: string | null;
+  /** 结构化附件；旧载荷缺省 → []。 */
+  artifacts?: ProjectedArtifact[];
+  /** 完整 canonical 回合的图片卡总数（尾窗裁剪不改变；UI 12 图限额另行展示）。 */
+  turnImageCount?: number;
+  /** 仅服务端预算省略的附件数；与 UI 的 12 图／6 chip 展示限额无关。 */
+  omittedArtifactCount?: number;
 }
 
 /** 结构化问题（Plan blocking input）。is_secret 的回答不入审计/日志。 */
@@ -123,13 +163,33 @@ export interface ThreadProjection {
   contentState: ContentState;
   messages: ProjectedMessage[];
   truncated: boolean;
+  /** 历史代际 token（同代分页锚点；旧载荷缺省 → 空串，**不得据此分页**）。 */
+  historyToken?: string;
   pending: PendingView[];
+}
+
+/** 同代只读消息页状态（与 Rust `MessagesPageStatus` 逐字对齐；非正常状态不得
+ *  当作完整空页，也不得被解释为「没有更多」）。 */
+export type MessagesPageStatus = "ready" | "end" | "loading" | "unavailable" | "cursor_invalid";
+
+/** 同代只读历史页（`GET /m/api/v1/codex/thread/messages`，Task 4 端点）。
+ *  `messages` 是**严格在游标之前**的一页（canonical 旧→新）；`historyToken` 是
+ *  下一页游标对应的 token，客户端原样回传；`reasonCode` 为有界机器码。 */
+export interface MessagesPage {
+  messages: ProjectedMessage[];
+  historyToken: string;
+  revision: number | null;
+  nextBefore: string | null;
+  status: MessagesPageStatus;
+  reasonCode: string | null;
 }
 
 // ==== 端点路径（唯一来源：实现与测试 stub 都引用它）====
 
 export const CODEX_THREAD_PATH = "/m/api/v1/codex/thread";
 export const CODEX_THREAD_EVENTS_PATH = "/m/api/v1/codex/thread/events";
+/** 同代只读历史页（Task 4 端点；长路径，测试/实现判序需在 CODEX_THREAD_PATH 之前）。 */
+export const CODEX_THREAD_MESSAGES_PATH = "/m/api/v1/codex/thread/messages";
 export const CODEX_PENDING_RESPONSE_PATH = "/m/api/v1/codex/pending-response";
 export const CODEX_ACTION_PATH = "/m/api/v1/codex/action";
 export const CODEX_QUEUE_PATH = "/m/api/v1/codex/queue";
@@ -163,6 +223,26 @@ async function toApiError(path: string, r: Response): Promise<ApiError> {
  *  拿不到真值宁可报错也不把 loading/unsupported 冒充成 ready 空会话）。 */
 const CONTENT_STATES = new Set(["loading", "ready", "partial", "unsupported"]);
 
+/** 消息兼容归一化（2026-10-20 Task 3）：`turnId`/`artifacts`/`turnImageCount`/
+ *  `omittedArtifactCount` 是兼容扩展，旧载荷缺省时补 null/[]/0；其他字段原样保留。
+ *  缺省 ≠ 服务端省略：`omittedArtifactCount` 只由后端预算给出，旧载荷不会被伪造成
+ *  「有附件被省略」。 */
+function normalizeProjectedMessage(message: ProjectedMessage): ProjectedMessage {
+  return {
+    ...message,
+    turnId: message.turnId ?? null,
+    artifacts: Array.isArray(message.artifacts) ? message.artifacts : [],
+    turnImageCount:
+      typeof message.turnImageCount === "number" && message.turnImageCount >= 0
+        ? message.turnImageCount
+        : 0,
+    omittedArtifactCount:
+      typeof message.omittedArtifactCount === "number" && message.omittedArtifactCount >= 0
+        ? message.omittedArtifactCount
+        : 0,
+  };
+}
+
 function asThreadProjection(v: unknown): ThreadProjection {
   const p = v as ThreadProjection | null;
   if (
@@ -176,7 +256,12 @@ function asThreadProjection(v: unknown): ThreadProjection {
   ) {
     throw new ApiError(200, "codex/thread: malformed projection payload");
   }
-  return p;
+  return {
+    ...p,
+    // 历史代际 token 是兼容扩展：旧载荷缺省补空串（服务端新载荷恒序列化）。
+    historyToken: typeof p.historyToken === "string" ? p.historyToken : "",
+    messages: p.messages.map(normalizeProjectedMessage),
+  };
 }
 
 /** 拉取 Thread 投影（useCodexThread 的轮询/refresh 通道）。
@@ -196,6 +281,83 @@ export async function fetchCodexThread(
   if (r.status === 403) return null; // 设备失效 → 回配对页（全局判废）
   if (!r.ok) throw await toApiError("codex/thread", r);
   return asThreadProjection(await r.json());
+}
+
+// ==== 同代只读历史页（Task 5 客户端；端点见 Task 4）====
+
+const MESSAGES_PAGE_STATUSES = new Set([
+  "ready",
+  "end",
+  "loading",
+  "unavailable",
+  "cursor_invalid",
+]);
+
+/**
+ * 消息页的共享归一化（与投影同一消息归一化 `normalizeProjectedMessage`）。
+ *
+ * 守卫：`status` 必填且必须属于五个状态值、`messages` 必须是数组；其余字段兼容
+ * 缺省（`historyToken` → 空串、`nextBefore`/`reasonCode` → null、`revision` → null）。
+ * `status !== "ready"` 的页按契约恒为空消息——即使载荷带了半页也丢弃，绝不把
+ * 非正常状态伪装成完整空页。
+ */
+function asMessagesPage(v: unknown): MessagesPage {
+  const p = v as MessagesPage | null;
+  if (
+    p === null ||
+    typeof p !== "object" ||
+    typeof p.status !== "string" ||
+    !MESSAGES_PAGE_STATUSES.has(p.status) ||
+    !Array.isArray(p.messages)
+  ) {
+    throw new ApiError(200, "codex/thread/messages: malformed messages page payload");
+  }
+  const ready = p.status === "ready";
+  return {
+    messages: ready ? p.messages.map(normalizeProjectedMessage) : [],
+    historyToken: typeof p.historyToken === "string" ? p.historyToken : "",
+    revision: typeof p.revision === "number" ? p.revision : null,
+    nextBefore: typeof p.nextBefore === "string" && p.nextBefore !== "" ? p.nextBefore : null,
+    status: p.status,
+    reasonCode: typeof p.reasonCode === "string" && p.reasonCode !== "" ? p.reasonCode : null,
+  };
+}
+
+/** `fetchCodexMessagesPage` 参数（Task 4 端点契约）。 */
+export interface CodexMessagesPageQuery {
+  sessionId: string;
+  /** 历史代际 token：首次取当前投影 `historyToken`，后续取上一页 `historyToken`。 */
+  historyToken: string;
+  /** 游标（严格更早）；缺省/空串 = 历史末端锚点。 */
+  beforeId?: string | null;
+  /** 页大小（1..=50）；缺省由服务端按 50 处理。 */
+  limit?: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * 读取一页更早的 canonical 消息（只读；不触发发送/审批/写入）。
+ *
+ * 400（缺 token / 非法 limit）、404（会话不存在）等非 2xx 抛 `ApiError`；
+ * 网络异常包装为 `ApiError(status=null)`；残缺载荷抛 `ApiError(200, malformed...)`。
+ * 注意：403 不在此函数内吞成 null——由 hook 统一按不可用处理，避免分页层静默
+ * 改变设备失效语义（与 `fetchCodexThread` 的 null 约定分列）。
+ */
+export async function fetchCodexMessagesPage(query: CodexMessagesPageQuery): Promise<MessagesPage> {
+  const params = new URLSearchParams({
+    session_id: query.sessionId,
+    history_token: query.historyToken,
+  });
+  if (query.beforeId) params.set("before_id", query.beforeId);
+  if (query.limit !== undefined) params.set("limit", String(query.limit));
+  let r: Response;
+  try {
+    r = await fetch(`${CODEX_THREAD_MESSAGES_PATH}?${params}`, { signal: query.signal });
+  } catch (e) {
+    throw networkFail("codex/thread/messages", e);
+  }
+  if (!r.ok) throw await toApiError("codex/thread/messages", r);
+  return asMessagesPage(await r.json());
 }
 
 // ==== SSE 订阅 ====

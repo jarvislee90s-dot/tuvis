@@ -216,6 +216,8 @@ export async function fetchSessionMessages(
  *  旧载荷无此键 → undefined（来源筛选按「全部来源」处理，行上不渲染徽标） */
 export interface SessionFileEntry {
   path: string;
+  /** 后端词法身份键；旧载荷缺失时仍按 path 展示与预览。 */
+  fileKey?: string;
   lastSeq: number;
   lastTs: number | null;
   hits: number;
@@ -262,17 +264,26 @@ export type FilePayload =
  *  （loaded, total）；total 取 content-length——axum/hyper 会隐式写入该头，
  *  但隧道（Cloudflare Funnel / Tailscale Funnel）是否原样透传**未经真机确认**
  *  （2026-10-07 登记：无真机隧道环境，唯一外部变量，待做）——拿不到就传 null，
- *  UI 退化为只显示已传字节、不显示假百分比。文本分支走 json()，无进度回调 */
+ *  UI 退化为只显示已传字节、不显示假百分比。文本分支走 json()，无进度回调。
+ *  signal（Task 6 新增第 4 参，兼容旧调用）：预览关闭 / 换文件 / 会话卸载时中止
+ *  在途读取；被动中止按 AbortError 原样抛给调用方（不包装成网络失败，避免把
+ *  「主动取消」显示成「加载失败」）。 */
 export async function fetchFile(
   sessionId: string,
   filePath: string,
-  onProgress?: (loaded: number, total: number | null) => void
+  onProgress?: (loaded: number, total: number | null) => void,
+  signal?: AbortSignal
 ): Promise<FilePayload> {
+  if (signal?.aborted) throw new DOMException("aborted", "AbortError");
   const q = new URLSearchParams({ session_id: sessionId, path: filePath });
   let r: Response;
   try {
-    r = await fetch(`/m/api/v1/file?${q}`);
+    // 无 signal 时保持旧调用形态（单参 fetch；既有契约测试逐参断言）
+    r = signal
+      ? await fetch(`/m/api/v1/file?${q}`, { signal })
+      : await fetch(`/m/api/v1/file?${q}`);
   } catch (e) {
+    if (signal?.aborted) throw e; // 主动中止：交给调用方按取消处理
     throw new ApiError(null, `MOBILE_NETWORK_FAIL:file: file 网络异常: ${String(e)}`);
   }
   if (!r.ok) {
@@ -296,6 +307,7 @@ export async function fetchFile(
     if (r.body && onProgress) {
       const reader = r.body.getReader();
       for (;;) {
+        if (signal?.aborted) throw new DOMException("aborted", "AbortError");
         const { done, value } = await reader.read();
         if (done) break;
         chunks.push(value);

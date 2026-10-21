@@ -536,7 +536,7 @@ pub async fn channel_info(
 
 /// GET /m/api/v1/session-files?agent_type=&session_id=（M3 Task 8）
 /// GET /m/api/v1/session-files?agent_type=&session_id=&limit=（M3 Task 8 / M3+ 富化）
-/// 该会话工具调用涉及的文件表：`{files: [{path, lastSeq, lastTs, hits}], truncated}`
+/// 该会话涉及的文件表：`{files: [{path, fileKey?, lastSeq, lastTs, hits}], truncated}`
 /// （结构化条目 + 出现序排序，泛化提取见 files::extract_file_paths）。移动端
 /// 详情页一份数据两用：正文路径链接化（取 path 集）+ 文件面板列表（全字段）。
 /// - 缺参（agent_type / session_id）或空串 → 400 BAD_REQUEST；
@@ -572,13 +572,28 @@ pub async fn session_files(
     // path_source 不可 clone（Box<dyn Fn>）：整体 move 进阻塞线程池调用（与
     // session_messages handler 的写法一致）
     let st = st.clone();
-    let (files, truncated) =
-        tokio::task::spawn_blocking(move || (st.path_source)(agent.as_str(), sid.as_str(), limit))
-            .await
-            .map_err(|e| {
-                log::error!("文件路径提取任务异常: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+    let (files, truncated) = tokio::task::spawn_blocking(move || {
+        let (mut files, truncated) = (st.path_source)(agent.as_str(), sid.as_str(), limit);
+        // 与 /file 预览端点使用同一份会话快照 cwd，而非消息流里的 pg.cwd。
+        let preview_cwd = (st.session_source)()
+            .sessions
+            .into_iter()
+            .find(|s| s.id == sid)
+            .map(|s| s.project_path);
+        for entry in &mut files {
+            entry.file_key = Some(crate::file_identity::file_identity_key(
+                &entry.path,
+                preview_cwd.as_deref(),
+                cfg!(windows),
+            ));
+        }
+        (files, truncated)
+    })
+    .await
+    .map_err(|e| {
+        log::error!("文件路径提取任务异常: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     Ok((
         // 门禁下的私有数据（会话涉及的文件路径），禁止中间层缓存（sessions 同规）
         [(axum::http::header::CACHE_CONTROL, "no-store")],

@@ -26,6 +26,7 @@ import {
   RotateCw,
   X,
 } from "lucide-react";
+import i18n from "@/i18n";
 import ApproveCard from "./ApproveCard";
 import PlanFeedbackBar from "./PlanFeedbackBar";
 import { collapsedLabel, isProcessKind } from "./message-fold";
@@ -38,10 +39,20 @@ import QuestionCard from "./QuestionCard";
 // Codex Desktop IPC：原生投影接管内容源与交互卡（Codex APP 会话）
 import CodexQueuePanel from "./CodexQueuePanel";
 import PendingRequestCard, { CodexAvailabilityBanner } from "./PendingRequestCard";
+import ProjectedArtifacts, { buildArtifactMessageContexts } from "./ProjectedArtifacts";
+import useArtifactImages from "./useArtifactImages";
 import useCodexThread from "./useCodexThread";
 import useDelayedUnsupported from "./useDelayedUnsupported";
+import useArtifactJump, {
+  ARTIFACT_JUMP_MAX_PAGES,
+  type ArtifactJumpFailure,
+  type ArtifactJumpHit,
+  type ArtifactJumpState,
+} from "./useArtifactJump";
+import { buildArtifactFileView, type ArtifactJumpTarget } from "./artifact-links";
+import { boundedCodexHistoryWindow } from "./codex-history";
 import BookmarkBar from "./BookmarkBar";
-import FilePanel from "./FilePanel";
+import FilePanel, { type FilePanelEntry } from "./FilePanel";
 import FilePreview from "./FilePreview";
 import MessageComposer from "./MessageComposer";
 import PreviewModeSwitcher, { type PreviewMode } from "./PreviewModeSwitcher";
@@ -108,6 +119,10 @@ type PreviewState = {
   open: { kind: "none" } | { kind: "file"; path: string } | { kind: "subagent"; id: string };
   mode: PreviewMode;
   backToList: boolean;
+  /** 显式打开计数（Task 6）：每次用户显式打开文件 +1，作为 FilePreview 的刷新键
+   *  ——同一路径内容已变、预览仍开着时再点一次也会重读当前文件。宽窄屏/布局切换
+   *  不是新的打开，不递增。 */
+  openSeq: number;
 };
 
 /** 面板默认追溯档位（首屏数据源，与详情页默认 limit 同标尺） */
@@ -142,6 +157,67 @@ function isNearBottom(el: HTMLDivElement): boolean {
 
 /** 「跳到最新」按钮显隐阈值：距底超过该值才出现——贴底阅读时它是纯噪声 */
 export const JUMP_SHOW_THRESHOLD_PX = 240;
+
+/** Task 7：命中高亮时长（毫秒）——命中消息与节点短暂高亮约两秒后清理。 */
+export const ARTIFACT_JUMP_HIGHLIGHT_MS = 2000;
+/** Task 7：命中后等待目标 DOM 可用的上限（更早页合并后列表重渲染的短窗口）。 */
+export const ARTIFACT_JUMP_DOM_WAIT_MS = 1000;
+
+/** 命中节点在消息内的 DOM 定位：附件按 artifactId、正文按 data-file-path，
+ *  同消息多处命中取**最后一个**节点（与纯函数 findLastFileReference 的语义一致）。 */
+function jumpHitNode(messageEl: HTMLElement, hit: ArtifactJumpHit): HTMLElement | null {
+  let attribute: "data-artifact-id" | "data-file-path";
+  let value: string;
+  if (hit.via === "artifact" && hit.artifactId !== null) {
+    attribute = "data-artifact-id";
+    value = hit.artifactId;
+  } else if (hit.path !== null) {
+    attribute = "data-file-path";
+    value = hit.path;
+  } else {
+    return null;
+  }
+  let found: HTMLElement | null = null;
+  for (const el of messageEl.querySelectorAll<HTMLElement>(`[${attribute}]`)) {
+    if (el.getAttribute(attribute) === value) found = el;
+  }
+  return found;
+}
+
+/** 定位状态文案（搜索/命中/范围内未命中/到头/失败各自成文；失败不伪装未命中）。 */
+function artifactJumpText(state: ArtifactJumpState): string {
+  switch (state.phase) {
+    case "searching":
+      return i18n.t("mobile.artifacts.locate.searching", {
+        pages: state.pages,
+        max: ARTIFACT_JUMP_MAX_PAGES,
+      });
+    case "hit":
+      return i18n.t("mobile.artifacts.locate.hit", { page: state.hit?.page ?? state.pages });
+    case "miss":
+      return i18n.t("mobile.artifacts.locate.miss");
+    case "end":
+      return i18n.t("mobile.artifacts.locate.end");
+    case "failed":
+      return artifactJumpFailureText(state.failure);
+    default:
+      return "";
+  }
+}
+
+function artifactJumpFailureText(failure: ArtifactJumpFailure | null): string {
+  switch (failure?.kind) {
+    case "history_incomplete":
+      return i18n.t("mobile.artifacts.locate.failure.historyIncomplete");
+    case "cursor_invalid":
+      return i18n.t("mobile.artifacts.locate.failure.cursorInvalid");
+    case "generation_invalid":
+      return i18n.t("mobile.artifacts.locate.failure.generationInvalid");
+    case "load_failed":
+    default:
+      return i18n.t("mobile.artifacts.locate.failure.loadFailed");
+  }
+}
 
 /** 消息滚动区（两个布局分支共用，2026-09-20 抽取）：滚动容器 + 右下角
  *  「跳到最新」浮动按钮。对话一长，手翻到最新要很久（用户实测）；
@@ -268,6 +344,15 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // - state=null（无 IPC / 拉取中）：旧路径照旧，零回归。
   // stale：保留最后视图但禁写。
   const codex = useCodexThread(session.id, session.agentType === "codex");
+  /** 附件图片资源控制器（Task 6）：整页共用一份，保证同会话消费者共享请求与
+   *  object URL、全局最多两个在途；换会话时 hook 内部销毁旧 store。 */
+  const artifactImages = useArtifactImages(session.id);
+  /** 每条消息的附件上下文（同回合提示词 / 每回合 12 图预算）：以 canonical 合并顺序
+   *  的 loadedMessages 为准，翻页合并后仍只按真实回合取提示词，不借上一回合。 */
+  const artifactContexts = useMemo(
+    () => buildArtifactMessageContexts(codex.loadedMessages),
+    [codex.loadedMessages]
+  );
   /** 队列刷新独立信号（2026-10-20 复审 P2）：不依赖 Desktop 必须产生新帧——
    *  投影 revision 变化与发送回执各推进一次；旧会话的回调随组件卸载丢弃。 */
   const [queueTick, setQueueTick] = useState(0);
@@ -324,6 +409,36 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // 追溯档位（M3+ 用户裁决 3）：面板三档 200/500/1000，切档重拉
   const [fileScope, setFileScope] = useState<number>(FILE_DEFAULT_SCOPE);
   const [fileLoading, setFileLoading] = useState(false);
+  // ===== Task 7：文件池合并与五页反向定位 =====
+  // 引用范围 = 当前显示窗口（尾窗 + 已滚出的保留缓冲）+ Task 5 预算内更早页：
+  // `boundedCodexHistoryWindow` 在这里只做边界收敛的便利——保留缓冲必须并入，
+  // 否则接缝消息在列表里看得见、却不参与来源排序；第六页及更早即使被注入缓存
+  // 也不参与。
+  const fileReferenceRange = useMemo(
+    () =>
+      boundedCodexHistoryWindow(
+        codex.state?.messages ?? [],
+        codex.historyPages,
+        codex.state?.historyToken ?? "",
+        codex.retained
+      ),
+    [codex.state, codex.historyPages, codex.retained]
+  );
+  /** 文件面板视图：后端条目 + 缺失结构化引用；来源优先级/已修改标志保持后端口径，
+   *  排序按本次范围内的最近引用倒序（其余条目保持后端相对顺序）。 */
+  const fileView = useMemo(
+    () => buildArtifactFileView(fileEntries, fileReferenceRange),
+    [fileEntries, fileReferenceRange]
+  );
+  /** 五页定位状态机（纯逻辑在 useArtifactJump；本组件只接线、切布局与高亮）。 */
+  const artifactJump = useArtifactJump({
+    sessionId: session.id,
+    state: codex.state,
+    historyPages: codex.historyPages,
+    retained: codex.retained,
+    loadEarlier: codex.loadEarlier,
+    fileEntries,
+  });
   // 字号档位（默认 100%）
   const [fontScale, setFontScale] = useState<number>(1);
   // 书签表（M3+）：初值从模块级 store 读——SessionDetail 卸载重挂后仍恢复
@@ -331,6 +446,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // 跳转失败提示（书签指向更早范围，当前窗口内找不到）
   const [bookmarkJumpMiss, setBookmarkJumpMiss] = useState(false);
   const [preview, setPreview] = useState<PreviewState | null>(null);
+  /** Task 7：定位动作在窄屏关闭的全屏预览快照——失败/结束后可原样返回；
+   *  宽屏分屏下预览仍在，快照为 null（不需要返回入口）。 */
+  const [jumpReturnPreview, setJumpReturnPreview] = useState<PreviewState | null>(null);
+  /** Task 7：命中高亮的计时器与已标记 DOM 节点（清理时逐个摘属性）。 */
+  const jumpHighlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const jumpHighlightNodesRef = useRef<HTMLElement[]>([]);
   // 文件栏占比（可拖分隔条，需求 2026-09-16）：两形态各自保留用户拖出的比例，
   // 初值 0.5（对半分，与旧版 h-1/2 / w-1/2 观感一致）
   const [fileRatioV, setFileRatioV] = useState(0.5);
@@ -556,12 +677,14 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // 正文进入 → files sheet 选中该文件，backToList=false（无返回列表按钮，既有行为不变）
   const openFile = useCallback(
     (path: string) => {
-      setPreview({
+      setPreview((p) => ({
         sheet: "files",
         open: { kind: "file", path },
         mode: isWideViewport() ? "split-h" : "fullscreen",
         backToList: false,
-      });
+        // 每次显式打开都推进刷新键（同一路径再点一次也重读当前内容）
+        openSeq: (p?.openSeq ?? 0) + 1,
+      }));
     },
     [isWideViewport]
   );
@@ -574,6 +697,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       open: { kind: "file", path },
       mode: p?.mode ?? "fullscreen",
       backToList: true,
+      openSeq: (p?.openSeq ?? 0) + 1,
     }));
   }, []);
 
@@ -584,12 +708,13 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // 忽略 mode 恒单栏）
   const openSubagent = useCallback(
     (id: string) => {
-      setPreview({
+      setPreview((p) => ({
         sheet: "subagents",
         open: { kind: "subagent", id },
         mode: isWideViewport() ? "split-h" : "fullscreen",
         backToList: true,
-      });
+        openSeq: p?.openSeq ?? 0,
+      }));
     },
     [isWideViewport]
   );
@@ -601,6 +726,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       open: { kind: "subagent", id },
       mode: p?.mode ?? "fullscreen",
       backToList: true,
+      openSeq: p?.openSeq ?? 0,
     }));
   }, []);
 
@@ -628,11 +754,28 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             open: { kind: "none" },
             mode: isWideViewport() ? "split-h" : "fullscreen",
             backToList: false,
+            openSeq: p?.openSeq ?? 0,
           }
     );
   }, [isWideViewport]);
 
   const closePreview = useCallback(() => setPreview(null), []);
+
+  /** 文件池入口（Task 6：fileChange chip 超限汇总行）：已开着文件面板则保持，
+   *  否则切到文件面板（沿用当前布局口径；文件选中态收回一级看板）。 */
+  const showFilePanel = useCallback(() => {
+    setPreview((p) =>
+      p !== null && p.sheet === "files" && p.open.kind === "none"
+        ? p
+        : {
+            sheet: "files",
+            open: { kind: "none" },
+            mode: isWideViewport() ? "split-h" : "fullscreen",
+            backToList: false,
+            openSeq: p?.openSeq ?? 0,
+          }
+    );
+  }, [isWideViewport]);
 
   // 从二级内容（文件预览 / 子 agent 详情）返回所在 sheet 的看板态（保持当前布局 mode）
   const backToBoard = useCallback(() => {
@@ -644,9 +787,141 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     setPreview((p) => (p ? { ...p, mode } : p));
   }, []);
 
+  // ===== Task 7：定位动作接线（窄屏先切回消息区）与命中高亮 =====
+
+  /** 摘除命中高亮属性并清掉两秒计时器（结束/换会话/新动作/卸载共用）。 */
+  const clearJumpHighlight = useCallback(() => {
+    if (jumpHighlightTimerRef.current !== null) {
+      clearTimeout(jumpHighlightTimerRef.current);
+      jumpHighlightTimerRef.current = null;
+    }
+    for (const el of jumpHighlightNodesRef.current) {
+      el.removeAttribute("data-jump-hit");
+      el.removeAttribute("data-jump-node");
+    }
+    jumpHighlightNodesRef.current = [];
+  }, []);
+
+  /** 发起一次定位（新点击 = 新动作）：窄屏（全屏浮层）先切回消息区并保留返回快照，
+   *  宽屏分屏下预览保持原位。查找本身由 useArtifactJump 执行（当前页 + 最多四页）。 */
+  const startArtifactJump = useCallback(
+    (target: ArtifactJumpTarget) => {
+      const current = preview;
+      if (current?.mode === "fullscreen") {
+        setJumpReturnPreview(current);
+        setPreview(null);
+      } else {
+        setJumpReturnPreview(null);
+      }
+      clearJumpHighlight();
+      void artifactJump.jump(target);
+    },
+    [preview, artifactJump, clearJumpHighlight]
+  );
+
+  /** 文件池来源按钮：按条目身份（fileKey 优先，未知来源退化 path）发起查找。 */
+  const locateFromPanel = useCallback(
+    (entry: FilePanelEntry) => {
+      startArtifactJump({ fileKey: entry.fileKey ?? null, path: entry.path });
+    },
+    [startArtifactJump]
+  );
+
+  /** 预览页头定位：用当前打开路径解析身份；找不到条目时 fileKey 为 null（不预造
+   *  messageId，也不猜别名），仍走同一有界查找。 */
+  const locateFileInMessages = useCallback(
+    (path: string) => {
+      const matched = fileView.find((entry) => entry.path === path);
+      // 从附件卡直达预览时，打开的可能是附件的展示原文（与后端展示路径不同形态）：
+      // 只用**同一 path** 的结构化附件身份键补足，不猜别名。
+      const fromArtifact =
+        fileReferenceRange
+          .flatMap((message) => message.artifacts ?? [])
+          .find((artifact) => artifact.path === path)?.fileKey ?? null;
+      startArtifactJump({ fileKey: matched?.fileKey ?? fromArtifact, path });
+    },
+    [fileView, fileReferenceRange, startArtifactJump]
+  );
+
+  /** 返回定位前被关闭的全屏预览（失败/结束后仍能回到原文件预览）。 */
+  const returnToJumpPreview = useCallback(() => {
+    if (jumpReturnPreview === null) return;
+    setPreview(jumpReturnPreview);
+    setJumpReturnPreview(null);
+  }, [jumpReturnPreview]);
+
+  /** 关闭定位提示（结束本次动作；高亮与返回快照一并清理）。 */
+  const dismissJumpBanner = useCallback(() => {
+    clearJumpHighlight();
+    setJumpReturnPreview(null);
+    artifactJump.reset();
+  }, [artifactJump, clearJumpHighlight]);
+
+  // 命中：先等目标 DOM（更早页合并是异步渲染），再滚动 + 高亮约两秒。
+  // 新动作（phase 离开 hit）与卸载都会清掉上一次高亮，不留下悬挂计时器。
+  useEffect(() => {
+    const { phase, hit } = artifactJump.state;
+    if (phase !== "hit" || hit === null) {
+      clearJumpHighlight();
+      return;
+    }
+    let cancelled = false;
+    let raf: number | null = null;
+    const deadline = Date.now() + ARTIFACT_JUMP_DOM_WAIT_MS;
+    const attempt = () => {
+      if (cancelled) return;
+      const area = messageAreaRef.current;
+      let messageEl: HTMLElement | null = null;
+      if (area !== null) {
+        for (const el of area.querySelectorAll<HTMLElement>("[data-message-id]")) {
+          if (el.getAttribute("data-message-id") === hit.messageId) {
+            messageEl = el;
+            break;
+          }
+        }
+      }
+      if (messageEl !== null) {
+        const node = jumpHitNode(messageEl, hit);
+        messageEl.setAttribute("data-jump-hit", "true");
+        const marked = [messageEl];
+        if (node !== null && node !== messageEl) {
+          node.setAttribute("data-jump-node", "true");
+          marked.push(node);
+        }
+        jumpHighlightNodesRef.current = marked;
+        const scrollTarget = node ?? messageEl;
+        if (typeof scrollTarget.scrollIntoView === "function") {
+          scrollTarget.scrollIntoView({ block: "center" });
+        }
+        jumpHighlightTimerRef.current = setTimeout(() => {
+          jumpHighlightTimerRef.current = null;
+          clearJumpHighlight();
+        }, ARTIFACT_JUMP_HIGHLIGHT_MS);
+        return;
+      }
+      if (Date.now() >= deadline) return; // 目标未出现：不滚错位置（结果条仍如实显示）
+      raf = requestAnimationFrame(attempt);
+    };
+    attempt();
+    return () => {
+      cancelled = true;
+      if (raf !== null) cancelAnimationFrame(raf);
+    };
+  }, [artifactJump.state, clearJumpHighlight]);
+
+  // 卸载清理高亮计时器；换会话清理高亮与返回快照
+  useEffect(() => () => clearJumpHighlight(), [clearJumpHighlight]);
+  useEffect(() => {
+    clearJumpHighlight();
+    setJumpReturnPreview(null);
+  }, [session.id, clearJumpHighlight]);
+
   // 消息渲染器（观察台 T6 起迁至 ./message-render 共用）：renderBody 消费本页
   // 既有 openFile（正文路径点击 → 预览）与 files（链接化路径集）
-  const { renderBody } = useMessageRenderers({ openFile, files });
+  const { renderBody, renderMarkdown, renderLinkifiedText } = useMessageRenderers({
+    openFile,
+    files,
+  });
 
   const retry = useCallback(() => {
     setError(null);
@@ -904,6 +1179,63 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     />
   );
 
+  // ===== Task 7：定位状态条 =====
+  // 搜索中/命中/范围内未命中/真正到头/失败各自文案；失败提供「重试」（新动作），
+  // 被窄屏关闭的预览提供「返回文件预览」；**未命中不提供任何“继续加载”入口**。
+  const jumpBanner =
+    artifactJump.state.phase === "idle" ? null : (
+      <div
+        data-testid="artifact-jump-banner"
+        data-phase={artifactJump.state.phase}
+        data-failure-kind={artifactJump.state.failure?.kind ?? undefined}
+        className={`mb-2 flex shrink-0 items-start gap-2 rounded-lg px-3 py-2 text-xs ${
+          artifactJump.state.phase === "failed"
+            ? "bg-rose-500/10 text-rose-700 dark:text-rose-400"
+            : "bg-[var(--btnp)]/10 text-[var(--tx)]"
+        }`}
+      >
+        <div className="min-w-0 flex-1">
+          <p data-testid="artifact-jump-text">{artifactJumpText(artifactJump.state)}</p>
+          {artifactJump.state.phase === "miss" && (
+            <p data-testid="artifact-jump-hint" className="mt-0.5 text-[10px] opacity-80">
+              {i18n.t("mobile.artifacts.locate.missHint")}
+            </p>
+          )}
+        </div>
+        {artifactJump.state.phase === "failed" && (
+          <button
+            type="button"
+            data-testid="artifact-jump-retry"
+            onClick={() => void artifactJump.retry()}
+            className="shrink-0 rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--tx)]"
+          >
+            {i18n.t("mobile.artifacts.locate.retry")}
+          </button>
+        )}
+        {jumpReturnPreview !== null && artifactJump.state.phase !== "searching" && (
+          <button
+            type="button"
+            data-testid="artifact-jump-return-preview"
+            onClick={returnToJumpPreview}
+            className="shrink-0 rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--tx)]"
+          >
+            {jumpReturnPreview.open.kind === "file"
+              ? i18n.t("mobile.artifacts.locate.returnPreview")
+              : i18n.t("mobile.artifacts.locate.returnPanel")}
+          </button>
+        )}
+        <button
+          type="button"
+          data-testid="artifact-jump-dismiss"
+          aria-label={i18n.t("mobile.artifacts.locate.dismiss")}
+          onClick={dismissJumpBanner}
+          className="shrink-0 rounded-full p-0.5 text-[var(--mut)] hover:bg-[var(--cb)] dark:hover:bg-[var(--btnp)]"
+        >
+          <X size={12} />
+        </button>
+      </div>
+    );
+
   // ===== 卡片停靠区（2026-10-04 用户裁决「问答弹窗出现在页面下半部」）=====
   // 审批/问答/模式三卡从「消息区上方」移到「消息区下方、composer 之上」——
   // InteractiveCard 的设计注释本就写明「交互只发生在底部交互卡，消息流只读」，
@@ -1021,33 +1353,67 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                     : "读取异常（内容状态不受支持）"}
               </p>
             )}
-          {codexState.messages.length === 0 ? (
+          {codex.loadedMessages.length === 0 ? (
             codexState.contentState === "ready" ? (
               <p className="py-16 text-center text-sm text-[var(--mut)]">暂无消息</p>
             ) : null
           ) : (
+            // 消息正文走既有 renderMarkdown / renderLinkifiedText：文件池已知路径
+            // 继续可点（不新增 basename 推断）；附件卡片复用同一个 openFile。
+            // 列表以 loadedMessages 为准（Task 5：尾窗 + 已合并更早页，最新在最后），
+            // 翻页合并后自然出现，不在这里另造无界「加载更多」循环（Task 7 拥有
+            // 有界查找，且 Task 5 没有终点信号）。
+            // 注意（Task 6 复审 I1）：split/split-h 与 fullscreen 是不同 React 子树，
+            // 切换布局会卸载并重建本消息列——图片资源随之释放并在重建后重新读取，
+            // FilePreview 也会重挂载再读一次。这是既有布局结构的行为，本任务按
+            // 「沿用现状」保留；消除需布局级提升资源，已登记为后续项。
             <ul className="space-y-2 pb-4">
-              {codexState.messages.map((m) => (
-                <li
-                  key={m.id}
-                  data-testid={`codex-msg-${m.id}`}
-                  data-role={m.role}
-                  data-kind={m.kind}
-                  className={
-                    m.role === "user" ? "flex flex-col items-end" : "flex flex-col items-start"
-                  }
-                >
-                  <div
-                    className={
-                      m.role === "user"
-                        ? "max-w-[85%] rounded-2xl bg-[var(--btnp)]/15 px-3 py-2 text-sm whitespace-pre-wrap text-[var(--tx)]"
-                        : "max-w-[85%] rounded-2xl bg-[var(--cb)]/60 px-3 py-2 text-sm whitespace-pre-wrap text-[var(--tx)]"
-                    }
+              {codex.loadedMessages.map((m) => {
+                const ctx = artifactContexts.get(m.id);
+                const hasArtifacts = (m.artifacts?.length ?? 0) > 0;
+                // 服务端预算可能把附件全部省略：此时仍需渲染消息级提示（组件内判空）
+                const hasOmittedArtifacts = (m.omittedArtifactCount ?? 0) > 0;
+                const isUser = m.role === "user";
+                return (
+                  <li
+                    key={m.id}
+                    data-testid={`codex-msg-${m.id}`}
+                    data-message-id={m.id}
+                    data-role={m.role}
+                    data-kind={m.kind}
+                    className={`${
+                      isUser ? "flex flex-col items-end" : "flex flex-col items-start"
+                    } data-[jump-hit=true]:rounded-xl data-[jump-hit=true]:bg-amber-500/10 data-[jump-hit=true]:ring-2 data-[jump-hit=true]:ring-amber-500/70`}
                   >
-                    {m.text}
-                  </div>
-                </li>
-              ))}
+                    {m.text !== "" && (
+                      <div
+                        className={
+                          isUser
+                            ? "max-w-[85%] rounded-2xl bg-[var(--btnp)]/15 px-3 py-2 text-sm text-[var(--tx)]"
+                            : "max-w-[85%] rounded-2xl bg-[var(--cb)]/60 px-3 py-2 text-sm text-[var(--tx)]"
+                        }
+                      >
+                        {m.role === "user" || m.role === "assistant" ? (
+                          <div className="md-body">{renderMarkdown(m.text)}</div>
+                        ) : (
+                          <div className="whitespace-pre-wrap">{renderLinkifiedText(m.text)}</div>
+                        )}
+                      </div>
+                    )}
+                    {(hasArtifacts || hasOmittedArtifacts) && ctx !== undefined && (
+                      <div className="mt-1 w-full">
+                        <ProjectedArtifacts
+                          message={m}
+                          context={ctx}
+                          openFile={openFile}
+                          images={artifactImages}
+                          onOpenFilePanel={showFilePanel}
+                        />
+                      </div>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           )}
         </div>
@@ -1209,6 +1575,8 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   // 当前选中的子 agent（subagents sheet 二级详情在显；null = 看板态/文件选中）。
   // 先解出裸 id：闭包（.find 回调）里 TS 不保留 preview.open 的属性路径收窄
   const subagentDetailId = preview?.open.kind === "subagent" ? preview.open.id : null;
+  // Task 7：当前打开文件路径（闭包里 TS 不保留 preview.open 的属性路径收窄）
+  const openFilePath = preview?.open.kind === "file" ? preview.open.path : null;
 
   // 顶栏 sheet bar（审查 S5 唯一实例裁决）：sheet 两钮 + 布局切换器 + 关闭。
   // 原 FilePanel / FilePreview / SubagentDetail 内部的切换器/关闭钮全部不再渲染。
@@ -1274,12 +1642,13 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const sheetBoard = preview ? (
     preview.sheet === "files" ? (
       <FilePanel
-        entries={fileEntries}
+        entries={fileView}
         truncated={fileTruncated}
         scope={fileScope}
         loading={fileLoading}
         onScopeChange={setFileScope}
         onOpenFile={openFileFromList}
+        onLocate={codexProjectionActive ? locateFromPanel : undefined}
         fontScale={fontScale}
       />
     ) : subagentsShown ? (
@@ -1308,7 +1677,13 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         filePath={preview.open.path}
         mode={preview.mode}
         fontScale={fontScale}
+        refreshKey={preview.openSeq}
         onBack={preview.backToList ? backToBoard : undefined}
+        onLocate={
+          codexProjectionActive && openFilePath !== null
+            ? () => locateFileInMessages(openFilePath)
+            : undefined
+        }
       />
     ) : subagentDetailId !== null ? (
       <SubagentDetail
@@ -1431,6 +1806,8 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             style={preview.mode === "split" ? { minHeight: SPLIT_CONVERSATION_MIN_PX } : undefined}
           >
             {bookmarkBar}
+            {/* Task 7 定位状态条（搜索/命中/未命中/失败；失败可重试、可返回原预览） */}
+            {jumpBanner}
             {/* 审批/问答/模式三卡 2026-10-04 起停靠在消息区下方（cardDock）——
                 原「消息区上方」挂载位置连同挂载门语义注释一并迁移至 cardDock 定义处 */}
             <MessageScrollArea
@@ -1500,6 +1877,8 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       ) : (
         <div className="flex min-h-0 flex-1 flex-col">
           {bookmarkBar}
+          {/* Task 7 定位状态条（与分屏分支同构） */}
+          {jumpBanner}
           {/* 审批/问答/模式三卡 2026-10-04 起停靠在消息区下方（cardDock，与分屏
               分支同构）——原「紧贴 messageArea 上方」的挂载注释（M8 Task 12 红卡
               刷新机制 / M9R P3 钥匙防线 / 丁T1-T2 挂载门）一并迁移至 cardDock 定义处 */}

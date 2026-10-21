@@ -508,6 +508,7 @@ async fn new_routes_require_device_cookie() {
     let app = f.app.clone();
     for uri in [
         "/m/api/v1/codex/thread?session_id=x",
+        "/m/api/v1/codex/thread/messages?session_id=x",
         "/m/api/v1/codex/action?action_id=a",
         "/m/api/v1/codex/queue?session_id=x",
     ] {
@@ -563,6 +564,19 @@ async fn revoked_device_gets_403_on_new_routes() {
         .await
         .unwrap();
     assert_eq!(r.status(), 403, "吊销设备必须 403");
+    // 任务 4 的分页路由同属门禁内层（吊销后同样 403）
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread/messages?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "吊销设备访问分页必须 403");
 }
 
 // ============================================================
@@ -4787,4 +4801,531 @@ async fn same_thread_retrigger_queues_behind_in_flight_compat() {
     .expect("第一条兜底落账");
     wait_handoff(&f, "act-ser-2", Duration::from_secs(5)).await;
     f.state.codex_control.stop();
+}
+
+// ============================================================
+// 17. 任务 4：同代只读消息分页（GET /codex/thread/messages）
+// ============================================================
+
+/// 单回合 N 条 agentMessage 的 canonical 状态（任务 4 合成分页夹具）。
+fn paged_state(ids: &[&str]) -> serde_json::Value {
+    let items: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|id| {
+            serde_json::json!({ "type": "agentMessage", "id": id, "text": format!("text-{id}") })
+        })
+        .collect();
+    serde_json::json!({
+        "turns": [], "requests": [],
+        "threadRuntimeStatus": { "type": "idle" },
+        "turnHistory": { "kind": "canonical", "history": {
+            "isComplete": true,
+            "entitiesByKey": {
+                "turn:t1": { "turnId": "t1", "status": "completed", "items": items }
+            },
+            "islands": [{ "entries": [{ "key": "turn:t1", "value": "turn:t1" }] }]
+        }}
+    })
+}
+
+/// 分页夹具 + 一个仍在活动的最新 Turn：让 t1 成为「已结算」区域（token v2 的
+/// contentEpoch 只在已结算 Turn 的渲染内容变化时推进；最新 Turn 视为仍在流式产出）。
+fn paged_state_with_active_tail(ids: &[&str]) -> serde_json::Value {
+    let mut state = paged_state(ids);
+    let history = state
+        .get_mut("turnHistory")
+        .and_then(|turn_history| turn_history.get_mut("history"))
+        .expect("history");
+    history["entitiesByKey"]["turn:tail"] = serde_json::json!({
+        "turnId": "tail",
+        "status": "inProgress",
+        "items": [{ "type": "agentMessage", "id": "tail-stream", "text": "streaming" }]
+    });
+    history["islands"][0]["entries"]
+        .as_array_mut()
+        .expect("island entries")
+        .push(serde_json::json!({ "key": "turn:tail", "value": "turn:tail" }));
+    state
+}
+
+fn incomplete_paged_state(ids: &[&str]) -> serde_json::Value {
+    let mut state = paged_state(ids);
+    state["turnHistory"]["history"]["isComplete"] = serde_json::json!(false);
+    state
+}
+
+/// `thread-stream-state-changed` 广播帧（任务 4 分页夹具）。
+fn paged_state_frame(thread: &str, change: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": { "conversationId": thread, "hostId": "local", "change": change }
+    })
+}
+
+fn paged_snapshot_frame(
+    thread: &str,
+    revision: u64,
+    state: serde_json::Value,
+) -> serde_json::Value {
+    paged_state_frame(
+        thread,
+        serde_json::json!({ "type": "snapshot", "revision": revision, "conversationState": state }),
+    )
+}
+
+/// 驱动一次 ensure 的协议（with_init=false 用于复用连接后的第二个 thread）。
+async fn drive_ensure_state(
+    peer: &mut ScriptedPeer,
+    thread: &str,
+    revision: u64,
+    state: serde_json::Value,
+    with_init: bool,
+) {
+    if with_init {
+        handshake(peer, "owner-1").await;
+    }
+    let disc = peer.recv().await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    assert_eq!(disc["params"]["conversationId"], thread);
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let follow = peer.recv().await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    assert_eq!(follow["params"]["conversationId"], thread);
+    peer.send(&paged_snapshot_frame(thread, revision, state))
+        .await;
+}
+
+/// 限时收帧（防测试悬挂）。
+async fn recv_frame(peer: &mut ScriptedPeer, secs: u64) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(secs), peer.recv())
+        .await
+        .expect("帧超时")
+}
+
+fn messages_uri(session: &str, query: &str) -> String {
+    format!("/m/api/v1/codex/thread/messages?session_id={session}{query}")
+}
+
+/// 带设备 cookie 的 GET，返回 (状态码, JSON)。
+async fn http_json(app: &axum::Router, uri: &str) -> (axum::http::StatusCode, serde_json::Value) {
+    let r = app
+        .clone()
+        .oneshot(req("GET", uri, Some(COOKIE), None))
+        .await
+        .unwrap();
+    let status = r.status();
+    let body = body_string(r).await;
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or_else(|_| panic!("非 JSON 响应: {body}")),
+    )
+}
+
+/// GET /codex/thread 并驱动假 Desktop 的 ensure（有界只读路径）。
+async fn get_thread_state(
+    f: &Fixture,
+    peer: &mut ScriptedPeer,
+    session: &str,
+    revision: u64,
+    state: serde_json::Value,
+    with_init: bool,
+) -> serde_json::Value {
+    let app = f.app.clone();
+    let uri = format!("/m/api/v1/codex/thread?session_id={session}");
+    let task = tokio::spawn(async move {
+        app.oneshot(req("GET", &uri, Some(COOKIE), None))
+            .await
+            .unwrap()
+    });
+    drive_ensure_state(peer, session, revision, state, with_init).await;
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("thread state in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    serde_json::from_str(&body_string(r).await).unwrap()
+}
+
+/// 投影尾窗 → 更早两页 → end；不含游标、不重复不跳过、只读、no-store。
+#[tokio::test]
+async fn thread_messages_pages_older_history_over_http() {
+    let ids: Vec<String> = (0..600).map(|i| format!("m{i:03}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let projection = get_thread_state(&f, &mut peer, THREAD, 1, paged_state(&refs), true).await;
+    let window: Vec<&str> = projection["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(window.len(), 500, "尾窗最多 500 条");
+    assert_eq!(window[0], "m100");
+    let token = projection["historyToken"]
+        .as_str()
+        .expect("投影必须带兼容的 historyToken")
+        .to_string();
+    assert!(!token.is_empty());
+
+    // 第一页：游标 = 尾窗最早条 → m050..m099（响应必须 no-store）
+    let uri = messages_uri(
+        THREAD,
+        &format!("&before_id=m100&history_token={token}&limit=50"),
+    );
+    let r = f
+        .app
+        .clone()
+        .oneshot(req("GET", &uri, Some(COOKIE), None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "分页响应必须 no-store"
+    );
+    let page: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    let first: Vec<&str> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(page["status"], "ready");
+    assert_eq!(page["revision"], 1);
+    assert!(page["reasonCode"].is_null());
+    assert_eq!(first.len(), 50);
+    assert_eq!(first[0], "m050");
+    assert_eq!(first[49], "m099");
+    assert!(!first.contains(&"m100"), "页不含游标自身");
+    assert_eq!(page["nextBefore"], "m050");
+    let token2 = page["historyToken"].as_str().unwrap().to_string();
+    assert_ne!(token2, token, "下一页 token 绑定新的游标前缀");
+
+    // 第二页：m000..m049
+    let uri = messages_uri(THREAD, &format!("&before_id=m050&history_token={token2}"));
+    let (status, page) = http_json(&f.app, &uri).await;
+    assert_eq!(status, 200);
+    let second: Vec<&str> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(page["status"], "ready");
+    assert_eq!(second.len(), 50);
+    assert_eq!(second[0], "m000");
+    assert_eq!(second[49], "m049");
+    assert_eq!(page["nextBefore"], "m000");
+    let token3 = page["historyToken"].as_str().unwrap().to_string();
+
+    // 第三页：真正到头 → end（空页 + null nextBefore）
+    let uri = messages_uri(THREAD, &format!("&before_id=m000&history_token={token3}"));
+    let (status, page) = http_json(&f.app, &uri).await;
+    assert_eq!(status, 200);
+    assert_eq!(page["status"], "end");
+    assert_eq!(page["messages"], serde_json::json!([]));
+    assert!(page["nextBefore"].is_null());
+    assert!(page["reasonCode"].is_null(), "真正到头是正常状态");
+
+    // 只读：整轮分页没有触发任何 IPC 帧（不发送、不审批、不重拉）。
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "分页不得触发发送/审批等写动作"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 参数校验：缺 session_id / history_token、limit 越界与非数字 → 400；
+/// limit 边界 1/50 合法；无 cookie → 403（门禁结构性覆盖）。
+#[tokio::test]
+async fn thread_messages_rejects_bad_parameters_and_missing_auth() {
+    let f = fixture_disabled(vec![codex_app_session(THREAD)]);
+    for uri in [
+        "/m/api/v1/codex/thread/messages".to_string(),
+        format!("/m/api/v1/codex/thread/messages?session_id={THREAD}"),
+        "/m/api/v1/codex/thread/messages?history_token=v1-x".to_string(),
+        messages_uri(THREAD, "&before_id=m1&history_token=v1-x&limit=0"),
+        messages_uri(THREAD, "&before_id=m1&history_token=v1-x&limit=51"),
+        messages_uri(THREAD, "&before_id=m1&history_token=v1-x&limit=abc"),
+        messages_uri(THREAD, "&before_id=m1&history_token=v1-x&limit=1.5"),
+        messages_uri(THREAD, "&before_id=m1&history_token=v1-x&limit="),
+        messages_uri(THREAD, "&before_id=m1&history_token=&limit=5"),
+    ] {
+        let r = f
+            .app
+            .clone()
+            .oneshot(req("GET", &uri, Some(COOKIE), None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "参数非法必须 400：{uri}");
+    }
+    let uri = messages_uri(THREAD, "&before_id=m1&history_token=v1-x");
+    let r = f
+        .app
+        .clone()
+        .oneshot(req("GET", &uri, None, None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "无设备 cookie 必须 403");
+    // 合法 limit 边界：hub 关闭（没有 Desktop）→ 200 unavailable，而不是 400。
+    for limit in [1, 50] {
+        let uri = messages_uri(
+            THREAD,
+            &format!("&before_id=m1&history_token=v1-x&limit={limit}"),
+        );
+        let (status, page) = http_json(&f.app, &uri).await;
+        assert_eq!(status, 200, "limit={limit} 合法");
+        assert_eq!(page["status"], "unavailable");
+        assert_eq!(page["reasonCode"], "mirror_unavailable");
+    }
+}
+
+/// 一个会话不能读取别的线程：S1 的游标/ token 打到 S2 必须 cursor_invalid，
+/// 且响应不携带 S1 正文。
+#[tokio::test]
+async fn thread_messages_cannot_read_another_thread() {
+    const S1: &str = "aaaa1111-1111-4111-8111-111111111111";
+    const S2: &str = "bbbb2222-2222-4222-8222-222222222222";
+    let mut f = fixture_ipc(vec![codex_app_session(S1), codex_app_session(S2)]);
+    let mut peer = f.peer.take().unwrap();
+    let p1 = get_thread_state(&f, &mut peer, S1, 1, paged_state(&["s1-a", "s1-b"]), true).await;
+    let p2 = get_thread_state(
+        &f,
+        &mut peer,
+        S2,
+        1,
+        paged_state(&["s2-a", "s2-b", "s2-c"]),
+        false,
+    )
+    .await;
+    assert_eq!(p1["messages"][0]["id"], "s1-a");
+    assert_eq!(p2["messages"][0]["id"], "s2-a");
+    let token1 = p1["historyToken"].as_str().unwrap().to_string();
+
+    // S2 + S1 的游标：S2 自己的历史里没有该游标 → cursor_not_found
+    let uri = messages_uri(S2, &format!("&before_id=s1-a&history_token={token1}"));
+    let (status, page) = http_json(&f.app, &uri).await;
+    assert_eq!(status, 200);
+    assert_eq!(page["status"], "cursor_invalid");
+    assert_eq!(page["reasonCode"], "cursor_not_found");
+    assert_eq!(page["messages"], serde_json::json!([]));
+    assert!(
+        !serde_json::to_string(&page).unwrap().contains("s1-"),
+        "不得回传另一个线程的消息"
+    );
+
+    // S2 自己的游标 + S1 的 token：token 绑定别的线程/前缀 → 拒绝
+    let uri = messages_uri(S2, &format!("&before_id=s2-a&history_token={token1}"));
+    let (_, page) = http_json(&f.app, &uri).await;
+    assert_eq!(page["status"], "cursor_invalid");
+    assert_eq!(page["reasonCode"], "history_rewritten");
+
+    // S2 游标 + S2 token → 真正到头
+    let token2 = p2["historyToken"].as_str().unwrap().to_string();
+    let uri = messages_uri(S2, &format!("&before_id=s2-a&history_token={token2}"));
+    let (_, page) = http_json(&f.app, &uri).await;
+    assert_eq!(page["status"], "end");
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 未跟随的 thread：分页端点复用 GET /codex/thread 的有界只读 ensure/hydrate；
+/// 历史不完整 → loading（不得当作 end），且只发只读 load-complete-history。
+#[tokio::test]
+async fn thread_messages_reuses_read_only_hydrate_for_partial_history() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let uri = messages_uri(THREAD, "&before_id=m1&history_token=v1-x");
+    let task = tokio::spawn(async move {
+        app.oneshot(req("GET", &uri, Some(COOKIE), None))
+            .await
+            .unwrap()
+    });
+    drive_ensure_state(
+        &mut peer,
+        THREAD,
+        1,
+        incomplete_paged_state(&["m0", "m1"]),
+        true,
+    )
+    .await;
+    // 历史不完整 → 既有只读 hydrate（mutating=false 路径），不是写动作。
+    let load = recv_frame(&mut peer, 10).await;
+    assert_eq!(load["type"], "request");
+    assert_eq!(load["method"], "thread-follower-load-complete-history");
+    assert_eq!(load["params"]["conversationId"], THREAD);
+    assert_eq!(load["params"]["hostId"], "local");
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": load["requestId"],
+        "resultType": "success", "method": "thread-follower-load-complete-history",
+        "result": {}
+    }))
+    .await;
+
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("page in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let page: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(page["status"], "loading", "历史不完整不是 end");
+    assert_eq!(page["reasonCode"], "history_incomplete");
+    assert_eq!(page["messages"], serde_json::json!([]));
+    assert!(page["nextBefore"].is_null());
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "分页 + hydrate 全程不得产生写动作帧"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 历史改写（已分页区域换身份）后，旧游标 + 旧 token 不能继续返回旧页；
+/// 新投影 token 可恢复，且改后的身份出现在页里。
+#[tokio::test]
+async fn thread_messages_history_rewrite_invalidates_old_page() {
+    let ids: Vec<String> = (0..600).map(|i| format!("m{i:03}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let projection = get_thread_state(
+        &f,
+        &mut peer,
+        THREAD,
+        1,
+        paged_state_with_active_tail(&refs),
+        true,
+    )
+    .await;
+    let token = projection["historyToken"].as_str().unwrap().to_string();
+    let uri = messages_uri(
+        THREAD,
+        &format!("&before_id=m100&history_token={token}&limit=50"),
+    );
+    let (_, page) = http_json(&f.app, &uri).await;
+    assert_eq!(page["status"], "ready");
+
+    // 改写已返回页里的 m075（换身份，结构仍合法）→ revision 2
+    peer.send(&paged_state_frame(
+        THREAD,
+        serde_json::json!({
+            "type": "patches", "baseRevision": 1, "revision": 2, "patches": [
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "items", 75, "id"],
+                  "value": "m075-rewritten" }
+            ]
+        }),
+    ))
+    .await;
+    let key = f.thread_key();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while f
+        .state
+        .codex_control
+        .adapter
+        .projection(&key)
+        .await
+        .revision
+        != Some(2)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "历史改写 patch 未应用到镜像"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 旧 (游标, token) 对已改写的前缀 → cursor_invalid/history_rewritten
+    let uri = messages_uri(
+        THREAD,
+        &format!("&before_id=m100&history_token={token}&limit=50"),
+    );
+    let (status, page) = http_json(&f.app, &uri).await;
+    assert_eq!(status, 200);
+    assert_eq!(page["status"], "cursor_invalid");
+    assert_eq!(page["reasonCode"], "history_rewritten");
+    assert_eq!(page["messages"], serde_json::json!([]));
+
+    // 重新取投影 → 新 token 可用，页里出现改写后的身份
+    let refreshed = f.state.codex_control.adapter.projection(&key).await;
+    let fresh_token = refreshed.history_token.clone();
+    let uri = messages_uri(
+        THREAD,
+        &format!("&before_id=m100&history_token={fresh_token}&limit=50"),
+    );
+    let (_, page) = http_json(&f.app, &uri).await;
+    assert_eq!(page["status"], "ready");
+    let rewritten = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"] == "m075-rewritten");
+    assert!(rewritten, "新页必须反映当前 canonical 历史");
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 空历史 → end（缺 before_id = 历史末端锚点）；非空历史缺 before_id 必须明确
+/// cursor_invalid/cursor_required（不猜最新页，也不猜到头），旧代 token 不伪装成 end。
+#[tokio::test]
+async fn thread_messages_empty_history_ends_and_missing_cursor_is_explicit() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let empty = get_thread_state(&f, &mut peer, THREAD, 1, paged_state(&[]), true).await;
+    assert_eq!(empty["messages"], serde_json::json!([]));
+    assert_eq!(empty["contentState"], "ready");
+    let token = empty["historyToken"].as_str().unwrap().to_string();
+    let uri = messages_uri(THREAD, &format!("&history_token={token}"));
+    let (status, page) = http_json(&f.app, &uri).await;
+    assert_eq!(status, 200);
+    assert_eq!(page["status"], "end", "空历史是真正到头");
+    assert_eq!(page["messages"], serde_json::json!([]));
+    assert!(page["nextBefore"].is_null());
+
+    // 补一条消息（新 snapshot → 新镜像重建代）：先确认镜像推进到 revision 2
+    peer.send(&paged_snapshot_frame(THREAD, 2, paged_state(&["only"])))
+        .await;
+    let key = f.thread_key();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while f
+        .state
+        .codex_control
+        .adapter
+        .projection(&key)
+        .await
+        .revision
+        != Some(2)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "补消息 snapshot 未应用到镜像"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 非空历史 + 缺 before_id：不得猜成最新页或 end
+    let projection = f.state.codex_control.adapter.projection(&key).await;
+    let uri = messages_uri(
+        THREAD,
+        &format!("&history_token={}", projection.history_token),
+    );
+    let (status, page) = http_json(&f.app, &uri).await;
+    assert_eq!(status, 200);
+    assert_eq!(page["status"], "cursor_invalid");
+    assert_eq!(page["reasonCode"], "cursor_required");
+    assert_eq!(page["messages"], serde_json::json!([]));
+
+    // 上一代的 token（镜像重建前）也不得回退成 end
+    let uri = messages_uri(THREAD, &format!("&before_id=only&history_token={token}"));
+    let (_, page) = http_json(&f.app, &uri).await;
+    assert_eq!(page["status"], "unavailable");
+    assert_eq!(page["reasonCode"], "generation_mismatch");
+    f.state.codex_control.adapter.shutdown().await;
 }
