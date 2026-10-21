@@ -29,6 +29,11 @@ _Only versions translated so far are listed here; the full history lives in the
   same preview path (`60beea0c` / PR #171).
 - **Codex file pool now extracts `event_msg.local_images`** so user-uploaded or
   referenced local images can appear in the file panel (#69).
+- **Codex APP message and artifact links**: recognized file references in message
+  bodies open the preview; uploaded/referenced images, generated images, and files
+  changed or viewed enter the file panel with accurate source labels. A file entry can
+  jump to its latest message reference within the current tail and at most four earlier
+  pages. Preview always reads current file contents and does not retain file history.
 
 ### Changed
 
