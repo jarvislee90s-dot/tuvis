@@ -11,9 +11,11 @@ mod support;
 use multi_agents_manager_lib::database::migration;
 use multi_agents_manager_lib::services::usage::model::UsageSourceId;
 use multi_agents_manager_lib::services::usage::v2::model::{
-    ModelDisplayNameRequest, PricingIdentityRequest, PricingReference,
+    ModelDisplayNameRequest, PriceCurrency, PriceOverrideRequest, PricingIdentityRequest,
+    PricingReference, TimePriceRule, TimePriceTimezone, TimePriceWindow,
 };
 use multi_agents_manager_lib::services::usage::v2::model_config;
+use multi_agents_manager_lib::services::usage::v2::pricing;
 use rusqlite::Connection;
 
 fn provider_request(model: &str, display: Option<&str>) -> ModelDisplayNameRequest {
@@ -355,6 +357,7 @@ fn migrate_backfills_override_currency_column_defaulting_to_usd() {
             cache_read: None,
             cache_write: None,
             output: None,
+            time_rule: None,
         },
         1_000,
     )
@@ -380,6 +383,163 @@ fn migrate_backfills_override_currency_column_defaulting_to_usd() {
         dirty.is_err(),
         "迁移后的表必须沿用 CHECK 拒绝非 USD/CNY 币种"
     );
+}
+
+/// 2026-10-21 分时价格迁移：老库的 `usage_price_override` 没有 time_* 列 ⇒
+/// 幂等 ALTER 补列，存量行一律固定价（time_enabled=0、时区默认 asiaShanghai、
+/// 窗口与低谷价为空），四价/币种/时间戳原样保留；迁移后的表可继续写分时规则。
+#[test]
+fn migrate_adds_time_price_columns_idempotently() {
+    let mut conn = support::open_ledger_db("model_config_override_time");
+    conn.execute_batch(
+        "DROP TABLE usage_price_override;
+         CREATE TABLE usage_price_override (
+             normalized_model_id TEXT PRIMARY KEY,
+             currency            TEXT NOT NULL DEFAULT 'USD' CHECK(currency IN ('USD','CNY')),
+             input_scaled        INTEGER,
+             cache_read_scaled   INTEGER,
+             cache_write_scaled  INTEGER,
+             output_scaled       INTEGER,
+             updated_at          INTEGER NOT NULL,
+             CHECK (
+                 input_scaled IS NOT NULL OR cache_read_scaled IS NOT NULL
+                 OR cache_write_scaled IS NOT NULL OR output_scaled IS NOT NULL
+             )
+         );
+         INSERT INTO usage_price_override
+             (normalized_model_id, currency, input_scaled, output_scaled, updated_at)
+         VALUES ('legacy-fixed', 'CNY', 1500000000, 7000000000, 42);",
+    )
+    .unwrap();
+
+    migration::migrate(&conn).unwrap();
+    migration::migrate(&conn).unwrap(); // 连续两次：ALTER 必须幂等
+
+    let columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(usage_price_override)")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    for column in [
+        "time_enabled",
+        "time_timezone",
+        "time_windows",
+        "offpeak_input_scaled",
+        "offpeak_cache_read_scaled",
+        "offpeak_cache_write_scaled",
+        "offpeak_output_scaled",
+    ] {
+        assert!(
+            columns.iter().any(|existing| existing == column),
+            "迁移后必须存在列 {column}"
+        );
+    }
+
+    let legacy: (String, i64, i64, i64, String, Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT currency, input_scaled, output_scaled, updated_at,
+                    time_timezone, time_windows, offpeak_input_scaled
+             FROM usage_price_override WHERE normalized_model_id = 'legacy-fixed'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        legacy,
+        (
+            "CNY".to_string(),
+            1_500_000_000,
+            7_000_000_000,
+            42,
+            "asiaShanghai".to_string(),
+            None,
+            None,
+        ),
+        "存量行必须保留原值并落成固定价"
+    );
+    let legacy_enabled: i64 = conn
+        .query_row(
+            "SELECT time_enabled FROM usage_price_override WHERE normalized_model_id = 'legacy-fixed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_enabled, 0, "旧规则一律固定价（不得被读成高峰规则）");
+
+    // 迁移后的老表可继续写分时规则；固定价存量行不受影响。
+    let views = pricing::set_override_with_conn(
+        &mut conn,
+        &PriceOverrideRequest {
+            normalized_model_id: "deepseek-chat".to_string(),
+            currency: PriceCurrency::Usd,
+            input: Some("5".to_string()),
+            cache_read: None,
+            cache_write: None,
+            output: Some("20".to_string()),
+            time_rule: Some(TimePriceRule {
+                timezone: TimePriceTimezone::Utc,
+                windows: vec![
+                    TimePriceWindow {
+                        start: "09:00".to_string(),
+                        end: "12:00".to_string(),
+                    },
+                    TimePriceWindow {
+                        start: "22:00".to_string(),
+                        end: "02:00".to_string(),
+                    },
+                ],
+                offpeak_input: Some("2".to_string()),
+                offpeak_cache_read: None,
+                offpeak_cache_write: None,
+                offpeak_output: Some("8".to_string()),
+            }),
+        },
+        1_000,
+    )
+    .unwrap();
+    let timed = views
+        .iter()
+        .find(|view| view.normalized_model_id == "deepseek-chat")
+        .expect("分时覆盖价必须回读");
+    let rule = timed.time_rule.as_ref().expect("timeRule 必须保留");
+    assert_eq!(rule.timezone, TimePriceTimezone::Utc);
+    assert_eq!(rule.windows.len(), 2);
+    assert_eq!(rule.offpeak_input.as_deref(), Some("2"));
+    assert_eq!(rule.offpeak_output.as_deref(), Some("8"));
+
+    let (enabled, timezone, windows): (i64, String, String) = conn
+        .query_row(
+            "SELECT time_enabled, time_timezone, time_windows
+             FROM usage_price_override WHERE normalized_model_id = 'deepseek-chat'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(enabled, 1);
+    assert_eq!(timezone, "utc");
+    assert!(windows.contains("\"22:00\"") && windows.contains("\"02:00\""));
+    let legacy_still_fixed: i64 = conn
+        .query_row(
+            "SELECT time_enabled FROM usage_price_override WHERE normalized_model_id = 'legacy-fixed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_still_fixed, 0);
 }
 
 /// 2026-10-20 两张新表（usage_pricing_native / usage_pricing_fx）：schema::init 建齐、

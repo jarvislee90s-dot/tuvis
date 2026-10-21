@@ -626,6 +626,7 @@ async function assertV2AliasAndOverrideCommands(invoke: Invoke) {
     "sourceModel",
     "releaseDate",
     "snapshotDate",
+    "timeRule",
   ]);
   for (const view of overrides) {
     expect(actualKeys(view)).toEqual(overrideKeys);

@@ -157,9 +157,11 @@ describe("usage-worksummary 组件（工作小结区）", () => {
     // 「分层后的**单值**」（D17 默认裁定）：行内只有一个数字，不做父子两行/可展开层
     expect(sessions.textContent?.match(/\d+/g)).toEqual(["42"]);
 
-    expect(screen.getByTestId("work-subagent-layer")).toHaveTextContent(
-      tf("usage.work.subagentLayer")
-    );
+    const layer = screen.getByTestId("work-subagent-layer");
+    expect(layer).toHaveTextContent(tf("usage.work.subagentLayer"));
+    // 2026-10-21 新文案：口径说清「本卡不统计 Token」，不再暗示含子代理的 token 合计
+    expect(layer).toHaveTextContent("本卡不统计 Token");
+    expect(layer.textContent).not.toContain("token 合计含子代理");
 
     view.unmount();
   });

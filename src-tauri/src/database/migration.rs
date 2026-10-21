@@ -276,6 +276,47 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         .map_err(|e| format!("MIGRATE_OVERRIDE_CURRENCY_FAIL: 迁移覆盖价币种失败: {}", e))?;
     }
 
+    // 分时价格（2026-10-21）：存量规则一律固定价（time_enabled=0），分时列补空。
+    for (column, ddl) in [
+        (
+            "time_enabled",
+            "ALTER TABLE usage_price_override ADD COLUMN time_enabled INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "time_timezone",
+            "ALTER TABLE usage_price_override ADD COLUMN time_timezone TEXT NOT NULL DEFAULT 'asiaShanghai'",
+        ),
+        (
+            "time_windows",
+            "ALTER TABLE usage_price_override ADD COLUMN time_windows TEXT",
+        ),
+        (
+            "offpeak_input_scaled",
+            "ALTER TABLE usage_price_override ADD COLUMN offpeak_input_scaled INTEGER",
+        ),
+        (
+            "offpeak_cache_read_scaled",
+            "ALTER TABLE usage_price_override ADD COLUMN offpeak_cache_read_scaled INTEGER",
+        ),
+        (
+            "offpeak_cache_write_scaled",
+            "ALTER TABLE usage_price_override ADD COLUMN offpeak_cache_write_scaled INTEGER",
+        ),
+        (
+            "offpeak_output_scaled",
+            "ALTER TABLE usage_price_override ADD COLUMN offpeak_output_scaled INTEGER",
+        ),
+    ] {
+        if !column_exists(conn, "usage_price_override", column) {
+            conn.execute(ddl, []).map_err(|e| {
+                format!(
+                    "MIGRATE_OVERRIDE_TIME_FAIL: 迁移 usage_price_override.{column} 失败: {}",
+                    e
+                )
+            })?;
+        }
+    }
+
     Ok(())
 }
 

@@ -3,7 +3,7 @@
 // 覆盖（9 条）：① 设置页接线可渲染（菜单项 → 分区 → 8 项全在场，且**不含** ① 的「采集状态 / 立即采集」
 // 验收面）；② 开关改动即发 patch，并用**后端返回的合并对象**回写本地态；③ 数字输入过滤非数字；
 // ④ 条数夹取上下界（99→7、0→1）；⑤ 范围 / 姿态是原生 select（3 档 / `poseKeysFor(11)` 的 11 项含
-// `look`）；⑥ 保留期提示随值更新且夹取 1–3650；⑦ 规则校验与后端 `merge_patch` 同判据（合法 JSON
+// `look`）；⑥ 保留期提示随值更新且夹取 1–90；⑦ 规则校验与后端 `merge_patch` 同判据（合法 JSON
 // 但形态不符同样提示）且**只提示不阻断**（patch 照发）；⑧ 评语占位符提示 + 保存失败原因可见
 // （`usage-set-error`，不静默）；⑨ 换宠物 → 姿态非 `random` 时回退 `random` 并提示（已是则幂等）。
 //
@@ -268,25 +268,28 @@ describe("设置页「用量统计」分组（计划② Task 14）", () => {
     expect(screen.queryByTestId("usage-export-pose")).toBeNull();
   });
 
-  it("6. 保留期提示：明示「N 天前无明细」，随值更新且夹取 1–3650", async () => {
+  it("6. 保留期提示：明示「N 天前无明细」，随值更新且夹取 1–90", async () => {
     renderSection();
     const hint = await screen.findByTestId("usage-detail-retention-hint");
     expect(hint.textContent).toContain("90");
     expect(hint.textContent ?? "").toMatch(/not kept/i);
+    // 区间文案随本轮上限调整（1–90）
+    expect(hint.textContent).toContain("1–90");
 
-    fireEvent.change(input("usage-detail-retention-days"), { target: { value: "3650" } });
-    await waitFor(() => expect(hint.textContent).toContain("3650"));
-    expect(hint.textContent ?? "").not.toContain("90");
+    fireEvent.change(input("usage-detail-retention-days"), { target: { value: "30" } });
+    await waitFor(() => expect(hint.textContent).toContain("30"));
+    // 区间说明恒在（1–90），但「N 天前」的 N 已不再是 90
+    expect(hint.textContent ?? "").not.toContain("older than 90");
 
-    // 上界夹取（3650 上限之外的输入不会被发出去）
+    // 上界夹取（90 上限之外的输入不会被发出去）
     fireEvent.change(input("usage-detail-retention-days"), { target: { value: "99999" } });
-    expect(input("usage-detail-retention-days").value).toBe("3650");
+    expect(input("usage-detail-retention-days").value).toBe("90");
     await waitFor(() => expect(setPatches()).toHaveLength(2));
-    expect(setPatches()[1]).toEqual({ detailRetentionDays: 3650 });
-    // 发出去的每个值都在后端白名单域内（1–3650；越界那边是整包拒绝）
+    expect(setPatches()[1]).toEqual({ detailRetentionDays: 90 });
+    // 发出去的每个值都在后端白名单域内（1–90；越界那边是整包拒绝）
     for (const patch of setPatches()) {
       expect(patch.detailRetentionDays).toBeGreaterThanOrEqual(1);
-      expect(patch.detailRetentionDays).toBeLessThanOrEqual(3650);
+      expect(patch.detailRetentionDays).toBeLessThanOrEqual(90);
     }
   });
 

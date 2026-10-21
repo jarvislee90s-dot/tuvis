@@ -24,8 +24,10 @@ use crate::database::connection::DB;
 use crate::database::dao::usage_billing as dao;
 use crate::services::usage::v2::model::{
     PriceOverrideRequest, PriceOverrideView, PricingAutoMatch, PricingCatalogEntry,
-    PricingCatalogSearch, PricingQuotePreview, PricingReference, PricingStatus,
+    PricingCatalogSearch, PricingQuotePreview, PricingReference, PricingStatus, TimePriceRule,
+    TimePriceTimezone,
 };
+use crate::services::usage::v2::time_price;
 use crate::services::usage::UsageError;
 
 const RATE_KEYS: [&str; 4] = ["input", "cache_read", "cache_write", "output"];
@@ -45,16 +47,15 @@ const REFRESH_LOOP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const CATALOG_SEARCH_DEFAULT_LIMIT: usize = 50;
 pub const CATALOG_SEARCH_MAX_LIMIT: usize = 200;
 
-/// 精选**直营官方** provider（2026-10-20 用户裁决：直营官方优先于聚合/托管来源）。
-/// 含中国站官方变体（`-cn`）；订阅计划（如 `zhipuai-coding-plan`）保留，零价表示套餐内，
-/// 由去重链与按量价竞争。
-pub const CURATED_OFFICIAL_PROVIDERS: [&str; 14] = [
+/// 精选**直营官方** provider（2026-10-21 用户裁决：自动匹配只看「官方 > OpenRouter」）。
+/// 含中国站官方变体（`-cn`）；`zhipuai-coding-plan` 因单价全 0（套餐内）已移出，
+/// 避免把套餐价当按量参考价。
+pub const CURATED_OFFICIAL_PROVIDERS: [&str; 13] = [
     "openai",
     "anthropic",
     "google",
     "deepseek",
     "zhipuai",
-    "zhipuai-coding-plan",
     "moonshotai",
     "moonshotai-cn",
     "alibaba",
@@ -64,18 +65,13 @@ pub const CURATED_OFFICIAL_PROVIDERS: [&str; 14] = [
     "mistral",
     "meta",
 ];
-/// 托管/聚合来源（Ollama Cloud）：直营官方没有候选时才落到这里，仍优先于 OpenRouter。
-pub const CURATED_HOSTED_PROVIDERS: [&str; 1] = ["ollama-cloud"];
-/// 精选兜底来源（直营官方/托管都没有候选时自动匹配才落到这里）。
+/// 精选兜底来源：直营官方没有非零候选时落到 OpenRouter。
 pub const CURATED_OPENROUTER_PROVIDER: &str = "openrouter";
 
-/// 精选分类：直营官方 → `"official"`，Ollama Cloud → `"hosted"`，
-/// OpenRouter → `"openrouter"`，其余 → `None`。
+/// 精选分类：直营官方 → `"official"`，OpenRouter → `"openrouter"`，其余 → `None`。
 pub fn curated_kind_of(provider_id: &str) -> Option<&'static str> {
     if CURATED_OFFICIAL_PROVIDERS.contains(&provider_id) {
         Some("official")
-    } else if CURATED_HOSTED_PROVIDERS.contains(&provider_id) {
-        Some("hosted")
     } else if provider_id == CURATED_OPENROUTER_PROVIDER {
         Some("openrouter")
     } else {
@@ -1053,6 +1049,11 @@ fn normalized_candidate(quote: &PriceQuote) -> NormalizedQuote {
     }
 }
 
+/// 至少一个分量是非零价（`Some(0)` 不算有效价格）。自动匹配用它跳过全零套餐价。
+fn has_nonzero_rate(rates: &[Option<i128>; 4]) -> bool {
+    rates.iter().flatten().any(|rate| *rate != 0)
+}
+
 /// 同一归一化 ID 的去重优先级（计划 §4.2）：
 /// release_date 降序 → 有至少一项费率优先 → 非 conditional 优先 → provider/model 字典序升序。
 fn candidate_is_better(candidate: &NormalizedQuote, current: &NormalizedQuote) -> bool {
@@ -1451,8 +1452,10 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<PriceCatalog, UsageError> {
     // 精选索引（2026-10-20 用户裁决）：直营官方 / Ollama Cloud / OpenRouter **各自**先按
     // 同一条去重链收敛，再按「直营官方 > 托管 > OpenRouter」合成——非精选来源
     // （哪怕 release_date 最新）不参与。这样智谱行不会再取到 Ollama Cloud 的价。
+    // 精选索引（2026-10-21 用户裁决）：直营官方 / OpenRouter **各自**先按同一条
+    // 去重链收敛，再按「直营官方 > OpenRouter」合成；非精选来源不参与。
+    // 四价全 0（或全空）的候选视为「无有效价格」直接跳过，继续同层/下一层找非零价。
     let mut curated_official: BTreeMap<String, NormalizedQuote> = BTreeMap::new();
-    let mut curated_hosted: BTreeMap<String, NormalizedQuote> = BTreeMap::new();
     let mut curated_openrouter: BTreeMap<String, NormalizedQuote> = BTreeMap::new();
     for quote in quotes.values() {
         if quote.normalized_model_id.is_empty() {
@@ -1471,11 +1474,10 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<PriceCatalog, UsageError> {
         }
         let curated_slot = match curated_kind_of(&quote.reference.provider_id) {
             Some("official") => Some(&mut curated_official),
-            Some("hosted") => Some(&mut curated_hosted),
             Some("openrouter") => Some(&mut curated_openrouter),
             _ => None,
         };
-        if let Some(index) = curated_slot {
+        if let Some(index) = curated_slot.filter(|_| has_nonzero_rate(&candidate.rates)) {
             match index.entry(candidate.normalized_model_id.clone()) {
                 std::collections::btree_map::Entry::Vacant(slot) => {
                     slot.insert(candidate);
@@ -1489,9 +1491,6 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<PriceCatalog, UsageError> {
         }
     }
     let mut normalized_curated = curated_official;
-    for (key, quote) in curated_hosted {
-        normalized_curated.entry(key).or_insert(quote);
-    }
     for (key, quote) in curated_openrouter {
         normalized_curated.entry(key).or_insert(quote);
     }
@@ -1539,6 +1538,32 @@ fn request_rates(request: &PriceOverrideRequest) -> Result<[Option<i128>; 4], Us
     Ok(rates)
 }
 
+fn request_time_rule(
+    request: &PriceOverrideRequest,
+) -> Result<Option<dao::TimePriceRuleRecord>, UsageError> {
+    let Some(rule) = request.time_rule.as_ref() else {
+        return Ok(None);
+    };
+    // 窗口校验独立于计价：整点、非空、起止不同、不重叠；跨午夜合法。
+    time_price::normalize_windows(&rule.windows)?;
+    let offpeak_rates = [
+        parse_override_component("offpeak input", rule.offpeak_input.as_ref())?,
+        parse_override_component("offpeak cacheRead", rule.offpeak_cache_read.as_ref())?,
+        parse_override_component("offpeak cacheWrite", rule.offpeak_cache_write.as_ref())?,
+        parse_override_component("offpeak output", rule.offpeak_output.as_ref())?,
+    ];
+    if offpeak_rates.iter().all(Option::is_none) {
+        return Err(override_invalid(
+            "time price rule must set at least one offpeak rate",
+        ));
+    }
+    Ok(Some(dao::TimePriceRuleRecord {
+        timezone: rule.timezone,
+        windows: rule.windows.clone(),
+        offpeak_rates,
+    }))
+}
+
 fn override_view(
     record: &dao::PriceOverrideRecord,
     catalog: Option<&(String, i64, Arc<PriceCatalog>)>,
@@ -1562,6 +1587,14 @@ fn override_view(
         cache_read: record.rates[1].map(rate_string),
         cache_write: record.rates[2].map(rate_string),
         output: record.rates[3].map(rate_string),
+        time_rule: record.time_rule.as_ref().map(|rule| TimePriceRule {
+            timezone: rule.timezone,
+            windows: rule.windows.clone(),
+            offpeak_input: rule.offpeak_rates[0].map(rate_string),
+            offpeak_cache_read: rule.offpeak_rates[1].map(rate_string),
+            offpeak_cache_write: rule.offpeak_rates[2].map(rate_string),
+            offpeak_output: rule.offpeak_rates[3].map(rate_string),
+        }),
         updated_at: record.updated_at,
         source_provider,
         source_model,
@@ -1570,11 +1603,20 @@ fn override_view(
     }
 }
 
-/// 查询层使用的有效覆盖价：四价 + 计价币种。
+/// 查询层使用的分时规则（窗口已规范化；低谷价格 scaled）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveTimePriceRule {
+    pub timezone: TimePriceTimezone,
+    pub windows: Vec<time_price::NormalizedWindow>,
+    pub offpeak_rates: [Option<i128>; 4],
+}
+
+/// 查询层使用的有效覆盖价：四价 + 计价币种 + 可选分时规则。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveOverride {
     pub rates: [Option<i128>; 4],
     pub currency: crate::services::usage::v2::model::PriceCurrency,
+    pub time_rule: Option<EffectiveTimePriceRule>,
 }
 
 /// 读取全部手动覆盖价的费率表（查询层一次性加载，避免逐行查库）。
@@ -1583,18 +1625,54 @@ pub struct EffectiveOverride {
 pub fn load_effective_overrides_with_conn(
     conn: &Connection,
 ) -> Result<BTreeMap<String, EffectiveOverride>, UsageError> {
-    Ok(dao::load_overrides_conn(conn)?
-        .into_iter()
-        .map(|record| {
-            (
-                record.normalized_model_id,
-                EffectiveOverride {
-                    rates: record.rates,
-                    currency: record.currency,
-                },
+    let mut out = BTreeMap::new();
+    for record in dao::load_overrides_conn(conn)? {
+        let time_rule = match record.time_rule {
+            Some(rule) => match time_price::normalize_windows(&rule.windows) {
+                Ok(windows) => Some(EffectiveTimePriceRule {
+                    timezone: rule.timezone,
+                    windows,
+                    offpeak_rates: rule.offpeak_rates,
+                }),
+                Err(error) => {
+                    // 手工改库等异常不得拖垮整张覆盖表：降级为固定价并留日志。
+                    log::warn!(
+                        "usage v2: price override {} has invalid time windows ({}); falling back to fixed rates",
+                        record.normalized_model_id,
+                        error.detail
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        out.insert(
+            record.normalized_model_id,
+            EffectiveOverride {
+                rates: record.rates,
+                currency: record.currency,
+                time_rule,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// 是否存在分时价格规则（费用查询据此决定是否按小时取数）。
+pub fn has_time_price_rules_with_conn(conn: &Connection) -> Result<bool, UsageError> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM usage_price_override WHERE time_enabled = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            UsageError::new(
+                "usage-db-failed",
+                format!("time price rule read failed: {e}"),
             )
-        })
-        .collect())
+        })?;
+    Ok(count > 0)
 }
 
 /// 读取全部手动覆盖价。无 active 目录时来源字段为 null，但覆盖值仍可用。
@@ -1628,7 +1706,15 @@ pub fn set_override_with_conn(
         ));
     }
     let rates = request_rates(request)?;
-    dao::upsert_override_conn(conn, &normalized_model_id, request.currency, &rates, now_ms)?;
+    let time_rule = request_time_rule(request)?;
+    dao::upsert_override_conn(
+        conn,
+        &normalized_model_id,
+        request.currency,
+        &rates,
+        time_rule.as_ref(),
+        now_ms,
+    )?;
     overrides_with_conn(conn, now_ms)
 }
 
@@ -1716,6 +1802,7 @@ pub fn delete_override(normalized_model_id: &str) -> Result<Vec<PriceOverrideVie
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::usage::v2::model::TimePriceWindow;
     use rusqlite::Connection;
     use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -2529,6 +2616,44 @@ mod tests {
             cache_read: cache_read.map(str::to_string),
             cache_write: cache_write.map(str::to_string),
             output: output.map(str::to_string),
+            time_rule: None,
+        }
+    }
+
+    fn fixed_window(start: &str, end: &str) -> TimePriceWindow {
+        TimePriceWindow {
+            start: start.to_string(),
+            end: end.to_string(),
+        }
+    }
+
+    fn time_rule_request(
+        normalized_model_id: &str,
+        peak_input: Option<&str>,
+        peak_output: Option<&str>,
+        timezone: TimePriceTimezone,
+        windows: &[(&str, &str)],
+        offpeak_input: Option<&str>,
+        offpeak_output: Option<&str>,
+    ) -> PriceOverrideRequest {
+        PriceOverrideRequest {
+            normalized_model_id: normalized_model_id.to_string(),
+            currency: crate::services::usage::v2::model::PriceCurrency::Usd,
+            input: peak_input.map(str::to_string),
+            cache_read: None,
+            cache_write: None,
+            output: peak_output.map(str::to_string),
+            time_rule: Some(TimePriceRule {
+                timezone,
+                windows: windows
+                    .iter()
+                    .map(|(start, end)| fixed_window(start, end))
+                    .collect(),
+                offpeak_input: offpeak_input.map(str::to_string),
+                offpeak_cache_read: None,
+                offpeak_cache_write: None,
+                offpeak_output: offpeak_output.map(str::to_string),
+            }),
         }
     }
 
@@ -2555,6 +2680,12 @@ mod tests {
         assert_eq!(view.source_model, None);
         assert_eq!(view.release_date, None);
         assert_eq!(view.snapshot_date, None);
+        assert_eq!(view.time_rule, None, "固定价视图不得携带分时规则");
+        let wire = serde_json::to_value(view).unwrap();
+        assert!(
+            wire.get("timeRule").is_none(),
+            "固定价的 timeRule 必须省略（不是 null）"
+        );
 
         assert_eq!(overrides_with_conn(&conn, 2_000).unwrap(), views);
 
@@ -2620,6 +2751,179 @@ mod tests {
             );
         }
         assert!(overrides_with_conn(&conn, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_explicit_zero_rate_is_kept() {
+        let mut conn = mem_db();
+        let views = set_override_with_conn(
+            &mut conn,
+            &override_request("zero-model", Some("0"), None, None, None),
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            views[0].input.as_deref(),
+            Some("0"),
+            "手动显式 0 价必须保留（与自动匹配跳过全 0 相反）"
+        );
+        let effective = load_effective_overrides_with_conn(&conn).unwrap();
+        assert_eq!(effective["zero-model"].rates[0], Some(0));
+        assert_eq!(effective["zero-model"].time_rule, None);
+    }
+
+    #[test]
+    fn time_override_roundtrip_preserves_timezone_windows_and_offpeak() {
+        let mut conn = mem_db();
+        let request = time_rule_request(
+            "deepseek-chat",
+            Some("5"),
+            Some("20"),
+            TimePriceTimezone::Utc,
+            &[("09:00", "12:00"), ("22:00", "02:00")],
+            Some("2"),
+            Some("8"),
+        );
+        let views = set_override_with_conn(&mut conn, &request, 1_000).unwrap();
+        let view = &views[0];
+        assert_eq!(view.input.as_deref(), Some("5"));
+        assert_eq!(view.output.as_deref(), Some("20"));
+        let rule = view.time_rule.as_ref().expect("分时价必须回读 timeRule");
+        assert_eq!(rule.timezone, TimePriceTimezone::Utc);
+        assert_eq!(
+            rule.windows,
+            vec![
+                fixed_window("09:00", "12:00"),
+                fixed_window("22:00", "02:00")
+            ],
+            "跨午夜窗口必须原样保留"
+        );
+        assert_eq!(rule.offpeak_input.as_deref(), Some("2"));
+        assert_eq!(rule.offpeak_output.as_deref(), Some("8"));
+        assert_eq!(rule.offpeak_cache_read, None);
+        assert_eq!(rule.offpeak_cache_write, None);
+
+        let wire = serde_json::to_value(view).unwrap();
+        let rule_wire = wire.get("timeRule").expect("分时价 wire 必须带 timeRule");
+        assert_eq!(rule_wire["timezone"], "utc");
+        assert_eq!(rule_wire["windows"][1]["start"], "22:00");
+        assert_eq!(rule_wire["windows"][1]["end"], "02:00");
+        assert_eq!(rule_wire["offpeakInput"], "2");
+
+        // 查询层同样保留完整规则（窗口已规范化）。
+        let effective = load_effective_overrides_with_conn(&conn).unwrap();
+        let loaded = effective["deepseek-chat"]
+            .time_rule
+            .as_ref()
+            .expect("有效覆盖价必须带分时规则");
+        assert_eq!(loaded.timezone, TimePriceTimezone::Utc);
+        assert_eq!(
+            loaded.windows,
+            vec![
+                time_price::NormalizedWindow {
+                    start_min: 9 * 60,
+                    end_min: 12 * 60,
+                },
+                time_price::NormalizedWindow {
+                    start_min: 22 * 60,
+                    end_min: 2 * 60,
+                }
+            ]
+        );
+        assert_eq!(
+            loaded.offpeak_rates,
+            [Some(2_000_000_000), None, None, Some(8_000_000_000)]
+        );
+        assert!(has_time_price_rules_with_conn(&conn).unwrap());
+    }
+
+    #[test]
+    fn time_override_rejects_invalid_windows_and_empty_offpeak() {
+        let mut conn = mem_db();
+
+        let invalid_windows: Vec<Vec<(&str, &str)>> = vec![
+            vec![],
+            vec![("09:30", "12:00")],
+            vec![("09:00", "09:00")],
+            vec![("09:00", "12:00"), ("11:00", "13:00")],
+            vec![("22:00", "02:00"), ("01:00", "03:00")],
+        ];
+        for windows in invalid_windows {
+            let request = time_rule_request(
+                "deepseek-chat",
+                Some("5"),
+                None,
+                TimePriceTimezone::Local,
+                &windows,
+                Some("2"),
+                None,
+            );
+            let error = set_override_with_conn(&mut conn, &request, 1).unwrap_err();
+            assert_eq!(error.code, "usage-settings-invalid");
+            assert!(
+                error.detail.contains("time price window")
+                    || error.detail.contains("at least one window"),
+                "窗口非法必须给出明确错误：{windows:?} -> {}",
+                error.detail
+            );
+        }
+
+        // 窗口合法但低谷四价全空 ⇒ 拒绝（分时规则必须至少给一个低谷价）。
+        let empty_offpeak = time_rule_request(
+            "deepseek-chat",
+            Some("5"),
+            None,
+            TimePriceTimezone::Local,
+            &[("09:00", "12:00")],
+            None,
+            None,
+        );
+        let error = set_override_with_conn(&mut conn, &empty_offpeak, 1).unwrap_err();
+        assert_eq!(error.code, "usage-settings-invalid");
+        assert_eq!(
+            error.detail,
+            "time price rule must set at least one offpeak rate"
+        );
+
+        assert!(overrides_with_conn(&conn, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fixed_override_clears_previously_saved_time_rule() {
+        let mut conn = mem_db();
+        set_override_with_conn(
+            &mut conn,
+            &time_rule_request(
+                "deepseek-chat",
+                Some("5"),
+                None,
+                TimePriceTimezone::AsiaShanghai,
+                &[("09:00", "12:00")],
+                Some("2"),
+                None,
+            ),
+            1_000,
+        )
+        .unwrap();
+        let views = set_override_with_conn(
+            &mut conn,
+            &override_request("deepseek-chat", Some("3"), None, None, None),
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(views[0].time_rule, None, "改回固定价必须清空分时规则");
+        assert!(!has_time_price_rules_with_conn(&conn).unwrap());
+        let (enabled, windows, offpeak): (i64, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT time_enabled, time_windows, offpeak_input_scaled
+                 FROM usage_price_override WHERE normalized_model_id = 'deepseek-chat'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(enabled, 0);
+        assert_eq!(windows, None);
+        assert_eq!(offpeak, None);
     }
 
     #[test]
@@ -2925,14 +3229,13 @@ mod tests {
 
     #[test]
     fn curated_constants_match_the_frozen_official_list() {
-        assert_eq!(CURATED_OFFICIAL_PROVIDERS.len(), 14);
+        assert_eq!(CURATED_OFFICIAL_PROVIDERS.len(), 13);
         for provider in [
             "openai",
             "anthropic",
             "google",
             "deepseek",
             "zhipuai",
-            "zhipuai-coding-plan",
             "moonshotai",
             "moonshotai-cn",
             "alibaba",
@@ -2953,12 +3256,22 @@ mod tests {
                 "{provider} 的精选分类必须是 official"
             );
         }
-        assert_eq!(CURATED_HOSTED_PROVIDERS, ["ollama-cloud"]);
-        assert!(is_curated("ollama-cloud"), "Ollama Cloud 是托管来源");
+        // 2026-10-21 用户裁决：套餐价（单价全 0）与托管来源都不再参与自动匹配。
+        assert!(
+            !CURATED_OFFICIAL_PROVIDERS.contains(&"zhipuai-coding-plan"),
+            "zhipuai-coding-plan 因单价全 0 必须移出官方精选"
+        );
+        assert!(!is_curated("zhipuai-coding-plan"));
+        assert_eq!(
+            curated_kind_of("zhipuai-coding-plan"),
+            None,
+            "套餐来源不得再带 official/hosted 标签"
+        );
+        assert!(!is_curated("ollama-cloud"), "Ollama Cloud 不再参与自动匹配");
         assert_eq!(
             curated_kind_of("ollama-cloud"),
-            Some("hosted"),
-            "ollama-cloud 从官方移入托管档（直营官方优先于它）"
+            None,
+            "托管来源从精选集合整体移除"
         );
         assert!(is_curated("openrouter"), "OpenRouter 是精选兜底来源");
         assert_eq!(curated_kind_of("openrouter"), Some("openrouter"));
@@ -3032,13 +3345,13 @@ mod tests {
         assert_eq!(all_hit.quote.unwrap().reference.provider_id, "aggregator-x");
     }
 
-    // ── 2026-10-20 用户裁决：精选三档优先级（直营官方 > ollama-cloud > OpenRouter）────
+    // ── 2026-10-21 用户裁决：精选两档优先级（直营官方 > OpenRouter），托管来源移出 ────
 
     const CURATED_HOSTED: &str =
         include_str!("../../../../../tests/fixtures/usage-v2/pricing/curated-hosted.json");
 
     #[test]
-    fn curated_index_ranks_official_above_hosted_above_openrouter() {
+    fn curated_index_ranks_official_above_openrouter_and_ignores_hosted() {
         let catalog = parse(CURATED_HOSTED).unwrap();
         assert_eq!(catalog.provider_count, 4);
 
@@ -3050,15 +3363,19 @@ mod tests {
         assert_eq!(curated.rates[0], Some(1_000_000_000));
         assert_eq!(curated.rates[3], Some(8_000_000_000));
 
-        // 仅 hosted（无直营官方）⇒ ollama-cloud 胜 OpenRouter（release_date 更新也不翻盘）。
+        // 仅 hosted（无直营官方）⇒ Ollama Cloud 已不参与精选，落到 OpenRouter。
         let hosted = catalog
             .normalized_curated
             .get("deepseek-v4-1-flash")
             .unwrap();
-        assert_eq!(hosted.reference.provider_id, "ollama-cloud");
+        assert_eq!(
+            hosted.reference.provider_id, "openrouter",
+            "ollama-cloud 不再参与自动匹配，必须落到 OpenRouter"
+        );
         assert_eq!(hosted.reference.model_id, "deepseek-v4.1-flash");
+        assert_eq!(hosted.rates[0], Some(7_000_000_000));
 
-        // 全量索引不受三档影响：仍按去重链选 release_date 最新的 aggregator-x。
+        // 全量索引不受精选两档影响：仍按去重链选 release_date 最新的 aggregator-x。
         let all = catalog.normalized.get("glm-5-3").unwrap();
         assert_eq!(all.reference.provider_id, "aggregator-x");
 
@@ -3074,8 +3391,61 @@ mod tests {
         assert_eq!(hosted_match.kind, ModelMatchKind::Exact);
         assert_eq!(
             hosted_match.quote.unwrap().reference.provider_id,
-            "ollama-cloud",
-            "仅 hosted 的模型落到 ollama-cloud（优先于 OpenRouter）"
+            "openrouter",
+            "仅 hosted 的模型不得命中 ollama-cloud"
+        );
+    }
+
+    #[test]
+    fn auto_match_skips_zero_rate_curated_candidates() {
+        // 官方候选四价全 0（套餐内）⇒ 跳过，同层/下一层继续找非零价。
+        let catalog = parse(
+            r#"{
+                "zhipuai": {"models": {
+                    "glm-sub": {"id": "glm-sub", "cost": {"input": 0, "output": 0},
+                        "modalities": {"input": ["text"], "output": ["text"]}},
+                    "glm-free-only": {"id": "glm-free-only", "cost": {"input": 0, "output": 0},
+                        "modalities": {"input": ["text"], "output": ["text"]}},
+                    "glm-unpriced": {"id": "glm-unpriced",
+                        "modalities": {"input": ["text"], "output": ["text"]}}
+                }},
+                "openrouter": {"models": {
+                    "glm-sub": {"id": "glm-sub", "cost": {"input": 3, "output": 12},
+                        "modalities": {"input": ["text"], "output": ["text"]}},
+                    "glm-free-only": {"id": "glm-free-only", "cost": {"input": 0, "output": 0},
+                        "modalities": {"input": ["text"], "output": ["text"]}}
+                }},
+                "aggregator-x": {"models": {
+                    "glm-free-only": {"id": "glm-free-only", "cost": {"input": 9, "output": 90},
+                        "modalities": {"input": ["text"], "output": ["text"]}}
+                }}
+            }"#,
+        )
+        .unwrap();
+
+        // 官方全 0 ⇒ 落到 OpenRouter 非零候选。
+        let fallback = match_model_scoped(&catalog, "glm-sub", MatchScope::Curated);
+        assert_eq!(fallback.kind, ModelMatchKind::Exact);
+        assert_eq!(fallback.quote.unwrap().reference.provider_id, "openrouter");
+
+        // 官方与 OpenRouter 全 0 ⇒ 精选作用域不命中；全量索引仍能看到非精选来源。
+        let all_zero = match_model_scoped(&catalog, "glm-free-only", MatchScope::Curated);
+        assert_eq!(all_zero.kind, ModelMatchKind::None);
+        assert!(all_zero.quote.is_none());
+        assert_eq!(
+            match_model_scoped(&catalog, "glm-free-only", MatchScope::All)
+                .quote
+                .unwrap()
+                .reference
+                .provider_id,
+            "aggregator-x",
+            "全量索引不受零价跳过规则影响"
+        );
+
+        // 官方缺价（四价 None）同样不算有效候选。
+        assert_eq!(
+            match_model_scoped(&catalog, "glm-unpriced", MatchScope::Curated).kind,
+            ModelMatchKind::None
         );
     }
 

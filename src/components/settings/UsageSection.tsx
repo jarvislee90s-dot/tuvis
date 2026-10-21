@@ -9,7 +9,7 @@
 //  2 `miniBarRange`          原生 `<select>`：当日 / 近 5 小时 / 近 7 天
 //  3 `miniBarToolRows`       `inputMode="numeric"` + 手动过滤数字，夹取 **1–7**（默认 3；上限 7 是
 //                            浮窗可用高度的硬约束，与 D20 的固定 5 行共同保证不越界）
-//  4 `detailRetentionDays`   同上，夹取 **1–3650**；提示明示「N 天前无明细」
+//  4 `detailRetentionDays`   同上，夹取 **1–90**；提示明示「N 天前无明细」
 //  5 `collectIntervalMin`    同上，夹取 **1–1440**
 //  6 `providerMapRules`      **已从界面撤下**（2026-10-07）→ 见文件内注释
 //  7 `exportQuote`           **已搬走**（2026-10-07 B1）→ 看板导出条的 `UsageQuoteEditor`
@@ -72,7 +72,7 @@ function clampDigits(raw: string, min: number, max: number): number | null {
 
 const TOOL_ROWS_RANGE = [1, 7] as const;
 
-const RETENTION_RANGE = [1, 3650] as const;
+const RETENTION_RANGE = [1, 90] as const;
 
 const INTERVAL_RANGE = [1, 1440] as const;
 

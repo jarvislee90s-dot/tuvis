@@ -178,6 +178,25 @@ export type PricingBasis = "baseCurrent" | "insufficient" | "userOverride";
 /** 覆盖价币种：按所选币种存储，显示另一币种时按当日汇率换算。 */
 export type PriceCurrency = "USD" | "CNY";
 
+/** 分时价格时区：固定预设（本地 / 中国标准时间 / UTC）。 */
+export type TimePriceTimezone = "local" | "asiaShanghai" | "utc";
+
+/** 高峰窗口；`start > end` 表示跨午夜，只支持整点（HH:00）。 */
+export interface TimePriceWindow {
+  start: string;
+  end: string;
+}
+
+/** 分时规则：高峰四价沿用 PriceOverrideRequest 的 input/cacheRead/...。 */
+export interface TimePriceRule {
+  timezone: TimePriceTimezone;
+  windows: TimePriceWindow[];
+  offpeakInput: string | null;
+  offpeakCacheRead: string | null;
+  offpeakCacheWrite: string | null;
+  offpeakOutput: string | null;
+}
+
 /** 用户手动覆盖价的请求：四价均可空，`null` = 不覆盖该分量；空字符串非法。 */
 export interface PriceOverrideRequest {
   /** 用户输入的原始/归一化模型 ID，后端再归一化。 */
@@ -187,6 +206,8 @@ export interface PriceOverrideRequest {
   cacheRead: string | null;
   cacheWrite: string | null;
   output: string | null;
+  /** 为空 = 固定价；非空 = 分时价（四价为高峰价）。 */
+  timeRule?: TimePriceRule | null;
 }
 
 /** 用户手动覆盖价的视图：目录来源与快照日期（无目录时为 null）。 */
@@ -196,6 +217,15 @@ export interface PriceOverrideView extends PriceOverrideRequest {
   sourceModel: string | null;
   releaseDate: string | null;
   snapshotDate: number | null;
+}
+
+export type PriceRuleKind = "none" | "fixed" | "time";
+
+/** 分时价格行的 Token 分布；日聚合回退单独计入。 */
+export interface TimePriceBreakdown {
+  peakTokens: number;
+  offpeakTokens: number;
+  dailyFallbackTokens: number;
 }
 
 export interface CostComponent {
@@ -258,6 +288,10 @@ export interface CostRow {
   pricingReleaseDate: string | null;
   /** 该行至少一个计费分量使用了用户覆盖价。 */
   priceOverride: boolean;
+  /** 覆盖规则形态：无 / 固定 / 分时。 */
+  priceRuleKind: PriceRuleKind;
+  /** 分时价格行的 Token 分布；固定价或未匹配时为 null。 */
+  timeBreakdown: TimePriceBreakdown | null;
   /** 行成员一致配置的自定义模型名；无人配置或成员分歧时为 null（前端回退原始模型名）。 */
   displayModelName: string | null;
 }
@@ -288,7 +322,7 @@ export interface PricingCatalogEntry {
   hasRates: boolean;
   /** 存在无法确认的计价条件（未知 cost 键 / 非纯文本模态）。 */
   conditional: boolean;
-  /** 精选来源分类："official" / "hosted" / "openrouter" / null（非精选，仅 scope=all 出现）。 */
+  /** 精选来源分类："official" / "openrouter" / null（非精选，仅 scope=all 出现）。 */
   curatedKind: string | null;
 }
 

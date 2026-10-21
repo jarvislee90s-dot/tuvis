@@ -33,10 +33,11 @@ use multi_agents_manager_lib::services::usage::model::{
 use multi_agents_manager_lib::services::usage::v2::model::{
     AttributionKind, BillingCommit, ChannelKind, ChannelOption, CostComponents, CostRow,
     CostStatus, DistributionGroup, DistributionRow, IdentityKey, ModelDisplayNameRequest,
-    ObservedModelEntry, PriceCurrency, PriceOverrideRequest, PriceOverrideView, PricingAutoMatch,
-    PricingBasis, PricingCatalogEntry, PricingCatalogSearch, PricingIdentityRequest,
-    PricingQuotePreview, PricingReference, ProviderAliasConfig, ProviderAliasKind,
-    ProviderAliasRule, TrendSelection,
+    ObservedModelEntry, PriceCurrency, PriceOverrideRequest, PriceOverrideView, PriceRuleKind,
+    PricingAutoMatch, PricingBasis, PricingCatalogEntry, PricingCatalogSearch,
+    PricingIdentityRequest, PricingQuotePreview, PricingReference, ProviderAliasConfig,
+    ProviderAliasKind, ProviderAliasRule, TimePriceRule, TimePriceTimezone, TimePriceWindow,
+    TrendSelection,
 };
 use multi_agents_manager_lib::services::usage::v2::pricing;
 
@@ -610,7 +611,8 @@ fn set_settings_reports_persist_failure_instead_of_success() {
         .expect("建触发器必须成功（前提：settings 表存在）");
 
     let result = tauri::async_runtime::block_on(ipc::usage_set_settings(UsageSettingsPatch {
-        detail_retention_days: Some(before + 7),
+        // 保留期现上限 90：取一个仍在合法区间内的新值，确保失败来自写库而非参数校验。
+        detail_retention_days: Some(before.saturating_sub(1).max(1)),
         ..Default::default()
     }));
 
@@ -669,8 +671,8 @@ fn every_test_in_this_file_takes_the_serial_lock() {
         checked += 1;
     }
     assert_eq!(
-        checked, 17,
-        "本文件应有 17 条用例（含本自省用例）；新增用例必须同步持有 serial()"
+        checked, 18,
+        "本文件应有 18 条用例（含本自省用例）；新增用例必须同步持有 serial()"
     );
 }
 
@@ -826,6 +828,7 @@ fn v2_price_override_and_channel_row_fields_are_frozen() {
         cache_read: None,
         cache_write: None,
         output: Some("7".to_string()),
+        time_rule: None,
     };
     let v = serde_json::to_value(&request).unwrap();
     assert_eq!(
@@ -836,11 +839,13 @@ fn v2_price_override_and_channel_row_fields_are_frozen() {
             "currency",
             "input",
             "normalizedModelId",
-            "output"
+            "output",
+            "timeRule"
         ],
         "PriceOverrideRequest 的 wire 字段逐字冻结"
     );
     assert_eq!(v["currency"], "USD", "PriceCurrency 序列化为大写 ISO 代码");
+    assert!(v["timeRule"].is_null(), "固定价请求必须显式 null timeRule");
     assert!(v["cacheRead"].is_null(), "未覆盖的分量必须显式 null");
     assert!(v["cacheWrite"].is_null());
     assert_eq!(v["input"], "1.5");
@@ -849,6 +854,7 @@ fn v2_price_override_and_channel_row_fields_are_frozen() {
     let legacy: PriceOverrideRequest =
         serde_json::from_str(r#"{"normalizedModelId":"gpt-4","input":"1"}"#).unwrap();
     assert_eq!(legacy.currency, PriceCurrency::Usd, "缺省币种必须是 USD");
+    assert_eq!(legacy.time_rule, None, "缺省 timeRule 必须是固定价");
     let cny: PriceOverrideRequest =
         serde_json::from_str(r#"{"normalizedModelId":"m","currency":"CNY","input":"1"}"#).unwrap();
     assert_eq!(cny.currency, PriceCurrency::Cny);
@@ -863,6 +869,7 @@ fn v2_price_override_and_channel_row_fields_are_frozen() {
         cache_read: None,
         cache_write: None,
         output: Some("7".to_string()),
+        time_rule: None,
         updated_at: 1_700_000_000_000,
         source_provider: None,
         source_model: None,
@@ -902,6 +909,10 @@ fn v2_price_override_and_channel_row_fields_are_frozen() {
         );
     }
     assert_eq!(v["updatedAt"], 1_700_000_000_000i64);
+    assert!(
+        v.get("timeRule").is_none(),
+        "固定价视图必须省略 timeRule（不是 null）"
+    );
 
     assert_eq!(
         serde_json::to_value(PricingBasis::UserOverride).unwrap(),
@@ -1047,6 +1058,8 @@ fn v2_price_override_and_channel_row_fields_are_frozen() {
         normalized_model_id: Some("m".to_string()),
         pricing_release_date: Some("2026-10".to_string()),
         price_override: true,
+        price_rule_kind: PriceRuleKind::None,
+        time_breakdown: None,
         display_model_name: None,
     };
     let v = serde_json::to_value(&cost).unwrap();
@@ -1072,6 +1085,7 @@ fn v2_price_override_and_channel_row_fields_are_frozen() {
             "normalizedModelId",
             "observedProviders",
             "priceOverride",
+            "priceRuleKind",
             "priceUpdatedAt",
             "pricedTokens",
             "pricedTokensCny",
@@ -1083,6 +1097,7 @@ fn v2_price_override_and_channel_row_fields_are_frozen() {
             "sourceIds",
             "status",
             "statusCny",
+            "timeBreakdown",
             "tokenUsage",
             "unpricedTokens",
             "unpricedTokensCny",
@@ -1648,10 +1663,10 @@ fn v2_model_config_commands_round_trip() {
                  ('2026-10-17','workbuddy','','','measured','',1,0,0,2,3,1,NULL,0);",
         )
         .unwrap();
-        // 精选目录（ollama-cloud 官方 + 搜索夹具）。
+        // 精选目录（deepseek 直营官方 + 非精选聚合来源夹具）。
         pricing::set_enabled_with_conn(&conn, true).expect("启用定价必须成功");
         const CATALOG: &str = r#"{
-            "ollama-cloud": {"models": {
+            "deepseek": {"models": {
                 "deepseek-v4.1-flash": {
                     "release_date": "2025-09-01",
                     "cost": {"input": 1, "output": 2},
@@ -1710,7 +1725,7 @@ fn v2_model_config_commands_round_trip() {
             source_id: None,
             model_id: "deepseek-v4.1-flash".to_string(),
             reference: Some(PricingReference {
-                provider_id: "ollama-cloud".to_string(),
+                provider_id: "deepseek".to_string(),
                 model_id: "deepseek-v4.1-flash".to_string(),
             }),
         }))
@@ -1719,7 +1734,7 @@ fn v2_model_config_commands_round_trip() {
         .iter()
         .find(|entry| entry.provider_raw.as_deref() == Some("openai"))
         .unwrap();
-    assert_eq!(openai.pricing_provider.as_deref(), Some("ollama-cloud"));
+    assert_eq!(openai.pricing_provider.as_deref(), Some("deepseek"));
 
     // 幽灵身份拒绝（经 IPC 错误码透传）。
     let err = tauri::async_runtime::block_on(v2ipc::usage_model_display_name_set(
@@ -1743,9 +1758,9 @@ fn v2_model_config_commands_round_trip() {
     .expect("usage_pricing_catalog_search 必须成功");
     assert_eq!(search.provider_count, 2);
     assert_eq!(search.entries.len(), 1);
-    assert_eq!(search.entries[0].provider_id, "ollama-cloud");
-    // 2026-10-20 精选三分类：ollama-cloud 是 hosted（不再是 official）。
-    assert_eq!(search.entries[0].curated_kind.as_deref(), Some("hosted"));
+    assert_eq!(search.entries[0].provider_id, "deepseek");
+    // 直营官方精选分类保持 official。
+    assert_eq!(search.entries[0].curated_kind.as_deref(), Some("official"));
     let all = tauri::async_runtime::block_on(v2ipc::usage_pricing_catalog_search(
         None,
         Some(50),
@@ -1777,8 +1792,8 @@ fn v2_model_config_commands_round_trip() {
         "缺省作用域必须等价 curated"
     );
 
-    // 自动匹配（固定精选）：归一化命中精选（直营官方 > hosted > OpenRouter）。
-    // 本夹具只有 ollama-cloud（hosted）与 aggregator-x（非精选）⇒ hosted 胜出。
+    // 自动匹配（固定精选）：归一化命中直营官方。
+    // 本夹具 deepseek 是官方、aggregator-x 非精选（release_date 更新也不得翻盘）。
     let matched = tauri::async_runtime::block_on(v2ipc::usage_pricing_auto_match(
         "deepseek-v4.1-flash".to_string(),
         None,
@@ -1787,8 +1802,8 @@ fn v2_model_config_commands_round_trip() {
     assert_eq!(matched.kind, "exact");
     assert_eq!(
         matched.reference.as_ref().unwrap().provider_id,
-        "ollama-cloud",
-        "hosted 优先（aggregator-x 的 release_date 更新也不得翻盘）"
+        "deepseek",
+        "官方优先（aggregator-x 的 release_date 更新也不得翻盘）"
     );
     let matched_quote = matched.quote.as_ref().unwrap();
     assert_eq!(matched_quote.snapshot_date, Some(1_000));
@@ -1803,7 +1818,7 @@ fn v2_model_config_commands_round_trip() {
 
     // 价格预览：精确键四价 + 快照日期；无条目 null。
     let quote = tauri::async_runtime::block_on(v2ipc::usage_pricing_quote_get(
-        "ollama-cloud".to_string(),
+        "deepseek".to_string(),
         "deepseek-v4.1-flash".to_string(),
         None,
     ))
@@ -1821,11 +1836,12 @@ fn v2_model_config_commands_round_trip() {
     assert!(miss.is_none(), "目录无该条目 ⇒ null（不是错误）");
 }
 
-/// 2026-10-20 精选三档（IPC 真跑）：自动匹配 glm-5.3 必须取直营官方 zhipuai
-///（而非 ollama-cloud / OpenRouter）；仅 hosted 的模型落到 ollama-cloud；
-/// 种入原生人民币价后预览的 CNY 面改为原生价且不再标 converted。
+/// 2026-10-21 精选两档（IPC 真跑）：自动匹配 glm-5.3 必须取直营官方 zhipuai
+///（而非 OpenRouter）；Ollama Cloud 不再参与自动匹配（仅有 hosted 的模型落到
+/// OpenRouter，纯 hosted 模型 kind=none）；种入原生人民币价后预览的 CNY 面改为
+/// 原生价且不再标 converted。
 #[test]
-fn v2_auto_match_prefers_official_over_hosted_and_native_cny_skips_conversion() {
+fn v2_auto_match_prefers_official_ignores_hosted_and_native_cny_skips_conversion() {
     let _g = serial();
 
     // 其它用例可能种过快照：先清 active，保证本用例从零种快照。
@@ -1847,12 +1863,16 @@ fn v2_auto_match_prefers_official_over_hosted_and_native_cny_skips_conversion() 
             "glm-5.3": {"release_date": "2025-09-01", "cost": {"input": 5, "output": 20},
                 "modalities": {"input": ["text"], "output": ["text"]}},
             "deepseek-v4.1-flash": {"release_date": "2025-09-01", "cost": {"input": 1, "output": 2},
+                "modalities": {"input": ["text"], "output": ["text"]}},
+            "hosted-only": {"release_date": "2025-09-01", "cost": {"input": 2, "output": 4},
                 "modalities": {"input": ["text"], "output": ["text"]}}
         }},
-        "openrouter": {"models": {"glm-5.3": {
-            "release_date": "2025-12-01", "cost": {"input": 9, "output": 90},
-            "modalities": {"input": ["text"], "output": ["text"]}
-        }}}
+        "openrouter": {"models": {
+            "glm-5.3": {"release_date": "2025-12-01", "cost": {"input": 9, "output": 90},
+                "modalities": {"input": ["text"], "output": ["text"]}},
+            "deepseek-v4.1-flash": {"release_date": "2025-12-01", "cost": {"input": 7, "output": 70},
+                "modalities": {"input": ["text"], "output": ["text"]}}
+        }}
     }"#;
     let snapshot_id = {
         let mut conn = DB.lock().unwrap_or_else(|e| e.into_inner());
@@ -1877,7 +1897,7 @@ fn v2_auto_match_prefers_official_over_hosted_and_native_cny_skips_conversion() 
     assert_eq!(
         matched.reference.as_ref().unwrap().provider_id,
         "zhipuai",
-        "直营官方 > ollama-cloud > OpenRouter（后两者 release_date 更新也不翻盘）"
+        "直营官方优先于 OpenRouter（后者 release_date 更新也不翻盘）"
     );
     let quote = matched.quote.as_ref().unwrap();
     assert_eq!(quote.input.as_deref(), Some("1"));
@@ -1889,16 +1909,27 @@ fn v2_auto_match_prefers_official_over_hosted_and_native_cny_skips_conversion() 
     assert!(quote.fx_fallback);
     assert!(quote.fx_fetched_at.is_none());
 
-    // 仅 hosted（无直营官方）⇒ ollama-cloud（优先于 OpenRouter）。
-    let hosted = tauri::async_runtime::block_on(v2ipc::usage_pricing_auto_match(
+    // 无直营官方：Ollama Cloud 已不参与精选 ⇒ 落到 OpenRouter。
+    let fallback = tauri::async_runtime::block_on(v2ipc::usage_pricing_auto_match(
         "deepseek-v4.1-flash".to_string(),
         None,
     ))
     .expect("usage_pricing_auto_match 必须成功");
+    assert_eq!(fallback.kind, "exact");
     assert_eq!(
-        hosted.reference.as_ref().unwrap().provider_id,
-        "ollama-cloud"
+        fallback.reference.as_ref().unwrap().provider_id,
+        "openrouter"
     );
+    assert_eq!(fallback.quote.as_ref().unwrap().input.as_deref(), Some("7"));
+
+    // 仅 hosted、无 OpenRouter 候选 ⇒ 精选作用域无命中（ollama-cloud 被忽略）。
+    let hosted_only = tauri::async_runtime::block_on(v2ipc::usage_pricing_auto_match(
+        "hosted-only".to_string(),
+        None,
+    ))
+    .expect("usage_pricing_auto_match 必须成功");
+    assert_eq!(hosted_only.kind, "none");
+    assert!(hosted_only.reference.is_none());
 
     // 种原生人民币价（zhipuai/glm-5.3，`List price: CNY 8/2/28` 的解析形态）⇒
     // 预览 CNY 面改为原生价，converted=false；USD 面不变。
@@ -2109,7 +2140,7 @@ fn v2_commands_serialize_contract_shapes() {
     let csv = tauri::async_runtime::block_on(v2ipc::usage_cost_export_csv(today()))
         .expect("usage_cost_export_csv 必须成功");
     assert!(csv.starts_with(
-        "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override\n"
+        "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override,price_rule_kind\n"
     ));
     assert!(!csv.to_lowercase().contains("total"));
 }
@@ -2350,6 +2381,7 @@ fn v2_alias_and_override_commands_round_trip() {
         cache_read: None,
         cache_write: None,
         output: Some("7".to_string()),
+        time_rule: None,
     };
     let after_set = tauri::async_runtime::block_on(v2ipc::usage_pricing_override_set(request))
         .expect("覆盖价写入必须成功");
@@ -2397,6 +2429,7 @@ fn v2_alias_and_override_commands_round_trip() {
         cache_read: None,
         cache_write: None,
         output: Some("28".to_string()),
+        time_rule: None,
     };
     let after_cny = tauri::async_runtime::block_on(v2ipc::usage_pricing_override_set(cny_request))
         .expect("CNY 覆盖价写入必须成功");
@@ -2418,6 +2451,7 @@ fn v2_alias_and_override_commands_round_trip() {
         cache_read: None,
         cache_write: None,
         output: None,
+        time_rule: None,
     };
     let err = tauri::async_runtime::block_on(v2ipc::usage_pricing_override_set(empty))
         .expect_err("四价全空必须拒绝");
@@ -2431,6 +2465,7 @@ fn v2_alias_and_override_commands_round_trip() {
         cache_read: None,
         cache_write: None,
         output: None,
+        time_rule: None,
     };
     let err = tauri::async_runtime::block_on(v2ipc::usage_pricing_override_set(bad_rate))
         .expect_err("非法费率必须拒绝");
@@ -2472,4 +2507,169 @@ fn v2_alias_and_override_commands_round_trip() {
             .is_empty(),
         "用例结束必须恢复空别名状态"
     );
+}
+
+/// 2026-10-21 分时价格（IPC 真跑）：固定价 → 分时价 → 回到固定价的完整 roundtrip；
+/// 分时规则保留 timezone / 跨午夜窗口 / 低谷四价；非法窗口与空低谷经真命令拒绝。
+#[test]
+fn v2_time_price_override_commands_round_trip() {
+    let _g = serial();
+
+    // 固定价：timeRule 在视图 wire 上省略（不是 null）。
+    let fixed = PriceOverrideRequest {
+        normalized_model_id: "time-roundtrip".to_string(),
+        currency: PriceCurrency::Usd,
+        input: Some("5".to_string()),
+        cache_read: None,
+        cache_write: None,
+        output: Some("20".to_string()),
+        time_rule: None,
+    };
+    let after_fixed =
+        tauri::async_runtime::block_on(v2ipc::usage_pricing_override_set(fixed)).unwrap();
+    let fixed_view = after_fixed
+        .iter()
+        .find(|view| view.normalized_model_id == "time-roundtrip")
+        .expect("固定价条目必须在列");
+    assert!(fixed_view.time_rule.is_none());
+    assert!(
+        serde_json::to_value(fixed_view)
+            .unwrap()
+            .get("timeRule")
+            .is_none(),
+        "固定价视图必须省略 timeRule"
+    );
+
+    // 分时价：跨午夜窗口合法；时区/窗口/低谷价完整保留。
+    let timed = PriceOverrideRequest {
+        normalized_model_id: "time-roundtrip".to_string(),
+        currency: PriceCurrency::Usd,
+        input: Some("5".to_string()),
+        cache_read: None,
+        cache_write: None,
+        output: Some("20".to_string()),
+        time_rule: Some(TimePriceRule {
+            timezone: TimePriceTimezone::Utc,
+            windows: vec![
+                TimePriceWindow {
+                    start: "09:00".to_string(),
+                    end: "12:00".to_string(),
+                },
+                TimePriceWindow {
+                    start: "22:00".to_string(),
+                    end: "02:00".to_string(),
+                },
+            ],
+            offpeak_input: Some("2".to_string()),
+            offpeak_cache_read: None,
+            offpeak_cache_write: None,
+            offpeak_output: Some("8".to_string()),
+        }),
+    };
+    let after_timed =
+        tauri::async_runtime::block_on(v2ipc::usage_pricing_override_set(timed)).unwrap();
+    let timed_view = after_timed
+        .iter()
+        .find(|view| view.normalized_model_id == "time-roundtrip")
+        .expect("分时价条目必须在列");
+    let rule = timed_view.time_rule.as_ref().expect("timeRule 必须回读");
+    assert_eq!(rule.timezone, TimePriceTimezone::Utc);
+    assert_eq!(
+        rule.windows,
+        vec![
+            TimePriceWindow {
+                start: "09:00".to_string(),
+                end: "12:00".to_string(),
+            },
+            TimePriceWindow {
+                start: "22:00".to_string(),
+                end: "02:00".to_string(),
+            }
+        ]
+    );
+    assert_eq!(rule.offpeak_input.as_deref(), Some("2"));
+    assert_eq!(rule.offpeak_output.as_deref(), Some("8"));
+    let wire = serde_json::to_value(timed_view).unwrap();
+    assert_eq!(wire["timeRule"]["timezone"], "utc");
+    assert_eq!(wire["timeRule"]["windows"][1]["start"], "22:00");
+    assert_eq!(wire["timeRule"]["windows"][1]["end"], "02:00");
+    assert_eq!(wire["timeRule"]["offpeakInput"], "2");
+
+    // 非法窗口（非整点）拒绝。
+    let bad_window = PriceOverrideRequest {
+        normalized_model_id: "time-roundtrip".to_string(),
+        currency: PriceCurrency::Usd,
+        input: Some("5".to_string()),
+        cache_read: None,
+        cache_write: None,
+        output: None,
+        time_rule: Some(TimePriceRule {
+            timezone: TimePriceTimezone::Local,
+            windows: vec![TimePriceWindow {
+                start: "09:30".to_string(),
+                end: "12:00".to_string(),
+            }],
+            offpeak_input: Some("2".to_string()),
+            offpeak_cache_read: None,
+            offpeak_cache_write: None,
+            offpeak_output: None,
+        }),
+    };
+    let err = tauri::async_runtime::block_on(v2ipc::usage_pricing_override_set(bad_window))
+        .expect_err("非整点窗口必须拒绝");
+    assert_eq!(err.code, "usage-settings-invalid");
+    assert!(err.detail.contains("whole hours"), "detail={}", err.detail);
+
+    // 空低谷拒绝。
+    let empty_offpeak = PriceOverrideRequest {
+        normalized_model_id: "time-roundtrip".to_string(),
+        currency: PriceCurrency::Usd,
+        input: Some("5".to_string()),
+        cache_read: None,
+        cache_write: None,
+        output: None,
+        time_rule: Some(TimePriceRule {
+            timezone: TimePriceTimezone::Local,
+            windows: vec![TimePriceWindow {
+                start: "09:00".to_string(),
+                end: "12:00".to_string(),
+            }],
+            offpeak_input: None,
+            offpeak_cache_read: None,
+            offpeak_cache_write: None,
+            offpeak_output: None,
+        }),
+    };
+    let err = tauri::async_runtime::block_on(v2ipc::usage_pricing_override_set(empty_offpeak))
+        .expect_err("低谷四价全空必须拒绝");
+    assert_eq!(err.code, "usage-settings-invalid");
+    assert_eq!(
+        err.detail,
+        "time price rule must set at least one offpeak rate"
+    );
+
+    // 回到固定价必须清空分时规则。
+    let fixed_again = PriceOverrideRequest {
+        normalized_model_id: "time-roundtrip".to_string(),
+        currency: PriceCurrency::Usd,
+        input: Some("3".to_string()),
+        cache_read: None,
+        cache_write: None,
+        output: None,
+        time_rule: None,
+    };
+    let after_fixed_again =
+        tauri::async_runtime::block_on(v2ipc::usage_pricing_override_set(fixed_again)).unwrap();
+    assert!(after_fixed_again
+        .iter()
+        .find(|view| view.normalized_model_id == "time-roundtrip")
+        .unwrap()
+        .time_rule
+        .is_none());
+
+    // 清理，避免污染同二进制后续用例。
+    tauri::async_runtime::block_on(v2ipc::usage_pricing_override_delete(
+        "time-roundtrip".to_string(),
+    ))
+    .expect("清理分时覆盖价必须成功");
 }

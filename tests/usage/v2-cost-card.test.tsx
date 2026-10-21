@@ -152,6 +152,8 @@ function costRow(
     normalizedModelId: "gpt-5",
     pricingReleaseDate: "2025-08-07",
     priceOverride: false,
+    priceRuleKind: "none",
+    timeBreakdown: null,
     ...opts,
   };
 }

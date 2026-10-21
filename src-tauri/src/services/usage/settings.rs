@@ -8,8 +8,13 @@ use crate::database::{get_setting, set_setting};
 pub const SETTINGS_KEY: &str = "usage.settings";
 
 pub fn parse_settings(raw: Option<&str>) -> UsageSettings {
-    raw.and_then(|s| serde_json::from_str::<UsageSettings>(s).ok())
-        .unwrap_or_default()
+    let mut settings = raw
+        .and_then(|s| serde_json::from_str::<UsageSettings>(s).ok())
+        .unwrap_or_default();
+    // 旧版本允许 1–3650 天；2026-10-21 用户裁决上限 90 天。存量值在读取时收敛，
+    // 避免用户不改设置却继续保留超长明细。
+    settings.detail_retention_days = settings.detail_retention_days.clamp(1, 90);
+    settings
 }
 
 pub fn merge_patch(
@@ -33,10 +38,10 @@ pub fn merge_patch(
         next.mini_bar_tool_rows = v;
     }
     if let Some(v) = patch.detail_retention_days {
-        if !(1..=3650).contains(&v) {
+        if !(1..=90).contains(&v) {
             return Err(UsageError::new(
                 "usage-settings-invalid",
-                "detail retention must be 1-3650 days",
+                "detail retention must be 1-90 days",
             ));
         }
         next.detail_retention_days = v;
@@ -128,4 +133,66 @@ pub fn save(s: &UsageSettings) -> Result<(), UsageError> {
     Ok(())
 }
 // ==== usage 自省锁：以下为排除区（测试代码），勿删勿复制 ====
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(days: i64) -> String {
+        format!(
+            r#"{{"enabled":true,"miniBarRange":"today","miniBarToolRows":3,"detailRetentionDays":{days},"collectIntervalMin":10,"providerMapRules":"","exportQuote":"","exportPose":"random"}}"#
+        )
+    }
+
+    #[test]
+    fn parse_settings_clamps_legacy_retention_into_1_to_90() {
+        assert_eq!(
+            parse_settings(Some(&raw(3650))).detail_retention_days,
+            90,
+            "旧版允许的 3650 天必须在读取时收敛到 90"
+        );
+        assert_eq!(
+            parse_settings(Some(&raw(0))).detail_retention_days,
+            1,
+            "低于 1 天的脏值必须收敛到 1"
+        );
+        assert_eq!(parse_settings(Some(&raw(30))).detail_retention_days, 30);
+        assert_eq!(
+            parse_settings(None).detail_retention_days,
+            90,
+            "缺省保留期仍为 90 天"
+        );
+        assert_eq!(
+            parse_settings(Some("not-json")).detail_retention_days,
+            90,
+            "损坏的存量 JSON 回退默认值"
+        );
+    }
+
+    #[test]
+    fn merge_patch_enforces_retention_upper_bound_90() {
+        let cur = UsageSettings::default();
+        let accepted = merge_patch(
+            &cur,
+            &UsageSettingsPatch {
+                detail_retention_days: Some(90),
+                ..UsageSettingsPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(accepted.detail_retention_days, 90);
+
+        for rejected in [91, 3650, 0] {
+            let error = merge_patch(
+                &cur,
+                &UsageSettingsPatch {
+                    detail_retention_days: Some(rejected),
+                    ..UsageSettingsPatch::default()
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "usage-settings-invalid");
+            assert_eq!(error.detail, "detail retention must be 1-90 days");
+        }
+    }
+}
 // ==== usage 自省锁：排除区结束，勿删勿复制 ====

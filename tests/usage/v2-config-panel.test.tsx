@@ -19,7 +19,8 @@
 //  * 条目 B 面：三行结构（row1 原始证据 / row2 双输入 / row3 计价身份）、展示键多成员折叠、
 //    多成员批量写、复制原始模型名、清除自定义名、自动匹配徽标、仅下拉选择、
 //    「显示全部 N 个来源」切换 scope、悬停价格表内容；
-//  * 高级区：默认收起、展开才挂载 Manager、无 billing manager、legacy 脚注在场；
+//  * 高级区：标题「自定义价格规则」、默认收起、展开才挂载 Manager、无 billing manager、
+//    旧版绑定说明（legacyMoved / usage-config-legacy-info-*）已删除；
 //  * Info tooltip：hover / focus 显示 role=tooltip 说明；
 //  * 条目快捷入口：空模型 disabled / 新覆盖预填原始模型名 / 已有覆盖进入编辑态 / 覆盖徽标 /
 //    scrollIntoView 滚动回归（prefill 被子组件清空不得取消 rAF；同毫秒重复点击重滚）。
@@ -108,6 +109,11 @@ function observedEntry(patch: Partial<ObservedModelEntry>): ObservedModelEntry {
     recentTokens7d: 100,
     ...patch,
   };
+}
+
+/** 配置条目的 DOM testid（展示键 = 显示供应商 + 原始模型；空 provider 走 u- 前缀）。 */
+function entry(provider: string, model: string): string {
+  return `usage-config-model-entry-d-${provider}-${model}`;
 }
 
 /** mock 别名存储里的 provider 显示名（未配置 = 原始串）；观察条目夹具用它保持与真机解析一致 */
@@ -618,6 +624,286 @@ describe("Top10 默认 / 展开全部 / 搜索", () => {
     await openConfigPanel();
     expect(callsOf("usage_observed_entries_get").length).toBeGreaterThan(0);
     expect(screen.queryByTestId("usage-config-model-more")).toBeNull();
+  });
+});
+
+describe("排序（2026-10-21：三键 + 同键升降序 + Top10 截断前排序）", () => {
+  /** 显示名顺序刻意与原始 provider / 用量顺序都不同，证明排序键取自原始证据。 */
+  function sortableEntries(): ObservedModelEntry[] {
+    return [
+      observedEntry({
+        providerRaw: "zeta",
+        displayProvider: "Alpha",
+        modelId: "m-1",
+        normalizedModelId: "m-1",
+        totalTokens: 100,
+        recentTokens7d: 100,
+      }),
+      observedEntry({
+        providerRaw: "alpha",
+        displayProvider: "Zeta",
+        modelId: "m-2",
+        normalizedModelId: "m-2",
+        totalTokens: 300,
+        recentTokens7d: 300,
+      }),
+      observedEntry({
+        providerRaw: "mike",
+        displayProvider: "Mike",
+        modelId: "m-3",
+        normalizedModelId: "m-3",
+        totalTokens: 200,
+        recentTokens7d: 200,
+      }),
+      observedEntry({
+        providerRaw: "bravo",
+        displayProvider: "Bravo",
+        modelId: "m-4",
+        normalizedModelId: "m-4",
+        totalTokens: 400,
+        recentTokens7d: 400,
+      }),
+    ];
+  }
+
+  const entryOrder = (): string[] =>
+    screen
+      .getAllByTestId(/^usage-config-model-entry-/)
+      .map((el) => el.getAttribute("data-testid") ?? "");
+
+  it("7. 默认用量降序；图例与三键在场；同一键再点切换升/降序", async () => {
+    const restore = override({
+      usage_observed_entries_get: () => Promise.resolve(sortableEntries()),
+    });
+    await openConfigPanel(entry("Bravo", "m-4"));
+
+    // 默认：用法降序（400 → 100）
+    expect(entryOrder()).toEqual([
+      entry("Bravo", "m-4"),
+      entry("Zeta", "m-2"),
+      entry("Mike", "m-3"),
+      entry("Alpha", "m-1"),
+    ]);
+    const usageSort = screen.getByTestId("usage-config-sort-usage");
+    expect(usageSort).toHaveAttribute("aria-pressed", "true");
+    expect(usageSort).toHaveAttribute(
+      "aria-label",
+      `${i18n.t("usage.config.modelSection.sortUsage")} ${i18n.t(
+        "usage.config.modelSection.sortDesc"
+      )}`
+    );
+    expect(screen.getByTestId("usage-config-sort-provider")).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
+    expect(screen.getByTestId("usage-config-sort-model")).toHaveAttribute("aria-pressed", "false");
+
+    // 图例三态
+    expect(screen.getByText(i18n.t("usage.config.modelSection.legend"))).toBeTruthy();
+    expect(screen.getByText(i18n.t("usage.config.modelSection.legendReadonly"))).toBeTruthy();
+    expect(screen.getByText(i18n.t("usage.config.modelSection.legendEditable"))).toBeTruthy();
+    const modified = screen.getByText(i18n.t("usage.config.modelSection.legendModified"));
+    expect(modified.className).toContain("amber-500/10");
+
+    // 同一键再点：升序（100 → 400）
+    fireEvent.click(usageSort);
+    expect(entryOrder()).toEqual([
+      entry("Alpha", "m-1"),
+      entry("Mike", "m-3"),
+      entry("Zeta", "m-2"),
+      entry("Bravo", "m-4"),
+    ]);
+    expect(usageSort).toHaveAttribute("aria-pressed", "true");
+    expect(usageSort).toHaveAttribute(
+      "aria-label",
+      `${i18n.t("usage.config.modelSection.sortUsage")} ${i18n.t(
+        "usage.config.modelSection.sortAsc"
+      )}`
+    );
+
+    // 第三次点：回到降序
+    fireEvent.click(usageSort);
+    expect(entryOrder()[0]).toBe(entry("Bravo", "m-4"));
+
+    restore();
+  });
+
+  it("7b. 按原始供应商名 / 原始模型名排序（不按显示名），同键再点反向", async () => {
+    const restore = override({
+      usage_observed_entries_get: () => Promise.resolve(sortableEntries()),
+    });
+    await openConfigPanel(entry("Bravo", "m-4"));
+
+    // 原始 provider 升序：alpha(B) < bravo(D) < mike(C) < zeta(A)
+    fireEvent.click(screen.getByTestId("usage-config-sort-provider"));
+    expect(entryOrder()).toEqual([
+      entry("Zeta", "m-2"),
+      entry("Bravo", "m-4"),
+      entry("Mike", "m-3"),
+      entry("Alpha", "m-1"),
+    ]);
+    expect(screen.getByTestId("usage-config-sort-provider")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+
+    // 再点：原始 provider 降序
+    fireEvent.click(screen.getByTestId("usage-config-sort-provider"));
+    expect(entryOrder()).toEqual([
+      entry("Alpha", "m-1"),
+      entry("Mike", "m-3"),
+      entry("Bravo", "m-4"),
+      entry("Zeta", "m-2"),
+    ]);
+
+    // 原始模型名升序：m-1 < m-2 < m-3 < m-4
+    fireEvent.click(screen.getByTestId("usage-config-sort-model"));
+    expect(entryOrder()).toEqual([
+      entry("Alpha", "m-1"),
+      entry("Zeta", "m-2"),
+      entry("Mike", "m-3"),
+      entry("Bravo", "m-4"),
+    ]);
+    expect(screen.getByTestId("usage-config-sort-model")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("usage-config-sort-provider")).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
+
+    // 再点：原始模型名降序
+    fireEvent.click(screen.getByTestId("usage-config-sort-model"));
+    expect(entryOrder()).toEqual([
+      entry("Bravo", "m-4"),
+      entry("Mike", "m-3"),
+      entry("Zeta", "m-2"),
+      entry("Alpha", "m-1"),
+    ]);
+
+    restore();
+  });
+
+  it("7c. 排序作用于全部条目后再截 Top10（低用量但原始 provider 靠前的条目能进榜）", async () => {
+    // 12 条：用量随序号递减；最后两条（m-11/m-12）用 aa-* 原始 provider。
+    // 默认用量 Top10 会隐藏它们；按原始 provider 升序后它们应排在最前并进入 Top10。
+    const entries = Array.from({ length: 12 }, (_, index) => {
+      const n = String(index + 1).padStart(2, "0");
+      const lowUsage = index >= 10;
+      return observedEntry({
+        providerRaw: lowUsage ? `aa-${n}` : `zz-${n}`,
+        displayProvider: lowUsage ? `aa-${n}` : `zz-${n}`,
+        modelId: `m-${n}`,
+        normalizedModelId: `m-${n}`,
+        totalTokens: 1300 - (index + 1) * 100,
+        recentTokens7d: 1300 - (index + 1) * 100,
+      });
+    });
+    const restore = override({
+      usage_observed_entries_get: () => Promise.resolve(entries),
+    });
+    await openConfigPanel(entry("zz-10", "m-10"));
+
+    // 默认：前 10 条用量最大的在榜；aa-11/aa-12 被截掉
+    expect(entryOrder()[0]).toBe(entry("zz-01", "m-01"));
+    expect(screen.queryByTestId(entry("aa-11", "m-11"))).toBeNull();
+    expect(screen.queryByTestId(entry("aa-12", "m-12"))).toBeNull();
+
+    // 按原始 provider 升序后：aa-11、aa-12 排最前（可见），zz-09/zz-10 被挤出 Top10
+    fireEvent.click(screen.getByTestId("usage-config-sort-provider"));
+    expect(entryOrder()[0]).toBe(entry("aa-11", "m-11"));
+    expect(entryOrder()[1]).toBe(entry("aa-12", "m-12"));
+    expect(screen.queryByTestId(entry("zz-09", "m-09"))).toBeNull();
+    expect(screen.queryByTestId(entry("zz-10", "m-10"))).toBeNull();
+    // Top10 之外仍有 2 条（展开按钮文案不变）
+    expect(screen.getByTestId("usage-config-model-more")).toHaveTextContent(
+      i18n.t("usage.config.modelSection.expandAll", { count: 2 })
+    );
+
+    restore();
+  });
+});
+
+describe("可交互性标识（2026-10-21）", () => {
+  it("7d. 自定义供应商/模型输入 + 计价身份覆盖 badge/ref 琥珀色；普通行无琥珀；按钮 outline/边框", async () => {
+    const restore = override({
+      usage_observed_entries_get: () =>
+        Promise.resolve([
+          observedEntry({
+            providerRaw: "openai",
+            displayProvider: "OpenAI Custom",
+            displayModelName: "GPT Custom",
+            pricingProvider: "openai",
+            pricingModel: "gpt-5",
+            totalTokens: 500,
+            recentTokens7d: 500,
+          }),
+          // 普通行：无自定义名、无计价身份覆盖
+          observedEntry({
+            providerRaw: "azure-openai",
+            sourceId: "codex",
+            displayProvider: null,
+            displayModelName: null,
+            modelId: "plain",
+            normalizedModelId: "plain",
+            totalTokens: 100,
+            recentTokens7d: 100,
+          }),
+        ]),
+    });
+    await openConfigPanel(entry("OpenAI-Custom", "gpt-5"));
+
+    // 有自定义值：供应商名/模型名输入框琥珀色
+    const providerInput = screen.getByTestId(
+      "usage-config-model-provider-input-d-OpenAI-Custom-gpt-5"
+    );
+    expect(providerInput.className).toContain("border-amber-500/60");
+    expect(providerInput.className).toContain("text-amber-700");
+    const modelInput = screen.getByTestId(
+      "usage-config-model-display-name-input-d-OpenAI-Custom-gpt-5"
+    );
+    expect(modelInput.className).toContain("border-amber-500/60");
+    expect(modelInput.className).toContain("text-amber-700");
+
+    // 计价身份覆盖：徽标 + ref 琥珀色
+    const badge = await screen.findByTestId("usage-config-pricing-badge-d-OpenAI-Custom-gpt-5");
+    expect(badge).toHaveTextContent(i18n.t("usage.config.modelSection.pricingOverridden"));
+    expect(badge.className).toContain("amber-500/50");
+    expect(badge.className).toContain("text-amber-700");
+    const ref = screen.getByTestId("usage-config-pricing-ref-d-OpenAI-Custom-gpt-5");
+    expect(ref).toHaveTextContent("openai / gpt-5");
+    expect(ref.className).toContain("text-amber-700");
+
+    // 按钮形态：覆盖快捷入口 / 清除覆盖 / 身份选择器 outline；选项按钮有边框
+    expect(screen.getByTestId("usage-config-model-override-d-OpenAI-Custom-gpt-5")).toHaveAttribute(
+      "data-variant",
+      "outline"
+    );
+    expect(screen.getByTestId("usage-config-pricing-clear-d-OpenAI-Custom-gpt-5")).toHaveAttribute(
+      "data-variant",
+      "outline"
+    );
+    const toggle = screen.getByTestId("usage-config-pricing-toggle-d-OpenAI-Custom-gpt-5");
+    expect(toggle).toHaveAttribute("data-variant", "outline");
+    fireEvent.click(toggle);
+    // 目录候选按查询词拉取（未输入时只给短查询提示）
+    fireEvent.change(screen.getByTestId("usage-config-pricing-search-d-OpenAI-Custom-gpt-5"), {
+      target: { value: "gp" },
+    });
+    const option = await screen.findByTestId("usage-config-pricing-option-openai/gpt-5");
+    expect(option.className).toContain("border");
+
+    // 普通行：无自定义值 / 无覆盖徽标，输入框不带琥珀色；覆盖入口仍保留（未禁用）
+    const plainProvider = screen.getByTestId("usage-config-model-provider-input-u-codex-plain");
+    expect(plainProvider.className).not.toContain("amber");
+    const plainModel = screen.getByTestId("usage-config-model-display-name-input-u-codex-plain");
+    expect(plainModel.className).not.toContain("amber");
+    expect(screen.queryByTestId("usage-config-model-overridden-u-codex-plain")).toBeNull();
+    expect(screen.queryByTestId("usage-config-pricing-badge-u-codex-plain")).toBeNull();
+    expect(screen.queryByTestId("usage-config-pricing-ref-u-codex-plain")).toBeNull();
+    // 普通行不出现「指派/绑定」类附加按钮（原有覆盖入口保持唯一）
+    expect(document.querySelector('[data-testid*="usage-config-assign"]')).toBeNull();
+    expect(screen.getByTestId("usage-config-model-override-u-codex-plain")).toBeTruthy();
+
+    restore();
   });
 });
 
@@ -1133,7 +1419,7 @@ describe("折叠键无损性（P2-2 回归：sanitize 仅用于 testid，不作�
 });
 
 describe("高级覆盖区（UsageDisclosure 受控折叠）", () => {
-  it("12. 高级区默认收起；展开才挂载 Manager；无 billing manager；旧版脚注在场", async () => {
+  it("12. 高级区：标题「自定义价格规则」；默认收起；展开才挂载 Manager；旧版脚注已删除", async () => {
     await openConfigPanel();
 
     const advToggle = screen.getByTestId("usage-config-advanced-settings-toggle");
@@ -1151,19 +1437,17 @@ describe("高级覆盖区（UsageDisclosure 受控折叠）", () => {
     fireEvent.click(advToggle);
     expect(advToggle).toHaveAttribute("aria-expanded", "true");
     expect(advToggle).toHaveAttribute("aria-controls", "usage-config-advanced-settings-content");
-    // 高级标题 + 摘要在标题按钮上
-    expect(screen.getByTestId("usage-config-advanced-settings")).toHaveTextContent(
-      i18n.t("usage.config.advanced")
-    );
-    expect(screen.getByTestId("usage-config-advanced-settings")).toHaveTextContent(
-      i18n.t("usage.config.advancedHint")
-    );
-    // 展开后 Manager 挂载；旧版说明脚注 + 记录页提示 + 旧版 Info 在场
+    // 高级标题 + 摘要在标题按钮上（2026-10-21 标题改为「自定义价格规则」）
+    const advanced = screen.getByTestId("usage-config-advanced-settings");
+    expect(advanced).toHaveTextContent(i18n.t("usage.config.advanced"));
+    expect(advanced).toHaveTextContent("自定义价格规则");
+    expect(advanced).toHaveTextContent(i18n.t("usage.config.advancedHint"));
+    // 展开后 Manager 挂载；高级区 Info 仍在，旧版说明脚注 / 旧版 Info 已删除
     expect(await screen.findByTestId("price-override-manager")).toBeTruthy();
-    expect(screen.getByTestId("usage-config-advanced-settings-content")).toHaveTextContent(
-      i18n.t("usage.config.legacyMoved")
-    );
-    expect(screen.getByTestId("usage-config-legacy-info-settings")).toBeTruthy();
+    const content = screen.getByTestId("usage-config-advanced-settings-content");
+    expect(content).not.toHaveTextContent(i18n.t("usage.config.legacyMoved"));
+    expect(content).not.toHaveTextContent("旧版计费渠道绑定");
+    expect(screen.queryByTestId("usage-config-legacy-info-settings")).toBeNull();
     expect(screen.getByTestId("usage-config-advanced-info-settings")).toBeTruthy();
 
     // chevron 按钮同样可切换收起：Manager 卸载
@@ -1313,6 +1597,10 @@ describe("弹窗壳（设置页与 D 卡共用）", () => {
     expect(dialog).toHaveAttribute("data-testid", "usage-config-dialog-settings");
     expect(within(dialog).getByTestId("usage-config-panel-settings")).toBeTruthy();
     expect(within(dialog).getByTestId("usage-config-info-settings")).toBeTruthy();
+    // 宽度与主看板窗口一致：初始 1040px、最小 840px（受视口约束），旧 1100px 上限退场
+    expect(dialog.className).toContain("w-[1040px]");
+    expect(dialog.className).toContain("min-w-[min(840px,calc(100vw-2rem))]");
+    expect(dialog.className).not.toContain("max-w-[min(1100px");
 
     // 行内截断纪律保留：原始证据 span truncate + 完整 title
     const raw = screen.getByTestId(

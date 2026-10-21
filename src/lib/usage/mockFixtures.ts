@@ -781,6 +781,7 @@ const initialOverrides = (): PriceOverrideView[] => [
     cacheRead: "0.125",
     cacheWrite: null,
     output: "10",
+    timeRule: null,
     updatedAt: 1_700_000_000_000,
     sourceProvider: "openai",
     sourceModel: "gpt-5",
@@ -963,7 +964,7 @@ const CATALOG_SCOPE_FIXTURES: MockCatalogEntry[] = [
     releaseDate: "2025-09-01",
     hasRates: true,
     conditional: false,
-    curatedKind: "hosted",
+    curatedKind: null,
     rates: [null, null, null, null],
   },
   {
@@ -1044,18 +1045,16 @@ export function mockPricingAutoMatch(modelId: string, _fallbackRate?: string): P
     return { kind: "none", reference: null, quote: null };
   }
   const normalized = normalizeMockModelId(modelId);
-  // exact：精选集合内「直营官方 > 托管 > OpenRouter」——OpenRouter 精选条目的 exact 也能命中
-  //（与 Rust `MatchScope::Curated` 一致；非精选条目永不参与自动匹配）。
+  // exact：精选集合内「直营官方 > OpenRouter」——四价全 0/全空的条目不参与自动匹配
+  //（与 Rust `MatchScope::Curated` 一致；非精选条目永不参与）。
+  const hasNonzero = (entry: MockCatalogEntry): boolean =>
+    entry.rates.some((rate) => rate !== null && Number(rate) !== 0);
+  const curated = CATALOG_SCOPE_FIXTURES.filter(
+    (entry) => entry.curatedKind !== null && hasNonzero(entry)
+  );
   const exact =
-    CATALOG_SCOPE_FIXTURES.find(
-      (entry) => entry.curatedKind === "official" && entry.modelId === normalized
-    ) ??
-    CATALOG_SCOPE_FIXTURES.find(
-      (entry) => entry.curatedKind === "hosted" && entry.modelId === normalized
-    ) ??
-    CATALOG_SCOPE_FIXTURES.find(
-      (entry) => entry.curatedKind === "openrouter" && entry.modelId === normalized
-    );
+    curated.find((entry) => entry.curatedKind === "official" && entry.modelId === normalized) ??
+    curated.find((entry) => entry.curatedKind === "openrouter" && entry.modelId === normalized);
   if (exact) {
     return {
       kind: "exact",
@@ -1065,13 +1064,10 @@ export function mockPricingAutoMatch(modelId: string, _fallbackRate?: string): P
   }
   // 前缀回退（噪声尾）同样在精选集合内、直营官方优先；未命中返回 none。
   const prefixHit =
-    CATALOG_SCOPE_FIXTURES.find(
+    curated.find(
       (entry) => entry.curatedKind === "official" && normalized.startsWith(entry.modelId)
     ) ??
-    CATALOG_SCOPE_FIXTURES.find(
-      (entry) => entry.curatedKind === "hosted" && normalized.startsWith(entry.modelId)
-    ) ??
-    CATALOG_SCOPE_FIXTURES.find(
+    curated.find(
       (entry) => entry.curatedKind === "openrouter" && normalized.startsWith(entry.modelId)
     );
   if (prefixHit && normalized !== prefixHit.modelId) {
@@ -1479,6 +1475,61 @@ export function mockPricingOverrideSet(
   if (components.every(([, value]) => value === null)) {
     return aliasInvalid("price override must set at least one rate");
   }
+  // 分时规则（2026-10-21）：与 Rust `request_time_rule` 同口径做最小校验，
+  // 并把规则原样挂到视图上，供「保存 → 重取 → 编辑回填」闭环。
+  const timeRule = request.timeRule ?? null;
+  if (timeRule) {
+    const hourValid = (value: string): boolean => /^(?:[01]\d|2[0-3]):00$/.test(value);
+    if (!["local", "asiaShanghai", "utc"].includes(timeRule.timezone)) {
+      return aliasInvalid("time price rule timezone is invalid");
+    }
+    if (timeRule.windows.length === 0) {
+      return aliasInvalid("time price rule requires at least one window");
+    }
+    for (const window of timeRule.windows) {
+      if (!hourValid(window.start) || !hourValid(window.end)) {
+        return aliasInvalid("time price window must use whole hours");
+      }
+      if (window.start === window.end) {
+        return aliasInvalid("time price window start and end must differ");
+      }
+    }
+    const toMinutes = (value: string): number => {
+      const [hour, minute] = value.split(":").map(Number);
+      return hour * 60 + minute;
+    };
+    const segments = timeRule.windows.flatMap((window): Array<[number, number]> => {
+      const start = toMinutes(window.start);
+      const end = toMinutes(window.end);
+      return start < end
+        ? [[start, end]]
+        : [
+            [start, 1440],
+            [0, end],
+          ];
+    });
+    for (let index = 0; index < segments.length; index += 1) {
+      for (let next = index + 1; next < segments.length; next += 1) {
+        if (segments[index][0] < segments[next][1] && segments[next][0] < segments[index][1]) {
+          return aliasInvalid("time price windows must not overlap");
+        }
+      }
+    }
+    const offpeak = [
+      timeRule.offpeakInput,
+      timeRule.offpeakCacheRead,
+      timeRule.offpeakCacheWrite,
+      timeRule.offpeakOutput,
+    ];
+    for (const value of offpeak) {
+      if (!validMockRate(value)) {
+        return aliasInvalid("time price offpeak rate is invalid");
+      }
+    }
+    if (offpeak.every((value) => value === null)) {
+      return aliasInvalid("time price rule must set at least one offpeak rate");
+    }
+  }
   const view: PriceOverrideView = {
     normalizedModelId,
     currency: request.currency ?? "USD",
@@ -1486,6 +1537,7 @@ export function mockPricingOverrideSet(
     cacheRead: request.cacheRead,
     cacheWrite: request.cacheWrite,
     output: request.output,
+    timeRule,
     updatedAt: Date.now(),
     ...overrideSource(normalizedModelId),
   };
@@ -1570,7 +1622,7 @@ const PRICING_CATALOG_FIXTURES: PricingCatalogEntry[] = [
     releaseDate: "2025-09-01",
     hasRates: true,
     conditional: false,
-    curatedKind: "hosted",
+    curatedKind: null,
   },
   {
     providerId: "ollama-cloud",
@@ -1578,7 +1630,7 @@ const PRICING_CATALOG_FIXTURES: PricingCatalogEntry[] = [
     releaseDate: null,
     hasRates: false,
     conditional: false,
-    curatedKind: "hosted",
+    curatedKind: null,
   },
   {
     providerId: "zhipuai-coding-plan",
@@ -1586,7 +1638,7 @@ const PRICING_CATALOG_FIXTURES: PricingCatalogEntry[] = [
     releaseDate: "2025-10-01",
     hasRates: true,
     conditional: true,
-    curatedKind: "official",
+    curatedKind: null,
   },
 ];
 
@@ -1672,6 +1724,8 @@ export function mockUsageCosts(range: UsageRange): UsageCosts {
     normalizedModelId: "gpt-5",
     pricingReleaseDate: "2025-08-07",
     priceOverride: Boolean(gpt5Override),
+    priceRuleKind: gpt5Override?.timeRule ? "time" : gpt5Override ? "fixed" : "none",
+    timeBreakdown: null,
     displayModelName: null,
   };
   const partial: CostRow = {
@@ -1717,6 +1771,8 @@ export function mockUsageCosts(range: UsageRange): UsageCosts {
     normalizedModelId: "claude-sonnet-4-5",
     pricingReleaseDate: "2025-08-07",
     priceOverride: false,
+    priceRuleKind: "none",
+    timeBreakdown: null,
     displayModelName: null,
   };
   const unpriced: CostRow = {
@@ -1753,6 +1809,8 @@ export function mockUsageCosts(range: UsageRange): UsageCosts {
     normalizedModelId: null,
     pricingReleaseDate: null,
     priceOverride: false,
+    priceRuleKind: "none",
+    timeBreakdown: null,
     displayModelName: null,
   };
   // dsh 明细全价行变体（2026-10-20 计划 Task 4/7）：明细按日聚合路径下 dsh 四桶
@@ -1801,6 +1859,8 @@ export function mockUsageCosts(range: UsageRange): UsageCosts {
     normalizedModelId: "dsh-glm",
     pricingReleaseDate: "2025-10-01",
     priceOverride: false,
+    priceRuleKind: "none",
+    timeBreakdown: null,
     displayModelName: null,
   };
   return {
@@ -1815,7 +1875,7 @@ export function mockUsageCosts(range: UsageRange): UsageCosts {
 }
 
 const COST_CSV_HEADER =
-  "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override";
+  "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override,price_rule_kind";
 
 function csvCell(value: string): string {
   const neutralized = /^[=+\-@\t\r\n]/.test(value) ? `'${value}` : value;
@@ -1854,6 +1914,7 @@ export function mockUsageCostCsv(range: UsageRange): string {
       row.normalizedModelId ?? "",
       row.pricingReleaseDate ?? "",
       row.priceOverride ? "true" : "false",
+      row.priceRuleKind,
     ];
     return cells.map(csvCell).join(",");
   });

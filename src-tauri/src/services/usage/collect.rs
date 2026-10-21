@@ -1534,7 +1534,7 @@ mod tests {
     ///   **加上** END 之后 → 文件尾（去行内空白、剥**整行** `//` 注释）；
     /// * 34 个文件**每个都必须恰好一对标记**：**28 个有测试模块**的文件把标记**包住测试模块**
     ///   （BEGIN 在 `#[cfg(test)]` 前一行、END 在测试模块收口 `}` 之后）；**6 个无测试模块**的文件
-    ///   （`caps.rs` / `delta.rs` / `model.rs` / `settings.rs` / `v2/model.rs` / `v2/mod.rs`）
+    ///   （`caps.rs` / `delta.rs` / `model.rs` / `v2/model.rs` / `v2/mod.rs`）
     ///   把两行**相邻**放在文件末尾 ⇒ 排除区为空、**整文件都在面内**（第 6 轮：`mod.rs` 因新增
     ///   `self_lock_tests` 由空区转为测试模块区；第 42 轮：`v2/model_config.rs` 以**测试模块区**
     ///   形态入面）；**分类由
@@ -1740,9 +1740,9 @@ mod tests {
         );
     }
 
-    /// 自省锁的**扫描面**：`services/usage/**/*.rs` **全部 36 个文件**。
-    /// 与磁盘**逐一对账**见 `usage_source_scan_covers_every_file_on_disk`（防第 37 个文件静默逃逸）。
-    const USAGE_SOURCES: [(&str, &str); 36] = [
+    /// 自省锁的**扫描面**：`services/usage/**/*.rs` **全部 37 个文件**。
+    /// 与磁盘**逐一对账**见 `usage_source_scan_covers_every_file_on_disk`（防第 38 个文件静默逃逸）。
+    const USAGE_SOURCES: [(&str, &str); 37] = [
         ("caps.rs", include_str!("caps.rs")),
         ("collect.rs", include_str!("collect.rs")),
         ("collectors/claude.rs", include_str!("collectors/claude.rs")),
@@ -1785,6 +1785,7 @@ mod tests {
         ("v2/native_price.rs", include_str!("v2/native_price.rs")),
         ("v2/pricing.rs", include_str!("v2/pricing.rs")),
         ("v2/query.rs", include_str!("v2/query.rs")),
+        ("v2/time_price.rs", include_str!("v2/time_price.rs")),
     ];
 
     /// **面尺寸钉子（第 7 轮 C-1）**：把「判据面 = N 行 / M 字符」这个数字**逐字钉住**。
@@ -2061,6 +2062,11 @@ mod tests {
     ///   * `v2/cost_query.rs`：自动匹配固定 `MatchScope::Curated`。
     ///     新增测试全部落在 BEGIN..END 排除区内 ⇒ 不进面；文件数仍为 34、
     ///     28/6 分类与排除区标记均未动。
+    ///     **第 48 轮同步（2026-10-21 自定义价格规则与分时计费）**：
+    ///     13451/301445 → **13935/312793**（+484 行 / +11348 字符），测试模块区 30→32（time_price + settings 测试入排除区）。
+    ///     新增 `v2/time_price.rs`（窗口校验/时区换算/峰谷判定，含测试排除区）；
+    ///     其余变化来自 `v2/pricing.rs` 的自定义规则/精选精简、`v2/cost_query.rs` 的
+    ///     小时取数与分时费用字段、`v2/model.rs` 的新 wire 类型。
     #[test]
     fn scan_face_size_is_pinned() {
         let (mut lines, mut chars) = (0usize, 0usize);
@@ -2071,7 +2077,7 @@ mod tests {
         }
         assert_eq!(
             (lines, chars),
-            (13451, 301445),
+            (13935, 312793),
             "判据面尺寸变了（实测 {lines} 行 / {chars} 字符）：本用例是**声明 = 实际**的钉子——\
              先弄清面为什么变（新增文件？改了排除区标记？动了生产代码？），再同步本常量、\
              `no_source_timezone_is_fed_into_any_key_function` 的锁注释、`KNOWN-PLAN-DEFECTS.md` \
@@ -2126,9 +2132,9 @@ mod tests {
             .count();
         assert_eq!(
             (USAGE_SOURCES.len() - empty, empty),
-            (30, 6),
-            "排除区分类应为 **30 个测试模块区 / 6 个空区**（空区 = `caps.rs` / `delta.rs` / \
-             `model.rs` / `settings.rs` / `v2/model.rs` / `v2/mod.rs`）。改动某文件的\
+            (32, 5),
+            "排除区分类应为 **32 个测试模块区 / 5 个空区**（空区 = `caps.rs` / `delta.rs` / \
+             `model.rs` / `v2/model.rs` / `v2/mod.rs`）。改动某文件的\
              排除区形态（加测试模块 / 改成空区）时，必须**同步**本断言、`self_lock` 的文档与\
              两处锁的声明"
         );
