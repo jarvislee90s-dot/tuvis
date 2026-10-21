@@ -24,39 +24,141 @@ import { useEffect, useRef, useState } from "react";
 import InteractiveCard from "./InteractiveCard";
 import i18n from "@/i18n";
 import {
+  codexCapabilityTier,
   fetchCodexAction,
   newActionId,
+  probeReasonErrorKey,
+  probeReasonStage,
   respondCodexPending,
   type ActionReceipt,
+  type CodexCapabilityTier,
   type ControlAvailability,
   type PendingView,
+  type ProbeStatus,
   type QuestionView,
 } from "./codexIpcApi";
 import { ApiError } from "./api";
 
 // ============================================================
-// 四档能力横幅（服务端下发档位，前端只渲染不推断——spec F8）
+// 能力横幅（服务端下发档位，前端只渲染不推断——spec F8）
 // ============================================================
 
-/** 能力横幅：四档各一句 + stale 保留视图说明。data-availability / data-stale
- *  供测试与上游分诊（文案断言在 PendingRequestCard.test 固定 zh 后逐字断言）。 */
+/** 三态徽标配色：已验证=绿、兼容探测（实验）=琥珀、未解锁=中性灰。
+ *  配色与文案一起按态走——徽标的**颜色**也是信息，不能三态同色。 */
+const TIER_CLASS: Record<CodexCapabilityTier, string> = {
+  verified: "rounded-full bg-emerald-500/15 px-2 py-0.5 text-emerald-800 dark:text-emerald-300",
+  compat: "rounded-full bg-amber-500/15 px-2 py-0.5 text-amber-800 dark:text-amber-300",
+  locked: "rounded-full bg-slate-500/15 px-2 py-0.5 text-slate-700 dark:text-slate-300",
+};
+
+/**
+ * 探测结论 → 展示文案（`failed` / `inconclusive` 必给原因）。
+ *
+ * 机器码 → 顶层 `errors` 段文案（动态码 `probe_failed:P2` 按**前缀**取基线文案，
+ * stage 另附在文案尾）；词表外的码**不猜**——落通用「原因未知」。
+ */
+function probeReasonCopy(probe: ProbeStatus | undefined): string | null {
+  if (probe === undefined) return null;
+  if (probe.state !== "failed" && probe.state !== "inconclusive" && probe.state !== "idle") {
+    return null;
+  }
+  const key = probeReasonErrorKey(probe.reasonCode);
+  if (key === null) {
+    // 词表外的码（failed / inconclusive）→ 通用「原因未知」（不猜具体原因）；
+    // `idle` 且无码 = 探测事实**取不到**（不是「没通过」）→ 什么都不说（不猜）。
+    return probe.state === "idle" ? null : i18n.t("mobile.codex.probe.reasonUnknown");
+  }
+  const base = i18n.t(key);
+  const stage = probeReasonStage(probe.reasonCode) ?? probe.stage;
+  if (stage === null) return base;
+  return `${base}${i18n.t("mobile.codex.probe.stage", { stage })}`;
+}
+
+/**
+ * 能力横幅：**三态徽标** + 服务端档位明细 + 探测事实（#172/T9b）。
+ *
+ * - 三态取自唯一映射源 `codexCapabilityTier()`（四档 → 三态），文案/配色按态走；
+ * - 探测在飞（`probeStatus.state === "probing"`）时**只出骨架**：结论未定，此刻给出
+ *   任何档位定论（含「未解锁」）都是抢跑——骨架只说「正在探测」；
+ * - 用户可**取消等待**：取消 = 客户端放弃等待（收起骨架、记住「已取消等待」，
+ *   不再反复显示骨架）。服务端探测本身有 15s 硬上限（`probe/runner.rs` 的
+ *   `TOTAL_BUDGET`）自行结束——**不伪造服务端 abort**，界面如实写清这层语义；
+ * - `failed` / `inconclusive`：横幅给出**原因**（机器码 → `errors` 段文案 + stage）。
+ *
+ * data-availability / data-tier / data-stale / data-probe-state 供测试与上游分诊
+ * （文案断言在 PendingRequestCard.test 固定 zh 后逐字断言）。
+ */
 export function CodexAvailabilityBanner({
   availability,
   stale,
+  probeStatus,
 }: {
   availability: ControlAvailability;
   stale: boolean;
+  /** #172/T9a：探测只读事实。老后端不下发 → undefined（按「无探测信息」处理）。 */
+  probeStatus?: ProbeStatus | undefined;
 }) {
+  const tier = codexCapabilityTier(availability);
+  const probeState = probeStatus?.state ?? null;
+  const probing = probeState === "probing";
+  /** 用户已取消等待（客户端放弃等待；服务端探测仍在 15s 硬上限内自行结束） */
+  const [waitCancelled, setWaitCancelled] = useState(false);
+  // 探测离开 probing → 复位「已取消等待」记忆（下一次进入 probing 又是新的一次等待）
+  useEffect(() => {
+    if (!probing) setWaitCancelled(false);
+  }, [probing]);
+
+  const showSkeleton = probing && !waitCancelled;
+  const reason = probeReasonCopy(probeStatus);
+
   return (
     <div
       data-testid="codex-availability-banner"
       data-availability={availability}
+      data-tier={tier}
       data-stale={stale ? "true" : "false"}
+      data-probe-state={probeState ?? "none"}
       className="flex flex-wrap items-center gap-2 rounded-lg bg-[var(--btnp)]/10 px-3 py-2 text-xs text-[var(--tx)]"
     >
-      <span data-testid="codex-availability-label">
-        {i18n.t(`mobile.codex.availability.${availability}`)}
-      </span>
+      {showSkeleton ? (
+        <div data-testid="codex-probe-skeleton" className="flex flex-wrap items-center gap-2">
+          <span data-testid="codex-probe-skeleton-label">
+            {i18n.t("mobile.codex.probe.probing")}
+          </span>
+          {/* 骨架块：占位条（**不是**结论——此刻没有结论可写） */}
+          <span aria-hidden className="h-2 w-16 animate-pulse rounded bg-[var(--mut)]/30" />
+          <span aria-hidden className="h-2 w-10 animate-pulse rounded bg-[var(--mut)]/30" />
+          <button
+            type="button"
+            data-testid="codex-probe-cancel"
+            onClick={() => setWaitCancelled(true)}
+            className="rounded-full bg-[var(--btnp)]/15 px-2 py-0.5"
+          >
+            {i18n.t("mobile.codex.probe.cancelWait")}
+          </button>
+        </div>
+      ) : waitCancelled && probing ? (
+        <span
+          data-testid="codex-probe-wait-cancelled"
+          className="text-amber-700 dark:text-amber-400"
+        >
+          {i18n.t("mobile.codex.probe.waitCancelled")}
+        </span>
+      ) : (
+        <>
+          <span data-testid="codex-availability-label">
+            {i18n.t(`mobile.codex.availability.${availability}`)}
+          </span>
+          <span data-testid="codex-tier-badge" data-tier={tier} className={TIER_CLASS[tier]}>
+            {i18n.t(`mobile.codex.tier.${tier}`)}
+          </span>
+        </>
+      )}
+      {reason !== null && (
+        <p data-testid="codex-probe-reason" className="w-full text-amber-700 dark:text-amber-400">
+          {reason}
+        </p>
+      )}
       {stale && (
         <span data-testid="codex-stale-note" className="text-amber-700 dark:text-amber-400">
           {i18n.t("mobile.codex.staleBanner")}

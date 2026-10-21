@@ -1928,6 +1928,18 @@
         "compat_only": "Compatibility mode only",
         "unavailable": "Not controllable right now"
       },
+      "tier": {
+        "verified": "Verified",
+        "compat": "Compatibility probe (experimental)",
+        "locked": "Not unlocked"
+      },
+      "probe": {
+        "probing": "Probing this desktop build's compatibility…",
+        "cancelWait": "Stop waiting",
+        "waitCancelled": "Stopped waiting (the server-side probe ends on its own within 15 seconds)",
+        "reasonUnknown": "The probe did not pass and the reason is unknown — check the desktop",
+        "stage": "(probe stage {{stage}})"
+      },
       "staleBanner": "Desktop connection interrupted — showing the last known view; remote actions are disabled for now",
       "pending": {
         "titleCommand": "Command approval request",

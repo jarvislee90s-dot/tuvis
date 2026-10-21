@@ -953,6 +953,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             key={`codex-banner-${session.id}`}
             availability={codexState.availability}
             stale={codexState.stale}
+            probeStatus={codexState.probeStatus}
           />
           {codexProjectionActive &&
             codexState.pending.map((p) => (

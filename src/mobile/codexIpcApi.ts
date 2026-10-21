@@ -30,6 +30,123 @@ export type ControlRoute = "desktop_ipc" | "headless_compat" | "none";
 export type ControlAvailability =
   "controllable" | "send_only" | "read_only" | "compat_only" | "unavailable";
 
+/** 能力三态（#172/T9b）：把服务端下发的**四档**压成用户看得懂的三态。
+ *  - `verified` = 已验证：该 build 有真机证据（可控制 / 可发送）；
+ *  - `compat` = 兼容探测（实验）：未知 build——读链已取证但写未开放，或只剩兼容
+ *    发送路径（须显式 opt-in 的实验开关）；
+ *  - `locked` = 未解锁：服务端明确判不可用。 */
+export type CodexCapabilityTier = "verified" | "compat" | "locked";
+
+/**
+ * 四档 → 三态的**唯一映射源**（#172/T9b）。
+ *
+ * 为什么要有这一层：四档是协议内的细分（`read_only` 与 `compat_only` 对用户没有
+ * 区别——都是「这个 build 我们没有完整证据」），三态才是用户能据此决策的口径。
+ * **徽标渲染与测试都只引用本函数**，禁止在别处各写一份对照表（两份对照表必然漂移，
+ * 而漂移出来的档位文案会直接撒谎）。
+ */
+export function codexCapabilityTier(availability: ControlAvailability): CodexCapabilityTier {
+  switch (availability) {
+    case "controllable":
+    case "send_only":
+      return "verified";
+    case "read_only":
+    case "compat_only":
+      return "compat";
+    case "unavailable":
+      return "locked";
+    default:
+      // 词表外取值（后端漂移）不猜「已验证」——落到最保守档（不宣称任何能力）
+      return "locked";
+  }
+}
+
+/** 探测只读事实的状态档（#172/T9a 后端下发；小写形态与 serde 对齐）。 */
+export type ProbeStatusState = "idle" | "probing" | "probed" | "inconclusive" | "failed";
+
+/**
+ * 探测只读事实（#172/T9a）：这台 build 的**只读**探测到哪一步了。
+ *
+ * 语义（在飞 / 账本结论 / 无记录 / 取不到）：
+ *  - `probing`：探测在飞（服务端单飞器有在飞任务）；
+ *  - `probed` / `inconclusive` / `failed`：账本 `state` 行的结论；
+ *  - `idle` + `desktop_build_unverified`：该 build 没有任何探测记录；
+ *  - `idle` + 无码：取不到（**不猜**）。
+ *
+ * 它是**只读事实**：不携带任何写语义，也不得由前端推断出「能不能操控」。
+ */
+export interface ProbeStatus {
+  state: ProbeStatusState;
+  /** 最后一次探测到哪一级（P0..P3）；无记录 → null。 */
+  stage: "P0" | "P1" | "P2" | "P3" | null;
+  /** 机器码（snake_case）；无 → null。 */
+  reasonCode: string | null;
+}
+
+/** 探测级次取值域（P0..P3；脏数据不进）。 */
+const PROBE_STAGES = new Set(["P0", "P1", "P2", "P3"]);
+
+/** 探测状态取值域（与后端 serde 形态逐字对齐）。 */
+const PROBE_STATES = new Set<ProbeStatusState>([
+  "idle",
+  "probing",
+  "probed",
+  "inconclusive",
+  "failed",
+]);
+
+/**
+ * 探测 reasonCode → 顶层 `errors` 段的 i18n 键（词表外 → null = **不猜**）。
+ *
+ * 动态码（`probe_failed:P2`）按**前缀**取基线码的键——`P2` 这样的 stage 不另设文案，
+ * 由调用方把 stage 附在基线文案后面（见 `probeReasonStage`）。
+ */
+const PROBE_REASON_ERROR_KEYS: Record<string, string> = {
+  desktop_build_unverified: "errors.desktopBuildUnverified",
+  probe_failed: "errors.probeFailed",
+  protocol_drift_suspected: "errors.protocolDriftSuspected",
+  probe_inconclusive: "errors.probeInconclusive",
+};
+
+/** 探测 reasonCode → `errors` 段 i18n 键；词表外（含未知动态码）→ null。 */
+export function probeReasonErrorKey(reasonCode: string | null | undefined): string | null {
+  if (typeof reasonCode !== "string") return null;
+  const base = reasonCode.split(":")[0].trim();
+  if (base.length === 0) return null;
+  return PROBE_REASON_ERROR_KEYS[base] ?? null;
+}
+
+/** 动态码里的 stage（`probe_failed:P2` → `P2`）；没有合法 stage → null。 */
+export function probeReasonStage(reasonCode: string | null | undefined): string | null {
+  if (typeof reasonCode !== "string") return null;
+  const parts = reasonCode.trim().split(":");
+  if (parts.length < 2) return null;
+  const tail = parts[parts.length - 1].trim();
+  return PROBE_STAGES.has(tail) ? tail : null;
+}
+
+/**
+ * 探测事实的形状守卫（纵深防御，与 `asThreadProjection` 同款纪律）。
+ *
+ * 老后端**不下发**该字段 → `undefined`（按「无探测信息」处理，界面回到旧路径）；
+ * 下发了但形状脏（状态枚举外 / stage 非法）→ 归一成安全值：状态非法整个丢弃
+ * （拿不到就不猜），stage 非法降为 `null`。**任何情况下都不会让 undefined 崩**。
+ */
+export function asProbeStatus(v: unknown): ProbeStatus | undefined {
+  if (v === null || typeof v !== "object") return undefined;
+  const raw = v as { state?: unknown; stage?: unknown; reasonCode?: unknown };
+  if (typeof raw.state !== "string" || !PROBE_STATES.has(raw.state as ProbeStatusState)) {
+    return undefined;
+  }
+  const stage =
+    typeof raw.stage === "string" && PROBE_STAGES.has(raw.stage)
+      ? (raw.stage as ProbeStatus["stage"])
+      : null;
+  const reasonCode =
+    typeof raw.reasonCode === "string" && raw.reasonCode.length > 0 ? raw.reasonCode : null;
+  return { state: raw.state as ProbeStatusState, stage, reasonCode };
+}
+
 /** 待处理交互类别。未知 method → unsupported（actionable=false）。 */
 export type PendingKind =
   | "command_approval"
@@ -134,6 +251,9 @@ export interface ThreadProjection {
   messages: ProjectedMessage[];
   truncated: boolean;
   pending: PendingView[];
+  /** #172/T9a：探测只读事实。**老后端不下发** → undefined（界面按「无探测信息」
+   *  走旧路径，绝不因缺字段崩）。 */
+  probeStatus?: ProbeStatus;
 }
 
 // ==== 端点路径（唯一来源：实现与测试 stub 都引用它）====
@@ -186,7 +306,10 @@ function asThreadProjection(v: unknown): ThreadProjection {
   ) {
     throw new ApiError(200, "codex/thread: malformed projection payload");
   }
-  return p;
+  // 探测事实（#172/T9a）：老后端不下发 → undefined；下发但形状脏 → 归一。
+  // 归一放在守卫之后：投影的**主干**字段缺失仍然按残缺载荷报错（不拿半截 DTO
+  // 渲染界面），而探测事实是**附加**只读字段，脏值只降级不致命。
+  return { ...p, probeStatus: asProbeStatus((p as { probeStatus?: unknown }).probeStatus) };
 }
 
 /** 拉取 Thread 投影（useCodexThread 的轮询/refresh 通道）。

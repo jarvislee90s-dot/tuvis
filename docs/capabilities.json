@@ -1,6 +1,6 @@
 {
   "$comment": "Tuvis 多终端能力矩阵单一数据源。README「多终端能力矩阵（总表）」的结构化版本，两处随发版同步更新；tuvis-website 官网经 api.github.com 拉取本文件渲染兼容矩阵。",
-  "updated": "2026-10-20",
+  "updated": "2026-10-22",
   "legend": {
     "yes": "✅ 支持",
     "partial": "◐ 部分",
@@ -235,8 +235,8 @@
             "dsh": "no",
             "openclaw": "no"
           },
-          "note": "实验性；仅 Windows 26.1013.4894.0 / macOS 26.1013.40934 按 build 解锁；permissions 关闭；生成图入会话产物",
-          "noteEn": "Experimental; only Windows 26.1013.4894.0 / macOS 26.1013.40934 per exact build; permissions off; generated images are session artifacts"
+          "note": "实验性；仅 Windows 26.1013.4894.0 / macOS 26.1013.40934 按 build 解锁；permissions 关闭；生成图入会话产物。三态徽标：已验证（该 build 有真机证据）/ 兼容探测（实验：未知 build 先做只读探测，服务端 15 秒硬上限，探测在飞时只显示「探测中」骨架、不提前下「未解锁」定论；兼容发送需在设置页显式开启「兼容发送（实验）」）/ 未解锁。未知 build 的兼容路径为实验能力。证据等级：命令审批已有真机证据（4894 的 accept/decline 闭环 + 6573 的 pending 形状）；文件审批目前只有官方方法表/调用点证据，端到端尚未真机闭环",
+          "noteEn": "Experimental; only Windows 26.1013.4894.0 / macOS 26.1013.40934 per exact build; permissions off; generated images are session artifacts. Three-state badge: verified (real-machine evidence for that build) / compatibility probe (experimental: an unknown build goes through a read-only probe capped at 15 seconds server-side; while it is running the UI only shows a \"probing\" skeleton and never concludes \"not unlocked\" up front; compatibility sending must be enabled explicitly via the \"Compatibility sending (experimental)\" switch in settings) / not unlocked. The unknown-build compatibility path is experimental. Evidence level: command approval has real-machine evidence (4894 accept/decline closed loop + 6573 pending shape); file approval currently has only official method-table / call-site evidence and is not yet closed end-to-end on real hardware"
         }
       ]
     }

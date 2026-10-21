@@ -1928,6 +1928,18 @@
         "compat_only": "仅可使用兼容模式",
         "unavailable": "当前不可控制"
       },
+      "tier": {
+        "verified": "已验证",
+        "compat": "兼容探测（实验）",
+        "locked": "未解锁"
+      },
+      "probe": {
+        "probing": "正在探测该桌面端版本的兼容性…",
+        "cancelWait": "取消等待",
+        "waitCancelled": "已取消等待（服务端探测将在 15 秒内自行结束）",
+        "reasonUnknown": "探测未通过，原因未知；请到桌面端查看",
+        "stage": "（探测阶段 {{stage}}）"
+      },
       "staleBanner": "桌面端连接中断，已保留最后视图，暂时不能远程操作",
       "pending": {
         "titleCommand": "命令执行请求",
