@@ -3634,13 +3634,13 @@ async fn probe_single_flight_emits_one_protocol_run() {
 
 use multi_agents_manager_lib::database::dao::codex_ipc_probe::ProbeState;
 use multi_agents_manager_lib::services::codex_desktop_ipc::probe::{
-    ProbeLedger, ProbeLedgerEntry, CAP_STATE,
+    ProbeLedger, ProbeLedgerEntry, CAP_SCHEMA, CAP_STATE,
 };
 use multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile;
 use std::sync::Arc;
 
-/// 内存账本行：(state, next_retry_at)。
-type LedgerRow = (ProbeState, Option<i64>);
+/// 内存账本行：(state, next_retry_at, error_code)。
+type LedgerRow = (ProbeState, Option<i64>, Option<String>);
 type LedgerKey = (String, String);
 
 /// 内存账本（测试用）：记录读写次数，方便断言「零帧复用」「未探测」。
@@ -3661,7 +3661,7 @@ impl MemoryLedger {
     ) {
         self.rows.lock().unwrap().insert(
             (probe_key.to_string(), capability.to_string()),
-            (state, next_retry_at),
+            (state, next_retry_at, None),
         );
     }
     fn gets(&self) -> usize {
@@ -3670,12 +3670,12 @@ impl MemoryLedger {
     fn records(&self) -> usize {
         self.records.load(std::sync::atomic::Ordering::SeqCst)
     }
-    fn row(&self, probe_key: &str, capability: &str) -> Option<(ProbeState, Option<i64>)> {
+    fn row(&self, probe_key: &str, capability: &str) -> Option<LedgerRow> {
         self.rows
             .lock()
             .unwrap()
             .get(&(probe_key.to_string(), capability.to_string()))
-            .copied()
+            .cloned()
     }
 }
 
@@ -3683,7 +3683,7 @@ impl ProbeLedger for MemoryLedger {
     fn get(&self, probe_key: &str, capability: &str) -> Option<ProbeLedgerEntry> {
         self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.row(probe_key, capability)
-            .map(|(state, next_retry_at)| ProbeLedgerEntry {
+            .map(|(state, next_retry_at, _)| ProbeLedgerEntry {
                 state,
                 next_retry_at,
             })
@@ -3699,7 +3699,11 @@ impl ProbeLedger for MemoryLedger {
         });
         self.rows.lock().unwrap().insert(
             (probe_key.to_string(), capability.to_string()),
-            (outcome.as_state(), next_retry_at),
+            (
+                outcome.as_state(),
+                next_retry_at,
+                outcome.error_code().map(str::to_string),
+            ),
         );
     }
 }
@@ -3952,4 +3956,106 @@ async fn unknown_build_probe_failure_does_not_fake_state() {
         "退避窗口内不得再发探测帧"
     );
     adapter.shutdown().await;
+}
+
+// ============================================================
+// #172/T7-R4：schema 探针结论落进探测账本（capability = "schema"）
+// ============================================================
+
+/// schema 探针取证成功 → 账本 `schema` 行 = `probed`，且审批策略切到 schema 档。
+///
+/// 用例**注入**探针结论（测试缝）：绝不 spawn 本机 `codex.exe`
+/// （真跑会执行 `app-server generate-json-schema`，不受控）。
+#[tokio::test]
+async fn schema_evidence_is_recorded_in_ledger() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::probe::schema_probe::{
+        SchemaEvidence, SchemaProbeOutcome,
+    };
+    use multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind;
+
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(FailingConnector::new()),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.set_schema_probe_override(Some(SchemaProbeOutcome::Known(SchemaEvidence {
+        fingerprint: "fp-fixture".into(),
+        command_decisions: vec![
+            "accept".into(),
+            "acceptForSession".into(),
+            "decline".into(),
+            "cancel".into(),
+        ],
+        file_decisions: vec!["accept".into(), "cancel".into()],
+    })));
+    assert!(
+        adapter.approval_policy().is_empty(),
+        "取证前：未知 build 不开放审批决策"
+    );
+
+    adapter.ensure_schema_evidence().await;
+
+    let row = ledger
+        .row(&expected_probe_key("macos", "26.9999.0"), CAP_SCHEMA)
+        .expect("schema 结论必须落账（capability = \"schema\"）");
+    assert_eq!(row.0, ProbeState::Probed, "取到 decision 枚举 = probed");
+    assert_eq!(row.2, None, "成功没有错误码");
+    assert_eq!(ledger.records(), 1, "只落一行（state 行不在本次范围）");
+
+    // 取证后：审批策略切到 schema 档（accept + cancel；非空）
+    let policy = adapter.approval_policy();
+    assert!(!policy.is_empty(), "schema 已取证 → 审批策略非空");
+    assert_eq!(
+        policy.for_kind(PendingKind::CommandApproval),
+        ["accept", "cancel"],
+        "schema 档只开 accept + cancel"
+    );
+    assert_eq!(
+        policy.for_kind(PendingKind::FileChangeApproval),
+        ["accept", "cancel"]
+    );
+
+    // 幂等：已有证据 → 不再探、不再记账
+    adapter.ensure_schema_evidence().await;
+    assert_eq!(ledger.records(), 1, "幂等：不得重复记账");
+}
+
+/// schema 探针失败（`Unknown`）→ 账本 `schema` 行 = `inconclusive`（带错误码），
+/// 且**审批保持关闭**（未取证不开放）。
+#[tokio::test]
+async fn schema_probe_failure_is_recorded_as_inconclusive() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::probe::schema_probe::SchemaProbeOutcome;
+
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(FailingConnector::new()),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.set_schema_probe_override(Some(SchemaProbeOutcome::Unknown {
+        error_code: "cli_not_found".into(),
+    }));
+
+    adapter.ensure_schema_evidence().await;
+
+    let row = ledger
+        .row(&expected_probe_key("macos", "26.9999.0"), CAP_SCHEMA)
+        .expect("失败也必须如实落账");
+    assert_eq!(
+        row.0,
+        ProbeState::Inconclusive,
+        "取不到 schema = 没有证据（不是 failed：不是协议被证伪）"
+    );
+    assert_eq!(
+        row.2.as_deref(),
+        Some("cli_not_found"),
+        "错误码必须带进账本（供人工排查）"
+    );
+    assert!(row.1.is_some(), "inconclusive 必须带退避窗口");
+    assert_eq!(ledger.records(), 1);
+    assert!(
+        adapter.approval_policy().is_empty(),
+        "未取证不得开放审批决策（卡片走「到桌面处理」）"
+    );
 }

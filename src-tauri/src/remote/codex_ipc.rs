@@ -243,27 +243,9 @@ impl CodexControlHub {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let adapter_for_schema = adapter.clone();
                 handle.spawn(async move {
-                    match crate::services::codex_desktop_ipc::probe::schema_probe::probe_schema()
-                        .await
-                    {
-                        crate::services::codex_desktop_ipc::probe::schema_probe::SchemaProbeOutcome::Known(
-                            evidence,
-                        ) => {
-                            log::info!(
-                                "codex-ipc schema: fingerprint={} command={:?} file={:?}",
-                                evidence.fingerprint,
-                                evidence.command_decisions,
-                                evidence.file_decisions
-                            );
-                            adapter_for_schema.set_schema_evidence(Some(evidence));
-                        }
-                        crate::services::codex_desktop_ipc::probe::schema_probe::SchemaProbeOutcome::Unknown {
-                            error_code,
-                        } => {
-                            // 拿不到就保持关闭（审批卡走「到桌面处理」），不重试、不猜
-                            log::info!("codex-ipc schema: 未取证（{error_code}），审批保持关闭");
-                        }
-                    }
+                    // #172/T7-R4：取证**与落账本**（`capability = "schema"`）都在
+                    // adapter 里——生产层只负责「什么时候探一次」。
+                    adapter_for_schema.ensure_schema_evidence().await;
                 });
             }
         }

@@ -15,8 +15,16 @@ pub mod schema_probe;
 
 use crate::database::dao::codex_ipc_probe::ProbeState;
 
-/// 账本 `capability` 列的能力词（本阶段只做 `state`；send/command 等随后续任务）。
+/// 账本 `capability` 列的能力词（读链探测做 `state`；send/command 等随后续任务）。
 pub const CAP_STATE: &str = "state";
+
+/// 账本 `capability` 列的 **schema 探针**能力词（#172/T7-R4）。
+///
+/// 与 `state` 并列的一行：同一 `(probe_key, capability)` 主键下，
+/// `state` 记「读链能不能用」，`schema` 记「官方 schema 能不能给出审批决策词」。
+/// 结论词沿用账本既有三态：`probed`（取到 decision 枚举）/ `inconclusive`
+/// （取不到，带错误码）——**不引入新状态词**（`capability` 是字符串列，无需改表结构）。
+pub const CAP_SCHEMA: &str = "schema";
 
 /// 探测账本接口（#172）：由 remote 层用 `DeviceStore` 实现注入 adapter；测试可注入
 /// 内存实现。语义 = `codex_ipc_probe` 表的读写（见 `database::dao::codex_ipc_probe`）。
