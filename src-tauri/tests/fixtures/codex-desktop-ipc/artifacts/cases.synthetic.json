@@ -1,0 +1,118 @@
+{
+  "_evidence": "SYNTHETIC regression inputs; not captured IPC; field names derive from macOS 26.1013.40934 static mapping and existing canonical envelope fixtures. Status and change kind values below are invented test inputs, not observed enum values.",
+  "cases": [
+    {
+      "id": "user-only-image",
+      "turn": {
+        "turnId": "synthetic-turn-image",
+        "params": null,
+        "items": [
+          {
+            "type": "userMessage",
+            "id": "synthetic-item-image",
+            "content": [
+              { "type": "localImage", "path": "/project/fixtures/image.png" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "user-only-document",
+      "turn": {
+        "turnId": "synthetic-turn-document",
+        "params": null,
+        "items": [
+          {
+            "type": "userMessage",
+            "id": "synthetic-item-document",
+            "content": [
+              { "type": "mention", "name": "report.pdf", "path": "/project/fixtures/report.pdf" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "opening-empty-text-with-attachments",
+      "turn": {
+        "turnId": "synthetic-turn-opening",
+        "params": {
+          "clientUserMessageId": "synthetic-client-opening",
+          "input": [
+            { "type": "text", "text": "" },
+            { "type": "localImage", "path": "figures/draft.png" },
+            { "type": "mention", "name": "notes.md", "path": "notes.md" }
+          ]
+        },
+        "items": []
+      }
+    },
+    {
+      "id": "missing-path-and-image-references",
+      "turn": {
+        "turnId": "synthetic-turn-unavailable",
+        "params": null,
+        "items": [
+          {
+            "type": "userMessage",
+            "id": "synthetic-item-unavailable",
+            "content": [
+              { "type": "localImage", "path": null },
+              { "type": "mention", "name": "missing.pdf" },
+              { "type": "image", "fileId": "synthetic-file-id" },
+              { "type": "image", "url": "data:image/png;synthetic-placeholder" },
+              { "type": "image", "url": "https://example.invalid/figure.png" }
+            ]
+          },
+          { "type": "imageGeneration", "id": "synthetic-generation-missing", "savedPath": null, "status": "synthetic-pending" },
+          { "type": "imageView", "id": "synthetic-view-missing", "path": null }
+        ]
+      }
+    },
+    {
+      "id": "generated-and-viewed-image",
+      "turn": {
+        "turnId": "synthetic-turn-generated",
+        "params": null,
+        "items": [
+          {
+            "type": "imageGeneration",
+            "id": "synthetic-generation",
+            "savedPath": "/project/fixtures/generated.png",
+            "revisedPrompt": "Synthetic image description",
+            "status": "synthetic-complete"
+          },
+          { "type": "imageView", "id": "synthetic-view", "path": "figures/draft.png" }
+        ]
+      }
+    },
+    {
+      "id": "file-changes-with-unverified-status-values",
+      "turn": {
+        "turnId": "synthetic-turn-changes",
+        "params": null,
+        "items": [
+          {
+            "type": "fileChange",
+            "id": "synthetic-change-in-progress",
+            "status": "synthetic-in-progress",
+            "changes": [
+              { "path": "src/new.ts", "kind": "synthetic-add" },
+              { "path": "src/existing.ts", "kind": "synthetic-modify" }
+            ]
+          },
+          {
+            "type": "fileChange",
+            "id": "synthetic-change-failed",
+            "status": "synthetic-failed",
+            "changes": [
+              { "path": "src/removed.ts", "kind": "synthetic-delete" },
+              { "path": null, "kind": "synthetic-modify" }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

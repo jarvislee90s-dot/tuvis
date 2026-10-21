@@ -22,8 +22,9 @@ use super::owners::{
 use super::pending::parse_request_key;
 use super::profile::ProtocolProfile;
 use super::types::{
-    CapabilitySet, ContentState, ControlAvailability, Delivery, OwnerLease, PendingAction,
-    PendingKind, PendingView, ProtocolError, ThreadKey, ThreadProjection,
+    CapabilitySet, ContentState, ControlAvailability, Delivery, MessagesPage, MessagesPageStatus,
+    OwnerLease, PendingAction, PendingKind, PendingView, ProtocolError, ThreadKey,
+    ThreadProjection,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -497,9 +498,38 @@ impl DesktopIpcAdapter {
             content_state: ContentState::Loading,
             messages: Vec::new(),
             truncated: false,
+            history_token: String::new(),
             pending: Vec::new(),
             owner_epoch: 0,
             owner_generation: 0,
+        }
+    }
+
+    /// 该 Thread 是否已有镜像（分页端点前置：无镜像才走有界 ensure/hydrate）。
+    pub async fn has_mirror(&self, key: &ThreadKey) -> bool {
+        self.inner.mirrors.lock().await.contains_key(key)
+    }
+
+    /// 同代只读历史页：取镜像锁 → **同步**分页 → 释放；不跨 await 持锁、不重扫
+    /// rollout/磁盘。无镜像 → `unavailable/mirror_unavailable`（不是 `end`）。
+    pub async fn messages_page(
+        &self,
+        key: &ThreadKey,
+        cursor: Option<&str>,
+        history_token: &str,
+        limit: usize,
+    ) -> MessagesPage {
+        let mirrors = self.inner.mirrors.lock().await;
+        match mirrors.get(key) {
+            Some(mirror) => mirror.messages_page(cursor, history_token, limit),
+            None => MessagesPage {
+                messages: Vec::new(),
+                history_token: String::new(),
+                revision: None,
+                next_before: None,
+                status: MessagesPageStatus::Unavailable,
+                reason_code: Some("mirror_unavailable".into()),
+            },
         }
     }
 

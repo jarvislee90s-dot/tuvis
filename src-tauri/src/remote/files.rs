@@ -23,6 +23,7 @@
 // 测试约束（宪法级）：一律 tempdir，绝不触真实 ~/.zcode ~/.claude 等数据目录；
 // Windows 语义分支以 `windows: bool` 参数注入，darwin 上也可全分支测试。
 
+use crate::file_identity::{file_identity_key, normalize_key};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -709,6 +710,9 @@ impl FileOrigin {
 pub struct FileEntry {
     /// 文件路径：**最后一次出现**的原始形态（归一化只用于去重比较，用户裁决 7）
     pub path: String,
+    /// 与附件共用的路径身份键；旧载荷可缺失，HTTP 文件池按预览 cwd 填充。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_key: Option<String>,
     /// 最后出现条目的 seq（finalize 重排后的数组内序，稳定可排序）
     pub last_seq: i64,
     /// 最后出现条目的时间戳（原生存储无时间戳则为 None，前端显示 `—`）
@@ -759,58 +763,6 @@ fn is_read_only_tool(name: Option<&str>) -> bool {
         }
         None => false,
     }
-}
-
-/// 归一化比较键（去重用，用户裁决 7）：`\`→`/`；Windows 语义再 to_lowercase。
-/// 平台语义以参数注入便于跨平台测试（path_within_semantics 先例），生产 cfg!(windows)
-fn normalize_key(path: &str, windows: bool) -> String {
-    let unified = path.replace('\\', "/");
-    if windows {
-        unified.to_lowercase()
-    } else {
-        unified
-    }
-}
-
-/// 会话产物候选的去重键（2026-10-13 用户裁决）：cwd 可得且候选是**相对路径**时，
-/// 先按 cwd 绝对化再做**词法**规范化（`Path::components` 丢弃 `.` 段、合并重复
-/// 分隔符；**不触盘**，故仍是纯函数）——否则「工具参数写绝对路径 + 正文写相对
-/// 链接」会让同一物理文件在面板里出两行（一行工具读取、一行会话产物）。cwd
-/// 不可得/为空则退回原文（保守：不猜，宁可多一行也不误合）。`..` 段不解析
-/// （词法规范化的保守边界）。展示路径不受影响（仍用正文原文）
-///
-/// 落地要点（2026-10-13 补齐，实测 std 后修正）：`components()` 只归一**非行首**
-/// 的 `.` 段——`./out/x.md` 的组件是 `[CurDir, out, x.md]`，直接 `collect()` 会还原
-/// 成 `./out/x.md`（`Path::new(".").components()` 也非空，而是 `[CurDir]`），行首
-/// `.` 必须**显式滤掉**才算「`.` 段丢弃」。滤 CurDir 不会误合两个不同文件：无论
-/// cwd 如何，相对形态 `./x` 与 `x` 恒指同一物理文件。绝对路径候选同样过词法
-/// 规范化（工具侧 `C:/w/./x.md` 一并归到 `c:/w/x.md`）
-///
-/// 因果澄清（2026-10-13 最终评审批次，实测修正）：**内部** `.` 段与重复分隔符
-/// 本就由 `std::path::Components` 自行归一（`join` 之后前导 `.` 亦成内部段）；
-/// 本函数的显式 CurDir 过滤只在**键不 join** 时（cwd 不可得，键取相对原文）才
-/// 额外改变结果——即额外覆盖**行首** `.`（`./x` ≡ `x`）。故它不是「`.` 段归一」
-/// 的决定性修复，决定性归 std；本过滤是 cwd 不可得形态下的键稳定性补丁
-fn artifact_dedup_key(path: &str, cwd: Option<&str>, windows: bool) -> String {
-    let p = Path::new(path.trim());
-    let joined: PathBuf = match cwd {
-        Some(c) if !c.trim().is_empty() && !p.is_absolute() => Path::new(c.trim()).join(p),
-        _ => p.to_path_buf(),
-    };
-    let lexically_normal: PathBuf = joined
-        .components()
-        .filter(|c| !matches!(c, std::path::Component::CurDir))
-        .collect();
-    let normalized = lexically_normal.to_string_lossy();
-    if normalized.is_empty() {
-        // 退化输入（空串 / 只由 `.` 段构成，如 `.`、`./`）：词法规范化后无任何组件。
-        // 若统一取空键，彼此不同的原文形态会塌缩成同一行（误合）→ 退回原文归一化键，
-        // 与「cwd 不可得退回原文」同一保守口径。生产链路候选必经 `is_path_candidate`
-        // + `artifact_ext_allowed`（要求末段有白名单扩展名），这类输入到不了这里，
-        // 本守卫是纵深防御（不触盘、不改其它语义）
-        return normalize_key(path.trim(), windows);
-    }
-    normalize_key(&normalized, windows)
 }
 
 /// 从统一消息流提取文件条目（纯函数，M3+ 富化 + M5 B2 来源判定；来源值域四池）：
@@ -914,6 +866,7 @@ impl EntryMerger {
                 self.index.insert(key, self.out.len());
                 self.out.push(FileEntry {
                     path: path.to_string(),
+                    file_key: None,
                     last_seq: seq,
                     last_ts: ts,
                     hits: 1,
@@ -938,7 +891,7 @@ impl EntryMerger {
     /// 未命中才以 SessionArtifact 落池。**本趟自建的产物条目不受短路影响**：同一
     /// 路径在正文里重复出现时累加 hits、取**最后一次**出现的 seq/ts/形态（2026-10-13
     /// 用户裁决；与 FileEntry 字段契约一致）——故短路集合必须在循环前**一次性快照**，
-    /// 而不是边合并边查 index。去重键按会话 cwd 绝对化（见 [`artifact_dedup_key`]），
+    /// 而不是边合并边查 index。去重键按会话 cwd 绝对化（见 [`file_identity_key`]），
     /// 且短路集合与候选键**同口径**（见下），故「工具写绝对/相对路径 + 正文写相对
     /// 链接」都只出一行；展示路径仍是正文原文
     ///
@@ -951,14 +904,14 @@ impl EntryMerger {
     ) {
         // 短路集合必须在循环前一次性快照（本趟自建条目不受短路影响），且**两边同口径**：
         // index 里的原始键（三池条目按 normalize_key 现算）∪ 既有条目展示路径经
-        // artifact_dedup_key 重算的键——否则「工具侧相对路径 + 正文相对链接」这类
+        // file_identity_key 重算的键——否则「工具侧相对路径 + 正文相对链接」这类
         // 同形形态会因一边绝对化、一边没绝对化而匹配不上，同一文件出两行
         let mut preexisting: HashSet<String> = self.index.keys().cloned().collect();
         for e in &self.out {
-            preexisting.insert(artifact_dedup_key(&e.path, cwd, self.windows));
+            preexisting.insert(file_identity_key(&e.path, cwd, self.windows));
         }
         for (path, seq, ts) in candidates {
-            let key = artifact_dedup_key(path, cwd, self.windows);
+            let key = file_identity_key(path, cwd, self.windows);
             if preexisting.contains(&key) {
                 continue;
             }
@@ -2139,6 +2092,7 @@ mod tests {
     fn file_entry_serializes_modified_flag() {
         let e = FileEntry {
             path: "/p/a.rs".into(),
+            file_key: None,
             last_seq: 1,
             last_ts: None,
             hits: 1,
@@ -2210,6 +2164,30 @@ mod tests {
         assert_eq!(normalize_key("", true), "");
     }
 
+    /// 共享身份按目录和完整文件名区分；缺失文件同样只做词法处理。
+    #[test]
+    fn shared_file_identity_keeps_distinct_files_apart_without_disk_lookup() {
+        let key = crate::file_identity::file_identity_key;
+        let cwd = if cfg!(windows) {
+            "C:/never-exists/project"
+        } else {
+            "/never-exists/project"
+        };
+        let expected = format!("{cwd}/out/report.md");
+        assert_eq!(key("./out/report.md", Some(cwd), false), expected);
+        assert_eq!(key(&expected, Some("/other"), false), expected);
+        assert_ne!(
+            key("out/report.md", Some(cwd), false),
+            key("elsewhere/report.md", Some(cwd), false)
+        );
+        assert_ne!(
+            key("out/report.md", Some(cwd), false),
+            key("out/other.md", Some(cwd), false)
+        );
+        assert_eq!(key("./out/report.md", None, false), "out/report.md");
+        assert_ne!(key("out/../out/report.md", Some(cwd), false), expected);
+    }
+
     /// M3+ lastTs 可为 None（原生存储无时间戳条目）——不得 panic
     #[test]
     fn extract_entries_tolerate_missing_timestamp() {
@@ -2225,6 +2203,7 @@ mod tests {
     fn file_entry_serializes_camel_case() {
         let e = FileEntry {
             path: "/p/a.rs".into(),
+            file_key: None,
             last_seq: 7,
             last_ts: Some(700),
             hits: 2,
@@ -2649,9 +2628,9 @@ mod tests {
     /// 绝对路径必须是同一个键；`..` 段不解析（保守边界，不触盘）。
     /// 注：std 的 `components()` 只归一**非行首**的 `.` 段（`./a/b` 比 `a/b` 多一个
     /// CurDir 组件，`Path::new(".").components()` 也非空）——行首 CurDir 需显式滤掉，
-    /// 见 `artifact_dedup_key` 实现注释；本用例锁死该口径
+    /// 见 `file_identity_key` 实现注释；本用例锁死该口径
     #[test]
-    fn artifact_dedup_key_drops_dot_segments_but_keeps_parent_dir() {
+    fn file_identity_key_drops_dot_segments_but_keeps_parent_dir() {
         let cwd = if cfg!(windows) { "C:/w" } else { "/w" };
         let abs = if cfg!(windows) {
             "C:/w/out/report.md"
@@ -2659,33 +2638,33 @@ mod tests {
             "/w/out/report.md"
         };
         assert_eq!(
-            artifact_dedup_key("./out/report.md", Some(cwd), false),
-            artifact_dedup_key(abs, Some(cwd), false),
+            file_identity_key("./out/report.md", Some(cwd), false),
+            file_identity_key(abs, Some(cwd), false),
             "`./` 前缀必须归一（正文常见形态，与工具侧绝对路径同键）"
         );
         assert_eq!(
-            artifact_dedup_key("out/report.md", Some(cwd), false),
-            artifact_dedup_key("./out/report.md", Some(cwd), false),
+            file_identity_key("out/report.md", Some(cwd), false),
+            file_identity_key("./out/report.md", Some(cwd), false),
             "有 cwd 时 `./x` 与 `x` 同键"
         );
         assert_eq!(
-            artifact_dedup_key("out/report.md", None, false),
+            file_identity_key("out/report.md", None, false),
             "out/report.md",
             "cwd 不可得 → 退回原文归一化键（不猜）"
         );
         assert_eq!(
-            artifact_dedup_key("./out/report.md", None, false),
-            artifact_dedup_key("out/report.md", None, false),
+            file_identity_key("./out/report.md", None, false),
+            file_identity_key("out/report.md", None, false),
             "无 cwd 时 `./` 前缀同样归一（行首 CurDir 显式丢弃）"
         );
         assert_eq!(
-            artifact_dedup_key("./out/./report.md", Some(cwd), false),
-            artifact_dedup_key("out//report.md", Some(cwd), false),
+            file_identity_key("./out/./report.md", Some(cwd), false),
+            file_identity_key("out//report.md", Some(cwd), false),
             "中间 `.` 段与重复分隔符一并归一"
         );
         assert_ne!(
-            artifact_dedup_key("out/../out/report.md", Some(cwd), false),
-            artifact_dedup_key("out/report.md", Some(cwd), false),
+            file_identity_key("out/../out/report.md", Some(cwd), false),
+            file_identity_key("out/report.md", Some(cwd), false),
             "`..` 段不解析（词法规范化保守边界，不猜）"
         );
         // Windows 语义（生产 cfg!(windows)=true）：小写归一 + 分隔符归一。
@@ -2694,7 +2673,7 @@ mod tests {
         //（与追记「MSYS 风格路径按相对解析」的残留边界同源，CI Linux 首跑抓获）
         if cfg!(windows) {
             assert_eq!(
-                artifact_dedup_key("C:/W/Out/Report.MD", Some("C:/w"), true),
+                file_identity_key("C:/W/Out/Report.MD", Some("C:/w"), true),
                 "c:/w/out/report.md",
                 "Windows 语义下大小写/分隔符/盘符风格归一"
             );
@@ -2703,18 +2682,18 @@ mod tests {
         // 原文键，不塌缩成同一个空键（生产候选过不了 `is_path_candidate` +
         // `artifact_ext_allowed`，到不了这里；此为纵深防御）
         assert_eq!(
-            artifact_dedup_key(".", None, false),
+            file_identity_key(".", None, false),
             ".",
             "退化输入 `.` 单点：退回原文键，不产出空键"
         );
         assert_eq!(
-            artifact_dedup_key("", None, false),
+            file_identity_key("", None, false),
             "",
             "空串退回原文键（空键仅此一态，不与 `.` 误合）"
         );
         assert_ne!(
-            artifact_dedup_key("", None, false),
-            artifact_dedup_key(".", None, false),
+            file_identity_key("", None, false),
+            file_identity_key(".", None, false),
             "两个不同的退化原文形态不得误合"
         );
     }
@@ -2750,6 +2729,7 @@ mod tests {
         };
         let mk = |path: &str, origin: FileOrigin| FileEntry {
             path: path.into(),
+            file_key: None,
             last_seq: 1,
             last_ts: None,
             hits: 1,

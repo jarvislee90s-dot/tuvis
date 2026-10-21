@@ -11,6 +11,7 @@
 //! 不提供认证。
 
 pub mod adapter;
+mod artifacts;
 pub mod codec;
 pub mod connection;
 pub mod history_view;
