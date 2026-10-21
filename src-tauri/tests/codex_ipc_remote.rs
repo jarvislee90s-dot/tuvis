@@ -1048,7 +1048,8 @@ fn fixture_state_only(sessions: Vec<Session>) -> Fixture {
 }
 
 /// #172 裁决（设计 §10.1）：桌面归属会话的 A 路写能力未取证 → **如实失败**
-/// `capability_unverified`，**不得静默改走 headless**。
+/// `capability_unverified`，**不得静默改走 headless**；`session-send-info` 必须同源
+/// 同码同文案（判据与位置都在 H3 分支之前）。
 ///
 /// 旧行为：H3 关闭 → 403 headless_disabled（把「能力未验证」误报成「无头未开」）；
 /// H3 打开 → 静默走无头通道（用户点发送，消息落到另一个会话）。新行为：两档 H3
@@ -1069,6 +1070,10 @@ async fn send_desktop_owned_without_send_refuses_instead_of_headless() {
         assert!(
             !f.state.codex_control.send_available(),
             "closed hub：写能力必须不可用"
+        );
+        assert!(
+            !f.state.codex_control.build_send_verified(),
+            "closed hub：build 无写能力证据"
         );
         let r = f
             .app
@@ -1102,6 +1107,35 @@ async fn send_desktop_owned_without_send_refuses_instead_of_headless() {
             audits.iter().any(|a| a.action == "codex_fallback"
                 && a.result.contains("refused:capability_unverified")),
             "H3={h3_on}：拒发必须留痕: {audits:?}"
+        );
+
+        // send-info 同源：同一码 + 同一句文案 + 输入区置灰
+        let r = f
+            .app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/session-send-info?session_id={THREAD}"),
+                Some(COOKIE),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "send-info 恒 200 载荷");
+        let info: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(
+            info["injectable"],
+            serde_json::json!(false),
+            "H3={h3_on}: {info}"
+        );
+        assert_eq!(
+            info["reasonCode"], "capability_unverified",
+            "两端口径必须一致（H3={h3_on}）: {info}"
+        );
+        assert_eq!(
+            info["reason"].as_str().unwrap_or(""),
+            reason,
+            "同一句原因文案（H3={h3_on}）"
         );
     }
 }
@@ -1139,10 +1173,13 @@ async fn send_state_only_build_refuses_as_capability_unverified() {
     );
 }
 
-/// #172 边界：headless-owned（codex CLI 形态）会话不经 hub 门——路由结论仍是
-/// `no_process`（不是 capability_unverified），证明新门只约束桌面归属会话。
+/// #172 边界：**codex CLI 形态**（`form=Cli`，终端归属）会话不进入桌面归属门——
+/// 路由结论仍是 `no_process`（不是 capability_unverified）。
+///
+/// **本用例不覆盖 App 形态**：App 形态的门见 `send_desktop_owned_*` 与
+/// `verified_build_link_down_*` 两组用例。
 #[tokio::test]
-async fn send_headless_owned_session_unaffected_by_hub_send_gate() {
+async fn send_cli_form_session_not_gated_by_desktop_hub() {
     let mut cli = codex_app_session(THREAD);
     cli.form = ProcessForm::Cli;
     cli.pid = 0; // 进程不在：路由走 no_process 早退（零注入）
@@ -1283,6 +1320,100 @@ async fn send_not_sent_hands_off_to_compat_when_h3_on() {
             .any(|a| a.action == "codex_fallback" && a.summary.contains("act-cmp-1")),
         "降级有可追踪审计行：{:?}",
         audits
+    );
+}
+
+/// #172 裁决 B 的对侧：**已验证 build 的瞬时断链不是「能力未取证」**——兜底照旧
+/// （H3 开 → 200 headless 封套），`send-info` 同口径（injectable:true，headless 通道），
+/// 不得报 capability_unverified。
+#[tokio::test]
+async fn verified_build_link_down_keeps_headless_route_for_send_and_info() {
+    let _path = IsolatedPath::lock_empty();
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.headless_enabled', 'true')",
+            [],
+        )
+        .unwrap();
+    });
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("断链消息", Some("act-ld-1"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    // 握手到 following 后断链：已验证 build 的 A 路 NotSent → 既有兜底契约（H3 开）
+    handshake(&mut peer, "owner-1").await;
+    let disc = peer.recv().await;
+    peer.send(&discovery_response(
+        disc["requestId"].as_str().unwrap(),
+        "owner-1",
+    ))
+    .await;
+    let _follow = peer.recv().await;
+    peer.close();
+    let r = tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("compat in time")
+        .unwrap();
+    assert_eq!(r.status(), 200, "已验证 build 断链：兜底契约不变");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["status"], "headless", "{v}");
+
+    // 再 ensure 一次（连接已死 → adapter 回落 closed profile）：
+    // 「当前写不可用」但「build 的写能力证据仍在」——正是本用例要钉住的双条件
+    let _ = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !f.state.codex_control.send_available(),
+        "断链：当前写能力不可用"
+    );
+    assert!(
+        f.state.codex_control.build_send_verified(),
+        "但 build 的写能力证据必须仍在（不能被链路状态冲掉）"
+    );
+
+    // send-info 同口径：H3 开 → 输入区可用（headless 通道），不是 capability_unverified
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/session-send-info?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let info: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(info["injectable"], serde_json::json!(true), "{info}");
+    assert_ne!(
+        info["reasonCode"], "capability_unverified",
+        "已验证 build 断链不得报能力未取证: {info}"
+    );
+    assert!(
+        info["channels"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|c| c == "headless_codex_queue")),
+        "与 send 的实发通道同源: {info}"
     );
 }
 
@@ -1455,6 +1586,9 @@ async fn send_info_h3_off_ipc_available_injectable_true() {
     );
 }
 
+/// #172：桌面归属会话且 build 无写能力证据 → `injectable:false` 且归因
+/// `capability_unverified`（与 session-send 的 403 同码；旧实现报 headless_disabled，
+/// 把「能力未验证」误报成「无头未开」）。
 #[tokio::test]
 async fn send_info_h3_off_ipc_unavailable_still_disabled() {
     let f = fixture_disabled(vec![codex_app_session(THREAD)]);
@@ -1471,7 +1605,7 @@ async fn send_info_h3_off_ipc_unavailable_still_disabled() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
     assert_eq!(v["injectable"], serde_json::json!(false));
-    assert_eq!(v["reasonCode"], "headless_disabled");
+    assert_eq!(v["reasonCode"], "capability_unverified", "{v}");
 }
 
 // ============================================================

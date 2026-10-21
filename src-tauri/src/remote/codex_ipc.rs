@@ -289,6 +289,16 @@ impl CodexControlHub {
         self.capable && self.adapter.capabilities().state
     }
 
+    /// #172：本机 Desktop build 是否**带写能力证据**（与「当前连接是否活着」解耦）。
+    ///
+    /// 兜底交接门与 `session-send-info` 的能力门都用它，**不用** `send_available()`：
+    /// 兜底只发生在 A 路没投递出去之后，此刻连接多半已断、adapter 的 profile 已回落
+    /// `closed()`——`send_available()` 对「已验证 build 瞬时断链」同样为 false。判据
+    /// 必须是 build 的证据，否则会把 PR #165 的既有兜底契约一并挡死。
+    pub fn build_send_verified(&self) -> bool {
+        self.capable && self.adapter.build_send_verified()
+    }
+
     /// R7.3：详情订阅引用 +1（SSE thread/events 建流前调用）。
     pub fn follow_ref_acquire(&self, key: &ThreadKey) {
         self.gate.acquire(key);
@@ -521,7 +531,7 @@ pub(crate) fn consume_fallback(st: &Arc<RemoteState>, outcome: RouterOutcome, au
     // #172 裁决：桌面归属会话只允许「发到 A 或诚实失败」——**这个 build 没有写能力
     // 证据**时不得静默改走无头通道（那会变成另一个会话）。本门在 H3 之前：H3 开着也
     // 不许降级；headless 只服务 headless-owned 会话。
-    if !build_send_verified(&st.codex_control) {
+    if !st.codex_control.build_send_verified() {
         let action_id = permit.action_id().to_string();
         let ctx = permit.context().clone();
         let receipt = not_sent_receipt(&action_id, ControlRoute::None, DESKTOP_SEND_UNVERIFIED);
@@ -937,16 +947,6 @@ pub(crate) const DESKTOP_SEND_UNVERIFIED_REASON: &str =
 /// 审计结果词（与 H3 拒发 `refused:headless_disabled` 同形，便于事后按码检索）。
 const REFUSED_SEND_UNVERIFIED: &str = "refused:capability_unverified";
 
-/// #172：**这个 build 是否带写能力证据**（桌面归属会话的兜底交接门）。
-///
-/// 为什么不用 `send_available()` 当判据：兜底只在 A 路没投递出去时发生，此刻连接多半
-/// 已断、adapter 的 profile 已回落 `closed()`——`send_available()` 对「已验证 build
-/// 瞬时断链」同样为 false，拿它当门会把 PR #165 的既有兜底契约一并挡死。判据必须是
-/// **build 的证据**（[`DesktopIpcAdapter::build_send_verified`]），与链路状态解耦。
-fn build_send_verified(hub: &CodexControlHub) -> bool {
-    hub.capable && hub.adapter.build_send_verified()
-}
-
 /// Codex 控制动作审计单点：`summary` = JSON
 /// `{actionId,threadId,requestKey?,envelopeId?,result}`。
 ///
@@ -1344,7 +1344,7 @@ pub(crate) async fn session_send_via_hub(
             // #172 裁决：桌面归属会话只允许「发到 A 或诚实失败」——**这个 build 没有
             // 写能力证据**时不得静默改走无头通道（那会变成另一个会话）。本门在 H3
             // 之前：H3 开着也不许降级；headless 只服务 headless-owned 会话。
-            if !build_send_verified(hub) {
+            if !hub.build_send_verified() {
                 let receipt = not_sent_receipt(
                     permit.action_id(),
                     ControlRoute::None,

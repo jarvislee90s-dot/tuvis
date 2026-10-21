@@ -1943,11 +1943,27 @@ pub async fn session_send_info(
         );
     };
     let tool = session.agent_type.tool_id().to_string();
+    // #172：**与 session-send 同源的能力门**（判据相同、位置相同——都在 H3 分支之前）。
+    // 桌面归属会话且本 build **没有写能力证据**（未知 build / 本进程还没解析到 build）：
+    // 输入区如实置灰 + 同一句原因文案。若这里放行到 H3/兼容分支，会出现
+    // 「send-info 说可发、真发却 403」的两端口径不一致。
+    if codex_app_form(&session)
+        && !st.codex_control.send_available()
+        && !st.codex_control.build_send_verified()
+    {
+        return json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "injectable": false,
+                "reasonCode": super::codex_ipc::DESKTOP_SEND_UNVERIFIED,
+                "reason": super::codex_ipc::DESKTOP_SEND_UNVERIFIED_REASON,
+            }),
+        );
+    }
     // H3：无头总开关关闭 → 无头绑定会话 `injectable:false` + **标因**（移动端输入区
     // 置灰 + 原因）。**Codex APP 先看 hub（Desktop IPC）**——A 可写时 `injectable:true`
-    // **不看 H3**（只有兼容分支受 H3）；hub 写能力不可用（disabled / build 未验证）
-    // 才落回兼容分支并受 H3。判据与 session-send 的 H3 门**同一函数**（#172 起只问
-    // `send_available`：输入区可用性只看「能不能发」，不再连坐只读能力）。
+    // **不看 H3**（只有兼容分支受 H3）；A 不可写但 build 有写能力证据（已验证 build
+    // 瞬时断链）→ 保持原兼容分支并受 H3。判据与 session-send 的 H3 门**同一函数**。
     let hub_route = codex_app_form(&session) && st.codex_control.send_available();
     if !hub_route {
         if let Some(reason) = headless_blocked(&st, &tool, session.form, session.pid) {
