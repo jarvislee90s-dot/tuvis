@@ -1502,6 +1502,53 @@ mod tests {
         fixture(&format!("observed/{name}"))
     }
 
+    /// 2026-10-21 真机（build 26.1016.6573.0）：**命令审批** pending 的真实形状——
+    /// `id` 是**整数**；`params` = kind/threadId/turnId/itemId/startedAtMs/environmentId/
+    /// reason/command/cwd/commandActions/proposedExecpolicyAmendment/availableDecisions。
+    ///
+    /// 两条纪律：① 决策词来自**策略**（证据档 accept/decline），不能拿
+    /// `availableDecisions` 当白名单——它没有 `decline` 字面量，但 `decision:"decline"`
+    /// 在 4894 真机被接受并生效；② `availableDecisions` 里的对象形态
+    /// （`acceptWithExecpolicyAmendment`）属执行策略修订（权限扩大），**永不自动发**。
+    #[test]
+    fn observed_pending_command_approval_projects_actionable() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(
+            &lease(),
+            &observed_change("windows-6573-pending-command.sanitized.json"),
+        )
+        .unwrap();
+        let mut evidence_caps = caps();
+        evidence_caps.command = true; // 证据档（shipped build）
+        let p = m.project(evidence_caps);
+        assert_eq!(p.pending.len(), 1, "命令审批 pending 必须投影出来");
+        let view = &p.pending[0];
+        assert_eq!(view.kind, PendingKind::CommandApproval);
+        assert!(view.actionable, "证据档下命令审批可远程决策");
+        assert_eq!(
+            view.allowed_decisions,
+            vec!["accept", "decline"],
+            "决策词来自策略，不是 availableDecisions（后者没有 decline）"
+        );
+        assert_eq!(
+            view.command.as_deref(),
+            Some("<synthetic command>"),
+            "命令正文按真机字段名取"
+        );
+        assert_eq!(view.cwd.as_deref(), Some("C:\\Temp\\probe-project"));
+        assert_eq!(view.reason.as_deref(), Some("<synthetic reason>"));
+        assert!(
+            view.request_key.starts_with("n:"),
+            "整数 id 走 n: 前缀：{}",
+            view.request_key
+        );
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(
+            !json.contains("availableDecisions") && !json.contains("proposedExecpolicyAmendment"),
+            "raw 参数不得进远端 DTO：{json}"
+        );
+    }
+
     /// 2026-10-21 真机（rev 146）：`requests[]` 里除了命令/权限/问答，还有**计划实现审批**
     /// `item/plan/requestImplementation`（`params` = `planContent`；`id` 是 **string**，
     /// 不是整数）。施工单 §3 明确不探测/不开放 plan → 投影必须是 `Unsupported` +

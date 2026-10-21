@@ -55,6 +55,26 @@ macOS 金样 5 条事实**同构**（T2 逐项核对全 ✓，含 `tail:0:local:
 | `windows-4894-opening.derived.sanitized.json` | **DERIVED**（源：`raw/t4-1.jsonl` T4 rev3 snapshot）：删去某 Turn 的正式 userMessage，保留 `params.input`/`clientUserMessageId`——开场后备投影测试用；其余字节与原脱敏样本一致 |
 | `windows-4894-busy-negative.derived.sanitized.json` | **DERIVED**（源：`raw/t7-1.jsonl` 忙态负例）：某 Turn 的 `params.clientUserMessageId`/`input` 被替换为合成第二条 prompt（未落 Turn），`items` 保留第一条真实 userMessage——`opening_*` 幽灵气泡负例；只有这两处派生 |
 | `windows-4894-plan-request-implementation.sanitized.json` | **DERIVED**（源：2026-10-21 真机只读抓取 rev 146）：`conversationState.requests` 里的**计划实现审批** `item/plan/requestImplementation`（`params` = `planContent`；`id` 是 **string**，51 字符）——施工单 §3 明确不开放 plan，本夹具钉死「必须保持 `Unsupported`/到桌面处理」，并证明 string id 走 `s:` 前缀 |
+| `windows-6573-pending-command.sanitized.json` | **DERIVED**（源：2026-10-21 真机只读抓取，build **26.1016.6573.0**）：`conversationState.requests` 里的**命令审批** `item/commandExecution/requestApproval`——`id` 是**整数**，`params` = kind/threadId/turnId/itemId/startedAtMs/environmentId/reason/command/cwd/commandActions/proposedExecpolicyAmendment/**availableDecisions**。未知 build 的 pending 形状证据（无真机 decision 闭环，见 T10） |
 同批已知边界（如实登记）：permissions 请求在该 build 的读场景 NOT_TRIGGERED（外部读取升权
 走 command approval）；空会话不落 session（真空首帧无样本）；忙态 start-turn 返回 success
 但新 prompt 不落 Turn（生产忙态屏障必需，不能把写回执当投递成功）。
+
+## Windows 26.1016.6573.0（2026-10-21 探测批，未知 build 兼容路径的真机样本）
+
+来源：同一条只读探针（`tests/codex_ipc_live_capture.rs`）在**新 build** 上抓取；Desktop 已从
+`26.1013.4894.0` 升级到 `26.1016.6573.0`，本仓 shipped 表**尚未**登记该 build（读链证据已具备，
+是否提升等用户裁决）。三条事实（本轮如实登记）：
+
+1. **官方方法表与 `26.1013.4894.0` 完全一致**：`thread-stream-state-changed: 11`、
+   `thread-follower-start-turn: 2`、`thread-follower-command-approval-decision: 1`、
+   `thread-follower-file-approval-decision: 1` 等逐项相同 → 未知 build 的**协议语法稳定**，
+   「版本只用于归因、能力靠证据或探测」的前提成立。
+2. **官方 command/file 决策方法的参数形状** = `{conversationId, requestId, decision}`
+   （+ 可选 `targetClientId`，走信封）——本仓的两个决策方法与之一致。
+3. **官方 pending 自带 `availableDecisions`** = `["accept", {acceptWithExecpolicyAmendment: {…}}, "cancel"]`
+   ——**没有 `decline` 字面量**。对象形态（`acceptWithExecpolicyAmendment` /
+   `applyNetworkPolicyAmendment`）属**执行策略修订（权限扩大）**，本仓一律忽略、永不自动发。
+   决策词以「字符串词」为准；`decline` 在 4894 真机已被接受并生效
+   （`windows-4894-command-approval-decline.sanitized.json`）。
+
