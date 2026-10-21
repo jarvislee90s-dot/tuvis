@@ -15,25 +15,28 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-21
+
 ### Added
 
-- **Codex APP remote control (experimental, unlocked per exact Desktop build)**: Codex
-  desktop APP sessions can now be viewed and operated from the phone — message
-  projection and runtime status, send/queue, command approval, and Plan blocking Q&A.
-  When Desktop is absent and H3 is enabled, the compatible exec path is used; with H3
-  off the request is refused honestly. Windows `26.1013.4894.0` unlocks
-  send/status/command approval/Plan Q&A; macOS `26.1013.40934` unlocks send/status.
-  permissions stays disabled, and no other build is claimed (PR #171).
-- **Codex generated images in the file panel**: images under
-  `~/.codex/generated_images/<threadId>/` are pooled as session artifacts and use the
-  same preview path (`60beea0c` / PR #171).
-- **Codex file pool now extracts `event_msg.local_images`** so user-uploaded or
-  referenced local images can appear in the file panel (#69).
-- **Codex APP message and artifact links**: recognized file references in message
-  bodies open the preview; uploaded/referenced images, generated images, and files
-  changed or viewed enter the file panel with accurate source labels. A file entry can
-  jump to its latest message reference within the current tail and at most four earlier
-  pages. Preview always reads current file contents and does not retain file history.
+- **Codex APP mobile control and message/file links (experimental)**: view message
+  content and runtime status, send and queue messages, handle command approvals, and
+  answer Plan-blocking questions from a phone. Capabilities are unlocked per exact
+  Desktop build: Windows `26.1013.4894.0` supports send/status/command approval/Plan
+  Q&A; macOS `26.1013.40934` supports send/status. `permissions` remains disabled.
+  When Desktop is absent, the compatible exec path is used only if H3 is enabled;
+  otherwise the request is refused honestly. Recognized file paths in message text
+  open the preview; uploaded/referenced images, generated images under
+  `~/.codex/generated_images/<threadId>/`, and files changed or viewed appear in the
+  file panel with accurate source labels. A file entry jumps to its latest message
+  reference within the current tail and at most four earlier pages (up to 50 messages
+  per page). Previews read the current file on disk; historical file versions are not
+  retained.
+- **Codex session image extraction**: the file pool now reads `event_msg.local_images`
+  so user-uploaded or referenced local images can appear in the panel (#69).
+- **Token dashboard V2 and cost estimates**: refreshed usage summaries, trend and
+  distribution views, provider aliases, model pricing from curated public sources,
+  USD/CNY estimates, hourly cost calculation, and a separate cost CSV export.
 
 ### Changed
 
@@ -63,9 +66,8 @@ _Only versions translated so far are listed here; the full history lives in the
 - Split the bilingual changelog and backfilled v0.5.6–v0.5.8 English entries; added
   `nameEn` to the capability matrix; translated the remaining 7 English manual
   chapters; corrected the OpenClaw matrix cells.
-- Added `CHANGELOG.en.md` to the website-notification trigger paths; the post-0.5.8
-  change inventory (excluding PR #171) lives in
-  `docs/superpowers/reviews/2026-10-20-post-0.5.8-change-inventory.md`.
+- Added `CHANGELOG.en.md` to the website-notification trigger paths, so English-only
+  changelog updates also trigger a website rebuild.
 
 ## [0.5.8] - 2026-10-16
 
@@ -85,11 +87,11 @@ _Only versions translated so far are listed here; the full history lives in the
   Chinese strings to prevent regressions (#123/#150/#157). Quote the error code in a bug
   report and the failure can be pinpointed.
 - Added "session artifacts" as a fourth source for the file panel: artifact links and
-  inline file references are scanned from session bodies (both inside and outside code
-  fences) and wired into desktop and mobile from one shared implementation; preview
-  honors an extension whitelist, existence filtering and rank-based fallback merging,
-  and Codex sessions pass their working directory through as the base for resolving
-  relative paths.
+  inline file references are scanned from session bodies (plain text and inline
+  backtick paths, excluding triple-backtick code blocks) and wired into desktop and
+  mobile from one shared implementation; preview honors an extension whitelist,
+  existence filtering and rank-based fallback merging, and Codex sessions pass their
+  working directory through as the base for resolving relative paths.
 - The Codex trust gate became a persistent in-app action card instead of a one-shot
   system notification after registration (showing the card is not the same as clearing
   it — only "Copy command" or "Don't remind me again" dismisses it, and the card carries
