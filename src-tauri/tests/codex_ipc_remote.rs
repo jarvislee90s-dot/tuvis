@@ -11,6 +11,7 @@ use multi_agents_manager_lib::remote::codex_ipc::CodexControlHub;
 
 #[path = "support/codex_fixture.rs"]
 mod codex_fixture;
+use multi_agents_manager_lib::database::dao::codex_ipc_probe::ProbeState;
 use multi_agents_manager_lib::remote::pairing::{
     persist_device, revoke_device, DeviceStore, NewDevice,
 };
@@ -23,7 +24,11 @@ use multi_agents_manager_lib::services::codex_desktop_ipc::adapter::{
     Connector, DesktopIpcAdapter,
 };
 use multi_agents_manager_lib::services::codex_desktop_ipc::codec::{encode_frame, FrameDecoder};
-use multi_agents_manager_lib::services::codex_desktop_ipc::profile::profile_for;
+use multi_agents_manager_lib::services::codex_desktop_ipc::probe::runner::ProbeOutcome;
+use multi_agents_manager_lib::services::codex_desktop_ipc::probe::{ProbeLedger, ProbeLedgerEntry};
+use multi_agents_manager_lib::services::codex_desktop_ipc::profile::{
+    profile_for, ProtocolProfile,
+};
 use multi_agents_manager_lib::services::codex_desktop_ipc::transport::{BoxIo, IpcIo};
 use multi_agents_manager_lib::session::{
     AgentType, ProcessForm, Session, SessionStatus, SessionsResponse,
@@ -83,6 +88,14 @@ impl ScriptedPeer {
     fn close(self) {
         drop(self.io);
     }
+
+    /// 对端断链（EOF）——**保留 peer 本体**：断链后仍可断言「没有第二帧」
+    /// （`close` 消费 self，断链后就没法再读帧了）。
+    fn eof(&mut self) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        drop(server); // 对端消失 → 本端读到 EOF
+        self.io = client; // 旧 io 随赋值丢弃 → 适配器那侧同步见 EOF
+    }
 }
 
 struct StaticConnector {
@@ -99,12 +112,18 @@ const TEST_BUILD: &str = "26.1013.3656.0";
 
 impl StaticConnector {
     fn new(io: Box<dyn IpcIo>) -> Self {
+        Self::with_build(io, TEST_BUILD)
+    }
+
+    /// 自报 build 身份（未知 build 用例用）：能力由生产 `profile_for` 派生——
+    /// 未命中 shipped 表 → 「尚无证据」档（写能力未取证）。
+    fn with_build(io: Box<dyn IpcIo>, build: &str) -> Self {
         Self {
             endpoint:
                 multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint {
                     platform: "windows".into(),
                     path: "\\\\.\\pipe\\codex-ipc-test-fixture".into(),
-                    build: Some(TEST_BUILD.into()),
+                    build: Some(build.into()),
                 },
             io: StdMutex::new(Some(io)),
         }
@@ -5062,4 +5081,360 @@ async fn same_thread_retrigger_queues_behind_in_flight_compat() {
     .expect("第一条兜底落账");
     wait_handoff(&f, "act-ser-2", Duration::from_secs(5)).await;
     f.state.codex_control.stop();
+}
+
+// ============================================================
+// 19. #172/T8：兼容发送（实验）——未知 build 的**显式 opt-in** 发送通道
+//    默认关；开关开才允许尝试发送（同一 start_turn 路径，wire 形态不变），
+//    并把结果如实映射到探测账本（capability = "send"）。
+// ============================================================
+
+/// 未知 build 的 build 号（**不进 shipped 表**——这里只作「未验证 build」的替身）。
+const UNKNOWN_BUILD: &str = "26.1013.9999.0";
+/// 兼容发送用例固定的账本键：真实键的 `cli_id` 段要 spawn 本机 `codex.exe --version`
+/// （测试绝不 spawn 本机 CLI）→ 用固定键把归因钉死。
+const COMPAT_PROBE_KEY: &str = "windows|26.1013.9999.0|test-cli|1";
+
+/// 探测账本桩：只读探测**已通过**（`state` 行 = probed）→ 探测**零帧复用**，
+/// 不让用例额外跑一遍 P0–P3（那会多出 discovery/following 帧，干扰帧数断言）。
+struct ProbedStateLedger;
+
+impl ProbeLedger for ProbedStateLedger {
+    fn get(&self, _probe_key: &str, capability: &str) -> Option<ProbeLedgerEntry> {
+        (capability == "state").then_some(ProbeLedgerEntry {
+            state: ProbeState::Probed,
+            next_retry_at: None,
+        })
+    }
+    fn record(&self, _probe_key: &str, _capability: &str, _outcome: &ProbeOutcome) {}
+}
+
+/// 未验证 build 的「尚无证据」档 profile（能力位全关；方法表沿用基线）。
+fn unknown_build_profile() -> ProtocolProfile {
+    ProtocolProfile::unverified("windows", UNKNOWN_BUILD)
+}
+
+/// 未知 build fixture（假 IPC peer 在场）：endpoint 自报**未验证 build** → adapter
+/// 每次连接按 endpoint 重算 profile → 写能力未取证（`build_send_verified` = false）。
+fn fixture_unknown_build(sessions: Vec<Session>) -> Fixture {
+    let (io, peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::with_build(io, UNKNOWN_BUILD)),
+        unknown_build_profile(),
+    ));
+    adapter.set_probe_key_override(Some(COMPAT_PROBE_KEY.into()));
+    adapter.set_probe_ledger(Arc::new(ProbedStateLedger));
+    fixture_with(
+        sessions,
+        move |store| Arc::new(CodexControlHub::with_adapter(store, adapter, true)),
+        Some(peer),
+    )
+}
+
+/// 未知 build + **连接不可达** fixture（写前 NotSent 的成因：连接不可达）。
+fn fixture_unknown_build_offline(sessions: Vec<Session>) -> Fixture {
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(FailingConnector),
+        unknown_build_profile(),
+    ));
+    adapter.set_probe_key_override(Some(COMPAT_PROBE_KEY.into()));
+    adapter.set_probe_ledger(Arc::new(ProbedStateLedger));
+    fixture_with(
+        sessions,
+        move |store| Arc::new(CodexControlHub::with_adapter(store, adapter, true)),
+        None,
+    )
+}
+
+/// 打开兼容发送开关（设置项 `remote.compat_send_enabled`，缺键 = 关）。
+fn enable_compat_send(f: &Fixture) {
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.compat_send_enabled', 'true')",
+            [],
+        )
+        .unwrap();
+    });
+}
+
+/// 探测账本里 `capability = "send"` 的行（probe_key, state, error_code）。
+fn send_probe_rows(f: &Fixture) -> Vec<(String, String, Option<String>)> {
+    let conn = f.conn.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT probe_key, state, error_code FROM codex_ipc_probe
+              WHERE capability = 'send' ORDER BY probe_key",
+        )
+        .unwrap();
+    stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })
+    .unwrap()
+    .filter_map(|r| r.ok())
+    .collect()
+}
+
+/// peer 后续还会收到的 `thread-follower-start-turn` 帧数（backlog + 新帧，读到
+/// EOF/超时为止）——「不得重发」的帧数断言。
+async fn count_start_turn_frames(peer: &mut ScriptedPeer) -> usize {
+    let mut count = 0;
+    for f in peer.backlog.drain(..) {
+        if f["method"] == "thread-follower-start-turn" {
+            count += 1;
+        }
+    }
+    let mut decoder = FrameDecoder::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = match tokio::time::timeout(Duration::from_millis(300), peer.io.read(&mut buf)).await
+        {
+            Ok(Ok(n)) => n,
+            _ => break,
+        };
+        if n == 0 {
+            break; // EOF
+        }
+        for f in decoder.push(&buf[..n]).expect("decode") {
+            if f["method"] == "thread-follower-start-turn" {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// #172/T8 开关关：未知 build 维持现状——send 与 send-info 都 403 /
+/// `capability_unverified`，**零投递**（peer 收不到 start-turn 帧），账本无 send 行。
+#[tokio::test]
+async fn compat_send_switch_off_keeps_403() {
+    let mut f = fixture_unknown_build(vec![codex_app_session(THREAD)]);
+    assert!(
+        !f.state.codex_control.build_send_verified(),
+        "未知 build：没有写能力证据"
+    );
+    // 开关默认关（缺键 = 关）
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("开关关的消息", Some("act-cs-off-1"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    // 读链照常走（ensure → discovery/following/snapshot），但**写出**必须被能力门挡住
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("in time")
+        .unwrap();
+    assert_eq!(r.status(), 403, "开关关：如实拒发");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "capability_unverified", "{v}");
+    assert_eq!(v["reasonCode"], "capability_unverified");
+    assert_eq!(
+        count_start_turn_frames(&mut peer).await,
+        0,
+        "开关关：零投递（不得发出 start-turn 帧）"
+    );
+    // send-info 同源同码：输入区置灰 + 同一原因码
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/session-send-info?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let info: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(info["injectable"], serde_json::json!(false), "{info}");
+    assert_eq!(info["reasonCode"], "capability_unverified", "{info}");
+    // 账本无 send 记录（开关关时不得留下任何「试过」的痕迹）
+    assert!(send_probe_rows(&f).is_empty(), "开关关：账本不得有 send 行");
+}
+
+/// #172/T8 开关开：未知 build 允许**尝试**发送（同一 start_turn 路径，wire 形态不变），
+/// 假 IPC 受理 → 回执 accepted + 账本 capability=send 记 **probed**。
+#[tokio::test]
+async fn compat_send_switch_on_allows_attempt_and_records_probed() {
+    let mut f = fixture_unknown_build(vec![codex_app_session(THREAD)]);
+    enable_compat_send(&f);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("兼容发送消息", Some("act-cs-on-1"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(
+        frame["method"], "thread-follower-start-turn",
+        "开关开：允许尝试发送（走同一 start_turn 路径）"
+    );
+    confirm_client_message_identity(&mut peer, &frame, "turn-cs-1", "兼容发送消息", 8, "owner-1")
+        .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-cs-1", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["status"], "desktop_ipc", "{v}");
+    assert_eq!(v["receipt"]["delivery"], "accepted", "{v}");
+    // 账本：capability = "send" → probed（该 build 的发送确被受理）
+    let rows = send_probe_rows(&f);
+    assert_eq!(rows.len(), 1, "账本只应有 send 一行: {rows:?}");
+    assert_eq!(rows[0].0, COMPAT_PROBE_KEY);
+    assert_eq!(rows[0].1, "probed", "{rows:?}");
+    assert_eq!(rows[0].2, None, "probed 不带错误码: {rows:?}");
+    // send-info 同源：输入区不置灰（发送门放行）
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/session-send-info?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(info["injectable"], serde_json::json!(true), "{info}");
+}
+
+/// #172/T8 写前未投递（连接不可达）→ 账本记 **failed**，并**允许一次**既有兜底
+/// （R8 语义：写前没送出去才允许兜底一次）。
+#[tokio::test]
+async fn compat_send_not_sent_records_failed_and_allows_one_fallback() {
+    let _path = IsolatedPath::lock_empty();
+    let f = fixture_unknown_build_offline(vec![codex_app_session(THREAD)]);
+    enable_compat_send(&f);
+    // H3 开（兜底通道可用）；空 PATH → CLI 缺失 → 兜底投递前明确拒绝（零 spawn）
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.headless_enabled', 'true')",
+            [],
+        )
+        .unwrap();
+    });
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("兼容兜底消息", Some("act-cs-ns-1"), false)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "兜底回执走 headless 封套（HTTP 200）");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["status"], "headless", "写前未投递 → 允许一次兜底: {v}");
+    assert_eq!(v["actionId"], "act-cs-ns-1");
+    // 账本：capability = "send" → failed
+    let rows = send_probe_rows(&f);
+    assert_eq!(rows.len(), 1, "账本只应有 send 一行: {rows:?}");
+    assert_eq!(rows[0].1, "failed", "{rows:?}");
+    // 兜底**只被触发一次**（交接 CAS 恰好一次）
+    let handed_off = f
+        .codex_audits()
+        .iter()
+        .filter(|a| a.action == "codex_fallback" && a.result.contains("handed_off"))
+        .count();
+    assert_eq!(
+        handed_off,
+        1,
+        "兜底只允许一次: {audits:?}",
+        audits = f.codex_audits()
+    );
+    // 零队列投递（CLI 缺失 → 投递前拒绝）
+    let queue_rows: i64 = {
+        let conn = f.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM inject_queue", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(queue_rows, 0);
+}
+
+/// #172/T8 结果未知（超时/断链）→ 账本记 **inconclusive** + reason `delivery_unknown`，
+/// **不重发、不 fallback**（wire 上不得出现第二帧）。
+#[tokio::test]
+async fn compat_send_unknown_records_inconclusive_and_never_retries() {
+    let mut f = fixture_unknown_build(vec![codex_app_session(THREAD)]);
+    enable_compat_send(&f);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("未知投递消息", Some("act-cs-uk-1"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    // 对端断链（EOF）→ 在飞 mutating RPC 结果未知
+    peer.eof();
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("in time")
+        .unwrap();
+    assert_eq!(r.status(), 200, "unknown 是 200 的明确回执");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["receipt"]["delivery"], "unknown_delivery", "{v}");
+    // 账本：capability = "send" → inconclusive + reason delivery_unknown
+    let rows = send_probe_rows(&f);
+    assert_eq!(rows.len(), 1, "账本只应有 send 一行: {rows:?}");
+    assert_eq!(rows[0].1, "inconclusive", "{rows:?}");
+    assert_eq!(
+        rows[0].2.as_deref(),
+        Some("delivery_unknown"),
+        "未知结果的固定原因码: {rows:?}"
+    );
+    // **没有第二帧**：未知结果绝不自动重发
+    assert_eq!(
+        count_start_turn_frames(&mut peer).await,
+        0,
+        "未知结果不得重发（wire 上不得出现第二帧）"
+    );
+    // 未知结果不触发兜底（router 只给 NotSent 兜底资格）
+    let handed_off = f
+        .codex_audits()
+        .iter()
+        .filter(|a| a.action == "codex_fallback" && a.result.contains("handed_off"))
+        .count();
+    assert_eq!(handed_off, 0, "未知结果不得兜底");
 }

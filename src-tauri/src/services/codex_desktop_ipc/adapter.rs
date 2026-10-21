@@ -172,6 +172,9 @@ struct AdapterInner {
     /// #172：当前「**尚无证据**」档 build 的探测目标（shipped build → `None`；
     /// 连接失败回落 closed 时保留原目标，便于重连后复用同一键）。
     probe_target: std::sync::Mutex<Option<ProbeTarget>>,
+    /// #172/T8 测试缝：固定账本键（生产恒 `None` → 真实计算；测试避免 spawn
+    /// 本机 `codex.exe --version` 取 `cli_id`）。
+    probe_key_override: std::sync::Mutex<Option<String>>,
     /// #172：探测预算（生产 = P1/P2/P3 2/3/3s；测试可收紧，免得真等 8s）。
     probe_budget: std::sync::Mutex<super::probe::runner::ProbeBudget>,
     conn: Mutex<Option<ConnectionHandle>>,
@@ -252,6 +255,7 @@ impl DesktopIpcAdapter {
                         key: None,
                     }
                 })),
+                probe_key_override: std::sync::Mutex::new(None),
                 probe_budget: std::sync::Mutex::new(super::probe::runner::ProbeBudget::default()),
                 conn: Mutex::new(None),
                 ensure_lock: tokio::sync::Mutex::new(()),
@@ -637,9 +641,42 @@ impl DesktopIpcAdapter {
             .clone()
     }
 
+    /// #172/T8：**当前 build 的账本键**（探测/兼容发送的归因用）。
+    ///
+    /// 拿不到 build 目标（还没 resolve 到 build）→ `None` = **不记账**（宁可缺行，
+    /// 不可错记——错记会把别的 build 的证据算到本 build 头上）。
+    pub async fn current_probe_key(&self) -> Option<String> {
+        let target = self.probe_target_snapshot()?;
+        Some(self.resolve_probe_key(&target).await)
+    }
+
+    /// #172/T8 测试缝：固定账本键（生产恒 `None`）。
+    ///
+    /// 为什么需要：真实键含 `cli_id` 段——它要跑本机 `codex.exe --version`（spawn）。
+    /// 测试里绝不 spawn 本机 CLI，故用固定键把归因钉死（断言也据此写死）。
+    #[doc(hidden)]
+    pub fn set_probe_key_override(&self, key: Option<String>) {
+        *self
+            .inner
+            .probe_key_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = key;
+    }
+
     /// 取（并缓存）该 build 的账本键：`cli_id` 可能要跑一次 `codex.exe --version`
     /// （2s 上限），放阻塞线程池，避免卡住 async worker；同 build 只算一次。
     async fn resolve_probe_key(&self, target: &ProbeTarget) -> String {
+        // 测试缝优先：固定键（避免测试里跑本机 CLI 指纹探测——它会 spawn
+        // `codex.exe --version`；生产恒 None → 走真实计算）。
+        if let Some(fixed) = self
+            .inner
+            .probe_key_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return fixed;
+        }
         if let Some(key) = &target.key {
             return key.clone();
         }
@@ -1118,13 +1155,46 @@ impl DesktopIpcAdapter {
     pub async fn start_turn(
         &self,
         key: &ThreadKey,
-        _action_id: &str,
+        action_id: &str,
         text: &str,
         client_message_id: &str,
     ) -> RpcOutcome {
+        self.start_turn_with(key, action_id, text, client_message_id, false)
+            .await
+    }
+
+    /// **兼容发送变体（#172/T8）**：本 build 的写能力**未取证**时，用户在设置页显式
+    /// 开启「兼容发送（实验）」后，允许走**同一条 start_turn 路径**尝试写出
+    /// （wire 形态逐字不变——只放开能力门，不改协议）。
+    ///
+    /// 为什么放在 adapter 而不是调用方：`start_turn` 的能力门是「这个 build 能不能写」
+    /// 的**最后一道**防线，绕过它就等于在未验证 build 上盲发。放行许可只能来自
+    /// **同一个**设置键 + 同一个 build 证据判据（remote 层与派发层共用）。
+    pub async fn start_turn_compat(
+        &self,
+        key: &ThreadKey,
+        action_id: &str,
+        text: &str,
+        client_message_id: &str,
+    ) -> RpcOutcome {
+        self.start_turn_with(key, action_id, text, client_message_id, true)
+            .await
+    }
+
+    /// start turn 主体（`compat` = 兼容发送许可；false = 既有语义逐字不变）。
+    async fn start_turn_with(
+        &self,
+        key: &ThreadKey,
+        _action_id: &str,
+        text: &str,
+        client_message_id: &str,
+        compat: bool,
+    ) -> RpcOutcome {
         let envelope_id = super::types::new_uuid();
         // R3：能力读当前连接的动态 profile（无连接/未知 build → closed → 拒）
-        if !self.current_caps().send {
+        // #172/T8：兼容发送许可只放开「写能力未取证」这一档；**已验证 build 的行为
+        // 完全不变**（它的 caps.send 本来就是 true，根本进不到这个分支）。
+        if !self.current_caps().send && !compat {
             return not_sent(&envelope_id, "capability_unavailable");
         }
         let (lease, validity) = {

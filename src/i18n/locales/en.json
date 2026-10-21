@@ -415,7 +415,11 @@
       "headlessTimeoutLabel": "Headless timeout (ms)",
       "headlessTimeoutHint": "Watchdog limit for a single headless turn; on expiry the process tree is killed and the receipt reports stage=timeout (retryable). Default 600000 (10 minutes).",
       "headlessConcurrencyLabel": "Headless concurrency cap",
-      "headlessConcurrencyHint": "Maximum number of concurrent headless turns (1-8); excess requests immediately get a 'not executed' receipt (no queueing, no auto-retry; resend later). Default 2."
+      "headlessConcurrencyHint": "Maximum number of concurrent headless turns (1-8); excess requests immediately get a 'not executed' receipt (no queueing, no auto-retry; resend later). Default 2.",
+      "compatSendTitle": "Compatibility send (experimental)",
+      "compatSendHint": "Only applies to unverified Codex desktop builds; messages may be delivered to the wrong session — you accept the risk.",
+      "compatSendNeedsProbe": "A read-only probe must complete first (the read chain of this Codex desktop build is not verified yet)",
+      "groupCompatSend": "5. Compatibility send (unverified Codex desktop builds only)"
     },
     "audit": {
       "title": "Injection Audit",
@@ -1899,6 +1903,7 @@
     "migrateCodexBarrierReleaseFail": "Failed to migrate codex_actions.barrier_force_released_at: {error}",
     "codexQueueRetractPending": "This message is still queued; use retract instead",
     "codexQueueForceInFlight": "This message is in-flight (auto-settled), out of force-release scope",
+    "compatSendNeedsProbe": "A read-only probe must complete first (the read chain of this Codex desktop build is not verified yet)",
     "migrateSignatureAppliedFail": "Failed to migrate codex_actions.signature_applied: {error}"
   },
   "mobile": {

@@ -1943,13 +1943,21 @@ pub async fn session_send_info(
         );
     };
     let tool = session.agent_type.tool_id().to_string();
+    // #172/T8：兼容发送放行判据（与 session-send **同一判据**：同一个设置键 + 同一个
+    // `build_send_verified` 事实）——两端口径因此同源同码（不会「send-info 说可发、
+    // 真发却 403」）。
+    let compat = st
+        .codex_control
+        .compat_send_allowed(st.store.with(super::compat_send_enabled_conn));
     // #172：**与 session-send 同源的能力门**（判据相同、位置相同——都在 H3 分支之前）。
     // 桌面归属会话且本 build **没有写能力证据**（未知 build / 本进程还没解析到 build）：
     // 输入区如实置灰 + 同一句原因文案。若这里放行到 H3/兼容分支，会出现
     // 「send-info 说可发、真发却 403」的两端口径不一致。
+    // #172/T8：兼容发送（未知 build + 开关开）例外——此时发送门放行，输入区不置灰。
     if codex_app_form(&session)
         && !st.codex_control.send_available()
         && !st.codex_control.build_send_verified()
+        && !compat
     {
         return json_no_store(
             StatusCode::OK,
@@ -1964,7 +1972,9 @@ pub async fn session_send_info(
     // 置灰 + 原因）。**Codex APP 先看 hub（Desktop IPC）**——A 可写时 `injectable:true`
     // **不看 H3**（只有兼容分支受 H3）；A 不可写但 build 有写能力证据（已验证 build
     // 瞬时断链）→ 保持原兼容分支并受 H3。判据与 session-send 的 H3 门**同一函数**。
-    let hub_route = codex_app_form(&session) && st.codex_control.send_available();
+    // #172/T8：兼容发送（未知 build + 开关开）也走 hub 臂——它写的是 Desktop IPC，
+    // 不是无头通道，因此**不受 H3 约束**（与 A 可写同一档）。
+    let hub_route = codex_app_form(&session) && (st.codex_control.send_available() || compat);
     if !hub_route {
         if let Some(reason) = headless_blocked(&st, &tool, session.form, session.pid) {
             return json_no_store(

@@ -56,6 +56,16 @@ pub const KEY_ACCESS_PIN: &str = "remote.access_pin";
 pub const KEY_HEADLESS: &str = "remote.headless_enabled";
 /// H3 关闭态文案：移动端输入区置灰的原因——send-info 的 reason 原样透出
 pub const HEADLESS_DISABLED_REASON: &str = "无头通道未开启，请在电脑端 Tuvis 设置中开启";
+/// **兼容发送开关（#172/T8；实验）**：默认关（缺键 = 关），显式开启才允许对
+/// **写能力未取证**的 Codex 桌面 build 尝试发送（消息可能被投递到错误会话，
+/// 风险自负）。值口径与 KEY_HEADLESS 同：写侧恒 "true"/"false" 显式两值，
+/// 读侧只认 "true"（不认第二真值）。
+/// 消费方：发送门（`remote::codex_ipc` 的兼容发送分支）、`remote_status.compatSendEnabled`
+/// 下发、设置页「兼容发送（实验）」开关。
+pub const KEY_COMPAT_SEND: &str = "remote.compat_send_enabled";
+/// 兼容发送前置未满足时的拒绝文案（前端置灰提示同源一句；后端是最终裁决）
+pub const COMPAT_SEND_NEEDS_PROBE_MSG: &str =
+    "COMPAT_SEND_NEEDS_PROBE: 需先完成只读探测（该 Codex 桌面版本的读链尚未取证）";
 /// **无头 watchdog 超时键（H4）**：毫秒，默认 [`DEFAULT_HEADLESS_TIMEOUT_MS`]（600000）。
 /// 值口径与其余数值键同：写侧恒十进制字符串、读侧缺键/乱串回默认、越界 clamp
 /// （1_000..=3_600_000，数字单点在 `inject::headless`）。
@@ -144,6 +154,77 @@ fn toggle_headless_core(
 #[tauri::command]
 pub fn remote_toggle_headless(enabled: bool) -> Result<(), String> {
     pairing::DeviceStore::global().with(|c| toggle_headless_core(c, enabled, events::audit));
+    Ok(())
+}
+
+/// 兼容发送开关解析（纯函数）：仅 `"true"` 为开——缺键（未设置 = 默认关）/
+/// `"false"` / 乱串一律判关（与 `headless_enabled_from` 同口径，不认第二真值）
+pub fn compat_send_enabled_from(v: Option<&str>) -> bool {
+    v == Some("true")
+}
+
+/// 兼容发送开关读取（**store 缝版本**）：直用调用方传入的 conn（锁内只做这一条
+/// SQL + 纯解析；不自取任何锁）
+pub fn compat_send_enabled_conn(conn: &rusqlite::Connection) -> bool {
+    compat_send_enabled_from(
+        crate::database::dao::settings::get_setting_conn(conn, KEY_COMPAT_SEND).as_deref(),
+    )
+}
+
+/// 兼容发送放行判据（纯函数，#172/T8）：**开关开** ∧ **本 build 写能力未取证**。
+///
+/// 为什么已验证 build 恒 false：shipped 证据里的 build 行为**完全不变**——兼容开关
+/// 对它零影响（既不放开也不收紧），避免「同一台机器换个 build 语义就变了」。
+pub fn compat_send_allowed(switch_on: bool, build_send_verified: bool) -> bool {
+    switch_on && !build_send_verified
+}
+
+/// **兼容发送状态下发装配（可测缝）**：从注入的连接读开关 + 写入「读链是否已取证」
+/// 的前置判据——设置页「兼容发送（实验）」开关的唯一数据源（缺键 = 关）。
+///
+/// `compatSendEligible` = 该 build 的读链已取证（shipped 证据或只读探测通过）：
+/// false 时前端置灰并提示「需先完成只读探测」。**为什么带这个字段**：remote_status
+/// 原本没有任何 Codex 能力字段，前端没有判据就无法置灰；这里补一个**只读事实**
+/// （不改任何协议语义：send-info 的 reasonCode 契约原样不动）。
+pub fn apply_compat_send_status(
+    st: &mut serde_json::Value,
+    conn: &rusqlite::Connection,
+    eligible: bool,
+) {
+    st["compatSendEnabled"] = serde_json::json!(compat_send_enabled_conn(conn));
+    st["compatSendEligible"] = serde_json::json!(eligible);
+}
+
+/// 兼容发送开关内核（**可测核**；conn 与审计出口以参数注入）
+fn toggle_compat_send_core(
+    conn: &rusqlite::Connection,
+    enabled: bool,
+    audit: impl FnOnce(&str, &str),
+) {
+    crate::database::dao::settings::set_setting_conn(
+        conn,
+        KEY_COMPAT_SEND,
+        if enabled { "true" } else { "false" },
+    );
+    audit("compat_send_toggled", &format!("compatSend={enabled}"));
+    events::emit_ui(
+        "remote-changed",
+        serde_json::json!({ "compatSendEnabled": enabled }),
+    );
+}
+
+/// 兼容发送（实验）开关翻转（#172/T8：默认关，显式开启才放行）。
+///
+/// **前置门**：开启时要求「该 build 的读链已取证」（shipped 证据或只读探测通过）——
+/// 未取证时**拒绝并给出引导文案**（前端同口径置灰；后端是最终裁决，防绕过 UI 打开）。
+/// 关闭**永远允许**（用户随时能收回风险）。
+#[tauri::command]
+pub fn remote_toggle_compat_send(enabled: bool) -> Result<(), String> {
+    let store = pairing::DeviceStore::global();
+    if enabled && !codex_ipc::read_chain_verified(&store) {
+        return Err(COMPAT_SEND_NEEDS_PROBE_MSG.to_string());
+    }
+    store.with(|c| toggle_compat_send_core(c, enabled, events::audit));
     Ok(())
 }
 
@@ -1192,6 +1273,14 @@ pub fn remote_status() -> serde_json::Value {
     // H3/H4：无头注入总开关 + watchdog 超时 + 并发上限（设置页初值 + 移动端置灰判据；
     // 缺键 = 默认关 / 600000ms / 2）。经可测缝 apply_headless_status（与门同一条读取路径）
     pairing::DeviceStore::global().with(|c| apply_headless_status(&mut st, c));
+    // #172/T8：兼容发送（实验）开关 + 「读链已取证」前置判据（设置页置灰的唯一数据源；
+    // 缺键 = 默认关）。判定走**只读**路径（账本 + endpoint 解析），不装配控制面、
+    // 不跑 schema 探针——设置页读一次状态不该有副作用。
+    {
+        let store = pairing::DeviceStore::global();
+        let eligible = codex_ipc::read_chain_verified(&store);
+        store.with(|c| apply_compat_send_status(&mut st, c, eligible));
+    }
     // M5 A5：通道开关（read_channels 含惰性迁移）+ 隧道双通道快照 + tailscale 快照
     let chans = read_channels();
     let tun = tunnel::snapshot();
@@ -2080,6 +2169,41 @@ mod tests {
         assert_eq!(KEY_PUBLIC_ACK, "remote.public_ack");
         assert_eq!(KEY_HOST_NAME, "remote.host_name");
         assert_eq!(DEFAULT_PORT, 9420);
+    }
+
+    /// #172/T8：兼容发送开关的取值口径（缺键 = 关；只认 "true"）+ 放行判据
+    /// （开关开 ∧ 写能力未取证；已验证 build 恒不受益）。
+    #[test]
+    fn compat_send_switch_and_gate_semantics() {
+        // 缺键 / "false" / 乱串 → 一律关（与 headless 同口径，不认第二真值）
+        assert!(!compat_send_enabled_from(None));
+        assert!(!compat_send_enabled_from(Some("false")));
+        assert!(!compat_send_enabled_from(Some("1")));
+        assert!(!compat_send_enabled_from(Some("TRUE")));
+        assert!(compat_send_enabled_from(Some("true")));
+        // 放行判据：开关关 → 恒不；开关开 + 写能力未取证 → 放行；
+        // 开关开 + 写能力已取证（shipped build）→ 不放行（它的行为完全不变）
+        assert!(!compat_send_allowed(false, false));
+        assert!(!compat_send_allowed(false, true));
+        assert!(compat_send_allowed(true, false));
+        assert!(!compat_send_allowed(true, true));
+    }
+
+    /// #172/T8：兼容发送状态装配（设置页的唯一数据源）——缺键 = 关；前置判据原样下发。
+    #[test]
+    fn compat_send_status_payload_shape() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        let mut st = serde_json::json!({});
+        apply_compat_send_status(&mut st, &conn, false);
+        assert_eq!(st["compatSendEnabled"], serde_json::json!(false));
+        assert_eq!(st["compatSendEligible"], serde_json::json!(false));
+        // 写侧恒写显式两值；读侧只认 "true"
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_COMPAT_SEND, "true");
+        let mut st = serde_json::json!({});
+        apply_compat_send_status(&mut st, &conn, true);
+        assert_eq!(st["compatSendEnabled"], serde_json::json!(true));
+        assert_eq!(st["compatSendEligible"], serde_json::json!(true));
     }
 
     // ==== Task 4 生命周期接线：纯逻辑测试 ====

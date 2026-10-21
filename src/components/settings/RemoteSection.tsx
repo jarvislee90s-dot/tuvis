@@ -44,6 +44,7 @@ import {
   setPin,
   toggleChannel,
   toggleHeadless,
+  toggleCompatSend,
   setHeadlessLimits,
   type RemoteDevice,
   type RemoteStatus,
@@ -349,6 +350,11 @@ export function RemoteSection() {
   const enabled = status?.enabled ?? false;
   // H3 无头总开关态：唯一数据源 = remote_status.headlessEnabled（缺键/旧载荷 = 关）
   const headlessEnabled = status?.headlessEnabled ?? false;
+  // #172/T8 兼容发送（实验）两个数据源（同源 remote_status，缺键 = 关 / 不可开）：
+  // - compatSendEnabled：开关真值；
+  // - compatSendEligible：前置判据（该 build 读链已取证 = 可开；false → 置灰）。
+  const compatSendEnabled = status?.compatSendEnabled ?? false;
+  const compatSendEligible = status?.compatSendEligible ?? false;
 
   // 花名册与状态 3s 轮询恒开（与移动端看板同节奏）。花名册是 DB 语义（已配对设备
   // 的吊销/重命名管理入口），不随远程关闭清空——Mac 报告七-6「关闭期间 0/10 而 DB
@@ -642,6 +648,21 @@ export function RemoteSection() {
     }
   };
 
+  // #172/T8 兼容发送（实验）总开关落盘（后端写 KV + 审计 + 广播）。**开启有前置**：
+  // 该 build 的读链须已取证（只读探测通过）——后端是最终裁决，前端同口径置灰。
+  const applyCompatSend = async (v: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await toggleCompatSend(v);
+      await refreshStatus();
+    } catch (e) {
+      toast.error(formatInvokeError(e, t));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   // H4 无头配置保存（越界 clamp 后落 KV + 审计 + 广播）；空/非法输入交给后端 clamp
   const saveHeadlessLimits = async () => {
     if (busy) return;
@@ -918,6 +939,34 @@ export function RemoteSection() {
             >
               {t("settings.remote.save")}
             </Button>
+          </div>
+
+          {/* #172/T8 兼容发送（实验）：默认关；**读探测通过才允许开**——未取证时
+              置灰并提示先做只读探测（后端开启时同样拒：同一判据）。已验证的 Codex
+              桌面版本不受此开关影响（它的发送行为逐字不变）。 */}
+          <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
+            {t("settings.remote.groupCompatSend")}
+          </div>
+          <div className="flex items-center justify-between gap-4 py-3">
+            <div className="flex-1">
+              <label className="text-sm font-semibold">
+                {t("settings.remote.compatSendTitle")}
+              </label>
+              <p className="text-muted-foreground mt-0.5 text-xs">
+                {t("settings.remote.compatSendHint")}
+              </p>
+              {!compatSendEligible && (
+                <p className="text-muted-foreground mt-0.5 text-xs">
+                  {t("settings.remote.compatSendNeedsProbe")}
+                </p>
+              )}
+            </div>
+            <Switch
+              aria-label={t("settings.remote.compatSendTitle")}
+              checked={compatSendEnabled}
+              disabled={busy || !status || !compatSendEligible}
+              onCheckedChange={(v) => void applyCompatSend(v)}
+            />
           </div>
 
           {/* ② 通道（开关各自独立，可同时开启；点卡片在下方展开详情） */}
