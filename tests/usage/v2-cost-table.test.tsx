@@ -84,6 +84,8 @@ function costRow(key: string, opts: Partial<CostRow> = {}): CostRow {
     normalizedModelId: "gpt-5",
     pricingReleaseDate: "2025-08-07",
     priceOverride: false,
+    priceRuleKind: "none",
+    timeBreakdown: null,
     displayModelName: null,
     ...opts,
   };
@@ -405,9 +407,45 @@ describe("UsageCostTable · 小字区", () => {
     const row = costRow("basis", { pricingBasis: "userOverride", priceOverride: true });
     renderTable([row]);
     const details = detailOf(row);
-    expect(details).toHaveTextContent("用户覆盖价");
-    expect(details).not.toHaveTextContent("当前基准价回算");
-    expect(screen.getByTestId("usage-cost-override-basis")).toHaveTextContent("用户覆盖价");
+    expect(details).toHaveTextContent(tf("usage.cost.userOverride"));
+    expect(details).not.toHaveTextContent(tf("usage.cost.baseCurrent"));
+    expect(screen.getByTestId("usage-cost-override-basis")).toHaveTextContent(
+      tf("usage.cost.priceOverride")
+    );
+  });
+
+  it("15b. 分时规则：行名旁分时徽标 + 详情 Token 分布；非分时行不显示", () => {
+    const timed = costRow("timed", {
+      priceRuleKind: "time",
+      priceOverride: true,
+      timeBreakdown: { peakTokens: 1234, offpeakTokens: 500, dailyFallbackTokens: 20 },
+    });
+    renderTable([timed]);
+
+    // 徽标在名称列、带说明 title；固定价/无规则行没有该徽标
+    const badge = screen.getByTestId("usage-cost-time-badge-timed");
+    expect(badge).toHaveTextContent(tf("usage.cost.timeRule"));
+    expect(badge).toHaveAttribute("title", tf("usage.cost.timeRuleHint"));
+
+    const details = detailOf(timed);
+    const breakdown = within(details).getByTestId("usage-cost-time-breakdown-timed");
+    expect(breakdown).toHaveTextContent(
+      tf("usage.cost.timeBreakdown", {
+        peak: fmtTokens(1234),
+        offpeak: fmtTokens(500),
+        fallback: fmtTokens(20),
+      })
+    );
+    // 琥珀色提示（与规则类型视觉一致）
+    expect(breakdown.className).toContain("amber-700");
+
+    // 固定价行：有覆盖徽标但无分时徽标/分布
+    const fixed = costRow("fixed", { priceRuleKind: "fixed", priceOverride: true });
+    renderTable([fixed]);
+    expect(screen.queryByTestId("usage-cost-time-badge-fixed")).toBeNull();
+    const fixedDetails = detailOf(fixed);
+    expect(screen.queryByTestId("usage-cost-time-breakdown-fixed")).toBeNull();
+    expect(within(fixedDetails).getByTestId("usage-cost-override-fixed")).toBeInTheDocument();
   });
 });
 

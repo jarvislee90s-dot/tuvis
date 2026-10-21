@@ -188,6 +188,7 @@ describe("V2 IPC 包装（src/lib/api/usageV2.ts）", () => {
         "normalizedModelId",
         "observedProviders",
         "priceOverride",
+        "priceRuleKind",
         "priceUpdatedAt",
         "pricedTokens",
         "pricedTokensCny",
@@ -199,12 +200,21 @@ describe("V2 IPC 包装（src/lib/api/usageV2.ts）", () => {
         "sourceIds",
         "status",
         "statusCny",
+        "timeBreakdown",
         "tokenUsage",
         "unpricedTokens",
         "unpricedTokensCny",
         "usdConverted",
       ]);
       expect("totalCost" in row).toBe(false);
+      // 规则形态三值；分时行才带 Token 分布（固定价/未匹配为 null）
+      expect(["none", "fixed", "time"]).toContain(row.priceRuleKind);
+      expect(
+        row.timeBreakdown === null ||
+          (typeof row.timeBreakdown.peakTokens === "number" &&
+            typeof row.timeBreakdown.offpeakTokens === "number" &&
+            typeof row.timeBreakdown.dailyFallbackTokens === "number")
+      ).toBe(true);
       expect(row.estimatedUsd === null || typeof row.estimatedUsd === "string").toBe(true);
       expect(row.estimatedCny === null || typeof row.estimatedCny === "string").toBe(true);
       expect(typeof row.usdConverted).toBe("boolean");
@@ -246,10 +256,15 @@ describe("V2 IPC 包装（src/lib/api/usageV2.ts）", () => {
     );
     expect(costs.rows.some((row) => row.estimatedUsd === null)).toBe(true);
     expect(costs.rows.some((row) => row.coverageRate === null)).toBe(true);
+    // 夹具覆盖固定价形态（gpt-5 有覆盖价）与无规则形态；分时行由 UI 单测本地构造
+    expect(costs.rows.find((row) => row.normalizedModelId === "gpt-5")?.priceRuleKind).toBe(
+      "fixed"
+    );
+    expect(costs.rows.some((row) => row.priceRuleKind === "none")).toBe(true);
 
     const csv = await usageCostExportCsv(LAST7D);
     expect(csv.split("\n")[0]).toBe(
-      "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override"
+      "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override,price_rule_kind"
     );
     expect(csv.toLowerCase()).not.toContain("total");
 
@@ -425,6 +440,7 @@ describe("V2 IPC 包装（src/lib/api/usageV2.ts）", () => {
         "snapshotDate",
         "sourceModel",
         "sourceProvider",
+        "timeRule",
         "updatedAt",
       ]);
       expect(typeof view.updatedAt).toBe("number");
@@ -493,6 +509,46 @@ describe("V2 IPC 包装（src/lib/api/usageV2.ts）", () => {
       ["usage_pricing_override_set", ["request"]],
       ["usage_pricing_override_delete", ["normalizedModelId"]],
     ]);
+  });
+
+  it("5b. 分时规则随 request.timeRule 透传，固定价显式 null", async () => {
+    // 固定价：timeRule = null（wire 上仍是显式键，与 Rust Option 序列化一致）
+    const fixed = await usagePricingOverrideSet({
+      normalizedModelId: "glm-5.3",
+      currency: "USD",
+      input: "2",
+      cacheRead: null,
+      cacheWrite: null,
+      output: "8",
+      timeRule: null,
+    });
+    expect(fixed.find((view) => view.normalizedModelId === "glm-5-3")?.timeRule).toBeNull();
+
+    // 分时价：高峰四价 + 时区/窗口/低谷四价原样往返
+    const timeRule = {
+      timezone: "asiaShanghai" as const,
+      windows: [
+        { start: "09:00", end: "12:00" },
+        { start: "22:00", end: "02:00" },
+      ],
+      offpeakInput: "1",
+      offpeakCacheRead: "0.1",
+      offpeakCacheWrite: null,
+      offpeakOutput: "4",
+    };
+    const afterSet = await usagePricingOverrideSet({
+      normalizedModelId: "glm-5.3",
+      currency: "USD",
+      input: "2",
+      cacheRead: null,
+      cacheWrite: null,
+      output: "8",
+      timeRule,
+    });
+    const view = afterSet.find((item) => item.normalizedModelId === "glm-5-3");
+    expect(view?.timeRule).toEqual(timeRule);
+
+    await usagePricingOverrideDelete("glm-5.3");
   });
 
   it("8. 六条观察条目/模型配置/精选目录命令名、参数键与返回形状逐字对齐", async () => {

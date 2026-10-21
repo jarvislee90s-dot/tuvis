@@ -133,7 +133,7 @@ for in one ledger: the app collects once shortly after startup, and `usage_colle
 collection on demand (single-flight mutex + a default minimum interval of 10 minutes);
 **collection runs on its own on-demand path and never enters the 3-second session polling loop**. The ledger
 lives in 4 tables in `~/.tuvis/tuvis.db` (hourly detail, permanently kept daily aggregates, collection cursors,
-session dimension); detail is kept for 90 days by default (configurable), and after expiry only the daily
+session dimension); detail is kept for 90 days by default with a 90-day maximum (configurable), and after expiry only the daily
 aggregates remain.
 
 **Dashboard V2**: A Token overview stays expanded (new input / cache hit / cache miss / output /
@@ -165,21 +165,25 @@ previews the rule's matching tools, models and total tokens over the last 30 day
 when two subscriptions log the exact same raw provider string, aliases cannot split them and the channels stay
 merged; only the ambiguous row's "Bind billing attribution" or the footer's advanced entry (explicit billing
 binding) can help, and tokens are never split proportionally. Settings → "Display & pricing config" (the same entry as the cost card's "Manage config") and
-"Advanced overrides" now live in **one shared dialog**: the settings page and the D card open the same dialog, and
+"Custom price rules" now live in **one shared dialog**: the settings page and the D card open the same dialog, and
 the D card's "Manage config" opens it directly; the upper part holds the provider/model entries and the lower part
-is a collapsible advanced overrides section (collapsed by default). Settings and the D card are separate WebViews;
+is a collapsible custom price rules section (collapsed by default). Settings and the D card are separate WebViews;
 changes in Settings do not guarantee an immediate refresh of an already-open usage dashboard, and the in-dashboard config is the primary path. Entries default to the top 10 by usage in the last
-7 days, with "show all" and search at the bottom; each entry has three rows — raw identity (read-only) / provider
+7 days, with "show all" and search at the bottom, plus three sort keys (usage / raw provider / raw model, click again
+to reverse). Each entry has three rows — raw identity (read-only) / provider
 name (editable, applied globally to the same raw provider; empty-provider entries write a toolModel alias and stay
 "unassigned channel" when unnamed) + model name (editable, applied per (display provider, raw model)) / pricing
-identity (dropdown / search selection only). The advanced area keeps only the **four-rate override** (USD/CNY
-denominated); legacy billing-attribution binding / reference rules moved to the Records page footer's "Advanced" entry. Every advanced
-option has an Info icon with a hover/focus explanation; each model entry also has an "Override this model's price /
-Edit price override" shortcut that pre-fills the raw model name (normalized on save) and shows a "Four-rate override applied" badge when
-present. The override applies globally by **normalized model name**: no provider needed, custom display names do
+identity (dropdown / search selection only). "Custom price rules" supports **fixed** and **time-of-day** pricing:
+time-of-day uses peak rates inside multiple Monday–Friday peak windows (cross-midnight allowed) and off-peak rates
+elsewhere; a blank off-peak component falls back to the catalog rate; the time zone can be China Standard Time, UTC
+or system local and only affects API billing peak/off-peak calculation; a "peak × %" helper fills the off-peak rates.
+Legacy billing-attribution binding / reference rules moved to the Records page footer's "Advanced" entry. Every advanced
+option has an Info icon with a hover/focus explanation; each model entry also has a "Set custom price /
+Edit custom price" shortcut that pre-fills the raw model name (normalized on save) and shows a "Custom price applied" badge when
+present. The rule applies globally by **normalized model name**: no provider needed, custom display names do
 not participate, and it is not selected in pricing identities or reference rules. Pricing is matched automatically from the public
 models.dev catalog, with curated sources ranked **direct official providers (including China-site variants) >
-Ollama Cloud > OpenRouter**: model IDs are mechanically normalized then matched exactly; within a tier, the
+OpenRouter**; all-zero quotes are skipped in favour of the next non-zero candidate. Model IDs are mechanically normalized then matched exactly; within a tier, the
 latest `release_date` wins and the normalized model shares one price per currency. Prefix fallback is used only
 when the candidate is unique, or when multiple candidates match but all share exactly the same price; cross-family
 substitution still requires an explicitly chosen reference model. Models missing from the curated set stay
@@ -207,8 +211,8 @@ values.
 
 API-equivalent costs are estimated per channel / model row, with **no global cost total or channel subtotal**; the
 export bar has a separate **Cost CSV** (all cost rows for the current window, no totals, no BOM added by the
-frontend; six columns — channel key / channel kind / display name / normalized model / catalog release date /
-override flag — are appended after the existing 17, and the single-value `observed_provider` column is left empty
+frontend; seven columns — channel key / channel kind / display name / normalized model / catalog release date /
+override flag / price-rule kind — are appended after the existing 17, and the single-value `observed_provider` column is left empty
 when a row merges multiple raw providers or includes an unlabeled source, with the full evidence available in the
 UI tooltip).
 

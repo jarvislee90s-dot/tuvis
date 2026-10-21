@@ -186,6 +186,8 @@ function costRow(key: string, profileId: string, tokenUsage: number): CostRow {
     normalizedModelId: "gpt-5",
     pricingReleaseDate: "2025-08-07",
     priceOverride: false,
+    priceRuleKind: "none",
+    timeBreakdown: null,
   };
 }
 
@@ -641,6 +643,8 @@ function costOf(opts: {
     normalizedModelId: opts.normalizedModelId ?? "gpt-5",
     pricingReleaseDate: "2025-08-07",
     priceOverride: opts.priceOverride ?? false,
+    priceRuleKind: opts.priceRuleKind ?? "none",
+    timeBreakdown: opts.timeBreakdown ?? null,
   };
 }
 
@@ -1250,9 +1254,10 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
     );
 
     // 设置手动覆盖价（真实 mock 命令写入覆盖表并失效 USAGE_KEY）。
-    // 2026-10-20 第三轮：Manager 移入 D 卡「管理配置 → 高级覆盖」，状态面板只剩迁移提示。
+    // 2026-10-20 第三轮：Manager 移入 D 卡「管理配置 → 自定义价格规则」；
+    // 2026-10-21：状态面板不再渲染迁移提示（旧提示指向已改名的入口）。
     expect(screen.queryByTestId("price-override-manager")).toBeNull();
-    expect(screen.getByText(tf("usage.pricing.overridesMovedHint"))).toBeTruthy();
+    expect(screen.queryByText(tf("usage.pricing.overridesMovedHint"))).toBeNull();
     fireEvent.click(screen.getByTestId("usage-cost-manage"));
     fireEvent.click(await screen.findByTestId("usage-config-advanced-cost-toggle"));
     fireEvent.click(await screen.findByTestId("price-override-add"));
@@ -1266,10 +1271,10 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
       expect(screen.getByTestId(`usage-cost-amount-override:${MODEL}`)).toHaveTextContent("$0.003")
     );
     expect(screen.getByTestId(`usage-cost-override-override:${MODEL}`)).toHaveTextContent(
-      "用户覆盖价"
+      tf("usage.cost.priceOverride")
     );
     const details = screen.getByTestId(`usage-cost-details-override:${MODEL}`);
-    expect(details).toHaveTextContent("用户覆盖价");
+    expect(details).toHaveTextContent(tf("usage.cost.userOverride"));
     expect(details).not.toHaveTextContent("当前基准价回算");
 
     // 刷新价目表：mock 同步只写快照/状态，不碰覆盖表
@@ -1283,7 +1288,7 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
     );
     expect(screen.getByTestId(`usage-cost-amount-override:${MODEL}`)).toHaveTextContent("$0.003");
     expect(screen.getByTestId(`usage-cost-override-override:${MODEL}`)).toHaveTextContent(
-      "用户覆盖价"
+      tf("usage.cost.priceOverride")
     );
 
     restore();
@@ -1460,6 +1465,7 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
       "normalized_model_id",
       "pricing_release_date",
       "price_override",
+      "price_rule_kind",
     ];
 
     render(wrap(<UsageDashboardPage />));
@@ -1490,7 +1496,7 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
     for (const line of rows) {
       expect(line.split(",")).toHaveLength(header.length);
     }
-    expect(saved.content).toMatch(/,"true"$/m);
+    expect(saved.content).toMatch(/,"true","fixed"$/m);
   });
 });
 
@@ -1558,6 +1564,8 @@ describe("Task 10 验收：配置两段式联动 · 明细计费 · D 卡单表"
     normalizedModelId: "dsh-glm",
     pricingReleaseDate: "2025-10-01",
     priceOverride: false,
+    priceRuleKind: "none",
+    timeBreakdown: null,
     displayModelName: null,
   };
 
@@ -2222,7 +2230,8 @@ describe("Task 10 验收：配置两段式联动 · 明细计费 · D 卡单表"
     expect(saved.content).toContain('"0.000529"');
     expect(saved.content).not.toContain("¥");
     expect(saved.content).not.toContain("3.809");
-    expect(saved.content.split("\n")[0].split(",")).toHaveLength(23);
+    // 23 列 + 2026-10-21 追加的 price_rule_kind
+    expect(saved.content.split("\n")[0].split(",")).toHaveLength(24);
 
     // 切回 USD：展示层恢复
     fireEvent.click(screen.getByTestId("usage-cost-table-currency-usd"));

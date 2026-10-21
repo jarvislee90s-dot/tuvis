@@ -71,6 +71,7 @@ const APPENDED_COST_COLUMNS = [
   "normalized_model_id",
   "pricing_release_date",
   "price_override",
+  "price_rule_kind",
 ];
 const COST_COLUMNS = [...LEGACY_COST_COLUMNS, ...APPENDED_COST_COLUMNS];
 
@@ -190,7 +191,7 @@ describe("费用 CSV 导出（Task 18）", () => {
     expect(screen.getByTestId("usage-export-open-dir")).toBeTruthy();
   });
 
-  it("5. 费用 CSV 追加 6 列：无 BOM、无总计行、缺金额为空、公式中和原样", async () => {
+  it("5. 费用 CSV 追加 7 列：无 BOM、无总计行、缺金额为空、规则形态列在场", async () => {
     const range = { preset: "last7d" as const };
     const content = installExport({ content: mockUsageCostCsv(range) });
     render(<UsageExportActions {...props({ range })} />);
@@ -220,7 +221,12 @@ describe("费用 CSV 导出（Task 18）", () => {
       expect(["priced", "partial", "unpriced"]).toContain(row[8]);
       expect(["billingProfile", "alias", "provider", "unassigned", "ambiguous"]).toContain(row[18]);
       expect(["true", "false"]).toContain(row[22]);
+      // 新增末列：覆盖规则形态（none / fixed / time）
+      expect(["none", "fixed", "time"]).toContain(row[23]);
     }
+    // 夹具里 gpt-5 有固定覆盖价 → fixed；其余行为 none
+    expect(rows.some((row) => row[23] === "fixed")).toBe(true);
+    expect(rows.some((row) => row[23] === "none")).toBe(true);
     expect(content).not.toMatch(/"(?:总计|合计|grand\s+total)"/i);
     // 缺金额是空字段，不是 0
     const unpriced = rows.filter((row) => row[8] === "unpriced");

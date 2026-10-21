@@ -56,11 +56,11 @@ pub(crate) mod self_lock {
     );
 
     /// 排除区**结束**标记（每个文件**恰好 1 行**）。位置：有测试模块的文件 = 其测试模块的收口
-    /// `}` 之后（本域 30 个文件里它就是文件最后一行）；**无测试模块的 6 个文件**
-    /// （`caps.rs` / `delta.rs` / `model.rs` / `settings.rs` / `v2/model.rs` / `v2/mod.rs`）
+    /// `}` 之后（本域 32 个文件里它就是文件最后一行）；**无测试模块的 5 个文件**
+    /// （`caps.rs` / `delta.rs` / `model.rs` / `v2/model.rs` / `v2/mod.rs`）
     /// = **紧邻 BEGIN 之后**（排除区为空 ⇒ 整文件都在面内）。**分类由
     /// `collect::tests::usage_source_scan_covers_every_file_on_disk`
-    /// 机械钉住（30/6）**——给空区文件加测试模块而不同步这里，用例会红。
+    /// 机械钉住（32/5）**——给空区文件加测试模块而不同步这里，用例会红。
     pub(crate) const EXCLUDE_END: &str =
         concat!("// ==== usage 自省锁：", "排除区结束，勿删勿复制 ====");
 
@@ -107,7 +107,7 @@ pub(crate) mod self_lock {
 
     /// **排除区形态断言（第 6 轮 P1-A）**：排除区只允许两种形态 ——
     ///
-    /// * **空区**（两标记之间没有**非注释**行）：`caps.rs` / `delta.rs` / `model.rs` / `settings.rs`
+    /// * **空区**（两标记之间没有**非注释**行）：`caps.rs` / `delta.rs` / `model.rs`
     ///   / `v2/model.rs` / `v2/mod.rs`；
     /// * **测试模块区**：① 首个非空行 == `#[cfg(test)]`；② 次个非空行以 `mod ` 开头；
     ///   ③ 末个非空行 == `}`；④ **除这三行外，区内其余非空行一律必须缩进**。
@@ -128,7 +128,7 @@ pub(crate) mod self_lock {
     ///   宿主裁定**不为此重引入结构推断 / 大括号深度判据**（那会引入「字符串与注释里的括号误判」
     ///   一整类新代价，收益不抵）。
     /// * **已知误报面**：排除区内的**多行字符串字面量**若某行顶格（如 `r#"…"#` 里顶格的 JSON 夹具），
-    ///   会被当成顶格代码行 ⇒ **假红**（响亮、安全方向；当前 36 个文件实测 0 例）。
+    ///   会被当成顶格代码行 ⇒ **假红**（响亮、安全方向；当前 37 个文件实测 0 例）。
     ///   修法是把该行缩进（rustfmt **不会**重排字符串内容）。
     fn assert_exclude_shape(name: &str, region: &[&str]) {
         if region.is_empty() {
@@ -166,7 +166,7 @@ pub(crate) mod self_lock {
         );
     }
 
-    /// 该文件的排除区是否为空（空区 = 两标记之间没有**非注释**行）。供 30/6 普查用例使用。
+    /// 该文件的排除区是否为空（空区 = 两标记之间没有**非注释**行）。供 32/5 普查用例使用。
     pub(crate) fn exclusion_is_empty(name: &str, src: &str) -> bool {
         let raw: Vec<&str> = src.lines().collect();
         let (b, e) = markers(name, src);
@@ -227,7 +227,7 @@ pub(crate) mod self_lock {
 /// 顺序反、面空）此前在仓内**没有任何用例覆盖**（复审只能用变异间接打响前两条）。
 ///
 /// **本模块的存在会改变 `mod.rs` 的分类**：它从「相邻空区」变成「有测试模块」——
-/// `collect::tests::usage_source_scan_covers_every_file_on_disk` 的 **30/6** 断言与两处声明
+/// `collect::tests::usage_source_scan_covers_every_file_on_disk` 的 **32/5** 断言与两处声明
 /// 已同步（这正是 B-3 要的机械钉住）。
 // ==== usage 自省锁：以下为排除区（测试代码），勿删勿复制 ====
 #[cfg(test)]

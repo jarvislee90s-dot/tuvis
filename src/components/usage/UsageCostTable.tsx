@@ -149,12 +149,23 @@ function UsageCostCardRow({ row, channelName, t, showChannelName }: UsageCostCar
     >
       <div className="contents" data-testid={`usage-cost-row-${row.key}`}>
         <div className={TABLE_GRID_COLS}>
-          <span
-            data-testid={`usage-cost-name-${row.key}`}
-            className="min-w-0 truncate font-medium"
-            title={fullName}
-          >
-            {rowName}
+          <span className="flex min-w-0 items-center gap-1">
+            <span
+              data-testid={`usage-cost-name-${row.key}`}
+              className="min-w-0 truncate font-medium"
+              title={fullName}
+            >
+              {rowName}
+            </span>
+            {row.priceRuleKind === "time" ? (
+              <span
+                data-testid={`usage-cost-time-badge-${row.key}`}
+                className="shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-1.5 py-px text-[10px] text-amber-700 dark:text-amber-300"
+                title={t("usage.cost.timeRuleHint")}
+              >
+                {t("usage.cost.timeRule")}
+              </span>
+            ) : null}
           </span>
           <span data-testid={`usage-cost-amount-${row.key}`} className="text-right tabular-nums">
             <ConvertedPrice
@@ -245,6 +256,18 @@ function UsageCostCardRow({ row, channelName, t, showChannelName }: UsageCostCar
             >
               {t("usage.cost.priceOverride")}
             </span>
+          ) : null}
+          {row.priceRuleKind === "time" && row.timeBreakdown ? (
+            <p
+              data-testid={`usage-cost-time-breakdown-${row.key}`}
+              className="text-[11px] text-amber-700 dark:text-amber-300"
+            >
+              {t("usage.cost.timeBreakdown", {
+                peak: fmtTokens(row.timeBreakdown.peakTokens, lang),
+                offpeak: fmtTokens(row.timeBreakdown.offpeakTokens, lang),
+                fallback: fmtTokens(row.timeBreakdown.dailyFallbackTokens, lang),
+              })}
+            </p>
           ) : null}
         </div>
       </div>

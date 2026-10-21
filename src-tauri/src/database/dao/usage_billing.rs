@@ -10,7 +10,8 @@
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::services::usage::v2::model::{
-    BillingConfig, BillingRevision, PriceCurrency, PricingStatus,
+    BillingConfig, BillingRevision, PriceCurrency, PricingStatus, TimePriceTimezone,
+    TimePriceWindow,
 };
 use crate::services::usage::UsageError;
 
@@ -376,13 +377,24 @@ pub fn load_active_snapshot_conn(
 // 按归一化模型 ID 全局生效；`*_scaled` 与 pricing::parse_rate 同口径
 // （10^-9 `currency` / 百万 Token），四价逐项可空，至少一项非空。刷新流程绝不调用本组写函数。
 
+/// 分时规则中的低谷价格（与 `rates` 同序）与时段配置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimePriceRuleRecord {
+    pub timezone: TimePriceTimezone,
+    pub windows: Vec<TimePriceWindow>,
+    /// 顺序固定 `[input, cache_read, cache_write, output]`。
+    pub offpeak_rates: [Option<i128>; 4],
+}
+
 /// 一条手动覆盖价（内存侧用 `i128`，落库时校验并转换为 `i64`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceOverrideRecord {
     pub normalized_model_id: String,
     pub currency: PriceCurrency,
-    /// 顺序固定 `[input, cache_read, cache_write, output]`。
+    /// 顺序固定 `[input, cache_read, cache_write, output]`；分时规则下为高峰价。
     pub rates: [Option<i128>; 4],
+    /// `None` = 固定价；`Some` = 分时价。
+    pub time_rule: Option<TimePriceRuleRecord>,
     pub updated_at: i64,
 }
 
@@ -409,7 +421,11 @@ pub fn load_overrides_conn(conn: &Connection) -> Result<Vec<PriceOverrideRecord>
     let mut stmt = conn
         .prepare(
             "SELECT normalized_model_id, currency, input_scaled, cache_read_scaled,
-                    cache_write_scaled, output_scaled, updated_at
+                    cache_write_scaled, output_scaled,
+                    time_enabled, time_timezone, time_windows,
+                    offpeak_input_scaled, offpeak_cache_read_scaled,
+                    offpeak_cache_write_scaled, offpeak_output_scaled,
+                    updated_at
              FROM usage_price_override
              ORDER BY normalized_model_id",
         )
@@ -419,29 +435,66 @@ pub fn load_overrides_conn(conn: &Connection) -> Result<Vec<PriceOverrideRecord>
             let rate = |index: usize| -> rusqlite::Result<Option<i128>> {
                 Ok(row.get::<_, Option<i64>>(index)?.map(i128::from))
             };
-            let currency: String = row.get(1)?;
-            Ok(PriceOverrideRecord {
-                normalized_model_id: row.get(0)?,
-                // CHECK(currency IN ('USD','CNY')) 下不可达；纵深防御：脏值按 USD 读。
-                currency: PriceCurrency::parse(&currency).unwrap_or_default(),
-                rates: [rate(2)?, rate(3)?, rate(4)?, rate(5)?],
-                updated_at: row.get(6)?,
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                [rate(2)?, rate(3)?, rate(4)?, rate(5)?],
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                [rate(9)?, rate(10)?, rate(11)?, rate(12)?],
+                row.get::<_, i64>(13)?,
+            ))
         })
         .map_err(|e| db_failed("price override read failed", e))?;
     let mut records = Vec::new();
     for row in rows {
-        records.push(row.map_err(|e| db_failed("price override read failed", e))?);
+        let (normalized_model_id, currency, rates, enabled, timezone, windows, offpeak, updated_at) =
+            row.map_err(|e| db_failed("price override read failed", e))?;
+        let time_rule = if enabled != 0 {
+            match windows
+                .as_deref()
+                .ok_or("time_windows is null")
+                .and_then(|raw| {
+                    serde_json::from_str::<Vec<TimePriceWindow>>(raw).map_err(|_| "invalid JSON")
+                }) {
+                Ok(windows) => Some(TimePriceRuleRecord {
+                    timezone: TimePriceTimezone::parse(&timezone).unwrap_or_default(),
+                    windows,
+                    offpeak_rates: offpeak,
+                }),
+                Err(reason) => {
+                    // 手工改库等异常不得拖垮整张覆盖表：降级为固定价并留日志。
+                    log::warn!(
+                        "usage v2: price override {normalized_model_id} has invalid time rule ({reason}); falling back to fixed rates"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        records.push(PriceOverrideRecord {
+            normalized_model_id,
+            // CHECK(currency IN ('USD','CNY')) 下不可达；纵深防御：脏值按 USD 读。
+            currency: PriceCurrency::parse(&currency).unwrap_or_default(),
+            rates,
+            time_rule,
+            updated_at,
+        });
     }
     Ok(records)
 }
 
 /// 插入或整体替换一条覆盖价（参数化；未给出的分量写 NULL）。
+///
+/// `time_rule` 为空 = 固定价（清空分时列）；非空 = 分时价，`rates` 为高峰价。
 pub fn upsert_override_conn(
     conn: &Connection,
     normalized_model_id: &str,
     currency: PriceCurrency,
     rates: &[Option<i128>; 4],
+    time_rule: Option<&TimePriceRuleRecord>,
     now_ms: i64,
 ) -> Result<(), UsageError> {
     let scaled = [
@@ -456,17 +509,53 @@ pub fn upsert_override_conn(
             "price override must set at least one rate",
         ));
     }
+    let (time_enabled, timezone, windows, offpeak) = match time_rule {
+        Some(rule) => {
+            let offpeak = [
+                override_scaled(rule.offpeak_rates[0], OVERRIDE_COMPONENTS[0])?,
+                override_scaled(rule.offpeak_rates[1], OVERRIDE_COMPONENTS[1])?,
+                override_scaled(rule.offpeak_rates[2], OVERRIDE_COMPONENTS[2])?,
+                override_scaled(rule.offpeak_rates[3], OVERRIDE_COMPONENTS[3])?,
+            ];
+            if offpeak.iter().all(Option::is_none) {
+                return Err(UsageError::new(
+                    "usage-settings-invalid",
+                    "time price rule must set at least one offpeak rate",
+                ));
+            }
+            let windows = serde_json::to_string(&rule.windows)
+                .map_err(|e| db_failed("price override time windows encode failed", e))?;
+            (1_i64, rule.timezone.as_str(), Some(windows), offpeak)
+        }
+        None => (
+            0_i64,
+            TimePriceTimezone::default().as_str(),
+            None,
+            [None; 4],
+        ),
+    };
     conn.execute(
         "INSERT INTO usage_price_override
              (normalized_model_id, currency, input_scaled, cache_read_scaled,
-              cache_write_scaled, output_scaled, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+              cache_write_scaled, output_scaled,
+              time_enabled, time_timezone, time_windows,
+              offpeak_input_scaled, offpeak_cache_read_scaled,
+              offpeak_cache_write_scaled, offpeak_output_scaled,
+              updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(normalized_model_id) DO UPDATE SET
              currency = excluded.currency,
              input_scaled = excluded.input_scaled,
              cache_read_scaled = excluded.cache_read_scaled,
              cache_write_scaled = excluded.cache_write_scaled,
              output_scaled = excluded.output_scaled,
+             time_enabled = excluded.time_enabled,
+             time_timezone = excluded.time_timezone,
+             time_windows = excluded.time_windows,
+             offpeak_input_scaled = excluded.offpeak_input_scaled,
+             offpeak_cache_read_scaled = excluded.offpeak_cache_read_scaled,
+             offpeak_cache_write_scaled = excluded.offpeak_cache_write_scaled,
+             offpeak_output_scaled = excluded.offpeak_output_scaled,
              updated_at = excluded.updated_at",
         params![
             normalized_model_id,
@@ -475,6 +564,13 @@ pub fn upsert_override_conn(
             scaled[1],
             scaled[2],
             scaled[3],
+            time_enabled,
+            timezone,
+            windows,
+            offpeak[0],
+            offpeak[1],
+            offpeak[2],
+            offpeak[3],
             now_ms
         ],
     )

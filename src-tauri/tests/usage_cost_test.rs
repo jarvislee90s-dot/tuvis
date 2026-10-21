@@ -8,7 +8,8 @@ use multi_agents_manager_lib::services::usage::v2::cost_query::{
     cost_csv_with_conn, costs_with_conn,
 };
 use multi_agents_manager_lib::services::usage::v2::model::{
-    ChannelKind, CostStatus, PriceCurrency, PriceOverrideRequest, PricingBasis,
+    ChannelKind, CostStatus, PriceCurrency, PriceOverrideRequest, PriceRuleKind, PricingBasis,
+    TimePriceRule, TimePriceTimezone, TimePriceWindow,
 };
 use multi_agents_manager_lib::services::usage::v2::model::{
     ModelDisplayNameRequest, PricingIdentityRequest, PricingReference,
@@ -72,6 +73,77 @@ fn add_detail(conn: &Connection, day: &str, hour: &str, source: &str, provider: 
         params![source, hour, day, provider],
     )
     .unwrap();
+}
+
+/// 指定四桶的小时明细行（分时价格用例）：`requestTotal = fresh + read + write`，
+/// 保证 `safe_components` 的互斥恢复口径与生产一致。
+#[allow(clippy::too_many_arguments)]
+fn add_detail_buckets(
+    conn: &Connection,
+    hour_key: &str,
+    source: &str,
+    provider: &str,
+    model: &str,
+    input_fresh: i64,
+    cache_read: i64,
+    cache_write: i64,
+    output: i64,
+) {
+    let day_key: String = hour_key.chars().take(10).collect();
+    let request_total = input_fresh + cache_read + cache_write;
+    conn.execute(
+        "INSERT INTO usage_detail
+         (source_id, session_id, project_key, hour_key, day_key, model, provider,
+          provider_kind, input_fresh, cache_read, cache_write, output,
+          request_total, requests, user_est, first_seen_at, updated_at)
+         VALUES (?1, 's1', '', ?2, ?3, ?4, ?5, 'measured', ?6, ?7, ?8, ?9, ?10, 1, NULL, 0, 0)",
+        params![
+            source,
+            hour_key,
+            day_key,
+            model,
+            provider,
+            input_fresh,
+            cache_read,
+            cache_write,
+            output,
+            request_total
+        ],
+    )
+    .unwrap();
+}
+
+fn timed_override_request(
+    model: &str,
+    peak_input: &str,
+    peak_output: Option<&str>,
+    offpeak_input: Option<&str>,
+    offpeak_output: Option<&str>,
+    timezone: TimePriceTimezone,
+    windows: &[(&str, &str)],
+) -> PriceOverrideRequest {
+    PriceOverrideRequest {
+        normalized_model_id: model.to_string(),
+        currency: PriceCurrency::Usd,
+        input: Some(peak_input.to_string()),
+        cache_read: None,
+        cache_write: None,
+        output: peak_output.map(str::to_string),
+        time_rule: Some(TimePriceRule {
+            timezone,
+            windows: windows
+                .iter()
+                .map(|(start, end)| TimePriceWindow {
+                    start: (*start).to_string(),
+                    end: (*end).to_string(),
+                })
+                .collect(),
+            offpeak_input: offpeak_input.map(str::to_string),
+            offpeak_cache_read: None,
+            offpeak_cache_write: None,
+            offpeak_output: offpeak_output.map(str::to_string),
+        }),
+    }
 }
 
 fn profile(id: &str, name: &str) -> Value {
@@ -385,6 +457,7 @@ fn cost_rows_have_no_aggregate_total_fields() {
             "normalizedModelId",
             "observedProviders",
             "priceOverride",
+            "priceRuleKind",
             "priceUpdatedAt",
             "pricedTokens",
             "pricedTokensCny",
@@ -396,6 +469,7 @@ fn cost_rows_have_no_aggregate_total_fields() {
             "sourceIds",
             "status",
             "statusCny",
+            "timeBreakdown",
             "tokenUsage",
             "unpricedTokens",
             "unpricedTokensCny",
@@ -475,17 +549,18 @@ fn csv_header_is_frozen_and_cells_are_escaped() {
     );
 
     let csv = cost_csv_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms()).unwrap();
-    let header = "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override";
+    let header = "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override,price_rule_kind";
     assert!(csv.starts_with(&format!("{header}\n")));
     assert!(!csv.starts_with('\u{feff}'));
 
     let records = csv_records(&csv);
     assert_eq!(records.len(), 2, "header + 1 data row，无总计行");
-    assert_eq!(records[0].len(), 23);
-    assert_eq!(records[1].len(), 23, "引号内的逗号/换行不得破坏列数");
+    assert_eq!(records[0].len(), 24);
+    assert_eq!(records[1].len(), 24, "引号内的逗号/换行不得破坏列数");
     assert_eq!(records[1][1], format!("'{evil_name}"), "公式前缀必须先中和");
     assert_eq!(records[1][2], "codex");
     assert_eq!(records[1][16], "1000");
+    assert_eq!(records[1][23], "none", "无自定义规则必须标记 none");
     assert!(!records
         .iter()
         .any(|record| record.iter().any(|cell| cell.eq_ignore_ascii_case("total"))));
@@ -891,7 +966,7 @@ fn csv_null_coverage_is_an_empty_cell() {
 
     let csv = cost_csv_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms()).unwrap();
     let records = csv_records(&csv);
-    assert_eq!(records[1].len(), 23);
+    assert_eq!(records[1].len(), 24);
     assert_eq!(records[1][11], "", "coverage null 必须是空字段");
     assert_eq!(records[1][7], "", "amount null 必须是空字段");
 }
@@ -918,6 +993,7 @@ fn override_request(
         cache_read: cache_read.map(str::to_string),
         cache_write: cache_write.map(str::to_string),
         output: output.map(str::to_string),
+        time_rule: None,
     }
 }
 
@@ -1167,7 +1243,11 @@ fn csv_observed_provider_is_blank_for_merged_or_unlabeled_evidence() {
     let csv = cost_csv_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms()).unwrap();
     let records = csv_records(&csv);
     assert_eq!(records.len(), 2, "header + 合并后的 1 行");
-    assert_eq!(records[1].len(), 23, "不得新增列，保持 23 列契约");
+    assert_eq!(
+        records[1].len(),
+        24,
+        "固定 24 列契约（末尾追加 price_rule_kind）"
+    );
     assert_eq!(
         records[1][3], "",
         "多个原始 provider 合并时 observed_provider 列必须留空"
@@ -1188,7 +1268,7 @@ fn csv_observed_provider_is_blank_for_merged_or_unlabeled_evidence() {
     let csv = cost_csv_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms()).unwrap();
     let records = csv_records(&csv);
     assert_eq!(records.len(), 2, "header + 混合后的 1 行");
-    assert_eq!(records[1].len(), 23);
+    assert_eq!(records[1].len(), 24);
     assert_eq!(
         records[1][3], "",
         "存在未标注行时 observed_provider 列必须留空"
@@ -1377,6 +1457,12 @@ fn manual_override_applies_over_catalog_and_survives_refresh_failure() {
     assert!(row.price_override);
     assert_eq!(row.pricing_basis, PricingBasis::UserOverride);
     assert_eq!(
+        row.price_rule_kind,
+        multi_agents_manager_lib::services::usage::v2::model::PriceRuleKind::Fixed,
+        "固定价覆盖必须标记 fixed"
+    );
+    assert_eq!(row.time_breakdown, None);
+    assert_eq!(
         row.components
             .input
             .as_ref()
@@ -1426,6 +1512,10 @@ fn manual_override_prices_without_catalog_and_hides_source_fields() {
     let row = &costs.rows[0];
     assert!(row.price_override);
     assert_eq!(row.pricing_basis, PricingBasis::UserOverride);
+    assert_eq!(
+        row.price_rule_kind,
+        multi_agents_manager_lib::services::usage::v2::model::PriceRuleKind::Fixed
+    );
     assert_eq!(row.estimated_usd.as_deref(), Some("0.00015"));
     assert_eq!(row.status, CostStatus::Priced);
     assert_eq!(row.pricing_reference, None, "纯覆盖价不得冒充目录来源");
@@ -1437,6 +1527,345 @@ fn manual_override_prices_without_catalog_and_hides_source_fields() {
         Some("m"),
         "纯覆盖价保留覆盖键的归一化 ID（供核对），但不冒充目录 reference"
     );
+}
+
+// ── 分时价格（2026-10-21）──────────────────────────────────────────────────
+
+/// DeepSeek 两个高峰窗口（09–12、14–18）：高峰小时用高峰价、午休与夜间用低谷价，
+/// `timeBreakdown` 与加权单价必须按真实小时分布给出。
+#[test]
+fn time_override_uses_peak_and_offpeak_rates_per_window() {
+    let mut conn = support::open_ledger_db("cost_time_windows");
+    for hour in ["09", "11", "14", "17"] {
+        add_detail_buckets(
+            &conn,
+            &format!("2026-10-16T{hour}"),
+            "codex",
+            "deepseek",
+            "deepseek-chat",
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+    }
+    for hour in ["08", "12", "18", "23"] {
+        add_detail_buckets(
+            &conn,
+            &format!("2026-10-16T{hour}"),
+            "codex",
+            "deepseek",
+            "deepseek-chat",
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+    }
+    pricing::set_override_with_conn(
+        &mut conn,
+        &timed_override_request(
+            "deepseek-chat",
+            "5",
+            None,
+            Some("2"),
+            None,
+            TimePriceTimezone::Local,
+            &[("09:00", "12:00"), ("14:00", "18:00")],
+        ),
+        now_ms(),
+    )
+    .unwrap();
+
+    let costs = costs_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms(), None).unwrap();
+    assert_eq!(costs.rows.len(), 1, "同一渠道/模型聚合成一行");
+    let row = &costs.rows[0];
+    assert_eq!(row.token_usage, 8_000_000);
+    assert!(row.price_override);
+    assert_eq!(row.pricing_basis, PricingBasis::UserOverride);
+    assert_eq!(row.price_rule_kind, PriceRuleKind::Time);
+    let breakdown = row
+        .time_breakdown
+        .as_ref()
+        .expect("分时行必须带 timeBreakdown");
+    assert_eq!(breakdown.peak_tokens, 4_000_000, "09/11/14/17 为高峰");
+    assert_eq!(breakdown.offpeak_tokens, 4_000_000, "08/12/18/23 为低谷");
+    assert_eq!(breakdown.daily_fallback_tokens, 0);
+    assert_eq!(row.estimated_usd.as_deref(), Some("28"), "4M×5 + 4M×2 = 28");
+    let input = row.components.input.as_ref().expect("input 必须计价");
+    assert_eq!(input.tokens, 8_000_000);
+    assert_eq!(
+        input.unit_usd_per_million.as_deref(),
+        Some("3.5"),
+        "跨小时单价必须用金额/Token 加权，不得取最后一个小时的费率"
+    );
+    assert_eq!(input.estimated_usd.as_deref(), Some("28"));
+    assert!(
+        !row.reasons
+            .iter()
+            .any(|reason| reason == "timePriceDailyFallback"),
+        "小时明细可用时不得走日聚合回退：{:?}",
+        row.reasons
+    );
+
+    let csv = cost_csv_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms()).unwrap();
+    let records = csv_records(&csv);
+    assert_eq!(records[1].len(), 24);
+    assert_eq!(records[1][23], "time", "CSV 末列必须标记分时价");
+}
+
+/// 手动显式 0 价是最优先来源：不得被目录价补洞（与自动匹配跳过全 0 相反）。
+#[test]
+fn manual_explicit_zero_rate_is_used_instead_of_catalog_price() {
+    let mut conn = support::open_ledger_db("cost_override_zero");
+    add_detail_buckets(
+        &conn,
+        "2026-10-16T10",
+        "codex",
+        "openai",
+        "m",
+        1_000_000,
+        0,
+        0,
+        0,
+    );
+    put_pricing(
+        &conn,
+        &catalog(json!({"m": priced_model("m", true)})),
+        1_000,
+    );
+    pricing::set_override_with_conn(
+        &mut conn,
+        &override_request("m", Some("0"), None, None, None),
+        now_ms(),
+    )
+    .unwrap();
+
+    let costs = costs_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms(), None).unwrap();
+    let row = &costs.rows[0];
+    assert!(row.price_override);
+    assert_eq!(row.pricing_basis, PricingBasis::UserOverride);
+    assert_eq!(row.price_rule_kind, PriceRuleKind::Fixed);
+    assert_eq!(
+        row.estimated_usd.as_deref(),
+        Some("0"),
+        "显式 0 价金额就是 0"
+    );
+    assert_eq!(
+        row.components
+            .input
+            .as_ref()
+            .unwrap()
+            .unit_usd_per_million
+            .as_deref(),
+        Some("0"),
+        "不得被目录 input=2 补洞"
+    );
+}
+
+/// 跨午夜窗口（22–02）：工作日深夜与次日凌晨都算高峰，周六深夜/周日凌晨不算。
+#[test]
+fn time_override_handles_cross_midnight_and_weekend_boundaries() {
+    let mut conn = support::open_ledger_db("cost_time_cross_midnight");
+    for hour in [
+        "2026-10-15T23", // Thursday
+        "2026-10-16T01", // Friday, from Thursday
+        "2026-10-17T01", // Saturday, from Friday
+    ] {
+        add_detail_buckets(
+            &conn,
+            hour,
+            "codex",
+            "deepseek",
+            "deepseek-chat",
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+    }
+    for hour in ["2026-10-16T12", "2026-10-16T21", "2026-10-17T12"] {
+        add_detail_buckets(
+            &conn,
+            hour,
+            "codex",
+            "deepseek",
+            "deepseek-chat",
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+    }
+    pricing::set_override_with_conn(
+        &mut conn,
+        &timed_override_request(
+            "deepseek-chat",
+            "5",
+            None,
+            Some("1"),
+            None,
+            TimePriceTimezone::Local,
+            &[("22:00", "02:00")],
+        ),
+        now_ms(),
+    )
+    .unwrap();
+
+    let costs = costs_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms(), None).unwrap();
+    let row = &costs.rows[0];
+    let breakdown = row.time_breakdown.as_ref().unwrap();
+    assert_eq!(breakdown.peak_tokens, 3_000_000);
+    assert_eq!(breakdown.offpeak_tokens, 3_000_000);
+    assert_eq!(row.estimated_usd.as_deref(), Some("18"), "3M×5 + 3M×1 = 18");
+    assert_eq!(
+        row.components
+            .input
+            .as_ref()
+            .unwrap()
+            .unit_usd_per_million
+            .as_deref(),
+        Some("3")
+    );
+}
+
+/// 日聚合回退（无小时明细）：无法区分峰谷 ⇒ 整段按低谷价估算，标注 reason 与
+/// `dailyFallbackTokens`；低谷缺项的分量回退目录价。
+#[test]
+fn time_override_daily_fallback_uses_offpeak_and_reports_reason() {
+    let mut conn = support::open_ledger_db("cost_time_daily_fallback");
+    add_daily(&conn, "2026-10-16", "codex", "", "measured", "m", 5);
+    put_pricing(
+        &conn,
+        &catalog(json!({"m": priced_model("m", true)})),
+        1_000,
+    );
+    pricing::set_override_with_conn(
+        &mut conn,
+        &timed_override_request(
+            "m",
+            "5",
+            Some("20"),
+            Some("1"),
+            None,
+            TimePriceTimezone::Local,
+            &[("09:00", "12:00")],
+        ),
+        now_ms(),
+    )
+    .unwrap();
+
+    let costs = costs_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms(), None).unwrap();
+    let row = &costs.rows[0];
+    assert_eq!(row.token_usage, 15);
+    assert_eq!(row.price_rule_kind, PriceRuleKind::Time);
+    let breakdown = row.time_breakdown.as_ref().expect("回退行仍属分时规则");
+    assert_eq!(breakdown.peak_tokens, 0);
+    assert_eq!(breakdown.offpeak_tokens, 0);
+    assert_eq!(breakdown.daily_fallback_tokens, 15);
+    assert!(
+        row.reasons
+            .iter()
+            .any(|reason| reason == "timePriceDailyFallback"),
+        "日聚合回退必须标注 timePriceDailyFallback：{:?}",
+        row.reasons
+    );
+    // input 10 tokens × 低谷 1；output 5 tokens × 目录 10（低谷未给 output）。
+    assert_eq!(row.estimated_usd.as_deref(), Some("0.00006"));
+    assert_eq!(
+        row.components
+            .input
+            .as_ref()
+            .unwrap()
+            .unit_usd_per_million
+            .as_deref(),
+        Some("1"),
+        "日聚合回退按低谷价估算"
+    );
+    assert_eq!(
+        row.components
+            .output
+            .as_ref()
+            .unwrap()
+            .unit_usd_per_million
+            .as_deref(),
+        Some("10"),
+        "低谷 output 缺项必须回退目录价"
+    );
+    assert!(row.pricing_reference.is_some(), "回退分量仍使用目录来源");
+}
+
+/// 小时明细下低谷缺项同样回退目录价（不是 0 价，也不是高峰价）。
+#[test]
+fn time_override_offpeak_missing_component_falls_back_to_catalog() {
+    let mut conn = support::open_ledger_db("cost_time_offpeak_fallback");
+    add_detail_buckets(
+        &conn,
+        "2026-10-16T12",
+        "codex",
+        "openai",
+        "m",
+        1_000_000,
+        0,
+        0,
+        1_000_000,
+    );
+    put_pricing(
+        &conn,
+        &catalog(json!({"m": priced_model("m", true)})),
+        1_000,
+    );
+    pricing::set_override_with_conn(
+        &mut conn,
+        &timed_override_request(
+            "m",
+            "5",
+            Some("20"),
+            Some("2"),
+            None,
+            TimePriceTimezone::Local,
+            &[("09:00", "12:00")],
+        ),
+        now_ms(),
+    )
+    .unwrap();
+
+    let costs = costs_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms(), None).unwrap();
+    let row = &costs.rows[0];
+    let breakdown = row.time_breakdown.as_ref().unwrap();
+    assert_eq!(breakdown.offpeak_tokens, 2_000_000);
+    assert_eq!(breakdown.peak_tokens, 0);
+    assert_eq!(
+        row.estimated_usd.as_deref(),
+        Some("12"),
+        "input 1M×低谷 2 + output 1M×目录 10 = 12"
+    );
+    assert_eq!(
+        row.components
+            .input
+            .as_ref()
+            .unwrap()
+            .unit_usd_per_million
+            .as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        row.components
+            .output
+            .as_ref()
+            .unwrap()
+            .unit_usd_per_million
+            .as_deref(),
+        Some("10")
+    );
+    assert_eq!(row.price_rule_kind, PriceRuleKind::Time);
+    assert_eq!(row.pricing_basis, PricingBasis::UserOverride);
+
+    // CSV 的 price_rule_kind 与行内标记一致（不依赖高峰判定）。
+    let csv = cost_csv_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms()).unwrap();
+    let records = csv_records(&csv);
+    assert_eq!(records[1].len(), 24);
+    assert_eq!(records[1][23], "time");
 }
 
 #[test]
@@ -1467,12 +1896,12 @@ fn csv_appends_channel_and_pricing_context_columns() {
     .unwrap();
 
     let csv = cost_csv_with_conn(&conn, &range(UsageRangePreset::Last7d), now_ms()).unwrap();
-    let header = "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override";
+    let header = "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override,price_rule_kind";
     assert!(csv.starts_with(&format!("{header}\n")));
     let records = csv_records(&csv);
     assert_eq!(records.len(), 2, "header + 1 data row，无总计行");
-    assert_eq!(records[0].len(), 23);
-    assert_eq!(records[1].len(), 23);
+    assert_eq!(records[0].len(), 24);
+    assert_eq!(records[1].len(), 24);
     assert_eq!(records[1][15], "userOverride");
     assert_eq!(records[1][17], "provider:openai");
     assert_eq!(records[1][18], "provider");
@@ -1480,6 +1909,7 @@ fn csv_appends_channel_and_pricing_context_columns() {
     assert_eq!(records[1][20], "gpt-4o");
     assert_eq!(records[1][21], "2024-08-06");
     assert_eq!(records[1][22], "true");
+    assert_eq!(records[1][23], "fixed", "CSV 末列必须标记固定价覆盖");
     assert!(!records
         .iter()
         .any(|record| record.iter().any(|cell| cell.eq_ignore_ascii_case("total"))));
@@ -1955,6 +2385,7 @@ fn pricing_identity_override_sits_between_rule_and_auto_match() {
             cache_read: None,
             cache_write: None,
             output: Some("99".to_string()),
+            time_rule: None,
         },
         now_ms(),
     )
@@ -2341,6 +2772,7 @@ fn cny_override_prices_convert_into_usd_row_with_converted_flag() {
             cache_read: None,
             cache_write: None,
             output: None,
+            time_rule: None,
         },
         2_000,
     )

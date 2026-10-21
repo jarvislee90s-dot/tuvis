@@ -4,7 +4,7 @@
 // 弹窗内仍保留可折叠的高级区（默认收起，展开才挂载四价覆盖管理器）。
 //
 // 壳纪律：
-//  * 加宽弹窗 ≈1100px，1040 窗口自动收窄；只纵向滚动，无横向滚动；
+//  * 宽度与主看板窗口一致：初始 1040px、最小 840px（受当前窗口宽度约束）；只纵向滚动；
 //  * 弹窗内容只在打开时挂载 ⇒ observed entries / 覆盖价查询随打开态门控；
 //  * 设置页用自带触发按钮；D 卡用受控 `open`（「管理配置」按钮打开）。
 import { useState, type ReactNode } from "react";
@@ -51,7 +51,7 @@ export function UsageConfigDialog({
       {trigger ? <DialogTrigger asChild>{trigger}</DialogTrigger> : null}
       <DialogContent
         data-testid={`usage-config-dialog-${instanceId}`}
-        className="max-h-[85vh] w-full max-w-[min(1100px,calc(100vw-2rem))] overflow-x-hidden overflow-y-auto sm:max-w-[min(1100px,calc(100vw-2rem))]"
+        className="max-h-[85vh] w-[1040px] max-w-[calc(100vw-2rem)] min-w-[min(840px,calc(100vw-2rem))] overflow-x-hidden overflow-y-auto sm:max-w-[calc(100vw-2rem)]"
         onOpenAutoFocus={(event) => {
           // Radix 默认聚焦第一个可 tab 元素（标题旁的 InfoTip 按钮），聚焦会立刻打开
           // Tooltip，而 Tooltip 的 DismissableLayer 会先消费掉第一次 Esc。
