@@ -1,6 +1,6 @@
 [package]
 name = "tuvis"
-version = "0.5.8"
+version = "0.6.0"
 description = "你的桌面多 Agent 指挥台"
 authors = ["jarvis"]
 edition = "2021"
