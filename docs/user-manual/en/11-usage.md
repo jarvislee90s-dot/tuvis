@@ -6,7 +6,7 @@ One ledger shows at a glance how many tokens each tool burns — collected autom
 
 Tuvis keeps one ledger for seven tools — Claude Code / Codex / Kimi Code / OpenCode / ZCode / WorkBuddy / dsh (OpenClaw is not collected yet). It only reads and aggregates each tool's own session records on this machine and reports no telemetry of any kind; the ledger lives in `~/.tuvis/tuvis.db`, hourly-bucket details are kept for 90 days by default with a 90-day maximum (configurable), and only daily aggregates remain after that.
 
-Collection cadence: one automatic catch-up shortly after app launch, then on the configured interval (single-flight mutex plus a minimum-interval floor — it never rides on the 3-second session polling). **Settings → Usage statistics** offers "collect now" at any time plus a master switch — when off, nothing is collected or written (settings and export keep working, and the export covers the existing ledger).
+Collection cadence: one automatic catch-up shortly after app launch, then on the configured interval (single-flight mutex plus a minimum-interval floor — it never rides on the 3-second session polling). **Settings → Usage statistics** offers "collect now" at any time plus a master switch — when off, nothing is collected or written (settings and export keep working, and the export covers the existing ledger). Numeric settings (mini-bar tool rows / detail retention / collection interval) keep a draft while typing and clamp/save only on blur or Enter, so values do not change mid-keystroke.
 
 ## Opening the big board
 
