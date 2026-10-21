@@ -152,10 +152,17 @@ pub struct CodexControlHub {
     /// 测试缝：兜底回合最短执行时长（毫秒；生产恒 0 = 不延迟）——回归测试注入
     /// 「分钟级兜底」，验证调度循环与单 thread 兜底执行解耦（PR #165 审查 Important）
     compat_min_duration_ms: AtomicU64,
+    /// #172/T7：审批回执的「消失确认」窗口（毫秒）。生产 5000（决策后等 request 从新
+    /// snapshot 消失）；测试构造默认 0（不等待、不影响既有用例），需要验证超时的用例
+    /// 用 [`set_decision_confirm_ms`](Self::set_decision_confirm_ms) 收窄。
+    decision_confirm_ms: AtomicU64,
 }
 
 /// 周期对账默认间隔（R7.2：有界定时器；空待发集合时只有一条 EXISTS 级查询）。
 pub(crate) const RECONCILE_PERIOD_MS: u64 = 30_000;
+
+/// #172/T7：审批决策后等「pending 从新快照消失」的窗口（受理 ≠ 生效）。
+pub(crate) const DECISION_CONFIRM_MS: u64 = 5_000;
 
 impl CodexControlHub {
     /// 测试/关闭态装配（计划 Task 8 接口）：一切能力关闭、恒 CompatOnly/拒绝。
@@ -226,6 +233,40 @@ impl CodexControlHub {
         adapter.set_probe_ledger(Arc::new(StoreProbeLedger {
             store: store.clone(),
         }));
+        // #172/T7：官方 schema 证据（未知 build 的审批决策词来源）。**一次性**在装配期
+        // 后台跑（3s 上限，失败静默）：它只决定「未知 build 的审批卡能不能给
+        // accept/cancel」——拿不到证据就保持「到桌面处理」，绝不影响读/发。
+        // 只在未知 build 上跑（shipped build 有真机审批证据，不需要）。
+        if adapter.probe_eligible() {
+            // 同步上下文里 `tokio::spawn` 会 panic（无 reactor）：只在有 runtime 时后台跑
+            // （生产装配必在 runtime 内；纯同步测试构造 hub 时安静跳过）。
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let adapter_for_schema = adapter.clone();
+                handle.spawn(async move {
+                    match crate::services::codex_desktop_ipc::probe::schema_probe::probe_schema()
+                        .await
+                    {
+                        crate::services::codex_desktop_ipc::probe::schema_probe::SchemaProbeOutcome::Known(
+                            evidence,
+                        ) => {
+                            log::info!(
+                                "codex-ipc schema: fingerprint={} command={:?} file={:?}",
+                                evidence.fingerprint,
+                                evidence.command_decisions,
+                                evidence.file_decisions
+                            );
+                            adapter_for_schema.set_schema_evidence(Some(evidence));
+                        }
+                        crate::services::codex_desktop_ipc::probe::schema_probe::SchemaProbeOutcome::Unknown {
+                            error_code,
+                        } => {
+                            // 拿不到就保持关闭（审批卡走「到桌面处理」），不重试、不猜
+                            log::info!("codex-ipc schema: 未取证（{error_code}），审批保持关闭");
+                        }
+                    }
+                });
+            }
+        }
         // FollowGate 单实例同源（R7 复审 P2-1）：AdapterDispatch（ensure 失败回滚判定）
         // 与 hub（SSE 引用计数）必须看同一份关注引用——双实例会让派发侧误判零引用，
         // 把有活跃订阅的 thread 挤出 following 且恢复循环不再重建
@@ -236,6 +277,8 @@ impl CodexControlHub {
         });
         let mut hub = Self::with_parts(store, adapter, dispatch, true);
         hub.gate = gate;
+        // #172/T7：审批回执的消失确认窗口（5s）——受理后等 pending 真的从快照消失
+        hub.set_decision_confirm_ms(DECISION_CONFIRM_MS);
         hub
     }
 
@@ -261,7 +304,20 @@ impl CodexControlHub {
             sched: Mutex::new(None),
             reconcile_period_ms: AtomicU64::new(RECONCILE_PERIOD_MS),
             compat_min_duration_ms: AtomicU64::new(0),
+            decision_confirm_ms: AtomicU64::new(0),
         }
+    }
+
+    /// #172/T7：审批回执「消失确认」窗口（毫秒）。生产装配显式设 5000。
+    #[doc(hidden)]
+    pub fn set_decision_confirm_ms(&self, ms: u64) {
+        self.decision_confirm_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn decision_confirm_ms(&self) -> u64 {
+        self.decision_confirm_ms
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 测试装配变体：注入 adapter 并以生产形态装配派发缝（AdapterDispatch 包住注入的
@@ -2296,6 +2352,8 @@ pub async fn pending_response(
     };
     let kind = match pending.kind {
         PendingKind::CommandApproval => ActionKind::CommandApproval,
+        // #172/T7：文件变更审批与命令审批同属 L3（账本动作类别共用）
+        PendingKind::FileChangeApproval => ActionKind::FileChangeApproval,
         PendingKind::PermissionsApproval => ActionKind::PermissionsApproval,
         PendingKind::UserInput => ActionKind::UserInput,
         PendingKind::Unsupported => return capability_unavailable(),
@@ -2304,8 +2362,10 @@ pub async fn pending_response(
     let compatible = matches!(
         (&pending_action, pending.kind),
         (PendingAction::Approve, PendingKind::CommandApproval)
+            | (PendingAction::Approve, PendingKind::FileChangeApproval)
             | (PendingAction::Approve, PendingKind::PermissionsApproval)
             | (PendingAction::Reject, PendingKind::CommandApproval)
+            | (PendingAction::Reject, PendingKind::FileChangeApproval)
             | (PendingAction::Reject, PendingKind::PermissionsApproval)
             | (PendingAction::Answer(_), PendingKind::UserInput)
     );
@@ -2329,7 +2389,13 @@ pub async fn pending_response(
         )
         .await
     {
-        RouterOutcome::Completed(receipt) => {
+        RouterOutcome::Completed(mut receipt) => {
+            // #172/T7：**受理 ≠ 生效**——decision 之后等 requestId 从新 snapshot 消失
+            //（≤ `decision_confirm_ms`）；仍在场 → 如实标 `decision_unconfirmed`
+            //（前端提示「未确认，可终止本轮」），绝不假装成功。
+            if receipt.delivery == Delivery::Accepted {
+                receipt = confirm_decision_gone(hub, &ctx.key, &request_key, receipt).await;
+            }
             let result = audit_result_of_receipt(&receipt);
             codex_audit(
                 &st,
@@ -2354,6 +2420,42 @@ pub async fn pending_response(
             let _ = permit.finish(receipt);
             capability_unavailable()
         }
+    }
+}
+
+/// #172/T7「回执」：decision 后等该 request 从新 snapshot 消失，最多
+/// `decision_confirm_ms`（默认 5s，测试可收窄到 0）。
+///
+/// 语义：`Accepted` 只代表 Desktop **受理**了决策帧；只有 pending 从快照里消失才是
+/// 「生效」。超时仍未见消失 → 回执加 `decision_unconfirmed`（前端提示「未确认，可
+/// 终止本轮」），绝不把受理当成功。
+async fn confirm_decision_gone(
+    hub: &CodexControlHub,
+    key: &ThreadKey,
+    request_key: &str,
+    mut receipt: ActionReceipt,
+) -> ActionReceipt {
+    let total = hub.decision_confirm_ms();
+    if total == 0 {
+        return receipt;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(total);
+    loop {
+        let projection = hub.adapter.projection(key).await;
+        if !projection
+            .pending
+            .iter()
+            .any(|p| p.request_key == request_key)
+        {
+            return receipt;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if receipt.reason_code.is_none() {
+                receipt.reason_code = Some("decision_unconfirmed".to_string());
+            }
+            return receipt;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }
 

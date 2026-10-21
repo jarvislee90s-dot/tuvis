@@ -19,7 +19,7 @@ use super::mirror::ThreadMirror;
 use super::owners::{
     bind_lease, declare_following, discover_owner, wait_first_snapshot, FollowingSet,
 };
-use super::pending::parse_request_key;
+use super::pending::{parse_request_key, DECISION_ACCEPT, DECISION_CANCEL, DECISION_DECLINE};
 use super::probe::runner::{ProbeOutcome, ProbeRunner, ProbeStage};
 use super::probe::{ProbeLedger, CAP_STATE};
 use super::profile::ProtocolProfile;
@@ -207,6 +207,9 @@ struct AdapterInner {
     follow_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     /// B3 测试缝探针：任务已到达 follow gate。
     follow_gate_reached: AtomicBool,
+    /// #172/T7：官方 schema 证据（未知 build 的审批决策词来源；`None` = 尚未取证）。
+    /// 有它就能在「无真机审批证据」的 build 上安全开放 `accept` + `cancel`。
+    schema_evidence: std::sync::Mutex<Option<super::probe::schema_probe::SchemaEvidence>>,
     epoch: AtomicU64,
     events: broadcast::Sender<ThreadProjection>,
 }
@@ -259,9 +262,48 @@ impl DesktopIpcAdapter {
                 interphase_gate: std::sync::Mutex::new(None),
                 follow_gate: std::sync::Mutex::new(None),
                 follow_gate_reached: AtomicBool::new(false),
+                schema_evidence: std::sync::Mutex::new(None),
                 epoch: AtomicU64::new(0),
                 events: broadcast::channel(256).0,
             }),
+        }
+    }
+
+    /// #172/T7：注入官方 schema 证据（生产由装配期一次性探测填入；测试直接注入）。
+    pub fn set_schema_evidence(
+        &self,
+        evidence: Option<super::probe::schema_probe::SchemaEvidence>,
+    ) {
+        *self
+            .inner
+            .schema_evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = evidence;
+    }
+
+    /// 当前生效的**审批决策策略**（服务端单一来源）：
+    ///
+    /// * 有真机证据（shipped profile 的 `command` 能力）→ `accept` + `decline`；
+    /// * 未知 build 但 schema 已取证、且两个词都在 → `accept` + `cancel`；
+    /// * 其余 → 空（卡片只显示「到桌面处理」，且 `respond` 拒发）。
+    pub fn approval_policy(&self) -> super::pending::DecisionPolicy {
+        if self.current_caps().command {
+            return super::pending::DecisionPolicy::evidence();
+        }
+        let evidence = self
+            .inner
+            .schema_evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match evidence {
+            Some(ev) => super::pending::DecisionPolicy::schema(
+                ev.command_allows(super::pending::DECISION_ACCEPT)
+                    && ev.command_allows(super::pending::DECISION_CANCEL),
+                ev.file_allows(super::pending::DECISION_ACCEPT)
+                    && ev.file_allows(super::pending::DECISION_CANCEL),
+            ),
+            None => super::pending::DecisionPolicy::default(),
         }
     }
 
@@ -794,10 +836,15 @@ impl DesktopIpcAdapter {
     }
 
     /// 当前投影（不触发连接；未跟随/无状态 → stale 空投影）。
+    ///
+    /// #172/T7：投影前把当前**审批策略**下发给镜像——`allowedDecisions` 只在这里算，
+    /// 前端不重复策略。
     pub async fn projection(&self, key: &ThreadKey) -> ThreadProjection {
         let caps = self.current_caps();
-        let mirrors = self.inner.mirrors.lock().await;
-        if let Some(m) = mirrors.get(key) {
+        let policy = self.approval_policy();
+        let mut mirrors = self.inner.mirrors.lock().await;
+        if let Some(m) = mirrors.get_mut(key) {
+            m.set_approval_policy(Some(policy));
             return m.project(caps);
         }
         ThreadProjection {
@@ -1009,6 +1056,7 @@ impl DesktopIpcAdapter {
         let inflight_key = (key.thread_id.clone(), request_key.to_string());
         // 阶段 1（R5 短锁：只持 mirrors）：stale 门（R4.1）+ 全部 mirror 读 + 镜像
         // 绑定的 owner lease（C3 同代复核锚）
+        let policy = self.approval_policy();
         let snap = {
             let mirrors = self.inner.mirrors.lock().await;
             let Some(mirror) = mirrors.get(key) else {
@@ -1017,7 +1065,7 @@ impl DesktopIpcAdapter {
             if mirror.is_stale() {
                 return not_sent(&envelope_id, "stale_context");
             }
-            RespondSnapshot::collect(mirror, caps, request_key, context_token)
+            RespondSnapshot::collect(mirror, caps, &policy, request_key, context_token)
         };
         // 阶段 2（R5 短锁：只持 inflight）：清理已消失/换 token 的 Blocked + 抢占提交权
         {
@@ -1233,10 +1281,11 @@ impl RespondSnapshot {
     fn collect(
         mirror: &ThreadMirror,
         caps: CapabilitySet,
+        policy: &super::pending::DecisionPolicy,
         request_key: &str,
         _token: &str,
     ) -> Self {
-        let projection = mirror.project(caps);
+        let projection = mirror.project_with_policy(caps, policy);
         let live_pendings = projection
             .pending
             .iter()
@@ -1282,36 +1331,59 @@ impl RespondSnapshot {
         }
         let request_id_value = self.request_id.ok_or_else(|| "invalid_id".to_string())?;
         let caps = self.caps;
-        let (method, version): (&str, u32) = match (&pending.kind, action) {
-            (PendingKind::CommandApproval, PendingAction::Approve | PendingAction::Reject) => {
-                if !caps.command {
-                    return Err("capability_unavailable".into());
+        // (方法名, 决策词, 版本)；决策词只对 command/file 有意义，其余为空串
+        let (method, decision_word, version): (&str, &str, u32) = match (&pending.kind, action) {
+            // 命令 / 文件变更审批：**决策词由服务端策略给定的 allowedDecisions 决定**
+            // （单一来源；未知 build 只有 accept/cancel，已知 build 有 accept/decline）
+            (
+                PendingKind::CommandApproval | PendingKind::FileChangeApproval,
+                PendingAction::Approve | PendingAction::Reject,
+            ) => {
+                let method = match pending.kind {
+                    PendingKind::CommandApproval => "thread-follower-command-approval-decision",
+                    _ => "thread-follower-file-approval-decision",
+                };
+                let word = match action {
+                    PendingAction::Approve => {
+                        pick_decision(&pending.allowed_decisions, &[DECISION_ACCEPT])
+                    }
+                    // 拒绝：优先 `decline`（回合继续），策略只给了 `cancel` 时用它
+                    // （终止本轮）——两者语义不同，绝不混用
+                    _ => pick_decision(
+                        &pending.allowed_decisions,
+                        &[DECISION_DECLINE, DECISION_CANCEL],
+                    ),
                 }
-                ("thread-follower-command-approval-decision", 1)
+                .ok_or_else(|| "capability_unavailable".to_string())?;
+                (method, word, 1)
             }
             (PendingKind::PermissionsApproval, PendingAction::Approve | PendingAction::Reject) => {
                 if !caps.permissions {
                     return Err("capability_unavailable".into());
                 }
-                ("thread-follower-permissions-request-approval-response", 1)
+                (
+                    "thread-follower-permissions-request-approval-response",
+                    "",
+                    1,
+                )
             }
             (PendingKind::UserInput, PendingAction::Answer(_)) => {
                 if !caps.blocking_input {
                     return Err("capability_unavailable".into());
                 }
-                ("thread-follower-submit-user-input", 1)
+                ("thread-follower-submit-user-input", "", 1)
             }
             (PendingKind::Unsupported, _) => return Err("unsupported".into()),
             _ => return Err("action_mismatch".into()),
         };
         let approve = matches!(action, PendingAction::Approve);
         let params = match (&pending.kind, action) {
-            (PendingKind::CommandApproval, _) => {
-                // command 变体：只发 decision 词，绝不携带 permissions 对象
+            // command / file 共用同一决策体：只发 decision 词，绝不携带 permissions 对象
+            (PendingKind::CommandApproval | PendingKind::FileChangeApproval, _) => {
                 json!({
                     "conversationId": key.thread_id,
                     "requestId": request_id_value,
-                    "decision": if approve { "accept" } else { "decline" },
+                    "decision": decision_word,
                 })
             }
             (PendingKind::PermissionsApproval, _) => {
@@ -1390,6 +1462,17 @@ struct PreparedRespond {
     method: String,
     version: u32,
     params: Value,
+}
+
+/// 从策略给的 `allowedDecisions` 里按**优先级**挑一个词（候选取自语义正确的集合）。
+///
+/// 例：拒绝的候选是 `[decline, cancel]`——策略同时给了两个词时先用 `decline`
+///（回合继续），只给 `cancel` 时才用它（终止本轮）。
+fn pick_decision<'a>(allowed: &[String], candidates: &[&'a str]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .copied()
+        .find(|word| allowed.iter().any(|w| w == word))
 }
 
 // ============================================================

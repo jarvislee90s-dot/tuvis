@@ -16,7 +16,7 @@
 //!   最新一条自身超窗时截头保底保留（绝不把整份投影清成 0 条）。
 
 use super::history_view::HistoryView;
-use super::pending::PendingProjector;
+use super::pending::{DecisionPolicy as PendingDecisionPolicy, PendingProjector};
 use super::types::{
     CapabilitySet, ContentState, ControlAvailability, OwnerLease, ProjectedMessage, ProtocolError,
     ThreadKey, ThreadProjection,
@@ -127,6 +127,8 @@ pub struct ThreadMirror {
     ledger: Option<Arc<std::sync::Mutex<MirrorLedger>>>,
     /// 本镜像当前保留字节数（账本对账依据）
     size: usize,
+    /// #172/T7：审批决策策略覆盖（未知 build 用 schema 档；`None` = 按能力位取证据档）
+    approval_policy: Option<PendingDecisionPolicy>,
 }
 
 impl Drop for ThreadMirror {
@@ -152,7 +154,19 @@ impl ThreadMirror {
             history_complete: true,
             ledger: None,
             size: 0,
+            approval_policy: None,
         }
+    }
+
+    /// #172/T7：下发审批决策策略（未知 build 的 schema 档由 adapter 在取证后设置）。
+    /// `None` = 回到「按能力位取证据档」的缺省行为。
+    pub fn set_approval_policy(&mut self, policy: Option<PendingDecisionPolicy>) {
+        self.approval_policy = policy;
+    }
+
+    /// 当前生效的审批策略（供 adapter 判断是否需要下发、以及测试断言）。
+    pub fn approval_policy(&self) -> Option<&PendingDecisionPolicy> {
+        self.approval_policy.as_ref()
     }
 
     /// 挂全局字节账本（adapter 构造镜像的唯一生产入口）。
@@ -439,7 +453,29 @@ impl ThreadMirror {
 
     /// 统一状态投影（远程 API / SSE / 移动端唯一消费形态）。
     /// token 缓存存于 PendingProjector 内部互斥锁，`&self` 即可投影。
+    ///
+    /// 审批策略优先取镜像上已下发的覆盖（[`ThreadMirror::set_approval_policy`]）；
+    /// 没有覆盖时按能力位取证据档（老行为）。
     pub fn project(&self, caps: CapabilitySet) -> ThreadProjection {
+        match &self.approval_policy {
+            Some(policy) => {
+                let policy = policy.clone();
+                self.project_with_policy(caps, &policy)
+            }
+            None => {
+                let policy = PendingDecisionPolicy::from_caps(&caps);
+                self.project_with_policy(caps, &policy)
+            }
+        }
+    }
+
+    /// 同上，但**显式**指定审批策略（adapter 在 respond 路径上直接用当前生效策略，
+    /// 不依赖镜像上是否已下发）。
+    pub fn project_with_policy(
+        &self,
+        caps: CapabilitySet,
+        policy: &PendingDecisionPolicy,
+    ) -> ThreadProjection {
         // R1：state 即 conversationState 本体，按根直读
         let state = self.state.clone().unwrap_or(Value::Null);
         let messages = project_messages(&state);
@@ -449,7 +485,7 @@ impl ThreadMirror {
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default();
-        let pending = self.pending.project(&requests, &caps);
+        let pending = self.pending.project_with_policy(&requests, &caps, policy);
         ThreadProjection {
             thread_id: self.key.thread_id.clone(),
             revision: self.revision,

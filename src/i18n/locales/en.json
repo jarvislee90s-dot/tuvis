@@ -1920,6 +1920,7 @@
       "staleBanner": "Desktop connection interrupted — showing the last known view; remote actions are disabled for now",
       "pending": {
         "titleCommand": "Command approval request",
+        "titleFileChange": "File change request",
         "titlePermissions": "Permission request",
         "titleInput": "Waiting for your answer",
         "titleUnsupported": "Pending request",
@@ -1927,6 +1928,9 @@
         "unverified": "The current Desktop build has not verified this action",
         "approve": "Approve",
         "reject": "Reject",
+        "cancelTurn": "Stop this turn",
+        "fileChanges": "{{n}} file change(s) — see details on Desktop",
+        "decisionUnconfirmed": "Accepted but not confirmed — stop the turn or verify on Desktop",
         "submit": "Submit answer",
         "freePlaceholder": "Other (free text)",
         "freeAria": "Free-form answer",

@@ -90,6 +90,10 @@ function disabledCopy(code: string | null): string {
 /** 回执 → 底注文案（unknown 是「结果未知」不是失败，更不是可重试错误——S5） */
 function receiptCopy(r: ActionReceipt): string {
   if (r.delivery === "unknown_delivery") return i18n.t("mobile.codex.pending.unknownDelivery");
+  // #172/T7：受理但 5s 内没看到 pending 从快照消失 → 如实说「未确认」（不是成功）
+  if (r.delivery === "accepted" && r.reasonCode === "decision_unconfirmed") {
+    return i18n.t("mobile.codex.pending.decisionUnconfirmed");
+  }
   if (r.delivery === "accepted") return i18n.t("mobile.codex.pending.accepted");
   if (r.delivery === "rejected") return i18n.t("mobile.codex.pending.rejectedReceipt");
   return i18n.t("mobile.codex.pending.notSent");
@@ -223,9 +227,21 @@ export default function PendingRequestCard({
   }, [request.requestKey, request.contextToken]);
 
   const isInput = request.kind === "user_input";
-  const operable =
-    request.actionable &&
-    (isInput || request.kind === "command_approval" || request.kind === "permissions_approval");
+  const isApproval =
+    request.kind === "command_approval" ||
+    request.kind === "file_change_approval" ||
+    request.kind === "permissions_approval";
+  const operable = request.actionable && (isInput || isApproval);
+
+  // #172/T7：按钮只按服务端给的 allowedDecisions 渲染（前端不做策略判断）。
+  // 命令/文件审批的老回执没有该字段 → 退回「批准 + 拒绝」两键。
+  const decisions = request.allowedDecisions ?? [];
+  const canAccept = decisions.includes("accept");
+  const canDecline = decisions.includes("decline");
+  const canCancel = decisions.includes("cancel");
+  const showApprove = canAccept || decisions.length === 0;
+  const showDecline = canDecline || decisions.length === 0;
+  const showCancel = canCancel;
 
   // 未答题面（防静默丢题第一道闸；第二道在服务端——空答案 400）
   const unanswered = isInput
@@ -346,11 +362,13 @@ export default function PendingRequestCard({
   const titleKey =
     request.kind === "command_approval"
       ? "mobile.codex.pending.titleCommand"
-      : request.kind === "permissions_approval"
-        ? "mobile.codex.pending.titlePermissions"
-        : isInput
-          ? "mobile.codex.pending.titleInput"
-          : "mobile.codex.pending.titleUnsupported";
+      : request.kind === "file_change_approval"
+        ? "mobile.codex.pending.titleFileChange"
+        : request.kind === "permissions_approval"
+          ? "mobile.codex.pending.titlePermissions"
+          : isInput
+            ? "mobile.codex.pending.titleInput"
+            : "mobile.codex.pending.titleUnsupported";
   const tone = request.kind === "user_input" ? "question" : operable ? "approve" : "neutral";
 
   return (
@@ -382,6 +400,12 @@ export default function PendingRequestCard({
       {request.permissionSummary && (
         <p data-testid="codex-pending-permission" className="mt-1 text-xs break-words">
           {request.permissionSummary}
+        </p>
+      )}
+      {/* 文件变更审批：服务端只给「变更条数」这类安全摘要（真机参数形态未取证） */}
+      {request.fileSummary && (
+        <p data-testid="codex-pending-files" className="mt-1 text-xs break-words">
+          {i18n.t("mobile.codex.pending.fileChanges", { n: request.fileSummary })}
         </p>
       )}
       {request.reason && <p className="mt-1 text-xs text-[var(--mut)]">{request.reason}</p>}
@@ -495,28 +519,47 @@ export default function PendingRequestCard({
             </button>
           ) : (
             <>
-              <button
-                type="button"
-                data-testid="codex-pending-approve"
-                disabled={disabled}
-                onClick={() => {
-                  void respond("approve");
-                }}
-                className="rounded-full bg-emerald-500/15 px-3 py-0.5 text-xs text-emerald-800 disabled:opacity-40 dark:bg-emerald-400/15 dark:text-emerald-300"
-              >
-                {i18n.t("mobile.codex.pending.approve")}
-              </button>
-              <button
-                type="button"
-                data-testid="codex-pending-reject"
-                disabled={disabled}
-                onClick={() => {
-                  void respond("reject");
-                }}
-                className="rounded-full bg-rose-500/15 px-3 py-0.5 text-xs text-rose-800 disabled:opacity-40 dark:bg-rose-400/15 dark:text-rose-300"
-              >
-                {i18n.t("mobile.codex.pending.reject")}
-              </button>
+              {showApprove && (
+                <button
+                  type="button"
+                  data-testid="codex-pending-approve"
+                  disabled={disabled}
+                  onClick={() => {
+                    void respond("approve");
+                  }}
+                  className="rounded-full bg-emerald-500/15 px-3 py-0.5 text-xs text-emerald-800 disabled:opacity-40 dark:bg-emerald-400/15 dark:text-emerald-300"
+                >
+                  {i18n.t("mobile.codex.pending.approve")}
+                </button>
+              )}
+              {showDecline && (
+                <button
+                  type="button"
+                  data-testid="codex-pending-reject"
+                  disabled={disabled}
+                  onClick={() => {
+                    void respond("reject");
+                  }}
+                  className="rounded-full bg-rose-500/15 px-3 py-0.5 text-xs text-rose-800 disabled:opacity-40 dark:bg-rose-400/15 dark:text-rose-300"
+                >
+                  {i18n.t("mobile.codex.pending.reject")}
+                </button>
+              )}
+              {/* 未知 build（无真机审批证据）只给「终止本轮」：cancel 语义 = 拒绝并立即
+                  中断，与服务端 allowedDecisions 一一对应 */}
+              {showCancel && (
+                <button
+                  type="button"
+                  data-testid="codex-pending-cancel-turn"
+                  disabled={disabled}
+                  onClick={() => {
+                    void respond("reject");
+                  }}
+                  className="rounded-full bg-rose-500/15 px-3 py-0.5 text-xs text-rose-800 disabled:opacity-40 dark:bg-rose-400/15 dark:text-rose-300"
+                >
+                  {i18n.t("mobile.codex.pending.cancelTurn")}
+                </button>
+              )}
             </>
           )}
         </div>

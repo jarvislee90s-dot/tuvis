@@ -64,6 +64,7 @@ fn kind_str(kind: ActionKind) -> &'static str {
     match kind {
         ActionKind::Send => "send",
         ActionKind::CommandApproval => "command_approval",
+        ActionKind::FileChangeApproval => "file_change_approval",
         ActionKind::PermissionsApproval => "permissions_approval",
         ActionKind::UserInput => "user_input",
     }
@@ -73,6 +74,7 @@ fn kind_from_str(s: &str) -> Option<ActionKind> {
     match s {
         "send" => Some(ActionKind::Send),
         "command_approval" => Some(ActionKind::CommandApproval),
+        "file_change_approval" => Some(ActionKind::FileChangeApproval),
         "permissions_approval" => Some(ActionKind::PermissionsApproval),
         "user_input" => Some(ActionKind::UserInput),
         _ => None,

@@ -995,7 +995,8 @@ pub(crate) fn tombstone_expired_terminal_conn(
 fn audit_action_of(kind: &str) -> &'static str {
     match kind {
         "send" => "codex_send",
-        "command_approval" | "permissions_approval" => "codex_approve",
+        // 命令审批与文件变更审批同属「批准类」动作（#172/T7 新增后者）
+        "command_approval" | "file_change_approval" | "permissions_approval" => "codex_approve",
         "user_input" => "codex_answer",
         _ => "codex_send",
     }

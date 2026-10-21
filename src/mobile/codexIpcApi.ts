@@ -32,7 +32,11 @@ export type ControlAvailability =
 
 /** 待处理交互类别。未知 method → unsupported（actionable=false）。 */
 export type PendingKind =
-  "command_approval" | "permissions_approval" | "user_input" | "unsupported";
+  | "command_approval"
+  | "file_change_approval"
+  | "permissions_approval"
+  | "user_input"
+  | "unsupported";
 
 /** 完成的动作回执（HTTP 原样返回）。 */
 export interface ActionReceipt {
@@ -102,9 +106,13 @@ export interface PendingView {
   kind: PendingKind;
   actionable: boolean;
   disabledReasonCode: string | null;
+  /** 服务端策略给出的可用决策词（accept/decline/cancel）；空 = 只能到桌面处理。 */
+  allowedDecisions?: string[];
   command: string | null;
   cwd: string | null;
   reason: string | null;
+  /** 文件变更审批的安全摘要（变更条数）；命令审批为 null。 */
+  fileSummary?: string | null;
   permissionSummary: string | null;
   questions: QuestionView[];
 }

@@ -1138,6 +1138,108 @@ async fn native_command_approval_uses_decision_wire() {
     adapter.shutdown().await;
 }
 
+/// #172/T7：**文件变更审批**走自己的 decision 方法（不是 command 那个），
+/// 证据档（shipped build）下决策词是 `accept` / `decline`。
+#[tokio::test]
+async fn native_file_change_approval_uses_file_decision_wire() {
+    let (adapter, mut peer, projection, key) = harness_for(
+        "windows",
+        WINDOWS_BUILD,
+        vec![serde_json::json!({
+            "id": 21, "method": "item/fileChange/requestApproval",
+            "params": { "cwd": "/w", "reason": "r", "changes": [{}, {}] }
+        })],
+    )
+    .await;
+    let file_key = projection
+        .pending
+        .iter()
+        .find(|p| {
+            p.kind
+                == multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind::FileChangeApproval
+        })
+        .expect("file change pending")
+        .clone();
+    assert_eq!(
+        file_key.allowed_decisions,
+        vec!["accept", "decline"],
+        "证据档：文件审批也给 accept/decline（老行为保留 decline）"
+    );
+
+    let t = {
+        let a = adapter.clone();
+        let key = key.clone();
+        let rk = file_key.request_key.clone();
+        let tk = file_key.context_token.clone();
+        tokio::spawn(async move { a.respond(&key, &rk, &tk, PendingAction::Reject).await })
+    };
+    let frame = peer.recv().await;
+    assert_eq!(
+        frame["method"], "thread-follower-file-approval-decision",
+        "文件审批必须用自己的 decision 方法"
+    );
+    assert_eq!(frame["version"], serde_json::json!(1));
+    assert_eq!(frame["params"]["requestId"], serde_json::json!(21));
+    assert_eq!(
+        frame["params"]["decision"], "decline",
+        "证据档的拒绝 = decline（回合继续）"
+    );
+    assert!(frame["params"].get("permissions").is_none());
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-file-approval-decision",
+        "result": { "ok": true }
+    }))
+    .await;
+    let o = tokio::time::timeout(Duration::from_secs(5), t)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(o.delivery, Delivery::Accepted);
+    adapter.shutdown().await;
+}
+
+/// #172/T7：**未知 build**（无真机审批证据）在有 schema 证据时用 `cancel`（终止本轮），
+/// 没有 schema 证据时拒绝派发（零帧）——两张卡的行为差一个「是否可应答」。
+#[tokio::test]
+async fn unknown_build_approval_policy_requires_schema_evidence() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::probe::schema_probe::SchemaEvidence;
+    use multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile;
+
+    let adapter = DesktopIpcAdapter::new(
+        std::sync::Arc::new(FailingConnector::new()),
+        ProtocolProfile::unverified("windows", "26.9999.0"),
+    );
+    // 无 schema 证据：不开放（卡片「到桌面处理」）
+    assert!(
+        adapter.approval_policy().is_empty(),
+        "未知 build 未取证时不得开放审批决策"
+    );
+    // 注入真机同形的 schema 证据（accept + cancel）
+    adapter.set_schema_evidence(Some(SchemaEvidence {
+        fingerprint: "test".into(),
+        command_decisions: vec![
+            "accept".into(),
+            "acceptForSession".into(),
+            "decline".into(),
+            "cancel".into(),
+        ],
+        file_decisions: vec!["accept".into(), "cancel".into()],
+    }));
+    let policy = adapter.approval_policy();
+    use multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind;
+    assert_eq!(
+        policy.for_kind(PendingKind::CommandApproval),
+        ["accept", "cancel"],
+        "schema 档只开 accept + cancel（不含 decline）"
+    );
+    assert_eq!(
+        policy.for_kind(PendingKind::FileChangeApproval),
+        ["accept", "cancel"]
+    );
+    assert!(policy.for_kind(PendingKind::PermissionsApproval).is_empty());
+}
+
 #[tokio::test]
 async fn native_permissions_approval_echoes_saved_permissions() {
     // R3 后能力由生产 profile 派生：permissions 已验证 = macOS build（command 未验证）

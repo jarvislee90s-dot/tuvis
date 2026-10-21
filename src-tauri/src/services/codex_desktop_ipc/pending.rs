@@ -42,10 +42,23 @@ impl PendingProjector {
     /// 把 `requests[]` 投影为 `PendingView` 列表（输入数组顺序即输出顺序）。
     /// 投影后清除已消失请求的 token（R4：`[r]→[]→[r]` 重现时生成新 token，
     /// 旧卡不可复活）。
+    ///
+    /// 策略缺省 = 证据档（`caps.command` 有真机证据 → accept/decline）；未知 build 的
+    /// schema 档由调用方用 [`PendingProjector::project_with_policy`] 传入。
     pub fn project(
         &self,
         requests: &[serde_json::Value],
         caps: &CapabilitySet,
+    ) -> Vec<PendingView> {
+        self.project_with_policy(requests, caps, &DecisionPolicy::from_caps(caps))
+    }
+
+    /// 同上，但显式指定决策策略（未知 build 的 schema 档 / 测试注入）。
+    pub fn project_with_policy(
+        &self,
+        requests: &[serde_json::Value],
+        caps: &CapabilitySet,
+        policy: &DecisionPolicy,
     ) -> Vec<PendingView> {
         let mut tokens = self.tokens.lock().expect("token lock");
         // R4：本轮仍在场的 request_key 之外的缓存条目一律清除
@@ -59,7 +72,7 @@ impl PendingProjector {
         tokens.retain(|key, _| live.contains(key));
         requests
             .iter()
-            .filter_map(|req| project_one(req, caps, &mut tokens))
+            .filter_map(|req| project_one(req, caps, policy, &mut tokens))
             .collect()
     }
 
@@ -88,6 +101,7 @@ fn fingerprint(method: &str, value: &serde_json::Value) -> u64 {
 fn project_one(
     req: &serde_json::Value,
     caps: &CapabilitySet,
+    policy: &DecisionPolicy,
     tokens: &mut HashMap<String, TokenEntry>,
 ) -> Option<PendingView> {
     let id_value = req.get("id")?;
@@ -99,87 +113,136 @@ fn project_one(
         .unwrap_or(serde_json::Value::Null);
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
-    let (kind, actionable, disabled, command, cwd, reason, permission_summary, questions) =
-        match method {
-            "item/commandExecution/requestApproval" => {
-                let cap_ok = caps.command;
-                (
-                    PendingKind::CommandApproval,
-                    cap_ok,
-                    // 方法已知、该 build 能力未验证 → unverified（与「方法未知」拆码，
-                    // 前端文案可区分：「当前 Desktop 版本未验证该操作」）
-                    (!cap_ok).then(|| "capability_unverified".to_string()),
-                    Some(
-                        params
-                            .get("command")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    ),
+    let (
+        kind,
+        actionable_caps,
+        disabled,
+        command,
+        cwd,
+        reason,
+        file_summary,
+        permission_summary,
+        questions,
+    ) = match method {
+        "item/commandExecution/requestApproval" => {
+            let cap_ok = caps.command;
+            (
+                PendingKind::CommandApproval,
+                cap_ok,
+                // 方法已知、该 build 能力未验证 → unverified（与「方法未知」拆码，
+                // 前端文案可区分：「当前 Desktop 版本未验证该操作」）
+                (!cap_ok).then(|| "capability_unverified".to_string()),
+                Some(
                     params
-                        .get("cwd")
+                        .get("command")
                         .and_then(|c| c.as_str())
-                        .map(str::to_string),
-                    params
-                        .get("reason")
-                        .and_then(|r| r.as_str())
-                        .map(str::to_string),
-                    None,
-                    Vec::new(),
-                )
-            }
-            "item/permissions/requestApproval" => {
-                let cap_ok = caps.permissions;
-                (
-                    PendingKind::PermissionsApproval,
-                    cap_ok,
-                    // 同上：已知方法的未验证能力 → unverified
-                    (!cap_ok).then(|| "capability_unverified".to_string()),
-                    None,
-                    params
-                        .get("cwd")
-                        .and_then(|c| c.as_str())
-                        .map(str::to_string),
-                    params
-                        .get("reason")
-                        .and_then(|r| r.as_str())
-                        .map(str::to_string),
-                    Some(permissions_summary(params.get("permissions"))),
-                    Vec::new(),
-                )
-            }
-            "item/tool/requestUserInput" => {
-                let cap_ok = caps.blocking_input;
-                let questions = params
-                    .get("questions")
-                    .and_then(|q| q.as_array())
-                    .map(|arr| arr.iter().filter_map(question_view).collect())
-                    .unwrap_or_default();
-                (
-                    PendingKind::UserInput,
-                    cap_ok,
-                    // 同上：已知方法的未验证能力 → unverified
-                    (!cap_ok).then(|| "capability_unverified".to_string()),
-                    None,
-                    None,
-                    None,
-                    None,
-                    questions,
-                )
-            }
-            _ => (
-                // 未知 method：只显示「此请求暂不支持远程处理」，不暴露 raw method/参数
-                // （保持 capability_unavailable——与「已知但未验证」的 unverified 拆分）
-                PendingKind::Unsupported,
-                false,
-                Some("capability_unavailable".to_string()),
-                None,
-                None,
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                params
+                    .get("cwd")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string),
+                params
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .map(str::to_string),
                 None,
                 None,
                 Vec::new(),
-            ),
-        };
+            )
+        }
+        // #172/T7：文件变更审批（与命令审批同属 L3；decision 方法名不同）
+        "item/fileChange/requestApproval" => {
+            let cap_ok = caps.command;
+            (
+                PendingKind::FileChangeApproval,
+                cap_ok,
+                (!cap_ok).then(|| "capability_unverified".to_string()),
+                None,
+                params
+                    .get("cwd")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string),
+                params
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .map(str::to_string),
+                // 真机参数形状尚未取证（见 T7 记录）：只做**安全的展示摘要**，
+                // 认不出就 None（绝不 dump raw 参数）
+                file_change_summary(&params),
+                None,
+                Vec::new(),
+            )
+        }
+        "item/permissions/requestApproval" => {
+            let cap_ok = caps.permissions;
+            (
+                PendingKind::PermissionsApproval,
+                cap_ok,
+                // 同上：已知方法的未验证能力 → unverified
+                (!cap_ok).then(|| "capability_unverified".to_string()),
+                None,
+                params
+                    .get("cwd")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string),
+                params
+                    .get("reason")
+                    .and_then(|r| r.as_str())
+                    .map(str::to_string),
+                None,
+                Some(permissions_summary(params.get("permissions"))),
+                Vec::new(),
+            )
+        }
+        "item/tool/requestUserInput" => {
+            let cap_ok = caps.blocking_input;
+            let questions = params
+                .get("questions")
+                .and_then(|q| q.as_array())
+                .map(|arr| arr.iter().filter_map(question_view).collect())
+                .unwrap_or_default();
+            (
+                PendingKind::UserInput,
+                cap_ok,
+                // 同上：已知方法的未验证能力 → unverified
+                (!cap_ok).then(|| "capability_unverified".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                questions,
+            )
+        }
+        _ => (
+            // 未知 method：只显示「此请求暂不支持远程处理」，不暴露 raw method/参数
+            // （保持 capability_unavailable——与「已知但未验证」的 unverified 拆分）
+            PendingKind::Unsupported,
+            false,
+            Some("capability_unavailable".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+        ),
+    };
+
+    // 决策词由**服务端策略**决定（单一来源）：空 = 只能到桌面处理。
+    // 卡片只按这个列表渲染按钮，前端不做策略判断。
+    let allowed_decisions = policy.for_kind(kind).to_vec();
+    let actionable = match kind {
+        // 命令/文件审批：能给出决策词才算可操作（未知 build 未取证 = 不可操作）
+        PendingKind::CommandApproval | PendingKind::FileChangeApproval => {
+            !allowed_decisions.is_empty()
+        }
+        // 权限/问答/未知：沿用能力门（问答走 Answer 动作，不是决策词）
+        _ => actionable_caps,
+    };
+    let disabled = if actionable { None } else { disabled };
 
     // token：同 request 同 method 同内容 → 复用；内容/方法变化、重现 → 换新
     let fp = fingerprint(method, &params);
@@ -204,12 +267,90 @@ fn project_one(
         kind,
         actionable,
         disabled_reason_code: disabled,
+        allowed_decisions,
         command,
         cwd,
         reason,
+        file_summary,
         permission_summary,
         questions,
     })
+}
+
+/// 文件变更审批的展示摘要（**只做安全摘要**：认不出就 `None`，绝不 dump raw 参数）。
+///
+/// 真机参数形状尚未取证（2026-10-21 抓到的 pending 是计划实现审批，不是 file 变更），
+/// 所以这里只认 `changes` 数组的**长度**（最保守的可用信息）；字段名不符 → 无摘要。
+fn file_change_summary(params: &serde_json::Value) -> Option<String> {
+    let n = params.get("changes")?.as_array()?.len();
+    (n > 0).then(|| n.to_string())
+}
+
+/// **决策策略**（服务端单一来源）：每一类审批允许哪些决策词。
+///
+/// 两档来源：
+/// * [`DecisionPolicy::evidence`]：该 build 有真机证据（`caps.command`）→ `accept` +
+///   `decline`（老行为，`decline` = 拒绝但回合继续）；
+/// * [`DecisionPolicy::schema`]：未知 build 但官方 schema 里两个词都在 → `accept` +
+///   `cancel`（`cancel` = 拒绝并**立即中断本轮**）——#172 的「终止本轮」。
+///
+/// 空策略 = 不可远程决策（卡片只显示「到桌面处理」）。**权限/问答永远是空**。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecisionPolicy {
+    command: Vec<String>,
+    file: Vec<String>,
+}
+
+/// `accept`：允许执行。
+pub const DECISION_ACCEPT: &str = "accept";
+/// `decline`：拒绝，但回合继续（老行为；仅证据档提供）。
+pub const DECISION_DECLINE: &str = "decline";
+/// `cancel`：拒绝并**立即中断本轮**（schema 档的「终止本轮」）。
+pub const DECISION_CANCEL: &str = "cancel";
+
+impl DecisionPolicy {
+    /// 兼容构造（无 schema 证据时）：有真机证据（`caps.command`）→ 证据档；否则空。
+    pub fn from_caps(caps: &CapabilitySet) -> Self {
+        if caps.command {
+            Self::evidence()
+        } else {
+            Self::default()
+        }
+    }
+
+    /// 证据档（已知 build）：`accept` + `decline`。
+    pub fn evidence() -> Self {
+        Self {
+            command: vec![DECISION_ACCEPT.to_string(), DECISION_DECLINE.to_string()],
+            file: vec![DECISION_ACCEPT.to_string(), DECISION_DECLINE.to_string()],
+        }
+    }
+
+    /// schema 档（未知 build）：只有 schema 同时认识 `accept` 与 `cancel` 才开放，
+    /// 且**只开这两个词**（`decline` 不在未知 build 上冒险——语义差异会让用户以为
+    /// 「拒绝后回合继续」，实际我们更希望明确终止）。
+    pub fn schema(command_ok: bool, file_ok: bool) -> Self {
+        let words = || vec![DECISION_ACCEPT.to_string(), DECISION_CANCEL.to_string()];
+        Self {
+            command: if command_ok { words() } else { Vec::new() },
+            file: if file_ok { words() } else { Vec::new() },
+        }
+    }
+
+    /// 该类别允许的决策词（顺序即 UI 顺序）。
+    pub fn for_kind(&self, kind: PendingKind) -> &[String] {
+        match kind {
+            PendingKind::CommandApproval => &self.command,
+            PendingKind::FileChangeApproval => &self.file,
+            // 权限 / 问答 / 未知：永不开放决策词
+            _ => &[],
+        }
+    }
+
+    /// 是否完全为空（两类都不可决策）。
+    pub fn is_empty(&self) -> bool {
+        self.command.is_empty() && self.file.is_empty()
+    }
 }
 
 /// 权限对象 → 人类可读摘要（不含原始对象；远端不得上送自定义 permissions）。
@@ -295,6 +436,119 @@ mod tests {
             command: true,
             permissions: true,
             blocking_input: true,
+        }
+    }
+
+    fn caps_unknown_build() -> CapabilitySet {
+        CapabilitySet {
+            send: false,
+            state: true,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+        }
+    }
+
+    /// #172/T7：文件变更审批的投影——类别、安全摘要、决策词都按策略来；
+    /// **不暴露 raw 参数**（真机参数形状未取证）。
+    #[test]
+    fn file_change_approval_projects_kind_summary_and_policy_words() {
+        let p = PendingProjector::new();
+        let views = p.project_with_policy(
+            &[serde_json::json!({
+                "id": 21,
+                "method": "item/fileChange/requestApproval",
+                "params": { "cwd": "/w", "reason": "r", "changes": [{}, {}, {}] }
+            })],
+            &caps_all(),
+            &DecisionPolicy::evidence(),
+        );
+        assert_eq!(views.len(), 1);
+        let v = &views[0];
+        assert_eq!(v.kind, PendingKind::FileChangeApproval);
+        assert!(v.actionable, "证据档下文件审批可远程决策");
+        assert_eq!(v.allowed_decisions, vec!["accept", "decline"]);
+        assert_eq!(
+            v.file_summary.as_deref(),
+            Some("3"),
+            "只给条数，不 dump 变更内容"
+        );
+        assert_eq!(v.command, None, "文件审批没有 command 字段");
+        assert_eq!(v.disabled_reason_code, None);
+    }
+
+    /// 未知 build 的 schema 档：**只有** `accept` + `cancel`（没有 decline）。
+    #[test]
+    fn schema_policy_offers_accept_and_cancel_only() {
+        let p = PendingProjector::new();
+        let policy = DecisionPolicy::schema(true, true);
+        let views = p.project_with_policy(
+            &[
+                serde_json::json!({
+                    "id": 1, "method": "item/commandExecution/requestApproval",
+                    "params": { "command": "echo hi", "cwd": "/w" }
+                }),
+                serde_json::json!({
+                    "id": 2, "method": "item/fileChange/requestApproval",
+                    "params": { "reason": "r" }
+                }),
+            ],
+            &caps_unknown_build(),
+            &policy,
+        );
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].allowed_decisions, vec!["accept", "cancel"]);
+        assert_eq!(views[1].allowed_decisions, vec!["accept", "cancel"]);
+        assert!(views[0].actionable && views[1].actionable);
+        // 认不出的变更形状 → 无摘要（不猜）
+        assert_eq!(views[1].file_summary, None);
+    }
+
+    /// 策略为空（未知 build 且未取证）：不可操作 + 明确原因码，绝不暴露决策词。
+    #[test]
+    fn empty_policy_keeps_command_approval_non_actionable() {
+        let p = PendingProjector::new();
+        let views = p.project_with_policy(
+            &[serde_json::json!({
+                "id": 3, "method": "item/commandExecution/requestApproval",
+                "params": { "command": "echo hi" }
+            })],
+            &caps_unknown_build(),
+            &DecisionPolicy::default(),
+        );
+        let v = &views[0];
+        assert!(!v.actionable);
+        assert!(v.allowed_decisions.is_empty());
+        assert_eq!(
+            v.disabled_reason_code.as_deref(),
+            Some("capability_unverified")
+        );
+    }
+
+    /// 权限/问答**永远**没有决策词（施工单 §3：一律不开放）。
+    #[test]
+    fn permissions_and_user_input_never_get_decision_words() {
+        let p = PendingProjector::new();
+        let views = p.project_with_policy(
+            &[
+                serde_json::json!({
+                    "id": 4, "method": "item/permissions/requestApproval",
+                    "params": { "cwd": "/w", "permissions": {} }
+                }),
+                serde_json::json!({
+                    "id": 5, "method": "item/tool/requestUserInput",
+                    "params": { "questions": [] }
+                }),
+            ],
+            &caps_all(),
+            &DecisionPolicy::evidence(),
+        );
+        for v in &views {
+            assert!(
+                v.allowed_decisions.is_empty(),
+                "{:?} 不得有任何决策词",
+                v.kind
+            );
         }
     }
 

@@ -34,6 +34,8 @@ pub enum Delivery {
 pub enum ActionKind {
     Send,
     CommandApproval,
+    /// #172/T7：文件变更审批（decision 方法 `thread-follower-file-approval-decision`）
+    FileChangeApproval,
     PermissionsApproval,
     UserInput,
 }
@@ -195,10 +197,14 @@ pub struct ProjectedMessage {
 
 /// 待处理交互类别。未知 method → `Unsupported`（actionable=false，只显示
 /// 「此请求暂不支持远程处理」，不暴露 raw method/参数对象）。
+///
+/// `FileChangeApproval` 是 #172/T7 新增：`item/fileChange/requestApproval`（文件变更
+/// 审批）与命令审批同属 L3，但 decision 方法名不同（`…-file-approval-decision`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingKind {
     CommandApproval,
+    FileChangeApproval,
     PermissionsApproval,
     UserInput,
     Unsupported,
@@ -218,9 +224,16 @@ pub struct PendingView {
     pub actionable: bool,
     #[serde(rename = "disabledReasonCode")]
     pub disabled_reason_code: Option<String>,
+    /// 本卡**允许**的决策词（服务端策略单一来源：`accept` / `decline` / `cancel`）。
+    /// 空 = 只能到桌面处理；卡片按钮只按这个列表渲染，前端不做策略判断。
+    #[serde(rename = "allowedDecisions", default)]
+    pub allowed_decisions: Vec<String>,
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub reason: Option<String>,
+    /// 文件变更审批（`item/fileChange/requestApproval`）的变更摘要；命令审批为 `None`。
+    #[serde(rename = "fileSummary", default)]
+    pub file_summary: Option<String>,
     #[serde(rename = "permissionSummary")]
     pub permission_summary: Option<String>,
     pub questions: Vec<QuestionView>,
