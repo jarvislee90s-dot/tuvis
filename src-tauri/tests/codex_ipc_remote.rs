@@ -5104,6 +5104,9 @@ impl ProbeLedger for ProbedStateLedger {
         (capability == "state").then_some(ProbeLedgerEntry {
             state: ProbeState::Probed,
             next_retry_at: None,
+            // #172/T9a：探测只读事实用的两个字段（桩里没有具体级次/错误码）
+            stage: Some("P3".into()),
+            error_code: None,
         })
     }
     fn record(&self, _probe_key: &str, _capability: &str, _outcome: &ProbeOutcome) {}

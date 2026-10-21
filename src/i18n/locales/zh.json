@@ -1904,7 +1904,13 @@
     "codexQueueRetractPending": "该消息仍在排队，请使用撤回",
     "codexQueueForceInFlight": "该消息派发在飞（有自动落账路径），不在人工解除范围",
     "compatSendNeedsProbe": "需先完成只读探测（该 Codex 桌面版本的读链尚未取证）",
-    "migrateSignatureAppliedFail": "迁移 codex_actions.signature_applied 失败：{error}"
+    "migrateSignatureAppliedFail": "迁移 codex_actions.signature_applied 失败：{error}",
+    "desktopBuildUnverified": "该 Codex 桌面端版本尚未经真机验证，探测通过前不能远程操控；请在电脑端打开该会话触发探测，或升级到已验证版本",
+    "probeFailed": "只读探测明确失败，该桌面端版本的协议形态与兔维斯不兼容；请到桌面端处理，或升级/回退 Codex 客户端",
+    "protocolDriftSuspected": "探测疑似遇到协议漂移，桌面端返回的结构与兔维斯预期不一致；请重启桌面端后重试，若持续出现请升级客户端",
+    "probeInconclusive": "只读探测暂无线索（桌面端可能未启动、无人持有或正忙），兔维斯稍后会自动重试；期间请到桌面端查看该会话",
+    "deliveryUnknown": "投递结果未知，这条消息可能已送达也可能没有；请到桌面端核对后再决定是否重发，兔维斯不会自动重发",
+    "decisionUnconfirmed": "审批决策已被受理但尚未确认生效，请到桌面端核对该请求是否已消失；必要时可终止本轮"
   },
   "mobile": {
     "composer": {

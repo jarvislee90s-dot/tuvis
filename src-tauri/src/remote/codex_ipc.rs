@@ -1087,6 +1087,9 @@ impl ProbeLedger for StoreProbeLedger {
             .map(|row| ProbeLedgerEntry {
                 state: row.state,
                 next_retry_at: row.next_retry_at,
+                // #172/T9a：探测只读事实要用的两个字段（只读；不改既有语义）
+                stage: row.probe_stage,
+                error_code: row.error_code,
             })
     }
 
@@ -1158,7 +1161,11 @@ fn closed_profile() -> crate::services::codex_desktop_ipc::profile::ProtocolProf
 /// "send" 字符串一致——同一列、同一口径，不新造词表）。
 pub(crate) const CAP_SEND: &str = "send";
 /// 兼容发送「结果未知」的账本原因码（超时 / 断链——**结果未知，绝不重发**）。
-pub(crate) const COMPAT_SEND_DELIVERY_UNKNOWN: &str = "delivery_unknown";
+///
+/// #172/T9a：机器码**单一出处**在 `services::codex_desktop_ipc::reason_code`
+/// （前端按 `errors.deliveryUnknown` 取文案）；此处只是别名，值一字不改。
+pub(crate) const COMPAT_SEND_DELIVERY_UNKNOWN: &str =
+    crate::services::codex_desktop_ipc::reason_code::DELIVERY_UNKNOWN;
 
 /// 兼容发送的一次结果（**只在本路径上产生**：未知 build + 开关开）。
 #[derive(Debug, Clone, Copy)]
@@ -2640,7 +2647,14 @@ async fn confirm_decision_gone(
         }
         if tokio::time::Instant::now() >= deadline {
             if receipt.reason_code.is_none() {
-                receipt.reason_code = Some("decision_unconfirmed".to_string());
+                // #172/T9a：机器码单一出处（前端按 `errors.decisionUnconfirmed` 取文案）
+                let code = crate::services::codex_desktop_ipc::reason_code::DECISION_UNCONFIRMED;
+                log::info!(
+                    "codex-ipc decision: 受理后 {total}ms 未见生效，reason={code} userMessage={}",
+                    crate::services::codex_desktop_ipc::reason_code::message_of(code)
+                        .unwrap_or("-")
+                );
+                receipt.reason_code = Some(code.to_string());
             }
             return receipt;
         }
@@ -2715,7 +2729,7 @@ mod startup_merge_tests {
 
     use super::{merge_startup_buffer, supersedes, turn_association_refusal};
     use crate::services::codex_desktop_ipc::types::{
-        CapabilitySet, ContentState, ControlAvailability, ThreadKey, ThreadProjection,
+        CapabilitySet, ContentState, ControlAvailability, ProbeStatus, ThreadKey, ThreadProjection,
     };
 
     fn k(thread: &str) -> ThreadKey {
@@ -2743,6 +2757,7 @@ mod startup_merge_tests {
             messages: Vec::new(),
             truncated: false,
             pending: Vec::new(),
+            probe_status: ProbeStatus::idle(),
             owner_epoch: epoch,
             owner_generation: gen,
         }

@@ -3639,8 +3639,8 @@ use multi_agents_manager_lib::services::codex_desktop_ipc::probe::{
 use multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile;
 use std::sync::Arc;
 
-/// 内存账本行：(state, next_retry_at, error_code)。
-type LedgerRow = (ProbeState, Option<i64>, Option<String>);
+/// 内存账本行：(state, next_retry_at, error_code, stage)。
+type LedgerRow = (ProbeState, Option<i64>, Option<String>, Option<String>);
 type LedgerKey = (String, String);
 
 /// 内存账本（测试用）：记录读写次数，方便断言「零帧复用」「未探测」。
@@ -3659,9 +3659,27 @@ impl MemoryLedger {
         state: ProbeState,
         next_retry_at: Option<i64>,
     ) {
+        self.seed_detail(probe_key, capability, state, next_retry_at, None, None);
+    }
+
+    /// 带级次与错误码的种行（#172/T9a：探测只读事实要读这两个字段）。
+    fn seed_detail(
+        &self,
+        probe_key: &str,
+        capability: &str,
+        state: ProbeState,
+        next_retry_at: Option<i64>,
+        stage: Option<&str>,
+        error_code: Option<&str>,
+    ) {
         self.rows.lock().unwrap().insert(
             (probe_key.to_string(), capability.to_string()),
-            (state, next_retry_at, None),
+            (
+                state,
+                next_retry_at,
+                error_code.map(str::to_string),
+                stage.map(str::to_string),
+            ),
         );
     }
     fn gets(&self) -> usize {
@@ -3683,10 +3701,14 @@ impl ProbeLedger for MemoryLedger {
     fn get(&self, probe_key: &str, capability: &str) -> Option<ProbeLedgerEntry> {
         self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.row(probe_key, capability)
-            .map(|(state, next_retry_at, _)| ProbeLedgerEntry {
-                state,
-                next_retry_at,
-            })
+            .map(
+                |(state, next_retry_at, error_code, stage)| ProbeLedgerEntry {
+                    state,
+                    next_retry_at,
+                    error_code,
+                    stage,
+                },
+            )
     }
 
     fn record(&self, probe_key: &str, capability: &str, outcome: &ProbeOutcome) {
@@ -3703,6 +3725,7 @@ impl ProbeLedger for MemoryLedger {
                 outcome.as_state(),
                 next_retry_at,
                 outcome.error_code().map(str::to_string),
+                Some(outcome.stage().as_str().to_string()),
             ),
         );
     }
@@ -4058,4 +4081,203 @@ async fn schema_probe_failure_is_recorded_as_inconclusive() {
         adapter.approval_policy().is_empty(),
         "未取证不得开放审批决策（卡片走「到桌面处理」）"
     );
+}
+
+// ============================================================
+// #172/T9a：探测只读事实（probe_status）——只读、机器码落地、camelCase 序列化
+// ============================================================
+
+use multi_agents_manager_lib::services::codex_desktop_ipc::reason_code::{
+    probe_failed_code, DESKTOP_BUILD_UNVERIFIED, PROBE_INCONCLUSIVE, PROTOCOL_DRIFT_SUSPECTED,
+};
+use multi_agents_manager_lib::services::codex_desktop_ipc::types::{ProbeStatus, ProbeStatusState};
+
+/// 造一个「账本里已有一行给定结论」的 adapter，取它的探测只读事实。
+///
+/// 每个结论一份独立 adapter：探测事实的结论来自账本，缓存按 adapter 隔离，
+/// 这样三行结论互不干扰（也如实反映「一行 = 一个结论」）。
+async fn probe_status_of_ledger_row(
+    state: ProbeState,
+    stage: Option<&str>,
+    error_code: Option<&str>,
+) -> ProbeStatus {
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(FailingConnector::new()),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    ledger.seed_detail(
+        &expected_probe_key("macos", "26.9999.0"),
+        CAP_STATE,
+        state,
+        None,
+        stage,
+        error_code,
+    );
+    adapter.set_probe_ledger(ledger);
+    adapter.probe_status().await
+}
+
+/// 该 build **尚无任何探测记录** → `idle` + `desktop_build_unverified`。
+#[tokio::test]
+async fn probe_status_reports_unverified_build_before_any_probe() {
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+
+    let status = adapter.probe_status().await;
+    assert_eq!(status.state, ProbeStatusState::Idle);
+    assert_eq!(
+        status.reason_code.as_deref(),
+        Some(DESKTOP_BUILD_UNVERIFIED),
+        "没有探测记录 = 这台 build 未经真机验证"
+    );
+    assert_eq!(status.stage, None, "没有记录就没有级次");
+    // 只读：查账本不写账本、不建连、不发帧
+    assert_eq!(ledger.records(), 0, "只读事实不得写账本");
+    assert_eq!(connector.attempts(), 0, "只读事实不得建连");
+}
+
+/// 账本三态 → 状态与 reasonCode 逐一对上。
+#[tokio::test]
+async fn probe_status_maps_ledger_states() {
+    // probed：探测通过 → 无失败码
+    let probed = probe_status_of_ledger_row(ProbeState::Probed, Some("P3"), None).await;
+    assert_eq!(probed.state, ProbeStatusState::Probed);
+    assert_eq!(probed.stage.as_deref(), Some("P3"));
+    assert_eq!(probed.reason_code, None, "通过没有失败码");
+
+    // inconclusive：不确定（非判死）→ probe_inconclusive
+    let inconclusive = probe_status_of_ledger_row(
+        ProbeState::Inconclusive,
+        Some("P1"),
+        Some("no-client-found"),
+    )
+    .await;
+    assert_eq!(inconclusive.state, ProbeStatusState::Inconclusive);
+    assert_eq!(
+        inconclusive.reason_code.as_deref(),
+        Some(PROBE_INCONCLUSIVE)
+    );
+    assert_eq!(inconclusive.stage.as_deref(), Some("P1"));
+
+    // inconclusive + 漂移疑似 → 保留漂移码（比通用不确定码更可行动）
+    let drift = probe_status_of_ledger_row(
+        ProbeState::Inconclusive,
+        Some("P2"),
+        Some(PROTOCOL_DRIFT_SUSPECTED),
+    )
+    .await;
+    assert_eq!(drift.state, ProbeStatusState::Inconclusive);
+    assert_eq!(drift.reason_code.as_deref(), Some(PROTOCOL_DRIFT_SUSPECTED));
+
+    // failed：明确失败 → probe_failed:<stage>（动态码由常量前缀拼）
+    let failed =
+        probe_status_of_ledger_row(ProbeState::Failed, Some("P2"), Some("method_not_found")).await;
+    assert_eq!(failed.state, ProbeStatusState::Failed);
+    assert_eq!(
+        failed.reason_code.as_deref(),
+        Some(probe_failed_code("P2").as_str())
+    );
+    assert_eq!(failed.stage.as_deref(), Some("P2"));
+
+    // failed 但级次取不到 → 退回账本里的错误码（不猜级次）
+    let failed_no_stage =
+        probe_status_of_ledger_row(ProbeState::Failed, None, Some("method_not_found")).await;
+    assert_eq!(failed_no_stage.state, ProbeStatusState::Failed);
+    assert_eq!(
+        failed_no_stage.reason_code.as_deref(),
+        Some("method_not_found")
+    );
+}
+
+/// 只读 + camelCase 序列化；既有字段语义一字不动。
+#[tokio::test]
+async fn probe_status_is_readonly_and_serializes_camel_case() {
+    // 序列化：camelCase（`reasonCode` / `state` / `stage`）
+    let status = ProbeStatus {
+        state: ProbeStatusState::Inconclusive,
+        stage: Some("P2".into()),
+        reason_code: Some(PROBE_INCONCLUSIVE.into()),
+    };
+    let v = serde_json::to_value(&status).unwrap();
+    assert_eq!(v["state"], serde_json::json!("inconclusive"));
+    assert_eq!(v["stage"], serde_json::json!("P2"));
+    assert_eq!(v["reasonCode"], serde_json::json!(PROBE_INCONCLUSIVE));
+    assert!(
+        v.get("reason_code").is_none(),
+        "键名必须是 camelCase（与既有 DTO 一致）"
+    );
+    // 空态也要有键（前端不必判缺省）
+    let empty = serde_json::to_value(ProbeStatus::idle()).unwrap();
+    assert_eq!(empty["state"], serde_json::json!("idle"));
+    assert!(empty["stage"].is_null());
+    assert!(empty["reasonCode"].is_null());
+
+    // 只读：取事实不写账本、不建连
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    let _ = adapter.probe_status().await;
+    assert_eq!(ledger.records(), 0, "只读事实不得写账本");
+    assert_eq!(connector.attempts(), 0, "只读事实不得建连");
+
+    // 投影里带上这个事实，且**不改动既有字段的语义**
+    let p = adapter.projection(&probe_thread("t-readonly")).await;
+    assert_eq!(p.probe_status.state, ProbeStatusState::Idle);
+    assert_eq!(
+        p.availability,
+        multi_agents_manager_lib::services::codex_desktop_ipc::types::ControlAvailability::CompatOnly,
+        "只读事实不得改变可用性档位"
+    );
+    assert!(!p.capabilities.state, "未取证不得声称读能力可用");
+}
+
+/// 探测**在飞** → `probing`（单飞器既有能力；不新写并发结构）。
+#[tokio::test]
+async fn probe_status_reports_probing_while_probe_in_flight() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(TestConnector::new(test_endpoint("macos", "26.9999.0"), io)),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.set_probe_budget(probe_budget());
+
+    let key = probe_thread("thread-probing");
+    let key_in_task = key.clone();
+    let a = adapter.clone();
+    let probe = tokio::spawn(async move { a.ensure_read_evidence(&key_in_task).await });
+
+    // 探测已起飞（等握手到达 = 探测已进入 P0/P1）
+    handshake(&mut peer, "owner-1").await;
+    let status = adapter.probe_status().await;
+    assert_eq!(
+        status.state,
+        ProbeStatusState::Probing,
+        "探测在飞必须如实报 probing（前端据此渲染骨架态）"
+    );
+    assert_eq!(status.reason_code, None, "在飞不是失败，没有失败码");
+
+    // 探测结束 → 结论落账，事实随之更新
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let _follow = expect_frame(&mut peer, "following").await;
+    peer.send(&probe_snapshot("thread-probing", 3)).await;
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    let after = adapter.probe_status().await;
+    assert_eq!(after.state, ProbeStatusState::Probed);
+    adapter.shutdown().await;
 }

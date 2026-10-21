@@ -26,7 +26,7 @@ use super::probe::{ProbeLedger, CAP_SCHEMA, CAP_STATE};
 use super::profile::ProtocolProfile;
 use super::types::{
     CapabilitySet, ContentState, ControlAvailability, Delivery, OwnerLease, PendingAction,
-    PendingKind, PendingView, ProtocolError, ThreadKey, ThreadProjection,
+    PendingKind, PendingView, ProbeStatus, ProtocolError, ThreadKey, ThreadProjection,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -221,6 +221,13 @@ struct AdapterInner {
     /// #172/T7-R4 测试缝：注入 schema 探针结论（生产恒 `None` → 真跑 CLI；
     /// 测试注入后**绝不 spawn 真实 codex.exe**）。
     schema_probe_override: std::sync::Mutex<Option<SchemaProbeOutcome>>,
+    /// #172/T9a：探测只读事实的**缓存**（账本 `state` 行的结论）。
+    ///
+    /// 为什么要缓存：投影在每次状态变化时都会重建（多处发布点），每次都查账本
+    /// 会把 SQLite 读放大成热路径负担。账本 `state` 行的**唯一写者**是本 adapter
+    /// 的 [`DesktopIpcAdapter::ensure_read_evidence`]（remote 层只写 `send` 行），
+    /// 故在写点与 build 目标变更点失效即可保持准确。
+    probe_status_cache: std::sync::Mutex<Option<ProbeStatus>>,
     epoch: AtomicU64,
     events: broadcast::Sender<ThreadProjection>,
 }
@@ -277,6 +284,7 @@ impl DesktopIpcAdapter {
                 schema_evidence: std::sync::Mutex::new(None),
                 schema_probe_ran: AtomicBool::new(false),
                 schema_probe_override: std::sync::Mutex::new(None),
+                probe_status_cache: std::sync::Mutex::new(None),
                 epoch: AtomicU64::new(0),
                 events: broadcast::channel(256).0,
             }),
@@ -484,6 +492,85 @@ impl DesktopIpcAdapter {
             .probe_ledger
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(ledger);
+        // #172/T9a：账本换手 → 探测只读事实的缓存作废（下次现查）。
+        self.invalidate_probe_status_cache();
+    }
+
+    // ========================================================
+    // #172/T9a：探测结论的只读事实（probe_status）
+    // ========================================================
+
+    /// #172/T9a：**这台 build 的读链探测到哪一步了**（只读事实）。
+    ///
+    /// 数据来源全是既有只读能力，**不新增任何副作用**（不写账本、不建连、不发帧）：
+    /// * **在飞** → `probing`（单飞器 `is_flight_active`；同 build 的不同线程
+    ///   各有一条单飞键，故按 build 前缀匹配）；
+    /// * **账本 `state` 行** → `probed` / `inconclusive` / `failed`
+    ///   （映射见 [`super::reason_code::probe_status_from`]）；
+    /// * **该 build 尚无任何探测记录** → `idle` + `desktop_build_unverified`；
+    /// * **取不到**（无 build 目标 / 账本不可用）→ `idle` + **无码**（不猜）。
+    pub async fn probe_status(&self) -> ProbeStatus {
+        let Some(target) = self.probe_target_snapshot() else {
+            // 没有 build 目标（shipped build / 还没 resolve 到 build）→ 取不到，不猜
+            return ProbeStatus::idle();
+        };
+        let probe_key = self.resolve_probe_key(&target).await;
+        // 在飞 → probing（单飞器既有能力；只读查询）
+        if self.inner.probe.is_flight_active(&probe_key) {
+            return ProbeStatus::probing();
+        }
+        // 账本结论（缓存；写点失效后重查）
+        if let Some(cached) = self
+            .inner
+            .probe_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return cached;
+        }
+        let status = self.load_probe_status(&probe_key);
+        *self
+            .inner
+            .probe_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(status.clone());
+        status
+    }
+
+    /// 读账本 `state` 行 → 探测只读事实（**只读**：不写账本、不触发探测）。
+    fn load_probe_status(&self, probe_key: &str) -> ProbeStatus {
+        let Some(ledger) = self.probe_ledger() else {
+            // 账本不可用 → 取不到，不猜（不报「未验证」——那也是猜）
+            return ProbeStatus::idle();
+        };
+        match ledger.get(probe_key, CAP_STATE) {
+            Some(entry) => super::reason_code::probe_status_from(
+                entry.state,
+                entry.stage.as_deref(),
+                entry.error_code.as_deref(),
+            ),
+            // 该 build 尚无任何探测记录 → idle + desktop_build_unverified
+            None => ProbeStatus::unverified(),
+        }
+    }
+
+    /// 探测只读事实的缓存作废（账本写点 / build 目标变更点调用）。
+    fn invalidate_probe_status_cache(&self) {
+        *self
+            .inner
+            .probe_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 给投影盖上探测只读事实（#172/T9a；**单一盖章点**）。
+    ///
+    /// 镜像层不知道账本与单飞器，故由 adapter 在**发布前**统一盖；既有字段的
+    /// 语义一字不动——本方法只写 `probe_status` 这一个**只读**字段。
+    async fn stamp_probe_status(&self, mut p: ThreadProjection) -> ThreadProjection {
+        p.probe_status = self.probe_status().await;
+        p
     }
 
     /// 是否正在跑只读探测（#172 的「探测中」信号；T9 用它渲染骨架态）。
@@ -565,6 +652,8 @@ impl DesktopIpcAdapter {
                             duration_ms: 0,
                         },
                     );
+                    // #172/T9a：账本写点 → 探测只读事实的缓存作废
+                    self.invalidate_probe_status_cache();
                 }
                 return;
             }
@@ -590,10 +679,28 @@ impl DesktopIpcAdapter {
         );
         if let Some(ledger) = self.probe_ledger() {
             ledger.record(&probe_key, CAP_STATE, &outcome);
+            // #172/T9a：账本写点 → 探测只读事实的缓存作废（下次现查）
+            self.invalidate_probe_status_cache();
         }
         if matches!(outcome, ProbeOutcome::Probed { .. }) {
             self.set_state_capability(true);
         }
+        // #172/T9a：把「用户看到什么」也记进日志（只读事实的中文原文；供排障）
+        let status = super::reason_code::probe_status_from(
+            outcome.as_state(),
+            Some(outcome.stage().as_str()),
+            outcome.error_code(),
+        );
+        let reason = status.reason_code.as_deref().unwrap_or("-");
+        log::info!(
+            "codex-ipc probe status: state={} reason={reason} userMessage={}",
+            status.state.as_str(),
+            status
+                .reason_code
+                .as_deref()
+                .and_then(super::reason_code::message_of)
+                .unwrap_or("-")
+        );
     }
 
     /// 账本复用（**账本命中必须零帧**）：命中 `probed`/`verified` → 提升 `state` 并
@@ -789,6 +896,8 @@ impl DesktopIpcAdapter {
                 key: None,
             });
         }
+        // #172/T9a：build 目标变了 → 探测只读事实的缓存作废（账本键换了）
+        self.invalidate_probe_status_cache();
         // 双检：另一任务可能已重连（持 conn 锁期间不做其他锁操作）
         let (conn, epoch) = {
             let mut guard = self.inner.conn.lock().await;
@@ -850,12 +959,20 @@ impl DesktopIpcAdapter {
     }
 
     /// 已跟随且新鲜的投影（短锁；None = 需要 follow）。
+    ///
+    /// #172/T9a：镜像锁**之外**再盖探测只读事实（盖章要读账本/单飞器，不得持镜像锁）。
     async fn fresh_projection(&self, key: &ThreadKey) -> Option<ThreadProjection> {
-        let mirrors = self.inner.mirrors.lock().await;
-        mirrors
-            .get(key)
-            .filter(|m| !m.is_stale() && m.revision().is_some())
-            .map(|m| m.project(self.current_caps()))
+        let p = {
+            let mirrors = self.inner.mirrors.lock().await;
+            mirrors
+                .get(key)
+                .filter(|m| !m.is_stale() && m.revision().is_some())
+                .map(|m| m.project(self.current_caps()))
+        };
+        match p {
+            Some(p) => Some(self.stamp_probe_status(p).await),
+            None => None,
+        }
     }
 
     /// 恢复任务的 follow 统一入口（第三轮复审 B3）：**前置核验**仍有关注（已卸载
@@ -1006,15 +1123,22 @@ impl DesktopIpcAdapter {
     ///
     /// #172/T7：投影前把当前**审批策略**下发给镜像——`allowedDecisions` 只在这里算，
     /// 前端不重复策略。
+    ///
+    /// #172/T9a：镜像锁**之外**再盖探测只读事实（盖章要读账本/单飞器，不得持镜像锁）。
     pub async fn projection(&self, key: &ThreadKey) -> ThreadProjection {
         let caps = self.current_caps();
         let policy = self.approval_policy();
-        let mut mirrors = self.inner.mirrors.lock().await;
-        if let Some(m) = mirrors.get_mut(key) {
-            m.set_approval_policy(Some(policy));
-            return m.project(caps);
-        }
-        ThreadProjection {
+        let p = {
+            let mut mirrors = self.inner.mirrors.lock().await;
+            match mirrors.get_mut(key) {
+                Some(m) => {
+                    m.set_approval_policy(Some(policy));
+                    Some(m.project(caps))
+                }
+                None => None,
+            }
+        };
+        let p = p.unwrap_or(ThreadProjection {
             thread_id: key.thread_id.clone(),
             revision: None,
             stale: true,
@@ -1025,9 +1149,11 @@ impl DesktopIpcAdapter {
             messages: Vec::new(),
             truncated: false,
             pending: Vec::new(),
+            probe_status: ProbeStatus::idle(),
             owner_epoch: 0,
             owner_generation: 0,
-        }
+        });
+        self.stamp_probe_status(p).await
     }
 
     /// 同步忙快照（Codex Desktop IPC Task 8 加性接口：`DesktopDispatch::thread_busy`
@@ -1981,7 +2107,10 @@ async fn handle_state_changed(adapter: &DesktopIpcAdapter, frame: Value) {
         // C3：状态应用驱动的提交屏障清理——pending 消失或重现换 token 即解除旧
         // Unknown 屏障（不等下一次 respond 入口），新卡立即可答
         cleanup_inflight_for(adapter, &key.thread_id, &p.pending).await;
-        adapter.publish_event(p).await;
+        // #172/T9a：盖上探测只读事实（镜像锁已释放）
+        adapter
+            .publish_event(adapter.stamp_probe_status(p).await)
+            .await;
         if history_needed {
             maybe_request_complete_history(adapter, &key).await;
         }
@@ -2064,7 +2193,10 @@ async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {
         mirrors.get(key).map(|m| m.project(caps))
     };
     if let Some(p) = projection {
-        adapter.publish_event(p).await;
+        // #172/T9a：盖上探测只读事实（镜像锁已释放）
+        adapter
+            .publish_event(adapter.stamp_probe_status(p).await)
+            .await;
     }
 }
 
@@ -2318,7 +2450,10 @@ async fn handle_client_status_changed(adapter: &DesktopIpcAdapter, frame: &Value
         inflight.retain(|(tid, _), _| !affected.iter().any(|k| &k.thread_id == tid));
     }
     for p in projections {
-        adapter.publish_event(p).await;
+        // #172/T9a：盖上探测只读事实（镜像锁已释放）
+        adapter
+            .publish_event(adapter.stamp_probe_status(p).await)
+            .await;
     }
     // 2026-10-17 复审 C2：owner 失效但 socket 仍活着——连接级恢复循环不会触发；
     // 主动重新 discovery/follow 让新 owner 接管（重新接管的帧才能落进镜像），
@@ -2385,7 +2520,10 @@ async fn mark_all_mirrors_stale(adapter: &DesktopIpcAdapter, invalidate: bool) {
         }
     }
     for p in projections {
-        adapter.publish_event(p).await;
+        // #172/T9a：盖上探测只读事实（镜像锁已释放）
+        adapter
+            .publish_event(adapter.stamp_probe_status(p).await)
+            .await;
     }
 }
 

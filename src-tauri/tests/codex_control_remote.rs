@@ -408,7 +408,7 @@ fn minimal_projection(thread_id: &str, status: &str) -> ThreadProjection {
 
 fn projection_with_rev(thread_id: &str, status: &str, revision: u64) -> ThreadProjection {
     use multi_agents_manager_lib::services::codex_desktop_ipc::types::{
-        CapabilitySet, ContentState, ControlAvailability, ProjectedMessage,
+        CapabilitySet, ContentState, ControlAvailability, ProbeStatus, ProjectedMessage,
     };
     ThreadProjection {
         thread_id: thread_id.to_string(),
@@ -433,6 +433,7 @@ fn projection_with_rev(thread_id: &str, status: &str, revision: u64) -> ThreadPr
         }],
         truncated: false,
         pending: Vec::new(),
+        probe_status: ProbeStatus::idle(),
         owner_epoch: 0,
         owner_generation: 0,
     }

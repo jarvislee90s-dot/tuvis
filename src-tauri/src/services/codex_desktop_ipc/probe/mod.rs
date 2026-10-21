@@ -39,8 +39,15 @@ pub trait ProbeLedger: Send + Sync {
 }
 
 /// 账本结论的精简视图（adapter 只关心「能否复用」与「退避到点没」）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// #172/T9a 追加两个**只读**字段（探测事实要用）：`stage`（最后探测级 P0..P3）
+/// 与 `error_code`（账本里的错误码）——不改既有字段的语义。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeLedgerEntry {
     pub state: ProbeState,
     pub next_retry_at: Option<i64>,
+    /// 最后探测级（`P0`..`P3`）；旧行/无行 → `None`。
+    pub stage: Option<String>,
+    /// 账本里的错误码（`failed` / `inconclusive` 行有值）；`probed` 行 → `None`。
+    pub error_code: Option<String>,
 }

@@ -1904,7 +1904,13 @@
     "codexQueueRetractPending": "This message is still queued; use retract instead",
     "codexQueueForceInFlight": "This message is in-flight (auto-settled), out of force-release scope",
     "compatSendNeedsProbe": "A read-only probe must complete first (the read chain of this Codex desktop build is not verified yet)",
-    "migrateSignatureAppliedFail": "Failed to migrate codex_actions.signature_applied: {error}"
+    "migrateSignatureAppliedFail": "Failed to migrate codex_actions.signature_applied: {error}",
+    "desktopBuildUnverified": "This Codex desktop build is not machine-verified yet — remote control stays off until the read-only probe passes; open that thread on the desktop to trigger the probe, or upgrade to a verified build",
+    "probeFailed": "The read-only probe failed outright — this desktop build's protocol shape is not compatible with Tuvis; handle it on the desktop, or upgrade / roll back the Codex client",
+    "protocolDriftSuspected": "The probe suspects protocol drift — the desktop returned a structure that differs from what Tuvis expects; restart the desktop and retry, and upgrade the client if it keeps happening",
+    "probeInconclusive": "The read-only probe has no conclusion yet (the desktop may be closed, unowned or busy) — Tuvis retries later; until then, read that thread on the desktop",
+    "deliveryUnknown": "Delivery outcome unknown — this message may have arrived or may not have; check on the desktop before deciding to resend (Tuvis never resends on its own)",
+    "decisionUnconfirmed": "The approval decision was accepted but not confirmed as effective — check on the desktop whether that request is gone; you can stop the turn if needed"
   },
   "mobile": {
     "composer": {

@@ -207,6 +207,20 @@ impl ProbeRunner {
     pub fn inflight(&self) -> usize {
         self.flights.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
+
+    /// 该 build 是否有探测**在飞**（#172/T9a：探测只读事实的「探测中」信号）。
+    ///
+    /// 单飞键形如 `{probe_key}|{thread_id}`（同 build 的不同线程各自一条），故按
+    /// 前缀匹配。只读查询：**不新增并发结构**（复用既有 `flights` 表），也不改
+    /// 单飞语义。
+    pub fn is_flight_active(&self, probe_key: &str) -> bool {
+        let prefix = format!("{probe_key}|");
+        self.flights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .any(|k| k == probe_key || k.starts_with(&prefix))
+    }
 }
 
 // ============================================================

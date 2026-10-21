@@ -18,8 +18,8 @@
 use super::history_view::HistoryView;
 use super::pending::{DecisionPolicy as PendingDecisionPolicy, PendingProjector};
 use super::types::{
-    CapabilitySet, ContentState, ControlAvailability, OwnerLease, ProjectedMessage, ProtocolError,
-    ThreadKey, ThreadProjection,
+    CapabilitySet, ContentState, ControlAvailability, OwnerLease, ProbeStatus, ProjectedMessage,
+    ProtocolError, ThreadKey, ThreadProjection,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -497,6 +497,9 @@ impl ThreadMirror {
             truncated: messages.1,
             messages: messages.0,
             pending,
+            // #172/T9a：探测只读事实由 **adapter** 盖章（镜像层不知道账本/单飞器）；
+            // 这里先给诚实缺省（idle + 无码），adapter 随后覆盖。
+            probe_status: ProbeStatus::idle(),
             // 代际来自镜像**绑定的 lease**（广播事件与 GET/首快照同源）——首快照
             // 不带 0，否则 SSE 启动缓冲的 `supersedes` 会把任何事件都判成更新
             //（2026-10-20 第三轮复审 Important）。

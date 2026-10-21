@@ -161,12 +161,103 @@ pub struct ThreadProjection {
     pub messages: Vec<ProjectedMessage>,
     pub truncated: bool,
     pub pending: Vec<PendingView>,
+    /// #172/T9a：探测结论的**只读事实**（这台 build 的读链探测到哪一步了）。
+    ///
+    /// **只读**：不携带任何写语义，也不改变既有字段的含义——它只是把「为什么这台
+    /// build 只能只读/不能写」这一事实如实说给前端看。
+    pub probe_status: ProbeStatus,
     /// Owner 代际（epoch, generation）：**不序列化给前端**，只用于 SSE 首快照与
     /// 订阅缓冲事件的先后判定（跨 owner revision 可能回退，不能只比 revision）。
     #[serde(skip)]
     pub owner_epoch: u64,
     #[serde(skip)]
     pub owner_generation: u64,
+}
+
+/// 探测结论的**只读事实**（#172/T9a；随投影下发）。
+///
+/// 数据来源全部是既有只读能力：单飞器（在飞探测）+ 探测账本 `codex_ipc_probe` 的
+/// `(probe_key, capability='state')` 行。**取不到就不猜**（`state = idle`、
+/// `reasonCode = null`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeStatus {
+    /// `idle` / `probing` / `probed` / `inconclusive` / `failed`。
+    pub state: ProbeStatusState,
+    /// 最后一次探测到哪一级（`P0`..`P3`）；无记录 → `null`。
+    pub stage: Option<String>,
+    /// 机器码（snake_case；词表见 `crate::services::codex_desktop_ipc::reason_code`）。
+    /// 无 → `null`。
+    #[serde(rename = "reasonCode")]
+    pub reason_code: Option<String>,
+}
+
+/// 探测只读事实的状态档（与账本 `ProbeState` 同形但**不含** `verified`：
+/// `verified` 只来自 shipped 表，不是探测结论）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbeStatusState {
+    /// 尚无该 build 的任何探测记录（`reasonCode` 通常是 `desktop_build_unverified`）。
+    Idle,
+    /// 探测在飞。
+    Probing,
+    /// 探测通过（读链已实证）。
+    Probed,
+    /// 不确定（有 attempt、无结论、非判死——按退避重试）。
+    Inconclusive,
+    /// 明确失败（协议/连接形态不可用——不自动重试）。
+    Failed,
+}
+
+impl ProbeStatusState {
+    /// 线上/日志词（与 serde 形态一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Probing => "probing",
+            Self::Probed => "probed",
+            Self::Inconclusive => "inconclusive",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl Default for ProbeStatus {
+    fn default() -> Self {
+        Self::idle()
+    }
+}
+
+impl ProbeStatus {
+    /// `idle` + **无码**（取不到：不猜）。
+    pub fn idle() -> Self {
+        Self {
+            state: ProbeStatusState::Idle,
+            stage: None,
+            reason_code: None,
+        }
+    }
+
+    /// `idle` + `desktop_build_unverified`（该 build 尚无任何探测记录）。
+    pub fn unverified() -> Self {
+        Self {
+            state: ProbeStatusState::Idle,
+            stage: None,
+            reason_code: Some(
+                crate::services::codex_desktop_ipc::reason_code::DESKTOP_BUILD_UNVERIFIED
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// `probing`（探测在飞；级次未知 → `stage = null`）。
+    pub fn probing() -> Self {
+        Self {
+            state: ProbeStatusState::Probing,
+            stage: None,
+            reason_code: None,
+        }
+    }
 }
 
 /// 内容健康状态（`contentState`）：ready 且真实 0 条才允许显示「暂无消息」；
