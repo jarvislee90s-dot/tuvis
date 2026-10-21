@@ -13,7 +13,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import hljs from "highlight.js/lib/common";
-import { ArrowLeft, X } from "lucide-react";
+import { ArrowLeft, Crosshair, X } from "lucide-react";
+import i18n from "@/i18n";
 import PreviewModeSwitcher, { type PreviewMode } from "./PreviewModeSwitcher";
 import { fileKindOf } from "./FilePanel";
 import { ApiError, fetchFile, type FilePayload } from "./api";
@@ -42,6 +43,13 @@ interface FilePreviewProps {
    *  SessionDetail 不再传本 prop（页头关闭钮不渲染）；直接用法/既有测试传值仍渲染，
    *  行为不变 */
   onClose?: () => void;
+  /** 显式打开计数（Task 6）：同一路径每次被用户显式打开时 +1，作为重新读取的
+   *  刷新键——预览仍开着、磁盘内容已变，再点一次也显示当前内容。宽窄屏/布局切换
+   *  不是新的打开，不进入本键；缺省 0（挂载即读，旧行为不变）。 */
+  refreshKey?: number;
+  /** 定位最近正文引用（Task 7）：与文件池来源按钮走**同一个**五页有界查找流程。
+   *  缺省不渲染定位按钮（其他工具/既有直接用法不变）。 */
+  onLocate?: () => void;
 }
 
 type LoadState =
@@ -106,6 +114,8 @@ export default function FilePreview({
   onBack,
   fontScale = 1,
   onClose,
+  refreshKey = 0,
+  onLocate,
 }: FilePreviewProps) {
   const [state, setState] = useState<LoadState>({ phase: "loading" }); // 手动重试信号（403 时文件可能已被 agent 补写回限内 / 网络恢复后再试）
   const [retryTick, setRetryTick] = useState(0);
@@ -157,21 +167,30 @@ export default function FilePreview({
   // （GitHub / VSCode 默认口径）
   const docSource = segKind === "markdown" || fileKindOf(filePath) === "doc";
 
-  // 拉取文件：挂载与 filePath 变化时各一次；图片 object URL 在清理函数里 revoke，
-  // 防浮窗反复开关泄漏 blob。alive 标记防卸载后 setState 与迟到响应的 revoke 竞态
+  // 拉取文件：挂载 / 换文件 / 手动重试 / 显式重新打开（refreshKey）各一次；
+  // 图片 object URL 在清理函数里 revoke，防浮窗反复开关泄漏 blob。alive 标记防
+  // 卸载后 setState 与迟到响应的 revoke 竞态；AbortSignal 让关闭预览、换文件或
+  // 重新打开时中止旧的在途读取（主动取消不显示为加载失败）。
+  // 注意：mode（宽窄屏/分屏切换）刻意不在依赖里——布局切换不是一次新的打开。
   useEffect(() => {
     let alive = true;
     let objectUrl: string | null = null;
+    const ctrl = new AbortController();
     setState({ phase: "loading" });
     setProgress(null); // 换文件/重试先清上一份进度（UI 不得串场）
     firstSampleRef.current = null;
-    fetchFile(session.id, filePath, (loaded, total) => {
-      if (!alive) return;
-      const atMs = Date.now(); // 事件回调里取样（非渲染期），供剩余时间估算
-      const first = firstSampleRef.current ?? { loaded, atMs };
-      firstSampleRef.current = first;
-      setProgress({ loaded, total, rateBps: transferRateBps(first, { loaded, atMs }) });
-    })
+    fetchFile(
+      session.id,
+      filePath,
+      (loaded, total) => {
+        if (!alive) return;
+        const atMs = Date.now(); // 事件回调里取样（非渲染期），供剩余时间估算
+        const first = firstSampleRef.current ?? { loaded, atMs };
+        firstSampleRef.current = first;
+        setProgress({ loaded, total, rateBps: transferRateBps(first, { loaded, atMs }) });
+      },
+      ctrl.signal
+    )
       .then((p) => {
         if (!alive) {
           if (p.kind === "image") URL.revokeObjectURL(p.url); // 迟到的图片响应直接释放
@@ -181,7 +200,7 @@ export default function FilePreview({
         setState({ phase: "ok", payload: p });
       })
       .catch((e: unknown) => {
-        if (alive) {
+        if (alive && !ctrl.signal.aborted) {
           setState({
             phase: "error",
             status: e instanceof ApiError ? e.status : null,
@@ -191,9 +210,10 @@ export default function FilePreview({
       });
     return () => {
       alive = false;
+      ctrl.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [session.id, filePath, retryTick]);
+  }, [session.id, filePath, retryTick, refreshKey]);
 
   // 路径末段作标题（分隔符双态：win 反斜杠 / unix 斜杠）
   const baseName = filePath.split(/[\\/]/).pop() || filePath;
@@ -276,6 +296,19 @@ export default function FilePreview({
         <span className="min-w-0 flex-1 truncate text-sm font-medium text-[var(--tx)]">
           {baseName}
         </span>
+        {/* 定位最近正文引用（Task 7）：与文件池来源按钮同一有界查找；窄屏会先切回消息区 */}
+        {onLocate && (
+          <button
+            type="button"
+            data-testid="preview-locate"
+            aria-label={i18n.t("mobile.artifacts.locate.action")}
+            title={i18n.t("mobile.artifacts.locate.action")}
+            onClick={onLocate}
+            className="shrink-0 rounded-full border border-[var(--cb)] p-1 text-[var(--mut)] hover:bg-[var(--cb)] hover:text-[var(--tx)] dark:hover:bg-[var(--btnp)]"
+          >
+            <Crosshair size={14} />
+          </button>
+        )}
         {state.phase === "error" && (
           <button
             type="button"

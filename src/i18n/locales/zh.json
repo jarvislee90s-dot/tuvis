@@ -2016,6 +2016,66 @@
         "headless_failed": "兼容通道未送达：{{reason}}",
         "headless_cancelled": "兼容通道已取消：{{reason}}"
       }
+    },
+    "artifacts": {
+      "source": {
+        "image_generation": "生成",
+        "local_image": "上传",
+        "mention": "上传",
+        "file_change": "修改",
+        "image_view": "查看",
+        "image_url": "外部图片",
+        "unknown": "未知来源"
+      },
+      "imageIndex": "第 {{n}} 张",
+      "imageAlt": "附件图片",
+      "imagePending": "图片将在进入视野后加载",
+      "imageLoading": "图片加载中…",
+      "openImage": "预览图片 {{name}}",
+      "imageOverflow": "本回合共 {{total}} 张图片，最多展示前 {{shown}} 张",
+      "fileChangeOverflow": "另有 {{count}} 个文件变更未展示",
+      "serverOmitted": "另有 {{count}} 个附件因服务端预算未下发",
+      "openFilePanel": "打开文件面板",
+      "sourceFallback": "来源：{{label}}",
+      "externalImage": "外部图片",
+      "reason": {
+        "missingPath": "缺少文件路径，无法预览",
+        "unresolvedFileId": "该图片只有文件标识，无法在设备上打开",
+        "dataUrl": "内嵌图片不提供预览，也不会转成下载",
+        "unsupportedScheme": "不支持该链接协议，仅支持 HTTP(S)",
+        "pathTooLong": "文件路径过长，无法预览",
+        "fileKeyTooLong": "文件标识过长，无法关联",
+        "missingUrl": "缺少链接地址，无法打开",
+        "urlTooLong": "链接过长，无法打开",
+        "unreadable": "无法读取该文件",
+        "denied": "该路径受安全策略保护，无法预览",
+        "removed": "文件不存在或已被移动",
+        "tooLarge": "文件超过预览上限，无法显示",
+        "notFile": "该路径不是文件",
+        "notImage": "该路径不是可显示的图片",
+        "decodeFailed": "图片无法解码",
+        "unknown": "无法预览该引用"
+      },
+      "locate": {
+        "action": "在正文中定位最近引用",
+        "aria": "在正文中定位 {{name}} 的最近引用",
+        "short": "定位",
+        "searching": "正在定位最近引用…（已搜索 {{pages}} / {{max}} 页）",
+        "hit": "已定位到最近引用（第 {{page}} 页）",
+        "miss": "最近五页消息中未找到该文件的引用",
+        "missHint": "定位不会继续向前加载；这不代表该文件从未被引用",
+        "end": "已查到最早消息，未找到该文件的引用",
+        "returnPreview": "返回文件预览",
+        "returnPanel": "返回文件面板",
+        "retry": "重试",
+        "dismiss": "关闭定位提示",
+        "failure": {
+          "historyIncomplete": "历史尚未完整载入，本次定位已停止（可重试）",
+          "loadFailed": "读取更早消息失败，本次定位已停止（可重试）",
+          "cursorInvalid": "历史游标已失效（历史可能已更新），本次定位已停止（可重试）",
+          "generationInvalid": "历史代际已失效（会话已更新），本次定位已停止（可重试）"
+        }
+      }
     }
   }
 }
