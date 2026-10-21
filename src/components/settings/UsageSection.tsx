@@ -76,6 +76,48 @@ const RETENTION_RANGE = [1, 90] as const;
 
 const INTERVAL_RANGE = [1, 1440] as const;
 
+/** 数字设置输入：编辑期保留字符串草稿，失焦/Enter 才夹取并保存，避免逐字符重渲染导致光标跳动。 */
+function NumericSettingInput({
+  id,
+  testId,
+  range,
+  value,
+  className,
+  onCommit,
+}: {
+  id: string;
+  testId: string;
+  range: readonly [number, number];
+  value: number;
+  className: string;
+  onCommit(next: number): void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const commit = () => {
+    if (draft === null) return;
+    const next = clampDigits(draft, range[0], range[1]);
+    setDraft(null);
+    if (next !== null && next !== value) onCommit(next);
+  };
+  return (
+    <Input
+      id={id}
+      data-testid={testId}
+      inputMode="numeric"
+      className={className}
+      value={draft ?? String(value)}
+      onChange={(event) => setDraft(event.currentTarget.value.replace(/\D/g, ""))}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          commit();
+        }
+      }}
+    />
+  );
+}
+
 export function UsageSection() {
   const { t } = useAppTranslation();
   const queryClient = useQueryClient();
@@ -124,16 +166,6 @@ export function UsageSection() {
   const change = (patch: UsageSettingsPatch) => {
     setForm((f) => (f ? { ...f, ...patch } : f));
     void save(patch);
-  };
-
-  const onNumberChange = (
-    raw: string,
-    [min, max]: readonly [number, number],
-    key: "miniBarToolRows" | "detailRetentionDays" | "collectIntervalMin"
-  ) => {
-    const value = clampDigits(raw, min, max);
-    if (value === null) return;
-    change({ [key]: value } as UsageSettingsPatch);
   };
 
   // 换宠物 → 姿态回退 `random`（见文件头第三条纪律）。`subscribeConfig` 覆盖同窗口与跨窗口两条路径；
@@ -220,15 +252,13 @@ export function UsageSection() {
               hint={t("settings.usage.miniBarToolRowsHint")}
               htmlFor="usage-minibar-tool-rows"
             >
-              <Input
+              <NumericSettingInput
                 id="usage-minibar-tool-rows"
-                data-testid="usage-minibar-tool-rows"
-                inputMode="numeric"
+                testId="usage-minibar-tool-rows"
+                range={TOOL_ROWS_RANGE}
                 className="h-8 w-16 text-right font-mono text-sm tabular-nums"
                 value={form.miniBarToolRows}
-                onChange={(e) =>
-                  onNumberChange(e.currentTarget.value, TOOL_ROWS_RANGE, "miniBarToolRows")
-                }
+                onCommit={(next) => change({ miniBarToolRows: next })}
               />
             </SettingRow>
             <div className="border-t" />
@@ -243,15 +273,13 @@ export function UsageSection() {
               }
               htmlFor="usage-detail-retention-days"
             >
-              <Input
+              <NumericSettingInput
                 id="usage-detail-retention-days"
-                data-testid="usage-detail-retention-days"
-                inputMode="numeric"
+                testId="usage-detail-retention-days"
+                range={RETENTION_RANGE}
                 className="h-8 w-20 text-right font-mono text-sm tabular-nums"
                 value={form.detailRetentionDays}
-                onChange={(e) =>
-                  onNumberChange(e.currentTarget.value, RETENTION_RANGE, "detailRetentionDays")
-                }
+                onCommit={(next) => change({ detailRetentionDays: next })}
               />
             </SettingRow>
             <div className="border-t" />
@@ -261,15 +289,13 @@ export function UsageSection() {
               hint={t("settings.usage.collectIntervalHint")}
               htmlFor="usage-collect-interval-min"
             >
-              <Input
+              <NumericSettingInput
                 id="usage-collect-interval-min"
-                data-testid="usage-collect-interval-min"
-                inputMode="numeric"
+                testId="usage-collect-interval-min"
+                range={INTERVAL_RANGE}
                 className="h-8 w-20 text-right font-mono text-sm tabular-nums"
                 value={form.collectIntervalMin}
-                onChange={(e) =>
-                  onNumberChange(e.currentTarget.value, INTERVAL_RANGE, "collectIntervalMin")
-                }
+                onCommit={(next) => change({ collectIntervalMin: next })}
               />
             </SettingRow>
             <div className="border-t" />

@@ -500,7 +500,7 @@
     },
     "usage": {
       "title": "Usage statistics",
-      "desc": "Eight settings for usage collection, the pet mini bar and the share image.",
+      "desc": "Usage collection, pet mini bar, cost display and share-image settings.",
       "enabled": "Enable usage statistics",
       "enabledHint": "When off, no session file is scanned; the dashboard and mini bar keep showing the already-collected ledger.",
       "miniBarRange": "Mini bar range",

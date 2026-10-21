@@ -91,7 +91,7 @@ fn is_workday(day: Weekday) -> bool {
     )
 }
 
-fn previous_workday(day: Weekday) -> Weekday {
+fn previous_day(day: Weekday) -> Weekday {
     match day {
         Weekday::Mon => Weekday::Sun,
         Weekday::Tue => Weekday::Mon,
@@ -127,13 +127,14 @@ fn target_local(local: NaiveDateTime, timezone: TimePriceTimezone) -> Option<Nai
 pub fn is_peak_at(target: NaiveDateTime, windows: &[NormalizedWindow]) -> bool {
     let minute = target.hour() as i32 * 60 + target.minute() as i32;
     let workday = is_workday(target.weekday());
-    let previous_workday = is_workday(previous_workday(target.weekday()));
+    let previous_day_is_workday = is_workday(previous_day(target.weekday()));
     windows.iter().any(|window| {
         if window.start_min < window.end_min {
             workday && minute >= window.start_min && minute < window.end_min
         } else {
             // 当天 [start, 24:00) 或前一天跨午夜窗口的 [00:00, end)
-            (workday && minute >= window.start_min) || (previous_workday && minute < window.end_min)
+            (workday && minute >= window.start_min)
+                || (previous_day_is_workday && minute < window.end_min)
         }
     })
 }
