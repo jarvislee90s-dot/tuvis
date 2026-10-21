@@ -88,12 +88,29 @@ fn candidate_threads(limit: usize) -> Vec<String> {
         .into_iter()
         .filter_map(|(_, path)| {
             let name = path.file_name()?.to_string_lossy().to_string();
-            let stem = name.strip_suffix(".jsonl")?;
-            let tail = stem.rsplit('-').next()?;
-            (tail.len() == 36 && tail.matches('-').count() == 4).then(|| tail.to_string())
+            uuid_from_rollout_name(&name)
         })
         .take(limit)
         .collect()
+}
+
+/// 从 rollout 文件名取 thread UUID：文件名形如
+/// `rollout-2026-10-21T15-52-41-<uuid>.jsonl`——**UUID 自己也被 `-` 切碎**，所以只能
+/// 取「去掉 `.jsonl` 后的末 36 字符」再校验 UUID 形态（按 `-` 切段取尾会只剩 12 位 hex，
+/// 这正是 2026-10-21 子代理探测时候选列表为空的 bug）。
+fn uuid_from_rollout_name(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".jsonl")?;
+    if stem.len() < 36 {
+        return None;
+    }
+    let tail = &stem[stem.len() - 36..];
+    let bytes = tail.as_bytes();
+    let shaped = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        });
+    shaped.then(|| tail.to_string())
 }
 
 fn collect_rollouts(
@@ -356,4 +373,24 @@ async fn unfollow(conn: &ConnectionHandle, key: &ThreadKey) -> Result<(), String
     )
     .await
     .map_err(|e| e.code().to_string())
+}
+
+/// 文件名取 thread UUID 的回归（真机 rollout 名样例）：UUID 自身被 `-` 切碎，必须取
+/// 「去后缀后末 36 字符」再校验形态——按 `-` 切段取尾只会剩 12 位 hex（2026-10-21 探针
+/// 的候选列表因此为空）。
+#[test]
+fn rollout_filename_yields_thread_uuid() {
+    assert_eq!(
+        uuid_from_rollout_name(
+            "rollout-2026-10-21T15-52-41-01a153d7-78d4-7d60-9709-5500cd0aed0f.jsonl"
+        )
+        .as_deref(),
+        Some("01a153d7-78d4-7d60-9709-5500cd0aed0f")
+    );
+    assert_eq!(
+        uuid_from_rollout_name("rollout-2026-10-21T15-52-41-not-a-uuid.jsonl"),
+        None
+    );
+    assert_eq!(uuid_from_rollout_name("short.jsonl"), None);
+    assert_eq!(uuid_from_rollout_name("rollout-x.jsonl.bak"), None);
 }
