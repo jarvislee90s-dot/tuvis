@@ -165,8 +165,11 @@ async fn probe_live_unknown_build() {
         "readProbe": probe_json,
     });
     let out = std::env::temp_dir().join(format!("tuvis-live-probe-{platform}-{build}.json"));
-    std::fs::write(&out, format!("{}\n", serde_json::to_string_pretty(&report).unwrap()))
-        .expect("写证据文件失败");
+    std::fs::write(
+        &out,
+        format!("{}\n", serde_json::to_string_pretty(&report).unwrap()),
+    )
+    .expect("写证据文件失败");
     println!("[probe] 证据文件：{}", out.display());
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
