@@ -34,6 +34,14 @@ _Only versions translated so far are listed here; the full history lives in the
 
 - **Stop the Codex desktop turn from the phone**: while a desktop turn keeps running, the mobile outgoing-queue panel gains a "Stop the desktop turn & continue" action — it interrupts the turn currently running in desktop Codex, and **work that turn has not finished is lost** (the confirmation says so before anything is sent); once the turn stops, the queue continues on its own. Verified on macOS `26.1013.40934`; other Desktop builds are unverified and stay disabled.
 
+### Changed
+
+- **Default README switched to English**: `README.md` is now the English version
+  (content moved in from `README.en.md`); the Chinese source-of-truth moved to
+  `README.zh-CN.md`, with language-switcher links at the top of both files. The
+  `AGENTS.md` bilingual asset table, project tree, and the README pin in the
+  `usage-partial-coverage-lock` test were updated accordingly.
+
 ## [0.6.0] - 2026-10-21
 
 ### Added
