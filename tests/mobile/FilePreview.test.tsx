@@ -1,7 +1,13 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import FilePreview from "@/mobile/FilePreview";
 import type { Session } from "@/types/session";
+
+beforeEach(async () => {
+  // Task 7 的定位按钮文案走 i18n（本文件其余断言为硬编码中文，zh 与之一致）
+  await i18n.changeLanguage("zh");
+});
 
 // M3 Task 8：文件预览三态（文本 / markdown / 图片）+ 错误态 + 模式标记。
 // fetch 全量 stub；jsdom 无真实高亮，只断言容器与文本存在。
@@ -297,5 +303,155 @@ describe("FilePreview HTML 缩放与源码换行（M5 P2-b）", () => {
     const pre = await screen.findByTestId("preview-code");
     expect(pre.className).not.toContain("whitespace-pre-wrap");
     expect(pre.className).toContain("overflow-auto");
+  });
+});
+
+// ==== 任务 6：显式打开计数刷新 + 读取取消 ====
+
+describe("FilePreview 当前内容刷新（任务 6）", () => {
+  it("布局（mode）切换不重新读取；显式打开计数 refreshKey 递增才重读并显示新内容", async () => {
+    let calls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (!url.includes("/file?")) throw new Error(`unexpected fetch: ${url}`);
+        calls += 1;
+        return new Response(JSON.stringify({ content: `版本 ${calls}`, mime: "text/plain" }), {
+          status: 200,
+        });
+      })
+    );
+    const { rerender } = render(
+      <FilePreview
+        session={makeSession()}
+        filePath="/tmp/proj/live.txt"
+        mode="fullscreen"
+        refreshKey={0}
+      />
+    );
+    expect((await screen.findByTestId("preview-code")).textContent).toContain("版本 1");
+    expect(calls).toBe(1);
+
+    // 宽窄屏 / 布局切换不是新的显式打开：不重读
+    rerender(
+      <FilePreview
+        session={makeSession()}
+        filePath="/tmp/proj/live.txt"
+        mode="split"
+        refreshKey={0}
+      />
+    );
+    expect(screen.getByTestId("file-preview").getAttribute("data-mode")).toBe("split");
+    expect(screen.getByTestId("preview-code").textContent).toContain("版本 1");
+    expect(calls).toBe(1);
+
+    // 同一路径再次显式打开（refreshKey+1）→ 重新读取并显示磁盘当前内容
+    rerender(
+      <FilePreview
+        session={makeSession()}
+        filePath="/tmp/proj/live.txt"
+        mode="split"
+        refreshKey={1}
+      />
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("preview-code").textContent).toContain("版本 2");
+    });
+    expect(calls).toBe(2);
+  });
+
+  it("关闭/卸载时取消在途读取（AbortSignal 传递）", async () => {
+    const signals: AbortSignal[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_input: RequestInfo | URL, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            const signal = init?.signal;
+            if (!signal) throw new Error("FilePreview 未把 AbortSignal 传给 fetch");
+            signals.push(signal);
+            signal.addEventListener("abort", () =>
+              reject(new DOMException("aborted", "AbortError"))
+            );
+          })
+      )
+    );
+    const { unmount } = render(
+      <FilePreview
+        session={makeSession()}
+        filePath="/tmp/proj/big.png"
+        mode="fullscreen"
+        refreshKey={0}
+      />
+    );
+    await waitFor(() => expect(signals.length).toBe(1));
+    expect(signals[0].aborted).toBe(false);
+    unmount();
+    expect(signals[0].aborted).toBe(true);
+  });
+
+  it("换文件时取消旧读取并发起新读取", async () => {
+    const signals: AbortSignal[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (!url.includes("/file?")) throw new Error(`unexpected fetch: ${url}`);
+        if (init?.signal) signals.push(init.signal);
+        const name = decodeURIComponent(url);
+        const content = name.includes("a.txt") ? "A" : "B";
+        return new Response(JSON.stringify({ content, mime: "text/plain" }), { status: 200 });
+      })
+    );
+    const { rerender } = render(
+      <FilePreview session={makeSession()} filePath="/tmp/proj/a.txt" mode="fullscreen" />
+    );
+    await screen.findByTestId("preview-code");
+    expect(signals.length).toBe(1);
+    rerender(<FilePreview session={makeSession()} filePath="/tmp/proj/b.txt" mode="fullscreen" />);
+    await waitFor(() => {
+      expect(screen.getByTestId("preview-code").textContent).toContain("B");
+    });
+    expect(signals[0].aborted).toBe(true);
+    expect(signals.length).toBe(2);
+  });
+});
+
+// ==== Task 7：预览页头的“最近引用”定位入口（与文件池同一查找流程）====
+
+describe("FilePreview 定位最近引用（Task 7）", () => {
+  function textFetch() {
+    installFileFetch(
+      () =>
+        new Response(JSON.stringify({ content: "fn main() {}", mime: "text/rust" }), {
+          status: 200,
+        })
+    );
+  }
+
+  it("提供 onLocate 时渲染定位按钮并回调", async () => {
+    textFetch();
+    const onLocate = vi.fn();
+    render(
+      <FilePreview
+        session={makeSession()}
+        filePath="/tmp/proj/main.rs"
+        mode="fullscreen"
+        onLocate={onLocate}
+      />
+    );
+    await screen.findByTestId("preview-code");
+    const locate = screen.getByTestId("preview-locate");
+    expect(locate.getAttribute("aria-label")).toContain("定位");
+    fireEvent.click(locate);
+    expect(onLocate).toHaveBeenCalledTimes(1);
+  });
+
+  it("未提供 onLocate（其他工具/既有用法）不渲染定位按钮", async () => {
+    textFetch();
+    renderPreview();
+    await screen.findByTestId("preview-code");
+    expect(screen.queryByTestId("preview-locate")).toBeNull();
   });
 });

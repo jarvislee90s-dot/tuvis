@@ -68,7 +68,7 @@ The PIN applies to **all four channels** (**including access from this computer*
 
 - Expand details while running (thinking / tool calls are collapsible), auto-collapse to the final summary once a turn completes
 - Markdown rendering (headings / lists / tables / code highlighting); project file paths in the text become clickable links
-- **File panel**: aggregates the files a session touched, newest first, with document/image filters and a **200 / 500 / 1000 message** look-back range; **modified** files are highlighted and **read-only** ones are neutral (both previewable), and tapping the secondary line reveals the full path. Since v0.5.8 a fourth source, **Session artifacts**, scans the conversation body for artifact links and inline file references (both inside and outside code fences) into the same list; whitelisted formats preview on tap (desktop and mobile alike)
+- **File panel**: aggregates the files a session touched, newest first, with document/image filters and a **200 / 500 / 1000 message** look-back range; **modified** files are highlighted and **read-only** ones are neutral (both previewable), and tapping the secondary line reveals the full path. Since v0.5.8 a fourth source, **Session artifacts**, scans ordinary message text for artifact links and inline file references (paths in code blocks are excluded); whitelisted formats preview on tap (desktop and mobile alike). **Since v0.6.0, recognized file paths in Codex APP messages open the preview, and uploaded/referenced images, generated images, and files changed or viewed appear as structured artifacts with source labels. File entries can jump back to the latest message reference within the current tail and up to four earlier pages of 50 messages each.**
 - **File preview**: markdown / syntax highlighting / inline images; three switchable layouts — side-by-side (chat left, file right), stacked, and fullscreen overlay — with a draggable splitter; readable scope is the session project directory plus your home directory (sensitive directories such as keys are always refused)
 - **Transfer progress and honest bandwidth disclosure**: uploads and downloads both show a **progress bar** (bytes transferred / percentage / instantaneous rate / ETA); **when the rate or the total size is unknown it shows bytes transferred only and never invents a percentage**. On a bandwidth-limited tunnel channel the file panel and the attachment area say **in place** that this is a channel limit, not a malfunction, with time estimates based on this channel's measured rate (about 1.5 minutes to download and 3.3 minutes to upload a 20 MB attachment) and a **full-speed upgrade path** (install Tailscale on your phone and join the tailnet to connect directly, 1–2 orders of magnitude faster)
 - **Message bookmarks**: mark a spot to revisit with a colored dot (up to 10, one per color), jump back by tapping it, delete individually or clear all; stored in the browser — refresh-proof, cleared when Tuvis restarts or the tab is closed
@@ -85,7 +85,7 @@ Not just looking — you can **act**: send messages, approve tool calls, answer 
 - **Remote Q&A**: single-choice, multi-select, and free-form answers (including **Other — overwrite & clear**: enter edit, backspace to empty, then type; an empty text is rejected honestly), per-question progression with a confirmation card; multi-select taps only toggle, "next question" advances explicitly (opencode/kimi also support ◀/▶ back and forth) — the phone and the terminal always stay on the same question. **Confirmation-card answers are sourced from the terminal's Review page via screen reading**: after a refresh or page reopen they match the terminal summary exactly; local memory is only a fallback
 - **Permission modes**: kimi's three tiers (`/permission` / `/yolo` / `/auto`) use a **two-step flow** — open the menu, screen-read the highlighted row, only then press Enter — plus a **mode/permission dual read-back** in the status bar (both the switch receipt and the current tier carry screen-read evidence); codex switches via the terminal menu single-select
 - **Guards**: while a dialog is pending, ordinary message injection is blocked (to avoid answering the default by accident); input-line residue is detected to prevent double sends; dangerous keys (such as Ctrl+C, which quits OpenCode) are blacklisted
-- **Codex desktop APP remote control (experimental, unlocked per exact Desktop build)**: Windows `26.1013.4894.0` supports message projection / sending / status / command approval / Plan blocking Q&A; macOS `26.1013.40934` supports sending / status. `permissions` stays disabled; other builds or unsupported capabilities are refused honestly as "not unlocked / work in progress" — no fake approvals or empty sessions. Codex APP generated images also appear in the file panel as session artifacts. See the capability matrix below.
+- **Codex desktop APP remote control (experimental, unlocked per exact Desktop build)**: Windows `26.1013.4894.0` supports message projection / sending / status / command approval / Plan blocking Q&A; macOS `26.1013.40934` supports sending / status. `permissions` stays disabled; other builds or unsupported capabilities are refused honestly as "not unlocked / work in progress" — no fake approvals or empty sessions. Recognized file references in message bodies open the existing preview; returning from a preview searches the current tail plus at most four earlier pages for the latest reference. Preview always reads the file's current contents and does not retain historical versions. See the capability matrix below.
 
 |                Session detail · messages                |              Send · queue & jump               |
 | :-----------------------------------------------------: | :--------------------------------------------: |
@@ -133,7 +133,7 @@ for in one ledger: the app collects once shortly after startup, and `usage_colle
 collection on demand (single-flight mutex + a default minimum interval of 10 minutes);
 **collection runs on its own on-demand path and never enters the 3-second session polling loop**. The ledger
 lives in 4 tables in `~/.tuvis/tuvis.db` (hourly detail, permanently kept daily aggregates, collection cursors,
-session dimension); detail is kept for 90 days by default (configurable), and after expiry only the daily
+session dimension); detail is kept for 90 days by default with a 90-day maximum (configurable), and after expiry only the daily
 aggregates remain.
 
 **Dashboard V2**: A Token overview stays expanded (new input / cache hit / cache miss / output /
@@ -165,21 +165,25 @@ previews the rule's matching tools, models and total tokens over the last 30 day
 when two subscriptions log the exact same raw provider string, aliases cannot split them and the channels stay
 merged; only the ambiguous row's "Bind billing attribution" or the footer's advanced entry (explicit billing
 binding) can help, and tokens are never split proportionally. Settings → "Display & pricing config" (the same entry as the cost card's "Manage config") and
-"Advanced overrides" now live in **one shared dialog**: the settings page and the D card open the same dialog, and
+"Custom price rules" now live in **one shared dialog**: the settings page and the D card open the same dialog, and
 the D card's "Manage config" opens it directly; the upper part holds the provider/model entries and the lower part
-is a collapsible advanced overrides section (collapsed by default). Settings and the D card are separate WebViews;
+is a collapsible custom price rules section (collapsed by default). Settings and the D card are separate WebViews;
 changes in Settings do not guarantee an immediate refresh of an already-open usage dashboard, and the in-dashboard config is the primary path. Entries default to the top 10 by usage in the last
-7 days, with "show all" and search at the bottom; each entry has three rows — raw identity (read-only) / provider
+7 days, with "show all" and search at the bottom, plus three sort keys (usage / raw provider / raw model, click again
+to reverse). Each entry has three rows — raw identity (read-only) / provider
 name (editable, applied globally to the same raw provider; empty-provider entries write a toolModel alias and stay
 "unassigned channel" when unnamed) + model name (editable, applied per (display provider, raw model)) / pricing
-identity (dropdown / search selection only). The advanced area keeps only the **four-rate override** (USD/CNY
-denominated); legacy billing-attribution binding / reference rules moved to the Records page footer's "Advanced" entry. Every advanced
-option has an Info icon with a hover/focus explanation; each model entry also has an "Override this model's price /
-Edit price override" shortcut that pre-fills the raw model name (normalized on save) and shows a "Four-rate override applied" badge when
-present. The override applies globally by **normalized model name**: no provider needed, custom display names do
+identity (dropdown / search selection only). "Custom price rules" supports **fixed** and **time-of-day** pricing:
+time-of-day uses peak rates inside multiple Monday–Friday peak windows (cross-midnight allowed) and off-peak rates
+elsewhere; a blank off-peak component falls back to the catalog rate; the time zone can be China Standard Time, UTC
+or system local and only affects API billing peak/off-peak calculation; a "peak × %" helper fills the off-peak rates.
+Legacy billing-attribution binding / reference rules moved to the Records page footer's "Advanced" entry. Every advanced
+option has an Info icon with a hover/focus explanation; each model entry also has a "Set custom price /
+Edit custom price" shortcut that pre-fills the raw model name (normalized on save) and shows a "Custom price applied" badge when
+present. The rule applies globally by **normalized model name**: no provider needed, custom display names do
 not participate, and it is not selected in pricing identities or reference rules. Pricing is matched automatically from the public
 models.dev catalog, with curated sources ranked **direct official providers (including China-site variants) >
-Ollama Cloud > OpenRouter**: model IDs are mechanically normalized then matched exactly; within a tier, the
+OpenRouter**; all-zero quotes are skipped in favour of the next non-zero candidate. Model IDs are mechanically normalized then matched exactly; within a tier, the
 latest `release_date` wins and the normalized model shares one price per currency. Prefix fallback is used only
 when the candidate is unique, or when multiple candidates match but all share exactly the same price; cross-family
 substitution still requires an explicitly chosen reference model. Models missing from the curated set stay
@@ -207,8 +211,8 @@ values.
 
 API-equivalent costs are estimated per channel / model row, with **no global cost total or channel subtotal**; the
 export bar has a separate **Cost CSV** (all cost rows for the current window, no totals, no BOM added by the
-frontend; six columns — channel key / channel kind / display name / normalized model / catalog release date /
-override flag — are appended after the existing 17, and the single-value `observed_provider` column is left empty
+frontend; seven columns — channel key / channel kind / display name / normalized model / catalog release date /
+override flag / price-rule kind — are appended after the existing 17, and the single-value `observed_provider` column is left empty
 when a row merges multiple raw providers or includes an unlabeled source, with the full evidence available in the
 UI tooltip).
 
@@ -346,7 +350,7 @@ Capabilities across the 13 capability rows × 8 terminal-class AI coding tools (
 | Mobile · sub-agent observatory     | ✅          | ❌        | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
 | Mobile · Codex APP control (Desktop IPC) | ❌    | 🧪        | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
 
-**Codex APP remote control (experimental)**: Codex only, unlocked per exact Desktop build (Windows `26.1013.4894.0`: send/status/command approval/Plan blocking Q&A, `permissions` off; macOS `26.1013.40934`: send/status). Unsupported capabilities are refused honestly — no fake approvals or empty sessions. Codex APP generated images and local images appear in the file panel as session artifacts. Real-phone PRODUCT acceptance is not fully executed yet; see `docs/superpowers/reviews/2026-10-20-codex-app-product-acceptance.md`.
+**Codex APP remote control (v0.6.0, experimental)**: Codex only, unlocked per exact Desktop build (Windows `26.1013.4894.0`: send/status/command approval/Plan blocking Q&A, `permissions` off; macOS `26.1013.40934`: send/status). Recognized file paths in message bodies open the preview; the file panel shows uploaded/referenced images, generated images, and files changed or viewed with source labels, and entries can jump to the latest body reference (current tail plus up to four earlier pages of 50 messages each). Unsupported capabilities are refused honestly — no fake approvals or empty sessions; previews read current file contents and retain no history. Real-phone PRODUCT acceptance is not fully executed yet; see `docs/superpowers/reviews/2026-10-20-codex-app-product-acceptance.md`.
 
 **Three-state capability badge for Codex APP remote control (mobile)**: capabilities are shown as three honest states instead of claiming theoretical support — **verified** (that Desktop build has real-machine evidence: controllable / sendable), **compatibility probe (experimental)** (unknown build: the read chain is evidenced but writing is not open yet, or only the compatibility send path remains), **locked** (the server states it is unavailable). The compatibility path for unknown builds is an **experimental** capability: Tuvis first runs a **read-only probe** on that build (15-second hard cap server-side) and opens no write capability until the probe passes; while a probe is in flight the UI shows only a "probing" skeleton and **does not prematurely declare the build locked**. Compatibility sending requires explicitly enabling the **"compatibility send (experimental)"** switch in the desktop settings (off by default; sends are refused honestly while it is off).
 

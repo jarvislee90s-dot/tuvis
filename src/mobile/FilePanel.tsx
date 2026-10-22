@@ -11,9 +11,12 @@
 //   逻辑零变化（同一批 useState 换控件形态），「代码文件仅在类型=全部可见」
 //   口径保留，搜索纪律（S3：点「搜索」或回车才执行）保留。
 import { useEffect, useMemo, useState } from "react";
-import { FileText, Image as ImageIcon, X } from "lucide-react";
+import { Crosshair, FileText, Image as ImageIcon, X } from "lucide-react";
+import i18n from "@/i18n";
 import { formatRelativeTime } from "./board-logic";
 import { fetchChannel, type ChannelInfo, type SessionFileEntry } from "./api";
+import { artifactSourceLabel } from "./ProjectedArtifacts";
+import type { ArtifactSource } from "./codexIpcApi";
 
 /** 带宽耗时预估的参考附件大小（§C5，MB）：面板只知路径不知大小，按线稿口径用
  *  20 MB 参考量给出「量级感受」（20MB×8bit / 1.8Mbps ≈ 1.5 分钟 / ÷0.8 ≈ 3.3 分钟） */
@@ -108,9 +111,22 @@ function FilterDivider() {
 const FILTER_SELECT_CLS =
   "rounded-md border border-[var(--cb)] bg-[var(--cbg)] px-1 py-0.5 text-xs text-[var(--tx)]";
 
+/** 文件面板条目形态：后端 `FileEntry` + Task 7 合并视图的可选补充字段。
+ *  后端原始条目（无引用证据）可缺席这些字段——渲染退回既有行为。 */
+export interface FilePanelEntry extends SessionFileEntry {
+  /** 最近一次结构化引用的来源（只作行为标签：生成/修改/查看/上传）。 */
+  artifactSource?: ArtifactSource | null;
+  /** 原始状态标量（不翻译、不写成成功/失败）。 */
+  sourceStatus?: string | null;
+  /** 原始变更类型标量（不猜 add/modify/delete）。 */
+  changeKind?: string | null;
+  /** 来源摘要（同回合提示词优先，≤24 字；无引用证据的后端行为 null）。 */
+  summary?: string | null;
+}
+
 interface FilePanelProps {
-  /** 已按 lastSeq 降序（后端契约，本组件不再排序） */
-  entries: SessionFileEntry[];
+  /** 已按 lastSeq 降序（后端契约，本组件不再排序；Task 7 合并视图已按最近引用排好） */
+  entries: FilePanelEntry[];
   /** 该档位下还有更早文件未纳入（档位提示依据） */
   truncated: boolean;
   scope: number;
@@ -118,6 +134,9 @@ interface FilePanelProps {
   onScopeChange: (n: number) => void;
   /** 主行文件名点击 → 进入单文件预览 */
   onOpenFile: (path: string) => void;
+  /** 来源按钮（Task 7）：在正文中定位该文件的最近引用（与预览页头同一查找流程）。
+   *  缺省不渲染定位按钮——其他工具的文件池行为不变。 */
+  onLocate?: (entry: FilePanelEntry) => void;
   /** 字号档位（2026-09-16 用户裁决）：作用于列表内容区（筛选条不受影响） */
   fontScale?: number;
 }
@@ -129,6 +148,7 @@ export default function FilePanel({
   loading,
   onScopeChange,
   onOpenFile,
+  onLocate,
   fontScale = 1,
 }: FilePanelProps) {
   const [kind, setKind] = useState<FileKindFilter>("all");
@@ -314,24 +334,57 @@ export default function FilePanel({
             <li
               key={`${e.path}-${i}`}
               data-testid={`file-row-${i}`}
+              data-change-kind={e.changeKind ?? undefined}
               className="rounded-lg px-2 py-1.5 hover:bg-[var(--cbg)] dark:hover:bg-[var(--btnp)]"
             >
-              {/* 主行 = 末段文件名（加粗，即超链接）；次行 = 目录 + 时间 */}
-              <button
-                type="button"
-                data-testid={`file-row-${i}-open`}
-                onClick={() => onOpenFile(e.path)}
-                className={`block w-full truncate text-left text-sm hover:underline ${
-                  e.modified ? "font-semibold text-[var(--tx)]" : "font-medium text-[var(--mut)]"
-                }`}
-              >
-                {fileKindOf(e.path) === "image" ? (
-                  <ImageIcon size={12} className="mr-1 inline shrink-0" />
-                ) : (
-                  <FileText size={12} className="mr-1 inline shrink-0" />
+              {/* 主行 = 末段文件名（打开预览）＋ 来源按钮（在正文中定位最近引用）。
+                  **两个热区互不触发**：文件名只走 onOpenFile，来源按钮只走 onLocate；
+                  未知来源（无 origin / 无结构化引用）也保留定位入口。 */}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  data-testid={`file-row-${i}-open`}
+                  onClick={() => onOpenFile(e.path)}
+                  className={`block min-w-0 flex-1 truncate text-left text-sm hover:underline ${
+                    e.modified ? "font-semibold text-[var(--tx)]" : "font-medium text-[var(--mut)]"
+                  }`}
+                >
+                  {fileKindOf(e.path) === "image" ? (
+                    <ImageIcon size={12} className="mr-1 inline shrink-0" />
+                  ) : (
+                    <FileText size={12} className="mr-1 inline shrink-0" />
+                  )}
+                  {fileBaseName(e.path)}
+                </button>
+                {onLocate && (
+                  <button
+                    type="button"
+                    data-testid={`file-row-${i}-locate`}
+                    aria-label={i18n.t("mobile.artifacts.locate.aria", {
+                      name: fileBaseName(e.path),
+                    })}
+                    title={i18n.t("mobile.artifacts.locate.action")}
+                    onClick={() => onLocate(e)}
+                    className="flex shrink-0 items-center gap-0.5 rounded-full border border-[var(--cb)] px-1.5 py-px text-[10px] text-[var(--mut)] hover:bg-[var(--cb)] hover:text-[var(--tx)] dark:hover:bg-[var(--btnp)]"
+                  >
+                    <Crosshair size={10} className="shrink-0" />
+                    {e.artifactSource
+                      ? artifactSourceLabel(e.artifactSource)
+                      : i18n.t("mobile.artifacts.locate.short")}
+                  </button>
                 )}
-                {fileBaseName(e.path)}
-              </button>
+              </div>
+              {/* 来源摘要（Task 7 R5）：仅结构化引用有证据时出现；24 字已在合并视图
+                  截断，title 带完整摘要供长按/悬停查看。无摘要的行布局不变。 */}
+              {typeof e.summary === "string" && e.summary !== "" && (
+                <p
+                  data-testid={`file-row-${i}-summary`}
+                  title={e.summary}
+                  className="mt-0.5 truncate pl-5 text-xs text-[var(--tx)]"
+                >
+                  {e.summary}
+                </p>
+              )}
               <div className="flex items-center gap-2 text-xs text-[var(--mut)]">
                 {/* 来源徽标（M5 线稿 .from pill）：undefined（旧载荷）不渲染 */}
                 {e.origin && (
@@ -340,6 +393,16 @@ export default function FilePanel({
                     className="flex-none rounded-full border border-[var(--cb)] px-1.5 py-px text-[10px] text-[var(--mut)]"
                   >
                     {originLabel[e.origin] ?? e.origin}
+                  </span>
+                )}
+                {/* 原始状态标量（Task 7）：只原样展示，绝不改写成“已写入/成功” */}
+                {typeof e.sourceStatus === "string" && e.sourceStatus !== "" && (
+                  <span
+                    data-testid={`file-row-${i}-status`}
+                    data-status={e.sourceStatus}
+                    className="flex-none rounded-full bg-[var(--cb)] px-1.5 py-px font-mono text-[10px] text-[var(--mut)]"
+                  >
+                    {e.sourceStatus}
                   </span>
                 )}
                 {fileDirPrefix(e.path) ? (

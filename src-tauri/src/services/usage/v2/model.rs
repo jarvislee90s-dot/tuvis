@@ -123,7 +123,71 @@ impl PriceCurrency {
     }
 }
 
+/// 分时价格使用的时区口径（2026-10-21 用户裁决：固定预设，不引入完整时区库）。
+///
+/// `bucket_key` 由采集侧按**宿主本地**生成；非 `local` 预设会先把宿主本地时间
+/// 换算到目标时区，再判断星期与时段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TimePriceTimezone {
+    /// 系统本地：直接按 `hour_key` 解释，不做换算。
+    Local,
+    /// 中国标准时间（UTC+8）。
+    #[default]
+    AsiaShanghai,
+    /// UTC。
+    Utc,
+}
+
+impl TimePriceTimezone {
+    pub const ALL: [Self; 3] = [Self::AsiaShanghai, Self::Utc, Self::Local];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::AsiaShanghai => "asiaShanghai",
+            Self::Utc => "utc",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|item| item.as_str() == value)
+    }
+}
+
+/// 高峰窗口（整点边界；结束时间不包含在窗口内）。
+///
+/// `start > end` 表示跨午夜（例如 `22:00`–`02:00`）。星期固定为周一至周五，
+/// 不处理法定节假日；跨午夜窗口的下一天凌晨仍属于前一天的高峰。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimePriceWindow {
+    pub start: String,
+    pub end: String,
+}
+
+/// 分时价格规则（高峰四价沿用 `PriceOverrideRequest` 的 input/cache_read/...，
+/// 这里只存时区、窗口与低谷四价）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimePriceRule {
+    #[serde(default)]
+    pub timezone: TimePriceTimezone,
+    pub windows: Vec<TimePriceWindow>,
+    #[serde(default)]
+    pub offpeak_input: Option<String>,
+    #[serde(default)]
+    pub offpeak_cache_read: Option<String>,
+    #[serde(default)]
+    pub offpeak_cache_write: Option<String>,
+    #[serde(default)]
+    pub offpeak_output: Option<String>,
+}
+
 /// 用户手动覆盖价的请求：四价均可空，`None` = 不覆盖该分量；空字符串非法。
+///
+/// `time_rule` 为空 = 固定价；非空 = 分时价，此时四价为**高峰**价格，
+/// 低谷价格由 `time_rule.offpeak_*` 给出。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PriceOverrideRequest {
@@ -136,6 +200,9 @@ pub struct PriceOverrideRequest {
     pub cache_read: Option<String>,
     pub cache_write: Option<String>,
     pub output: Option<String>,
+    /// 为空 = 固定价；非空 = 分时价。
+    #[serde(default)]
+    pub time_rule: Option<TimePriceRule>,
 }
 
 /// 用户手动覆盖价的视图：包含目录来源与快照日期（无目录时为 null）。
@@ -148,6 +215,9 @@ pub struct PriceOverrideView {
     pub cache_read: Option<String>,
     pub cache_write: Option<String>,
     pub output: Option<String>,
+    /// 分时规则；`None` = 固定价。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_rule: Option<TimePriceRule>,
     pub updated_at: i64,
     pub source_provider: Option<String>,
     pub source_model: Option<String>,
@@ -418,6 +488,36 @@ pub struct CostComponents {
     pub output: Option<CostComponent>,
 }
 
+/// 费用行的价格规则形态（CSV / UI 标记）：无自定义规则、固定价、分时价。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PriceRuleKind {
+    None,
+    Fixed,
+    Time,
+}
+
+impl PriceRuleKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Fixed => "fixed",
+            Self::Time => "time",
+        }
+    }
+}
+
+/// 分时价格行的 Token 分布（高峰 / 低谷 / 日聚合回退）。
+///
+/// 日聚合回退时无法按小时拆分，整段按低谷价估算，单独计入 `daily_fallback_tokens`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimePriceBreakdown {
+    pub peak_tokens: i64,
+    pub offpeak_tokens: i64,
+    pub daily_fallback_tokens: i64,
+}
+
 /// 费用查询的一行。`token_usage` 是规范 Token 总量（旧口径 hero 的组成部分），
 /// 不是四桶结构；`Option` 全部显式序列化为 null。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -468,6 +568,10 @@ pub struct CostRow {
     pub pricing_release_date: Option<String>,
     /// 该行至少一个计费分量使用了用户覆盖价。
     pub price_override: bool,
+    /// 覆盖规则形态：无 / 固定 / 分时。
+    pub price_rule_kind: PriceRuleKind,
+    /// 分时价格行的 Token 分布；固定价或未匹配时为 null。
+    pub time_breakdown: Option<TimePriceBreakdown>,
     /// 该行成员在 `usage_model_config` 里一致配置的自定义模型名；
     /// 无人配置或成员分歧（>1 个不同自定义名）时为 null（前端回退原始模型名）。
     pub display_model_name: Option<String>,

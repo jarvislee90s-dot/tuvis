@@ -14,6 +14,7 @@ pub mod model_config;
 pub mod native_price;
 pub mod pricing;
 pub mod query;
+pub mod time_price;
 
 pub use identity::{merge_bucket, resolve_at, resolve_bucket};
 pub use model::*;

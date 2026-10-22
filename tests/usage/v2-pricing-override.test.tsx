@@ -1,9 +1,10 @@
-// Task 8 · 手动覆盖价 UI。
+// Task 8 · 自定义价格规则 UI（2026-10-21：固定价 / 分时价）。
 // 2026-10-20 第三轮：Manager 从定价状态面板移入配置卡「高级覆盖」（本文件直接渲染 Manager
-// 或通过 prefill prop 驱动）；状态面板只保留迁移提示。
-// 覆盖：列表四价/来源/日期/覆盖标记；新增（空串→null、至少一项）；编辑（模型键只读）；
-// 删除二次确认；非法数字拒绝；无目录来源仍可保存；保存后统一失效 USAGE_KEY；
-// 条目快捷入口 prefill（新建预填原始模型名 / 已有覆盖进入编辑态）。
+// 或通过 prefill prop 驱动）；状态面板只保留启用/刷新，不再渲染迁移提示。
+// 覆盖：列表四价/来源/日期/规则类型徽标；新增（空串→null、至少一项、固定价 timeRule=null）；
+// 编辑（模型键只读）；删除二次确认；非法数字拒绝；无目录来源仍可保存；保存后统一失效 USAGE_KEY；
+// 条目快捷入口 prefill（新建预填原始模型名 / 已有覆盖进入编辑态）；
+// 分时表单：开关、时区、多窗口、跨午夜、百分比填充低谷价、编辑回填。
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -57,6 +58,14 @@ const FRESH: PricingStatus = {
 
 function openAddForm() {
   fireEvent.click(screen.getByTestId("price-override-add"));
+}
+
+function enableTimeRule() {
+  fireEvent.click(screen.getByTestId("price-override-time-toggle"));
+}
+
+function setField(testId: string, value: string) {
+  fireEvent.change(screen.getByTestId(testId), { target: { value } });
 }
 
 function fillForm(fields: {
@@ -121,7 +130,12 @@ describe("Task 8 · 手动覆盖价管理", () => {
     expect(screen.getByTestId("price-override-updated-gpt-5")).toHaveTextContent(
       /\d{4}-\d{2}-\d{2}/
     );
-    expect(screen.getByTestId("price-override-badge-gpt-5")).toHaveTextContent("用户覆盖价");
+    // 固定价规则徽标（原「用户覆盖价」→「固定价」）
+    expect(screen.getByTestId("price-override-badge-gpt-5")).toHaveTextContent(
+      tf("usage.pricing.overrides.kindFixed")
+    );
+    // 固定价没有分时摘要
+    expect(screen.queryByTestId("price-override-time-gpt-5")).toBeNull();
   });
 
   it("2. 新增：空串提交 null；保存走 override_set 并统一失效 USAGE_KEY；无目录来源仍可保存", async () => {
@@ -147,6 +161,7 @@ describe("Task 8 · 手动覆盖价管理", () => {
         cacheRead: null,
         cacheWrite: "0",
         output: null,
+        timeRule: null,
       },
     });
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: USAGE_KEY }));
@@ -188,6 +203,7 @@ describe("Task 8 · 手动覆盖价管理", () => {
         cacheRead: "0.125",
         cacheWrite: null,
         output: null,
+        timeRule: null,
       },
     });
     await waitFor(() =>
@@ -234,6 +250,7 @@ describe("Task 8 · 手动覆盖价管理", () => {
         cacheRead: null,
         cacheWrite: null,
         output: null,
+        timeRule: null,
       },
     });
     await waitFor(() =>
@@ -347,7 +364,7 @@ describe("Task 8 · 手动覆盖价管理", () => {
     restore();
   });
 
-  it("7. 状态面板不再挂覆盖价管理器（2026-10-20 第三轮移入配置卡高级区）；只显示迁移提示且不触发启用/刷新", async () => {
+  it("7. 状态面板不挂覆盖价管理器，也不渲染已废弃的迁移提示；不触发启用/刷新", async () => {
     const restore = override({
       usage_pricing_get: () => Promise.resolve(FRESH),
     });
@@ -357,8 +374,9 @@ describe("Task 8 · 手动覆盖价管理", () => {
 
     // Manager 不再在状态面板里（避免同一页两个覆盖价管理器）
     expect(screen.queryByTestId("price-override-manager")).toBeNull();
-    // 迁移提示在场，指引到「显示与计价配置 → 高级覆盖」
-    expect(screen.getByText(tf("usage.pricing.overridesMovedHint"))).toBeTruthy();
+    // 2026-10-21：迁移提示已删除（高级区标题已改为「自定义价格规则」，
+    // 旧提示把用户指向不存在的「高级覆盖」入口）
+    expect(screen.queryByText(tf("usage.pricing.overridesMovedHint"))).toBeNull();
     // 状态面板自身行为不变：不自动启用/刷新
     expect(callsOf("usage_pricing_set_enabled")).toHaveLength(0);
     expect(callsOf("usage_pricing_refresh")).toHaveLength(0);
@@ -366,7 +384,7 @@ describe("Task 8 · 手动覆盖价管理", () => {
     restore();
   });
 
-  it("8. 定价状态加载中/失败时状态面板自洁：无 Manager、提示与错误互不遮挡", async () => {
+  it("8. 定价状态加载中/失败时状态面板自洁：无 Manager、无旧提示、错误不遮挡", async () => {
     // Manager 已移入配置卡高级区；状态面板的三态（加载中/失败）只影响状态区自身。
     const restorePending = override({
       usage_pricing_get: () => new Promise(() => {}),
@@ -374,7 +392,7 @@ describe("Task 8 · 手动覆盖价管理", () => {
     const pending = render(wrap(<PricingStatusPanel t={tf} />));
     expect(await screen.findByText(tf("common.loading"))).toBeTruthy();
     expect(screen.queryByTestId("price-override-manager")).toBeNull();
-    expect(screen.getByText(tf("usage.pricing.overridesMovedHint"))).toBeTruthy();
+    expect(screen.queryByText(tf("usage.pricing.overridesMovedHint"))).toBeNull();
     pending.unmount();
     restorePending();
 
@@ -385,7 +403,7 @@ describe("Task 8 · 手动覆盖价管理", () => {
     render(wrap(<PricingStatusPanel t={tf} />));
     expect(await screen.findByText(/pricing status boom/)).toBeTruthy();
     expect(screen.queryByTestId("price-override-manager")).toBeNull();
-    expect(screen.getByText(tf("usage.pricing.overridesMovedHint"))).toBeTruthy();
+    expect(screen.queryByText(tf("usage.pricing.overridesMovedHint"))).toBeNull();
 
     restoreError();
   });
@@ -419,6 +437,7 @@ describe("Task 8 · 手动覆盖价管理", () => {
         cacheRead: null,
         cacheWrite: null,
         output: null,
+        timeRule: null,
       },
     });
     expect(await screen.findByTestId("price-override-row-glm-5-3")).toBeTruthy();
@@ -462,5 +481,220 @@ describe("Task 8 · 手动覆盖价管理", () => {
     const modelInput = screen.getByLabelText(tf("usage.pricing.overrides.model"));
     expect(modelInput).toHaveAttribute("id", "price-override-model");
     expect(modelInput).toHaveAttribute("data-testid", "price-override-model");
+  });
+
+  it("12. 分时开关：显示时区/多窗口/低谷四价；跨午夜可保存；保存后列表摘要 + 编辑回填", async () => {
+    render(wrap(<PriceOverrideManager t={tf} />));
+    await screen.findByTestId("price-override-row-gpt-5");
+    openAddForm();
+    fillForm({ model: "glm-5.3", input: "10", output: "40" });
+
+    // 关闭时只有固定四价，没有分时控件
+    expect(screen.queryByTestId("price-override-timezone")).toBeNull();
+    expect(screen.getByTestId("price-override-form")).toHaveTextContent(
+      tf("usage.pricing.overrides.fixedRates")
+    );
+
+    enableTimeRule();
+    expect(screen.getByTestId("price-override-time-toggle")).toHaveAttribute(
+      "aria-checked",
+      "true"
+    );
+    // 默认时区 = 中国标准时间；默认一个 09:00–12:00 窗口；低谷四价全部出现
+    expect(screen.getByTestId("price-override-timezone")).toHaveValue("asiaShanghai");
+    expect(screen.getByTestId("price-override-window-start-0")).toHaveValue("09:00");
+    expect(screen.getByTestId("price-override-window-end-0")).toHaveValue("12:00");
+    for (const key of ["input", "cacheRead", "cacheWrite", "output"]) {
+      expect(screen.getByTestId(`price-override-offpeak-${key}`)).toBeTruthy();
+    }
+    expect(screen.getByText(tf("usage.pricing.overrides.peakRates"))).toBeTruthy();
+    expect(screen.getByText(tf("usage.pricing.overrides.offpeakRates"))).toBeTruthy();
+
+    // 添加第二个窗口，并把第一个改成跨午夜 22:00–02:00；时区切 UTC
+    fireEvent.click(screen.getByTestId("price-override-window-add"));
+    expect(screen.getByTestId("price-override-window-start-1")).toBeTruthy();
+    setField("price-override-window-start-0", "22:00");
+    setField("price-override-window-end-0", "02:00");
+    setField("price-override-timezone", "utc");
+    setField("price-override-offpeak-input", "5");
+    setField("price-override-offpeak-cacheRead", "2.5");
+    setField("price-override-offpeak-cacheWrite", "0");
+    setField("price-override-offpeak-output", "20");
+
+    fireEvent.click(screen.getByTestId("price-override-save"));
+    await waitFor(() => expect(callsOf("usage_pricing_override_set")).toHaveLength(1));
+    expect(callsOf("usage_pricing_override_set")[0][1]).toEqual({
+      request: {
+        normalizedModelId: "glm-5.3",
+        currency: "USD",
+        input: "10",
+        cacheRead: null,
+        cacheWrite: null,
+        output: "40",
+        timeRule: {
+          timezone: "utc",
+          windows: [
+            { start: "22:00", end: "02:00" },
+            { start: "09:00", end: "12:00" },
+          ],
+          offpeakInput: "5",
+          offpeakCacheRead: "2.5",
+          offpeakCacheWrite: "0",
+          offpeakOutput: "20",
+        },
+      },
+    });
+
+    // 列表：分时价徽标 + 时段摘要 + 低谷汇总
+    const row = await screen.findByTestId("price-override-row-glm-5-3");
+    expect(screen.getByTestId("price-override-badge-glm-5-3")).toHaveTextContent(
+      tf("usage.pricing.overrides.kindTime")
+    );
+    const schedule = within(row).getByTestId("price-override-time-schedule-glm-5-3");
+    expect(schedule).toHaveTextContent("22:00–02:00");
+    expect(schedule).toHaveTextContent("09:00–12:00");
+    expect(schedule).toHaveTextContent(tf("usage.pricing.overrides.timezoneUtc"));
+    const offpeak = within(row).getByTestId("price-override-offpeak-summary-glm-5-3");
+    expect(offpeak).toHaveTextContent("5");
+    expect(offpeak).toHaveTextContent("2.5");
+    expect(offpeak).toHaveTextContent("20");
+
+    // 编辑回填：分时开关、时区、两个窗口、高峰/低谷四价
+    fireEvent.click(within(row).getByTestId("price-override-edit-glm-5-3"));
+    expect(screen.getByTestId("price-override-model")).toBeDisabled();
+    expect(screen.getByTestId("price-override-time-toggle")).toHaveAttribute(
+      "aria-checked",
+      "true"
+    );
+    expect(screen.getByTestId("price-override-timezone")).toHaveValue("utc");
+    expect(screen.getByTestId("price-override-window-start-0")).toHaveValue("22:00");
+    expect(screen.getByTestId("price-override-window-end-0")).toHaveValue("02:00");
+    expect(screen.getByTestId("price-override-window-start-1")).toHaveValue("09:00");
+    expect(screen.getByTestId("price-override-input")).toHaveValue("10");
+    expect(screen.getByTestId("price-override-output")).toHaveValue("40");
+    expect(screen.getByTestId("price-override-offpeak-input")).toHaveValue("5");
+    expect(screen.getByTestId("price-override-offpeak-cacheRead")).toHaveValue("2.5");
+    expect(screen.getByTestId("price-override-offpeak-cacheWrite")).toHaveValue("0");
+    expect(screen.getByTestId("price-override-offpeak-output")).toHaveValue("20");
+    // 折扣填充值不持久化，编辑时回到默认 50
+    expect(screen.getByTestId("price-override-discount")).toHaveValue("50");
+  });
+
+  it("13. 时段增删：仅剩一个窗口时删除按钮禁用；删除后保存只带剩余窗口", async () => {
+    render(wrap(<PriceOverrideManager t={tf} />));
+    await screen.findByTestId("price-override-row-gpt-5");
+    openAddForm();
+    fillForm({ model: "glm-5.3", input: "10" });
+    enableTimeRule();
+
+    // 默认一个窗口：删除按钮禁用
+    expect(screen.getByTestId("price-override-window-remove-0")).toBeDisabled();
+
+    fireEvent.click(screen.getByTestId("price-override-window-add"));
+    expect(screen.getByTestId("price-override-window-remove-0")).not.toBeDisabled();
+    fireEvent.click(screen.getByTestId("price-override-window-remove-1"));
+    expect(screen.queryByTestId("price-override-window-start-1")).toBeNull();
+    expect(screen.getByTestId("price-override-window-remove-0")).toBeDisabled();
+
+    setField("price-override-offpeak-input", "1");
+    fireEvent.click(screen.getByTestId("price-override-save"));
+    await waitFor(() => expect(callsOf("usage_pricing_override_set")).toHaveLength(1));
+    const request = callsOf("usage_pricing_override_set")[0][1]?.request as {
+      timeRule?: { windows: Array<{ start: string; end: string }> };
+    };
+    expect(request.timeRule?.windows).toEqual([{ start: "09:00", end: "12:00" }]);
+  });
+
+  it("14. 百分比填充低谷价：按高峰四价缩放；折扣 0/101 拒绝且不改写", async () => {
+    render(wrap(<PriceOverrideManager t={tf} />));
+    await screen.findByTestId("price-override-row-gpt-5");
+    openAddForm();
+    fillForm({ model: "glm-5.3", input: "10", cacheRead: "5", cacheWrite: "2", output: "40" });
+    enableTimeRule();
+
+    setField("price-override-discount", "25");
+    fireEvent.click(screen.getByTestId("price-override-discount-apply"));
+    expect(screen.getByTestId("price-override-offpeak-input")).toHaveValue("2.5");
+    expect(screen.getByTestId("price-override-offpeak-cacheRead")).toHaveValue("1.25");
+    expect(screen.getByTestId("price-override-offpeak-cacheWrite")).toHaveValue("0.5");
+    expect(screen.getByTestId("price-override-offpeak-output")).toHaveValue("10");
+
+    // 非法折扣：错误可见、已填值不被覆盖
+    setField("price-override-discount", "0");
+    fireEvent.click(screen.getByTestId("price-override-discount-apply"));
+    expect(screen.getByTestId("price-override-form-error")).toHaveTextContent(
+      tf("usage.pricing.overrides.invalidDiscount")
+    );
+    expect(screen.getByTestId("price-override-offpeak-input")).toHaveValue("2.5");
+
+    setField("price-override-discount", "101");
+    fireEvent.click(screen.getByTestId("price-override-discount-apply"));
+    expect(screen.getByTestId("price-override-form-error")).toHaveTextContent(
+      tf("usage.pricing.overrides.invalidDiscount")
+    );
+    expect(screen.getByTestId("price-override-offpeak-output")).toHaveValue("10");
+
+    // 上界 100% 合法：低谷价 = 高峰价
+    setField("price-override-discount", "100");
+    fireEvent.click(screen.getByTestId("price-override-discount-apply"));
+    expect(screen.getByTestId("price-override-offpeak-input")).toHaveValue("10");
+    expect(screen.getByTestId("price-override-offpeak-cacheWrite")).toHaveValue("2");
+  });
+
+  it("15. 分时校验：起止相同 / 无低谷价 / 非法低谷价均拒绝且不发请求", async () => {
+    render(wrap(<PriceOverrideManager t={tf} />));
+    await screen.findByTestId("price-override-row-gpt-5");
+    openAddForm();
+    fillForm({ model: "glm-5.3", input: "10" });
+    enableTimeRule();
+
+    // 起止相同
+    setField("price-override-window-end-0", "09:00");
+    fireEvent.click(screen.getByTestId("price-override-save"));
+    expect(screen.getByTestId("price-override-form-error")).toHaveTextContent(
+      tf("usage.pricing.overrides.windowInvalid")
+    );
+    expect(callsOf("usage_pricing_override_set")).toHaveLength(0);
+
+    // 低谷四价全空
+    setField("price-override-window-end-0", "12:00");
+    fireEvent.click(screen.getByTestId("price-override-save"));
+    expect(screen.getByTestId("price-override-form-error")).toHaveTextContent(
+      tf("usage.pricing.overrides.atLeastOneOffpeak")
+    );
+    expect(callsOf("usage_pricing_override_set")).toHaveLength(0);
+
+    // 非法低谷数字
+    setField("price-override-offpeak-input", "abc");
+    fireEvent.click(screen.getByTestId("price-override-save"));
+    expect(screen.getByTestId("price-override-form-error")).toHaveTextContent(
+      tf("usage.pricing.overrides.invalidRate")
+    );
+    expect(callsOf("usage_pricing_override_set")).toHaveLength(0);
+
+    // 修正后放行
+    setField("price-override-offpeak-input", "1");
+    fireEvent.click(screen.getByTestId("price-override-save"));
+    await waitFor(() => expect(callsOf("usage_pricing_override_set")).toHaveLength(1));
+  });
+
+  it("16. 固定价（开关关闭）保存 timeRule=null，列表只显示固定价徽标", async () => {
+    render(wrap(<PriceOverrideManager t={tf} />));
+    await screen.findByTestId("price-override-row-gpt-5");
+    openAddForm();
+    fillForm({ model: "glm-5.3", input: "8" });
+    fireEvent.click(screen.getByTestId("price-override-save"));
+
+    await waitFor(() => expect(callsOf("usage_pricing_override_set")).toHaveLength(1));
+    const request = callsOf("usage_pricing_override_set")[0][1]?.request as {
+      timeRule?: unknown;
+    };
+    expect(request.timeRule).toBeNull();
+
+    const row = await screen.findByTestId("price-override-row-glm-5-3");
+    expect(within(row).getByTestId("price-override-badge-glm-5-3")).toHaveTextContent(
+      tf("usage.pricing.overrides.kindFixed")
+    );
+    expect(within(row).queryByTestId("price-override-time-glm-5-3")).toBeNull();
   });
 });

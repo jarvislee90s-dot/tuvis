@@ -1,5 +1,4 @@
-// 用量配置卡模型条目（2026-10-20 计划 Task 6；同日用户裁决：删除 A 段、条目内同时改供应商名/模型名、
-// 默认最近 7 天 Top10 + 底部展开 + 搜索）。
+// 用量配置卡模型条目（2026-10-20 计划 Task 6；2026-10-21 增加三键排序与可交互性标识）。
 //
 // 展示键 =（显示供应商, 原始模型）；空 provider 未指派条目按（sourceId, 原始模型）单列。
 // 同一展示键下多个原始来源折叠为一个条目（别名合并面），编辑对**全部成员**批量写（收敛一致）。
@@ -11,10 +10,12 @@
 //  * row3：计价身份（目录 provider/model，仅下拉/搜索选择，无自由输入）；
 //    默认显示精选自动匹配徽标，可显式覆盖/清除；「显示全部 N 个来源」切换目录可见范围；
 //    悬停/聚焦显示价格表（四价 + 发布日 + 条件价 + 快照日期，按当前显示币种）。
+//  * 排序：按用量（默认降序）/ 原始供应商名 / 原始模型名，同一键再点切换升降序。
 //
 // 纪律：只改展示与估价口径，绝不回写账本；只消费既有 i18n 键。
 import { useEffect, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { ArrowDown, ArrowUp } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ConvertedPrice } from "@/components/usage/ConvertedPrice";
@@ -32,6 +33,7 @@ import {
   useUsagePricingQuoteQuery,
   useUsageProviderAliasesQuery,
 } from "@/lib/query/queries/usageV2";
+import { cn } from "@/lib/utils";
 import type { TFn } from "@/lib/usage/range";
 import type { ProviderAliasRule } from "@/types/usageV2";
 import type { UsageSourceId } from "@/types/usage";
@@ -49,7 +51,6 @@ const CURATED_OFFICIAL = new Set([
   "google",
   "deepseek",
   "zhipuai",
-  "zhipuai-coding-plan",
   "moonshotai",
   "moonshotai-cn",
   "alibaba",
@@ -59,7 +60,6 @@ const CURATED_OFFICIAL = new Set([
   "mistral",
   "meta",
 ]);
-const CURATED_HOSTED = new Set(["ollama-cloud"]);
 const CURATED_OPENROUTER = "openrouter";
 
 /** 默认只展示最近 7 天用量前 10 条（2026-10-20 用户裁决）。 */
@@ -254,18 +254,21 @@ function PricingIdentityCell(props: {
             type="button"
             data-testid={`usage-config-pricing-badge-${entryTestId}`}
             aria-describedby={previewId}
-            className="rounded-full border px-1.5 py-px text-[11px]"
+            className="rounded-full border border-amber-500/50 bg-amber-500/10 px-1.5 py-px text-[11px] text-amber-700 dark:text-amber-300"
           >
             {t("usage.config.modelSection.pricingOverridden")}
           </button>
           <PricePreview id={previewId} quote={quote} t={t} currency={currency} />
         </span>
-        <span data-testid={`usage-config-pricing-ref-${entryTestId}`} className="font-mono text-xs">
+        <span
+          data-testid={`usage-config-pricing-ref-${entryTestId}`}
+          className="font-mono text-xs text-amber-700 dark:text-amber-300"
+        >
           {override.providerId} / {override.modelId}
         </span>
         <Button
           size="xs"
-          variant="ghost"
+          variant="outline"
           data-testid={`usage-config-pricing-clear-${entryTestId}`}
           disabled={busy}
           // 与 copy/clear 同因：防止 blur 保存抢占 busy 后 click 被吞
@@ -278,14 +281,12 @@ function PricingIdentityCell(props: {
     );
   } else if (autoMatch.data && autoMatch.data.kind !== "none" && autoMatch.data.reference) {
     const providerId = autoMatch.data.reference.providerId;
-    const sourceLabel =
-      CURATED_OPENROUTER === providerId
-        ? t("usage.config.modelSection.sources.openrouter")
-        : CURATED_HOSTED.has(providerId)
-          ? t("usage.config.modelSection.sources.hosted")
-          : CURATED_OFFICIAL.has(providerId)
-            ? t("usage.config.modelSection.sources.official")
-            : t("usage.config.modelSection.sources.other");
+    let sourceLabel = t("usage.config.modelSection.sources.other");
+    if (providerId === CURATED_OPENROUTER) {
+      sourceLabel = t("usage.config.modelSection.sources.openrouter");
+    } else if (CURATED_OFFICIAL.has(providerId)) {
+      sourceLabel = t("usage.config.modelSection.sources.official");
+    }
     const prefix =
       autoMatch.data.kind === "prefix" ? ` · ${t("usage.config.modelSection.prefixMatched")}` : "";
     badge = (
@@ -328,7 +329,7 @@ function PricingIdentityCell(props: {
       <span className="flex min-w-0 items-center gap-2">
         <Button
           size="xs"
-          variant="ghost"
+          variant="outline"
           data-testid={`usage-config-pricing-toggle-${entryTestId}`}
           aria-expanded={pickerOpen}
           disabled={busy}
@@ -403,7 +404,7 @@ function PricingIdentityCell(props: {
                     <button
                       type="button"
                       data-testid={`usage-config-pricing-option-${entry.providerId}/${entry.modelId}`}
-                      className="hover:bg-accent w-full truncate rounded px-1.5 py-1 text-left font-mono text-xs"
+                      className="hover:bg-accent w-full truncate rounded border px-1.5 py-1 text-left font-mono text-xs"
                       title={`${entry.providerId} / ${entry.modelId}`}
                       disabled={busy}
                       onClick={() =>
@@ -446,12 +447,41 @@ export function UsageConfigModelSection({
   const [providerDrafts, setProviderDrafts] = useState<Record<string, string>>({});
   const [expanded, setExpanded] = useState(false);
   const [filter, setFilter] = useState("");
+  const [sortKey, setSortKey] = useState<"usage" | "provider" | "model">("usage");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
 
   const groups = modelGroupsOf(entries);
   const unknownModelLabel = t("usage.label.unknownModel");
   const aliases = aliasesQuery.data?.aliases ?? [];
+
+  const toggleSort = (key: "usage" | "provider" | "model") => {
+    if (key === sortKey) {
+      setSortDirection((current) => (current === "asc" ? "desc" : "asc"));
+      return;
+    }
+    setSortKey(key);
+    setSortDirection(key === "usage" ? "desc" : "asc");
+  };
+
+  const rawProviderOf = (group: ModelEntryGroup): string =>
+    group.members.find((member) => member.providerRaw !== null)?.providerRaw ?? "";
+  const sortedGroups = [...groups].sort((left, right) => {
+    const direction = sortDirection === "asc" ? 1 : -1;
+    let primary: number;
+    if (sortKey === "usage") {
+      primary = left.recentTokens - right.recentTokens;
+    } else if (sortKey === "provider") {
+      primary = rawProviderOf(left).localeCompare(rawProviderOf(right));
+    } else {
+      primary = left.modelId.localeCompare(right.modelId);
+    }
+    if (primary !== 0) return primary * direction;
+    // 同值时用稳定键兜底，避免排序抖动；用量始终作为第一兜底。
+    if (left.recentTokens !== right.recentTokens) return right.recentTokens - left.recentTokens;
+    return left.key.localeCompare(right.key);
+  });
 
   const findAlias = (
     predicate: (rule: ProviderAliasRule) => boolean
@@ -565,7 +595,7 @@ export function UsageConfigModelSection({
 
   const needle = filter.trim().toLowerCase();
   const filtered = needle
-    ? groups.filter((group) => {
+    ? sortedGroups.filter((group) => {
         const evidence = rawEvidenceOf(group, unknownModelLabel).toLowerCase();
         return (
           (group.displayProvider ?? "").toLowerCase().includes(needle) ||
@@ -576,7 +606,7 @@ export function UsageConfigModelSection({
           evidence.includes(needle)
         );
       })
-    : groups;
+    : sortedGroups;
   const visible = expanded || needle !== "" ? filtered : filtered.slice(0, TOP_ROWS);
   const hiddenCount = Math.max(0, groups.length - TOP_ROWS);
 
@@ -593,6 +623,61 @@ export function UsageConfigModelSection({
           </UsageInfoTip>
         </div>
         <span className="text-muted-foreground text-xs">{t("usage.config.modelSection.desc")}</span>
+      </div>
+
+      <div className="bg-muted/30 flex flex-wrap items-center justify-between gap-2 rounded-md border px-2 py-1.5">
+        <div className="text-muted-foreground flex flex-wrap items-center gap-2 text-[11px]">
+          <span>{t("usage.config.modelSection.legend")}</span>
+          <span className="rounded border border-transparent px-1">
+            {t("usage.config.modelSection.legendReadonly")}
+          </span>
+          <span className="bg-background rounded border px-1">
+            {t("usage.config.modelSection.legendEditable")}
+          </span>
+          <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1 text-amber-700 dark:text-amber-300">
+            {t("usage.config.modelSection.legendModified")}
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1">
+          <span className="text-muted-foreground text-[11px]">
+            {t("usage.config.modelSection.sortBy")}
+          </span>
+          {(
+            [
+              ["usage", "sortUsage"],
+              ["provider", "sortProvider"],
+              ["model", "sortModel"],
+            ] as const
+          ).map(([key, labelKey]) => {
+            const active = sortKey === key;
+            const direction = active && sortDirection === "asc" ? "asc" : "desc";
+            return (
+              <Button
+                key={key}
+                type="button"
+                size="xs"
+                variant={active ? "default" : "outline"}
+                aria-pressed={active}
+                aria-label={`${t(`usage.config.modelSection.${labelKey}`)} ${
+                  direction === "asc"
+                    ? t("usage.config.modelSection.sortAsc")
+                    : t("usage.config.modelSection.sortDesc")
+                }`}
+                data-testid={`usage-config-sort-${key}`}
+                onClick={() => toggleSort(key)}
+              >
+                {t(`usage.config.modelSection.${labelKey}`)}
+                {active ? (
+                  sortDirection === "asc" ? (
+                    <ArrowUp className="h-3 w-3" aria-hidden="true" />
+                  ) : (
+                    <ArrowDown className="h-3 w-3" aria-hidden="true" />
+                  )
+                ) : null}
+              </Button>
+            );
+          })}
+        </div>
       </div>
 
       {error ? (
@@ -656,6 +741,12 @@ export function UsageConfigModelSection({
                 const providerPlaceholder =
                   group.members.find((m) => m.providerRaw !== null)?.providerRaw ??
                   t("usage.label.unassignedChannel");
+                const rawProvider =
+                  group.members.find((m) => m.providerRaw !== null)?.providerRaw ?? null;
+                const providerModified =
+                  group.displayProvider !== null &&
+                  (rawProvider === null || group.displayProvider !== rawProvider);
+                const modelModified = currentName !== null && currentName !== group.modelId;
                 return (
                   <li
                     key={group.key}
@@ -684,7 +775,11 @@ export function UsageConfigModelSection({
                         data-testid={`usage-config-model-provider-input-${group.testId}`}
                         aria-label={t("usage.config.modelSection.providerName")}
                         placeholder={providerPlaceholder}
-                        className="h-8 w-40 min-w-0"
+                        className={cn(
+                          "h-8 w-40 min-w-0",
+                          providerModified &&
+                            "border-amber-500/60 text-amber-700 dark:text-amber-300"
+                        )}
                         disabled={busy}
                         value={providerValue}
                         onChange={(e) =>
@@ -708,7 +803,10 @@ export function UsageConfigModelSection({
                         data-testid={`usage-config-model-display-name-input-${group.testId}`}
                         aria-label={t("usage.config.modelSection.modelName")}
                         placeholder={group.modelId || unknownModelLabel}
-                        className="h-8 min-w-0 flex-1"
+                        className={cn(
+                          "h-8 min-w-0 flex-1",
+                          modelModified && "border-amber-500/60 text-amber-700 dark:text-amber-300"
+                        )}
                         disabled={busy}
                         value={value}
                         onChange={(e) =>
@@ -818,7 +916,7 @@ export function UsageConfigModelSection({
                           ) : null}
                           <Button
                             size="xs"
-                            variant="ghost"
+                            variant="outline"
                             data-testid={`usage-config-model-override-${group.testId}`}
                             disabled={busy || normalizedModelId === ""}
                             onClick={() => onOverride(group.modelId, normalizedModelId)}

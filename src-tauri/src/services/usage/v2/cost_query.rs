@@ -28,8 +28,8 @@ use crate::services::usage::v2::currency::{
 };
 use crate::services::usage::v2::model::{
     AttributionKind, BillingConfig, ChannelKind, CostComponent, CostComponents, CostRow,
-    CostStatus, IdentityKey, PriceCurrency, PricingBasis, PricingReference, RuleMatch, UsageCosts,
-    UsageRange,
+    CostStatus, IdentityKey, PriceCurrency, PriceRuleKind, PricingBasis, PricingReference,
+    RuleMatch, TimePriceBreakdown, UsageCosts, UsageRange,
 };
 use crate::services::usage::v2::model_config::RowConfigIndex;
 use crate::services::usage::v2::pricing::{
@@ -37,9 +37,10 @@ use crate::services::usage::v2::pricing::{
     PriceCatalog,
 };
 use crate::services::usage::v2::query::{attribute_rows, AttributedRow};
+use crate::services::usage::v2::time_price;
 use crate::services::usage::UsageError;
 
-const CSV_HEADER: &str = "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override";
+const CSV_HEADER: &str = "billing_profile_id,billing_profile_name,source_ids,observed_provider,model_id,attribution_kind,token_usage,estimated_usd,status,priced_tokens,unpriced_tokens,coverage_rate,pricing_provider,pricing_model,pricing_snapshot_id,pricing_basis,price_updated_at,channel_key,channel_kind,display_provider,normalized_model_id,pricing_release_date,price_override,price_rule_kind";
 
 /// 费用查询取数来源（2026-10-20 计划 §3.4）。
 ///
@@ -165,56 +166,135 @@ fn load_detail_daily_rows(
     Ok(out)
 }
 
-/// 费用查询取数（§3.4）：返回归因行 + 本次取数的 provenance。
+/// 明细按小时取数（分时价格专用）：保留 `hour_key` 供峰谷判定，输出仍由 `row_key`
+/// 聚合成「渠道 / 模型」一行。
+fn load_detail_hourly_rows(
+    conn: &Connection,
+    first_day: &str,
+    last_day: &str,
+) -> Result<Vec<LedgerRow>, UsageError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT hour_key, source_id, provider, MIN(provider_kind), model,
+                    SUM(input_fresh), SUM(cache_read), SUM(cache_write), SUM(output),
+                    SUM(request_total), SUM(requests)
+             FROM usage_detail
+             WHERE day_key BETWEEN ?1 AND ?2
+             GROUP BY hour_key, source_id, provider, model",
+        )
+        .map_err(|e| internal(format!("cost query: hourly detail aggregation failed: {e}")))?;
+    let rows = stmt
+        .query_map([first_day, last_day], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+            ))
+        })
+        .map_err(|e| internal(format!("cost query: hourly detail aggregation failed: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (
+            hour_key,
+            source_id,
+            provider,
+            provider_kind,
+            model,
+            input_fresh,
+            cache_read,
+            cache_write,
+            output,
+            request_total,
+            requests,
+        ) = row.map_err(|e| internal(format!("cost query: hourly detail row read failed: {e}")))?;
+        out.push(LedgerRow {
+            bucket_key: hour_key,
+            source_id,
+            session_id: String::new(),
+            project_key: String::new(),
+            project_label: String::new(),
+            provider,
+            provider_kind: match provider_kind.as_str() {
+                "inferred" => SourceKind::Inferred,
+                "unknown" => SourceKind::Unknown,
+                _ => SourceKind::Measured,
+            },
+            model,
+            buckets: UsageBuckets {
+                input_fresh,
+                cache_read,
+                cache_write,
+                output,
+            },
+            request_total,
+            requests,
+            user_est: None,
+        });
+    }
+    Ok(out)
+}
 /// 本函数是费用域专用；billing preview 走 billing.rs 的直连归因路径
 /// （`attribute_rows` + `load_ledger_rows_with`），不经本函数、也不经 `snapshot_with_conn`。
+/// 费用查询取数（§3.4）：返回归因行、本次取数的 provenance，以及实际计价粒度。
+///
+/// 分时价格必须保留小时桶：Day 档在明细覆盖完整时改为按小时取数（`Hour` 粒度），
+/// 否则无法区分高峰/低谷。日聚合回退保持 `Day`，由计价层按低谷价估算并标注。
 pub(crate) fn cost_snapshot_with_conn(
     conn: &Connection,
     range: &UsageRange,
     now_ms: i64,
-) -> Result<(Vec<AttributedRow>, CostBucketProvenance), UsageError> {
+) -> Result<(Vec<AttributedRow>, CostBucketProvenance, RangeGranularity), UsageError> {
     if !crate::services::usage::settings::load_from_conn(conn).enabled {
-        return Ok((Vec::new(), CostBucketProvenance::Daily));
+        return Ok((
+            Vec::new(),
+            CostBucketProvenance::Daily,
+            granularity_of(range.preset),
+        ));
     }
     let resolved = resolve_range(range, now_ms)?;
     let config = crate::services::usage::v2::billing::load_with_conn(conn)?;
+    let first_day = resolved
+        .cur
+        .keys
+        .first()
+        .map(String::as_str)
+        .unwrap_or_default();
+    let last_day = resolved
+        .cur
+        .keys
+        .last()
+        .map(String::as_str)
+        .unwrap_or_default();
     let provenance = match resolved.cur.granularity {
         // 5h/当日：现路径逐行明细 ⇒ Detail。
         RangeGranularity::Hour => CostBucketProvenance::Detail,
-        RangeGranularity::Day => detail_provenance(
-            conn,
-            resolved
-                .cur
-                .keys
-                .first()
-                .map(String::as_str)
-                .unwrap_or_default(),
-            resolved
-                .cur
-                .keys
-                .last()
-                .map(String::as_str)
-                .unwrap_or_default(),
-        )?,
+        RangeGranularity::Day => detail_provenance(conn, first_day, last_day)?,
+    };
+    let has_time_rules = pricing::has_time_price_rules_with_conn(conn)?;
+    let effective_granularity = if resolved.cur.granularity == RangeGranularity::Day
+        && provenance == CostBucketProvenance::Detail
+        && has_time_rules
+    {
+        RangeGranularity::Hour
+    } else {
+        resolved.cur.granularity
     };
     let rows = match provenance {
         CostBucketProvenance::Detail => {
-            if resolved.cur.granularity == RangeGranularity::Day {
-                load_detail_daily_rows(
-                    conn,
-                    resolved
-                        .cur
-                        .keys
-                        .first()
-                        .map(String::as_str)
-                        .unwrap_or_default(),
-                    resolved
-                        .cur
-                        .keys
-                        .last()
-                        .map(String::as_str)
-                        .unwrap_or_default(),
-                )?
+            if effective_granularity == RangeGranularity::Hour
+                && resolved.cur.granularity == RangeGranularity::Day
+            {
+                load_detail_hourly_rows(conn, first_day, last_day)?
+            } else if resolved.cur.granularity == RangeGranularity::Day {
+                load_detail_daily_rows(conn, first_day, last_day)?
             } else {
                 crate::services::usage::query::load_ledger_rows_with(conn, &resolved)
             }
@@ -223,8 +303,8 @@ pub(crate) fn cost_snapshot_with_conn(
             crate::services::usage::query::load_ledger_rows_with(conn, &resolved)
         }
     };
-    let attributed = attribute_rows(rows, resolved.cur.granularity, &config)?;
-    Ok((attributed, provenance))
+    let attributed = attribute_rows(rows, effective_granularity, &config)?;
+    Ok((attributed, provenance, effective_granularity))
 }
 
 fn internal(detail: impl Into<String>) -> UsageError {
@@ -402,6 +482,13 @@ fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeSlot {
+    Peak,
+    Offpeak,
+    DailyFallback,
+}
+
 struct RowPricing {
     reference: Option<PricingReference>,
     usd: CurrencyRates,
@@ -412,6 +499,7 @@ struct RowPricing {
     normalized_model_id: Option<String>,
     release_date: Option<String>,
     price_override: bool,
+    time_slot: Option<TimeSlot>,
     reasons: Vec<String>,
 }
 
@@ -426,6 +514,7 @@ fn insufficient_pricing(reference: Option<PricingReference>) -> RowPricing {
         normalized_model_id: None,
         release_date: None,
         price_override: false,
+        time_slot: None,
         reasons: Vec::new(),
     }
 }
@@ -466,6 +555,8 @@ fn resolve_row_pricing(
     fx: &FxRate,
     model_config: &RowConfigIndex,
     auto_cache: &mut HashMap<String, AutoMatch>,
+    bucket_key: &str,
+    daily_fallback: bool,
 ) -> Result<RowPricing, UsageError> {
     let mut reasons: Vec<String> = Vec::new();
     let mut reference: Option<PricingReference> = None;
@@ -550,21 +641,42 @@ fn resolve_row_pricing(
                 .as_deref()
                 .and_then(|key| overrides.get(key))
         })
-        .filter(|override_rates| override_rates.rates.iter().any(Option::is_some));
+        .filter(|rule| rule.rates.iter().any(Option::is_some) || rule.time_rule.is_some());
 
     if let Some(effective_override) = effective_override {
         // 覆盖价是最优先来源：它能把规则冲突/前缀歧义下无法确定的行按覆盖价计价。
         reasons.retain(|reason| reason != "noPrice");
+        let (override_rates, time_slot) = match effective_override.time_rule.as_ref() {
+            None => (effective_override.rates, None),
+            Some(rule) => {
+                let slot = if daily_fallback {
+                    TimeSlot::DailyFallback
+                } else if time_price::is_peak(bucket_key, rule.timezone, &rule.windows) {
+                    TimeSlot::Peak
+                } else {
+                    TimeSlot::Offpeak
+                };
+                let rates = if slot == TimeSlot::Peak {
+                    effective_override.rates
+                } else {
+                    rule.offpeak_rates
+                };
+                (rates, Some(slot))
+            }
+        };
+        if time_slot == Some(TimeSlot::DailyFallback) {
+            reasons.push("timePriceDailyFallback".to_string());
+        }
         let (catalog_usd, catalog_cny) = match quote.as_ref() {
             Some(quote) => catalog_currency_views(quote, native, fx)?,
             None => (CurrencyRates::default(), CurrencyRates::default()),
         };
         let uses_catalog = (0..4).any(|index| {
-            effective_override.rates[index].is_none()
+            override_rates[index].is_none()
                 && (catalog_usd.rates[index].is_some() || catalog_cny.rates[index].is_some())
         });
         let (usd, cny) = merge_override_views(
-            effective_override.rates,
+            override_rates,
             effective_override.currency,
             catalog_usd,
             catalog_cny,
@@ -617,6 +729,7 @@ fn resolve_row_pricing(
                 .then(|| quote.as_ref().and_then(|quote| quote.release_date.clone()))
                 .flatten(),
             price_override: true,
+            time_slot,
             reasons,
         });
     }
@@ -651,6 +764,7 @@ fn resolve_row_pricing(
         normalized_model_id: quote.normalized_model_id.clone(),
         release_date: quote.release_date.clone(),
         price_override: false,
+        time_slot: None,
         reasons,
     };
     if out.usd.has_rates() || out.cny.has_rates() {
@@ -771,6 +885,8 @@ fn calculate_row(
         fx,
         model_config,
         auto_cache,
+        &row.bucket_key,
+        provenance == CostBucketProvenance::Daily,
     )?;
     let channel = resolve_channel(identity, &attributed.attribution, resolver);
 
@@ -840,6 +956,8 @@ struct ComponentAcc {
     amount_scaled: i128,
     rate_scaled: i128,
     converted: bool,
+    /// 该分量的费率按小时变化（分时价），单价需用金额/Token 加权。
+    time_priced: bool,
 }
 
 #[derive(Default)]
@@ -865,6 +983,10 @@ struct GroupAcc {
     normalized_model_id: Option<String>,
     release_date: Option<String>,
     price_override: bool,
+    time_rule_seen: bool,
+    time_peak_tokens: i64,
+    time_offpeak_tokens: i64,
+    time_fallback_tokens: i64,
     /// 成员身份在 `usage_model_config` 里配置的自定义模型名（非空才收）；
     /// 输出时恰有一个不同值 ⇒ 生效，无人配置或分歧 ⇒ null（§3.5 诚实降级）。
     display_model_names: BTreeSet<String>,
@@ -890,6 +1012,7 @@ fn accumulate_currency(
     acc: &mut CurrencyAcc,
     estimate: &Estimate,
     converted: [bool; 4],
+    time_priced: bool,
 ) -> Result<(), UsageError> {
     acc.priced_tokens = add_signed(acc.priced_tokens, estimate.priced_tokens, "priced tokens")?;
     acc.unpriced_tokens = add_signed(
@@ -914,6 +1037,7 @@ fn accumulate_currency(
             .checked_add(component.amount_scaled)
             .ok_or_else(|| internal("cost query: component amount overflow"))?;
         entry.rate_scaled = component.rate_scaled;
+        entry.time_priced |= time_priced;
         entry.converted |= converted[index];
         acc.any_converted |= converted[index];
     }
@@ -939,10 +1063,9 @@ pub fn costs_with_conn(
     // 行级模型配置一次性加载（计价身份覆盖 + displayModelName 解析）。
     let model_config = RowConfigIndex::load_with_conn(conn)?;
     let mut auto_cache: HashMap<String, AutoMatch> = HashMap::new();
-    let granularity = granularity_of(range.preset);
-    // 费用域专用取数：Detail（明细按日聚合）/ Daily（日聚合回退）+ provenance。
+    // 费用域专用取数：Detail（明细，可能按小时）/ Daily（日聚合回退）+ provenance + 实际粒度。
     // billing preview 走 billing.rs 直连路径（`attribute_rows` + `load_ledger_rows_with`），不经本函数。
-    let (attributed, provenance) = cost_snapshot_with_conn(conn, range, now_ms)?;
+    let (attributed, provenance, granularity) = cost_snapshot_with_conn(conn, range, now_ms)?;
 
     let mut groups: BTreeMap<String, GroupAcc> = BTreeMap::new();
     for attributed_row in attributed {
@@ -977,6 +1100,10 @@ pub fn costs_with_conn(
                 normalized_model_id: calculated.pricing.normalized_model_id.clone(),
                 release_date: calculated.pricing.release_date.clone(),
                 price_override: calculated.pricing.price_override,
+                time_rule_seen: calculated.pricing.time_slot.is_some(),
+                time_peak_tokens: 0,
+                time_offpeak_tokens: 0,
+                time_fallback_tokens: 0,
                 display_model_names: BTreeSet::new(),
                 token_usage: 0,
                 request_total: 0,
@@ -1000,21 +1127,50 @@ pub fn costs_with_conn(
             group.display_model_names.insert(name);
         }
         group.token_usage = add_signed(group.token_usage, calculated.token_usage, "token usage")?;
+        group.price_override |= calculated.pricing.price_override;
+        match calculated.pricing.time_slot {
+            Some(TimeSlot::Peak) => {
+                group.time_peak_tokens = add_signed(
+                    group.time_peak_tokens,
+                    calculated.token_usage,
+                    "peak tokens",
+                )?;
+            }
+            Some(TimeSlot::Offpeak) => {
+                group.time_offpeak_tokens = add_signed(
+                    group.time_offpeak_tokens,
+                    calculated.token_usage,
+                    "offpeak tokens",
+                )?;
+            }
+            Some(TimeSlot::DailyFallback) => {
+                group.time_fallback_tokens = add_signed(
+                    group.time_fallback_tokens,
+                    calculated.token_usage,
+                    "time fallback tokens",
+                )?;
+            }
+            None => {}
+        }
+        group.time_rule_seen |= calculated.pricing.time_slot.is_some();
         group.request_total = add_signed(
             group.request_total,
             calculated.request_total,
             "request total",
         )?;
         group.cache_read = add_signed(group.cache_read, calculated.cache_read, "cache read")?;
+        let time_priced = calculated.pricing.time_slot.is_some();
         accumulate_currency(
             &mut group.usd,
             &calculated.estimate_usd,
             calculated.pricing.usd.converted,
+            time_priced,
         )?;
         accumulate_currency(
             &mut group.cny,
             &calculated.estimate_cny,
             calculated.pricing.cny.converted,
+            time_priced,
         )?;
         group.reasons.extend(calculated.reasons);
     }
@@ -1074,10 +1230,20 @@ pub fn costs_with_conn(
                     (None, None) => continue,
                 };
                 let unit = |component: &ComponentAcc| -> Result<String, UsageError> {
-                    let scaled = component
-                        .rate_scaled
-                        .checked_mul(1_000_000)
-                        .ok_or_else(|| internal("cost query: unit overflow"))?;
+                    // 分时价同一分量跨小时费率不同：用金额/Token 反推加权单价，
+                    // 避免拿最后一个小时的费率冒充整行单价。
+                    let scaled = if component.time_priced && component.tokens != 0 {
+                        component
+                            .amount_scaled
+                            .checked_mul(1_000_000)
+                            .ok_or_else(|| internal("cost query: unit overflow"))?
+                            / i128::from(component.tokens)
+                    } else {
+                        component
+                            .rate_scaled
+                            .checked_mul(1_000_000)
+                            .ok_or_else(|| internal("cost query: unit overflow"))?
+                    };
                     Ok(usd_string(scaled))
                 };
                 components[index] = Some(CostComponent {
@@ -1157,6 +1323,18 @@ pub fn costs_with_conn(
                 normalized_model_id: group.normalized_model_id,
                 pricing_release_date: group.release_date,
                 price_override: group.price_override,
+                price_rule_kind: if group.time_rule_seen {
+                    PriceRuleKind::Time
+                } else if group.price_override {
+                    PriceRuleKind::Fixed
+                } else {
+                    PriceRuleKind::None
+                },
+                time_breakdown: group.time_rule_seen.then_some(TimePriceBreakdown {
+                    peak_tokens: group.time_peak_tokens,
+                    offpeak_tokens: group.time_offpeak_tokens,
+                    daily_fallback_tokens: group.time_fallback_tokens,
+                }),
                 display_model_name,
             })
         })
@@ -1263,6 +1441,7 @@ pub fn cost_csv_with_conn(
             row.normalized_model_id.clone().unwrap_or_default(),
             row.pricing_release_date.clone().unwrap_or_default(),
             row.price_override.to_string(),
+            row.price_rule_kind.as_str().to_string(),
         ];
         out.push_str(
             &cells

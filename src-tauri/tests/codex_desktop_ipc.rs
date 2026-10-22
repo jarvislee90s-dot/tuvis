@@ -4362,3 +4362,1844 @@ fn observed_6573_command_approval_closure_is_pinned() {
     );
     assert!(views[0].actionable);
 }
+
+// 以下附件组合均为合成回归输入，字段证据见 artifacts/cases.synthetic.json。
+// 测试只证明投影契约，不证明 Desktop 的运行时状态枚举。
+fn artifact_projection(turn: serde_json::Value) -> serde_json::Value {
+    artifact_projection_turns(vec![("turn", turn)])
+}
+
+/// 多回合投影：`entitiesByKey` 按给定顺序建引用链，用于验证回合间编号隔离。
+fn artifact_projection_turns(turns: Vec<(&str, serde_json::Value)>) -> serde_json::Value {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::{
+        mirror::ThreadMirror,
+        types::{CapabilitySet, OwnerLease},
+    };
+    let key = ThreadKey {
+        host_id: "local".into(),
+        thread_id: "artifacts".into(),
+    };
+    let lease = OwnerLease {
+        key: key.clone(),
+        client_id: "owner".into(),
+        epoch: 1,
+        generation: 1,
+    };
+    let mut entities = serde_json::Map::new();
+    let mut entries = Vec::new();
+    for (entity_key, turn) in turns {
+        entities.insert(entity_key.to_owned(), turn);
+        entries.push(serde_json::json!({"key": entity_key, "value": entity_key}));
+    }
+    let mut mirror = ThreadMirror::new(key);
+    mirror
+        .apply(
+            &lease,
+            &serde_json::json!({
+                "type": "snapshot", "revision": 1,
+                "conversationState": { "cwd": "/project", "turns": [], "requests": [],
+                    "turnHistory": { "kind": "canonical", "history": { "isComplete": true,
+                        "entitiesByKey": serde_json::Value::Object(entities),
+                        "islands": [{ "entries": entries }]
+                    }}
+                }
+            }),
+        )
+        .unwrap();
+    serde_json::to_value(mirror.project(CapabilitySet {
+        send: true,
+        state: true,
+        command: false,
+        permissions: false,
+        blocking_input: false,
+    }))
+    .unwrap()
+}
+
+/// 附件对象字段集合（任务 1 契约）：序列化后应恰好是这 12 个键。
+const ARTIFACT_KEYS: [&str; 12] = [
+    "artifactId",
+    "kind",
+    "source",
+    "path",
+    "url",
+    "fileKey",
+    "ordinal",
+    "imageIndexInTurn",
+    "summary",
+    "sourceStatus",
+    "changeKind",
+    "unavailableReason",
+];
+
+/// 从夹具记录的用户输入 / item 独立反推应产出的来源顺序。夹具是已评审证据，
+/// 期望由它推导，不维护一份与记录位置对齐的硬编码清单（避免错位后静默通过）。
+fn fixture_expected_sources(case: &serde_json::Value) -> Vec<&'static str> {
+    fn push_blocks(blocks: &serde_json::Value, out: &mut Vec<&'static str>) {
+        for block in blocks.as_array().into_iter().flatten() {
+            match block["type"].as_str() {
+                Some("localImage") => out.push("local_image"),
+                Some("mention") => out.push("mention"),
+                Some("image") => out.push("image_url"),
+                _ => {}
+            }
+        }
+    }
+    let turn = &case["turn"];
+    let items = turn["items"].as_array().cloned().unwrap_or_default();
+    let has_formal_user = items.iter().any(|item| {
+        item["type"] == "userMessage"
+            && item["content"].as_array().is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    matches!(
+                        block["type"].as_str(),
+                        Some("text" | "localImage" | "mention" | "image")
+                    )
+                })
+            })
+    });
+    let mut out = Vec::new();
+    for item in &items {
+        match item["type"].as_str() {
+            Some("userMessage") => push_blocks(&item["content"], &mut out),
+            Some("imageGeneration") => out.push("image_generation"),
+            Some("imageView") => out.push("image_view"),
+            Some("fileChange") => out.extend(std::iter::repeat_n(
+                "file_change",
+                item["changes"].as_array().map_or(0, Vec::len),
+            )),
+            _ => {}
+        }
+    }
+    if !has_formal_user {
+        push_blocks(&turn["params"]["input"], &mut out);
+    }
+    out
+}
+
+#[test]
+fn artifacts_extract_all_documented_sources_without_inventing_success() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/codex-desktop-ipc/artifacts/cases.synthetic.json"
+    ))
+    .unwrap();
+    let cases = fixture["cases"].as_array().expect("fixture cases");
+    assert_eq!(
+        cases.len(),
+        6,
+        "Task 1 夹具固定六个回归组合；增删须先评审证据本身"
+    );
+    let expected: Vec<(&str, Vec<&str>)> = cases
+        .iter()
+        .map(|case| {
+            (
+                case["id"].as_str().expect("case id"),
+                fixture_expected_sources(case),
+            )
+        })
+        .collect();
+    // 六类来源都必须被夹具覆盖（image_url 是用户 image.url 的独立分支）。
+    let covered: std::collections::HashSet<&str> = expected
+        .iter()
+        .flat_map(|(_, sources)| sources.iter().copied())
+        .collect();
+    for source in [
+        "image_generation",
+        "local_image",
+        "mention",
+        "file_change",
+        "image_view",
+        "image_url",
+    ] {
+        assert!(covered.contains(source), "夹具未覆盖来源 {source}");
+    }
+    for (id, wanted) in &expected {
+        let case = cases
+            .iter()
+            .find(|case| case["id"] == *id)
+            .expect("fixture case");
+        let p = artifact_projection(case["turn"].clone());
+        let artifacts: Vec<&serde_json::Value> = p["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .flat_map(|message| message["artifacts"].as_array().into_iter().flatten())
+            .collect();
+        let actual: Vec<&str> = artifacts
+            .iter()
+            .map(|artifact| artifact["source"].as_str().expect("source"))
+            .collect();
+        assert_eq!(actual, *wanted, "case {id} 的来源顺序与夹具记录不一致");
+        for artifact in &artifacts {
+            let object = artifact.as_object().expect("artifact object");
+            assert_eq!(
+                object.len(),
+                ARTIFACT_KEYS.len(),
+                "case {id} 附件字段集合应与任务 1 契约一致"
+            );
+            for key in ARTIFACT_KEYS {
+                assert!(object.contains_key(key), "case {id} 缺字段 {key}");
+            }
+            assert!(
+                matches!(
+                    artifact["kind"].as_str(),
+                    Some("image" | "document" | "external_image")
+                ),
+                "case {id} kind 越界: {artifact}"
+            );
+        }
+    }
+    // 夹具未覆盖的组合：同一回合内五类引用 + fileChange 并存；`skill` 必须排除。
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":[
+        {"id":"u", "type":"userMessage", "content":[
+            {"type":"localImage", "path":"upload.png"},
+            {"type":"mention", "name":"notes.md", "path":"notes.md"},
+            {"type":"image", "url":"https://example.invalid/figure.png"},
+            {"type":"image", "fileId":"secret"},
+            {"type":"skill", "path":"ignored/SKILL.md"}]},
+        {"id":"gen", "type":"imageGeneration", "savedPath":"generated.png", "revisedPrompt":"prompt"},
+        {"id":"change", "type":"fileChange", "status":"invented-status", "changes":[
+            {"path":"src/a.ts", "kind":"invented-add"}, {"path":null, "kind":"invented-modify"}]},
+        {"id":"view", "type":"imageView", "path":"viewed.png"}]}));
+    let artifacts: Vec<&serde_json::Value> = p["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .flat_map(|message| message["artifacts"].as_array().into_iter().flatten())
+        .collect();
+    let sources: Vec<&str> = artifacts
+        .iter()
+        .map(|artifact| artifact["source"].as_str().expect("source"))
+        .collect();
+    assert_eq!(
+        sources,
+        [
+            "local_image",
+            "mention",
+            "image_url",
+            "image_url",
+            "image_generation",
+            "file_change",
+            "file_change",
+            "image_view"
+        ],
+        "同一回合混合来源的投影顺序"
+    );
+    assert_eq!(
+        artifacts[2]["url"], "https://example.invalid/figure.png",
+        "HTTP(S) 外链原样保留，不代理下载"
+    );
+    assert_eq!(artifacts[3]["unavailableReason"], "unresolved_file_id");
+    assert!(
+        artifacts[3]["path"].is_null() && artifacts[3]["url"].is_null(),
+        "纯 fileId 不推测本地路径"
+    );
+    // 无完成语义证据的状态/变更类型只保留原标量，fileChange 仍是文件 chip；
+    // 可预览引用不因“完成度未验证”被标成不可用。
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":[
+        {"id":"change", "type":"fileChange", "status":"invented-status", "changes":[
+            {"path":"a.png", "kind":"invented-kind"}]},
+        {"id":"unknown", "type":"newTool", "output":"/secret/guess.png"}
+    ]}));
+    let change = &p["messages"][0]["artifacts"][0];
+    assert_eq!(change["kind"], "document", "fileChange 图片仍是文件 chip");
+    assert_eq!(change["sourceStatus"], "invented-status");
+    assert_eq!(change["changeKind"], "invented-kind");
+    assert_eq!(change["path"], "a.png");
+    assert_eq!(change["fileKey"], "/project/a.png");
+    assert_eq!(change["imageIndexInTurn"], serde_json::Value::Null);
+    assert_eq!(
+        change["unavailableReason"],
+        serde_json::Value::Null,
+        "可预览引用不因完成度未验证而不可用"
+    );
+    assert_eq!(p["messages"][1]["text"], "[unsupported item: newTool]");
+    assert_eq!(p["messages"][1]["artifacts"], serde_json::json!([]));
+    // 原始状态/变更类型同样有界：超限丢弃原文，不截断伪造标量，也不写不可用原因。
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":[
+        {"id":"change", "type":"fileChange", "status":"s".repeat(1025),
+         "changes":[{"path":"a.ts", "kind":"k".repeat(1025)}]}]}));
+    let change = &p["messages"][0]["artifacts"][0];
+    assert_eq!(change["kind"], "document");
+    assert!(
+        change["sourceStatus"].is_null() && change["changeKind"].is_null(),
+        "超限原始标量不截断、不猜测语义"
+    );
+    assert_eq!(change["path"], "a.ts");
+    assert_eq!(change["fileKey"], "/project/a.ts");
+    assert_eq!(
+        change["unavailableReason"],
+        serde_json::Value::Null,
+        "元数据超限不是预览不可用"
+    );
+}
+
+#[test]
+fn artifacts_mention_kind_follows_allowed_image_extensions() {
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":[
+        {"id":"u", "type":"userMessage", "content":[
+            {"type":"mention", "name":"photo.PNG", "path":"photo.PNG"},
+            {"type":"mention", "name":"report.pdf", "path":"report.pdf"},
+            {"type":"mention", "name":"no-path.png"}]}]}));
+    let artifacts = p["messages"][0]["artifacts"].as_array().expect("artifacts");
+    assert_eq!(
+        artifacts[0]["kind"], "image",
+        "图片扩展名（大小写不敏感）→ 图片卡"
+    );
+    assert_eq!(
+        artifacts[0]["summary"], "photo.PNG",
+        "mention 摘要取 name 原文"
+    );
+    assert_eq!(artifacts[0]["imageIndexInTurn"], 1);
+    assert_eq!(artifacts[1]["kind"], "document");
+    assert!(artifacts[1]["imageIndexInTurn"].is_null());
+    assert_eq!(artifacts[1]["fileKey"], "/project/report.pdf");
+    // 缺路径的图片名不产生本地路径 / 图片编号，仍保留不可用引用。
+    assert_eq!(artifacts[2]["kind"], "image");
+    assert_eq!(artifacts[2]["unavailableReason"], "missing_path");
+    assert!(artifacts[2]["path"].is_null() && artifacts[2]["imageIndexInTurn"].is_null());
+    assert_eq!(p["messages"][0]["turnImageCount"], 1);
+}
+
+#[test]
+fn artifacts_attachment_only_formal_replaces_opening_with_same_identity() {
+    let mut turn = serde_json::json!({"turnId":"t", "params":{
+        "clientUserMessageId":"client", "input":[{"type":"localImage", "path":"./a.png"}]}, "items":[]});
+    let before = artifact_projection(turn.clone());
+    let before_messages = before["messages"].as_array().expect("messages");
+    assert_eq!(before_messages.len(), 1, "纯附件开场后备必须可见");
+    assert_eq!(before_messages[0]["role"], "user");
+    assert_eq!(before_messages[0]["text"], "");
+    assert_eq!(before_messages[0]["turnId"], "t", "后备也有稳定回合身份");
+    assert_eq!(before_messages[0]["artifacts"][0]["source"], "local_image");
+    assert_eq!(before_messages[0]["turnImageCount"], 1);
+    turn["items"] = serde_json::json!([{"id":"formal", "clientId":"client", "type":"userMessage",
+        "content":[{"type":"localImage", "path":"./a.png"}]}]);
+    let after = artifact_projection(turn);
+    let after_messages = after["messages"].as_array().expect("messages");
+    assert_eq!(
+        after_messages.len(),
+        1,
+        "正式项替换后备，不得叠成两条用户消息"
+    );
+    assert_eq!(
+        after_messages[0]["id"], before_messages[0]["id"],
+        "同一逻辑消息身份不变"
+    );
+    assert_eq!(
+        after_messages[0]["artifacts"], before_messages[0]["artifacts"],
+        "替换后附件身份与内容不变"
+    );
+    assert_eq!(
+        after_messages[0]["artifacts"][0]["fileKey"],
+        "/project/a.png"
+    );
+    assert_eq!(after_messages[0]["text"], "");
+}
+
+#[test]
+fn artifacts_number_before_tail_window_and_separate_source_ordinals() {
+    let mut items = vec![
+        serde_json::json!({"id":"u", "type":"userMessage", "content":[
+        {"type":"localImage", "path":"upload.png"},
+        {"type":"image", "url":"https://example.invalid/a.png"}]}),
+        serde_json::json!({"id":"f", "type":"fileChange", "changes":[{"path":"f.png"}]}),
+    ];
+    for i in 0..501 {
+        items.push(serde_json::json!({"id":format!("g{i}"), "type":"imageGeneration", "savedPath":format!("g{i}.png")}));
+    }
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":items}));
+    let messages = p["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 500, "尾窗最多 500 条");
+    assert_eq!(messages[0]["id"], "g1", "丢弃更早三条，保留最新 500 条");
+    // 编号在完整 canonical 顺序上统计：g0 被裁掉仍占第 1 个生成图序号 / 第 2 张图。
+    assert_eq!(messages[0]["artifacts"][0]["source"], "image_generation");
+    assert_eq!(
+        messages[0]["artifacts"][0]["artifactId"], "g1/artifact/0",
+        "尾窗裁剪不改变附件身份"
+    );
+    assert_eq!(
+        messages[0]["artifacts"][0]["ordinal"], 2,
+        "来源序号按生成图自身计数"
+    );
+    assert_eq!(
+        messages[0]["artifacts"][0]["imageIndexInTurn"], 3,
+        "回合图片索引与来源序号互不混用"
+    );
+    assert_eq!(messages[0]["turnImageCount"], 502);
+    assert_eq!(messages[499]["artifacts"][0]["imageIndexInTurn"], 502);
+    assert_eq!(p["truncated"], true);
+}
+
+#[test]
+fn artifacts_missing_and_unsupported_references_have_bounded_reasons() {
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":[
+        {"id":"u", "type":"userMessage", "content":[
+            {"type":"localImage", "path":"  "}, {"type":"mention", "name":"missing.pdf"},
+            {"type":"image", "fileId":"secret-id"},
+            {"type":"image"},
+            {"type":"image", "url":format!("data:image/png;base64,{}", "A".repeat(2_000_000))},
+            {"type":"image", "url":"file:///secret.png"},
+            {"type":"image", "url":"https://example.invalid/a.png"},
+            {"type":"image", "url":format!("https://example.invalid/{}", "a".repeat(16 * 1024))},
+            {"type":"skill", "path":"not-a-mention.md"}]}]}));
+    let message = &p["messages"][0];
+    let a = message["artifacts"].as_array().expect("artifacts");
+    assert_eq!(a.len(), 8, "skill 不因与 mention 共用字段而扩张为附件");
+    for (i, reason) in [
+        (0, "missing_path"),
+        (1, "missing_path"),
+        (2, "unresolved_file_id"),
+        (3, "missing_url"),
+        (4, "data_url"),
+        (5, "unsupported_url_scheme"),
+        (7, "url_too_long"),
+    ] {
+        assert_eq!(a[i]["unavailableReason"], reason, "artifact {i}");
+        assert!(a[i]["path"].is_null() && a[i]["url"].is_null() && a[i]["fileKey"].is_null());
+        assert!(
+            a[i]["imageIndexInTurn"].is_null(),
+            "不可用图片不占回合图片索引"
+        );
+    }
+    assert_eq!(a[6]["kind"], "external_image");
+    assert_eq!(a[6]["url"], "https://example.invalid/a.png");
+    assert_eq!(a[6]["unavailableReason"], serde_json::Value::Null);
+    assert!(a[6]["imageIndexInTurn"].is_null(), "外链不占图片卡限额");
+    assert_eq!(message["turnImageCount"], 0, "不可用引用不算图片卡");
+    // data URL 原文（2 MB 的 A）与超长 URL 不进入 DTO；纯 fileId 也不复制。
+    let serialized = serde_json::to_string(&p).unwrap();
+    assert!(serialized.len() < 10_000, "投影体积与输入 base64/URL 无关");
+    assert!(!serialized.contains("data:image/png;base64"));
+    assert!(!serialized.contains("secret-id"));
+}
+
+#[test]
+fn artifacts_bound_fields_counts_and_preserve_full_turn_image_count() {
+    let mut content = vec![
+        serde_json::json!({"type":"mention", "name":"图".repeat(1100), "path":"ok.md"}),
+        serde_json::json!({"type":"localImage", "path":"x".repeat(16 * 1024 + 1)}),
+        serde_json::json!({"type":"localImage", "path":"p".repeat(16 * 1024)}),
+    ];
+    for i in 0..130 {
+        content.push(serde_json::json!({"type":"localImage", "path":format!("{i}.png")}));
+    }
+    let p = artifact_projection(
+        serde_json::json!({"turnId":"t", "items":[{"id":"u", "type":"userMessage", "content":content}]}),
+    );
+    let m = &p["messages"][0];
+    assert_eq!(
+        m["artifacts"].as_array().unwrap().len(),
+        128,
+        "每消息最多 128 个附件"
+    );
+    assert_eq!(m["omittedArtifactCount"], 5, "溢出只计数，不复制字段");
+    assert_eq!(
+        m["turnImageCount"], 131,
+        "总数按完整回合的可展示图片统计（不含超长路径那条）"
+    );
+    assert_eq!(
+        m["artifacts"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        1024,
+        "摘要按 Unicode 字符截到 1024"
+    );
+    assert_eq!(
+        m["artifacts"][0]["unavailableReason"],
+        serde_json::Value::Null,
+        "摘要截断不是预览不可用，路径/身份键可用的引用保持可渲染"
+    );
+    assert_eq!(m["artifacts"][0]["path"], "ok.md");
+    assert_eq!(m["artifacts"][0]["fileKey"], "/project/ok.md");
+    assert_eq!(m["artifacts"][1]["unavailableReason"], "path_too_long");
+    assert!(m["artifacts"][1]["path"].is_null());
+    assert!(
+        m["artifacts"][1]["imageIndexInTurn"].is_null(),
+        "路径不可用的图片不占回合图片索引"
+    );
+    assert_eq!(m["artifacts"][2]["unavailableReason"], "file_key_too_long");
+    assert!(m["artifacts"][2]["fileKey"].is_null());
+    assert_eq!(
+        m["artifacts"][2]["imageIndexInTurn"], 1,
+        "路径可用但身份键超限仍可作为图片卡显示"
+    );
+    assert_eq!(m["artifacts"][127]["imageIndexInTurn"], 126);
+    assert_eq!(
+        p["truncated"], false,
+        "128 条/消息是服务端附件预算，不能冒充尾窗截断"
+    );
+}
+
+#[test]
+fn artifacts_serialized_budget_counts_escaping_and_latest_metadata() {
+    // 引号在 JSON 里转义为 2 字节：按 text.len() 累计会低估一半，尾窗按实际
+    // 序列化字节计。
+    let items: Vec<_> = (0..4).map(|i| serde_json::json!({"type":"agentMessage", "id":format!("a{i}"), "text":"\"".repeat(200_000)})).collect();
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":items}));
+    let messages = p["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 2, "4×400 KB（转义后）只容得下最新 2 条");
+    assert_eq!(messages[1]["id"], "a3");
+    assert!(serde_json::to_vec(messages).unwrap().len() <= 1024 * 1024);
+    assert_eq!(p["truncated"], true, "丢弃更早消息必须显式标记");
+    // 最新条 128 个超大路径附件自身 > 1 MiB：保底保留最新条，超限附件按服务端
+    // 预算省略并计数；较早消息因预算被丢弃。不能把省略说成 UI 的 12 图限额。
+    let content: Vec<_> = (0..128).map(|_| serde_json::json!({"type":"localImage", "path":format!("/{}.png", "x".repeat(12_000))})).collect();
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":[
+        {"id":"old", "type":"agentMessage", "text":"o".repeat(100_000)},
+        {"id":"latest", "type":"userMessage", "content":content}]}));
+    let messages = p["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1, "较早条被字节预算丢弃，最新条保底保留");
+    assert_eq!(messages[0]["id"], "latest");
+    assert!(
+        messages[0]["omittedArtifactCount"].as_u64().unwrap() > 0,
+        "被预算裁掉的附件必须计数"
+    );
+    assert_eq!(p["truncated"], true);
+    assert!(
+        serde_json::to_vec(messages).unwrap().len() <= 1024 * 1024,
+        "按实际序列化字节守 1 MiB 预算"
+    );
+}
+
+#[test]
+fn artifacts_long_summary_keeps_image_cards_renderable() {
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":[
+        {"id":"u", "type":"userMessage", "content":[
+            {"type":"text", "text":"长".repeat(1100)},
+            {"type":"localImage", "path":"upload.png"}]},
+        {"id":"gen", "type":"imageGeneration", "savedPath":"generated.png",
+         "revisedPrompt":"p".repeat(1100), "status":"synthetic-complete"}]}));
+    let messages = p["messages"].as_array().expect("messages");
+    let artifacts: Vec<&serde_json::Value> = messages
+        .iter()
+        .flat_map(|message| message["artifacts"].as_array().into_iter().flatten())
+        .collect();
+    assert_eq!(artifacts.len(), 2);
+    for artifact in &artifacts {
+        assert_eq!(
+            artifact["summary"].as_str().unwrap().chars().count(),
+            1024,
+            "摘要按 Unicode 字符有界"
+        );
+        assert_eq!(
+            artifact["unavailableReason"],
+            serde_json::Value::Null,
+            "摘要/状态有界截断不得把可预览引用标成不可用"
+        );
+        assert!(
+            artifact["path"].as_str().is_some() && artifact["fileKey"].as_str().is_some(),
+            "可预览引用必须保留路径与身份键"
+        );
+    }
+    assert_eq!(artifacts[0]["kind"], "image");
+    assert_eq!(artifacts[0]["path"], "upload.png");
+    assert_eq!(artifacts[0]["fileKey"], "/project/upload.png");
+    assert_eq!(artifacts[0]["imageIndexInTurn"], 1);
+    assert_eq!(artifacts[1]["path"], "generated.png");
+    assert_eq!(artifacts[1]["fileKey"], "/project/generated.png");
+    assert_eq!(artifacts[1]["sourceStatus"], "synthetic-complete");
+    assert_eq!(artifacts[1]["imageIndexInTurn"], 2);
+}
+
+#[test]
+fn artifacts_opening_fallback_survives_empty_formal_user_content() {
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "params":{
+        "clientUserMessageId":"client",
+        "input":[{"type":"text", "text":"开场正文"}]},
+        "items":[{"id":"formal", "type":"userMessage", "content":[]}]}));
+    let messages = p["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1, "空 content 的正式项不得压掉开场后备");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["text"], "开场正文");
+    assert_eq!(messages[0]["id"], "t/opening/client");
+}
+
+#[test]
+fn artifacts_opening_fallback_survives_skill_only_formal_user_content() {
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "params":{
+        "clientUserMessageId":"client",
+        "input":[{"type":"text", "text":"开场正文"}]},
+        "items":[{"id":"formal", "clientId":"client", "type":"userMessage",
+                  "content":[{"type":"skill", "name":"x", "path":"SKILL.md"}]}]}));
+    let messages = p["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1, "skill-only 正式项不得压掉开场后备");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["text"], "开场正文");
+    assert_eq!(messages[0]["id"], "t/opening/client");
+}
+
+#[test]
+fn artifacts_popping_newest_artifacts_does_not_mark_window_truncated() {
+    let content: Vec<_> = (0..128)
+        .map(|_| {
+            serde_json::json!({"type":"localImage", "path":format!("/{}.png", "x".repeat(12_000))})
+        })
+        .collect();
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":[
+        {"id":"latest", "type":"userMessage", "content":content}]}));
+    let messages = p["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1);
+    let artifacts = messages[0]["artifacts"].as_array().expect("artifacts");
+    assert!(artifacts.len() < 128, "单条超预算时必须裁掉附件元数据");
+    assert!(
+        messages[0]["omittedArtifactCount"].as_u64().unwrap() > 0,
+        "被裁附件必须计数"
+    );
+    assert_eq!(
+        p["truncated"], false,
+        "只省略消息内附件不是消息窗口截断，横幅不得误报"
+    );
+}
+
+#[test]
+fn artifacts_turn_numbering_and_omitted_counts_are_isolated_per_turn() {
+    let p = artifact_projection_turns(vec![
+        (
+            "turnA",
+            serde_json::json!({"turnId":"turnA", "items":[
+                {"id":"ua", "type":"userMessage", "content":[
+                    {"type":"localImage", "path":"a1.png"},
+                    {"type":"localImage", "path":"a2.png"}]},
+                {"id":"fa", "type":"fileChange", "changes":[
+                    {"path":"a.ts"}, {"path":"b.ts"}]}]}),
+        ),
+        (
+            "turnB",
+            serde_json::json!({"turnId":"turnB", "items":[
+                {"id":"ub", "type":"userMessage", "content":[
+                    {"type":"localImage", "path":"b1.png"}]},
+                {"id":"fb", "type":"fileChange", "changes":[{"path":"c.ts"}]}]}),
+        ),
+    ]);
+    let messages = p["messages"].as_array().expect("messages");
+    let turn_artifacts = |turn_id: &str| -> Vec<&serde_json::Value> {
+        messages
+            .iter()
+            .filter(|message| message["turnId"] == turn_id)
+            .flat_map(|message| message["artifacts"].as_array().into_iter().flatten())
+            .collect()
+    };
+    let a = turn_artifacts("turnA");
+    let b = turn_artifacts("turnB");
+    assert_eq!(a.len(), 4);
+    assert_eq!(b.len(), 2);
+    // 每个回合的来源序号从 1 独立开始，不跨回合串号。
+    assert_eq!(a[0]["ordinal"], 1);
+    assert_eq!(a[1]["ordinal"], 2);
+    assert_eq!(a[2]["ordinal"], 1);
+    assert_eq!(a[3]["ordinal"], 2);
+    assert_eq!(b[0]["ordinal"], 1);
+    assert_eq!(b[1]["ordinal"], 1);
+    // 图片索引与总数按回合各自统计。
+    assert_eq!(a[0]["imageIndexInTurn"], 1);
+    assert_eq!(a[1]["imageIndexInTurn"], 2);
+    assert_eq!(b[0]["imageIndexInTurn"], 1);
+    for (turn_id, expected_images) in [("turnA", 2), ("turnB", 1)] {
+        for message in messages.iter().filter(|m| m["turnId"] == turn_id) {
+            assert_eq!(message["turnImageCount"], expected_images, "{turn_id}");
+            assert_eq!(message["omittedArtifactCount"], 0, "{turn_id}");
+        }
+    }
+}
+
+#[test]
+fn artifacts_serialized_window_counts_commas_for_retained_non_newest_message() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::types::ProjectedMessage;
+    // 先量出 agentMessage 的固定序列化开销（id "old" 与 "new" 等长，文本为 ASCII
+    // 单字节、无转义），再把非最新条长度精确放到“含逗号刚好等于 1 MiB”的边界。
+    let base = serde_json::to_vec(&ProjectedMessage {
+        id: "old".into(),
+        role: "assistant".into(),
+        kind: "agentMessage".into(),
+        text: String::new(),
+        ts: None,
+        turn_id: Some("t".into()),
+        artifacts: Vec::new(),
+        turn_image_count: 0,
+        omitted_artifact_count: 0,
+    })
+    .unwrap()
+    .len();
+    let newest_text = 1_000;
+    let newest_bytes = base + newest_text;
+    // 2（数组括号）+ 最新条 + 1（逗号）+ 非最新条 == 1 MiB。
+    let older_text = 1024 * 1024 - 2 - newest_bytes - 1 - base;
+
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":[
+        {"id":"old", "type":"agentMessage", "text":"y".repeat(older_text)},
+        {"id":"new", "type":"agentMessage", "text":"z".repeat(newest_text)}]}));
+    let messages = p["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 2, "含逗号刚好落在预算内的非最新条必须保留");
+    assert_eq!(messages[0]["id"], "old");
+    assert_eq!(messages[1]["id"], "new");
+    let byte_len = serde_json::to_vec(messages).unwrap().len();
+    assert_eq!(
+        byte_len,
+        1024 * 1024,
+        "尾窗按含数组逗号的真实序列化字节精确计数"
+    );
+    assert_eq!(p["truncated"], false);
+
+    // 非最新条再多 1 字节：含逗号后越过预算，必须丢弃它并标 truncated。
+    let p = artifact_projection(serde_json::json!({"turnId":"t", "items":[
+        {"id":"old", "type":"agentMessage", "text":"y".repeat(older_text + 1)},
+        {"id":"new", "type":"agentMessage", "text":"z".repeat(newest_text)}]}));
+    let messages = p["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1, "逗号参与预算后，超 1 字节即丢旧条");
+    assert_eq!(messages[0]["id"], "new");
+    assert_eq!(p["truncated"], true);
+}
+
+#[test]
+fn artifacts_old_message_payload_defaults_new_fields() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::types::ProjectedMessage;
+    let m: ProjectedMessage = serde_json::from_value(serde_json::json!({"id":"old", "role":"user", "kind":"userMessage", "text":"old text", "ts":null})).unwrap();
+    let m = serde_json::to_value(m).unwrap();
+    assert_eq!(m["artifacts"], serde_json::json!([]));
+    assert_eq!(m["turnId"], serde_json::Value::Null);
+    assert_eq!(m["turnImageCount"], 0);
+    assert_eq!(m["omittedArtifactCount"], 0);
+}
+
+// ============================================================
+// 任务 4：同代只读消息分页（ThreadMirror::messages_page）
+//
+// 夹具全部合成，只证明分页契约（游标/代际/预算/状态），不冒充 Desktop 实机字段证据。
+// ============================================================
+
+mod messages_page {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::{
+        mirror::{
+            MirrorLedger, ThreadMirror, MESSAGES_PAGE_BYTES, MESSAGES_PAGE_LIMIT,
+            PROJECTION_TAIL_BYTES,
+        },
+        types::{
+            CapabilitySet, MessagesPage, MessagesPageStatus, OwnerLease, ProjectedMessage,
+            ThreadKey, ThreadProjection,
+        },
+    };
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    fn key() -> ThreadKey {
+        ThreadKey {
+            host_id: "local".into(),
+            thread_id: "page-thread".into(),
+        }
+    }
+
+    fn lease(epoch: u64, generation: u64) -> OwnerLease {
+        OwnerLease {
+            key: key(),
+            client_id: "owner-1".into(),
+            epoch,
+            generation,
+        }
+    }
+
+    fn caps() -> CapabilitySet {
+        CapabilitySet {
+            send: true,
+            state: true,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+        }
+    }
+
+    fn snapshot(rev: u64, state: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "snapshot", "revision": rev, "conversationState": state
+        })
+    }
+
+    fn state_of_items(items: serde_json::Value) -> serde_json::Value {
+        state_of_items_with_status(items, "completed")
+    }
+
+    /// 单 Turn 夹具，可指定该 Turn 的状态（活动 Turn 用 `inProgress`）。
+    fn state_of_items_with_status(items: serde_json::Value, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "turns": [], "requests": [],
+            "threadRuntimeStatus": { "type": "idle" },
+            "turnHistory": { "kind": "canonical", "history": {
+                "isComplete": true,
+                "entitiesByKey": {
+                    "turn:t1": { "turnId": "t1", "status": status, "items": items }
+                },
+                "islands": [{ "entries": [{ "key": "turn:t1", "value": "turn:t1" }] }]
+            }}
+        })
+    }
+
+    fn state_with_ids(ids: &[&str]) -> serde_json::Value {
+        state_with_ids_status(ids, "completed")
+    }
+
+    /// 单 Turn 夹具（可指定状态）：活动 Turn 用 `inProgress`。
+    fn state_with_ids_status(ids: &[&str], status: &str) -> serde_json::Value {
+        let items: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| serde_json::json!({ "type": "agentMessage", "id": id, "text": format!("text-{id}") }))
+            .collect();
+        state_of_items_with_status(serde_json::json!(items), status)
+    }
+
+    fn mirror_with_ids_status(ids: &[&str], status: &str) -> ThreadMirror {
+        let mut m = ThreadMirror::new(key());
+        m.apply(
+            &lease(1, 1),
+            &snapshot(1, state_with_ids_status(ids, status)),
+        )
+        .expect("snapshot");
+        m
+    }
+
+    fn mirror_with_ids(ids: &[&str]) -> ThreadMirror {
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(1, 1), &snapshot(1, state_with_ids(ids)))
+            .expect("snapshot");
+        m
+    }
+
+    fn message_ids(messages: &[ProjectedMessage]) -> Vec<String> {
+        messages.iter().map(|m| m.id.clone()).collect()
+    }
+
+    fn page(mirror: &ThreadMirror, cursor: Option<&str>, token: &str) -> MessagesPage {
+        mirror.messages_page(cursor, token, MESSAGES_PAGE_LIMIT)
+    }
+
+    fn projection(mirror: &ThreadMirror) -> ThreadProjection {
+        mirror.project(caps())
+    }
+
+    /// 多 Turn 夹具：一个 island 里按 t1..tN 顺序引用实体（canonical 旧 → 新）。
+    fn state_of_turns(turns: &[(String, Vec<serde_json::Value>)]) -> serde_json::Value {
+        let mut entities = serde_json::Map::new();
+        let mut entries = Vec::new();
+        for (turn_id, items) in turns {
+            let key = format!("turn:{turn_id}");
+            entities.insert(
+                key.clone(),
+                serde_json::json!({ "turnId": turn_id, "status": "completed", "items": items }),
+            );
+            entries.push(serde_json::json!({ "key": key, "value": key }));
+        }
+        serde_json::json!({
+            "turns": [], "requests": [],
+            "threadRuntimeStatus": { "type": "idle" },
+            "turnHistory": { "kind": "canonical", "history": {
+                "isComplete": true,
+                "entitiesByKey": entities,
+                "islands": [{ "entries": entries }]
+            }}
+        })
+    }
+
+    fn turn(id: &str, items: Vec<serde_json::Value>) -> (String, Vec<serde_json::Value>) {
+        (id.to_string(), items)
+    }
+
+    /// 多 Turn 夹具：把**最后一个** Turn 标成 `inProgress`——活动 Turn 的真实形态
+    /// （流式补全只发生在活动 Turn 的末条消息上）。
+    fn state_of_turns_last_active(turns: &[(String, Vec<serde_json::Value>)]) -> serde_json::Value {
+        let mut state = state_of_turns(turns);
+        let key = format!("turn:{}", turns.last().expect("至少一个 Turn").0);
+        state["turnHistory"]["history"]["entitiesByKey"][key.as_str()]["status"] =
+            serde_json::json!("inProgress");
+        state
+    }
+
+    /// 覆盖若干 Turn 的状态（`None` = 删掉 status 字段，模拟未知/旧载荷）。
+    fn override_turn_status(state: &mut serde_json::Value, overrides: &[(&str, Option<&str>)]) {
+        for (turn_id, status) in overrides {
+            let key = format!("turn:{turn_id}");
+            let entity = state["turnHistory"]["history"]["entitiesByKey"]
+                .get_mut(key.as_str())
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap_or_else(|| panic!("夹具缺少 Turn {turn_id}"));
+            match status {
+                Some(value) => {
+                    entity.insert("status".to_string(), serde_json::json!(value));
+                }
+                None => {
+                    entity.remove("status");
+                }
+            }
+        }
+    }
+
+    fn agent(id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "agentMessage", "id": id, "text": text })
+    }
+
+    fn user(id: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "userMessage", "id": id,
+            "content": [{ "type": "text", "text": text }]
+        })
+    }
+
+    fn mirror_of(state: serde_json::Value) -> ThreadMirror {
+        let mut mirror = ThreadMirror::new(key());
+        mirror
+            .apply(&lease(1, 1), &snapshot(1, state))
+            .expect("snapshot");
+        mirror
+    }
+
+    fn patch(
+        mirror: &mut ThreadMirror,
+        base_revision: u64,
+        revision: u64,
+        patches: serde_json::Value,
+    ) {
+        mirror
+            .apply(
+                &lease(1, 1),
+                &serde_json::json!({
+                    "type": "patches",
+                    "baseRevision": base_revision,
+                    "revision": revision,
+                    "patches": patches
+                }),
+            )
+            .expect("patch");
+    }
+
+    /// 600 条 / 60 个 Turn（每 Turn 10 条）：尾窗 500 条饱和，dropped = 100。
+    fn turns_000_to_599() -> Vec<(String, Vec<serde_json::Value>)> {
+        (0..60)
+            .map(|turn_index| {
+                let items: Vec<serde_json::Value> = (0..10)
+                    .map(|offset| {
+                        let index = turn_index * 10 + offset;
+                        agent(&format!("m{index:03}"), &format!("text-m{index:03}"))
+                    })
+                    .collect();
+                (format!("t{}", turn_index + 1), items)
+            })
+            .collect()
+    }
+
+    /// 页边界：不含游标自身、canonical 顺序、连续翻页不重复不跳过；空历史与真正
+    /// 到头返回 end。
+    #[test]
+    fn page_boundaries_are_contiguous_and_exclude_cursor() {
+        let ids: Vec<String> = (0..600).map(|i| format!("m{i:03}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mirror = mirror_with_ids(&refs);
+        let p1 = projection(&mirror);
+        assert_eq!(p1.messages.len(), 500, "尾窗最多 500 条");
+        assert_eq!(p1.messages[0].id, "m100");
+        assert!(p1.truncated);
+        assert!(!p1.history_token.is_empty(), "投影必须带历史代际 token");
+
+        let cursor = p1.messages[0].id.clone();
+        let first = page(&mirror, Some(cursor.as_str()), &p1.history_token);
+        assert_eq!(first.status, MessagesPageStatus::Ready);
+        assert_eq!(first.revision, Some(1));
+        assert_eq!(first.reason_code, None);
+        assert_eq!(
+            message_ids(&first.messages),
+            (50..100).map(|i| format!("m{i:03}")).collect::<Vec<_>>()
+        );
+        assert!(
+            first.messages.iter().all(|m| m.id != cursor),
+            "页不含游标自身"
+        );
+        assert_eq!(
+            first.next_before.as_deref(),
+            Some("m050"),
+            "nextBefore 是页内最早条"
+        );
+        assert!(
+            first.messages.windows(2).all(|w| w[0].id < w[1].id),
+            "canonical 顺序（旧 → 新）"
+        );
+
+        // 连续翻页：直到 end；各页倒序拼接后必须与完整 canonical 历史逐条一致。
+        let mut pages = vec![message_ids(&p1.messages), message_ids(&first.messages)];
+        let (mut cursor, mut token) = (
+            first.next_before.clone().expect("nextBefore"),
+            first.history_token.clone(),
+        );
+        let mut ended = false;
+        for _ in 0..16 {
+            let next = page(&mirror, Some(cursor.as_str()), &token);
+            if next.status == MessagesPageStatus::End {
+                assert!(next.messages.is_empty(), "end 不带消息");
+                assert_eq!(next.next_before, None);
+                ended = true;
+                break;
+            }
+            assert_eq!(next.status, MessagesPageStatus::Ready);
+            assert!(!next.messages.is_empty());
+            assert!(next.messages.iter().all(|m| m.id != cursor));
+            assert_eq!(
+                next.next_before.as_deref(),
+                Some(next.messages[0].id.as_str())
+            );
+            pages.push(message_ids(&next.messages));
+            cursor = next.next_before.clone().expect("nextBefore");
+            token = next.history_token.clone();
+        }
+        assert!(ended, "600 条 / 每页 50 必然走到 end");
+        let mut flattened = Vec::new();
+        for page_ids in pages.iter().rev() {
+            flattened.extend(page_ids.iter().cloned());
+        }
+        assert_eq!(
+            flattened, ids,
+            "连续翻页不重复、不跳过，覆盖完整 canonical 历史"
+        );
+    }
+
+    /// 超 1 MiB 的单条：不得丢弃、不得伪装成完整页；截头 + 显式标记，且后续仍可翻页。
+    #[test]
+    fn page_single_oversized_message_is_trimmed_and_still_pages() {
+        let original_chars = PROJECTION_TAIL_BYTES / 3 + 1000; // 3 B/char → > 1 MiB
+        let big = "汉".repeat(original_chars);
+        let state = state_of_items(serde_json::json!([
+            { "type": "agentMessage", "id": "m0", "text": "small" },
+            { "type": "agentMessage", "id": "big1", "text": big },
+            { "type": "agentMessage", "id": "m2", "text": "after" },
+            { "type": "agentMessage", "id": "m3", "text": "newest" }
+        ]));
+        let mut mirror = ThreadMirror::new(key());
+        mirror.apply(&lease(1, 1), &snapshot(1, state)).unwrap();
+        let p = projection(&mirror);
+        // 尾窗只留得下最新两条（big1 自身超 1 MiB 被尾窗丢弃）——分页必须能取回它。
+        assert_eq!(message_ids(&p.messages), ["m2", "m3"]);
+
+        let first = page(&mirror, Some("m2"), &p.history_token);
+        assert_eq!(first.status, MessagesPageStatus::Ready);
+        assert_eq!(
+            message_ids(&first.messages),
+            ["big1"],
+            "超大单条不得静默丢弃，也不得把旧条混进来冒充"
+        );
+        assert_eq!(
+            first.reason_code.as_deref(),
+            Some("page_truncated"),
+            "内容被裁剪必须显式上报（不能假装完整）"
+        );
+        let text = &first.messages[0].text;
+        assert!(
+            text.starts_with("DISPLAY_TRUNCATED: "),
+            "沿用展示截断标记: {text}"
+        );
+        assert!(text.ends_with(&format!("…已截断，原文共 {original_chars} 字符")));
+        assert!(text.len() < big.len());
+        assert!(
+            serde_json::to_vec(&first.messages).unwrap().len() <= MESSAGES_PAGE_BYTES,
+            "页 messages 序列化体积必须 ≤ 1 MiB"
+        );
+        assert_eq!(first.next_before.as_deref(), Some("big1"));
+
+        // 仍能继续往前翻（省略只影响该条正文，不切断游标链）。
+        let second = page(&mirror, Some("big1"), &first.history_token);
+        assert_eq!(second.status, MessagesPageStatus::Ready);
+        assert_eq!(message_ids(&second.messages), ["m0"]);
+        assert_eq!(second.reason_code, None);
+        let third = page(&mirror, Some("m0"), &second.history_token);
+        assert_eq!(third.status, MessagesPageStatus::End);
+    }
+
+    /// 缺游标 / 游标不存在 / 部分历史 / 坏 token / 无镜像 / 镜像预算拒绝：都不是 end。
+    #[test]
+    fn page_statuses_cover_missing_cursor_partial_history_and_bad_token() {
+        // 空历史（真实 0 条）+ 合法 token → end
+        let empty = mirror_with_ids(&[]);
+        let empty_token = projection(&empty).history_token;
+        let end = page(&empty, None, &empty_token);
+        assert_eq!(end.status, MessagesPageStatus::End);
+        assert!(end.messages.is_empty());
+        assert_eq!(end.next_before, None);
+
+        // 非空历史 + 缺游标 → cursor_invalid/cursor_required（不猜最新页）
+        let m = mirror_with_ids(&["m0", "m1"]);
+        let token = projection(&m).history_token;
+        let missing = page(&m, None, &token);
+        assert_eq!(missing.status, MessagesPageStatus::CursorInvalid);
+        assert_eq!(missing.reason_code.as_deref(), Some("cursor_required"));
+        assert!(missing.messages.is_empty(), "非正常状态不能当完整空页");
+
+        // 游标不存在 → cursor_not_found（不能解释为 end）
+        let unknown = page(&m, Some("does-not-exist"), &token);
+        assert_eq!(unknown.status, MessagesPageStatus::CursorInvalid);
+        assert_eq!(unknown.reason_code.as_deref(), Some("cursor_not_found"));
+
+        // 畸形 token → invalid_history_token
+        let malformed = page(&m, Some("m1"), "not-a-token");
+        assert_eq!(malformed.status, MessagesPageStatus::CursorInvalid);
+        assert_eq!(
+            malformed.reason_code.as_deref(),
+            Some("invalid_history_token")
+        );
+
+        // 部分历史（turn 列表不完整）→ loading/history_incomplete，先不返回半页
+        let mut partial_state = state_with_ids(&["m0", "m1"]);
+        partial_state["turnHistory"]["history"]["isComplete"] = serde_json::json!(false);
+        let mut partial = ThreadMirror::new(key());
+        partial
+            .apply(&lease(1, 1), &snapshot(1, partial_state))
+            .unwrap();
+        let loading = page(&partial, Some("m1"), &projection(&partial).history_token);
+        assert_eq!(loading.status, MessagesPageStatus::Loading);
+        assert_eq!(loading.reason_code.as_deref(), Some("history_incomplete"));
+        assert!(loading.messages.is_empty());
+        assert_eq!(loading.next_before, None);
+
+        // 列表完整但 items 分页未载完 → 同样 loading（不拿残缺 items 当到头）
+        let mut items_state = state_with_ids(&["m0", "m1"]);
+        items_state["turnHistory"]["history"]["entitiesByKey"]["turn:t1"]["itemsPagination"] =
+            serde_json::json!({ "hasLoadedOldest": false });
+        let mut items = ThreadMirror::new(key());
+        items
+            .apply(&lease(1, 1), &snapshot(1, items_state))
+            .unwrap();
+        let loading = page(&items, Some("m1"), &projection(&items).history_token);
+        assert_eq!(loading.status, MessagesPageStatus::Loading);
+        assert_eq!(loading.reason_code.as_deref(), Some("history_incomplete"));
+
+        // 无镜像（未跟随/已清态）→ unavailable/mirror_unavailable
+        let bare = ThreadMirror::new(key());
+        let unavailable = page(&bare, Some("m1"), "v1-x");
+        assert_eq!(unavailable.status, MessagesPageStatus::Unavailable);
+        assert_eq!(
+            unavailable.reason_code.as_deref(),
+            Some("mirror_unavailable")
+        );
+        assert_eq!(unavailable.revision, None);
+
+        // 镜像字节预算拒绝 → unavailable/mirror_capacity，不得伪装成 end
+        let mut budgeted =
+            ThreadMirror::with_ledger(key(), Arc::new(StdMutex::new(MirrorLedger::with_cap(0))));
+        assert!(budgeted
+            .apply(&lease(1, 1), &snapshot(1, state_with_ids(&["m0"])))
+            .is_err());
+        let refused = page(&budgeted, None, "v1-x");
+        assert_eq!(refused.status, MessagesPageStatus::Unavailable);
+        assert_eq!(refused.reason_code.as_deref(), Some("mirror_capacity"));
+    }
+
+    /// token 隔离 owner/镜像重建与历史改写；普通尾部追加与流式补全不得使历史页失效。
+    #[test]
+    fn page_token_isolates_generations_and_rewrites_but_not_appends() {
+        let ids: Vec<String> = (0..600).map(|i| format!("m{i:03}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut mirror = mirror_with_ids_status(&refs, "inProgress");
+        let p = projection(&mirror);
+        let cursor = p.messages[0].id.clone();
+        let token = p.history_token.clone();
+        let baseline = page(&mirror, Some(cursor.as_str()), &token);
+        assert_eq!(baseline.status, MessagesPageStatus::Ready);
+
+        // 1) 普通尾部追加（patch add 一条 agentMessage）→ 前缀 id 序不变 → 页仍有效
+        let append = serde_json::json!({
+            "type": "patches", "baseRevision": 1, "revision": 2, "patches": [
+                { "op": "add", "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "items", 600],
+                  "value": { "type": "agentMessage", "id": "m600", "text": "tail" } }
+            ]
+        });
+        mirror.apply(&lease(1, 1), &append).unwrap();
+        let after_append = page(&mirror, Some(cursor.as_str()), &token);
+        assert_eq!(
+            after_append.status,
+            MessagesPageStatus::Ready,
+            "尾部追加不得使历史页无故失效"
+        );
+        assert_eq!(
+            message_ids(&after_append.messages),
+            message_ids(&baseline.messages)
+        );
+
+        // 2) 活动消息流式补全（同 id 文本原位变长，且必须是**当前末条** m600——
+        //    活动豁免只覆盖末条；改写倒数第二条属于历史改写，必须失效）→ 页仍有效
+        let stream = serde_json::json!({
+            "type": "patches", "baseRevision": 2, "revision": 3, "patches": [
+                { "op": "replace", "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "items", 600, "text"],
+                  "value": "streaming completion".repeat(1000) }
+            ]
+        });
+        mirror.apply(&lease(1, 1), &stream).unwrap();
+        let after_stream = page(&mirror, Some(cursor.as_str()), &token);
+        assert_eq!(
+            after_stream.status,
+            MessagesPageStatus::Ready,
+            "活动消息流式补全不得使历史页无故失效"
+        );
+        assert_eq!(
+            message_ids(&after_stream.messages),
+            message_ids(&baseline.messages)
+        );
+
+        // 3) 已分页区域被改写（m050 换成新身份）→ 绑定该前缀的页 token 不能继续用。
+        //    投影 token 是「首屏锚点」（v2 root），不绑 dropped 前缀；先取一页更近的
+        //    历史，拿到绑定「m100 之前前缀」的页 token，再用它续翻。
+        let seed = page(&mirror, Some("m150"), &token);
+        assert_eq!(seed.status, MessagesPageStatus::Ready);
+        assert_eq!(seed.next_before.as_deref(), Some("m100"));
+        let prefix_token = seed.history_token.clone();
+        let rewrite = serde_json::json!({
+            "type": "patches", "baseRevision": 3, "revision": 4, "patches": [
+                { "op": "replace", "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "items", 50, "id"],
+                  "value": "m050-rewritten" }
+            ]
+        });
+        mirror.apply(&lease(1, 1), &rewrite).unwrap();
+        let stale = page(&mirror, Some(cursor.as_str()), &prefix_token);
+        assert_eq!(stale.status, MessagesPageStatus::CursorInvalid);
+        assert_eq!(stale.reason_code.as_deref(), Some("history_rewritten"));
+        assert!(stale.messages.is_empty());
+
+        // 4) owner 换代（epoch 2）→ 旧 token 的 generation 不再可用；新投影 token 可用
+        let fresh_state = state_with_ids(&refs);
+        mirror
+            .apply(&lease(2, 1), &snapshot(5, fresh_state))
+            .unwrap();
+        let old = page(&mirror, Some(cursor.as_str()), &token);
+        assert_eq!(old.status, MessagesPageStatus::Unavailable);
+        assert_eq!(old.reason_code.as_deref(), Some("generation_mismatch"));
+        let fresh = projection(&mirror);
+        let fresh_page = page(
+            &mirror,
+            Some(fresh.messages[0].id.as_str()),
+            &fresh.history_token,
+        );
+        assert_eq!(fresh_page.status, MessagesPageStatus::Ready);
+
+        // 5) 镜像重建（同 lease 再次快照）→ 旧 token 同样失效
+        let rebuilt = state_with_ids(&refs);
+        mirror.apply(&lease(2, 1), &snapshot(6, rebuilt)).unwrap();
+        let stale = page(
+            &mirror,
+            Some(fresh.messages[0].id.as_str()),
+            &fresh.history_token,
+        );
+        assert_eq!(stale.status, MessagesPageStatus::Unavailable);
+        assert_eq!(stale.reason_code.as_deref(), Some("generation_mismatch"));
+    }
+
+    // ---- P1/P2（token v2）：已结算内容的观察与尾窗前移解耦 ----
+
+    /// 已结算 Turn 内**同 id** 文本原位改写（落在已取回的页里）：投影 token 必须换，
+    /// 绑定该页前缀的页 token 不能继续。
+    /// BASE 红：v1 token 只绑 id 前缀——同 id 文本改写既不换投影 token，也放行旧页。
+    #[test]
+    fn same_id_text_rewrite_in_settled_turn_invalidates_tokens() {
+        let turns = turns_000_to_599();
+        let mut mirror = mirror_of(state_of_turns(&turns));
+        let before = projection(&mirror);
+        assert_eq!(before.messages[0].id, "m100");
+        let first = page(&mirror, Some("m100"), &before.history_token);
+        assert_eq!(first.status, MessagesPageStatus::Ready);
+        assert_eq!(first.next_before.as_deref(), Some("m050"));
+        let page_token = first.history_token.clone();
+
+        // t7（m060..m069）是已结算 Turn，且落在刚取回的页里；只改文本、id 不变。
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t7", "items", 0, "text"],
+                  "value": "m060-rewritten" }
+            ]),
+        );
+
+        // m060 不在 page_token 绑定的前缀 [m000..m049) 里——只有内容观察代能拦住它。
+        // 先只走分页路径：分页本身必须观察到已结算内容变化（不依赖先调 project）。
+        let stale = page(&mirror, first.next_before.as_deref(), &page_token);
+        assert_eq!(stale.status, MessagesPageStatus::CursorInvalid);
+        assert_eq!(stale.reason_code.as_deref(), Some("history_rewritten"));
+        assert!(stale.messages.is_empty());
+
+        let after = projection(&mirror);
+        assert_ne!(
+            after.history_token, before.history_token,
+            "已结算 Turn 的同 id 文本改写必须换投影 token"
+        );
+    }
+
+    /// 已结算 Turn 内同 id 附件变化（imageGeneration.savedPath）：投影 token 必须换，
+    /// 已取回的页 token 不能继续。
+    /// BASE 红：id 序不变 → 投影 token 不变、旧页照常续翻。
+    #[test]
+    fn same_id_artifact_change_in_settled_turn_invalidates_tokens() {
+        let mut turns = turns_000_to_599();
+        // t7 的第 6 条（全局 index 65，落在已取回的页里）改为图片生成卡。
+        turns[6].1[5] = serde_json::json!({
+            "type": "imageGeneration", "id": "img65",
+            "savedPath": "/tmp/one.png", "status": "completed"
+        });
+        let mut mirror = mirror_of(state_of_turns(&turns));
+        let before = projection(&mirror);
+        let first = page(&mirror, Some("m100"), &before.history_token);
+        assert_eq!(first.status, MessagesPageStatus::Ready);
+        assert_eq!(first.next_before.as_deref(), Some("m050"));
+        let page_token = first.history_token.clone();
+        let paged = first
+            .messages
+            .iter()
+            .find(|m| m.id == "img65")
+            .expect("图片生成卡必须出现在已取回的页里");
+        assert_eq!(
+            paged.artifacts[0].path.as_deref(),
+            Some("/tmp/one.png"),
+            "夹具必须真的把 savedPath 投到 path"
+        );
+
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t7", "items", 5, "savedPath"],
+                  "value": "/tmp/two.png" }
+            ]),
+        );
+
+        // img65 不在 page_token 绑定的前缀 [m000..m049) 里——只有内容观察代能拦住它。
+        // 先只走分页路径：分页本身必须观察到已结算内容变化（不依赖先调 project）。
+        let stale = page(&mirror, first.next_before.as_deref(), &page_token);
+        assert_eq!(stale.status, MessagesPageStatus::CursorInvalid);
+        assert_eq!(stale.reason_code.as_deref(), Some("history_rewritten"));
+        assert!(stale.messages.is_empty());
+
+        let after = projection(&mirror);
+        assert_ne!(
+            after.history_token, before.history_token,
+            "已结算 Turn 的附件变化必须换投影 token"
+        );
+    }
+
+    /// 删除已结算 Turn：投影 token 必须换。
+    /// BASE 红：小夹具 dropped = 0，v1 token 只由 id 前缀决定，删除不换 token。
+    #[test]
+    fn deletion_of_settled_turn_changes_projection_token() {
+        let mut mirror = mirror_of(state_of_turns(&[
+            turn("t1", vec![user("m0", "q0"), agent("m1", "a0")]),
+            turn("t2", vec![user("m2", "q1")]),
+            turn("t3", vec![agent("m3", "a2")]),
+        ]));
+        let before = projection(&mirror);
+        assert_eq!(message_ids(&before.messages), ["m0", "m1", "m2", "m3"]);
+
+        // 删除 t1 的 canonical 引用（实体表孤儿不影响可见历史，引用链决定顺序）。
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "remove",
+                  "path": ["turnHistory", "history", "islands", 0, "entries", 0] }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_eq!(
+            message_ids(&after.messages),
+            ["m2", "m3"],
+            "删除的 Turn 不得继续出现在投影里"
+        );
+        assert_ne!(
+            after.history_token, before.history_token,
+            "删除已结算 Turn 必须换投影 token"
+        );
+    }
+
+    /// 尾窗饱和后普通追加一个**新 Turn**：投影 token 不变，追加前的页 token 仍可
+    /// 继续翻到更早一页。BASE 红：尾窗前移使 dropped 增大 → 投影 token 换。
+    #[test]
+    fn append_of_new_turn_after_tail_saturation_keeps_tokens() {
+        let turns = turns_000_to_599();
+        let mut mirror = mirror_of(state_of_turns(&turns));
+        let before = projection(&mirror);
+        assert_eq!(before.messages.len(), 500);
+        assert_eq!(before.messages[0].id, "m100");
+        let first = page(&mirror, Some("m100"), &before.history_token);
+        assert_eq!(first.status, MessagesPageStatus::Ready);
+        assert_eq!(first.next_before.as_deref(), Some("m050"));
+        let page_token = first.history_token.clone();
+
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "add",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t61"],
+                  "value": { "turnId": "t61", "status": "inProgress",
+                             "items": [{ "type": "agentMessage", "id": "m600", "text": "tail" }] } },
+                { "op": "add",
+                  "path": ["turnHistory", "history", "islands", 0, "entries", 60],
+                  "value": { "key": "turn:t61", "value": "turn:t61" } }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_eq!(after.messages.len(), 500);
+        assert_eq!(after.messages[0].id, "m101", "尾窗前移一条");
+        assert_eq!(
+            after.history_token, before.history_token,
+            "普通新 Turn 追加（尾窗前移）不得换投影 token"
+        );
+        let next = page(&mirror, first.next_before.as_deref(), &page_token);
+        assert_eq!(
+            next.status,
+            MessagesPageStatus::Ready,
+            "追加前的页 token 必须仍可继续"
+        );
+        assert_eq!(
+            message_ids(&next.messages),
+            (0..50).map(|i| format!("m{i:03}")).collect::<Vec<_>>()
+        );
+    }
+
+    /// 最新（**活动**，status = inProgress）Turn 的 agent 消息流式补全（同 id 文本
+    /// 从空占位到有正文）不得换投影 token。活动身份是这条用例的前提：已结算 Turn
+    /// 的末条改写必须换 token（见 `same_id_text_rewrite_in_completed_latest_turn...`）。
+    /// BASE 红：消息变为可投影后 dropped +1 → 投影 token 换。
+    #[test]
+    fn streaming_growth_of_newest_agent_message_keeps_projection_token() {
+        let turns = turns_000_to_599();
+        let mut mirror = mirror_of(state_of_turns_last_active(&turns));
+        let before = projection(&mirror);
+        assert_eq!(before.messages[0].id, "m100");
+
+        // 空文本占位不投影（既有语义），随后同 id 原位补全才出现。
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "add",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t60", "items", 10],
+                  "value": { "type": "agentMessage", "id": "stream", "text": "" } }
+            ]),
+        );
+        let placeholder = projection(&mirror);
+        assert!(!placeholder.messages.iter().any(|m| m.id == "stream"));
+        assert_eq!(placeholder.history_token, before.history_token);
+
+        patch(
+            &mut mirror,
+            2,
+            3,
+            serde_json::json!([
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t60", "items", 10, "text"],
+                  "value": "流式补全的正文" }
+            ]),
+        );
+        let after = projection(&mirror);
+        assert!(after.messages.iter().any(|m| m.id == "stream"));
+        assert_eq!(
+            after.history_token, before.history_token,
+            "活动 Turn 流式补全不得换投影 token"
+        );
+    }
+
+    /// 仅尾窗前移（已结算内容不变，窗口从 500/100 变 500/150）：投影 token 逐字
+    /// 相同。BASE 红：token 直接绑 dropped 前缀。
+    #[test]
+    fn tail_window_rollover_alone_keeps_projection_token() {
+        let turns = turns_000_to_599();
+        let mut mirror = mirror_of(state_of_turns(&turns));
+        let before = projection(&mirror);
+        assert_eq!(before.messages[0].id, "m100");
+        assert!(before.truncated);
+
+        let patches: Vec<serde_json::Value> = (0..50)
+            .map(|offset| {
+                serde_json::json!({
+                    "op": "add",
+                    "path": ["turnHistory", "history", "entitiesByKey", "turn:t60", "items", 10 + offset],
+                    "value": { "type": "agentMessage", "id": format!("tail{offset:02}"), "text": "tail" }
+                })
+            })
+            .collect();
+        patch(&mut mirror, 1, 2, serde_json::Value::Array(patches));
+
+        let after = projection(&mirror);
+        assert_eq!(after.messages.len(), 500);
+        assert_eq!(after.messages[0].id, "m150", "尾窗前移 50 条（内容未变）");
+        assert_eq!(
+            after.history_token, before.history_token,
+            "仅尾窗前移不得换投影 token"
+        );
+    }
+
+    // ---- 复核 F1/F4：最新 Turn 不再整体豁免；跨 Turn 顺序进入观察 ----
+
+    /// 复核 F1：单 Turn 600 条、仍在产出时，**已分页**的 m050—m099 不是无人看守的
+    /// 可变区——m099 同 id 正文改写必须换投影 token，并让绑定 m050 游标的页失效。
+    /// BASE 红：整体排除最新 Turn → 内容代不动，旧页照常续翻并展示旧正文。
+    #[test]
+    fn same_id_text_rewrite_in_long_active_turn_invalidates_paged_history() {
+        let ids: Vec<String> = (0..600).map(|i| format!("m{i:03}")).collect();
+        let items: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| agent(id, &format!("text-{id}")))
+            .collect();
+        let mut mirror = mirror_of(state_of_items_with_status(
+            serde_json::json!(items),
+            "inProgress",
+        ));
+        let before = projection(&mirror);
+        assert_eq!(before.messages[0].id, "m100", "尾窗只保留最新 500 条");
+        let first = page(&mirror, Some("m100"), &before.history_token);
+        assert_eq!(first.status, MessagesPageStatus::Ready);
+        assert_eq!(first.next_before.as_deref(), Some("m050"));
+        assert_eq!(first.messages.last().map(|m| m.id.as_str()), Some("m099"));
+        let page_token = first.history_token.clone();
+
+        // m099 是该 Turn 的倒数第二条（末条是 m599），不在「活动末条」豁免内。
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "items", 99, "text"],
+                  "value": "m099-rewritten" }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_ne!(
+            after.history_token, before.history_token,
+            "单 Turn 内已分页内容被改写必须换投影 token"
+        );
+        let stale = page(&mirror, first.next_before.as_deref(), &page_token);
+        assert_eq!(stale.status, MessagesPageStatus::CursorInvalid);
+        assert_eq!(stale.reason_code.as_deref(), Some("history_rewritten"));
+    }
+
+    /// 复核 F1（附件面）：单 Turn 600 条、仍在产出时，已分页的图片生成卡
+    /// `savedPath` 变化同样必须换 token（附件序列化进指纹）。
+    /// BASE 红：整体排除最新 Turn → 附件改写观察不到。
+    #[test]
+    fn same_id_artifact_change_in_long_active_turn_invalidates_paged_history() {
+        let ids: Vec<String> = (0..600).map(|i| format!("m{i:03}")).collect();
+        let mut items: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| agent(id, &format!("text-{id}")))
+            .collect();
+        items[99] = serde_json::json!({
+            "type": "imageGeneration", "id": "m099",
+            "savedPath": "/tmp/one.png", "status": "failed"
+        });
+        let mut mirror = mirror_of(state_of_items_with_status(
+            serde_json::json!(items),
+            "inProgress",
+        ));
+        let before = projection(&mirror);
+        let first = page(&mirror, Some("m100"), &before.history_token);
+        assert_eq!(first.status, MessagesPageStatus::Ready);
+        let page_token = first.history_token.clone();
+        let paged = first
+            .messages
+            .iter()
+            .find(|m| m.id == "m099")
+            .expect("图片生成卡必须在已取回的页里");
+        assert_eq!(paged.artifacts[0].path.as_deref(), Some("/tmp/one.png"));
+
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "items", 99, "savedPath"],
+                  "value": "/tmp/two.png" }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_ne!(
+            after.history_token, before.history_token,
+            "单 Turn 内已分页附件的 savedPath 变化必须换投影 token"
+        );
+        let stale = page(&mirror, first.next_before.as_deref(), &page_token);
+        assert_eq!(stale.status, MessagesPageStatus::CursorInvalid);
+        assert_eq!(stale.reason_code.as_deref(), Some("history_rewritten"));
+    }
+
+    /// 复核 F1：**最新 Turn 已结算**时，其末条消息的同 id 改写也必须换 token——
+    /// 流式豁免只该给仍在产出的 Turn。
+    /// BASE 红：最新 Turn 整体不登记 → 末条改写观察不到。
+    #[test]
+    fn same_id_text_rewrite_in_completed_latest_turn_invalidates() {
+        let turns = turns_000_to_599();
+        let mut mirror = mirror_of(state_of_turns(&turns));
+        let before = projection(&mirror);
+
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t60", "items", 9, "text"],
+                  "value": "m599-rewritten" }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_ne!(
+            after.history_token, before.history_token,
+            "已结算的最新 Turn 末条改写必须换投影 token"
+        );
+        // 基线已跟上：再投影不得继续抖动（一次改写只推进一次内容代）。
+        let again = projection(&mirror);
+        assert_eq!(again.history_token, after.history_token);
+    }
+
+    /// 复核 F4：两个已结算 Turn 整体互换（各自内容与内部顺序都不变）必须换 token。
+    /// BASE 红：`HashMap<turn, fingerprint>` 保不住顺序 → 观察集合相等，token 不变。
+    #[test]
+    fn reorder_of_settled_turns_changes_projection_token() {
+        let mut mirror = mirror_of(state_of_turns(&[
+            turn("t1", vec![user("m0", "q0")]),
+            turn("t2", vec![agent("m1", "a0")]),
+            turn("t3", vec![agent("m2", "a1")]),
+        ]));
+        let before = projection(&mirror);
+        assert_eq!(message_ids(&before.messages), ["m0", "m1", "m2"]);
+
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "islands", 0, "entries", 0],
+                  "value": { "key": "turn:t2", "value": "turn:t2" } },
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "islands", 0, "entries", 1],
+                  "value": { "key": "turn:t1", "value": "turn:t1" } }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_eq!(message_ids(&after.messages), ["m1", "m0", "m2"]);
+        assert_ne!(
+            after.history_token, before.history_token,
+            "已结算 Turn 整体换序必须换投影 token"
+        );
+    }
+
+    /// 复核 G2：最新的 Turn **已失败**时，它的末条消息不是流式可变区——同 id 改写
+    /// 必须换 token。「不是 completed」不等于「仍在输出」。
+    /// BASE 红：非 completed 一律 active → 末条被豁免，改写观察不到。
+    #[test]
+    fn rewrite_of_failed_latest_turn_tail_invalidates_tokens() {
+        let mut state = state_of_turns(&[
+            turn("t1", vec![user("m0", "q0")]),
+            turn("t2", vec![agent("m1", "a0")]),
+        ]);
+        override_turn_status(&mut state, &[("t2", Some("failed"))]);
+        let mut mirror = mirror_of(state);
+        let before = projection(&mirror);
+
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t2", "items", 0, "text"],
+                  "value": "a0-rewritten" }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_ne!(
+            after.history_token, before.history_token,
+            "已失败的最新 Turn 末条改写必须换投影 token"
+        );
+    }
+
+    /// 复核 G2：状态缺失的末条同样不得豁免（未知状态 ≠ 正在输出）。
+    #[test]
+    fn rewrite_of_statusless_latest_turn_tail_invalidates_tokens() {
+        let mut state = state_of_turns(&[
+            turn("t1", vec![user("m0", "q0")]),
+            turn("t2", vec![agent("m1", "a0")]),
+        ]);
+        override_turn_status(&mut state, &[("t2", None)]);
+        let mut mirror = mirror_of(state);
+        let before = projection(&mirror);
+
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t2", "items", 0, "text"],
+                  "value": "a0-rewritten" }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_ne!(
+            after.history_token, before.history_token,
+            "缺状态的最新 Turn 末条改写必须换投影 token"
+        );
+    }
+
+    /// 复核 G3：末次增量与「追加下一条」同批到达时不得换 token（旧末条只豁免一次）。
+    /// BASE 红：新末条是 m2 → m1 被纳入比对 → 正常结算增量触发换代、清空旧页。
+    #[test]
+    fn final_delta_with_appended_item_keeps_projection_token() {
+        let mut mirror = mirror_of(state_of_items_with_status(
+            serde_json::json!([
+                { "type": "userMessage", "id": "m0",
+                  "content": [{ "type": "text", "text": "q" }] },
+                { "type": "agentMessage", "id": "m1", "text": "partial" }
+            ]),
+            "inProgress",
+        ));
+        let before = projection(&mirror);
+
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "items", 1, "text"],
+                  "value": "final text" },
+                { "op": "add",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "items", 2],
+                  "value": { "type": "agentMessage", "id": "m2", "text": "next" } }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_eq!(message_ids(&after.messages), ["m0", "m1", "m2"]);
+        assert_eq!(
+            after.history_token, before.history_token,
+            "末次增量 + 追加下一条不得换投影 token"
+        );
+        assert_eq!(
+            projection(&mirror).history_token,
+            after.history_token,
+            "基线必须跟上"
+        );
+    }
+
+    /// 复核 G3：末次增量与 turn 结算同批到达时同样不得换 token。
+    #[test]
+    fn final_delta_with_turn_completion_keeps_projection_token() {
+        let mut mirror = mirror_of(state_of_items_with_status(
+            serde_json::json!([
+                { "type": "userMessage", "id": "m0",
+                  "content": [{ "type": "text", "text": "q" }] },
+                { "type": "agentMessage", "id": "m1", "text": "partial" }
+            ]),
+            "inProgress",
+        ));
+        let before = projection(&mirror);
+
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "status"],
+                  "value": "completed" },
+                { "op": "replace",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "items", 1, "text"],
+                  "value": "final text" }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_eq!(
+            after.history_token, before.history_token,
+            "末次增量 + turn 结算不得换投影 token"
+        );
+        assert_eq!(
+            projection(&mirror).history_token,
+            after.history_token,
+            "基线必须跟上"
+        );
+    }
+
+    /// 复核 F1 补例：活动 Turn 内**删除**一条非末条消息必须换 token（id 序变短）。
+    #[test]
+    fn deletion_of_message_in_active_turn_changes_projection_token() {
+        let mut mirror = mirror_of(state_of_items_with_status(
+            serde_json::json!([
+                { "type": "userMessage", "id": "m0",
+                  "content": [{ "type": "text", "text": "q" }] },
+                { "type": "agentMessage", "id": "m1", "text": "a1" },
+                { "type": "agentMessage", "id": "m2", "text": "a2" }
+            ]),
+            "inProgress",
+        ));
+        let before = projection(&mirror);
+        assert_eq!(message_ids(&before.messages), ["m0", "m1", "m2"]);
+
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "remove",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "items", 1] }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_eq!(message_ids(&after.messages), ["m0", "m2"]);
+        assert_ne!(
+            after.history_token, before.history_token,
+            "活动 Turn 内删除消息必须换投影 token"
+        );
+    }
+
+    /// 复核 F1 的反向守卫：活动 Turn 内**追加**一条新消息不得换 token（否则每个
+    /// 新 item 都会清空用户刚翻出来的历史页）。
+    #[test]
+    fn append_within_active_turn_keeps_projection_token() {
+        let mut mirror = mirror_of(state_of_items_with_status(
+            serde_json::json!([
+                { "type": "userMessage", "id": "m0",
+                  "content": [{ "type": "text", "text": "q" }] },
+                { "type": "agentMessage", "id": "m1", "text": "a1" }
+            ]),
+            "inProgress",
+        ));
+        let before = projection(&mirror);
+
+        patch(
+            &mut mirror,
+            1,
+            2,
+            serde_json::json!([
+                { "op": "add",
+                  "path": ["turnHistory", "history", "entitiesByKey", "turn:t1", "items", 2],
+                  "value": { "type": "agentMessage", "id": "m2", "text": "a2" } }
+            ]),
+        );
+
+        let after = projection(&mirror);
+        assert_eq!(message_ids(&after.messages), ["m0", "m1", "m2"]);
+        assert_eq!(
+            after.history_token, before.history_token,
+            "活动 Turn 内追加新消息不得换投影 token"
+        );
+    }
+}

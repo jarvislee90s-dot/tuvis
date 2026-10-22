@@ -3,7 +3,9 @@ import {
   ApiError,
   deleteArchivedSession,
   fetchArchivedSessions,
+  fetchFile,
   fetchHost,
+  fetchSessionFiles,
   fetchSessions,
   pairWithPin,
   queueJump,
@@ -15,6 +17,39 @@ afterEach(() => {
 });
 
 describe("mobile api", () => {
+  it("fetchSessionFiles 兼容旧载荷并透传新 fileKey", async () => {
+    const legacy = {
+      path: "old.txt",
+      lastSeq: 1,
+      lastTs: null,
+      hits: 1,
+      modified: false,
+      origin: "tool_read",
+    };
+    const keyed = { ...legacy, path: "new.txt", fileKey: "/project/new.txt" };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ files: [legacy, keyed], truncated: false })))
+    );
+    const result = await fetchSessionFiles("codex", "session", 200);
+    expect(result.files[0].path).toBe("old.txt");
+    expect(result.files[0].fileKey).toBeUndefined();
+    expect(result.files[1].fileKey).toBe("/project/new.txt");
+    const previewFetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ content: "old", mime: "text/plain" }), {
+          headers: { "content-type": "application/json" },
+        })
+    );
+    vi.stubGlobal("fetch", previewFetch);
+    expect(await fetchFile("session", result.files[0].path)).toEqual({
+      kind: "text",
+      content: "old",
+      mime: "text/plain",
+    });
+    expect(previewFetch).toHaveBeenCalledWith("/m/api/v1/file?session_id=session&path=old.txt");
+  });
+
   it("pairWithPin POST /pair/pin 携带 pin，成功透传 ok", async () => {
     const f = vi.fn(async () => new Response('{"ok":true}', { status: 200 }));
     vi.stubGlobal("fetch", f);

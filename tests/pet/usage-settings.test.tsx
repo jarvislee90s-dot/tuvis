@@ -1,11 +1,13 @@
 // tests/pet/usage-settings.test.tsx — 计划② Task 14：设置页「用量统计」分组（P7 的 8 项设置）验收面。
 //
-// 覆盖（9 条）：① 设置页接线可渲染（菜单项 → 分区 → 8 项全在场，且**不含** ① 的「采集状态 / 立即采集」
-// 验收面）；② 开关改动即发 patch，并用**后端返回的合并对象**回写本地态；③ 数字输入过滤非数字；
-// ④ 条数夹取上下界（99→7、0→1）；⑤ 范围 / 姿态是原生 select（3 档 / `poseKeysFor(11)` 的 11 项含
-// `look`）；⑥ 保留期提示随值更新且夹取 1–3650；⑦ 规则校验与后端 `merge_patch` 同判据（合法 JSON
-// 但形态不符同样提示）且**只提示不阻断**（patch 照发）；⑧ 评语占位符提示 + 保存失败原因可见
-// （`usage-set-error`，不静默）；⑨ 换宠物 → 姿态非 `random` 时回退 `random` 并提示（已是则幂等）。
+// 覆盖（10 条）：① 设置页接线可渲染（菜单项 → 分区 → 8 项全在场，且**不含** ① 的「采集状态 / 立即采集」
+// 验收面）；② 开关改动即发 patch，并用**后端返回的合并对象**回写本地态；③ 数字输入过滤非数字，
+// **编辑期只留字符串草稿、失焦才保存**；④ 条数夹取上下界（99→7、0→1，失焦/Enter 时才夹）；
+// ⑤ 范围 / 姿态是原生 select（3 档 / `poseKeysFor(11)` 的 11 项含 `look`）；⑥ 保留期提示随**提交后的
+// 值**更新且夹取 1–90；⑦ 保留期逐字符输入只改草稿（锁旧 bug：逐字符夹取导致 30 存成 3/1）、
+// 999→90、空串回退原值；⑧ 保存失败原因可见（`usage-set-error`，不静默）；⑨ 换宠物 → 姿态非
+// `random` 时回退 `random` 并提示（已是则幂等）；⑩ 采集间隔 Enter/失焦同一条提交路径（1–1440，
+// 夹取后与当前值相同则不重复写）。
 //
 // **假后端**（不是桩）：`usage_get_settings` 读 `stored`、`usage_set_settings` 按后端 `merge_patch`
 // 同语义合并回写 `stored` 并返回**完整 8 字段** —— 用例 2 靠它证明「回写的是返回的合并对象」而不是
@@ -215,32 +217,45 @@ describe("设置页「用量统计」分组（计划② Task 14）", () => {
     await waitFor(() => expect(input("usage-detail-retention-days").value).toBe("7"));
   });
 
-  it("3. 数字输入：非数字被过滤掉，剩下的数字即时保存", async () => {
+  it("3. 数字输入：非数字被过滤掉，编辑期只留草稿、失焦才保存", async () => {
     renderSection();
     await screen.findByTestId("usage-detail-retention-days");
     const field = input("usage-detail-retention-days");
 
     fireEvent.change(field, { target: { value: "3a0b" } });
 
-    // 过滤（不是 parseInt / Number：那会得到 3 或 NaN），落回输入框的是 30
+    // 过滤（不是 parseInt / Number：那会得到 3 或 NaN），编辑期输入框回显草稿 30，但**尚未保存**
     expect(field.value).toBe("30");
+    expect(setPatches()).toEqual([]);
+
+    fireEvent.blur(field);
+
     await waitFor(() => expect(setPatches()).toEqual([{ detailRetentionDays: 30 }]));
+    await waitFor(() => expect(field.value).toBe("30"));
   });
 
-  it("4. 条数夹取：99 → 7、0 → 1（上下界都夹，且只发夹取后的值）", async () => {
+  it("4. 条数夹取：99 → 7、0 → 1（失焦/Enter 时才夹，且只发夹取后的值）", async () => {
     renderSection();
     await screen.findByTestId("usage-minibar-tool-rows");
     const field = input("usage-minibar-tool-rows");
 
     fireEvent.change(field, { target: { value: "99" } });
-    expect(field.value).toBe("7");
+    // 编辑期不夹取：草稿原样显示，也不发请求（否则用户打到一半就会被改写）
+    expect(field.value).toBe("99");
+    expect(setPatches()).toEqual([]);
+
+    fireEvent.blur(field);
     await waitFor(() => expect(setPatches()).toEqual([{ miniBarToolRows: 7 }]));
+    await waitFor(() => expect(field.value).toBe("7"));
 
     fireEvent.change(field, { target: { value: "0" } });
-    expect(field.value).toBe("1");
+    expect(field.value).toBe("0");
+    // Enter 与失焦走同一条提交路径（下界同样夹取）
+    fireEvent.keyDown(field, { key: "Enter" });
     await waitFor(() =>
       expect(setPatches()).toEqual([{ miniBarToolRows: 7 }, { miniBarToolRows: 1 }])
     );
+    await waitFor(() => expect(field.value).toBe("1"));
 
     // 发出去的每个值都必须在后端白名单域内（merge_patch 越界是整包拒绝，不静默夹取）
     for (const patch of setPatches()) {
@@ -268,26 +283,69 @@ describe("设置页「用量统计」分组（计划② Task 14）", () => {
     expect(screen.queryByTestId("usage-export-pose")).toBeNull();
   });
 
-  it("6. 保留期提示：明示「N 天前无明细」，随值更新且夹取 1–3650", async () => {
+  it("6. 保留期提示：明示「N 天前无明细」，随提交值更新且夹取 1–90", async () => {
     renderSection();
     const hint = await screen.findByTestId("usage-detail-retention-hint");
     expect(hint.textContent).toContain("90");
     expect(hint.textContent ?? "").toMatch(/not kept/i);
+    // 区间文案随本轮上限调整（1–90）
+    expect(hint.textContent).toContain("1–90");
 
-    fireEvent.change(input("usage-detail-retention-days"), { target: { value: "3650" } });
-    await waitFor(() => expect(hint.textContent).toContain("3650"));
-    expect(hint.textContent ?? "").not.toContain("90");
+    fireEvent.change(input("usage-detail-retention-days"), { target: { value: "30" } });
+    // 编辑期草稿不影响提示：提示跟的是**已提交**的值（仍是 90）
+    expect(hint.textContent).toContain("90");
+    fireEvent.blur(input("usage-detail-retention-days"));
+    await waitFor(() => expect(hint.textContent).toContain("30"));
+    // 区间说明恒在（1–90），但「N 天前」的 N 已不再是 90
+    expect(hint.textContent ?? "").not.toContain("older than 90");
 
-    // 上界夹取（3650 上限之外的输入不会被发出去）
+    // 上界夹取（90 上限之外的输入不会被发出去）
     fireEvent.change(input("usage-detail-retention-days"), { target: { value: "99999" } });
-    expect(input("usage-detail-retention-days").value).toBe("3650");
+    expect(input("usage-detail-retention-days").value).toBe("99999"); // 编辑期仍是草稿
+    fireEvent.blur(input("usage-detail-retention-days"));
+    await waitFor(() => expect(input("usage-detail-retention-days").value).toBe("90"));
     await waitFor(() => expect(setPatches()).toHaveLength(2));
-    expect(setPatches()[1]).toEqual({ detailRetentionDays: 3650 });
-    // 发出去的每个值都在后端白名单域内（1–3650；越界那边是整包拒绝）
+    expect(setPatches()[1]).toEqual({ detailRetentionDays: 90 });
+    // 发出去的每个值都在后端白名单域内（1–90；越界那边是整包拒绝）
     for (const patch of setPatches()) {
       expect(patch.detailRetentionDays).toBeGreaterThanOrEqual(1);
-      expect(patch.detailRetentionDays).toBeLessThanOrEqual(3650);
+      expect(patch.detailRetentionDays).toBeLessThanOrEqual(90);
     }
+  });
+
+  it("7. 保留期逐字符输入：编辑期只改草稿，失焦才夹取提交（30；999→90；空串回退）", async () => {
+    // 旧实现每次 change 都夹取并保存 ⇒ 逐字符输入「3」「0」会被拆成 3 与 1（0 被夹到下限）两次写入，
+    // 用户永远打不出 30 这类「首字符低于下限」的两位数。本用例锁住「编辑期草稿、失焦才提交」。
+    renderSection();
+    await screen.findByTestId("usage-detail-retention-days");
+    const field = input("usage-detail-retention-days");
+
+    fireEvent.change(field, { target: { value: "3" } });
+    expect(field.value).toBe("3");
+    expect(setPatches()).toEqual([]); // 中途不得落库
+    fireEvent.change(field, { target: { value: "30" } });
+    expect(field.value).toBe("30");
+    expect(setPatches()).toEqual([]);
+
+    fireEvent.blur(field);
+    await waitFor(() => expect(setPatches()).toEqual([{ detailRetentionDays: 30 }]));
+    await waitFor(() => expect(field.value).toBe("30"));
+
+    // 超上界：失焦时夹到 90，而不是把 999 发给后端等整包拒绝
+    fireEvent.change(field, { target: { value: "999" } });
+    expect(field.value).toBe("999");
+    fireEvent.blur(field);
+    await waitFor(() =>
+      expect(setPatches()).toEqual([{ detailRetentionDays: 30 }, { detailRetentionDays: 90 }])
+    );
+    await waitFor(() => expect(field.value).toBe("90"));
+
+    // 空串：无可提交数字 ⇒ 回退到当前值，且不产生新写入
+    fireEvent.change(field, { target: { value: "" } });
+    expect(field.value).toBe("");
+    fireEvent.blur(field);
+    await waitFor(() => expect(field.value).toBe("90"));
+    expect(setPatches()).toHaveLength(2);
   });
 
   it("8. 保存失败原因可见（usage-set-error，不静默）——载体随界面变动更换", async () => {
@@ -348,5 +406,34 @@ describe("设置页「用量统计」分组（计划② Task 14）", () => {
       saveActiveId("another-pet", false, "Another");
     });
     expect(setPatches()).toHaveLength(1);
+  });
+
+  it("10. 采集间隔：Enter/失焦同一条提交路径（1–1440；夹取后与当前值相同则不重复写）", async () => {
+    renderSection();
+    await screen.findByTestId("usage-collect-interval-min");
+    const field = input("usage-collect-interval-min");
+
+    fireEvent.change(field, { target: { value: "1440" } });
+    expect(field.value).toBe("1440"); // 编辑期草稿
+    expect(setPatches()).toEqual([]);
+    fireEvent.keyDown(field, { key: "Enter" });
+    await waitFor(() => expect(setPatches()).toEqual([{ collectIntervalMin: 1440 }]));
+    await waitFor(() => expect(field.value).toBe("1440"));
+
+    // 上界夹取后与当前值相同 ⇒ 不产生多余写入（避免无意义的 IPC / 错误横幅闪烁）
+    fireEvent.change(field, { target: { value: "99999" } });
+    expect(field.value).toBe("99999");
+    fireEvent.keyDown(field, { key: "Enter" });
+    await waitFor(() => expect(field.value).toBe("1440"));
+    expect(setPatches()).toHaveLength(1);
+
+    // 下界同样夹取；失焦也是同一条提交路径
+    fireEvent.change(field, { target: { value: "0" } });
+    expect(field.value).toBe("0");
+    fireEvent.blur(field);
+    await waitFor(() =>
+      expect(setPatches()).toEqual([{ collectIntervalMin: 1440 }, { collectIntervalMin: 1 }])
+    );
+    await waitFor(() => expect(field.value).toBe("1"));
   });
 });

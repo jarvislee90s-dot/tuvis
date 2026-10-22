@@ -37,6 +37,7 @@ use crate::services::codex_control::{
 use crate::services::codex_desktop_ipc::adapter::{
     Connector, DesktopIpcAdapter, ProductionConnector,
 };
+use crate::services::codex_desktop_ipc::mirror::MESSAGES_PAGE_LIMIT;
 use crate::services::codex_desktop_ipc::probe::runner::ProbeOutcome;
 use crate::services::codex_desktop_ipc::probe::{ProbeLedger, ProbeLedgerEntry};
 use crate::services::codex_desktop_ipc::profile::{profile_for, ProtocolProfile};
@@ -1860,6 +1861,101 @@ async fn live_projection(hub: &CodexControlHub, key: &ThreadKey) -> ThreadProjec
 }
 
 // ============================================================
+// 端点：GET /codex/thread/messages（同代只读历史分页）
+// ============================================================
+
+/// GET /m/api/v1/codex/thread/messages?session_id=&before_id=&history_token=&limit=：
+/// 在镜像已取得的 canonical 历史里读取更早消息（计划任务 4）。
+///
+/// 契约：
+/// - `session_id`、`history_token` 必填（缺失/空白 → 400）；`before_id` 可缺省——
+///   表示「历史末端锚点」：空历史下与投影 token 一起返回 `end`，非空历史返回
+///   `cursor_invalid/cursor_required`（绝不猜成最新页）；
+/// - `limit` 缺省 50，允许 1..=50，其余（0/51/非数字/空）→ 400；
+/// - 复用远程鉴权（路由位于 gated nest）与 `find_session_sync` +
+///   `resolve_session_thread`（错误会话 → 404；跨会话只解析到自己线程）；
+/// - 无镜像时复用 GET /codex/thread 的**有界只读** ensure/hydrate（连接 + follow +
+///   snapshot + 既有 load-complete-history）；失败不报错，分页按镜像实际状态如实
+///   返回 `unavailable`；
+/// - 响应 no-store；不触发发送/审批/写入，不重扫 rollout 或磁盘目录，分页在镜像锁内
+///   同步完成（不跨 await 持锁）。
+pub async fn thread_messages(
+    State(st): State<Arc<RemoteState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(sid) = params
+        .get("session_id")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return bad_request();
+    };
+    // 无历史 token = 拒绝（客户端必须带投影/上一页给出的同代锚点）。
+    let Some(history_token) = params
+        .get("history_token")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return bad_request();
+    };
+    // limit 缺省 50，允许 1..=50，其余 400（不做静默夹取）。
+    let limit = match params.get("limit") {
+        None => MESSAGES_PAGE_LIMIT,
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) if (1..=MESSAGES_PAGE_LIMIT).contains(&value) => value,
+            _ => return bad_request(),
+        },
+    };
+    let before_id = params
+        .get("before_id")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let hub = &st.codex_control;
+    let probe_st = st.clone();
+    let probe_sid = sid.clone();
+    let session =
+        match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid)).await {
+            Ok(value) => value,
+            Err(e) => {
+                log::error!("codex/thread/messages 会话扫描任务异常: {e}");
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        };
+    let Some(session) = session else {
+        return not_found();
+    };
+    let Some(key) = resolve_session_thread(&st, &session) else {
+        return not_found();
+    };
+    // 复用既有只读 hydrate 路径（与 GET /codex/thread 同源）：只在没有镜像时触发，
+    // 正常分页不额外连接、不额外投影。失败/超时是常态（Desktop 不在），不影响下面
+    // 按既有镜像状态如实分页。
+    if !hub.adapter.has_mirror(&key).await {
+        let _ = live_projection(hub, &key).await;
+    }
+    let page = hub
+        .adapter
+        .messages_page(&key, before_id.as_deref(), &history_token, limit)
+        .await;
+    json_no_store(
+        StatusCode::OK,
+        serde_json::to_value(&page).unwrap_or_else(|_| {
+            serde_json::json!({
+                "messages": [],
+                "historyToken": "",
+                "revision": serde_json::Value::Null,
+                "nextBefore": serde_json::Value::Null,
+                "status": "unavailable",
+                "reasonCode": "serialize_failed",
+            })
+        }),
+    )
+}
+
+// ============================================================
 // 端点：GET /codex/thread/events（SSE）
 // ============================================================
 
@@ -2771,6 +2867,7 @@ mod startup_merge_tests {
             content_state: ContentState::Ready,
             messages: Vec::new(),
             truncated: false,
+            history_token: String::new(),
             pending: Vec::new(),
             probe_status: ProbeStatus::idle(),
             owner_epoch: epoch,

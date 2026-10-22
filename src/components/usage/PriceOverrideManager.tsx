@@ -1,15 +1,17 @@
-// 四价覆盖管理（2026-10-20 第三轮：只挂在配置卡「高级覆盖」里；可从模型条目快捷预填）。
+// 自定义价格规则管理（2026-10-21：固定价 / 分时价）。
 //
-// 口径（计划 §4.4 / §5.1）：
-//  * 覆盖价按归一化模型 ID 全局生效；价目表刷新不会覆盖用户值；
+// 口径：
+//  * 规则按归一化模型 ID 全局生效；价目表刷新不会覆盖用户值；
+//  * 固定价 = 现在的四价覆盖；分时价 = 高峰四价 + 低谷四价 + 周一至周五时段；
 //  * 四价用文本输入，提交字符串，空串 → null；至少一项非空；非法数字前端拒绝；
-//  * 无 active 目录时来源字段为 null，仍可离线保存并显示「无有效目录来源」；
+//  * 分时窗口只支持整点，允许跨午夜；低谷缺项回落目录价（后端合并）；
 //  * 保存/删除后统一 `invalidateQueries({queryKey: USAGE_KEY})`，覆盖价与费用查询一起失效；
 //  * 不新增轮询、不改 locale。
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { UsageInfoTip } from "@/components/usage/UsageInfoTip";
 import { usageErrMsg } from "@/components/usage/usageErrors";
 import { usagePricingOverrideDelete, usagePricingOverrideSet } from "@/lib/api/usageV2";
@@ -17,7 +19,13 @@ import { USAGE_KEY, useUsagePriceOverridesQuery } from "@/lib/query/queries/usag
 import { EM_DASH, fmtDateTime } from "@/lib/usage/format";
 import { useDisplayCurrency } from "@/lib/usage/displayCurrency";
 import type { TFn } from "@/lib/usage/range";
-import type { PriceCurrency, PriceOverrideView } from "@/types/usageV2";
+import type {
+  PriceCurrency,
+  PriceOverrideView,
+  TimePriceRule,
+  TimePriceTimezone,
+  TimePriceWindow,
+} from "@/types/usageV2";
 
 /** 条目快捷入口的预填请求；nonce 保证重复点击同一模型也重新打开 */
 export interface PriceOverridePrefill {
@@ -71,6 +79,68 @@ function isRateValid(v: string): boolean {
   return trimmed === "" || RATE_RE.test(trimmed);
 }
 
+/** 整点选项（分时窗口只支持 HH:00；00:00 同时表示午夜/结束）。 */
+const HOUR_OPTIONS = Array.from({ length: 24 }, (_, hour) => `${String(hour).padStart(2, "0")}:00`);
+
+const TIMEZONE_OPTIONS: { value: TimePriceTimezone; labelKey: string }[] = [
+  { value: "asiaShanghai", labelKey: "usage.pricing.overrides.timezoneAsiaShanghai" },
+  { value: "utc", labelKey: "usage.pricing.overrides.timezoneUtc" },
+  { value: "local", labelKey: "usage.pricing.overrides.timezoneLocal" },
+];
+
+/** 按百分比缩放一个十进制费率文本；非法/空值保持原样。 */
+function scaleRateText(value: string, percent: number): string {
+  const trimmed = value.trim();
+  if (trimmed === "") return "";
+  const number = Number(trimmed);
+  if (!Number.isFinite(number)) return value;
+  const scaled = (number * percent) / 100;
+  if (scaled === 0) return "0";
+  return scaled.toFixed(9).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function timezoneLabel(t: TFn, timezone: TimePriceTimezone): string {
+  const key = TIMEZONE_OPTIONS.find((item) => item.value === timezone)?.labelKey;
+  return key ? t(key) : timezone;
+}
+
+function windowsLabel(windows: readonly TimePriceWindow[]): string {
+  return windows.map((window) => `${window.start}–${window.end}`).join(", ");
+}
+
+function offpeakRateOf(rule: TimePriceRule | null | undefined, key: RateKey): string | null {
+  if (!rule) return null;
+  if (key === "input") return rule.offpeakInput;
+  if (key === "cacheRead") return rule.offpeakCacheRead;
+  if (key === "cacheWrite") return rule.offpeakCacheWrite;
+  return rule.offpeakOutput;
+}
+
+/** 分钟边界；跨午夜拆成当天两段，用于与后端同口径的重叠校验。 */
+function windowSegments(windows: readonly TimePriceWindow[]): [number, number][] {
+  const minutes = (value: string): number => {
+    const [hour, minute] = value.split(":").map(Number);
+    return hour * 60 + minute;
+  };
+  return windows.flatMap((window) => {
+    const start = minutes(window.start);
+    const end = minutes(window.end);
+    return start < end
+      ? ([[start, end]] as [number, number][])
+      : ([
+          [start, 1440],
+          [0, end],
+        ] as [number, number][]);
+  });
+}
+
+function windowsOverlap(windows: readonly TimePriceWindow[]): boolean {
+  const segments = windowSegments(windows);
+  return segments.some((left, index) =>
+    segments.slice(index + 1).some((right) => left[0] < right[1] && right[0] < left[1])
+  );
+}
+
 export function PriceOverrideManager({ t, prefill, onPrefillHandled }: PriceOverrideManagerProps) {
   const queryClient = useQueryClient();
   const overrides = useUsagePriceOverridesQuery();
@@ -84,6 +154,11 @@ export function PriceOverrideManager({ t, prefill, onPrefillHandled }: PriceOver
   const [model, setModel] = useState("");
   const [currency, setCurrency] = useState<PriceCurrency>("USD");
   const [rates, setRates] = useState<RateDraft>(EMPTY_DRAFT);
+  const [timeEnabled, setTimeEnabled] = useState(false);
+  const [timezone, setTimezone] = useState<TimePriceTimezone>("asiaShanghai");
+  const [windows, setWindows] = useState<TimePriceWindow[]>([{ start: "09:00", end: "12:00" }]);
+  const [offpeakRates, setOffpeakRates] = useState<RateDraft>(EMPTY_DRAFT);
+  const [discountPercent, setDiscountPercent] = useState("50");
   const [formError, setFormError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<unknown>(null);
   const [notice, setNotice] = useState(false);
@@ -102,6 +177,11 @@ export function PriceOverrideManager({ t, prefill, onPrefillHandled }: PriceOver
     setModel("");
     setCurrency("USD");
     setRates(EMPTY_DRAFT);
+    setTimeEnabled(false);
+    setTimezone("asiaShanghai");
+    setWindows([{ start: "09:00", end: "12:00" }]);
+    setOffpeakRates(EMPTY_DRAFT);
+    setDiscountPercent("50");
     setFormError(null);
     setActionError(null);
   };
@@ -125,6 +205,18 @@ export function PriceOverrideManager({ t, prefill, onPrefillHandled }: PriceOver
       cacheWrite: view.cacheWrite ?? "",
       output: view.output ?? "",
     });
+    setTimeEnabled(view.timeRule != null);
+    setTimezone(view.timeRule?.timezone ?? "asiaShanghai");
+    setWindows(
+      view.timeRule?.windows?.length ? view.timeRule.windows : [{ start: "09:00", end: "12:00" }]
+    );
+    setOffpeakRates({
+      input: view.timeRule?.offpeakInput ?? "",
+      cacheRead: view.timeRule?.offpeakCacheRead ?? "",
+      cacheWrite: view.timeRule?.offpeakCacheWrite ?? "",
+      output: view.timeRule?.offpeakOutput ?? "",
+    });
+    setDiscountPercent("50");
     setFormError(null);
     setActionError(null);
     setNotice(false);
@@ -153,6 +245,31 @@ export function PriceOverrideManager({ t, prefill, onPrefillHandled }: PriceOver
     setFormError(null);
   };
 
+  const setOffpeakRate = (key: RateKey, value: string) => {
+    setOffpeakRates((prev) => ({ ...prev, [key]: value }));
+    setFormError(null);
+  };
+
+  const applyDiscount = () => {
+    const percent = Number(discountPercent);
+    if (!Number.isFinite(percent) || percent <= 0 || percent > 100) {
+      setFormError(t("usage.pricing.overrides.invalidDiscount"));
+      return;
+    }
+    setOffpeakRates({
+      input: scaleRateText(rates.input, percent),
+      cacheRead: scaleRateText(rates.cacheRead, percent),
+      cacheWrite: scaleRateText(rates.cacheWrite, percent),
+      output: scaleRateText(rates.output, percent),
+    });
+    setFormError(null);
+  };
+
+  const updateWindow = (index: number, patch: Partial<TimePriceWindow>) => {
+    setWindows((prev) => prev.map((window, i) => (i === index ? { ...window, ...patch } : window)));
+    setFormError(null);
+  };
+
   const submit = async () => {
     setFormError(null);
     setActionError(null);
@@ -169,6 +286,39 @@ export function PriceOverrideManager({ t, prefill, onPrefillHandled }: PriceOver
       return;
     }
 
+    let timeRule: TimePriceRule | null = null;
+    if (timeEnabled) {
+      if (windows.length === 0) {
+        setFormError(t("usage.pricing.overrides.atLeastOneWindow"));
+        return;
+      }
+      if (windows.some((window) => window.start === window.end)) {
+        setFormError(t("usage.pricing.overrides.windowInvalid"));
+        return;
+      }
+      if (windowsOverlap(windows)) {
+        setFormError(t("usage.pricing.overrides.windowOverlap"));
+        return;
+      }
+      const offpeakValues = RATE_FIELDS.map(({ key }) => offpeakRates[key]);
+      if (offpeakValues.some((value) => !isRateValid(value))) {
+        setFormError(t("usage.pricing.overrides.invalidRate"));
+        return;
+      }
+      if (offpeakValues.every((value) => value.trim() === "")) {
+        setFormError(t("usage.pricing.overrides.atLeastOneOffpeak"));
+        return;
+      }
+      timeRule = {
+        timezone,
+        windows,
+        offpeakInput: toRate(offpeakRates.input),
+        offpeakCacheRead: toRate(offpeakRates.cacheRead),
+        offpeakCacheWrite: toRate(offpeakRates.cacheWrite),
+        offpeakOutput: toRate(offpeakRates.output),
+      };
+    }
+
     setBusy(true);
     try {
       await usagePricingOverrideSet({
@@ -178,6 +328,7 @@ export function PriceOverrideManager({ t, prefill, onPrefillHandled }: PriceOver
         cacheRead: toRate(rates.cacheRead),
         cacheWrite: toRate(rates.cacheWrite),
         output: toRate(rates.output),
+        timeRule,
       });
       // 统一失效链：priceOverrides 与 costs 都在 `["usage"]` 前缀下
       await queryClient.invalidateQueries({ queryKey: USAGE_KEY });
@@ -312,6 +463,37 @@ export function PriceOverrideManager({ t, prefill, onPrefillHandled }: PriceOver
                 ))}
               </div>
             </div>
+            <div className="flex items-center justify-between gap-3 rounded-md border px-2 py-1.5 sm:col-span-2">
+              <div className="min-w-0">
+                <span className="flex items-center gap-1 text-xs font-medium">
+                  {t("usage.pricing.overrides.timeEnabled")}
+                  <UsageInfoTip
+                    label={t("usage.pricing.overrides.timeHelpLabel")}
+                    testId="price-override-time-info"
+                  >
+                    {t("usage.pricing.overrides.timeHint")}
+                  </UsageInfoTip>
+                </span>
+                <p className="text-muted-foreground text-[11px]">
+                  {t("usage.pricing.overrides.timeEnabledHint")}
+                </p>
+              </div>
+              <Switch
+                data-testid="price-override-time-toggle"
+                aria-label={t("usage.pricing.overrides.timeEnabled")}
+                checked={timeEnabled}
+                onCheckedChange={(enabled) => {
+                  setTimeEnabled(enabled);
+                  setFormError(null);
+                }}
+              />
+            </div>
+
+            <div className="text-muted-foreground text-xs font-medium sm:col-span-2">
+              {timeEnabled
+                ? t("usage.pricing.overrides.peakRates")
+                : t("usage.pricing.overrides.fixedRates")}
+            </div>
             {RATE_FIELDS.map(({ key, labelKey, testId }) => (
               <label key={key} className="space-y-1">
                 <span className="text-muted-foreground text-xs">
@@ -326,6 +508,151 @@ export function PriceOverrideManager({ t, prefill, onPrefillHandled }: PriceOver
                 />
               </label>
             ))}
+
+            {timeEnabled ? (
+              <>
+                <div className="space-y-2 rounded-md border p-2 sm:col-span-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-medium">
+                      {t("usage.pricing.overrides.peakWindows")}
+                    </span>
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="outline"
+                      data-testid="price-override-window-add"
+                      onClick={() =>
+                        setWindows((prev) => [...prev, { start: "09:00", end: "12:00" }])
+                      }
+                    >
+                      {t("usage.pricing.overrides.addWindow")}
+                    </Button>
+                  </div>
+                  <p className="text-muted-foreground text-[11px]">
+                    {t("usage.pricing.overrides.weekdaysHint")}
+                  </p>
+                  {windows.map((window, index) => (
+                    <div key={index} className="flex flex-wrap items-center gap-1.5">
+                      <select
+                        aria-label={t("usage.pricing.overrides.windowStart")}
+                        data-testid={`price-override-window-start-${index}`}
+                        className="bg-background h-8 rounded-md border px-2 text-xs"
+                        value={window.start}
+                        onChange={(event) => updateWindow(index, { start: event.target.value })}
+                      >
+                        {HOUR_OPTIONS.map((hour) => (
+                          <option key={hour} value={hour}>
+                            {hour}
+                          </option>
+                        ))}
+                      </select>
+                      <span className="text-muted-foreground text-xs">–</span>
+                      <select
+                        aria-label={t("usage.pricing.overrides.windowEnd")}
+                        data-testid={`price-override-window-end-${index}`}
+                        className="bg-background h-8 rounded-md border px-2 text-xs"
+                        value={window.end}
+                        onChange={(event) => updateWindow(index, { end: event.target.value })}
+                      >
+                        {HOUR_OPTIONS.map((hour) => (
+                          <option key={hour} value={hour}>
+                            {hour}
+                          </option>
+                        ))}
+                      </select>
+                      {window.start > window.end ? (
+                        <span className="text-muted-foreground text-[11px]">
+                          {t("usage.pricing.overrides.windowCrossMidnight")}
+                        </span>
+                      ) : null}
+                      <Button
+                        type="button"
+                        size="xs"
+                        variant="ghost"
+                        data-testid={`price-override-window-remove-${index}`}
+                        disabled={windows.length <= 1}
+                        onClick={() =>
+                          setWindows((prev) => prev.filter((_, item) => item !== index))
+                        }
+                      >
+                        {t("usage.pricing.overrides.removeWindow")}
+                      </Button>
+                    </div>
+                  ))}
+                  <label className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="text-muted-foreground">
+                      {t("usage.pricing.overrides.timezone")}
+                    </span>
+                    <select
+                      data-testid="price-override-timezone"
+                      className="bg-background h-8 rounded-md border px-2 text-xs"
+                      value={timezone}
+                      onChange={(event) =>
+                        setTimezone(event.currentTarget.value as TimePriceTimezone)
+                      }
+                    >
+                      {TIMEZONE_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {t(option.labelKey)}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="text-muted-foreground text-[11px]">
+                      {t("usage.pricing.overrides.timezoneHint")}
+                    </span>
+                  </label>
+                </div>
+
+                <div className="space-y-2 rounded-md border p-2 sm:col-span-2">
+                  <div className="flex flex-wrap items-end gap-2">
+                    <span className="text-xs font-medium">
+                      {t("usage.pricing.overrides.offpeakRates")}
+                    </span>
+                    <label className="flex items-center gap-1 text-xs">
+                      <span className="text-muted-foreground">
+                        {t("usage.pricing.overrides.discountLabel")}
+                      </span>
+                      <Input
+                        data-testid="price-override-discount"
+                        className="h-8 w-16 font-mono text-xs"
+                        inputMode="decimal"
+                        value={discountPercent}
+                        onChange={(event) => setDiscountPercent(event.currentTarget.value)}
+                      />
+                      <span className="text-muted-foreground">%</span>
+                    </label>
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="outline"
+                      data-testid="price-override-discount-apply"
+                      onClick={applyDiscount}
+                    >
+                      {t("usage.pricing.overrides.applyDiscount")}
+                    </Button>
+                  </div>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {RATE_FIELDS.map(({ key, labelKey }) => (
+                      <label key={key} className="space-y-1">
+                        <span className="text-muted-foreground text-xs">
+                          {t(labelKey)} ({currency})
+                        </span>
+                        <Input
+                          data-testid={`price-override-offpeak-${key}`}
+                          className="h-8 font-mono text-xs tabular-nums"
+                          inputMode="decimal"
+                          value={offpeakRates[key]}
+                          onChange={(event) => setOffpeakRate(key, event.currentTarget.value)}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  <p className="text-muted-foreground text-[11px]">
+                    {t("usage.pricing.overrides.offpeakHint")}
+                  </p>
+                </div>
+              </>
+            ) : null}
           </div>
 
           {formError ? (
@@ -391,7 +718,9 @@ export function PriceOverrideManager({ t, prefill, onPrefillHandled }: PriceOver
                         data-testid={`price-override-badge-${id}`}
                         className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[10px]"
                       >
-                        {t("usage.cost.userOverride")}
+                        {view.timeRule
+                          ? t("usage.pricing.overrides.kindTime")
+                          : t("usage.pricing.overrides.kindFixed")}
                       </span>
                       <span
                         data-testid={`price-override-currency-${id}`}
@@ -402,12 +731,39 @@ export function PriceOverrideManager({ t, prefill, onPrefillHandled }: PriceOver
                     </div>
 
                     <div className="text-muted-foreground flex flex-wrap gap-x-3 gap-y-1">
+                      <span className="font-medium">
+                        {view.timeRule
+                          ? t("usage.pricing.overrides.peakRates")
+                          : t("usage.pricing.overrides.fixedRates")}
+                      </span>
                       {RATE_FIELDS.map(({ key, labelKey, testId }) => (
                         <span key={key} data-testid={`${testId}-${id}`}>
                           {t(labelKey)}: {view[key] ?? EM_DASH}
                         </span>
                       ))}
                     </div>
+
+                    {view.timeRule ? (
+                      <div
+                        data-testid={`price-override-time-${id}`}
+                        className="text-muted-foreground flex flex-wrap gap-x-3 gap-y-1"
+                      >
+                        <span data-testid={`price-override-time-schedule-${id}`}>
+                          {t("usage.pricing.overrides.schedule")}:{" "}
+                          {t("usage.pricing.overrides.weekdaysShort", {
+                            windows: windowsLabel(view.timeRule.windows),
+                            timezone: timezoneLabel(t, view.timeRule.timezone),
+                          })}
+                        </span>
+                        <span data-testid={`price-override-offpeak-summary-${id}`}>
+                          {t("usage.pricing.overrides.offpeakRates")}:{" "}
+                          {RATE_FIELDS.map(({ key, labelKey }) => {
+                            const value = offpeakRateOf(view.timeRule, key);
+                            return `${t(labelKey)} ${value ?? EM_DASH}`;
+                          }).join(" · ")}
+                        </span>
+                      </div>
+                    ) : null}
 
                     <div className="text-muted-foreground flex flex-wrap gap-x-3 gap-y-1">
                       <span data-testid={`price-override-source-${id}`}>

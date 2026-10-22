@@ -5,9 +5,15 @@
 // kind/origin/scope/search 四状态与叠加过滤语义零变化；布局切换器与关闭钮
 // 上收 SessionDetail 顶栏（唯一实例裁决），本组件头部操作用例随之删除。
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import FilePanel, { FILE_SCOPES, fileKindOf } from "@/mobile/FilePanel";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
+import FilePanel, { FILE_SCOPES, fileKindOf, type FilePanelEntry } from "@/mobile/FilePanel";
 import type { SessionFileEntry } from "@/mobile/api";
+
+beforeEach(async () => {
+  // Task 7 新文案走 i18n（来源标签/定位入口）；既有硬编码中文断言与 zh 一致
+  await i18n.changeLanguage("zh");
+});
 
 afterEach(cleanup);
 
@@ -18,8 +24,13 @@ function entry(path: string, over: Partial<SessionFileEntry> = {}): SessionFileE
 
 /** 渲染面板（默认回调全部注入 mock；mode/onModeChange/onClose 等顶栏收编 props 已删） */
 function renderPanel(
-  entries: SessionFileEntry[],
-  over: { truncated?: boolean; scope?: number; loading?: boolean } = {}
+  entries: FilePanelEntry[],
+  over: {
+    truncated?: boolean;
+    scope?: number;
+    loading?: boolean;
+    onLocate?: (entry: FilePanelEntry) => void;
+  } = {}
 ) {
   const onOpenFile = vi.fn();
   const onScopeChange = vi.fn();
@@ -31,6 +42,7 @@ function renderPanel(
       loading={over.loading ?? false}
       onScopeChange={onScopeChange}
       onOpenFile={onOpenFile}
+      onLocate={over.onLocate}
     />
   );
   return { onOpenFile, onScopeChange };
@@ -422,5 +434,125 @@ describe("FilePanel 可预览说明（M5 P2-a）", () => {
     renderPanel([]);
     expect(screen.getByTestId("panel-preview-help").textContent).toContain("500KB");
     expect(screen.getByTestId("panel-preview-help").textContent).toContain("5MB");
+  });
+});
+
+// ==== Task 7：来源按钮（定位最近引用）与文件名预览是两个独立热区 ====
+
+describe("FilePanel 定位最近引用（Task 7）", () => {
+  /** 合并视图条目：后端字段 + 结构化来源/状态标量 */
+  function viewEntry(over: Partial<FilePanelEntry> = {}): FilePanelEntry {
+    return {
+      path: "/p/a.md",
+      lastSeq: 1,
+      lastTs: 1_700_000_000_000,
+      hits: 1,
+      modified: false,
+      origin: "tool_read",
+      ...over,
+    } as FilePanelEntry;
+  }
+
+  it("来源按钮：展示最近引用的行为来源并触发 onLocate，不打开预览", () => {
+    const onLocate = vi.fn();
+    const { onOpenFile } = renderPanel(
+      [viewEntry({ path: "/p/edited.md", artifactSource: "file_change" })],
+      { onLocate }
+    );
+    const locate = screen.getByTestId("file-row-0-locate");
+    expect(locate.textContent).toBe("修改");
+    fireEvent.click(locate);
+    expect(onLocate).toHaveBeenCalledTimes(1);
+    expect(onLocate.mock.calls[0][0].path).toBe("/p/edited.md");
+    expect(onOpenFile).not.toHaveBeenCalled();
+  });
+
+  it("文件名预览热区不触发定位（两个热区互不触发）", () => {
+    const onLocate = vi.fn();
+    const { onOpenFile } = renderPanel(
+      [viewEntry({ path: "/p/a.md", artifactSource: "image_view" })],
+      { onLocate }
+    );
+    fireEvent.click(screen.getByTestId("file-row-0-open"));
+    expect(onOpenFile).toHaveBeenCalledWith("/p/a.md");
+    expect(onLocate).not.toHaveBeenCalled();
+  });
+
+  it("未知来源仍保留定位入口（不依赖 origin / 结构化来源，也不预造消息）", () => {
+    const onLocate = vi.fn();
+    renderPanel([{ path: "/p/legacy.rs", lastSeq: 1, lastTs: null, hits: 1, modified: false }], {
+      onLocate,
+    });
+    const locate = screen.getByTestId("file-row-0-locate");
+    expect(locate.textContent).toBe("定位");
+    fireEvent.click(locate);
+    expect(onLocate).toHaveBeenCalledTimes(1);
+    expect(onLocate.mock.calls[0][0].path).toBe("/p/legacy.rs");
+  });
+
+  it("fileChange 原始状态原样展示（不写成成功写盘）", () => {
+    renderPanel(
+      [
+        viewEntry({
+          path: "/p/edit.md",
+          origin: "tool_write",
+          artifactSource: "file_change",
+          sourceStatus: "in_progress",
+          changeKind: "modify",
+        }),
+      ],
+      { onLocate: vi.fn() }
+    );
+    const status = screen.getByTestId("file-row-0-status");
+    expect(status.textContent).toBe("in_progress");
+    expect(status.getAttribute("data-status")).toBe("in_progress");
+    // 池中没有任何“已写入/成功”的成功文案（状态只作原始标量展示）
+    expect(screen.getByTestId("file-panel").textContent).not.toMatch(/已写入|写入成功|success/i);
+  });
+
+  it("来源摘要：仅在有摘要时渲染一行（truncate + 完整 title），后端行布局不变", () => {
+    renderPanel(
+      [
+        viewEntry({
+          path: "/p/exec-1.png",
+          artifactSource: "image_generation",
+          summary: "请根据这张照片生成一张十六比九的",
+        }),
+        viewEntry({ path: "/p/backend.md" }),
+      ],
+      { onLocate: vi.fn() }
+    );
+    const summary = screen.getByTestId("file-row-0-summary");
+    expect(summary.textContent).toBe("请根据这张照片生成一张十六比九的");
+    expect(summary.getAttribute("title")).toBe("请根据这张照片生成一张十六比九的");
+    expect(summary.className).toContain("truncate");
+    // 无引用证据的后端行没有摘要行，原布局（文件名/来源/目录/时间）不变
+    expect(screen.queryByTestId("file-row-1-summary")).toBeNull();
+    expect(screen.getByTestId("file-row-1-open").textContent).toContain("backend.md");
+    expect(screen.getByTestId("file-row-1-origin").textContent).toBe("工具读取");
+  });
+
+  it("未验证的合成写来源行（tool_write + modified=false）不加粗，状态仍原样展示", () => {
+    renderPanel(
+      [
+        viewEntry({
+          path: "/p/exec-1.png",
+          origin: "tool_write",
+          modified: false,
+          artifactSource: "file_change",
+          sourceStatus: "failed",
+        }),
+      ],
+      { onLocate: vi.fn() }
+    );
+    expect(screen.getByTestId("file-row-0-origin").textContent).toBe("工具读写");
+    expect(screen.getByTestId("file-row-0-open").className).not.toContain("font-semibold");
+    expect(screen.getByTestId("file-row-0-status").textContent).toBe("failed");
+  });
+
+  it("未提供 onLocate（非 Codex 会话）不渲染定位按钮——其他工具文件池不变", () => {
+    renderPanel([viewEntry({ path: "/p/a.md", origin: "user" })]);
+    expect(screen.queryByTestId("file-row-0-locate")).toBeNull();
+    expect(screen.getByTestId("file-row-0-origin").textContent).toBe("我上传的");
   });
 });

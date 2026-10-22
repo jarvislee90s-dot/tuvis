@@ -93,18 +93,6 @@ export function UsageConfigPanel({ t, instanceId }: UsageConfigPanelProps) {
       >
         <div ref={overrideRef} className="space-y-3">
           <PriceOverrideManager t={t} prefill={prefill} onPrefillHandled={() => setPrefill(null)} />
-          {/* 旧版入口只作为一行脚注，详细说明在 Info 浮窗里，避免抢占四价覆盖的位置 */}
-          <div className="flex items-start gap-1.5 border-t pt-2">
-            <p className="text-muted-foreground text-[11px] leading-relaxed">
-              {t("usage.config.legacyMoved")}
-            </p>
-            <UsageInfoTip
-              label={t("usage.config.help.legacyLabel")}
-              testId={`usage-config-legacy-info-${instanceId}`}
-            >
-              {t("usage.config.help.legacy")}
-            </UsageInfoTip>
-          </div>
         </div>
       </UsageDisclosure>
     </div>

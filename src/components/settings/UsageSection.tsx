@@ -9,7 +9,7 @@
 //  2 `miniBarRange`          原生 `<select>`：当日 / 近 5 小时 / 近 7 天
 //  3 `miniBarToolRows`       `inputMode="numeric"` + 手动过滤数字，夹取 **1–7**（默认 3；上限 7 是
 //                            浮窗可用高度的硬约束，与 D20 的固定 5 行共同保证不越界）
-//  4 `detailRetentionDays`   同上，夹取 **1–3650**；提示明示「N 天前无明细」
+//  4 `detailRetentionDays`   同上，夹取 **1–90**；提示明示「N 天前无明细」
 //  5 `collectIntervalMin`    同上，夹取 **1–1440**
 //  6 `providerMapRules`      **已从界面撤下**（2026-10-07）→ 见文件内注释
 //  7 `exportQuote`           **已搬走**（2026-10-07 B1）→ 看板导出条的 `UsageQuoteEditor`
@@ -72,9 +72,51 @@ function clampDigits(raw: string, min: number, max: number): number | null {
 
 const TOOL_ROWS_RANGE = [1, 7] as const;
 
-const RETENTION_RANGE = [1, 3650] as const;
+const RETENTION_RANGE = [1, 90] as const;
 
 const INTERVAL_RANGE = [1, 1440] as const;
+
+/** 数字设置输入：编辑期保留字符串草稿，失焦/Enter 才夹取并保存，避免逐字符重渲染导致光标跳动。 */
+function NumericSettingInput({
+  id,
+  testId,
+  range,
+  value,
+  className,
+  onCommit,
+}: {
+  id: string;
+  testId: string;
+  range: readonly [number, number];
+  value: number;
+  className: string;
+  onCommit(next: number): void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const commit = () => {
+    if (draft === null) return;
+    const next = clampDigits(draft, range[0], range[1]);
+    setDraft(null);
+    if (next !== null && next !== value) onCommit(next);
+  };
+  return (
+    <Input
+      id={id}
+      data-testid={testId}
+      inputMode="numeric"
+      className={className}
+      value={draft ?? String(value)}
+      onChange={(event) => setDraft(event.currentTarget.value.replace(/\D/g, ""))}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          commit();
+        }
+      }}
+    />
+  );
+}
 
 export function UsageSection() {
   const { t } = useAppTranslation();
@@ -124,16 +166,6 @@ export function UsageSection() {
   const change = (patch: UsageSettingsPatch) => {
     setForm((f) => (f ? { ...f, ...patch } : f));
     void save(patch);
-  };
-
-  const onNumberChange = (
-    raw: string,
-    [min, max]: readonly [number, number],
-    key: "miniBarToolRows" | "detailRetentionDays" | "collectIntervalMin"
-  ) => {
-    const value = clampDigits(raw, min, max);
-    if (value === null) return;
-    change({ [key]: value } as UsageSettingsPatch);
   };
 
   // 换宠物 → 姿态回退 `random`（见文件头第三条纪律）。`subscribeConfig` 覆盖同窗口与跨窗口两条路径；
@@ -220,15 +252,13 @@ export function UsageSection() {
               hint={t("settings.usage.miniBarToolRowsHint")}
               htmlFor="usage-minibar-tool-rows"
             >
-              <Input
+              <NumericSettingInput
                 id="usage-minibar-tool-rows"
-                data-testid="usage-minibar-tool-rows"
-                inputMode="numeric"
+                testId="usage-minibar-tool-rows"
+                range={TOOL_ROWS_RANGE}
                 className="h-8 w-16 text-right font-mono text-sm tabular-nums"
                 value={form.miniBarToolRows}
-                onChange={(e) =>
-                  onNumberChange(e.currentTarget.value, TOOL_ROWS_RANGE, "miniBarToolRows")
-                }
+                onCommit={(next) => change({ miniBarToolRows: next })}
               />
             </SettingRow>
             <div className="border-t" />
@@ -243,15 +273,13 @@ export function UsageSection() {
               }
               htmlFor="usage-detail-retention-days"
             >
-              <Input
+              <NumericSettingInput
                 id="usage-detail-retention-days"
-                data-testid="usage-detail-retention-days"
-                inputMode="numeric"
+                testId="usage-detail-retention-days"
+                range={RETENTION_RANGE}
                 className="h-8 w-20 text-right font-mono text-sm tabular-nums"
                 value={form.detailRetentionDays}
-                onChange={(e) =>
-                  onNumberChange(e.currentTarget.value, RETENTION_RANGE, "detailRetentionDays")
-                }
+                onCommit={(next) => change({ detailRetentionDays: next })}
               />
             </SettingRow>
             <div className="border-t" />
@@ -261,15 +289,13 @@ export function UsageSection() {
               hint={t("settings.usage.collectIntervalHint")}
               htmlFor="usage-collect-interval-min"
             >
-              <Input
+              <NumericSettingInput
                 id="usage-collect-interval-min"
-                data-testid="usage-collect-interval-min"
-                inputMode="numeric"
+                testId="usage-collect-interval-min"
+                range={INTERVAL_RANGE}
                 className="h-8 w-20 text-right font-mono text-sm tabular-nums"
                 value={form.collectIntervalMin}
-                onChange={(e) =>
-                  onNumberChange(e.currentTarget.value, INTERVAL_RANGE, "collectIntervalMin")
-                }
+                onCommit={(next) => change({ collectIntervalMin: next })}
               />
             </SettingRow>
             <div className="border-t" />

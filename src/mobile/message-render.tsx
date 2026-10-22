@@ -5,7 +5,9 @@
 import { useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkParse from "remark-parse";
 import rehypeHighlight from "rehype-highlight";
+import { unified } from "unified";
 import type { SessionMessage } from "./api";
 
 /** 已知路径按长度降序（最长优先替换：路径互为前缀时不被短路径截断）。
@@ -15,20 +17,17 @@ export function sortedPaths(files: Set<string>): string[] {
   return [...files].sort((a, b) => b.length - a.length);
 }
 
-/** markdown 正文链接化预处理：把出现的已知路径替换为 `#file:` 内链，
- *  再由 components.a 拦截渲染成可点按钮。路径含 markdown 特殊字符（[]()）时
- *  该处替换可能不成链（保持原样文本，M3 接受） */
-export function linkifyMarkdown(text: string, files: string[]): string {
-  let out = text;
-  for (const p of files) {
-    if (!p) continue;
-    out = out.split(p).join(`[${p}](#file:${encodeURIComponent(p)})`);
-  }
-  return out;
-}
-
 /** 链接化分段元素：文本段或命中已知路径的文件段 */
 type LinkSegment = { type: "text" | "file"; value: string };
+
+interface MarkdownNode {
+  type: string;
+  value?: string;
+  url?: string;
+  title?: string | null;
+  children?: MarkdownNode[];
+  [key: string]: unknown;
+}
 
 /** 纯文本分段链接化：按已知路径把正文切成文本段与文件段（thinking / tool-result 用） */
 export function linkifySegments(text: string, files: string[]): LinkSegment[] {
@@ -50,6 +49,61 @@ export function linkifySegments(text: string, files: string[]): LinkSegment[] {
     segments = next;
   }
   return segments;
+}
+
+/** ReactMarkdown 所用的 CommonMark parser；代码位置与可渲染文本同源。 */
+const markdownParser = unified().use(remarkParse).use(remarkGfm);
+
+/** Markdown 正文中可链接的路径段；code / inlineCode / 既有链接节点不参与。 */
+export function linkifyMarkdownSegments(text: string, files: string[]): LinkSegment[] {
+  const tree = markdownParser.parse(text) as unknown as MarkdownNode;
+  const segments: LinkSegment[] = [];
+  const visit = (node: MarkdownNode) => {
+    if (
+      node.type === "code" ||
+      node.type === "inlineCode" ||
+      node.type === "link" ||
+      node.type === "linkReference"
+    )
+      return;
+    if (node.type === "text" && typeof node.value === "string") {
+      segments.push(...linkifySegments(node.value, files));
+      return;
+    }
+    node.children?.forEach(visit);
+  };
+  visit(tree);
+  return segments;
+}
+
+/** remark 插件：只把可见 Markdown 文本节点中的已知路径改成文件链接。 */
+export function remarkFileLinks(files: string[]) {
+  return () => (tree: MarkdownNode) => {
+    const transform = (node: MarkdownNode): MarkdownNode[] => {
+      if (
+        node.type === "code" ||
+        node.type === "inlineCode" ||
+        node.type === "link" ||
+        node.type === "linkReference"
+      )
+        return [node];
+      if (node.type === "text" && typeof node.value === "string") {
+        return linkifySegments(node.value, files).map((segment): MarkdownNode =>
+          segment.type === "file"
+            ? {
+                type: "link",
+                url: `#file:${encodeURIComponent(segment.value)}`,
+                title: null,
+                children: [{ type: "text", value: segment.value }],
+              }
+            : { type: "text", value: segment.value }
+        );
+      }
+      if (node.children !== undefined) node.children = node.children.flatMap(transform);
+      return [node];
+    };
+    if (tree.children !== undefined) tree.children = tree.children.flatMap(transform);
+  };
 }
 
 /** 计划正文抽取（2026-09-20 用户实测：ExitPlanMode 的整篇计划在手机上是 \n 字面量汤）。
@@ -96,7 +150,7 @@ export function useMessageRenderers({
   const renderMarkdown = useCallback(
     (text: string) => (
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkFileLinks(sorted)]}
         rehypePlugins={[rehypeHighlight]}
         components={{
           a: ({ href, children }) => {
@@ -106,7 +160,8 @@ export function useMessageRenderers({
                 <button
                   type="button"
                   data-testid="file-link"
-                  className="inline text-left break-all text-[var(--tx)] underline underline-offset-2"
+                  data-file-path={p}
+                  className="inline text-left break-all text-[var(--tx)] underline underline-offset-2 data-[jump-node=true]:rounded data-[jump-node=true]:bg-amber-500/40"
                   onClick={() => openFile(p)}
                 >
                   {children}
@@ -121,7 +176,7 @@ export function useMessageRenderers({
           },
         }}
       >
-        {linkifyMarkdown(text, sorted)}
+        {text}
       </ReactMarkdown>
     ),
     [openFile, sorted]
@@ -138,7 +193,8 @@ export function useMessageRenderers({
             key={i}
             type="button"
             data-testid="file-link"
-            className="break-all text-[var(--tx)] underline underline-offset-2"
+            data-file-path={seg.value}
+            className="break-all text-[var(--tx)] underline underline-offset-2 data-[jump-node=true]:rounded data-[jump-node=true]:bg-amber-500/40"
             onClick={() => openFile(seg.value)}
           >
             {seg.value}

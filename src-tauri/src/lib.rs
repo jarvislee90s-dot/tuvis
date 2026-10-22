@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod commands;
 pub mod database;
 pub mod errcode;
+mod file_identity;
 pub mod inject;
 pub mod linker;
 pub mod monitor;

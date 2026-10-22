@@ -654,6 +654,12 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // 原生审批与阻塞问答应答。**全部走既有 gated nest**——PIN 门禁内层 gate
         // 结构性覆盖，新端点不需要各自鉴权代码；所有响应 no-store。
         .route("/codex/thread", get(super::codex_ipc::thread_state))
+        // 同代只读历史分页（计划任务 4）：镜像已取得的 canonical 历史里读取更早消息；
+        // 只读、无写动作，门禁由本子路由内层 layer 结构性覆盖
+        .route(
+            "/codex/thread/messages",
+            get(super::codex_ipc::thread_messages),
+        )
         .route("/codex/thread/events", get(super::codex_ipc::thread_events))
         .route("/codex/action", get(super::codex_ipc::action_status))
         .route("/codex/queue", get(super::codex_ipc::queue_view))
@@ -2226,7 +2232,8 @@ mod tests {
             path_source: Box::new(|_, _, _| {
                 (
                     vec![crate::remote::files::FileEntry {
-                        path: "/absent/proj/src/main.rs".to_string(),
+                        path: "src/main.rs".to_string(),
+                        file_key: None,
                         last_seq: 1,
                         last_ts: None,
                         hits: 1,
@@ -2448,11 +2455,17 @@ mod tests {
         // M3+ 富化形状：结构化条目（camelCase）+ truncated
         let files_body = body_string(r).await;
         assert!(
-            files_body.contains("\"path\":\"/absent/proj/src/main.rs\"")
+            files_body.contains("\"path\":\"src/main.rs\"")
                 && files_body.contains("\"lastSeq\":1")
                 && files_body.contains("\"hits\":1")
                 && files_body.contains("\"truncated\":false"),
             "session-files 应透传注入路径源的结构化条目，实际 {files_body}"
+        );
+        let files_json: serde_json::Value = serde_json::from_str(&files_body).unwrap();
+        let expected_key = tmp.path().join("src/main.rs").to_string_lossy().to_string();
+        assert_eq!(
+            files_json["files"][0]["fileKey"], expected_key,
+            "文件池身份键须按预览端点使用的会话 cwd 解析，且不存在的文件也有键"
         );
     }
 

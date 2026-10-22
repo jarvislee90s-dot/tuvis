@@ -152,12 +152,5 @@ export function PricingStatusPanel({ t }: PricingStatusPanelProps) {
     );
   }
 
-  return (
-    <div className="space-y-2 text-sm">
-      {statusBody}
-      {/* 2026-10-20 第三轮：四价覆盖移入上方「显示与计价配置 → 高级覆盖」，
-          状态面板只保留启用/刷新/错误，避免同一页出现两个覆盖价管理器。 */}
-      <p className="text-muted-foreground text-xs">{t("usage.pricing.overridesMovedHint")}</p>
-    </div>
-  );
+  return <div className="space-y-2 text-sm">{statusBody}</div>;
 }

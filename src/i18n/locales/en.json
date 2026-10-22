@@ -504,14 +504,14 @@
     },
     "usage": {
       "title": "Usage statistics",
-      "desc": "Eight settings for usage collection, the pet mini bar and the share image.",
+      "desc": "Usage collection, pet mini bar, cost display and share-image settings.",
       "enabled": "Enable usage statistics",
       "enabledHint": "When off, no session file is scanned; the dashboard and mini bar keep showing the already-collected ledger.",
       "miniBarRange": "Mini bar range",
       "miniBarToolRows": "Mini bar tool rows",
       "miniBarToolRowsHint": "How many tools the mini bar's third line lists, 1–7 (3 by default).",
       "detailRetentionDays": "Detail retention (days)",
-      "detailRetentionHint": "Details older than {{days}} days are not kept (1–3650 days).",
+      "detailRetentionHint": "Details older than {{days}} days are not kept (1–90 days).",
       "collectIntervalMin": "Fallback collect interval (minutes)",
       "collectIntervalHint": "The dashboard and mini bar collect when they open; this interval only floors the background fallback ticker, 1–1440 minutes.",
       "displayCurrency": "Display currency",
@@ -1269,10 +1269,10 @@
       "refresh": "Refresh catalog",
       "noSnapshot": "No valid snapshot yet",
       "overrides": {
-        "title": "Four-rate override (advanced)",
-        "desc": "Applies globally by normalized model name with the highest priority; catalog refreshes never overwrite user values.",
-        "empty": "No four-rate overrides",
-        "add": "Add override",
+        "title": "Price rules",
+        "desc": "Fixed or time-of-day pricing, applied globally by normalized model name with the highest priority; catalog refreshes never overwrite user values.",
+        "empty": "No custom price rules",
+        "add": "Add rule",
         "edit": "Edit",
         "delete": "Delete",
         "model": "Model name",
@@ -1289,14 +1289,45 @@
         "releaseDate": "Release date",
         "snapshotDate": "Snapshot date",
         "noCatalog": "No active catalog source",
-        "saved": "Price override saved",
-        "deleteConfirm": "Delete this model's four-rate override?",
+        "saved": "Price rule saved",
+        "deleteConfirm": "Delete this model's price rule?",
         "currency": "Rate currency",
         "scopeAllChannels": "Scope: all channels sharing the same normalized model",
-        "helpLabel": "Four-rate override help",
-        "help": "Enter the model name only — no provider needed. Custom display names do not participate. Once saved, all channels share the price. It is not selected in pricing identities or reference rules.",
+        "helpLabel": "Custom price rule help",
+        "help": "A fixed rule overrides the four rates. A time-of-day rule uses the peak rates inside the weekday peak windows and the off-peak rates elsewhere. No provider is needed, and custom display names do not participate.",
         "modelHelpLabel": "Model name input help",
-        "modelHint": "Do not include a provider; with a slash the backend uses the last segment. It is stored under the normalized key (e.g. glm-5-3)."
+        "modelHint": "Do not include a provider; with a slash the backend uses the last segment. It is stored under the normalized key (e.g. glm-5-3).",
+        "timeEnabled": "Time-of-day pricing",
+        "timeHelpLabel": "Time-of-day pricing help",
+        "timeHint": "Uses peak rates inside Monday–Friday peak windows; all other times (including weekends) use off-peak rates. Public holidays are not handled.",
+        "timeEnabledHint": "The schedule only affects API billing peak/off-peak calculation",
+        "peakRates": "Peak rates",
+        "fixedRates": "Fixed rates",
+        "peakWindows": "Peak windows (multiple allowed)",
+        "addWindow": "Add window",
+        "weekdaysHint": "Monday–Friday; cross-midnight windows such as 22:00–02:00 are allowed; whole hours only.",
+        "windowStart": "Start",
+        "windowEnd": "End",
+        "windowCrossMidnight": "Cross-midnight counts into the next day",
+        "removeWindow": "Remove",
+        "timezone": "Time zone",
+        "timezoneAsiaShanghai": "China Standard Time (UTC+8)",
+        "timezoneUtc": "UTC",
+        "timezoneLocal": "System local",
+        "timezoneHint": "Only affects peak/off-peak calculation",
+        "offpeakRates": "Off-peak rates",
+        "discountLabel": "Peak ×",
+        "applyDiscount": "Fill off-peak",
+        "invalidDiscount": "Discount must be between 1 and 100 percent",
+        "atLeastOneWindow": "Add at least one peak window",
+        "windowInvalid": "Peak window start and end must differ",
+        "atLeastOneOffpeak": "Enter at least one off-peak rate",
+        "offpeakHint": "A blank off-peak component falls back to the catalog rate; if the catalog has none, that component stays unpriced.",
+        "kindTime": "Time-of-day",
+        "kindFixed": "Fixed",
+        "schedule": "Schedule",
+        "weekdaysShort": "Mon–Fri {{windows}} · {{timezone}}",
+        "windowOverlap": "Peak windows must not overlap"
       },
       "overridesMovedHint": "The four-rate override has moved to \"Display & pricing config → Advanced overrides\" above."
     },
@@ -1339,7 +1370,8 @@
         "pricingPrefixAmbiguous": "Prefix matched multiple models with different prices; left unpriced",
         "untrustedSource": "This source/granularity lacks provable billing semantics",
         "untrustedInputBuckets": "Day aggregation cannot distinguish input/cache semantics; output is priced only",
-        "conditionalBaseRate": "Multimodal/context-tier conditions exist; estimated at base text rates"
+        "conditionalBaseRate": "Multimodal/context-tier conditions exist; estimated at base text rates",
+        "timePriceDailyFallback": "Hourly detail is unavailable; estimated at off-peak rates"
       },
       "more": "Show more ({{n}})",
       "less": "Collapse",
@@ -1356,8 +1388,8 @@
       "pricingReleaseDateHint": "The model release date is not the price data date; price data is dated by the snapshot fetch time.",
       "currencyHintUsd": "Display currency: USD",
       "normalizedModel": "Normalized model",
-      "priceOverride": "User override",
-      "userOverride": "User override",
+      "priceOverride": "Custom price",
+      "userOverride": "Custom price",
       "sync": "Sync prices",
       "syncDone": "Prices synced · snapshot fetched {{time}}",
       "syncDoneNoSnapshot": "Refresh finished, but there is no valid price snapshot yet",
@@ -1365,7 +1397,10 @@
       "currencyFallback": "rate from cache/fallback",
       "convertedLegend": "Dashed underline = amount converted at the daily rate (native-currency prices have no underline)",
       "convertedPriceHint": "Converted at the daily rate",
-      "noSnapshotYet": "Pricing catalog enabled; fetching the price snapshot…"
+      "noSnapshotYet": "Pricing catalog enabled; fetching the price snapshot…",
+      "timeRule": "Time-of-day",
+      "timeRuleHint": "This row is priced by peak/off-peak hours; the unit price is a weighted average.",
+      "timeBreakdown": "Peak {{peak}} · Off-peak {{offpeak}} · daily fallback {{fallback}}"
     },
     "billing": {
       "title": "Channel assignment",
@@ -1497,7 +1532,7 @@
       "topList": "Top tools",
       "unavailable": "Not available",
       "unavailableAll": "Not available in any source",
-      "subagentLayer": "Counts are layered (parent sessions only); token totals include subagents"
+      "subagentLayer": "Session and tool-call counts are split by subagent scope; this card does not report tokens."
     },
     "notCollected": "Not collected yet",
     "footer": {
@@ -1544,9 +1579,9 @@
     "config": {
       "title": "Display & pricing config",
       "open": "Open config",
-      "desc": "Provider names, model names and pricing identities. A provider name applies globally to the same raw provider; the advanced four-rate override corrects prices. Display/estimate only — the ledger is never rewritten.",
-      "advanced": "Advanced overrides",
-      "advancedHint": "The four-rate override corrects catalog prices; legacy channel binding / reference rules moved to the usage dashboard's Records page.",
+      "desc": "Provider names, model names and pricing identities. A provider name applies globally to the same raw provider; the advanced custom price rule supports fixed or time-of-day pricing. Display/estimate only — the ledger is never rewritten.",
+      "advanced": "Custom price rules",
+      "advancedHint": "Fixed prices or weekday time-of-day rates; legacy billing attribution and reference rules remain in the Records footer.",
       "modelSection": {
         "title": "Provider / model entries",
         "desc": "Top 10 by usage in the last 7 days; edit provider names (global), model names and pricing identities.",
@@ -1583,23 +1618,33 @@
         "searchPlaceholder": "Search provider or model…",
         "expandAll": "Show all ({{count}})",
         "collapse": "Collapse",
-        "overridePrice": "Override this model's price",
-        "editOverridePrice": "Edit price override",
-        "priceOverriddenBadge": "Four-rate override applied"
+        "overridePrice": "Set custom price",
+        "editOverridePrice": "Edit custom price",
+        "priceOverriddenBadge": "Custom price applied",
+        "legend": "Legend",
+        "legendReadonly": "Read-only evidence",
+        "legendEditable": "Editable (bordered)",
+        "legendModified": "Modified (amber)",
+        "sortBy": "Sort",
+        "sortUsage": "Usage",
+        "sortProvider": "Raw provider",
+        "sortModel": "Raw model",
+        "sortAsc": "ascending",
+        "sortDesc": "descending"
       },
       "legacyMoved": "Legacy billing-channel binding / reference rules moved to the usage dashboard's Records page.",
       "help": {
         "panelLabel": "Display & pricing config help",
-        "panel": "Provider/model entries handle display names and pricing identities; the advanced four-rate override corrects catalog prices. Display/estimate only — the ledger is never rewritten.",
+        "panel": "Provider/model entries handle display names and pricing identities; the advanced \"Custom price rules\" section corrects catalog prices (fixed or time-of-day). Display/estimate only — the ledger is never rewritten.",
         "modelEntriesLabel": "Provider/model entries help",
         "modelEntries": "A provider name applies globally to the same raw provider; a model name only changes D-card row names; the pricing identity only selects from the models.dev catalog.",
         "pricingIdentityLabel": "Pricing identity help",
-        "pricingIdentity": "Selects a reference price from the curated catalog; it is a different layer from the four-rate override and the legacy reference rules. Models outside the curated set stay unpriced by default; the four-rate override is not in this dropdown.",
-        "advancedLabel": "Advanced overrides help",
-        "advanced": "The four-rate override applies globally by normalized model name and has the highest priority. It needs no provider and is not selected in rules or pricing identities. Legacy channel binding / reference rules moved to the Records page.",
+        "pricingIdentity": "Selects a reference price from the curated catalog; it is a different layer from custom price rules and the legacy reference rules. Models outside the curated set stay unpriced by default; custom price rules are not in this dropdown.",
+        "advancedLabel": "Custom price rules help",
+        "advanced": "Custom price rules apply globally by normalized model name with the highest priority: a fixed rule overrides the four rates, while a time-of-day rule uses peak rates inside Monday–Friday windows and off-peak rates elsewhere. No provider is needed, and they are not selected in pricing identities or reference rules.",
         "legacyLabel": "Legacy advanced features help",
         "legacy": "Billing channel binding splits subscriptions that log the same raw provider string; reference rules map log identities to catalog prices in bulk. Most users do not need them; use them on the usage dashboard's Records page.",
-        "priceBadge": "This model already has a four-rate override; it applies to all channels."
+        "priceBadge": "A custom price rule applies to this model; click to edit fixed or time-of-day rates."
       }
     },
     "costTable": {
@@ -1910,7 +1955,8 @@
     "protocolDriftSuspected": "The probe suspects protocol drift — the desktop returned a structure that differs from what Tuvis expects; restart the desktop and retry, and upgrade the client if it keeps happening",
     "probeInconclusive": "The read-only probe has no conclusion yet (the desktop may be closed, unowned or busy) — Tuvis retries later; until then, read that thread on the desktop",
     "deliveryUnknown": "Delivery outcome unknown — this message may have arrived or may not have; check on the desktop before deciding to resend (Tuvis never resends on its own)",
-    "decisionUnconfirmed": "The approval decision was accepted but not confirmed as effective — check on the desktop whether that request is gone; you can stop the turn if needed"
+    "decisionUnconfirmed": "The approval decision was accepted but not confirmed as effective — check on the desktop whether that request is gone; you can stop the turn if needed",
+    "migrateOverrideTimeFail": "Failed to migrate time-price columns: {{detail}}"
   },
   "mobile": {
     "composer": {
@@ -1997,6 +2043,66 @@
         "headless_queued": "Compatibility channel queued",
         "headless_failed": "Compatibility channel not delivered: {{reason}}",
         "headless_cancelled": "Compatibility channel cancelled: {{reason}}"
+      }
+    },
+    "artifacts": {
+      "source": {
+        "image_generation": "Generated",
+        "local_image": "Uploaded",
+        "mention": "Uploaded",
+        "file_change": "Modified",
+        "image_view": "Viewed",
+        "image_url": "External image",
+        "unknown": "Unknown source"
+      },
+      "imageIndex": "Image {{n}}",
+      "imageAlt": "Attached image",
+      "imagePending": "Image loads when it enters view",
+      "imageLoading": "Loading image…",
+      "openImage": "Preview image {{name}}",
+      "imageOverflow": "This turn has {{total}} images; at most the first {{shown}} are shown",
+      "fileChangeOverflow": "{{count}} more file changes not shown",
+      "serverOmitted": "{{count}} more attachments were not delivered due to a server budget limit",
+      "openFilePanel": "Open file panel",
+      "sourceFallback": "Source: {{label}}",
+      "externalImage": "External image",
+      "reason": {
+        "missingPath": "No file path, cannot preview",
+        "unresolvedFileId": "Only a file ID is available; it cannot be opened on this device",
+        "dataUrl": "Embedded images cannot be previewed and are never turned into downloads",
+        "unsupportedScheme": "Unsupported link scheme; only HTTP(S) is allowed",
+        "pathTooLong": "File path is too long to preview",
+        "fileKeyTooLong": "File identity is too long to link",
+        "missingUrl": "No link address, cannot open",
+        "urlTooLong": "Link is too long to open",
+        "unreadable": "This file cannot be read",
+        "denied": "This path is protected by the security policy and cannot be previewed",
+        "removed": "The file does not exist or has moved",
+        "tooLarge": "The file exceeds the preview limit and cannot be shown",
+        "notFile": "This path is not a file",
+        "notImage": "This path is not a displayable image",
+        "decodeFailed": "The image could not be decoded",
+        "unknown": "This reference cannot be previewed"
+      },
+      "locate": {
+        "action": "Locate the latest reference in messages",
+        "aria": "Locate the latest reference to {{name}} in messages",
+        "short": "Locate",
+        "searching": "Locating the latest reference… ({{pages}} of {{max}} pages searched)",
+        "hit": "Located the latest reference (page {{page}})",
+        "miss": "No reference to this file was found in the latest five pages of messages",
+        "missHint": "The lookup does not load older messages; this does not mean the file was never referenced",
+        "end": "Reached the earliest message without finding a reference to this file",
+        "returnPreview": "Back to file preview",
+        "returnPanel": "Back to file panel",
+        "retry": "Retry",
+        "dismiss": "Dismiss locate message",
+        "failure": {
+          "historyIncomplete": "History is not fully loaded yet; the lookup stopped (you can retry)",
+          "loadFailed": "Loading earlier messages failed; the lookup stopped (you can retry)",
+          "cursorInvalid": "The history cursor is invalid (history may have changed); the lookup stopped (you can retry)",
+          "generationInvalid": "The history generation is invalid (the session changed); the lookup stopped (you can retry)"
+        }
       }
     }
   }

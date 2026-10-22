@@ -467,6 +467,15 @@ pub fn init(conn: &Connection) {
             cache_read_scaled   INTEGER,
             cache_write_scaled  INTEGER,
             output_scaled       INTEGER,
+            -- 分时价格（2026-10-21）：time_enabled=1 时上面四价 = 高峰价，
+            -- offpeak_* = 低谷价；time_windows 为 JSON 数组（start/end HH:00）。
+            time_enabled        INTEGER NOT NULL DEFAULT 0 CHECK(time_enabled IN (0,1)),
+            time_timezone       TEXT NOT NULL DEFAULT 'asiaShanghai',
+            time_windows        TEXT,
+            offpeak_input_scaled        INTEGER,
+            offpeak_cache_read_scaled   INTEGER,
+            offpeak_cache_write_scaled  INTEGER,
+            offpeak_output_scaled       INTEGER,
             updated_at          INTEGER NOT NULL,
             CHECK (
                 input_scaled IS NOT NULL OR cache_read_scaled IS NOT NULL
@@ -477,6 +486,12 @@ pub fn init(conn: &Connection) {
                 AND (cache_read_scaled IS NULL OR cache_read_scaled >= 0)
                 AND (cache_write_scaled IS NULL OR cache_write_scaled >= 0)
                 AND (output_scaled IS NULL OR output_scaled >= 0)
+            ),
+            CHECK (
+                (offpeak_input_scaled IS NULL OR offpeak_input_scaled >= 0)
+                AND (offpeak_cache_read_scaled IS NULL OR offpeak_cache_read_scaled >= 0)
+                AND (offpeak_cache_write_scaled IS NULL OR offpeak_cache_write_scaled >= 0)
+                AND (offpeak_output_scaled IS NULL OR offpeak_output_scaled >= 0)
             )
         );
         -- 模型条目配置（2026-10-20 计划 §2.1）：自定义模型显示名 + 计价身份覆盖。

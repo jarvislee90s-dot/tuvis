@@ -96,3 +96,11 @@ macOS 金样 5 条事实**同构**（T2 逐项核对全 ✓，含 `tail:0:local:
 附带发现（如实登记）：本 build 的随包 CLI 是 **`0.163.0-alpha.11`**（4894 上是
 `0.163.0-alpha.10.2`）→ **CLI 随 Desktop 一起漂移**，这实证了账本键必须带 `cli_id`
 （只看 build 会把「同 build、不同 CLI」的证据混用）。
+## 2026-10-21 附件任务取证状态
+现有 OBSERVED canonical 快照没有 `imageGeneration`、`localImage`、`mention`、
+`fileChange`、`imageView` 或用户图片 URL／fileId 分支。此次没有新增 OBSERVED
+附件文件：本机仅有已有私人会话可供 IPC 读取；在不读取私人对话且不触发真实
+会话动作的约束下，无法安全取得含附件的真实样本。字段名的 macOS 静态核验与
+未完成的 Windows 附件核验见
+`docs/superpowers/reviews/2026-10-20-codex-artifact-field-evidence.md`。
+独立合成回归输入位于同级 `artifacts/`，不得当作真实 canonical 形态。

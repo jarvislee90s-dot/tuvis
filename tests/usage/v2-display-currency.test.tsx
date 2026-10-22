@@ -75,6 +75,8 @@ function costRow(overrides: Partial<CostRow> = {}): CostRow {
     normalizedModelId: "gpt-5",
     pricingReleaseDate: "2025-08-07",
     priceOverride: false,
+    priceRuleKind: "none",
+    timeBreakdown: null,
     displayModelName: null,
     ...overrides,
   };

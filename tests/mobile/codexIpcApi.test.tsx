@@ -3,8 +3,10 @@ import {
   CODEX_SSE_DEGRADE_AFTER,
   CODEX_SSE_RECONNECT_BASE_MS,
   CODEX_THREAD_EVENTS_PATH,
+  CODEX_THREAD_MESSAGES_PATH,
   CODEX_THREAD_PATH,
   fetchCodexAction,
+  fetchCodexMessagesPage,
   fetchCodexQueue,
   fetchCodexThread,
   newActionId,
@@ -12,6 +14,7 @@ import {
   retractCodexAction,
   subscribeCodexThread,
   type CapabilitySet,
+  type MessagesPage,
   type ThreadProjection,
 } from "@/mobile/codexIpcApi";
 import { sessionSend, type SendResult } from "@/mobile/api";
@@ -44,8 +47,22 @@ function projection(over: Partial<ThreadProjection> = {}): ThreadProjection {
     capabilities: caps(),
     runtimeStatus: "idle",
     contentState: "ready",
-    messages: [{ id: "m-1", role: "user", kind: "user_input", text: "你好", ts: 1000 }],
+    messages: [
+      {
+        id: "m-1",
+        role: "user",
+        kind: "user_input",
+        text: "你好",
+        ts: 1000,
+        turnId: null,
+        artifacts: [],
+        turnImageCount: 0,
+        omittedArtifactCount: 0,
+      },
+    ],
     truncated: false,
+    // 服务端新载荷恒序列化 historyToken（旧载荷缺省由归一化补空串）
+    historyToken: "",
     pending: [],
     ...over,
   };
@@ -65,6 +82,9 @@ function receipt(delivery: string) {
 interface Routes {
   thread?: ThreadProjection;
   threadStatus?: number;
+  /** Task 5：同代只读历史页（未设时按 end 兜底） */
+  messages?: MessagesPage;
+  messagesStatus?: number;
   action?: Record<string, unknown>;
   actionStatus?: number;
   respond?: Record<string, unknown>;
@@ -99,6 +119,23 @@ function installFetch() {
         status: 200,
         headers: { "content-type": "text/event-stream" },
       });
+    }
+    // Task 5：页端点排在投影端点之前（/codex/thread/messages ⊃ /codex/thread）
+    if (url.includes(CODEX_THREAD_MESSAGES_PATH)) {
+      if (routes.messagesStatus) return new Response("no", { status: routes.messagesStatus });
+      return new Response(
+        JSON.stringify(
+          routes.messages ?? {
+            messages: [],
+            historyToken: "",
+            revision: 7,
+            nextBefore: null,
+            status: "end",
+            reasonCode: null,
+          }
+        ),
+        { status: 200 }
+      );
     }
     if (url.includes(CODEX_THREAD_PATH)) {
       if (routes.threadStatus) return new Response("no", { status: routes.threadStatus });
@@ -466,5 +503,228 @@ describe("codexIpcApi：subscribeCodexThread（SSE 订阅）", () => {
     expect(es.closed).toBe(true);
     es.emit("snapshot", projection());
     expect(onState).not.toHaveBeenCalled();
+  });
+});
+
+it("旧消息载荷补齐附件默认值", async () => {
+  installFetch();
+  // 旧后端载荷：没有 turnId / artifacts / 计数（模拟升级前的投影）。
+  routes.thread = projection({
+    messages: [{ id: "m-1", role: "user", kind: "user_input", text: "你好", ts: 1000 }],
+  });
+  const p = await fetchCodexThread("s");
+  expect(p?.messages[0]).toMatchObject({
+    turnId: null,
+    artifacts: [],
+    turnImageCount: 0,
+    omittedArtifactCount: 0,
+  });
+});
+
+it("新附件字段按 Rust DTO 原样透出（camelCase，不重排字段）", async () => {
+  installFetch();
+  const artifact = {
+    artifactId: "t-1/artifact/0",
+    kind: "image",
+    source: "image_generation",
+    path: "/project/generated.png",
+    url: null,
+    fileKey: "/project/generated.png",
+    ordinal: 1,
+    imageIndexInTurn: 1,
+    summary: "Synthetic image description",
+    sourceStatus: "synthetic-complete",
+    changeKind: null,
+    unavailableReason: null,
+  } as const;
+  routes.thread = projection({
+    messages: [
+      {
+        id: "m-gen",
+        role: "system",
+        kind: "imageGeneration",
+        text: "",
+        ts: null,
+        turnId: "t-1",
+        artifacts: [{ ...artifact }],
+        turnImageCount: 3,
+        omittedArtifactCount: 2,
+      },
+    ],
+  });
+  const p = await fetchCodexThread("s");
+  expect(p?.messages[0]).toMatchObject({
+    turnId: "t-1",
+    artifacts: [artifact],
+    turnImageCount: 3,
+    omittedArtifactCount: 2,
+  });
+});
+
+// ==== Task 5：线程 historyToken + 同代只读消息页 ====
+
+function messagesPage(over: Partial<MessagesPage> = {}): MessagesPage {
+  return {
+    messages: [],
+    historyToken: "",
+    revision: 7,
+    nextBefore: null,
+    status: "end",
+    reasonCode: null,
+    ...over,
+  };
+}
+
+/** 旧投影消息（无 Task 3/4 新字段），用于旧载荷降级用例 */
+function legacyMessage(id: string) {
+  return { id, role: "user", kind: "user_input", text: id, ts: 1000 };
+}
+
+describe("codexIpcApi：historyToken 归一化（Task 5）", () => {
+  it("thread_history_token_legacy_defaults_empty：旧载荷缺 historyToken → 空串（不得据此分页）", async () => {
+    installFetch();
+    routes.thread = projection({ messages: [legacyMessage("m-1")] });
+    // 模拟升级前载荷：连 historyToken 键都没有
+    delete (routes.thread as Record<string, unknown>).historyToken;
+    const p = await fetchCodexThread("s1");
+    expect(p?.historyToken).toBe("");
+    // 消息兼容字段同样补齐（首帧/GET/轮询同一归一化入口）
+    expect(p?.messages[0]).toMatchObject({
+      turnId: null,
+      artifacts: [],
+      turnImageCount: 0,
+      omittedArtifactCount: 0,
+    });
+  });
+
+  it("thread_history_token_passthrough：新载荷原样透出", async () => {
+    installFetch();
+    routes.thread = projection({ historyToken: "v1-tag-1-2-3-deadbeef" });
+    const p = await fetchCodexThread("s1");
+    expect(p?.historyToken).toBe("v1-tag-1-2-3-deadbeef");
+  });
+
+  it("sse_frames_share_history_token_normalization：首帧/增量帧同一归一化（缺省空串、新值透传）", () => {
+    MockEventSource.reset();
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", MockEventSource);
+    installFetch();
+    const onState = vi.fn();
+    const stop = subscribeCodexThread("s1", onState, vi.fn());
+    const es = MockEventSource.latest();
+    // 旧帧：JSON 里没有 historyToken
+    es.emit("snapshot", JSON.stringify({ ...projection(), historyToken: undefined }));
+    expect(onState.mock.calls[0][0].historyToken).toBe("");
+    es.emit("state", projection({ historyToken: "v1-new" }));
+    expect(onState.mock.calls[1][0].historyToken).toBe("v1-new");
+    expect(onState).toHaveBeenCalledTimes(2);
+    stop();
+  });
+});
+
+describe("codexIpcApi：fetchCodexMessagesPage（同代只读历史页）", () => {
+  it("messages_page_query_contract：session_id/history_token/before_id/limit 与 AbortSignal 原样上送", async () => {
+    installFetch();
+    const ctrl = new AbortController();
+    routes.messages = messagesPage({
+      status: "ready",
+      messages: [legacyMessage("m-1")],
+      historyToken: "v1-next",
+      nextBefore: "m-1",
+    });
+    const p = await fetchCodexMessagesPage({
+      sessionId: "s1",
+      historyToken: "v1-curr",
+      beforeId: "m-2",
+      limit: 20,
+      signal: ctrl.signal,
+    });
+    expect(p.status).toBe("ready");
+    expect(p.historyToken).toBe("v1-next");
+    expect(p.nextBefore).toBe("m-1");
+    const call = fetchMock.mock.calls.find(([u]) => String(u).includes(CODEX_THREAD_MESSAGES_PATH));
+    expect(call).toBeTruthy();
+    const u = new URL(String(call![0]), "http://localhost");
+    expect(u.pathname).toBe(CODEX_THREAD_MESSAGES_PATH);
+    expect(u.searchParams.get("session_id")).toBe("s1");
+    expect(u.searchParams.get("history_token")).toBe("v1-curr");
+    expect(u.searchParams.get("before_id")).toBe("m-2");
+    expect(u.searchParams.get("limit")).toBe("20");
+    expect((call![1] as RequestInit).signal).toBe(ctrl.signal);
+
+    // before_id / limit 缺省时不上送（服务端按「末端锚点 / 默认 50」处理）
+    await fetchCodexMessagesPage({ sessionId: "s1", historyToken: "v1-curr" });
+    const u2 = new URL(String(fetchMock.mock.calls[1][0]), "http://localhost");
+    expect(u2.searchParams.has("before_id")).toBe(false);
+    expect(u2.searchParams.has("limit")).toBe(false);
+  });
+
+  it("messages_page_normalizes_legacy_messages：页内旧消息补默认值，缺省字段安全降级", async () => {
+    installFetch();
+    routes.messages = {
+      messages: [legacyMessage("m-1")],
+      historyToken: "v1-next",
+      revision: 3,
+      nextBefore: "m-1",
+      status: "ready",
+      reasonCode: null,
+    } as unknown as MessagesPage;
+    const p = await fetchCodexMessagesPage({ sessionId: "s1", historyToken: "v1-curr" });
+    expect(p.messages[0]).toMatchObject({
+      id: "m-1",
+      turnId: null,
+      artifacts: [],
+      turnImageCount: 0,
+      omittedArtifactCount: 0,
+    });
+
+    // 旧/残缺页载荷缺 historyToken / revision / nextBefore / reasonCode → 安全默认
+    routes.messages = { messages: [], status: "end" } as unknown as MessagesPage;
+    await expect(
+      fetchCodexMessagesPage({ sessionId: "s1", historyToken: "v1-curr" })
+    ).resolves.toEqual({
+      messages: [],
+      historyToken: "",
+      revision: null,
+      nextBefore: null,
+      status: "end",
+      reasonCode: null,
+    });
+  });
+
+  it("messages_page_non_ready_has_no_messages：非正常状态不得带出半页消息（不伪装完整空页）", async () => {
+    installFetch();
+    routes.messages = messagesPage({
+      status: "cursor_invalid",
+      reasonCode: "history_rewritten",
+      messages: [legacyMessage("m-1")],
+    });
+    const p = await fetchCodexMessagesPage({ sessionId: "s1", historyToken: "v1-curr" });
+    expect(p.status).toBe("cursor_invalid");
+    expect(p.reasonCode).toBe("history_rewritten");
+    expect(p.messages).toEqual([]);
+    expect(p.nextBefore).toBeNull();
+  });
+
+  it("messages_page_malformed_payload_rejected：缺 status / 枚举外 status / 缺 messages → ApiError", async () => {
+    installFetch();
+    for (const bad of [{ messages: [] }, { messages: [], status: "ok" }, { status: "ready" }]) {
+      routes.messages = bad as unknown as MessagesPage;
+      await expect(
+        fetchCodexMessagesPage({ sessionId: "s1", historyToken: "v1-curr" })
+      ).rejects.toThrow("malformed messages page payload");
+    }
+  });
+
+  it("messages_page_http_error_throws：400（非法 limit/缺 token）等非 2xx 抛 ApiError", async () => {
+    installFetch();
+    routes.messagesStatus = 400;
+    const err = await fetchCodexMessagesPage({
+      sessionId: "s1",
+      historyToken: "v1-curr",
+      limit: 51,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(400);
   });
 });

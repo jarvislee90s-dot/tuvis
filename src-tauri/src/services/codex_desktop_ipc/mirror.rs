@@ -14,16 +14,72 @@
 //!   新 epoch（换代后）不与旧 revision 比大小（状态已清）；
 //! * 预算：单 Thread 镜像 16 MiB；投影正文尾窗 1 MiB / 500 条并标 truncated；
 //!   最新一条自身超窗时截头保底保留（绝不把整份投影清成 0 条）。
+//!
+//! ## 同代只读分页（任务 4）
+//!
+//! 分页与尾窗共用**同一个完整 canonical 投影器**（[`project_full_messages`]），但
+//! **不经过**尾窗裁剪（[`bound_messages`] 只由 [`ThreadMirror::project`] 使用）：尾窗
+//! 是展示窗口，不能用来判断「还有没有更早消息」。
+//!
+//! `historyToken` 组成（v2，`ThreadMirror::history_token` 是唯一实现）：
+//!
+//! ```text
+//! v2-<clientTag>-<epoch>-<generation>-<buildGeneration>-<contentEpoch>-<digest>
+//!   clientTag        = sha256(owner clientId) 前 4 字节（8 hex）
+//!   epoch/generation = 镜像绑定的 OwnerLease 代际（换代即失效）
+//!   buildGeneration  = 本镜像每装订一次新 snapshot 递增（镜像重建即失效；patch 不动）
+//!   contentEpoch     = 已结算内容观察代（见下；只随已结算 Turn 的渲染内容变化）
+//!   digest           = 前缀形：sha256("tuvis.codex.messages.history"
+//!                               || len(hostId)||hostId || len(threadId)||threadId
+//!                               || len(clientId)||clientId || epoch || generation
+//!                               || buildGeneration || len(prefix)
+//!                               || 游标之前每条消息 id 的 FNV-1a 64 指纹) 前 16 字节
+//!                      根锚点形："root" || sha256("tuvis.codex.messages.root"
+//!                               || len(hostId)||hostId || len(threadId)||threadId)
+//!                               前 4 字节（8 hex）
+//!   prefix           = **严格早于游标**的消息身份序（不含游标自身与更新消息）
+//! ```
+//!
+//! 两类 token 的职责：
+//! * **根锚点**（`project()` 下发，digest = root+线程标签）：只绑 owner/重建代与
+//!   `contentEpoch`，**不绑尾窗被裁掉的前缀长度**——尾窗随普通追加/流式补全前移时
+//!   token 逐字不变（R2）。它只用于给「第一页」找锚点；游标本身仍单独校验。
+//!   线程标签保证 A 线程的根锚点不能在 B 线程上复用（同 owner/同 buildGeneration
+//!   时元数据会重合，只靠 `root` 字面量无法区分线程）。
+//! * **前缀形**（`messages_page` 逐页下发）：额外绑定下一页游标之前的前缀 id 序，
+//!   续翻安全。
+//!
+//! 内容观察（P1/P2 修复，复核 F1/F4 后加强）：每次投影/分页在**已算好的完整
+//! canonical 投影**上，按连续 `turn_id` 段登记**每一个** Turn 的消息身份序与逐条
+//! 渲染指纹（id/role/kind/文本/附件序列化），并**保序**保存。
+//!
+//! 不推进代的情形：普通尾部追加（新 Turn / Turn 内追加）、仍在产出的 Turn 的末条
+//! 消息流式补全、尾窗前移。推进代的情形：任何已观察 Turn 内同 id 的正文/附件改写、
+//! 消息删除、Turn 内中段插入或重排、Turn 删除、**跨 Turn 换序**，以及已结算 Turn
+//! 末条消息的改写（`status = completed` 的 Turn 没有流式豁免）。
+//!
+//! 相比「整体排除最新 Turn」：单 Turn 超过一页（例如 600 条）时，其 m050—m099 这类
+//! 已分页内容不再是无人看守的可变区；而活动 Turn 的正常补全仍不会清空历史页。
+//! 顺序敏感由保序表承担，跨 Turn 换序因此可以被发现（键值表比不出来）。
+//!
+//! 代际段（tag/epoch/generation/buildGeneration）不一致 → `unavailable`
+//! （`generation_mismatch`）；代际一致但 `contentEpoch` 或前缀 digest 不一致 →
+//! `cursor_invalid`（`history_rewritten`）。token 不参与鉴权，只做一致性锚。
 
-use super::history_view::HistoryView;
+use super::artifacts::{
+    bounded_id, bounded_summary_source, has_input_artifacts, project_input_artifacts,
+    project_item_artifacts, TurnArtifacts,
+};
+use super::history_view::{HistoryView, ViewHealth};
 use super::pending::{DecisionPolicy as PendingDecisionPolicy, PendingProjector};
 use super::types::{
-    CapabilitySet, ContentState, ControlAvailability, OwnerLease, ProbeStatus, ProjectedMessage,
-    ProtocolError, ThreadKey, ThreadProjection,
+    CapabilitySet, ContentState, ControlAvailability, MessagesPage, MessagesPageStatus, OwnerLease,
+    ProbeStatus, ProjectedMessage, ProtocolError, ThreadKey, ThreadProjection,
 };
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 /// 单 Thread 镜像字节预算。
 pub const MIRROR_BUDGET: usize = 16 * 1024 * 1024;
@@ -38,6 +94,19 @@ pub const PROJECTION_TAIL_BYTES: usize = 1024 * 1024;
 /// 单条正文尾窗保底上限：最新一条自身超 [`PROJECTION_TAIL_BYTES`] 时该条不整条
 /// 裁掉，正文截头到该字节数（字符边界对齐）加显式截断标记。
 pub const PROJECTION_HEAD_BYTES: usize = 64 * 1024;
+/// 只读历史页最多返回条数（HTTP `limit` 上限；缺省同为 50）。
+pub const MESSAGES_PAGE_LIMIT: usize = 50;
+/// 只读历史页 `messages` 序列化字节上限（独立计价；**不经过**尾窗裁剪）。
+pub const MESSAGES_PAGE_BYTES: usize = 1024 * 1024;
+/// 历史页 token 版本前缀（形态变更即不兼容旧 token）。
+const HISTORY_TOKEN_VERSION: &str = "v2";
+/// 根锚点 digest 的字面前缀（后接 8 hex 线程标签）。
+const ROOT_DIGEST_PREFIX: &str = "root";
+/// 历史 token 有界上限：最长形态 = 3 + 8 + 4×(1+20) + 1 + 32 ≈ 128 字符。
+const HISTORY_TOKEN_MAX_LEN: usize = 160;
+
+/// 单条正文被页预算裁剪时的显式机器码（页级 `reasonCode`；不是错误状态）。
+const PAGE_TRUNCATED_REASON: &str = "page_truncated";
 
 /// 全体镜像字节账本：claim(key, old, new) 原子预留，超总预算返回 false（镜像转
 /// stale + Capacity 拒绝，等内存释放后由下次 ensure/事件救活）；mirror 卸载/
@@ -110,6 +179,38 @@ impl MirrorEffect {
     };
 }
 
+/// 内容观察状态（token v2 的 `contentEpoch` 来源）。
+///
+/// **登记全部 Turn**（不是「除最新以外」）：最新 Turn 里已翻页 / 已离开尾窗的内容
+/// 一旦被改写，必须能让旧页失效——单 Turn 超 500 条时，把整个最新 Turn 当作
+/// 「流式可变区」会让 m050—m099 这类已分页内容永远陈旧。
+///
+/// 记录按 canonical 顺序存放（`Vec`，不是 `HashMap`）：跨 Turn 整体换序同样是
+/// 历史改写，键值表比较不出来，顺序表可以。
+///
+/// 唯一豁免：**仍在产出**的 Turn 的**末条消息**——它可能正在流式补全，每来一个
+/// delta 都推进内容代会把用户刚翻出来的历史页清空。已结算 Turn（status =
+/// `completed`）没有这个豁免，末条消息的改写同样推进内容代。
+#[derive(Default)]
+struct ContentObservation {
+    /// 内容观察代：已结算内容变化、Turn 删除或换序时 +1。
+    epoch: u64,
+    /// 每个 Turn 的观察记录，canonical 旧→新。
+    turns: Vec<TurnObservation>,
+}
+
+/// 单个 Turn 的观察记录（canonical 顺序，与投影同源）。
+struct TurnObservation {
+    /// Turn 身份指纹（FNV-1a 64 over `turn_id`）。
+    turn: u64,
+    /// Turn 内每条消息的 id 指纹（canonical 顺序）。
+    ids: Vec<u64>,
+    /// 与 `ids` 一一对应的渲染内容指纹（id/role/kind/文本/附件）。
+    fingerprints: Vec<u64>,
+    /// 观察时该 Turn 是否仍在产出：活动 Turn 的末条消息允许流式增长、不参与比对。
+    active: bool,
+}
+
 pub struct ThreadMirror {
     key: ThreadKey,
     lease: Option<OwnerLease>,
@@ -129,6 +230,15 @@ pub struct ThreadMirror {
     size: usize,
     /// #172/T7：审批决策策略覆盖（未知 build 用 schema 档；`None` = 按能力位取证据档）
     approval_policy: Option<PendingDecisionPolicy>,
+    /// 镜像重建代（历史页 token 的一段）：每成功装订一次**新 snapshot**（含首帧、
+    /// 重拉、换代重建）递增；patch 是增量，不递增——否则流式补全会每帧打断分页。
+    build_generation: u64,
+    /// 最近一次装订是否因镜像预算被拒。预算拒绝后可能没有可用 state；分页必须报
+    /// `unavailable/mirror_capacity`，不得把「读不到」伪装成「没有更多」。
+    budget_refused: bool,
+    /// 已结算内容观察器：每次投影/分页在已算好的完整投影上顺带观察（不重投影）。
+    /// 锁内只做一次指纹集合比较与交换，不跨 await、不记录正文或路径。
+    content: Mutex<ContentObservation>,
 }
 
 impl Drop for ThreadMirror {
@@ -155,6 +265,9 @@ impl ThreadMirror {
             ledger: None,
             size: 0,
             approval_policy: None,
+            build_generation: 0,
+            budget_refused: false,
+            content: Mutex::new(ContentObservation::default()),
         }
     }
 
@@ -297,6 +410,9 @@ impl ThreadMirror {
         self.state = None;
         self.stale = true;
         self.history_complete = true;
+        // 清态后「上次预算拒绝」不再是当前事实：分页按 mirror_unavailable 如实上报，
+        // 不沿用旧原因码。
+        self.budget_refused = false;
         self.pending.reset();
     }
 
@@ -352,6 +468,8 @@ impl ThreadMirror {
             .cloned()
             .unwrap_or(Value::Null);
         self.adopt(rev, state)?;
+        // 镜像重建代：只在新 snapshot 装订成功时递增（patch 是增量，不动它）。
+        self.build_generation = self.build_generation.saturating_add(1);
         Ok(MirrorEffect {
             changed: true,
             need_snapshot: false,
@@ -428,6 +546,7 @@ impl ThreadMirror {
             .unwrap_or(usize::MAX);
         if size > MIRROR_BUDGET {
             self.stale = true;
+            self.budget_refused = true;
             return Err(ProtocolError::Capacity(format!(
                 "mirror exceeds per-thread budget: {size} > {MIRROR_BUDGET}"
             )));
@@ -437,12 +556,14 @@ impl ThreadMirror {
             let mut l = ledger.lock().expect("ledger lock");
             if !l.claim(&self.key, self.size, size) {
                 self.stale = true;
+                self.budget_refused = true;
                 return Err(ProtocolError::Capacity(format!(
                     "mirror exceeds global budget: total would exceed {} bytes",
                     l.cap_of()
                 )));
             }
         }
+        self.budget_refused = false;
         self.size = size;
         self.revision = Some(rev);
         self.history_complete = HistoryView::new(&state).turn_list_complete();
@@ -456,6 +577,9 @@ impl ThreadMirror {
     ///
     /// 审批策略优先取镜像上已下发的覆盖（[`ThreadMirror::set_approval_policy`]）；
     /// 没有覆盖时按能力位取证据档（老行为）。
+    /// `historyToken` 是**根锚点**（v2：只绑 owner/重建代与已结算内容代，不绑尾窗
+    /// 被裁掉的前缀长度）：客户端用它 + 尾窗最早一条作为第一次更早分页的入参。
+    /// 尾窗前移本身不换 token（R2）。
     pub fn project(&self, caps: CapabilitySet) -> ThreadProjection {
         match &self.approval_policy {
             Some(policy) => {
@@ -478,7 +602,11 @@ impl ThreadMirror {
     ) -> ThreadProjection {
         // R1：state 即 conversationState 本体，按根直读
         let state = self.state.clone().unwrap_or(Value::Null);
-        let messages = project_messages(&state);
+        let all = project_full_messages(&state);
+        // 已结算内容观察与投影共用同一次完整 canonical 投影（不额外投影）。
+        let content_epoch = self.observe_content(&all);
+        let (messages, truncated) = bound_messages(all);
+        let history_token = self.history_token(content_epoch, HistoryTokenDigest::Root);
         let content_state = content_state_of(self.state.as_ref());
         let requests = state
             .get("requests")
@@ -494,8 +622,9 @@ impl ThreadMirror {
             capabilities: caps,
             runtime_status: runtime_status(&state),
             content_state,
-            truncated: messages.1,
-            messages: messages.0,
+            truncated,
+            messages,
+            history_token,
             pending,
             // #172/T9a：探测只读事实由 **adapter** 盖章（镜像层不知道账本/单飞器）；
             // 这里先给诚实缺省（idle + 无码），adapter 随后覆盖。
@@ -507,6 +636,560 @@ impl ThreadMirror {
             owner_generation: self.lease.as_ref().map(|l| l.generation).unwrap_or(0),
         }
     }
+
+    /// **同代只读历史分页**（`GET /codex/thread/messages` 的唯一实现；同步、不跨
+    /// await、不重扫 rollout/磁盘）。复用完整 canonical 投影器，**不经过**尾窗裁剪。
+    ///
+    /// 状态映射（`reasonCode` 为有界机器码；非正常状态恒为空消息、`nextBefore=null`）：
+    ///
+    /// | 条件 | status | reasonCode |
+    /// | --- | --- | --- |
+    /// | 返回一页更早消息 | `ready` | null，或内容被裁时 `page_truncated` |
+    /// | 游标之前没有消息（空历史同） | `end` | null |
+    /// | 非空历史但没给游标 | `cursor_invalid` | `cursor_required` |
+    /// | 游标不在当前 canonical 投影里 | `cursor_invalid` | `cursor_not_found` |
+    /// | token 畸形 / 版本未知 | `cursor_invalid` | `invalid_history_token` |
+    /// | token 代际一致但已结算内容变化，或前缀已改写/删除/重排 | `cursor_invalid` | `history_rewritten` |
+    /// | token 的 owner/镜像重建代与当前不一致 | `unavailable` | `generation_mismatch` |
+    /// | 无镜像 state（未 hydrate / 已清态） | `unavailable` | `mirror_unavailable` |
+    /// | 镜像预算拒绝且无可用 state | `unavailable` | `mirror_capacity` |
+    /// | 历史结构不可读 | `unavailable` | `history_unreadable` |
+    /// | 历史列表不完整 / items 未载完 | `loading` | `history_incomplete` |
+    ///
+    /// 页预算：最多 `limit` 条且 `messages` 序列化 ≤ [`MESSAGES_PAGE_BYTES`]。预算不
+    /// 够时**从最旧一侧收缩**（保持与游标相邻、无空洞）；最新一条自身超预算时按
+    /// [`PROJECTION_HEAD_BYTES`] 截头并置 `page_truncated`，游标链仍可继续往前。
+    pub fn messages_page(
+        &self,
+        cursor: Option<&str>,
+        history_token: &str,
+        limit: usize,
+    ) -> MessagesPage {
+        let revision = self.revision;
+        let Some(state) = self.state.as_ref() else {
+            let reason = if self.budget_refused {
+                "mirror_capacity"
+            } else {
+                "mirror_unavailable"
+            };
+            return status_page(MessagesPageStatus::Unavailable, reason, revision);
+        };
+        // 历史健康先于游标判定：不完整/不可读时不能拿残缺投影回答「到头」。
+        let view = HistoryView::new(state);
+        if !view.readable() || view.health() != ViewHealth::Ok {
+            return status_page(
+                MessagesPageStatus::Unavailable,
+                "history_unreadable",
+                revision,
+            );
+        }
+        if !view.turn_list_complete() || view.items_incomplete() {
+            return status_page(MessagesPageStatus::Loading, "history_incomplete", revision);
+        }
+        let all = project_full_messages(state);
+        // 与投影同源的内容观察：分页也要在比对 token 前观察到最新已结算内容，
+        // 否则「先改写、后分页」会漏掉 epoch 推进。
+        let content_epoch = self.observe_content(&all);
+        if cursor.is_none() && !all.is_empty() {
+            // 非空历史必须显式给游标：不把「没给锚点」猜成最新一页（也不猜成到头）。
+            return status_page(
+                MessagesPageStatus::CursorInvalid,
+                "cursor_required",
+                revision,
+            );
+        }
+        let anchor = match cursor {
+            None => all.len(),
+            Some(id) => match all.iter().position(|m| m.id == id) {
+                Some(index) => index,
+                None => {
+                    return status_page(
+                        MessagesPageStatus::CursorInvalid,
+                        "cursor_not_found",
+                        revision,
+                    )
+                }
+            },
+        };
+        let fingerprints: Vec<u64> = all.iter().map(|m| id_fingerprint(&m.id)).collect();
+        match self.verify_history_token(history_token, &fingerprints[..anchor], content_epoch) {
+            HistoryTokenCheck::Ok => {}
+            HistoryTokenCheck::Malformed => {
+                return status_page(
+                    MessagesPageStatus::CursorInvalid,
+                    "invalid_history_token",
+                    revision,
+                )
+            }
+            HistoryTokenCheck::Generation => {
+                return status_page(
+                    MessagesPageStatus::Unavailable,
+                    "generation_mismatch",
+                    revision,
+                )
+            }
+            HistoryTokenCheck::Rewritten => {
+                return status_page(
+                    MessagesPageStatus::CursorInvalid,
+                    "history_rewritten",
+                    revision,
+                )
+            }
+        }
+        let limit = limit.clamp(1, MESSAGES_PAGE_LIMIT);
+        let start = anchor.saturating_sub(limit);
+        // 页字节预算：与尾窗同一计价口径（真实 JSON、数组括号与逗号）；从最新一条
+        // 往旧累计——预算不够只丢**更旧**的候选，保证游标链无空洞。
+        let mut kept = anchor;
+        let mut bytes = 2usize; // `[]`
+        let mut oversized = false;
+        while kept > start {
+            let index = kept - 1;
+            let extra = serialized_message_bytes(&all[index]) + usize::from(kept != anchor);
+            if bytes + extra > MESSAGES_PAGE_BYTES {
+                if kept == anchor {
+                    // 只有最新一条（紧邻游标）自身超预算：不丢弃、不假装完整。
+                    kept = index;
+                    oversized = true;
+                }
+                break;
+            }
+            bytes += extra;
+            kept = index;
+        }
+        if kept == anchor {
+            // 游标之前没有任何消息：真正到头（不是加载失败/预算拒绝）。
+            return MessagesPage {
+                messages: Vec::new(),
+                history_token: self.history_token(
+                    content_epoch,
+                    HistoryTokenDigest::Prefix(&fingerprints[..anchor]),
+                ),
+                revision,
+                next_before: None,
+                status: MessagesPageStatus::End,
+                reason_code: None,
+            };
+        }
+        let mut messages: Vec<ProjectedMessage> = all[kept..anchor].to_vec();
+        let mut reason_code = None;
+        if oversized && fit_page_message(&mut messages[0]) {
+            reason_code = Some(PAGE_TRUNCATED_REASON.to_string());
+        }
+        let next_before = messages.first().map(|m| m.id.clone());
+        MessagesPage {
+            messages,
+            // 下一页 token 绑定**下一页锚点**（本页最早一条）之前的前缀。
+            history_token: self.history_token(
+                content_epoch,
+                HistoryTokenDigest::Prefix(&fingerprints[..kept]),
+            ),
+            revision,
+            next_before,
+            status: MessagesPageStatus::Ready,
+            reason_code,
+        }
+    }
+
+    /// 历史代际 token（组成见模块文档）。`digest` 决定它是根锚点（投影）还是
+    /// 前缀形（下一页游标）。
+    fn history_token(&self, content_epoch: u64, digest: HistoryTokenDigest<'_>) -> String {
+        let (client_id, epoch, generation) = self
+            .lease
+            .as_ref()
+            .map(|l| (l.client_id.as_str(), l.epoch, l.generation))
+            .unwrap_or(("", 0, 0));
+        let digest = match digest {
+            HistoryTokenDigest::Root => self.root_digest(),
+            HistoryTokenDigest::Prefix(prefix) => self.prefix_digest(prefix),
+        };
+        format!(
+            "{HISTORY_TOKEN_VERSION}-{tag}-{epoch}-{generation}-{build}-{content_epoch}-{digest}",
+            tag = short_hash(client_id.as_bytes()),
+            build = self.build_generation,
+        )
+    }
+
+    /// 前缀形 digest：绑定**严格早于游标**的消息 id 指纹序（含线程/代际上下文）。
+    fn prefix_digest(&self, prefix: &[u64]) -> String {
+        let (client_id, epoch, generation) = self
+            .lease
+            .as_ref()
+            .map(|l| (l.client_id.as_str(), l.epoch, l.generation))
+            .unwrap_or(("", 0, 0));
+        let mut hasher = Sha256::new();
+        hasher.update(b"tuvis.codex.messages.history\n");
+        for field in [
+            self.key.host_id.as_str(),
+            self.key.thread_id.as_str(),
+            client_id,
+        ] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        hasher.update(epoch.to_le_bytes());
+        hasher.update(generation.to_le_bytes());
+        hasher.update(self.build_generation.to_le_bytes());
+        hasher.update((prefix.len() as u64).to_le_bytes());
+        for fingerprint in prefix {
+            hasher.update(fingerprint.to_le_bytes());
+        }
+        hasher
+            .finalize()
+            .iter()
+            .take(16)
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// 根锚点 digest：`root` + 线程短标签（不绑尾窗被裁掉的前缀长度，也不绑
+    /// contentEpoch——后者已在 metadata 段）。尾窗前移因此不改 token；线程标签
+    /// 保证 A 线程的根锚点不能在 B 线程上复用（同 owner / 同 buildGeneration 时
+    /// 其余元数据会重合）。
+    fn root_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tuvis.codex.messages.root\n");
+        for field in [self.key.host_id.as_str(), self.key.thread_id.as_str()] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        let tag: String = hasher
+            .finalize()
+            .iter()
+            .take(4)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("{ROOT_DIGEST_PREFIX}{tag}")
+    }
+
+    /// 内容观察：在已算好的完整 canonical 投影上按连续 Turn 段登记每个 Turn 的
+    /// 消息身份序与渲染指纹，并与上次观察比对。新 Turn 追加、活动 Turn 的末条流式
+    /// 增长不推进代；任何已观察内容的改写、删除、重排 → `epoch + 1`。返回 epoch。
+    fn observe_content(&self, all: &[ProjectedMessage]) -> u64 {
+        let observed = self.turn_observations(all);
+        let mut observation = self.content.lock().expect("content observation lock");
+        if !content_unchanged(&observation.turns, &observed) {
+            observation.epoch = observation.epoch.saturating_add(1);
+        }
+        // 无论是否推进代都换存：活动 Turn 的末条指纹必须跟上最新一次观察，
+        // 否则它结算那一刻会被误判成「内容刚刚变过」。
+        observation.turns = observed;
+        observation.epoch
+    }
+
+    /// **有证据**仍在产出的 Turn id 集合。证据面只有观测夹具里的 `inProgress`
+    /// （活动 Turn 的唯一已知形态）。`completed`、失败、已终止、缺状态都不在此列：
+    /// 未知状态不能自动获得历史一致性豁免（复核 G2），否则历史 failed Turn 的
+    /// 末条改写会继续漏检——「不是 completed」不等于「仍在流式」。
+    fn active_turn_ids(&self) -> HashSet<&str> {
+        const ACTIVE_STATUSES: &[&str] = &["inProgress"];
+        let Some(state) = self.state.as_ref() else {
+            return HashSet::new();
+        };
+        HistoryView::new(state)
+            .turns()
+            .iter()
+            .filter(|turn| {
+                turn.status
+                    .is_some_and(|status| ACTIVE_STATUSES.contains(&status))
+            })
+            .map(|turn| turn.turn_id)
+            .collect()
+    }
+
+    /// 把完整 canonical 投影切成按连续 `turn_id` 分组的观察记录。
+    /// 旧载荷缺 `turn_id` 时同属空串组（整段按一个 Turn 观察）。
+    ///
+    /// 活动豁免要**两个条件同时成立**：该 Turn 是有证据的活动状态（`inProgress`），
+    /// 且它是 canonical 顺序里的**最后一个** Turn——只有那里才可能正在产出。历史
+    /// Turn 无论标注什么状态都按已结算内容比对，多义/错标换不来豁免。
+    fn turn_observations(&self, all: &[ProjectedMessage]) -> Vec<TurnObservation> {
+        let active_ids = self.active_turn_ids();
+        let mut turns: Vec<TurnObservation> = Vec::new();
+        for message in all {
+            let turn_id = message.turn_id.as_deref().unwrap_or("");
+            let turn = id_fingerprint(turn_id);
+            if turns.last().is_none_or(|last| last.turn != turn) {
+                turns.push(TurnObservation {
+                    turn,
+                    ids: Vec::new(),
+                    fingerprints: Vec::new(),
+                    active: active_ids.contains(turn_id),
+                });
+            }
+            let last = turns.last_mut().expect("turn group just pushed");
+            last.ids.push(id_fingerprint(&message.id));
+            let mut hash = Fnv64::offset();
+            fingerprint_message(&mut hash, message);
+            last.fingerprints.push(hash.finish());
+        }
+        if let Some((_, history)) = turns.split_last_mut() {
+            for turn in history {
+                turn.active = false;
+            }
+        }
+        turns
+    }
+
+    /// token 校验：畸形 → Malformed；owner/重建代不同 → Generation；内容观察代
+    /// 不同或前缀 digest 不同 → Rewritten；根锚点在代际/内容一致时放行（游标已
+    /// 单独校验；续翻仍由前缀形 token 绑定）。
+    fn verify_history_token(
+        &self,
+        token: &str,
+        prefix: &[u64],
+        content_epoch: u64,
+    ) -> HistoryTokenCheck {
+        let Some(given) = parse_history_token(token) else {
+            return HistoryTokenCheck::Malformed;
+        };
+        let (client_id, epoch, generation) = self
+            .lease
+            .as_ref()
+            .map(|l| (l.client_id.as_str(), l.epoch, l.generation))
+            .unwrap_or(("", 0, 0));
+        if given.tag != short_hash(client_id.as_bytes())
+            || given.epoch != epoch
+            || given.generation != generation
+            || given.build_generation != self.build_generation
+        {
+            return HistoryTokenCheck::Generation;
+        }
+        if given.content_epoch != content_epoch {
+            return HistoryTokenCheck::Rewritten;
+        }
+        if given.digest.starts_with(ROOT_DIGEST_PREFIX) {
+            return if given.digest == self.root_digest() {
+                HistoryTokenCheck::Ok
+            } else {
+                HistoryTokenCheck::Rewritten
+            };
+        }
+        if given.digest != self.prefix_digest(prefix) {
+            return HistoryTokenCheck::Rewritten;
+        }
+        HistoryTokenCheck::Ok
+    }
+}
+
+/// 历史 token 的 digest 形态。
+enum HistoryTokenDigest<'a> {
+    /// 投影根锚点（只绑线程身份与元数据代际；不绑尾窗前缀）。
+    Root,
+    /// 下一页游标之前的消息 id 指纹序。
+    Prefix(&'a [u64]),
+}
+
+/// 已解析的 v2 token。计数器都以 `u64` 解析；tag/digest 只认固定长度 ASCII hex。
+struct ParsedHistoryToken<'a> {
+    tag: &'a str,
+    epoch: u64,
+    generation: u64,
+    build_generation: u64,
+    content_epoch: u64,
+    digest: &'a str,
+}
+
+/// 历史 token 校验结果（映射见 [`ThreadMirror::messages_page`] 的状态表）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryTokenCheck {
+    Ok,
+    /// 形态/版本不认识（客户端乱填、旧版本 token）。
+    Malformed,
+    /// 代际段不一致：owner 换代、进程重启或镜像重建。
+    Generation,
+    /// 代际一致但内容观察代或前缀身份序变了：已结算历史被改写/删除，或已分页
+    /// 前缀被改写/删除/重排。
+    Rewritten,
+}
+
+/// 非正常状态页：空消息、`nextBefore=null`、空 token（不得被当作完整空页）。
+fn status_page(
+    status: MessagesPageStatus,
+    reason_code: &str,
+    revision: Option<u64>,
+) -> MessagesPage {
+    MessagesPage {
+        messages: Vec::new(),
+        history_token: String::new(),
+        revision,
+        next_before: None,
+        status,
+        reason_code: Some(reason_code.to_string()),
+    }
+}
+
+/// 解析 `v2-<tag>-<epoch>-<generation>-<build>-<contentEpoch>-<digest>`；形态不合法
+/// （版本/tag/计数器/digest 段）→ None。计数器只做十进制解析，tag/digest 只认固定
+/// 长度 ASCII hex，杜绝把任意字符串当 token 比较；超长一律畸形（有界）。
+fn parse_history_token(token: &str) -> Option<ParsedHistoryToken<'_>> {
+    if token.len() > HISTORY_TOKEN_MAX_LEN {
+        return None;
+    }
+    let (meta, digest) = token.rsplit_once('-')?;
+    let mut parts = meta.split('-');
+    if parts.next()? != HISTORY_TOKEN_VERSION {
+        return None;
+    }
+    let tag = parts.next()?;
+    if tag.len() != 8 || !tag.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let epoch = parts.next()?.parse::<u64>().ok()?;
+    let generation = parts.next()?.parse::<u64>().ok()?;
+    let build_generation = parts.next()?.parse::<u64>().ok()?;
+    let content_epoch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let digest_ok = match digest.strip_prefix(ROOT_DIGEST_PREFIX) {
+        Some(tag) => tag.len() == 8 && tag.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => digest.len() == 32 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+    };
+    if !digest_ok {
+        return None;
+    }
+    Some(ParsedHistoryToken {
+        tag,
+        epoch,
+        generation,
+        build_generation,
+        content_epoch,
+        digest,
+    })
+}
+
+/// 客户端身份短标签（8 hex）；只用于 token 代际段，不泄露原 clientId。
+fn short_hash(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// 消息 id 的稳定指纹（FNV-1a 64）：分页 token 只绑定消息**身份序**，不绑正文
+/// 字节——流式补全（同 id 文本增长）不得使历史页失效。
+fn id_fingerprint(id: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// FNV-1a 64 增量哈希：流式写入已投影字段/附件 JSON，不额外分配。
+struct Fnv64(u64);
+
+impl Fnv64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn offset() -> Self {
+        Self(Self::OFFSET)
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    /// 长度前缀 + 字节：字段拼接不产生歧义。
+    fn push_str(&mut self, value: &str) {
+        self.write_bytes(&(value.len() as u64).to_le_bytes());
+        self.write_bytes(value.as_bytes());
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl std::io::Write for Fnv64 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_bytes(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 一条消息里客户端可见字段的指纹：id/role/kind/文本 + 序列化附件。附件直接
+/// `to_writer` 喂给哈希器（与下发 JSON 同源，且不分配）。
+fn fingerprint_message(hash: &mut Fnv64, message: &ProjectedMessage) {
+    hash.push_str(&message.id);
+    hash.push_str(&message.role);
+    hash.push_str(&message.kind);
+    hash.push_str(&message.text);
+    serde_json::to_writer(&mut *hash, &message.artifacts).expect("附件只含 JSON 可序列化字段");
+}
+
+/// 两次内容观察是否等价（true = 不推进内容代）。
+///
+/// 规则（对应复核 F1/F4）：
+/// * Turn 只能**追加**：数量变少、同位置 Turn 身份不同、或某个 Turn 的 id 序不再是
+///   上次的前缀 → 删除 / 跨 Turn 换序 / Turn 内中段插入，一律判为变化；
+/// * 已结算 Turn：id 前缀内每条消息的渲染指纹必须逐字相同（含末条）；
+/// * 活动 Turn：末条消息可能仍在流式补全，只比到「当前末条之前」——正常补全不
+///   推进代，而这条之前任何同 id 改写/删除都会被抓到；
+/// * 上一观察里那条活动末条：即使本次它已不再是末条（末次增量与追加下一条、或与
+///   turn 结算同批到达），也只放过它这一次——否则正常的结算增量会清空用户刚翻出
+///   的历史页（复核 G3）。下一次观察它已是历史消息，按已结算内容全量比对。
+fn content_unchanged(previous: &[TurnObservation], observed: &[TurnObservation]) -> bool {
+    if observed.len() < previous.len() {
+        return false;
+    }
+    for (old, new) in previous.iter().zip(observed.iter()) {
+        if old.turn != new.turn {
+            return false;
+        }
+        if new.ids.len() < old.ids.len() || new.ids[..old.ids.len()] != old.ids[..] {
+            return false;
+        }
+        let limit = if new.active {
+            new.ids.len().saturating_sub(1)
+        } else {
+            new.ids.len()
+        };
+        let mut compared = old.ids.len().min(limit);
+        if old.active {
+            // 上一观察允许补全的那条：只豁免一次（它随后就是历史内容）。
+            compared = compared.min(old.ids.len().saturating_sub(1));
+        }
+        if new.fingerprints[..compared] != old.fingerprints[..compared] {
+            return false;
+        }
+    }
+    true
+}
+
+/// 单条撑破页预算：先按既有展示截断纪律截正文头部，附件元数据仍超限时按服务端
+/// 预算省略并计数（不静默丢整条）。返回是否发生内容裁剪（`page_truncated`）。
+fn fit_page_message(message: &mut ProjectedMessage) -> bool {
+    let mut size = serialized_message_bytes(message) + 2;
+    let mut trimmed = false;
+    if size > MESSAGES_PAGE_BYTES && message.text.len() > PROJECTION_HEAD_BYTES {
+        message.text = truncate_text_head(&message.text, PROJECTION_HEAD_BYTES);
+        size = serialized_message_bytes(message) + 2;
+        trimmed = true;
+    }
+    while size > MESSAGES_PAGE_BYTES {
+        let Some(popped) = message.artifacts.pop() else {
+            break;
+        };
+        size -= serde_json::to_vec(&popped)
+            .expect("附件只含 JSON 可序列化字段")
+            .len()
+            + usize::from(!message.artifacts.is_empty());
+        message.omitted_artifact_count += 1;
+        trimmed = true;
+    }
+    trimmed
 }
 
 /// 内容健康状态（与写能力正交——能发送不代表历史已载入；读取出错不得呈现为
@@ -589,8 +1272,8 @@ fn runtime_status(state: &Value) -> String {
     }
 }
 
-/// 按正史顺序投影消息，尾窗 1 MiB / 500 条，超出标 truncated。
-/// 返回 (消息, 是否截断)。
+/// **完整** canonical 历史投影（不分页、不裁尾窗）：尾窗与历史页共用的唯一投影器。
+/// 回合内编号在完整序列上生成，翻页不重编号。
 /// 字节尾窗**绝不把最新一条整条裁掉**：单条自身超 1 MiB（agentMessage 贴大日志/
 /// 大代码块真实可达）→ 保底保留该 1 条，正文截头（[`PROJECTION_HEAD_BYTES`]）+
 /// 显式标记，truncated 置位；多条累计超限才丢弃较旧条目（维持既有逻辑）。
@@ -599,84 +1282,110 @@ fn runtime_status(state: &Value) -> String {
 /// `userMessage.content[]` 的 text 块、`agentMessage.text`；`error.message` 走系统
 /// 安全摘要；`reasoning` 按产品语义过滤；未知 kind 保留 `[unsupported item]` 摘要，
 /// 绝不静默滤成 0 条。
-/// 开场用户正文的纯提取（计划 Task 6）：**只处理已经由 HistoryView 验明身份的
-/// Turn**；`params.input` 非文本块不猜内容。返回 `(投影 ID, 正文)`。
+/// 开场用户项（计划 Task 6）：**只处理已经由 HistoryView 验明身份的 Turn**；
+/// `params.input` 非文本块只在存在附件时保留消息。返回
+/// `(投影 ID, 正文, 原始输入块)`，不猜非文本块的内容。
 ///
 /// 投影 ID = `{turnId}/opening/{clientUserMessageId}`——它是**显示身份**，不是投递
 /// 身份：不参与 `ThreadMirror` 健康、完整性、runtime、送达或屏障。
-fn opening_input(turn_id: &str, params: &Value) -> Option<(String, String)> {
+fn opening_input<'a>(turn_id: &str, params: &'a Value) -> Option<(String, String, &'a [Value])> {
     let client = params.get("clientUserMessageId")?.as_str()?;
     if client.is_empty() {
         return None;
     }
-    let text = params
-        .get("input")?
-        .as_array()?
-        .iter()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|b| b.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.is_empty() {
+    let blocks = params.get("input")?.as_array()?;
+    let text = input_text(blocks);
+    if text.is_empty() && !has_input_artifacts(blocks) {
         return None;
     }
-    Some((format!("{turn_id}/opening/{client}"), text))
+    Some((
+        bounded_id(&format!("{turn_id}/opening/{client}")),
+        text,
+        blocks,
+    ))
 }
 
-fn project_messages(state: &Value) -> (Vec<ProjectedMessage>, bool) {
+/// 可渲染的正式用户项：有文本，或只有附件（纯附件消息也必须可见）。
+fn is_renderable_user_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("userMessage")
+        && (user_message_text(item).is_some()
+            || item
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| has_input_artifacts(blocks)))
+}
+
+fn project_full_messages(state: &Value) -> Vec<ProjectedMessage> {
     let view = HistoryView::new(state);
-    let mut all: Vec<ProjectedMessage> = Vec::new();
-    // P2-2（复审）：键迁移双引用窗口（同 turnId 两个被引用实体）下 items 可能
-    // 重叠——按 item id 跨 turn 去重，绝不追加重复气泡
-    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let turns = view.turns();
-    // 第一遍：已有可渲染正式 userMessage 的 turnId——后备只在**没有正式用户项**时
-    // 出现；跨键副本先看到后备、后看到正式项时也必须由本遍压住。
-    let mut has_formal_user: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for turn in &turns {
-        if turn.items.iter().any(|item| {
-            item.get("type").and_then(Value::as_str) == Some("userMessage")
-                && user_message_text(item).is_some()
-        }) {
-            has_formal_user.insert(turn.turn_id);
-        }
-    }
+    let cwd = state.get("cwd").and_then(Value::as_str);
+    // 先确认正式用户项：键迁移双引用窗口里旧副本的开场后备不得先于新副本输出。
+    let has_formal_user: HashSet<&str> = turns
+        .iter()
+        .filter(|turn| turn.items.iter().any(is_renderable_user_item))
+        .map(|turn| turn.turn_id)
+        .collect();
+    let mut all: Vec<ProjectedMessage> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    // 编号上下文按 canonical 回合聚合：尾窗只切消息，不重编号。
+    let mut contexts: HashMap<String, TurnArtifacts> = HashMap::new();
+    // 同回合“附件之前最近一条非空用户消息”的有界副本（摘要来源）。
+    let mut user_summaries: HashMap<&str, String> = HashMap::new();
+
     for turn in turns {
-        // 开场后备：Turn 有 `params.input` 而正式 userMessage 尚未到达（或已被历史
-        // 裁剪）时补一条用户气泡；正式项到达后由第一遍压住，同一逻辑消息不重复。
-        let opening = turn.params.and_then(|p| opening_input(turn.turn_id, p));
+        let context = contexts.entry(bounded_id(turn.turn_id)).or_default();
+        let opening = turn
+            .params
+            .and_then(|params| opening_input(turn.turn_id, params));
+        // 开场后备：正式用户项未到达（或已被历史裁剪）时补一条；正式项到达后由
+        // `has_formal_user` 压住，同一逻辑消息不出现第二条。
         if !has_formal_user.contains(turn.turn_id) {
-            if let Some((id, text)) = &opening {
+            if let Some((id, text, blocks)) = &opening {
                 if seen_ids.insert(id.clone()) {
+                    if !text.trim().is_empty() {
+                        user_summaries.insert(turn.turn_id, bounded_summary_source(text));
+                    }
+                    let summary = user_summaries.get(turn.turn_id).map(String::as_str);
+                    let batch = project_input_artifacts(blocks, id, cwd, summary, context);
                     all.push(ProjectedMessage {
                         id: id.clone(),
-                        role: "user".to_string(),
-                        kind: "userMessage".to_string(),
+                        role: "user".into(),
+                        kind: "userMessage".into(),
                         text: text.clone(),
                         ts: None,
+                        turn_id: Some(bounded_id(turn.turn_id)),
+                        artifacts: batch.artifacts,
+                        omitted_artifact_count: batch.omitted,
+                        turn_image_count: 0,
                     });
                 }
             }
         }
-        for (idx, item) in turn.items.iter().enumerate() {
+
+        for (position, item) in turn.items.iter().enumerate() {
             let Some(obj) = item.as_object() else {
                 continue; // 非对象 item：无可读形态，保守跳过（不猜）
             };
             let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
-            // 稳定标识 = item.id；缺 id 的兜底拼接不作长期标识（仅保序去重可用）。
-            // **正式 userMessage 的 clientId 与 params.clientUserMessageId 相等时**
-            // 复用开场投影 ID：同一逻辑消息在「后备 → 正式」替换时身份不变。
+            // 稳定标识 = item.id；缺 id 的兜底拼接仅保序去重。正式 userMessage 的
+            // clientId 与 params.clientUserMessageId 相等时复用开场投影 ID：
+            // 同一逻辑消息在「后备 → 正式」替换时身份不变。
             let mut id = obj
                 .get("id")
                 .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{}/{}", turn.turn_id, idx));
+                .map(bounded_id)
+                .unwrap_or_else(|| bounded_id(&format!("{}/{}", turn.turn_id, position)));
             if kind == "userMessage" {
-                if let (Some((opening_id, _)), Some(client)) = (
+                if let (Some((opening_id, _, _)), Some(client)) = (
                     opening.as_ref(),
                     obj.get("clientId").and_then(Value::as_str),
                 ) {
-                    if opening_id.ends_with(&format!("/opening/{client}")) {
+                    if turn
+                        .params
+                        .and_then(|params| params.get("clientUserMessageId"))
+                        .and_then(Value::as_str)
+                        == Some(client)
+                    {
                         id = opening_id.clone();
                     }
                 }
@@ -686,9 +1395,19 @@ fn project_messages(state: &Value) -> (Vec<ProjectedMessage>, bool) {
             }
             let (role, text) = match kind {
                 "userMessage" => {
-                    let Some(text) = user_message_text(item) else {
-                        continue; // 无可渲染正文（content 缺/空）不造空泡
-                    };
+                    let text = user_message_text(item).unwrap_or_default();
+                    // 无可渲染正文且无附件 → 不造空泡；纯附件消息必须保留。
+                    if text.is_empty()
+                        && !obj
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .is_some_and(|blocks| has_input_artifacts(blocks))
+                    {
+                        continue;
+                    }
+                    if !text.trim().is_empty() {
+                        user_summaries.insert(turn.turn_id, bounded_summary_source(&text));
+                    }
                     ("user", text)
                 }
                 "agentMessage" => {
@@ -696,57 +1415,133 @@ fn project_messages(state: &Value) -> (Vec<ProjectedMessage>, bool) {
                         .get("text")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
-                        .to_string();
+                        .to_owned();
                     if text.is_empty() {
                         continue; // 流式空文本占位不造空泡（文本经 replace 原位出现）
                     }
                     ("assistant", text)
                 }
                 // 推理过程不上墙（复审裁决：允许按产品语义过滤 reasoning）
-                "reasoning" => continue,
+                "reasoning" | "" => continue,
                 "error" => ("system", error_item_summary(item)),
-                "" => continue, // 无 type 的 item：形态不明，保守跳过
-                other => ("system", format!("[unsupported item: {other}]")),
+                // 结构化附件载体：正文为空，内容在 `artifacts` 上（Task 3）。
+                "imageGeneration" | "fileChange" | "imageView" => ("system", String::new()),
+                other => (
+                    "system",
+                    format!("[unsupported item: {}]", bounded_id(other)),
+                ),
             };
+            let batch = project_item_artifacts(
+                item,
+                &id,
+                cwd,
+                user_summaries.get(turn.turn_id).map(String::as_str),
+                context,
+            );
+            if text.is_empty() && batch.artifacts.is_empty() {
+                continue; // 既无正文也无附件（如空 changes）：不留空气泡
+            }
             all.push(ProjectedMessage {
                 id,
-                role: role.to_string(),
-                kind: kind.to_string(),
+                role: role.into(),
+                kind: bounded_id(kind),
                 text,
                 ts: obj.get("ts").and_then(Value::as_i64),
+                turn_id: Some(bounded_id(turn.turn_id)),
+                artifacts: batch.artifacts,
+                omitted_artifact_count: batch.omitted,
+                turn_image_count: 0,
             });
         }
     }
 
-    // 尾窗：500 条 / 1 MiB
+    // 回合内图片卡总数在完整 canonical 顺序上生成；尾窗与以后分页只切消息。
+    for message in &mut all {
+        message.turn_image_count = message
+            .turn_id
+            .as_deref()
+            .and_then(|turn_id| contexts.get(turn_id))
+            .map_or(0, |turn| turn.image_count);
+    }
+    all
+}
+
+/// 尾窗预算：500 条 / 1 MiB，按**实际序列化 JSON** 计（含字段、附件、转义、
+/// 引号与数组标点）。`truncated` 只表达消息窗口裁剪（丢消息）或最新条正文截头
+/// （预有语义）；只弹最新条的附件**不**置 `truncated`，由递增的
+/// `omittedArtifactCount` 单独表达，避免单条投影被横幅误报为“仅显示最近的消息”。
+fn bound_messages(mut all: Vec<ProjectedMessage>) -> (Vec<ProjectedMessage>, bool) {
     let mut truncated = false;
     if all.len() > PROJECTION_MAX_MESSAGES {
         all = all.split_off(all.len() - PROJECTION_MAX_MESSAGES);
         truncated = true;
     }
-    let mut total: usize = 0;
-    let mut cut = 0usize;
-    for (i, m) in all.iter().rev().enumerate() {
-        total += m.text.len();
-        if total > PROJECTION_TAIL_BYTES {
-            cut = all.len() - i;
+    // 最新一条保底：先按实际序列化体积裁正文/附件，绝不把整份投影清成 0 条。
+    if let Some(last) = all.last_mut() {
+        let mut size = serialized_message_bytes(last);
+        if size + 2 > PROJECTION_TAIL_BYTES {
+            if last.text.len() > PROJECTION_HEAD_BYTES {
+                // 预有语义：最新条正文截头属于消息窗口裁剪，置 truncated。
+                truncated = true;
+                last.text = truncate_text_head(&last.text, PROJECTION_HEAD_BYTES);
+                size = serialized_message_bytes(last);
+            }
+            // 优先保留正文与较早附件；被预算裁掉的元数据只计数，不冒充 UI 展示限额。
+            while size + 2 > PROJECTION_TAIL_BYTES {
+                let Some(popped) = last.artifacts.pop() else {
+                    break;
+                };
+                size -= serde_json::to_vec(&popped)
+                    .expect("附件只含 JSON 可序列化字段")
+                    .len()
+                    + usize::from(!last.artifacts.is_empty());
+                last.omitted_artifact_count += 1;
+            }
+        }
+    }
+    // 从新到旧累计实际序列化字节（含数组括号与逗号）；不足预算的更早消息丢弃。
+    let mut bytes = 2; // 空数组 `[]`
+    let mut keep_from = all.len();
+    for (index, message) in all.iter().enumerate().rev() {
+        let next = serialized_message_bytes(message) + usize::from(keep_from < all.len());
+        if bytes + next > PROJECTION_TAIL_BYTES {
             truncated = true;
             break;
         }
+        bytes += next;
+        keep_from = index;
     }
-    if cut > 0 {
-        if cut >= all.len() {
-            // 最新一条自身超字节预算（倒序首轮 i == 0 → cut == all.len()）：不得
-            // 整条裁成 0 条投影——移动端会把有内容的会话显示成「暂无消息」，与
-            // 本文件「未知 kind 绝不静默滤成 0 条」同纪律。保底保留该条，正文
-            // 单独截头 + 显式标记；truncated 已在循环内置位。
-            let last = all.last_mut().expect("cut == all.len() 蕴含非空");
-            last.text = truncate_text_head(&last.text, PROJECTION_HEAD_BYTES);
-        } else {
-            all = all.split_off(cut);
+    if keep_from == all.len() && !all.is_empty() {
+        // 最新条自身仍超预算：当前所有字段均有界，理论上已被上面裁进预算。
+        // 防御式保底保留最新一条（debug 下断言暴露不变量被破坏），绝不清成 0 条。
+        debug_assert!(
+            false,
+            "newest projected message still exceeds the tail budget after trimming"
+        );
+        if let Some(newest) = all.pop() {
+            all.clear();
+            all.push(newest);
+            truncated = true;
         }
+    } else if keep_from > 0 {
+        all = all.split_off(keep_from);
     }
     (all, truncated)
+}
+
+fn serialized_message_bytes(message: &ProjectedMessage) -> usize {
+    serde_json::to_vec(message)
+        .expect("投影只含 JSON 可序列化字段")
+        .len()
+}
+
+fn input_text(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// userMessage 正文：`content[]` 中 `type=="text"` 块的 `text` 拼接（真机形态；
