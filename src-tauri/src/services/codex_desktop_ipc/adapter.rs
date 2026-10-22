@@ -651,11 +651,11 @@ impl DesktopIpcAdapter {
         if self.inner.followings.lock().await.is_following(key) {
             return;
         }
-        let Some(target) = self.probe_target_snapshot() else {
+        let Some(mut target) = self.probe_target_snapshot() else {
             return; // 还没 resolve 到 build：无法归因，不探（等下次连接）
         };
-        let probe_key = self.resolve_probe_key(&target).await;
-        if self.reuse_ledger_evidence(&probe_key) {
+        let mut probe_key = self.resolve_probe_key(&target).await;
+        if self.reuse_ledger_evidence(&target, &probe_key) {
             return;
         }
         let conn = match self.ensure_connection().await {
@@ -667,27 +667,35 @@ impl DesktopIpcAdapter {
                     "codex-ipc probe: P0 不可达（{}），本轮不探（key={probe_key}）",
                     e.code()
                 );
-                if let Some(ledger) = self.probe_ledger() {
-                    ledger.record(
-                        &probe_key,
-                        CAP_STATE,
-                        &ProbeOutcome::Inconclusive {
-                            stage: ProbeStage::P0,
-                            error_code: e.code().to_string(),
-                            duration_ms: 0,
-                        },
-                        // 读链证据没有内容指纹（只有官方 schema 有）
-                        None,
-                    );
-                    // #172/T9a：账本写点 → 探测只读事实的缓存作废
-                    self.invalidate_probe_status_cache();
-                }
+                self.apply_read_probe_result(
+                    &target,
+                    &probe_key,
+                    &ProbeOutcome::Inconclusive {
+                        stage: ProbeStage::P0,
+                        error_code: e.code().to_string(),
+                        duration_ms: 0,
+                    },
+                );
                 return;
             }
         };
+        // 建连可能换代：重新绑定该连接的目标与指纹，不能带着旧 key 探测新连接。
+        let Some(connected_target) = self.probe_target_snapshot() else {
+            return;
+        };
+        if connected_target.epoch != conn.epoch() {
+            return;
+        }
+        if target.epoch != connected_target.epoch {
+            target = connected_target;
+            probe_key = self.resolve_probe_key(&target).await;
+        }
+        if self.with_current_probe_target(&target, || ()).is_none() {
+            return;
+        }
         // 单飞键带上线程：同 build 的两个线程各自触发时，A 线程的「无 owner」不得
         // 直接当成 B 线程的结论（账本键仍不含线程——那才是跨线程复用的粒度）。
-        let flight_key = format!("{probe_key}|{}", key.thread_id);
+        let flight_key = format!("{probe_key}|{}|{}", target.epoch, key.thread_id);
         let outcome = self
             .inner
             .probe
@@ -704,14 +712,8 @@ impl DesktopIpcAdapter {
             outcome.error_code(),
             outcome.duration_ms()
         );
-        if let Some(ledger) = self.probe_ledger() {
-            // 读链证据没有内容指纹（只有官方 schema 行带）
-            ledger.record(&probe_key, CAP_STATE, &outcome, None);
-            // #172/T9a：账本写点 → 探测只读事实的缓存作废（下次现查）
-            self.invalidate_probe_status_cache();
-        }
-        if matches!(outcome, ProbeOutcome::Probed { .. }) {
-            self.set_state_capability(true);
+        if !self.apply_read_probe_result(&target, &probe_key, &outcome) {
+            return;
         }
         // #172/T9a：把「用户看到什么」也记进日志（只读事实的中文原文；供排障）
         let status = super::reason_code::probe_status_from(
@@ -734,30 +736,77 @@ impl DesktopIpcAdapter {
     /// 账本复用（**账本命中必须零帧**）：命中 `probed`/`verified` → 提升 `state` 并
     /// 返回 `true`；`failed` → 返回 `true`（本 build 已判死，本轮不探）；
     /// `inconclusive` 未到重试点 → 返回 `true`（本轮不探，但能力仍关）。
-    fn reuse_ledger_evidence(&self, probe_key: &str) -> bool {
+    fn reuse_ledger_evidence(&self, target: &ProbeTarget, probe_key: &str) -> bool {
+        if self.with_current_probe_target(target, || ()).is_none() {
+            return true;
+        }
         let Some(ledger) = self.probe_ledger() else {
             return false;
         };
         let Some(entry) = ledger.get(probe_key, CAP_STATE) else {
             return false;
         };
-        match entry.state {
-            crate::database::dao::codex_ipc_probe::ProbeState::Probed
-            | crate::database::dao::codex_ipc_probe::ProbeState::Verified => {
-                log::info!("codex-ipc probe: 账本命中，零帧复用（key={probe_key}）");
-                self.set_state_capability(true);
-                true
+        // 账本读取期间也可能重连；效果必须在身份守卫内提交。
+        self.with_current_probe_target(target, || {
+            match entry.state {
+                crate::database::dao::codex_ipc_probe::ProbeState::Probed
+                | crate::database::dao::codex_ipc_probe::ProbeState::Verified => {
+                    log::info!("codex-ipc probe: 账本命中，零帧复用（key={probe_key}）");
+                    self.set_state_capability(true);
+                    true
+                }
+                // 明确失败 = 这个 build 已经判死：本轮不探（换 build / epoch 变更 /
+                // 用户显式重探才会再来）——否则每次详情页访问都会白跑一遍 15s 探测。
+                crate::database::dao::codex_ipc_probe::ProbeState::Failed => true,
+                // 不确定：到退避点才重试；窗口内本轮不探
+                crate::database::dao::codex_ipc_probe::ProbeState::Inconclusive => {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    entry.next_retry_at.is_some_and(|at| at > now)
+                }
+                _ => false,
             }
-            // 明确失败 = 这个 build 已经判死：本轮不探（换 build / epoch 变更 /
-            // 用户显式重探才会再来）——否则每次详情页访问都会白跑一遍 15s 探测。
-            crate::database::dao::codex_ipc_probe::ProbeState::Failed => true,
-            // 不确定：到退避点才重试；窗口内本轮不探
-            crate::database::dao::codex_ipc_probe::ProbeState::Inconclusive => {
-                let now = chrono::Utc::now().timestamp_millis();
-                entry.next_retry_at.is_some_and(|at| at > now)
-            }
-            _ => false,
+        })
+        .unwrap_or(true)
+    }
+
+    /// 与重连身份更新共用 target 锁；同步效果全部完成后才允许切换目标。
+    fn with_current_probe_target<T>(
+        &self,
+        target: &ProbeTarget,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let slot = self
+            .inner
+            .probe_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let current = slot.as_ref()?;
+        if current.epoch != target.epoch
+            || self.inner.epoch.load(Ordering::SeqCst) != target.epoch
+            || current.platform != target.platform
+            || current.build != target.build
+        {
+            return None;
         }
+        Some(action())
+    }
+
+    fn apply_read_probe_result(
+        &self,
+        target: &ProbeTarget,
+        key: &str,
+        outcome: &ProbeOutcome,
+    ) -> bool {
+        self.with_current_probe_target(target, || {
+            if let Some(ledger) = self.probe_ledger() {
+                ledger.record(key, CAP_STATE, outcome, None);
+                self.invalidate_probe_status_cache();
+            }
+            if matches!(outcome, ProbeOutcome::Probed { .. }) {
+                self.set_state_capability(true);
+            }
+        })
+        .is_some()
     }
 
     fn probe_ledger(&self) -> Option<Arc<dyn ProbeLedger>> {
@@ -782,7 +831,8 @@ impl DesktopIpcAdapter {
     /// 不可错记——错记会把别的 build 的证据算到本 build 头上）。
     pub async fn current_probe_key(&self) -> Option<String> {
         let target = self.probe_target_snapshot()?;
-        Some(self.resolve_probe_key(&target).await)
+        let key = self.resolve_probe_key(&target).await;
+        self.with_current_probe_target(&target, || key)
     }
 
     /// #172/T8 测试缝：固定账本键（生产恒 `None`）。
@@ -861,7 +911,7 @@ impl DesktopIpcAdapter {
     /// 写能力仍由 shipped 证据或后续 L2 开关决定。
     fn set_state_capability(&self, on: bool) {
         let mut profile = self.inner.profile.lock().expect("profile lock");
-        if profile.capabilities.state != on {
+        if profile.is_probe_eligible() && profile.capabilities.state != on {
             profile.capabilities.state = on;
         }
     }
@@ -881,7 +931,7 @@ impl DesktopIpcAdapter {
     /// 确保连接存活（每次重连 epoch 递增，不重置为 0）。
     /// R3：每次连接按 endpoint 重算 profile（未知 build/无 endpoint → closed）；
     /// 连接失败同样落到 closed——Desktop 晚启动不需要重启 Tuvis，投影照常给出
-    /// stale/CompatOnly。R5：全程单锁短临界区，不嵌套。
+    /// stale/CompatOnly。身份安装锁序 conn → target → profile，同步段不跨 await。
     async fn ensure_connection(&self) -> Result<ConnectionHandle, ProtocolError> {
         if self.inner.stopping.load(Ordering::SeqCst) {
             // C4：shutdown 后不再新建连接（恢复循环/热重启统一由 stop/resume 管理）
@@ -933,30 +983,28 @@ impl DesktopIpcAdapter {
                     return Ok(c.clone());
                 }
             }
-            let epoch = self.inner.epoch.fetch_add(1, Ordering::SeqCst) + 1;
-            let conn = super::connection::spawn(io, profile.clone(), epoch);
-            *guard = Some(conn.clone());
-            (conn, epoch)
-        };
-        // 探测目标：只有「尚无证据」档才记（shipped → None，不再探测）
-        {
+            // 固定锁序 conn → target → profile；同步段内安装整组身份。
             let mut target = self
                 .inner
                 .probe_target
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            let epoch = self.inner.epoch.fetch_add(1, Ordering::SeqCst) + 1;
             *target = profile.is_probe_eligible().then(|| ProbeTarget {
                 epoch,
                 platform: endpoint.platform.clone(),
                 build,
                 key: None,
             });
-        }
+            self.set_profile(profile.clone());
+            let conn = super::connection::spawn(io, profile.clone(), epoch);
+            *guard = Some(conn.clone());
+            (conn, epoch)
+        };
         // #172/T9a：build 目标变了 → 探测只读事实的缓存作废（账本键换了）
         self.invalidate_probe_status_cache();
         // 已释放 conn 锁：换代清理（短锁逐个）
         self.inner.owners.lock().await.reset(epoch);
-        self.set_profile(profile);
         // 每次连接均检查当前完整指纹；覆盖已知版本升级到未知版本。
         let adapter_for_schema = self.clone();
         tokio::spawn(async move {
@@ -2869,6 +2917,105 @@ mod dispatch_tests {
             adapter.probe_target_snapshot().unwrap().key.as_deref(),
             Some("cli-b")
         );
+    }
+
+    #[derive(Default)]
+    struct ProbedLedger {
+        records: AtomicU64,
+    }
+    impl ProbeLedger for ProbedLedger {
+        fn get(&self, key: &str, _: &str) -> Option<super::super::probe::ProbeLedgerEntry> {
+            (key == "cli-a").then(|| super::super::probe::ProbeLedgerEntry {
+                state: crate::database::dao::codex_ipc_probe::ProbeState::Probed,
+                next_retry_at: None,
+                stage: None,
+                error_code: None,
+                fingerprint: None,
+            })
+        }
+        fn record(&self, key: &str, _: &str, _: &ProbeOutcome, _: Option<&str>) {
+            assert_eq!(key, "cli-b", "旧结果不得落账");
+            self.records.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn old_read_key_cannot_unlock_reconnected_target() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "same-build"),
+        );
+        adapter.set_probe_ledger(Arc::new(ProbedLedger::default()));
+        let old_target = adapter.probe_target_snapshot().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let a = adapter.clone();
+        let old = tokio::spawn(async move {
+            let key = a
+                .resolve_probe_key_with(&old_target, async {
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                    "cli-a".to_string()
+                })
+                .await;
+            a.reuse_ledger_evidence(&old_target, &key)
+        });
+        started_rx.await.unwrap();
+        {
+            let mut slot = adapter.inner.probe_target.lock().unwrap();
+            adapter.inner.epoch.fetch_add(1, Ordering::SeqCst);
+            *slot = Some(ProbeTarget {
+                epoch: 1,
+                platform: "macos".into(),
+                build: "same-build".into(),
+                key: None,
+            });
+            adapter.set_profile(ProtocolProfile::unverified("macos", "same-build"));
+        }
+        finish_tx.send(()).unwrap();
+        old.await.unwrap();
+        assert!(!adapter.capabilities().state, "A 的 probed 账本不得解锁 B");
+    }
+
+    #[tokio::test]
+    async fn old_read_result_cannot_record_or_unlock_reconnected_target() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "same-build"),
+        );
+        let ledger = Arc::new(ProbedLedger::default());
+        adapter.set_probe_ledger(ledger.clone());
+        let old_target = adapter.probe_target_snapshot().unwrap();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let a = adapter.clone();
+        let old = tokio::spawn(async move {
+            let outcome = finish_rx.await.unwrap();
+            a.apply_read_probe_result(&old_target, "cli-a", &outcome)
+        });
+        {
+            let mut slot = adapter.inner.probe_target.lock().unwrap();
+            adapter.inner.epoch.fetch_add(1, Ordering::SeqCst);
+            *slot = Some(ProbeTarget {
+                epoch: 1,
+                platform: "macos".into(),
+                build: "same-build".into(),
+                key: None,
+            });
+            adapter.set_profile(ProtocolProfile::unverified("macos", "same-build"));
+        }
+        let outcome = ProbeOutcome::Probed {
+            stage: ProbeStage::P3,
+            revision: Some(1),
+            duration_ms: 0,
+        };
+        finish_tx.send(outcome.clone()).unwrap();
+        assert!(!old.await.unwrap());
+        assert_eq!(ledger.records.load(Ordering::SeqCst), 0);
+        assert!(!adapter.capabilities().state, "A 的探测成功不得解锁 B");
+        let current = adapter.probe_target_snapshot().unwrap();
+        assert!(adapter.apply_read_probe_result(&current, "cli-b", &outcome));
+        assert_eq!(ledger.records.load(Ordering::SeqCst), 1);
+        assert!(adapter.capabilities().state, "B 自己的证据应能解锁 B");
     }
 
     fn lease() -> OwnerLease {

@@ -4286,8 +4286,9 @@ async fn probe_status_reports_probing_while_probe_in_flight() {
     let a = adapter.clone();
     let probe = tokio::spawn(async move { a.ensure_read_evidence(&key_in_task).await });
 
-    // 探测已起飞（等握手到达 = 探测已进入 P0/P1）
+    // 重连后须重新确认指纹；discovery 到达才证明单飞探测已进入 P1。
     handshake(&mut peer, "owner-1").await;
+    let disc = expect_frame(&mut peer, "discovery").await;
     let status = adapter.probe_status().await;
     assert_eq!(
         status.state,
@@ -4297,7 +4298,6 @@ async fn probe_status_reports_probing_while_probe_in_flight() {
     assert_eq!(status.reason_code, None, "在飞不是失败，没有失败码");
 
     // 探测结束 → 结论落账，事实随之更新
-    let disc = expect_frame(&mut peer, "discovery").await;
     peer.send(&discovery_ok(&disc["requestId"])).await;
     let _follow = expect_frame(&mut peer, "following").await;
     peer.send(&probe_snapshot("thread-probing", 3)).await;
