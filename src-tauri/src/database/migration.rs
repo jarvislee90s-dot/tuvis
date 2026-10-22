@@ -80,6 +80,17 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
         .map_err(|e| format!("MIGRATE_EXT_FIELDS_FAIL: 迁移扩展资源字段失败: {}", e))?;
     }
 
+    // #172：Codex Desktop IPC 能力账本补 fingerprint 列（官方 schema 探针的内容指纹，
+    // 只对 capability='schema' 的行有意义）。新库由 schema.rs 的建表 DDL 直接带上；
+    // 老库（表已存在、缺列）在此幂等补列——**不加会读列失败**（no such column）。
+    if !column_exists(conn, "codex_ipc_probe", "fingerprint") {
+        conn.execute(
+            "ALTER TABLE codex_ipc_probe ADD COLUMN fingerprint TEXT",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
+    }
+
     // 预设 v2（spec §4）：presets 补描述/类型/绑定工具三列（新表由 schema.rs IF NOT EXISTS 覆盖）
     for (col, ddl) in [
         (

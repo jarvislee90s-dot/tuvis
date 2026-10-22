@@ -74,6 +74,9 @@ pub struct ProbeRow {
     /// 最后通过的探测级（P0..P3；失败时可为最后尝试级）。
     pub probe_stage: Option<String>,
     pub error_code: Option<String>,
+    /// 证据指纹（只对 `capability='schema'` 的行有意义：官方 schema 探针的
+    /// 「文件名+大小」sha256）。让「build × 能力」数据集能追到具体 schema 版本。
+    pub fingerprint: Option<String>,
     /// 本 (key, capability) 的累计探测次数（含首次）。
     pub attempts: u32,
     pub first_seen_at: i64,
@@ -90,7 +93,7 @@ pub fn get_conn(
     capability: &str,
 ) -> rusqlite::Result<Option<ProbeRow>> {
     let mut stmt = conn.prepare(
-        "SELECT probe_key, capability, state, probe_stage, error_code, attempts,
+        "SELECT probe_key, capability, state, probe_stage, error_code, fingerprint, attempts,
                 first_seen_at, last_seen_at, next_retry_at, last_duration_ms
          FROM codex_ipc_probe WHERE probe_key = ?1 AND capability = ?2",
     )?;
@@ -105,20 +108,27 @@ pub fn get_conn(
         state: ProbeState::parse(&state_raw),
         probe_stage: row.get(3)?,
         error_code: row.get(4)?,
-        attempts: row.get::<_, i64>(5)?.max(0) as u32,
-        first_seen_at: row.get(6)?,
-        last_seen_at: row.get(7)?,
-        next_retry_at: row.get(8)?,
-        last_duration_ms: row.get::<_, Option<i64>>(9)?.map(|v| v.max(0) as u64),
+        fingerprint: row.get(5)?,
+        attempts: row.get::<_, i64>(6)?.max(0) as u32,
+        first_seen_at: row.get(7)?,
+        last_seen_at: row.get(8)?,
+        next_retry_at: row.get(9)?,
+        last_duration_ms: row.get::<_, Option<i64>>(10)?.map(|v| v.max(0) as u64),
     }))
 }
 
 /// 探测通过：`state = probed`，清退避（`next_retry_at = NULL`）。
+///
+/// 形参**刻意与 SQL 列序一一对应**（DAO 层的「列即参数」惯例）；补 `fingerprint`
+/// 列后超过 clippy 的 7 参上限——这是**刻意**的（避免为省一个参数而把列序打乱、
+/// 引入与表结构脱节的位置参数），故显式豁免并在此写明理由。
+#[allow(clippy::too_many_arguments)]
 pub fn upsert_ok_conn(
     conn: &Connection,
     probe_key: &str,
     capability: &str,
     probe_stage: Option<&str>,
+    fingerprint: Option<&str>,
     duration_ms: Option<u64>,
     now_ms: i64,
 ) -> rusqlite::Result<()> {
@@ -129,6 +139,7 @@ pub fn upsert_ok_conn(
         ProbeState::Probed,
         probe_stage,
         None,
+        fingerprint,
         duration_ms,
         now_ms,
         None,
@@ -136,12 +147,16 @@ pub fn upsert_ok_conn(
 }
 
 /// 明确失败：`state = failed`，不设退避（不自动重试）。
+///
+/// 形参与 SQL 列序一一对应（见 [`upsert_ok_conn`] 的说明）；超参上限是**刻意**豁免。
+#[allow(clippy::too_many_arguments)]
 pub fn upsert_fail_conn(
     conn: &Connection,
     probe_key: &str,
     capability: &str,
     probe_stage: Option<&str>,
     error_code: &str,
+    fingerprint: Option<&str>,
     duration_ms: Option<u64>,
     now_ms: i64,
 ) -> rusqlite::Result<()> {
@@ -152,6 +167,7 @@ pub fn upsert_fail_conn(
         ProbeState::Failed,
         probe_stage,
         Some(error_code),
+        fingerprint,
         duration_ms,
         now_ms,
         None,
@@ -159,12 +175,16 @@ pub fn upsert_fail_conn(
 }
 
 /// 不确定：`state = inconclusive` + 按**本次（含）累计次数**给退避窗口。
+///
+/// 形参与 SQL 列序一一对应（见 [`upsert_ok_conn`] 的说明）；超参上限是**刻意**豁免。
+#[allow(clippy::too_many_arguments)]
 pub fn upsert_inconclusive_conn(
     conn: &Connection,
     probe_key: &str,
     capability: &str,
     probe_stage: Option<&str>,
     error_code: &str,
+    fingerprint: Option<&str>,
     duration_ms: Option<u64>,
     now_ms: i64,
 ) -> rusqlite::Result<()> {
@@ -186,6 +206,7 @@ pub fn upsert_inconclusive_conn(
         ProbeState::Inconclusive,
         probe_stage,
         Some(error_code),
+        fingerprint,
         duration_ms,
         now_ms,
         Some(next_retry_at),
@@ -194,7 +215,7 @@ pub fn upsert_inconclusive_conn(
 
 /// 单点 upsert（`ON CONFLICT(probe_key, capability)`）：
 /// * `attempts` 累加（`+1`），`first_seen_at` **保留首次**（冲突时不覆盖）；
-/// * `last_seen_at` / `state` / `stage` / `error_code` / 退避 / 耗时按本次覆盖。
+/// * `last_seen_at` / `state` / `stage` / `error_code` / `fingerprint` / 退避 / 耗时按本次覆盖。
 #[allow(clippy::too_many_arguments)]
 fn upsert_conn(
     conn: &Connection,
@@ -203,19 +224,21 @@ fn upsert_conn(
     state: ProbeState,
     probe_stage: Option<&str>,
     error_code: Option<&str>,
+    fingerprint: Option<&str>,
     duration_ms: Option<u64>,
     now_ms: i64,
     next_retry_at: Option<i64>,
 ) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO codex_ipc_probe
-            (probe_key, capability, state, probe_stage, error_code, attempts,
+            (probe_key, capability, state, probe_stage, error_code, fingerprint, attempts,
              first_seen_at, last_seen_at, next_retry_at, last_duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6, ?7, ?8)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7, ?8, ?9)
          ON CONFLICT(probe_key, capability) DO UPDATE SET
             state            = excluded.state,
             probe_stage      = excluded.probe_stage,
             error_code       = excluded.error_code,
+            fingerprint      = excluded.fingerprint,
             attempts         = codex_ipc_probe.attempts + 1,
             last_seen_at     = excluded.last_seen_at,
             next_retry_at    = excluded.next_retry_at,
@@ -226,6 +249,7 @@ fn upsert_conn(
             state.as_str(),
             probe_stage,
             error_code,
+            fingerprint,
             now_ms,
             next_retry_at,
             duration_ms.map(|d| d as i64)
@@ -256,7 +280,7 @@ mod tests {
     #[test]
     fn upsert_is_idempotent_single_row_and_accumulates_attempts() {
         let conn = mem();
-        upsert_ok_conn(&conn, KEY, "state", Some("P3"), Some(420), 1_000).unwrap();
+        upsert_ok_conn(&conn, KEY, "state", Some("P3"), None, Some(420), 1_000).unwrap();
         let first = get_conn(&conn, KEY, "state").unwrap().unwrap();
         assert_eq!(first.state, ProbeState::Probed);
         assert_eq!(first.attempts, 1);
@@ -264,10 +288,11 @@ mod tests {
         assert_eq!(first.last_seen_at, 1_000);
         assert_eq!(first.probe_stage.as_deref(), Some("P3"));
         assert_eq!(first.error_code, None);
+        assert_eq!(first.fingerprint, None);
         assert_eq!(first.next_retry_at, None);
         assert_eq!(first.last_duration_ms, Some(420));
 
-        upsert_ok_conn(&conn, KEY, "state", Some("P3"), Some(380), 2_000).unwrap();
+        upsert_ok_conn(&conn, KEY, "state", Some("P3"), None, Some(380), 2_000).unwrap();
         let second = get_conn(&conn, KEY, "state").unwrap().unwrap();
         assert_eq!(count_rows(&conn), 1, "upsert 不是 append：只能一行");
         assert_eq!(second.attempts, 2, "attempts 累加");
@@ -286,6 +311,7 @@ mod tests {
             "state",
             Some("P1"),
             "method_not_found",
+            None,
             Some(120),
             5_000,
         )
@@ -310,6 +336,7 @@ mod tests {
             Some("P1"),
             "no-client-found",
             None,
+            None,
             now,
         )
         .unwrap();
@@ -325,6 +352,7 @@ mod tests {
             Some("P1"),
             "no-client-found",
             None,
+            None,
             now,
         )
         .unwrap();
@@ -339,6 +367,7 @@ mod tests {
                 "state",
                 Some("P1"),
                 "no-client-found",
+                None,
                 None,
                 now,
             )
@@ -364,7 +393,7 @@ mod tests {
         ] {
             assert_ne!(state, ProbeState::Verified, "写侧集合不含 verified");
         }
-        upsert_ok_conn(&conn, KEY, "state", Some("P3"), None, 1).unwrap();
+        upsert_ok_conn(&conn, KEY, "state", Some("P3"), None, None, 1).unwrap();
         assert_eq!(
             get_conn(&conn, KEY, "state").unwrap().unwrap().state,
             ProbeState::Probed
@@ -385,9 +414,18 @@ mod tests {
     #[test]
     fn rows_are_scoped_per_key_and_capability() {
         let conn = mem();
-        upsert_ok_conn(&conn, KEY, "state", Some("P3"), None, 1).unwrap();
-        upsert_ok_conn(&conn, KEY, "send", Some("P4"), None, 1).unwrap();
-        upsert_ok_conn(&conn, "windows|other|-|1", "state", Some("P3"), None, 1).unwrap();
+        upsert_ok_conn(&conn, KEY, "state", Some("P3"), None, None, 1).unwrap();
+        upsert_ok_conn(&conn, KEY, "send", Some("P4"), None, None, 1).unwrap();
+        upsert_ok_conn(
+            &conn,
+            "windows|other|-|1",
+            "state",
+            Some("P3"),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
         assert_eq!(count_rows(&conn), 3);
         assert_eq!(
             get_conn(&conn, KEY, "send").unwrap().unwrap().state,
@@ -403,5 +441,47 @@ mod tests {
         assert!(get_conn(&conn, KEY, "state").unwrap().is_none());
         assert_eq!(ProbeState::parse("whatever"), ProbeState::Unknown);
         assert_eq!(ProbeState::parse("probed"), ProbeState::Probed);
+    }
+
+    /// **schema 指纹落库**（#172/T7-R4 补列）：`capability='schema'` 的行带官方
+    /// schema 探针的内容指纹；读回一致，且**后写覆盖前值**（upsert 语义）。
+    #[test]
+    fn schema_fingerprint_round_trips_and_overwrites() {
+        let conn = mem();
+        upsert_ok_conn(
+            &conn,
+            KEY,
+            "schema",
+            Some("P3"),
+            Some("sha256-of-names-and-sizes"),
+            Some(230),
+            1_000,
+        )
+        .unwrap();
+        let row = get_conn(&conn, KEY, "schema").unwrap().unwrap();
+        assert_eq!(
+            row.fingerprint.as_deref(),
+            Some("sha256-of-names-and-sizes"),
+            "schema 行必须能追到具体 schema 版本"
+        );
+        assert_eq!(row.state, ProbeState::Probed);
+
+        upsert_ok_conn(
+            &conn,
+            KEY,
+            "schema",
+            Some("P3"),
+            Some("sha256-after-upgrade"),
+            Some(240),
+            2_000,
+        )
+        .unwrap();
+        let row2 = get_conn(&conn, KEY, "schema").unwrap().unwrap();
+        assert_eq!(count_rows(&conn), 1, "仍是一行");
+        assert_eq!(
+            row2.fingerprint.as_deref(),
+            Some("sha256-after-upgrade"),
+            "后写覆盖前值"
+        );
     }
 }

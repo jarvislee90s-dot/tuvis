@@ -1090,10 +1090,18 @@ impl ProbeLedger for StoreProbeLedger {
                 // #172/T9a：探测只读事实要用的两个字段（只读；不改既有语义）
                 stage: row.probe_stage,
                 error_code: row.error_code,
+                // 证据指纹（只对 capability='schema' 有意义）
+                fingerprint: row.fingerprint,
             })
     }
 
-    fn record(&self, probe_key: &str, capability: &str, outcome: &ProbeOutcome) {
+    fn record(
+        &self,
+        probe_key: &str,
+        capability: &str,
+        outcome: &ProbeOutcome,
+        fingerprint: Option<&str>,
+    ) {
         let now = chrono::Utc::now().timestamp_millis();
         let stage = Some(outcome.stage().as_str());
         let recorded = self.store.with(|conn| match outcome {
@@ -1102,6 +1110,7 @@ impl ProbeLedger for StoreProbeLedger {
                 probe_key,
                 capability,
                 stage,
+                fingerprint,
                 Some(outcome.duration_ms()),
                 now,
             ),
@@ -1112,6 +1121,7 @@ impl ProbeLedger for StoreProbeLedger {
                     capability,
                     stage,
                     error_code,
+                    fingerprint,
                     Some(outcome.duration_ms()),
                     now,
                 )
@@ -1123,6 +1133,7 @@ impl ProbeLedger for StoreProbeLedger {
                     capability,
                     stage,
                     error_code,
+                    fingerprint,
                     Some(outcome.duration_ms()),
                     now,
                 )
@@ -1199,7 +1210,9 @@ async fn record_compat_send_outcome(st: &Arc<RemoteState>, outcome: CompatSendOu
     let now = chrono::Utc::now().timestamp_millis();
     let recorded = st.store.with(|conn| match outcome {
         CompatSendOutcome::Accepted => crate::database::dao::codex_ipc_probe::upsert_ok_conn(
-            conn, &probe_key, CAP_SEND, None, None, now,
+            conn, &probe_key, CAP_SEND, None,
+            // 发送结论没有内容指纹（只有官方 schema 行带）
+            None, None, now,
         ),
         CompatSendOutcome::NotSent => crate::database::dao::codex_ipc_probe::upsert_fail_conn(
             conn,
@@ -1207,6 +1220,7 @@ async fn record_compat_send_outcome(st: &Arc<RemoteState>, outcome: CompatSendOu
             CAP_SEND,
             None,
             COMPAT_SEND_NOT_SENT_REASON,
+            None,
             None,
             now,
         ),
@@ -1217,6 +1231,7 @@ async fn record_compat_send_outcome(st: &Arc<RemoteState>, outcome: CompatSendOu
                 CAP_SEND,
                 None,
                 COMPAT_SEND_DELIVERY_UNKNOWN,
+                None,
                 None,
                 now,
             )

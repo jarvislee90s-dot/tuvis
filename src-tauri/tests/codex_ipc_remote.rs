@@ -5107,9 +5107,18 @@ impl ProbeLedger for ProbedStateLedger {
             // #172/T9a：探测只读事实用的两个字段（桩里没有具体级次/错误码）
             stage: Some("P3".into()),
             error_code: None,
+            // 桩里没有内容指纹（只对 capability='schema' 有意义）
+            fingerprint: None,
         })
     }
-    fn record(&self, _probe_key: &str, _capability: &str, _outcome: &ProbeOutcome) {}
+    fn record(
+        &self,
+        _probe_key: &str,
+        _capability: &str,
+        _outcome: &ProbeOutcome,
+        _fingerprint: Option<&str>,
+    ) {
+    }
 }
 
 /// 未验证 build 的「尚无证据」档 profile（能力位全关；方法表沿用基线）。

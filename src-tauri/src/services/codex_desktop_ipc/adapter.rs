@@ -379,6 +379,7 @@ impl DesktopIpcAdapter {
                     evidence.command_decisions,
                     evidence.file_decisions
                 );
+                let fingerprint = evidence.fingerprint.clone();
                 self.set_schema_evidence(Some(evidence));
                 if let Some(ledger) = self.probe_ledger() {
                     // stage 记 P3：账本的 `probe_stage` 只有 P0–P3 词表，schema 探针
@@ -391,6 +392,9 @@ impl DesktopIpcAdapter {
                             revision: None,
                             duration_ms,
                         },
+                        // 官方 schema 的内容指纹（文件名+大小的 sha256）：让「build × 能力」
+                        // 数据集能追到具体 schema 版本
+                        Some(&fingerprint),
                     );
                 }
             }
@@ -408,6 +412,8 @@ impl DesktopIpcAdapter {
                             error_code,
                             duration_ms,
                         },
+                        // 未取证 → 没有指纹可给
+                        None,
                     );
                 }
             }
@@ -651,6 +657,8 @@ impl DesktopIpcAdapter {
                             error_code: e.code().to_string(),
                             duration_ms: 0,
                         },
+                        // 读链证据没有内容指纹（只有官方 schema 有）
+                        None,
                     );
                     // #172/T9a：账本写点 → 探测只读事实的缓存作废
                     self.invalidate_probe_status_cache();
@@ -678,7 +686,8 @@ impl DesktopIpcAdapter {
             outcome.duration_ms()
         );
         if let Some(ledger) = self.probe_ledger() {
-            ledger.record(&probe_key, CAP_STATE, &outcome);
+            // 读链证据没有内容指纹（只有官方 schema 行带）
+            ledger.record(&probe_key, CAP_STATE, &outcome, None);
             // #172/T9a：账本写点 → 探测只读事实的缓存作废（下次现查）
             self.invalidate_probe_status_cache();
         }

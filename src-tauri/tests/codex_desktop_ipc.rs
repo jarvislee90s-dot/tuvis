@@ -1,4 +1,4 @@
-//! Codex Desktop IPC 集成测试（本地假 IPC，Tokio duplex ScriptedPeer；不连接真实 Desktop）。
+﻿//! Codex Desktop IPC 集成测试（本地假 IPC，Tokio duplex ScriptedPeer；不连接真实 Desktop）。
 //!
 //! 覆盖：RPC 关联（id+method）、未知投递边界（部分写/EOF=Unknown；排队前失败=NotSent）、
 //! discovery 必答（旁路容量）、在飞上限、超时=Unknown。
@@ -3707,11 +3707,19 @@ impl ProbeLedger for MemoryLedger {
                     next_retry_at,
                     error_code,
                     stage,
+                    // 内存替身不存指纹（只对 capability='schema' 有意义）
+                    fingerprint: None,
                 },
             )
     }
 
-    fn record(&self, probe_key: &str, capability: &str, outcome: &ProbeOutcome) {
+    fn record(
+        &self,
+        probe_key: &str,
+        capability: &str,
+        outcome: &ProbeOutcome,
+        _fingerprint: Option<&str>,
+    ) {
         self.records
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // 与 DAO 同语义：inconclusive 带退避窗口（首探 30s），其余清空
@@ -3852,7 +3860,6 @@ async fn ledger_failed_state_suppresses_probe() {
     assert_eq!(ledger.records(), 0, "failed 账本不得被重写");
     assert_eq!(ledger.gets(), 1);
 }
-
 /// P0 不可达（Desktop 没起）→ 记 **inconclusive**（不是 failed）：没证据 ≠ 判死。
 #[tokio::test]
 async fn p0_unreachable_records_inconclusive() {

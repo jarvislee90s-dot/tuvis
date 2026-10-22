@@ -511,12 +511,16 @@ pub fn init(conn: &Connection) {
         --   不存正文 / threadId / 原始帧（只存 stage / 错误码 / 耗时，对齐审计隐私纪律）。
         --   时间列用 INTEGER 毫秒（与 heartbeat_observations 等既有表同惯例；设计稿写
         --   TEXT 是示意，语义只要求单调可比较）。
+        --   fingerprint：官方 schema 探针的**内容指纹**（文件名+大小的 sha256）——只对
+        --   capability='schema' 的行有意义；让「build × 能力」数据集能追到具体
+        --   schema 版本（老库由 migration.rs 补列）。
         CREATE TABLE IF NOT EXISTS codex_ipc_probe (
             probe_key        TEXT NOT NULL,
             capability       TEXT NOT NULL,
             state            TEXT NOT NULL,
             probe_stage      TEXT,
             error_code       TEXT,
+            fingerprint      TEXT,
             attempts         INTEGER NOT NULL DEFAULT 1,
             first_seen_at    INTEGER NOT NULL,
             last_seen_at     INTEGER NOT NULL,

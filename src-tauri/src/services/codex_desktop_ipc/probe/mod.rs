@@ -35,7 +35,16 @@ pub trait ProbeLedger: Send + Sync {
     /// 读某 `(probe_key, capability)` 的结论；无行 → `None`。
     fn get(&self, probe_key: &str, capability: &str) -> Option<ProbeLedgerEntry>;
     /// 落账（upsert；`attempts` 累加、`next_retry_at` 按退避算）。
-    fn record(&self, probe_key: &str, capability: &str, outcome: &runner::ProbeOutcome);
+    ///
+    /// `fingerprint`：**证据指纹**——只对 `capability = "schema"` 的行有意义（官方
+    /// schema 探针的「文件名+大小」sha256）；其余能力传 `None`（无指纹可给）。
+    fn record(
+        &self,
+        probe_key: &str,
+        capability: &str,
+        outcome: &runner::ProbeOutcome,
+        fingerprint: Option<&str>,
+    );
 }
 
 /// 账本结论的精简视图（adapter 只关心「能否复用」与「退避到点没」）。
@@ -50,4 +59,7 @@ pub struct ProbeLedgerEntry {
     pub stage: Option<String>,
     /// 账本里的错误码（`failed` / `inconclusive` 行有值）；`probed` 行 → `None`。
     pub error_code: Option<String>,
+    /// 证据指纹（只对 `capability = "schema"` 的行有值：官方 schema 探针的
+    /// 内容指纹）；其余能力 → `None`。
+    pub fingerprint: Option<String>,
 }
