@@ -6,10 +6,56 @@
 use super::{DesktopEndpoint, EndpointResolver};
 #[allow(unused_imports)]
 use crate::services::codex_desktop_ipc::types::ProtocolError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 官方 Desktop bundle id（Mac 探针 OBSERVED：com.openai.codex）。
 pub const CODEX_BUNDLE_ID: &str = "com.openai.codex";
+
+/// 官方 Desktop bundle 的 `Contents/Info.plist` 文本（缺文件/读不了 → `None`）。
+///
+/// 已知边界：仅支持 **XML plist**（官方现发 XML）。若未来改发二进制 plist
+/// （`bplist00`），子串搜索会失配 → 身份判定如实为 false → 降级为缺 build/指纹，
+/// 不会误判成官方。
+fn read_info_plist(bundle: &Path) -> Option<String> {
+    std::fs::read_to_string(bundle.join("Contents").join("Info.plist")).ok()
+}
+
+/// 官方 Codex Desktop bundle 的身份判据：`Info.plist` 的 `CFBundleIdentifier` 精确
+/// 等于 [`CODEX_BUNDLE_ID`]。**不按显示名猜**——官方安装也可能叫 `ChatGPT.app`
+/// （PR #178 真机验收实测）；helper 的嵌套 bundle id 不符 → 不认。
+pub fn is_official_codex_bundle(bundle: &Path) -> bool {
+    read_info_plist(bundle)
+        .and_then(|text| plist_value(&text, "CFBundleIdentifier"))
+        .as_deref()
+        == Some(CODEX_BUNDLE_ID)
+}
+
+/// 进程 exe 路径 → 所属 `.app` bundle（**只做路径形态截取**，不读文件/不验身份）：
+/// 取首个 `.app/` 前缀——嵌套在外层包内的 helper `.app` 会归并到外层主 bundle。
+/// endpoint resolver（[`platform::desktop_build`]）与探测指纹（fingerprint 的随包
+/// CLI 定位）共用本截取 + [`is_official_codex_bundle`] 身份判据，不许各自再抄一份
+/// （会漂移）。调用方应先对截取结果**排序去重**再验身份（每进程一次截取、每唯一
+/// bundle 一次 Info.plist 读）。
+pub fn app_bundle_prefix(exe: &str) -> Option<PathBuf> {
+    let end = exe.find(".app/")?;
+    Some(PathBuf::from(&exe[..end + 4]))
+}
+
+/// 极简 XML Info.plist 取值（无新依赖）：`<key>K</key>` 之后首个 `<string>` 的值；
+/// 空串视为缺失。
+pub fn plist_value(text: &str, key: &str) -> Option<String> {
+    let needle = format!("<key>{key}</key>");
+    let pos = text.find(&needle)?;
+    let rest = &text[pos + needle.len()..];
+    let open = rest.find("<string>")? + "<string>".len();
+    let close = rest[open..].find("</string>")? + open;
+    let v = rest[open..close].trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
 
 // 当前有效用户 id：免 libc 依赖的 extern 声明（仅 unix 编译）。
 #[cfg(unix)]
@@ -181,20 +227,20 @@ mod platform {
             true,
             ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
         );
-        let mut versions: Vec<String> = Vec::new();
-        for process in sys.processes().values() {
-            let Some(exe) = process.exe().map(|p| p.to_path_buf()) else {
-                continue;
-            };
-            let exe_str = exe.to_string_lossy();
-            let Some(app_end) = exe_str.find(".app/") else {
-                continue;
-            };
-            let bundle = &exe_str[..app_end + 4]; // 含 ".app"
-            if let Some(v) = bundle_version(bundle) {
-                versions.push(v);
-            }
-        }
+        // 先截取 .app 前缀并按安装路径去重，再对唯一 bundle 读 Info.plist
+        // （每唯一安装一次读盘，非每进程一次）。
+        let mut bundles: Vec<PathBuf> = sys
+            .processes()
+            .values()
+            .filter_map(|p| p.exe())
+            .filter_map(|exe| super::app_bundle_prefix(&exe.to_string_lossy()))
+            .collect();
+        bundles.sort();
+        bundles.dedup();
+        let mut versions: Vec<String> = bundles
+            .iter()
+            .filter_map(|bundle| bundle_version(bundle))
+            .collect();
         versions.sort();
         versions.dedup();
         if versions.len() == 1 {
@@ -204,30 +250,14 @@ mod platform {
         }
     }
 
-    /// 极简 XML Info.plist 读取（无新依赖）：CFBundleIdentifier 必须精确匹配官方
-    /// bundle id；版本取 CFBundleShortVersionString。
-    fn bundle_version(bundle: &str) -> Option<String> {
-        let plist = Path::new(bundle).join("Contents").join("Info.plist");
-        let text = std::fs::read_to_string(plist).ok()?;
-        let id = plist_value(&text, "CFBundleIdentifier")?;
-        if id != CODEX_BUNDLE_ID {
+    /// bundle 版本（`CFBundleShortVersionString`）——身份判据与
+    /// [`super::official_codex_bundle`] 同源（bundle id 精确匹配）；版本缺失 → `None`。
+    fn bundle_version(bundle: &Path) -> Option<String> {
+        let text = super::read_info_plist(bundle)?;
+        if super::plist_value(&text, "CFBundleIdentifier")?.as_str() != CODEX_BUNDLE_ID {
             return None;
         }
-        plist_value(&text, "CFBundleShortVersionString")
-    }
-
-    fn plist_value(text: &str, key: &str) -> Option<String> {
-        let needle = format!("<key>{key}</key>");
-        let pos = text.find(&needle)?;
-        let rest = &text[pos + needle.len()..];
-        let open = rest.find("<string>")? + "<string>".len();
-        let close = rest[open..].find("</string>")? + open;
-        let v = rest[open..close].trim();
-        if v.is_empty() {
-            None
-        } else {
-            Some(v.to_string())
-        }
+        super::plist_value(&text, "CFBundleShortVersionString")
     }
 }
 

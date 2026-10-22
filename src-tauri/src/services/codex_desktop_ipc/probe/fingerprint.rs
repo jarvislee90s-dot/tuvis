@@ -12,9 +12,14 @@
 //! * macOS：读随包 `Contents/Resources/codex-cli/codex-package.json` 的 `version`
 //!   （免执行子进程；该平台没有哈希目录）。
 //!
-//! 身份歧义一律 `None`（不猜）：多份不同的 codex.exe / 多个不同 bundle 时不产出指纹，
-//! 账本按「缺 cli_id」记一行——宁可复用面窄一点，也不把两台机器的证据混成一条。
+//! 身份歧义一律 `None`（不猜）：候选先按官方 bundle id 精确识别（与 endpoint
+//! resolver 同源），多份不同的 codex.exe / 多个不同**官方 Codex 安装**时不产出
+//! 指纹，账本按「缺 cli_id」记一行——宁可复用面窄一点，也不把两台机器的证据
+//! 混成一条。
 
+use crate::services::codex_desktop_ipc::transport::unix::{
+    app_bundle_prefix, is_official_codex_bundle,
+};
 use std::path::{Path, PathBuf};
 
 /// 探测算法 / 方法表 / 解析期望 / 探测步骤变更即 **+1**（不是 Tuvis 应用版本号）。
@@ -119,11 +124,8 @@ fn windows_cli_executable() -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn macos_cli_executable() -> Option<PathBuf> {
-    let bundles = running_bundles();
-    if bundles.len() != 1 {
-        return None;
-    }
-    macos_cli_in_bundle(&bundles[0])
+    let bundle = sole_codex_bundle(&running_exe_paths())?;
+    macos_cli_in_bundle(&bundle)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -266,11 +268,8 @@ pub fn hash_dir_of(exe: &Path) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn macos_cli_id() -> Option<String> {
-    let bundles = running_bundles();
-    if bundles.len() != 1 {
-        return None;
-    }
-    package_version_in_bundle(&bundles[0])
+    let bundle = sole_codex_bundle(&running_exe_paths())?;
+    package_version_in_bundle(&bundle)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -279,10 +278,32 @@ fn macos_cli_id() -> Option<String> {
     None
 }
 
-/// 运行中进程的 `.app` 包路径（排序去重）。只按路径形态截取，**身份校验**留给
-/// `package_version_in_bundle`（bundle 内没有随包 CLI 就没有指纹，不猜）。
+/// 从进程 exe 路径列表解析**唯一的官方 Codex Desktop bundle**。不扫进程表：候选由
+/// 调用方注入（但会读候选 bundle 的 `Info.plist` 做身份校验）。
+///
+/// 筛选顺序（PR #178 真机验收修复）：① 每条路径取首个 `.app/` 前缀为候选；② 安装
+/// 路径排序去重（每唯一 bundle 只读一次 Info.plist）；③ 按[`is_official_codex_bundle`]
+/// 官方 bundle id 精确识别（无关 App 与 helper 的嵌套 bundle 一并剔除——判据与
+/// endpoint resolver 同源，不按显示名猜）；④ **唯一才取**：0 个 = 未运行/未安装；
+/// 多个不同安装 = 多义，保守拒绝（不任取一个）。
+pub fn sole_codex_bundle(exes: &[PathBuf]) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = exes
+        .iter()
+        .filter_map(|exe| app_bundle_prefix(&exe.to_string_lossy()))
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    let mut official: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|bundle| is_official_codex_bundle(bundle))
+        .collect();
+    (official.len() == 1).then(|| official.remove(0))
+}
+
+/// 运行中进程的 exe 路径（`sysinfo` 扫描；候选筛选与唯一性判断在
+/// [`sole_codex_bundle`]）。
 #[cfg(target_os = "macos")]
-fn running_bundles() -> Vec<PathBuf> {
+fn running_exe_paths() -> Vec<PathBuf> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let mut sys = System::new();
     sys.refresh_processes_specifics(
@@ -290,19 +311,10 @@ fn running_bundles() -> Vec<PathBuf> {
         true,
         ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
     );
-    let mut bundles: Vec<PathBuf> = sys
-        .processes()
+    sys.processes()
         .values()
         .filter_map(|p| p.exe().map(|e| e.to_path_buf()))
-        .filter_map(|exe| {
-            let text = exe.to_string_lossy();
-            let end = text.find(".app/")?;
-            Some(PathBuf::from(&text[..end + 4]))
-        })
-        .collect();
-    bundles.sort();
-    bundles.dedup();
-    bundles
+        .collect()
 }
 
 /// 读 App 包内随包 CLI 的 `codex-package.json` → `version`。
@@ -468,5 +480,240 @@ mod tests {
         );
         // 未知平台不产路径
         assert_eq!(cli_executable_for("linux"), None);
+    }
+
+    // ============================================================
+    // sole_codex_bundle 身份筛选（PR #178 真机验收回归）
+    //
+    // 验收机（macOS，Codex Desktop 26.1016.61520 @ /Applications/ChatGPT.app，
+    // CFBundleIdentifier=com.openai.codex）上桌面同时运行多个 App：旧逻辑把所有
+    // 运行中的 .app 都收进候选、不筛身份，又要求候选恰一个 → CLI 定位恒 None、
+    // 账本键出现 `-`、schema 探针报 cli_not_found。修复方向：候选先按官方 bundle
+    // id（读 Contents/Info.plist 的 CFBundleIdentifier）精确筛选，再排序去重，
+    // 唯一才取。以下用例用 tempfile 造假 .app 钉住该行为。
+    // ============================================================
+
+    use crate::services::codex_desktop_ipc::transport::unix::CODEX_BUNDLE_ID;
+
+    /// 造一个最小 .app 包：`<base>/<name>.app/Contents/Info.plist`，内容为含
+    /// CFBundleIdentifier 与 CFBundleShortVersionString 的极简 XML plist（形态对齐
+    /// `transport::unix::plist_value` 的解析规则：`<key>K</key><string>v</string>`）。
+    /// `base` 用正斜杠字符串，返回值保持正斜杠形态——`sole_codex_bundle` 靠
+    /// `find(".app/")` 截取候选，Windows 下 `join()` 的反斜杠会让截取失配。
+    fn make_app(base: &str, name: &str, bundle_id: &str, version: &str) -> PathBuf {
+        let bundle = format!("{base}/{name}.app");
+        std::fs::create_dir_all(format!("{bundle}/Contents")).unwrap();
+        std::fs::write(
+            format!("{bundle}/Contents/Info.plist"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <plist version=\"1.0\">\n<dict>\n\
+                 \x20 <key>CFBundleIdentifier</key><string>{bundle_id}</string>\n\
+                 \x20 <key>CFBundleShortVersionString</key><string>{version}</string>\n\
+                 </dict>\n</plist>\n"
+            ),
+        )
+        .unwrap();
+        PathBuf::from(bundle)
+    }
+
+    /// 给 bundle arm 上随包 CLI 证据：`codex-package.json`（版本指纹）与 `bin/codex`
+    /// shim（可执行定位目标），写入路径与 [`package_version_in_bundle`] /
+    /// [`macos_cli_in_bundle`] 的读取路径一致。
+    fn arm_bundle_cli(bundle: &Path, cli_version: &str) {
+        let cli_dir = bundle.join("Contents").join("Resources").join("codex-cli");
+        std::fs::create_dir_all(cli_dir.join("bin")).unwrap();
+        std::fs::write(
+            cli_dir.join("codex-package.json"),
+            format!(r#"{{"version":"{cli_version}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(cli_dir.join("bin").join("codex"), b"#!/bin/sh\n").unwrap();
+    }
+
+    /// 主程序 exe 路径（正斜杠字符串形态）：`<bundle>/Contents/MacOS/<bin>`。
+    fn main_exe(bundle: &Path, bin: &str) -> PathBuf {
+        PathBuf::from(format!(
+            "{}/Contents/MacOS/{bin}",
+            bundle.to_string_lossy().replace('\\', "/")
+        ))
+    }
+
+    /// 验收机场景：无关 App（Safari / ZCode）与官方 Codex 同屏运行。候选必须先按
+    /// 官方 bundle id 筛身份——只有 ChatGPT.app（id=com.openai.codex）能当选，且
+    /// 选出后能读出 CLI 版本指纹、定位到 shim（身份 → 定位 → 证据一条龙）。
+    #[test]
+    fn macos_multiple_running_apps_pick_only_official_codex_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let safari = make_app(&base, "Safari", "com.apple.Safari", "18.0");
+        let zcode = make_app(&base, "ZCode", "com.zcode.editor", "1.2.3");
+        let chatgpt = make_app(&base, "ChatGPT", CODEX_BUNDLE_ID, "26.1016.61520");
+        arm_bundle_cli(&chatgpt, "0.163.0-alpha.10.2");
+
+        let exes = vec![
+            main_exe(&safari, "Safari"),
+            main_exe(&zcode, "ZCode"),
+            main_exe(&chatgpt, "ChatGPT"),
+        ];
+        let bundle = sole_codex_bundle(&exes);
+        assert_eq!(
+            bundle.as_ref(),
+            Some(&chatgpt),
+            "无关 App 在场时官方 Codex 仍须唯一当选（旧逻辑：3 候选 → None）"
+        );
+
+        let bundle = bundle.unwrap();
+        assert_eq!(
+            package_version_in_bundle(&bundle).as_deref(),
+            Some("0.163.0-alpha.10.2"),
+            "选中 bundle 内的 codex-package.json 要能读出 CLI 版本"
+        );
+        assert_eq!(
+            macos_cli_in_bundle(&bundle),
+            Some(
+                bundle
+                    .join("Contents")
+                    .join("Resources")
+                    .join("codex-cli")
+                    .join("bin")
+                    .join("codex")
+            ),
+            "CLI 可执行定位到 328B 固定 shim"
+        );
+    }
+
+    /// 同一官方 Codex 的主进程 + 多个嵌套 helper 不算多安装：helper 的 `.app`
+    /// 嵌在外层包内，首个 `.app/` 前缀归并到外层 bundle → 仍唯一 → Some。
+    #[test]
+    fn macos_nested_helpers_merge_into_outer_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let chatgpt = make_app(&base, "ChatGPT", CODEX_BUNDLE_ID, "26.1016.61520");
+
+        let exes = vec![
+            main_exe(&chatgpt, "ChatGPT"),
+            PathBuf::from(format!(
+                "{}/Contents/Frameworks/ChatGPT Helper.app/Contents/MacOS/ChatGPT Helper",
+                chatgpt.to_string_lossy()
+            )),
+            PathBuf::from(format!(
+                "{}/Contents/Frameworks/ChatGPT Helper (GPU).app/Contents/MacOS/ChatGPT Helper (GPU)",
+                chatgpt.to_string_lossy()
+            )),
+        ];
+        assert_eq!(
+            sole_codex_bundle(&exes).as_ref(),
+            Some(&chatgpt),
+            "主进程与 helper 同属一个安装，不得误判多义"
+        );
+    }
+
+    /// 两个不同路径的官方 Codex 安装 = 多义：保守拒绝（None），不任取一个。
+    #[test]
+    fn macos_two_distinct_official_installs_refuse_guess() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let installed = make_app(
+            &format!("{base}/Applications"),
+            "ChatGPT",
+            CODEX_BUNDLE_ID,
+            "26.1016.61520",
+        );
+        let downloaded = make_app(
+            &format!("{base}/Downloads"),
+            "ChatGPT",
+            CODEX_BUNDLE_ID,
+            "26.1008.60000",
+        );
+
+        let exes = vec![
+            main_exe(&installed, "ChatGPT"),
+            main_exe(&downloaded, "ChatGPT"),
+        ];
+        assert_eq!(
+            sole_codex_bundle(&exes),
+            None,
+            "两份不同路径的官方安装无法归因 → 一律不猜"
+        );
+    }
+
+    /// 只有无关 App → None；空列表 → None。其中冒牌货 bundle 里也 arm 上
+    /// codex-package.json，证明筛选按官方 bundle id，而非「有没有 CLI 文件」。
+    #[test]
+    fn macos_unofficial_apps_yield_none_even_when_carrying_cli_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let fake = make_app(&base, "FakeCodex", "com.fake.codex", "9.9.9");
+        arm_bundle_cli(&fake, "0.0.0-fake");
+        let notes = make_app(&base, "Notes", "com.apple.Notes", "4.11");
+
+        let exes = vec![main_exe(&fake, "FakeCodex"), main_exe(&notes, "Notes")];
+        assert_eq!(
+            sole_codex_bundle(&exes),
+            None,
+            "带 CLI 证据的冒牌货也不是官方 Codex：身份看 bundle id，不看文件"
+        );
+        assert_eq!(sole_codex_bundle(&[]), None, "无进程 → 无候选 → None");
+    }
+
+    /// 身份不按显示名猜：`Codex.app` 名字撞官方但 bundle id 不对 → 冒牌；
+    /// `Whatever.app` 名字无关但 bundle id = 官方 → 真货。唯一真货必须当选。
+    #[test]
+    fn macos_bundle_id_not_display_name_decides_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let fake = make_app(&base, "Codex", "com.example.codex-clone", "1.0.0");
+        let real = make_app(&base, "Whatever", CODEX_BUNDLE_ID, "26.1016.61520");
+
+        let exes = vec![main_exe(&fake, "Codex"), main_exe(&real, "Whatever")];
+        assert_eq!(
+            sole_codex_bundle(&exes).as_ref(),
+            Some(&real),
+            "显示名不代表身份：按 CFBundleIdentifier 精确匹配（旧逻辑：2 候选 → None）"
+        );
+    }
+
+    /// 单个无关 App 也不得充当候选：唯一性不能被非官方 App 满足（旧逻辑的反向
+    /// 失败模式——不筛身份时「只有一个 .app」就错发 Some）。
+    #[test]
+    fn macos_single_unofficial_app_is_not_sole_codex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let safari = make_app(&base, "Safari", "com.apple.Safari", "18.0");
+
+        let exes = vec![main_exe(&safari, "Safari")];
+        assert_eq!(
+            sole_codex_bundle(&exes),
+            None,
+            "非官方 App 唯一 ≠ 官方 Codex 唯一"
+        );
+    }
+
+    /// 官方 bundle 但没带 CLI payload：身份筛选仍返回 Some（身份与定位分离），
+    /// 版本指纹与可执行定位诚实为 None（缺证据不猜）。
+    #[test]
+    fn macos_official_bundle_without_cli_payload_reports_none_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let chatgpt = make_app(&base, "ChatGPT", CODEX_BUNDLE_ID, "26.1016.61520");
+
+        let bundle = sole_codex_bundle(&[main_exe(&chatgpt, "ChatGPT")]);
+        assert_eq!(
+            bundle.as_ref(),
+            Some(&chatgpt),
+            "身份成立与否和 CLI 是否在场无关"
+        );
+        let bundle = bundle.unwrap();
+        assert_eq!(
+            package_version_in_bundle(&bundle),
+            None,
+            "没带 codex-package.json → 没有版本指纹"
+        );
+        assert_eq!(
+            macos_cli_in_bundle(&bundle),
+            None,
+            "没带 CLI 可执行 → 定位为 None"
+        );
     }
 }
