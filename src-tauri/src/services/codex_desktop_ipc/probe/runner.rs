@@ -162,6 +162,35 @@ impl Flight {
     }
 }
 
+// leader 被外层 timeout/drop 时，释放槽位并给所有等待者一个有界结论。
+struct FlightGuard<'a> {
+    runner: &'a ProbeRunner,
+    key: &'a str,
+    flight: Arc<Flight>,
+}
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        if self
+            .flight
+            .result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            self.flight.publish(ProbeOutcome::Inconclusive {
+                stage: ProbeStage::P3,
+                error_code: "probe_cancelled".into(),
+                duration_ms: 0,
+            });
+        }
+        self.runner
+            .flights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(self.key);
+    }
+}
+
 impl ProbeRunner {
     pub fn new() -> Self {
         Self::default()
@@ -187,6 +216,11 @@ impl ProbeRunner {
         if !leader {
             return flight.wait().await;
         }
+        let _guard = FlightGuard {
+            runner: self,
+            key: probe_key,
+            flight: flight.clone(),
+        };
         let outcome = match tokio::time::timeout(TOTAL_BUDGET, probe).await {
             Ok(outcome) => outcome,
             Err(_) => ProbeOutcome::Inconclusive {
@@ -196,10 +230,6 @@ impl ProbeRunner {
             },
         };
         flight.publish(outcome.clone());
-        self.flights
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(probe_key);
         outcome
     }
 
@@ -625,6 +655,40 @@ fn short_code(err: &crate::services::codex_desktop_ipc::types::ProtocolError) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_leader_releases_followers_and_allows_retry() {
+        let runner = Arc::new(ProbeRunner::new());
+        let r = runner.clone();
+        let leader = tokio::spawn(async move { r.run("cancel", std::future::pending()).await });
+        while runner.inflight() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let flight = runner
+            .flights
+            .lock()
+            .unwrap()
+            .get("cancel")
+            .unwrap()
+            .clone();
+        leader.abort();
+        let _ = leader.await;
+        let outcome = tokio::time::timeout(Duration::from_secs(1), flight.wait())
+            .await
+            .unwrap();
+        assert_eq!(outcome.error_code(), Some("probe_cancelled"));
+        assert_eq!(runner.inflight(), 0);
+        let outcome = runner
+            .run("cancel", async {
+                ProbeOutcome::Probed {
+                    stage: ProbeStage::P3,
+                    revision: Some(1),
+                    duration_ms: 0,
+                }
+            })
+            .await;
+        assert!(matches!(outcome, ProbeOutcome::Probed { .. }));
+    }
 
     fn snapshot_frame(thread_id: &str, revision: u64) -> Value {
         serde_json::json!({

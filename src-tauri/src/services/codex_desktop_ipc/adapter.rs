@@ -214,11 +214,11 @@ struct AdapterInner {
     follow_gate_reached: AtomicBool,
     /// #172/T7：官方 schema 证据（未知 build 的审批决策词来源；`None` = 尚未取证）。
     /// 有它就能在「无真机审批证据」的 build 上安全开放 `accept` + `cancel`。
-    schema_evidence: std::sync::Mutex<Option<SchemaEvidence>>,
-    /// #172/T7-R4：schema 探针**只跑一次**的单飞标志（结论为 `Unknown` 时也不重跑：
+    schema_evidence: std::sync::Mutex<Option<(u64, Option<ProbeTarget>, SchemaEvidence)>>,
+    /// #172/T7-R4：schema 探针对完整指纹与连接代际**各跑一次**的单飞标志（结论为 `Unknown` 时也不重跑：
     /// 探针失败即「未知」，重跑只会再拿同一个 `Unknown`；账本行已记 `inconclusive`
     /// + 退避窗口，跨重启的复用由账本负责）。
-    schema_probe_ran: AtomicBool,
+    schema_probe_ran: tokio::sync::Mutex<Option<(u64, String)>>,
     /// #172/T7-R4 测试缝：注入 schema 探针结论（生产恒 `None` → 真跑 CLI；
     /// 测试注入后**绝不 spawn 真实 codex.exe**）。
     schema_probe_override: std::sync::Mutex<Option<SchemaProbeOutcome>>,
@@ -283,7 +283,7 @@ impl DesktopIpcAdapter {
                 follow_gate: std::sync::Mutex::new(None),
                 follow_gate_reached: AtomicBool::new(false),
                 schema_evidence: std::sync::Mutex::new(None),
-                schema_probe_ran: AtomicBool::new(false),
+                schema_probe_ran: tokio::sync::Mutex::new(None),
                 schema_probe_override: std::sync::Mutex::new(None),
                 probe_status_cache: std::sync::Mutex::new(None),
                 epoch: AtomicU64::new(0),
@@ -298,7 +298,13 @@ impl DesktopIpcAdapter {
             .inner
             .schema_evidence
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = evidence;
+            .unwrap_or_else(|e| e.into_inner()) = evidence.map(|ev| {
+            (
+                self.inner.epoch.load(Ordering::SeqCst),
+                self.probe_target_snapshot(),
+                ev,
+            )
+        });
     }
 
     /// #172/T7-R4 测试缝：注入 schema 探针的**结论**（`Known` / `Unknown`）。
@@ -318,15 +324,6 @@ impl DesktopIpcAdapter {
             .unwrap_or_else(|e| e.into_inner()) = outcome;
     }
 
-    /// 已有 schema 证据（幂等判据）。
-    fn has_schema_evidence(&self) -> bool {
-        self.inner
-            .schema_evidence
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-    }
-
     /// #172/T7-R4：**官方 schema 探针的结论落进探测账本**（`capability = "schema"`）。
     ///
     /// 为什么要有这一层：`state` 行只说「这台 build 的**读链**有没有证据」，说不清
@@ -334,7 +331,7 @@ impl DesktopIpcAdapter {
     /// 「build × 能力」的数据集才完整（后续人工提升 shipped 表时可回看依据）。
     ///
     /// 流程（幂等 + 只跑一次）：
-    /// 1. **已有证据** → 直接返回（不重复探、不重复记账）；
+    /// 1. **同一完整指纹与连接代际已完成探测** → 直接返回；
     /// 2. 取探测目标（`probe_target_snapshot()` + `resolve_probe_key()`）：取不到
     ///    target → **直接返回，不记账**（无法归因的行宁可没有，也不能错记到别的
     ///    build 上）；
@@ -343,27 +340,21 @@ impl DesktopIpcAdapter {
     /// 4. `Known(evidence)` → 装证据 + 记 `Probed`；`Unknown{error_code}` → **不装
     ///    证据**（审批保持「到桌面处理」）+ 记 `Inconclusive`（带错误码）。
     ///
-    /// **`fingerprint` 只进日志**：账本表没有该列，要持久化得做一次 DB 迁移——
-    /// **本轮不做**（见下方 TODO）。
-    ///
-    /// TODO(#172/T7-R4)：账本表加 `evidence_fingerprint` 列并做 DB 迁移后，把
-    /// `evidence.fingerprint` 一并落库（当前只写日志，供人工追溯）。
+    /// schema 内容指纹随结论写入账本，供审批词表归因。
     pub async fn ensure_schema_evidence(&self) {
-        // 幂等第一道：已有证据 → 不探不记账（注入为空时同样适用）。
-        if self.has_schema_evidence() {
-            return;
-        }
         // 归因：拿不到 build 目标就没有 probe_key——**不记账**（宁可缺行，不可错记）。
         let Some(target) = self.probe_target_snapshot() else {
             log::info!("codex-ipc schema: 未取到 build 目标（无法归因），不探不记账");
             return;
         };
-        // 幂等第二道：schema 探针**只跑一次**（结论为 Unknown 时也不重跑——重跑只会
-        // 再拿同一个 Unknown；账本行已记 inconclusive + 退避窗口）。
-        if self.inner.schema_probe_ran.swap(true, Ordering::SeqCst) {
+        let epoch = self.inner.epoch.load(Ordering::SeqCst);
+        let probe_key = self.resolve_probe_key(&target).await;
+        let bound_target = self.probe_target_snapshot();
+        // 锁覆盖探测；取消时自动释放，且仅完成后标记已探测。
+        let mut ran = self.inner.schema_probe_ran.lock().await;
+        if ran.as_ref() == Some(&(epoch, probe_key.clone())) {
             return;
         }
-        let probe_key = self.resolve_probe_key(&target).await;
         let started = std::time::Instant::now();
         // 测试缝：注入结论时**不跑真实 CLI**（生产恒 None → 真跑）。
         let outcome = match self.schema_probe_override() {
@@ -371,6 +362,12 @@ impl DesktopIpcAdapter {
             None => super::probe::schema_probe::probe_schema().await,
         };
         let duration_ms = started.elapsed().as_millis() as u64;
+        if self.inner.epoch.load(Ordering::SeqCst) != epoch
+            || self.probe_target_snapshot() != bound_target
+        {
+            return; // 身份已变化，拒收旧异步结果（也不记账）。
+        }
+        *ran = Some((epoch, probe_key.clone()));
         match outcome {
             SchemaProbeOutcome::Known(evidence) => {
                 // §4.11 观测：结构化日志（打指纹与两个决策词列表；不记正文）。
@@ -381,7 +378,11 @@ impl DesktopIpcAdapter {
                     evidence.file_decisions
                 );
                 let fingerprint = evidence.fingerprint.clone();
-                self.set_schema_evidence(Some(evidence));
+                *self
+                    .inner
+                    .schema_evidence
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((epoch, bound_target, evidence));
                 if let Some(ledger) = self.probe_ledger() {
                     // stage 记 P3：账本的 `probe_stage` 只有 P0–P3 词表，schema 探针
                     // 属「读链末端的能力取证」，归入 P3（不改 DAO 的词表）。
@@ -446,13 +447,18 @@ impl DesktopIpcAdapter {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         match evidence {
-            Some(ev) => super::pending::DecisionPolicy::schema(
-                ev.command_allows(super::pending::DECISION_ACCEPT)
-                    && ev.command_allows(super::pending::DECISION_CANCEL),
-                ev.file_allows(super::pending::DECISION_ACCEPT)
-                    && ev.file_allows(super::pending::DECISION_CANCEL),
-            ),
-            None => super::pending::DecisionPolicy::default(),
+            Some((epoch, target, ev))
+                if epoch == self.inner.epoch.load(Ordering::SeqCst)
+                    && target == self.probe_target_snapshot() =>
+            {
+                super::pending::DecisionPolicy::schema(
+                    ev.command_allows(super::pending::DECISION_ACCEPT)
+                        && ev.command_allows(super::pending::DECISION_CANCEL),
+                    ev.file_allows(super::pending::DECISION_ACCEPT)
+                        && ev.file_allows(super::pending::DECISION_CANCEL),
+                )
+            }
+            _ => super::pending::DecisionPolicy::default(),
         }
     }
 
@@ -924,6 +930,11 @@ impl DesktopIpcAdapter {
         // 已释放 conn 锁：换代清理（短锁逐个）
         self.inner.owners.lock().await.reset(epoch);
         self.set_profile(profile);
+        // 每次连接均检查当前完整指纹；覆盖已知版本升级到未知版本。
+        let adapter_for_schema = self.clone();
+        tokio::spawn(async move {
+            adapter_for_schema.ensure_schema_evidence().await;
+        });
         // 旧镜像全部标 stale（重新 following 的 snapshot 复活）
         {
             let mut mirrors = self.inner.mirrors.lock().await;
@@ -2759,6 +2770,32 @@ mod dispatch_tests {
         fn connect(&self) -> ConnectFuture<'_> {
             Box::pin(async { Err(ProtocolError::Disconnected("test connector".into())) })
         }
+    }
+
+    #[tokio::test]
+    async fn schema_evidence_is_bound_to_identity_and_reprobed() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "unknown-a"),
+        );
+        adapter.set_probe_key_override(Some("macos|unknown-a|cli-a|1".into()));
+        adapter.set_schema_probe_override(Some(SchemaProbeOutcome::Known(SchemaEvidence {
+            fingerprint: "schema-a".into(),
+            command_decisions: vec!["accept".into(), "cancel".into()],
+            file_decisions: vec![],
+        })));
+        adapter.ensure_schema_evidence().await;
+        assert!(!adapter.approval_policy().is_empty());
+        adapter.inner.epoch.fetch_add(1, Ordering::SeqCst);
+        *adapter.inner.probe_target.lock().unwrap() = Some(ProbeTarget {
+            platform: "macos".into(),
+            build: "unknown-b".into(),
+            key: None,
+        });
+        adapter.set_probe_key_override(Some("macos|unknown-b|cli-b|1".into()));
+        assert!(adapter.approval_policy().is_empty(), "旧证据不得跨身份复用");
+        adapter.ensure_schema_evidence().await;
+        assert!(!adapter.approval_policy().is_empty(), "新身份应重新取证");
     }
 
     fn lease() -> OwnerLease {

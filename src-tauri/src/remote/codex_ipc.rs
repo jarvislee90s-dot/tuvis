@@ -2701,7 +2701,8 @@ pub async fn pending_response(
             //（≤ `decision_confirm_ms`）；仍在场 → 如实标 `decision_unconfirmed`
             //（前端提示「未确认，可终止本轮」），绝不假装成功。
             if receipt.delivery == Delivery::Accepted {
-                receipt = confirm_decision_gone(hub, &ctx.key, &request_key, receipt).await;
+                receipt =
+                    confirm_decision_gone(hub, &ctx.key, &request_key, &projection, receipt).await;
             }
             let result = audit_result_of_receipt(&receipt);
             codex_audit(
@@ -2740,6 +2741,7 @@ async fn confirm_decision_gone(
     hub: &CodexControlHub,
     key: &ThreadKey,
     request_key: &str,
+    before: &ThreadProjection,
     mut receipt: ActionReceipt,
 ) -> ActionReceipt {
     let total = hub.decision_confirm_ms();
@@ -2749,11 +2751,7 @@ async fn confirm_decision_gone(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(total);
     loop {
         let projection = hub.adapter.projection(key).await;
-        if !projection
-            .pending
-            .iter()
-            .any(|p| p.request_key == request_key)
-        {
+        if decision_snapshot_confirms(before, &projection, request_key) {
             return receipt;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2771,6 +2769,21 @@ async fn confirm_decision_gone(
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+}
+
+fn decision_snapshot_confirms(
+    before: &ThreadProjection,
+    current: &ThreadProjection,
+    request_key: &str,
+) -> bool {
+    !current.stale
+        && current.owner_epoch == before.owner_epoch
+        && current.owner_generation == before.owner_generation
+        && current
+            .revision
+            .zip(before.revision)
+            .is_some_and(|(now, old)| now > old)
+        && !current.pending.iter().any(|p| p.request_key == request_key)
 }
 
 /// 回执 → HTTP：非 200 档（409/400/503）返回**错误体** `{"error": <机器码>}`（过期
@@ -2838,7 +2851,9 @@ mod startup_merge_tests {
     //! 2026-10-20 复审 P2：SSE 首快照与订阅缓冲的合并语义（纯函数层，确定性覆盖
     //! 「快照与建流交界处发布最终态」「旧缓冲不得覆盖较新快照」「owner 换代」）。
 
-    use super::{merge_startup_buffer, supersedes, turn_association_refusal};
+    use super::{
+        decision_snapshot_confirms, merge_startup_buffer, supersedes, turn_association_refusal,
+    };
     use crate::services::codex_desktop_ipc::types::{
         CapabilitySet, ContentState, ControlAvailability, ProbeStatus, ThreadKey, ThreadProjection,
     };
@@ -2847,6 +2862,25 @@ mod startup_merge_tests {
         ThreadKey {
             host_id: "local".into(),
             thread_id: thread.into(),
+        }
+    }
+
+    #[test]
+    fn decision_confirmation_rejects_disconnect_and_old_snapshots() {
+        let before = p("t", 1, 2, Some(10), false);
+        assert!(decision_snapshot_confirms(
+            &before,
+            &p("t", 1, 2, Some(11), false),
+            "r"
+        ));
+        for current in [
+            p("t", 1, 2, Some(11), true),
+            p("t", 1, 2, Some(10), false),
+            p("t", 2, 2, Some(11), false),
+            p("t", 1, 3, Some(11), false),
+            p("t", 1, 2, None, false),
+        ] {
+            assert!(!decision_snapshot_confirms(&before, &current, "r"));
         }
     }
 

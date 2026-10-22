@@ -3649,6 +3649,7 @@ struct MemoryLedger {
     rows: StdMutex<std::collections::HashMap<LedgerKey, LedgerRow>>,
     gets: std::sync::atomic::AtomicUsize,
     records: std::sync::atomic::AtomicUsize,
+    state_records: std::sync::atomic::AtomicUsize,
 }
 
 impl MemoryLedger {
@@ -3722,6 +3723,10 @@ impl ProbeLedger for MemoryLedger {
     ) {
         self.records
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if capability == CAP_STATE {
+            self.state_records
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         // 与 DAO 同语义：inconclusive 带退避窗口（首探 30s），其余清空
         let next_retry_at = (outcome.as_state() == ProbeState::Inconclusive).then(|| {
             chrono::Utc::now().timestamp_millis()
@@ -3922,7 +3927,12 @@ async fn unknown_build_probe_upgrades_state_and_records() {
         .row(&expected_probe_key("macos", "26.9999.0"), CAP_STATE)
         .expect("账本必须落一行");
     assert_eq!(row.0, ProbeState::Probed);
-    assert_eq!(ledger.records(), 1);
+    assert_eq!(
+        ledger
+            .state_records
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     // 探完即放
     let off = expect_frame(&mut peer, "unfollow").await;
     assert_eq!(off["params"]["following"], serde_json::json!(false));
@@ -3930,7 +3940,12 @@ async fn unknown_build_probe_upgrades_state_and_records() {
     // 二次触发：已有证据 → 零帧零账本访问
     adapter.ensure_read_evidence(&key).await;
     assert_eq!(ledger.gets(), 1, "二次触发不再查账本");
-    assert_eq!(ledger.records(), 1);
+    assert_eq!(
+        ledger
+            .state_records
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     adapter.shutdown().await;
 }
 
@@ -3978,7 +3993,13 @@ async fn unknown_build_probe_failure_does_not_fake_state() {
 
     // 退避窗口内再触发：查账本但**不再探测**（不产生新帧、不重写账本）
     adapter.ensure_read_evidence(&key).await;
-    assert_eq!(ledger.records(), 1, "窗口内不得重写账本");
+    assert_eq!(
+        ledger
+            .state_records
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "窗口内不得重写读链账本（schema 独立取证不计入）"
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(300), peer.recv())
             .await

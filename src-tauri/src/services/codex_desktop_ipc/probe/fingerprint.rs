@@ -248,15 +248,14 @@ fn normalize_version(raw: &str) -> Option<String> {
 
 /// `bin/<hash>/codex.exe` → `<hash>`（`--version` 不可用时的兜底指纹）。
 pub fn hash_dir_of(exe: &Path) -> Option<String> {
-    let dir = exe.parent()?;
-    let parent = dir.parent()?;
-    if !parent
-        .file_name()
-        .is_some_and(|n| n.eq_ignore_ascii_case("bin"))
-    {
+    // Windows 路径也需能在 macOS/Linux 的取证测试中解析。
+    let normalized = exe.to_string_lossy().replace('\\', "/");
+    let mut parts = normalized.rsplit('/');
+    parts.next()?;
+    let name = parts.next()?.to_string();
+    if !parts.next()?.eq_ignore_ascii_case("bin") {
         return None;
     }
-    let name = dir.file_name()?.to_string_lossy().to_string();
     let shaped = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric());
     shaped.then_some(name)
 }

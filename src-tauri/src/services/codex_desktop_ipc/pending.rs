@@ -326,10 +326,10 @@ fn string_decision_words(params: &serde_json::Value) -> Option<Vec<String>> {
             }
         }
     }
-    (!words.is_empty()).then_some(words)
+    Some(words)
 }
 
-/// 请求词 ∩ 策略词（保持**请求词顺序**）；交集为空 → 策略词兜底。
+/// 请求词 ∩ 策略词（保持**请求词顺序**）；交集为空 → 关闭操作。
 ///
 /// 交集保证 schema 档不会发出 schema 未取证的词，也保证 pending 没提供的词
 /// （例如命令侧的 `decline`）不会凭空出现。
@@ -339,11 +339,7 @@ fn intersect_decision_words(policy_words: &[String], request_words: &[String]) -
         .filter(|word| policy_words.contains(word))
         .cloned()
         .collect();
-    if picked.is_empty() {
-        policy_words.to_vec()
-    } else {
-        picked
-    }
+    picked
 }
 
 /// **决策策略**（服务端单一来源）：每一类审批允许哪些决策词。
@@ -878,7 +874,21 @@ mod tests {
         );
     }
 
-    /// pending 没带 `availableDecisions`（或没有字符串词）→ 回退 schema 档词。
+    #[test]
+    fn disjoint_available_decisions_disable_approval() {
+        let views = PendingProjector::new().project_with_policy(
+            &[serde_json::json!({
+                "id": 36, "method": "item/commandExecution/requestApproval",
+                "params": { "command": "echo hi", "availableDecisions": ["acceptForSession"] }
+            })],
+            &caps_unknown_build(),
+            &DecisionPolicy::schema(true, true),
+        );
+        assert!(!views[0].actionable);
+        assert!(views[0].allowed_decisions.is_empty());
+    }
+
+    /// pending 没带 `availableDecisions`→ 回退 schema 档词。
     #[test]
     fn missing_available_decisions_falls_back_to_schema() {
         let p = PendingProjector::new();
@@ -967,7 +977,7 @@ mod tests {
         }
     }
 
-    /// 纯函数：只收字符串词、保序、去重；对象/空数组/缺失 → None。
+    /// 纯函数：只收字符串词、保序、去重；对象与空数组 → 空词表；字段缺失 → None。
     #[test]
     fn string_decision_words_keep_order_skip_objects_and_dedupe() {
         let params = serde_json::json!({
@@ -985,13 +995,13 @@ mod tests {
         assert_eq!(string_decision_words(&serde_json::json!({})), None);
         assert_eq!(
             string_decision_words(&serde_json::json!({ "availableDecisions": [] })),
-            None
+            Some(vec![])
         );
         assert_eq!(
             string_decision_words(&serde_json::json!({
                 "availableDecisions": [{ "acceptWithExecpolicyAmendment": {} }]
             })),
-            None
+            Some(vec![])
         );
     }
 }

@@ -964,7 +964,7 @@ export function RemoteSection() {
             <Switch
               aria-label={t("settings.remote.compatSendTitle")}
               checked={compatSendEnabled}
-              disabled={busy || !status || !compatSendEligible}
+              disabled={busy || !status || (!compatSendEnabled && !compatSendEligible)}
               onCheckedChange={(v) => void applyCompatSend(v)}
             />
           </div>
