@@ -132,6 +132,8 @@ enum InflightState {
 /// #172：当前「尚无证据」档 build 的探测目标（键含 `cli_id`，算一次即缓存）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProbeTarget {
+    /// 目标所属连接代际；同 build 重连也必须隔离异步指纹回填。
+    epoch: u64,
     platform: String,
     build: String,
     /// 账本主键（`platform|build|cli_id|epoch`）；`None` = 尚未计算（算 `cli_id` 可能
@@ -258,6 +260,7 @@ impl DesktopIpcAdapter {
                 // build / 测试注入），先把探测目标记下来：连接暂不可达也能查账本
                 probe_target: std::sync::Mutex::new(profile.is_probe_eligible().then(|| {
                     ProbeTarget {
+                        epoch: 0,
                         platform: profile.platform.clone(),
                         build: profile.build.clone(),
                         key: None,
@@ -347,9 +350,18 @@ impl DesktopIpcAdapter {
             log::info!("codex-ipc schema: 未取到 build 目标（无法归因），不探不记账");
             return;
         };
-        let epoch = self.inner.epoch.load(Ordering::SeqCst);
+        let epoch = target.epoch;
         let probe_key = self.resolve_probe_key(&target).await;
         let bound_target = self.probe_target_snapshot();
+        if self.inner.epoch.load(Ordering::SeqCst) != epoch
+            || !bound_target.as_ref().is_some_and(|current| {
+                current.epoch == target.epoch
+                    && current.platform == target.platform
+                    && current.build == target.build
+            })
+        {
+            return;
+        }
         // 锁覆盖探测；取消时自动释放，且仅完成后标记已探测。
         let mut ran = self.inner.schema_probe_ran.lock().await;
         if ran.as_ref() == Some(&(epoch, probe_key.clone())) {
@@ -803,28 +815,42 @@ impl DesktopIpcAdapter {
         if let Some(key) = &target.key {
             return key.clone();
         }
-        let platform = target.platform.clone();
-        let build = target.build.clone();
-        let computed = tokio::task::spawn_blocking(move || {
-            super::probe::fingerprint::probe_key(&platform, Some(build.as_str())).to_key()
+        self.resolve_probe_key_with(target, async {
+            let platform = target.platform.clone();
+            let build = target.build.clone();
+            tokio::task::spawn_blocking(move || {
+                super::probe::fingerprint::probe_key(&platform, Some(build.as_str())).to_key()
+            })
+            .await
+            .unwrap_or_else(|_| {
+                super::probe::fingerprint::ProbeKey::new(
+                    &target.platform,
+                    Some(target.build.as_str()),
+                    None,
+                )
+                .to_key()
+            })
         })
         .await
-        .unwrap_or_else(|_| {
-            super::probe::fingerprint::ProbeKey::new(
-                &target.platform,
-                Some(target.build.as_str()),
-                None,
-            )
-            .to_key()
-        });
-        // 回填缓存（目标可能已换 build：只在仍匹配时写）
+    }
+
+    async fn resolve_probe_key_with<F>(&self, target: &ProbeTarget, compute: F) -> String
+    where
+        F: std::future::Future<Output = String>,
+    {
+        let computed = compute.await;
+        // 在 target 锁内核对连接代际与目标身份，拒绝同 build 重连的旧计算。
         let mut slot = self
             .inner
             .probe_target
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(cur) = slot.as_mut() {
-            if cur.platform == target.platform && cur.build == target.build {
+            if cur.epoch == target.epoch
+                && self.inner.epoch.load(Ordering::SeqCst) == target.epoch
+                && cur.platform == target.platform
+                && cur.build == target.build
+            {
                 cur.key = Some(computed.clone());
             }
         }
@@ -899,21 +925,6 @@ impl DesktopIpcAdapter {
             Some(p) if !forced_unverified => p.clone(),
             _ => ProtocolProfile::unverified(&endpoint.platform, &build),
         };
-        // 探测目标：只有「尚无证据」档才记（shipped → None，不再探测）
-        {
-            let mut target = self
-                .inner
-                .probe_target
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *target = profile.is_probe_eligible().then(|| ProbeTarget {
-                platform: endpoint.platform.clone(),
-                build,
-                key: None,
-            });
-        }
-        // #172/T9a：build 目标变了 → 探测只读事实的缓存作废（账本键换了）
-        self.invalidate_probe_status_cache();
         // 双检：另一任务可能已重连（持 conn 锁期间不做其他锁操作）
         let (conn, epoch) = {
             let mut guard = self.inner.conn.lock().await;
@@ -927,6 +938,22 @@ impl DesktopIpcAdapter {
             *guard = Some(conn.clone());
             (conn, epoch)
         };
+        // 探测目标：只有「尚无证据」档才记（shipped → None，不再探测）
+        {
+            let mut target = self
+                .inner
+                .probe_target
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *target = profile.is_probe_eligible().then(|| ProbeTarget {
+                epoch,
+                platform: endpoint.platform.clone(),
+                build,
+                key: None,
+            });
+        }
+        // #172/T9a：build 目标变了 → 探测只读事实的缓存作废（账本键换了）
+        self.invalidate_probe_status_cache();
         // 已释放 conn 锁：换代清理（短锁逐个）
         self.inner.owners.lock().await.reset(epoch);
         self.set_profile(profile);
@@ -2788,6 +2815,7 @@ mod dispatch_tests {
         assert!(!adapter.approval_policy().is_empty());
         adapter.inner.epoch.fetch_add(1, Ordering::SeqCst);
         *adapter.inner.probe_target.lock().unwrap() = Some(ProbeTarget {
+            epoch: 1,
             platform: "macos".into(),
             build: "unknown-b".into(),
             key: None,
@@ -2796,6 +2824,51 @@ mod dispatch_tests {
         assert!(adapter.approval_policy().is_empty(), "旧证据不得跨身份复用");
         adapter.ensure_schema_evidence().await;
         assert!(!adapter.approval_policy().is_empty(), "新身份应重新取证");
+    }
+
+    #[tokio::test]
+    async fn old_fingerprint_cannot_fill_reconnected_target() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "same-build"),
+        );
+        let old_target = adapter.probe_target_snapshot().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let old_adapter = adapter.clone();
+        let old = tokio::spawn(async move {
+            old_adapter
+                .resolve_probe_key_with(&old_target, async {
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                    "cli-a".to_string()
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        // build 不变，连接与 CLI 已换代；先清空新 target，再放行旧计算。
+        adapter.inner.epoch.fetch_add(1, Ordering::SeqCst);
+        *adapter.inner.probe_target.lock().unwrap() = Some(ProbeTarget {
+            epoch: 1,
+            platform: "macos".into(),
+            build: "same-build".into(),
+            key: None,
+        });
+        finish_tx.send(()).unwrap();
+        assert_eq!(old.await.unwrap(), "cli-a");
+        assert_eq!(
+            adapter.probe_target_snapshot().unwrap().key,
+            None,
+            "旧 CLI 指纹不得污染新连接的缓存"
+        );
+        let new_target = adapter.probe_target_snapshot().unwrap();
+        adapter
+            .resolve_probe_key_with(&new_target, async { "cli-b".to_string() })
+            .await;
+        assert_eq!(
+            adapter.probe_target_snapshot().unwrap().key.as_deref(),
+            Some("cli-b")
+        );
     }
 
     fn lease() -> OwnerLease {
