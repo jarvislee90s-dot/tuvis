@@ -15,6 +15,20 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ## [Unreleased]
 
+### Changed
+
+- **Unified fixed-address setup completion**: Tailscale and Cloudflare Own domain use timelines that collapse only after real public board verification, retaining address, copy/open, QR and setup-details actions. Later failures keep the summary; historical completion never implies current availability.
+- **Cloudflare Own-domain wizard**: for domains already on Cloudflare, guide tunnel creation, Token entry, confirmed connection, browser-side hostname binding and access verification. A live process alone is not a connected tunnel, and changed configurations require fresh verification.
+- **First-install remote setup**: installations without a historical database enable Remote Access and launch at login by default, with device signatures off. Channels remain manual; upgrades retain their settings, and switches stay off after users disable them.
+- **Tailscale installer experience**: packages are saved in the system Downloads folder. The wizard aligns actions on a vertical timeline, marks completion in green, shows file paths only after verification, reveals manual download only after automatic download fails, and reuses verified legacy packages; temporary downloads become clickable packages only after checksum verification.
+
+### Fixed
+
+- **Tailscale enable wrap-up**: enabling Funnel from the wizard now persists the channel switch and writes an audit entry, so the wizard completes after public verification and the channel restores after a relaunch (previously the flag was never written and the completion gate could not be met).
+- **Approval link retention**: the browser approval link returned by first-time enable is no longer cleared by ordinary same-config status refreshes; config changes, channel off or master off still invalidate stale links and in-flight receipts.
+- **Separate DNS waiting from repair**: confirmed missing public records show continuous elapsed time and an estimate of around ten minutes, with automatic read-only checks and no repeated retry action. Ordinary verification no longer resets Funnel; an explicitly confirmed re-enable performs repair. Enabled macOS extensions require no further action, and a stopped backend no longer implies missing approval.
+- **macOS Tailscale installation**: the install action opens the system installer and rechecks status when Tuvis regains focus. Cancellation stays incomplete; installer failures retain exit codes and stdout/stderr instead of showing a blank error.
+
 ## [0.6.0] - 2026-10-21
 
 ### Added
