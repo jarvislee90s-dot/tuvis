@@ -30,12 +30,14 @@ pub(crate) use reach::{
 // 升级检查的 DoH 钉 IP 兜底（commands/updater.rs）：直连/代理失败后经生产探针解析
 // api.github.com 真实地址——2026-10-08 实测本机 DNS 污染（假证书），钉 IP 直连 200
 pub(crate) use reach::real_probe;
+#[allow(unused_imports)]
+// remote/named and remote/mod consume these in the parallel wizard work.
+pub(crate) use reach::{config_key_snapshot, observe_port, probe_public_http, waiting_status};
 // 重开档常量：生产路径经 `record_pending_hint(republish)` 取文案（不直接引用常量），
 // crate 内只有**测试**要按名断言两档不同 ⇒ 仅测试构建再导出（与 set_reachability 同纪律）
 #[cfg(test)]
 pub(crate) use reach::RECORD_REPUBLISH_HINT;
-// set_reachability 的**生产**写入点全在子模块内（verify 步 / 轮询重验 / 生命周期作废），
-// crate 内只有测试要注入夹具 → 仅测试构建再导出（避免非测试构建的 unused_import）
+// 生产校验经代际提交；测试需要直接注入夹具，仅测试构建再导出。
 #[cfg(test)]
 pub(crate) use reach::set_reachability;
 pub(crate) use status::{set_ts_snapshot, start_channel, stop_all, stop_channel, ts_snapshot};
@@ -1597,6 +1599,15 @@ mod tests {
             other => Err(format!("测试未应答的 CLI 调用: {other:?}")),
         })));
         let p = wizard_status_with(9420, true);
+        assert!(
+            p["enabled"].is_boolean(),
+            "通道意图开关须随 probe 返回: {p}"
+        );
+        assert!(p["configKey"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("sha256:"));
+        assert!(p["waiting"].is_null(), "没有 DNS 等待时返回 null: {p}");
         let expected_platform = if cfg!(target_os = "macos") {
             "mac"
         } else if cfg!(target_os = "windows") {
@@ -2448,6 +2459,95 @@ mod tests {
         teardown_globals();
     }
 
+    #[test]
+    fn first_funnel_step_persists_intent_and_can_complete_the_wizard() {
+        let _g = test_lock();
+        use crate::database::dao::settings::{get_setting, set_setting};
+        let old_enabled = get_setting(crate::remote::KEY_ENABLED).unwrap_or_else(|| "false".into());
+        let old_channel =
+            get_setting(crate::remote::KEY_CHAN_TAILSCALE).unwrap_or_else(|| "0".into());
+        set_setting(crate::remote::KEY_ENABLED, "true");
+        set_setting(crate::remote::KEY_CHAN_TAILSCALE, "0");
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cli_active = active.clone();
+        set_run_cli_override(Some(Box::new(move |args| {
+            match args {
+            ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+            ["funnel", "status", "--json"] if cli_active.load(std::sync::atomic::Ordering::SeqCst) => Ok(r#"{"Web":{"x.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9420"}}}}}"#.into()),
+            ["funnel", "status", "--json"] => Ok("{}".into()),
+            ["set", "--shields-up=false"] => Ok(String::new()),
+            ["get", "--json"] => Ok(r#"{"shields-up":false}"#.into()),
+            ["funnel", "--bg", "9420"] => { cli_active.store(true, std::sync::atomic::Ordering::SeqCst); Ok(String::new()) },
+            ["funnel", "status"] => Ok(String::new()),
+            other => Err(format!("测试未应答: {other:?}")),
+        }
+        })));
+        let probe_active = active.clone();
+        set_verify_probe_override(Some(Box::new(move |_| {
+            Ok(if probe_active.load(std::sync::atomic::Ordering::SeqCst) {
+                vec!["203.0.113.10".into()]
+            } else {
+                vec![]
+            })
+        })));
+        set_http_probe_override(Some(Box::new(|_, _| Ok(()))));
+        assert_eq!(wizard_status_with(9420, true)["enabled"], false);
+        assert_eq!(
+            run_step("verify", 9420).unwrap()["reach"]["state"],
+            "record_pending"
+        );
+        assert_eq!(
+            get_setting(crate::remote::KEY_CHAN_TAILSCALE).as_deref(),
+            Some("0")
+        );
+        let opened = run_step("funnel", 9420).unwrap();
+        let verified = run_step("verify", 9420).unwrap();
+        let probe = wizard_status_with(9420, true);
+        let persisted = get_setting(crate::remote::KEY_CHAN_TAILSCALE);
+        set_setting(crate::remote::KEY_ENABLED, &old_enabled);
+        set_setting(crate::remote::KEY_CHAN_TAILSCALE, &old_channel);
+        teardown_globals();
+        assert_eq!(opened["ok"], true);
+        assert_eq!(verified["done"], true);
+        assert_eq!(persisted.as_deref(), Some("1"));
+        assert_eq!(probe["enabled"], true);
+        assert_eq!(probe["reach"]["state"], "verified");
+        assert!(probe["running"].as_bool().unwrap());
+        assert!(probe["states"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|state| state["done"] == true));
+    }
+
+    #[test]
+    fn failed_first_funnel_step_keeps_channel_intent_off() {
+        let _g = test_lock();
+        use crate::database::dao::settings::{get_setting, set_setting};
+        let old_channel =
+            get_setting(crate::remote::KEY_CHAN_TAILSCALE).unwrap_or_else(|| "0".into());
+        set_setting(crate::remote::KEY_CHAN_TAILSCALE, "0");
+        let calls = spy_cli(|args| {
+            match args {
+            ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+            ["funnel", "status", "--json"] => Ok(r#"{"Web":{"foreign.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}}}"#.into()),
+            ["get", "--json"] => Ok(r#"{"shields-up":false}"#.into()),
+            other => Err(format!("归属守卫拒绝时不得执行: {other:?}")),
+        }
+        });
+        let result = run_step("funnel", 9420);
+        let persisted = get_setting(crate::remote::KEY_CHAN_TAILSCALE);
+        let probe = wizard_status_with(9420, true);
+        set_setting(crate::remote::KEY_CHAN_TAILSCALE, &old_channel);
+        let calls = calls.lock().unwrap().clone();
+        teardown_globals();
+        assert!(result.unwrap_err().contains("TS_FOREIGN_SERVE"));
+        assert_eq!(persisted.as_deref(), Some("0"));
+        assert_eq!(probe["enabled"], false);
+        assert_eq!(probe["running"], false);
+        assert_no_write_calls(&calls);
+    }
+
     /// A1 **变异锚点**（2026-10-07 Windows 实测）：`funnel --bg` **成功即算开通**——
     /// 没有批准链接是**正常成功路径**（Windows 实测零批准链接），不是「等待批准」也不是错误。
     /// 代码若改成「等批准」「无链接即报错/卡住」，本测试必红。
@@ -2515,11 +2615,173 @@ mod tests {
         teardown_globals();
     }
 
-    /// 自愈正路：第一次校验解析不到（记录未发布）→ 通道开着（DESIRED=Some）→
+    #[test]
+    fn verify_is_read_only_even_when_channel_is_enabled_and_record_is_pending() {
+        let _g = test_lock();
+        *DESIRED.lock().unwrap() = Some(9420);
+        let calls = spy_cli(|args: &[&str]| match args {
+            ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+            other => Err(format!("普通 verify 不应执行写入或守卫命令: {other:?}")),
+        });
+        set_verify_probe_override(Some(Box::new(|_h: &str| Ok(vec![]))));
+
+        let result = run_step("verify", 9420).expect("只读 verify 应返回检查结果");
+        assert_eq!(result["reach"]["state"], "record_pending");
+        assert_eq!(
+            reachability(),
+            Reachability::RecordPending { republish: false }
+        );
+        assert!(calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|args| args == &["status".to_string(), "--json".to_string()]));
+        teardown_globals();
+    }
+
+    #[test]
+    fn repair_does_not_reset_funnel_when_channel_intent_is_off() {
+        let _g = test_lock();
+        *DESIRED.lock().unwrap() = None;
+        let calls = spy_cli(|args: &[&str]| match args {
+            ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+            other => Err(format!("关闭状态下 repair 不得执行配置写入: {other:?}")),
+        });
+        set_verify_probe_override(Some(Box::new(|_h: &str| Ok(vec![]))));
+
+        let result = run_step("repair", 9420).expect("关闭状态下 repair 仍返回只读结论");
+        assert_eq!(result["reach"]["state"], "record_pending");
+        assert!(calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|args| args == &["status".to_string(), "--json".to_string()]));
+        teardown_globals();
+    }
+
+    #[test]
+    fn repair_aborts_before_reset_when_channel_closes_during_guard_read() {
+        let _g = test_lock();
+        *DESIRED.lock().unwrap() = Some(9420);
+        let calls = spy_cli(|args: &[&str]| match args {
+            ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+            ["funnel", "status", "--json"] => {
+                *DESIRED.lock().unwrap() = None;
+                super::reach::invalidate_verification_lifecycle();
+                Ok("{}".into())
+            }
+            other => Err(format!("关闭期间不应继续 repair: {other:?}")),
+        });
+        set_verify_probe_override(Some(Box::new(|_h: &str| Ok(vec![]))));
+
+        let result = run_step("repair", 9420).expect("过期 repair 回执应正常返回");
+        assert_eq!(result["stale"], true);
+        assert!(calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|args| args != &["funnel".to_string(), "reset".to_string()]));
+        teardown_globals();
+    }
+
+    #[test]
+    fn repair_does_not_reenable_after_lifecycle_changes_during_reset() {
+        let _g = test_lock();
+        *DESIRED.lock().unwrap() = Some(9420);
+        let calls = spy_cli(|args: &[&str]| match args {
+            ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+            ["funnel", "status", "--json"] => Ok("{}".into()),
+            ["funnel", "reset"] => {
+                super::reach::advance_lifecycle_epoch();
+                Ok(String::new())
+            }
+            ["set", "--shields-up=false"] => Ok(String::new()),
+            ["get", "--json"] => Ok(r#"{"shields-up": false}"#.into()),
+            ["funnel", "--bg", "9420"] => Ok(String::new()),
+            ["funnel", "status"] => Ok(String::new()),
+            other => Err(format!("关闭后的 repair 不应继续写: {other:?}")),
+        });
+        set_verify_probe_override(Some(Box::new(|_h: &str| Ok(vec![]))));
+
+        let result = run_step("repair", 9420).expect("过期 repair 回执应正常返回");
+        assert_eq!(result["stale"], true);
+        assert!(calls.lock().unwrap().iter().all(|args| {
+            args != &["set".to_string(), "--shields-up=false".to_string()]
+                && args != &["funnel".to_string(), "--bg".to_string(), "9420".to_string()]
+        }));
+        teardown_globals();
+    }
+
+    #[test]
+    fn repair_rechecks_lifecycle_after_reopen_reads_and_between_writes() {
+        let _g = test_lock();
+        for interrupt_on in ["reopen_guard", "shields_write"] {
+            *DESIRED.lock().unwrap() = Some(9420);
+            let guard_reads = std::sync::atomic::AtomicUsize::new(0);
+            let calls = spy_cli(move |args: &[&str]| match args {
+                ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+                ["funnel", "status", "--json"] => {
+                    if guard_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1
+                        && interrupt_on == "reopen_guard"
+                    {
+                        super::reach::advance_lifecycle_epoch();
+                    }
+                    Ok("{}".into())
+                }
+                ["funnel", "reset"] => Ok(String::new()),
+                ["set", "--shields-up=false"] => {
+                    if interrupt_on == "shields_write" {
+                        super::reach::advance_lifecycle_epoch();
+                    }
+                    Ok(String::new())
+                }
+                ["get", "--json"] => Ok(r#"{"shields-up":false}"#.into()),
+                ["funnel", "--bg", "9420"] | ["funnel", "status"] => Ok(String::new()),
+                other => Err(format!("测试未应答: {other:?}")),
+            });
+            set_verify_probe_override(Some(Box::new(|_| Ok(vec![]))));
+            let result = run_step("repair", 9420).unwrap();
+            assert_eq!(result["stale"], true);
+            let calls = calls.lock().unwrap();
+            assert!(
+                !calls.iter().any(|args| args == &["funnel", "--bg", "9420"]),
+                "{interrupt_on}: 关闭请求已发生，不得继续公开端口: {calls:?}"
+            );
+            if interrupt_on == "reopen_guard" {
+                assert!(!calls
+                    .iter()
+                    .any(|args| args == &["set", "--shields-up=false"]));
+            }
+            drop(calls);
+            teardown_globals();
+        }
+    }
+
+    #[test]
+    fn verify_and_repair_return_missing_dns_host_reason_instead_of_stale_unverified() {
+        let _g = test_lock();
+        set_run_cli_override(Some(Box::new(|args: &[&str]| match args {
+            ["status", "--json"] => Ok(STATUS_NEEDS_LOGIN_NO_URL.into()),
+            other => Err(format!("缺域名路径不应调用其他 CLI: {other:?}")),
+        })));
+
+        for step in ["verify", "repair"] {
+            let result = run_step(step, 9420).expect("缺域名应返回校验结果");
+            assert_eq!(result["stale"], false, "{step}: {result}");
+            assert_eq!(result["reach"]["state"], "failed", "{step}: {result}");
+            assert!(result["reach"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("TSWIZ_VERIFY_HOST_MISSING:"));
+        }
+        teardown_globals();
+    }
+
+    /// repair 自愈正路：第一次校验解析不到（记录未发布）→ 通道开着（DESIRED=Some）→
     /// 自动 reset + 重开 → 记录「重新发布」→ 重验 Verified。
     /// **变异锚点**：把 verify_with_heal 的自愈分支删掉 → reset/bg 不入账、done 断言红
     #[test]
-    fn run_step_verify_failed_heals_via_reset_and_reenable() {
+    fn run_step_repair_failed_heals_via_reset_and_reenable() {
         let _g = test_lock();
         *DESIRED.lock().unwrap() = Some(9420); // 通道开着 → 允许自愈
         let calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
@@ -2555,7 +2817,7 @@ mod tests {
         })));
         set_http_probe_override(Some(Box::new(|_h, _ip| Ok(()))));
 
-        let r = run_step("verify", 9420).expect("verify 应 Ok");
+        let r = run_step("repair", 9420).expect("repair 应 Ok");
         assert_eq!(r["done"], true, "自愈后记录发布 → 重验通过: {r}");
         assert_eq!(reachability(), Reachability::Verified);
         assert!(
@@ -2640,7 +2902,7 @@ mod tests {
     /// 对照上一条：**其他**失败（DoH 全挂 → 无法验证）仍走自愈——reset+重开的意义在
     /// 「真故障时触发记录重发布」（2026-10-06 实测机理），2026-10-13 裁决只收窄连不通类。
     #[test]
-    fn run_step_verify_other_failure_still_heals() {
+    fn run_step_repair_other_failure_still_heals() {
         let _g = test_lock();
         *DESIRED.lock().unwrap() = Some(9420);
         let calls = spy_cli(|args: &[&str]| match args {
@@ -2658,7 +2920,7 @@ mod tests {
             Err("3 个 DoH 源均无有效应答: 223.5.5.5、223.6.6.6、1.12.12.12".into())
         })));
 
-        run_step("verify", 9420).expect("verify 应 Ok");
+        run_step("repair", 9420).expect("repair 应 Ok");
         assert!(
             matches!(reachability(), Reachability::Failed { ref reason } if reason.contains("无法验证")),
             "自愈后仍验不过 → 如实 Failed: {:?}",
@@ -2747,7 +3009,7 @@ mod tests {
             "起点：本进程还没 reset 过（判据未置位前，档位必须不是「重开」）"
         );
 
-        let r = run_step("verify", 9420).expect("verify 应 Ok");
+        let r = run_step("repair", 9420).expect("repair 应 Ok");
         // ① 自愈确实发生了（reset + 重开）
         assert_eq!(
             calls
@@ -2804,7 +3066,7 @@ mod tests {
         });
         set_verify_probe_override(Some(Box::new(|_h: &str| Ok(vec![]))));
 
-        let r = run_step("verify", 9420).expect("verify 应 Ok");
+        let r = run_step("repair", 9420).expect("repair 应 Ok");
         // ① 如实报失败（点名「重置 Funnel 未成功」与真原因）
         assert_eq!(r["done"], false);
         let reason = r["reach"]["reason"].as_str().unwrap_or_default();
@@ -2907,7 +3169,7 @@ mod tests {
         set_verify_probe_override(Some(Box::new(|_h| Ok(vec![])))); // 解析不到 → Failed → 走自愈
         set_http_probe_override(Some(Box::new(|_h, _ip| Ok(()))));
 
-        let r = run_step("verify", 9420).expect("verify 应 Ok");
+        let r = run_step("repair", 9420).expect("repair 应 Ok");
         assert_eq!(r["done"], false);
         let reason = r["reach"]["reason"].as_str().unwrap_or_default();
         assert!(
@@ -3069,9 +3331,9 @@ mod tests {
             elapsed += slept;
             let now = t0 + std::time::Duration::from_secs(elapsed);
             CLOCK.store(elapsed, std::sync::atomic::Ordering::Relaxed);
-            let retired = poller_tick(&mut st, now, &mut |h| {
+            let retired = poller_tick(&mut st, now, &mut |h, port| {
                 attempts += 1;
-                Some(reverify_with(h, &probe))
+                Some(reverify_with(h, port, &probe))
             });
             assert!(!retired, "通道开着，轮询线程不得退役");
             if matches!(reachability(), Reachability::Verified) {
@@ -3105,11 +3367,11 @@ mod tests {
         set_http_probe_override(Some(Box::new(|_h, _ip| Ok(()))));
         set_reachability(Reachability::Unverified);
         // 先通：Verified 写全局（零捕获闭包 Send+Sync，可直接按 &ProbeFn 用）
-        let r = reverify_with("a.ts.net", &|_h| Ok(vec!["203.0.113.10".into()]));
+        let r = reverify_with("a.ts.net", 9420, &|_h| Ok(vec!["203.0.113.10".into()]));
         assert_eq!(r, Reachability::Verified);
         assert_eq!(reachability(), Reachability::Verified);
         // 后不通（解析记录被撤）：RecordPending 覆写全局
-        let r = reverify_with("a.ts.net", &|_h| Ok(vec![]));
+        let r = reverify_with("a.ts.net", 9420, &|_h| Ok(vec![]));
         assert!(matches!(r, Reachability::RecordPending { .. }));
         assert!(
             matches!(reachability(), Reachability::RecordPending { .. }),
@@ -3180,7 +3442,7 @@ mod tests {
         set_reachability(Reachability::Verified);
         set_boot_recovery_override(Some(true));
         set_http_probe_override(Some(Box::new(|_h, _ip| Err("TLS 失败".into()))));
-        let r = reverify_with("a.ts.net", &|_h| Ok(vec!["203.0.113.10".into()]));
+        let r = reverify_with("a.ts.net", 9420, &|_h| Ok(vec!["203.0.113.10".into()]));
         assert_eq!(r, Reachability::Recovering, "窗口内应落恢复中: {r:?}");
         assert_eq!(
             reachability(),
@@ -3440,7 +3702,8 @@ mod tests {
         stop_channel().expect("停通道");
         // 自愈路径同走一条原语（reset + 重开），一并纳入核对
         *DESIRED.lock().unwrap() = Some(9420);
-        let _ = heal_and_reverify(9420);
+        let token = begin_verification("jarvismac-mini.example-tailnet.ts.net", 9420);
+        let _ = heal_and_reverify(9420, &token);
         let recorded = calls.lock().unwrap().clone();
         let is_enable = |c: &Vec<String>| {
             c.first().map(String::as_str) == Some("funnel")
@@ -4531,7 +4794,7 @@ mod tests {
         })));
         set_verify_probe_override(Some(Box::new(|_h| Ok(vec![])))); // 解析不到 → Failed → 走自愈
         set_http_probe_override(Some(Box::new(|_h, _ip| Ok(()))));
-        let r = run_step("verify", 9420).expect("verify 应 Ok（失败如实落态）");
+        let r = run_step("repair", 9420).expect("repair 应 Ok（失败如实落态）");
         assert_eq!(r["done"], false);
         let reason = r["reach"]["reason"].as_str().unwrap_or_default();
         assert!(
@@ -4678,10 +4941,14 @@ mod tests {
     #[test]
     fn poll_reverify_lifts_restarted_unverified_to_verified() {
         let _g = test_lock();
+        *DESIRED.lock().unwrap() = Some(9420);
+        set_run_cli_override(Some(Box::new(|_| {
+            Ok(STATUS_RUNNING.replace("jarvismac-mini.example-tailnet.ts.net", "a.ts.net"))
+        })));
         set_reachability(Reachability::Unverified);
         set_verify_probe_override(Some(Box::new(|_h| Ok(vec!["203.0.113.10".into()]))));
         set_http_probe_override(Some(Box::new(|_h, _ip| Ok(()))));
-        let r = poll_reverify("a.ts.net").expect("测试已装假探针 → 轮询入口应真的校验");
+        let r = poll_reverify("a.ts.net", 9420).expect("测试已装假探针 → 轮询入口应真的校验");
         assert_eq!(r, Reachability::Verified);
         assert_eq!(
             reachability(),
@@ -4700,7 +4967,7 @@ mod tests {
         set_verify_probe_override(None);
         set_reachability(Reachability::Verified);
         assert!(
-            poll_reverify("a.ts.net").is_none(),
+            poll_reverify("a.ts.net", 9420).is_none(),
             "无假探针 → 测试构建必须跳过（零网络红线）"
         );
         assert_eq!(
@@ -4709,6 +4976,132 @@ mod tests {
             "跳过时不得改动校验态"
         );
         teardown_globals();
+    }
+
+    #[test]
+    fn poll_reverify_discards_results_invalidated_during_the_http_probe() {
+        let _g = test_lock();
+        *DESIRED.lock().unwrap() = Some(9420);
+        set_run_cli_override(Some(Box::new(|_| {
+            Ok(STATUS_RUNNING.replace("jarvismac-mini.example-tailnet.ts.net", "a.ts.net"))
+        })));
+        set_verify_probe_override(Some(Box::new(|_host| {
+            invalidate_verification_lifecycle();
+            Ok(vec!["203.0.113.10".into()])
+        })));
+        set_http_probe_override(Some(Box::new(|_host, _ip| Ok(()))));
+        set_reachability(Reachability::Unverified);
+
+        let result = poll_reverify("a.ts.net", 9420).expect("假探针应走后台入口");
+
+        assert_eq!(result, Reachability::Unverified);
+        assert_eq!(reachability(), Reachability::Unverified);
+        teardown_globals();
+    }
+
+    #[test]
+    fn poll_reverify_preserves_new_configuration_failure_after_old_probe_returns() {
+        let _g = test_lock();
+        *DESIRED.lock().unwrap() = Some(9420);
+        set_run_cli_override(Some(Box::new(|_| {
+            Ok(STATUS_RUNNING.replace("jarvismac-mini.example-tailnet.ts.net", "a.ts.net"))
+        })));
+        set_verify_probe_override(Some(Box::new(|_host| {
+            super::reach::observe_config("new.ts.net", 9430);
+            set_reachability(Reachability::Failed {
+                reason: "new configuration failure".into(),
+            });
+            Ok(vec!["203.0.113.10".into()])
+        })));
+        set_http_probe_override(Some(Box::new(|_host, _ip| Ok(()))));
+        let result = poll_reverify("a.ts.net", 9420).unwrap();
+        assert_eq!(
+            result,
+            Reachability::Failed {
+                reason: "new configuration failure".into()
+            }
+        );
+        assert_eq!(reachability(), result);
+        assert_eq!(waiting_status(), serde_json::Value::Null);
+        teardown_globals();
+    }
+
+    #[test]
+    fn poller_reverify_does_not_start_after_channel_closes_during_hostname_read() {
+        let _g = test_lock();
+        *LAST_REVERIFY.lock().unwrap() = None;
+        *DESIRED.lock().unwrap() = Some(9420);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        set_run_cli_override(Some(Box::new(move |args| match args {
+            ["status", "--json"] => {
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    *DESIRED.lock().unwrap() = None;
+                    invalidate_verification_lifecycle();
+                }
+                Ok(STATUS_RUNNING.into())
+            }
+            ["funnel", "status", "--json"] => Ok(
+                r#"{"Web":{"x.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9420"}}}}}"#
+                    .into(),
+            ),
+            other => Err(format!("后台复验不得写配置: {other:?}")),
+        })));
+        set_verify_probe_override(Some(Box::new(|_| Ok(vec![]))));
+        let mut st = PollerState::default();
+        assert!(!poller_tick(
+            &mut st,
+            std::time::Instant::now(),
+            &mut poll_reverify
+        ));
+        assert_eq!(reachability(), Reachability::Unverified);
+        assert_eq!(waiting_status(), serde_json::Value::Null);
+        teardown_globals();
+    }
+
+    #[test]
+    fn poller_reverify_discards_http_result_after_real_stop_or_port_change() {
+        let _g = test_lock();
+        for close in [true, false] {
+            *LAST_REVERIFY.lock().unwrap() = None;
+            *DESIRED.lock().unwrap() = Some(9420);
+            set_run_cli_override(Some(Box::new(|args| {
+                match args {
+                ["status", "--json"] => Ok(STATUS_RUNNING.into()),
+                ["funnel", "status", "--json"] => Ok(r#"{"Web":{"x.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9420"}}}}}"#.into()),
+                ["funnel", "reset"] => Ok(String::new()),
+                other => Err(format!("测试未应答: {other:?}")),
+            }
+            })));
+            set_verify_probe_override(Some(Box::new(|_| Ok(vec!["203.0.113.10".into()]))));
+            set_http_probe_override(Some(Box::new(move |_, _| {
+                if close {
+                    stop_channel().expect("关闭走真实生命周期，CLI 使用 fake");
+                } else {
+                    *DESIRED.lock().unwrap() = Some(9430);
+                    super::reach::observe_port(9430);
+                    set_reachability(Reachability::Failed {
+                        reason: "new port failure".into(),
+                    });
+                }
+                Ok(())
+            })));
+            let mut st = PollerState::default();
+            assert!(!poller_tick(
+                &mut st,
+                std::time::Instant::now(),
+                &mut poll_reverify
+            ));
+            let expected = if close {
+                Reachability::Unverified
+            } else {
+                Reachability::Failed {
+                    reason: "new port failure".into(),
+                }
+            };
+            assert_eq!(reachability(), expected);
+            assert_eq!(waiting_status(), serde_json::Value::Null);
+            teardown_globals();
+        }
     }
 
     /// B-I1（§C3 要求 7「校验态必须随生命周期失效」）**变异锚点**：stop / start 之后
@@ -4919,7 +5312,7 @@ mod tests {
                 st.ready_streak, 0,
                 "第 {i} 轮：非就绪轮不得累计 ready_streak（「连续 2 轮就绪」的确认语义）"
             );
-            let retired = poller_tick(&mut st, now, &mut |_| None);
+            let retired = poller_tick(&mut st, now, &mut |_, _| None);
             assert!(!retired, "通道开着，轮询线程不得退役");
             assert_eq!(st.ready_streak, 0, "第 {i} 轮（走完整轮）：streak 仍须为 0");
             // ③ 第二道门（enable_funnel ⓪）的覆盖：整轮里零写命令
@@ -5078,6 +5471,7 @@ mod tests {
         });
         let now = std::time::Instant::now();
         // ① 已 Verified：走**生产路**（store_tick → note_backend_ready）——不得被抢写
+        super::reach::observe_config("jarvismac-mini.example-tailnet.ts.net", 9420);
         set_reachability(Reachability::Verified);
         let tick = read_tick(9420);
         store_tick(9420, &tick);
@@ -5123,7 +5517,7 @@ mod tests {
         let mut st = PollerState::default();
         let now = std::time::Instant::now();
         for _ in 0..3 {
-            assert!(!poller_tick(&mut st, now, &mut |_| None));
+            assert!(!poller_tick(&mut st, now, &mut |_, _| None));
             assert_no_write_calls(&calls.lock().unwrap());
         }
         let s = ts_snapshot();
@@ -5171,7 +5565,7 @@ mod tests {
         let mut st = PollerState::default();
         let now = std::time::Instant::now();
         for _ in 0..3 {
-            assert!(!poller_tick(&mut st, now, &mut |_| None));
+            assert!(!poller_tick(&mut st, now, &mut |_, _| None));
         }
         assert_eq!(
             st.interval,
@@ -5180,7 +5574,7 @@ mod tests {
             st.interval
         );
         // 后端转 Running：**只有相位变了**（快照仍逐字相同）→ 间隔必须回落到 POLL_SECS
-        assert!(!poller_tick(&mut st, now, &mut |_| None));
+        assert!(!poller_tick(&mut st, now, &mut |_, _| None));
         assert_eq!(
             st.interval, POLL_SECS,
             "后端相位跃迁必须重置退避（否则补开通最坏要等 ~2 个退避窗 ≈2 分钟）"
@@ -5216,17 +5610,17 @@ mod tests {
                 .count()
         };
         // 第 1 轮：后端第一眼 Running 不算「确认」（实测 T+73s 配置才逐字段回来）
-        assert!(!poller_tick(&mut st, now, &mut |_| None));
+        assert!(!poller_tick(&mut st, now, &mut |_, _| None));
         assert_eq!(
             bg_count(&calls.lock().unwrap()),
             0,
             "第一眼 Running 不得立刻判缺失"
         );
         // 第 2 轮：连续 Running + 配置确认缺失 → 补开通恰好一次
-        assert!(!poller_tick(&mut st, now, &mut |_| None));
+        assert!(!poller_tick(&mut st, now, &mut |_, _| None));
         assert_eq!(bg_count(&calls.lock().unwrap()), 1, "确认缺失后必须补开通");
         // 第 3 轮：仍缺失也不重复轰炸（一次缺失期只试一次）
-        assert!(!poller_tick(&mut st, now, &mut |_| None));
+        assert!(!poller_tick(&mut st, now, &mut |_, _| None));
         assert_eq!(bg_count(&calls.lock().unwrap()), 1, "同一次缺失只试一次");
         teardown_globals();
     }
@@ -5374,7 +5768,8 @@ mod tests {
             ["funnel", "status", "--json"] => Ok("{}".into()),
             other => Err(format!("恢复窗口内不该有这条调用: {other:?}")),
         });
-        let _r = heal_and_reverify(9420);
+        let token = begin_verification("node.tailnet.ts.net", 9420);
+        let _r = heal_and_reverify(9420, &token);
         assert_no_write_calls(&calls.lock().unwrap());
         teardown_globals();
     }
@@ -5400,15 +5795,15 @@ mod tests {
         let mut st = PollerState::default();
         let now = std::time::Instant::now();
         // 两轮让判据成立并触发补开通（失败）
-        assert!(!poller_tick(&mut st, now, &mut |_| None));
-        assert!(!poller_tick(&mut st, now, &mut |_| None));
+        assert!(!poller_tick(&mut st, now, &mut |_, _| None));
+        assert!(!poller_tick(&mut st, now, &mut |_, _| None));
         let e = ts_snapshot().error.unwrap_or_default();
         assert!(
             e.contains("补开通") && e.contains("ACL 不允许 Funnel"),
             "补开通失败必须如实上墙（带真原因）: {e:?}"
         );
         // 再推一轮：map_status 重算会把快照 error 清成 None——留痕必须把它顶回来
-        assert!(!poller_tick(&mut st, now, &mut |_| None));
+        assert!(!poller_tick(&mut st, now, &mut |_, _| None));
         let e = ts_snapshot().error.unwrap_or_default();
         assert!(
             e.contains("补开通"),
@@ -5453,7 +5848,7 @@ mod tests {
         let absent = |_h: &str| Ok(vec![]); // 权威否定：记录尚未发布
                                             // ① 首次开通档（本进程没有 reset 过）
         set_reachability(Reachability::Verified); // 生产规则：验过 = 翻页
-        let r = reverify_with("a.ts.net", &absent);
+        let r = reverify_with("a.ts.net", 9420, &absent);
         let j = serde_json::to_value(&r).expect("可达性可序列化");
         assert_eq!(
             j["state"], "record_pending",
@@ -5472,7 +5867,7 @@ mod tests {
             reset_seen_raw(),
             "`disable_funnel` 是 `funnel reset` 的唯一调用点——必须记下这个可证事实"
         );
-        let r = reverify_with("a.ts.net", &absent);
+        let r = reverify_with("a.ts.net", 9420, &absent);
         let j = serde_json::to_value(&r).expect("可达性可序列化");
         assert_eq!(j["republish"], true, "reset 后重开 = 重新开通档: {j}");
 
@@ -5482,7 +5877,7 @@ mod tests {
             !reset_seen_raw(),
             "Verified 必须翻页（否则一次 reset 会把整个进程的档位永久钉死）"
         );
-        let r = reverify_with("a.ts.net", &absent);
+        let r = reverify_with("a.ts.net", 9420, &absent);
         let j = serde_json::to_value(&r).expect("可达性可序列化");
         assert_eq!(
             j["republish"], false,

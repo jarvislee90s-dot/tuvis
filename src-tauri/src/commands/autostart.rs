@@ -26,6 +26,26 @@ pub fn get_autostart_enabled(app: AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
+/// 仅正式版首次安装尝试一次，状态真值始终由系统读取。
+pub(crate) fn initialize_on_first_launch<R: Runtime>(app: &AppHandle<R>) {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let claimed = {
+        let conn = crate::database::connection::DB.lock().unwrap();
+        crate::database::first_run::claim_autostart(&conn)
+    };
+    match claimed {
+        Ok(true) => {
+            if let Err(e) = flip_and_sync(app, true) {
+                log::warn!("首次安装注册开机启动失败（可在设置中重试）: {e}");
+            }
+        }
+        Ok(false) => {}
+        Err(e) => log::warn!("读取首次安装开机启动标记失败: {e}"),
+    }
+}
+
 /// 翻转自启动（设置页命令与托盘菜单臂的**共用单点**）：debug 拒写门 →
 /// enable/disable → Windows 引号修复（评审 I1）→ 广播 `autostart-changed`
 ///（设置页监听同步）。托盘菜单重建由调用方各自执行（泛型 R 的托盘臂走统一
