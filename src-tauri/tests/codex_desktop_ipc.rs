@@ -2162,7 +2162,7 @@ async fn late_frame_from_old_owner_is_dropped() {
 }
 
 #[tokio::test]
-async fn unknown_build_closes_and_verified_reopens() {
+async fn unknown_build_compat_send_and_verified_reopens() {
     // resolver 链：无 Desktop → verified build → unknown build → verified；
     // 每步断言能力动态变化与零/有 IPC 写（不注入固定 profile）。
     let resolver = std::sync::Arc::new(FakeResolver::absent());
@@ -2236,7 +2236,9 @@ async fn unknown_build_closes_and_verified_reopens() {
         .expect("join");
     assert_eq!(o.delivery, Delivery::Accepted);
 
-    // Step C：unknown build（先切 resolver 再断开）→ 重连后立即关 A 写、start_turn 零写
+    // Step C：unknown build（先切 resolver 再断开）→ 重连后**兼容发送档**（2026-10-22
+    // 用户裁决「build 没对上默认开会话通道」）：send/state 开、破坏性能力（interrupt
+    // 等）仍证据门控；start_turn 正常出帧（方法版本协商 + 如实回执兜漂移），管道不锁死
     resolver.set_endpoint(test_endpoint("macos", "9.9.9-unknown"));
     peer_b.close();
     drive_follow(
@@ -2248,11 +2250,33 @@ async fn unknown_build_closes_and_verified_reopens() {
     )
     .await;
     let _ = wait_revision(&adapter, &key, 2).await;
-    assert!(!adapter.capabilities().send, "unknown build → 能力立即关闭");
-    let o = adapter.start_turn(&key, "act-c", "x", "cmid-c").await;
-    assert_eq!(o.delivery, Delivery::NotSent);
-    assert_eq!(o.reason_code.as_deref(), Some("capability_unavailable"));
-    assert_no_frame(&mut peer_c, 500).await;
+    assert!(
+        adapter.capabilities().send,
+        "unknown build → 会话通道默认开（兼容发送档）"
+    );
+    assert!(
+        !adapter.capabilities().interrupt,
+        "破坏性能力不随档放开（仍证据门控）"
+    );
+    let wt = {
+        let a = adapter.clone();
+        let k = key.clone();
+        tokio::spawn(async move { a.start_turn(&k, "act-c", "x", "cmid-c").await })
+    };
+    let frame = recv_frame(&mut peer_c, 5).await;
+    assert_eq!(frame["method"], "thread-follower-start-turn");
+    peer_c
+        .send(&serde_json::json!({
+            "type": "response", "requestId": frame["requestId"],
+            "resultType": "success", "method": "thread-follower-start-turn",
+            "result": { "turn": { "id": "turn-c", "status": "inProgress" } }
+        }))
+        .await;
+    let o = tokio::time::timeout(Duration::from_secs(5), wt)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(o.delivery, Delivery::Accepted);
 
     // Step D：verified 重开（无需重启 Tuvis）
     resolver.set_endpoint(test_endpoint("macos", MACOS_BUILD));
