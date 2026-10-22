@@ -324,6 +324,7 @@ pub fn download_to(dest: &Path) -> Result<(), String> {
 // ============================================================
 
 use once_cell::sync::Lazy;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -388,6 +389,222 @@ struct TunnelSlots {
     named: Option<TunnelHandle>,
 }
 static TUNNELS: Lazy<Mutex<TunnelSlots>> = Lazy::new(Mutex::default);
+
+#[derive(Default)]
+struct NamedConnections {
+    generation: u64,
+    verification_epoch: u64,
+    config_key: Option<String>,
+    indexes: BTreeSet<u32>,
+}
+static NAMED_CONNECTIONS: Lazy<Mutex<NamedConnections>> = Lazy::new(Mutex::default);
+static NAMED_PROCESS_EFFECTS: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static NAMED_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NAMED_VERIFICATION_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NamedConnectionIdentity {
+    pub(crate) process_generation: u64,
+    pub(crate) verification_epoch: u64,
+}
+
+fn begin_named_generation(config_key: String) -> u64 {
+    let _effects = NAMED_PROCESS_EFFECTS.lock().unwrap();
+    let mut state = NAMED_CONNECTIONS.lock().unwrap();
+    let generation = NAMED_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    let verification_epoch = NAMED_VERIFICATION_EPOCH
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    *state = NamedConnections {
+        generation,
+        verification_epoch,
+        config_key: Some(config_key),
+        indexes: BTreeSet::new(),
+    };
+    generation
+}
+
+fn invalidate_named_generation() {
+    let _effects = NAMED_PROCESS_EFFECTS.lock().unwrap();
+    let mut state = NAMED_CONNECTIONS.lock().unwrap();
+    let generation = NAMED_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    let verification_epoch = NAMED_VERIFICATION_EPOCH
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    *state = NamedConnections {
+        generation,
+        verification_epoch,
+        ..NamedConnections::default()
+    };
+}
+
+fn invalidate_named_generation_if(expected: u64) {
+    let _effects = NAMED_PROCESS_EFFECTS.lock().unwrap();
+    let mut state = NAMED_CONNECTIONS.lock().unwrap();
+    if state.generation == expected {
+        let generation = NAMED_GENERATION
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        let verification_epoch = NAMED_VERIFICATION_EPOCH
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        *state = NamedConnections {
+            generation,
+            verification_epoch,
+            ..NamedConnections::default()
+        };
+    }
+}
+
+fn update_named_connection(generation: u64, config_key: &str, line: &str) -> bool {
+    let mut state = NAMED_CONNECTIONS.lock().unwrap();
+    if state.generation == generation && state.config_key.as_deref() == Some(config_key) {
+        let had_connection = !state.indexes.is_empty();
+        let changed = super::named::update_connection_index(&mut state.indexes, line);
+        if changed && had_connection && state.indexes.is_empty() {
+            state.verification_epoch = NAMED_VERIFICATION_EPOCH
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1);
+        }
+        return changed;
+    }
+    false
+}
+
+fn named_process_is_current(generation: u64, config_key: &str) -> bool {
+    let state = NAMED_CONNECTIONS.lock().unwrap();
+    state.generation == generation && state.config_key.as_deref() == Some(config_key)
+}
+
+pub(crate) fn named_connection_generation(config_key: &str) -> Option<NamedConnectionIdentity> {
+    let state = NAMED_CONNECTIONS.lock().unwrap();
+    (state.config_key.as_deref() == Some(config_key) && !state.indexes.is_empty()).then_some(
+        NamedConnectionIdentity {
+            process_generation: state.generation,
+            verification_epoch: state.verification_epoch,
+        },
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NamedStderrActions {
+    registered: bool,
+    auth_failure: bool,
+    address: Option<String>,
+}
+
+fn named_stderr_actions(
+    generation: u64,
+    connector_key: &str,
+    current_connector_key: &str,
+    line: &str,
+) -> Option<NamedStderrActions> {
+    if connector_key != current_connector_key
+        || !named_process_is_current(generation, connector_key)
+    {
+        return None;
+    }
+    let accepted = update_named_connection(generation, connector_key, line);
+    let is_connection_event = line.contains("Registered tunnel connection")
+        || line.contains("Connection terminated")
+        || line.contains("Unregistered tunnel connection");
+    Some(NamedStderrActions {
+        registered: accepted && line.contains("Registered tunnel connection"),
+        auth_failure: !is_connection_event && super::named::is_auth_failure_line(line),
+        address: (!is_connection_event)
+            .then(|| parsed_board_url(line, false))
+            .flatten(),
+    })
+}
+
+fn apply_named_stderr_line(
+    generation: u64,
+    connector_key: &str,
+    line: &str,
+    read_current_connector_key: impl FnOnce() -> String,
+    on_registered: impl FnOnce(),
+    on_auth_failure: impl FnOnce(),
+    on_address: impl FnOnce(String),
+) -> bool {
+    let _effects = NAMED_PROCESS_EFFECTS.lock().unwrap();
+    let current_connector_key = read_current_connector_key();
+    let Some(actions) =
+        named_stderr_actions(generation, connector_key, &current_connector_key, line)
+    else {
+        return false;
+    };
+    if actions.registered {
+        on_registered();
+    }
+    if actions.auth_failure {
+        on_auth_failure();
+    }
+    if let Some(address) = actions.address {
+        on_address(address);
+    }
+    true
+}
+
+fn apply_gave_up_error(
+    mode: &str,
+    previous_error: Option<&str>,
+    write_snapshot: impl FnOnce(&str),
+    emit_error: impl FnOnce(&str),
+) -> String {
+    let error = if mode == KEY_CHANNEL_VALUE_NAMED
+        && previous_error.is_some_and(|error| error.starts_with("REMOTE_NAMED_AUTH_FAIL:"))
+    {
+        previous_error.unwrap().to_string()
+    } else {
+        "REMOTE_TUNNEL_GAVE_UP: cloudflared 连续失败 3 次，已停止守护".into()
+    };
+    write_snapshot(&error);
+    emit_error(&error);
+    error
+}
+
+async fn finish_named_process(
+    generation: u64,
+    reader: Option<tauri::async_runtime::JoinHandle<()>>,
+    drain_timeout: std::time::Duration,
+) {
+    // wait() 完成时 stderr 未必排空；先吸收最终失败原因再撤销代际。
+    // 继承管道迟迟不关时有界等待，stop_channel 仍可立即撤销代际并 abort supervisor。
+    if let Some(mut reader) = reader {
+        if tokio::time::timeout(drain_timeout, &mut reader)
+            .await
+            .is_err()
+        {
+            reader.abort();
+        }
+    }
+    invalidate_named_generation_if(generation);
+}
+
+fn record_tunnel_address(mode: &str, url_sink: &Mutex<Option<String>>, url: String) {
+    let fresh = {
+        let mut last = url_sink.lock().unwrap();
+        let fresh = last.as_ref() != Some(&url);
+        *last = Some(url.clone());
+        fresh
+    };
+    if !fresh {
+        return;
+    }
+    set_channel_snapshot(mode, |c| c.url = Some(url.clone()));
+    if mode == KEY_CHANNEL_VALUE_NAMED {
+        crate::database::dao::settings::set_setting(crate::remote::KEY_NAMED_ADDR_LAST, &url);
+    }
+    crate::remote::events::emit_ui(
+        "remote-tunnel-address",
+        serde_json::json!({ "url": url, "channel": mode }),
+    );
+}
 
 /// 按通道写快照（supervise 摄取点 / stop 复位的单点入口）：mode 只认 quick/named
 /// 两字面量（调用方来自 ChannelKind / parse_channel 值域，此处再过滤乱串防御）
@@ -502,6 +719,9 @@ pub fn start_channel(mode: &str, port: u16) {
         supervise(m, port, stop2).await;
     });
     *slot = Some(TunnelHandle { stop, supervisor });
+    if is_named {
+        super::named::start_watchdog();
+    }
 }
 
 /// 守护主循环（每通道独立运行一份）：确保二进制 → spawn → 监听 stderr(quick 解析地址)
@@ -546,13 +766,21 @@ async fn supervise(mode: String, port: u16, stop: Arc<AtomicBool>) {
         cmd.arg("tunnel").arg("--no-autoupdate").kill_on_drop(true); // supervisor 被 abort 时子进程必死（无孤儿）
                                                                      // 防闪窗：cloudflared 是控制台程序且**常驻运行**（隧道活多久黑窗挂多久）
         cmd.no_window();
-        if mode == KEY_CHANNEL_VALUE_QUICK {
-            cmd.arg("--url").arg(format!("http://127.0.0.1:{port}"));
-        } else {
+        let (named_token, named_connection_key) = if mode == KEY_CHANNEL_VALUE_NAMED {
             let token =
                 crate::database::dao::settings::get_setting(crate::remote::KEY_TUNNEL_TOKEN)
                     .unwrap_or_default();
-            cmd.arg("run").arg("--token").arg(token);
+            let connection_key = super::named::connector_key_for_token(&token, port);
+            (Some(token), Some(connection_key))
+        } else {
+            (None, None)
+        };
+        if mode == KEY_CHANNEL_VALUE_QUICK {
+            cmd.arg("--url").arg(format!("http://127.0.0.1:{port}"));
+        } else {
+            cmd.arg("run")
+                .arg("--token")
+                .arg(named_token.as_deref().unwrap_or_default());
         }
         cmd.stderr(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null());
@@ -567,59 +795,59 @@ async fn supervise(mode: String, port: u16, stop: Arc<AtomicBool>) {
                 return;
             }
         };
+        let named_generation = named_connection_key
+            .as_ref()
+            .map(|key| begin_named_generation(key.clone()));
         // stderr 读取任务（地址解析：quick=trycloudflare 行；named=自有子域行）
         let stderr = child.stderr.take();
         let mode_for_stderr = mode.clone();
+        let connection_key_for_stderr = named_connection_key.clone();
+        let generation_for_stderr = named_generation;
         let url_sink = Arc::new(Mutex::new(Option::<String>::None));
         let url_sink2 = url_sink.clone();
-        if let Some(err) = stderr {
+        let stderr_reader = stderr.map(|err| {
             tauri::async_runtime::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let quick = mode_for_stderr == KEY_CHANNEL_VALUE_QUICK;
                 let mut lines = BufReader::new(err).lines();
                 // clippy whilelet_loop 适配（蓝本 loop/match 同语义：Ok(None)/Err 均终止）
                 while let Ok(Some(line)) = lines.next_line().await {
-                    // 归一在摄取点（parsed_board_url 内部完成解析 + board_url 两步）：
-                    // 快照 url 恒为看板完整地址——url_sink / set_snapshot / emit_ui 消费的
-                    // 全是归一后的值，下游（地址表 / issue_token / 托盘 / toast）不再各自拼 /m
+                    if let (Some(connection_key), Some(generation)) =
+                        (connection_key_for_stderr.as_deref(), generation_for_stderr)
+                    {
+                        // 对 named 行先统一做连接器键和 process generation 护栏；拒绝的行
+                        // 不得继续写认证错误、URL、lastAddr 或事件。
+                        apply_named_stderr_line(
+                            generation,
+                            connection_key,
+                            &line,
+                            super::named::current_connector_key_for_settings,
+                            || set_channel_snapshot(&mode_for_stderr, |c| c.error = None),
+                            || {
+                                set_channel_snapshot(&mode_for_stderr, |c| {
+                                    c.error = Some("REMOTE_NAMED_AUTH_FAIL: Cloudflare 拒绝了 Tunnel Token，请检查 Token 并重新连接".into())
+                                })
+                            },
+                            |url| record_tunnel_address(&mode_for_stderr, &url_sink2, url),
+                        );
+                        continue;
+                    }
                     if let Some(u) = parsed_board_url(&line, quick) {
-                        let fresh = {
-                            let mut g = url_sink2.lock().unwrap();
-                            let fresh = g.as_ref() != Some(&u);
-                            *g = Some(u.clone());
-                            fresh
-                        };
-                        if fresh {
-                            // 竞态窗口取舍（评审 Minor 3，payload 侧收口）：本写入任务
-                            // 不持有句柄，stop_channel 的快照复位与在途行写入存在毫秒级
-                            // 竞态——产物 url=Some/running=false/error=None 的陈旧快照会
-                            // 留到下次 start_channel。读取侧（channels_payload）以
-                            // running 为门把已停通道的 address 收口为 null，窗口无害化；
-                            // 此处不另做停止标志检查（多一份需同步的标志拷贝，两处口径
-                            // 易漂移）
-                            set_channel_snapshot(&mode_for_stderr, |c| c.url = Some(u.clone()));
-                            // M5 P2-c：自动记忆最近一次解析成功的自有域名地址（KV 持久，
-                            // 隧道关着/未解析时设置页与豁免名单仍可用）。仅 named 记忆
-                            // （quick 地址每次必变，记忆无意义）
-                            if mode_for_stderr == KEY_CHANNEL_VALUE_NAMED {
-                                crate::database::dao::settings::set_setting(
-                                    crate::remote::KEY_NAMED_ADDR_LAST,
-                                    &u,
-                                );
-                            }
-                            // spec T1c：地址变化桌面通知（含首次拿到地址；channel 字段
-                            // 供前端区分双通道，A6 消费）
-                            crate::remote::events::emit_ui(
-                                "remote-tunnel-address",
-                                serde_json::json!({ "url": u, "channel": mode_for_stderr }),
-                            );
-                        }
+                        record_tunnel_address(&mode_for_stderr, &url_sink2, u);
                     }
                 }
-            });
-        }
+            })
+        });
         // 等子进程退出（或被 stop 方经 kill_on_drop/标志位终止）
         let status = child.wait().await;
+        if let Some(generation) = named_generation {
+            finish_named_process(
+                generation,
+                stderr_reader,
+                std::time::Duration::from_millis(500),
+            )
+            .await;
+        }
         if stop.load(Ordering::Relaxed) {
             break; // 主动停止不算失败
         }
@@ -635,14 +863,22 @@ async fn supervise(mode: String, port: u16, stop: Arc<AtomicBool>) {
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             }
             None => {
-                set_channel_snapshot(&mode, |c| {
-                    c.error =
-                        Some("REMOTE_TUNNEL_GAVE_UP: cloudflared 连续失败 3 次，已停止守护".into())
-                });
+                let previous_error = if mode == KEY_CHANNEL_VALUE_NAMED {
+                    snapshot().named.error
+                } else {
+                    snapshot().quick.error
+                };
                 // spec T1b：放弃时桌面通知报错（Task 8 的 useRemoteEvents 监听）
-                crate::remote::events::emit_ui(
-                    "remote-tunnel-error",
-                    serde_json::json!({"error": "REMOTE_TUNNEL_GAVE_UP: cloudflared 连续失败 3 次，已停止守护", "channel": mode}),
+                apply_gave_up_error(
+                    &mode,
+                    previous_error.as_deref(),
+                    |error| set_channel_snapshot(&mode, |c| c.error = Some(error.to_string())),
+                    |error| {
+                        crate::remote::events::emit_ui(
+                            "remote-tunnel-error",
+                            serde_json::json!({"error": error, "channel": mode}),
+                        )
+                    },
                 );
                 return;
             }
@@ -734,6 +970,10 @@ pub fn stop_channel(mode: &str) {
         h.stop.store(true, Ordering::Relaxed);
         h.supervisor.abort(); // kill 由 abort 传播（子进程 kill_on_drop 已设——无孤儿）
     }
+    if mode == KEY_CHANNEL_VALUE_NAMED {
+        invalidate_named_generation();
+        super::named::invalidate_verification();
+    }
     set_channel_snapshot(mode, |c| {
         c.url = None;
         c.error = None;
@@ -755,6 +995,18 @@ pub fn stop_all() {
 pub(crate) mod test_sync {
     use once_cell::sync::Lazy;
     pub static TUNNEL_GLOBALS: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
+
+    pub(crate) fn begin_named(key: &str) -> u64 {
+        super::begin_named_generation(key.into())
+    }
+
+    pub(crate) fn named_log(generation: u64, key: &str, line: &str) {
+        super::apply_named_stderr_line(generation, key, line, || key.into(), || {}, || {}, |_| {});
+    }
+
+    pub(crate) fn reset_named() {
+        super::invalidate_named_generation();
+    }
 }
 
 #[cfg(test)]
@@ -1337,5 +1589,282 @@ mod tests {
         assert_eq!(backoff_ms(2), Some(2000));
         assert_eq!(backoff_ms(3), Some(4000));
         assert_eq!(backoff_ms(4), None); // 连续失败 3 次后停止（spec T1b）
+    }
+
+    #[test]
+    fn old_named_stderr_cannot_restore_connection_after_new_config_generation() {
+        let _serial = test_sync::TUNNEL_GLOBALS.lock().unwrap();
+        let old = begin_named_generation("key-old".into());
+        update_named_connection(
+            old,
+            "key-old",
+            "INF Registered tunnel connection connIndex=0 event=0",
+        );
+        assert_eq!(
+            named_connection_generation("key-old").map(|id| id.process_generation),
+            Some(old)
+        );
+
+        let current = begin_named_generation("key-new".into());
+        update_named_connection(
+            old,
+            "key-old",
+            "INF Registered tunnel connection connIndex=1 event=0",
+        );
+        assert_eq!(named_connection_generation("key-old"), None);
+        assert_eq!(named_connection_generation("key-new"), None);
+        update_named_connection(
+            current,
+            "key-new",
+            "INF Registered tunnel connection connIndex=0 event=0",
+        );
+        assert_eq!(
+            named_connection_generation("key-new").map(|id| id.process_generation),
+            Some(current)
+        );
+        invalidate_named_generation();
+    }
+
+    #[test]
+    fn old_named_stderr_side_effects_are_rejected_for_same_token_and_port_new_process() {
+        let _serial = test_sync::TUNNEL_GLOBALS.lock().unwrap();
+        let key = "same-token-and-port";
+        let old = begin_named_generation(key.into());
+        update_named_connection(
+            old,
+            key,
+            "INF Registered tunnel connection connIndex=0 event=0",
+        );
+        let current = begin_named_generation(key.into());
+
+        let effects = std::cell::RefCell::new(Vec::new());
+        assert!(!apply_named_stderr_line(
+            old,
+            key,
+            "ERR Register tunnel error: Unauthorized",
+            || key.to_string(),
+            || effects.borrow_mut().push("registered".to_string()),
+            || effects.borrow_mut().push("auth".to_string()),
+            |_| effects.borrow_mut().push("address".to_string()),
+        ));
+        assert!(!apply_named_stderr_line(
+            old,
+            key,
+            r#"INF Updated to new configuration {"config":{"ingress":[{"hostname":"old.example.com"}]}}"#,
+            || key.to_string(),
+            || effects.borrow_mut().push("registered".to_string()),
+            || effects.borrow_mut().push("auth".to_string()),
+            |_| effects.borrow_mut().push("address".to_string()),
+        ));
+        assert!(
+            effects.borrow().is_empty(),
+            "stale stderr applied side effects: {effects:?}"
+        );
+        assert_eq!(named_connection_generation(key), None);
+
+        assert!(apply_named_stderr_line(
+            current,
+            key,
+            "ERR Register tunnel error: Unauthorized",
+            || key.to_string(),
+            || effects.borrow_mut().push("registered".to_string()),
+            || effects.borrow_mut().push("auth".to_string()),
+            |_| effects.borrow_mut().push("address".to_string()),
+        ));
+        assert_eq!(*effects.borrow(), ["auth"]);
+        effects.borrow_mut().clear();
+        assert!(apply_named_stderr_line(
+            current,
+            key,
+            r#"INF Updated to new configuration {"config":{"ingress":[{"hostname":"new.example.com"}]}}"#,
+            || key.to_string(),
+            || effects.borrow_mut().push("registered".to_string()),
+            || effects.borrow_mut().push("auth".to_string()),
+            |address| effects.borrow_mut().push(address),
+        ));
+        assert_eq!(*effects.borrow(), ["https://new.example.com/m"]);
+        invalidate_named_generation();
+    }
+
+    #[test]
+    fn same_process_last_connection_drop_and_reregister_advances_verification_epoch() {
+        let _serial = test_sync::TUNNEL_GLOBALS.lock().unwrap();
+        let key = "token-port";
+        let process = begin_named_generation(key.into());
+        update_named_connection(
+            process,
+            key,
+            "INF Registered tunnel connection connIndex=0 event=0",
+        );
+        let before = named_connection_generation(key).unwrap();
+        update_named_connection(
+            process,
+            key,
+            "INF Registered tunnel connection connIndex=1 event=0",
+        );
+        update_named_connection(process, key, "INF Connection terminated connIndex=0");
+        assert_eq!(
+            named_connection_generation(key),
+            Some(before),
+            "仍有边缘连接时保持已有验证"
+        );
+        update_named_connection(process, key, "INF Connection terminated connIndex=1");
+        update_named_connection(
+            process,
+            key,
+            "INF Registered tunnel connection connIndex=0 event=0",
+        );
+        let after = named_connection_generation(key).unwrap();
+        assert_ne!(before, after, "同进程重新注册必须得到新验证代际");
+        invalidate_named_generation();
+    }
+
+    #[test]
+    fn stale_named_stderr_cannot_write_snapshot_or_persistent_address() {
+        let _serial = test_sync::TUNNEL_GLOBALS.lock().unwrap();
+        reset_globals();
+        // lib 单测数据库已有进程私有 temp 重定向；这里只读取既有值，禁止写真实账户。
+        let remembered =
+            crate::database::dao::settings::get_setting(crate::remote::KEY_NAMED_ADDR_LAST);
+        let key = "same-token-port";
+        let old = begin_named_generation(key.into());
+        let current = begin_named_generation(key.into());
+        set_channel_snapshot(KEY_CHANNEL_VALUE_NAMED, |c| {
+            c.url = Some("https://current.example.com/m".into());
+            c.error = Some("current-process-error".into());
+        });
+        let sink = Mutex::new(None);
+        let stale_lines = [
+            "ERR Register tunnel error: Unauthorized",
+            r#"INF Updated configuration {"hostname":"old.example.com"}"#,
+        ];
+        for (generation, current_key) in [(old, key), (current, "same-token-new-port")] {
+            for line in stale_lines {
+                assert!(!apply_named_stderr_line(
+                    generation,
+                    key,
+                    line,
+                    || current_key.into(),
+                    || set_channel_snapshot(KEY_CHANNEL_VALUE_NAMED, |c| c.error = None),
+                    || set_channel_snapshot(KEY_CHANNEL_VALUE_NAMED, |c| c.error =
+                        Some("stale-auth".into())),
+                    |url| record_tunnel_address(KEY_CHANNEL_VALUE_NAMED, &sink, url),
+                ));
+            }
+        }
+        let status = snapshot().named;
+        assert_eq!(status.url.as_deref(), Some("https://current.example.com/m"));
+        assert_eq!(status.error.as_deref(), Some("current-process-error"));
+        assert_eq!(*sink.lock().unwrap(), None);
+        assert_eq!(
+            crate::database::dao::settings::get_setting(crate::remote::KEY_NAMED_ADDR_LAST),
+            remembered
+        );
+        invalidate_named_generation();
+        reset_globals();
+    }
+
+    #[test]
+    fn terminal_failure_keeps_explicit_named_auth_cause_in_snapshot_and_event() {
+        let _serial = test_sync::TUNNEL_GLOBALS.lock().unwrap();
+        let auth = "REMOTE_NAMED_AUTH_FAIL: Cloudflare rejected the Tunnel Token";
+        let mut snapshot_error = String::new();
+        let mut event_error = String::new();
+        let final_error = apply_gave_up_error(
+            KEY_CHANNEL_VALUE_NAMED,
+            Some(auth),
+            |error| snapshot_error = error.to_string(),
+            |error| event_error = error.to_string(),
+        );
+        assert!(final_error.contains("REMOTE_NAMED_AUTH_FAIL"));
+        assert_eq!(snapshot_error, final_error);
+        assert_eq!(event_error, final_error);
+    }
+
+    #[tokio::test]
+    // 刻意持「串行票据」跨 await（2026-10-22 CI Windows clippy）：碰全局态的全部测试
+    // 同抢 TUNNEL_GLOBALS 这一把锁做互斥；tokio::test 是单线程 runtime，await 期间
+    // 没有重入这把锁的路径（生产代码不认识测试锁），不存在死锁——该 lint 的「换
+    // async 锁/先放锁」建议在此要么破坏同步↔异步测试互斥、要么让等待期失去串行保护。
+    #[allow(clippy::await_holding_lock)]
+    async fn terminal_auth_log_is_drained_before_process_generation_expires() {
+        let _serial = test_sync::TUNNEL_GLOBALS.lock().unwrap();
+        reset_globals();
+        let key = "same-token-port";
+        for failures in 1..=4 {
+            let generation = begin_named_generation(key.into());
+            let reader = tauri::async_runtime::spawn(async move {
+                // 模拟 wait 已完成，但 stderr 的最后一行仍排在 reader 队列中。
+                tokio::task::yield_now().await;
+                apply_named_stderr_line(
+                    generation,
+                    key,
+                    "ERR Register tunnel error: Unauthorized",
+                    || key.into(),
+                    || {},
+                    || {
+                        set_channel_snapshot(KEY_CHANNEL_VALUE_NAMED, |c| {
+                            c.error = Some("REMOTE_NAMED_AUTH_FAIL: Token rejected".into())
+                        })
+                    },
+                    |_| {},
+                );
+            });
+            finish_named_process(generation, Some(reader), std::time::Duration::from_secs(1)).await;
+            assert_eq!(
+                snapshot().named.error.as_deref(),
+                Some("REMOTE_NAMED_AUTH_FAIL: Token rejected")
+            );
+            if backoff_ms(failures).is_none() {
+                let previous = snapshot().named.error;
+                let mut event = String::new();
+                apply_gave_up_error(
+                    KEY_CHANNEL_VALUE_NAMED,
+                    previous.as_deref(),
+                    |error| {
+                        set_channel_snapshot(KEY_CHANNEL_VALUE_NAMED, |c| {
+                            c.error = Some(error.into())
+                        })
+                    },
+                    |error| event = error.into(),
+                );
+                assert_eq!(snapshot().named.error.as_deref(), Some(event.as_str()));
+                assert!(event.starts_with("REMOTE_NAMED_AUTH_FAIL:"));
+                assert!(matches!(
+                    super::super::named::probe().reach,
+                    super::super::tailscale::Reachability::Failed { reason }
+                        if reason.starts_with("REMOTE_NAMED_AUTH_FAIL:")
+                ));
+            }
+        }
+        reset_globals();
+    }
+
+    #[tokio::test]
+    // 串行票据跨 await 的理由同上（见 terminal_auth_log_is_drained… 的注释）
+    #[allow(clippy::await_holding_lock)]
+    async fn stderr_drain_aborts_reader_when_pipe_never_closes() {
+        let _serial = test_sync::TUNNEL_GLOBALS.lock().unwrap();
+        let generation = begin_named_generation("token-port".into());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let reader = tauri::async_runtime::spawn(async move {
+            let _tx = tx;
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            finish_named_process(
+                generation,
+                Some(reader),
+                std::time::Duration::from_millis(5),
+            ),
+        )
+        .await
+        .expect("继承的 stderr 管道不能阻塞隧道重启");
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .unwrap()
+            .is_err());
+        assert!(!named_process_is_current(generation, "token-port"));
     }
 }
