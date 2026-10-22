@@ -117,67 +117,19 @@ fn macos_profile(build: &str) -> ProtocolProfile {
     }
 }
 
-/// macOS `26.1013.40934`（2026-10-18 实机登记）：**只读方法 + start-turn v2 已受控
-/// harness 实证**（initialize/discovery/following/snapshot/load-complete-history 由
-/// 复审探针验证；start-turn 由实现侧探针实证——turn 成功创建 inProgress，23:58）。
-/// **permissions/command/blocking_input 在该 build 未实测，flag 保持 false**——
-/// 旧 build 的 PASS 不跨 build 迁移；审批/问答按证据逐项解锁。
+/// macOS 登记档（interrupt 开）——三 build 能力面相同，共享构造器；逐 build 的
+/// 取证故事见 `profile_for` 各臂注释与对应 reprobe 文档。共性纪律：**审批/问答/
+/// permissions 未实测不跨 build 迁移**（旧 build 的 PASS 不自带）。
 ///
-/// **interrupt（2026-10-21 开启）**：Desktop 侧方法表静态取证——该 build 的
-/// `thread-follower-interrupt-turn` 基值 **4**，params `{conversationId, mode,
-/// expectedTurnId}`，被打断的回合状态置 `interrupted`；配合本仓 `turn_is_terminal`
-/// 放开 `interrupted` 后，「远程停止桌面回合并继续」链路闭环（打断 → 回合终态 →
-/// 屏障释放 → 队列接力）。
-fn macos_40934_profile(build: &str) -> ProtocolProfile {
-    ProtocolProfile {
-        platform: "macos".to_string(),
-        build: build.to_string(),
-        capabilities: CapabilitySet {
-            send: true,
-            state: true,
-            command: false,
-            permissions: false,
-            blocking_input: false,
-            interrupt: true,
-        },
-        method_versions: method_table(),
-    }
-}
-
-/// macOS `26.1016.51333`（2026-10-22 复探登记；证据
-/// `docs/superpowers/reviews/2026-10-22-codex-app-51333-reprobe.md`）：Desktop 自动
-/// 升级后按纪律重取证。**方法表逐项零漂移**（tuvis 在册 6 个 follower 方法 +
-/// 6 个非 follower 方法，与 40934 登记值全同；interrupt 基值 4 / start-turn 2 /
-/// state-changed 11）；**版本协商函数、interrupt handler、安全阀三段源码与
-/// 40934 取证逐字符等价**（仅压缩变量名更名：`Oe`→`ke`、`ox`→`fx`）；活体
-/// `initialize` 握手回执形态同构。能力位按 40934 同面登记：send/state/interrupt
-/// 开，审批/问答/permissions 关（未实测不跨 build 迁移）。send 闭环由登记后的
-/// 收官验收提供；**发现漂移立即摘除本登记**（回滚 = 删本分支 + 测试两处断言）。
-fn macos_51333_profile(build: &str) -> ProtocolProfile {
-    ProtocolProfile {
-        platform: "macos".to_string(),
-        build: build.to_string(),
-        capabilities: CapabilitySet {
-            send: true,
-            state: true,
-            command: false,
-            permissions: false,
-            blocking_input: false,
-            interrupt: true,
-        },
-        method_versions: method_table(),
-    }
-}
-
-/// macOS `26.1016.61520`（2026-10-22 深夜复探登记；证据
-/// `docs/superpowers/reviews/2026-10-22-codex-app-61520-reprobe.md`）：当日第二次
-/// 自动升级（51333 → 61520，app.asar 22:58 落地）。四项静态证据零漂移——11 个
-/// 在册方法逐一同值（interrupt-turn=4 / start-turn=2 / state-changed=11）、版本
-/// 协商 `je` 逐字符同（变量名未再更名）、安全阀正则逐字符命中、打断后置
-/// `interrupted`；活体 initialize / discovery / 安全打断探针（bogus turnId →
-/// `{interruptedTurnId:null, ok:true}`）与档案同构。能力位按 51333/40934 同面：
-/// send/state/interrupt 开，审批/问答/permissions 关。
-fn macos_61520_profile(build: &str) -> ProtocolProfile {
+/// - `26.1013.40934`（2026-10-18 实机登记）：只读方法 + start-turn v2 受控 harness
+///   实证（initialize/discovery/following/snapshot/load-complete-history 复审探针
+///   验证；start-turn 实现侧探针实证——turn 成功创建 inProgress）。
+/// - **interrupt（2026-10-21 起，三 build 同契约）**：Desktop 侧方法表基值 4，
+///   params `{conversationId, mode, expectedTurnId}`，被打断回合置 `interrupted`；
+///   配合 `turn_is_terminal` 放行后「打断 → 终态 → 屏障释放 → 队列接力」闭环。
+/// - `26.1016.51333` / `26.1016.61520`（2026-10-22 两轮复探）：四项静态证据
+///   （方法表 / 版本协商 / interrupt handler / 安全阀）逐字符零漂移 + 活体探针同构。
+fn macos_interrupt_profile(build: &str) -> ProtocolProfile {
     ProtocolProfile {
         platform: "macos".to_string(),
         build: build.to_string(),
@@ -225,9 +177,13 @@ pub fn profile_for(platform: &str, build: &str) -> Option<ProtocolProfile> {
         ("windows", "26.1013.3656.0") => Some(windows_profile(build)),
         ("windows", "26.1013.4894.0") => Some(windows_4894_profile(build)),
         ("macos", "26.1013.31256") => Some(macos_profile(build)),
-        ("macos", "26.1013.40934") => Some(macos_40934_profile(build)),
-        ("macos", "26.1016.51333") => Some(macos_51333_profile(build)),
-        ("macos", "26.1016.61520") => Some(macos_61520_profile(build)),
+        // 40934：2026-10-18 实机登记 + 2026-10-21 interrupt 取证
+        //（docs/superpowers/reviews/2026-10-22-codex-interrupt-probe-results.md）
+        ("macos", "26.1013.40934") => Some(macos_interrupt_profile(build)),
+        // 51333：2026-10-22 复探零漂移（reviews/2026-10-22-codex-app-51333-reprobe.md）
+        ("macos", "26.1016.51333") => Some(macos_interrupt_profile(build)),
+        // 61520：2026-10-22 深夜复探零漂移（reviews/2026-10-22-codex-app-61520-reprobe.md）
+        ("macos", "26.1016.61520") => Some(macos_interrupt_profile(build)),
         _ => None,
     }
 }

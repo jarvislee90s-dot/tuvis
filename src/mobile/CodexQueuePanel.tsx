@@ -286,6 +286,21 @@ export default function CodexQueuePanel({
     (view.blockedReasonCode === "native_turn_pending" ||
       view.blockedReasonCode === "native_turn_active") &&
     view.canInterrupt === true;
+  // 阻塞文案分流（分码 + 能力位）：有打断能力的 build 才承诺「可点下方停止」，
+  // 无能力 build 如实说明暂无停止出口（按钮在源头隐藏，文案也不撒谎）
+  const blockedBannerKey = () => {
+    if (view.blockedReasonCode === "native_turn_pending")
+      return view.canInterrupt === true
+        ? "mobile.codex.queue.blockedNativeTurn"
+        : "mobile.codex.queue.blockedNativeTurnNoCap";
+    if (view.blockedReasonCode === "native_turn_active")
+      return view.canInterrupt === true
+        ? "mobile.codex.queue.blockedNativeTurnActive"
+        : "mobile.codex.queue.blockedNativeTurnActiveNoCap";
+    if (view.blockedReasonCode === "native_delivery_unknown")
+      return "mobile.codex.queue.blockedNativeUnknown";
+    return "mobile.codex.queue.blockedCompat";
+  };
 
   return (
     <div
@@ -303,17 +318,7 @@ export default function CodexQueuePanel({
           data-reason={view.blockedReasonCode}
           className="mt-1 text-xs text-amber-700 dark:text-amber-400"
         >
-          {view.blockedReasonCode === "native_turn_pending"
-            ? view.canInterrupt === true
-              ? i18n.t("mobile.codex.queue.blockedNativeTurn")
-              : i18n.t("mobile.codex.queue.blockedNativeTurnNoCap")
-            : view.blockedReasonCode === "native_turn_active"
-              ? view.canInterrupt === true
-                ? i18n.t("mobile.codex.queue.blockedNativeTurnActive")
-                : i18n.t("mobile.codex.queue.blockedNativeTurnActiveNoCap")
-              : view.blockedReasonCode === "native_delivery_unknown"
-                ? i18n.t("mobile.codex.queue.blockedNativeUnknown")
-                : i18n.t("mobile.codex.queue.blockedCompat")}
+          {i18n.t(blockedBannerKey())}
         </p>
       )}
       {/* 人工解除（无出口屏障复审 Important）：两步确认——未确认不发任何请求；
