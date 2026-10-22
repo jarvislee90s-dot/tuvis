@@ -10,10 +10,14 @@ import {
   fetchCodexQueue,
   fetchCodexThread,
   newActionId,
+  reconcileCodexQueuedReceipt,
   respondCodexPending,
   retractCodexAction,
   subscribeCodexThread,
   type CapabilitySet,
+  type CodexActionView,
+  type CodexQueuedReceipt,
+  type CodexQueueView,
   type MessagesPage,
   type ThreadProjection,
 } from "@/mobile/codexIpcApi";
@@ -727,5 +731,39 @@ describe("codexIpcApi：fetchCodexMessagesPage（同代只读历史页）", () =
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ApiError);
     expect((err as ApiError).status).toBe(400);
+  });
+});
+
+// ==== reconcileCodexQueuedReceipt（2026-10-22 B1：codexQueued 回执收敛）====
+
+describe("reconcileCodexQueuedReceipt", () => {
+  const prev: CodexQueuedReceipt = { kind: "codexQueued", position: 2, actionId: "act-1" };
+  const view = (actions: CodexQueueView["actions"]): CodexQueueView => ({
+    actions,
+    blockedReasonCode: "native_turn_pending",
+    canInterrupt: true,
+  });
+  const queued = (actionId: string, position: number | null): CodexActionView => ({
+    actionId,
+    state: "queued",
+    position,
+    receipt: null,
+  });
+
+  it("action_gone_converges_to_null：动作已离队（派发/撤回/他端清空）→ null，chip 收敛清除", () => {
+    expect(reconcileCodexQueuedReceipt(prev, view([]))).toBeNull();
+    expect(reconcileCodexQueuedReceipt(prev, view([queued("other", 1)]))).toBeNull();
+  });
+
+  it("position_follows_and_stable：位次变化 → 跟随；位次不变 / null → 原引用（不触发无谓重渲）", () => {
+    expect(reconcileCodexQueuedReceipt(prev, view([queued("act-1", 1)]))).toEqual({
+      kind: "codexQueued",
+      position: 1,
+      actionId: "act-1",
+    });
+    const same = view([queued("act-1", 2)]);
+    expect(reconcileCodexQueuedReceipt(prev, same)).toBe(prev);
+    const nullPos = view([queued("act-1", null)]);
+    expect(reconcileCodexQueuedReceipt(prev, nullPos)).toBe(prev);
   });
 });

@@ -337,6 +337,15 @@ impl DesktopIpcAdapter {
             .map(|m| m.project(self.current_caps()))
     }
 
+    /// 当前镜像里处于 `inProgress` 的活动回合 id（2026-10-22 原生回合打断扩展）：
+    /// 端点打断阀值的回退来源——在册屏障不存在（回合由桌面手打产生）时，用它
+    /// 定位目标。无镜像 / stale / 无活动回合 → None——端点据此如实拒绝，不盲发
+    /// （P1-1 纪律不变：有阀值才发，只是阀值来源多一级）。
+    pub async fn mirror_active_turn_id(&self, key: &ThreadKey) -> Option<String> {
+        let mirrors = self.inner.mirrors.lock().await;
+        mirrors.get(key).and_then(|m| m.active_turn_id())
+    }
+
     /// 恢复任务的 follow 统一入口（第三轮复审 B3）：**前置核验**仍有关注（已卸载
     /// 的 key——含 B2 待办合并进来的——直接跳过，不 discovery、不重建镜像）；
     /// follow 完成后**事后复查**，途中被退出关注的（discovery/following 已在途）

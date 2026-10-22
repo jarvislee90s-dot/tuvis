@@ -2,7 +2,7 @@
 
 > 日期：2026-10-22。
 > 状态：实现完成；macOS `26.1013.40934` 真机端到端验收通过（打断 → 回合终态 → 屏障释放 → 队列接力）。Windows 与其他 build 未实测，能力位保持关闭。
-> **build 登记面（2026-10-22 复探）**：Desktop 自动升级到 `26.1016.51333` 后按纪律重取证——方法表 / 版本协商 / 安全阀逐项零漂移，已与 40934 同面登记（证据：`docs/superpowers/reviews/2026-10-22-codex-app-51333-reprobe.md`）。
+> **build 登记面（2026-10-22 两轮复探）**：Desktop 当日两次自动升级（`26.1013.40934` → `26.1016.51333` → `26.1016.61520`），均按纪律重取证——两轮方法表 / 版本协商 / 安全阀逐项零漂移，`51333` / `61520` 已与 40934 同面登记（证据：`docs/superpowers/reviews/2026-10-22-codex-app-51333-reprobe.md`、`docs/superpowers/reviews/2026-10-22-codex-app-61520-reprobe.md`）。当日两连跳实证 build 精确门在自动升级节奏下的锁死代价，系统性解法见 PR #178。
 > 分支：`codex/remote-interrupt-turn`；基线：`origin/main@6fb3868e`。
 > 依据：《Codex Desktop IPC 远程控制 · 需求说明书》（冻结设计，提交 `e39d7665`）§5 明列「interrupt / steer」**不在本 Spec 范围**，「这些能力可以在后续专项 Probe / Spec 中独立增加」——本文即该专项 Spec；同批 Probe 取证见 `docs/superpowers/reviews/2026-10-22-codex-interrupt-probe-results.md`。
 
@@ -55,7 +55,7 @@ Desktop 侧方法表（打包产物静态核对 + 真机探针）：
 
 ### 4.1 能力位与门控
 
-`CapabilitySet` 新增 `interrupt: bool`。`false` 的含义与其他能力位一致：**该 build 尚未活体验证，不表示协议实现不存在**。macOS `26.1013.40934`（2026-10-21 取证）与 macOS `26.1016.51333`（2026-10-22 复探登记，静态证据零漂移）开启；Windows 4894 / 3656、macOS 31256 保持 false——「未经验证的 Desktop 版本或方法不得盲目启用对应能力」（冻结 spec §3.5）。
+`CapabilitySet` 新增 `interrupt: bool`。`false` 的含义与其他能力位一致：**该 build 尚未活体验证，不表示协议实现不存在**。macOS `26.1013.40934`（2026-10-21 取证）与 macOS `26.1016.51333`、`26.1016.61520`（2026-10-22 两轮复探登记，静态证据零漂移）开启；Windows 4894 / 3656、macOS 31256 保持 false——「未经验证的 Desktop 版本或方法不得盲目启用对应能力」（冻结 spec §3.5）。
 
 未开启时端点返回 503 `capability_unavailable`，**零 IPC 写入**（有集成用例钉死）。
 
@@ -78,7 +78,8 @@ POST /m/api/v1/codex/turn/interrupt
 ```
 
 - `turnId` 缺省时，服务端取**在册原生屏障绑定的 turnId**（`codex_actions` 中 route=desktop_ipc ∧ state=accepted ∧ compat_outstanding=1 ∧ compat_turn_id 非空，取 seq 最大一条）作 `expectedTurnId`；这也是「打断的正是卡住我的那个回合」的精确性保证。
-- **无阀拒发（2026-10-22 复审 P1-1 补强）**：请求未带 `turnId` 且在册屏障查不到绑定 turnId → 409 `no_expected_turn` 拒绝（零 IPC 写入）；DB 读失败 → 500。两路都**绝不降级为「无阀照发」**——adapter 层对 `expectedTurnId == None` 同样硬门拒发（缺该参数的 interrupt Desktop 照收不误，等于无阀打断当前活动回合，含桌面手开的无关回合）。
+- **原生回合扩展（2026-10-22，用户确认需求）**：屏障不存在（回合由桌面手打产生）时，阀值**回退取镜像活动回合 id**（`ThreadMirror::active_turn_id`——镜像里 `inProgress` 的最新回合，原生/受理一视同仁）。队列视图同步给出 `native_turn_active` 阻塞码（区别于屏障态 `native_turn_pending`），面板对两者都出打断按钮——桌面手打的长任务/卡住回合从手机也能停。**无新协议面**：同一打断方法、同一份已取证契约；Desktop 侧安全阀原样兜底——镜像给的 id 已过期（回合刚结束）时 `expectedTurnId` 不匹配 → 静默返回 null → 端点如实报「没有可打断回合」，失败方向保守。
+- **无阀拒发（2026-10-22 复审 P1-1 补强）**：请求未带 `turnId` 且**两级阀值来源（屏障 → 镜像活动回合）都取不到** → 409 `no_expected_turn` 拒绝（零 IPC 写入）；DB 读失败 → 500。两路都**绝不降级为「无阀照发」**——adapter 层对 `expectedTurnId == None` 同样硬门拒发（缺该参数的 interrupt Desktop 照收不误，等于无阀打断当前活动回合，含桌面手开的无关回合）。
 - Desktop 侧无可打断回合时回 `interruptedTurnId: null`——端点如实回 null，**不谎报打断成功**，也不当作错误。
 - **投递结果三分支（2026-10-22 复审 P2-3 补强）**：明确受理 → 200 `uncertain:false`；RPC 超时等「帧已交 writer 但结果未知」→ 200 `uncertain:true`（打断可能已生效，不得报「停止失败」诱导重按）；Desktop 明确拒绝（Rejected）→ 409 `desktop_rejected`（不是 503——服务本身可用）。拒绝类错误响应统一带中文可读 `reason`，无能力 build 的打断按钮由队列视图新增的 `canInterrupt` 能力位在**前端源头隐藏**（P2-2）。
 - 端点只负责「发出打断」并触发一次结算；屏障释放由终态证据驱动（`release_turn_if_complete`），回合终态帧到达时调度循环自动接力。
@@ -86,7 +87,7 @@ POST /m/api/v1/codex/turn/interrupt
 
 ### 4.4 前端
 
-队列面板在 `blockedReasonCode === "native_turn_pending"` 时展示「停止桌面回合并继续」——与「人工解除」是两种不同的东西：解除只清屏障（消息仍要等桌面空闲才投得出去），打断是真的让桌面停下。
+队列面板在 `blockedReasonCode === "native_turn_pending"`（手机受理回合在跑，屏障态）或 `"native_turn_active"`（桌面手打的原生回合在跑，2026-10-22 扩展）时展示「停止桌面回合并继续」——与「人工解除」是两种不同的东西：解除只清屏障（消息仍要等桌面空闲才投得出去），打断是真的让桌面停下。
 
 两步确认（未确认不发任何请求），确认文案如实披露「该回合未完成的工作会丢失」；打断成功／结果不确定（指令已发出但未知，劝阻连续重按）／桌面无可打断回合／失败，**四种结果**分别如实回报（不静默）。按钮仅 `canInterrupt === true`（队列视图下发的 interrupt 能力位）可见——无能力 build 在源头隐藏，不给渲染出来只会 503 的假出口（复审 P2-2）。
 

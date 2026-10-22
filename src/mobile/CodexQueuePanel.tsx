@@ -275,15 +275,17 @@ export default function CodexQueuePanel({
     (view.blockedReasonCode === "native_delivery_unknown" ||
       view.blockedReasonCode === "compat_outstanding") &&
     (view.blockedActionIds?.length ?? 0) > 0;
-  // 打断出口（2026-10-21）：native_turn_pending = 桌面回合未确认完成 → 队列暂停
-  // 派发。自动恢复路径是「回合自己结束」——但回合若一直不结束（长任务/卡住），
-  // 手机端就完全无解。这里的出口是**真的让桌面停下**（打断当前回合），而不是
-  // 仅清屏障（清屏障后消息仍要等桌面空闲才投得出去）。
+  // 打断出口（2026-10-21；2026-10-22 扩展原生回合）：两类阻塞态都给出「真的让
+  // 桌面停下」的出口，而非仅清屏障——
+  // - native_turn_pending：手机受理回合在跑（在册屏障），阀值 = 屏障绑定回合；
+  // - native_turn_active：桌面手打的原生回合在跑（无屏障），阀值 = 镜像活动回合。
   // 能力位门控（复审 P2-2）：canInterrupt=false 的 Desktop build（未活体验证
   // interrupt）按钮在源头隐藏——渲染出来也只会永远 503；旧载荷缺省视为无能力
   //（保守方向：宁可没有按钮，不可有假出口）。
   const canInterrupt =
-    view.blockedReasonCode === "native_turn_pending" && view.canInterrupt === true;
+    (view.blockedReasonCode === "native_turn_pending" ||
+      view.blockedReasonCode === "native_turn_active") &&
+    view.canInterrupt === true;
 
   return (
     <div
@@ -303,9 +305,11 @@ export default function CodexQueuePanel({
         >
           {view.blockedReasonCode === "native_turn_pending"
             ? i18n.t("mobile.codex.queue.blockedNativeTurn")
-            : view.blockedReasonCode === "native_delivery_unknown"
-              ? i18n.t("mobile.codex.queue.blockedNativeUnknown")
-              : i18n.t("mobile.codex.queue.blockedCompat")}
+            : view.blockedReasonCode === "native_turn_active"
+              ? i18n.t("mobile.codex.queue.blockedNativeTurnActive")
+              : view.blockedReasonCode === "native_delivery_unknown"
+                ? i18n.t("mobile.codex.queue.blockedNativeUnknown")
+                : i18n.t("mobile.codex.queue.blockedCompat")}
         </p>
       )}
       {/* 人工解除（无出口屏障复审 Important）：两步确认——未确认不发任何请求；

@@ -82,7 +82,12 @@ import {
 import { ChannelBwNote } from "./FilePanel";
 import { etaRemainingText, formatBytes, transferRateBps, type TransferSample } from "./board-logic";
 // Codex APP 原生发送（Desktop IPC）：actionId 生成与回执 DTO
-import { newActionId, type ActionReceipt } from "./codexIpcApi";
+import {
+  fetchCodexQueue,
+  newActionId,
+  reconcileCodexQueuedReceipt,
+  type ActionReceipt,
+} from "./codexIpcApi";
 
 interface MessageComposerProps {
   /** 发送回执触发的队列刷新信号（2026-10-20 复审 P2）：本地队列可见性不依赖
@@ -152,9 +157,12 @@ type Receipt =
     }
   | {
       /** **忙 Thread 留队**（宪法 R2.3）：中性回执带队位；队列查看/撤回由
-       *  CodexQueuePanel 承担（本组件不重复渲染队列，也无插队入口）。 */
+       *  CodexQueuePanel 承担（本组件不重复渲染队列，也无插队入口）。
+       *  actionId 是对账锚（2026-10-22 B1）：轮询对齐 codex 队列视图真值，
+       *  动作离开队列（派发/撤回）→ chip 收敛清除，不再常驻误导。 */
       kind: "codexQueued";
       position: number;
+      actionId: string;
     }
   | null;
 
@@ -314,6 +322,12 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
    *  唯一条目时更会停摆轮询 → 用户重发 = 重复注入，本项目头号禁忌）。作废一份
    *  快照的代价 ≤ 3s 自愈，方向一律保守（同毫秒按更旧处理，用 <=） */
   const queueMutatedAtRef = useRef(0);
+  /** codexQueued 回执最近一次设置/更换的时刻（2026-10-22 复审 Important-1，与
+   *  queueMutatedAtRef 同款 I1 时序防御）：忙线程连发时新 receipt 以新 actionId
+   *  原子换入，此前发起的 /codex/queue tick 快照必不含新锚——若放行会把「刚入队」
+   *  误判成已离队，清掉新 chip 且停摆轮询（无自愈）。tick 快照若发起早于该时刻
+   *  一律作废（同毫秒按更旧处理，用 <=），作废一份 ≤ 3s 自愈，方向保守 */
+  const codexReceiptSetAtRef = useRef(0);
   /** 修改重发只入队标志（D6）：「修改」确认出队后置 true，下一次发送携带
    *  queueOnly=true 并清除（消费即清——失败重试不再带标志，回归普通发送语义）。
    *  保守语义：修改后的重发一律入队，用户手动改字不清除标志。入队后的放行节奏：
@@ -469,6 +483,39 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
     };
   }, [queueTracked, session.id]);
 
+  // codexQueued 回执收敛（2026-10-22 B1）：通用 session-queue 不含 codex 动作，
+  // 该 chip 的权威真值在 /codex/queue——单独按 actionId 对齐该视图。动作离开
+  // 队列（派发/撤回）→ chip 清除（派发结果经会话轮询自然呈现，不再常驻误导）；
+  // 位次变化 → 跟随。依赖布尔量而非回执本体，位次更新不重建定时器。
+  const codexQueuedTracked = receipt?.kind === "codexQueued";
+  useEffect(() => {
+    if (!codexQueuedTracked) return;
+    let alive = true;
+    const iv = setInterval(() => {
+      // I1（复审 Important-1，与通用队列 queueMutatedAtRef 同款）：先记快照发起
+      // 时刻——响应到货时若发起早于回执设置/更换时刻，说明它不含新锚，作废
+      const issuedAt = Date.now();
+      void fetchCodexQueue(session.id)
+        .then((view) => {
+          if (!alive) return;
+          if (issuedAt <= codexReceiptSetAtRef.current) return;
+          // 403（设备失效）→ null：无法对账，保持现状（下轮再试）
+          if (view === null) return;
+          setReceipt((prev) => {
+            if (prev?.kind !== "codexQueued") return prev;
+            return reconcileCodexQueuedReceipt(prev, view);
+          });
+        })
+        .catch(() => {
+          /* 单次轮询失败忽略，下轮再试 */
+        });
+    }, QUEUE_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(iv);
+    };
+  }, [codexQueuedTracked, session.id]);
+
   const injectable = sendInfo !== null && sendInfo.injectable;
 
   const handleSend = useCallback(async () => {
@@ -620,11 +667,18 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
         setReceipt({ kind: "codex", receipt: res.receipt });
         onQueueChanged?.();
       } else if (res.status === "codex_queued") {
-        // 忙 Thread 留队：消息已进服务端 FIFO（账本锚 = actionId），由调度循环按序派发
+        // 忙 Thread 留队：消息已进服务端 FIFO（账本锚 = actionId），由调度循环按序派发。
+        // actionId 存入回执（B1）：轮询对齐 codex 队列视图真值的对账锚。
+        // 先前移对账时刻（复审 Important-1）：在途旧 tick 快照不得清掉新 chip。
+        codexReceiptSetAtRef.current = Date.now();
         setText("");
         setAttachments([]);
         codexActionIdRef.current = null;
-        setReceipt({ kind: "codexQueued", position: res.position });
+        setReceipt({
+          kind: "codexQueued",
+          position: res.position,
+          actionId: res.actionId,
+        });
         onQueueChanged?.();
       } else if (res.status === "headless") {
         // 兼容通道回执（每回合 spawn）：ok/queued 即消息已交给 CLI；失败如实展示原因

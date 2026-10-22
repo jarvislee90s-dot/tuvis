@@ -62,6 +62,28 @@ export interface CodexQueueView {
   canInterrupt?: boolean;
 }
 
+/** 「已进入桌面队列」发送回执 chip（MessageComposer 持有；actionId 是对账锚）。 */
+export interface CodexQueuedReceipt {
+  kind: "codexQueued";
+  position: number;
+  actionId: string;
+}
+
+/** codexQueued 回执对齐 codex 队列视图真值（2026-10-22 B1 收敛修复）：动作已不在
+ *  队列（派发/撤回）→ null（chip 收敛清除）；位次变化 → 跟随；其余 → 原样返回。
+ *  纯函数——轮询 effect 每 tick 调用，测试直接钉行为。 */
+export function reconcileCodexQueuedReceipt(
+  prev: CodexQueuedReceipt,
+  view: CodexQueueView
+): CodexQueuedReceipt | null {
+  const mine = view.actions.find((a) => a.actionId === prev.actionId);
+  if (!mine) return null;
+  if (mine.position !== null && mine.position !== prev.position) {
+    return { ...prev, position: mine.position };
+  }
+  return prev;
+}
+
 /** 平台能力集。false = 该 build 尚未活体验证，不表示协议实现不存在。 */
 export interface CapabilitySet {
   send: boolean;

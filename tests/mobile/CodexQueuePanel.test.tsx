@@ -592,6 +592,26 @@ describe("CodexQueuePanel（Task 9）", () => {
     r3.unmount();
   });
 
+  it("native_turn_active_interrupt：桌面手打的原生回合（无屏障）→ 横幅分文案 + 打断按钮可见（2026-10-22 原生回合扩展）；空队列也出按钮；无能力 build 照旧隐藏", async () => {
+    installFetch();
+    // 空队列 + native_turn_active：面板不自隐（阻塞码在场），按钮出——
+    // 原生回合打断不要求有排队消息（用户诉求：桌面在跑就能停）
+    routes.queue = [queueView([], "native_turn_active")];
+    const { unmount } = render(<CodexQueuePanel sessionId="s1" />);
+    const banner = await screen.findByTestId("codex-queue-blocked");
+    expect(banner.getAttribute("data-reason")).toBe("native_turn_active");
+    expect(banner.textContent).toContain("正在运行");
+    expect(banner.textContent).toContain("未完成的工作会丢失");
+    expect(screen.getByTestId("codex-queue-interrupt")).toBeTruthy();
+    unmount();
+    // 无能力 build（canInterrupt=false）：按钮照旧源头隐藏（P2-2 纪律跨阻塞态一致）
+    routes.queue = [queueView([], "native_turn_active", [], false)];
+    const r2 = render(<CodexQueuePanel sessionId="s1" />);
+    await screen.findByTestId("codex-queue-blocked");
+    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
+    r2.unmount();
+  });
+
   it("interrupt_button_hidden_when_capability_false：canInterrupt=false（或缺省的旧载荷）→ native_turn_pending 阻塞态也不渲染打断按钮，零请求（复审 P2-2：无能力 build 不给假出口）", async () => {
     installFetch();
     // canInterrupt=false：本 Desktop build 未活体验证打断能力

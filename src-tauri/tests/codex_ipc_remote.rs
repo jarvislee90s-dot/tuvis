@@ -5912,3 +5912,124 @@ async fn interrupt_turn_refused_when_capability_not_enabled() {
         "能力未开启时零 IPC 写入（不盲发未验证方法）"
     );
 }
+
+/// 原生回合打断扩展（2026-10-22 B3）：回合由桌面手打产生（无在册屏障）但镜像里
+/// 有 inProgress 回合 → ① 队列视图给 native_turn_active + canInterrupt；② 请求
+/// 不带 turnId → 阀值回退 = 镜像活动回合 id（帧恒带 expectedTurnId，P1-1 纪律
+/// 不破）；桌面确认 → 200 interrupted + 审计。诚实边界（镜像无活动回合 → 409
+/// 零帧）由 refused_without_valve 用例既有覆盖（其 seed 快照无 inProgress 回合）。
+#[tokio::test]
+async fn interrupt_turn_falls_back_to_mirror_active_turn_for_native() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+
+    // ensure（seed：t1 completed，无屏障动作）→ 原生活动回合快照（rev 8 > 基线 7）
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "active").await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("ensure in time")
+        .unwrap();
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": {
+            "conversationId": THREAD, "hostId": "local",
+            "change": {
+                "type": "snapshot", "revision": 8,
+                "conversationState": {
+                    "turns": [], "requests": [],
+                    "threadRuntimeStatus": { "type": "active" },
+                    "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
+                            "t1": { "id": "t1", "type": "turn", "status": "completed", "items": ["u1"] },
+                            "u1": { "id": "u1", "type": "user_message", "text": "seed", "ts": 1 },
+                            "t-native": { "id": "t-native", "type": "turn", "status": "inProgress", "items": ["u2"] },
+                            "u2": { "id": "u2", "type": "user_message", "text": "桌面手打的回合", "ts": 2 }
+                        }), serde_json::json!([{ "entries": ["t1"] }, { "entries": ["t-native"] }]))
+                }
+            }
+        }
+    }))
+    .await;
+
+    // ① 队列视图：无屏障 + 镜像活动原生回合 → native_turn_active + canInterrupt。
+    //    快照广播经连接转发任务异步入镜像，轮询等待对账窗口。
+    let mut saw_code = false;
+    for _ in 0..40 {
+        let r = f
+            .app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/codex/queue?session_id={THREAD}"),
+                Some(COOKIE),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        if v["blockedReasonCode"] == "native_turn_active" {
+            assert_eq!(v["canInterrupt"], true, "interrupt 能力 build → 可打断");
+            saw_code = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        saw_code,
+        "快照应在对账窗口内使队列视图给出 native_turn_active"
+    );
+
+    // ② 不带 turnId 的打断：阀值回退 = 镜像活动回合（帧恒带 expectedTurnId）
+    let body = serde_json::json!({ "sessionId": THREAD }).to_string();
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 10).await;
+    assert_eq!(frame["method"], "thread-follower-interrupt-turn");
+    assert_eq!(frame["version"], 4);
+    assert_eq!(
+        frame["params"]["expectedTurnId"], "t-native",
+        "阀值回退：在册屏障不存在 → 用镜像活动回合 id"
+    );
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": "t-native", "ok": true }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("interrupt in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["interruptedTurnId"], "t-native");
+    let audits = f.codex_audits();
+    assert!(
+        audits
+            .iter()
+            .any(|a| a.action == "codex_interrupt" && a.result == "interrupted"),
+        "原生回合打断同样进审计（result 词 = interrupted）"
+    );
+}

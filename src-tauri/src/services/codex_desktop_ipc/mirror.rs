@@ -345,6 +345,24 @@ impl ThreadMirror {
             .unwrap_or_default()
     }
 
+    /// 当前镜像中处于 `inProgress` 的 Turn id（canonical 序最后一个 = 最新活动
+    /// 回合）。**原生回合与受理回合一视同仁**（2026-10-22 原生回合打断扩展）：
+    /// 它是端点打断阀值的回退来源——在册屏障不存在（桌面手打的回合）时，用它
+    /// 定位「桌面上正在跑的那个回合」。stale / 无镜像 / 无活动回合 → None
+    /// （调用方按「无阀值」保守拒发，与 P1-1 纪律一致）。
+    pub fn active_turn_id(&self) -> Option<String> {
+        if self.stale {
+            return None;
+        }
+        let state = self.state.as_ref()?;
+        HistoryView::new(state)
+            .turns()
+            .into_iter()
+            .filter(|t| t.status == Some("inProgress"))
+            .map(|t| t.turn_id.to_string())
+            .last()
+    }
+
     /// **本次请求的正式消息身份是否已在该 Turn 中落地**（2026-10-20 复审 P1）：
     /// 只认 `userMessage` item 的 `clientId == client_message_id`（正式消息身份）。
     /// `params.input` / `params.clientUserMessageId` 都是请求侧回显，不能作为送达
@@ -2185,6 +2203,42 @@ mod tests {
         });
         m2.apply(&lease(), &running).unwrap();
         assert!(!m2.turn_is_terminal("turn-mine"), "进行中的回合不是终态");
+    }
+
+    /// `active_turn_id`（2026-10-22 原生回合打断扩展）：inProgress 回合 → Some；
+    /// stale 镜像一律 None（阀值回退的保守方向——过期镜像不给打断阀值，复审
+    /// Nit-4 钉死）。端点 409 负例由集成测试 refused_without_valve 覆盖。
+    #[test]
+    fn active_turn_id_follows_inprogress_and_stale_is_none() {
+        let mut m = ThreadMirror::new(key());
+        let running = serde_json::json!({
+            "type": "snapshot", "revision": 1,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "threadRuntimeStatus": { "type": "active" },
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true,
+                    "entitiesByKey": {
+                        "turn:done": { "turnId": "turn-done",
+                                       "status": "completed", "items": [] },
+                        "turn:live": { "turnId": "turn-live",
+                                       "status": "inProgress", "items": [] }
+                    },
+                    "islands": [{ "entries": [
+                        { "key": "turn:done", "value": "turn:done" },
+                        { "key": "turn:live", "value": "turn:live" }
+                    ] }]
+                } }
+            }
+        });
+        m.apply(&lease(), &running).unwrap();
+        assert_eq!(
+            m.active_turn_id().as_deref(),
+            Some("turn-live"),
+            "completed 不算活动，inProgress 的最新回合才去"
+        );
+        m.mark_stale();
+        assert!(m.active_turn_id().is_none(), "stale 镜像不给阀值（保守）");
     }
 
     #[test]

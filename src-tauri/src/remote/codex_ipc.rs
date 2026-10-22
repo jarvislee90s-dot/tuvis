@@ -55,6 +55,9 @@ pub(crate) const BLOCKED_COMPAT_OUTSTANDING: &str = "compat_outstanding";
 /// 原生 Turn 屏障的在册码（2026-10-18 形态适配配套）：route=desktop_ipc 的
 /// Accepted 动作在等精确 Turn 终态证据——不是「兼容模式」，UI 分文案。
 pub(crate) const BLOCKED_NATIVE_TURN_PENDING: &str = "native_turn_pending";
+/// 原生活动回合（2026-10-22 原生回合打断扩展）：无屏障但镜像里有 `inProgress`
+/// 回合（桌面手打产生的回合）——打断出口对它同样开放，阀值取镜像活动回合 id。
+pub(crate) const BLOCKED_NATIVE_TURN_ACTIVE: &str = "native_turn_active";
 /// 原生 Unknown/缺 turnId 保守屏障的在册码（复审 P2-3）：**没有自动恢复路径**
 /// （释放门要求精确 turnId 终态证据）——文案必须与「等待后自动继续」区分。
 pub(crate) const BLOCKED_NATIVE_DELIVERY_UNKNOWN: &str = "native_delivery_unknown";
@@ -1904,7 +1907,8 @@ pub async fn queue_view(
     //（终态证据驱动自动对账，等待后自动继续）；native_delivery_unknown = 原生
     // Unknown/缺 turnId 保守屏障（**无自动恢复路径**，如实说）；compat_outstanding =
     // 兼容路径 fence。都不提示不存在的「回 Desktop 手工解除」。
-    let blocked_reason_code = match store.outstanding_fence_summary(&key) {
+    let fence_summary = store.outstanding_fence_summary(&key);
+    let blocked_reason_code = match &fence_summary {
         Ok(rows) => {
             // 优先级：unknown/缺 turnId（**永不自动解除**）> accepted+turnId（等待
             // 后自动继续）> compat。若两者并存，队列最终仍会停在 Unknown 屏障上，
@@ -1929,6 +1933,20 @@ pub async fn queue_view(
             log::error!("codex/queue fence 摘要读取失败: {e}");
             None
         }
+    };
+    // 原生活动回合（2026-10-22 扩展）：无屏障但镜像里有 inProgress 回合（桌面
+    // 手打的原生回合）→ native_turn_active，打断出口对它同样开放。屏障态优先
+    // （native_turn_pending / unknown / compat 语义不变）；**仅当 fence 摘要读取
+    // 成功且确认无屏障**才回退——读降级（Err）期真实阻塞可能正是读不出的屏障，
+    // 不得被镜像活动回合「洗」成 native_turn_active（复审 Minor-2）；镜像 stale /
+    // 无活动回合 → 保持 None（面板自隐，不渲染空壳）。
+    let blocked_reason_code = if blocked_reason_code.is_none() && fence_summary.is_ok() {
+        match st.codex_control.adapter.mirror_active_turn_id(&key).await {
+            Some(_) => Some(BLOCKED_NATIVE_TURN_ACTIVE.to_string()),
+            None => None,
+        }
+    } else {
+        blocked_reason_code
     };
     // 在册屏障动作清单（2026-10-19 无出口屏障修复）：人工解除端点的靶向依据——
     // 前端按钮据此逐个 force-continue。读取失败如实降级为空清单（阻塞码派生同上，
@@ -2245,29 +2263,38 @@ pub async fn interrupt_turn(
         {
             Ok(Some(v)) => Some(v),
             Ok(None) => {
-                // ctx 仅用于审计（envelope 尚不存在 → None）；action_id 沿用
-                // interrupt- 前缀，result 词记拒绝原因。
-                let ctx = ActionContext {
-                    action_id: "interrupt-none".to_string(),
-                    device_id: device_id.clone(),
-                    device_name: device_name.clone(),
-                    kind: ActionKind::Interrupt,
-                    key: key.clone(),
-                };
-                codex_audit(
-                    st.as_ref(),
-                    &ctx,
-                    AUDIT_INTERRUPT,
-                    &session.id,
-                    None,
-                    None,
-                    "refused:no_expected_turn",
-                );
-                return error_body(
-                    StatusCode::CONFLICT,
-                    "no_expected_turn",
-                    Some("取不到打断安全阀：请求未带 turnId，且没有在册的原生回合屏障可定位目标回合。为免误伤桌面其他回合，已拒绝打断（未发送任何指令）"),
-                );
+                // 原生回合打断扩展（2026-10-22）：在册屏障不存在（回合由桌面
+                // 手打产生）→ 回退用镜像活动回合 id 作阀值。Desktop 侧安全阀
+                // 原样兜底：镜像给的 id 若已过期（回合刚结束），expectedTurnId
+                // 不匹配 → 静默返回 null → 端点如实报「没有可打断回合」，
+                // 失败方向保守。仍取不到 → 走下方 409 拒发（P1-1 纪律不变）。
+                if let Some(active) = st.codex_control.adapter.mirror_active_turn_id(&key).await {
+                    Some(active)
+                } else {
+                    // ctx 仅用于审计（envelope 尚不存在 → None）；action_id 沿用
+                    // interrupt- 前缀，result 词记拒绝原因。
+                    let ctx = ActionContext {
+                        action_id: "interrupt-none".to_string(),
+                        device_id: device_id.clone(),
+                        device_name: device_name.clone(),
+                        kind: ActionKind::Interrupt,
+                        key: key.clone(),
+                    };
+                    codex_audit(
+                        st.as_ref(),
+                        &ctx,
+                        AUDIT_INTERRUPT,
+                        &session.id,
+                        None,
+                        None,
+                        "refused:no_expected_turn",
+                    );
+                    return error_body(
+                        StatusCode::CONFLICT,
+                        "no_expected_turn",
+                        Some("取不到打断安全阀：请求未带 turnId，且没有在册的原生回合屏障，镜像里也没有正在运行的回合。为免误伤桌面其他回合，已拒绝打断（未发送任何指令）"),
+                    );
+                }
             }
             Err(e) => {
                 log::error!("codex/turn/interrupt 读取在册 turnId 失败: {e}");
