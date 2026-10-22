@@ -169,6 +169,30 @@ fn macos_51333_profile(build: &str) -> ProtocolProfile {
     }
 }
 
+/// macOS `26.1016.61520`（2026-10-22 深夜复探登记；证据
+/// `docs/superpowers/reviews/2026-10-22-codex-app-61520-reprobe.md`）：当日第二次
+/// 自动升级（51333 → 61520，app.asar 22:58 落地）。四项静态证据零漂移——11 个
+/// 在册方法逐一同值（interrupt-turn=4 / start-turn=2 / state-changed=11）、版本
+/// 协商 `je` 逐字符同（变量名未再更名）、安全阀正则逐字符命中、打断后置
+/// `interrupted`；活体 initialize / discovery / 安全打断探针（bogus turnId →
+/// `{interruptedTurnId:null, ok:true}`）与档案同构。能力位按 51333/40934 同面：
+/// send/state/interrupt 开，审批/问答/permissions 关。
+fn macos_61520_profile(build: &str) -> ProtocolProfile {
+    ProtocolProfile {
+        platform: "macos".to_string(),
+        build: build.to_string(),
+        capabilities: CapabilitySet {
+            send: true,
+            state: true,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+            interrupt: true,
+        },
+        method_versions: method_table(),
+    }
+}
+
 /// Windows `26.1013.4894.0`（2026-10-19 真机探测批登记）：受控探针 prodprobe3 直连
 /// 真实 ChatGPT.exe 管道全链取证——只读协议往返（T1）、start-turn v2 创建 Turn 至
 /// completed（T4）、command approval accept/decline 双臂 + 文件落盘/未落盘（T6）、
@@ -203,6 +227,7 @@ pub fn profile_for(platform: &str, build: &str) -> Option<ProtocolProfile> {
         ("macos", "26.1013.31256") => Some(macos_profile(build)),
         ("macos", "26.1013.40934") => Some(macos_40934_profile(build)),
         ("macos", "26.1016.51333") => Some(macos_51333_profile(build)),
+        ("macos", "26.1016.61520") => Some(macos_61520_profile(build)),
         _ => None,
     }
 }
@@ -280,6 +305,15 @@ mod tests {
         assert!(!p51333.capabilities.command);
         assert!(!p51333.capabilities.blocking_input);
         assert!(profile_for("macos", "26.1016.51334").is_none());
+        // 61520 = 2026-10-22 深夜复探登记（当日第二次自动升级，零漂移，
+        // 见 docs/superpowers/reviews/2026-10-22-codex-app-61520-reprobe.md）
+        let p61520 = profile_for("macos", "26.1016.61520").expect("registered");
+        assert!(p61520.capabilities.send && p61520.capabilities.state);
+        assert!(p61520.capabilities.interrupt);
+        assert!(!p61520.capabilities.permissions);
+        assert!(!p61520.capabilities.command);
+        assert!(!p61520.capabilities.blocking_input);
+        assert!(profile_for("macos", "26.1016.61521").is_none());
         assert!(profile_for("windows", "26.1013.3655.0").is_none());
         // 4894.0 = 2026-10-19 真机探测批登记（T1/T4/T6/T8/T9 PASS + T2 同构；证据 =
         // observed/windows-4894-*.sanitized.json）：caps 逐项钉死，permissions 无证据保持关
