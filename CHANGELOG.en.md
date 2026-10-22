@@ -13,7 +13,7 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
-## [Unreleased]
+## [0.6.1] - 2026-10-22
 
 ### Changed
 
@@ -28,6 +28,7 @@ _Only versions translated so far are listed here; the full history lives in the
 - **Approval link retention**: the browser approval link returned by first-time enable is no longer cleared by ordinary same-config status refreshes; config changes, channel off or master off still invalidate stale links and in-flight receipts.
 - **Separate DNS waiting from repair**: confirmed missing public records show continuous elapsed time and an estimate of around ten minutes, with automatic read-only checks and no repeated retry action. Ordinary verification no longer resets Funnel; an explicitly confirmed re-enable performs repair. Enabled macOS extensions require no further action, and a stopped backend no longer implies missing approval.
 - **macOS Tailscale installation**: the install action opens the system installer and rechecks status when Tuvis regains focus. Cancellation stays incomplete; installer failures retain exit codes and stdout/stderr instead of showing a blank error.
+- **Re-verification process hint**: while the automatic re-check runs after a channel is re-enabled, the summary shows a spinner with the expected timing (usually within a minute); it clears itself once verification passes, letting users tell normal waiting from a fault.
 
 ## [0.6.0] - 2026-10-21
 
