@@ -1,4 +1,4 @@
-﻿//! Codex Desktop IPC 集成测试（本地假 IPC，Tokio duplex ScriptedPeer；不连接真实 Desktop）。
+//! Codex Desktop IPC 集成测试（本地假 IPC，Tokio duplex ScriptedPeer；不连接真实 Desktop）。
 //!
 //! 覆盖：RPC 关联（id+method）、未知投递边界（部分写/EOF=Unknown；排队前失败=NotSent）、
 //! discovery 必答（旁路容量）、在飞上限、超时=Unknown。
@@ -4287,4 +4287,78 @@ async fn probe_status_reports_probing_while_probe_in_flight() {
     let after = adapter.probe_status().await;
     assert_eq!(after.state, ProbeStatusState::Probed);
     adapter.shutdown().await;
+}
+
+/// T10 真机闭环金样（build 26.1016.6573.0）：**pending → 决策请求 → 回执**三段的形态
+/// 与语义钉死——决策参数形状 = `{conversationId, requestId, decision}`、版本 1、回执
+/// `{"ok":true}`；同时证明脱敏到位（无真实命令正文/标识符）。
+#[test]
+fn observed_6573_command_approval_closure_is_pinned() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::pending::{
+        DecisionPolicy, PendingProjector,
+    };
+    use multi_agents_manager_lib::services::codex_desktop_ipc::types::CapabilitySet;
+
+    let raw = std::fs::read_to_string(format!(
+        "{}/tests/fixtures/codex-desktop-ipc/observed/windows-6573-command-approval-accept.sanitized.json",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("闭环夹具必须存在");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("夹具必须是合法 JSON");
+
+    // ① pending 段：命令审批 + 整数 id
+    let pending = &v["pendingRequest"];
+    assert_eq!(pending["method"], "item/commandExecution/requestApproval");
+    assert!(pending["id"].is_number(), "6573 的 pending id 是整数");
+
+    // ② 决策帧段：方法 / 版本 / 参数形状
+    let request = &v["request"];
+    assert_eq!(
+        request["method"],
+        "thread-follower-command-approval-decision"
+    );
+    assert_eq!(request["version"], serde_json::json!(1));
+    let params = request["params"].as_object().expect("params 是对象");
+    let mut keys: Vec<&str> = params.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["conversationId", "decision", "requestId"],
+        "官方决策参数形状 = {{conversationId, requestId, decision}}"
+    );
+    assert_eq!(params["decision"], "accept");
+
+    // ③ 回执段：受理 + ok
+    assert_eq!(v["response"]["resultType"], "success");
+    assert_eq!(v["response"]["result"]["ok"], serde_json::json!(true));
+
+    // ④ 脱敏护栏：不得含真实命令正文 / 真实标识符
+    assert_eq!(pending["params"]["command"], "<synthetic command>");
+    assert_eq!(pending["params"]["cwd"], "<synthetic cwd>");
+    assert!(
+        !raw.contains("01a153d7") && !raw.contains("exec-e52b86f6"),
+        "夹具不得含真实 thread/item 标识符"
+    );
+
+    // ⑤ 投影层：这条 pending 在未知 build（schema 档）下应给出 accept + cancel
+    let projector = PendingProjector::new();
+    let caps = CapabilitySet {
+        send: false,
+        state: true,
+        command: false,
+        permissions: false,
+        blocking_input: false,
+    };
+    let views = projector.project_with_policy(
+        std::slice::from_ref(pending),
+        &caps,
+        &DecisionPolicy::schema(true, true),
+    );
+    assert_eq!(views.len(), 1);
+    assert_eq!(
+        views[0].allowed_decisions,
+        vec!["accept", "cancel"],
+        "pending 自带 availableDecisions 的字符串词 = accept + cancel（对象形态不发）"
+    );
+    assert!(views[0].actionable);
 }
