@@ -57,6 +57,15 @@ Desktop 侧方法表（打包产物静态核对 + 真机探针）：
 
 `CapabilitySet` 新增 `interrupt: bool`。`false` 的含义与其他能力位一致：**该 build 尚未活体验证，不表示协议实现不存在**。macOS `26.1013.40934`（2026-10-21 取证）与 macOS `26.1016.51333`、`26.1016.61520`（2026-10-22 两轮复探登记，静态证据零漂移）开启；Windows 4894 / 3656、macOS 31256 保持 false——「未经验证的 Desktop 版本或方法不得盲目启用对应能力」（冻结 spec §3.5）。
 
+> **裁决记录（2026-10-22 深夜，用户拍板「build 没对上时默认开会话通道」）**：当日两次
+> 自动升级（40934→51333→61520）均触发 closed() 锁死，发送全断。据此对冻结 spec §3.5
+> 作**范围收窄的修订**：未知 build（非空）兜底 `compat_send_profile`——send/state 默认
+> 开（会话通道保持可达），漂移由方法版本协商（不匹配 → request-version-mismatch →
+> NotSent 如实未送达）+ 如实回执 + 原生回合打断出口（§4.3 扩展）三层兜底；**破坏性能力
+> （interrupt / command / permissions / blocking_input）仍走证据门控不随档放开**；空
+> build（身份读不出）仍 closed。系统性解法（探测账本 + 分级能力）归 PR #178，合并后
+> 本兜底由其 L1/L2 语义取代。
+
 未开启时端点返回 503 `capability_unavailable`，**零 IPC 写入**（有集成用例钉死）。
 
 ### 4.2 终态门

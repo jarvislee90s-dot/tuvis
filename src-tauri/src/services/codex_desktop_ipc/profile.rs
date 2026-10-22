@@ -232,6 +232,38 @@ pub fn profile_for(platform: &str, build: &str) -> Option<ProtocolProfile> {
     }
 }
 
+/// 未知 build 的**兼容发送档**（2026-10-22 用户裁决「build 没对上时默认开会话
+/// 通道」）：send/state 开，破坏性能力（interrupt / command / permissions /
+/// blocking_input）仍走证据门控不随档放开。漂移兜底链：方法版本不匹配 →
+/// `request-version-mismatch` → NotSent 如实未送达；回合卡死 → 镜像可见 +
+/// 原生回合打断出口（B3）。登记 build 的证据门控不受影响——本档只接住
+/// `profile_for` 落空的未知 build；空 build（Desktop 身份读不出来）仍用 closed。
+pub fn compat_send_profile(platform: &str, build: &str) -> ProtocolProfile {
+    ProtocolProfile {
+        platform: platform.to_string(),
+        build: build.to_string(),
+        capabilities: CapabilitySet {
+            send: true,
+            state: true,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+            interrupt: false,
+        },
+        method_versions: method_table(),
+    }
+}
+
+/// 连接档位选择：登记 build → 证据档；未知 build（非空）→ 兼容发送档（用户
+/// 裁决，见 [`compat_send_profile`]）；空 build（身份读不出来/多义）→ closed。
+pub fn profile_for_or_compat(platform: &str, build: &str) -> ProtocolProfile {
+    match profile_for(platform, build) {
+        Some(p) => p,
+        None if !build.is_empty() => compat_send_profile(platform, build),
+        None => ProtocolProfile::closed(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +360,31 @@ mod tests {
         // 已验证 build 精确命中
         assert!(profile_for("macos", "26.1013.31256").is_some());
         assert!(profile_for("windows", "26.1013.3656.0").is_some());
+    }
+
+    /// 未知 build 兜底档（2026-10-22 用户裁决「build 没对上默认开会话通道」）：
+    /// 未知 build → 兼容发送档（send/state 开，破坏性能力保持证据门关）；
+    /// 空 build（身份读不出来/多义）→ closed；登记 build → 证据档原样。
+    #[test]
+    fn profile_for_or_compat_unknown_build_defaults_compat_send() {
+        let p = profile_for_or_compat("macos", "26.1016.99999");
+        assert!(
+            p.capabilities.send && p.capabilities.state,
+            "会话通道默认开"
+        );
+        assert!(!p.capabilities.interrupt, "破坏性能力不随档放开");
+        assert!(!p.capabilities.command && !p.capabilities.permissions);
+        assert!(!p.capabilities.blocking_input);
+        assert_eq!(p.build, "26.1016.99999", "build 原样保留（归因/缓存键）");
+        let w = profile_for_or_compat("windows", "26.1020.7000.0");
+        assert!(w.capabilities.send && w.capabilities.state);
+        assert!(!w.capabilities.interrupt);
+        // 空 build（desktop_build 多义/读不出）→ closed 保守不变
+        let empty = profile_for_or_compat("macos", "");
+        assert!(!empty.capabilities.send, "空 build 仍 closed");
+        // 登记 build → 证据档原样（不打折）
+        let reg = profile_for_or_compat("macos", "26.1016.61520");
+        assert!(reg.capabilities.interrupt, "登记 build 能力面原样");
     }
 
     #[test]

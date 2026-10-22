@@ -129,7 +129,8 @@ enum InflightState {
 struct AdapterInner {
     connector: Arc<dyn Connector>,
     /// 当前连接的 profile（R3：动态）。初始为构造入参（首个连接前的基线）；
-    /// 每次连接按 endpoint build 重算（未知 build/无 endpoint → `closed()`）。
+    /// 每次连接按 endpoint build 重算（登记 build → 证据档；未知 build → 兼容
+    /// 发送档；空 build/无 endpoint → `closed()`）。
     /// 同步短临界区读写，绝不跨 await 持有、不与其他锁嵌套。
     profile: std::sync::Mutex<ProtocolProfile>,
     conn: Mutex<Option<ConnectionHandle>>,
@@ -265,12 +266,12 @@ impl DesktopIpcAdapter {
                 return Err(e);
             }
         };
-        // endpoint → profile（R3：精确 build 匹配；未知 build → closed，A 写全关）
-        let profile = super::profile::profile_for(
+        // endpoint → profile（R3：登记 build → 证据档；未知 build → 兼容发送档
+        // （send/state 开，2026-10-22 用户裁决）；空 build/无 endpoint → closed）
+        let profile = super::profile::profile_for_or_compat(
             &endpoint.platform,
             endpoint.build.as_deref().unwrap_or(""),
-        )
-        .unwrap_or_else(ProtocolProfile::closed);
+        );
         // 双检：另一任务可能已重连（持 conn 锁期间不做其他锁操作）
         let (conn, epoch) = {
             let mut guard = self.inner.conn.lock().await;

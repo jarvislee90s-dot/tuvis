@@ -304,9 +304,13 @@ export default function CodexQueuePanel({
           className="mt-1 text-xs text-amber-700 dark:text-amber-400"
         >
           {view.blockedReasonCode === "native_turn_pending"
-            ? i18n.t("mobile.codex.queue.blockedNativeTurn")
+            ? view.canInterrupt === true
+              ? i18n.t("mobile.codex.queue.blockedNativeTurn")
+              : i18n.t("mobile.codex.queue.blockedNativeTurnNoCap")
             : view.blockedReasonCode === "native_turn_active"
-              ? i18n.t("mobile.codex.queue.blockedNativeTurnActive")
+              ? view.canInterrupt === true
+                ? i18n.t("mobile.codex.queue.blockedNativeTurnActive")
+                : i18n.t("mobile.codex.queue.blockedNativeTurnActiveNoCap")
               : view.blockedReasonCode === "native_delivery_unknown"
                 ? i18n.t("mobile.codex.queue.blockedNativeUnknown")
                 : i18n.t("mobile.codex.queue.blockedCompat")}
