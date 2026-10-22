@@ -9,13 +9,8 @@
 // 排版层级统一走 components/settings/typography.ts 单一出处（2026-10-07 用户裁决 C1）：
 // 卡标题取 SETTINGS_CARD_TITLE（2026-10-11 起搬进灰底卡头条），不再内联字号字重；本文件
 // 另被登记为小字号豁免面（密集数据网格），豁免理由见 typography.ts。
-import {
-  SETTINGS_CARD_TITLE,
-  SETTINGS_REMOTE_BADGE,
-  SETTINGS_REMOTE_QR_CAPTION,
-} from "@/components/settings/typography";
+import { SETTINGS_CARD_TITLE, SETTINGS_REMOTE_BADGE } from "@/components/settings/typography";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import QRCode from "qrcode";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -55,6 +50,9 @@ import { getSetting, setSetting } from "@/lib/api/settings";
 // 步骤表组件自带标题与全部 tsWizard.* i18n 字面量（RemoteSection 不直接引用两级键
 // ——本文件的 i18n 守卫测试按单层键扫描）
 import { TailscaleWizard } from "@/components/settings/TailscaleWizard";
+import { NamedDomainWizard } from "@/components/settings/NamedDomainWizard";
+import { ChannelQr } from "@/components/settings/ChannelQr";
+import { ProcessHint } from "@/components/settings/ProcessHint";
 
 // B1：撤销预览载荷（Rust 端 run_step("disable_preview") 的形状，见 wizard.rs 注释）
 type TsDisablePreview = {
@@ -109,6 +107,14 @@ function lastSeenLabel(lastSeenAt: number, t: TFunc): string {
 }
 
 // 徽标（线稿 .badge：green 推荐/运行中、blue 公网、gray 仅本机/局域网、violet 隧道）
+//
+// **语义色成文（2026-10-22 四卡设计语言统一）**：颜色 = 语义，全分区通用，不得复用混借——
+//   green  = 可用/推荐（有证据：运行且地址在手 / 公网校验通过）
+//   blue   = 公网入口（入口属性说明，不代表可用性）
+//   gray   = 未开启 / 未运行（成因分档见 offBadge/offHint）
+//   amber  = 等待 / 恢复中（正在进行、无需操作的中间态）
+//   violet = 配置中（向导在途）
+// 新颜色先来这里看语义是否已被既有档表达；第五种颜色需要先论证语义缺口。
 function Badge({
   tone,
   children,
@@ -178,33 +184,6 @@ type TsPhase =
   | "recovering"
   | "unknown";
 
-// 通道二维码（qrcode 生成放 effect 事件路径，不在渲染期调用；失败降级无图不阻塞页面）
-function ChannelQr({ url, caption }: { url: string; caption: string }) {
-  const [dataUrl, setDataUrl] = useState<string | null>(null);
-  useEffect(() => {
-    let alive = true;
-    setDataUrl(null);
-    QRCode.toDataURL(url, { width: 132, margin: 1 })
-      .then((d) => {
-        if (alive) setDataUrl(d);
-      })
-      .catch((e) => console.error("qrcode render failed:", e));
-    return () => {
-      alive = false;
-    };
-  }, [url]);
-  return (
-    <div className="flex flex-none flex-col items-center gap-1">
-      {dataUrl ? (
-        <img src={dataUrl} alt={caption} className="h-[132px] w-[132px] rounded-lg border" />
-      ) : (
-        <div className="bg-muted/40 h-[132px] w-[132px] animate-pulse rounded-lg border" />
-      )}
-      <p className={`text-muted-foreground text-center ${SETTINGS_REMOTE_QR_CAPTION}`}>{caption}</p>
-    </div>
-  );
-}
-
 export function RemoteSection() {
   const { t } = useAppTranslation();
   const [status, setStatus] = useState<RemoteStatus | null>(null);
@@ -223,15 +202,17 @@ export function RemoteSection() {
   // 不折腾在跑的连接器（见 saveToken）
   const [token, setToken] = useState("");
   const [savedToken, setSavedToken] = useState("");
-  // 教程 popover（线稿 .help：点击展开/收起，可保持展开边看边操作）
-  const [helpOpen, setHelpOpen] = useState(false);
+  const tokenEdited = useRef(false);
+  const tokenRead = useRef(0);
   // 唯一展开的通道详情卡（线稿 pick()：同时只显示一个，点其它卡切换）。默认局域网
   // ——本机卡已删（§C4），局域网是本机访问与局域网访问共用的第一入口
   const [selected, setSelected] = useState<ChannelKind>("lan");
   // tailscale 卡相位数据源（remote_ts_probe）与「一键配置」展开的向导本体开关：
   // 探测要 spawn CLI 子进程，只在选中该卡后发起（不偷跑）
   const [tsProbe, setTsProbe] = useState<TsWizardProbe | null>(null);
+  const [tsProbeLoaded, setTsProbeLoaded] = useState(false);
   const [tsWizardOpen, setTsWizardOpen] = useState(false);
+  const [tsWizardMounted, setTsWizardMounted] = useState(false);
   // B1：撤销 tailscale 前的只读预览（确认框数据源）与被清除条目的卡面呈现
   const [tsPreview, setTsPreview] = useState<TsDisablePreview | null>(null);
   const [tsCleared, setTsCleared] = useState<{ entries: TsServeEntry[] } | null>(null);
@@ -252,11 +233,15 @@ export function RemoteSection() {
   const headlessLimitsInitRef = useRef(false);
   // 开关在途互斥：连点会并发远程命令（启停竞态），与旧版 busy 语义一致
   const [busy, setBusy] = useState(false);
+  const statusRequest = useRef(0);
+  const tsProbeRequest = useRef(0);
 
   // 轻量 status 刷新：只刷 status——轮询若回读 KV 会 clobber 编辑中的输入框
   const refreshStatus = useCallback(async () => {
+    const request = ++statusRequest.current;
     try {
-      setStatus(await remoteStatus());
+      const next = await remoteStatus();
+      if (request === statusRequest.current) setStatus(next);
     } catch {
       /* 刷新尽力而为，下一拍自愈 */
     }
@@ -274,15 +259,25 @@ export function RemoteSection() {
   // tailscale 向导探测（尽力而为）：失败静默置空——卡面落 unknown 态，
   // 由向导本体的加载脉冲/读取失败行诚实呈现，前端不猜相位
   const loadTsProbe = useCallback(async () => {
+    const request = ++tsProbeRequest.current;
     try {
-      setTsProbe(await remoteTsProbe());
+      const next = await remoteTsProbe();
+      if (request !== tsProbeRequest.current) return;
+      setTsProbe(next);
+      setTsProbeLoaded(true);
     } catch {
+      if (request !== tsProbeRequest.current) return;
       setTsProbe(null);
+      setTsProbeLoaded(true);
     }
   }, []);
 
   useEffect(() => {
     void refreshStatus();
+    return () => {
+      statusRequest.current += 1;
+      tsProbeRequest.current += 1;
+    };
   }, [refreshStatus]);
 
   // 保活回填：进面板读一次；null/非 "false" → 默认开（与后端 fail-safe 口径一致）
@@ -314,11 +309,16 @@ export function RemoteSection() {
 
   // Token 回填：进面板读已存值，后续刷新不回读
   useEffect(() => {
+    const request = ++tokenRead.current;
     void (async () => {
       const saved = (await getSetting(TUNNEL_TOKEN_KEY)) ?? "";
-      setToken(saved);
+      if (request !== tokenRead.current) return;
+      if (!tokenEdited.current) setToken(saved);
       setSavedToken(saved);
     })();
+    return () => {
+      tokenRead.current += 1;
+    };
   }, []);
 
   // PIN 回填：首个非空 status.pin 填一次（ref 闸），轮询不覆盖编辑中值
@@ -377,7 +377,8 @@ export function RemoteSection() {
   // 监听/隧道，不改通道 KV）：载荷 {enabled:true, running:false, addresses:[真实地址]}
   // 下旧版照旧给绿色推荐徽标 + 地址 + 复制 + 二维码，全是死链。
   const chanEnabled = (key: ChannelKind): boolean => Boolean(channels?.[key]?.enabled);
-  const chanRunning = (key: ChannelKind): boolean => Boolean(channels?.[key]?.running);
+  const chanRunning = (key: ChannelKind): boolean =>
+    Boolean(channels?.[key]?.running && (key !== "named" || channels?.named?.connected));
   const lanRunning = chanRunning("lan");
   const quickRunning = chanRunning("quick");
 
@@ -463,21 +464,23 @@ export function RemoteSection() {
   // running/address/reach 任一翻转（键为字符串快照，轮询同值不重探）。两路覆盖
   // 「开通 → 运行 → 校验通过」的全部跃迁，卡面随真值收敛
   const tsRefetchKey = tsChannel
-    ? `${tsChannel.running}|${tsChannel.address ?? ""}|${tsChannel.reach?.state ?? ""}`
+    ? `${tsChannel.enabled}|${tsChannel.running}|${tsChannel.address ?? ""}|${tsChannel.reach?.state ?? ""}|${tsChannel.configKey ?? ""}`
     : "";
   useEffect(() => {
     if (selected !== "tailscale") return;
     void loadTsProbe();
   }, [selected, tsRefetchKey, loadTsProbe]);
 
-  // 有界重探（4s，仅一小窗）：未安装态且向导已打开——一键配置各步完成会推进 detect
-  // 判据（装好 CLI 即翻态），而此时 running/address/reach 尚未变化，上面两路探不到；
-  // 翻入下一态即自动停表
   useEffect(() => {
-    if (selected !== "tailscale" || !tsWizardOpen || tsPhase !== "notInstalled") return;
-    const timer = setInterval(() => void loadTsProbe(), 4000);
-    return () => clearInterval(timer);
-  }, [selected, tsWizardOpen, tsPhase, loadTsProbe]);
+    if (
+      selected === "tailscale" &&
+      ((tsPhase !== "notInstalled" && tsPhase !== "unknown") ||
+        (tsPhase === "unknown" && tsProbeLoaded) ||
+        tsWizardOpen)
+    ) {
+      setTsWizardMounted(true);
+    }
+  }, [selected, tsPhase, tsWizardOpen, tsProbeLoaded]);
 
   // 二维码内容 = 通道地址 + 密码参数（线稿：链接已含密码，扫码自动填入直接进入）
   const pin = typeof status?.pin === "string" ? status.pin : "";
@@ -679,13 +682,14 @@ export function RemoteSection() {
         toast.success(t("settings.remote.tokenSaved"));
         return;
       }
+      tokenRead.current += 1;
       await setSetting(TUNNEL_TOKEN_KEY, token);
       setSavedToken(token);
       if (chanEnabled("named")) {
         await toggleChannel("named", false);
         await toggleChannel("named", true);
-        await refreshStatus();
       }
+      await refreshStatus();
       toast.success(t("settings.remote.tokenSaved"));
     } catch (e) {
       toast.error(formatInvokeError(e, t));
@@ -750,15 +754,24 @@ export function RemoteSection() {
   // 「本机」不再有地址行（零豁免 §C4：本机访问走局域网卡地址，local 段不进 UI）
   const lanAddrs = channels?.lan?.addresses ?? [];
   const quickAddr = channels?.quick?.address ?? null;
+  // 「完全可用」绿卡判据（2026-10-22 用户裁决：只有验证通过、完全可用才整卡挂绿）——
+  // 与地址渲染同一证据门控，运行中≠可用（Tailscale 有「在跑但地址未生效」阶段）：
+  //   局域网   = 监听中且地址在手（无公网校验环节，地址即可用证据）
+  //   临时隧道 = 运行中且地址已解析
+  //   自有域名 = 启用 ∧ 运行 ∧ 已连接 ∧ 公网校验通过
+  //   外部域名 = 后端已按 §C3 三门收口 address（运行 ∧ 无错误 ∧ verified），地址在手即绿
+  // 视觉：绿底 + 绿描边与 Frame 完成摘要同款语言；选中态仍走黑描边（交互态与业务态分离）。
+  const chanUsable = (key: ChannelKind): boolean => {
+    if (key === "lan") return lanRunning && lanAddrs.length > 0;
+    if (key === "quick") return quickRunning && Boolean(quickAddr);
+    if (key === "named") {
+      const n = channels?.named;
+      return Boolean(n?.enabled && n.running && n.connected && n.reach?.state === "verified");
+    }
+    const ts = channels?.tailscale;
+    return Boolean(ts?.enabled && ts.running && !ts.error && ts.address);
+  };
   const quickErr = channels?.quick?.error ?? null;
-  const namedAddr = channels?.named?.address ?? null;
-  const namedErr = channels?.named?.error ?? null;
-  const namedRunning = chanRunning("named");
-  // M5 P2-c：手填地址（已保存值）与自动记忆的上次地址（解析失败时的显示兜底）
-  const namedLastAddr = channels?.named?.lastAddr ?? null;
-  // 命名卡片展示优先级：解析地址 > 手填 > 上次地址（三者皆无 = 从未配置）
-  const namedDisplayAddr = namedAddr ?? namedLastAddr;
-  const tsAddr = tsChannel?.address ?? null;
   const tsErr = tsChannel?.error ?? null;
 
   // 通道卡定义（线稿 v6 顺序：局域网连接 / 临时隧道 / 自有域名 / 外部域名；
@@ -942,7 +955,12 @@ export function RemoteSection() {
                     "cursor-pointer rounded-[10px] border-[1.5px] p-2.5 transition-colors outline-none",
                     sel
                       ? "border-foreground shadow-[0_0_0_2px_rgba(15,23,42,0.07)] dark:shadow-[0_0_0_2px_rgba(255,255,255,0.09)]"
-                      : "border-border hover:border-muted-foreground/60"
+                      : chanUsable(c.key)
+                        ? "border-emerald-500/30 hover:border-emerald-500/50"
+                        : "border-border hover:border-muted-foreground/60",
+                    // 完全可用绿卡（判据见 chanUsable）：绿底与 Frame 完成摘要同款；
+                    // 选中态黑描边不变——交互态与业务态分层
+                    chanUsable(c.key) && "bg-emerald-500/5"
                   )}
                 >
                   <div className="flex items-center justify-between gap-1.5">
@@ -987,7 +1005,12 @@ export function RemoteSection() {
           </div>
 
           {/* 唯一展开详情区（线稿 pick()：同一时刻只显示一个；「本机」没有展开块——
-          零豁免 §C4 后本机访问走局域网卡地址） */}
+          零豁免 §C4 后本机访问走局域网卡地址）。
+          **三层结构成文（2026-10-22 四卡设计语言统一）**：展开区信息一律三层——
+          ① 状态行：Badge（语义色见 Badge 注释）+ 成因/过程小字；
+          ② 地址行：code 地址 + 复制 + ChannelQr（与状态同一证据门控，地址在才渲染）；
+          ③ 说明行：灰字补充（访问口径 / 自动行为 / 边界警告）。
+          lan/quick 即范本；named/tailscale 由向导接管，同构形态由 Frame 摘要承接。 */}
           <div data-expand={selected} className="bg-muted/30 mt-2.5 rounded-xl border p-4 text-sm">
             {selected === "lan" && (
               <>
@@ -1055,12 +1078,9 @@ export function RemoteSection() {
                   ) : // 运行中但地址尚未解析（cloudflared 启动/重试窗口）：占位提示而非
                   // 空白或旧值——脏/旧地址 + 「已获取」toast 的误导组合已在解析器侧治理
                   quickRunning && !quickErr ? (
-                    <span
-                      data-testid="quick-fetching"
-                      className="text-muted-foreground animate-pulse text-xs"
-                    >
+                    <ProcessHint testId="quick-fetching">
                       {t("settings.remote.quickFetching")}
-                    </span>
+                    </ProcessHint>
                   ) : null}
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -1098,121 +1118,35 @@ export function RemoteSection() {
               </>
             )}
             {selected === "named" && (
-              <>
-                <div className="flex items-start justify-between gap-4">
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[12.5px] font-semibold">
-                      {t("settings.remote.tunnelToken")}{" "}
-                      {/* 教程 popover（线稿 .help：点击展开/收起，可保持展开边看边操作） */}
-                      <span className="relative inline-block align-baseline">
-                        <span
-                          role="button"
-                          tabIndex={0}
-                          aria-expanded={helpOpen}
-                          data-help={helpOpen ? "open" : "closed"}
-                          className="cursor-pointer border-b border-dotted border-blue-500 text-xs text-blue-500"
-                          onClick={() => setHelpOpen((v) => !v)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" || e.key === " ") setHelpOpen((v) => !v);
-                          }}
-                        >
-                          {t("settings.remote.tutorialToggle")}
-                        </span>
-                        {helpOpen && (
-                          <div className="bg-background absolute top-6 left-[-40px] z-30 w-[420px] rounded-xl border p-3.5 text-xs shadow-lg">
-                            <p className="font-semibold">{t("settings.remote.tutorialPre")}</p>
-                            <ol className="mt-1.5 list-decimal space-y-1.5 pl-4">
-                              <li>{t("settings.remote.tutorialStep1")}</li>
-                              <li>{t("settings.remote.tutorialStep2")}</li>
-                              <li>{t("settings.remote.tutorialStep3")}</li>
-                              <li>{t("settings.remote.tutorialStep4")}</li>
-                              <li>{t("settings.remote.tutorialStep5")}</li>
-                              <li>{t("settings.remote.tutorialStep6")}</li>
-                            </ol>
-                            <p className="text-muted-foreground mt-2">
-                              {t("settings.remote.tutorialPost")}
-                            </p>
-                            {/* 官方图文兜底：Cloudflare 面板 UI 迭代快，应用内步骤以简版
-                            为主，细节引导到官方文档（2026-09-20 用户裁决） */}
-                            <a
-                              href="https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/"
-                              target="_blank"
-                              rel="noreferrer"
-                              className="mt-1.5 inline-block text-xs text-blue-500 underline"
-                            >
-                              {t("settings.remote.tutorialDocs")}
-                            </a>
-                          </div>
-                        )}
-                      </span>
+              <NamedDomainWizard
+                hasToken={savedToken.trim().length > 0}
+                pin={pin}
+                remoteEnabled={status?.enabled ?? true}
+                refreshKey={`${channels?.named?.enabled ?? false}|${channels?.named?.running ?? false}|${channels?.named?.connected ?? false}|${channels?.named?.reach?.state ?? ""}|${channels?.named?.configKey ?? ""}`}
+                tokenEditor={
+                  <div className="space-y-1">
+                    <label htmlFor="remote-tunnel-token" className="text-muted-foreground text-xs">
+                      {t("settings.remote.tunnelToken")} · {t("settings.remote.tokenHint")}
+                    </label>
+                    <div className="flex gap-2">
+                      <Input
+                        id="remote-tunnel-token"
+                        type="password"
+                        value={token}
+                        aria-label={t("settings.remote.tunnelToken")}
+                        className="min-w-0 flex-1"
+                        onChange={(e) => {
+                          tokenEdited.current = true;
+                          setToken(e.target.value);
+                        }}
+                      />
+                      <Button size="sm" disabled={busy} onClick={() => void saveToken()}>
+                        {t("settings.remote.save")}
+                      </Button>
                     </div>
-                    <p className="text-muted-foreground mt-0.5 text-xs">
-                      {t("settings.remote.tokenHint")}
-                    </p>
                   </div>
-                  <div className="flex max-w-[300px] flex-none gap-2">
-                    <Input
-                      id="remote-tunnel-token"
-                      type="password"
-                      value={token}
-                      aria-label={t("settings.remote.tunnelToken")}
-                      className="flex-1"
-                      onChange={(e) => setToken(e.target.value)}
-                    />
-                    <Button size="sm" disabled={busy} onClick={() => void saveToken()}>
-                      {t("settings.remote.save")}
-                    </Button>
-                  </div>
-                </div>
-                <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <Badge tone="blue">{t("settings.remote.badgePublic")}</Badge>
-                  {/* M5 P2-c：显示优先级 解析地址 > 手填 > 上次地址（灰字标注来源）。
-                  B3 判据原则：**用户自己的/永久的地址保留显示**（未运行也留着，用户要能
-                  复制存书签）——但下面必须紧跟运行态徽标，绝不宣称可用 */}
-                  {namedDisplayAddr ? (
-                    <code className="bg-muted rounded-md px-2 py-0.5 font-mono text-[12.5px] break-all">
-                      {namedDisplayAddr}
-                      {!namedAddr && namedDisplayAddr !== namedAddr && (
-                        <span className="text-muted-foreground ml-1 font-sans text-[10px]">
-                          {t("settings.remote.addrFallback")}
-                        </span>
-                      )}
-                    </code>
-                  ) : null}
-                  {namedDisplayAddr && (
-                    <Button variant="outline" size="sm" onClick={() => void copy(namedDisplayAddr)}>
-                      {t("settings.remote.copy")}
-                    </Button>
-                  )}
-                  {namedErr && (
-                    <span className="text-xs text-amber-500">{formatInvokeError(namedErr, t)}</span>
-                  )}
-                </div>
-                {/* 运行态行（B3，与 lan/quick 同一套 offCause 口径）：永久地址卡也必须有 */}
-                <div className="mt-2 flex flex-wrap items-center gap-2">
-                  {namedRunning ? (
-                    <>
-                      <Badge tone="green">{t("settings.remote.badgeRunning")}</Badge>
-                      <span className="text-muted-foreground text-xs">
-                        {t("settings.remote.namedRunningHint")}
-                      </span>
-                    </>
-                  ) : (
-                    status && (
-                      <>
-                        <Badge tone="gray">{offBadge("named")}</Badge>
-                        <span className="text-muted-foreground text-xs">{offHint("named")}</span>
-                      </>
-                    )
-                  )}
-                </div>
-                {/* 二维码与「扫码即可用」同门：未运行不渲染（死链不宣称；地址本身保留） */}
-                {namedRunning && namedDisplayAddr && (
-                  <div className="mt-3">
-                    <ChannelQr url={withPin(namedDisplayAddr)} caption={qrCaption} />
-                  </div>
-                )}
-              </>
+                }
+              />
             )}
             {selected === "tailscale" && (
               <div data-testid="ts-phase" data-phase={tsPhase}>
@@ -1257,11 +1191,6 @@ export function RemoteSection() {
                         {t("settings.remote.tsWizardPath")}
                       </span>
                     </div>
-                    {tsWizardOpen && (
-                      <div className="bg-background mt-3 rounded-lg border p-3">
-                        <TailscaleWizard />
-                      </div>
-                    )}
                   </>
                 )}
                 {/* W-A：开机恢复中（状态五，线稿 p-ext 六次回写）——**既不是故障也不是
@@ -1299,49 +1228,6 @@ export function RemoteSection() {
                     </div>
                     {/* 向导进度 = remote_ts_probe 的平台步骤表数据（每步三态 + 卡在哪一步
                     + blocked_reason），§C2 步骤表是数据不写死——不照抄线稿 5 行示意 */}
-                    <div className="mt-2">
-                      <TailscaleWizard />
-                    </div>
-                  </>
-                )}
-                {tsPhase === "configured" && (
-                  <>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Badge tone="green">{t("settings.remote.tsStateConfigured")}</Badge>
-                      {/* 地址行 = badge + code.url + 复制（线稿 .addr 统一形态）；
-                      reach 已由相位判定门控为 Verified，address 仍只在载荷宣称时渲染 */}
-                      {tsAddr && (
-                        <>
-                          <Badge tone="blue">{t("settings.remote.badgePublic")}</Badge>
-                          <code className="bg-muted rounded-md px-2 py-0.5 font-mono text-[12.5px] break-all">
-                            {tsAddr}
-                          </code>
-                          <Button variant="outline" size="sm" onClick={() => void copy(tsAddr)}>
-                            {t("settings.remote.copy")}
-                          </Button>
-                        </>
-                      )}
-                    </div>
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      {/* 状态三 = 通道在运行（相位机已把 tsRunning 收进 configured 判据），
-                      故这里恒为「运行中」——不再在同一个块里留一条「未运行 + 成因」的
-                      分支：那条分支在旧相位机下永远渲染不到（I-1），成因行已移到下面
-                      configuredIdle（状态四）里 */}
-                      <Badge tone="green">{t("settings.remote.badgeRunning")}</Badge>
-                      <span className="text-muted-foreground text-xs">
-                        {t("settings.remote.tsRunningHint")}
-                      </span>
-                      {tsErr && (
-                        <span className="text-xs text-amber-500">
-                          {formatInvokeError(tsErr, t)}
-                        </span>
-                      )}
-                    </div>
-                    {tsAddr && (
-                      <div className="mt-3">
-                        <ChannelQr url={withPin(tsAddr)} caption={qrCaption} />
-                      </div>
-                    )}
                   </>
                 )}
                 {tsPhase === "configuredIdle" && (
@@ -1390,11 +1276,6 @@ export function RemoteSection() {
                         </Button>
                       </div>
                     )}
-                    {tsWizardOpen && tsErr && (
-                      <div className="bg-background mt-3 rounded-lg border p-3">
-                        <TailscaleWizard />
-                      </div>
-                    )}
                     {/* M-5（用户裁决：**只加文案，不改逻辑**）：本态不渲染地址（§C3 三门），
                     而本功能的核心承诺是「获得一个固定的链接」——地址一消失，用户就会怀疑
                     「这链接到底是不是固定的、下次开还是不是这个」。故补一句安抚，恒在
@@ -1409,7 +1290,17 @@ export function RemoteSection() {
                   </>
                 )}
                 {/* probe 未达（加载中/失败）：不猜相位——向导本体自带加载脉冲/读取失败行 */}
-                {tsPhase === "unknown" && <TailscaleWizard />}
+                {tsWizardMounted && (
+                  <div className="bg-background mt-3 rounded-lg border p-3">
+                    <TailscaleWizard
+                      pin={pin}
+                      refreshKey={tsRefetchKey}
+                      remoteEnabled={status?.enabled ?? true}
+                      configKey={tsChannel?.configKey ?? null}
+                      channelEnabled={tsChannel?.enabled ?? true}
+                    />
+                  </div>
+                )}
               </div>
             )}
           </div>

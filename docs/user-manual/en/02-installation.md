@@ -1,5 +1,7 @@
 # Download and Installation
 
+**Fresh-install defaults**: with no historical database (including legacy-brand data), Remote Access starts enabled, the release app attempts to register launch at login once, and remote-message device signatures are off. Enable individual channels as needed; upgrades keep their previous state. Turning a switch off is respected on later launches. Launch-at-login status reflects the operating system; a failed registration can be retried in Settings.
+
 Tuvis ships installers for Windows and macOS — grab the latest release from GitHub Releases; installation takes about a minute.
 
 ## Download

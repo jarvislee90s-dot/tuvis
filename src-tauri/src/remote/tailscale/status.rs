@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use super::reach::{current_dns_host, poll_reverify, set_reachability, Reachability};
+use super::reach::{current_dns_host, observe_config, poll_reverify, Reachability};
 use super::wizard::extract_approval_url;
 use crate::remote::NoWindow;
 
@@ -613,7 +613,7 @@ pub(crate) fn set_ts_snapshot(f: impl FnOnce(&mut crate::remote::tunnel::Channel
 /// 而生命周期入口是**已知的失效时刻**（我们亲手改动了 Funnel 配置），没有理由留窗口。
 /// 重开后的校验由轮询守护在首个轮询窗内自动发起（见 [`ensure_poller`]），用户不必手点。
 pub(super) fn invalidate_reachability() {
-    set_reachability(Reachability::Unverified);
+    super::reach::invalidate_verification_lifecycle();
     *LAST_REVERIFY.lock().unwrap() = None;
 }
 
@@ -979,6 +979,25 @@ pub(super) fn record_deferred_open_failure(port: u16, msg: String) {
 /// （`DESIRED=None` 期间再无 `store_tick` 可纠正，退役分支也不碰可达性）。
 pub(super) fn store_tick(port: u16, tick: &TsTick) {
     let mut snap = tick.snapshot.clone();
+    let host = tick
+        .status
+        .as_ref()
+        .ok()
+        .map(|s| {
+            let dns = s.dns_name.trim().trim_end_matches('.');
+            if dns.is_empty() {
+                s.cert_domains.first().cloned().unwrap_or_default()
+            } else {
+                dns.to_string()
+            }
+        })
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            snap.url
+                .as_deref()
+                .and_then(super::reach::host_from_board_url)
+        });
+    observe_config(host.as_deref().unwrap_or(""), port);
     // 配置确认在（快照宣称运行）→ 延迟补开通这一页翻过去了，留痕清位
     if snap.running {
         set_deferred_open_error(None);
@@ -1124,7 +1143,7 @@ pub(super) fn deferred_open_due(st: &mut PollerState, port: u16, tick: &TsTick) 
 pub(super) fn poller_tick(
     st: &mut PollerState,
     now: std::time::Instant,
-    reverify: &mut dyn FnMut(&str) -> Option<Reachability>,
+    reverify: &mut dyn FnMut(&str, u16) -> Option<Reachability>,
 ) -> bool {
     let mut changed = true; // 退役分支也视为「变化」→ 重置周期
     let desired = *DESIRED.lock().unwrap();
@@ -1178,7 +1197,7 @@ pub(super) fn poller_tick(
             if should_reverify(snap.running, due) {
                 *LAST_REVERIFY.lock().unwrap() = Some(now);
                 if let Some(host) = current_dns_host() {
-                    let _ = reverify(&host);
+                    let _ = reverify(&host, port);
                 }
             }
         }
@@ -1214,8 +1233,8 @@ fn ensure_poller() {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(st.interval));
                 // 测试构建下无假探针 → None（跳过，零网络红线）；生产恒 Some
-                if poller_tick(&mut st, std::time::Instant::now(), &mut |h| {
-                    poll_reverify(h)
+                if poller_tick(&mut st, std::time::Instant::now(), &mut |h, port| {
+                    poll_reverify(h, port)
                 }) {
                     return;
                 }
@@ -1261,6 +1280,14 @@ pub(super) enum FunnelOutcome {
 /// 无待批链接（幂等重开/已批准/上游不要求）返回 None。Err 时 DESIRED/快照不动
 ///（生命周期收口由调用方负责——start_channel 与 run_step 各自处理）
 pub(super) fn enable_funnel(port: u16) -> Result<FunnelOutcome, String> {
+    enable_funnel_with_write(port, &mut run_cli)
+}
+
+/// 保持同一套后端门与归属守卫；repair 在每条写命令前复核生命周期，读命令不持状态锁。
+pub(super) fn enable_funnel_with_write(
+    port: u16,
+    write: &mut dyn FnMut(&[&str]) -> Result<String, String>,
+) -> Result<FunnelOutcome, String> {
     // ⓪ 后端门（读不到状态 = Err，fail-closed：绝不拿"读不到"当"可以开"）
     let st = run_cli(&["status", "--json"]).and_then(|j| parse_status(&j))?;
     if backend_phase(&st) != BackendPhase::Ready {
@@ -1275,10 +1302,10 @@ pub(super) fn enable_funnel(port: u16) -> Result<FunnelOutcome, String> {
     if let ServeOwnership::Foreign { others } = serve_ownership(&before, port) {
         return Err(foreign_serve_error("开通", others));
     }
-    disable_shields_up()?;
+    disable_shields_up_with_write(write)?;
     // **`--bg` 必须在**（A6 实测：不加会阻塞终端直到 Ctrl+C）。锁见
     // tests::every_funnel_enable_call_passes_bg_or_it_would_block_the_terminal
-    run_cli(&["funnel", "--bg", &port.to_string()])?;
+    write(&["funnel", "--bg", &port.to_string()])?;
     // 开通动作已完成（`--bg` 返回成功即算开通）——下一步是等公网解析（§C3 的 verify
     // 轮询），**不在这里等批准**：批准链接可能存在也可能不存在（Windows 实测不存在）。
     // 有链接就交回前端给用户点，没有就直接返回 None（不是错误）。
@@ -1292,7 +1319,13 @@ pub(super) fn enable_funnel(port: u16) -> Result<FunnelOutcome, String> {
 /// （探测提示词第 6 步），故写完必须回读确认——读不回/仍为开就如实报错，
 /// 绝不把「写没写进去不知道」伪装成成功
 pub(super) fn disable_shields_up() -> Result<(), String> {
-    run_cli(&["set", "--shields-up=false"])?;
+    disable_shields_up_with_write(&mut run_cli)
+}
+
+fn disable_shields_up_with_write(
+    write: &mut dyn FnMut(&[&str]) -> Result<String, String>,
+) -> Result<(), String> {
+    write(&["set", "--shields-up=false"])?;
     let after = run_cli(&["get", "--json"])?;
     let v: serde_json::Value =
         serde_json::from_str(&after).map_err(|e| format!("回读偏好失败: {e}"))?;
@@ -1413,6 +1446,9 @@ pub(super) fn stop_inner_outcome(
     port_hint: Option<u16>,
     force: bool,
 ) -> Result<Option<ServeResetReport>, String> {
+    // 先于 DESIRED 锁递增 epoch：repair 正在执行一条写命令时，关闭会等该命令结束，
+    // 但它返回后下一步 repair 写操作会立即被 epoch 检查拦下。
+    super::reach::advance_lifecycle_epoch();
     // 本地宣称收口（期望态清空 + 快照复位 + 校验态作废）必须在**同一临界区**完成
     // （B-I3）：分开做会给在途轮询轮留下「读到 Some → 被抢占 → 这里清空 → 轮询把运行态
     // 写回」的窗口，卡面在停机后继续宣称运行最长一个轮询窗

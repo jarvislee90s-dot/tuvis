@@ -67,7 +67,17 @@ const channelsOf = (
     error: null,
     ...over.quick,
   },
-  named: { enabled: false, running: false, address: null, error: null, ...over.named },
+  named: {
+    enabled: false,
+    running: false,
+    connected: false,
+    configKey: "named-config-a",
+    address: null,
+    error: null,
+    reach: { state: "unverified" },
+    waiting: null,
+    ...over.named,
+  },
   // §C3 地址三重门：address 只在 running ∧ error 空 ∧ reach=verified 时由后端宣称
   tailscale: {
     enabled: false,
@@ -75,6 +85,8 @@ const channelsOf = (
     address: null,
     error: null,
     reach: { state: "unverified" },
+    configKey: "tailscale-config-a",
+    waiting: null,
     ...over.tailscale,
   },
 });
@@ -164,6 +176,41 @@ describe("RemoteSection 四卡渲染与状态点映射（§C4 重排）", () => 
     expect(cardSwitch("quick")).toBeChecked();
     expect(cardSwitch("named")).not.toBeChecked();
     expect(cardSwitch("tailscale")).not.toBeChecked();
+  });
+
+  it("完全可用绿卡（2026-10-22 裁决）：验证通过/地址在手才挂绿，运行中≠可用", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status")
+        return statusOf({
+          channels: channelsOf({
+            lan: { enabled: true, running: true }, // 地址在手 → 绿
+            quick: { enabled: true, running: true }, // 地址已解析 → 绿
+            named: {
+              enabled: true,
+              running: true,
+              connected: true,
+              address: "https://remote.example.com/m",
+              reach: { state: "verified" }, // 全门过 → 绿
+            },
+            tailscale: { enabled: true, running: true, address: null }, // 在跑但未过三门 → 不绿
+          }),
+        });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    const master = screen.getByRole("switch", { name: /enable remote access/i });
+    await waitFor(() => expect(master).toBeEnabled());
+    expect(card("lan").className).toContain("bg-emerald-500/5");
+    // 局域网默认被选中：绿底照挂，但描边让位给选中态黑边（交互态与业务态分层）
+    expect(card("lan").className).toContain("border-foreground");
+    // 未选中的可用卡：绿底 + 绿描边
+    expect(card("quick").className).toContain("bg-emerald-500/5");
+    expect(card("quick").className).toContain("border-emerald-500/30");
+    expect(card("named").className).toContain("bg-emerald-500/5");
+    // 运行中≠可用：外部域名在跑但地址未过三门 → 不挂绿（证据门控与地址渲染同源）
+    expect(card("tailscale").className).not.toContain("bg-emerald-500/5");
   });
 
   it("点总开关关 → remote_toggle(false)；P3-a 修订后关闭语义文案随行展示", async () => {
@@ -541,7 +588,44 @@ describe("RemoteSection quick 换址警告与运行态（M5 A6）", () => {
   });
 });
 
-describe("RemoteSection 自有域名：Token 保存与教程 popover（M5 A6）", () => {
+describe("RemoteSection 自有域名：Token 保存与向导（M5 A6）", () => {
+  it("迟到的 Token 初始读取不得覆盖用户已输入的新 Token", async () => {
+    let resolveToken: (value: string) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string, args?: { key?: string }) => {
+      if (cmd === "remote_status") return statusOf();
+      if (cmd === "remote_devices") return [];
+      if (cmd === "get_setting" && args?.key === "remote.tunnel_token")
+        return await new Promise((resolve) => {
+          resolveToken = resolve;
+        });
+      return null;
+    });
+    render(<RemoteSection />);
+    fireEvent.click(card("named"));
+    const input = await screen.findByLabelText("Tunnel Token");
+    fireEvent.change(input, { target: { value: "new-draft-token" } });
+    await act(async () => resolveToken("old-saved-token"));
+    expect(input).toHaveValue("new-draft-token");
+  });
+
+  it("通道关闭时保存新 Token 也重新读取状态以刷新配置标识", async () => {
+    render(<RemoteSection />);
+    fireEvent.click(card("named"));
+    const input = await screen.findByLabelText("Tunnel Token");
+    await waitFor(() => expect(input).toHaveValue("eyJh-saved-token"));
+    const reads = invokeMock.mock.calls.filter((call) => call[0] === "remote_status").length;
+    fireEvent.change(input, { target: { value: "new-disabled-token" } });
+    fireEvent.click(
+      within(document.querySelector('[data-expand="named"]')!).getByRole("button", {
+        name: /^save$/i,
+      })
+    );
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.filter((call) => call[0] === "remote_status").length
+      ).toBeGreaterThan(reads)
+    );
+  });
   it("Token 输入回填已存值，保存走 set_setting(remote.tunnel_token)", async () => {
     render(<RemoteSection />);
     fireEvent.click(card("named"));
@@ -660,55 +744,55 @@ describe("RemoteSection 自有域名：Token 保存与教程 popover（M5 A6）"
     await waitFor(() => expect(toastSuccessMock).toHaveBeenCalled());
   });
 
-  it("教程 popover：点击展开六步教程，再点收起（可保持展开边看边操作）", async () => {
+  it("Cloudflare 步骤时间轴取代旧教程弹层", async () => {
     render(<RemoteSection />);
     fireEvent.click(card("named"));
-    // 收起态：教程正文不在文档
-    expect(screen.queryByText(/Prerequisite: a domain hosted on Cloudflare/i)).toBeNull();
-    fireEvent.click(screen.getByText(/How-to \(click to expand\/collapse\)/i));
-    // 展开：前置 + 六步 + 收尾说明；data-help 钩子随开合翻转（A8 评审：勿留死钩子）
-    expect(screen.getByText(/Prerequisite: a domain hosted on Cloudflare/i)).toBeTruthy();
-    expect(
-      (screen.getByText(/How-to \(click to expand\/collapse\)/i) as HTMLElement).dataset["help"]
-    ).toBe("open");
-    expect(screen.getByText(/Sign in at dash\.cloudflare\.com/i)).toBeTruthy();
-    expect(screen.getByText(/Create a tunnel, connection type Cloudflared/i)).toBeTruthy();
-    expect(screen.getByText(/Save tunnel;/i)).toBeTruthy();
-    expect(screen.getByText(/install nothing/i)).toBeTruthy();
-    expect(screen.getByText(/Public Hostname tab/i)).toBeTruthy();
-    expect(screen.getByText(/paste the token into the input and click Save/i)).toBeTruthy();
-    expect(screen.getByText(/never changes afterwards/i)).toBeTruthy();
-    // 再点收起
-    fireEvent.click(screen.getByText(/How-to \(click to expand\/collapse\)/i));
-    expect(screen.queryByText(/Prerequisite: a domain hosted on Cloudflare/i)).toBeNull();
+    expect(await screen.findByTestId("named-wizard")).toBeTruthy();
+    expect(screen.getByRole("list", { name: "Own domain setup steps" })).toBeTruthy();
+    expect(screen.queryByText(/How-to \(click to expand\/collapse\)/i)).toBeNull();
   });
 
-  it("自有域名详情含公网地址与二维码；错误态展示 error 原文", async () => {
-    invokeMock.mockImplementation(async (cmd: string) => {
+  it("公网二维码只在 Cloudflare 连接已登记且公网看板验证通过时出现", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: { key?: string }) => {
       if (cmd === "remote_status")
         return statusOf({
           channels: channelsOf({
             named: {
               enabled: true,
               running: true,
+              connected: true,
               address: "https://mam.jarvis.example.com/m",
-              error: null,
             },
           }),
         });
+      if (cmd === "get_setting" && args?.key === "remote.tunnel_token") return "saved-token";
       if (cmd === "get_setting") return null;
       if (cmd === "remote_devices") return [];
+      if (cmd === "remote_ts_probe") return macLikeProbeDone();
+      if (cmd === "remote_named_probe")
+        return {
+          configKey: "named-config",
+          hasToken: true,
+          enabled: true,
+          running: true,
+          connected: true,
+          originUrl: "http://127.0.0.1:9420",
+          address: "https://mam.jarvis.example.com/m",
+          lastAddress: null,
+          reach: { state: "verified" },
+          waiting: null,
+        };
       return null;
     });
     render(<RemoteSection />);
     fireEvent.click(card("named"));
-    expect(await screen.findByText("https://mam.jarvis.example.com/m")).toBeTruthy();
     await waitFor(() =>
       expect(toDataUrlMock).toHaveBeenCalledWith(
         "https://mam.jarvis.example.com/m#pin=4827",
         expect.anything()
       )
     );
+    expect(screen.getByTestId("setup-wizard-frame").getAttribute("data-complete")).toBe("true");
   });
 });
 
@@ -726,6 +810,9 @@ const tsWState = (id: string, done: boolean, blockedReason: string | null = null
 // macOS 九步基线：detect 完成、其余待做（= 配置中）
 const probeOf = (over: Record<string, unknown> = {}) => ({
   platform: "mac",
+  enabled: true,
+  configKey: "tailscale-config-a",
+  waiting: null,
   windowsVerified: true,
   steps: [
     tsWStep("detect"),
@@ -877,9 +964,12 @@ describe("RemoteSection tailscale 卡三态（§C4 / 简报 Step 4）", () => {
     render(<RemoteSection />);
     fireEvent.click(card("tailscale"));
     await waitFor(() => expect(phaseEl().getAttribute("data-phase")).toBe("configured"));
+    await waitFor(() =>
+      expect(screen.getByTestId("setup-wizard-frame").getAttribute("data-complete")).toBe("true")
+    );
     expect(screen.getByText("https://mam.tail1234.ts.net/m")).toBeTruthy();
-    expect(screen.getByText("Running")).toBeTruthy();
-    expect(screen.getByText(/Auto-restores on launch/i)).toBeTruthy();
+    expect(screen.getByText("Setup complete, your fixed address is ready")).toBeTruthy();
+    await waitFor(() => expect(screen.queryByTestId("ts-wizard")).toBeNull());
     await waitFor(() =>
       expect(toDataUrlMock).toHaveBeenCalledWith(
         "https://mam.tail1234.ts.net/m#pin=4827",
@@ -887,6 +977,99 @@ describe("RemoteSection tailscale 卡三态（§C4 / 简报 Step 4）", () => {
       )
     );
   });
+
+  it("成功摘要在异常后可展开诊断，后台恢复后保持手动展开", async () => {
+    const fullProbe = (reach: "verified" | "failed") =>
+      probeOf({
+        enabled: true,
+        configKey: "tailscale-stable-config",
+        running: true,
+        boardUrl: "https://mam.tail1234.ts.net/m",
+        reach:
+          reach === "verified"
+            ? { state: "verified" }
+            : { state: "failed", reason: "公网解析暂时失败" },
+        states: probeOf().states.map((state: { id: string }) => ({
+          ...state,
+          done: reach === "verified" || state.id !== "verify",
+        })),
+      });
+    let currentStatus = statusOf({
+      channels: channelsOf({
+        tailscale: {
+          enabled: true,
+          running: true,
+          address: "https://mam.tail1234.ts.net/m",
+          error: null,
+          reach: { state: "verified" },
+          configKey: "tailscale-stable-config",
+        },
+      }),
+    });
+    let currentProbe = fullProbe("verified");
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status") return currentStatus;
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      if (cmd === "remote_ts_probe") return currentProbe;
+      return null;
+    });
+    render(<RemoteSection />);
+    fireEvent.click(card("tailscale"));
+    await waitFor(() => expect(phaseEl().getAttribute("data-phase")).toBe("configured"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_setting", {
+        key: "remote.setup.tailscale",
+        value: JSON.stringify({
+          configKey: "tailscale-stable-config",
+          address: "https://mam.tail1234.ts.net/m",
+        }),
+      })
+    );
+    await waitFor(() => expect(screen.queryByTestId("ts-wizard")).toBeNull());
+
+    currentStatus = statusOf({
+      channels: channelsOf({
+        tailscale: {
+          enabled: true,
+          running: false,
+          address: null,
+          error: "公网解析暂时失败",
+          reach: { state: "failed", reason: "公网解析暂时失败" },
+          configKey: "tailscale-stable-config",
+        },
+      }),
+    });
+    currentProbe = fullProbe("failed");
+    await waitFor(() => expect(phaseEl().getAttribute("data-phase")).toBe("configuredIdle"), {
+      timeout: 10000,
+    });
+    await screen.findByText("Previously configured · needs attention");
+    const summary = screen.getByRole("button", { name: /view diagnosis/i });
+    fireEvent.click(summary);
+    expect(await screen.findByTestId("ts-wizard")).toBeTruthy();
+
+    currentStatus = statusOf({
+      channels: channelsOf({
+        tailscale: {
+          enabled: true,
+          running: true,
+          address: "https://mam.tail1234.ts.net/m",
+          error: null,
+          reach: { state: "verified" },
+          configKey: "tailscale-stable-config",
+        },
+      }),
+    });
+    currentProbe = fullProbe("verified");
+    await waitFor(() => expect(phaseEl().getAttribute("data-phase")).toBe("configured"), {
+      timeout: 10000,
+    });
+    expect(await screen.findByTestId("ts-wizard")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: /hide details/i }).getAttribute("aria-expanded")
+    ).toBe("true");
+  }, 20000);
 });
 
 describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的运行态与成因口径", () => {
@@ -932,59 +1115,44 @@ describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的
     reach: { state: "verified" },
   });
 
-  it("自有域名 running=false：地址与复制**保留**（永久地址），但带「未开启」徽标 + 成因，二维码不渲染", async () => {
-    mock({
-      channels: channelsOf({
-        named: {
-          enabled: false,
-          running: false,
-          address: null,
-          error: null,
-          lastAddr: "https://mam.jarvis.example.com/m",
-        },
-      }),
-    });
-    render(<RemoteSection />);
-    fireEvent.click(card("named"));
-    expect(await screen.findByText("Off", undefined, { timeout: 3000 })).toBeTruthy();
-    // 永久地址保留显示（可复制存书签）——判据原则：用户自己的地址不因未运行而消失
-    expect(screen.getByText("https://mam.jarvis.example.com/m")).toBeTruthy();
-    expect(copyButtons().length).toBeGreaterThan(0);
-    // 但绝不宣称可用：成因文案在场、二维码（=扫码即可用）不渲染
-    expect(screen.getByText(/turn it on to restore/i)).toBeTruthy();
-    expect(toDataUrlMock).not.toHaveBeenCalled();
-    expect(screen.queryByText("Running")).toBeNull();
-  });
-
-  it("自有域名 running=true：绿「运行中」徽标 + 二维码（可扫码即用）", async () => {
-    mock({
-      channels: channelsOf({
-        named: {
+  it("自有域名的旧 status 地址和 running 状态不作为已验证证据", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: { key?: string }) => {
+      if (cmd === "remote_status")
+        return statusOf({
+          channels: channelsOf({
+            named: {
+              enabled: true,
+              running: true,
+              address: "https://old.example.com/m",
+              lastAddr: "https://old.example.com/m",
+            },
+          }),
+        });
+      if (cmd === "get_setting" && args?.key === "remote.tunnel_token") return "test-token";
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      if (cmd === "remote_ts_probe") return macLikeProbeDone();
+      if (cmd === "remote_named_probe")
+        return {
+          configKey: "named-current",
+          hasToken: true,
           enabled: true,
           running: true,
-          address: "https://mam.jarvis.example.com/m",
-          error: null,
-        },
-      }),
+          connected: false,
+          originUrl: "http://127.0.0.1:9420",
+          address: "https://new.example.com/m",
+          lastAddress: null,
+          reach: { state: "unverified" },
+          waiting: null,
+        };
+      return null;
     });
     render(<RemoteSection />);
     fireEvent.click(card("named"));
-    expect(await screen.findByText("Running", undefined, { timeout: 3000 })).toBeTruthy();
-    expect(screen.getByText("https://mam.jarvis.example.com/m")).toBeTruthy();
-    await waitFor(() => expect(toDataUrlMock).toHaveBeenCalled());
-  });
-
-  it("自有域名总开关关闭：成因指向总开关（不谎报成「该通道开关未打开」）", async () => {
-    mock({
-      enabled: false,
-      channels: channelsOf({
-        named: { enabled: true, running: false, address: null, error: null },
-      }),
-    });
-    render(<RemoteSection />);
-    fireEvent.click(card("named"));
-    expect(await screen.findByText("Not running", undefined, { timeout: 3000 })).toBeTruthy();
-    expect(screen.getByText(/Remote access is off/i)).toBeTruthy();
+    await screen.findByTestId("named-wizard");
+    expect(screen.queryByText("Setup complete, your fixed address is ready")).toBeNull();
+    expect(screen.queryByText("https://old.example.com/m")).toBeNull();
+    expect(toDataUrlMock).not.toHaveBeenCalled();
   });
 
   // W-A（真机重启逐秒实测）：重启后有 1–2 分钟恢复窗口（T+58s 服务已 Running 但
@@ -1013,7 +1181,7 @@ describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的
     // 不是「未运行」成因档、不是「配置中」向导、也没有红色「尚未生效」
     expect(screen.queryByText("Not running")).toBeNull();
     expect(screen.queryByText("Setting up")).toBeNull();
-    expect(screen.queryByTestId("ts-wizard")).toBeNull();
+    expect(await screen.findByTestId("ts-wizard")).toBeTruthy();
     expect(screen.queryByTestId("ts-not-live")).toBeNull();
     // 地址与二维码不渲染（§C3 三门：未验证不宣称可用）；安抚文案在场
     expect(screen.queryByText("https://mam.tail1234.ts.net/m")).toBeNull();
@@ -1073,7 +1241,7 @@ describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的
     expect(screen.getByText(/NoState/)).toBeTruthy();
     expect(screen.queryByText(/nothing to do/i)).toBeNull();
     // （b）升级路径：向导重试入口在场，点击后挂出向导本体（verify 行的重试按钮在其中）
-    expect(screen.queryByTestId("ts-wizard")).toBeNull();
+    expect(await screen.findByTestId("ts-wizard")).toBeTruthy();
     fireEvent.click(screen.getByTestId("ts-wizard-retry-entry"));
     expect(await screen.findByTestId("ts-wizard")).toBeTruthy();
     // 非连不通类失败 → 不挂瞬时抖动引导（那条只属于「地址已解析但连不通」）
@@ -1102,8 +1270,8 @@ describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的
     // 错误 span 现经 formatInvokeError 渲染（码→英文模板，jsdom 默认英文语言）
     expect(screen.getByText(/Address resolves but unreachable/)).toBeTruthy();
     const hint = screen.getByTestId("ts-transient-hint");
-    expect(hint.textContent).toMatch(/transient jitter/i);
-    expect(hint.textContent).toMatch(/1[–-]2 minutes/i);
+    expect(hint.textContent).toMatch(/transient public-network jitter/i);
+    expect(hint.textContent).toMatch(/after 10 minutes/i);
   });
 
   it("外部域名卡 running=false ∧ 总开关开着：落到「已配置·未运行」态，成因是「服务没在监听」，不是笼统的「开关已关」", async () => {
@@ -1127,7 +1295,7 @@ describe("RemoteSection B3：永久地址卡（自有域名 / 外部域名）的
     // 是「配置中」+ 向导列表（成因被吞掉）
     expect(phaseEl().getAttribute("data-phase")).toBe("configuredIdle");
     expect(screen.queryByText("Setting up")).toBeNull();
-    expect(screen.queryByTestId("ts-wizard")).toBeNull();
+    expect(await screen.findByTestId("ts-wizard")).toBeTruthy();
     // B3：旧版无论哪种成因都只给一句 tsOffHint（「开关已关」）——那是谎报
     expect(screen.getByText(/is not listening yet/i)).toBeTruthy();
     expect(screen.queryByText(/Switch is off/i)).toBeNull();

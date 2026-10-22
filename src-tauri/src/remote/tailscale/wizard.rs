@@ -5,13 +5,297 @@
 //! 的地方（触发系统授权框，不静默提权），与 [`super::status`] 的通道运行态风险画像不同——
 //! 审供应链改动时不必读轮询线程，反之亦然。
 
-use super::reach::{reachability, set_reachability, verify_with_heal, Reachability};
+use super::reach::{
+    apply_reachability, begin_verification, config_key, discard_verification, do_verify,
+    invalidate_verification_lifecycle, observe_config, reachability, verify_with_heal,
+    waiting_status_for, Reachability,
+};
 use super::status::{
     backend_initializing, disable_shields_up, find_cli, foreign_serve_config, funnel_active,
     funnel_status_unreadable, parse_status, run_cli, serve_entries, serve_ownership,
     start_channel_inner, stop_inner, ts_snapshot, FunnelOutcome, ServeResetReport, TsStatus,
 };
 use crate::remote::NoWindow;
+
+const TAILSCALE_SYSTEM_EXTENSION_BUNDLE_ID: &str = "io.tailscale.ipn.macsys.network-extension";
+
+/// `systemextensionsctl list` 中只认明确的 Tailscale `[activated enabled]` 证据。
+fn system_extension_enabled_from(output: &str) -> Option<bool> {
+    output
+        .lines()
+        .any(|line| {
+            line.contains(TAILSCALE_SYSTEM_EXTENSION_BUNDLE_ID)
+                && line.contains("[activated enabled]")
+        })
+        .then_some(true)
+}
+
+#[cfg(test)]
+static SYSTEM_EXTENSION_LIST_OVERRIDE: once_cell::sync::Lazy<std::sync::Mutex<Option<String>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+fn set_system_extension_list_override(output: Option<&str>) {
+    *SYSTEM_EXTENSION_LIST_OVERRIDE.lock().unwrap() = output.map(str::to_string);
+}
+
+fn system_extension_enabled() -> Option<bool> {
+    if current_platform() != Platform::Mac {
+        return None;
+    }
+    #[cfg(test)]
+    {
+        return SYSTEM_EXTENSION_LIST_OVERRIDE
+            .lock()
+            .unwrap()
+            .as_deref()
+            .and_then(system_extension_enabled_from);
+    }
+    #[cfg(not(test))]
+    {
+        let output = std::process::Command::new("systemextensionsctl")
+            .arg("list")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        system_extension_enabled_from(&String::from_utf8_lossy(&output.stdout))
+    }
+}
+
+/// 安装器参数独立传递，不经 shell 解析下载路径。
+fn installer_command(p: Platform, pkg: &std::path::Path) -> Result<std::process::Command, String> {
+    let mut cmd = match p {
+        Platform::Mac => {
+            let mut cmd = std::process::Command::new("/usr/bin/open");
+            cmd.args(["-a", "/System/Library/CoreServices/Installer.app"]);
+            cmd
+        }
+        Platform::Windows => {
+            let mut cmd = std::process::Command::new("msiexec");
+            cmd.no_window().arg("/i");
+            cmd
+        }
+        Platform::Other => {
+            return Err("TSWIZ_PLATFORM_UNSUPPORTED: 当前平台暂不支持一键配置".into())
+        }
+    };
+    cmd.arg(pkg);
+    Ok(cmd)
+}
+
+fn installer_exit_error(label: &str, code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> String {
+    let err = String::from_utf8_lossy(stderr);
+    let out = String::from_utf8_lossy(stdout);
+    let detail = if !err.trim().is_empty() {
+        err.trim()
+    } else if !out.trim().is_empty() {
+        out.trim()
+    } else {
+        "no output"
+    };
+    format!("TSWIZ_INSTALLER_FAIL: {label} 退出码 {code:?}: {detail}")
+}
+
+/// 先在同目录临时落盘并校验，原子改名后才允许用户双击正式安装包。
+fn stage_installer_with(
+    dest: &std::path::Path,
+    legacy: &std::path::Path,
+    expected: &str,
+    download: impl FnOnce(&std::path::Path) -> Result<(), String>,
+) -> Result<(), String> {
+    use crate::remote::tunnel::verify_sha256_file;
+    if verify_sha256_file(dest, expected).is_ok() {
+        return Ok(());
+    }
+    let parent = dest
+        .parent()
+        .ok_or("TSWIZ_DOWNLOAD_DIR_INVALID: 安装包下载目录无效")?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("TSWIZ_DOWNLOAD_DIR_FAIL: 创建下载目录失败: {e}"))?;
+    let part = parent.join(format!(".tailscale-{:032x}.part", rand::random::<u128>()));
+    let result = (|| {
+        if verify_sha256_file(legacy, expected).is_ok() {
+            std::fs::copy(legacy, &part)
+                .map_err(|e| format!("TSWIZ_INSTALLER_COPY_FAIL: 复制已有安装包失败: {e}"))?;
+        } else {
+            download(&part)?;
+        }
+        verify_sha256_file(&part, expected)?;
+        std::fs::rename(&part, dest)
+            .map_err(|e| format!("TSWIZ_INSTALLER_SAVE_FAIL: 安装包保存失败: {e}"))
+    })();
+    if result.is_err() && part.exists() {
+        if let Err(e) = std::fs::remove_file(&part) {
+            log::warn!("清理未完成的 Tailscale 安装包失败: {e}");
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod onboarding_tests {
+    use super::*;
+    const HELLO_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[test]
+    fn mac_opens_system_installer_with_one_literal_package_argument() {
+        let pkg = std::path::Path::new("/Users/a b/Downloads/a'$(echo bad).pkg");
+        let cmd = installer_command(Platform::Mac, pkg).unwrap();
+        assert_eq!(cmd.get_program(), "/usr/bin/open");
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec![
+                "-a",
+                "/System/Library/CoreServices/Installer.app",
+                pkg.to_str().unwrap()
+            ]
+        );
+        let win = installer_command(Platform::Windows, pkg).unwrap();
+        assert_eq!(win.get_program(), "msiexec");
+        assert_eq!(
+            win.get_args().collect::<Vec<_>>(),
+            vec!["/i", pkg.to_str().unwrap()]
+        );
+    }
+
+    #[test]
+    fn installer_errors_include_exit_code_and_fall_back_to_stdout() {
+        let e = installer_exit_error("installer", Some(1), b"Must be run as root", b"");
+        assert!(e.contains("Must be run as root") && e.contains('1'), "{e}");
+        let e = installer_exit_error("installer", None, b"", b"");
+        assert!(!e.trim().is_empty());
+        assert!(installer_exit_error("msiexec", Some(2), b"out", b"err").contains("err"));
+    }
+
+    #[test]
+    fn download_is_staged_and_verified_before_package_becomes_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("Downloads/Tailscale.pkg");
+        let legacy = dir.path().join("missing.pkg");
+        stage_installer_with(&dest, &legacy, HELLO_SHA, |part| {
+            assert!(!dest.exists());
+            assert_eq!(part.extension().unwrap(), "part");
+            std::fs::write(part, b"hello").map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        stage_installer_with(&dest, &legacy, HELLO_SHA, |_| panic!("有效包不得重下")).unwrap();
+    }
+
+    #[test]
+    fn valid_legacy_package_is_copied_and_bad_download_never_promoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("Downloads/Tailscale.pkg");
+        let legacy = dir.path().join("old.pkg");
+        std::fs::write(&legacy, b"hello").unwrap();
+        stage_installer_with(&dest, &legacy, HELLO_SHA, |_| panic!("应复用旧包")).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        std::fs::remove_file(&dest).unwrap();
+        std::fs::remove_file(&legacy).unwrap();
+        assert!(stage_installer_with(&dest, &legacy, HELLO_SHA, |part| {
+            std::fs::write(part, b"corrupt").map_err(|e| e.to_string())
+        })
+        .is_err());
+        assert!(!dest.exists());
+        assert_eq!(
+            std::fs::read_dir(dest.parent().unwrap()).unwrap().count(),
+            0
+        );
+        assert!(
+            stage_installer_with(&dest, &legacy, HELLO_SHA, |_| Err("网络失败".into())).is_err()
+        );
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn system_extension_stopped_only_prompts_to_check_the_tailscale_client() {
+        if current_platform() != Platform::Mac {
+            return;
+        }
+        let readings = |backend_state: &str| CliReadings {
+            status: Some(TsStatus {
+                backend_state: backend_state.into(),
+                auth_url: String::new(),
+                dns_name: String::new(),
+                cert_domains: Vec::new(),
+            }),
+            shields: None,
+            funnel_json: Err("unused".into()),
+            system_extension_enabled: None,
+        };
+        let running = probe_steps_from(9420, false, &readings("Running"));
+        let running = running.iter().find(|s| s.id == "sys_ext").unwrap();
+        assert!(running.done, "Running 已直接证明客户端可用，无需额外操作");
+
+        let stopped = probe_steps_from(9420, false, &readings("Stopped"));
+        let stopped = stopped.iter().find(|s| s.id == "sys_ext").unwrap();
+        let reason = stopped.blocked_reason.as_deref().unwrap();
+        assert!(reason.contains("请检查客户端"), "{reason}");
+        assert!(
+            reason.contains("无法据此判断系统扩展是否已批准"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("批准系统扩展"),
+            "不得把 Stopped 推断为未批准: {reason}"
+        );
+    }
+
+    #[test]
+    fn activated_system_extension_completes_before_login_without_marking_login_done() {
+        if current_platform() != Platform::Mac {
+            return;
+        }
+        let _serial = super::super::test_lock();
+        let extension_row = "*\t*\tW5364U7YZB\tio.tailscale.ipn.macsys.network-extension (1.102.4/101.102.4)\tTailscale Network Extension\t[activated enabled]";
+        let readings = CliReadings {
+            status: Some(TsStatus {
+                backend_state: "NeedsLogin".into(),
+                auth_url: "https://login.tailscale.com/a/test".into(),
+                dns_name: String::new(),
+                cert_domains: Vec::new(),
+            }),
+            shields: None,
+            funnel_json: Err("unused".into()),
+            system_extension_enabled: Some(true),
+        };
+        let states = probe_steps_from(9420, true, &readings);
+        assert!(states.iter().find(|s| s.id == "sys_ext").unwrap().done);
+        assert!(!states.iter().find(|s| s.id == "login").unwrap().done);
+        assert_eq!(system_extension_enabled_from(extension_row), Some(true));
+        assert_eq!(
+            system_extension_enabled_from(
+                "*\t*\tW5364U7YZB\tio.tailscale.ipn.macsys.network-extension\tTailscale Network Extension\t[terminated waiting to uninstall on reboot]"
+            ),
+            None
+        );
+
+        // 状态装配链：CLI status=NeedsLogin + OS 已激活证据时，第4步完成、第5步仍待登录。
+        set_system_extension_list_override(Some(extension_row));
+        super::super::set_run_cli_override(Some(Box::new(|args: &[&str]| {
+            match args {
+            ["status", "--json"] => Ok(r#"{"BackendState":"NeedsLogin","AuthURL":"https://login.tailscale.com/a/test","Self":{"DNSName":""},"CertDomains":[]}"#.into()),
+            ["get", "--json"] => Ok(r#"{"shields-up":true}"#.into()),
+            ["funnel", "status", "--json"] => Ok("{}".into()),
+            other => Err(format!("测试未应答的 CLI 调用: {other:?}")),
+        }
+        })));
+        let probe = wizard_status_with(9420, true);
+        let states = probe["states"].as_array().unwrap();
+        assert!(
+            states.iter().find(|s| s["id"] == "sys_ext").unwrap()["done"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(!states.iter().find(|s| s["id"] == "login").unwrap()["done"]
+            .as_bool()
+            .unwrap());
+        set_system_extension_list_override(None);
+        super::super::set_run_cli_override(None);
+    }
+}
 
 // ============================================================
 // 首次配置引导（§C2 一条龙）：平台步骤表 + 安装包资产表 + 逐步探测
@@ -341,13 +625,15 @@ pub(super) fn ts_expected_sha256(asset: &str) -> Result<&'static str, String> {
     }
 }
 
-/// 安装包落位路径：`~/.tuvis/downloads/<资产名>`（bin/ 留给可执行文件；安装包校验
-/// 通过后保留，重复执行 install 无需重新下载）。数据目录构造沿 manifest.rs 先例
+/// 与导出共用系统下载目录解析及 reveal 白名单，支持 Windows 下载目录重定向。
 pub(super) fn ts_installer_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".tuvis")
-        .join("downloads")
+    crate::commands::export::exports_dir().join(ts_asset_name(current_platform()))
+}
+
+/// 仅下载动作复用旧包；只读探测不搬文件。
+fn legacy_installer_path() -> std::path::PathBuf {
+    crate::database::connection::app_data_home()
+        .join(".tuvis/downloads")
         .join(ts_asset_name(current_platform()))
 }
 
@@ -362,45 +648,21 @@ pub(super) fn installer_file_ok(p: Platform, path: &std::path::Path) -> bool {
     crate::remote::tunnel::verify_sha256_file(path, expected).is_ok()
 }
 
-/// 触发安装。**必须让系统弹授权框——不静默提权**（msiexec 不加 /qn）：要自动化就得
-/// 让 兔维斯 常驻管理员，那正是本项目安全上要避免的（设计说明书 §C2「安全红线」）
+/// macOS 打开系统安装界面；Windows 保持交互式 MSI。授权由用户在系统界面完成。
 pub(super) fn run_installer(pkg: &std::path::Path) -> Result<(), String> {
-    match current_platform() {
-        // macOS：installer 自身会弹「输入管理员密码」
-        Platform::Mac => {
-            let out = std::process::Command::new("installer")
-                .arg("-pkg")
-                .arg(pkg)
-                .arg("-target")
-                .arg("/")
-                .output()
-                .map_err(|e| format!("TSWIZ_INSTALLER_FAIL: 调用 installer 失败: {e}"))?;
-            if !out.status.success() {
-                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-            }
-            Ok(())
-        }
-        // Windows：msiexec 弹 UAC（per-machine 安装必然提权）。**不加 /qn**——
-        // 静默参数是否可用仍在探测中（见探测提示词第 3 步），未实测前一律走交互式
-        Platform::Windows => {
-            // 防闪窗：MSI 自己的安装向导 UI 不受影响（CREATE_NO_WINDOW 只抑制
-            // 控制台分配，不抑制 msiexec 的图形界面），少一个多余的 console 壳
-            let out = std::process::Command::new("msiexec")
-                .no_window()
-                .arg("/i")
-                .arg(pkg)
-                .output()
-                .map_err(|e| format!("TSWIZ_MSIEXEC_FAIL: 调用 msiexec 失败: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "TSWIZ_MSIEXEC_EXIT: msiexec 退出码 {:?}",
-                    out.status.code()
-                ));
-            }
-            Ok(())
-        }
-        Platform::Other => Err("TSWIZ_PLATFORM_UNSUPPORTED: 当前平台暂不支持一键配置".into()),
+    let mut cmd = installer_command(current_platform(), pkg)?;
+    let label = cmd.get_program().to_string_lossy().into_owned();
+    let out = cmd.output().map_err(|e| {
+        let error = format!("TSWIZ_INSTALLER_FAIL: 打开 {label} 失败: {e}");
+        log::warn!("{error}");
+        error
+    })?;
+    if !out.status.success() {
+        let error = installer_exit_error(&label, out.status.code(), &out.stdout, &out.stderr);
+        log::warn!("{error}");
+        return Err(error);
     }
+    Ok(())
 }
 
 /// install 步内核（可测，路径与触发器注入；run_step 传生产值 `ts_installer_path()` +
@@ -870,9 +1132,8 @@ impl StepState {
 /// 判据表（§C2）：
 /// - `detect` / `install`：`find_cli().is_some()`
 /// - `download`：已装（无需下载）或安装包已在落位路径且 sha256 对得上
-/// - `sys_ext`（仅 macOS）：CLI 能连上本机后端（`status --json` 可解析且
-///   `BackendState != "Stopped"`）——⚠️ 未批准系统扩展时的确切形态**待实测校验**，
-///   以实机为准后修订本判据并在注释登记
+/// - `sys_ext`（仅 macOS）：`Running` = 后端可用、直接完成；`Stopped` 只提示检查客户端，
+///   不推断系统扩展未批准
 /// - `login`：`BackendState == "Running"`
 /// - `shields_up`：`get --json` 的 `shields-up == false`。
 ///   **W-A/I2 门**：`BackendState` 仍在初始化（`NoState`/`Starting`）时**不判该步**
@@ -892,6 +1153,7 @@ pub(super) struct CliReadings {
     status: Option<TsStatus>,
     shields: Option<bool>,
     funnel_json: Result<String, String>,
+    system_extension_enabled: Option<bool>,
 }
 
 /// 取一轮读数（唯一的进程派生点，便于计数与替换：run_cli 的测试缝覆盖它）
@@ -905,6 +1167,7 @@ pub(super) fn read_cli_readings() -> CliReadings {
             .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
             .and_then(|v| v.get("shields-up").and_then(|x| x.as_bool())),
         funnel_json: run_cli(&["funnel", "status", "--json"]),
+        system_extension_enabled: system_extension_enabled(),
     }
 }
 
@@ -924,18 +1187,25 @@ pub(super) fn probe_steps_from(port: u16, installed: bool, r: &CliReadings) -> V
                     ws.id,
                     installed || installer_file_ok(current_platform(), &ts_installer_path()),
                 ),
+                "sys_ext" if r.system_extension_enabled == Some(true) => StepState::done(ws.id),
                 "sys_ext" => match &status {
                     None => StepState::blocked(
                         ws.id,
                         "读不到 Tailscale 状态（CLI 未安装或调用失败）".into(),
                     ),
+                    Some(s) if s.backend_state == "Running" => StepState::done(ws.id),
                     Some(s) if s.backend_state == "Stopped" => StepState::blocked(
                         ws.id,
-                        "Tailscale 后端已停止——若刚安装，请到「系统设置」批准系统扩展\
-                         （确切形态待实机校验）"
+                        "TSWIZ_SYS_EXT_NOT_RUNNING: Tailscale 后端未处于运行状态——\
+                         请检查客户端；无法据此判断系统扩展是否已批准"
                             .into(),
                     ),
-                    Some(_) => StepState::done(ws.id),
+                    Some(_) => StepState::blocked(
+                        ws.id,
+                        "TSWIZ_SYS_EXT_NOT_RUNNING: Tailscale 后端未处于运行状态——\
+                         请检查客户端；无法据此判断系统扩展是否已批准"
+                            .into(),
+                    ),
                 },
                 "login" => match &status {
                     None => StepState::blocked(
@@ -1036,14 +1306,16 @@ pub(super) fn probe_steps_from(port: u16, installed: bool, r: &CliReadings) -> V
 
 /// 向导载荷装配（remote_ts_probe 的内核，可测；JSON 形状即前后端契约）：
 /// `{ platform, windowsVerified, windowsVerifiedFrom, windowsUnverifiedSteps,
-///    writePathVerified, steps[], states[], authUrl, running, boardUrl, reach }`
+///    writePathVerified, steps[], states[], authUrl, enabled, running, boardUrl,
+///    configKey, waiting, reach }`
 /// （reach = 可达性态（与 [`Reachability`] 的 serde 形状同源，共**六个**变体：
 ///   `unverified` / `verifying` / `verified` / `record_pending`{republish} /
 ///   `recovering` / `failed`{reason}——不写死数字，避免与枚举漂移），形状 =
 ///    "reason"（仅 failed）}`，见下方 Reachability 的 serde 形状）。
 /// steps = 静态平台步骤表（needsHuman/humanActionKey 原样透出，i18n 键由前端翻译）；
 /// states = probe_steps_from 现算；authUrl = 待登录授权链接（login 步「去登录」按钮数据源，
-/// 兔维斯 不代登录）；running/boardUrl = Task 5 通道快照（向导头部展示用）。
+/// 兔维斯 不代登录）；running/boardUrl = Task 5 通道快照（向导头部展示用）；
+/// enabled = 总开关与 Tailscale 通道开关均开启；waiting 是同一主机与端口的连续 DNS 等待信息。
 /// **I-3**：Windows 验证位三项同源派生（[`windows_verification_for`]）——`windowsVerified`
 /// 表示**整条**流程都实测过（2026-10-07 用户实机走完 兔维斯 向导全程后**当前为 true**，依据见
 /// [`WINDOWS_VERIFIED_FROM`]），`windowsVerifiedFrom`/`windowsUnverifiedSteps`
@@ -1065,6 +1337,34 @@ pub(super) fn wizard_status_with(port: u16, installed: bool) -> serde_json::Valu
         .map(|s| s.auth_url.clone())
         .unwrap_or_default();
     let snap = ts_snapshot();
+    let dns_host = readings
+        .status
+        .as_ref()
+        .and_then(|s| {
+            let host = s.dns_name.trim().trim_end_matches('.');
+            if !host.is_empty() {
+                Some(host.to_string())
+            } else {
+                s.cert_domains.first().filter(|h| !h.is_empty()).cloned()
+            }
+        })
+        .or_else(|| {
+            snap.url
+                .as_deref()
+                .and_then(super::reach::host_from_board_url)
+        });
+    let host_for_key = dns_host.as_deref().unwrap_or("");
+    let probe_config_key = config_key(host_for_key, port);
+    observe_config(host_for_key, port);
+    let waiting = dns_host
+        .as_deref()
+        .and_then(|host| waiting_status_for(host, port));
+    let enabled = crate::database::dao::settings::get_setting(crate::remote::KEY_ENABLED)
+        .as_deref()
+        == Some("true")
+        && crate::database::dao::settings::get_setting(crate::remote::KEY_CHAN_TAILSCALE)
+            .as_deref()
+            == Some("1");
     let platform = match current_platform() {
         Platform::Mac => "mac",
         Platform::Windows => "windows",
@@ -1077,6 +1377,9 @@ pub(super) fn wizard_status_with(port: u16, installed: bool) -> serde_json::Valu
     // I-3：Windows 验证位三项（整条流程是否验过 / 实测覆盖起点 / 没跑过的步骤）
     let win = windows_verification_for(current_platform());
     serde_json::json!({
+        "installerPath": if ts_asset_name(current_platform()).is_empty() { None } else { Some(ts_installer_path().display().to_string()) },
+        "downloadUrl": if ts_asset_name(current_platform()).is_empty() { None } else { Some(ts_download_url(current_platform())) },
+        "installerReady": installer_file_ok(current_platform(), &ts_installer_path()),
         "platform": platform,
         "windowsVerified": win["windowsVerified"],
         "windowsVerifiedFrom": win["windowsVerifiedFrom"],
@@ -1112,6 +1415,9 @@ pub(super) fn wizard_status_with(port: u16, installed: bool) -> serde_json::Valu
             .collect::<Vec<_>>(),
         "authUrl": auth_url,
         "running": snap.running,
+        "enabled": enabled,
+        "configKey": probe_config_key,
+        "waiting": waiting,
         "boardUrl": snap.url,
         // §C3（Task 7）：校验态随载荷透出——前端据此门控头部地址展示（Verified 才
         // 显示地址），raw boardUrl 保持 Task 5 语义不变（门控是展示层职责，见前端）
@@ -1204,13 +1510,14 @@ pub(super) fn disable_step_with(
 /// - 静态探针：`status`（安装/登录/域名/Funnel 概览，Task 5 既有）
 /// - 向导步（id 与 [`wizard_steps`] 一致）：`detect` / `download` / `install` /
 ///   `sys_ext` / `login` / `shields_up` / `funnel` / `verify` / `autostart`
+/// - 独立修复：`repair`（仅用户明确触发；通道意图开启时可执行原自愈流程）
 /// - 通道动作：`enable`（= `funnel` 的同义旧名）| `disable`（完整停止语义：走
 ///   stop_inner 同一守卫并同步收口 DESIRED——修复轮 1 起与 stop_channel/stop_all
 ///   单点共用）
 ///
 /// 需要人的步骤只做「触发+回报」，**不代点**（登录只递 AuthURL、安装只触发系统
-/// 授权框、批准链接只递出去）。`verify` 自 Task 7 起为 §C3 强制可达性校验：
-/// 外部解析 + 钉 IP 探测，失败自动自愈一次，结果写校验态全局并随回执透出
+/// 授权框、批准链接只递出去）。`verify` 是 §C3 强制只读可达性校验；只有 `repair`
+/// 在通道意图开启时可触发 reset + 重开，结果写校验态全局并随回执透出。
 pub(crate) fn run_step(step: &str, port: u16) -> Result<serde_json::Value, String> {
     match step {
         "status" => {
@@ -1249,13 +1556,11 @@ pub(crate) fn run_step(step: &str, port: u16) -> Result<serde_json::Value, Strin
                     "path": dest.display().to_string(),
                 }));
             }
-            crate::remote::tunnel::download_url_to(&ts_download_url(p), &dest)?;
-            // 下载器只管传输，校验在本步收口（校验单点 = tunnel 的 sha256 比对）：
-            // 半截/被篡改的包在这里拦下，绝不带病进安装步。**流式**读回（B-M6）——
-            // 不把数十 MB 整包读进内存
             let expected = ts_expected_sha256(ts_asset_name(p))
                 .map_err(|e| format!("TSWIZ_CHECKSUM_MISSING: 安装包无校验值，拒绝使用: {e}"))?;
-            crate::remote::tunnel::verify_sha256_file(&dest, expected)?;
+            stage_installer_with(&dest, &legacy_installer_path(), expected, |part| {
+                crate::remote::tunnel::download_url_to(&ts_download_url(p), part)
+            })?;
             Ok(serde_json::json!({
                 "ok": true,
                 "path": dest.display().to_string(),
@@ -1335,37 +1640,85 @@ pub(crate) fn run_step(step: &str, port: u16) -> Result<serde_json::Value, Strin
         // **W-A**：后端还在初始化时回执必须如实说"推迟"（`deferred` + `backendState` +
         // 成因说明），**不得**报成 `ok:true` 让用户以为已经开通了——期望态已记，
         // 后端就绪后由轮询自动补开通（见 status::deferred_open_due）
-        "funnel" | "enable" => start_channel_inner(port).map(|o| match o {
-            FunnelOutcome::Opened(approval) => {
-                serde_json::json!({ "ok": true, "approvalUrl": approval })
-            }
-            // 同 shields_up：`deferred` 语义 =「这一步没做，**不是失败**」——此处**期望态
-            // 已记**（DESIRED），后端就绪后由 `status::deferred_open_due` 自动复评/补开通。
-            // 前端只声明不消费（理由同 shields_up 处注释：动作后重探的载荷已如实呈现，
-            // 不引入第二份回执派生的状态源）。
-            FunnelOutcome::Deferred { backend_state } => serde_json::json!({
-                "ok": true,
-                "deferred": true,
-                "backendState": backend_state,
-                "note": format!(
-                    "Tailscale 后端尚未就绪（{backend_state}）——开机恢复窗口内不判定 Funnel \
-                     配置、不重开；通道已记为期望开启，后端就绪后会自动复评/补开通"
-                ),
-            }),
-        }),
-        // verify（§C3 实装）：外部解析 + 钉 IP 探测（本机自检不可信，见模块头注释）；
-        // 失败且通道开着 → 自动自愈（守卫先行的 reset + 重开 + 短退避 + 重验）。
+        "funnel" | "enable" => {
+            let outcome = start_channel_inner(port)?;
+            // 用户明确开通成功（含已登记的延迟恢复）后，持久化通道意图；失败不落位。
+            crate::remote::write_chan_flag(crate::remote::ChannelKind::Tailscale, true);
+            crate::remote::events::audit("channel_toggled", "channel=tailscale on=true");
+            crate::remote::events::emit_ui(
+                "remote-changed",
+                serde_json::json!({ "channel": "tailscale", "on": true }),
+            );
+            Ok(match outcome {
+                FunnelOutcome::Opened(approval) => {
+                    serde_json::json!({ "ok": true, "approvalUrl": approval })
+                }
+                // 同 shields_up：`deferred` 语义 =「这一步没做，**不是失败**」——此处**期望态
+                // 已记**（DESIRED），后端就绪后由 `status::deferred_open_due` 自动复评/补开通。
+                // 前端只声明不消费（理由同 shields_up 处注释：动作后重探的载荷已如实呈现，
+                // 不引入第二份回执派生的状态源）。
+                FunnelOutcome::Deferred { backend_state } => serde_json::json!({
+                    "ok": true,
+                    "deferred": true,
+                    "backendState": backend_state,
+                    "note": format!(
+                        "Tailscale 后端尚未就绪（{backend_state}）——开机恢复窗口内不判定 Funnel \
+                         配置、不重开；通道已记为期望开启，后端就绪后会自动复评/补开通"
+                    ),
+                }),
+            })
+        }
+        // verify（§C3 实装）：只读执行外部解析 + 钉 IP 探测；失败不改 Funnel 配置。
         // 结果写校验态全局（载荷三门/向导 verify 判据随之联动），回执带最终状态。
-        // **长阻塞注意**：含自愈时最长约 5s 退避 + 2×10s 探测超时——remote_ts_run_step
+        // **长阻塞注意**：公网探测最长包含 DoH 与 HTTP 超时——remote_ts_run_step
         // 命令经 spawn_blocking 调本函数，绝不占 IPC/主线程
         "verify" => {
-            set_reachability(Reachability::Verifying);
-            let r = verify_with_heal(port);
-            set_reachability(r.clone());
+            let host = super::reach::current_dns_host();
+            let token = begin_verification(host.as_deref().unwrap_or(""), port);
+            let r = if let Some(host) = host.as_deref() {
+                do_verify(host)
+            } else {
+                Reachability::Failed {
+                    reason: "TSWIZ_VERIFY_HOST_MISSING: 读不到机器域名，无法执行公网校验或修复（先完成登录/开通）".into(),
+                }
+            };
+            let same_target = super::reach::current_dns_host() == host;
+            let applied = same_target && apply_reachability(&token, r.clone());
+            if !same_target {
+                discard_verification(&token);
+            }
+            let final_reach = if applied { r } else { reachability() };
             Ok(serde_json::json!({
                 "ok": true,
-                "done": matches!(r, Reachability::Verified),
-                "reach": serde_json::to_value(&r)
+                "done": matches!(final_reach, Reachability::Verified),
+                "stale": !applied,
+                "reach": serde_json::to_value(&final_reach)
+                    .unwrap_or_else(|_| serde_json::json!({ "state": "unverified" })),
+            }))
+        }
+        // 独立的显式修复动作：只有用户明确触发 repair 才调用原 reset + 重开 + 重验。
+        "repair" => {
+            invalidate_verification_lifecycle();
+            let host = super::reach::current_dns_host();
+            let token = begin_verification(host.as_deref().unwrap_or(""), port);
+            let r = if host.is_none() {
+                Reachability::Failed {
+                    reason: "TSWIZ_VERIFY_HOST_MISSING: 读不到机器域名，无法执行公网校验或修复（先完成登录/开通）".into(),
+                }
+            } else {
+                verify_with_heal(port, &token)
+            };
+            let same_target = super::reach::current_dns_host() == host;
+            let applied = same_target && apply_reachability(&token, r.clone());
+            if !same_target {
+                discard_verification(&token);
+            }
+            let final_reach = if applied { r } else { reachability() };
+            Ok(serde_json::json!({
+                "ok": true,
+                "done": matches!(final_reach, Reachability::Verified),
+                "stale": !applied,
+                "reach": serde_json::to_value(&final_reach)
                     .unwrap_or_else(|_| serde_json::json!({ "state": "unverified" })),
             }))
         }

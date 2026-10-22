@@ -12,8 +12,8 @@
 //! 「未验证」（fail-closed），**不谎报**成「记录尚未发布」。
 
 use super::status::{
-    disable_funnel, enable_funnel, foreign_serve_error, funnel_status_unreadable, parse_status,
-    run_cli, serve_ownership, ts_snapshot, ServeOwnership, DESIRED,
+    disable_funnel, enable_funnel_with_write, foreign_serve_error, funnel_status_unreadable,
+    parse_status, run_cli, serve_ownership, ts_snapshot, ServeOwnership, DESIRED,
 };
 
 // ============================================================
@@ -70,22 +70,275 @@ pub(crate) enum Reachability {
 }
 
 /// 校验态全局（载荷地址三门的第三道门 + 向导 verify 步判据的数据源）。
-/// 写入点：三处经 [`set_reachability`]（verify 步 / 轮询守护的 60s 重验 / 生命周期作废），
-/// 后端相位跃迁（[`note_backend_initializing`] / [`note_backend_ready`]）直接写本 static
+/// verify/repair 与后台重验经代际提交，生命周期与后端相位跃迁直接作废或更新。
 static REACHABILITY: once_cell::sync::Lazy<std::sync::Mutex<Reachability>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(Reachability::Unverified));
+
+/// 一次只读校验的目标与代际。代际每次新校验、配置变化或生命周期作废时递增，
+/// 让迟到的 CLI/网络结果不能覆盖关闭、重开或更新配置后的状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VerificationToken {
+    config_key: String,
+    generation: u64,
+    lifecycle_epoch: u64,
+}
+
+#[derive(Default)]
+struct VerificationState {
+    config_key: Option<String>,
+    host: Option<String>,
+    observed_port: Option<u16>,
+    generation: u64,
+    waiting_since_ms: Option<u64>,
+}
+
+static VERIFICATION: once_cell::sync::Lazy<std::sync::Mutex<VerificationState>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(VerificationState::default()));
+static LAST_WAITING_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIFECYCLE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OBSERVED_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+static OBSERVED_CONFIG_FINGERPRINT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// 按规范化 DNS 主机名 + 看板端口生成稳定、不含原始主机名的配置键。
+pub(super) fn config_key(host: &str, port: u16) -> String {
+    use sha2::{Digest, Sha256};
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let digest = Sha256::digest(format!("{normalized}:{port}").as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{hex}")
+}
+
+fn config_key_fingerprint(key: &str) -> u64 {
+    u64::from_str_radix(&key[7..23], 16).unwrap_or_default()
+}
+
+/// 开始一次校验。仅目标变化会清理等待起点；同配置的 verifying 往返保留它。
+pub(super) fn begin_verification(host: &str, port: u16) -> VerificationToken {
+    let key = config_key(host, port);
+    let fingerprint = config_key_fingerprint(&key);
+    let previous_key =
+        OBSERVED_CONFIG_FINGERPRINT.swap(fingerprint, std::sync::atomic::Ordering::SeqCst);
+    if previous_key != 0 && previous_key != fingerprint {
+        LIFECYCLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let previous_port = OBSERVED_PORT.swap(port, std::sync::atomic::Ordering::SeqCst);
+    if previous_port != 0 && previous_port != port {
+        LIFECYCLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let mut state = VERIFICATION.lock().unwrap();
+    if state.config_key.as_deref() != Some(key.as_str()) {
+        LIFECYCLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        state.config_key = Some(key.clone());
+        state.waiting_since_ms = None;
+    }
+    state.observed_port = Some(port);
+    state.host = Some(host.trim().trim_end_matches('.').to_ascii_lowercase());
+    state.generation = state.generation.wrapping_add(1);
+    *REACHABILITY.lock().unwrap() = Reachability::Verifying;
+    VerificationToken {
+        config_key: key,
+        generation: state.generation,
+        lifecycle_epoch: LIFECYCLE_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
+    }
+}
+
+/// remote_ts_probe 观察到外部更改的主机/端口时，使旧状态和在途结果立即失效。
+pub(super) fn observe_config(host: &str, port: u16) {
+    let key = config_key(host, port);
+    let fingerprint = config_key_fingerprint(&key);
+    let previous_key =
+        OBSERVED_CONFIG_FINGERPRINT.swap(fingerprint, std::sync::atomic::Ordering::SeqCst);
+    if previous_key != 0 && previous_key != fingerprint {
+        LIFECYCLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let previous_port = OBSERVED_PORT.swap(port, std::sync::atomic::Ordering::SeqCst);
+    if previous_port != 0 && previous_port != port {
+        LIFECYCLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let mut state = VERIFICATION.lock().unwrap();
+    if state.config_key.as_deref() != Some(key.as_str()) {
+        LIFECYCLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        state.config_key = Some(key);
+        state.generation = state.generation.wrapping_add(1);
+        state.waiting_since_ms = None;
+        *REACHABILITY.lock().unwrap() = Reachability::Unverified;
+    }
+    state.observed_port = Some(port);
+    state.host = Some(host.trim().trim_end_matches('.').to_ascii_lowercase());
+}
+
+/// 无 CLI 的端口观察点，供 remote_status 高频装配路径调用；端口改变时同步失效旧结论。
+pub(crate) fn observe_port(port: u16) {
+    let previous_port = OBSERVED_PORT.swap(port, std::sync::atomic::Ordering::SeqCst);
+    if previous_port != 0 && previous_port != port {
+        LIFECYCLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let mut state = VERIFICATION.lock().unwrap();
+    if state.observed_port != Some(port) {
+        if previous_port == 0 {
+            LIFECYCLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        state.observed_port = Some(port);
+        state.config_key = Some(config_key(state.host.as_deref().unwrap_or(""), port));
+        state.generation = state.generation.wrapping_add(1);
+        state.waiting_since_ms = None;
+        *REACHABILITY.lock().unwrap() = Reachability::Unverified;
+    }
+}
+
+/// 只接受当前配置与代际的结果。Verifying 保留连续等待起点，离开等待则清理。
+pub(super) fn apply_reachability(token: &VerificationToken, r: Reachability) -> bool {
+    let mut state = VERIFICATION.lock().unwrap();
+    if state.config_key.as_deref() != Some(token.config_key.as_str())
+        || state.generation != token.generation
+        || LIFECYCLE_EPOCH.load(std::sync::atomic::Ordering::SeqCst) != token.lifecycle_epoch
+    {
+        return false;
+    }
+    match r {
+        Reachability::RecordPending { .. } => {
+            if state.waiting_since_ms.is_none() {
+                state.waiting_since_ms = Some(unix_millis());
+            }
+        }
+        Reachability::Verifying => {}
+        _ => state.waiting_since_ms = None,
+    }
+    if matches!(r, Reachability::Verified) {
+        clear_funnel_reset_seen();
+    }
+    *REACHABILITY.lock().unwrap() = r;
+    true
+}
+
+/// 若探测期间发现主机名已变，只撤销自己的Verifying代际，不触碰后续新校验结果。
+pub(super) fn discard_verification(token: &VerificationToken) {
+    let mut state = VERIFICATION.lock().unwrap();
+    if state.config_key.as_deref() == Some(token.config_key.as_str())
+        && state.generation == token.generation
+    {
+        state.generation = state.generation.wrapping_add(1);
+        state.waiting_since_ms = None;
+        *REACHABILITY.lock().unwrap() = Reachability::Unverified;
+    }
+}
+
+/// 在状态/端口变更开始时先递增 epoch，再等待全局状态锁；在途写命令完成后会因 epoch
+/// 不匹配而被后续 repair 写步骤拦下。
+pub(super) fn advance_lifecycle_epoch() {
+    LIFECYCLE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// repair 的单条写命令与关闭/重开状态变更串行。写入前同时核对目标、代际及开关端口。
+pub(super) fn with_repair_intent<T>(
+    port: u16,
+    token: &VerificationToken,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let desired = DESIRED.lock().unwrap();
+    let state = VERIFICATION.lock().unwrap();
+    if *desired != Some(port)
+        || state.config_key.as_deref() != Some(token.config_key.as_str())
+        || state.generation != token.generation
+        || LIFECYCLE_EPOCH.load(std::sync::atomic::Ordering::SeqCst) != token.lifecycle_epoch
+    {
+        return Err("repair superseded by a newer channel lifecycle".into());
+    }
+    action()
+}
+
+/// 配置/生命周期失效时使全部在途校验过期，并结束等待计时。
+pub(super) fn invalidate_verification_lifecycle() {
+    advance_lifecycle_epoch();
+    let mut state = VERIFICATION.lock().unwrap();
+    state.generation = state.generation.wrapping_add(1);
+    state.waiting_since_ms = None;
+    *REACHABILITY.lock().unwrap() = Reachability::Unverified;
+}
+
+fn clear_waiting_clock() {
+    VERIFICATION.lock().unwrap().waiting_since_ms = None;
+}
+
+fn unix_millis() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut previous = LAST_WAITING_MS.load(std::sync::atomic::Ordering::SeqCst);
+    loop {
+        let next = now.max(previous.saturating_add(1));
+        match LAST_WAITING_MS.compare_exchange(
+            previous,
+            next,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => previous = actual,
+        }
+    }
+}
+
+fn waiting_value(state: &VerificationState) -> Option<serde_json::Value> {
+    state.waiting_since_ms.map(
+        |started_at_ms| serde_json::json!({ "startedAtMs": started_at_ms, "expectedSeconds": 600 }),
+    )
+}
+
+pub(super) fn waiting_status_for(host: &str, port: u16) -> Option<serde_json::Value> {
+    let state = VERIFICATION.lock().unwrap();
+    let key = config_key(host, port);
+    (state.config_key.as_deref() == Some(key.as_str()))
+        .then(|| waiting_value(&state))
+        .flatten()
+}
+
+/// 向 remote_status 提供当前目标的等待元数据（无等待时为 JSON null）。
+pub(crate) fn waiting_status() -> serde_json::Value {
+    waiting_value(&VERIFICATION.lock().unwrap()).unwrap_or(serde_json::Value::Null)
+}
+
+/// 最近一次观察到的配置键快照；不调用 CLI，供 remote_status 高频装配。
+pub(crate) fn config_key_snapshot() -> Option<String> {
+    VERIFICATION.lock().unwrap().config_key.clone()
+}
+
+#[cfg(test)]
+fn reset_waiting_for_test() {
+    *VERIFICATION.lock().unwrap() = VerificationState::default();
+    *REACHABILITY.lock().unwrap() = Reachability::Unverified;
+    LIFECYCLE_EPOCH.store(0, std::sync::atomic::Ordering::SeqCst);
+    OBSERVED_PORT.store(0, std::sync::atomic::Ordering::SeqCst);
+    OBSERVED_CONFIG_FINGERPRINT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// 当前校验态（remote_status / remote_ts_probe 消费）
 pub(crate) fn reachability() -> Reachability {
     REACHABILITY.lock().unwrap().clone()
 }
 
-/// 写入校验态（生产写入点全在本模块内：verify 步、轮询重验、生命周期作废；测试用它注入夹具）。
+/// 测试夹具直接写入校验态；生产校验结果必须经代际提交。
 /// **副作用（W-B 翻页规则）**：写入 `Verified` 时清掉「重开档」标记——记录又发布了，
 /// 下一次"没记录"不该继续算重开档（否则一次 reset 会把整个进程的档位永久钉死）。
+#[cfg(test)]
 pub(crate) fn set_reachability(r: Reachability) {
     if matches!(r, Reachability::Verified) {
         clear_funnel_reset_seen();
+    }
+    let mut waiting = VERIFICATION.lock().unwrap();
+    match r {
+        Reachability::RecordPending { .. } => {
+            if waiting.waiting_since_ms.is_none() {
+                waiting.waiting_since_ms = Some(unix_millis());
+            }
+        }
+        Reachability::Verifying => {}
+        _ => waiting.waiting_since_ms = None,
     }
     *REACHABILITY.lock().unwrap() = r;
 }
@@ -289,6 +542,8 @@ pub(super) fn note_backend_initializing(state: &str, now: std::time::Instant) ->
             return None;
         }
         *g = Reachability::Recovering;
+        drop(g);
+        clear_waiting_clock();
         return None;
     }
     // 超上界：降级（不再说"正在恢复、无需任何操作"，如实点名成因与已等时长）
@@ -299,6 +554,8 @@ pub(super) fn note_backend_initializing(state: &str, now: std::time::Instant) ->
         *g = Reachability::Failed {
             reason: reason.clone(),
         };
+        drop(g);
+        clear_waiting_clock();
     }
     Some(reason)
 }
@@ -324,6 +581,8 @@ pub(super) fn note_backend_ready(now: std::time::Instant) {
     let degraded_failure = degraded && matches!(*g, Reachability::Failed { .. });
     if matches!(*g, Reachability::Recovering) || degraded_failure {
         *g = Reachability::Unverified;
+        drop(g);
+        clear_waiting_clock();
     }
 }
 
@@ -580,6 +839,7 @@ fn probe_http(host: &str, ip: &str) -> Result<(), String> {
         // **禁用系统代理**（no_proxy）：本机代理可能做本地 MITM——§C3 实测教训
         //（本地全绿而公网打不开）。钉 IP 的意义就在于同时绕开本机 DNS 与本机代理
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .resolve(host, std::net::SocketAddr::new(addr, 443))
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -597,6 +857,11 @@ fn probe_http(host: &str, ip: &str) -> Result<(), String> {
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     mam_response_ok(status, marker.as_deref())
+}
+
+/// 已解析公网地址后的 HTTP 探针，供 named 通道复用同一特征标记判据。
+pub(crate) fn probe_public_http(host: &str, ip: &str) -> Result<(), String> {
+    probe_http(host, ip)
 }
 
 /// 生产探针（[`ProbeFn`] 的真实现）：**逐源逐类型**问 DoH JSON →
@@ -710,7 +975,7 @@ pub(super) fn probe_addresses(
 
 /// 校验入口单点（生产 = [`real_probe`]；测试经 `VERIFY_PROBE_OVERRIDE` 注入假探针，
 /// 使 run_step("verify") / heal 全链可零网络测试）
-fn do_verify(host: &str) -> Reachability {
+pub(super) fn do_verify(host: &str) -> Reachability {
     #[cfg(test)]
     if let Some(f) = VERIFY_PROBE_OVERRIDE.lock().unwrap().as_ref() {
         let r = verify_reachability(host, f);
@@ -771,9 +1036,9 @@ pub(super) fn host_from_board_url(url: &str) -> Option<String> {
         .filter(|h| !h.is_empty())
 }
 
-/// verify 步内核：现算可达性；失败**且用户开着本通道**（DESIRED=Some）才自愈。
-/// 通道没开绝不借 verify 偷开 Funnel——开通只属于 funnel 步/开关的职责
-pub(super) fn verify_with_heal(port: u16) -> Reachability {
+/// repair 步内核：现算可达性；失败**且用户开着本通道**（DESIRED=Some）才自愈。
+/// 通道没开绝不借 repair 偷开 Funnel——开通只属于 funnel 步/开关的职责
+pub(super) fn verify_with_heal(port: u16, token: &VerificationToken) -> Reachability {
     let Some(host) = current_dns_host() else {
         return Reachability::Failed {
             reason: "读不到机器域名，无法校验（先完成登录/开通）".into(),
@@ -783,7 +1048,7 @@ pub(super) fn verify_with_heal(port: u16) -> Reachability {
     // 恢复窗口**不自愈**（W-A）：此刻配置极可能安然无恙（实测 T+73s tailscaled 自己
     // 就恢复了），reset+重开只会把它清掉；`Recovering` 也不是"失败"，轮询窗口会继续复验。
     if matches!(r, Reachability::Verified | Reachability::Recovering)
-        || DESIRED.lock().unwrap().is_none()
+        || *DESIRED.lock().unwrap() != Some(port)
     {
         return r;
     }
@@ -794,7 +1059,7 @@ pub(super) fn verify_with_heal(port: u16) -> Reachability {
     {
         return r;
     }
-    heal_and_reverify(port)
+    heal_and_reverify(port, token)
 }
 
 /// 失败时自动尝试自愈：**重置 Funnel 后重新开启**——2026-10-06 实测这一招能
@@ -805,7 +1070,7 @@ pub(super) fn verify_with_heal(port: u16) -> Reachability {
 /// **守卫先行（与 stop_inner 同红线）**：配置是外来的绝不 `funnel reset`——它清
 /// 整份 serve 配置；拒绝时如实报错，不掩盖（简报草稿里 reset 在守卫前，此处修正：
 /// 否则 reset 先把外来配置清掉，守卫形同虚设）。
-pub(super) fn heal_and_reverify(port: u16) -> Reachability {
+pub(super) fn heal_and_reverify(port: u16, token: &VerificationToken) -> Reachability {
     // **W-A 后端门（2026-10-07 真机重启实测）**：判配置归属与 `funnel reset` **之前**
     // 必须先确认 `BackendState=Running`——恢复窗口里 `funnel status --json` 会短暂为 `{}`，
     // 而 T+73s 实测 tailscaled 自己就把配置逐字段恢复了；此时 reset + 重开等于把
@@ -848,12 +1113,14 @@ pub(super) fn heal_and_reverify(port: u16) -> Reachability {
     // 会落首开档（把实测 30–49 秒说成 5–6 分钟，正是自愈最该走重开档的场景）；
     // ② 失败必须**如实返回**，绝不吞掉：reset 没成功还继续 `--bg` 等于把「半程自愈」
     // 当成功（配置已被清掉、地址却继续被宣称在路上）。
-    if let Err(e) = disable_funnel() {
+    if let Err(e) = with_repair_intent(port, token, disable_funnel) {
         return Reachability::Failed {
             reason: format!("自愈失败（重置 Funnel 未成功）: {e}"),
         };
     }
-    if let Err(e) = enable_funnel(port) {
+    if let Err(e) = enable_funnel_with_write(port, &mut |args| {
+        with_repair_intent(port, token, || run_cli(args))
+    }) {
         return Reachability::Failed {
             reason: format!("自愈失败: {e}"),
         };
@@ -909,24 +1176,63 @@ pub(super) fn failure_event_reason(prev: &Reachability, next: &Reachability) -> 
 /// 判定要发时发既有 remote-tunnel-error 事件（复用 tunnel.rs 放弃守护时的形状
 /// `{"error", "channel"}`），地址由载荷三门随之撤下。**通道无关（宪法原则 2）**：只写
 /// tailscale 自己的校验态，不触碰隧道两路
-pub(super) fn reverify_with(host: &str, probe: &ProbeFn) -> Reachability {
+#[cfg(test)]
+pub(super) fn reverify_with(host: &str, port: u16, probe: &ProbeFn) -> Reachability {
+    reverify_with_target(host, port, probe, false, || Some(host.to_string()))
+}
+
+fn reverify_with_target(
+    host: &str,
+    port: u16,
+    probe: &ProbeFn,
+    require_intent: bool,
+    current_host: impl FnOnce() -> Option<String>,
+) -> Reachability {
     let prev = reachability();
+    let token = if require_intent {
+        // 捕获代际与期望态在同一临界区，防止轮询读到域名时通道已经关闭。
+        let desired = DESIRED.lock().unwrap();
+        if *desired != Some(port) {
+            return reachability();
+        }
+        begin_verification(host, port)
+    } else {
+        begin_verification(host, port)
+    };
     let r = verify_reachability(host, probe);
     log_reach("轮询复验", host, &r);
-    set_reachability(r.clone());
-    if let Some(reason) = failure_event_reason(&prev, &r) {
-        crate::remote::events::emit_ui(
-            "remote-tunnel-error",
-            serde_json::json!({ "error": reason, "channel": "tailscale" }),
-        );
+    let live_host = current_host();
+    let port_matches = match OBSERVED_PORT.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => true,
+        current => current == port,
+    };
+    let target_matches = live_host.as_deref() == Some(host) && port_matches;
+    let applied = target_matches && apply_reachability(&token, r.clone());
+    if !target_matches {
+        discard_verification(&token);
     }
-    r
+    let current = if applied { r } else { reachability() };
+    if applied {
+        if let Some(reason) = failure_event_reason(&prev, &current) {
+            crate::remote::events::emit_ui(
+                "remote-tunnel-error",
+                serde_json::json!({ "error": reason, "channel": "tailscale" }),
+            );
+        }
+    }
+    current
 }
 
 /// 轮询线程的重验入口（生产）：探针与用户手点 verify 同源（[`real_probe`]）
 #[cfg(not(test))]
-pub(super) fn poll_reverify(host: &str) -> Option<Reachability> {
-    Some(reverify_with(host, real_probe()))
+pub(super) fn poll_reverify(host: &str, port: u16) -> Option<Reachability> {
+    Some(reverify_with_target(
+        host,
+        port,
+        real_probe(),
+        true,
+        current_dns_host,
+    ))
 }
 
 /// 轮询线程的重验入口（测试构建）：假探针优先；**没有假探针就不探测**（返回 None）。
@@ -935,7 +1241,150 @@ pub(super) fn poll_reverify(host: &str) -> Option<Reachability> {
 /// 真探针会发起**真实网络请求**，违反零网络红线。故测试构建下探测必须显式注入
 /// （与 run_cli 的 RUN_CLI_OVERRIDE 同纪律）；生产构建没有这个分支
 #[cfg(test)]
-pub(super) fn poll_reverify(host: &str) -> Option<Reachability> {
+pub(super) fn poll_reverify(host: &str, port: u16) -> Option<Reachability> {
     let g = VERIFY_PROBE_OVERRIDE.lock().unwrap();
-    g.as_ref().map(|f| reverify_with(host, f))
+    g.as_ref()
+        .map(|f| reverify_with_target(host, port, f, true, current_dns_host))
+}
+
+#[cfg(test)]
+mod waiting_tests {
+    use super::*;
+
+    #[test]
+    fn waiting_clock_survives_verifying_round_trip_for_same_config() {
+        let _serial = super::super::test_lock();
+        reset_waiting_for_test();
+        let token = begin_verification("node.tailnet.ts.net", 9420);
+        apply_reachability(&token, Reachability::RecordPending { republish: false });
+        let first = waiting_status_for("node.tailnet.ts.net", 9420).unwrap();
+
+        let token = begin_verification("node.tailnet.ts.net", 9420);
+        apply_reachability(&token, Reachability::Verifying);
+        apply_reachability(&token, Reachability::RecordPending { republish: false });
+        let second = waiting_status_for("node.tailnet.ts.net", 9420).unwrap();
+
+        assert_eq!(second["startedAtMs"], first["startedAtMs"]);
+        assert_eq!(second["expectedSeconds"], 600);
+        reset_waiting_for_test();
+    }
+
+    #[test]
+    fn waiting_clock_resets_when_target_config_changes_or_waiting_ends() {
+        let _serial = super::super::test_lock();
+        reset_waiting_for_test();
+        let token = begin_verification("node.tailnet.ts.net", 9420);
+        apply_reachability(&token, Reachability::RecordPending { republish: false });
+        let first = waiting_status_for("node.tailnet.ts.net", 9420).unwrap();
+
+        let changed = begin_verification("node.tailnet.ts.net", 9430);
+        assert_eq!(waiting_status_for("node.tailnet.ts.net", 9430), None);
+        apply_reachability(&changed, Reachability::RecordPending { republish: false });
+        let second = waiting_status_for("node.tailnet.ts.net", 9430).unwrap();
+        assert_ne!(second["startedAtMs"], first["startedAtMs"]);
+
+        apply_reachability(
+            &changed,
+            Reachability::Failed {
+                reason: "test".into(),
+            },
+        );
+        assert_eq!(waiting_status_for("node.tailnet.ts.net", 9430), None);
+        reset_waiting_for_test();
+    }
+
+    #[test]
+    fn stale_verification_cannot_restore_reachability_after_lifecycle_change() {
+        let _serial = super::super::test_lock();
+        reset_waiting_for_test();
+        let old = begin_verification("node.tailnet.ts.net", 9420);
+        invalidate_verification_lifecycle();
+        let current = begin_verification("node.tailnet.ts.net", 9420);
+
+        assert!(!apply_reachability(&old, Reachability::Verified));
+        assert_eq!(reachability(), Reachability::Verifying);
+        assert!(apply_reachability(
+            &current,
+            Reachability::Failed {
+                reason: "new".into()
+            }
+        ));
+        assert_eq!(
+            reachability(),
+            Reachability::Failed {
+                reason: "new".into()
+            }
+        );
+        reset_waiting_for_test();
+    }
+
+    #[test]
+    fn observing_new_port_invalidates_pending_wait_and_old_results_without_cli() {
+        let _serial = super::super::test_lock();
+        reset_waiting_for_test();
+        let old = begin_verification("node.tailnet.ts.net", 9420);
+        apply_reachability(&old, Reachability::RecordPending { republish: false });
+
+        observe_port(9430);
+
+        assert_eq!(waiting_status(), serde_json::Value::Null);
+        assert!(!apply_reachability(&old, Reachability::Verified));
+        assert_eq!(reachability(), Reachability::Unverified);
+        reset_waiting_for_test();
+    }
+
+    #[test]
+    fn background_reverify_discards_result_when_lifecycle_changes_during_probe() {
+        let _serial = super::super::test_lock();
+        reset_waiting_for_test();
+        set_http_probe_override(Some(Box::new(|_host, _ip| Ok(()))));
+        let result = reverify_with("node.tailnet.ts.net", 9420, &|_host| {
+            invalidate_verification_lifecycle();
+            Ok(vec!["203.0.113.10".into()])
+        });
+        assert_eq!(result, Reachability::Unverified);
+        assert_eq!(reachability(), Reachability::Unverified);
+        set_http_probe_override(None);
+        reset_waiting_for_test();
+    }
+
+    #[test]
+    fn background_reverify_discards_result_when_config_changes_during_probe() {
+        let _serial = super::super::test_lock();
+        reset_waiting_for_test();
+        set_http_probe_override(Some(Box::new(|_host, _ip| Ok(()))));
+        let result = reverify_with("node.tailnet.ts.net", 9420, &|_host| {
+            observe_config("new-node.tailnet.ts.net", 9430);
+            Ok(vec!["203.0.113.10".into()])
+        });
+        assert_eq!(result, Reachability::Unverified);
+        assert_eq!(reachability(), Reachability::Unverified);
+        set_http_probe_override(None);
+        reset_waiting_for_test();
+    }
+
+    #[test]
+    fn config_key_binds_normalized_host_and_port() {
+        let a = config_key("Node.Tailnet.TS.NET.", 9420);
+        assert_eq!(a, config_key("node.tailnet.ts.net", 9420));
+        assert_ne!(a, config_key("node.tailnet.ts.net", 9430));
+        assert!(a.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn config_key_snapshot_changes_with_observed_port_without_cli() {
+        let _serial = super::super::test_lock();
+        reset_waiting_for_test();
+        observe_config("node.tailnet.ts.net", 9420);
+        assert_eq!(
+            config_key_snapshot(),
+            Some(config_key("node.tailnet.ts.net", 9420))
+        );
+        observe_port(9430);
+        assert_eq!(
+            config_key_snapshot(),
+            Some(config_key("node.tailnet.ts.net", 9430))
+        );
+        reset_waiting_for_test();
+    }
 }

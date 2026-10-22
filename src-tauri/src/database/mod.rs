@@ -1,5 +1,6 @@
 pub mod connection;
 pub mod dao;
+pub(crate) mod first_run;
 pub mod migration;
 pub mod schema;
 

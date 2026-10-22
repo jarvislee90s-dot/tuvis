@@ -20,6 +20,10 @@ import {
   remoteToggle,
   remoteTsProbe,
   remoteTsRunStep,
+  remoteNamedProbe,
+  remoteNamedSetAddress,
+  remoteNamedVerify,
+  remoteTsRevealDownloads,
   renameDevice,
   resetDevices,
   setPin,
@@ -32,6 +36,15 @@ beforeEach(() => {
 });
 
 describe("remote api wrappers", () => {
+  it("Windows 重定向下载目录仅定位父目录，保留含空格路径", async () => {
+    await remoteTsRevealDownloads("D:\\My Downloads\\tailscale-setup-1.102.4-amd64.msi");
+    expect(invokeMock).toHaveBeenCalledWith("reveal_dir", { path: "D:\\My Downloads" });
+  });
+
+  it("Windows 下载目录重定向到盘符根时保留根分隔符", async () => {
+    await remoteTsRevealDownloads("D:\\tailscale.msi");
+    expect(invokeMock).toHaveBeenCalledWith("reveal_dir", { path: "D:\\" });
+  });
   it("remoteStatus 无参调用 remote_status，透传返回值", async () => {
     const status = {
       enabled: true,
@@ -40,7 +53,16 @@ describe("remote api wrappers", () => {
         local: { running: true, address: "http://127.0.0.1:9420/m" },
         lan: { enabled: true, running: true, addresses: ["http://192.168.1.5:9420/m"] },
         quick: { enabled: false, running: false, address: null, error: null },
-        named: { enabled: false, running: false, address: null, error: null },
+        named: {
+          enabled: false,
+          running: false,
+          connected: false,
+          address: null,
+          error: null,
+          configKey: "named-config",
+          reach: { state: "unverified" },
+          waiting: null,
+        },
         // §C1/§C3（Task 5/7）：tailscale 段随四通道载荷透出，reach 随段
         tailscale: {
           enabled: false,
@@ -48,6 +70,8 @@ describe("remote api wrappers", () => {
           address: null,
           error: null,
           reach: { state: "unverified" },
+          configKey: "tailscale-config",
+          waiting: null,
         },
       },
       pin: "4827",
@@ -127,5 +151,33 @@ describe("remote api wrappers", () => {
     invokeMock.mockResolvedValueOnce(stepResult);
     expect(await remoteTsRunStep("funnel")).toEqual(stepResult);
     expect(invokeMock).toHaveBeenCalledWith("remote_ts_run_step", { step: "funnel" });
+  });
+
+  it("named 向导 API 只通过固定 Tauri 命令取状态、保存地址与只读验证", async () => {
+    const probe = {
+      configKey: "cfg-1",
+      hasToken: true,
+      enabled: true,
+      running: true,
+      connected: true,
+      originUrl: "http://127.0.0.1:9420",
+      address: "https://remote.example.com/m",
+      lastAddress: null,
+      reach: { state: "unverified" },
+      waiting: null,
+    };
+    invokeMock.mockResolvedValueOnce(probe);
+    expect(await remoteNamedProbe()).toEqual(probe);
+    expect(invokeMock).toHaveBeenLastCalledWith("remote_named_probe");
+
+    invokeMock.mockResolvedValueOnce(probe);
+    expect(await remoteNamedSetAddress("https://remote.example.com/m")).toEqual(probe);
+    expect(invokeMock).toHaveBeenLastCalledWith("remote_named_set_address", {
+      address: "https://remote.example.com/m",
+    });
+
+    invokeMock.mockResolvedValueOnce(probe);
+    expect(await remoteNamedVerify()).toEqual(probe);
+    expect(invokeMock).toHaveBeenLastCalledWith("remote_named_verify");
   });
 });

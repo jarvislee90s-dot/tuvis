@@ -10,6 +10,7 @@ pub mod content;
 pub mod events;
 pub mod files;
 pub mod gate;
+pub mod named;
 pub mod pairing;
 pub mod pin;
 pub mod power;
@@ -1195,6 +1196,7 @@ pub fn remote_status() -> serde_json::Value {
     // M5 A5：通道开关（read_channels 含惰性迁移）+ 隧道双通道快照 + tailscale 快照
     let chans = read_channels();
     let tun = tunnel::snapshot();
+    tailscale::observe_port(port);
     let ts = tailscale::ts_snapshot();
     // M5 A5：通道状态（形状契约见 channels_payload 注释）+ 当前访问密码
     // （gate 已保证本载荷只被本机/已过闸前端读到——pin 展示给设置页与看板持有者）
@@ -1208,6 +1210,23 @@ pub fn remote_status() -> serde_json::Value {
         &ts,
         tailscale::reachability(),
     );
+    // Named 通道的公网可用态由独立只读快照提供；remote_status 每 3 秒轮询时不做网络探测。
+    let named_probe = named::probe();
+    ch["named"]["connected"] = serde_json::json!(named_probe.connected);
+    ch["named"]["configKey"] = serde_json::json!(named_probe.config_key);
+    ch["named"]["reach"] = serde_json::to_value(&named_probe.reach)
+        .unwrap_or_else(|_| serde_json::json!({ "state": "unverified" }));
+    ch["named"]["waiting"] = named_probe.waiting.clone();
+    ch["named"]["address"] = named::available_address(&named_probe)
+        .map_or(serde_json::Value::Null, serde_json::Value::String);
+    // 只读内存快照：配置变更即使没有改变运行/可达性枚举，也能通知向导重探。
+    ch["tailscale"]["configKey"] = serde_json::json!(tailscale::config_key_snapshot());
+    // 与 named 同形状提供 Tailscale 连续等待起点；通道关闭时必须为 null。
+    ch["tailscale"]["waiting"] = if chans.tailscale {
+        tailscale::waiting_status()
+    } else {
+        serde_json::Value::Null
+    };
     // M5 P2-c：命名地址记忆/手填透出（named 卡片显示优先级：解析地址 > 手填 > 上次）
     ch["named"]["lastAddr"] = serde_json::json!(named_last_addr());
     st["channels"] = ch;
