@@ -180,7 +180,9 @@ describe("TailscaleWizard 步骤渲染与三态（§C2）", () => {
     );
     render(<TailscaleWizard />);
     await screen.findByRole("list", { name: "Setup steps" });
-    expect(stepRow("detect").getAttribute("data-done")).toBe("true");
+    // 慢机竞态防御（CI 2026-10-23 实测 flake）：list 在场时步骤行可能晚一拍才挂载
+    //（首行 querySelector 即 null）——首个行级断言用 waitFor 等待，其后各行必然已在场
+    await waitFor(() => expect(stepRow("detect").getAttribute("data-done")).toBe("true"));
     expect(
       screen.getByText("Tailscale was not detected. Continue below to download and install it.")
     ).toBeTruthy();
