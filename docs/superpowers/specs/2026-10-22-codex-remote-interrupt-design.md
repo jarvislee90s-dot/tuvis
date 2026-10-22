@@ -2,6 +2,7 @@
 
 > 日期：2026-10-22。
 > 状态：实现完成；macOS `26.1013.40934` 真机端到端验收通过（打断 → 回合终态 → 屏障释放 → 队列接力）。Windows 与其他 build 未实测，能力位保持关闭。
+> **build 登记面（2026-10-22 复探）**：Desktop 自动升级到 `26.1016.51333` 后按纪律重取证——方法表 / 版本协商 / 安全阀逐项零漂移，已与 40934 同面登记（证据：`docs/superpowers/reviews/2026-10-22-codex-app-51333-reprobe.md`）。
 > 分支：`codex/remote-interrupt-turn`；基线：`origin/main@6fb3868e`。
 > 依据：《Codex Desktop IPC 远程控制 · 需求说明书》（冻结设计，提交 `e39d7665`）§5 明列「interrupt / steer」**不在本 Spec 范围**，「这些能力可以在后续专项 Probe / Spec 中独立增加」——本文即该专项 Spec；同批 Probe 取证见 `docs/superpowers/reviews/2026-10-22-codex-interrupt-probe-results.md`。
 
@@ -54,7 +55,7 @@ Desktop 侧方法表（打包产物静态核对 + 真机探针）：
 
 ### 4.1 能力位与门控
 
-`CapabilitySet` 新增 `interrupt: bool`。`false` 的含义与其他能力位一致：**该 build 尚未活体验证，不表示协议实现不存在**。仅 macOS `26.1013.40934` 开启（真机证据见 Probe 记录）；Windows 4894 / 3656、macOS 31256 保持 false——「未经验证的 Desktop 版本或方法不得盲目启用对应能力」（冻结 spec §3.5）。
+`CapabilitySet` 新增 `interrupt: bool`。`false` 的含义与其他能力位一致：**该 build 尚未活体验证，不表示协议实现不存在**。macOS `26.1013.40934`（2026-10-21 取证）与 macOS `26.1016.51333`（2026-10-22 复探登记，静态证据零漂移）开启；Windows 4894 / 3656、macOS 31256 保持 false——「未经验证的 Desktop 版本或方法不得盲目启用对应能力」（冻结 spec §3.5）。
 
 未开启时端点返回 503 `capability_unavailable`，**零 IPC 写入**（有集成用例钉死）。
 
@@ -132,7 +133,7 @@ Codex APP 的「问题」是 `AgentMessage.questions[]` 形态（模型提问挂
 | 文件 | 改动 | 关键点 |
 | --- | --- | --- |
 | `codex_desktop_ipc/types.rs` | `CapabilitySet` 增 `interrupt: bool` | 语义同既有能力位：`false` = 未活体验证，**不代表协议不存在** |
-| `codex_desktop_ipc/profile.rs` | 方法表登记 `thread-follower-interrupt-turn`（基值 4）；仅 macOS `26.1013.40934` 置 `interrupt: true` | 其余 build 保持 false；不因单平台实测而跨 build 放行 |
+| `codex_desktop_ipc/profile.rs` | 方法表登记 `thread-follower-interrupt-turn`（基值 4）；macOS `26.1013.40934` 与 `26.1016.51333` 置 `interrupt: true` | 其余 build 保持 false；不因单平台实测而跨 build 放行 |
 | `codex_desktop_ipc/mirror.rs` | `turn_is_terminal` 增 `Some("interrupted")` | 与能力位同批的理由见 §6.1 |
 | `codex_desktop_ipc/adapter.rs` | 新增 `interrupt_turn()` | 能力门在**发帧之前**（未开启 → 零 IPC 写入）；`mode: "user-stop"`；`expectedTurnId` 始终带 |
 | `database/dao/codex_actions.rs` | 新增 `outstanding_native_turn_id_conn()` | 取 route=desktop_ipc ∧ state=accepted ∧ fence=1 ∧ turnId 非空 ∧ seq 最大的一条 |
