@@ -216,11 +216,45 @@ fn windows_4894_profile(build: &str) -> ProtocolProfile {
     }
 }
 
+/// Windows `26.1016.6573.0`（2026-10-22 真机取证批登记）：Desktop 自动升级后的**当前**
+/// build——四条证据齐备，逐条有真机依据：
+/// * **读链**：生产代码路径只读探测 P0–P3 全通过（`ensure_read_evidence` → 真实
+///   IPC：owner discovery → 临时 following → 首个 snapshot 判据）；
+/// * **send**：真机 send 闭环（`start_turn_compat` 走生产 adapter 路径，**只发一帧**）→
+///   回执 `Accepted`（674ms）+ 回执内 `turn.status="inProgress"`，事后核对**状态真的前进**
+///   （revision 前进 / 消息变多）——「受理 ≠ 生效」这条纪律在 send 上同样成立并已核对；
+/// * **command 审批**：真机 decision 闭环（`thread-follower-command-approval-decision`
+///   v1 / decision=accept → `resultType=success`、`result.ok=true`），脱敏夹具
+///   `observed/windows-6573-command-approval-accept.sanitized.json`；
+/// * **官方方法表**：`app.asar` 里 `thread-stream-state-changed:11` / `start-turn:2` /
+///   各 decision v1 与 `26.1013.4894.0` **逐项一致**（含
+///   `thread-follower-file-approval-decision:1`）→ 协议语法未漂移，4894 上的 decline 可用性
+///   可平移。
+///
+/// **保持关闭的位（如实）**：`permissions`（无 `item/permissions/requestApproval` 证据）、
+/// `blocking_input`（本 build 未实测 Plan 阻塞问答）、Plan / collaboration 模式切换。
+fn windows_6573_profile(build: &str) -> ProtocolProfile {
+    ProtocolProfile {
+        platform: "windows".to_string(),
+        build: build.to_string(),
+        capabilities: CapabilitySet {
+            send: true,
+            state: true,
+            command: true,
+            permissions: false,
+            blocking_input: false,
+        },
+        method_versions: method_table(),
+        evidence: EvidenceLevel::Shipped,
+    }
+}
+
 /// 精确 build 匹配（不是版本下限——升级后的 build 未经验证必须重新门控）。
 pub fn profile_for(platform: &str, build: &str) -> Option<ProtocolProfile> {
     match (platform, build) {
         ("windows", "26.1013.3656.0") => Some(windows_profile(build)),
         ("windows", "26.1013.4894.0") => Some(windows_4894_profile(build)),
+        ("windows", "26.1016.6573.0") => Some(windows_6573_profile(build)),
         ("macos", "26.1013.31256") => Some(macos_profile(build)),
         ("macos", "26.1013.40934") => Some(macos_40934_profile(build)),
         _ => None,
@@ -269,6 +303,18 @@ mod tests {
         assert!(!p4894.capabilities.permissions);
         // 未探测的相邻 build 仍然 fail-closed（精确门，不是版本下限）
         assert!(profile_for("windows", "26.1013.4895.0").is_none());
+        // 6573.0 = 2026-10-22 真机取证批登记（读链 P0–P3 + send 闭环 + command 审批
+        // 闭环 + 官方方法表与 4894 逐项一致）：caps 逐项钉死；permissions / blocking_input
+        // 无证据保持关
+        let p6573 = profile_for("windows", "26.1016.6573.0").expect("registered");
+        assert!(p6573.capabilities.send && p6573.capabilities.state);
+        assert!(p6573.capabilities.command);
+        assert!(!p6573.capabilities.permissions);
+        assert!(
+            !p6573.capabilities.blocking_input,
+            "6573 未实测 Plan 阻塞问答 → 保持关（如实）"
+        );
+        assert!(profile_for("windows", "26.1016.6573.1").is_none());
         assert!(profile_for("linux", "26.1013.31256").is_none());
         assert!(profile_for("macos", "").is_none());
         // 已验证 build 精确命中

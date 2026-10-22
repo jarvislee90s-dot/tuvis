@@ -79,3 +79,20 @@ macOS 金样 5 条事实**同构**（T2 逐项核对全 ✓，含 `tail:0:local:
    决策词以「字符串词」为准；`decline` 在 4894 真机已被接受并生效
    （`windows-4894-command-approval-decline.sanitized.json`）。
 
+
+## Windows 26.1016.6573.0 提升登记（2026-10-22 取证批，四条证据齐备）
+
+该 build 已于 2026-10-22 完成取证并**登记进 shipped 表**（`profile.rs` 的
+`windows_6573_profile`）：`state` / `send` / `command` = true；`permissions` /
+`blocking_input`（Plan 阻塞问答）/ Plan / collaboration 模式切换**保持关闭**（无证据）。
+
+| 证据 | 取得方式 | 落点 |
+| --- | --- | --- |
+| 读链 P0–P3 | 生产 adapter `ensure_read_evidence`（owner discovery → 临时 following → 首个 snapshot 判据）真机通过 | `tests/codex_ipc_live_probe.rs` |
+| **send 闭环** | 生产 adapter `start_turn_compat` **只发一帧** → 回执 `Accepted`（674ms）+ 回执内 `turn.status="inProgress"`，事后核对**状态真的前进** | `tests/codex_ipc_live_send.rs`（显式同意闸 + 事后核对「受理≠生效」） |
+| command 审批 decision 闭环 | `thread-follower-command-approval-decision` v1 / `decision=accept` → `resultType=success`、`result.ok=true` | `windows-6573-command-approval-accept.sanitized.json` |
+| 官方方法表 | `app.asar` 与 `26.1013.4894.0` 逐项一致（`state-changed:11` / `start-turn:2` / 各 decision v1） | 上节「官方方法表与 4894 完全一致」 |
+
+附带发现（如实登记）：本 build 的随包 CLI 是 **`0.163.0-alpha.11`**（4894 上是
+`0.163.0-alpha.10.2`）→ **CLI 随 Desktop 一起漂移**，这实证了账本键必须带 `cli_id`
+（只看 build 会把「同 build、不同 CLI」的证据混用）。

@@ -7,8 +7,10 @@
 ## 0. 结论
 
 **未知 build 的只读能力探测链路（P0–P3）在真实 Desktop 上用生产代码路径跑通**；
-官方 schema 探针也取到了本 build 的决策枚举与内容指纹。仍缺 **send（真发一条消息）** 的真机闭环，
-因此 `26.1016.6573.0` **暂不进入 shipped 表**。
+官方 schema 探针也取到了本 build 的决策枚举与内容指纹。随后补做了 **send 真机闭环**
+（只发一帧，回执 `Accepted` + 回执内 `turn.status="inProgress"`，事后核对状态真的前进），
+四条证据齐备 → **`26.1016.6573.0` 已登记进 shipped 表**（`state`/`send`/`command` = true；
+`permissions` / `blocking_input` / Plan / collaboration 无证据，保持关闭）。
 
 ## 1. 探测输出（原样）
 
@@ -60,11 +62,32 @@
 | 读链（P0–P3） | 真机只读探测通过（本次，生产代码路径） | ✅ 可提升 |
 | 官方 schema 枚举 | 真机 schema 探针（本次，含内容指纹） | ✅ 可提升 |
 | 命令审批 decision | 真机闭环（2026-10-21，accept，`result.ok=true`） | ✅ 可提升 |
-| **send（真发消息）** | **缺** | ❌ 未取证 |
+| **send（真发消息）** | 真机闭环：只发一帧 → `Accepted`（674ms）+ 回执内 `turn.status="inProgress"` + 状态真的前进 | ✅ 已取证 |
+| **unknown build 的审批决策闭环** | 真机：`thread-follower-command-approval-decision` v1 / `decision=accept` → `resultType=success`、`result.ok=true` | ✅ 已取证 |
 
-→ **建议**：等补一次 send 闭环后，把 `26.1016.6573.0` 写入 shipped 表
-（`state=true, command=true, send=true, permissions=false, blocking_input=false`），
-让该 build 走「已验证」路径而不是「未知 build 兼容路径」。
+→ **已办**：`26.1016.6573.0` 写入 shipped 表
+（`state=true, send=true, command=true, permissions=false, blocking_input=false`），
+该 build 走「已验证」路径，不再付「未知 build 探测 + 兼容发送开关」的代价；
+其余未取证 build 继续走未知 build 兼容路径（只读探测 → schema 审批 → 显式兼容发送）。
+
+## 3.1 send 闭环原始输出
+
+```json
+{
+  "platform": "windows",
+  "build": "26.1016.6573.0",
+  "delivery": "Accepted",
+  "accepted": true,
+  "elapsedMs": 674,
+  "revisionBefore": 24,
+  "messagesBefore": 26,
+  "stateAdvanced": true,
+  "textLen": 40
+}
+```
+
+回执原文（截取）：`result.turn = {id:"01a16194-…", status:"inProgress", itemsView:"notLoaded"}`
+——回合真的起来了；事后又核对到状态前进（revision/消息数），**不是**只有 `Accepted` 就报成功。
 
 ## 4. 复现
 
