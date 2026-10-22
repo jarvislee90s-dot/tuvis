@@ -29,6 +29,7 @@ impl ProtocolProfile {
                 command: false,
                 permissions: false,
                 blocking_input: false,
+                interrupt: false,
             },
             method_versions: method_table(),
         }
@@ -66,6 +67,11 @@ fn method_table() -> BTreeMap<String, u32> {
             1,
         ),
         ("thread-follower-submit-user-input".to_string(), 1),
+        // 打断桌面当前回合（2026-10-21 由 Desktop 侧方法表静态取证：方法名存在、
+        // 基值 4；params `{conversationId, mode, expectedTurnId}`；被打断的回合
+        // 状态置 `interrupted`）。**必须带 expectedTurnId**——Desktop 的版本协商
+        // 对「缺 expectedTurnId 的 interrupt」期望版本 3，带上则走基值 4。
+        ("thread-follower-interrupt-turn".to_string(), 4),
         // broadcast/信号面（接收为主）
         ("client-status-changed".to_string(), 0),
         ("ipc-connection-reset".to_string(), 1),
@@ -87,6 +93,7 @@ fn windows_profile(build: &str) -> ProtocolProfile {
             command: true,
             permissions: false,
             blocking_input: true,
+            interrupt: false,
         },
         method_versions: method_table(),
     }
@@ -104,17 +111,25 @@ fn macos_profile(build: &str) -> ProtocolProfile {
             command: false,
             permissions: true,
             blocking_input: false,
+            interrupt: false,
         },
         method_versions: method_table(),
     }
 }
 
-/// macOS `26.1013.40934`（2026-10-18 实机登记）：**只读方法 + start-turn v2 已受控
-/// harness 实证**（initialize/discovery/following/snapshot/load-complete-history 由
-/// 复审探针验证；start-turn 由实现侧探针实证——turn 成功创建 inProgress，23:58）。
-/// **permissions/command/blocking_input 在该 build 未实测，flag 保持 false**——
-/// 旧 build 的 PASS 不跨 build 迁移；审批/问答按证据逐项解锁。
-fn macos_40934_profile(build: &str) -> ProtocolProfile {
+/// macOS 登记档（interrupt 开）——三 build 能力面相同，共享构造器；逐 build 的
+/// 取证故事见 `profile_for` 各臂注释与对应 reprobe 文档。共性纪律：**审批/问答/
+/// permissions 未实测不跨 build 迁移**（旧 build 的 PASS 不自带）。
+///
+/// - `26.1013.40934`（2026-10-18 实机登记）：只读方法 + start-turn v2 受控 harness
+///   实证（initialize/discovery/following/snapshot/load-complete-history 复审探针
+///   验证；start-turn 实现侧探针实证——turn 成功创建 inProgress）。
+/// - **interrupt（2026-10-21 起，三 build 同契约）**：Desktop 侧方法表基值 4，
+///   params `{conversationId, mode, expectedTurnId}`，被打断回合置 `interrupted`；
+///   配合 `turn_is_terminal` 放行后「打断 → 终态 → 屏障释放 → 队列接力」闭环。
+/// - `26.1016.51333` / `26.1016.61520`（2026-10-22 两轮复探）：四项静态证据
+///   （方法表 / 版本协商 / interrupt handler / 安全阀）逐字符零漂移 + 活体探针同构。
+fn macos_interrupt_profile(build: &str) -> ProtocolProfile {
     ProtocolProfile {
         platform: "macos".to_string(),
         build: build.to_string(),
@@ -124,6 +139,7 @@ fn macos_40934_profile(build: &str) -> ProtocolProfile {
             command: false,
             permissions: false,
             blocking_input: false,
+            interrupt: true,
         },
         method_versions: method_table(),
     }
@@ -149,6 +165,7 @@ fn windows_4894_profile(build: &str) -> ProtocolProfile {
             command: true,
             permissions: false,
             blocking_input: true,
+            interrupt: false,
         },
         method_versions: method_table(),
     }
@@ -160,8 +177,46 @@ pub fn profile_for(platform: &str, build: &str) -> Option<ProtocolProfile> {
         ("windows", "26.1013.3656.0") => Some(windows_profile(build)),
         ("windows", "26.1013.4894.0") => Some(windows_4894_profile(build)),
         ("macos", "26.1013.31256") => Some(macos_profile(build)),
-        ("macos", "26.1013.40934") => Some(macos_40934_profile(build)),
+        // 40934：2026-10-18 实机登记 + 2026-10-21 interrupt 取证
+        //（docs/superpowers/reviews/2026-10-22-codex-interrupt-probe-results.md）
+        ("macos", "26.1013.40934") => Some(macos_interrupt_profile(build)),
+        // 51333：2026-10-22 复探零漂移（reviews/2026-10-22-codex-app-51333-reprobe.md）
+        ("macos", "26.1016.51333") => Some(macos_interrupt_profile(build)),
+        // 61520：2026-10-22 深夜复探零漂移（reviews/2026-10-22-codex-app-61520-reprobe.md）
+        ("macos", "26.1016.61520") => Some(macos_interrupt_profile(build)),
         _ => None,
+    }
+}
+
+/// 未知 build 的**兼容发送档**（2026-10-22 用户裁决「build 没对上时默认开会话
+/// 通道」）：send/state 开，破坏性能力（interrupt / command / permissions /
+/// blocking_input）仍走证据门控不随档放开。漂移兜底链：方法版本不匹配 →
+/// `request-version-mismatch` → NotSent 如实未送达；回合卡死 → 镜像可见 +
+/// 原生回合打断出口（B3）。登记 build 的证据门控不受影响——本档只接住
+/// `profile_for` 落空的未知 build；空 build（Desktop 身份读不出来）仍用 closed。
+pub fn compat_send_profile(platform: &str, build: &str) -> ProtocolProfile {
+    ProtocolProfile {
+        platform: platform.to_string(),
+        build: build.to_string(),
+        capabilities: CapabilitySet {
+            send: true,
+            state: true,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+            interrupt: false,
+        },
+        method_versions: method_table(),
+    }
+}
+
+/// 连接档位选择：登记 build → 证据档；未知 build（非空）→ 兼容发送档（用户
+/// 裁决，见 [`compat_send_profile`]）；空 build（身份读不出来/多义）→ closed。
+pub fn profile_for_or_compat(platform: &str, build: &str) -> ProtocolProfile {
+    match profile_for(platform, build) {
+        Some(p) => p,
+        None if !build.is_empty() => compat_send_profile(platform, build),
+        None => ProtocolProfile::closed(),
     }
 }
 
@@ -188,6 +243,36 @@ mod tests {
         );
     }
 
+    /// 打断桌面当前回合（2026-10-21）：方法已登记且版本与 Desktop 侧方法表一致
+    /// （基值 4）；能力位**按 build 逐个门控**——未实测的 build 不开。
+    #[test]
+    fn interrupt_turn_registered_v4_and_capability_gated_per_build() {
+        // 方法已登记：本地 follower 请求（envelope 不发 hostId）→ 基值 4
+        let mac = profile_for("macos", "26.1013.40934").unwrap();
+        assert_eq!(
+            mac.version("thread-follower-interrupt-turn", None).unwrap(),
+            4,
+            "打断方法版本与 Desktop 侧方法表基值一致"
+        );
+        assert!(mac.capabilities.interrupt, "40934 build 已开启打断能力");
+        // 未实测的 build 一律不开（不盲发）
+        let mac_old = profile_for("macos", "26.1013.31256").unwrap();
+        assert!(!mac_old.capabilities.interrupt);
+        let win = profile_for("windows", "26.1013.4894.0").unwrap();
+        assert!(!win.capabilities.interrupt);
+        let win_base = profile_for("windows", "26.1013.3656.0").unwrap();
+        assert!(!win_base.capabilities.interrupt);
+        // closed profile：能力全关但方法表仍在（只读同步不受影响）
+        let closed = ProtocolProfile::closed();
+        assert!(!closed.capabilities.interrupt);
+        assert_eq!(
+            closed
+                .version("thread-follower-interrupt-turn", None)
+                .unwrap(),
+            4
+        );
+    }
+
     #[test]
     fn unverified_or_unknown_builds_are_none() {
         assert!(profile_for("macos", "26.1013.31257").is_none());
@@ -198,6 +283,25 @@ mod tests {
         assert!(!p.capabilities.permissions);
         assert!(!p.capabilities.command);
         assert!(!p.capabilities.blocking_input);
+        // 51333 = 2026-10-22 复探登记（方法表/协商/安全阀零漂移，见
+        // docs/superpowers/reviews/2026-10-22-codex-app-51333-reprobe.md）：
+        // caps 与 40934 同面；相邻 build 仍 fail-closed
+        let p51333 = profile_for("macos", "26.1016.51333").expect("registered");
+        assert!(p51333.capabilities.send && p51333.capabilities.state);
+        assert!(p51333.capabilities.interrupt);
+        assert!(!p51333.capabilities.permissions);
+        assert!(!p51333.capabilities.command);
+        assert!(!p51333.capabilities.blocking_input);
+        assert!(profile_for("macos", "26.1016.51334").is_none());
+        // 61520 = 2026-10-22 深夜复探登记（当日第二次自动升级，零漂移，
+        // 见 docs/superpowers/reviews/2026-10-22-codex-app-61520-reprobe.md）
+        let p61520 = profile_for("macos", "26.1016.61520").expect("registered");
+        assert!(p61520.capabilities.send && p61520.capabilities.state);
+        assert!(p61520.capabilities.interrupt);
+        assert!(!p61520.capabilities.permissions);
+        assert!(!p61520.capabilities.command);
+        assert!(!p61520.capabilities.blocking_input);
+        assert!(profile_for("macos", "26.1016.61521").is_none());
         assert!(profile_for("windows", "26.1013.3655.0").is_none());
         // 4894.0 = 2026-10-19 真机探测批登记（T1/T4/T6/T8/T9 PASS + T2 同构；证据 =
         // observed/windows-4894-*.sanitized.json）：caps 逐项钉死，permissions 无证据保持关
@@ -212,6 +316,31 @@ mod tests {
         // 已验证 build 精确命中
         assert!(profile_for("macos", "26.1013.31256").is_some());
         assert!(profile_for("windows", "26.1013.3656.0").is_some());
+    }
+
+    /// 未知 build 兜底档（2026-10-22 用户裁决「build 没对上默认开会话通道」）：
+    /// 未知 build → 兼容发送档（send/state 开，破坏性能力保持证据门关）；
+    /// 空 build（身份读不出来/多义）→ closed；登记 build → 证据档原样。
+    #[test]
+    fn profile_for_or_compat_unknown_build_defaults_compat_send() {
+        let p = profile_for_or_compat("macos", "26.1016.99999");
+        assert!(
+            p.capabilities.send && p.capabilities.state,
+            "会话通道默认开"
+        );
+        assert!(!p.capabilities.interrupt, "破坏性能力不随档放开");
+        assert!(!p.capabilities.command && !p.capabilities.permissions);
+        assert!(!p.capabilities.blocking_input);
+        assert_eq!(p.build, "26.1016.99999", "build 原样保留（归因/缓存键）");
+        let w = profile_for_or_compat("windows", "26.1020.7000.0");
+        assert!(w.capabilities.send && w.capabilities.state);
+        assert!(!w.capabilities.interrupt);
+        // 空 build（desktop_build 多义/读不出）→ closed 保守不变
+        let empty = profile_for_or_compat("macos", "");
+        assert!(!empty.capabilities.send, "空 build 仍 closed");
+        // 登记 build → 证据档原样（不打折）
+        let reg = profile_for_or_compat("macos", "26.1016.61520");
+        assert!(reg.capabilities.interrupt, "登记 build 能力面原样");
     }
 
     #[test]
@@ -233,11 +362,13 @@ mod tests {
             11
         );
         assert_eq!(p.version("client-status-changed", None).unwrap(), 0);
-        // 未登记方法拒绝，不盲发
+        // 未登记方法拒绝，不盲发。
+        // （反例名用**确实不存在**的方法——`thread-follower-interrupt-turn` 已于
+        //  2026-10-21 登记为打断方法（基值 4），不能再当未登记反例。）
         assert_eq!(
-            p.version("thread-follower-interrupt-turn", None),
+            p.version("thread-follower-not-a-real-method", None),
             Err(ProtocolError::UnsupportedMethod(
-                "thread-follower-interrupt-turn".to_string()
+                "thread-follower-not-a-real-method".to_string()
             ))
         );
     }

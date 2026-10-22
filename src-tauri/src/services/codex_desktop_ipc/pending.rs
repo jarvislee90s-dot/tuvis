@@ -295,6 +295,7 @@ mod tests {
             command: true,
             permissions: true,
             blocking_input: true,
+            interrupt: false,
         }
     }
 

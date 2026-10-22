@@ -30,6 +30,10 @@ _Only versions translated so far are listed here; the full history lives in the
 - **macOS Tailscale installation**: the install action opens the system installer and rechecks status when Tuvis regains focus. Cancellation stays incomplete; installer failures retain exit codes and stdout/stderr instead of showing a blank error.
 - **Re-verification process hint**: while the automatic re-check runs after a channel is re-enabled, the summary shows a spinner with the expected timing (usually within a minute); it clears itself once verification passes, letting users tell normal waiting from a fault.
 
+### Added
+
+- **Stop the Codex desktop turn from the phone**: while a desktop turn keeps running, the mobile outgoing-queue panel gains a "Stop the desktop turn & continue" action — it interrupts the turn currently running in desktop Codex, and **work that turn has not finished is lost** (the confirmation says so before anything is sent); once the turn stops, the queue continues on its own. Verified on macOS `26.1013.40934`; other Desktop builds are unverified and stay disabled.
+
 ## [0.6.0] - 2026-10-21
 
 ### Added

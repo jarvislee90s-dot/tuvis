@@ -129,7 +129,8 @@ enum InflightState {
 struct AdapterInner {
     connector: Arc<dyn Connector>,
     /// 当前连接的 profile（R3：动态）。初始为构造入参（首个连接前的基线）；
-    /// 每次连接按 endpoint build 重算（未知 build/无 endpoint → `closed()`）。
+    /// 每次连接按 endpoint build 重算（登记 build → 证据档；未知 build → 兼容
+    /// 发送档；空 build/无 endpoint → `closed()`）。
     /// 同步短临界区读写，绝不跨 await 持有、不与其他锁嵌套。
     profile: std::sync::Mutex<ProtocolProfile>,
     conn: Mutex<Option<ConnectionHandle>>,
@@ -265,12 +266,12 @@ impl DesktopIpcAdapter {
                 return Err(e);
             }
         };
-        // endpoint → profile（R3：精确 build 匹配；未知 build → closed，A 写全关）
-        let profile = super::profile::profile_for(
+        // endpoint → profile（R3：登记 build → 证据档；未知 build → 兼容发送档
+        // （send/state 开，2026-10-22 用户裁决）；空 build/无 endpoint → closed）
+        let profile = super::profile::profile_for_or_compat(
             &endpoint.platform,
             endpoint.build.as_deref().unwrap_or(""),
-        )
-        .unwrap_or_else(ProtocolProfile::closed);
+        );
         // 双检：另一任务可能已重连（持 conn 锁期间不做其他锁操作）
         let (conn, epoch) = {
             let mut guard = self.inner.conn.lock().await;
@@ -335,6 +336,15 @@ impl DesktopIpcAdapter {
             .get(key)
             .filter(|m| !m.is_stale() && m.revision().is_some())
             .map(|m| m.project(self.current_caps()))
+    }
+
+    /// 当前镜像里处于 `inProgress` 的活动回合 id（2026-10-22 原生回合打断扩展）：
+    /// 端点打断阀值的回退来源——在册屏障不存在（回合由桌面手打产生）时，用它
+    /// 定位目标。无镜像 / stale / 无活动回合 → None——端点据此如实拒绝，不盲发
+    /// （P1-1 纪律不变：有阀值才发，只是阀值来源多一级）。
+    pub async fn mirror_active_turn_id(&self, key: &ThreadKey) -> Option<String> {
+        let mirrors = self.inner.mirrors.lock().await;
+        mirrors.get(key).and_then(|m| m.active_turn_id())
     }
 
     /// 恢复任务的 follow 统一入口（第三轮复审 B3）：**前置核验**仍有关注（已卸载
@@ -700,6 +710,77 @@ impl DesktopIpcAdapter {
         });
         self.dispatch(
             "thread-follower-start-turn",
+            version,
+            params,
+            lease,
+            validity,
+        )
+        .await
+    }
+
+    /// 打断桌面当前回合（`thread-follower-interrupt-turn` v4，2026-10-21 新增）。
+    ///
+    /// 协议契约（由 Desktop 打包产物静态取证：`app.asar` 方法表 + handler + 打断
+    /// 状态机）：
+    /// - method `thread-follower-interrupt-turn`，基值版本 **4**；
+    /// - params `{conversationId, mode, expectedTurnId}`；`mode` 取 `user-stop`
+    ///   （等价用户手动按 Stop）或 `system`；`expectedTurnId` 是**安全阀**——与
+    ///   当前活动回合不一致时 Desktop 静默不动作（不误伤别的回合）；
+    /// - 返回 `{interruptedTurnId, ok}`（`goalPauseError` 只在 mode=user-stop 且
+    ///   goal 暂停失败时出现，且仍带 interruptedTurnId）。
+    ///
+    /// 版本纪律：Desktop 侧版本协商对「params 缺 `expectedTurnId` 的 interrupt」
+    /// 期望版本 **3**、带上则期望基值 **4**。本实现**始终带上 expectedTurnId**
+    /// （缺省由调用方给出在册屏障绑定的 turnId），故固定走基值 4。
+    ///
+    /// **安全阀硬门（2026-10-22 复审 P1-1）**：`expected_turn_id == None` →
+    /// `not_sent("expected_turn_missing")`，**零 IPC 写入**。缺该参数的 interrupt
+    /// Desktop 照收不误（期望版本还会回落 3），等于无阀打断当前活动回合——含用户
+    /// 在桌面手开的、与队列无关的回合。阀值必须由调用方（端点）取到：请求显式
+    /// 携带，或从在册原生屏障绑定 turnId 读出；两路都取不到就拒发，不做回退。
+    ///
+    /// 打断后 Desktop 把该回合 status 置 `interrupted`——镜像终态门已认该状态
+    /// （`mirror.rs turn_is_terminal`），屏障随之释放、队列接力下一条。
+    pub async fn interrupt_turn(
+        &self,
+        key: &ThreadKey,
+        expected_turn_id: Option<&str>,
+    ) -> RpcOutcome {
+        let envelope_id = super::types::new_uuid();
+        if !self.current_caps().interrupt {
+            return not_sent(&envelope_id, "capability_unavailable");
+        }
+        // 安全阀硬门（复审 P1-1）：无阀值一律拒发、零 IPC 写入（理由见函数注释）。
+        let Some(expected_turn_id) = expected_turn_id else {
+            return not_sent(&envelope_id, "expected_turn_missing");
+        };
+        let (lease, validity) = {
+            let owners = self.inner.owners.lock().await;
+            match current_lease(&owners, key) {
+                Some(l) => {
+                    let v = owners.validity(&l);
+                    (l, v)
+                }
+                None => return not_sent(&envelope_id, "stale_context"),
+            }
+        };
+        let version = {
+            let conn = self.inner.conn.lock().await;
+            match conn
+                .as_ref()
+                .map(|c| c.version_of("thread-follower-interrupt-turn"))
+            {
+                Some(Ok(v)) => v,
+                _ => return not_sent(&envelope_id, "disconnected"),
+            }
+        };
+        let params = json!({
+            "conversationId": key.thread_id,
+            "mode": "user-stop",
+            "expectedTurnId": expected_turn_id,
+        });
+        self.dispatch(
+            "thread-follower-interrupt-turn",
             version,
             params,
             lease,

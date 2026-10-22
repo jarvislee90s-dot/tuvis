@@ -421,6 +421,7 @@ fn projection_with_rev(thread_id: &str, status: &str, revision: u64) -> ThreadPr
             command: false,
             permissions: false,
             blocking_input: false,
+            interrupt: false,
         },
         runtime_status: status.to_string(),
         content_state: ContentState::Ready,

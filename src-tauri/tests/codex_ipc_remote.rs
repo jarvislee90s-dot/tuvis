@@ -109,6 +109,23 @@ impl StaticConnector {
             io: StdMutex::new(Some(io)),
         }
     }
+
+    /// 打断能力 fixture 用：自报**已开启 `interrupt` 的**已验证 build
+    /// （macOS `26.1013.40934`——2026-10-21 真机协议取证：直连真实 Desktop 的
+    /// `thread-follower-interrupt-turn` v4，回包 `{interruptedTurnId:null, ok:true}`
+    /// 且安全阀生效未打断任何回合 → 方法名/版本/参数形态/owner 路由全对）。
+    /// 能力由生产 `profile_for(platform, build)` 派生，**不注入固定 profile**。
+    fn new_interrupt(io: Box<dyn IpcIo>) -> Self {
+        Self {
+            endpoint:
+                multi_agents_manager_lib::services::codex_desktop_ipc::transport::DesktopEndpoint {
+                    platform: "macos".into(),
+                    path: "/tmp/codex-ipc-test-fixture.sock".into(),
+                    build: Some("26.1013.40934".into()),
+                },
+            io: StdMutex::new(Some(io)),
+        }
+    }
 }
 
 impl Connector for StaticConnector {
@@ -214,6 +231,14 @@ async fn peer_has_traffic(peer: &mut ScriptedPeer) -> bool {
     )
 }
 
+/// 有界收帧（打断端点用例专用）：端点若因能力门/上下文拒发则**不会出帧**——
+/// 裸 `recv()` 会永久挂住整个测试二进制，这里给上限，超时即失败（不掩盖问题）。
+async fn recv_within(peer: &mut ScriptedPeer, secs: u64) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(secs), peer.recv())
+        .await
+        .expect("打断端点未在时限内发出 IPC 帧（应发帧或明确拒发）")
+}
+
 // ============================================================
 // RemoteState fixture
 // ============================================================
@@ -313,6 +338,22 @@ fn fixture_ipc(sessions: Vec<Session>) -> Fixture {
     let (io, peer) = ScriptedPeer::new();
     let adapter = Arc::new(DesktopIpcAdapter::new(
         Arc::new(StaticConnector::new(io)),
+        caps_open_profile(),
+    ));
+    fixture_with(
+        sessions,
+        move |store| Arc::new(CodexControlHub::with_adapter(store, adapter, true)),
+        Some(peer),
+    )
+}
+
+/// 打断能力开启的 fixture（2026-10-21 新增能力位 `interrupt`——能力由 endpoint
+/// 自报 build 派生，故此处假 Desktop 自报已开启打断的 macOS build；未开启的 build
+/// 上打断端点必须 503 拒发）。
+fn fixture_ipc_interrupt(sessions: Vec<Session>) -> Fixture {
+    let (io, peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(StaticConnector::new_interrupt(io)),
         caps_open_profile(),
     ));
     fixture_with(
@@ -1706,6 +1747,10 @@ async fn queue_view_and_retract_auth_matrix() {
     let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
     assert_eq!(v["actions"], serde_json::json!([]));
     assert!(v["blockedReasonCode"].is_null());
+    assert_eq!(
+        v["canInterrupt"], false,
+        "未开启 interrupt 的 build：队列视图 canInterrupt 必须 false（按钮源头隐藏，复审 P2-2）"
+    );
 }
 
 /// 撤回：本设备 queued 可撤（cancelled 视图 + 墓碑）；他人 404；已派发 409；
@@ -5328,4 +5373,663 @@ async fn thread_messages_empty_history_ends_and_missing_cursor_is_explicit() {
     assert_eq!(page["status"], "unavailable");
     assert_eq!(page["reasonCode"], "generation_mismatch");
     f.state.codex_control.adapter.shutdown().await;
+}
+
+// ============================================================
+// 打断桌面当前回合（2026-10-21 新增端点）
+// ============================================================
+
+/// 打断端点：POST /codex/turn/interrupt → `thread-follower-interrupt-turn` **v4**
+/// 帧（params：`conversationId` + `mode=user-stop` + `expectedTurnId` 安全阀）→
+/// Desktop 回执 `{interruptedTurnId, ok}` → 200 如实回传打断结果。
+#[tokio::test]
+async fn interrupt_turn_sends_follower_interrupt_v4_with_expected_turn_id() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    // 先 ensure（取得 owner lease + 镜像）；runtime=active = 桌面回合正在跑
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "active").await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("ensure in time")
+        .unwrap();
+
+    let body = serde_json::json!({ "sessionId": THREAD, "turnId": "t-live" });
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body.to_string()),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 10).await;
+    assert_eq!(frame["method"], "thread-follower-interrupt-turn");
+    assert_eq!(frame["version"], 4, "打断方法版本 = Desktop 侧方法表基值");
+    assert_eq!(frame["params"]["conversationId"], THREAD);
+    assert_eq!(frame["params"]["mode"], "user-stop");
+    assert_eq!(
+        frame["params"]["expectedTurnId"], "t-live",
+        "expectedTurnId 安全阀必须带上（缺失时 Desktop 期望版本 3 而非 4）"
+    );
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": "t-live", "ok": true }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("interrupt in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(
+        v["uncertain"], false,
+        "明确受理（复审 P2-3）不得带不确定标记"
+    );
+    assert_eq!(v["interruptedTurnId"], "t-live");
+    assert_eq!(v["expectedTurnId"], "t-live");
+    // 破坏性动作必须留审计（result 词与回执对应：interruptedTurnId 有值 → interrupted）
+    let audits = f.codex_audits();
+    assert!(
+        audits
+            .iter()
+            .any(|a| a.action == "codex_interrupt" && a.result == "interrupted"),
+        "打断动作必须进审计且 result 词 = interrupted，实际：{:?}",
+        audits
+    );
+}
+
+/// 桌面侧无可打断回合（回执 interruptedTurnId=null）→ 200 如实回 null，
+/// **不谎报打断成功**、也不当作错误。请求**显式带 turnId**（复审 P1-1：无 turnId
+/// 且无在册屏障 → 409 拒发，走不到这一臂——见 refused_without_valve 用例）。
+#[tokio::test]
+async fn interrupt_turn_reports_no_active_turn_without_faking_success() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("ensure in time")
+        .unwrap();
+
+    let body = serde_json::json!({ "sessionId": THREAD, "turnId": "t-gone" });
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body.to_string()),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 10).await;
+    assert_eq!(frame["method"], "thread-follower-interrupt-turn");
+    assert_eq!(frame["version"], 4, "打断方法版本 = Desktop 侧方法表基值");
+    assert_eq!(frame["params"]["expectedTurnId"], "t-gone", "阀值照带");
+    assert_eq!(frame["params"]["mode"], "user-stop");
+    assert_eq!(frame["params"]["conversationId"], THREAD);
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": null, "ok": true }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("interrupt in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["ok"], true, "回合已结束不是错误，如实回 null 不谎报成功");
+    assert_eq!(
+        v["uncertain"], false,
+        "明确受理（复审 P2-3）不得带不确定标记"
+    );
+    assert_eq!(v["interruptedTurnId"], serde_json::Value::Null);
+    assert_eq!(v["expectedTurnId"], "t-gone");
+}
+
+/// 复审 P1-1 无阀拒发：请求不带 turnId 且在册原生屏障查无绑定 turnId（测试库
+/// 为空 → DAO 返回 Ok(None)）→ 409 `no_expected_turn`、**零 IPC 帧**、审计留
+/// `refused:no_expected_turn`（复审 P3-1 全臂审计）。即便 owner lease 新鲜可用
+/// （ensure 已取）也照样拒——拒发发生在 HTTP 层，先于 adapter，绝不降级为
+/// 无阀打断「当前活动回合」（那会误伤用户在桌面手开的回合）。
+#[tokio::test]
+async fn interrupt_turn_refused_without_valve_zero_ipc_write() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    // ensure 取 lease：证明上下文可用不是豁免理由，无阀两路（请求未带 / 屏障
+    // 查无）在 HTTP 层就被拒，走不到 adapter。
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "active").await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("ensure in time")
+        .unwrap();
+
+    // 只带 sessionId（测试库无在册屏障）
+    let body = serde_json::json!({ "sessionId": THREAD }).to_string();
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 409, "无阀拒发 → 409（复审 P1-1）");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "no_expected_turn");
+    assert!(
+        v["reason"].as_str().is_some_and(|s| !s.is_empty()),
+        "拒绝必须带中文可读 reason"
+    );
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "无阀拒发零 IPC 帧（不得裸发无 expectedTurnId 的打断）"
+    );
+    let audits = f.codex_audits();
+    assert!(
+        audits
+            .iter()
+            .any(|a| a.action == "codex_interrupt" && a.result == "refused:no_expected_turn"),
+        "拒发臂必须留审计（全臂审计 P3-1），实际：{:?}",
+        audits
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 复审 P2-1/P2-2 真实失败臂：目标 thread 无 owner lease → adapter
+/// `current_lease` 为 None → `not_sent("stale_context")` → 409（状态冲突，不是
+/// 503）、**零 IPC 帧**、审计留 `refused:stale_context`（拒绝臂同样留痕）。
+///
+/// 编排：只 ensure「另一个」会话的 thread——adapter 因此已连接（能力位按 endpoint
+/// 重算为 interrupt-on），目标 THREAD 从未被 ensure、无 lease。不能「完全不做
+/// ensure」：构造期基线 profile（windows build）无 interrupt 能力位，会在 lease
+/// 门之前先撞 503 capability_unavailable（能力位在首个连接时才按 endpoint 重算）。
+#[tokio::test]
+async fn interrupt_turn_stale_context_maps_conflict_without_sending() {
+    let other = "99994444-ffff-4222-8333-444455556666";
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD), codex_app_session(other)]);
+    let mut peer = f.peer.take().unwrap();
+    // 只 ensure other：连接建立 + interrupt 能力位就位；THREAD 保持无 lease
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={other}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, other, vec![], "active").await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("ensure in time")
+        .unwrap();
+
+    // 打断目标 = 从未 ensure 的 THREAD：session/thread 解析走 rollout 兜底（UUID
+    // 会话号），不依赖 ensure；expectedTurnId 已带 → 撞的是 lease 门
+    let body = serde_json::json!({ "sessionId": THREAD, "turnId": "t-any" }).to_string();
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        409,
+        "stale_context 是状态冲突 → 409（复审 P2-2，不是 503）"
+    );
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "stale_context");
+    assert!(
+        v["reason"].as_str().is_some_and(|s| !s.is_empty()),
+        "NotSent 拒绝必须带中文可读 reason（不裸示机器码）"
+    );
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "NotSent = 写尝试开始前即失败：零 IPC 帧"
+    );
+    let audits = f.codex_audits();
+    assert!(
+        audits
+            .iter()
+            .any(|a| a.action == "codex_interrupt" && a.result == "refused:stale_context"),
+        "拒绝臂必须留审计（result 词 refused:<reason>），实际：{:?}",
+        audits
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 复审 P3-2：请求体 `deny_unknown_fields`——任何多余键（如 `ownerClientId`）
+/// → 400，HTTP 层不得出现 IPC owner 参数；拒绝发生在解析期，零 IPC 帧。
+#[tokio::test]
+async fn interrupt_turn_rejects_unknown_fields_with_400() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let body = serde_json::json!({
+        "sessionId": THREAD, "turnId": "t-any", "ownerClientId": "spoof"
+    })
+    .to_string();
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "多余键必须 400（deny_unknown_fields）");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "bad_request");
+    assert!(!peer_has_traffic(&mut peer).await, "解析期拒绝：零 IPC 帧");
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// P2-3 明确拒绝臂：Desktop 回错误回执（resultType=error，如 goalPauseError）
+/// → `Delivery::Rejected` → 409 `desktop_rejected`——服务本身可用，语义是状态
+/// 冲突而非「服务不可用」（不是 503）；拒绝必须带中文 reason，审计留
+/// `rejected`（全臂审计 P3-1）。
+#[tokio::test]
+async fn interrupt_turn_rejected_maps_conflict() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "active").await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("ensure in time")
+        .unwrap();
+
+    let body = serde_json::json!({ "sessionId": THREAD, "turnId": "t-live" });
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body.to_string()),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 10).await;
+    assert_eq!(frame["method"], "thread-follower-interrupt-turn");
+    // Desktop 明确拒绝：错误回执（无需超时编排，回执直达）
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "error", "method": "thread-follower-interrupt-turn",
+        "error": { "code": "goalPauseError", "message": "goal pause failed" }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("interrupt in time")
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        409,
+        "Desktop 明确拒绝 → 409 状态冲突（不是 503）"
+    );
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "desktop_rejected");
+    assert!(
+        v["reason"].as_str().is_some_and(|s| !s.is_empty()),
+        "拒绝必须带中文可读 reason"
+    );
+    let audits = f.codex_audits();
+    assert!(
+        audits
+            .iter()
+            .any(|a| a.action == "codex_interrupt" && a.result == "rejected"),
+        "明确拒绝臂必须留审计（result 词 rejected），实际：{:?}",
+        audits
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// P2-3 不确定臂：Desktop 收帧后**保持沉默** → 端点等满 RPC_TIMEOUT
+/// （connection.rs 15s）→ `Delivery::UnknownDelivery` → 200 + `uncertain:true`
+/// （帧已交 writer，打断**可能已生效**——绝不报「停止失败」诱导用户立刻重按，
+/// 重按 = 双发破坏性指令）+ `reasonCode:"timeout"`；审计留 `uncertain:timeout`。
+/// 耗时 ~15s 是测试代价；pending 条目由超时路径清理，无需额外收尾。
+#[tokio::test]
+async fn interrupt_turn_timeout_reports_uncertain_not_failure() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "active").await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("ensure in time")
+        .unwrap();
+
+    let body = serde_json::json!({ "sessionId": THREAD, "turnId": "t-live" });
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body.to_string()),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 10).await;
+    assert_eq!(frame["method"], "thread-follower-interrupt-turn");
+    // 刻意不回包：桌面沉默 → RPC 超时（15s）；外层 30s 留 2 倍余量
+    let r = tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("interrupt in time")
+        .unwrap();
+    assert_eq!(r.status(), 200, "结果未知不是失败：200 如实回 uncertain");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(
+        v["uncertain"], true,
+        "超时 = 打断可能已生效，必须 uncertain:true"
+    );
+    assert_eq!(v["interruptedTurnId"], serde_json::Value::Null);
+    assert_eq!(v["reasonCode"], "timeout");
+    assert_eq!(v["expectedTurnId"], "t-live");
+    let audits = f.codex_audits();
+    assert!(
+        audits
+            .iter()
+            .any(|a| a.action == "codex_interrupt" && a.result == "uncertain:timeout"),
+        "不确定臂必须留审计（result 词 uncertain:<reason>），实际：{:?}",
+        audits
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 复审 P2-2：`canInterrupt` 能力位随队列视图下发（codex/queue 从
+/// `adapter.capabilities().interrupt` 填充）。已开启打断的 build 上必须为
+/// true——若填充被删（`#[serde(default)]` → 恒 false），前端打断按钮会全局
+/// 静默消失，本用例变红。
+#[tokio::test]
+async fn queue_view_surfaces_can_interrupt_on_interrupt_capable_build() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    // ensure 建立连接：能力位按 endpoint（已开启打断的 build）重算后可读
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "active").await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("ensure in time")
+        .unwrap();
+
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/queue?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(
+        v["canInterrupt"], true,
+        "interrupt 能力开的 build：队列视图必须携带 canInterrupt=true"
+    );
+    f.state.codex_control.adapter.shutdown().await;
+}
+
+/// 能力门：该 Desktop build 未开启 `interrupt` → 503 拒发，**零 IPC 写入**。
+#[tokio::test]
+async fn interrupt_turn_refused_when_capability_not_enabled() {
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "active").await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("ensure in time")
+        .unwrap();
+
+    // 复审 P1-1 后：无 turnId 的请求在 HTTP 层就被 409 no_expected_turn 拒掉、
+    // 到不了能力门——要钉「能力未开启」语义，请求必须带 turnId 走到 adapter。
+    let body = serde_json::json!({ "sessionId": THREAD, "turnId": "t-any" }).to_string();
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 503, "能力未开启 → 503 拒发");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "capability_unavailable");
+    assert!(
+        v["reason"].as_str().is_some_and(|s| !s.is_empty()),
+        "拒绝必须带中文可读 reason（复审 P2-2）"
+    );
+    assert!(
+        !peer_has_traffic(&mut peer).await,
+        "能力未开启时零 IPC 写入（不盲发未验证方法）"
+    );
+}
+
+/// 原生回合打断扩展（2026-10-22 B3）：回合由桌面手打产生（无在册屏障）但镜像里
+/// 有 inProgress 回合 → ① 队列视图给 native_turn_active + canInterrupt；② 请求
+/// 不带 turnId → 阀值回退 = 镜像活动回合 id（帧恒带 expectedTurnId，P1-1 纪律
+/// 不破）；桌面确认 → 200 interrupted + 审计。诚实边界（镜像无活动回合 → 409
+/// 零帧）由 refused_without_valve 用例既有覆盖（其 seed 快照无 inProgress 回合）。
+#[tokio::test]
+async fn interrupt_turn_falls_back_to_mirror_active_turn_for_native() {
+    let mut f = fixture_ipc_interrupt(vec![codex_app_session(THREAD)]);
+    let mut peer = f.peer.take().unwrap();
+
+    // ensure（seed：t1 completed，无屏障动作）→ 原生活动回合快照（rev 8 > 基线 7）
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "GET",
+            &format!("/m/api/v1/codex/thread?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "active").await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("ensure in time")
+        .unwrap();
+    peer.send(&serde_json::json!({
+        "type": "broadcast", "method": "thread-stream-state-changed", "version": 11,
+        "sourceClientId": "owner-1",
+        "params": {
+            "conversationId": THREAD, "hostId": "local",
+            "change": {
+                "type": "snapshot", "revision": 8,
+                "conversationState": {
+                    "turns": [], "requests": [],
+                    "threadRuntimeStatus": { "type": "active" },
+                    "turnHistory": codex_fixture::canonical_turn_history(serde_json::json!({
+                            "t1": { "id": "t1", "type": "turn", "status": "completed", "items": ["u1"] },
+                            "u1": { "id": "u1", "type": "user_message", "text": "seed", "ts": 1 },
+                            "t-native": { "id": "t-native", "type": "turn", "status": "inProgress", "items": ["u2"] },
+                            "u2": { "id": "u2", "type": "user_message", "text": "桌面手打的回合", "ts": 2 }
+                        }), serde_json::json!([{ "entries": ["t1"] }, { "entries": ["t-native"] }]))
+                }
+            }
+        }
+    }))
+    .await;
+
+    // ① 队列视图：无屏障 + 镜像活动原生回合 → native_turn_active + canInterrupt。
+    //    快照广播经连接转发任务异步入镜像，轮询等待对账窗口。
+    let mut saw_code = false;
+    for _ in 0..40 {
+        let r = f
+            .app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/m/api/v1/codex/queue?session_id={THREAD}"),
+                Some(COOKIE),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        if v["blockedReasonCode"] == "native_turn_active" {
+            assert_eq!(v["canInterrupt"], true, "interrupt 能力 build → 可打断");
+            saw_code = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        saw_code,
+        "快照应在对账窗口内使队列视图给出 native_turn_active"
+    );
+
+    // ② 不带 turnId 的打断：阀值回退 = 镜像活动回合（帧恒带 expectedTurnId）
+    let body = serde_json::json!({ "sessionId": THREAD }).to_string();
+    let app = f.app.clone();
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/codex/turn/interrupt",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    let frame = recv_within(&mut peer, 10).await;
+    assert_eq!(frame["method"], "thread-follower-interrupt-turn");
+    assert_eq!(frame["version"], 4);
+    assert_eq!(
+        frame["params"]["expectedTurnId"], "t-native",
+        "阀值回退：在册屏障不存在 → 用镜像活动回合 id"
+    );
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-interrupt-turn",
+        "result": { "interruptedTurnId": "t-native", "ok": true }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("interrupt in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["interruptedTurnId"], "t-native");
+    let audits = f.codex_audits();
+    assert!(
+        audits
+            .iter()
+            .any(|a| a.action == "codex_interrupt" && a.result == "interrupted"),
+        "原生回合打断同样进审计（result 词 = interrupted）"
+    );
 }

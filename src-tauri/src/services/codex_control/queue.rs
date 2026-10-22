@@ -66,6 +66,8 @@ fn kind_str(kind: ActionKind) -> &'static str {
         ActionKind::CommandApproval => "command_approval",
         ActionKind::PermissionsApproval => "permissions_approval",
         ActionKind::UserInput => "user_input",
+        // 打断不进动作账本（仅供 ActionContext/审计语义如实），映射仅为 match 穷尽。
+        ActionKind::Interrupt => "interrupt",
     }
 }
 
@@ -75,6 +77,7 @@ fn kind_from_str(s: &str) -> Option<ActionKind> {
         "command_approval" => Some(ActionKind::CommandApproval),
         "permissions_approval" => Some(ActionKind::PermissionsApproval),
         "user_input" => Some(ActionKind::UserInput),
+        "interrupt" => Some(ActionKind::Interrupt),
         _ => None,
     }
 }
@@ -441,6 +444,15 @@ impl ActionStore {
         key: &ThreadKey,
     ) -> Result<Vec<(String, String, bool)>, StoreError> {
         self.with(|c| dao::outstanding_fence_summary_conn(c, &key.thread_id).map_err(db_err))
+    }
+
+    /// 在册**原生**屏障绑定的 turnId（打断端点的 `expectedTurnId` 安全阀来源）。
+    /// 无在册原生屏障 → None。
+    pub fn outstanding_native_turn_id(
+        &self,
+        key: &ThreadKey,
+    ) -> Result<Option<String>, StoreError> {
+        self.with(|c| dao::outstanding_native_turn_id_conn(c, &key.thread_id).map_err(db_err))
     }
 
     /// 清 fence：仅终态动作允许（queued/reserved → `Conflict`）。Accepted/Unknown 必须

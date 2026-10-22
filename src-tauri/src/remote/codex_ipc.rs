@@ -55,6 +55,9 @@ pub(crate) const BLOCKED_COMPAT_OUTSTANDING: &str = "compat_outstanding";
 /// 原生 Turn 屏障的在册码（2026-10-18 形态适配配套）：route=desktop_ipc 的
 /// Accepted 动作在等精确 Turn 终态证据——不是「兼容模式」，UI 分文案。
 pub(crate) const BLOCKED_NATIVE_TURN_PENDING: &str = "native_turn_pending";
+/// 原生活动回合（2026-10-22 原生回合打断扩展）：无屏障但镜像里有 `inProgress`
+/// 回合（桌面手打产生的回合）——打断出口对它同样开放，阀值取镜像活动回合 id。
+pub(crate) const BLOCKED_NATIVE_TURN_ACTIVE: &str = "native_turn_active";
 /// 原生 Unknown/缺 turnId 保守屏障的在册码（复审 P2-3）：**没有自动恢复路径**
 /// （释放门要求精确 turnId 终态证据）——文案必须与「等待后自动继续」区分。
 pub(crate) const BLOCKED_NATIVE_DELIVERY_UNKNOWN: &str = "native_delivery_unknown";
@@ -883,6 +886,7 @@ fn closed_profile() -> crate::services::codex_desktop_ipc::profile::ProtocolProf
             command: false,
             permissions: false,
             blocking_input: false,
+            interrupt: false,
         },
         method_versions: Default::default(),
     }
@@ -897,6 +901,8 @@ const AUDIT_APPROVE: &str = "codex_approve";
 const AUDIT_REJECT: &str = "codex_reject";
 const AUDIT_ANSWER: &str = "codex_answer";
 const AUDIT_FALLBACK: &str = "codex_fallback";
+/// 打断桌面当前回合（破坏性动作——审计必须留痕）。
+const AUDIT_INTERRUPT: &str = "codex_interrupt";
 /// Desktop IPC 动作的审计 channel 词（兜底行记**实际 headless 通道名**——由封套取）。
 const AUDIT_CHANNEL: &str = "codex_desktop_ipc";
 
@@ -1901,7 +1907,8 @@ pub async fn queue_view(
     //（终态证据驱动自动对账，等待后自动继续）；native_delivery_unknown = 原生
     // Unknown/缺 turnId 保守屏障（**无自动恢复路径**，如实说）；compat_outstanding =
     // 兼容路径 fence。都不提示不存在的「回 Desktop 手工解除」。
-    let blocked_reason_code = match store.outstanding_fence_summary(&key) {
+    let fence_summary = store.outstanding_fence_summary(&key);
+    let blocked_reason_code = match &fence_summary {
         Ok(rows) => {
             // 优先级：unknown/缺 turnId（**永不自动解除**）> accepted+turnId（等待
             // 后自动继续）> compat。若两者并存，队列最终仍会停在 Unknown 屏障上，
@@ -1927,6 +1934,21 @@ pub async fn queue_view(
             None
         }
     };
+    // 原生活动回合（2026-10-22 扩展）：无屏障但镜像里有 inProgress 回合（桌面
+    // 手打的原生回合）→ native_turn_active，打断出口对它同样开放。屏障态优先
+    // （native_turn_pending / unknown / compat 语义不变）；**仅当 fence 摘要读取
+    // 成功且确认无屏障**才回退——读降级（Err）期真实阻塞可能正是读不出的屏障，
+    // 不得被镜像活动回合「洗」成 native_turn_active（复审 Minor-2）；镜像 stale /
+    // 无活动回合 → 保持 None（面板自隐，不渲染空壳）。
+    let blocked_reason_code = if blocked_reason_code.is_none() && fence_summary.is_ok() {
+        st.codex_control
+            .adapter
+            .mirror_active_turn_id(&key)
+            .await
+            .map(|_| BLOCKED_NATIVE_TURN_ACTIVE.to_string())
+    } else {
+        blocked_reason_code
+    };
     // 在册屏障动作清单（2026-10-19 无出口屏障修复）：人工解除端点的靶向依据——
     // 前端按钮据此逐个 force-continue。读取失败如实降级为空清单（阻塞码派生同上，
     // 两者独立读取互不牵连）。
@@ -1941,6 +1963,10 @@ pub async fn queue_view(
         actions,
         blocked_reason_code,
         barrier_action_ids,
+        // interrupt 能力位随队列视图下发（复审 P2-2）：无能力 build 的打断按钮在
+        // 前端源头隐藏，而不是渲染出来永远 503。读当前连接的动态 profile——与
+        // adapter 各写前门控同源。
+        can_interrupt: st.codex_control.adapter.capabilities().interrupt,
     };
     json_no_store(
         StatusCode::OK,
@@ -2121,6 +2147,290 @@ fn action_view_response(view: CodexActionView) -> Response {
         StatusCode::OK,
         serde_json::to_value(&view).unwrap_or_else(|_| serde_json::json!({})),
     )
+}
+
+// ============================================================
+// 端点：POST /codex/turn/interrupt
+// ============================================================
+
+/// POST /codex/turn/interrupt 请求体（camelCase）。**deny_unknown_fields**：与
+/// pending-response 同纪律——`ownerClientId` / raw method 等任何多余键 → 400
+///（HTTP 层不出现 IPC owner 参数，2026-10-22 复审 P3-2）。`turnId` 可选：缺省取
+/// **在册原生屏障绑定的 turnId**（上一条被桌面受理的回合），作为 Desktop 侧
+/// `expectedTurnId` 安全阀——与当前活动回合不符时 Desktop 静默不动作（不误伤）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InterruptTurnReq {
+    pub session_id: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+}
+
+/// 打断指令的 NotSent 拒绝 → HTTP 回应（复审 P2-2：拒绝类错误必须带中文可读
+/// reason，不裸示机器码；stale_context 是状态冲突 → 409，其余未送达 → 503）。
+/// `NotSent` = 写尝试开始前即失败，桌面侧零改动——reason 文案如实说「未送达」。
+fn interrupt_not_sent_response(reason: &str) -> Response {
+    match reason {
+        "stale_context" => error_body(
+            StatusCode::CONFLICT,
+            reason,
+            Some("CODEX_INTERRUPT_STALE_CONTEXT: 桌面会话上下文已过期（桌面端可能重开或换代），请刷新页面后重试"),
+        ),
+        "capability_unavailable" => error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            reason,
+            Some("CODEX_INTERRUPT_CAPABILITY_UNVERIFIED: 当前桌面 Codex 版本未启用远程停止能力（未完成活体验证），无法远程打断回合"),
+        ),
+        "expected_turn_missing" => error_body(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            reason,
+            Some(
+                "CODEX_INTERRUPT_VALVE_MISSING: 服务端未能取到打断安全阀（expectedTurnId），已放弃本次打断——未向桌面发送任何指令",
+            ),
+        ),
+        _ => error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            reason,
+            Some("CODEX_INTERRUPT_UNDELIVERED: 停止指令未能送达桌面（连接不可用或通道拥塞），桌面未被改动"),
+        ),
+    }
+}
+
+/// POST /codex/turn/interrupt：**打断桌面 Codex 当前回合**（`thread-follower-interrupt-turn`
+/// v4）。打断后 Desktop 把该回合状态置 `interrupted`（终态）→ 镜像终态门放行 →
+/// 在册屏障释放 → 待发队列接力下一条（这就是「远程点掉那个卡」的闭环）。
+///
+/// 语义边界（必须如实，不美化）：
+/// - **破坏性**：被打断回合未完成的工作会丢失。端点只负责"发出打断"，不代用户
+///   判断该不该打断——那一层由前端两步确认 + 风险披露承担。
+/// - **不谎报**：回合已结束（不再 inProgress）时 Desktop 静默不动作，端点回
+///   `interruptedTurnId: null` + `ok: true`——不谎称打断成功，也不报错。
+/// - **安全阀双层硬门（复审 P1-1）**：`expectedTurnId` 取不到（请求未带且在册
+///   屏障查无绑定 turnId）→ 409 `no_expected_turn` 拒绝；DB 读失败 → 500。两路
+///   都**绝不降级为 None 照发**——adapter 侧对 None 阀值同样零 IPC 写入拒发。
+/// - **投递结果三分支（复审 P2-3）**：明确受理 → 200；RPC 超时等「帧已交 writer
+///   但结果未知」→ 200 + `uncertain: true`（打断可能已生效，不得报「失败」诱导
+///   重按）；Desktop 明确拒绝（Rejected）→ 409（不是 503——服务本身可用）。
+/// - **能力门**：该 Desktop build 未活体验证 `interrupt` → 503 `capability_unavailable`。
+/// - 打断**不直接清屏障**：屏障由终态证据驱动释放（`release_turn_if_complete`），
+///   本端点只发打断并触发一次结算；回合终态帧到达时调度循环自动接力。
+/// - **全臂审计（复审 P3-1）**：拒绝/不确定/明确拒绝各臂都留 `codex_interrupt`
+///   审计，事后可回答「谁在何时试图打断、为什么没打出去」。
+pub async fn interrupt_turn(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    body: Result<Json<InterruptTurnReq>, JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(v) => v,
+        Err(_) => return bad_request(),
+    };
+    let session_id = req.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return bad_request();
+    }
+    let Some((device_id, device_name)) = device_identity(st.as_ref(), &headers) else {
+        return forbidden_defense();
+    };
+    let probe_st = st.clone();
+    let probe_sid = session_id.clone();
+    let session =
+        match tokio::task::spawn_blocking(move || find_session_sync(&probe_st, &probe_sid)).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("codex/turn/interrupt 会话扫描任务异常: {e}");
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "error": "internal" }),
+                );
+            }
+        };
+    let Some(session) = session else {
+        return not_found();
+    };
+    let Some(key) = resolve_session_thread(&st, &session) else {
+        return not_found();
+    };
+    // expectedTurnId：调用方给了就用；否则取在册原生屏障绑定的 turnId（安全阀）。
+    // 复审 P1-1：两路都取不到 → 409 拒发；DB 读失败 → 500。**不得**降级为 None
+    // 继续发——adapter 对 None 阀值会拒发（零 IPC 写入），这里先一步如实拒绝。
+    let expected_turn_id = match req.turn_id.as_deref().map(str::trim) {
+        Some(t) if !t.is_empty() => Some(t.to_string()),
+        _ => match st
+            .codex_control
+            .router
+            .store()
+            .outstanding_native_turn_id(&key)
+        {
+            Ok(Some(v)) => Some(v),
+            Ok(None) => {
+                // 原生回合打断扩展（2026-10-22）：在册屏障不存在（回合由桌面
+                // 手打产生）→ 回退用镜像活动回合 id 作阀值。Desktop 侧安全阀
+                // 原样兜底：镜像给的 id 若已过期（回合刚结束），expectedTurnId
+                // 不匹配 → 静默返回 null → 端点如实报「没有可打断回合」，
+                // 失败方向保守。仍取不到 → 走下方 409 拒发（P1-1 纪律不变）。
+                if let Some(active) = st.codex_control.adapter.mirror_active_turn_id(&key).await {
+                    Some(active)
+                } else {
+                    // ctx 仅用于审计（envelope 尚不存在 → None）；action_id 沿用
+                    // interrupt- 前缀，result 词记拒绝原因。
+                    let ctx = ActionContext {
+                        action_id: "interrupt-none".to_string(),
+                        device_id: device_id.clone(),
+                        device_name: device_name.clone(),
+                        kind: ActionKind::Interrupt,
+                        key: key.clone(),
+                    };
+                    codex_audit(
+                        st.as_ref(),
+                        &ctx,
+                        AUDIT_INTERRUPT,
+                        &session.id,
+                        None,
+                        None,
+                        "refused:no_expected_turn",
+                    );
+                    return error_body(
+                        StatusCode::CONFLICT,
+                        "no_expected_turn",
+                        Some("CODEX_INTERRUPT_NO_VALVE: 取不到打断安全阀：请求未带 turnId，且没有在册的原生回合屏障，镜像里也没有正在运行的回合。为免误伤桌面其他回合，已拒绝打断（未发送任何指令）"),
+                    );
+                }
+            }
+            Err(e) => {
+                log::error!("codex/turn/interrupt 读取在册 turnId 失败: {e}");
+                // 本臂**有意不留审计**（复审 Minor-1 已声明取舍）：审计账本与
+                // codex_actions 同源一个 SQLite——刚发生读失败时再写审计，轻则把
+                // 原始故障掩盖成审计成功，重则把 500 拖成写挂死；此处只留 log
+                // error（与既有 internal 500 臂同口径），审计以「能写时才写」为界。
+                return json_no_store(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({
+                        "error": "internal",
+                        "reason": "CODEX_INTERRUPT_VALVE_READ_FAILED: 读取打断安全阀失败，已放弃本次打断（未向桌面发送任何指令），请稍后重试",
+                    }),
+                );
+            }
+        },
+    };
+    let outcome = st
+        .codex_control
+        .adapter
+        // 走到这里 expected_turn_id 恒为 Some（None 两路已在上面如实拒绝）；仍以
+        // Option 传入——adapter 侧的 None 硬门作为纵深防御保留（复审 P1-1）。
+        .interrupt_turn(&key, expected_turn_id.as_deref())
+        .await;
+    // 审计上下文（复审 P3-3）：打断动作用自己的 ActionKind::Interrupt，不复用 Send。
+    let ctx = ActionContext {
+        action_id: format!(
+            "interrupt-{}",
+            outcome
+                .result
+                .as_ref()
+                .and_then(|r| r.get("interruptedTurnId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("none")
+        ),
+        device_id,
+        device_name,
+        kind: ActionKind::Interrupt,
+        key: key.clone(),
+    };
+    match outcome.delivery {
+        Delivery::Accepted => {
+            let interrupted_turn_id = outcome
+                .result
+                .as_ref()
+                .and_then(|r| r.get("interruptedTurnId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // 触发一次结算：等回合终态帧到达时由调度循环释放屏障并接力队列。
+            st.codex_control.notify_settled(&key);
+            codex_audit(
+                st.as_ref(),
+                &ctx,
+                AUDIT_INTERRUPT,
+                &session.id,
+                None,
+                Some(outcome.envelope_id.as_str()),
+                if interrupted_turn_id.is_some() {
+                    "interrupted"
+                } else {
+                    "no_active_turn"
+                },
+            );
+            json_no_store(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "uncertain": false,
+                    "interruptedTurnId": interrupted_turn_id,
+                    "expectedTurnId": expected_turn_id,
+                }),
+            )
+        }
+        Delivery::UnknownDelivery => {
+            // 帧已交 writer（超时/断连发生在写后）——打断**可能已生效**。如实回
+            // 200 + uncertain:true，绝不报「停止失败」诱导用户立刻重按（重按 =
+            // 双发破坏性指令）。结算照常触发：若打断实际已生效，终态证据会释放屏障。
+            st.codex_control.notify_settled(&key);
+            let reason = outcome
+                .reason_code
+                .unwrap_or_else(|| "unknown_delivery".to_string());
+            codex_audit(
+                st.as_ref(),
+                &ctx,
+                AUDIT_INTERRUPT,
+                &session.id,
+                None,
+                Some(outcome.envelope_id.as_str()),
+                &format!("uncertain:{reason}"),
+            );
+            json_no_store(
+                StatusCode::OK,
+                serde_json::json!({
+                    "ok": true,
+                    "uncertain": true,
+                    "interruptedTurnId": serde_json::Value::Null,
+                    "expectedTurnId": expected_turn_id,
+                    "reasonCode": reason,
+                }),
+            )
+        }
+        Delivery::Rejected => {
+            // Desktop 明确拒绝（resultType=error 回执）——服务本身可用，语义是
+            // 状态冲突而非「服务不可用」，映射 409（复审 P2-3）。
+            codex_audit(
+                st.as_ref(),
+                &ctx,
+                AUDIT_INTERRUPT,
+                &session.id,
+                None,
+                Some(outcome.envelope_id.as_str()),
+                "rejected",
+            );
+            error_body(
+                StatusCode::CONFLICT,
+                "desktop_rejected",
+                Some("CODEX_INTERRUPT_DESKTOP_REJECTED: 桌面 Codex 明确拒绝了本次打断指令，回合未被停止"),
+            )
+        }
+        Delivery::NotSent => {
+            let reason = outcome
+                .reason_code
+                .unwrap_or_else(|| "not_sent".to_string());
+            codex_audit(
+                st.as_ref(),
+                &ctx,
+                AUDIT_INTERRUPT,
+                &session.id,
+                None,
+                Some(outcome.envelope_id.as_str()),
+                &format!("refused:{reason}"),
+            );
+            interrupt_not_sent_response(&reason)
+        }
+    }
 }
 
 // ============================================================
@@ -2376,6 +2686,7 @@ mod startup_merge_tests {
                 command: true,
                 permissions: false,
                 blocking_input: true,
+                interrupt: false,
             },
             runtime_status: "idle".into(),
             content_state: ContentState::Ready,

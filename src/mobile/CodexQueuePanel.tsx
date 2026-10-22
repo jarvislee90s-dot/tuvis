@@ -17,6 +17,15 @@
 //   不中断剩余；真失败显示错误不静默（note 走 reason →
 //   机器码 → message 可读化回退链）。native_turn_pending 有自动恢复路径（Turn
 //   终态证据驱动），不提供该按钮；
+// - **打断桌面回合（2026-10-21 新增）**：native_turn_pending 的自动恢复路径是
+//   「桌面回合自己结束」——回合若一直不结束（长任务/卡死），手机端就完全无解
+//   （「解除」只清屏障，消息仍要等桌面空闲才投得出去）。故本面板在该阻塞态
+//   额外提供「停止桌面回合并继续」：真发 `thread-follower-interrupt-turn`（破坏性
+//   ——**两步确认**，文案如实披露「该回合未完成的工作会丢失」），打断后回合转终态
+//   → 屏障释放 → 队列自动接力。仅 canInterrupt=true（该 Desktop build 已活体
+//   验证）才渲染按钮（复审 P2-2：无能力 build 不给假出口）；打断成功／结果不确定
+//  （指令已发出但未知，不诱导重按）／桌面无可打断回合／失败，四种结果如实分别
+//   回报，不谎报不静默（复审 P2-3）。
 // - **不提供插队**：本面板没有「立即发送/跳到队首」语义（宪法 R2.3 忙态留队、
 //   FIFO 按序，任何插队入口都是越权）——cancelled/终态条目也不出现重试按钮
 //   （重投 = 同 actionId 双投风险，绝不自动）；
@@ -30,11 +39,13 @@ import i18n from "@/i18n";
 import {
   fetchCodexQueue,
   forceContinueCodexAction,
+  interruptCodexTurn,
   retractCodexAction,
   type CodexActionState,
   type CodexQueueView,
 } from "./codexIpcApi";
 import { ApiError } from "./api";
+import { formatInvokeError } from "../lib/invokeError";
 
 /** 外部触发的去抖窗口（毫秒）：同一会话内的密集触发（发送回执 + 投影跃迁几乎
  *  同时到达）合并为一次重拉；拉取本身是会话级短查询，延迟一拍无感 */
@@ -64,11 +75,17 @@ function stateLabel(s: CodexActionState): string {
 
 /** ApiError → 可读分诊片段：后端 reason（人类可读，如「该消息仍在排队，请使用
  *  撤回」）优先，其次机器码 error（如 no_barrier / queued_use_retract），最后兜底
- *  e.message——对齐 PendingRequestCard C5 臂的回退链，不把「路径 + 状态码」裸示人 */
+ *  e.message——对齐 PendingRequestCard C5 臂的回退链，不把「路径 + 状态码」裸示人。
+ *  带码 reason（错误码门禁约定）过 formatInvokeError 按码换 errors.* 文案；
+ *  未知码/无码原样返回。 */
 function apiErrorReason(e: ApiError): string {
-  if (typeof e.data?.reason === "string" && e.data.reason !== "") return e.data.reason;
-  if (typeof e.data?.error === "string" && e.data.error !== "") return e.data.error;
-  return e.message;
+  const raw =
+    typeof e.data?.reason === "string" && e.data.reason !== ""
+      ? e.data.reason
+      : typeof e.data?.error === "string" && e.data.error !== ""
+        ? e.data.error
+        : e.message;
+  return formatInvokeError(raw, i18n.t);
 }
 
 /** 该次 force-continue 失败是否「该 id 无需解除」的确定性收尾（2026-10-19 复审
@@ -105,6 +122,10 @@ export default function CodexQueuePanel({
   const [forceArmed, setForceArmed] = useState(false);
   /** 人工解除进行中（逐个解除 blockedActionIds 期间禁用全部按钮） */
   const [forceBusy, setForceBusy] = useState(false);
+  /** 打断桌面回合的二次确认臂（未确认不发任何请求——破坏性动作的前端防线） */
+  const [interruptArmed, setInterruptArmed] = useState(false);
+  /** 打断进行中（请求在飞期间禁用全部按钮） */
+  const [interruptBusy, setInterruptBusy] = useState(false);
   /** 乱序防护（R11）：请求序号——每次发起 +1，响应落地时不再是最新序号即作废
    *  （先发后至的响应不得覆盖后发请求的结果） */
   const seqRef = useRef(0);
@@ -221,6 +242,37 @@ export default function CodexQueuePanel({
     }
   }, [busyId, forceBusy, view, load]);
 
+  // 打断桌面当前回合（2026-10-21 新增，破坏性动作）：
+  // 桌面 Codex 正在跑的回合不结束 → 在册屏障不释放 → 本面板的待发队列永远不派发
+  // （native_turn_pending）。这里给出远程出口：打断 → 回合转终态（interrupted）→
+  // 屏障释放 → 队列自动接力。**未确认不发请求**；打断会丢弃该回合未完成的工作，
+  // 风险由确认臂的文案如实披露。
+  const interruptTurn = useCallback(async () => {
+    if (busyId !== null || forceBusy || interruptBusy) return;
+    setInterruptArmed(false);
+    setInterruptBusy(true);
+    setNote(null);
+    try {
+      const res = await interruptCodexTurn(sessionId);
+      // 三种结果如实分别回报（复审 P2-3）：打断成功 / 结果不确定（可能已生效，
+      // 不得报失败诱导重按）/ 桌面无可打断回合。失败走 catch 臂。
+      setNote(
+        res.uncertain
+          ? i18n.t("mobile.codex.queue.interruptUncertain")
+          : res.interruptedTurnId !== null
+            ? i18n.t("mobile.codex.queue.interruptDone")
+            : i18n.t("mobile.codex.queue.interruptNoTurn")
+      );
+    } catch (e) {
+      const message = e instanceof ApiError ? apiErrorReason(e) : String(e);
+      setNote(i18n.t("mobile.codex.queue.interruptFailed", { message }));
+    } finally {
+      setInterruptBusy(false);
+      // 重拉：回合转终态后屏障会释放、队列接力——面板展示以服务端账本为唯一权威
+      await load();
+    }
+  }, [busyId, forceBusy, interruptBusy, sessionId, load]);
+
   if (view === null) return null;
   // 全空且无暂停原因：面板自隐（不渲染空壳）
   if (view.actions.length === 0 && view.blockedReasonCode === null) return null;
@@ -230,6 +282,32 @@ export default function CodexQueuePanel({
     (view.blockedReasonCode === "native_delivery_unknown" ||
       view.blockedReasonCode === "compat_outstanding") &&
     (view.blockedActionIds?.length ?? 0) > 0;
+  // 打断出口（2026-10-21；2026-10-22 扩展原生回合）：两类阻塞态都给出「真的让
+  // 桌面停下」的出口，而非仅清屏障——
+  // - native_turn_pending：手机受理回合在跑（在册屏障），阀值 = 屏障绑定回合；
+  // - native_turn_active：桌面手打的原生回合在跑（无屏障），阀值 = 镜像活动回合。
+  // 能力位门控（复审 P2-2）：canInterrupt=false 的 Desktop build（未活体验证
+  // interrupt）按钮在源头隐藏——渲染出来也只会永远 503；旧载荷缺省视为无能力
+  //（保守方向：宁可没有按钮，不可有假出口）。
+  const canInterrupt =
+    (view.blockedReasonCode === "native_turn_pending" ||
+      view.blockedReasonCode === "native_turn_active") &&
+    view.canInterrupt === true;
+  // 阻塞文案分流（分码 + 能力位）：有打断能力的 build 才承诺「可点下方停止」，
+  // 无能力 build 如实说明暂无停止出口（按钮在源头隐藏，文案也不撒谎）
+  const blockedBannerKey = () => {
+    if (view.blockedReasonCode === "native_turn_pending")
+      return view.canInterrupt === true
+        ? "mobile.codex.queue.blockedNativeTurn"
+        : "mobile.codex.queue.blockedNativeTurnNoCap";
+    if (view.blockedReasonCode === "native_turn_active")
+      return view.canInterrupt === true
+        ? "mobile.codex.queue.blockedNativeTurnActive"
+        : "mobile.codex.queue.blockedNativeTurnActiveNoCap";
+    if (view.blockedReasonCode === "native_delivery_unknown")
+      return "mobile.codex.queue.blockedNativeUnknown";
+    return "mobile.codex.queue.blockedCompat";
+  };
 
   return (
     <div
@@ -247,11 +325,7 @@ export default function CodexQueuePanel({
           data-reason={view.blockedReasonCode}
           className="mt-1 text-xs text-amber-700 dark:text-amber-400"
         >
-          {view.blockedReasonCode === "native_turn_pending"
-            ? i18n.t("mobile.codex.queue.blockedNativeTurn")
-            : view.blockedReasonCode === "native_delivery_unknown"
-              ? i18n.t("mobile.codex.queue.blockedNativeUnknown")
-              : i18n.t("mobile.codex.queue.blockedCompat")}
+          {i18n.t(blockedBannerKey())}
         </p>
       )}
       {/* 人工解除（无出口屏障复审 Important）：两步确认——未确认不发任何请求；
@@ -298,6 +372,53 @@ export default function CodexQueuePanel({
             className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-[var(--tx)] disabled:opacity-40"
           >
             {i18n.t("mobile.codex.queue.forceContinueCancel")}
+          </button>
+        </span>
+      )}
+      {/* 打断桌面回合（native_turn_pending 专用出口）：与「人工解除」是两种不同的
+          东西——解除只清屏障（消息仍要等桌面空闲才投得出去），打断是真的让桌面
+          停下当前回合，队列随即自动接力。两步确认 + 风险如实披露。 */}
+      {canInterrupt && !interruptArmed && (
+        <button
+          type="button"
+          data-testid="codex-queue-interrupt"
+          disabled={busyId !== null || forceBusy || interruptBusy}
+          onClick={() => {
+            setNote(null);
+            setInterruptArmed(true);
+          }}
+          className="mt-1 rounded-full border border-red-500/50 px-2 py-0.5 text-xs text-red-700 disabled:opacity-40 dark:text-red-300"
+        >
+          {i18n.t("mobile.codex.queue.interrupt")}
+        </button>
+      )}
+      {canInterrupt && interruptArmed && (
+        <span
+          data-testid="codex-queue-interrupt-confirm"
+          className="mt-1 flex w-full flex-wrap items-center gap-2 rounded-lg bg-red-500/10 px-2 py-1 text-[11px] text-red-700 dark:text-red-300"
+        >
+          <span>{i18n.t("mobile.codex.queue.interruptRisk")}</span>
+          <button
+            type="button"
+            data-testid="codex-queue-interrupt-yes"
+            disabled={busyId !== null || forceBusy || interruptBusy}
+            onClick={() => {
+              void interruptTurn();
+            }}
+            className="rounded-full bg-red-600 px-2 py-0.5 font-semibold text-white disabled:opacity-40 dark:bg-red-500"
+          >
+            {i18n.t("mobile.codex.queue.interruptYes")}
+          </button>
+          <button
+            type="button"
+            data-testid="codex-queue-interrupt-no"
+            disabled={busyId !== null || forceBusy || interruptBusy}
+            onClick={() => {
+              setInterruptArmed(false);
+            }}
+            className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-[var(--tx)] disabled:opacity-40"
+          >
+            {i18n.t("mobile.codex.queue.interruptCancel")}
           </button>
         </span>
       )}

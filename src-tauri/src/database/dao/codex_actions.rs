@@ -707,6 +707,28 @@ pub(crate) fn outstanding_fence_summary_conn(
     Ok(out)
 }
 
+/// 在册**原生**屏障绑定的 turnId（2026-10-21 打断端点用）：route=desktop_ipc 且
+/// state=accepted 且 compat_outstanding=1 且 compat_turn_id 非空。取 seq 最大的一条
+/// （最新派发的那个回合）——打断端点用它作 `expectedTurnId` 安全阀：Desktop 侧
+/// 「与当前活动回合不符 → 静默不动作」，避免打断到别的回合。
+/// 无在册原生屏障 → None（调用方据此决定是否传 expectedTurnId）。
+pub(crate) fn outstanding_native_turn_id_conn(
+    conn: &Connection,
+    thread_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT compat_turn_id FROM codex_actions \
+         WHERE thread_id = ?1 AND route = 'desktop_ipc' AND state = 'accepted' \
+           AND compat_outstanding = 1 AND compat_turn_id IS NOT NULL \
+         ORDER BY seq DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query([thread_id])?;
+    match rows.next()? {
+        Some(r) => Ok(Some(r.get::<_, String>(0)?)),
+        None => Ok(None),
+    }
+}
+
 /// **原子** compat 派发屏障（R9.1，2026-10-17 审计）：fence 与只读核对证据在**同一条
 /// UPDATE** 内持久化（单语句原子性）——持久化成功是 compat bridge 调用真实 helper 的
 /// 前提；写失败时 helper 不被调用，动作如实落账。
@@ -1447,6 +1469,47 @@ mod tests {
         assert!(
             native_unknown,
             "并存时 Unknown 优先展示（无自动恢复路径，不得承诺自动继续）"
+        );
+    }
+
+    /// 在册原生屏障的绑定 turnId（2026-10-21 打断端点的 `expectedTurnId` 安全阀
+    /// 来源）：取 seq 最大的 accepted+turnId 行；兼容路由 / 无 turnId / 非在册 → None。
+    #[test]
+    fn outstanding_native_turn_id_picks_latest_bound_turn() {
+        let c = mem();
+        assert_eq!(
+            outstanding_native_turn_id_conn(&c, THREAD).unwrap(),
+            None,
+            "无在册屏障 → None（调用方据此不带 expectedTurnId）"
+        );
+        finish_with_barrier(&c, "old", Delivery::Accepted, Some("t-old"), 1000);
+        finish_with_barrier(&c, "new", Delivery::Accepted, Some("t-new"), 2000);
+        assert_eq!(
+            outstanding_native_turn_id_conn(&c, THREAD)
+                .unwrap()
+                .as_deref(),
+            Some("t-new"),
+            "取 seq 最大的在册原生屏障（最新派发的那个回合）"
+        );
+        // 兼容路由的屏障不在此列（打断只针对 desktop_ipc 的原生回合）
+        let c2 = mem();
+        insert(&c2, "compat", Some("乙"), 1000);
+        reserve_conn(&c2, "compat", ControlRoute::HeadlessCompat, 1100).unwrap();
+        set_compat_dispatch_barrier_conn(
+            &c2,
+            "compat",
+            Some("m1"),
+            None,
+            Some("/tmp/r.jsonl"),
+            Some(64),
+            Some("wh"),
+            1200,
+        )
+        .unwrap();
+        assert_eq!(
+            outstanding_native_turn_id_conn(&c2, THREAD).unwrap(),
+            None,
+            "兼容屏障不提供原生 turnId"
         );
     }
 

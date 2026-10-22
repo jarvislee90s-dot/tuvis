@@ -36,6 +36,10 @@ pub enum ActionKind {
     CommandApproval,
     PermissionsApproval,
     UserInput,
+    /// 打断桌面当前回合（`thread-follower-interrupt-turn`）。**不进动作账本**（打断
+    /// 不经队列登记），只用于 ActionContext/审计语义如实——2026-10-22 复审 P3-3：
+    /// 打断审计上下文不再复用 `Send`。
+    Interrupt,
 }
 
 /// 动作账本状态（`codex_actions.state`；与 Task 7 DAO 共用）。
@@ -79,6 +83,9 @@ pub struct CapabilitySet {
     pub command: bool,
     pub permissions: bool,
     pub blocking_input: bool,
+    /// 打断桌面当前回合（`thread-follower-interrupt-turn`）。`false` = 该 build
+    /// 尚未活体验证，**不代表协议不存在**（Desktop 侧方法表已登记该方法）。
+    pub interrupt: bool,
 }
 
 /// 完成的动作回执（持久化于 `codex_actions.receipt_json`，HTTP 原样返回）。
@@ -121,6 +128,11 @@ pub struct CodexQueueView {
     pub blocked_reason_code: Option<String>,
     #[serde(default)]
     pub barrier_action_ids: Vec<String>,
+    /// 本 Desktop build 是否已活体验证「打断当前回合」（`interrupt` 能力位）。
+    /// false = 队列面板**不得**渲染打断按钮（渲染了也只会 503）——2026-10-22 复审
+    /// P2-2：无能力 build 的按钮在源头隐藏；`#[serde(default)]` 兼容旧载荷消费方。
+    #[serde(default)]
+    pub can_interrupt: bool,
 }
 
 /// 官方 Desktop 持有租约：owner 身份随连接生命周期变化（spec F6），epoch 由
@@ -576,6 +588,7 @@ mod tests {
             command: false,
             permissions: false,
             blocking_input: false,
+            interrupt: false,
         };
         let v = serde_json::to_value(caps).unwrap();
         assert!(v.get("send").is_some());
@@ -597,9 +610,12 @@ mod tests {
             }],
             blocked_reason_code: None,
             barrier_action_ids: Vec::new(),
+            can_interrupt: false,
         };
         let v = serde_json::to_value(&view).unwrap();
         assert!(v["actions"][0]["actionId"].is_string());
         assert!(v["blockedReasonCode"].is_null());
+        // 复审 P2-2：能力位恒序列化（camelCase），消费方据此隐藏打断按钮
+        assert_eq!(v["canInterrupt"], serde_json::json!(false));
     }
 }
