@@ -69,19 +69,25 @@ Desktop 侧方法表（打包产物静态核对 + 真机探针）：
 ```
 POST /m/api/v1/codex/turn/interrupt
 { "sessionId": "...", "turnId": "..."? }
-→ 200 { "ok": true, "interruptedTurnId": "...|null", "expectedTurnId": "...|null" }
+→ 200 { "ok": true, "uncertain": false, "interruptedTurnId": "...|null", "expectedTurnId": "..." }
+→ 200 { "ok": true, "uncertain": true, "interruptedTurnId": null,
+        "expectedTurnId": "...", "reasonCode": "timeout|…" }   // RPC 超时等：结果未知
+→ 409 { "error": "no_expected_turn"|"stale_context"|"desktop_rejected", "reason": "<中文>" }
+→ 503 { "error": "capability_unavailable"|…, "reason": "<中文>" }   // 未送达/未验证
 ```
 
 - `turnId` 缺省时，服务端取**在册原生屏障绑定的 turnId**（`codex_actions` 中 route=desktop_ipc ∧ state=accepted ∧ compat_outstanding=1 ∧ compat_turn_id 非空，取 seq 最大一条）作 `expectedTurnId`；这也是「打断的正是卡住我的那个回合」的精确性保证。
+- **无阀拒发（2026-10-22 复审 P1-1 补强）**：请求未带 `turnId` 且在册屏障查不到绑定 turnId → 409 `no_expected_turn` 拒绝（零 IPC 写入）；DB 读失败 → 500。两路都**绝不降级为「无阀照发」**——adapter 层对 `expectedTurnId == None` 同样硬门拒发（缺该参数的 interrupt Desktop 照收不误，等于无阀打断当前活动回合，含桌面手开的无关回合）。
 - Desktop 侧无可打断回合时回 `interruptedTurnId: null`——端点如实回 null，**不谎报打断成功**，也不当作错误。
-- 端点只负责「发出打断」并触发一次结算；屏障释放由终态证据驱动（`release_turn_if_complete`），回合终态帧到达时调度循环自动接力队列。
-- 破坏性动作进审计（`codex_interrupt`），摘要只含 id 与结果词，不含正文。
+- **投递结果三分支（2026-10-22 复审 P2-3 补强）**：明确受理 → 200 `uncertain:false`；RPC 超时等「帧已交 writer 但结果未知」→ 200 `uncertain:true`（打断可能已生效，不得报「停止失败」诱导重按）；Desktop 明确拒绝（Rejected）→ 409 `desktop_rejected`（不是 503——服务本身可用）。拒绝类错误响应统一带中文可读 `reason`，无能力 build 的打断按钮由队列视图新增的 `canInterrupt` 能力位在**前端源头隐藏**（P2-2）。
+- 端点只负责「发出打断」并触发一次结算；屏障释放由终态证据驱动（`release_turn_if_complete`），回合终态帧到达时调度循环自动接力。
+- 破坏性动作进审计（`codex_interrupt`），摘要只含 id 与结果词，不含正文；**拒绝/不确定/明确拒绝各臂同样留审计**（P3-1），结果词区分 `interrupted` / `no_active_turn` / `uncertain:<reason>` / `rejected` / `refused:<reason>`。
 
 ### 4.4 前端
 
 队列面板在 `blockedReasonCode === "native_turn_pending"` 时展示「停止桌面回合并继续」——与「人工解除」是两种不同的东西：解除只清屏障（消息仍要等桌面空闲才投得出去），打断是真的让桌面停下。
 
-两步确认（未确认不发任何请求），确认文案如实披露「该回合未完成的工作会丢失」；打断成功／桌面无可打断回合／失败三种结果分别如实回报（不静默）。
+两步确认（未确认不发任何请求），确认文案如实披露「该回合未完成的工作会丢失」；打断成功／结果不确定（指令已发出但未知，劝阻连续重按）／桌面无可打断回合／失败，**四种结果**分别如实回报（不静默）。按钮仅 `canInterrupt === true`（队列视图下发的 interrupt 能力位）可见——无能力 build 在源头隐藏，不给渲染出来只会 503 的假出口（复审 P2-2）。
 
 ## 五、风险与诚实边界
 

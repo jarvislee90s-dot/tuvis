@@ -723,6 +723,12 @@ impl DesktopIpcAdapter {
     /// 期望版本 **3**、带上则期望基值 **4**。本实现**始终带上 expectedTurnId**
     /// （缺省由调用方给出在册屏障绑定的 turnId），故固定走基值 4。
     ///
+    /// **安全阀硬门（2026-10-22 复审 P1-1）**：`expected_turn_id == None` →
+    /// `not_sent("expected_turn_missing")`，**零 IPC 写入**。缺该参数的 interrupt
+    /// Desktop 照收不误（期望版本还会回落 3），等于无阀打断当前活动回合——含用户
+    /// 在桌面手开的、与队列无关的回合。阀值必须由调用方（端点）取到：请求显式
+    /// 携带，或从在册原生屏障绑定 turnId 读出；两路都取不到就拒发，不做回退。
+    ///
     /// 打断后 Desktop 把该回合 status 置 `interrupted`——镜像终态门已认该状态
     /// （`mirror.rs turn_is_terminal`），屏障随之释放、队列接力下一条。
     pub async fn interrupt_turn(
@@ -734,6 +740,10 @@ impl DesktopIpcAdapter {
         if !self.current_caps().interrupt {
             return not_sent(&envelope_id, "capability_unavailable");
         }
+        // 安全阀硬门（复审 P1-1）：无阀值一律拒发、零 IPC 写入（理由见函数注释）。
+        let Some(expected_turn_id) = expected_turn_id else {
+            return not_sent(&envelope_id, "expected_turn_missing");
+        };
         let (lease, validity) = {
             let owners = self.inner.owners.lock().await;
             match current_lease(&owners, key) {
@@ -754,13 +764,11 @@ impl DesktopIpcAdapter {
                 _ => return not_sent(&envelope_id, "disconnected"),
             }
         };
-        let mut params = json!({
+        let params = json!({
             "conversationId": key.thread_id,
             "mode": "user-stop",
+            "expectedTurnId": expected_turn_id,
         });
-        if let Some(t) = expected_turn_id {
-            params["expectedTurnId"] = json!(t);
-        }
         self.dispatch(
             "thread-follower-interrupt-turn",
             version,

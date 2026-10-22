@@ -22,8 +22,10 @@
 //   （「解除」只清屏障，消息仍要等桌面空闲才投得出去）。故本面板在该阻塞态
 //   额外提供「停止桌面回合并继续」：真发 `thread-follower-interrupt-turn`（破坏性
 //   ——**两步确认**，文案如实披露「该回合未完成的工作会丢失」），打断后回合转终态
-//   → 屏障释放 → 队列自动接力。桌面无可打断回合时如实回「没有可停止的回合」，
-//   不谎报成功；失败显示错误不静默。
+//   → 屏障释放 → 队列自动接力。仅 canInterrupt=true（该 Desktop build 已活体
+//   验证）才渲染按钮（复审 P2-2：无能力 build 不给假出口）；打断成功／结果不确定
+//  （指令已发出但未知，不诱导重按）／桌面无可打断回合／失败，四种结果如实分别
+//   回报，不谎报不静默（复审 P2-3）。
 // - **不提供插队**：本面板没有「立即发送/跳到队首」语义（宪法 R2.3 忙态留队、
 //   FIFO 按序，任何插队入口都是越权）——cancelled/终态条目也不出现重试按钮
 //   （重投 = 同 actionId 双投风险，绝不自动）；
@@ -245,10 +247,14 @@ export default function CodexQueuePanel({
     setNote(null);
     try {
       const res = await interruptCodexTurn(sessionId);
+      // 三种结果如实分别回报（复审 P2-3）：打断成功 / 结果不确定（可能已生效，
+      // 不得报失败诱导重按）/ 桌面无可打断回合。失败走 catch 臂。
       setNote(
-        res.interruptedTurnId !== null
-          ? i18n.t("mobile.codex.queue.interruptDone")
-          : i18n.t("mobile.codex.queue.interruptNoTurn")
+        res.uncertain
+          ? i18n.t("mobile.codex.queue.interruptUncertain")
+          : res.interruptedTurnId !== null
+            ? i18n.t("mobile.codex.queue.interruptDone")
+            : i18n.t("mobile.codex.queue.interruptNoTurn")
       );
     } catch (e) {
       const message = e instanceof ApiError ? apiErrorReason(e) : String(e);
@@ -273,7 +279,11 @@ export default function CodexQueuePanel({
   // 派发。自动恢复路径是「回合自己结束」——但回合若一直不结束（长任务/卡住），
   // 手机端就完全无解。这里的出口是**真的让桌面停下**（打断当前回合），而不是
   // 仅清屏障（清屏障后消息仍要等桌面空闲才投得出去）。
-  const canInterrupt = view.blockedReasonCode === "native_turn_pending";
+  // 能力位门控（复审 P2-2）：canInterrupt=false 的 Desktop build（未活体验证
+  // interrupt）按钮在源头隐藏——渲染出来也只会永远 503；旧载荷缺省视为无能力
+  //（保守方向：宁可没有按钮，不可有假出口）。
+  const canInterrupt =
+    view.blockedReasonCode === "native_turn_pending" && view.canInterrupt === true;
 
   return (
     <div

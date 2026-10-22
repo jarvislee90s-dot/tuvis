@@ -2010,6 +2010,7 @@
         "interruptYes": "停止并继续",
         "interruptCancel": "取消",
         "interruptDone": "已发出停止指令——回合停止后队列会自动继续",
+        "interruptUncertain": "停止指令已发出，但结果不确定（可能已生效）——请回桌面核对回合状态，不要连续重按",
         "interruptNoTurn": "桌面当前没有可停止的回合（可能刚好自己结束了）",
         "interruptFailed": "停止失败：{{message}}"
       },

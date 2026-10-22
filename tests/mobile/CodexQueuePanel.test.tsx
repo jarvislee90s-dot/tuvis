@@ -28,9 +28,11 @@ function action(over: Partial<CodexActionView> = {}): CodexActionView {
 function queueView(
   actions: CodexActionView[],
   blockedReasonCode: string | null = null,
-  blockedActionIds: string[] = []
+  blockedActionIds: string[] = [],
+  /** 2026-10-22 复审 P2-2：canInterrupt 能力位（缺省 true = 已活体验证的 build） */
+  canInterrupt: boolean = true
 ): CodexQueueView {
-  return { actions, blockedReasonCode, blockedActionIds };
+  return { actions, blockedReasonCode, blockedActionIds, canInterrupt };
 }
 
 interface Routes {
@@ -45,6 +47,8 @@ interface Routes {
   queueHang?: boolean;
   /** POST /codex/turn/interrupt 的失败状态码（缺省 200） */
   interruptStatus?: number;
+  /** POST /codex/turn/interrupt 的错误体覆盖（缺省 {error:"capability_unavailable"}） */
+  interruptErrorBody?: Record<string, unknown>;
   /** POST /codex/turn/interrupt 的回执体覆盖（null = 桌面无可打断回合） */
   interruptBody?: Record<string, unknown>;
 }
@@ -90,9 +94,10 @@ function installFetch() {
     }
     if (url.includes("/codex/turn/interrupt")) {
       if (routes.interruptStatus) {
-        return new Response(JSON.stringify({ error: "capability_unavailable" }), {
-          status: routes.interruptStatus,
-        });
+        return new Response(
+          JSON.stringify(routes.interruptErrorBody ?? { error: "capability_unavailable" }),
+          { status: routes.interruptStatus }
+        );
       }
       return new Response(
         JSON.stringify(
@@ -587,6 +592,34 @@ describe("CodexQueuePanel（Task 9）", () => {
     r3.unmount();
   });
 
+  it("interrupt_button_hidden_when_capability_false：canInterrupt=false（或缺省的旧载荷）→ native_turn_pending 阻塞态也不渲染打断按钮，零请求（复审 P2-2：无能力 build 不给假出口）", async () => {
+    installFetch();
+    // canInterrupt=false：本 Desktop build 未活体验证打断能力
+    routes.queue = [queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"], false)];
+    const { unmount } = render(<CodexQueuePanel sessionId="s1" />);
+    // 面板与阻塞说明条在（不是面板没渲染导致的假绿）
+    await screen.findByTestId("codex-queue-blocked");
+    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
+    // 确认条也不出现（按钮都无，确认臂无从进入）
+    expect(screen.queryByTestId("codex-queue-interrupt-confirm")).toBeNull();
+    // 零打断请求（无假出口 = 不会发出注定 503 的调用）
+    expect(interruptBodies()).toEqual([]);
+    unmount();
+    // 旧后端载荷缺省 canInterrupt 字段 → 同样视为无能力（保守方向）
+    routes.queue = [
+      {
+        actions: [action({ actionId: "a2" })],
+        blockedReasonCode: "native_turn_pending",
+        blockedActionIds: ["t-1"],
+      },
+    ];
+    const r2 = render(<CodexQueuePanel sessionId="s1" />);
+    await screen.findByTestId("codex-queue-blocked");
+    expect(screen.queryByTestId("codex-queue-interrupt")).toBeNull();
+    expect(interruptBodies()).toEqual([]);
+    r2.unmount();
+  });
+
   it("interrupt_requires_confirmation：点击先出确认条（含工作丢失风险披露），确认前零请求；取消零请求", async () => {
     installFetch();
     routes.queue = [queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"])];
@@ -632,9 +665,42 @@ describe("CodexQueuePanel（Task 9）", () => {
     expect(screen.getByTestId("codex-queue-note").textContent).toContain("没有可停止的回合");
   });
 
-  it("interrupt_failure_shows_error：失败显示错误不静默（仍重拉权威列表）", async () => {
+  it("interrupt_uncertain_reported_honestly：uncertain=true（指令已发出但结果未知）→ 如实说「不确定」并劝阻连续重按，不报失败也不谎报确定成功（复审 P2-3）", async () => {
+    installFetch();
+    // RPC 超时形态：200 但 uncertain=true、interruptedTurnId=null、reasonCode=timeout
+    routes.interruptBody = {
+      ok: true,
+      uncertain: true,
+      interruptedTurnId: null,
+      expectedTurnId: "t-1",
+      reasonCode: "timeout",
+    };
+    routes.queue = [
+      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
+      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]), // 操作后重拉
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
+    fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
+    await waitFor(() => expect(interruptBodies()).toEqual(['{"sessionId":"s1"}']));
+    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
+    // 如实呈现「不确定」+ 明确劝阻连续重按（重按 = 双发破坏性指令）
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain("不确定");
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain("不要连续重按");
+    // 不是失败（不得诱导立刻重按），也不是「没有可停止的回合」
+    expect(screen.getByTestId("codex-queue-note").textContent).not.toContain("停止失败");
+    expect(screen.getByTestId("codex-queue-note").textContent).not.toContain("没有可停止的回合");
+    // 仍重拉权威列表（回合真实终态以服务端账本为准）
+    expect(queueGetCalls()).toBe(2);
+  });
+
+  it("interrupt_failure_shows_error：503 能力不可用（body 带中文 reason）→ note 显示后端 reason 原文，不裸示机器码（仍重拉权威列表）", async () => {
     installFetch();
     routes.interruptStatus = 503;
+    routes.interruptErrorBody = {
+      error: "capability_unavailable",
+      reason: "当前桌面 Codex 版本未启用远程停止能力（未完成活体验证），无法远程打断回合",
+    };
     routes.queue = [
       queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
       queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
@@ -644,7 +710,36 @@ describe("CodexQueuePanel（Task 9）", () => {
     fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
     await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
     expect(screen.getByTestId("codex-queue-note").textContent).toContain("停止失败");
+    // reason 回退链第一优先：后端中文 reason 原文可见，机器码不裸示
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain(
+      "当前桌面 Codex 版本未启用远程停止能力（未完成活体验证），无法远程打断回合"
+    );
+    expect(screen.getByTestId("codex-queue-note").textContent).not.toContain(
+      "capability_unavailable"
+    );
     expect(queueGetCalls()).toBe(2);
+  });
+
+  it("interrupt_failure_shows_backend_reason_desktop_rejected：409 desktop_rejected（桌面明确拒绝）→ note 显示中文 reason，不裸示机器码", async () => {
+    installFetch();
+    routes.interruptStatus = 409;
+    routes.interruptErrorBody = {
+      error: "desktop_rejected",
+      reason: "桌面 Codex 明确拒绝了本次打断指令，回合未被停止",
+    };
+    routes.queue = [
+      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
+      queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
+    ];
+    render(<CodexQueuePanel sessionId="s1" />);
+    fireEvent.click(await screen.findByTestId("codex-queue-interrupt"));
+    fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
+    await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain("停止失败");
+    expect(screen.getByTestId("codex-queue-note").textContent).toContain(
+      "桌面 Codex 明确拒绝了本次打断指令，回合未被停止"
+    );
+    expect(screen.getByTestId("codex-queue-note").textContent).not.toContain("desktop_rejected");
   });
 
   it("interrupt_i18n_keys_exist：新键两侧必须存在（键集对齐由 check:i18n 保证）", async () => {
@@ -654,6 +749,7 @@ describe("CodexQueuePanel（Task 9）", () => {
       "interruptYes",
       "interruptCancel",
       "interruptDone",
+      "interruptUncertain",
       "interruptNoTurn",
       "interruptFailed",
     ]) {

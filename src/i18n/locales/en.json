@@ -2010,6 +2010,7 @@
         "interruptYes": "Stop & continue",
         "interruptCancel": "Cancel",
         "interruptDone": "Stop request sent — the queue will continue once the turn stops",
+        "interruptUncertain": "Stop request sent, but the outcome is uncertain (it may have taken effect) — verify the turn state on the desktop instead of pressing repeatedly",
         "interruptNoTurn": "No running turn to stop on the desktop (it may have just finished on its own)",
         "interruptFailed": "Stop failed: {{message}}"
       },
