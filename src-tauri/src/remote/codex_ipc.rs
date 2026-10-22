@@ -1941,10 +1941,11 @@ pub async fn queue_view(
     // 不得被镜像活动回合「洗」成 native_turn_active（复审 Minor-2）；镜像 stale /
     // 无活动回合 → 保持 None（面板自隐，不渲染空壳）。
     let blocked_reason_code = if blocked_reason_code.is_none() && fence_summary.is_ok() {
-        match st.codex_control.adapter.mirror_active_turn_id(&key).await {
-            Some(_) => Some(BLOCKED_NATIVE_TURN_ACTIVE.to_string()),
-            None => None,
-        }
+        st.codex_control
+            .adapter
+            .mirror_active_turn_id(&key)
+            .await
+            .map(|_| BLOCKED_NATIVE_TURN_ACTIVE.to_string())
     } else {
         blocked_reason_code
     };
@@ -2173,24 +2174,24 @@ fn interrupt_not_sent_response(reason: &str) -> Response {
         "stale_context" => error_body(
             StatusCode::CONFLICT,
             reason,
-            Some("桌面会话上下文已过期（桌面端可能重开或换代），请刷新页面后重试"),
+            Some("CODEX_INTERRUPT_STALE_CONTEXT: 桌面会话上下文已过期（桌面端可能重开或换代），请刷新页面后重试"),
         ),
         "capability_unavailable" => error_body(
             StatusCode::SERVICE_UNAVAILABLE,
             reason,
-            Some("当前桌面 Codex 版本未启用远程停止能力（未完成活体验证），无法远程打断回合"),
+            Some("CODEX_INTERRUPT_CAPABILITY_UNVERIFIED: 当前桌面 Codex 版本未启用远程停止能力（未完成活体验证），无法远程打断回合"),
         ),
         "expected_turn_missing" => error_body(
             StatusCode::INTERNAL_SERVER_ERROR,
             reason,
             Some(
-                "服务端未能取到打断安全阀（expectedTurnId），已放弃本次打断——未向桌面发送任何指令",
+                "CODEX_INTERRUPT_VALVE_MISSING: 服务端未能取到打断安全阀（expectedTurnId），已放弃本次打断——未向桌面发送任何指令",
             ),
         ),
         _ => error_body(
             StatusCode::SERVICE_UNAVAILABLE,
             reason,
-            Some("停止指令未能送达桌面（连接不可用或通道拥塞），桌面未被改动"),
+            Some("CODEX_INTERRUPT_UNDELIVERED: 停止指令未能送达桌面（连接不可用或通道拥塞），桌面未被改动"),
         ),
     }
 }
@@ -2292,7 +2293,7 @@ pub async fn interrupt_turn(
                     return error_body(
                         StatusCode::CONFLICT,
                         "no_expected_turn",
-                        Some("取不到打断安全阀：请求未带 turnId，且没有在册的原生回合屏障，镜像里也没有正在运行的回合。为免误伤桌面其他回合，已拒绝打断（未发送任何指令）"),
+                        Some("CODEX_INTERRUPT_NO_VALVE: 取不到打断安全阀：请求未带 turnId，且没有在册的原生回合屏障，镜像里也没有正在运行的回合。为免误伤桌面其他回合，已拒绝打断（未发送任何指令）"),
                     );
                 }
             }
@@ -2306,7 +2307,7 @@ pub async fn interrupt_turn(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     serde_json::json!({
                         "error": "internal",
-                        "reason": "读取打断安全阀失败，已放弃本次打断（未向桌面发送任何指令），请稍后重试",
+                        "reason": "CODEX_INTERRUPT_VALVE_READ_FAILED: 读取打断安全阀失败，已放弃本次打断（未向桌面发送任何指令），请稍后重试",
                     }),
                 );
             }
@@ -2411,7 +2412,7 @@ pub async fn interrupt_turn(
             error_body(
                 StatusCode::CONFLICT,
                 "desktop_rejected",
-                Some("桌面 Codex 明确拒绝了本次打断指令，回合未被停止"),
+                Some("CODEX_INTERRUPT_DESKTOP_REJECTED: 桌面 Codex 明确拒绝了本次打断指令，回合未被停止"),
             )
         }
         Delivery::NotSent => {

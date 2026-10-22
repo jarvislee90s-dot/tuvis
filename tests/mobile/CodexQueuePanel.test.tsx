@@ -714,12 +714,13 @@ describe("CodexQueuePanel（Task 9）", () => {
     expect(queueGetCalls()).toBe(2);
   });
 
-  it("interrupt_failure_shows_error：503 能力不可用（body 带中文 reason）→ note 显示后端 reason 原文，不裸示机器码（仍重拉权威列表）", async () => {
+  it("interrupt_failure_shows_error：503 能力不可用（body 带打码中文 reason）→ note 显示按码映射的文案，不裸示机器码（仍重拉权威列表）", async () => {
     installFetch();
     routes.interruptStatus = 503;
     routes.interruptErrorBody = {
       error: "capability_unavailable",
-      reason: "当前桌面 Codex 版本未启用远程停止能力（未完成活体验证），无法远程打断回合",
+      reason:
+        "CODEX_INTERRUPT_CAPABILITY_UNVERIFIED: 当前桌面 Codex 版本未启用远程停止能力（未完成活体验证），无法远程打断回合",
     };
     routes.queue = [
       queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
@@ -730,22 +731,22 @@ describe("CodexQueuePanel（Task 9）", () => {
     fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
     await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
     expect(screen.getByTestId("codex-queue-note").textContent).toContain("停止失败");
-    // reason 回退链第一优先：后端中文 reason 原文可见，机器码不裸示
-    expect(screen.getByTestId("codex-queue-note").textContent).toContain(
-      "当前桌面 Codex 版本未启用远程停止能力（未完成活体验证），无法远程打断回合"
-    );
+    // 带码 reason 过 formatInvokeError：按码映射 errors.* 文案，码前缀不裸示
+    const note = screen.getByTestId("codex-queue-note").textContent ?? "";
+    expect(note).toContain("当前桌面 Codex 版本未启用远程停止能力");
+    expect(note).not.toContain("CODEX_INTERRUPT_");
     expect(screen.getByTestId("codex-queue-note").textContent).not.toContain(
       "capability_unavailable"
     );
     expect(queueGetCalls()).toBe(2);
   });
 
-  it("interrupt_failure_shows_backend_reason_desktop_rejected：409 desktop_rejected（桌面明确拒绝）→ note 显示中文 reason，不裸示机器码", async () => {
+  it("interrupt_failure_shows_backend_reason_desktop_rejected：409 desktop_rejected（桌面明确拒绝，打码 reason）→ note 显示映射文案，不裸示机器码", async () => {
     installFetch();
     routes.interruptStatus = 409;
     routes.interruptErrorBody = {
       error: "desktop_rejected",
-      reason: "桌面 Codex 明确拒绝了本次打断指令，回合未被停止",
+      reason: "CODEX_INTERRUPT_DESKTOP_REJECTED: 桌面 Codex 明确拒绝了本次打断指令，回合未被停止",
     };
     routes.queue = [
       queueView([action({ actionId: "a1" })], "native_turn_pending", ["t-1"]),
@@ -756,9 +757,9 @@ describe("CodexQueuePanel（Task 9）", () => {
     fireEvent.click(screen.getByTestId("codex-queue-interrupt-yes"));
     await waitFor(() => expect(screen.getByTestId("codex-queue-note")).toBeTruthy());
     expect(screen.getByTestId("codex-queue-note").textContent).toContain("停止失败");
-    expect(screen.getByTestId("codex-queue-note").textContent).toContain(
-      "桌面 Codex 明确拒绝了本次打断指令，回合未被停止"
-    );
+    const note = screen.getByTestId("codex-queue-note").textContent ?? "";
+    expect(note).toContain("桌面 Codex 明确拒绝了本次打断指令");
+    expect(note).not.toContain("CODEX_INTERRUPT_");
     expect(screen.getByTestId("codex-queue-note").textContent).not.toContain("desktop_rejected");
   });
 

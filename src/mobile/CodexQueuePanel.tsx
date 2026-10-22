@@ -45,6 +45,7 @@ import {
   type CodexQueueView,
 } from "./codexIpcApi";
 import { ApiError } from "./api";
+import { formatInvokeError } from "../lib/invokeError";
 
 /** 外部触发的去抖窗口（毫秒）：同一会话内的密集触发（发送回执 + 投影跃迁几乎
  *  同时到达）合并为一次重拉；拉取本身是会话级短查询，延迟一拍无感 */
@@ -74,11 +75,17 @@ function stateLabel(s: CodexActionState): string {
 
 /** ApiError → 可读分诊片段：后端 reason（人类可读，如「该消息仍在排队，请使用
  *  撤回」）优先，其次机器码 error（如 no_barrier / queued_use_retract），最后兜底
- *  e.message——对齐 PendingRequestCard C5 臂的回退链，不把「路径 + 状态码」裸示人 */
+ *  e.message——对齐 PendingRequestCard C5 臂的回退链，不把「路径 + 状态码」裸示人。
+ *  带码 reason（错误码门禁约定）过 formatInvokeError 按码换 errors.* 文案；
+ *  未知码/无码原样返回。 */
 function apiErrorReason(e: ApiError): string {
-  if (typeof e.data?.reason === "string" && e.data.reason !== "") return e.data.reason;
-  if (typeof e.data?.error === "string" && e.data.error !== "") return e.data.error;
-  return e.message;
+  const raw =
+    typeof e.data?.reason === "string" && e.data.reason !== ""
+      ? e.data.reason
+      : typeof e.data?.error === "string" && e.data.error !== ""
+        ? e.data.error
+        : e.message;
+  return formatInvokeError(raw, i18n.t);
 }
 
 /** 该次 force-continue 失败是否「该 id 无需解除」的确定性收尾（2026-10-19 复审

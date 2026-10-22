@@ -360,7 +360,7 @@ impl ThreadMirror {
             .into_iter()
             .filter(|t| t.status == Some("inProgress"))
             .map(|t| t.turn_id.to_string())
-            .last()
+            .next_back()
     }
 
     /// **本次请求的正式消息身份是否已在该 Turn 中落地**（2026-10-20 复审 P1）：
