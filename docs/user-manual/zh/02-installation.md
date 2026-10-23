@@ -32,3 +32,37 @@
 - **从 0.5.5 及之后版本升级**：直接用新安装包覆盖安装即可，hook 配置由应用启动时自动迁移。
 - **数据都在本地**：兔维斯的所有数据（数据库、设置、日志、技能仓库）存放在 `~/.tuvis/` 目录，备份这个目录即备份全部数据。
 - **macOS 提示「应用已损坏」或「无法验证开发者」**：这是系统对未公证安装包的通用拦截。在「系统设置」的隐私与安全性区域找到关于兔维斯的放行提示并点击允许；或对应用右键（Ctrl+点按）选「打开」启动一次，之后即可正常双击打开。
+
+## 数据目录
+
+应用数据统一存放在 `~/.tuvis/`：
+
+| 路径                            | 用途                                        |
+| ------------------------------- | ------------------------------------------- |
+| `~/.tuvis/tuvis.db`             | SQLite 数据库（设置、扩展、预设、会话缓存） |
+| `~/.tuvis/skills/`              | 全局 Skill 仓库                             |
+| `~/.tuvis/mcp/`                 | 全局 MCP 服务器配置                         |
+| `~/.tuvis/hooks/status-hook.sh` | 共享 Hook 脚本（状态事件）                  |
+| `~/.tuvis/events/`              | Hook 事件文件（自动清理，30 秒 TTL）        |
+
+## 开发构建（从源码运行）
+
+**macOS 开发版提示**：开发版（未签名打包）首次使用「一键恢复会话」开窗前，需在
+**系统设置 > 隐私与安全性 > 自动化** 中手动允许兔维斯控制
+Terminal / iTerm2 一次（TCC 不会自动弹窗）。未授权时 osascript 以 -1743 失败，
+resume 会回执「macOS 自动化授权缺失」并给出该指引。
+
+**helper 构建门（批次丙 T2 固化）**：`tuvis-hook-listener`（hook 事件监听 helper）
+与 `tuvis-marker`（窗口标题标记）都挂在 Cargo `required-features` 门后——**不带
+feature 时根本不构建**，应用启动的 `ensure_hook_script` 就找不到同目录 helper、
+跳过安装，`~/.tuvis/bin/` 里那份永远是旧构建（实测故障：事件缺 `tool_name` 载荷 →
+问答卡通道 A 永不识别）。
+
+- `pnpm tauri:dev` / `pnpm tauri:build` **已内置 feature**（`hook-listener` 与
+  `marker-helper`，后者蕴含前者），照常用即可；
+- 单独构建 helper（如跑实机 `#[ignore]` 测试）必须显式带上：
+  `cd src-tauri && cargo build --bin tuvis-hook-listener --features hook-listener`；
+- 跑 bin 测试同理：`cargo test --bin tuvis-hook-listener --features hook-listener`；
+- macOS 打包（`release:macos` / release.yml 的 macOS job）走的是裸
+  `pnpm tauri build` 显式参数，**不受**上述 npm script 影响——额外 bin 会令
+  universal 打包失败，故 macOS 侧有意不带 feature（helper 为 Windows 通道）。

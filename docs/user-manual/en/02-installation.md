@@ -32,3 +32,15 @@ Tuvis ships installers for Windows and macOS — grab the latest release from Gi
 - **Upgrading from 0.5.5 or later**: just install over the top with the new installer; hook configuration is migrated automatically at app startup.
 - **All data stays local**: everything Tuvis keeps (database, settings, logs, skill repository) lives under `~/.tuvis/` — back up that directory and you have backed up everything.
 - **macOS says the app "is damaged" or "can't verify the developer"**: this is the system's standard block for unnotarized packages. In System Settings' Privacy & Security area, find the allow prompt about Tuvis and click Allow; or right-click the app (Ctrl+click) and choose "Open" once — after that double-clicking works normally.
+
+## Data directory (`~/.tuvis/`)
+
+The app stores its data in `~/.tuvis/`:
+
+| Path                            | Purpose                                                        |
+| ------------------------------- | -------------------------------------------------------------- |
+| `~/.tuvis/tuvis.db`             | SQLite database (settings, extensions, presets, session cache) |
+| `~/.tuvis/skills/`              | Global skill repository                                        |
+| `~/.tuvis/mcp/`                 | Global MCP server configs                                      |
+| `~/.tuvis/hooks/status-hook.sh` | Shared Hook script for status events                           |
+| `~/.tuvis/events/`              | Hook event files (auto-cleaned, 30s TTL)                       |
