@@ -23,6 +23,18 @@ _Only versions translated so far are listed here; the full history lives in the
   `AGENTS.md` bilingual asset table, project tree, and the README pin in the
   `usage-partial-coverage-lock` test were updated accordingly.
 
+## [0.6.2] - Unreleased
+
+### Upgrade Notes
+
+- **One-time UI language reset**: older versions cached the auto-detected system
+  language in the same local key as manual choices, so the two could not be told
+  apart. From this version on, only manual choices are remembered. After
+  upgrading, desktop users who had manually switched the UI language will fall
+  back to the system language once — pick your language again and it sticks
+  (no longer overridden by system-language changes). Users who never switched
+  manually will notice no difference.
+
 ## [0.6.1] - 2026-10-22
 
 ### Changed
