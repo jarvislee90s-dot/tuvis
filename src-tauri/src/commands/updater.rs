@@ -307,40 +307,154 @@ struct ProgressPayload<'a> {
     content_length: Option<u64>,
 }
 
-/// 一键升级：动态端点指向目标 release 的 latest.json，复用插件的
-/// 签名校验与平台安装（Windows NSIS passive 后插件自行退出重启；
-/// macOS 换壳成功后由本命令重启）。进度经 `tuvis-updater-progress` 事件广播。
-#[tauri::command]
-pub async fn install_github_update(
-    app: tauri::AppHandle,
-    latest_json_url: String,
-) -> Result<(), String> {
-    // 插件仅在 release 构建注册（lib.rs）；debug 构建下 updater_builder 会因
-    // state 未托管而 panic，先降级提示（评审 I3：运行时 env 门已随 lib.rs 移除）
-    if cfg!(debug_assertions) {
-        return Err(
-            "此构建未启用应用内升级（仅 release 构建支持），请到 GitHub release 页下载".into(),
-        );
-    }
-    validate_latest_json_url(&latest_json_url)?;
-    let url: tauri::Url = latest_json_url
-        .parse()
-        .map_err(|e| format!("UPDATER_MANIFEST_URL_INVALID: 升级清单地址无效: {e}"))?;
+/// 升级下载链路涉及的域名（DoH 兜底钉 IP 的覆盖面）：latest.json 挂在 github.com，
+/// 拿到 302 后落资产域——release-assets 为现行域、objects 为旧域，两代都钉（漏钉
+/// 的域回落系统解析 + 直连，该域兜底失效但不致错连）
+const DOWNLOAD_HOSTS: [&str; 3] = [
+    "github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+];
 
-    let updater = app
+/// 一次升级尝试的失败分类：传输层失败（reqwest 请求失败 / 下载 HTTP 异常状态）换
+/// 管道重试有价值；签名/安装/「远端无更新」等换网络救不了，直接如实上报。
+struct AttemptError {
+    message: String,
+    retryable: bool,
+}
+
+impl AttemptError {
+    fn terminal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    /// 插件错误 → 是否可重试 + 完整 source 链拍平（0.5.1 教训同 flatten_error_chain
+    /// 注释：reqwest 顶层 Display 只有一句「error sending request for url」，成因
+    /// 全在链里——裸 {e} 会让用户分不清代理挂了还是证书被劫持）。
+    /// 可重试 = 传输层家族：Reqwest/Network 之外还包括 ReleaseNotFound——插件
+    /// （2.13.0 check 循环）对清单请求**非 2xx**（经代理的 502/503、GitHub 限流
+    /// 403——代理瞬断的常见形态）不记 last_error，循环尽后统一落该变体；真
+    /// 「远端无更新」走 204 → Ok(None)，不经此变体，改判可重试不会误吞。
+    fn from_plugin(code: &str, what: &str, e: tauri_plugin_updater::Error) -> Self {
+        let retryable = matches!(
+            &e,
+            tauri_plugin_updater::Error::Reqwest(_)
+                | tauri_plugin_updater::Error::Network(_)
+                | tauri_plugin_updater::Error::ReleaseNotFound
+        );
+        Self {
+            message: format!("{code}: {what}: {}", flatten_error_chain(&e)),
+            retryable,
+        }
+    }
+}
+
+/// DoH 解析下载域并产出钉 IP 表：github.com（清单域）解析不到 → 兜底无从谈起，
+/// Err 以其失败为主因如实带出（其余域的错误附后）；资产域解析不到 → 跳过该域
+/// （部分钉仍优于全不钉）。探针是 reqwest::blocking——async 上下文直接调会
+/// panic，必须 spawn_blocking（与发现层 fetch_releases_via_doh_pinned 同纪律）。
+/// 口径取舍（与发现层不同强度，后人勿当成对等）：每域只钉首个可用地址、不逐
+/// IP 轮试（发现层按 3 IP 重建重试——安装层每次重试要重建整套 updater，首 IP
+/// 陈旧即整跳失败的代价可接受）；三域串行探测最坏 ~90s（3 域 × 2 类型 × 3 源 ×
+/// 5s 超时），期间命令在途、进度条静止属已知有界边界。
+async fn resolve_download_hosts_pinned() -> Result<Vec<(String, std::net::SocketAddr)>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let probe = crate::remote::tailscale::real_probe();
+        let mut pinned = Vec::new();
+        // github.com 的失败单独留存：它是 Err 的充分条件（主因），不能被后续域的
+        // 失败覆写挤出报文——「失败原因第一眼可定位」
+        let mut manifest_err: Option<String> = None;
+        let mut asset_errs: Vec<String> = Vec::new();
+        for host in DOWNLOAD_HOSTS {
+            let addrs = match probe(host) {
+                Ok(addrs) => addrs,
+                Err(e) => {
+                    let msg = format!("{host}: {e}");
+                    if host == "github.com" {
+                        manifest_err = Some(msg);
+                    } else {
+                        asset_errs.push(msg);
+                    }
+                    continue;
+                }
+            };
+            match addrs
+                .iter()
+                .find_map(|a| a.parse::<std::net::IpAddr>().ok())
+            {
+                Some(ip) => pinned.push((host.to_string(), std::net::SocketAddr::new(ip, 443))),
+                None => {
+                    let msg = format!("{host}: DoH 未给出可用地址");
+                    if host == "github.com" {
+                        manifest_err = Some(msg);
+                    } else {
+                        asset_errs.push(msg);
+                    }
+                }
+            }
+        }
+        match manifest_err {
+            Some(primary) => {
+                let mut msg = format!("UPDATER_DOH_FAIL: 下载域 DoH 解析失败: {primary}");
+                if !asset_errs.is_empty() {
+                    msg.push_str(&format!("；其余域: {}", asset_errs.join("; ")));
+                }
+                Err(msg)
+            }
+            None => Ok(pinned),
+        }
+    })
+    .await
+    .map_err(|e| format!("UPDATER_DOH_TASK_FAIL: DoH 解析任务失败: {e}"))?
+}
+
+/// 单次升级尝试：建 updater（可选注入「no_proxy + DoH 钉 IP」客户端定制）→
+/// check 清单 → download_and_install。进度事件沿 PROGRESS_EVENT 广播（两跳共用，
+/// 第二跳重试会重播 Started/Progress，前端按同一事件流续显）；Windows 成功路径
+/// 在插件 install 内部 exit(0)，Ok(()) 实际仅非 Windows 路径可达。
+async fn run_updater_attempt(
+    app: &tauri::AppHandle,
+    url: tauri::Url,
+    pinned: Option<Vec<(String, std::net::SocketAddr)>>,
+) -> Result<(), AttemptError> {
+    let builder = app
         .updater_builder()
         .endpoints(vec![url])
-        .map_err(|e| format!("UPDATER_ENDPOINT_INVALID: 升级端点无效: {e}"))?
+        .map_err(|e| {
+            AttemptError::terminal(format!("UPDATER_ENDPOINT_INVALID: 升级端点无效: {e}"))
+        })?
         // 评审 I1：Windows 安装路径插件内部直接 exit(0)，不走 RunEvent::Exit——
         // 挂共享退出清理，保证隧道/电源锁不孤儿化（macOS 走 restart→Exit，钩子冗余无害）
-        .on_before_exit(crate::exit_cleanup)
+        .on_before_exit(crate::exit_cleanup);
+    // configure_client 是 replace 语义（后调覆盖先调），两路定制必须各自完整：
+    // 共同项 = connect_timeout（插件默认无超时——代理挂死时请求无限悬停，用户只能
+    // 干等；只约束建连，不截断慢速大包传输）；兜底路再加 no_proxy + 钉 IP resolve。
+    // 闭包参数是插件私有 reqwest 0.13 的 ClientBuilder（与应用侧 0.12 不是同一类型，
+    // 无法具名导入）——依赖 configure_client 的泛型签名推断，方法调用照常。
+    let builder = match pinned {
+        Some(pinned) => builder.configure_client(move |b| {
+            pinned
+                .iter()
+                .fold(b.no_proxy(), |b, (host, addr)| b.resolve(host.as_str(), *addr))
+                .connect_timeout(std::time::Duration::from_secs(10))
+        }),
+        None => {
+            builder.configure_client(|b| b.connect_timeout(std::time::Duration::from_secs(10)))
+        }
+    };
+    let updater = builder
         .build()
-        .map_err(|e| format!("UPDATER_BUILDER_FAIL: 升级器构建失败: {e}"))?;
+        .map_err(|e| {
+            AttemptError::terminal(format!("UPDATER_BUILDER_FAIL: 升级器构建失败: {e}"))
+        })?;
     let update = updater
         .check()
         .await
-        .map_err(|e| format!("UPDATER_MANIFEST_VERIFY: 升级清单校验失败: {e}"))?
-        .ok_or("远端清单不包含可用更新")?;
+        .map_err(|e| AttemptError::from_plugin("UPDATER_MANIFEST_VERIFY", "升级清单校验失败", e))?
+        .ok_or_else(|| AttemptError::terminal("远端清单不包含可用更新"))?;
 
     let emit_progress = |event: &str, downloaded: u64, content_length: Option<u64>| {
         let _ = app.emit(
@@ -381,7 +495,7 @@ pub async fn install_github_update(
             },
         )
         .await
-        .map_err(|e| format!("UPDATER_INSTALL_FAIL: 下载或安装失败: {e}"))?;
+        .map_err(|e| AttemptError::from_plugin("UPDATER_INSTALL_FAIL", "下载或安装失败", e))?;
 
     // Windows：插件在 install 内部已 exit(0)（由 NSIS /UPDATE 装完重启），走不到这里；
     // macOS：换壳完成，重启进新版本（restart 返回 !，下方 Ok 仅非 macOS 路径可达）
@@ -390,6 +504,48 @@ pub async fn install_github_update(
 
     #[cfg(not(target_os = "macos"))]
     Ok(())
+}
+
+/// 一键升级：动态端点指向目标 release 的 latest.json，复用插件的
+/// 签名校验与平台安装（Windows NSIS passive 后插件自行退出重启；
+/// macOS 换壳成功后由本命令重启）。进度经 `tuvis-updater-progress` 事件广播。
+#[tauri::command]
+pub async fn install_github_update(
+    app: tauri::AppHandle,
+    latest_json_url: String,
+) -> Result<(), String> {
+    // 插件仅在 release 构建注册（lib.rs）；debug 构建下 updater_builder 会因
+    // state 未托管而 panic，先降级提示（评审 I3：运行时 env 门已随 lib.rs 移除）
+    if cfg!(debug_assertions) {
+        return Err(
+            "此构建未启用应用内升级（仅 release 构建支持），请到 GitHub release 页下载".into(),
+        );
+    }
+    validate_latest_json_url(&latest_json_url)?;
+    let url: tauri::Url = latest_json_url
+        .parse()
+        .map_err(|e| format!("UPDATER_MANIFEST_URL_INVALID: 升级清单地址无效: {e}"))?;
+
+    // 两跳编排（与发现层 fetch_github_releases 同哲学）：第一跳插件默认管道（环境
+    // 变量 + 系统代理）；传输层失败（代理瞬断/直连被墙）→ 第二跳 DoH 钉 IP 直连
+    // 兜底。非传输类失败（签名/安装/远端无更新）换网络无意义，直接上报。两跳的
+    // 失败原因都如实带出（拼接格式与发现层一致）。
+    match run_updater_attempt(&app, url.clone(), None).await {
+        Ok(()) => Ok(()),
+        Err(first) if first.retryable => {
+            let via_pinned = match resolve_download_hosts_pinned().await {
+                Ok(pinned) => run_updater_attempt(&app, url, Some(pinned)).await,
+                Err(doh) => Err(AttemptError::terminal(doh)),
+            };
+            via_pinned.map_err(|second| {
+                format!(
+                    "{}；DoH 钉 IP 直连兜底也失败: {}",
+                    first.message, second.message
+                )
+            })
+        }
+        Err(terminal) => Err(terminal.message),
+    }
 }
 
 /// 扫除 base 目录下 `{app_name}-*-updater-*` 残留（仅 Windows 升级流产生；
