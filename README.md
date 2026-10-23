@@ -51,6 +51,21 @@ Step-by-step documentation lives in the **[user manual](docs/user-manual/en/01-o
 | ✅ **Tool toggle management** | Decide which tools Tuvis monitors and manages; unchecking fully restores and hides the tool | [Ch. 9](docs/user-manual/en/09-resources.md) |
 | 🩺 **Signal health** | Hook trust-gate self-check per tool, with honest per-tool reasons instead of a bare "unregistered" | [Ch. 12](docs/user-manual/en/12-troubleshooting.md) |
 
+## See it in action
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/user-manual/img/mobile-board.png" alt="Mobile session board" /><br><sub><b>Mobile board</b> — the same traffic-light board in your phone's browser</sub></td>
+    <td align="center"><img src="docs/images/mobile-detail-v0.5.0.png" alt="Session detail page" /><br><sub><b>Session detail</b> — messages, files and sub-agents in one view</sub></td>
+    <td align="center"><img src="docs/images/mobile-approve-v0.5.0.png" alt="Remote approval card" /><br><sub><b>Remote approvals</b> — approve tool calls &amp; plans from your phone</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/user-manual/img/usage-dashboard.png" alt="Token usage dashboard" /><br><sub><b>Usage ledger</b> — tokens &amp; costs for seven tools, honestly accounted</sub></td>
+    <td align="center"><img src="docs/images/foxbell-pet.png" alt="Desktop pet" /><br><sub><b>Desktop pets</b> — status cards &amp; voice alerts in the corner of your screen</sub></td>
+    <td align="center"><img src="docs/images/remote-settings-v0.6.0.png" alt="Remote access settings" /><br><sub><b>Remote access</b> — four channels, each with its own setup wizard</sub></td>
+  </tr>
+</table>
+
 ## Capability Matrix
 
 13 capability rows × 8 terminal-class AI coding tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported) — the master table, updated with every release. Structured source: [`docs/capabilities.json`](docs/capabilities.json), shared with the website.

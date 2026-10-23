@@ -51,6 +51,21 @@
 | ✅ **工具勾选管理** | 决定哪些工具纳入监控与管理；取消勾选彻底还原并隐藏 | [第 9 章](docs/user-manual/zh/09-resources.md) |
 | 🩺 **信号健康度** | 各工具 Hook 信任门自查，未就绪时给出如实原因而非干巴巴的「未注册」 | [第 12 章](docs/user-manual/zh/12-troubleshooting.md) |
 
+## 产品一览
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/user-manual/img/mobile-board.png" alt="手机看板" /><br><sub><b>手机看板</b>——手机浏览器里同一块红绿灯看板</sub></td>
+    <td align="center"><img src="docs/images/mobile-detail-v0.5.0.png" alt="会话详情页" /><br><sub><b>会话详情</b>——消息、文件、子 Agent 一页看全</sub></td>
+    <td align="center"><img src="docs/images/mobile-approve-v0.5.0.png" alt="远程审批卡" /><br><sub><b>远程审批</b>——手机上批准工具调用与计划</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/user-manual/img/usage-dashboard.png" alt="Token 用量看板" /><br><sub><b>用量账本</b>——七个工具的 Token 与费用，口径如实</sub></td>
+    <td align="center"><img src="docs/images/foxbell-pet.png" alt="内置桌宠" /><br><sub><b>内置桌宠</b>——屏幕角落的状态卡片与原声语音</sub></td>
+    <td align="center"><img src="docs/images/remote-settings-v0.6.0.png" alt="远程接入设置页" /><br><sub><b>远程接入</b>——四条通道，各带配置向导</sub></td>
+  </tr>
+</table>
+
 ## 能力矩阵
 
 13 行能力 × 8 个终端类 AI 编程工具（✅ 支持 / ◐ 部分 / 🧪 试验性 / ❌ 不支持）——能力总表，随每次发版更新。结构化源：[`docs/capabilities.json`](docs/capabilities.json)，与官网同源。
