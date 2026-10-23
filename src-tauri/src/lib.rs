@@ -366,6 +366,8 @@ pub fn run() {
         remote::remote_toggle_headless,
         // H4：无头子区另两件——watchdog 超时 + 全局并发上限
         remote::remote_set_headless_limits,
+        // #172/T8：兼容发送（实验）——默认关；开启需「该 build 读链已取证」
+        remote::remote_toggle_compat_send,
         // M7 W5：桌面端写审计查看（最近 N 条，只读）
         inject::inject_list_audit,
         // 用量域（计划①）：采集 / 大看板 / 记录页 / CSV / 设置读写

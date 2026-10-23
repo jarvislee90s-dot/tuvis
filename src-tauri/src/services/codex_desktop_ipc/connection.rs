@@ -57,6 +57,12 @@ pub struct RpcRequest {
     pub target: Option<OwnerLease>,
     pub mutating: bool,
     pub validity: Option<watch::Receiver<bool>>,
+    /// #172：**信封级** `sourceClientId`（我方 clientId）。Desktop 自己的 `sendRequest`
+    /// 把它放在信封上（与 `build_broadcast_frame` 的 `sourceClientId` 同位置），
+    /// **不在 params 里**——探测的 owner discovery 按上游形态发，减少未知。
+    pub source_client_id: Option<String>,
+    /// #172：**信封级** `timeoutMs`（上游 `sendRequest` 同样带在信封上）。
+    pub timeout_ms: Option<u64>,
 }
 
 /// RPC 结果。`envelope_id` 恒为本次生成的 envelope UUID。
@@ -329,6 +335,8 @@ impl ConnectionHandle {
             &req.params,
             req.version,
             req.target.as_ref(),
+            req.source_client_id.as_deref(),
+            req.timeout_ms,
         ) {
             Ok(f) => f,
             Err(e) => return RpcOutcome::not_sent(envelope_id, e.code()),
@@ -404,6 +412,8 @@ fn build_request_frame(
     params: &Value,
     version: Option<u32>,
     target: Option<&OwnerLease>,
+    source_client_id: Option<&str>,
+    timeout_ms: Option<u64>,
 ) -> Result<Vec<u8>, ProtocolError> {
     let mut envelope = json!({
         "type": "request",
@@ -416,6 +426,14 @@ fn build_request_frame(
     }
     if let Some(lease) = target {
         envelope["targetClientId"] = json!(lease.client_id);
+    }
+    // #172：信封级 `sourceClientId` / `timeoutMs`（与 broadcast 的 sourceClientId 同位置；
+    // Desktop 自己的 `sendRequest` 就是这么发的——不进 params）
+    if let Some(source) = source_client_id {
+        envelope["sourceClientId"] = json!(source);
+    }
+    if let Some(ms) = timeout_ms {
+        envelope["timeoutMs"] = json!(ms);
     }
     super::codec::encode_frame(&envelope)
 }
@@ -650,13 +668,23 @@ async fn handle_frame(
     }
 }
 
-/// 回执关联：requestId 命中且 method 一致才完成；不一致放回（超时兜底）。
+/// 回执关联：`requestId` 命中即视为该 pending 的回执；仅当响应**携带** `method`
+/// 且与 pending 不一致时才放回等待（超时兜底）。
+///
+/// method 缺省 ≠ 不匹配：Windows 实测（2026-10-21）router 级错误响应是
+/// `{"type":"response","requestId":…,"resultType":"error","error":"no-client-found"}`
+/// ——**没有 method 字段**。旧实现要求 method 相等，会把这条回执扔回 pending，
+/// 于是 owner discovery 失败要卡到 15s RPC 超时才返回（#172 探测会把「无 owner」
+/// 误判成超时）。
 async fn handle_response(shared: &Arc<ConnectionShared>, rid: String, frame: Value) {
     let mut pending = shared.pending.lock().await;
     if let Some(p) = pending.remove(&rid) {
-        if frame.get("method").and_then(|m| m.as_str()) != Some(p.method.as_str()) {
-            pending.insert(rid, p);
-            return;
+        // 只有响应自带 method（router 的 normal 回执）才做方法一致性校验
+        if let Some(method) = frame.get("method").and_then(|m| m.as_str()) {
+            if method != p.method.as_str() {
+                pending.insert(rid, p);
+                return;
+            }
         }
         let handled_by = frame
             .get("handledByClientId")
@@ -854,6 +882,95 @@ mod tests {
         assert!(
             shared.init_tx.lock().unwrap().is_none(),
             "握手不可恢复失败后 init sender 必须已收尾（等待者可唤醒）"
+        );
+    }
+
+    /// T0 回归：router 级错误响应**不带 `method`**（Windows 4894 实测
+    /// `{"type":"response","requestId":…,"resultType":"error","error":"no-client-found"}`）。
+    /// requestId 命中且 method 缺省 → 必须按该 pending 完成（Rejected），不得扔回
+    /// pending 等到 15s RPC 超时。
+    #[tokio::test]
+    async fn method_less_error_response_completes_pending() {
+        let (shared, _main_tx) = test_shared();
+        let envelope = "env-methodless";
+        let (tx, mut rx) = oneshot::channel();
+        shared.pending.lock().await.insert(
+            envelope.to_string(),
+            PendingRpc {
+                method: "thread-owner-discovery".into(),
+                tx,
+            },
+        );
+
+        handle_response(
+            &shared,
+            envelope.to_string(),
+            serde_json::json!({
+                "type": "response",
+                "requestId": envelope,
+                "resultType": "error",
+                "error": "no-client-found",
+            }),
+        )
+        .await;
+
+        let outcome = rx
+            .try_recv()
+            .expect("method 缺省的错误回执必须完成 pending（不能卡到 15s 超时）");
+        assert_eq!(outcome.delivery, Delivery::Rejected);
+        assert_eq!(
+            outcome.result,
+            Some(serde_json::json!("no-client-found")),
+            "error 字段原样交给上层归因（no-client-found ≠ 协议失败）"
+        );
+        assert_eq!(outcome.envelope_id, envelope);
+        assert!(
+            shared.pending.lock().await.is_empty(),
+            "完成的 pending 必须从表中移除"
+        );
+    }
+
+    /// T0 回归：响应携带 method 但与 pending 不一致 → 放回等待（超时兜底），
+    /// 不得误完成别的 RPC。
+    #[tokio::test]
+    async fn method_mismatch_keeps_pending() {
+        let (shared, _main_tx) = test_shared();
+        let envelope = "env-mismatch";
+        let (tx, mut rx) = oneshot::channel();
+        shared.pending.lock().await.insert(
+            envelope.to_string(),
+            PendingRpc {
+                method: "thread-follower-start-turn".into(),
+                tx,
+            },
+        );
+
+        handle_response(
+            &shared,
+            envelope.to_string(),
+            serde_json::json!({
+                "type": "response",
+                "requestId": envelope,
+                "resultType": "success",
+                "method": "thread-owner-discovery",
+                "result": {},
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "方法不一致的响应不得完成 pending"
+        );
+        assert_eq!(
+            shared
+                .pending
+                .lock()
+                .await
+                .get(envelope)
+                .map(|p| p.method.as_str()),
+            Some("thread-follower-start-turn"),
+            "方法不一致的响应必须放回等待"
         );
     }
 }

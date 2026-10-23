@@ -19,11 +19,14 @@ use super::mirror::ThreadMirror;
 use super::owners::{
     bind_lease, declare_following, discover_owner, wait_first_snapshot, FollowingSet,
 };
-use super::pending::parse_request_key;
+use super::pending::{parse_request_key, DECISION_ACCEPT, DECISION_CANCEL, DECISION_DECLINE};
+use super::probe::runner::{ProbeOutcome, ProbeRunner, ProbeStage};
+use super::probe::schema_probe::{SchemaEvidence, SchemaProbeOutcome};
+use super::probe::{ProbeLedger, CAP_SCHEMA, CAP_STATE};
 use super::profile::ProtocolProfile;
 use super::types::{
     CapabilitySet, ContentState, ControlAvailability, Delivery, MessagesPage, MessagesPageStatus,
-    OwnerLease, PendingAction, PendingKind, PendingView, ProtocolError, ThreadKey,
+    OwnerLease, PendingAction, PendingKind, PendingView, ProbeStatus, ProtocolError, ThreadKey,
     ThreadProjection,
 };
 use serde_json::{json, Value};
@@ -126,6 +129,29 @@ enum InflightState {
     BlockedUnknown,
 }
 
+/// #172：当前「尚无证据」档 build 的探测目标（键含 `cli_id`，算一次即缓存）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeTarget {
+    /// 目标所属连接代际；同 build 重连也必须隔离异步指纹回填。
+    epoch: u64,
+    platform: String,
+    build: String,
+    /// 账本主键（`platform|build|cli_id|epoch`）；`None` = 尚未计算（算 `cli_id` 可能
+    /// 要跑一次 `codex.exe --version`，只在真正探测时按需算，不拖慢连接路径）。
+    key: Option<String>,
+}
+
+/// #172：debug 专用强制开关（`TUVIS_CODEX_IPC_FORCE_UNVERIFIED=1`）——把**已验证**
+/// build 也压到「尚无证据」档，好在真机上跑探测分支（本机 4894 已 shipped，否则永远
+/// 走不到未知 build 的路径）。**release 构建恒 false**：`cfg!(debug_assertions)` 是
+/// 编译期常量，发行包里这条分支被消掉，用户无法借此关掉能力门。
+fn force_unverified() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("TUVIS_CODEX_IPC_FORCE_UNVERIFIED")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+}
+
 struct AdapterInner {
     connector: Arc<dyn Connector>,
     /// 当前连接的 profile（R3：动态）。初始为构造入参（首个连接前的基线）；
@@ -133,6 +159,28 @@ struct AdapterInner {
     /// 发送档；空 build/无 endpoint → `closed()`）。
     /// 同步短临界区读写，绝不跨 await 持有、不与其他锁嵌套。
     profile: std::sync::Mutex<ProtocolProfile>,
+    /// #172：**最近一次成功 resolve 的 Desktop build 是否带写能力证据**。
+    /// `None` = 本进程内还没成功解析过 build；`Some(false)` = 解析到了但不在 shipped
+    /// 证据表（未知 build）；`Some(true)` = 已验证 build。
+    ///
+    /// 为什么要与 [`profile`] 分开记：连接失败会把 profile 回落 `closed()`（R3 的
+    /// 「Desktop 缺席」诚实缺省），此时能力位不再回答「这台 build 支持什么」。兜底
+    /// 交接必须区分「build 没取证」（不得静默改走 headless）与「验证过的 build 断了」
+    /// （既有兜底契约不变），所以证据要单独留存、不被链路状态冲掉。
+    build_send_verified: std::sync::Mutex<Option<bool>>,
+    /// #172：只读探测单飞器（同一 `probe_key` 同刻只有一条探测在飞）。
+    probe: Arc<ProbeRunner>,
+    /// #172：探测账本（remote 层注入 `DeviceStore` 实现；`None` = 不查不写账本，
+    /// 仍可探测——测试与「账本不可用」降级路径）。
+    probe_ledger: std::sync::Mutex<Option<Arc<dyn ProbeLedger>>>,
+    /// #172：当前「**尚无证据**」档 build 的探测目标（shipped build → `None`；
+    /// 连接失败回落 closed 时保留原目标，便于重连后复用同一键）。
+    probe_target: std::sync::Mutex<Option<ProbeTarget>>,
+    /// #172/T8 测试缝：固定账本键（生产恒 `None` → 真实计算；测试避免 spawn
+    /// 本机 `codex.exe --version` 取 `cli_id`）。
+    probe_key_override: std::sync::Mutex<Option<String>>,
+    /// #172：探测预算（生产 = P1/P2/P3 2/3/3s；测试可收紧，免得真等 8s）。
+    probe_budget: std::sync::Mutex<super::probe::runner::ProbeBudget>,
     conn: Mutex<Option<ConnectionHandle>>,
     /// follow 互斥（C2）：settle 对账与派发路径可能并发 ensure 同一 thread——
     /// 冷启动竞跑会产生重复 discovery/绑定（lease 翻代）。持锁串行化 follow 段；
@@ -167,6 +215,23 @@ struct AdapterInner {
     follow_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     /// B3 测试缝探针：任务已到达 follow gate。
     follow_gate_reached: AtomicBool,
+    /// #172/T7：官方 schema 证据（未知 build 的审批决策词来源；`None` = 尚未取证）。
+    /// 有它就能在「无真机审批证据」的 build 上安全开放 `accept` + `cancel`。
+    schema_evidence: std::sync::Mutex<Option<(u64, Option<ProbeTarget>, SchemaEvidence)>>,
+    /// #172/T7-R4：schema 探针对完整指纹与连接代际**各跑一次**的单飞标志（结论为 `Unknown` 时也不重跑：
+    /// 探针失败即「未知」，重跑只会再拿同一个 `Unknown`；账本行已记 `inconclusive`
+    /// + 退避窗口，跨重启的复用由账本负责）。
+    schema_probe_ran: tokio::sync::Mutex<Option<(u64, String)>>,
+    /// #172/T7-R4 测试缝：注入 schema 探针结论（生产恒 `None` → 真跑 CLI；
+    /// 测试注入后**绝不 spawn 真实 codex.exe**）。
+    schema_probe_override: std::sync::Mutex<Option<SchemaProbeOutcome>>,
+    /// #172/T9a：探测只读事实的**缓存**（账本 `state` 行的结论）。
+    ///
+    /// 为什么要缓存：投影在每次状态变化时都会重建（多处发布点），每次都查账本
+    /// 会把 SQLite 读放大成热路径负担。账本 `state` 行的**唯一写者**是本 adapter
+    /// 的 [`DesktopIpcAdapter::ensure_read_evidence`]（remote 层只写 `send` 行），
+    /// 故在写点与 build 目标变更点失效即可保持准确。
+    probe_status_cache: std::sync::Mutex<Option<ProbeStatus>>,
     epoch: AtomicU64,
     events: broadcast::Sender<ThreadProjection>,
 }
@@ -184,7 +249,26 @@ impl DesktopIpcAdapter {
         Self {
             inner: Arc::new(AdapterInner {
                 connector,
-                profile: std::sync::Mutex::new(profile),
+                profile: std::sync::Mutex::new(profile.clone()),
+                // 构造期基线 profile 来自装配时 resolve 到的 build（生产）/ 注入基线
+                //（测试）：**有写能力证据才记 true**，无证据保持 None（按「未取证」处理）
+                build_send_verified: std::sync::Mutex::new(
+                    profile.capabilities.send.then_some(true),
+                ),
+                probe: Arc::new(ProbeRunner::new()),
+                probe_ledger: std::sync::Mutex::new(None),
+                // 构造期基线 profile 若已是「尚无证据」档（生产装配时 resolve 到未知
+                // build / 测试注入），先把探测目标记下来：连接暂不可达也能查账本
+                probe_target: std::sync::Mutex::new(profile.is_probe_eligible().then(|| {
+                    ProbeTarget {
+                        epoch: 0,
+                        platform: profile.platform.clone(),
+                        build: profile.build.clone(),
+                        key: None,
+                    }
+                })),
+                probe_key_override: std::sync::Mutex::new(None),
+                probe_budget: std::sync::Mutex::new(super::probe::runner::ProbeBudget::default()),
                 conn: Mutex::new(None),
                 ensure_lock: tokio::sync::Mutex::new(()),
                 owners: Mutex::new(OwnerRegistry::default()),
@@ -202,9 +286,192 @@ impl DesktopIpcAdapter {
                 interphase_gate: std::sync::Mutex::new(None),
                 follow_gate: std::sync::Mutex::new(None),
                 follow_gate_reached: AtomicBool::new(false),
+                schema_evidence: std::sync::Mutex::new(None),
+                schema_probe_ran: tokio::sync::Mutex::new(None),
+                schema_probe_override: std::sync::Mutex::new(None),
+                probe_status_cache: std::sync::Mutex::new(None),
                 epoch: AtomicU64::new(0),
                 events: broadcast::channel(256).0,
             }),
+        }
+    }
+
+    /// #172/T7：注入官方 schema 证据（生产由装配期一次性探测填入；测试直接注入）。
+    pub fn set_schema_evidence(&self, evidence: Option<SchemaEvidence>) {
+        *self
+            .inner
+            .schema_evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = evidence.map(|ev| {
+            (
+                self.inner.epoch.load(Ordering::SeqCst),
+                self.probe_target_snapshot(),
+                ev,
+            )
+        });
+    }
+
+    /// #172/T7-R4 测试缝：注入 schema 探针的**结论**（`Known` / `Unknown`）。
+    ///
+    /// 注入后 [`ensure_schema_evidence`](Self::ensure_schema_evidence) 直接采用注入结果，
+    /// **不跑真实 CLI**——测试绝不 spawn 本机的 `codex.exe`（那会真的执行
+    /// `app-server generate-json-schema`，既慢又不受控）。
+    ///
+    /// 传 `None` = 回到「真跑 CLI」的生产行为。注入为空**且**已有证据时仍按幂等
+    /// 直接返回（证据检查在注入检查之前）。
+    #[doc(hidden)]
+    pub fn set_schema_probe_override(&self, outcome: Option<SchemaProbeOutcome>) {
+        *self
+            .inner
+            .schema_probe_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = outcome;
+    }
+
+    /// #172/T7-R4：**官方 schema 探针的结论落进探测账本**（`capability = "schema"`）。
+    ///
+    /// 为什么要有这一层：`state` 行只说「这台 build 的**读链**有没有证据」，说不清
+    /// 「这台 build 的**审批决策词**从哪来」。把 schema 探针的结论也记一行，
+    /// 「build × 能力」的数据集才完整（后续人工提升 shipped 表时可回看依据）。
+    ///
+    /// 流程（幂等 + 只跑一次）：
+    /// 1. **同一完整指纹与连接代际已完成探测** → 直接返回；
+    /// 2. 取探测目标（`probe_target_snapshot()` + `resolve_probe_key()`）：取不到
+    ///    target → **直接返回，不记账**（无法归因的行宁可没有，也不能错记到别的
+    ///    build 上）；
+    /// 3. 跑探针（`probe_schema()` 内部已 3s 有界 + 临时目录用完即删；测试走注入
+    ///    结论，绝不 spawn 真实 CLI）；
+    /// 4. `Known(evidence)` → 装证据 + 记 `Probed`；`Unknown{error_code}` → **不装
+    ///    证据**（审批保持「到桌面处理」）+ 记 `Inconclusive`（带错误码）。
+    ///
+    /// schema 内容指纹随结论写入账本，供审批词表归因。
+    pub async fn ensure_schema_evidence(&self) {
+        // 归因：拿不到 build 目标就没有 probe_key——**不记账**（宁可缺行，不可错记）。
+        let Some(target) = self.probe_target_snapshot() else {
+            log::info!("codex-ipc schema: 未取到 build 目标（无法归因），不探不记账");
+            return;
+        };
+        let epoch = target.epoch;
+        let probe_key = self.resolve_probe_key(&target).await;
+        let bound_target = self.probe_target_snapshot();
+        if self.inner.epoch.load(Ordering::SeqCst) != epoch
+            || !bound_target.as_ref().is_some_and(|current| {
+                current.epoch == target.epoch
+                    && current.platform == target.platform
+                    && current.build == target.build
+            })
+        {
+            return;
+        }
+        // 锁覆盖探测；取消时自动释放，且仅完成后标记已探测。
+        let mut ran = self.inner.schema_probe_ran.lock().await;
+        if ran.as_ref() == Some(&(epoch, probe_key.clone())) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        // 测试缝：注入结论时**不跑真实 CLI**（生产恒 None → 真跑）。
+        let outcome = match self.schema_probe_override() {
+            Some(injected) => injected,
+            None => super::probe::schema_probe::probe_schema().await,
+        };
+        let duration_ms = started.elapsed().as_millis() as u64;
+        if self.inner.epoch.load(Ordering::SeqCst) != epoch
+            || self.probe_target_snapshot() != bound_target
+        {
+            return; // 身份已变化，拒收旧异步结果（也不记账）。
+        }
+        *ran = Some((epoch, probe_key.clone()));
+        match outcome {
+            SchemaProbeOutcome::Known(evidence) => {
+                // §4.11 观测：结构化日志（打指纹与两个决策词列表；不记正文）。
+                log::info!(
+                    "codex-ipc schema: key={probe_key} fingerprint={} command={:?} file={:?} durationMs={duration_ms}",
+                    evidence.fingerprint,
+                    evidence.command_decisions,
+                    evidence.file_decisions
+                );
+                let fingerprint = evidence.fingerprint.clone();
+                *self
+                    .inner
+                    .schema_evidence
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((epoch, bound_target, evidence));
+                if let Some(ledger) = self.probe_ledger() {
+                    // stage 记 P3：账本的 `probe_stage` 只有 P0–P3 词表，schema 探针
+                    // 属「读链末端的能力取证」，归入 P3（不改 DAO 的词表）。
+                    ledger.record(
+                        &probe_key,
+                        CAP_SCHEMA,
+                        &ProbeOutcome::Probed {
+                            stage: ProbeStage::P3,
+                            revision: None,
+                            duration_ms,
+                        },
+                        // 官方 schema 的内容指纹（文件名+大小的 sha256）：让「build × 能力」
+                        // 数据集能追到具体 schema 版本
+                        Some(&fingerprint),
+                    );
+                }
+            }
+            SchemaProbeOutcome::Unknown { error_code } => {
+                // 拿不到就保持关闭（审批卡走「到桌面处理」），不重试、不猜。
+                log::info!(
+                    "codex-ipc schema: key={probe_key} 未取证（{error_code}），审批保持关闭"
+                );
+                if let Some(ledger) = self.probe_ledger() {
+                    ledger.record(
+                        &probe_key,
+                        CAP_SCHEMA,
+                        &ProbeOutcome::Inconclusive {
+                            stage: ProbeStage::P3,
+                            error_code,
+                            duration_ms,
+                        },
+                        // 未取证 → 没有指纹可给
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    /// 取出测试缝注入的 schema 探针结论（生产恒 `None`）。
+    fn schema_probe_override(&self) -> Option<SchemaProbeOutcome> {
+        self.inner
+            .schema_probe_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 当前生效的**审批决策策略**（服务端单一来源）：
+    ///
+    /// * 有真机证据（shipped profile 的 `command` 能力）→ `accept` + `decline`；
+    /// * 未知 build 但 schema 已取证、且两个词都在 → `accept` + `cancel`；
+    /// * 其余 → 空（卡片只显示「到桌面处理」，且 `respond` 拒发）。
+    pub fn approval_policy(&self) -> super::pending::DecisionPolicy {
+        if self.current_caps().command {
+            return super::pending::DecisionPolicy::evidence();
+        }
+        let evidence = self
+            .inner
+            .schema_evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match evidence {
+            Some((epoch, target, ev))
+                if epoch == self.inner.epoch.load(Ordering::SeqCst)
+                    && target == self.probe_target_snapshot() =>
+            {
+                super::pending::DecisionPolicy::schema(
+                    ev.command_allows(super::pending::DECISION_ACCEPT)
+                        && ev.command_allows(super::pending::DECISION_CANCEL),
+                    ev.file_allows(super::pending::DECISION_ACCEPT)
+                        && ev.file_allows(super::pending::DECISION_CANCEL),
+                )
+            }
+            _ => super::pending::DecisionPolicy::default(),
         }
     }
 
@@ -228,6 +495,428 @@ impl DesktopIpcAdapter {
         self.current_caps()
     }
 
+    /// #172：本机 Desktop build 是否**带写能力证据**（与当前连接是否活着解耦）。
+    /// `false` = 未知 build / 本进程还没解析过 build / 已验证但无写能力——这类桌面
+    /// 归属会话**不得静默改走 headless**（兜底交接门用它，见 `remote::codex_ipc`）。
+    pub fn build_send_verified(&self) -> bool {
+        self.inner
+            .build_send_verified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(false)
+    }
+
+    // ========================================================
+    // #172：能力探测（惰性只读；账本优先；单飞）
+    // ========================================================
+
+    /// 注入探测账本（生产 `DeviceStore` 实现；测试内存实现）。不注入 = 不查不写，
+    /// 仍可探测（降级路径：结论不跨重启复用）。
+    pub fn set_probe_ledger(&self, ledger: Arc<dyn ProbeLedger>) {
+        *self
+            .inner
+            .probe_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(ledger);
+        // #172/T9a：账本换手 → 探测只读事实的缓存作废（下次现查）。
+        self.invalidate_probe_status_cache();
+    }
+
+    // ========================================================
+    // #172/T9a：探测结论的只读事实（probe_status）
+    // ========================================================
+
+    /// #172/T9a：**这台 build 的读链探测到哪一步了**（只读事实）。
+    ///
+    /// 数据来源全是既有只读能力，**不新增任何副作用**（不写账本、不建连、不发帧）：
+    /// * **在飞** → `probing`（单飞器 `is_flight_active`；同 build 的不同线程
+    ///   各有一条单飞键，故按 build 前缀匹配）；
+    /// * **账本 `state` 行** → `probed` / `inconclusive` / `failed`
+    ///   （映射见 [`super::reason_code::probe_status_from`]）；
+    /// * **该 build 尚无任何探测记录** → `idle` + `desktop_build_unverified`；
+    /// * **取不到**（无 build 目标 / 账本不可用）→ `idle` + **无码**（不猜）。
+    pub async fn probe_status(&self) -> ProbeStatus {
+        let Some(target) = self.probe_target_snapshot() else {
+            // 没有 build 目标（shipped build / 还没 resolve 到 build）→ 取不到，不猜
+            return ProbeStatus::idle();
+        };
+        let probe_key = self.resolve_probe_key(&target).await;
+        // 在飞 → probing（单飞器既有能力；只读查询）
+        if self.inner.probe.is_flight_active(&probe_key) {
+            return ProbeStatus::probing();
+        }
+        // 账本结论（缓存；写点失效后重查）
+        if let Some(cached) = self
+            .inner
+            .probe_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return cached;
+        }
+        let status = self.load_probe_status(&probe_key);
+        *self
+            .inner
+            .probe_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(status.clone());
+        status
+    }
+
+    /// 读账本 `state` 行 → 探测只读事实（**只读**：不写账本、不触发探测）。
+    fn load_probe_status(&self, probe_key: &str) -> ProbeStatus {
+        let Some(ledger) = self.probe_ledger() else {
+            // 账本不可用 → 取不到，不猜（不报「未验证」——那也是猜）
+            return ProbeStatus::idle();
+        };
+        match ledger.get(probe_key, CAP_STATE) {
+            Some(entry) => super::reason_code::probe_status_from(
+                entry.state,
+                entry.stage.as_deref(),
+                entry.error_code.as_deref(),
+            ),
+            // 该 build 尚无任何探测记录 → idle + desktop_build_unverified
+            None => ProbeStatus::unverified(),
+        }
+    }
+
+    /// 探测只读事实的缓存作废（账本写点 / build 目标变更点调用）。
+    fn invalidate_probe_status_cache(&self) {
+        *self
+            .inner
+            .probe_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 给投影盖上探测只读事实（#172/T9a；**单一盖章点**）。
+    ///
+    /// 镜像层不知道账本与单飞器，故由 adapter 在**发布前**统一盖；既有字段的
+    /// 语义一字不动——本方法只写 `probe_status` 这一个**只读**字段。
+    async fn stamp_probe_status(&self, mut p: ThreadProjection) -> ThreadProjection {
+        p.probe_status = self.probe_status().await;
+        p
+    }
+
+    /// 是否正在跑只读探测（#172 的「探测中」信号；T9 用它渲染骨架态）。
+    pub fn probe_in_progress(&self) -> bool {
+        self.inner.probe.inflight() > 0
+    }
+
+    /// 测试缝：收紧探测预算（生产恒 2/3/3s；用例不必真等 8s）。
+    #[doc(hidden)]
+    pub fn set_probe_budget(&self, budget: super::probe::runner::ProbeBudget) {
+        *self
+            .inner
+            .probe_budget
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = budget;
+    }
+
+    fn probe_budget(&self) -> super::probe::runner::ProbeBudget {
+        *self
+            .inner
+            .probe_budget
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 当前是否处于「尚无证据、可探测」档（唯一允许探测的证据级别）。
+    pub fn probe_eligible(&self) -> bool {
+        self.current_profile().is_probe_eligible()
+    }
+
+    /// **首次 `state` 访问触发的只读探测**（#172）。
+    ///
+    /// 顺序（都不得阻断读路径）：
+    /// 1. 已有写/读证据（shipped 档、或本进程先前探测通过）→ 直接返回；
+    /// 2. 非「尚无证据」档（closed / 不可达）→ 不探；
+    /// 3. 算/取指纹键（同 build 只算一次）→ 查账本：
+    ///    * `probed`/`verified` → 提升本进程 profile 的 `state`，**零帧**复用；
+    ///    * `failed` → 本 build 已判死（明确协议错），**本轮不探**（换 build /
+    ///      `PROBE_EPOCH` 变更 / 用户显式重探才会再来）；
+    ///    * `inconclusive` 未到重试点 → 本轮不探（到点后才重试）；
+    /// 4. 探测（P0 `ensure_connection` + P1–P3）→ 落账本；通过才提升 `state`。
+    ///
+    /// 探测失败**不阻断**后续读路径（follow 照常尝试，读不通自有别的原因）。
+    pub async fn ensure_read_evidence(&self, key: &ThreadKey) {
+        if self.current_caps().state {
+            return; // 已有证据（shipped 或先前探测通过）
+        }
+        if !self.probe_eligible() {
+            return; // closed / 不可达：不探（判死档不因触发而复活）
+        }
+        // 已跟随该线程 = 生产读链在跑：探测会用临时 follow/unfollow 打扰它（wire 上
+        // 后到的 following:false 会撤掉生产跟随）——此时不探，交给后续触发点。
+        if self.inner.followings.lock().await.is_following(key) {
+            return;
+        }
+        let Some(mut target) = self.probe_target_snapshot() else {
+            return; // 还没 resolve 到 build：无法归因，不探（等下次连接）
+        };
+        let mut probe_key = self.resolve_probe_key(&target).await;
+        if self.reuse_ledger_evidence(&target, &probe_key) {
+            return;
+        }
+        let conn = match self.ensure_connection().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // P0 不可达 = **没有证据**（Desktop 可能只是没起/冷启动），不是协议被
+                // 证伪——记 inconclusive（带错误码），到退避点后再试。
+                log::info!(
+                    "codex-ipc probe: P0 不可达（{}），本轮不探（key={probe_key}）",
+                    e.code()
+                );
+                self.apply_read_probe_result(
+                    &target,
+                    &probe_key,
+                    &ProbeOutcome::Inconclusive {
+                        stage: ProbeStage::P0,
+                        error_code: e.code().to_string(),
+                        duration_ms: 0,
+                    },
+                );
+                return;
+            }
+        };
+        // 建连可能换代：重新绑定该连接的目标与指纹，不能带着旧 key 探测新连接。
+        let Some(connected_target) = self.probe_target_snapshot() else {
+            return;
+        };
+        if connected_target.epoch != conn.epoch() {
+            return;
+        }
+        if target.epoch != connected_target.epoch {
+            target = connected_target;
+            probe_key = self.resolve_probe_key(&target).await;
+        }
+        if self.with_current_probe_target(&target, || ()).is_none() {
+            return;
+        }
+        // 单飞键带上线程：同 build 的两个线程各自触发时，A 线程的「无 owner」不得
+        // 直接当成 B 线程的结论（账本键仍不含线程——那才是跨线程复用的粒度）。
+        let flight_key = format!("{probe_key}|{}|{}", target.epoch, key.thread_id);
+        let outcome = self
+            .inner
+            .probe
+            .run(
+                &flight_key,
+                super::probe::runner::probe_read_with_budget(&conn, key, self.probe_budget()),
+            )
+            .await;
+        // §4.11 观测：结构化日志（不记正文；供排障与人工提升 shipped 表时检索）
+        log::info!(
+            "codex-ipc probe: key={probe_key} stage={} ok={} error={:?} durationMs={}",
+            outcome.stage().as_str(),
+            matches!(outcome, ProbeOutcome::Probed { .. }),
+            outcome.error_code(),
+            outcome.duration_ms()
+        );
+        if !self.apply_read_probe_result(&target, &probe_key, &outcome) {
+            return;
+        }
+        // #172/T9a：把「用户看到什么」也记进日志（只读事实的中文原文；供排障）
+        let status = super::reason_code::probe_status_from(
+            outcome.as_state(),
+            Some(outcome.stage().as_str()),
+            outcome.error_code(),
+        );
+        let reason = status.reason_code.as_deref().unwrap_or("-");
+        log::info!(
+            "codex-ipc probe status: state={} reason={reason} userMessage={}",
+            status.state.as_str(),
+            status
+                .reason_code
+                .as_deref()
+                .and_then(super::reason_code::message_of)
+                .unwrap_or("-")
+        );
+    }
+
+    /// 账本复用（**账本命中必须零帧**）：命中 `probed`/`verified` → 提升 `state` 并
+    /// 返回 `true`；`failed` → 返回 `true`（本 build 已判死，本轮不探）；
+    /// `inconclusive` 未到重试点 → 返回 `true`（本轮不探，但能力仍关）。
+    fn reuse_ledger_evidence(&self, target: &ProbeTarget, probe_key: &str) -> bool {
+        if self.with_current_probe_target(target, || ()).is_none() {
+            return true;
+        }
+        let Some(ledger) = self.probe_ledger() else {
+            return false;
+        };
+        let Some(entry) = ledger.get(probe_key, CAP_STATE) else {
+            return false;
+        };
+        // 账本读取期间也可能重连；效果必须在身份守卫内提交。
+        self.with_current_probe_target(target, || {
+            match entry.state {
+                crate::database::dao::codex_ipc_probe::ProbeState::Probed
+                | crate::database::dao::codex_ipc_probe::ProbeState::Verified => {
+                    log::info!("codex-ipc probe: 账本命中，零帧复用（key={probe_key}）");
+                    self.set_state_capability(true);
+                    true
+                }
+                // 明确失败 = 这个 build 已经判死：本轮不探（换 build / epoch 变更 /
+                // 用户显式重探才会再来）——否则每次详情页访问都会白跑一遍 15s 探测。
+                crate::database::dao::codex_ipc_probe::ProbeState::Failed => true,
+                // 不确定：到退避点才重试；窗口内本轮不探
+                crate::database::dao::codex_ipc_probe::ProbeState::Inconclusive => {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    entry.next_retry_at.is_some_and(|at| at > now)
+                }
+                _ => false,
+            }
+        })
+        .unwrap_or(true)
+    }
+
+    /// 与重连身份更新共用 target 锁；同步效果全部完成后才允许切换目标。
+    fn with_current_probe_target<T>(
+        &self,
+        target: &ProbeTarget,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let slot = self
+            .inner
+            .probe_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let current = slot.as_ref()?;
+        if current.epoch != target.epoch
+            || self.inner.epoch.load(Ordering::SeqCst) != target.epoch
+            || current.platform != target.platform
+            || current.build != target.build
+        {
+            return None;
+        }
+        Some(action())
+    }
+
+    fn apply_read_probe_result(
+        &self,
+        target: &ProbeTarget,
+        key: &str,
+        outcome: &ProbeOutcome,
+    ) -> bool {
+        self.with_current_probe_target(target, || {
+            if let Some(ledger) = self.probe_ledger() {
+                ledger.record(key, CAP_STATE, outcome, None);
+                self.invalidate_probe_status_cache();
+            }
+            if matches!(outcome, ProbeOutcome::Probed { .. }) {
+                self.set_state_capability(true);
+            }
+        })
+        .is_some()
+    }
+
+    fn probe_ledger(&self) -> Option<Arc<dyn ProbeLedger>> {
+        self.inner
+            .probe_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn probe_target_snapshot(&self) -> Option<ProbeTarget> {
+        self.inner
+            .probe_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// #172/T8：**当前 build 的账本键**（探测/兼容发送的归因用）。
+    ///
+    /// 拿不到 build 目标（还没 resolve 到 build）→ `None` = **不记账**（宁可缺行，
+    /// 不可错记——错记会把别的 build 的证据算到本 build 头上）。
+    pub async fn current_probe_key(&self) -> Option<String> {
+        let target = self.probe_target_snapshot()?;
+        let key = self.resolve_probe_key(&target).await;
+        self.with_current_probe_target(&target, || key)
+    }
+
+    /// #172/T8 测试缝：固定账本键（生产恒 `None`）。
+    ///
+    /// 为什么需要：真实键含 `cli_id` 段——它要跑本机 `codex.exe --version`（spawn）。
+    /// 测试里绝不 spawn 本机 CLI，故用固定键把归因钉死（断言也据此写死）。
+    #[doc(hidden)]
+    pub fn set_probe_key_override(&self, key: Option<String>) {
+        *self
+            .inner
+            .probe_key_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = key;
+    }
+
+    /// 取（并缓存）该 build 的账本键：`cli_id` 可能要跑一次 `codex.exe --version`
+    /// （2s 上限），放阻塞线程池，避免卡住 async worker；同 build 只算一次。
+    async fn resolve_probe_key(&self, target: &ProbeTarget) -> String {
+        // 测试缝优先：固定键（避免测试里跑本机 CLI 指纹探测——它会 spawn
+        // `codex.exe --version`；生产恒 None → 走真实计算）。
+        if let Some(fixed) = self
+            .inner
+            .probe_key_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return fixed;
+        }
+        if let Some(key) = &target.key {
+            return key.clone();
+        }
+        self.resolve_probe_key_with(target, async {
+            let platform = target.platform.clone();
+            let build = target.build.clone();
+            tokio::task::spawn_blocking(move || {
+                super::probe::fingerprint::probe_key(&platform, Some(build.as_str())).to_key()
+            })
+            .await
+            .unwrap_or_else(|_| {
+                super::probe::fingerprint::ProbeKey::new(
+                    &target.platform,
+                    Some(target.build.as_str()),
+                    None,
+                )
+                .to_key()
+            })
+        })
+        .await
+    }
+
+    async fn resolve_probe_key_with<F>(&self, target: &ProbeTarget, compute: F) -> String
+    where
+        F: std::future::Future<Output = String>,
+    {
+        let computed = compute.await;
+        // 在 target 锁内核对连接代际与目标身份，拒绝同 build 重连的旧计算。
+        let mut slot = self
+            .inner
+            .probe_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(cur) = slot.as_mut() {
+            if cur.epoch == target.epoch
+                && self.inner.epoch.load(Ordering::SeqCst) == target.epoch
+                && cur.platform == target.platform
+                && cur.build == target.build
+            {
+                cur.key = Some(computed.clone());
+            }
+        }
+        computed
+    }
+
+    /// 提升本进程 profile 的 `state` 能力（探测通过 / 账本命中）。**只动 state**：
+    /// 写能力仍由 shipped 证据或后续 L2 开关决定。
+    fn set_state_capability(&self, on: bool) {
+        let mut profile = self.inner.profile.lock().expect("profile lock");
+        if profile.is_probe_eligible() && profile.capabilities.state != on {
+            profile.capabilities.state = on;
+        }
+    }
+
     /// 订阅投影事件（REST/SSE/队列调度共用）。
     /// 广播一份投影：代际已由 `ThreadMirror::project` 从**绑定的 lease** 填好
     ///（广播事件与 GET/SSE 首快照同源），此处不再二次盖章——否则会把「新 owner 的
@@ -243,7 +932,7 @@ impl DesktopIpcAdapter {
     /// 确保连接存活（每次重连 epoch 递增，不重置为 0）。
     /// R3：每次连接按 endpoint 重算 profile（未知 build/无 endpoint → closed）；
     /// 连接失败同样落到 closed——Desktop 晚启动不需要重启 Tuvis，投影照常给出
-    /// stale/CompatOnly。R5：全程单锁短临界区，不嵌套。
+    /// stale/CompatOnly。身份安装锁序 conn → target → profile，同步段不跨 await。
     async fn ensure_connection(&self) -> Result<ConnectionHandle, ProtocolError> {
         if self.inner.stopping.load(Ordering::SeqCst) {
             // C4：shutdown 后不再新建连接（恢复循环/热重启统一由 stop/resume 管理）
@@ -272,6 +961,23 @@ impl DesktopIpcAdapter {
             &endpoint.platform,
             endpoint.build.as_deref().unwrap_or(""),
         );
+        // #172：把「build 的写能力证据」单独留存（不看连接存活；连接失败路径不
+        // 覆盖）。兼容档 send 开 = 用户裁决背书，按「已验证」记 true（headless
+        // 兜底口径不变：链路断了可走既有兜底）。
+        *self
+            .inner
+            .build_send_verified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(profile.capabilities.send);
+        // #172 debug 专用强制开关：把任何档压回「尚无证据」档（能力位全关，可
+        // 探测），真机才能跑到未知 build 的探测分支；release 构建恒不触发。
+        let forced_unverified = force_unverified();
+        let build = endpoint.build.clone().unwrap_or_default();
+        let profile = if forced_unverified {
+            ProtocolProfile::unverified(&endpoint.platform, &build)
+        } else {
+            profile
+        };
         // 双检：另一任务可能已重连（持 conn 锁期间不做其他锁操作）
         let (conn, epoch) = {
             let mut guard = self.inner.conn.lock().await;
@@ -280,14 +986,33 @@ impl DesktopIpcAdapter {
                     return Ok(c.clone());
                 }
             }
+            // 固定锁序 conn → target → profile；同步段内安装整组身份。
+            let mut target = self
+                .inner
+                .probe_target
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let epoch = self.inner.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+            *target = profile.is_probe_eligible().then(|| ProbeTarget {
+                epoch,
+                platform: endpoint.platform.clone(),
+                build,
+                key: None,
+            });
+            self.set_profile(profile.clone());
             let conn = super::connection::spawn(io, profile.clone(), epoch);
             *guard = Some(conn.clone());
             (conn, epoch)
         };
+        // #172/T9a：build 目标变了 → 探测只读事实的缓存作废（账本键换了）
+        self.invalidate_probe_status_cache();
         // 已释放 conn 锁：换代清理（短锁逐个）
         self.inner.owners.lock().await.reset(epoch);
-        self.set_profile(profile);
+        // 每次连接均检查当前完整指纹；覆盖已知版本升级到未知版本。
+        let adapter_for_schema = self.clone();
+        tokio::spawn(async move {
+            adapter_for_schema.ensure_schema_evidence().await;
+        });
         // 旧镜像全部标 stale（重新 following 的 snapshot 复活）
         {
             let mut mirrors = self.inner.mirrors.lock().await;
@@ -309,6 +1034,9 @@ impl DesktopIpcAdapter {
     /// 后到者持锁后重查新鲜镜像即短路（不产生第二次 discovery/绑定）。
     pub async fn ensure_thread(&self, key: &ThreadKey) -> Result<ThreadProjection, ProtocolError> {
         let conn = self.ensure_connection().await?;
+        // #172：首次 `state` 访问 → 惰性只读探测（账本优先；失败不阻断读路径——
+        // 读不通自有别的原因，探测只是给出「这台 build 的读能力有没有证据」）。
+        self.ensure_read_evidence(key).await;
         // 快路径：已跟随且新鲜（短锁）
         if let Some(p) = self.fresh_projection(key).await {
             return Ok(p);
@@ -330,12 +1058,20 @@ impl DesktopIpcAdapter {
     }
 
     /// 已跟随且新鲜的投影（短锁；None = 需要 follow）。
+    ///
+    /// #172/T9a：镜像锁**之外**再盖探测只读事实（盖章要读账本/单飞器，不得持镜像锁）。
     async fn fresh_projection(&self, key: &ThreadKey) -> Option<ThreadProjection> {
-        let mirrors = self.inner.mirrors.lock().await;
-        mirrors
-            .get(key)
-            .filter(|m| !m.is_stale() && m.revision().is_some())
-            .map(|m| m.project(self.current_caps()))
+        let p = {
+            let mirrors = self.inner.mirrors.lock().await;
+            mirrors
+                .get(key)
+                .filter(|m| !m.is_stale() && m.revision().is_some())
+                .map(|m| m.project(self.current_caps()))
+        };
+        match p {
+            Some(p) => Some(self.stamp_probe_status(p).await),
+            None => None,
+        }
     }
 
     /// 当前镜像里处于 `inProgress` 的活动回合 id（2026-10-22 原生回合打断扩展）：
@@ -492,13 +1228,25 @@ impl DesktopIpcAdapter {
     }
 
     /// 当前投影（不触发连接；未跟随/无状态 → stale 空投影）。
+    ///
+    /// #172/T7：投影前把当前**审批策略**下发给镜像——`allowedDecisions` 只在这里算，
+    /// 前端不重复策略。
+    ///
+    /// #172/T9a：镜像锁**之外**再盖探测只读事实（盖章要读账本/单飞器，不得持镜像锁）。
     pub async fn projection(&self, key: &ThreadKey) -> ThreadProjection {
         let caps = self.current_caps();
-        let mirrors = self.inner.mirrors.lock().await;
-        if let Some(m) = mirrors.get(key) {
-            return m.project(caps);
-        }
-        ThreadProjection {
+        let policy = self.approval_policy();
+        let p = {
+            let mut mirrors = self.inner.mirrors.lock().await;
+            match mirrors.get_mut(key) {
+                Some(m) => {
+                    m.set_approval_policy(Some(policy));
+                    Some(m.project(caps))
+                }
+                None => None,
+            }
+        };
+        let p = p.unwrap_or(ThreadProjection {
             thread_id: key.thread_id.clone(),
             revision: None,
             stale: true,
@@ -510,9 +1258,11 @@ impl DesktopIpcAdapter {
             truncated: false,
             history_token: String::new(),
             pending: Vec::new(),
+            probe_status: ProbeStatus::idle(),
             owner_epoch: 0,
             owner_generation: 0,
-        }
+        });
+        self.stamp_probe_status(p).await
     }
 
     /// 该 Thread 是否已有镜像（分页端点前置：无镜像才走有界 ensure/hydrate）。
@@ -668,13 +1418,46 @@ impl DesktopIpcAdapter {
     pub async fn start_turn(
         &self,
         key: &ThreadKey,
-        _action_id: &str,
+        action_id: &str,
         text: &str,
         client_message_id: &str,
     ) -> RpcOutcome {
+        self.start_turn_with(key, action_id, text, client_message_id, false)
+            .await
+    }
+
+    /// **兼容发送变体（#172/T8）**：本 build 的写能力**未取证**时，用户在设置页显式
+    /// 开启「兼容发送（实验）」后，允许走**同一条 start_turn 路径**尝试写出
+    /// （wire 形态逐字不变——只放开能力门，不改协议）。
+    ///
+    /// 为什么放在 adapter 而不是调用方：`start_turn` 的能力门是「这个 build 能不能写」
+    /// 的**最后一道**防线，绕过它就等于在未验证 build 上盲发。放行许可只能来自
+    /// **同一个**设置键 + 同一个 build 证据判据（remote 层与派发层共用）。
+    pub async fn start_turn_compat(
+        &self,
+        key: &ThreadKey,
+        action_id: &str,
+        text: &str,
+        client_message_id: &str,
+    ) -> RpcOutcome {
+        self.start_turn_with(key, action_id, text, client_message_id, true)
+            .await
+    }
+
+    /// start turn 主体（`compat` = 兼容发送许可；false = 既有语义逐字不变）。
+    async fn start_turn_with(
+        &self,
+        key: &ThreadKey,
+        _action_id: &str,
+        text: &str,
+        client_message_id: &str,
+        compat: bool,
+    ) -> RpcOutcome {
         let envelope_id = super::types::new_uuid();
         // R3：能力读当前连接的动态 profile（无连接/未知 build → closed → 拒）
-        if !self.current_caps().send {
+        // #172/T8：兼容发送许可只放开「写能力未取证」这一档；**已验证 build 的行为
+        // 完全不变**（它的 caps.send 本来就是 true，根本进不到这个分支）。
+        if !self.current_caps().send && !compat {
             return not_sent(&envelope_id, "capability_unavailable");
         }
         let (lease, validity) = {
@@ -685,16 +1468,6 @@ impl DesktopIpcAdapter {
                     (l, v)
                 }
                 None => return not_sent(&envelope_id, "stale_context"),
-            }
-        };
-        let version = {
-            let conn = self.inner.conn.lock().await;
-            match conn
-                .as_ref()
-                .map(|c| c.version_of("thread-follower-start-turn"))
-            {
-                Some(Ok(v)) => v,
-                _ => return not_sent(&envelope_id, "disconnected"),
             }
         };
         let params = json!({
@@ -708,14 +1481,10 @@ impl DesktopIpcAdapter {
                 "context": {},
             }
         });
-        self.dispatch(
-            "thread-follower-start-turn",
-            version,
-            params,
-            lease,
-            validity,
-        )
-        .await
+        // 版本不在此解析：dispatch 统一按方法表查（无连接 → disconnected，
+        // 方法缺失 → unsupported_method，均为零投递）。
+        self.dispatch("thread-follower-start-turn", None, params, lease, validity)
+            .await
     }
 
     /// 打断桌面当前回合（`thread-follower-interrupt-turn` v4，2026-10-21 新增）。
@@ -781,7 +1550,7 @@ impl DesktopIpcAdapter {
         });
         self.dispatch(
             "thread-follower-interrupt-turn",
-            version,
+            Some(version),
             params,
             lease,
             validity,
@@ -807,6 +1576,7 @@ impl DesktopIpcAdapter {
         let inflight_key = (key.thread_id.clone(), request_key.to_string());
         // 阶段 1（R5 短锁：只持 mirrors）：stale 门（R4.1）+ 全部 mirror 读 + 镜像
         // 绑定的 owner lease（C3 同代复核锚）
+        let policy = self.approval_policy();
         let snap = {
             let mirrors = self.inner.mirrors.lock().await;
             let Some(mirror) = mirrors.get(key) else {
@@ -815,7 +1585,7 @@ impl DesktopIpcAdapter {
             if mirror.is_stale() {
                 return not_sent(&envelope_id, "stale_context");
             }
-            RespondSnapshot::collect(mirror, caps, request_key, context_token)
+            RespondSnapshot::collect(mirror, caps, &policy, request_key, context_token)
         };
         // 阶段 2（R5 短锁：只持 inflight）：清理已消失/换 token 的 Blocked + 抢占提交权
         {
@@ -900,13 +1670,7 @@ impl DesktopIpcAdapter {
             return not_sent(&envelope_id, "stale_context");
         }
         let outcome = self
-            .dispatch(
-                &prepared.method,
-                prepared.version,
-                prepared.params,
-                lease,
-                validity,
-            )
+            .dispatch(prepared.method, None, prepared.params, lease, validity)
             .await;
         // R4.3 + C3：Accepted/Rejected/NotSent（保守零投递，可重试）释放提交权；
         // UnknownDelivery → 保留为 Blocked（记提交所用 token 分代，状态应用驱动清理）。
@@ -928,17 +1692,32 @@ impl DesktopIpcAdapter {
     }
 
     /// 统一派发：mutating RPC（未知结果绝不自动重试——connection 语义保证）。
+    ///
+    /// **版本号唯一来源 = profile 方法表**：这里按方法名查表（`version_of`），任何调用
+    /// 点都不得自带版本——组装侧硬编码会绕过单一真相源。方法不在表里 = **明确方法
+    /// 缺失** → `NotSent`（零投递），绝不用猜测版本瞎发；**新增方法必须先有真机证据
+    /// 才能进表**（`profile::method_table` 注释）。
     async fn dispatch(
         &self,
         method: &str,
-        version: u32,
+        version: Option<u32>,
         params: Value,
         target: OwnerLease,
         validity: tokio::sync::watch::Receiver<bool>,
     ) -> RpcOutcome {
+        let envelope_id = super::types::new_uuid();
         let conn = self.inner.conn.lock().await.clone();
         let Some(conn) = conn else {
-            return not_sent(&super::types::new_uuid(), "disconnected");
+            return not_sent(&envelope_id, "disconnected");
+        };
+        // 方法缺失 = 明确协议错（unsupported_method）→ 零投递，保持既有 not_sent 语义；
+        // 显式版本（interrupt 基值 4 纪律）跳过查表。
+        let version = match version {
+            Some(v) => v,
+            None => match conn.version_of(method) {
+                Ok(v) => v,
+                Err(e) => return not_sent(&envelope_id, e.code()),
+            },
         };
         conn.request(RpcRequest {
             method: method.to_string(),
@@ -947,6 +1726,8 @@ impl DesktopIpcAdapter {
             target: Some(target),
             mutating: true,
             validity: Some(validity),
+            source_client_id: None,
+            timeout_ms: None,
         })
         .await
     }
@@ -1006,6 +1787,28 @@ fn current_lease(owners: &OwnerRegistry, key: &ThreadKey) -> Option<OwnerLease> 
     owners.is_current(&lease).then_some(lease)
 }
 
+/// 审批/作答类方法名（集中登记，避免散落在组装与派发两侧）。
+///
+/// **版本号唯一来源 = [`ProtocolProfile`] 方法表**（`profile::method_table`）：这些常量
+/// 只钉方法名，版本一律由 [`DesktopIpcAdapter::dispatch`] 用 `conn.version_of` 解析；
+/// 方法不在表里 = 明确方法缺失 → `NotSent`（零投递），绝不带猜测版本瞎发。
+/// **新增方法必须先有真机证据才能进表**（见 observed/README.md）。
+const METHOD_COMMAND_DECISION: &str = "thread-follower-command-approval-decision";
+const METHOD_FILE_DECISION: &str = "thread-follower-file-approval-decision";
+const METHOD_PERMISSIONS_RESPONSE: &str = "thread-follower-permissions-request-approval-response";
+const METHOD_SUBMIT_USER_INPUT: &str = "thread-follower-submit-user-input";
+
+/// 审批类 pending → 对应决策方法名（command / file 各用各的方法，绝不混用）。
+/// 非审批类（permissions / 问答 / 不支持）没有「决策词」方法，返回 `None`。
+fn decision_method(kind: &PendingKind) -> Option<&'static str> {
+    match kind {
+        PendingKind::CommandApproval => Some(METHOD_COMMAND_DECISION),
+        // 官方方法表 `26.1016.6573.0` 已核对：file 决策方法与 command 并列登记为 v1
+        PendingKind::FileChangeApproval => Some(METHOD_FILE_DECISION),
+        _ => None,
+    }
+}
+
 /// respond 的镜像侧快照（阶段 1 的产物；收集于 mirrors 短锁内，之后不持锁使用）。
 struct RespondSnapshot {
     /// 能力基线（阶段 1 取自当前动态 profile）
@@ -1029,10 +1832,11 @@ impl RespondSnapshot {
     fn collect(
         mirror: &ThreadMirror,
         caps: CapabilitySet,
+        policy: &super::pending::DecisionPolicy,
         request_key: &str,
         _token: &str,
     ) -> Self {
-        let projection = mirror.project(caps);
+        let projection = mirror.project_with_policy(caps, policy);
         let live_pendings = projection
             .pending
             .iter()
@@ -1078,36 +1882,55 @@ impl RespondSnapshot {
         }
         let request_id_value = self.request_id.ok_or_else(|| "invalid_id".to_string())?;
         let caps = self.caps;
-        let (method, version): (&str, u32) = match (&pending.kind, action) {
-            (PendingKind::CommandApproval, PendingAction::Approve | PendingAction::Reject) => {
-                if !caps.command {
-                    return Err("capability_unavailable".into());
+        // (方法名, 决策词)；决策词只对 command/file 有意义，其余为空串。
+        // **这里不写版本号**：版本唯一来源是方法表，由派发侧 `dispatch` 用
+        // `conn.version_of(method)` 解析（方法缺失 → NotSent，见 dispatch 注释）。
+        let (method, decision_word): (&'static str, &str) = match (&pending.kind, action) {
+            // 命令 / 文件变更审批：**决策词由服务端策略给定的 allowedDecisions 决定**
+            // （单一来源；未知 build 只有 accept/cancel，已知 build 有 accept/decline）
+            (
+                PendingKind::CommandApproval | PendingKind::FileChangeApproval,
+                PendingAction::Approve | PendingAction::Reject,
+            ) => {
+                let method =
+                    decision_method(&pending.kind).ok_or_else(|| "unsupported".to_string())?;
+                let word = match action {
+                    PendingAction::Approve => {
+                        pick_decision(&pending.allowed_decisions, &[DECISION_ACCEPT])
+                    }
+                    // 拒绝：优先 `decline`（回合继续），策略只给了 `cancel` 时用它
+                    // （终止本轮）——两者语义不同，绝不混用
+                    _ => pick_decision(
+                        &pending.allowed_decisions,
+                        &[DECISION_DECLINE, DECISION_CANCEL],
+                    ),
                 }
-                ("thread-follower-command-approval-decision", 1)
+                .ok_or_else(|| "capability_unavailable".to_string())?;
+                (method, word)
             }
             (PendingKind::PermissionsApproval, PendingAction::Approve | PendingAction::Reject) => {
                 if !caps.permissions {
                     return Err("capability_unavailable".into());
                 }
-                ("thread-follower-permissions-request-approval-response", 1)
+                (METHOD_PERMISSIONS_RESPONSE, "")
             }
             (PendingKind::UserInput, PendingAction::Answer(_)) => {
                 if !caps.blocking_input {
                     return Err("capability_unavailable".into());
                 }
-                ("thread-follower-submit-user-input", 1)
+                (METHOD_SUBMIT_USER_INPUT, "")
             }
             (PendingKind::Unsupported, _) => return Err("unsupported".into()),
             _ => return Err("action_mismatch".into()),
         };
         let approve = matches!(action, PendingAction::Approve);
         let params = match (&pending.kind, action) {
-            (PendingKind::CommandApproval, _) => {
-                // command 变体：只发 decision 词，绝不携带 permissions 对象
+            // command / file 共用同一决策体：只发 decision 词，绝不携带 permissions 对象
+            (PendingKind::CommandApproval | PendingKind::FileChangeApproval, _) => {
                 json!({
                     "conversationId": key.thread_id,
                     "requestId": request_id_value,
-                    "decision": if approve { "accept" } else { "decline" },
+                    "decision": decision_word,
                 })
             }
             (PendingKind::PermissionsApproval, _) => {
@@ -1173,19 +1996,29 @@ impl RespondSnapshot {
         };
         let _ = request_key;
         let _ = context_token;
-        Ok(PreparedRespond {
-            method: method.to_string(),
-            version,
-            params,
-        })
+        Ok(PreparedRespond { method, params })
     }
 }
 
 /// wire 组装完成后的派发载荷。
+///
+/// **不携带版本号**：版本唯一来源是 profile 方法表，由 [`DesktopIpcAdapter::dispatch`]
+/// 在真正派发前按方法名解析（方法不在表里 → NotSent）。组装侧若自带版本，等于绕过
+/// 单一真相源——这正是本结构此前硬编码 `version = 1` 的问题。
 struct PreparedRespond {
-    method: String,
-    version: u32,
+    method: &'static str,
     params: Value,
+}
+
+/// 从策略给的 `allowedDecisions` 里按**优先级**挑一个词（候选取自语义正确的集合）。
+///
+/// 例：拒绝的候选是 `[decline, cancel]`——策略同时给了两个词时先用 `decline`
+///（回合继续），只给 `cancel` 时才用它（终止本轮）。
+fn pick_decision<'a>(allowed: &[String], candidates: &[&'a str]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .copied()
+        .find(|word| allowed.iter().any(|w| w == word))
 }
 
 // ============================================================
@@ -1487,7 +2320,10 @@ async fn handle_state_changed(adapter: &DesktopIpcAdapter, frame: Value) {
         // C3：状态应用驱动的提交屏障清理——pending 消失或重现换 token 即解除旧
         // Unknown 屏障（不等下一次 respond 入口），新卡立即可答
         cleanup_inflight_for(adapter, &key.thread_id, &p.pending).await;
-        adapter.publish_event(p).await;
+        // #172/T9a：盖上探测只读事实（镜像锁已释放）
+        adapter
+            .publish_event(adapter.stamp_probe_status(p).await)
+            .await;
         if history_needed {
             maybe_request_complete_history(adapter, &key).await;
         }
@@ -1570,7 +2406,10 @@ async fn publish_projection(adapter: &DesktopIpcAdapter, key: &ThreadKey) {
         mirrors.get(key).map(|m| m.project(caps))
     };
     if let Some(p) = projection {
-        adapter.publish_event(p).await;
+        // #172/T9a：盖上探测只读事实（镜像锁已释放）
+        adapter
+            .publish_event(adapter.stamp_probe_status(p).await)
+            .await;
     }
 }
 
@@ -1701,6 +2540,8 @@ async fn maybe_request_complete_history(adapter: &DesktopIpcAdapter, key: &Threa
                     target: None,
                     mutating: false,
                     validity: None,
+                    source_client_id: None,
+                    timeout_ms: None,
                 })
                 .await;
             let accepted = matches!(outcome.delivery, super::types::Delivery::Accepted);
@@ -1822,7 +2663,10 @@ async fn handle_client_status_changed(adapter: &DesktopIpcAdapter, frame: &Value
         inflight.retain(|(tid, _), _| !affected.iter().any(|k| &k.thread_id == tid));
     }
     for p in projections {
-        adapter.publish_event(p).await;
+        // #172/T9a：盖上探测只读事实（镜像锁已释放）
+        adapter
+            .publish_event(adapter.stamp_probe_status(p).await)
+            .await;
     }
     // 2026-10-17 复审 C2：owner 失效但 socket 仍活着——连接级恢复循环不会触发；
     // 主动重新 discovery/follow 让新 owner 接管（重新接管的帧才能落进镜像），
@@ -1889,7 +2733,10 @@ async fn mark_all_mirrors_stale(adapter: &DesktopIpcAdapter, invalidate: bool) {
         }
     }
     for p in projections {
-        adapter.publish_event(p).await;
+        // #172/T9a：盖上探测只读事实（镜像锁已释放）
+        adapter
+            .publish_event(adapter.stamp_probe_status(p).await)
+            .await;
     }
 }
 
@@ -2059,5 +2906,292 @@ mod recovery_queue_tests {
         assert_eq!(c.len(), produced, "零重复消费");
         let q = queue.lock().unwrap();
         assert!(q.pending.is_empty() && !q.running, "终态无残留无消费者");
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    //! T7-R3：派发版本号**只从方法表解析**——方法不在表里 = 明确方法缺失 →
+    //! `NotSent`（证明不再像旧实现那样在组装侧硬编码 `version = 1` 放行）。
+    //! 方法表新增项（file 决策方法）的取证见 profile.rs 单测与 observed/README.md。
+
+    use super::*;
+    use crate::services::codex_desktop_ipc::connection;
+
+    type ConnectFuture<'a> = Pin<
+        Box<
+            dyn std::future::Future<Output = Result<super::super::transport::BoxIo, ProtocolError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// 本模块不建真实连接：dispatch 在版本解析阶段即返回，连接只作为 `Some` 存在。
+    struct NoopConnector;
+
+    impl Connector for NoopConnector {
+        fn connect(&self) -> ConnectFuture<'_> {
+            Box::pin(async { Err(ProtocolError::Disconnected("test connector".into())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_evidence_is_bound_to_identity_and_reprobed() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "unknown-a"),
+        );
+        adapter.set_probe_key_override(Some("macos|unknown-a|cli-a|1".into()));
+        adapter.set_schema_probe_override(Some(SchemaProbeOutcome::Known(SchemaEvidence {
+            fingerprint: "schema-a".into(),
+            command_decisions: vec!["accept".into(), "cancel".into()],
+            file_decisions: vec![],
+        })));
+        adapter.ensure_schema_evidence().await;
+        assert!(!adapter.approval_policy().is_empty());
+        adapter.inner.epoch.fetch_add(1, Ordering::SeqCst);
+        *adapter.inner.probe_target.lock().unwrap() = Some(ProbeTarget {
+            epoch: 1,
+            platform: "macos".into(),
+            build: "unknown-b".into(),
+            key: None,
+        });
+        adapter.set_probe_key_override(Some("macos|unknown-b|cli-b|1".into()));
+        assert!(adapter.approval_policy().is_empty(), "旧证据不得跨身份复用");
+        adapter.ensure_schema_evidence().await;
+        assert!(!adapter.approval_policy().is_empty(), "新身份应重新取证");
+    }
+
+    #[tokio::test]
+    async fn old_fingerprint_cannot_fill_reconnected_target() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "same-build"),
+        );
+        let old_target = adapter.probe_target_snapshot().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let old_adapter = adapter.clone();
+        let old = tokio::spawn(async move {
+            old_adapter
+                .resolve_probe_key_with(&old_target, async {
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                    "cli-a".to_string()
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        // build 不变，连接与 CLI 已换代；先清空新 target，再放行旧计算。
+        adapter.inner.epoch.fetch_add(1, Ordering::SeqCst);
+        *adapter.inner.probe_target.lock().unwrap() = Some(ProbeTarget {
+            epoch: 1,
+            platform: "macos".into(),
+            build: "same-build".into(),
+            key: None,
+        });
+        finish_tx.send(()).unwrap();
+        assert_eq!(old.await.unwrap(), "cli-a");
+        assert_eq!(
+            adapter.probe_target_snapshot().unwrap().key,
+            None,
+            "旧 CLI 指纹不得污染新连接的缓存"
+        );
+        let new_target = adapter.probe_target_snapshot().unwrap();
+        adapter
+            .resolve_probe_key_with(&new_target, async { "cli-b".to_string() })
+            .await;
+        assert_eq!(
+            adapter.probe_target_snapshot().unwrap().key.as_deref(),
+            Some("cli-b")
+        );
+    }
+
+    #[derive(Default)]
+    struct ProbedLedger {
+        records: AtomicU64,
+    }
+    impl ProbeLedger for ProbedLedger {
+        fn get(&self, key: &str, _: &str) -> Option<super::super::probe::ProbeLedgerEntry> {
+            (key == "cli-a").then_some(super::super::probe::ProbeLedgerEntry {
+                state: crate::database::dao::codex_ipc_probe::ProbeState::Probed,
+                next_retry_at: None,
+                stage: None,
+                error_code: None,
+                fingerprint: None,
+            })
+        }
+        fn record(&self, key: &str, _: &str, _: &ProbeOutcome, _: Option<&str>) {
+            assert_eq!(key, "cli-b", "旧结果不得落账");
+            self.records.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn old_read_key_cannot_unlock_reconnected_target() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "same-build"),
+        );
+        adapter.set_probe_ledger(Arc::new(ProbedLedger::default()));
+        let old_target = adapter.probe_target_snapshot().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let a = adapter.clone();
+        let old = tokio::spawn(async move {
+            let key = a
+                .resolve_probe_key_with(&old_target, async {
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                    "cli-a".to_string()
+                })
+                .await;
+            a.reuse_ledger_evidence(&old_target, &key)
+        });
+        started_rx.await.unwrap();
+        {
+            let mut slot = adapter.inner.probe_target.lock().unwrap();
+            adapter.inner.epoch.fetch_add(1, Ordering::SeqCst);
+            *slot = Some(ProbeTarget {
+                epoch: 1,
+                platform: "macos".into(),
+                build: "same-build".into(),
+                key: None,
+            });
+            adapter.set_profile(ProtocolProfile::unverified("macos", "same-build"));
+        }
+        finish_tx.send(()).unwrap();
+        old.await.unwrap();
+        assert!(!adapter.capabilities().state, "A 的 probed 账本不得解锁 B");
+    }
+
+    #[tokio::test]
+    async fn old_read_result_cannot_record_or_unlock_reconnected_target() {
+        let adapter = DesktopIpcAdapter::new(
+            Arc::new(NoopConnector),
+            ProtocolProfile::unverified("macos", "same-build"),
+        );
+        let ledger = Arc::new(ProbedLedger::default());
+        adapter.set_probe_ledger(ledger.clone());
+        let old_target = adapter.probe_target_snapshot().unwrap();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let a = adapter.clone();
+        let old = tokio::spawn(async move {
+            let outcome = finish_rx.await.unwrap();
+            a.apply_read_probe_result(&old_target, "cli-a", &outcome)
+        });
+        {
+            let mut slot = adapter.inner.probe_target.lock().unwrap();
+            adapter.inner.epoch.fetch_add(1, Ordering::SeqCst);
+            *slot = Some(ProbeTarget {
+                epoch: 1,
+                platform: "macos".into(),
+                build: "same-build".into(),
+                key: None,
+            });
+            adapter.set_profile(ProtocolProfile::unverified("macos", "same-build"));
+        }
+        let outcome = ProbeOutcome::Probed {
+            stage: ProbeStage::P3,
+            revision: Some(1),
+            duration_ms: 0,
+        };
+        finish_tx.send(outcome.clone()).unwrap();
+        assert!(!old.await.unwrap());
+        assert_eq!(ledger.records.load(Ordering::SeqCst), 0);
+        assert!(!adapter.capabilities().state, "A 的探测成功不得解锁 B");
+        let current = adapter.probe_target_snapshot().unwrap();
+        assert!(adapter.apply_read_probe_result(&current, "cli-b", &outcome));
+        assert_eq!(ledger.records.load(Ordering::SeqCst), 1);
+        assert!(adapter.capabilities().state, "B 自己的证据应能解锁 B");
+    }
+
+    fn lease() -> OwnerLease {
+        OwnerLease {
+            key: ThreadKey {
+                host_id: "local".into(),
+                thread_id: "t-1".into(),
+            },
+            client_id: "owner-1".into(),
+            epoch: 1,
+            generation: 1,
+        }
+    }
+
+    /// 回归：未进表方法即便拿到一条活连接也只能 `NotSent`，reason 为方法缺失码
+    ///（旧硬编码路径会以 v1 发出 → 这里会变成非 NotSent，用例即变红）。
+    #[tokio::test]
+    async fn dispatch_rejects_method_missing_from_table() {
+        let (io, _peer) = tokio::io::duplex(64 * 1024);
+        let conn = connection::spawn(Box::new(io), ProtocolProfile::closed(), 1);
+        let adapter = DesktopIpcAdapter::new(Arc::new(NoopConnector), ProtocolProfile::closed());
+        *adapter.inner.conn.lock().await = Some(conn.clone());
+        let (_tx, validity) = tokio::sync::watch::channel(true);
+        //「形似官方方法但未进表」：正是硬编码时代会被放行的名字
+        //（interrupt-turn 已随原生打断功能入表，另取形似名）
+        let outcome = adapter
+            .dispatch(
+                "thread-follower-interrupt-turn-legacy",
+                None,
+                json!({}),
+                lease(),
+                validity,
+            )
+            .await;
+        assert_eq!(outcome.delivery, Delivery::NotSent, "未进表方法必须零投递");
+        assert_eq!(
+            outcome.reason_code.as_deref(),
+            Some("unsupported_method"),
+            "reason = 方法缺失码（不是 disconnected / 放行）"
+        );
+        assert!(outcome.result.is_none());
+        conn.shutdown().await;
+    }
+
+    /// 方法名集中登记：command / file 各用各的决策方法，且两条都必须在方法表里
+    /// （版本唯一来源）；非决策类不伪造决策方法。
+    #[test]
+    fn decision_methods_resolve_from_method_table() {
+        let profile = ProtocolProfile::closed();
+        for kind in [
+            PendingKind::CommandApproval,
+            PendingKind::FileChangeApproval,
+        ] {
+            let method = decision_method(&kind).expect("审批类必须有决策方法");
+            assert_eq!(
+                profile.version(method, None),
+                Ok(1),
+                "{method} 必须登记在方法表且为 v1"
+            );
+        }
+        assert_eq!(
+            decision_method(&PendingKind::CommandApproval),
+            Some(METHOD_COMMAND_DECISION)
+        );
+        assert_eq!(
+            decision_method(&PendingKind::FileChangeApproval),
+            Some(METHOD_FILE_DECISION)
+        );
+        assert_ne!(
+            METHOD_COMMAND_DECISION, METHOD_FILE_DECISION,
+            "command / file 决策方法互不替代"
+        );
+        // 非决策类没有「决策词」方法
+        assert_eq!(decision_method(&PendingKind::PermissionsApproval), None);
+        assert_eq!(decision_method(&PendingKind::UserInput), None);
+        assert_eq!(decision_method(&PendingKind::Unsupported), None);
+        // 原生打断方法已登记（基值 4，2026-10-21 静态取证；main 合并）
+        assert_eq!(
+            profile.version("thread-follower-interrupt-turn", None),
+            Ok(4),
+            "interrupt-turn 必须从方法表取版本（基值 4）"
+        );
+        // 未登记方法 → UnsupportedMethod（单一真相源明确拒绝，不猜版本）
+        assert_eq!(
+            profile.version("thread-follower-interrupt-turn-legacy", None),
+            Err(ProtocolError::UnsupportedMethod(
+                "thread-follower-interrupt-turn-legacy".into()
+            ))
+        );
     }
 }

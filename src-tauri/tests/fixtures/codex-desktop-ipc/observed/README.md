@@ -54,13 +54,49 @@ macOS 金样 5 条事实**同构**（T2 逐项核对全 ✓，含 `tail:0:local:
 | `windows-4894-plan-input.sanitized.json` | `/plan` 会话的 `item/tool/requestUserInput`（**整数 id**）+ `thread-follower-submit-user-input` 作答 + `{"ok":true}` |
 | `windows-4894-opening.derived.sanitized.json` | **DERIVED**（源：`raw/t4-1.jsonl` T4 rev3 snapshot）：删去某 Turn 的正式 userMessage，保留 `params.input`/`clientUserMessageId`——开场后备投影测试用；其余字节与原脱敏样本一致 |
 | `windows-4894-busy-negative.derived.sanitized.json` | **DERIVED**（源：`raw/t7-1.jsonl` 忙态负例）：某 Turn 的 `params.clientUserMessageId`/`input` 被替换为合成第二条 prompt（未落 Turn），`items` 保留第一条真实 userMessage——`opening_*` 幽灵气泡负例；只有这两处派生 |
-
+| `windows-4894-plan-request-implementation.sanitized.json` | **DERIVED**（源：2026-10-21 真机只读抓取 rev 146）：`conversationState.requests` 里的**计划实现审批** `item/plan/requestImplementation`（`params` = `planContent`；`id` 是 **string**，51 字符）——施工单 §3 明确不开放 plan，本夹具钉死「必须保持 `Unsupported`/到桌面处理」，并证明 string id 走 `s:` 前缀 |
+| `windows-6573-pending-command.sanitized.json` | **DERIVED**（源：2026-10-21 真机只读抓取，build **26.1016.6573.0**）：`conversationState.requests` 里的**命令审批** `item/commandExecution/requestApproval`——`id` 是**整数**，`params` = kind/threadId/turnId/itemId/startedAtMs/environmentId/reason/command/cwd/commandActions/proposedExecpolicyAmendment/**availableDecisions**。未知 build 的 pending 形状证据（无真机 decision 闭环，见 T10） |
+| `windows-6573-command-approval-accept.sanitized.json` | **OBSERVED**（源：2026-10-22 真机**受控决策闭环**探针 `tests/codex_ipc_live_decision.rs`，build **26.1016.6573.0**）：三段闭环——pending（`item/commandExecution/requestApproval`，整数 id 8）→ 决策请求（`thread-follower-command-approval-decision` v1，`params={conversationId,requestId,decision}`，信封带 `targetClientId`）→ 回执（`resultType=success`、`result={"ok":true}`、`handledByClientId` 存在）。**6573 上的 decision 应答已真机闭环**（accept）；`cancel` 轮未跑 |
 同批已知边界（如实登记）：permissions 请求在该 build 的读场景 NOT_TRIGGERED（外部读取升权
 走 command approval）；空会话不落 session（真空首帧无样本）；忙态 start-turn 返回 success
 但新 prompt 不落 Turn（生产忙态屏障必需，不能把写回执当投递成功）。
 
-## 2026-10-21 附件任务取证状态
+## Windows 26.1016.6573.0（2026-10-21 探测批，未知 build 兼容路径的真机样本）
 
+来源：同一条只读探针（`tests/codex_ipc_live_capture.rs`）在**新 build** 上抓取；Desktop 已从
+`26.1013.4894.0` 升级到 `26.1016.6573.0`，本仓 shipped 表**尚未**登记该 build（读链证据已具备，
+是否提升等用户裁决）。三条事实（本轮如实登记）：
+
+1. **官方方法表与 `26.1013.4894.0` 完全一致**：`thread-stream-state-changed: 11`、
+   `thread-follower-start-turn: 2`、`thread-follower-command-approval-decision: 1`、
+   `thread-follower-file-approval-decision: 1` 等逐项相同 → 未知 build 的**协议语法稳定**，
+   「版本只用于归因、能力靠证据或探测」的前提成立。
+2. **官方 command/file 决策方法的参数形状** = `{conversationId, requestId, decision}`
+   （+ 可选 `targetClientId`，走信封）——本仓的两个决策方法与之一致。
+3. **官方 pending 自带 `availableDecisions`** = `["accept", {acceptWithExecpolicyAmendment: {…}}, "cancel"]`
+   ——**没有 `decline` 字面量**。对象形态（`acceptWithExecpolicyAmendment` /
+   `applyNetworkPolicyAmendment`）属**执行策略修订（权限扩大）**，本仓一律忽略、永不自动发。
+   决策词以「字符串词」为准；`decline` 在 4894 真机已被接受并生效
+   （`windows-4894-command-approval-decline.sanitized.json`）。
+
+
+## Windows 26.1016.6573.0 提升登记（2026-10-22 取证批，四条证据齐备）
+
+该 build 已于 2026-10-22 完成取证并**登记进 shipped 表**（`profile.rs` 的
+`windows_6573_profile`）：`state` / `send` / `command` = true；`permissions` /
+`blocking_input`（Plan 阻塞问答）/ Plan / collaboration 模式切换**保持关闭**（无证据）。
+
+| 证据 | 取得方式 | 落点 |
+| --- | --- | --- |
+| 读链 P0–P3 | 生产 adapter `ensure_read_evidence`（owner discovery → 临时 following → 首个 snapshot 判据）真机通过 | `tests/codex_ipc_live_probe.rs` |
+| **send 闭环** | 生产 adapter `start_turn_compat` **只发一帧** → 回执 `Accepted`（674ms）+ 回执内 `turn.status="inProgress"`，事后核对**状态真的前进** | `tests/codex_ipc_live_send.rs`（显式同意闸 + 事后核对「受理≠生效」） |
+| command 审批 decision 闭环 | `thread-follower-command-approval-decision` v1 / `decision=accept` → `resultType=success`、`result.ok=true` | `windows-6573-command-approval-accept.sanitized.json` |
+| 官方方法表 | `app.asar` 与 `26.1013.4894.0` 逐项一致（`state-changed:11` / `start-turn:2` / 各 decision v1） | 上节「官方方法表与 4894 完全一致」 |
+
+附带发现（如实登记）：本 build 的随包 CLI 是 **`0.163.0-alpha.11`**（4894 上是
+`0.163.0-alpha.10.2`）→ **CLI 随 Desktop 一起漂移**，这实证了账本键必须带 `cli_id`
+（只看 build 会把「同 build、不同 CLI」的证据混用）。
+## 2026-10-21 附件任务取证状态
 现有 OBSERVED canonical 快照没有 `imageGeneration`、`localImage`、`mention`、
 `fileChange`、`imageView` 或用户图片 URL／fileId 分支。此次没有新增 OBSERVED
 附件文件：本机仅有已有私人会话可供 IPC 读取；在不读取私人对话且不触发真实

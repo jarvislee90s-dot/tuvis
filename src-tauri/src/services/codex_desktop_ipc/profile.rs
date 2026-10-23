@@ -3,17 +3,40 @@
 //!
 //! profile 常量是**当前协议基线**：`false` = 该 build 尚未活体验证，不是协议不存在；
 //! 只有 Task 10 真机闭环 PASS 才翻转对应 flag，测试可用注入 profile 测构造器。
+//!
+//! **#172 起语义变更（措辞变了，不变量不变）**：`profile_for` 从「准入白名单」降级为
+//! 「**证据缓存**」——版本号只做归因与缓存键，能力一律来自证据或探测。未命中 shipped
+//! 表不再等价于「能力全关」，而是 [`ProtocolProfile::unverified`]（尚无证据：可惰性
+//! 探测 / 可复用账本）；[`ProtocolProfile::closed`] 只留给**明确不可用**
+//! （连接不可达 / 平台不支持 / 探测明确失败）。
 
 use crate::services::codex_desktop_ipc::types::{CapabilitySet, ProtocolError};
 use std::collections::BTreeMap;
 
-/// 已验证 Desktop build 的能力/版本基线；未识别 build 返回 `None`（能力全关）。
+/// 已验证 Desktop build 的能力/版本基线；未命中 shipped 表由调用方按证据级别建
+/// [`ProtocolProfile::unverified`] 或 [`ProtocolProfile::closed`]。
 #[derive(Clone)]
 pub struct ProtocolProfile {
     pub platform: String,
     pub build: String,
     pub capabilities: CapabilitySet,
     pub method_versions: BTreeMap<String, u32>,
+    /// #172：这份 profile 是「**尚无证据**」（未知 build，可探测 / 可查账本）还是
+    /// 「**明确不可用**」（连接不可达 / 平台不支持 / 探测明确失败）。
+    /// 两者能力位都是全 false，但**能不能探**不同——这是从「准入白名单」降级为
+    /// 「证据缓存」后唯一必须保留的区分。
+    pub evidence: EvidenceLevel,
+}
+
+/// profile 的证据级别（不是用户可见档位；用户档位见 `ControlAvailability`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceLevel {
+    /// 精确 build 在 shipped 表里（真机证据，无需探测）。
+    Shipped,
+    /// 未知 build：**尚无证据**，首次触发时惰性探测（或复用账本）。
+    Unverified,
+    /// 明确不可用：连接不可达 / 平台不支持 / 探测明确失败——不再探测。
+    Closed,
 }
 
 impl ProtocolProfile {
@@ -32,7 +55,35 @@ impl ProtocolProfile {
                 interrupt: false,
             },
             method_versions: method_table(),
+            evidence: EvidenceLevel::Closed,
         }
+    }
+
+    /// #172：**「尚无证据」档**——「尚无证据」不是「明确不可用」。能力位全 false
+    /// （未取证前不启用任何能力），方法表沿用基线；与 [`closed`] 的区别只在
+    /// [`evidence`]：这一档**可以**惰性探测 / 复用账本，判死档不行。
+    /// 未知 build 的生产档位已让位给 [`compat_send_profile`]（2026-10-22 用户
+    /// 裁决）；本档保留给 debug 强制开关（`force_unverified`）压档调试探测分支。
+    pub fn unverified(platform: &str, build: &str) -> Self {
+        Self {
+            platform: platform.to_string(),
+            build: build.to_string(),
+            capabilities: CapabilitySet {
+                send: false,
+                state: false,
+                command: false,
+                permissions: false,
+                blocking_input: false,
+                interrupt: false,
+            },
+            method_versions: method_table(),
+            evidence: EvidenceLevel::Unverified,
+        }
+    }
+
+    /// 是否处于「尚无证据、可探测」档（只有这一档允许触发只读探测）。
+    pub fn is_probe_eligible(&self) -> bool {
+        self.evidence == EvidenceLevel::Unverified
     }
 
     /// 按方法取版本。`envelope_host` 为 `Some` 时仅 `thread-follower-*` 基值 +1
@@ -53,6 +104,11 @@ impl ProtocolProfile {
 /// 协议方法版本表（与平台无关；探测定案 + 计划「协议与工程值」）。
 /// `load-complete-history` / command 变体 / Plan blocking input 在 Mac 未实测，
 /// 版本常量按表登记但能力 flag 保持 false——未验证不启用。
+///
+/// **本表是版本号的唯一来源**：派发侧（`adapter::dispatch`）只按方法名查表拿版本，
+/// 任何调用点都不得硬编码版本号；**新增方法必须先有真机证据**（官方方法表核对，
+/// 见 `tests/fixtures/codex-desktop-ipc/observed/README.md`）才能进表——未进表的方法
+/// 一律视为「明确方法缺失」，派发返回 `NotSent`，绝不带猜测版本瞎发。
 fn method_table() -> BTreeMap<String, u32> {
     BTreeMap::from([
         ("thread-owner-discovery".to_string(), 1),
@@ -62,6 +118,11 @@ fn method_table() -> BTreeMap<String, u32> {
         ("thread-follower-start-turn".to_string(), 2),
         ("thread-follower-load-complete-history".to_string(), 1),
         ("thread-follower-command-approval-decision".to_string(), 1),
+        // 依据 = build `26.1016.6573.0` 真机方法表（2026-10-21 探测批，
+        // observed/README.md「官方方法表与 26.1013.4894.0 完全一致」）：文件变更审批的
+        // 决策方法与 command 决策方法同为 v1，是官方基线方法——此前遗漏导致 file 审批
+        // 只能靠调用点硬编码版本，现纳入单一真相源。
+        ("thread-follower-file-approval-decision".to_string(), 1),
         (
             "thread-follower-permissions-request-approval-response".to_string(),
             1,
@@ -96,6 +157,7 @@ fn windows_profile(build: &str) -> ProtocolProfile {
             interrupt: false,
         },
         method_versions: method_table(),
+        evidence: EvidenceLevel::Shipped,
     }
 }
 
@@ -114,6 +176,7 @@ fn macos_profile(build: &str) -> ProtocolProfile {
             interrupt: false,
         },
         method_versions: method_table(),
+        evidence: EvidenceLevel::Shipped,
     }
 }
 
@@ -142,6 +205,7 @@ fn macos_interrupt_profile(build: &str) -> ProtocolProfile {
             interrupt: true,
         },
         method_versions: method_table(),
+        evidence: EvidenceLevel::Shipped,
     }
 }
 
@@ -168,6 +232,41 @@ fn windows_4894_profile(build: &str) -> ProtocolProfile {
             interrupt: false,
         },
         method_versions: method_table(),
+        evidence: EvidenceLevel::Shipped,
+    }
+}
+
+/// Windows `26.1016.6573.0`（2026-10-22 真机取证批登记）：Desktop 自动升级后的**当前**
+/// build——四条证据齐备，逐条有真机依据：
+/// * **读链**：生产代码路径只读探测 P0–P3 全通过（`ensure_read_evidence` → 真实
+///   IPC：owner discovery → 临时 following → 首个 snapshot 判据）；
+/// * **send**：真机 send 闭环（`start_turn_compat` 走生产 adapter 路径，**只发一帧**）→
+///   回执 `Accepted`（674ms）+ 回执内 `turn.status="inProgress"`，事后核对**状态真的前进**
+///   （revision 前进 / 消息变多）——「受理 ≠ 生效」这条纪律在 send 上同样成立并已核对；
+/// * **command 审批**：真机 decision 闭环（`thread-follower-command-approval-decision`
+///   v1 / decision=accept → `resultType=success`、`result.ok=true`），脱敏夹具
+///   `observed/windows-6573-command-approval-accept.sanitized.json`；
+/// * **官方方法表**：`app.asar` 里 `thread-stream-state-changed:11` / `start-turn:2` /
+///   各 decision v1 与 `26.1013.4894.0` **逐项一致**（含
+///   `thread-follower-file-approval-decision:1`）→ 协议语法未漂移，4894 上的 decline 可用性
+///   可平移。
+///
+/// **保持关闭的位（如实）**：`permissions`（无 `item/permissions/requestApproval` 证据）、
+/// `blocking_input`（本 build 未实测 Plan 阻塞问答）、Plan / collaboration 模式切换。
+fn windows_6573_profile(build: &str) -> ProtocolProfile {
+    ProtocolProfile {
+        platform: "windows".to_string(),
+        build: build.to_string(),
+        capabilities: CapabilitySet {
+            send: true,
+            state: true,
+            command: true,
+            permissions: false,
+            blocking_input: false,
+            interrupt: false,
+        },
+        method_versions: method_table(),
+        evidence: EvidenceLevel::Shipped,
     }
 }
 
@@ -176,6 +275,7 @@ pub fn profile_for(platform: &str, build: &str) -> Option<ProtocolProfile> {
     match (platform, build) {
         ("windows", "26.1013.3656.0") => Some(windows_profile(build)),
         ("windows", "26.1013.4894.0") => Some(windows_4894_profile(build)),
+        ("windows", "26.1016.6573.0") => Some(windows_6573_profile(build)),
         ("macos", "26.1013.31256") => Some(macos_profile(build)),
         // 40934：2026-10-18 实机登记 + 2026-10-21 interrupt 取证
         //（docs/superpowers/reviews/2026-10-22-codex-interrupt-probe-results.md）
@@ -194,6 +294,9 @@ pub fn profile_for(platform: &str, build: &str) -> Option<ProtocolProfile> {
 /// `request-version-mismatch` → NotSent 如实未送达；回合卡死 → 镜像可见 +
 /// 原生回合打断出口（B3）。登记 build 的证据门控不受影响——本档只接住
 /// `profile_for` 落空的未知 build；空 build（Desktop 身份读不出来）仍用 closed。
+///
+/// `evidence = Unverified`（#172 接线，合并裁决）：本档保持**可探测**——只读探测 /
+/// 账本 / schema 证据照常运转，command/permissions 等证据门控能力在取证后解锁。
 pub fn compat_send_profile(platform: &str, build: &str) -> ProtocolProfile {
     ProtocolProfile {
         platform: platform.to_string(),
@@ -207,6 +310,7 @@ pub fn compat_send_profile(platform: &str, build: &str) -> ProtocolProfile {
             interrupt: false,
         },
         method_versions: method_table(),
+        evidence: EvidenceLevel::Unverified,
     }
 }
 
@@ -311,6 +415,18 @@ mod tests {
         assert!(!p4894.capabilities.permissions);
         // 未探测的相邻 build 仍然 fail-closed（精确门，不是版本下限）
         assert!(profile_for("windows", "26.1013.4895.0").is_none());
+        // 6573.0 = 2026-10-22 真机取证批登记（读链 P0–P3 + send 闭环 + command 审批
+        // 闭环 + 官方方法表与 4894 逐项一致）：caps 逐项钉死；permissions / blocking_input
+        // 无证据保持关
+        let p6573 = profile_for("windows", "26.1016.6573.0").expect("registered");
+        assert!(p6573.capabilities.send && p6573.capabilities.state);
+        assert!(p6573.capabilities.command);
+        assert!(!p6573.capabilities.permissions);
+        assert!(
+            !p6573.capabilities.blocking_input,
+            "6573 未实测 Plan 阻塞问答 → 保持关（如实）"
+        );
+        assert!(profile_for("windows", "26.1016.6573.1").is_none());
         assert!(profile_for("linux", "26.1013.31256").is_none());
         assert!(profile_for("macos", "").is_none());
         // 已验证 build 精确命中
@@ -370,6 +486,30 @@ mod tests {
             Err(ProtocolError::UnsupportedMethod(
                 "thread-follower-not-a-real-method".to_string()
             ))
+        );
+    }
+
+    /// T7-R3：`26.1016.6573.0` 真机方法表取证——文件变更审批的决策方法必须进表
+    /// （与 command 决策方法并列，均为 v1）。此前漏登记，adapter 只能硬编码版本。
+    #[test]
+    fn method_table_registers_file_approval_decision_from_observed_build() {
+        let table = method_table();
+        assert_eq!(
+            table.get("thread-follower-file-approval-decision"),
+            Some(&1),
+            "官方方法表（26.1016.6573.0 真机核对）登记 file 决策方法 v1"
+        );
+        assert_eq!(
+            table.get("thread-follower-command-approval-decision"),
+            Some(&1),
+            "command 决策方法仍并列在表（两条决策方法互不替代）"
+        );
+        // 公开查表口径（envelope 不含 hostId → 基值）：file 决策方法可解析到 v1
+        let p = ProtocolProfile::closed();
+        assert_eq!(
+            p.version("thread-follower-file-approval-decision", None)
+                .unwrap(),
+            1
         );
     }
 

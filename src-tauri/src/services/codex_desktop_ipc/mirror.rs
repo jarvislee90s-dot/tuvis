@@ -71,10 +71,10 @@ use super::artifacts::{
     project_item_artifacts, TurnArtifacts,
 };
 use super::history_view::{HistoryView, ViewHealth};
-use super::pending::PendingProjector;
+use super::pending::{DecisionPolicy as PendingDecisionPolicy, PendingProjector};
 use super::types::{
     CapabilitySet, ContentState, ControlAvailability, MessagesPage, MessagesPageStatus, OwnerLease,
-    ProjectedMessage, ProtocolError, ThreadKey, ThreadProjection,
+    ProbeStatus, ProjectedMessage, ProtocolError, ThreadKey, ThreadProjection,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -228,6 +228,8 @@ pub struct ThreadMirror {
     ledger: Option<Arc<std::sync::Mutex<MirrorLedger>>>,
     /// 本镜像当前保留字节数（账本对账依据）
     size: usize,
+    /// #172/T7：审批决策策略覆盖（未知 build 用 schema 档；`None` = 按能力位取证据档）
+    approval_policy: Option<PendingDecisionPolicy>,
     /// 镜像重建代（历史页 token 的一段）：每成功装订一次**新 snapshot**（含首帧、
     /// 重拉、换代重建）递增；patch 是增量，不递增——否则流式补全会每帧打断分页。
     build_generation: u64,
@@ -262,10 +264,22 @@ impl ThreadMirror {
             history_complete: true,
             ledger: None,
             size: 0,
+            approval_policy: None,
             build_generation: 0,
             budget_refused: false,
             content: Mutex::new(ContentObservation::default()),
         }
+    }
+
+    /// #172/T7：下发审批决策策略（未知 build 的 schema 档由 adapter 在取证后设置）。
+    /// `None` = 回到「按能力位取证据档」的缺省行为。
+    pub fn set_approval_policy(&mut self, policy: Option<PendingDecisionPolicy>) {
+        self.approval_policy = policy;
+    }
+
+    /// 当前生效的审批策略（供 adapter 判断是否需要下发、以及测试断言）。
+    pub fn approval_policy(&self) -> Option<&PendingDecisionPolicy> {
+        self.approval_policy.as_ref()
     }
 
     /// 挂全局字节账本（adapter 构造镜像的唯一生产入口）。
@@ -585,10 +599,31 @@ impl ThreadMirror {
     /// 统一状态投影（远程 API / SSE / 移动端唯一消费形态）。
     /// token 缓存存于 PendingProjector 内部互斥锁，`&self` 即可投影。
     ///
+    /// 审批策略优先取镜像上已下发的覆盖（[`ThreadMirror::set_approval_policy`]）；
+    /// 没有覆盖时按能力位取证据档（老行为）。
     /// `historyToken` 是**根锚点**（v2：只绑 owner/重建代与已结算内容代，不绑尾窗
     /// 被裁掉的前缀长度）：客户端用它 + 尾窗最早一条作为第一次更早分页的入参。
     /// 尾窗前移本身不换 token（R2）。
     pub fn project(&self, caps: CapabilitySet) -> ThreadProjection {
+        match &self.approval_policy {
+            Some(policy) => {
+                let policy = policy.clone();
+                self.project_with_policy(caps, &policy)
+            }
+            None => {
+                let policy = PendingDecisionPolicy::from_caps(&caps);
+                self.project_with_policy(caps, &policy)
+            }
+        }
+    }
+
+    /// 同上，但**显式**指定审批策略（adapter 在 respond 路径上直接用当前生效策略，
+    /// 不依赖镜像上是否已下发）。
+    pub fn project_with_policy(
+        &self,
+        caps: CapabilitySet,
+        policy: &PendingDecisionPolicy,
+    ) -> ThreadProjection {
         // R1：state 即 conversationState 本体，按根直读
         let state = self.state.clone().unwrap_or(Value::Null);
         let all = project_full_messages(&state);
@@ -602,7 +637,7 @@ impl ThreadMirror {
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default();
-        let pending = self.pending.project(&requests, &caps);
+        let pending = self.pending.project_with_policy(&requests, &caps, policy);
         ThreadProjection {
             thread_id: self.key.thread_id.clone(),
             revision: self.revision,
@@ -615,6 +650,9 @@ impl ThreadMirror {
             messages,
             history_token,
             pending,
+            // #172/T9a：探测只读事实由 **adapter** 盖章（镜像层不知道账本/单飞器）；
+            // 这里先给诚实缺省（idle + 无码），adapter 随后覆盖。
+            probe_status: ProbeStatus::idle(),
             // 代际来自镜像**绑定的 lease**（广播事件与 GET/首快照同源）——首快照
             // 不带 0，否则 SSE 启动缓冲的 `supersedes` 会把任何事件都判成更新
             //（2026-10-20 第三轮复审 Important）。
@@ -1204,13 +1242,19 @@ fn content_state_of(state: Option<&Value>) -> ContentState {
     }
 }
 
+/// 能力档位投影（#172 解耦）：`state` 独立决定「能不能看」，`send` 独立决定
+/// 「能不能发」——
+/// * `send && state` → 可控制；
+/// * `send && !state` → 仅可发送（写可用、读链未取证）；
+/// * `!send && state` → **只读**（读链已取证、写未开放；旧实现落 CompatOnly，把
+///   只读取证结果连同界面一起降级）；
+/// * 两者皆无 → 兼容模式（不注入、不出原生卡）。
 fn availability_of(caps: &CapabilitySet) -> ControlAvailability {
-    if caps.send && caps.state {
-        ControlAvailability::Controllable
-    } else if caps.send {
-        ControlAvailability::SendOnly
-    } else {
-        ControlAvailability::CompatOnly
+    match (caps.send, caps.state) {
+        (true, true) => ControlAvailability::Controllable,
+        (true, false) => ControlAvailability::SendOnly,
+        (false, true) => ControlAvailability::ReadOnly,
+        (false, false) => ControlAvailability::CompatOnly,
     }
 }
 
@@ -1767,6 +1811,57 @@ mod tests {
         fixture("macos-snapshot.json")["params"]["change"].clone()
     }
 
+    /// #172 解耦：档位矩阵由 (send, state) 两维独立决定——`state && !send` 是
+    /// **只读**档（旧实现落 CompatOnly，只读取证结果连界面一起降级）。
+    #[test]
+    fn availability_matrix_decouples_state_and_send() {
+        let mk = |send: bool, state: bool| CapabilitySet {
+            send,
+            state,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+            interrupt: false,
+        };
+        assert_eq!(
+            availability_of(&mk(true, true)),
+            ControlAvailability::Controllable
+        );
+        assert_eq!(
+            availability_of(&mk(true, false)),
+            ControlAvailability::SendOnly
+        );
+        assert_eq!(
+            availability_of(&mk(false, true)),
+            ControlAvailability::ReadOnly
+        );
+        assert_eq!(
+            availability_of(&mk(false, false)),
+            ControlAvailability::CompatOnly
+        );
+    }
+
+    /// #172：只读取证（state=true / send=false）必须仍出正文投影与原生卡（只是不可
+    /// 写），不能因为「还不能发」把整页读能力一起关掉。
+    #[test]
+    fn state_only_projection_keeps_content_but_not_actionable() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(&lease(), &macos_change()).unwrap();
+        let read_only = CapabilitySet {
+            send: false,
+            state: true,
+            command: false,
+            permissions: false,
+            blocking_input: false,
+            interrupt: false,
+        };
+        let p = m.project(read_only);
+        assert_eq!(p.availability, ControlAvailability::ReadOnly);
+        assert_eq!(p.messages.len(), 2, "只读档仍要能看历史正文");
+        assert_eq!(p.pending.len(), 1, "pending 仍如实展示");
+        assert!(!p.pending[0].actionable, "只读档不给可操作卡");
+    }
+
     #[test]
     fn empty_turns_uses_canonical_history() {
         let mut m = ThreadMirror::new(key());
@@ -2318,6 +2413,90 @@ mod tests {
 
     fn observed_change(name: &str) -> Value {
         fixture(&format!("observed/{name}"))
+    }
+
+    /// 2026-10-21 真机（build 26.1016.6573.0）：**命令审批** pending 的真实形状——
+    /// `id` 是**整数**；`params` = kind/threadId/turnId/itemId/startedAtMs/environmentId/
+    /// reason/command/cwd/commandActions/proposedExecpolicyAmendment/availableDecisions。
+    ///
+    /// 两条纪律：① 决策词来自**策略**（证据档 accept/decline），不能拿
+    /// `availableDecisions` 当白名单——它没有 `decline` 字面量，但 `decision:"decline"`
+    /// 在 4894 真机被接受并生效；② `availableDecisions` 里的对象形态
+    /// （`acceptWithExecpolicyAmendment`）属执行策略修订（权限扩大），**永不自动发**。
+    #[test]
+    fn observed_pending_command_approval_projects_actionable() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(
+            &lease(),
+            &observed_change("windows-6573-pending-command.sanitized.json"),
+        )
+        .unwrap();
+        let mut evidence_caps = caps();
+        evidence_caps.command = true; // 证据档（shipped build）
+        let p = m.project(evidence_caps);
+        assert_eq!(p.pending.len(), 1, "命令审批 pending 必须投影出来");
+        let view = &p.pending[0];
+        assert_eq!(view.kind, PendingKind::CommandApproval);
+        assert!(view.actionable, "证据档下命令审批可远程决策");
+        assert_eq!(
+            view.allowed_decisions,
+            vec!["accept", "decline"],
+            "决策词来自策略，不是 availableDecisions（后者没有 decline）"
+        );
+        assert_eq!(
+            view.command.as_deref(),
+            Some("<synthetic command>"),
+            "命令正文按真机字段名取"
+        );
+        assert_eq!(view.cwd.as_deref(), Some("C:\\Temp\\probe-project"));
+        assert_eq!(view.reason.as_deref(), Some("<synthetic reason>"));
+        assert!(
+            view.request_key.starts_with("n:"),
+            "整数 id 走 n: 前缀：{}",
+            view.request_key
+        );
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(
+            !json.contains("availableDecisions") && !json.contains("proposedExecpolicyAmendment"),
+            "raw 参数不得进远端 DTO：{json}"
+        );
+    }
+
+    /// 2026-10-21 真机（rev 146）：`requests[]` 里除了命令/权限/问答，还有**计划实现审批**
+    /// `item/plan/requestImplementation`（`params` = `planContent`；`id` 是 **string**，
+    /// 不是整数）。施工单 §3 明确不探测/不开放 plan → 投影必须是 `Unsupported` +
+    /// 不可操作，且不得把 `planContent` 暴露到远端 DTO。
+    #[test]
+    fn observed_plan_request_implementation_stays_unsupported() {
+        let mut m = ThreadMirror::new(key());
+        m.apply(
+            &lease(),
+            &observed_change("windows-4894-plan-request-implementation.sanitized.json"),
+        )
+        .unwrap();
+        let p = m.project(caps());
+        assert_eq!(
+            p.pending.len(),
+            1,
+            "plan 审批要作为 pending 出现（只是不可操作）"
+        );
+        let view = &p.pending[0];
+        assert_eq!(view.kind, PendingKind::Unsupported);
+        assert!(!view.actionable, "plan 一律不可远程决策");
+        assert_eq!(
+            view.disabled_reason_code.as_deref(),
+            Some("capability_unavailable")
+        );
+        assert!(
+            view.request_key.starts_with("s:"),
+            "string id 必须按 s: 前缀编码（整数 id 才是 n:）：{}",
+            view.request_key
+        );
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(
+            !json.contains("planContent") && !json.contains("synthetic plan content"),
+            "不得把 raw 参数/计划正文暴露给远端：{json}"
+        );
     }
 
     #[test]

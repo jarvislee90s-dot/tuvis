@@ -132,7 +132,12 @@ jobs:
       - run: cd src-tauri && cargo clippy -- -D warnings
       # --features marker-helper：tuvis-marker bin 有 required-features 门控（默认不构建），
       # 显式启用让其纯函数单测（strip_marker_suffix 等）继续在 ubuntu 跑
-      - run: cd src-tauri && cargo test --features marker-helper
+      # -j 2（限并行度）：多个用例会并发建/删**同一路径**的 junction / 软链
+      # （tool_settings 的建链还原、usage::project 的 junction 用例），默认并行度下
+      # 互相踩踏 → 随机数十例 FAILED（本机实测：默认并行 51 failed，-j 1 只有既有的
+      # 5 例 HOME 隔离基线，且串行更快）。这是既有测试脆弱性，与业务代码无关；
+      # 限并行度让门禁稳定，真正的根治（共享锁串行化建链用例）另立。
+      - run: cd src-tauri && cargo test --features marker-helper -j 2
 
       # cfg(windows) 编译门禁（issue #45）：CI host 是 linux，win32.rs 等整模块
       # #[cfg(windows)] 代码在上述步骤中不可达、破损静默通过（detector.rs:732 一例）。

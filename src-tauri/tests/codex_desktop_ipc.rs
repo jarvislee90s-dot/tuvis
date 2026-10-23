@@ -129,6 +129,8 @@ fn simple_request(method: &str) -> RpcRequest {
         target: None,
         mutating: false,
         validity: None,
+        source_client_id: None,
+        timeout_ms: None,
     }
 }
 
@@ -847,6 +849,8 @@ async fn owner_rebind_invalidates_old_lease_end_to_end() {
             target: Some(lease_a.clone()),
             mutating: true,
             validity: Some(validity),
+            source_client_id: None,
+            timeout_ms: None,
         })
         .await;
     assert_eq!(outcome.delivery, Delivery::NotSent);
@@ -1132,6 +1136,108 @@ async fn native_command_approval_uses_decision_wire() {
         .expect("join");
     assert_eq!(o.delivery, Delivery::Accepted);
     adapter.shutdown().await;
+}
+
+/// #172/T7：**文件变更审批**走自己的 decision 方法（不是 command 那个），
+/// 证据档（shipped build）下决策词是 `accept` / `decline`。
+#[tokio::test]
+async fn native_file_change_approval_uses_file_decision_wire() {
+    let (adapter, mut peer, projection, key) = harness_for(
+        "windows",
+        WINDOWS_BUILD,
+        vec![serde_json::json!({
+            "id": 21, "method": "item/fileChange/requestApproval",
+            "params": { "cwd": "/w", "reason": "r", "changes": [{}, {}] }
+        })],
+    )
+    .await;
+    let file_key = projection
+        .pending
+        .iter()
+        .find(|p| {
+            p.kind
+                == multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind::FileChangeApproval
+        })
+        .expect("file change pending")
+        .clone();
+    assert_eq!(
+        file_key.allowed_decisions,
+        vec!["accept", "decline"],
+        "证据档：文件审批也给 accept/decline（老行为保留 decline）"
+    );
+
+    let t = {
+        let a = adapter.clone();
+        let key = key.clone();
+        let rk = file_key.request_key.clone();
+        let tk = file_key.context_token.clone();
+        tokio::spawn(async move { a.respond(&key, &rk, &tk, PendingAction::Reject).await })
+    };
+    let frame = peer.recv().await;
+    assert_eq!(
+        frame["method"], "thread-follower-file-approval-decision",
+        "文件审批必须用自己的 decision 方法"
+    );
+    assert_eq!(frame["version"], serde_json::json!(1));
+    assert_eq!(frame["params"]["requestId"], serde_json::json!(21));
+    assert_eq!(
+        frame["params"]["decision"], "decline",
+        "证据档的拒绝 = decline（回合继续）"
+    );
+    assert!(frame["params"].get("permissions").is_none());
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-file-approval-decision",
+        "result": { "ok": true }
+    }))
+    .await;
+    let o = tokio::time::timeout(Duration::from_secs(5), t)
+        .await
+        .expect("in time")
+        .expect("join");
+    assert_eq!(o.delivery, Delivery::Accepted);
+    adapter.shutdown().await;
+}
+
+/// #172/T7：**未知 build**（无真机审批证据）在有 schema 证据时用 `cancel`（终止本轮），
+/// 没有 schema 证据时拒绝派发（零帧）——两张卡的行为差一个「是否可应答」。
+#[tokio::test]
+async fn unknown_build_approval_policy_requires_schema_evidence() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::probe::schema_probe::SchemaEvidence;
+    use multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile;
+
+    let adapter = DesktopIpcAdapter::new(
+        std::sync::Arc::new(FailingConnector::new()),
+        ProtocolProfile::unverified("windows", "26.9999.0"),
+    );
+    // 无 schema 证据：不开放（卡片「到桌面处理」）
+    assert!(
+        adapter.approval_policy().is_empty(),
+        "未知 build 未取证时不得开放审批决策"
+    );
+    // 注入真机同形的 schema 证据（accept + cancel）
+    adapter.set_schema_evidence(Some(SchemaEvidence {
+        fingerprint: "test".into(),
+        command_decisions: vec![
+            "accept".into(),
+            "acceptForSession".into(),
+            "decline".into(),
+            "cancel".into(),
+        ],
+        file_decisions: vec!["accept".into(), "cancel".into()],
+    }));
+    let policy = adapter.approval_policy();
+    use multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind;
+    assert_eq!(
+        policy.for_kind(PendingKind::CommandApproval),
+        ["accept", "cancel"],
+        "schema 档只开 accept + cancel（不含 decline）"
+    );
+    assert_eq!(
+        policy.for_kind(PendingKind::FileChangeApproval),
+        ["accept", "cancel"]
+    );
+    assert!(policy.for_kind(PendingKind::PermissionsApproval).is_empty());
 }
 
 #[tokio::test]
@@ -3161,6 +3267,1148 @@ async fn unfollow_between_bind_and_declare_recovery_retry_stays_dead() {
     let p = adapter.projection(&key).await;
     assert!(p.stale && p.revision.is_none(), "owner 帧不复活镜像");
     adapter.shutdown().await;
+}
+
+// ============================================================
+// #172：只读探测执行器（probe::runner）——四场景 + 单飞
+// ============================================================
+
+use multi_agents_manager_lib::services::codex_desktop_ipc::probe::runner::{
+    probe_read_with_budget, ProbeBudget, ProbeOutcome, ProbeRunner, ProbeStage,
+};
+
+/// 收敛后的探测预算（毫秒级）：用例不必真等生产预算（2/3/3s）。
+fn probe_budget() -> ProbeBudget {
+    ProbeBudget {
+        p1: Duration::from_millis(500),
+        p2: Duration::from_millis(200),
+        p3: Duration::from_millis(150),
+    }
+}
+
+/// 本线程 snapshot 帧（Windows 4894 实测形态：`change.type=snapshot` + `revision` +
+/// `conversationState` 三容器；空线程也通过）。
+fn probe_snapshot(thread_id: &str, revision: u64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "broadcast",
+        "method": "thread-stream-state-changed",
+        "params": {
+            "conversationId": thread_id,
+            "change": {
+                "type": "snapshot",
+                "revision": revision,
+                "conversationState": {
+                    "id": thread_id,
+                    "turns": [],
+                    "requests": [],
+                    "turnHistory": { "kind": "canonical", "history": { "isComplete": true } }
+                }
+            }
+        }
+    })
+}
+
+fn probe_thread(thread_id: &str) -> ThreadKey {
+    ThreadKey {
+        host_id: "local".into(),
+        thread_id: thread_id.into(),
+    }
+}
+
+async fn expect_frame(peer: &mut ScriptedPeer, what: &str) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(5), peer.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{what} 帧未在 5s 内到达"))
+}
+
+fn discovery_ok(request_id: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "response", "requestId": request_id,
+        "resultType": "success", "method": "thread-owner-discovery",
+        "handledByClientId": "owner-1",
+        "result": { "supportsUntrustedAppInput": true }
+    })
+}
+
+/// 场景 1（同构新 build）：P1 discovery（带 sourceClientId/timeoutMs）→ P2 following →
+/// P3 snapshot 判据通过 → Probed，并且**探完立即 unfollow**（临时引用，不占名额）。
+#[tokio::test]
+async fn probe_homomorphic_build_passes_then_unfollows() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let thread = "9f1e2d3c-1111-4222-8333-444455556666";
+    let key = probe_thread(thread);
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    // P1：`sourceClientId` / `timeoutMs` 在**信封**上（与 Desktop 自己的 sendRequest
+    // 同形），不在 params 里
+    let disc = expect_frame(&mut peer, "discovery").await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    assert_eq!(disc["sourceClientId"], "owner-1", "信封级 sourceClientId");
+    assert_eq!(disc["timeoutMs"], 2000, "信封级 timeoutMs");
+    assert!(
+        disc["params"].get("sourceClientId").is_none() && disc["params"].get("timeoutMs").is_none(),
+        "params 里不得再带这两个字段（那是信封字段）: {disc}"
+    );
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+
+    // P2：临时 follow（following:true）
+    let follow = expect_frame(&mut peer, "following").await;
+    assert_eq!(follow["method"], "thread-stream-following-changed");
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    assert_eq!(
+        follow["params"]["conversationId"],
+        serde_json::json!(thread)
+    );
+
+    // 声明之后到达的 snapshot 才算我方证据
+    peer.send(&probe_snapshot(thread, 5)).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Probed {
+            stage, revision, ..
+        } => {
+            assert_eq!(stage, ProbeStage::P3);
+            assert_eq!(revision, Some(5));
+        }
+        other => panic!("同构 build 必须 Probed，got {other:?}"),
+    }
+
+    // 探完即放：wire 上必须看到 following:false
+    let off = expect_frame(&mut peer, "unfollow").await;
+    assert_eq!(off["method"], "thread-stream-following-changed");
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+    conn.shutdown().await;
+}
+
+/// 场景 2（版本漂移 / 静默）：声明 following 后没有任何 snapshot → 补 status-requested
+/// 仍静默 → Inconclusive(P2, protocol_drift_suspected)；**不误判可用**。
+#[tokio::test]
+async fn probe_silent_after_following_is_inconclusive_drift() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let key = probe_thread("thread-drift");
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let follow = expect_frame(&mut peer, "following").await;
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    // P2 静默 → 补 status-requested
+    let status = expect_frame(&mut peer, "status-requested").await;
+    assert_eq!(
+        status["method"], "thread-stream-following-status-requested",
+        "静默时按 Desktop 自己的信封补一次状态请求"
+    );
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Inconclusive {
+            stage, error_code, ..
+        } => {
+            assert_eq!(stage, ProbeStage::P2);
+            assert_eq!(error_code, "protocol_drift_suspected");
+        }
+        other => panic!("静默必须是 inconclusive（不判死、不判可用），got {other:?}"),
+    }
+    // 静默路径也要释放临时 follow
+    let off = expect_frame(&mut peer, "unfollow").await;
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+    conn.shutdown().await;
+}
+
+/// 场景 3（字段缺失 / 改名）：snapshot 结构对不上 → Inconclusive(P3, snapshot_unreadable)，
+/// **不伪造空会话**，也不判死。
+#[tokio::test]
+async fn probe_missing_core_fields_is_inconclusive_p3() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let key = probe_thread("thread-fields");
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let _follow = expect_frame(&mut peer, "following").await;
+    // turnHistory 被改名成 turn_history（字段漂移的典型形态）
+    let mut frame = probe_snapshot("thread-fields", 7);
+    let cs = frame["params"]["change"]["conversationState"]
+        .as_object_mut()
+        .unwrap();
+    cs.insert("turn_history".into(), serde_json::json!({}));
+    cs.remove("turnHistory");
+    peer.send(&frame).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Inconclusive {
+            stage, error_code, ..
+        } => {
+            assert_eq!(stage, ProbeStage::P3);
+            assert_eq!(error_code, "snapshot_unreadable");
+        }
+        other => panic!("解析不出只能是 inconclusive，got {other:?}"),
+    }
+    conn.shutdown().await;
+}
+
+/// 场景 4（断链）：P2 等待期间连接结束 → **Inconclusive**(P2, disconnected)——链路中断
+/// 只说明「没有证据」，不是协议被证伪；到退避点可重试。
+#[tokio::test]
+async fn probe_disconnect_during_follow_is_inconclusive() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let key = probe_thread("thread-eof");
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let _follow = expect_frame(&mut peer, "following").await;
+    peer.close(); // EOF：探测期间断链
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Inconclusive {
+            stage, error_code, ..
+        } => {
+            assert_eq!(stage, ProbeStage::P2);
+            assert_eq!(error_code, "disconnected");
+        }
+        other => panic!("断链只能记「没有证据」（inconclusive），got {other:?}"),
+    }
+}
+
+/// 顺序回归：`subscribe → drain_stale → declare_following → wait_snapshot`。
+/// 声明之后**立刻**到达的 snapshot 必须留在等待窗口里——旧顺序（declare → drain）会把
+/// 它当成「声明前的被动广播」丢掉，白等到预算耗尽。
+#[tokio::test]
+async fn snapshot_arriving_right_after_declare_is_not_drained() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let thread = "thread-immediate-snapshot";
+    let key = probe_thread(thread);
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let follow = expect_frame(&mut peer, "following").await;
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    // 收到 following 声明后**不做任何等待**，立刻回 snapshot（模拟「声明即快照」）
+    peer.send(&probe_snapshot(thread, 42)).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Probed { revision, .. } => {
+            assert_eq!(revision, Some(42), "声明后立刻到达的 snapshot 不得被 drain")
+        }
+        other => panic!("紧跟在声明后的 snapshot 必须被采信，got {other:?}"),
+    }
+    let _off = expect_frame(&mut peer, "unfollow").await;
+    conn.shutdown().await;
+}
+
+/// 场景 5（无 owner）：router 级错误 `no-client-found`（**响应不带 method 字段**）→
+/// Inconclusive(P1, no-client-found)——不能当死亡判决（与版本不匹配同形）。
+#[tokio::test]
+async fn probe_no_client_found_is_inconclusive_not_fatal() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let key = probe_thread("thread-no-owner");
+    let c = conn.clone();
+    let k = key.clone();
+    let probe = tokio::spawn(async move { probe_read_with_budget(&c, &k, probe_budget()).await });
+
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": disc["requestId"],
+        "resultType": "error",
+        // 实测形态：router 级错误响应**没有** method 字段（T0 修复的正是它）
+        "error": "no-client-found"
+    }))
+    .await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    match outcome {
+        ProbeOutcome::Inconclusive {
+            stage, error_code, ..
+        } => {
+            assert_eq!(stage, ProbeStage::P1);
+            assert_eq!(error_code, "no-client-found");
+        }
+        other => panic!("no-client-found 只能记不确定，got {other:?}"),
+    }
+    conn.shutdown().await;
+}
+
+/// 单飞（wire 级）：同 key 并发两次探测只产生**一条** discovery 帧，两方拿同一结论。
+#[tokio::test]
+async fn probe_single_flight_emits_one_protocol_run() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let profile = profile_for("macos", "26.1013.31256").unwrap();
+    let conn = spawn(io, profile, 1);
+    handshake(&mut peer, "owner-1").await;
+    let _ = wait_initialized(&conn).await;
+
+    let thread = "thread-single-flight";
+    let key = probe_thread(thread);
+    let runner = std::sync::Arc::new(ProbeRunner::new());
+    let probe_key = "windows|26.1013.9999.0|-|1";
+
+    let c1 = conn.clone();
+    let k1 = key.clone();
+    let r1 = runner.clone();
+    let first = tokio::spawn(async move {
+        r1.run(probe_key, probe_read_with_budget(&c1, &k1, probe_budget()))
+            .await
+    });
+
+    // leader 已在飞（discovery 已出帧），此刻再起第二个触发点
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let c2 = conn.clone();
+    let k2 = key.clone();
+    let r2 = runner.clone();
+    let second = tokio::spawn(async move {
+        r2.run(probe_key, probe_read_with_budget(&c2, &k2, probe_budget()))
+            .await
+    });
+
+    let follow = expect_frame(&mut peer, "following").await;
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    peer.send(&probe_snapshot(thread, 9)).await;
+
+    let o1 = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("leader in time")
+        .expect("task ok");
+    let o2 = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("follower in time")
+        .expect("task ok");
+    assert_eq!(o1, o2, "follower 必须拿到 leader 的同一结论");
+    assert!(matches!(o1, ProbeOutcome::Probed { .. }));
+
+    let off = expect_frame(&mut peer, "unfollow").await;
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+    // 单飞：不得有第二条探测的任何帧（第二条 discovery / 第二次 follow 都不许出现）
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), peer.recv())
+            .await
+            .is_err(),
+        "同一 probe_key 同刻只跑一条探测（不得产生第二条协议流）"
+    );
+    conn.shutdown().await;
+}
+
+// ============================================================
+// #172：adapter 探测接入（shipped 不探 / 账本命中零帧 / 断链不伪造）
+// ============================================================
+
+use multi_agents_manager_lib::database::dao::codex_ipc_probe::ProbeState;
+use multi_agents_manager_lib::services::codex_desktop_ipc::probe::{
+    ProbeLedger, ProbeLedgerEntry, CAP_SCHEMA, CAP_STATE,
+};
+use multi_agents_manager_lib::services::codex_desktop_ipc::profile::ProtocolProfile;
+use std::sync::Arc;
+
+/// 内存账本行：(state, next_retry_at, error_code, stage)。
+type LedgerRow = (ProbeState, Option<i64>, Option<String>, Option<String>);
+type LedgerKey = (String, String);
+
+/// 内存账本（测试用）：记录读写次数，方便断言「零帧复用」「未探测」。
+#[derive(Default)]
+struct MemoryLedger {
+    rows: StdMutex<std::collections::HashMap<LedgerKey, LedgerRow>>,
+    gets: std::sync::atomic::AtomicUsize,
+    records: std::sync::atomic::AtomicUsize,
+    state_records: std::sync::atomic::AtomicUsize,
+}
+
+impl MemoryLedger {
+    fn seed(
+        &self,
+        probe_key: &str,
+        capability: &str,
+        state: ProbeState,
+        next_retry_at: Option<i64>,
+    ) {
+        self.seed_detail(probe_key, capability, state, next_retry_at, None, None);
+    }
+
+    /// 带级次与错误码的种行（#172/T9a：探测只读事实要读这两个字段）。
+    fn seed_detail(
+        &self,
+        probe_key: &str,
+        capability: &str,
+        state: ProbeState,
+        next_retry_at: Option<i64>,
+        stage: Option<&str>,
+        error_code: Option<&str>,
+    ) {
+        self.rows.lock().unwrap().insert(
+            (probe_key.to_string(), capability.to_string()),
+            (
+                state,
+                next_retry_at,
+                error_code.map(str::to_string),
+                stage.map(str::to_string),
+            ),
+        );
+    }
+    fn gets(&self) -> usize {
+        self.gets.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn records(&self) -> usize {
+        self.records.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn row(&self, probe_key: &str, capability: &str) -> Option<LedgerRow> {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&(probe_key.to_string(), capability.to_string()))
+            .cloned()
+    }
+}
+
+impl ProbeLedger for MemoryLedger {
+    fn get(&self, probe_key: &str, capability: &str) -> Option<ProbeLedgerEntry> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.row(probe_key, capability)
+            .map(
+                |(state, next_retry_at, error_code, stage)| ProbeLedgerEntry {
+                    state,
+                    next_retry_at,
+                    error_code,
+                    stage,
+                    // 内存替身不存指纹（只对 capability='schema' 有意义）
+                    fingerprint: None,
+                },
+            )
+    }
+
+    fn record(
+        &self,
+        probe_key: &str,
+        capability: &str,
+        outcome: &ProbeOutcome,
+        _fingerprint: Option<&str>,
+    ) {
+        self.records
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if capability == CAP_STATE {
+            self.state_records
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        // 与 DAO 同语义：inconclusive 带退避窗口（首探 30s），其余清空
+        let next_retry_at = (outcome.as_state() == ProbeState::Inconclusive).then(|| {
+            chrono::Utc::now().timestamp_millis()
+                + multi_agents_manager_lib::database::dao::codex_ipc_probe::retry_backoff_ms(1)
+        });
+        self.rows.lock().unwrap().insert(
+            (probe_key.to_string(), capability.to_string()),
+            (
+                outcome.as_state(),
+                next_retry_at,
+                outcome.error_code().map(str::to_string),
+                Some(outcome.stage().as_str().to_string()),
+            ),
+        );
+    }
+}
+
+/// 恒败连接器（记录尝试次数）：证明「账本命中不建连 → 零帧」。
+struct FailingConnector {
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl FailingConnector {
+    fn new() -> Self {
+        Self {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Connector for FailingConnector {
+    fn connect(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        BoxIo,
+                        multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            Err(
+                multi_agents_manager_lib::services::codex_desktop_ipc::types::ProtocolError::Disconnected(
+                    "fixture: no desktop".into(),
+                ),
+            )
+        })
+    }
+}
+
+/// 期望的账本键（与 adapter 内部同一函数算，避免测试重写键格式）。
+fn expected_probe_key(platform: &str, build: &str) -> String {
+    multi_agents_manager_lib::services::codex_desktop_ipc::probe::fingerprint::probe_key(
+        platform,
+        Some(build),
+    )
+    .to_key()
+}
+
+/// shipped build **不探测**：证据级别不是「尚无证据」档，连账本都不查。
+#[tokio::test]
+async fn shipped_build_never_probes() {
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        profile_for("windows", WINDOWS_BUILD).unwrap(),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    assert!(!adapter.probe_eligible(), "shipped 档不可探测");
+    adapter
+        .ensure_read_evidence(&probe_thread("t-shipped"))
+        .await;
+    assert_eq!(ledger.gets(), 0, "shipped 不查账本（不探测）");
+    assert_eq!(ledger.records(), 0, "shipped 不写账本");
+    assert_eq!(connector.attempts(), 0, "shipped 不建连");
+    assert!(adapter.capabilities().state, "shipped 读能力本来就开");
+}
+
+/// 账本命中 → **零帧**提升 `state`（同 build 不重探；连连接都不建）。
+#[tokio::test]
+async fn ledger_hit_upgrades_state_with_zero_frames() {
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    ledger.seed(
+        &expected_probe_key("macos", "26.9999.0"),
+        CAP_STATE,
+        ProbeState::Probed,
+        None,
+    );
+    adapter.set_probe_ledger(ledger.clone());
+    assert!(!adapter.capabilities().state, "未复用前能力关");
+    adapter
+        .ensure_read_evidence(&probe_thread("t-ledger"))
+        .await;
+    assert!(adapter.capabilities().state, "账本命中的结论直接生效");
+    assert_eq!(ledger.gets(), 1);
+    assert_eq!(ledger.records(), 0, "命中不重写账本");
+    assert_eq!(connector.attempts(), 0, "账本命中零帧（不建连、不探测）");
+}
+
+/// 账本 `failed`（明确协议错）= 本 build 已判死 → 本轮**不探**（不建连、不重写账本）。
+#[tokio::test]
+async fn ledger_failed_state_suppresses_probe() {
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    ledger.seed(
+        &expected_probe_key("macos", "26.9999.0"),
+        CAP_STATE,
+        ProbeState::Failed,
+        None,
+    );
+    adapter.set_probe_ledger(ledger.clone());
+    adapter
+        .ensure_read_evidence(&probe_thread("t-failed"))
+        .await;
+    assert!(!adapter.capabilities().state, "判死的 build 不提升能力");
+    assert_eq!(connector.attempts(), 0, "failed 账本不得再触发探测");
+    assert_eq!(ledger.records(), 0, "failed 账本不得被重写");
+    assert_eq!(ledger.gets(), 1);
+}
+/// P0 不可达（Desktop 没起）→ 记 **inconclusive**（不是 failed）：没证据 ≠ 判死。
+#[tokio::test]
+async fn p0_unreachable_records_inconclusive() {
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.ensure_read_evidence(&probe_thread("t-p0")).await;
+    assert_eq!(connector.attempts(), 1, "应尝试建连一次");
+    assert!(!adapter.capabilities().state);
+    let row = ledger
+        .row(&expected_probe_key("macos", "26.9999.0"), CAP_STATE)
+        .expect("P0 失败也要落账");
+    assert_eq!(
+        row.0,
+        ProbeState::Inconclusive,
+        "不可达只能记「没有证据」（Desktop 可能只是没起）"
+    );
+    assert!(row.1.is_some(), "带退避窗口");
+}
+
+/// 未知 build 首次 state 访问 → 探测通过 → 内存 profile 提升 `state` + 账本落 probed。
+#[tokio::test]
+async fn unknown_build_probe_upgrades_state_and_records() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(TestConnector::new(test_endpoint("macos", "26.9999.0"), io)),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.set_probe_budget(probe_budget());
+
+    let thread = "thread-unknown";
+    let key = probe_thread(thread);
+    let key_in_task = key.clone();
+    let a = adapter.clone();
+    let probe = tokio::spawn(async move { a.ensure_read_evidence(&key_in_task).await });
+
+    handshake(&mut peer, "owner-1").await;
+    let disc = expect_frame(&mut peer, "discovery").await;
+    assert_eq!(disc["method"], "thread-owner-discovery");
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let follow = expect_frame(&mut peer, "following").await;
+    assert_eq!(follow["params"]["following"], serde_json::json!(true));
+    peer.send(&probe_snapshot(thread, 3)).await;
+
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    assert!(
+        adapter.capabilities().state,
+        "探测通过 → 内存 profile 的 state 必须提升（投影转只读档）"
+    );
+    let row = ledger
+        .row(&expected_probe_key("macos", "26.9999.0"), CAP_STATE)
+        .expect("账本必须落一行");
+    assert_eq!(row.0, ProbeState::Probed);
+    assert_eq!(
+        ledger
+            .state_records
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    // 探完即放
+    let off = expect_frame(&mut peer, "unfollow").await;
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+
+    // 二次触发：已有证据 → 零帧零账本访问
+    adapter.ensure_read_evidence(&key).await;
+    assert_eq!(ledger.gets(), 1, "二次触发不再查账本");
+    assert_eq!(
+        ledger
+            .state_records
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    adapter.shutdown().await;
+}
+
+/// 未知 build 探测不确定（静默）→ 账本如实记 inconclusive（可退避重试）；兼容档的
+/// state/send 由 2026-10-22 用户裁决默认开（main 合并），探测不确定**不回撤**裁决
+/// 能力（main 侧 5801bdba 同款重钉：send stays up，证据门控的结论落在账本里）。
+#[tokio::test]
+async fn unknown_build_probe_failure_does_not_fake_state() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(TestConnector::new(test_endpoint("macos", "26.9999.0"), io)),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.set_probe_budget(probe_budget());
+
+    let key = probe_thread("thread-unknown-fail");
+    let key_in_task = key.clone();
+    let a = adapter.clone();
+    let probe = tokio::spawn(async move { a.ensure_read_evidence(&key_in_task).await });
+
+    handshake(&mut peer, "owner-1").await;
+    let disc = expect_frame(&mut peer, "discovery").await;
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let _follow = expect_frame(&mut peer, "following").await;
+    // 之后保持静默：P2 静默 → status-requested → 仍静默 → inconclusive
+    let _status = expect_frame(&mut peer, "status-requested").await;
+
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    assert!(
+        adapter.capabilities().state,
+        "兼容档 state 由裁决默认开；探测不确定不回撤（不伪造的是账本结论，不是能力位）"
+    );
+    assert!(!adapter.probe_in_progress(), "探测结束后不得留在飞");
+    let row = ledger
+        .row(&expected_probe_key("macos", "26.9999.0"), CAP_STATE)
+        .expect("账本必须如实落一行");
+    assert_eq!(row.0, ProbeState::Inconclusive);
+    assert!(row.1.is_some(), "inconclusive 必须带退避窗口");
+    // 失败路径同样释放临时 follow
+    let off = expect_frame(&mut peer, "unfollow").await;
+    assert_eq!(off["params"]["following"], serde_json::json!(false));
+
+    // 退避窗口内再触发：查账本但**不再探测**（不产生新帧、不重写账本）
+    adapter.ensure_read_evidence(&key).await;
+    assert_eq!(
+        ledger
+            .state_records
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "窗口内不得重写读链账本（schema 独立取证不计入）"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), peer.recv())
+            .await
+            .is_err(),
+        "退避窗口内不得再发探测帧"
+    );
+    adapter.shutdown().await;
+}
+
+// ============================================================
+// #172/T7-R4：schema 探针结论落进探测账本（capability = "schema"）
+// ============================================================
+
+/// schema 探针取证成功 → 账本 `schema` 行 = `probed`，且审批策略切到 schema 档。
+///
+/// 用例**注入**探针结论（测试缝）：绝不 spawn 本机 `codex.exe`
+/// （真跑会执行 `app-server generate-json-schema`，不受控）。
+#[tokio::test]
+async fn schema_evidence_is_recorded_in_ledger() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::probe::schema_probe::{
+        SchemaEvidence, SchemaProbeOutcome,
+    };
+    use multi_agents_manager_lib::services::codex_desktop_ipc::types::PendingKind;
+
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(FailingConnector::new()),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.set_schema_probe_override(Some(SchemaProbeOutcome::Known(SchemaEvidence {
+        fingerprint: "fp-fixture".into(),
+        command_decisions: vec![
+            "accept".into(),
+            "acceptForSession".into(),
+            "decline".into(),
+            "cancel".into(),
+        ],
+        file_decisions: vec!["accept".into(), "cancel".into()],
+    })));
+    assert!(
+        adapter.approval_policy().is_empty(),
+        "取证前：未知 build 不开放审批决策"
+    );
+
+    adapter.ensure_schema_evidence().await;
+
+    let row = ledger
+        .row(&expected_probe_key("macos", "26.9999.0"), CAP_SCHEMA)
+        .expect("schema 结论必须落账（capability = \"schema\"）");
+    assert_eq!(row.0, ProbeState::Probed, "取到 decision 枚举 = probed");
+    assert_eq!(row.2, None, "成功没有错误码");
+    assert_eq!(ledger.records(), 1, "只落一行（state 行不在本次范围）");
+
+    // 取证后：审批策略切到 schema 档（accept + cancel；非空）
+    let policy = adapter.approval_policy();
+    assert!(!policy.is_empty(), "schema 已取证 → 审批策略非空");
+    assert_eq!(
+        policy.for_kind(PendingKind::CommandApproval),
+        ["accept", "cancel"],
+        "schema 档只开 accept + cancel"
+    );
+    assert_eq!(
+        policy.for_kind(PendingKind::FileChangeApproval),
+        ["accept", "cancel"]
+    );
+
+    // 幂等：已有证据 → 不再探、不再记账
+    adapter.ensure_schema_evidence().await;
+    assert_eq!(ledger.records(), 1, "幂等：不得重复记账");
+}
+
+/// schema 探针失败（`Unknown`）→ 账本 `schema` 行 = `inconclusive`（带错误码），
+/// 且**审批保持关闭**（未取证不开放）。
+#[tokio::test]
+async fn schema_probe_failure_is_recorded_as_inconclusive() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::probe::schema_probe::SchemaProbeOutcome;
+
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(FailingConnector::new()),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.set_schema_probe_override(Some(SchemaProbeOutcome::Unknown {
+        error_code: "cli_not_found".into(),
+    }));
+
+    adapter.ensure_schema_evidence().await;
+
+    let row = ledger
+        .row(&expected_probe_key("macos", "26.9999.0"), CAP_SCHEMA)
+        .expect("失败也必须如实落账");
+    assert_eq!(
+        row.0,
+        ProbeState::Inconclusive,
+        "取不到 schema = 没有证据（不是 failed：不是协议被证伪）"
+    );
+    assert_eq!(
+        row.2.as_deref(),
+        Some("cli_not_found"),
+        "错误码必须带进账本（供人工排查）"
+    );
+    assert!(row.1.is_some(), "inconclusive 必须带退避窗口");
+    assert_eq!(ledger.records(), 1);
+    assert!(
+        adapter.approval_policy().is_empty(),
+        "未取证不得开放审批决策（卡片走「到桌面处理」）"
+    );
+}
+
+// ============================================================
+// #172/T9a：探测只读事实（probe_status）——只读、机器码落地、camelCase 序列化
+// ============================================================
+
+use multi_agents_manager_lib::services::codex_desktop_ipc::reason_code::{
+    probe_failed_code, DESKTOP_BUILD_UNVERIFIED, PROBE_INCONCLUSIVE, PROTOCOL_DRIFT_SUSPECTED,
+};
+use multi_agents_manager_lib::services::codex_desktop_ipc::types::{ProbeStatus, ProbeStatusState};
+
+/// 造一个「账本里已有一行给定结论」的 adapter，取它的探测只读事实。
+///
+/// 每个结论一份独立 adapter：探测事实的结论来自账本，缓存按 adapter 隔离，
+/// 这样三行结论互不干扰（也如实反映「一行 = 一个结论」）。
+async fn probe_status_of_ledger_row(
+    state: ProbeState,
+    stage: Option<&str>,
+    error_code: Option<&str>,
+) -> ProbeStatus {
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(FailingConnector::new()),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    ledger.seed_detail(
+        &expected_probe_key("macos", "26.9999.0"),
+        CAP_STATE,
+        state,
+        None,
+        stage,
+        error_code,
+    );
+    adapter.set_probe_ledger(ledger);
+    adapter.probe_status().await
+}
+
+/// 该 build **尚无任何探测记录** → `idle` + `desktop_build_unverified`。
+#[tokio::test]
+async fn probe_status_reports_unverified_build_before_any_probe() {
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+
+    let status = adapter.probe_status().await;
+    assert_eq!(status.state, ProbeStatusState::Idle);
+    assert_eq!(
+        status.reason_code.as_deref(),
+        Some(DESKTOP_BUILD_UNVERIFIED),
+        "没有探测记录 = 这台 build 未经真机验证"
+    );
+    assert_eq!(status.stage, None, "没有记录就没有级次");
+    // 只读：查账本不写账本、不建连、不发帧
+    assert_eq!(ledger.records(), 0, "只读事实不得写账本");
+    assert_eq!(connector.attempts(), 0, "只读事实不得建连");
+}
+
+/// 账本三态 → 状态与 reasonCode 逐一对上。
+#[tokio::test]
+async fn probe_status_maps_ledger_states() {
+    // probed：探测通过 → 无失败码
+    let probed = probe_status_of_ledger_row(ProbeState::Probed, Some("P3"), None).await;
+    assert_eq!(probed.state, ProbeStatusState::Probed);
+    assert_eq!(probed.stage.as_deref(), Some("P3"));
+    assert_eq!(probed.reason_code, None, "通过没有失败码");
+
+    // inconclusive：不确定（非判死）→ probe_inconclusive
+    let inconclusive = probe_status_of_ledger_row(
+        ProbeState::Inconclusive,
+        Some("P1"),
+        Some("no-client-found"),
+    )
+    .await;
+    assert_eq!(inconclusive.state, ProbeStatusState::Inconclusive);
+    assert_eq!(
+        inconclusive.reason_code.as_deref(),
+        Some(PROBE_INCONCLUSIVE)
+    );
+    assert_eq!(inconclusive.stage.as_deref(), Some("P1"));
+
+    // inconclusive + 漂移疑似 → 保留漂移码（比通用不确定码更可行动）
+    let drift = probe_status_of_ledger_row(
+        ProbeState::Inconclusive,
+        Some("P2"),
+        Some(PROTOCOL_DRIFT_SUSPECTED),
+    )
+    .await;
+    assert_eq!(drift.state, ProbeStatusState::Inconclusive);
+    assert_eq!(drift.reason_code.as_deref(), Some(PROTOCOL_DRIFT_SUSPECTED));
+
+    // failed：明确失败 → probe_failed:<stage>（动态码由常量前缀拼）
+    let failed =
+        probe_status_of_ledger_row(ProbeState::Failed, Some("P2"), Some("method_not_found")).await;
+    assert_eq!(failed.state, ProbeStatusState::Failed);
+    assert_eq!(
+        failed.reason_code.as_deref(),
+        Some(probe_failed_code("P2").as_str())
+    );
+    assert_eq!(failed.stage.as_deref(), Some("P2"));
+
+    // failed 但级次取不到 → 退回账本里的错误码（不猜级次）
+    let failed_no_stage =
+        probe_status_of_ledger_row(ProbeState::Failed, None, Some("method_not_found")).await;
+    assert_eq!(failed_no_stage.state, ProbeStatusState::Failed);
+    assert_eq!(
+        failed_no_stage.reason_code.as_deref(),
+        Some("method_not_found")
+    );
+}
+
+/// 只读 + camelCase 序列化；既有字段语义一字不动。
+#[tokio::test]
+async fn probe_status_is_readonly_and_serializes_camel_case() {
+    // 序列化：camelCase（`reasonCode` / `state` / `stage`）
+    let status = ProbeStatus {
+        state: ProbeStatusState::Inconclusive,
+        stage: Some("P2".into()),
+        reason_code: Some(PROBE_INCONCLUSIVE.into()),
+    };
+    let v = serde_json::to_value(&status).unwrap();
+    assert_eq!(v["state"], serde_json::json!("inconclusive"));
+    assert_eq!(v["stage"], serde_json::json!("P2"));
+    assert_eq!(v["reasonCode"], serde_json::json!(PROBE_INCONCLUSIVE));
+    assert!(
+        v.get("reason_code").is_none(),
+        "键名必须是 camelCase（与既有 DTO 一致）"
+    );
+    // 空态也要有键（前端不必判缺省）
+    let empty = serde_json::to_value(ProbeStatus::idle()).unwrap();
+    assert_eq!(empty["state"], serde_json::json!("idle"));
+    assert!(empty["stage"].is_null());
+    assert!(empty["reasonCode"].is_null());
+
+    // 只读：取事实不写账本、不建连
+    let connector = Arc::new(FailingConnector::new());
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        connector.clone(),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    let _ = adapter.probe_status().await;
+    assert_eq!(ledger.records(), 0, "只读事实不得写账本");
+    assert_eq!(connector.attempts(), 0, "只读事实不得建连");
+
+    // 投影里带上这个事实，且**不改动既有字段的语义**
+    let p = adapter.projection(&probe_thread("t-readonly")).await;
+    assert_eq!(p.probe_status.state, ProbeStatusState::Idle);
+    assert_eq!(
+        p.availability,
+        multi_agents_manager_lib::services::codex_desktop_ipc::types::ControlAvailability::CompatOnly,
+        "只读事实不得改变可用性档位"
+    );
+    assert!(!p.capabilities.state, "未取证不得声称读能力可用");
+}
+
+/// 探测**在飞** → `probing`（单飞器既有能力；不新写并发结构）。
+#[tokio::test]
+async fn probe_status_reports_probing_while_probe_in_flight() {
+    let (io, mut peer) = ScriptedPeer::new();
+    let adapter = Arc::new(DesktopIpcAdapter::new(
+        Arc::new(TestConnector::new(test_endpoint("macos", "26.9999.0"), io)),
+        ProtocolProfile::unverified("macos", "26.9999.0"),
+    ));
+    let ledger = Arc::new(MemoryLedger::default());
+    adapter.set_probe_ledger(ledger.clone());
+    adapter.set_probe_budget(probe_budget());
+
+    let key = probe_thread("thread-probing");
+    let key_in_task = key.clone();
+    let a = adapter.clone();
+    let probe = tokio::spawn(async move { a.ensure_read_evidence(&key_in_task).await });
+
+    // 重连后须重新确认指纹；discovery 到达才证明单飞探测已进入 P1。
+    handshake(&mut peer, "owner-1").await;
+    let disc = expect_frame(&mut peer, "discovery").await;
+    let status = adapter.probe_status().await;
+    assert_eq!(
+        status.state,
+        ProbeStatusState::Probing,
+        "探测在飞必须如实报 probing（前端据此渲染骨架态）"
+    );
+    assert_eq!(status.reason_code, None, "在飞不是失败，没有失败码");
+
+    // 探测结束 → 结论落账，事实随之更新
+    peer.send(&discovery_ok(&disc["requestId"])).await;
+    let _follow = expect_frame(&mut peer, "following").await;
+    peer.send(&probe_snapshot("thread-probing", 3)).await;
+    tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("探测在预算内结束")
+        .expect("task ok");
+    let after = adapter.probe_status().await;
+    assert_eq!(after.state, ProbeStatusState::Probed);
+    adapter.shutdown().await;
+}
+
+/// T10 真机闭环金样（build 26.1016.6573.0）：**pending → 决策请求 → 回执**三段的形态
+/// 与语义钉死——决策参数形状 = `{conversationId, requestId, decision}`、版本 1、回执
+/// `{"ok":true}`；同时证明脱敏到位（无真实命令正文/标识符）。
+#[test]
+fn observed_6573_command_approval_closure_is_pinned() {
+    use multi_agents_manager_lib::services::codex_desktop_ipc::pending::{
+        DecisionPolicy, PendingProjector,
+    };
+    use multi_agents_manager_lib::services::codex_desktop_ipc::types::CapabilitySet;
+
+    let raw = std::fs::read_to_string(format!(
+        "{}/tests/fixtures/codex-desktop-ipc/observed/windows-6573-command-approval-accept.sanitized.json",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("闭环夹具必须存在");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("夹具必须是合法 JSON");
+
+    // ① pending 段：命令审批 + 整数 id
+    let pending = &v["pendingRequest"];
+    assert_eq!(pending["method"], "item/commandExecution/requestApproval");
+    assert!(pending["id"].is_number(), "6573 的 pending id 是整数");
+
+    // ② 决策帧段：方法 / 版本 / 参数形状
+    let request = &v["request"];
+    assert_eq!(
+        request["method"],
+        "thread-follower-command-approval-decision"
+    );
+    assert_eq!(request["version"], serde_json::json!(1));
+    let params = request["params"].as_object().expect("params 是对象");
+    let mut keys: Vec<&str> = params.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["conversationId", "decision", "requestId"],
+        "官方决策参数形状 = {{conversationId, requestId, decision}}"
+    );
+    assert_eq!(params["decision"], "accept");
+
+    // ③ 回执段：受理 + ok
+    assert_eq!(v["response"]["resultType"], "success");
+    assert_eq!(v["response"]["result"]["ok"], serde_json::json!(true));
+
+    // ④ 脱敏护栏：不得含真实命令正文 / 真实标识符
+    assert_eq!(pending["params"]["command"], "<synthetic command>");
+    assert_eq!(pending["params"]["cwd"], "<synthetic cwd>");
+    assert!(
+        !raw.contains("01a153d7") && !raw.contains("exec-e52b86f6"),
+        "夹具不得含真实 thread/item 标识符"
+    );
+
+    // ⑤ 投影层：这条 pending 在未知 build（schema 档）下应给出 accept + cancel
+    let projector = PendingProjector::new();
+    let caps = CapabilitySet {
+        send: false,
+        state: true,
+        command: false,
+        permissions: false,
+        blocking_input: false,
+        interrupt: false,
+    };
+    let views = projector.project_with_policy(
+        std::slice::from_ref(pending),
+        &caps,
+        &DecisionPolicy::schema(true, true),
+    );
+    assert_eq!(views.len(), 1);
+    assert_eq!(
+        views[0].allowed_decisions,
+        vec!["accept", "cancel"],
+        "pending 自带 availableDecisions 的字符串词 = accept + cancel（对象形态不发）"
+    );
+    assert!(views[0].actionable);
 }
 
 // 以下附件组合均为合成回归输入，字段证据见 artifacts/cases.synthetic.json。

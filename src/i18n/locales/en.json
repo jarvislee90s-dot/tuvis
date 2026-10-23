@@ -502,7 +502,11 @@
       "headlessTimeoutLabel": "Headless timeout (ms)",
       "headlessTimeoutHint": "Watchdog limit for a single headless turn; on expiry the process tree is killed and the receipt reports stage=timeout (retryable). Default 600000 (10 minutes).",
       "headlessConcurrencyLabel": "Headless concurrency cap",
-      "headlessConcurrencyHint": "Maximum number of concurrent headless turns (1-8); excess requests immediately get a 'not executed' receipt (no queueing, no auto-retry; resend later). Default 2."
+      "headlessConcurrencyHint": "Maximum number of concurrent headless turns (1-8); excess requests immediately get a 'not executed' receipt (no queueing, no auto-retry; resend later). Default 2.",
+      "compatSendTitle": "Compatibility send (experimental)",
+      "compatSendHint": "Only applies to unverified Codex desktop builds; messages may be delivered to the wrong session — you accept the risk.",
+      "compatSendNeedsProbe": "A read-only probe must complete first (the read chain of this Codex desktop build is not verified yet)",
+      "groupCompatSend": "5. Compatibility send (unverified Codex desktop builds only)"
     },
     "audit": {
       "title": "Injection Audit",
@@ -2037,6 +2041,13 @@
     "migrateCodexBarrierReleaseFail": "Failed to migrate codex_actions.barrier_force_released_at: {error}",
     "codexQueueRetractPending": "This message is still queued; use retract instead",
     "codexQueueForceInFlight": "This message is in-flight (auto-settled), out of force-release scope",
+    "compatSendNeedsProbe": "A read-only probe must complete first (the read chain of this Codex desktop build is not verified yet)",
+    "desktopBuildUnverified": "This Codex desktop build is not machine-verified yet — remote control stays off until the read-only probe passes; open that thread on the desktop to trigger the probe, or upgrade to a verified build",
+    "probeFailed": "The read-only probe failed outright — this desktop build's protocol shape is not compatible with Tuvis; handle it on the desktop, or upgrade / roll back the Codex client",
+    "protocolDriftSuspected": "The probe suspects protocol drift — the desktop returned a structure that differs from what Tuvis expects; restart the desktop and retry, and upgrade the client if it keeps happening",
+    "probeInconclusive": "The read-only probe has no conclusion yet (the desktop may be closed, unowned or busy) — Tuvis retries later; until then, read that thread on the desktop",
+    "deliveryUnknown": "Delivery outcome unknown — this message may have arrived or may not have; check on the desktop before deciding to resend (Tuvis never resends on its own)",
+    "decisionUnconfirmed": "The approval decision was accepted but not confirmed as effective — check on the desktop whether that request is gone; you can stop the turn if needed",
     "codexInterruptStaleContext": "The desktop session context is stale (the desktop may have reopened or changed generations); refresh the page and retry",
     "codexInterruptCapabilityUnverified": "This desktop Codex build does not have remote stop enabled (live verification incomplete); the turn cannot be interrupted remotely",
     "codexInterruptValveMissing": "The server could not obtain the interrupt safety valve (expectedTurnId); the interrupt was abandoned — nothing was sent to the desktop",
@@ -2295,12 +2306,26 @@
       "availability": {
         "controllable": "Controllable",
         "send_only": "Send-only (no interactive control)",
+        "read_only": "Read-only (viewable, remote sending not available yet)",
         "compat_only": "Compatibility mode only",
         "unavailable": "Not controllable right now"
+      },
+      "tier": {
+        "verified": "Verified",
+        "compat": "Compatibility probe (experimental)",
+        "locked": "Not unlocked"
+      },
+      "probe": {
+        "probing": "Probing this desktop build's compatibility…",
+        "cancelWait": "Stop waiting",
+        "waitCancelled": "Stopped waiting (the server-side probe ends on its own within 15 seconds)",
+        "reasonUnknown": "The probe did not pass and the reason is unknown — check the desktop",
+        "stage": "(probe stage {{stage}})"
       },
       "staleBanner": "Desktop connection interrupted — showing the last known view; remote actions are disabled for now",
       "pending": {
         "titleCommand": "Command approval request",
+        "titleFileChange": "File change request",
         "titlePermissions": "Permission request",
         "titleInput": "Waiting for your answer",
         "titleUnsupported": "Pending request",
@@ -2308,6 +2333,9 @@
         "unverified": "The current Desktop build has not verified this action",
         "approve": "Approve",
         "reject": "Reject",
+        "cancelTurn": "Stop this turn",
+        "fileChanges": "{{n}} file change(s) — see details on Desktop",
+        "decisionUnconfirmed": "Accepted but not confirmed — stop the turn or verify on Desktop",
         "submit": "Submit answer",
         "freePlaceholder": "Other (free text)",
         "freeAria": "Free-form answer",

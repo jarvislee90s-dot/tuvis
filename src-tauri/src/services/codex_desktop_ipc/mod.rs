@@ -18,6 +18,8 @@ pub mod history_view;
 pub mod mirror;
 pub mod owners;
 pub mod pending;
+pub mod probe;
 pub mod profile;
+pub mod reason_code;
 pub mod transport;
 pub mod types;

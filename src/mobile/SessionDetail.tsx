@@ -336,9 +336,11 @@ export function isPlanPending(
 export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   // ===== Codex Desktop IPC 投影（A snapshot）=====
-  // 仅 Codex 会话订阅（其余工具 enabled=false 零开销）。可用性四档按服务端数据渲染：
-  // - controllable / send_only：投影**替换** Codex 会话实时内容源（不与本地读取简单
-  //   混排——同一历史两份源各说各话是骗人），原生 pending 出卡、队列面板挂载；
+  // 仅 Codex 会话订阅（其余工具 enabled=false 零开销）。可用性按服务端数据渲染：
+  // - controllable / send_only / read_only：投影**替换** Codex 会话实时内容源（不与
+  //   本地读取简单混排——同一历史两份源各说各话是骗人），原生 pending 出卡（只读档
+  //   卡面按 actionable=false 只读展示）、队列面板挂载；read_only = #172 解耦新增的
+  //   只读档（读链已取证、写未开放）；
   // - compat_only / unavailable：不出投影正文与原生卡——保持旧 QuestionCard 路径，
   //   能力横幅仍按服务端档位诚实展示；
   // - state=null（无 IPC / 拉取中）：旧路径照旧，零回归。
@@ -365,7 +367,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const codexState = codex.state;
   const codexProjectionActive =
     codexState !== null &&
-    (codexState.availability === "controllable" || codexState.availability === "send_only");
+    (codexState.availability === "controllable" ||
+      codexState.availability === "send_only" ||
+      codexState.availability === "read_only");
   // Task 7：瞬态 Unsupported 只延迟**前端错误提示**（后端 contentState 即时、禁写/
   // stale/屏障不去抖）——过渡 164–382ms 不闪烁，持续异常 500ms 后如实显示。
   const showUnsupported = useDelayedUnsupported(
@@ -1281,6 +1285,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             key={`codex-banner-${session.id}`}
             availability={codexState.availability}
             stale={codexState.stale}
+            probeStatus={codexState.probeStatus}
           />
           {codexProjectionActive &&
             codexState.pending.map((p) => (

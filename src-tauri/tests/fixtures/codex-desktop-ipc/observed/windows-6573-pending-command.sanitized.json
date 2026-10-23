@@ -1,0 +1,56 @@
+{
+  "_source": "2026-10-21 Windows 26.1016.6573.0 真机只读抓取（DERIVED：只保留 pending 请求骨架；ID 占位、正文 synthetic）",
+  "_captured_from": "thread-stream-state-changed / conversationState.requests（revision 2，线程占位化）",
+  "_note": "命令审批 pending 的真机形态：id 是**整数**；params 带 kind/threadId/turnId/itemId/startedAtMs/environmentId/reason/command/cwd/commandActions/proposedExecpolicyAmendment/availableDecisions。availableDecisions 里 contain 对象变体（acceptWithExecpolicyAmendment），**没有** decline 字面量——但 decision:\"decline\" 仍被接受（见 windows-4894-command-approval-accept）。",
+  "type": "snapshot",
+  "revision": 2,
+  "conversationState": {
+    "id": "00000000-0000-4000-8000-0000000000b1",
+    "turns": [],
+    "requests": [
+      {
+        "method": "item/commandExecution/requestApproval",
+        "id": 7,
+        "params": {
+          "kind": "command",
+          "threadId": "00000000-0000-4000-8000-0000000000b1",
+          "turnId": "00000000-0000-4000-8000-0000000000b2",
+          "itemId": "exec-0000000000b3",
+          "startedAtMs": 1792575758076,
+          "environmentId": "local",
+          "reason": "<synthetic reason>",
+          "command": "<synthetic command>",
+          "cwd": "C:\\Temp\\probe-project",
+          "commandActions": [
+            {
+              "type": "unknown",
+              "command": "<synthetic command>"
+            }
+          ],
+          "proposedExecpolicyAmendment": [
+            "<synthetic command>",
+            "<synthetic command>"
+          ],
+          "availableDecisions": [
+            "accept",
+            {
+              "acceptWithExecpolicyAmendment": {
+                "execpolicy_amendment": [
+                  "<synthetic command>",
+                  "<synthetic command>"
+                ]
+              }
+            },
+            "cancel"
+          ]
+        }
+      }
+    ],
+    "turnHistory": {
+      "kind": "canonical",
+      "history": {
+        "isComplete": true
+      }
+    }
+  }
+}
