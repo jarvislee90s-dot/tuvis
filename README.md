@@ -1,612 +1,595 @@
 <div align="center">
 
-# 兔维斯（Tuvis）
+# Tuvis
 
-**你的桌面多 Agent 指挥台**
+**Your Desktop Multi-Agent Command Deck**
 
-一站式监控、通知、跳转、管理 Claude Code / Codex CLI / OpenCode / OpenClaw / Kimi Code / WorkBuddy / ZCode / dsh 的桌面应用
+A desktop app to monitor, notify, jump to, and manage Claude Code / Codex CLI / OpenCode / OpenClaw / Kimi Code / WorkBuddy / ZCode / dsh sessions
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Tauri v2](https://img.shields.io/badge/Tauri-v2-blue?logo=tauri)](https://v2.tauri.app/)
 [![React 19](https://img.shields.io/badge/React-19-61DAFB?logo=react)](https://react.dev/)
 
-[English](README.en.md) · 中文
+English · [中文](README.zh-CN.md)
 
-<img src="docs/images/tuvis-hero.png" width="400" alt="兔维斯 —— 聪明的 AI 伙伴" />
+<img src="docs/images/tuvis-hero.png" width="400" alt="Tuvis — AI Agent for Developers" />
 
 </div>
 
 ---
 
-## 功能概览
+## Features
 
-> v0.5.8 起，应用内所有报错统一带**错误码**（中英文案齐备）：遇到问题反馈时附上错误码即可精确定位。
+> Since v0.5.8 every in-app error carries a stable **error code** with localized (EN/中文) wording — include the code when reporting an issue for precise diagnosis.
 
-### 会话监控看板
+### Session Monitoring Dashboard
 
-实时红绿灯状态看板，一目了然掌握所有 AI 编程工具的运行状态。
+Real-time traffic-light status board for all active AI coding tool sessions.
 
-| 状态    | 含义            |
-| ------- | --------------- |
-| 🔴 红色 | 等待用户输入    |
-| 🟡 黄色 | 处理中 / 思考中 |
-| 🟢 绿色 | 空闲 / 已完成   |
+| Status    | Meaning                |
+| --------- | ---------------------- |
+| 🔴 Red    | Waiting for user input |
+| 🟡 Yellow | Processing / Thinking  |
+| 🟢 Green  | Idle / Finished        |
 
-- 自动发现运行中的 **Claude Code**、**Codex CLI/APP**、**OpenCode**、**OpenClaw**、**Kimi Code**、**WorkBuddy**、**ZCode**、**dsh** 会话
-- 区分 CLI 与桌面 APP 形态：APP 类支持会话级深度链接直达（`workbuddy://chat/<id>`、`codex://threads/<id>`，失败自动落 APP 前台保底）；ZCode（单窗口多标签）跳转直接聚焦其唯一窗口；dsh（web 宿主）跳转聚焦/打开浏览器中的 dsh 标签页（macOS）。APP 类均支持持久未读卡（转绿跨重启保留、宿主退出自动清理）
-- 显示项目名称、Git 分支、最后消息预览、CPU 占用、运行时长
-- 按优先级排序：等待中 → 运行中 → 空闲
-- 标签栏下方「全部」+ 7 工具 **chips 单选筛选**（图标/配色与卡片徽章同源；选择记忆在本地，计数条保持全量，筛空时如实报出工具名；openclaw 不支持消息提醒不入筛，徽章保留，残留旧筛选自动回落「全部」）
-- 系统托盘图标反映聚合状态（🔴/🟡/🟢）
-  <img width="1384" height="1039" alt="image" src="https://github.com/user-attachments/assets/3ba29602-6c3d-46fe-957b-6b0db98a5f4c" />
+- Auto-discovers running **Claude Code**, **Codex CLI/APP**, **OpenCode**, **OpenClaw**, **Kimi Code**, **WorkBuddy**, **ZCode**, and **dsh** sessions
+- Distinguishes CLI vs. desktop APP form: APP sessions support session-level deep-link jumps (`workbuddy://chat/<id>`, `codex://threads/<id>`, with APP-foreground fallback) and persistent unread cards (kept across restarts, cleared when the host exits); dsh (web-hosted) jumps focus/open the dsh tab in your browser (macOS)
+- Shows project name, git branch, last message preview, CPU usage, runtime
+- Sorts by priority: waiting → running → idle
+- **Tool filter chips** ("All" + 7 tools) below the tab bar — icons/colors share one source with the card badges; the choice is remembered locally, the counter stays global, and an empty result names the tool instead of showing a blank board. OpenClaw is not filterable (no message alerts) though its badge remains; a stale OpenClaw filter falls back to "All" automatically
+- System tray icon reflects aggregate status (🔴/🟡/🟢)
 
-### 远程接入与移动看板（局域网 / 临时隧道 / 自有域名 / 外部域名）
+### Remote Access & Mobile Board (LAN / Quick Tunnel / Own Domain / External Domain)
 
-手机浏览器打开与桌面**同源**的八工具会话看板。设置 → 远程接入，**四张通道卡按需开启**（各自独立开关、可同时开）：
+Open the same eight-tool session board from your phone browser. Settings → Remote Access offers **four channel cards, each with its own switch and usable simultaneously**:
 
-| 通道卡               | 适用场景                               | 说明                                                                                                                                                               |
-| -------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 📶 局域网连接        | 手机与电脑同一 WiFi / 网线（**推荐**） | 速度最快；需访问密码；**本机浏览器访问也走这张卡给出的地址**（前提是该开关已打开）                                                                                 |
-| 🔀 临时隧道          | 人不在家、手机切蜂窝网络也要看         | 公网免注册（Cloudflare）；**地址每次开启会变**，旧链接失效                                                                                                         |
-| 🌐 自有域名          | 想要一个固定入口长期使用               | 需 Cloudflare 账号（免费计划即可）+ Tunnel Token；配置一次后**地址永久不变**，兔维斯 自动下载并守护 cloudflared，设置页内附逐步图文教程                            |
-| 🛰 外部域名（免域名） | 没有自己的域名，也想要一个永久地址     | **无需自备域名**：卡内向导一键引导安装 Tailscale 并开通 Funnel，拿到形如 `https://<机器名>.<尾网名>.ts.net/m` 的**永久地址**；只需一次性在本机安装并登录 Tailscale |
+| Channel card                         | When to use                                                   | Notes                                                                                                                                                                                                                                            |
+| ------------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 📶 LAN                               | Phone and computer on the same WiFi / cable (**recommended**) | Fastest; requires the access PIN; **your own browser on this computer uses this card's address too** (its switch must be on)                                                                                                                     |
+| 🔀 Quick tunnel                      | You're away and your phone is on cellular                     | Public, no signup (Cloudflare); **address changes every time it's enabled**                                                                                                                                                                      |
+| 🌐 Own domain                        | You want a stable entry point                                 | Needs a Cloudflare account (free plan works) + a Tunnel Token; the address is **permanent** once configured — Tuvis downloads and supervises cloudflared for you, with a step-by-step guide in Settings                                          |
+| 🛰 External domain (no domain needed) | You don't have a domain but still want a permanent address    | **No domain required**: the card's wizard walks you through installing Tailscale and enabling Funnel to get a **permanent** address like `https://<machine>.<tailnet>.ts.net/m`; you only install and sign in to Tailscale once on this computer |
 
-**访问密码对本机同样生效**：本机（回环）访问**不再免密**——从这台电脑自己的浏览器打开看板，与远程设备一视同仁（首次输入一次，之后 180 天免输入）。「本机」**不再是通道卡**：它只是"从本机访问"这一种访问方式，走「局域网连接」那张卡给出的地址。
+**The access PIN applies to this computer too**: loopback access is **no longer PIN-free** — opening the board from this machine's own browser is treated exactly like a remote device (enter the PIN once, then remembered for 180 days). "This machine" is **no longer a channel card**: it is just one way to connect, using the address shown on the "LAN" card.
 
-![远程接入 · 桌面设置页](docs/images/remote-settings-v0.6.0.png)
+![Remote Access · desktop settings page](docs/images/remote-settings-v0.6.0.png)
 
-接入流程：开启「远程接入」总开关 → 打开对应通道 → 点卡片展开取地址 / 扫码（**链接已含访问密码，扫码即自动填入**）→ 手机浏览器打开对应地址（**必须以 `/m` 结尾**）。**外部域名（免域名）首次使用走卡内向导**：点「一键配置」后依次是检测 → 从官方源下载并校验安装包 → 安装（系统弹一次管理员确认）→ 登录 Tailscale（兔维斯 把授权链接做成按钮，在浏览器里完成）→ 关闭「阻止传入连接」→ 开通 Funnel → **可达性校验**，全程不用碰命令行；macOS 另需在系统设置里批准一次 Tailscale 系统扩展，首次开通 Funnel 可能还需在浏览器里点一次批准（也可能不需要）。
+**Fresh-install defaults**: with no historical database (including legacy-brand data), Remote Access starts enabled, the release app attempts to register launch at login once, and remote-message device signatures are off. Enable individual channels as needed; upgrades keep their previous state. Turning a switch off is respected on later launches. Launch-at-login status reflects the operating system; a failed registration can be retried in Settings.
 
-**地址只在从公网侧实测校验通过后才显示**：校验中或尚未生效时，卡片如实显示「生效中」并按场景给出预期时长（首次开通约 5–6 分钟；此前开通过通常 1 分钟内，此时地址不会变；开机恢复约 1–2 分钟），不会把一个打不开的链接摆在界面上让用户干等；已生效后定期自动复验（约 1 分钟一次，空闲时更疏），异常时自动尝试恢复。地址永久不变、已配对设备免重配，**每次开机 兔维斯 会自动恢复该通道**（开机后先等 Tailscale 后端就绪再补开通，不会把正在恢复的完好配置清掉）。
+How to connect: confirm "Enable Remote Access" is on → enable the channel you want → click its card to reveal the address / QR code (**the link already contains the PIN, so scanning fills it in automatically**) → open it on your phone (**the URL must end with `/m`**). **The first run of "External domain (no domain needed)" goes through the card's wizard**: click "One-click setup" and it walks through detect → download from the official source with checksum verification → install (the system installer opens on macOS; an MSI wizard opens on Windows) → sign in to Tailscale (Tuvis turns the authorization link into a button; you finish in the browser) → turn off "block incoming connections" → enable Funnel → **reachability verification** — no command line at any point; on macOS you also approve Tailscale's system extension once in System Settings, and the first Funnel enablement may additionally need one browser approval (or none at all).
 
-访问密码对**全部四条通道**生效（**本机访问同样需要**）：新设备输入一次 **180 天免输入**，改密后所有设备需重新输入；「已接入设备」列表可重命名 / 踢下线，上限 10 台。
+**Tailscale installer and manual installation**: on macOS and Windows, packages are saved in the system Downloads folder, including redirected Windows folders. The wizard follows a vertical timeline, with actions on the right and completed steps in green. The actual path and “Open downloads folder” appear only after download and verification; the pinned official “Download manually” link appears only if automatic download fails. If the installer cannot open, double-click the verified package from its downloads folder. On macOS, clicking “Install Tailscale” opens the system installer automatically; follow its instructions and authorization prompts, then return to Tuvis and click “Refresh status”. Cancelling does not mark installation complete.
 
-> **如实申报**：向导内的平台标注与实现同源——Windows 侧的**安装与登录**流程尚未端到端实机跑过（只实测了其后半段：已安装 / 已登录之后的检测、开通、撤销与重启恢复），macOS 的**写路径**（开通 / 撤销 / 自愈）也尚未在本平台实机验证（只读探测已实测）；向导会在对应平台就地告知，不假装整条流程都验过。
+**Both fixed-address wizards**: Own domain assumes your domain is already on Cloudflare and guides you through tunnel creation, Token entry and a confirmed connection, browser-side hostname binding, and board-response verification. External domain (Tailscale) follows its installation and enablement steps. Once required steps and public board verification pass, the timeline collapses and the address, copy/open actions, and QR code stay in the channel card; “View setup steps” reopens it. Later failures keep the summary with the previous address clearly marked unavailable; open and QR actions pause without restarting installation.
 
-**实时看板**：会话状态变化 2 秒级推送到手机（SSE 主通道）——横幅 + 提示音 + 振动三件套提醒，点横幅直接进对应会话；断流自动降级为 3 秒轮询，网络恢复后刷新页面即重连。状态跃迁的去重与桌面通知同一套服务端逻辑（手机端拿到的已是去重边沿）。
+**Waiting for public DNS**: when the local board and Funnel are ready but public records are absent, the wizard shows elapsed time and an estimate of several minutes, potentially around ten minutes, while checking read-only about once per minute. No repeated retry is needed; overdue waits provide troubleshooting. Refresh and ordinary checks never reset Funnel; the explicit “Re-enable” repair retains configuration ownership safeguards. An enabled macOS extension needs no further action; a stopped backend first calls for checking the Tailscale client.
 
-**会话详情页**（ZCode 式对话视图，八工具统一）：
+**The address is only shown after it passes a real check from outside the tailnet**: while verifying or not yet effective, the card honestly reports "taking effect" and gives the expected wait for the situation (several minutes, potentially around ten minutes, for public DNS; about 1–2 minutes when recovering after boot) — it never puts a dead link in front of you. Once verified it is re-checked periodically (about once a minute, less often when idle) and continues read-only checks on failure; an explicit repair requires your confirmation. The address never changes, paired devices never need re-pairing, and **Tuvis restores the channel automatically on every boot** (it waits for the Tailscale backend to be ready before re-enabling, so it never wipes a config that is still coming back).
 
-- 运行中展开明细（思考过程/工具调用可点击展开），执行完成后自动折叠只显最终总结
-- markdown 渲染（标题/列表/表格/代码高亮），正文中出现的项目文件路径自动变可点链接
-- **文件面板**：把会话涉及的文件聚合为一份列表（按最近出现倒序），支持「文档 / 图片」类型过滤与 **200 / 500 / 1000 条消息**三档追溯范围；**已改写**的文件名为强调色、**仅读过**的为常规色（均可点击预览），点次行目录可弹出完整路径；v0.5.8 起新增第四来源**「会话产物」**——从普通正文文本中的产物链接与行内文件引用识别并归入同一列表，白名单格式点击即预览（桌面/手机一致）。**v0.6.0 起，Codex APP 会话的正文文件路径可直接打开预览；上传／引用图片、生成图、已修改和已查看文件会作为结构化产物显示并标注来源，文件项还能跳回最近一次正文引用（当前尾窗及最多四页、每页 50 条）。**
-- **文件预览**：markdown / 代码高亮 / 图片直显；三种布局随时切换——左右分屏（左对话右文件）、上下分屏、全屏浮层，分屏比例可拖动调整；可读范围为会话项目目录与用户主目录（密钥等敏感目录一律拒绝）
-- **传输进度与带宽如实告知**：文件上传 / 下载都出**进度条**（已传字节 / 百分比 / 瞬时速率 / 预计剩余）；**速率或总量不可知时只显示已传字节，不编假百分比**。走带宽受限的隧道通道时，文件面板与附件区**就地**说明「这是通道限制，不是故障」，并按本通道实测速率给出耗时量级（20 MB 附件下载约 1.5 分钟、上传约 3.3 分钟）与满速升级路径（手机上装 Tailscale 走尾网直连，带宽高 1–2 个数量级）
-- **消息书签**：长会话里拖到某处觉得「待会回来看」，点书签条上的「+ 书签」选个颜色即可打标（最多 10 个，每色一个）；点色点跳回该处，点「管理」可删单个或清空全部。书签保存在浏览器本地：刷新页面不丢、切回看板再进同一会话仍在；关掉 兔维斯（重启）或关闭浏览器标签页后清空
-- **字号档位**：对话正文字号 50% / 75% / 100% / 125% 四档可调（只影响正文与文件内容，界面控件不变）
-- **历史会话区**：已结束或失联的会话不再霸屏——登记制归档（历史页按 1/3/7 天懒加载），点卡片进只读详情、可一键重新激活；看板卡片支持关闭/归档（CLI 会话停止进程入档，APP 会话真「叉」语义）
-- 进入会话默认停在最新消息处；往上翻到顶有「加载更早消息」按钮，续读时视线停在原处不跳
-
-### 远程操控 · 手机发消息与审批（试验性 · v0.5.0 起）
-
-不止看，还能**操作**——手机端向 CLI 会话发消息、批准、答题、切权限，甚至**直接新建会话**（支持 **Claude Code / Codex CLI / Kimi Code / OpenCode** 四家，试验性）：
-
-- **新建会话**：手机端直接拉起一个新 CLI 会话——选候选项目或手填路径（路径黑名单校验）、可带首句自动注入；创建进度实时反馈、完成后自动跳转新会话。四家弹窗形态（信任框/更新框等）经实机 E2E 定案自动处置
-- **发消息与排队**：会话忙时消息自动排队不丢失；「立即发送」打断插队（各家按实测键序：claude = Esc 中断 + 队列整批取出、codex = Tab 原生队列 / Esc 插队 / Ctrl+C 撤回、kimi = 回合结束自动续发）；排队消息可撤回。每条消息走**键序注入 + 屏读回执闭环**（尾戳逐字校验），未投递如实告知，绝不谎报成功
-- **远程审批**：工具调用批准（允许/拒绝）、计划确认（计划正文 + 终端对话框选项屏读实时同步、数字直选）、claude 计划批准数字键直达 + **计划反馈条**（批准后可对计划发文字反馈 / 一键清除）；审批卡使命完成后自动收起
-- **远程问答**：单选/多选/自由作答（含 **Other 覆盖写入与清空**——进编辑退格到底再打新文，空文本如实拒），多题逐题推进 + 答完确认卡；多选题点选只勾选、「切换题目」显式推进（opencode/kimi 支持 ◀/▶ 双向）——手机与终端永远同题不错位。**确认卡摘要以终端 Review 页屏读为准**：刷新/重开页面后逐题答案与终端汇总页完全一致，本地记录只是兜底
-- **权限模式切换**：kimi 三档（`/permission` / `/yolo` / `/auto`）**两段式**——开菜单后屏读确认高亮才回车，且底栏**模式/权限双轴回读**（切档回执与当前档都有屏读证据）；codex 走终端菜单单选题
-- **守卫**：对话框挂起时拦截普通消息注入（防误答默认项）、输入行残留检测防双发、Ctrl+C 等危险键黑名单（如 opencode 会整应用退出）
-- **Codex 桌面 APP 远程控制（实验性，按 Desktop build 精确解锁）**：Windows `26.1013.4894.0` 支持消息投影/发送/状态/command 审批/Plan 阻塞问答；macOS `26.1013.40934` 支持发送/状态。permissions 保持关闭；其他 build 或未解锁能力会如实返回「未解锁/开发中」，不伪造审批、不创建空会话。消息正文中已有识别能力的文件引用可点开预览；从文件预览返回正文时，最多搜索当前尾窗加四页更早消息，定位最近一次引用。预览始终读取文件当前内容，不保存历史版本。详见下方能力矩阵。
-
-|                    会话详情 · 消息查看                     |                   发消息 · 排队与插队                    |
-| :--------------------------------------------------------: | :------------------------------------------------------: |
-| ![会话详情·消息查看](docs/images/mobile-detail-v0.5.0.png) | ![发消息·排队与插队](docs/images/mobile-send-v0.5.0.png) |
-|                    **审批 · 计划确认**                     |                **问答 · 多选题与确认卡**                 |
-|  ![审批·计划确认](docs/images/mobile-approve-v0.5.0.png)   |  ![问答·多选题](docs/images/mobile-question-v0.5.0.png)  |
-
-### 子 Agent 观察台（移动端已合入）
-
-会话详情实时显示后台子 agent 的运行状态与执行过程：
-
-- **运行 chip**：会话消息区下方实时显示后台子 agent（名字 / 时长走字 / token 消耗），点击直达执行详情
-- **子 Agent 看板**：与文件面板平级的独立看板——单一清单按派发序排列，绿点活跃走字、
-  灰点完成后冻结原位；点卡片进入执行过程详情
-- **执行过程详情**：任务原文、思考过程（默认折叠）、工具调用与结果、输出正文；活跃时
-  5s 一拍自动刷新贴底跟随，完成后定格快照
-- **回报提醒开关**：子 agent 完成回报唤醒主会话的提醒可独立静默（设置页，默认开）
-- v1 覆盖 Claude 全量（经典任务通知 + teammate 空闲通告双机制自动识别）；其余工具清单
-  照常、详情暂不支持
-
-**连不上？按这几条排查（均为实测踩过的坑）：**
-
-1. **路由器开了「终端隔离 / AP 隔离 / 访客网络」** —— 最隐蔽的一个：手机和电脑明明连着同一个 WiFi，路由器却禁止无线设备互访，怎么都连不通。到路由器后台关闭该设置（实测踩坑：其余全部排查正常，最后就是它）。
-2. **临时隧道的地址每次开关都会变** —— 每次开启临时隧道都会重新生成公网地址（旧链接 / 二维码立刻失效），别把它当长期入口；要固定地址请用「自有域名」或「外部域名（免域名）」。切换其他设置不影响本通道。
-3. **手机地址必须带 `/m` 后缀** —— 完整地址形如 `http://192.168.x.x:9420/m`；推荐直接扫二维码（**链接已含访问密码，自动填入**），手输漏掉 `/m` 会得到 404 空页。
-4. **从本机访问也要访问密码** —— 「本机」已不是通道卡：本机浏览器访问与远程设备一视同仁（首次输入一次访问密码），地址用「局域网连接」卡给出的那个，且**该开关必须打开**（服务只在回环监听时这个地址不可达）；手机请用「局域网连接」或隧道通道的地址。
-5. **防火墙放行** —— Windows 首次监听端口会弹「允许访问」，点过取消就会拦入站：Windows 安全中心 → 防火墙 → 允许应用通过防火墙 → 勾选 兔维斯（专用 + 公用都勾）。
-6. **TLS 确认框** —— 局域网直连是明文 HTTP，勾选表示「我知情/我已配 TLS 反代」；家庭局域网直接勾上即可，不需要真配反代。
-7. **自有域名显示「运行中」但域名打不开** —— 检查 Cloudflare 侧是否配了 **Public Hostname**（子域 + 域名 + Service 填 `HTTP://localhost:9420`）——漏做这一步时隧道虽显示 Healthy，但域名无解析、地址打不开（设置页「使用教程」有逐步图文）。
-8. **「外部域名（免域名）」卡一直显示「生效中」** —— 首次开通后公网 DNS 记录约需 5–6 分钟才发布：本机直连立刻就通，从外网则要等记录，此时卡片不给地址是**如实**而非故障；长时间不生效可点卡内「打开向导重试」，兔维斯 也会自动重置 Funnel 重开自愈。开机后若显示「恢复中」，那是 Tailscale 后端在重连（通常 1–2 分钟），配置与地址都不会变，无需任何操作。
-
-### 内置桌宠（tuvis-3D / Foxbell）
-
-内置桌宠常驻屏幕一角，实时监控所有会话状态：**tuvis-3D**（3D 科技兔，v0.5.8 起默认）与
-**Foxbell**（小狐狸，31 条原声语音）。
-
-![内置桌宠](docs/images/foxbell-pet.png)
-
-- 头顶状态卡片与看板同色同义：🔴 等待操作 / 🟡 运行中 / 🟢 已完成，点卡片直接跳转对应终端
-- 语音提醒（各带原声语音包：tuvis-3D 16 条 / Foxbell 31 条）：等待操作撒娇催促、任务完成求夸、双击闲聊，字幕与语音时长自动对齐
-- 拖拽物理：铆钉式跟手拖动、松手重力坠落、抛掷惯性、落地压扁回弹（可关；**每次重启应用默认关**，会话内可再开）
-- 单击挥手、双击说话、右键菜单：出声 / 字幕 / 物理 / 悬浮最前 / 大小三档 / 场景动作绑定 / 隐藏
-- 与看板联动：桌宠开启时接管完成提示音、悬浮最前时抑制通知浮窗；看板 🦊 按钮、系统托盘、设置页多入口开关互通
-- 悬停宠物约 0.5 秒出浮窗（迷你条 / 状态卡片）；**移开后留 2 秒宽限**再收起，
-  够出从容点「详情 »」的时间（2026-10-07 由 200ms 放宽，此前会被判为「够不到」）
-- **「启动时跟出」开关**（设置页「通知与桌宠」块，默认开）：决定桌宠是否随兔维斯一起启动显示；关掉后它不再自动跟出，且该选择会被记住、不被启动兜底逻辑覆盖
-- **切换内置宠物**：设置 → 通知与桌宠 → 「切换宠物」，内置列表 tuvis-3D 第一、Foxbell 第二，热切换无需重启；升级用户的既有选择自动保留（旧版 `foxbell` 激活记录自动识别）
-
-#### 外部桌宠
-
-v0.3.0 起桌宠格式开放，不只有内置两只：
-
-- **导入自定义宠物**：本地 zip / 目录导入，或从 Petdex 在线仓库下载；manifest 结构、帧率、尺寸、语音清单全量校验
-- **管理面板**：导入 / 描述编辑 / 重命名 / 删除 / 一键切换，宠物窗口热切换无需重启；删除或切换后活动宠物自动恢复
-- **能力门控**：无语音的宠物自动降级为纯动画（瞬态动作保留），语音能力双向同步
-
-### Token 用量看板（用量账本）
-
-七个工具（Claude Code / Codex / Kimi Code / OpenCode / ZCode / WorkBuddy / dsh）的 token 用量统一记账：
-应用启动后延迟采集一次，并开放 `usage_collect` 供前端按需触发（单飞互斥 + 默认 10 分钟的最小间隔兜底）；
-**采集走独立按需路径，不进入 3 秒会话轮询**。账本落在 `~/.tuvis/tuvis.db` 的 4 张表（明细按小时桶、日聚合永久保留、
-采集游标、会话维度），明细默认保留 90 天、上限 90 天（可配），到期只保留日聚合。
-
-**界面已落地（阶段②）**：设置页「用量统计」分区——总开关（关闭后零扫描）、迷你条时间档（当日 / 近 5 小时 /
-近 7 天）、迷你条工具行数（1–7）、明细保留期、采集间隔等设置即时保存；另有「采集状态」分区
-（采集状态自查 + 立即采集）。**桌宠迷你条**：浮窗常驻 5 行核心指标（新增输入+命中率 / 缓存命中+输出 /
-四桶明细 / 报错 / 最长单 turn，行序钉死），时间档与工具行数随设置联动。
-
-**Token 看板 V2**：A Token 总览固定展开（新增输入 / 缓存命中 / 未缓存命中 / 输出 / 命中率 / 请求次数；
-原「缓存写入（解释）」块已移除，计量维度统一为「新增输入 / 缓存命中 / 输出 / 合计」）；B 用量趋势在卡内按「全部 / 按工具 / 按渠道」局部筛选，峰值与环比同口径，
-不影响全局总览；**渠道 = 供应商别名**（provider 显示名；未编辑 = 原名；不同原始串可映射到同一显示名并跨工具合并；显式计费
-绑定优先，工具不参与渠道分类），未配置别名时非空 provider 按原始串聚合；C 用量分布可在「渠道 / 工具 /
-项目 / 模型」间切换，默认 Top5 并支持显示更多，每行给出 Token、缓存命中率与相对条；同显示名跨工具合并，
-同名模型不再出现无法区分的重复行，空模型显示「未知模型」；空 provider 未指派时渠道维度合并为「未指定渠道」
-一行、模型维度按工具拆行；渠道维度另有「渠道可能混合」行（同一日志身份可能混合多个账户、无法拆分），
-「未指定渠道」与「渠道可能混合」不作为趋势筛选选项。工作活动默认折叠，p50 / 最长 turn / 工具耗时收在
-展开后的高级统计。C 与工作活动可折叠，A/B 固定展开。记录页行名改为**供应商别名优先**：显示
-「别名 / 原始模型」，无别名时回退原始「供应商 / 模型」，原始身份保留在 title 与行数据中；**C 分布的渠道 / 模型维度与
-D 费用行 tooltip** 展示原始 provider 证据——合并多个原始 provider 时列出完整列表，组内有非空 provider
-且含未标注来源时追加「含未标注来源」提示（工具 / 项目维度不展示 provider 证据）。普通行不再出现
-「指定渠道 / 修改关联」，只有含糊行显示「绑定计费归属」，旧版计费归属与参考价规则收在记录页页脚的
-「高级」入口；每行另有「供应商显示名」入口——非空 provider
-可映射显示名，空 provider 的「工具 + 模型」条目可逐条设置别名、保存后回溯生效，浮窗保存前可预览该规则
-近 30 天的命中工具、模型与 Token 合计。已知限制：两个订阅的原始
-provider 串完全相同时，别名无法拆分，渠道会被合并；只能靠含糊行的「绑定计费归属」或页脚高级入口
-（显式计费绑定），不按 Token 比例拆账。设置 →「显示与计价配置」（费用卡「管理配置」同入口）与「自定义价格规则」放在**同一个弹窗**里：
-设置页与 D 卡共用该弹窗，D 卡「管理配置」直接打开；弹窗内上半是供应商/模型条目，下半是可折叠的自定义价格规则（默认收起）。设置页与 D 卡是两个 WebView，设置页修改后已打开的看板不保证立即刷新，看板内配置是主路径。条目默认按最近 7 天 Token 用量
-显示前 10，可按用量 / 原始供应商名 / 原始模型名三键排序（同键再点切换升降序）；每条三行——原始身份（只读）/ 供应商名（可编辑，对同一原始 provider
-全局生效；空 provider 条目写 toolModel 别名，未命名 = 未指定渠道）+ 模型名（可编辑，按（显示供应商,
-原始模型）批量生效）/ 计价身份（仅下拉 / 搜索选择，无自由输入）。高级区「自定义价格规则」支持**固定价**与**分时价**：
-分时价按周一至周五的多个高峰窗口（可跨午夜）使用高峰四价，其余时间使用低谷四价；低谷缺项回退目录价；时区可选
-上海 / UTC / 系统本地，只影响 API 计费峰谷区间计算；也提供「按高峰 × %」快捷填充。计费归属绑定 / 参考价规则是旧版能力，
-入口移至「用量看板 → 记录」页页脚的「高级」入口。每个高级选项旁有 Info 图标，
-hover/focus 显示用途说明；每条模型另有「设置自定义价格 / 编辑自定义价格」快捷入口，自动预填原始模型名（保存时后端归一化），已有规则
-显示「已应用自定义价格」徽标。自定义规则按**归一化模型名**全局生效：不需要写供应商，自定义显示名不参与匹配，
-也不在计价身份 / 参考价规则里选择。定价由 models.dev 公开价目自动匹配，精选来源按「直营官方（含中国站变体）> OpenRouter」
-取价，四价全 0 的条目跳过并继续找非零价；模型 ID 机械归一化后精确匹配，层内按 `release_date` 最新去重后同币种同价；精确未命中时
-前缀回退仅在唯一，或命中多个候选但价格完全一致时采用，跨模型族替代仍须用户显式指定参考模型；精选未命中的
-模型默认未估价，可在计价身份里显式选择目录条目（目录搜索默认精选，可开「显示全部 N 个来源」）。多模态 /
-上下文阶梯等条件价不再整行丢弃：有基础文本四价就按基础价估算，并在不准确原因里标注「按基础文本价估算」；
-缺价仍显示 `—`，不显示 0。**D 卡默认展开**，每条模型一张卡片（主行五列：渠道 / 模型 | 估价 | 总 Token |
-缓存命中率 | 计费详情），明细在卡片内部展开「新增输入 / 缓存命中 / 输出 / 合计」×「项目 / Token 用量 /
-金额 / 单价」，主表头与明细列头为实体字，合计行单价留空，缓存写仅有数据时出现；卡头新增「同步价格」按钮，
-手动强制刷新 models.dev + 人民币来源 + 当日汇率（loading / 行内状态），并保留每日/过期后台刷新与首次启用
-刷新。小字只留归一化模型与快照获取时间——**模型发布日不是价格日期**；不准确原因一行用 `·` 分割。
-**CNY 优先使用 models.dev 源 TOML 明确写出的原生人民币价，缺失时按当日汇率换算；USD 优先使用目录 USD
-原价。原生币种价格正常显示，经汇率换算的金额 / 单价加虚线下划线（卡头有图例）**；表头 USD / CNY 快捷切换，
-账本与费用 CSV 仍 USD。费用计价粒度：近 7 天 / 30 天 / 自定义（≤31 天）改按**小时明细按日聚合**，dsh 也能
-按输入 / 缓存命中 / 输出全量计价；明细保留期调低或清理导致范围内缺明细时**整段回退日聚合**（dsh 保持仅
-输出计价，原因中如实披露）；近 5 小时 / 当日不变。「定价目录状态」仍在设置页，可启用 / 刷新目录（失败沿用
-最后有效快照）；覆盖价列表同样展示目录来源 provider/model、发布日期与快照日期，后续同步不覆盖用户值。
-
-API 等效费用按「渠道 / 模型」逐行估算，**不提供全局费用总额或渠道小计**；导出条另有独立的「费用 CSV」（当前时间窗全部费用行，不含总计，前端
-不加 BOM；在既有 17 列后追加渠道键 / 渠道类型 / 显示名 / 归一化模型 / 目录发布日期 / 覆盖价标记 / 价格规则形态 7 列；
-`observed_provider` 单值列在一行合并多个原始 provider 或含未标注来源时留空，完整证据见 UI tooltip）。
-
-**口径说明（务必先读）**
-
-- **四桶**：未缓存输入 / 缓存读 / 缓存写 / 输出；**新增输入**（账本 requestTotal）与**命中率**由缓存语义三态
-  （互斥 / 包含 / 仅总量）派生。各源语义不一致，**同一工具不同记录也可能不同**——
-  Codex 逐条用 `total_tokens` 算术判定（本机实测：正确判据命中率 92.69%，一律按包含会得到
-  \>100% 的荒谬值）。拿不准时一律按「互斥」（算错的后果是命中率偏低，而不是静默多算）。
-- **总处理 Token = 新增输入 + 输出**；**未缓存命中输入 = 新增输入 − 缓存命中**（本期与上期同公式）。
-  V2 已从看板与分享摘要删除「用户输入(估)」（不是 API Token），并把计量维度统一为
-  「新增输入 / 缓存命中 / 输出 / 合计」；账本字段与 Token CSV 的原始列保留兼容。
-- **含子代理**：token 总量包含子代理/侧链用量；**会话数与 turn 数按父子分层**（不把一次对话算成多次）。
-- **子代理标记只在小时档有真值**：分组行的子代理标记（`isSubagent`）在**小时档**给出 `true` / `false`；
-  **日档与记录页卡内行恒为空态 `null`**（这两档的行维度不含会话，算不出）——空态**不得**当作
-  `false`（「不含子代理」）读。
-- **turn 数不跨工具合计**（各源判据语义不可比）；**最长单 turn 逐工具给 p50 + 最长**，
-  且**含挂机、未剔除 idle**。
-- **报错三层分列 + 用户主动打断单列**（三层互不包含，相加没有意义）。
-- **不可得的指标显示空态，不显示 0**：WorkBuddy 无回合概念、无时长字段、供应商不可得；
-  OpenCode 工具级错误不可得；kimi 的用户主动打断判据缺失；dsh 的报错与最长 turn
-  只能从原始会话日志取（**只有一部分会话仍留有原始日志**——**比例不写死**：覆盖率随机器与
-  会话清理策略变化，探测期的「19/99」已作废）。这类**部分覆盖不在界面表达**（2026-10-06 用户裁决）：
-  取到的照常显示，取不到的位次是 `—`，界面**不设「部分覆盖」档**（详见 `docs/superpowers/specs/2026-10-03-pet-token-usage-dashboard-design.md` §9.5.1）。
-- **总开关默认开**：**关闭后不采集、不落库**（也不做保留期清理），看板 / 记录页查询走关闭态早退；
-  但 **CSV 导出目前不受总开关门控**，关闭态仍可导出既有账本历史（该不对称是已登记的待裁口径）。
-- **「按项目」按记录归属**：一个会话文件可跨多个项目（同一条会话记录内的 cwd 才算它的项目），
-  项目名与首页会话卡片同源（`projectName`）；Windows 上各源路径大小写形态不同，
-  同一目录可能裂成两组；无 cwd 的记录落 `Unknown`。
-- **隐私**：账本查询与后续呈现面只出现结构化数字与静态文本（工具名、模型名、项目名、会话标题），
-  **不含任何 prompt 原文或代码内容**；CSV 导出只含结构化账本列，**会话标题与原始路径不进 CSV**。
-  CSV 导出为 UTF-8 with BOM（Excel 兼容）。
-
-### 桌面通知与提示音
-
-- 状态颜色变化时发送桌面通知（红↔黄↔绿），带去重机制
-- Web Audio API 提示音，无需音频文件
-- 设置中可开关
-- 通知可点击，附带「查看会话」动作直接跳转终端
-
-### 开机自动启动
-
-- 设置页「通知与桌宠」块、以及系统托盘「显示窗口」项下方，两处均可开关——共用同一条读写路径、勾选态回环一致
-- 开关显示的是**系统里的真实状态**（Windows 读注册表启动项，含任务管理器里的启用/禁用标记；macOS 读登录项），界面显示即实际状态，不落本地缓存、不会漂移；开关失败回滚并如实报错
-- 自启拉起时主窗口**静默进托盘**、桌宠照常跟出（不会开机弹一屏）
-- Windows 卸载时由安装器钩子清理该用户的启动项；macOS 无卸载钩子，需手动移除 `~/Library/LaunchAgents/` 下对应的 plist
-
-### 快速跳转终端
-
-点击会话卡片即可瞬间聚焦对应终端标签页：
-
-| 终端                       | 支持情况                                      |
-| -------------------------- | --------------------------------------------- |
-| iTerm2                     | ✅ AppleScript                                |
-| Terminal.app               | ✅ AppleScript                                |
-| tmux                       | ✅ pane 选择 + 终端聚焦                       |
-| Windows Terminal / conhost | ✅ 进程树消歧 + 一次性标题标记锁定（Windows） |
-| 浏览器标签（dsh）          | ✅ 标签页聚焦/打开（macOS）                   |
-| Wayland                    | ❌ 优雅降级提示                               |
-
-终端类工具（Claude Code / Codex CLI / OpenCode / Kimi Code）经进程树 + 窗口内容逐层消歧聚焦；**同项目双开直达**：Kimi / OpenCode 的窗口标题与会话标题（kimi `state.json` 标题 / OpenCode DB 标题）归一化比对，唯一命中即锁定，双开终端不再弹选择器。Windows 上消歧还会对目标终端贴一次性身份标记（` — 兔维斯:xxxxxxxxxxxx`，聚焦成功后自动清除）正向锁定，且标记不会叠加残留；卡片↔终端配对存疑（同项目多开）时**宁可弹选择器也不锁错窗**，聚焦被系统拒绝时显式报错而非静默假成功。
-
-桌面 APP 类工具（Codex APP、WorkBuddy）支持深度链接直达：`codex://threads/<id>`、`workbuddy://chat/<id>`（会话级），派发前校验协议 handler、派发后验证前台化，失败自动落 APP 级前台保底（macOS AppleScript / Windows 近祖聚焦），且不误标已读。ZCode 为单窗口多标签应用，跳转直接聚焦唯一窗口（卡片携带宿主 pid，零歧义锁定）。
-
-### 扩展资源统一管理
-
-Skill / MCP 服务器 / 插件的统一仓库，一键映射到各工具：
-
-- **Skill**：符号链接（Unix）/ 交接点（Windows）映射到各工具的 skill 目录
-- **MCP 服务器**：自动格式转换 —— JSON（Claude / Kimi / WorkBuddy）/ TOML（Codex）/ JSONC（OpenCode）/ JSON 嵌套子树（ZCode：`mcp.servers`，读-改-写只动该子树、未知键与原键序保留）
-- **插件**：文件/配置混合管理
-- 首次启动自动导入已有 skill（从 `~/.claude/skills/`、`~/.codex/skills/`、`~/.config/opencode/skills/` 等各工具目录，以及共享目录 `~/.agents/skills/`）
-- `~/.agents/skills/` 为**只读共享导入源**（来源标签 `agents-shared`）：兔维斯 仅扫描入库（不归属工具、不建链），codex / zcode 等遵循开放标准的工具直接读取该目录
-- 重新扫描按钮发现新安装的 skill
-<img width="1384" height="1016" alt="image" src="https://github.com/user-attachments/assets/3b2e9996-0989-4d31-98fd-b0675a00c24f" />
-
-### 预设组一键切换
-
-将 Skill + MCP + 插件打包为命名预设组，一键应用/取消：
-
-- 一键应用到任意工具 —— 自动适配各工具的配置格式
-- 部分成功处理：失败项报告错误，不回滚已成功项
-- 冲突检测：跳过已存在的资源
-- 系统托盘菜单集成，快速切换
-
-### 子 Agent 级资源分配
-
-为多 Agent 工具（OpenCode 等）的子角色分配资源子集：
-
-- 子 Agent 分配受工具级启用范围约束
-- 工具级禁用自动级联到所有子 Agent
-
-### 工具勾选管理
-
-设置页独立分区，按工具决定是否纳入 兔维斯 监控与管理：
-
-- 行式开关列表：图标 + 名称 + 安装状态 badge，本地暂存、批量保存，保存前确认弹窗列出还原/回溯清单，未保存离开自动拦截
-- 取消勾选 = 彻底还原：符号链接还原为真实文件、MCP 条目从工具配置移除、未读卡清空；SSOT 仓库与 DB 分配关系保留，重新勾选按原分配整体重建（失败自动回滚，重新保存即幂等重试）
-- 未勾选工具彻底隐藏：会话扫描跳过、通知静音、资源/预设界面不出现，相关写命令返回明确错误（结构化错误码 + 中英文案）
-
-### 信号健康度（Hook 信任门自查）
-
-设置页「工具与体检」块分区，自查各工具的 Hook 通道是否真正在工作：
-
-- 每个支持 Hook 的工具显示注册状态、最近事件时间与待办提示（数据来自既有 Hook 事件目录与会话扫描快照，打开分区/手动刷新时各拉一次，无后台轮询）
-- 判据：已注册 + 该工具存在活跃会话 + 30 秒窗口内零事件 → 显示「需在工具终端输入 /hooks 并信任 兔维斯 条目（一次性）」，附一键复制 `/hooks` 命令
-- 未注册的工具如实标注原因（如 macOS 上 kimi 显示「本平台暂不分发 Hook 通道，无需处理」），不再是干巴巴的「未注册」
-- codex 存在信任门：兔维斯 注册成功 ≠ 事件触发，需在 Codex TUI 内输入 `/hooks` 人工信任一次（信任后哈希落用户层配置）；注册完成后以**应用内常驻操作卡**提醒——弹卡≠销账，点「复制命令」/「不再提醒」才销账，卡面自带命令文本兜底剪贴板不可用
-
-> 已知限制：判据基于 30 秒 TTL 事件窗口，活跃会话单次长操作静默超过 30 秒时会短暂误报待办——本分区是启发式自查面板，以工具终端实际状态为准。
-
-## 技术栈
-
-| 层级     | 技术                                                                                      |
-| -------- | ----------------------------------------------------------------------------------------- |
-| 桌面框架 | [Tauri v2](https://v2.tauri.app/)（Rust）                                                 |
-| 前端     | [React 19](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/)            |
-| UI 组件  | [shadcn/ui](https://ui.shadcn.com/)（Radix UI）                                           |
-| 样式     | [Tailwind CSS v4](https://tailwindcss.com/)                                               |
-| 状态管理 | [Zustand](https://zustand-demo.pmnd.rs/)                                                  |
-| 国际化   | [i18next](https://www.i18next.com/)（中文 / English）                                     |
-| 数据库   | [SQLite](https://www.sqlite.org/)（via [rusqlite](https://github.com/rusqlite/rusqlite)） |
-| 进程监控 | [sysinfo](https://github.com/GuillaumeGomez/sysinfo)                                      |
-
-## 架构
+The PIN applies to **all four channels** (**including access from this computer**): enter it once per device for **180 days**, and after a PIN change every device must re-enter it. Paired devices can be renamed or kicked from the "Paired Devices" list (up to 10).
+
+> **Stated honestly**: the platform notes inside the wizard match the implementation — on Windows only the second half has been tested on a real machine (detect, enable, revoke and restart recovery after "installed / signed in"), while the **install and sign-in flow has not been run end to end**; on macOS the **write paths** (enable / revoke / self-heal) are **not yet verified on a real machine** either (read-only probing has been). The wizard says so on the spot per platform and does not pretend the whole flow has been verified.
+
+**Live board**: session status changes are pushed to your phone within ~2 seconds (SSE as the primary channel) — banner, chime, and vibration, with a tap taking you straight to that session; if the stream drops it degrades to 3-second polling automatically. Transition deduplication uses the same server-side logic as desktop notifications.
+
+**Session detail page** (ZCode-style conversation view, unified across all eight tools):
+
+- Expand details while running (thinking / tool calls are collapsible), auto-collapse to the final summary once a turn completes
+- Markdown rendering (headings / lists / tables / code highlighting); project file paths in the text become clickable links
+- **File panel**: aggregates the files a session touched, newest first, with document/image filters and a **200 / 500 / 1000 message** look-back range; **modified** files are highlighted and **read-only** ones are neutral (both previewable), and tapping the secondary line reveals the full path. Since v0.5.8 a fourth source, **Session artifacts**, scans ordinary message text for artifact links and inline file references (paths in code blocks are excluded); whitelisted formats preview on tap (desktop and mobile alike). **Since v0.6.0, recognized file paths in Codex APP messages open the preview, and uploaded/referenced images, generated images, and files changed or viewed appear as structured artifacts with source labels. File entries can jump back to the latest message reference within the current tail and up to four earlier pages of 50 messages each.**
+- **File preview**: markdown / syntax highlighting / inline images; three switchable layouts — side-by-side (chat left, file right), stacked, and fullscreen overlay — with a draggable splitter; readable scope is the session project directory plus your home directory (sensitive directories such as keys are always refused)
+- **Transfer progress and honest bandwidth disclosure**: uploads and downloads both show a **progress bar** (bytes transferred / percentage / instantaneous rate / ETA); **when the rate or the total size is unknown it shows bytes transferred only and never invents a percentage**. On a bandwidth-limited tunnel channel the file panel and the attachment area say **in place** that this is a channel limit, not a malfunction, with time estimates based on this channel's measured rate (about 1.5 minutes to download and 3.3 minutes to upload a 20 MB attachment) and a **full-speed upgrade path** (install Tailscale on your phone and join the tailnet to connect directly, 1–2 orders of magnitude faster)
+- **Message bookmarks**: mark a spot to revisit with a colored dot (up to 10, one per color), jump back by tapping it, delete individually or clear all; stored in the browser — refresh-proof, cleared when Tuvis restarts or the tab is closed
+- **Font size**: 50% / 75% / 100% / 125% for message and file text only
+- **Archived history**: finished or unreachable sessions stop cluttering the board — registry-based archiving (history page lazy-loads 1/3/7 days), tap a card for a read-only detail view with one-tap reactivation; board cards can be closed/archived (CLI sessions stop their process, APP sessions get a true "close")
+
+### Remote Control · send messages & approve from your phone (v0.5.0, experimental)
+
+Not just looking — you can **act**: send messages, approve tool calls, answer questions, switch permission modes, and even **create new sessions** from your phone (currently **Claude Code / Codex CLI / Kimi Code / OpenCode**, experimental):
+
+- **Create sessions**: start a brand-new CLI session straight from the phone — pick a known project or type a path (checked against a blocklist), optionally with an opening message injected automatically; creation progress streams back and the board jumps to the new session when it is ready. Per-tool popup shapes (trust prompts, update notices, …) are handled automatically, verified by on-machine E2E
+- **Send & queue**: messages queue automatically while a session is busy, "send now" interrupts and jumps the queue (per-tool key sequences measured on real machines), and queued messages can be retracted. Every message uses **key-sequence injection with a screen-read receipt** (character-by-character tail verification) — a non-delivery is reported honestly, never faked as success
+- **Remote approvals**: tool-call approval (allow/deny), plan confirmation (plan body plus terminal dialog options synced live from the screen, direct digit selection), Claude plan-approval digit shortcuts plus a **plan feedback bar** (send written feedback on an approved plan, or clear it in one tap); the approval card dismisses itself once its job is done
+- **Remote Q&A**: single-choice, multi-select, and free-form answers (including **Other — overwrite & clear**: enter edit, backspace to empty, then type; an empty text is rejected honestly), per-question progression with a confirmation card; multi-select taps only toggle, "next question" advances explicitly (opencode/kimi also support ◀/▶ back and forth) — the phone and the terminal always stay on the same question. **Confirmation-card answers are sourced from the terminal's Review page via screen reading**: after a refresh or page reopen they match the terminal summary exactly; local memory is only a fallback
+- **Permission modes**: kimi's three tiers (`/permission` / `/yolo` / `/auto`) use a **two-step flow** — open the menu, screen-read the highlighted row, only then press Enter — plus a **mode/permission dual read-back** in the status bar (both the switch receipt and the current tier carry screen-read evidence); codex switches via the terminal menu single-select
+- **Guards**: while a dialog is pending, ordinary message injection is blocked (to avoid answering the default by accident); input-line residue is detected to prevent double sends; dangerous keys (such as Ctrl+C, which quits OpenCode) are blacklisted
+- **Codex desktop APP remote control (experimental, unlocked per exact Desktop build)**: Windows `26.1013.4894.0` supports message projection / sending / status / command approval / Plan blocking Q&A; macOS `26.1013.40934` supports sending / status. `permissions` stays disabled; other builds or unsupported capabilities are refused honestly as "not unlocked / work in progress" — no fake approvals or empty sessions. Recognized file references in message bodies open the existing preview; returning from a preview searches the current tail plus at most four earlier pages for the latest reference. Preview always reads the file's current contents and does not retain historical versions. See the capability matrix below.
+
+|                Session detail · messages                |              Send · queue & jump               |
+| :-----------------------------------------------------: | :--------------------------------------------: |
+| ![Session detail](docs/images/mobile-detail-v0.5.0.png) |  ![Send](docs/images/mobile-send-v0.5.0.png)   |
+|                  **Approvals · plan**                   |             **Q&A · multi-select**             |
+|   ![Approvals](docs/images/mobile-approve-v0.5.0.png)   | ![Q&A](docs/images/mobile-question-v0.5.0.png) |
+
+**Can't connect? Check these first (every item below is a pit we actually hit):**
+
+1. **The router has "client isolation / AP isolation / guest network" enabled** — the most elusive one: your phone and computer are on the same WiFi, yet the router forbids wireless clients from talking to each other, so nothing connects. Turn that setting off in the router's admin page (field note: everything else checked out; this turned out to be it).
+2. **The quick tunnel address changes every time it is toggled** — each time you enable the quick tunnel a new public address is generated (the old link / QR code dies immediately), so don't treat it as a long-term entry point; for a fixed address use "Own domain" or "External domain (no domain needed)". Toggling other settings does not affect this channel.
+3. **The phone URL must end with `/m`** — a full address looks like `http://192.168.x.x:9420/m`; scanning the QR code is recommended (**the link already contains the PIN, filled in automatically**), and typing it without `/m` gives you an empty 404 page.
+4. **Access from this computer needs the PIN too** — "This machine" is no longer a channel card: opening the board in this machine's own browser is treated exactly like a remote device (enter the PIN once), using the address shown on the "LAN" card, and **that switch must be on** (the address is unreachable when the server only listens on loopback); on your phone use the "LAN" card or a tunnel address.
+5. **Firewall** — on Windows the first listen triggers an "allow access" prompt; if it was dismissed, inbound traffic is blocked: Windows Security → Firewall & network protection → Allow an app through firewall → tick Tuvis (both Private and Public).
+6. **The TLS confirmation dialog** — a direct LAN connection is plain HTTP; ticking the box means "I understand / I have a TLS reverse proxy in front"; for a home LAN just tick it — you don't need to actually set up a reverse proxy.
+7. **Own domain is connected but the domain won't open** — follow “Bind public hostname” in the channel timeline: in Cloudflare, go to Routes → Add route → Published application, configure the subdomain, choose HTTP for Type, and use the current origin address shown by the wizard for Service. Save the route and return to Tuvis to verify; setup completes only after the public board response passes verification.
+8. **The “External domain (no domain needed)” card keeps waiting for public DNS** — publishing records or refreshing a negative cache can take several minutes, potentially around ten. Keep the channel enabled; read-only checks run every minute. Retry is hidden during this wait, and overdue waits provide troubleshooting. Ordinary checks never reset Funnel; only an explicitly confirmed re-enable performs repair. An enabled extension needs no further approval; recovery after boot normally means the Tailscale backend is reconnecting.
+
+### Built-in Pets (tuvis-3D / Foxbell)
+
+Built-in companions live in a corner of your screen and watch every session in real time: **tuvis-3D** (a 3D tech rabbit, the default since v0.5.8) and **Foxbell** (a fox with 31 voice clips).
+
+![Built-in desktop pet](docs/images/foxbell-pet.png)
+
+- Status cards above the pet mirror the dashboard: 🔴 waiting / 🟡 running / 🟢 finished — click a card to jump to its terminal
+- Voice alerts (each pet ships its own clips: tuvis-3D 16 / Foxbell 31): playful nudges on waiting approvals, cheers on completion, small talk on double-click, subtitles synced to audio length
+- Drag physics: pinned-to-cursor dragging, gravity fall on release, throw inertia, squash-and-bounce landing (optional; **defaults to off after every app restart** since v0.5.8 — re-enable per session)
+- Single-click waves, double-click talks, right-click menu: sound / subtitles / physics / always-on-top / size / per-scene action binding / hide
+- Dashboard integration: takes over completion chimes, suppresses toast popups while always-on-top; toggle from the dashboard 🦊 button, system tray, or settings
+- **"Launch with the app" switch** (Settings → "Notifications & Pet" block, on by default): decides whether the pet follows Tuvis at startup; once turned off it stays off and is no longer overridden by the startup fallback logic
+- **Switch built-in pets**: Settings → "Notifications & Pet" → "Switch pet" lists tuvis-3D first and Foxbell second; hot swap, no restart. Choices from earlier versions carry over automatically (legacy `foxbell` activation records are recognized)
+
+#### External Pets
+
+Since v0.3.0 the pet format is open — beyond the two built-ins:
+
+- **Import custom pets**: from a local zip / directory, or download from the Petdex online repository; manifest structure, frame rate, dimensions and voice manifests are fully validated
+- **Manage panel**: import / edit description / rename / delete / one-click hot swap — no app restart needed; the active pet is auto-restored after deletion or switching
+- **Capability gating**: pets without voices gracefully degrade to animation-only (transient actions kept); voice capabilities stay in two-way sync
+
+### Token Usage Dashboard (Usage Ledger)
+
+Token usage from seven tools (Claude Code / Codex / Kimi Code / OpenCode / ZCode / WorkBuddy / dsh) is accounted
+for in one ledger: the app collects once shortly after startup, and `usage_collect` lets the frontend trigger a
+collection on demand (single-flight mutex + a default minimum interval of 10 minutes);
+**collection runs on its own on-demand path and never enters the 3-second session polling loop**. The ledger
+lives in 4 tables in `~/.tuvis/tuvis.db` (hourly detail, permanently kept daily aggregates, collection cursors,
+session dimension); detail is kept for 90 days by default with a 90-day maximum (configurable), and after expiry only the daily
+aggregates remain.
+
+**Dashboard V2**: A Token overview stays expanded (new input / cache hit / cache miss / output /
+hit rate / requests; the former "cache write (explained)" block is removed and meter labels are unified as
+new input / cache hit / output / total); B Usage trend
+filters locally inside the card by **All / By tool / By channel**, with peak and period comparison using the
+same scope and no effect on the global overview; **"channel" means the provider alias** (the provider display
+name; unedited = raw name;
+different raw strings can map to the same display name and merge across tools; an explicit billing binding wins;
+tools are not a channel dimension), and non-empty raw provider strings are used when no alias exists; C Usage
+distribution switches between **By channel / By tool / By project / By model**, shows Top 5 by default with "show
+more", and lists tokens, cache hit rate and a relative bar per row; the same display name merges across tools,
+identically named models no longer produce indistinguishable duplicate rows, an empty model shows "unknown
+model"; when an empty provider has no assignment, the channel view merges it into one "unassigned channel" row
+and the model view splits by tool; the channel view also has a "channel may be mixed" row for log identities
+that may mix multiple accounts and cannot be split, and neither "unassigned channel" nor "channel may be mixed"
+is offered as a trend filter option. Work activity is collapsed by default, with p50 / longest turn / tool
+duration inside its advanced stats. C and Work activity are collapsible; A/B are fixed. Records-page row names
+now prefer the **provider alias**: they show "alias / raw model" and fall back to the raw "provider / model" when
+no alias exists, while the raw identity stays in the title and the row data; **the channel / model dimensions of C and the D
+cost-row tooltips** show raw provider evidence — when multiple raw providers merge, the complete list is shown,
+and groups that contain a non-empty provider together with an unlabeled source are marked
+"includes unlabeled source" (the tool / project dimensions show no provider evidence). Ordinary rows no longer
+show "Assign channel / Edit assignment"; only ambiguous rows offer "Bind billing attribution", and the legacy
+billing attribution / reference rules live behind the "Advanced" entry in the Records footer; every row still
+has a "Provider display name" entry — a non-empty provider can map to a display name, and an empty provider's
+"tool + model" entry can be given an alias individually (applies retroactively once saved); the dialog also
+previews the rule's matching tools, models and total tokens over the last 30 days before saving. Known limitation:
+when two subscriptions log the exact same raw provider string, aliases cannot split them and the channels stay
+merged; only the ambiguous row's "Bind billing attribution" or the footer's advanced entry (explicit billing
+binding) can help, and tokens are never split proportionally. Settings → "Display & pricing config" (the same entry as the cost card's "Manage config") and
+"Custom price rules" now live in **one shared dialog**: the settings page and the D card open the same dialog, and
+the D card's "Manage config" opens it directly; the upper part holds the provider/model entries and the lower part
+is a collapsible custom price rules section (collapsed by default). Settings and the D card are separate WebViews;
+changes in Settings do not guarantee an immediate refresh of an already-open usage dashboard, and the in-dashboard config is the primary path. Entries default to the top 10 by usage in the last
+7 days, with "show all" and search at the bottom, plus three sort keys (usage / raw provider / raw model, click again
+to reverse). Each entry has three rows — raw identity (read-only) / provider
+name (editable, applied globally to the same raw provider; empty-provider entries write a toolModel alias and stay
+"unassigned channel" when unnamed) + model name (editable, applied per (display provider, raw model)) / pricing
+identity (dropdown / search selection only). "Custom price rules" supports **fixed** and **time-of-day** pricing:
+time-of-day uses peak rates inside multiple Monday–Friday peak windows (cross-midnight allowed) and off-peak rates
+elsewhere; a blank off-peak component falls back to the catalog rate; the time zone can be China Standard Time, UTC
+or system local and only affects API billing peak/off-peak calculation; a "peak × %" helper fills the off-peak rates.
+Legacy billing-attribution binding / reference rules moved to the Records page footer's "Advanced" entry. Every advanced
+option has an Info icon with a hover/focus explanation; each model entry also has a "Set custom price /
+Edit custom price" shortcut that pre-fills the raw model name (normalized on save) and shows a "Custom price applied" badge when
+present. The rule applies globally by **normalized model name**: no provider needed, custom display names do
+not participate, and it is not selected in pricing identities or reference rules. Pricing is matched automatically from the public
+models.dev catalog, with curated sources ranked **direct official providers (including China-site variants) >
+OpenRouter**; all-zero quotes are skipped in favour of the next non-zero candidate. Model IDs are mechanically normalized then matched exactly; within a tier, the
+latest `release_date` wins and the normalized model shares one price per currency. Prefix fallback is used only
+when the candidate is unique, or when multiple candidates match but all share exactly the same price; cross-family
+substitution still requires an explicitly chosen reference model. Models missing from the curated set stay
+unpriced by default — pick a catalog entry explicitly via the pricing identity (the catalog search is curated-only
+by default, with a "show all N sources" switch). Conditional quotes (multimodal input, context tiers, etc.) are no
+longer discarded: when base text rates exist, the estimate uses them and the caveat line says "estimated at base
+text rates"; missing prices still render `—`, never 0. **The D card is expanded by default** and renders one card
+per model (five columns: channel / model | estimate | total tokens | cache hit rate | billing detail), with the
+detail expanded inside the card as four rows (new input / cache hit / output / total) × four columns (item /
+tokens / amount / unit price). Main and detail headers use solid foreground text; the total row leaves the unit
+price blank, and cache write appears only when data exists. A "Sync prices" button in the card header force-refreshes
+models.dev + native RMB sources + the daily FX rate (loading / inline status), while daily/stale background refresh
+and first-enable refresh remain. The footnote keeps only the normalized model and snapshot fetch time — **a model
+release date is not a price date**; caveats join into one dot-separated line. **CNY prefers native RMB prices
+explicitly written in the models.dev source TOMLs and converts at the daily rate when missing; USD prefers the
+catalog's native USD price. Native-currency prices render normally; amounts/unit prices converted by FX carry a
+dashed underline (legend in the card header)**. The header keeps the USD / CNY quick switch; the ledger and cost
+CSV stay in USD. Cost granularity: the last 7 days / 30 days / custom spans (≤31 days) are priced from **hourly
+details aggregated per day**, so dsh is fully priced across input / cache hit / output; when lowered detail
+retention or cleanup leaves days without details, the whole span falls back to daily aggregation (dsh stays
+output-only, disclosed in the caveats); the last 5 hours / today are unchanged. "Pricing catalog status" stays in
+Settings and enables/refreshes the catalog (falling back to the last valid snapshot on failure); the override list
+also shows the catalog source provider/model, release date and snapshot date, and later syncs never overwrite user
+values.
+
+API-equivalent costs are estimated per channel / model row, with **no global cost total or channel subtotal**; the
+export bar has a separate **Cost CSV** (all cost rows for the current window, no totals, no BOM added by the
+frontend; seven columns — channel key / channel kind / display name / normalized model / catalog release date /
+override flag / price-rule kind — are appended after the existing 17, and the single-value `observed_provider` column is left empty
+when a row merges multiple raw providers or includes an unlabeled source, with the full evidence available in the
+UI tooltip).
+
+**How the numbers are defined (read this first)**
+
+- **Four buckets**: uncached input / cache read / cache write / output; **new input** (the ledger's request
+  total) and the
+  **cache hit rate** are derived from the three cache-semantics modes (exclusive / subset / total-only).
+  Sources disagree on semantics, and **records of the same tool can differ too** — Codex decides per record
+  by arithmetic on `total_tokens` (measured on this machine: 92.69% with the correct rule; treating
+  everything as "subset" yields absurd values above 100%). When in doubt we treat it as "exclusive"
+  (a wrong call shows a lower hit rate instead of silently over-counting).
+- **Total processed tokens = new input + output**; **cache-miss input = new input − cache read**
+  (same formula for the current and previous windows). V2 removes "user input (est.)" from the dashboard and
+  shared summaries (it is not API tokens) and unifies meter labels as new input / cache hit / output / total;
+  the ledger field and the raw Token CSV column remain for compatibility.
+- **Sub-agents included**: token totals include sub-agent / sidechain usage; **session and turn counts are
+  layered by parent/child** (one conversation is not counted as several).
+- **The sub-agent flag is only meaningful in the hourly tier**: `isSubagent` is `true` / `false` for hourly
+  grouped rows, and is the empty state `null` in the daily tier and for record-page card rows (neither tier
+  has a session dimension, so it cannot be computed) — `null` must **not** be read as `false` ("no sub-agents").
+- **Turn counts are never summed across tools** (each source's rule is not comparable); **the longest single
+  turn is reported per tool as p50 + max**, and **it includes idle time (idle is not excluded)**.
+- **Errors are split into three layers, plus a separate "user interrupted" column** (the three layers are
+  mutually exclusive; adding them up is meaningless).
+- **Unavailable metrics show an empty state, never 0**: WorkBuddy has no turn concept, no duration field and
+  no provider; OpenCode has no tool-level errors; kimi has no user-interrupt rule; dsh errors and longest
+  turns can only come from raw session logs (only a subset of sessions still have raw logs — **no ratio is
+  hard-coded**, since coverage varies with the machine and cleanup policy; the earlier "19/99" is obsolete).
+- **Master switch (on by default)**: when it is off, **nothing is collected and nothing is written to the
+  ledger** (retention cleanup is skipped as well) and dashboard / record queries return the off-state early;
+  **CSV export is currently not gated by the master switch**, so existing ledger history can still be exported
+  while it is off (a registered decision pending review).
+- **"By project" follows record ownership**: one session file can span several projects (only the cwd inside a
+  given record counts as its project); project names come from the same source as the dashboard session cards
+  (`projectName`); on Windows the same directory may split into two groups because path casing differs between
+  sources; records without a cwd fall into `Unknown`.
+- **Privacy**: ledger queries and the upcoming surfaces contain only structured numbers and static text
+  (tool name, model name, project name, session title) — **no prompt text and no code content**;
+  CSV export contains only structured ledger columns, and **session titles and raw paths never enter the CSV**.
+  CSV export is UTF-8 with BOM (Excel-friendly).
+
+### Desktop Notifications & Sound Alerts
+
+- Color-change-based notifications (red↔yellow↔green) with deduplication
+- Web Audio API chimes — no audio files needed
+- Configurable on/off toggle in settings
+- Clickable notifications with "View Session" action to jump to terminal
+
+### Launch at Login
+
+- A fresh release installation attempts to enable launch at login once; existing installations and legacy-brand migrations keep their state. Failed registration can be retried in Settings.
+- Toggle it from the Settings → "Notifications & Pet" card, or from below the tray's "Show Window" item — both share one read/write path and keep the checkbox state in sync
+- What you see is the **real OS-side state, read live** (Windows registry Run key, including the enable/disable flag Task Manager writes; macOS login items) — no local cache, and a failed toggle rolls back and reports honestly
+- When launched by autostart, the main window **starts hidden in the tray** and the desktop pet still follows (no window popping up on boot)
+- On Windows, uninstalling removes the startup entry for the user who uninstalls it; macOS has no uninstall hook, so remove the matching plist under `~/Library/LaunchAgents/` manually
+
+### Quick Terminal Jump
+
+Click a session card to instantly focus the corresponding terminal tab:
+
+| Terminal     | Support                            |
+| ------------ | ---------------------------------- |
+| iTerm2       | ✅ AppleScript                     |
+| Terminal.app | ✅ AppleScript                     |
+| tmux         | ✅ pane selection + terminal focus |
+| Wayland      | ❌ Graceful fallback message       |
+
+Terminal tools (Claude Code / Codex CLI / OpenCode / Kimi Code) resolve through process-tree and window-content disambiguation; **same-project dual-open jumps land directly**: for Kimi / OpenCode, the window title is matched against the session title (kimi `state.json` title / OpenCode DB title) after normalization — a unique hit locks onto the window, so dual terminals no longer raise a picker. On Windows, resolution also stamps a one-shot identity marker onto the target terminal title (` — Tuvis:xxxxxxxxxxxx`, cleared automatically after focus) for positive locking; markers never stack, and when the card↔terminal pairing is uncertain (same-project multi-open) the app **raises a picker rather than risking the wrong window**, and focus refusals surface an explicit error instead of failing silently.
+
+Desktop APP tools (Codex APP, WorkBuddy) support deep-link jumps: `codex://threads/<id>`, `workbuddy://chat/<id>` (session-level). The handler is verified before dispatch and foregrounding is verified after; on failure it falls back to APP-level focus (macOS AppleScript / Windows nearest-ancestor) without marking the session read. ZCode is a single-window multi-tab app — its jump simply focuses the unique window (cards carry the host pid, zero ambiguity). dsh's jump focuses (or opens) the dsh web tab in your browser.
+
+### Extension Resource Management
+
+Unified repository for Skills, MCP servers, and Plugins across tools:
+
+- **Skills**: Symlink (Unix) / Junction (Windows) mapping to each tool's skill directory
+- **MCP Servers**: Auto-format conversion — JSON (Claude / Kimi / WorkBuddy) / TOML (Codex) / JSONC (OpenCode) / nested JSON subtree (ZCode: `mcp.servers`; read-modify-write touches only that subtree, preserving unknown keys and original key order)
+- **Plugins**: File/config hybrid management
+- Auto-import existing skills on first launch (from per-tool directories such as `~/.claude/skills/`, `~/.codex/skills/`, `~/.config/opencode/skills/`, plus the shared directory `~/.agents/skills/`)
+- `~/.agents/skills/` is a **read-only shared import source** (source label `agents-shared`): Tuvis only scans it into the repository (no tool attribution, no linking); tools that follow the open standard, such as codex / zcode, read this directory directly
+- Rescan button for discovering newly installed skills
+
+### Preset Groups
+
+Bundle Skills + MCP servers + Plugins into named presets and apply/deactivate in one click:
+
+- One-click apply to any tool — auto-adapts to each tool's config format
+- Partial success handling: reports failures without rolling back successful items
+- Conflict detection: skips already-existing resources
+- System tray menu integration for quick switching
+
+### Sub-Agent Resource Allocation
+
+For multi-agent tools (Hermes, OpenCode, etc.), allocate resource subsets to sub-agents:
+
+- Sub-agent allocation is constrained to the tool-level enabled range
+- Tool-level disable cascades down to all sub-agents
+
+### Tool Toggle Management
+
+A dedicated settings section to decide which tools Tuvis monitors and manages:
+
+- Row-style toggle list: icon + name + installed badge; changes are staged locally and batch-saved, with a confirmation dialog listing restore/rollback items and an unsaved-changes leave guard
+- Unchecking = full restore: symlinks become real files, MCP entries are removed from tool configs, unread cards are cleared; the SSOT repository and DB assignments are kept, and re-checking rebuilds everything per the original assignments (partial failures auto-rollback — re-saving retries idempotently)
+- Unchecked tools are fully hidden: session scanning skips them, notifications are muted, resource/preset UIs hide them, and guarded commands return structured, localized errors
+
+### Signal Health (Hook trust-gate self-check)
+
+A settings section under the "Tools & Health Check" block to verify each tool's Hook channel is actually working:
+
+- Every Hook-capable tool shows registration status, last event time, and pending prompts (data comes from the existing Hook event directory and session-scan snapshots, fetched on open/manual refresh — no background polling)
+- Criterion: registered + an active session exists for the tool + zero events within a 30-second window → shows "enter /hooks in the tool's terminal and trust the Tuvis entry (one-time)" with a one-click copy of the `/hooks` command
+- Unregistered tools get an honest reason (e.g. kimi on macOS shows "the Hook channel is not distributed on this platform; nothing to do") instead of a bare "unregistered"
+- codex has an extra trust gate: Tuvis being registered ≠ events firing — you must run `/hooks` inside the Codex TUI and trust it once (the trust hash lands in your user-level config). After registration Tuvis raises a **persistent in-app action card** instead of a one-shot desktop notification: raising the card ≠ dismissing it; only "Copy command" or "Don't remind me again" clears it, and the card carries the command text as a clipboard fallback
+
+---
+
+## Tool Support Matrix
+
+Capabilities across the 13 capability rows × 8 terminal-class AI coding tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported) — this is the master capability table, updated with every release (structured source: [`docs/capabilities.json`](docs/capabilities.json), shared with the website):
+
+| Capability                         | Claude Code | Codex CLI | OpenCode | OpenClaw | Kimi Code    | WorkBuddy | ZCode           | dsh         |
+| ---------------------------------- | ----------- | --------- | -------- | -------- | ------------ | --------- | --------------- | ----------- |
+| Session monitoring                 | ✅          | ✅        | ✅       | ✅       | ✅           | ✅        | ✅              | ✅          |
+| Desktop notifications              | ✅          | ✅        | ✅       | ✅       | ✅           | ✅        | ✅              | ✅          |
+| Skill management                   | ✅          | ✅        | ✅       | ✅       | ✅           | ✅        | ✅              | ◐ read-only |
+| MCP management                     | ✅ JSON     | ✅ TOML   | ✅ JSONC | ✅ JSON  | ✅ JSON      | ✅ JSON   | ✅ JSON subtree | ❌          |
+| Plugin management                  | ✅          | ✅        | ✅       | ✅       | ◐ file-based | ❌        | ❌              | ❌          |
+| Status hooks                       | ✅          | ✅        | ❌       | ❌       | ✅           | ❌        | ❌              | ❌          |
+| Mobile · message viewing           | ✅          | ✅        | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
+| Mobile · file preview              | ✅          | ✅        | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
+| Mobile · send messages (injection) | 🧪          | 🧪        | 🧪       | ❌       | 🧪           | ❌        | ❌              | ❌          |
+| Mobile · create sessions           | 🧪          | 🧪        | 🧪       | ❌       | 🧪           | ❌        | ❌              | ❌          |
+| Token usage collection             | ✅          | ✅        | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
+| Mobile · sub-agent observatory     | ✅          | ❌        | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
+| Mobile · Codex APP control (Desktop IPC) | ❌    | 🧪        | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
+
+**Codex APP remote control (v0.6.0, experimental)**: Codex only, unlocked per exact Desktop build (Windows `26.1013.4894.0`: send/status/command approval/Plan blocking Q&A, `permissions` off; macOS `26.1013.40934`: send/status). Recognized file paths in message bodies open the preview; the file panel shows uploaded/referenced images, generated images, and files changed or viewed with source labels, and entries can jump to the latest body reference (current tail plus up to four earlier pages of 50 messages each). Unsupported capabilities are refused honestly — no fake approvals or empty sessions; previews read current file contents and retain no history. Real-phone PRODUCT acceptance is not fully executed yet; see `docs/superpowers/reviews/2026-10-20-codex-app-product-acceptance.md`.
+
+**Three-state capability badge for Codex APP remote control (mobile)**: capabilities are shown as three honest states instead of claiming theoretical support — **verified** (that Desktop build has real-machine evidence: controllable / sendable), **compatibility send (experimental)** (unknown build: send/status default to on per the 2026-10-22 ruling, while destructive capabilities — interrupt, approvals — stay evidence-gated: Tuvis first runs a **read-only probe** on that build (15-second hard cap server-side) and takes schema evidence from the bundled CLI, unlocking them only after evidence; while a probe is in flight the UI shows only a "probing" skeleton and **does not prematurely declare the build locked**), **locked** (the server states it is unavailable).
+
+**Evidence level of Codex APP approvals (reported as-is)**: **command approvals** have real-machine evidence (accept/decline closure on `26.1013.4894.0` + the pending shape on `26.1016.6573.0`); **file approvals** currently have **official method-table / call-site** evidence only — **not yet closed end-to-end on a real machine**.
+
+**Mobile remote control (v0.5.0, experimental)**: message viewing and file preview cover 7 of the 8 tools (OpenClaw's black-box build is not remotely readable yet); **sending messages to CLI sessions and creating sessions from your phone are experimental**, currently supporting Claude Code / Codex CLI / OpenCode / Kimi Code. Messages are injected as keystrokes into the terminal and verified by screen-reading receipts (no false "delivered"); queueing, interrupt-and-jump, remote approvals, question answering, permission-mode switching, and session creation are included. See the Chinese README for illustrated walkthroughs and per-tool limitations.
+
+---
+
+## Tech Stack
+
+| Layer              | Technology                                                                               |
+| ------------------ | ---------------------------------------------------------------------------------------- |
+| Desktop Framework  | [Tauri v2](https://v2.tauri.app/) (Rust)                                                 |
+| Frontend           | [React 19](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/)           |
+| UI Components      | [shadcn/ui](https://ui.shadcn.com/) (Radix UI)                                           |
+| Styling            | [Tailwind CSS v4](https://tailwindcss.com/)                                              |
+| State Management   | [Zustand](https://zustand-demo.pmnd.rs/)                                                 |
+| i18n               | [i18next](https://www.i18next.com/) (Chinese / English)                                  |
+| Database           | [SQLite](https://www.sqlite.org/) (via [rusqlite](https://github.com/rusqlite/rusqlite)) |
+| Process Monitoring | [sysinfo](https://github.com/GuillaumeGomez/sysinfo)                                     |
+
+## Architecture
 
 ```
 src-tauri/src/
-├── adapter/           # Agent 适配器 trait + 各工具实现
-│   ├── claude.rs      #   Claude Code（JSONL + Hook）
-│   ├── codex.rs       #   Codex CLI/APP（JSONL + Hook）
-│   ├── opencode.rs    #   OpenCode（SQLite）
-│   ├── openclaw.rs    #   OpenClaw（state.json）
-│   ├── kimi.rs        #   Kimi Code（session_index + wire.jsonl）
-│   ├── workbuddy.rs   #   WorkBuddy（心跳驱动 + JSONL）
-│   ├── zcode.rs       #   ZCode（宿主判定 + SQLite 会话聚合）
-│   ├── dsh.rs         #   dsh（web 宿主 + zstd 多帧日志）
-│   └── mod.rs         #   AgentAdapter trait + 工具注册表 + 会话发现调度器
+├── adapter/           # Agent adapter trait + per-tool implementations
+│   ├── claude.rs      #   Claude Code (JSONL + Hook)
+│   ├── codex.rs       #   Codex CLI/APP (JSONL + Hook)
+│   ├── opencode.rs    #   OpenCode (SQLite)
+│   ├── openclaw.rs    #   OpenClaw (state.json)
+│   ├── kimi.rs        #   Kimi Code (session_index + wire.jsonl)
+│   ├── workbuddy.rs   #   WorkBuddy (heartbeat-driven + JSONL)
+│   ├── zcode.rs       #   ZCode (host detection + SQLite session aggregation)
+│   ├── dsh.rs         #   dsh (web host + zstd multi-frame logs)
+│   └── mod.rs         #   AgentAdapter trait + tool registry + session discovery scheduler
 ├── monitor/
-│   ├── process.rs     #   进程发现（sysinfo 扫描）
-│   ├── claude_parser.rs   # Claude 解析器（message.role 协议）
-│   ├── codex_parser.rs    # Codex 解析器（rollout JSONL 协议）
-│   ├── opencode_parser.rs # OpenCode SQLite 解析器
-│   ├── openclaw_parser.rs # OpenClaw state.json 解析器
-│   ├── kimi_parser.rs     # Kimi Code 解析器（session_index + wire.jsonl）
-│   ├── workbuddy_parser.rs # WorkBuddy 解析器（心跳 + JSONL 尾部推导）
-│   ├── zcode_parser.rs    # ZCode 解析器（tasks-index + session/message/part 双 SQLite）
-│   ├── dsh/           #   dsh 解析器（projcache + zstd 多帧日志 + 状态/预览五模块）
-│   ├── jsonl.rs       #   JSONL 读取公共件（尾部读取、文件枚举）
-│   ├── cwd.rs         #   cwd 归一化（进程 ↔ 会话匹配公共设施）
-│   ├── git.rs         #   GitHub URL 查询（进程内缓存）
-│   ├── path_codec.rs  #   Claude projects 目录名编解码
-│   ├── project.rs     #   项目名提取与 cwd 形态校验
-│   ├── status.rs      #   纯消息状态判定
-│   └── hooks.rs       #   Hook 注册 + 事件文件读取
-├── services/          #   业务服务（按功能域拆分）
-│   ├── skill/         #   Skill 安装/启用/禁用 + 自动导入
-│   ├── resource/      #   资源扫描、SSOT 导入、补链
-│   ├── mcp/           #   MCP 配置写入（JSON/TOML/JSONC）
-│   ├── preset/        #   预设应用/取消 + 兼容性检查
-│   ├── plugin/        #   插件管理
-│   └── manifest/      #   扩展清单校验与更新检查
+│   ├── process.rs     #   Process discovery (sysinfo scan)
+│   ├── claude_parser.rs   # Claude parser (message.role protocol)
+│   ├── codex_parser.rs    # Codex parser (rollout JSONL protocol)
+│   ├── opencode_parser.rs # OpenCode SQLite parser
+│   ├── openclaw_parser.rs # OpenClaw state.json parser
+│   ├── kimi_parser.rs     # Kimi Code parser (session_index + wire.jsonl)
+│   ├── workbuddy_parser.rs # WorkBuddy parser (heartbeat + JSONL tail)
+│   ├── zcode_parser.rs    # ZCode parser (tasks-index + session/message/part dual SQLite)
+│   ├── dsh/           #   dsh parser (projcache + zstd logs + status/preview, 5 modules)
+│   ├── jsonl.rs       #   Shared JSONL reading (tail read, file enumeration)
+│   ├── cwd.rs         #   cwd normalization (process ↔ session matching)
+│   ├── git.rs         #   GitHub URL lookup (in-process cache)
+│   ├── path_codec.rs  #   Claude projects dir-name codec
+│   ├── project.rs     #   Project name extraction + cwd shape validation
+│   ├── status.rs      #   Pure-message status determination
+│   └── hooks.rs       #   Hook registration + event file reader
+├── services/          #   Business services split by domain
+│   ├── skill/         #   Skill install/enable/disable + auto-import
+│   ├── resource/      #   Resource scan, SSOT import, link sync
+│   ├── mcp/           #   MCP config writer (JSON/TOML/JSONC)
+│   ├── preset/        #   Preset apply/deactivate + compatibility check
+│   ├── plugin/        #   Plugin management
+│   └── manifest/      #   Extension manifest validation + update check
 ├── linker/
-│   ├── mod.rs         #   符号链接/交接点管理 + 安全检查
-│   ├── detector.rs    #   工具安装检测
-│   ├── layer2.rs      #   Layer 2 工具级激活目录
-│   └── layer3.rs      #   Layer 3 子 Agent 级激活目录
-├── commands/          #   按模块拆分的 Tauri IPC 命令
-├── database/          #   SQLite 数据层（schema/migration/dao）
-├── session/           #   会话模型 + 状态枚举
-├── window/            #   终端聚焦（iTerm2/Terminal.app/tmux）
+│   ├── mod.rs         #   Symlink/Junction management + security checks
+│   ├── detector.rs    #   Tool installation detection
+│   ├── layer2.rs      #   Layer 2 tool-level active directory
+│   └── layer3.rs      #   Layer 3 sub-agent-level active directory
+├── commands/          #   Tauri IPC commands split by module
+├── database/          #   SQLite data layer (schema/migration/dao)
+├── session/           #   Session model + status enum
+├── window/            #   Terminal focus (iTerm2 / Terminal.app / tmux)
 ├── plugins/
-│   └── system_tray.rs #   系统托盘（状态 + 预设菜单）
-└── lib.rs             #   应用入口 + 插件注册
+│   └── system_tray.rs #   System tray with status + preset menu
+└── lib.rs             #   App entry + plugin registration
 
 src/
-├── pages/             #   首页 / 设置 / 关于
+├── pages/             #   Home / Settings / About
 ├── components/
-│   ├── SessionCard.tsx #   带状态灯的会话卡片
-│   ├── SessionGrid.tsx #   看板网格
-│   ├── ExtensionList.tsx # 双视图（按分类/按工具）资源管理
-│   ├── ResourceByKindView.tsx # Skill/MCP/Plugin 三栏视图
-│   ├── ResourceByToolView.tsx # 四工具卡片视图
-│   ├── ImportDialog.tsx  #   原生资源扫描与导入
-│   ├── CompatibilityDialog.tsx # 预设兼容性检查
-│   ├── PresetList.tsx  #   预设组增删改查
-│   └── ui/            #   shadcn/ui 基础组件
+│   ├── SessionCard.tsx #   Session card with status light
+│   ├── SessionGrid.tsx #   Dashboard grid
+│   ├── ExtensionList.tsx # Dual-view (byKind/byTool) resource management
+│   ├── ResourceByKindView.tsx # Skills/MCP/Plugins three-section view
+│   ├── ResourceByToolView.tsx # Four-tool card view
+│   ├── ImportDialog.tsx  #   Native resource scan & import
+│   ├── CompatibilityDialog.tsx # Preset compatibility check
+│   ├── PresetList.tsx  #   Preset group CRUD
+│   └── ui/            #   shadcn/ui primitives
 ├── hooks/             #   useSessions, useNotification, useUpdater
-├── stores/            #   Zustand 会话存储
-├── lib/               #   音频、快捷键、更新器、窗口工具
-├── i18n/              #   中文 + 英文语言包
-└── types/             #   TypeScript 类型定义
+├── stores/            #   Zustand session store
+├── lib/               #   Audio, shortcut, updater, window utils
+├── i18n/              #   Chinese + English locales
+└── types/             #   TypeScript type definitions
 ```
 
 ---
 
-## 快速开始
+## Getting Started
 
-### 环境要求
+### Prerequisites
 
 - [Node.js](https://nodejs.org/) ≥ 18
 - [pnpm](https://pnpm.io/) ≥ 8
 - [Rust](https://www.rust-lang.org/tools/install) ≥ 1.77
 - [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)
 
-### 安装与运行
+### Install & Run
 
 ```bash
-# 克隆仓库
+# Clone the repository
 git clone https://github.com/jarvislee90s-dot/tuvis.git
 cd tuvis
 
-# 安装前端依赖
+# Install frontend dependencies
 pnpm install
 
-# 启动开发模式
+# Start development mode
 pnpm tauri:dev
 ```
 
-> **macOS 开发版提示**：开发版（未签名打包）首次使用「一键恢复会话」开窗前，需在
-> **系统设置 > 隐私与安全性 > 自动化** 中手动允许 兔维斯 控制
-> Terminal / iTerm2 一次（TCC 不会自动弹窗）。未授权时 osascript 以 -1743 失败，
-> resume 会回执「macOS 自动化授权缺失」并给出该指引。
-
-### 构建
+### Build
 
 ```bash
-# 构建发布版（Windows NSIS 安装包）
+# Build release binary (Windows NSIS installer)
 pnpm tauri:build
 ```
 
-> **helper 构建门（批次丙 T2 固化）**：`tuvis-hook-listener`（hook 事件监听 helper）
-> 与 `tuvis-marker`（窗口标题标记）都挂在 Cargo `required-features` 门后——**不带
-> feature 时根本不构建**，应用启动的 `ensure_hook_script` 就找不到同目录 helper、
-> 跳过安装，`~/.tuvis/bin/` 里那份永远是旧构建（实测故障：事件缺 `tool_name` 载荷 →
-> 问答卡通道 A 永不识别）。
->
-> - `pnpm tauri:dev` / `pnpm tauri:build` **已内置 feature**（`hook-listener` 与
->   `marker-helper`，后者蕴含前者），照常用即可；
-> - 单独构建 helper（如跑实机 `#[ignore]` 测试）必须显式带上：
->   `cd src-tauri && cargo build --bin tuvis-hook-listener --features hook-listener`；
-> - 跑 bin 测试同理：`cargo test --bin tuvis-hook-listener --features hook-listener`；
-> - macOS 打包（`release:macos` / release.yml 的 macOS job）走的是裸
->   `pnpm tauri build` 显式参数，**不受**上述 npm script 影响——额外 bin 会令
->   universal 打包失败，故 macOS 侧有意不带 feature（helper 为 Windows 通道）。
-
-### 代码检查与格式化
+### Lint & Format
 
 ```bash
 pnpm check        # format:check + lint + build
-pnpm format       # Prettier 自动格式化
-pnpm lint         # ESLint 检查
-pnpm lint:fix     # ESLint 自动修复
+pnpm format       # auto-format with Prettier
+pnpm lint         # ESLint check
+pnpm lint:fix     # ESLint auto-fix
 ```
 
 ---
 
-## 配置
+## Configuration
 
-应用数据存储在 `~/.tuvis/`：
+The app stores its data in `~/.tuvis/`:
 
-| 路径                            | 用途                                        |
-| ------------------------------- | ------------------------------------------- |
-| `~/.tuvis/tuvis.db`             | SQLite 数据库（设置、扩展、预设、会话缓存） |
-| `~/.tuvis/skills/`              | 全局 Skill 仓库                             |
-| `~/.tuvis/mcp/`                 | 全局 MCP 服务器配置                         |
-| `~/.tuvis/hooks/status-hook.sh` | 共享 Hook 脚本（状态事件）                  |
-| `~/.tuvis/events/`              | Hook 事件文件（自动清理，30 秒 TTL）        |
+| Path                            | Purpose                                                        |
+| ------------------------------- | -------------------------------------------------------------- |
+| `~/.tuvis/tuvis.db`             | SQLite database (settings, extensions, presets, session cache) |
+| `~/.tuvis/skills/`              | Global skill repository                                        |
+| `~/.tuvis/mcp/`                 | Global MCP server configs                                      |
+| `~/.tuvis/hooks/status-hook.sh` | Shared Hook script for status events                           |
+| `~/.tuvis/events/`              | Hook event files (auto-cleaned, 30s TTL)                       |
 
-### 各工具配置支持
+### Supported Tool Configs
 
-| 工具        | Skill 目录                   | MCP 配置                           | MCP 格式                       | Hook 支持                                  |
-| ----------- | ---------------------------- | ---------------------------------- | ------------------------------ | ------------------------------------------ |
-| Claude Code | `~/.claude/skills/`          | `~/.claude.json`                   | JSON                           | ✅（PascalCase）                           |
-| Codex CLI   | `~/.codex/skills/`           | `~/.codex/config.toml`             | TOML                           | ✅（PascalCase）                           |
-| OpenCode    | `~/.config/opencode/skills/` | `~/.config/opencode/opencode.json` | JSONC                          | ❌                                         |
-| OpenClaw    | `~/.openclaw/skills/`        | `~/.openclaw/openclaw.json`        | JSON                           | ❌                                         |
-| Kimi Code   | `~/.kimi-code/skills/`       | `~/.kimi-code/mcp.json`            | JSON                           | ✅（PermissionRequest / PermissionResult） |
-| WorkBuddy   | `~/.workbuddy/skills/`       | `~/.workbuddy/mcp.json`            | JSON                           | ❌（状态经心跳 + JSONL 推导）              |
-| ZCode       | `~/.zcode/skills/`           | `~/.zcode/cli/config.json`         | JSON（`mcp.servers` 嵌套子树） | ❌（状态经 SQLite 消息流尾部推导）         |
-| dsh         | ◐ 只读接入 + 启停            | N/A（探测不支持）                  | N/A                            | ❌（状态经 lock 交叉判定 + 事件流推导）    |
+| Tool        | Skill Directory              | MCP Config                         | MCP Format                          | Hook Support                                             |
+| ----------- | ---------------------------- | ---------------------------------- | ----------------------------------- | -------------------------------------------------------- |
+| Claude Code | `~/.claude/skills/`          | `~/.claude.json`                   | JSON                                | ✅ (PascalCase)                                          |
+| Codex CLI   | `~/.codex/skills/`           | `~/.codex/config.toml`             | TOML                                | ✅ (camelCase)                                           |
+| OpenCode    | `~/.config/opencode/skills/` | `~/.config/opencode/opencode.json` | JSONC                               | ❌                                                       |
+| OpenClaw    | `~/.openclaw/skills/`        | N/A                                | N/A                                 | ❌                                                       |
+| Kimi Code   | `~/.kimi-code/skills/`       | `~/.kimi-code/mcp.json`            | JSON                                | ❌ (status parsed from wire)                             |
+| WorkBuddy   | `~/.workbuddy/skills/`       | `~/.workbuddy/mcp.json`            | JSON                                | ❌ (status derived from heartbeat + JSONL)               |
+| ZCode       | `~/.zcode/skills/`           | `~/.zcode/cli/config.json`         | JSON (nested `mcp.servers` subtree) | ❌ (status derived from SQLite message-stream tail)      |
+| dsh         | `~/.dsh/skills/`             | N/A (probed unsupported)           | N/A                                 | ❌ (status derived from lock cross-check + event stream) |
 
-> 注：`~/.agents/skills/` 是 Agent Skills 开放标准的跨工具共享目录（codex / zcode 等直接读取）。兔维斯 对 codex 的 skill 激活目录为私有 `~/.codex/skills/`；`.agents` 仅作只读共享导入源（来源标签 `agents-shared`）——兔维斯 扫描入库、不归属工具、不建链；除一次性迁移 兔维斯 自建遗留链接外，永不写入该目录。
-
-### Kimi Code 数据目录重定向
-
-Kimi Code 支持 `KIMI_CODE_HOME` 环境变量重定向数据根（默认 `~/.kimi-code`，早期版本为 `~/.kimi`，应用会自动回退）。注意本应用读取的是**自身 GUI 进程**的环境变量：
-
-- macOS 从 Dock / Spotlight 启动的应用**不继承** shell 配置（`.zshrc` 等）中的 `export KIMI_CODE_HOME=...`；
-- 需要 GUI 侧生效时，可执行 `launchctl setenv KIMI_CODE_HOME <路径>` 后重启本应用，或直接为用户设置全局级环境变量。
+> Note: `~/.agents/skills/` is the cross-tool shared directory of the Agent Skills open standard (read directly by codex / zcode and other compliant tools). Tuvis's skill activation directory for codex is the private `~/.codex/skills/`; `.agents` serves only as a read-only shared import source (source label `agents-shared`) — Tuvis scans it into the repository, with no tool attribution, no linking, and never writes to it (sole exception: one-time migration of Tuvis-created legacy links).
 
 ---
 
-## 路线图
+## Roadmap
 
-- [x] US1 — 多工具会话监控看板
-- [x] US2 — 状态变更通知与提示音
-- [x] US3 — 终端快速跳转（iTerm2/Terminal.app/tmux）
-- [x] US4 — Skill/MCP/Plugin 统一仓库管理
-- [x] US5 — 预设组一键切换
-- [x] US6 — 子 Agent 级资源分配
-- [x] 资源看板重设计（双视图 + 导入 + 兼容性）
-- [x] OpenClaw 支持（第四工具）
-- [x] Kimi Code 支持（第五工具：会话监控 + MCP 管理 + `KIMI_CODE_HOME` 数据目录重定向）
-- [x] WorkBuddy 支持（第六工具：心跳驱动监控 + 深度链接跳转 + 资源管理）
-- [x] ZCode 支持（第七工具：SQLite 会话聚合监控 + 子代理活跃度仲裁 + 唯一窗口聚焦跳转 + Skill/MCP 资源管理）
-- [x] dsh 支持（第八工具：web 宿主监控 + zstd 多帧日志解析 + 三色状态 + 浏览器标签跳转 + Skill 只读接入）
-- [x] Foxbell 桌宠（状态卡片 + 语音提醒 + 拖拽物理）
-- [x] 外部桌宠开放（本地/Petdex 导入 + 管理面板热切换 + 能力门控）
-- [x] 工具勾选管理（批量保存 + 还原/重建 + 彻底隐藏）
-- [x] APP 类工具会话卡与深度链接跳转
-- [x] 插件管理（文件/配置混合）
-- [x] i18n（中文 + English）
-- [x] GitHub Releases 自动更新（v0.5.1 重做：prerelease 渠道 + 忽略本版本 + 标题栏升级徽标）
-- [x] 暗色/亮色主题跟随系统
-- [x] Windows 支持（NSIS 安装包 + 深度链接 + 近祖窗口聚焦）
-- [x] 远程操控二期（v0.5.0 · 试验性）——手机端发消息/排队插队/远程审批/问答/权限切换（Claude Code / Codex CLI / Kimi Code / OpenCode）
-- [x] 移动端历史会话区（登记制归档 + 重新激活闭环）
-- [x] 远程接入 · 外部域名（免域名）固定地址通道（Tailscale 一键引导开通 + 公网侧可达性校验 + 开机自动恢复；本机访问不再免密）
-- [x] 外部域名向导 Windows 实测收口（v0.5.1）——Tailscale CLI 自定义路径查找治本 + 登录步主动递授权链接（不代登录）
-- [x] Token 用量看板（阶段① 采集底座与账本 + 阶段② 设置分区 / 桌宠迷你条呈现；口径说明见「Token 用量看板」一节）
-- [x] 子 Agent 观察台（移动端：会话运行 chip + 子 Agent 看板 + 执行过程详情）
-- [x] 开机自动启动（设置页 + 托盘双入口；真值源 = 操作系统侧状态实时读，不落本地缓存）
-- [x] 看板按工具筛选（桌面端 8 工具 chips 单选 + 本地记忆，与移动端同口径）
-- [ ] Linux 支持
-- [ ] Kitty & WezTerm 终端跳转支持
-
----
-
-## 写在 v0.5.1
-
-这仍然是一个比较早期的版本。远程操控的键序注入链路（注入 → 屏读 → 回执）已用四个工具逐键实测打磨；v0.5.1 又把外部域名（免域名）向导在 Windows 上从零端到端走了一遍，实测暴露的缺口（自定义安装路径查找、登录授权链接）全部修掉。但终端形态千变万化，边缘场景一定还有没踩到的坑。
-
-希望更多朋友能体验「人离开桌面，Agent 不停工」——看板上的红绿灯在手机里跳动，批准一次计划只需一次点击。**使用中遇到任何问题，欢迎直接提 [Issue](https://github.com/jarvislee90s-dot/tuvis/issues)**（附终端工具与版本号），我们会尽量远程响应大家的需求。
+- [x] US1 — Multi-tool session monitoring dashboard
+- [x] US2 — Status change notifications & sound alerts
+- [x] US3 — Quick terminal jump (iTerm2/Terminal.app/tmux)
+- [x] US4 — Skill/MCP/Plugin unified repository management
+- [x] US5 — Preset group one-click switching
+- [x] US6 — Sub-agent level resource allocation
+- [x] Resource dashboard redesign (dual-view + import + compatibility)
+- [x] OpenClaw support (4th tool)
+- [x] Kimi Code support (5th tool: session monitoring + MCP management + `KIMI_CODE_HOME` data directory redirection)
+- [x] WorkBuddy support (6th tool: heartbeat-driven monitoring + deep-link jumps + resource management)
+- [x] ZCode support (7th tool: SQLite session-aggregate monitoring + subagent-activity arbitration + workspace deep-link jumps + skill/MCP resource management)
+- [x] dsh support (8th tool: web-host monitoring + zstd multi-frame log parsing + tri-color status + browser-tab jumps + read-only skill access)
+- [x] Foxbell desktop pet (status cards + voice alerts + drag physics)
+- [x] External pets (local/Petdex import + manage panel hot swap + capability gating)
+- [x] Tool toggle management (batch save + restore/rebuild + full hiding)
+- [x] APP-form session cards and deep-link jumps
+- [x] Plugin management (file/config hybrid)
+- [x] i18n (Chinese + English)
+- [x] Auto-update via GitHub Releases (redone in v0.5.1: prerelease channel + ignore-this-version + title-bar upgrade badge)
+- [x] Dark/light theme sync with system
+- [x] Windows support (NSIS installer + deep links + nearest-ancestor window focus)
+- [x] Remote control phase 2 (v0.5.0, experimental) — send messages / queue & jump the queue / remote approvals / Q&A / permission switching from your phone (Claude Code / Codex CLI / Kimi Code / OpenCode)
+- [x] Mobile archived history (registry-based archiving + reactivation loop)
+- [x] Remote access · External domain (no domain needed) fixed-address channel (one-click Tailscale onboarding + public-side reachability verification + automatic recovery on boot; access from this computer now requires the PIN)
+- [x] External-domain wizard validated on Windows (v0.5.1) — custom Tailscale CLI path lookup fixed at the root + the login step hands you the authorization link (never logs in for you)
+- [x] Token usage dashboard (phase 1 collection substrate & ledger + phase 2 settings section / pet mini-bar; see the "Token Usage Dashboard" section for the exact accounting rules)
+- [x] Mobile sub-agent observatory (running-session chip + sub-agent board + execution detail)
+- [x] Launch at login (Settings + tray entries; source of truth = live OS-side state, no local cache)
+- [x] Board filtering by tool (desktop 7-tool chips + local memory, same semantics as mobile)
+- [ ] Linux support
+- [ ] Kitty & WezTerm terminal jump support
 
 ---
 
-## 参与贡献
+## Contributing
 
-欢迎提交 Pull Request！
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-1. Fork 本仓库
-2. 创建功能分支（`git checkout -b feature/amazing-feature`）
-3. 提交更改（`git commit -m 'feat: add amazing feature'`）
-4. 推送到分支（`git push origin feature/amazing-feature`）
-5. 打开 Pull Request
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'feat: add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
-请阅读 [AGENTS.md](AGENTS.md) 了解项目架构与开发规范。
-
----
-
-## 许可证
-
-本项目采用 MIT 许可证 —— 详见 [LICENSE](LICENSE) 文件。
+Please read [AGENTS.md](AGENTS.md) for project architecture and development guidelines.
 
 ---
 
-## 二次开发指引
+## License
 
-欢迎 fork 与二次开发。按 MIT 许可证的要求，分发衍生版本时请保留原版权声明与许可证文本；在此基础上，欢迎（非强制）在项目说明中注明"基于兔维斯（Tuvis）二次开发"并回链本仓库，帮助用户识别上游。品牌名称与 Logo 的使用边界见 [TRADEMARK.md](TRADEMARK.md)。改进欢迎以 PR 形式回馈上游，让你的成果随主线一起演进。
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
+---
+
+## Forking & Derivative Works
+
+Forks and derivative projects are welcome. As required by the MIT License, please retain the original copyright notice and license text when redistributing. On top of that, you are welcome (but not obliged) to note "based on Tuvis" in your project description with a link back to this repository, so users can identify the upstream. See [TRADEMARK.md](TRADEMARK.md) for the boundaries on using the brand name and logo. Improvements are best contributed back upstream via PR, so your work evolves with the mainline.
 
 ---
 
-## 商标与非官方声明
+## Trademarks & Non-Affiliation
 
-兔维斯 是一个独立的开源项目，与 Anthropic（Claude / Claude Code）、OpenAI（Codex / ChatGPT）、OpenCode、OpenClaw、月之暗面（Kimi Code）、WorkBuddy、ZCode、dsh 及本仓库提及的其他任何公司或产品均无关联、未获其背书或赞助。文中出现的名称与商标归其各自所有者所有，仅用于描述兼容性（名词性合理使用）。应用内图标为原创设计，部分配色仅用于辨识对应工具，不代表任何官方身份。
+Tuvis is an independent, open-source project. It is not affiliated with, endorsed by, or sponsored by Anthropic (Claude / Claude Code), OpenAI (Codex / ChatGPT), OpenCode, OpenClaw, Moonshot AI (Kimi Code), WorkBuddy, ZCode, dsh, or any other company or product mentioned in this repository. All product names, logos, and brands are the property of their respective owners; they are used here solely to describe compatibility (nominative fair use). Icons in this app are original designs; some color schemes are used only to help identify the corresponding tool and do not imply any official status.
 
-## 官方渠道
+## Official Channels
 
-本项目唯一的官方发布渠道是本仓库的 [GitHub Releases](../../releases)。任何其他网站或渠道提供的下载均为第三方分发，请自行甄别风险。品牌使用规范见 [TRADEMARK.md](TRADEMARK.md)。
----
-
-## 多终端能力矩阵（总表，随版本随时更新）
-
-13 行能力 × 8 个终端（✅ 支持 / ◐ 部分 / 🧪 试验性 / ❌ 不支持）——本表为能力总表，每次发版随功能增删更新（结构化源：[`docs/capabilities.json`](docs/capabilities.json)，与官网同源）：
-
-| 能力                   | Claude Code | Codex CLI | OpenCode | OpenClaw | Kimi Code | WorkBuddy | ZCode        | dsh    |
-| ---------------------- | ----------- | --------- | -------- | -------- | --------- | --------- | ------------ | ------ |
-| 会话监控（红绿灯）     | ✅          | ✅        | ✅       | ✅       | ✅        | ✅        | ✅           | ✅     |
-| 本机桌面通知           | ✅          | ✅        | ✅       | ✅       | ✅        | ✅        | ✅           | ✅     |
-| Skill 管理             | ✅          | ✅        | ✅       | ✅       | ✅        | ✅        | ✅           | ◐ 只读 |
-| MCP 管理               | ✅ JSON     | ✅ TOML   | ✅ JSONC | ✅ JSON  | ✅ JSON   | ✅ JSON   | ✅ JSON 子树 | ❌     |
-| 插件管理               | ✅          | ✅        | ✅       | ✅       | ◐ 文件型  | ❌        | ❌           | ❌     |
-| 状态 Hook              | ✅          | ✅        | ❌       | ❌       | ✅        | ❌        | ❌           | ❌     |
-| 手机 · 消息查看        | ✅          | ✅        | ✅       | ❌       | ✅        | ✅        | ✅           | ✅     |
-| 手机 · 文件预览        | ✅          | ✅        | ✅       | ❌       | ✅        | ✅        | ✅           | ✅     |
-| 手机 · 发消息（注入）  | 🧪          | 🧪        | 🧪       | ❌       | 🧪        | ❌        | ❌           | ❌     |
-| 手机 · 新建会话        | 🧪          | 🧪        | 🧪       | ❌       | 🧪        | ❌        | ❌           | ❌     |
-| Token 用量采集         | ✅          | ✅        | ✅       | ❌       | ✅        | ✅        | ✅           | ✅     |
-| 手机 · 子 Agent 观察台 | ✅          | ❌        | ❌       | ❌       | ❌        | ❌        | ❌           | ❌     |
-| 手机 · Codex APP 远程控制（Desktop IPC） | ❌ | 🧪 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-
-**Codex APP 远程控制（v0.6.0，实验性）**：仅 Codex 一家、按精确 Desktop build 解锁（Windows 26.1013.4894.0：发送/状态/command 审批/Plan 阻塞问答；permissions 关闭；macOS 26.1013.40934：发送/状态）。正文中的可识别文件路径可打开预览；文件池显示上传／引用图片、生成图、已修改和已查看文件并标注来源，文件项可跳回最近一次正文引用（当前尾窗及最多四页、每页 50 条）。未解锁能力如实拒绝，不伪造审批或空会话；预览读取当前文件，不保存历史版本。真实手机主路径与双平台 PRODUCT 验收仍未全部完成，详见 `docs/superpowers/reviews/2026-10-20-codex-app-product-acceptance.md`。
-
-**Codex APP 远程控制的三态徽标（移动端）**：能力按三态如实呈现，不按「理论上支持」吹嘘——**已验证**（该 Desktop build 有真机证据：可控制 / 可发送）、**兼容探测（实验）**（未知 build：读链已取证但写未开放，或只剩兼容发送路径）、**未解锁**（服务端明确判不可用）。未知 build 的兼容路径是**实验**能力：兔维斯先对该 build 做一次**只读探测**（服务端 15 秒硬上限），探测未通过前不开放写操作；探测在飞时界面只显示「探测中」骨架，**不提前下「未解锁」的定论**。兼容发送需在电脑端设置页显式打开「**兼容发送（实验）**」开关（默认关；未打开时如实拒发）。
-
-**Codex APP 审批能力的证据等级（如实呈报）**：**命令审批**已有真机证据（`26.1013.4894.0` 的 accept/decline 闭环 + `26.1016.6573.0` 的 pending 形状）；**文件审批**目前只有**官方方法表 / 调用点**证据，**端到端尚未真机闭环**。
-
-
-**手机操控**：消息查看与文件预览覆盖 7 家（OpenClaw 为黑盒形态暂不支持远程查看）；**发消息（注入）与新建会话处于试验阶段**，目前支持 Claude Code / Codex CLI / OpenCode / Kimi Code 四家。OpenClaw / WorkBuddy 为黑盒形态（无外部写通道）、ZCode 预留无头通道、dsh 写通道另评——工具差异如实呈现，不假装统一。
-
-**四个可注入终端的现状与不足（如实呈报）**：
-
-- **Claude Code**：忙时消息排队不丢；「立即发送」= Esc 打断 + 队列整批取出开新回合；撤回窗口保护（输入行有残留时拒绝投递并如实回报）；**计划批准卡**（批准等待红灯 + 数字键直达 + 批准后计划反馈条）；问答多题 ←/→ 双向切题 + 多选自由作答（已写入后可**编辑/覆盖写入/清空**）；多选问题面板不再被误读为审批卡（复选框守卫 + 审批键禁用）。
-- **Codex CLI**：Tab 进原生队列（不打断当前回合）、Esc 插队打断、Ctrl+C 撤回排队消息；问答支持备注栏（Tab 展开/清空，**终端 note 行屏读同步回输入框**）+ 多选自由作答；**模式/权限远程切换**——模式计划↔操作 chips 直选（当前档高亮）、权限四档直选（含 Full Access 二次确认），切换结果以终端屏读为准。不足：多题切页键未实测（多题切题引导终端完成）。
-- **Kimi Code**：忙时排队回合结束自动续发；权限三档**两段式**切换（开菜单屏读确认高亮）+ 底栏模式/权限双轴回读；**2.1.1 问卷全链**——Other 自由作答（编辑/覆盖写入/清空）、多选勾选、单选自动推进 + 落点校验（n 题选完必落 n+1）、切题 ←/→、确认卡摘要以终端 Review 页屏读为准。不足：审批数字选择禁用（与菜单键冲突，改走导航）；`Ctrl+S` 立即引导未产品化。
-- **OpenCode**：问答 enter / 数字切换选择 + 单选/多选**自由作答**（覆盖写入/清空、单选自愈送达）；◀/▶ 双向切题；Esc 打断插队；2.x 双 schema 会话发现。不足：Ctrl+C 全局禁用（会直接退出 opencode 应用）。
-
----
+The only official distribution channel for this project is the [GitHub Releases](../../releases) page of this repository. Downloads offered anywhere else are third-party redistribution. See [TRADEMARK.md](TRADEMARK.md) for brand usage guidelines.

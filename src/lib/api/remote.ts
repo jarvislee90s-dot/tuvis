@@ -49,6 +49,10 @@ export type RemoteChannels = {
     error: string | null;
     /** M5 P2-c：最近一次解析成功的地址（KV remote.named_addr_last） */
     lastAddr?: string | null;
+    connected?: boolean;
+    configKey?: string;
+    reach?: TsReachability;
+    waiting?: RemoteReachWaiting | null;
   };
   // §C1 Tailscale 固定网址通道（Task 5 只加类型，卡片在 Task 9）：
   // 形状与隧道通道同构；address = 机器域名看板地址（https://<机器名>.<尾网>.ts.net/m）；
@@ -62,6 +66,8 @@ export type RemoteChannels = {
     address: string | null;
     error: string | null;
     reach: TsReachability;
+    configKey?: string;
+    waiting?: RemoteReachWaiting | null;
   };
 };
 
@@ -79,6 +85,32 @@ export type TsReachability =
   | { state: "record_pending"; republish: boolean }
   | { state: "recovering" }
   | { state: "failed"; reason: string };
+
+/** 复验在途（2026-10-22 四卡统一）：尚无结论且系统仍在推进——未验证 / 等公网 DNS /
+ *  校验中。verified 有绿摘要，failed/recovering 各有自己的台词，都不算在途。
+ *  Tailscale / 自有域名两套向导的「正在自动复验」提示共用此判据。 */
+export const reachChecking = (reach: TsReachability): boolean =>
+  reach.state === "unverified" || reach.state === "record_pending" || reach.state === "verifying";
+
+/** DNS/公网传播等待元数据。startedAtMs 由服务端给出，前端只负责显示经过时长。 */
+export type RemoteReachWaiting = {
+  startedAtMs: number;
+  expectedSeconds: number | null;
+};
+
+/** 自有域名向导快照。running 只代表进程存活，connected 才代表 Cloudflare 已注册连接。 */
+export type NamedWizardProbe = {
+  configKey: string;
+  hasToken: boolean;
+  enabled: boolean;
+  running: boolean;
+  connected: boolean;
+  originUrl: string;
+  address: string | null;
+  lastAddress: string | null;
+  reach: TsReachability;
+  waiting: RemoteReachWaiting | null;
+};
 
 // 命令定义于 src-tauri/src/remote/mod.rs（M5 A1-A5 已落地）
 export async function remoteStatus(): Promise<RemoteStatus> {
@@ -193,6 +225,12 @@ export type TsStepState = {
 // reach = 可达性态（**逐名枚举见上 TsReachability，不写死态数**——M6 纪律；
 // 前端据此门控头部地址展示：只有 Verified 才显示）
 export type TsWizardProbe = {
+  enabled?: boolean;
+  configKey?: string;
+  waiting?: RemoteReachWaiting | null;
+  installerPath: string | null;
+  downloadUrl: string | null;
+  installerReady: boolean;
   platform: "mac" | "windows" | "other";
   windowsVerified: boolean;
   /** I-3：实测覆盖从哪一步起（非 Windows 平台为 null） */
@@ -283,9 +321,31 @@ export async function remoteTsProbe(): Promise<TsWizardProbe> {
   return await invoke<TsWizardProbe>("remote_ts_probe");
 }
 
+/** 仅定位向导提供的安装包所在目录，沿用后端目录白名单。 */
+export async function remoteTsRevealDownloads(installerPath: string): Promise<void> {
+  const parent = installerPath.replace(/[\\/][^\\/]+$/, "");
+  const path = /^[A-Za-z]:$/.test(parent) ? `${parent}\\` : parent || "/";
+  await invoke<void>("reveal_dir", { path });
+}
+
 // 幂等；需要人的步骤只做「触发+回报」，不代点。Err（如外来 serve 配置守卫拒绝、
 // 安装包校验失败）以字符串 reject 透传——调用方（TailscaleWizard）把它落到对应
 // 步骤行内的可见错误行（组件内展示，**无全局 toast**；Task 6 评审移交指针修正）
 export async function remoteTsRunStep(step: string): Promise<TsStepResult> {
   return await invoke<TsStepResult>("remote_ts_run_step", { step });
+}
+
+/** 读取自有域名向导状态；不接受任意 URL 作为网络请求目标。 */
+export async function remoteNamedProbe(): Promise<NamedWizardProbe> {
+  return await invoke<NamedWizardProbe>("remote_named_probe");
+}
+
+/** 保存经过后端规范化与校验的公网域名。 */
+export async function remoteNamedSetAddress(address: string): Promise<NamedWizardProbe> {
+  return await invoke<NamedWizardProbe>("remote_named_set_address", { address });
+}
+
+/** 只读执行一次公网看板验证。 */
+export async function remoteNamedVerify(): Promise<NamedWizardProbe> {
+  return await invoke<NamedWizardProbe>("remote_named_verify");
 }

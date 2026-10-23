@@ -12,6 +12,7 @@
 // 本组件页头仅保留 状态点/名字/back 钮（mode/onModeChange/onClose props 删除）。
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
+import i18n from "@/i18n";
 import { collapsedLabel, isProcessKind } from "./message-fold";
 import { useMessageRenderers } from "./message-render";
 import { ApiError, fetchSessionFiles, fetchSubagentMessages, type SessionMessage } from "./api";
@@ -163,7 +164,7 @@ export default function SubagentDetail({
   return (
     <section
       data-testid="subagent-detail"
-      aria-label="子 Agent 详情"
+      aria-label={i18n.t("mobile.subagent.detailAria")}
       className="flex h-full min-h-0 flex-col bg-[var(--cbg)]"
     >
       <header className="flex shrink-0 items-center gap-2 border-b border-[var(--cb)] px-3 py-2">
@@ -172,7 +173,7 @@ export default function SubagentDetail({
           <button
             type="button"
             data-testid="subagent-back"
-            aria-label="返回列表"
+            aria-label={i18n.t("mobile.subagent.backToList")}
             onClick={onBack}
             className="shrink-0 rounded-full p-1 text-[var(--mut)] hover:bg-[var(--cb)] dark:hover:bg-[var(--btnp)]"
           >
@@ -188,7 +189,11 @@ export default function SubagentDetail({
         <span className="min-w-0 flex-1 truncate text-sm font-medium text-[var(--tx)]">
           {subagentName ?? subagentId}
         </span>
-        {running && <span className="shrink-0 text-[10px] text-[var(--mut)]">实时 · 5s</span>}
+        {running && (
+          <span className="shrink-0 text-[10px] text-[var(--mut)]">
+            {i18n.t("mobile.subagent.liveTicker")}
+          </span>
+        )}
         {/* S5 唯一实例裁决：布局切换器与关闭钮在顶栏 sheet bar，本页头不再渲染 */}
       </header>
 
@@ -203,7 +208,7 @@ export default function SubagentDetail({
             data-testid="subagent-detail-unsupported"
             className="py-12 text-center text-sm text-[var(--mut)]"
           >
-            该工具暂不支持查看详情（子 Agent 清单照常）
+            {i18n.t("mobile.subagent.unsupported")}
           </p>
         ) : error ? (
           <div className="py-12 text-center">
@@ -211,7 +216,9 @@ export default function SubagentDetail({
               data-testid="subagent-detail-error"
               className="mb-3 text-sm text-rose-600 dark:text-rose-400"
             >
-              {error.status === 404 ? "无法读取该子 agent 内容" : "加载失败，请检查网络后重试"}
+              {i18n.t(
+                error.status === 404 ? "mobile.subagent.error404" : "mobile.subagent.errorGeneric"
+              )}
             </p>
             {/* M3 评审修复：定格快照（running=false）遇到临时失败（网络闪断）此前
                 是死局——补一发手动重试（bump retryTick 单发重拉，不引入轮询） */}
@@ -221,17 +228,19 @@ export default function SubagentDetail({
               onClick={() => setRetryTick((t) => t + 1)}
               className="rounded-full bg-[var(--cb)] px-4 py-1.5 text-sm text-[var(--tx)]"
             >
-              重试
+              {i18n.t("mobile.subagent.retry")}
             </button>
           </div>
         ) : messages === null ? (
-          <p className="py-12 text-center text-sm text-[var(--mut)]">加载中…</p>
+          <p className="py-12 text-center text-sm text-[var(--mut)]">
+            {i18n.t("mobile.detail.loading")}
+          </p>
         ) : (
           <>
             {firstUser && (
               <div data-testid="subagent-task" className="mb-2">
                 <p className="mb-1 text-[11px] font-medium tracking-wide text-[var(--mut)] uppercase">
-                  任务原文
+                  {i18n.t("mobile.subagent.taskOriginal")}
                 </p>
                 <div
                   data-testid="subagent-task-text"

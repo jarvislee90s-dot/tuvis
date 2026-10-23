@@ -46,10 +46,9 @@ interface ApproveCardProps {
 
 /** 计划待确认条的脚注文案（丁T2）：预期态在场但后端没读到终端对话框选项——
  *  与后端 `remote/api.rs` 的降级语义同源（终端对话框可能尚未绘制/已关闭/不在
- *  Windows 可见窗口）。前端自持文案：后端在 available=true 形态下不下发 reason
- *  （reason 是 available=false 的严格档通道），故此处由前端给同义提示。 */
-const PLAN_CHECK_MISS_HINT =
-  "未读到终端对话框选项——请再点一次「检查终端对话框」，或直接在终端处理该确认";
+ *  Windows 可见窗口）。前端自持文案（M5 双语键）：后端在 available=true 形态下
+ *  不下发 reason（reason 是 available=false 的严格档通道），故此处由前端给同义提示。 */
+const PLAN_CHECK_MISS_HINT = "mobile.approve.checkMissHint";
 
 /** 裁12 折叠阈值：计划正文超过该字符数**默认折叠**（长内容不得把 composer 顶出
  *  首屏——卡体总高度上限由 max-h 封顶、长文再默认折叠，点开查看全文） */
@@ -77,7 +76,7 @@ function PlanBody({ plan }: { plan: { content: string; isFile: boolean } }) {
         }`}
       >
         <p className="mb-1 text-[11px] font-medium tracking-wide text-[var(--tx)]/80 uppercase">
-          {plan.isFile ? "计划文件" : "计划内容"}
+          {i18n.t(plan.isFile ? "mobile.approve.planFile" : "mobile.approve.planContent")}
         </p>
         {plan.isFile ? (
           <p data-testid="approve-plan-file" className="font-mono break-all">
@@ -96,7 +95,7 @@ function PlanBody({ plan }: { plan: { content: string; isFile: boolean } }) {
           onClick={() => setExpanded((v) => !v)}
           className="mt-1 text-[11px] font-medium text-[var(--tx)]/80 underline"
         >
-          {expanded ? "收起计划" : "展开全文"}
+          {i18n.t(expanded ? "mobile.approve.collapsePlan" : "mobile.approve.expandFull")}
         </button>
       )}
     </div>
@@ -287,7 +286,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
         tone="question"
         testId="approve-card"
         mode="plan-pending"
-        title="计划待确认"
+        title={i18n.t("mobile.approve.planPendingTitle")}
         footer={
           <>
             <button
@@ -297,7 +296,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
               onClick={handleCheck}
               className="mt-2 rounded-full bg-[var(--btnp)] px-3 py-1.5 text-xs font-medium text-[var(--btnpt)] hover:bg-[var(--btnp)] disabled:opacity-40"
             >
-              {checking ? "检查中…" : "检查终端对话框"}
+              {i18n.t(checking ? "mobile.approve.checking" : "mobile.approve.checkDialog")}
             </button>
             {/* 检查未命中：明示（红线 3——不假装成功）；命中则本条整个消失（走选项卡分支） */}
             {checkMissed && (
@@ -305,7 +304,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
                 data-testid="approve-plan-check-miss"
                 className="mt-1 text-xs text-amber-700 dark:text-amber-400"
               >
-                {PLAN_CHECK_MISS_HINT}
+                {i18n.t(PLAN_CHECK_MISS_HINT)}
               </p>
             )}
           </>
@@ -318,7 +317,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
             消息尾部判据（`isPlanPending`）会让整张卡不再挂载 = 预期态彻底清除。 */}
         {!checkMissed && (
           <p data-testid="approve-plan-pending" className="mt-1 text-xs text-[var(--tx)]/80">
-            终端正在等待这个计划的确认——请到终端对话框选择，或点下方按钮读取选项
+            {i18n.t("mobile.approve.planPendingBody")}
           </p>
         )}
         {/* 计划全文（T8 聚合；无计划消息 → 不渲染主体）——裁12 布局契约见 PlanBody */}
@@ -340,7 +339,11 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
       testId="approve-card"
       mode={options.dialog ? (options.planDialog ? "plan-dialog" : "dialog") : "binary"}
       title={
-        options.dialog ? (options.planDialog ? "计划批准" : "等待批准（终端对话框）") : "等待批准"
+        options.dialog
+          ? i18n.t(
+              options.planDialog ? "mobile.approve.planApprove" : "mobile.approve.waitingDialog"
+            )
+          : i18n.t("mobile.approve.waiting")
       }
       footer={
         <>
@@ -357,7 +360,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
               data-testid="approve-sent"
               className="mt-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400"
             >
-              已发送按键
+              {i18n.t("mobile.approve.keySent")}
             </p>
           )}
           {/* **降级态（读不到终端对话框）不给出键**（2026-10-10 用户裁决「读不到就
@@ -372,15 +375,15 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
                 onClick={handleCheck}
                 className="mt-2 rounded-full bg-[var(--btnp)] px-3 py-1.5 text-xs font-medium text-[var(--btnpt)] hover:bg-[var(--btnp)] disabled:opacity-40"
               >
-                {checking ? "检查中…" : "检查终端对话框"}
+                {i18n.t(checking ? "mobile.approve.checking" : "mobile.approve.checkDialog")}
               </button>
               <p
                 data-testid="approve-degraded-state"
                 className="mt-1 text-xs text-amber-700 dark:text-amber-400"
               >
-                {checkMissed
-                  ? "仍未读到终端对话框选项——上方按键保持禁用，请到终端确认当前面板"
-                  : "正在核对终端对话框——读到选项后上方按键可用"}
+                {i18n.t(
+                  checkMissed ? "mobile.approve.degradedMissed" : "mobile.approve.degradedChecking"
+                )}
               </p>
             </>
           )}
@@ -419,7 +422,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
                 <span className="min-w-0 flex-1 break-words">{o.label}</span>
                 {isFeedback && (
                   <span className="mt-0.5 shrink-0 text-[11px] text-sky-700/70 dark:text-sky-400/70">
-                    输入修改意见 →
+                    {i18n.t("mobile.approve.feedbackEntry")}
                   </span>
                 )}
               </button>
@@ -430,9 +433,9 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
     >
       {options.dialog && (
         <p data-testid="approve-dialog-label" className="mt-1 text-xs text-[var(--tx)]/80">
-          {options.planDialog
-            ? "以下选项读自终端对话框——点按即代你用方向键选择；反馈项会打开意见输入框"
-            : "以下选项读自终端对话框，点按即代你按对应数字键"}
+          {i18n.t(
+            options.planDialog ? "mobile.approve.dialogLabelPlan" : "mobile.approve.dialogLabel"
+          )}
         </p>
       )}
       {/* T8：审批点 plan 聚合——计划确认类审批卡主体即见计划全文（不再要用户去
@@ -446,7 +449,7 @@ export default function ApproveCard({ session, onPlanFeedbackReady }: ApproveCar
       )}
       {options.drift && (
         <p data-testid="approve-drift" className="mt-1 text-xs text-amber-700 dark:text-amber-400">
-          映射待实测确认，若提示不符请用普通发送
+          {i18n.t("mobile.approve.driftHint")}
         </p>
       )}
       {/* R1-3 降级警示（计划红线 3）：命中审批但未读到终端对话框选项 → 终端可能正

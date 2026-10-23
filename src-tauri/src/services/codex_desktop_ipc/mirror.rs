@@ -359,6 +359,24 @@ impl ThreadMirror {
             .unwrap_or_default()
     }
 
+    /// 当前镜像中处于 `inProgress` 的 Turn id（canonical 序最后一个 = 最新活动
+    /// 回合）。**原生回合与受理回合一视同仁**（2026-10-22 原生回合打断扩展）：
+    /// 它是端点打断阀值的回退来源——在册屏障不存在（桌面手打的回合）时，用它
+    /// 定位「桌面上正在跑的那个回合」。stale / 无镜像 / 无活动回合 → None
+    /// （调用方按「无阀值」保守拒发，与 P1-1 纪律一致）。
+    pub fn active_turn_id(&self) -> Option<String> {
+        if self.stale {
+            return None;
+        }
+        let state = self.state.as_ref()?;
+        HistoryView::new(state)
+            .turns()
+            .into_iter()
+            .filter(|t| t.status == Some("inProgress"))
+            .map(|t| t.turn_id.to_string())
+            .next_back()
+    }
+
     /// **本次请求的正式消息身份是否已在该 Turn 中落地**（2026-10-20 复审 P1）：
     /// 只认 `userMessage` item 的 `clientId == client_message_id`（正式消息身份）。
     /// `params.input` / `params.clientUserMessageId` 都是请求侧回显，不能作为送达
@@ -376,13 +394,19 @@ impl ThreadMirror {
         })
     }
 
-    /// 指定 Turn 是否已以终态出现在当前镜像（completed/failed）。
+    /// 指定 Turn 是否已以终态出现在当前镜像（completed/failed/**interrupted**）。
     /// 不在场 / inProgress / 未知状态 / stale / 无镜像 → false（保守不释放）。
+    ///
+    /// **interrupted（2026-10-21）**：Desktop 侧打断当前回合后把该 Turn 的 status
+    /// 置 `interrupted`（打包产物中 `t.status = "interrupted"` 实证）。它**是**终态
+    /// ——回合已结束，不会再有后续输出。不认它的话：远程打断 → 回合变 interrupted →
+    /// 终态门不认 → 屏障永久在册 → 队列永远暂停（比打断前更糟：用户以为已解围）。
+    /// 认它之后链路闭环：打断 → 终态证据 → 屏障释放 → 队列接力下一条。
     pub fn turn_is_terminal(&self, turn_id: &str) -> bool {
         !self.stale
             && matches!(
                 self.turn_status(turn_id).as_deref(),
-                Some("completed") | Some("failed")
+                Some("completed") | Some("failed") | Some("interrupted")
             )
     }
 
@@ -1770,6 +1794,7 @@ mod tests {
             command: false,
             permissions: true,
             blocking_input: false,
+            interrupt: false,
         }
     }
 
@@ -1796,6 +1821,7 @@ mod tests {
             command: false,
             permissions: false,
             blocking_input: false,
+            interrupt: false,
         };
         assert_eq!(
             availability_of(&mk(true, true)),
@@ -1827,6 +1853,7 @@ mod tests {
             command: false,
             permissions: false,
             blocking_input: false,
+            interrupt: false,
         };
         let p = m.project(read_only);
         assert_eq!(p.availability, ControlAvailability::ReadOnly);
@@ -2219,6 +2246,94 @@ mod tests {
         // stale 镜像一律无证据
         m.mark_stale();
         assert!(!m.turn_is_terminal("turn-mine"), "stale 镜像不出证据");
+    }
+
+    /// 打断后的回合（status=interrupted）**是终态**——2026-10-21 远程打断闭环的
+    /// 关键一环：打断 → Desktop 把回合状态置 `interrupted` → 终态门放行 → 屏障释放
+    /// → 队列接力。若不认它，打断后屏障永久在册（比打断前更糟：用户以为已解围）。
+    #[test]
+    fn interrupted_turn_counts_as_terminal_evidence() {
+        let mut m = ThreadMirror::new(key());
+        let change = serde_json::json!({
+            "type": "snapshot", "revision": 1,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "threadRuntimeStatus": { "type": "active" },
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true,
+                    "entitiesByKey": {
+                        "turn:mine": { "turnId": "turn-mine",
+                                       "status": "interrupted", "items": [] }
+                    },
+                    "islands": [{ "entries": [
+                        { "key": "turn:mine", "value": "turn:mine" }
+                    ] }]
+                } }
+            }
+        });
+        m.apply(&lease(), &change).unwrap();
+        assert_eq!(m.turn_status("turn-mine").as_deref(), Some("interrupted"));
+        assert!(
+            m.turn_is_terminal("turn-mine"),
+            "被打断的回合是终态——屏障据此释放"
+        );
+        // inProgress 仍不是终态（对照）
+        let mut m2 = ThreadMirror::new(key());
+        let running = serde_json::json!({
+            "type": "snapshot", "revision": 1,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "threadRuntimeStatus": { "type": "active" },
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true,
+                    "entitiesByKey": {
+                        "turn:mine": { "turnId": "turn-mine",
+                                       "status": "inProgress", "items": [] }
+                    },
+                    "islands": [{ "entries": [
+                        { "key": "turn:mine", "value": "turn:mine" }
+                    ] }]
+                } }
+            }
+        });
+        m2.apply(&lease(), &running).unwrap();
+        assert!(!m2.turn_is_terminal("turn-mine"), "进行中的回合不是终态");
+    }
+
+    /// `active_turn_id`（2026-10-22 原生回合打断扩展）：inProgress 回合 → Some；
+    /// stale 镜像一律 None（阀值回退的保守方向——过期镜像不给打断阀值，复审
+    /// Nit-4 钉死）。端点 409 负例由集成测试 refused_without_valve 覆盖。
+    #[test]
+    fn active_turn_id_follows_inprogress_and_stale_is_none() {
+        let mut m = ThreadMirror::new(key());
+        let running = serde_json::json!({
+            "type": "snapshot", "revision": 1,
+            "conversationState": {
+                "turns": [], "requests": [],
+                "threadRuntimeStatus": { "type": "active" },
+                "turnHistory": { "kind": "canonical",
+                    "history": { "isComplete": true,
+                    "entitiesByKey": {
+                        "turn:done": { "turnId": "turn-done",
+                                       "status": "completed", "items": [] },
+                        "turn:live": { "turnId": "turn-live",
+                                       "status": "inProgress", "items": [] }
+                    },
+                    "islands": [{ "entries": [
+                        { "key": "turn:done", "value": "turn:done" },
+                        { "key": "turn:live", "value": "turn:live" }
+                    ] }]
+                } }
+            }
+        });
+        m.apply(&lease(), &running).unwrap();
+        assert_eq!(
+            m.active_turn_id().as_deref(),
+            Some("turn-live"),
+            "completed 不算活动，inProgress 的最新回合才去"
+        );
+        m.mark_stale();
+        assert!(m.active_turn_id().is_none(), "stale 镜像不给阀值（保守）");
     }
 
     #[test]

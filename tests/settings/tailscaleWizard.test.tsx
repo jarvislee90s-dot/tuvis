@@ -27,6 +27,59 @@ import { TailscaleWizard } from "@/components/settings/TailscaleWizard";
 
 void i18n;
 
+describe("Tailscale 探测代际", () => {
+  it("较早探测晚到不能覆盖新配置", async () => {
+    let resolveOld: (value: unknown) => void = () => {};
+    let reads = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd !== "remote_ts_probe") return null;
+      reads += 1;
+      if (reads === 1)
+        return await new Promise((resolve) => {
+          resolveOld = resolve;
+        });
+      return macProbe({ configKey: "new", authUrl: "https://login.tailscale.com/a/new" });
+    });
+    const view = render(<TailscaleWizard refreshKey="old" />);
+    view.rerender(<TailscaleWizard refreshKey="new" />);
+    await waitFor(() =>
+      expect(screen.getByTestId("ts-auth-link")).toHaveAttribute(
+        "href",
+        "https://login.tailscale.com/a/new"
+      )
+    );
+    await act(async () =>
+      resolveOld(macProbe({ configKey: "old", authUrl: "https://login.tailscale.com/a/old" }))
+    );
+    expect(screen.getByTestId("ts-auth-link")).toHaveAttribute(
+      "href",
+      "https://login.tailscale.com/a/new"
+    );
+  });
+
+  it("旧动作失败晚到不能写入新配置的步骤错误", async () => {
+    let rejectOld: (error: unknown) => void = () => {};
+    let currentKey = "action-old";
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_ts_probe") return macProbe({ configKey: currentKey });
+      if (cmd === "remote_ts_run_step")
+        return await new Promise((_, reject) => {
+          rejectOld = reject;
+        });
+      return null;
+    });
+    const view = render(<TailscaleWizard refreshKey="old" configKey="action-old" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Enable fixed address" }));
+    currentKey = "action-new";
+    view.rerender(<TailscaleWizard refreshKey="new" configKey="action-new" />);
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter((call) => call[0] === "remote_ts_probe")).toHaveLength(2)
+    );
+    await act(async () => rejectOld("TSWIZ_FUNNEL_FAIL: old action"));
+    expect(screen.queryByTestId("ts-step-error")).toBeNull();
+  });
+});
+
 // ---- mock 载荷工厂（形状契约 = Rust 端 tailscale::wizard_status 注释）----
 const step = (id: string, needsHuman = false, humanActionKey = "", humanOptional = false) => ({
   id,
@@ -44,6 +97,9 @@ const state = (id: string, done: boolean, blockedReason: string | null = null) =
 // login 待做（带 authUrl）、funnel 待做、verify 未验（§C3 校验态全局默认 unverified）、
 // autostart 恒完成
 const macProbe = (over: Record<string, unknown> = {}) => ({
+  installerPath: "/Users/test/Downloads/Tailscale-1.102.4-macos.pkg",
+  downloadUrl: "https://pkgs.tailscale.com/stable/Tailscale-1.102.4-macos.pkg",
+  installerReady: true,
   platform: "mac",
   windowsVerified: true,
   // I-3：Windows 验证位按覆盖面拆细——windowsVerifiedFrom = 实测覆盖从哪一步起，
@@ -78,6 +134,9 @@ const macProbe = (over: Record<string, unknown> = {}) => ({
   running: false,
   boardUrl: null,
   reach: { state: "unverified" },
+  enabled: true,
+  configKey: "tailscale-config-a",
+  waiting: null,
   ...over,
 });
 
@@ -105,6 +164,207 @@ afterEach(() => {
 });
 
 describe("TailscaleWizard 步骤渲染与三态（§C2）", () => {
+  it("未安装现场只开放下载入口，检测完成与未安装分别说明，后续步骤不提前报错", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "remote_ts_probe"
+        ? macProbe({
+            installerReady: false,
+            authUrl: "",
+            states: macProbe().states.map((s) =>
+              ["detect", "install", "download"].includes(s.id)
+                ? state(s.id, false)
+                : state(s.id, false, "未安装，CLI不可用")
+            ),
+          })
+        : null
+    );
+    render(<TailscaleWizard />);
+    await screen.findByRole("list", { name: "Setup steps" });
+    // 慢机竞态防御（CI 2026-10-23 实测 flake）：list 在场时步骤行可能晚一拍才挂载
+    //（首行 querySelector 即 null）——首个行级断言用 waitFor 等待，其后各行必然已在场
+    await waitFor(() => expect(stepRow("detect").getAttribute("data-done")).toBe("true"));
+    expect(
+      screen.getByText("Tailscale was not detected. Continue below to download and install it.")
+    ).toBeTruthy();
+    expect(
+      within(stepRow("download"))
+        .getByRole("button", { name: "Download installer automatically" })
+        .hasAttribute("disabled")
+    ).toBe(false);
+    expect(screen.queryByRole("link", { name: "Download manually" })).toBeNull();
+    expect(screen.queryByText("未安装，CLI不可用")).toBeNull();
+    expect(
+      within(stepRow("login"))
+        .getByRole("button", { name: "Get login link" })
+        .hasAttribute("disabled")
+    ).toBe(true);
+  });
+
+  it("安装包未就绪时突出自动下载，不提前显示手动入口或不存在的路径", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "remote_ts_probe" ? macProbe({ installerReady: false }) : null
+    );
+    render(<TailscaleWizard />);
+    await screen.findByText("Detect Tailscale");
+    expect(
+      within(stepRow("install"))
+        .getByRole("button", { name: "Install Tailscale" })
+        .hasAttribute("disabled")
+    ).toBe(true);
+    expect(screen.queryByRole("link", { name: "Download manually" })).toBeNull();
+    expect(screen.queryByText("/Users/test/Downloads/Tailscale-1.102.4-macos.pkg")).toBeNull();
+    expect(
+      within(stepRow("download")).getByRole("button", { name: "Download installer automatically" })
+    ).toBeTruthy();
+  });
+
+  it("下载失败显示本地化原因与手动安装指引，空错误也有兜底", async () => {
+    let error = "TSWIZ_DOWNLOAD_DIR_FAIL: 系统拒绝写入";
+    let ready = false;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_ts_probe") return macProbe({ installerReady: ready });
+      if (cmd === "remote_ts_run_step") throw error;
+      return null;
+    });
+    render(<TailscaleWizard />);
+    await screen.findByText("Detect Tailscale");
+    fireEvent.click(
+      within(stepRow("download")).getByRole("button", { name: "Download installer automatically" })
+    );
+    expect(
+      await screen.findByText(/Action failed: Could not create the downloads folder/)
+    ).toBeTruthy();
+    expect(
+      within(stepRow("download"))
+        .getByRole("link", { name: "Download manually" })
+        .getAttribute("href")
+    ).toBe("https://pkgs.tailscale.com/stable/Tailscale-1.102.4-macos.pkg");
+    expect(screen.queryByText("/Users/test/Downloads/Tailscale-1.102.4-macos.pkg")).toBeNull();
+    ready = true;
+    fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    await waitFor(() =>
+      expect(
+        within(stepRow("install"))
+          .getByRole("button", { name: "Install Tailscale" })
+          .hasAttribute("disabled")
+      ).toBe(false)
+    );
+    error = "";
+    fireEvent.click(within(stepRow("install")).getByRole("button", { name: "Install Tailscale" }));
+    expect(await screen.findByText(/The action failed without error details/)).toBeTruthy();
+    expect(screen.queryByTestId("ts-install-awaiting")).toBeNull();
+    expect(
+      within(stepRow("install")).getByRole("button", { name: "Open downloads folder" })
+    ).toBeTruthy();
+    expect(
+      within(stepRow("install")).getByText(/The installer is downloaded and verified/)
+    ).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Download manually" })).toBeNull();
+  });
+
+  it("校验成功才在下载步骤显示实际文件位置与文件夹入口", async () => {
+    render(<TailscaleWizard />);
+    expect(
+      await screen.findByText("/Users/test/Downloads/Tailscale-1.102.4-macos.pkg")
+    ).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Download manually" })).toBeNull();
+    expect(
+      within(stepRow("download")).getByText("/Users/test/Downloads/Tailscale-1.102.4-macos.pkg")
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open downloads folder" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("reveal_dir", { path: "/Users/test/Downloads" })
+    );
+  });
+
+  it("时间轴动作在统一操作区，失败降级与文件信息随下载结果清除和更新", async () => {
+    let ready = false;
+    let fail = true;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_ts_probe")
+        return macProbe({
+          installerReady: ready,
+          states: macProbe().states.map((s) => (s.id === "download" ? state(s.id, ready) : s)),
+        });
+      if (cmd === "remote_ts_run_step") {
+        if (fail) throw "下载失败";
+        ready = true;
+        return { ok: true };
+      }
+      return null;
+    });
+    render(<TailscaleWizard />);
+    await screen.findByRole("list", { name: "Setup steps" });
+    const download = stepRow("download");
+    expect(download.getAttribute("aria-current")).toBe("step");
+    fireEvent.click(
+      within(download).getByRole("button", { name: "Download installer automatically" })
+    );
+    await screen.findByRole("link", { name: "Download manually" });
+    fail = false;
+    fireEvent.click(within(download).getByRole("button", { name: "Retry automatic download" }));
+    await screen.findByText("/Users/test/Downloads/Tailscale-1.102.4-macos.pkg");
+    expect(screen.queryByRole("link", { name: "Download manually" })).toBeNull();
+    expect(download.getAttribute("data-done")).toBe("true");
+    expect(stepRow("install").getAttribute("aria-current")).toBe("step");
+    expect(
+      within(stepRow("install"))
+        .getByTestId("ts-step-actions")
+        .contains(within(stepRow("install")).getByRole("button", { name: "Install Tailscale" }))
+    ).toBe(true);
+  });
+
+  it("下载失败后手动安装再刷新，完成态会清掉旧错误和手动下载降级", async () => {
+    let recovered = false;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_ts_probe")
+        return macProbe({
+          installerReady: false,
+          authUrl: "",
+          states: macProbe().states.map((s) =>
+            ["detect", "download", "install"].includes(s.id) ? state(s.id, recovered) : s
+          ),
+        });
+      if (cmd === "remote_ts_run_step") throw "下载失败";
+      return null;
+    });
+    render(<TailscaleWizard />);
+    await screen.findByText("Detect Tailscale");
+    fireEvent.click(
+      within(stepRow("download")).getByRole("button", { name: "Download installer automatically" })
+    );
+    await screen.findByRole("link", { name: "Download manually" });
+    expect(screen.getByRole("alert")).toBeTruthy();
+    recovered = true;
+    fireEvent.click(screen.getAllByRole("button", { name: "Refresh status" })[0]);
+    await waitFor(() => expect(stepRow("download").getAttribute("data-done")).toBe("true"));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("link", { name: "Download manually" })).toBeNull();
+    expect(screen.queryByText("/Users/test/Downloads/Tailscale-1.102.4-macos.pkg")).toBeNull();
+  });
+
+  it("macOS 打开安装器后等待用户完成，回到窗口即重新探测，未装好不误报完成", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_ts_probe") return macProbe();
+      if (cmd === "remote_ts_run_step") return { ok: true, triggered: true };
+      return null;
+    });
+    render(<TailscaleWizard />);
+    await screen.findByText("Detect Tailscale");
+    fireEvent.click(within(stepRow("install")).getByRole("button", { name: "Install Tailscale" }));
+    await screen.findByText(
+      "Complete the installation in the system installer, then return here and refresh the status."
+    );
+    expect(stepRow("install").getAttribute("data-done")).toBe("false");
+    const count = invokeMock.mock.calls.filter(([cmd]) => cmd === "remote_ts_probe").length;
+    fireEvent.focus(window);
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "remote_ts_probe").length).toBe(
+        count + 1
+      )
+    );
+  });
+
   it("macOS 渲染九步；done 态映射三态点（detect 已完成 / download 待做 / autostart 恒完成）", async () => {
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
@@ -119,8 +379,15 @@ describe("TailscaleWizard 步骤渲染与三态（§C2）", () => {
   });
 
   it("需要人的步骤突出动作文案（后端 humanActionKey 下发 → 前端翻译上墙）", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "remote_ts_probe"
+        ? macProbe({
+            states: macProbe().states.map((s) => (s.id === "sys_ext" ? state(s.id, false) : s)),
+          })
+        : null
+    );
     render(<TailscaleWizard />);
-    expect(await screen.findByText(/prompt for the admin password/i)).toBeTruthy();
+    expect(await screen.findByText(/open the system installer automatically/i)).toBeTruthy();
     expect(screen.getByText(/approve the Tailscale system extension/i)).toBeTruthy();
     expect(screen.getByText(/complete Tailscale login in your browser/i)).toBeTruthy();
     expect(screen.getByText(/approve it once in your browser/i)).toBeTruthy();
@@ -391,7 +658,9 @@ describe("TailscaleWizard ④下载步「在走动」反馈（不确定进度，
     await screen.findByText("Detect Tailscale");
     // 未发起时没有指示器
     expect(screen.queryByTestId("ts-step-progress")).toBeNull();
-    fireEvent.click(within(stepRow("download")).getByRole("button", { name: /run/i }));
+    fireEvent.click(
+      within(stepRow("download")).getByRole("button", { name: "Download installer automatically" })
+    );
     // **核心断言**：invoke 仍挂着，但界面已经显示「在走动」——证明下载阻塞期间前端能渲染
     const bar = await within(stepRow("download")).findByTestId("ts-step-progress");
     expect(bar.getAttribute("role")).toBe("progressbar");
@@ -417,9 +686,9 @@ describe("TailscaleWizard ④下载步「在走动」反馈（不确定进度，
     });
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
-    fireEvent.click(within(stepRow("install")).getByRole("button", { name: /run/i }));
+    fireEvent.click(within(stepRow("install")).getByRole("button", { name: "Install Tailscale" }));
     const bar = await within(stepRow("install")).findByTestId("ts-step-progress");
-    expect(bar.textContent).toMatch(/installing/i);
+    expect(bar.textContent).toMatch(/opening the installer/i);
     expect(bar.textContent).not.toMatch(/%/);
     release({ ok: true });
     await waitFor(() => expect(screen.queryByTestId("ts-step-progress")).toBeNull());
@@ -434,7 +703,9 @@ describe("TailscaleWizard ④下载步「在走动」反馈（不确定进度，
     });
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
-    fireEvent.click(within(stepRow("shields_up")).getByRole("button", { name: /run/i }));
+    fireEvent.click(
+      within(stepRow("shields_up")).getByRole("button", { name: "Allow incoming connections" })
+    );
     expect(within(stepRow("shields_up")).queryByTestId("ts-step-progress")).toBeNull();
   });
 });
@@ -706,7 +977,9 @@ describe("TailscaleWizard A1：Funnel 批准是「可能不出现」的分支，
     });
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
-    fireEvent.click(within(stepRow("funnel")).getByRole("button", { name: /run/i }));
+    fireEvent.click(
+      within(stepRow("funnel")).getByRole("button", { name: "Enable fixed address" })
+    );
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("remote_ts_run_step", { step: "funnel" })
     );
@@ -766,7 +1039,9 @@ describe("TailscaleWizard 单步触发（remote_ts_run_step）", () => {
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
     const probesBefore = invokeMock.mock.calls.filter((c) => c[0] === "remote_ts_probe").length;
-    fireEvent.click(within(stepRow("shields_up")).getByRole("button", { name: /run/i }));
+    fireEvent.click(
+      within(stepRow("shields_up")).getByRole("button", { name: "Allow incoming connections" })
+    );
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("remote_ts_run_step", { step: "shields_up" })
     );
@@ -777,14 +1052,14 @@ describe("TailscaleWizard 单步触发（remote_ts_run_step）", () => {
     });
   });
 
-  it("detect / autostart 不出执行按钮（只读探针 / 兔维斯 自身行为）；verify 走专属重试钮", async () => {
+  it("detect / autostart 不出执行按钮（只读探针 / 兔维斯 自身行为）；verify 只提供只读检查", async () => {
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
     for (const id of ["detect", "autostart"]) {
       expect(within(stepRow(id)).queryByRole("button")).toBeNull();
     }
-    // verify 未验时出「Retry」重试按钮（调 remote_ts_run_step("verify")，见下组用例）
-    expect(within(stepRow("verify")).getByTestId("ts-verify-retry")).toBeTruthy();
+    expect(within(stepRow("verify")).getByTestId("ts-verify-check")).toBeTruthy();
+    expect(within(stepRow("sys_ext")).getByText("No action needed")).toBeTruthy();
   });
 
   it("login 步：兔维斯 不代登录——「去登录」为 authUrl 链接（href 原样透传）", async () => {
@@ -805,15 +1080,151 @@ describe("TailscaleWizard 单步触发（remote_ts_run_step）", () => {
     });
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
-    fireEvent.click(within(stepRow("funnel")).getByRole("button", { name: /run/i }));
+    fireEvent.click(
+      within(stepRow("funnel")).getByRole("button", { name: "Enable fixed address" })
+    );
     const approval = await screen.findByTestId("ts-approval");
     const link = approval.querySelector("a") as HTMLAnchorElement;
     expect(link.getAttribute("href")).toBe("https://login.tailscale.com/funnel/abc");
   });
+
+  it("同配置开启及运行态刷新保留 Funnel 批准链接，关闭后清除", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_ts_probe") return macProbe();
+      if (cmd === "remote_ts_run_step")
+        return { ok: true, approvalUrl: "https://login.tailscale.com/funnel/kept" };
+      return null;
+    });
+    const view = render(
+      <TailscaleWizard configKey="tailscale-config-a" channelEnabled={false} refreshKey="off" />
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Enable fixed address" }));
+    await screen.findByTestId("ts-approval");
+    view.rerender(
+      <TailscaleWizard configKey="tailscale-config-a" channelEnabled refreshKey="running" />
+    );
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter((call) => call[0] === "remote_ts_probe")).toHaveLength(3)
+    );
+    expect(screen.getByTestId("ts-approval").querySelector("a")).toHaveAttribute(
+      "href",
+      "https://login.tailscale.com/funnel/kept"
+    );
+    view.rerender(
+      <TailscaleWizard
+        configKey="tailscale-config-a"
+        channelEnabled={false}
+        refreshKey="off-again"
+      />
+    );
+    await waitFor(() => expect(screen.queryByTestId("ts-approval")).toBeNull());
+  });
+
+  it("Funnel 在途时同配置状态刷新，仍接受首次开通的批准回执", async () => {
+    let resolveAction: (value: unknown) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_ts_probe") return macProbe();
+      if (cmd === "remote_ts_run_step")
+        return await new Promise((resolve) => {
+          resolveAction = resolve;
+        });
+      return null;
+    });
+    const view = render(
+      <TailscaleWizard configKey="tailscale-config-a" channelEnabled={false} refreshKey="off" />
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Enable fixed address" }));
+    view.rerender(
+      <TailscaleWizard configKey="tailscale-config-a" channelEnabled refreshKey="running" />
+    );
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter((call) => call[0] === "remote_ts_probe")).toHaveLength(2)
+    );
+    await act(async () =>
+      resolveAction({ ok: true, approvalUrl: "https://login.tailscale.com/funnel/in-flight" })
+    );
+    expect(screen.getByTestId("ts-approval").querySelector("a")).toHaveAttribute(
+      "href",
+      "https://login.tailscale.com/funnel/in-flight"
+    );
+  });
+
+  it.each(["config", "channel", "master"])(
+    "Funnel 在途后 %s 失效，拒绝旧批准回执",
+    async (change) => {
+      let resolveAction: (value: unknown) => void = () => {};
+      let currentKey = "tailscale-config-a";
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "remote_ts_probe") return macProbe({ configKey: currentKey });
+        if (cmd === "remote_ts_run_step")
+          return await new Promise((resolve) => {
+            resolveAction = resolve;
+          });
+        return null;
+      });
+      const view = render(
+        <TailscaleWizard configKey={currentKey} channelEnabled refreshKey="on" />
+      );
+      fireEvent.click(await screen.findByRole("button", { name: "Enable fixed address" }));
+      if (change === "config") currentKey = "tailscale-config-new";
+      view.rerender(
+        <TailscaleWizard
+          configKey={currentKey}
+          channelEnabled={change !== "channel"}
+          remoteEnabled={change !== "master"}
+          refreshKey="changed"
+        />
+      );
+      await waitFor(() =>
+        expect(invokeMock.mock.calls.filter((call) => call[0] === "remote_ts_probe")).toHaveLength(
+          2
+        )
+      );
+      await act(async () =>
+        resolveAction({ ok: true, approvalUrl: "https://login.tailscale.com/funnel/stale" })
+      );
+      expect(screen.queryByTestId("ts-approval")).toBeNull();
+    }
+  );
 });
 
-describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () => {
-  it('reach=failed：verify 行显示「固定地址尚未生效」+ reason + 重试按钮；点重试调 remote_ts_run_step("verify")', async () => {
+describe("TailscaleWizard 复验过程提示（把自动复验讲给用户听，状态≠过程）", () => {
+  const historyValue = JSON.stringify({
+    configKey: "tailscale-config-a",
+    address: "https://jarvismac-mini.tail3c33b6.ts.net/m",
+  });
+
+  it("复验全链路（未验/等 DNS/校验中）都给过程提示；服务没跑不给", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_setting") return historyValue;
+      if (cmd === "remote_ts_probe") return macProbe({ running: true });
+      return null;
+    });
+    const view = render(<TailscaleWizard />);
+    await screen.findByTestId("setup-reverify-hint");
+    // 首验落进「等公网 DNS」仍是过程在途——提示不得中途退场
+    //（2026-10-22 用户实测：转圈十几秒就消失，但看板要几十秒到一分钟才通）
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_setting") return historyValue;
+      if (cmd === "remote_ts_probe")
+        return macProbe({ running: true, reach: { state: "record_pending", republish: false } });
+      return null;
+    });
+    view.rerender(<TailscaleWizard refreshKey="pending" />);
+    await waitFor(() => expect(screen.getByTestId("setup-reverify-hint")).toBeTruthy());
+    // running 翻 false（通道关闭中）→ 不能再承诺「正在复验」
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_setting") return historyValue;
+      if (cmd === "remote_ts_probe") return macProbe({ running: false });
+      return null;
+    });
+    view.rerender(<TailscaleWizard refreshKey="flip" />);
+    await waitFor(() => expect(screen.queryByTestId("setup-reverify-hint")).toBeNull());
+  });
+});
+
+describe("TailscaleWizard verify（只读检查与明确修复）", () => {
+  it("reach=failed：verify 只读检查；修复需要二次确认后才调 repair", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "remote_ts_probe")
         return macProbe({
@@ -842,10 +1253,16 @@ describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () =
     expect(within(row).queryByText("Done")).toBeNull();
     // 非连不通类失败 → 不挂瞬时抖动引导（那条只属于「地址已解析但连不通」）
     expect(within(row).queryByTestId("ts-transient-hint")).toBeNull();
-    // 重试按钮触发 verify 步（后端自动含自愈）
-    fireEvent.click(within(row).getByTestId("ts-verify-retry"));
+    // 普通核验只读；修复入口明确确认后才触发 repair。
+    fireEvent.click(within(row).getByTestId("ts-verify-check"));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("remote_ts_run_step", { step: "verify" })
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith("remote_ts_run_step", { step: "repair" });
+    fireEvent.click(within(row).getByTestId("ts-repair-open"));
+    fireEvent.click(await screen.findByTestId("ts-repair-confirm"));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remote_ts_run_step", { step: "repair" })
     );
   });
 
@@ -877,8 +1294,8 @@ describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () =
     const row = stepRow("verify");
     expect(within(row).getByTestId("ts-not-live")).toBeTruthy();
     const hint = within(row).getByTestId("ts-transient-hint");
-    expect(hint.textContent).toMatch(/transient jitter/i);
-    expect(hint.textContent).toMatch(/1[–-]2 minutes/i);
+    expect(hint.textContent).toMatch(/transient public-network jitter/i);
+    expect(hint.textContent).toMatch(/after 10 minutes/i);
   });
 
   it("reach=verified：verify 行 Done 且无重试按钮；头部看板地址上墙", async () => {
@@ -906,7 +1323,7 @@ describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () =
     await screen.findByText("Detect Tailscale");
     const row = stepRow("verify");
     expect(row.getAttribute("data-done")).toBe("true");
-    expect(within(row).queryByTestId("ts-verify-retry")).toBeNull();
+    expect(within(row).queryByTestId("ts-verify-check")).toBeNull();
     expect(within(row).getByText("Done")).toBeTruthy();
     // 头部地址只在 Verified 显示
     expect(screen.getByText("https://a.ts.net/m")).toBeTruthy();
@@ -939,11 +1356,10 @@ describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () =
     });
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
-    // 实测：首次开通后公网记录约 5–6 分钟才发布，这期间用户唯一感受是"连不上"——
-    // 必须告知这是正常现象与预期时长（旧文案只说「尚未生效」，不给时长）
+    // 初始状态不猜DNS时长；由后端返回等待起点与预计时长后再显示估时。
     const hint = screen.getByTestId("ts-pending");
-    expect(hint.textContent).toMatch(/5–6 minutes/i);
-    expect(hint.textContent).toMatch(/not published yet/i);
+    expect(hint.textContent).toMatch(/not verified yet/i);
+    expect(screen.queryByTestId("ts-verify-check")).toBeTruthy();
   });
 
   // W-B（真机实测三档时长）：固定一句 5 分钟会把 reset 后重开（实测 30–49 秒）与
@@ -956,16 +1372,23 @@ describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () =
           running: true,
           boardUrl: "https://a.ts.net/m",
           reach: { state: "record_pending", republish: false },
+          waiting: { startedAtMs: Date.now() - 120_000, expectedSeconds: 600 },
         });
       return null;
     });
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
     const hint = screen.getByTestId("ts-pending");
-    expect(hint.textContent).toMatch(/5–6 minutes/i);
+    expect(hint.textContent).toMatch(/up to about 10 minutes/i);
+    expect(hint.textContent).toMatch(/waited: [12] minutes/i);
     // M3：首开档照线稿（357 行）**不带** badge——两档不得一律加徽标
-    expect(hint.querySelector("span")).toBeNull();
-    expect(screen.queryByTestId("ts-republish")).toBeNull();
+    expect(screen.queryByTestId("ts-verify-check")).toBeNull();
+    expect(screen.queryByTestId("ts-repair-open")).toBeNull();
+    expect(within(stepRow("verify")).getByTestId("ts-pending")).toBe(hint);
+    expect(within(stepRow("verify")).getByText(/local board and Funnel are working/i)).toBeTruthy();
+    expect(
+      within(stepRow("verify")).getByText(/Settings.*Remote Access.*channel card/i)
+    ).toBeTruthy();
   });
 
   it("W-B：reach=record_pending 且 republish=true → 重新开通档（30 秒～1 分钟），不套用 5 分钟", async () => {
@@ -975,20 +1398,73 @@ describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () =
           running: true,
           boardUrl: "https://a.ts.net/m",
           reach: { state: "record_pending", republish: true },
+          waiting: { startedAtMs: Date.now() - 30_000, expectedSeconds: 600 },
         });
       return null;
     });
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
-    const hint = screen.getByTestId("ts-republish");
-    expect(hint.textContent).toMatch(/30 seconds|1 minute/i);
-    expect(hint.textContent).not.toMatch(/5–6 minutes/i);
-    // M3（2026-10-07 评审）：线稿状态二把「发布中」画成**带琥珀 badge** 的行（wireframe
-    // 355），实现必须同形——否则线稿与实现各说各话
-    expect(hint.querySelector("span")?.textContent).toBe("Republishing");
-    expect(hint.querySelector("span")?.className).toMatch(/amber/);
-    // 两档互斥：重开档不得同时挂首开档那块
-    expect(screen.queryByTestId("ts-pending")).toBeNull();
+    const hint = screen.getByTestId("ts-pending");
+    expect(hint.textContent).toMatch(/waited: 0 minutes/i);
+    expect(screen.queryByTestId("ts-verify-check")).toBeNull();
+    expect(screen.queryByTestId("ts-repair-open")).toBeNull();
+  });
+
+  it.each(["record_pending", "verifying"])(
+    "DNS 超时 %s 先排查，再自主选择确认重新开通",
+    async (reachState) => {
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "remote_ts_probe")
+          return macProbe({
+            running: true,
+            boardUrl: "https://a.ts.net/m",
+            reach: { state: reachState, republish: false },
+            waiting: { startedAtMs: Date.now() - 601_000, expectedSeconds: 600 },
+          });
+        if (cmd === "remote_ts_run_step") return { ok: true };
+        return null;
+      });
+      render(<TailscaleWizard />);
+      await screen.findByText("Detect Tailscale");
+      const row = stepRow("verify");
+      expect(within(row).getByTestId("ts-waiting-overdue")).toBeTruthy();
+      expect(within(row).queryByTestId("ts-verify-check")).toBeNull();
+      expect(within(row).queryByRole("button", { name: "Re-enable connection" })).toBeNull();
+      expect(within(row).queryByTestId("ts-troubleshooting")).toBeNull();
+      fireEvent.click(within(row).getByRole("button", { name: "View troubleshooting steps" }));
+      const guidance = within(row).getByTestId("ts-troubleshooting");
+      expect(guidance.textContent).toMatch(/keep.*Tailscale.*channel.*on/i);
+      expect(guidance.textContent).toMatch(/internet connection/i);
+      expect(guidance.textContent).toMatch(/continue.*automatically/i);
+      expect(invokeMock.mock.calls.filter((call) => call[0] === "remote_ts_run_step")).toHaveLength(
+        0
+      );
+      fireEvent.click(within(row).getByTestId("ts-repair-open"));
+      expect(invokeMock.mock.calls.filter((call) => call[0] === "remote_ts_run_step")).toHaveLength(
+        0
+      );
+      fireEvent.click(await screen.findByTestId("ts-repair-confirm"));
+      await waitFor(() =>
+        expect(invokeMock).toHaveBeenCalledWith("remote_ts_run_step", { step: "repair" })
+      );
+    }
+  );
+
+  it("后台开始每分钟复验时保留等待元数据，不能重复触发检查", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_ts_probe")
+        return macProbe({
+          running: true,
+          reach: { state: "verifying" },
+          waiting: { startedAtMs: Date.now() - 120_000, expectedSeconds: 600 },
+        });
+      return null;
+    });
+    render(<TailscaleWizard />);
+    await screen.findByText("Detect Tailscale");
+    expect(screen.getByTestId("ts-pending").textContent).toMatch(/up to about 10 minutes/i);
+    expect(screen.getByTestId("ts-pending").textContent).toMatch(/Checking the address now/i);
+    expect(screen.queryByTestId("ts-verify-check")).toBeNull();
   });
 
   it("W-A：reach=recovering（开机恢复窗口）→ 「恢复中」语义：不是故障、也不是「域名生效中」", async () => {
@@ -1032,7 +1508,9 @@ describe("TailscaleWizard verify §C3（尚未生效 + 重试，Task 7）", () =
     });
     render(<TailscaleWizard />);
     await screen.findByText("Detect Tailscale");
-    fireEvent.click(within(stepRow("funnel")).getByRole("button", { name: /run/i }));
+    fireEvent.click(
+      within(stepRow("funnel")).getByRole("button", { name: "Enable fixed address" })
+    );
     const err = await within(stepRow("funnel")).findByTestId("ts-step-error");
     expect(err.textContent).toContain("Action failed");
     expect(err.textContent).toContain("检测到非 兔维斯");
@@ -1100,6 +1578,7 @@ describe("tailscale 卡展开区集成（Task 9 收敛：向导挂进卡片详�
       if (cmd === "remote_status")
         return {
           ...remoteStatusPayload(),
+          enabled: true,
           channels: {
             ...remoteStatusPayload().channels,
             tailscale: {
@@ -1126,8 +1605,12 @@ describe("tailscale 卡展开区集成（Task 9 收敛：向导挂进卡片详�
     fireEvent.click(document.querySelector('[data-card="tailscale"]')!);
     const phase = await screen.findByTestId("ts-phase");
     await waitFor(() => expect(phase.getAttribute("data-phase")).toBe("configured"));
-    expect(screen.getByText("https://mam.tail1234.ts.net/m")).toBeTruthy();
-    expect(screen.queryByTestId("ts-wizard")).toBeNull();
+    await waitFor(() =>
+      expect(screen.getByTestId("setup-wizard-frame").getAttribute("data-complete")).toBe("true")
+    );
+    expect(screen.getAllByText("https://mam.tail1234.ts.net/m").length).toBeGreaterThan(0);
+    await waitFor(() => expect(screen.queryByTestId("ts-wizard")).toBeNull());
+    expect(screen.getByTestId("setup-wizard-frame").getAttribute("data-complete")).toBe("true");
   });
 });
 

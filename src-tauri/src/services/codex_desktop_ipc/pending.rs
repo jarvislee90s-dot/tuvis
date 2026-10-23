@@ -513,6 +513,7 @@ mod tests {
             command: true,
             permissions: true,
             blocking_input: true,
+            interrupt: false,
         }
     }
 
@@ -523,6 +524,7 @@ mod tests {
             command: false,
             permissions: false,
             blocking_input: false,
+            interrupt: false,
         }
     }
 

@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/i18n";
 import SubagentDetail from "@/mobile/SubagentDetail";
 import type { Session } from "@/types/session";
 
@@ -34,7 +35,8 @@ let routes: {
   fail?: boolean;
 };
 
-beforeEach(() => {
+beforeEach(async () => {
+  await i18n.changeLanguage("zh");
   routes = {};
   vi.stubGlobal(
     "fetch",

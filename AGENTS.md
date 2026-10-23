@@ -1,5 +1,10 @@
 # 项目指令
 
+## 工作区与分支（2026-10-22 用户裁决）
+
+- 默认直接在 `/Users/jarvis/Documents/tuvis` 内建立功能分支、开发与验证。
+- 如需隔离 worktree，只能建在 `/Users/jarvis/Documents/` 下；不得使用 `~/.codex/worktrees/` 等其他目录。
+
 ## 项目宪法（最高设计依据）
 
 `docs/MASTER-PLAN.md`（兔维斯 远程接入与操控平台 · 总需求说明书）是本项目**唯一最高权威设计文档**，定义三期总纲（一期只读接入 / 二期消息注入 / 三期全控与任务流转）、共用底座、技术选型与横切原则。任何设计文档、spec、实现、任务列表与其冲突时，**一律以它为准**。
@@ -26,7 +31,7 @@
 - `CHANGELOG.md` 本版小节：全部变更入库（工程质量类可合并叙述，但不漏项）
 - `docs/release-notes/vX.Y.Z.md`：用户可感知变更全覆盖；行为变更（默认值变化、设置迁移、
   快捷键/入口变化等）必须写进「升级须知」
-- `README.md`：功能概览与受影响的功能章节反映最新行为（新功能补入概览、行为变更就地更新）
+- `README.zh-CN.md`（中文主笔；英文侧 `README.md` 同步）：功能概览与受影响的功能章节反映最新行为（新功能补入概览、行为变更就地更新）
 
 ### ② 中英对照检查
 
@@ -35,7 +40,7 @@
 | 双语资产 | 中文侧 | 英文侧 | 说明 |
 | --- | --- | --- | --- |
 | 前端页面文案 | `src/i18n/locales/zh.json` | `src/i18n/locales/en.json` | `pnpm check:i18n` 只保**键集**一致，键下的英文值漂移不报，须逐键比对 |
-| 项目 README | `README.md` | `README.en.md` | 无门禁，人工/代理核对 |
+| 项目 README | `README.zh-CN.md` | `README.md` | 无门禁，人工/代理核对；`README.md` 为英文侧（默认展示），中文主笔在 `README.zh-CN.md` |
 | 用户手册（官网 `/docs` 挂载） | `docs/user-manual/zh/`（13 章） | `docs/user-manual/en/` | 无门禁；en 曾为骨架，至少核对本版有变动的章节 |
 | 更新日志（官网 `/changelog` 挂载） | `CHANGELOG.md`（纯中文） | `CHANGELOG.en.md`（纯英文） | 2026-10-17 拆分（此前「同文件内嵌 `EN:` 行」契约作废）：两份各自单语、版本/日期/分区逐条对齐，未译条目只写中文版 |
 
@@ -109,7 +114,8 @@ cd src-tauri && cargo clippy   # Rust 代码 lint
 ├── package.json           # 项目配置
 ├── vite.config.ts         # Vite 构建配置
 ├── tsconfig.json          # TypeScript 配置
-└── README.md              # 项目说明
+├── README.md              # 项目说明（英文，默认展示）
+└── README.zh-CN.md        # 项目说明（中文主笔）
 ```
 
 ## 卡面状态权威源：屏读为准（2026-10-03 用户裁决）

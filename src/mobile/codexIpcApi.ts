@@ -174,11 +174,37 @@ export interface CodexActionView {
 }
 
 /** 队列视图。blockedReasonCode 非空（如 compat_outstanding）= 暂停派发，必须展示说明。
- *  blockedActionIds = 在册屏障的动作清单（人工解除端点的靶向依据；旧后端载荷缺省）。 */
+ *  blockedActionIds = 在册屏障的动作清单（人工解除端点的靶向依据；旧后端载荷缺省）。
+ *  canInterrupt = 本 Desktop build 是否已活体验证「打断当前回合」（interrupt 能力位）；
+ *  false（或旧载荷缺省）时队列面板**不得**渲染打断按钮——渲染了也只会 503
+ * （2026-10-22 复审 P2-2：无能力 build 按钮在源头隐藏）。 */
 export interface CodexQueueView {
   actions: CodexActionView[];
   blockedReasonCode: string | null;
   blockedActionIds?: string[];
+  canInterrupt?: boolean;
+}
+
+/** 「已进入桌面队列」发送回执 chip（MessageComposer 持有；actionId 是对账锚）。 */
+export interface CodexQueuedReceipt {
+  kind: "codexQueued";
+  position: number;
+  actionId: string;
+}
+
+/** codexQueued 回执对齐 codex 队列视图真值（2026-10-22 B1 收敛修复）：动作已不在
+ *  队列（派发/撤回）→ null（chip 收敛清除）；位次变化 → 跟随；其余 → 原样返回。
+ *  纯函数——轮询 effect 每 tick 调用，测试直接钉行为。 */
+export function reconcileCodexQueuedReceipt(
+  prev: CodexQueuedReceipt,
+  view: CodexQueueView
+): CodexQueuedReceipt | null {
+  const mine = view.actions.find((a) => a.actionId === prev.actionId);
+  if (!mine) return null;
+  if (mine.position !== null && mine.position !== prev.position) {
+    return { ...prev, position: mine.position };
+  }
+  return prev;
 }
 
 /** 平台能力集。false = 该 build 尚未活体验证，不表示协议实现不存在。 */
@@ -188,6 +214,7 @@ export interface CapabilitySet {
   command: boolean;
   permissions: boolean;
   blockingInput: boolean;
+  interrupt: boolean;
 }
 
 /** 附件类别（Rust `ArtifactKind` 的 snake_case 取值）。 */
@@ -325,6 +352,7 @@ export const CODEX_ACTION_PATH = "/m/api/v1/codex/action";
 export const CODEX_QUEUE_PATH = "/m/api/v1/codex/queue";
 export const CODEX_QUEUE_RETRACT_PATH = "/m/api/v1/codex/queue/retract";
 export const CODEX_QUEUE_FORCE_CONTINUE_PATH = "/m/api/v1/codex/queue/force-continue";
+export const CODEX_TURN_INTERRUPT_PATH = "/m/api/v1/codex/turn/interrupt";
 
 // ==== fetch 基建 ====
 
@@ -692,6 +720,60 @@ export async function forceContinueCodexAction(actionId: string): Promise<CodexA
   }
   if (!r.ok) throw await toApiError("codex/queue/force-continue", r);
   return (await r.json()) as CodexActionView;
+}
+
+// ==== 打断桌面回合 ====
+
+/** 打断桌面当前回合的结果（2026-10-22 复审 P2-3：投递结果三分支如实回报）。
+ *  - `interruptedTurnId` 非空 = 确实打断了那个回合；
+ *  - `interruptedTurnId` 为 null 且 `uncertain` false = 桌面侧没有可打断的活动回合
+ *   （**不谎报成功**，也不当作错误——回合可能刚好自己结束了）；
+ *  - `uncertain` true = 停止指令已发出但结果未知（RPC 超时等）——打断**可能已生效**，
+ *    调用方必须如实呈现「不确定」，不得当作失败诱导立刻重按（重按 = 双发破坏性
+ *    指令）。此时 `reasonCode` 携带机器码（如 timeout）。 */
+export interface InterruptTurnResult {
+  ok: boolean;
+  uncertain: boolean;
+  interruptedTurnId: string | null;
+  expectedTurnId: string | null;
+  /** uncertain=true 时的机器码（timeout / caller_dropped 等）；其余为 null。 */
+  reasonCode?: string | null;
+}
+
+/** 打断桌面 Codex 当前回合（2026-10-21 新增）。
+ *
+ * **破坏性动作**：被打断回合未完成的工作会丢失——调用方必须先经两步确认并向用户
+ * 披露该风险，不得静默触发。
+ *
+ * `turnId` 缺省时由服务端取**在册原生屏障绑定的 turnId** 作 `expectedTurnId` 安全阀
+ * （Desktop 侧「与当前活动回合不符 → 静默不动作」）；两路都取不到阀值 → 409
+ * `no_expected_turn` 拒绝（零 IPC 写入，复审 P1-1——服务端绝不无阀照发）。
+ * 200 = 打断请求已投递（`uncertain` 见上）；409 = 上下文过期（stale_context）或
+ * 桌面明确拒绝（desktop_rejected）；503 = 该 Desktop 版本未验证打断能力 / 连接不可用。
+ * 错误体的 `reason` 为中文可读文案，展示侧优先取用（不裸示机器码）。 */
+export async function interruptCodexTurn(
+  sessionId: string,
+  turnId?: string
+): Promise<InterruptTurnResult> {
+  let r: Response;
+  try {
+    r = await fetch(CODEX_TURN_INTERRUPT_PATH, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(turnId ? { sessionId, turnId } : { sessionId }),
+    });
+  } catch (e) {
+    throw networkFail("codex/turn/interrupt", e);
+  }
+  if (!r.ok) throw await toApiError("codex/turn/interrupt", r);
+  const raw = (await r.json()) as Partial<InterruptTurnResult>;
+  return {
+    ok: raw.ok === true,
+    uncertain: raw.uncertain === true,
+    interruptedTurnId: raw.interruptedTurnId ?? null,
+    expectedTurnId: raw.expectedTurnId ?? null,
+    reasonCode: raw.reasonCode ?? null,
+  };
 }
 
 // ==== actionId 生成 ====

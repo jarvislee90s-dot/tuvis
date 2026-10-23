@@ -1,7 +1,14 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import PairPage from "@/mobile/PairPage";
 import { ApiError, pairWithPin } from "@/mobile/api";
+
+// 文案走 mobile.pair.* 双语键后按 zh 断言（QuestionCard.test 同款：显式引入并固定中文）
+import i18n from "@/i18n";
+
+beforeAll(async () => {
+  await i18n.changeLanguage("zh");
+});
 
 // 只 mock pairWithPin（交互用例不依赖真实 fetch）；ApiError 保持真实现
 vi.mock("@/mobile/api", async (importOriginal) => {

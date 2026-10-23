@@ -1,7 +1,22 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import ApproveCard from "@/mobile/ApproveCard";
 import type { ApproveOptionsView } from "@/mobile/api";
+
+// 文案走 mobile.* 双语键后按 zh 断言（Board.test 同款：显式引入并固定中文）。
+// 只 changeLanguage 不够：jsdom 默认 en-US 会在语言重评估时翻回 en——浏览器
+// 语言一并钉到 zh（language-toggle 同款）
+import { pinZhNavigator } from "./pinZhNavigator";
+
+let unpinZh: () => void;
+
+beforeAll(async () => {
+  unpinZh = await pinZhNavigator();
+});
+
+afterAll(() => {
+  unpinZh();
+});
 
 // M8 Task 12：移动端红卡审批选项卡。fetch 全量 stub（盖过 setup.ts 的 msw），
 // 按 URL 分路到 approve-options / approve 两族端点（注意前缀包含关系：
@@ -718,7 +733,7 @@ describe("ApproveCard：计划批准卡（2026-10-04）", () => {
 // 而 ApproveCard 两处 catch（点选项 / 点反馈项）都没消费该码 → 用户屏幕上出现
 // 「session-approve 409」。本组钉住：两处入口都走 api.ts 的 `approveErrorCopy` 单点，
 // 渲染后端中文引导、且不含「409」。
-// 断言一律用**字面量**中文，不 import `APP_FORM_PENDING_FALLBACK` 去比对自身——
+// 断言一律用**字面量**中文，不 import `mobile.errors.appFormPending` 键值去比对自身——
 // 否则常量一改用例照样绿，退化成循环断言（既有 mobile 用例同此惯例）。
 describe("ApproveCard：app_form_pending 分诊（Task 15 止血门）", () => {
   /** 后端下发的引导原文（与 api.rs 的 APP_FORM_PENDING_REASON 逐字同义） */

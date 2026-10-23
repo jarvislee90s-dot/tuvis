@@ -50,7 +50,7 @@
 
 | # | 功能 | 说明 |
 |---|---|---|
-| F1.1 | 接入层核心 | axum 服务器（默认关闭，设置/托盘开关）、配对面板（审批配对默认 + 直通配对可选，见 D11）、设备管理（花名册/吊销/手动腾位） |
+| F1.1 | 接入层核心 | axum 服务器（无历史数据库的新安装默认开启，已有配置保持原值；设置/托盘开关；各通道仍由用户手动开启，2026-10-22 用户裁决）、配对面板（审批配对默认 + 直通配对可选，见 D11）、设备管理（花名册/吊销/手动腾位） |
 | F1.2 | 通道四模式 | 直连域名（绑 0.0.0.0，用户反代+TLS）/ named tunnel（Token）/ quick tunnel（自动拉起 cloudflared，地址随重启变化需界面明示）/ Tailscale（文档指引） |
 | F1.3 | 移动看板 | 会话卡片（状态/项目/分支/最后消息预览/运行时长），按状态优先级排序，SSE 实时刷新 |
 | F1.4 | 会话内容只读 | `read_session_messages`：按会话全量读（ZCode db.sqlite、Claude/Codex JSONL、OpenCode SQLite、Kimi wire、WorkBuddy JSONL、dsh sessions） |

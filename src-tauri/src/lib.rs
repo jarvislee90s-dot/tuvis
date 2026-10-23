@@ -204,6 +204,7 @@ pub fn run() {
             // M2 远程接入：按设置恢复远程服务器（开机自启语义；内部用
             // tauri::async_runtime，无 runtime 上下文的主线程可安全调用）
             crate::remote::restore_on_launch();
+            commands::autostart::initialize_on_first_launch(app.handle());
             // 用量账本：应用启动采集一次（按需路径，绝不进 3 秒轮询）
             crate::services::usage::collect::spawn_initial_collection();
             // 公开价格：每 5 分钟检查一次 enabled && stale；未启用时零请求
@@ -343,6 +344,8 @@ pub fn run() {
         commands::manifest::get_store_index,
         remote::remote_toggle,
         remote::remote_status,
+        // 三终端语言自适应（C-3）：前端推送桌面当前语言（远程端跟随的数据源）
+        remote::set_desktop_language,
         remote::remote_confirm_public,
         remote::remote_devices,
         remote::remote_revoke_device,
@@ -356,6 +359,9 @@ pub fn run() {
         // §C2：Tailscale 首次配置引导一条龙（向导探测 + 单步触发）
         remote::remote_ts_probe,
         remote::remote_ts_run_step,
+        remote::named::remote_named_probe,
+        remote::named::remote_named_set_address,
+        remote::named::remote_named_verify,
         // H3：无头注入总开关——默认关，翻转写审计 + 广播状态
         remote::remote_toggle_headless,
         // H4：无头子区另两件——watchdog 超时 + 全局并发上限

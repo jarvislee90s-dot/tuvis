@@ -607,6 +607,12 @@ pub struct RemoteState {
     /// CompatOnly/拒绝、不装配调度循环）；生产 = `remote/mod.rs` STATE 的
     /// [`crate::remote::codex_ipc::CodexControlHub::production`]。
     pub codex_control: std::sync::Arc<super::codex_ipc::CodexControlHub>,
+    /// **桌面当前语言内存源**（三终端语言自适应 C-3，2026-10-22）：真值来自前端
+    /// 推送（tauri 命令 `set_desktop_language`，启动初始化后 + 每次切换触发），
+    /// Rust **只存不判**；消费方 = `api::host` 的 C-4 下发。`None` = 未知态
+    /// （未推送），下发如实给 null。Clone 共享内部态；测试各自独立实例防互踩
+    /// （capability_table 同款纪律）。
+    pub desktop_language: super::language::LanguageSource,
 }
 
 /// API 子路由：业务端点 + /pair/pin + 内层 fallback（未知 API 路径直接 403）+ gate 内层 layer。
@@ -616,6 +622,9 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
     Router::new()
         .route("/sessions", get(api::sessions))
         .route("/host", get(api::host))
+        // /device-language（三终端语言自适应 C-5，2026-10-22）：远程端手动语言
+        // 切换写账（仅已配对会话可调——本子路由整体过 gate，全局约束 4）
+        .route("/device-language", post(api::device_language))
         // /ui-config（2026-10-05 UI 改版）：远程端外观配置下发（settings KV 只读缝；
         // PIN 门禁内层 gate 结构性覆盖——新端点不需要各自鉴权代码）
         .route("/ui-config", get(api::ui_config))
@@ -676,6 +685,12 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         .route(
             "/codex/pending-response",
             post(super::codex_ipc::pending_response),
+        )
+        // 打断桌面当前回合（破坏性：打断后回合未完成的工作丢失）。回合终态到达时
+        // 屏障释放、待发队列接力——「远程点掉那个卡」的闭环。
+        .route(
+            "/codex/turn/interrupt",
+            post(super::codex_ipc::interrupt_turn),
         )
         // M8 Task 11：审批端点（红卡一键批准/拒绝——选项可用性 + 按键应答；PIN 门禁
         // 内层 gate 结构性覆盖，新端点不需要各自鉴权代码）
@@ -874,6 +889,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         })
     }
 
@@ -1522,6 +1538,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         });
         // 预置有效设备，令 gate 放行（否则不会走到 session_source，测试失去意义）
         let now = chrono::Utc::now().timestamp_millis();
@@ -1920,6 +1937,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         });
         let app = router(state.clone());
         let now = chrono::Utc::now().timestamp_millis();
@@ -1965,6 +1983,324 @@ mod tests {
         assert!(
             body.contains("\"enabledTools\""),
             "enabledTools 数据源随载荷返回"
+        );
+    }
+
+    // ==== 三终端语言自适应（2026-10-22）：C-4 连接下发 + C-5 记账端点 ====
+
+    /// 测试设备落库（内存库配对身份——语言账本键与配对身份同源的结构前提）
+    fn persist_language_test_device(state: &Arc<RemoteState>, id: &str) {
+        state.store.with(|c| {
+            crate::remote::pairing::persist_device(
+                c,
+                &crate::remote::pairing::NewDevice {
+                    id: id.into(),
+                    name: String::new(),
+                    ua: "ua-lang".into(),
+                    origin_ip: "127.0.0.1".into(),
+                    via: "lan".into(),
+                    paired_at: chrono::Utc::now().timestamp_millis(),
+                },
+            )
+            .unwrap();
+        });
+    }
+
+    /// C-4：已配对连接响应（GET /host）携带 `desktopLanguage`（C-3 内存源当前值）
+    /// 与 `manualLanguage`（**该设备**的手动记录）；且下发是纯读——C-5 ⑤：连接下发
+    /// **绝不产生任何记账写入**（自动跟随结果绝不落账，设备记录不被桌面语言覆盖）
+    #[tokio::test]
+    async fn host_paired_response_carries_language_fields_without_writing_ledger() {
+        let state = test_state();
+        // LanguageSource 是 Clone 的共享句柄：直接经 Arc 解引用推送当前语言
+        state
+            .desktop_language
+            .set(crate::remote::language::UiLanguage::Zh);
+        persist_language_test_device(&state, "hd");
+        // 预置 hd 的手动记录 = en（该手机曾手动选英文）
+        state.store.with(|c| {
+            crate::remote::language::set_manual_language(
+                c,
+                "hd",
+                crate::remote::language::UiLanguage::En,
+                1000,
+            )
+            .unwrap();
+        });
+
+        let app = crate::remote::server::router(state.clone());
+        let r = app
+            .oneshot(req("GET", "/m/api/v1/host", Some("mam_device=hd"), None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            body.contains("\"desktopLanguage\":\"zh\""),
+            "desktopLanguage 随 C-3 内存源下发，实际 {body}"
+        );
+        assert!(
+            body.contains("\"manualLanguage\":\"en\""),
+            "manualLanguage 按设备记录下发（手动优先于桌面语言），实际 {body}"
+        );
+
+        // C-5 ⑤：GET 之后账本零变化（行数不变、记录未被改写成桌面语言）
+        let rows: i64 = state.store.with(|c| {
+            c.query_row("SELECT COUNT(*) FROM remote_device_language", [], |x| {
+                x.get(0)
+            })
+            .unwrap()
+        });
+        assert_eq!(rows, 1, "连接下发绝不写账（自动结果不入账本）");
+        let still = state
+            .store
+            .with(|c| crate::remote::language::manual_language(c, "hd"));
+        assert_eq!(
+            still,
+            Some(crate::remote::language::UiLanguage::En),
+            "下发不覆盖设备手动记录（§1.5 独立计算）"
+        );
+    }
+
+    /// C-4 未知态：前端尚未推送（内存源未知）与设备无手动记录（新设备）→ 两字段
+    /// 如实 null——Rust 只存不判，绝不自行补值（移动端决策链负责兜底，M2）
+    #[tokio::test]
+    async fn host_language_fields_stay_null_when_unknown_or_unrecorded() {
+        let state = test_state(); // desktop_language 保持未知（未推送）
+        persist_language_test_device(&state, "hd");
+        let app = crate::remote::server::router(state);
+        let r = app
+            .oneshot(req("GET", "/m/api/v1/host", Some("mam_device=hd"), None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            body.contains("\"desktopLanguage\":null"),
+            "未推送 = null（不自行判定），实际 {body}"
+        );
+        assert!(
+            body.contains("\"manualLanguage\":null"),
+            "无记录 = null（C-5 ①），实际 {body}"
+        );
+    }
+
+    /// 全局约束 4 / L1：未配对（无 cookie）与设备失效（已吊销）的响应**不含**
+    /// C-4 两字段——语言下发只走已配对通道，配对页拿不到桌面语言
+    #[tokio::test]
+    async fn unpaired_and_revoked_host_responses_omit_language_fields() {
+        let state = test_state();
+        state
+            .desktop_language
+            .set(crate::remote::language::UiLanguage::En);
+        persist_language_test_device(&state, "hd");
+        let app = crate::remote::server::router(state.clone());
+
+        // ① 无 cookie（未配对）→ 403 且不含语言字段
+        let r = app
+            .clone()
+            .oneshot(req("GET", "/m/api/v1/host", None, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+        let body = body_string(r).await;
+        assert!(
+            !body.contains("desktopLanguage") && !body.contains("manualLanguage"),
+            "未配对响应不得携带 C-4 两字段，实际 {body}"
+        );
+
+        // ② 已吊销设备 cookie → 403 同样不含（gate 拒绝，端点根本不执行）
+        state
+            .store
+            .with(|c| crate::remote::pairing::revoke_device(c, "hd").unwrap());
+        let r = app
+            .oneshot(req("GET", "/m/api/v1/host", Some("mam_device=hd"), None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+        let body = body_string(r).await;
+        assert!(
+            !body.contains("desktopLanguage") && !body.contains("manualLanguage"),
+            "过不了闸的响应不得携带 C-4 两字段，实际 {body}"
+        );
+    }
+
+    /// C-5 写端点矩阵（POST /device-language）：未配对 403 且不落账 → 值集外 400
+    /// 且不落账 → 手动写 zh → 200 返回最新记录 `{manual:true,language:"zh"}` →
+    /// 再写 en 覆盖（U14 最后一次手动为准）→ 账本读侧与响应逐次一致且不新增行
+    #[tokio::test]
+    async fn device_language_endpoint_write_matrix() {
+        let state = test_state();
+        persist_language_test_device(&state, "hd");
+        let app = crate::remote::server::router(state.clone());
+
+        // ① 未配对（无 cookie）→ 403（写接口仅已配对会话可调，全局约束 4）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/device-language",
+                None,
+                Some(r#"{"language":"zh"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+        assert!(
+            state
+                .store
+                .with(|c| crate::remote::language::manual_language(c, "hd"))
+                .is_none(),
+            "403 路径绝不落账"
+        );
+
+        // ② 值集外（"fr"）→ 400 且不落账（Rust 不判语言，非法即拒）
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/device-language",
+                Some("mam_device=hd"),
+                Some(r#"{"language":"fr"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        assert!(
+            state
+                .store
+                .with(|c| crate::remote::language::manual_language(c, "hd"))
+                .is_none(),
+            "非法值不落账"
+        );
+
+        // ③ 手动写 zh → 200 + 最新记录 {manual:true, language:"zh"}，账本可读回
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/device-language",
+                Some("mam_device=hd"),
+                Some(r#"{"language":"zh"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            body.contains("\"manual\":true") && body.contains("\"language\":\"zh\""),
+            "响应返回该设备最新记录，实际 {body}"
+        );
+        assert_eq!(
+            state
+                .store
+                .with(|c| crate::remote::language::manual_language(c, "hd")),
+            Some(crate::remote::language::UiLanguage::Zh)
+        );
+
+        // ④ 再写 en → 覆盖（最后一次手动为准，U14），响应与账本同步、不新增行
+        let r = app
+            .oneshot(req(
+                "POST",
+                "/m/api/v1/device-language",
+                Some("mam_device=hd"),
+                Some(r#"{"language":"en"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let body = body_string(r).await;
+        assert!(
+            body.contains("\"manual\":true") && body.contains("\"language\":\"en\""),
+            "覆盖后响应返回最新记录，实际 {body}"
+        );
+        assert_eq!(
+            state
+                .store
+                .with(|c| crate::remote::language::manual_language(c, "hd")),
+            Some(crate::remote::language::UiLanguage::En)
+        );
+        let rows: i64 = state.store.with(|c| {
+            c.query_row("SELECT COUNT(*) FROM remote_device_language", [], |x| {
+                x.get(0)
+            })
+            .unwrap()
+        });
+        assert_eq!(rows, 1, "同设备反复切换只占一行（覆盖不新增）");
+    }
+
+    /// §6.4-3 / L2 路由级钉死：配对 → 该设备写手动记录 → 同一浏览器重配
+    /// （指纹 upsert 复用同一设备 id）→ 记录清零（读作无记录，回到跟随桌面语言，
+    /// 连接下发如实 null）。配对行为本身（身份签发/名额语义）零改动——全局约束 12。
+    #[tokio::test]
+    async fn repairing_same_device_clears_language_ledger_record() {
+        let (state, _t) = a3_state(Some("1234"), 10, &[], &[], &[], false);
+        let app = router(state.clone());
+
+        // ① 首次配对（同浏览器 = 同 UA + 同来源 → 同指纹）
+        let r = app
+            .clone()
+            .oneshot(pin_post(
+                "203.0.113.7:53001",
+                None,
+                Some("ua-repair"),
+                r#"{"pin":"1234","name":"我的手机"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let id1 = cookie_device_id(&r);
+        // 预置该设备的手动语言记录 = en（曾手动选英文），另设他设备记录作对照组
+        state.store.with(|c| {
+            crate::remote::language::set_manual_language(
+                c,
+                &id1,
+                crate::remote::language::UiLanguage::En,
+                1000,
+            )
+            .unwrap();
+            crate::remote::language::set_manual_language(
+                c,
+                "other-device",
+                crate::remote::language::UiLanguage::Zh,
+                1000,
+            )
+            .unwrap();
+        });
+
+        // ② 同一浏览器重配（同 UA + 同来源）→ 指纹命中旧行，复用同一设备 id
+        //（正是「记录会穿越重配幸存」的路径——本测试的变异锚点）
+        let r = app
+            .clone()
+            .oneshot(pin_post(
+                "203.0.113.7:53001",
+                None,
+                Some("ua-repair"),
+                r#"{"pin":"1234","name":"我的手机"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let id2 = cookie_device_id(&r);
+        assert_eq!(
+            id2, id1,
+            "upsert 命中必须复用同一设备 id（评审 B 语义，cookie 下发依赖它）"
+        );
+
+        // ③ 重配完成 → 该设备手动记录清零；按键级隔离，他设备记录不受影响
+        assert_eq!(
+            state
+                .store
+                .with(|c| crate::remote::language::manual_language(c, &id1)),
+            None,
+            "重新配对 = 记录清零，回到自动跟随（§6.4-3 / L2）"
+        );
+        assert_eq!(
+            state
+                .store
+                .with(|c| crate::remote::language::manual_language(c, "other-device")),
+            Some(crate::remote::language::UiLanguage::Zh),
+            "清零只作用于重配设备，他设备记录不动"
         );
     }
 
@@ -2063,6 +2399,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         });
         let app = router(state.clone());
         let now = chrono::Utc::now().timestamp_millis();
@@ -2266,6 +2603,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         });
         let app = router(state.clone());
         persist_device(&state, "fe");
@@ -2562,6 +2900,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         });
         let app = router(state.clone());
         persist_device(&state, "fe");
@@ -2746,6 +3085,7 @@ mod tests {
                 pairing_counter: Box::new(Vec::new),
 
                 codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+                desktop_language: Default::default(),
             }),
             t,
         )
@@ -3963,6 +4303,7 @@ mod tests {
                     pairing_counter: Box::new(Vec::new),
 
                     codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+                    desktop_language: Default::default(),
                 }),
                 t,
             )
@@ -4317,6 +4658,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         })
     }
 
@@ -4562,6 +4904,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         })
     }
 
@@ -6730,6 +7073,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         })
     }
 
@@ -7768,6 +8112,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         });
         persist_named_device(&state, "mm", "测试设备");
         (state, inner, script)
@@ -10983,6 +11328,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         })
     }
 
@@ -12112,6 +12458,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         })
     }
 
@@ -12396,6 +12743,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         });
         persist_named_device(&state2, "mm", "测试设备");
         let app = router(state2.clone());
@@ -12881,6 +13229,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         });
         (state, sid_out)
     }
@@ -12938,6 +13287,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         });
         (state, sid_out)
     }
@@ -13025,6 +13375,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         });
         (state, sid_out)
     }
@@ -14347,6 +14698,7 @@ mod tests {
             subagent_message_source: std::collections::HashMap::new(),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         })
     }
 
@@ -15313,6 +15665,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         })
     }
 
@@ -15476,6 +15829,7 @@ mod tests {
             pairing_counter: Box::new(Vec::new),
 
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         })
     }
 

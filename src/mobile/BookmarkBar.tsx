@@ -13,6 +13,7 @@
 // 唯一内部状态是「调色板是否展开」「是否管理态」。
 import { useState } from "react";
 import { FoldVertical, Plus, Settings2, UnfoldVertical, X } from "lucide-react";
+import i18n from "@/i18n";
 import { BOOKMARK_COLORS, type Bookmark } from "./bookmarks";
 
 interface BookmarkBarProps {
@@ -53,8 +54,8 @@ export default function BookmarkBar({
         <button
           type="button"
           data-testid="bookmark-add"
-          aria-label="添加书签"
-          title={atLimit ? "已达 10 个书签上限" : "在当前位置添加书签"}
+          aria-label={i18n.t("mobile.bookmark.addAria")}
+          title={i18n.t(atLimit ? "mobile.bookmark.limitTitle" : "mobile.bookmark.addTitle")}
           aria-expanded={paletteOpen}
           disabled={atLimit}
           onClick={() => setPaletteOpen((v) => !v)}
@@ -65,7 +66,7 @@ export default function BookmarkBar({
           }`}
         >
           <Plus size={13} />
-          书签
+          {i18n.t("mobile.bookmark.add")}
         </button>
 
         {/* 管理 / 完成（2026-09-20 用户裁决：紧挨「书签」文字右侧，
@@ -73,7 +74,7 @@ export default function BookmarkBar({
         <button
           type="button"
           data-testid={managing ? "bookmark-manage-done" : "bookmark-manage"}
-          aria-label={managing ? "完成管理" : "管理书签"}
+          aria-label={i18n.t(managing ? "mobile.bookmark.doneAria" : "mobile.bookmark.manageAria")}
           aria-pressed={managing}
           onClick={() => setManaging((v) => !v)}
           className={`shrink-0 rounded-full p-1 text-xs ${
@@ -82,7 +83,7 @@ export default function BookmarkBar({
               : "text-[var(--mut)] hover:bg-[var(--cb)] dark:hover:bg-[var(--btnp)]"
           }`}
         >
-          {managing ? "完成" : <Settings2 size={14} />}
+          {managing ? i18n.t("mobile.bookmark.done") : <Settings2 size={14} />}
         </button>
 
         {/* 清空全部（仅管理态 + 有书签） */}
@@ -90,11 +91,11 @@ export default function BookmarkBar({
           <button
             type="button"
             data-testid="bookmark-clear-all"
-            aria-label="清空全部书签"
+            aria-label={i18n.t("mobile.bookmark.clearAllAria")}
             onClick={onClear}
             className="shrink-0 rounded-full bg-rose-500/15 px-2 py-0.5 text-xs text-rose-700 dark:text-rose-400"
           >
-            清空全部
+            {i18n.t("mobile.bookmark.clearAll")}
           </button>
         )}
 
@@ -105,8 +106,13 @@ export default function BookmarkBar({
               key={b.color}
               type="button"
               data-testid={`bookmark-${managing ? "remove" : "dot"}-${b.color}`}
-              aria-label={`${managing ? "删除" : "跳转到"}书签 ${b.preview}`}
-              title={managing ? `删除：${b.preview}` : b.preview}
+              aria-label={i18n.t(
+                managing ? "mobile.bookmark.removeAria" : "mobile.bookmark.jumpAria",
+                { preview: b.preview }
+              )}
+              title={
+                managing ? i18n.t("mobile.bookmark.removeTitle", { preview: b.preview }) : b.preview
+              }
               onClick={() => (managing ? onRemove(b.color) : onJump(b.anchor))}
               style={{ backgroundColor: b.color }}
               className={
@@ -127,12 +133,16 @@ export default function BookmarkBar({
           <button
             type="button"
             data-testid="process-collapse-toggle"
-            aria-label={processToggle.allCollapsed ? "展开全部过程" : "折叠全部过程"}
+            aria-label={i18n.t(
+              processToggle.allCollapsed
+                ? "mobile.bookmark.processExpandAria"
+                : "mobile.bookmark.processCollapseAria"
+            )}
             aria-pressed={!processToggle.allCollapsed}
             title={
               processToggle.allCollapsed
-                ? "展开全部过程（思考/工具调用）"
-                : "折叠全部过程（思考/工具调用）"
+                ? i18n.t("mobile.bookmark.processExpandTitle")
+                : i18n.t("mobile.bookmark.processCollapseTitle")
             }
             onClick={processToggle.onToggle}
             className={`flex shrink-0 items-center gap-0.5 rounded-full px-2 py-0.5 text-xs ${
@@ -142,7 +152,9 @@ export default function BookmarkBar({
             }`}
           >
             {processToggle.allCollapsed ? <UnfoldVertical size={13} /> : <FoldVertical size={13} />}
-            {processToggle.allCollapsed ? "过程展开" : "过程折叠"}
+            {processToggle.allCollapsed
+              ? i18n.t("mobile.bookmark.processExpand")
+              : i18n.t("mobile.bookmark.processCollapse")}
           </button>
         )}
       </div>
@@ -152,7 +164,7 @@ export default function BookmarkBar({
         <div
           data-testid="bookmark-palette"
           role="dialog"
-          aria-label="选择书签颜色"
+          aria-label={i18n.t("mobile.bookmark.paletteAria")}
           className="absolute top-full left-3 z-10 mt-1 flex flex-wrap gap-1.5 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2 shadow-lg"
         >
           {BOOKMARK_COLORS.map((c) => {
@@ -162,8 +174,13 @@ export default function BookmarkBar({
                 key={c}
                 type="button"
                 data-testid={`bookmark-color-${c}`}
-                aria-label={used ? `颜色 ${c} 已占用` : `用颜色 ${c} 添加书签`}
-                title={used ? "该颜色已占用" : "用此颜色添加书签"}
+                aria-label={i18n.t(
+                  used ? "mobile.bookmark.colorUsedAria" : "mobile.bookmark.colorAddAria",
+                  { color: c }
+                )}
+                title={i18n.t(
+                  used ? "mobile.bookmark.colorUsedTitle" : "mobile.bookmark.colorAddTitle"
+                )}
                 disabled={used}
                 onClick={() => {
                   onAdd(c);

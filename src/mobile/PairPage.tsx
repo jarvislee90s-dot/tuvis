@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import i18n from "@/i18n";
 import { ApiError, pairWithPin } from "./api";
 
 interface PairPageProps {
@@ -16,7 +17,7 @@ type PairStatus = "idle" | "pairing" | "ok";
 // 扫码 token 流（#token=）随 M4 审批制一并下线，扫码参数改为 #pin=<密码>。
 // 错误文案按 /pair/pin 响应分診（401 invalid_pin+remaining / 429 retryAfter /
 // pin_not_set / cap_full / 网络异常），逐字口径见 describePairError。
-// 文案硬编码中文（移动页 i18n 随 M3 完善）；P8f 双态配色与 Board.tsx 同口径。
+// 文案走 mobile.pair.* 双语键（三终端语言自适应 M5）；P8f 双态配色与 Board.tsx 同口径。
 export default function PairPage({ onPaired, probing = false }: PairPageProps) {
   const [pin, setPin] = useState("");
   const [status, setStatus] = useState<PairStatus>("idle");
@@ -31,7 +32,7 @@ export default function PairPage({ onPaired, probing = false }: PairPageProps) {
       // 扫码坏链防御（手输路径按钮已禁用，到不了这里）：不发注定失败的请求
       if (!/^\d{4}$/.test(p)) {
         setStatus("idle");
-        setMsg("链接里的访问密码格式不对，请手动输入 4 位数字");
+        setMsg(i18n.t("mobile.pair.error.badPinInLink"));
         return;
       }
       setStatus("pairing");
@@ -49,7 +50,7 @@ export default function PairPage({ onPaired, probing = false }: PairPageProps) {
         return;
       }
       setStatus("idle");
-      setMsg("配对失败，请重试");
+      setMsg(i18n.t("mobile.pair.error.failed"));
     },
     [onPaired]
   );
@@ -70,25 +71,23 @@ export default function PairPage({ onPaired, probing = false }: PairPageProps) {
   return (
     <div className="flex min-h-screen flex-col items-center justify-center bg-[var(--pg)] px-6 text-[var(--tx)]">
       <div className="w-full max-w-xs">
-        <h1 className="text-xl font-semibold text-[var(--tx)]">兔维斯 远程接入</h1>
+        <h1 className="text-xl font-semibold text-[var(--tx)]">{i18n.t("mobile.pair.title")}</h1>
         {/* M5 P3-b：探测期（paired===null）渲染连接指示器而非密码表单——区分
             「探测中」与「未配对」，隧道场景探测可达一二十秒；副标题随态切换 */}
         {probing ? (
           <>
-            <p className="mt-1 text-sm text-[var(--mut)]">正在确认配对状态…</p>
+            <p className="mt-1 text-sm text-[var(--mut)]">{i18n.t("mobile.pair.probing")}</p>
             <div
               data-testid="probe-indicator"
               className="mt-8 flex items-center justify-center gap-2"
             >
               <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-[var(--cb)]" />
-              <span className="text-sm text-[var(--mut)]">正在连接看板…</span>
+              <span className="text-sm text-[var(--mut)]">{i18n.t("mobile.pair.connecting")}</span>
             </div>
           </>
         ) : (
           <>
-            <p className="mt-1 text-sm text-[var(--mut)]">
-              输入访问密码，绑定此设备（180 天免输入）
-            </p>
+            <p className="mt-1 text-sm text-[var(--mut)]">{i18n.t("mobile.pair.subtitle")}</p>
             <form
               onSubmit={(e) => {
                 e.preventDefault();
@@ -116,7 +115,7 @@ export default function PairPage({ onPaired, probing = false }: PairPageProps) {
                   data-testid="autofill-hint"
                   className="mt-2 text-center text-xs text-emerald-600 dark:text-emerald-400"
                 >
-                  ✓ 已从链接自动填入，正在进入…
+                  {i18n.t("mobile.pair.autofillHint")}
                 </p>
               )}
               <button
@@ -124,7 +123,9 @@ export default function PairPage({ onPaired, probing = false }: PairPageProps) {
                 disabled={pin.trim().length !== 4 || status === "pairing"}
                 className="mt-4 w-full rounded-lg bg-[var(--btnp)] py-2.5 text-sm font-medium text-[var(--btnpt)] disabled:opacity-50"
               >
-                {status === "pairing" ? "进入中…" : "进入看板"}
+                {status === "pairing"
+                  ? i18n.t("mobile.pair.entering")
+                  : i18n.t("mobile.pair.enter")}
               </button>
             </form>
             {status === "idle" && msg && (
@@ -136,34 +137,37 @@ export default function PairPage({ onPaired, probing = false }: PairPageProps) {
         )}
         {status === "ok" && (
           <p className="mt-4 text-sm text-emerald-700 dark:text-emerald-400">
-            接入成功，正在进入看板…
+            {i18n.t("mobile.pair.success")}
           </p>
         )}
-        <p className="mt-10 text-center text-xs text-[var(--mut)]">扫码进入时无需手动输入</p>
+        <p className="mt-10 text-center text-xs text-[var(--mut)]">
+          {i18n.t("mobile.pair.scanHint")}
+        </p>
       </div>
     </div>
   );
 }
 
 /** /pair/pin 错误分診（线稿口径）：剩余次数 / 锁定分钟 / 未设密码 / 设备满 / 网络。
- *  非 JSON 错误体（data=null）按状态码兜底；未知组合统一「配对失败」。 */
+ *  非 JSON 错误体（data=null）按状态码兜底；未知组合统一「配对失败」。
+ *  文案走 mobile.pair.error.* 双语键（g5：错误类文案不私造硬编码）。 */
 function describePairError(e: unknown): string {
   if (!(e instanceof ApiError) || e.status === null) {
-    return "网络异常，请检查连接后重试";
+    return i18n.t("mobile.pair.error.network");
   }
   const data = (e.data ?? {}) as { error?: string; remaining?: number; retryAfter?: number };
   if (data.error === "invalid_pin") {
     if (typeof data.remaining === "number" && data.remaining > 0) {
-      return `密码不正确，还可尝试 ${data.remaining} 次（连续输错将锁定 10 分钟）`;
+      return i18n.t("mobile.pair.error.invalidPinRemaining", { remaining: data.remaining });
     }
-    return "密码错误次数过多，已锁定，请约 10 分钟后再试";
+    return i18n.t("mobile.pair.error.invalidPinLocked");
   }
   if (e.status === 429 && typeof data.retryAfter === "number") {
     // 服务端给秒，人读分钟（向上取整，最少 1——「还有 40 秒」显示成 0 分钟是反直觉的）
     const mins = Math.max(1, Math.ceil(data.retryAfter / 60));
-    return `尝试次数过多，已锁定，请约 ${mins} 分钟后再试`;
+    return i18n.t("mobile.pair.error.rateLimited", { minutes: mins });
   }
-  if (data.error === "pin_not_set") return "桌面端尚未设置访问密码";
-  if (data.error === "cap_full") return "设备数量已达上限，请在桌面端花名册腾位后重试";
-  return "配对失败，请重试";
+  if (data.error === "pin_not_set") return i18n.t("mobile.pair.error.pinNotSet");
+  if (data.error === "cap_full") return i18n.t("mobile.pair.error.capFull");
+  return i18n.t("mobile.pair.error.failed");
 }

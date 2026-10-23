@@ -28,6 +28,7 @@ function caps(over: Partial<CapabilitySet> = {}): CapabilitySet {
     command: true,
     permissions: true,
     blockingInput: true,
+    interrupt: false,
     ...over,
   };
 }

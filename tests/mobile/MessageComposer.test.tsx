@@ -1,7 +1,35 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import MessageComposer from "@/mobile/MessageComposer";
 import type { QueueItemView, SendInfo } from "@/mobile/api";
+
+// 文案走 mobile.* 双语键后按 zh 断言（Board.test 同款：显式引入并固定中文）。
+// 只 changeLanguage 不够：jsdom 默认 en-US 会在语言重评估时翻回 en——浏览器
+// 语言一并钉到 zh（language-toggle 同款）
+import i18n from "@/i18n";
+import { pinZhNavigator } from "./pinZhNavigator";
+
+let unpinZh: () => void;
+
+beforeAll(async () => {
+  unpinZh = await pinZhNavigator();
+});
+
+afterAll(() => {
+  unpinZh();
+});
+
+/** en 本地化断言助手（M5 后文件级 beforeAll 钉 zh）：formatInvokeError / reasonCode
+ *  的 en 路径按英文断言（这两条用例验证的就是「英文环境不透出中文原文」），
+ *  跑完切回 zh 不影响同文件其余用例 */
+async function withEn(run: () => Promise<void>) {
+  await i18n.changeLanguage("en");
+  try {
+    await run();
+  } finally {
+    await i18n.changeLanguage("zh");
+  }
+}
 
 // M7 Task 7：移动端发送 UI（W4）。fetch 全量 stub（盖过 setup.ts 的 msw），
 // 按 URL 分路到 send-info / session-send / queue 三族端点（注意 URL 前缀包含
@@ -395,26 +423,27 @@ describe("MessageComposer：发送与回执（W4）", () => {
     expect(input.value).toBe("第一行"); // 输入保持
   });
 
-  it("发送失败（failed 回执）：红 chip 带错误文案、输入保留，可重试转绿", async () => {
-    installFetch();
-    routes.info = sendInfo();
-    routes.send = { status: "failed", error: "定位终端失败：tmux 会话不存在" };
-    render(<MessageComposer session={{ id: "sess-1" }} />);
-    const input = await screen.findByTestId("composer-input");
-    fireEvent.change(input, { target: { value: "再来一次" } });
-    fireEvent.click(screen.getByTestId("composer-send"));
-    const chip = await screen.findByTestId("send-receipt-failed");
-    expect(chip.textContent).toContain("Send failed");
-    expect(chip.textContent).toContain("定位终端失败：tmux 会话不存在");
-    // 失败不清空输入（保留原文供重试）
-    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("再来一次");
-    // 重试 = 再按发送：修正路由后转 delivered
-    routes.send = { status: "delivered" };
-    fireEvent.click(screen.getByTestId("composer-send"));
-    expect(await screen.findByTestId("send-receipt-delivered")).toBeTruthy();
-    expect(screen.queryByTestId("send-receipt-failed")).toBeNull();
-    expect(sendCalls()).toHaveLength(2);
-  });
+  it("发送失败（failed 回执）：红 chip 带错误文案、输入保留，可重试转绿", async () =>
+    withEn(async () => {
+      installFetch();
+      routes.info = sendInfo();
+      routes.send = { status: "failed", error: "定位终端失败：tmux 会话不存在" };
+      render(<MessageComposer session={{ id: "sess-1" }} />);
+      const input = await screen.findByTestId("composer-input");
+      fireEvent.change(input, { target: { value: "再来一次" } });
+      fireEvent.click(screen.getByTestId("composer-send"));
+      const chip = await screen.findByTestId("send-receipt-failed");
+      expect(chip.textContent).toContain("Send failed");
+      expect(chip.textContent).toContain("定位终端失败：tmux 会话不存在");
+      // 失败不清空输入（保留原文供重试）
+      expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("再来一次");
+      // 重试 = 再按发送：修正路由后转 delivered
+      routes.send = { status: "delivered" };
+      fireEvent.click(screen.getByTestId("composer-send"));
+      expect(await screen.findByTestId("send-receipt-delivered")).toBeTruthy();
+      expect(screen.queryByTestId("send-receipt-failed")).toBeNull();
+      expect(sendCalls()).toHaveLength(2);
+    }));
 
   it("网络层 ApiError（如 500）：错误文案可见且可重试", async () => {
     installFetch();
@@ -901,24 +930,25 @@ describe("直发确认分诊回执（D7/T3）", () => {
     expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("");
   });
 
-  it("failed 防重警示回执照旧（T3 回归）：红 chip 携带后端防重文案与（可重试）", async () => {
-    installFetch();
-    routes.info = sendInfo();
-    routes.send = {
-      status: "failed",
-      error: "已注入未确认（未见会话记录），请检查终端后重试",
-    };
-    render(<MessageComposer session={{ id: "sess-1" }} />);
-    const input = await screen.findByTestId("composer-input");
-    fireEvent.change(input, { target: { value: "滞留真失败" } });
-    fireEvent.click(screen.getByTestId("composer-send"));
-    const chip = await screen.findByTestId("send-receipt-failed");
-    expect(chip.textContent).toContain("Send failed");
-    expect(chip.textContent).toContain("已注入未确认（未见会话记录），请检查终端后重试");
-    expect(chip.textContent).toContain("(retry available)");
-    // 分诊两态不混淆：failed 不得渲染成 submitted 中性 chip
-    expect(screen.queryByTestId("send-receipt-submitted")).toBeNull();
-  });
+  it("failed 防重警示回执照旧（T3 回归）：红 chip 携带后端防重文案与（可重试）", async () =>
+    withEn(async () => {
+      installFetch();
+      routes.info = sendInfo();
+      routes.send = {
+        status: "failed",
+        error: "已注入未确认（未见会话记录），请检查终端后重试",
+      };
+      render(<MessageComposer session={{ id: "sess-1" }} />);
+      const input = await screen.findByTestId("composer-input");
+      fireEvent.change(input, { target: { value: "滞留真失败" } });
+      fireEvent.click(screen.getByTestId("composer-send"));
+      const chip = await screen.findByTestId("send-receipt-failed");
+      expect(chip.textContent).toContain("Send failed");
+      expect(chip.textContent).toContain("已注入未确认（未见会话记录），请检查终端后重试");
+      expect(chip.textContent).toContain("(retry available)");
+      // 分诊两态不混淆：failed 不得渲染成 submitted 中性 chip
+      expect(screen.queryByTestId("send-receipt-submitted")).toBeNull();
+    }));
 });
 
 // ==== 附件上传（2026-09-20）：+ 钮 / 粘贴图片 / 发送拼内联标记行 ====
@@ -2044,25 +2074,26 @@ describe("MessageComposer：Codex 动作账本与队列刷新", () => {
     expect(second.actionId).not.toBe("act-old");
   });
 
-  it("403 headless_disabled 显示服务端 reason（不是裸 session-send 403）", async () => {
-    installFetch();
-    routes.info = sendInfo({ channels: ["headless_codex_queue"] });
-    routes.sendStatus = 403;
-    routes.sendBody = {
-      error: "headless_disabled",
-      reasonCode: "headless_disabled",
-      reason: "无头通道未开启，请在电脑端 Tuvis 设置中开启",
-    };
-    render(<MessageComposer session={{ id: "sess-1" }} />);
-    const input = await screen.findByTestId("composer-input");
-    fireEvent.change(input, { target: { value: "兼容发送" } });
-    fireEvent.click(screen.getByTestId("composer-send"));
-    const chip = await screen.findByTestId("send-receipt-failed");
-    // 测试环境默认 en：reasonCode 必须本地化（后端 reason 只有中文，不能原样透出）
-    expect(chip.textContent).toContain("Headless channel is off");
-    expect(chip.textContent).not.toContain("无头通道未开启");
-    expect(chip.textContent).not.toContain("session-send 403");
-  });
+  it("403 headless_disabled 显示服务端 reason（不是裸 session-send 403）", async () =>
+    withEn(async () => {
+      installFetch();
+      routes.info = sendInfo({ channels: ["headless_codex_queue"] });
+      routes.sendStatus = 403;
+      routes.sendBody = {
+        error: "headless_disabled",
+        reasonCode: "headless_disabled",
+        reason: "无头通道未开启，请在电脑端 Tuvis 设置中开启",
+      };
+      render(<MessageComposer session={{ id: "sess-1" }} />);
+      const input = await screen.findByTestId("composer-input");
+      fireEvent.change(input, { target: { value: "兼容发送" } });
+      fireEvent.click(screen.getByTestId("composer-send"));
+      const chip = await screen.findByTestId("send-receipt-failed");
+      // en 环境下 reasonCode 必须本地化（后端 reason 只有中文，不能原样透出）
+      expect(chip.textContent).toContain("Headless channel is off");
+      expect(chip.textContent).not.toContain("无头通道未开启");
+      expect(chip.textContent).not.toContain("session-send 403");
+    }));
 
   it("codex_queued 回执触发 onQueueChanged（本地队列刷新不依赖 Desktop 新帧）", async () => {
     installFetch();

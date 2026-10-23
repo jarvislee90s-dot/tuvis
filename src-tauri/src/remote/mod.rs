@@ -10,6 +10,9 @@ pub mod content;
 pub mod events;
 pub mod files;
 pub mod gate;
+// 三终端语言自适应（2026-10-22）：桌面语言内存源（C-3）+ 配对设备语言手动记账（C-5）
+pub mod language;
+pub mod named;
 pub mod pairing;
 pub mod pin;
 pub mod power;
@@ -696,6 +699,9 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         // M5 P2-a 追记：敏感黑名单的主目录基准（真实 home；取不到时 read_file_safe
         // 走全段保守匹配分支）
         home_source: Box::new(real_home_dir),
+        // 三终端语言自适应（C-3）：桌面当前语言内存源（前端经 set_desktop_language
+        // 命令推送；STATE 单例持有，推送与 /host 下发同源）
+        desktop_language: language::LanguageSource::default(),
     })
 });
 
@@ -1284,6 +1290,7 @@ pub fn remote_status() -> serde_json::Value {
     // M5 A5：通道开关（read_channels 含惰性迁移）+ 隧道双通道快照 + tailscale 快照
     let chans = read_channels();
     let tun = tunnel::snapshot();
+    tailscale::observe_port(port);
     let ts = tailscale::ts_snapshot();
     // M5 A5：通道状态（形状契约见 channels_payload 注释）+ 当前访问密码
     // （gate 已保证本载荷只被本机/已过闸前端读到——pin 展示给设置页与看板持有者）
@@ -1297,11 +1304,48 @@ pub fn remote_status() -> serde_json::Value {
         &ts,
         tailscale::reachability(),
     );
+    // Named 通道的公网可用态由独立只读快照提供；remote_status 每 3 秒轮询时不做网络探测。
+    let named_probe = named::probe();
+    ch["named"]["connected"] = serde_json::json!(named_probe.connected);
+    ch["named"]["configKey"] = serde_json::json!(named_probe.config_key);
+    ch["named"]["reach"] = serde_json::to_value(&named_probe.reach)
+        .unwrap_or_else(|_| serde_json::json!({ "state": "unverified" }));
+    ch["named"]["waiting"] = named_probe.waiting.clone();
+    ch["named"]["address"] = named::available_address(&named_probe)
+        .map_or(serde_json::Value::Null, serde_json::Value::String);
+    // 只读内存快照：配置变更即使没有改变运行/可达性枚举，也能通知向导重探。
+    ch["tailscale"]["configKey"] = serde_json::json!(tailscale::config_key_snapshot());
+    // 与 named 同形状提供 Tailscale 连续等待起点；通道关闭时必须为 null。
+    ch["tailscale"]["waiting"] = if chans.tailscale {
+        tailscale::waiting_status()
+    } else {
+        serde_json::Value::Null
+    };
     // M5 P2-c：命名地址记忆/手填透出（named 卡片显示优先级：解析地址 > 手填 > 上次）
     ch["named"]["lastAddr"] = serde_json::json!(named_last_addr());
     st["channels"] = ch;
     st["pin"] = serde_json::json!(pin::get_pin());
     st
+}
+
+/// 三终端语言自适应（C-3，2026-10-22）：前端推送桌面当前语言（启动 i18n 初始化
+/// 完成后 + 每次切换触发，与托盘重建同路）。Rust **只存不判**：值集只认
+/// `"zh"` / `"en"`（C-1），其余一律 Err 拒收——绝不在此猜测归流；写入目标是
+/// STATE 单例的内存源（`/host` 的 C-4 下发同源读取）。
+#[tauri::command]
+pub fn set_desktop_language(language: String) -> Result<(), String> {
+    match language::UiLanguage::parse(&language) {
+        Some(lang) => {
+            STATE.desktop_language.set(lang);
+            Ok(())
+        }
+        None => Err(format!(
+            // 拒收信息面向开发者（前端 console.error），走英文原文——错误码需配
+            // zh/en locale 双键（src/i18n/** 不在本任务可改范围），裸中文串会触发
+            // 错误码迁移棘轮（mod.rs 基线 0）
+            "set_desktop_language: invalid language value {language:?} (expect \"zh\" or \"en\")"
+        )),
+    }
 }
 
 /// 快照聚合的「首个可用隧道看板地址」（纯函数，quick 优先）：错误通道不宣称——
@@ -2204,6 +2248,20 @@ mod tests {
         apply_compat_send_status(&mut st, &conn, true);
         assert_eq!(st["compatSendEnabled"], serde_json::json!(true));
         assert_eq!(st["compatSendEligible"], serde_json::json!(true));
+    }
+
+    /// 三终端语言自适应（C-3）：推送命令的值集闸门——"zh"/"en" 之外一律 Err
+    /// （Rust 只存不判）。只测拒收路径：Ok 路径写全局 STATE，单测不触
+    /// （内存源推送次序语义由 language::tests 的 LanguageSource 用例覆盖）
+    #[test]
+    fn set_desktop_language_rejects_values_outside_c1_set() {
+        assert!(set_desktop_language("fr".to_string()).is_err());
+        assert!(
+            set_desktop_language("ZH".to_string()).is_err(),
+            "大小写变体不收"
+        );
+        assert!(set_desktop_language(String::new()).is_err());
+        assert!(set_desktop_language("zh-CN".to_string()).is_err());
     }
 
     // ==== Task 4 生命周期接线：纯逻辑测试 ====

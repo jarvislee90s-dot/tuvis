@@ -255,6 +255,16 @@ pub fn init(conn: &Connection) {
             session_id   TEXT PRIMARY KEY,
             hidden_at    TEXT NOT NULL
         );
+        -- 三终端语言自适应（2026-10-22）：远程端配对设备语言手动记账（C-5）。
+        -- 键 = remote_devices.id（配对身份同源，换网络/换 IP 不丢；重新配对新身份天然无记录）；
+        -- 行存在即「该设备设置过手动语言」（manual 恒 true，无独立布尔列），
+        -- language 只认 "zh"/"en"（值集校验在 Rust 侧 remote::language::UiLanguage::parse）。
+        -- 只由移动端手动切换端点写入，自动跟随结果绝不落账；读侧无行 = 未手动选择。
+        CREATE TABLE IF NOT EXISTS remote_device_language (
+            device_id   TEXT PRIMARY KEY,
+            language    TEXT NOT NULL,
+            updated_at  INTEGER NOT NULL DEFAULT 0
+        );
         -- ===== 用量账本（计划①，契约 §4）=====
         -- 明细：per-(源, 会话, **小时桶**, **记录级项目键**, 模型, 供应商) 的增量账；保留期可配（默认 90 天）。
         -- hour_key = "YYYY-MM-DDTHH"（本地时区，支持 5h 档小时趋势）；day_key 为派生冗余列

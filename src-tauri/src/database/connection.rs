@@ -6,7 +6,7 @@ use std::sync::Mutex;
 /// 应用数据主目录：TUVIS_HOME 环境变量仅在 debug/test 构建（debug_assertions）生效，
 /// 用于集成测试重定向数据目录（Windows 下 dirs::home_dir 无法用 HOME 重定向）；
 /// release 生产构建一律使用真实用户目录，防止环境变量误设导致 DB 与 skills/plugins 数据割裂
-fn app_data_home() -> std::path::PathBuf {
+pub(crate) fn app_data_home() -> std::path::PathBuf {
     // release 构建里 `TUVIS_HOME` 根本不参与解析 ⇒ 连环境变量都不读（与改动前逐字同义）。
     // `cfg!` 是编译期常量，本分支在 release 会被整个折掉。
     let mam_home = if cfg!(debug_assertions) {
@@ -47,12 +47,16 @@ fn app_data_home_with(mam_home: Option<std::ffi::OsString>) -> std::path::PathBu
 
 /// 全局数据库连接（从 store.rs 搬移，保持原有模式）
 pub static DB: Lazy<Mutex<Connection>> = Lazy::new(|| {
+    // 必须在品牌迁移及建库之前取证；旧库缺设置键也不等于首次安装。
+    let fresh = super::first_run::is_fresh_home(&app_data_home());
     migrate_legacy_data_home();
     let db_dir = app_data_home().join(".tuvis");
     let _ = std::fs::create_dir_all(&db_dir);
     let db_path = db_dir.join("tuvis.db");
     let conn = Connection::open(&db_path).expect("Failed to open mam database");
     crate::database::schema::init(&conn);
+    super::first_run::seed_defaults(&conn, fresh)
+        .expect("Failed to initialize first-install defaults");
     Mutex::new(conn)
 });
 

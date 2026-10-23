@@ -1,24 +1,20 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Archive, Moon, Power, Sun, Volume2, VolumeX } from "lucide-react";
+import { Archive, Languages, Moon, Power, Sun, Volume2, VolumeX } from "lucide-react";
 import CreateSessionSheet from "./CreateSessionSheet";
 import logoLight from "./assets/logo-light.png";
 import logoDark from "./assets/logo-dark.png";
-import {
-  closeSession,
-  connectEvents,
-  fetchHost,
-  fetchSessions,
-  hideSession,
-  type HostPayload,
-} from "./api";
+import { closeSession, connectEvents, fetchSessions, hideSession, type HostPayload } from "./api";
 import { currentAccent, getInitialTheme, toggleTheme, type Theme } from "./theme";
+import { applyConnectLanguage, fetchConnectPayload, switchMobileLanguage } from "./language";
 import { getSoundEnabled, playCompletionChime, toggleSoundEnabled } from "./sound";
+import i18n from "@/i18n";
+import type { UiLanguage } from "@/i18n/language-prefs";
 import {
   STATUS_COLOR_KIND,
-  STATUS_LABELS,
+  STATUS_LABEL_KEYS,
   TOOL_BRAND_COLORS,
   TOOL_BRAND_COLORS_DARK,
-  TOOL_LABELS,
+  TOOL_LABEL_KEYS,
   applyTransition,
   filterByAgent,
   filterEnabledTools,
@@ -139,6 +135,24 @@ export default function Board({
   const [theme, setTheme] = useState<Theme>(() => getInitialTheme());
   // 提示音总开关（2026-09-19）：初值从 localStorage 读；只控提示音，不影响横幅/振动
   const [soundOn, setSoundOn] = useState<boolean>(() => getSoundEnabled());
+  // 界面语言（三终端语言自适应 M4，U6 二值）：真值源 = i18n 生效语言（启动检测 /
+  // 连接时重评估 / 手动切换同一出处），languageChanged 订阅把外部变化（连接时跟随
+  // 桌面）同步进按钮；点击经 switchMobileLanguage 立即生效 + 钉住手动 + 桌面按设备
+  // 记账（C-5；记账失败由入口经 formatInvokeError toast 如实提示，乐观显示不回滚
+  // ——账本真值由下次连接收敛，见 ./language.ts 模块注）。
+  // 按钮短码「ZH/EN」为语言代码自指（ISO 码永不被翻译），不入 i18n 键（豁免登记）
+  const [lang, setLang] = useState<UiLanguage>(() => i18n.language as UiLanguage);
+  useEffect(() => {
+    const syncLang = () => setLang(i18n.language as UiLanguage);
+    i18n.on("languageChanged", syncLang);
+    return () => i18n.off("languageChanged", syncLang);
+  }, []);
+  /** 二值切换（无三态，U6）：乐观翻转按钮态 + 走切换生效入口（生效/钉住/记账一体）。 */
+  const toggleLanguage = () => {
+    const next: UiLanguage = lang === "zh" ? "en" : "zh";
+    setLang(next);
+    void switchMobileLanguage(next);
+  };
   // 新建会话面板开关（Phase C C11）：开 = 全屏浮层 CreateSessionSheet（条件渲染，
   // 挂载即拉目录候选，关闭即卸载停轮询——无常驻成本）
   const [createOpen, setCreateOpen] = useState(false);
@@ -288,8 +302,8 @@ export default function Board({
   const handleCardClose = useCallback((s: Session) => {
     const isCli = s.form === "cli";
     const msg = isCli
-      ? "关闭桌面终端？该会话将进入历史归档"
-      : "归档该会话？等同在桌面端叉掉：将从手机看板隐藏且不再自动回归，可从历史页移回";
+      ? i18n.t("mobile.board.confirmCloseCli")
+      : i18n.t("mobile.board.confirmArchiveApp");
     if (!window.confirm(msg)) return;
     void (isCli ? closeSession(s.id) : hideSession(s.id))
       .then(() => {
@@ -379,17 +393,23 @@ export default function Board({
 
   // 品牌行数据：挂载时拉一次（host 信息不变，无需轮询；失败静默，见 state 注释）。
   // enabledTools（P8d 受管名单）与 installedTools（P1-9 安装探测）随同一载荷更新
-  // ——host 拉取失败时保持 null，chips 收敛为「全部」，与品牌行同口径静默降级
+  // ——host 拉取失败时保持 null，chips 收敛为「全部」，与品牌行同口径静默降级。
+  // 三终端语言自适应：同一载荷的 C-4 两字段（desktopLanguage / manualLanguage）在
+  // 此做**连接时语言重评估**（手动记录 > 桌面当前 > 浏览器兜底，U2 连接时跟随）；
+  // fetchConnectPayload 在请求发出时钉住代数——在途期间用户手动切换的话，迟到的
+  // 响应属过期账面，重评估整体忽略（I1：不得回翻刚做的手动选择）。
+  // 拉取失败（403/网络）不调重评估——启动时的浏览器归流语言继续生效（M2 fail-open）
   useEffect(() => {
     let alive = true;
-    void fetchHost<HostPayload>()
-      .then((h) => {
-        if (alive && h !== null) {
-          setHost(h.host);
-          setEnabledTools(new Set(h.enabledTools));
+    void fetchConnectPayload<HostPayload>()
+      .then(({ generation, payload }) => {
+        if (alive && payload !== null) {
+          applyConnectLanguage(payload, generation);
+          setHost(payload.host);
+          setEnabledTools(new Set(payload.enabledTools));
           // 缺字段（旧版后端）透传 null——「不猜」契约：null = 名单未知（四工具全可
           // 点），不得当空集（会误显全灰「未安装」）
-          setInstalledTools(h.installedTools ? new Set(h.installedTools) : null);
+          setInstalledTools(payload.installedTools ? new Set(payload.installedTools) : null);
         }
       })
       .catch(() => {
@@ -401,6 +421,11 @@ export default function Board({
   }, []);
 
   const sessions = data ? sortSessions(filterByAgent(data.sessions, filter)) : [];
+  // 语言按钮可达名/悬浮提示（g4）：描述「点下去切到什么」的动作（随当前语言翻转），
+  // 文案出自 mobile.language.* 双语键；当前语言另有按钮内短码可见
+  const langToggleLabel = i18n.t(
+    lang === "zh" ? "mobile.language.toggleToEn" : "mobile.language.toggleToZh"
+  );
   // 品牌点缀方式（外观配置器，spec §5）：edge/top/tint/none；无配置 → edge
   const accent = currentAccent();
   // chips 选中/未选中的两态类（全部钮与工具钮共用同一套口径）
@@ -475,53 +500,74 @@ export default function Board({
           图标 + 可达名描述「点下去切到什么」，aria-label 供测试与无障碍精确定位。
           会话计数在窄屏会让位（主题/音效两个按钮优先）——计数是信息、按钮是操作 */}
       <header className="mb-3 flex items-baseline justify-between">
-        <h1 className="text-lg font-semibold text-[var(--tx)]">会话看板</h1>
+        <h1 className="text-lg font-semibold text-[var(--tx)]">{i18n.t("mobile.board.title")}</h1>
         <span className="flex items-center gap-2">
           <button
             type="button"
             data-testid="create-open"
             onClick={() => setCreateOpen(true)}
             className="rounded-full border border-[var(--cb)] bg-[var(--cbg)] px-2.5 py-1 text-xs text-[var(--mut)]"
-            aria-label="新建会话"
+            aria-label={i18n.t("mobile.board.createAria")}
           >
-            ＋ 新建
+            {i18n.t("mobile.board.create")}
           </button>
           <button
             type="button"
             onClick={onOpenHistory}
             className="rounded-full border border-[var(--cb)] bg-[var(--cbg)] px-2.5 py-1 text-xs text-[var(--mut)]"
-            aria-label="历史会话"
+            aria-label={i18n.t("mobile.board.historyAria")}
           >
-            历史
+            {i18n.t("mobile.board.history")}
           </button>
           <span className="hidden text-xs text-[var(--mut)] sm:inline">
-            {data ? `${data.totalCount} 个会话` : "加载中…"}
+            {data
+              ? i18n.t("mobile.board.sessionCount", { count: data.totalCount })
+              : i18n.t("mobile.board.loading")}
           </span>
           <button
             type="button"
             data-testid="sound-toggle"
             onClick={() => setSoundOn(toggleSoundEnabled())}
-            aria-label={soundOn ? "关闭完成提示音" : "开启完成提示音"}
+            aria-label={i18n.t(soundOn ? "mobile.board.soundOnAria" : "mobile.board.soundOffAria")}
             aria-pressed={soundOn}
-            title={soundOn ? "完成提示音：开" : "完成提示音：关"}
+            title={i18n.t(soundOn ? "mobile.board.soundOnTitle" : "mobile.board.soundOffTitle")}
             className="rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-1.5 text-[var(--mut)]"
           >
             {soundOn ? <Volume2 size={14} /> : <VolumeX size={14} />}
           </button>
           <button
             type="button"
+            data-testid="theme-toggle"
             onClick={() => setTheme(toggleTheme())}
-            aria-label={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
+            aria-label={i18n.t(
+              theme === "dark" ? "mobile.board.themeToLight" : "mobile.board.themeToDark"
+            )}
             className="rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-1.5 text-[var(--mut)]"
           >
             {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
+          </button>
+          {/* 语言切换（三终端语言自适应 M4 / U4）：换肤图标旁、与同排图标按钮同构
+              （同壳类 + size 14 图标），短码展示当前语言（ZH/EN 自指豁免，见 state 注）；
+              二值切换无三态（U6）。data-testid 供测试精确定位 */}
+          <button
+            type="button"
+            data-testid="language-toggle"
+            onClick={toggleLanguage}
+            aria-label={langToggleLabel}
+            title={langToggleLabel}
+            className="flex items-center gap-1 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-1.5 text-[var(--mut)]"
+          >
+            <Languages size={14} />
+            <span aria-hidden="true" className="text-[10px] leading-none font-medium">
+              {lang === "zh" ? "ZH" : "EN"}
+            </span>
           </button>
         </span>
       </header>
 
       {loadError && (
         <p className="mb-3 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-          网络连接失败，正在自动重试…（当前展示上次数据）
+          {i18n.t("mobile.board.loadError")}
         </p>
       )}
 
@@ -564,7 +610,7 @@ export default function Board({
             onClick={() => setFilter("all")}
             className={chipCls(filter === "all")}
           >
-            全部
+            {i18n.t("mobile.board.filterAll")}
           </button>
           {sortedCardTools.map((tool) => (
             <button
@@ -574,7 +620,7 @@ export default function Board({
               onClick={() => setFilter(tool)}
               className={chipCls(filter === tool)}
             >
-              {TOOL_LABELS[tool]}
+              {i18n.t(TOOL_LABEL_KEYS[tool])}
             </button>
           ))}
         </div>
@@ -584,14 +630,14 @@ export default function Board({
             onClick={() => setChipsExpanded((v) => !v)}
             className="shrink-0 rounded-full border border-[var(--cb)] bg-[var(--cbg)] px-3 py-1 text-xs text-[var(--mut)]"
           >
-            {chipsExpanded ? "收起" : "展开"}
+            {chipsExpanded ? i18n.t("mobile.board.collapse") : i18n.t("mobile.board.expand")}
           </button>
         )}
       </div>
 
       {sessions.length === 0 ? (
         <p className="py-16 text-center text-sm text-[var(--mut)]">
-          {filteredOut ? "该工具暂无会话" : "暂无会话"}
+          {filteredOut ? i18n.t("mobile.board.filteredEmpty") : i18n.t("mobile.board.empty")}
         </p>
       ) : (
         <ul className="space-y-2.5">
@@ -637,7 +683,9 @@ export default function Board({
                 <div className="flex items-center gap-2">
                   {/* 桌面组件但零 Tauri 依赖，移动 bundle 可直接 import（控制者裁决） */}
                   <ToolIcon toolId={s.agentType} size={18} className="shrink-0" />
-                  <span className="shrink-0 text-sm font-semibold">{TOOL_LABELS[s.agentType]}</span>
+                  <span className="shrink-0 text-sm font-semibold">
+                    {i18n.t(TOOL_LABEL_KEYS[s.agentType])}
+                  </span>
                   <span className="truncate text-xs text-[var(--mut)]">{s.projectName}</span>
                   <span className="ml-auto shrink-0 font-mono text-[11px] text-[var(--mut)]">
                     {formatRelativeTime(s.lastActivityAt, now)}
@@ -648,8 +696,16 @@ export default function Board({
                   <button
                     type="button"
                     data-testid={`card-close-${s.id}`}
-                    aria-label={s.form === "cli" ? "关闭终端" : "归档会话"}
-                    title={s.form === "cli" ? "关闭终端" : "归档会话"}
+                    aria-label={i18n.t(
+                      s.form === "cli"
+                        ? "mobile.board.closeTerminalAria"
+                        : "mobile.board.archiveAria"
+                    )}
+                    title={i18n.t(
+                      s.form === "cli"
+                        ? "mobile.board.closeTerminalAria"
+                        : "mobile.board.archiveAria"
+                    )}
                     onClick={(e) => {
                       e.stopPropagation();
                       handleCardClose(s);
@@ -660,7 +716,9 @@ export default function Board({
                   </button>
                 </div>
                 {/* 副行（P8c 定稿）：标题+最新消息预览（现有数据重新排布，无新 API） */}
-                <p className="mt-1 truncate text-sm font-semibold">{s.title ?? "（无标题）"}</p>
+                <p className="mt-1 truncate text-sm font-semibold">
+                  {s.title ?? i18n.t("mobile.board.untitled")}
+                </p>
                 {s.lastMessage && (
                   <p className="mt-0.5 truncate text-xs text-[var(--mut)]">{s.lastMessage}</p>
                 )}
@@ -674,8 +732,8 @@ export default function Board({
                       s.status === "waiting" ? "animate-pulse" : ""
                     }`}
                   />
-                  {STATUS_LABELS[s.status]}
-                  {s.unread ? " · 未读" : ""}
+                  {i18n.t(STATUS_LABEL_KEYS[s.status])}
+                  {s.unread ? i18n.t("mobile.board.unreadSuffix") : ""}
                 </span>
               </li>
             );

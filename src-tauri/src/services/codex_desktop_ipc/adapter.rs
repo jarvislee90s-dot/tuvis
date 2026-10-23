@@ -155,7 +155,8 @@ fn force_unverified() -> bool {
 struct AdapterInner {
     connector: Arc<dyn Connector>,
     /// 当前连接的 profile（R3：动态）。初始为构造入参（首个连接前的基线）；
-    /// 每次连接按 endpoint build 重算（未知 build/无 endpoint → `closed()`）。
+    /// 每次连接按 endpoint build 重算（登记 build → 证据档；未知 build → 兼容
+    /// 发送档；空 build/无 endpoint → `closed()`）。
     /// 同步短临界区读写，绝不跨 await 持有、不与其他锁嵌套。
     profile: std::sync::Mutex<ProtocolProfile>,
     /// #172：**最近一次成功 resolve 的 Desktop build 是否带写能力证据**。
@@ -954,26 +955,28 @@ impl DesktopIpcAdapter {
                 return Err(e);
             }
         };
-        // endpoint → profile（R3：精确 build 匹配；未知 build → **尚无证据**档，可探测）
-        let resolved = super::profile::profile_for(
+        // endpoint → profile（R3：登记 build → 证据档；未知 build → 兼容发送档
+        // （send/state 开，2026-10-22 用户裁决）；空 build/无 endpoint → closed）
+        let profile = super::profile::profile_for_or_compat(
             &endpoint.platform,
             endpoint.build.as_deref().unwrap_or(""),
         );
-        // #172：把「build 的写能力证据」单独留存（不看连接存活；连接失败路径不覆盖）
+        // #172：把「build 的写能力证据」单独留存（不看连接存活；连接失败路径不
+        // 覆盖）。兼容档 send 开 = 用户裁决背书，按「已验证」记 true（headless
+        // 兜底口径不变：链路断了可走既有兜底）。
         *self
             .inner
             .build_send_verified
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) =
-            Some(resolved.as_ref().is_some_and(|p| p.capabilities.send));
-        // #172：未命中 shipped 表 → **「尚无证据」档**（不是「明确不可用」）：能力位全关，
-        // 但允许首次 state 访问时惰性探测 / 复用账本。debug 专用强制开关把已验证 build
-        // 也压到这一档（本机 4894 已 shipped，否则跑不到未知分支）。
+            .unwrap_or_else(|e| e.into_inner()) = Some(profile.capabilities.send);
+        // #172 debug 专用强制开关：把任何档压回「尚无证据」档（能力位全关，可
+        // 探测），真机才能跑到未知 build 的探测分支；release 构建恒不触发。
         let forced_unverified = force_unverified();
         let build = endpoint.build.clone().unwrap_or_default();
-        let profile = match &resolved {
-            Some(p) if !forced_unverified => p.clone(),
-            _ => ProtocolProfile::unverified(&endpoint.platform, &build),
+        let profile = if forced_unverified {
+            ProtocolProfile::unverified(&endpoint.platform, &build)
+        } else {
+            profile
         };
         // 双检：另一任务可能已重连（持 conn 锁期间不做其他锁操作）
         let (conn, epoch) = {
@@ -1069,6 +1072,15 @@ impl DesktopIpcAdapter {
             Some(p) => Some(self.stamp_probe_status(p).await),
             None => None,
         }
+    }
+
+    /// 当前镜像里处于 `inProgress` 的活动回合 id（2026-10-22 原生回合打断扩展）：
+    /// 端点打断阀值的回退来源——在册屏障不存在（回合由桌面手打产生）时，用它
+    /// 定位目标。无镜像 / stale / 无活动回合 → None——端点据此如实拒绝，不盲发
+    /// （P1-1 纪律不变：有阀值才发，只是阀值来源多一级）。
+    pub async fn mirror_active_turn_id(&self, key: &ThreadKey) -> Option<String> {
+        let mirrors = self.inner.mirrors.lock().await;
+        mirrors.get(key).and_then(|m| m.active_turn_id())
     }
 
     /// 恢复任务的 follow 统一入口（第三轮复审 B3）：**前置核验**仍有关注（已卸载
@@ -1471,8 +1483,79 @@ impl DesktopIpcAdapter {
         });
         // 版本不在此解析：dispatch 统一按方法表查（无连接 → disconnected，
         // 方法缺失 → unsupported_method，均为零投递）。
-        self.dispatch("thread-follower-start-turn", params, lease, validity)
+        self.dispatch("thread-follower-start-turn", None, params, lease, validity)
             .await
+    }
+
+    /// 打断桌面当前回合（`thread-follower-interrupt-turn` v4，2026-10-21 新增）。
+    ///
+    /// 协议契约（由 Desktop 打包产物静态取证：`app.asar` 方法表 + handler + 打断
+    /// 状态机）：
+    /// - method `thread-follower-interrupt-turn`，基值版本 **4**；
+    /// - params `{conversationId, mode, expectedTurnId}`；`mode` 取 `user-stop`
+    ///   （等价用户手动按 Stop）或 `system`；`expectedTurnId` 是**安全阀**——与
+    ///   当前活动回合不一致时 Desktop 静默不动作（不误伤别的回合）；
+    /// - 返回 `{interruptedTurnId, ok}`（`goalPauseError` 只在 mode=user-stop 且
+    ///   goal 暂停失败时出现，且仍带 interruptedTurnId）。
+    ///
+    /// 版本纪律：Desktop 侧版本协商对「params 缺 `expectedTurnId` 的 interrupt」
+    /// 期望版本 **3**、带上则期望基值 **4**。本实现**始终带上 expectedTurnId**
+    /// （缺省由调用方给出在册屏障绑定的 turnId），故固定走基值 4。
+    ///
+    /// **安全阀硬门（2026-10-22 复审 P1-1）**：`expected_turn_id == None` →
+    /// `not_sent("expected_turn_missing")`，**零 IPC 写入**。缺该参数的 interrupt
+    /// Desktop 照收不误（期望版本还会回落 3），等于无阀打断当前活动回合——含用户
+    /// 在桌面手开的、与队列无关的回合。阀值必须由调用方（端点）取到：请求显式
+    /// 携带，或从在册原生屏障绑定 turnId 读出；两路都取不到就拒发，不做回退。
+    ///
+    /// 打断后 Desktop 把该回合 status 置 `interrupted`——镜像终态门已认该状态
+    /// （`mirror.rs turn_is_terminal`），屏障随之释放、队列接力下一条。
+    pub async fn interrupt_turn(
+        &self,
+        key: &ThreadKey,
+        expected_turn_id: Option<&str>,
+    ) -> RpcOutcome {
+        let envelope_id = super::types::new_uuid();
+        if !self.current_caps().interrupt {
+            return not_sent(&envelope_id, "capability_unavailable");
+        }
+        // 安全阀硬门（复审 P1-1）：无阀值一律拒发、零 IPC 写入（理由见函数注释）。
+        let Some(expected_turn_id) = expected_turn_id else {
+            return not_sent(&envelope_id, "expected_turn_missing");
+        };
+        let (lease, validity) = {
+            let owners = self.inner.owners.lock().await;
+            match current_lease(&owners, key) {
+                Some(l) => {
+                    let v = owners.validity(&l);
+                    (l, v)
+                }
+                None => return not_sent(&envelope_id, "stale_context"),
+            }
+        };
+        let version = {
+            let conn = self.inner.conn.lock().await;
+            match conn
+                .as_ref()
+                .map(|c| c.version_of("thread-follower-interrupt-turn"))
+            {
+                Some(Ok(v)) => v,
+                _ => return not_sent(&envelope_id, "disconnected"),
+            }
+        };
+        let params = json!({
+            "conversationId": key.thread_id,
+            "mode": "user-stop",
+            "expectedTurnId": expected_turn_id,
+        });
+        self.dispatch(
+            "thread-follower-interrupt-turn",
+            Some(version),
+            params,
+            lease,
+            validity,
+        )
+        .await
     }
 
     /// 审批/作答。requestKey/contextToken 回显校验；服务端保存的 pending 上下文是
@@ -1587,7 +1670,7 @@ impl DesktopIpcAdapter {
             return not_sent(&envelope_id, "stale_context");
         }
         let outcome = self
-            .dispatch(prepared.method, prepared.params, lease, validity)
+            .dispatch(prepared.method, None, prepared.params, lease, validity)
             .await;
         // R4.3 + C3：Accepted/Rejected/NotSent（保守零投递，可重试）释放提交权；
         // UnknownDelivery → 保留为 Blocked（记提交所用 token 分代，状态应用驱动清理）。
@@ -1617,6 +1700,7 @@ impl DesktopIpcAdapter {
     async fn dispatch(
         &self,
         method: &str,
+        version: Option<u32>,
         params: Value,
         target: OwnerLease,
         validity: tokio::sync::watch::Receiver<bool>,
@@ -1626,10 +1710,14 @@ impl DesktopIpcAdapter {
         let Some(conn) = conn else {
             return not_sent(&envelope_id, "disconnected");
         };
-        // 方法缺失 = 明确协议错（unsupported_method）→ 零投递，保持既有 not_sent 语义
-        let version = match conn.version_of(method) {
-            Ok(v) => v,
-            Err(e) => return not_sent(&envelope_id, e.code()),
+        // 方法缺失 = 明确协议错（unsupported_method）→ 零投递，保持既有 not_sent 语义；
+        // 显式版本（interrupt 基值 4 纪律）跳过查表。
+        let version = match version {
+            Some(v) => v,
+            None => match conn.version_of(method) {
+                Ok(v) => v,
+                Err(e) => return not_sent(&envelope_id, e.code()),
+            },
         };
         conn.request(RpcRequest {
             method: method.to_string(),
@@ -2925,7 +3013,7 @@ mod dispatch_tests {
     }
     impl ProbeLedger for ProbedLedger {
         fn get(&self, key: &str, _: &str) -> Option<super::super::probe::ProbeLedgerEntry> {
-            (key == "cli-a").then(|| super::super::probe::ProbeLedgerEntry {
+            (key == "cli-a").then_some(super::super::probe::ProbeLedgerEntry {
                 state: crate::database::dao::codex_ipc_probe::ProbeState::Probed,
                 next_retry_at: None,
                 stage: None,
@@ -3040,9 +3128,11 @@ mod dispatch_tests {
         *adapter.inner.conn.lock().await = Some(conn.clone());
         let (_tx, validity) = tokio::sync::watch::channel(true);
         //「形似官方方法但未进表」：正是硬编码时代会被放行的名字
+        //（interrupt-turn 已随原生打断功能入表，另取形似名）
         let outcome = adapter
             .dispatch(
-                "thread-follower-interrupt-turn",
+                "thread-follower-interrupt-turn-legacy",
+                None,
                 json!({}),
                 lease(),
                 validity,
@@ -3090,11 +3180,17 @@ mod dispatch_tests {
         assert_eq!(decision_method(&PendingKind::PermissionsApproval), None);
         assert_eq!(decision_method(&PendingKind::UserInput), None);
         assert_eq!(decision_method(&PendingKind::Unsupported), None);
-        // 未登记方法 → UnsupportedMethod（单一真相源明确拒绝，不猜版本）
+        // 原生打断方法已登记（基值 4，2026-10-21 静态取证；main 合并）
         assert_eq!(
             profile.version("thread-follower-interrupt-turn", None),
+            Ok(4),
+            "interrupt-turn 必须从方法表取版本（基值 4）"
+        );
+        // 未登记方法 → UnsupportedMethod（单一真相源明确拒绝，不猜版本）
+        assert_eq!(
+            profile.version("thread-follower-interrupt-turn-legacy", None),
             Err(ProtocolError::UnsupportedMethod(
-                "thread-follower-interrupt-turn".into()
+                "thread-follower-interrupt-turn-legacy".into()
             ))
         );
     }

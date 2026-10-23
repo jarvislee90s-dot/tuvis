@@ -1,7 +1,22 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import ModeBar from "@/mobile/ModeBar";
 import type { MamMode, SessionModeView } from "@/mobile/api";
+
+// 文案走 mobile.* 双语键后按 zh 断言（Board.test 同款：显式引入并固定中文）。
+// 只 changeLanguage 不够：jsdom 默认 en-US 会在语言重评估时翻回 en——浏览器
+// 语言一并钉到 zh（language-toggle 同款）
+import { pinZhNavigator } from "./pinZhNavigator";
+
+let unpinZh: () => void;
+
+beforeAll(async () => {
+  unpinZh = await pinZhNavigator();
+});
+
+afterAll(() => {
+  unpinZh();
+});
 
 // 批次丙 T6 + 丁T4：模式栏。覆盖——
 // ① 显示当前档（屏读回显成功时）；② 档未知时**必须**显示人工核对提示（红线 4）；
@@ -781,7 +796,7 @@ describe("ModeBar：T5 codex 回执消费（observed）", () => {
 // 「session-mode/switch 409」这种对用户无意义的串显示出来（本仓库既有教训，
 // 见 api.ts 的 questionAnswerErrorCopy 注释），止血门的用户价值只落地一半。
 // 文案遵循既有惯例：后端 `reason` 在场用 reason（单一来源），缺省用同义兜底常量
-// （`APP_FORM_PENDING_FALLBACK`，与问答侧同一常量——两入口不漂移）。
+// （`mobile.errors.appFormPending` 键，与问答侧同一兜底——两入口不漂移）。
 describe("Task 15 止血门：app_form_pending 分诊", () => {
   /** 后端下发的引导原文（与 api.rs 的 APP_FORM_PENDING_REASON 逐字同义） */
   const REASON = "APP 会话该操作走协议通道，开发中——请在 APP 内操作";

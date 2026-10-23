@@ -1,13 +1,15 @@
 // 新建会话 UI（Phase C C11）：表单（工具四选 + 目录候选/手填 + 首句）→ 提交 →
 // 2s 轮询进度 → done 看板见新卡后复用既有导航跳详情。全屏浮层形态对齐
-// FilePreview 全屏态（fixed inset-0 z-50），文案硬编码中文（移动页无 i18n 契约，
-// PairPage 同口径）。数据源三方法均为 C10 客户端（api.ts「Phase C C10」段）：
+// FilePreview 全屏态（fixed inset-0 z-50）；文案走 mobile.create.* 双语键
+// （语言自适应 M5，语言切换随 Board 重渲染即时生效）。数据源三方法均为 C10
+// 客户端（api.ts「Phase C C10」段）：
 // fetchCreateProjects(7) / createSession（400/409 走返回值，非异常）/
 // fetchCreateStatus（404 走类型化 no_task）。样式消费 mobile.css 语义 token
 // （--pg/--cbg/--cb/--tx/--mut/--bub/--btnp/--btnpt/--rr/--font-ui）：日/夜与
 // 六皮肤/字体/圆角随桌面外观配置器生效；状态语义色（红/黄/绿/sky）按仓内
 // 「状态色不随皮肤」口径保留裸 Tailwind 色。
 import { useCallback, useEffect, useRef, useState } from "react";
+import i18n from "@/i18n";
 import {
   ApiError,
   createSession,
@@ -15,7 +17,7 @@ import {
   fetchCreateStatus,
   type CreateProjectView,
 } from "./api";
-import { formatRelativeTime, TOOL_LABELS } from "./board-logic";
+import { formatRelativeTime, toolLabel } from "./board-logic";
 import type { AgentType, Session } from "@/types/session";
 
 /** 新建会话 v1 工具面（计划 §C11）：固定四选；其余工具不在本入口提供 */
@@ -37,35 +39,48 @@ const CREATE_STALLED_HINT_MS = 120_000;
  *  （不伪造 Session 字段强行跳转——快照没有就不装作有） */
 const WAIT_BOARD_MS = 15_000;
 
-/** 任务相 → 中文（六值全覆盖，wire 未知值回落原串展示——不渲染 undefined，
- *  formatTransition 同口径） */
-export const CREATE_PHASE_LABELS: Record<string, string> = {
-  opening_terminal: "开终端",
-  dialog_handling: "处置弹窗",
-  injecting_first: "注入首句",
-  waiting_materialize: "等待上板",
-  done: "完成",
-  failed: "失败",
+/** 任务相 → 用户可读文案的 i18n 键（六值全覆盖；wire 未知值回落原串展示——
+ *  不渲染 undefined，formatTransition 同口径；文案渲染期经 createPhaseLabel 现取，
+ *  语言切换即时生效） */
+const CREATE_PHASE_LABEL_KEYS: Record<string, string> = {
+  opening_terminal: "mobile.create.phaseOpeningTerminal",
+  dialog_handling: "mobile.create.phaseDialogHandling",
+  injecting_first: "mobile.create.phaseInjectingFirst",
+  waiting_materialize: "mobile.create.phaseWaitingMaterialize",
+  done: "mobile.create.phaseDone",
+  failed: "mobile.create.phaseFailed",
 };
 
-/** POST /session-create 400 的 reasonCode → 中文分診文案（后端
+/** 任务相 → 用户可读文案（渲染期现取）：键表外未知值原样回落（不渲染 undefined） */
+export function createPhaseLabel(phase: string): string {
+  const key = CREATE_PHASE_LABEL_KEYS[phase];
+  return key !== undefined ? i18n.t(key) : phase;
+}
+
+/** POST /session-create 400 的 reasonCode → 分诊文案的 i18n 键（后端
  *  create_path::PathReject.code + 端点层三码全集（tool_unavailable /
  *  path_too_long / mkdir_failed），C10 注释登记；码不在表内 → 调用侧通用兜底文案） */
-export const CREATE_REJECT_LABELS: Record<string, string> = {
-  tool_unavailable: "工具未启用或未安装",
-  empty: "路径为空",
-  not_absolute: "路径须为绝对路径",
-  non_ascii_path: "v1 路径限纯 ASCII",
-  not_local_volume: "仅支持本地盘",
-  bad_windows_form: "Windows 路径须为 X:\\ 形态",
-  blacklisted: "路径命中危险目录黑名单",
-  mkdir_failed: "目录创建失败",
-  path_too_long: "路径超长（上限 10000 字符）",
+const CREATE_REJECT_LABEL_KEYS: Record<string, string> = {
+  tool_unavailable: "mobile.create.rejectToolUnavailable",
+  empty: "mobile.create.rejectEmpty",
+  not_absolute: "mobile.create.rejectNotAbsolute",
+  non_ascii_path: "mobile.create.rejectNonAscii",
+  not_local_volume: "mobile.create.rejectNotLocalVolume",
+  bad_windows_form: "mobile.create.rejectBadWindowsForm",
+  blacklisted: "mobile.create.rejectBlacklisted",
+  mkdir_failed: "mobile.create.rejectMkdirFailed",
+  path_too_long: "mobile.create.rejectPathTooLong",
 };
 
-/** 黄字（表单与回执共用文案，≥1 语义）：选中/创建的工具在该目录已有活跃会话，
- *  多实例下后续消息路由可能混淆——只提示不拦截（与配对不确定信号分层） */
-const ACTIVE_HINT_TEXT = "该项目已有该工具的活跃会话，多实例下后续消息路由可能混淆";
+/** reasonCode → 分诊文案（渲染/提交期现取）：码不在表内 → null（调用侧通用兜底） */
+function createRejectLabel(reasonCode: string): string | null {
+  const key = CREATE_REJECT_LABEL_KEYS[reasonCode];
+  return key !== undefined ? i18n.t(key) : null;
+}
+
+/** 黄字（表单与回执共用文案，≥1 语义）的 i18n 键：选中/创建的工具在该目录已有
+ *  活跃会话，多实例下后续消息路由可能混淆——只提示不拦截（与配对不确定信号分层） */
+const ACTIVE_HINT_KEY = "mobile.create.activeHint";
 
 /** Windows 手填形态提示判据：盘符前缀但非 `X:\` 形态（如 C:/ 或 C:）。
  *  仅提示不拦截——服务端权威校验（400 bad_windows_form） */
@@ -99,7 +114,7 @@ function RecentProjectChips({
   return (
     <div
       role="group"
-      aria-label="最近项目"
+      aria-label={i18n.t("mobile.create.recentChipsAria")}
       data-testid="create-recent-chips"
       className="mb-4 flex gap-2 overflow-x-auto pb-1"
     >
@@ -235,7 +250,7 @@ export default function CreateSessionSheet({
     // 首句预检（评审修复⑥）：与后端 MAX_SEND_CHARS 同标尺（10k）——后端超长回裸
     // bad_request（无 reasonCode），预检给可读提示且免一次必然失败的往返
     if (firstMessage.trim().length > 10000) {
-      setFormError("首句超长（上限 10000 字符），请精简后重试");
+      setFormError(i18n.t("mobile.create.firstMessageTooLong"));
       return;
     }
     setSubmitting(true);
@@ -251,16 +266,16 @@ export default function CreateSessionSheet({
       if ("kind" in r) {
         // 400/409 是类型化返回值（业务流，非异常）——分診文案后留在表单可改可重试
         if (r.kind === "conflict") {
-          setFormError("已有创建任务进行中");
+          setFormError(i18n.t("mobile.create.conflictTaskActive"));
         } else {
           // 后端 reason（定位详情，如黑名单命中段+所属表）优先于本地码表——
           // 修复批 I1：定位信息直达用户，缺省再按码表/兜底（评审建议形态）
           setFormError(
             r.reasonCode
               ? (r.reason ??
-                  CREATE_REJECT_LABELS[r.reasonCode] ??
-                  `参数校验失败（${r.reasonCode}），请修改后重试`)
-              : "参数校验失败，请修改后重试"
+                  createRejectLabel(r.reasonCode) ??
+                  i18n.t("mobile.create.rejectFallback", { code: r.reasonCode }))
+              : i18n.t("mobile.create.rejectGeneric")
           );
         }
         return;
@@ -280,10 +295,10 @@ export default function CreateSessionSheet({
     } catch (e) {
       if (e instanceof ApiError && e.status === 403) {
         // 评审修复④：设备失效在本面板可辨（cookie 判废）——如实指向重新配对
-        setFormError("设备已失效，请重新配对");
+        setFormError(i18n.t("mobile.create.deviceInvalid"));
       } else {
         // ApiError（5xx/网络）：通用文案（Board 会话通道会统一判废 403 会话态）
-        setFormError("创建请求失败（网络或服务异常），请稍后重试");
+        setFormError(i18n.t("mobile.create.createRequestFailed"));
       }
     } finally {
       setSubmitting(false);
@@ -380,7 +395,7 @@ export default function CreateSessionSheet({
       data-testid="create-active-hint"
       className="mb-3 rounded-[var(--rr)] bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
     >
-      {ACTIVE_HINT_TEXT}
+      {i18n.t(ACTIVE_HINT_KEY)}
     </p>
   );
 
@@ -390,11 +405,11 @@ export default function CreateSessionSheet({
       className="fixed inset-0 z-50 flex flex-col bg-[var(--pg)] [font-family:var(--font-ui)] text-[var(--tx)]"
     >
       <header className="flex items-center justify-between border-b border-[var(--cb)] px-4 py-3">
-        <h2 className="text-base font-semibold">新建会话</h2>
+        <h2 className="text-base font-semibold">{i18n.t("mobile.create.title")}</h2>
         <button
           type="button"
           data-testid="create-close"
-          aria-label="关闭"
+          aria-label={i18n.t("mobile.create.close")}
           onClick={onClose}
           className="rounded-full p-1 text-[var(--mut)] hover:bg-[var(--cb)]"
         >
@@ -435,13 +450,15 @@ export default function CreateSessionSheet({
                 同源）；安装探测之外置灰标「未安装」（host.installedTools，P1-9）——
                 两名单分列，文案可辨（服务端 400 tool_unavailable 兜底统一覆盖） */}
             <section className="mb-4">
-              <h3 className="mb-2 text-sm font-medium">工具</h3>
+              <h3 className="mb-2 text-sm font-medium">{i18n.t("mobile.create.sectionTools")}</h3>
               <div className="flex flex-wrap gap-2">
                 {CREATE_TOOLS.map((t) => {
                   const notEnabled = enabledTools !== null && !enabledTools.has(t);
                   const notInstalled = installedTools !== null && !installedTools.has(t);
                   const disabled = notEnabled || notInstalled;
-                  const disabledLabel = notInstalled ? "未安装" : "未启用";
+                  const disabledLabel = notInstalled
+                    ? i18n.t("mobile.create.notInstalled")
+                    : i18n.t("mobile.create.notEnabled");
                   const selected = tool === t;
                   return (
                     <button
@@ -459,7 +476,7 @@ export default function CreateSessionSheet({
                             : "rounded-full bg-[var(--cb)] px-3 py-1 text-xs text-[var(--mut)]"
                       }
                     >
-                      {TOOL_LABELS[t]}
+                      {toolLabel(t)}
                       {disabled && <span className="ml-1">{disabledLabel}</span>}
                     </button>
                   );
@@ -470,9 +487,9 @@ export default function CreateSessionSheet({
             {/* 目录：候选列表（path + 相对活跃时间 + 工具名）或手填切换。
                 候选是「后端已滤除不可用路径」的短名单（CreateProjectView 契约） */}
             <section className="mb-4">
-              <h3 className="mb-2 text-sm font-medium">目录</h3>
+              <h3 className="mb-2 text-sm font-medium">{i18n.t("mobile.create.sectionDir")}</h3>
               {projects === null ? (
-                <p className="text-xs text-[var(--mut)]">目录候选加载中…</p>
+                <p className="text-xs text-[var(--mut)]">{i18n.t("mobile.create.dirLoading")}</p>
               ) : projects.length > 0 ? (
                 <ul data-testid="create-project-list" className="mb-2 space-y-1">
                   {projects.map((p, i) => (
@@ -494,7 +511,7 @@ export default function CreateSessionSheet({
                         <span className="block truncate text-sm">{p.path}</span>
                         <span className="block text-xs text-[var(--mut)]">
                           {formatRelativeTime(p.lastActiveAt, now)} ·{" "}
-                          {p.tools.map((t) => TOOL_LABELS[t as AgentType] ?? t).join("、")}
+                          {p.tools.map((t) => toolLabel(t)).join(i18n.t("mobile.common.listSep"))}
                         </span>
                       </button>
                     </li>
@@ -503,8 +520,8 @@ export default function CreateSessionSheet({
               ) : (
                 <p className="mb-2 text-xs text-[var(--mut)]">
                   {projectsFailed
-                    ? "目录候选不可用，请手动输入路径"
-                    : "近 7 天无活跃项目，请手动输入路径"}
+                    ? i18n.t("mobile.create.dirUnavailable")
+                    : i18n.t("mobile.create.dirEmpty")}
                 </p>
               )}
               <button
@@ -518,7 +535,7 @@ export default function CreateSessionSheet({
                     : "bg-[var(--cb)] text-[var(--mut)]"
                 }`}
               >
-                手动输入路径
+                {i18n.t("mobile.create.manualInput")}
               </button>
               {manualMode && (
                 <>
@@ -535,21 +552,23 @@ export default function CreateSessionSheet({
                       data-testid="create-win-hint"
                       className="mt-1 text-xs text-amber-600 dark:text-amber-400"
                     >
-                      Windows 路径须为 X:\ 形态（以服务端校验为准）
+                      {i18n.t("mobile.create.winFormHint")}
                     </p>
                   )}
                 </>
               )}
               {!manualMode && selectedPath !== null && (
                 <p data-testid="create-selected-path" className="mt-1 text-xs text-[var(--mut)]">
-                  已选：{selectedPath}
+                  {i18n.t("mobile.create.selectedPath", { path: selectedPath })}
                 </p>
               )}
             </section>
 
             {/* 首句：占位 hi；留空提交 → 请求体省 firstMessage 键（后端缺省探针 hi） */}
             <section className="mb-4">
-              <h3 className="mb-2 text-sm font-medium">首句</h3>
+              <h3 className="mb-2 text-sm font-medium">
+                {i18n.t("mobile.create.sectionFirstMessage")}
+              </h3>
               <input
                 type="text"
                 data-testid="create-first-message"
@@ -558,7 +577,9 @@ export default function CreateSessionSheet({
                 onChange={(e) => setFirstMessage(e.target.value)}
                 className="w-full rounded-[var(--rr)] border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)]"
               />
-              <p className="mt-1 text-xs text-[var(--mut)]">留空将发送默认问候「hi」</p>
+              <p className="mt-1 text-xs text-[var(--mut)]">
+                {i18n.t("mobile.create.firstMessageHint")}
+              </p>
             </section>
 
             {formYellow && activeHint}
@@ -570,7 +591,7 @@ export default function CreateSessionSheet({
               onClick={() => void handleSubmit()}
               className="w-full rounded-[var(--rr)] bg-[var(--btnp)] px-3 py-2 text-sm font-medium text-[var(--btnpt)] disabled:opacity-40"
             >
-              {submitting ? "提交中…" : "开始创建"}
+              {i18n.t(submitting ? "mobile.create.submitting" : "mobile.create.submit")}
             </button>
           </>
         ) : deviceInvalid ? (
@@ -581,7 +602,7 @@ export default function CreateSessionSheet({
               data-testid="create-error"
               className="mb-3 rounded-[var(--rr)] bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-400"
             >
-              设备已失效，请重新配对
+              {i18n.t("mobile.create.deviceInvalid")}
             </p>
             <div className="flex gap-2">
               <button
@@ -590,14 +611,14 @@ export default function CreateSessionSheet({
                 onClick={() => backToForm()}
                 className="flex-1 rounded-[var(--rr)] bg-[var(--btnp)] px-3 py-2 text-sm font-medium text-[var(--btnpt)]"
               >
-                返回重试
+                {i18n.t("mobile.create.backRetry")}
               </button>
               <button
                 type="button"
                 onClick={onClose}
                 className="flex-1 rounded-[var(--rr)] border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2 text-sm"
               >
-                关闭
+                {i18n.t("mobile.create.close")}
               </button>
             </div>
           </>
@@ -608,7 +629,7 @@ export default function CreateSessionSheet({
               data-testid="create-error"
               className="mb-3 rounded-[var(--rr)] bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-400"
             >
-              任务已失效（主机可能重启），请重试
+              {i18n.t("mobile.create.taskStale")}
             </p>
             <div className="flex gap-2">
               <button
@@ -617,14 +638,14 @@ export default function CreateSessionSheet({
                 onClick={() => backToForm()}
                 className="flex-1 rounded-[var(--rr)] bg-[var(--btnp)] px-3 py-2 text-sm font-medium text-[var(--btnpt)]"
               >
-                返回重试
+                {i18n.t("mobile.create.backRetry")}
               </button>
               <button
                 type="button"
                 onClick={onClose}
                 className="flex-1 rounded-[var(--rr)] border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2 text-sm"
               >
-                关闭
+                {i18n.t("mobile.create.close")}
               </button>
             </div>
           </>
@@ -636,13 +657,13 @@ export default function CreateSessionSheet({
               data-testid="create-phase"
               className="mb-2 text-sm font-medium text-red-600 dark:text-red-400"
             >
-              {CREATE_PHASE_LABELS.failed}
+              {createPhaseLabel("failed")}
             </p>
             <p
               data-testid="create-detail"
               className="mb-4 rounded-[var(--rr)] bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-400"
             >
-              {detail ?? "创建失败，请重试"}
+              {detail ?? i18n.t("mobile.create.failedFallback")}
             </p>
             <div className="flex gap-2">
               <button
@@ -651,14 +672,14 @@ export default function CreateSessionSheet({
                 onClick={() => backToForm()}
                 className="flex-1 rounded-[var(--rr)] bg-[var(--btnp)] px-3 py-2 text-sm font-medium text-[var(--btnpt)]"
               >
-                重试
+                {i18n.t("mobile.create.retry")}
               </button>
               <button
                 type="button"
                 onClick={onClose}
                 className="flex-1 rounded-[var(--rr)] border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2 text-sm"
               >
-                关闭
+                {i18n.t("mobile.create.close")}
               </button>
             </div>
           </>
@@ -670,7 +691,7 @@ export default function CreateSessionSheet({
               data-testid="create-phase"
               className="mb-2 text-sm font-medium text-green-600 dark:text-green-400"
             >
-              {CREATE_PHASE_LABELS.done}
+              {createPhaseLabel("done")}
             </p>
             {detail && (
               <p
@@ -681,25 +702,25 @@ export default function CreateSessionSheet({
               </p>
             )}
             {sessionId === null ? (
-              <p className="text-sm text-[var(--mut)]">会话已创建，请到看板查看</p>
+              <p className="text-sm text-[var(--mut)]">{i18n.t("mobile.create.createdGoBoard")}</p>
             ) : waitHint ? (
               <>
                 <p
                   data-testid="create-wait-hint"
                   className="mb-3 text-sm text-amber-600 dark:text-amber-400"
                 >
-                  会话已创建，但尚未在看板出现——请稍后在看板中查看
+                  {i18n.t("mobile.create.waitHint")}
                 </p>
                 <button
                   type="button"
                   onClick={onClose}
                   className="w-full rounded-[var(--rr)] border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2 text-sm"
                 >
-                  关闭
+                  {i18n.t("mobile.create.close")}
                 </button>
               </>
             ) : (
-              <p className="text-sm text-[var(--mut)]">等待会话上板后自动打开…</p>
+              <p className="text-sm text-[var(--mut)]">{i18n.t("mobile.create.waitingAutoOpen")}</p>
             )}
           </>
         ) : (
@@ -707,7 +728,9 @@ export default function CreateSessionSheet({
           <>
             {receiptYellow && activeHint}
             <p data-testid="create-phase" className="mb-2 text-sm font-medium">
-              {phase === null ? "正在获取进度…" : (CREATE_PHASE_LABELS[phase] ?? phase)}
+              {phase === null
+                ? i18n.t("mobile.create.phaseFetchingProgress")
+                : createPhaseLabel(phase)}
             </p>
             {detail && (
               <p data-testid="create-detail" className="mb-3 text-xs text-[var(--mut)]">
@@ -719,22 +742,19 @@ export default function CreateSessionSheet({
                 data-testid="create-stalled-hint"
                 className="mb-3 rounded-[var(--rr)] bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
               >
-                创建耗时已超 2 分钟仍未完成——主机侧可能异常（断连/停摆），可稍后在
-                看板确认结果，或返回重试
+                {i18n.t("mobile.create.stalledHint")}
               </p>
             )}
             <button
               type="button"
               data-testid="create-cancel"
-              onClick={() =>
-                backToForm("已取消跟踪进度；主机侧创建仍将继续至终态，完成后会话将出现在看板")
-              }
+              onClick={() => backToForm(i18n.t("mobile.create.cancelledNotice"))}
               className="w-full rounded-[var(--rr)] border border-[var(--cb)] bg-[var(--cbg)] px-3 py-2 text-sm"
             >
-              取消跟踪
+              {i18n.t("mobile.create.cancelTracking")}
             </button>
             <p className="mt-2 text-xs text-[var(--mut)]">
-              取消仅停止本页进度跟踪，主机侧创建仍将继续至终态
+              {i18n.t("mobile.create.cancelFootnote")}
             </p>
           </>
         )}

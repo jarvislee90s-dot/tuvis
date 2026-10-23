@@ -15,6 +15,55 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ## [Unreleased]
 
+### Changed
+
+- **Default README switched to English**: `README.md` is now the English version
+  (content moved in from `README.en.md`); the Chinese source-of-truth moved to
+  `README.zh-CN.md`, with language-switcher links at the top of both files. The
+  `AGENTS.md` bilingual asset table, project tree, and the README pin in the
+  `usage-partial-coverage-lock` test were updated accordingly.
+
+## [0.6.2] - Unreleased
+
+### Upgrade Notes
+
+- **One-time UI language reset**: older versions cached the auto-detected system
+  language in the same local key as manual choices, so the two could not be told
+  apart. From this version on, only manual choices are remembered. After
+  upgrading, desktop users who had manually switched the UI language will fall
+  back to the system language once — pick your language again and it sticks
+  (no longer overridden by system-language changes). Users who never switched
+  manually will notice no difference.
+
+## [0.6.1] - 2026-10-22
+
+### Changed
+
+- **Unified fixed-address setup completion**: Tailscale and Cloudflare Own domain use timelines that collapse only after real public board verification, retaining address, copy/open, QR and setup-details actions. Later failures keep the summary; historical completion never implies current availability.
+- **Cloudflare Own-domain wizard**: for domains already on Cloudflare, guide tunnel creation, Token entry, confirmed connection, browser-side hostname binding and access verification. A live process alone is not a connected tunnel, and changed configurations require fresh verification.
+- **First-install remote setup**: installations without a historical database enable Remote Access and launch at login by default, with device signatures off. Channels remain manual; upgrades retain their settings, and switches stay off after users disable them.
+- **Tailscale installer experience**: packages are saved in the system Downloads folder. The wizard aligns actions on a vertical timeline, marks completion in green, shows file paths only after verification, reveals manual download only after automatic download fails, and reuses verified legacy packages; temporary downloads become clickable packages only after checksum verification.
+
+### Fixed
+
+- **Tailscale enable wrap-up**: enabling Funnel from the wizard now persists the channel switch and writes an audit entry, so the wizard completes after public verification and the channel restores after a relaunch (previously the flag was never written and the completion gate could not be met).
+- **Approval link retention**: the browser approval link returned by first-time enable is no longer cleared by ordinary same-config status refreshes; config changes, channel off or master off still invalidate stale links and in-flight receipts.
+- **Separate DNS waiting from repair**: confirmed missing public records show continuous elapsed time and an estimate of around ten minutes, with automatic read-only checks and no repeated retry action. Ordinary verification no longer resets Funnel; an explicitly confirmed re-enable performs repair. Enabled macOS extensions require no further action, and a stopped backend no longer implies missing approval.
+- **macOS Tailscale installation**: the install action opens the system installer and rechecks status when Tuvis regains focus. Cancellation stays incomplete; installer failures retain exit codes and stdout/stderr instead of showing a blank error.
+- **Re-verification process hint**: while the automatic re-check runs after a channel is re-enabled, the summary shows a spinner with the expected timing (usually within a minute); it clears itself once verification passes, letting users tell normal waiting from a fault.
+
+### Added
+
+- **Stop the Codex desktop turn from the phone**: while a desktop turn keeps running, the mobile outgoing-queue panel gains a "Stop the desktop turn & continue" action — it interrupts the turn currently running in desktop Codex, and **work that turn has not finished is lost** (the confirmation says so before anything is sent); once the turn stops, the queue continues on its own. Verified on macOS `26.1013.40934`; other Desktop builds are unverified and stay disabled.
+
+### Changed
+
+- **Default README switched to English**: `README.md` is now the English version
+  (content moved in from `README.en.md`); the Chinese source-of-truth moved to
+  `README.zh-CN.md`, with language-switcher links at the top of both files. The
+  `AGENTS.md` bilingual asset table, project tree, and the README pin in the
+  `usage-partial-coverage-lock` test were updated accordingly.
+
 ## [0.6.0] - 2026-10-21
 
 ### Added
