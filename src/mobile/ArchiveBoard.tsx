@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import i18n from "@/i18n";
 import {
   deleteArchivedSession,
   fetchArchivedSessions,
@@ -13,12 +14,12 @@ type Days = 1 | 3 | 7;
 
 /** 空态文案：无筛选时按当前天数给扩窗引导（7 天已到顶 → 暂无）；有筛选残留
  * （常见：选定项目后切小窗，新窗口不含该项目）——扩窗文案会误导（扩了也没有），
- * 改显筛选语义（评审 Minor） */
+ * 改显筛选语义（评审 Minor）。文案 M5 双语键现取 */
 function emptyStateText(days: Days, tool: string, project: string): string {
-  if (tool !== "all" || project !== "all") return "当前筛选无匹配会话";
-  if (days === 7) return "暂无归档记录";
-  if (days === 3) return "最近 3 天没有非活跃会话，可试 7 天";
-  return "最近 1 天没有非活跃会话，可试 3 天 / 7 天";
+  if (tool !== "all" || project !== "all") return i18n.t("mobile.archive.filterNoMatch");
+  if (days === 7) return i18n.t("mobile.archive.empty");
+  if (days === 3) return i18n.t("mobile.archive.empty3d");
+  return i18n.t("mobile.archive.empty1d");
 }
 
 /** 历史会话页（spec §7.2）：懒加载（进页 days=1，切天数重拉，页内不轮询——
@@ -85,11 +86,11 @@ export default function ArchiveBoard({
             type="button"
             onClick={onBack}
             className="text-sm text-[var(--mut)]"
-            aria-label="返回看板"
+            aria-label={i18n.t("mobile.archive.backAria")}
           >
-            ‹ 返回
+            {i18n.t("mobile.archive.back")}
           </button>
-          <h1 className="text-lg font-semibold">历史会话</h1>
+          <h1 className="text-lg font-semibold">{i18n.t("mobile.archive.title")}</h1>
         </div>
         <span className="flex items-center gap-2 text-xs text-[var(--mut)]">
           <button
@@ -101,21 +102,21 @@ export default function ArchiveBoard({
               void load(days);
             }}
           >
-            刷新
+            {i18n.t("mobile.archive.refresh")}
           </button>
           <button
             type="button"
             data-testid="archive-clear"
             className="underline"
             onClick={() => {
-              if (!window.confirm("清空全部归档记录？")) return;
+              if (!window.confirm(i18n.t("mobile.archive.clearConfirm"))) return;
               setManageError(false);
               deleteArchivedSession()
                 .then(() => void load(days))
                 .catch(() => setManageError(true));
             }}
           >
-            清空归档
+            {i18n.t("mobile.archive.clear")}
           </button>
         </span>
       </header>
@@ -123,11 +124,11 @@ export default function ArchiveBoard({
       {/* 清空归档失败反馈（终审 Finding 3）：小号红字贴近操作点，不触发 retry */}
       {manageError && (
         <p data-testid="archive-manage-error" className="mb-2 text-right text-xs text-red-600">
-          操作失败，请重试
+          {i18n.t("mobile.archive.manageError")}
         </p>
       )}
 
-      {/* 第一行：工具 chips（文案复用 TOOL_LABELS；选中态样式从简，品牌色后续按需） */}
+      {/* 第一行：工具 chips（文案复用 archive-logic.chipLabel → mobile.tool.* 键；选中态样式从简，品牌色后续按需） */}
       <div className="mb-2 flex gap-2 overflow-x-auto">
         {tools.map((t) => (
           <button
@@ -147,9 +148,9 @@ export default function ArchiveBoard({
           value={project}
           onChange={(e) => setProject(e.target.value)}
           className="min-w-0 flex-1 rounded-lg border border-[var(--cb)] px-2 py-1.5 text-sm"
-          aria-label="按项目筛选"
+          aria-label={i18n.t("mobile.archive.projectFilterAria")}
         >
-          <option value="all">项目：全部</option>
+          <option value="all">{i18n.t("mobile.archive.projectAll")}</option>
           {(data?.projects ?? []).map((p) => (
             <option key={p} value={p}>
               {p}
@@ -165,7 +166,7 @@ export default function ArchiveBoard({
               onClick={() => setDays(d)}
               className={`rounded-lg px-2.5 py-1.5 text-xs ${d === days ? "bg-[var(--btnp)] text-[var(--btnpt)]" : "bg-[var(--cb)] text-[var(--tx)]"}`}
             >
-              {d}天
+              {i18n.t("mobile.archive.days", { d })}
             </button>
           ))}
         </span>
@@ -173,19 +174,21 @@ export default function ArchiveBoard({
 
       {error && (
         <div className="py-8 text-center text-sm text-[var(--mut)]">
-          加载失败
+          {i18n.t("mobile.archive.loadFailed")}
           <button
             type="button"
             data-testid="archive-retry"
             className="ml-2 underline"
             onClick={() => void load(days)}
           >
-            重试
+            {i18n.t("mobile.archive.retry")}
           </button>
         </div>
       )}
       {!error && data === null && (
-        <p className="py-8 text-center text-sm text-[var(--mut)]">加载中…</p>
+        <p className="py-8 text-center text-sm text-[var(--mut)]">
+          {i18n.t("mobile.detail.loading")}
+        </p>
       )}
       {!error && data && rows.length === 0 && (
         <p className="py-8 text-center text-sm text-[var(--mut)]">
@@ -208,18 +211,18 @@ export default function ArchiveBoard({
                     data-testid="alive-badge"
                     className="shrink-0 rounded-full bg-green-100 px-1.5 py-0.5 text-[10px] text-green-700 dark:bg-green-900/40 dark:text-green-300"
                   >
-                    未结束
+                    {i18n.t("mobile.archive.aliveBadge")}
                   </span>
                 )}
                 <span className="truncate text-sm font-medium">{s.projectName}</span>
               </span>
               <span className="shrink-0 text-xs text-[var(--mut)]">
                 {formatRelativeTime(s.lastSeenAt, now)}
-                {s.hiddenAlive ? "活跃" : "结束"}
+                {i18n.t(s.hiddenAlive ? "mobile.archive.alive" : "mobile.archive.ended")}
               </span>
             </div>
             <div className="mt-0.5 text-xs text-[var(--mut)]">
-              {chipLabel(s.agentType)} · {s.title ?? "（无标题）"}
+              {chipLabel(s.agentType)} · {s.title ?? i18n.t("mobile.board.untitled")}
             </div>
           </button>
         ))}

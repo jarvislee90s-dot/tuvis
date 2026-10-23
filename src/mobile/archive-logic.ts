@@ -1,16 +1,17 @@
 // 历史会话过滤纯函数（spec §7.2）：工具 × 项目双维。与 board-logic.ts 同风格：
-// 不改入参。相对时间与状态中文**复用** board-logic 既有导出
-// （formatRelativeTime / STATUS_LABELS），本文件不自造。
-import { TOOL_LABELS } from "./board-logic";
+// 不改入参。相对时间与状态显示名**复用** board-logic 既有导出
+// （formatRelativeTime / toolLabel），本文件不自造。
+import i18n from "@/i18n";
+import { toolLabel } from "./board-logic";
 
 export type ArchiveToolFilter = string; // "all" 或工具 id
 
-/** 工具 id → 显示中文（TOOL_LABELS 以 string 索引安全读，未知回退原文；"all" →
- *  「全部」）。ArchiveBoard chips 与 ArchiveDetail 信息行共用——信息行不再裸显
- *  agentType 原文（评审 Minor）。 */
+/** 工具 id → 显示名（toolLabel 以 string 索引安全读，未知回退原文；"all" →
+ *  mobile.archive.toolAll）。ArchiveBoard chips 与 ArchiveDetail 信息行共用——信息行
+ *  不再裸显 agentType 原文（评审 Minor）。M5 Task 7：全量经 i18n 渲染期现取。 */
 export function chipLabel(t: string): string {
-  if (t === "all") return "全部";
-  return (TOOL_LABELS as Record<string, string>)[t] ?? t;
+  if (t === "all") return i18n.t("mobile.archive.toolAll");
+  return toolLabel(t);
 }
 
 export function filterArchivedByTool<T extends { agentType: string }>(

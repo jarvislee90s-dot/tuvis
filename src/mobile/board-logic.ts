@@ -1,5 +1,8 @@
-// 移动看板纯函数层：排序 / 过滤 / 状态配色 / 相对时长 —— 零 React、零 Tauri、零时钟依赖
+// 移动看板纯函数层：排序 / 过滤 / 状态配色 / 相对时长 —— 零 React、零时钟依赖
 // （相对时长接收 now 参数，组件侧传 Date.now()，保证可测性）
+// M5 文案双语化（Task 7）：显示文案经 i18n 单例现取（渲染期求值，语言切换即时生效）；
+// 本文件仍保持零组件依赖——i18n 单例无 React，纯函数可测性不变
+import i18n from "@/i18n";
 import type { AgentType, Session, SessionStatus, TransitionEvent } from "@/types/session";
 
 // 穷尽守卫（类型级，以 src/types/session.ts 的 AgentType 为源）：
@@ -22,20 +25,29 @@ export const AGENT_TYPES: readonly AgentType[] = Object.values(AGENT_TYPE_RECORD
 // 注：仅测试消费（board-logic.test 穷尽断言），生产代码用 host.enabledTools 驱动
 export type ToolFilter = AgentType | "all";
 
-/** 工具显示名（P8c 卡片主行）：八值与桌面 agentBadge.tsx 的 label 口径一致，但**独立定义**
- *  （桌面组件与移动 bundle 隔离，不从桌面 import）。Record<AgentType, string> 穷尽守卫
- *  （对齐 AGENT_TYPE_RECORD 模式）：AgentType 增删值时此处编译报错，主行不会静默缺名。
+/** 工具显示名 i18n 键表（P8c 卡片主行；M5 Task 7 双语化）：八值与桌面 agentBadge.tsx
+ *  的 label 口径一致，但**独立定义**（桌面组件与移动 bundle 隔离，不从桌面 import）。
+ *  Record<AgentType, string> 穷尽守卫（对齐 AGENT_TYPE_RECORD 模式）：AgentType 增删值时
+ *  此处编译报错，主行不会静默缺名。值 = `mobile.tool.*` 键，显示文案经 [`toolLabel`]
+ *  渲染期现取。
  *  注意与桌面 getAgentLabel 的差异：桌面 codex 按 form 区分 APP/CLI，移动主行统一 "Codex" */
-export const TOOL_LABELS: Record<AgentType, string> = {
-  claude: "Claude",
-  codex: "Codex",
-  opencode: "OpenCode",
-  openclaw: "OpenClaw",
-  kimi: "Kimi Code",
-  workbuddy: "WorkBuddy",
-  zcode: "ZCode",
-  dsh: "DSH",
+export const TOOL_LABEL_KEYS: Record<AgentType, string> = {
+  claude: "mobile.tool.claude",
+  codex: "mobile.tool.codex",
+  opencode: "mobile.tool.opencode",
+  openclaw: "mobile.tool.openclaw",
+  kimi: "mobile.tool.kimi",
+  workbuddy: "mobile.tool.workbuddy",
+  zcode: "mobile.tool.zcode",
+  dsh: "mobile.tool.dsh",
 };
+
+/** 工具 id → 显示名（渲染期现取 i18n；string 入参宽容未知值——未知工具 id 原样回落，
+ *  不渲染 undefined，formatTransition / archive-logic.chipLabel 同口径） */
+export function toolLabel(t: string): string {
+  const key = (TOOL_LABEL_KEYS as Record<string, string | undefined>)[t];
+  return key ? i18n.t(key) : t;
+}
 
 /** 过滤 chips：全部在最前，其后按 AgentType 八值顺序 */
 /** 工具品牌色（P8e chips 底色，逐字对齐 Task 3 brief；色值仅作品牌识别，与桌面 ToolIcon 的
@@ -158,26 +170,34 @@ export const STATUS_COLOR_KIND: Record<SessionStatus, "red" | "yellow" | "green"
   finished: "green",
 };
 
-/** 状态中文名（M3 Task 6 跃迁横幅「变化方向」用；文案对齐桌面 i18n
- *  sessionList.statusLabels：waiting=等待操作 / finished=已结束）。
- *  Record<SessionStatus, string> 穷尽守卫：状态增删时此处编译报错，横幅不会静默缺文案 */
+/** 状态显示名 i18n 键表（M3 Task 6 跃迁横幅「变化方向」/ 看板卡状态字用；M5 Task 7
+ *  双语化：值 = `mobile.status.*` 键，文案经 [`statusLabel`] 渲染期现取；zh 值沿用原
+ *  状态中文名）。Record<SessionStatus, string> 穷尽守卫：状态增删时此处编译报错，
+ *  横幅不会静默缺文案 */
 /** 跃迁横幅文案（M3 Task 6）：`工具 · 项目 · 前态 → 后态 [· 消息预览]`。
  *  wire 值防御：agentType / from / to 理论上受后端类型约束，但 JSON.parse 结果不可信——
  *  未知值回落原样字符串（横幅仍可读），不得渲染 undefined */
-export const STATUS_LABELS: Record<SessionStatus, string> = {
-  waiting: "等待操作",
-  processing: "运行中",
-  thinking: "思考中",
-  compacting: "压缩中",
-  idle: "空闲",
-  finished: "已完成",
+export const STATUS_LABEL_KEYS: Record<SessionStatus, string> = {
+  waiting: "mobile.status.waiting",
+  processing: "mobile.status.processing",
+  thinking: "mobile.status.thinking",
+  compacting: "mobile.status.compacting",
+  idle: "mobile.status.idle",
+  finished: "mobile.status.finished",
 };
+
+/** 状态 → 显示名（渲染期现取 i18n；string 入参宽容未知 wire 值——原样回落不渲染
+ *  undefined，formatTransition / ArchiveDetail 最后状态同口径） */
+export function statusLabel(s: string): string {
+  const key = (STATUS_LABEL_KEYS as Record<string, string | undefined>)[s];
+  return key ? i18n.t(key) : s;
+}
 // 注：横幅文案回归锁（测试断言六值穷尽），防格式化时漏加状态
 
 export function formatTransition(ev: TransitionEvent): string {
-  const tool = TOOL_LABELS[ev.agentType] ?? ev.agentType;
-  const from = STATUS_LABELS[ev.from] ?? ev.from;
-  const to = STATUS_LABELS[ev.to] ?? ev.to;
+  const tool = toolLabel(ev.agentType);
+  const from = statusLabel(ev.from);
+  const to = statusLabel(ev.to);
   const preview = ev.lastMessage ? ` · ${ev.lastMessage}` : "";
   return `${tool} · ${ev.projectName} · ${from} → ${to}${preview}`;
 }
@@ -201,18 +221,19 @@ export function applyTransition(sessions: Session[], ev: TransitionEvent): Sessi
   return next;
 }
 
-/** lastActivityAt 距 now 的相对时长（中文文案，移动页 i18n 随 M3 完善） */
+/** lastActivityAt 距 now 的相对时长（M5 Task 7 双语化：文案经 mobile.time.* 现取，
+ *  英文侧分钟/小时/天带 _one/_other 复数） */
 export function formatRelativeTime(lastActivityAt: string, now: number): string {
   const t = Date.parse(lastActivityAt);
   if (Number.isNaN(t)) return "--";
   const diff = now - t;
   // 未来时间戳（设备时钟偏差）按刚发生处理
-  if (diff < 60_000) return "刚刚";
+  if (diff < 60_000) return i18n.t("mobile.time.justNow");
   const mins = Math.floor(diff / 60_000);
-  if (mins < 60) return `${mins} 分钟前`;
+  if (mins < 60) return i18n.t("mobile.time.minutesAgo", { count: mins });
   const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours} 小时前`;
-  return `${Math.floor(hours / 24)} 天前`;
+  if (hours < 24) return i18n.t("mobile.time.hoursAgo", { count: hours });
+  return i18n.t("mobile.time.daysAgo", { count: Math.floor(hours / 24) });
 }
 
 // ==== 文件传输进度（Task 10 §C5）：上行/下行进度 UI 共用的纯函数 ====
@@ -256,6 +277,6 @@ export function etaRemainingText(
 ): string | null {
   if (total === null || rateBps === null || rateBps <= 0 || loaded >= total) return null;
   const s = (total - loaded) / rateBps;
-  if (s < 90) return `预计剩余 ~${Math.max(1, Math.round(s))} 秒`;
-  return `预计剩余 ~${Math.round(s / 60)} 分钟`;
+  if (s < 90) return i18n.t("mobile.file.etaSeconds", { n: Math.max(1, Math.round(s)) });
+  return i18n.t("mobile.file.etaMinutes", { n: Math.round(s / 60) });
 }

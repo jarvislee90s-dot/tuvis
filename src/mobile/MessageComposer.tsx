@@ -174,13 +174,14 @@ const QUEUE_POLL_MS = 3000;
 const MAX_SEND_CHARS = 10000;
 
 /** gone 收敛文案定稿（评审裁决，中性、不带「可重试」）：jump 条目可能已送达
- *  （守卫方 flush 循环刚把队首投出）；retract 只需告知不在队 */
-const GONE_JUMP_MESSAGE = "条目已离开队列（可能已送达，可在会话内容中确认）";
-const GONE_RETRACT_MESSAGE = "条目已不在队列";
+ *  （守卫方 flush 循环刚把队首投出）；retract 只需告知不在队。M5 起存 i18n 键，
+ *  消费点经 i18n.t 现取（语言切换后新产生的回执跟随生效语言）。 */
+const GONE_JUMP_MESSAGE = "mobile.composer.goneJump";
+const GONE_RETRACT_MESSAGE = "mobile.composer.goneRetract";
 /** 轮询发现条目消失（2026-09-20）：此前静默清空回执——用户实测「桌面端插队后，
  *  手机端排队提示无声消失」。队列会话级共享、无归属标记，移动端无法区分被送达
  *  还是被其他端处理，故给中性提示留痕；真实归属需后端审计回传，边缘场景不做 */
-const GONE_POLL_CONSUMED_MESSAGE = "该消息已不在队列（可能已送达，或由电脑端处理）";
+const GONE_POLL_CONSUMED_MESSAGE = "mobile.composer.gonePollConsumed";
 
 /** D8 队列预览截断长度（字符）：逐条预览只给「前十余字符」一眼可辨的量 */
 const PREVIEW_MAX_CHARS = 12;
@@ -214,18 +215,16 @@ type TerminalCardPresence = "none" | "questionFreeText" | "questionBlocked" | "a
  *  （`delivered` / `submitted`），按端点自带的 `verified` 三态分派——语义见
  *  `SessionQuestionAnswerResult.verified`（true=屏读到终态锚 / false=读到屏但未见锚
  *  / null=读屏不可用；**后两者都不是失败，是「未确认」**）。 */
-const QUESTION_FREETEXT_PLACEHOLDER = "输入内容将作为本题的回答发送";
-const QUESTION_BLOCKED_RECEIPT =
-  "终端正在等待回答，但本题不能在本输入框作答：请在问答卡中作答，或直接在终端作答";
-const APPROVE_PRESENT_RECEIPT = "终端等待审批，请用卡片按钮";
+const QUESTION_FREETEXT_PLACEHOLDER = "mobile.composer.questionFreePlaceholder";
+const QUESTION_BLOCKED_RECEIPT = "mobile.composer.questionBlockedReceipt";
+const APPROVE_PRESENT_RECEIPT = "mobile.composer.approvePresent";
 
 /** 附件与「作为回答发送」的冲突拦截（丁T6 复评的用户裁决：**拦截而不是静默丢**）。
  *  理由：自由作答是「回答」不是「消息」——后端 freeText 走**字符通道**（不带签名、
  *  也不带附件标记行），卡内输入框同样没有附件入口。若 composer 带着附件转向
  *  freeText，那些附件**必然被静默丢弃**（用户以为发出去了，agent 看不到路径）——
  *  静默丢用户内容是坏体验（本仓「回执如实」纪律的同一面）。故拦截并说清去处。 */
-const FREETEXT_WITH_ATTACHMENT_RECEIPT =
-  "附件不能随「回答」发送（自由作答不带附件）。请移除附件后作为回答发送，或改用卡片按钮/终端";
+const FREETEXT_WITH_ATTACHMENT_RECEIPT = "mobile.composer.freetextWithAttachment";
 
 /** W1 来源标记（服务端 compose_injection 注入，非用户正文）：预览与「修改」放回正文
  *  时剥离——不剥则修改重发会二次叠加签名。
@@ -236,7 +235,8 @@ const FREETEXT_WITH_ATTACHMENT_RECEIPT =
  *  容错：正文里偶然出现 `[mobile …]` 字样但**不在尾部**时不剥（与 Rust 侧
  *  `normalize::strip_mobile_signature` 同口径：只剥形态完整的尾签名）。 */
 const MOBILE_SIGNATURE_RE = /\s*\[mobile[^\]]*\]$/;
-/** 附件内联标记（文件池既有约定）：<image|file path="…"> → 预览中替换为 [附件] */
+/** 附件内联标记（文件池既有约定）：<image|file path="…"> → 预览中替换为 [附件]。
+ *  展示标记文案走 i18n 键（M5；仅展示用，「修改」放回正文不受影响） */
 const ATTACH_MARKUP_RE = /<(?:image|file)\s+path="[^"]*">/g;
 
 /** 剥离尾部 `[mobile 设备名]` 签名（正则不命中则原样返回）：预览与修改放回共用。
@@ -248,7 +248,10 @@ function stripMobileSignature(content: string): string {
 /** 队列条目预览（D8）：剥尾部 [mobile …] 签名 → 附件标记替换 [附件] → 截前 12 字符
  *  （不足则全显）。仅用于展示；「修改」放回正文只剥签名、保留附件标记行 */
 function queueItemPreview(content: string): string {
-  const body = stripMobileSignature(content).replace(ATTACH_MARKUP_RE, "[附件]");
+  const body = stripMobileSignature(content).replace(
+    ATTACH_MARKUP_RE,
+    i18n.t("mobile.composer.attachMark")
+  );
   return body.length > PREVIEW_MAX_CHARS ? `${body.slice(0, PREVIEW_MAX_CHARS)}…` : body;
 }
 
@@ -915,7 +918,12 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
         const isImage = f.type.startsWith("image/");
         setAttachments((prev) => [
           ...prev,
-          { id, name: f.name || (isImage ? "粘贴图片.png" : "file"), isImage, status: "uploading" },
+          {
+            id,
+            name: f.name || (isImage ? i18n.t("mobile.composer.pastedImageName") : "file"),
+            isImage,
+            status: "uploading",
+          },
         ]);
         // AbortController：上传中可取消（× 移除 = 中断上传 + 移除 chip）——
         // 大文件（视频）上传耗时长，不可取消会被迫干等（2026-09-20 用户实测）
@@ -942,7 +950,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
             );
           });
           uploadFirstSampleRef.current.delete(id);
-          if (res === null) throw new ApiError(403, "设备已失效，请重新配对");
+          if (res === null) throw new ApiError(403, i18n.t("mobile.composer.deviceInvalid"));
           setAttachments((prev) =>
             prev.map((a) => (a.id === id ? { ...a, status: "ready", path: res.path } : a))
           );
@@ -957,7 +965,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           if (isNoCwd) setNoCwd(true);
           const reason =
             e instanceof ApiError && isNoCwd
-              ? "该会话没有项目目录信息"
+              ? i18n.t("mobile.composer.noCwdShort")
               : formatInvokeError(e instanceof ApiError ? e.message : String(e), i18n.t);
           setAttachments((prev) =>
             prev.map((a) => (a.id === id ? { ...a, status: "failed", error: reason } : a))
@@ -1007,8 +1015,11 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
       {/* 不可注入：输入区整体禁用，仅留 reason 展示（输入行保留占位但不可用） */}
       {!injectable && (
         <p data-testid="send-disabled-reason" className="mb-2 text-xs text-[var(--mut)]">
-          无法发送：{sendInfo.reason ?? "该会话不支持远程注入"}
-          {sendInfo.reasonCode ? `（${sendInfo.reasonCode}）` : ""}
+          {i18n.t("mobile.composer.sendDisabledPrefix")}
+          {sendInfo.reason ?? i18n.t("mobile.composer.sendDisabledFallback")}
+          {sendInfo.reasonCode
+            ? i18n.t("mobile.composer.sendDisabledCode", { code: sendInfo.reasonCode })
+            : ""}
         </p>
       )}
       {/* 丁T3 接入② / 丁T6 复评：终端卡片在场提示条（**输入区仍可用**——不把输入框
@@ -1025,8 +1036,8 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           className="mb-2 text-xs text-amber-700 dark:text-amber-400"
         >
           {cardPresence === "approve"
-            ? "终端等待审批——本输入框直发已被拦截，请用上方卡片按钮应答"
-            : "终端正在等待回答——本输入框发送的内容将作为本题的回答送到终端"}
+            ? i18n.t("mobile.composer.presenceApprove")
+            : i18n.t("mobile.composer.presenceQuestion")}
         </p>
       )}
       {/* 投递中（灰3）：send await 全程在场——慢消费者长文投递可达分钟级，
@@ -1039,8 +1050,10 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
             className="rounded-full bg-[var(--btnp)]/10 px-2 py-0.5 text-xs text-[var(--tx)]"
           >
             <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--btnp)] align-middle" />
-            投递中…
-            <span className="ml-1 text-[var(--mut)]">长文投递可能需要几分钟</span>
+            {i18n.t("mobile.composer.delivering")}
+            <span className="ml-1 text-[var(--mut)]">
+              {i18n.t("mobile.composer.deliveringHint")}
+            </span>
           </span>
         </div>
       )}
@@ -1056,7 +1069,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
               data-testid="send-receipt-delivered"
               className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-400"
             >
-              已送达终端
+              {i18n.t("mobile.composer.delivered")}
             </span>
           )}
           {receipt.kind === "submitted" && (
@@ -1067,7 +1080,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
               data-testid="send-receipt-submitted"
               className="rounded-full bg-[var(--cb)]/70 px-2 py-0.5 text-xs text-[var(--mut)]"
             >
-              已投递至终端输入，agent 空闲后处理（未确认落盘）
+              {i18n.t("mobile.composer.submitted")}
             </span>
           )}
           {receipt.kind === "failed" && (
@@ -1080,23 +1093,25 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           )}
           {receipt.kind === "gone" && (
             // 中性收敛（评审裁决）：条目经复核确认已离开队列——大概率已送达，
-            // 不标失败红色、不带「（可重试）」，防重复注入
+            // 不标失败红色、不带「（可重试）」，防重复注入。
+            // message 存 i18n 键（M5），渲染期现取——语言切换后旧回执也跟随
             <span
               data-testid="send-receipt-gone"
               className="rounded-full bg-[var(--cb)]/70 px-2 py-0.5 text-xs text-[var(--mut)]"
             >
-              {receipt.message}
+              {i18n.t(receipt.message)}
             </span>
           )}
           {receipt.kind === "blocked" && (
             // 丁T3 接入②：分流拦截（非失败——无注入尝试、无「可重试」语义）。
             // 配色同 gone（中性 slate）：红 chip 会暗示「操作出错」，而这是**安全
-            // 侧的正确行为**（终端在等对话框，此刻直发会误触选项）
+            // 侧的正确行为**（终端在等对话框，此刻直发会误触选项）。
+            // message 存 i18n 键（M5），渲染期现取
             <span
               data-testid="send-receipt-blocked"
               className="rounded-full bg-[var(--cb)]/70 px-2 py-0.5 text-xs text-[var(--mut)]"
             >
-              {receipt.message}
+              {i18n.t(receipt.message)}
             </span>
           )}
           {receipt.kind === "codex" && receipt.receipt.delivery === "accepted" && (
@@ -1172,7 +1187,9 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
                   data-testid={`queue-position-${item.id}`}
                   className="shrink-0 text-xs text-amber-700 dark:text-amber-300"
                 >
-                  {item.position >= 1 ? `第${item.position}位` : "排队中"}
+                  {item.position >= 1
+                    ? i18n.t("mobile.codex.queue.position", { n: item.position })
+                    : i18n.t("mobile.composer.queuedNoPosition")}
                 </span>
                 <span
                   className="min-w-0 flex-1 truncate text-xs text-[var(--tx)]"
@@ -1189,7 +1206,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
                   }}
                   className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
                 >
-                  立即发送
+                  {i18n.t("mobile.composer.jumpNow")}
                 </button>
                 <button
                   type="button"
@@ -1200,7 +1217,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
                   }}
                   className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-700 disabled:opacity-40 dark:bg-amber-400/20 dark:text-amber-300"
                 >
-                  修改
+                  {i18n.t("mobile.composer.editAction")}
                 </button>
                 <button
                   type="button"
@@ -1211,13 +1228,13 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
                   }}
                   className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--mut)] disabled:opacity-40"
                 >
-                  撤回
+                  {i18n.t("mobile.codex.queue.retract")}
                 </button>
               </li>
             ))}
           </ul>
           <p data-testid="queue-hint" className="mt-1 text-[11px] text-[var(--mut)]">
-            空闲时将按序自动发送
+            {i18n.t("mobile.composer.queueHint")}
           </p>
         </div>
       )}
@@ -1260,16 +1277,21 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
                     }`}
                   >
                     {uploading
-                      ? `上传中：${a.name}`
+                      ? i18n.t("mobile.composer.uploadUploading", { name: a.name })
                       : a.status === "failed"
-                        ? `失败：${a.name}（${a.error}）`
+                        ? i18n.t("mobile.composer.uploadFailed", {
+                            name: a.name,
+                            error: a.error ?? "",
+                          })
                         : a.name}
                     {uploading && a.loaded !== undefined && (
                       <span
                         data-testid={`attach-progress-${a.id}`}
                         className="text-[var(--mut)] tabular-nums"
                       >
-                        {`· 已传 ${formatBytes(a.loaded)}`}
+                        {i18n.t("mobile.composer.uploadedBytes", {
+                          bytes: formatBytes(a.loaded),
+                        })}
                         {a.total != null && pct !== null && ` / ${formatBytes(a.total)} · ${pct}%`}
                         {eta && ` · ${eta}`}
                       </span>
@@ -1277,7 +1299,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
                     <button
                       type="button"
                       data-testid={`attach-remove-${a.id}`}
-                      aria-label={`移除附件 ${a.name}`}
+                      aria-label={i18n.t("mobile.composer.removeAttachmentAria", { name: a.name })}
                       onClick={() => removeAttachment(a.id)}
                       className="text-[var(--mut)] hover:text-[var(--mut)]"
                     >
@@ -1304,7 +1326,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
               data-testid="attach-upl-meta"
               className="mt-1 text-[11px] leading-4 text-[var(--mut)]"
             >
-              受限通道按本通道实测速率预估剩余时间；速率未知时只显示已传字节，不显示假百分比。
+              {i18n.t("mobile.composer.uplMeta")}
             </p>
           )}
           {/* 带宽横幅（§C5 / 复评 I-2 后半）：设计说明书原文是「在**文件面板与附件区**
@@ -1336,13 +1358,13 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           <button
             type="button"
             data-testid="attach-add"
-            aria-label="添加附件"
+            aria-label={i18n.t("mobile.composer.attachAddAria")}
             aria-expanded={attachHintOpen}
             disabled={!injectable || noCwd}
             title={
               noCwd
-                ? "该会话没有项目目录信息，无法上传附件"
-                : "添加附件（保存到项目目录 .tuvis-attachments/）"
+                ? i18n.t("mobile.composer.attachAddTitleNoCwd")
+                : i18n.t("mobile.composer.attachAddTitle")
             }
             onClick={() => fileInputRef.current?.click()}
             className="shrink-0 rounded-full p-1 text-[var(--mut)] hover:bg-[var(--cb)] disabled:opacity-40 dark:hover:bg-[var(--btnp)]"
@@ -1352,7 +1374,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           <button
             type="button"
             data-testid="attach-help"
-            aria-label="附件存储说明"
+            aria-label={i18n.t("mobile.composer.attachHelpAria")}
             aria-expanded={attachHintOpen}
             onClick={() => setAttachHintOpen((v) => !v)}
             className="shrink-0 rounded-full p-0.5 text-[10px] leading-none text-[var(--mut)] hover:bg-[var(--cb)] dark:hover:bg-[var(--btnp)]"
@@ -1363,7 +1385,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
         <textarea
           ref={inputRef}
           data-testid="composer-input"
-          aria-label="消息输入"
+          aria-label={i18n.t("mobile.composer.inputAria")}
           value={text}
           maxLength={MAX_SEND_CHARS}
           onChange={(e) => setText(e.target.value.slice(0, MAX_SEND_CHARS))}
@@ -1372,14 +1394,14 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           disabled={!injectable}
           placeholder={
             !injectable
-              ? "该会话不支持远程注入"
+              ? i18n.t("mobile.composer.sendDisabledFallback")
               : cardPresence === "questionFreeText"
-                ? QUESTION_FREETEXT_PLACEHOLDER
+                ? i18n.t(QUESTION_FREETEXT_PLACEHOLDER)
                 : cardPresence === "questionBlocked"
-                  ? "终端等待回答（本题请到卡片或终端作答）"
+                  ? i18n.t("mobile.composer.placeholderBlocked")
                   : cardPresence === "approve"
-                    ? "终端等待审批，请用卡片按钮"
-                    : "输入消息发送到终端…"
+                    ? i18n.t(APPROVE_PRESENT_RECEIPT)
+                    : i18n.t("mobile.composer.placeholder")
           }
           className="min-h-0 flex-1 resize-none rounded-lg border border-[var(--cb)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none disabled:opacity-50"
         />
@@ -1390,7 +1412,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           onClick={handleSend}
           className="shrink-0 rounded-full bg-[var(--btnp)]/10 px-4 py-2 text-sm text-[var(--tx)] disabled:opacity-40"
         >
-          {sending ? "发送中…" : "发送"}
+          {i18n.t(sending ? "mobile.composer.sending" : "mobile.composer.send")}
         </button>
       </div>
       {/* 知情披露（2026-09-20 用户要求）：「?」点开才显示——附件落在用户项目目录，
@@ -1400,8 +1422,7 @@ export default function MessageComposer({ session, onQueueChanged }: MessageComp
           data-testid="attach-hint"
           className="mt-1 rounded-lg bg-[var(--cbg)] px-2 py-1.5 text-[11px] leading-4 text-[var(--mut)]"
         >
-          附件将保存到用户项目目录 .tuvis-attachments/&lt;会话&gt;/（已在本地 git
-          排除，不会提交）；项目收尾时可整目录清理。
+          {i18n.t("mobile.composer.attachHint")}
         </p>
       )}
     </div>

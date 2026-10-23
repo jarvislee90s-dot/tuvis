@@ -52,10 +52,13 @@ export function ChannelBwNote({
       data-testid={testId}
       className={`rounded-lg bg-[var(--cbg)] px-2 py-1.5 text-[11px] leading-4 text-[var(--mut)] ${className}`}
     >
-      当前通道带宽受限（实测下行 ~{channel.estMbpsDown} Mbps / 上行 ~{channel.estMbpsUp}{" "}
-      Mbps——这是通道限制，不是故障）：{BW_REFERENCE_MB} MB 附件下载约需{" "}
-      {minutesFor(channel.estMbpsDown)} 分钟、上传约需 {minutesFor(channel.estMbpsUp)} 分钟。
-      手机装上 Tailscale 并加入尾网后可直连本机，带宽可提升 1–2 个数量级（满速）。
+      {i18n.t("mobile.file.bwNote", {
+        down: channel.estMbpsDown,
+        up: channel.estMbpsUp,
+        ref: BW_REFERENCE_MB,
+        downMinutes: minutesFor(channel.estMbpsDown),
+        upMinutes: minutesFor(channel.estMbpsUp),
+      })}
     </div>
   );
 }
@@ -200,32 +203,32 @@ export default function FilePanel({
 
   // 到顶判定（用户裁决 3）：1000 = MAX_LIMIT，到顶后不再提示"还有更早文件"
   const atTop = scope >= FILE_SCOPES[FILE_SCOPES.length - 1];
-  // 类型下拉档（原 chips 收编为「文件类型」下拉，决策 6）
+  // 类型下拉档（原 chips 收编为「文件类型」下拉，决策 6；文案 M5 双语键现取）
   const kindOptions: Array<{ key: FileKindFilter; label: string }> = [
-    { key: "all", label: "全部" },
-    { key: "doc", label: "文档" },
-    { key: "image", label: "图片" },
+    { key: "all", label: i18n.t("mobile.file.kindAll") },
+    { key: "doc", label: i18n.t("mobile.file.kindDoc") },
+    { key: "image", label: i18n.t("mobile.file.kindImage") },
   ];
   // 来源下拉档（原 origin chips 收编为「文件来源」下拉；键 = 后端 origin 值域）
   const originOptions: Array<{ key: FileOriginFilter; label: string }> = [
-    { key: "all", label: "全部" },
-    { key: "user", label: "我上传的" },
-    { key: "tool_read", label: "工具读取" },
-    { key: "tool_write", label: "工具读写" },
-    { key: "session_artifact", label: "会话产物" },
+    { key: "all", label: i18n.t("mobile.file.originAll") },
+    { key: "user", label: i18n.t("mobile.file.originUser") },
+    { key: "tool_read", label: i18n.t("mobile.file.originToolRead") },
+    { key: "tool_write", label: i18n.t("mobile.file.originToolWrite") },
+    { key: "session_artifact", label: i18n.t("mobile.file.originArtifact") },
   ];
   // 行内来源徽标文案（undefined = 旧载荷，不渲染）
   const originLabel: Record<string, string> = {
-    user: "我上传的",
-    tool_read: "工具读取",
-    tool_write: "工具读写",
-    session_artifact: "会话产物",
+    user: i18n.t("mobile.file.originUser"),
+    tool_read: i18n.t("mobile.file.originToolRead"),
+    tool_write: i18n.t("mobile.file.originToolWrite"),
+    session_artifact: i18n.t("mobile.file.originArtifact"),
   };
 
   return (
     <section
       data-testid="file-panel"
-      aria-label="文件面板"
+      aria-label={i18n.t("mobile.file.panelAria")}
       className="flex h-full min-h-0 flex-col bg-[var(--cbg)]"
     >
       {/* 筛选条（决策 6 单行三组）：追溯范围 ┃ 文件来源 ┃ 文件类型 ┃ 文件名搜索。
@@ -235,15 +238,12 @@ export default function FilePanel({
         className="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b border-[var(--cb)] px-3 py-2 text-xs"
       >
         <label className="flex items-center gap-1 text-[var(--mut)]">
-          <span
-            data-testid="file-scope-hint"
-            title="按最近的消息条数统计：user / assistant / 思考 / 工具调用 / 工具结果 各算 1 条"
-          >
-            追溯范围
+          <span data-testid="file-scope-hint" title={i18n.t("mobile.file.scopeHint")}>
+            {i18n.t("mobile.file.scopeLabel")}
           </span>
           <select
             data-testid="file-scope-select"
-            aria-label="追溯范围（消息条数）"
+            aria-label={i18n.t("mobile.file.scopeAria")}
             value={String(scope)}
             onChange={(e) => onScopeChange(Number(e.target.value))}
             className={FILTER_SELECT_CLS}
@@ -257,10 +257,10 @@ export default function FilePanel({
         </label>
         <FilterDivider />
         <label className="flex items-center gap-1 text-[var(--mut)]">
-          <span>文件来源</span>
+          <span>{i18n.t("mobile.file.originLabel")}</span>
           <select
             data-testid="file-origin-select"
-            aria-label="文件来源"
+            aria-label={i18n.t("mobile.file.originLabel")}
             value={origin}
             onChange={(e) => setOrigin(e.target.value as FileOriginFilter)}
             className={FILTER_SELECT_CLS}
@@ -274,10 +274,10 @@ export default function FilePanel({
         </label>
         <FilterDivider />
         <label className="flex items-center gap-1 text-[var(--mut)]">
-          <span>文件类型</span>
+          <span>{i18n.t("mobile.file.kindLabel")}</span>
           <select
             data-testid="file-kind-select"
-            aria-label="文件类型"
+            aria-label={i18n.t("mobile.file.kindLabel")}
             value={kind}
             onChange={(e) => setKind(e.target.value as FileKindFilter)}
             className={FILTER_SELECT_CLS}
@@ -293,7 +293,7 @@ export default function FilePanel({
         {/* 文件名搜索（M5 决策 10）：点「搜索」（或回车）才执行——两态分离纪律不变 */}
         <form
           role="search"
-          aria-label="文件名搜索"
+          aria-label={i18n.t("mobile.file.searchAria")}
           className="ml-auto flex items-center"
           onSubmit={(e) => {
             e.preventDefault();
@@ -303,9 +303,9 @@ export default function FilePanel({
           <input
             value={searchDraft}
             onChange={(e) => setSearchDraft(e.target.value)}
-            placeholder="按文件名搜索"
+            placeholder={i18n.t("mobile.file.searchPlaceholder")}
             data-testid="file-search-input"
-            aria-label="按文件名搜索"
+            aria-label={i18n.t("mobile.file.searchPlaceholder")}
             className="w-28 rounded-l-lg border border-r-0 border-[var(--cb)] bg-[var(--cbg)] px-2 py-1 text-xs outline-none focus:border-[var(--cb)]"
           />
           <button
@@ -313,10 +313,12 @@ export default function FilePanel({
             data-testid="file-search-run"
             className="rounded-r-lg border border-[var(--cb)] bg-[var(--cbg)] px-2 py-1 text-xs text-[var(--mut)] hover:bg-[var(--cb)]"
           >
-            搜索
+            {i18n.t("mobile.file.search")}
           </button>
         </form>
-        {loading && <span className="text-xs text-[var(--mut)]">加载中…</span>}
+        {loading && (
+          <span className="text-xs text-[var(--mut)]">{i18n.t("mobile.detail.loading")}</span>
+        )}
       </div>
 
       <div
@@ -326,7 +328,9 @@ export default function FilePanel({
       >
         {visible.length === 0 && !loading && (
           <p data-testid="panel-empty" className="py-12 text-center text-sm text-[var(--mut)]">
-            {activeSearch || origin !== "all" ? "无匹配文件" : "该范围内未发现文件"}
+            {i18n.t(
+              activeSearch || origin !== "all" ? "mobile.file.noMatch" : "mobile.file.emptyInRange"
+            )}
           </p>
         )}
         <ul className={`space-y-1 ${loading && entries.length > 0 ? "opacity-60" : ""}`}>
@@ -409,8 +413,8 @@ export default function FilePanel({
                   <button
                     type="button"
                     data-testid={`file-row-${i}-dir`}
-                    aria-label="查看完整路径"
-                    title="点击查看完整路径"
+                    aria-label={i18n.t("mobile.file.viewFullPath")}
+                    title={i18n.t("mobile.file.viewFullPathTitle")}
                     onClick={() =>
                       setPathPopover((p) =>
                         p === fileDirPrefix(e.path) ? null : fileDirPrefix(e.path)
@@ -438,14 +442,14 @@ export default function FilePanel({
           <div
             data-testid="path-popover"
             role="dialog"
-            aria-label="完整路径"
+            aria-label={i18n.t("mobile.file.fullPathAria")}
             className="sticky bottom-0 mt-2 flex items-start gap-2 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2 shadow-lg"
           >
             <code className="min-w-0 flex-1 text-xs break-all text-[var(--tx)]">{pathPopover}</code>
             <button
               type="button"
               data-testid="path-popover-close"
-              aria-label="关闭路径浮窗"
+              aria-label={i18n.t("mobile.file.closePathPopover")}
               onClick={() => setPathPopover(null)}
               className="shrink-0 rounded-full p-0.5 text-[var(--mut)] hover:bg-[var(--cb)] dark:hover:bg-[var(--btnp)]"
             >
@@ -459,7 +463,7 @@ export default function FilePanel({
             data-testid="panel-truncated-hint"
             className="mt-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
           >
-            范围内还有更早文件，可扩大追溯范围
+            {i18n.t("mobile.file.truncatedHint")}
           </p>
         )}
         {/* 可预览说明（M5 P2-a：类型与上限前置告知，配合 403 原因细分排障） */}
@@ -467,8 +471,7 @@ export default function FilePanel({
           data-testid="panel-preview-help"
           className="mt-3 border-t border-[var(--cb)] pt-2 text-[10px] leading-relaxed text-[var(--mut)]"
         >
-          可预览：文本 / 代码 ≤500KB（md/html 支持渲染切换），图片 ≤5MB
-          （png/jpg/jpeg/gif/webp/svg/bmp）；敏感目录不可预览，其余原因见报错提示。
+          {i18n.t("mobile.file.previewHelp")}
         </p>
         {/* 带宽受限提示 + 满速升级指引（Task 10 §C5）：仅受限通道（隧道）就地出现，
             局域网直连与拉取失败都不渲染——升级指引不占通道卡片位（§C4 4 卡不变），

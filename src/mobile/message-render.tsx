@@ -8,6 +8,7 @@ import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
 import rehypeHighlight from "rehype-highlight";
 import { unified } from "unified";
+import i18n from "@/i18n";
 import type { SessionMessage } from "./api";
 
 /** 已知路径按长度降序（最长优先替换：路径互为前缀时不被短路径截断）。
@@ -234,7 +235,7 @@ export function useMessageRenderers({
               className="rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2 text-xs text-[var(--tx)]"
             >
               <p className="mb-1 text-[11px] font-medium tracking-wide text-[var(--mut)] uppercase">
-                计划
+                {i18n.t("mobile.msgRender.planLabel")}
               </p>
               {/* 丁T5 修复（问题 11 的真实断点）：计划卡此前**漏挂** `.md-body` 排版层
                   ——Tailwind v4 preflight 把 h1-h6 的字号/字重与 ul/ol 的 list-style
@@ -265,7 +266,7 @@ export function useMessageRenderers({
               className="rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-2 text-xs"
             >
               <p className="mb-1 text-[11px] font-medium tracking-wide text-emerald-700 uppercase dark:text-emerald-400">
-                计划文件
+                {i18n.t("mobile.msgRender.planFileLabel")}
               </p>
               <div className="flex items-center gap-2">
                 <span
@@ -281,7 +282,7 @@ export function useMessageRenderers({
                   className="shrink-0 rounded-md bg-emerald-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-emerald-700"
                   onClick={() => openFile(full)}
                 >
-                  查看计划
+                  {i18n.t("mobile.msgRender.openPlan")}
                 </button>
               </div>
             </div>
@@ -294,7 +295,9 @@ export function useMessageRenderers({
           return (
             <div className="space-y-1">
               <p className="text-xs font-medium text-[var(--tx)]">
-                {m.toolName ? `调用 ${m.toolName}` : "工具调用"}
+                {m.toolName
+                  ? i18n.t("mobile.msgRender.toolCall", { name: m.toolName })
+                  : i18n.t("mobile.msgRender.toolCallGeneric")}
               </p>
               {m.toolArgs && planBody === null && (
                 <pre
@@ -310,7 +313,7 @@ export function useMessageRenderers({
                   className="rounded-lg border border-[var(--cb)] bg-[var(--cbg)] p-2 text-xs text-[var(--tx)]"
                 >
                   <p className="mb-1 text-[11px] font-medium tracking-wide text-[var(--mut)] uppercase">
-                    计划
+                    {i18n.t("mobile.msgRender.planLabel")}
                   </p>
                   {/* 丁T5 复评 F6-1：本支（**工具参数升格**——claude 的 ExitPlanMode 走这
                       里，任务书问题 11 点名的路径）与上面的 `case "plan"` 是同一缺陷的

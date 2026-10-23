@@ -1,9 +1,25 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import Board from "@/mobile/Board";
 import { applyInitialTheme } from "@/mobile/theme";
 import { MockEventSource } from "./eventSourceMock";
 import type { Session, SessionsResponse, TransitionEvent } from "@/types/session";
+
+// 文案走 mobile.board.* 双语键后按 zh 断言（QuestionCard.test 同款：显式引入并固定中文）。
+// 只 changeLanguage 不够：Board 挂载拉 /host 后做连接时语言重评估（无语言字段 → 浏览器
+// 兜底），jsdom 默认 en-US 会把语言翻回 en——浏览器语言一并钉到 zh（language-toggle 同款）
+import i18n from "@/i18n";
+import { pinZhNavigator } from "./pinZhNavigator";
+
+let unpinZh: () => void;
+
+beforeAll(async () => {
+  unpinZh = await pinZhNavigator();
+});
+
+afterAll(() => {
+  unpinZh();
+});
 
 // M3 Task 6 后，Board 的主数据通道是 SSE（首帧 snapshot + transition 增量），
 // 3s 轮询只在连续 2 次失败降级后启用。因此本文件的夹具统一走「脚本化 EventSource」：
@@ -1000,8 +1016,10 @@ describe("Board 工具 chips（P8d/P8e）", () => {
 
 // M3 Task 4：P8f 日/夜双皮肤（顶部切换按钮 + 容器双态底色）
 //
-// 测试口径：按钮的可访问名描述「点下去会切到什么」（暗色下叫「切换到浅色模式」），
-// 主题初值来自 getInitialTheme（localStorage > matchMedia > 默认 dark，详见 theme.test.ts）。
+// 测试口径：按钮以 data-testid="theme-toggle" 定位（对齐 sound-toggle/language-toggle
+// 惯例，可达名随语言键漂移不影响定位），可达名描述「点下去会切到什么」仍以
+// i18n 键值断言（语言自适应 M5 文案双语化）；主题初值来自 getInitialTheme
+// （localStorage > matchMedia > 默认 dark，详见 theme.test.ts）。
 describe("Board 主题切换（P8f）", () => {
   // jsdom 无 matchMedia：安装可控 shim（同 tests/pet/petSettings.test.tsx:11 模式）
   function installMatchMedia(matches: boolean) {
@@ -1031,7 +1049,7 @@ describe("Board 主题切换（P8f）", () => {
     document.documentElement.classList.remove("dark", "light");
   });
 
-  it("初始暗色：按钮文案为「切换到浅色模式」；点击后翻转浅色——移除 dark 类 + 持久化 tuvis-theme=light", async () => {
+  it("初始暗色：可达名描述切到浅色；点击后翻转浅色——移除 dark 类 + 持久化 tuvis-theme=light", async () => {
     installSse(okSessions(0));
     vi.stubGlobal(
       "fetch",
@@ -1040,16 +1058,19 @@ describe("Board 主题切换（P8f）", () => {
     render(<Board onPaired={vi.fn()} onUnpaired={vi.fn()} />);
     await advance(0);
 
-    const toggle = screen.getByRole("button", { name: "切换到浅色模式" });
+    const toggle = screen.getByTestId("theme-toggle");
+    expect(toggle.getAttribute("aria-label")).toBe(i18n.t("mobile.board.themeToLight"));
     fireEvent.click(toggle);
     // 翻转后：documentElement 去掉 dark 类（dark: 前缀类随之全部失效）
     expect(document.documentElement.classList.contains("dark")).toBe(false);
     expect(localStorage.getItem("tuvis-theme")).toBe("light");
-    // 图标/文案同步为「切回深色」
-    expect(screen.getByRole("button", { name: "切换到深色模式" })).toBeInTheDocument();
+    // 图标/可达名同步为「切回深色」（键值断言，文案编辑不破测试）
+    expect(screen.getByTestId("theme-toggle").getAttribute("aria-label")).toBe(
+      i18n.t("mobile.board.themeToDark")
+    );
 
     // 再点一次回暗色：dark 类加回、持久化翻转
-    fireEvent.click(screen.getByRole("button", { name: "切换到深色模式" }));
+    fireEvent.click(screen.getByTestId("theme-toggle"));
     expect(document.documentElement.classList.contains("dark")).toBe(true);
     expect(localStorage.getItem("tuvis-theme")).toBe("dark");
   });
@@ -1063,8 +1084,10 @@ describe("Board 主题切换（P8f）", () => {
     );
     render(<Board onPaired={vi.fn()} onUnpaired={vi.fn()} />);
     await advance(0);
-    expect(screen.getByRole("button", { name: "切换到深色模式" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "切换到浅色模式" })).not.toBeInTheDocument();
+    // light 初始：可达名描述「切到深色」而非「切到浅色」（键值断言）
+    expect(screen.getByTestId("theme-toggle").getAttribute("aria-label")).toBe(
+      i18n.t("mobile.board.themeToDark")
+    );
   });
 
   it("容器底色双态回归锁：浅色底（bg-white）+ dark: 前缀深色底，body 同款不残留黑底", async () => {
