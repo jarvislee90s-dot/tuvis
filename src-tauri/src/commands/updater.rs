@@ -841,6 +841,191 @@ mod tests {
         );
     }
 
+    // —— from_plugin 插件错误分类表（89ca9364 两跳回退的判定核心）——
+    //
+    // 分类依据 = 插件 tauri-plugin-updater 2.13.0 源码行为（升级插件版本时逐条
+    // 复核，本表锁的是对这些内部行为的认知，插件改了行为这里必须跟着改判）：
+    //
+    // 【可重试 = 传输层家族，换 DoH 钉 IP 管道重试有价值】
+    // - `ReleaseNotFound`：check 循环对清单请求「非 2xx」**只 log::error! 不记
+    //   last_error**（插件 updater.rs「update endpoint did not respond with a
+    //   successful status code」分支），循环尽后 remote_release 为空才落
+    //   `remote_release.ok_or(Error::ReleaseNotFound)`——经代理的 502/503、
+    //   GitHub 限流 403（代理瞬断的常见形态）都聚到这里；真「远端无更新」走
+    //   204 → `Ok(None)`（StatusCode::NO_CONTENT 分支直接 return），不经
+    //   from_plugin（本命令侧 check 之后 `.ok_or_else` 直接终态），所以改判
+    //   可重试不会误吞「无更新」。
+    // - `Network(_)`：下载阶段的传输失败（插件 download 路径以 String 报网络错）。
+    // - `Reqwest(_)`：清单请求 send 失败（插件 `last_error = Some(err.into())`）。
+    //   **本表测不到该分支**：payload 是插件私有 reqwest 0.13 的 Error（Cargo.lock
+    //   与应用侧 0.12 双版本并存，插件不 re-export），应用 crate 无法构造实例——
+    //   升级插件后若有人动 matches! 里的 Reqwest 判定，须人工核对。
+    //
+    // 【终态 = 其余全部】签名/防篡改类（Minisign/Base64/SignatureUtf8/
+    // SignedVersionMismatch/MissingSignedVersion）换网络救不了且重试绝不该成为
+    // 绕过校验失败的手段；清单结构/平台/安装类拿到的是远端有效回复或确定性
+    // 本地失败，重试只会得到同一结局。
+    #[test]
+    fn from_plugin_routes_transport_family_to_fallback_hop() {
+        let network = AttemptError::from_plugin(
+            "UPDATER_INSTALL_FAIL",
+            "下载或安装失败",
+            tauri_plugin_updater::Error::Network("connection reset during download".into()),
+        );
+        assert!(network.retryable, "Network 是下载阶段传输失败，必须走 DoH 兜底跳");
+
+        let not_found = AttemptError::from_plugin(
+            "UPDATER_MANIFEST_VERIFY",
+            "升级清单校验失败",
+            tauri_plugin_updater::Error::ReleaseNotFound,
+        );
+        assert!(
+            not_found.retryable,
+            "非 2xx 清单请求（经代理瞬断/限流）聚落 ReleaseNotFound，必须走 DoH 兜底跳"
+        );
+        // Reqwest(_) 见上方注释：可重试家族成员，payload 类型应用侧不可构造，
+        // 无法入表——升级插件时人工核对 matches! 分支。
+    }
+
+    #[test]
+    fn from_plugin_marks_every_other_variant_terminal() {
+        // 逐 variant 构造实例锁死终态分类（plugin Error 带 #[non_exhaustive]，
+        // 构造不受限，只影响匹配面）。三个无法在应用 crate 构造的 variant：
+        // - Minisign(_)：minisign-verify 非应用直接依赖、插件不 re-export，
+        //   payload 不可名状——它必须终态（签名失败不得经重试绕过）。
+        // - Reqwest(_)：见上方可重试表注释（reqwest 0.13 私有）。
+        // - Extract(_)：cfg(windows + zip) 才编译进枚举，本机（macOS）无此
+        //   variant；属解包/安装类，同为终态家族。
+        let cases: Vec<(&str, tauri_plugin_updater::Error)> = vec![
+            // —— 签名/防篡改类：终态是安全要求 ——
+            (
+                "Base64",
+                tauri_plugin_updater::Error::Base64(base64::DecodeError::InvalidByte(0, b'!')),
+            ),
+            (
+                "SignatureUtf8",
+                tauri_plugin_updater::Error::SignatureUtf8("not-base64-signature".into()),
+            ),
+            (
+                "SignedVersionMismatch",
+                tauri_plugin_updater::Error::SignedVersionMismatch {
+                    signed: "0.5.0".into(),
+                    announced: "9.9.9".into(),
+                },
+            ),
+            ("MissingSignedVersion", tauri_plugin_updater::Error::MissingSignedVersion),
+            // —— 清单结构/内容类：远端有效回复的形态问题，重试只得同一份 ——
+            ("EmptyEndpoints", tauri_plugin_updater::Error::EmptyEndpoints),
+            (
+                "Semver",
+                tauri_plugin_updater::Error::Semver(
+                    semver::Version::parse("not-a-semver").unwrap_err(),
+                ),
+            ),
+            (
+                "Serialization",
+                tauri_plugin_updater::Error::Serialization(
+                    serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+                ),
+            ),
+            (
+                "UrlParse",
+                tauri_plugin_updater::Error::UrlParse(tauri::Url::parse("not a url").unwrap_err()),
+            ),
+            (
+                "TargetNotFound",
+                tauri_plugin_updater::Error::TargetNotFound("darwin-aarch64".into()),
+            ),
+            (
+                "TargetsNotFound",
+                tauri_plugin_updater::Error::TargetsNotFound(vec!["darwin-aarch64".into()]),
+            ),
+            (
+                "InsecureTransportProtocol",
+                tauri_plugin_updater::Error::InsecureTransportProtocol,
+            ),
+            ("FormatDate", tauri_plugin_updater::Error::FormatDate),
+            // —— 请求构造类：确定性失败，非传输层 ——
+            (
+                "Http",
+                // 1000 超出合法状态码域（1xx-5xx），http 构建期确定性报错
+                tauri_plugin_updater::Error::Http(
+                    tauri::http::Response::builder()
+                        .status(1000u16)
+                        .body(())
+                        .unwrap_err(),
+                ),
+            ),
+            (
+                "InvalidHeaderValue",
+                tauri_plugin_updater::Error::InvalidHeaderValue(
+                    reqwest::header::HeaderValue::from_str("\n").unwrap_err(),
+                ),
+            ),
+            (
+                "InvalidHeaderName",
+                tauri_plugin_updater::Error::InvalidHeaderName(
+                    reqwest::header::HeaderName::from_bytes(b"bad header").unwrap_err(),
+                ),
+            ),
+            // —— 平台/环境/安装类：本地确定性失败 ——
+            ("UnsupportedArch", tauri_plugin_updater::Error::UnsupportedArch),
+            ("UnsupportedOs", tauri_plugin_updater::Error::UnsupportedOs),
+            (
+                "FailedToDetermineExtractPath",
+                tauri_plugin_updater::Error::FailedToDetermineExtractPath,
+            ),
+            (
+                "Io",
+                tauri_plugin_updater::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "disk full",
+                )),
+            ),
+            ("TempDirNotFound", tauri_plugin_updater::Error::TempDirNotFound),
+            (
+                "TempDirNotOnSameMountPoint",
+                tauri_plugin_updater::Error::TempDirNotOnSameMountPoint,
+            ),
+            (
+                "BinaryNotFoundInArchive",
+                tauri_plugin_updater::Error::BinaryNotFoundInArchive,
+            ),
+            (
+                "AuthenticationFailed",
+                tauri_plugin_updater::Error::AuthenticationFailed,
+            ),
+            ("DebInstallFailed", tauri_plugin_updater::Error::DebInstallFailed),
+            (
+                "PackageInstallFailed",
+                tauri_plugin_updater::Error::PackageInstallFailed,
+            ),
+            (
+                "InvalidUpdaterFormat",
+                tauri_plugin_updater::Error::InvalidUpdaterFormat,
+            ),
+            (
+                "Tauri",
+                tauri_plugin_updater::Error::Tauri(tauri::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "runtime io",
+                ))),
+            ),
+        ];
+        for (name, e) in cases {
+            let attempt = AttemptError::from_plugin("UPDATER_TEST", name, e);
+            assert!(
+                !attempt.retryable,
+                "{name} 应为终态（直接上报），不得触发 DoH 兜底跳"
+            );
+            assert!(
+                attempt.message.starts_with("UPDATER_TEST: ") && attempt.message.contains(name),
+                "{name} 报文必须带错误码与来源描述，实际：{}",
+                attempt.message
+            );
+        }
+    }
+
     #[test]
     #[ignore = "需真机联网（不需要代理）——DoH 钉 IP 直连兜底的实链路验证；\
                 本机 DNS 污染/VPN 关闭环境恰是它的目标场景"]
