@@ -13,6 +13,16 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
+## [Unreleased]
+
+### Changed
+
+- **Default README switched to English**: `README.md` is now the English version
+  (content moved in from `README.en.md`); the Chinese source-of-truth moved to
+  `README.zh-CN.md`, with language-switcher links at the top of both files. The
+  `AGENTS.md` bilingual asset table, project tree, and the README pin in the
+  `usage-partial-coverage-lock` test were updated accordingly.
+
 ## [0.6.1] - 2026-10-22
 
 ### Changed

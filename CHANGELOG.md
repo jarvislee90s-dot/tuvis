@@ -8,6 +8,14 @@
      存在；新增版本时两份文件同批更新（发版文档纪律见 docs/RELEASE.md）。
      网站（tuvis-website）构建时按双源同步：本文件 → 中文站，CHANGELOG.en.md → 英文站。 -->
 
+## [Unreleased]
+
+### Changed
+
+- **仓库默认 README 切为英文**：`README.md` 改为英文版（原 `README.en.md` 内容迁入），
+  中文主笔版迁移至 `README.zh-CN.md`，两份顶部互设语言切换链接；`AGENTS.md` 双语资产表、
+  结构树与文档锁 `usage-partial-coverage-lock` 的 README 判据同步更新。
+
 ## [0.6.1] - 2026-10-22
 
 ### Changed
