@@ -438,18 +438,16 @@ async fn run_updater_attempt(
         Some(pinned) => builder.configure_client(move |b| {
             pinned
                 .iter()
-                .fold(b.no_proxy(), |b, (host, addr)| b.resolve(host.as_str(), *addr))
+                .fold(b.no_proxy(), |b, (host, addr)| {
+                    b.resolve(host.as_str(), *addr)
+                })
                 .connect_timeout(std::time::Duration::from_secs(10))
         }),
-        None => {
-            builder.configure_client(|b| b.connect_timeout(std::time::Duration::from_secs(10)))
-        }
+        None => builder.configure_client(|b| b.connect_timeout(std::time::Duration::from_secs(10))),
     };
-    let updater = builder
-        .build()
-        .map_err(|e| {
-            AttemptError::terminal(format!("UPDATER_BUILDER_FAIL: 升级器构建失败: {e}"))
-        })?;
+    let updater = builder.build().map_err(|e| {
+        AttemptError::terminal(format!("UPDATER_BUILDER_FAIL: 升级器构建失败: {e}"))
+    })?;
     let update = updater
         .check()
         .await
@@ -872,7 +870,10 @@ mod tests {
             "下载或安装失败",
             tauri_plugin_updater::Error::Network("connection reset during download".into()),
         );
-        assert!(network.retryable, "Network 是下载阶段传输失败，必须走 DoH 兜底跳");
+        assert!(
+            network.retryable,
+            "Network 是下载阶段传输失败，必须走 DoH 兜底跳"
+        );
 
         let not_found = AttemptError::from_plugin(
             "UPDATER_MANIFEST_VERIFY",
@@ -913,9 +914,15 @@ mod tests {
                     announced: "9.9.9".into(),
                 },
             ),
-            ("MissingSignedVersion", tauri_plugin_updater::Error::MissingSignedVersion),
+            (
+                "MissingSignedVersion",
+                tauri_plugin_updater::Error::MissingSignedVersion,
+            ),
             // —— 清单结构/内容类：远端有效回复的形态问题，重试只得同一份 ——
-            ("EmptyEndpoints", tauri_plugin_updater::Error::EmptyEndpoints),
+            (
+                "EmptyEndpoints",
+                tauri_plugin_updater::Error::EmptyEndpoints,
+            ),
             (
                 "Semver",
                 tauri_plugin_updater::Error::Semver(
@@ -969,7 +976,10 @@ mod tests {
                 ),
             ),
             // —— 平台/环境/安装类：本地确定性失败 ——
-            ("UnsupportedArch", tauri_plugin_updater::Error::UnsupportedArch),
+            (
+                "UnsupportedArch",
+                tauri_plugin_updater::Error::UnsupportedArch,
+            ),
             ("UnsupportedOs", tauri_plugin_updater::Error::UnsupportedOs),
             (
                 "FailedToDetermineExtractPath",
@@ -977,12 +987,12 @@ mod tests {
             ),
             (
                 "Io",
-                tauri_plugin_updater::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "disk full",
-                )),
+                tauri_plugin_updater::Error::Io(std::io::Error::other("disk full")),
             ),
-            ("TempDirNotFound", tauri_plugin_updater::Error::TempDirNotFound),
+            (
+                "TempDirNotFound",
+                tauri_plugin_updater::Error::TempDirNotFound,
+            ),
             (
                 "TempDirNotOnSameMountPoint",
                 tauri_plugin_updater::Error::TempDirNotOnSameMountPoint,
@@ -995,7 +1005,10 @@ mod tests {
                 "AuthenticationFailed",
                 tauri_plugin_updater::Error::AuthenticationFailed,
             ),
-            ("DebInstallFailed", tauri_plugin_updater::Error::DebInstallFailed),
+            (
+                "DebInstallFailed",
+                tauri_plugin_updater::Error::DebInstallFailed,
+            ),
             (
                 "PackageInstallFailed",
                 tauri_plugin_updater::Error::PackageInstallFailed,
@@ -1006,8 +1019,7 @@ mod tests {
             ),
             (
                 "Tauri",
-                tauri_plugin_updater::Error::Tauri(tauri::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                tauri_plugin_updater::Error::Tauri(tauri::Error::Io(std::io::Error::other(
                     "runtime io",
                 ))),
             ),

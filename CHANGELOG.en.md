@@ -25,11 +25,12 @@ _Only versions translated so far are listed here; the full history lives in the
 - **README facade rewrite and dual community channels**: both READMEs were rebuilt as
   facade pages (hero trio, feature table linking into the manual, a 2×3 screenshot
   gallery, and a community section), with the former release-level details migrated
-  into 16 user-manual chapter files (`docs/user-manual/{zh,en}/`); two community
-  channels went live — QQ group `1131682176` and Discord (`discord.gg/2PBUDYuD5`) —
-  with stable links and QR images checked into `docs/images/` (no more screenshots of
-  expiring group-QR codes); `AGENTS.md` gained a "documentation division of labor"
-  discipline (facade / manual / ledger responsibilities are mutually exclusive).
+  into 8 chapters of the 13-chapter user manual (16 files across zh/en,
+  `docs/user-manual/{zh,en}/`); two community channels went live — QQ group
+  `1131682176` and Discord (`discord.gg/2PBUDYuD5`) — with stable links and QR images
+  checked into `docs/images/` (expiring group-QR screenshots are never inlined);
+  `AGENTS.md` gained a "documentation division of labor" discipline (facade / manual /
+  ledger responsibilities are mutually exclusive).
 
 ### Fixed
 

@@ -16,10 +16,10 @@
   中文主笔版迁移至 `README.zh-CN.md`，两份顶部互设语言切换链接；`AGENTS.md` 双语资产表、
   结构树与文档锁 `usage-partial-coverage-lock` 的 README 判据同步更新。
 - **README 门面化重构与双社区渠道上线**：中英 README 重构为门面页（首屏三件套、功能卡片表
-  链接手册、2×3 截图画廊、社区区），原 README 的发版级细节迁入用户手册 16 个章节文件
-  （`docs/user-manual/{zh,en}/`）；上线 QQ 群 `1131682176` 与 Discord（`discord.gg/2PBUDYuD5`）
-  双社区渠道，稳定链接与二维码图片入库 `docs/images/`（不再直挂会过期的群码截图）；
-  `AGENTS.md` 新增「文档分工纪律」（门面 / 手册 / 账本职责互斥）。
+  链接手册、2×3 截图画廊、社区区），原 README 的发版级细节迁入 13 章用户手册的 8 个章节
+  （zh/en 双语共 16 个文件，`docs/user-manual/{zh,en}/`）；上线 QQ 群 `1131682176` 与 Discord
+  （`discord.gg/2PBUDYuD5`）双社区渠道，稳定链接与二维码图片入库 `docs/images/`
+  （不直挂会过期的群码截图）；`AGENTS.md` 新增「文档分工纪律」（门面 / 手册 / 账本职责互斥）。
 
 ### Fixed
 
