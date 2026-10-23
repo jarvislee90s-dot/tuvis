@@ -10,6 +10,8 @@ pub mod content;
 pub mod events;
 pub mod files;
 pub mod gate;
+// 三终端语言自适应（2026-10-22）：桌面语言内存源（C-3）+ 配对设备语言手动记账（C-5）
+pub mod language;
 pub mod named;
 pub mod pairing;
 pub mod pin;
@@ -616,6 +618,9 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
         // M5 P2-a 追记：敏感黑名单的主目录基准（真实 home；取不到时 read_file_safe
         // 走全段保守匹配分支）
         home_source: Box::new(real_home_dir),
+        // 三终端语言自适应（C-3）：桌面当前语言内存源（前端经 set_desktop_language
+        // 命令推送；STATE 单例持有，推送与 /host 下发同源）
+        desktop_language: language::LanguageSource::default(),
     })
 });
 
@@ -1232,6 +1237,26 @@ pub fn remote_status() -> serde_json::Value {
     st["channels"] = ch;
     st["pin"] = serde_json::json!(pin::get_pin());
     st
+}
+
+/// 三终端语言自适应（C-3，2026-10-22）：前端推送桌面当前语言（启动 i18n 初始化
+/// 完成后 + 每次切换触发，与托盘重建同路）。Rust **只存不判**：值集只认
+/// `"zh"` / `"en"`（C-1），其余一律 Err 拒收——绝不在此猜测归流；写入目标是
+/// STATE 单例的内存源（`/host` 的 C-4 下发同源读取）。
+#[tauri::command]
+pub fn set_desktop_language(language: String) -> Result<(), String> {
+    match language::UiLanguage::parse(&language) {
+        Some(lang) => {
+            STATE.desktop_language.set(lang);
+            Ok(())
+        }
+        None => Err(format!(
+            // 拒收信息面向开发者（前端 console.error），走英文原文——错误码需配
+            // zh/en locale 双键（src/i18n/** 不在本任务可改范围），裸中文串会触发
+            // 错误码迁移棘轮（mod.rs 基线 0）
+            "set_desktop_language: invalid language value {language:?} (expect \"zh\" or \"en\")"
+        )),
+    }
 }
 
 /// 快照聚合的「首个可用隧道看板地址」（纯函数，quick 优先）：错误通道不宣称——
@@ -2099,6 +2124,20 @@ mod tests {
         assert_eq!(KEY_PUBLIC_ACK, "remote.public_ack");
         assert_eq!(KEY_HOST_NAME, "remote.host_name");
         assert_eq!(DEFAULT_PORT, 9420);
+    }
+
+    /// 三终端语言自适应（C-3）：推送命令的值集闸门——"zh"/"en" 之外一律 Err
+    /// （Rust 只存不判）。只测拒收路径：Ok 路径写全局 STATE，单测不触
+    /// （内存源推送次序语义由 language::tests 的 LanguageSource 用例覆盖）
+    #[test]
+    fn set_desktop_language_rejects_values_outside_c1_set() {
+        assert!(set_desktop_language("fr".to_string()).is_err());
+        assert!(
+            set_desktop_language("ZH".to_string()).is_err(),
+            "大小写变体不收"
+        );
+        assert!(set_desktop_language(String::new()).is_err());
+        assert!(set_desktop_language("zh-CN".to_string()).is_err());
     }
 
     // ==== Task 4 生命周期接线：纯逻辑测试 ====

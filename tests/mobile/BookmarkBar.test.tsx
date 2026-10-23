@@ -3,9 +3,17 @@
 // 最右「管理」钮（编辑态：每个色点显示 ×、「清空全部」出现，再点「完成」退出）。
 // 纯展示组件：书签数据由 SessionDetail 从 store 取，增删查全部经回调上抛。
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import BookmarkBar from "@/mobile/BookmarkBar";
 import { BOOKMARK_COLORS, type Bookmark } from "@/mobile/bookmarks";
+
+// aria-label 等文案走 mobile.bookmark.* 双语键后按 zh 断言（QuestionCard.test 同款：
+// 显式引入并固定中文）
+import i18n from "@/i18n";
+
+beforeAll(async () => {
+  await i18n.changeLanguage("zh");
+});
 
 afterEach(cleanup);
 

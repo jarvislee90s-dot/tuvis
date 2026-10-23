@@ -6,6 +6,7 @@
 // 按 status 分诊，本组件只上报 id）。空（null/[]）整体不渲染（§二.7）。
 // 分屏主从布局（审查 S5 后的左清单右详情）下用 selectedId 高亮选中卡。
 import { useEffect, useState } from "react";
+import i18n from "@/i18n";
 import type { SubagentView } from "./api";
 import { chipTokenText, formatElapsed, subagentElapsedMs } from "./SubagentChips";
 
@@ -30,9 +31,9 @@ export default function SubagentList({
 
   if (!list || list.length === 0) return null;
   return (
-    <section data-testid="subagent-list" aria-label="子 Agent">
+    <section data-testid="subagent-list" aria-label={i18n.t("mobile.subagent.listAria")}>
       <p className="mb-1 text-xs font-medium tracking-wide text-[var(--mut)] uppercase">
-        子 Agent（{list.length}）
+        {i18n.t("mobile.subagent.listCount", { count: list.length })}
       </p>
       <ul className="space-y-1">
         {list.map((s) => {

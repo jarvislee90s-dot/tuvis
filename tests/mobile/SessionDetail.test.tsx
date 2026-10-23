@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "@/mobile/App";
 import SessionDetail, { isPlanPending } from "@/mobile/SessionDetail";
 import type { SessionFileEntry, SessionMessage, SubagentView } from "@/mobile/api";
@@ -7,6 +7,22 @@ import { BOOKMARK_COLORS, clearBookmarks, messageAnchor } from "@/mobile/bookmar
 import { MockEventSource } from "./eventSourceMock";
 import type { Session } from "@/types/session";
 import planPendingCases from "../fixtures/plan_pending_cases.json";
+
+// 书签条 aria-label 等文案走 mobile.bookmark.* 双语键后按 zh 断言（QuestionCard.test
+// 同款：显式引入并固定中文）
+import { pinZhNavigator } from "./pinZhNavigator";
+
+// 本文件渲染 App：挂载即做连接时语言重评估（jsdom 默认 en-US 会翻回 en），
+// 浏览器语言一并钉到 zh（Board.test 同款）
+let unpinZh: () => void;
+
+beforeAll(async () => {
+  unpinZh = await pinZhNavigator();
+});
+
+afterAll(() => {
+  unpinZh();
+});
 
 // M3 Task 8：ZCode 式会话详情页渲染矩阵。fetch 全量 stub（盖过 setup.ts 的 msw），
 // 按 URL 分路到 messages / session-files / file 三端点；jsdom 无真实高亮，

@@ -1,4 +1,5 @@
 // 移动端 API：纯 fetch，零 Tauri 依赖（PWA/浏览器同构）
+import i18n from "@/i18n";
 import type { SessionsResponse, TransitionEvent } from "@/types/session";
 // Codex Desktop IPC：SendResult 的 desktop_ipc 分支引用 ActionReceipt（type-only，无运行时环）
 import type { ActionReceipt } from "./codexIpcApi";
@@ -66,12 +67,55 @@ export interface HostPayload {
   /** 安装探测结果（P1-9，2026-10-03）：新建会话四家中 PATH 探测命中的子集——
    * 前端「未安装」置灰的数据源（与 enabledTools 分列：受管 ≠ 已安装） */
   installedTools: string[];
+  /** 三终端语言自适应 C-4（2026-10-22）：桌面当前语言（"zh"|"en"；null = 未推送/
+   * 不可得——消费侧一律按「桌面语言不可得」兜底浏览器归流）。旧版后端缺席 = undefined。 */
+  desktopLanguage?: "zh" | "en" | null;
+  /** C-4：本设备（cookie 身份）的手动语言记录（"zh"|"en"；null = 无记录；缺席 = 旧版后端）。
+   *  仅已配对（过闸）响应携带；下发是纯读，绝不产生记账写入（C-5 口径）。 */
+  manualLanguage?: "zh" | "en" | null;
 }
 
 export async function fetchHost<T = HostPayload>(): Promise<T | null> {
   const r = await fetch("/m/api/v1/host");
   if (r.status === 403) return null; // 设备失效 → 与 sessions 同语义
   return r.json() as Promise<T>;
+}
+
+/** 远程端手动语言记账回执（POST /device-language 响应，与 Rust `device_language`
+ *  逐字段对应，勿漂移）：manual 恒 true（行存在即手动），language = 该设备最新记录。 */
+export interface DeviceLanguageRecord {
+  manual: boolean;
+  language: "zh" | "en";
+}
+
+/** 手动语言记账（三终端语言自适应 C-5，2026-10-22）：POST /device-language，
+ *  桌面按配对设备（cookie 身份）落账；**只认手动切换**，自动跟随结果绝不调用本端点。
+ *  200 → 该设备最新记录；400（值集外）/ 403（设备失效）/ 5xx（记账失败）→
+ *  抛 ApiError（调用方经 formatInvokeError 呈现，不静默假成功） */
+export async function pushDeviceLanguage(lang: "zh" | "en"): Promise<DeviceLanguageRecord> {
+  let r: Response;
+  try {
+    r = await fetch("/m/api/v1/device-language", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ language: lang }),
+    });
+  } catch (e) {
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:device-language: device-language 网络异常: ${String(e)}`
+    );
+  }
+  if (!r.ok) {
+    let data: Record<string, unknown> | null = null;
+    try {
+      data = (await r.json()) as Record<string, unknown>;
+    } catch {
+      /* 非 JSON 错误体（代理注入页等）：data 保持 null，按状态码兜底 */
+    }
+    throw new ApiError(r.status, `device-language ${r.status}`, data);
+  }
+  return (await r.json()) as DeviceLanguageRecord;
 }
 
 // ==== Task 10 §C5：通道能力装饰（带宽如实告知）====
@@ -578,7 +622,10 @@ export async function uploadAttachment(
   onProgress?: (loaded: number, total: number) => void
 ): Promise<{ path: string; size: number } | null> {
   if (signal?.aborted) {
-    throw new ApiError(null, "session-attachment 网络异常: AbortError（上传已取消）");
+    throw new ApiError(
+      null,
+      `MOBILE_NETWORK_FAIL:session-attachment: session-attachment 网络异常: AbortError（上传已取消）`
+    );
   }
   const q = new URLSearchParams({ session_id: sessionId, name: file.name });
   return new Promise<{ path: string; size: number } | null>((resolve, reject) => {
@@ -620,13 +667,20 @@ export async function uploadAttachment(
       reject(
         new ApiError(
           null,
-          `session-attachment 网络异常: ${String(xhr.statusText || "network error")}`
+          // M5 Task 7（g5）：补齐 errcode 码——无码原文会绕过 formatInvokeError
+          // （英文界面下裸显中文），有码则映射 errors.mobileNetworkFail 双语模板
+          `MOBILE_NETWORK_FAIL:session-attachment: session-attachment 网络异常: ${String(xhr.statusText || "network error")}`
         )
       );
     };
     xhr.onabort = () => {
       finish();
-      reject(new ApiError(null, "session-attachment 网络异常: AbortError（上传已取消）"));
+      reject(
+        new ApiError(
+          null,
+          `MOBILE_NETWORK_FAIL:session-attachment: session-attachment 网络异常: AbortError（上传已取消）`
+        )
+      );
     };
     xhr.send(file); // File 直传——XHR 原生跟踪 Blob 的上传字节
   });
@@ -1048,23 +1102,30 @@ export type QuestionAnswerResult =
 
 /** codex APP 止血门（Task 15，2026-10-12）的用户可读**缺省**文案：**单一来源**——
  *  后端下发 `reason` 时一律以后端为准（文案单一来源，与 `blocked_by_dialog` 同惯例），
- *  只在缺省（旧后端 / 异体响应）时用它。取值逻辑见 [`appFormPendingCopy`]。 */
-export const APP_FORM_PENDING_FALLBACK = "APP 会话该操作走协议通道，开发中——请在 APP 内操作";
+ *  只在缺省（旧后端 / 异体响应）时用它。M5 Task 7 双语化：缺省文案经
+ *  `mobile.errors.appFormPending` 渲染期现取（后端下发的 reason 仍原样优先，L3 边界：
+ *  后端文案属终端侧原文，不翻）。（原常量 `APP_FORM_PENDING_FALLBACK` 随键化退役，
+ *  键即单一来源。）取值逻辑见 [`appFormPendingCopy`]。 */
 
 /** 止血门 `app_form_pending` → 用户可读文案（**取值逻辑单点**，2026-10-13 复评抽出）。
  *
  *  三处入口共用：问答侧 [`questionAnswerErrorCopy`]、审批侧 [`approveErrorCopy`]、
- *  `ModeBar` 的 409 分诊。此前只抽出了常量 [`APP_FORM_PENDING_FALLBACK`]，而「取后端
- *  `reason`、缺省兜底」这段**选择逻辑**仍被逐字抄了三份——正是抽常量要防的那种漂移
- *  （常量单点了、逻辑还在漂）。调用方**勿再另写三元表达式**。 */
+ *  `ModeBar` 的 409 分诊。此前只抽出了常量 `APP_FORM_PENDING_FALLBACK`（已随 M5 键化
+ *  退役），而「取后端 `reason`、缺省兜底」这段**选择逻辑**仍被逐字抄了三份——正是抽
+ *  常量要防的那种漂移（常量单点了、逻辑还在漂）。调用方**勿再另写三元表达式**。 */
 export function appFormPendingCopy(e: ApiError): string {
-  return typeof e.data?.reason === "string" ? e.data.reason : APP_FORM_PENDING_FALLBACK;
+  return typeof e.data?.reason === "string"
+    ? e.data.reason
+    : i18n.t("mobile.errors.appFormPending");
 }
 
-/** 问答应答**错误码 → 用户可读中文文案**（丁T6 复评抽出：卡内与 composer 两条入口
+/** 问答应答**错误码 → 用户可读文案**（丁T6 复评抽出：卡内与 composer 两条入口
  *  必须**同口径**——两处各写一套 `if/else` 迟早漂移，且 composer 侧曾漏掉这条映射
  *  （读的是 `data.reason` 而问答端点回的是 `data.error`）→ 409 会显示成
  *  「session-question/answer 409」这种对用户无意义的串）。
+ *
+ *  M5 Task 7 双语化：各码文案经 `mobile.question.answer*` 键渲染期现取（原中文内联
+ *  随键化退役，zh 值逐字保留）。
  *
  *  取值来源：后端 `remote::api::session_question_answer` 的 409/400 错误码
  *  （`no_question` / `multi_questions` / `tool_readonly` / `bad_index` /
@@ -1072,22 +1133,25 @@ export function appFormPendingCopy(e: ApiError): string {
  *  （不编文案）。 */
 export function questionAnswerErrorCopy(e: ApiError): string {
   const code = typeof e.data?.error === "string" ? e.data.error : null;
-  if (code === "no_question") return "当前没有待回答的问题";
-  if (code === "multi_questions") return "多个问题请回到终端完成作答";
-  if (code === "tool_readonly") return "该工具的远程作答尚未实测，请在终端完成作答";
-  if (code === "bad_index") return "选项序号无效，请刷新后重试";
+  if (code === "no_question") return i18n.t("mobile.question.answerNoQuestion");
+  if (code === "multi_questions") return i18n.t("mobile.question.answerMultiQuestions");
+  if (code === "tool_readonly") return i18n.t("mobile.question.answerToolReadonly");
+  if (code === "bad_index") return i18n.t("mobile.question.answerBadIndex");
   // Task 15 止血门：codex APP 会话的问答写动作走协议通道（开发中）——**必须**消费
   // 这条码，否则用户看到的是「session-question/answer 409」这种无意义串（本函数的
-  // 存在理由同上）。取值逻辑单点见 [`appFormPendingCopy`]（reason 优先、常量兜底）
+  // 存在理由同上）。取值逻辑单点见 [`appFormPendingCopy`]（reason 优先、缺省键兜底）
   if (code === "app_form_pending") return appFormPendingCopy(e);
   return e.message;
 }
 
-/** 审批应答**错误码 → 用户可读中文文案**（第二轮复评 J1 抽出：ApproveCard 的
+/** 审批应答**错误码 → 用户可读文案**（第二轮复评 J1 抽出：ApproveCard 的
  *  `handleAnswer` / `handleFeedbackStart` 两处 catch 本来就各写一套同义 `if/else`，
  *  且**都没有**消费 Task 15 止血门的 `app_form_pending` → 用户屏幕上出现
  *  「session-approve 409」这种无意义串。与 [`questionAnswerErrorCopy`] 同一条纪律：
  *  一码一文案、单点映射，调用方勿另写一套）。
+ *
+ *  M5 Task 7 双语化：各码文案经 `mobile.approve.*` 键渲染期现取（原中文内联随键化
+ *  退役，zh 值逐字保留）。
  *
  *  取值来源：后端 `remote::api::session_approve` 的 409/404 错误码
  *  （`not_waiting` / `no_mapping` / `no_session` / `app_form_pending`；
@@ -1098,9 +1162,9 @@ export function questionAnswerErrorCopy(e: ApiError): string {
  *  「该工具暂不支持审批应答，请用普通发送」——严格优于原来的无意义串。 */
 export function approveErrorCopy(e: ApiError): string {
   const code = typeof e.data?.error === "string" ? e.data.error : null;
-  if (code === "not_waiting") return "会话不在等待状态";
-  if (code === "no_mapping") return "该工具暂不支持审批应答，请用普通发送";
-  if (code === "no_session") return "会话已结束，请返回看板刷新";
+  if (code === "not_waiting") return i18n.t("mobile.approve.notWaiting");
+  if (code === "no_mapping") return i18n.t("mobile.approve.noMapping");
+  if (code === "no_session") return i18n.t("mobile.approve.noSession");
   // Task 15 止血门（I2 新开的 409 出口）：codex APP 会话的审批写动作走协议通道
   //（开发中）——**必须**消费这条码，否则用户看到的是「session-approve 409」。
   // 取值逻辑单点见 [`appFormPendingCopy`]（与问答侧 / ModeBar 侧**同一实现**，不漂移）
@@ -1590,7 +1654,7 @@ export interface CreateSessionAccepted {
  *  - bad_request（400）：reasonCode ∈ tool_unavailable / empty / not_absolute /
  *    non_ascii_path / not_local_volume / bad_windows_form / blacklisted /
  *    mkdir_failed / path_too_long（端点层码全集，与 CreateSessionSheet 的
- *    CREATE_REJECT_LABELS 同步维护）；reason 为后端定位详情（黑名单命中段+所属表等，修复批 I1——
+ *    CREATE_REJECT_LABEL_KEYS 同步维护——M5 Task 6 起该表值为 i18n 键）；reason 为后端定位详情（黑名单命中段+所属表等，修复批 I1——
  *    展示层 reason 优先于本地码表）；裸 bad_request（入参超长等）无该二键；
  *  - conflict（409）：全局单飞占用（已有非终态创建任务——终态 done/failed
  *    不占额度）。 */

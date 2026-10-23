@@ -1,6 +1,21 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import PlanFeedbackBar from "@/mobile/PlanFeedbackBar";
+
+// 文案走 mobile.* 双语键后按 zh 断言（Board.test 同款：显式引入并固定中文）。
+// 只 changeLanguage 不够：jsdom 默认 en-US 会在语言重评估时翻回 en——浏览器
+// 语言一并钉到 zh（language-toggle 同款）
+import { pinZhNavigator } from "./pinZhNavigator";
+
+let unpinZh: () => void;
+
+beforeAll(async () => {
+  unpinZh = await pinZhNavigator();
+});
+
+afterAll(() => {
+  unpinZh();
+});
 
 // 计划反馈条（2026-10-04 计划批准卡）：claude 计划批准框反馈通道的卡内 UI。
 // fetch 全量 stub，按 /session-plan-feedback 单端点分路。

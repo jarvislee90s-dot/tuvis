@@ -84,7 +84,7 @@ export default function ModeBar({ session }: { session: { id: string } }) {
             // wire 对位：observed（核验末拍屏读档）有值也不改本地状态——卡面以
             // 重拉 GET 为准。2026-10-10 用户指令后「已在目标档（零投递）」态已
             // 不存在（点切换必然发键），hint 只剩命中/不符/未生效三态。
-            setReceipt(res.hint ?? "已切换");
+            setReceipt(res.hint ?? i18n.t("mobile.mode.switched"));
             try {
               setView(await fetchSessionMode(session.id));
             } catch {
@@ -94,7 +94,7 @@ export default function ModeBar({ session }: { session: { id: string } }) {
             // 红线 4：不假装成功——原样透出后端 hint（含「预期/实际」或「请人工核对」）。
             // T5：observed 非空且 verified=false 时，后端 hint 已含「屏已切换至 X
             // （预期 Y）」——这里只透传，**不重复拼接** observed 的档名。
-            setReceipt(res.hint ?? "已发送切换，请人工核对终端模式");
+            setReceipt(res.hint ?? i18n.t("mobile.mode.sentVerifyHint"));
           }
         } else {
           setError(formatInvokeError(res.error, i18n.t));
@@ -102,15 +102,17 @@ export default function ModeBar({ session }: { session: { id: string } }) {
       } catch (e) {
         if (e instanceof ApiError) {
           if (e.status === 404 && e.data?.error === "no_session") {
-            setError("会话已结束，请返回看板刷新");
+            setError(i18n.t("mobile.mode.sessionEnded"));
           } else if (e.status === 409 && e.data?.error === "no_mechanism") {
-            setError("该工具的模式切换未实测");
+            setError(i18n.t("mobile.mode.noMechanism"));
           } else if (e.status === 409 && e.data?.error === "blocked_by_dialog") {
             // 丁T3 §2.7 对话框在场红线（裁8/9，问题 5）：控制类注入被拒——后端
             // 屏读见编号选项对话框，切换键/斜杠命令会落进对话框（实机连点 17 次
             // 全变「选第一项」）。文案用后端下发的 reason（单一来源），缺省给同义兜底
             setError(
-              typeof e.data?.reason === "string" ? e.data.reason : "终端有待决对话框，请先处理"
+              typeof e.data?.reason === "string"
+                ? e.data.reason
+                : i18n.t("mobile.mode.blockedByDialog")
             );
           } else if (e.status === 409 && e.data?.error === "blocked_by_question") {
             // E3② 待决拦截（硬）：kimi 问答待决时切档注入（含回车）会误选答案——
@@ -118,7 +120,7 @@ export default function ModeBar({ session }: { session: { id: string } }) {
             setError(
               typeof e.data?.reason === "string"
                 ? e.data.reason
-                : "终端有待答的问题，请先在问答卡作答"
+                : i18n.t("mobile.mode.blockedByQuestion")
             );
           } else if (e.status === 409 && e.data?.error === "app_form_pending") {
             // Task 15 止血门（2026-10-12）：codex APP 会话的模式/权限写动作走协议
@@ -174,7 +176,7 @@ export default function ModeBar({ session }: { session: { id: string } }) {
           data-testid="mode-question-pending-hint"
           className="text-[11px] text-amber-700 dark:text-amber-400"
         >
-          终端有待答的问题——切权限/模式的命令会误选答案，请先在问答卡作答
+          {i18n.t("mobile.mode.questionPendingHint")}
         </span>
       )}
       {error !== null && (
@@ -222,7 +224,7 @@ function modeGroups(view: SessionModeView): ModeGroupView[] {
   return [
     {
       id: "mode",
-      label: "模式",
+      label: i18n.t("mobile.mode.groupMode"),
       step: view.switchKind === "shiftTab",
       readback: view.readback,
       current: view.current,
@@ -279,7 +281,7 @@ function ModeGroupRow({
   busy: boolean;
   onSwitch: (target: MamMode) => void;
 }) {
-  const currentText = group.currentLabel ?? "模式未知";
+  const currentText = group.currentLabel ?? i18n.t("mobile.mode.unknown");
   const unknown = group.current === null;
   // 完全信任二次确认的待确认态（只在含 bypass 档的权限组用得上）
   const [bypassArmed, setBypassArmed] = useState(false);
@@ -314,7 +316,7 @@ function ModeGroupRow({
           data-testid={`mode-current-source-${group.id}`}
           className="text-[10px] text-[var(--mut)]"
         >
-          （上次切换）
+          {i18n.t("mobile.mode.memorySuffix")}
         </span>
       )}
       {unknown && (
@@ -322,7 +324,7 @@ function ModeGroupRow({
           data-testid={`mode-unknown-hint-${group.id}`}
           className="text-[11px] text-amber-700 dark:text-amber-400"
         >
-          请人工核对终端当前模式
+          {i18n.t("mobile.mode.unknownHint")}
         </span>
       )}
       {group.layout === "picker" ? (
@@ -364,7 +366,8 @@ function ModeGroupRow({
         // 屏读结果高亮。上一版三段 [计划][◀▶][操作] 的「切换模式」按钮已删。
         (() => {
           const labelFor = (m: MamMode): string =>
-            group.tiers.find((x) => x.mode === m)?.label ?? (m === "plan" ? "计划" : "操作");
+            group.tiers.find((x) => x.mode === m)?.label ??
+            i18n.t(m === "plan" ? "mobile.mode.plan" : "mobile.mode.action");
           return (
             <span className="flex items-center gap-1">
               {(["plan", "default"] as const).map((m) => {
@@ -378,7 +381,7 @@ function ModeGroupRow({
                     // 当前档不可点（用户指令：高亮的那档禁用，点另一档=切过去）；
                     // 档位未知时两档都可点（纵深防御，落点以屏读为准）
                     disabled={busy || isCurrent}
-                    title="向终端发送一次 shift+tab，切档结果以终端屏读为准（卡面跟随高亮）"
+                    title={i18n.t("mobile.mode.shiftTabTitle")}
                     onClick={() => onSwitch(m)}
                     className={chipClass(isCurrent)}
                   >
@@ -399,7 +402,7 @@ function ModeGroupRow({
           onClick={() => onSwitch("default")}
           className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-[11px] text-[var(--tx)] disabled:opacity-40"
         >
-          切换模式
+          {i18n.t("mobile.mode.switchNext")}
         </button>
       ) : (
         // 直达轴（模式组/权限组）：逐档按钮。**只渲染 selectable 的档**（裁7 的
@@ -439,7 +442,7 @@ function ModeGroupRow({
                 title={t.reason ?? undefined}
                 className="rounded-full border border-dashed border-[var(--cb)]/40 px-2 py-0.5 text-[11px] text-[var(--mut)]"
               >
-                {t.label}（不可用）
+                {i18n.t("mobile.mode.tierUnavailable", { label: t.label })}
               </span>
             );
           })}
@@ -454,7 +457,7 @@ function ModeGroupRow({
           data-testid="mode-bypass-confirm"
           className="flex w-full flex-wrap items-center gap-2 rounded-lg bg-rose-500/10 px-2 py-1 text-[11px] text-rose-700 dark:text-rose-300"
         >
-          <span>将连发两次按键（4→1）启用完全信任：终端会弹出风险确认框，由 兔维斯 代按确认。</span>
+          <span>{i18n.t("mobile.mode.bypassConfirmBody")}</span>
           <button
             type="button"
             data-testid="mode-bypass-confirm-yes"
@@ -465,7 +468,7 @@ function ModeGroupRow({
             }}
             className="rounded-full bg-rose-600 px-2 py-0.5 font-semibold text-white disabled:opacity-40 dark:bg-rose-500"
           >
-            确认启用
+            {i18n.t("mobile.mode.bypassConfirmYes")}
           </button>
           <button
             type="button"
@@ -474,7 +477,7 @@ function ModeGroupRow({
             onClick={() => setBypassArmed(false)}
             className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-[var(--tx)] disabled:opacity-40"
           >
-            取消
+            {i18n.t("mobile.mode.cancel")}
           </button>
         </span>
       )}

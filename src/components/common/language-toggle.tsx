@@ -3,12 +3,17 @@ import { useTranslation } from "react-i18next";
 import { emit } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { loadVisible } from "@/components/pet/petConfig";
+import { writeManualLanguage, type UiLanguage } from "@/i18n/language-prefs";
 
 export function LanguageToggle() {
   const { i18n, t } = useTranslation();
 
   const toggleLanguage = async () => {
-    const newLang = i18n.language === "zh" ? "en" : "zh";
+    const newLang: UiLanguage = i18n.language === "zh" ? "en" : "zh";
+    // C-2：手动选择先写「手动标记 + 值」（唯一持久化写点，最后一次写入生效）；
+    // 此后系统语言变化不再覆盖手动选择。changeLanguage 本身只改内存不落盘
+    // （i18n 初始化已去掉 detector 的 localStorage 缓存）。
+    writeManualLanguage(newLang);
     await i18n.changeLanguage(newLang);
 
     // Update tray menu with new language（Task 16 统一重建：基础项 + 预设项一次成型，
@@ -29,6 +34,15 @@ export function LanguageToggle() {
       });
     } catch (error) {
       console.error("Failed to update tray menu:", error);
+    }
+
+    // 三终端语言自适应（C-3）：手动切换即把新语言推给 Rust 内存源（远程端连接时
+    // 经 /host 下发跟随；启动时的推送在 HomePage 托盘 effect）。切换入口可能不在
+    // HomePage（设置页），故本入口与托盘重建同样就地推送，不依赖跨窗口回流
+    try {
+      await invoke("set_desktop_language", { language: newLang });
+    } catch (error) {
+      console.error("Failed to push desktop language:", error);
     }
 
     // Emit event to sync language across windows

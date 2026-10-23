@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import { AGENT_BADGE, getAgentLabel } from "@/lib/agentBadge";
 import { ToolIcon } from "@/components/common/ToolIcon";
 import { SUPPORTED_TOOLS } from "@/config/constants";
-import { TOOL_LABELS } from "@/mobile/board-logic";
+import { TOOL_LABEL_KEYS } from "@/mobile/board-logic";
 
 describe("getAgentLabel", () => {
   it("maps every supported tool to a display name", () => {
@@ -48,13 +48,13 @@ describe("AGENT_BADGE", () => {
     expect(AGENT_BADGE.openclaw.className).toContain("border-red-500/30");
   });
 
-  // 渲染冒烟穷尽锁：键集派生自 Object.keys(TOOL_LABELS)（Record<AgentType,…>
+  // 渲染冒烟穷尽锁：键集派生自 Object.keys(TOOL_LABEL_KEYS)（Record<AgentType,…>
   // 编译穷尽，第 9 工具接入时键集自动扩张，硬编码清单会静默逃逸覆盖），并互锁
   // AGENT_BADGE 键集与之全等（漏挂徽章/孤儿徽章双向红）。含已退出筛选清单的
   // openclaw——canonical 图标聚齐 BrandIcons 后，任何一图标实现崩溃（如缺
   // import / 组件抛错）在此直接红
   it("renders a visible icon (svg or official bitmap img) for every badge (smoke; key set derived from the exhaustive AgentType record)", () => {
-    const keys = Object.keys(TOOL_LABELS);
+    const keys = Object.keys(TOOL_LABEL_KEYS);
     expect(Object.keys(AGENT_BADGE).sort()).toEqual([...keys].sort());
     for (const key of keys) {
       const badge = AGENT_BADGE[key];

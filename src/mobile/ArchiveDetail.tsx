@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { ArrowDownToLine, ArrowUpToLine, ChevronDown, ChevronRight } from "lucide-react";
+import i18n from "@/i18n";
 import {
   ApiError,
   deleteArchivedSession,
@@ -10,12 +11,12 @@ import {
   type ArchivedSession,
   type SessionMessage,
 } from "./api";
-// 复用既有导出（勿自造）：STATUS_LABELS 状态中文 / formatRelativeTime 相对时间
-import { STATUS_LABELS, formatRelativeTime } from "./board-logic";
+// 复用既有导出（勿自造）：statusLabel 状态显示名（M5 Task 7 键化后现取）/ formatRelativeTime 相对时间
+import { formatRelativeTime, statusLabel } from "./board-logic";
 import { chipLabel } from "./archive-logic";
 import { collapsedLabel, isProcessKind } from "./message-fold";
 import { JUMP_SHOW_THRESHOLD_PX } from "./SessionDetail";
-import { RESUME_UNSUPPORTED_REASON, resumeUnavailableReason } from "./resume-gate";
+import { resumeUnavailableReason, resumeUnsupportedReason } from "./resume-gate";
 
 /** 归档详情单次拉取条数（与活会话详情默认 limit 同标尺；truncated 即有更早内容未载） */
 const ARCHIVE_PAGE_LIMIT = 200;
@@ -25,11 +26,15 @@ const MAX_LIMIT = 1000;
 /** 打开失败文案分诊（评审 Minor：归档语境哨兵引导）。哨兵串与后端 api.rs 的
  *  Err 哨兵对应（404 载荷 data.error）：no_session=活/档双未命中（归档记录可能
  *  已被移除/清空，引导刷新）；no_resume_command=工具未入命令表（复用 resume-gate
- *  门的文案）；其余透传后端原文。 */
+ *  门的文案）；其余透传后端原文。文案走 mobile.archive.* 双语键（M5；reason 段
+ *  含后端/resume-gate 原文，its 本身归 ts 逻辑文件侧） */
 function openFailureCopy(error: string | null | undefined): string {
-  if (error === "no_session") return "归档记录已不存在，请刷新列表";
-  if (error === "no_resume_command") return `打开失败：${RESUME_UNSUPPORTED_REASON}`;
-  return `打开失败：${error ?? "未知错误"}`;
+  if (error === "no_session") return i18n.t("mobile.archive.gone");
+  if (error === "no_resume_command")
+    return i18n.t("mobile.archive.openFailed", { reason: resumeUnsupportedReason() });
+  return i18n.t("mobile.archive.openFailed", {
+    reason: error ?? i18n.t("mobile.archive.unknownError"),
+  });
 }
 
 /** 归档详情页（spec §7.3）：只读消息（/session-messages 按 id 直读文件，零后端改动）
@@ -71,11 +76,11 @@ export default function ArchiveDetail({
   // 挂载时取一次快照（归档详情为静态只读页，无需定时走动）
   const [now] = useState(() => Date.now());
   const reason = resumeUnavailableReason(session);
-  // 最后状态中文（spec §7.3 顶部信息行要求）：lastStatus 小写串与 STATUS_LABELS
+  // 最后状态显示名（spec §7.3 顶部信息行要求）：lastStatus 小写串与 statusLabel
   // 六键（waiting/processing/thinking/compacting/idle/finished）精确对齐——Rust 端
-  // format!("{:?}", status).to_lowercase() 产物一致；未知串回退原文
-  const statusLabel =
-    (STATUS_LABELS as Record<string, string>)[session.lastStatus] ?? session.lastStatus;
+  // format!("{:?}", status).to_lowercase() 产物一致；未知串回退原文（M5 Task 7：
+  // 经 board-logic.statusLabel 渲染期现取 i18n，中英随语言切换）
+  const lastStatusLabel = statusLabel(session.lastStatus);
 
   useEffect(() => {
     let alive = true;
@@ -204,9 +209,9 @@ export default function ArchiveDetail({
       if (r.status === "opening") {
         // T3 未信任预检（评审修复：移动端用户可见承载）：电脑侧命中未信任目录——
         // claude 将弹终端信任提示，手机注入答不了，须人工去主机应答否则会话挂起。
-        // 文案与 Rust TRUST_PROMPT_REMINDER 同义；移动端口径硬编码中文（无 i18n 契约）
+        // 文案与 Rust TRUST_PROMPT_REMINDER 同义（M5 双语键）
         if (r.trustPromptExpected) {
-          toast("重开的会话所在目录未做信任确认，请在主机终端应答信任提示，否则会话将挂起");
+          toast(i18n.t("mobile.archive.trustPrompt"));
         }
         onActivated(); // 乐观回看板：活板 3s 内出卡，归档条目下次拉取自然消失
         return;
@@ -216,7 +221,11 @@ export default function ArchiveDetail({
       // 404 哨兵在响应体 data.error（api.ts 解析进 ApiError.data）——命中哨兵走
       // 归档语境文案，其余（网络异常等）维持原 String(e) 形态
       const code = e instanceof ApiError ? (e.data?.error as string | undefined) : undefined;
-      setOpenError(code !== undefined ? openFailureCopy(code) : `打开失败：${String(e)}`);
+      setOpenError(
+        code !== undefined
+          ? openFailureCopy(code)
+          : i18n.t("mobile.archive.openFailed", { reason: String(e) })
+      );
     } finally {
       setOpening(false);
     }
@@ -229,22 +238,22 @@ export default function ArchiveDetail({
           type="button"
           onClick={onBack}
           className="text-sm text-[var(--mut)]"
-          aria-label="返回历史页"
+          aria-label={i18n.t("mobile.archive.backToListAria")}
         >
-          ‹ 返回
+          {i18n.t("mobile.archive.back")}
         </button>
         <h1 className="text-lg font-semibold">{session.projectName}</h1>
       </header>
       <p className="mt-1 shrink-0 text-xs text-[var(--mut)]">
-        {chipLabel(session.agentType)} · {session.projectPath} · {statusLabel} ·{" "}
+        {chipLabel(session.agentType)} · {session.projectPath} · {lastStatusLabel} ·{" "}
         {formatRelativeTime(session.lastSeenAt, now)}
-        {session.hiddenAlive ? "活跃" : "结束"}{" "}
+        {i18n.t(session.hiddenAlive ? "mobile.archive.alive" : "mobile.archive.ended")}{" "}
         {session.hiddenAlive && (
           <span
             data-testid="hidden-alive-badge"
             className="rounded-full bg-green-100 px-1.5 py-0.5 text-[10px] text-green-700 dark:bg-green-900/40 dark:text-green-300"
           >
-            未结束 · 看板已隐藏
+            {i18n.t("mobile.archive.aliveHidden")}
           </span>
         )}
       </p>
@@ -255,7 +264,7 @@ export default function ArchiveDetail({
           data-testid="archive-truncated"
           className="mt-2 shrink-0 rounded-lg bg-amber-50 px-3 py-1.5 text-center text-xs text-amber-700 dark:bg-amber-950/40 dark:text-amber-400"
         >
-          内容较长，仅显示最近 {ARCHIVE_PAGE_LIMIT} 条
+          {i18n.t("mobile.archive.truncated", { count: ARCHIVE_PAGE_LIMIT })}
         </p>
       )}
 
@@ -266,7 +275,7 @@ export default function ArchiveDetail({
           data-testid="archive-fold-banner"
           className="mt-2 flex shrink-0 items-center justify-between rounded-lg bg-[var(--cbg)] px-3 py-1.5 text-xs text-[var(--mut)]"
         >
-          <span>{collapsedCount} 条过程内容已折叠</span>
+          <span>{i18n.t("mobile.archive.foldedCount", { count: collapsedCount })}</span>
           <span className="flex gap-2">
             <button
               type="button"
@@ -274,7 +283,7 @@ export default function ArchiveDetail({
               className="underline"
               onClick={expandAll}
             >
-              展开全部
+              {i18n.t("mobile.archive.expandAll")}
             </button>
             <button
               type="button"
@@ -282,7 +291,7 @@ export default function ArchiveDetail({
               className="underline"
               onClick={collapseAll}
             >
-              收起
+              {i18n.t("mobile.archive.collapse")}
             </button>
           </span>
         </div>
@@ -299,14 +308,18 @@ export default function ArchiveDetail({
         >
           {contentError && (
             <p className="py-6 text-center text-sm text-[var(--mut)]">
-              内容暂不可读（会话文件可能已被工具清理）
+              {i18n.t("mobile.archive.contentUnreadable")}
             </p>
           )}
           {messages === null && !contentError && (
-            <p className="py-6 text-center text-sm text-[var(--mut)]">加载中…</p>
+            <p className="py-6 text-center text-sm text-[var(--mut)]">
+              {i18n.t("mobile.detail.loading")}
+            </p>
           )}
           {messages?.length === 0 && (
-            <p className="py-6 text-center text-sm text-[var(--mut)]">（无历史消息）</p>
+            <p className="py-6 text-center text-sm text-[var(--mut)]">
+              {i18n.t("mobile.archive.noMessages")}
+            </p>
           )}
           {/* 加载更早消息（体验批二，活会话同款）：条数达 limit 或 truncated 即提供 */}
           {hasLoadMore && (
@@ -316,7 +329,7 @@ export default function ArchiveDetail({
               onClick={loadMore}
               className="mx-auto mb-2 block rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs text-[var(--mut)] hover:bg-[var(--cbg)] dark:hover:bg-[var(--btnp)]"
             >
-              加载更早消息
+              {i18n.t("mobile.detail.loadMore")}
             </button>
           )}
           <ul className="flex flex-col gap-2 pb-2">
@@ -361,8 +374,8 @@ export default function ArchiveDetail({
           <button
             type="button"
             data-testid="jump-to-top"
-            aria-label="跳到顶部"
-            title="跳到顶部"
+            aria-label={i18n.t("mobile.detail.jumpTop")}
+            title={i18n.t("mobile.detail.jumpTop")}
             onClick={jumpToTop}
             className="absolute top-2 right-2 z-10 rounded-full border border-[var(--cb)] bg-[var(--cbg)] p-2 text-[var(--mut)] shadow-md hover:bg-[var(--cbg)] dark:hover:bg-[var(--btnp)]"
           >
@@ -373,8 +386,8 @@ export default function ArchiveDetail({
           <button
             type="button"
             data-testid="jump-to-bottom"
-            aria-label="跳到底部"
-            title="跳到底部"
+            aria-label={i18n.t("mobile.archive.jumpBottom")}
+            title={i18n.t("mobile.archive.jumpBottom")}
             onClick={jumpToBottom}
             className="absolute right-2 bottom-2 z-10 rounded-full border border-[var(--cb)] bg-[var(--cbg)] p-2 text-[var(--mut)] shadow-md hover:bg-[var(--cbg)] dark:hover:bg-[var(--btnp)]"
           >
@@ -399,10 +412,12 @@ export default function ArchiveDetail({
               }}
               className="w-full rounded-lg bg-[var(--btnp)] px-3 py-2 text-sm text-[var(--btnpt)]"
             >
-              移回看板
+              {i18n.t("mobile.archive.unhide")}
             </button>
             {unhideError && (
-              <p className="mt-1 text-center text-xs text-red-600">操作失败，请重试</p>
+              <p className="mt-1 text-center text-xs text-red-600">
+                {i18n.t("mobile.archive.manageError")}
+              </p>
             )}
           </>
         ) : (
@@ -415,7 +430,7 @@ export default function ArchiveDetail({
               onClick={handleOpen}
               className="w-full rounded-lg bg-green-700 px-3 py-2 text-sm text-white enabled:hover:bg-green-800 disabled:opacity-50"
             >
-              {opening ? "正在电脑上打开终端…" : "在桌面端打开"}
+              {i18n.t(opening ? "mobile.archive.opening" : "mobile.archive.open")}
             </button>
             {reason && <p className="mt-1 text-center text-xs text-[var(--mut)]">{reason}</p>}
             {openError && (
@@ -442,14 +457,14 @@ export default function ArchiveDetail({
                     .catch(() => setRemoveError(true));
                 }}
               >
-                确认移除
+                {i18n.t("mobile.archive.removeConfirm")}
               </button>
               <button
                 type="button"
                 className="flex-1 rounded-lg border border-[var(--cb)] px-3 py-1.5 text-xs"
                 onClick={() => setConfirmRemove(false)}
               >
-                取消
+                {i18n.t("mobile.archive.cancel")}
               </button>
             </span>
           ) : (
@@ -459,12 +474,12 @@ export default function ArchiveDetail({
               className="w-full rounded-lg border border-red-300 px-3 py-2 text-sm text-red-600 hover:bg-red-50 dark:border-red-900 dark:hover:bg-red-950/40"
               onClick={() => setConfirmRemove(true)}
             >
-              从归档移除
+              {i18n.t("mobile.archive.remove")}
             </button>
           )}
           {removeError && (
             <p data-testid="archive-remove-error" className="mt-1 text-center text-xs text-red-600">
-              操作失败，请重试
+              {i18n.t("mobile.archive.manageError")}
             </p>
           )}
         </div>

@@ -344,6 +344,8 @@ pub fn run() {
         commands::manifest::get_store_index,
         remote::remote_toggle,
         remote::remote_status,
+        // 三终端语言自适应（C-3）：前端推送桌面当前语言（远程端跟随的数据源）
+        remote::set_desktop_language,
         remote::remote_confirm_public,
         remote::remote_devices,
         remote::remote_revoke_device,

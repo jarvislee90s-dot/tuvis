@@ -1173,6 +1173,7 @@ mod tests {
             archive_delete: std::sync::Arc::new(|_: Option<&str>| 0usize),
             // Codex Desktop IPC：fixture 显式 disabled hub（一切能力关闭）
             codex_control: crate::remote::codex_ipc::CodexControlHub::disabled_arc(),
+            desktop_language: Default::default(),
         }
     }
 
