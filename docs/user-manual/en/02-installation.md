@@ -32,3 +32,42 @@ Tuvis ships installers for Windows and macOS — grab the latest release from Gi
 - **Upgrading from 0.5.5 or later**: just install over the top with the new installer; hook configuration is migrated automatically at app startup.
 - **All data stays local**: everything Tuvis keeps (database, settings, logs, skill repository) lives under `~/.tuvis/` — back up that directory and you have backed up everything.
 - **macOS says the app "is damaged" or "can't verify the developer"**: this is the system's standard block for unnotarized packages. In System Settings' Privacy & Security area, find the allow prompt about Tuvis and click Allow; or right-click the app (Ctrl+click) and choose "Open" once — after that double-clicking works normally.
+
+## Data directory (`~/.tuvis/`)
+
+The app stores its data in `~/.tuvis/`:
+
+| Path                            | Purpose                                                        |
+| ------------------------------- | -------------------------------------------------------------- |
+| `~/.tuvis/tuvis.db`             | SQLite database (settings, extensions, presets, session cache) |
+| `~/.tuvis/skills/`              | Global skill repository                                        |
+| `~/.tuvis/mcp/`                 | Global MCP server configs                                      |
+| `~/.tuvis/hooks/status-hook.sh` | Shared Hook script for status events                           |
+| `~/.tuvis/events/`              | Hook event files (auto-cleaned, 30s TTL)                       |
+
+## Development builds (running from source)
+
+**macOS dev-build note**: dev builds (unsigned packages) need a one-time manual grant
+before the first one-click session resume opens a window — allow Tuvis to control
+Terminal / iTerm2 under **System Settings → Privacy & Security → Automation** (TCC does
+not prompt automatically). Without the grant, osascript fails with -1743, and resume
+replies with a "macOS automation permission missing" error pointing to these
+instructions.
+
+**Helper build gate (locked in by batch-C task T2)**: `tuvis-hook-listener` (the
+hook-event listener helper) and `tuvis-marker` (the window-title marker) both sit
+behind Cargo `required-features` gates — **without the features they are not built at
+all**, so the app's startup `ensure_hook_script` step cannot find the same-directory
+helper and skips installing it, leaving the copy under `~/.tuvis/bin/` stale forever
+(field-observed failure: hook events missing the `tool_name` payload → Q&A-card
+channel A never recognized).
+
+- `pnpm tauri:dev` / `pnpm tauri:build` **already include the features** (`hook-listener`
+  and `marker-helper`, the latter implying the former) — just use them as usual;
+- Building a helper standalone (e.g. for on-device `#[ignore]` tests) must pass the
+  feature explicitly: `cd src-tauri && cargo build --bin tuvis-hook-listener --features hook-listener`;
+- Same for bin tests: `cargo test --bin tuvis-hook-listener --features hook-listener`;
+- macOS packaging (`release:macos` / the macOS job in release.yml) runs bare
+  `pnpm tauri build` with explicit arguments and is **not** affected by the npm scripts
+  above — the extra bins would break the universal build, so the macOS side
+  deliberately omits the features (the helpers serve the Windows channel).

@@ -38,3 +38,16 @@ A row of chips above the cards: "All" on the far left, then seven tools (Claude 
 1. Click a session card and Tuvis brings the matching terminal window to the foreground;
 2. When one project has multiple windows and several candidates match, a picker lets you choose the target;
 3. Forms that do not support jumping say so in place — Tuvis never fakes a successful jump.
+
+Terminal support:
+
+| Terminal     | Support                            |
+| ------------ | ---------------------------------- |
+| iTerm2       | ✅ AppleScript                     |
+| Terminal.app | ✅ AppleScript                     |
+| tmux         | ✅ pane selection + terminal focus |
+| Wayland      | ❌ Graceful fallback message       |
+
+Terminal tools (Claude Code / Codex CLI / OpenCode / Kimi Code) resolve through process-tree and window-content disambiguation; **same-project dual-open jumps land directly**: for Kimi / OpenCode, the window title is matched against the session title (kimi `state.json` title / OpenCode DB title) after normalization — a unique hit locks onto the window, so dual terminals no longer raise a picker. On Windows, resolution also stamps a one-shot identity marker onto the target terminal title (` — Tuvis:xxxxxxxxxxxx`, cleared automatically after focus) for positive locking; markers never stack, and when the card↔terminal pairing is uncertain (same-project multi-open) the app **raises a picker rather than risking the wrong window**, and focus refusals surface an explicit error instead of failing silently.
+
+Desktop APP tools (Codex APP, WorkBuddy) support deep-link jumps: `codex://threads/<id>`, `workbuddy://chat/<id>` (session-level). The handler is verified before dispatch and foregrounding is verified after; on failure it falls back to APP-level focus (macOS AppleScript / Windows nearest-ancestor) without marking the session read. ZCode is a single-window multi-tab app — its jump simply focuses the unique window (cards carry the host pid, zero ambiguity). dsh's jump focuses (or opens) the dsh web tab in your browser.

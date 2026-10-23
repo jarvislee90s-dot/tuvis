@@ -10,7 +10,7 @@ The default companion tuvis-3D is a 3D tech rabbit floating in a corner of your 
 
 - **Status card overhead**: same colors, same meaning as the dashboard (red = waiting for you / yellow = running / green = finished); click the card to jump to the matching terminal;
 - **Usage snippet**: hover for about half a second and a popup appears with a token-usage minibar on top of the status card (New input / Cache hit / Output / per-tool totals); after the mouse leaves there is a 2-second grace period — plenty of time to click "Details »";
-- **Voice reminders**: playful nudges while waiting, cheers on completion, subtitles synced to audio length; double-click for a little chat.
+- **Voice reminders**: playful nudges while waiting, cheers on completion, subtitles synced to audio length; double-click for a little chat. Each pet ships its own voice pack — tuvis-3D 16 clips, Foxbell 31 clips.
 
 ## Switching built-in pets
 
@@ -30,9 +30,9 @@ All three stay in sync — any one of them turns the pet on or off.
 
 ## Always on top
 
-The "float above all windows" switch (in the settings page and the pet's right-click menu) decides whether the pet sits above everything; while on top it automatically suppresses notification toasts, so the two never fight.
+The "float above all windows" switch (in the settings page and the pet's right-click menu) decides whether the pet sits above everything; while on top it automatically suppresses notification toasts, so the two never fight. This is one half of the pet's dashboard integration — the other half: with the pet enabled, it takes over the completion chime.
 
-> 💡 The right-click menu also holds sound / subtitles / gravity physics / three size tiers and more — all toggleable on the spot. Since v0.5.8 the gravity physics **defaults to off after every app restart** (re-enable per session; multi-window sync unchanged).
+> 💡 The right-click menu also holds sound / subtitles / gravity physics (pinned-to-cursor dragging, gravity fall on release, throw inertia, squash-and-bounce landing) / three size tiers / per-scene action binding / hide — all toggleable on the spot. Since v0.5.8 the gravity physics **defaults to off after every app restart** (re-enable per session; multi-window sync unchanged).
 
 ## Pet management
 
@@ -49,3 +49,5 @@ The "Notifications & Pet" card in settings holds the "current pet", "switch pet"
 3. **petdex online**: browse the petdex.dev gallery first, then paste a pet page link (e.g. `https://petdex.dev/pets/capvolt`) to download and stage it.
 
 The wizard then asks for the pet id, display name, and description, with a spritesheet preview before anything is written. Pets missing voice files degrade gracefully to animation-only; everything else keeps working.
+
+Since v0.3.0 the pet format is open, so external pets go beyond the two built-ins: manifest structure, frame rate, dimensions and voice manifests are fully validated on import. The voice-capable flag stays in two-way sync, and a pet running as animation-only keeps its transient actions.

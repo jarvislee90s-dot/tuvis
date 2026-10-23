@@ -38,3 +38,22 @@
 1. 点会话卡，兔维斯自动把对应终端窗口调到前台；
 2. 同项目多开、命中多个候选窗口时，会弹出选择器让你点选目标；
 3. 不支持跳转的形态就地提示，绝不假装跳转。
+
+### 支持的终端
+
+| 终端                       | 支持情况                                      |
+| -------------------------- | --------------------------------------------- |
+| iTerm2                     | ✅ AppleScript                                |
+| Terminal.app               | ✅ AppleScript                                |
+| tmux                       | ✅ pane 选择 + 终端聚焦                       |
+| Windows Terminal / conhost | ✅ 进程树消歧 + 一次性标题标记锁定（Windows） |
+| 浏览器标签（dsh）          | ✅ 标签页聚焦/打开（macOS）                   |
+| Wayland                    | ❌ 优雅降级提示                               |
+
+### 终端类工具如何消歧
+
+终端类工具（Claude Code / Codex CLI / OpenCode / Kimi Code）经进程树 + 窗口内容逐层消歧聚焦；**同项目双开直达**：Kimi / OpenCode 的窗口标题与会话标题（kimi `state.json` 标题 / OpenCode DB 标题）归一化比对，唯一命中即锁定，双开终端不再弹选择器。Windows 上消歧还会对目标终端贴一次性身份标记（` — 兔维斯:xxxxxxxxxxxx`，聚焦成功后自动清除）正向锁定，且标记不会叠加残留；卡片↔终端配对存疑（同项目多开）时**宁可弹选择器也不锁错窗**，聚焦被系统拒绝时显式报错而非静默假成功。
+
+### APP 类工具：深度链接直达
+
+桌面 APP 类工具（Codex APP、WorkBuddy）支持深度链接直达：`codex://threads/<id>`、`workbuddy://chat/<id>`（会话级），派发前校验协议 handler、派发后验证前台化，失败自动落 APP 级前台保底（macOS AppleScript / Windows 近祖聚焦），且不误标已读。ZCode 为单窗口多标签应用，跳转直接聚焦唯一窗口（卡片携带宿主 pid，零歧义锁定）。

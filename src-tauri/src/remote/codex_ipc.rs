@@ -485,6 +485,12 @@ impl CodexControlHub {
         // C4：热重启统一入口——解除停机态（stop 后 ensure 拒连），装配前恢复可连
         self.adapter.resume();
         let hub = self.clone();
+        // 刻意保留裸 tokio::spawn、与 stop 的 tauri::async_runtime::spawn **不对称**：
+        // start 只从服务器任务（runtime 内，server.rs）调，裸 spawn 本就安全；而调度
+        // 循环挂在调用方 runtime 上是集成测试（tests/codex_ipc_remote.rs）对循环驱动
+        // 时序的既有假设——换 tauri 全局 runtime 后循环变跨 runtime 真并发，71 个
+        // 集成用例中 2 个确定性红（2026-10-23 合入轮实证）。若未来 start 出现
+        // runtime 外的调用方，须连测试假设一起重审，不能只换 spawn 宏
         let handle = tokio::spawn(async move { scheduler_loop(hub, st).await });
         *self.sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
@@ -504,9 +510,14 @@ impl CodexControlHub {
         if let Some(h) = self.sched.lock().unwrap_or_else(|e| e.into_inner()).take() {
             h.abort();
         }
-        // 连接关闭是异步收尾（conn 锁）：后台执行，peer 侧看到 EOF
+        // 连接关闭是异步收尾（conn 锁）：后台执行，peer 侧看到 EOF。
+        // 必须 tauri::async_runtime::spawn：本函数经 stop_server_with 从**同步命令**
+        // （remote_toggle(false) / 通道热重启）的内联线程调——无 runtime 上下文，
+        // 裸 tokio::spawn 直接 panic「no reactor running」，且 panic 落在 WebView2
+        // IPC 回调边界不可 unwind → abort 整个进程（v0.6.1 三次切换开关闪退的根因，
+        // WER 0xc0000409/FAST_FAIL=7 + mam.log panic 记录实证）
         let adapter = self.adapter.clone();
-        tokio::spawn(async move { adapter.shutdown().await });
+        tauri::async_runtime::spawn(async move { adapter.shutdown().await });
     }
 }
 

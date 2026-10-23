@@ -8,12 +8,14 @@
 //  * 裁决本身也要可发现：**「部分覆盖」不新增界面档位**（可得性模型是布尔两态，加一档要动冻结
 //    契约；且前端不直渲后端中文 `reason`）。裁决被删掉、与比例被写回来，一样是回归。
 // ⇒ 本锁钉住两头：**比例不许回来** + **登记必须在位**（spec §9.5.1 / `availability.ts` 口径 ④ /
-//    验收清单 §0+§6 / README——2026-10-22 英文化后为中英两份：`README.zh-CN.md` + `README.md`）。
+//    验收清单 §0+§6 / 用户手册 zh/11 + en/11——2026-10-22 README 英文化后曾钉中英双 README；
+//    2026-10-23 README 门面化（PR #181 文档三分）把可得性小节迁入
+//    `docs/user-manual/{zh,en}/11-usage.md`，锁面随内容迁移重指两章手册）。
 //
 // ⚠️ **范围（别以为它覆盖全仓）**：本锁只扫下面这几个文件 —— 判据面（`services/usage/**`）的 4 个
-//    Rust 文件 + spec + **验收清单**（`ACCEPT`）+ **双 README**（`README.zh-CN.md` + `README.md`，
-//    共 8 个被扫文件）。**用例 1 的 `files` 数组 =
-//    `RUST_FILES + SPEC + ACCEPT + README + README_EN`**（2026-10-06 第三轮把 ACCEPT 补进来：此前文件头声明
+//    Rust 文件 + spec + **验收清单**（`ACCEPT`）+ **双手册章**（`docs/user-manual/zh/11-usage.md` +
+//    `en/11-usage.md`，共 8 个被扫文件）。**用例 1 的 `files` 数组 =
+//    `RUST_FILES + SPEC + ACCEPT + MANUAL_ZH + MANUAL_EN`**（2026-10-06 第三轮把 ACCEPT 补进来：此前文件头声明
 //    含验收清单、而 `files` 与黑名单都不含它 ⇒ 那份文件里的 `19/99` 其实**不受本锁保护**，
 //    它当时那两处恰巧都带「已作废」标记，属侥幸而非设计）。**① 的历史计划文件
 //    `docs/superpowers/plans/2026-10-03-usage-collector-and-storage.md` 不在范围内**：它是
@@ -22,12 +24,18 @@
 // 2026-10-22（README 英文化后）：锁面扩为中英双 README —— 默认 `README.md` 已是英文版，其作废标记为
 //    `obsolete`。英文版无「不在界面表达」对应句（翻译缺口，待另行补译），该面暂无英文锁。
 //
+// 2026-10-23（README 门面化后）：锁面由双 README 迁至手册 `zh/11-usage.md` + `en/11-usage.md`
+//    （可得性小节随 PR #181 文档三分迁入门册，锁随内容走——README 门面不再承载裁决登记）。
+//    英文侧三句与 obsolete 退役引用在 en/11 完整在位；中文侧 zh/11 只留「比例不写死」的
+//    定性口径（19/99 数字本身未随迁，属比英文更彻底的清理，非遗漏——该数字在 zh 侧零出现，
+//    「不得当作现行事实」的不变量天然成立）。
+//
 // ⚠️ **判据强度（如实标注，别当成行为锁）** —— 逐条给**单点硬钉 / 存在性判据**的分类与
 //    **该串在目标文件里的实际出现次数**（第三轮按实测数字改写；早先把用例 2 / 3 一并写成
 //    「存在性判据」是**低估**了用例 2）：
 //  * **用例 1** = **逐行判据**：出现 `19/99` 的行必须自带「作废 / 不写死 / 过期 / obsolete」之一。
-//    含 `19/99` 的**被锁文件是七个**（8 个被扫文件里只有 `query.rs` 一处都没有），
-//    **逐文件行数 = 3 / 2 / 2 / 1 / 1 / 1 / 1** —— 这组数字的**唯一出处是下面那张 `EXPECTED_COUNTS`
+//    含 `19/99` 的**被锁文件是六个**（8 个被扫文件里 `query.rs` 与 zh/11 一处都没有），
+//    **逐文件行数 = 3 / 2 / 2 / 1 / 1 / 1** —— 这组数字的**唯一出处是下面那张 `EXPECTED_COUNTS`
 //    表**，用例 1 会逐文件 `match(/19\/99/g)` 数一遍并与它 `toEqual` **互锁**（第五轮新增：
 //    手写计数已腐烂过一次——第四轮前写「三个文件 3 / 2 / 1」，实测是六文件 3/2/2/1/1/1）。
 //    **黑名单那两条是全文包含判据**——任一被锁文件里写回那两种断言式写法即红（单点硬钉）。
@@ -35,9 +43,9 @@
 //  * **用例 2** = **混合**：
 //      - **单点硬钉**（该串在目标文件里**只此一处** ⇒ 删掉它本用例即红）：
 //        spec 的 `布尔两态`（1 处）、`availability.ts` 的三个串（`不在界面上表达` / `布尔两态` /
-//        `EM_DASH` **各 1 处**）、README 中文版的 `不在界面表达`（1 处）、README 英文版的三个
-//        对应串（`no ratio is…hard-coded` 跨行正则 / `coverage varies…` / `the earlier "19/99"
-//        is obsolete` **各 1 处**；英文版无「不在界面表达」对应句，该面暂无英文锁）；
+//        `EM_DASH` **各 1 处**）、手册中文版 zh/11 的 `不在界面表达`（1 处）、手册英文版 en/11 的
+//        三个对应串（`no ratio is…hard-coded` 跨行正则 / `coverage varies…` / `the earlier "19/99"
+//        figure is obsolete` **各 1 处**；英文侧无「不在界面表达」的中文原句，该面无中文串锁）；
 //      - **存在性判据**（多处 ⇒ 删掉其中任一处仍绿）：spec 的 `9.5.1`（2 处）、
 //        spec 的 `不在界面表达`（4 处）、`ACCEPT` 的 `部分覆盖`（4 处）与 `不在界面表达`（2 处）。
 //  * **用例 3** = **几乎全是存在性判据**：`一部分会话`（spec 9 处）、`部分覆盖`（spec 11 处）、
@@ -61,8 +69,8 @@ const COLLECT = "src-tauri/src/services/usage/collect.rs";
 const RUST_FILES = [CAPS, QUERY, DSH, COLLECT];
 const SPEC = "docs/superpowers/specs/2026-10-03-pet-token-usage-dashboard-design.md";
 const ACCEPT = "docs/release-notes/usage-dashboard-acceptance.md";
-const README = "README.zh-CN.md"; // 中文主笔版：锁钉的是中文裁决串（不在界面表达/作废标记）
-const README_EN = "README.md"; // 默认英文版：锁对应英文裁决句（作废标记是 obsolete）——2026-10-22 英文化后入锁
+const MANUAL_ZH = "docs/user-manual/zh/11-usage.md"; // 中文主笔：锁钉中文裁决串（不在界面表达/不写死）——2026-10-23 门面化后自 README.zh-CN.md 迁入
+const MANUAL_EN = "docs/user-manual/en/11-usage.md"; // 英文侧对应句（作废标记 obsolete）——自 README.md 迁入
 
 /**
  * **含 `19/99` 的被锁文件 × 逐文件行数** —— 文件头那句「七个文件、3 / 2 / 2 / 1 / 1 / 1 / 1」的
@@ -79,8 +87,7 @@ const EXPECTED_COUNTS: Record<string, number> = {
   [ACCEPT]: 2,
   [CAPS]: 1,
   [DSH]: 1,
-  [README]: 1,
-  [README_EN]: 1,
+  [MANUAL_EN]: 1, // zh/11 为 0（中文侧迁移时连数字一起清理，只留定性口径），故不列——见文件头 2026-10-23 注
 };
 
 /**
@@ -112,12 +119,12 @@ describe("usage-partial-coverage-lock（「部分覆盖不在界面表达」+ �
   it("1. 旧比例不得再被当作现行事实：出现处必须自带「已作废 / 不写死」语境（写回来即红）", () => {
     // **含 ACCEPT**（2026-10-06 第三轮补齐）：文件头声明的扫描面里有验收清单，`files` 也必须真有它，
     // 否则那份文件里的 19/99 不受保护（当时靠"两处恰巧都带标记"过关，不是设计）。
-    // **含双 README**（2026-10-22 补齐英文侧）：README 英文化后 `README.md` 一并入锁。
-    const files = [...RUST_FILES, SPEC, ACCEPT, README, README_EN];
+    // **含双手册章**（2026-10-23 门面化后）：可得性小节自双 README 迁入 zh/11 + en/11，锁面随迁。
+    const files = [...RUST_FILES, SPEC, ACCEPT, MANUAL_ZH, MANUAL_EN];
     for (const f of files) assertOnlyRetiredMentions(f, read(f));
     // **计数互锁（第五轮新增）**：逐文件数 `19/99`，与文件头那张 `EXPECTED_COUNTS` **逐字比对** ——
     // 手写数字从此不可能静默漂（本表上一轮已腐烂过一次：写「三个文件 3 / 2 / 1」，实测六文件
-    // 3 / 2 / 2 / 1 / 1 / 1）。`query.rs` 一处都没有 ⇒ 表里不列它，但下面单独钉住「它是 0」。
+    // 3 / 2 / 2 / 1 / 1 / 1）。`query.rs` 与 zh/11 一处都没有 ⇒ 表里不列它们，但下面分别钉住「它们是 0」。
     const actualCounts: Record<string, number> = {};
     for (const f of files) {
       const n = (read(f).match(/19\/99/g) ?? []).length;
@@ -125,6 +132,7 @@ describe("usage-partial-coverage-lock（「部分覆盖不在界面表达」+ �
     }
     expect(actualCounts).toEqual(EXPECTED_COUNTS);
     expect(actualCounts[QUERY] ?? 0).toBe(0);
+    expect(actualCounts[MANUAL_ZH] ?? 0).toBe(0);
     // 表里的键必须是**被扫文件**的子集（防把路径写错成「永远数不到的幽灵文件」）
     for (const f of Object.keys(EXPECTED_COUNTS)) expect(files).toContain(f);
     // 当年那几种**断言式**写法逐字清零（它们才是缺陷本身）。
@@ -138,7 +146,7 @@ describe("usage-partial-coverage-lock（「部分覆盖不在界面表达」+ �
     }
   });
 
-  it("2. 裁决登记齐：spec §9.5.1 / availability.ts 口径 ④ / 验收清单 §0+§6 / 双 README", () => {
+  it("2. 裁决登记齐：spec §9.5.1 / availability.ts 口径 ④ / 验收清单 §0+§6 / 手册 zh/11 + en/11", () => {
     const spec = read(SPEC);
     expect(spec).toContain("9.5.1"); // 登记小节
     expect(spec).toContain("不在界面表达");
@@ -153,13 +161,13 @@ describe("usage-partial-coverage-lock（「部分覆盖不在界面表达」+ �
     expect(acc).toContain("部分覆盖");
     expect(acc).toContain("不在界面表达"); // §0 的第 9 行
 
-    expect(read(README)).toContain("不在界面表达"); // README 中文版的可得性小节同步登记
+    expect(read(MANUAL_ZH)).toContain("不在界面表达"); // 手册中文版 zh/11 的可得性条目同步登记
 
-    // 英文默认版对应句入锁（各恰 1 处 = 单点硬钉）；「不在界面表达」句英文版缺失（翻译缺口，见文件头标注）。
-    const en = read(README_EN);
+    // 英文侧对应句入锁（各恰 1 处 = 单点硬钉）；「不在界面表达」句为中文原句，英文面无此串锁。
+    const en = read(MANUAL_EN);
     expect(en).toMatch(/no ratio is\s+hard-coded/); // 比例不写死的对应句（中间断行，须用正则）
     expect(en).toContain("coverage varies with the machine and cleanup policy");
-    expect(en).toContain('the earlier "19/99" is obsolete'); // 「已作废」的直接对应
+    expect(en).toContain('the earlier "19/99" figure is obsolete'); // 「已作废」的直接对应（迁移时补了 figure 一词，钉以新家实际句子为准）
   });
 
   it("3. 清理比例 ≠ 删掉结论：定性的「一部分会话 / 部分覆盖 / available=true」仍在位", () => {

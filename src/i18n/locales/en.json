@@ -1874,6 +1874,7 @@
     "updaterGithubParse": "Failed to parse the GitHub API response — see logs",
     "updaterDohTaskFail": "DoH resolution task crashed — see logs",
     "updaterDohAllFail": "DoH resolution failed (all sources unavailable) — see logs",
+    "updaterDohFail": "Download-host DoH resolution failed — see logs",
     "updaterPinFail": "Pinned-IP direct connection failed — see logs",
     "updaterManifestPrefix": "Invalid update manifest URL (bad prefix)",
     "updaterManifestFilename": "Invalid update manifest URL (not latest.json)",

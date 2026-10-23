@@ -6,11 +6,11 @@ When you are away from the terminal, Tuvis keeps watch for you — three layers 
 
 ## Three-layer reminders
 
-When a session's state changes (after dedup and debounce), three channels relay in turn:
+When a session's status color changes (red ↔ yellow ↔ green), three channels relay in turn after dedup and debounce:
 
 1. **System desktop notification**: an OS-level notification with a built-in "view session" action — one click jumps straight to that session's terminal; approval-waiting states add a "go to approval" action;
 2. **Notification toast**: a small in-app card pops up from a corner of the screen; clicking the card jumps to the session's terminal, and it tucks itself away after a few seconds of being ignored;
-3. **Sound**: synthesized tones — no extra audio files needed.
+3. **Sound**: chimes synthesized via the Web Audio API — no extra audio files needed.
 
 ## Alert policy
 
@@ -30,3 +30,11 @@ Sounds have two tiers: pick a **global completion sound** as the default, then s
 ## Notification bell & history
 
 The bell on the main window's tab bar gathers all notification history: the unread count shows as a badge (99+ once it exceeds 99), and opening it lets you browse, jump, "clear all", or clear only the read ones. A missed banner can always be fished back out here.
+
+## Launch at login
+
+- A fresh release installation attempts to enable launch at login once; existing installations and legacy-brand migrations keep their state. A failed registration can be retried in Settings.
+- Toggle it from the Settings → "Notifications & Pet" card, or from below the tray's "Show Window" item — both entries share one read/write path and keep the checkbox state in sync.
+- What you see is the **real OS-side state, read live** (the Windows registry Run key, including the enable/disable flag Task Manager writes; macOS login items) — no local cache, and a failed toggle rolls back and reports honestly.
+- When launched by autostart, the main window **starts hidden in the tray** and the desktop pet still follows — no window popping up on boot.
+- On Windows, uninstalling removes the startup entry for the user who uninstalls; macOS has no uninstall hook, so remove the matching plist under `~/Library/LaunchAgents/` manually.

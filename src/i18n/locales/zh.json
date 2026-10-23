@@ -1874,6 +1874,7 @@
     "updaterGithubParse": "GitHub API 响应解析失败——详见日志",
     "updaterDohTaskFail": "DoH 解析任务失败——详见日志",
     "updaterDohAllFail": "DoH 解析失败（所有源都不可用）——详见日志",
+    "updaterDohFail": "下载域 DoH 解析失败——详见日志",
     "updaterPinFail": "钉 IP 直连失败——详见日志",
     "updaterManifestPrefix": "非法的升级清单地址（前缀不符）",
     "updaterManifestFilename": "非法的升级清单地址（非 latest.json）",

@@ -1,5 +1,5 @@
 {
-  "description": "PR #158 五轮：Rust 生产裸中文字符串在错误上下文 ±3 行的候选数；已排除测试、日志调用参数、UsageError/PetRpcError 参数。不是可达上屏错误总数，不与旧逐行口径 172 混比。口径固定：±3 行启发式命中时须添加错误码，后续迁移只降低各文件预算。五轮修复了剔除器「cfg(test) 项类型位顶层逗号」缺陷，本表随之由 452 收紧至 446（remote/attachment_fixtures.rs 的 6 条测试夹具候选归零）。",
+  "description": "PR #158 五轮：Rust 生产裸中文字符串在错误上下文 ±3 行的候选数；已排除测试、日志调用参数、UsageError/PetRpcError 参数。不是可达上屏错误总数，不与旧逐行口径 172 混比。口径固定：±3 行启发式命中时须添加错误码，后续迁移只降低各文件预算。五轮修复了剔除器「cfg(test) 项类型位顶层逗号」缺陷，本表随之由 452 收紧至 446（remote/attachment_fixtures.rs 的 6 条测试夹具候选归零）。PR #181 增记 updater.rs 4→7：安装层两跳回退（89ca9364）的三个纯拼接片段——「{host}: DoH 未给出可用地址」「；其余域: {}」「{}；DoH 钉 IP 直连兜底也失败: {}」，均为已带码顶层报文的内嵌明细/连接拷贝（与发现层基线内既有片段同构，发现层对应拷贝为基线原 4 项之一），顶层码本体（UPDATER_MANIFEST_VERIFY/UPDATER_INSTALL_FAIL/UPDATER_DOH_FAIL）均已恢复/新增码形态并配齐 i18n 键。",
   "files": {
     "src-tauri/src/bin/tuvis-marker.rs": 8,
     "src-tauri/src/commands/autostart.rs": 1,
@@ -11,7 +11,7 @@
     "src-tauri/src/commands/resource.rs": 4,
     "src-tauri/src/commands/screenshot.rs": 4,
     "src-tauri/src/commands/session.rs": 3,
-    "src-tauri/src/commands/updater.rs": 4,
+    "src-tauri/src/commands/updater.rs": 7,
     "src-tauri/src/inject/anchor_ledger.rs": 4,
     "src-tauri/src/inject/confirm.rs": 1,
     "src-tauri/src/inject/create.rs": 4,
