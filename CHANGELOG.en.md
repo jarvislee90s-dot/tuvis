@@ -22,6 +22,32 @@ _Only versions translated so far are listed here; the full history lives in the
   `README.zh-CN.md`, with language-switcher links at the top of both files. The
   `AGENTS.md` bilingual asset table, project tree, and the README pin in the
   `usage-partial-coverage-lock` test were updated accordingly.
+- **README facade rewrite and dual community channels**: both READMEs were rebuilt as
+  facade pages (hero trio, feature table linking into the manual, a 2×3 screenshot
+  gallery, and a community section), with the former release-level details migrated
+  into 16 user-manual chapter files (`docs/user-manual/{zh,en}/`); two community
+  channels went live — QQ group `1131682176` and Discord (`discord.gg/2PBUDYuD5`) —
+  with stable links and QR images checked into `docs/images/` (no more screenshots of
+  expiring group-QR codes); `AGENTS.md` gained a "documentation division of labor"
+  discipline (facade / manual / ledger responsibilities are mutually exclusive).
+
+### Fixed
+
+- **Crash when toggling remote or hot-restarting a channel (Windows)**: turning the
+  Remote Access master switch off or hot-restarting a channel could abort the whole
+  process (0xc0000409 crashes, observed three times on 2026-10-23) — the stop path of
+  the Codex APP desktop IPC spawned its shutdown from a synchronous command thread
+  with no async runtime, and the panic crossed a no-unwind WebView2 callback boundary;
+  the shutdown is now spawned via the app runtime, so toggling no longer crashes the
+  app.
+- **Updater install network fallback and honest errors**: the install layer had no
+  network fallback (the discovery layer does) — when the system proxy broke
+  mid-install, the download timed out reaching GitHub directly and only reported a
+  manifest verification failure. Installation now runs two hops: the plugin's default
+  pipeline first (10s connect timeout), then on transport-class failures a retry
+  through a no-proxy client pinning DoH-resolved addresses for github.com and both
+  release asset hosts. Errors are flattened through the full source chain, so the
+  failure toast shows the actual cause.
 
 ## [0.6.1] - 2026-10-22
 
