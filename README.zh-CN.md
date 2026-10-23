@@ -55,14 +55,14 @@
 
 <table>
   <tr>
-    <td align="center"><img src="docs/user-manual/img/mobile-board.png" alt="手机看板" /><br><sub><b>手机看板</b>——手机浏览器里同一块红绿灯看板</sub></td>
-    <td align="center"><img src="docs/images/mobile-detail-v0.5.0.png" alt="会话详情页" /><br><sub><b>会话详情</b>——消息、文件、子 Agent 一页看全</sub></td>
-    <td align="center"><img src="docs/images/mobile-approve-v0.5.0.png" alt="远程审批卡" /><br><sub><b>远程审批</b>——手机上批准工具调用与计划</sub></td>
+    <td align="center"><img src="docs/user-manual/img/mobile-board.png" alt="手机看板" height="380" /><br><sub><b>手机看板</b>——手机浏览器里同一块红绿灯看板</sub></td>
+    <td align="center"><img src="docs/images/mobile-detail-v0.5.0.png" alt="会话详情页" height="380" /><br><sub><b>会话详情</b>——消息、文件、子 Agent 一页看全</sub></td>
+    <td align="center"><img src="docs/images/mobile-approve-v0.5.0.png" alt="远程审批卡" height="380" /><br><sub><b>远程审批</b>——手机上批准工具调用与计划</sub></td>
   </tr>
   <tr>
-    <td align="center"><img src="docs/user-manual/img/usage-dashboard.png" alt="Token 用量看板" /><br><sub><b>用量账本</b>——七个工具的 Token 与费用，口径如实</sub></td>
-    <td align="center"><img src="docs/images/foxbell-pet.png" alt="内置桌宠" /><br><sub><b>内置桌宠</b>——屏幕角落的状态卡片与原声语音</sub></td>
-    <td align="center"><img src="docs/images/remote-settings-v0.6.0.png" alt="远程接入设置页" /><br><sub><b>远程接入</b>——四条通道，各带配置向导</sub></td>
+    <td align="center"><img src="docs/user-manual/img/usage-dashboard.png" alt="Token 用量看板" height="230" /><br><sub><b>用量账本</b>——七个工具的 Token 与费用，口径如实</sub></td>
+    <td align="center"><img src="docs/images/foxbell-pet.png" alt="内置桌宠" height="230" /><br><sub><b>内置桌宠</b>——屏幕角落的状态卡片与原声语音</sub></td>
+    <td align="center"><img src="docs/images/remote-settings-v0.6.0.png" alt="远程接入设置页" height="230" /><br><sub><b>远程接入</b>——四条通道，各带配置向导</sub></td>
   </tr>
 </table>
 
