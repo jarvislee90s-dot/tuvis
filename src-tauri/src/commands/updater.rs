@@ -338,7 +338,14 @@ impl AttemptError {
     /// （2.13.0 check 循环）对清单请求**非 2xx**（经代理的 502/503、GitHub 限流
     /// 403——代理瞬断的常见形态）不记 last_error，循环尽后统一落该变体；真
     /// 「远端无更新」走 204 → Ok(None)，不经此变体，改判可重试不会误吞。
-    fn from_plugin(code: &str, what: &str, e: tauri_plugin_updater::Error) -> Self {
+    fn from_plugin(coded: &str, e: tauri_plugin_updater::Error) -> Self {
+        // 码与文案必须以同一「CODE: 文案」字面量传入：check-error-codes.mjs 靠该
+        // 形态从源码提取码并对账 i18n 键——拆成两个参数会让码从源码视图消失
+        // （i18n 孤儿键）、文案落成未迁移裸串（棘轮上升）。
+        let (code, what) = coded
+            .split_once(':')
+            .expect("from_plugin 需要「CODE: 文案」形态的字面量");
+        let what = what.trim_start();
         let retryable = matches!(
             &e,
             tauri_plugin_updater::Error::Reqwest(_)
@@ -451,7 +458,7 @@ async fn run_updater_attempt(
     let update = updater
         .check()
         .await
-        .map_err(|e| AttemptError::from_plugin("UPDATER_MANIFEST_VERIFY", "升级清单校验失败", e))?
+        .map_err(|e| AttemptError::from_plugin("UPDATER_MANIFEST_VERIFY: 升级清单校验失败", e))?
         .ok_or_else(|| AttemptError::terminal("远端清单不包含可用更新"))?;
 
     let emit_progress = |event: &str, downloaded: u64, content_length: Option<u64>| {
@@ -493,7 +500,7 @@ async fn run_updater_attempt(
             },
         )
         .await
-        .map_err(|e| AttemptError::from_plugin("UPDATER_INSTALL_FAIL", "下载或安装失败", e))?;
+        .map_err(|e| AttemptError::from_plugin("UPDATER_INSTALL_FAIL: 下载或安装失败", e))?;
 
     // Windows：插件在 install 内部已 exit(0)（由 NSIS /UPDATE 装完重启），走不到这里；
     // macOS：换壳完成，重启进新版本（restart 返回 !，下方 Ok 仅非 macOS 路径可达）
@@ -866,8 +873,7 @@ mod tests {
     #[test]
     fn from_plugin_routes_transport_family_to_fallback_hop() {
         let network = AttemptError::from_plugin(
-            "UPDATER_INSTALL_FAIL",
-            "下载或安装失败",
+            "UPDATER_INSTALL_FAIL: 下载或安装失败",
             tauri_plugin_updater::Error::Network("connection reset during download".into()),
         );
         assert!(
@@ -876,8 +882,7 @@ mod tests {
         );
 
         let not_found = AttemptError::from_plugin(
-            "UPDATER_MANIFEST_VERIFY",
-            "升级清单校验失败",
+            "UPDATER_MANIFEST_VERIFY: 升级清单校验失败",
             tauri_plugin_updater::Error::ReleaseNotFound,
         );
         assert!(
@@ -1025,7 +1030,7 @@ mod tests {
             ),
         ];
         for (name, e) in cases {
-            let attempt = AttemptError::from_plugin("UPDATER_TEST", name, e);
+            let attempt = AttemptError::from_plugin(&format!("UPDATER_TEST: {name}"), e);
             assert!(
                 !attempt.retryable,
                 "{name} 应为终态（直接上报），不得触发 DoH 兜底跳"
