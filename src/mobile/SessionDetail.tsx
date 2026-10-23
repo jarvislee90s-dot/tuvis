@@ -66,7 +66,7 @@ import {
   type SessionMessage,
   type SubagentView,
 } from "./api";
-import { STATUS_DOT_COLOR, TOOL_LABELS } from "./board-logic";
+import { STATUS_DOT_COLOR, TOOL_LABEL_KEYS } from "./board-logic";
 import {
   addBookmark,
   bookmarkPreview,
@@ -261,8 +261,8 @@ function MessageScrollArea({
         <button
           type="button"
           data-testid="jump-to-top"
-          aria-label="跳到顶部"
-          title="跳到顶部"
+          aria-label={i18n.t("mobile.detail.jumpTop")}
+          title={i18n.t("mobile.detail.jumpTop")}
           onClick={onJumpTop}
           className="absolute top-3 right-3 z-10 rounded-full border border-[var(--cb)] bg-[var(--cbg)] p-2 text-[var(--mut)] shadow-md hover:bg-[var(--cbg)] dark:hover:bg-[var(--btnp)]"
         >
@@ -273,8 +273,8 @@ function MessageScrollArea({
         <button
           type="button"
           data-testid="jump-to-bottom"
-          aria-label="跳到最新消息"
-          title="跳到最新消息"
+          aria-label={i18n.t("mobile.detail.jumpLatest")}
+          title={i18n.t("mobile.detail.jumpLatest")}
           onClick={onJump}
           className="absolute right-3 bottom-3 z-10 rounded-full border border-[var(--cb)] bg-[var(--cbg)] p-2 text-[var(--mut)] shadow-md hover:bg-[var(--cbg)] dark:hover:bg-[var(--btnp)]"
         >
@@ -336,9 +336,11 @@ export function isPlanPending(
 export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   // ===== Codex Desktop IPC 投影（A snapshot）=====
-  // 仅 Codex 会话订阅（其余工具 enabled=false 零开销）。可用性四档按服务端数据渲染：
-  // - controllable / send_only：投影**替换** Codex 会话实时内容源（不与本地读取简单
-  //   混排——同一历史两份源各说各话是骗人），原生 pending 出卡、队列面板挂载；
+  // 仅 Codex 会话订阅（其余工具 enabled=false 零开销）。可用性按服务端数据渲染：
+  // - controllable / send_only / read_only：投影**替换** Codex 会话实时内容源（不与
+  //   本地读取简单混排——同一历史两份源各说各话是骗人），原生 pending 出卡（只读档
+  //   卡面按 actionable=false 只读展示）、队列面板挂载；read_only = #172 解耦新增的
+  //   只读档（读链已取证、写未开放）；
   // - compat_only / unavailable：不出投影正文与原生卡——保持旧 QuestionCard 路径，
   //   能力横幅仍按服务端档位诚实展示；
   // - state=null（无 IPC / 拉取中）：旧路径照旧，零回归。
@@ -365,7 +367,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const codexState = codex.state;
   const codexProjectionActive =
     codexState !== null &&
-    (codexState.availability === "controllable" || codexState.availability === "send_only");
+    (codexState.availability === "controllable" ||
+      codexState.availability === "send_only" ||
+      codexState.availability === "read_only");
   // Task 7：瞬态 Unsupported 只延迟**前端错误提示**（后端 contentState 即时、禁写/
   // stale/屏障不去抖）——过渡 164–382ms 不闪烁，持续异常 500ms 后如实显示。
   const showUnsupported = useDelayedUnsupported(
@@ -1281,6 +1285,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             key={`codex-banner-${session.id}`}
             availability={codexState.availability}
             stale={codexState.stale}
+            probeStatus={codexState.probeStatus}
           />
           {codexProjectionActive &&
             codexState.pending.map((p) => (
@@ -1336,7 +1341,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               data-testid="codex-projection-truncated"
               className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
             >
-              投影超过展示上限，仅显示最近的消息
+              {i18n.t("mobile.detail.projectionTruncated")}
             </p>
           )}
           {codexState.contentState !== "ready" &&
@@ -1347,15 +1352,17 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                 className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
               >
                 {codexState.contentState === "loading"
-                  ? "正在载入完整历史…"
+                  ? i18n.t("mobile.detail.stateLoading")
                   : codexState.contentState === "partial"
-                    ? "历史不完整（按需继续载入）"
-                    : "读取异常（内容状态不受支持）"}
+                    ? i18n.t("mobile.detail.statePartial")
+                    : i18n.t("mobile.detail.stateUnsupported")}
               </p>
             )}
           {codex.loadedMessages.length === 0 ? (
             codexState.contentState === "ready" ? (
-              <p className="py-16 text-center text-sm text-[var(--mut)]">暂无消息</p>
+              <p className="py-16 text-center text-sm text-[var(--mut)]">
+                {i18n.t("mobile.detail.noMessages")}
+              </p>
             ) : null
           ) : (
             // 消息正文走既有 renderMarkdown / renderLinkifiedText：文件池已知路径
@@ -1424,7 +1431,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           data-testid="summary-banner"
           className="mb-2 flex items-center gap-2 rounded-lg bg-[var(--btnp)]/10 px-3 py-2 text-xs text-[var(--tx)]"
         >
-          <span>总结模式 · 已折叠 {collapsedCount} 条过程消息</span>
+          <span>{i18n.t("mobile.detail.summaryBanner", { count: collapsedCount })}</span>
           <span className="ml-auto flex shrink-0 gap-1">
             {collapsedCount > 0 && (
               <button
@@ -1433,7 +1440,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                 onClick={expandAll}
                 className="rounded-full bg-[var(--btnp)]/20 px-2 py-0.5 text-xs text-[var(--tx)]"
               >
-                展开全部
+                {i18n.t("mobile.detail.expandAll")}
               </button>
             )}
             {collapsedCount < toggleableMessages.length && (
@@ -1443,19 +1450,21 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                 onClick={collapseAll}
                 className="rounded-full bg-[var(--cb)] px-2 py-0.5 text-xs text-[var(--mut)]"
               >
-                收起全部
+                {i18n.t("mobile.detail.collapseAll")}
               </button>
             )}
           </span>
         </div>
       )}
       {loading && messages === null && (
-        <p className="py-16 text-center text-sm text-[var(--mut)]">加载中…</p>
+        <p className="py-16 text-center text-sm text-[var(--mut)]">
+          {i18n.t("mobile.detail.loading")}
+        </p>
       )}
       {error && (
         <div className="py-16 text-center">
           <p data-testid="detail-error" className="mb-3 text-sm text-rose-600 dark:text-rose-400">
-            {error.status === 404 ? "无法读取该会话内容" : "加载失败，请检查网络后重试"}
+            {i18n.t(error.status === 404 ? "mobile.detail.error404" : "mobile.detail.errorGeneric")}
           </p>
           <button
             type="button"
@@ -1463,12 +1472,14 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             onClick={retry}
             className="rounded-full bg-[var(--cb)] px-4 py-1.5 text-sm text-[var(--tx)]"
           >
-            重试
+            {i18n.t("mobile.detail.retry")}
           </button>
         </div>
       )}
       {!codexProjectionActive && messages !== null && !error && messages.length === 0 && (
-        <p className="py-16 text-center text-sm text-[var(--mut)]">暂无消息</p>
+        <p className="py-16 text-center text-sm text-[var(--mut)]">
+          {i18n.t("mobile.detail.noMessages")}
+        </p>
       )}
       {/* 书签跳转：自动加载中提示（M5 P3-c）与到顶未命中 miss 提示（M3+） */}
       {jumpLoading && (
@@ -1476,7 +1487,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           data-testid="bookmark-jump-loading"
           className="mb-2 rounded-lg bg-[var(--btnp)]/10 px-3 py-2 text-xs text-[var(--tx)]"
         >
-          正在加载更早消息以定位书签…
+          {i18n.t("mobile.detail.bookmarkJumpLoading")}
         </p>
       )}
       {bookmarkJumpMiss && !jumpLoading && (
@@ -1484,7 +1495,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           data-testid="bookmark-jump-miss"
           className="mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400"
         >
-          已到最早消息，未找到该书签目标
+          {i18n.t("mobile.detail.bookmarkJumpMiss")}
         </p>
       )}
       {/* 「加载更早消息」置于列表**最上方**（2026-09-16 用户裁决）：语义是
@@ -1504,7 +1515,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             }}
             className="rounded-full bg-[var(--cb)] px-4 py-1.5 text-xs text-[var(--tx)]"
           >
-            {loading ? "加载中…" : "加载更早消息"}
+            {i18n.t(loading ? "mobile.detail.loading" : "mobile.detail.loadMore")}
           </button>
         </div>
       )}
@@ -1529,7 +1540,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
                 {msgBookmark && (
                   <span
                     data-testid={`msg-bookmark-${m.seq}`}
-                    title={`书签：${msgBookmark.preview}`}
+                    title={i18n.t("mobile.detail.bookmarkTitle", { preview: msgBookmark.preview })}
                     className="absolute -top-1 -left-1 h-2.5 w-2.5 rounded-full ring-2 ring-[var(--pg)]"
                     style={{ backgroundColor: msgBookmark.color }}
                   />
@@ -1598,7 +1609,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             : "bg-[var(--cb)] text-[var(--mut)] hover:text-[var(--tx)]"
         }`}
       >
-        ▤ 文件
+        {i18n.t("mobile.detail.tabFiles")}
       </button>
       {subagentsShown && (
         <button
@@ -1612,7 +1623,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               : "bg-[var(--cb)] text-[var(--mut)] hover:text-[var(--tx)]"
           }`}
         >
-          ◉ 子 Agent ({runningCount})
+          {i18n.t("mobile.detail.tabSubagents", { count: runningCount })}
         </button>
       )}
       {/* 布局切换器：仅「文件」sheet 显示——子 Agent sheet 是两层级导航（清单 →
@@ -1628,7 +1639,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         <button
           type="button"
           data-testid="preview-close"
-          aria-label="关闭预览"
+          aria-label={i18n.t("mobile.detail.closePreview")}
           onClick={closePreview}
           className="shrink-0 rounded-full p-1 text-[var(--mut)] hover:bg-[var(--cb)] dark:hover:bg-[var(--btnp)]"
         >
@@ -1664,7 +1675,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         data-testid="subagent-board-empty"
         className="flex-1 py-12 text-center text-sm text-[var(--mut)]"
       >
-        暂无子 Agent
+        {i18n.t("mobile.detail.noSubagents")}
       </p>
     )
   ) : null;
@@ -1701,7 +1712,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         data-testid="preview-empty"
         className="flex h-full items-center justify-center px-4 text-sm text-[var(--mut)]"
       >
-        选择左侧项目查看
+        {i18n.t("mobile.detail.selectLeft")}
       </div>
     )
   ) : null;
@@ -1712,7 +1723,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         <button
           type="button"
           data-testid="detail-back"
-          aria-label="返回看板"
+          aria-label={i18n.t("mobile.detail.backToBoard")}
           onClick={onBack}
           className="shrink-0 rounded-full p-1 text-[var(--mut)] hover:bg-[var(--cb)] dark:hover:bg-[var(--btnp)]"
         >
@@ -1723,7 +1734,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             {session.projectName}
           </span>
           <span className="block truncate text-xs text-[var(--mut)]">
-            {TOOL_LABELS[session.agentType]}
+            {i18n.t(TOOL_LABEL_KEYS[session.agentType])}
             {session.title ? ` · ${session.title}` : ""}
           </span>
         </span>
@@ -1738,9 +1749,11 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         <button
           type="button"
           data-testid="file-panel-button"
-          aria-label="文件面板"
+          aria-label={i18n.t("mobile.detail.filePanel")}
           aria-pressed={panelOpen}
-          title={panelOpen ? "收起文件面板" : "打开文件面板"}
+          title={i18n.t(
+            panelOpen ? "mobile.detail.collapseFilePanel" : "mobile.detail.openFilePanel"
+          )}
           onClick={togglePanel}
           className={`shrink-0 rounded-full p-1 ${
             panelOpen
@@ -1753,8 +1766,8 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         {/* 字号档位（2026-09-16 用户裁决）：面板按钮旁，作用于正文与预览内容 */}
         <select
           data-testid="font-scale-select"
-          aria-label="正文字号"
-          title="正文字号"
+          aria-label={i18n.t("mobile.detail.fontScale")}
+          title={i18n.t("mobile.detail.fontScale")}
           value={String(fontScale)}
           onChange={(e) => setFontScale(Number(e.target.value))}
           className="shrink-0 rounded-md border border-[var(--cb)] bg-transparent px-1 py-0.5 text-xs text-[var(--mut)]"
@@ -1770,7 +1783,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         <button
           type="button"
           data-testid="detail-refresh"
-          aria-label="刷新消息"
+          aria-label={i18n.t("mobile.detail.refresh")}
           onClick={retry}
           className="shrink-0 rounded-full p-1 text-[var(--mut)] hover:bg-[var(--cb)] dark:hover:bg-[var(--btnp)]"
         >

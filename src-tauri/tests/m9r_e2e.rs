@@ -1107,6 +1107,7 @@ async fn e2e_http_full_chain() {
         },
 
         codex_control: multi_agents_manager_lib::remote::codex_ipc::CodexControlHub::disabled_arc(),
+        desktop_language: Default::default(),
     });
 
     // 配对设备（server.rs 既有 persist_named_device 先例）：cookie 直指内存库设备行

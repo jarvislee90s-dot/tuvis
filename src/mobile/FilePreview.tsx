@@ -229,13 +229,14 @@ export default function FilePreview({
       : null;
   const errorText = (() => {
     if (state.phase !== "error") return "";
-    if (errorReason === "sensitive") return "该路径受安全策略保护，无法预览";
-    if (errorReason === "too_large")
-      return "文件超过预览上限（文本 500KB / 图片 5MB），请用工具导出小结后查看";
-    if (errorReason === "not_found") return "文件不存在或已被移动";
-    if (errorReason === "not_file") return "该路径不是文件";
-    if (state.status === 403 || state.status === 404) return "无法预览该文件";
-    return "预览加载失败";
+    // 403 原因分诊文案走 i18n 键（M5 双语）；未列原因保留兜底
+    if (errorReason === "sensitive") return i18n.t("mobile.preview.errSensitive");
+    if (errorReason === "too_large") return i18n.t("mobile.preview.errTooLarge");
+    if (errorReason === "not_found") return i18n.t("mobile.preview.errNotFound");
+    if (errorReason === "not_file") return i18n.t("mobile.preview.errNotFile");
+    if (state.status === 403 || state.status === 404)
+      return i18n.t("mobile.preview.errUnpreviewable");
+    return i18n.t("mobile.preview.errLoadFailed");
   })();
 
   // 正文三分支（M5 B4）：markdown 渲染 / html 沙箱 iframe / 源码高亮。
@@ -277,7 +278,7 @@ export default function FilePreview({
     <section
       data-testid="file-preview"
       data-mode={mode}
-      aria-label={`文件预览 ${baseName}`}
+      aria-label={i18n.t("mobile.preview.aria", { name: baseName })}
       className="flex h-full min-h-0 flex-col bg-[var(--pg)]"
     >
       <header className="flex shrink-0 items-center gap-2 border-b border-[var(--cb)] px-3 py-2">
@@ -286,7 +287,7 @@ export default function FilePreview({
           <button
             type="button"
             data-testid="preview-back-list"
-            aria-label="返回文件列表"
+            aria-label={i18n.t("mobile.preview.backToList")}
             onClick={onBack}
             className="shrink-0 rounded-full p-1 text-[var(--mut)] hover:bg-[var(--cb)] dark:hover:bg-[var(--btnp)]"
           >
@@ -316,7 +317,7 @@ export default function FilePreview({
             onClick={() => setRetryTick((t) => t + 1)}
             className="shrink-0 rounded-md bg-[var(--cb)] px-2 py-1 text-xs text-[var(--tx)]"
           >
-            重试
+            {i18n.t("mobile.preview.retry")}
           </button>
         )}
         {/* 布局切换控件（Bug 2，M3 验收）：T1 后切换器唯一实例在 SessionDetail 顶栏
@@ -330,7 +331,7 @@ export default function FilePreview({
         {segKind !== null && state.phase === "ok" && state.payload.kind === "text" && (
           <span
             role="group"
-            aria-label="源码/渲染切换"
+            aria-label={i18n.t("mobile.preview.segAria")}
             data-testid="preview-seg"
             className="flex shrink-0 overflow-hidden rounded-lg border border-[var(--cb)]"
           >
@@ -345,7 +346,7 @@ export default function FilePreview({
                   : "text-[var(--mut)] hover:bg-[var(--cbg)] dark:hover:bg-[var(--btnp)]"
               }`}
             >
-              源码
+              {i18n.t("mobile.preview.source")}
             </button>
             <button
               type="button"
@@ -358,7 +359,7 @@ export default function FilePreview({
                   : "text-[var(--mut)] hover:bg-[var(--cbg)] dark:hover:bg-[var(--btnp)]"
               }`}
             >
-              渲染
+              {i18n.t("mobile.preview.render")}
             </button>
           </span>
         )}
@@ -366,14 +367,14 @@ export default function FilePreview({
         {showHtmlFrame && (
           <span
             role="group"
-            aria-label="渲染缩放"
+            aria-label={i18n.t("mobile.preview.zoomAria")}
             data-testid="preview-zoom"
             className="flex shrink-0 items-center overflow-hidden rounded-lg border border-[var(--cb)]"
           >
             <button
               type="button"
               data-testid="preview-zoom-out"
-              aria-label="缩小"
+              aria-label={i18n.t("mobile.preview.zoomOut")}
               onClick={() => bumpZoom(-1)}
               className="px-2 py-1 text-xs text-[var(--mut)] hover:bg-[var(--cbg)] dark:hover:bg-[var(--btnp)]"
             >
@@ -382,7 +383,7 @@ export default function FilePreview({
             <button
               type="button"
               data-testid="preview-zoom-reset"
-              aria-label="重置缩放"
+              aria-label={i18n.t("mobile.preview.zoomReset")}
               onClick={() => setZoom(1)}
               className="border-x border-[var(--cb)] px-1.5 py-1 text-[10px] text-[var(--mut)] hover:bg-[var(--cbg)] dark:hover:bg-[var(--btnp)]"
             >
@@ -391,7 +392,7 @@ export default function FilePreview({
             <button
               type="button"
               data-testid="preview-zoom-in"
-              aria-label="放大"
+              aria-label={i18n.t("mobile.preview.zoomIn")}
               onClick={() => bumpZoom(1)}
               className="px-2 py-1 text-xs text-[var(--mut)] hover:bg-[var(--cbg)] dark:hover:bg-[var(--btnp)]"
             >
@@ -405,7 +406,7 @@ export default function FilePreview({
           <button
             type="button"
             data-testid="preview-close"
-            aria-label="关闭预览"
+            aria-label={i18n.t("mobile.preview.close")}
             onClick={onClose}
             className="shrink-0 rounded-full p-1 text-[var(--mut)] hover:bg-[var(--cb)] dark:hover:bg-[var(--btnp)]"
           >
@@ -425,10 +426,10 @@ export default function FilePreview({
         {state.phase === "loading" && (
           <div data-testid="preview-progress">
             <div className="flex items-center justify-between gap-2 text-sm text-[var(--mut)]">
-              <span>加载中…</span>
+              <span>{i18n.t("mobile.detail.loading")}</span>
               {progress && (
                 <span data-testid="preview-progress-text" className="text-xs tabular-nums">
-                  {`已传 ${formatBytes(progress.loaded)}`}
+                  {i18n.t("mobile.preview.uploaded", { bytes: formatBytes(progress.loaded) })}
                   {progressTotal !== null &&
                     progressPercent !== null &&
                     ` / ${formatBytes(progressTotal)} · ${progressPercent}%`}
@@ -464,7 +465,7 @@ export default function FilePreview({
         {showHtmlFrame && (
           <iframe
             data-testid="preview-html-frame"
-            title={`渲染 ${baseName}`}
+            title={i18n.t("mobile.preview.renderTitle", { name: baseName })}
             /* 沙箱仅 allow-scripts（无 allow-same-origin）：渲染态可跑脚本，
              * 但与看板数据、cookie、storage 完全隔离（M5 线稿既定安全口径）。
              * 缩放（M5 P2-b）：注入 html{zoom} 样式实现放缩——内容自带样式表的

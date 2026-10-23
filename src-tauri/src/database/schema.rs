@@ -255,6 +255,16 @@ pub fn init(conn: &Connection) {
             session_id   TEXT PRIMARY KEY,
             hidden_at    TEXT NOT NULL
         );
+        -- 三终端语言自适应（2026-10-22）：远程端配对设备语言手动记账（C-5）。
+        -- 键 = remote_devices.id（配对身份同源，换网络/换 IP 不丢；重新配对新身份天然无记录）；
+        -- 行存在即「该设备设置过手动语言」（manual 恒 true，无独立布尔列），
+        -- language 只认 "zh"/"en"（值集校验在 Rust 侧 remote::language::UiLanguage::parse）。
+        -- 只由移动端手动切换端点写入，自动跟随结果绝不落账；读侧无行 = 未手动选择。
+        CREATE TABLE IF NOT EXISTS remote_device_language (
+            device_id   TEXT PRIMARY KEY,
+            language    TEXT NOT NULL,
+            updated_at  INTEGER NOT NULL DEFAULT 0
+        );
         -- ===== 用量账本（计划①，契约 §4）=====
         -- 明细：per-(源, 会话, **小时桶**, **记录级项目键**, 模型, 供应商) 的增量账；保留期可配（默认 90 天）。
         -- hour_key = "YYYY-MM-DDTHH"（本地时区，支持 5h 档小时趋势）；day_key 为派生冗余列
@@ -519,6 +529,30 @@ pub fn init(conn: &Connection) {
         -- SQLite 表级 PRIMARY KEY 不折叠 NULL：必须用表达式唯一索引锁身份键。
         CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_model_config_identity
             ON usage_model_config(provider_raw, COALESCE(source_id, ''), model_raw);
+        -- #172：Codex Desktop IPC 能力探测账本（程序自用的证据缓存，不随会话增长）。
+        --   probe_key = platform|build|cli_id|probe_epoch（probe/fingerprint.rs）；
+        --   一行 = 一个 (版本指纹, 能力)，upsert 覆盖（ON CONFLICT），**不是 append**；
+        --   state ∈ probed|failed|inconclusive（`verified` 只来自 shipped 表，账本永不写）；
+        --   不存正文 / threadId / 原始帧（只存 stage / 错误码 / 耗时，对齐审计隐私纪律）。
+        --   时间列用 INTEGER 毫秒（与 heartbeat_observations 等既有表同惯例；设计稿写
+        --   TEXT 是示意，语义只要求单调可比较）。
+        --   fingerprint：官方 schema 探针的**内容指纹**（文件名+大小的 sha256）——只对
+        --   capability='schema' 的行有意义；让「build × 能力」数据集能追到具体
+        --   schema 版本（老库由 migration.rs 补列）。
+        CREATE TABLE IF NOT EXISTS codex_ipc_probe (
+            probe_key        TEXT NOT NULL,
+            capability       TEXT NOT NULL,
+            state            TEXT NOT NULL,
+            probe_stage      TEXT,
+            error_code       TEXT,
+            fingerprint      TEXT,
+            attempts         INTEGER NOT NULL DEFAULT 1,
+            first_seen_at    INTEGER NOT NULL,
+            last_seen_at     INTEGER NOT NULL,
+            next_retry_at    INTEGER,
+            last_duration_ms INTEGER,
+            PRIMARY KEY (probe_key, capability)
+        );
         "#,
     )
     .expect("Failed to initialize database schema");

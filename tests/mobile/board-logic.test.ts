@@ -1,11 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import i18n from "@/i18n";
 import {
   AGENT_TYPES,
   STATUS_DOT_COLOR,
-  STATUS_LABELS,
+  STATUS_LABEL_KEYS,
   TOOL_BRAND_COLORS,
   TOOL_BRAND_COLORS_DARK,
-  TOOL_LABELS,
+  TOOL_LABEL_KEYS,
   applyTransition,
   filterByAgent,
   filterEnabledTools,
@@ -13,8 +14,16 @@ import {
   formatTransition,
   sortChipsByActivity,
   sortSessions,
+  statusLabel,
+  toolLabel,
 } from "@/mobile/board-logic";
 import type { Session, SessionStatus, TransitionEvent } from "@/types/session";
+
+// M5 Task 7：显示文案经 i18n 现取（board-logic 不再内联中文）——本文件的文案断言
+// 即被测行为（横幅/相对时长），锁中文值，故统一钉在 zh 下断言
+beforeAll(async () => {
+  await i18n.changeLanguage("zh");
+});
 
 // 会话夹具：仅 board-logic 消费的字体段有语义，其余给合法默认值
 function makeSession(
@@ -128,18 +137,22 @@ describe("board-logic 工具过滤", () => {
 
 describe("board-logic 工具显示名（P8c 卡片主行）", () => {
   it("键集穷尽 AgentType 八值（Record 守卫，增删 AgentType 时此断言同步修正）", () => {
-    expect(Object.keys(TOOL_LABELS).sort()).toEqual([...AGENT_TYPES].sort());
+    expect(Object.keys(TOOL_LABEL_KEYS).sort()).toEqual([...AGENT_TYPES].sort());
   });
 
-  it("八值显示名与桌面 agentBadge 口径一致（codex 不分 APP/CLI，统一 Codex）", () => {
-    expect(TOOL_LABELS.claude).toBe("Claude");
-    expect(TOOL_LABELS.codex).toBe("Codex");
-    expect(TOOL_LABELS.opencode).toBe("OpenCode");
-    expect(TOOL_LABELS.openclaw).toBe("OpenClaw");
-    expect(TOOL_LABELS.kimi).toBe("Kimi Code");
-    expect(TOOL_LABELS.workbuddy).toBe("WorkBuddy");
-    expect(TOOL_LABELS.zcode).toBe("ZCode");
-    expect(TOOL_LABELS.dsh).toBe("DSH");
+  it("八值显示名与桌面 agentBadge 口径一致（codex 不分 APP/CLI，统一 Codex；M5 Task 7 键化后经 toolLabel 现取）", () => {
+    expect(toolLabel("claude")).toBe("Claude");
+    expect(toolLabel("codex")).toBe("Codex");
+    expect(toolLabel("opencode")).toBe("OpenCode");
+    expect(toolLabel("openclaw")).toBe("OpenClaw");
+    expect(toolLabel("kimi")).toBe("Kimi Code");
+    expect(toolLabel("workbuddy")).toBe("WorkBuddy");
+    expect(toolLabel("zcode")).toBe("ZCode");
+    expect(toolLabel("dsh")).toBe("DSH");
+  });
+
+  it("toolLabel：未知工具 id 回落原文（wire 防御，不渲染 undefined）", () => {
+    expect(toolLabel("future-tool")).toBe("future-tool");
   });
 });
 
@@ -173,8 +186,8 @@ describe("board-logic 跃迁展示（M3 Task 6）", () => {
     };
   }
 
-  it("STATUS_LABELS 键集穷尽 SessionStatus 六值（横幅不会静默缺文案）", () => {
-    expect(Object.keys(STATUS_LABELS).sort()).toEqual([
+  it("STATUS_LABEL_KEYS 键集穷尽 SessionStatus 六值（横幅不会静默缺文案；M5 Task 7 键化，值 = mobile.status.* 键）", () => {
+    expect(Object.keys(STATUS_LABEL_KEYS).sort()).toEqual([
       "compacting",
       "finished",
       "idle",
@@ -182,6 +195,13 @@ describe("board-logic 跃迁展示（M3 Task 6）", () => {
       "thinking",
       "waiting",
     ]);
+    // 键必须真实存在于目录（键名拼错 → i18n.t 回落键本身，横幅显示键路径）
+    for (const key of Object.values(STATUS_LABEL_KEYS)) {
+      expect(i18n.t(key)).not.toBe(key);
+    }
+    expect(statusLabel("waiting")).toBe("等待操作");
+    expect(statusLabel("finished")).toBe("已完成");
+    expect(statusLabel("bogus")).toBe("bogus"); // 未知 wire 值回落原文
   });
 
   it("formatTransition：工具 · 项目 · 前态 → 后态 [· 消息预览]", () => {

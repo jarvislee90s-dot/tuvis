@@ -38,8 +38,9 @@ export default function PlanFeedbackBar({
   const fail = useCallback((e: unknown) => {
     if (e instanceof ApiError) {
       const code = typeof e.data?.error === "string" ? e.data.error : null;
-      if (code === "not_waiting") setError("会话不在等待状态");
-      else if (code === "no_session") setError("会话已结束，请返回看板刷新");
+      // 错误码 → 文案走 i18n 键（M5 双语；其余 message 经 formatInvokeError 既有体系）
+      if (code === "not_waiting") setError(i18n.t("mobile.plan.notWaiting"));
+      else if (code === "no_session") setError(i18n.t("mobile.plan.sessionEnded"));
       else setError(formatInvokeError(e.message, i18n.t));
     } else {
       setError(formatInvokeError(String(e), i18n.t));
@@ -89,7 +90,7 @@ export default function PlanFeedbackBar({
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="inline-block h-2 w-2 shrink-0 rounded-full bg-sky-500" />
         <span className="text-sm font-semibold text-sky-700 dark:text-sky-400">
-          告诉 Claude 要改什么
+          {i18n.t("mobile.plan.title")}
         </span>
         <button
           type="button"
@@ -98,15 +99,15 @@ export default function PlanFeedbackBar({
           onClick={() => onDismiss?.()}
           className="ml-auto rounded-full px-2 py-0.5 text-xs text-slate-500 hover:bg-slate-500/10 dark:text-slate-400"
         >
-          收起
+          {i18n.t("mobile.plan.collapse")}
         </button>
       </div>
       <p className="mt-1 text-xs text-sky-700/80 dark:text-sky-400/80">
-        输入修改意见发送后，Claude 仍停留在计划模式并重新出计划；选上面的选项 1/2 才会开始执行
+        {i18n.t("mobile.plan.hint")}
       </p>
       <textarea
         data-testid="plan-feedback-input"
-        aria-label="计划修改意见"
+        aria-label={i18n.t("mobile.plan.inputAria")}
         value={text}
         rows={2}
         maxLength={MAX_FEEDBACK_CHARS}
@@ -127,7 +128,7 @@ export default function PlanFeedbackBar({
           data-testid="plan-feedback-sent"
           className="mt-1 text-xs font-medium text-emerald-600 dark:text-emerald-400"
         >
-          已发送，Claude 正在修改计划…
+          {i18n.t("mobile.plan.sent")}
         </p>
       )}
       <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
@@ -138,7 +139,9 @@ export default function PlanFeedbackBar({
           onClick={() => run("type", { text, submit: true })}
           className="rounded-full bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-40 dark:bg-sky-500"
         >
-          {staged && text.trim() === "" ? "提交已输入内容" : "发送"}
+          {staged && text.trim() === ""
+            ? i18n.t("mobile.plan.submitStaged")
+            : i18n.t("mobile.plan.send")}
         </button>
         <button
           type="button"
@@ -147,7 +150,7 @@ export default function PlanFeedbackBar({
           onClick={() => run("type", { text, submit: false })}
           className="rounded-full bg-sky-500/10 px-3 py-1.5 text-xs text-sky-700 hover:bg-sky-500/20 disabled:opacity-40 dark:bg-sky-400/10 dark:text-sky-300"
         >
-          覆盖写入
+          {i18n.t("mobile.plan.overwrite")}
         </button>
         <button
           type="button"
@@ -156,11 +159,11 @@ export default function PlanFeedbackBar({
           onClick={() => run("clear")}
           className="rounded-full bg-slate-500/10 px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-500/20 disabled:opacity-40 dark:bg-slate-400/10 dark:text-slate-300"
         >
-          清空
+          {i18n.t("mobile.plan.clear")}
         </button>
         {staged && (
           <span className="text-[11px] text-slate-500 dark:text-slate-400">
-            终端已暂存内容（未提交）
+            {i18n.t("mobile.plan.staged")}
           </span>
         )}
       </div>

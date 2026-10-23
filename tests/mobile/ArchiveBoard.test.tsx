@@ -1,7 +1,22 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import ArchiveBoard from "@/mobile/ArchiveBoard";
 import type { ArchivedPayload } from "@/mobile/api";
+
+// 文案走 mobile.* 双语键后按 zh 断言（Board.test 同款：显式引入并固定中文）。
+// 只 changeLanguage 不够：jsdom 默认 en-US 会在语言重评估时翻回 en——浏览器
+// 语言一并钉到 zh（language-toggle 同款）
+import { pinZhNavigator } from "./pinZhNavigator";
+
+let unpinZh: () => void;
+
+beforeAll(async () => {
+  unpinZh = await pinZhNavigator();
+});
+
+afterAll(() => {
+  unpinZh();
+});
 
 const payload: ArchivedPayload = {
   archived: [

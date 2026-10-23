@@ -957,6 +957,7 @@ async fn e2e_create_http_full_chain() {
         screen_probe: Arc::new(|_sid: &str, pid: u32| read_screen_lines(pid)),
 
         codex_control: multi_agents_manager_lib::remote::codex_ipc::CodexControlHub::disabled_arc(),
+        desktop_language: Default::default(),
     });
 
     // ② 预置配对设备（内存库直插设备行；cookie 名 mam_device——m9r 先例）

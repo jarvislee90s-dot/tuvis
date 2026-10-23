@@ -201,6 +201,10 @@ pub fn device_cookie(device_id: &str) -> String {
 }
 
 /// 设备存储注入缝：生产走全局 DB，测试注入内存库（绝不写真实 ~/.tuvis）
+///
+/// `Clone`（#172 起）：能力探测账本与 hub 的 ActionStore 共用同一份存储——`Global`
+/// 是零成本的单位变体，`Owned` 克隆共享同一个连接（`Arc`），不产生第二个库。
+#[derive(Clone)]
 pub enum DeviceStore {
     /// 生产：全局 `~/.tuvis/tuvis.db`（`crate::database::connection::DB`）
     Global,

@@ -1,8 +1,23 @@
 import { render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "@/mobile/App";
 import { MockEventSource } from "./eventSourceMock";
 import type { SessionsResponse } from "@/types/session";
+
+// 文案走 mobile.pair.* / mobile.board.* 双语键后按 zh 断言（QuestionCard.test 同款：
+// 显式引入并固定中文）。App 渲染 Board 会拉 /host 做连接时语言重评估（无语言字段 →
+// 浏览器兜底），jsdom 默认 en-US 会翻回 en——浏览器语言一并钉到 zh（language-toggle 同款）
+import { pinZhNavigator } from "./pinZhNavigator";
+
+let unpinZh: () => void;
+
+beforeAll(async () => {
+  unpinZh = await pinZhNavigator();
+});
+
+afterAll(() => {
+  unpinZh();
+});
 
 // stub 全局 fetch（盖过 setup.ts 的 msw），探测链路完全确定；结束还原防泄漏到其他用例
 afterEach(() => {

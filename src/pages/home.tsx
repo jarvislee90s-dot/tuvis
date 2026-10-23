@@ -30,7 +30,7 @@ export default function HomePage() {
   const legacyMigration = useLegacySkillMigration();
   const [activeTab, setActiveTab] = useState<"dashboard" | "extensions">("dashboard");
   const { sessions, totalCount, waitingCount, loading } = useSessionStore();
-  const { t } = useAppTranslation();
+  const { t, i18n } = useAppTranslation();
   const queryClient = useQueryClient();
 
   // 按工具筛选（2026-10-11）：单选 chips + localStorage 记忆（重启保持上次选择，
@@ -82,6 +82,14 @@ export default function HomePage() {
       } catch (error) {
         console.error("Failed to initialize tray menu:", error);
       }
+      // 三终端语言自适应（C-3）：桌面当前语言推给 Rust 内存源（远程端连接时经 /host
+      // 下发跟随）。与托盘重建同路触发：启动 i18n 初始化后本 effect 首跑 + 每次语言
+      // 切换（t 变化即重跑，覆盖标题栏/设置页/托盘跨窗口的切换回流）；Rust 只存不判
+      try {
+        await invoke("set_desktop_language", { language: i18n.language });
+      } catch (error) {
+        console.error("Failed to push desktop language:", error);
+      }
     };
     initTrayMenu();
 
@@ -93,8 +101,9 @@ export default function HomePage() {
     return () => {
       unlistenRemoteChanged.then((fn) => fn());
     };
-    // petOn 变化时重跑本 effect，托盘桌宠文案随开关/语言刷新
-  }, [t, petOn]);
+    // petOn 变化时重跑本 effect，托盘桌宠文案随开关/语言刷新；
+    // i18n.language 变化时重跑（语言切换 → 托盘文案 + C-3 语言推送一并刷新）
+  }, [t, petOn, i18n.language]);
 
   return (
     <WindowFrame

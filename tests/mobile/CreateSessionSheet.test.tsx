@@ -1,10 +1,25 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import Board from "@/mobile/Board";
 import CreateSessionSheet from "@/mobile/CreateSessionSheet";
 import { MockEventSource } from "./eventSourceMock";
 import type { CreateProjectView } from "@/mobile/api";
 import type { Session } from "@/types/session";
+
+// 文案走 mobile.* 双语键后按 zh 断言（Board.test 同款：显式引入并固定中文）。
+// 只 changeLanguage 不够：jsdom 默认 en-US 会在语言重评估时翻回 en——浏览器
+// 语言一并钉到 zh（language-toggle 同款）
+import { pinZhNavigator } from "./pinZhNavigator";
+
+let unpinZh: () => void;
+
+beforeAll(async () => {
+  unpinZh = await pinZhNavigator();
+});
+
+afterAll(() => {
+  unpinZh();
+});
 
 // C11：新建会话 UI（表单 + 进度 + 跳转）。fetch 全量 stub（盖过 setup.ts 的 msw），
 // 按 URL 分路到 create-projects / session-create / session-create/status 三族端点

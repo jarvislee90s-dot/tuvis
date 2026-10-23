@@ -25,7 +25,7 @@
 //   哪一段 + 原因 + 引到终端**（不是笼统的「已发送按键」）；
 // - **进行中态**（§2.3「卡片进行中态替代『已发送按键』」）：请求在途期间卡片显示
 //   「进行中（走到哪一段）」——后端的段推进是同步的（一次请求内走完），故前端只需
-//   一个总进行中态 + 段名文案（`QUESTION_STAGE_LABELS`）；
+//   一个总进行中态 + 段名文案（`questionStageLabel`，mobile.question.stage* 键）；
 // - 自由文本（**丁T5 §2.4 入口 1**；支持面随批次逐步放开——2026-10-10 起
 //   claude/kimi/opencode/**codex** 四家全通；codex = 0.162.1 复验复活，走位
 //   Other → tab 开备注 → 文本 → 回车，序列与其三家不同族由后端编排屏蔽）：
@@ -75,34 +75,45 @@ import {
   type QuestionView,
 } from "./api";
 
-/** 阶段名 → 用户可读文案（**进行中态与中止回执共用**，两处不会漂移）。
+/** 阶段名 → 用户可读文案的 i18n 键（**进行中态与中止回执共用**，两处不会漂移）。
  *  取值与后端 `remote::api::QUESTION_STAGE_*` 逐字对应（见 api.ts 的
- *  `QuestionAnswerStage` 注释）。 */
-const QUESTION_STAGE_LABELS: Record<QuestionAnswerStage, string> = {
-  "submit-row": "定位提交入口",
-  review: "等待确认屏",
-  confirm: "确认提交",
-  receipt: "核对完成回执",
-  "free-row": "定位自由作答行",
-  "free-text": "提交回答文本",
-  "toggle-row": "定位选项行并切勾",
-  advance: "切换到下一题",
-  select: "定位选项行并选择",
+ *  `QuestionAnswerStage` 注释）；文案渲染期经 `questionStageLabel` 现取
+ *  （语言自适应 M5：跟随 i18n 生效语言即时切换）。 */
+const QUESTION_STAGE_LABEL_KEYS: Record<QuestionAnswerStage, string> = {
+  "submit-row": "mobile.question.stageSubmitRow",
+  review: "mobile.question.stageReview",
+  confirm: "mobile.question.stageConfirm",
+  receipt: "mobile.question.stageReceipt",
+  "free-row": "mobile.question.stageFreeRow",
+  "free-text": "mobile.question.stageFreeText",
+  "toggle-row": "mobile.question.stageToggleRow",
+  advance: "mobile.question.stageAdvance",
+  select: "mobile.question.stageSelect",
 };
 
-/** 阶段名 → 进行中文案（比 `QUESTION_STAGE_LABELS` 更像「正在做什么」——
+/** 阶段名 → 进行中文案的 i18n 键（比 `QUESTION_STAGE_LABEL_KEYS` 更像「正在做什么」——
  *  同一段在「进行中」与「中止」两个语境里的措辞不同，两套文案都在本文件内。 */
-const QUESTION_STAGE_PROGRESS: Record<QuestionAnswerStage, string> = {
-  "submit-row": "正在定位提交入口（屏读确认）…",
-  review: "已提交勾选，正在等待确认屏…",
-  confirm: "确认屏已出现，正在确认提交…",
-  receipt: "正在核对完成回执…",
-  "free-row": "正在定位自由作答输入行…",
-  "free-text": "正在提交回答文本…",
-  "toggle-row": "正在定位选项行并按空格切勾（屏读校验）…",
-  advance: "正在 ←/→ 切换题目（屏读核对）…",
-  select: "正在定位选项行并选择…",
+const QUESTION_STAGE_PROGRESS_KEYS: Record<QuestionAnswerStage, string> = {
+  "submit-row": "mobile.question.progSubmitRow",
+  review: "mobile.question.progReview",
+  confirm: "mobile.question.progConfirm",
+  receipt: "mobile.question.progReceipt",
+  "free-row": "mobile.question.progFreeRow",
+  "free-text": "mobile.question.progFreeText",
+  "toggle-row": "mobile.question.progToggleRow",
+  advance: "mobile.question.progAdvance",
+  select: "mobile.question.progSelect",
 };
+
+/** 阶段名 → 用户可读文案（渲染期现取，语言切换即时生效） */
+function questionStageLabel(stage: QuestionAnswerStage): string {
+  return i18n.t(QUESTION_STAGE_LABEL_KEYS[stage]);
+}
+
+/** 阶段名 → 进行中文案（渲染期现取，语言切换即时生效） */
+function questionStageProgress(stage: QuestionAnswerStage): string {
+  return i18n.t(QUESTION_STAGE_PROGRESS_KEYS[stage]);
+}
 
 /** 自由作答文本长度上限（与 composer 的 `MAX_SEND_CHARS` 对齐；后端同口径 400） */
 const MAX_FREE_TEXT_CHARS = 10000;
@@ -898,7 +909,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
         testId="question-card"
         mode="tool-readonly"
         pulsing={false}
-        title="等待回答"
+        title={i18n.t("mobile.question.waiting")}
       >
         {q0.header && (
           <div
@@ -925,7 +936,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
           ))}
         </ol>
         <p data-testid="question-tool-readonly-hint" className="mt-1.5 text-xs text-[var(--tx)]">
-          该工具的远程作答尚未实测，请在终端完成作答
+          {i18n.t("mobile.question.toolReadonlyHint")}
         </p>
       </InteractiveCard>
     );
@@ -947,7 +958,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
         htmlFor="question-multi-freetext-input"
         className="mb-1 block text-xs text-[var(--mut)]"
       >
-        自由作答（直接输入，切题时自动保存）
+        {i18n.t("mobile.question.freeInputLabel")}
       </label>
       <div className="flex gap-1.5">
         <input
@@ -959,7 +970,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
           readOnly={mqFreeText[qi] !== undefined && !editingFreeText}
           onChange={(e) => setFreeText(e.target.value.slice(0, MAX_FREE_TEXT_CHARS))}
           className="min-w-0 flex-1 rounded-lg border border-[var(--cb)] bg-[var(--cbg)] px-2 py-1.5 text-xs text-[var(--tx)] placeholder:text-[var(--mut)] focus:border-[var(--btnp)] focus:outline-none disabled:opacity-60"
-          placeholder="输入内容后点发送（勿在终端按回车）"
+          placeholder={i18n.t("mobile.question.freeInputPlaceholder")}
         />
         {/* codex 屏驱按钮面（2026-10-10 用户规格）：按钮跟随终端 note 行屏读——
             无字 → 「发送」（overwrite=false，tab→脚注核验→打字→上屏核验→回车）；
@@ -976,7 +987,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                 onClick={() => handleAnswer("freeText", undefined, "", qi, undefined, true)}
                 className="shrink-0 rounded-full bg-rose-500/10 px-3 py-1.5 text-xs text-rose-700 hover:bg-rose-500/20 disabled:opacity-40 dark:bg-rose-400/10 dark:text-rose-300"
               >
-                清空
+                {i18n.t("mobile.question.clear")}
               </button>
               <button
                 type="button"
@@ -985,7 +996,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                 onClick={() => handleAnswer("freeText", undefined, freeText, qi, undefined, true)}
                 className="shrink-0 rounded-full bg-[var(--btnp)] px-3 py-1.5 text-xs font-medium text-[var(--btnpt)] hover:bg-[var(--btnp)] disabled:opacity-40"
               >
-                覆盖写入
+                {i18n.t("mobile.question.overwrite")}
               </button>
             </>
           ) : (
@@ -996,12 +1007,12 @@ export default function QuestionCard({ session }: QuestionCardProps) {
               onClick={() => handleAnswer("freeText", undefined, freeText, qi)}
               className="rounded-full bg-[var(--btnp)] px-3 py-1.5 text-xs font-medium text-[var(--btnpt)] hover:bg-[var(--btnp)] disabled:opacity-40"
             >
-              发送
+              {i18n.t("mobile.question.send")}
             </button>
           )
         ) : mqFreeText[qi] !== undefined && info.freeTextOverwrite !== true ? (
           <p className="mt-1.5 rounded-lg bg-slate-500/10 px-2 py-1.5 text-xs text-slate-600 dark:bg-slate-400/10 dark:text-slate-300">
-            已写入。该工具的卡内覆盖/清空尚未实机验证——修改请到终端完成
+            {i18n.t("mobile.question.writtenNoOverwrite")}
           </p>
         ) : mqFreeText[qi] !== undefined && !editingFreeText ? (
           <button
@@ -1014,7 +1025,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             }}
             className="rounded-full bg-[var(--btnp)]/10 px-3 py-1.5 text-xs text-[var(--tx)] hover:bg-[var(--btnp)]/20 disabled:opacity-40"
           >
-            编辑
+            {i18n.t("mobile.question.edit")}
           </button>
         ) : (
           <button
@@ -1033,7 +1044,9 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             }
             className="rounded-full bg-[var(--btnp)] px-3 py-1.5 text-xs font-medium text-[var(--btnpt)] hover:bg-[var(--btnp)] disabled:opacity-40"
           >
-            {freeText.trim() !== "" || mqFreeText[qi] !== undefined ? "覆盖写入" : "发送"}
+            {freeText.trim() !== "" || mqFreeText[qi] !== undefined
+              ? i18n.t("mobile.question.overwrite")
+              : i18n.t("mobile.question.send")}
           </button>
         )}
         {/* 清空（独立动作，不依赖编辑解锁）：**输入格有内容即在场**（2026-10-06 用户
@@ -1047,18 +1060,18 @@ export default function QuestionCard({ session }: QuestionCardProps) {
               onClick={() => handleAnswer("freeText", undefined, "", qi, undefined, true)}
               className="shrink-0 rounded-full bg-rose-500/10 px-3 py-1.5 text-xs text-rose-700 hover:bg-rose-500/20 disabled:opacity-40 dark:bg-rose-400/10 dark:text-rose-300"
             >
-              清空
+              {i18n.t("mobile.question.clear")}
             </button>
           )}
       </div>
       {mqFreeText[qi] !== undefined && (
         <p className="mt-1 text-xs text-emerald-600 dark:text-emerald-400">
-          已写入：{mqFreeText[qi]}
+          {i18n.t("mobile.question.written", { text: mqFreeText[qi] })}
         </p>
       )}
       {ftUnverified && (
         <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
-          已发送但未能屏读核验——请到终端核对该行内容与勾选态后重试
+          {i18n.t("mobile.question.ftUnverified")}
         </p>
       )}
     </div>
@@ -1071,7 +1084,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
           testId="question-card"
           mode="readonly"
           pulsing={false}
-          title={`有 ${questions.length} 个问题等待回答`}
+          title={i18n.t("mobile.question.countWaiting", { count: questions.length })}
         >
           <ol className="mt-1.5 space-y-1">
             {questions.map((q, i) => (
@@ -1090,7 +1103,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             ))}
           </ol>
           <p data-testid="question-readonly-hint" className="mt-1.5 text-xs text-[var(--tx)]">
-            请在终端完成作答
+            {i18n.t("mobile.question.answerInTerminal")}
           </p>
         </InteractiveCard>
       );
@@ -1110,7 +1123,12 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             data-testid="question-aborted"
             className="mt-1 text-xs text-amber-700 dark:text-amber-400"
           >
-            卡在阶段：{QUESTION_STAGE_LABELS[abortedStage] ?? abortedStage}
+            {i18n.t("mobile.question.stuckAtStage", {
+              stage:
+                abortedStage in QUESTION_STAGE_LABEL_KEYS
+                  ? questionStageLabel(abortedStage)
+                  : abortedStage,
+            })}
           </p>
         )}
         {sent && (
@@ -1118,7 +1136,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             data-testid="question-sent"
             className="mt-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400"
           >
-            已发送按键
+            {i18n.t("mobile.question.keySent")}
           </p>
         )}
       </>
@@ -1130,11 +1148,11 @@ export default function QuestionCard({ session }: QuestionCardProps) {
           testId="question-card"
           mode="multi-confirm"
           pulsing={false}
-          title={`有 ${questions.length} 个问题等待回答（确认提交）`}
+          title={i18n.t("mobile.question.countConfirm", { count: questions.length })}
           footer={multiFooter}
         >
           <p data-testid="question-confirm-hint" className="mt-1 text-xs text-[var(--tx)]">
-            全部题目已翻页完毕，终端应已停在 Confirm（Review）页——提交后模型会收到全部答案。
+            {i18n.t("mobile.question.confirmHint")}
           </p>
           {/* **已选答案清单**（2026-10-02）：本地记忆渲染（多选=勾选项 / 单选=选中项 /
               自由作答=文本）；终端 Review 页为准——用户在终端改动不会同步到本清单 */}
@@ -1157,7 +1175,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                     [...checkedSet]
                       .sort((a, b) => a - b)
                       .map((i) => qi.options[i]?.label ?? `#${i + 1}`)
-                      .join("、")
+                      .join(i18n.t("mobile.common.listSep"))
                   );
                 }
                 if (typeof selectedIdx === "number") {
@@ -1180,12 +1198,14 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                         : "ml-1 text-[var(--mut)]"
                     }
                   >
-                    → {parts.length > 0 ? parts.join("；") : "（未作答）"}
+                    → {parts.length > 0 ? parts.join("；") : i18n.t("mobile.question.unanswered")}
                   </span>
                 </div>
               );
             })}
-            <p className="text-xs text-[var(--mut)]">以终端 Review 页为准</p>
+            <p className="text-xs text-[var(--mut)]">
+              {i18n.t("mobile.question.reviewAuthoritative")}
+            </p>
           </div>
           {!sent && (
             <div className="mt-2 space-y-1.5">
@@ -1196,7 +1216,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                 onClick={() => handleAnswer("submit")}
                 className="w-full rounded-full bg-[var(--btnp)] px-3 py-1.5 text-xs font-medium text-[var(--btnpt)] hover:bg-[var(--btnp)] disabled:opacity-40"
               >
-                提交答案
+                {i18n.t("mobile.question.submitAnswers")}
               </button>
               <button
                 type="button"
@@ -1205,7 +1225,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                 onClick={() => handleAnswer("advance", undefined, undefined, undefined, "prev")}
                 className="w-full rounded-full bg-[var(--btnp)]/10 px-3 py-1.5 text-xs text-[var(--tx)] hover:bg-[var(--btnp)]/20 disabled:opacity-40"
               >
-                ◀ 返回上一题修改
+                {i18n.t("mobile.question.backToPrev")}
               </button>
               <button
                 type="button"
@@ -1234,7 +1254,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
         testId="question-card"
         mode="multi"
         pulsing={false}
-        title={`有 ${questions.length} 个问题等待回答（第 ${mqIndex + 1} 题）`}
+        title={i18n.t("mobile.question.countAt", { count: questions.length, index: mqIndex + 1 })}
         footer={multiFooter}
       >
         <p data-testid="question-multi-current" className="mt-1 text-xs text-[var(--tx)]">
@@ -1249,7 +1269,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
               data-testid="question-multi-multiselect-badge"
               className="ml-1 rounded bg-[var(--btnp)]/10 px-1 py-0.5 text-[10px] font-medium text-[var(--tx)]"
             >
-              多选
+              {i18n.t("mobile.question.multiBadge")}
             </span>
           )}
         </p>
@@ -1260,7 +1280,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             data-testid="question-unanswered-hint"
             className="mt-1 text-xs text-amber-700 dark:text-amber-400"
           >
-            {unansweredHint} 题未答
+            {i18n.t("mobile.question.unansweredCount", { count: unansweredHint })}
           </p>
         )}
         <div className="mt-1.5 space-y-1">
@@ -1321,7 +1341,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                 onClick={() => handleAnswer("advance", undefined, undefined, undefined, "prev")}
                 className="flex-1 rounded-full bg-[var(--btnp)]/10 px-3 py-1.5 text-xs text-[var(--tx)] hover:bg-[var(--btnp)]/20 disabled:opacity-40"
               >
-                ◀ 上一题
+                {i18n.t("mobile.question.prev")}
               </button>
             )}
             <button
@@ -1331,7 +1351,8 @@ export default function QuestionCard({ session }: QuestionCardProps) {
               onClick={() => handleAnswer("advance", undefined, undefined, undefined, "next")}
               className="flex-1 rounded-full bg-[var(--btnp)] px-3 py-1.5 text-xs font-medium text-[var(--btnpt)] hover:bg-[var(--btnp)] disabled:opacity-40"
             >
-              下一题 ▶{mqIndex < questions.length - 1 ? "" : "（进入确认页）"}
+              {i18n.t("mobile.question.next")}
+              {mqIndex < questions.length - 1 ? "" : i18n.t("mobile.question.nextConfirmSuffix")}
             </button>
           </div>
         )}
@@ -1343,7 +1364,9 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             data-testid="question-multi-advance-unavailable"
             className="mt-2 text-xs text-[var(--mut)]"
           >
-            {q.multiSelect ? "多选题勾选后请到终端切换下一题并提交" : "请到终端切换题目"}
+            {q.multiSelect
+              ? i18n.t("mobile.question.advanceUnavailableMulti")
+              : i18n.t("mobile.question.advanceUnavailable")}
           </p>
         )}
       </InteractiveCard>
@@ -1376,7 +1399,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
       tone="question"
       testId="question-card"
       mode={q.multiSelect ? "multi" : "single"}
-      title={q.multiSelect ? "等待回答（多选）" : "等待回答"}
+      title={i18n.t(q.multiSelect ? "mobile.question.waitingMulti" : "mobile.question.waiting")}
       titleSuffix={
         q.header ? (
           <span
@@ -1400,7 +1423,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
           className="mt-1.5 text-xs font-medium text-[var(--tx)]"
         >
           <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--btnp)] align-middle" />
-          {QUESTION_STAGE_PROGRESS[inProgress]}
+          {questionStageProgress(inProgress)}
         </p>
       )}
       {error !== null && (
@@ -1408,7 +1431,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
           {/* 中止（阶段机）时把「卡在哪一段」放在原因之前——用户第一眼要知道停在哪 */}
           {abortedStage !== null && (
             <span data-testid="question-aborted-stage" className="font-medium">
-              中止于「{QUESTION_STAGE_LABELS[abortedStage]}」段：
+              {i18n.t("mobile.question.abortedAt", { stage: questionStageLabel(abortedStage) })}
             </span>
           )}
           {error}
@@ -1419,7 +1442,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
           data-testid="question-aborted-hint"
           className="mt-1 text-xs text-amber-700 dark:text-amber-400"
         >
-          已停止投递后续按键——请到终端查看当前对话框状态后重试
+          {i18n.t("mobile.question.abortedHint")}
         </p>
       )}
       {sent && (
@@ -1427,7 +1450,8 @@ export default function QuestionCard({ session }: QuestionCardProps) {
           <p data-testid="question-sent">
             {/* 阶段机动作走完整条闭环 → 追加「已走完提交闭环」；单键动作与走完整条的
                 都保留「已发送按键」这句主文案（既有用例与用户习惯都认它）。 */}
-            已发送按键{verified !== null && "（已走完提交闭环）"}
+            {i18n.t("mobile.question.keySent")}
+            {verified !== null && i18n.t("mobile.question.closureDone")}
           </p>
           {/* **终态回执核验**的三态（丁T5）：true 不额外提示；false/未核验要如实说 */}
           {verified === false && (
@@ -1435,7 +1459,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
               data-testid="question-verified-unseen"
               className="mt-1 text-amber-700 dark:text-amber-400"
             >
-              已按屏读完成提交，但未在屏上见到完成回执——请到终端确认结果
+              {i18n.t("mobile.question.verifiedUnseen")}
             </p>
           )}
         </div>
@@ -1484,7 +1508,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
               onClick={() => handleAnswer("submit")}
               className="mt-2 w-full rounded-full bg-[var(--btnp)] px-3 py-1.5 text-sm font-medium text-[var(--btnpt)] disabled:opacity-40"
             >
-              提交勾选
+              {i18n.t("mobile.question.submitChecked")}
             </button>
           )}
           <button
@@ -1501,13 +1525,14 @@ export default function QuestionCard({ session }: QuestionCardProps) {
             // **终端 notes 行屏读回显**（2026-10-10 用户指令：note 位置但凡有输入，
             // 一定要显示在远端页面上）——只读事实行，与输入框互不干扰
             <p data-testid="question-note-text" className="mt-1.5 text-xs text-[var(--mut)]">
-              终端备注（屏读）：<span className="text-[var(--tx)]">{info.screen.noteText}</span>
+              {i18n.t("mobile.question.notePrefix")}
+              <span className="text-[var(--tx)]">{info.screen.noteText}</span>
             </p>
           )}
           {freeTextEnabled ? (
             <div className="mt-2" data-testid="question-freetext">
               <p data-testid="question-freetext-label" className="mb-1 text-xs text-[var(--mut)]">
-                或直接输入回答（将作为本题的答案发送到终端）
+                {i18n.t("mobile.question.freetextLabel")}
               </p>
               {(() => {
                 // **按钮面由终端 note 行屏读驱动**（2026-10-10 用户规格）：
@@ -1520,13 +1545,17 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                   <div className="flex gap-1.5">
                     <input
                       data-testid="question-freetext-input"
-                      aria-label="回答内容"
+                      aria-label={i18n.t("mobile.question.freetextAria")}
                       type="text"
                       value={freeText}
                       maxLength={MAX_FREE_TEXT_CHARS}
                       disabled={busy}
                       onChange={(e) => setFreeText(e.target.value.slice(0, MAX_FREE_TEXT_CHARS))}
-                      placeholder={hasNote ? "终端已有备注——覆盖写入将替换它" : "输入你的回答…"}
+                      placeholder={i18n.t(
+                        hasNote
+                          ? "mobile.question.placeholderWithNote"
+                          : "mobile.question.placeholder"
+                      )}
                       className="min-w-0 flex-1 rounded-lg border border-[var(--cb)] px-2.5 py-1.5 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none disabled:opacity-50"
                     />
                     {hasNote ? (
@@ -1540,7 +1569,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                           }
                           className="shrink-0 rounded-full bg-rose-500/10 px-3 py-1.5 text-sm text-rose-700 hover:bg-rose-500/20 disabled:opacity-40 dark:bg-rose-400/10 dark:text-rose-300"
                         >
-                          清空
+                          {i18n.t("mobile.question.clear")}
                         </button>
                         <button
                           type="button"
@@ -1558,7 +1587,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                           }
                           className="shrink-0 rounded-full bg-[var(--btnp)] px-3 py-1.5 text-sm font-medium text-[var(--btnpt)] disabled:opacity-40"
                         >
-                          覆盖写入
+                          {i18n.t("mobile.question.overwrite")}
                         </button>
                       </>
                     ) : (
@@ -1569,7 +1598,7 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                         onClick={() => handleAnswer("freeText", undefined, freeText)}
                         className="shrink-0 rounded-full bg-[var(--btnp)] px-3 py-1.5 text-sm font-medium text-[var(--btnpt)] disabled:opacity-40"
                       >
-                        作为回答发送
+                        {i18n.t("mobile.question.sendAsAnswer")}
                       </button>
                     )}
                   </div>
@@ -1584,8 +1613,8 @@ export default function QuestionCard({ session }: QuestionCardProps) {
                   不同，写清楚能少一次困惑）：① 多选题 → 「多选卡」限制（复评 F6-3，
                   题目形态维度）；② 工具未定案 → 「该工具尚未实测」（§2.8，工具维度）。 */}
               {q.multiSelect
-                ? "需自由作答？当前工具的多选题自由作答尚未验证，请在终端作答"
-                : "需自由作答？该工具的远程自由作答尚未实测，请在终端作答"}
+                ? i18n.t("mobile.question.freeformUnavailableMulti")
+                : i18n.t("mobile.question.freeformUnavailableTool")}
             </p>
           )}
         </>

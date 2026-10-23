@@ -38,7 +38,9 @@ use crate::services::codex_desktop_ipc::adapter::{
     Connector, DesktopIpcAdapter, ProductionConnector,
 };
 use crate::services::codex_desktop_ipc::mirror::MESSAGES_PAGE_LIMIT;
-use crate::services::codex_desktop_ipc::profile::profile_for;
+use crate::services::codex_desktop_ipc::probe::runner::ProbeOutcome;
+use crate::services::codex_desktop_ipc::probe::{ProbeLedger, ProbeLedgerEntry};
+use crate::services::codex_desktop_ipc::profile::{profile_for, ProtocolProfile};
 use crate::services::codex_desktop_ipc::types::{
     ActionReceipt, ActionState, CodexActionView, CodexQueueView, ControlRoute, PendingKind,
     ProtocolError, ThreadKey, ThreadProjection,
@@ -125,8 +127,9 @@ pub(crate) enum HubEvent {
 /// 内部事件通道、生产生命周期句柄。
 ///
 /// **`disabled()` 契约**（既有全部测试 fixture 显式填 disabled hub——编译即暴露）：
-/// 一切能力关闭——`ipc_available()` 恒 false（closed profile 能力全 false → 投影恒
-/// `compat_only`）、审批一律拒绝、`start()` 不装配调度循环（不订阅/不恢复/不调度）。
+/// 一切能力关闭——`send_available()`/`state_available()` 恒 false（closed profile 能力
+/// 全 false → 投影恒 `compat_only`）、审批一律拒绝、`start()` 不装配调度循环（不订阅/
+/// 不恢复/不调度）。
 /// R8 起普通消息**仍经 router**（登记→reserve→NotSent→兜底资格，账本纪律不因 hub
 /// 不可用绕过）。
 pub struct CodexControlHub {
@@ -138,7 +141,8 @@ pub struct CodexControlHub {
     events: tokio::sync::broadcast::Sender<HubEvent>,
     /// R7.3：关注引用闸（与 AdapterDispatch 共享；SSE 详情订阅 +1/结束 -1）
     gate: Arc<FollowGate>,
-    /// 生产能力标志：`disabled()` 恒 false——`start()/stop()/ipc_available()` 全部短路与拒绝
+    /// 生产能力标志：`disabled()` 恒 false——`start()/stop()/send_available()/
+    /// state_available()` 全部短路与拒绝
     capable: bool,
     /// 调度循环在跑标志（幂等启停）
     running: AtomicBool,
@@ -152,10 +156,85 @@ pub struct CodexControlHub {
     /// 测试缝：兜底回合最短执行时长（毫秒；生产恒 0 = 不延迟）——回归测试注入
     /// 「分钟级兜底」，验证调度循环与单 thread 兜底执行解耦（PR #165 审查 Important）
     compat_min_duration_ms: AtomicU64,
+    /// #172/T7：审批回执的「消失确认」窗口（毫秒）。生产 5000（决策后等 request 从新
+    /// snapshot 消失）；测试构造默认 0（不等待、不影响既有用例），需要验证超时的用例
+    /// 用 [`set_decision_confirm_ms`](Self::set_decision_confirm_ms) 收窄。
+    decision_confirm_ms: AtomicU64,
 }
 
 /// 周期对账默认间隔（R7.2：有界定时器；空待发集合时只有一条 EXISTS 级查询）。
 pub(crate) const RECONCILE_PERIOD_MS: u64 = 30_000;
+
+/// #172/T7：审批决策后等「pending 从新快照消失」的窗口（受理 ≠ 生效）。
+pub(crate) const DECISION_CONFIRM_MS: u64 = 5_000;
+
+/// 生产 endpoint 解析器（**单一来源**）：控制面装配（[`CodexControlHub::production`]）
+/// 与「读链取证查询」（[`read_chain_verified`]）共用同一套解析口径——平台分支、
+/// Windows 的 MSIX build 读取都只此一处，杜绝两处口径漂移。
+fn production_resolver() -> Arc<dyn crate::services::codex_desktop_ipc::transport::EndpointResolver>
+{
+    match std::env::consts::OS {
+        "macos" => Arc::new(
+            crate::services::codex_desktop_ipc::transport::unix::UnixEndpointResolver {
+                codex_home: None,
+                // Windows 交叉编译下该字段被 #[cfg(unix)] 剔除（本臂不可达但须编译）
+                #[cfg(unix)]
+                legacy_tmpdir: None,
+            },
+        ),
+        "windows" => Arc::new(
+            crate::services::codex_desktop_ipc::transport::windows::WindowsEndpointResolver,
+        ),
+        _ => Arc::new(NullConnector),
+    }
+}
+
+/// #172/T8：**该 build 的读链是否已取证**（兼容发送开关的前置判据）。
+///
+/// 口径（两档都算「已取证」）：
+/// * shipped build —— 真机证据已覆盖读链（`profile_for` 命中）；
+/// * 未知 build —— 探测账本里该 build 的 `state` 行已是 `probed`/`verified`。
+///
+/// 为什么查账本而不是读运行期能力位：运行期能力位随连接断开回落 `closed()`，
+/// 开关会无缘无故变灰；账本是**持久证据**（跨重启、跨连接都稳定）。
+///
+/// **只读、无副作用**：不装配控制面、不建连接、不跑 schema 探针；`cli_id` 段用
+/// SQL 通配（取它要 spawn 本机 `codex.exe --version`——为一个只读判据不值）。
+/// 取不到 build（Desktop 未运行 / 多义 / 平台不支持）→ false（不猜）。
+pub fn read_chain_verified(store: &DeviceStore) -> bool {
+    let Ok(ep) = production_resolver().resolve() else {
+        return false;
+    };
+    let Some(build) = ep.build.as_deref().map(str::trim).filter(|b| !b.is_empty()) else {
+        return false; // 读不到 build → 无法归因 → 不猜
+    };
+    // shipped build：读链已由真机证据覆盖（无需探测）
+    if profile_for(&ep.platform, build).is_some() {
+        return true;
+    }
+    // 未知 build：探测账本里该 build 的 `state` 行 = probed/verified
+    // （键形如 `platform|build|cli_id|epoch`；平台段小写归一，与 fingerprint 一致）
+    // LIKE 通配符（`%`/`_`）在 build 段转义——版本串本不该含它们，但转义后
+    // 「只认本 build」这条判据不受任何意外字符影响。
+    let pattern = format!(
+        "{}|{}|%",
+        ep.platform.trim().to_ascii_lowercase(),
+        build
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    store.with(|conn| {
+        conn.query_row(
+            "SELECT 1 FROM codex_ipc_probe
+              WHERE capability = 'state' AND state IN ('probed', 'verified')
+                AND probe_key LIKE ?1 ESCAPE '\\'",
+            [pattern],
+            |_| Ok(()),
+        )
+        .is_ok()
+    })
+}
 
 impl CodexControlHub {
     /// 测试/关闭态装配（计划 Task 8 接口）：一切能力关闭、恒 CompatOnly/拒绝。
@@ -190,30 +269,44 @@ impl CodexControlHub {
     /// 装配时判定一次：未识别 build → closed profile → A 写能力关闭（不能伪装成已
     /// 验证版本；Desktop 后续才启动的场景保守按不可用，Tuvis 重启后重新判定）。
     pub fn production(store: DeviceStore) -> Self {
-        let resolver: Arc<dyn crate::services::codex_desktop_ipc::transport::EndpointResolver> =
-            match std::env::consts::OS {
-                "macos" => Arc::new(
-                    crate::services::codex_desktop_ipc::transport::unix::UnixEndpointResolver {
-                        codex_home: None,
-                        // Windows 交叉编译下该字段被 #[cfg(unix)] 剔除（本臂不可达但须编译）
-                        #[cfg(unix)]
-                        legacy_tmpdir: None,
-                    },
-                ),
-                "windows" => Arc::new(
-                    crate::services::codex_desktop_ipc::transport::windows::WindowsEndpointResolver,
-                ),
-                _ => Arc::new(NullConnector),
-            };
-        let profile = resolver
-            .resolve()
-            .ok()
-            .and_then(|ep| profile_for(&ep.platform, ep.build.as_deref().unwrap_or("")))
-            .unwrap_or_else(closed_profile);
+        let resolver = production_resolver();
+        // #172：profile 从「准入白名单」降级为「证据缓存」——resolve 到 build 但不在
+        // shipped 表时用「尚无证据」档（可惰性探测），resolve 失败才是「明确不可用」。
+        let profile = match resolver.resolve() {
+            Ok(ep) => {
+                let platform = ep.platform.clone();
+                let build = ep.build.clone().unwrap_or_default();
+                profile_for(&platform, &build)
+                    .unwrap_or_else(|| ProtocolProfile::unverified(&platform, &build))
+            }
+            Err(_) => closed_profile(),
+        };
         let adapter = Arc::new(DesktopIpcAdapter::new(
             Arc::new(ProductionConnector { resolver }),
             profile,
         ));
+        // #172：能力探测账本（`codex_ipc_probe`）——程序自用的证据缓存，与 hub 的
+        // ActionStore 同库（设备/动作/探测三类事实一处）。DeviceStore 只在内存库里
+        // 需要共享（生产 Global 是零成本的单位变体）。
+        adapter.set_probe_ledger(Arc::new(StoreProbeLedger {
+            store: store.clone(),
+        }));
+        // #172/T7：官方 schema 证据（未知 build 的审批决策词来源）。**一次性**在装配期
+        // 后台跑（3s 上限，失败静默）：它只决定「未知 build 的审批卡能不能给
+        // accept/cancel」——拿不到证据就保持「到桌面处理」，绝不影响读/发。
+        // 只在未知 build 上跑（shipped build 有真机审批证据，不需要）。
+        if adapter.probe_eligible() {
+            // 同步上下文里 `tokio::spawn` 会 panic（无 reactor）：只在有 runtime 时后台跑
+            // （生产装配必在 runtime 内；纯同步测试构造 hub 时安静跳过）。
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let adapter_for_schema = adapter.clone();
+                handle.spawn(async move {
+                    // #172/T7-R4：取证**与落账本**（`capability = "schema"`）都在
+                    // adapter 里——生产层只负责「什么时候探一次」。
+                    adapter_for_schema.ensure_schema_evidence().await;
+                });
+            }
+        }
         // FollowGate 单实例同源（R7 复审 P2-1）：AdapterDispatch（ensure 失败回滚判定）
         // 与 hub（SSE 引用计数）必须看同一份关注引用——双实例会让派发侧误判零引用，
         // 把有活跃订阅的 thread 挤出 following 且恢复循环不再重建
@@ -221,9 +314,12 @@ impl CodexControlHub {
         let dispatch = Arc::new(AdapterDispatch {
             adapter: adapter.clone(),
             gate: gate.clone(),
+            store: store.clone(),
         });
         let mut hub = Self::with_parts(store, adapter, dispatch, true);
         hub.gate = gate;
+        // #172/T7：审批回执的消失确认窗口（5s）——受理后等 pending 真的从快照消失
+        hub.set_decision_confirm_ms(DECISION_CONFIRM_MS);
         hub
     }
 
@@ -249,7 +345,20 @@ impl CodexControlHub {
             sched: Mutex::new(None),
             reconcile_period_ms: AtomicU64::new(RECONCILE_PERIOD_MS),
             compat_min_duration_ms: AtomicU64::new(0),
+            decision_confirm_ms: AtomicU64::new(0),
         }
+    }
+
+    /// #172/T7：审批回执「消失确认」窗口（毫秒）。生产装配显式设 5000。
+    #[doc(hidden)]
+    pub fn set_decision_confirm_ms(&self, ms: u64) {
+        self.decision_confirm_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn decision_confirm_ms(&self) -> u64 {
+        self.decision_confirm_ms
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 测试装配变体：注入 adapter 并以生产形态装配派发缝（AdapterDispatch 包住注入的
@@ -264,6 +373,7 @@ impl CodexControlHub {
         let dispatch = Arc::new(AdapterDispatch {
             adapter: adapter.clone(),
             gate: gate.clone(),
+            store: store.clone(),
         });
         let mut hub = Self::with_parts(store, adapter, dispatch, capable);
         hub.gate = gate;
@@ -275,14 +385,39 @@ impl CodexControlHub {
         let _ = self.events.send(HubEvent::ThreadSettled(key.clone()));
     }
 
-    /// **A 路可用判据**（session-send / send-info 的 hub 分派门）：生产 hub 且本 build
-    /// 能力已验证（send+state）。disabled hub 恒 false；未识别 Desktop build 同 false
-    /// （「未经验证的 Desktop 版本或方法不得盲目启用对应能力」）。
-    pub fn ipc_available(&self) -> bool {
-        self.capable && {
-            let caps = self.adapter.capabilities();
-            caps.send && caps.state
-        }
+    /// **A 路发送可用判据**（session-send / send-info 的 hub 分派门、兜底交接门）：
+    /// 生产 hub 且本 build 的 `send` 能力已由证据确认。disabled hub 恒 false；
+    /// 未识别 Desktop build 同 false（「未经验证的 Desktop 版本或方法不得盲目启用
+    /// 对应能力」）。与 [`state_available`](Self::state_available) **解耦**：写能不能开
+    /// 只看 `send`，不因为读链未取证而连坐。
+    pub fn send_available(&self) -> bool {
+        self.capable && self.adapter.capabilities().send
+    }
+
+    /// **A 路只读可用判据**（详情投影 / SSE / 审批待办读取）：只读链是否可用。
+    /// 由 `state` 独立决定（#172 解耦）——探测证明 `state` 可用即可看，不必等 `send`
+    /// 打开；旧实现 `send && state` 把只读取证结果绑死在写能力上。
+    pub fn state_available(&self) -> bool {
+        self.capable && self.adapter.capabilities().state
+    }
+
+    /// #172：本机 Desktop build 是否**带写能力证据**（与「当前连接是否活着」解耦）。
+    ///
+    /// 兜底交接门与 `session-send-info` 的能力门都用它，**不用** `send_available()`：
+    /// 兜底只发生在 A 路没投递出去之后，此刻连接多半已断、adapter 的 profile 已回落
+    /// `closed()`——`send_available()` 对「已验证 build 瞬时断链」同样为 false。判据
+    /// 必须是 build 的证据，否则会把 PR #165 的既有兜底契约一并挡死。
+    pub fn build_send_verified(&self) -> bool {
+        self.capable && self.adapter.build_send_verified()
+    }
+
+    /// #172/T8：**兼容发送放行判据**（remote 层单点）。
+    ///
+    /// = 开关开 ∧ 本 build 写能力未取证 ∧ 控制面可用。已验证 build 恒 false
+    /// （开关对它零影响，行为完全不变）。派发侧（[`AdapterDispatch`]）用**同一**
+    /// 设置键 + 同一个 `build_send_verified` 事实，两端口径因此同源同码。
+    pub fn compat_send_allowed(&self, switch_on: bool) -> bool {
+        self.capable && super::compat_send_allowed(switch_on, self.build_send_verified())
     }
 
     /// R7.3：详情订阅引用 +1（SSE thread/events 建流前调用）。
@@ -498,7 +633,7 @@ async fn settle_thread(hub: &Arc<CodexControlHub>, st: &Arc<RemoteState>, key: &
     }
     // ③ 接力下一条（try-lock 让路：兜底 permit 在外时本函数直接 no-op）
     if let Some(outcome) = hub.router.flush_thread(key).await {
-        consume_fallback(st, outcome, &key.thread_id);
+        consume_fallback(st, outcome, &key.thread_id).await;
     }
 }
 
@@ -516,7 +651,11 @@ async fn settle_thread(hub: &Arc<CodexControlHub>, st: &Arc<RemoteState>, key: &
 /// 完成与如实拒绝封套都通知，接力不因解耦丢失；panic 路径不通知（与既有语义一致，
 /// 接力由周期对账兜底），permit 随 unwind Drop 守卫落账 unknown 并记日志。进程退出
 /// 时在飞任务随 runtime 丢弃（行为与现状对齐：Drop 守卫记 unknown，无 join 句柄）。
-pub(crate) fn consume_fallback(st: &Arc<RemoteState>, outcome: RouterOutcome, audit_session: &str) {
+pub(crate) async fn consume_fallback(
+    st: &Arc<RemoteState>,
+    outcome: RouterOutcome,
+    audit_session: &str,
+) {
     // reason_code 仅 HTTP 内联路径消费；调度路径的兜底回执由 run_compat 落账给出
     let permit = match outcome {
         RouterOutcome::UseFallback { permit, .. } => permit,
@@ -525,6 +664,34 @@ pub(crate) fn consume_fallback(st: &Arc<RemoteState>, outcome: RouterOutcome, au
             return;
         }
     };
+    // #172 裁决：桌面归属会话只允许「发到 A 或诚实失败」——**这个 build 没有写能力
+    // 证据**时不得静默改走无头通道（那会变成另一个会话）。本门在 H3 之前：H3 开着也
+    // 不许降级；headless 只服务 headless-owned 会话。
+    // #172/T8：兼容发送（未知 build + 开关开）例外——写前未投递时**允许一次**既有
+    // 兜底（R8 语义），并把这次尝试如实记进探测账本（failed）。
+    if !st.codex_control.build_send_verified() {
+        let compat = st
+            .codex_control
+            .compat_send_allowed(st.store.with(super::compat_send_enabled_conn));
+        if !compat {
+            let action_id = permit.action_id().to_string();
+            let ctx = permit.context().clone();
+            let receipt = not_sent_receipt(&action_id, ControlRoute::None, DESKTOP_SEND_UNVERIFIED);
+            let _ = permit.finish(receipt);
+            codex_audit(
+                st,
+                &ctx,
+                AUDIT_FALLBACK,
+                audit_session,
+                None,
+                None,
+                REFUSED_SEND_UNVERIFIED,
+            );
+            return;
+        }
+        // 兼容发送的写前未投递：记 failed（原因码固定词，不逐字回抄派发细节）
+        record_compat_send_outcome(st, CompatSendOutcome::NotSent).await;
+    }
     if !st.store.with(super::headless_enabled_conn) {
         // H3 关闭：兜底拒发（零投递）——finish 同事务清 fence，队列不为此卡死
         let action_id = permit.action_id().to_string();
@@ -671,6 +838,9 @@ struct AdapterDispatch {
     adapter: Arc<DesktopIpcAdapter>,
     /// R7.3：与 hub 共享的关注引用闸（ensure 失败回滚名额的判断依据）
     gate: Arc<FollowGate>,
+    /// #172/T8：设置库（读「兼容发送」开关的**唯一**来源；与 hub 的 ActionStore
+    /// 同库同连接——测试夹具写内存库即可切开关）。
+    store: DeviceStore,
 }
 
 impl AdapterDispatch {
@@ -691,6 +861,18 @@ impl AdapterDispatch {
                 false
             }
         }
+    }
+
+    /// #172/T8：**兼容发送放行判据**（派发侧）——开关开 ∧ 本 build 写能力未取证。
+    ///
+    /// 与 remote 层（`session_send_via_hub` / `session_send_info`）**同一判据**：
+    /// 都读同一个设置键 + 同一个 `build_send_verified` 事实（send-info 与 send
+    /// 同源同码就靠这里）。已验证 build 恒 false → 行为完全不变。
+    fn compat_send_allowed(&self) -> bool {
+        super::compat_send_allowed(
+            self.store.with(super::compat_send_enabled_conn),
+            self.adapter.build_send_verified(),
+        )
     }
 }
 
@@ -721,6 +903,9 @@ impl DesktopDispatch for AdapterDispatch {
         let composed = composed_text.to_string();
         let cmid = client_message_id.to_string();
         let action_id = action_id.to_string();
+        // #172/T8：兼容发送许可（**派发前**取一次——写能力门就在 start_turn 里；
+        // 开关关 → 恒 false → 与既有行为逐字相同）。
+        let compat = self.compat_send_allowed();
         Box::pin(async move {
             // ensure_thread 有界等待（connect 3s + snapshot 5s 量级；Desktop 不在即快败）
             match tokio::time::timeout(
@@ -749,7 +934,15 @@ impl DesktopDispatch for AdapterDispatch {
                     revision: adapter.projection(&key).await.revision,
                 };
             }
-            let outcome = adapter.start_turn(&key, &action_id, &composed, &cmid).await;
+            // #172/T8：兼容发送走**同一 start_turn 路径**（wire 形态不变），只是把
+            // 「写能力未取证」这一道能力门在用户显式开启后放开。
+            let outcome = if compat {
+                adapter
+                    .start_turn_compat(&key, &action_id, &composed, &cmid)
+                    .await
+            } else {
+                adapter.start_turn(&key, &action_id, &composed, &cmid).await
+            };
             // R6.3：回执时投影 revision 基线（完成证据的严格后续判定基准）
             let revision = adapter.projection(&key).await.revision;
             let mut out = outcome_of(outcome);
@@ -886,7 +1079,90 @@ impl Connector for NullConnector {
     }
 }
 
-/// 能力全关的保守 profile（未识别平台/build 的诚实缺省——写入恒 `capability_unavailable`）。
+// ============================================================
+// #172：探测账本的存储实现（DeviceStore 上的 `codex_ipc_probe`）
+// ============================================================
+
+/// 生产账本：与 hub 的 ActionStore 同库（`~/.tuvis/tuvis.db`；测试注入内存库）。
+///
+/// 只做三件事：读一行、按结论 upsert 一行、退避字段由 DAO 单点算。**不**碰正文/
+/// 线程标识；`verified` 永不写（`probe::ProbeOutcome::as_state` 只出三种词）。
+pub(crate) struct StoreProbeLedger {
+    store: DeviceStore,
+}
+
+impl ProbeLedger for StoreProbeLedger {
+    fn get(&self, probe_key: &str, capability: &str) -> Option<ProbeLedgerEntry> {
+        self.store
+            .with(|conn| {
+                crate::database::dao::codex_ipc_probe::get_conn(conn, probe_key, capability)
+                    .ok()
+                    .flatten()
+            })
+            .map(|row| ProbeLedgerEntry {
+                state: row.state,
+                next_retry_at: row.next_retry_at,
+                // #172/T9a：探测只读事实要用的两个字段（只读；不改既有语义）
+                stage: row.probe_stage,
+                error_code: row.error_code,
+                // 证据指纹（只对 capability='schema' 有意义）
+                fingerprint: row.fingerprint,
+            })
+    }
+
+    fn record(
+        &self,
+        probe_key: &str,
+        capability: &str,
+        outcome: &ProbeOutcome,
+        fingerprint: Option<&str>,
+    ) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let stage = Some(outcome.stage().as_str());
+        let recorded = self.store.with(|conn| match outcome {
+            ProbeOutcome::Probed { .. } => crate::database::dao::codex_ipc_probe::upsert_ok_conn(
+                conn,
+                probe_key,
+                capability,
+                stage,
+                fingerprint,
+                Some(outcome.duration_ms()),
+                now,
+            ),
+            ProbeOutcome::Failed { error_code, .. } => {
+                crate::database::dao::codex_ipc_probe::upsert_fail_conn(
+                    conn,
+                    probe_key,
+                    capability,
+                    stage,
+                    error_code,
+                    fingerprint,
+                    Some(outcome.duration_ms()),
+                    now,
+                )
+            }
+            ProbeOutcome::Inconclusive { error_code, .. } => {
+                crate::database::dao::codex_ipc_probe::upsert_inconclusive_conn(
+                    conn,
+                    probe_key,
+                    capability,
+                    stage,
+                    error_code,
+                    fingerprint,
+                    Some(outcome.duration_ms()),
+                    now,
+                )
+            }
+        });
+        if let Err(e) = recorded {
+            // 账本写失败不影响本次探测结论（本进程内存 profile 已按结论提升）；
+            // 只失去「跨重启复用」，如实记日志。
+            log::warn!("codex-ipc probe: 账本落盘失败 key={probe_key} err={e}");
+        }
+    }
+}
+
+/// 能力全关的保守 profile（未识别平台/build 的诚实缺省——写入恒 `capability_unavailable`）。/// #172：`evidence = Closed` —— **不探测**（这是「明确不可用」档，不是「尚无证据」档）。
 fn closed_profile() -> crate::services::codex_desktop_ipc::profile::ProtocolProfile {
     crate::services::codex_desktop_ipc::profile::ProtocolProfile {
         platform: std::env::consts::OS.to_string(),
@@ -900,8 +1176,92 @@ fn closed_profile() -> crate::services::codex_desktop_ipc::profile::ProtocolProf
             interrupt: false,
         },
         method_versions: Default::default(),
+        evidence: crate::services::codex_desktop_ipc::profile::EvidenceLevel::Closed,
     }
 }
+
+// ============================================================
+// #172/T8：兼容发送的结果映射（发送结果 → 探测账本 capability = "send"）
+// ============================================================
+
+/// 账本 `capability` 列的**发送**能力词（与 `codex_ipc_probe` 既有测试里的
+/// "send" 字符串一致——同一列、同一口径，不新造词表）。
+pub(crate) const CAP_SEND: &str = "send";
+/// 兼容发送「结果未知」的账本原因码（超时 / 断链——**结果未知，绝不重发**）。
+///
+/// #172/T9a：机器码**单一出处**在 `services::codex_desktop_ipc::reason_code`
+/// （前端按 `errors.deliveryUnknown` 取文案）；此处只是别名，值一字不改。
+pub(crate) const COMPAT_SEND_DELIVERY_UNKNOWN: &str =
+    crate::services::codex_desktop_ipc::reason_code::DELIVERY_UNKNOWN;
+
+/// 兼容发送的一次结果（**只在本路径上产生**：未知 build + 开关开）。
+#[derive(Debug, Clone, Copy)]
+enum CompatSendOutcome {
+    /// 受理（对端确认收到这次 start-turn）→ 账本记 **probed**。
+    Accepted,
+    /// 写前未投递（连接不可达 / 忙态拒绝 / 方法缺失）→ 账本记 **failed**。
+    NotSent,
+    /// 结果未知（超时 / 断链）→ 账本记 **inconclusive** + reason `delivery_unknown`。
+    Unknown,
+}
+
+/// 兼容发送结果 → 探测账本（`capability = "send"`）。
+///
+/// **为什么记这个**：兼容发送是**用户在风险已知的前提下**放开的通道——它产出的证据
+/// 只说明「这个 build 的发送确被受理」，**不**因此写进 shipped 表（提升 shipped
+/// 表需要用户裁决，不是程序能自封的）。账本三态与 `codex_ipc_probe` 既有语义同口径：
+/// * `probed` = 这次发送确被受理（该 build 的写能力**有**了一次实证）；
+/// * `failed` = 写前明确未投递（协议错 / 不可达 / 方法缺失——不自动重试）；
+/// * `inconclusive` = 结果未知（**绝不据此重发**，也绝不据此判死）。
+///
+/// `Rejected`（对端明确拒绝这次动作）**不记账**：一次业务拒绝不等于「这个 build 的
+/// 写能力不可用」，把它记成 failed 会把 build 误判成协议错。
+///
+/// 拿不到 build 目标 → **不记账**（宁可缺行，不可错记到别的 build 上）。
+async fn record_compat_send_outcome(st: &Arc<RemoteState>, outcome: CompatSendOutcome) {
+    let Some(probe_key) = st.codex_control.adapter.current_probe_key().await else {
+        log::info!("codex_ipc: 兼容发送无 build 目标，不记账（宁可缺行，不可错记）");
+        return;
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let recorded = st.store.with(|conn| match outcome {
+        CompatSendOutcome::Accepted => crate::database::dao::codex_ipc_probe::upsert_ok_conn(
+            conn, &probe_key, CAP_SEND, None,
+            // 发送结论没有内容指纹（只有官方 schema 行带）
+            None, None, now,
+        ),
+        CompatSendOutcome::NotSent => crate::database::dao::codex_ipc_probe::upsert_fail_conn(
+            conn,
+            &probe_key,
+            CAP_SEND,
+            None,
+            COMPAT_SEND_NOT_SENT_REASON,
+            None,
+            None,
+            now,
+        ),
+        CompatSendOutcome::Unknown => {
+            crate::database::dao::codex_ipc_probe::upsert_inconclusive_conn(
+                conn,
+                &probe_key,
+                CAP_SEND,
+                None,
+                COMPAT_SEND_DELIVERY_UNKNOWN,
+                None,
+                None,
+                now,
+            )
+        }
+    });
+    if let Err(e) = recorded {
+        // 账本写失败不影响本次发送结论（回执照常给出）；只失去「跨重启复用」。
+        log::warn!("codex_ipc: 兼容发送账本落盘失败 key={probe_key} err={e}");
+    }
+}
+
+/// 写前未投递的账本原因码（**固定词**，不逐字回抄派发原因码——派发原因码是
+/// 本次失败的细节，账本要的是「写前没送出去」这一档事实）。
+const COMPAT_SEND_NOT_SENT_REASON: &str = "not_sent_before_write";
 
 // ============================================================
 // 审计（动作词表 + summary JSON；凭据零泄漏）
@@ -916,6 +1276,17 @@ const AUDIT_FALLBACK: &str = "codex_fallback";
 const AUDIT_INTERRUPT: &str = "codex_interrupt";
 /// Desktop IPC 动作的审计 channel 词（兜底行记**实际 headless 通道名**——由封套取）。
 const AUDIT_CHANNEL: &str = "codex_desktop_ipc";
+
+/// #172 用户裁决（设计 §10.1）：**桌面归属会话不得静默改走 headless**——A 路写能力
+/// 未取证时只能「发到 A 或诚实失败」，headless 只服务 headless-owned 会话。
+/// 机器码沿用既有 `capability_unverified`（方法已知、能力未验证；与「方法未知」的
+/// `capability_unavailable` 拆码）。
+pub(crate) const DESKTOP_SEND_UNVERIFIED: &str = "capability_unverified";
+/// 同上门的用户可读文案（手机端只读 `reason` 展示；不暴露协议细节）。
+pub(crate) const DESKTOP_SEND_UNVERIFIED_REASON: &str =
+    "当前 Codex 桌面版本未验证远程发送能力，已拒绝以免消息落到别的会话；请到电脑端处理";
+/// 审计结果词（与 H3 拒发 `refused:headless_disabled` 同形，便于事后按码检索）。
+const REFUSED_SEND_UNVERIFIED: &str = "refused:capability_unverified";
 
 /// Codex 控制动作审计单点：`summary` = JSON
 /// `{actionId,threadId,requestKey?,envelopeId?,result}`。
@@ -1250,6 +1621,9 @@ fn refused_envelope(action_id: &str, reason: &str) -> serde_json::Value {
 /// - `Queued` → `{status:"codex_queued", actionId, position}`；
 /// - `UseFallback` → 兼容分支（受 H3）：关闭 → 403 `headless_disabled`（permit 以
 ///   NotSent 落账）；开启 → 旧 headless 封套 + 附 actionId。
+/// - **#172 裁决**：桌面归属会话的 A 路写能力未取证（`!send_available()`）→ 403
+///   `capability_unverified` 且 permit 以 NotSent 落账，**不进 headless**（即使 H3 开着）——
+///   否则用户点发送会静默改走无头通道，变成另一个会话。
 pub(crate) async fn session_send_via_hub(
     st: &Arc<RemoteState>,
     session: &crate::session::Session,
@@ -1273,12 +1647,33 @@ pub(crate) async fn session_send_via_hub(
         kind: ActionKind::Send,
         key: key.clone(),
     };
+    // #172/T8：兼容发送放行判据（**与派发侧同一判据**：同一个设置键 + 同一个
+    // `build_send_verified` 事实）——send 与 send-info 因此同源同码。
+    let compat = hub.compat_send_allowed(st.store.with(super::compat_send_enabled_conn));
     match hub
         .router
         .send(ctx.clone(), text.to_string(), queue_only)
         .await
     {
         RouterOutcome::Completed(receipt) => {
+            // #172/T8：兼容发送路径的结果映射（**仅**未知 build + 开关开时生效）：
+            // - Accepted → 账本记 probed（该 build 的发送确被受理；**不**写进 shipped
+            //   表——提升 shipped 表需要用户裁决）；
+            // - Unknown（超时/断链）→ 账本记 inconclusive + reason `delivery_unknown`
+            //   （**不重发、不 fallback**：router 对 Unknown 只落保守屏障，不给兜底资格）；
+            // - NotSent 不在此记账（它是「写前未投递」，走下面的兜底分支；这里出现的
+            //   NotSent 是重放/存储失败等**没有发生写尝试**的情形）。
+            if compat {
+                match receipt.delivery {
+                    Delivery::Accepted => {
+                        record_compat_send_outcome(st, CompatSendOutcome::Accepted).await
+                    }
+                    Delivery::UnknownDelivery => {
+                        record_compat_send_outcome(st, CompatSendOutcome::Unknown).await
+                    }
+                    _ => {}
+                }
+            }
             codex_audit(
                 st,
                 &ctx,
@@ -1308,6 +1703,41 @@ pub(crate) async fn session_send_via_hub(
             )
         }
         RouterOutcome::UseFallback { permit, .. } => {
+            // #172 裁决：桌面归属会话只允许「发到 A 或诚实失败」——**这个 build 没有
+            // 写能力证据**时不得静默改走无头通道（那会变成另一个会话）。本门在 H3
+            // 之前：H3 开着也不许降级；headless 只服务 headless-owned 会话。
+            if !hub.build_send_verified() {
+                // #172/T8：兼容发送（未知 build + 开关开）——写前未投递时**允许一次**
+                // 既有兜底（R8 语义：写前没送出去才允许兜底一次），并把这次尝试
+                // 如实记进探测账本（capability = "send" → failed）。
+                // 开关关 → 维持现状：403 capability_unverified，零投递、不进 headless。
+                if !compat {
+                    let receipt = not_sent_receipt(
+                        permit.action_id(),
+                        ControlRoute::None,
+                        DESKTOP_SEND_UNVERIFIED,
+                    );
+                    let _ = permit.finish(receipt);
+                    codex_fallback_audit(
+                        st,
+                        &ctx,
+                        &session.id,
+                        "",
+                        None,
+                        None,
+                        REFUSED_SEND_UNVERIFIED,
+                    );
+                    return json_no_store(
+                        StatusCode::FORBIDDEN,
+                        serde_json::json!({
+                            "error": DESKTOP_SEND_UNVERIFIED,
+                            "reasonCode": DESKTOP_SEND_UNVERIFIED,
+                            "reason": DESKTOP_SEND_UNVERIFIED_REASON,
+                        }),
+                    );
+                }
+                record_compat_send_outcome(st, CompatSendOutcome::NotSent).await;
+            }
             // 兼容分支：唯一受 H3 的路径
             if st.store.with(super::headless_enabled_conn) {
                 let st2 = st.clone();
@@ -2487,7 +2917,10 @@ pub async fn pending_response(
         Err(_) => return bad_request(),
     };
     let hub = &st.codex_control;
-    if !hub.ipc_available() {
+    // #172 解耦：审批只要求**读链可用**（能在投影里看到 pending）——写决策的类别能力
+    // （command / permissions / blocking_input）由 adapter 按当前 profile 逐项门控，
+    // 不在端点入口用 `send` 连坐。disabled hub / 读链未取证 → 503 capability_unavailable。
+    if !hub.state_available() {
         return capability_unavailable();
     }
     let sid = req.session_id.trim().to_string();
@@ -2547,6 +2980,8 @@ pub async fn pending_response(
     };
     let kind = match pending.kind {
         PendingKind::CommandApproval => ActionKind::CommandApproval,
+        // #172/T7：文件变更审批与命令审批同属 L3（账本动作类别共用）
+        PendingKind::FileChangeApproval => ActionKind::FileChangeApproval,
         PendingKind::PermissionsApproval => ActionKind::PermissionsApproval,
         PendingKind::UserInput => ActionKind::UserInput,
         PendingKind::Unsupported => return capability_unavailable(),
@@ -2555,8 +2990,10 @@ pub async fn pending_response(
     let compatible = matches!(
         (&pending_action, pending.kind),
         (PendingAction::Approve, PendingKind::CommandApproval)
+            | (PendingAction::Approve, PendingKind::FileChangeApproval)
             | (PendingAction::Approve, PendingKind::PermissionsApproval)
             | (PendingAction::Reject, PendingKind::CommandApproval)
+            | (PendingAction::Reject, PendingKind::FileChangeApproval)
             | (PendingAction::Reject, PendingKind::PermissionsApproval)
             | (PendingAction::Answer(_), PendingKind::UserInput)
     );
@@ -2580,7 +3017,14 @@ pub async fn pending_response(
         )
         .await
     {
-        RouterOutcome::Completed(receipt) => {
+        RouterOutcome::Completed(mut receipt) => {
+            // #172/T7：**受理 ≠ 生效**——decision 之后等 requestId 从新 snapshot 消失
+            //（≤ `decision_confirm_ms`）；仍在场 → 如实标 `decision_unconfirmed`
+            //（前端提示「未确认，可终止本轮」），绝不假装成功。
+            if receipt.delivery == Delivery::Accepted {
+                receipt =
+                    confirm_decision_gone(hub, &ctx.key, &request_key, &projection, receipt).await;
+            }
             let result = audit_result_of_receipt(&receipt);
             codex_audit(
                 &st,
@@ -2606,6 +3050,61 @@ pub async fn pending_response(
             capability_unavailable()
         }
     }
+}
+
+/// #172/T7「回执」：decision 后等该 request 从新 snapshot 消失，最多
+/// `decision_confirm_ms`（默认 5s，测试可收窄到 0）。
+///
+/// 语义：`Accepted` 只代表 Desktop **受理**了决策帧；只有 pending 从快照里消失才是
+/// 「生效」。超时仍未见消失 → 回执加 `decision_unconfirmed`（前端提示「未确认，可
+/// 终止本轮」），绝不把受理当成功。
+async fn confirm_decision_gone(
+    hub: &CodexControlHub,
+    key: &ThreadKey,
+    request_key: &str,
+    before: &ThreadProjection,
+    mut receipt: ActionReceipt,
+) -> ActionReceipt {
+    let total = hub.decision_confirm_ms();
+    if total == 0 {
+        return receipt;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(total);
+    loop {
+        let projection = hub.adapter.projection(key).await;
+        if decision_snapshot_confirms(before, &projection, request_key) {
+            return receipt;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if receipt.reason_code.is_none() {
+                // #172/T9a：机器码单一出处（前端按 `errors.decisionUnconfirmed` 取文案）
+                let code = crate::services::codex_desktop_ipc::reason_code::DECISION_UNCONFIRMED;
+                log::info!(
+                    "codex-ipc decision: 受理后 {total}ms 未见生效，reason={code} userMessage={}",
+                    crate::services::codex_desktop_ipc::reason_code::message_of(code)
+                        .unwrap_or("-")
+                );
+                receipt.reason_code = Some(code.to_string());
+            }
+            return receipt;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+fn decision_snapshot_confirms(
+    before: &ThreadProjection,
+    current: &ThreadProjection,
+    request_key: &str,
+) -> bool {
+    !current.stale
+        && current.owner_epoch == before.owner_epoch
+        && current.owner_generation == before.owner_generation
+        && current
+            .revision
+            .zip(before.revision)
+            .is_some_and(|(now, old)| now > old)
+        && !current.pending.iter().any(|p| p.request_key == request_key)
 }
 
 /// 回执 → HTTP：非 200 档（409/400/503）返回**错误体** `{"error": <机器码>}`（过期
@@ -2673,15 +3172,36 @@ mod startup_merge_tests {
     //! 2026-10-20 复审 P2：SSE 首快照与订阅缓冲的合并语义（纯函数层，确定性覆盖
     //! 「快照与建流交界处发布最终态」「旧缓冲不得覆盖较新快照」「owner 换代」）。
 
-    use super::{merge_startup_buffer, supersedes, turn_association_refusal};
+    use super::{
+        decision_snapshot_confirms, merge_startup_buffer, supersedes, turn_association_refusal,
+    };
     use crate::services::codex_desktop_ipc::types::{
-        CapabilitySet, ContentState, ControlAvailability, ThreadKey, ThreadProjection,
+        CapabilitySet, ContentState, ControlAvailability, ProbeStatus, ThreadKey, ThreadProjection,
     };
 
     fn k(thread: &str) -> ThreadKey {
         ThreadKey {
             host_id: "local".into(),
             thread_id: thread.into(),
+        }
+    }
+
+    #[test]
+    fn decision_confirmation_rejects_disconnect_and_old_snapshots() {
+        let before = p("t", 1, 2, Some(10), false);
+        assert!(decision_snapshot_confirms(
+            &before,
+            &p("t", 1, 2, Some(11), false),
+            "r"
+        ));
+        for current in [
+            p("t", 1, 2, Some(11), true),
+            p("t", 1, 2, Some(10), false),
+            p("t", 2, 2, Some(11), false),
+            p("t", 1, 3, Some(11), false),
+            p("t", 1, 2, None, false),
+        ] {
+            assert!(!decision_snapshot_confirms(&before, &current, "r"));
         }
     }
 
@@ -2705,6 +3225,7 @@ mod startup_merge_tests {
             truncated: false,
             history_token: String::new(),
             pending: Vec::new(),
+            probe_status: ProbeStatus::idle(),
             owner_epoch: epoch,
             owner_generation: gen,
         }

@@ -14,6 +14,7 @@
 //   方向同样随 ratioPane 取反；
 // - touch-action: none 关掉浏览器滚动手势，避免手机上拖动被识别为滚动。
 import { useCallback, useEffect, useRef } from "react";
+import i18n from "@/i18n";
 
 /** 文件栏占比下/上限：任一区至少保留 15%（防拖没） */
 export const MIN_RATIO = 0.15;
@@ -134,7 +135,7 @@ export default function SplitHandle({
       type="button"
       role="separator"
       aria-orientation={orientation === "horizontal" ? "vertical" : "horizontal"}
-      aria-label="拖动调整分屏比例"
+      aria-label={i18n.t("mobile.split.handleAria")}
       aria-valuenow={Math.round(ratio * 100)}
       aria-valuemin={Math.round(MIN_RATIO * 100)}
       aria-valuemax={Math.round(MAX_RATIO * 100)}

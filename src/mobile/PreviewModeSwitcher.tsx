@@ -3,6 +3,7 @@
 // T1 sheet 化后唯一实例在 SessionDetail 顶栏 sheet bar；FilePreview 内部的
 // 切换器仅显式传 onModeChange 的直用场景（独立测试）渲染。
 import { Columns2, Maximize2, Rows2 } from "lucide-react";
+import i18n from "@/i18n";
 
 /** 预览形态三态：与 SessionDetail.PreviewMode 同源（此文件为避免循环依赖
  *  独立声明；两者由 usage 类型检查保持一致） */
@@ -26,14 +27,14 @@ export default function PreviewModeSwitcher({
   return (
     <span
       role="group"
-      aria-label="预览布局"
+      aria-label={i18n.t("mobile.preview.layoutAria")}
       className="flex shrink-0 items-center rounded-full bg-[var(--cb)] p-0.5"
     >
       <button
         type="button"
         data-testid={`${testIdPrefix}-split`}
         aria-pressed={mode === "split"}
-        aria-label="上下分屏预览"
+        aria-label={i18n.t("mobile.preview.layoutSplit")}
         onClick={() => onChange("split")}
         className={cls(mode === "split")}
       >
@@ -44,7 +45,7 @@ export default function PreviewModeSwitcher({
         type="button"
         data-testid={`${testIdPrefix}-split-h`}
         aria-pressed={mode === "split-h"}
-        aria-label="左右分屏预览"
+        aria-label={i18n.t("mobile.preview.layoutSplitH")}
         onClick={() => onChange("split-h")}
         className={cls(mode === "split-h")}
       >
@@ -55,7 +56,7 @@ export default function PreviewModeSwitcher({
         type="button"
         data-testid={`${testIdPrefix}-fullscreen`}
         aria-pressed={mode === "fullscreen"}
-        aria-label="全屏预览"
+        aria-label={i18n.t("mobile.preview.layoutFullscreen")}
         onClick={() => onChange("fullscreen")}
         className={cls(mode === "fullscreen")}
       >

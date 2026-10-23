@@ -1,12 +1,27 @@
 // 文件传输进度（Task 10 §C5）：下行流式读进度 + 上行 XHR 进度 + 通道装饰端点。
 // fetch 全量 stub（盖过 setup.ts 的 msw）——transfer.test 与 api.test.ts 同款纪律。
 import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { fetchFile, uploadAttachment } from "@/mobile/api";
 import FilePanel from "@/mobile/FilePanel";
 import FilePreview from "@/mobile/FilePreview";
 import { etaRemainingText, formatBytes, transferRateBps } from "@/mobile/board-logic";
 import type { SessionFileEntry } from "@/mobile/api";
+
+// 文案走 mobile.* 双语键后按 zh 断言（Board.test 同款：显式引入并固定中文）。
+// 只 changeLanguage 不够：jsdom 默认 en-US 会在语言重评估时翻回 en——浏览器
+// 语言一并钉到 zh（language-toggle 同款）
+import { pinZhNavigator } from "./pinZhNavigator";
+
+let unpinZh: () => void;
+
+beforeAll(async () => {
+  unpinZh = await pinZhNavigator();
+});
+
+afterAll(() => {
+  unpinZh();
+});
 
 afterEach(() => {
   cleanup();

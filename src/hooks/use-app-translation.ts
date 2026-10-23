@@ -15,5 +15,7 @@ export function useAppTranslation() {
     };
   }, [i18n]);
 
-  return { t };
+  // i18n 一并暴露：消费方（HomePage 托盘 effect）需要读 i18n.language 把当前语言
+  // 推给 Rust（三终端语言自适应 C-3）；i18n.language 恒为规范 "zh"/"en"（C-1）
+  return { t, i18n };
 }

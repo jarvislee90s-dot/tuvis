@@ -64,6 +64,7 @@ fn kind_str(kind: ActionKind) -> &'static str {
     match kind {
         ActionKind::Send => "send",
         ActionKind::CommandApproval => "command_approval",
+        ActionKind::FileChangeApproval => "file_change_approval",
         ActionKind::PermissionsApproval => "permissions_approval",
         ActionKind::UserInput => "user_input",
         // 打断不进动作账本（仅供 ActionContext/审计语义如实），映射仅为 match 穷尽。
@@ -75,6 +76,7 @@ fn kind_from_str(s: &str) -> Option<ActionKind> {
     match s {
         "send" => Some(ActionKind::Send),
         "command_approval" => Some(ActionKind::CommandApproval),
+        "file_change_approval" => Some(ActionKind::FileChangeApproval),
         "permissions_approval" => Some(ActionKind::PermissionsApproval),
         "user_input" => Some(ActionKind::UserInput),
         "interrupt" => Some(ActionKind::Interrupt),

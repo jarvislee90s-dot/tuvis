@@ -1,0 +1,63 @@
+{
+  "_source": "2026-10-22 Windows 26.1016.6573.0 真机审批决策闭环（T10-A 受控探针；命令正文/路径/标识符已占位化，仅保留结构性事实）",
+  "_note": "闭环三段：pending（item/commandExecution/requestApproval，整数 id 8）→ 决策请求（thread-follower-command-approval-decision v1，params={conversationId,requestId,decision}，信封带 targetClientId）→ 回执（resultType=success，result={\"ok\":true}，handledByClientId 存在）。decision=accept 在 availableDecisions 的字符串词里；对象形态 acceptWithExecpolicyAmendment 只记形状、不发。",
+  "pendingRequest": {
+    "method": "item/commandExecution/requestApproval",
+    "id": 8,
+    "params": {
+      "kind": "command",
+      "threadId": "00000000-0000-4000-8000-000000000001",
+      "turnId": "00000000-0000-4000-8000-000000000002",
+      "itemId": "exec-000000000003",
+      "startedAtMs": "<redacted>",
+      "environmentId": "<redacted:5>",
+      "reason": "<redacted>",
+      "command": "<synthetic command>",
+      "cwd": "<synthetic cwd>",
+      "commandActions": [
+        {
+          "type": "unknown",
+          "command": "<synthetic command>"
+        }
+      ],
+      "proposedExecpolicyAmendment": [
+        "<redacted:4>",
+        "<redacted:13>"
+      ],
+      "availableDecisions": [
+        "accept",
+        {
+          "acceptWithExecpolicyAmendment": {
+            "execpolicy_amendment": [
+              "<redacted:4>",
+              "<redacted:13>"
+            ]
+          }
+        },
+        "cancel"
+      ]
+    }
+  },
+  "request": {
+    "type": "request",
+    "requestId": "00000000-0000-4000-8000-000000000004",
+    "method": "thread-follower-command-approval-decision",
+    "params": {
+      "conversationId": "00000000-0000-4000-8000-000000000001",
+      "requestId": 8,
+      "decision": "accept"
+    },
+    "version": 1,
+    "targetClientId": "00000000-0000-4000-8000-000000000005"
+  },
+  "response": {
+    "type": "response",
+    "requestId": "00000000-0000-4000-8000-000000000004",
+    "resultType": "success",
+    "method": "thread-follower-command-approval-decision",
+    "handledByClientId": "00000000-0000-4000-8000-000000000005",
+    "result": {
+      "ok": true
+    }
+  }
+}

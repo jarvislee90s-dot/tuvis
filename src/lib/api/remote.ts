@@ -22,6 +22,17 @@ export type RemoteStatus = {
   headlessTimeoutMs?: number;
   /** H4 全局并发上限（缺键 = 2） */
   headlessConcurrency?: number;
+  /**
+   * #172/T8 兼容发送（实验）总开关（缺键 = 关；后端是唯一数据源）。
+   * 只影响**写能力未取证**的 Codex 桌面 build：开关关 = 如实拒发
+   * （capability_unverified），开关开 = 允许尝试发送（消息可能落到错误会话）。
+   */
+  compatSendEnabled?: boolean;
+  /**
+   * #172/T8 前置判据：false = 该 build 的读链尚未取证（只读探测未完成）→
+   * 设置页把开关置灰并提示先做只读探测（后端开启时同样会拒）。
+   */
+  compatSendEligible?: boolean;
 };
 
 // M5 A5 四通道状态载荷（Rust 端 channels_payload 注释即唯一契约）：
@@ -122,6 +133,14 @@ export async function toggleHeadless(enabled: boolean): Promise<void> {
 /** H4 无头配置：watchdog 超时 + 全局并发上限（越界值后端 clamp 后落库）。 */
 export async function setHeadlessLimits(timeoutMs: number, concurrency: number): Promise<void> {
   return await invoke("remote_set_headless_limits", { timeoutMs, concurrency });
+}
+/**
+ * #172/T8 兼容发送（实验）总开关（默认关）：后端写 KV + 审计 + 广播 remote-changed。
+ * 开启有前置：后端要求「该 build 的读链已取证」（只读探测通过），否则 Err
+ * （前端同口径置灰 + 提示）。
+ */
+export async function toggleCompatSend(enabled: boolean): Promise<void> {
+  return await invoke("remote_toggle_compat_send", { enabled });
 }
 // 设置访问密码（M5 A4）：首次只落库；改值 = 全部设备吊销 + 断连；非法 PIN Err
 export async function setPin(pin: string): Promise<void> {
