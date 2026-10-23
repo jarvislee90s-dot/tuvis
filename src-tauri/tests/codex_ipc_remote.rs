@@ -444,6 +444,7 @@ fn fixture_on(
         dialog_probe: Arc::new(|_, _| None),
         screen_probe: Arc::new(|_, _| None),
         codex_control: hub_builder(DeviceStore::Owned(conn.clone())),
+        desktop_language: Default::default(),
     });
     let app = router(state.clone());
     Fixture {

@@ -443,8 +443,16 @@ fn persist_and_cookie(
     };
     let effective_id = st.store.with(|c| {
         // 显式传指纹输入（**不是** origin_ip）：两个职责在 DAO 入口处分离
-        crate::remote::pairing::persist_device_with_fingerprint(c, &dev, origin_fingerprint)
-            .unwrap_or_else(|_| device_id.to_string())
+        let effective =
+            crate::remote::pairing::persist_device_with_fingerprint(c, &dev, origin_fingerprint)
+                .unwrap_or_else(|_| device_id.to_string());
+        // 三终端语言自适应（L2 / §6.4-3）：**配对完成即清零该设备的手动语言记录**——
+        // 重新配对 = 回到自动跟随。upsert 命中旧行时设备 id 不变（同一浏览器不吊销
+        // 直接重配复用同一身份），不清零旧记录会穿越重配幸存。只影响语言跟随，
+        // 配对身份/名额语义零改动（全局约束 12）；与 persist 同一 with 闭包
+        // （DeviceStore 锁不可重入，勿拆两段）
+        crate::remote::language::clear_manual_language(c, &effective);
+        effective
     });
     (
         [(
@@ -461,13 +469,93 @@ fn persist_and_cookie(
 /// host 信息运行期不变，移动端挂载时拉一次即可，无需轮询。
 /// 直调 host_source 注入缝（生产 = remote::host_info()，与 remote_status 的 host 部分同源，
 /// 禁止复制聚合逻辑）——读 settings DAO 是轻量 SQLite 查询，无需 spawn_blocking
-pub async fn host(State(st): State<Arc<RemoteState>>) -> impl IntoResponse {
+///
+/// 三终端语言自适应（2026-10-22）：本端点是**已配对连接的初始化响应**，C-4 两字段
+/// 随此载荷下发（**仅此一处**——未配对 / 未过闸的 403 响应为空体，天然不含两字段）：
+/// - `desktopLanguage`：桌面当前语言（C-3 内存源；"zh"|"en"，未推送 = null，
+///   Rust 只存不判，移动端决策链自行兜底）；
+/// - `manualLanguage`：**该设备**（cookie 身份）的手动语言记录，无记录 = null。
+///   下发是纯读：连接下发**绝不产生任何记账写入**（C-5：自动跟随结果绝不落账）。
+pub async fn host(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let mut payload = (st.host_source)();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            "desktopLanguage".to_string(),
+            serde_json::json!(st
+                .desktop_language
+                .get()
+                .map(super::language::UiLanguage::as_str)),
+        );
+        // 设备记录按 cookie 身份读账（gate 已保证设备有效；取不到 cookie 时如实 null）
+        let manual = super::gate::extract_device(&headers)
+            .and_then(|device_id| {
+                st.store
+                    .with(|c| super::language::manual_language(c, &device_id))
+            })
+            .map(super::language::UiLanguage::as_str);
+        obj.insert("manualLanguage".to_string(), serde_json::json!(manual));
+    }
     // 门禁下的私有数据（本机名/启用工具），与会话数据同样禁止中间层缓存
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json((st.host_source)()),
+        Json(payload),
     )
         .into_response()
+}
+
+/// POST /m/api/v1/device-language 载荷（C-5 契约钉死：字段名 `language`，值集
+/// "zh"|"en"——任务 4（移动端 UI）按此消费）。pub = pub fn 端点的提取器类型可见性
+#[derive(Deserialize)]
+pub struct DeviceLanguageReq {
+    language: String,
+}
+
+/// POST /m/api/v1/device-language（三终端语言自适应 C-5，2026-10-22）：远程端某
+/// 设备的手动语言切换写账。**仅已配对会话可调**（api_router 整体过 gate，全局约束 4；
+/// handler 内 cookie 取不到时 403 防御兜底）。
+/// - 写入口径：只认移动端**手动**切换（载荷 `language`）；自动跟随结果绝不写账；
+/// - 覆盖语义：同一设备再次切换覆盖前值（最后一次手动为准，U14）；
+/// - 响应 = 该设备**最新**记录 `{manual, language}`（manual 恒 true——行存在即手动）；
+/// - 值集外（含缺字段）→ 400，不猜测归流。
+pub async fn device_language(
+    State(st): State<Arc<RemoteState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<DeviceLanguageReq>,
+) -> Response {
+    // C-1 值集钉死：只收 "zh" / "en"，其余 400（Rust 不判语言，非法即拒）
+    let Some(lang) = super::language::UiLanguage::parse(&req.language) else {
+        return bad_request();
+    };
+    let Some(device_id) = super::gate::extract_device(&headers) else {
+        return forbidden_defense();
+    };
+    let now = (st.now_source)();
+    // 写 + 回读必须合并进**同一个** with 闭包（DeviceStore 锁不可重入，勿拆两段）
+    let record: Result<Option<super::language::UiLanguage>, String> = st.store.with(|c| {
+        super::language::set_manual_language(c, &device_id, lang, now)?;
+        Ok(super::language::manual_language(c, &device_id))
+    });
+    match record {
+        Ok(Some(latest)) => json_no_store(
+            StatusCode::OK,
+            serde_json::json!({ "manual": true, "language": latest.as_str() }),
+        ),
+        // 写后读不到 = 内部矛盾（写成功必有行），如实 500 不伪造成功
+        Ok(None) => json_no_store(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "error": "language record missing after write" }),
+        ),
+        Err(e) => {
+            log::error!("device-language 记账失败: {e}");
+            json_no_store(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "language ledger write failed" }),
+            )
+        }
+    }
 }
 
 /// GET /m/api/v1/ui-config（2026-10-05 UI 改版，spec §6.2）：远程端外观配置下发。
