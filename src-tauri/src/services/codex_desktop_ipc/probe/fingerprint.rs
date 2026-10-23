@@ -282,8 +282,8 @@ fn macos_cli_id() -> Option<String> {
 /// 调用方注入（但会读候选 bundle 的 `Info.plist` 做身份校验）。
 ///
 /// 筛选顺序（PR #178 真机验收修复）：① 每条路径取首个 `.app/` 前缀为候选；② 安装
-/// 路径排序去重（每唯一 bundle 只读一次 Info.plist）；③ 按[`is_official_codex_bundle`]
-/// 官方 bundle id 精确识别（无关 App 与 helper 的嵌套 bundle 一并剔除——判据与
+/// 路径排序去重（每唯一 bundle 只读一次 Info.plist）；③ 按 [`is_official_codex_bundle`]
+/// 的官方 bundle id 精确识别（无关 App 与 helper 的嵌套 bundle 一并剔除——判据与
 /// endpoint resolver 同源，不按显示名猜）；④ **唯一才取**：0 个 = 未运行/未安装；
 /// 多个不同安装 = 多义，保守拒绝（不任取一个）。
 pub fn sole_codex_bundle(exes: &[PathBuf]) -> Option<PathBuf> {
@@ -488,18 +488,23 @@ mod tests {
     // 验收机（macOS，Codex Desktop 26.1016.61520 @ /Applications/ChatGPT.app，
     // CFBundleIdentifier=com.openai.codex）上桌面同时运行多个 App：旧逻辑把所有
     // 运行中的 .app 都收进候选、不筛身份，又要求候选恰一个 → CLI 定位恒 None、
-    // 账本键出现 `-`、schema 探针报 cli_not_found。修复方向：候选先按官方 bundle
-    // id（读 Contents/Info.plist 的 CFBundleIdentifier）精确筛选，再排序去重，
-    // 唯一才取。以下用例用 tempfile 造假 .app 钉住该行为。
+    // 账本键出现 `-`、schema 探针报 cli_not_found。修复后：先按安装路径去重，再按
+    // 官方 bundle id（读 Contents/Info.plist 的 CFBundleIdentifier）精确筛选，唯一
+    // 才取。以下用例用 tempfile 造假 .app 钉住该行为。
     // ============================================================
 
     use crate::services::codex_desktop_ipc::transport::unix::CODEX_BUNDLE_ID;
 
+    /// 路径 → 正斜杠字符串形态：`sole_codex_bundle` 靠 `find(".app/")` 截取候选，
+    /// Windows 下 `join()` 产出的反斜杠会让截取失配。
+    fn posix(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
     /// 造一个最小 .app 包：`<base>/<name>.app/Contents/Info.plist`，内容为含
     /// CFBundleIdentifier 与 CFBundleShortVersionString 的极简 XML plist（形态对齐
-    /// `transport::unix::plist_value` 的解析规则：`<key>K</key><string>v</string>`）。
-    /// `base` 用正斜杠字符串，返回值保持正斜杠形态——`sole_codex_bundle` 靠
-    /// `find(".app/")` 截取候选，Windows 下 `join()` 的反斜杠会让截取失配。
+    /// `transport::unix::plist_value` 的解析规则：`<key>K</key><string>v</string>`；
+    /// 解析按子串匹配 + trim，元素间空白无关紧要）。
     fn make_app(base: &str, name: &str, bundle_id: &str, version: &str) -> PathBuf {
         let bundle = format!("{base}/{name}.app");
         std::fs::create_dir_all(format!("{bundle}/Contents")).unwrap();
@@ -508,8 +513,8 @@ mod tests {
             format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                  <plist version=\"1.0\">\n<dict>\n\
-                 \x20 <key>CFBundleIdentifier</key><string>{bundle_id}</string>\n\
-                 \x20 <key>CFBundleShortVersionString</key><string>{version}</string>\n\
+                 <key>CFBundleIdentifier</key><string>{bundle_id}</string>\n\
+                 <key>CFBundleShortVersionString</key><string>{version}</string>\n\
                  </dict>\n</plist>\n"
             ),
         )
@@ -533,10 +538,7 @@ mod tests {
 
     /// 主程序 exe 路径（正斜杠字符串形态）：`<bundle>/Contents/MacOS/<bin>`。
     fn main_exe(bundle: &Path, bin: &str) -> PathBuf {
-        PathBuf::from(format!(
-            "{}/Contents/MacOS/{bin}",
-            bundle.to_string_lossy().replace('\\', "/")
-        ))
+        PathBuf::from(format!("{}/Contents/MacOS/{bin}", posix(bundle)))
     }
 
     /// 验收机场景：无关 App（Safari / ZCode）与官方 Codex 同屏运行。候选必须先按
@@ -545,7 +547,7 @@ mod tests {
     #[test]
     fn macos_multiple_running_apps_pick_only_official_codex_bundle() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let base = posix(tmp.path());
         let safari = make_app(&base, "Safari", "com.apple.Safari", "18.0");
         let zcode = make_app(&base, "ZCode", "com.zcode.editor", "1.2.3");
         let chatgpt = make_app(&base, "ChatGPT", CODEX_BUNDLE_ID, "26.1016.61520");
@@ -588,7 +590,7 @@ mod tests {
     #[test]
     fn macos_nested_helpers_merge_into_outer_bundle() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let base = posix(tmp.path());
         let chatgpt = make_app(&base, "ChatGPT", CODEX_BUNDLE_ID, "26.1016.61520");
 
         let exes = vec![
@@ -613,7 +615,7 @@ mod tests {
     #[test]
     fn macos_two_distinct_official_installs_refuse_guess() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let base = posix(tmp.path());
         let installed = make_app(
             &format!("{base}/Applications"),
             "ChatGPT",
@@ -643,7 +645,7 @@ mod tests {
     #[test]
     fn macos_unofficial_apps_yield_none_even_when_carrying_cli_payload() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let base = posix(tmp.path());
         let fake = make_app(&base, "FakeCodex", "com.fake.codex", "9.9.9");
         arm_bundle_cli(&fake, "0.0.0-fake");
         let notes = make_app(&base, "Notes", "com.apple.Notes", "4.11");
@@ -662,7 +664,7 @@ mod tests {
     #[test]
     fn macos_bundle_id_not_display_name_decides_identity() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let base = posix(tmp.path());
         let fake = make_app(&base, "Codex", "com.example.codex-clone", "1.0.0");
         let real = make_app(&base, "Whatever", CODEX_BUNDLE_ID, "26.1016.61520");
 
@@ -679,7 +681,7 @@ mod tests {
     #[test]
     fn macos_single_unofficial_app_is_not_sole_codex() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let base = posix(tmp.path());
         let safari = make_app(&base, "Safari", "com.apple.Safari", "18.0");
 
         let exes = vec![main_exe(&safari, "Safari")];
@@ -695,7 +697,7 @@ mod tests {
     #[test]
     fn macos_official_bundle_without_cli_payload_reports_none_fingerprint() {
         let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_string_lossy().replace('\\', "/");
+        let base = posix(tmp.path());
         let chatgpt = make_app(&base, "ChatGPT", CODEX_BUNDLE_ID, "26.1016.61520");
 
         let bundle = sole_codex_bundle(&[main_exe(&chatgpt, "ChatGPT")]);
