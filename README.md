@@ -17,7 +17,7 @@ English · [中文](README.zh-CN.md)
 
 [Features](#features) · [Capability Matrix](#capability-matrix) · [Quick Start](#quick-start) · [Roadmap](#roadmap) · [Community](#community)
 
-<img src="docs/images/dashboard-main.png" width="820" alt="Tuvis dashboard — live traffic-light session board for eight AI coding tools" />
+<img src="docs/images/product-forms-en.png" width="820" alt="Tuvis product forms — one desktop board and one phone, the two forms of the command deck, lights always in sync" />
 
 <b>Now adapted for iPhone Duo.</b>
 
