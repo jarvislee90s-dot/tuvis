@@ -58,7 +58,7 @@ import { TailscaleWizard } from "@/components/settings/TailscaleWizard";
 import { NamedDomainWizard } from "@/components/settings/NamedDomainWizard";
 import { ChannelQr } from "@/components/settings/ChannelQr";
 import { ProcessHint } from "@/components/settings/ProcessHint";
-// A2（设计 §4.1）：⑤无头注入 / ⑥兼容发送抽取为纯呈现子组件——状态 owner（草稿、
+// A2（设计 §4.1）：⑤无头注入（含兼容发送）抽取为纯呈现子组件——状态 owner（草稿、
 // ref 闸回填）、保存/错误回执与 3s 轮询都留在本文件（不建第二套状态/第二个定时器）
 import { HeadlessSettingsSection } from "@/components/settings/HeadlessSettingsSection";
 
@@ -1388,7 +1388,7 @@ export function RemoteSection() {
             {t("settings.remote.groupTools")}
           </div>
 
-          {/* ⑤ 无头注入 / ⑥ 兼容发送（抽取子组件；状态 owner 与 3s 轮询仍在本文件） */}
+          {/* ⑤ 无头注入（含兼容发送；抽取子组件；状态 owner 与 3s 轮询仍在本文件） */}
           <HeadlessSettingsSection
             status={status}
             busy={busy}

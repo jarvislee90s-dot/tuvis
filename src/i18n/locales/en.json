@@ -506,7 +506,7 @@
       "compatSendTitle": "Compatibility send (experimental)",
       "compatSendHint": "On by default. Only applies to unverified Codex desktop builds; messages may be delivered to the wrong session — you accept the risk.",
       "compatSendNeedsProbe": "A read-only probe must complete first (the read chain of this Codex desktop build is not verified yet)",
-      "groupCompatSend": "6. Compatibility send (unverified Codex desktop builds only)",
+      "groupCompatSend": "Compatibility send (unverified Codex desktop builds only)",
       "groupTools": "4. Tool-specific configuration"
     },
     "audit": {

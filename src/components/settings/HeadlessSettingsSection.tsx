@@ -1,4 +1,4 @@
-// 设置页「远程接入」⑤无头注入 / ⑥兼容发送子区（A2 自 RemoteSection 抽取，设计 §4.1）。
+// 设置页「远程接入」⑤无头注入（含兼容发送）子区（A2 自 RemoteSection 抽取，设计 §4.1）。
 // **纯呈现子组件**：状态 owner 仍是 RemoteSection——
 //   * 超时/并发两份草稿（含 ref 闸回填、3s 轮询不 clobber 编辑中值）仍在父级；
 //   * 3s 轮询（status + 设备花名册）只有父级那一个，本组件不建第二个定时器；
@@ -47,12 +47,12 @@ export function HeadlessSettingsSection({
   const headlessEnabled = status?.headlessEnabled ?? true;
   // #172/T8 兼容发送（实验）两个数据源（同源 remote_status）：
   // - compatSendEnabled：开关真值（缺键 = 新默认开，显式 false 保留）；
-  // - compatSendEligible：前置判据（该 build 读链已取证 = 可从关切到开；
-  //   false → 未取证提示照常显示，资格不从偏好默认继承）。
+  // - compatSendEligible：前置判据（该 build 读链已取证 = 可从关切到开；缺键 = 未取证，
+  //   资格不从偏好默认继承）。它只阻断「关→开」；开关已开时资格不参与显示。
   const compatSendEnabled = status?.compatSendEnabled ?? true;
   const compatSendEligible = status?.compatSendEligible ?? false;
   // A2 修正（A1 遗留文案）：开关已开着时不再宣称「需先完成只读探测」——探测只是
-  // 「从关切到开」这一方向的前置；资格判定本身不变（data-group 供顺序锁定位）。
+  // 「从关切到开」这一方向的前置；资格判定本身不变（关 + 未取证 → 提示 + 置灰）。
   const showProbeHint = !compatSendEnabled && !compatSendEligible;
 
   return (
@@ -130,7 +130,7 @@ export function HeadlessSettingsSection({
       {/* #172/T8 兼容发送（实验）：缺键默认开、显式关闭保留；**从关切到开
           仍要求读探测通过**——未取证且当前为关时提示先做只读探测（后端开启时同样拒：
           同一判据）。资格字段独立，不随偏好默认值变化。已验证的 Codex
-          桌面版本不受此开关影响（它的发送行为逐字不变）。 */}
+          桌面版本不受此开关影响（它的发送行为逐字不变）。分组锚供六段顺序锁定位。 */}
       <div data-group="compat" className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
         {t("settings.remote.groupCompatSend")}
       </div>

@@ -1948,6 +1948,27 @@ describe("RemoteSection 投递偏好默认值（A1 §7.1）", () => {
     expect(compat).toBeEnabled();
   });
 
+  it("资格字段缺键不当成已取证：compatSendEnabled=false + 缺 compatSendEligible → 置灰 + 探测提示", async () => {
+    // 上一条用例里 compatSendEnabled=true 时「缺键」与「取证通过」观测上相同，锁不住
+    // compatSendEligible 的默认值。这里让开关处于「关」态、资格字段缺键：兜底必须是
+    // false（未取证）——若回归成 `compatSendEligible ?? true`，开关会变成可操作且
+    // 探测提示消失，与本用例断言相反。
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status") return statusOf({ compatSendEnabled: false });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /enable remote access/i })).toBeEnabled()
+    );
+    const compat = switchOf(/compatibility send/i);
+    expect(compat).not.toBeChecked();
+    expect(compat).toBeDisabled();
+    expect(screen.getByText(/read-only probe must complete first/i)).toBeTruthy();
+  });
+
   it("资格字段独立决定可开启性：未取证 + 显式关闭 → 不可开启；取证后 → 可开启", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "remote_status")
@@ -2046,7 +2067,7 @@ describe("RemoteSection i18n zh/en 无缺键（M5 A6）", () => {
     // 源码扫描：两个消费方引用的键必须双 locale 存在
     const sources = [
       path.join(root, "src/components/settings/RemoteSection.tsx"),
-      // A2：⑤⑥ 段抽出后，无头/兼容发送的键改由子组件引用——扫描面必须跟上，
+      // A2：⑤ 段（含兼容发送）抽出后，无头/兼容发送的键改由子组件引用——扫描面必须跟上，
       // 否则抽出的子组件成了 i18n 守卫的盲区
       path.join(root, "src/components/settings/HeadlessSettingsSection.tsx"),
       path.join(root, "src/hooks/useRemoteEvents.ts"),

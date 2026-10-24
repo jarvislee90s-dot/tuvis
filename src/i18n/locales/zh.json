@@ -506,7 +506,7 @@
       "compatSendTitle": "兼容发送（实验）",
       "compatSendHint": "默认开启；仅对未验证的 Codex 桌面版本生效；消息可能被投递到错误会话，风险自负。",
       "compatSendNeedsProbe": "需先完成只读探测（该 Codex 桌面版本的读链尚未取证）",
-      "groupCompatSend": "⑥ 兼容发送（仅未验证的 Codex 桌面版本）",
+      "groupCompatSend": "兼容发送（仅未验证的 Codex 桌面版本）",
       "groupTools": "④ 工具特殊配置"
     },
     "audit": {
