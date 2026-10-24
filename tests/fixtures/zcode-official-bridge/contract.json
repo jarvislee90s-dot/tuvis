@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedBy": "B1（2026-10-24，source+fake 阶段；同日实连半场收官：auth.status 定案 proven，追加 live 证据）。2026-10-24 B2 准备阶段追加 operations 两条 live 已验只读操作（bootstrap-request / workspace-list-request）；send 能力维持 false 直到 B2 实发取证成立",
+  "generatedBy": "B1（2026-10-24，source+fake 阶段；同日实连半场收官：auth.status 定案 proven，追加 live 证据）。2026-10-24 B2 准备阶段追加 operations 两条 live 已验只读操作（bootstrap-request / workspace-list-request）。2026-10-24 B2 实连收官：send 能力定案前移 true（run macos-B220261024T132316Z-prItvw 受理 accepted + 用户可见性确认，见 operations sendConversationCommandV4 行）；其余能力维持 false 待各自批次",
   "evidenceRule": "本文件只收录已取证结论：source = 固定官方源码 zai-org/ZCode @ 3c5b227649371507ddc4eb46ac5133afe6db1cab 的客户端侧实现（行号引用）；fake = tests/remote/zcodeBridgeRelay.test.ts 的 in-test fake relay 锁形；live = 2026-10-24 B1 实连半场的脱敏私有证据（~/Documents/tuvis-verify-logs/zcode/<run_id>/，仓库内只引用 run id，真实值经 SecretRedactor fail-closed 闸从不入仓库/日志/夹具）。官方云 relay 服务端不在该仓库，服务端内部语义一律不得在本文件出现；未取证项不得以 TBD 或伪造 endpoint 占位。",
   "identity": {
     "platform": "macOS 27.0.1 arm64（B0 run_id macos-B20261024T142609+0800-k0zat1）",
@@ -98,13 +98,13 @@
     ]
   },
   "capabilities": {
-    "send": false,
+    "send": true,
     "approval": false,
     "userInput": false,
     "interrupt": false,
     "model": false,
     "thoughtLevel": false,
-    "reason": "B1 已完成只读实连（live：账号 OAuth、terminal token、单连接握手 paired、两个白名单只读查询，run macos-B120261024T105940Z-NarmSw），但 send/approval/userInput/interrupt/model/thoughtLevel 从未发出任何真实写帧；协议面入口（server-operations/interaction-broker）仍未经真实脱敏帧验证。按计划：未取得各自真实帧证据一律 false，B2 起逐项取证。"
+    "reason": "send：2026-10-24 B2 实连收官前移 true——run macos-B220261024T132316Z-prItvw（oauth PROVEN → paired → mapping MAPPED 119 行 → Travel/hi 指称精确唯一解析 → bridge ready → Initialize ok → sendConversationCommandV4 受理 accepted，framesSent=1、peerAck=true、干净 close、无重发）+ 用户确认 marker 以用户消息形态落在指定会话（§4.1 别名 hi）且 agent 已处理回复（user-testimony，时间戳与 transcript issuedUtc 一致）。approval/userInput/interrupt/model/thoughtLevel：从未发出任何真实写帧，维持 false——逐批授权制，B3/B4 起各自取证后才能前移。"
   },
   "operations": [
     {
@@ -122,6 +122,16 @@
       "source": "packages/web/src/web-remote-control/app/main.tsx:1572-1591（请求）；packages/shared/src/web-remote-control.ts:418-428,628-635,672-676（形状）",
       "live": "run macos-B120261024T105940Z-NarmSw（reads workspaceList=ok）",
       "class": "source + live"
+    },
+    {
+      "method": "sendConversationCommandV4",
+      "kind": "write",
+      "claim": "paired 且目标 workspace bridge 就绪（workspace-bridge-open{requestId, bridgeSessionId, workspaceKey, taskId} → ready 回显 → 桥 Initialize(200) 门 → helloConversationV4 → initializeConversationV4(clientHello)）后，终端可在 channel \"zcode-agent\" 上发 sendConversationCommandV4{workspacePath, workspaceIdentity?, envelope}；envelope = {commandId, clientId, sessionId, type:\"sendText\", payload:{text}, issuedAt}（sendText 只必带 text，模型/思考强度/模式缺省 = 沿用会话现值；不在 COMMANDS_REQUIRING_BASE_REVISION → 免 baseRevision）。B2 实连受理 accepted：恰一个 rpc-frame（CRC32 单分片）、peerAck=true；用户确认合成 marker 以用户消息形态落在指定会话且 agent 已处理回复",
+      "source": "packages/services/src/zcode-agent/zcodeAgent.ts:937,498-505（方法与 args）；packages/shared/src/channels.ts:114（Channel \"zcode-agent\"）；packages/shared/src/zcode-protocol-v4/command.ts:343-356,95-135,315-331（envelope / sendText payload / 免 baseRevision）；packages/shared/src/web-remote-control.ts:435-447,449-456（workspace-bridge-open / ready）；packages/ui/src/v4/agentV4ConnectionHandshake.ts:30-46 + packages/shared/src/zcode-protocol-v4/transport.ts:42-65,69-92（hello/clientHello 握手）；packages/shared/src/zcode-protocol-v4/controller.ts + packages/ui/src/v4/agentConversationTransport.ts:207-214,354-372 + packages/services/src/zcode-agent/zcodeAgent.ts:400-405（listing/订阅参数面）；packages/rpc/src/channelClient.ts:182-190 + packages/rpc/src/serialization.ts:169-175 + packages/rpc/src/channels.shared.ts:13-23 + packages/shared/src/web-remote-control-rpc-transport.ts:60-107,133-143（rpc-frame 承载）；channelServer.ts:29-36,45-47 + channelClient.ts:124-128（Initialize 门）——行号全部沿用决策文件 §7.2/§7.9，未改写",
+      "live": "run macos-B220261024T132316Z-prItvw（mapping MAPPED 119 行 → send ACCEPTED：framesSent=1、peerAck=true、commandId 已落私有 transcript；marker [tuvis-b2-marker:2026-10-24T13:26:59.709Z] 为合成值，只含 UTC 时间戳）",
+      "terminalEvidence": "私有脱敏证据 run macos-B220261024T132316Z-prItvw（live-sanitized）+ 用户直接陈述（user-testimony）：marker 以用户消息形态出现在指定会话（§4.1 别名 hi，workspace 别名 Travel）中，agent 正常处理并回复（turn 约 31s，回复明确识别其为测试 marker；截图由用户持有，不入仓库）；精确归属 = 单帧单 run，marker 只落在指定会话，无任何其他会话收到写向",
+      "unknownRule": "受理（rpc-frame-ack）但窗口内无应答/无结果 → 结果只记 unknown，绝不重发（结构性无重发计时器）：实现于 scripts/zcode-bridge-probe/sessionBridge.ts SendOnceLoop；fake 锁形 = tests/remote/zcodeBridgeSession.test.ts unknown_not_resent 用例；本轮未触发（受理即终态 accepted）",
+      "class": "source + live + user-testimony + fake"
     }
   ]
 }

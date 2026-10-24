@@ -631,3 +631,49 @@ peerAckedFrames=0、bridge-messages 出现 6 字节"乱码"帧）对照钉源复
    （manager.ts:1000-1054 只要求目标 workspace 在当前桌面窗口里）；activeWorkspaceKey
    只是手机页初始选区导航默认（web-remote-control.ts:758-783）→ 重跑无需把 APP 切到
    Travel 前台；拒绝情形以 `bridge-open-refused` verdict + 脱敏 reason/error 落证。
+
+## 7.10 B2 发送闭环定案（2026-10-24 收官追加；不改写上文）
+
+> 本节登记 B2 实连半场收官判定与合同落点。证据级别沿用 §6.9 口径：**live-sanitized**
+> = 实连脱敏私有证据；**user-testimony** = 用户直接陈述；**source** = 固定 SHA 行号；
+> **fake** = tests/remote/zcodeBridgeSession.test.ts 锁形。私有证据目录
+> `~/Documents/tuvis-verify-logs/zcode/macos-B220261024T132316Z-prItvw/`（0700/0600，
+> 不入仓库；本节只引用 run id 与 §4.1 别名，无任何真实值）。
+
+六项事实（逐条挂证据级别）：
+
+1. **实连 run 主链**【live-sanitized】：`macos-B220261024T132316Z-prItvw`——oauth
+   PROVEN → connect PAIRED → mapping MAPPED（bootstrap / workspace-list ok，
+   workspace 条目 28 原始去重为 14；主动任务枚举 snapshot×1 + deltas×19 = 119 行）→
+   目标锁定（指称 Travel / hi 按 §7.3 阶梯精确唯一解析出真实 id，证据只见别名）→
+   workspace-bridge-ready → 桥 Initialize ok → `sendConversationCommandV4` 受理
+   outcome=**accepted**、framesSent=1、peerAck=true → 探针主动 close 收尾。全程恰一个
+   会话发送帧、无重发（unknownRule 未触发——本轮受理即终态，见第 4 条合同落点）。
+2. **marker 落点与用户可见性**【user-testimony】：用户确认
+   `[tuvis-b2-marker:2026-10-24T13:26:59.709Z]`（与 transcript 的 issuedUtc 一致）以
+   **用户消息**形态出现在指定测试会话（§4.1 别名 `hi`）中，agent 正常处理该消息并回复
+   （turn 约 31 秒；回复明确识别其为测试 marker）。截图证据由用户本人持有，不入仓库。
+   「只读 DB 最终可见性」不再作为本批次的强制追加项：用户在 APP 侧的直接可见性已覆盖
+   §7.5 登记的核对面主体。
+3. **精确归属**【live-sanitized + user-testimony】：marker 只落在指定会话；单帧单 run，
+   无任何其他会话收到写向（transcript 发送帧计数恒 1；用户侧未见串投）——§7.7 的
+   「envelope.sessionId ≡ listing address.taskId 同命名空间」显式核验项由该落点成立。
+4. **能力前移**：`contract.capabilities.send = true`。第 1/2/3 条为 live/user 级证据，
+   wire 形状基础 = §7.2 的 source 行号（未改写）；operations 追加
+   sendConversationCommandV4 行（kind=write），含 unknownRule（受理但无结果 → unknown、
+   绝不重发——实现于 SendOnceLoop、fake 锁形 `unknown_not_resent` 用例）。其余能力
+   （approval / userInput / interrupt / model / thoughtLevel）维持 false，等各自批次
+   授权后取证，本节不解锁。
+5. **stdout 泄漏缺口（本轮发现并修复）**：收官 run 的「目标已锁定」一行把**真实**
+   taskId/workspaceKey 打上了 stdout——证据文件经 SecretRedactor fail-closed 落盘闸，
+   但 stdout 不在其内（别名制只护了文件面）。修复 = 该行改经
+   `formatTargetLockedLine`（session-probe.ts）先登记取别名再拼行、故障围栏行的原始
+   message 同样过 sanitizeText，人类可读 verdict 措辞不变；fake 断言追加锁定「真实值
+   不上 stdout、别名与 mapping 阶段登记稳定复用」。已落仓库的收官 run 证据文件本身
+   经查无泄漏（fail-closed 闸有效），缺口只在 stdout 控制台面。
+6. **B2 范围内遗留（评审 deferred minors，如实登记）**：①`wrong_target_rejected` 用例
+   对 SendOnceLoop 分支的断言为 spy 同义反复（该分支实际由 mapper/gate 前置拦截，
+   测试面只锁「唯一入口是 mapper 解析产物」的纪律）；②`isTurnActivity` 判定宽松
+   （`rawJson.includes(taskId)` 子串判据，可能与无关帧误配）；③`summarizePayload` 把
+   app payload 原样嵌入证据结构（依赖 writeEvidence 前 sanitizeDeep 兜底，可再走
+   redactPayload 加固）。三项不影响本节判定，留后续批次跟进。

@@ -811,6 +811,22 @@ function record(ctx: RunContext, step: string, message: string, data?: unknown):
   });
 }
 
+/**
+ * 目标锁定行的 stdout 文案（2026-10-24 收官修复）：此前该行把**真实** taskId /
+ * workspaceKey 直接打上 stdout——证据文件经 SecretRedactor fail-closed 脱敏，但
+ * stdout 不在落盘闸内（run macos-B220261024T132316Z-prItvw 即漏）。修复 = 真实值
+ * 一律先经 redactor 登记取别名再拼行（mapping 阶段已登记过同一值 → 复用同一别名）；
+ * 人类可读的 verdict 措辞保持不变。
+ */
+export function formatTargetLockedLine(
+  redactor: SecretRedactor,
+  target: { taskId: string; workspaceKey: string; generation: number }
+): string {
+  const taskIdAlias = redactor.register("sid", target.taskId) ?? "<unregistered>";
+  const workspaceAlias = redactor.register("path", target.workspaceKey) ?? "<unregistered>";
+  return `目标已锁定（别名）：taskId=${taskIdAlias} workspace=${workspaceAlias}（generation ${target.generation}）。`;
+}
+
 export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
   const parsed = parseFlags(argv);
   if (typeof parsed === "string") {
@@ -1561,9 +1577,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         listingSizes: { workspaces: workspaces.length, tasks: tasks.length },
         note: "指称只在 designate 步用于唯一化定位；发送归因用精确 id（resolveTarget 产物）",
       });
-      log(
-        `目标已锁定（别名）：taskId=${bound.taskId} workspace=${bound.workspaceKey}（generation ${bound.generation}）。`
-      );
+      log(formatTargetLockedLine(redactor, bound));
 
       // —— s7：send（缺 --send-authorized 只打印 WOULD-send） ————————————————
       stage = "send";
@@ -1951,7 +1965,10 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
       stage,
       message: redactor.sanitizeText(message),
     });
-    log(`探针故障（${stage} 阶段未处理异常）：${message}；清理连接并照常落证。`);
+    // stdout 同样只出别名（与证据同口径）：异常 message 可能内嵌真实路径/会话 id。
+    log(
+      `探针故障（${stage} 阶段未处理异常）：${redactor.sanitizeText(message)}；清理连接并照常落证。`
+    );
     cleanupLive();
     // 在飞阶段尚无终局 verdict → 记 STOPPED:fault-<阶段>；已定案的 verdict 不改写
     // （故障细节在 transcript 的 fault 事件条目里）。
