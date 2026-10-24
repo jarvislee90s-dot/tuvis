@@ -15,7 +15,49 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ## [Unreleased]
 
+### Added
+
+- **ZCode official remote link configuration with per-state phone hints**: the remote
+  settings gained a "④ Tool-specific configuration" section whose first release is a
+  single collapsed ZCode card — it stores the official remote-control link produced by
+  the ZCode app's "mobile remote control" on this machine (strict format checks: only
+  https on the official host with a versioned /remote/vN path and a non-empty sid;
+  errors are shown in place, malformed values are never distributed, and the full link
+  never enters logs); paired phones read the same value through a read-only endpoint.
+  The card's "Saved · connection pending" state only means the link passed format
+  checks — **saved ≠ connected**. On the phone, a ZCode session's board, messages and
+  files keep working; the composer explains the link state in place (not configured /
+  needs updating / connection pending), keeps the draft, and never fakes a send.
+- **ZCode session read recovery**: main session IDs written by newer ZCode builds
+  (`session_` + 32 hex chars) used to be rejected wholesale by the read gate; they are
+  now accepted alongside the legacy shape (`sess_` + UUID) — original IDs are preserved
+  verbatim, never rewritten or merged; all other read gates (interactive, 24h window,
+  caps) are unchanged. ZCode attachment reference numbers are now aligned with the
+  final rendered message sequence (numbered after multi-part expansion and tail
+  trimming), so "jump to latest reference" no longer lands off-target; file-only
+  messages keep their files and honestly carry no message sequence number.
+
 ### Changed
+
+- **Headless injection and compatibility send default to on (upgrade note)**:
+  `remote.headless_enabled` and `remote.compat_send_enabled` now resolve to **on** when
+  the settings hold no choice of yours (key absent — fresh installs or upgrades without
+  a stored value); users who explicitly turned a switch **off keep it off**, and invalid
+  values (e.g. empty) still resolve to off — never guessed into on. No table-wide
+  migration and no fabricated toggle audit; the existing timeout (600000 ms), concurrency
+  cap (2) and the compatibility-send guards (read-chain verification / build / device /
+  pending queue) are unchanged.
+- **Remote settings page rearranged into a fixed six-section order**: ① General →
+  ② Channels → ③ Access & security (including the device list) → ④ Tool-specific
+  configuration → ⑤ Headless injection (with compatibility send) → Injection audit;
+  the headless and compatibility-send controls were extracted into their own sub-section,
+  and the compatibility-send probe hint now only appears while the switch is off.
+- **Access PIN masked by default**: the 4-digit PIN box in settings starts masked, with
+  an eye button toggling reveal / mask; leaving the block, switching settings blocks, or
+  the window losing focus restores the mask automatically — display only; the PIN value,
+  storage and pairing are unaffected.
+
+### Fixed
 
 - **Default README switched to English**: `README.md` is now the English version
   (content moved in from `README.en.md`); the Chinese source-of-truth moved to
@@ -49,6 +91,12 @@ _Only versions translated so far are listed here; the full history lives in the
   through a no-proxy client pinning DoH-resolved addresses for github.com and both
   release asset hosts. Errors are flattened through the full source chain, so the
   failure toast shows the actual cause.
+
+### Engineering
+
+- Gate cleanup for the A package: one closure in `tests/zcode_config_remote.rs` replaced
+  with a function reference (new clippy `redundant_closure` warning; test-only, no
+  behavior change).
 
 ## [0.6.2] - Unreleased
 

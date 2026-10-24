@@ -33,6 +33,8 @@ A row of chips above the cards: "All" on the far left, then seven tools (Claude 
 
 > 💡 Chip icons and labels share one source with the card badges — recognize a face once and find it everywhere.
 
+> 💡 Newer and older ZCode builds write different session ID shapes; Tuvis accepts both and puts the cards up as-is (IDs are kept verbatim, no manual migration needed). ZCode sessions that previously never appeared because of the new ID shape are back on the board.
+
 ## Click a card: jump to the terminal
 
 1. Click a session card and Tuvis brings the matching terminal window to the foreground;

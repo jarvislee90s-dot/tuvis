@@ -48,6 +48,45 @@ How to connect: confirm "Enable Remote Access" is on → enable the channel you 
 
 ![Settings → Remote Access (channels / access password / devices)](../img/remote-settings.png)
 
+## The remote settings page: six-section order, PIN masking, and tool configuration
+
+The remote block under **Settings → Remote Access** is laid out in a fixed six-section order that survives upgrades:
+
+1. **① General** — the existing items such as the remote master switch;
+2. **② Channels** — the four channel cards (independent switches, can run together);
+3. **③ Access & security** — the 4-digit access PIN, device reset, and the paired-device list (the device list always lives in this section);
+4. **④ Tool-specific configuration** — collapsible per-tool cards; the first release ships a single ZCode card (see below);
+5. **⑤ Headless injection** — the headless switch, timeout and concurrency caps, and compatibility send (experimental);
+6. **Injection audit** — always last in this block.
+
+### Access PIN: masked by default + eye button
+
+The 4-digit PIN box under **③ Access & security** **starts masked**; tap the eye button next to the box to reveal it, tap again to mask it. Leaving the block and coming back, switching settings blocks, or the window losing focus all restore the mask automatically — well suited to screenshots and screen sharing. The eye changes **display only**: the PIN value, digit filtering, random generation, saving, and device pairing are all unaffected.
+
+### Headless injection and compatibility send: on by default (upgrade note)
+
+The **headless injection** and **compatibility send (experimental)** switches under **⑤ Headless injection** now **default to on**:
+
+| What you did before                                   | State after upgrading / on a fresh install    |
+| ----------------------------------------------------- | --------------------------------------------- |
+| Never touched either switch (no choice stored)        | **On** (the new default)                      |
+| Explicitly turned a switch **off**                    | **Stays off** — Tuvis never overrides your explicit choice |
+| The stored value is invalid (e.g. empty)              | Treated as **off** — never guessed into "on"  |
+
+The new default only changes what counts when no choice of yours is stored: there is no table-wide migration and no fabricated toggle audit; saving still writes an explicit on/off. Defaulting to on loosens nothing — compatibility send still applies **only to Codex desktop builds whose write capability is unverified**, and the existing guards (read-chain verification, build / device / pending-queue) are all preserved; you can turn either switch off explicitly at any time.
+
+### ZCode official remote link (tool-specific configuration)
+
+Section **④ Tool-specific configuration** ships a single **ZCode remote link** card, collapsed by default; tap the card header to expand / collapse (no separate settings page):
+
+- **What it is for**: storing the official remote-control link produced by the ZCode app's "mobile remote control" on this computer; paired phones read the same value;
+- **How to get the link**: open the ZCode app on this computer → open mobile remote control → turn it on → copy the link shown on screen (or scan the on-screen QR code with your phone) → come back here, paste it into the box and save. Tuvis **never signs you in** and never opens or closes your ZCode; "Open the official page" is an explicit action for checking the link yourself — opening it does not change the card's status;
+- **Saved ≠ connected**: the card's states are only "Not configured / Saved · connection pending / Link needs updating" — "Saved" only means the link passed format checks and is stored; the official-side connection and identity confirmation are **still pending**. A saved link **never displays as "connected"**. A malformed link (not https, not the official host, broken link, …) is rejected in place with the reason, and an already-stored valid value is untouched;
+- **On the phone**: the ZCode session's board, messages and file previews keep working regardless of the link state; the composer explains the state in place ("Configure the ZCode remote link on your computer", "Connection pending — sending from here is not available yet (your draft is kept)", …) and never fakes a send;
+- The link is stored on this machine only and the full link never enters logs; deleting clears only this machine's copy, and the board and message / file reading keep working.
+
+> **Stated honestly (capability boundary)**: what this round ships for ZCode is **reading and configuration** — the board, messages, files, and the remote-link configuration all work; **unified control (sending / approvals / Q&A / interrupts / model switching from the phone) still awaits official authorization and the bridge (pending)**. It stays unavailable until then, and no fake "connected" state will ever be shown.
+
 ## Opening the board on your phone
 
 1. Open the given address in your phone's browser (**it must end in `/m`**); scanning the QR code is recommended — the link already contains the access password and scanning fills it in;
@@ -63,6 +102,7 @@ The screenshot above shows the site's interactive demo.
 - **See the cards**: traffic-light session cards for all eight tools; state changes push in about 2 seconds (banner + sound + vibration), degrading to 3-second polling if the stream drops;
 - **See the files**: the file panel aggregates session files with preview (markdown / code / images) and split-screen layouts; four sources — beyond "uploaded by me", "tool reads", and "tool reads & writes", there is "**Session artifacts**": generated files that appeared in the conversation as a link or backtick path and still exist on disk (reports, charts, data produced by scripts/commands; only previewable types like md / images / html / json make the list). Files the tool actually rewrote still show as "tool reads & writes". Artifacts with relative paths need the session working directory — **currently Codex sessions only** (sessions inside the Codex app and the other seven tools list absolute-path artifacts only); paths inside triple-backtick code blocks do not count as artifacts (`~~~` fences and indented blocks are not recognized yet);
 - **Codex APP message and file links**: recognized file paths in message bodies open the preview; uploaded/referenced images, generated images, and files changed or viewed also appear as structured artifacts with accurate source labels. A file entry can jump to its latest message reference by searching the current tail and at most four earlier pages (up to 50 messages per page); it does not keep loading beyond that range. If a path is overwritten, preview reads the current file on disk and does not retain historical versions.
+- **ZCode session discovery & reading**: newer and older ZCode builds write different session ID shapes; both are accepted and shown as-is (IDs are never rewritten), so no sessions are missed. File reference numbers in message bodies are aligned with the final rendered message order, so "jump to latest reference" no longer lands off-target (file-only messages keep their files and honestly carry no message sequence number).
 - **Stop the desktop turn** (Codex APP): while a desktop turn keeps running, the outgoing-queue panel offers "Stop the desktop turn & continue" — it interrupts the turn currently running in desktop Codex, and **work that turn has not finished is lost** (a confirmation says so first); once the turn stops, the messages waiting in the queue go out on their own. Available from macOS `26.1013.40934`; other Desktop builds are not verified yet and do not offer it.
 - **Approvals**: tool-call approvals (allow / deny) and plan confirmations (body synced, number shortcuts);
 - **Q&A**: single / multiple choice, free text (overwrite write-in / clear), multi-question flow and question switching;

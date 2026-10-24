@@ -77,7 +77,7 @@ fn state(conn: &SharedConn) -> Arc<RemoteState> {
         pin_source: Box::new(|| Some("1234".to_string())),
         now_source: Box::new(|| chrono::Utc::now().timestamp_millis()),
         via_hosts_source: Box::new(|| None),
-        rate_bucket_channels_source: Box::new(|| Vec::new()),
+        rate_bucket_channels_source: Box::new(Vec::new),
         home_source: Box::new(|| None),
         injector: Arc::new(multi_agents_manager_lib::inject::engine::RealInjector),
         resume_spawner: Arc::new(|_: &multi_agents_manager_lib::inject::resume::SpawnSpec| Ok(())),
