@@ -2064,7 +2064,18 @@
     "tswizDownloadDirInvalid": "安装包下载目录无效",
     "tswizDownloadDirFail": "创建下载目录失败——请检查目录权限或手动下载安装",
     "tswizInstallerCopyFail": "复制已有安装包失败——请检查下载目录权限",
-    "tswizInstallerSaveFail": "保存安装包失败——请检查下载目录权限或手动下载安装"
+    "tswizInstallerSaveFail": "保存安装包失败——请检查下载目录权限或手动下载安装",
+    "zcodeUrlInvalid": "远控链接格式无效，请粘贴 ZCode 应用内复制的完整链接",
+    "zcodeUrlScheme": "仅支持 https 官方链接",
+    "zcodeUrlHost": "仅支持 zcode.z.ai 官方主机",
+    "zcodeUrlPath": "官方链接路径需为 /remote/vN",
+    "zcodeUrlUserinfo": "链接不得包含用户名或密码",
+    "zcodeUrlPort": "仅支持默认 443 端口",
+    "zcodeUrlTooLong": "链接长度超过 4096 字节",
+    "zcodeUrlSidMissing": "链接缺少 sid 参数",
+    "zcodeUrlSidDuplicate": "链接中 sid 参数重复",
+    "zcodeUrlSidInvalid": "sid 不能为空且不得超过 128 字节",
+    "zcodeUrlParamDuplicate": "链接中身份参数重复"
   },
   "mobile": {
     "common": {

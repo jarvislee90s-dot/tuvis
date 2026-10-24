@@ -22,6 +22,8 @@ pub mod usage;
 pub mod usage_v2;
 // 升级检查（prerelease 渠道）：GitHub 发现层 + 动态端点安装 + 临时残留清理
 pub mod updater;
+// ZCode 统一远控的官方链接配置（A4）：桌面端读写命令，校验单点在 services::zcode_control
+pub mod zcode_remote;
 
 pub use screenshot::capture_window_screenshot;
 pub use session::get_all_sessions;

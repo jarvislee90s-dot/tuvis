@@ -2064,7 +2064,18 @@
     "tswizDownloadDirInvalid": "Invalid installer download directory",
     "tswizDownloadDirFail": "Could not create the downloads folder — check permissions or download and install manually",
     "tswizInstallerCopyFail": "Could not copy the existing installer — check downloads folder permissions",
-    "tswizInstallerSaveFail": "Could not save the installer — check permissions or download and install manually"
+    "tswizInstallerSaveFail": "Could not save the installer — check permissions or download and install manually",
+    "zcodeUrlInvalid": "Invalid remote-control link format — paste the full link copied from the ZCode app",
+    "zcodeUrlScheme": "Only official https links are supported",
+    "zcodeUrlHost": "Only the official zcode.z.ai host is supported",
+    "zcodeUrlPath": "The official link path must be /remote/vN",
+    "zcodeUrlUserinfo": "The link must not contain a username or password",
+    "zcodeUrlPort": "Only the default port 443 is supported",
+    "zcodeUrlTooLong": "The link exceeds 4096 bytes",
+    "zcodeUrlSidMissing": "The link is missing the sid parameter",
+    "zcodeUrlSidDuplicate": "The sid parameter appears more than once in the link",
+    "zcodeUrlSidInvalid": "sid must not be empty and must not exceed 128 bytes",
+    "zcodeUrlParamDuplicate": "An identity parameter appears more than once in the link"
   },
   "mobile": {
     "common": {

@@ -558,6 +558,39 @@ pub async fn device_language(
     }
 }
 
+/// GET /m/api/v1/official-control?agent_type=zcode（A4）：ZCode 官方远控链接配置。
+///
+/// - 缺参/空/首版不支持的其他工具 → 400（首版只有 ZCode 一种官方控制目标）；
+/// - 响应 = `ZcodeRemoteConfig` wire DTO `{configState, url}`；`configState=saved`
+///   **只表示格式已落库**，绝不表示已联机/已授权（设计 §4.3/§5.2）；
+/// - 只读：不回写、不读取官方账号、不发任何外部 HTTP（数据链留给 B 包适配器）；
+/// - `Cache-Control: no-store`：门禁下的私有配置，sessions 同规。
+pub async fn official_control(
+    State(st): State<Arc<RemoteState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, StatusCode> {
+    let Some(agent) = params
+        .get("agent_type")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    if !agent.eq_ignore_ascii_case("zcode") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // 只读 settings（DeviceStore 即全局 DB 连接缝；测试 = 内存库）。读取时复验格式，
+    // 坏值如实 Invalid + url null——不缓存、不探测官方服务。
+    let config = st
+        .store
+        .with(crate::services::zcode_control::get_config);
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(config),
+    )
+        .into_response())
+}
+
 /// GET /m/api/v1/ui-config（2026-10-05 UI 改版，spec §6.2）：远程端外观配置下发。
 /// 载荷 `{daySkin, nightSkin, font, radius, accent}`（camelCase，与 TS `UiConfig`
 /// 逐字段对应）。KV 未配置 / JSON 解析失败 / 非对象 → 回落默认值（纸感对 + 标准
