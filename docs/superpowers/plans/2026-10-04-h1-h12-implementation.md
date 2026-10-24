@@ -1,5 +1,7 @@
 # H1–H12 实施计划 · APP 类注入与无头通道（二期收尾第一部分）
 
+> **2026-10-24 本轮ZCode执行入口：** 采用[统一远控新总计划](2026-10-24-zcode-unified-remote-master-plan.md)。本文是多工具共享历史计划，本轮不执行旧ZCode CLI无头／新建移植和真实hi自动探针；旧H3默认关按用户新裁决更新为缺键默认开、显式false保留。其余工具及历史证据不删除。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 交付 spec H1–H12：四件前置修复（dsh 读侧诊断修复 / WB 发现双源 / TTY 靶向消歧 / 插队诚实化）+ 无头底座（开关/生命周期/回执/门控）+ zcode、codex APP、WorkBuddy、三家 CLI 的无头注入 + zcode 无头新建。

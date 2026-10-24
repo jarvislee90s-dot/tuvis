@@ -16,16 +16,18 @@ export type RemoteStatus = {
   // ——A6 本机名称输入框的默认值来源
   host?: { name: string; platform?: string; version?: string; bootId?: string };
   enabledTools?: string[];
-  /** H3 无头注入总开关（缺键 = 关；后端是唯一数据源） */
+  /** H3 无头注入总开关（缺键 = 开；显式 false 才是用户关闭；后端是唯一数据源） */
   headlessEnabled?: boolean;
   /** H4 watchdog 超时（毫秒；缺键 = 600000） */
   headlessTimeoutMs?: number;
   /** H4 全局并发上限（缺键 = 2） */
   headlessConcurrency?: number;
   /**
-   * #172/T8 兼容发送（实验）总开关（缺键 = 关；后端是唯一数据源）。
+   * #172/T8 兼容发送（实验）总开关（缺键 = 开；显式 false 才是用户关闭；
+   * 后端是唯一数据源）。
    * 只影响**写能力未取证**的 Codex 桌面 build：开关关 = 如实拒发
    * （capability_unverified），开关开 = 允许尝试发送（消息可能落到错误会话）。
+   * 偏好默认开不等于资格满足——`compatSendEligible` 仍独立判定能否开启。
    */
   compatSendEnabled?: boolean;
   /**
@@ -126,7 +128,8 @@ export async function remoteToggle(enabled: boolean): Promise<void> {
 export async function toggleChannel(channel: string, on: boolean): Promise<void> {
   return await invoke("remote_toggle_channel", { channel, on });
 }
-/** H3 无头注入总开关（默认关）：后端写 KV + 审计 + 广播 remote-changed。 */
+/** H3 无头注入总开关（缺键 = 开；显式 false 才是用户关闭）：后端写 KV + 审计 +
+ *  广播 remote-changed。A1 起默认开，缺键不再等同「用户关闭」。 */
 export async function toggleHeadless(enabled: boolean): Promise<void> {
   return await invoke("remote_toggle_headless", { enabled });
 }
@@ -135,9 +138,9 @@ export async function setHeadlessLimits(timeoutMs: number, concurrency: number):
   return await invoke("remote_set_headless_limits", { timeoutMs, concurrency });
 }
 /**
- * #172/T8 兼容发送（实验）总开关（默认关）：后端写 KV + 审计 + 广播 remote-changed。
- * 开启有前置：后端要求「该 build 的读链已取证」（只读探测通过），否则 Err
- * （前端同口径置灰 + 提示）。
+ * #172/T8 兼容发送（实验）总开关（缺键 = 开；显式 false 才是用户关闭）：后端写 KV +
+ * 审计 + 广播 remote-changed。偏好默认开不等于资格满足——开启（关→开方向）仍有前置：
+ * 后端要求「该 build 的读链已取证」（只读探测通过），否则 Err（前端同口径置灰 + 提示）。
  */
 export async function toggleCompatSend(enabled: boolean): Promise<void> {
   return await invoke("remote_toggle_compat_send", { enabled });

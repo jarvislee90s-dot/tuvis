@@ -52,17 +52,19 @@ pub const KEY_NAMED_ADDR_LAST: &str = "remote.named_addr_last";
 /// 访问密码键（M5 A2）：4 位数字（validate_pin 唯一口径；A3 端点 / A4 命令消费）
 pub const KEY_ACCESS_PIN: &str = "remote.access_pin";
 
-/// **无头注入总开关键（H3）**：默认关（缺键 = 关），显式开启才放行无头通道；
-/// 值口径与 KEY_ENABLED 同（写侧恒 "true"/"false" 显式两值，读侧只认 "true"）。
+/// **无头注入总开关键（H3）**：默认开（缺键 = 开；2026-10-24 用户裁决 §7.1），
+/// 只有显式 "false" 才保留用户关闭；空串/乱串等非法值仍判关。
+/// 值口径（写侧恒 "true"/"false" 显式两值，读侧只认 "true"）不随默认变化。
 /// 消费方：session-send / session-send-info 的 H3 门（`headless_enabled_conn`）、
 /// `remote_status.headlessEnabled` 下发、设置页「无头注入」开关。
 pub const KEY_HEADLESS: &str = "remote.headless_enabled";
 /// H3 关闭态文案：移动端输入区置灰的原因——send-info 的 reason 原样透出
 pub const HEADLESS_DISABLED_REASON: &str = "无头通道未开启，请在电脑端 Tuvis 设置中开启";
-/// **兼容发送开关（#172/T8；实验）**：默认关（缺键 = 关），显式开启才允许对
-/// **写能力未取证**的 Codex 桌面 build 尝试发送（消息可能被投递到错误会话，
-/// 风险自负）。值口径与 KEY_HEADLESS 同：写侧恒 "true"/"false" 显式两值，
-/// 读侧只认 "true"（不认第二真值）。
+/// **兼容发送开关（#172/T8；实验）**：默认开（缺键 = 开；2026-10-24 用户裁决
+/// §7.1），只有显式 "false" 才保留用户关闭；空串/乱串等非法值仍判关。偏好开只
+/// 放开「写能力未取证」这一档尝试发送（消息可能被投递到错误会话，风险自负），
+/// 不绕过 build/设备/pending/投递证据等既有守卫。值口径与 KEY_HEADLESS 同：
+/// 写侧恒 "true"/"false" 显式两值，读侧只认 "true"（不认第二真值）。
 /// 消费方：发送门（`remote::codex_ipc` 的兼容发送分支）、`remote_status.compatSendEnabled`
 /// 下发、设置页「兼容发送（实验）」开关。
 pub const KEY_COMPAT_SEND: &str = "remote.compat_send_enabled";
@@ -111,10 +113,11 @@ pub fn headless_concurrency_conn(conn: &rusqlite::Connection) -> usize {
     )
 }
 
-/// 无头开关解析（纯函数）：仅 `"true"` 为开——缺键（未设置 = 默认关）/
-/// `"false"` / 乱串一律判关（与 KEY_ENABLED 的 `v == "true"` 同口径，不认第二真值）
+/// 无头开关解析（纯函数）：**缺键 = 开**（新默认；未配置不是用户关闭）——
+/// 显式 `"true"` 为开，显式 `"false"` 保留用户关闭；空串/乱串等非法值仍判关
+/// （不认第二真值，也不猜成用户允许）。写侧仍恒写显式两值，不做全表迁移。
 pub fn headless_enabled_from(v: Option<&str>) -> bool {
-    v == Some("true")
+    matches!(v, None | Some("true"))
 }
 
 /// 无头开关读取（**store 缝版本**，两个 H3 门共用）：直用调用方 `DeviceStore.with`
@@ -127,7 +130,8 @@ pub fn headless_enabled_conn(conn: &rusqlite::Connection) -> bool {
 
 /// **无头状态下发装配（可测缝）**：从注入的连接读开关 + H4 两项配置并写入 status
 /// 载荷——键名与取值口径的唯一落点（H3：开关状态持久化 settings 表并随
-/// `remote_status` 下发；H4：watchdog 超时与并发上限同住，三件套控件同一数据源）。
+/// `remote_status` 下发，**缺键 = 新默认开**；H4：watchdog 超时与并发上限同住，
+/// 三件套控件同一数据源）。
 pub fn apply_headless_status(st: &mut serde_json::Value, conn: &rusqlite::Connection) {
     st["headlessEnabled"] = serde_json::json!(headless_enabled_conn(conn));
     // H4：缺键也上线默认值（前端三件套控件不出现 undefined）
@@ -153,17 +157,18 @@ fn toggle_headless_core(
     );
 }
 
-/// 无头注入总开关翻转（H3：默认关，显式开启；单一总开关，不做每工具分开关）。
+/// 无头注入总开关翻转（H3：缺键默认开，显式关闭保留；单一总开关，不做每工具分开关）。
 #[tauri::command]
 pub fn remote_toggle_headless(enabled: bool) -> Result<(), String> {
     pairing::DeviceStore::global().with(|c| toggle_headless_core(c, enabled, events::audit));
     Ok(())
 }
 
-/// 兼容发送开关解析（纯函数）：仅 `"true"` 为开——缺键（未设置 = 默认关）/
-/// `"false"` / 乱串一律判关（与 `headless_enabled_from` 同口径，不认第二真值）
+/// 兼容发送开关解析（纯函数）：**缺键 = 开**（新默认；未配置不是用户关闭）——
+/// 显式 `"true"` 为开，显式 `"false"` 保留用户关闭；空串/乱串等非法值仍判关
+/// （与 `headless_enabled_from` 同口径，不认第二真值，也不猜成用户允许）。
 pub fn compat_send_enabled_from(v: Option<&str>) -> bool {
-    v == Some("true")
+    matches!(v, None | Some("true"))
 }
 
 /// 兼容发送开关读取（**store 缝版本**）：直用调用方传入的 conn（锁内只做这一条
@@ -174,7 +179,8 @@ pub fn compat_send_enabled_conn(conn: &rusqlite::Connection) -> bool {
     )
 }
 
-/// 兼容发送放行判据（纯函数，#172/T8）：**开关开** ∧ **本 build 写能力未取证**。
+/// 兼容发送放行判据（纯函数，#172/T8）：**开关开**（缺键 = 新默认开）∧
+/// **本 build 写能力未取证**。
 ///
 /// 为什么已验证 build 恒 false：shipped 证据里的 build 行为**完全不变**——兼容开关
 /// 对它零影响（既不放开也不收紧），避免「同一台机器换个 build 语义就变了」。
@@ -183,12 +189,13 @@ pub fn compat_send_allowed(switch_on: bool, build_send_verified: bool) -> bool {
 }
 
 /// **兼容发送状态下发装配（可测缝）**：从注入的连接读开关 + 写入「读链是否已取证」
-/// 的前置判据——设置页「兼容发送（实验）」开关的唯一数据源（缺键 = 关）。
+/// 的前置判据——设置页「兼容发送（实验）」开关的唯一数据源（缺键 = 新默认开）。
 ///
 /// `compatSendEligible` = 该 build 的读链已取证（shipped 证据或只读探测通过）：
-/// false 时前端置灰并提示「需先完成只读探测」。**为什么带这个字段**：remote_status
-/// 原本没有任何 Codex 能力字段，前端没有判据就无法置灰；这里补一个**只读事实**
-/// （不改任何协议语义：send-info 的 reasonCode 契约原样不动）。
+/// false 时前端提示「需先完成只读探测」并禁止从关切到开（偏好本身可随时关闭）。
+/// **为什么带这个字段**：remote_status 原本没有任何 Codex 能力字段，前端没有判据
+/// 就无法表达资格；这里补一个**只读事实**（不改任何协议语义：send-info 的
+/// reasonCode 契约原样不动）。
 pub fn apply_compat_send_status(
     st: &mut serde_json::Value,
     conn: &rusqlite::Connection,
@@ -216,11 +223,12 @@ fn toggle_compat_send_core(
     );
 }
 
-/// 兼容发送（实验）开关翻转（#172/T8：默认关，显式开启才放行）。
+/// 兼容发送（实验）开关翻转（#172/T8；A1 起缺键默认开，显式关闭保留）。
 ///
-/// **前置门**：开启时要求「该 build 的读链已取证」（shipped 证据或只读探测通过）——
-/// 未取证时**拒绝并给出引导文案**（前端同口径置灰；后端是最终裁决，防绕过 UI 打开）。
-/// 关闭**永远允许**（用户随时能收回风险）。
+/// **前置门**：用户显式开启（例如关掉后重新打开）时要求「该 build 的读链已取证」
+/// （shipped 证据或只读探测通过）——未取证时**拒绝并给出引导文案**（前端同口径
+/// 置灰；后端是最终裁决，防绕过 UI 打开）。关闭**永远允许**（用户随时能收回风险）。
+/// 缺键默认开不写审计、不伪造用户操作——启动不迁移、不补 toggle 事件。
 #[tauri::command]
 pub fn remote_toggle_compat_send(enabled: bool) -> Result<(), String> {
     let store = pairing::DeviceStore::global();
@@ -1277,11 +1285,12 @@ pub fn remote_status() -> serde_json::Value {
     // 设备上限（线稿「已接入设备 N / 上限」徽标；KV 可改，未设置默认 10——决策 #17）
     st["maxDevices"] = serde_json::json!(max_devices_from_kv());
     // H3/H4：无头注入总开关 + watchdog 超时 + 并发上限（设置页初值 + 移动端置灰判据；
-    // 缺键 = 默认关 / 600000ms / 2）。经可测缝 apply_headless_status（与门同一条读取路径）
+    // A1 起缺键 = 默认开 / 600000ms / 2）。经可测缝 apply_headless_status
+    //（与门同一条读取路径）
     pairing::DeviceStore::global().with(|c| apply_headless_status(&mut st, c));
     // #172/T8：兼容发送（实验）开关 + 「读链已取证」前置判据（设置页置灰的唯一数据源；
-    // 缺键 = 默认关）。判定走**只读**路径（账本 + endpoint 解析），不装配控制面、
-    // 不跑 schema 探针——设置页读一次状态不该有副作用。
+    // A1 起缺键 = 默认开；资格字段仍独立为 false）。判定走**只读**路径（账本 +
+    // endpoint 解析），不装配控制面、不跑 schema 探针——设置页读一次状态不该有副作用。
     {
         let store = pairing::DeviceStore::global();
         let eligible = codex_ipc::read_chain_verified(&store);
@@ -2215,12 +2224,65 @@ mod tests {
         assert_eq!(DEFAULT_PORT, 9420);
     }
 
-    /// #172/T8：兼容发送开关的取值口径（缺键 = 关；只认 "true"）+ 放行判据
+    /// A1（2026-10-24 用户裁决 §7.1）：两个投递偏好「缺键 = 开」——只改缺键默认，
+    /// 显式 true/false 与非法值的旧口径不动；两个设置键互相独立，不得彼此替代。
+    #[test]
+    fn default_flags_preserve_user_choice() {
+        for (name, f) in [
+            (
+                "headless",
+                headless_enabled_from as fn(Option<&str>) -> bool,
+            ),
+            (
+                "compat_send",
+                compat_send_enabled_from as fn(Option<&str>) -> bool,
+            ),
+        ] {
+            assert!(f(None), "{name}: 缺键 = 新默认开（未配置不是用户关闭）");
+            assert!(f(Some("true")), "{name}: 显式 true 仍是开");
+            assert!(!f(Some("false")), "{name}: 显式 false 保留用户关闭");
+            // 非法值一律保守判关：不猜成用户允许（空串 / 数字 / 大写变体）
+            assert!(!f(Some("")), "{name}: 空串是非法值");
+            assert!(!f(Some("1")), "{name}: 不认第二真值");
+            assert!(!f(Some("TRUE")), "{name}: 大小写变体不收");
+        }
+
+        // 同一个内存库：两键各自读取，缺键各取默认；写其中一个不影响另一个。
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::database::schema::init(&conn);
+        crate::database::migration::migrate(&conn).unwrap();
+        assert!(headless_enabled_conn(&conn), "两键均缺 → 各取默认开");
+        assert!(compat_send_enabled_conn(&conn), "两键均缺 → 各取默认开");
+        // 缺键读取只是解释默认值，不迁移、不补写、不伪造用户操作。
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key IN (?1, ?2)",
+                rusqlite::params![KEY_HEADLESS, KEY_COMPAT_SEND],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "缺键不得被补写成显式设置");
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "false");
+        assert!(!headless_enabled_conn(&conn));
+        assert!(
+            compat_send_enabled_conn(&conn),
+            "显式关闭 H3 不得连带关闭兼容发送"
+        );
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_COMPAT_SEND, "false");
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_HEADLESS, "true");
+        assert!(headless_enabled_conn(&conn));
+        assert!(
+            !compat_send_enabled_conn(&conn),
+            "显式关闭兼容发送不得被 H3 的开覆盖"
+        );
+    }
+
+    /// #172/T8：兼容发送开关的取值口径（缺键 = 开；只认 "true"）+ 放行判据
     /// （开关开 ∧ 写能力未取证；已验证 build 恒不受益）。
     #[test]
     fn compat_send_switch_and_gate_semantics() {
-        // 缺键 / "false" / 乱串 → 一律关（与 headless 同口径，不认第二真值）
-        assert!(!compat_send_enabled_from(None));
+        // 缺键 = 新默认开；"false" / 乱串 → 一律关（不认第二真值）
+        assert!(compat_send_enabled_from(None));
         assert!(!compat_send_enabled_from(Some("false")));
         assert!(!compat_send_enabled_from(Some("1")));
         assert!(!compat_send_enabled_from(Some("TRUE")));
@@ -2233,16 +2295,21 @@ mod tests {
         assert!(!compat_send_allowed(true, true));
     }
 
-    /// #172/T8：兼容发送状态装配（设置页的唯一数据源）——缺键 = 关；前置判据原样下发。
+    /// #172/T8：兼容发送状态装配（设置页的唯一数据源）——A1 起缺键 = 默认开；
+    /// 显式 false 保留；前置判据原样下发（不随开关默认值变化）。
     #[test]
     fn compat_send_status_payload_shape() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::database::schema::init(&conn);
         let mut st = serde_json::json!({});
         apply_compat_send_status(&mut st, &conn, false);
-        assert_eq!(st["compatSendEnabled"], serde_json::json!(false));
+        assert_eq!(st["compatSendEnabled"], serde_json::json!(true));
         assert_eq!(st["compatSendEligible"], serde_json::json!(false));
-        // 写侧恒写显式两值；读侧只认 "true"
+        // 写侧恒写显式两值；显式 false 不被缺键默认覆盖
+        crate::database::dao::settings::set_setting_conn(&conn, KEY_COMPAT_SEND, "false");
+        let mut st = serde_json::json!({});
+        apply_compat_send_status(&mut st, &conn, false);
+        assert_eq!(st["compatSendEnabled"], serde_json::json!(false));
         crate::database::dao::settings::set_setting_conn(&conn, KEY_COMPAT_SEND, "true");
         let mut st = serde_json::json!({});
         apply_compat_send_status(&mut st, &conn, true);

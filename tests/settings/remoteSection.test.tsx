@@ -9,6 +9,7 @@
 // 踢下线 / N / 10 上限徽标 / 本机名称默认系统名 / i18n zh-en 无缺键。
 // mock 模式沿用本文件旧版（vi.hoisted + vi.mock，自带 invoke/event/sonner/qrcode）。
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -1452,6 +1453,145 @@ describe("RemoteSection 访问密码（M5 A6）", () => {
   });
 });
 
+// A3（2026-10-24 设计 §7.2）：访问密码眼睛按钮。可见性只是页内呈现状态——
+// 不落库、不写日志、不改 PIN、不触发重配对；本组用合成 PIN 1234 断言「值始终不变」。
+describe("RemoteSection PIN 可见性遮罩（A3 设计 §7.2）", () => {
+  const pinInput = () => screen.getByLabelText("Access PIN") as HTMLInputElement;
+  const pinCommandCalls = (cmd: string) =>
+    invokeMock.mock.calls.filter(([called]) => called === cmd).length;
+
+  // 设置块宿主：复刻 SettingsPage 的 visibleIds 条件装配（离开块 = 卸载，返回 = 重挂载）
+  function BlockHost({ show }: { show: boolean }) {
+    return show ? <RemoteSection /> : <div data-testid="other-block" />;
+  }
+
+  const stubPinStatus = () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status") return statusOf({ pin: "1234" });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+  };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("pin_visibility_is_presentation_only", async () => {
+    stubPinStatus();
+    render(<RemoteSection />);
+    await waitFor(() => expect(pinInput().value).toBe("1234"));
+
+    // 初始 = 密码掩码；眼睛是普通按钮（type=button，不提交表单）
+    expect(pinInput().type).toBe("password");
+    const show = screen.getByRole("button", { name: "Show password" }) as HTMLButtonElement;
+    expect(show.type).toBe("button");
+    expect(show).toHaveAttribute("aria-pressed", "false");
+
+    // 点击显示 → text；底层值原样 1234，aria 状态与文案翻转
+    fireEvent.click(show);
+    expect(pinInput().type).toBe("text");
+    expect(pinInput().value).toBe("1234");
+    const hide = screen.getByRole("button", { name: "Hide password" });
+    expect(hide).toHaveAttribute("aria-pressed", "true");
+
+    // 再点击 → 回到密码掩码；值仍不变
+    fireEvent.click(hide);
+    expect(pinInput().type).toBe("password");
+    expect(pinInput().value).toBe("1234");
+    expect(screen.getByRole("button", { name: "Show password" })).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
+
+    // 纯呈现：切换不保存 PIN、不重置设备（零后端副作用）
+    expect(pinCommandCalls("remote_set_pin")).toBe(0);
+    expect(pinCommandCalls("remote_reset_devices")).toBe(0);
+
+    // PIN 值不得复制进 title 或其它可见文案（只允许存在于输入框 value 本身）
+    expect(document.querySelector('[title*="1234"]')).toBeNull();
+    expect(document.querySelector('[aria-label*="1234"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("1234");
+  });
+
+  it("pin_hides_on_blur_or_remount", async () => {
+    stubPinStatus();
+    const addSpy = vi.spyOn(window, "addEventListener");
+    const removeSpy = vi.spyOn(window, "removeEventListener");
+    // 捕获 3s 轮询回调，手动触发真实刷新（不真等 3 秒，也不用假定时器干扰交互）
+    const intervalSpy = vi.spyOn(window, "setInterval");
+    const view = render(<BlockHost show />);
+    await waitFor(() => expect(pinInput().value).toBe("1234"));
+    const poll = intervalSpy.mock.calls.find(([, delay]) => delay === 3000)?.[0] as
+      (() => void) | undefined;
+    expect(poll).toBeTypeOf("function");
+
+    // 键盘可操作：原生 button 聚焦后 Enter 触发切换（不改其它行为）
+    const user = userEvent.setup();
+    const show = screen.getByRole("button", { name: "Show password" }) as HTMLButtonElement;
+    show.focus();
+    await user.keyboard("{Enter}");
+    expect(pinInput().type).toBe("text");
+    expect(screen.getByRole("button", { name: "Hide password" })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+
+    // 轮询刷新：隐藏态不被揭示、显示态也不被改写（呈现状态与刷新解耦）
+    fireEvent.click(screen.getByRole("button", { name: "Hide password" }));
+    const statusCallsBefore = pinCommandCalls("remote_status");
+    await act(async () => {
+      poll!();
+    });
+    expect(pinCommandCalls("remote_status")).toBeGreaterThan(statusCallsBefore);
+    expect(pinInput().type).toBe("password");
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }));
+    await act(async () => {
+      poll!();
+    });
+    expect(pinInput().type).toBe("text");
+
+    // 隐藏后再随机：随机只改值，不自动揭示
+    fireEvent.click(screen.getByRole("button", { name: "Hide password" }));
+    expect(pinInput().type).toBe("password");
+    fireEvent.click(screen.getByRole("button", { name: /random/i }));
+    expect(pinInput().type).toBe("password");
+    expect(pinInput().value).toMatch(/^\d{4}$/);
+
+    // 隐藏后保存：保存生效但不自动揭示
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(pinCommandCalls("remote_set_pin")).toBe(1));
+    expect(pinInput().type).toBe("password");
+
+    // 窗口失焦 → 立即恢复隐藏（重新打开截图时不残留明文）
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }));
+    expect(pinInput().type).toBe("text");
+    fireEvent.blur(window);
+    expect(pinInput().type).toBe("password");
+    expect(screen.getByRole("button", { name: "Show password" })).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
+
+    // 离开设置块再返回（卸载 → 重挂载）→ 恢复隐藏；blur 监听随卸载清理
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }));
+    expect(pinInput().type).toBe("text");
+    const blurHandler = addSpy.mock.calls.find(([type]) => type === "blur")?.[1];
+    expect(blurHandler).toBeTypeOf("function");
+    view.rerender(<BlockHost show={false} />);
+    expect(screen.queryByLabelText("Access PIN")).toBeNull();
+    expect(removeSpy).toHaveBeenCalledWith("blur", blurHandler);
+    view.rerender(<BlockHost show />);
+    await waitFor(() => expect(pinInput().value).toBe("1234"));
+    expect(pinInput().type).toBe("password");
+    expect(screen.getByRole("button", { name: "Show password" })).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
+  });
+});
+
 describe("RemoteSection 已接入设备列表（M5 A6）", () => {
   const devicesOf = () => [
     {
@@ -1907,6 +2047,142 @@ describe("RemoteSection 本机名称默认系统名（M5 A6）", () => {
   });
 });
 
+// A1（2026-10-24 §7.1）：remote.headless_enabled / remote.compat_send_enabled 缺键
+// 新默认 = 开；状态未返回时 loading/disabled（不得先显示成「用户关了」），旧载荷缺
+// 字段时按新默认展示；compatSendEligible 仍独立决定开关可开启性，不从偏好继承。
+describe("RemoteSection 投递偏好默认值（A1 §7.1）", () => {
+  const switchOf = (name: RegExp) => screen.getByRole("switch", { name });
+
+  it("status 未返回时两个偏好开关 loading/disabled，不把缺键短暂显示成关闭", () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status") return new Promise(() => {}); // 永不返回：停在加载态
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    const headless = switchOf(/headless injection/i);
+    const compat = switchOf(/compatibility send/i);
+    expect(headless).toBeDisabled();
+    expect(compat).toBeDisabled();
+    // 新默认 = 开（缺键不是用户关闭）；加载中只禁用交互，不闪成 false
+    expect(headless).toBeChecked();
+    expect(compat).toBeChecked();
+  });
+
+  it("旧载荷缺字段 → 两开关按新默认展示为开；资格字段不继承该默认", async () => {
+    // 默认 beforeEach 的 statusOf() 不带 headless/compat 字段（= 旧载荷形状）
+    render(<RemoteSection />);
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /enable remote access/i })).toBeEnabled()
+    );
+    const headless = switchOf(/headless injection/i);
+    expect(headless).toBeEnabled();
+    expect(headless).toBeChecked();
+    const compat = switchOf(/compatibility send/i);
+    expect(compat).toBeChecked();
+    // A2 修正（A1 遗留文案）：开关已按新默认开着时**不再**宣称「需先完成只读探测」——
+    // 探测只是「从关切到开」方向的前置，不是已开启状态的既存缺陷。资格并不因此消失：
+    // 下面一条用例（显式关闭 + 未取证）继续锁「不满足资格时无法从关切回开」。
+    expect(screen.queryByText(/read-only probe must complete first/i)).toBeNull();
+    expect(compat).toBeEnabled();
+  });
+
+  it("资格字段缺键不当成已取证：compatSendEnabled=false + 缺 compatSendEligible → 置灰 + 探测提示", async () => {
+    // 上一条用例里 compatSendEnabled=true 时「缺键」与「取证通过」观测上相同，锁不住
+    // compatSendEligible 的默认值。这里让开关处于「关」态、资格字段缺键：兜底必须是
+    // false（未取证）——若回归成 `compatSendEligible ?? true`，开关会变成可操作且
+    // 探测提示消失，与本用例断言相反。
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status") return statusOf({ compatSendEnabled: false });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /enable remote access/i })).toBeEnabled()
+    );
+    const compat = switchOf(/compatibility send/i);
+    expect(compat).not.toBeChecked();
+    expect(compat).toBeDisabled();
+    expect(screen.getByText(/read-only probe must complete first/i)).toBeTruthy();
+  });
+
+  it("资格字段独立决定可开启性：未取证 + 显式关闭 → 不可开启；取证后 → 可开启", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status")
+        return statusOf({ compatSendEnabled: false, compatSendEligible: false });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /enable remote access/i })).toBeEnabled()
+    );
+    const compat = switchOf(/compatibility send/i);
+    expect(compat).not.toBeChecked();
+    expect(compat).toBeDisabled();
+    expect(screen.getByText(/read-only probe must complete first/i)).toBeTruthy();
+
+    cleanup();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status")
+        return statusOf({ compatSendEnabled: false, compatSendEligible: true });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /enable remote access/i })).toBeEnabled()
+    );
+    expect(switchOf(/compatibility send/i)).toBeEnabled();
+  });
+});
+
+// A2（2026-10-24 设计 §4.1 六段顺序）：通用 → 四通道 → 访问与安全/设备列表 →
+// 工具特殊配置 → 无头注入/兼容发送 → 注入审计。前三段留在 RemoteSection；工具配置
+// 是**只有标题的装配点**（A5 填 ZCode 卡，A2 不交付空工具卡）；无头区抽成独立子组件，
+// 但状态 owner 与 3s 轮询仍留在 RemoteSection。审计由 SettingsPage 在其后装配，
+// 顺序锁放在 settingsBlocks.test.ts（本文件只渲染 RemoteSection）。
+describe("RemoteSection 六段顺序（A2 remote_sections_follow_user_order）", () => {
+  // 分组锚：data-group 是顺序判定的稳定钩子（文案随 i18n 变，锚不变）
+  const group = (key: string) =>
+    document.querySelector(`[data-group="${key}"]`) as HTMLElement | null;
+  const ORDER = ["general", "channels", "security", "devices", "tools", "headless", "compat"];
+
+  it("remote_sections_follow_user_order：通用→四通道→安全/设备→工具配置→无头→兼容发送，四通道与设备列表各一份", async () => {
+    render(<RemoteSection />);
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /enable remote access/i })).toBeEnabled()
+    );
+    // 每个分组锚恰一份（漏渲染 ⇒ 该段在界面上消失；重复渲染 ⇒ 顺序断言会被绕开）
+    for (const key of ORDER) {
+      const hits = document.querySelectorAll(`[data-group="${key}"]`);
+      expect(hits, `分组锚 ${key} 的渲染份数`).toHaveLength(1);
+    }
+    // 文档顺序 = 可访问顺序：后一个锚必须出现在前一个锚之后
+    for (let i = 1; i < ORDER.length; i++) {
+      const prev = group(ORDER[i - 1])!;
+      const next = group(ORDER[i])!;
+      expect(
+        (prev.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+        `顺序错误：${ORDER[i - 1]} 必须排在 ${ORDER[i]} 之前`
+      ).toBe(true);
+    }
+    // 四通道卡与设备列表各恰好一份（抽取/重排不得复制或丢段）
+    for (const key of ["lan", "quick", "named", "tailscale"]) {
+      expect(
+        document.querySelectorAll(`[data-card="${key}"]`),
+        `通道卡 ${key} 的份数`
+      ).toHaveLength(1);
+    }
+    expect(document.querySelectorAll("[data-device-list]"), "设备列表的份数").toHaveLength(1);
+  });
+});
+
 // i18n 契约：RemoteSection / useRemoteEvents 源码里引用的每个 settings.remote.* 键，
 // 必须在 zh 与 en 两个 locale 同齐备（缺键即键路径泄漏到 UI）；两 locale 键集必须相等。
 describe("RemoteSection i18n zh/en 无缺键（M5 A6）", () => {
@@ -1931,6 +2207,9 @@ describe("RemoteSection i18n zh/en 无缺键（M5 A6）", () => {
     // 源码扫描：两个消费方引用的键必须双 locale 存在
     const sources = [
       path.join(root, "src/components/settings/RemoteSection.tsx"),
+      // A2：⑤ 段（含兼容发送）抽出后，无头/兼容发送的键改由子组件引用——扫描面必须跟上，
+      // 否则抽出的子组件成了 i18n 守卫的盲区
+      path.join(root, "src/components/settings/HeadlessSettingsSection.tsx"),
       path.join(root, "src/hooks/useRemoteEvents.ts"),
     ];
     const used = new Set<string>();
