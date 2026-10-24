@@ -584,9 +584,9 @@ describe("zcode 官方桥接：单连接、会话映射与发送闭环（B2 fake
     expect(loop.duplicateInboundFrames).toBeGreaterThanOrEqual(3);
   });
 
-  it("stale_epoch_rejected：旧连接代际绑定的映射在新代际上不能授权发送，且一个帧都不发", async () => {
+  it("stale_epoch_rejected：旧连接代际绑定的映射在新代际上不能授权发送；bridge 代际回显不构成构造闸", async () => {
     await startRelay();
-    await connectPaired(); // 占住 relay（本用例只测映射代际，不发帧）
+    const conn = await connectPaired(); // 占住 relay（bridge 代际回显段的发送走这条连接）
     const mapper = SessionTargetMapper.fromListings({ ...FAKE_LISTING, generation: 1 });
     const bound = mapper.resolveTarget({ taskId: FAKE_TARGET.taskId });
 
@@ -603,21 +603,34 @@ describe("zcode 官方桥接：单连接、会话映射与发送闭环（B2 fake
     // 授权看绑定代际本身，不因「存在新 mapper」而放行。
     expect(() => mapper.authorizeSend(bound, 2)).toThrow(/stale-epoch/);
 
-    // 发送循环在未经 authorize 的目标上不得发帧：直接构造 loop 也要求代际一致，
-    // 旧代际 target 传入 → 构造即抛，零 data 帧。
-    expect(
-      () =>
-        new SendOnceLoop({
-          sender: { sendData: () => true },
-          identity: { ...FAKE_IDENTITY, bridgeGeneration: 2 },
-          target: bound, // generation 1
-          markerText: "[tuvis-b2-marker:stale]",
-          clientId: "fake-client",
-          timeouts: { ackMs: 60, activityMs: 20 },
-          sleep: realSleep,
-        })
-    ).toThrow(/stale-epoch/);
-    expect(relay.clientDataPayloads.length).toBe(0);
+    // 构造不做代际校验（评审 Important 修复）：identity.bridgeGeneration 是宿主
+    // workspace-bridge-ready 回显的 bridge 通道代际，与探针连接代际
+    // （target.generation）不同命名空间——回显 ≠1（如 7）不得中断发送闭环：
+    // 构造成功、帧照发且携带回显值、run 照常进行。
+    const loopGen7 = new SendOnceLoop({
+      sender: conn,
+      identity: { ...FAKE_IDENTITY, bridgeGeneration: 7 },
+      target: bound, // generation 1：与 bridgeGeneration=7 不同命名空间，不构成 stale-epoch
+      markerText: "[tuvis-b2-marker:bridge-gen-echo]",
+      clientId: "fake-client",
+      timeouts: { ackMs: 150, activityMs: 20 },
+      sleep: realSleep,
+    });
+    conn.onData = (payload) => loopGen7.onData(payload);
+    const outcomeGen7Promise = loopGen7.run();
+    await waitFor(() => relay.clientDataPayloads.length >= 1);
+    expect(relay.clientDataPayloads[0].bridgeGeneration).toBe(7);
+    // 无应答注入 → unknown；帧数恒 1（不因代际回显而中断，也无重发）。
+    const outcomeGen7 = await outcomeGen7Promise;
+    expect(outcomeGen7.kind).toBe("unknown");
+    expect(loopGen7.framesSent).toBe(1);
+    expect(relay.clientDataPayloads.length).toBe(1);
+
+    // stale-epoch 闸依旧唯一住在 mapper（like-for-like：映射代际 vs 连接代际）——
+    // 旧代际映射在新代际上不能授权；未过闸的映射没有任何额外发送路径
+    // （除上面那一帧外 relay 收到的 data 帧仍为 0 条增量）。
+    expect(() => mapper.authorizeSend(bound, 2)).toThrow(/stale-epoch/);
+    expect(relay.clientDataPayloads.length).toBe(1);
   });
 
   it("wire 形状自检：CRC32 与官方实现一致（B1 实连 4 帧checksum复算），请求字节按 serialization.ts 编码", async () => {

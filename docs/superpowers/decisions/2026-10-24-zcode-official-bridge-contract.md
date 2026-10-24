@@ -515,3 +515,19 @@ route `ownerScope`/`bindingNote` 勘正如上；`capabilities` 维持全 false�
 `operations` 追加且仅追加两条 live 已验**只读**操作（`bootstrap-request` /
 `workspace-list-request`，B1 run `macos-B120261024T105940Z-NarmSw`）；`capabilities.send`
 维持 false——实发取证前不得前移；schema 其余不动。
+
+## 7.7 追加与勘误（2026-10-24，B2 发送前评审修复；不改写上文）
+
+- **live-verification 显式项（新增）**：`envelope.sessionId ≡ listing address.taskId`
+  **同命名空间**是发送结果可解释的前提——`sendConversationCommandV4` envelope 携带的
+  sessionId 必须与 tasks listing `address.taskId` 属同一 id 空间；实连半场须把该等同性
+  列为显式核验项（拿 marker 落点回对 listing 行归因）。判错即 fail-closed（不发送／
+  结果作废），但 COMPLETED/ACCEPTED/UNKNOWN 的 verdict 解读依赖它成立。
+- **勘误（§7.3「SendOnceLoop 构造即二次校验」与 §7.4 用例 5 同款措辞）**：构造**不再**
+  比较 `identity.bridgeGeneration` vs `target.generation`——bridgeGeneration 是宿主
+  workspace-bridge-ready 回显的 **bridge 通道代际**，与探针连接代际不同命名空间，拿两者
+  比较属类别错误（宿主回显 ≠1 时构造曾在 try/catch 之外抛出，探针裸 crash 丢证据）。
+  stale-epoch 闸唯一住在 `SessionTargetMapper.authorizeSend`（映射代际 vs 存活连接代际，
+  like-for-like）；bridgeGeneration 仅信息性（随帧回传 + 落证据，不作闸）。配套加固：
+  session-probe 主体加故障围栏——任何阶段未处理异常一律记 `STOPPED:fault-<阶段>`
+  verdict 并照常落证，绝不裸 crash。

@@ -613,7 +613,10 @@ export type SendOutcome =
 export type SendOnceLoopOptions = {
   sender: ProbeConnection;
   identity: RpcFrameIdentity;
-  /** 只接受 SessionTargetMapper.resolveTarget 的产物（代际不一致构造即抛）。 */
+  /**
+   * 只接受 SessionTargetMapper.resolveTarget 的产物；调用方必须先以 authorizeSend
+   * 通过代际闸（stale-epoch 判据 = 映射代际 vs 存活连接代际）。构造不做代际校验。
+   */
   target: BoundTarget;
   markerText: string;
   clientId: string;
@@ -667,16 +670,11 @@ export class SendOnceLoop {
   peerAcknowledged = false;
 
   constructor(options: SendOnceLoopOptions) {
-    // 代际闸硬前置：构造即校验，杜绝旧代际映射被带进新连接（tests: stale_epoch_rejected）。
-    if (
-      options.identity.bridgeGeneration !== undefined &&
-      options.identity.bridgeGeneration !== options.target.generation
-    ) {
-      throw new Error(
-        `stale-epoch: target bound to generation ${options.target.generation}, ` +
-          `identity bridgeGeneration is ${options.identity.bridgeGeneration}`
-      );
-    }
+    // 代际闸唯一住在 SessionTargetMapper.authorizeSend（映射代际 vs 存活连接代际，
+    // like-for-like）。identity.bridgeGeneration 是宿主 workspace-bridge-ready 回显的
+    // **bridge 通道代际**，与探针的连接代际（target.generation）不同命名空间——拿两者
+    // 比较属类别错误（评审 Important 修复：宿主回显 ≠1 时构造曾在 try/catch 之外抛出，
+    // 探针裸 crash 丢证据）。本字段仅信息性：随帧回传 + 落证据，不作闸。
     this.sender = options.sender;
     this.identity = options.identity;
     this.target = options.target;

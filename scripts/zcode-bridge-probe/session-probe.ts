@@ -653,6 +653,9 @@ type RunContext = {
   events: Array<Record<string, unknown>>;
 };
 
+/** 探针在飞阶段标签（故障围栏用：fault 时给对应阶段记 STOPPED:fault-<阶段>）。 */
+type ProbeStage = "oauth" | "connect" | "mapping" | "send" | "teardown";
+
 function record(ctx: RunContext, step: string, message: string, data?: unknown): void {
   ctx.events.push({
     t: new Date().toISOString(),
@@ -706,739 +709,833 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
   const ctx: RunContext = { redactor, run, startedIso, flags: parsed, events: [] };
   log(`证据目录（私有，勿提交/外发）：${run.dir}`);
 
-  // —— s2：probe-oauth（默认 bigmodel——B1 定案用户账号在该通道） ————————————
+  // —— 故障围栏（评审 Important 修复）：主体全程 try/catch——任何阶段抛出（含
+  // SendOnceLoop 构造）都不得变成无证据的裸 crash；catch 里记账、尽力清理连接、
+  // 给在飞阶段记结构化 STOPPED:fault-<阶段> verdict 并照常落证。
   let jwt: string | null = null;
   let oauthVerdict = "SKIPPED";
+  let connectVerdict = "SKIPPED";
+  let mappingVerdict = "SKIPPED";
+  let sendVerdict = "SKIPPED";
   const oauthSummary: Record<string, unknown> = {
     attempted: !parsed.jwtStdin,
     provider: parsed.provider,
   };
-  if (parsed.jwtStdin) {
-    record(ctx, "probe-oauth", "skipped", { reason: "jwt-stdin rerun" });
-    log("probe-oauth 跳过（--jwt-stdin 重跑模式）。");
-  } else {
-    const isZai = parsed.provider === "zai";
-    record(ctx, "probe-oauth", "start", {
-      provider: parsed.provider,
-      authorizeOrigin: isZai ? OFFICIAL_AUTHORIZE_ORIGIN : OFFICIAL_BIGMODEL_AUTHORIZE_ORIGIN,
-      authorizePath: isZai ? OFFICIAL_AUTHORIZE_PATH : OFFICIAL_BIGMODEL_AUTHORIZE_PATH,
-      clientIdentifierField: isZai ? "client_id" : "appId",
-      clientIdentifier: isZai ? OFFICIAL_OAUTH_CLIENT_ID : OFFICIAL_BIGMODEL_APP_ID,
-    });
-    const state = generateOAuthState();
-    redactor.register("state", state);
-    const server = await LoopbackCallbackServer.start();
-    let callback: LoopbackCallback;
-    const redirectUri = server.redirectUri;
-    try {
-      const authorizeUrl = buildAuthorizeUrl(parsed.provider, { redirectUri, state });
-      redactor.register("link", authorizeUrl);
-      oauthSummary.redirect = { host: "127.0.0.1", port: server.port, path: "/callback" };
-      record(ctx, "probe-oauth", "listening", { redirectPort: server.port });
-      log(
-        parsed.provider === "bigmodel"
-          ? "请在浏览器打开下面的官方授权 URL，并用你的国内智谱（bigmodel.cn）账号完成授权："
-          : "请在浏览器打开下面的官方授权 URL，并用你的 ZCode 账号完成授权："
-      );
-      log(`  ${authorizeUrl}`);
-      if (parsed.open) {
-        log(
-          openInBrowser(authorizeUrl)
-            ? "已请求系统浏览器打开（--open）。"
-            : "--open 失败，请手动复制 URL。"
-        );
-      }
-      log(`等待回环回调（有界 ${parsed.oauthWaitMs} ms）……`);
-      callback = await server.waitCallback(state, parsed.oauthWaitMs);
-    } finally {
-      await server.close();
-    }
-    if (callback.kind === "code") {
-      redactor.register("auth-code", callback.code);
-      const exchange = await exchangeCodeForToken({
-        zcodeOrigin: OFFICIAL_ZCODE_ENDPOINT_ORIGIN,
-        code: callback.code,
-        redirectUri,
-        state,
-        provider: parsed.provider,
-      });
-      if (exchange.kind === "ok") {
-        jwt = exchange.jwt;
-        redactor.register("jwt", jwt);
-        oauthVerdict = "PROVEN";
-        oauthSummary.verdict = "PROVEN";
-        oauthSummary.jwt = {
-          alias: "JWT_1",
-          masked: maskJwt(jwt),
-          expiresInSeconds: exchange.expiresInSeconds,
-        };
-        record(ctx, "probe-oauth", "exchange-ok", {
-          verdict: "PROVEN",
-          masked: maskJwt(jwt),
-          expiresInSeconds: exchange.expiresInSeconds,
-        });
-        log("probe-oauth verdict = PROVEN。");
-      } else {
-        oauthVerdict = exchange.kind === "rejected" ? "UNSUPPORTED" : "INCONCLUSIVE";
-        oauthSummary.verdict = oauthVerdict;
-        oauthSummary.stage = "token-exchange";
-        oauthSummary.reason = exchange.kind === "rejected" ? exchange.reason : "unreachable";
-        record(ctx, "probe-oauth", "exchange-failed", { verdict: oauthVerdict });
-        log(`probe-oauth verdict = ${oauthVerdict}。`);
-      }
-    } else {
-      oauthVerdict = "UNSUPPORTED";
-      oauthSummary.verdict = "UNSUPPORTED";
-      oauthSummary.stage = callback.kind === "authorize-error" ? "authorize" : "callback-wait";
-      record(ctx, "probe-oauth", "callback-failed", { kind: callback.kind });
-      log(`probe-oauth verdict = UNSUPPORTED（${callback.kind}）。`);
-    }
-  }
-
-  // —— s1/s3/s4：链接 → token → 单连接 ————————————————————————————————————
-  let connectVerdict = "SKIPPED";
-  let mappingVerdict = "SKIPPED";
-  let sendVerdict = "SKIPPED";
   const connectSummary: Record<string, unknown> = { attempted: false };
   const mappingSummary: Record<string, unknown> = { attempted: false };
   const sendSummary: Record<string, unknown> = { attempted: false };
-
-  if (parsed.jwtStdin) {
-    const raw = (await readAllStdin()).trim();
-    if (!JWT_SHAPE.test(raw)) {
-      record(ctx, "connect", "jwt-invalid-shape", {});
-      console.error("[b2-probe] stdin 内容不是 JWT 形状，拒绝执行。");
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
-      );
-      return {
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict: "ABORTED:jwt-shape",
-        exitCode: 2,
-      };
-    }
-    jwt = raw;
-    redactor.register("jwt", jwt);
-    connectSummary.jwt = { alias: "JWT_1", masked: maskJwt(jwt) };
-  }
-
-  const gate = new SingleConnectionGate();
-  if (jwt) {
-    connectSummary.attempted = true;
-    let sid: string;
-    let mid: string | null = null;
-    let origin = OFFICIAL_ZCODE_ENDPOINT_ORIGIN;
-    if (parsed.sid) {
-      sid = parsed.sid;
-      redactor.register("sid", sid);
-      connectSummary.linkSource = "cli";
-    } else {
-      const dbPath = parsed.dbPath ?? path.join(os.homedir(), ".tuvis", "tuvis.db");
-      const settings = readOfficialLinkFromSettings(dbPath);
-      if (settings.kind !== "ok") {
-        connectVerdict = `ABORTED:settings-${settings.kind}`;
-        record(ctx, "connect", "settings-read-failed", { kind: settings.kind });
-        log(`connect 中止：无法从 ${dbPath} 读取官方链接（${settings.kind}）。`);
-        await writeEvidence(
-          ctx,
-          oauthVerdict,
-          connectVerdict,
-          mappingVerdict,
-          sendVerdict,
-          oauthSummary,
-          connectSummary,
-          mappingSummary,
-          sendSummary
-        );
-        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 2 };
-      }
-      const parsedLink = parseOfficialLink(settings.link);
-      if (!parsedLink.ok) {
-        connectVerdict = `ABORTED:link-invalid-${parsedLink.reason}`;
-        record(ctx, "connect", "link-invalid", { reason: parsedLink.reason });
-        log(`connect 中止：已保存链接未通过 A4 复验（${parsedLink.reason}）。`);
-        await writeEvidence(
-          ctx,
-          oauthVerdict,
-          connectVerdict,
-          mappingVerdict,
-          sendVerdict,
-          oauthSummary,
-          connectSummary,
-          mappingSummary,
-          sendSummary
-        );
-        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 2 };
-      }
-      redactor.register("link", settings.link);
-      sid = parsedLink.sid;
-      mid = parsedLink.mid;
-      origin = parsedLink.origin;
-      redactor.register("sid", sid);
-      redactor.register("mid", parsedLink.mid);
-      if (parsedLink.name) redactor.register("name", parsedLink.name);
-      connectSummary.linkSource = "settings";
-      connectSummary.link = {
-        origin: parsedLink.origin,
-        pathVersion: parsedLink.pathVersion,
-        sid: "SID_A",
-        mid: parsedLink.mid ? "MID_A" : null,
-      };
-    }
-
-    const relayWsUrl = relayWsUrlFromOrigin(origin);
-    connectSummary.relay = { origin, wsUrl: relayWsUrl, midAttached: mid !== null };
-    const token = await requestTerminalToken({
-      relayOrigin: origin,
-      accountJwt: jwt,
-      signal: AbortSignal.timeout(RELAY_HTTP_TIMEOUT_MS),
-    });
-    if (token.kind !== "ok") {
-      connectVerdict = `STOPPED:token-${token.kind}`;
-      record(ctx, "connect", "token-request-failed", { kind: token.kind });
-      log(`connect 停止：token 申请失败（${token.kind}），不重试。`);
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
-      );
-      return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
-    }
-    redactor.register("relay-token", token.token);
-    connectSummary.terminalToken = {
-      alias: "TOK_1",
-      masked: maskOpaque(token.token),
-      expiresInSeconds: token.expiresInSeconds,
-    };
-    record(ctx, "connect", "terminal-token", {
-      masked: maskOpaque(token.token),
-      expiresInSeconds: token.expiresInSeconds,
-    });
-    log(`terminal token OK（expires_in=${token.expiresInSeconds}s，一次性）。`);
-
-    log("建立单条 WS 连接（SingleConnectionGate 唯一放行；30s 路由窗口）……");
-    const acquired = gate.acquire<RelayTerminalConnection>(
-      () =>
-        new RelayTerminalConnection({
-          relayWsUrl,
-          token: token.token,
-          deviceSid: sid,
-          deviceMid: mid,
-        })
-    );
-    if (!acquired.ok) {
-      // 结构性不可达：gate 在 active 之外不会拒绝第一次 acquire。
-      connectVerdict = "STOPPED:gate";
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
-      );
-      return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 1 };
-    }
-    const conn = acquired.connection;
-    const channel = new B2Channel({ allowedTypes: READONLY_REQUEST_TYPES });
-    channel.attach(conn);
-    const outcome = await conn.connect();
-    if (outcome !== "paired") {
-      connectVerdict = `STOPPED:${outcome}`;
-      record(ctx, "connect", "handshake-terminal", { outcome });
-      log(`connect 停止：握手终态 = ${outcome}（无重试）。`);
-      conn.close();
-      channel.detach();
-      gate.release();
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
-      );
-      return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
-    }
-    connectVerdict = "PAIRED";
-    record(ctx, "connect", "paired", {});
-    log("已配对。开始只读映射（bootstrap → workspace-list + 收帧窗）……");
-
-    // —— s5：mapping ————————————————————————————————————————————————————————
-    mappingSummary.attempted = true;
-    const bootstrap = await channel.request(conn, "bootstrap-request", READ_QUERY_TIMEOUT_MS);
-    const workspaceList = await channel.request(
-      conn,
-      "workspace-list-request",
-      READ_QUERY_TIMEOUT_MS
-    );
-    record(ctx, "mapping", "bootstrap-request", summarizePayload(bootstrap));
-    record(ctx, "mapping", "workspace-list-request", summarizePayload(workspaceList));
-    log(`bootstrap-request → ${bootstrap.kind}；workspace-list-request → ${workspaceList.kind}。`);
-
-    log(`被动收帧窗 ${CAPTURE_WINDOW_MS} ms（tasks-index 等宿主推送，B1 实连同款）……`);
-    await new Promise((resolve) => setTimeout(resolve, CAPTURE_WINDOW_MS));
-
-    // 结构化收割（真实值只在内存；登记别名后只落别名证据）。
-    const workspaces: WorkspaceListingEntry[] = [];
-    harvestWorkspaceEntries(
-      [
-        bootstrap.kind === "ok" ? bootstrap.payload : null,
-        workspaceList.kind === "ok" ? workspaceList.payload : null,
-      ],
-      workspaces
-    );
-    const rawRows: TaskListingRow[] = [];
-    for (const message of channel.bridgeMessages) {
+  let stage: ProbeStage = "oauth";
+  // 存活连接登记（fault 路径的尽力清理用；正常路径各自的显式 teardown 不受影响）。
+  let liveGate: SingleConnectionGate | null = null;
+  let liveConn: RelayTerminalConnection | null = null;
+  const liveChannels: B2Channel[] = [];
+  const cleanupLive = (): void => {
+    for (const channel of liveChannels.splice(0)) {
       try {
-        harvestTaskRows(JSON.parse(message) as unknown, rawRows);
+        channel.detach();
       } catch {
-        // 非 JSON 消息跳过（计数即可）。
+        // 尽力清理：fault 路径不允许二次抛出。
       }
     }
-    const tasks = dedupeRows(rawRows);
-    for (const entry of workspaces) {
-      redactor.register("path", entry.workspacePath);
-      if (entry.workspaceIdentity) redactor.register("sid", entry.workspaceIdentity);
-      if (entry.remoteSessionId) redactor.register("sid", entry.remoteSessionId);
-      if (entry.label) redactor.register("name", entry.label);
-    }
-    for (const row of tasks) {
-      redactor.register("path", row.address.workspacePath);
-      redactor.register("sid", row.address.taskId);
-      if (row.meta?.title) redactor.register("name", row.meta.title);
-    }
-    mappingSummary.listings = {
-      bootstrapOutcome: bootstrap.kind,
-      workspaceListOutcome: workspaceList.kind,
-      workspaceEntries: workspaces.length,
-      taskRows: tasks.length,
-      bridgeMessages: channel.bridgeMessages.length,
-      rpcFramesSeen: channel.rpcFramesSeen.length,
-      rpcAckCount: channel.rpcAckCount,
-      rpcDuplicateCount: channel.rpcDuplicateCount,
-      rpcFaultCount: channel.rpcFaultCount,
-    };
-    record(ctx, "mapping", "harvest", mappingSummary.listings);
-    recordChannelEvidence(ctx, "mapping", channel);
-    log(
-      `映射输入：workspace 条目 ×${workspaces.length}，task 行 ×${tasks.length}（收帧 ${channel.bridgeMessages.length} 条）。`
-    );
-
-    // —— s6：designate（指称 → 精确 id；唯一匹配，绝不按标题发送） ————————————
-    const designation = designateTarget(ctx, workspaces, tasks, parsed.workspace, parsed.taskTitle);
-    if (!designation.ok) {
-      mappingVerdict = `ABORTED:designate-${designation.reason}`;
-      record(ctx, "mapping", "designate-failed", {
-        reason: designation.reason,
-        workspaceDesignation: redactor.sanitizeText(parsed.workspace),
-        taskDesignation: redactor.sanitizeText(parsed.taskTitle),
-      });
-      log(`映射中止：${designation.reason}（未发送任何写向；未匹配的指称不入证据正文）。`);
-      conn.close();
-      channel.detach();
-      gate.release();
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
-      );
-      return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
-    }
-    const bound: BoundTarget = designation.bound;
     try {
-      const mapper = SessionTargetMapper.fromListings({
+      liveConn?.close();
+    } catch {
+      // 尽力清理。
+    }
+    liveConn = null;
+    try {
+      liveGate?.release();
+    } catch {
+      // 尽力清理。
+    }
+    liveGate = null;
+  };
+
+  try {
+    // —— s2：probe-oauth（默认 bigmodel——B1 定案用户账号在该通道；verdict/summary
+    // 已在围栏区声明，fault 路径也要能读到） ————————————
+    if (parsed.jwtStdin) {
+      record(ctx, "probe-oauth", "skipped", { reason: "jwt-stdin rerun" });
+      log("probe-oauth 跳过（--jwt-stdin 重跑模式）。");
+    } else {
+      const isZai = parsed.provider === "zai";
+      record(ctx, "probe-oauth", "start", {
+        provider: parsed.provider,
+        authorizeOrigin: isZai ? OFFICIAL_AUTHORIZE_ORIGIN : OFFICIAL_BIGMODEL_AUTHORIZE_ORIGIN,
+        authorizePath: isZai ? OFFICIAL_AUTHORIZE_PATH : OFFICIAL_BIGMODEL_AUTHORIZE_PATH,
+        clientIdentifierField: isZai ? "client_id" : "appId",
+        clientIdentifier: isZai ? OFFICIAL_OAUTH_CLIENT_ID : OFFICIAL_BIGMODEL_APP_ID,
+      });
+      const state = generateOAuthState();
+      redactor.register("state", state);
+      const server = await LoopbackCallbackServer.start();
+      let callback: LoopbackCallback;
+      const redirectUri = server.redirectUri;
+      try {
+        const authorizeUrl = buildAuthorizeUrl(parsed.provider, { redirectUri, state });
+        redactor.register("link", authorizeUrl);
+        oauthSummary.redirect = { host: "127.0.0.1", port: server.port, path: "/callback" };
+        record(ctx, "probe-oauth", "listening", { redirectPort: server.port });
+        log(
+          parsed.provider === "bigmodel"
+            ? "请在浏览器打开下面的官方授权 URL，并用你的国内智谱（bigmodel.cn）账号完成授权："
+            : "请在浏览器打开下面的官方授权 URL，并用你的 ZCode 账号完成授权："
+        );
+        log(`  ${authorizeUrl}`);
+        if (parsed.open) {
+          log(
+            openInBrowser(authorizeUrl)
+              ? "已请求系统浏览器打开（--open）。"
+              : "--open 失败，请手动复制 URL。"
+          );
+        }
+        log(`等待回环回调（有界 ${parsed.oauthWaitMs} ms）……`);
+        callback = await server.waitCallback(state, parsed.oauthWaitMs);
+      } finally {
+        await server.close();
+      }
+      if (callback.kind === "code") {
+        redactor.register("auth-code", callback.code);
+        const exchange = await exchangeCodeForToken({
+          zcodeOrigin: OFFICIAL_ZCODE_ENDPOINT_ORIGIN,
+          code: callback.code,
+          redirectUri,
+          state,
+          provider: parsed.provider,
+        });
+        if (exchange.kind === "ok") {
+          jwt = exchange.jwt;
+          redactor.register("jwt", jwt);
+          oauthVerdict = "PROVEN";
+          oauthSummary.verdict = "PROVEN";
+          oauthSummary.jwt = {
+            alias: "JWT_1",
+            masked: maskJwt(jwt),
+            expiresInSeconds: exchange.expiresInSeconds,
+          };
+          record(ctx, "probe-oauth", "exchange-ok", {
+            verdict: "PROVEN",
+            masked: maskJwt(jwt),
+            expiresInSeconds: exchange.expiresInSeconds,
+          });
+          log("probe-oauth verdict = PROVEN。");
+        } else {
+          oauthVerdict = exchange.kind === "rejected" ? "UNSUPPORTED" : "INCONCLUSIVE";
+          oauthSummary.verdict = oauthVerdict;
+          oauthSummary.stage = "token-exchange";
+          oauthSummary.reason = exchange.kind === "rejected" ? exchange.reason : "unreachable";
+          record(ctx, "probe-oauth", "exchange-failed", { verdict: oauthVerdict });
+          log(`probe-oauth verdict = ${oauthVerdict}。`);
+        }
+      } else {
+        oauthVerdict = "UNSUPPORTED";
+        oauthSummary.verdict = "UNSUPPORTED";
+        oauthSummary.stage = callback.kind === "authorize-error" ? "authorize" : "callback-wait";
+        record(ctx, "probe-oauth", "callback-failed", { kind: callback.kind });
+        log(`probe-oauth verdict = UNSUPPORTED（${callback.kind}）。`);
+      }
+    }
+
+    // —— s1/s3/s4：链接 → token → 单连接 ————————————————————————————————————
+    stage = "connect";
+    if (parsed.jwtStdin) {
+      const raw = (await readAllStdin()).trim();
+      if (!JWT_SHAPE.test(raw)) {
+        record(ctx, "connect", "jwt-invalid-shape", {});
+        console.error("[b2-probe] stdin 内容不是 JWT 形状，拒绝执行。");
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return {
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict: "ABORTED:jwt-shape",
+          exitCode: 2,
+        };
+      }
+      jwt = raw;
+      redactor.register("jwt", jwt);
+      connectSummary.jwt = { alias: "JWT_1", masked: maskJwt(jwt) };
+    }
+
+    const gate = new SingleConnectionGate();
+    liveGate = gate;
+    if (jwt) {
+      connectSummary.attempted = true;
+      let sid: string;
+      let mid: string | null = null;
+      let origin = OFFICIAL_ZCODE_ENDPOINT_ORIGIN;
+      if (parsed.sid) {
+        sid = parsed.sid;
+        redactor.register("sid", sid);
+        connectSummary.linkSource = "cli";
+      } else {
+        const dbPath = parsed.dbPath ?? path.join(os.homedir(), ".tuvis", "tuvis.db");
+        const settings = readOfficialLinkFromSettings(dbPath);
+        if (settings.kind !== "ok") {
+          connectVerdict = `ABORTED:settings-${settings.kind}`;
+          record(ctx, "connect", "settings-read-failed", { kind: settings.kind });
+          log(`connect 中止：无法从 ${dbPath} 读取官方链接（${settings.kind}）。`);
+          await writeEvidence(
+            ctx,
+            oauthVerdict,
+            connectVerdict,
+            mappingVerdict,
+            sendVerdict,
+            oauthSummary,
+            connectSummary,
+            mappingSummary,
+            sendSummary
+          );
+          return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 2 };
+        }
+        const parsedLink = parseOfficialLink(settings.link);
+        if (!parsedLink.ok) {
+          connectVerdict = `ABORTED:link-invalid-${parsedLink.reason}`;
+          record(ctx, "connect", "link-invalid", { reason: parsedLink.reason });
+          log(`connect 中止：已保存链接未通过 A4 复验（${parsedLink.reason}）。`);
+          await writeEvidence(
+            ctx,
+            oauthVerdict,
+            connectVerdict,
+            mappingVerdict,
+            sendVerdict,
+            oauthSummary,
+            connectSummary,
+            mappingSummary,
+            sendSummary
+          );
+          return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 2 };
+        }
+        redactor.register("link", settings.link);
+        sid = parsedLink.sid;
+        mid = parsedLink.mid;
+        origin = parsedLink.origin;
+        redactor.register("sid", sid);
+        redactor.register("mid", parsedLink.mid);
+        if (parsedLink.name) redactor.register("name", parsedLink.name);
+        connectSummary.linkSource = "settings";
+        connectSummary.link = {
+          origin: parsedLink.origin,
+          pathVersion: parsedLink.pathVersion,
+          sid: "SID_A",
+          mid: parsedLink.mid ? "MID_A" : null,
+        };
+      }
+
+      const relayWsUrl = relayWsUrlFromOrigin(origin);
+      connectSummary.relay = { origin, wsUrl: relayWsUrl, midAttached: mid !== null };
+      const token = await requestTerminalToken({
+        relayOrigin: origin,
+        accountJwt: jwt,
+        signal: AbortSignal.timeout(RELAY_HTTP_TIMEOUT_MS),
+      });
+      if (token.kind !== "ok") {
+        connectVerdict = `STOPPED:token-${token.kind}`;
+        record(ctx, "connect", "token-request-failed", { kind: token.kind });
+        log(`connect 停止：token 申请失败（${token.kind}），不重试。`);
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      redactor.register("relay-token", token.token);
+      connectSummary.terminalToken = {
+        alias: "TOK_1",
+        masked: maskOpaque(token.token),
+        expiresInSeconds: token.expiresInSeconds,
+      };
+      record(ctx, "connect", "terminal-token", {
+        masked: maskOpaque(token.token),
+        expiresInSeconds: token.expiresInSeconds,
+      });
+      log(`terminal token OK（expires_in=${token.expiresInSeconds}s，一次性）。`);
+
+      log("建立单条 WS 连接（SingleConnectionGate 唯一放行；30s 路由窗口）……");
+      const acquired = gate.acquire<RelayTerminalConnection>(
+        () =>
+          new RelayTerminalConnection({
+            relayWsUrl,
+            token: token.token,
+            deviceSid: sid,
+            deviceMid: mid,
+          })
+      );
+      if (!acquired.ok) {
+        // 结构性不可达：gate 在 active 之外不会拒绝第一次 acquire。
+        connectVerdict = "STOPPED:gate";
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 1 };
+      }
+      const conn = acquired.connection;
+      liveConn = conn;
+      const channel = new B2Channel({ allowedTypes: READONLY_REQUEST_TYPES });
+      liveChannels.push(channel);
+      channel.attach(conn);
+      const outcome = await conn.connect();
+      if (outcome !== "paired") {
+        connectVerdict = `STOPPED:${outcome}`;
+        record(ctx, "connect", "handshake-terminal", { outcome });
+        log(`connect 停止：握手终态 = ${outcome}（无重试）。`);
+        conn.close();
+        channel.detach();
+        gate.release();
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      connectVerdict = "PAIRED";
+      record(ctx, "connect", "paired", {});
+      log("已配对。开始只读映射（bootstrap → workspace-list + 收帧窗）……");
+
+      // —— s5：mapping ————————————————————————————————————————————————————————
+      stage = "mapping";
+      mappingSummary.attempted = true;
+      const bootstrap = await channel.request(conn, "bootstrap-request", READ_QUERY_TIMEOUT_MS);
+      const workspaceList = await channel.request(
+        conn,
+        "workspace-list-request",
+        READ_QUERY_TIMEOUT_MS
+      );
+      record(ctx, "mapping", "bootstrap-request", summarizePayload(bootstrap));
+      record(ctx, "mapping", "workspace-list-request", summarizePayload(workspaceList));
+      log(
+        `bootstrap-request → ${bootstrap.kind}；workspace-list-request → ${workspaceList.kind}。`
+      );
+
+      log(`被动收帧窗 ${CAPTURE_WINDOW_MS} ms（tasks-index 等宿主推送，B1 实连同款）……`);
+      await new Promise((resolve) => setTimeout(resolve, CAPTURE_WINDOW_MS));
+
+      // 结构化收割（真实值只在内存；登记别名后只落别名证据）。
+      const workspaces: WorkspaceListingEntry[] = [];
+      harvestWorkspaceEntries(
+        [
+          bootstrap.kind === "ok" ? bootstrap.payload : null,
+          workspaceList.kind === "ok" ? workspaceList.payload : null,
+        ],
+        workspaces
+      );
+      const rawRows: TaskListingRow[] = [];
+      for (const message of channel.bridgeMessages) {
+        try {
+          harvestTaskRows(JSON.parse(message) as unknown, rawRows);
+        } catch {
+          // 非 JSON 消息跳过（计数即可）。
+        }
+      }
+      const tasks = dedupeRows(rawRows);
+      for (const entry of workspaces) {
+        redactor.register("path", entry.workspacePath);
+        if (entry.workspaceIdentity) redactor.register("sid", entry.workspaceIdentity);
+        if (entry.remoteSessionId) redactor.register("sid", entry.remoteSessionId);
+        if (entry.label) redactor.register("name", entry.label);
+      }
+      for (const row of tasks) {
+        redactor.register("path", row.address.workspacePath);
+        redactor.register("sid", row.address.taskId);
+        if (row.meta?.title) redactor.register("name", row.meta.title);
+      }
+      mappingSummary.listings = {
+        bootstrapOutcome: bootstrap.kind,
+        workspaceListOutcome: workspaceList.kind,
+        workspaceEntries: workspaces.length,
+        taskRows: tasks.length,
+        bridgeMessages: channel.bridgeMessages.length,
+        rpcFramesSeen: channel.rpcFramesSeen.length,
+        rpcAckCount: channel.rpcAckCount,
+        rpcDuplicateCount: channel.rpcDuplicateCount,
+        rpcFaultCount: channel.rpcFaultCount,
+      };
+      record(ctx, "mapping", "harvest", mappingSummary.listings);
+      recordChannelEvidence(ctx, "mapping", channel);
+      log(
+        `映射输入：workspace 条目 ×${workspaces.length}，task 行 ×${tasks.length}（收帧 ${channel.bridgeMessages.length} 条）。`
+      );
+
+      // —— s6：designate（指称 → 精确 id；唯一匹配，绝不按标题发送） ————————————
+      const designation = designateTarget(
+        ctx,
         workspaces,
         tasks,
-        generation: CONNECTION_GENERATION,
-      });
-      mapper.authorizeSend(bound, CONNECTION_GENERATION);
-    } catch (error) {
-      mappingVerdict = "ABORTED:generation";
-      record(ctx, "mapping", "generation-check-failed", {
-        reason: error instanceof Error ? error.message : String(error),
-      });
-      conn.close();
-      channel.detach();
-      gate.release();
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
+        parsed.workspace,
+        parsed.taskTitle
       );
-      return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
-    }
-    mappingVerdict = "MAPPED";
-    mappingSummary.target = {
-      taskId: bound.taskId,
-      workspacePath: bound.workspacePath,
-      workspaceKey: bound.workspaceKey,
-      generation: bound.generation,
-    };
-    record(ctx, "mapping", "designated", {
-      taskId: bound.taskId,
-      workspacePath: bound.workspacePath,
-      workspaceKey: bound.workspaceKey,
-      generation: bound.generation,
-      note: "以上为 redactor 别名（transcript 落盘前统一 sanitizeDeep）",
-    });
-    log(
-      `目标已锁定（别名）：taskId=${bound.taskId} workspace=${bound.workspaceKey}（generation ${bound.generation}）。`
-    );
-
-    // —— s7：send（缺 --send-authorized 只打印 WOULD-send） ————————————————
-    if (!parsed.sendAuthorized) {
-      sendVerdict = "MAPPED-NOT-SENT";
-      sendSummary.attempted = false;
-      sendSummary.reason = "missing --send-authorized";
-      const marker = `[tuvis-b2-marker:${new Date().toISOString()}]`;
-      sendSummary.wouldSend = {
-        chain:
-          "workspace-bridge-open{workspaceKey,taskId} → ready → rpc-frame 通道 " +
-          "helloConversationV4 → initializeConversationV4(clientHello) → " +
-          "subscribeConversationV4{workspacePath, workspaceIdentity?, sessionId} → " +
-          "sendConversationCommandV4{workspacePath, workspaceIdentity?, envelope}",
-        envelope: {
-          commandId: "<uuid>",
-          clientId: "<probe-client-id>",
-          sessionId: bound.taskId,
-          type: "sendText",
-          payload: { text: marker },
-          issuedAt: "<epoch-ms>",
-        },
-        note: "模型/思考强度/模式全缺省 = 沿用会话现值；不审批、不打断；恰一个 rpc-frame；未知不重发。",
-      };
-      record(ctx, "send", "would-send", sendSummary.wouldSend);
-      log("未提供 --send-authorized：映射完成即停。将发送的内容已记录到证据（would-send）。");
-      conn.close();
-      channel.detach();
-      gate.release();
-      record(ctx, "teardown", "closed", {});
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
-      );
-      return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
-    }
-
-    sendSummary.attempted = true;
-    const sendChannel = new B2Channel({
-      allowedTypes: SEND_PHASE_ALLOWED_TYPES,
-    });
-    sendChannel.attach(conn);
-    const bridgeSessionId = `b2-bridge-${crypto.randomUUID()}`;
-    redactor.register("sid", bridgeSessionId);
-    // workspace-bridge-open 形状钉源 @ 3c5b2276：
-    // WebRemoteControlWorkspaceBridgeOpenPayload{requestId, bridgeSessionId,
-    // bridgeGeneration?, recoveryId?, workspaceKey, taskId?}（packages/shared/src/
-    // web-remote-control.ts:435-447）；ready 回显同文件 :449-456；
-    // workspaceKey = workspaceIdentity?.trim() || workspacePath（同文件 :743-747）。
-    const bridgeOpen = await sendChannel.openWorkspaceBridge(
-      conn,
-      {
-        requestId: `b2-bridge-open-${crypto.randomBytes(6).toString("hex")}`,
-        bridgeSessionId,
-        workspaceKey: bound.workspaceKey,
+      if (!designation.ok) {
+        mappingVerdict = `ABORTED:designate-${designation.reason}`;
+        record(ctx, "mapping", "designate-failed", {
+          reason: designation.reason,
+          workspaceDesignation: redactor.sanitizeText(parsed.workspace),
+          taskDesignation: redactor.sanitizeText(parsed.taskTitle),
+        });
+        log(`映射中止：${designation.reason}（未发送任何写向；未匹配的指称不入证据正文）。`);
+        conn.close();
+        channel.detach();
+        gate.release();
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      const bound: BoundTarget = designation.bound;
+      try {
+        const mapper = SessionTargetMapper.fromListings({
+          workspaces,
+          tasks,
+          generation: CONNECTION_GENERATION,
+        });
+        mapper.authorizeSend(bound, CONNECTION_GENERATION);
+      } catch (error) {
+        mappingVerdict = "ABORTED:generation";
+        record(ctx, "mapping", "generation-check-failed", {
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        conn.close();
+        channel.detach();
+        gate.release();
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      mappingVerdict = "MAPPED";
+      mappingSummary.target = {
         taskId: bound.taskId,
-      },
-      BRIDGE_OPEN_TIMEOUT_MS
-    );
-    record(ctx, "send", "workspace-bridge-open", summarizePayload(bridgeOpen));
-    if (bridgeOpen.kind !== "ok") {
-      sendVerdict = `STOPPED:bridge-open-${bridgeOpen.kind}`;
-      log(`send 停止：workspace-bridge-open 未得到 ready（${bridgeOpen.kind}）。`);
-      conn.close();
-      sendChannel.detach();
-      channel.detach();
-      gate.release();
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
+        workspacePath: bound.workspacePath,
+        workspaceKey: bound.workspaceKey,
+        generation: bound.generation,
+      };
+      record(ctx, "mapping", "designated", {
+        taskId: bound.taskId,
+        workspacePath: bound.workspacePath,
+        workspaceKey: bound.workspaceKey,
+        generation: bound.generation,
+        note: "以上为 redactor 别名（transcript 落盘前统一 sanitizeDeep）",
+      });
+      log(
+        `目标已锁定（别名）：taskId=${bound.taskId} workspace=${bound.workspaceKey}（generation ${bound.generation}）。`
       );
-      return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
-    }
-    const readyPayload = bridgeOpen.payload as {
-      bridgeSessionId?: unknown;
-      bridgeGeneration?: unknown;
-      bridge?: { bridgeSessionId?: unknown; bridgeGeneration?: unknown; kind?: unknown };
-    };
-    const readyBridge = readyPayload.bridge;
-    const resolvedBridgeSessionId =
-      (typeof readyBridge?.bridgeSessionId === "string" && readyBridge.bridgeSessionId) ||
-      (typeof readyPayload.bridgeSessionId === "string" && readyPayload.bridgeSessionId) ||
-      bridgeSessionId;
-    const bridgeGeneration =
-      (typeof readyBridge?.bridgeGeneration === "number" && readyBridge.bridgeGeneration) ||
-      (typeof readyPayload.bridgeGeneration === "number" && readyPayload.bridgeGeneration) ||
-      CONNECTION_GENERATION;
-    const identity: RpcFrameIdentity = {
-      bridgeSessionId: resolvedBridgeSessionId,
-      bridgeGeneration,
-    };
-    redactor.register("sid", resolvedBridgeSessionId);
-    record(ctx, "send", "workspace-bridge-ready", {
-      bridgeSessionId: resolvedBridgeSessionId,
-      bridgeGeneration,
-      kind: typeof readyBridge?.kind === "string" ? readyBridge.kind : null,
-    });
-    log(`workspace bridge 已就绪（bridgeGeneration=${bridgeGeneration}）。`);
 
-    const clientId = `tuvis-b2-probe-${crypto.randomBytes(4).toString("hex")}`;
-    let bridgeSeq = 0;
-    let bridgeMessageSeq = 0;
-    let bridgeId = 0;
-    const bridgeCall = async (method: string, params: unknown): Promise<BridgeRpcOutcome> => {
-      bridgeId += 1;
-      bridgeSeq += 1;
-      bridgeMessageSeq += 1;
-      const result = await sendChannel.bridgeRequest(
+      // —— s7：send（缺 --send-authorized 只打印 WOULD-send） ————————————————
+      stage = "send";
+      if (!parsed.sendAuthorized) {
+        sendVerdict = "MAPPED-NOT-SENT";
+        sendSummary.attempted = false;
+        sendSummary.reason = "missing --send-authorized";
+        const marker = `[tuvis-b2-marker:${new Date().toISOString()}]`;
+        sendSummary.wouldSend = {
+          chain:
+            "workspace-bridge-open{workspaceKey,taskId} → ready → rpc-frame 通道 " +
+            "helloConversationV4 → initializeConversationV4(clientHello) → " +
+            "subscribeConversationV4{workspacePath, workspaceIdentity?, sessionId} → " +
+            "sendConversationCommandV4{workspacePath, workspaceIdentity?, envelope}",
+          envelope: {
+            commandId: "<uuid>",
+            clientId: "<probe-client-id>",
+            sessionId: bound.taskId,
+            type: "sendText",
+            payload: { text: marker },
+            issuedAt: "<epoch-ms>",
+          },
+          note: "模型/思考强度/模式全缺省 = 沿用会话现值；不审批、不打断；恰一个 rpc-frame；未知不重发。",
+        };
+        record(ctx, "send", "would-send", sendSummary.wouldSend);
+        log("未提供 --send-authorized：映射完成即停。将发送的内容已记录到证据（would-send）。");
+        conn.close();
+        channel.detach();
+        gate.release();
+        record(ctx, "teardown", "closed", {});
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+
+      sendSummary.attempted = true;
+      const sendChannel = new B2Channel({
+        allowedTypes: SEND_PHASE_ALLOWED_TYPES,
+      });
+      liveChannels.push(sendChannel);
+      sendChannel.attach(conn);
+      const bridgeSessionId = `b2-bridge-${crypto.randomUUID()}`;
+      redactor.register("sid", bridgeSessionId);
+      // workspace-bridge-open 形状钉源 @ 3c5b2276：
+      // WebRemoteControlWorkspaceBridgeOpenPayload{requestId, bridgeSessionId,
+      // bridgeGeneration?, recoveryId?, workspaceKey, taskId?}（packages/shared/src/
+      // web-remote-control.ts:435-447）；ready 回显同文件 :449-456；
+      // workspaceKey = workspaceIdentity?.trim() || workspacePath（同文件 :743-747）。
+      const bridgeOpen = await sendChannel.openWorkspaceBridge(
         conn,
-        { id: bridgeId, method, params, identity, seq: bridgeSeq, messageSeq: bridgeMessageSeq },
-        BRIDGE_RPC_TIMEOUT_MS
+        {
+          requestId: `b2-bridge-open-${crypto.randomBytes(6).toString("hex")}`,
+          bridgeSessionId,
+          workspaceKey: bound.workspaceKey,
+          taskId: bound.taskId,
+        },
+        BRIDGE_OPEN_TIMEOUT_MS
       );
-      record(ctx, "send", `bridge-${method}`, { id: bridgeId, outcome: result.kind });
-      return result;
-    };
+      record(ctx, "send", "workspace-bridge-open", summarizePayload(bridgeOpen));
+      if (bridgeOpen.kind !== "ok") {
+        sendVerdict = `STOPPED:bridge-open-${bridgeOpen.kind}`;
+        log(`send 停止：workspace-bridge-open 未得到 ready（${bridgeOpen.kind}）。`);
+        conn.close();
+        sendChannel.detach();
+        channel.detach();
+        gate.release();
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      const readyPayload = bridgeOpen.payload as {
+        bridgeSessionId?: unknown;
+        bridgeGeneration?: unknown;
+        bridge?: { bridgeSessionId?: unknown; bridgeGeneration?: unknown; kind?: unknown };
+      };
+      const readyBridge = readyPayload.bridge;
+      const resolvedBridgeSessionId =
+        (typeof readyBridge?.bridgeSessionId === "string" && readyBridge.bridgeSessionId) ||
+        (typeof readyPayload.bridgeSessionId === "string" && readyPayload.bridgeSessionId) ||
+        bridgeSessionId;
+      const bridgeGeneration =
+        (typeof readyBridge?.bridgeGeneration === "number" && readyBridge.bridgeGeneration) ||
+        (typeof readyPayload.bridgeGeneration === "number" && readyPayload.bridgeGeneration) ||
+        CONNECTION_GENERATION;
+      const identity: RpcFrameIdentity = {
+        bridgeSessionId: resolvedBridgeSessionId,
+        bridgeGeneration,
+      };
+      redactor.register("sid", resolvedBridgeSessionId);
+      record(ctx, "send", "workspace-bridge-ready", {
+        bridgeSessionId: resolvedBridgeSessionId,
+        bridgeGeneration,
+        kind: typeof readyBridge?.kind === "string" ? readyBridge.kind : null,
+      });
+      log(`workspace bridge 已就绪（bridgeGeneration=${bridgeGeneration}）。`);
 
-    // 官方握手顺序 hello → clientHello（形状钉源 @ 3c5b2276：
-    // packages/ui/src/v4/agentV4ConnectionHandshake.ts:30-46 —— hello 先行、
-    // clientHello{kind, protocolVersion, clientId, clientKind, appVersion, capabilities?}，
-    // clientKind = hello.clientMode === "desktop-continuous" ? "desktop" : "web"；
-    // helloMessageSchema = {kind:"hello", protocolVersion, connectionId, clientMode:
-    // "desktop-continuous"|"web-remote-replayable", deliveryProfile, serverTime,
-    // capabilities, auth}（packages/shared/src/zcode-protocol-v4/transport.ts:42-65）；
-    // clientHelloSchema 同文件 :69-92（capabilities 可选，缺省=旧客户端）；
-    // capabilities.independentPlanState 见同文件 :23-39（hostCapabilitiesSchema）。
-    // 探针省略 capabilities（optional，不声明任何扩展位=最小面）。
-    const hello = await bridgeCall(AGENT_HELLO_METHOD, undefined);
-    if (hello.kind !== "ok") {
-      sendVerdict = `STOPPED:hello-${hello.kind}`;
-      log(`send 停止：hello 未得到应答（${hello.kind}），不发送。`);
-      await teardownSend(conn, sendChannel, channel, gate);
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
+      const clientId = `tuvis-b2-probe-${crypto.randomBytes(4).toString("hex")}`;
+      let bridgeSeq = 0;
+      let bridgeMessageSeq = 0;
+      let bridgeId = 0;
+      const bridgeCall = async (method: string, params: unknown): Promise<BridgeRpcOutcome> => {
+        bridgeId += 1;
+        bridgeSeq += 1;
+        bridgeMessageSeq += 1;
+        const result = await sendChannel.bridgeRequest(
+          conn,
+          { id: bridgeId, method, params, identity, seq: bridgeSeq, messageSeq: bridgeMessageSeq },
+          BRIDGE_RPC_TIMEOUT_MS
+        );
+        record(ctx, "send", `bridge-${method}`, { id: bridgeId, outcome: result.kind });
+        return result;
+      };
+
+      // 官方握手顺序 hello → clientHello（形状钉源 @ 3c5b2276：
+      // packages/ui/src/v4/agentV4ConnectionHandshake.ts:30-46 —— hello 先行、
+      // clientHello{kind, protocolVersion, clientId, clientKind, appVersion, capabilities?}，
+      // clientKind = hello.clientMode === "desktop-continuous" ? "desktop" : "web"；
+      // helloMessageSchema = {kind:"hello", protocolVersion, connectionId, clientMode:
+      // "desktop-continuous"|"web-remote-replayable", deliveryProfile, serverTime,
+      // capabilities, auth}（packages/shared/src/zcode-protocol-v4/transport.ts:42-65）；
+      // clientHelloSchema 同文件 :69-92（capabilities 可选，缺省=旧客户端）；
+      // capabilities.independentPlanState 见同文件 :23-39（hostCapabilitiesSchema）。
+      // 探针省略 capabilities（optional，不声明任何扩展位=最小面）。
+      const hello = await bridgeCall(AGENT_HELLO_METHOD, undefined);
+      if (hello.kind !== "ok") {
+        sendVerdict = `STOPPED:hello-${hello.kind}`;
+        log(`send 停止：hello 未得到应答（${hello.kind}），不发送。`);
+        await teardownSend(conn, sendChannel, channel, gate);
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      const helloBody = hello.decoded.body as {
+        kind?: unknown;
+        connectionId?: unknown;
+        clientMode?: unknown;
+        capabilities?: { independentPlanState?: unknown };
+      } | null;
+      if (!helloBody || helloBody.kind !== "hello" || typeof helloBody.connectionId !== "string") {
+        sendVerdict = "STOPPED:hello-shape";
+        record(ctx, "send", "hello-shape-unexpected", {});
+        log("send 停止：hello 应答形状不符，不发送。");
+        await teardownSend(conn, sendChannel, channel, gate);
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      const clientMode =
+        helloBody.clientMode === "desktop-continuous"
+          ? "desktop-continuous"
+          : "web-remote-replayable";
+      const clientHello = await bridgeCall(AGENT_CLIENT_HELLO_METHOD, {
+        kind: "clientHello",
+        protocolVersion: V4_WIRE_PROTOCOL_VERSION,
+        clientId,
+        clientKind: clientMode === "desktop-continuous" ? "desktop" : "web",
+        appVersion: "tuvis-b2-probe",
+      });
+      if (clientHello.kind !== "ok") {
+        sendVerdict = `STOPPED:clientHello-${clientHello.kind}`;
+        log(`send 停止：clientHello 未得到应答（${clientHello.kind}），不发送。`);
+        await teardownSend(conn, sendChannel, channel, gate);
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+
+      // 订阅目标会话（官方 UI transport 同款 wire 参数，打开完成证据的事件流；
+      // 官方发送本身只依赖握手，不依赖订阅——此处订阅只为观察轮次活动帧）。
+      // 形状钉源 @ 3c5b2276：subscribe params = {workspacePath, workspaceIdentity?,
+      // sessionId, base?, visibility?, retryInitialization?}
+      // （packages/ui/src/v4/agentConversationTransport.ts:207-214：{...workspace,
+      // sessionId, ...可选基线}；workspace = {workspacePath, workspaceIdentity?}
+      // 同文件 :94-97；ZCodeAgentConversationSubscribeParams
+      // packages/services/src/zcode-agent/zcodeAgent.ts:400-405）。
+      // sessionId = "conversation/<sessionId>" topic 的精确后缀
+      // （packages/shared/src/zcode-protocol-v4/transport.ts:113,205）。
+      const subscribe = await bridgeCall("subscribeConversationV4", {
+        workspacePath: bound.workspacePath,
+        ...(bound.workspaceIdentity !== undefined
+          ? { workspaceIdentity: bound.workspaceIdentity }
+          : {}),
+        sessionId: bound.taskId,
+      });
+      if (subscribe.kind !== "ok") {
+        sendVerdict = `STOPPED:subscribe-${subscribe.kind}`;
+        log(`send 停止：会话订阅未得到应答（${subscribe.kind}），不发送。`);
+        await teardownSend(conn, sendChannel, channel, gate);
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+
+      // 发送：唯一合成 marker；恰一个 rpc-frame；未知不重发。
+      const marker = `[tuvis-b2-marker:${new Date().toISOString()}]`;
+      const loop = new SendOnceLoop({
+        sender: conn,
+        identity,
+        target: bound,
+        markerText: marker,
+        clientId,
+        timeouts: { ackMs: SEND_ACK_TIMEOUT_MS, activityMs: SEND_ACTIVITY_TIMEOUT_MS },
+        channelRequestId: bridgeId + 1,
+        firstSeq: bridgeSeq + 1,
+        firstMessageSeq: bridgeMessageSeq + 1,
+        isTurnActivity: (decoded, rawJson) =>
+          decoded?.headerType === RESPONSE_TYPE_EVENT_FIRE && rawJson.includes(bound.taskId),
+      });
+      // rpc-frame 与 rpc-frame-ack 经 handle → onRpcFrame 喂给 loop（attach 已在
+      // bridge-open 前完成；ack 转发见 B2Channel.handle 的 rpc-frame-ack 分支）。
+      sendChannel.onRpcFrame = (payload) => loop.onData(payload);
+      const sendOutcome = await loop.run();
+      sendSummary.marker = {
+        prefix: "[tuvis-b2-marker:",
+        issuedUtc: marker.slice(17, -1),
+        synthetic: true,
+      };
+      sendSummary.outcome = sendOutcome;
+      sendSummary.lifecycle = {
+        framesSent: loop.framesSent,
+        peerAcknowledged: loop.peerAcknowledged,
+        duplicateInboundFrames: loop.duplicateInboundFrames,
+        activityFrames: loop.activityFrames,
+        commandId: loop.sentCommandId,
+      };
+      record(ctx, "send", "outcome", {
+        outcome: sendOutcome,
+        lifecycle: sendSummary.lifecycle,
+        note: "恰一个 rpc-frame；重复入站帧去重；unknown 不重发（结构性无重发路径）",
+      });
+      log(
+        `send outcome = ${sendOutcome.kind}${
+          sendOutcome.kind === "completed" ? `（activityFrames=${sendOutcome.activityFrames}）` : ""
+        }；framesSent=${loop.framesSent}，peerAck=${loop.peerAcknowledged}。`
       );
-      return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
-    }
-    const helloBody = hello.decoded.body as {
-      kind?: unknown;
-      connectionId?: unknown;
-      clientMode?: unknown;
-      capabilities?: { independentPlanState?: unknown };
-    } | null;
-    if (!helloBody || helloBody.kind !== "hello" || typeof helloBody.connectionId !== "string") {
-      sendVerdict = "STOPPED:hello-shape";
-      record(ctx, "send", "hello-shape-unexpected", {});
-      log("send 停止：hello 应答形状不符，不发送。");
+      sendVerdict =
+        sendOutcome.kind === "completed"
+          ? "COMPLETED"
+          : sendOutcome.kind === "accepted"
+            ? "ACCEPTED"
+            : sendOutcome.kind === "rejected"
+              ? "REJECTED"
+              : sendOutcome.kind === "send-failed"
+                ? "STOPPED:send-failed"
+                : "UNKNOWN";
+      recordChannelEvidence(ctx, "send", sendChannel);
+
+      // —— s8：teardown ————————————————————————————————————————————————————————
+      stage = "teardown";
       await teardownSend(conn, sendChannel, channel, gate);
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
-      );
-      return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
-    }
-    const clientMode =
-      helloBody.clientMode === "desktop-continuous"
-        ? "desktop-continuous"
-        : "web-remote-replayable";
-    const clientHello = await bridgeCall(AGENT_CLIENT_HELLO_METHOD, {
-      kind: "clientHello",
-      protocolVersion: V4_WIRE_PROTOCOL_VERSION,
-      clientId,
-      clientKind: clientMode === "desktop-continuous" ? "desktop" : "web",
-      appVersion: "tuvis-b2-probe",
-    });
-    if (clientHello.kind !== "ok") {
-      sendVerdict = `STOPPED:clientHello-${clientHello.kind}`;
-      log(`send 停止：clientHello 未得到应答（${clientHello.kind}），不发送。`);
-      await teardownSend(conn, sendChannel, channel, gate);
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
-      );
-      return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      record(ctx, "teardown", "closed", {});
+      log("连接已主动断开（探针侧 close；无重连路径）。JWT/一次性 token 随进程退出即弃。");
     }
 
-    // 订阅目标会话（官方 UI transport 同款 wire 参数，打开完成证据的事件流；
-    // 官方发送本身只依赖握手，不依赖订阅——此处订阅只为观察轮次活动帧）。
-    // 形状钉源 @ 3c5b2276：subscribe params = {workspacePath, workspaceIdentity?,
-    // sessionId, base?, visibility?, retryInitialization?}
-    // （packages/ui/src/v4/agentConversationTransport.ts:207-214：{...workspace,
-    // sessionId, ...可选基线}；workspace = {workspacePath, workspaceIdentity?}
-    // 同文件 :94-97；ZCodeAgentConversationSubscribeParams
-    // packages/services/src/zcode-agent/zcodeAgent.ts:400-405）。
-    // sessionId = "conversation/<sessionId>" topic 的精确后缀
-    // （packages/shared/src/zcode-protocol-v4/transport.ts:113,205）。
-    const subscribe = await bridgeCall("subscribeConversationV4", {
-      workspacePath: bound.workspacePath,
-      ...(bound.workspaceIdentity !== undefined
-        ? { workspaceIdentity: bound.workspaceIdentity }
-        : {}),
-      sessionId: bound.taskId,
-    });
-    if (subscribe.kind !== "ok") {
-      sendVerdict = `STOPPED:subscribe-${subscribe.kind}`;
-      log(`send 停止：会话订阅未得到应答（${subscribe.kind}），不发送。`);
-      await teardownSend(conn, sendChannel, channel, gate);
-      await writeEvidence(
-        ctx,
-        oauthVerdict,
-        connectVerdict,
-        mappingVerdict,
-        sendVerdict,
-        oauthSummary,
-        connectSummary,
-        mappingSummary,
-        sendSummary
-      );
-      return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
-    }
-
-    // 发送：唯一合成 marker；恰一个 rpc-frame；未知不重发。
-    const marker = `[tuvis-b2-marker:${new Date().toISOString()}]`;
-    const loop = new SendOnceLoop({
-      sender: conn,
-      identity,
-      target: bound,
-      markerText: marker,
-      clientId,
-      timeouts: { ackMs: SEND_ACK_TIMEOUT_MS, activityMs: SEND_ACTIVITY_TIMEOUT_MS },
-      channelRequestId: bridgeId + 1,
-      firstSeq: bridgeSeq + 1,
-      firstMessageSeq: bridgeMessageSeq + 1,
-      isTurnActivity: (decoded, rawJson) =>
-        decoded?.headerType === RESPONSE_TYPE_EVENT_FIRE && rawJson.includes(bound.taskId),
-    });
-    // rpc-frame 与 rpc-frame-ack 经 handle → onRpcFrame 喂给 loop（attach 已在
-    // bridge-open 前完成；ack 转发见 B2Channel.handle 的 rpc-frame-ack 分支）。
-    sendChannel.onRpcFrame = (payload) => loop.onData(payload);
-    const sendOutcome = await loop.run();
-    sendSummary.marker = {
-      prefix: "[tuvis-b2-marker:",
-      issuedUtc: marker.slice(17, -1),
-      synthetic: true,
-    };
-    sendSummary.outcome = sendOutcome;
-    sendSummary.lifecycle = {
-      framesSent: loop.framesSent,
-      peerAcknowledged: loop.peerAcknowledged,
-      duplicateInboundFrames: loop.duplicateInboundFrames,
-      activityFrames: loop.activityFrames,
-      commandId: loop.sentCommandId,
-    };
-    record(ctx, "send", "outcome", {
-      outcome: sendOutcome,
-      lifecycle: sendSummary.lifecycle,
-      note: "恰一个 rpc-frame；重复入站帧去重；unknown 不重发（结构性无重发路径）",
-    });
-    log(
-      `send outcome = ${sendOutcome.kind}${
-        sendOutcome.kind === "completed" ? `（activityFrames=${sendOutcome.activityFrames}）` : ""
-      }；framesSent=${loop.framesSent}，peerAck=${loop.peerAcknowledged}。`
+    await writeEvidence(
+      ctx,
+      oauthVerdict,
+      connectVerdict,
+      mappingVerdict,
+      sendVerdict,
+      oauthSummary,
+      connectSummary,
+      mappingSummary,
+      sendSummary
     );
-    sendVerdict =
-      sendOutcome.kind === "completed"
-        ? "COMPLETED"
-        : sendOutcome.kind === "accepted"
-          ? "ACCEPTED"
-          : sendOutcome.kind === "rejected"
-            ? "REJECTED"
-            : sendOutcome.kind === "send-failed"
-              ? "STOPPED:send-failed"
-              : "UNKNOWN";
-    recordChannelEvidence(ctx, "send", sendChannel);
-
-    // —— s8：teardown ————————————————————————————————————————————————————————
-    await teardownSend(conn, sendChannel, channel, gate);
-    record(ctx, "teardown", "closed", {});
-    log("连接已主动断开（探针侧 close；无重连路径）。JWT/一次性 token 随进程退出即弃。");
+    log(
+      `oauth=${oauthVerdict} connect=${connectVerdict} mapping=${mappingVerdict} send=${sendVerdict}`
+    );
+    return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+  } catch (error) {
+    // 故障围栏：任何未处理异常 → 记账 + 尽力清理 + 结构化 STOPPED verdict + 证据照常
+    // 落盘（绝不裸 crash 丢证据——评审 Important 修复；exit 约定：干净停止 0，
+    // 证据落盘本身失败 2）。
+    const message = error instanceof Error ? error.message : String(error);
+    record(ctx, "fault", "unhandled-throw", {
+      stage,
+      message: redactor.sanitizeText(message),
+    });
+    log(`探针故障（${stage} 阶段未处理异常）：${message}；清理连接并照常落证。`);
+    cleanupLive();
+    // 在飞阶段尚无终局 verdict → 记 STOPPED:fault-<阶段>；已定案的 verdict 不改写
+    // （故障细节在 transcript 的 fault 事件条目里）。
+    if (stage === "oauth" && oauthVerdict === "SKIPPED") {
+      oauthVerdict = "STOPPED:fault-oauth";
+    } else if (stage === "connect" && connectVerdict === "SKIPPED") {
+      connectVerdict = "STOPPED:fault-connect";
+    } else if (stage === "mapping" && mappingVerdict === "SKIPPED") {
+      mappingVerdict = "STOPPED:fault-mapping";
+    } else if (stage === "send" && sendVerdict === "SKIPPED") {
+      sendVerdict = "STOPPED:fault-send";
+    }
+    let exitCode = 0;
+    try {
+      await writeEvidence(
+        ctx,
+        oauthVerdict,
+        connectVerdict,
+        mappingVerdict,
+        sendVerdict,
+        oauthSummary,
+        connectSummary,
+        mappingSummary,
+        sendSummary
+      );
+    } catch (flushError) {
+      // 证据落盘本身失败（如 fail-closed 断言拒写）：如实报告，run 不算干净完成。
+      console.error(
+        `[b2-probe] 证据落盘失败：${flushError instanceof Error ? flushError.message : String(flushError)}`
+      );
+      exitCode = 2;
+    }
+    log(
+      `oauth=${oauthVerdict} connect=${connectVerdict} mapping=${mappingVerdict} send=${sendVerdict}`
+    );
+    return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode };
   }
-
-  await writeEvidence(
-    ctx,
-    oauthVerdict,
-    connectVerdict,
-    mappingVerdict,
-    sendVerdict,
-    oauthSummary,
-    connectSummary,
-    mappingSummary,
-    sendSummary
-  );
-  log(
-    `oauth=${oauthVerdict} connect=${connectVerdict} mapping=${mappingVerdict} send=${sendVerdict}`
-  );
-  return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
 }
 
 async function teardownSend(
