@@ -159,8 +159,12 @@ export class RelayTerminalConnection {
   private socket?: WebSocket;
   private pairWindowTimer?: ReturnType<typeof setTimeout>;
   private readonly webSocketImpl: typeof WebSocket;
+  // 注意：不用构造器参数属性（private readonly options）——本目录需可被 `node`
+  // 的 type-stripping 直接执行，只能用可擦除 TS 语法。
+  private readonly options: RelayTerminalConnectionOptions;
 
-  constructor(private readonly options: RelayTerminalConnectionOptions) {
+  constructor(options: RelayTerminalConnectionOptions) {
+    this.options = options;
     this.webSocketImpl = options.webSocketImpl ?? WebSocket;
   }
 
