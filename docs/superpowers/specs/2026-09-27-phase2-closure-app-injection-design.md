@@ -1,5 +1,7 @@
 # 二期收尾总设计 · APP 类注入 + 无头通道 + 交接导出 v2（需求说明书）
 
+> **2026-10-24 新裁决与当前执行入口：** [ZCode 统一远控设计 v3](2026-10-24-zcode-unified-remote-design.md) 与[新总计划](../plans/2026-10-24-zcode-unified-remote-master-plan.md) 承接本轮设置／读取和官方协议统一 UI。用户已明确 H3 与 Codex 兼容发送缺键默认开启、显式 false 保留；下文默认关／yolo 是历史裁决，不再作为本轮默认值依据。ZCode H7/H10 CLI 移植暂不执行，其他工具历史内容保留；不修改 MASTER-PLAN。
+
 > 日期：2026-09-27（2026-10-04 落档）· 状态：**定稿落档**——Phase P+ 探测两端完成 + 裁决门六裁（裁决 12–17）+ 补测暴露缺陷裁决（裁决 18）+ Windows 补测收口；实现批次（C0 起）计划另立文档
 > 基线：`origin/main` `78bf114`（v0.5.0-beta.1；M6–M9 注入主线 + M6R–M9R 加固已交付）；工作分支 `feat/phase2-closure-app-injection`
 > 上位文档：`docs/MASTER-PLAN.md`（宪法）；`docs/superpowers/specs/2026-09-18-phase2-message-injection-design.md`（二期注入总 spec，本批 = 其 W7/M11 提前扩容 + W9/M10 落地 + 收尾编排；功能点 H 系与旧 spec W 系映射见附录 C）
