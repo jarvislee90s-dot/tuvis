@@ -11,9 +11,10 @@
 //   - 响应信封 {code:0,msg,data:{token,expires_in}}，token 为 22 字符 base64URL（末字符∈[AQgw]）
 //     → contract.ts:119-133（token schema 与信封 union）
 //   - WS /api/v1/remote/ws2?token=<一次性token>，open 后发
-//     auth_init{device_sid,meta,client_ts} → auth_ack{device_sid,pair_status}
+//     auth_init{device_sid,meta,client_ts} → auth_ack{device_sid,pair_status: waiting|matched}；
+//     waiting 为合法配对前态（官方 30s 窗口内等 matched，超时为独立终态、非 rejected）
 //     → contract.ts:19-24 与 53-59；packages/web/src/web-remote-control/adapters/
-//       webRemoteControlTransport.ts:106-143（URL 参数与 auth_init）
+//       webRemoteControlTransport.ts:106-143,460-473
 //   - 出站 data 帧仅在 paired 态发送（客户端门禁）
 //     → webRemoteControlTransport.ts:216-222（未 paired 返回 unavailable）
 //   - error 帧 code ∈ AUTH_FAILED|WRONG_PARAM|KICKED|INTERNAL|DEVICE_OFFLINE
@@ -21,7 +22,8 @@
 //     → packages/shared/src/web-remote-relay/domain/retry.ts:26-30
 //
 // 被测客户端 = scripts/zcode-bridge-probe/relayAuth.ts（Tuvis 侧参照实现）：
-// 单连接、无自动重连、token 一次性、认证失败/被踢即停且不发后续帧。
+// 单连接、无自动重连、token 一次性、认证失败/被踢/配对窗口超时即停且不发后续帧；
+// pair_status=waiting 为非终态前态（保活等 matched，不并案 rejected）。
 // 全部凭据为合成值（b1-fake-* / 随机 token），不含任何真实 SID/JWT/token/链接。
 import * as crypto from "node:crypto";
 import * as http from "node:http";
@@ -45,6 +47,7 @@ import {
   OFFICIAL_TOKEN_SHAPE,
   RelayTerminalConnection,
   requestTerminalToken,
+  type RelayConnectionResult,
 } from "../../scripts/zcode-bridge-probe/relayAuth";
 
 // ---------------------------------------------------------------------------
@@ -79,6 +82,8 @@ class FakeRelay {
   private readonly server: http.Server;
   private readonly tokens = new Map<string, StoredToken>();
   private readonly sessions = new Set<ClientSession>();
+  /** auth_ack 的 pair_status 剧本：默认 ["matched"]；waiting 用例注入 ["waiting"] 等。 */
+  private pairScript: Array<"waiting" | "matched"> = ["matched"];
 
   constructor() {
     this.server = http.createServer((req, res) => this.handleHttp(req, res));
@@ -120,6 +125,29 @@ class FakeRelay {
         this.stats.kickedSent += 1;
         this.sendJson(session, { type: "error", code: "KICKED", message: "fake-relay: kicked" });
         this.closeSession(session);
+      }
+    }
+  }
+
+  /** 测试直发：改写 auth_ack 的 pair_status 剧本（默认 ["matched"]）。 */
+  setPairScript(script: Array<"waiting" | "matched">): void {
+    this.pairScript = [...script];
+  }
+
+  /**
+   * 测试直发：对已认证会话补发 auth_ack（官方 pair_status_query 心跳的回应形态，
+   * contract.ts:53-59；被测客户端不发心跳，waiting 语义由该注入驱动）。
+   */
+  sendPairAck(pairStatus: "waiting" | "matched"): void {
+    for (const session of this.sessions) {
+      if (session.authenticated && session.alive) {
+        this.sendJson(session, {
+          type: "auth_ack",
+          device_sid: this.deviceSid,
+          terminal_sid: "b1-fake-terminal-sid-0001",
+          pair_status: pairStatus,
+          server_ts: Math.floor(Date.now() / 1000),
+        });
       }
     }
   }
@@ -230,7 +258,7 @@ class FakeRelay {
         type: "auth_ack",
         device_sid: this.deviceSid,
         terminal_sid: "b1-fake-terminal-sid-0001",
-        pair_status: "matched",
+        pair_status: this.pairScript.shift() ?? "matched",
         server_ts: Math.floor(Date.now() / 1000),
       });
       return;
@@ -422,8 +450,12 @@ describe("zcode 官方桥接：fake relay 上的终端身份门槛（B1）", () 
     expect(OFFICIAL_TOKEN_SHAPE.test(first.token)).toBe(true); // 官方客户端侧 schema（contract.ts:121）
 
     // token 一次性、不缓存：每次申请铸造新值（webRemoteControlV2Token.ts:8）
+    // 先断言第二次申请确已成功（kind/token 形状），再做不等式——避免失败态混过比较。
     const second = await requestTerminalToken({ relayOrigin, accountJwt: relay.accountJwt });
-    expect(second.kind === "ok" && second.token).not.toBe(first.token);
+    expect(second).toMatchObject({ kind: "ok" });
+    if (second.kind !== "ok") return;
+    expect(second.token).not.toBe(first.token);
+    expect(OFFICIAL_TOKEN_SHAPE.test(second.token)).toBe(true);
 
     const conn = track(
       new RelayTerminalConnection({ relayWsUrl, token: first.token, deviceSid: relay.deviceSid })
@@ -434,6 +466,57 @@ describe("zcode 官方桥接：fake relay 上的终端身份门槛（B1）", () 
     // paired 后 data 帧被 relay 接受
     expect(conn.sendData({ probe: "b1-read-only-marker" })).toBe(true);
     await waitFor(() => relay.stats.dataAccepted === 1);
+  });
+
+  it("pair_status=waiting 是合法前态：保活等待，收到 matched 才 paired", async () => {
+    relay.setPairScript(["waiting"]);
+    const conn = track(
+      new RelayTerminalConnection({
+        relayWsUrl,
+        token: relay.mintToken(),
+        deviceSid: relay.deviceSid,
+        pairWindowMs: 5_000, // 官方 30s 窗口的测试短模（OFFICIAL_PAIR_WINDOW_MS 同因终态）
+      })
+    );
+    let outcome: RelayConnectionResult | undefined;
+    void conn.connect().then((result) => {
+      outcome = result;
+    });
+    await waitFor(() => conn.currentState === "waiting");
+    // 窗口内：连接保活、未终态、未 paired 不得发送 data（客户端门禁照常生效）
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(outcome).toBeUndefined();
+    expect(conn.currentState).toBe("waiting");
+    expect(conn.sendData({ probe: "while-waiting" })).toBe(false);
+    expect(relay.stats.wsUpgrades).toBe(1);
+
+    // 后续 auth_ack(matched)（官方 pair_status_query 心跳的回应形态）→ 才落 paired
+    relay.sendPairAck("matched");
+    await waitFor(() => outcome === "paired");
+    expect(conn.currentState).toBe("paired");
+    expect(conn.sendData({ probe: "after-matched" })).toBe(true);
+    await waitFor(() => relay.stats.dataAccepted === 1);
+  });
+
+  it("waiting 配对窗口超时：结果为 pair-timeout（非 rejected），不发后续帧也不重连", async () => {
+    relay.setPairScript(["waiting"]);
+    const conn = track(
+      new RelayTerminalConnection({
+        relayWsUrl,
+        token: relay.mintToken(),
+        deviceSid: relay.deviceSid,
+        pairWindowMs: 60, // 有界短窗口（官方 30s 的测试模，webRemoteControlTransport.ts:460-473）
+      })
+    );
+    await expect(conn.connect()).resolves.toBe("pair-timeout");
+    expect(conn.currentState).toBe("pair-timeout");
+    // 超时 ≠ 显式拒绝：不得静默并案为 rejected（决策文件 §6.2-9 口径）
+    expect(conn.currentState).not.toBe("rejected");
+    expect(conn.sendData({ probe: "after-timeout" })).toBe(false);
+    expect(relay.stats.dataAccepted).toBe(0);
+    // 客户端无重连路径：升级计数不增长
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(relay.stats.wsUpgrades).toBe(1);
   });
 
   it("过期 token 与已消费 token 均被拒；认证失败后客户端不发后续帧", async () => {

@@ -14,9 +14,9 @@
 // 的客户端侧实现 + tests/remote/zcodeBridgeRelay.test.ts 的 fake relay 锁形；
 // 逐条行号见 scripts/zcode-bridge-probe/relayAuth.ts 头注与决策文件 B1 节。
 
-import { RelayTerminalConnection, requestTerminalToken } from "./relayAuth";
-
-/** 探针安全闸（红线，工作包 B 全局约束）：全部硬编码，运行期不可放宽。 */
+/** 探针安全闸（红线，工作包 B 全局约束）：全部硬编码，运行期不可放宽。
+ *  本阶段（B1 source+fake 骨架）**仅为声明式登记（declarative-only）**：骨架不执行任何
+ *  连接，这些闸的运行期强制（单连接、只读白名单、超时断开等）随真实连接实现批次落地。 */
 export const PROBE_GUARDS = {
   /** 全程只允许存在一条上游连接；连接失败/被拒不重试。 */
   singleConnection: true,
@@ -112,7 +112,8 @@ export function main(argv: readonly string[] = process.argv): never {
       `真实连接须由操作员携带 ${REAL_CONNECTION_UNLOCK_FLAG} 且停等项全部完成后才可运行。`
   );
 
-  // —— 解锁后（未来批次）的实现要点（此处不可达，仅登记形状）：
+  // —— 解锁后（未来批次）的实现要点（此处不可达，仅登记形状；
+  //    requestTerminalToken / RelayTerminalConnection 均为 ./relayAuth 导出）：
   //
   // const result = await requestTerminalToken({ relayOrigin, accountJwt });
   // if (result.kind !== "ok") fail(result.kind);

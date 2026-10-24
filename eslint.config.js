@@ -12,6 +12,7 @@ export default tseslint.config(
       "src/**/*.{ts,tsx}",
       "tests/**/*.{ts,tsx}",
       "scripts/*.mjs",
+      "scripts/zcode-bridge-probe/**/*.ts",
       "vite.config.ts",
       "vite.config.mobile.ts",
     ],
