@@ -1907,6 +1907,77 @@ describe("RemoteSection 本机名称默认系统名（M5 A6）", () => {
   });
 });
 
+// A1（2026-10-24 §7.1）：remote.headless_enabled / remote.compat_send_enabled 缺键
+// 新默认 = 开；状态未返回时 loading/disabled（不得先显示成「用户关了」），旧载荷缺
+// 字段时按新默认展示；compatSendEligible 仍独立决定开关可开启性，不从偏好继承。
+describe("RemoteSection 投递偏好默认值（A1 §7.1）", () => {
+  const switchOf = (name: RegExp) => screen.getByRole("switch", { name });
+
+  it("status 未返回时两个偏好开关 loading/disabled，不把缺键短暂显示成关闭", () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status") return new Promise(() => {}); // 永不返回：停在加载态
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    const headless = switchOf(/headless injection/i);
+    const compat = switchOf(/compatibility send/i);
+    expect(headless).toBeDisabled();
+    expect(compat).toBeDisabled();
+    // 新默认 = 开（缺键不是用户关闭）；加载中只禁用交互，不闪成 false
+    expect(headless).toBeChecked();
+    expect(compat).toBeChecked();
+  });
+
+  it("旧载荷缺字段 → 两开关按新默认展示为开；资格字段不继承该默认", async () => {
+    // 默认 beforeEach 的 statusOf() 不带 headless/compat 字段（= 旧载荷形状）
+    render(<RemoteSection />);
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /enable remote access/i })).toBeEnabled()
+    );
+    const headless = switchOf(/headless injection/i);
+    expect(headless).toBeEnabled();
+    expect(headless).toBeChecked();
+    const compat = switchOf(/compatibility send/i);
+    expect(compat).toBeChecked();
+    // 资格仍独立：缺 compatSendEligible → 未取证提示照常显示（不因偏好开而隐藏）
+    expect(screen.getByText(/read-only probe must complete first/i)).toBeTruthy();
+  });
+
+  it("资格字段独立决定可开启性：未取证 + 显式关闭 → 不可开启；取证后 → 可开启", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status")
+        return statusOf({ compatSendEnabled: false, compatSendEligible: false });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /enable remote access/i })).toBeEnabled()
+    );
+    const compat = switchOf(/compatibility send/i);
+    expect(compat).not.toBeChecked();
+    expect(compat).toBeDisabled();
+    expect(screen.getByText(/read-only probe must complete first/i)).toBeTruthy();
+
+    cleanup();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status")
+        return statusOf({ compatSendEnabled: false, compatSendEligible: true });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+    render(<RemoteSection />);
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /enable remote access/i })).toBeEnabled()
+    );
+    expect(switchOf(/compatibility send/i)).toBeEnabled();
+  });
+});
+
 // i18n 契约：RemoteSection / useRemoteEvents 源码里引用的每个 settings.remote.* 键，
 // 必须在 zh 与 en 两个 locale 同齐备（缺键即键路径泄漏到 UI）；两 locale 键集必须相等。
 describe("RemoteSection i18n zh/en 无缺键（M5 A6）", () => {

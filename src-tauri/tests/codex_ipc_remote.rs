@@ -1217,9 +1217,19 @@ async fn send_desktop_owned_without_send_refuses_instead_of_headless() {
 
 /// #172 解耦：只读取证 build（state=true / send=false）——读能力可用、发送如实拒绝，
 /// 且拒绝理由**不是** headless_disabled（两者拆开归因）。
+///
+/// A1 起兼容发送偏好缺键 = 开；本用例显式关闭该偏好，保留「没有兼容许可时，
+/// 写能力未取证不得改走无头通道」的既有能力门回归。
 #[tokio::test]
 async fn send_state_only_build_refuses_as_capability_unverified() {
     let f = fixture_state_only(vec![codex_app_session(THREAD)]);
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.compat_send_enabled', 'false')",
+            [],
+        )
+        .unwrap();
+    });
     assert!(
         f.state.codex_control.state_available(),
         "读链已取证 → 详情投影可用"
@@ -5279,11 +5289,176 @@ async fn count_start_turn_frames(peer: &mut ScriptedPeer) -> usize {
     count
 }
 
+/// A1（2026-10-24 §7.1）：兼容发送偏好缺键 = 开，但「偏好」不替代证据/能力门。
+///
+/// 四档同一 fake hub / 设备缝：
+/// ① 未知 build + 连接不可达（写前 NotSent）+ 不配置任何设置 → 偏好默认开允许一次
+///    既有兜底，并把「写前未投递」如实记进探测账本（failed）；
+/// ② 同一故障形态 + 显式 `false` + H3 显式开 → 仍按旧选择拒发（403
+///    capability_unverified，零兜底、零账本行）；
+/// ③ 不具备能力资格的 closed build + 缺键默认 → 仍拒发（默认开不得绕过能力门；
+///    send-info 同源置灰）；
+/// ④ 已取证 build + 缺键默认 → 路由不变（仍走 Desktop IPC accepted，不写实验账本）。
+#[tokio::test]
+async fn default_compat_still_requires_evidence() {
+    // ① 缺键 = 新默认开：未知 build 的兼容路径无需用户先配置即可请求。
+    let _path = IsolatedPath::lock_empty();
+    let f = fixture_unknown_build_offline(vec![codex_app_session(THREAD)]);
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("默认兼容尝试", Some("act-def-1"), false)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "缺键默认开：允许一次兼容兜底尝试");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["status"], "headless", "{v}");
+    assert_eq!(v["actionId"], "act-def-1");
+    let rows = send_probe_rows(&f);
+    assert_eq!(rows.len(), 1, "缺键默认开也必须如实记一次尝试: {rows:?}");
+    assert_eq!(rows[0].1, "failed", "写前未投递 = failed: {rows:?}");
+
+    // ② 显式 false 保留：同一故障形态不再走兼容兜底。
+    let f = fixture_unknown_build_offline(vec![codex_app_session(THREAD)]);
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.compat_send_enabled', 'false')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.headless_enabled', 'true')",
+            [],
+        )
+        .unwrap();
+    });
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("显式关闭", Some("act-def-2"), false)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "显式 false 仍拒发");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["error"], "capability_unverified", "{v}");
+    assert!(
+        send_probe_rows(&f).is_empty(),
+        "未获兼容许可不得写实验账本: {:?}",
+        send_probe_rows(&f)
+    );
+    assert!(
+        !f.codex_audits()
+            .iter()
+            .any(|a| a.action == "codex_fallback" && a.result.contains("handed_off")),
+        "显式 false 不得兜底交接: {:?}",
+        f.codex_audits()
+    );
+
+    // ③ 不具备能力资格的 closed build：缺键默认开也不放行。
+    let f = fixture_disabled(vec![codex_app_session(THREAD)]);
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(send_body("能力门仍在", Some("act-def-3"), false)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "能力门不得被默认值绕过");
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["reasonCode"], "capability_unverified", "{v}");
+    assert!(send_probe_rows(&f).is_empty());
+    // send-info 与 send 同源：输入区仍置灰并给同一归因。
+    let r = f
+        .app
+        .clone()
+        .oneshot(req(
+            "GET",
+            &format!("/m/api/v1/session-send-info?session_id={THREAD}"),
+            Some(COOKIE),
+            None,
+        ))
+        .await
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(info["injectable"], serde_json::json!(false), "{info}");
+    assert_eq!(info["reasonCode"], "capability_unverified", "{info}");
+
+    // ④ 已取证 build：偏好默认开不改变既有路由（Desktop IPC 原样).
+    let mut f = fixture_ipc(vec![codex_app_session(THREAD)]);
+    assert!(
+        f.state.codex_control.build_send_verified(),
+        "已验证 build 必须带写能力证据"
+    );
+    let mut peer = f.peer.take().unwrap();
+    let app = f.app.clone();
+    let body = send_body("已取证 build 消息", Some("act-def-4"), false);
+    let task = tokio::spawn(async move {
+        app.oneshot(req(
+            "POST",
+            "/m/api/v1/session-send",
+            Some(COOKIE),
+            Some(body),
+        ))
+        .await
+        .unwrap()
+    });
+    drive_ensure(&mut peer, THREAD, vec![], "idle").await;
+    let frame = peer.recv().await;
+    assert_eq!(
+        frame["method"], "thread-follower-start-turn",
+        "已验证 build 仍走既有 start_turn"
+    );
+    confirm_client_message_identity(
+        &mut peer,
+        &frame,
+        "turn-def-4",
+        "已取证 build 消息",
+        8,
+        "owner-1",
+    )
+    .await;
+    peer.send(&serde_json::json!({
+        "type": "response", "requestId": frame["requestId"],
+        "resultType": "success", "method": "thread-follower-start-turn",
+        "handledByClientId": "owner-1",
+        "result": { "turn": { "id": "turn-def-4", "status": "inProgress" } }
+    }))
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("in time")
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+    assert_eq!(v["status"], "desktop_ipc", "{v}");
+    assert_eq!(v["receipt"]["delivery"], "accepted", "{v}");
+    assert!(
+        send_probe_rows(&f).is_empty(),
+        "已验证 build 不写兼容实验账本: {:?}",
+        send_probe_rows(&f)
+    );
+}
+
 /// 2026-10-22 用户裁决（main 合并）：未知 build → 兼容发送档，send/state 默认开——
-/// **开关关不再拦截**派发（send stays up）。本用例重钉新形态：开关保持默认关，
-/// 发送照常走 start_turn、send-info 不置灰；账本**不留** send 行（实验未开启，
-/// 正常路径与已验证 build 同口径）。开关门只对「无写能力证据」的档位（closed /
-/// 强制压档 / 断链兜底路径）继续生效（见同文件 not_sent / inconclusive 两用例）。
+/// **开关关不再拦截**派发（send stays up）。本用例重钉新形态：**显式关闭**兼容发送
+/// （A1 起缺键 = 开，故显式写 false 才能表达旧选择）时，发送照常走 start_turn、
+/// send-info 不置灰；账本**不留** send 行（实验未开启，正常路径与已验证 build 同口径）。
+/// 开关门只对「无写能力证据」的档位（closed / 强制压档 / 断链兜底路径）继续生效
+/// （见同文件 not_sent / inconclusive 两用例）。
 #[tokio::test]
 async fn unknown_build_send_dispatches_even_with_compat_switch_off() {
     let mut f = fixture_unknown_build(vec![codex_app_session(THREAD)]);
@@ -5292,7 +5467,14 @@ async fn unknown_build_send_dispatches_even_with_compat_switch_off() {
         !f.state.codex_control.build_send_verified(),
         "连接前：没有写能力记录"
     );
-    // 开关保持默认关（不写设置键）
+    // A1 起缺键 = 默认开，故显式写 false 表达「用户关了兼容实验」
+    f.state.store.with(|c| {
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('remote.compat_send_enabled', 'false')",
+            [],
+        )
+        .unwrap();
+    });
     let mut peer = f.peer.take().unwrap();
     let app = f.app.clone();
     let body = send_body("开关关也照发的消息", Some("act-cs-off-1"), false);

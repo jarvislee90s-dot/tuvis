@@ -348,12 +348,14 @@ export function RemoteSection() {
   }, [status]);
 
   const enabled = status?.enabled ?? false;
-  // H3 无头总开关态：唯一数据源 = remote_status.headlessEnabled（缺键/旧载荷 = 关）
-  const headlessEnabled = status?.headlessEnabled ?? false;
-  // #172/T8 兼容发送（实验）两个数据源（同源 remote_status，缺键 = 关 / 不可开）：
-  // - compatSendEnabled：开关真值；
-  // - compatSendEligible：前置判据（该 build 读链已取证 = 可开；false → 置灰）。
-  const compatSendEnabled = status?.compatSendEnabled ?? false;
+  // H3 无头总开关态：唯一数据源 = remote_status.headlessEnabled（缺键/旧载荷 =
+  // 新默认开；只有显式 false 才是用户关闭——加载中由 !status 禁用，不闪成关）。
+  const headlessEnabled = status?.headlessEnabled ?? true;
+  // #172/T8 兼容发送（实验）两个数据源（同源 remote_status）：
+  // - compatSendEnabled：开关真值（缺键 = 新默认开，显式 false 保留）；
+  // - compatSendEligible：前置判据（该 build 读链已取证 = 可从关切到开；
+  //   false → 未取证提示照常显示，资格不从偏好默认继承）。
+  const compatSendEnabled = status?.compatSendEnabled ?? true;
   const compatSendEligible = status?.compatSendEligible ?? false;
 
   // 花名册与状态 3s 轮询恒开（与移动端看板同节奏）。花名册是 DB 语义（已配对设备
@@ -885,8 +887,9 @@ export function RemoteSection() {
             />
           </div>
 
-          {/* ③b 无头注入（H3）：**单一总开关**，默认关；H4 的 watchdog 超时 /
-              并发上限两件同住本分组。开关关闭时兼容发送入口一律 403/置灰。 */}
+          {/* ③b 无头注入（H3）：**单一总开关**，缺键默认开、显式关闭保留；
+              H4 的 watchdog 超时 / 并发上限两件同住本分组。开关关闭时兼容发送入口
+              一律 403/置灰。加载中（!status）禁用，不把缺键显示成用户关闭。 */}
           <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
             {t("settings.remote.groupHeadless")}
           </div>
@@ -954,8 +957,9 @@ export function RemoteSection() {
             </Button>
           </div>
 
-          {/* #172/T8 兼容发送（实验）：默认关；**读探测通过才允许开**——未取证时
-              置灰并提示先做只读探测（后端开启时同样拒：同一判据）。已验证的 Codex
+          {/* #172/T8 兼容发送（实验）：缺键默认开、显式关闭保留；**从关切到开
+              仍要求读探测通过**——未取证时提示先做只读探测（后端开启时同样拒：
+              同一判据）。资格字段独立，不随偏好默认值变化。已验证的 Codex
               桌面版本不受此开关影响（它的发送行为逐字不变）。 */}
           <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
             {t("settings.remote.groupCompatSend")}
