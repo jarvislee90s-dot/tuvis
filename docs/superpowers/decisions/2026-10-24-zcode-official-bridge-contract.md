@@ -138,3 +138,192 @@
   不提交真实 SID／JWT／token／会话正文；不修改 `docs/MASTER-PLAN.md`；本包不编辑产品运行链；
   本轮及本文件生成过程中未调用任何官方远端服务（仅 GitHub API 公开仓库元数据）。
 - 后续追加区（B1：identity/auth/wire 实况；B2—B4：各自 operations／fixtures）在此线以下按轮次追加，不改写上节记录。
+
+---
+
+# 6. B1 部分（2026-10-24 追加）：官方身份与最小认证合同（source + fake 阶段）
+
+> 本节只做两件事：①从固定官方源码核对「官方允许的终端登录／授权流」，逐条给出行号证据；
+> ②用 in-test fake relay 锁死 Tuvis 客户端侧行为（红测→绿测）。**本轮未连接任何真实远端**；
+> 实连半场被 §6.7 停等项阻塞。所有凭据/标识均为合成值，不含真实 SID/JWT/token/链接。
+
+## 6.0 执行方式声明
+
+- GitHub 只读取文（`gh api contents` at 固定 SHA `3c5b2276…`）共 15 个实现文件 + 树清单；未 clone 仓库。
+- 本机未启动 ZCode APP／CLI／Tuvis；未执行任何真实网络连接（除 GitHub API 公开端点）。
+- 测试执行：`pnpm exec vitest run tests/remote/zcodeBridgeRelay.test.ts`（RED 与 GREEN 证据见 §6.5）。
+- 新增文件：`tests/remote/zcodeBridgeRelay.test.ts`、`scripts/zcode-bridge-probe/relayAuth.ts`、
+  `scripts/zcode-bridge-probe/auth-check.ts`（骨架，拒绝连接）、`tests/fixtures/zcode-official-bridge/contract.json`。
+  探针目录不挂应用启动/扫描（工作包 B「固定产物与接口」）。
+
+## 6.1 对 B0 §3.2 模块清单的勘误补充（追加，不改写 B0 原文）
+
+B0 §3.2 末行「官方 Web 远控前端与云 relay 服务**不在本仓库**」的 **apps/ 目录陈述为真**
+（固定 SHA 的 `apps/` 确实只有 `zcode-cli` 与 `dev-docs`），但仓库级判断不完整。本轮树清查
+（`git trees?recursive=1` @ 同 SHA）证实以下三组**客户端侧实现就在本仓库**：
+
+| 目录 | 角色 | B1 用途 |
+| --- | --- | --- |
+| `packages/shared/src/web-remote-relay/` | relay V2 wire 契约（zod schema：HTTP 路径表、WS 消息、token 形状、错误码） | 本轮 wire 引用的第一权威 |
+| `packages/web/src/web-remote-control/`（含 `auth/`） | 官方网页远控前端（终端角色）+ 其 OAuth 登录模块 | 终端授权流与账号 JWT 来源的证据源 |
+| `packages/desktop/src/main/web-remote-relay/` | 官方桌面端（设备角色）relay 客户端 | 设备注册/注销与凭据持久化对照面 |
+
+**仍然不在仓库**：云 relay/hub 服务端本体与 `zcode.z.ai` 站点部署配置。因此 B0 的结论
+「relay wire 证据只能来自客户端侧实现 + 授权返回 + 真实脱敏帧」**维持成立**，且本轮起
+客户端侧证据已实际在手。
+
+## 6.2 官方允许的终端登录／授权流（逐条行号证据，文件均 @ `3c5b2276…`）
+
+缩写：`shared/contract.ts` = `packages/shared/src/web-remote-relay/contract.ts`；
+`web/transport.ts` = `packages/web/src/web-remote-control/adapters/webRemoteControlTransport.ts`；
+`web/v2token.ts` = `packages/web/src/web-remote-control/adapters/webRemoteControlV2Token.ts`；
+`entry.ts` = `packages/web/src/web-remote-control/app/webRemoteControlEntry.ts`。
+
+**A. 账号身份（OAuth → ZCode JWT）**
+
+1. 授权入口（ZAI 通道）：`{chat.z.ai}/api/oauth/authorize?redirect_uri=<回调>&response_type=code&client_id=<公开client_id>&state=<state>`
+   （`packages/web/src/auth/zaiWebOAuthProvider.ts:184-191`；默认 origin `https://chat.z.ai`，
+   `webZaiOAuthConfig.ts:30`）。BigModel 通道变体：`{bigmodel}/login?redirect=<回调>&appId=zcode&state=<state>`
+   （`zaiWebOAuthProvider.ts:175-181`；`webZaiOAuthConfig.ts:40-43,60-61`，appId 默认 `zcode` 即「桌面端在用的」）。
+2. `client_id` 默认 `client_P8X5CMWmlaRO9gyO-KSqtg`，源码注释明示「client_id 会出现在授权 URL 中，
+   属于公开配置」（`webZaiOAuthConfig.ts:57-58`）——它是**官方网页 app 的第一方公开客户端**，
+   不是第三方客户端发放通道。
+3. 回调 redirect_uri **钉死**官方网页自身：`webRemoteCallbackUrl = {zcodeOrigin}/remote/v4`
+   （`webZaiOAuthConfig.ts:62` + `packages/shared/src/zcodeEndpoint.ts:378`；callback 判定
+   `/remote/v4` + `state` + `code|authCode|error`，`entry.ts:17-26`）。exchange 时回传同一
+   redirect_uri（`zaiWebOAuthProvider.ts:225`）。dev 环境另有 `VITE_WEB_REMOTE_ALLOW_DEV_RETURN_TO`
+   门控的 devOrigin 回调（`webZaiOAuthConfig.ts:64-65,74-81`）——构建期开关，不是产品第三方通路。
+4. token 交换：`POST {zcodeOrigin}/api/v1/oauth/token`，body `{provider, code, redirect_uri, state}`
+   → `{code:0, data:{token:<ZCode账号JWT>, zai|bigmodel:{access_token}, expires_in, user}}`
+   （`zaiWebOAuthProvider.ts:211-239`；`data.token` 即 `zcodeJwtToken`，121-124,151-156）。
+5. JWT 持久化在网页 localStorage，读用时校验过期，**过期即 clearAll 并要求重新 OAuth**；
+   logout = `clearAll()`（`packages/web/src/auth/browserOAuthCredentialRepo.ts:145-179`；
+   `webAuthService.ts:205-207`；`entry.ts:250-255`）。**没有 refresh token 流**——「刷新」即重新走 OAuth。
+
+**B. 终端角色接入（relay token → WS 握手）**
+
+6. 终端一次性 token：`POST /api/v1/remote/token`，`Authorization: Bearer <ZCode JWT>`，
+   body `{role:"terminal"}`（路径表 `shared/contract.ts:96-101`；请求形状 `web/v2token.ts:13-22`）。
+   响应 `{code:0, msg, data:{token, expires_in}}`；token = 16 字节无填充 Base64URL 的 22 字符、
+   末字符∈`[AQgw]`（schema `shared/contract.ts:119-123`，注释明示 16 字节语义）。
+7. **一次性、不缓存**：「一次性 token 不缓存；401 交给入口恢复登录」（`web/v2token.ts:8`）；
+   终端传输**每次连接尝试都现取新 token**（`web/transport.ts:104`）；401 → `auth-required`
+   终态交上层回登录（`web/v2token.ts:23`；`entry.ts:236`）。→「重连需新 token」由实现结构保证。
+8. WS 连接：`{relayWsUrl}` = `wss://<relay>/api/v1/remote/ws2`（`zcodeEndpoint.ts:380`；路径常量
+   `shared/contract.ts:102`），URL 带 `?token=<一次性token>`（可选 `mid`）（`web/transport.ts:106-110`）。
+9. 握手：open 后发 `auth_init{device_sid, meta:{platform:"web",version,name:"mobile-browser"}, client_ts}`
+   （`shared/contract.ts:19-24`；`web/transport.ts:119-143`），服务端回
+   `auth_ack{device_sid, terminal_sid?, pair_status: waiting|matched, server_ts?}`
+   （`shared/contract.ts:53-59`）；客户端要求 `device_sid` 回显匹配才认账（`web/transport.ts:318`）。
+   `waiting` 为合法配对前态（心跳 `pair_status_query` 维持，30s 未 matched → desktop-disconnected 终态，
+   `web/transport.ts:460-473`）。
+10. 数据面门禁：`data` 帧**仅 authenticated 且 paired** 才处理（`web/transport.ts:329-331`）；
+    发送侧未 paired 直接返回 unavailable——不发送、不排队（`web/transport.ts:216-222`）。
+    出站/入站 data 形状 `{type:"data", payload, client_ts?|server_ts?}`（`shared/contract.ts:36-44,66-70`）。
+11. 错误帧 `error{code: AUTH_FAILED|WRONG_PARAM|KICKED|INTERNAL|DEVICE_OFFLINE, message?, server_ts?}`
+    （`shared/contract.ts:18,71-76`）。终端侧处置：`KICKED` → `kickedDelay()`：60 秒窗口内已有
+    一次 KICK 则返回 null → **终态失败 session-conflict（state=kicked，停止）**，否则 2–5 秒后
+    重连一次（`domain/retry.ts:26-30`；`web/transport.ts:389-394`）；`AUTH_FAILED` → 终态
+    `device-not-owned`、`WRONG_PARAM` → 终态 `invalid-mobile-connection`（`web/transport.ts:402-407`）。
+12. **单 owner 的直接实现证据**：官方生命周期注释「同一个远控链接建立第二条 terminal socket
+    并被 relay 踢成 KICKED」（`packages/web/src/web-remote-control/app/webRemoteControlLifecycle.ts:29-33`）
+    ——同链接（同 device_sid/role）的第二个终端连接会踢掉第一个；终端重试参数
+    initial 500ms / max 10s（`web/transport.ts:45-49`），设备侧 initial 1s / max 30s
+    （`domain/retry.ts:9-12` + 桌面 `packages/desktop/src/main/web-remote-relay/webRemoteControlTransport.ts:51`）。
+
+**C. 对照面（设备角色与注销）**
+
+13. 设备注册：`POST /api/v1/remote/device {device_mid}` → `device_sid`；注销：
+    `POST /api/v1/remote/device/delete {device_sid}`；列表 `GET /api/v1/remote/device`
+    （`shared/contract.ts:96-101,105-118`；`packages/desktop/src/main/web-remote-relay/webRemoteControlV2Http.ts:47-61`）。
+14. 设备侧凭据持久化 = 桌面 App settings 的 `webRemoteControlRelayV2Device` 字段
+    （`packages/desktop/src/main/web-remote-relay/webRemoteControlDeviceStorage.ts:11-24`）——
+    官方桌面端同样**没有** OS keychain，注册记录（非凭据）落 settings；legacy 凭据有显式清除迁移。
+15. 链接形状：`{zcodeOrigin}/remote/vN?sid=<device_sid>&mid=<device_mid>&name=<name>&app_version=<v>`
+    （构造 `packages/shared/src/web-remote-control.ts:163-189`；解析 191-207：**带 legacy `hash`/`t`
+    参数直接判 null 拒绝**；选择设备后 URL 才带 sid/mid，`entry.ts:186-199`）。与 A4 合同
+    （E7：`https` + `zcode.z.ai` + `/remote/vN` + 非空唯一 `sid`）一致，且补充：vN 当前取
+    v3/v4（按 appVersion 门控，`zcodeEndpoint.ts:371-377`）。
+
+## 6.3 第三方可复用授权路径核查（B1 关键问题）
+
+**结论：本仓库源码没有展示任何第三方可复用的授权返回通路。** 证据：
+
+- 唯一的账号凭据获取流是官方网页自己的 OAuth：client_id 为第一方公开客户端（§6.2-2），
+  redirect_uri 钉死官方 `/remote/v4` 回调（§6.2-3），exchange 回传同一 redirect_uri；
+  仓库内没有第三方 client 注册、动态 redirect、PAT/设备码（device flow）或任何
+  「把账号凭据交给非官方客户端」的机制（全仓树清查 + `packages/web/src/auth/` 全量阅读）。
+- 设备角色（桌面端）的注册凭据是桌面 App 自己的账号 JWT，属**其他应用凭据**，按工作包 B
+  约束禁止读取。
+- 因此：`auth.status = interim`（不是 proven，也**尚不能**判 unsupported——缺失的不是流程知识，
+  而是「官方授权服务器是否接受 Tuvis 控制的 redirect_uri」这一服务器侧行为，仓库无法证明或证伪）。
+  **禁止**以习惯假设官方支持任意第三方 OAuth client；该问题只能由 §6.7-③ 的用户在场浏览器
+  探测或官方渠道问答定案。
+
+## 6.4 contract.json（auth/route 填写与证据类别）
+
+- 文件：`tests/fixtures/zcode-official-bridge/contract.json`（schemaVersion=1，本轮新建）。
+- `auth.status = "interim"`（计划枚举 proven|unsupported 之外的显式过渡值，附
+  `interimMissing` 说明缺失项）；`flowName`/`tokenSourceKind`/`credentialPersistence`
+  全部来自 §6.2 的 source 证据，`evidence[]` 逐条标 `class: source | fake`。
+- `route.role = "terminal"`；`ownerScope` = 同 device_sid 单 owner、KICKED 冲突、探针即停口径；
+  `workspaceBindingFields`/`sessionBindingFields` = 空数组 + `bindingNote`（relay 层只有
+  `device_sid` 绑定；workspace/session 绑定属 RPC 层，**留 B2 真实帧取证，不猜测字段**）。
+- `capabilities` 全 false（未实连，无真实帧）；`operations` 空数组（同因）。
+
+## 6.5 fake relay 红测证据（tests/remote/zcodeBridgeRelay.test.ts）
+
+- 文件首行 `// @vitest-environment node`（仓库既有约定，同 `tests/lib/errorCodesGate.test.ts:1`）；
+  未新增任何依赖、未引入 tsx；WS 客户端用 Node ≥22 全局 `WebSocket`，fake 服务端为本文件内
+  ~120 行的最小 RFC6455 实现（`node:http` upgrade + SHA1 accept + masked 帧解析）。
+- **RED**（先写测试、`scripts/zcode-bridge-probe/relayAuth.ts` 尚不存在）：
+  `pnpm exec vitest run tests/remote/zcodeBridgeRelay.test.ts` →
+  `Error: Cannot find module '../../scripts/zcode-bridge-probe/relayAuth'`（1 failed suite）。
+- **GREEN**（实现 `relayAuth.ts` 后同命令）：**5 passed / 0 failed**，无 MSW 干预
+  （文件级 `beforeAll` 关闭全局 MSW，仅本文件作用域）：
+  1. 未认证（错/空凭据）申请 token → 401×2、`tokenMinted=0`（没有任何可消费 token 产出）；
+     裸 WS 无 token：`auth_init` 即 `error{AUTH_FAILED}`，其后 data 帧被丢弃不计数（`dataAccepted=0`）。
+  2. 合成合法凭据：`role:"terminal"` 申请成功、token 合官方形状、`expires_in>0`；两次申请
+     token 不同（一次性）；WS `auth_init→auth_ack(matched)` → paired；paired 后 data 被接受。
+  3. 过期 token（60ms TTL）连接 → `rejected`；已消费 token 重连 → `rejected`；两者
+     `sendData` 均 false（认证失败不发后续帧），`wsAuthFailed` 计数精确 +1/+1。
+  4. SID 形态字符串冒充 Bearer → 401；冒充 WS token → `rejected`；`dataAccepted` 恒 0。
+  5. KICKED 注入 → 客户端终态 `kicked`、不再发送；等待 100ms 后 `wsUpgrades` 仍为 1
+     （**结构性无重连**：客户端没有重连代码路径，`relayAuth.ts` 无任何计时器）。
+- 被测客户端 = `scripts/zcode-bridge-probe/relayAuth.ts`（Tuvis 参照实现）：单连接、无自动重连、
+  token 一次性不落盘、未 paired 不发送、KICKED/拒绝即终态；每个常量与分支注释都标了
+  官方源码行号。fake 侧「FAKE 策略」注释明确区分了本测试自定行为（如升级必成、auth_init 后
+  才校验 token、未认证 data 丢弃并断开）与官方取证结论。
+
+## 6.6 实连半场探针骨架（scripts/zcode-bridge-probe/auth-check.ts）
+
+- 骨架仅声明 6 步（取链接→账号凭据通路定案→申请 terminal token→单连接握手→只读观察→
+  断开落证）与硬安全闸（单连接、`reconnectPolicy:"never"`、KICKED 即停、只读白名单、
+  60s 硬超时、凭据只入内存）。`main()` 在解锁旗标缺席时**一律抛错拒绝执行**；
+  本轮不连接任何远端；不挂产品启动/扫描。
+
+## 6.7 停等项（用户动作；全部完成前不执行任何真实连接/写实验）
+
+1. **有效官方链接（阻塞实连）**：现存的两个月前链接已显示 Not Found，**禁止复用**。
+   请用户本人在 ZCode APP 内开启移动远控→复制**当前有效**链接→经 Tuvis 设置页 ZCode 卡
+   （A4）粘贴保存；链接本体按合同不入本文档/日志/夹具。
+2. **专用测试目标（阻塞任何真实写实验，B2 前置）**：指定专用测试工作区/会话，并在本文档
+   §4 追加小节登记别名与逐批授权动作清单（真实路径/ID 只留私有目录映射）。
+3. **账号凭据通路探测授权（决定 interim→proven/unsupported，实连半场第一闸）**：
+   官方终端 token 需要**账号 JWT**（§6.2-6），而 JWT 的官方获取流是浏览器 OAuth（§6.2-1—5），
+   其 redirect_uri 钉死官方回调、仓库未见第三方通路（§6.3）。需要用户**在场**二选一：
+   (a) 授权做一次浏览器 OAuth 通路探测（用户本人操作浏览器完成官方授权，验证官方授权服务器
+   是否接受 Tuvis 本地回环 redirect——不接受即 `auth.status=unsupported` 定案）；
+   (b) 或直接裁决走官方渠道询问/其他合法备选。Agent 不代登、不读浏览器/其他应用凭据、
+   不要求用户粘贴 JWT 原文。
+4. **同 role 互踢知情确认（实连前）**：单 owner 语义（§6.2-12）意味着探针连接可能踢掉用户
+   正在使用的官方网页会话；实连时段需用户确认不依赖网页会话，且探针 KICKED 即停不互踢。
+
+## 6.8 本轮遗留与风险登记
+
+- `expires_in` 的真实时长是服务器侧值，仓库不可见；「token 短期性」只能实连观测（§6.7 全部
+  完成后于实连半场验证）。
+- 官方服务端对「未认证 data 帧」的处置未取证（fake 取保守丢弃+断开策略并标注 FAKE 策略）；
+  Tuvis 客户端行为不受影响（发送侧门禁使未 paired 从不发出 data）。
+- `terminal_sid`（auth_ack 可选字段）的确切语义/稳定性待实连帧确认，暂不入合同字段。
+- B1 实连半场的验收门维持计划原文：「proven 且实际只读连到正确测试 APP」才进 B2。

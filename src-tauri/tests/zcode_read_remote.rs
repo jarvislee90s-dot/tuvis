@@ -6,6 +6,8 @@
 //! 归档／deleted／窗口外逐项排除、空串 parent 沿用旧口径、无宿主不出卡；
 //! 合成新 ID 经快照 → /session-messages／/session-files 正文与附件可读，
 //! 合成内容过滤与状态输入不变，隐藏／未读仍按各自门。
+//! A7 追加：正文与附件引用的同源锚点——附件序号 = 所属消息投影后的最终显示 seq
+//! （非原 DB 窗口 ordinal），file-only／被过滤消息保留文件、lastSeq 取中性 0 占位。
 //!
 //! 零真实副作用纪律：全部 SQLite 一律 tempdir／内存库 fixture，只用合成 id 与
 //! 合成正文，绝不接触真实 ~/.zcode、~/.tuvis；本测试不实现任何发送／审批能力。
@@ -16,7 +18,9 @@ use multi_agents_manager_lib::monitor::zcode_parser::{
 };
 use multi_agents_manager_lib::remote::codex_ipc::CodexControlHub;
 use multi_agents_manager_lib::remote::content::read_session_messages_with;
-use multi_agents_manager_lib::remote::files::extract_file_paths_with;
+use multi_agents_manager_lib::remote::files::{
+    extract_file_paths_with, read_file_safe, FileOrigin,
+};
 use multi_agents_manager_lib::remote::pairing::{persist_device, DeviceStore, NewDevice};
 use multi_agents_manager_lib::remote::server::{router, RemoteState};
 use multi_agents_manager_lib::session::{ProcessForm, Session, SessionStatus, SessionsResponse};
@@ -749,4 +753,306 @@ async fn new_id_reaches_remote_reading() {
         serde_json::Value::Null,
         "取消隐藏后须回归"
     );
+}
+
+// ===== A7 红测：正文与附件引用的同源锚点（设计 §6 末段）=====
+//
+// 缺陷本体：`read_zcode_attachment_refs_with` 用消息窗口的**原始 DB ordinal**当
+// 附件序号，而正文侧的 seq 是「多 parts 展开 + 合成过滤 + tail 裁剪（finalize）」
+// 之后的显示序号——两个刻度对不齐，卡片上的附件锚点会指错消息。修法：附件锚点
+// 必须从与正文同一个有界窗口／finalize 投影结果推导（私有 ZcodeProjection 的
+// source_anchors：数据库 message ID → 最终显示 seq）；无显示条目的消息（file-only
+// /被过滤）保留文件池、lastSeq 用既有中性 0 口径仅作排序占位。
+
+const ANCHOR_SID: &str = "sess_1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+
+/// 红测 1：附件锚点 = 所属消息在投影后的**最终显示 seq**，不是原 DB ordinal；
+/// fixture 序：合成消息 → user 文本 → assistant（thinking/tool/text 三条目）→
+/// 下一 user 文本+file。改变 limit 后仍对齐。
+#[test]
+fn zcode_attachment_anchor_matches_projected_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let roots = ZcodeRoots::from_home(tmp.path());
+    let cli = build_cli_db(&roots.cli_db);
+
+    const SYNTH_BODY: &str = "anchor1-synthetic-reminder-应被过滤";
+    const U2_BODY: &str = "anchor1-user-first-body";
+    const THINK: &str = "anchor1-assistant-thinking";
+    const A3_BODY: &str = "anchor1-assistant-final-text";
+    const U4_BODY: &str = "anchor1-user-second-body-with-file";
+    const UPLOAD: &str = "/synthetic/anchor1/upload.txt";
+
+    // DB 窗口 ordinal（旧缺陷口径）：m_synth=0 / m_u2=1 / m_a3=2 / m_u4=3；
+    // 显示 seq（正确口径，合成被滤、assistant 展开 3 条）：u2=0 thinking=1
+    // tool=2 text=3 u4=4 —— 附件必须锚到 4，而不是原 ordinal 3。
+    insert_message(
+        &cli,
+        "m_synth",
+        ANCHOR_SID,
+        1,
+        NOW - 4000,
+        r#"{"role":"user","synthetic":true,"semantics":{"kind":"todo_reminder"}}"#,
+    );
+    insert_part(
+        &cli,
+        "p_synth",
+        "m_synth",
+        1,
+        &format!(r#"{{"type":"text","text":"{SYNTH_BODY}"}}"#),
+    );
+    insert_message(
+        &cli,
+        "m_u2",
+        ANCHOR_SID,
+        2,
+        NOW - 3000,
+        r#"{"role":"user","semantics":{"kind":"user_prompt"}}"#,
+    );
+    insert_part(
+        &cli,
+        "p_u2",
+        "m_u2",
+        1,
+        &format!(r#"{{"type":"text","text":"{U2_BODY}"}}"#),
+    );
+    insert_message(
+        &cli,
+        "m_a3",
+        ANCHOR_SID,
+        3,
+        NOW - 2000,
+        r#"{"role":"assistant","semantics":{"kind":"assistant"}}"#,
+    );
+    insert_part(
+        &cli,
+        "p_a3_th",
+        "m_a3",
+        1,
+        &format!(r#"{{"type":"reasoning","text":"{THINK}"}}"#),
+    );
+    insert_part(
+        &cli,
+        "p_a3_tool",
+        "m_a3",
+        2,
+        r#"{"type":"tool","tool":"Bash","state":{"input":{"command":"ls"}}}"#,
+    );
+    insert_part(
+        &cli,
+        "p_a3_tx",
+        "m_a3",
+        3,
+        &format!(r#"{{"type":"text","text":"{A3_BODY}"}}"#),
+    );
+    insert_message(
+        &cli,
+        "m_u4",
+        ANCHOR_SID,
+        4,
+        NOW - 1000,
+        r#"{"role":"user","semantics":{"kind":"user_prompt"}}"#,
+    );
+    insert_part(
+        &cli,
+        "p_u4",
+        "m_u4",
+        1,
+        &format!(r#"{{"type":"text","text":"{U4_BODY}"}}"#),
+    );
+    insert_part(
+        &cli,
+        "p_u4_file",
+        "m_u4",
+        2,
+        &format!(r#"{{"type":"file","source":{{"path":"{UPLOAD}"}}}}"#),
+    );
+    drop(cli);
+
+    // —— limit=500：完整窗（合成过滤 + 多 parts 展开后共 5 条显示项）
+    let pg = read_session_messages_with(tmp.path(), "zcode", ANCHOR_SID, 500).unwrap();
+    assert_eq!(
+        pg.messages.len(),
+        5,
+        "u2 1 条 + assistant 展开 3 条 + u4 1 条"
+    );
+    let body_seq = pg
+        .messages
+        .iter()
+        .find(|m| m.content == U4_BODY)
+        .expect("带附件的 user 正文必须上板")
+        .seq;
+    assert_eq!(body_seq, 4, "显示序：合成被滤、assistant 占 1..3");
+    let (entries, _) = extract_file_paths_with(tmp.path(), "zcode", ANCHOR_SID, 500);
+    let file = entries
+        .iter()
+        .find(|e| e.path == UPLOAD)
+        .expect("附件必须入池（既有行为保留）");
+    assert_eq!(file.origin, FileOrigin::User);
+    assert_eq!(
+        file.last_seq, body_seq,
+        "附件锚点必须等于所属消息最终显示 seq（同源投影），实得 {}",
+        file.last_seq
+    );
+    assert_eq!(file.last_seq, 4, "锚点是投影后 seq，不是原 DB ordinal 3");
+
+    // —— limit=3：有界窗（尾 3 条消息）再 tail 裁剪（尾 3 个显示项）后仍对齐
+    let pg3 = read_session_messages_with(tmp.path(), "zcode", ANCHOR_SID, 3).unwrap();
+    let body_seq3 = pg3
+        .messages
+        .iter()
+        .find(|m| m.content == U4_BODY)
+        .expect("limit=3 尾窗仍须覆盖带附件消息")
+        .seq;
+    let (entries3, _) = extract_file_paths_with(tmp.path(), "zcode", ANCHOR_SID, 3);
+    let file3 = entries3
+        .iter()
+        .find(|e| e.path == UPLOAD)
+        .expect("limit=3 附件仍在池");
+    assert_eq!(
+        file3.last_seq, body_seq3,
+        "改变 limit 后锚点仍须与投影正文同刻度（正文侧实得 {body_seq3}）"
+    );
+}
+
+/// 红测 2：被过滤条目不指向其他消息；file-only 消息无可显示条目 → 文件保留、
+/// lastSeq=0 作中性排序占位（不新增正文消息、不引入负数哨兵）；预览仍可用。
+#[test]
+fn synthetic_or_unrendered_has_no_fake_anchor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let roots = ZcodeRoots::from_home(tmp.path());
+    let cli = build_cli_db(&roots.cli_db);
+
+    const SID: &str = ANCHOR_SID;
+    const M1_BODY: &str = "anchor2-user-body-A";
+    const SYNTH_BODY: &str = "anchor2-synthetic-应被过滤";
+    const M3_BODY: &str = "anchor2-user-body-B";
+    // 合成消息携带的附件：旧缺陷 = ordinal 1（恰指到 m3 的显示槽位 = 假锚点）
+    let fake_synth_path = tmp.path().join("synth-src/fake-synth.txt");
+    // file-only 消息（无 text part → 无显示条目）：旧缺陷 = ordinal 3
+    let only_file_path = tmp.path().join("synth-src/only-file.txt");
+    std::fs::create_dir_all(only_file_path.parent().unwrap()).unwrap();
+    std::fs::write(&fake_synth_path, b"synthetic fake").unwrap();
+    std::fs::write(&only_file_path, b"synthetic only-file body").unwrap();
+    let fake_synth = fake_synth_path.to_string_lossy().into_owned();
+    let only_file = only_file_path.to_string_lossy().into_owned();
+
+    insert_message(
+        &cli,
+        "m1",
+        SID,
+        1,
+        NOW - 4000,
+        r#"{"role":"user","semantics":{"kind":"user_prompt"}}"#,
+    );
+    insert_part(
+        &cli,
+        "p1",
+        "m1",
+        1,
+        &format!(r#"{{"type":"text","text":"{M1_BODY}"}}"#),
+    );
+    insert_message(
+        &cli,
+        "m2",
+        SID,
+        2,
+        NOW - 3000,
+        r#"{"role":"user","synthetic":true,"semantics":{"kind":"todo_reminder"}}"#,
+    );
+    insert_part(
+        &cli,
+        "p2",
+        "m2",
+        1,
+        &format!(r#"{{"type":"text","text":"{SYNTH_BODY}"}}"#),
+    );
+    insert_part(
+        &cli,
+        "p2_file",
+        "m2",
+        2,
+        &format!(r#"{{"type":"file","source":{{"path":"{fake_synth}"}}}}"#),
+    );
+    insert_message(
+        &cli,
+        "m3",
+        SID,
+        3,
+        NOW - 2000,
+        r#"{"role":"user","semantics":{"kind":"user_prompt"}}"#,
+    );
+    insert_part(
+        &cli,
+        "p3",
+        "m3",
+        1,
+        &format!(r#"{{"type":"text","text":"{M3_BODY}"}}"#),
+    );
+    // file-only user 消息：整条只有一个 file part（无正文可显示）
+    insert_message(
+        &cli,
+        "m4",
+        SID,
+        4,
+        NOW - 1000,
+        r#"{"role":"user","semantics":{"kind":"user_prompt"}}"#,
+    );
+    insert_part(
+        &cli,
+        "p4_file",
+        "m4",
+        1,
+        &format!(r#"{{"type":"file","source":{{"path":"{only_file}"}}}}"#),
+    );
+    drop(cli);
+
+    // 正文面：合成被滤、file-only 不伪造正文 —— 恰两条显示消息
+    let pg = read_session_messages_with(tmp.path(), "zcode", SID, 500).unwrap();
+    assert_eq!(
+        pg.messages.len(),
+        2,
+        "被过滤与 file-only 消息都不得新增正文条目（不伪造）"
+    );
+    assert!(pg.messages.iter().all(|m| m.content != SYNTH_BODY));
+    let m3_seq = pg
+        .messages
+        .iter()
+        .find(|m| m.content == M3_BODY)
+        .unwrap()
+        .seq;
+
+    // 文件面：两条附件都保留在池里
+    let (entries, _) = extract_file_paths_with(tmp.path(), "zcode", SID, 500);
+    let synth = entries
+        .iter()
+        .find(|e| e.path == fake_synth)
+        .expect("合成消息的附件仍须保留文件池");
+    let only = entries
+        .iter()
+        .find(|e| e.path == only_file)
+        .expect("file-only 消息的附件仍须保留文件池");
+    assert!(
+        entries.iter().all(|e| e.last_seq >= 0),
+        "不得引入负数哨兵：{:?}",
+        entries.iter().map(|e| e.last_seq).collect::<Vec<_>>()
+    );
+    // 中性 0 占位；旧缺陷口径下合成条目拿 ordinal 1 = 恰指向 m3 显示槽（假锚点）
+    assert_eq!(
+        synth.last_seq, 0,
+        "被过滤条目不得指向其他消息（m3 seq={m3_seq}）"
+    );
+    assert_ne!(
+        synth.last_seq, m3_seq,
+        "合成附件的锚点不得假指到真实显示的 m3"
+    );
+    assert_eq!(only.last_seq, 0, "file-only 无显示条目 → 中性 0 排序占位");
+    assert_eq!(synth.origin, FileOrigin::User);
+    assert_eq!(only.origin, FileOrigin::User);
+
+    // 预览仍可用：入池路径即磁盘实体，read_file_safe 正常读出
+    let home_s = tmp.path().to_str().unwrap();
+    let (bytes, _) = read_file_safe(home_s, &only_file, Some(home_s)).expect("预览可用");
+    assert_eq!(bytes, b"synthetic only-file body");
+    let (bytes2, _) = read_file_safe(home_s, &fake_synth, Some(home_s)).expect("预览可用");
+    assert_eq!(bytes2, b"synthetic fake");
 }

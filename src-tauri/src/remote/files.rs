@@ -573,9 +573,12 @@ pub(crate) fn extract_file_paths_with_env(
             merger.absorb_messages(&pg.messages);
             // M5 B2：zcode 用户附件第二抽取源——part 表 type=file（B1 调研）。
             // 该形态不在统一消息流的文本里（content.rs 只拼 text parts），故走
-            // content 层专用查询拿「(窗口序号, 路径或 artifact URI, ts)」，序号与
-            // SessionMessage.seq 同刻度（同一窗口查询），合并排序语义一致。
-            // 其它工具用户附件已随 user 正文内联标记覆盖（absorb_messages）。
+            // content 层专用查询拿「(显示序号, 路径或 artifact URI, ts)」。
+            // A7 同源锚点：序号出自与正文同一个 bounded-window／finalize 投影
+            // （read_zcode_projection_with）的所属消息最终显示 seq，与本页
+            // SessionMessage.seq 同刻度；所属消息无显示条目（file-only／被过滤）
+            // 时取中性 0 仅作排序占位。其它工具用户附件已随 user 正文内联标记
+            // 覆盖（absorb_messages）。
             if agent_type == "zcode" {
                 for (seq, r#ref, ts) in
                     super::content::read_zcode_attachment_refs_with(home, session_id, limit)

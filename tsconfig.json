@@ -25,6 +25,6 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"],
+  "include": ["src", "scripts/zcode-bridge-probe"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "B1（2026-10-24，source+fake 阶段）",
+  "evidenceRule": "本文件只收录已取证结论：source = 固定官方源码 zai-org/ZCode @ 3c5b227649371507ddc4eb46ac5133afe6db1cab 的客户端侧实现（行号引用）；fake = tests/remote/zcodeBridgeRelay.test.ts 的 in-test fake relay 锁形。官方云 relay 服务端不在该仓库，服务端内部语义一律不得在本文件出现；未取证项不得以 TBD 或伪造 endpoint 占位。",
+  "identity": {
+    "platform": "macOS 27.0.1 arm64（B0 run_id macos-B20261024T142609+0800-k0zat1）",
+    "appBuild": "3.16.2.8769（CFBundleVersion，/Applications/ZCode.app/Contents/Info.plist）",
+    "bundledCliFingerprint": "sha256:a055234a6ca3da0172616d3987cf3c617b6a26deb1332d69035300c2a0ae0de1（Contents/Resources/glm/zcode.cjs，15,243,891 B）",
+    "sourceSha": "3c5b227649371507ddc4eb46ac5133afe6db1cab",
+    "evidenceClass": "PACKAGE + SOURCE（B0 直读/复核，见决策文件 §1—§3）"
+  },
+  "auth": {
+    "status": "interim",
+    "interimMissing": "官方把账号凭据交给 Tuvis（第三方客户端）的通路未证实：源码内 redirect_uri 钉死官方网页回调（{zcodeOrigin}/remote/v4），未见任何第三方 OAuth client、动态 redirect 注册或 PAT 发放机制；该缺失项只能由用户本人在场的浏览器授权探测或官方渠道确认，不得假设。",
+    "flowName": "zai-web-oauth → zcode-jwt（POST /api/v1/oauth/token）→ 一次性 relay token（POST /api/v1/remote/token，Authorization: Bearer <jwt>，body {role:\"terminal\"}）→ WS /api/v1/remote/ws2?token=<一次性token> → auth_init{device_sid,meta,client_ts} → auth_ack{device_sid,pair_status:waiting|matched}",
+    "tokenSourceKind": "relay 一次性短期 token：16 字节无填充 Base64URL 的 22 字符（末字符∈[AQgw]），带 expires_in（秒，正整数）；每次连接现取、不缓存、用后即弃；401 → auth-required 回登录。上游身份 = ZCode 账号 JWT（OAuth 换取，浏览器 localStorage 持有，过期即清空重登，无 refresh token 流）",
+    "credentialPersistence": "官方侧：桌面端仅持久化 device 注册记录（AppSettings.webRemoteControlRelayV2Device），JWT 在网页 localStorage、relay token 不落盘；Tuvis 侧：未定案——proven 前不得落明文 settings（工作包 B 计划 §B1 第 7 条）；决策文件 B1 节列了候选方案，留实连半场定案",
+    "evidence": [
+      {
+        "claim": "终端角色 token 请求：POST /api/v1/remote/token，Bearer jwt，body {role:\"terminal\"}，401→auth-required，一次性不缓存",
+        "source": "packages/shared/src/web-remote-relay/contract.ts:96-101,119-133; packages/web/src/web-remote-control/adapters/webRemoteControlV2Token.ts:8,13-23,34-37",
+        "class": "source"
+      },
+      {
+        "claim": "WS 路径 /api/v1/remote/ws2 与 auth_init/auth_ack/error 帧形（error codes: AUTH_FAILED|WRONG_PARAM|KICKED|INTERNAL|DEVICE_OFFLINE）",
+        "source": "packages/shared/src/web-remote-relay/contract.ts:16-24,53-59,71-76,102",
+        "class": "source"
+      },
+      {
+        "claim": "终端连接 URL ?token=（可选 mid）+ open 后 auth_init{device_sid,meta{platform:\"web\",version,name:\"mobile-browser\"},client_ts}；auth_ack 需 device_sid 回显匹配；data 仅 authenticated+paired 处理，未 paired 发送被客户端门禁挡下",
+        "source": "packages/web/src/web-remote-control/adapters/webRemoteControlTransport.ts:104-143,317-331,216-222",
+        "class": "source"
+      },
+      {
+        "claim": "KICKED 语义：60 秒窗口内第二次 KICKED → 终态 session-conflict（kicked）；首次允许一次 2–5s 重连；AUTH_FAILED→终态 device-not-owned",
+        "source": "packages/shared/src/web-remote-relay/domain/retry.ts:26-30; packages/web/src/web-remote-control/adapters/webRemoteControlTransport.ts:389-407; packages/web/src/web-remote-control/app/webRemoteControlLifecycle.ts:29-33（第二条 terminal socket 会被踢成 KICKED 的实现注释）",
+        "class": "source"
+      },
+      {
+        "claim": "账号 JWT 来源 = 官方网页 OAuth：authorize=chat.z.ai/api/oauth/authorize（redirect_uri/response_type=code/client_id/state），exchange POST /api/v1/oauth/token {provider,code,redirect_uri,state} → data.token=ZCode JWT；BigModel 变体 /login?redirect&appId=zcode；client_id 为公开配置 client_P8X5CMWmlaRO9gyO-KSqtg",
+        "source": "packages/web/src/auth/zaiWebOAuthProvider.ts:168-238,117-133; packages/web/src/auth/webZaiOAuthConfig.ts:29-66; packages/shared/src/zcodeEndpoint.ts:376-380（webRemoteCallbackUrl=/remote/v4、relayWsUrl=/api/v1/remote/ws2）",
+        "class": "source"
+      },
+      {
+        "claim": "JWT 持久化与注销：浏览器 localStorage；过期→clearAll+reauthentication-required；logout=clearAll；无 refresh token 流（重新 OAuth 即刷新）",
+        "source": "packages/web/src/auth/browserOAuthCredentialRepo.ts:82-119,145-179; packages/web/src/auth/webAuthService.ts:205-207; packages/web/src/web-remote-control/app/webRemoteControlEntry.ts:250-255",
+        "class": "source"
+      },
+      {
+        "claim": "设备侧注册/注销（对照面）：register POST /api/v1/remote/device {device_mid}→device_sid；delete POST /api/v1/remote/device/delete {device_sid}；device 注册记录持久化在 AppSettings.webRemoteControlRelayV2Device",
+        "source": "packages/desktop/src/main/web-remote-relay/webRemoteControlV2Http.ts:47-61; packages/desktop/src/main/web-remote-relay/webRemoteControlDeviceStorage.ts:11-24; packages/shared/src/web-remote-relay/contract.ts:105-118",
+        "class": "source"
+      },
+      {
+        "claim": "fake 锁形：未认证不能申请/消费 token 或发 data；合法凭据可申请 role=terminal；过期/已消费 token 被拒；SID 字符串不被接受为 token 或凭据；KICKED 即停且无新连接",
+        "source": "tests/remote/zcodeBridgeRelay.test.ts（5 用例，RED→GREEN 证据见决策文件 B1 节 6.5）；客户端被测实现 scripts/zcode-bridge-probe/relayAuth.ts",
+        "class": "fake"
+      }
+    ]
+  },
+  "route": {
+    "role": "terminal",
+    "ownerScope": "同 device_sid 的 terminal 角色单 owner：新 terminal 连接会使旧连接收到 error{KICKED}（官方终端允许一次 2–5s 重连、60s 窗口内第二次即终态 session-conflict）；Tuvis 探针口径 = 收到 KICKED 直接终态停止，不自动重连、不夺 owner",
+    "workspaceBindingFields": [],
+    "sessionBindingFields": [],
+    "bindingNote": "relay 层唯一的绑定字段是 device_sid（官方链接的 sid 参数；auth_init/auth_ack 均以 device_sid 回显校验）；链接其余参数为 mid/name/app_version（展示与匹配辅助），legacy hash/t 参数被官方解析器直接拒绝。workspace/session 级绑定发生在 relay 之上的 RPC/APP 层，未取证——由 B2 以真实帧补齐，本文件保持空数组（不猜测字段）",
+    "evidence": [
+      {
+        "claim": "绑定字段与链接参数形状：sid/mid/name/app_version；hash/t 拒收；selectDevice 以 device_sid 选择目标",
+        "source": "packages/shared/src/web-remote-control.ts:116-122,163-207; packages/web/src/web-remote-control/app/webRemoteControlEntry.ts:88-97,177-201,203-209",
+        "class": "source"
+      },
+      {
+        "claim": "单 owner/KICKED：同 role 新连接踢旧连接（见 auth.evidence 第 4 条）；设备在线性以 auth_ack/pair_status 表达",
+        "source": "packages/shared/src/web-remote-relay/contract.ts:53-65; packages/shared/src/web-remote-relay/domain/retry.ts:26-30",
+        "class": "source + fake（tests/remote/zcodeBridgeRelay.test.ts KICKED 用例）"
+      }
+    ]
+  },
+  "capabilities": {
+    "send": false,
+    "approval": false,
+    "userInput": false,
+    "interrupt": false,
+    "model": false,
+    "thoughtLevel": false,
+    "reason": "B1 尚未建立任何真实连接；协议面入口（server-operations/interaction-broker）在 B0 已登记但未经真实脱敏帧验证。按计划：未取得真实帧证据一律 false，B2 起逐项取证。"
+  },
+  "operations": []
+}
