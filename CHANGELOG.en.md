@@ -95,6 +95,11 @@ _Only versions translated so far are listed here; the full history lives in the
 - Gate cleanup for the A package: one closure in `tests/zcode_config_remote.rs` replaced
   with a function reference (new clippy `redundant_closure` warning; test-only, no
   behavior change).
+- B-package evidence artifacts landed: the ZCode official-bridge decision document
+  (`docs/superpowers/decisions/2026-10-24-zcode-official-bridge-contract.md`, including
+  line-number auth-chain evidence from the pinned source SHA), a fake-relay Vitest suite
+  (`tests/remote/zcodeBridgeRelay.test.ts`), and the `scripts/zcode-bridge-probe` skeleton;
+  all forensic/test assets, no product behavior change.
 
 ## [0.6.2] - Unreleased
 

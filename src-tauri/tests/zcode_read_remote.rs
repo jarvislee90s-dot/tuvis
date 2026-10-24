@@ -359,7 +359,7 @@ fn mixed_main_sessions_keep_distinct_ids() {
     let sessions = build_sessions(&roots, &fake_host(), NOW);
     let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
 
-    // 出卡集合逐项断言：四个主会话都在，六个排除项都不在
+    // 出卡集合逐项断言：四个主会话都在，五个排除项都不在（另有无宿主两条单独断言）
     assert!(ids.contains(&OLD_MAIN), "旧形态主会话应出卡，实际 {ids:?}");
     assert!(ids.contains(&NEW_MAIN), "新形态主会话应出卡，实际 {ids:?}");
     assert!(

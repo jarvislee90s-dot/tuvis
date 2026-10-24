@@ -1198,7 +1198,8 @@ fn audit_action_for(text: &str, base: &'static str) -> &'static str {
 
 /// **H3 无头总开关门**（session-send / session-send-info 共用）：判据 =
 /// 「路由结论是无头族」（`routing::headless_kind_of`，不另立工具/形态表）+
-/// `KEY_HEADLESS`（缺键 = 默认关），开关经 `st.store` 缝读取——生产 = 全局 DB
+/// `KEY_HEADLESS`（缺键 = 默认开；显式 "false" 才是用户关闭；空串/乱串等非法值判关），
+/// 开关经 `st.store` 缝读取——生产 = 全局 DB
 /// 同锁同连接，测试 = 内存库（零接触真实 ~/.tuvis）。
 ///
 /// **边界（按构造成立）**：终端通道（claude/kimi/opencode/codex CLI）的路由候选全是
@@ -1425,9 +1426,10 @@ pub async fn session_send(
         )
         .await;
     }
-    // ④b H3 无头通道总开关（默认关，显式开启；**门在最前**——无头绑定会话先看开关，
-    //    再看路由判据）。判据单点在 [`headless_blocked`]（路由结论 + 开关；开关经
-    //    st.store 缝读取）。**边界**：终端注入四家恒不受本门影响。
+    // ④b H3 无头通道总开关（缺键 = 默认开；显式 "false" 才是用户关闭，非法值判关；
+    //    **门在最前**——无头绑定会话先看开关，再看路由判据）。判据单点在
+    //    [`headless_blocked`]（路由结论 + 开关；开关经 st.store 缝读取）。
+    //    **边界**：终端注入四家恒不受本门影响。
     let tool = session.agent_type.tool_id().to_string();
     if headless_blocked(&st, &tool, session.form, session.pid).is_some() {
         return json_no_store(
