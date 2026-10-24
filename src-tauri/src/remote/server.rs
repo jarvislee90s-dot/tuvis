@@ -628,6 +628,10 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // /ui-config（2026-10-05 UI 改版）：远程端外观配置下发（settings KV 只读缝；
         // PIN 门禁内层 gate 结构性覆盖——新端点不需要各自鉴权代码）
         .route("/ui-config", get(api::ui_config))
+        // /official-control（A4）：ZCode 官方远控链接配置只读下发（settings KV，
+        // 读取即复验）。PIN 门禁内层 gate 结构性覆盖；移动端无写接口——
+        // 保存只走桌面端 Tauri 命令（设计 §4.2「首版桌面编辑」）
+        .route("/official-control", get(api::official_control))
         // /channel（§C5，Task 10）：通道能力**装饰**端点（走哪条通道/带宽受限 +
         // 实测速率）。读 Host 推断、可被伪造、允许不准、**永不得进安全判定**
         // （不变量 §G1 推论③，见 api::channel_info 注释）；gate 由本子路由的

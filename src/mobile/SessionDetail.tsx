@@ -1838,6 +1838,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
             <MessageComposer
               key={`composer-${session.id}`}
               session={session}
+              agentType={session.agentType}
               onQueueChanged={bumpQueue}
             />
           </div>
@@ -1909,10 +1910,13 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
           {cardDock}
           {/* 发送输入区（M7 Task 7，W4）：**全布局态挂载**（正文 / split / split-h，
               2026-09-19 用户裁决）——分屏时对话列同样可发消息；
-              send-info 拉取失败时组件自静默，不影响对话渲染；钥匙口径同上 */}
+              send-info 拉取失败时组件自静默，不影响对话渲染；钥匙口径同上。
+              A5：把 agentType 交给 composer——只有 ZCode 会话才去读本机官方远控配置并在
+              发送区给就地原因（正文/文件预览这条读链完全不受它影响）。 */}
           <MessageComposer
             key={`composer-${session.id}`}
             session={session}
+            agentType={session.agentType}
             onQueueChanged={bumpQueue}
           />
         </div>

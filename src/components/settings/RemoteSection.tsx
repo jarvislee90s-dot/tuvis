@@ -3,7 +3,8 @@
 // **六段顺序（2026-10-24 设计 §4.1，A2）**：① 通用（总开关 / 电源保活 / 本机名称）
 // ② 通道四卡一排 + 唯一展开详情区（「本机」不是通道，是访问方式：走局域网卡地址，
 // 零豁免 §C4）③ 访问与安全（访问密码 / 重置设备 / 已接入设备列表）④ 工具特殊配置
-// （目前只有标题的装配点，ZCode 卡由 A5 填入——不交付空工具卡）⑤ 无头注入 /
+// （分组锚留本文件，卡内容由 ToolRemoteSettingsSection 提供——首版只有 ZCode 一张，
+// 不交付空工具卡）⑤ 无头注入 /
 // 兼容发送（抽取为 HeadlessSettingsSection；状态与轮询仍由本文件拥有）⑥ 注入审计
 // （AuditLogSection 由 SettingsPage 紧随其后装配，不在本文件）。分组标题挂
 // data-group 锚供顺序锁（tests/settings/remoteSection.test.tsx）定位。
@@ -62,6 +63,9 @@ import { ProcessHint } from "@/components/settings/ProcessHint";
 // A2（设计 §4.1）：⑤无头注入（含兼容发送）抽取为纯呈现子组件——状态 owner（草稿、
 // ref 闸回填）、保存/错误回执与 3s 轮询都留在本文件（不建第二套状态/第二个定时器）
 import { HeadlessSettingsSection } from "@/components/settings/HeadlessSettingsSection";
+// A5（设计 §4.1）：④工具特殊配置的卡内容——首版只有 ZCode 一张折叠卡（分组锚留在
+// 本文件供六段顺序锁定位；不交付空工具卡、不预建多工具框架）
+import { ToolRemoteSettingsSection } from "@/components/settings/ToolRemoteSettingsSection";
 
 // B1：撤销预览载荷（Rust 端 run_step("disable_preview") 的形状，见 wizard.rs 注释）
 type TsDisablePreview = {
@@ -1406,14 +1410,16 @@ export function RemoteSection() {
             {t("settings.remote.notice")}
           </p>
 
-          {/* ④ 工具特殊配置装配点（设计 §4.1）：A2 只交付**标题**，ZCode 折叠卡由 A5
-              填入——不渲染空工具卡，也不预建多工具框架。分组锚供顺序锁定位。 */}
+          {/* ④ 工具特殊配置装配点（设计 §4.1）：分组锚留在这里（六段顺序锁的定位面），
+              卡内容由 ToolRemoteSettingsSection 提供——首版只有 ZCode 一张折叠卡，
+              不渲染空工具卡、不预建多工具框架（A5）。 */}
           <div
             data-group="tools"
             className="text-muted-foreground mt-4 text-[12.5px] font-semibold"
           >
             {t("settings.remote.groupTools")}
           </div>
+          <ToolRemoteSettingsSection />
 
           {/* ⑤ 无头注入（含兼容发送；抽取子组件；状态 owner 与 3s 轮询仍在本文件） */}
           <HeadlessSettingsSection

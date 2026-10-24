@@ -411,6 +411,10 @@ pub fn run() {
         // 升级检查（prerelease 渠道）：GitHub 发现层 + 动态端点一键升级
         commands::updater::check_for_github_update,
         commands::updater::install_github_update,
+        // ZCode 官方远控链接配置（A4）：桌面端读写，服务端单点校验、读取即复验；
+        // 手机只经配对门内 GET /m/api/v1/official-control 读取，无写接口
+        commands::zcode_remote::zcode_remote_config_get,
+        commands::zcode_remote::zcode_remote_config_set,
     ]);
 
     // 仅 release 构建注册 updater（评审 I3 修正，2026-10-08）：

@@ -121,6 +121,8 @@ beforeEach(() => {
       return null; // remote.host_name 未设置 → 默认系统名；remote.keepalive → true
     }
     if (cmd === "remote_devices") return [];
+    // A5：④ 工具特殊配置的 ZCode 折叠卡挂载即读一次本机配置（缺键形态=未配置）
+    if (cmd === "zcode_remote_config_get") return { configState: "missing", url: null };
     return null;
   });
 });
@@ -2180,6 +2182,9 @@ describe("RemoteSection 六段顺序（A2 remote_sections_follow_user_order）",
       ).toHaveLength(1);
     }
     expect(document.querySelectorAll("[data-device-list]"), "设备列表的份数").toHaveLength(1);
+    // A5：④ 段的装配点现在挂**且只挂** ZCode 一张工具卡（不交付空卡、不预建多工具框架）
+    expect(document.querySelectorAll('[data-tool-card="zcode"]'), "ZCode 卡的份数").toHaveLength(1);
+    expect(document.querySelectorAll("[data-tool-card]"), "工具卡的总份数").toHaveLength(1);
   });
 });
 
