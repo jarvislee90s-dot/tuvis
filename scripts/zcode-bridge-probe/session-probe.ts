@@ -8,12 +8,17 @@
 //                         单条连接 auth_init→auth_ack→paired（SingleConnectionGate 全程
 //                         只放行这一条）；
 //   3. mapping         —— paired 后只发两个白名单只读查询 bootstrap-request /
-//                         workspace-list-request（B1 已实连验证），并被动收帧组装
-//                         controller/tasks-index 等 rpc-frame（B1 实连已观察到该推送），
-//                         得到 workspace 条目 + task 行（精确 taskId/workspacePath）；
-//   4. designate       —— 操作员指称（--workspace 默认 Travel、--task-title 默认 hi）→
-//                         在 listing 里**精确唯一**匹配出真实 id；匹配不唯一/不命中一律
-//                         中止（绝不按标题发送）；映射只绑定当前连接代际；
+//                         workspace-list-request（B1 已实连验证）；随后**主动**枚举
+//                         任务索引：workspace-bridge-open（taskId 缺省）打开读面桥 →
+//                         EventListen onDynamicControllerFrame + subscribeControllerV4
+//                         {topic: controller/tasks-index}（channel window-controller）
+//                         → 有界收帧窗收 snapshot/deltas 任务行（B2 修复：被动 8s 窗
+//                         实连 0 帧，任务行必须主动拉）；
+//   4. designate       —— 操作员指称（--workspace 默认 Travel、--task-title 默认 hi）：
+//                         workspace 走唯一化阶梯（label 精确 → purpose=project →
+//                         activeWorkspaceKey）→ task 在解析出的 workspace 内**精确唯一**
+//                         匹配 title；不唯一/不命中一律中止（绝不按标题发送）；
+//                         映射只绑定当前连接代际；
 //   5. send（--send-authorized 显式解锁，缺省只打印 WOULD-send 即停）——
 //                         workspace-bridge-open{workspaceKey, taskId} → ready →
 //                         rpc-frame 通道 hello/clientHello →
@@ -61,14 +66,18 @@ import {
   AGENT_CLIENT_HELLO_METHOD,
   AGENT_HELLO_METHOD,
   RESPONSE_TYPE_EVENT_FIRE,
+  ControllerTaskIndexReader,
   RpcFrameAssembler,
   SendOnceLoop,
   SessionTargetMapper,
   SingleConnectionGate,
   V4_WIRE_PROTOCOL_VERSION,
   decodeChannelMessage,
+  dedupeWorkspaceEntries,
   encodeChannelRequest,
   encodeRpcFrame,
+  readActiveWorkspaceKeyFromListings,
+  resolveDesignatedWorkspace,
   type BoundTarget,
   type DecodedChannelMessage,
   type RpcFrameIdentity,
@@ -94,20 +103,22 @@ export const PROBE_GUARDS = {
   stopOnKicked: true,
   /**
    * mapping 阶段只读白名单（bootstrap-request / workspace-list-request，B1 已验证）；
-   * send 阶段唯一追加的写向 = workspace-bridge-open（bridge 打开是发送链的官方前置，
-   * 决策文件 §7），且必须 --send-authorized 显式解锁。
+   * 任务枚举阶段追加的唯一 app payload 写向 = workspace-bridge-open（打开读面订阅桥，
+   * taskId 缺省，不选任务不标已读），其上只发 controller/tasks-index 的订阅/退订
+   * 控制帧；send 阶段才允许真正的发送链（且必须 --send-authorized 显式解锁）。
    */
   mappingReadonly: true,
   /** 发送步硬闸：缺 --send-authorized 时映射完成后即停，绝不构造发送帧。 */
   sendRequiresExplicitFlag: true,
-  /** 一次运行的发送帧数上限（SendOnceLoop 结构性恒 1）。 */
+  /** 一次运行的发送帧数上限（SendOnceLoop 结构性恒 1；任务枚举的订阅/退订控制帧不计数）。 */
   maxSendFrames: 1,
   /**
    * connect→teardown 的声明性预算（ms；不是 wall-clock 强杀）：配对窗口 30s +
-   * 2×10s 只读查询 + 8s 收帧窗 + 10s bridge-open + 10s 握手/订阅 + 20s ACK 窗 +
-   * 30s 活动窗 ≈ 148s。OAuth 回调等待单独有界（--wait-ms）。时限由各阶段自有界承担。
+   * 2×10s 只读查询 + [10s bridge-open + 10s subscribe + 8s 收帧窗 + 5s 退订]（任务
+   * 枚举）+ 10s bridge-open + 10s 握手/订阅 + 20s ACK 窗 + 30s 活动窗 ≈ 163s。
+   * OAuth 回调等待单独有界（--wait-ms）。时限由各阶段自有界承担。
    */
-  maxDurationMs: 150_000,
+  maxDurationMs: 170_000,
   /** 凭据只经运行期输入（浏览器授权 / stdin），禁止写盘、禁止进环境变量与日志。 */
   credentialsInMemoryOnly: true,
 } as const;
@@ -120,12 +131,17 @@ const SEND_FLAG = "--send-authorized";
 const RELAY_HTTP_TIMEOUT_MS = 10_000;
 /** 单个只读查询超时：官方 payloadRequester 默认 10s（payloadRequester.ts:67）。 */
 const READ_QUERY_TIMEOUT_MS = 10_000;
-/** 映射收帧窗：paired 后被动收 rpc-frame 的有界窗口。 */
+/**
+ * 任务枚举收帧窗：subscribeControllerV4 ack 后收集 tasks-index snapshot/deltas 的
+ * 有界窗口（B2 修复：改为主动订阅后的收帧窗，不再被动等待宿主推送）。
+ */
 const CAPTURE_WINDOW_MS = 8_000;
 /** workspace-bridge-open 等待 ready 的有界窗口。 */
 const BRIDGE_OPEN_TIMEOUT_MS = 10_000;
 /** bridge RPC（hello/clientHello/subscribe）单请求有界窗口。 */
 const BRIDGE_RPC_TIMEOUT_MS = 10_000;
+/** 任务枚举的退订请求有界窗口（尽力而为；失败不影响结果）。 */
+const TASK_ENUM_UNSUBSCRIBE_TIMEOUT_MS = 5_000;
 /** 发送 ACK 窗口（CommandAck 应答；超窗 = unknown，绝不重发）。 */
 const SEND_ACK_TIMEOUT_MS = 20_000;
 /** 受理后的轮次活动观察窗。 */
@@ -137,9 +153,14 @@ const DEFAULT_DB_PATH = "~/.tuvis/tuvis.db";
 /** 本连接的映射代际（本探针单连接、无重连，代际恒 1；换代只发生在新的进程运行）。 */
 const CONNECTION_GENERATION = 1;
 
-/** mapping 阶段允许的 app payload 类型（B1 白名单）；send 阶段追加 bridge-open。 */
+/** mapping 阶段允许的 app payload 类型（B1 白名单）；枚举/send 阶段追加 bridge-open。 */
 const SEND_PHASE_ALLOWED_TYPES = [...READONLY_REQUEST_TYPES, "workspace-bridge-open"] as const;
 type AppPayloadRequestType = (typeof SEND_PHASE_ALLOWED_TYPES)[number];
+/** 任务枚举阶段允许的 app payload 类型：mapping 只读查询 + bridge-open 打开读面桥。 */
+const TASK_ENUM_ALLOWED_TYPES: readonly AppPayloadRequestType[] = [
+  ...READONLY_REQUEST_TYPES,
+  "workspace-bridge-open",
+];
 
 export type SessionProbeStep = {
   id: string;
@@ -173,18 +194,22 @@ export const SESSION_PROBE_STEPS: readonly SessionProbeStep[] = [
   },
   {
     id: "s5-mapping",
-    title: "只读映射：bootstrap / workspace-list + 被动收帧（精确 id）",
+    title: "只读映射：bootstrap / workspace-list + 主动任务索引枚举（精确 id）",
     requires: "s4 进入 paired",
     detail:
-      "白名单两个只读查询 + 有界收帧窗组装 tasks-index 推送；产出 workspace 条目与 task 行" +
-      "（精确 taskId / workspacePath），全程脱敏落证。",
+      "白名单两个只读查询（双 listing 去重）+ workspace-bridge-open（taskId 缺省）打开读面桥" +
+      "后主动订阅 controller/tasks-index（EventListen + subscribeControllerV4，有界收帧窗）" +
+      "收任务行；产出 workspace 条目与 task 行（精确 taskId / workspacePath），全程脱敏落证。",
   },
   {
     id: "s6-designate",
-    title: "目标指称 → 精确 id（唯一匹配，绝不按标题发送）",
-    requires: "--workspace（默认 Travel）/ --task-title（默认 hi）与 listing 精确唯一对应",
+    title: "目标指称 → 精确 id（workspace 阶梯唯一化 + task 唯一匹配，绝不按标题发送）",
+    requires: "--workspace（默认 Travel）/ --task-title（默认 hi）与 listing 精确对应",
     detail:
-      "指称只用于人读定位；发送授权用的是解析出的精确 id；不唯一/不命中 → 中止（映射证据照常落盘）。",
+      "workspace：label 精确匹配 → 多候选时优先 workspacePurpose=project → 仍多候选时优先 " +
+      "APP 当前打开的 workspace（bootstrap activeWorkspaceKey）→ 仍不唯一即中止；" +
+      "task：在解析出的 workspace 内按 title 精确唯一匹配；不唯一/不命中 → 中止" +
+      "（映射证据照常落盘）。发送授权用的是解析出的精确 id。",
   },
   {
     id: "s7-send",
@@ -295,9 +320,11 @@ function printHelp(): void {
     `  ${SEND_FLAG}             发送步解锁（batch-1 授权：会话 ${DEFAULT_TASK_DESIGNATION} 发一条消息）。`
   );
   lines.push("                             缺席时映射完成后只打印 WOULD-send 即停，绝不发送。");
+  lines.push("  --workspace=<指称>        测试工作区指称（默认 Travel；listing label 精确匹配，");
   lines.push(
-    "  --workspace=<指称>        测试工作区指称（默认 Travel；listing label 精确唯一匹配）。"
+    "                             多候选时按 purpose=project → activeWorkspaceKey 阶梯唯一化，"
   );
+  lines.push("                             仍不唯一即中止。");
   lines.push("  --task-title=<指称>       测试会话指称（默认 hi；任务 title 精确唯一匹配，");
   lines.push("                             只用于定位，发送归因用解析出的精确 id）。");
   lines.push("  --provider=<zai|bigmodel> OAuth 通道（默认 bigmodel——B1 定案用户账号在该通道）。");
@@ -419,10 +446,11 @@ class B2Channel {
     return this.requestPayload(sender, type, {}, timeoutMs);
   }
 
-  /** send 阶段唯一追加的写向：workspace-bridge-open（仍过白名单闸）。 */
+  /** send 阶段唯一追加的写向：workspace-bridge-open（仍过白名单闸）。
+   * taskId 可选（web-remote-control.ts:435-447 `taskId?`）；任务枚举期省略。 */
   openWorkspaceBridge(
     sender: { sendData(payload: unknown): boolean },
-    payload: { requestId: string; bridgeSessionId: string; workspaceKey: string; taskId: string },
+    payload: { requestId: string; bridgeSessionId: string; workspaceKey: string; taskId?: string },
     timeoutMs: number
   ): Promise<AppPayloadOutcome> {
     return this.requestPayload(sender, "workspace-bridge-open", payload, timeoutMs);
@@ -616,6 +644,9 @@ function harvestWorkspaceEntries(
           : {}),
         ...(typeof record.label === "string" ? { label: record.label } : {}),
         ...(typeof record.kind === "string" ? { kind: record.kind } : {}),
+        ...(typeof record.workspacePurpose === "string"
+          ? { workspacePurpose: record.workspacePurpose }
+          : {}),
       });
     }
   }
@@ -1039,43 +1070,37 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         `bootstrap-request → ${bootstrap.kind}；workspace-list-request → ${workspaceList.kind}。`
       );
 
-      log(`被动收帧窗 ${CAPTURE_WINDOW_MS} ms（tasks-index 等宿主推送，B1 实连同款）……`);
-      await new Promise((resolve) => setTimeout(resolve, CAPTURE_WINDOW_MS));
-
       // 结构化收割（真实值只在内存；登记别名后只落别名证据）。
-      const workspaces: WorkspaceListingEntry[] = [];
+      const workspacesRaw: WorkspaceListingEntry[] = [];
       harvestWorkspaceEntries(
         [
           bootstrap.kind === "ok" ? bootstrap.payload : null,
           workspaceList.kind === "ok" ? workspaceList.payload : null,
         ],
-        workspaces
+        workspacesRaw
       );
-      const rawRows: TaskListingRow[] = [];
-      for (const message of channel.bridgeMessages) {
-        try {
-          harvestTaskRows(JSON.parse(message) as unknown, rawRows);
-        } catch {
-          // 非 JSON 消息跳过（计数即可）。
-        }
-      }
-      const tasks = dedupeRows(rawRows);
+      // B2 修复：bootstrap 与 workspace-list 携带同一份 workspaces[]（实连
+      // macos-B220261024T121929Z-SnWWVA：14×2=28），不去重则任何 label 精确匹配
+      // 至少翻倍、「精确唯一」永假（实连即在 workspace-ambiguous fail-closed）。
+      const workspaces = dedupeWorkspaceEntries(workspacesRaw);
+      // APP 当前打开的 workspace（只读自 bootstrap response；阶梯第三级判据）。
+      const activeWorkspaceKey = readActiveWorkspaceKeyFromListings({
+        bootstrap: bootstrap.kind === "ok" ? bootstrap.payload : null,
+        workspaceList: workspaceList.kind === "ok" ? workspaceList.payload : null,
+      });
       for (const entry of workspaces) {
         redactor.register("path", entry.workspacePath);
         if (entry.workspaceIdentity) redactor.register("sid", entry.workspaceIdentity);
         if (entry.remoteSessionId) redactor.register("sid", entry.remoteSessionId);
         if (entry.label) redactor.register("name", entry.label);
       }
-      for (const row of tasks) {
-        redactor.register("path", row.address.workspacePath);
-        redactor.register("sid", row.address.taskId);
-        if (row.meta?.title) redactor.register("name", row.meta.title);
-      }
+      if (activeWorkspaceKey) redactor.register("path", activeWorkspaceKey);
       mappingSummary.listings = {
         bootstrapOutcome: bootstrap.kind,
         workspaceListOutcome: workspaceList.kind,
+        workspaceEntriesRaw: workspacesRaw.length,
         workspaceEntries: workspaces.length,
-        taskRows: tasks.length,
+        activeWorkspaceKnown: activeWorkspaceKey !== null,
         bridgeMessages: channel.bridgeMessages.length,
         rpcFramesSeen: channel.rpcFramesSeen.length,
         rpcAckCount: channel.rpcAckCount,
@@ -1085,25 +1110,44 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
       record(ctx, "mapping", "harvest", mappingSummary.listings);
       recordChannelEvidence(ctx, "mapping", channel);
       log(
-        `映射输入：workspace 条目 ×${workspaces.length}，task 行 ×${tasks.length}（收帧 ${channel.bridgeMessages.length} 条）。`
+        `映射输入：workspace 条目 ×${workspaces.length}（原始 ×${workspacesRaw.length}，双 listing 去重后）；` +
+          `activeWorkspaceKey ${activeWorkspaceKey ? "已知" : "未知"}。`
       );
 
-      // —— s6：designate（指称 → 精确 id；唯一匹配，绝不按标题发送） ————————————
-      const designation = designateTarget(
-        ctx,
+      // —— s6a：workspace 指称唯一化（label → purpose=project → activeWorkspaceKey） ——
+      const wsDesignation = resolveDesignatedWorkspace({
         workspaces,
-        tasks,
-        parsed.workspace,
-        parsed.taskTitle
-      );
-      if (!designation.ok) {
-        mappingVerdict = `ABORTED:designate-${designation.reason}`;
+        label: parsed.workspace,
+        activeWorkspaceKey,
+      });
+      record(ctx, "mapping", "designation-workspace-evidence", {
+        workspaceDesignationAlias: redactor.sanitizeText(parsed.workspace),
+        evidence: wsDesignation.evidence,
+        activeWorkspaceKeyAlias: activeWorkspaceKey
+          ? redactor.sanitizeText(activeWorkspaceKey)
+          : null,
+        resolvedWorkspace: wsDesignation.ok
+          ? {
+              label: wsDesignation.entry.label
+                ? redactor.register("name", wsDesignation.entry.label)
+                : null,
+              workspacePath: redactor.register("path", wsDesignation.entry.workspacePath),
+              kind: wsDesignation.entry.kind ?? null,
+              workspacePurpose: wsDesignation.entry.workspacePurpose ?? null,
+            }
+          : null,
+        note: "阶梯证据只含 sanitized 计数/布尔/步骤标签，绝不含真实值",
+      });
+      if (!wsDesignation.ok) {
+        mappingVerdict = `ABORTED:designate-${wsDesignation.reason}`;
         record(ctx, "mapping", "designate-failed", {
-          reason: designation.reason,
+          reason: wsDesignation.reason,
+          stage: "workspace",
           workspaceDesignation: redactor.sanitizeText(parsed.workspace),
-          taskDesignation: redactor.sanitizeText(parsed.taskTitle),
         });
-        log(`映射中止：${designation.reason}（未发送任何写向；未匹配的指称不入证据正文）。`);
+        log(
+          `映射中止：workspace ${wsDesignation.reason}（未发送任何写向；未匹配的指称不入证据正文）。`
+        );
         conn.close();
         channel.detach();
         gate.release();
@@ -1120,12 +1164,186 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         );
         return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
       }
-      const bound: BoundTarget = designation.bound;
+      const workspaceEntry = wsDesignation.entry;
+
+      // —— s5b：任务索引主动枚举（B2 修复）————————————————————————————————————
+      // 被动收帧窗实连 0 条 rpc-frame → 任务行必须主动拉。方法（行号 @ 3c5b2276）：
+      // workspace-bridge-open（taskId 可选，web-remote-control.ts:435-447，枚举期省略）
+      // → 就绪身份 → channel "window-controller"（channels.ts:112；只在 workspace
+      // bridge relay 通道发布，remoteServiceAccess.ts:181-185 + websocket.ts:102-108 +
+      // webRemoteControlWorkspaceBridgeSession.ts:39-74）上：EventListen(102)
+      // "onDynamicControllerFrame"（windowController.ts:78；proxy-channel.ts:126-127；
+      // channelClient.ts:150-177,179-194；官方先监听后订阅
+      // windowControllerTaskListRegistry.ts:145,220-224）+ subscribeControllerV4
+      // {topic:"controller/tasks-index", visibility:"foreground"}
+      // （windowController.ts:75；controller.ts:258-271；ack transport.ts:125-131 +
+      // controller.ts:273-274）→ 有界收帧窗收 snapshot/deltas 任务行（controller.ts
+      // :251-256,155-164,187-191,93-123）。全部为读面控制帧，无会话发送帧。
+      const enumBridgeSessionId = `b2-bridge-${crypto.randomUUID()}`;
+      redactor.register("sid", enumBridgeSessionId);
+      const enumChannel = new B2Channel({ allowedTypes: TASK_ENUM_ALLOWED_TYPES });
+      liveChannels.push(enumChannel);
+      enumChannel.attach(conn);
+      const enumBridgeOpen = await enumChannel.openWorkspaceBridge(
+        conn,
+        {
+          requestId: `b2-bridge-open-${crypto.randomBytes(6).toString("hex")}`,
+          bridgeSessionId: enumBridgeSessionId,
+          // workspaceKey 口径 = workspaceIdentity?.trim() || workspacePath
+          // （web-remote-control.ts:744-747）。
+          workspaceKey: workspaceEntry.workspaceIdentity?.trim() || workspaceEntry.workspacePath,
+        },
+        BRIDGE_OPEN_TIMEOUT_MS
+      );
+      record(ctx, "mapping", "tasks-bridge-open", summarizePayload(enumBridgeOpen));
+      if (enumBridgeOpen.kind !== "ok") {
+        mappingVerdict = `ABORTED:designate-task-bridge-open-${enumBridgeOpen.kind}`;
+        record(ctx, "mapping", "designate-failed", {
+          reason: mappingVerdict,
+          stage: "task-enumeration",
+        });
+        log(`映射中止：任务枚举桥未就绪（${enumBridgeOpen.kind}）（未发送任何写向）。`);
+        conn.close();
+        enumChannel.detach();
+        channel.detach();
+        gate.release();
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      const enumReady = extractBridgeReady(enumBridgeOpen.payload, enumBridgeSessionId);
+      redactor.register("sid", enumReady.bridgeSessionId);
+      record(ctx, "mapping", "tasks-bridge-ready", {
+        bridgeSessionId: enumReady.bridgeSessionId,
+        bridgeGeneration: enumReady.bridgeGeneration,
+      });
+      const reader = new ControllerTaskIndexReader({
+        sender: conn,
+        identity: enumReady.identity,
+        timeouts: {
+          subscribeMs: BRIDGE_RPC_TIMEOUT_MS,
+          windowMs: CAPTURE_WINDOW_MS,
+          unsubscribeMs: TASK_ENUM_UNSUBSCRIBE_TIMEOUT_MS,
+        },
+      });
+      enumChannel.onRpcFrame = (payload) => reader.onData(payload);
+      log(`主动任务枚举：EventListen + subscribeControllerV4（收帧窗 ${CAPTURE_WINDOW_MS} ms）……`);
+      const enumResult = await reader.run();
+      recordChannelEvidence(ctx, "tasks", enumChannel);
+      // 枚举收帧窗已闭：摘除枚举通道（conn.onData 单槽让位给 send 阶段的通道；
+      // detach 幂等，后续 abort 路径重复调用为 no-op）。
+      enumChannel.detach();
+      mappingSummary.taskEnumeration = {
+        outcome: enumResult.kind,
+        ackMode: enumResult.kind === "ok" ? enumResult.ackMode : null,
+        ...enumResult.counters,
+      };
+      record(ctx, "mapping", "task-enumeration", mappingSummary.taskEnumeration);
+      log(
+        `任务枚举 = ${enumResult.kind}（rows=${enumResult.kind === "ok" ? enumResult.rows.length : 0}，` +
+          `snapshotFrames=${enumResult.counters.snapshotFrames}，deltaFrames=${enumResult.counters.deltaFrames}）。`
+      );
+      if (enumResult.kind !== "ok") {
+        mappingVerdict = `ABORTED:designate-task-${enumResult.kind}`;
+        record(ctx, "mapping", "designate-failed", {
+          reason: enumResult.kind,
+          stage: "task-enumeration",
+        });
+        log(`映射中止：任务枚举失败（${enumResult.kind}）（未发送任何写向）。`);
+        conn.close();
+        enumChannel.detach();
+        channel.detach();
+        gate.release();
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      // 任务行 = 主动枚举产物 + mapping 通道被动桥帧兜底（同键去重；两者都来自
+      // 真实帧的结构化收割）。
+      const passiveRows: TaskListingRow[] = [];
+      for (const message of channel.bridgeMessages) {
+        try {
+          harvestTaskRows(JSON.parse(message) as unknown, passiveRows);
+        } catch {
+          // 非 JSON 消息跳过（计数即可）。
+        }
+      }
+      const tasks = dedupeRows([...enumResult.rows, ...passiveRows]);
+      for (const row of tasks) {
+        redactor.register("path", row.address.workspacePath);
+        redactor.register("sid", row.address.taskId);
+        if (row.meta?.title) redactor.register("name", row.meta.title);
+      }
+      mappingSummary.listings = {
+        ...(mappingSummary.listings as Record<string, unknown>),
+        taskRows: tasks.length,
+        taskRowsFromEnumeration: enumResult.rows.length,
+      };
+
+      // —— s6b：task 指称在解析出的 workspace 内精确唯一匹配（绝不按标题发送） ——
+      const taskMatches = tasks.filter(
+        (row) =>
+          row.address.workspacePath === workspaceEntry.workspacePath &&
+          row.meta?.title === parsed.taskTitle
+      );
+      if (taskMatches.length === 0 || taskMatches.length > 1) {
+        mappingVerdict = `ABORTED:designate-task-${taskMatches.length === 0 ? "not-found" : "ambiguous"}`;
+        record(ctx, "mapping", "designate-failed", {
+          reason: taskMatches.length === 0 ? "task-not-found" : "task-ambiguous",
+          stage: "task",
+          taskDesignation: redactor.sanitizeText(parsed.taskTitle),
+          workspacePathAlias: redactor.register("path", workspaceEntry.workspacePath),
+          candidateRows: taskMatches.length,
+        });
+        log(
+          `映射中止：task ${taskMatches.length === 0 ? "task-not-found" : "task-ambiguous"}（未发送任何写向）。`
+        );
+        conn.close();
+        enumChannel.detach();
+        channel.detach();
+        gate.release();
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      const taskRow = taskMatches[0];
+      const mapper = SessionTargetMapper.fromListings({
+        workspaces,
+        tasks,
+        generation: CONNECTION_GENERATION,
+      });
+      let bound: BoundTarget;
       try {
-        const mapper = SessionTargetMapper.fromListings({
-          workspaces,
-          tasks,
-          generation: CONNECTION_GENERATION,
+        bound = mapper.resolveTarget({
+          taskId: taskRow.address.taskId,
+          workspacePath: workspaceEntry.workspacePath,
         });
         mapper.authorizeSend(bound, CONNECTION_GENERATION);
       } catch (error) {
@@ -1134,6 +1352,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           reason: error instanceof Error ? error.message : String(error),
         });
         conn.close();
+        enumChannel.detach();
         channel.detach();
         gate.release();
         await writeEvidence(
@@ -1156,12 +1375,23 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         workspaceKey: bound.workspaceKey,
         generation: bound.generation,
       };
-      record(ctx, "mapping", "designated", {
-        taskId: bound.taskId,
-        workspacePath: bound.workspacePath,
-        workspaceKey: bound.workspaceKey,
-        generation: bound.generation,
-        note: "以上为 redactor 别名（transcript 落盘前统一 sanitizeDeep）",
+      record(ctx, "mapping", "designation-evidence", {
+        workspaceDesignationAlias: redactor.sanitizeText(parsed.workspace),
+        taskDesignationAlias: redactor.sanitizeText(parsed.taskTitle),
+        workspaceEvidence: wsDesignation.evidence,
+        activeWorkspaceConfirmed: wsDesignation.evidence.activeWorkspaceConfirmed,
+        matchedWorkspace: {
+          label: workspaceEntry.label ? redactor.register("name", workspaceEntry.label) : null,
+          workspacePath: redactor.register("path", workspaceEntry.workspacePath),
+          kind: workspaceEntry.kind ?? null,
+          workspacePurpose: workspaceEntry.workspacePurpose ?? null,
+        },
+        matchedTask: {
+          taskId: redactor.register("sid", taskRow.address.taskId),
+          title: taskRow.meta?.title ? redactor.register("name", taskRow.meta.title) : null,
+        },
+        listingSizes: { workspaces: workspaces.length, tasks: tasks.length },
+        note: "指称只在 designate 步用于唯一化定位；发送归因用精确 id（resolveTarget 产物）",
       });
       log(
         `目标已锁定（别名）：taskId=${bound.taskId} workspace=${bound.workspaceKey}（generation ${bound.generation}）。`
@@ -1551,60 +1781,35 @@ async function teardownSend(
 }
 
 /**
- * 指称 → 精确 id：操作员指称（人读）在 listing 里**精确唯一**匹配；
- * 不唯一/不命中一律拒绝。匹配发生在内存真实值上；证据只写别名。
+ * 从 workspace-bridge-open ready 回显提取 rpc 帧身份。形状钉源 @ 3c5b2276：
+ * ready 回显 {requestId, bridgeSessionId, bridgeGeneration?, recoveryId?,
+ * bridge?{bridgeSessionId, bridgeGeneration, kind}}
+ * （packages/shared/src/web-remote-control.ts:449-456）。提取逻辑与 send 阶段
+ * 同款；独立实现以保持发送路径零改动。
  */
-function designateTarget(
-  ctx: RunContext,
-  workspaces: WorkspaceListingEntry[],
-  tasks: TaskListingRow[],
-  workspaceDesignation: string,
-  taskDesignation: string
-): { ok: true; bound: BoundTarget } | { ok: false; reason: string } {
-  const wsMatches = workspaces.filter((entry) => entry.label === workspaceDesignation);
-  if (wsMatches.length === 0) {
-    return { ok: false, reason: "workspace-not-found" };
-  }
-  if (wsMatches.length > 1) {
-    return { ok: false, reason: "workspace-ambiguous" };
-  }
-  const workspace = wsMatches[0];
-  const taskMatches = tasks.filter(
-    (row) =>
-      row.address.workspacePath === workspace.workspacePath && row.meta?.title === taskDesignation
-  );
-  if (taskMatches.length === 0) {
-    return { ok: false, reason: "task-not-found" };
-  }
-  if (taskMatches.length > 1) {
-    return { ok: false, reason: "task-ambiguous" };
-  }
-  const row = taskMatches[0];
-  const mapper = SessionTargetMapper.fromListings({
-    workspaces,
-    tasks,
-    generation: CONNECTION_GENERATION,
-  });
-  const bound = mapper.resolveTarget({
-    taskId: row.address.taskId,
-    workspacePath: workspace.workspacePath,
-  });
-  record(ctx, "mapping", "designation-evidence", {
-    workspaceDesignationAlias: ctx.redactor.sanitizeText(workspaceDesignation),
-    taskDesignationAlias: ctx.redactor.sanitizeText(taskDesignation),
-    matchedWorkspace: {
-      label: workspace.label ? ctx.redactor.register("name", workspace.label) : null,
-      workspacePath: ctx.redactor.register("path", workspace.workspacePath),
-      kind: workspace.kind ?? null,
-    },
-    matchedTask: {
-      taskId: ctx.redactor.register("sid", row.address.taskId),
-      title: row.meta?.title ? ctx.redactor.register("name", row.meta.title) : null,
-    },
-    listingSizes: { workspaces: workspaces.length, tasks: tasks.length },
-    note: "指称只在 designate 步用于唯一化定位；发送归因用精确 id（resolveTarget 产物）",
-  });
-  return { ok: true, bound };
+function extractBridgeReady(
+  payload: Record<string, unknown>,
+  fallbackBridgeSessionId: string
+): { identity: RpcFrameIdentity; bridgeSessionId: string; bridgeGeneration: number } {
+  const ready = payload as {
+    bridgeSessionId?: unknown;
+    bridgeGeneration?: unknown;
+    bridge?: { bridgeSessionId?: unknown; bridgeGeneration?: unknown };
+  };
+  const bridge = ready.bridge;
+  const bridgeSessionId =
+    (typeof bridge?.bridgeSessionId === "string" && bridge.bridgeSessionId) ||
+    (typeof ready.bridgeSessionId === "string" && ready.bridgeSessionId) ||
+    fallbackBridgeSessionId;
+  const bridgeGeneration =
+    (typeof bridge?.bridgeGeneration === "number" && bridge.bridgeGeneration) ||
+    (typeof ready.bridgeGeneration === "number" && ready.bridgeGeneration) ||
+    CONNECTION_GENERATION;
+  return {
+    identity: { bridgeSessionId, bridgeGeneration },
+    bridgeSessionId,
+    bridgeGeneration,
+  };
 }
 
 function summarizePayload(outcome: AppPayloadOutcome): Record<string, unknown> {

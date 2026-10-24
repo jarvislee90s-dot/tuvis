@@ -12,6 +12,11 @@
 //   - SendOnceLoop：一次发送只构造一个 rpc-frame；peer 受理（rpc-frame-ack）后丢响应
 //     → 结果只记 unknown，绝不重发（无任何重发计时器）；重复 rpc-frame-ack / 重复事件
 //     去重，不产生第二条发送。
+//   - （B2 map-only 修复追加）workspace 指称唯一化阶梯：双 listing 去重 + label 精确 →
+//     purpose=project → activeWorkspaceKey（bootstrap 回读）；controller tasks-index
+//     主动枚举：EventListen(102) + subscribeControllerV4{topic:"controller/tasks-index"}
+//     （channel "window-controller"，行号见 sessionBridge.ts 常量注）→ snapshot/deltas
+//     任务行收割；枚举全程只发读面控制帧，无任何会话发送帧。
 //
 // wire 形状依据 = 固定官方源码 zai-org/ZCode @ 3c5b227649371507ddc4eb46ac5133afe6db1cab
 // 的客户端侧实现（行号见 sessionBridge.ts 各常量注释）：
@@ -53,15 +58,21 @@ import {
   AGENT_CHANNEL,
   AGENT_SEND_COMMAND_METHOD,
   REQUEST_TYPE_PROMISE,
+  RESPONSE_TYPE_EVENT_FIRE,
   RESPONSE_TYPE_PROMISE_SUCCESS,
+  ControllerTaskIndexReader,
   SendOnceLoop,
   SessionTargetMapper,
   SingleConnectionGate,
   crc32WireBytes,
   decodeChannelMessage,
+  dedupeWorkspaceEntries,
   encodeChannelRequest,
   encodeChannelResponse,
   encodeRpcFrame,
+  readActiveWorkspaceKeyFromListings,
+  resolveDesignatedWorkspace,
+  type WorkspaceListingEntry,
 } from "../../scripts/zcode-bridge-probe/sessionBridge";
 
 // ---------------------------------------------------------------------------
@@ -657,5 +668,468 @@ describe("zcode 官方桥接：单连接、会话映射与发送闭环（B2 fake
     expect(decoded?.id).toBe(5);
     expect(decoded?.channelName).toBe(AGENT_CHANNEL);
     expect(decoded?.method).toBe(AGENT_SEND_COMMAND_METHOD);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B2 map-only 修复（实连 run macos-B220261024T121929Z-SnWWVA 在 workspace-ambiguous
+// fail-closed、被动 8s 收帧窗 0 条 rpc-frame）：
+//   1. workspace 指称唯一化阶梯（纯函数，无网络）；
+//   2. controller tasks-index 主动枚举（fake relay 同款 wire）。
+// ---------------------------------------------------------------------------
+
+describe("workspace 指称唯一化阶梯（B2 map-only 修复）", () => {
+  it("双 listing 去重：bootstrap 与 workspace-list 携带同一份条目只保留一份（实连 28→14 复现）", () => {
+    const entryA: WorkspaceListingEntry = {
+      workspacePath: "/fake/Travel",
+      label: "Travel",
+      kind: "local",
+      workspacePurpose: "project",
+    };
+    const entryB: WorkspaceListingEntry = {
+      workspacePath: "/fake/Travel",
+      label: "Travel",
+      kind: "local",
+      workspacePurpose: "conversation",
+    };
+    // 同一条目在两份 listing 里重复 → 去重为 1；不同 purpose 是不同条目 → 保留。
+    expect(dedupeWorkspaceEntries([entryA, entryA, entryB, entryA])).toHaveLength(2);
+  });
+
+  it("activeWorkspaceKey 只读自 bootstrap（mobileViewState 优先），缺失回落 workspace-list 顶层", () => {
+    const bootstrap = {
+      result: { mobileViewState: { activeWorkspaceKey: "/fake/from-bootstrap" } },
+    };
+    const workspaceList = { result: { activeWorkspaceKey: "/fake/from-list" } };
+    expect(readActiveWorkspaceKeyFromListings({ bootstrap, workspaceList })).toBe(
+      "/fake/from-bootstrap"
+    );
+    expect(readActiveWorkspaceKeyFromListings({ bootstrap: null, workspaceList })).toBe(
+      "/fake/from-list"
+    );
+    expect(readActiveWorkspaceKeyFromListings({ bootstrap: null, workspaceList: null })).toBeNull();
+  });
+
+  it("同 label 的 project/conversation 双候选 → purpose 收窄唯一解析；计数证据不含值", () => {
+    const workspaces: WorkspaceListingEntry[] = [
+      {
+        workspacePath: "/fake/Travel-conv",
+        label: "Travel",
+        kind: "local",
+        workspacePurpose: "conversation",
+      },
+      {
+        workspacePath: "/fake/Travel-proj",
+        label: "Travel",
+        kind: "local",
+        workspacePurpose: "project",
+      },
+    ];
+    const result = resolveDesignatedWorkspace({
+      workspaces,
+      label: "Travel",
+      activeWorkspaceKey: "/fake/elsewhere",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.entry.workspacePath).toBe("/fake/Travel-proj");
+    expect(result.evidence).toEqual({
+      labelMatches: 2,
+      afterPurposeFilter: 1,
+      afterActiveKeyFilter: null,
+      activeWorkspaceKnown: true,
+      resolvedStep: "purpose-project",
+      activeWorkspaceConfirmed: false,
+    });
+  });
+
+  it("多 project 候选 → activeWorkspaceKey 收窄解析，且 activeWorkspaceConfirmed=true", () => {
+    const workspaces: WorkspaceListingEntry[] = [
+      {
+        workspacePath: "/fake/Travel-A",
+        label: "Travel",
+        kind: "local",
+        workspacePurpose: "project",
+      },
+      {
+        workspacePath: "/fake/Travel-B",
+        label: "Travel",
+        kind: "local",
+        workspacePurpose: "project",
+      },
+    ];
+    const result = resolveDesignatedWorkspace({
+      workspaces,
+      label: "Travel",
+      activeWorkspaceKey: "/fake/Travel-B",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.entry.workspacePath).toBe("/fake/Travel-B");
+    expect(result.evidence.resolvedStep).toBe("active-workspace-key");
+    expect(result.evidence.afterPurposeFilter).toBe(2);
+    expect(result.evidence.afterActiveKeyFilter).toBe(1);
+    expect(result.evidence.activeWorkspaceConfirmed).toBe(true);
+  });
+
+  it("purpose 收窄为空集（全 conversation）时保留原候选集继续走 activeWorkspaceKey", () => {
+    const workspaces: WorkspaceListingEntry[] = [
+      {
+        workspacePath: "/fake/Only-A",
+        label: "Solo",
+        kind: "local",
+        workspacePurpose: "conversation",
+      },
+      {
+        workspacePath: "/fake/Only-B",
+        label: "Solo",
+        kind: "local",
+        workspacePurpose: "conversation",
+      },
+    ];
+    const result = resolveDesignatedWorkspace({
+      workspaces,
+      label: "Solo",
+      activeWorkspaceKey: "/fake/Only-B",
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.entry.workspacePath).toBe("/fake/Only-B");
+    expect(result.evidence.afterPurposeFilter).toBe(0);
+    expect(result.evidence.resolvedStep).toBe("active-workspace-key");
+  });
+
+  it("仍不唯一（activeWorkspaceKey 缺失/不命中）→ ambiguous 中止；零命中 → not-found 中止", () => {
+    const workspaces: WorkspaceListingEntry[] = [
+      {
+        workspacePath: "/fake/Travel-A",
+        label: "Travel",
+        kind: "local",
+        workspacePurpose: "project",
+      },
+      {
+        workspacePath: "/fake/Travel-B",
+        label: "Travel",
+        kind: "local",
+        workspacePurpose: "project",
+      },
+    ];
+    const ambiguousNoKey = resolveDesignatedWorkspace({
+      workspaces,
+      label: "Travel",
+      activeWorkspaceKey: null,
+    });
+    expect(ambiguousNoKey.ok).toBe(false);
+    if (!ambiguousNoKey.ok) expect(ambiguousNoKey.reason).toBe("workspace-ambiguous");
+    const ambiguousMiss = resolveDesignatedWorkspace({
+      workspaces,
+      label: "Travel",
+      activeWorkspaceKey: "/fake/Not-Listed",
+    });
+    expect(ambiguousMiss.ok).toBe(false);
+    if (!ambiguousMiss.ok) {
+      expect(ambiguousMiss.reason).toBe("workspace-ambiguous");
+      expect(ambiguousMiss.evidence.afterActiveKeyFilter).toBe(0);
+    }
+    const notFound = resolveDesignatedWorkspace({ workspaces, label: "Nope" });
+    expect(notFound.ok).toBe(false);
+    if (!notFound.ok) expect(notFound.reason).toBe("workspace-not-found");
+  });
+
+  it("唯一命中 → exact-label；path 与 activeWorkspaceKey 相同时交叉确认 activeWorkspaceConfirmed", () => {
+    const workspaces: WorkspaceListingEntry[] = [
+      { workspacePath: "/fake/Unique", label: "Unique", kind: "local" },
+    ];
+    const confirmed = resolveDesignatedWorkspace({
+      workspaces,
+      label: "Unique",
+      activeWorkspaceKey: "/fake/Unique",
+    });
+    expect(confirmed.ok).toBe(true);
+    if (confirmed.ok) {
+      expect(confirmed.evidence.resolvedStep).toBe("exact-label");
+      expect(confirmed.evidence.activeWorkspaceConfirmed).toBe(true);
+    }
+    const unconfirmed = resolveDesignatedWorkspace({
+      workspaces,
+      label: "Unique",
+      activeWorkspaceKey: "/fake/Other",
+    });
+    expect(unconfirmed.ok).toBe(true);
+    if (unconfirmed.ok) expect(unconfirmed.evidence.activeWorkspaceConfirmed).toBe(false);
+  });
+});
+
+describe("controller tasks-index 主动枚举（B2 map-only 修复）", () => {
+  let relay: FakeRelay;
+  const connections: RelayTerminalConnection[] = [];
+
+  afterEach(async () => {
+    for (const conn of connections.splice(0)) {
+      conn.close();
+    }
+    if (relay) await relay.close();
+  });
+
+  async function connectFakePaired(): Promise<RelayTerminalConnection> {
+    relay = new FakeRelay();
+    const port = await relay.listen();
+    const conn = new RelayTerminalConnection({
+      relayWsUrl: `ws://127.0.0.1:${port}/api/v1/remote/ws2`,
+      token: relay.mintToken(),
+      deviceSid: relay.deviceSid,
+    });
+    connections.push(conn);
+    expect(await conn.connect()).toBe("paired");
+    return conn;
+  }
+
+  function decodeClientFrame(index: number) {
+    const payload = relay.clientDataPayloads[index];
+    return decodeChannelMessage(Uint8Array.from(Buffer.from(String(payload.dataBase64), "base64")));
+  }
+
+  function controllerEventFrame(id: number, body: unknown, seq: number, messageSeq: number) {
+    return frameFromBytes(
+      encodeChannelResponse({ responseType: RESPONSE_TYPE_EVENT_FIRE, id, body }),
+      seq,
+      messageSeq
+    );
+  }
+
+  function hiTaskRow(liveStatus: string) {
+    return {
+      address: { workspacePath: FAKE_TARGET.workspacePath, taskId: FAKE_TARGET.taskId },
+      meta: {
+        title: "hi",
+        taskId: FAKE_TARGET.taskId,
+        workspacePath: FAKE_TARGET.workspacePath,
+      },
+      membership: { pinned: false, archived: false, active: true },
+      sourceAvailability: "online",
+      liveStatus,
+    };
+  }
+
+  it("subscribe_active_enumeration：EventListen+subscribeControllerV4 → snapshot/deltas 任务行 → title 精确唯一匹配；全程只发读面控制帧", async () => {
+    const conn = await connectFakePaired();
+    const reader = new ControllerTaskIndexReader({
+      sender: conn,
+      identity: FAKE_IDENTITY,
+      timeouts: { subscribeMs: 2_000, windowMs: 400, unsubscribeMs: 400 },
+      sleep: realSleep,
+    });
+    conn.onData = (payload) => reader.onData(payload);
+    const runPromise = reader.run();
+
+    // 前两个出站控制帧 = EventListen(102) + subscribeControllerV4(100)，都在
+    // channel "window-controller" 上（官方 registry 同序：先监听后订阅）。
+    await waitFor(() => relay.clientDataPayloads.length >= 2);
+    const listenDecoded = decodeClientFrame(0);
+    const subscribeDecoded = decodeClientFrame(1);
+    expect(listenDecoded?.headerType).toBe(102);
+    expect(listenDecoded?.channelName).toBe("window-controller");
+    expect(listenDecoded?.method).toBe("onDynamicControllerFrame");
+    expect(subscribeDecoded?.headerType).toBe(REQUEST_TYPE_PROMISE);
+    expect(subscribeDecoded?.channelName).toBe("window-controller");
+    expect(subscribeDecoded?.method).toBe("subscribeControllerV4");
+    expect((subscribeDecoded?.body as unknown[])[0]).toEqual({
+      topic: "controller/tasks-index",
+      visibility: "foreground",
+    });
+    const listenId = listenDecoded?.id as number;
+    const subscribeId = subscribeDecoded?.id as number;
+
+    // subscribe ack（PromiseSuccess 201 → {ack:{subscriptionId, mode, logEpoch}}）。
+    relay.pushPayload(
+      frameFromBytes(
+        encodeChannelResponse({
+          responseType: RESPONSE_TYPE_PROMISE_SUCCESS,
+          id: subscribeId,
+          body: {
+            ack: { subscriptionId: "fake-sub-1", mode: "snapshot", logEpoch: "fake-log-epoch" },
+          },
+        }),
+        1,
+        1
+      )
+    );
+    // snapshot 事件帧（204 按 EventListen id 路由）：hi 行 + 另一行。
+    relay.pushPayload(
+      controllerEventFrame(
+        listenId,
+        {
+          topic: "controller/tasks-index",
+          subscriptionId: "fake-sub-1",
+          logEpoch: "fake-log-epoch",
+          fromSeq: 0,
+          toSeq: 1,
+          sentAt: 0,
+          payload: {
+            kind: "snapshot",
+            snapshot: {
+              protocolVersion: 1,
+              logEpoch: "fake-log-epoch",
+              tasks: [
+                hiTaskRow("idle"),
+                {
+                  address: {
+                    workspacePath: FAKE_TARGET.workspacePath,
+                    taskId: "fake-task-other-0002",
+                  },
+                  meta: {
+                    title: "other",
+                    taskId: "fake-task-other-0002",
+                    workspacePath: FAKE_TARGET.workspacePath,
+                  },
+                  membership: { pinned: false, archived: false, active: false },
+                  sourceAvailability: "online",
+                  liveStatus: "running",
+                },
+              ],
+            },
+          },
+        },
+        2,
+        2
+      )
+    );
+    // delta 事件帧：task.upserted 同键覆盖（行数不增）。
+    relay.pushPayload(
+      controllerEventFrame(
+        listenId,
+        {
+          topic: "controller/tasks-index",
+          subscriptionId: "fake-sub-1",
+          logEpoch: "fake-log-epoch",
+          fromSeq: 1,
+          toSeq: 2,
+          sentAt: 0,
+          payload: {
+            kind: "deltas",
+            deltas: [{ op: "task.upserted", task: hiTaskRow("running") }],
+          },
+        },
+        3,
+        3
+      )
+    );
+    // peer 受理回执（FAKE 策略：由测试直发；官方对端按帧回 rpc-frame-ack）。
+    relay.pushPayload({ zcode_type: "rpc-frame-ack", ...FAKE_IDENTITY, ackMessageSeq: 1 });
+
+    // 收帧窗闭后退订：第 3 个出站控制帧 = unsubscribeControllerV4；推回其 201
+    // 应答，让「尽力退订」在其有界窗内得到确认。
+    await waitFor(() => relay.clientDataPayloads.length >= 3);
+    const unsubDecoded = decodeClientFrame(2);
+    expect(unsubDecoded?.headerType).toBe(REQUEST_TYPE_PROMISE);
+    expect(unsubDecoded?.channelName).toBe("window-controller");
+    expect(unsubDecoded?.method).toBe("unsubscribeControllerV4");
+    expect((unsubDecoded?.body as unknown[])[0]).toEqual({ subscriptionId: "fake-sub-1" });
+    const unsubId = unsubDecoded?.id as number;
+    relay.pushPayload(
+      frameFromBytes(
+        encodeChannelResponse({
+          responseType: RESPONSE_TYPE_PROMISE_SUCCESS,
+          id: unsubId,
+          body: {},
+        }),
+        4,
+        4
+      )
+    );
+
+    const result = await runPromise;
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") return;
+    expect(result.ackMode).toBe("snapshot");
+    expect(result.rows).toHaveLength(2);
+    // 探针 designate 同款：workspace 内 title 精确唯一匹配 → 精确 taskId。
+    const matches = result.rows.filter(
+      (row) => row.address.workspacePath === FAKE_TARGET.workspacePath && row.meta?.title === "hi"
+    );
+    expect(matches).toHaveLength(1);
+    expect(matches[0].address.taskId).toBe(FAKE_TARGET.taskId);
+    expect(result.counters.controllerFramesSeen).toBe(2);
+    expect(result.counters.snapshotFrames).toBe(1);
+    expect(result.counters.deltaFrames).toBe(1);
+    expect(result.counters.peerAckedFrames).toBeGreaterThanOrEqual(1);
+    expect(result.counters.controlFramesSent).toBe(3);
+    expect(result.counters.unsubscribed).toBe(true);
+    expect(unsubId).toBeGreaterThan(subscribeId);
+
+    // 全程恰 3 条出站帧，无任何会话发送帧（sendConversationCommandV4 不存在）。
+    expect(relay.clientDataPayloads).toHaveLength(3);
+    for (const payload of relay.clientDataPayloads) {
+      const decoded = decodeChannelMessage(
+        Uint8Array.from(Buffer.from(String(payload.dataBase64), "base64"))
+      );
+      expect(decoded?.method).not.toBe(AGENT_SEND_COMMAND_METHOD);
+    }
+  });
+
+  it("zero_rows_after_ack：subscribe ack 后窗内零任务行 → rows 空（调用方 fail-closed）", async () => {
+    const conn = await connectFakePaired();
+    const reader = new ControllerTaskIndexReader({
+      sender: conn,
+      identity: FAKE_IDENTITY,
+      timeouts: { subscribeMs: 1_000, windowMs: 250, unsubscribeMs: 400 },
+      sleep: realSleep,
+    });
+    conn.onData = (payload) => reader.onData(payload);
+    const runPromise = reader.run();
+    await waitFor(() => relay.clientDataPayloads.length >= 2);
+    const subscribeId = decodeClientFrame(1)?.id as number;
+    relay.pushPayload(
+      frameFromBytes(
+        encodeChannelResponse({
+          responseType: RESPONSE_TYPE_PROMISE_SUCCESS,
+          id: subscribeId,
+          body: { ack: { subscriptionId: "fake-sub-2", mode: "snapshot", logEpoch: "fake-epoch" } },
+        }),
+        1,
+        1
+      )
+    );
+    // 收帧窗（零行）闭后退订：出现第 3 个出站帧后直发其 201 应答（FAKE 策略）。
+    await waitFor(() => relay.clientDataPayloads.length >= 3);
+    const unsubDecoded = decodeClientFrame(2);
+    expect(unsubDecoded?.method).toBe("unsubscribeControllerV4");
+    relay.pushPayload(
+      frameFromBytes(
+        encodeChannelResponse({
+          responseType: RESPONSE_TYPE_PROMISE_SUCCESS,
+          id: unsubDecoded?.id as number,
+          body: {},
+        }),
+        2,
+        2
+      )
+    );
+    const result = await runPromise;
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") return;
+    expect(result.rows).toHaveLength(0);
+    expect(result.counters.controllerFramesSeen).toBe(0);
+    // 无任务行也会尽力退订（ack 带了 subscriptionId）。
+    expect(result.counters.unsubscribed).toBe(true);
+  });
+
+  it("subscribe_timeout：ack 缺席 → 结构性失败（subscribe-timeout），零行、不退订、不重发", async () => {
+    const conn = await connectFakePaired();
+    const reader = new ControllerTaskIndexReader({
+      sender: conn,
+      identity: FAKE_IDENTITY,
+      timeouts: { subscribeMs: 250, windowMs: 100, unsubscribeMs: 100 },
+      sleep: realSleep,
+    });
+    conn.onData = (payload) => reader.onData(payload);
+    const result = await reader.run();
+    expect(result.kind).toBe("subscribe-timeout");
+    expect(result.counters.controlFramesSent).toBe(2);
+    expect(result.counters.unsubscribeRequestId).toBeNull();
+    expect(result.counters.rowsCollected).toBe(0);
+    // 不重发：出站帧恒为 EventListen + subscribe 两帧。
+    await realSleep(80);
+    expect(relay.clientDataPayloads).toHaveLength(2);
   });
 });

@@ -40,6 +40,28 @@ export const AGENT_HELLO_METHOD = "helloConversationV4";
 export const AGENT_CLIENT_HELLO_METHOD = "initializeConversationV4";
 /** 发送命令方法（zcodeAgent.ts:937）。 */
 export const AGENT_SEND_COMMAND_METHOD = "sendConversationCommandV4";
+/** rpc 事件订阅请求类型（packages/rpc/src/channels.shared.ts:18-23）。 */
+export const REQUEST_TYPE_EVENT_LISTEN = 102;
+/**
+ * 窗口 Host controller 服务频道与其任务索引订阅面（@ 3c5b2276）：
+ * 频道名 `window-controller`（packages/shared/src/channels.ts:112
+ * ServiceChannels.WindowController）；方法 `subscribeControllerV4` /
+ * `unsubscribeControllerV4`、动态帧事件 `onDynamicControllerFrame`
+ * （packages/services/src/window-controller/windowController.ts:75-78）。官方调用面 =
+ * 桌面/手机任务列表 registry：先挂帧监听再订阅
+ * （packages/ui/src/v4/windowControllerTaskListRegistry.ts:145,220-224；手机任务首页
+ * 经 packages/ui/src/hooks/useGlobalTaskList.ts:45-47 消费同一 registry）。该服务只在
+ * workspace bridge 的 relay 通道上发布（packages/client/src/remoteServiceAccess.ts
+ * :181-185；websocket.ts:102-108；packages/web/src/web-remote-control/app/
+ * webRemoteControlWorkspaceBridgeSession.ts:39-74）→ 枚举前必须先 workspace-bridge-open。
+ */
+export const WINDOW_CONTROLLER_CHANNEL = "window-controller";
+export const CONTROLLER_SUBSCRIBE_METHOD = "subscribeControllerV4";
+export const CONTROLLER_UNSUBSCRIBE_METHOD = "unsubscribeControllerV4";
+/** 动态帧事件的 wire 事件名 = 属性名本体（packages/rpc/src/proxy-channel.ts:126-127）。 */
+export const CONTROLLER_DYNAMIC_FRAME_EVENT = "onDynamicControllerFrame";
+/** controller 订阅 topic（packages/shared/src/zcode-protocol-v4/controller.ts:9）。 */
+export const CONTROLLER_TASKS_INDEX_TOPIC = "controller/tasks-index";
 /** ControllerClient 请求/响应类型（packages/rpc/src/channels.shared.ts:13-23）。 */
 export const REQUEST_TYPE_PROMISE = 100;
 export const RESPONSE_TYPE_PROMISE_SUCCESS = 201;
@@ -182,6 +204,27 @@ export function encodeChannelRequest(args: {
 }): Uint8Array {
   const header = serializeValue([REQUEST_TYPE_PROMISE, args.id, args.channel, args.method]);
   const body = serializeValue([args.params]);
+  const out = new Uint8Array(header.byteLength + body.byteLength);
+  out.set(header, 0);
+  out.set(body, header.byteLength);
+  return out;
+}
+
+/**
+ * 编码一次 Channel 事件订阅（RequestType.EventListen=102；channelClient.ts:150-177
+ * requestEvent → sendRequest :179-194：serialize([102, id, channel, event]) +
+ * serialize(arg)）。后续帧以 EventFire(204) 按同一 id 回推（channelClient.ts:210-231
+ * onBuffer → handlers.get(id)）。官方动态事件 wire 名 = 属性名本体
+ * （proxy-channel.ts:126-127）。
+ */
+export function encodeChannelEventListen(args: {
+  id: number;
+  channel: string;
+  eventName: string;
+  arg?: unknown;
+}): Uint8Array {
+  const header = serializeValue([REQUEST_TYPE_EVENT_LISTEN, args.id, args.channel, args.eventName]);
+  const body = serializeValue(args.arg);
   const out = new Uint8Array(header.byteLength + body.byteLength);
   out.set(header, 0);
   out.set(body, header.byteLength);
@@ -479,6 +522,9 @@ export type WorkspaceListingEntry = {
   remoteSessionId?: string;
   label?: string;
   kind?: string;
+  /** App 展示分类（web-remote-control.ts:633 WorkspacePurpose；B2 实连实证
+   * project | conversation，部分旧条目缺席）。 */
+  workspacePurpose?: string;
 };
 
 export type TaskListingRow = {
@@ -585,6 +631,518 @@ export class SessionTargetMapper {
         `stale-epoch: mapping bound to generation ${target.generation}, live connection is ${liveGeneration}`
       );
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// workspace 指称唯一化（B2 实连 map-only 修复，2026-10-24）
+//
+// 实连 run macos-B220261024T121929Z-SnWWVA：bootstrap-response 与
+// workspace-list-response 携带**同一份** workspaces[]（两份 14 条原样合并 28 条），
+// 任何 label 的精确匹配都至少翻倍 → 「精确唯一」永假，map-only run 在 designate
+// workspace-ambiguous fail-closed（未发送任何写向）。修复三件套：
+//   1) 双 listing 去重（dedupeWorkspaceEntries）；
+//   2) 同 label 多候选时按 workspacePurpose === "project" 收窄（web-remote-control.ts
+//      :633 workspacePurpose；实连实证同 label 会以 project/conversation 各挂一条）；
+//   3) 仍多候选时按 workspacePath === activeWorkspaceKey 收窄——activeWorkspaceKey
+//      只读自 bootstrap.response result.mobileViewState.activeWorkspaceKey
+//      （web-remote-control.ts:694-698 MobileViewState + :726-735 bootstrap result；
+//      B2 实连已实证该字段存在），缺失时回落 workspace-list result.activeWorkspaceKey
+//      （同文件 :672-676）。
+// 每一步收窄只以**计数**进证据（绝不输出值）。发送授权仍只认 resolveTarget 产物：
+// 本节函数只产出 listing 条目，不构造任何发送目标。
+// ---------------------------------------------------------------------------
+
+/** 双 listing 去重：bootstrap 与 workspace-list 的同一条目只保留一份。 */
+export function dedupeWorkspaceEntries(entries: WorkspaceListingEntry[]): WorkspaceListingEntry[] {
+  const seen = new Set<string>();
+  const out: WorkspaceListingEntry[] = [];
+  for (const entry of entries) {
+    const key = JSON.stringify([
+      entry.workspacePath,
+      entry.workspaceIdentity ?? null,
+      entry.remoteSessionId ?? null,
+      entry.label ?? null,
+      entry.kind ?? null,
+      entry.workspacePurpose ?? null,
+    ]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
+ * APP 当前打开的 workspace key：优先 bootstrap.result.mobileViewState.activeWorkspaceKey
+ * （web-remote-control.ts:694-698 + :726-735），缺失回落 workspace-list
+ * result.activeWorkspaceKey（同文件 :672-676）；都缺失 → null（阶梯退化为只按
+ * purpose 收窄）。
+ */
+export function readActiveWorkspaceKeyFromListings(args: {
+  bootstrap: Record<string, unknown> | null;
+  workspaceList: Record<string, unknown> | null;
+}): string | null {
+  const readFrom = (payload: Record<string, unknown> | null): string | null => {
+    if (!payload) return null;
+    const result = payload.result;
+    if (!result || typeof result !== "object") return null;
+    const record = result as Record<string, unknown>;
+    const mobile = record.mobileViewState;
+    const fromMobileViewState =
+      mobile && typeof mobile === "object"
+        ? (mobile as { activeWorkspaceKey?: unknown }).activeWorkspaceKey
+        : undefined;
+    const candidate =
+      typeof fromMobileViewState === "string" && fromMobileViewState
+        ? fromMobileViewState
+        : record.activeWorkspaceKey;
+    return typeof candidate === "string" && candidate ? candidate : null;
+  };
+  return readFrom(args.bootstrap) ?? readFrom(args.workspaceList);
+}
+
+/** designation 证据（全部为计数/布尔/步骤标签，绝不含真实值）。 */
+export type WorkspaceDesignationEvidence = {
+  /** label 精确相等的候选数。 */
+  labelMatches: number;
+  /** purpose=project 收窄后的候选数（该步未应用 = null）。 */
+  afterPurposeFilter: number | null;
+  /** activeWorkspaceKey 收窄后的候选数（该步未应用 = null）。 */
+  afterActiveKeyFilter: number | null;
+  /** bootstrap/workspace-list 是否提供了 activeWorkspaceKey。 */
+  activeWorkspaceKnown: boolean;
+  /** 唯一化发生在哪一步（中止 = null）。 */
+  resolvedStep: "exact-label" | "purpose-project" | "active-workspace-key" | null;
+  /** 解析产物 workspacePath === activeWorkspaceKey 的交叉确认。 */
+  activeWorkspaceConfirmed: boolean;
+};
+
+export type WorkspaceDesignation =
+  | { ok: true; entry: WorkspaceListingEntry; evidence: WorkspaceDesignationEvidence }
+  | {
+      ok: false;
+      reason: "workspace-not-found" | "workspace-ambiguous";
+      evidence: WorkspaceDesignationEvidence;
+    };
+
+/**
+ * workspace 指称唯一化阶梯：label 精确匹配 → 唯一即定；多候选时优先
+ * workspacePurpose === "project" → 仍多候选时优先 workspacePath ===
+ * activeWorkspaceKey → 仍不唯一即 workspace-ambiguous（fail-closed）。
+ * purpose 收窄为空集时保留原候选集继续走 activeWorkspaceKey（"prefer" 语义，
+ * 不因空集放弃收窄机会）。
+ */
+export function resolveDesignatedWorkspace(args: {
+  workspaces: WorkspaceListingEntry[];
+  label: string;
+  activeWorkspaceKey?: string | null;
+}): WorkspaceDesignation {
+  const activeWorkspaceKnown =
+    typeof args.activeWorkspaceKey === "string" && args.activeWorkspaceKey.length > 0;
+  const evidence: WorkspaceDesignationEvidence = {
+    labelMatches: 0,
+    afterPurposeFilter: null,
+    afterActiveKeyFilter: null,
+    activeWorkspaceKnown,
+    resolvedStep: null,
+    activeWorkspaceConfirmed: false,
+  };
+  const labelMatches = args.workspaces.filter((entry) => entry.label === args.label);
+  evidence.labelMatches = labelMatches.length;
+  if (labelMatches.length === 0) {
+    return { ok: false, reason: "workspace-not-found", evidence };
+  }
+  if (labelMatches.length === 1) {
+    evidence.resolvedStep = "exact-label";
+    evidence.activeWorkspaceConfirmed =
+      activeWorkspaceKnown && labelMatches[0].workspacePath === args.activeWorkspaceKey;
+    return { ok: true, entry: labelMatches[0], evidence };
+  }
+  let candidates = labelMatches;
+  const projects = candidates.filter((entry) => entry.workspacePurpose === "project");
+  evidence.afterPurposeFilter = projects.length;
+  if (projects.length === 1) {
+    evidence.resolvedStep = "purpose-project";
+    evidence.activeWorkspaceConfirmed =
+      activeWorkspaceKnown && projects[0].workspacePath === args.activeWorkspaceKey;
+    return { ok: true, entry: projects[0], evidence };
+  }
+  if (projects.length > 1) {
+    candidates = projects;
+  }
+  if (activeWorkspaceKnown) {
+    const active = candidates.filter((entry) => entry.workspacePath === args.activeWorkspaceKey);
+    evidence.afterActiveKeyFilter = active.length;
+    if (active.length === 1) {
+      evidence.resolvedStep = "active-workspace-key";
+      evidence.activeWorkspaceConfirmed = true;
+      return { ok: true, entry: active[0], evidence };
+    }
+  }
+  return { ok: false, reason: "workspace-ambiguous", evidence };
+}
+
+// ---------------------------------------------------------------------------
+// controller tasks-index 主动枚举（B2 实连 map-only 修复，2026-10-24）
+//
+// 被动收帧窗在 B2 实连（macos-B220261024T121929Z-SnWWVA）8s 内 0 条 rpc-frame——
+// 任务行必须主动订阅。wire 全部钉 @ 3c5b2276：
+//   - channel "window-controller" 只在 workspace bridge 的 relay 通道上发布
+//     （remoteServiceAccess.ts:181-185；websocket.ts:102-108；
+//     webRemoteControlWorkspaceBridgeSession.ts:39-74）→ 先 workspace-bridge-open
+//     （taskId 可选：web-remote-control.ts:435-447；枚举期省略）拿 bridge 身份；
+//   - 帧监听 = EventListen(102) 事件 "onDynamicControllerFrame"
+//     （windowController.ts:78；proxy-channel.ts:126-127 动态事件 → channel.listen；
+//     channelClient.ts:150-177 requestEvent、:179-194 sendRequest、:210-231 按 id 回推
+//     EventFire；channels.shared.ts:21）——官方 registry 在 subscribe 前先挂监听
+//     （windowControllerTaskListRegistry.ts:145 → :220-224）；
+//   - 主动枚举 = subscribeControllerV4{topic:"controller/tasks-index",
+//     visibility:"foreground"}（windowController.ts:75；params controller.ts:258-271；
+//     ack {subscriptionId, mode, logEpoch} transport.ts:125-131 + controller.ts:273-274）；
+//   - 任务行从 EventFire(204) 帧回推，body = WindowHostControllerTaskFrame
+//     （controller.ts:251-256）：snapshot.tasks（:155-164）或 deltas
+//     task.upserted / task.removed（:187-191）；行形状 :93-123（address{workspacePath,
+//     taskId, workspaceIdentity?} + meta.title）。官方消费面同款
+//     （windowControllerTaskListRegistry.ts:176-198）。
+// 本 reader 只读：全部出站帧都是读面控制帧（订阅/退订），不构造任何会话发送帧
+// （maxSendFrames 闸只数会话发送帧，与此处正交）。
+// ---------------------------------------------------------------------------
+
+/** 枚举全程计数（证据只落数值，绝不落真实 id/epoch）。 */
+export type ControllerTaskIndexCounters = {
+  eventListenRequestId: number;
+  subscribeRequestId: number;
+  unsubscribeRequestId: number | null;
+  /** 出站 rpc-frame 总数（EventListen + subscribe + unsubscribe；读面控制帧）。 */
+  controlFramesSent: number;
+  /** peer 受理回执数（rpc-frame-ack；去重后）。 */
+  peerAckedFrames: number;
+  duplicateInboundFrames: number;
+  /** topic = controller/tasks-index 的 EventFire 帧数。 */
+  controllerFramesSeen: number;
+  snapshotFrames: number;
+  deltaFrames: number;
+  /** 去重后保留的任务行数。 */
+  rowsCollected: number;
+  /** 超 maxRows 上限被丢弃的行数。 */
+  rowsOverflow: number;
+  /** 退订是否得到应答（尽力而为；失败不影响结果）。 */
+  unsubscribed: boolean;
+};
+
+export type ControllerTaskIndexReadResult =
+  | {
+      kind: "ok";
+      rows: TaskListingRow[];
+      /** subscribe ack 的 mode（"snapshot" | "resume"；回显缺失时 null）。 */
+      ackMode: string | null;
+      counters: ControllerTaskIndexCounters;
+    }
+  | {
+      kind: "send-failed" | "subscribe-timeout" | "subscribe-rejected";
+      counters: ControllerTaskIndexCounters;
+    };
+
+export type ControllerTaskIndexReaderOptions = {
+  sender: ProbeConnection;
+  /** 已就绪 workspace bridge 的帧身份（bridge-open ready 回显）。 */
+  identity: RpcFrameIdentity;
+  timeouts: { subscribeMs: number; windowMs: number; unsubscribeMs: number };
+  firstSeq?: number;
+  firstMessageSeq?: number;
+  /** 任务行收集上限（防巨库撑爆内存；超限丢弃并计数）。 */
+  maxRows?: number;
+  sleep?: (ms: number) => Promise<void>;
+};
+
+/**
+ * 主动任务索引枚举器：EventListen → subscribeControllerV4 → 有界收帧窗 →
+ * 尽力退订。行按 `workspacePath\u0000taskId` upsert 去重（snapshot 后的增量同键
+ * 覆盖，task.removed 同键删除）。等待循环只有 sleep+判定，无任何重发路径。
+ */
+export class ControllerTaskIndexReader {
+  readonly counters: ControllerTaskIndexCounters = {
+    eventListenRequestId: 0,
+    subscribeRequestId: 0,
+    unsubscribeRequestId: null,
+    controlFramesSent: 0,
+    peerAckedFrames: 0,
+    duplicateInboundFrames: 0,
+    controllerFramesSeen: 0,
+    snapshotFrames: 0,
+    deltaFrames: 0,
+    rowsCollected: 0,
+    rowsOverflow: 0,
+    unsubscribed: false,
+  };
+
+  private readonly sender: ProbeConnection;
+  private readonly identity: RpcFrameIdentity;
+  private readonly subscribeMs: number;
+  private readonly windowMs: number;
+  private readonly unsubscribeMs: number;
+  private readonly maxRows: number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly assembler: RpcFrameAssembler;
+  private readonly rows = new Map<string, TaskListingRow>();
+  private nextRequestId: number;
+  private seq: number;
+  private messageSeq: number;
+  private eventListenRequestId = 0;
+  private subscribeRequestId = 0;
+  private unsubscribeRequestId = 0;
+  private settledAck:
+    | { status: "ok"; mode: string | null; subscriptionId: string | null }
+    | { status: "rejected" }
+    | null = null;
+  private unsubscribeSettled = false;
+  private lastPeerAckSeq = 0;
+
+  constructor(options: ControllerTaskIndexReaderOptions) {
+    this.sender = options.sender;
+    this.identity = options.identity;
+    this.subscribeMs = Math.max(1, options.timeouts.subscribeMs);
+    this.windowMs = Math.max(1, options.timeouts.windowMs);
+    this.unsubscribeMs = Math.max(1, options.timeouts.unsubscribeMs);
+    this.maxRows = Math.max(1, options.maxRows ?? 1024);
+    this.sleep = options.sleep ?? realSleepDefault;
+    this.assembler = new RpcFrameAssembler({ identity: options.identity });
+    this.nextRequestId = 1;
+    this.seq = options.firstSeq ?? 1;
+    this.messageSeq = options.firstMessageSeq ?? 1;
+  }
+
+  /**
+   * 订阅并收集一个有界窗内的任务行。顺序 = 官方 registry 同款：帧监听先行 →
+   * subscribeControllerV4 → 等窗 → unsubscribe（尽力）。subscribe 失败/超窗 =
+   * 结构性失败（rows 为空，由调用方 fail-closed），不重试。
+   */
+  async run(): Promise<ControllerTaskIndexReadResult> {
+    // 1) 帧监听（102；无应答帧——后续 EventFire 事件本体就是回执）。
+    this.eventListenRequestId = this.nextRequestId;
+    this.nextRequestId += 1;
+    this.counters.eventListenRequestId = this.eventListenRequestId;
+    if (
+      !this.sendFrame(
+        encodeChannelEventListen({
+          id: this.eventListenRequestId,
+          channel: WINDOW_CONTROLLER_CHANNEL,
+          eventName: CONTROLLER_DYNAMIC_FRAME_EVENT,
+        })
+      )
+    ) {
+      return { kind: "send-failed", counters: this.counters };
+    }
+
+    // 2) 主动枚举订阅（100，{topic, visibility}；controller.ts:258-271）。
+    this.subscribeRequestId = this.nextRequestId;
+    this.nextRequestId += 1;
+    this.counters.subscribeRequestId = this.subscribeRequestId;
+    if (
+      !this.sendFrame(
+        encodeChannelRequest({
+          id: this.subscribeRequestId,
+          channel: WINDOW_CONTROLLER_CHANNEL,
+          method: CONTROLLER_SUBSCRIBE_METHOD,
+          params: { topic: CONTROLLER_TASKS_INDEX_TOPIC, visibility: "foreground" },
+        })
+      )
+    ) {
+      return { kind: "send-failed", counters: this.counters };
+    }
+    const subscribeDeadline = Date.now() + this.subscribeMs;
+    while (this.settledAck === null && Date.now() < subscribeDeadline) {
+      await this.sleep(Math.min(20, Math.max(1, subscribeDeadline - Date.now())));
+    }
+    const settled = this.settledAck;
+    if (settled === null) {
+      return { kind: "subscribe-timeout", counters: this.counters };
+    }
+    if (settled.status === "rejected") {
+      return { kind: "subscribe-rejected", counters: this.counters };
+    }
+
+    // 3) 有界收帧窗：snapshot / deltas → 任务行（upsert 去重）。
+    const windowDeadline = Date.now() + this.windowMs;
+    while (Date.now() < windowDeadline) {
+      await this.sleep(Math.min(20, Math.max(1, windowDeadline - Date.now())));
+    }
+    const rows = Array.from(this.rows.values());
+    this.counters.rowsCollected = rows.length;
+
+    // 4) 尽力退订（读面卫生；失败/超时不影响结果、不重试）。
+    if (settled.subscriptionId) {
+      const subscriptionId = settled.subscriptionId;
+      this.unsubscribeRequestId = this.nextRequestId;
+      this.nextRequestId += 1;
+      this.counters.unsubscribeRequestId = this.unsubscribeRequestId;
+      if (
+        this.sendFrame(
+          encodeChannelRequest({
+            id: this.unsubscribeRequestId,
+            channel: WINDOW_CONTROLLER_CHANNEL,
+            method: CONTROLLER_UNSUBSCRIBE_METHOD,
+            params: { subscriptionId },
+          })
+        )
+      ) {
+        const unsubscribeDeadline = Date.now() + this.unsubscribeMs;
+        while (!this.unsubscribeSettled && Date.now() < unsubscribeDeadline) {
+          await this.sleep(Math.min(20, Math.max(1, unsubscribeDeadline - Date.now())));
+        }
+        this.counters.unsubscribed = this.unsubscribeSettled;
+      }
+    }
+    return { kind: "ok", rows, ackMode: settled.mode, counters: this.counters };
+  }
+
+  /** 入站 data payload 喂入口（对接宿主 channel 的 onRpcFrame 单钩子）。 */
+  onData(payload: unknown): void {
+    if (!payload || typeof payload !== "object") return;
+    const record = payload as { zcode_type?: unknown; ackMessageSeq?: unknown };
+    if (record.zcode_type === "rpc-frame-ack") {
+      // peer 受理：只计数（读面控制帧的回执），无任何副作用。
+      const ackSeq = typeof record.ackMessageSeq === "number" ? record.ackMessageSeq : 0;
+      if (ackSeq <= this.lastPeerAckSeq) {
+        this.counters.duplicateInboundFrames += 1;
+        return;
+      }
+      this.lastPeerAckSeq = ackSeq;
+      this.counters.peerAckedFrames += 1;
+      return;
+    }
+    if (record.zcode_type !== "rpc-frame") return;
+    const event = this.assembler.accept(payload);
+    if (event.kind === "duplicate") {
+      this.counters.duplicateInboundFrames += 1;
+      return;
+    }
+    if (event.kind === "fault" || event.kind === "incomplete") return;
+    const decoded = decodeChannelMessage(event.bytes);
+    if (!decoded) return;
+    if (
+      this.subscribeRequestId !== 0 &&
+      decoded.id === this.subscribeRequestId &&
+      (decoded.headerType === RESPONSE_TYPE_PROMISE_SUCCESS ||
+        decoded.headerType === RESPONSE_TYPE_PROMISE_ERROR)
+    ) {
+      if (this.settledAck !== null) {
+        this.counters.duplicateInboundFrames += 1;
+        return;
+      }
+      if (decoded.headerType === RESPONSE_TYPE_PROMISE_ERROR) {
+        this.settledAck = { status: "rejected" };
+        return;
+      }
+      const body = decoded.body as
+        { ack?: { subscriptionId?: unknown; mode?: unknown } } | undefined;
+      const ack = body?.ack;
+      this.settledAck = {
+        status: "ok",
+        mode: typeof ack?.mode === "string" ? ack.mode : null,
+        subscriptionId: typeof ack?.subscriptionId === "string" ? ack.subscriptionId : null,
+      };
+      return;
+    }
+    if (
+      this.unsubscribeRequestId !== 0 &&
+      decoded.id === this.unsubscribeRequestId &&
+      decoded.headerType === RESPONSE_TYPE_PROMISE_SUCCESS
+    ) {
+      if (!this.unsubscribeSettled) {
+        this.unsubscribeSettled = true;
+      } else {
+        this.counters.duplicateInboundFrames += 1;
+      }
+      return;
+    }
+    if (decoded.headerType === RESPONSE_TYPE_EVENT_FIRE) {
+      this.acceptControllerFrame(decoded.body);
+    }
+  }
+
+  /** tasks-index 帧体解析（snapshot / deltas；形状松校验，坏行跳过不致命）。 */
+  private acceptControllerFrame(body: unknown): void {
+    if (!body || typeof body !== "object") return;
+    const frame = body as {
+      topic?: unknown;
+      payload?: { kind?: unknown; snapshot?: { tasks?: unknown }; deltas?: unknown };
+    };
+    if (frame.topic !== CONTROLLER_TASKS_INDEX_TOPIC) return;
+    this.counters.controllerFramesSeen += 1;
+    if (frame.payload?.kind === "snapshot" && Array.isArray(frame.payload.snapshot?.tasks)) {
+      this.counters.snapshotFrames += 1;
+      for (const row of frame.payload.snapshot.tasks) this.upsertRow(row);
+      return;
+    }
+    if (frame.payload?.kind === "deltas" && Array.isArray(frame.payload.deltas)) {
+      this.counters.deltaFrames += 1;
+      for (const delta of frame.payload.deltas) {
+        if (!delta || typeof delta !== "object") continue;
+        const record = delta as { op?: unknown; task?: unknown; address?: unknown };
+        if (record.op === "task.upserted") {
+          this.upsertRow(record.task);
+        } else if (
+          record.op === "task.removed" &&
+          record.address &&
+          typeof record.address === "object"
+        ) {
+          const address = record.address as { workspacePath?: unknown; taskId?: unknown };
+          if (typeof address.workspacePath === "string" && typeof address.taskId === "string") {
+            this.rows.delete(`${address.workspacePath}\u0000${address.taskId}`);
+          }
+        }
+      }
+    }
+  }
+
+  private upsertRow(candidate: unknown): void {
+    if (!candidate || typeof candidate !== "object") return;
+    const record = candidate as {
+      address?: { workspacePath?: unknown; taskId?: unknown; workspaceIdentity?: unknown };
+      meta?: { title?: unknown };
+    };
+    const address = record.address;
+    if (
+      !address ||
+      typeof address.workspacePath !== "string" ||
+      typeof address.taskId !== "string"
+    ) {
+      return;
+    }
+    const key = `${address.workspacePath}\u0000${address.taskId}`;
+    if (this.rows.size >= this.maxRows && !this.rows.has(key)) {
+      this.counters.rowsOverflow += 1;
+      return;
+    }
+    const title =
+      record.meta && typeof record.meta === "object" && typeof record.meta.title === "string"
+        ? record.meta.title
+        : undefined;
+    this.rows.set(key, {
+      address: {
+        taskId: address.taskId,
+        workspacePath: address.workspacePath,
+        ...(typeof address.workspaceIdentity === "string"
+          ? { workspaceIdentity: address.workspaceIdentity }
+          : {}),
+      },
+      ...(title !== undefined ? { meta: { title } } : {}),
+    });
+  }
+
+  private sendFrame(bytes: Uint8Array): boolean {
+    const frame = encodeRpcFrame({
+      identity: this.identity,
+      seq: this.seq,
+      messageSeq: this.messageSeq,
+      bytes,
+    });
+    this.seq += 1;
+    this.messageSeq += 1;
+    this.counters.controlFramesSent += 1;
+    return this.sender.sendData(frame);
   }
 }
 

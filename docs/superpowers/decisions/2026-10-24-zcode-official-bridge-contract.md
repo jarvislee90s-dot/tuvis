@@ -531,3 +531,71 @@ route `ownerScope`/`bindingNote` 勘正如上；`capabilities` 维持全 false�
   like-for-like）；bridgeGeneration 仅信息性（随帧回传 + 落证据，不作闸）。配套加固：
   session-probe 主体加故障围栏——任何阶段未处理异常一律记 `STOPPED:fault-<阶段>`
   verdict 并照常落证，绝不裸 crash。
+
+## 7.8 追加：B2 实连 map-only 修复（2026-10-24；不改写上文）
+
+实连 run `macos-B220261024T121929Z-SnWWVA`（map-only，`--send-authorized` 已挂但未走到）：
+bootstrap-response / workspace-list-response 均 OK，28 条 workspace 条目；
+designate 在 workspace 阶段 `workspace-ambiguous` fail-closed（**未发送任何写向**）；
+被动 8s 收帧窗 0 条 rpc-frame / 0 条 bridge 消息（taskRows=0）。归因与修复：
+
+- **双 listing 重复（根因一）**：bootstrap-response 与 workspace-list-response 携带
+  **同一份** `workspaces[]`（实连 14 条 ×2 = 28 条原样合并），任何 label 的精确匹配都
+  至少翻倍、「精确唯一」永假。修复 = `dedupeWorkspaceEntries` 按全部采集字段精确去重
+  （sessionBridge.ts；证据记 `workspaceEntriesRaw` vs `workspaceEntries` 计数）。
+- **同 label 双条目（根因二）**：workspace 条目含 `workspacePurpose`
+  （`web-remote-control.ts:633`；`WorkspacePurpose = "project" | "conversation"`，
+  `packages/shared/src/workspacePurpose.ts`），同一人读 label 会以 project/conversation
+  各挂一条 → 单靠 label 唯一匹配不成立。修复 = 指称唯一化阶梯
+  `resolveDesignatedWorkspace`（sessionBridge.ts；探针 designate 步改调它）：
+  label 精确匹配 → 多候选时优先 `workspacePurpose === "project"` → 仍多候选时优先
+  `workspacePath === activeWorkspaceKey` → 仍不唯一即 `workspace-ambiguous` 中止；
+  **purpose 收窄为空集时保留原候选集**继续走 activeWorkspaceKey（"prefer" 语义）。
+  每步收窄只以 sanitized 计数进证据（`labelMatches` / `afterPurposeFilter` /
+  `afterActiveKeyFilter` / `resolvedStep`），绝不输出值。
+- **activeWorkspaceKey 的权威源 = bootstrap response**（只读回读，不是探针记忆）：
+  `bootstrap-response.result.mobileViewState.activeWorkspaceKey`
+  （`web-remote-control.ts:694-698` MobileViewState + `:726-735` bootstrap result；
+  实连 run 已实证该字段存在且为 workspacePath 口径）；bootstrap 缺失时回落
+  workspace-list-response 的 `result.activeWorkspaceKey`（同文件 `:672-676`）。
+  解析产物 workspacePath 与 activeWorkspaceKey 相等时证据记
+  `activeWorkspaceConfirmed: true`（APP 当前打开工作区的交叉确认）。
+- **任务索引主动枚举（根因三的修复）**：被动收帧窗不再作为任务行来源。改为：
+  `workspace-bridge-open`（taskId 可选：`web-remote-control.ts:435-447`；枚举期省略）
+  打开读面桥拿到 bridge 身份 → 在 channel **`"window-controller"`**
+  （`packages/shared/src/channels.ts:112` ServiceChannels.WindowController；该服务只在
+  workspace bridge 的 relay 通道上发布——`packages/client/src/remoteServiceAccess.ts
+  :181-185` + `websocket.ts:102-108` connectViaProtocol +
+  `packages/web/src/web-remote-control/app/webRemoteControlWorkspaceBridgeSession.ts
+  :39-74`）上：
+  1. `EventListen(102)` 事件 `"onDynamicControllerFrame"`
+     （`packages/services/src/window-controller/windowController.ts:78`；wire =
+     `serialize([102, id, channel, event]) + serialize(undefined)`，
+     `packages/rpc/src/channelClient.ts:150-177,179-194` +
+     `channels.shared.ts:21`；动态事件名即属性名本体
+     `packages/rpc/src/proxy-channel.ts:126-127`；后续帧以 EventFire(204) 按该 id 回推
+     `channelClient.ts:210-231`）——官方 registry 同序：先挂帧监听再订阅
+     （`packages/ui/src/v4/windowControllerTaskListRegistry.ts:145` → `:220-224`；
+     手机任务首页 `packages/ui/src/hooks/useGlobalTaskList.ts:45-47` 消费同一 registry）；
+  2. `subscribeControllerV4{topic:"controller/tasks-index", visibility:"foreground"}`
+     （`windowController.ts:75`；params
+     `packages/shared/src/zcode-protocol-v4/controller.ts:258-271`；ack
+     `{subscriptionId, mode, logEpoch}` = `transport.ts:125-131` +
+     `controller.ts:273-274`）；
+  3. 有界收帧窗（8s）内收 `WindowHostControllerTaskFrame`
+     （`controller.ts:251-256`）：`payload.kind="snapshot"` → `snapshot.tasks`
+     （`:155-164`）；`kind="deltas"` → `task.upserted`/`task.removed`
+     （`:187-191`）；行形状 `WindowHostControllerTaskRow`
+     `:17-35,93-123`（`address{workspacePath, taskId, workspaceIdentity?}` +
+     `meta.title`）。行按 `workspacePath\0taskId` upsert 去重，上限 1024 行防巨库。
+  实现 = `ControllerTaskIndexReader`（sessionBridge.ts）+ session-probe 新 s5b 阶段；
+  全部出站帧为**读面控制帧**（监听/订阅/退订），`maxSendFrames=1` 闸仍只数会话发送帧，
+  发送路径零改动。`unsubscribeControllerV4{subscriptionId}`（`windowController.ts:77`）
+  在窗闭后尽力退订（失败不影响结果）。subscribe 失败/超窗 = 结构性失败
+  （`ABORTED:designate-task-subscribe-*`），零行 = `task-not-found`，
+  多行 = `task-ambiguous`（沿用原中止语义，绝不按标题发送）。
+- **fake 合同追加（tests/remote/zcodeBridgeSession.test.ts）**：阶梯七断言（去重复现
+  28→14、bootstrap 优先/回落、purpose 收窄、activeWorkspaceKey 收窄 + confirmed、
+  空集回退、不唯一/零命中中止、exact-label）+ 枚举三断言（subscribe→snapshot/deltas→
+  title 精确唯一匹配且全程只发读面控制帧、零行、subscribe 超时不重发）；
+  原六用例全绿。
