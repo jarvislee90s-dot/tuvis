@@ -691,7 +691,7 @@ peerAckedFrames=0、bridge-messages 出现 6 字节"乱码"帧）对照钉源复
 ### 8.2 客户端侧绑定与幂等（fake 合同）
 
 - pending 册（`PendingBook`）只收 `conversation/<本会话>` topic 帧；四元组绑定 session/generation/anchor；`authorizePendingResolution` 三查闸（存在性 → 会话一致 → 代际一致）过闸即消费，重复应答给 `already-consumed`，错会话/旧代际**不会消费**别的 pending（`interaction-registry.ts:155-167` 的服务端幂等只是最后防线）。
-- 每个交互 run：恰 1 个触发帧（复用 B2 已验证 send 链）+ 至多 1 个 resolve/stop 帧；CommandAck 分类 accepted/duplicate/noop/rejected/stale/failed，超窗 = unknown，**结构性无重发路径**。
+- 每个交互 run：恰 1 个触发帧（复用 B2 已验证 send 链）+ 至多 1 个 resolve/stop 帧（autoResolution 在场时前置至多 1 个 snoozeInteractionAutoResolution 帧）；CommandAck 分类 accepted/duplicate/noop/rejected/stale/failed，超窗 = unknown，**结构性无重发路径**。
 - fake 合同（`tests/remote/zcodeBridgeInteraction.test.ts`）：pending 绑定与代际、错/已消费拒绝、迟到响应不释放新代际、打断只作用于目标 turn、只读面不因交互流程被改写。
 
 ### 8.3 实跑入口与授权（未执行；待用户在场）
@@ -704,4 +704,4 @@ node scripts/zcode-bridge-probe/interaction-probe.ts approve \
 
 - 前置：用户本人在浏览器完成一次官方 OAuth（每 run 一次）；实跑期间不依赖官方网页会话（同 role 互踢）；目标固定为 Travel 工作区「hi」会话（batch-2 已授权）。
 - 触发指令为合成文本（`[tuvis-b3-probe:<UTC>]` + 无害文件操作 / 提问卡 / 逐行写文件），不含真实会话内容。
-- 如实申报：若会话为自动批准模式（无 pending 卡）→ 审批能力记 `UNAVAILABLE:no-pending-observed`；问答卡形状不可解 → `UNAVAILABLE:answer-shape-unresolved`；无前台执行 id → `NOOP:guard.stopTargetChanged`；均不重试、不猜测。
+- 如实申报：若会话为自动批准模式（无 pending 卡）→ 审批能力记 `UNAVAILABLE:no-pending-observed`；问答卡形状不可解或非 AskUserQuestion（含计划审批卡）→ `UNAVAILABLE:answer-shape-unsupported`；无前台执行 id → `UNAVAILABLE:no-foreground-execution`（旧口径 `NOOP:guard.stopTargetChanged` 仅在守卫在执行中变化时出现）；均不重试、不猜测。
