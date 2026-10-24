@@ -15,6 +15,7 @@
 // 另被登记为小字号豁免面（密集数据网格），豁免理由见 typography.ts。
 import { SETTINGS_CARD_TITLE, SETTINGS_REMOTE_BADGE } from "@/components/settings/typography";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { Eye, EyeOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -206,6 +207,9 @@ export function RemoteSection() {
   // 访问密码：首拍 status.pin 回填一次，轮询不回读（保留编辑中值）
   const [pinInput, setPinInput] = useState("");
   const pinInitRef = useRef(false);
+  // A3（设计 §7.2）：PIN 可见性 = 纯页内呈现态，初值掩码；不落库、不写日志、
+  // 不改 PIN、不触发重配对（值仍由 pinInput 唯一拥有）
+  const [pinVisible, setPinVisible] = useState(false);
   // 隧道 Token：进面板回填已存值；savedToken 记「库里当前值」——值未变时保存
   // 不折腾在跑的连接器（见 saveToken）
   const [token, setToken] = useState("");
@@ -338,6 +342,14 @@ export function RemoteSection() {
       setPinInput(p);
     }
   }, [status]);
+
+  // A3（设计 §7.2）：窗口失焦即恢复掩码（切走再截图不残留明文）；卸载时解绑。
+  // 离开设置块再返回/初次进入 = 组件重挂载，pinVisible 自然回到 false。
+  useEffect(() => {
+    const hidePin = () => setPinVisible(false);
+    window.addEventListener("blur", hidePin);
+    return () => window.removeEventListener("blur", hidePin);
+  }, []);
 
   // M-1：撤销回看（被一并清除的条目）只在**当前这次撤销**的语境里有意义——切换卡片就
   // 收起（重新开通也收起，见 changeChannel 的 on 分支）。旧实现一旦置上永不清，用户
@@ -1282,6 +1294,7 @@ export function RemoteSection() {
             <div className="flex flex-none items-center gap-2.5">
               <Input
                 id="remote-pin"
+                type={pinVisible ? "text" : "password"}
                 inputMode="numeric"
                 maxLength={4}
                 placeholder="0000"
@@ -1289,6 +1302,20 @@ export function RemoteSection() {
                 onChange={(e) => setPinInput(e.target.value.replace(/\D/g, "").slice(0, 4))}
                 className="w-28 text-center font-mono text-lg font-bold tracking-[0.3em]"
               />
+              {/* A3：眼睛只切换 type（password/text）；值仍由 pinInput 唯一拥有，
+                  不复制进 title/文案。aria-pressed = 当前是否可见。 */}
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label={
+                  pinVisible ? t("settings.remote.pinHide") : t("settings.remote.pinShow")
+                }
+                aria-pressed={pinVisible}
+                onClick={() => setPinVisible((visible) => !visible)}
+              >
+                {pinVisible ? <EyeOff /> : <Eye />}
+              </Button>
               <Button variant="outline" size="sm" onClick={randomPin}>
                 {t("settings.remote.pinRandom")}
               </Button>

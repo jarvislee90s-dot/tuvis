@@ -349,6 +349,8 @@
       "pinHint": "Applies to all external channels: LAN / Quick tunnel / Own domain / External domain; local access on this computer also enters it once (via the LAN address). Click Save to apply; a new device enters it once and stays trusted for 180 days; changing it signs out every device",
       "pinRandom": "Random",
       "pinSaved": "Saved: all devices must re-enter the access PIN",
+      "pinShow": "Show password",
+      "pinHide": "Hide password",
       "resetDevices": "Reset devices",
       "resetTitle": "Reset devices?",
       "resetDesc": "All connected devices will be disconnected and must re-enter the access PIN; the PIN itself stays unchanged.",

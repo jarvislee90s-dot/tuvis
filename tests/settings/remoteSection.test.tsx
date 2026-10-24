@@ -9,6 +9,7 @@
 // 踢下线 / N / 10 上限徽标 / 本机名称默认系统名 / i18n zh-en 无缺键。
 // mock 模式沿用本文件旧版（vi.hoisted + vi.mock，自带 invoke/event/sonner/qrcode）。
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -1449,6 +1450,145 @@ describe("RemoteSection 访问密码（M5 A6）", () => {
     fireEvent.click(await screen.findByRole("button", { name: /reset$/i }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("remote_reset_devices"));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+});
+
+// A3（2026-10-24 设计 §7.2）：访问密码眼睛按钮。可见性只是页内呈现状态——
+// 不落库、不写日志、不改 PIN、不触发重配对；本组用合成 PIN 1234 断言「值始终不变」。
+describe("RemoteSection PIN 可见性遮罩（A3 设计 §7.2）", () => {
+  const pinInput = () => screen.getByLabelText("Access PIN") as HTMLInputElement;
+  const pinCommandCalls = (cmd: string) =>
+    invokeMock.mock.calls.filter(([called]) => called === cmd).length;
+
+  // 设置块宿主：复刻 SettingsPage 的 visibleIds 条件装配（离开块 = 卸载，返回 = 重挂载）
+  function BlockHost({ show }: { show: boolean }) {
+    return show ? <RemoteSection /> : <div data-testid="other-block" />;
+  }
+
+  const stubPinStatus = () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "remote_status") return statusOf({ pin: "1234" });
+      if (cmd === "get_setting") return null;
+      if (cmd === "remote_devices") return [];
+      return null;
+    });
+  };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("pin_visibility_is_presentation_only", async () => {
+    stubPinStatus();
+    render(<RemoteSection />);
+    await waitFor(() => expect(pinInput().value).toBe("1234"));
+
+    // 初始 = 密码掩码；眼睛是普通按钮（type=button，不提交表单）
+    expect(pinInput().type).toBe("password");
+    const show = screen.getByRole("button", { name: "Show password" }) as HTMLButtonElement;
+    expect(show.type).toBe("button");
+    expect(show).toHaveAttribute("aria-pressed", "false");
+
+    // 点击显示 → text；底层值原样 1234，aria 状态与文案翻转
+    fireEvent.click(show);
+    expect(pinInput().type).toBe("text");
+    expect(pinInput().value).toBe("1234");
+    const hide = screen.getByRole("button", { name: "Hide password" });
+    expect(hide).toHaveAttribute("aria-pressed", "true");
+
+    // 再点击 → 回到密码掩码；值仍不变
+    fireEvent.click(hide);
+    expect(pinInput().type).toBe("password");
+    expect(pinInput().value).toBe("1234");
+    expect(screen.getByRole("button", { name: "Show password" })).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
+
+    // 纯呈现：切换不保存 PIN、不重置设备（零后端副作用）
+    expect(pinCommandCalls("remote_set_pin")).toBe(0);
+    expect(pinCommandCalls("remote_reset_devices")).toBe(0);
+
+    // PIN 值不得复制进 title 或其它可见文案（只允许存在于输入框 value 本身）
+    expect(document.querySelector('[title*="1234"]')).toBeNull();
+    expect(document.querySelector('[aria-label*="1234"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("1234");
+  });
+
+  it("pin_hides_on_blur_or_remount", async () => {
+    stubPinStatus();
+    const addSpy = vi.spyOn(window, "addEventListener");
+    const removeSpy = vi.spyOn(window, "removeEventListener");
+    // 捕获 3s 轮询回调，手动触发真实刷新（不真等 3 秒，也不用假定时器干扰交互）
+    const intervalSpy = vi.spyOn(window, "setInterval");
+    const view = render(<BlockHost show />);
+    await waitFor(() => expect(pinInput().value).toBe("1234"));
+    const poll = intervalSpy.mock.calls.find(([, delay]) => delay === 3000)?.[0] as
+      (() => void) | undefined;
+    expect(poll).toBeTypeOf("function");
+
+    // 键盘可操作：原生 button 聚焦后 Enter 触发切换（不改其它行为）
+    const user = userEvent.setup();
+    const show = screen.getByRole("button", { name: "Show password" }) as HTMLButtonElement;
+    show.focus();
+    await user.keyboard("{Enter}");
+    expect(pinInput().type).toBe("text");
+    expect(screen.getByRole("button", { name: "Hide password" })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+
+    // 轮询刷新：隐藏态不被揭示、显示态也不被改写（呈现状态与刷新解耦）
+    fireEvent.click(screen.getByRole("button", { name: "Hide password" }));
+    const statusCallsBefore = pinCommandCalls("remote_status");
+    await act(async () => {
+      poll!();
+    });
+    expect(pinCommandCalls("remote_status")).toBeGreaterThan(statusCallsBefore);
+    expect(pinInput().type).toBe("password");
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }));
+    await act(async () => {
+      poll!();
+    });
+    expect(pinInput().type).toBe("text");
+
+    // 隐藏后再随机：随机只改值，不自动揭示
+    fireEvent.click(screen.getByRole("button", { name: "Hide password" }));
+    expect(pinInput().type).toBe("password");
+    fireEvent.click(screen.getByRole("button", { name: /random/i }));
+    expect(pinInput().type).toBe("password");
+    expect(pinInput().value).toMatch(/^\d{4}$/);
+
+    // 隐藏后保存：保存生效但不自动揭示
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(pinCommandCalls("remote_set_pin")).toBe(1));
+    expect(pinInput().type).toBe("password");
+
+    // 窗口失焦 → 立即恢复隐藏（重新打开截图时不残留明文）
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }));
+    expect(pinInput().type).toBe("text");
+    fireEvent.blur(window);
+    expect(pinInput().type).toBe("password");
+    expect(screen.getByRole("button", { name: "Show password" })).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
+
+    // 离开设置块再返回（卸载 → 重挂载）→ 恢复隐藏；blur 监听随卸载清理
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }));
+    expect(pinInput().type).toBe("text");
+    const blurHandler = addSpy.mock.calls.find(([type]) => type === "blur")?.[1];
+    expect(blurHandler).toBeTypeOf("function");
+    view.rerender(<BlockHost show={false} />);
+    expect(screen.queryByLabelText("Access PIN")).toBeNull();
+    expect(removeSpy).toHaveBeenCalledWith("blur", blurHandler);
+    view.rerender(<BlockHost show />);
+    await waitFor(() => expect(pinInput().value).toBe("1234"));
+    expect(pinInput().type).toBe("password");
+    expect(screen.getByRole("button", { name: "Show password" })).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
   });
 });
 
