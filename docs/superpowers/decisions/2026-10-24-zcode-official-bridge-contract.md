@@ -677,3 +677,31 @@ peerAckedFrames=0、bridge-messages 出现 6 字节"乱码"帧）对照钉源复
    （`rawJson.includes(taskId)` 子串判据，可能与无关帧误配）；③`summarizePayload` 把
    app payload 原样嵌入证据结构（依赖 writeEvidence 前 sanitizeDeep 兜底，可再走
    redactPayload 加固）。三项不影响本节判定，留后续批次跟进。
+
+## 8. B3 准备：审批 / 问答 / 打断的接入链（source 取证 + fake 合同）
+
+> 追加于 2026-10-24。本节只登记**源码取证结论与 fake 合同**；真实动作证据在 B3 实跑后追加到 §8.x。固定源码基线 3c5b227649371507ddc4eb46ac5133afe6db1cab（逐条行号见 `scripts/zcode-bridge-probe/interactionBridge.ts` 头注与类注释）。
+
+### 8.1 三条链（客户端侧，全部经 bridge 的 rpc-frame 通道）
+
+1. **审批（permission pending）**：pending 卡由会话 topic 的 snapshot/deltas 下发（`transport.ts:163-191`；`snapshot.ts:511`；`delta.ts:40,120`）、控制态 `control.activeWorks` 同帧携带（`snapshot.ts:53-64,133-148`）。应答 = `resolveInteraction` 命令，payload `{interactionId, answer}`，answer 形状 `{optionId, freeText?}`（`V4InteractionDialogs.tsx:358-363`；`command.ts:221-234`）。**探针红线**：`fullAccess` 特权项在客户端硬闸排除（`snapshot.ts:234`；宿主侧 `interaction-background.ts:50-54`）。
+2. **问答（userInput pending）**：应答 = `resolveInteraction` + `{action:"accept", content}`，content 形状同 `buildElicitationResponseContent`（`ElicitationDialog.tsx:273-303`）：`answers{[题干全文]: 选中 value ", " 连接}` + `answer_<i>` + 单题兼容 `answer`；题干/选项一律回传卡上原值（`interaction-broker.ts:505-517,622-650,766-780`）；空答案不伪造偏好（同文件 :277-278）。
+3. **打断（stop）**：命令 `stop`，payload `{expectedForegroundExecutionId}`（`command.ts:161-164`）。守卫 id **必须**来自 `control.activeWorks` 的观察（`snapshot.ts:53-64`），缺省 = 盲停 → 探针 fail-closed 拒绝构造（`session-flow.ts:292-360` 守卫语义）。
+
+### 8.2 客户端侧绑定与幂等（fake 合同）
+
+- pending 册（`PendingBook`）只收 `conversation/<本会话>` topic 帧；四元组绑定 session/generation/anchor；`authorizePendingResolution` 三查闸（存在性 → 会话一致 → 代际一致）过闸即消费，重复应答给 `already-consumed`，错会话/旧代际**不会消费**别的 pending（`interaction-registry.ts:155-167` 的服务端幂等只是最后防线）。
+- 每个交互 run：恰 1 个触发帧（复用 B2 已验证 send 链）+ 至多 1 个 resolve/stop 帧；CommandAck 分类 accepted/duplicate/noop/rejected/stale/failed，超窗 = unknown，**结构性无重发路径**。
+- fake 合同（`tests/remote/zcodeBridgeInteraction.test.ts`）：pending 绑定与代际、错/已消费拒绝、迟到响应不释放新代际、打断只作用于目标 turn、只读面不因交互流程被改写。
+
+### 8.3 实跑入口与授权（未执行；待用户在场）
+
+```
+node scripts/zcode-bridge-probe/interaction-probe.ts approve \
+  --i-know-this-connects --interaction-authorized --provider=bigmodel --open
+# 其余模式：reject / answer / interrupt
+```
+
+- 前置：用户本人在浏览器完成一次官方 OAuth（每 run 一次）；实跑期间不依赖官方网页会话（同 role 互踢）；目标固定为 Travel 工作区「hi」会话（batch-2 已授权）。
+- 触发指令为合成文本（`[tuvis-b3-probe:<UTC>]` + 无害文件操作 / 提问卡 / 逐行写文件），不含真实会话内容。
+- 如实申报：若会话为自动批准模式（无 pending 卡）→ 审批能力记 `UNAVAILABLE:no-pending-observed`；问答卡形状不可解 → `UNAVAILABLE:answer-shape-unresolved`；无前台执行 id → `NOOP:guard.stopTargetChanged`；均不重试、不猜测。
