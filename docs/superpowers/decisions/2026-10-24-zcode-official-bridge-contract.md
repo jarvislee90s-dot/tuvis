@@ -142,6 +142,16 @@
   （有效链接、凭据通路探测授权、同 role 互踢知情确认）约束。
 - 别名 → 真实值的映射由用户保存在私有目录（不入仓库/日志/夹具）；后续批次引用一律用别名。
 
+### 4.2 等待项收官登记（2026-10-24 追加，B1 实连半场；按 §6.7 编号逐项销账，不改写上文）
+
+| §6.7 等待项 | 状态 | 日期与依据 |
+| --- | --- | --- |
+| ① 有效官方链接（阻塞实连） | **DONE（2026-10-24）** | 用户本人在 ZCode APP 开启移动远控并经 Tuvis A4 设置卡保存当前有效链接；探针自 `~/.tuvis/tuvis.db` 只读读取成功并解析 sid/mid（`linkSource=settings`，见 §6.9 run 引用） |
+| ② 专用测试目标（阻塞真实写） | **部分完成（2026-10-24）** | 测试目标已指定并登记 §4.1（workspace `Travel` / session `hi`），batch 1 = 发送消息已授权；审批／问答／打断／切模型批次仍未授权，B2 起逐批申请 |
+| ③ 账号凭据通路探测授权 | **DONE（2026-10-24）** | 用户在场完成浏览器 OAuth 通路探测：bigmodel 通道回环 redirect 被接受、交换端点签发有效账号 JWT → `auth.status=proven` 定案（详见 §6.9 第 1 条） |
+| ④ 同 role 互踢知情确认 | **已消解（2026-10-24）** | 实连证实官方流程**不存在 APP 侧配对确认**（waiting = 路由不可达/设备离线态，§6.9 第 3/4 条）；互踢语义维持原判——同一链接第二条 terminal 连接会把第一条踢成 KICKED（官方源码注释 + fake 锁形维持），探针 KICKED 即停口径不变；实连时段用户知情且未依赖网页会话 |
+
+
 
 ## 5. 纪律声明（B 包约束登记）
 
@@ -341,3 +351,57 @@ B0 §3.2 末行「官方 Web 远控前端与云 relay 服务**不在本仓库**�
   Tuvis 客户端行为不受影响（发送侧门禁使未 paired 从不发出 data）。
 - `terminal_sid`（auth_ack 可选字段）的确切语义/稳定性待实连帧确认，暂不入合同字段。
 - B1 实连半场的验收门维持计划原文：「proven 且实际只读连到正确测试 APP」才进 B2。
+
+## 6.9 B1 实连判定（live connection verdict，2026-10-24 收官追加）
+
+> 任务书原称「§6.4 live connection verdict」；因 §6.4 已被「contract.json 填写与证据类别」
+> 占用，按「追加不改写」纪律落为本节 §6.9。B1 live 验收门判定：**PASSED**（proven 且实际
+> 只读连到正确测试 APP，controller 记录）。私有脱敏证据目录
+> `~/Documents/tuvis-verify-logs/zcode/`（0700，不入仓库）；本节只引用 run id，无任何真实值。
+> 证据级别标注：**live-sanitized** = 实连脱敏私有证据；**user-testimony** = 用户直接陈述；
+> **source** = 固定 SHA 官方源码行号。
+
+实连 run 索引（私有，只读引用）：
+
+| run id | oauth | connect | 说明 |
+| --- | --- | --- | --- |
+| `macos-B120261024T102434Z-SbxvWA` | UNSUPPORTED（callback-timeout） | SKIPPED | zai 通道——用户账号在 BigModel 侧，通道不符；inconclusive，**非**服务器拒绝 |
+| `macos-B120261024T104607Z-iykCdg` | PROVEN（bigmodel） | STOPPED:pair-timeout | 探针缺 mid → pair_status 恒 waiting → 30s 超时 |
+| `macos-B120261024T104720Z-OMksKw` | PROVEN（bigmodel） | STOPPED:pair-timeout | 同上（复跑） |
+| `macos-B120261024T105940Z-NarmSw` | PROVEN（bigmodel） | **COMPLETED** | mid 修复后收官 run：paired + 两只读查询 ok |
+
+六项判定（逐条挂证据级别）：
+
+1. **auth.status：interim → proven。**【live-sanitized】官方授权服务器（bigmodel.cn 通道，
+   国内智谱账号）接受 Tuvis 本地回环 redirect_uri（127.0.0.1 随机端口回调），共用交换端点
+   `POST /api/v1/oauth/token` 签发有效账号 JWT。三次实连 OAuth 事件：①zai 通道
+   callback-timeout（用户账号在 BigModel 侧、通道不符，inconclusive——**不是**服务器拒绝）
+   【live-sanitized】；②bigmodel PROVEN【live-sanitized】；③bigmodel PROVEN（mid 修复后复跑）
+   【live-sanitized】。
+2. **终端 token 实测。**【live-sanitized】`POST /api/v1/remote/token` Bearer JWT
+   `{role:"terminal"}` → 22 字符 token、`expires_in=60s`；一次性核验通过（同一 run 两次申请值
+   不同）、每次连接现取新 token；两条独立 run 复现。
+3. **mid 绑定发现。**【live-sanitized + source】relay 以 ws2 升级 URL 的 `mid` 查询参数把终端
+   路由到目标设备：官方 web 终端在链接 mid 非空时**条件性**附加（`webRemoteControlTransport.ts:107-110`）
+   【source】；APP（设备角色）**恒发**自身 mid（desktop `webRemoteControlTransport.ts:117-119`）
+   【source】。探针无 mid → pair_status 恒 waiting → 30s pair-timeout（run `…iykCdg` /
+   `…OMksKw`）；带 mid → **auth 后约 131ms 即 matched**——全程无 APP 侧人工介入
+   【live-sanitized】。
+4. **用户观察证据。**【user-testimony】用户陈述：任何浏览器打开官方远控链接只出现浏览器
+   登录/授权一步，ZCode APP 从不弹出任何配对确认——与探针自动 matched 一致。结论：官方流程
+   **不存在 APP 侧配对确认步骤**；`waiting` = 终端不可路由/设备离线态，**不是**「等待用户
+   批准」。早前合同里「官方 30s 配对窗口（等待用户）」的假设就此勘正为「**30s 路由窗口**」
+   （探针 `auth-check.ts` 的等待提示文案已随本批次修正）。
+5. **只读连接实测。**【live-sanitized】单条 WS：`auth_init{device_sid,meta,client_ts}` →
+   `auth_ack` → matched；白名单两个只读 RPC 查询 `bootstrap-request` /
+   `workspace-list-request` 均返回 ok；探针侧主动 close 收尾；无重连路径（结构性与 fake 锁形
+   维持）。脱敏证据在私有 run 目录（按 run id 引用，无真实值）。
+6. **route 面定案。** role=terminal 实连成立【live-sanitized】；relay 层绑定字段 =
+   **mid（设备路由）+ device_sid（auth_init 回显校验）**【live-sanitized + source】；
+   workspace/session 绑定仍在 relay 之上的 RPC 层——留 B2 以真实帧取证，不猜测。
+
+合同落点：`tests/fixtures/zcode-official-bridge/contract.json` 的 `auth.status=proven`、
+`interimMissing` 改记解除过程、`auth.evidence`/`route.evidence` 追加 live 条目、
+route `ownerScope`/`bindingNote` 勘正如上；`capabilities` 维持全 false、`operations` 维持
+空数组（send 等属 B2+，未取得各自真实帧证据不得前移）。
+

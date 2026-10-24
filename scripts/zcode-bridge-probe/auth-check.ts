@@ -8,9 +8,10 @@
 //      UNSUPPORTED（结构化、脱敏）定案。JWT 只存内存。
 //   2. connect-readonly —— 仅当上一步在进程内持有 JWT（或 --jwt-stdin 重跑）：
 //      取已保存官方链接的 sid/mid（--sid 或只读打开 ~/.tuvis/tuvis.db）→ 申请 role=terminal
-//      一次性 token（两次申请值必须不同）→ 单条 WS 连接 auth_init→auth_ack（waiting 为
-//      合法配对前态：用户需在 ZCode APP 内确认配对，官方 30s 窗口）→ paired 后**只发**
-//      bootstrap-request / workspace-list-request 两个只读查询 → 主动断开。
+//      一次性 token（两次申请值必须不同）→ 单条 WS 连接 auth_init→auth_ack（waiting =
+//      终端尚未可路由到设备：缺 mid/设备离线；官方无 APP 侧配对确认，30s 路由窗口自动
+//      超时）→ paired 后**只发** bootstrap-request / workspace-list-request 两个只读查询 →
+//      主动断开。
 //   3. 证据：脱敏 transcript.json + run.md 写入 ~/Documents/tuvis-verify-logs/zcode/
 //      的私有运行目录（0600）；真实值经 SecretRedactor fail-closed 闸，绝不入仓库/stdout。
 //
@@ -148,8 +149,8 @@ export const PROBE_STEPS: readonly ProbeStep[] = [
     detail:
       "wss://<官方链接主机>/api/v1/remote/ws2?token=<一次性>（链接 mid 非空时追加 &mid=，" +
       "官方 webRemoteControlTransport.ts:107-110）；auth_init→auth_ack；" +
-      "waiting = 合法配对前态：请在 ZCode APP 内确认配对（官方 30s 窗口）；" +
-      "KICKED/AUTH_FAILED/配对窗口超时 → 终态即停（无重连）。",
+      "waiting = 终端尚未可路由到设备（缺 mid/设备离线）：官方无 APP 侧配对确认，" +
+      "30s 路由窗口自动超时；KICKED/AUTH_FAILED/路由窗口超时 → 终态即停（无重连）。",
   },
   {
     id: "s5-readonly-observe",
@@ -274,7 +275,8 @@ function printHelp(): void {
   lines.push("");
   lines.push("用户交互：");
   lines.push("  · 授权由你本人在浏览器完成（探针不碰密码、不代登）；");
-  lines.push("  · 若 relay 返回 waiting，请在 ZCode APP 内确认配对（官方 30 秒窗口）；");
+  lines.push("  · waiting = 终端尚未可路由到设备（缺 mid/设备离线）：官方无 APP 侧配对确认，");
+  lines.push("    30 秒路由窗口自动超时（无需也不会有任何 APP 内操作）；");
   lines.push(
     "  · 探针连接可能踢掉你正在用的官方网页会话（同 role 单 owner），请在此时段不依赖网页端。"
   );
@@ -802,7 +804,8 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
     // s4：单条连接 + 握手
     log("建立单条 WS 连接（auth_init → auth_ack）……");
     log(
-      "若进入 waiting：请在 ZCode APP 内确认配对（官方 30 秒窗口）；确认前请勿依赖官方网页会话。"
+      "waiting = 终端尚未可路由到设备（缺 mid/设备离线）；官方无 APP 侧配对确认，" +
+        "30 秒路由窗口自动超时；期间请勿依赖官方网页会话（同 role 连接会互踢）。"
     );
     const conn = new RelayTerminalConnection({
       relayWsUrl,
