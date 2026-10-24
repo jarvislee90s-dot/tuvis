@@ -142,6 +142,16 @@
   （有效链接、凭据通路探测授权、同 role 互踢知情确认）约束。
 - 别名 → 真实值的映射由用户保存在私有目录（不入仓库/日志/夹具）；后续批次引用一律用别名。
 
+### 4.2 等待项收官登记（2026-10-24 追加，B1 实连半场；按 §6.7 编号逐项销账，不改写上文）
+
+| §6.7 等待项 | 状态 | 日期与依据 |
+| --- | --- | --- |
+| ① 有效官方链接（阻塞实连） | **DONE（2026-10-24）** | 用户本人在 ZCode APP 开启移动远控并经 Tuvis A4 设置卡保存当前有效链接；探针自 `~/.tuvis/tuvis.db` 只读读取成功并解析 sid/mid（`linkSource=settings`，见 §6.9 run 引用） |
+| ② 专用测试目标（阻塞真实写） | **部分完成（2026-10-24）** | 测试目标已指定并登记 §4.1（workspace `Travel` / session `hi`），batch 1 = 发送消息已授权；审批／问答／打断／切模型批次仍未授权，B2 起逐批申请 |
+| ③ 账号凭据通路探测授权 | **DONE（2026-10-24）** | 用户在场完成浏览器 OAuth 通路探测：bigmodel 通道回环 redirect 被接受、交换端点签发有效账号 JWT → `auth.status=proven` 定案（详见 §6.9 第 1 条） |
+| ④ 同 role 互踢知情确认 | **已消解（2026-10-24）** | 实连证实官方流程**不存在 APP 侧配对确认**（waiting = 路由不可达/设备离线态，§6.9 第 3/4 条）；互踢语义维持原判——同一链接第二条 terminal 连接会把第一条踢成 KICKED（官方源码注释 + fake 锁形维持），探针 KICKED 即停口径不变；实连时段用户知情且未依赖网页会话 |
+
+
 
 ## 5. 纪律声明（B 包约束登记）
 
@@ -341,3 +351,283 @@ B0 §3.2 末行「官方 Web 远控前端与云 relay 服务**不在本仓库**�
   Tuvis 客户端行为不受影响（发送侧门禁使未 paired 从不发出 data）。
 - `terminal_sid`（auth_ack 可选字段）的确切语义/稳定性待实连帧确认，暂不入合同字段。
 - B1 实连半场的验收门维持计划原文：「proven 且实际只读连到正确测试 APP」才进 B2。
+
+## 6.9 B1 实连判定（live connection verdict，2026-10-24 收官追加）
+
+> 任务书原称「§6.4 live connection verdict」；因 §6.4 已被「contract.json 填写与证据类别」
+> 占用，按「追加不改写」纪律落为本节 §6.9。B1 live 验收门判定：**PASSED**（proven 且实际
+> 只读连到正确测试 APP，controller 记录）。私有脱敏证据目录
+> `~/Documents/tuvis-verify-logs/zcode/`（0700，不入仓库）；本节只引用 run id，无任何真实值。
+> 证据级别标注：**live-sanitized** = 实连脱敏私有证据；**user-testimony** = 用户直接陈述；
+> **source** = 固定 SHA 官方源码行号。
+
+实连 run 索引（私有，只读引用）：
+
+| run id | oauth | connect | 说明 |
+| --- | --- | --- | --- |
+| `macos-B120261024T102434Z-SbxvWA` | UNSUPPORTED（callback-timeout） | SKIPPED | zai 通道——用户账号在 BigModel 侧，通道不符；inconclusive，**非**服务器拒绝 |
+| `macos-B120261024T104607Z-iykCdg` | PROVEN（bigmodel） | STOPPED:pair-timeout | 探针缺 mid → pair_status 恒 waiting → 30s 超时 |
+| `macos-B120261024T104720Z-OMksKw` | PROVEN（bigmodel） | STOPPED:pair-timeout | 同上（复跑） |
+| `macos-B120261024T105940Z-NarmSw` | PROVEN（bigmodel） | **COMPLETED** | mid 修复后收官 run：paired + 两只读查询 ok |
+
+六项判定（逐条挂证据级别）：
+
+1. **auth.status：interim → proven。**【live-sanitized】官方授权服务器（bigmodel.cn 通道，
+   国内智谱账号）接受 Tuvis 本地回环 redirect_uri（127.0.0.1 随机端口回调），共用交换端点
+   `POST /api/v1/oauth/token` 签发有效账号 JWT。三次实连 OAuth 事件：①zai 通道
+   callback-timeout（用户账号在 BigModel 侧、通道不符，inconclusive——**不是**服务器拒绝）
+   【live-sanitized】；②bigmodel PROVEN【live-sanitized】；③bigmodel PROVEN（mid 修复后复跑）
+   【live-sanitized】。
+2. **终端 token 实测。**【live-sanitized】`POST /api/v1/remote/token` Bearer JWT
+   `{role:"terminal"}` → 22 字符 token、`expires_in=60s`；一次性核验通过（同一 run 两次申请值
+   不同）、每次连接现取新 token；两条独立 run 复现。
+3. **mid 绑定发现。**【live-sanitized + source】relay 以 ws2 升级 URL 的 `mid` 查询参数把终端
+   路由到目标设备：官方 web 终端在链接 mid 非空时**条件性**附加（`webRemoteControlTransport.ts:107-110`）
+   【source】；APP（设备角色）**恒发**自身 mid（desktop `webRemoteControlTransport.ts:117-119`）
+   【source】。探针无 mid → pair_status 恒 waiting → 30s pair-timeout（run `…iykCdg` /
+   `…OMksKw`）；带 mid → **auth 后约 131ms 即 matched**——全程无 APP 侧人工介入
+   【live-sanitized】。
+4. **用户观察证据。**【user-testimony】用户陈述：任何浏览器打开官方远控链接只出现浏览器
+   登录/授权一步，ZCode APP 从不弹出任何配对确认——与探针自动 matched 一致。结论：官方流程
+   **不存在 APP 侧配对确认步骤**；`waiting` = 终端不可路由/设备离线态，**不是**「等待用户
+   批准」。早前合同里「官方 30s 配对窗口（等待用户）」的假设就此勘正为「**30s 路由窗口**」
+   （探针 `auth-check.ts` 的等待提示文案已随本批次修正）。
+5. **只读连接实测。**【live-sanitized】单条 WS：`auth_init{device_sid,meta,client_ts}` →
+   `auth_ack` → matched；白名单两个只读 RPC 查询 `bootstrap-request` /
+   `workspace-list-request` 均返回 ok；探针侧主动 close 收尾；无重连路径（结构性与 fake 锁形
+   维持）。脱敏证据在私有 run 目录（按 run id 引用，无真实值）。
+6. **route 面定案。** role=terminal 实连成立【live-sanitized】；relay 层绑定字段 =
+   **mid（设备路由）+ device_sid（auth_init 回显校验）**【live-sanitized + source】；
+   workspace/session 绑定仍在 relay 之上的 RPC 层——留 B2 以真实帧取证，不猜测。
+
+合同落点：`tests/fixtures/zcode-official-bridge/contract.json` 的 `auth.status=proven`、
+`interimMissing` 改记解除过程、`auth.evidence`/`route.evidence` 追加 live 条目、
+route `ownerScope`/`bindingNote` 勘正如上；`capabilities` 维持全 false、`operations` 维持
+空数组（send 等属 B2+，未取得各自真实帧证据不得前移）。
+
+
+---
+
+# 7. B2 部分（2026-10-24 追加）：单连接、会话映射与单次发送的准备定案
+
+> 本节登记 B2 的**准备阶段**产物：发送链 wire 定案（source 级，逐条行号）、会话映射方案、
+> 合成 marker 设计与 fake 合同。**send 能力未前移**：`contract.capabilities.send` 维持 false，
+> 须待 B2 实连半场（controller 与用户在场按批准次数执行）取得受理/归属/结果证据后再裁。
+> 本节不含任何真实会话 id / 路径 / SID / token；私有证据目录
+> `~/Documents/tuvis-verify-logs/zcode/macos-B2<UTC>-<短码>/`（0700/0600，脱敏 fail-closed）。
+
+## 7.1 新增资产
+
+| 文件 | 职责 |
+| --- | --- |
+| `scripts/zcode-bridge-probe/sessionBridge.ts` | Tuvis 侧参照实现：二进制 Channel 序列化、CRC32、rpc-frame 编解码/组装器、SingleConnectionGate、SessionTargetMapper（精确归属+代际绑定）、SendOnceLoop（单帧发送闭环）。不在产品运行链上。 |
+| `scripts/zcode-bridge-probe/session-probe.ts` | B2 实连半场探针（OAuth → token → ws2+mid 单连接 → 只读映射 → designate → 受闸单次发送 → 脱敏落证）。`--i-know-this-connects` 解锁连接；`--send-authorized` 单独解锁发送（缺省 map-only，打印 WOULD-send 即停）。 |
+| `tests/remote/zcodeBridgeSession.test.ts` | B2 fake 合同六用例（见 §7.4）。 |
+| `scripts/zcode-bridge-probe/sanitize.ts` | `createEvidenceRunDir` 增加 batchPrefix（B2 运行目录 `macos-B2…`）。 |
+
+## 7.2 发送链 wire 定案（source 级；全部行号 @ 固定 SHA `3c5b2276…`）
+
+发送一条消息的完整链（官方 web 远控客户端同款）：
+
+1. **app payload**：`workspace-bridge-open{requestId, bridgeSessionId, workspaceKey,
+   taskId}`（形状 `packages/shared/src/web-remote-control.ts:435-447`）→ 宿主
+   workspace-bridge-ready（`bridgeSessionId`/`bridgeGeneration` 回显，同文件 :449-456）。
+   workspaceKey 口径 = `resolveWebRemoteControlWorkspaceKey` =
+   `workspaceIdentity?.trim() || workspacePath`（同文件 :743-747）。
+2. **rpc-frame 通道握手**（Channel = `"zcode-agent"`，`packages/shared/src/channels.ts:114`；
+   顺序钉 `packages/ui/src/v4/agentV4ConnectionHandshake.ts:30-46`）：
+   `helloConversationV4()` → `HelloMessage{kind:"hello", protocolVersion, connectionId,
+   clientMode:"desktop-continuous"|"web-remote-replayable", deliveryProfile, serverTime,
+   capabilities, auth}`（`packages/shared/src/zcode-protocol-v4/transport.ts:42-65`）→
+   `initializeConversationV4(clientHello)`，clientHello =
+   `{kind:"clientHello", protocolVersion:3, clientId, clientKind:"desktop"|"web",
+   appVersion, capabilities?}`（同文件 :69-92，capabilities 可选；clientKind 映射见
+   handshake 文件 :43）。
+3. **订阅**（仅为打开活动帧证据流；官方发送本身只依赖握手）：
+   `subscribeConversationV4{workspacePath, workspaceIdentity?, sessionId}`——
+   参数面钉 `packages/ui/src/v4/agentConversationTransport.ts:207-214`（`{...workspace,
+   sessionId, base?, visibility?, retryInitialization?}`；workspace = `{workspacePath,
+   workspaceIdentity?}` 同文件 :94-97）+ `packages/services/src/zcode-agent/zcodeAgent.ts:400-405`
+   （`ZCodeAgentConversationSubscribeParams extends ZCodeAgentSessionTarget`）；
+   sessionId = `"conversation/<sessionId>"` topic 的精确后缀
+   （`packages/shared/src/zcode-protocol-v4/transport.ts:113,205`）。
+   **勘误记录**：准备稿曾按 `{topic, connectionId, clientMode, workspace:{…}}` 发订阅——
+   该形状在固定源码中不存在，已按上行钉源修正（无 guess 留存）。
+4. **发送**：`sendConversationCommandV4`（`packages/services/src/zcode-agent/zcodeAgent.ts:937`），
+   args = `{workspacePath, workspaceIdentity?, projectId?, envelope}`
+   （`ZCodeAgentConversationCommandParams` 同文件 :498-505；workspace target
+   `zcodeAgentPluginParams.ts:9-14`；官方 UI 调用面
+   `agentConversationTransport.ts:354-372`）。envelope =
+   `{commandId, clientId, sessionId, baseRevision?, baseLogEpoch?, type, payload, issuedAt}`
+   （`packages/shared/src/zcode-protocol-v4/command.ts:343-356`）；sendText payload 只**必带**
+   `text`，model/mode/plan 全部 optional=缺省沿用会话现值（同文件 :95-135）；
+   sendText **不在** `COMMANDS_REQUIRING_BASE_REVISION`（同文件 :315-331）→ 免 baseRevision。
+5. **承载**：Channel 消息字节 → 单分片 rpc-frame（CRC32）→ relay data 信封
+   `{type:"data", payload, client_ts}`（`packages/shared/src/web-remote-control-rpc-transport.ts:60-107,133-143`；
+   请求字节 wire = `serialize([100, id, channel, method]) + serialize([args])`
+   `packages/rpc/src/channelClient.ts:182-190` + `serialization.ts:169-175`；
+   类型码 100/201/202/204 `packages/rpc/src/channels.shared.ts:13-23`）。
+
+## 7.3 会话映射方案（精确归属，绝不按标题发送）
+
+- **listing 双源**：workspace 条目来自 bootstrap/workspace-list response 的
+  `WebRemoteControlWorkspaceTarget{workspacePath, workspaceIdentity?, label, kind,…}`
+  （`web-remote-control.ts:628-635`，B1 实连已验）；task 行来自宿主推送
+  `controller/tasks-index` 帧的 `WindowHostControllerTaskRow{address:{workspacePath, taskId},
+  meta:{title,…}}`（`packages/shared/src/zcode-protocol-v4/controller.ts:17-35,93-123`；
+  B1 实连观察到同形状增量推送）。
+- **designate**：操作员指称（`--workspace` 默认 Travel、`--task-title` 默认 hi）只用于
+  在 listing 里**精确唯一**匹配出真实 id；不唯一/不命中一律中止。**发送授权只认
+  `resolveTarget` 产物**（taskId 在当前代际 listing 里精确存在 + workspacePath 严格相等）；
+  本参照实现没有任何按标题/cwd 查找的 API（测试以反射断言缺席）。
+- **代际绑定**：映射绑定解析时的连接代际；`authorizeSend(target, liveGeneration)` 拒绝
+  旧代际映射（stale-epoch），SendOnceLoop 构造即二次校验。探针单连接无重连，代际恒 1。
+- **能力边界（计划 §B2 第 4 条）**：绑定证据不充分的卡（taskId/workspaces 对不上唯一行）
+  只读不发送——mapper 的 ambiguous/not-in-listing 拒绝即该边界的强制点。
+
+## 7.4 fake 合同（tests/remote/zcodeBridgeSession.test.ts，RED→GREEN）
+
+六用例（fake relay 127.0.0.1，无真实服务；合成 id `b2-fake-*` / `fake-bridge-*`）：
+
+1. `single_upstream_connection`——已有 paired 连接时第二个请求本地即拒（factory 不调用、
+   relay wsUpgrades 保持 1）；
+2. `wrong_target_rejected`——未知/错 taskId、错 workspacePath、以标题当 id 全部客户端侧拒绝，
+   零 data 帧发出；按标题查找 API 反射断言不存在；
+3. `unknown_not_resent`——peer 受理（rpc-frame-ack）后丢响应 → 结果只记 unknown，
+   恰好 1 个发送帧，多等一拍仍无重发（结构性无重发计时器）；
+4. `duplicate_events_deduped`——重复 ack×3 + 重复应答×2 + 重复事件×2 全部去重，
+   发送帧恒 1，结果 completed；
+5. `stale_epoch_rejected`——旧代际映射在新代际上 authorizeSend 即抛、构造 SendOnceLoop 即抛，
+   零 data 帧；新代际必须用新 listing 重新绑定；
+6. wire 形状自检——CRC32 往返、rpc-frame 字段、Channel 请求头数组序列化。
+
+## 7.5 合成 marker 设计
+
+正文 = `[tuvis-b2-marker:<UTC ISO 时间戳>]`（唯一、合成、不含任何秘密）；一次运行
+**至多一条**（`--send-authorized` 显式解锁；SendOnceLoop 结构性恒 1 帧）；模型/思考强度/
+模式全缺省=沿用会话现值；不审批、不打断。结果三态：completed（受理+窗口内观察到该会话
+活动帧，去重后）/ accepted（受理但活动窗静默）/ unknown（应答超窗——**绝不重发**）。
+验证核对面（官方 snapshot 的 user 消息与 turn 关联、只读 DB 最终可见性、兄弟会话不串投）
+留实连半场按批准次数执行后入账。
+
+## 7.6 contract.json 落点（B2 准备阶段）
+
+`operations` 追加且仅追加两条 live 已验**只读**操作（`bootstrap-request` /
+`workspace-list-request`，B1 run `macos-B120261024T105940Z-NarmSw`）；`capabilities.send`
+维持 false——实发取证前不得前移；schema 其余不动。
+
+## 7.7 追加与勘误（2026-10-24，B2 发送前评审修复；不改写上文）
+
+- **live-verification 显式项（新增）**：`envelope.sessionId ≡ listing address.taskId`
+  **同命名空间**是发送结果可解释的前提——`sendConversationCommandV4` envelope 携带的
+  sessionId 必须与 tasks listing `address.taskId` 属同一 id 空间；实连半场须把该等同性
+  列为显式核验项（拿 marker 落点回对 listing 行归因）。判错即 fail-closed（不发送／
+  结果作废），但 COMPLETED/ACCEPTED/UNKNOWN 的 verdict 解读依赖它成立。
+- **勘误（§7.3「SendOnceLoop 构造即二次校验」与 §7.4 用例 5 同款措辞）**：构造**不再**
+  比较 `identity.bridgeGeneration` vs `target.generation`——bridgeGeneration 是宿主
+  workspace-bridge-ready 回显的 **bridge 通道代际**，与探针连接代际不同命名空间，拿两者
+  比较属类别错误（宿主回显 ≠1 时构造曾在 try/catch 之外抛出，探针裸 crash 丢证据）。
+  stale-epoch 闸唯一住在 `SessionTargetMapper.authorizeSend`（映射代际 vs 存活连接代际，
+  like-for-like）；bridgeGeneration 仅信息性（随帧回传 + 落证据，不作闸）。配套加固：
+  session-probe 主体加故障围栏——任何阶段未处理异常一律记 `STOPPED:fault-<阶段>`
+  verdict 并照常落证，绝不裸 crash。
+
+## 7.8 追加：B2 实连 map-only 修复（2026-10-24；不改写上文）
+
+实连 run `macos-B220261024T121929Z-SnWWVA`（map-only，`--send-authorized` 已挂但未走到）：
+bootstrap-response / workspace-list-response 均 OK，28 条 workspace 条目；
+designate 在 workspace 阶段 `workspace-ambiguous` fail-closed（**未发送任何写向**）；
+被动 8s 收帧窗 0 条 rpc-frame / 0 条 bridge 消息（taskRows=0）。归因与修复：
+
+- **双 listing 重复（根因一）**：bootstrap-response 与 workspace-list-response 携带
+  **同一份** `workspaces[]`（实连 14 条 ×2 = 28 条原样合并），任何 label 的精确匹配都
+  至少翻倍、「精确唯一」永假。修复 = `dedupeWorkspaceEntries` 按全部采集字段精确去重
+  （sessionBridge.ts；证据记 `workspaceEntriesRaw` vs `workspaceEntries` 计数）。
+- **同 label 双条目（根因二）**：workspace 条目含 `workspacePurpose`
+  （`web-remote-control.ts:633`；`WorkspacePurpose = "project" | "conversation"`，
+  `packages/shared/src/workspacePurpose.ts`），同一人读 label 会以 project/conversation
+  各挂一条 → 单靠 label 唯一匹配不成立。修复 = 指称唯一化阶梯
+  `resolveDesignatedWorkspace`（sessionBridge.ts；探针 designate 步改调它）：
+  label 精确匹配 → 多候选时优先 `workspacePurpose === "project"` → 仍多候选时优先
+  `workspacePath === activeWorkspaceKey` → 仍不唯一即 `workspace-ambiguous` 中止；
+  **purpose 收窄为空集时保留原候选集**继续走 activeWorkspaceKey（"prefer" 语义）。
+  每步收窄只以 sanitized 计数进证据（`labelMatches` / `afterPurposeFilter` /
+  `afterActiveKeyFilter` / `resolvedStep`），绝不输出值。
+- **activeWorkspaceKey 的权威源 = bootstrap response**（只读回读，不是探针记忆）：
+  `bootstrap-response.result.mobileViewState.activeWorkspaceKey`
+  （`web-remote-control.ts:694-698` MobileViewState + `:726-735` bootstrap result；
+  实连 run 已实证该字段存在且为 workspacePath 口径）；bootstrap 缺失时回落
+  workspace-list-response 的 `result.activeWorkspaceKey`（同文件 `:672-676`）。
+  解析产物 workspacePath 与 activeWorkspaceKey 相等时证据记
+  `activeWorkspaceConfirmed: true`（APP 当前打开工作区的交叉确认）。
+- **任务索引主动枚举（根因三的修复）**：被动收帧窗不再作为任务行来源。改为：
+  `workspace-bridge-open`（taskId 可选：`web-remote-control.ts:435-447`；枚举期省略）
+  打开读面桥拿到 bridge 身份 → 在 channel **`"window-controller"`**
+  （`packages/shared/src/channels.ts:112` ServiceChannels.WindowController；该服务只在
+  workspace bridge 的 relay 通道上发布——`packages/client/src/remoteServiceAccess.ts
+  :181-185` + `websocket.ts:102-108` connectViaProtocol +
+  `packages/web/src/web-remote-control/app/webRemoteControlWorkspaceBridgeSession.ts
+  :39-74`）上：
+  1. `EventListen(102)` 事件 `"onDynamicControllerFrame"`
+     （`packages/services/src/window-controller/windowController.ts:78`；wire =
+     `serialize([102, id, channel, event]) + serialize(undefined)`，
+     `packages/rpc/src/channelClient.ts:150-177,179-194` +
+     `channels.shared.ts:21`；动态事件名即属性名本体
+     `packages/rpc/src/proxy-channel.ts:126-127`；后续帧以 EventFire(204) 按该 id 回推
+     `channelClient.ts:210-231`）——官方 registry 同序：先挂帧监听再订阅
+     （`packages/ui/src/v4/windowControllerTaskListRegistry.ts:145` → `:220-224`；
+     手机任务首页 `packages/ui/src/hooks/useGlobalTaskList.ts:45-47` 消费同一 registry）；
+  2. `subscribeControllerV4{topic:"controller/tasks-index", visibility:"foreground"}`
+     （`windowController.ts:75`；params
+     `packages/shared/src/zcode-protocol-v4/controller.ts:258-271`；ack
+     `{subscriptionId, mode, logEpoch}` = `transport.ts:125-131` +
+     `controller.ts:273-274`）；
+  3. 有界收帧窗（8s）内收 `WindowHostControllerTaskFrame`
+     （`controller.ts:251-256`）：`payload.kind="snapshot"` → `snapshot.tasks`
+     （`:155-164`）；`kind="deltas"` → `task.upserted`/`task.removed`
+     （`:187-191`）；行形状 `WindowHostControllerTaskRow`
+     `:17-35,93-123`（`address{workspacePath, taskId, workspaceIdentity?}` +
+     `meta.title`）。行按 `workspacePath\0taskId` upsert 去重，上限 1024 行防巨库。
+  实现 = `ControllerTaskIndexReader`（sessionBridge.ts）+ session-probe 新 s5b 阶段；
+  全部出站帧为**读面控制帧**（监听/订阅/退订），`maxSendFrames=1` 闸仍只数会话发送帧，
+  发送路径零改动。`unsubscribeControllerV4{subscriptionId}`（`windowController.ts:77`）
+  在窗闭后尽力退订（失败不影响结果）。subscribe 失败/超窗 = 结构性失败
+  （`ABORTED:designate-task-subscribe-*`），零行 = `task-not-found`，
+  多行 = `task-ambiguous`（沿用原中止语义，绝不按标题发送）。
+- **fake 合同追加（tests/remote/zcodeBridgeSession.test.ts）**：阶梯七断言（去重复现
+  28→14、bootstrap 优先/回落、purpose 收窄、activeWorkspaceKey 收窄 + confirmed、
+  空集回退、不唯一/零命中中止、exact-label）+ 枚举三断言（subscribe→snapshot/deltas→
+  title 精确唯一匹配且全程只发读面控制帧、零行、subscribe 超时不重发）；
+  原六用例全绿。
+
+### 7.9 workspace-bridge-open 身份/Initialize/回执勘误（2026-10-24 实连 124743Z 后二修）
+
+实连 run `macos-B220261024T124743Z-gz7zRQ`（tasks-bridge-open=ok、subscribe-timeout、
+peerAckedFrames=0、bridge-messages 出现 6 字节"乱码"帧）对照钉源复盘，修正三点
+（行号 @ 3c5b2276）：
+
+1. **ready 无 success 字段**：`workspace-bridge-ready`
+   {requestId, bridgeSessionId, bridgeGeneration?, recoveryId?, bridge}
+   （web-remote-control.ts:449-456）不携带 success；desktop 只在失败时发
+   `workspace-bridge-error{reason, error}`（webRemoteControlManager.ts:1175-1191）。
+   实连 transcript 的 `payload.success=false` 是探针旧 summary `success === true` 的
+   误报——bridge-open 实际成功。summary 改三态（true/false/null）。
+2. **帧身份 = 请求声明字段的原样回显，绝不虚构**：ready 的 bridgeGeneration/recoveryId
+   只是请求回显（manager.ts:1156-1165 仅在 request 存在时写）；APP 接收侧
+   `rawIdentityMatches` 对身份做严格相等（含 undefined，
+   webRemoteControlAcknowledgedRelayProtocolTypes.ts:65-76）。探针旧实现给身份补默认
+   `bridgeGeneration: 1` → 每条出站 rpc-frame 被静默丢弃且不回 ack = subscribe-timeout
+   真因。规则：open 请求不声明 → 帧/ack 身份同样缺席。
+3. **Initialize 门 + 接收侧回执**：桥 ChannelServer 构造即发
+   Initialize=200 = `serialize([200])+serialize(undefined)` = `04 01 06 C8 01 00`
+   （channelServer.ts:29-36,45-47,57-66；实连 bridge-messages 里的"乱码"帧即此）；
+   官方 ChannelClient 把一切请求排在 whenInitialized 之后（channelClient.ts:124-128,
+   159-163）→ 探针枚举与 send 都加有界 Initialize 门（超窗 =
+   `initialize-timeout` / `STOPPED:bridge-init-timeout`，零控制帧出站）。接收侧按
+   ackRelayProtocol.ts:293-304 对每条完整组装的入站消息回累计 rpc-frame-ack（读面控制
+   帧，不占 maxSendFrames；不回执 → 对端按重放期限反复重发并最终降级桥，实连 3×
+   Initialize 即此）。
+4. **无前台前置**：workspace-bridge-open 不校验 `mobileViewState.activeWorkspaceKey`
+   （manager.ts:1000-1054 只要求目标 workspace 在当前桌面窗口里）；activeWorkspaceKey
+   只是手机页初始选区导航默认（web-remote-control.ts:758-783）→ 重跑无需把 APP 切到
+   Travel 前台；拒绝情形以 `bridge-open-refused` verdict + 脱敏 reason/error 落证。
