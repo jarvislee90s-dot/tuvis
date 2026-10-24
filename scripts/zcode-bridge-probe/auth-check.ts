@@ -146,7 +146,8 @@ export const PROBE_STEPS: readonly ProbeStep[] = [
     title: "单条 WS 连接 + auth_init 只读握手",
     requires: "s3 的第一枚 token；用户确认此刻不依赖官方网页会话（同 role 连接会互踢）",
     detail:
-      "wss://<官方链接主机>/api/v1/remote/ws2?token=<一次性>；auth_init→auth_ack；" +
+      "wss://<官方链接主机>/api/v1/remote/ws2?token=<一次性>（链接 mid 非空时追加 &mid=，" +
+      "官方 webRemoteControlTransport.ts:107-110）；auth_init→auth_ack；" +
       "waiting = 合法配对前态：请在 ZCode APP 内确认配对（官方 30s 窗口）；" +
       "KICKED/AUTH_FAILED/配对窗口超时 → 终态即停（无重连）。",
   },
@@ -649,8 +650,10 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
 
   if (jwt) {
     connectSummary.attempted = true;
-    // s1：sid/origin（mid 只在 settings 分支就地登记——WS URL 的 mid 为可选，探针不依赖）
+    // s1：sid/origin/mid——mid 与 sid 同出自官方链接（MID_A），随 s4 透传进 ws2 升级 URL
+    // （官方条件性 webRemoteControlTransport.ts:107-110）；--sid 直指定时无 mid（null）。
     let sid: string;
+    let mid: string | null = null;
     let origin = OFFICIAL_ZCODE_ENDPOINT_ORIGIN;
     if (parsed.sid) {
       sid = parsed.sid;
@@ -704,6 +707,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
       }
       redactor.register("link", settings.link);
       sid = parsedLink.sid;
+      mid = parsedLink.mid;
       origin = parsedLink.origin;
       redactor.register("sid", sid);
       redactor.register("mid", parsedLink.mid);
@@ -726,6 +730,9 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
       origin,
       tokenUrl: new URL("/api/v1/remote/token", origin).toString(),
       wsUrl: relayWsUrl,
+      // mid 是否随 ws2 升级 URL 透传（官方条件性 webRemoteControlTransport.ts:107-110）——
+      // f1c350a4 及之前恒缺 mid → relay 无法路由 → pair_status 恒 waiting → pair-timeout。
+      midAttached: mid !== null,
       derivation: "relay host = 官方链接 origin 同主机（zcodeEndpoint.ts:369-380,14）",
     };
     log(`relay 派生：${origin} → ${relayWsUrl}`);
@@ -801,6 +808,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
       relayWsUrl,
       token: tokenFirst.token,
       deviceSid: sid,
+      deviceMid: mid,
     });
     const channel = new ReadonlyPayloadChannel();
     channel.attach(conn);

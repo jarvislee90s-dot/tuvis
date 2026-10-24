@@ -20,8 +20,9 @@
 //   响应 {code:0,msg,data:{token,expires_in}}，token 22 字符 base64URL（末字符∈[AQgw]）
 //     → contract.ts:119-133
 //   401 → auth-required（交上层回登录，不重试）→ webRemoteControlV2Token.ts:23
-//   WS /api/v1/remote/ws2?token=<一次性token>（+可选 mid）
-//     → contract.ts:102；web/.../webRemoteControlTransport.ts:106-110
+//   WS /api/v1/remote/ws2?token=<一次性token>（链接 mid trim 非空时追加 &mid=<device_mid>）
+//     → contract.ts:102；web/.../webRemoteControlTransport.ts:106-110（mid 条件 ：107-110）；
+//       desktop/.../webRemoteControlTransport.ts:117-119（device 角色同款）
 //   open 后 auth_init{device_sid,meta,client_ts} → auth_ack{device_sid,pair_status}
 //     → contract.ts:19-24,53-59；web/.../webRemoteControlTransport.ts:119-143,317-324
 //   pair_status ∈ waiting|matched（contract.ts:53-59）：waiting 是合法配对前态——官方以
@@ -140,6 +141,13 @@ export type RelayTerminalConnectionOptions = {
   /** 目标桌面端 device_sid（来自官方链接的 sid 参数）。 */
   deviceSid: string;
   /**
+   * 目标桌面端 device_mid（来自官方链接的 mid 参数，可选）。官方终端在链接 mid trim
+   * 非空时把它 set 进 ws2 升级 URL（web/.../webRemoteControlTransport.ts:107-110；
+   * desktop 设备角色同款 ：117-119）——relay 以它路由到目标设备；缺省/空白不 set
+   * （官方条件性）。缺席时 pair_status 恒 waiting → 30s pair-timeout，非服务器拒绝。
+   */
+  deviceMid?: string | null;
+  /**
    * waiting→matched 的配对窗口上限（ms）。官方 30s
    * （web/.../webRemoteControlTransport.ts:460-473）；默认同官方，测试可注入短窗口。
    */
@@ -187,6 +195,15 @@ export class RelayTerminalConnection {
       };
       const url = new URL(this.options.relayWsUrl);
       url.searchParams.set("token", this.options.token);
+      // mid 条件性透传 = 官方 1:1：deviceMid?.trim() 非空才 set（值保持原文不 trim）——
+      // packages/web/src/web-remote-control/adapters/webRemoteControlTransport.ts:107-110
+      // （web 终端角色）；desktop/.../webRemoteControlTransport.ts:117-119（device 角色同款）。
+      // relay 靠 mid 路由到目标设备：缺席时 pair_status 恒 waiting → 30s pair-timeout
+      // （B1 实连两轮 macos-B120261024T104607Z-iykCdg / macos-B120261024T104720Z-OMksKw
+      // 即此因，属探针缺陷、非服务器拒绝）。
+      if (this.options.deviceMid?.trim()) {
+        url.searchParams.set("mid", this.options.deviceMid);
+      }
       const ws = new this.webSocketImpl(url.toString());
       this.socket = ws;
       ws.addEventListener("open", () => {

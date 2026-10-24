@@ -10,7 +10,8 @@
 //       packages/web/src/web-remote-control/adapters/webRemoteControlV2Token.ts:13-22
 //   - 响应信封 {code:0,msg,data:{token,expires_in}}，token 为 22 字符 base64URL（末字符∈[AQgw]）
 //     → contract.ts:119-133（token schema 与信封 union）
-//   - WS /api/v1/remote/ws2?token=<一次性token>，open 后发
+//   - WS /api/v1/remote/ws2?token=<一次性token>（链接 mid trim 非空时追加 &mid=<device_mid>，
+//     官方条件性 webRemoteControlTransport.ts:107-110；desktop 设备角色同款 ：117-119），open 后发
 //     auth_init{device_sid,meta,client_ts} → auth_ack{device_sid,pair_status: waiting|matched}；
 //     waiting 为合法配对前态（官方 30s 窗口内等 matched，超时为独立终态、非 rejected）
 //     → contract.ts:19-24 与 53-59；packages/web/src/web-remote-control/adapters/
@@ -79,6 +80,8 @@ class FakeRelay {
     preAuthDataRejected: 0,
     kickedSent: 0,
   };
+  /** 每次 ws 升级 URL 的查询参数快照（升级序）；mid 条件性断言用。 */
+  readonly wsUpgradeQueries: URLSearchParams[] = [];
   private readonly server: http.Server;
   private readonly tokens = new Map<string, StoredToken>();
   private readonly sessions = new Set<ClientSession>();
@@ -190,6 +193,7 @@ class FakeRelay {
   private handleUpgrade(req: http.IncomingMessage, socket: Socket): void {
     const url = new URL(req.url ?? "/", "http://fake-relay.invalid");
     this.stats.wsUpgrades += 1;
+    this.wsUpgradeQueries.push(url.searchParams);
     if (url.pathname !== "/api/v1/remote/ws2") {
       socket.destroy();
       return;
@@ -466,6 +470,64 @@ describe("zcode 官方桥接：fake relay 上的终端身份门槛（B1）", () 
     // paired 后 data 帧被 relay 接受
     expect(conn.sendData({ probe: "b1-read-only-marker" })).toBe(true);
     await waitFor(() => relay.stats.dataAccepted === 1);
+  });
+
+  it("ws 升级 URL 条件性携带 mid：trim 非空才 set，空白/空串/缺省一律省略（官方条件）", async () => {
+    // 官方条件 deviceMid?.trim() 非空才 searchParams.set("mid", …)：
+    // web/.../webRemoteControlTransport.ts:107-110；desktop 设备角色同款 :117-119。
+    // relay 靠 mid 路由到目标设备：缺席 → pair_status 恒 waiting → pair-timeout
+    // （B1 实连两轮 macos-B120261024T104607Z-iykCdg / macos-B120261024T104720Z-OMksKw 的根因）。
+    const tokenA = relay.mintToken();
+    const connWithMid = track(
+      new RelayTerminalConnection({
+        relayWsUrl,
+        token: tokenA,
+        deviceSid: relay.deviceSid,
+        deviceMid: "b1-fake-device-mid-0001",
+      })
+    );
+    await expect(connWithMid.connect()).resolves.toBe("paired");
+    expect(relay.wsUpgradeQueries[0].get("mid")).toBe("b1-fake-device-mid-0001");
+    expect(relay.wsUpgradeQueries[0].get("token")).toBe(tokenA);
+    connWithMid.close();
+
+    // 空白 mid：trim 后为空 → 条件不成立 → 不携带 mid 参数
+    const tokenB = relay.mintToken();
+    const connBlankMid = track(
+      new RelayTerminalConnection({
+        relayWsUrl,
+        token: tokenB,
+        deviceSid: relay.deviceSid,
+        deviceMid: "   ",
+      })
+    );
+    await expect(connBlankMid.connect()).resolves.toBe("paired");
+    expect(relay.wsUpgradeQueries[1].has("mid")).toBe(false);
+    expect(relay.wsUpgradeQueries[1].get("token")).toBe(tokenB);
+    connBlankMid.close();
+
+    // 空串：同上省略
+    const tokenC = relay.mintToken();
+    const connEmptyMid = track(
+      new RelayTerminalConnection({
+        relayWsUrl,
+        token: tokenC,
+        deviceSid: relay.deviceSid,
+        deviceMid: "",
+      })
+    );
+    await expect(connEmptyMid.connect()).resolves.toBe("paired");
+    expect(relay.wsUpgradeQueries[2].has("mid")).toBe(false);
+    connEmptyMid.close();
+
+    // 缺省（options 未传）：同样省略——既有用例的连接形状不变
+    const tokenD = relay.mintToken();
+    const connNoMid = track(
+      new RelayTerminalConnection({ relayWsUrl, token: tokenD, deviceSid: relay.deviceSid })
+    );
+    await expect(connNoMid.connect()).resolves.toBe("paired");
+    expect(relay.wsUpgradeQueries[3].has("mid")).toBe(false);
+    expect(relay.wsUpgradeQueries[3].get("token")).toBe(tokenD);
   });
 
   it("pair_status=waiting 是合法前态：保活等待，收到 matched 才 paired", async () => {
