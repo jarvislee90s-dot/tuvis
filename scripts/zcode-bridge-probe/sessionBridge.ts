@@ -67,6 +67,16 @@ export const REQUEST_TYPE_PROMISE = 100;
 export const RESPONSE_TYPE_PROMISE_SUCCESS = 201;
 export const RESPONSE_TYPE_PROMISE_ERROR = 202;
 export const RESPONSE_TYPE_EVENT_FIRE = 204;
+/**
+ * ResponseType.Initialize = 200（channels.shared.ts:25-31）：桥上的 ChannelServer
+ * 构造即回 `send([200])` + 默认 body undefined（channelServer.ts:29-36,45-47,57-66），
+ * wire 字节 = `04 01 06 C8 01 00`——B2 实连 macos-B220261024T124743Z bridge-messages[0]
+ * 的 6 字节帧即此。官方 ChannelClient 在收到它之前**不发任何请求**（Promise 与
+ * EventListen 都排在 whenInitialized 之后，channelClient.ts:124-128,159-163）→ 探针的
+ * 枚举/握手也必须先等 Initialize（ControllerTaskIndexReader.run 第 0 步 / send 阶段
+ * hello 之前）。
+ */
+export const RESPONSE_TYPE_INITIALIZE = 200;
 
 // ---------------------------------------------------------------------------
 // 二进制序列化（packages/rpc/src/serialization.ts 的最小往返实现）
@@ -179,10 +189,12 @@ export type DecodedChannelMessage = {
   body: unknown;
 };
 
-/** 解码一条 Channel 消息字节（请求或应答）；形状不符返回 null。 */
+/** 解码一条 Channel 消息字节（请求或应答）；形状不符返回 null。
+ * Initialize 的 header 是单元素数组 `[200]`（channelServer.ts:45-47 `send([response.type])`），
+ * 与双元素应答 `[type, id]` / 四元素请求并存 → 这里放宽为 length ≥ 1。 */
 export function decodeChannelMessage(bytes: Uint8Array): DecodedChannelMessage | null {
   const header = deserializeValue(bytes, 0);
-  if (!header || !Array.isArray(header.value) || header.value.length < 2) return null;
+  if (!header || !Array.isArray(header.value) || header.value.length < 1) return null;
   const [headerType, id, channelName, method] = header.value as unknown[];
   if (typeof headerType !== "number") return null;
   const body = deserializeValue(bytes, header.pos);
@@ -229,6 +241,54 @@ export function encodeChannelEventListen(args: {
   out.set(header, 0);
   out.set(body, header.byteLength);
   return out;
+}
+
+/**
+ * 编码桥 ChannelServer 的 Initialize 消息字节（探针/测试对拍用）：
+ * `send([response.type])` + 默认 body undefined（channelServer.ts:45-47,57-66）→
+ * serialize([200]) + serialize(undefined) = `04 01 06 C8 01 00`（6 字节，即 B2 实连
+ * macos-B220261024T124743Z bridge-messages[0] 的帧）。
+ */
+export function encodeChannelInitialize(): Uint8Array {
+  const header = serializeValue([RESPONSE_TYPE_INITIALIZE]);
+  const body = serializeValue(undefined);
+  const out = new Uint8Array(header.byteLength + body.byteLength);
+  out.set(header, 0);
+  out.set(body, header.byteLength);
+  return out;
+}
+
+/** rpc-frame-ack payload（web-remote-control-rpc-transport.ts:112-123 形状）。 */
+export type RpcFrameAckPayload = {
+  zcode_type: "rpc-frame-ack";
+  bridgeSessionId: string;
+  bridgeGeneration?: number;
+  recoveryId?: string;
+  ackMessageSeq: number;
+};
+
+/**
+ * 编码接收侧 rpc-frame 回执（官方 AcknowledgedRelayProtocol 同款：
+ * `{zcode_type:"rpc-frame-ack", ...identity, ackMessageSeq}`，ackRelayProtocol.ts:203-218）。
+ * 身份字段**只输出 identity 里声明过的**——APP 接收侧 rawIdentityMatches 对
+ * bridgeGeneration/recoveryId 做===严格相等（含 undefined，
+ * webRemoteControlAcknowledgedRelayProtocolTypes.ts:65-76）；探针 open 请求未声明
+ * generation 时多写 `bridgeGeneration: 1` 会被对端静默丢帧且不回 ack（B2 实连
+ * macos-B220261024T124743Z peerAckedFrames=0 的根因）。
+ */
+export function encodeRpcFrameAck(args: {
+  identity: RpcFrameIdentity;
+  ackMessageSeq: number;
+}): RpcFrameAckPayload {
+  return {
+    zcode_type: "rpc-frame-ack",
+    bridgeSessionId: args.identity.bridgeSessionId,
+    ...(args.identity.bridgeGeneration !== undefined
+      ? { bridgeGeneration: args.identity.bridgeGeneration }
+      : {}),
+    ...(args.identity.recoveryId !== undefined ? { recoveryId: args.identity.recoveryId } : {}),
+    ackMessageSeq: args.ackMessageSeq,
+  };
 }
 
 /** 编码一条服务端→客户端消息（应答 / EventFire），fake 与探针解析对拍用。 */
@@ -635,6 +695,82 @@ export class SessionTargetMapper {
 }
 
 // ---------------------------------------------------------------------------
+// workspace-bridge-open 应答分类（B2 实连 124743Z 修复）
+//
+// 官方应答面（@ 3c5b2276）：
+//   - 成功 = workspace-bridge-ready：{requestId, bridgeSessionId, bridgeGeneration?,
+//     recoveryId?, bridge}（web-remote-control.ts:449-456）——**没有 success 字段**；
+//     探针旧 summary 用 `payload.success === true` 判定，把 ready 误报成 success:false。
+//   - 失败 = workspace-bridge-error：{requestId, reason, error}
+//     （web-remote-control.ts:458-466；desktop 侧 webRemoteControlManager.ts:1175-1191
+//     在 createWorkspaceBridge 抛错时发送；payloadRequester.ts:115-124 将其作为请求拒绝）。
+//   - ready 的 bridgeGeneration/recoveryId 只是**请求字段的回显**（manager.ts:1156-1165
+//     仅在 request 里存在时才写）；APP 接收侧按严格相等判帧身份
+//     （webRemoteControlAcknowledgedRelayProtocolTypes.ts:65-76）→ 帧身份必须原样采用
+//     ready/请求声明过的字段，缺省就保持缺席，绝不虚构默认值。
+// ---------------------------------------------------------------------------
+
+export type WorkspaceBridgeOpenClassification =
+  | {
+      kind: "ready";
+      identity: RpcFrameIdentity;
+      bridgeSessionId: string;
+      bridgeKind: string | null;
+    }
+  | { kind: "refused"; reason: string | null; error: string | null }
+  | { kind: "unknown" };
+
+/**
+ * 分类 workspace-bridge-open 的应答 payload：
+ *   - workspace-bridge-error → refused（reason/error 原样带出，供脱敏落证）；
+ *   - 显式 success === false（bootstrap 式包装，防御分支）→ refused；
+ *   - workspace-bridge-ready 且能解析出 bridgeSessionId（bridge 对象或顶层）→ ready，
+ *     身份只含 ready 里真实声明过的字段（见上节注）；
+ *   - 其余（含缺 bridgeSessionId 的残缺 ready）→ unknown（fail-closed，不猜）。
+ */
+export function classifyWorkspaceBridgeOpenResponse(
+  payload: unknown
+): WorkspaceBridgeOpenClassification {
+  if (!payload || typeof payload !== "object") return { kind: "unknown" };
+  const record = payload as Record<string, unknown>;
+  const bridge = record.bridge as
+    { bridgeSessionId?: unknown; bridgeGeneration?: unknown; kind?: unknown } | undefined;
+  if (record.success === false || record.zcode_type === "workspace-bridge-error") {
+    return {
+      kind: "refused",
+      reason: typeof record.reason === "string" ? record.reason : null,
+      error: typeof record.error === "string" ? record.error : null,
+    };
+  }
+  if (record.zcode_type !== "workspace-bridge-ready") return { kind: "unknown" };
+  const bridgeSessionId =
+    typeof bridge?.bridgeSessionId === "string" && bridge.bridgeSessionId
+      ? bridge.bridgeSessionId
+      : typeof record.bridgeSessionId === "string" && record.bridgeSessionId
+        ? record.bridgeSessionId
+        : null;
+  if (!bridgeSessionId) return { kind: "unknown" };
+  const generation =
+    typeof bridge?.bridgeGeneration === "number"
+      ? bridge.bridgeGeneration
+      : typeof record.bridgeGeneration === "number"
+        ? record.bridgeGeneration
+        : undefined;
+  const recoveryId =
+    typeof record.recoveryId === "string" && record.recoveryId ? record.recoveryId : undefined;
+  return {
+    kind: "ready",
+    identity: {
+      bridgeSessionId,
+      ...(generation !== undefined ? { bridgeGeneration: generation } : {}),
+      ...(recoveryId !== undefined ? { recoveryId } : {}),
+    },
+    bridgeSessionId,
+    bridgeKind: typeof bridge?.kind === "string" ? bridge.kind : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // workspace 指称唯一化（B2 实连 map-only 修复，2026-10-24）
 //
 // 实连 run macos-B220261024T121929Z-SnWWVA：bootstrap-response 与
@@ -797,9 +933,15 @@ export function resolveDesignatedWorkspace(args: {
 //     channelClient.ts:150-177 requestEvent、:179-194 sendRequest、:210-231 按 id 回推
 //     EventFire；channels.shared.ts:21）——官方 registry 在 subscribe 前先挂监听
 //     （windowControllerTaskListRegistry.ts:145 → :220-224）；
+//   - **Initialize 门**：官方 ChannelClient 把所有请求（Promise 与 EventListen）排在
+//     whenInitialized 之后（channelClient.ts:124-128,159-163）——桥 ChannelServer 构造即
+//     发 Initialize=200（channelServer.ts:29-36,45-47）→ 枚举器先等 Initialize 再发帧
+//     （B2 实连 124743Z：过早发出的控制帧 0 ack 0 应答）；
 //   - 主动枚举 = subscribeControllerV4{topic:"controller/tasks-index",
 //     visibility:"foreground"}（windowController.ts:75；params controller.ts:258-271；
-//     ack {subscriptionId, mode, logEpoch} transport.ts:125-131 + controller.ts:273-274）；
+//     ack {subscriptionId, mode, logEpoch} transport.ts:125-131 + controller.ts:273-274；
+//     官方 registry 同款 visibility="foreground"，windowControllerTaskListRegistry.ts
+//     :219-232）；
 //   - 任务行从 EventFire(204) 帧回推，body = WindowHostControllerTaskFrame
 //     （controller.ts:251-256）：snapshot.tasks（:155-164）或 deltas
 //     task.upserted / task.removed（:187-191）；行形状 :93-123（address{workspacePath,
@@ -816,6 +958,8 @@ export type ControllerTaskIndexCounters = {
   unsubscribeRequestId: number | null;
   /** 出站 rpc-frame 总数（EventListen + subscribe + unsubscribe；读面控制帧）。 */
   controlFramesSent: number;
+  /** 桥 ChannelServer 的 Initialize(200) 是否已观察到（channelClient.ts:124-128 门）。 */
+  initializeObserved: boolean;
   /** peer 受理回执数（rpc-frame-ack；去重后）。 */
   peerAckedFrames: number;
   duplicateInboundFrames: number;
@@ -840,15 +984,21 @@ export type ControllerTaskIndexReadResult =
       counters: ControllerTaskIndexCounters;
     }
   | {
-      kind: "send-failed" | "subscribe-timeout" | "subscribe-rejected";
+      kind: "initialize-timeout" | "send-failed" | "subscribe-timeout" | "subscribe-rejected";
       counters: ControllerTaskIndexCounters;
     };
 
 export type ControllerTaskIndexReaderOptions = {
   sender: ProbeConnection;
-  /** 已就绪 workspace bridge 的帧身份（bridge-open ready 回显）。 */
+  /** 已就绪 workspace bridge 的帧身份（bridge-open ready 回显；只含声明过的字段）。 */
   identity: RpcFrameIdentity;
-  timeouts: { subscribeMs: number; windowMs: number; unsubscribeMs: number };
+  timeouts: {
+    /** 桥 Initialize(200) 的有界等待窗（官方 ChannelClient 的 whenInitialized 门）。 */
+    initializeMs: number;
+    subscribeMs: number;
+    windowMs: number;
+    unsubscribeMs: number;
+  };
   firstSeq?: number;
   firstMessageSeq?: number;
   /** 任务行收集上限（防巨库撑爆内存；超限丢弃并计数）。 */
@@ -857,9 +1007,9 @@ export type ControllerTaskIndexReaderOptions = {
 };
 
 /**
- * 主动任务索引枚举器：EventListen → subscribeControllerV4 → 有界收帧窗 →
- * 尽力退订。行按 `workspacePath\u0000taskId` upsert 去重（snapshot 后的增量同键
- * 覆盖，task.removed 同键删除）。等待循环只有 sleep+判定，无任何重发路径。
+ * 主动任务索引枚举器：等 Initialize → EventListen → subscribeControllerV4 →
+ * 有界收帧窗 → 尽力退订。行按 `workspacePath\u0000taskId` upsert 去重（snapshot 后的
+ * 增量同键覆盖，task.removed 同键删除）。等待循环只有 sleep+判定，无任何重发路径。
  */
 export class ControllerTaskIndexReader {
   readonly counters: ControllerTaskIndexCounters = {
@@ -867,6 +1017,7 @@ export class ControllerTaskIndexReader {
     subscribeRequestId: 0,
     unsubscribeRequestId: null,
     controlFramesSent: 0,
+    initializeObserved: false,
     peerAckedFrames: 0,
     duplicateInboundFrames: 0,
     controllerFramesSeen: 0,
@@ -879,6 +1030,7 @@ export class ControllerTaskIndexReader {
 
   private readonly sender: ProbeConnection;
   private readonly identity: RpcFrameIdentity;
+  private readonly initializeMs: number;
   private readonly subscribeMs: number;
   private readonly windowMs: number;
   private readonly unsubscribeMs: number;
@@ -892,6 +1044,7 @@ export class ControllerTaskIndexReader {
   private eventListenRequestId = 0;
   private subscribeRequestId = 0;
   private unsubscribeRequestId = 0;
+  private initializeObserved = false;
   private settledAck:
     | { status: "ok"; mode: string | null; subscriptionId: string | null }
     | { status: "rejected" }
@@ -902,6 +1055,7 @@ export class ControllerTaskIndexReader {
   constructor(options: ControllerTaskIndexReaderOptions) {
     this.sender = options.sender;
     this.identity = options.identity;
+    this.initializeMs = Math.max(1, options.timeouts.initializeMs);
     this.subscribeMs = Math.max(1, options.timeouts.subscribeMs);
     this.windowMs = Math.max(1, options.timeouts.windowMs);
     this.unsubscribeMs = Math.max(1, options.timeouts.unsubscribeMs);
@@ -914,11 +1068,22 @@ export class ControllerTaskIndexReader {
   }
 
   /**
-   * 订阅并收集一个有界窗内的任务行。顺序 = 官方 registry 同款：帧监听先行 →
-   * subscribeControllerV4 → 等窗 → unsubscribe（尽力）。subscribe 失败/超窗 =
-   * 结构性失败（rows 为空，由调用方 fail-closed），不重试。
+   * 订阅并收集一个有界窗内的任务行。顺序 = 官方同款：Initialize（ChannelClient
+   * whenInitialized 门）→ 帧监听先行 → subscribeControllerV4 → 等窗 → unsubscribe
+   * （尽力）。Initialize 缺席 / subscribe 失败/超窗 = 结构性失败（rows 为空，由调用方
+   * fail-closed），不重试。
    */
   async run(): Promise<ControllerTaskIndexReadResult> {
+    // 0) 等桥 ChannelServer 的 Initialize(200)。官方 ChannelClient 在此之前不发任何
+    // 请求（channelClient.ts:124-128 whenInitialized；159-163 EventListen 同门）。
+    const initializeDeadline = Date.now() + this.initializeMs;
+    while (!this.initializeObserved && Date.now() < initializeDeadline) {
+      await this.sleep(Math.min(20, Math.max(1, initializeDeadline - Date.now())));
+    }
+    if (!this.initializeObserved) {
+      return { kind: "initialize-timeout", counters: this.counters };
+    }
+
     // 1) 帧监听（102；无应答帧——后续 EventFire 事件本体就是回执）。
     this.eventListenRequestId = this.nextRequestId;
     this.nextRequestId += 1;
@@ -1021,6 +1186,14 @@ export class ControllerTaskIndexReader {
     if (event.kind === "fault" || event.kind === "incomplete") return;
     const decoded = decodeChannelMessage(event.bytes);
     if (!decoded) return;
+    if (decoded.headerType === RESPONSE_TYPE_INITIALIZE) {
+      // 桥 ChannelServer 就绪信号（channelServer.ts:29-36,45-47）：解锁出站控制帧。
+      if (!this.initializeObserved) {
+        this.initializeObserved = true;
+        this.counters.initializeObserved = true;
+      }
+      return;
+    }
     if (
       this.subscribeRequestId !== 0 &&
       decoded.id === this.subscribeRequestId &&

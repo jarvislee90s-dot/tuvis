@@ -59,17 +59,21 @@ import {
   AGENT_SEND_COMMAND_METHOD,
   REQUEST_TYPE_PROMISE,
   RESPONSE_TYPE_EVENT_FIRE,
+  RESPONSE_TYPE_INITIALIZE,
   RESPONSE_TYPE_PROMISE_SUCCESS,
   ControllerTaskIndexReader,
   SendOnceLoop,
   SessionTargetMapper,
   SingleConnectionGate,
+  classifyWorkspaceBridgeOpenResponse,
   crc32WireBytes,
   decodeChannelMessage,
   dedupeWorkspaceEntries,
+  encodeChannelInitialize,
   encodeChannelRequest,
   encodeChannelResponse,
   encodeRpcFrame,
+  encodeRpcFrameAck,
   readActiveWorkspaceKeyFromListings,
   resolveDesignatedWorkspace,
   type WorkspaceListingEntry,
@@ -349,6 +353,16 @@ function frameFromBytes(
 ): Record<string, unknown> {
   const encoded = encodeRpcFrame({ identity: FAKE_IDENTITY, seq, messageSeq, bytes });
   return encoded as unknown as Record<string, unknown>;
+}
+
+/**
+ * 桥 ChannelServer 的 Initialize 帧（channelServer.ts:30,45-47：sendResponse(Initialize)
+ * → send([200]) + 默认 body undefined）。B2 实连 macos-B220261024T124743Z 收到的
+ * 6 字节帧 04 01 06 C8 01 00 即此形状——官方 ChannelClient 在收到它之前不发任何请求
+ * （channelClient.ts:124-128 whenInitialized 门）。
+ */
+function initializeFrame(seq: number, messageSeq: number): Record<string, unknown> {
+  return frameFromBytes(encodeChannelInitialize(), seq, messageSeq);
 }
 
 /** 服务端→客户端的 PromiseSuccess 应答字节（channelClient.ts:212-213 的对偶）。 */
@@ -911,16 +925,20 @@ describe("controller tasks-index 主动枚举（B2 map-only 修复）", () => {
     };
   }
 
-  it("subscribe_active_enumeration：EventListen+subscribeControllerV4 → snapshot/deltas 任务行 → title 精确唯一匹配；全程只发读面控制帧", async () => {
+  it("subscribe_active_enumeration：Initialize 门 → EventListen+subscribeControllerV4 → snapshot/deltas 任务行 → title 精确唯一匹配；全程只发读面控制帧", async () => {
     const conn = await connectFakePaired();
     const reader = new ControllerTaskIndexReader({
       sender: conn,
       identity: FAKE_IDENTITY,
-      timeouts: { subscribeMs: 2_000, windowMs: 400, unsubscribeMs: 400 },
+      timeouts: { initializeMs: 2_000, subscribeMs: 2_000, windowMs: 400, unsubscribeMs: 400 },
       sleep: realSleep,
     });
     conn.onData = (payload) => reader.onData(payload);
     const runPromise = reader.run();
+
+    // 官方 ChannelClient 在收到桥 ChannelServer 的 Initialize 之前不发任何请求
+    // （channelClient.ts:124-128 whenInitialized 门）：FAKE 先推 Initialize。
+    relay.pushPayload(initializeFrame(1, 1));
 
     // 前两个出站控制帧 = EventListen(102) + subscribeControllerV4(100)，都在
     // channel "window-controller" 上（官方 registry 同序：先监听后订阅）。
@@ -950,8 +968,8 @@ describe("controller tasks-index 主动枚举（B2 map-only 修复）", () => {
             ack: { subscriptionId: "fake-sub-1", mode: "snapshot", logEpoch: "fake-log-epoch" },
           },
         }),
-        1,
-        1
+        2,
+        2
       )
     );
     // snapshot 事件帧（204 按 EventListen id 路由）：hi 行 + 另一行。
@@ -990,8 +1008,8 @@ describe("controller tasks-index 主动枚举（B2 map-only 修复）", () => {
             },
           },
         },
-        2,
-        2
+        3,
+        3
       )
     );
     // delta 事件帧：task.upserted 同键覆盖（行数不增）。
@@ -1010,8 +1028,8 @@ describe("controller tasks-index 主动枚举（B2 map-only 修复）", () => {
             deltas: [{ op: "task.upserted", task: hiTaskRow("running") }],
           },
         },
-        3,
-        3
+        4,
+        4
       )
     );
     // peer 受理回执（FAKE 策略：由测试直发；官方对端按帧回 rpc-frame-ack）。
@@ -1033,8 +1051,8 @@ describe("controller tasks-index 主动枚举（B2 map-only 修复）", () => {
           id: unsubId,
           body: {},
         }),
-        4,
-        4
+        5,
+        5
       )
     );
 
@@ -1055,6 +1073,7 @@ describe("controller tasks-index 主动枚举（B2 map-only 修复）", () => {
     expect(result.counters.peerAckedFrames).toBeGreaterThanOrEqual(1);
     expect(result.counters.controlFramesSent).toBe(3);
     expect(result.counters.unsubscribed).toBe(true);
+    expect(result.counters.initializeObserved).toBe(true);
     expect(unsubId).toBeGreaterThan(subscribeId);
 
     // 全程恰 3 条出站帧，无任何会话发送帧（sendConversationCommandV4 不存在）。
@@ -1072,11 +1091,12 @@ describe("controller tasks-index 主动枚举（B2 map-only 修复）", () => {
     const reader = new ControllerTaskIndexReader({
       sender: conn,
       identity: FAKE_IDENTITY,
-      timeouts: { subscribeMs: 1_000, windowMs: 250, unsubscribeMs: 400 },
+      timeouts: { initializeMs: 1_000, subscribeMs: 1_000, windowMs: 250, unsubscribeMs: 400 },
       sleep: realSleep,
     });
     conn.onData = (payload) => reader.onData(payload);
     const runPromise = reader.run();
+    relay.pushPayload(initializeFrame(1, 1));
     await waitFor(() => relay.clientDataPayloads.length >= 2);
     const subscribeId = decodeClientFrame(1)?.id as number;
     relay.pushPayload(
@@ -1086,8 +1106,8 @@ describe("controller tasks-index 主动枚举（B2 map-only 修复）", () => {
           id: subscribeId,
           body: { ack: { subscriptionId: "fake-sub-2", mode: "snapshot", logEpoch: "fake-epoch" } },
         }),
-        1,
-        1
+        2,
+        2
       )
     );
     // 收帧窗（零行）闭后退订：出现第 3 个出站帧后直发其 201 应答（FAKE 策略）。
@@ -1101,8 +1121,8 @@ describe("controller tasks-index 主动枚举（B2 map-only 修复）", () => {
           id: unsubDecoded?.id as number,
           body: {},
         }),
-        2,
-        2
+        3,
+        3
       )
     );
     const result = await runPromise;
@@ -1114,22 +1134,189 @@ describe("controller tasks-index 主动枚举（B2 map-only 修复）", () => {
     expect(result.counters.unsubscribed).toBe(true);
   });
 
-  it("subscribe_timeout：ack 缺席 → 结构性失败（subscribe-timeout），零行、不退订、不重发", async () => {
+  it("subscribe_timeout：Initialize 已到而 subscribe ack 缺席 → 结构性失败（subscribe-timeout），零行、不退订、不重发", async () => {
     const conn = await connectFakePaired();
     const reader = new ControllerTaskIndexReader({
       sender: conn,
       identity: FAKE_IDENTITY,
-      timeouts: { subscribeMs: 250, windowMs: 100, unsubscribeMs: 100 },
+      timeouts: { initializeMs: 500, subscribeMs: 250, windowMs: 100, unsubscribeMs: 100 },
       sleep: realSleep,
     });
     conn.onData = (payload) => reader.onData(payload);
-    const result = await reader.run();
+    const runPromise = reader.run();
+    relay.pushPayload(initializeFrame(1, 1));
+    await waitFor(() => relay.clientDataPayloads.length >= 2);
+    const result = await runPromise;
     expect(result.kind).toBe("subscribe-timeout");
+    expect(result.counters.initializeObserved).toBe(true);
     expect(result.counters.controlFramesSent).toBe(2);
     expect(result.counters.unsubscribeRequestId).toBeNull();
     expect(result.counters.rowsCollected).toBe(0);
     // 不重发：出站帧恒为 EventListen + subscribe 两帧。
     await realSleep(80);
     expect(relay.clientDataPayloads).toHaveLength(2);
+  });
+
+  it("initialize_timeout：桥 Initialize 缺席 → initialize-timeout，一个控制帧都不发（官方 whenInitialized 门）", async () => {
+    const conn = await connectFakePaired();
+    const reader = new ControllerTaskIndexReader({
+      sender: conn,
+      identity: FAKE_IDENTITY,
+      timeouts: { initializeMs: 150, subscribeMs: 100, windowMs: 100, unsubscribeMs: 100 },
+      sleep: realSleep,
+    });
+    conn.onData = (payload) => reader.onData(payload);
+    const result = await reader.run();
+    expect(result.kind).toBe("initialize-timeout");
+    expect(result.counters.initializeObserved).toBe(false);
+    expect(result.counters.controlFramesSent).toBe(0);
+    expect(result.counters.eventListenRequestId).toBe(0);
+    expect(result.counters.subscribeRequestId).toBe(0);
+    expect(result.counters.unsubscribeRequestId).toBeNull();
+    expect(relay.clientDataPayloads).toHaveLength(0);
+    // 再等一拍也不发（无重试路径；官方客户端同样在 Initialize 前静默排队）。
+    await realSleep(60);
+    expect(relay.clientDataPayloads).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B2 实连 124743Z 修复的 wire 形状与应答分类（纯函数；不依赖 relay fixture）：
+//   1. 桥 Initialize 帧 = serialize([200]) + serialize(undefined) == 实连 6 字节
+//      （channelServer.ts:30,45-47,57-66；B2 实连 macos-B220261024T124743Z bridge-messages[0]）；
+//   2. workspace-bridge-open 应答分类：ready 不带 success 字段（探针旧 summary 把它
+//      误报成 success:false）；正式拒绝通道 = workspace-bridge-error
+//      （webRemoteControlManager.ts:1175-1191）；ready 帧身份 = 请求声明字段的**原样回显**
+//      （manager.ts:1156-1165 只回显 request 里存在的 generation/recoveryId）——探针绝不
+//      虚构 bridgeGeneration：APP 接收侧 rawIdentityMatches 严格相等（含 undefined，
+//      webRemoteControlAcknowledgedRelayProtocolTypes.ts:65-76），多余字段 = 静默丢帧无 ack
+//      （= 实连 subscribe-timeout 根因）；
+//   3. rpc-frame-ack 编码：身份缺省字段不得出现（同上严格相等判据；
+//      ackRelayProtocol.ts:203-218 接收侧回执形状）。
+// ---------------------------------------------------------------------------
+describe("workspace-bridge-open 应答分类与桥 wire 形状（B2 实连 124743Z 修复）", () => {
+  it("Initialize wire：serialize([200])+serialize(undefined) == 实连 6 字节帧；decodeChannelMessage 可解", () => {
+    const bytes = encodeChannelInitialize();
+    expect([...bytes]).toEqual([0x04, 0x01, 0x06, 200, 0x01, 0x00]);
+    const decoded = decodeChannelMessage(bytes);
+    expect(decoded).not.toBeNull();
+    expect(decoded?.headerType).toBe(RESPONSE_TYPE_INITIALIZE);
+    expect(decoded?.id).toBeNull();
+    expect(decoded?.channelName).toBeNull();
+    expect(decoded?.method).toBeNull();
+  });
+
+  it("ready 回显身份只含请求声明过的字段：无 generation 的 open → 帧身份与发送帧绝不虚构 bridgeGeneration", () => {
+    // B2 实连 124743Z 的 ready 形状：bridge 对象无 bridgeGeneration/recoveryId。
+    const ready = {
+      zcode_type: "workspace-bridge-ready",
+      requestId: "b2-fake-req-1",
+      bridgeSessionId: "fake-bridge-open-0002",
+      bridge: {
+        bridgeSessionId: "fake-bridge-open-0002",
+        kind: "local",
+        workspaceKey: "/Users/fake/Travel-workspace",
+        workspacePath: "/Users/fake/Travel-workspace",
+      },
+    };
+    const cls = classifyWorkspaceBridgeOpenResponse(ready);
+    expect(cls.kind).toBe("ready");
+    if (cls.kind !== "ready") return;
+    expect(cls.identity).toEqual({ bridgeSessionId: "fake-bridge-open-0002" });
+    expect("bridgeGeneration" in cls.identity).toBe(false);
+    expect("recoveryId" in cls.identity).toBe(false);
+    expect(cls.bridgeKind).toBe("local");
+    // 用该身份编码的 rpc-frame 也不携带 bridgeGeneration——APP 接收侧按严格相等
+    // 判 identity（含 undefined），多余字段会被静默丢弃且不回 ack。
+    const frame = encodeRpcFrame({
+      identity: cls.identity,
+      seq: 1,
+      messageSeq: 1,
+      bytes: new Uint8Array([1, 2, 3]),
+    });
+    expect("bridgeGeneration" in frame).toBe(false);
+    expect("recoveryId" in frame).toBe(false);
+  });
+
+  it("ready 携带回显 generation/recoveryId 时身份原样保留（manager 只回显请求里存在的字段）", () => {
+    const ready = {
+      zcode_type: "workspace-bridge-ready",
+      requestId: "b2-fake-req-2",
+      bridgeSessionId: "fake-bridge-open-0003",
+      bridgeGeneration: 4,
+      recoveryId: "fake-recovery-1",
+      bridge: { bridgeSessionId: "fake-bridge-open-0003", bridgeGeneration: 4, kind: "remote" },
+    };
+    const cls = classifyWorkspaceBridgeOpenResponse(ready);
+    expect(cls).toMatchObject({
+      kind: "ready",
+      identity: {
+        bridgeSessionId: "fake-bridge-open-0003",
+        bridgeGeneration: 4,
+        recoveryId: "fake-recovery-1",
+      },
+    });
+  });
+
+  it("workspace-bridge-error → refused（reason/error 原样带出）；success:false 包装 → refused", () => {
+    // 正式拒绝通道（webRemoteControlManager.ts:1180-1190）。
+    expect(
+      classifyWorkspaceBridgeOpenResponse({
+        zcode_type: "workspace-bridge-error",
+        requestId: "b2-fake-req-3",
+        bridgeSessionId: "fake-bridge-open-0004",
+        reason: "workspace-not-found",
+        error: "目标工作区不在当前桌面窗口中，无法创建 Web 远程控制 bridge。",
+      })
+    ).toEqual({
+      kind: "refused",
+      reason: "workspace-not-found",
+      error: "目标工作区不在当前桌面窗口中，无法创建 Web 远程控制 bridge。",
+    });
+    // 防御分支：显式 success:false 一律按拒绝处理（ready 本身无 success 字段——
+    // web-remote-control.ts:449-456）。
+    expect(
+      classifyWorkspaceBridgeOpenResponse({
+        zcode_type: "workspace-bridge-ready",
+        requestId: "r",
+        success: false,
+        error: null,
+      })
+    ).toEqual({ kind: "refused", reason: null, error: null });
+  });
+
+  it("其他形状 → unknown（fail-closed，不猜）", () => {
+    expect(classifyWorkspaceBridgeOpenResponse(null)).toEqual({ kind: "unknown" });
+    expect(classifyWorkspaceBridgeOpenResponse({ zcode_type: "bootstrap-response" })).toEqual({
+      kind: "unknown",
+    });
+    expect(
+      classifyWorkspaceBridgeOpenResponse({ zcode_type: "workspace-bridge-ready" }, "fallback-id")
+    ).toEqual({ kind: "unknown" });
+  });
+
+  it("rpc-frame-ack 编码：身份缺省字段不得出现（接收侧严格相等判据）", () => {
+    expect(
+      encodeRpcFrameAck({
+        identity: { bridgeSessionId: "fake-bridge-open-0005" },
+        ackMessageSeq: 3,
+      })
+    ).toEqual({
+      zcode_type: "rpc-frame-ack",
+      bridgeSessionId: "fake-bridge-open-0005",
+      ackMessageSeq: 3,
+    });
+    expect(
+      encodeRpcFrameAck({
+        identity: { bridgeSessionId: "b", bridgeGeneration: 2, recoveryId: "r" },
+        ackMessageSeq: 4,
+      })
+    ).toEqual({
+      zcode_type: "rpc-frame-ack",
+      bridgeSessionId: "b",
+      bridgeGeneration: 2,
+      recoveryId: "r",
+      ackMessageSeq: 4,
+    });
   });
 });

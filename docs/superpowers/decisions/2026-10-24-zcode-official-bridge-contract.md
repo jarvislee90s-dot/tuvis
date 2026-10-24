@@ -599,3 +599,35 @@ designate 在 workspace 阶段 `workspace-ambiguous` fail-closed（**未发送�
   空集回退、不唯一/零命中中止、exact-label）+ 枚举三断言（subscribe→snapshot/deltas→
   title 精确唯一匹配且全程只发读面控制帧、零行、subscribe 超时不重发）；
   原六用例全绿。
+
+### 7.9 workspace-bridge-open 身份/Initialize/回执勘误（2026-10-24 实连 124743Z 后二修）
+
+实连 run `macos-B220261024T124743Z-gz7zRQ`（tasks-bridge-open=ok、subscribe-timeout、
+peerAckedFrames=0、bridge-messages 出现 6 字节"乱码"帧）对照钉源复盘，修正三点
+（行号 @ 3c5b2276）：
+
+1. **ready 无 success 字段**：`workspace-bridge-ready`
+   {requestId, bridgeSessionId, bridgeGeneration?, recoveryId?, bridge}
+   （web-remote-control.ts:449-456）不携带 success；desktop 只在失败时发
+   `workspace-bridge-error{reason, error}`（webRemoteControlManager.ts:1175-1191）。
+   实连 transcript 的 `payload.success=false` 是探针旧 summary `success === true` 的
+   误报——bridge-open 实际成功。summary 改三态（true/false/null）。
+2. **帧身份 = 请求声明字段的原样回显，绝不虚构**：ready 的 bridgeGeneration/recoveryId
+   只是请求回显（manager.ts:1156-1165 仅在 request 存在时写）；APP 接收侧
+   `rawIdentityMatches` 对身份做严格相等（含 undefined，
+   webRemoteControlAcknowledgedRelayProtocolTypes.ts:65-76）。探针旧实现给身份补默认
+   `bridgeGeneration: 1` → 每条出站 rpc-frame 被静默丢弃且不回 ack = subscribe-timeout
+   真因。规则：open 请求不声明 → 帧/ack 身份同样缺席。
+3. **Initialize 门 + 接收侧回执**：桥 ChannelServer 构造即发
+   Initialize=200 = `serialize([200])+serialize(undefined)` = `04 01 06 C8 01 00`
+   （channelServer.ts:29-36,45-47,57-66；实连 bridge-messages 里的"乱码"帧即此）；
+   官方 ChannelClient 把一切请求排在 whenInitialized 之后（channelClient.ts:124-128,
+   159-163）→ 探针枚举与 send 都加有界 Initialize 门（超窗 =
+   `initialize-timeout` / `STOPPED:bridge-init-timeout`，零控制帧出站）。接收侧按
+   ackRelayProtocol.ts:293-304 对每条完整组装的入站消息回累计 rpc-frame-ack（读面控制
+   帧，不占 maxSendFrames；不回执 → 对端按重放期限反复重发并最终降级桥，实连 3×
+   Initialize 即此）。
+4. **无前台前置**：workspace-bridge-open 不校验 `mobileViewState.activeWorkspaceKey`
+   （manager.ts:1000-1054 只要求目标 workspace 在当前桌面窗口里）；activeWorkspaceKey
+   只是手机页初始选区导航默认（web-remote-control.ts:758-783）→ 重跑无需把 APP 切到
+   Travel 前台；拒绝情形以 `bridge-open-refused` verdict + 脱敏 reason/error 落证。

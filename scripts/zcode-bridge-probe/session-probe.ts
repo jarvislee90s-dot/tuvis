@@ -10,24 +10,32 @@
 //   3. mapping         —— paired 后只发两个白名单只读查询 bootstrap-request /
 //                         workspace-list-request（B1 已实连验证）；随后**主动**枚举
 //                         任务索引：workspace-bridge-open（taskId 缺省）打开读面桥 →
-//                         EventListen onDynamicControllerFrame + subscribeControllerV4
-//                         {topic: controller/tasks-index}（channel window-controller）
-//                         → 有界收帧窗收 snapshot/deltas 任务行（B2 修复：被动 8s 窗
-//                         实连 0 帧，任务行必须主动拉）；
+//                         等桥 Initialize(200)（官方 ChannelClient 的 whenInitialized 门，
+//                         channelClient.ts:124-128）→ EventListen onDynamicControllerFrame +
+//                         subscribeControllerV4 {topic: controller/tasks-index}（channel
+//                         window-controller）→ 有界收帧窗收 snapshot/deltas 任务行；收到的
+//                         桥内消息按官方接收侧回累计 rpc-frame-ack（ackRelayProtocol.ts
+//                         :293-304）；bridge-open 被拒（workspace-bridge-error）→
+//                         bridge-open-refused 中止；
 //   4. designate       —— 操作员指称（--workspace 默认 Travel、--task-title 默认 hi）：
 //                         workspace 走唯一化阶梯（label 精确 → purpose=project →
 //                         activeWorkspaceKey）→ task 在解析出的 workspace 内**精确唯一**
 //                         匹配 title；不唯一/不命中一律中止（绝不按标题发送）；
 //                         映射只绑定当前连接代际；
 //   5. send（--send-authorized 显式解锁，缺省只打印 WOULD-send 即停）——
-//                         workspace-bridge-open{workspaceKey, taskId} → ready →
-//                         rpc-frame 通道 hello/clientHello →
+//                         workspace-bridge-open{workspaceKey, taskId} → ready → 等桥
+//                         Initialize → rpc-frame 通道 hello/clientHello →
 //                         subscribeConversationV4{workspacePath, workspaceIdentity?,
 //                         sessionId=<精确 taskId>}（订阅只为观察活动帧；官方发送只依赖
 //                         握手）→ sendConversationCommandV4（sendText，正文 = 唯一合成
 //                         marker `[tuvis-b2-marker:<UTC>]`，模型/模式全缺省=沿用会话现
 //                         值）→ 记录受理/完成/未知全生命周期（恰一个 rpc-frame，重复去
 //                         重，未知不重发）→ 主动 close。
+//   前置说明（源码裁决 @ 3c5b2276）：workspace-bridge-open **不要求目标 workspace 是
+//   APP 当前前台**（webRemoteControlManager.ts:1000-1054 只要求目标在当前桌面窗口里；
+//   bootstrap 的 mobileViewState.activeWorkspaceKey 只是手机页初始选区的导航默认，
+//   web-remote-control.ts:758-783）→ 无需先切前台；APP 若拒绝会回
+//   workspace-bridge-error，探针以 bridge-open-refused 中止并落 reason/error。
 //   证据：脱敏 transcript.json + run.md → ~/Documents/tuvis-verify-logs/zcode/
 //   macos-B2<UTC 时间戳>-<随机码>/（0700 目录 / 0600 文件；fail-closed）。
 //
@@ -66,16 +74,19 @@ import {
   AGENT_CLIENT_HELLO_METHOD,
   AGENT_HELLO_METHOD,
   RESPONSE_TYPE_EVENT_FIRE,
+  RESPONSE_TYPE_INITIALIZE,
   ControllerTaskIndexReader,
   RpcFrameAssembler,
   SendOnceLoop,
   SessionTargetMapper,
   SingleConnectionGate,
   V4_WIRE_PROTOCOL_VERSION,
+  classifyWorkspaceBridgeOpenResponse,
   decodeChannelMessage,
   dedupeWorkspaceEntries,
   encodeChannelRequest,
   encodeRpcFrame,
+  encodeRpcFrameAck,
   readActiveWorkspaceKeyFromListings,
   resolveDesignatedWorkspace,
   type BoundTarget,
@@ -114,11 +125,11 @@ export const PROBE_GUARDS = {
   maxSendFrames: 1,
   /**
    * connect→teardown 的声明性预算（ms；不是 wall-clock 强杀）：配对窗口 30s +
-   * 2×10s 只读查询 + [10s bridge-open + 10s subscribe + 8s 收帧窗 + 5s 退订]（任务
-   * 枚举）+ 10s bridge-open + 10s 握手/订阅 + 20s ACK 窗 + 30s 活动窗 ≈ 163s。
-   * OAuth 回调等待单独有界（--wait-ms）。时限由各阶段自有界承担。
+   * 2×10s 只读查询 + [10s bridge-open + 5s Initialize + 10s subscribe + 8s 收帧窗 +
+   * 5s 退订]（任务枚举）+ 10s bridge-open + 5s Initialize + 10s 握手/订阅 + 20s ACK 窗
+   * + 30s 活动窗 ≈ 173s。OAuth 回调等待单独有界（--wait-ms）。时限由各阶段自有界承担。
    */
-  maxDurationMs: 170_000,
+  maxDurationMs: 180_000,
   /** 凭据只经运行期输入（浏览器授权 / stdin），禁止写盘、禁止进环境变量与日志。 */
   credentialsInMemoryOnly: true,
 } as const;
@@ -138,6 +149,12 @@ const READ_QUERY_TIMEOUT_MS = 10_000;
 const CAPTURE_WINDOW_MS = 8_000;
 /** workspace-bridge-open 等待 ready 的有界窗口。 */
 const BRIDGE_OPEN_TIMEOUT_MS = 10_000;
+/**
+ * 桥 ChannelServer Initialize(200) 的有界等待窗（B2 实连 124743Z 修复）：官方
+ * ChannelClient 把所有请求排在 whenInitialized 之后（channelClient.ts:124-128），
+ * 桥 ChannelServer 构造即发 Initialize（channelServer.ts:29-36,45-47）。
+ */
+const BRIDGE_INIT_TIMEOUT_MS = 5_000;
 /** bridge RPC（hello/clientHello/subscribe）单请求有界窗口。 */
 const BRIDGE_RPC_TIMEOUT_MS = 10_000;
 /** 任务枚举的退订请求有界窗口（尽力而为；失败不影响结果）。 */
@@ -198,8 +215,10 @@ export const SESSION_PROBE_STEPS: readonly SessionProbeStep[] = [
     requires: "s4 进入 paired",
     detail:
       "白名单两个只读查询（双 listing 去重）+ workspace-bridge-open（taskId 缺省）打开读面桥" +
-      "后主动订阅 controller/tasks-index（EventListen + subscribeControllerV4，有界收帧窗）" +
-      "收任务行；产出 workspace 条目与 task 行（精确 taskId / workspacePath），全程脱敏落证。",
+      "（被拒 → bridge-open-refused 中止）后等桥 Initialize → 主动订阅 controller/tasks-index" +
+      "（EventListen + subscribeControllerV4，有界收帧窗）收任务行；收到的桥内消息按官方" +
+      "接收侧回 rpc-frame-ack；产出 workspace 条目与 task 行（精确 taskId / workspacePath），" +
+      "全程脱敏落证。",
   },
   {
     id: "s6-designate",
@@ -209,14 +228,16 @@ export const SESSION_PROBE_STEPS: readonly SessionProbeStep[] = [
       "workspace：label 精确匹配 → 多候选时优先 workspacePurpose=project → 仍多候选时优先 " +
       "APP 当前打开的 workspace（bootstrap activeWorkspaceKey）→ 仍不唯一即中止；" +
       "task：在解析出的 workspace 内按 title 精确唯一匹配；不唯一/不命中 → 中止" +
-      "（映射证据照常落盘）。发送授权用的是解析出的精确 id。",
+      "（映射证据照常落盘）。发送授权用的是解析出的精确 id。" +
+      "无需先把 APP 切到该 workspace 前台（源码裁决：bridge-open 不校验 activeWorkspaceKey）。",
   },
   {
     id: "s7-send",
     title: "单次发送（--send-authorized 显式解锁；缺省只打印 WOULD-send）",
     requires: "batch-1 授权（会话 hi 发送一条消息）+ --send-authorized",
     detail:
-      "workspace-bridge-open → ready → hello/clientHello → subscribe sessionId=<精确 taskId> → " +
+      "workspace-bridge-open → ready → 等桥 Initialize → hello/clientHello → " +
+      "subscribe sessionId=<精确 taskId> → " +
       "sendConversationCommandV4（sendText，正文 = [tuvis-b2-marker:<UTC>]，模型/模式缺省）→ " +
       "记录 accepted/completed/unknown 全生命周期；恰一个 rpc-frame；未知不重发。",
   },
@@ -349,6 +370,9 @@ function printHelp(): void {
   lines.push(
     "  · 探针连接可能踢掉你正在用的官方网页会话（同 role 单 owner），请在此时段不依赖网页端；"
   );
+  lines.push("  · 无需先把 APP 切到目标 workspace 前台（源码裁决：workspace-bridge-open 只要求");
+  lines.push("    目标 workspace 在当前桌面窗口里，不校验 activeWorkspaceKey）；APP 拒绝时探针以");
+  lines.push("    bridge-open-refused 中止并记录 APP 返回的 reason/error；");
   lines.push("  · 发送步只会向指定会话注入一条合成 marker 消息（内容仅含 UTC 时间戳），");
   lines.push("    不审批、不打断、不改模型；结果未知时绝不重发。");
   lines.push("");
@@ -408,17 +432,34 @@ class B2Channel {
   private readonly capture = new RpcFrameAssembler();
   /** 未经 request 匹配的入站 data payload（脱敏前原样持有在内存）。 */
   readonly unsolicited: unknown[] = [];
-  /** 被动组装完成的 Channel 消息文本（收帧窗内；含 tasks-index 等推送）。 */
+  /**
+   * 被动组装完成的 Channel 消息（收帧窗内；结构化记录 JSON——header 元数据 +
+     body 预览；B2 修复：不再存 lossy UTF-8 原文，二进制帧如 Initialize 不再变成
+     乱码证据）。
+   */
   readonly bridgeMessages: string[] = [];
   /** 收到的 rpc-frame 原始 payload（含 dataBase64；只落私有证据）。 */
   readonly rpcFramesSeen: unknown[] = [];
   /** 收到的 rpc-frame-ack 数（去重前）。 */
   rpcAckCount = 0;
+  /** 接收侧回执已发送数（rpc-frame-ack；官方 AcknowledgedRelayProtocol 同款）。 */
+  transportAcksSent = 0;
   /** 组装器判定的重复/故障计数。 */
   rpcDuplicateCount = 0;
   rpcFaultCount = 0;
   /** send 阶段钩子：每条入站 rpc-frame 转交 SendOnceLoop（onData 单槽的唯一出口）。 */
   onRpcFrame?: (payload: unknown) => void;
+  /** 桥 ChannelServer Initialize(200) 是否已观察到。 */
+  private initializeObserved = false;
+  private initializeWaiters: Array<(observed: boolean) => void> = [];
+  /**
+   * 接收侧回执状态：bridge-ready 后由调用方启用（B2Channel 是该连接 rpc-frame 的
+   * 唯一组装/回执点——枚举 reader 与 SendOnceLoop 都不重复回执，避免双份 ack）。
+   */
+  private transportAck: {
+    identity: RpcFrameIdentity;
+    sender: { sendData(payload: unknown): boolean };
+  } | null = null;
 
   constructor(options: { allowedTypes: readonly AppPayloadRequestType[] }) {
     this.allowedTypes = options.allowedTypes;
@@ -432,6 +473,42 @@ class B2Channel {
   detach(): void {
     if (this.attachedConn) this.attachedConn.onData = undefined;
     this.attachedConn = undefined;
+  }
+
+  /**
+   * 启用接收侧回执（官方接收侧对每条完整组装的入站消息回累计 rpc-frame-ack，
+   * ackRelayProtocol.ts:293-304；不回执 → 对端按重放期限反复重发（B2 实连 124743Z
+   * 的 3×Initialize）并最终把桥降级）。identity 必须 = workspace-bridge-open 请求
+   * 声明并被 ready 回显的字段（见 classifyWorkspaceBridgeOpenResponse 注）。
+   */
+  enableTransportAcks(args: {
+    identity: RpcFrameIdentity;
+    sender: { sendData(payload: unknown): boolean };
+  }): void {
+    this.transportAck = { identity: args.identity, sender: args.sender };
+  }
+
+  /**
+   * 有界等待桥 Initialize(200)（官方 ChannelClient 的 whenInitialized 门，
+   * channelClient.ts:124-128——Initialize 到达前不发任何 Channel 请求）。
+   * 超窗返回 false（结构性失败，由调用方中止）。
+   */
+  waitForBridgeInitialize(timeoutMs: number): Promise<boolean> {
+    if (this.initializeObserved) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      const waiter = (observed: boolean) => {
+        clearTimeout(timer);
+        resolve(observed);
+      };
+      const timer = setTimeout(
+        () => {
+          this.initializeWaiters = this.initializeWaiters.filter((entry) => entry !== waiter);
+          resolve(false);
+        },
+        Math.max(1, timeoutMs)
+      );
+      this.initializeWaiters.push(waiter);
+    });
   }
 
   /** mapping 白名单只读请求（bootstrap-request / workspace-list-request）。 */
@@ -554,8 +631,25 @@ class B2Channel {
         }
         if (event.kind === "incomplete") return;
         const decoded = decodeChannelMessage(event.bytes);
-        const rawJson = Buffer.from(event.bytes).toString("utf8");
-        if (this.bridgeMessages.length < 64) this.bridgeMessages.push(rawJson);
+        if (decoded && decoded.headerType === RESPONSE_TYPE_INITIALIZE) {
+          // 桥 ChannelServer 就绪信号（channelServer.ts:29-36,45-47）：解锁等待方。
+          if (!this.initializeObserved) {
+            this.initializeObserved = true;
+            const waiters = this.initializeWaiters.splice(0);
+            for (const waiter of waiters) waiter(true);
+          }
+        }
+        this.recordBridgeMessage(decoded, event.bytes);
+        // 接收侧回执（官方 ackRelayProtocol.ts:293-304：每条完整组装的入站消息回
+        // 累计 rpc-frame-ack；重复帧对齐 :289-291 的 lastCompleted 语义）。回执是
+        // 读面传输控制帧，不计入任何发送帧数。
+        if (this.transportAck) {
+          const ack = encodeRpcFrameAck({
+            identity: this.transportAck.identity,
+            ackMessageSeq: event.messageSeq,
+          });
+          if (this.transportAck.sender.sendData(ack)) this.transportAcksSent += 1;
+        }
         if (decoded && decoded.id !== null && this.pendingBridge.has(decoded.id)) {
           const resolve = this.pendingBridge.get(decoded.id);
           this.pendingBridge.delete(decoded.id);
@@ -578,6 +672,27 @@ class B2Channel {
       }
     }
     this.unsolicited.push(payload);
+  }
+
+  /**
+   * 桥 Channel 消息证据：结构化记录（header 元数据 + body 预览），超过上限丢弃。
+   * B2 修复：此前存 `Buffer→utf8` 的 lossy 原文，二进制帧（Initialize =
+   * `04 01 06 C8 01 00`，channelServer.ts:45-47）在证据里变成乱码、且因
+   * decodeChannelMessage 旧门（Array ≥ 2）解不出而完全不可读。
+   */
+  private recordBridgeMessage(decoded: DecodedChannelMessage | null, bytes: Uint8Array): void {
+    if (this.bridgeMessages.length >= 64) return;
+    const entry = {
+      kind: "channel-message",
+      bytes: bytes.byteLength,
+      headerType: decoded?.headerType ?? null,
+      id: decoded?.id ?? null,
+      channelName: decoded?.channelName ?? null,
+      method: decoded?.method ?? null,
+      initialize: decoded?.headerType === RESPONSE_TYPE_INITIALIZE,
+      bodyPreview: Buffer.from(bytes).toString("utf8").slice(0, 2048),
+    };
+    this.bridgeMessages.push(JSON.stringify(entry));
   }
 }
 
@@ -1171,12 +1286,14 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
       // workspace-bridge-open（taskId 可选，web-remote-control.ts:435-447，枚举期省略）
       // → 就绪身份 → channel "window-controller"（channels.ts:112；只在 workspace
       // bridge relay 通道发布，remoteServiceAccess.ts:181-185 + websocket.ts:102-108 +
-      // webRemoteControlWorkspaceBridgeSession.ts:39-74）上：EventListen(102)
-      // "onDynamicControllerFrame"（windowController.ts:78；proxy-channel.ts:126-127；
-      // channelClient.ts:150-177,179-194；官方先监听后订阅
+      // webRemoteControlWorkspaceBridgeSession.ts:39-74）上：等桥 Initialize(200)
+      // （官方 ChannelClient 的 whenInitialized 门，channelClient.ts:124-128）→
+      // EventListen(102) "onDynamicControllerFrame"（windowController.ts:78；
+      // proxy-channel.ts:126-127；channelClient.ts:150-177,179-194；官方先监听后订阅
       // windowControllerTaskListRegistry.ts:145,220-224）+ subscribeControllerV4
       // {topic:"controller/tasks-index", visibility:"foreground"}
-      // （windowController.ts:75；controller.ts:258-271；ack transport.ts:125-131 +
+      // （windowController.ts:75；controller.ts:258-271；registry 同款 visibility
+      // windowControllerTaskListRegistry.ts:219-232；ack transport.ts:125-131 +
       // controller.ts:273-274）→ 有界收帧窗收 snapshot/deltas 任务行（controller.ts
       // :251-256,155-164,187-191,93-123）。全部为读面控制帧，无会话发送帧。
       const enumBridgeSessionId = `b2-bridge-${crypto.randomUUID()}`;
@@ -1220,16 +1337,66 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         );
         return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
       }
-      const enumReady = extractBridgeReady(enumBridgeOpen.payload, enumBridgeSessionId);
+      // ready 应答分类（webRemoteControlManager.ts:1150-1192）：成功 = workspace-
+      // bridge-ready（无 success 字段）；拒绝 = workspace-bridge-error（reason/error）。
+      const enumOpenClass = classifyWorkspaceBridgeOpenResponse(enumBridgeOpen.payload);
+      if (enumOpenClass.kind !== "ready") {
+        mappingVerdict =
+          enumOpenClass.kind === "refused"
+            ? "ABORTED:bridge-open-refused"
+            : "ABORTED:bridge-open-unknown-shape";
+        record(ctx, "mapping", "tasks-bridge-open-refused", {
+          classification: enumOpenClass.kind,
+          reason:
+            enumOpenClass.kind === "refused" && enumOpenClass.reason !== null
+              ? redactor.sanitizeText(enumOpenClass.reason)
+              : null,
+          error:
+            enumOpenClass.kind === "refused" && enumOpenClass.error !== null
+              ? redactor.sanitizeText(enumOpenClass.error)
+              : null,
+          note: "APP 明确拒绝或应答形状不可解；ready 本身不携带 success 字段（web-remote-control.ts:449-456）",
+        });
+        log(`映射中止：workspace-bridge-open 被拒绝（${mappingVerdict}）（未发送任何写向）。`);
+        conn.close();
+        enumChannel.detach();
+        channel.detach();
+        gate.release();
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      // 帧身份 = ready 回显（只含请求声明过的字段）；绝不虚构默认值——APP 接收侧
+      // rawIdentityMatches 严格相等（含 undefined，ackRelayTypes.ts:65-76），多余字段
+      // 会被静默丢帧且不回 ack（B2 实连 124743Z subscribe-timeout 根因）。
+      const enumReady = {
+        identity: enumOpenClass.identity,
+        bridgeSessionId: enumOpenClass.bridgeSessionId,
+        bridgeKind: enumOpenClass.bridgeKind,
+      };
       redactor.register("sid", enumReady.bridgeSessionId);
       record(ctx, "mapping", "tasks-bridge-ready", {
         bridgeSessionId: enumReady.bridgeSessionId,
-        bridgeGeneration: enumReady.bridgeGeneration,
+        bridgeGeneration: enumReady.identity.bridgeGeneration ?? null,
+        bridgeKind: enumReady.bridgeKind,
       });
+      // 接收侧回执启用（ackRelayProtocol.ts:293-304）：不回执 → 对端反复重放并最终
+      // 降级桥（B2 实连 124743Z 的 3×Initialize 即未回执的重放）。
+      enumChannel.enableTransportAcks({ identity: enumReady.identity, sender: conn });
       const reader = new ControllerTaskIndexReader({
         sender: conn,
         identity: enumReady.identity,
         timeouts: {
+          initializeMs: BRIDGE_INIT_TIMEOUT_MS,
           subscribeMs: BRIDGE_RPC_TIMEOUT_MS,
           windowMs: CAPTURE_WINDOW_MS,
           unsubscribeMs: TASK_ENUM_UNSUBSCRIBE_TIMEOUT_MS,
@@ -1276,8 +1443,9 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         );
         return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
       }
-      // 任务行 = 主动枚举产物 + mapping 通道被动桥帧兜底（同键去重；两者都来自
-      // 真实帧的结构化收割）。
+      // 任务行 = 主动枚举产物 + mapping 通道被动桥帧兜底（同键去重；枚举行是权威，
+      // 兜底只收割恰好以纯 JSON 形态出现在被动消息里的任务行——桥内 Channel 消息是
+      // 二进制序列化，证据以结构化记录存储，不会贡献任务行）。
       const passiveRows: TaskListingRow[] = [];
       for (const message of channel.bridgeMessages) {
         try {
@@ -1406,8 +1574,8 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         const marker = `[tuvis-b2-marker:${new Date().toISOString()}]`;
         sendSummary.wouldSend = {
           chain:
-            "workspace-bridge-open{workspaceKey,taskId} → ready → rpc-frame 通道 " +
-            "helloConversationV4 → initializeConversationV4(clientHello) → " +
+            "workspace-bridge-open{workspaceKey,taskId} → ready → 等桥 Initialize → " +
+            "rpc-frame 通道 helloConversationV4 → initializeConversationV4(clientHello) → " +
             "subscribeConversationV4{workspacePath, workspaceIdentity?, sessionId} → " +
             "sendConversationCommandV4{workspacePath, workspaceIdentity?, envelope}",
           envelope: {
@@ -1451,8 +1619,9 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
       // workspace-bridge-open 形状钉源 @ 3c5b2276：
       // WebRemoteControlWorkspaceBridgeOpenPayload{requestId, bridgeSessionId,
       // bridgeGeneration?, recoveryId?, workspaceKey, taskId?}（packages/shared/src/
-      // web-remote-control.ts:435-447）；ready 回显同文件 :449-456；
-      // workspaceKey = workspaceIdentity?.trim() || workspacePath（同文件 :743-747）。
+      // web-remote-control.ts:435-447）；本请求不带 generation/recoveryId → ready 回显
+      // 与后续 rpc-frame 身份同样缺席（manager.ts:1156-1165 只回显请求里存在的字段；
+      // APP 接收侧严格相等判帧身份，ackRelayTypes.ts:65-76）。
       const bridgeOpen = await sendChannel.openWorkspaceBridge(
         conn,
         {
@@ -1484,31 +1653,85 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         );
         return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
       }
-      const readyPayload = bridgeOpen.payload as {
-        bridgeSessionId?: unknown;
-        bridgeGeneration?: unknown;
-        bridge?: { bridgeSessionId?: unknown; bridgeGeneration?: unknown; kind?: unknown };
-      };
-      const readyBridge = readyPayload.bridge;
-      const resolvedBridgeSessionId =
-        (typeof readyBridge?.bridgeSessionId === "string" && readyBridge.bridgeSessionId) ||
-        (typeof readyPayload.bridgeSessionId === "string" && readyPayload.bridgeSessionId) ||
-        bridgeSessionId;
-      const bridgeGeneration =
-        (typeof readyBridge?.bridgeGeneration === "number" && readyBridge.bridgeGeneration) ||
-        (typeof readyPayload.bridgeGeneration === "number" && readyPayload.bridgeGeneration) ||
-        CONNECTION_GENERATION;
-      const identity: RpcFrameIdentity = {
-        bridgeSessionId: resolvedBridgeSessionId,
-        bridgeGeneration,
-      };
+      // ready 分类：拒绝（workspace-bridge-error，manager.ts:1175-1191）或形状不可解
+      // → 带脱敏 reason/error 的独立中止 verdict；绝不带着可疑身份进入发送链。
+      const sendOpenClass = classifyWorkspaceBridgeOpenResponse(bridgeOpen.payload);
+      if (sendOpenClass.kind !== "ready") {
+        sendVerdict =
+          sendOpenClass.kind === "refused"
+            ? "STOPPED:bridge-open-refused"
+            : "STOPPED:bridge-open-unknown-shape";
+        record(ctx, "send", "workspace-bridge-open-refused", {
+          classification: sendOpenClass.kind,
+          reason:
+            sendOpenClass.kind === "refused" && sendOpenClass.reason !== null
+              ? redactor.sanitizeText(sendOpenClass.reason)
+              : null,
+          error:
+            sendOpenClass.kind === "refused" && sendOpenClass.error !== null
+              ? redactor.sanitizeText(sendOpenClass.error)
+              : null,
+          note: "APP 明确拒绝或应答形状不可解；ready 本身不携带 success 字段（web-remote-control.ts:449-456）",
+        });
+        log(`send 停止：workspace-bridge-open 被拒绝（${sendVerdict}），未发送任何会话帧。`);
+        conn.close();
+        sendChannel.detach();
+        channel.detach();
+        gate.release();
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      const identity: RpcFrameIdentity = sendOpenClass.identity;
+      const resolvedBridgeSessionId = sendOpenClass.bridgeSessionId;
       redactor.register("sid", resolvedBridgeSessionId);
       record(ctx, "send", "workspace-bridge-ready", {
         bridgeSessionId: resolvedBridgeSessionId,
-        bridgeGeneration,
-        kind: typeof readyBridge?.kind === "string" ? readyBridge.kind : null,
+        bridgeGeneration: identity.bridgeGeneration ?? null,
+        kind: sendOpenClass.bridgeKind,
       });
-      log(`workspace bridge 已就绪（bridgeGeneration=${bridgeGeneration}）。`);
+      log("workspace bridge 已就绪。");
+      // 接收侧回执 + Initialize 门（B2 实连 124743Z 修复）：官方 ChannelClient 把
+      // hello 等一切请求排在 whenInitialized 之后（channelClient.ts:124-128）；
+      // 不回执 → 对端重放并最终降级桥（ackRelayProtocol.ts:293-304 + replay 期限）。
+      sendChannel.enableTransportAcks({ identity, sender: conn });
+      const bridgeInitialized = await sendChannel.waitForBridgeInitialize(BRIDGE_INIT_TIMEOUT_MS);
+      record(ctx, "send", "bridge-initialize", {
+        observed: bridgeInitialized,
+        transportAcksSent: sendChannel.transportAcksSent,
+      });
+      if (!bridgeInitialized) {
+        sendVerdict = "STOPPED:bridge-init-timeout";
+        log("send 停止：桥 Initialize 未在窗口内到达（channelClient.ts:124-128 门），不发送。");
+        conn.close();
+        sendChannel.detach();
+        channel.detach();
+        gate.release();
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      log(
+        `workspace bridge Initialize 已到（transportAcksSent=${sendChannel.transportAcksSent}）。`
+      );
 
       const clientId = `tuvis-b2-probe-${crypto.randomBytes(4).toString("hex")}`;
       let bridgeSeq = 0;
@@ -1781,45 +2004,21 @@ async function teardownSend(
 }
 
 /**
- * 从 workspace-bridge-open ready 回显提取 rpc 帧身份。形状钉源 @ 3c5b2276：
- * ready 回显 {requestId, bridgeSessionId, bridgeGeneration?, recoveryId?,
- * bridge?{bridgeSessionId, bridgeGeneration, kind}}
- * （packages/shared/src/web-remote-control.ts:449-456）。提取逻辑与 send 阶段
- * 同款；独立实现以保持发送路径零改动。
+ * app payload 应答摘要（证据只落 sanitized 形态）。success 三态：
+ * true / false / null（缺席）——workspace-bridge-ready **不携带 success 字段**
+ * （web-remote-control.ts:449-456；manager.ts:1156-1165），旧实现
+ * `success: payload.success === true` 曾把 ready 误报成 success:false
+ * （B2 实连 macos-B220261024T124743Z 的假「failure」）。
  */
-function extractBridgeReady(
-  payload: Record<string, unknown>,
-  fallbackBridgeSessionId: string
-): { identity: RpcFrameIdentity; bridgeSessionId: string; bridgeGeneration: number } {
-  const ready = payload as {
-    bridgeSessionId?: unknown;
-    bridgeGeneration?: unknown;
-    bridge?: { bridgeSessionId?: unknown; bridgeGeneration?: unknown };
-  };
-  const bridge = ready.bridge;
-  const bridgeSessionId =
-    (typeof bridge?.bridgeSessionId === "string" && bridge.bridgeSessionId) ||
-    (typeof ready.bridgeSessionId === "string" && ready.bridgeSessionId) ||
-    fallbackBridgeSessionId;
-  const bridgeGeneration =
-    (typeof bridge?.bridgeGeneration === "number" && bridge.bridgeGeneration) ||
-    (typeof ready.bridgeGeneration === "number" && ready.bridgeGeneration) ||
-    CONNECTION_GENERATION;
-  return {
-    identity: { bridgeSessionId, bridgeGeneration },
-    bridgeSessionId,
-    bridgeGeneration,
-  };
-}
-
 function summarizePayload(outcome: AppPayloadOutcome): Record<string, unknown> {
   if (outcome.kind !== "ok") return { outcome: outcome.kind };
   const payload = outcome.payload;
   return {
     outcome: "ok",
     zcode_type: typeof payload.zcode_type === "string" ? payload.zcode_type : null,
-    success: payload.success === true,
+    success: payload.success === true ? true : payload.success === false ? false : null,
     error: typeof payload.error === "string" ? payload.error : null,
+    reason: typeof payload.reason === "string" ? payload.reason : null,
     payload: payload,
   };
 }
@@ -1846,6 +2045,7 @@ function recordChannelEvidence(ctx: RunContext, label: string, channel: B2Channe
   record(ctx, label, "rpc-frame-counts", {
     seen: channel.rpcFramesSeen.length,
     ack: channel.rpcAckCount,
+    acksSent: channel.transportAcksSent,
     duplicate: channel.rpcDuplicateCount,
     fault: channel.rpcFaultCount,
   });
