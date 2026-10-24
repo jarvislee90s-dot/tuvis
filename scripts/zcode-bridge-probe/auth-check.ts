@@ -43,6 +43,7 @@ import {
   buildZaiAuthorizeUrl,
   exchangeCodeForToken,
   generateOAuthState,
+  type LoopbackCallback,
 } from "./oauthFlow.ts";
 import { RELAY_WS_PATH, RelayTerminalConnection, requestTerminalToken } from "./relayAuth.ts";
 import {
@@ -70,6 +71,9 @@ export const PROBE_GUARDS = {
   /**
    * connect 阶段硬预算（ms）：配对窗口 30s（官方同款 relayAuth.OFFICIAL_PAIR_WINDOW_MS）
    * + 2×10s 只读查询 = 50s < 60s。OAuth 回调等待单独有界（--wait-ms，默认 300s）。
+   * 注意：这是**声明性预算，不是强制计时器**——本字段不设 wall-clock 强杀，探针整体
+   * 不按它中断；时限由各阶段自有界承担（waitCallback / READ_QUERY_TIMEOUT_MS /
+   * RELAY_HTTP_TIMEOUT_MS / relayAuth 配对窗口）。
    */
   maxDurationMs: 60_000,
   /** 凭据只经运行期输入（浏览器授权 / stdin），禁止写盘、禁止进环境变量与日志。 */
@@ -222,6 +226,9 @@ function printHelp(): void {
   lines.push(
     "  --sid=<device_sid>        跳过 DB 读取，直接指定 device_sid（origin 取官方默认）。"
   );
+  lines.push(
+    "                            注意：命令行参数在本机 ps 进程列表里可见，建议优先走默认 DB 路径。"
+  );
   lines.push(`  --db=<path>               settings 库路径（默认 ${DEFAULT_DB_PATH}，只读打开）。`);
   lines.push("  --help                    打印本帮助。");
   lines.push("");
@@ -310,8 +317,31 @@ const SENSITIVE_STRING_FIELDS: Array<{
   { key: "wsUrl", kind: "link" },
 ];
 
-/** 就地登记 payload 内敏感字段并为脱敏副本返回同结构对象（值已别名化）。 */
-function redactPayload(redactor: SecretRedactor, payload: unknown): unknown {
+/**
+ * 键名正则网（exact 名单之外的兜底，评审 Important）：入站推送帧/只读响应里的键名
+ * 若未命中 exact 名单但命中本网，一律按敏感处理（宁过勿漏）——评审示例
+ * `sessionId`（session）/ `access_token`（token）由此覆盖，`secret`/`jwt`/`url`/`path`
+ * 同网。合法非敏感键（platform / client_ts / zcode_type / requestId / success …）
+ * 均不命中本网，照常透传。命中键的字符串值经 register 登记别名，assertClean 对
+ * 登记值 fail-closed（真实值再入证据即拒写）。
+ */
+const SENSITIVE_KEY_NET = /(?:sid|session|token|secret|jwt|url|path)/i;
+
+/** 正则网命中键 → 别名类别（推断序固定：先凭据类后位置类；余下一律按 sid）。 */
+function netSecretKind(key: string): Parameters<SecretRedactor["register"]>[0] {
+  if (/jwt/i.test(key)) return "jwt";
+  if (/token|secret/i.test(key)) return "relay-token";
+  if (/url/i.test(key)) return "link";
+  if (/path/i.test(key)) return "path";
+  return "sid";
+}
+
+/**
+ * 就地登记 payload 内敏感字段并为脱敏副本返回同结构对象（值已别名化）：
+ * 先按 exact 名单（键名精确命中，类别显式），再按 SENSITIVE_KEY_NET 兜底。
+ * 仅字符串值参与登记（数字/布尔等非凭据形态原样透传）。
+ */
+export function redactPayload(redactor: SecretRedactor, payload: unknown): unknown {
   const walk = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(walk);
     if (!value || typeof value !== "object") return value;
@@ -320,6 +350,10 @@ function redactPayload(redactor: SecretRedactor, payload: unknown): unknown {
       const field = SENSITIVE_STRING_FIELDS.find((candidate) => candidate.key === key);
       if (field && typeof item === "string" && item) {
         out[key] = redactor.register(field.kind, item);
+        continue;
+      }
+      if (!field && typeof item === "string" && item && SENSITIVE_KEY_NET.test(key)) {
+        out[key] = redactor.register(netSecretKind(key), item);
         continue;
       }
       out[key] = walk(item);
@@ -406,29 +440,36 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
     const state = generateOAuthState();
     redactor.register("state", state);
     const server = await LoopbackCallbackServer.start();
-    const redirectUri = server.redirectUri;
-    const authorizeUrl = buildZaiAuthorizeUrl({ redirectUri, state });
-    // 完整授权 URL 也登记为 link 类：任何意外把它带进证据都会被别名化。
-    redactor.register("link", authorizeUrl);
-    oauthSummary.redirect = { host: "127.0.0.1", port: server.port, path: "/callback" };
-    oauthSummary.state = redactor.register("state", state);
-    record("probe-oauth", "listening", {
-      redirectHost: "127.0.0.1",
-      redirectPort: server.port,
-      state: "STATE_1",
-    });
-    log("请在浏览器打开下面的官方授权 URL，并用你的 ZCode 账号完成授权（探针绝不代登）：");
-    log(`  ${authorizeUrl}`);
-    if (parsed.open) {
-      log(
-        openInBrowser(authorizeUrl)
-          ? "已请求系统默认浏览器打开该 URL（--open）。"
-          : "--open 打开浏览器失败，请手动复制上面的 URL。"
-      );
+    // 监听器生命周期受 try/finally 保护（评审 Minor）：URL 构造/打印/等待回调中途抛错
+    // 也必须 close()，绝不让回环监听器留在事件循环里挂着（进程无法退出）。
+    let callback: LoopbackCallback;
+    let redirectUri: string;
+    try {
+      redirectUri = server.redirectUri;
+      const authorizeUrl = buildZaiAuthorizeUrl({ redirectUri, state });
+      // 完整授权 URL 也登记为 link 类：任何意外把它带进证据都会被别名化。
+      redactor.register("link", authorizeUrl);
+      oauthSummary.redirect = { host: "127.0.0.1", port: server.port, path: "/callback" };
+      oauthSummary.state = redactor.register("state", state);
+      record("probe-oauth", "listening", {
+        redirectHost: "127.0.0.1",
+        redirectPort: server.port,
+        state: "STATE_1",
+      });
+      log("请在浏览器打开下面的官方授权 URL，并用你的 ZCode 账号完成授权（探针绝不代登）：");
+      log(`  ${authorizeUrl}`);
+      if (parsed.open) {
+        log(
+          openInBrowser(authorizeUrl)
+            ? "已请求系统默认浏览器打开该 URL（--open）。"
+            : "--open 打开浏览器失败，请手动复制上面的 URL。"
+        );
+      }
+      log(`等待回环回调（有界 ${parsed.oauthWaitMs} ms）……`);
+      callback = await server.waitCallback(state, parsed.oauthWaitMs);
+    } finally {
+      await server.close();
     }
-    log(`等待回环回调（有界 ${parsed.oauthWaitMs} ms）……`);
-    const callback = await server.waitCallback(state, parsed.oauthWaitMs);
-    await server.close();
     record("probe-oauth", "wait-finished", {
       kind: callback.kind,
       ignored: server.ignoredRequests,

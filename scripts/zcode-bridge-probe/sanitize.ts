@@ -158,7 +158,8 @@ export function createEvidenceRunDir(baseDir: string = defaultEvidenceBase()): E
     .slice(0, 6);
   const runId = `macos-B1${stamp}-${rand || "r00000"}`;
   const dir = path.join(baseDir, runId);
-  fs.mkdirSync(dir, { recursive: true });
+  // owner-only 0700（评审 Minor）：证据运行目录与其中 0600 文件同权限口径，不让同机其他用户读。
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   return { dir, runId };
 }
 

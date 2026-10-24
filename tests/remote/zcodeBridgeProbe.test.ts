@@ -42,6 +42,7 @@ afterAll(() => {
 });
 
 import { parseOfficialLink } from "../../scripts/zcode-bridge-probe/officialLink";
+import { redactPayload } from "../../scripts/zcode-bridge-probe/auth-check";
 import {
   OFFICIAL_OAUTH_CLIENT_ID,
   LoopbackCallbackServer,
@@ -336,6 +337,57 @@ describe("zcode 官方桥接探针：客户端可测逻辑（B1 实连半场）"
     expect(() => redactor.assertClean("clean: SID_A / TOK_1", "unit")).not.toThrow();
   });
 
+  it("脱敏正则网：exact 名单外的敏感形键一律别名化且 fail-closed；非敏感键照常透传", () => {
+    const redactor = new SecretRedactor();
+    // 模拟入站推送帧：含评审示例的假设键（sessionId / access_token）与 net 其余分支。
+    const frame = {
+      type: "data",
+      client_ts: 1_760_000_000_000,
+      payload: {
+        platform: "darwin",
+        requestId: "b1-net-1",
+        sessionId: "b1-fake-session-777",
+        access_token: "b1-fake-access-token-777",
+        account_jwt: "b1-fake-jwt-777.a.b",
+        client_secret: "b1-fake-secret-777",
+        callback_url: "https://zcode.z.ai/remote/v4?sid=b1-fake-sid-0001",
+        config_path: "/Users/x/project",
+        keepPlain: "plain-value",
+      },
+    };
+    const out = redactPayload(redactor, frame) as typeof frame;
+    const inner = out.payload as Record<string, unknown>;
+    // 合法非敏感键照常透传（评审要求）。
+    expect(out.type).toBe("data");
+    expect(out.client_ts).toBe(1_760_000_000_000);
+    expect(inner.platform).toBe("darwin");
+    expect(inner.requestId).toBe("b1-net-1");
+    expect(inner.keepPlain).toBe("plain-value");
+    // 正则网命中键一律别名化（宁过勿漏）。
+    expect(inner.sessionId).toMatch(/^SID_[A-Z]$/);
+    expect(inner.access_token).toBe("TOK_1");
+    expect(inner.client_secret).toBe("TOK_2");
+    expect(inner.account_jwt).toBe("JWT_1");
+    expect(inner.callback_url).toMatch(/^LINK_\d+$/);
+    expect(inner.config_path).toMatch(/^PATH_\d+$/);
+    // 序列化形态不再含任何 raw 值；assertClean 对登记值 fail-closed。
+    const serialized = JSON.stringify(out);
+    for (const raw of [
+      "b1-fake-session-777",
+      "b1-fake-access-token-777",
+      "b1-fake-jwt-777.a.b",
+      "b1-fake-secret-777",
+      "b1-fake-sid-0001",
+      "/Users/x/project",
+    ]) {
+      expect(serialized).not.toContain(raw);
+    }
+    expect(() => redactor.assertClean(serialized, "unit")).not.toThrow();
+    expect(() =>
+      redactor.assertClean("raw access_token=b1-fake-access-token-777", "unit")
+    ).toThrow();
+  });
+
   it("证据落盘 fail-closed：含密内容拒写且不产生文件；干净内容以 0600 落盘", () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "b1-evidence-"));
     try {
@@ -344,6 +396,8 @@ describe("zcode 官方桥接探针：客户端可测逻辑（B1 实连半场）"
       redactor.register("jwt", secret);
       const run = createEvidenceRunDir(base);
       expect(fs.existsSync(run.dir)).toBe(true);
+      // 私有证据运行目录权限收紧为 owner-only（评审 Minor：mkdir 带 mode 0700）。
+      expect(fs.statSync(run.dir).mode & 0o777).toBe(0o700);
 
       expect(() =>
         writeEvidenceFiles(redactor, run.dir, [
