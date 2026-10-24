@@ -17,7 +17,7 @@
 
 [功能概览](#功能概览) · [能力矩阵](#能力矩阵) · [快速开始](#快速开始) · [路线图](#路线图) · [社区](#社区)
 
-<img src="docs/images/dashboard-main.png" width="820" alt="兔维斯看板——八个 AI 编程工具的实时红绿灯会话看板" />
+<img src="docs/images/product-forms-zh.png" width="820" alt="兔维斯产品形态——一块桌面看板与一部手机，指挥台的两种形态，红绿灯同源联动" />
 
 <b>现已适配 iPhone Duo.</b>
 
