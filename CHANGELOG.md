@@ -39,8 +39,6 @@
   离开该区块、切换设置大块或窗口失焦自动恢复遮罩——只影响显示，不改变密码值、存储
   与配对行为。
 
-### Fixed
-
 - **仓库默认 README 切为英文**：`README.md` 改为英文版（原 `README.en.md` 内容迁入），
   中文主笔版迁移至 `README.zh-CN.md`，两份顶部互设语言切换链接；`AGENTS.md` 双语资产表、
   结构树与文档锁 `usage-partial-coverage-lock` 的 README 判据同步更新。

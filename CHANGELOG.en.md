@@ -57,8 +57,6 @@ _Only versions translated so far are listed here; the full history lives in the
   the window losing focus restores the mask automatically — display only; the PIN value,
   storage and pairing are unaffected.
 
-### Fixed
-
 - **Default README switched to English**: `README.md` is now the English version
   (content moved in from `README.en.md`); the Chinese source-of-truth moved to
   `README.zh-CN.md`, with language-switcher links at the top of both files. The
