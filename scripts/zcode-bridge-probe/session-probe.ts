@@ -72,12 +72,12 @@ import {
   INTERACTION_COMMAND_TYPES,
   InteractionCommandLoop,
   PendingBook,
-  STOP_GUARD_NOOP_REASON,
   authorizePendingResolution,
   buildPermissionAnswer,
   buildStopPayload,
   buildUserInputAnswer,
   PERMISSION_FULL_ACCESS_OPTION_ID,
+  planInteractionCommands,
   type InteractionCommandType,
   type ObservedPending,
   type UserInputAnswerEntry,
@@ -184,6 +184,60 @@ const SEND_ACTIVITY_TIMEOUT_MS = 30_000;
 const INTERACTION_PENDING_WAIT_MS = 30_000;
 /** interrupt 模式下等待 control.activeWorks.foregroundExecutionId 的有界窗。 */
 const INTERACTION_FOREGROUND_WAIT_MS = 30_000;
+
+/**
+ * 按运行模式派生的安全闸（I5）：B3 交互 run 实际会发 2 个命令帧（触发 + 应答/stop），
+ * 若沿用 B2 的 maxSendFrames:1 与 sendRequiresExplicitFlag，证据里的闸与实际行为不符。
+ * 交互模式额外允许最多 1 个 autoResolution snooze 前置帧（I4；仅当卡上
+ * autoResolution 在场，见 interaction.snooze 证据），总命令帧 ≤3。
+ * 时长预算：B2 链 180s + 触发 ACK 20s + 观察窗 30s + 应答 ACK 20s = 250s。
+ */
+export type ProbeGuardSet = {
+  readonly singleConnection: true;
+  readonly reconnectPolicy: "never";
+  readonly stopOnKicked: true;
+  readonly mappingReadonly: true;
+  readonly sendRequiresExplicitFlag: boolean;
+  readonly interactionRequiresExplicitFlag: boolean;
+  readonly maxSendFrames: number;
+  readonly maxSnoozeFrames: number;
+  readonly maxDurationMs: number;
+  readonly credentialsInMemoryOnly: true;
+};
+
+export function deriveProbeGuards(mode: InteractionMode | null): ProbeGuardSet {
+  if (mode === null) {
+    return {
+      singleConnection: PROBE_GUARDS.singleConnection,
+      reconnectPolicy: PROBE_GUARDS.reconnectPolicy,
+      stopOnKicked: PROBE_GUARDS.stopOnKicked,
+      mappingReadonly: PROBE_GUARDS.mappingReadonly,
+      sendRequiresExplicitFlag: PROBE_GUARDS.sendRequiresExplicitFlag,
+      interactionRequiresExplicitFlag: false,
+      maxSendFrames: PROBE_GUARDS.maxSendFrames,
+      maxSnoozeFrames: 0,
+      maxDurationMs: PROBE_GUARDS.maxDurationMs,
+      credentialsInMemoryOnly: PROBE_GUARDS.credentialsInMemoryOnly,
+    };
+  }
+  return {
+    singleConnection: PROBE_GUARDS.singleConnection,
+    reconnectPolicy: PROBE_GUARDS.reconnectPolicy,
+    stopOnKicked: PROBE_GUARDS.stopOnKicked,
+    mappingReadonly: PROBE_GUARDS.mappingReadonly,
+    // 交互模式由 --interaction-authorized 解锁；--send-authorized 不参与交互链。
+    sendRequiresExplicitFlag: false,
+    interactionRequiresExplicitFlag: true,
+    maxSendFrames: 2,
+    maxSnoozeFrames: 1,
+    maxDurationMs:
+      PROBE_GUARDS.maxDurationMs +
+      SEND_ACK_TIMEOUT_MS +
+      INTERACTION_PENDING_WAIT_MS +
+      SEND_ACK_TIMEOUT_MS,
+    credentialsInMemoryOnly: PROBE_GUARDS.credentialsInMemoryOnly,
+  };
+}
 /** 交互半场指令的关键词前缀（合成 marker，正文只含 UTC 时间戳与随机短码）。 */
 const INTERACTION_MARKER_PREFIX = "[tuvis-b3-probe:";
 /** JWT 形状闸：三段 base64url（只判形，不解码不校验签名）。 */
@@ -918,60 +972,93 @@ function buildInteractionInstruction(mode: InteractionMode): string {
   }
 }
 
-/** 从 pending 原始 payload 里收集所有字符串 optionId（深度遍历；只读不改写）。 */
-function collectOptionIds(payload: Record<string, unknown>): string[] {
+/**
+ * 权限卡选项 id 收集：**只**读 payload.options（snapshot.ts:235-262
+ * permissionRequestPayloadSchema.options 是唯一选项面），不再对整份 payload 做深度
+ * 扫描——深度扫描会把 detail/display 里的同名字符串误当选项（I3）。
+ */
+export function collectOptionIdsFromOptions(options: unknown): string[] {
+  if (!Array.isArray(options)) return [];
   const found: string[] = [];
-  const visit = (value: unknown): void => {
-    if (Array.isArray(value)) {
-      for (const item of value) visit(item);
-      return;
-    }
-    if (!value || typeof value !== "object") return;
-    const record = value as Record<string, unknown>;
+  for (const option of options) {
+    if (!option || typeof option !== "object") continue;
+    const record = option as { optionId?: unknown };
     if (typeof record.optionId === "string" && record.optionId.length > 0) {
       found.push(record.optionId);
     }
-    for (const item of Object.values(record)) visit(item);
-  };
-  visit(payload);
+  }
   return [...new Set(found)];
 }
 
 /**
- * 权限卡选项选择：只从卡上原值里挑（approve→allow/accept/once 族；
- * reject→deny/decline/reject 族），fullAccess 特权项在客户端硬闸排除；
- * 无匹配 = null（调用方如实记 UNAVAILABLE，不猜 optionId）。
+ * 权限卡"常驻授权"判定：snapshot.ts:235-240 permissionOptionSchema.kind 闭集 =
+ * allowOnce | allowAlways | deny | custom；allowAlways 是常驻授权，探针绝不选。
+ * fullAccess 另由 optionId 硬闸（snapshot.ts:234 + buildPermissionAnswer 断言）。
  */
-function pickPermissionOption(pending: ObservedPending, mode: "approve" | "reject"): string | null {
-  const candidates = collectOptionIds(pending.payload).filter(
-    (id) => id !== PERMISSION_FULL_ACCESS_OPTION_ID
-  );
-  const prefer =
-    mode === "approve"
-      ? ["allow", "approve", "accept", "once", "yes", "confirm"]
-      : ["deny", "reject", "decline", "refuse", "no", "cancel"];
-  let best: string | null = null;
-  let bestScore = 0;
-  for (const id of candidates) {
-    const lower = id.toLowerCase();
-    const score = prefer.reduce(
-      (acc, keyword, index) =>
-        lower.includes(keyword) ? Math.max(acc, prefer.length - index) : acc,
-      0
-    );
-    if (score > bestScore) {
-      best = id;
-      bestScore = score;
-    }
-  }
-  return bestScore > 0 ? best : null;
+export function isStandingPermissionGrant(kind: unknown): boolean {
+  return kind === "allowAlways";
 }
 
 /**
- * 问答卡应答条目：题干全文 + 首个选项 value（原值回传）。形状不可解 = null
+ * 权限卡选项选择（I3）：只从卡上 payload.options 的显式 optionId 里挑——
+ *   approve → kind === "allowOnce"（一次性放行；常驻授权 allowAlways / custom 一律不选）；
+ *   reject  → kind === "deny"；
+ * fullAccess 特权项（optionId = "fullAccess"，snapshot.ts:234）无论 kind 都硬闸排除。
+ * 没有唯一明确的 once/deny 项 → null（调用方记 UNAVAILABLE:permission-option-unresolved，
+ * 绝不按字符串相似度猜 optionId）。
+ */
+export function pickPermissionOption(
+  pending: ObservedPending,
+  mode: "approve" | "reject"
+): string | null {
+  const options = (pending.payload as { options?: unknown }).options;
+  if (!Array.isArray(options)) return null;
+  const wantedKind = mode === "approve" ? "allowOnce" : "deny";
+  for (const option of options) {
+    if (!option || typeof option !== "object") continue;
+    const record = option as { optionId?: unknown; kind?: unknown };
+    if (typeof record.optionId !== "string" || record.optionId.length === 0) continue;
+    if (record.optionId === PERMISSION_FULL_ACCESS_OPTION_ID) continue;
+    if (isStandingPermissionGrant(record.kind)) continue;
+    if (record.kind !== wantedKind) continue;
+    return record.optionId;
+  }
+  return null;
+}
+
+/**
+ * 问答卡可答性（C2）：只有 AskUserQuestion 投影出的 userInput 卡才可进入 answer 链。
+ * 判别式（product-projection.ts @ 3c5b2276）：
+ *   - AskUserQuestion：permission_requested → kind:"userInput" 且
+ *     payload.toolName === "AskUserQuestion"（:3391-3409；isAskUserQuestionToolName
+ *     :5793-5795）；
+ *   - ExitPlanMode 计划审批**同样**投影成 kind:"userInput"（:3440-3459，
+ *     schema.interaction = "plan_approval"，question = reason，options[0].value =
+ *     "approve"）——它不是问答，绝不能当问答应答；
+ *   - MCP elicitation 也是 userInput（:3411-3438，schema.interaction =
+ *     MCP_ELICITATION_INTERACTION）；无可识别工具的卡一律不支持。
+ */
+export function isAnswerableUserInput(pending: ObservedPending): boolean {
+  if (pending.kind !== "userInput") return false;
+  const payload = pending.payload;
+  if (payload.toolName !== "AskUserQuestion") return false;
+  const schema = payload.schema;
+  if (
+    schema &&
+    typeof schema === "object" &&
+    (schema as { interaction?: unknown }).interaction === "plan_approval"
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 问答卡应答条目：题干全文 + 首个选项 value（原值回传）。调用方须先过
+ * isAnswerableUserInput（否则 plan approval 也可被当成问答）。形状不可解 = null
  * （调用方记 UNAVAILABLE:answer-shape-unresolved，绝不虚构题干/选项）。
  */
-function pickUserInputEntries(pending: ObservedPending): UserInputAnswerEntry[] | null {
+export function pickUserInputEntries(pending: ObservedPending): UserInputAnswerEntry[] | null {
   const questions = (pending.payload as { questions?: unknown }).questions;
   if (!Array.isArray(questions) || questions.length === 0) return null;
   const entries: UserInputAnswerEntry[] = [];
@@ -2108,10 +2195,14 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           sessionId: bound.taskId,
           generation: CONNECTION_GENERATION,
         });
-        let activeLoop: InteractionCommandLoop | null = null;
+        // 单一入站帧汇（C1）：trigger 运行期间也必须收到 rpc-frame-ack / CommandAck，
+        // 否则 trigger 永远 unknown、观察窗还会晚 20s 才开始。currentLoop 在 trigger
+        // run 之前指向 trigger，resolution run 之前换成 resolution；topic 组装器
+        // 照旧并行消费同一批帧（pending 卡来自 conversation topic 的 EventFire）。
+        let currentLoop: { onData(payload: unknown): void } | null = null;
         const topicAssembler = new RpcFrameAssembler({ identity });
         sendChannel.onRpcFrame = (payload) => {
-          activeLoop?.onData(payload);
+          currentLoop?.onData(payload);
           const event = topicAssembler.accept(payload);
           if (event.kind === "duplicate" || event.kind === "fault" || event.kind === "incomplete") {
             return;
@@ -2146,7 +2237,40 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           isTurnActivity: (decoded, rawJson) =>
             decoded?.headerType === RESPONSE_TYPE_EVENT_FIRE && rawJson.includes(bound.taskId),
         });
+        // 观察窗必须在 trigger.run() **之前**开始（C1）——trigger 的 ACK/活动窗可长达
+        // 20s+30s，触发期间落下的 pending 卡（或新前台执行）不能等 trigger 返回后才开始找。
+        // 关联（I1）：pending.createdAt 必须 >= 触发帧发送时刻；卡上缺 createdAt
+        // （旧快照/合成夹具）时回退为「触发后出现的首张卡」（快照本身是触发后收到的）。
+        const triggerSentAt = Date.now();
+        const controlRevisionBaseline = book.controlRevision;
+        const isFreshPending = (item: ObservedPending): boolean =>
+          item.createdAt === null || item.createdAt >= triggerSentAt;
+        const isInterrupt = interactionMode === "interrupt";
+        const pendingObservation: Promise<ObservedPending | null> = isInterrupt
+          ? Promise.resolve(null)
+          : interactionMode === "approve" || interactionMode === "reject"
+            ? waitUntil(
+                () =>
+                  book.list().find((item) => item.kind === "permission" && isFreshPending(item)) ??
+                  null,
+                INTERACTION_PENDING_WAIT_MS
+              )
+            : waitUntil(
+                () =>
+                  book.list().find((item) => item.kind === "userInput" && isFreshPending(item)) ??
+                  null,
+                INTERACTION_PENDING_WAIT_MS
+              );
+        const stopObservation: Promise<{ kind: string; foregroundExecutionId: string } | null> =
+          isInterrupt
+            ? waitUntil(
+                () => book.observeStopTarget({ afterRevision: controlRevisionBaseline }),
+                INTERACTION_FOREGROUND_WAIT_MS
+              )
+            : Promise.resolve(null);
+        currentLoop = trigger;
         const triggerOutcome = await trigger.run();
+        currentLoop = null;
         bridgeId += 1;
         bridgeSeq += 1;
         bridgeMessageSeq += 1;
@@ -2154,34 +2278,103 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           outcome: triggerOutcome,
           framesSent: trigger.framesSent,
           peerAcknowledged: trigger.peerAcknowledged,
+          triggerSentAt,
+          controlRevisionBaseline,
         };
         record(ctx, "interaction", "trigger", interaction.trigger);
         log(
           `interaction trigger = ${triggerOutcome.kind}；framesSent=${trigger.framesSent}，peerAck=${trigger.peerAcknowledged}。`
         );
 
-        // 2) 宿主侧观察窗（pending 卡 / 前台执行 id）；超窗如实记 unavailable。
+        // 2) 宿主侧观察窗（并发启动、此处取结果；pending 卡 / 前台执行 id）；超窗如实记
+        // unavailable。触发窗内落下的卡不会晚 20s 才被看见（C1 的另一半）。
+        const observedPending = await pendingObservation;
+        const observedStopTarget = await stopObservation;
         let commandType: InteractionCommandType | null = null;
         let payload: Record<string, unknown> | null = null;
         let unavailable: string | null = null;
+        let autoResolution = false;
+        let pendingInteractionId: string | null = null;
+
+        // I6：题干 / 选项 label / 选项 value 先登记别名，再记录证据（卡上真实文本
+        // 绝不原样进 transcript）。
+        const registerQuestionMaterial = (pending: ObservedPending): Record<string, unknown> => {
+          const questions = Array.isArray((pending.payload as { questions?: unknown }).questions)
+            ? ((pending.payload as { questions: unknown[] }).questions as unknown[])
+            : [];
+          const aliases: Array<Record<string, unknown>> = [];
+          for (const question of questions) {
+            if (!question || typeof question !== "object") continue;
+            const record = question as { question?: unknown; options?: unknown };
+            const options = Array.isArray(record.options) ? record.options : [];
+            aliases.push({
+              question:
+                typeof record.question === "string"
+                  ? redactor.register("name", record.question)
+                  : null,
+              options: options.map((option) => {
+                if (!option || typeof option !== "object") return null;
+                const entry = option as { value?: unknown; label?: unknown };
+                return {
+                  value:
+                    typeof entry.value === "string" ? redactor.register("name", entry.value) : null,
+                  label:
+                    typeof entry.label === "string" ? redactor.register("name", entry.label) : null,
+                };
+              }),
+            });
+          }
+          return { questionAliases: aliases };
+        };
+
+        const recordPendingObserved = (pending: ObservedPending): void => {
+          const options = (pending.payload as { options?: unknown }).options;
+          const optionSummaries = Array.isArray(options)
+            ? options
+                .map((option) => {
+                  if (!option || typeof option !== "object") return null;
+                  const entry = option as { optionId?: unknown; kind?: unknown; label?: unknown };
+                  return {
+                    optionId:
+                      typeof entry.optionId === "string"
+                        ? entry.optionId === PERMISSION_FULL_ACCESS_OPTION_ID
+                          ? "option:fullAccess(blocked)"
+                          : redactor.register("name", entry.optionId)
+                        : null,
+                    kind: typeof entry.kind === "string" ? entry.kind : null,
+                    label:
+                      typeof entry.label === "string"
+                        ? redactor.register("name", entry.label)
+                        : null,
+                  };
+                })
+                .filter((entry) => entry !== null)
+            : [];
+          record(ctx, "interaction", "pending-observed", {
+            kind: pending.kind,
+            interactionId: redactor.register("sid", pending.interactionId),
+            createdAt: pending.createdAt,
+            triggerSentAt,
+            autoResolution: pending.autoResolution,
+            autoResolutionState: pending.autoResolutionState,
+            optionIds: collectOptionIdsFromOptions(options).map((id) =>
+              redactor.register("name", id)
+            ),
+            optionSummaries,
+            fullAccessOptionPresent: pending.payload.fullAccessOption !== undefined,
+            ...(pending.kind === "userInput" ? registerQuestionMaterial(pending) : {}),
+            bookCounters: { ...book.counters },
+          });
+        };
+
         if (interactionMode === "approve" || interactionMode === "reject") {
-          const pending = await waitUntil(
-            () => book.list().find((item) => item.kind === "permission") ?? null,
-            INTERACTION_PENDING_WAIT_MS
-          );
-          if (!pending) {
+          if (!observedPending) {
             unavailable = "UNAVAILABLE:no-pending-observed";
           } else {
-            record(ctx, "interaction", "pending-observed", {
-              kind: pending.kind,
-              interactionId: redactor.register("sid", pending.interactionId),
-              optionIds: collectOptionIds(pending.payload).map((id) =>
-                id === PERMISSION_FULL_ACCESS_OPTION_ID
-                  ? "option:fullAccess(blocked)"
-                  : redactor.register("name", id)
-              ),
-              bookCounters: book.counters,
-            });
+            const pending = observedPending;
+            autoResolution = pending.autoResolution;
+            pendingInteractionId = pending.interactionId;
+            recordPendingObserved(pending);
             const optionId = pickPermissionOption(pending, interactionMode);
             if (optionId === null) {
               unavailable = "UNAVAILABLE:permission-option-unresolved";
@@ -2198,18 +2391,34 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
             }
           }
         } else if (interactionMode === "answer") {
-          const pending = await waitUntil(
-            () => book.list().find((item) => item.kind === "userInput") ?? null,
-            INTERACTION_PENDING_WAIT_MS
-          );
-          if (!pending) {
+          if (!observedPending) {
             unavailable = "UNAVAILABLE:no-pending-observed";
-          } else {
-            record(ctx, "interaction", "pending-observed", {
-              kind: pending.kind,
-              interactionId: redactor.register("sid", pending.interactionId),
-              bookCounters: book.counters,
+          } else if (!isAnswerableUserInput(observedPending)) {
+            // C2：计划审批（ExitPlanMode）/ MCP elicitation / 未知工具都投影成
+            // userInput，只有 AskUserQuestion 可答；其余一律不支持，零帧。
+            record(ctx, "interaction", "answer-shape-unsupported", {
+              kind: observedPending.kind,
+              toolName:
+                typeof observedPending.payload.toolName === "string"
+                  ? redactor.register("name", observedPending.payload.toolName)
+                  : null,
+              schemaInteraction:
+                observedPending.payload.schema &&
+                typeof observedPending.payload.schema === "object" &&
+                typeof (observedPending.payload.schema as { interaction?: unknown }).interaction ===
+                  "string"
+                  ? (observedPending.payload.schema as { interaction: string }).interaction
+                  : null,
+              note:
+                "only AskUserQuestion userInput is answerable " +
+                "(product-projection.ts:3391-3409,5793-5795; plan approval :3440-3459)",
             });
+            unavailable = "UNAVAILABLE:answer-shape-unsupported";
+          } else {
+            const pending = observedPending;
+            autoResolution = pending.autoResolution;
+            pendingInteractionId = pending.interactionId;
+            recordPendingObserved(pending);
             const entries = pickUserInputEntries(pending);
             if (entries === null) {
               unavailable = "UNAVAILABLE:answer-shape-unresolved";
@@ -2225,17 +2434,20 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
               };
             }
           }
+        } else if (!observedStopTarget) {
+          // 触发后没有新的 primaryTurn 前台执行 id → 不做盲停（Minor：UNAVAILABLE 而非 NOOP）。
+          unavailable = "UNAVAILABLE:no-foreground-execution";
         } else {
-          const stopTarget = await waitUntil(
-            () => book.observeStopTarget(),
-            INTERACTION_FOREGROUND_WAIT_MS
-          );
-          if (!stopTarget) {
-            unavailable = `NOOP:${STOP_GUARD_NOOP_REASON}`;
-          } else {
-            commandType = INTERACTION_COMMAND_TYPES.stop;
-            payload = buildStopPayload(stopTarget);
-          }
+          commandType = INTERACTION_COMMAND_TYPES.stop;
+          payload = buildStopPayload(observedStopTarget);
+          interaction.stopTarget = {
+            kind: observedStopTarget.kind,
+            foregroundExecutionId: redactor.register(
+              "sid",
+              observedStopTarget.foregroundExecutionId
+            ),
+            observedAfterControlRevision: controlRevisionBaseline,
+          };
         }
 
         interaction.channel = { ...book.counters, pendingSize: book.size };
@@ -2245,47 +2457,75 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           record(ctx, "interaction", "unavailable", interaction.resolution);
           log(`interaction 不可用：${unavailable}（未发送任何应答帧）。`);
         } else if (commandType !== null && payload !== null) {
-          const resolution = new InteractionCommandLoop({
-            sender: conn,
-            identity,
-            target: bound,
+          // I4：卡上带 autoResolution（AskUserQuestion 自动结束计时）时，先发
+          // snoozeInteractionAutoResolution 再发 resolve（首次有效操作永久暂停本次
+          // 自动结束；重复/迟到调用幂等 noop——command.ts:250-253）。snooze 只是
+          // 尽力而为的前置帧：失败/超窗如实记录后继续 resolve（resolve 本身先到先得，
+          // 若自动结束已抢先收口则 resolve 回 proto.alreadyResolved noop，绝不重发）。
+          const steps = planInteractionCommands({
+            pending: {
+              interactionId: pendingInteractionId ?? "",
+              autoResolution,
+            },
             commandType,
             payload,
-            clientId,
-            ackMs: SEND_ACK_TIMEOUT_MS,
-            channelRequestId: bridgeId + 1,
-            firstSeq: bridgeSeq + 1,
-            firstMessageSeq: bridgeMessageSeq + 1,
           });
-          activeLoop = resolution;
-          const outcome = await resolution.run();
-          activeLoop = null;
-          bridgeId += 1;
-          bridgeSeq += 1;
-          bridgeMessageSeq += 1;
-          interaction.resolution = {
-            attempted: true,
-            outcome,
-            framesSent: resolution.framesSent,
-            peerAcknowledged: resolution.peerAcknowledged,
-            duplicateInboundFrames: resolution.duplicateInboundFrames,
-          };
-          record(ctx, "interaction", "resolution", interaction.resolution);
-          sendVerdict =
-            outcome.kind === "accepted"
-              ? interactionMode === "interrupt"
-                ? "STOPPED:interrupt-accepted"
-                : "RESOLVED"
-              : outcome.kind === "noop"
-                ? `NOOP:${outcome.reasonCode ?? "unknown"}`
-                : outcome.kind === "rejected"
-                  ? `REJECTED:${outcome.reasonCode ?? "unknown"}`
-                  : outcome.kind === "send-failed"
-                    ? "STOPPED:interaction-send-failed"
-                    : "UNKNOWN";
-          log(
-            `interaction outcome = ${outcome.kind}；framesSent=${resolution.framesSent}，peerAck=${resolution.peerAcknowledged}。`
-          );
+          for (const step of steps) {
+            const loop = new InteractionCommandLoop({
+              sender: conn,
+              identity,
+              target: bound,
+              commandType: step.commandType,
+              payload: step.payload,
+              clientId,
+              ackMs: SEND_ACK_TIMEOUT_MS,
+              channelRequestId: bridgeId + 1,
+              firstSeq: bridgeSeq + 1,
+              firstMessageSeq: bridgeMessageSeq + 1,
+            });
+            currentLoop = loop;
+            const outcome = await loop.run();
+            currentLoop = null;
+            bridgeId += 1;
+            bridgeSeq += 1;
+            bridgeMessageSeq += 1;
+            if (step.commandType === INTERACTION_COMMAND_TYPES.snooze) {
+              interaction.snooze = {
+                attempted: true,
+                outcome,
+                framesSent: loop.framesSent,
+                peerAcknowledged: loop.peerAcknowledged,
+                autoResolutionState: observedPending?.autoResolutionState ?? null,
+                note: "best-effort: failure is recorded and resolve still proceeds (first-wins)",
+              };
+              record(ctx, "interaction", "snooze", interaction.snooze);
+              continue;
+            }
+            interaction.resolution = {
+              attempted: true,
+              outcome,
+              framesSent: loop.framesSent,
+              peerAcknowledged: loop.peerAcknowledged,
+              duplicateInboundFrames: loop.duplicateInboundFrames,
+              autoResolution,
+            };
+            record(ctx, "interaction", "resolution", interaction.resolution);
+            sendVerdict =
+              outcome.kind === "accepted"
+                ? interactionMode === "interrupt"
+                  ? "STOPPED:interrupt-accepted"
+                  : "RESOLVED"
+                : outcome.kind === "noop"
+                  ? `NOOP:${outcome.reasonCode ?? "unknown"}`
+                  : outcome.kind === "rejected"
+                    ? `REJECTED:${outcome.reasonCode ?? "unknown"}`
+                    : outcome.kind === "send-failed"
+                      ? "STOPPED:interaction-send-failed"
+                      : "UNKNOWN";
+            log(
+              `interaction outcome = ${outcome.kind}；framesSent=${loop.framesSent}，peerAck=${loop.peerAcknowledged}。`
+            );
+          }
         }
       }
 
@@ -2456,7 +2696,18 @@ export function summarizePayload(outcome: AppPayloadOutcome): Record<string, unk
 /** 收帧证据落 events（有界 + 截断 + 脱敏；真实值经 sanitizeText 只余别名）。 */
 function recordChannelEvidence(ctx: RunContext, label: string, channel: B2Channel): void {
   const messages = channel.bridgeMessages.slice(0, 64).map((message) => {
-    const sanitized = ctx.redactor.sanitizeText(message);
+    // I6：结构化预览先过 redactPayload（字段级别名登记，workspacePath/taskId/... 等），
+    // 再统一走 sanitizeText；非 JSON 消息退回纯文本脱敏。
+    const preview = (() => {
+      try {
+        return (
+          JSON.stringify(redactPayload(ctx.redactor, JSON.parse(message) as unknown)) ?? message
+        );
+      } catch {
+        return message;
+      }
+    })();
+    const sanitized = ctx.redactor.sanitizeText(preview);
     return sanitized.length > 40_000 ? `${sanitized.slice(0, 40_000)}…<truncated>` : sanitized;
   });
   record(ctx, label, "bridge-messages", {
@@ -2495,6 +2746,9 @@ async function writeEvidence(
 ): Promise<void> {
   const finishedIso = new Date().toISOString();
   const isInteraction = ctx.flags.interaction !== null;
+  // I5：证据里的安全闸按模式派生（交互 run 实际 2 个命令帧 + 可达 1 个 snooze 前置帧，
+  // 不再把 B2 的 maxSendFrames:1 抄进 B3 证据）。
+  const guards = deriveProbeGuards(ctx.flags.interaction);
   const transcript = {
     runId: ctx.run.runId,
     probe: isInteraction ? "zcode-bridge-interaction-probe" : "zcode-bridge-session-probe",
@@ -2504,7 +2758,7 @@ async function writeEvidence(
     sourceBaseline: "zai-org/ZCode @ 3c5b227649371507ddc4eb46ac5133afe6db1cab",
     startedUtc: ctx.startedIso,
     finishedUtc: finishedIso,
-    guards: PROBE_GUARDS,
+    guards,
     flags: {
       provider: ctx.flags.provider,
       unlock: ctx.flags.unlock,
@@ -2534,12 +2788,12 @@ async function writeEvidence(
     `- connect: **${connectVerdict}**`,
     `- mapping: **${mappingVerdict}**`,
     `- ${isInteraction ? "interaction" : "send"}: **${sendVerdict}**`,
-    `- guards: \`${JSON.stringify(PROBE_GUARDS)}\``,
+    `- guards: \`${JSON.stringify(guards)}\``,
     "",
     "本目录为私有证据（不进仓库）。所有 SID/JWT/token/state/授权码/链接/会话 id",
     "均以稳定别名与掩码形态记录；落盘前经 fail-closed 断言。marker 正文为合成值",
     isInteraction
-      ? "（[tuvis-b3-probe:<UTC>]，不含任何秘密）。指令帧恒 1、应答/stop 帧恒 1；未知不重发。"
+      ? "（[tuvis-b3-probe:<UTC>]，不含任何秘密）。指令帧恒 1、应答/stop 帧恒 1（autoResolution 在场时至多加 1 个 snooze 前置帧）；未知不重发。"
       : "（[tuvis-b2-marker:<UTC>]，不含任何秘密）。发送帧恒 1；未知不重发。",
     "",
     "细节见同目录 transcript.json。",

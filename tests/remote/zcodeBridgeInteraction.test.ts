@@ -89,8 +89,14 @@ import {
   buildStopPayload,
   buildUserInputAnswer,
   decodeTopicFrameSubject,
+  planInteractionCommands,
   type ObservedPending,
 } from "../../scripts/zcode-bridge-probe/interactionBridge";
+import {
+  deriveProbeGuards,
+  isAnswerableUserInput,
+  pickPermissionOption,
+} from "../../scripts/zcode-bridge-probe/session-probe";
 
 // ---------------------------------------------------------------------------
 // FAKE relay（仅测试；同 B1/B2 形状的最小 RFC6455 实现）。行为标签——凡注释标
@@ -1085,5 +1091,257 @@ describe("B3 wire 形状与应答构造器（@ 3c5b2276 行号锁形）", () => 
       (pending.payload.options as Array<{ optionId: string }>).map((option) => option.optionId)
     ).toEqual(["allowOnce", "denyOnce"]);
     expect(pending.generation).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B3 修复轮（C2 / I1 / I2 / I3 / I4 / I5）：判别式、选项闸、消费不可复活、
+// snooze 顺序与按模式派生的安全闸。
+// ---------------------------------------------------------------------------
+
+/** 合成 pending（判别式测试用；只填被测字段）。 */
+function pendingOf(
+  payload: Record<string, unknown>,
+  kind: "permission" | "userInput" = "permission"
+) {
+  return {
+    interactionId: "b3-fake-rule-1",
+    kind,
+    sessionId: FAKE_TARGET.taskId,
+    generation: 1,
+    anchorRowId: null,
+    toolCallId: null,
+    createdAt: 0,
+    autoResolution: false,
+    autoResolutionState: null,
+    payload,
+  } satisfies ObservedPending;
+}
+
+function questionPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    kind: "userInput",
+    prompt: "fake",
+    freeText: true,
+    toolName: "AskUserQuestion",
+    schema: { toolName: "AskUserQuestion" },
+    questions: [
+      {
+        question: "Continue?",
+        header: "Choice",
+        options: [{ value: "yes", label: "Yes" }],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+describe("B3 修复轮：C2 判别式 / I3 选项闸 / I2 消费复活 / I4 snooze / I5 派生闸", () => {
+  it("permission_option_selection_only_from_options：once 优先、allowAlways 拒绝、fullAccess 硬闸、无 once 即 null", () => {
+    // once 与 allowAlways 并存 → 只选 allowOnce。
+    expect(
+      pickPermissionOption(
+        pendingOf({
+          kind: "permission",
+          options: [
+            { optionId: "always", label: "Always", kind: "allowAlways" },
+            { optionId: "once", label: "Once", kind: "allowOnce" },
+          ],
+        }),
+        "approve"
+      )
+    ).toBe("once");
+    // 只有常驻授权 → 拒绝（不猜）。
+    expect(
+      pickPermissionOption(
+        pendingOf({
+          kind: "permission",
+          options: [{ optionId: "always", label: "Always", kind: "allowAlways" }],
+        }),
+        "approve"
+      )
+    ).toBeNull();
+    // fullAccess 特权项在客户端硬闸排除。
+    expect(
+      pickPermissionOption(
+        pendingOf({
+          kind: "permission",
+          options: [{ optionId: "fullAccess", label: "Full", kind: "custom" }],
+        }),
+        "approve"
+      )
+    ).toBeNull();
+    // 深度扫描反例：detail 里出现 optionId 不算选项（只认 payload.options）。
+    expect(
+      pickPermissionOption(
+        pendingOf({
+          kind: "permission",
+          detail: { optionId: "once" },
+          options: [{ optionId: "always", label: "Always", kind: "allowAlways" }],
+        }),
+        "approve"
+      )
+    ).toBeNull();
+    // reject → kind === "deny"。
+    expect(
+      pickPermissionOption(
+        pendingOf({
+          kind: "permission",
+          options: [
+            { optionId: "once", label: "Once", kind: "allowOnce" },
+            { optionId: "deny", label: "Deny", kind: "deny" },
+          ],
+        }),
+        "reject"
+      )
+    ).toBe("deny");
+  });
+
+  it("answer_only_for_ask_user_question：计划审批（ExitPlanMode）与未知工具一律不可答", () => {
+    expect(isAnswerableUserInput(pendingOf(questionPayload(), "userInput"))).toBe(true);
+    // ExitPlanMode 计划审批：同走 userInput 通道（product-projection.ts:3440-3459）。
+    expect(
+      isAnswerableUserInput(
+        pendingOf(
+          questionPayload({
+            toolName: "ExitPlanMode",
+            schema: { interaction: "plan_approval", toolName: "ExitPlanMode" },
+            questions: [
+              {
+                question: "Approve this plan?",
+                header: "Plan",
+                options: [{ value: "approve", label: "Approve" }],
+              },
+            ],
+          }),
+          "userInput"
+        )
+      )
+    ).toBe(false);
+    // 未知/缺省工具名、MCP elicitation、permission 卡都不可答。
+    expect(
+      isAnswerableUserInput(pendingOf(questionPayload({ toolName: undefined }), "userInput"))
+    ).toBe(false);
+    expect(
+      isAnswerableUserInput(
+        pendingOf(questionPayload({ toolName: "mcp_elicitation" }), "userInput")
+      )
+    ).toBe(false);
+    expect(
+      isAnswerableUserInput(pendingOf({ kind: "permission", options: [] }, "permission"))
+    ).toBe(false);
+  });
+
+  it("consumed_id_cannot_resurrect：已消费的 interactionId 不被后续 snapshot 重新入册", () => {
+    const book = new PendingBook({ sessionId: FAKE_TARGET.taskId, generation: 1 });
+    const card = permissionPending({
+      interactionId: "b3-fake-consumed-1",
+      toolCallId: "b3-fake-toolcall-c",
+      anchorRowId: 5,
+    });
+    book.acceptTopicFrame(
+      topicFrame({ sessionId: FAKE_TARGET.taskId, pendingInteractions: [card] })
+    );
+    const consumed = book.consume("b3-fake-consumed-1");
+    expect(consumed.createdAt).toBe(0);
+    expect(book.find("b3-fake-consumed-1")).toBeNull();
+
+    // 迟到快照仍带这张卡 + 一张新卡：旧卡不复活，新卡正常入册。
+    book.acceptTopicFrame(
+      topicFrame({
+        sessionId: FAKE_TARGET.taskId,
+        pendingInteractions: [
+          card,
+          permissionPending({
+            interactionId: "b3-fake-consumed-2",
+            toolCallId: "b3-fake-toolcall-d",
+            anchorRowId: 6,
+          }),
+        ],
+      })
+    );
+    expect(book.find("b3-fake-consumed-1")).toBeNull();
+    expect(book.find("b3-fake-consumed-2")).not.toBeNull();
+    expect(book.size).toBe(1);
+  });
+
+  it("stop_target_only_after_trigger_revision：触发前观察到的执行 id 不被采用，触发后新 control 才可用", () => {
+    const book = new PendingBook({ sessionId: FAKE_TARGET.taskId, generation: 1 });
+    const control = (id: string) => ({
+      activeWorks: [{ kind: "primaryTurn", foregroundExecutionId: id, startedAt: 0 }],
+    });
+    book.acceptTopicFrame(
+      topicFrame({ sessionId: FAKE_TARGET.taskId, control: control("b3-fake-exec-old") })
+    );
+    const revisionBeforeTrigger = book.controlRevision;
+    expect(revisionBeforeTrigger).toBe(1);
+    // 没有触发后的新 control → null（绝不拿旧执行 id 盲停）。
+    expect(book.observeStopTarget({ afterRevision: revisionBeforeTrigger })).toBeNull();
+    // 触发后新的 control patch → 只认新 id。
+    book.acceptTopicFrame(
+      deltasTopicFrame({
+        sessionId: FAKE_TARGET.taskId,
+        patch: { control: control("b3-fake-exec-new") },
+      })
+    );
+    expect(book.observeStopTarget({ afterRevision: revisionBeforeTrigger })).toEqual({
+      kind: "primaryTurn",
+      foregroundExecutionId: "b3-fake-exec-new",
+    });
+    // 非 primaryTurn 条目不作为 stop 目标（Minor）。
+    book.acceptTopicFrame(
+      deltasTopicFrame({
+        sessionId: FAKE_TARGET.taskId,
+        patch: {
+          control: {
+            activeWorks: [{ kind: "foregroundSubagent", foregroundExecutionId: "b3-fake-sub" }],
+          },
+        },
+      })
+    );
+    expect(book.observeStopTarget({ afterRevision: revisionBeforeTrigger })).toBeNull();
+  });
+
+  it("autoResolution_snooze_ordering：snooze 必在 resolve 之前，无 autoResolution 时只发 resolve", () => {
+    const resolvePayload = {
+      interactionId: "b3-fake-rule-1",
+      answer: { optionId: "allowOnce" },
+    };
+    const withSnooze = planInteractionCommands({
+      pending: { interactionId: "b3-fake-rule-1", autoResolution: true },
+      commandType: "resolveInteraction",
+      payload: resolvePayload,
+    });
+    expect(withSnooze.map((step) => step.commandType)).toEqual([
+      "snoozeInteractionAutoResolution",
+      "resolveInteraction",
+    ]);
+    expect(withSnooze[0]!.payload).toEqual({ interactionId: "b3-fake-rule-1" });
+    expect(withSnooze[1]!.payload).toEqual(resolvePayload);
+
+    const withoutSnooze = planInteractionCommands({
+      pending: { interactionId: "b3-fake-rule-1", autoResolution: false },
+      commandType: "resolveInteraction",
+      payload: resolvePayload,
+    });
+    expect(withoutSnooze.map((step) => step.commandType)).toEqual(["resolveInteraction"]);
+  });
+
+  it("guards_derived_per_mode：send 模式 1 帧 + send 锁；interaction 模式 2 命令帧 + interaction 锁 + 扩展时长", () => {
+    const send = deriveProbeGuards(null);
+    expect(send.maxSendFrames).toBe(1);
+    expect(send.sendRequiresExplicitFlag).toBe(true);
+    expect(send.interactionRequiresExplicitFlag).toBe(false);
+    expect(send.maxSnoozeFrames).toBe(0);
+    expect(send.maxDurationMs).toBe(180_000);
+
+    for (const mode of ["approve", "reject", "answer", "interrupt"] as const) {
+      const guards = deriveProbeGuards(mode);
+      expect(guards.maxSendFrames).toBe(2);
+      expect(guards.sendRequiresExplicitFlag).toBe(false);
+      expect(guards.interactionRequiresExplicitFlag).toBe(true);
+      expect(guards.maxSnoozeFrames).toBe(1);
+      expect(guards.maxDurationMs).toBe(250_000);
+    }
   });
 });

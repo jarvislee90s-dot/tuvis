@@ -11,15 +11,21 @@ const KNOWN_MODES = new Set(["approve", "reject", "answer", "interrupt"]);
 
 const argv = [...process.argv.slice(2)];
 const head = argv[0];
-if (head !== undefined && !head.startsWith("-")) {
-  if (!KNOWN_MODES.has(head)) {
-    console.error(
-      `interaction-probe: 未知交互模式「${head}」（只接受 approve | reject | answer | interrupt）`
-    );
-    process.exit(2);
-  }
-  argv.shift();
-  argv.unshift(`--interaction=${head}`);
+// I7：必须显式给出位置参数模式——缺省/只给 flags 时绝不静默退化成 B2 发送探针。
+if (head === undefined || head.startsWith("-")) {
+  console.error(
+    "interaction-probe: 用法：interaction-probe.ts <approve|reject|answer|interrupt> [flags]\n" +
+      "  （位置参数模式必填；交互探针不会退化为 B2 发送探针）"
+  );
+  process.exit(2);
 }
+if (!KNOWN_MODES.has(head)) {
+  console.error(
+    `interaction-probe: 未知交互模式「${head}」（只接受 approve | reject | answer | interrupt）`
+  );
+  process.exit(2);
+}
+argv.shift();
+argv.unshift(`--interaction=${head}`);
 
 void main(argv);

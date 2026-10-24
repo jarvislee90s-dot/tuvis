@@ -103,8 +103,17 @@ export type ObservedPending = {
   /** turn 锚：工具行 id（行携带 turnId，rows.ts:19-20）+ 工具调用 id。 */
   anchorRowId: number | null;
   toolCallId: string | null;
+  /**
+   * 卡创建时间（snapshot.ts:316-337 PendingInteraction.createdAt，
+   * timestampSchema = z.number() 即 epoch ms）。用于触发后关联：只有
+   * createdAt >= 触发帧发送时刻的 pending 才属于本次触发（旧卡不得被误应答）；
+   * 卡上缺该字段（旧快照/合成夹具）→ null，调用方回退为「触发后出现的首张卡」。
+   */
+  createdAt: number | null;
   /** AskUserQuestion 自动结束计时是否在场（interaction-registry.ts:30-31）。 */
   autoResolution: boolean;
+  /** autoResolution 的 state 字面量（hiddenGrace / visibleCountdown / snoozed）。 */
+  autoResolutionState: string | null;
   /** pendingInteraction payload 原样（应答字段只从这里取，绝不虚构）。 */
   payload: Record<string, unknown>;
 };
@@ -154,6 +163,12 @@ export class PendingBook {
   /** 已消费（authorizePendingResolution 过闸即消费）——重复应答给出精确的 already-consumed。 */
   private readonly consumedIds = new Set<string>();
   private lastControl: Record<string, unknown> | null = null;
+  /**
+   * control 观察代数：每次收到带 control 的 snapshot / state.updated patch +1。
+   * interrupt 关联（I1）用它做基线——只有**触发帧发出之后**收到的 control 更新
+   * 观察到的 stop 目标才可被采用（触发前的旧执行 id 不得被误停）。
+   */
+  private controlRevisionCounter = 0;
   /** 本会话最近观察到的 conversation topic（日志/证据用；恒等于绑定 sessionId）。 */
   lastTopicObserved = false;
 
@@ -179,6 +194,11 @@ export class PendingBook {
   /** 最近一次观察到的 control 状态（stop 守卫 id 来源；未观察 = null）。 */
   get control(): Record<string, unknown> | null {
     return this.lastControl;
+  }
+
+  /** control 观察代数（触发前取基线，observeStopTarget 只认基线之后的新值）。 */
+  get controlRevision(): number {
+    return this.controlRevisionCounter;
   }
 
   /**
@@ -212,6 +232,7 @@ export class PendingBook {
       }
       if (snapshot.control && typeof snapshot.control === "object") {
         this.lastControl = snapshot.control as Record<string, unknown>;
+        this.controlRevisionCounter += 1;
       }
       const incoming = Array.isArray(snapshot.pendingInteractions)
         ? snapshot.pendingInteractions
@@ -234,6 +255,7 @@ export class PendingBook {
         const patch = record2.patch as { pendingInteractions?: unknown; control?: unknown };
         if (patch.control && typeof patch.control === "object") {
           this.lastControl = patch.control as Record<string, unknown>;
+          this.controlRevisionCounter += 1;
           touched = true;
         }
         if (Array.isArray(patch.pendingInteractions)) {
@@ -275,28 +297,36 @@ export class PendingBook {
   }
 
   /**
-   * stop 守卫 id 观察：control.activeWorks 里取 foregroundExecutionId（优先
-   * primaryTurn；snapshot.ts:53-64 ActiveWorkSummary{kind, foregroundExecutionId?}）。
+   * stop 守卫 id 观察：control.activeWorks 里取 foregroundExecutionId（snapshot.ts:
+   * 53-64 ActiveWorkSummary{kind, foregroundExecutionId?}）。只有 primaryTurn 条目
+   * 可作为目标（前台子 agent / compact 等不是本轮 turn 的守卫点，宁不 stop 不误杀）。
+   * afterRevision = 触发帧发出前的 controlRevision 基线：control 观察代数未前进
+   * （没有触发后新 control）→ null——触发前的旧执行 id 绝不可被采用。
    * 未观察到 → null（调用方必须 fail-closed：没有守卫 id 就不做 stop）。
    */
-  observeStopTarget(): { kind: string; foregroundExecutionId: string } | null {
+  observeStopTarget(options?: {
+    afterRevision?: number;
+  }): { kind: string; foregroundExecutionId: string } | null {
+    if (
+      options?.afterRevision !== undefined &&
+      this.controlRevisionCounter <= options.afterRevision
+    ) {
+      return null;
+    }
     if (!this.lastControl) return null;
     const activeWorks = (this.lastControl as { activeWorks?: unknown }).activeWorks;
     if (!Array.isArray(activeWorks)) return null;
-    let fallback: { kind: string; foregroundExecutionId: string } | null = null;
     for (const work of activeWorks) {
       if (!work || typeof work !== "object") continue;
       const record = work as { kind?: unknown; foregroundExecutionId?: unknown };
       if (typeof record.foregroundExecutionId !== "string" || !record.foregroundExecutionId) {
         continue;
       }
-      const kind = typeof record.kind === "string" ? record.kind : "unknown";
-      if (kind === "primaryTurn") {
-        return { kind, foregroundExecutionId: record.foregroundExecutionId };
+      if (record.kind === "primaryTurn") {
+        return { kind: "primaryTurn", foregroundExecutionId: record.foregroundExecutionId };
       }
-      if (!fallback) fallback = { kind, foregroundExecutionId: record.foregroundExecutionId };
     }
-    return fallback;
+    return null;
   }
 
   /** 整体替换（键级语义：不深合并，delta.ts:8）；行形状校验不过的跳过计数。 */
@@ -330,10 +360,19 @@ export class PendingBook {
         this.counters.invalidPendingSkipped += 1;
         continue;
       }
+      // 已消费的 interactionId 不得被后续 snapshot 复活（I2：迟到的快照仍可能携带
+      // 已应答过的卡；重新入册会让同一 interaction 被二次应答）。
+      if (this.consumedIds.has(interactionId)) {
+        continue;
+      }
       const payloadRecord = payload as Record<string, unknown>;
       const toolCallId =
         typeof payloadRecord.toolCallId === "string" ? payloadRecord.toolCallId : null;
       const anchorRowId = typeof record.anchorRowId === "number" ? record.anchorRowId : null;
+      const autoResolutionRecord =
+        record.autoResolution && typeof record.autoResolution === "object"
+          ? (record.autoResolution as { state?: unknown })
+          : null;
       this.pendings.set(interactionId, {
         interactionId,
         kind,
@@ -341,7 +380,10 @@ export class PendingBook {
         generation: this.generation,
         anchorRowId,
         toolCallId,
-        autoResolution: record.autoResolution !== undefined,
+        createdAt: typeof record.createdAt === "number" ? record.createdAt : null,
+        autoResolution: autoResolutionRecord !== null,
+        autoResolutionState:
+          typeof autoResolutionRecord?.state === "string" ? autoResolutionRecord.state : null,
         payload: payloadRecord,
       });
     }
@@ -526,6 +568,35 @@ export type InteractionCommandLoopOptions = {
   firstSeq?: number;
   firstMessageSeq?: number;
 };
+
+/** 单帧闭环的一个步骤（命令类型 + 原样 payload）。 */
+export type InteractionCommandStep = {
+  commandType: InteractionCommandType;
+  payload: Record<string, unknown>;
+};
+
+/**
+ * 应答命令序列（I4）：卡上 autoResolution 在场 → 先 snoozeInteractionAutoResolution
+ * （{interactionId}，command.ts:250-253：首次有效操作永久暂停本次自动结束；重复/迟到
+ * 幂等 noop）再 resolve；否则只有 resolve。顺序即发送顺序，每步各恰一帧、无重发。
+ * 调用方按步骤逐个跑 InteractionCommandLoop（snooze 失败只记录、继续 resolve：
+ * resolve 本身先到先得，自动结束已收口时回 proto.alreadyResolved noop）。
+ */
+export function planInteractionCommands(args: {
+  pending: Pick<ObservedPending, "interactionId" | "autoResolution">;
+  commandType: InteractionCommandType;
+  payload: Record<string, unknown>;
+}): InteractionCommandStep[] {
+  const steps: InteractionCommandStep[] = [];
+  if (args.pending.autoResolution) {
+    steps.push({
+      commandType: INTERACTION_COMMAND_TYPES.snooze,
+      payload: { interactionId: args.pending.interactionId },
+    });
+  }
+  steps.push({ commandType: args.commandType, payload: args.payload });
+  return steps;
+}
 
 /**
  * resolveInteraction / stop / snooze 的单帧闭环。全生命周期恰好一个 rpc-frame；
