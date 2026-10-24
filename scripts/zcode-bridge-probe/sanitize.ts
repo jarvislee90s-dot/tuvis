@@ -138,8 +138,14 @@ export function defaultEvidenceBase(): string {
   return path.join(os.homedir(), "Documents", "tuvis-verify-logs", "zcode");
 }
 
-/** 建 `macos-B1<UTC 时间戳>-<随机短码>` 运行目录（不覆盖旧目录：秒级时间戳+短码）。 */
-export function createEvidenceRunDir(baseDir: string = defaultEvidenceBase()): EvidenceRunDir {
+/**
+ * 建 `<platform>-<批次前缀><UTC 时间戳>-<随机短码>` 运行目录（不覆盖旧目录：
+ * 秒级时间戳+短码）。批次前缀区分工作包子任务（B1 默认；B2 session 探针传 "B2"）。
+ */
+export function createEvidenceRunDir(
+  baseDir: string = defaultEvidenceBase(),
+  batchPrefix = "B1"
+): EvidenceRunDir {
   const now = new Date();
   const stamp = [
     String(now.getUTCFullYear()),
@@ -156,7 +162,7 @@ export function createEvidenceRunDir(baseDir: string = defaultEvidenceBase()): E
     .toString("base64url")
     .replace(/[^a-z0-9]/gi, "")
     .slice(0, 6);
-  const runId = `macos-B1${stamp}-${rand || "r00000"}`;
+  const runId = `macos-${batchPrefix}${stamp}-${rand || "r00000"}`;
   const dir = path.join(baseDir, runId);
   // owner-only 0700（评审 Minor）：证据运行目录与其中 0600 文件同权限口径，不让同机其他用户读。
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });

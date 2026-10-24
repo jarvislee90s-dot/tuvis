@@ -405,3 +405,113 @@ B0 §3.2 末行「官方 Web 远控前端与云 relay 服务**不在本仓库**�
 route `ownerScope`/`bindingNote` 勘正如上；`capabilities` 维持全 false、`operations` 维持
 空数组（send 等属 B2+，未取得各自真实帧证据不得前移）。
 
+
+---
+
+# 7. B2 部分（2026-10-24 追加）：单连接、会话映射与单次发送的准备定案
+
+> 本节登记 B2 的**准备阶段**产物：发送链 wire 定案（source 级，逐条行号）、会话映射方案、
+> 合成 marker 设计与 fake 合同。**send 能力未前移**：`contract.capabilities.send` 维持 false，
+> 须待 B2 实连半场（controller 与用户在场按批准次数执行）取得受理/归属/结果证据后再裁。
+> 本节不含任何真实会话 id / 路径 / SID / token；私有证据目录
+> `~/Documents/tuvis-verify-logs/zcode/macos-B2<UTC>-<短码>/`（0700/0600，脱敏 fail-closed）。
+
+## 7.1 新增资产
+
+| 文件 | 职责 |
+| --- | --- |
+| `scripts/zcode-bridge-probe/sessionBridge.ts` | Tuvis 侧参照实现：二进制 Channel 序列化、CRC32、rpc-frame 编解码/组装器、SingleConnectionGate、SessionTargetMapper（精确归属+代际绑定）、SendOnceLoop（单帧发送闭环）。不在产品运行链上。 |
+| `scripts/zcode-bridge-probe/session-probe.ts` | B2 实连半场探针（OAuth → token → ws2+mid 单连接 → 只读映射 → designate → 受闸单次发送 → 脱敏落证）。`--i-know-this-connects` 解锁连接；`--send-authorized` 单独解锁发送（缺省 map-only，打印 WOULD-send 即停）。 |
+| `tests/remote/zcodeBridgeSession.test.ts` | B2 fake 合同六用例（见 §7.4）。 |
+| `scripts/zcode-bridge-probe/sanitize.ts` | `createEvidenceRunDir` 增加 batchPrefix（B2 运行目录 `macos-B2…`）。 |
+
+## 7.2 发送链 wire 定案（source 级；全部行号 @ 固定 SHA `3c5b2276…`）
+
+发送一条消息的完整链（官方 web 远控客户端同款）：
+
+1. **app payload**：`workspace-bridge-open{requestId, bridgeSessionId, workspaceKey,
+   taskId}`（形状 `packages/shared/src/web-remote-control.ts:435-447`）→ 宿主
+   workspace-bridge-ready（`bridgeSessionId`/`bridgeGeneration` 回显，同文件 :449-456）。
+   workspaceKey 口径 = `resolveWebRemoteControlWorkspaceKey` =
+   `workspaceIdentity?.trim() || workspacePath`（同文件 :743-747）。
+2. **rpc-frame 通道握手**（Channel = `"zcode-agent"`，`packages/shared/src/channels.ts:114`；
+   顺序钉 `packages/ui/src/v4/agentV4ConnectionHandshake.ts:30-46`）：
+   `helloConversationV4()` → `HelloMessage{kind:"hello", protocolVersion, connectionId,
+   clientMode:"desktop-continuous"|"web-remote-replayable", deliveryProfile, serverTime,
+   capabilities, auth}`（`packages/shared/src/zcode-protocol-v4/transport.ts:42-65`）→
+   `initializeConversationV4(clientHello)`，clientHello =
+   `{kind:"clientHello", protocolVersion:3, clientId, clientKind:"desktop"|"web",
+   appVersion, capabilities?}`（同文件 :69-92，capabilities 可选；clientKind 映射见
+   handshake 文件 :43）。
+3. **订阅**（仅为打开活动帧证据流；官方发送本身只依赖握手）：
+   `subscribeConversationV4{workspacePath, workspaceIdentity?, sessionId}`——
+   参数面钉 `packages/ui/src/v4/agentConversationTransport.ts:207-214`（`{...workspace,
+   sessionId, base?, visibility?, retryInitialization?}`；workspace = `{workspacePath,
+   workspaceIdentity?}` 同文件 :94-97）+ `packages/services/src/zcode-agent/zcodeAgent.ts:400-405`
+   （`ZCodeAgentConversationSubscribeParams extends ZCodeAgentSessionTarget`）；
+   sessionId = `"conversation/<sessionId>"` topic 的精确后缀
+   （`packages/shared/src/zcode-protocol-v4/transport.ts:113,205`）。
+   **勘误记录**：准备稿曾按 `{topic, connectionId, clientMode, workspace:{…}}` 发订阅——
+   该形状在固定源码中不存在，已按上行钉源修正（无 guess 留存）。
+4. **发送**：`sendConversationCommandV4`（`packages/services/src/zcode-agent/zcodeAgent.ts:937`），
+   args = `{workspacePath, workspaceIdentity?, projectId?, envelope}`
+   （`ZCodeAgentConversationCommandParams` 同文件 :498-505；workspace target
+   `zcodeAgentPluginParams.ts:9-14`；官方 UI 调用面
+   `agentConversationTransport.ts:354-372`）。envelope =
+   `{commandId, clientId, sessionId, baseRevision?, baseLogEpoch?, type, payload, issuedAt}`
+   （`packages/shared/src/zcode-protocol-v4/command.ts:343-356`）；sendText payload 只**必带**
+   `text`，model/mode/plan 全部 optional=缺省沿用会话现值（同文件 :95-135）；
+   sendText **不在** `COMMANDS_REQUIRING_BASE_REVISION`（同文件 :315-331）→ 免 baseRevision。
+5. **承载**：Channel 消息字节 → 单分片 rpc-frame（CRC32）→ relay data 信封
+   `{type:"data", payload, client_ts}`（`packages/shared/src/web-remote-control-rpc-transport.ts:60-107,133-143`；
+   请求字节 wire = `serialize([100, id, channel, method]) + serialize([args])`
+   `packages/rpc/src/channelClient.ts:182-190` + `serialization.ts:169-175`；
+   类型码 100/201/202/204 `packages/rpc/src/channels.shared.ts:13-23`）。
+
+## 7.3 会话映射方案（精确归属，绝不按标题发送）
+
+- **listing 双源**：workspace 条目来自 bootstrap/workspace-list response 的
+  `WebRemoteControlWorkspaceTarget{workspacePath, workspaceIdentity?, label, kind,…}`
+  （`web-remote-control.ts:628-635`，B1 实连已验）；task 行来自宿主推送
+  `controller/tasks-index` 帧的 `WindowHostControllerTaskRow{address:{workspacePath, taskId},
+  meta:{title,…}}`（`packages/shared/src/zcode-protocol-v4/controller.ts:17-35,93-123`；
+  B1 实连观察到同形状增量推送）。
+- **designate**：操作员指称（`--workspace` 默认 Travel、`--task-title` 默认 hi）只用于
+  在 listing 里**精确唯一**匹配出真实 id；不唯一/不命中一律中止。**发送授权只认
+  `resolveTarget` 产物**（taskId 在当前代际 listing 里精确存在 + workspacePath 严格相等）；
+  本参照实现没有任何按标题/cwd 查找的 API（测试以反射断言缺席）。
+- **代际绑定**：映射绑定解析时的连接代际；`authorizeSend(target, liveGeneration)` 拒绝
+  旧代际映射（stale-epoch），SendOnceLoop 构造即二次校验。探针单连接无重连，代际恒 1。
+- **能力边界（计划 §B2 第 4 条）**：绑定证据不充分的卡（taskId/workspaces 对不上唯一行）
+  只读不发送——mapper 的 ambiguous/not-in-listing 拒绝即该边界的强制点。
+
+## 7.4 fake 合同（tests/remote/zcodeBridgeSession.test.ts，RED→GREEN）
+
+六用例（fake relay 127.0.0.1，无真实服务；合成 id `b2-fake-*` / `fake-bridge-*`）：
+
+1. `single_upstream_connection`——已有 paired 连接时第二个请求本地即拒（factory 不调用、
+   relay wsUpgrades 保持 1）；
+2. `wrong_target_rejected`——未知/错 taskId、错 workspacePath、以标题当 id 全部客户端侧拒绝，
+   零 data 帧发出；按标题查找 API 反射断言不存在；
+3. `unknown_not_resent`——peer 受理（rpc-frame-ack）后丢响应 → 结果只记 unknown，
+   恰好 1 个发送帧，多等一拍仍无重发（结构性无重发计时器）；
+4. `duplicate_events_deduped`——重复 ack×3 + 重复应答×2 + 重复事件×2 全部去重，
+   发送帧恒 1，结果 completed；
+5. `stale_epoch_rejected`——旧代际映射在新代际上 authorizeSend 即抛、构造 SendOnceLoop 即抛，
+   零 data 帧；新代际必须用新 listing 重新绑定；
+6. wire 形状自检——CRC32 往返、rpc-frame 字段、Channel 请求头数组序列化。
+
+## 7.5 合成 marker 设计
+
+正文 = `[tuvis-b2-marker:<UTC ISO 时间戳>]`（唯一、合成、不含任何秘密）；一次运行
+**至多一条**（`--send-authorized` 显式解锁；SendOnceLoop 结构性恒 1 帧）；模型/思考强度/
+模式全缺省=沿用会话现值；不审批、不打断。结果三态：completed（受理+窗口内观察到该会话
+活动帧，去重后）/ accepted（受理但活动窗静默）/ unknown（应答超窗——**绝不重发**）。
+验证核对面（官方 snapshot 的 user 消息与 turn 关联、只读 DB 最终可见性、兄弟会话不串投）
+留实连半场按批准次数执行后入账。
+
+## 7.6 contract.json 落点（B2 准备阶段）
+
+`operations` 追加且仅追加两条 live 已验**只读**操作（`bootstrap-request` /
+`workspace-list-request`，B1 run `macos-B120261024T105940Z-NarmSw`）；`capabilities.send`
+维持 false——实发取证前不得前移；schema 其余不动。
