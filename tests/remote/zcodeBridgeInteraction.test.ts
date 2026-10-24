@@ -74,11 +74,16 @@ import { RelayTerminalConnection } from "../../scripts/zcode-bridge-probe/relayA
 import {
   AGENT_CHANNEL,
   AGENT_SEND_COMMAND_METHOD,
+  ConversationTopicSubscription,
+  REQUEST_TYPE_EVENT_LISTEN,
   REQUEST_TYPE_PROMISE,
+  RESPONSE_TYPE_EVENT_FIRE,
   RESPONSE_TYPE_PROMISE_SUCCESS,
+  crc32WireBytes,
   decodeChannelMessage,
   encodeChannelResponse,
   encodeRpcFrame,
+  type DecodedChannelMessage,
 } from "../../scripts/zcode-bridge-probe/sessionBridge";
 import {
   InteractionCommandLoop,
@@ -485,6 +490,65 @@ function pushCommandAck(
     body: { ...ack, revisionAtDecision: 1 },
   });
   relay.pushPayload(encodeRpcFrame({ identity: FAKE_IDENTITY, seq, messageSeq, bytes }));
+}
+
+/** 解码第 index 条出站 data payload 的 Channel 消息（EventListen / Promise 形状断言用）。 */
+function decodeOutboundFrame(relay: FakeRelay, index: number): DecodedChannelMessage | null {
+  const payload = relay.clientDataPayloads[index];
+  if (!payload) return null;
+  const bytes = Uint8Array.from(Buffer.from(String(payload.dataBase64), "base64"));
+  return decodeChannelMessage(bytes);
+}
+
+/** 服务端 → 客户端 EventFire（204，按 EventListen id 路由；body = topic wire candidate）。 */
+function pushEventFire(
+  relay: FakeRelay,
+  eventId: number,
+  body: unknown,
+  seq: number,
+  messageSeq: number
+): void {
+  const bytes = encodeChannelResponse({
+    responseType: RESPONSE_TYPE_EVENT_FIRE,
+    id: eventId,
+    body,
+  });
+  relay.pushPayload(encodeRpcFrame({ identity: FAKE_IDENTITY, seq, messageSeq, bytes }));
+}
+
+/** conversation subscribe ack（v4-transport.ts:125-131,453-457 的 ACK-only 形状）。 */
+function pushSubscribeAck(
+  relay: FakeRelay,
+  requestId: number,
+  ack: { subscriptionId: string; mode: string; logEpoch: string },
+  seq: number,
+  messageSeq: number
+): void {
+  const bytes = encodeChannelResponse({
+    responseType: RESPONSE_TYPE_PROMISE_SUCCESS,
+    id: requestId,
+    body: { ack },
+  });
+  relay.pushPayload(encodeRpcFrame({ identity: FAKE_IDENTITY, seq, messageSeq, bytes }));
+}
+
+/** physical wire candidate（wire.ts:19-75 complete 形态）+ 内层 logical topic frame。 */
+function completeTopicWire(args: {
+  frame: Record<string, unknown>;
+  subscriptionId?: string;
+  logicalFrameId?: string;
+  logicalFrameOrdinal?: number;
+}): Record<string, unknown> {
+  return {
+    wireVersion: 3,
+    kind: "complete",
+    deliveryKind: "initial",
+    logicalFrameId: args.logicalFrameId ?? "b3-fake-logical-1",
+    logicalFrameOrdinal: args.logicalFrameOrdinal ?? 1,
+    topic: `conversation/${FAKE_TARGET.taskId}`,
+    subscriptionId: args.subscriptionId ?? "fake-sub-b3",
+    frame: args.frame,
+  };
 }
 
 describe("zcode 官方桥接：审批/问答/打断逐能力 fake 合同（B3）", () => {
@@ -1343,5 +1407,268 @@ describe("B3 修复轮：C2 判别式 / I3 选项闸 / I2 消费复活 / I4 snoo
       expect(guards.maxSnoozeFrames).toBe(1);
       expect(guards.maxDurationMs).toBe(250_000);
     }
+  });
+
+  describe("conversation topic subscription（B3 实连修复）", () => {
+    let relay: FakeRelay;
+    const connections: RelayTerminalConnection[] = [];
+
+    afterEach(async () => {
+      for (const conn of connections.splice(0)) {
+        conn.close();
+      }
+      if (relay) await relay.close();
+    });
+
+    async function connectPaired(): Promise<RelayTerminalConnection> {
+      relay = new FakeRelay();
+      await relay.listen();
+      const conn = new RelayTerminalConnection({
+        relayWsUrl: `ws://127.0.0.1:${relay.listenPort}/api/v1/remote/ws2`,
+        token: relay.mintToken(),
+        deviceSid: relay.deviceSid,
+      });
+      connections.push(conn);
+      expect(await conn.connect()).toBe("paired");
+      return conn;
+    }
+
+    it("conversation_topic_subscription_opens_wire_stream：EventListen(onDynamicConversationFrame,workspace) 先行 → subscribeConversationV4 参数/ack → ack 前暂存、ack 后按 subscriptionId 放行 → snapshot/deltas 进 PendingBook", async () => {
+      const conn = await connectPaired();
+      const book = new PendingBook({ sessionId: FAKE_TARGET.taskId, generation: 1 });
+      const subscription = new ConversationTopicSubscription({
+        sender: conn,
+        identity: FAKE_IDENTITY,
+        sessionId: FAKE_TARGET.taskId,
+        workspace: { workspacePath: FAKE_TARGET.workspacePath },
+        subscribeMs: 1_500,
+        sleep: realSleep,
+        onFrame: (frame) => {
+          book.acceptTopicFrame(frame);
+        },
+      });
+      conn.onData = (payload) => subscription.onData(payload);
+      const runPromise = subscription.run();
+      await realSleep(80);
+
+      // ① 第一帧 = EventListen(102)：channel zcode-agent，动态事件 onDynamicConversationFrame，
+      //    body 是 workspace 参数（proxy-channel.ts:126-127；agentConversationTransport.ts:94-97,552）。
+      const listen = decodeOutboundFrame(relay, 0);
+      expect(listen?.headerType).toBe(REQUEST_TYPE_EVENT_LISTEN);
+      expect(listen?.channelName).toBe(AGENT_CHANNEL);
+      expect(listen?.method).toBe("onDynamicConversationFrame");
+      expect(listen?.body).toEqual({ workspacePath: FAKE_TARGET.workspacePath });
+
+      // ② 第二帧 = subscribeConversationV4{workspacePath,workspaceIdentity?,sessionId}
+      //    （agentConversationTransport.ts:187-215；sessionId = conversation topic 后缀）。
+      const subscribeFrame = decodeOutboundFrame(relay, 1);
+      expect(subscribeFrame?.headerType).toBe(REQUEST_TYPE_PROMISE);
+      expect(subscribeFrame?.channelName).toBe(AGENT_CHANNEL);
+      expect(subscribeFrame?.method).toBe("subscribeConversationV4");
+      expect((subscribeFrame?.body as unknown[])[0]).toEqual({
+        workspacePath: FAKE_TARGET.workspacePath,
+        sessionId: FAKE_TARGET.taskId,
+      });
+
+      // ③ ack 之前先到 snapshot（官方 notification 可先于 RPC response；barrier 暂存）
+      const snapshot = topicFrame({
+        sessionId: FAKE_TARGET.taskId,
+        pendingInteractions: [
+          permissionPending({
+            interactionId: "b3-fake-wire-pending-a",
+            toolCallId: "b3-fake-toolcall-w",
+            anchorRowId: 7,
+          }),
+        ],
+      });
+      pushEventFire(relay, 1, completeTopicWire({ frame: snapshot }), 1, 1);
+      await realSleep(40);
+      expect(book.size).toBe(0);
+      expect(subscription.counters.stagedFrames).toBe(1);
+
+      // ④ ack {subscriptionId,mode,logEpoch} → activate；暂存帧按 subscriptionId 放行。
+      pushSubscribeAck(
+        relay,
+        2,
+        { subscriptionId: "fake-sub-b3", mode: "snapshot", logEpoch: "fake-log-epoch" },
+        2,
+        2
+      );
+      await expect(runPromise).resolves.toEqual({
+        kind: "ok",
+        ackMode: "snapshot",
+        subscriptionIdPresent: true,
+      });
+      expect(book.find("b3-fake-wire-pending-a")).not.toBeNull();
+      expect(book.counters.snapshotsApplied).toBe(1);
+
+      // ⑤ 旧 subscriptionId 的帧（ack 前的旧订阅/换代迟到）不交付；⑥ 兄弟 topic 不交付。
+      pushEventFire(
+        relay,
+        1,
+        completeTopicWire({
+          frame: {
+            ...topicFrame({ sessionId: FAKE_TARGET.taskId, pendingInteractions: [] }),
+            subscriptionId: "fake-sub-b3-old",
+          },
+          subscriptionId: "fake-sub-b3-old",
+          logicalFrameId: "b3-fake-logical-old",
+          logicalFrameOrdinal: 2,
+        }),
+        3,
+        3
+      );
+      pushEventFire(
+        relay,
+        1,
+        {
+          wireVersion: 3,
+          kind: "complete",
+          deliveryKind: "initial",
+          logicalFrameId: "b3-fake-logical-sibling",
+          logicalFrameOrdinal: 3,
+          topic: `conversation/${SIBLING_SESSION}`,
+          subscriptionId: "fake-sub-b3",
+          frame: topicFrame({
+            sessionId: SIBLING_SESSION,
+            pendingInteractions: [
+              permissionPending({
+                interactionId: "b3-fake-wire-pending-sibling",
+                toolCallId: "b3-fake-toolcall-s",
+                anchorRowId: 9,
+              }),
+            ],
+          }),
+        },
+        4,
+        4
+      );
+      await realSleep(40);
+      expect(book.size).toBe(1);
+      expect(subscription.counters.staleSubscriptionFrames).toBe(1);
+      expect(subscription.counters.foreignTopicFrames).toBe(1);
+
+      // ⑦ 本订阅 deltas（state.updated 键级整体替换）进册。
+      pushEventFire(
+        relay,
+        1,
+        completeTopicWire({
+          frame: deltasTopicFrame({
+            sessionId: FAKE_TARGET.taskId,
+            patch: { pendingInteractions: [] },
+          }),
+          logicalFrameId: "b3-fake-logical-delta",
+          logicalFrameOrdinal: 4,
+        }),
+        5,
+        5
+      );
+      await realSleep(40);
+      expect(book.size).toBe(0);
+      expect(book.counters.deltasApplied).toBe(1);
+      expect(subscription.counters.eventFramesSeen).toBe(4);
+      expect(subscription.counters.topicFramesDelivered).toBe(2);
+      expect(subscription.counters.controlFramesSent).toBe(2);
+      expect(subscription.counters.subscriptionAcked).toBe(true);
+      expect(subscription.counters.ackMode).toBe("snapshot");
+    });
+
+    it("conversation_topic_fragments_reassembled：physical fragment 按 CRC32 重组为 logical frame；坏 checksum fail-closed", async () => {
+      const conn = await connectPaired();
+      const book = new PendingBook({ sessionId: FAKE_TARGET.taskId, generation: 1 });
+      const subscription = new ConversationTopicSubscription({
+        sender: conn,
+        identity: FAKE_IDENTITY,
+        sessionId: FAKE_TARGET.taskId,
+        workspace: { workspacePath: FAKE_TARGET.workspacePath },
+        subscribeMs: 1_500,
+        sleep: realSleep,
+        onFrame: (frame) => {
+          book.acceptTopicFrame(frame);
+        },
+      });
+      conn.onData = (payload) => subscription.onData(payload);
+      const runPromise = subscription.run();
+      await realSleep(80);
+      pushSubscribeAck(
+        relay,
+        2,
+        { subscriptionId: "fake-sub-b3", mode: "snapshot", logEpoch: "fake-log-epoch" },
+        1,
+        1
+      );
+      await runPromise;
+
+      const pushFragments = (args: {
+        frame: Record<string, unknown>;
+        logicalFrameId: string;
+        ordinal: number;
+        firstSeq: number;
+        checksumOverride?: string;
+      }): void => {
+        const logical = Buffer.from(JSON.stringify(args.frame), "utf8");
+        const split = Math.max(1, Math.floor(logical.length / 2));
+        const checksum = crc32WireBytes(Uint8Array.from(logical));
+        const chunks = [logical.subarray(0, split), logical.subarray(split)];
+        for (const [fragmentIndex, chunk] of chunks.entries()) {
+          pushEventFire(
+            relay,
+            1,
+            {
+              wireVersion: 3,
+              kind: "fragment",
+              deliveryKind: "initial",
+              logicalFrameId: args.logicalFrameId,
+              logicalFrameOrdinal: args.ordinal,
+              topic: `conversation/${FAKE_TARGET.taskId}`,
+              subscriptionId: "fake-sub-b3",
+              fragmentIndex,
+              fragmentCount: chunks.length,
+              logicalBytes: logical.length,
+              checksum: { algorithm: "crc32", value: args.checksumOverride ?? checksum },
+              dataBase64: chunk.toString("base64"),
+            },
+            args.firstSeq + fragmentIndex,
+            args.firstSeq + fragmentIndex
+          );
+        }
+      };
+
+      // ① 正常两片：重组后 snapshot 进册。
+      pushFragments({
+        frame: topicFrame({
+          sessionId: FAKE_TARGET.taskId,
+          pendingInteractions: [
+            permissionPending({
+              interactionId: "b3-fake-frag-pending",
+              toolCallId: "b3-fake-toolcall-f",
+              anchorRowId: 4,
+            }),
+          ],
+        }),
+        logicalFrameId: "b3-fake-frag-1",
+        ordinal: 1,
+        firstSeq: 2,
+      });
+      await realSleep(60);
+      expect(book.find("b3-fake-frag-pending")).not.toBeNull();
+      expect(subscription.counters.fragmentedWireFrames).toBe(2);
+      expect(subscription.counters.fragmentsReassembled).toBe(1);
+
+      // ② 坏 checksum：不交付、不清册，计 assemblyFaults（fail-closed）。
+      const faultsBefore = subscription.counters.assemblyFaults;
+      pushFragments({
+        frame: topicFrame({ sessionId: FAKE_TARGET.taskId, pendingInteractions: [] }),
+        logicalFrameId: "b3-fake-frag-bad",
+        ordinal: 2,
+        firstSeq: 4,
+        checksumOverride: "00000000",
+      });
+      await realSleep(60);
+      expect(book.find("b3-fake-frag-pending")).not.toBeNull();
+      expect(book.size).toBe(1);
+      expect(subscription.counters.assemblyFaults).toBe(faultsBefore + 1);
+      expect(subscription.counters.fragmentsReassembled).toBe(1);
+    });
   });
 });

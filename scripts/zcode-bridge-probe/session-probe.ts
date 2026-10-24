@@ -25,9 +25,11 @@
 //   5. send（--send-authorized 显式解锁，缺省只打印 WOULD-send 即停）——
 //                         workspace-bridge-open{workspaceKey, taskId} → ready → 等桥
 //                         Initialize → rpc-frame 通道 hello/clientHello →
+//                         EventListen(onDynamicConversationFrame, workspace) +
 //                         subscribeConversationV4{workspacePath, workspaceIdentity?,
-//                         sessionId=<精确 taskId>}（订阅只为观察活动帧；官方发送只依赖
-//                         握手）→ sendConversationCommandV4（sendText，正文 = 唯一合成
+//                         sessionId=<精确 taskId>}（官方 UI transport 同序：事件监听
+//                         先行、subscribe ack 后才会有 topic EventFire 帧）→
+//                         sendConversationCommandV4（sendText，正文 = 唯一合成
 //                         marker `[tuvis-b2-marker:<UTC>]`，模型/模式全缺省=沿用会话现
 //                         值）→ 记录受理/完成/未知全生命周期（恰一个 rpc-frame，重复去
 //                         重，未知不重发）→ 主动 close。
@@ -87,6 +89,7 @@ import {
   AGENT_CHANNEL,
   AGENT_CLIENT_HELLO_METHOD,
   AGENT_HELLO_METHOD,
+  ConversationTopicSubscription,
   RESPONSE_TYPE_EVENT_FIRE,
   RESPONSE_TYPE_INITIALIZE,
   ControllerTaskIndexReader,
@@ -314,7 +317,7 @@ export const SESSION_PROBE_STEPS: readonly SessionProbeStep[] = [
     requires: "batch-1 授权（会话 hi 发送一条消息）+ --send-authorized",
     detail:
       "workspace-bridge-open → ready → 等桥 Initialize → hello/clientHello → " +
-      "subscribe sessionId=<精确 taskId> → " +
+      "EventListen(onDynamicConversationFrame) + subscribe sessionId=<精确 taskId> → " +
       "sendConversationCommandV4（sendText，正文 = [tuvis-b2-marker:<UTC>]，模型/模式缺省）→ " +
       "记录 accepted/completed/unknown 全生命周期；恰一个 rpc-frame；未知不重发。",
   },
@@ -1853,7 +1856,8 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           reason: "missing --interaction-authorized",
           chain:
             "workspace-bridge-open{workspaceKey,taskId} → ready → 等桥 Initialize → hello/clientHello → " +
-            "subscribeConversationV4 → 一条合成指令（sendConversationCommandV4）→ 有界等宿主 pending/" +
+            "EventListen(onDynamicConversationFrame,workspace) + subscribeConversationV4 → " +
+            "一条合成指令（sendConversationCommandV4）→ 有界等宿主 pending/" +
             "前台执行 id → resolveInteraction 或带守卫 stop（各恰一个 rpc-frame）",
           note: "无授权 = 不构造任何交互帧；映射与 target lock 证据照常落盘。",
         };
@@ -1887,6 +1891,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           chain:
             "workspace-bridge-open{workspaceKey,taskId} → ready → 等桥 Initialize → " +
             "rpc-frame 通道 helloConversationV4 → initializeConversationV4(clientHello) → " +
+            "EventListen(onDynamicConversationFrame,workspace) + " +
             "subscribeConversationV4{workspacePath, workspaceIdentity?, sessionId} → " +
             "sendConversationCommandV4{workspacePath, workspaceIdentity?, envelope}",
           envelope: {
@@ -2142,22 +2147,56 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
       }
 
-      // 订阅目标会话（官方 UI transport 同款 wire 参数，打开完成证据的事件流；
-      // 官方发送本身只依赖握手，不依赖订阅——此处订阅只为观察轮次活动帧）。
-      // 形状钉源 @ 3c5b2276：subscribe params = {workspacePath, workspaceIdentity?,
-      // sessionId, base?, visibility?, retryInitialization?}
-      // （packages/ui/src/v4/agentConversationTransport.ts:207-214：{...workspace,
-      // sessionId, ...可选基线}；workspace = {workspacePath, workspaceIdentity?}
-      // 同文件 :94-97；ZCodeAgentConversationSubscribeParams
-      // packages/services/src/zcode-agent/zcodeAgent.ts:400-405）。
-      // sessionId = "conversation/<sessionId>" topic 的精确后缀
-      // （packages/shared/src/zcode-protocol-v4/transport.ts:113,205）。
-      const subscribe = await bridgeCall("subscribeConversationV4", {
-        workspacePath: bound.workspacePath,
-        ...(bound.workspaceIdentity !== undefined
-          ? { workspaceIdentity: bound.workspaceIdentity }
-          : {}),
+      // 目标会话 topic 订阅（B3 实连修复）：conversation 帧只经 workspace 级动态事件
+      // onDynamicConversationFrame 下发——必须先 EventListen(onDynamicConversationFrame,
+      // workspace) 再 subscribeConversationV4（官方 transport 同序，
+      // agentConversationTransport.ts:187-259,539-554；dynamic event = EventListen+arg，
+      // proxy-channel.ts:126-127,61-74）。只发 subscribe RPC 时桥只回 request/response，
+      // topic/unsolicited 帧恒 0（B3 实连 230311Z/230432Z 的根因）。
+      const book = new PendingBook({
         sessionId: bound.taskId,
+        generation: CONNECTION_GENERATION,
+      });
+      // 单一入站帧汇（C1）：trigger 运行期间也必须收到 rpc-frame-ack / CommandAck，
+      // 否则 trigger 永远 unknown、观察窗还会晚 20s 才开始。currentLoop 在 trigger
+      // run 之前指向 trigger，resolution run 之前换成 resolution；topic 订阅器照旧
+      // 并行消费同一批帧（pending 卡来自 conversation topic 的 EventFire）。
+      let currentLoop: { onData(payload: unknown): void } | null = null;
+      const topicSubscription = new ConversationTopicSubscription({
+        sender: conn,
+        identity,
+        sessionId: bound.taskId,
+        workspace: {
+          workspacePath: bound.workspacePath,
+          ...(bound.workspaceIdentity !== undefined
+            ? { workspaceIdentity: bound.workspaceIdentity }
+            : {}),
+        },
+        subscribeMs: BRIDGE_RPC_TIMEOUT_MS,
+        firstRequestId: bridgeId + 1,
+        firstSeq: bridgeSeq + 1,
+        firstMessageSeq: bridgeMessageSeq + 1,
+        onFrame: (frame) => {
+          book.acceptTopicFrame(frame);
+        },
+      });
+      // 钩子必须在 run() 之前接好：EventFire 与 subscribe ack 都可能先于轮询到达。
+      sendChannel.onRpcFrame = (payload) => {
+        currentLoop?.onData(payload);
+        topicSubscription.onData(payload);
+      };
+      const subscribe = await topicSubscription.run();
+      bridgeId = topicSubscription.lastRequestId;
+      bridgeSeq = topicSubscription.lastSeq;
+      bridgeMessageSeq = topicSubscription.lastMessageSeq;
+      record(ctx, "send", "conversation-topic-subscribe", {
+        topic: `conversation/${redactor.register("sid", bound.taskId)}`,
+        outcome: subscribe.kind,
+        ackMode: subscribe.kind === "ok" ? subscribe.ackMode : null,
+        counters: { ...topicSubscription.counters },
+        note:
+          "EventListen(onDynamicConversationFrame,workspace) → subscribeConversationV4 → " +
+          "ack；topic=conversation/<taskId>，ack 前帧暂存、ack 后按 subscriptionId 放行",
       });
       if (subscribe.kind !== "ok") {
         sendVerdict = `STOPPED:subscribe-${subscribe.kind}`;
@@ -2191,26 +2230,6 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           foregroundWaitMs: INTERACTION_FOREGROUND_WAIT_MS,
         };
         sendSummary.interaction = interaction;
-        const book = new PendingBook({
-          sessionId: bound.taskId,
-          generation: CONNECTION_GENERATION,
-        });
-        // 单一入站帧汇（C1）：trigger 运行期间也必须收到 rpc-frame-ack / CommandAck，
-        // 否则 trigger 永远 unknown、观察窗还会晚 20s 才开始。currentLoop 在 trigger
-        // run 之前指向 trigger，resolution run 之前换成 resolution；topic 组装器
-        // 照旧并行消费同一批帧（pending 卡来自 conversation topic 的 EventFire）。
-        let currentLoop: { onData(payload: unknown): void } | null = null;
-        const topicAssembler = new RpcFrameAssembler({ identity });
-        sendChannel.onRpcFrame = (payload) => {
-          currentLoop?.onData(payload);
-          const event = topicAssembler.accept(payload);
-          if (event.kind === "duplicate" || event.kind === "fault" || event.kind === "incomplete") {
-            return;
-          }
-          const decoded = decodeChannelMessage(event.bytes);
-          if (!decoded || decoded.headerType !== RESPONSE_TYPE_EVENT_FIRE) return;
-          book.acceptTopicFrame(decoded.body);
-        };
         const sleepMs = (ms: number): Promise<void> =>
           new Promise((resolve) => setTimeout(resolve, ms));
         const waitUntil = async <T>(probe: () => T | null, ms: number): Promise<T | null> => {
@@ -2450,7 +2469,12 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           };
         }
 
-        interaction.channel = { ...book.counters, pendingSize: book.size };
+        interaction.channel = {
+          ...book.counters,
+          pendingSize: book.size,
+          // 订阅链证据：EventFire / wire 帧 / fragment 重组 / 交付计数（不含 subscriptionId）。
+          subscription: { ...topicSubscription.counters },
+        };
         if (unavailable !== null) {
           sendVerdict = unavailable;
           interaction.resolution = { attempted: false, reason: unavailable };
@@ -2547,8 +2571,10 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         });
         // rpc-frame 与 rpc-frame-ack 经 handle → onRpcFrame 喂给 loop（attach 已在
         // bridge-open 前完成；ack 转发见 B2Channel.handle 的 rpc-frame-ack 分支）。
-        sendChannel.onRpcFrame = (payload) => loop.onData(payload);
+        // 复用同一单槽帧汇：topic 订阅器继续消费 conversation 帧（活动判据见 loop）。
+        currentLoop = loop;
         const sendOutcome = await loop.run();
+        currentLoop = null;
         sendSummary.marker = {
           prefix: "[tuvis-b2-marker:",
           issuedUtc: marker.slice(17, -1),
@@ -2585,6 +2611,9 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
                   ? "STOPPED:send-failed"
                   : "UNKNOWN";
       }
+      // 事件流订阅证据（两种 send 模式都记）：EventFire / wire / fragment / 交付计数
+      // （不含 subscriptionId 真实值）。
+      sendSummary.subscription = { ...topicSubscription.counters };
       recordChannelEvidence(ctx, "send", sendChannel);
 
       // —— s8：teardown ————————————————————————————————————————————————————————

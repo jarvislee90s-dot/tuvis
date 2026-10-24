@@ -705,3 +705,20 @@ node scripts/zcode-bridge-probe/interaction-probe.ts approve \
 - 前置：用户本人在浏览器完成一次官方 OAuth（每 run 一次）；实跑期间不依赖官方网页会话（同 role 互踢）；目标固定为 Travel 工作区「hi」会话（batch-2 已授权）。
 - 触发指令为合成文本（`[tuvis-b3-probe:<UTC>]` + 无害文件操作 / 提问卡 / 逐行写文件），不含真实会话内容。
 - 如实申报：若会话为自动批准模式（无 pending 卡）→ 审批能力记 `UNAVAILABLE:no-pending-observed`；问答卡形状不可解或非 AskUserQuestion（含计划审批卡）→ `UNAVAILABLE:answer-shape-unsupported`；无前台执行 id → `UNAVAILABLE:no-foreground-execution`（旧口径 `NOOP:guard.stopTargetChanged` 仅在守卫在执行中变化时出现）；均不重试、不猜测。
+
+### 8.4 追加：conversation topic 事件流的 channel 订阅链勘误（2026-10-25；不改写上文）
+
+> 触发证据：B3 实连 `macos-B320261024T230311Z-aTrTIg` / `macos-B320261024T230432Z-Vmt1pg`。两次 run 在 `bridge-subscribeConversationV4 {outcome:"ok"}` 之后只收到 request/response 帧，`unsolicited-frames: 0`、无任何 EVENT_FIRE/topic 帧 → `PendingBook` 恒空。固定源码基线仍为 `3c5b227649371507ddc4eb46ac5133afe6db1cab`（行号 @ 该 SHA）。
+
+**根因（superseded 方案）**：此前只发 `bridgeCall("subscribeConversationV4", {workspacePath, sessionId})`（普通 Promise 请求）。该调用只让 CLI 建立订阅；CLI 的 conversation 帧走 `V4_NOTIFICATIONS.conversationFrame` 通知 → `zcodeAgentService` 按 workspace 投递给 `getConversationFrameEmitter(workspace)`（`zcodeAgentService.ts:2360-2395` 分发、`:1771-1780` 建 emitter、`:6563-6565` 暴露事件）。emitter 只有在 channel **事件监听**挂上时才有订阅者；官方 UI 的监听点是 `agentService.onDynamicConversationFrame(workspace)(...)`（`agentConversationTransport.ts:539-554`）。只发 RPC 不 EventListen 时该 emitter 无订阅者，桥侧只有 request/response 返程，因此 topic 帧永远不会变成 EVENT_FIRE/`unsolicited` 帧。B2 controller reader 之所以能收到帧，正是因为它先 `EventListen(onDynamicControllerFrame)` 再 subscribe。
+
+**官方客户端订阅链（逐段行号）**：
+
+1. **帧监听先行**：`agentService.onDynamicConversationFrame(workspace)`（`agentConversationTransport.ts:552-554`；`zcodeAgent.ts:956-960` 的签名为 `onDynamicConversationFrame(params: ZCodeAgentWorkspaceTarget): Event<ConversationTopicWireCandidate>`；`workspace = {workspacePath, workspaceIdentity?}` 同文件 `:94-97`）。动态事件客户端 = `channel.listen(propKey, arg)`（`proxy-channel.ts:126-127`），服务端 = 动态事件 `target.call(handler, arg)`（`proxy-channel.ts:61-74`）；wire = `EventListen(102) + serialize(arg)`（`channelClient.ts:150-177,179-194`）。
+2. **topic 订阅**：`subscribeConversationV4({...workspace, sessionId, ...(base?), ...(visibility?), ...(retryInitialization?)})`（`agentConversationTransport.ts:187-215`；`sessionId` 来自 topic 后缀 `:188`，topic 规则 `transport.ts:113,205`）。ack = `{ack:{subscriptionId, mode, logEpoch}}`（`v4-transport.ts:125-131,158-161,453-457`），`agentConversationTransport.ts:233,247` 取 `subscriptionId`。
+3. **ACK 激活屏障**：`barrier.begin(topic)` 在 RPC 前登记（`:202-205`）、`barrier.bind(pending, result.ack.subscriptionId)` 绑定 ack（`:232-247`）、`activate(subscriptionId)` 后只放行同 subscriptionId 的暂存帧（`:276-291`；`ackActivationBarrier.ts`：notification 可先于 RPC response，ack 前按 topic 暂存）。
+4. **帧体**：EVENT_FIRE body = physical wire candidate（`wire.ts:19-75`：`{wireVersion:3, kind:"complete"|"fragment", deliveryKind?, logicalFrameId, logicalFrameOrdinal, topic, subscriptionId, frame?|fragment 字段}`）；logical frame = `{topic,subscriptionId,fromSeq,toSeq,sentAt,payload}`（`v4-transport.ts:163-191`）。超 1 MiB 逻辑帧按 UTF-8 字节分片、CRC32 校验（`wire-codec.ts`）。
+
+**探针修正**：新增 `ConversationTopicSubscription`（`scripts/zcode-bridge-probe/sessionBridge.ts`，与 `ControllerTaskIndexReader` 同族：同一 `encodeChannelEventListen`/`encodeChannelRequest`/`RpcFrameAssembler`/`decodeChannelMessage` 与有界等待循环）。`run()` 顺序 = EventListen(`onDynamicConversationFrame`, workspace) → subscribe → 有界等 ack → 激活；ack 前帧暂存，ack 后按 `subscriptionId` 放行；兄弟 topic / 旧 subscriptionId / 坏 wire 帧只计数不交付；complete 直通、fragment 按 CRC32 重组。`session-probe.ts` 在 hello/clientHello 之后、触发帧之前建立该订阅，单槽帧汇先接钩子再 `run()`；topic 帧直入 `PendingBook`（不再把 EventFire body 当作 topic frame 直接喂册）。发送语义不变：仍恰 1 个触发帧 + 至多 1 个 resolve/stop（+ 至多 1 个 snooze），无重发。
+
+**fake 合同**：`tests/remote/zcodeBridgeInteraction.test.ts` 新增 2 条——①EventListen 帧先行（channel `zcode-agent`、事件名、workspace 参数）→ subscribe 参数 → ack 前暂存 → ack 激活/按 subscriptionId 放行 → 兄弟 topic 与旧订阅帧拒收 → deltas 进册；②fragment 两片 CRC32 重组进册、坏 checksum fail-closed。
