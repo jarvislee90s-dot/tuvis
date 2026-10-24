@@ -25,9 +25,11 @@
 //   5. send（--send-authorized 显式解锁，缺省只打印 WOULD-send 即停）——
 //                         workspace-bridge-open{workspaceKey, taskId} → ready → 等桥
 //                         Initialize → rpc-frame 通道 hello/clientHello →
+//                         EventListen(onDynamicConversationFrame, workspace) +
 //                         subscribeConversationV4{workspacePath, workspaceIdentity?,
-//                         sessionId=<精确 taskId>}（订阅只为观察活动帧；官方发送只依赖
-//                         握手）→ sendConversationCommandV4（sendText，正文 = 唯一合成
+//                         sessionId=<精确 taskId>}（官方 UI transport 同序：事件监听
+//                         先行、subscribe ack 后才会有 topic EventFire 帧）→
+//                         sendConversationCommandV4（sendText，正文 = 唯一合成
 //                         marker `[tuvis-b2-marker:<UTC>]`，模型/模式全缺省=沿用会话现
 //                         值）→ 记录受理/完成/未知全生命周期（恰一个 rpc-frame，重复去
 //                         重，未知不重发）→ 主动 close。
@@ -68,11 +70,26 @@ import {
   type LoopbackCallback,
   type OAuthProviderChannel,
 } from "./oauthFlow.ts";
+import {
+  INTERACTION_COMMAND_TYPES,
+  InteractionCommandLoop,
+  PendingBook,
+  authorizePendingResolution,
+  buildPermissionAnswer,
+  buildStopPayload,
+  buildUserInputAnswer,
+  PERMISSION_FULL_ACCESS_OPTION_ID,
+  planInteractionCommands,
+  type InteractionCommandType,
+  type ObservedPending,
+  type UserInputAnswerEntry,
+} from "./interactionBridge.ts";
 import { RELAY_WS_PATH, RelayTerminalConnection, requestTerminalToken } from "./relayAuth.ts";
 import {
   AGENT_CHANNEL,
   AGENT_CLIENT_HELLO_METHOD,
   AGENT_HELLO_METHOD,
+  ConversationTopicSubscription,
   RESPONSE_TYPE_EVENT_FIRE,
   RESPONSE_TYPE_INITIALIZE,
   ControllerTaskIndexReader,
@@ -163,6 +180,69 @@ const TASK_ENUM_UNSUBSCRIBE_TIMEOUT_MS = 5_000;
 const SEND_ACK_TIMEOUT_MS = 20_000;
 /** 受理后的轮次活动观察窗。 */
 const SEND_ACTIVITY_TIMEOUT_MS = 30_000;
+/**
+ * B3 交互半场（--interaction）：指令受理后等待宿主 pending 卡 / 前台执行 id 的有界窗。
+ * 超窗 = 该能力本 run 不可用（如实记录 reason，不重试、不猜测）。
+ */
+const INTERACTION_PENDING_WAIT_MS = 30_000;
+/** interrupt 模式下等待 control.activeWorks.foregroundExecutionId 的有界窗。 */
+const INTERACTION_FOREGROUND_WAIT_MS = 30_000;
+
+/**
+ * 按运行模式派生的安全闸（I5）：B3 交互 run 实际会发 2 个命令帧（触发 + 应答/stop），
+ * 若沿用 B2 的 maxSendFrames:1 与 sendRequiresExplicitFlag，证据里的闸与实际行为不符。
+ * 交互模式额外允许最多 1 个 autoResolution snooze 前置帧（I4；仅当卡上
+ * autoResolution 在场，见 interaction.snooze 证据），总命令帧 ≤3。
+ * 时长预算：B2 链 180s + 触发 ACK 20s + 观察窗 30s + 应答 ACK 20s = 250s。
+ */
+export type ProbeGuardSet = {
+  readonly singleConnection: true;
+  readonly reconnectPolicy: "never";
+  readonly stopOnKicked: true;
+  readonly mappingReadonly: true;
+  readonly sendRequiresExplicitFlag: boolean;
+  readonly interactionRequiresExplicitFlag: boolean;
+  readonly maxSendFrames: number;
+  readonly maxSnoozeFrames: number;
+  readonly maxDurationMs: number;
+  readonly credentialsInMemoryOnly: true;
+};
+
+export function deriveProbeGuards(mode: InteractionMode | null): ProbeGuardSet {
+  if (mode === null) {
+    return {
+      singleConnection: PROBE_GUARDS.singleConnection,
+      reconnectPolicy: PROBE_GUARDS.reconnectPolicy,
+      stopOnKicked: PROBE_GUARDS.stopOnKicked,
+      mappingReadonly: PROBE_GUARDS.mappingReadonly,
+      sendRequiresExplicitFlag: PROBE_GUARDS.sendRequiresExplicitFlag,
+      interactionRequiresExplicitFlag: false,
+      maxSendFrames: PROBE_GUARDS.maxSendFrames,
+      maxSnoozeFrames: 0,
+      maxDurationMs: PROBE_GUARDS.maxDurationMs,
+      credentialsInMemoryOnly: PROBE_GUARDS.credentialsInMemoryOnly,
+    };
+  }
+  return {
+    singleConnection: PROBE_GUARDS.singleConnection,
+    reconnectPolicy: PROBE_GUARDS.reconnectPolicy,
+    stopOnKicked: PROBE_GUARDS.stopOnKicked,
+    mappingReadonly: PROBE_GUARDS.mappingReadonly,
+    // 交互模式由 --interaction-authorized 解锁；--send-authorized 不参与交互链。
+    sendRequiresExplicitFlag: false,
+    interactionRequiresExplicitFlag: true,
+    maxSendFrames: 2,
+    maxSnoozeFrames: 1,
+    maxDurationMs:
+      PROBE_GUARDS.maxDurationMs +
+      SEND_ACK_TIMEOUT_MS +
+      INTERACTION_PENDING_WAIT_MS +
+      SEND_ACK_TIMEOUT_MS,
+    credentialsInMemoryOnly: PROBE_GUARDS.credentialsInMemoryOnly,
+  };
+}
+/** 交互半场指令的关键词前缀（合成 marker，正文只含 UTC 时间戳与随机短码）。 */
+const INTERACTION_MARKER_PREFIX = "[tuvis-b3-probe:";
 /** JWT 形状闸：三段 base64url（只判形，不解码不校验签名）。 */
 const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 /** 默认产品 DB 路径（只读打开）。 */
@@ -237,7 +317,7 @@ export const SESSION_PROBE_STEPS: readonly SessionProbeStep[] = [
     requires: "batch-1 授权（会话 hi 发送一条消息）+ --send-authorized",
     detail:
       "workspace-bridge-open → ready → 等桥 Initialize → hello/clientHello → " +
-      "subscribe sessionId=<精确 taskId> → " +
+      "EventListen(onDynamicConversationFrame) + subscribe sessionId=<精确 taskId> → " +
       "sendConversationCommandV4（sendText，正文 = [tuvis-b2-marker:<UTC>]，模型/模式缺省）→ " +
       "记录 accepted/completed/unknown 全生命周期；恰一个 rpc-frame；未知不重发。",
   },
@@ -249,9 +329,15 @@ export const SESSION_PROBE_STEPS: readonly SessionProbeStep[] = [
   },
 ];
 
+/** B3 交互模式（--interaction=<mode>；逐能力一条链路，绝不混用）。 */
+export const INTERACTION_MODES = ["approve", "reject", "answer", "interrupt"] as const;
+export type InteractionMode = (typeof INTERACTION_MODES)[number];
+
 type ProbeFlags = {
   unlock: boolean;
   sendAuthorized: boolean;
+  interaction: InteractionMode | null;
+  interactionAuthorized: boolean;
   open: boolean;
   oauthWaitMs: number;
   jwtStdin: boolean;
@@ -270,6 +356,8 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
   const flags: ProbeFlags = {
     unlock: false,
     sendAuthorized: false,
+    interaction: null,
+    interactionAuthorized: false,
     open: false,
     oauthWaitMs: 300_000,
     jwtStdin: false,
@@ -284,7 +372,16 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
     const arg = argv[i];
     if (arg === "--i-know-this-connects") flags.unlock = true;
     else if (arg === "--send-authorized") flags.sendAuthorized = true;
-    else if (arg === "--open") flags.open = true;
+    else if (arg === "--interaction-authorized") flags.interactionAuthorized = true;
+    else if (arg.startsWith("--interaction=")) {
+      const value = arg.slice("--interaction=".length).trim();
+      if (!INTERACTION_MODES.includes(value as InteractionMode)) {
+        return `--interaction 只接受 ${INTERACTION_MODES.join(" | ")}，收到：${value || "(空)"}`;
+      }
+      flags.interaction = value as InteractionMode;
+    } else if (arg === "--interaction") {
+      return "--interaction 需要 =<mode> 形式，例如 --interaction=approve";
+    } else if (arg === "--open") flags.open = true;
     else if (arg === "--jwt-stdin") flags.jwtStdin = true;
     else if (arg === "--help" || arg === "-h") flags.help = true;
     else if (arg.startsWith("--workspace=")) {
@@ -328,9 +425,12 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
 
 function printHelp(): void {
   const lines: string[] = [];
-  lines.push("zcode-bridge-probe / session-probe — B2 会话映射与单次发送探针");
+  lines.push("zcode-bridge-probe / session-probe — B2 会话映射与单次发送探针（B3 交互半场）");
   lines.push("");
   lines.push("用法：node scripts/zcode-bridge-probe/session-probe.ts <flags>");
+  lines.push(
+    "      node scripts/zcode-bridge-probe/interaction-probe.ts <approve|reject|answer|interrupt> <flags>"
+  );
   lines.push("");
   lines.push("安全闸（硬编码，不可放宽）：");
   lines.push(`  ${JSON.stringify(PROBE_GUARDS)}`);
@@ -341,6 +441,21 @@ function printHelp(): void {
     `  ${SEND_FLAG}             发送步解锁（batch-1 授权：会话 ${DEFAULT_TASK_DESIGNATION} 发一条消息）。`
   );
   lines.push("                             缺席时映射完成后只打印 WOULD-send 即停，绝不发送。");
+  lines.push(
+    `  --interaction=<mode>      B3 交互半场：approve | reject | answer | interrupt（缺省无）。`
+  );
+  lines.push(
+    "                             仅与 --interaction-authorized 同时给出才执行；approve/reject 发无害"
+  );
+  lines.push(
+    "                             文件写指令后应答宿主 pending 权限卡，answer 应答问答卡，interrupt 发"
+  );
+  lines.push(
+    "                             长跑指令后按 activeWorks 守卫 id 精确 stop；证据落 macos-B3<run_id>。"
+  );
+  lines.push(
+    "  --interaction-authorized  交互半场解锁（与 --interaction 成对；缺一即映射后只打印 WOULD-interact）。"
+  );
   lines.push("  --workspace=<指称>        测试工作区指称（默认 Travel；listing label 精确匹配，");
   lines.push(
     "                             多候选时按 purpose=project → activeWorkspaceKey 阶梯唯一化，"
@@ -375,6 +490,12 @@ function printHelp(): void {
   lines.push("    bridge-open-refused 中止并记录 APP 返回的 reason/error；");
   lines.push("  · 发送步只会向指定会话注入一条合成 marker 消息（内容仅含 UTC 时间戳），");
   lines.push("    不审批、不打断、不改模型；结果未知时绝不重发。");
+  lines.push(
+    "  · --interaction 交互步（需 --interaction-authorized）只做合成指令触发的单张 pending 应答或"
+  );
+  lines.push(
+    "    有守卫 stop；pending/执行 id 未在窗内出现即如实记 capability-unavailable，不重试、不盲停。"
+  );
   lines.push("");
   lines.push(
     `证据：~/Documents/tuvis-verify-logs/zcode/macos-B2<UTC 时间戳>-<随机码>/（0600，脱敏）。`
@@ -417,13 +538,17 @@ function relayWsUrlFromOrigin(origin: string): string {
 // B2 payload 通道：mapping 阶段白名单只读请求 + rpc-frame 被动组装 + bridge 请求
 // ---------------------------------------------------------------------------
 
-type AppPayloadOutcome =
+export type AppPayloadOutcome =
   { kind: "ok"; payload: Record<string, unknown> } | { kind: "send-failed" } | { kind: "timeout" };
 
 type BridgeRpcOutcome =
   { kind: "ok"; decoded: DecodedChannelMessage } | { kind: "send-failed" } | { kind: "timeout" };
 
-class B2Channel {
+/**
+ * B2/B3 共用的桥通道适配器（B3 interaction-probe 复用；导出不改任何行为——
+ * 单槽 onData / 白名单 payload / Initialize 门 / 接收侧回执语义见类内注释）。
+ */
+export class B2Channel {
   private readonly allowedTypes: readonly AppPayloadRequestType[];
   private readonly pendingApp = new Map<string, (payload: Record<string, unknown>) => void>();
   private readonly pendingBridge = new Map<number, (decoded: DecodedChannelMessage) => void>();
@@ -700,7 +825,10 @@ class B2Channel {
 // listing 采集：workspace 条目与 task 行（精确 id）从真实帧里结构化收割
 // ---------------------------------------------------------------------------
 
-function harvestTaskRows(value: unknown, out: TaskListingRow[]): void {
+/** listing 采集：workspace 条目与 task 行（精确 id）从真实帧里结构化收割
+ * （B3 interaction-probe 复用；导出不改任何行为）。 */
+
+export function harvestTaskRows(value: unknown, out: TaskListingRow[]): void {
   if (Array.isArray(value)) {
     for (const item of value) harvestTaskRows(item, out);
     return;
@@ -735,7 +863,7 @@ function harvestTaskRows(value: unknown, out: TaskListingRow[]): void {
   for (const item of Object.values(record)) harvestTaskRows(item, out);
 }
 
-function harvestWorkspaceEntries(
+export function harvestWorkspaceEntries(
   payloads: Array<Record<string, unknown> | null>,
   out: WorkspaceListingEntry[]
 ): void {
@@ -767,7 +895,7 @@ function harvestWorkspaceEntries(
   }
 }
 
-function dedupeRows(rows: TaskListingRow[]): TaskListingRow[] {
+export function dedupeRows(rows: TaskListingRow[]): TaskListingRow[] {
   const seen = new Set<string>();
   const out: TaskListingRow[] = [];
   for (const row of rows) {
@@ -811,6 +939,157 @@ function record(ctx: RunContext, step: string, message: string, data?: unknown):
   });
 }
 
+/**
+ * 目标锁定行的 stdout 文案（2026-10-24 收官修复）：此前该行把**真实** taskId /
+ * workspaceKey 直接打上 stdout——证据文件经 SecretRedactor fail-closed 脱敏，但
+ * stdout 不在落盘闸内（run macos-B220261024T132316Z-prItvw 即漏）。修复 = 真实值
+ * 一律先经 redactor 登记取别名再拼行（mapping 阶段已登记过同一值 → 复用同一别名）；
+ * 人类可读的 verdict 措辞保持不变。
+ */
+export function formatTargetLockedLine(
+  redactor: SecretRedactor,
+  target: { taskId: string; workspaceKey: string; generation: number }
+): string {
+  const taskIdAlias = redactor.register("sid", target.taskId) ?? "<unregistered>";
+  const workspaceAlias = redactor.register("path", target.workspaceKey) ?? "<unregistered>";
+  return `目标已锁定（别名）：taskId=${taskIdAlias} workspace=${workspaceAlias}（generation ${target.generation}）。`;
+}
+
+/**
+ * B3 交互半场的合成指令（唯一 marker 前缀；正文只含 UTC 时间戳与目标文件名，
+ * 不含任何真实会话内容/凭据）。措辞取「可观察、无害、可回滚」的最小面：
+ *   - approve/reject：一次临时文件创建（触发权限卡；路径在当前工作区，用户可删）；
+ *   - answer：请宿主用提问卡问一个二选一（观察 AskUserQuestion 卡与应答闭环）；
+ *   - interrupt：顺序逐行写文件的长任务（为精确停提供前台执行 id 观察窗）。
+ */
+function buildInteractionInstruction(mode: InteractionMode): string {
+  const tag = `${INTERACTION_MARKER_PREFIX}${new Date().toISOString()}]`;
+  switch (mode) {
+    case "approve":
+    case "reject":
+      return `${tag} 请创建一个名为 tuvis-b3-permission-test.txt 的临时文件（放在当前工作区根目录），内容写 tuvis-b3。完成后一句话说明结果。`;
+    case "answer":
+      return `${tag} 请用提问卡问我一个单选题，问题原文用「继续还是暂停？」，提供两个选项：继续 / 暂停。等我回答后再继续。`;
+    case "interrupt":
+      return `${tag} 请顺序执行一个耗时任务：从 1 数到 80，每一步把当前数字单独写一行追加到临时文件 tuvis-b3-interrupt-test.txt，逐行进行，不要合并、不要跳步，完成后简短总结。`;
+  }
+}
+
+/**
+ * 权限卡选项 id 收集：**只**读 payload.options（snapshot.ts:235-262
+ * permissionRequestPayloadSchema.options 是唯一选项面），不再对整份 payload 做深度
+ * 扫描——深度扫描会把 detail/display 里的同名字符串误当选项（I3）。
+ */
+export function collectOptionIdsFromOptions(options: unknown): string[] {
+  if (!Array.isArray(options)) return [];
+  const found: string[] = [];
+  for (const option of options) {
+    if (!option || typeof option !== "object") continue;
+    const record = option as { optionId?: unknown };
+    if (typeof record.optionId === "string" && record.optionId.length > 0) {
+      found.push(record.optionId);
+    }
+  }
+  return [...new Set(found)];
+}
+
+/**
+ * 权限卡"常驻授权"判定：snapshot.ts:235-240 permissionOptionSchema.kind 闭集 =
+ * allowOnce | allowAlways | deny | custom；allowAlways 是常驻授权，探针绝不选。
+ * fullAccess 另由 optionId 硬闸（snapshot.ts:234 + buildPermissionAnswer 断言）。
+ */
+export function isStandingPermissionGrant(kind: unknown): boolean {
+  return kind === "allowAlways";
+}
+
+/**
+ * 权限卡选项选择（I3）：只从卡上 payload.options 的显式 optionId 里挑——
+ *   approve → kind === "allowOnce"（一次性放行；常驻授权 allowAlways / custom 一律不选）；
+ *   reject  → kind === "deny"；
+ * fullAccess 特权项（optionId = "fullAccess"，snapshot.ts:234）无论 kind 都硬闸排除。
+ * 没有唯一明确的 once/deny 项 → null（调用方记 UNAVAILABLE:permission-option-unresolved，
+ * 绝不按字符串相似度猜 optionId）。
+ */
+export function pickPermissionOption(
+  pending: ObservedPending,
+  mode: "approve" | "reject"
+): string | null {
+  const options = (pending.payload as { options?: unknown }).options;
+  if (!Array.isArray(options)) return null;
+  const wantedKind = mode === "approve" ? "allowOnce" : "deny";
+  for (const option of options) {
+    if (!option || typeof option !== "object") continue;
+    const record = option as { optionId?: unknown; kind?: unknown };
+    if (typeof record.optionId !== "string" || record.optionId.length === 0) continue;
+    if (record.optionId === PERMISSION_FULL_ACCESS_OPTION_ID) continue;
+    if (isStandingPermissionGrant(record.kind)) continue;
+    if (record.kind !== wantedKind) continue;
+    return record.optionId;
+  }
+  return null;
+}
+
+/**
+ * 问答卡可答性（C2）：只有 AskUserQuestion 投影出的 userInput 卡才可进入 answer 链。
+ * 判别式（product-projection.ts @ 3c5b2276）：
+ *   - AskUserQuestion：permission_requested → kind:"userInput" 且
+ *     payload.toolName === "AskUserQuestion"（:3391-3409；isAskUserQuestionToolName
+ *     :5793-5795）；
+ *   - ExitPlanMode 计划审批**同样**投影成 kind:"userInput"（:3440-3459，
+ *     schema.interaction = "plan_approval"，question = reason，options[0].value =
+ *     "approve"）——它不是问答，绝不能当问答应答；
+ *   - MCP elicitation 也是 userInput（:3411-3438，schema.interaction =
+ *     MCP_ELICITATION_INTERACTION）；无可识别工具的卡一律不支持。
+ */
+export function isAnswerableUserInput(pending: ObservedPending): boolean {
+  if (pending.kind !== "userInput") return false;
+  const payload = pending.payload;
+  if (payload.toolName !== "AskUserQuestion") return false;
+  const schema = payload.schema;
+  if (
+    schema &&
+    typeof schema === "object" &&
+    (schema as { interaction?: unknown }).interaction === "plan_approval"
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 问答卡应答条目：题干全文 + 首个选项 value（原值回传）。调用方须先过
+ * isAnswerableUserInput（否则 plan approval 也可被当成问答）。形状不可解 = null
+ * （调用方记 UNAVAILABLE:answer-shape-unresolved，绝不虚构题干/选项）。
+ */
+export function pickUserInputEntries(pending: ObservedPending): UserInputAnswerEntry[] | null {
+  const questions = (pending.payload as { questions?: unknown }).questions;
+  if (!Array.isArray(questions) || questions.length === 0) return null;
+  const entries: UserInputAnswerEntry[] = [];
+  for (const question of questions) {
+    if (!question || typeof question !== "object") return null;
+    const record = question as Record<string, unknown>;
+    const questionText =
+      typeof record.question === "string"
+        ? record.question
+        : typeof record.text === "string"
+          ? record.text
+          : null;
+    const options = Array.isArray(record.options) ? record.options : [];
+    const values = options
+      .map((option) =>
+        option && typeof option === "object" ? (option as { value?: unknown }).value : null
+      )
+      .filter((value): value is string => typeof value === "string" && value.length > 0);
+    if (!questionText || values.length === 0) return null;
+    entries.push({
+      questionText,
+      selectedValues: [values[0]!],
+      multiSelect: record.multiSelect === true,
+    });
+  }
+  return entries;
+}
+
 export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
   const parsed = parseFlags(argv);
   if (typeof parsed === "string") {
@@ -850,7 +1129,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
   }
 
   const redactor = new SecretRedactor();
-  const run = createEvidenceRunDir(undefined, "B2");
+  const run = createEvidenceRunDir(undefined, parsed.interaction !== null ? "B3" : "B2");
   const startedIso = new Date().toISOString();
   const ctx: RunContext = { redactor, run, startedIso, flags: parsed, events: [] };
   log(`证据目录（私有，勿提交/外发）：${run.dir}`);
@@ -1561,13 +1840,49 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         listingSizes: { workspaces: workspaces.length, tasks: tasks.length },
         note: "指称只在 designate 步用于唯一化定位；发送归因用精确 id（resolveTarget 产物）",
       });
-      log(
-        `目标已锁定（别名）：taskId=${bound.taskId} workspace=${bound.workspaceKey}（generation ${bound.generation}）。`
-      );
+      log(formatTargetLockedLine(redactor, bound));
 
-      // —— s7：send（缺 --send-authorized 只打印 WOULD-send） ————————————————
+      // —— s7：send / B3 交互半场（两把锁各自独立：send 只认 --send-authorized，
+      // interaction 只认 --interaction + --interaction-authorized；缺锁一律映射后即停）
       stage = "send";
-      if (!parsed.sendAuthorized) {
+      const interactionMode = parsed.interaction;
+      if (interactionMode !== null && !parsed.interactionAuthorized) {
+        sendVerdict = "MAPPED-NOT-SENT";
+        sendSummary.attempted = false;
+        sendSummary.reason = "missing --interaction-authorized";
+        sendSummary.interaction = {
+          mode: interactionMode,
+          attempted: false,
+          reason: "missing --interaction-authorized",
+          chain:
+            "workspace-bridge-open{workspaceKey,taskId} → ready → 等桥 Initialize → hello/clientHello → " +
+            "EventListen(onDynamicConversationFrame,workspace) + subscribeConversationV4 → " +
+            "一条合成指令（sendConversationCommandV4）→ 有界等宿主 pending/" +
+            "前台执行 id → resolveInteraction 或带守卫 stop（各恰一个 rpc-frame）",
+          note: "无授权 = 不构造任何交互帧；映射与 target lock 证据照常落盘。",
+        };
+        record(ctx, "interaction", "would-interact", sendSummary.interaction);
+        log(
+          `未提供 --interaction-authorized：映射完成即停（--interaction=${interactionMode} 未执行）。`
+        );
+        conn.close();
+        channel.detach();
+        gate.release();
+        record(ctx, "teardown", "closed", {});
+        await writeEvidence(
+          ctx,
+          oauthVerdict,
+          connectVerdict,
+          mappingVerdict,
+          sendVerdict,
+          oauthSummary,
+          connectSummary,
+          mappingSummary,
+          sendSummary
+        );
+        return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
+      }
+      if (interactionMode === null && !parsed.sendAuthorized) {
         sendVerdict = "MAPPED-NOT-SENT";
         sendSummary.attempted = false;
         sendSummary.reason = "missing --send-authorized";
@@ -1576,6 +1891,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           chain:
             "workspace-bridge-open{workspaceKey,taskId} → ready → 等桥 Initialize → " +
             "rpc-frame 通道 helloConversationV4 → initializeConversationV4(clientHello) → " +
+            "EventListen(onDynamicConversationFrame,workspace) + " +
             "subscribeConversationV4{workspacePath, workspaceIdentity?, sessionId} → " +
             "sendConversationCommandV4{workspacePath, workspaceIdentity?, envelope}",
           envelope: {
@@ -1831,22 +2147,56 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
       }
 
-      // 订阅目标会话（官方 UI transport 同款 wire 参数，打开完成证据的事件流；
-      // 官方发送本身只依赖握手，不依赖订阅——此处订阅只为观察轮次活动帧）。
-      // 形状钉源 @ 3c5b2276：subscribe params = {workspacePath, workspaceIdentity?,
-      // sessionId, base?, visibility?, retryInitialization?}
-      // （packages/ui/src/v4/agentConversationTransport.ts:207-214：{...workspace,
-      // sessionId, ...可选基线}；workspace = {workspacePath, workspaceIdentity?}
-      // 同文件 :94-97；ZCodeAgentConversationSubscribeParams
-      // packages/services/src/zcode-agent/zcodeAgent.ts:400-405）。
-      // sessionId = "conversation/<sessionId>" topic 的精确后缀
-      // （packages/shared/src/zcode-protocol-v4/transport.ts:113,205）。
-      const subscribe = await bridgeCall("subscribeConversationV4", {
-        workspacePath: bound.workspacePath,
-        ...(bound.workspaceIdentity !== undefined
-          ? { workspaceIdentity: bound.workspaceIdentity }
-          : {}),
+      // 目标会话 topic 订阅（B3 实连修复）：conversation 帧只经 workspace 级动态事件
+      // onDynamicConversationFrame 下发——必须先 EventListen(onDynamicConversationFrame,
+      // workspace) 再 subscribeConversationV4（官方 transport 同序，
+      // agentConversationTransport.ts:187-259,539-554；dynamic event = EventListen+arg，
+      // proxy-channel.ts:126-127,61-74）。只发 subscribe RPC 时桥只回 request/response，
+      // topic/unsolicited 帧恒 0（B3 实连 230311Z/230432Z 的根因）。
+      const book = new PendingBook({
         sessionId: bound.taskId,
+        generation: CONNECTION_GENERATION,
+      });
+      // 单一入站帧汇（C1）：trigger 运行期间也必须收到 rpc-frame-ack / CommandAck，
+      // 否则 trigger 永远 unknown、观察窗还会晚 20s 才开始。currentLoop 在 trigger
+      // run 之前指向 trigger，resolution run 之前换成 resolution；topic 订阅器照旧
+      // 并行消费同一批帧（pending 卡来自 conversation topic 的 EventFire）。
+      let currentLoop: { onData(payload: unknown): void } | null = null;
+      const topicSubscription = new ConversationTopicSubscription({
+        sender: conn,
+        identity,
+        sessionId: bound.taskId,
+        workspace: {
+          workspacePath: bound.workspacePath,
+          ...(bound.workspaceIdentity !== undefined
+            ? { workspaceIdentity: bound.workspaceIdentity }
+            : {}),
+        },
+        subscribeMs: BRIDGE_RPC_TIMEOUT_MS,
+        firstRequestId: bridgeId + 1,
+        firstSeq: bridgeSeq + 1,
+        firstMessageSeq: bridgeMessageSeq + 1,
+        onFrame: (frame) => {
+          book.acceptTopicFrame(frame);
+        },
+      });
+      // 钩子必须在 run() 之前接好：EventFire 与 subscribe ack 都可能先于轮询到达。
+      sendChannel.onRpcFrame = (payload) => {
+        currentLoop?.onData(payload);
+        topicSubscription.onData(payload);
+      };
+      const subscribe = await topicSubscription.run();
+      bridgeId = topicSubscription.lastRequestId;
+      bridgeSeq = topicSubscription.lastSeq;
+      bridgeMessageSeq = topicSubscription.lastMessageSeq;
+      record(ctx, "send", "conversation-topic-subscribe", {
+        topic: `conversation/${redactor.register("sid", bound.taskId)}`,
+        outcome: subscribe.kind,
+        ackMode: subscribe.kind === "ok" ? subscribe.ackMode : null,
+        counters: { ...topicSubscription.counters },
+        note:
+          "EventListen(onDynamicConversationFrame,workspace) → subscribeConversationV4 → " +
+          "ack；topic=conversation/<taskId>，ack 前帧暂存、ack 后按 subscriptionId 放行",
       });
       if (subscribe.kind !== "ok") {
         sendVerdict = `STOPPED:subscribe-${subscribe.kind}`;
@@ -1866,58 +2216,404 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         return { oauthVerdict, connectVerdict, mappingVerdict, sendVerdict, exitCode: 0 };
       }
 
-      // 发送：唯一合成 marker；恰一个 rpc-frame；未知不重发。
-      const marker = `[tuvis-b2-marker:${new Date().toISOString()}]`;
-      const loop = new SendOnceLoop({
-        sender: conn,
-        identity,
-        target: bound,
-        markerText: marker,
-        clientId,
-        timeouts: { ackMs: SEND_ACK_TIMEOUT_MS, activityMs: SEND_ACTIVITY_TIMEOUT_MS },
-        channelRequestId: bridgeId + 1,
-        firstSeq: bridgeSeq + 1,
-        firstMessageSeq: bridgeMessageSeq + 1,
-        isTurnActivity: (decoded, rawJson) =>
-          decoded?.headerType === RESPONSE_TYPE_EVENT_FIRE && rawJson.includes(bound.taskId),
-      });
-      // rpc-frame 与 rpc-frame-ack 经 handle → onRpcFrame 喂给 loop（attach 已在
-      // bridge-open 前完成；ack 转发见 B2Channel.handle 的 rpc-frame-ack 分支）。
-      sendChannel.onRpcFrame = (payload) => loop.onData(payload);
-      const sendOutcome = await loop.run();
-      sendSummary.marker = {
-        prefix: "[tuvis-b2-marker:",
-        issuedUtc: marker.slice(17, -1),
-        synthetic: true,
-      };
-      sendSummary.outcome = sendOutcome;
-      sendSummary.lifecycle = {
-        framesSent: loop.framesSent,
-        peerAcknowledged: loop.peerAcknowledged,
-        duplicateInboundFrames: loop.duplicateInboundFrames,
-        activityFrames: loop.activityFrames,
-        commandId: loop.sentCommandId,
-      };
-      record(ctx, "send", "outcome", {
-        outcome: sendOutcome,
-        lifecycle: sendSummary.lifecycle,
-        note: "恰一个 rpc-frame；重复入站帧去重；unknown 不重发（结构性无重发路径）",
-      });
-      log(
-        `send outcome = ${sendOutcome.kind}${
-          sendOutcome.kind === "completed" ? `（activityFrames=${sendOutcome.activityFrames}）` : ""
-        }；framesSent=${loop.framesSent}，peerAck=${loop.peerAcknowledged}。`
-      );
-      sendVerdict =
-        sendOutcome.kind === "completed"
-          ? "COMPLETED"
-          : sendOutcome.kind === "accepted"
-            ? "ACCEPTED"
-            : sendOutcome.kind === "rejected"
-              ? "REJECTED"
-              : sendOutcome.kind === "send-failed"
-                ? "STOPPED:send-failed"
-                : "UNKNOWN";
+      // —— B3 交互半场（--interaction）：触发器 + 单帧应答/打断闭环 ——
+      // 与 marker 发送互斥（两把锁独立）：本分支恰 1 个触发帧 + 至多 1 个
+      // resolveInteraction/stop 帧；unknown 不重发（InteractionCommandLoop 结构性
+      // 无重发路径）。所有应答只回传 pending 卡原值（optionId/题干/选项 value），
+      // fullAccess 特权项在客户端硬闸排除。
+      if (interactionMode !== null) {
+        const interaction: Record<string, unknown> = {
+          mode: interactionMode,
+          attempted: true,
+          markerPrefix: INTERACTION_MARKER_PREFIX,
+          pendingWaitMs: INTERACTION_PENDING_WAIT_MS,
+          foregroundWaitMs: INTERACTION_FOREGROUND_WAIT_MS,
+        };
+        sendSummary.interaction = interaction;
+        const sleepMs = (ms: number): Promise<void> =>
+          new Promise((resolve) => setTimeout(resolve, ms));
+        const waitUntil = async <T>(probe: () => T | null, ms: number): Promise<T | null> => {
+          const deadline = Date.now() + ms;
+          for (;;) {
+            const hit = probe();
+            if (hit !== null) return hit;
+            if (Date.now() >= deadline) return null;
+            await sleepMs(25);
+          }
+        };
+
+        // 1) 合成触发器（复用 B2 已验证发送链；恰一帧，未知不重发）
+        const trigger = new SendOnceLoop({
+          sender: conn,
+          identity,
+          target: bound,
+          markerText: buildInteractionInstruction(interactionMode),
+          clientId,
+          timeouts: { ackMs: SEND_ACK_TIMEOUT_MS, activityMs: SEND_ACTIVITY_TIMEOUT_MS },
+          channelRequestId: bridgeId + 1,
+          firstSeq: bridgeSeq + 1,
+          firstMessageSeq: bridgeMessageSeq + 1,
+          isTurnActivity: (decoded, rawJson) =>
+            decoded?.headerType === RESPONSE_TYPE_EVENT_FIRE && rawJson.includes(bound.taskId),
+        });
+        // 观察窗必须在 trigger.run() **之前**开始（C1）——trigger 的 ACK/活动窗可长达
+        // 20s+30s，触发期间落下的 pending 卡（或新前台执行）不能等 trigger 返回后才开始找。
+        // 关联（I1）：pending.createdAt 必须 >= 触发帧发送时刻；卡上缺 createdAt
+        // （旧快照/合成夹具）时回退为「触发后出现的首张卡」（快照本身是触发后收到的）。
+        const triggerSentAt = Date.now();
+        const controlRevisionBaseline = book.controlRevision;
+        const isFreshPending = (item: ObservedPending): boolean =>
+          item.createdAt === null || item.createdAt >= triggerSentAt;
+        const isInterrupt = interactionMode === "interrupt";
+        const pendingObservation: Promise<ObservedPending | null> = isInterrupt
+          ? Promise.resolve(null)
+          : interactionMode === "approve" || interactionMode === "reject"
+            ? waitUntil(
+                () =>
+                  book.list().find((item) => item.kind === "permission" && isFreshPending(item)) ??
+                  null,
+                INTERACTION_PENDING_WAIT_MS
+              )
+            : waitUntil(
+                () =>
+                  book.list().find((item) => item.kind === "userInput" && isFreshPending(item)) ??
+                  null,
+                INTERACTION_PENDING_WAIT_MS
+              );
+        const stopObservation: Promise<{ kind: string; foregroundExecutionId: string } | null> =
+          isInterrupt
+            ? waitUntil(
+                () => book.observeStopTarget({ afterRevision: controlRevisionBaseline }),
+                INTERACTION_FOREGROUND_WAIT_MS
+              )
+            : Promise.resolve(null);
+        currentLoop = trigger;
+        const triggerOutcome = await trigger.run();
+        currentLoop = null;
+        bridgeId += 1;
+        bridgeSeq += 1;
+        bridgeMessageSeq += 1;
+        interaction.trigger = {
+          outcome: triggerOutcome,
+          framesSent: trigger.framesSent,
+          peerAcknowledged: trigger.peerAcknowledged,
+          triggerSentAt,
+          controlRevisionBaseline,
+        };
+        record(ctx, "interaction", "trigger", interaction.trigger);
+        log(
+          `interaction trigger = ${triggerOutcome.kind}；framesSent=${trigger.framesSent}，peerAck=${trigger.peerAcknowledged}。`
+        );
+
+        // 2) 宿主侧观察窗（并发启动、此处取结果；pending 卡 / 前台执行 id）；超窗如实记
+        // unavailable。触发窗内落下的卡不会晚 20s 才被看见（C1 的另一半）。
+        const observedPending = await pendingObservation;
+        const observedStopTarget = await stopObservation;
+        let commandType: InteractionCommandType | null = null;
+        let payload: Record<string, unknown> | null = null;
+        let unavailable: string | null = null;
+        let autoResolution = false;
+        let pendingInteractionId: string | null = null;
+
+        // I6：题干 / 选项 label / 选项 value 先登记别名，再记录证据（卡上真实文本
+        // 绝不原样进 transcript）。
+        const registerQuestionMaterial = (pending: ObservedPending): Record<string, unknown> => {
+          const questions = Array.isArray((pending.payload as { questions?: unknown }).questions)
+            ? ((pending.payload as { questions: unknown[] }).questions as unknown[])
+            : [];
+          const aliases: Array<Record<string, unknown>> = [];
+          for (const question of questions) {
+            if (!question || typeof question !== "object") continue;
+            const record = question as { question?: unknown; options?: unknown };
+            const options = Array.isArray(record.options) ? record.options : [];
+            aliases.push({
+              question:
+                typeof record.question === "string"
+                  ? redactor.register("name", record.question)
+                  : null,
+              options: options.map((option) => {
+                if (!option || typeof option !== "object") return null;
+                const entry = option as { value?: unknown; label?: unknown };
+                return {
+                  value:
+                    typeof entry.value === "string" ? redactor.register("name", entry.value) : null,
+                  label:
+                    typeof entry.label === "string" ? redactor.register("name", entry.label) : null,
+                };
+              }),
+            });
+          }
+          return { questionAliases: aliases };
+        };
+
+        const recordPendingObserved = (pending: ObservedPending): void => {
+          const options = (pending.payload as { options?: unknown }).options;
+          const optionSummaries = Array.isArray(options)
+            ? options
+                .map((option) => {
+                  if (!option || typeof option !== "object") return null;
+                  const entry = option as { optionId?: unknown; kind?: unknown; label?: unknown };
+                  return {
+                    optionId:
+                      typeof entry.optionId === "string"
+                        ? entry.optionId === PERMISSION_FULL_ACCESS_OPTION_ID
+                          ? "option:fullAccess(blocked)"
+                          : redactor.register("name", entry.optionId)
+                        : null,
+                    kind: typeof entry.kind === "string" ? entry.kind : null,
+                    label:
+                      typeof entry.label === "string"
+                        ? redactor.register("name", entry.label)
+                        : null,
+                  };
+                })
+                .filter((entry) => entry !== null)
+            : [];
+          record(ctx, "interaction", "pending-observed", {
+            kind: pending.kind,
+            interactionId: redactor.register("sid", pending.interactionId),
+            createdAt: pending.createdAt,
+            triggerSentAt,
+            autoResolution: pending.autoResolution,
+            autoResolutionState: pending.autoResolutionState,
+            optionIds: collectOptionIdsFromOptions(options).map((id) =>
+              redactor.register("name", id)
+            ),
+            optionSummaries,
+            fullAccessOptionPresent: pending.payload.fullAccessOption !== undefined,
+            ...(pending.kind === "userInput" ? registerQuestionMaterial(pending) : {}),
+            bookCounters: { ...book.counters },
+          });
+        };
+
+        if (interactionMode === "approve" || interactionMode === "reject") {
+          if (!observedPending) {
+            unavailable = "UNAVAILABLE:no-pending-observed";
+          } else {
+            const pending = observedPending;
+            autoResolution = pending.autoResolution;
+            pendingInteractionId = pending.interactionId;
+            recordPendingObserved(pending);
+            const optionId = pickPermissionOption(pending, interactionMode);
+            if (optionId === null) {
+              unavailable = "UNAVAILABLE:permission-option-unresolved";
+            } else {
+              const gated = authorizePendingResolution(book, pending.interactionId, {
+                sessionId: bound.taskId,
+                liveGeneration: CONNECTION_GENERATION,
+              });
+              commandType = INTERACTION_COMMAND_TYPES.resolve;
+              payload = {
+                interactionId: gated.interactionId,
+                answer: buildPermissionAnswer({ optionId }),
+              };
+            }
+          }
+        } else if (interactionMode === "answer") {
+          if (!observedPending) {
+            unavailable = "UNAVAILABLE:no-pending-observed";
+          } else if (!isAnswerableUserInput(observedPending)) {
+            // C2：计划审批（ExitPlanMode）/ MCP elicitation / 未知工具都投影成
+            // userInput，只有 AskUserQuestion 可答；其余一律不支持，零帧。
+            record(ctx, "interaction", "answer-shape-unsupported", {
+              kind: observedPending.kind,
+              toolName:
+                typeof observedPending.payload.toolName === "string"
+                  ? redactor.register("name", observedPending.payload.toolName)
+                  : null,
+              schemaInteraction:
+                observedPending.payload.schema &&
+                typeof observedPending.payload.schema === "object" &&
+                typeof (observedPending.payload.schema as { interaction?: unknown }).interaction ===
+                  "string"
+                  ? (observedPending.payload.schema as { interaction: string }).interaction
+                  : null,
+              note:
+                "only AskUserQuestion userInput is answerable " +
+                "(product-projection.ts:3391-3409,5793-5795; plan approval :3440-3459)",
+            });
+            unavailable = "UNAVAILABLE:answer-shape-unsupported";
+          } else {
+            const pending = observedPending;
+            autoResolution = pending.autoResolution;
+            pendingInteractionId = pending.interactionId;
+            recordPendingObserved(pending);
+            const entries = pickUserInputEntries(pending);
+            if (entries === null) {
+              unavailable = "UNAVAILABLE:answer-shape-unresolved";
+            } else {
+              const gated = authorizePendingResolution(book, pending.interactionId, {
+                sessionId: bound.taskId,
+                liveGeneration: CONNECTION_GENERATION,
+              });
+              commandType = INTERACTION_COMMAND_TYPES.resolve;
+              payload = {
+                interactionId: gated.interactionId,
+                answer: buildUserInputAnswer(entries),
+              };
+            }
+          }
+        } else if (!observedStopTarget) {
+          // 触发后没有新的 primaryTurn 前台执行 id → 不做盲停（Minor：UNAVAILABLE 而非 NOOP）。
+          unavailable = "UNAVAILABLE:no-foreground-execution";
+        } else {
+          commandType = INTERACTION_COMMAND_TYPES.stop;
+          payload = buildStopPayload(observedStopTarget);
+          interaction.stopTarget = {
+            kind: observedStopTarget.kind,
+            foregroundExecutionId: redactor.register(
+              "sid",
+              observedStopTarget.foregroundExecutionId
+            ),
+            observedAfterControlRevision: controlRevisionBaseline,
+          };
+        }
+
+        interaction.channel = {
+          ...book.counters,
+          pendingSize: book.size,
+          // 订阅链证据：EventFire / wire 帧 / fragment 重组 / 交付计数（不含 subscriptionId）。
+          subscription: { ...topicSubscription.counters },
+        };
+        if (unavailable !== null) {
+          sendVerdict = unavailable;
+          interaction.resolution = { attempted: false, reason: unavailable };
+          record(ctx, "interaction", "unavailable", interaction.resolution);
+          log(`interaction 不可用：${unavailable}（未发送任何应答帧）。`);
+        } else if (commandType !== null && payload !== null) {
+          // I4：卡上带 autoResolution（AskUserQuestion 自动结束计时）时，先发
+          // snoozeInteractionAutoResolution 再发 resolve（首次有效操作永久暂停本次
+          // 自动结束；重复/迟到调用幂等 noop——command.ts:250-253）。snooze 只是
+          // 尽力而为的前置帧：失败/超窗如实记录后继续 resolve（resolve 本身先到先得，
+          // 若自动结束已抢先收口则 resolve 回 proto.alreadyResolved noop，绝不重发）。
+          const steps = planInteractionCommands({
+            pending: {
+              interactionId: pendingInteractionId ?? "",
+              autoResolution,
+            },
+            commandType,
+            payload,
+          });
+          for (const step of steps) {
+            const loop = new InteractionCommandLoop({
+              sender: conn,
+              identity,
+              target: bound,
+              commandType: step.commandType,
+              payload: step.payload,
+              clientId,
+              ackMs: SEND_ACK_TIMEOUT_MS,
+              channelRequestId: bridgeId + 1,
+              firstSeq: bridgeSeq + 1,
+              firstMessageSeq: bridgeMessageSeq + 1,
+            });
+            currentLoop = loop;
+            const outcome = await loop.run();
+            currentLoop = null;
+            bridgeId += 1;
+            bridgeSeq += 1;
+            bridgeMessageSeq += 1;
+            if (step.commandType === INTERACTION_COMMAND_TYPES.snooze) {
+              interaction.snooze = {
+                attempted: true,
+                outcome,
+                framesSent: loop.framesSent,
+                peerAcknowledged: loop.peerAcknowledged,
+                autoResolutionState: observedPending?.autoResolutionState ?? null,
+                note: "best-effort: failure is recorded and resolve still proceeds (first-wins)",
+              };
+              record(ctx, "interaction", "snooze", interaction.snooze);
+              continue;
+            }
+            interaction.resolution = {
+              attempted: true,
+              outcome,
+              framesSent: loop.framesSent,
+              peerAcknowledged: loop.peerAcknowledged,
+              duplicateInboundFrames: loop.duplicateInboundFrames,
+              autoResolution,
+            };
+            record(ctx, "interaction", "resolution", interaction.resolution);
+            sendVerdict =
+              outcome.kind === "accepted"
+                ? interactionMode === "interrupt"
+                  ? "STOPPED:interrupt-accepted"
+                  : "RESOLVED"
+                : outcome.kind === "noop"
+                  ? `NOOP:${outcome.reasonCode ?? "unknown"}`
+                  : outcome.kind === "rejected"
+                    ? `REJECTED:${outcome.reasonCode ?? "unknown"}`
+                    : outcome.kind === "send-failed"
+                      ? "STOPPED:interaction-send-failed"
+                      : "UNKNOWN";
+            log(
+              `interaction outcome = ${outcome.kind}；framesSent=${loop.framesSent}，peerAck=${loop.peerAcknowledged}。`
+            );
+          }
+        }
+      }
+
+      if (interactionMode === null) {
+        // 发送：唯一合成 marker；恰一个 rpc-frame；未知不重发。
+        const marker = `[tuvis-b2-marker:${new Date().toISOString()}]`;
+        const loop = new SendOnceLoop({
+          sender: conn,
+          identity,
+          target: bound,
+          markerText: marker,
+          clientId,
+          timeouts: { ackMs: SEND_ACK_TIMEOUT_MS, activityMs: SEND_ACTIVITY_TIMEOUT_MS },
+          channelRequestId: bridgeId + 1,
+          firstSeq: bridgeSeq + 1,
+          firstMessageSeq: bridgeMessageSeq + 1,
+          isTurnActivity: (decoded, rawJson) =>
+            decoded?.headerType === RESPONSE_TYPE_EVENT_FIRE && rawJson.includes(bound.taskId),
+        });
+        // rpc-frame 与 rpc-frame-ack 经 handle → onRpcFrame 喂给 loop（attach 已在
+        // bridge-open 前完成；ack 转发见 B2Channel.handle 的 rpc-frame-ack 分支）。
+        // 复用同一单槽帧汇：topic 订阅器继续消费 conversation 帧（活动判据见 loop）。
+        currentLoop = loop;
+        const sendOutcome = await loop.run();
+        currentLoop = null;
+        sendSummary.marker = {
+          prefix: "[tuvis-b2-marker:",
+          issuedUtc: marker.slice(17, -1),
+          synthetic: true,
+        };
+        sendSummary.outcome = sendOutcome;
+        sendSummary.lifecycle = {
+          framesSent: loop.framesSent,
+          peerAcknowledged: loop.peerAcknowledged,
+          duplicateInboundFrames: loop.duplicateInboundFrames,
+          activityFrames: loop.activityFrames,
+          commandId: loop.sentCommandId,
+        };
+        record(ctx, "send", "outcome", {
+          outcome: sendOutcome,
+          lifecycle: sendSummary.lifecycle,
+          note: "恰一个 rpc-frame；重复入站帧去重；unknown 不重发（结构性无重发路径）",
+        });
+        log(
+          `send outcome = ${sendOutcome.kind}${
+            sendOutcome.kind === "completed"
+              ? `（activityFrames=${sendOutcome.activityFrames}）`
+              : ""
+          }；framesSent=${loop.framesSent}，peerAck=${loop.peerAcknowledged}。`
+        );
+        sendVerdict =
+          sendOutcome.kind === "completed"
+            ? "COMPLETED"
+            : sendOutcome.kind === "accepted"
+              ? "ACCEPTED"
+              : sendOutcome.kind === "rejected"
+                ? "REJECTED"
+                : sendOutcome.kind === "send-failed"
+                  ? "STOPPED:send-failed"
+                  : "UNKNOWN";
+      }
+      // 事件流订阅证据（两种 send 模式都记）：EventFire / wire / fragment / 交付计数
+      // （不含 subscriptionId 真实值）。
+      sendSummary.subscription = { ...topicSubscription.counters };
       recordChannelEvidence(ctx, "send", sendChannel);
 
       // —— s8：teardown ————————————————————————————————————————————————————————
@@ -1951,7 +2647,10 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
       stage,
       message: redactor.sanitizeText(message),
     });
-    log(`探针故障（${stage} 阶段未处理异常）：${message}；清理连接并照常落证。`);
+    // stdout 同样只出别名（与证据同口径）：异常 message 可能内嵌真实路径/会话 id。
+    log(
+      `探针故障（${stage} 阶段未处理异常）：${redactor.sanitizeText(message)}；清理连接并照常落证。`
+    );
     cleanupLive();
     // 在飞阶段尚无终局 verdict → 记 STOPPED:fault-<阶段>；已定案的 verdict 不改写
     // （故障细节在 transcript 的 fault 事件条目里）。
@@ -2010,7 +2709,7 @@ async function teardownSend(
  * `success: payload.success === true` 曾把 ready 误报成 success:false
  * （B2 实连 macos-B220261024T124743Z 的假「failure」）。
  */
-function summarizePayload(outcome: AppPayloadOutcome): Record<string, unknown> {
+export function summarizePayload(outcome: AppPayloadOutcome): Record<string, unknown> {
   if (outcome.kind !== "ok") return { outcome: outcome.kind };
   const payload = outcome.payload;
   return {
@@ -2026,7 +2725,18 @@ function summarizePayload(outcome: AppPayloadOutcome): Record<string, unknown> {
 /** 收帧证据落 events（有界 + 截断 + 脱敏；真实值经 sanitizeText 只余别名）。 */
 function recordChannelEvidence(ctx: RunContext, label: string, channel: B2Channel): void {
   const messages = channel.bridgeMessages.slice(0, 64).map((message) => {
-    const sanitized = ctx.redactor.sanitizeText(message);
+    // I6：结构化预览先过 redactPayload（字段级别名登记，workspacePath/taskId/... 等），
+    // 再统一走 sanitizeText；非 JSON 消息退回纯文本脱敏。
+    const preview = (() => {
+      try {
+        return (
+          JSON.stringify(redactPayload(ctx.redactor, JSON.parse(message) as unknown)) ?? message
+        );
+      } catch {
+        return message;
+      }
+    })();
+    const sanitized = ctx.redactor.sanitizeText(preview);
     return sanitized.length > 40_000 ? `${sanitized.slice(0, 40_000)}…<truncated>` : sanitized;
   });
   record(ctx, label, "bridge-messages", {
@@ -2064,18 +2774,26 @@ async function writeEvidence(
   sendSummary: Record<string, unknown>
 ): Promise<void> {
   const finishedIso = new Date().toISOString();
+  const isInteraction = ctx.flags.interaction !== null;
+  // I5：证据里的安全闸按模式派生（交互 run 实际 2 个命令帧 + 可达 1 个 snooze 前置帧，
+  // 不再把 B2 的 maxSendFrames:1 抄进 B3 证据）。
+  const guards = deriveProbeGuards(ctx.flags.interaction);
   const transcript = {
     runId: ctx.run.runId,
-    probe: "zcode-bridge-session-probe",
-    workPackage: "B2 实连半场：单连接、会话映射与单次发送闭环",
+    probe: isInteraction ? "zcode-bridge-interaction-probe" : "zcode-bridge-session-probe",
+    workPackage: isInteraction
+      ? "B3 交互半场：审批 / 问答 / 打断逐能力探针（单连接、映射与 target lock 复用 B2 链）"
+      : "B2 实连半场：单连接、会话映射与单次发送闭环",
     sourceBaseline: "zai-org/ZCode @ 3c5b227649371507ddc4eb46ac5133afe6db1cab",
     startedUtc: ctx.startedIso,
     finishedUtc: finishedIso,
-    guards: PROBE_GUARDS,
+    guards,
     flags: {
       provider: ctx.flags.provider,
       unlock: ctx.flags.unlock,
       sendAuthorized: ctx.flags.sendAuthorized,
+      interaction: ctx.flags.interaction,
+      interactionAuthorized: ctx.flags.interactionAuthorized,
       oauthWaitMs: ctx.flags.oauthWaitMs,
       jwtViaStdin: ctx.flags.jwtStdin,
       sidFromCli: ctx.flags.sid !== null,
@@ -2091,19 +2809,21 @@ async function writeEvidence(
   };
   const transcriptJson = JSON.stringify(ctx.redactor.sanitizeDeep(transcript), null, 2);
   const runMd = [
-    `# B2 实连半场探针 run — ${ctx.run.runId}`,
+    `# ${isInteraction ? "B3 交互半场" : "B2 实连半场"}探针 run — ${ctx.run.runId}`,
     "",
     `- started: ${ctx.startedIso}`,
     `- finished: ${finishedIso}`,
     `- oauth: **${oauthVerdict}**`,
     `- connect: **${connectVerdict}**`,
     `- mapping: **${mappingVerdict}**`,
-    `- send: **${sendVerdict}**`,
-    `- guards: \`${JSON.stringify(PROBE_GUARDS)}\``,
+    `- ${isInteraction ? "interaction" : "send"}: **${sendVerdict}**`,
+    `- guards: \`${JSON.stringify(guards)}\``,
     "",
     "本目录为私有证据（不进仓库）。所有 SID/JWT/token/state/授权码/链接/会话 id",
     "均以稳定别名与掩码形态记录；落盘前经 fail-closed 断言。marker 正文为合成值",
-    "（[tuvis-b2-marker:<UTC>]，不含任何秘密）。发送帧恒 1；未知不重发。",
+    isInteraction
+      ? "（[tuvis-b3-probe:<UTC>]，不含任何秘密）。指令帧恒 1、应答/stop 帧恒 1（autoResolution 在场时至多加 1 个 snooze 前置帧）；未知不重发。"
+      : "（[tuvis-b2-marker:<UTC>]，不含任何秘密）。发送帧恒 1；未知不重发。",
     "",
     "细节见同目录 transcript.json。",
     "",

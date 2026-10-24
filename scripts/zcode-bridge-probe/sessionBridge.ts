@@ -40,6 +40,26 @@ export const AGENT_HELLO_METHOD = "helloConversationV4";
 export const AGENT_CLIENT_HELLO_METHOD = "initializeConversationV4";
 /** 发送命令方法（zcodeAgent.ts:937）。 */
 export const AGENT_SEND_COMMAND_METHOD = "sendConversationCommandV4";
+/**
+ * 会话 topic 的 workspace 级下行帧动态事件（zcodeAgent.ts:956-960：
+ * `onDynamicConversationFrame(params: ZCodeAgentWorkspaceTarget): Event<
+ * ConversationTopicWireCandidate>`）。官方 UI 在首个 onFrame listener 挂载时
+ * 才 `agentService.onDynamicConversationFrame(workspace)(...)` 建立订阅
+ * （agentConversationTransport.ts:539-554），workspace = {workspacePath,
+ * workspaceIdentity?}（同文件 :94-97）；dynamic event 经 `channel.listen(name, workspace)`
+ * 走 EventListen（proxy-channel.ts:126-127；服务端 :61-74 动态事件 target.call(handler, arg)）。
+ * 只发 subscribeConversationV4 RPC 不挂这个监听 = 服务端通道没有事件订阅者，
+ * CLI 的 conversation 帧不会变成 EventFire 下发（B3 实连 unsolicited-frames: 0 根因）。
+ */
+export const AGENT_CONVERSATION_FRAME_EVENT = "onDynamicConversationFrame";
+/** 会话订阅/退订方法（zcodeAgent.ts:940-946）。 */
+export const AGENT_SUBSCRIBE_CONVERSATION_METHOD = "subscribeConversationV4";
+export const AGENT_UNSUBSCRIBE_CONVERSATION_METHOD = "unsubscribeConversationV4";
+/**
+ * conversation topic 前缀（packages/shared/src/zcode-protocol-v4/transport.ts:113,205：
+ * topic = `conversation/<sessionId>`，后缀即 subscribe 的 sessionId，非空）。
+ */
+export const CONVERSATION_TOPIC_PREFIX = "conversation/";
 /** rpc 事件订阅请求类型（packages/rpc/src/channels.shared.ts:18-23）。 */
 export const REQUEST_TYPE_EVENT_LISTEN = 102;
 /**
@@ -1303,6 +1323,523 @@ export class ControllerTaskIndexReader {
       },
       ...(title !== undefined ? { meta: { title } } : {}),
     });
+  }
+
+  private sendFrame(bytes: Uint8Array): boolean {
+    const frame = encodeRpcFrame({
+      identity: this.identity,
+      seq: this.seq,
+      messageSeq: this.messageSeq,
+      bytes,
+    });
+    this.seq += 1;
+    this.messageSeq += 1;
+    this.counters.controlFramesSent += 1;
+    return this.sender.sendData(frame);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// conversation topic 订阅（B3 实连修复：事件流必须走 channel 级 EventListen）
+//
+// B3 实连（macos-B320261024T230311Z / 230432Z）只发 subscribeConversationV4 RPC，
+// 收帧恒为 0（unsolicited-frames: 0）：CLI 的会话帧经
+// `V4_NOTIFICATIONS.conversationFrame` 通知到 service，再由 workspace 级 emitter
+// `getConversationFrameEmitter(workspace)` 发布（zcodeAgentService.ts:1771-1780,
+// 2360-2395）；该 emitter 只在 channel 事件监听挂上时才有订阅者——官方 UI 的
+// `onDynamicConversationFrame(workspace)` 就是那个监听（agentConversationTransport
+// :552-554）。它与 controller tasks-index 的 `onDynamicControllerFrame` 同属
+// dynamic event：wire 请求是 EventListen(102)+arg（proxy-channel.ts:126-127 客户端
+// `channel.listen(propKey, arg)`；:61-74 服务端动态事件 `target.call(handler, arg)`；
+// channelClient.ts:150-177 requestEvent → :179-194 sendRequest）。因此本订阅的
+// **官方同款顺序 = EventListen(onDynamicConversationFrame, workspace) → subscribe
+// → ack（subscriptionId）→ activate**，缺一则 topic 帧永不出现。
+//
+// 其余行号 @ 3c5b2276：
+//   - subscribe 参数 = {workspacePath, workspaceIdentity?, sessionId, base?,
+//     visibility?, retryInitialization?}（agentConversationTransport.ts:187-215；
+//     sessionId = topic 后缀 :188 + transport.ts:113,205；本探针不传 base/visibility，
+//     冷订阅 = 服务端 snapshot）；ack = {ack:{subscriptionId, mode, logEpoch}}
+//     （v4-transport.ts:125-131,158-161,453-457）。
+//   - ack 可能晚于首批 notification：官方 barrier 先按 topic 暂存 physical wire，
+//     `activate(subscriptionId)` 后只放行同 subscriptionId 的帧（agentConversationTransport
+//     :162-165,202-247,276-291；ackActivationBarrier.ts）。本类同语义：ack 前暂存、
+//     ack 后按 subscriptionId 过滤放行（旧订阅帧计 stale，不交付）。
+//   - EventFire body = physical wire candidate（wire.ts:19-75：{wireVersion:3,
+//     kind:"complete"|"fragment", deliveryKind?, logicalFrameId, logicalFrameOrdinal,
+//     topic, subscriptionId, frame?|fragment 字段}）；logical frame =
+//     {topic,subscriptionId,fromSeq,toSeq,sentAt,payload}（v4-transport.ts:163-191）。
+//     本类 complete 直通、fragment 按 CRC32 重组（wire-codec.ts 的 UTF-8 分片语义），
+//     坏帧只计数不交付。
+// ---------------------------------------------------------------------------
+
+/** 单次订阅 ack 的有界结果（fail-closed，无重发路径）。 */
+export type ConversationTopicSubscribeResult =
+  | { kind: "ok"; ackMode: string | null; subscriptionIdPresent: boolean }
+  | { kind: "send-failed" }
+  | { kind: "subscribe-timeout" }
+  | { kind: "subscribe-rejected" };
+
+export type ConversationTopicSubscriptionCounters = {
+  eventListenRequestId: number;
+  subscribeRequestId: number;
+  /** 出站 Channel 控制帧数（EventListen + subscribe；非会话发送帧）。 */
+  controlFramesSent: number;
+  subscriptionAcked: boolean;
+  ackMode: string | null;
+  /** EventFire 帧（按 EventListen id 路由）总数。 */
+  eventFramesSeen: number;
+  completeWireFrames: number;
+  fragmentedWireFrames: number;
+  fragmentsReassembled: number;
+  assemblyFaults: number;
+  /** ack 前暂存、ack 后放行的帧数（含暂存数）。 */
+  stagedFrames: number;
+  /** 交付给调用方（本 topic + 当前 subscriptionId）的 logical frame 数。 */
+  topicFramesDelivered: number;
+  /** 非本会话 topic 的帧（workspace 事件会广播兄弟会话帧）——拒收计数。 */
+  foreignTopicFrames: number;
+  /** 本 topic 但旧 subscriptionId 的帧（ack 前暂存或换代后迟到）——拒收计数。 */
+  staleSubscriptionFrames: number;
+  malformedWireFrames: number;
+  duplicateInboundFrames: number;
+};
+
+export type ConversationTopicSubscriptionOptions = {
+  sender: ProbeConnection;
+  /** workspace bridge-ready 回显的帧身份。 */
+  identity: RpcFrameIdentity;
+  /** 目标会话精确 id（= bound.taskId；topic = conversation/<sessionId>）。 */
+  sessionId: string;
+  /** 动态事件的 workspace 参数（agentConversationTransport.ts:94-97）。 */
+  workspace: { workspacePath: string; workspaceIdentity?: string };
+  /** subscribe ack 的有界等待窗（官方一样等 RPC response）。 */
+  subscribeMs: number;
+  /** 首个出站请求 id / seq / messageSeq（hello/clientHello 已占号时续号）。 */
+  firstRequestId?: number;
+  firstSeq?: number;
+  firstMessageSeq?: number;
+  /** 本 topic 当前 subscriptionId 的 logical frame（snapshot / deltas）回调。 */
+  onFrame?: (frame: Record<string, unknown>) => void;
+  sleep?: (ms: number) => Promise<void>;
+};
+
+const CONVERSATION_MAX_STAGED_FRAMES = 1024;
+const CONVERSATION_MAX_FRAGMENT_ASSEMBLIES = 32;
+
+type StagedConversationFrame = { frame: Record<string, unknown>; subscriptionId: string };
+
+type FragmentAssembly = {
+  fragmentCount: number;
+  logicalBytes: number;
+  checksum: string;
+  chunks: Array<Uint8Array | null>;
+  received: number;
+};
+
+/**
+ * 会话 topic 的 channel 级订阅器：EventListen（onDynamicConversationFrame，
+ * workspace 参数）→ subscribeConversationV4 → 有界等 ack → 按 subscriptionId
+ * 放行 topic 帧。与 ControllerTaskIndexReader 同族（同一套 envelope/组装/ack 判定），
+ * 等待循环只有 sleep+判定，**没有任何重发路径**；本类只发读面控制帧，不构造会话发送帧。
+ */
+export class ConversationTopicSubscription {
+  readonly counters: ConversationTopicSubscriptionCounters = {
+    eventListenRequestId: 0,
+    subscribeRequestId: 0,
+    controlFramesSent: 0,
+    subscriptionAcked: false,
+    ackMode: null,
+    eventFramesSeen: 0,
+    completeWireFrames: 0,
+    fragmentedWireFrames: 0,
+    fragmentsReassembled: 0,
+    assemblyFaults: 0,
+    stagedFrames: 0,
+    topicFramesDelivered: 0,
+    foreignTopicFrames: 0,
+    staleSubscriptionFrames: 0,
+    malformedWireFrames: 0,
+    duplicateInboundFrames: 0,
+  };
+
+  private readonly sender: ProbeConnection;
+  private readonly identity: RpcFrameIdentity;
+  private readonly sessionId: string;
+  private readonly topic: string;
+  private readonly workspace: { workspacePath: string; workspaceIdentity?: string };
+  private readonly subscribeMs: number;
+  private readonly onFrame: ((frame: Record<string, unknown>) => void) | null;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly assembler: RpcFrameAssembler;
+  private readonly staged: StagedConversationFrame[] = [];
+  private readonly fragmentAssemblies = new Map<string, FragmentAssembly>();
+  private nextRequestId: number;
+  private seq: number;
+  private messageSeq: number;
+  private eventListenRequestId = 0;
+  private subscribeRequestId = 0;
+  private settledAck:
+    { status: "ok"; mode: string | null; subscriptionId: string } | { status: "rejected" } | null =
+    null;
+  private boundSubscriptionId: string | null = null;
+
+  constructor(options: ConversationTopicSubscriptionOptions) {
+    if (typeof options.sessionId !== "string" || options.sessionId.length === 0) {
+      throw new Error("conversation-subscription: sessionId must be a non-empty exact id");
+    }
+    this.sender = options.sender;
+    this.identity = options.identity;
+    this.sessionId = options.sessionId;
+    this.topic = `${CONVERSATION_TOPIC_PREFIX}${options.sessionId}`;
+    this.workspace = {
+      workspacePath: options.workspace.workspacePath,
+      ...(options.workspace.workspaceIdentity !== undefined
+        ? { workspaceIdentity: options.workspace.workspaceIdentity }
+        : {}),
+    };
+    this.subscribeMs = Math.max(1, options.subscribeMs);
+    this.onFrame = options.onFrame ?? null;
+    this.sleep = options.sleep ?? realSleepDefault;
+    this.assembler = new RpcFrameAssembler({ identity: options.identity });
+    this.nextRequestId = options.firstRequestId ?? 1;
+    this.seq = options.firstSeq ?? 1;
+    this.messageSeq = options.firstMessageSeq ?? 1;
+  }
+
+  /** 最近一次出站控制帧占用的请求 id / seq / messageSeq（调用方续号用）。 */
+  get lastRequestId(): number {
+    return this.nextRequestId - 1;
+  }
+
+  get lastSeq(): number {
+    return this.seq - 1;
+  }
+
+  get lastMessageSeq(): number {
+    return this.messageSeq - 1;
+  }
+
+  get boundTopic(): string {
+    return this.topic;
+  }
+
+  /**
+   * 建立事件流：EventListen 先行（官方 registry/transport 同序）→ subscribe →
+   * 有界等 ack → 放行 ack 前暂存的同 subscriptionId 帧。失败 = 结构性失败，
+   * 由调用方 fail-closed；不重试。
+   */
+  async run(): Promise<ConversationTopicSubscribeResult> {
+    // 1) 帧监听（102；channel zcode-agent，dynamic event + workspace 参数）。
+    this.eventListenRequestId = this.nextRequestId;
+    this.nextRequestId += 1;
+    this.counters.eventListenRequestId = this.eventListenRequestId;
+    if (
+      !this.sendFrame(
+        encodeChannelEventListen({
+          id: this.eventListenRequestId,
+          channel: AGENT_CHANNEL,
+          eventName: AGENT_CONVERSATION_FRAME_EVENT,
+          arg: this.workspace,
+        })
+      )
+    ) {
+      return { kind: "send-failed" };
+    }
+
+    // 2) 会话订阅（100；params 与官方 transport 同形，base/visibility 不传=冷快照）。
+    this.subscribeRequestId = this.nextRequestId;
+    this.nextRequestId += 1;
+    this.counters.subscribeRequestId = this.subscribeRequestId;
+    if (
+      !this.sendFrame(
+        encodeChannelRequest({
+          id: this.subscribeRequestId,
+          channel: AGENT_CHANNEL,
+          method: AGENT_SUBSCRIBE_CONVERSATION_METHOD,
+          params: {
+            workspacePath: this.workspace.workspacePath,
+            ...(this.workspace.workspaceIdentity !== undefined
+              ? { workspaceIdentity: this.workspace.workspaceIdentity }
+              : {}),
+            sessionId: this.sessionId,
+          },
+        })
+      )
+    ) {
+      return { kind: "send-failed" };
+    }
+
+    const deadline = Date.now() + this.subscribeMs;
+    while (this.settledAck === null && Date.now() < deadline) {
+      await this.sleep(Math.min(20, Math.max(1, deadline - Date.now())));
+    }
+    const settled = this.settledAck;
+    if (settled === null) return { kind: "subscribe-timeout" };
+    if (settled.status === "rejected") return { kind: "subscribe-rejected" };
+    this.boundSubscriptionId = settled.subscriptionId;
+    this.counters.subscriptionAcked = true;
+    this.counters.ackMode = settled.mode;
+    this.flushStaged();
+    return {
+      kind: "ok",
+      ackMode: settled.mode,
+      subscriptionIdPresent: settled.subscriptionId.length > 0,
+    };
+  }
+
+  /** 入站 data payload 喂入口（对接宿主 channel 的 onRpcFrame 单钩子）。 */
+  onData(payload: unknown): void {
+    if (!payload || typeof payload !== "object") return;
+    const record = payload as { zcode_type?: unknown; ackMessageSeq?: unknown };
+    if (record.zcode_type === "rpc-frame-ack") {
+      // peer 受理回执（读面控制帧）；对话 topic 的帧本体才是信号。
+      return;
+    }
+    if (record.zcode_type !== "rpc-frame") return;
+    const event = this.assembler.accept(payload);
+    if (event.kind === "duplicate") {
+      this.counters.duplicateInboundFrames += 1;
+      return;
+    }
+    if (event.kind === "fault" || event.kind === "incomplete") return;
+    const decoded = decodeChannelMessage(event.bytes);
+    if (!decoded) return;
+    if (
+      this.subscribeRequestId !== 0 &&
+      decoded.id === this.subscribeRequestId &&
+      (decoded.headerType === RESPONSE_TYPE_PROMISE_SUCCESS ||
+        decoded.headerType === RESPONSE_TYPE_PROMISE_ERROR)
+    ) {
+      this.settleSubscribeAck(decoded);
+      return;
+    }
+    if (
+      decoded.id === this.eventListenRequestId &&
+      decoded.headerType === RESPONSE_TYPE_EVENT_FIRE
+    ) {
+      this.counters.eventFramesSeen += 1;
+      this.acceptWireFrame(decoded.body);
+    }
+  }
+
+  private settleSubscribeAck(decoded: DecodedChannelMessage): void {
+    if (this.settledAck !== null) {
+      this.counters.duplicateInboundFrames += 1;
+      return;
+    }
+    if (decoded.headerType === RESPONSE_TYPE_PROMISE_ERROR) {
+      this.settledAck = { status: "rejected" };
+      return;
+    }
+    const body = decoded.body as { ack?: { subscriptionId?: unknown; mode?: unknown } } | undefined;
+    const subscriptionId = body?.ack?.subscriptionId;
+    if (typeof subscriptionId !== "string" || subscriptionId.length === 0) {
+      // 官方 ack schema 必带 subscriptionId（v4-transport.ts:125-131,453-457）：
+      // 缺失/坏形状 = 拒绝（不能进入无 ownership 的收帧态）。
+      this.settledAck = { status: "rejected" };
+      return;
+    }
+    this.settledAck = {
+      status: "ok",
+      mode: typeof body?.ack?.mode === "string" ? body.ack.mode : null,
+      subscriptionId,
+    };
+  }
+
+  /** EventFire body = physical wire candidate（complete 或 fragment）。 */
+  private acceptWireFrame(body: unknown): void {
+    if (!body || typeof body !== "object") {
+      this.counters.malformedWireFrames += 1;
+      return;
+    }
+    const wire = body as {
+      wireVersion?: unknown;
+      kind?: unknown;
+      topic?: unknown;
+      subscriptionId?: unknown;
+      frame?: unknown;
+    };
+    if (
+      wire.wireVersion !== V4_WIRE_PROTOCOL_VERSION ||
+      typeof wire.topic !== "string" ||
+      typeof wire.subscriptionId !== "string"
+    ) {
+      this.counters.malformedWireFrames += 1;
+      return;
+    }
+    if (wire.topic !== this.topic) {
+      // workspace 级事件会广播全部会话/兄弟 topic：只收本会话（PendingBook 还有第二道闸）。
+      this.counters.foreignTopicFrames += 1;
+      return;
+    }
+    if (wire.kind === "complete") {
+      this.counters.completeWireFrames += 1;
+      const frame = wire.frame;
+      if (
+        !frame ||
+        typeof frame !== "object" ||
+        (frame as { topic?: unknown }).topic !== wire.topic ||
+        (frame as { subscriptionId?: unknown }).subscriptionId !== wire.subscriptionId
+      ) {
+        this.counters.malformedWireFrames += 1;
+        return;
+      }
+      this.stageOrDeliver(frame as Record<string, unknown>, wire.subscriptionId);
+      return;
+    }
+    if (wire.kind === "fragment") {
+      this.counters.fragmentedWireFrames += 1;
+      this.acceptFragment(wire);
+      return;
+    }
+    this.counters.malformedWireFrames += 1;
+  }
+
+  /** UTF-8 byte 层分片重组（wire-codec.ts 的 logical frame 原子语义）。 */
+  private acceptFragment(wire: {
+    topic?: unknown;
+    subscriptionId?: unknown;
+    logicalFrameId?: unknown;
+    logicalFrameOrdinal?: unknown;
+    fragmentIndex?: unknown;
+    fragmentCount?: unknown;
+    logicalBytes?: unknown;
+    checksum?: unknown;
+    dataBase64?: unknown;
+  }): void {
+    const logicalFrameId = wire.logicalFrameId;
+    const fragmentIndex = wire.fragmentIndex;
+    const fragmentCount = wire.fragmentCount;
+    const logicalBytes = wire.logicalBytes;
+    const checksum = (wire.checksum as { value?: unknown } | undefined)?.value;
+    const dataBase64 = wire.dataBase64;
+    if (
+      typeof logicalFrameId !== "string" ||
+      logicalFrameId.length === 0 ||
+      typeof wire.topic !== "string" ||
+      typeof wire.subscriptionId !== "string" ||
+      !Number.isInteger(fragmentIndex) ||
+      !Number.isInteger(fragmentCount) ||
+      (fragmentIndex as number) < 0 ||
+      (fragmentCount as number) <= 0 ||
+      (fragmentCount as number) > 1024 ||
+      (fragmentIndex as number) >= (fragmentCount as number) ||
+      typeof logicalBytes !== "number" ||
+      logicalBytes <= 0 ||
+      typeof checksum !== "string" ||
+      typeof dataBase64 !== "string"
+    ) {
+      this.counters.assemblyFaults += 1;
+      return;
+    }
+    const key = `${wire.topic}\u0000${wire.subscriptionId}\u0000${logicalFrameId}`;
+    let assembly = this.fragmentAssemblies.get(key);
+    if (!assembly) {
+      if (this.fragmentAssemblies.size >= CONVERSATION_MAX_FRAGMENT_ASSEMBLIES) {
+        this.counters.assemblyFaults += 1;
+        return;
+      }
+      assembly = {
+        fragmentCount: fragmentCount as number,
+        logicalBytes,
+        checksum,
+        chunks: new Array<Uint8Array | null>(fragmentCount as number).fill(null),
+        received: 0,
+      };
+      this.fragmentAssemblies.set(key, assembly);
+    }
+    if (
+      assembly.fragmentCount !== fragmentCount ||
+      assembly.logicalBytes !== logicalBytes ||
+      assembly.checksum !== checksum
+    ) {
+      this.fragmentAssemblies.delete(key);
+      this.counters.assemblyFaults += 1;
+      return;
+    }
+    if (assembly.chunks[fragmentIndex as number] !== null) return;
+    const chunk = Uint8Array.from(Buffer.from(dataBase64, "base64"));
+    if (chunk.byteLength === 0) {
+      this.fragmentAssemblies.delete(key);
+      this.counters.assemblyFaults += 1;
+      return;
+    }
+    assembly.chunks[fragmentIndex as number] = chunk;
+    assembly.received += 1;
+    if (assembly.received < assembly.fragmentCount) return;
+    this.fragmentAssemblies.delete(key);
+    const joined = new Uint8Array(assembly.logicalBytes);
+    let offset = 0;
+    for (const piece of assembly.chunks) {
+      if (!piece || offset + piece.byteLength > joined.byteLength) {
+        this.counters.assemblyFaults += 1;
+        return;
+      }
+      joined.set(piece, offset);
+      offset += piece.byteLength;
+    }
+    if (offset !== joined.byteLength || crc32WireBytes(joined) !== assembly.checksum) {
+      this.counters.assemblyFaults += 1;
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(Buffer.from(joined).toString("utf8"));
+    } catch {
+      this.counters.assemblyFaults += 1;
+      return;
+    }
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      (parsed as { topic?: unknown }).topic !== wire.topic ||
+      (parsed as { subscriptionId?: unknown }).subscriptionId !== wire.subscriptionId
+    ) {
+      this.counters.assemblyFaults += 1;
+      return;
+    }
+    this.counters.fragmentsReassembled += 1;
+    this.stageOrDeliver(parsed as Record<string, unknown>, wire.subscriptionId);
+  }
+
+  /** ack 前暂存；ack 后只放行绑定 subscriptionId 的帧（旧订阅帧计 stale）。 */
+  private stageOrDeliver(frame: Record<string, unknown>, subscriptionId: string): void {
+    if (this.boundSubscriptionId === null) {
+      if (this.staged.length >= CONVERSATION_MAX_STAGED_FRAMES) {
+        this.counters.assemblyFaults += 1;
+        return;
+      }
+      this.staged.push({ frame, subscriptionId });
+      this.counters.stagedFrames += 1;
+      return;
+    }
+    if (subscriptionId !== this.boundSubscriptionId) {
+      this.counters.staleSubscriptionFrames += 1;
+      return;
+    }
+    this.deliver(frame);
+  }
+
+  private flushStaged(): void {
+    const bound = this.boundSubscriptionId;
+    const staged = this.staged.splice(0);
+    for (const item of staged) {
+      if (item.subscriptionId !== bound) {
+        this.counters.staleSubscriptionFrames += 1;
+        continue;
+      }
+      this.deliver(item.frame);
+    }
+  }
+
+  private deliver(frame: Record<string, unknown>): void {
+    if (frame.topic !== this.topic) {
+      this.counters.foreignTopicFrames += 1;
+      return;
+    }
+    this.counters.topicFramesDelivered += 1;
+    this.onFrame?.(frame);
   }
 
   private sendFrame(bytes: Uint8Array): boolean {

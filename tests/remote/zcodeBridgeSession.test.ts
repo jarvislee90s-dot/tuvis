@@ -54,6 +54,8 @@ afterAll(() => {
 });
 
 import { RelayTerminalConnection } from "../../scripts/zcode-bridge-probe/relayAuth";
+import { SecretRedactor } from "../../scripts/zcode-bridge-probe/sanitize";
+import { formatTargetLockedLine } from "../../scripts/zcode-bridge-probe/session-probe";
 import {
   AGENT_CHANNEL,
   AGENT_SEND_COMMAND_METHOD,
@@ -1318,5 +1320,43 @@ describe("workspace-bridge-open 应答分类与桥 wire 形状（B2 实连 12474
       recoveryId: "r",
       ackMessageSeq: 4,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B2 收官修复（stdout 别名化；实连 run macos-B220261024T132316Z-prItvw 收官时发现）：
+// 「目标已锁定」一行曾把**真实** taskId/workspaceKey 打上 stdout——证据文件经
+// SecretRedactor fail-closed 脱敏，stdout 不在落盘闸内。修复 = 该行经
+// formatTargetLockedLine 走 redactor 别名化；本组断言锁形：真实值绝不上 stdout、
+// 别名与 mapping 阶段登记稳定复用、verdict 措辞保持人类可读。
+// ---------------------------------------------------------------------------
+describe("stdout 别名化（B2 收官修复）", () => {
+  const FAKE_REAL_TARGET = {
+    taskId: "b2-fake-real-task-id",
+    workspaceKey: "/Users/fake/real-travel-path",
+    generation: 1,
+  };
+
+  it("目标锁定行只含别名与代际：真实 taskId/workspace 路径不出现在文案里", () => {
+    const redactor = new SecretRedactor();
+    const line = formatTargetLockedLine(redactor, FAKE_REAL_TARGET);
+    expect(line).toContain("目标已锁定（别名）");
+    expect(line).toMatch(/taskId=SID_[A-Z]/);
+    expect(line).toMatch(/workspace=PATH_\d+/);
+    expect(line).toContain("（generation 1）");
+    expect(line).not.toContain(FAKE_REAL_TARGET.taskId);
+    expect(line).not.toContain(FAKE_REAL_TARGET.workspaceKey);
+  });
+
+  it("别名稳定复用：mapping 阶段已登记的同一值在 stdout 行上复用同一别名", () => {
+    const redactor = new SecretRedactor();
+    // mapping 阶段收割 task 行 / workspace 条目时已按同值登记（sid / path 两类）。
+    expect(redactor.register("sid", FAKE_REAL_TARGET.taskId)).toBe("SID_A");
+    expect(redactor.register("path", FAKE_REAL_TARGET.workspaceKey)).toBe("PATH_1");
+    const line = formatTargetLockedLine(redactor, FAKE_REAL_TARGET);
+    expect(line).toContain("taskId=SID_A");
+    expect(line).toContain("workspace=PATH_1");
+    expect(line).not.toContain(FAKE_REAL_TARGET.taskId);
+    expect(line).not.toContain(FAKE_REAL_TARGET.workspaceKey);
   });
 });
