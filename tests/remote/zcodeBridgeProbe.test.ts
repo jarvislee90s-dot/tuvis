@@ -5,14 +5,16 @@
 //   1. 官方链接解析（sid/mid 提取 + A4 拒绝面）
 //      → src-tauri/src/services/zcode_control/config.rs:17-27（键/主机/上限）、
 //        决策文件 §6.2-15（/remote/vN、legacy hash/t 拒收）
-//   2. OAuth 授权 URL 构造（ZAI 通道参数形状）
-//      → packages/web/src/auth/zaiWebOAuthProvider.ts:184-191 @ 3c5b2276；
-//        webZaiOAuthConfig.ts:30,56-58（authorize origin / token 路径 / 公开 client_id）
+//   2. OAuth 授权 URL 构造（ZAI / BigModel 双通道参数形状）
+//      → packages/web/src/auth/zaiWebOAuthProvider.ts:175-181,184-191 @ 3c5b2276；
+//        webZaiOAuthConfig.ts:30,40-42,56-61（authorize origin / bigmodel /login 拼接 /
+//        token 路径 / 公开 client_id / appId=zcode）；zcodeEndpoint.ts:6,252-264（bigmodel.cn）
 //   3. 本地回环回调监听（state 校验 + code|authCode|error 分型 + 不回显参数）
-//      → zaiWebOAuthProvider.ts:194-209（回调参数解析）；
+//      → zaiWebOAuthProvider.ts:194-209（回调参数解析，两通道共用）；
 //        entry.ts:17-26（callback 判定 = state + code|authCode|error）
-//   4. code 换 token 请求形状（POST /api/v1/oauth/token {provider,code,redirect_uri,state}）
-//      → zaiWebOAuthProvider.ts:211-239（body 形状与信封归一）、oauth.ts:12（provider="zai"）
+//   4. code 换 token 请求形状（POST /api/v1/oauth/token {provider,code,redirect_uri,state}，
+//      provider 字面量按通道 zai|bigmodel）
+//      → zaiWebOAuthProvider.ts:211-239（body 形状与信封归一）、oauth.ts:9,12（provider id）
 //   5. 凭据脱敏（稳定别名替换 / JWT 掩码 / fail-closed 断言）
 //   6. 证据落盘 fail-closed（含密内容拒写、不产生文件）
 //   7. settings 只读读取官方链接（node:sqlite readOnly，settings(key,value)）
@@ -44,8 +46,11 @@ afterAll(() => {
 import { parseOfficialLink } from "../../scripts/zcode-bridge-probe/officialLink";
 import { redactPayload } from "../../scripts/zcode-bridge-probe/auth-check";
 import {
+  OFFICIAL_BIGMODEL_APP_ID,
   OFFICIAL_OAUTH_CLIENT_ID,
   LoopbackCallbackServer,
+  buildAuthorizeUrl,
+  buildBigModelAuthorizeUrl,
   buildZaiAuthorizeUrl,
   exchangeCodeForToken,
 } from "../../scripts/zcode-bridge-probe/oauthFlow";
@@ -132,6 +137,100 @@ describe("zcode 官方桥接探针：客户端可测逻辑（B1 实连半场）"
     expect(parsed.searchParams.get("response_type")).toBe("code");
     expect(parsed.searchParams.get("client_id")).toBe(OFFICIAL_OAUTH_CLIENT_ID);
     expect(parsed.searchParams.get("state")).toBe("b1-fake-state-1");
+  });
+
+  it("授权 URL 构造：BigModel 通道官方参数形状（redirect/appId/state，无 response_type）", () => {
+    // 官方 appId 默认即桌面端在用的 "zcode"（webZaiOAuthConfig.ts:60-61 @ 3c5b2276）。
+    expect(OFFICIAL_BIGMODEL_APP_ID).toBe("zcode");
+    const url = buildBigModelAuthorizeUrl({
+      redirectUri: "http://127.0.0.1:49153/callback",
+      state: "b1-fake-state-bm-1",
+    });
+    expect(url.startsWith("https://bigmodel.cn/login?")).toBe(true);
+    const parsed = new URL(url);
+    expect(parsed.origin).toBe("https://bigmodel.cn");
+    expect(parsed.pathname).toBe("/login");
+    expect(parsed.searchParams.get("redirect")).toBe("http://127.0.0.1:49153/callback");
+    expect(parsed.searchParams.get("appId")).toBe("zcode");
+    expect(parsed.searchParams.get("state")).toBe("b1-fake-state-bm-1");
+    // BigModel 分支没有 ZAI 形状的任何参数（zaiWebOAuthProvider.ts:175-181 @ 3c5b2276）。
+    expect(parsed.searchParams.get("response_type")).toBeNull();
+    expect(parsed.searchParams.get("client_id")).toBeNull();
+    expect(parsed.searchParams.get("redirect_uri")).toBeNull();
+    // 参数插入序与官方一致：redirect → appId → state。
+    expect([...parsed.searchParams.keys()]).toEqual(["redirect", "appId", "state"]);
+  });
+
+  it("授权 URL 分派：zai/bigmodel 各走官方入口；交换 body 的 provider 字面量按通道取值", async () => {
+    // 分派：zai 与直调 buildZaiAuthorizeUrl 等价；bigmodel 落 bigmodel.cn/login。
+    const redirect = "http://127.0.0.1:49154/callback";
+    expect(buildAuthorizeUrl("zai", { redirectUri: redirect, state: "s-zai" })).toBe(
+      buildZaiAuthorizeUrl({ redirectUri: redirect, state: "s-zai" })
+    );
+    expect(buildAuthorizeUrl("bigmodel", { redirectUri: redirect, state: "s-bm" })).toBe(
+      buildBigModelAuthorizeUrl({ redirectUri: redirect, state: "s-bm" })
+    );
+    expect(
+      new URL(
+        buildAuthorizeUrl("bigmodel", { redirectUri: redirect, state: "s-bm" })
+      ).searchParams.get("appId")
+    ).toBe("zcode");
+
+    // 交换 body：缺省 provider = "zai"（官方服务端约定，oauth.ts:12）；显式两通道字面量
+    // = oauth.ts:9,12；信封/端点两通道一致（zaiWebOAuthProvider.ts:211-239 @ 3c5b2276）。
+    const bodies: Array<Record<string, unknown>> = [];
+    const fake = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk: Buffer) => {
+        body += chunk.toString("utf8");
+      });
+      req.on("end", () => {
+        bodies.push(JSON.parse(body));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            code: 0,
+            msg: "ok",
+            data: {
+              token: "b1-fake-jwt-header.b1-fake-jwt-payload.b1-fake-jwt-sig",
+              zai: { access_token: "b1-fake-zai-at" },
+              bigmodel: { access_token: "b1-fake-bigmodel-at" },
+              expires_in: 3600,
+              user: { id: "b1-fake-user" },
+            },
+          })
+        );
+      });
+    });
+    await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", () => resolve()));
+    const port = (fake.address() as AddressInfo).port;
+    const base = {
+      zcodeOrigin: `http://127.0.0.1:${port}`,
+      code: "b1-fake-code-1",
+      redirectUri: redirect,
+      state: "b1-fake-state-1",
+    };
+    try {
+      const byDefault = await exchangeCodeForToken({ ...base });
+      const asZai = await exchangeCodeForToken({ ...base, provider: "zai" });
+      const asBigmodel = await exchangeCodeForToken({ ...base, provider: "bigmodel" });
+      for (const result of [byDefault, asZai, asBigmodel]) {
+        expect(result).toMatchObject({
+          kind: "ok",
+          jwt: "b1-fake-jwt-header.b1-fake-jwt-payload.b1-fake-jwt-sig",
+          expiresInSeconds: 3600,
+        });
+      }
+      expect(bodies.map((entry) => entry.provider)).toEqual(["zai", "zai", "bigmodel"]);
+      for (const entry of bodies) {
+        expect(Object.keys(entry)).toEqual(["provider", "code", "redirect_uri", "state"]);
+        expect(entry.code).toBe("b1-fake-code-1");
+        expect(entry.redirect_uri).toBe(redirect);
+        expect(entry.state).toBe("b1-fake-state-1");
+      }
+    } finally {
+      await new Promise<void>((resolve) => fake.close(() => resolve()));
+    }
   });
 
   it("回环回调监听：state 不匹配继续等待；code/authCode/error 分型；响应不回显参数", async () => {

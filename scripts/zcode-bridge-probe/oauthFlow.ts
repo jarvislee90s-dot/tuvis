@@ -8,17 +8,26 @@
 //      `{chat.z.ai}/api/oauth/authorize?redirect_uri&response_type=code&client_id&state`
 //      → packages/web/src/auth/zaiWebOAuthProvider.ts:184-191 @ 3c5b2276；
 //        webZaiOAuthConfig.ts:30（默认 origin https://chat.z.ai）、57-58（公开 client_id）
-//      BigModel 通道变体 `{bigmodel}/login?redirect&appId=zcode&state` 存在
-//      （zaiWebOAuthProvider.ts:175-181；webZaiOAuthConfig.ts:59-61）——本轮探针只走
-//      默认 ZAI 通道，BigModel 变体留待需要时另行取证，不猜测其行为。
+//      BigModel（国内智谱）通道变体（2026-10-24 起实现；行号均 @ 3c5b2276）：
+//      `{origin}/login?redirect=<回调>&appId=<appId>&state=<state>`，参数名与 ZAI 完全
+//      不同（redirect/appId vs redirect_uri/client_id，且无 response_type）：
+//        zaiWebOAuthProvider.ts:175-181（BIGMODEL 分支 + 参数插入序 redirect→appId→state）；
+//        webZaiOAuthConfig.ts:40-42（入口拼 {origin}/login，兜底 resolveBigModelApiOrigin({})）；
+//        zcodeEndpoint.ts:6（DEFAULT_BIGMODEL_API_ORIGIN = "https://bigmodel.cn"，:7 test 同值）、
+//        zcodeEndpoint.ts:252-264（resolveBigModelApiOrigin 生产兜底 = 上值）；
+//        webZaiOAuthConfig.ts:60-61（appId 默认 "zcode"，明示「桌面端在用的」值）。
 //   2. LoopbackCallbackServer —— 127.0.0.1 随机空闲端口的本地回调监听：
 //      官方回调参数三元组 state + code|authCode|error（zaiWebOAuthProvider.ts:194-209；
 //      entry.ts:17-26）。state 精确匹配才消费；不匹配/缺 state 一律忽略并继续等待
 //      （防重放/他人回调）；响应体为静态文案，不回显任何参数。
 //   3. exchangeCodeForToken —— `POST {zcodeOrigin}/api/v1/oauth/token`，body
-//      `{provider:"zai", code, redirect_uri, state}`（官方 provider 常量 "zai"：
-//      packages/shared/src/oauth.ts:12；body 形状 zaiWebOAuthProvider.ts:211-239，
+//      `{provider, code, redirect_uri, state}`（body 形状 zaiWebOAuthProvider.ts:211-239，
 //      tokenUrl 相对路径 webZaiOAuthConfig.ts:56 → 与网页同源，即 zcodeOrigin）。
+//      **两通道共用同一交换端点与 body 形状，唯一通道差异是 provider 字面量**：
+//      `zai`（oauth.ts:12 ZAI_PROVIDER_ID）/ `bigmodel`（oauth.ts:9 BIGMODEL_PROVIDER_ID，
+//      经 zaiWebOAuthProvider.ts:217,222-223 发出）；响应差异仅在 access_token 落位
+//      （data.zai vs data.bigmodel 子对象，zaiWebOAuthProvider.ts:126-131）——探针只消费
+//      data.token（121-124），不受影响。
 //      官方网页从浏览器同源 fetch；探针从 Node 直连同一端点，形状一致（无 CORS 面）。
 //
 // 语法纪律：可被 `node`（type-stripping）直接执行——仅可擦除 TS 语法；相对导入带 .ts。
@@ -43,6 +52,22 @@ export const OFFICIAL_ZCODE_ENDPOINT_ORIGIN = "https://zcode.z.ai";
 export const OFFICIAL_OAUTH_TOKEN_PATH = "/api/v1/oauth/token";
 /** 交换 body 的 provider 缺省值（oauth.ts:12；zaiWebOAuthProvider.ts:217,222-223）。 */
 export const OAUTH_PROVIDER_ZAI = "zai";
+/**
+ * BigModel（国内智谱）通道授权入口 origin。生产默认常量
+ * `DEFAULT_BIGMODEL_API_ORIGIN = "https://bigmodel.cn"`（zcodeEndpoint.ts:6；test 同值 :7）；
+ * 官方网页配置层经 resolveBigModelApiOrigin({}) 兜底解析，注释明示「等价于生产 origin」
+ * （webZaiOAuthConfig.ts:37-42；解析函数 zcodeEndpoint.ts:252-264）。探针固定生产 origin。
+ */
+export const OFFICIAL_BIGMODEL_AUTHORIZE_ORIGIN = "https://bigmodel.cn";
+/** BigModel 通道授权路径：官方配置拼 `{origin}/login`（webZaiOAuthConfig.ts:40-42）。 */
+export const OFFICIAL_BIGMODEL_AUTHORIZE_PATH = "/login";
+/** BigModel 通道 appId 缺省值 `"zcode"`——源码注释明示「桌面端在用的」（webZaiOAuthConfig.ts:60-61）。 */
+export const OFFICIAL_BIGMODEL_APP_ID = "zcode";
+/** 交换 body 的 BigModel provider 字面量（oauth.ts:9 BIGMODEL_PROVIDER_ID）。 */
+export const OAUTH_PROVIDER_BIGMODEL = "bigmodel";
+
+/** OAuth 授权通道（对应官方 WebOAuthProviderId 两值：oauth.ts:9,12）。 */
+export type OAuthProviderChannel = "zai" | "bigmodel";
 
 /** 官方 ZAI 通道授权 URL（参数经 URLSearchParams 编码，与官方 buildAuthorizeUrl 同形）。 */
 export function buildZaiAuthorizeUrl(params: { redirectUri: string; state: string }): string {
@@ -53,6 +78,30 @@ export function buildZaiAuthorizeUrl(params: { redirectUri: string; state: strin
     state: params.state,
   });
   return `${OFFICIAL_AUTHORIZE_ORIGIN}${OFFICIAL_AUTHORIZE_PATH}?${query.toString()}`;
+}
+
+/**
+ * 官方 BigModel（国内智谱）通道授权 URL。与 ZAI 的差异（zaiWebOAuthProvider.ts:175-181）：
+ * 参数名 redirect/appId/state（无 response_type、无 client_id），插入序 redirect→appId→state；
+ * 入口 = `{bigmodel origin}/login`（webZaiOAuthConfig.ts:40-42）；appId 固定官方默认
+ * `"zcode"`（webZaiOAuthConfig.ts:60-61）。回调参数解析两通道共用（:194-209），探针
+ * 回环监听器无需通道分支。
+ */
+export function buildBigModelAuthorizeUrl(params: { redirectUri: string; state: string }): string {
+  const query = new URLSearchParams({
+    redirect: params.redirectUri,
+    appId: OFFICIAL_BIGMODEL_APP_ID,
+    state: params.state,
+  });
+  return `${OFFICIAL_BIGMODEL_AUTHORIZE_ORIGIN}${OFFICIAL_BIGMODEL_AUTHORIZE_PATH}?${query.toString()}`;
+}
+
+/** 按通道构造官方授权 URL（zai → chat.z.ai/api/oauth/authorize；bigmodel → bigmodel.cn/login）。 */
+export function buildAuthorizeUrl(
+  provider: OAuthProviderChannel,
+  params: { redirectUri: string; state: string }
+): string {
+  return provider === "bigmodel" ? buildBigModelAuthorizeUrl(params) : buildZaiAuthorizeUrl(params);
 }
 
 // ---------------------------------------------------------------------------
@@ -230,15 +279,23 @@ export type OAuthExchangeResult =
 
 /**
  * 以授权码换取 ZCode 账号 JWT（探针只消费 data.token；官方还要求 data.<provider>.
- * access_token，探针不使用 upstream access_token，故不作为成功条件——
- * data.token 即 B1 所需账号凭据，zaiWebOAuthProvider.ts:121-124,151-156）。
- * 任何失败都返回结构化结果而非抛错；错误不携带凭据。
+ * access_token——两通道落位不同：zai → data.zai.access_token、bigmodel → data.bigmodel.
+ * access_token（zaiWebOAuthProvider.ts:126-131）——探针不使用 upstream access_token，
+ * 故不作为成功条件，也不因通道而异：data.token 即 B1 所需账号凭据，
+ * zaiWebOAuthProvider.ts:121-124,151-156）。任何失败都返回结构化结果而非抛错；
+ * 错误不携带凭据。
+ *
+ * 交换端点与 body 形状两通道共用（zaiWebOAuthProvider.ts:211-239；tokenUrl 同源
+ * webZaiOAuthConfig.ts:56），唯一通道差异 = body.provider 字面量（oauth.ts:9,12；
+ * zaiWebOAuthProvider.ts:217,222-223）。缺省 provider 沿官方服务端约定取 "zai"。
  */
 export async function exchangeCodeForToken(options: {
   zcodeOrigin: string;
   code: string;
   redirectUri: string;
   state: string;
+  /** 通道字面量：zai（默认）| bigmodel。 */
+  provider?: OAuthProviderChannel;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
 }): Promise<OAuthExchangeResult> {
@@ -249,7 +306,7 @@ export async function exchangeCodeForToken(options: {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        provider: OAUTH_PROVIDER_ZAI,
+        provider: options.provider ?? OAUTH_PROVIDER_ZAI,
         code: options.code,
         redirect_uri: options.redirectUri,
         state: options.state,

@@ -16,9 +16,14 @@
 //
 // wire 依据 = 固定官方源码 zai-org/ZCode @ 3c5b227649371507ddc4eb46ac5133afe6db1cab
 // （逐条行号见各被调模块头注与决策文件 §6.2）：
-//   - 授权入口（ZAI 通道）`https://chat.z.ai/api/oauth/authorize`（webZaiOAuthConfig.ts:30）
-//   - 公开 client_id `client_P8X5CMWmlaRO9gyO-KSqtg`（webZaiOAuthConfig.ts:57-58）
-//   - 交换 `POST https://zcode.z.ai/api/v1/oauth/token`（webZaiOAuthConfig.ts:56 同源相对路径）
+//   - 授权入口按 --provider 通道分派（--provider=zai|bigmodel，默认 zai）：
+//     zai → `https://chat.z.ai/api/oauth/authorize`（webZaiOAuthConfig.ts:30）；
+//     bigmodel → `https://bigmodel.cn/login?redirect=<回调>&appId=zcode&state=<state>`
+//     （zaiWebOAuthProvider.ts:175-181；webZaiOAuthConfig.ts:40-42,60-61；zcodeEndpoint.ts:6,252-264）。
+//   - 公开 client_id `client_P8X5CMWmlaRO9gyO-KSqtg`（webZaiOAuthConfig.ts:57-58）——仅 zai 通道；
+//     bigmodel 通道用 appId=zcode（webZaiOAuthConfig.ts:60-61）。
+//   - 交换（两通道共用，仅 provider 字面量不同：oauth.ts:9,12）：
+//     `POST https://zcode.z.ai/api/v1/oauth/token`（webZaiOAuthConfig.ts:56 同源相对路径）
 //   - **relay 主机派生**：与 ZCode 端点同源主机——`buildZCodeEndpointUrls` 把同一 origin 的
 //     协议换成 ws(s) 后拼 `/api/v1/remote/ws2`（packages/shared/src/zcodeEndpoint.ts:369-370,380；
 //     默认常量 `wss://zcode.z.ai/api/v1/remote/ws2` zcodeEndpoint.ts:14；apiBaseUrl 同 origin
@@ -38,12 +43,18 @@ import { ReadonlyPayloadChannel } from "./appPayload.ts";
 import { parseOfficialLink } from "./officialLink.ts";
 import {
   LoopbackCallbackServer,
+  OFFICIAL_AUTHORIZE_ORIGIN,
+  OFFICIAL_BIGMODEL_AUTHORIZE_ORIGIN,
+  OFFICIAL_BIGMODEL_AUTHORIZE_PATH,
+  OFFICIAL_BIGMODEL_APP_ID,
   OFFICIAL_OAUTH_CLIENT_ID,
   OFFICIAL_ZCODE_ENDPOINT_ORIGIN,
-  buildZaiAuthorizeUrl,
+  OFFICIAL_AUTHORIZE_PATH,
+  buildAuthorizeUrl,
   exchangeCodeForToken,
   generateOAuthState,
   type LoopbackCallback,
+  type OAuthProviderChannel,
 } from "./oauthFlow.ts";
 import { RELAY_WS_PATH, RelayTerminalConnection, requestTerminalToken } from "./relayAuth.ts";
 import {
@@ -117,7 +128,8 @@ export const PROBE_STEPS: readonly ProbeStep[] = [
     title: "probe-oauth：账号凭据通路定案（interim→proven/unsupported 分岔点）",
     requires: "用户本人在浏览器完成官方 OAuth；Agent 不代登、不读浏览器/其他应用凭据",
     detail:
-      "授权 URL 用官方公开 client_id + redirect_uri=http://127.0.0.1:<随机端口>/callback；" +
+      "授权 URL 按 --provider 通道分派（zai 用官方公开 client_id；bigmodel 用 appId=zcode），" +
+      "redirect_uri=http://127.0.0.1:<随机端口>/callback；" +
       "授权服务器接受回环 redirect 且 code 换 token 成功 → PROVEN；" +
       "authorize-error / 交换被拒 / 回调超窗 → 结构化 UNSUPPORTED（脱敏）。JWT 只存内存。",
   },
@@ -164,6 +176,7 @@ type ProbeFlags = {
   jwtStdin: boolean;
   sid: string | null;
   dbPath: string | null;
+  provider: OAuthProviderChannel;
   help: boolean;
 };
 
@@ -175,6 +188,7 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
     jwtStdin: false,
     sid: null,
     dbPath: null,
+    provider: "zai",
     help: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -192,6 +206,16 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
       }
       flags.oauthWaitMs = value;
       if (arg === "--wait-ms") i += 1;
+    } else if (arg.startsWith("--provider=")) {
+      // 通道字面量与官方 provider id 一致（oauth.ts:9,12）；非通道值一律拒绝，不猜。
+      const value = arg.slice("--provider=".length).trim();
+      if (value === "zai" || value === "bigmodel") {
+        flags.provider = value;
+      } else {
+        return `--provider 只接受 zai | bigmodel，收到：${value || "(空)"}`;
+      }
+    } else if (arg === "--provider") {
+      return "--provider 需要 =<值> 形式，例如 --provider=bigmodel";
     } else if (arg.startsWith("--sid=")) {
       const value = arg.slice("--sid=".length).trim();
       const bytes = new TextEncoder().encode(value).length;
@@ -223,6 +247,14 @@ function printHelp(): void {
   lines.push("  --open                    授权阶段用系统默认浏览器打开授权 URL（默认只打印）。");
   lines.push("  --wait-ms=<ms>            OAuth 回调等待窗口（默认 300000，上限 3600000，有界）。");
   lines.push("  --jwt-stdin               重跑模式：跳过 OAuth，从 stdin 读账号 JWT（只入内存）。");
+  lines.push(
+    "  --provider=<zai|bigmodel> OAuth 通道（默认 zai）：zai = 国际站 chat.z.ai 授权入口；"
+  );
+  lines.push(
+    "                             bigmodel = 国内智谱 bigmodel.cn 授权入口（appId=zcode）。"
+  );
+  lines.push("                             两通道共用同一交换端点与下游 relay（s3—s6 不受影响），");
+  lines.push("                             仅授权 URL 形状与交换 body 的 provider 字面量不同。");
   lines.push(
     "  --sid=<device_sid>        跳过 DB 读取，直接指定 device_sid（origin 取官方默认）。"
   );
@@ -406,7 +438,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
     printHelp();
     console.error(
       `\n[b1-probe] 拒绝执行：缺少 ${UNLOCK_FLAG}。本探针会发起真实网络连接 ` +
-        `(chat.z.ai / zcode.z.ai / 本地回环回调)，必须由操作员显式解锁。`
+        `(chat.z.ai / bigmodel.cn / zcode.z.ai / 本地回环回调)，必须由操作员显式解锁。`
     );
     return { oauthVerdict: "NOT-RUN", connectVerdict: "NOT-RUN", exitCode: 2 };
   }
@@ -427,14 +459,21 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
 
   let jwt: string | null = null;
   let oauthVerdict = "SKIPPED";
-  const oauthSummary: Record<string, unknown> = { attempted: !parsed.jwtStdin };
+  // provider 通道字面量不是秘密（oauth.ts:9,12），如实入 summary/证据。
+  const oauthSummary: Record<string, unknown> = {
+    attempted: !parsed.jwtStdin,
+    provider: parsed.provider,
+  };
 
   // —— Step 2（s2）：probe-oauth ——————————————————————————————————————————
   if (!parsed.jwtStdin) {
+    const isZai = parsed.provider === "zai";
     record("probe-oauth", "start", {
-      authorizeOrigin: "https://chat.z.ai",
-      authorizePath: "/api/oauth/authorize",
-      clientId: OFFICIAL_OAUTH_CLIENT_ID,
+      provider: parsed.provider,
+      authorizeOrigin: isZai ? OFFICIAL_AUTHORIZE_ORIGIN : OFFICIAL_BIGMODEL_AUTHORIZE_ORIGIN,
+      authorizePath: isZai ? OFFICIAL_AUTHORIZE_PATH : OFFICIAL_BIGMODEL_AUTHORIZE_PATH,
+      clientIdentifierField: isZai ? "client_id" : "appId",
+      clientIdentifier: isZai ? OFFICIAL_OAUTH_CLIENT_ID : OFFICIAL_BIGMODEL_APP_ID,
       testTarget: "redirect_uri = http://127.0.0.1:<random-port>/callback",
     });
     const state = generateOAuthState();
@@ -446,7 +485,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
     let redirectUri: string;
     try {
       redirectUri = server.redirectUri;
-      const authorizeUrl = buildZaiAuthorizeUrl({ redirectUri, state });
+      const authorizeUrl = buildAuthorizeUrl(parsed.provider, { redirectUri, state });
       // 完整授权 URL 也登记为 link 类：任何意外把它带进证据都会被别名化。
       redactor.register("link", authorizeUrl);
       oauthSummary.redirect = { host: "127.0.0.1", port: server.port, path: "/callback" };
@@ -456,7 +495,11 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         redirectPort: server.port,
         state: "STATE_1",
       });
-      log("请在浏览器打开下面的官方授权 URL，并用你的 ZCode 账号完成授权（探针绝不代登）：");
+      log(
+        parsed.provider === "bigmodel"
+          ? "请在浏览器打开下面的官方授权 URL，并用你的国内智谱（bigmodel.cn）账号完成授权（探针绝不代登）："
+          : "请在浏览器打开下面的官方授权 URL，并用你的 ZCode 账号完成授权（探针绝不代登）："
+      );
       log(`  ${authorizeUrl}`);
       if (parsed.open) {
         log(
@@ -483,6 +526,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         code: callback.code,
         redirectUri,
         state,
+        provider: parsed.provider,
       });
       if (exchange.kind === "ok") {
         jwt = exchange.jwt;
@@ -859,6 +903,7 @@ async function writeEvidence(
     finishedUtc: finishedIso,
     guards: PROBE_GUARDS,
     flags: {
+      provider: flags.provider,
       unlock: flags.unlock,
       openRequested: flags.open,
       oauthWaitMs: flags.oauthWaitMs,
