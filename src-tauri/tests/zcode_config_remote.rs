@@ -80,9 +80,7 @@ fn state(conn: &SharedConn) -> Arc<RemoteState> {
         rate_bucket_channels_source: Box::new(|| Vec::new()),
         home_source: Box::new(|| None),
         injector: Arc::new(multi_agents_manager_lib::inject::engine::RealInjector),
-        resume_spawner: Arc::new(
-            |_: &multi_agents_manager_lib::inject::resume::SpawnSpec| Ok(()),
-        ),
+        resume_spawner: Arc::new(|_: &multi_agents_manager_lib::inject::resume::SpawnSpec| Ok(())),
         create_hub: Arc::new(multi_agents_manager_lib::remote::server::CreateTaskHub::stub()),
         archive_source: Box::new(Vec::new),
         archive_delete: Arc::new(|_: Option<&str>| 0usize),
@@ -126,11 +124,7 @@ async fn remote_config_requires_pairing() {
     let app = router(state(&conn));
 
     // 未配对：无 cookie → 403（回环同样拒绝；gate 零豁免）
-    let resp = app
-        .clone()
-        .oneshot(req("GET", ROUTE, None))
-        .await
-        .unwrap();
+    let resp = app.clone().oneshot(req("GET", ROUTE, None)).await.unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
 
     // 已配对 + 未配置 → 200 {missing,null}，且 no-store
@@ -164,7 +158,10 @@ async fn remote_config_requires_pairing() {
 
     // 只读：GET 不改写已存值
     assert_eq!(
-        DeviceStore::Owned(conn.clone()).with(get_config).url.as_deref(),
+        DeviceStore::Owned(conn.clone())
+            .with(get_config)
+            .url
+            .as_deref(),
         Some(SYNTH_URL)
     );
 
@@ -220,10 +217,7 @@ async fn stored_invalid_value_is_reported_without_url() {
         .expect("inject stored invalid value");
     let app = router(state(&conn));
 
-    let resp = app
-        .oneshot(req("GET", ROUTE, Some(COOKIE)))
-        .await
-        .unwrap();
+    let resp = app.oneshot(req("GET", ROUTE, Some(COOKIE))).await.unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
     assert_eq!(
         body_json(resp).await,

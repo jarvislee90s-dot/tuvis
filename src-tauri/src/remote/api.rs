@@ -581,9 +581,7 @@ pub async fn official_control(
     }
     // 只读 settings（DeviceStore 即全局 DB 连接缝；测试 = 内存库）。读取时复验格式，
     // 坏值如实 Invalid + url null——不缓存、不探测官方服务。
-    let config = st
-        .store
-        .with(crate::services::zcode_control::get_config);
+    let config = st.store.with(crate::services::zcode_control::get_config);
     Ok((
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(config),

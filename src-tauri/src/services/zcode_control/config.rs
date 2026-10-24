@@ -258,7 +258,8 @@ mod tests {
         assert_eq!(get_config(&conn), saved(v4));
 
         // v5 + 编码中文 + 未知 query：语义原样保留，不因新增字段/版本强制拒绝
-        let v5 = "https://zcode.z.ai/remote/v5?sid=synthetic-sid-0002&name=%E5%85%94%E5%AD%90&region=cn";
+        let v5 =
+            "https://zcode.z.ai/remote/v5?sid=synthetic-sid-0002&name=%E5%85%94%E5%AD%90&region=cn";
         let stored = set_config(&conn, v5).unwrap();
         assert_eq!(stored.config_state, ConfigState::Saved);
         let stored_url = stored.url.expect("已保存链接");
@@ -317,10 +318,7 @@ mod tests {
             "not a url",
         ];
         for bad in rejected {
-            assert!(
-                validate_official_url(bad).is_err(),
-                "应拒绝：{bad}"
-            );
+            assert!(validate_official_url(bad).is_err(), "应拒绝：{bad}");
         }
 
         // 显式默认端口 443 允许（Url 归一化后端口等同缺省）
@@ -337,10 +335,7 @@ mod tests {
             "https://zcode.z.ai/remote/v4?sid=synthetic-sid-1018&pad={}",
             "a".repeat(MAX_URL_BYTES)
         );
-        assert_eq!(
-            validate_official_url(&too_long),
-            Err(ConfigError::TooLong)
-        );
+        assert_eq!(validate_official_url(&too_long), Err(ConfigError::TooLong));
 
         // sid 字节边界：128 恰好通过，129 拒绝；中文按 UTF-8 字节计
         let sid_128 = "s".repeat(MAX_SID_BYTES);
@@ -362,7 +357,8 @@ mod tests {
         );
 
         // 未知 query 不擅自丢（含重复未知键）
-        let unknown = "https://zcode.z.ai/remote/v4?sid=synthetic-sid-1019&future=1&future=2&mid=m-1";
+        let unknown =
+            "https://zcode.z.ai/remote/v4?sid=synthetic-sid-1019&future=1&future=2&mid=m-1";
         let stored = validate_official_url(unknown)
             .expect("未知 query 应通过")
             .expect("非空白");
