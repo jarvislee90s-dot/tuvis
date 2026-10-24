@@ -19,6 +19,12 @@ English · [中文](README.zh-CN.md)
 
 <img src="docs/images/dashboard-main.png" width="820" alt="Tuvis dashboard — live traffic-light session board for eight AI coding tools" />
 
+<b>Now adapted for iPhone Duo.</b>
+
+<img src="docs/images/duo-unfold-en.gif" width="820" alt="iPhone Duo concept — the command deck unfolds from a 5.4″ cover screen into a 7.6″ two-pane view" />
+
+<i>Concept demo · Not an official Apple page · iPhone Duo is a trademark of Apple Inc.</i>
+
 </div>
 
 ## Why Tuvis

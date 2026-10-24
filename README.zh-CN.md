@@ -19,6 +19,12 @@
 
 <img src="docs/images/dashboard-main.png" width="820" alt="兔维斯看板——八个 AI 编程工具的实时红绿灯会话看板" />
 
+<b>现已适配 iPhone Duo.</b>
+
+<img src="docs/images/duo-unfold-zh.gif" width="820" alt="iPhone Duo 概念演示——从 5.4″ 外屏展开成 7.6″ 双栏指挥台" />
+
+<i>概念演示 · 非 Apple 官方页面 · iPhone Duo 为 Apple Inc. 商标</i>
+
 </div>
 
 ## 为什么是 Tuvis
