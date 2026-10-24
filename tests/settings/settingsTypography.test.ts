@@ -47,6 +47,10 @@ const EXEMPT = new Map<string, string>([
   ["src/components/settings/AuditLogSection.tsx", "五列审计表（密集网格）"],
   ["src/components/settings/SignalHealthSection.tsx", "信号矩阵（密集网格）"],
   ["src/components/settings/RemoteSection.tsx", "远程设备/文件表与模式名（密集网格）"],
+  [
+    "src/components/settings/HeadlessSettingsSection.tsx",
+    "远程分组标题（A2 自 RemoteSection 抽取的无头/兼容发送区，沿用 12.5px 分组档）",
+  ],
   ["src/components/settings/UsageStatusSection.tsx", "采集状态表（密集网格）"],
   ["src/components/settings/RemoteAppearanceSection.tsx", "缩微设备预览（小字号是缩微的一部分）"],
 ]);

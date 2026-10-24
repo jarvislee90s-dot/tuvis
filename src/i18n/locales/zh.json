@@ -495,7 +495,7 @@
       "tsClearedToast": "已撤销：另有 {{count}} 条非 兔维斯 条目被一并清除",
       "namedRunningHint": "隧道已连接；地址永久有效",
       "namedOffHint": "开关未打开——公网地址暂不可达；打开开关后恢复（地址不变，无需重配）。",
-      "groupHeadless": "④ 无头注入（绕过终端可视确认）",
+      "groupHeadless": "⑤ 无头注入（绕过终端可视确认）",
       "headlessTitle": "无头注入",
       "headlessHint": "默认开启。关闭时，手机端无法向 Codex APP 兼容通道会话发消息；终端注入不受影响。",
       "headlessLimitsSave": "保存无头配置",
@@ -506,7 +506,8 @@
       "compatSendTitle": "兼容发送（实验）",
       "compatSendHint": "默认开启；仅对未验证的 Codex 桌面版本生效；消息可能被投递到错误会话，风险自负。",
       "compatSendNeedsProbe": "需先完成只读探测（该 Codex 桌面版本的读链尚未取证）",
-      "groupCompatSend": "⑤ 兼容发送（仅未验证的 Codex 桌面版本）"
+      "groupCompatSend": "⑥ 兼容发送（仅未验证的 Codex 桌面版本）",
+      "groupTools": "④ 工具特殊配置"
     },
     "audit": {
       "title": "注入审计",

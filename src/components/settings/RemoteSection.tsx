@@ -1,9 +1,13 @@
 // 设置页「远程接入」分区（§C4：按线稿 v6 重排为 4 张对外通道卡，UI 唯一契约 =
 // docs/superpowers/wireframes/2026-09-17-remote-settings-redesign.html）。
-// 结构三段式：① 通用（总开关 / 电源保活 / 本机名称）② 通道四卡一排 + 唯一展开
-// 详情区（局域网连接 / 临时隧道 / 自有域名 / 外部域名——「本机」不是
-// 通道，是访问方式：走局域网卡地址，零豁免 §C4）③ 访问与安全（访问密码 / 重置设备
-// / 已接入设备列表）。状态唯一数据源 = remote_status 的 channels + pin 载荷（M5 A5）；
+// **六段顺序（2026-10-24 设计 §4.1，A2）**：① 通用（总开关 / 电源保活 / 本机名称）
+// ② 通道四卡一排 + 唯一展开详情区（「本机」不是通道，是访问方式：走局域网卡地址，
+// 零豁免 §C4）③ 访问与安全（访问密码 / 重置设备 / 已接入设备列表）④ 工具特殊配置
+// （目前只有标题的装配点，ZCode 卡由 A5 填入——不交付空工具卡）⑤ 无头注入 /
+// 兼容发送（抽取为 HeadlessSettingsSection；状态与轮询仍由本文件拥有）⑥ 注入审计
+// （AuditLogSection 由 SettingsPage 紧随其后装配，不在本文件）。分组标题挂
+// data-group 锚供顺序锁（tests/settings/remoteSection.test.tsx）定位。
+// 状态唯一数据源 = remote_status 的 channels + pin 载荷（M5 A5）；
 // tailscale 卡相位数据源 = remote_ts_probe（§C2/§C3；相位枚举见 TsPhase）；命令统一走
 // src/lib/api/remote.ts；Token / 本机名 / 保活写通用 set_setting。
 // 排版层级统一走 components/settings/typography.ts 单一出处（2026-10-07 用户裁决 C1）：
@@ -54,6 +58,9 @@ import { TailscaleWizard } from "@/components/settings/TailscaleWizard";
 import { NamedDomainWizard } from "@/components/settings/NamedDomainWizard";
 import { ChannelQr } from "@/components/settings/ChannelQr";
 import { ProcessHint } from "@/components/settings/ProcessHint";
+// A2（设计 §4.1）：⑤无头注入 / ⑥兼容发送抽取为纯呈现子组件——状态 owner（草稿、
+// ref 闸回填）、保存/错误回执与 3s 轮询都留在本文件（不建第二套状态/第二个定时器）
+import { HeadlessSettingsSection } from "@/components/settings/HeadlessSettingsSection";
 
 // B1：撤销预览载荷（Rust 端 run_step("disable_preview") 的形状，见 wizard.rs 注释）
 type TsDisablePreview = {
@@ -348,15 +355,8 @@ export function RemoteSection() {
   }, [status]);
 
   const enabled = status?.enabled ?? false;
-  // H3 无头总开关态：唯一数据源 = remote_status.headlessEnabled（缺键/旧载荷 =
-  // 新默认开；只有显式 false 才是用户关闭——加载中由 !status 禁用，不闪成关）。
-  const headlessEnabled = status?.headlessEnabled ?? true;
-  // #172/T8 兼容发送（实验）两个数据源（同源 remote_status）：
-  // - compatSendEnabled：开关真值（缺键 = 新默认开，显式 false 保留）；
-  // - compatSendEligible：前置判据（该 build 读链已取证 = 可从关切到开；
-  //   false → 未取证提示照常显示，资格不从偏好默认继承）。
-  const compatSendEnabled = status?.compatSendEnabled ?? true;
-  const compatSendEligible = status?.compatSendEligible ?? false;
+  // H3 / #172-T8 的无头与兼容发送开关真值、资格提示已随 markup 移入
+  // HeadlessSettingsSection（纯派生值，仍以 remote_status 为唯一数据源）。
 
   // 花名册与状态 3s 轮询恒开（与移动端看板同节奏）。花名册是 DB 语义（已配对设备
   // 的吊销/重命名管理入口），不随远程关闭清空——Mac 报告七-6「关闭期间 0/10 而 DB
@@ -830,7 +830,10 @@ export function RemoteSection() {
         </div>
         <div className="p-3">
           {/* ① 通用 */}
-          <div className="text-muted-foreground mt-2 text-[12.5px] font-semibold">
+          <div
+            data-group="general"
+            className="text-muted-foreground mt-2 text-[12.5px] font-semibold"
+          >
             {t("settings.remote.groupGeneral")}
           </div>
           <div className="flex items-center justify-between gap-4 py-3">
@@ -887,107 +890,11 @@ export function RemoteSection() {
             />
           </div>
 
-          {/* ③b 无头注入（H3）：**单一总开关**，缺键默认开、显式关闭保留；
-              H4 的 watchdog 超时 / 并发上限两件同住本分组。开关关闭时兼容发送入口
-              一律 403/置灰。加载中（!status）禁用，不把缺键显示成用户关闭。 */}
-          <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
-            {t("settings.remote.groupHeadless")}
-          </div>
-          <div className="flex items-center justify-between gap-4 py-3">
-            <div className="flex-1">
-              <label className="text-sm font-semibold">{t("settings.remote.headlessTitle")}</label>
-              <p className="text-muted-foreground mt-0.5 text-xs">
-                {t("settings.remote.headlessHint")}
-              </p>
-            </div>
-            <Switch
-              aria-label={t("settings.remote.headlessTitle")}
-              checked={headlessEnabled}
-              disabled={busy || !status}
-              onCheckedChange={(v) => void applyHeadless(v)}
-            />
-          </div>
-          <div
-            data-headless-limits
-            className="flex flex-wrap items-start gap-4 border-t border-dashed py-3"
-          >
-            <div className="min-w-[190px] flex-1">
-              <label htmlFor="headless-timeout" className="text-sm font-semibold">
-                {t("settings.remote.headlessTimeoutLabel")}
-              </label>
-              <Input
-                id="headless-timeout"
-                type="number"
-                min={1000}
-                max={3600000}
-                step={1000}
-                value={headlessTimeout}
-                onChange={(e) => setHeadlessTimeout(e.target.value)}
-                className="mt-1"
-              />
-              <p className="text-muted-foreground mt-0.5 text-xs">
-                {t("settings.remote.headlessTimeoutHint")}
-              </p>
-            </div>
-            <div className="min-w-[160px] flex-1">
-              <label htmlFor="headless-concurrency" className="text-sm font-semibold">
-                {t("settings.remote.headlessConcurrencyLabel")}
-              </label>
-              <Input
-                id="headless-concurrency"
-                type="number"
-                min={1}
-                max={8}
-                step={1}
-                value={headlessConcurrency}
-                onChange={(e) => setHeadlessConcurrency(e.target.value)}
-                className="mt-1"
-              />
-              <p className="text-muted-foreground mt-0.5 text-xs">
-                {t("settings.remote.headlessConcurrencyHint")}
-              </p>
-            </div>
-            <Button
-              className="mt-6"
-              aria-label={t("settings.remote.headlessLimitsSave")}
-              disabled={busy || !status}
-              onClick={() => void saveHeadlessLimits()}
-            >
-              {t("settings.remote.save")}
-            </Button>
-          </div>
-
-          {/* #172/T8 兼容发送（实验）：缺键默认开、显式关闭保留；**从关切到开
-              仍要求读探测通过**——未取证时提示先做只读探测（后端开启时同样拒：
-              同一判据）。资格字段独立，不随偏好默认值变化。已验证的 Codex
-              桌面版本不受此开关影响（它的发送行为逐字不变）。 */}
-          <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
-            {t("settings.remote.groupCompatSend")}
-          </div>
-          <div className="flex items-center justify-between gap-4 py-3">
-            <div className="flex-1">
-              <label className="text-sm font-semibold">
-                {t("settings.remote.compatSendTitle")}
-              </label>
-              <p className="text-muted-foreground mt-0.5 text-xs">
-                {t("settings.remote.compatSendHint")}
-              </p>
-              {!compatSendEligible && (
-                <p className="text-muted-foreground mt-0.5 text-xs">
-                  {t("settings.remote.compatSendNeedsProbe")}
-                </p>
-              )}
-            </div>
-            <Switch
-              aria-label={t("settings.remote.compatSendTitle")}
-              checked={compatSendEnabled}
-              disabled={busy || !status || (!compatSendEnabled && !compatSendEligible)}
-              onCheckedChange={(v) => void applyCompatSend(v)}
-            />
-          </div>
-
           {/* ② 通道（开关各自独立，可同时开启；点卡片在下方展开详情） */}
-          <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
+          <div
+            data-group="channels"
+            className="text-muted-foreground mt-4 text-[12.5px] font-semibold"
+          >
             {t("settings.remote.groupChannels")}
           </div>
           <div className="mt-2 grid grid-cols-4 gap-2">
@@ -1359,7 +1266,10 @@ export function RemoteSection() {
           </div>
 
           {/* ③ 访问与安全 */}
-          <div className="text-muted-foreground mt-4 text-[12.5px] font-semibold">
+          <div
+            data-group="security"
+            className="text-muted-foreground mt-4 text-[12.5px] font-semibold"
+          >
             {t("settings.remote.groupSecurity")}
           </div>
           <div className="flex items-center justify-between gap-4 py-3">
@@ -1395,7 +1305,7 @@ export function RemoteSection() {
               </Button>
             </div>
           </div>
-          <div className="py-3">
+          <div data-group="devices" data-device-list className="py-3">
             <div className="flex items-center gap-2">
               <span className="text-sm font-semibold">{t("settings.remote.devicesTitle")}</span>
               {/* 上限徽标：上限来自 remote_status.maxDevices（KV 可改，默认 10），不再硬编码 */}
@@ -1468,6 +1378,28 @@ export function RemoteSection() {
           <p className="mt-1 rounded-lg bg-amber-50 px-2.5 py-1.5 text-xs text-amber-600 dark:bg-amber-500/10 dark:text-amber-400">
             {t("settings.remote.notice")}
           </p>
+
+          {/* ④ 工具特殊配置装配点（设计 §4.1）：A2 只交付**标题**，ZCode 折叠卡由 A5
+              填入——不渲染空工具卡，也不预建多工具框架。分组锚供顺序锁定位。 */}
+          <div
+            data-group="tools"
+            className="text-muted-foreground mt-4 text-[12.5px] font-semibold"
+          >
+            {t("settings.remote.groupTools")}
+          </div>
+
+          {/* ⑤ 无头注入 / ⑥ 兼容发送（抽取子组件；状态 owner 与 3s 轮询仍在本文件） */}
+          <HeadlessSettingsSection
+            status={status}
+            busy={busy}
+            timeout={headlessTimeout}
+            concurrency={headlessConcurrency}
+            onTimeoutChange={setHeadlessTimeout}
+            onConcurrencyChange={setHeadlessConcurrency}
+            onToggleHeadless={(v) => void applyHeadless(v)}
+            onToggleCompatSend={(v) => void applyCompatSend(v)}
+            onSaveLimits={() => void saveHeadlessLimits()}
+          />
         </div>
       </div>
 

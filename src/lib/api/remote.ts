@@ -128,7 +128,8 @@ export async function remoteToggle(enabled: boolean): Promise<void> {
 export async function toggleChannel(channel: string, on: boolean): Promise<void> {
   return await invoke("remote_toggle_channel", { channel, on });
 }
-/** H3 无头注入总开关（默认关）：后端写 KV + 审计 + 广播 remote-changed。 */
+/** H3 无头注入总开关（缺键 = 开；显式 false 才是用户关闭）：后端写 KV + 审计 +
+ *  广播 remote-changed。A1 起默认开，缺键不再等同「用户关闭」。 */
 export async function toggleHeadless(enabled: boolean): Promise<void> {
   return await invoke("remote_toggle_headless", { enabled });
 }
@@ -137,9 +138,9 @@ export async function setHeadlessLimits(timeoutMs: number, concurrency: number):
   return await invoke("remote_set_headless_limits", { timeoutMs, concurrency });
 }
 /**
- * #172/T8 兼容发送（实验）总开关（默认关）：后端写 KV + 审计 + 广播 remote-changed。
- * 开启有前置：后端要求「该 build 的读链已取证」（只读探测通过），否则 Err
- * （前端同口径置灰 + 提示）。
+ * #172/T8 兼容发送（实验）总开关（缺键 = 开；显式 false 才是用户关闭）：后端写 KV +
+ * 审计 + 广播 remote-changed。偏好默认开不等于资格满足——开启（关→开方向）仍有前置：
+ * 后端要求「该 build 的读链已取证」（只读探测通过），否则 Err（前端同口径置灰 + 提示）。
  */
 export async function toggleCompatSend(enabled: boolean): Promise<void> {
   return await invoke("remote_toggle_compat_send", { enabled });

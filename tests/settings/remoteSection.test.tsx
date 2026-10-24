@@ -1941,8 +1941,11 @@ describe("RemoteSection 投递偏好默认值（A1 §7.1）", () => {
     expect(headless).toBeChecked();
     const compat = switchOf(/compatibility send/i);
     expect(compat).toBeChecked();
-    // 资格仍独立：缺 compatSendEligible → 未取证提示照常显示（不因偏好开而隐藏）
-    expect(screen.getByText(/read-only probe must complete first/i)).toBeTruthy();
+    // A2 修正（A1 遗留文案）：开关已按新默认开着时**不再**宣称「需先完成只读探测」——
+    // 探测只是「从关切到开」方向的前置，不是已开启状态的既存缺陷。资格并不因此消失：
+    // 下面一条用例（显式关闭 + 未取证）继续锁「不满足资格时无法从关切回开」。
+    expect(screen.queryByText(/read-only probe must complete first/i)).toBeNull();
+    expect(compat).toBeEnabled();
   });
 
   it("资格字段独立决定可开启性：未取证 + 显式关闭 → 不可开启；取证后 → 可开启", async () => {
@@ -1978,6 +1981,47 @@ describe("RemoteSection 投递偏好默认值（A1 §7.1）", () => {
   });
 });
 
+// A2（2026-10-24 设计 §4.1 六段顺序）：通用 → 四通道 → 访问与安全/设备列表 →
+// 工具特殊配置 → 无头注入/兼容发送 → 注入审计。前三段留在 RemoteSection；工具配置
+// 是**只有标题的装配点**（A5 填 ZCode 卡，A2 不交付空工具卡）；无头区抽成独立子组件，
+// 但状态 owner 与 3s 轮询仍留在 RemoteSection。审计由 SettingsPage 在其后装配，
+// 顺序锁放在 settingsBlocks.test.ts（本文件只渲染 RemoteSection）。
+describe("RemoteSection 六段顺序（A2 remote_sections_follow_user_order）", () => {
+  // 分组锚：data-group 是顺序判定的稳定钩子（文案随 i18n 变，锚不变）
+  const group = (key: string) =>
+    document.querySelector(`[data-group="${key}"]`) as HTMLElement | null;
+  const ORDER = ["general", "channels", "security", "devices", "tools", "headless", "compat"];
+
+  it("remote_sections_follow_user_order：通用→四通道→安全/设备→工具配置→无头→兼容发送，四通道与设备列表各一份", async () => {
+    render(<RemoteSection />);
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: /enable remote access/i })).toBeEnabled()
+    );
+    // 每个分组锚恰一份（漏渲染 ⇒ 该段在界面上消失；重复渲染 ⇒ 顺序断言会被绕开）
+    for (const key of ORDER) {
+      const hits = document.querySelectorAll(`[data-group="${key}"]`);
+      expect(hits, `分组锚 ${key} 的渲染份数`).toHaveLength(1);
+    }
+    // 文档顺序 = 可访问顺序：后一个锚必须出现在前一个锚之后
+    for (let i = 1; i < ORDER.length; i++) {
+      const prev = group(ORDER[i - 1])!;
+      const next = group(ORDER[i])!;
+      expect(
+        (prev.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+        `顺序错误：${ORDER[i - 1]} 必须排在 ${ORDER[i]} 之前`
+      ).toBe(true);
+    }
+    // 四通道卡与设备列表各恰好一份（抽取/重排不得复制或丢段）
+    for (const key of ["lan", "quick", "named", "tailscale"]) {
+      expect(
+        document.querySelectorAll(`[data-card="${key}"]`),
+        `通道卡 ${key} 的份数`
+      ).toHaveLength(1);
+    }
+    expect(document.querySelectorAll("[data-device-list]"), "设备列表的份数").toHaveLength(1);
+  });
+});
+
 // i18n 契约：RemoteSection / useRemoteEvents 源码里引用的每个 settings.remote.* 键，
 // 必须在 zh 与 en 两个 locale 同齐备（缺键即键路径泄漏到 UI）；两 locale 键集必须相等。
 describe("RemoteSection i18n zh/en 无缺键（M5 A6）", () => {
@@ -2002,6 +2046,9 @@ describe("RemoteSection i18n zh/en 无缺键（M5 A6）", () => {
     // 源码扫描：两个消费方引用的键必须双 locale 存在
     const sources = [
       path.join(root, "src/components/settings/RemoteSection.tsx"),
+      // A2：⑤⑥ 段抽出后，无头/兼容发送的键改由子组件引用——扫描面必须跟上，
+      // 否则抽出的子组件成了 i18n 守卫的盲区
+      path.join(root, "src/components/settings/HeadlessSettingsSection.tsx"),
       path.join(root, "src/hooks/useRemoteEvents.ts"),
     ];
     const used = new Set<string>();
