@@ -23,7 +23,9 @@
 // - ZCode 会在回合中途以 user 角色注入合成消息（通知/提醒/上下文）——按合成标记
 //   （synthetic / semantics.uiVisibility）识别并跳过，kind 枚举作纵深兜底（Z-P2，
 //   2026-09-15）：标记缺失的已知记账 kind 仍跳过，语义标记优先于枚举；
-// - 会话 id：`sess_` + 标准 UUID（8-4-4-4-12）；子代理 id `sess_subagent_agent_<uuid>`；
+// - 会话 id：主会话观察到的两型并存——`sess_` + 标准 UUID（8-4-4-4-12）与
+//   `session_` + 32 ASCII hex（新版构建形态，设计 §6 读取修复契约）；
+//   子代理 id `sess_subagent_agent_<uuid>`；
 // - 路径：macOS 正斜杠；Windows 反斜杠 + 大写盘符——展示/比对前归一化，原生形态保留。
 //
 // 防御性要求：任一数据库缺失/表缺失/字段类型不符/JSON 损坏 → 跳过该会话或整体降级
@@ -89,14 +91,27 @@ impl ZcodeRoots {
     }
 }
 
-/// 会话 id 合规判定：`sess_` 前缀 + 严格 UUID（8-4-4-4-12 hex）。
-/// 子代理 id（sess_subagent_agent_<uuid>）不满足该形态，天然被拒（双保险：
-/// task_type 过滤在前）；不合规 id 一律跳过该会话（脏数据防御）
+/// 会话 id 合规判定：主会话观察到的两型并存（新版 ZCode 构建改发新形态，
+/// 旧库仍是旧形态，同库可混排——两型都得收，否则新版会话整排放不出卡）：
+/// ① `sess_` + 严格 UUID（8-4-4-4-12 hex）；② `session_` + 32 ASCII hex
+///（无连字符）。hex 大小写均收（沿用 is_strict_uuid_form 的字节级 ASCII hex
+/// 口径）；前缀区分大小写，只放宽到上述两型——错配（sess_+32hex、session_+UUID）
+/// 不收。子代理 id（sess_subagent_agent_<uuid>）不满足任一形态，天然被拒
+///（双保险：task_type 过滤在前）；不合规 id 一律跳过该会话（脏数据防御）。
+/// **原 ID 即身份**：判定只做形态校验，不重命名、不归一化、不删横杠、不合并键
 pub fn is_valid_session_id(id: &str) -> bool {
-    let Some(uuid_part) = id.strip_prefix("sess_") else {
-        return false;
-    };
-    super::workbuddy_parser::is_strict_uuid_form(uuid_part)
+    if let Some(uuid_part) = id.strip_prefix("sess_") {
+        return super::workbuddy_parser::is_strict_uuid_form(uuid_part);
+    }
+    if let Some(hex_part) = id.strip_prefix("session_") {
+        return is_32_hex_form(hex_part);
+    }
+    false
+}
+
+/// `session_` 后段形态：恰好 32 个 ASCII hex（大小写不敏感；纯字节实现）
+fn is_32_hex_form(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 // ===== 宿主判定（进程侧只回答「ZCode 开没开」） =====
