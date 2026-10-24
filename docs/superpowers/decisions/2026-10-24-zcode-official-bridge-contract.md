@@ -67,7 +67,7 @@
 | --- | --- | --- | --- |
 | E1 | 旧 v1 设计「协议未支持审批／问答」的结论**已被同提交实现反证**，不得再引用 v1 措辞当作当前事实 | `docs/superpowers/plans/2026-10-23-zcode-probe/2026-10-24-p0-review.md` §2.2（撤销定论及修正表） | SOURCE（固定 SHA 行号，见 E2） |
 | E2 | 固定 SHA 上的审批／问答／stop 实现入口（桥接模块边界依据） | 同 §2.2 表：`apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-operations.ts:3513`（注入 `createProtocolInteractionBroker`）、`interaction-broker.ts:105`（requestPermission 反向请求，含 requestId/sessionId/turnId/toolCallId）、`interaction-broker.ts:306`（interactionRequestUserInput）、`zcode-protocol-v4/interaction-registry.ts:1`（broker 与 v4 resolveInteraction 汇合）、`zcode-protocol-v4/commands/handlers/interaction-background.ts:45`（answer 消费；存在 full-access 特权分支，禁止探测误触）、`zcode-protocol/server.ts:677` 与 `server-operations.ts:2702`（session/stop 路由、`requireSession` 后中止 `record.activeAbortController`） | SOURCE |
-| E3 | 上述方法在**本机安装版随包 CLI** 中存在（PACKAGE，不升级运行 PASS） | P0 复核 §2.2 末段静态计数：interaction/requestPermission×1、interaction/requestUserInput×1、resolveInteraction×5、session/stop×4；本轮确认 zcode.cjs 哈希（§1.2）使该计数对应当前文件 | PACKAGE |
+| E3 | 上述方法在**本机安装版随包 CLI** 中存在（PACKAGE，不升级运行 PASS） | P0 复核 §2.2 末段静态计数：interaction/requestPermission×1、interaction/requestUserInput×1、resolveInteraction×5、session/stop×4；本轮确认 zcode.cjs 哈希（§1.2）使该计数对应当前文件。注意：哈希↔静态计数的对应关系目前依托 P0 以来该文件的 (mtime,size) 同一性支撑（15,243,891 B / 2026-10-19 20:37），下次指纹复核须以内容哈希重算再确认 | PACKAGE |
 | E4 | Mac P0-R 已追出「APP host 独占本地 stdio；官方 Web 远控经账号→SID→短期 token→relay→RPC bridge 到 APP」的链路与 broker/server-operations 入口 | `mac-agent-supplement-prompt.md`（R-01 定义）、`mac-agent-prompt.md`（P0-05 定义）；回报本体在私有目录 `~/Documents/tuvis-verify-logs/zcode/macos-P0R20261024T002051+0800-5n1lm/`（留机不入库）；仓库内摘要见 `2026-10-24-capability-status.md` §3「已有 APP 回合审批／问答／打断」行与 §4.5 | RELAY（私有原件）＋SOURCE |
 | E5 | 官方远控（网页面）的发送／审批／打断／切模型／链接复用有用户约两个月长期实测；本包**不重复证明**，对象是 Tuvis 独立客户端身份／连接／逐动作映射 | `2026-10-24-capability-status.md` §7；设计 v3 §1「官方页面这些功能已有用户约两个月的真实使用证据」 | 用户直接陈述（登记于 capability-status） |
 | E6 | 读取断点根因（新旧 ID 双形态）与修复归属 A 包、不属桥接证据 | P0 复核 §2.1；设计 v3 §6 | OBSERVED（两平台） |
@@ -128,6 +128,20 @@
   「哪些动作已授权」清单为空。B0 其余子项（指纹、SHA 钉固、许可证／模块清单、证据索引）不依赖测试目标，已全部完成。
 - 该等待**不阻塞**后续源码／fake 测试面（B1 红测、fake relay 探针可先行），但 B1 的实连步骤与
   B2—B4 的真实写实验在用户动作完成前一律不执行。
+
+### 4.1 测试目标登记（2026-10-24 追加，B1 实连半场；别名制，真实 ID/路径只存私有映射）
+
+| 项 | 登记值（别名） | 说明 |
+| --- | --- | --- |
+| 测试 workspace 别名 | `Travel` | 用户指定的专用测试工作区；真实路径/ID 不入本文档，只存私有映射 |
+| 测试 session 别名 | `hi` | 该 workspace 内的专用测试会话；真实 session ID 同上 |
+| 已授权批次（batch 1） | 在会话 `hi` 中**发送消息** | 唯一获批的真实写动作 |
+| 未授权批次 | 审批 / 问答（自由作答与选项） / 打断（session/stop） / 模型切换 | 逐批授权制：未列即禁止，探针与后续批次不得触碰 |
+
+- 本登记只解除「测试目标未指定」的等待项（§4 第 2 条）；B1 实连仍受 §6.7 其余停等项
+  （有效链接、凭据通路探测授权、同 role 互踢知情确认）约束。
+- 别名 → 真实值的映射由用户保存在私有目录（不入仓库/日志/夹具）；后续批次引用一律用别名。
+
 
 ## 5. 纪律声明（B 包约束登记）
 

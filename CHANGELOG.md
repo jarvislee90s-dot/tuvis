@@ -63,6 +63,9 @@
 
 - A 包门禁收尾：`tests/zcode_config_remote.rs` 一处闭包改为函数引用（新版 clippy 的
   `redundant_closure` 告警；仅测试代码，零行为变化）。
+- B 包取证产物入库：ZCode 官方桥接决策文档（`docs/superpowers/decisions/2026-10-24-zcode-official-bridge-contract.md`，
+  含固定 SHA 源码的认证链行号证据）、fake relay 的 Vitest 套件（`tests/remote/zcodeBridgeRelay.test.ts`）
+  与 `scripts/zcode-bridge-probe` 探针骨架；全部为取证/测试资产，零产品行为变化。
 
 ## [0.6.2] - 未发布
 
