@@ -3,6 +3,9 @@ import i18n from "@/i18n";
 import type { SessionsResponse, TransitionEvent } from "@/types/session";
 // Codex Desktop IPC：SendResult 的 desktop_ipc 分支引用 ActionReceipt（type-only，无运行时环）
 import type { ActionReceipt } from "./codexIpcApi";
+// A5：ZCode 官方远控链接的 wire DTO 与桌面端**同一个形状**（type-only import：
+// 移动端零 Tauri 运行时依赖，构建期即擦除；不得在 mobile 侧重定义另一份 DTO）
+import type { ZcodeRemoteConfig } from "@/lib/api/zcodeRemote";
 
 /** 带 HTTP 状态的请求失败（status=null 表示网络层异常，无响应可读）。
  *  详情页/预览按 status 分流错误文案（404 → 会话不可读，403 → 文件不可预览）；
@@ -507,6 +510,85 @@ export async function fetchSendInfo(sessionId: string): Promise<SendInfo | null>
   if (r.status === 403) return null; // 设备失效 → 回配对页
   if (!r.ok) throw new ApiError(r.status, `session-send-info ${r.status}`);
   return (await r.json()) as SendInfo;
+}
+
+/**
+ * ZCode 官方远控配置的手机侧读面（A5，设计 §4.2/§4.3/§5.1）。
+ *
+ * **三个面分开持有，绝不合并成一个「可用」布尔**：
+ * - `readState`：本机配置**读到了没有**（checking / ok / failed）——读失败**不等于**
+ *   未配置或删除（§4.3 最后一行：外跳只看到 Not Found 时 Tuvis 也无权据此判定）；
+ * - `configState`：A4 的 wire 值（missing / saved / invalid）。`saved` 只表示**格式已
+ *   校验并落库**，永不表示已联机；
+ * - `connectionState`：官方连接态。**首版没有 ZCode 控制适配器 ⇒ 唯一可能值是
+ *   needs_connection**；B 包（官方身份/relay 就绪）落地后才扩枚举，本文件不预先伪造
+ *   其他值，也不由 configState 推导（两面证据源不同）。
+ *
+ * 手机侧**没有写接口**（首版桌面编辑，设计 §4.2）：这里只有 GET。
+ */
+export type ZcodeConnectionState = "needs_connection";
+
+export type ZcodeControlAvailability = {
+  readState: "checking" | "ok" | "failed";
+  /** readState=ok 时的本机配置态；其余为 null（不猜） */
+  configState: ZcodeRemoteConfig["configState"] | null;
+  connectionState: ZcodeConnectionState;
+  /** 官方远控链接（仅 saved 才有；invalid/missing/读失败恒 null——坏值不下发） */
+  url: string | null;
+};
+
+const zcodeAvailability = (
+  readState: ZcodeControlAvailability["readState"],
+  configState: ZcodeControlAvailability["configState"],
+  url: string | null
+): ZcodeControlAvailability => ({
+  readState,
+  configState,
+  connectionState: "needs_connection",
+  url,
+});
+
+/** 挂载首拍（请求在途）的保守值：不可控，但说「正在确认」而不是「未配置」 */
+export const zcodeControlChecking = (): ZcodeControlAvailability =>
+  zcodeAvailability("checking", null, null);
+
+/**
+ * 只读拉取本机 ZCode 官方远控配置（GET /m/api/v1/official-control?agent_type=zcode，
+ * 配对门 + Cache-Control: no-store 在服务端）。任何失败（网络 / 非 2xx / 设备失效）
+ * → readState=failed：发送区给「暂时读不到」的就地原因，**正文与文件预览不受影响**
+ * （与 fetchChannel 的静默降级同一惯例，但这里必须说得出原因，不能装成未配置）。
+ */
+export async function fetchZcodeControl(): Promise<ZcodeControlAvailability> {
+  try {
+    const r = await fetch("/m/api/v1/official-control?agent_type=zcode");
+    if (!r.ok) return zcodeAvailability("failed", null, null);
+    const cfg = (await r.json()) as ZcodeRemoteConfig;
+    if (!cfg || typeof cfg.configState !== "string") {
+      return zcodeAvailability("failed", null, null);
+    }
+    return zcodeAvailability("ok", cfg.configState, cfg.url ?? null);
+  } catch {
+    return zcodeAvailability("failed", null, null);
+  }
+}
+
+/**
+ * 发送区的就地原因键（设计 §4.3「手机控制区」列逐档对齐）；非 ZCode 会话返回 null
+ * （既有注入路径零变化）。首版对 ZCode 恒有值——没有适配器就没有「可发送」，
+ * **不伪造可写按钮**；B 包接上真连接态后由那一档返回 null。
+ */
+export function zcodeSendReasonKey(a: ZcodeControlAvailability | null): string | null {
+  if (a === null) return null;
+  if (a.readState === "checking") return "mobile.composer.zcodeChecking";
+  if (a.readState === "failed") return "mobile.composer.zcodeReadFailed";
+  switch (a.configState) {
+    case "missing":
+      return "mobile.composer.zcodeNeedsConfig";
+    case "invalid":
+      return "mobile.composer.zcodeNeedsUpdate";
+    default:
+      return "mobile.composer.zcodePending";
+  }
 }
 
 /** 发送回执（POST /session-send 响应四态，HTTP 200 恒定，语义在 body.status）：
