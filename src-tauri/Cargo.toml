@@ -116,6 +116,10 @@ wait-timeout = "0.2"
 # 契约 §3 的 export_save_bytes 以 base64 字符串收 PNG（GC 13 允许的第二项新依赖）：
 # 上游 rust-lang 维护、零传递依赖；宽松解码（data URL 前缀 / 折行）由本仓包一层
 base64 = "0.22"
+# ZCode 官方 relay terminal 连接（生产计划 T1.2）：只用客户端 connect_async；
+# TLS 固定 rustls + webpki 根（**禁止**关闭证书校验）。服务端 accept 能力只出现在
+# dev-dependency（本机 fake WS），生产依赖不引入 server feature。
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 [target.'cfg(windows)'.dependencies]
 junction = "2.1"
@@ -151,3 +155,5 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # codex_desktop_ipc 集成测试：start_paused 虚拟时间（RPC 超时用例不真等 15s）
 tokio = { version = "1", features = ["test-util"] }
+# ZCode T1.2 fake WS 服务端：仅测试侧 accept 握手（生产依赖只有 connect）
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake", "stream"] }
