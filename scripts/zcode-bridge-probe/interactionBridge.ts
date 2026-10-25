@@ -120,6 +120,17 @@ export type ObservedPending = {
   payload: Record<string, unknown>;
 };
 
+/**
+ * 宿主是否已**明确宣告** control：`activeWorks` 必须是数组。
+ * - `null` / 无 control 字段 = 初始状态尚未知（订阅 ACK 已到也可能还没快照）；
+ * - `activeWorks: []` = 已确认当前无执行；
+ * - 缺 `activeWorks` 字段 = 无法区分，按「尚未知」处理（fail-closed）。
+ */
+export function hasConfirmedControl(control: Record<string, unknown> | null): boolean {
+  if (!control) return false;
+  return Array.isArray((control as { activeWorks?: unknown }).activeWorks);
+}
+
 export type PendingBookCounters = {
   topicFramesSeen: number;
   /** 非 conversation/<本会话> 的 topic 帧（含兄弟会话）——拒收计数。 */

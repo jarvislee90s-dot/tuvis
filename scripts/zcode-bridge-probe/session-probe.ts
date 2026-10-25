@@ -78,6 +78,7 @@ import {
   buildPermissionAnswer,
   buildStopPayload,
   buildUserInputAnswer,
+  hasConfirmedControl,
   PERMISSION_FULL_ACCESS_OPTION_ID,
   planInteractionCommands,
   type InteractionCommandType,
@@ -194,6 +195,12 @@ const INTERACTION_PENDING_WAIT_MS = 30_000;
 /** interrupt 模式下等待 control.activeWorks.foregroundExecutionId 的有界窗。 */
 const INTERACTION_FOREGROUND_WAIT_MS = 30_000;
 /**
+ * interrupt 触发前等待**合法初始 control** 的有界窗（复审 3）：订阅 ACK 不等于初始
+ * 快照已到；没有 activeWorks 数组就无法区分「尚未知」与「已确认无执行」。
+ * 超窗 → 零触发、零 stop（fail-closed）。
+ */
+const INITIAL_CONTROL_WAIT_MS = 10_000;
+/**
  * ACK 之后的**终态观察窗**：必须等到宿主撤卡（answer/approval）或守卫执行从
  * control 消失（interrupt）才能报 RESOLVED/STOPPED；超窗只报 ACCEPTED:unconfirmed。
  */
@@ -204,7 +211,8 @@ const INTERACTION_TERMINAL_WAIT_MS = 10_000;
  * 若沿用 B2 的 maxSendFrames:1 与 sendRequiresExplicitFlag，证据里的闸与实际行为不符。
  * 交互模式额外允许最多 1 个 autoResolution snooze 前置帧（I4；仅当卡上
  * autoResolution 在场，见 interaction.snooze 证据），总命令帧 ≤3。
- * 时长预算：B2 链 180s + 触发 ACK 20s + 观察窗 30s + 应答 ACK 20s + 终态窗 10s = 260s。
+ * 时长预算：B2 链 180s + 初始 control 10s + 触发 ACK 20s + 观察窗 30s + 应答 ACK 20s +
+ * 终态窗 10s = 270s。
  */
 export type ProbeGuardSet = {
   readonly singleConnection: true;
@@ -246,6 +254,7 @@ export function deriveProbeGuards(mode: InteractionMode | null): ProbeGuardSet {
     maxSnoozeFrames: 1,
     maxDurationMs:
       PROBE_GUARDS.maxDurationMs +
+      INITIAL_CONTROL_WAIT_MS +
       SEND_ACK_TIMEOUT_MS +
       INTERACTION_PENDING_WAIT_MS +
       SEND_ACK_TIMEOUT_MS +
@@ -2545,6 +2554,34 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           }
         };
 
+        const isInterrupt = interactionMode === "interrupt";
+        // 复审 3：订阅 ACK ≠ 初始 control 已到。interrupt 必须等宿主明确宣告
+        // activeWorks（空数组 = 已确认无执行；缺字段/null = 尚未知），再取执行基线。
+        const initialControl = isInterrupt
+          ? await waitUntil(
+              () => (hasConfirmedControl(book.control) ? book.control : null),
+              INITIAL_CONTROL_WAIT_MS
+            )
+          : book.control;
+        const initialControlReady = !isInterrupt || initialControl !== null;
+        interaction.initialControl = {
+          required: isInterrupt,
+          observed: isInterrupt ? initialControl !== null : null,
+          waitMs: isInterrupt ? INITIAL_CONTROL_WAIT_MS : 0,
+          controlRevision: book.controlRevision,
+          activeWorksCount:
+            initialControl &&
+            Array.isArray((initialControl as { activeWorks?: unknown }).activeWorks)
+              ? (initialControl as { activeWorks: unknown[] }).activeWorks.length
+              : null,
+        };
+        record(ctx, "interaction", "initial-control", interaction.initialControl);
+        log(
+          `interaction initial-control = ${
+            isInterrupt ? (initialControl !== null ? "confirmed" : "missing") : "not-required"
+          }（required=${String(isInterrupt)}，controlRevision=${book.controlRevision}）。`
+        );
+
         // 1) 合成触发器（复用 B2 已验证发送链；恰一帧，未知不重发）
         const trigger = new SendOnceLoop({
           sender: conn,
@@ -2569,30 +2606,34 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         const triggerSentAt = Date.now();
         const controlRevisionBaseline = book.controlRevision;
         // 复核 C1：触发前已存在的执行 id 全部排除——新 control 帧仍报告旧 E 也不得停 E。
-        const baselineExecutionIds = book.foregroundExecutionIds();
+        // 未确认初始 control 时不取基线（也不会触发/stop）。
+        const baselineExecutionIds = initialControlReady
+          ? book.foregroundExecutionIds()
+          : new Set<string>();
         // --existing-pending：用户**显式指定**应答会话中已存在的卡——不做「触发后」关联，
         // 且不触发新指令（仅 approve/reject/answer 适用；interrupt 仍需本 run 的前台执行）。
         const isFreshPending = (item: ObservedPending): boolean =>
           parsed.existingPending || item.createdAt === null || item.createdAt >= triggerSentAt;
-        const isInterrupt = interactionMode === "interrupt";
         let triggerOutcomeKind: string | null = null;
-        const pendingObservation: Promise<ObservedPending | null> = isInterrupt
-          ? Promise.resolve(null)
-          : interactionMode === "approve" || interactionMode === "reject"
-            ? waitUntil(
-                () =>
-                  book.list().find((item) => item.kind === "permission" && isFreshPending(item)) ??
-                  null,
-                INTERACTION_PENDING_WAIT_MS
-              )
-            : waitUntil(
-                () =>
-                  book.list().find((item) => item.kind === "userInput" && isFreshPending(item)) ??
-                  null,
-                INTERACTION_PENDING_WAIT_MS
-              );
+        const pendingObservation: Promise<ObservedPending | null> =
+          !initialControlReady || isInterrupt
+            ? Promise.resolve(null)
+            : interactionMode === "approve" || interactionMode === "reject"
+              ? waitUntil(
+                  () =>
+                    book
+                      .list()
+                      .find((item) => item.kind === "permission" && isFreshPending(item)) ?? null,
+                  INTERACTION_PENDING_WAIT_MS
+                )
+              : waitUntil(
+                  () =>
+                    book.list().find((item) => item.kind === "userInput" && isFreshPending(item)) ??
+                    null,
+                  INTERACTION_PENDING_WAIT_MS
+                );
         const stopObservation: Promise<{ kind: string; foregroundExecutionId: string } | null> =
-          isInterrupt
+          isInterrupt && initialControlReady
             ? waitUntil(
                 () =>
                   book.observeStopTarget({
@@ -2612,10 +2653,22 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
             skipped: "existing-pending-designated",
             triggerSentAt,
             controlRevisionBaseline,
+            baselineExecutionCount: baselineExecutionIds.size,
             note: "用户显式指定会话中已存在的 pending；不触发新指令（无触发帧）",
           };
           record(ctx, "interaction", "existing-pending-designated", interaction.trigger);
           log("--existing-pending：跳过触发，直接应答会话中已存在的卡。");
+        } else if (!initialControlReady) {
+          triggerOutcomeKind = "no-initial-control";
+          interaction.trigger = {
+            skipped: "no-initial-control",
+            triggerSentAt,
+            controlRevisionBaseline,
+            baselineExecutionCount: baselineExecutionIds.size,
+            note: "initial control was not confirmed before trigger; zero trigger/stop",
+          };
+          record(ctx, "interaction", "trigger-skipped", interaction.trigger);
+          log("interaction trigger 跳过：初始 control 未确认（零触发、零 stop）。");
         } else {
           currentLoop = trigger;
           const triggerOutcome = await trigger.run();
@@ -2645,7 +2698,8 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           triggerOutcomeKind === "completed" || triggerOutcomeKind === "accepted";
         // 触发未被受理（unknown/send-failed）或 --existing-pending（无触发）→ 不等 stop 窗，
         // 更不得拿场上任何执行 id 去做 stop。
-        const observedStopTarget = isInterrupt && triggerAccepted ? await stopObservation : null;
+        const observedStopTarget =
+          isInterrupt && initialControlReady && triggerAccepted ? await stopObservation : null;
         // 诊断（B3 实跑 024023Z 教训）：请求 kind 未命中时，把场上**实际存在的卡**
         // 的形状（kind/别名 id/payload 键名）如实落证——不猜、不消费、不发送。
         if (observedPending === null && !isInterrupt) {
@@ -2750,7 +2804,9 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           });
         };
 
-        if (interactionMode === "approve" || interactionMode === "reject") {
+        if (!initialControlReady) {
+          unavailable = "UNAVAILABLE:no-initial-control";
+        } else if (interactionMode === "approve" || interactionMode === "reject") {
           if (!observedPending) {
             unavailable = "UNAVAILABLE:no-pending-observed";
           } else {

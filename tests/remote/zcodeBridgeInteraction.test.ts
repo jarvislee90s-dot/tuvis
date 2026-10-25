@@ -94,6 +94,7 @@ import {
   buildStopPayload,
   buildUserInputAnswer,
   decodeTopicFrameSubject,
+  hasConfirmedControl,
   planInteractionCommands,
   type ObservedPending,
 } from "../../scripts/zcode-bridge-probe/interactionBridge";
@@ -1447,6 +1448,56 @@ describe("B3 修复轮：C2 判别式 / I3 选项闸 / I2 消费复活 / I4 snoo
     expect(book.observeStopTarget({ afterRevision: revisionBeforeTrigger })).toBeNull();
   });
 
+  it("initial_control_must_be_confirmed_before_baseline：ACK 先到/首快照延迟时不得把旧 E 当新执行", () => {
+    const book = new PendingBook({ sessionId: FAKE_TARGET.taskId, generation: 1 });
+    const control = (id: string) => ({
+      activeWorks: [{ kind: "primaryTurn", foregroundExecutionId: id, startedAt: 0 }],
+    });
+
+    // 订阅 ACK 已到、初始 control 尚未到 → 不能取执行基线。
+    expect(hasConfirmedControl(book.control)).toBe(false);
+    // 只有 pending 的空快照仍不代表 control 已知。
+    book.acceptTopicFrame(topicFrame({ sessionId: FAKE_TARGET.taskId, pendingInteractions: [] }));
+    expect(hasConfirmedControl(book.control)).toBe(false);
+    // control 对象缺 activeWorks，同样按「尚未知」处理。
+    book.acceptTopicFrame(
+      deltasTopicFrame({ sessionId: FAKE_TARGET.taskId, patch: { control: {} } })
+    );
+    expect(hasConfirmedControl(book.control)).toBe(false);
+
+    // 延迟到达的首个 control 快照含早已运行的 E → 基线必须包含 E。
+    book.acceptTopicFrame(
+      topicFrame({ sessionId: FAKE_TARGET.taskId, control: control("b3-fake-exec-old") })
+    );
+    expect(hasConfirmedControl(book.control)).toBe(true);
+    const baseline = book.foregroundExecutionIds();
+    expect([...baseline]).toEqual(["b3-fake-exec-old"]);
+
+    // 后续 control 仍报告 E → 不得当成新执行。
+    book.acceptTopicFrame(
+      deltasTopicFrame({
+        sessionId: FAKE_TARGET.taskId,
+        patch: { control: control("b3-fake-exec-old") },
+      })
+    );
+    expect(
+      book.observeStopTarget({
+        afterRevision: book.controlRevision - 1,
+        excludeExecutionIds: baseline,
+      })
+    ).toBeNull();
+
+    // activeWorks: [] = 已确认无执行（与「尚未知」可区分）。
+    book.acceptTopicFrame(
+      deltasTopicFrame({
+        sessionId: FAKE_TARGET.taskId,
+        patch: { control: { activeWorks: [] } },
+      })
+    );
+    expect(hasConfirmedControl(book.control)).toBe(true);
+    expect(book.foregroundExecutionIds().size).toBe(0);
+  });
+
   it("stop_target_excludes_pre_trigger_execution：新 control 仍报告旧 id 时不得停旧执行", () => {
     const book = new PendingBook({ sessionId: FAKE_TARGET.taskId, generation: 1 });
     const control = (id: string) => ({
@@ -1534,7 +1585,7 @@ describe("B3 修复轮：C2 判别式 / I3 选项闸 / I2 消费复活 / I4 snoo
       expect(guards.sendRequiresExplicitFlag).toBe(false);
       expect(guards.interactionRequiresExplicitFlag).toBe(true);
       expect(guards.maxSnoozeFrames).toBe(1);
-      expect(guards.maxDurationMs).toBe(260_000);
+      expect(guards.maxDurationMs).toBe(270_000);
     }
   });
 
