@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedBy": "B1（2026-10-24，source+fake 阶段；同日实连半场收官：auth.status 定案 proven，追加 live 证据）。2026-10-24 B2 准备阶段追加 operations 两条 live 已验只读操作（bootstrap-request / workspace-list-request）。2026-10-24 B2 实连收官：send 能力定案前移 true（run macos-B220261024T132316Z-prItvw 受理 accepted + 用户可见性确认，见 operations sendConversationCommandV4 行）；其余能力维持 false 待各自批次",
+  "generatedBy": "B1（2026-10-24，source+fake 阶段；同日实连半场收官：auth.status 定案 proven，追加 live 证据）。2026-10-24 B2 准备阶段追加 operations 两条 live 已验只读操作（bootstrap-request / workspace-list-request）。2026-10-24 B2 实连收官：send 能力定案前移 true（run macos-B220261024T132316Z-prItvw 受理 accepted + 用户可见性确认，见 operations sendConversationCommandV4 行）；其余能力维持 false 待各自批次。2026-10-24/25 B3 实连收官：userInput / interrupt 定案前移 true（问答 run macos-B320261025T012945Z-aMtnqA、打断 run macos-B320261025T013128Z-X8HkPg），approval 维持 false 并记原因（run macos-B320261024T230311Z-aTrTIg：会话自动批准、指定测试会话无 pending 卡）；model / thoughtLevel 留 B4",
   "evidenceRule": "本文件只收录已取证结论：source = 固定官方源码 zai-org/ZCode @ 3c5b227649371507ddc4eb46ac5133afe6db1cab 的客户端侧实现（行号引用）；fake = tests/remote/zcodeBridgeRelay.test.ts 的 in-test fake relay 锁形；live = 2026-10-24 B1 实连半场的脱敏私有证据（~/Documents/tuvis-verify-logs/zcode/<run_id>/，仓库内只引用 run id，真实值经 SecretRedactor fail-closed 闸从不入仓库/日志/夹具）。官方云 relay 服务端不在该仓库，服务端内部语义一律不得在本文件出现；未取证项不得以 TBD 或伪造 endpoint 占位。",
   "identity": {
     "platform": "macOS 27.0.1 arm64（B0 run_id macos-B20261024T142609+0800-k0zat1）",
@@ -100,11 +100,11 @@
   "capabilities": {
     "send": true,
     "approval": false,
-    "userInput": false,
-    "interrupt": false,
+    "userInput": true,
+    "interrupt": true,
     "model": false,
     "thoughtLevel": false,
-    "reason": "send：2026-10-24 B2 实连收官前移 true——run macos-B220261024T132316Z-prItvw（oauth PROVEN → paired → mapping MAPPED 119 行 → Travel/hi 指称精确唯一解析 → bridge ready → Initialize ok → sendConversationCommandV4 受理 accepted，framesSent=1、peerAck=true、干净 close、无重发）+ 用户确认 marker 以用户消息形态落在指定会话（§4.1 别名 hi）且 agent 已处理回复（user-testimony，时间戳与 transcript issuedUtc 一致）。approval/userInput/interrupt/model/thoughtLevel：从未发出任何真实写帧，维持 false——逐批授权制，B3/B4 起各自取证后才能前移。"
+    "reason": "send：2026-10-24 B2 实连收官前移 true——run macos-B220261024T132316Z-prItvw（oauth PROVEN → paired → mapping MAPPED 119 行 → Travel/hi 指称精确唯一解析 → bridge ready → Initialize ok → sendConversationCommandV4 受理 accepted，framesSent=1、peerAck=true、干净 close、无重发）+ 用户确认 marker 以用户消息形态落在指定会话（§4.1 别名 hi）且 agent 已处理回复（user-testimony，时间戳与 transcript issuedUtc 一致）。approval：维持 false——reason: \"session auto-approves; no pending card exists in the designated test session\"（2026-10-24 B3 approve run macos-B320261024T230311Z-aTrTIg：触发受理、30s 待卡窗内无 pending 卡，agent 直接创建 tuvis-b3-permission-test.txt = 自动批准会话；reject 轮按裁决跳过——同一自动批准会话即同一结论；早期 pre-fix 无效 run macos-B320261024T151206Z-JWXiGw 标 preliminary/invalid 不计入裁决）。userInput：2026-10-25 B3 实连前移 true——run macos-B320261025T012945Z-aMtnqA（触发 completed → userInput pending 观察到 → 以卡上原值 id 应答 → outcome accepted → verdict RESOLVED）。interrupt：2026-10-25 B3 实连前移 true——run macos-B320261025T013128Z-X8HkPg（触发 completed → control.activeWorks 观察到守卫 id → stop accepted → verdict STOPPED:interrupt-accepted；更早 run macos-B320261025T013037Z-TT8HoQ 在建桥 Initialize 门超时、零帧出站，窗口加宽 e34f3fe9 后复跑通过）。model/thoughtLevel：从未发出真实写帧，维持 false，留 B4 取证。"
   },
   "operations": [
     {
@@ -132,6 +132,26 @@
       "terminalEvidence": "私有脱敏证据 run macos-B220261024T132316Z-prItvw（live-sanitized）+ 用户直接陈述（user-testimony）：marker 以用户消息形态出现在指定会话（§4.1 别名 hi，workspace 别名 Travel）中，agent 正常处理并回复（turn 约 31s，回复明确识别其为测试 marker；截图由用户持有，不入仓库）；精确归属 = 单帧单 run，marker 只落在指定会话，无任何其他会话收到写向",
       "unknownRule": "受理（rpc-frame-ack）但窗口内无应答/无结果 → 结果只记 unknown，绝不重发（结构性无重发计时器）：实现于 scripts/zcode-bridge-probe/sessionBridge.ts SendOnceLoop；fake 锁形 = tests/remote/zcodeBridgeSession.test.ts unknown_not_resent 用例；本轮未触发（受理即终态 accepted）",
       "class": "source + live + user-testimony + fake"
+    },
+    {
+      "method": "resolveInteraction",
+      "kind": "write",
+      "claim": "问答（userInput / AskUserQuestion）pending 卡的应答：在与 send 同一 channel \"zcode-agent\" 的桥通道上发 v4 命令 resolveInteraction，payload {interactionId, answer}；userInput 的 answer = {action:\"accept\", content}，content = {answers:{[题干全文]: 选中 value 以 \", \" 连接}, answer_<i>（多选 = value 数组、单选 = 首个 value）, answer（仅单题时附，旧 agent 读取路径兼容）}；interactionId / 题干 / 选项 value 一律回传 pending 卡原值，绝不虚构；空答案只提交 {answers:{}}（不伪造偏好）。permission 卡同命令的 answer = {optionId, freeText?}，fullAccess 特权选项在客户端硬闸排除（探针永不触达宿主 resolveFullAccess 分支）。resolveInteraction 不在 COMMANDS_REQUIRING_BASE_REVISION → 免 baseRevision。B3 实连受理 accepted（ackStatus accepted）",
+      "source": "scripts/zcode-bridge-probe/interactionBridge.ts:477-510（buildUserInputAnswer；:441-455 为 permission answer、:457-465 fullAccess 硬闸）；packages/shared/src/zcode-protocol-v4/command.ts:221-234（commandPayloadSchemas resolveInteraction）；ElicitationDialog.tsx:273-303（content 形状）、:529（decline 同族）；interaction-broker.ts:505-517,622-650,766-780（题干回对槽位 / value 归一）；V4InteractionDialogs.tsx:358-363（permission onRespond）；snapshot.ts:234（fullAccess 选项 id）——上游行号 @ 固定 SHA 3c5b2276，与决策文件 §8.1 一致",
+      "live": "run macos-B320261025T012945Z-aMtnqA（oauth PROVEN → PAIRED → MAPPED → 触发 completed → userInput pending 观察到 → 以卡上原值应答 → outcome accepted、framesSent=1、peerAck=true → verdict RESOLVED）",
+      "terminalEvidence": "私有脱敏证据 run macos-B320261025T012945Z-aMtnqA（live-sanitized）：resolution 帧恰 1、ack accepted、duplicateInboundFrames=0",
+      "unknownRule": "受理（ack accepted）但窗口内无结果 → 只记 unknown，绝不重发（结构性无重发计时器）；rejected/stale/noop 如实分类入账，不补发",
+      "class": "source + live + fake"
+    },
+    {
+      "method": "stop",
+      "kind": "write",
+      "claim": "打断：v4 命令 stop，payload {expectedForegroundExecutionId}；守卫 id 必须来自本会话 conversation topic 的 control.activeWorks 观察（缺省 = 盲停 → 探针 fail-closed 拒绝构造，决不按猜测的 id 打断）；守卫 id 与执行中的前台不匹配 → 服务端 noop guard.stopTargetChanged（不误杀用户没看到的新执行），探针 noop 不当成功、不补发。只做有守卫的精确打断，恰 1 个 stop 帧。B3 实连受理 accepted",
+      "source": "scripts/zcode-bridge-probe/interactionBridge.ts:517-536（buildStopPayload）、:655-670（run() 开头强制守卫）；packages/shared/src/zcode-protocol-v4/command.ts:161-164（stop payload）；snapshot.ts:53-64（control.activeWorks → foregroundExecutionId）；session-flow.ts:292-360（守卫 noop 语义）——上游行号 @ 固定 SHA 3c5b2276，与决策文件 §8.1 一致",
+      "live": "run macos-B320261025T013128Z-X8HkPg（oauth PROVEN → PAIRED → MAPPED → 触发 completed → control.activeWorks 观察到守卫 id（primaryTurn）→ stop outcome accepted → verdict STOPPED:interrupt-accepted）",
+      "terminalEvidence": "私有脱敏证据 run macos-B320261025T013128Z-X8HkPg（live-sanitized）：stop 帧恰 1、ack accepted、stopTarget kind=primaryTurn、duplicateInboundFrames=0；更早 run macos-B320261025T013037Z-TT8HoQ 在建桥 Initialize 门超时（STOPPED:bridge-init-timeout，零帧出站、未发任何 stop），窗口加宽（e34f3fe9）后复跑通过",
+      "unknownRule": "受理但窗口内无结果 → 只记 unknown，绝不重发；guard.stopTargetChanged 等 noop 不算成功、不补发",
+      "class": "source + live + fake"
     }
   ]
 }

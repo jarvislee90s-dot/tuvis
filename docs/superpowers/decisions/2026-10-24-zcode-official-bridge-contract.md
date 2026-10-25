@@ -722,3 +722,49 @@ node scripts/zcode-bridge-probe/interaction-probe.ts approve \
 **探针修正**：新增 `ConversationTopicSubscription`（`scripts/zcode-bridge-probe/sessionBridge.ts`，与 `ControllerTaskIndexReader` 同族：同一 `encodeChannelEventListen`/`encodeChannelRequest`/`RpcFrameAssembler`/`decodeChannelMessage` 与有界等待循环）。`run()` 顺序 = EventListen(`onDynamicConversationFrame`, workspace) → subscribe → 有界等 ack → 激活；ack 前帧暂存，ack 后按 `subscriptionId` 放行；兄弟 topic / 旧 subscriptionId / 坏 wire 帧只计数不交付；complete 直通、fragment 按 CRC32 重组。`session-probe.ts` 在 hello/clientHello 之后、触发帧之前建立该订阅，单槽帧汇先接钩子再 `run()`；topic 帧直入 `PendingBook`（不再把 EventFire body 当作 topic frame 直接喂册）。发送语义不变：仍恰 1 个触发帧 + 至多 1 个 resolve/stop（+ 至多 1 个 snooze），无重发。
 
 **fake 合同**：`tests/remote/zcodeBridgeInteraction.test.ts` 新增 2 条——①EventListen 帧先行（channel `zcode-agent`、事件名、workspace 参数）→ subscribe 参数 → ack 前暂存 → ack 激活/按 subscriptionId 放行 → 兄弟 topic 与旧订阅帧拒收 → deltas 进册；②fragment 两片 CRC32 重组进册、坏 checksum fail-closed。
+
+### 8.5 B3 实连结果（2026-10-25 收官追加；不改写上文）
+
+> 本节登记 B3（审批 / 问答 / 打断）实连半场的三项判定与合同落点。证据级别沿用 §6.9 口径：
+> **live-sanitized** = 实连脱敏私有证据（`~/Documents/tuvis-verify-logs/zcode/<run_id>/`，
+> 0700/0600，不入仓库；本节只引用 run id 与 §4.1 别名，无任何真实值 / 链接 / token）。
+
+三项判定（逐条挂 run id 与证据级别）：
+
+1. **审批 = UNAVAILABLE:no-pending-observed（`capabilities.approval` 维持 false）。**
+   【live-sanitized】run `macos-B320261024T230311Z-aTrTIg`：触发帧受理 accepted、
+   peerAck=true，30s 待卡窗内**零 pending 卡**（topicFramesSeen=0、pendingSize=0，
+   resolution 未尝试）；同时代理直接创建了 `tuvis-b3-permission-test.txt`——根因 =
+   **指定测试会话为自动批准模式**，不存在 pending 卡。结论原因记入合同：
+   "session auto-approves; no pending card exists in the designated test session"。
+   早前 run `macos-B320261024T151206Z-JWXiGw`（pre-fix，trigger unknown、未发任何应答帧）
+   标 **preliminary/invalid**，不计入裁决。
+2. **问答 = RESOLVED（`capabilities.userInput = true`）。**【live-sanitized】run
+   `macos-B320261025T012945Z-aMtnqA`：触发 completed → userInput pending 观察到
+   （interactionId / 题干 / 选项 value 全部取自卡上原值）→ resolveInteraction 应答 →
+   outcome accepted（ackStatus accepted、framesSent=1、peerAck=true）→ verdict RESOLVED。
+3. **打断 = STOPPED:interrupt-accepted（`capabilities.interrupt = true`）。**【live-sanitized】run
+   `macos-B320261025T013128Z-X8HkPg`：触发 completed → `control.activeWorks` 观察到
+   守卫 id（kind=primaryTurn）→ stop 帧受理 accepted（framesSent=1、peerAck=true）→
+   verdict STOPPED:interrupt-accepted。
+
+跨项事实：
+
+- **reject 轮跳过的裁决**：approve run 已证明该会话自动批准（无 pending 卡可拒绝）→
+  reject 轮必然同一结论，按裁决跳过、不额外消耗一次用户 OAuth；以本节登记代替空跑
+  （不伪造 reject 证据）。
+- **bridge-init 抖动 + 窗口加宽**：更早的打断尝试 run `macos-B320261025T013037Z-TT8HoQ`
+  在建桥 Initialize 门超时（verdict STOPPED:bridge-init-timeout，零帧出站、未发任何 stop，
+  结构性安全）；commit e34f3fe9 加宽 Initialize 等待窗后复跑通过（run `…X8HkPg`）。
+- **conversation 事件信封修复确认**：B3 事件流必须走 channel 事件信封——EventListen
+  （`onDynamicConversationFrame`）+ 动态 conversation 帧 + subscribe + ACK 激活
+  （§8.4 根因），fix commit 27bc9dd3。answer run 实证该链生效：监听先行
+  （eventListenRequestId=3 → subscribeRequestId=4）、subscribe ack（ackMode=snapshot）
+  后 topic 帧入册（eventFramesSeen=6、snapshotsApplied=1、deltasApplied=2），pending
+  才出现在 `PendingBook`——该 run 即修正后订阅链在真实环境的首证。
+
+合同落点：`tests/fixtures/zcode-official-bridge/contract.json`——`capabilities.userInput=true`、
+`capabilities.interrupt=true`、`capabilities.approval=false`（reason 如上）；`operations`
+追加 `resolveInteraction`（userInput answer）与 `stop` 两行（wire 形状沿用 §8.1 /
+`interactionBridge.ts` 钉源行号，terminalEvidence = 上述 run id），既有 operations 行不动；
+`model` / `thoughtLevel` 维持 false，留 B4。
