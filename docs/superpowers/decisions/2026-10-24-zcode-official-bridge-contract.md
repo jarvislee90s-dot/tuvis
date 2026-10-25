@@ -792,3 +792,10 @@ node scripts/zcode-bridge-probe/interaction-probe.ts approve \
 - run `macos-B320261025T031402Z-QjC2hA`（shell 触发：`pwd && echo tuvis-b3-shell-test`）：无 pending；turn 正常完成。
 - 结论：**该会话权限策略为全部放行**（文件写入与 exec 均不产生 `permission` 卡），探针实现无缺陷（`pendingSize` 摄入正常，userInput 卡可收可答）。
 - 取证前提（用户动作）：在 ZCode APP 把测试会话切到「需要确认 / Default / Ask」模式后复跑 approve/reject 两轮；若该构建无此模式，则 `capabilities.approval=false` 定案（原因：宿主不产生权限卡）。
+
+### 8.9 审批卡双向实跑（approve / reject 均通过）
+
+- **催卡前提（实跑结论）**：本构建下，仅**用户在 APP 输入框亲发**的提交（模式「变更前确认/guarded」）会拦截并弹 `kind="permission"` 卡；探针替会话合成的 sendText（默认或 `mode:"guarded"`）均直接执行不弹卡（4 轮负结果见 §8.8）。
+- **approve**（run `macos-B320261025T032425Z-K7I6ZA`）：用户 APP 发「删除 /tmp/tuvis-b3-approval-test.txt」→ 卡 3 选项（含 fullAccess，客户端硬闸排除）→ 探针 `--existing-pending` 选 allow-once → CommandAck `accepted` → **文件被删除**（产物核对）。
+- **reject**（run `macos-B320261025T034803Z-noorSA`）：同法再开一卡 → 选 deny → `accepted` → **文件仍在**（拒绝生效）。
+- **结论**：`capabilities.approval=true`；卡形状/选项/回执与源码取证一致；探针从不选择 fullAccess、不改会话权限模式。

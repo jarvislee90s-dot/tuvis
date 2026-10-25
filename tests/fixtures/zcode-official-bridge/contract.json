@@ -99,7 +99,7 @@
   },
   "capabilities": {
     "send": true,
-    "approval": false,
+    "approval": true,
     "userInput": true,
     "interrupt": true,
     "model": true,
@@ -156,6 +156,7 @@
   ],
   "capabilityNotes": {
     "thoughtLevel": "live-proven 2026-10-25 runs macos-B320261025T025928Z-3WyTFA and ...T030305Z-4leYdA: switch max→low, confirm, restore max, confirm.",
-    "model": "live-proven 2026-10-25 run macos-B320261025T030637Z-bS5dOg: catalog via model-selection.getView() (4 providers, terminal role allowed); switched GLM-5.3-Flash→GLM-5.3 within the same provider (ack accepted) → fresh snapshot confirmed model+thought → restored GLM-5.3-Flash (ack accepted) → confirmed restored."
+    "model": "live-proven 2026-10-25 run macos-B320261025T030637Z-bS5dOg: catalog via model-selection.getView() (4 providers, terminal role allowed); switched GLM-5.3-Flash→GLM-5.3 within the same provider (ack accepted) → fresh snapshot confirmed model+thought → restored GLM-5.3-Flash (ack accepted) → confirmed restored.",
+    "approval": "live-proven 2026-10-25: approve run macos-B320261025T032425Z-K7I6ZA (real kind=permission card, 3 options incl. fullAccess which is hard-blocked; allow-once option → ack accepted → /tmp file deleted) and reject run macos-B320261025T034803Z-noorSA (deny option → ack accepted → file remained). Elicitation precondition: cards only appeared for USER-composed submissions in 变更前确认 (guarded) mode; synthetic terminal-originated sendText (default or mode=guarded) did not prompt in this build. Probe answers cards via --existing-pending after explicit user designation."
   }
 }

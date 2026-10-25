@@ -51,7 +51,7 @@
 | 发送（sendConversationCommandV4，单帧、unknown 不重发） | ✅ 实跑 + 用户可见 | B2 同上（marker 可见且被 agent 处理） |
 | 问答（resolveInteraction，原题/选项回传） | ✅ 实跑 | B3 answer 同上（RESOLVED） |
 | 打断（带守卫 stop） | ✅ 实跑 | B3 interrupt run `macos-B320261025T013128Z-X8HkPg`（STOPPED:interrupt-accepted） |
-| 审批（权限卡应答） | ⚠️ **未取证** | 指定测试会话为自动批准模式：无卡、文件被直接创建（B3 approve run `macos-B320261024T230311Z-aTrTIg`）；卡路径的 wire 形状已从源码取证，但**未实跑** |
+| 审批（权限卡应答） | ✅ 实跑（批准+拒绝双向，产物核对） | runs `...T032425Z-K7I6ZA` / `...T034803Z-noorSA` |
 | 模型/思考强度（switchModelConfig + CAS） | ✅ 实跑（模型切换 + 切档 + 恢复原值） | `.superpowers/sdd/2026-10-24-zcode-official-bridge-validation/b4-source-notes.md`（READ `snapshot.config.*`；CHANGE `switchModelConfig{provider,model,thought}` + `baseRevision`；值源 `model-selection.getView()`/`thoughtLevels`）；B4 实跑延后 |
 | 两台配对手机并发 / 断线重连 / 链接失效流转 / 官方网页互踢实测 | ⚠️ 未覆盖 | 计划 T8 专门验收 |
 
@@ -85,8 +85,8 @@
 - 通过：错 ID/过期/重复不消费他卡；stop 无守卫即拒；迟到结果不入新代际。
 - 提交点：`feat(zcode): resolve pending interactions with guarded stop`。
 
-### T5 审批（受阻：卡在场才可应答）
-- 现状：指定测试会话自动批准（无权限卡）→ **当前无法取证**。禁止为取证而改会话权限模式或使用 fullAccess。
+### T5 审批（已取证：批准/拒绝双向通过）
+- 现状：已实跑通过（`...T032425Z-K7I6ZA` 批准→文件删除；`...T034803Z-noorSA` 拒绝→文件保留）。**催卡前提**：仅用户亲发、变更前确认模式的提交会弹卡；合成触发不弹——生产 UI 必须由用户真实发起动作，探针/适配器只做应答。
 - 红测（可先写）：`approval_requires_pending_card`；`approval_refuses_standing_grants`（allowAlways/allow_project/allowSession 一律拒绝）；`full_access_blocked`。
 - 实现：`command.rs` permission 分支 + 选项白名单（仅 `allowOnce`/`deny` 类，原值回传）。
 - 验证：fake：`cargo test --test zcode_approval_remote`。
