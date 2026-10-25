@@ -19,6 +19,7 @@
 //!   （`shared/web-remote-control-rpc-transport.ts`）。物理信封（`{type:"data",
 //!   payload, client_ts, server_ts}` 的精确 UTF-8 字节）上限 1,048,576 字节；
 //!   **出站只发单分片**，超预算在构造帧之前以 `payload_too_large` 拒绝，绝不静默截断。
+//!   逻辑消息上限（官方 `maxMessageBytes`）为 16 MiB，由多分片承载。
 //! - rpc-frame-ack 只表示「peer 受理了该物理帧」，**不是** Channel 业务应答：
 //!   ACK 不等于业务成功，业务结果必须来自 `201/202` 的 [`ChannelMessage`]。
 //!
@@ -29,14 +30,20 @@
 //! `Value::Null` 作为 [`encode_listen`] 的 body 时表示「arg 缺省」（Undefined 标签 0），
 //! 嵌套 null 仍按 JSON `null` 编码。
 //!
-//! # 收帧预算（Tuvis 本地限额，不是宣称的官方限额）
+//! # 收帧预算（两个上限分工：物理帧 ≠ 逻辑消息）
 //!
-//! - 并发重组 32 个 messageSeq、同时在途分片 1024 个（探针既有限额）；
-//! - 已完成消息保留至多 1024 条分片指纹（FIFO 淘汰）用于去重；
-//! - 暂存总字节 16,777,216；重组 TTL 10,000ms（从该 messageSeq 首片到达起算）；
-//! - **不按来帧声明的 `messageBytes` 直接分配**：声明值只做预算校验，实际分配只按
-//!   已解出的分片字节；超限一律返回冻结码并丢弃该重组，调用方必须重同步，
-//!   不得在吞掉错误后继续宣告投影新鲜。
+//! - **物理信封**（单条 WS 帧）1,048,576 字节；**逻辑 Channel 消息**（多分片重组后）
+//!   16,777,216 字节（官方 `maxMessageBytes`），单条消息最多 64 个分片（官方
+//!   `maxFragments`）。分片存在的唯一理由就是逻辑消息大于物理帧，因此
+//!   [`decode_channel`] 只受逻辑上限约束。
+//! - 并发重组 32 个 messageSeq、同时在途分片 1024 个、已完成消息保留至多 1024 条
+//!   分片指纹（FIFO 淘汰）、暂存总字节 16,777,216、重组 TTL 10,000ms（从该
+//!   messageSeq 首片到达起算）。
+//! - **不按来帧声明的长度分配**：数组解码按实际元素逐个增长（不 `with_capacity`
+//!   声明值）；整条消息组装前先核对 `stagedBytes == messageBytes`（与官方组建器
+//!   同序），声明值只做预算校验。
+//! - 超限、冲突或 TTL 到期一律返回冻结码并丢弃该重组（不交付任何字节），调用方
+//!   必须重同步，不得在吞掉错误后继续宣告投影新鲜。
 //!
 //! 错误只含冻结码（[`codes`]），不携带任何原始字节/正文/身份值。
 
@@ -61,10 +68,12 @@ pub const RESPONSE_TYPE_PROMISE_ERROR: u32 = 202;
 /// 事件推送（EventFire）。
 pub const RESPONSE_TYPE_EVENT_FIRE: u32 = 204;
 
-/// 物理信封上限（官方 v4 传输限额，1 MiB）。
+/// 物理信封上限（官方 `maxPhysicalFrameBytes`，1 MiB）：只约束**单条 WS 帧**的信封字节。
 pub const MAX_PHYSICAL_FRAME_BYTES: usize = 1_048_576;
-/// 单消息最大分片数（官方 maxFragments）。
-pub const MAX_FRAGMENTS_PER_MESSAGE: usize = 1024;
+/// 逻辑 Channel 消息上限（官方 `maxMessageBytes`，16 MiB）：多分片重组后的消息字节。
+pub const MAX_CHANNEL_MESSAGE_BYTES: usize = 16_777_216;
+/// 单消息最大分片数（官方 `maxFragments`）。
+pub const MAX_FRAGMENTS_PER_MESSAGE: usize = 64;
 /// 最大并发重组消息数（探针既有限额）。
 pub const MAX_CONCURRENT_ASSEMBLIES: usize = 32;
 /// 同时在途分片 / 去重指纹的暂存上限（探针既有限额）。
@@ -330,11 +339,13 @@ impl<'a> Decoder<'a> {
             }
             4 => {
                 let len = self.read_vql()? as usize;
-                // 每个元素至少 1 字节：声明长度不可能超过剩余字节，避免无界分配。
+                // 每个元素至少 1 字节：声明长度不可能超过剩余字节。
                 if len > self.remaining() {
                     return Err(invalid());
                 }
-                let mut items = Vec::with_capacity(len);
+                // 不按声明长度预分配：声明可被放大数万倍（嵌套帧每层都声明
+                // ≈剩余字节数）。增长只跟随实际读取到的元素，受输入字节数约束。
+                let mut items = Vec::new();
                 for _ in 0..len {
                     items.push(self.read_value(depth + 1)?);
                 }
@@ -346,13 +357,15 @@ impl<'a> Decoder<'a> {
 }
 
 /// 解码一条 Channel 消息（请求或应答）；形状不符返回 `unsupported_protocol`。
+///
+/// 大小上限是**逻辑消息** [`MAX_CHANNEL_MESSAGE_BYTES`]（官方 `maxMessageBytes`，
+/// 16 MiB），不是物理帧 1 MiB：多分片重组后的合法大消息必须能解码。
 pub fn decode_channel(bytes: &[u8]) -> ZResult<ChannelMessage> {
-    if bytes.is_empty() || bytes.len() > MAX_PHYSICAL_FRAME_BYTES {
-        return Err(if bytes.is_empty() {
-            invalid()
-        } else {
-            too_large()
-        });
+    if bytes.is_empty() {
+        return Err(invalid());
+    }
+    if bytes.len() > MAX_CHANNEL_MESSAGE_BYTES {
+        return Err(too_large());
     }
     let mut decoder = Decoder::new(bytes);
     let header = decoder.read_value(0)?;
@@ -562,7 +575,9 @@ fn optional_u64(object: &Map<String, Value>, key: &str) -> ZResult<Option<u64>> 
 ///
 /// 语义：身份严格相等绑定；分片按 `(messageSeq, fragmentIndex)` 暂存（允许同一消息
 /// 的分片乱序到达）；重复分片（同指纹）只确认不重复交付；元数据/CRC 冲突即拒绝并
-/// 丢弃该重组；TTL 到期或超预算同样丢弃并要求重同步。**坏帧永不交付**。
+/// 丢弃该重组；TTL 到期或超预算同样丢弃并**返回错误要求重同步**（不静默清理，
+/// 也不在本帧交付任何字节）。与官方组建器一致：只有实际暂存字节数
+/// 等于声明 `messageBytes` 时才组装整条消息。**坏帧永不交付**。
 pub struct FrameAssembler {
     identity: RpcIdentity,
     limits: FrameLimits,
@@ -618,7 +633,8 @@ impl FrameAssembler {
         }
     }
 
-    fn expire(&mut self, now_ms: u64) {
+    /// 清理过期重组；返回是否有重组因 TTL 到期被丢弃（调用方必须重同步）。
+    fn expire(&mut self, now_ms: u64) -> bool {
         let ttl = self.limits.assembly_ttl_ms;
         let expired: Vec<u64> = self
             .assemblies
@@ -626,9 +642,11 @@ impl FrameAssembler {
             .filter(|(_, assembly)| now_ms.saturating_sub(assembly.first_seen_ms) >= ttl)
             .map(|(message_seq, _)| *message_seq)
             .collect();
+        let dropped = !expired.is_empty();
         for message_seq in expired {
             self.drop_assembly(message_seq);
         }
+        dropped
     }
 
     fn remember_settled(&mut self, key: (u64, u64), fingerprint: String) {
@@ -689,7 +707,7 @@ impl FrameAssembler {
         {
             return Err(invalid());
         }
-        if fragment_count > MAX_FRAGMENTS_PER_MESSAGE || message_bytes > MAX_TOTAL_CACHED_BYTES {
+        if fragment_count > MAX_FRAGMENTS_PER_MESSAGE || message_bytes > MAX_CHANNEL_MESSAGE_BYTES {
             return Err(too_large());
         }
 
@@ -750,9 +768,14 @@ impl FrameAssembler {
 
     /// 接受一条入站 data payload 的 rpc-frame，返回本次完整交付的消息字节。
     ///
-    /// 未完成/重复帧返回空 vec；坏帧/超限/身份不符返回冻结码（**不交付任何字节**）。
+    /// 未完成/重复帧返回空 vec；坏帧/超限/身份不符/TTL 到期返回冻结码
+    /// （**不交付任何字节**）。TTL 到期属于终态：调用方必须 [`reset`](Self::reset)
+    /// 后重新同步，不得在吞掉错误后继续宣告投影新鲜。
     pub fn accept(&mut self, frame: Value, now_ms: u64) -> ZResult<Vec<Vec<u8>>> {
-        self.expire(now_ms);
+        if self.expire(now_ms) {
+            // 有进行中的重组过期：整条消息已不可恢复，本帧也不组装。
+            return Err(invalid());
+        }
         let parsed = self.parse_frame(&frame)?;
 
         let key = (parsed.message_seq, parsed.fragment_index as u64);
@@ -774,7 +797,11 @@ impl FrameAssembler {
                 self.drop_assembly(parsed.message_seq);
                 return Err(invalid());
             }
-            if let Some(existing) = &assembly.chunks[parsed.fragment_index] {
+            if let Some(existing) = assembly
+                .chunks
+                .get(parsed.fragment_index)
+                .and_then(Option::as_ref)
+            {
                 if existing.fingerprint == parsed.fingerprint {
                     return Ok(Vec::new());
                 }
@@ -799,51 +826,58 @@ impl FrameAssembler {
         let message_seq = parsed.message_seq;
         let fragment_index = parsed.fragment_index;
         let chunk_len = parsed.chunk.len();
-        let entry = self
-            .assemblies
-            .entry(message_seq)
-            .or_insert_with(|| Assembly {
-                message_seq,
-                fragment_count: parsed.fragment_count,
-                message_bytes: parsed.message_bytes,
-                checksum: parsed.checksum.clone(),
-                first_seen_ms: now_ms,
-                chunks: std::iter::repeat_with(|| None)
-                    .take(parsed.fragment_count)
-                    .collect(),
-                received: 0,
-                staged_bytes: 0,
+        let complete = {
+            let entry = self
+                .assemblies
+                .entry(message_seq)
+                .or_insert_with(|| Assembly {
+                    message_seq,
+                    fragment_count: parsed.fragment_count,
+                    message_bytes: parsed.message_bytes,
+                    checksum: parsed.checksum.clone(),
+                    first_seen_ms: now_ms,
+                    chunks: std::iter::repeat_with(|| None)
+                        .take(parsed.fragment_count)
+                        .collect(),
+                    received: 0,
+                    staged_bytes: 0,
+                });
+            let Some(slot) = entry.chunks.get_mut(fragment_index) else {
+                return Err(invalid());
+            };
+            *slot = Some(FragmentChunk {
+                fingerprint: parsed.fingerprint,
+                bytes: parsed.chunk,
             });
-        entry.chunks[fragment_index] = Some(FragmentChunk {
-            fingerprint: parsed.fingerprint,
-            bytes: parsed.chunk,
-        });
-        entry.received += 1;
-        entry.staged_bytes += chunk_len;
+            entry.received += 1;
+            entry.staged_bytes += chunk_len;
+            entry.received >= entry.fragment_count
+        };
         self.in_flight_fragments += 1;
         self.staged_bytes += chunk_len;
-        if entry.received < entry.fragment_count {
+        if !complete {
             return Ok(Vec::new());
         }
 
-        let assembly = self
-            .assemblies
-            .remove(&message_seq)
-            .expect("assembly just staged");
+        let Some(assembly) = self.assemblies.remove(&message_seq) else {
+            return Err(invalid());
+        };
         self.in_flight_fragments = self.in_flight_fragments.saturating_sub(assembly.received);
         self.staged_bytes = self.staged_bytes.saturating_sub(assembly.staged_bytes);
 
-        let mut joined = Vec::with_capacity(assembly.message_bytes);
+        // 与官方组建器同序：先核对实际暂存字节 == 声明 messageBytes，再分配。
+        if assembly.staged_bytes != assembly.message_bytes {
+            return Err(invalid());
+        }
+        let mut joined = Vec::with_capacity(assembly.staged_bytes);
         for chunk in &assembly.chunks {
             let Some(chunk) = chunk else {
                 return Err(invalid());
             };
             joined.extend_from_slice(&chunk.bytes);
-            if joined.len() > assembly.message_bytes {
-                return Err(invalid());
-            }
         }
-        if joined.len() != assembly.message_bytes || crc32_hex(&joined) != assembly.checksum {
+        debug_assert_eq!(joined.len(), assembly.message_bytes);
+        if crc32_hex(&joined) != assembly.checksum {
             // 坏 CRC：整条消息丢弃，零交付。
             return Err(invalid());
         }
@@ -864,11 +898,82 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 线程本地分配计量（只用于「恶意声明长度不得放大分配」的回归测试）。
+    ///
+    /// 测试各自独立线程，`Cell` 计数互不干扰；`System` 承担真实分配，本包装只记账。
+    mod test_alloc {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static CURRENT: Cell<usize> = const { Cell::new(0) };
+            static PEAK: Cell<usize> = const { Cell::new(0) };
+        }
+
+        pub struct CountingAllocator;
+
+        fn note_alloc(size: usize) {
+            CURRENT.with(|current| {
+                let next = current.get() + size;
+                current.set(next);
+                PEAK.with(|peak| {
+                    if next > peak.get() {
+                        peak.set(next);
+                    }
+                });
+            });
+        }
+
+        fn note_dealloc(size: usize) {
+            CURRENT.with(|current| current.set(current.get().saturating_sub(size)));
+        }
+
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let pointer = System.alloc(layout);
+                if !pointer.is_null() {
+                    note_alloc(layout.size());
+                }
+                pointer
+            }
+
+            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+                System.dealloc(pointer, layout);
+                note_dealloc(layout.size());
+            }
+
+            unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let next = System.realloc(pointer, layout, new_size);
+                if !next.is_null() {
+                    note_dealloc(layout.size());
+                    note_alloc(new_size);
+                }
+                next
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: CountingAllocator = CountingAllocator;
+
+        /// 清零当前线程的计数（在构造输入之后调用）。
+        pub fn reset() {
+            CURRENT.with(|current| current.set(0));
+            PEAK.with(|peak| peak.set(0));
+        }
+
+        /// 当前线程自 [`reset`] 以来的峰值存活分配字节数。
+        pub fn peak() -> usize {
+            PEAK.with(std::cell::Cell::get)
+        }
+    }
+
+    /// 夹具在仓库根 `tests/fixtures/`（与 `contract.json` 同目录），编译期嵌入。
     fn fixture() -> Value {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/zcode-official-bridge/wire-vectors.json");
-        let raw = std::fs::read_to_string(path).expect("read wire-vectors.json");
-        serde_json::from_str(&raw).expect("parse wire-vectors.json")
+        let raw = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/zcode-official-bridge/wire-vectors.json"
+        ));
+        serde_json::from_str(raw).expect("parse wire-vectors.json")
     }
 
     fn hex_to_bytes(hex: &str) -> Vec<u8> {
@@ -908,6 +1013,52 @@ mod tests {
         let last = bytes.last_mut().expect("non-empty chunk");
         *last ^= 0xff;
         frame["dataBase64"] = Value::from(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+
+    /// 合成一条合法的 Channel 应答消息（header + 可控长度的字符串 body）。
+    fn synthetic_channel_message(body_len: usize) -> Vec<u8> {
+        let header = json!([RESPONSE_TYPE_PROMISE_SUCCESS, 9u32]);
+        let body = Value::String("a".repeat(body_len));
+        let mut bytes = Vec::new();
+        write_value(&mut bytes, &header, 0).expect("encode header");
+        write_value(&mut bytes, &body, 0).expect("encode body");
+        bytes
+    }
+
+    /// 按官方分片信封形状合成一帧（与 `encode_frame` 同字段，允许指定分片位置）。
+    fn synthetic_frame(
+        message: &[u8],
+        message_seq: u64,
+        index: usize,
+        count: usize,
+        chunk: &[u8],
+    ) -> Value {
+        let seq = index as u64 + 1;
+        let message_bytes = message.len();
+        json!({
+            "zcode_type": "rpc-frame",
+            "bridgeSessionId": "bridge-test-0001",
+            "seq": seq,
+            "messageSeq": message_seq,
+            "fragmentIndex": index,
+            "fragmentCount": count,
+            "messageBytes": message_bytes,
+            "checksum": {"algorithm": "crc32", "value": crc32_hex(message)},
+            "dataBase64": base64::engine::general_purpose::STANDARD.encode(chunk),
+        })
+    }
+
+    /// 恶意嵌套帧：每层数组都声明「剩余字节数」，能通过 `len <= remaining` 守卫。
+    fn hostile_nested_frame(target: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(target);
+        for _ in 0..MAX_NESTING_DEPTH + 6 {
+            let remaining = target - bytes.len();
+            bytes.push(4); // Array 标签
+            let declared = u32::try_from(remaining - 4).expect("fits u32");
+            write_vql(&mut bytes, declared);
+        }
+        bytes.resize(target, 0);
+        bytes
     }
 
     #[test]
@@ -1157,8 +1308,22 @@ mod tests {
         assert!(decode_channel(&[4, 1, 1, 1, b'A', 0]).is_err());
         // 未知类型标签。
         assert!(decode_channel(&[9]).is_err());
-        // 物理上限。
-        assert!(decode_channel(&vec![0u8; MAX_PHYSICAL_FRAME_BYTES + 1]).is_err());
+        // 1 MiB+1 是物理信封问题，不是解码问题：解码侧只按形状拒绝
+        // （全零帧的 header 不是数组），不得报 payload_too_large。
+        assert!(decode_channel(&vec![0u8; MAX_PHYSICAL_FRAME_BYTES + 1])
+            .unwrap_err()
+            .is(codes::UNSUPPORTED_PROTOCOL));
+        // 物理上限在物理层（出站分帧）拒绝。
+        let identity = RpcIdentity::new("bridge-test-0001");
+        assert!(
+            encode_frame(&identity, 1, 1, &vec![0u8; MAX_PHYSICAL_FRAME_BYTES + 1])
+                .unwrap_err()
+                .is(codes::PAYLOAD_TOO_LARGE)
+        );
+        // 解码侧的上限是**逻辑**消息 16 MiB（多分片重组后的字节数）。
+        assert!(decode_channel(&vec![0u8; MAX_CHANNEL_MESSAGE_BYTES + 1])
+            .unwrap_err()
+            .is(codes::PAYLOAD_TOO_LARGE));
     }
 
     #[test]
@@ -1264,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_frames_are_rejected_without_allocation() {
+    fn oversized_frames_are_rejected_with_frozen_codes() {
         let fixture = fixture();
         let vector = named(&fixture, "fragments", "two_fragments");
         let frames = vector["frames"].as_array().expect("frames").clone();
@@ -1277,6 +1442,27 @@ mod tests {
             .accept(huge_declared, 0)
             .unwrap_err()
             .is(codes::PAYLOAD_TOO_LARGE));
+        assert_eq!(assembler.staged_bytes(), 0);
+
+        // 官方 maxFragments=64：65 片即拒绝。
+        let mut too_many_fragments = frames[0].clone();
+        too_many_fragments["fragmentCount"] = json!(65u64);
+        assert!(assembler
+            .accept(too_many_fragments, 0)
+            .unwrap_err()
+            .is(codes::PAYLOAD_TOO_LARGE));
+
+        // 声明 16 MiB、实际只给 1 字节分片：核对 stagedBytes == messageBytes 之前
+        // 不得组装/分配整条消息，直接坏帧拒绝并清空账本。
+        let mut mismatched = frames[0].clone();
+        mismatched["fragmentCount"] = json!(1u64);
+        mismatched["fragmentIndex"] = json!(0u64);
+        mismatched["messageBytes"] = json!((MAX_CHANNEL_MESSAGE_BYTES - 1) as u64);
+        assert!(assembler
+            .accept(mismatched, 0)
+            .unwrap_err()
+            .is(codes::UNSUPPORTED_PROTOCOL));
+        assert_eq!(assembler.active_assemblies(), 0);
         assert_eq!(assembler.staged_bytes(), 0);
 
         // 超长 base64 在解码前拒绝。
@@ -1297,6 +1483,124 @@ mod tests {
     }
 
     #[test]
+    fn multi_fragment_message_over_physical_frame_decodes() {
+        // 逻辑消息 1.5 MiB > 单帧 1 MiB，但 < 官方 maxMessageBytes 16 MiB。
+        let message = synthetic_channel_message(1_500_000);
+        assert!(
+            message.len() > MAX_PHYSICAL_FRAME_BYTES,
+            "message {} must exceed one physical frame",
+            message.len()
+        );
+        assert!(message.len() < MAX_CHANNEL_MESSAGE_BYTES);
+
+        let fragment_count = 3usize;
+        let chunk_len = message.len().div_ceil(fragment_count);
+        let mut assembler = FrameAssembler::new(RpcIdentity::new("bridge-test-0001"));
+        let mut delivered = Vec::new();
+        for index in 0..fragment_count {
+            let start = index * chunk_len;
+            let end = (start + chunk_len).min(message.len());
+            let frame = synthetic_frame(&message, 7, index, fragment_count, &message[start..end]);
+            // 物理信封仍受 1 MiB 约束（分片存在的前提）。
+            let envelope_len = serde_json::to_vec(&frame).expect("frame json").len();
+            assert!(
+                envelope_len <= MAX_PHYSICAL_FRAME_BYTES,
+                "frame envelope {envelope_len} must stay within physical limit"
+            );
+            delivered.extend(assembler.accept(frame, 0).expect("accept fragment"));
+        }
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0], message);
+        assert_eq!(assembler.active_assemblies(), 0);
+        assert_eq!(assembler.staged_bytes(), 0);
+
+        let decoded = decode_channel(&delivered[0]).expect("decode reassembled 1.5 MiB message");
+        assert_eq!(decoded.message_type, RESPONSE_TYPE_PROMISE_SUCCESS);
+        assert_eq!(decoded.body, Value::String("a".repeat(1_500_000)));
+    }
+
+    #[test]
+    fn hostile_declared_lengths_fail_fast_without_allocation() {
+        // 1 MiB 帧、每层数组都声明「剩余字节数」：按声明预分配会放大到 GiB 级。
+        let frame = hostile_nested_frame(MAX_PHYSICAL_FRAME_BYTES);
+        assert_eq!(frame.len(), MAX_PHYSICAL_FRAME_BYTES);
+
+        test_alloc::reset();
+        let result = decode_channel(&frame);
+        let peak = test_alloc::peak();
+        assert!(result.unwrap_err().is(codes::UNSUPPORTED_PROTOCOL));
+        assert!(
+            peak <= 4 * frame.len(),
+            "peak allocation {peak} bytes for a {} byte frame",
+            frame.len()
+        );
+
+        // 单个数组声明 u32::MAX 个元素：剩余字节不够，立即拒绝。
+        test_alloc::reset();
+        let absurd = decode_channel(&[4, 0xff, 0xff, 0xff, 0xff, 0x0f]);
+        assert!(absurd.unwrap_err().is(codes::UNSUPPORTED_PROTOCOL));
+        assert!(test_alloc::peak() <= 4 * 6);
+    }
+
+    #[test]
+    fn expired_reassembly_requires_resync() {
+        let fixture = fixture();
+        let vector = named(&fixture, "fragments", "three_fragments");
+        let frames = vector["frames"].as_array().expect("frames").clone();
+        let limits = FrameLimits {
+            assembly_ttl_ms: 1_000,
+            ..FrameLimits::default()
+        };
+        let mut assembler = FrameAssembler::with_limits(identity_from(vector), limits);
+
+        assert!(assembler.accept(frames[0].clone(), 0).unwrap().is_empty());
+        assert_eq!(assembler.active_assemblies(), 1);
+
+        // TTL 到期：丢弃进行中的重组；触发过期的这一帧也不得被交付/暂存。
+        assert!(assembler
+            .accept(frames[1].clone(), 1_000)
+            .unwrap_err()
+            .is(codes::UNSUPPORTED_PROTOCOL));
+        assert_eq!(assembler.active_assemblies(), 0);
+        assert_eq!(assembler.staged_bytes(), 0);
+
+        // 显式重同步后，同一消息从头重组可以完成。
+        assembler.reset();
+        let mut delivered = Vec::new();
+        for frame in &frames {
+            delivered.extend(
+                assembler
+                    .accept(frame.clone(), 2_000)
+                    .expect("fresh assembly"),
+            );
+        }
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            bytes_to_hex(&delivered[0]),
+            vector["messageHex"].as_str().expect("messageHex")
+        );
+    }
+
+    #[test]
+    fn production_limits_match_official_and_local_budgets() {
+        // 官方限额（`b2/web-remote-control-rpc-transport.ts` 固定 SHA 3c5b2276）。
+        assert_eq!(MAX_PHYSICAL_FRAME_BYTES, 1_048_576);
+        assert_eq!(MAX_CHANNEL_MESSAGE_BYTES, 16_777_216);
+        assert_eq!(MAX_FRAGMENTS_PER_MESSAGE, 64);
+        // Tuvis 本地预算（探针既有预算；暂存总字节取官方 maxMessageBytes）。
+        assert_eq!(MAX_CONCURRENT_ASSEMBLIES, 32);
+        assert_eq!(MAX_STAGED_FRAMES, 1024);
+        assert_eq!(MAX_TOTAL_CACHED_BYTES, 16_777_216);
+        assert_eq!(ASSEMBLY_TTL_MS, 10_000);
+
+        let limits = FrameLimits::default();
+        assert_eq!(limits.max_concurrent_assemblies, MAX_CONCURRENT_ASSEMBLIES);
+        assert_eq!(limits.max_staged_frames, MAX_STAGED_FRAMES);
+        assert_eq!(limits.max_total_bytes, MAX_TOTAL_CACHED_BYTES);
+        assert_eq!(limits.assembly_ttl_ms, ASSEMBLY_TTL_MS);
+    }
+
+    #[test]
     fn reassembly_ttl_expires_incomplete_messages() {
         let fixture = fixture();
         let vector = named(&fixture, "fragments", "three_fragments");
@@ -1310,19 +1614,17 @@ mod tests {
         assert!(assembler.accept(frames[0].clone(), 0).unwrap().is_empty());
         assert_eq!(assembler.active_assemblies(), 1);
 
-        // 另一条消息在 TTL 之后到达：旧重组被清理，不会与新消息混淆。
+        // TTL 到期后再有帧到达：过期重组被丢弃，本帧不暂存、零交付，
+        // 且返回要求重同步的冻结错误（不是 Ok(empty) 静默丢弃）。
         let mut other_message = frames[0].clone();
         other_message["messageSeq"] = json!(500u64);
-        assert!(assembler.accept(other_message, 1_000).unwrap().is_empty());
-        assert_eq!(assembler.active_assemblies(), 1);
-
-        // 旧消息的迟到分片只能开启一个新重组，不与过期进度拼接。
         assert!(assembler
-            .accept(frames[1].clone(), 1_000)
-            .unwrap()
-            .is_empty());
-        assert_eq!(assembler.active_assemblies(), 2);
-        assert_eq!(assembler.in_flight_fragments, 2);
+            .accept(other_message, 1_000)
+            .unwrap_err()
+            .is(codes::UNSUPPORTED_PROTOCOL));
+        assert_eq!(assembler.active_assemblies(), 0);
+        assert_eq!(assembler.staged_bytes(), 0);
+        assert_eq!(assembler.in_flight_fragments, 0);
     }
 
     #[test]
@@ -1380,20 +1682,18 @@ mod tests {
         let ack = encode_ack(&identity, 11);
         assert_eq!(ack["zcode_type"], json!("rpc-frame-ack"));
         assert_eq!(ack["ackMessageSeq"], json!(11));
-        // ACK 不是 Channel 消息：不含 messageType/status，不能解码成业务应答。
+        // ACK 不是 Channel 消息：不含 messageType/id，不能解码成业务应答。
         assert!(decode_channel(serde_json::to_vec(&ack).unwrap().as_slice()).is_err());
         assert!(ack.get("messageType").is_none());
+        assert!(ack.get("id").is_none());
         assert!(ack.get("status").is_none());
 
-        // 业务成功只能来自 201 的 ChannelMessage。
+        // 业务成功只能来自 201 的 ChannelMessage（带 id 与业务 body）。
         let success = named(&fixture, "responses", "promise_success");
         let decoded = decode_channel(&hex_to_bytes(success["hex"].as_str().expect("hex")))
             .expect("decode success");
         assert_eq!(decoded.message_type, RESPONSE_TYPE_PROMISE_SUCCESS);
-        assert_ne!(
-            Value::from(decoded.message_type),
-            ack["zcode_type"].clone(),
-            "ack 与业务应答是两种消息"
-        );
+        assert_eq!(decoded.id, Some(7));
+        assert_eq!(decoded.body["ack"]["mode"], json!("snapshot"));
     }
 }
