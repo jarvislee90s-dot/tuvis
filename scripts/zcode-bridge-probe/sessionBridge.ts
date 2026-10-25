@@ -1887,6 +1887,8 @@ export type SendOnceLoopOptions = {
    */
   target: BoundTarget;
   markerText: string;
+  /** 附加 payload 字段（B3 审批取证：submission mode，command.ts:95-115 `mode`）。 */
+  payloadExtra?: Record<string, unknown>;
   clientId: string;
   timeouts: { ackMs: number; activityMs: number };
   sleep?: (ms: number) => Promise<void>;
@@ -1916,6 +1918,7 @@ export class SendOnceLoop {
   private readonly identity: RpcFrameIdentity;
   private readonly target: BoundTarget;
   private readonly markerText: string;
+  private readonly payloadExtra?: Record<string, unknown>;
   private readonly clientId: string;
   private readonly ackMs: number;
   private readonly activityMs: number;
@@ -1947,6 +1950,7 @@ export class SendOnceLoop {
     this.identity = options.identity;
     this.target = options.target;
     this.markerText = options.markerText;
+    this.payloadExtra = options.payloadExtra;
     this.clientId = options.clientId;
     this.ackMs = options.timeouts.ackMs;
     this.activityMs = options.timeouts.activityMs;
@@ -1977,7 +1981,7 @@ export class SendOnceLoop {
       clientId: this.clientId,
       sessionId: this.target.taskId,
       type: "sendText" as const,
-      payload: { text: this.markerText },
+      payload: { text: this.markerText, ...(this.payloadExtra ?? {}) },
       issuedAt: this.now(),
     };
     this.commandId = envelope.commandId;

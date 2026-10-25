@@ -347,6 +347,8 @@ type ProbeFlags = {
   sid: string | null;
   dbPath: string | null;
   provider: OAuthProviderChannel;
+  /** 提交模式（B3 审批取证）：build|edit|plan|yolo|guarded（command.ts:95-115）。 */
+  submissionMode: string | null;
   workspace: string;
   taskTitle: string;
   help: boolean;
@@ -368,6 +370,7 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
     sid: null,
     dbPath: null,
     provider: "bigmodel",
+    submissionMode: null,
     workspace: DEFAULT_WORKSPACE_DESIGNATION,
     taskTitle: DEFAULT_TASK_DESIGNATION,
     help: false,
@@ -386,6 +389,13 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
       flags.interaction = value as InteractionMode;
     } else if (arg === "--interaction") {
       return "--interaction 需要 =<mode> 形式，例如 --interaction=approve";
+    } else if (arg.startsWith("--submission-mode=")) {
+      const value = arg.slice("--submission-mode=".length).trim();
+      const modes = ["build", "edit", "plan", "yolo", "guarded"];
+      if (!modes.includes(value)) {
+        return `--submission-mode 只接受 ${modes.join(" | ")}，收到：${value || "(空)"}`;
+      }
+      flags.submissionMode = value;
     } else if (arg === "--open") flags.open = true;
     else if (arg === "--jwt-stdin") flags.jwtStdin = true;
     else if (arg === "--help" || arg === "-h") flags.help = true;
@@ -974,7 +984,9 @@ function buildInteractionInstruction(mode: InteractionMode): string {
   switch (mode) {
     case "approve":
     case "reject":
-      return `${tag} 请创建一个名为 tuvis-b3-permission-test.txt 的临时文件（放在当前工作区根目录），内容写 tuvis-b3。完成后一句话说明结果。`;
+      // 「变更前确认」模式只对**工作区外写入/高风险命令**弹审批（用户实机确认）：
+      // 用一条无害、可回滚的 /tmp 写入来触发 permission 卡。
+      return `${tag} 请在 /tmp 目录创建一个文件 /tmp/tuvis-b3-approval-test.txt，内容写 tuvis-b3。这是一次工作区外的临时文件写入，用于验证审批流程，完成后一句话说明结果。`;
     case "answer":
       return `${tag} 请用提问卡问我一个单选题，问题原文用「继续还是暂停？」，提供两个选项：继续 / 暂停。等我回答后再继续。`;
     case "interrupt":
@@ -2461,6 +2473,9 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           identity,
           target: bound,
           markerText: buildInteractionInstruction(interactionMode),
+          ...(parsed.submissionMode !== null
+            ? { payloadExtra: { mode: parsed.submissionMode } }
+            : {}),
           clientId,
           timeouts: { ackMs: SEND_ACK_TIMEOUT_MS, activityMs: SEND_ACTIVITY_TIMEOUT_MS },
           channelRequestId: bridgeId + 1,
