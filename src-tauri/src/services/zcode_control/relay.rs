@@ -23,18 +23,30 @@
 //!   `heartbeatTiming.ts`；本模块是长驻连接，不以「短时探针无心跳」冒充可用）。
 //! - **数据面门禁**：`matched` 之前不发送任何 `data` 帧；[`RelayClient::send_data`] 在未
 //!   配对时返回错误且**写零帧**。收帧只在已配对时上报 [`RelayEvent::Data`]。
+//! - **入站上限**：单条 WS 消息超过 1,048,576 字节时在 JSON 解析前拒绝（冻结码
+//!   `unsupported_protocol`）并关闭连接，绝不上报 `Data`。
 //! - **错误卫生**：WS/HTTP 原始错误可能含 URL/token；一律丢弃原文，只映射 [`codes`] 的
 //!   冻结码。SID/MID/token/上游文案不进入错误、`Debug` 或事件。
 //! - **代际**：显式连接/断开推进 `generation`；迟到的 token 结果、WS 握手结果与旧帧一律
-//!   丢弃（不回退状态、不开第二条 socket）。这也是 T1.1 的衔接约束：clear 之后代际已变的
-//!   relay token 不得再建立活连接。
+//!   丢弃（不回退状态、不开第二条 socket）。写 `data` 帧前还会复核捕获的代际与配对态。
+//! - **换目标必须显式断开**：已有活连接（connecting/paired）时 [`RelayClient::connect`]
+//!   只对**同一目标**（`sid` + `mid`；`label` 仅显示）幂等；目标不同返回冻结码 `conflict`
+//!   且零新 socket，调用方必须先 `disconnect()`（T7.1 的 `config_changed` 即「先断开再连接」）。
 //!
 //! # 并发
 //!
-//! `connect` 用一把异步单飞锁串行化「开始新连接」；**断开不等待该锁**，只持状态锁推进
-//! 代际并通过 oneshot 通知连接任务退出，因此不会被网络等待拖住。连接任务独占 socket
-//! （split 成 sink/source），`send_data` 只经有界命令通道投递，绝不并发写 socket。
+//! `connect` 用一把异步单飞锁串行化「开始新连接」，且 WS 升级 + `auth_init`→`auth_ack`
+//! 共用 15s 总预算，任何情况都不会无限占用该锁。`disconnect` 不等待该锁，但会**有界等待
+//! 连接任务收尸**（生产 15s）后才返回：保证紧随的 `connect` 不会与尚未关闭的旧 socket
+//! 重叠而被官方 KICK；若 `live` 尚未登记（仍停在 WS 升级前的握手），断开立即返回。
+//! 连接任务独占 socket（split 成 sink/source），`send_data` 只经有界命令通道投递，绝不并发
+//! 写 socket。
+//!
+//! 事件通道是**尽力而为**：状态/数据事件一律 `try_send`，队列满时丢事件（lag），绝不阻塞
+//! `connect`/`disconnect`/actor；消费方以「重拉当前视图（GET）」兜底重同步。
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -47,12 +59,14 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::auth::AuthService;
 use super::config::validate_official_url;
-use super::types::{codes, ConnectionState, ConnectionView, ZResult, ZcodeError};
+use super::types::{codes, ConnectionState, ConnectionView, RelaySink, ZResult, ZcodeError};
 
 /// 官方 relay WebSocket 路径（固定源码 `shared/web-remote-relay/contract.ts:102`）。
 pub const OFFICIAL_RELAY_WS_PATH: &str = "/api/v1/remote/ws2";
 /// 官方 relay WebSocket origin（生产固定值，无配置/IPC 入口；https origin 的 wss 对应）。
 pub const OFFICIAL_RELAY_WS_ORIGIN: &str = "wss://zcode.z.ai";
+/// 入站帧上限：超过 1,048,576 字节的 WS 消息在 JSON 解析前拒绝（`unsupported_protocol`）。
+const MAX_INBOUND_FRAME_BYTES: usize = 1_048_576;
 
 /// 官方 relay 升级后的客户端流（ws/wss 统一为 `MaybeTlsStream`）。
 type WsStream =
@@ -108,6 +122,18 @@ impl DeviceRoute {
             label: label.filter(|label| !label.trim().is_empty()),
         })
     }
+
+    /// 是否为同一连接目标：只比较 `sid` + `mid`（`mid` 空白按缺失），`label` 仅显示不参与。
+    fn same_target(&self, other: &Self) -> bool {
+        fn normalized_mid(target: &DeviceRoute) -> Option<&str> {
+            target
+                .mid
+                .as_deref()
+                .map(str::trim)
+                .filter(|mid| !mid.is_empty())
+        }
+        self.sid == other.sid && normalized_mid(self) == normalized_mid(other)
+    }
 }
 
 /// relay 事件（Hub 的唯一输入口；绝无 JWT/token/URL）。
@@ -121,6 +147,8 @@ pub enum RelayEvent {
 /// 连接任务命令（唯一写 socket 的路径；有界通道，不在状态锁内 await 网络）。
 enum Command {
     SendData {
+        /// `send_data` 捕获的代际；actor 写帧前必须与当前代际复核。
+        generation: u64,
         payload: Value,
         reply: oneshot::Sender<ZResult<()>>,
     },
@@ -143,8 +171,12 @@ struct RelayTiming {
     ack_timeout: Duration,
     /// `waiting` 路由窗：30,000ms。
     pair_window: Duration,
-    /// WS 升级超时（生产 15s；测试可缩短）。
+    /// WS 升级 + auth_init→auth_ack 的连接总预算（生产 15s；测试可缩短）。
     connect_timeout: Duration,
+    /// `disconnect` 等待 actor 收尸（旧 socket 关闭）的上界（生产 15s；测试可缩短）。
+    shutdown_wait: Duration,
+    /// 单帧写 socket 的上限（生产 10s；半开连接 → 离线终态，绝不无限挂起 actor）。
+    send_timeout: Duration,
 }
 
 impl RelayTiming {
@@ -156,6 +188,8 @@ impl RelayTiming {
             ack_timeout: Duration::from_millis(15_000),
             pair_window: Duration::from_secs(30),
             connect_timeout: Duration::from_millis(15_000),
+            shutdown_wait: Duration::from_millis(15_000),
+            send_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -179,6 +213,9 @@ struct Shared {
     connect_lock: tokio::sync::Mutex<()>,
     /// 状态事件排序锁：状态更新与事件发送在它下面线性化，避免旧代际事件后到覆盖新状态。
     emit_lock: tokio::sync::Mutex<()>,
+    /// 测试观测：已退出的 connection actor 数（`disconnect` 收尸断言用）。
+    #[cfg(test)]
+    actor_exits: AtomicUsize,
 }
 
 struct InnerState {
@@ -186,6 +223,8 @@ struct InnerState {
     generation: u64,
     view: ConnectionView,
     live: Option<Arc<LiveConnection>>,
+    /// 当前（或最近一次）连接目标；只在 `live` 存在时参与「换目标」判定。
+    route: Option<DeviceRoute>,
 }
 
 /// 当前活连接的写入口与取消开关（只在代际匹配时存在）。
@@ -194,6 +233,8 @@ struct LiveConnection {
     paired: Arc<AtomicBool>,
     commands: mpsc::Sender<Command>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    /// actor 已退出（socket 已关闭）信号；`disconnect` 有界等待它。
+    closed: tokio::sync::watch::Receiver<bool>,
 }
 
 impl LiveConnection {
@@ -208,6 +249,29 @@ impl LiveConnection {
             let _ = sender.send(());
         }
     }
+
+    /// 有界等待 actor 退出（旧 socket 已关闭）；超时返回 `false`（不得无限拖住断开）。
+    async fn wait_closed(&self, timeout: Duration) -> bool {
+        let mut closed = self.closed.clone();
+        if *closed.borrow_and_update() {
+            return true;
+        }
+        match tokio::time::timeout(timeout, closed.changed()).await {
+            Ok(Ok(())) => true,
+            // 发送端被丢弃同样代表 actor 已不在。
+            Ok(Err(_)) => true,
+            Err(_) => false,
+        }
+    }
+}
+
+/// actor 退出信号（Drop 保证所有 return/panic 路径都通知等待方）。
+struct ClosedSignal(tokio::sync::watch::Sender<bool>);
+
+impl Drop for ClosedSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
 }
 
 /// 连接任务（独占 socket 的 sink/source 与全部计时器）。
@@ -221,6 +285,10 @@ struct ConnectionTask {
     commands: mpsc::Receiver<Command>,
     shutdown: oneshot::Receiver<()>,
     handshake: Option<oneshot::Sender<HandshakeOutcome>>,
+    /// actor 退出信号：`disconnect` 等它落地后才返回（旧 socket 已关闭）。
+    closed: Option<tokio::sync::watch::Sender<bool>>,
+    /// 写失败后 actor 已进入终态（`run_connection` 收尸退出）。
+    terminal: bool,
 }
 
 /// 连接任务内的握手/心跳计时状态。
@@ -231,6 +299,17 @@ struct SessionState {
     pair_deadline: Option<Instant>,
     heartbeat_due: Option<Instant>,
     ack_deadline: Option<Instant>,
+}
+
+/// 测试观测：actor 退出（所有 return 路径，含 panic 展开）时计数。
+#[cfg(test)]
+struct ActorExitGuard(Arc<Shared>);
+
+#[cfg(test)]
+impl Drop for ActorExitGuard {
+    fn drop(&mut self) {
+        self.0.actor_exits.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl RelayClient {
@@ -286,21 +365,30 @@ impl RelayClient {
                         device_label: None,
                     },
                     live: None,
+                    route: None,
                 }),
                 connect_lock: tokio::sync::Mutex::new(()),
                 emit_lock: tokio::sync::Mutex::new(()),
+                #[cfg(test)]
+                actor_exits: AtomicUsize::new(0),
             }),
         }
     }
 
     /// 建立单条 relay 连接（先取新 token，再走官方握手）。
     ///
-    /// - 已有活连接（`connecting`/`paired`）时是幂等的：返回当前视图，不取 token、
-    ///   不开第二条 socket（同 role 第二条 terminal socket 会被官方相互踢掉）。
+    /// - 已有活连接（`connecting`/`paired`）且目标是**同一设备**（`sid` + `mid` 相同；
+    ///   `label` 仅显示）时是幂等的：返回当前视图，不取 token、不开第二条 socket
+    ///   （同 role 第二条 terminal socket 会被官方相互踢掉）。
+    /// - 已有活连接但目标不同：返回冻结码 `conflict`，零新 socket、零新 token，旧连接原样
+    ///   保留。换/删链接、登出等配置变更必须先 `disconnect()`（T7.1 的 `config_changed`
+    ///   即「先推进代际并断开，再连接新目标」），本模块不订阅 auth 事件。
     /// - 返回 `Ok(Connecting)` 表示 `auth_ack(waiting)`（合法配对前态），连接保持并继续
     ///   心跳等待 `matched`；`Ok(Paired)` 表示已配对。
     /// - `Err(code)` 表示 token/网络/协议失败；对应状态已通过 [`RelayEvent::State`] 上报。
     /// - 迟到的 token/握手结果（代际已变）返回 `stale_generation`，绝不回退状态。
+    /// - WS 升级 + `auth_init`→`auth_ack` 共用 `connect_timeout` 总预算（生产 15s），
+    ///   失败按 `offline` 终态收口并等旧 socket 关闭，绝不悬在 `connecting`。
     pub async fn connect(&self, device: DeviceRoute) -> ZResult<ConnectionView> {
         if device.sid.trim().is_empty() {
             return Err(ZcodeError::of(codes::NEEDS_CONFIG));
@@ -316,6 +404,14 @@ impl RelayClient {
                     ConnectionState::Connecting | ConnectionState::Paired
                 )
             {
+                // 换目标不得静默复用旧 socket：必须显式 disconnect 后再连。
+                let different_target = inner
+                    .route
+                    .as_ref()
+                    .is_some_and(|current| !current.same_target(&device));
+                if different_target {
+                    return Err(ZcodeError::of(codes::CONFLICT));
+                }
                 return Ok(inner.view.clone());
             }
         }
@@ -323,6 +419,8 @@ impl RelayClient {
         let connecting = self.shared.begin_attempt(&device);
         let generation = connecting.generation;
         self.shared.announce_connecting(connecting).await;
+        // 升级 + 握手共用的绝对预算；任何一步超时都按同一终态收口。
+        let connect_deadline = Instant::now() + self.shared.timing.connect_timeout;
 
         // 1) 每次连接现取一次性 terminal token（不缓存、用后即弃）。
         let token_result = self.shared.auth.terminal_token().await;
@@ -354,11 +452,8 @@ impl RelayClient {
         drop(token);
 
         // 3) WS 升级（有界等待；原始错误可能含 URL，一律丢弃只映射常量码）。
-        let connected = tokio::time::timeout(
-            self.shared.timing.connect_timeout,
-            tokio_tungstenite::connect_async(url),
-        )
-        .await;
+        let connected =
+            tokio::time::timeout_at(connect_deadline, tokio_tungstenite::connect_async(url)).await;
         let socket = match connected {
             Ok(Ok((socket, _response))) => socket,
             Ok(Err(_)) | Err(_) => {
@@ -380,10 +475,12 @@ impl RelayClient {
         let paired = Arc::new(AtomicBool::new(false));
         let (commands, commands_rx) = mpsc::channel(8);
         let (shutdown, shutdown_rx) = oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
         let live = Arc::new(LiveConnection {
             paired: paired.clone(),
             commands,
             shutdown: Mutex::new(Some(shutdown)),
+            closed: closed_rx,
         });
         if !self.shared.install_live(generation, live.clone()) {
             live.signal_shutdown();
@@ -402,89 +499,139 @@ impl RelayClient {
             commands: commands_rx,
             shutdown: shutdown_rx,
             handshake: Some(handshake),
+            closed: Some(closed_tx),
+            terminal: false,
         }));
 
-        // 5) 等握手结果；代际在返回前再核一次（旧结果不得覆盖新状态）。
-        match handshake_rx.await {
-            Ok(HandshakeOutcome::Established(view)) => {
+        // 5) 等握手结果（握手总预算与升级共用 deadline）；返回前再核一次代际。
+        match tokio::time::timeout_at(connect_deadline, handshake_rx).await {
+            Ok(Ok(HandshakeOutcome::Established(view))) => {
                 if !self.shared.is_current(generation) {
                     return Err(ZcodeError::of(codes::STALE_GENERATION));
                 }
                 Ok(view)
             }
-            Ok(HandshakeOutcome::Failed(err)) => {
+            Ok(Ok(HandshakeOutcome::Failed(err))) => {
                 if !self.shared.is_current(generation) {
                     return Err(ZcodeError::of(codes::STALE_GENERATION));
                 }
                 Err(err)
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 if !self.shared.is_current(generation) {
                     Err(ZcodeError::of(codes::STALE_GENERATION))
                 } else {
                     Err(ZcodeError::offline())
                 }
             }
+            Err(_) => {
+                // 握手上限：先停 actor 并等它关闭旧 socket，再按 offline 终态收口，
+                // 避免紧随的重连与旧 owner 重叠被官方 KICK，也避免悬在 connecting。
+                let live = { self.shared.lock().live.take() };
+                if let Some(live) = &live {
+                    live.signal_shutdown();
+                }
+                self.shared
+                    .fail_attempt(generation, ConnectionState::Offline, codes::OFFLINE)
+                    .await;
+                if let Some(live) = live {
+                    let _ = live.wait_closed(self.shared.timing.shutdown_wait).await;
+                }
+                if !self.shared.is_current(generation) {
+                    return Err(ZcodeError::of(codes::STALE_GENERATION));
+                }
+                Err(ZcodeError::offline())
+            }
         }
     }
 
     /// 发送一条 `data` 帧；仅 `matched` 后允许，未配对返回错误且不写帧。
     pub async fn send_data(&self, payload: Value) -> ZResult<()> {
-        let live = {
+        let (live, generation) = {
             let inner = self.shared.lock();
             match &inner.live {
                 Some(live)
                     if inner.view.state == ConnectionState::Paired
                         && live.paired.load(Ordering::SeqCst) =>
                 {
-                    live.clone()
+                    (live.clone(), inner.generation)
                 }
                 _ => return Err(ZcodeError::of(codes::NOT_READY)),
             }
         };
         let (reply, reply_rx) = oneshot::channel();
-        if live
-            .commands
-            .send(Command::SendData { payload, reply })
-            .await
-            .is_err()
+        // 有界写：排队 + 回执共享同一上限。半开/拥塞的连接任务可能长时间停在
+        // socket 写上；调用方必须拿到真实的 `offline` 终态，而不是无限挂起或
+        // 伪装 `not_ready`（T1.2：任何写失败都是离线终态，零自动重发）。
+        let deadline = tokio::time::Instant::now() + self.shared.timing.send_timeout;
+        if tokio::time::timeout_at(
+            deadline,
+            live.commands.send(Command::SendData {
+                generation,
+                payload,
+                reply,
+            }),
+        )
+        .await
+        .is_err()
         {
             return Err(ZcodeError::offline());
         }
-        match reply_rx.await {
-            Ok(result) => result,
+        match tokio::time::timeout_at(deadline, reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ZcodeError::offline()),
             Err(_) => Err(ZcodeError::offline()),
         }
     }
 
     /// 显式断开：推进 generation、取消所有计时器并关闭 socket；无自动重连。
     ///
-    /// 不等待 `connect` 的单飞锁，因此即使连接流程正卡在网络等待也能立即返回；
-    /// 在途结果随后因代际不符被丢弃。
+    /// 不等待 `connect` 的单飞锁（若连接仍停在 WS 升级前的握手，`live` 尚未登记，立即返回）；
+    /// 已登记活连接时**有界等待 actor 收尸**（生产 15s）后才返回，保证紧接着的 `connect`
+    /// 不会与尚未关闭的旧 socket 重叠。只有状态真正变化（非 `offline`）时才发 State 事件。
     pub async fn disconnect(&self) {
         let live = {
             let _emit = self.shared.emit_lock.lock().await;
-            let (view, live) = {
+            let (previous_state, view, live) = {
                 let mut inner = self.shared.lock();
+                let previous_state = inner.view.state;
                 inner.generation = inner.generation.wrapping_add(1);
                 inner.view.state = ConnectionState::Offline;
                 inner.view.reason_code = None;
                 inner.view.generation = inner.generation;
-                (inner.view.clone(), inner.live.take())
+                (previous_state, inner.view.clone(), inner.live.take())
             };
             if let Some(live) = &live {
                 live.signal_shutdown();
             }
-            let _ = self.shared.events.send(RelayEvent::State(view)).await;
+            if previous_state != ConnectionState::Offline {
+                // 非阻塞：事件泵停摆不得拖住断开；消费方以当前视图兜底。
+                let _ = self.shared.events.try_send(RelayEvent::State(view));
+            }
             live
         };
-        drop(live);
+        if let Some(live) = live {
+            let _ = live.wait_closed(self.shared.timing.shutdown_wait).await;
+        }
     }
 
     /// 测试用当前视图（生产消费方走事件/上层 `connection()`）。
     #[cfg(test)]
     fn view(&self) -> ConnectionView {
         self.shared.current_view()
+    }
+
+    /// 测试观测：已退出的 connection actor 数。
+    #[cfg(test)]
+    fn actors_finished(&self) -> usize {
+        self.shared.actor_exits.load(Ordering::SeqCst)
+    }
+}
+
+/// 桥接域的窄端口实现：只暴露 `send_data`（未配对 → 冻结码 `not_ready`，零写帧）。
+impl RelaySink for RelayClient {
+    fn send_data(&self, payload: Value) -> futures::future::BoxFuture<'_, ZResult<()>> {
+        Box::pin(async move { RelayClient::send_data(self, payload).await })
     }
 }
 
@@ -503,7 +650,7 @@ impl Shared {
         self.lock().view.clone()
     }
 
-    /// 开始一次新连接：推进代际、登记 `connecting` 视图、停掉任何遗留活连接。
+    /// 开始一次新连接：推进代际、登记 `connecting` 视图与目标、停掉任何遗留活连接。
     fn begin_attempt(&self, device: &DeviceRoute) -> ConnectionView {
         let mut inner = self.lock();
         inner.generation = inner.generation.wrapping_add(1);
@@ -514,6 +661,7 @@ impl Shared {
             device_label: device.label.clone(),
         };
         inner.view = view.clone();
+        inner.route = Some(device.clone());
         if let Some(previous) = inner.live.take() {
             previous.signal_shutdown();
         }
@@ -537,6 +685,8 @@ impl Shared {
     }
 
     /// 发出 `connecting` 事件（若代际/视图已被更新的动作取代则丢弃）。
+    ///
+    /// 非阻塞：队列满时丢事件（lag），消费方以当前视图 GET 兜底。
     async fn announce_connecting(&self, view: ConnectionView) {
         let _emit = self.emit_lock.lock().await;
         {
@@ -545,10 +695,12 @@ impl Shared {
                 return;
             }
         }
-        let _ = self.events.send(RelayEvent::State(view)).await;
+        let _ = self.events.try_send(RelayEvent::State(view));
     }
 
     /// 线性化状态更新与事件发送；只有状态真的变化才发事件。
+    ///
+    /// 发送为 `try_send`：事件泵停摆只造成丢事件，不得把 actor/`connect`/`disconnect` 挂死。
     async fn transition_state(
         &self,
         generation: u64,
@@ -574,7 +726,7 @@ impl Shared {
             }
             inner.view.clone()
         };
-        let _ = self.events.send(RelayEvent::State(view)).await;
+        let _ = self.events.try_send(RelayEvent::State(view));
         true
     }
 
@@ -587,7 +739,7 @@ impl Shared {
                 return;
             }
         }
-        let _ = self.events.send(RelayEvent::Data(payload)).await;
+        let _ = self.events.try_send(RelayEvent::Data(payload));
     }
 
     async fn fail_attempt(&self, generation: u64, state: ConnectionState, reason: &str) {
@@ -597,8 +749,19 @@ impl Shared {
 }
 
 impl ConnectionTask {
-    /// 写一条已配对的数据帧（actor 内复核 paired，避免 check-then-write 漂移）。
-    async fn send_data_frame(&mut self, payload: Value, matched: bool) -> ZResult<()> {
+    /// 写一条已配对的数据帧（actor 内复核代际与 paired，避免 check-then-write 漂移）。
+    ///
+    /// 命令携带 `send_data` 捕获的代际；actor 在真正写帧前复核「代际未变且仍为当前连接」，
+    /// 断开/换代后到达的旧命令一律丢帧（`stale_generation`），不得污染新目标。
+    async fn send_data_frame(
+        &mut self,
+        generation: u64,
+        payload: Value,
+        matched: bool,
+    ) -> ZResult<()> {
+        if generation != self.generation || !self.shared.is_current(generation) {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
         if !matched || !self.paired.load(Ordering::SeqCst) {
             return Err(ZcodeError::of(codes::NOT_READY));
         }
@@ -607,9 +770,25 @@ impl ConnectionTask {
             "payload": payload,
             "client_ts": now_secs(),
         });
-        send_json(&mut self.sink, &frame)
-            .await
-            .map_err(|_| ZcodeError::offline())
+        match tokio::time::timeout(
+            self.shared.timing.send_timeout,
+            send_json(&mut self.sink, &frame),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(())) | Err(_) => {
+                // 写失败/写超时（半开 WS）：离线终态，actor 退出，绝不继续排队。
+                self.terminal = true;
+                self.fail(
+                    ConnectionState::Offline,
+                    codes::OFFLINE,
+                    ZcodeError::offline(),
+                )
+                .await;
+                Err(ZcodeError::offline())
+            }
+        }
     }
 
     /// 终态收口：置非配对、上报冻结状态、唤醒 connect、清活连接、关 socket。
@@ -641,6 +820,10 @@ impl ConnectionTask {
 
 /// 连接 actor：独占 socket、心跳与全部计时器；任何出口都终态且不重连。
 async fn run_connection(mut task: ConnectionTask) {
+    // 退出信号覆盖所有 return/panic 路径；后声明的 `_exit` 先 drop，保证计数先于通知。
+    let _closed = task.closed.take().map(ClosedSignal);
+    #[cfg(test)]
+    let _exit = ActorExitGuard(task.shared.clone());
     let generation = task.generation;
     // 任务真正开跑前再核一次代际：spawn 与断开竞态时不得再发 auth_init。
     if !task.shared.is_current(generation) {
@@ -658,7 +841,7 @@ async fn run_connection(mut task: ConnectionTask) {
         },
         "client_ts": now_secs(),
     });
-    if send_json(&mut task.sink, &auth_init).await.is_err() {
+    if !send_json_bounded(&task.shared, &mut task.sink, &auth_init).await {
         task.fail(
             ConnectionState::Offline,
             codes::OFFLINE,
@@ -717,7 +900,7 @@ async fn run_connection(mut task: ConnectionTask) {
                     "type": "pair_status_query",
                     "client_ts": now_secs(),
                 });
-                if send_json(&mut task.sink, &query).await.is_err() {
+                if !send_json_bounded(&task.shared, &mut task.sink, &query).await {
                     task.fail(
                         ConnectionState::Offline,
                         codes::OFFLINE,
@@ -747,9 +930,13 @@ async fn run_connection(mut task: ConnectionTask) {
             }
             command = task.commands.recv() => {
                 match command {
-                    Some(Command::SendData { payload, reply }) => {
-                        let result = task.send_data_frame(payload, session.matched).await;
+                    Some(Command::SendData { generation, payload, reply }) => {
+                        let result = task.send_data_frame(generation, payload, session.matched).await;
                         let _ = reply.send(result);
+                        if task.terminal {
+                            // 写失败已收口为离线终态：actor 不再消费任何命令。
+                            return;
+                        }
                     }
                     None => {
                         close_ws_sink(&mut task.sink).await;
@@ -789,8 +976,18 @@ async fn handle_incoming(
     session: &mut SessionState,
 ) -> bool {
     let value = match message {
-        Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).ok(),
-        Message::Binary(bytes) => serde_json::from_slice::<Value>(&bytes).ok(),
+        Message::Text(text) => {
+            if text.len() > MAX_INBOUND_FRAME_BYTES {
+                return reject_oversized(task).await;
+            }
+            serde_json::from_str::<Value>(text.as_str()).ok()
+        }
+        Message::Binary(bytes) => {
+            if bytes.len() > MAX_INBOUND_FRAME_BYTES {
+                return reject_oversized(task).await;
+            }
+            serde_json::from_slice::<Value>(&bytes).ok()
+        }
         Message::Ping(payload) => {
             let _ = task.sink.send(Message::Pong(payload)).await;
             return true;
@@ -951,6 +1148,17 @@ async fn handle_incoming(
     true
 }
 
+/// 入站帧超限：冻结码 `unsupported_protocol` 终态并关闭连接（零 Data 上报）。
+async fn reject_oversized(task: &mut ConnectionTask) -> bool {
+    task.fail(
+        ConnectionState::Unknown,
+        codes::UNSUPPORTED_PROTOCOL,
+        ZcodeError::of(codes::UNSUPPORTED_PROTOCOL),
+    )
+    .await;
+    false
+}
+
 fn next_wake(session: &SessionState) -> Option<Instant> {
     if !session.authenticated {
         return session.auth_deadline;
@@ -1011,8 +1219,17 @@ async fn send_json(sink: &mut WsSink, value: &Value) -> Result<(), ()> {
     sink.send(Message::Text(text.into())).await.map_err(|_| ())
 }
 
+/// 有上限的控制帧写（auth_init/心跳）；半开连接必须在 `send_timeout` 内失败。
+async fn send_json_bounded(shared: &Shared, sink: &mut WsSink, value: &Value) -> bool {
+    matches!(
+        tokio::time::timeout(shared.timing.send_timeout, send_json(sink, value)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// 关闭 socket 也必须有界：半开连接上的 Close 同样可能永久阻塞。
 async fn close_ws_sink(sink: &mut WsSink) {
-    let _ = sink.send(Message::Close(None)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), sink.send(Message::Close(None))).await;
 }
 
 async fn close_ws(mut socket: WsStream) {
@@ -1085,6 +1302,36 @@ mod tests {
         }
     }
 
+    fn route_for(sid: &str, mid: Option<&str>, label: &str) -> DeviceRoute {
+        DeviceRoute {
+            sid: sid.to_string(),
+            mid: mid.map(str::to_string),
+            label: Some(label.to_string()),
+        }
+    }
+
+    /// 原始 WS（不经过 RelayClient）：用于直接驱动 actor 路径与 owner 模型自检。
+    async fn raw_auth_socket(origin: &str, sid: &str) -> WsStream {
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+            "{origin}{OFFICIAL_RELAY_WS_PATH}?token=synthetic"
+        ))
+        .await
+        .expect("raw socket");
+        socket
+            .send(Message::text(
+                json!({
+                    "type": "auth_init",
+                    "device_sid": sid,
+                    "meta": {"platform": "tuvis", "version": "0", "name": "test"},
+                    "client_ts": now_secs(),
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("raw auth_init");
+        socket
+    }
+
     fn fast_timing(
         heartbeat_interval: Duration,
         ack_timeout: Duration,
@@ -1096,6 +1343,8 @@ mod tests {
             ack_timeout,
             pair_window,
             connect_timeout: Duration::from_secs(2),
+            shutdown_wait: Duration::from_secs(2),
+            send_timeout: Duration::from_secs(2),
         }
     }
 
@@ -1372,7 +1621,11 @@ mod tests {
         close_after_match: bool,
         data_before_ack: Option<Value>,
         data_after_match: Option<Value>,
+        /// 配对后立即下发一条超过入站上限的帧（字节数，不含 JSON 信封）。
+        oversized_after_match: Option<usize>,
         ack_gate: Option<Arc<Semaphore>>,
+        /// 配对后停止读取（半开连接：客户端写 socket 会阻塞）。
+        stall_after_match: bool,
     }
 
     impl Default for RelayScript {
@@ -1385,7 +1638,9 @@ mod tests {
                 close_after_match: false,
                 data_before_ack: None,
                 data_after_match: None,
+                oversized_after_match: None,
                 ack_gate: None,
+                stall_after_match: false,
             }
         }
     }
@@ -1398,6 +1653,11 @@ mod tests {
         client_frames: Vec<Value>,
         heartbeats: usize,
         data_payloads: Vec<Value>,
+        /// 单 owner 模型：sid → 当前持有 socket 的连接 id。
+        owner: HashMap<String, u64>,
+        next_connection_id: u64,
+        /// 因旧 owner 尚未关闭而被拒的新连接数（官方 KICK 行为）。
+        kicks_sent: usize,
     }
 
     struct FakeRelay {
@@ -1426,6 +1686,9 @@ mod tests {
                 client_frames: Vec::new(),
                 heartbeats: 0,
                 data_payloads: Vec::new(),
+                owner: HashMap::new(),
+                next_connection_id: 0,
+                kicks_sent: 0,
             }));
             let task = tokio::spawn(serve_relay(listener, state.clone()));
             Self {
@@ -1463,6 +1726,26 @@ mod tests {
 
         fn data_payloads(&self) -> Vec<Value> {
             self.state.lock().unwrap().data_payloads.clone()
+        }
+
+        fn kicks_sent(&self) -> usize {
+            self.state.lock().unwrap().kicks_sent
+        }
+    }
+
+    /// 单 owner 模型的持有者登记：socket 任务结束时释放（模拟官方「旧连接关闭后才允许新连接」）。
+    struct OwnerGuard {
+        state: Arc<Mutex<RelayState>>,
+        sid: String,
+        connection_id: u64,
+    }
+
+    impl Drop for OwnerGuard {
+        fn drop(&mut self) {
+            let mut state = self.state.lock().unwrap();
+            if state.owner.get(&self.sid) == Some(&self.connection_id) {
+                state.owner.remove(&self.sid);
+            }
         }
     }
 
@@ -1543,6 +1826,33 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+
+        // 单 owner：同 sid 的新连接在旧 socket 关闭前一律被拒（官方 KICKED 行为）。
+        // 这条模型让「disconnect 后立即 connect」的重叠窗口可以被测试捕获。
+        let connection_id = {
+            let mut state = state.lock().unwrap();
+            state.next_connection_id += 1;
+            let id = state.next_connection_id;
+            if state.owner.contains_key(&sid) {
+                state.kicks_sent += 1;
+                None
+            } else {
+                state.owner.insert(sid.clone(), id);
+                Some(id)
+            }
+        };
+        let Some(connection_id) = connection_id else {
+            send_server_json(&mut socket, &json!({"type": "error", "code": "KICKED"})).await;
+            close_server_socket(&mut socket).await;
+            state.lock().unwrap().connections_closed += 1;
+            return;
+        };
+        let _owner = OwnerGuard {
+            state: state.clone(),
+            sid: sid.clone(),
+            connection_id,
+        };
+
         let script = state.lock().unwrap().script.clone();
 
         if let Some(payload) = script.data_before_ack.clone() {
@@ -1580,6 +1890,11 @@ mod tests {
             }
         };
         if matched {
+            if let Some(size) = script.oversized_after_match {
+                let blob = "x".repeat(size);
+                let frame = json!({"type": "data", "payload": {"blob": blob}});
+                send_server_json(&mut socket, &frame).await;
+            }
             if let Some(payload) = script.data_after_match.clone() {
                 send_server_json(&mut socket, &json!({"type": "data", "payload": payload})).await;
             }
@@ -1588,6 +1903,11 @@ mod tests {
                 state.lock().unwrap().connections_closed += 1;
                 return;
             }
+        }
+
+        if matched && script.stall_after_match {
+            // 半开连接：socket 保持打开但不再读取（客户端写满缓冲后阻塞）。
+            std::future::pending::<()>().await;
         }
 
         let mut heartbeat_count = 0usize;
@@ -2480,6 +2800,8 @@ mod tests {
         assert_eq!(timing.heartbeat_jitter, Duration::from_millis(1_000));
         assert_eq!(timing.ack_timeout, Duration::from_millis(15_000));
         assert_eq!(timing.pair_window, Duration::from_secs(30));
+        assert_eq!(timing.connect_timeout, Duration::from_millis(15_000));
+        assert_eq!(timing.shutdown_wait, Duration::from_millis(15_000));
         for _ in 0..64 {
             let delay = jittered_heartbeat_delay(&timing);
             assert!(delay >= Duration::from_millis(4_000));
@@ -2598,5 +2920,453 @@ mod tests {
         let client_ts = data_frame["client_ts"].as_u64().expect("data client_ts");
         assert!(client_ts < 10_000_000_000);
         client.disconnect().await;
+    }
+
+    // ───────────────────────── 修复轮 1：owner／活性／上限回归 ─────────────────────────
+
+    /// 已有活连接时换目标：必须 conflict（零新 socket、零新 token），显式断开后才能连。
+    #[tokio::test]
+    async fn route_mismatch_requires_explicit_disconnect() {
+        let fake_auth = FakeAuthHttp::start().await;
+        fake_auth.set_tokens(&[SYNTHETIC_TOKEN_1, SYNTHETIC_TOKEN_2]);
+        let auth = authorized_service(&fake_auth).await;
+        let fake_relay = FakeRelay::start(RelayScript {
+            heartbeat: HeartbeatReply::Matched,
+            ..RelayScript::default()
+        })
+        .await;
+        let gate = fake_relay.hold_ack();
+        let (events, log) = EventLog::start();
+        let client = Arc::new(relay_client_with_timing(
+            auth,
+            events,
+            &fake_relay.origin,
+            fast_timing(
+                Duration::from_millis(10),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            ),
+        ));
+
+        let route_a = route_for(SYNTHETIC_SID, Some(SYNTHETIC_MID), "Device A");
+        let route_b = route_for("synthetic-sid-0002", Some(SYNTHETIC_MID), "Device B");
+
+        // A 握手在途（ack 被挂起）：B 必须被单飞锁挡住，不得插队。
+        let first = tokio::spawn({
+            let client = client.clone();
+            let route_a = route_a.clone();
+            async move { client.connect(route_a).await }
+        });
+        wait_until(
+            || {
+                fake_relay.sockets_opened() == 1
+                    && fake_relay
+                        .client_frames()
+                        .iter()
+                        .any(|frame| frame.get("type").and_then(Value::as_str) == Some("auth_init"))
+            },
+            "A 握手在途",
+        )
+        .await;
+        let second = tokio::spawn({
+            let client = client.clone();
+            let route_b = route_b.clone();
+            async move { client.connect(route_b).await }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!second.is_finished(), "同 role 单飞：A 握手期间 B 不得插队");
+
+        gate.add_permits(1);
+        let first_view = first.await.expect("任务不应 panic").expect("A 应建立连接");
+        assert_eq!(first_view.state, ConnectionState::Connecting);
+        let err = second
+            .await
+            .expect("任务不应 panic")
+            .expect_err("换目标必须显式 disconnect");
+        assert_eq!(err.code, codes::CONFLICT);
+        assert_eq!(fake_relay.sockets_opened(), 1, "换目标不得开新 socket");
+        assert_eq!(fake_auth.token_count(), 1, "换目标不得取新 token");
+        assert_eq!(client.view().device_label.as_deref(), Some("Device A"));
+
+        // A 经心跳升级为 Paired 后，换目标仍然是 conflict（A 原样保留且可用）。
+        log.wait_state(|view| view.is_paired(), "A paired").await;
+        let err = client
+            .connect(route_b.clone())
+            .await
+            .expect_err("已配对时换目标同样必须先断开");
+        assert_eq!(err.code, codes::CONFLICT);
+        assert_eq!(fake_relay.sockets_opened(), 1);
+        assert_eq!(fake_auth.token_count(), 1);
+        client
+            .send_data(json!({"target": "A"}))
+            .await
+            .expect("A 仍可发数据");
+        wait_until(|| fake_relay.data_payloads().len() == 1, "A 数据帧").await;
+
+        // 显式断开后，B 才能建立连接。
+        client.disconnect().await;
+        gate.add_permits(1);
+        let b_view = client.connect(route_b).await.expect("断开后 B 应可连接");
+        assert_eq!(b_view.device_label.as_deref(), Some("Device B"));
+        assert_eq!(fake_relay.sockets_opened(), 2);
+        assert_eq!(fake_auth.token_count(), 2);
+        client.disconnect().await;
+    }
+
+    /// disconnect 必须等 actor 收尸：紧随的 connect 不得与旧 socket 重叠而被官方 KICK。
+    #[tokio::test]
+    async fn disconnect_then_connect_does_not_race_owner() {
+        let fake_auth = FakeAuthHttp::start().await;
+        fake_auth.set_tokens(&[SYNTHETIC_TOKEN_1, SYNTHETIC_TOKEN_2]);
+        let auth = authorized_service(&fake_auth).await;
+        let fake_relay = FakeRelay::start(RelayScript {
+            handshake: HandshakeMode::Matched,
+            ..RelayScript::default()
+        })
+        .await;
+        let (events, _log) = EventLog::start();
+        let client = relay_client(auth, events, &fake_relay.origin);
+
+        assert!(client
+            .connect(route(Some(SYNTHETIC_MID)))
+            .await
+            .expect("首连")
+            .is_paired());
+        client.disconnect().await;
+        assert_eq!(
+            client.actors_finished(),
+            1,
+            "disconnect 返回时旧 actor 必须已退出（旧 socket 已关闭）"
+        );
+
+        let second = client
+            .connect(route(Some(SYNTHETIC_MID)))
+            .await
+            .expect("断开后立即重连");
+        assert!(second.is_paired(), "重连不得被旧 owner KICK");
+        assert_eq!(fake_relay.kicks_sent(), 0);
+        assert_eq!(fake_relay.sockets_opened(), 2);
+        client.disconnect().await;
+    }
+
+    /// fake 单 owner 模型自检：同 sid 旧 socket 未关闭时，新 socket 必须被 KICKED。
+    #[tokio::test]
+    async fn fake_single_owner_kicks_second_socket() {
+        let fake_relay = FakeRelay::start(RelayScript::default()).await;
+        let mut first = raw_auth_socket(&fake_relay.origin, SYNTHETIC_SID).await;
+        let ack = tokio::time::timeout(Duration::from_secs(2), first.next())
+            .await
+            .expect("首条 ack 超时")
+            .expect("首条帧")
+            .expect("首条帧可读");
+        let ack = json_message(ack).expect("auth_ack 是 JSON");
+        assert_eq!(ack["type"], "auth_ack");
+
+        let mut second = raw_auth_socket(&fake_relay.origin, SYNTHETIC_SID).await;
+        let kicked = tokio::time::timeout(Duration::from_secs(2), second.next())
+            .await
+            .expect("第二条应被拒")
+            .expect("第二条帧")
+            .expect("第二条帧可读");
+        let kicked = json_message(kicked).expect("error 帧是 JSON");
+        assert_eq!(kicked["type"], "error");
+        assert_eq!(kicked["code"], "KICKED");
+        assert_eq!(fake_relay.kicks_sent(), 1);
+    }
+
+    /// 事件消费者停摆（队列满且无人消费）时，connect/disconnect 必须仍有界返回。
+    #[tokio::test]
+    async fn stalled_event_consumer_does_not_block_connect() {
+        let fake_auth = FakeAuthHttp::start().await;
+        let auth = authorized_service(&fake_auth).await;
+        let fake_relay = FakeRelay::start(RelayScript {
+            handshake: HandshakeMode::Matched,
+            ..RelayScript::default()
+        })
+        .await;
+        // 容量 1 且保留接收端不消费：第二条事件必然满队。
+        let (events, _receiver) = mpsc::channel(1);
+        let client = relay_client(auth, events, &fake_relay.origin);
+
+        let view = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.connect(route(Some(SYNTHETIC_MID))),
+        )
+        .await
+        .expect("事件消费者停摆不得阻塞 connect")
+        .expect("connect 应成功");
+        assert!(view.is_paired());
+
+        tokio::time::timeout(Duration::from_secs(2), client.disconnect())
+            .await
+            .expect("事件消费者停摆不得阻塞 disconnect");
+        assert_eq!(client.view().state, ConnectionState::Offline);
+    }
+
+    /// 超过 1MiB 的入站帧在 JSON 解析前拒绝：unsupported_protocol 终态、零 Data。
+    #[tokio::test]
+    async fn oversized_inbound_frame_is_rejected() {
+        let fake_auth = FakeAuthHttp::start().await;
+        let auth = authorized_service(&fake_auth).await;
+        let fake_relay = FakeRelay::start(RelayScript {
+            handshake: HandshakeMode::Matched,
+            oversized_after_match: Some(MAX_INBOUND_FRAME_BYTES + 4096),
+            ..RelayScript::default()
+        })
+        .await;
+        let (events, log) = EventLog::start();
+        let client = relay_client(auth, events, &fake_relay.origin);
+
+        client
+            .connect(route(Some(SYNTHETIC_MID)))
+            .await
+            .expect("握手本身应完成");
+        let rejected = log
+            .wait_state(
+                |view| view.reason_code.as_deref() == Some(codes::UNSUPPORTED_PROTOCOL),
+                "超限帧拒绝",
+            )
+            .await;
+        assert_eq!(rejected.state, ConnectionState::Unknown);
+        wait_until(|| fake_relay.connections_closed() >= 1, "超限后关闭 socket").await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(log.data().is_empty(), "超限帧不得上报 Data");
+    }
+
+    /// 写 data 帧前复核代际：断开推进代际后，旧代际捕获的写必须被丢弃。
+    #[tokio::test]
+    async fn send_path_rechecks_generation_before_write() {
+        let fake_auth = FakeAuthHttp::start().await;
+        fake_auth.set_tokens(&[SYNTHETIC_TOKEN_1, SYNTHETIC_TOKEN_2]);
+        let auth = authorized_service(&fake_auth).await;
+        let fake_relay = FakeRelay::start(RelayScript {
+            handshake: HandshakeMode::Matched,
+            ..RelayScript::default()
+        })
+        .await;
+        let (events, _log) = EventLog::start();
+        let client = relay_client(auth, events, &fake_relay.origin);
+
+        assert!(client
+            .connect(route(Some(SYNTHETIC_MID)))
+            .await
+            .expect("matched 应建立连接")
+            .is_paired());
+        client.disconnect().await;
+        let generation = client.view().generation;
+
+        // 用一条独立 socket（不同 sid，避免 owner 干扰）直接驱动 actor 写路径。
+        let raw_sid = "synthetic-sid-raw";
+        let socket = raw_auth_socket(&fake_relay.origin, raw_sid).await;
+        let (sink, source) = socket.split();
+        let (commands, commands_rx) = mpsc::channel(1);
+        let (_shutdown, shutdown_rx) = oneshot::channel();
+        let mut task = ConnectionTask {
+            shared: client.shared.clone(),
+            sink,
+            source,
+            device: route_for(raw_sid, None, "Raw"),
+            generation,
+            paired: Arc::new(AtomicBool::new(true)),
+            commands: commands_rx,
+            shutdown: shutdown_rx,
+            handshake: None,
+            closed: None,
+            terminal: false,
+        };
+        let _commands = commands;
+
+        task.send_data_frame(generation, json!({"seq": 1}), true)
+            .await
+            .expect("当前代际应写出");
+        wait_until(|| fake_relay.data_payloads().len() == 1, "当前代际 data").await;
+
+        client.disconnect().await; // 推进代际（无 live，只换代）
+        assert!(client.view().generation > generation);
+        let err = task
+            .send_data_frame(generation, json!({"seq": 2}), true)
+            .await
+            .expect_err("旧代际必须丢帧");
+        assert_eq!(err.code, codes::STALE_GENERATION);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(fake_relay.data_payloads().len(), 1, "旧代际不得写帧");
+    }
+
+    /// 已配对后收到 KICKED：Conflict 终态、零重连、心跳停止。
+    #[tokio::test]
+    async fn paired_kick_is_terminal_and_stops_heartbeats() {
+        let fake_auth = FakeAuthHttp::start().await;
+        let auth = authorized_service(&fake_auth).await;
+        let fake_relay = FakeRelay::start(RelayScript {
+            handshake: HandshakeMode::Matched,
+            kick_after_heartbeats: Some(2),
+            ..RelayScript::default()
+        })
+        .await;
+        let (events, log) = EventLog::start();
+        let client = relay_client_with_timing(
+            auth,
+            events,
+            &fake_relay.origin,
+            fast_timing(
+                Duration::from_millis(10),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            ),
+        );
+
+        assert!(client
+            .connect(route(Some(SYNTHETIC_MID)))
+            .await
+            .expect("matched 应建立连接")
+            .is_paired());
+        let conflict = log
+            .wait_state(
+                |view| view.state == ConnectionState::Conflict,
+                "paired KICKED",
+            )
+            .await;
+        assert_eq!(conflict.reason_code.as_deref(), Some(codes::CONFLICT));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let heartbeats_at_close = fake_relay.heartbeats();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            fake_relay.heartbeats(),
+            heartbeats_at_close,
+            "KICKED 后心跳必须停止"
+        );
+        assert_eq!(fake_relay.sockets_opened(), 1, "KICKED 零自动重连");
+        wait_until(
+            || fake_relay.connections_closed() >= 1,
+            "KICKED 后关闭 socket",
+        )
+        .await;
+    }
+
+    /// 重复 disconnect 只在状态真正变化时发 State（不得重复 Offline）。
+    #[tokio::test]
+    async fn repeated_disconnect_emits_single_offline() {
+        let fake_auth = FakeAuthHttp::start().await;
+        let auth = authorized_service(&fake_auth).await;
+        let fake_relay = FakeRelay::start(RelayScript::default()).await;
+        let (events, log) = EventLog::start();
+        let client = relay_client(auth, events, &fake_relay.origin);
+
+        let before = client
+            .connect(route(Some(SYNTHETIC_MID)))
+            .await
+            .expect("waiting 应建立连接");
+        client.disconnect().await;
+        client.disconnect().await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let offline_states = log
+            .states()
+            .into_iter()
+            .filter(|view| view.state == ConnectionState::Offline)
+            .count();
+        assert_eq!(offline_states, 1, "重复断开不得重复发 Offline");
+        assert_eq!(
+            client.view().generation,
+            before.generation + 2,
+            "每次断开仍推进代际"
+        );
+        assert_eq!(fake_relay.sockets_opened(), 1);
+    }
+
+    /// 握手上限：对端不 ack 时 connect 有界失败并落 Offline 终态，绝不悬在 connecting。
+    #[tokio::test]
+    async fn connect_failure_does_not_stay_connecting() {
+        let fake_auth = FakeAuthHttp::start().await;
+        let auth = authorized_service(&fake_auth).await;
+        let fake_relay = FakeRelay::start(RelayScript::default()).await;
+        let gate = fake_relay.hold_ack();
+        let (events, log) = EventLog::start();
+        let timing = RelayTiming {
+            connect_timeout: Duration::from_millis(150),
+            ..fast_timing(
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+        };
+        let client = relay_client_with_timing(auth, events, &fake_relay.origin, timing);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.connect(route(Some(SYNTHETIC_MID))),
+        )
+        .await
+        .expect("connect 不得无限挂起")
+        .expect_err("对端不 ack 必须失败");
+        assert_eq!(err.code, codes::OFFLINE);
+        assert_eq!(
+            client.view().state,
+            ConnectionState::Offline,
+            "失败后不得停在 connecting"
+        );
+        assert_eq!(client.view().reason_code.as_deref(), Some(codes::OFFLINE));
+        log.wait_state(
+            |view| view.state == ConnectionState::Offline,
+            "超时 offline",
+        )
+        .await;
+
+        gate.add_permits(1);
+        wait_until(|| fake_relay.connections_closed() >= 1, "超时后关闭 socket").await;
+        assert_eq!(fake_relay.sockets_opened(), 1);
+        tokio::time::timeout(Duration::from_secs(1), client.disconnect())
+            .await
+            .expect("失败后 disconnect 应立即返回");
+    }
+
+    /// 半开 WS：对端停止读取 → `send_data` 必须在上限内以离线终态返回，
+    /// 不得把 actor 无限挂死，也不得以 `not_ready` 冒充排队失败。
+    #[tokio::test]
+    async fn stalled_write_is_bounded_and_goes_offline() {
+        let fake_auth = FakeAuthHttp::start().await;
+        let auth = authorized_service(&fake_auth).await;
+        let fake_relay = FakeRelay::start(RelayScript {
+            handshake: HandshakeMode::Matched,
+            heartbeat: HeartbeatReply::Matched,
+            stall_after_match: true,
+            ..RelayScript::default()
+        })
+        .await;
+        let (events, log) = EventLog::start();
+        let timing = RelayTiming {
+            send_timeout: Duration::from_millis(120),
+            ..fast_timing(
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+        };
+        let client = relay_client_with_timing(auth, events, &fake_relay.origin, timing);
+        let view = client
+            .connect(route(Some(SYNTHETIC_MID)))
+            .await
+            .expect("paired");
+        assert_eq!(view.state, ConnectionState::Paired);
+
+        // 足够大，确保写满本机 socket 缓冲（对端完全不读）。
+        let payload = json!({"blob": "x".repeat(4 * 1024 * 1024)});
+        let started = Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(3), client.send_data(payload))
+            .await
+            .expect("写帧不得无限挂起")
+            .expect_err("半开连接必须失败");
+        assert!(error.is(codes::OFFLINE), "实际错误：{error:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "写超时必须及时收口"
+        );
+
+        log.wait_state(
+            |view| view.state == ConnectionState::Offline,
+            "半开写失败 → 离线终态",
+        )
+        .await;
+        assert_eq!(client.view().state, ConnectionState::Offline);
     }
 }

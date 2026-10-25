@@ -9,6 +9,9 @@
 
 use std::fmt;
 
+use futures::future::BoxFuture;
+use serde_json::Value;
+
 /// 对外错误码（冻结：不得新增、改写或本地化；HTTP error 与 capability reasonCode 共用）。
 pub mod codes {
     /// 未保存官方链接/配置不可用。
@@ -153,4 +156,199 @@ impl ConnectionView {
     pub fn is_paired(&self) -> bool {
         self.state == ConnectionState::Paired
     }
+}
+
+// ---------------------------------------------------------------------------
+// 端口：relay 发送面（T2.2 裁决的最小抽象）
+// ---------------------------------------------------------------------------
+
+/// 桥接域唯一需要的 relay 能力：把一条 `data` 帧写到已配对的 socket。
+///
+/// 生产实现 = [`RelayClient`](super::relay::RelayClient)（见 `relay.rs` 的
+/// `impl RelaySink`）：这里**只**暴露 `send_data`，桥接域因此拿到不了连接生命周期、
+/// token 或配置入口。测试用 fake 实现记录出站帧并注入应答/事件。
+pub trait RelaySink: Send + Sync {
+    /// 发送一条 `data` 帧（未配对等失败以冻结码返回，不携带底层原因）。
+    fn send_data(&self, payload: Value) -> BoxFuture<'_, ZResult<()>>;
+}
+
+// ---------------------------------------------------------------------------
+// 目标绑定（T2.2）
+// ---------------------------------------------------------------------------
+
+/// 手机可提交的目标键：只有 Tuvis 原始 sessionId（= 官方 listing `address.taskId`）。
+///
+/// workspace 路径**不接受**客户端自报：它只在 bind 时由宿主 listing 的
+/// `address.workspacePath` 解析出来，见 [`BoundTarget`]。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetKey {
+    pub session_id: String,
+}
+
+/// 精确绑定产物：只由当前代际 listing 里**精确存在且唯一**的 taskId 解析。
+///
+/// `session_id` 两种形态（`sess_<uuid>` / `session_<32hex>`）原样保留，不做任何
+/// 归一化；`workspace_path` 来自 listing 行 `address.workspacePath`；
+/// `workspace_key` 口径 = `workspaceIdentity?.trim() || workspacePath`。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundTarget {
+    pub session_id: String,
+    pub workspace_path: String,
+    pub workspace_identity: Option<String>,
+    pub workspace_key: String,
+    pub generation: u64,
+}
+
+/// pending 卡种类（官方 `PendingInteraction.kind` 三元）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PendingKind {
+    /// 权限审批（工具调用前的 allow/deny）。
+    Permission,
+    /// 问答（AskUserQuestion 等）。
+    UserInput,
+    /// workspace hook 复核。
+    WorkspaceHookReview,
+}
+
+/// 问答选项（宿主原值：`value` 是应答要回传的值，`label` 是展示文本）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionOption {
+    pub value: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub preview: Option<String>,
+}
+
+/// 单个问题（多选题 `multi_select=true`；`free_text_allowed` 来自 payload.freeText）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionView {
+    pub header: String,
+    pub question_text: String,
+    pub options: Vec<QuestionOption>,
+    pub multi_select: bool,
+    pub free_text_allowed: bool,
+}
+
+/// 权限选项（`kind` 是准入白名单依据，`option_id` 是宿主原值必须回传）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionOptionView {
+    pub option_id: String,
+    pub label: String,
+    pub kind: String,
+}
+
+/// pending 卡视图（四元组锚：session + 真实行/toolCall 锚 + interaction + generation）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingView {
+    pub interaction_id: String,
+    pub kind: PendingKind,
+    pub anchor_row_id: Option<u64>,
+    pub tool_call_id: Option<String>,
+    pub created_at: Option<u64>,
+    pub summary: Option<String>,
+    pub tool_name: Option<String>,
+    pub sensitive: bool,
+    pub auto_resolution: bool,
+    pub auto_resolution_state: Option<String>,
+    pub questions: Vec<QuestionView>,
+    pub options: Vec<PermissionOptionView>,
+}
+
+/// control 里的一条活动（`foregroundExecutionId` = stop 守卫 id 的来源）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveWork {
+    pub kind: String,
+    pub foreground_execution_id: Option<String>,
+}
+
+/// 宿主明确宣告的 control（`activeWorks` 是数组才算「已确认」，含显式空数组）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlView {
+    pub active_works: Vec<ActiveWork>,
+}
+
+/// 模型目录项（只含当前 provider）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelChoice {
+    pub model_id: String,
+    pub thought_levels: Vec<String>,
+}
+
+/// 当前模型/思考档位（snapshot.config 的只读投影）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionView {
+    pub provider: String,
+    pub model: String,
+    pub thought: Option<String>,
+    pub models: Vec<ModelChoice>,
+}
+
+/// 单个能力开关（默认关闭并带原因码；不复制 contract 的宽泛 true）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityFlag {
+    pub enabled: bool,
+    pub reason_code: Option<String>,
+}
+
+/// 本会话能力矩阵（八项固定字段；本任务默认全部关闭 = 未取得实机证据）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityView {
+    pub send: CapabilityFlag,
+    pub single_select: CapabilityFlag,
+    pub multi_select: CapabilityFlag,
+    pub free_text: CapabilityFlag,
+    pub interrupt: CapabilityFlag,
+    pub approval_reply: CapabilityFlag,
+    pub model: CapabilityFlag,
+    pub thought_level: CapabilityFlag,
+}
+
+impl Default for CapabilityView {
+    /// 默认矩阵：全部关闭且 `reasonCode=needs_evidence`（不把宽泛 true 下发手机）。
+    fn default() -> Self {
+        let flag = || CapabilityFlag {
+            enabled: false,
+            reason_code: Some(codes::NEEDS_EVIDENCE.to_owned()),
+        };
+        Self {
+            send: flag(),
+            single_select: flag(),
+            multi_select: flag(),
+            free_text: flag(),
+            interrupt: flag(),
+            approval_reply: flag(),
+            model: flag(),
+            thought_level: flag(),
+        }
+    }
+}
+
+/// 会话投影视图（手机唯一可见的会话状态面）。
+///
+/// 只包含**已按本会话 topic + 当前 subscriptionId + 当前代际**过滤后的数据；
+/// `ready=false` 表示投影不新鲜（未收到快照/缺序/协议不符），此时控制面必须零写。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionView {
+    pub session_id: String,
+    pub generation: u64,
+    pub revision: Option<u64>,
+    pub ready: bool,
+    pub pending: Vec<PendingView>,
+    pub control: Option<ControlView>,
+    pub selection: Option<SelectionView>,
+    pub capabilities: CapabilityView,
 }
