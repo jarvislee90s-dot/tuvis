@@ -338,6 +338,8 @@ type ProbeFlags = {
   sendAuthorized: boolean;
   interaction: InteractionMode | null;
   interactionAuthorized: boolean;
+  /** 用户显式指定应答会话中「已存在」的 pending 卡（跳过触发、不做触发后关联）。 */
+  existingPending: boolean;
   open: boolean;
   oauthWaitMs: number;
   jwtStdin: boolean;
@@ -358,6 +360,7 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
     sendAuthorized: false,
     interaction: null,
     interactionAuthorized: false,
+    existingPending: false,
     open: false,
     oauthWaitMs: 300_000,
     jwtStdin: false,
@@ -373,6 +376,7 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
     if (arg === "--i-know-this-connects") flags.unlock = true;
     else if (arg === "--send-authorized") flags.sendAuthorized = true;
     else if (arg === "--interaction-authorized") flags.interactionAuthorized = true;
+    else if (arg === "--existing-pending") flags.existingPending = true;
     else if (arg.startsWith("--interaction=")) {
       const value = arg.slice("--interaction=".length).trim();
       if (!INTERACTION_MODES.includes(value as InteractionMode)) {
@@ -2262,8 +2266,10 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         // （旧快照/合成夹具）时回退为「触发后出现的首张卡」（快照本身是触发后收到的）。
         const triggerSentAt = Date.now();
         const controlRevisionBaseline = book.controlRevision;
+        // --existing-pending：用户**显式指定**应答会话中已存在的卡——不做「触发后」关联，
+        // 且不触发新指令（仅 approve/reject/answer 适用；interrupt 仍需本 run 的前台执行）。
         const isFreshPending = (item: ObservedPending): boolean =>
-          item.createdAt === null || item.createdAt >= triggerSentAt;
+          parsed.existingPending || item.createdAt === null || item.createdAt >= triggerSentAt;
         const isInterrupt = interactionMode === "interrupt";
         const pendingObservation: Promise<ObservedPending | null> = isInterrupt
           ? Promise.resolve(null)
@@ -2287,23 +2293,34 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
                 INTERACTION_FOREGROUND_WAIT_MS
               )
             : Promise.resolve(null);
-        currentLoop = trigger;
-        const triggerOutcome = await trigger.run();
-        currentLoop = null;
-        bridgeId += 1;
-        bridgeSeq += 1;
-        bridgeMessageSeq += 1;
-        interaction.trigger = {
-          outcome: triggerOutcome,
-          framesSent: trigger.framesSent,
-          peerAcknowledged: trigger.peerAcknowledged,
-          triggerSentAt,
-          controlRevisionBaseline,
-        };
-        record(ctx, "interaction", "trigger", interaction.trigger);
-        log(
-          `interaction trigger = ${triggerOutcome.kind}；framesSent=${trigger.framesSent}，peerAck=${trigger.peerAcknowledged}。`
-        );
+        if (parsed.existingPending) {
+          interaction.trigger = {
+            skipped: "existing-pending-designated",
+            triggerSentAt,
+            controlRevisionBaseline,
+            note: "用户显式指定会话中已存在的 pending；不触发新指令（无触发帧）",
+          };
+          record(ctx, "interaction", "existing-pending-designated", interaction.trigger);
+          log("--existing-pending：跳过触发，直接应答会话中已存在的卡。");
+        } else {
+          currentLoop = trigger;
+          const triggerOutcome = await trigger.run();
+          currentLoop = null;
+          bridgeId += 1;
+          bridgeSeq += 1;
+          bridgeMessageSeq += 1;
+          interaction.trigger = {
+            outcome: triggerOutcome,
+            framesSent: trigger.framesSent,
+            peerAcknowledged: trigger.peerAcknowledged,
+            triggerSentAt,
+            controlRevisionBaseline,
+          };
+          record(ctx, "interaction", "trigger", interaction.trigger);
+          log(
+            `interaction trigger = ${triggerOutcome.kind}；framesSent=${trigger.framesSent}，peerAck=${trigger.peerAcknowledged}。`
+          );
+        }
 
         // 2) 宿主侧观察窗（并发启动、此处取结果；pending 卡 / 前台执行 id）；超窗如实记
         // unavailable。触发窗内落下的卡不会晚 20s 才被看见（C1 的另一半）。
