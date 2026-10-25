@@ -389,6 +389,13 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
       flags.interaction = value as InteractionMode;
     } else if (arg === "--interaction") {
       return "--interaction 需要 =<mode> 形式，例如 --interaction=approve";
+    } else if (arg.startsWith("--submission-mode=")) {
+      const value = arg.slice("--submission-mode=".length).trim();
+      const modes = ["build", "edit", "plan", "yolo", "guarded"];
+      if (!modes.includes(value)) {
+        return `--submission-mode 只接受 ${modes.join(" | ")}，收到：${value || "(空)"}`;
+      }
+      flags.submissionMode = value;
     } else if (arg === "--open") flags.open = true;
     else if (arg === "--jwt-stdin") flags.jwtStdin = true;
     else if (arg === "--help" || arg === "-h") flags.help = true;
