@@ -171,7 +171,7 @@ const BRIDGE_OPEN_TIMEOUT_MS = 10_000;
  * ChannelClient 把所有请求排在 whenInitialized 之后（channelClient.ts:124-128），
  * 桥 ChannelServer 构造即发 Initialize（channelServer.ts:29-36,45-47）。
  */
-const BRIDGE_INIT_TIMEOUT_MS = 5_000;
+const BRIDGE_INIT_TIMEOUT_MS = 15_000;
 /** bridge RPC（hello/clientHello/subscribe）单请求有界窗口。 */
 const BRIDGE_RPC_TIMEOUT_MS = 10_000;
 /** 任务枚举的退订请求有界窗口（尽力而为；失败不影响结果）。 */
