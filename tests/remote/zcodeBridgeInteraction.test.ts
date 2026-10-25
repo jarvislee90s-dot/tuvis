@@ -98,6 +98,7 @@ import {
   type ObservedPending,
 } from "../../scripts/zcode-bridge-probe/interactionBridge";
 import {
+  bridgeMessageEvidence,
   deriveProbeGuards,
   isAnswerableUserInput,
   pickPermissionOption,
@@ -1329,6 +1330,86 @@ describe("B3 修复轮：C2 判别式 / I3 选项闸 / I2 消费复活 / I4 snoo
     expect(book.size).toBe(1);
   });
 
+  it("bridge_message_evidence_never_records_raw_body：普通帧只留元数据，Initialize 只留 hex", () => {
+    const secretBody = Buffer.from("synthetic-session-body-should-not-be-evidenced");
+    const normal = bridgeMessageEvidence(
+      {
+        headerType: RESPONSE_TYPE_PROMISE_SUCCESS,
+        channelName: null,
+        method: null,
+        id: 7,
+        body: { text: secretBody.toString("utf8") },
+      },
+      secretBody
+    );
+    expect(normal).not.toHaveProperty("bodyPreview");
+    expect(normal).not.toHaveProperty("bodyHex");
+    expect(JSON.stringify(normal)).not.toContain("synthetic-session-body");
+
+    const initialize = bridgeMessageEvidence(
+      {
+        headerType: 200,
+        channelName: null,
+        method: null,
+        id: null,
+        body: null,
+      },
+      new Uint8Array([0x04, 0x01, 0x06, 0xc8, 0x01, 0x00])
+    );
+    expect(initialize.bodyHex).toBe("040106c80100");
+    expect(initialize.initialize).toBe(true);
+  });
+
+  it("host_pending_revision_confirms_terminal_clear：本地消费不算终态，宿主撤卡才是", () => {
+    const book = new PendingBook({ sessionId: FAKE_TARGET.taskId, generation: 1 });
+    const card = permissionPending({
+      interactionId: "b3-fake-terminal-1",
+      toolCallId: "b3-fake-toolcall-t",
+      anchorRowId: 9,
+    });
+    book.acceptTopicFrame(
+      topicFrame({ sessionId: FAKE_TARGET.taskId, pendingInteractions: [card] })
+    );
+    expect(book.hostHasPending("b3-fake-terminal-1")).toBe(true);
+    const revisionAtAck = book.hostPendingRevision;
+
+    book.consume("b3-fake-terminal-1");
+    expect(book.find("b3-fake-terminal-1")).toBeNull();
+    // 本地三查闸已消费，但宿主尚未宣告撤卡 → 仍是「已受理、未确认」。
+    expect(book.hostHasPending("b3-fake-terminal-1")).toBe(true);
+    expect(book.hostPendingRevision).toBe(revisionAtAck);
+
+    book.acceptTopicFrame(
+      deltasTopicFrame({
+        sessionId: FAKE_TARGET.taskId,
+        patch: { pendingInteractions: [] },
+      })
+    );
+    expect(book.hostPendingRevision).toBeGreaterThan(revisionAtAck);
+    expect(book.hostHasPending("b3-fake-terminal-1")).toBe(false);
+  });
+
+  it("foreground_execution_observation_confirms_guard_clear：stop 后守卫 id 从 control 消失才算终态", () => {
+    const book = new PendingBook({ sessionId: FAKE_TARGET.taskId, generation: 1 });
+    const control = (id: string) => ({
+      activeWorks: [{ kind: "primaryTurn", foregroundExecutionId: id, startedAt: 0 }],
+    });
+    book.acceptTopicFrame(
+      topicFrame({ sessionId: FAKE_TARGET.taskId, control: control("b3-fake-exec-terminal") })
+    );
+    expect(book.hasForegroundExecution("b3-fake-exec-terminal")).toBe(true);
+    const revisionAtAck = book.controlRevision;
+
+    book.acceptTopicFrame(
+      deltasTopicFrame({
+        sessionId: FAKE_TARGET.taskId,
+        patch: { control: { activeWorks: [] } },
+      })
+    );
+    expect(book.controlRevision).toBeGreaterThan(revisionAtAck);
+    expect(book.hasForegroundExecution("b3-fake-exec-terminal")).toBe(false);
+  });
+
   it("stop_target_only_after_trigger_revision：触发前观察到的执行 id 不被采用，触发后新 control 才可用", () => {
     const book = new PendingBook({ sessionId: FAKE_TARGET.taskId, generation: 1 });
     const control = (id: string) => ({
@@ -1399,13 +1480,13 @@ describe("B3 修复轮：C2 判别式 / I3 选项闸 / I2 消费复活 / I4 snoo
     expect(send.maxSnoozeFrames).toBe(0);
     expect(send.maxDurationMs).toBe(180_000);
 
-    for (const mode of ["approve", "reject", "answer", "interrupt"] as const) {
+    for (const mode of ["approve", "reject", "answer", "interrupt", "select"] as const) {
       const guards = deriveProbeGuards(mode);
       expect(guards.maxSendFrames).toBe(2);
       expect(guards.sendRequiresExplicitFlag).toBe(false);
       expect(guards.interactionRequiresExplicitFlag).toBe(true);
       expect(guards.maxSnoozeFrames).toBe(1);
-      expect(guards.maxDurationMs).toBe(250_000);
+      expect(guards.maxDurationMs).toBe(260_000);
     }
   });
 
