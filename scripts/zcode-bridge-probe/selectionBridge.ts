@@ -66,15 +66,33 @@ export function readConfigFromSnapshot(snapshot: unknown): SessionConfigView | n
 }
 
 /** 从 model-selection.getView() 应答解析目录（宿主值 only）。 */
-export function resolveCatalogFromView(view: unknown): CatalogEntry[] | null {
-  if (!view || typeof view !== "object") return null;
-  const providers = (view as { providers?: unknown }).providers;
+export function resolveCatalogFromView(raw: unknown): CatalogEntry[] | null {
+  if (!raw || typeof raw !== "object") return null;
+  // 官方 channel 应答可能带 {code,msg,data} 或 {result} 包装：逐层解包后找 providers。
+  const seen = new Set<unknown>();
+  let view: Record<string, unknown> | null = raw as Record<string, unknown>;
+  for (let depth = 0; view && depth < 3; depth += 1) {
+    if ("providers" in view && Array.isArray(view.providers)) break;
+    const next =
+      (view.data && typeof view.data === "object" ? view.data : null) ??
+      (view.result && typeof view.result === "object" ? view.result : null);
+    if (!next || seen.has(next)) {
+      view = null;
+      break;
+    }
+    seen.add(next);
+    view = next as Record<string, unknown>;
+  }
+  if (!view) return null;
+  const providers = view.providers;
   if (!Array.isArray(providers) || providers.length === 0) return null;
   const out: CatalogEntry[] = [];
   for (const provider of providers) {
     if (!provider || typeof provider !== "object") return null;
     const record = provider as Record<string, unknown>;
-    const providerId = asString(record.id) ?? asString(record.provider);
+    // 官方 ModelSelectionView：providers[].providerId / models[].modelId（facades.ts:183-205）。
+    const providerId =
+      asString(record.providerId) ?? asString(record.id) ?? asString(record.provider);
     const models = Array.isArray(record.models) ? record.models : [];
     if (!providerId || models.length === 0) return null;
     const modelIds: string[] = [];
@@ -82,7 +100,8 @@ export function resolveCatalogFromView(view: unknown): CatalogEntry[] | null {
     for (const model of models) {
       if (!model || typeof model !== "object") return null;
       const modelRecord = model as Record<string, unknown>;
-      const modelId = asString(modelRecord.id) ?? asString(modelRecord.model);
+      const modelId =
+        asString(modelRecord.modelId) ?? asString(modelRecord.id) ?? asString(modelRecord.model);
       if (!modelId) return null;
       modelIds.push(modelId);
       const levels =
