@@ -25,7 +25,8 @@
 //! - [`AuthService::clear`] 经授权 epoch + 取消通知让在途授权立即失效：clear 之后的迟到
 //!   回调不产生任何交换，交换已完成但 epoch 已变的 JWT 不落内存（review focus 1）。
 //! - **凭据代际**：JWT 落内存时同时登记所属 epoch；[`AuthService::terminal_token`] 带着该
-//!   epoch 走完全程——请求在途时 clear/新授权 → 结果丢弃（返回 `needs_auth`，token 不逃出）；
+//!   epoch 走完全程，并在**持锁的交接点**最终复核——请求在途/响应体读取期间 clear/新授权
+//!   → 结果丢弃（返回 `needs_auth`，token 不逃出；`clear` 返回后不可能再交出旧代 token）；
 //!   旧 JWT 的迟到 401 只允许清仍是同一代的凭据，绝不触碰新 JWT 或取消新授权。
 
 use std::collections::HashMap;
@@ -277,8 +278,9 @@ impl AuthService {
     ///
     /// 入口把 JWT 与它所属的授权 epoch **一起捕获**，此后只认这一代：
     /// - 已过期 JWT 在任何 HTTP 请求之前返回 `needs_auth`；
-    /// - 请求在途时 clear/新授权发生（epoch 已变）→ 结果作废，返回 `needs_auth`，
-    ///   relay token 绝不逃出；
+    /// - 请求在途/响应体读取期间 clear/新授权发生（epoch 已变）→ 结果作废，返回
+    ///   `needs_auth`；最终交接在状态锁内复核代际（[`Self::handoff_terminal_token`]），
+    ///   因此 `clear()` 返回后绝不可能再交出旧代的 relay token；
     /// - 401 只清仍属本代的凭据（旧 JWT 的迟到 401 不得清掉新 JWT 或取消新授权）。
     pub async fn terminal_token(&self) -> ZResult<TerminalToken> {
         let (jwt, credential_epoch) = {
@@ -319,7 +321,28 @@ impl AuthService {
             return Err(ZcodeError::offline());
         }
         let value: serde_json::Value = response.json().await.map_err(|_| ZcodeError::unknown())?;
-        relay_payload(&value)
+        // 交接点：body 解析完成后再持锁复核代际，clear/新授权一旦返回，旧结果必定作废
+        self.handoff_terminal_token(credential_epoch, &value)
+    }
+
+    /// 一次性终端 token 的**唯一交接点**：持状态锁复核凭据代际，命中才构造并返回。
+    ///
+    /// `clear()`／新授权与这里争用同一把锁，因此交接是线性化的：
+    /// - `clear()` 先拿到锁 → 本次复核看到新 epoch，返回 `needs_auth`（token 不构造、不逃出）；
+    /// - 交接先拿到锁 → `clear()` 只能在 token 构造之后返回，逻辑上晚于本次发放。
+    ///
+    /// 响应体读取（`json().await`）期间的 clear/新授权由这里兜住；构造与返回都在锁内，
+    /// 不在 guard 内做任何 await。
+    fn handoff_terminal_token(
+        &self,
+        credential_epoch: u64,
+        value: &serde_json::Value,
+    ) -> ZResult<TerminalToken> {
+        let state = self.lock_state();
+        if state.epoch != credential_epoch || state.jwt_epoch != Some(credential_epoch) {
+            return Err(ZcodeError::needs_auth());
+        }
+        relay_payload(value)
     }
 
     /// 清除账号凭据并使在途授权失效（退出/登出/401/保存新链接时调用）。
@@ -748,6 +771,16 @@ mod tests {
 
     // ───────────────────────── 本机 fake HTTP（交换 + 终端 token） ─────────────────────────
 
+    /// 终端 token 响应的两阶段闸门：先写响应头并通知 `headers_sent`，
+    /// 再等 `body_gate` 放行后才写 body（把 `clear()` 精确塞进「头已到、体未到」窗口）。
+    #[derive(Clone)]
+    struct TwoPhaseReply {
+        /// 响应头 flush 后放行一个许可（测试据此得知 headers 已交给客户端）。
+        headers_sent: Arc<Semaphore>,
+        /// 拿到许可后才写 JSON body（在此之前客户端只会停在 response body 读取上）。
+        body_gate: Arc<Semaphore>,
+    }
+
     #[derive(Clone)]
     struct FakeConfig {
         exchange_status: u16,
@@ -759,6 +792,8 @@ mod tests {
         relay_body: String,
         relay_delay: Duration,
         relay_gate: Option<Arc<Semaphore>>,
+        /// 两阶段响应（仅新用例使用；默认一次性写完 headers+body）。
+        relay_two_phase: Option<TwoPhaseReply>,
     }
 
     impl Default for FakeConfig {
@@ -772,6 +807,7 @@ mod tests {
                 relay_body: relay_ok(SYNTHETIC_RELAY_TOKEN, 60),
                 relay_delay: Duration::ZERO,
                 relay_gate: None,
+                relay_two_phase: None,
             }
         }
     }
@@ -840,6 +876,16 @@ mod tests {
             let gate = Arc::new(Semaphore::new(0));
             self.config.lock().unwrap().relay_gate = Some(gate.clone());
             gate
+        }
+
+        /// 终端 token 响应改为两阶段：先写响应头并通知，body 等测试显式放行。
+        fn hold_relay_body(&self) -> TwoPhaseReply {
+            let reply = TwoPhaseReply {
+                headers_sent: Arc::new(Semaphore::new(0)),
+                body_gate: Arc::new(Semaphore::new(0)),
+            };
+            self.config.lock().unwrap().relay_two_phase = Some(reply.clone());
+            reply
         }
 
         /// 撤下终端 token 闸门（后续请求直接放行）。
@@ -921,7 +967,7 @@ mod tests {
             authorization,
             body: String::from_utf8_lossy(&body).to_string(),
         });
-        let (status, delay, response_body, gate) = {
+        let (status, delay, response_body, gate, two_phase) = {
             let config = config.lock().unwrap();
             if path.starts_with(OAUTH_TOKEN_PATH) {
                 (
@@ -929,6 +975,7 @@ mod tests {
                     config.exchange_delay,
                     config.exchange_body.clone(),
                     config.exchange_gate.clone(),
+                    None,
                 )
             } else if path.starts_with(RELAY_TOKEN_PATH) {
                 (
@@ -936,9 +983,10 @@ mod tests {
                     config.relay_delay,
                     config.relay_body.clone(),
                     config.relay_gate.clone(),
+                    config.relay_two_phase.clone(),
                 )
             } else {
-                (404, Duration::ZERO, "{}".to_string(), None)
+                (404, Duration::ZERO, "{}".to_string(), None, None)
             }
         };
         // 请求已记录：测试可见，再挂起等待显式放行（不发真实等待/睡眠）
@@ -948,11 +996,18 @@ mod tests {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let response = format!(
-            "HTTP/1.1 {status} FAKE\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+        let header = format!(
+            "HTTP/1.1 {status} FAKE\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             response_body.len()
         );
-        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(header.as_bytes()).await;
+        let _ = stream.flush().await;
+        if let Some(two_phase) = two_phase {
+            // 响应头已交给客户端；body 必须等测试放行（它把 clear() 放进这个窗口）
+            two_phase.headers_sent.add_permits(1);
+            let _ = two_phase.body_gate.acquire().await;
+        }
+        let _ = stream.write_all(response_body.as_bytes()).await;
         let _ = stream.flush().await;
     }
 
@@ -1617,6 +1672,54 @@ mod tests {
         );
 
         // 结果已丢弃：凭据为空，且不得再发出请求
+        assert_eq!(err_code(auth.terminal_token().await), "needs_auth");
+        assert_eq!(fake.relay_count(), 1);
+    }
+
+    // ───────────────────────── fix round 2：token 交接与代际线性化 ─────────────────────────
+
+    /// clear 落在「响应头已到、JSON body 未到」的窗口：200 响应必须作废，token 不得逃出。
+    ///
+    /// 时序全由闸门控制（两阶段 fake）：先 flush 响应头并通知 → 测试 `clear()` →
+    /// 才放行 body。因此 body 解析完成时凭据代际已变，交接点必须看到这一点；
+    /// 旧实现只在响应头之后复核一次，body 读完后就直接返回 token。
+    #[tokio::test]
+    async fn clear_during_token_response_body_discards_result() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        let auth = Arc::new(test_service(&fake));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+
+        fake.set_relay(200, relay_ok(SYNTHETIC_RELAY_TOKEN, 60));
+        let two_phase = fake.hold_relay_body();
+        let pending = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.terminal_token().await }
+        });
+        wait_until(|| fake.relay_count() == 1).await;
+
+        // 响应头已 flush：客户端 `send()` 先拿到 headers，随后停在 body 读取上
+        assert!(
+            two_phase.headers_sent.acquire().await.is_ok(),
+            "响应头闸门应正常放行"
+        );
+        // 让出调度：让客户端把「headers 已到」推进到 body 读取；body 仍被闸门挂起
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(fake.relay_count(), 1);
+
+        // clear 落在 body 读取期间；此后才发布 body
+        auth.clear();
+        two_phase.body_gate.add_permits(1);
+
+        assert_eq!(
+            err_code(pending.await.expect("请求任务不应 panic")),
+            "needs_auth"
+        );
+        // token 未逃出：凭据已清，后续零新请求
         assert_eq!(err_code(auth.terminal_token().await), "needs_auth");
         assert_eq!(fake.relay_count(), 1);
     }
