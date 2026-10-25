@@ -83,10 +83,10 @@
 
 ### T4 问答与打断
 
-- 红测：`resolve_binds_turn_and_epoch`；`wrong_or_consumed_rejected`；`stop_requires_observed_guard`；`auto_resolution_snoozes_first`；`answer_confirms_only_after_pending_cleared`；`interrupt_confirms_only_after_guard_cleared`；`ack_without_terminal_stays_accepted`；`stop_target_excludes_pre_trigger_execution`；`stop_requires_accepted_trigger`。
-- 实现：`command.rs` resolve/stop + `pending.rs` 三查闸 + snooze 前置 + **终态观察**（host pending 集合代数 / control 守卫消失）；stop 目标必须同时满足"control 代数前进 + 不在触发前执行基线"。
+- 红测：`resolve_binds_turn_and_epoch`；`wrong_or_consumed_rejected`；`stop_requires_observed_guard`；`auto_resolution_snoozes_first`；`answer_confirms_only_after_pending_cleared`；`interrupt_confirms_only_after_guard_cleared`；`ack_without_terminal_stays_accepted`；`stop_target_excludes_pre_trigger_execution`；`stop_requires_accepted_trigger`；`initial_control_required_before_trigger`。
+- 实现：`command.rs` resolve/stop + `pending.rs` 三查闸 + snooze 前置 + **终态观察**（host pending 集合代数 / control 守卫消失）；stop 目标必须同时满足"control 代数前进 + 不在触发前执行基线"；interrupt 触发前必须确认 `control.activeWorks` 已宣告（超时零触发/零 stop）。
 - 验证：`cargo test --test zcode_interaction_remote`。
-- 通过：错 ID/过期/重复不消费他卡；stop 无新守卫即拒；**旧执行 id 永不作为目标**；触发未被受理（unknown/send-failed）不进入 stop；`--existing-pending` 不支持 interrupt；迟到结果不入新代际；**ACK 后未见终态 → ActionState=Accepted，UI 只显示"已受理"**；多选/自由文本在实跑取证前不开放（`userInputMultiSelect/FreeText=false`）。
+- 通过：错 ID/过期/重复不消费他卡；stop 无新守卫即拒；**旧执行 id 永不作为目标**；**初始 control 未确认 → 零触发、零 stop**；触发未被受理（unknown/send-failed）不进入 stop；`--existing-pending` 不支持 interrupt；迟到结果不入新代际；**ACK 后未见终态 → ActionState=Accepted，UI 只显示"已受理"**；多选/自由文本在实跑取证前不开放（`userInputMultiSelect/FreeText=false`）。
 - 提交点：`feat(zcode): resolve pending interactions with terminal confirmation`。
 
 ### T5 审批（应答既有卡已证；发送→弹卡未证）

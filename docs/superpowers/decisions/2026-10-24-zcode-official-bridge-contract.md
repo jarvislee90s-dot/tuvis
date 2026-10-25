@@ -859,3 +859,11 @@ ack-only 或新鲜快照确认。`model` / `thoughtLevel` 由 §8.7 补全为 tr
     本轮不落 OS keychain）；补 B2 binding live evidence。复核期间出现的未提交
     `session-probe.ts` 回退（撤掉终态观察/逐模型校验、恢复 `bodyPreview`）已保存为
     补丁并从工作树移除，不进入任何提交。
+14. **初始 control 未确认不得触发 interrupt（第三轮复审 Critical）**：订阅只等 ACK，
+    初始 snapshot/control 可能延迟；若在 control 到达前取基线（空集合），延迟首快照
+    里的旧 E 会被误判为新执行。修正：interrupt 触发前等待
+    `hasConfirmedControl(book.control)`（`control.activeWorks` 为数组；`[]` = 已确认
+    无执行，null/缺字段 = 尚未知），超时 `INITIAL_CONTROL_WAIT_MS=10s` →
+    `UNAVAILABLE:no-initial-control`，**零触发、零 stop**；基线只在确认后取。回归：
+    `initial_control_must_be_confirmed_before_baseline`（ACK-only → pending-only
+    snapshot → control 缺 activeWorks → 延迟 control 含 E → 基线含 E → 后续 E 被排除）。
