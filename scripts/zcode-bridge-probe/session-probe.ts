@@ -2331,13 +2331,25 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         if (observedPending === null && !isInterrupt) {
           record(ctx, "interaction", "pending-inventory", {
             count: book.size,
-            items: book.list().map((item) => ({
-              kind: item.kind,
-              interactionId: redactor.register("sid", item.interactionId),
-              payloadKeys: Object.keys(item.payload).slice(0, 24),
-              autoResolution: item.autoResolution,
-              createdAt: item.createdAt,
-            })),
+            items: book.list().map((item) => {
+              const payload = item.payload as Record<string, unknown>;
+              const schema = payload.schema;
+              const schemaInteraction =
+                schema && typeof schema === "object"
+                  ? ((schema as Record<string, unknown>).interaction ?? null)
+                  : null;
+              const questions = payload.questions;
+              return {
+                kind: item.kind,
+                interactionId: redactor.register("sid", item.interactionId),
+                toolName: typeof payload.toolName === "string" ? payload.toolName : null,
+                schemaInteraction: typeof schemaInteraction === "string" ? schemaInteraction : null,
+                questionCount: Array.isArray(questions) ? questions.length : 0,
+                payloadKeys: Object.keys(payload).slice(0, 24),
+                autoResolution: item.autoResolution,
+                createdAt: item.createdAt,
+              };
+            }),
             bookCounters: book.counters,
           });
         }
@@ -2465,6 +2477,19 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
                 "(product-projection.ts:3391-3409,5793-5795; plan approval :3440-3459)",
             });
             unavailable = "UNAVAILABLE:answer-shape-unsupported";
+            {
+              const payload = observedPending.payload as Record<string, unknown>;
+              const schema = payload.schema;
+              const schemaInteraction =
+                schema && typeof schema === "object"
+                  ? ((schema as Record<string, unknown>).interaction ?? null)
+                  : null;
+              log(
+                `answer gate 未通过：toolName=${String(payload.toolName ?? "")} schema.interaction=${String(
+                  schemaInteraction ?? ""
+                )}`
+              );
+            }
           } else {
             const pending = observedPending;
             autoResolution = pending.autoResolution;
