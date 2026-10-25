@@ -55,7 +55,9 @@ export const INTERACTION_COMMAND_TYPES = {
   snooze: "snoozeInteractionAutoResolution",
 } as const;
 export type InteractionCommandType =
-  (typeof INTERACTION_COMMAND_TYPES)[keyof typeof INTERACTION_COMMAND_TYPES];
+  | (typeof INTERACTION_COMMAND_TYPES)[keyof typeof INTERACTION_COMMAND_TYPES]
+  /** B4：模型/思考强度切换（command.ts:254-258；CAS 必带 baseRevision :315-331）。 */
+  | "switchModelConfig";
 
 /**
  * fullAccess 特权选项 id（PERMISSION_FULL_ACCESS_OPTION_ID，snapshot.ts:234）。
@@ -552,6 +554,8 @@ export type InteractionCommandLoopOptions = {
   /** 发送目标（B2 精确归属产物）：envelope.sessionId = target.taskId。 */
   target: Pick<BoundTarget, "taskId" | "workspacePath" | "workspaceIdentity">;
   commandType: InteractionCommandType;
+  /** CAS：switchModelConfig 必带（command.ts:315-331,343-357）；其他命令不传。 */
+  baseRevision?: number;
   /**
    * resolveInteraction → {interactionId, answer}（command.ts:221-234）；
    * stop → {expectedForegroundExecutionId}（:161-164，必带——run() 开头强制）；
@@ -619,6 +623,7 @@ export class InteractionCommandLoop {
   private readonly identity: RpcFrameIdentity;
   private readonly target: Pick<BoundTarget, "taskId" | "workspacePath" | "workspaceIdentity">;
   private readonly commandType: InteractionCommandType;
+  private readonly baseRevision?: number;
   private readonly payload: Record<string, unknown>;
   private readonly clientId: string;
   private readonly ackMs: number;
@@ -642,6 +647,7 @@ export class InteractionCommandLoop {
     this.identity = options.identity;
     this.target = options.target;
     this.commandType = options.commandType;
+    this.baseRevision = options.baseRevision;
     this.payload = options.payload;
     this.clientId = options.clientId;
     this.ackMs = options.ackMs;
@@ -669,6 +675,7 @@ export class InteractionCommandLoop {
       commandId: crypto.randomUUID(),
       clientId: this.clientId,
       sessionId: this.target.taskId,
+      ...(this.baseRevision !== undefined ? { baseRevision: this.baseRevision } : {}),
       type: this.commandType,
       payload: this.payload,
       issuedAt: this.now(),

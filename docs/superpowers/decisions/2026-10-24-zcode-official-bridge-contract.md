@@ -772,3 +772,10 @@ node scripts/zcode-bridge-probe/interaction-probe.ts approve \
 ## 10. 生产实施计划指针（B5）
 
 - 生产统一控制施工单：[2026-10-25-zcode-official-bridge-implementation.md](../plans/2026-10-25-zcode-official-bridge-implementation.md)。基于本文件 §6–§8.5 的已取证合同；审批（卡路径）与模型/思考强度明确标为未取证/延后，能力默认关闭。
+
+### 8.6 B4 实跑（thoughtLevel 已证 / model 未证）
+
+- run `macos-B320261025T025928Z-3WyTFA`（脱敏证据私有目录）：读取 `snapshot.config` = provider `account:bigmodel-individual-coding-plan` / model `GLM-5.3-Flash` / thought `max`；`availability.switchModelConfig.allowed=true`。
+- 切换 thought `max → low`：`switchModelConfig` 命令 ack `accepted`；等待新快照后 `config.thought` 确为 `low`（**ACK≠投影生效，必须等 snapshot/delta**，与 §9 笔记一致）。
+- 恢复原值 `low → max`：ack `accepted`，新快照确认恢复；全程未改全局默认、未影响其他会话。
+- **结论**：`capabilities.thoughtLevel=true`；`capabilities.model=false`（本次目录只暴露当前模型 id，模型切换需 `model-selection.getView()` 目录且其 mobileRemote 角色可见性未验证，未尝试——UI 保持关闭）。

@@ -103,7 +103,7 @@
     "userInput": true,
     "interrupt": true,
     "model": false,
-    "thoughtLevel": false,
+    "thoughtLevel": true,
     "reason": "send：2026-10-24 B2 实连收官前移 true——run macos-B220261024T132316Z-prItvw（oauth PROVEN → paired → mapping MAPPED 119 行 → Travel/hi 指称精确唯一解析 → bridge ready → Initialize ok → sendConversationCommandV4 受理 accepted，framesSent=1、peerAck=true、干净 close、无重发）+ 用户确认 marker 以用户消息形态落在指定会话（§4.1 别名 hi）且 agent 已处理回复（user-testimony，时间戳与 transcript issuedUtc 一致）。approval：维持 false——reason: \"session auto-approves; no pending card exists in the designated test session\"（2026-10-24 B3 approve run macos-B320261024T230311Z-aTrTIg：触发受理、30s 待卡窗内无 pending 卡，agent 直接创建 tuvis-b3-permission-test.txt = 自动批准会话；reject 轮按裁决跳过——同一自动批准会话即同一结论；早期 pre-fix 无效 run macos-B320261024T151206Z-JWXiGw 标 preliminary/invalid 不计入裁决）。userInput：2026-10-25 B3 实连前移 true——run macos-B320261025T012945Z-aMtnqA（触发 completed → userInput pending 观察到 → 以卡上原值 id 应答 → outcome accepted → verdict RESOLVED）。interrupt：2026-10-25 B3 实连前移 true——run macos-B320261025T013128Z-X8HkPg（触发 completed → control.activeWorks 观察到守卫 id → stop accepted → verdict STOPPED:interrupt-accepted；更早 run macos-B320261025T013037Z-TT8HoQ 在建桥 Initialize 门超时、零帧出站，窗口加宽 e34f3fe9 后复跑通过）。model/thoughtLevel：从未发出真实写帧，维持 false，留 B4 取证。"
   },
   "operations": [
@@ -153,5 +153,9 @@
       "unknownRule": "受理但窗口内无结果 → 只记 unknown，绝不重发；guard.stopTargetChanged 等 noop 不算成功、不补发",
       "class": "source + live + fake"
     }
-  ]
+  ],
+  "capabilityNotes": {
+    "thoughtLevel": "live-proven 2026-10-25 run macos-B320261025T025928Z-3WyTFA: read snapshot.config → set thought max→low (ack accepted) → fresh snapshot confirmed low → restore max (ack accepted) → confirmed restored.",
+    "model": "NOT proven: snapshot catalog exposed only the current model id; a model change requires the model-selection channel getView() catalog (mobileRemote role check unverified) and was not attempted. UI stays disabled."
+  }
 }
