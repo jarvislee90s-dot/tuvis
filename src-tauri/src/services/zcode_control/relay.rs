@@ -175,6 +175,8 @@ struct RelayTiming {
     connect_timeout: Duration,
     /// `disconnect` 等待 actor 收尸（旧 socket 关闭）的上界（生产 15s；测试可缩短）。
     shutdown_wait: Duration,
+    /// 单帧写 socket 的上限（生产 10s；半开连接 → 离线终态，绝不无限挂起 actor）。
+    send_timeout: Duration,
 }
 
 impl RelayTiming {
@@ -187,6 +189,7 @@ impl RelayTiming {
             pair_window: Duration::from_secs(30),
             connect_timeout: Duration::from_millis(15_000),
             shutdown_wait: Duration::from_millis(15_000),
+            send_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -284,6 +287,8 @@ struct ConnectionTask {
     handshake: Option<oneshot::Sender<HandshakeOutcome>>,
     /// actor 退出信号：`disconnect` 等它落地后才返回（旧 socket 已关闭）。
     closed: Option<tokio::sync::watch::Sender<bool>>,
+    /// 写失败后 actor 已进入终态（`run_connection` 收尸退出）。
+    terminal: bool,
 }
 
 /// 连接任务内的握手/心跳计时状态。
@@ -495,6 +500,7 @@ impl RelayClient {
             shutdown: shutdown_rx,
             handshake: Some(handshake),
             closed: Some(closed_tx),
+            terminal: false,
         }));
 
         // 5) 等握手结果（握手总预算与升级共用 deadline）；返回前再核一次代际。
@@ -554,20 +560,26 @@ impl RelayClient {
             }
         };
         let (reply, reply_rx) = oneshot::channel();
-        if live
-            .commands
-            .send(Command::SendData {
+        // 有界写：排队 + 回执共享同一上限。半开/拥塞的连接任务可能长时间停在
+        // socket 写上；调用方必须拿到真实的 `offline` 终态，而不是无限挂起或
+        // 伪装 `not_ready`（T1.2：任何写失败都是离线终态，零自动重发）。
+        let deadline = tokio::time::Instant::now() + self.shared.timing.send_timeout;
+        if tokio::time::timeout_at(
+            deadline,
+            live.commands.send(Command::SendData {
                 generation,
                 payload,
                 reply,
-            })
-            .await
-            .is_err()
+            }),
+        )
+        .await
+        .is_err()
         {
             return Err(ZcodeError::offline());
         }
-        match reply_rx.await {
-            Ok(result) => result,
+        match tokio::time::timeout_at(deadline, reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ZcodeError::offline()),
             Err(_) => Err(ZcodeError::offline()),
         }
     }
@@ -758,9 +770,25 @@ impl ConnectionTask {
             "payload": payload,
             "client_ts": now_secs(),
         });
-        send_json(&mut self.sink, &frame)
-            .await
-            .map_err(|_| ZcodeError::offline())
+        match tokio::time::timeout(
+            self.shared.timing.send_timeout,
+            send_json(&mut self.sink, &frame),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(())) | Err(_) => {
+                // 写失败/写超时（半开 WS）：离线终态，actor 退出，绝不继续排队。
+                self.terminal = true;
+                self.fail(
+                    ConnectionState::Offline,
+                    codes::OFFLINE,
+                    ZcodeError::offline(),
+                )
+                .await;
+                Err(ZcodeError::offline())
+            }
+        }
     }
 
     /// 终态收口：置非配对、上报冻结状态、唤醒 connect、清活连接、关 socket。
@@ -813,7 +841,7 @@ async fn run_connection(mut task: ConnectionTask) {
         },
         "client_ts": now_secs(),
     });
-    if send_json(&mut task.sink, &auth_init).await.is_err() {
+    if !send_json_bounded(&task.shared, &mut task.sink, &auth_init).await {
         task.fail(
             ConnectionState::Offline,
             codes::OFFLINE,
@@ -872,7 +900,7 @@ async fn run_connection(mut task: ConnectionTask) {
                     "type": "pair_status_query",
                     "client_ts": now_secs(),
                 });
-                if send_json(&mut task.sink, &query).await.is_err() {
+                if !send_json_bounded(&task.shared, &mut task.sink, &query).await {
                     task.fail(
                         ConnectionState::Offline,
                         codes::OFFLINE,
@@ -905,6 +933,10 @@ async fn run_connection(mut task: ConnectionTask) {
                     Some(Command::SendData { generation, payload, reply }) => {
                         let result = task.send_data_frame(generation, payload, session.matched).await;
                         let _ = reply.send(result);
+                        if task.terminal {
+                            // 写失败已收口为离线终态：actor 不再消费任何命令。
+                            return;
+                        }
                     }
                     None => {
                         close_ws_sink(&mut task.sink).await;
@@ -1187,8 +1219,17 @@ async fn send_json(sink: &mut WsSink, value: &Value) -> Result<(), ()> {
     sink.send(Message::Text(text.into())).await.map_err(|_| ())
 }
 
+/// 有上限的控制帧写（auth_init/心跳）；半开连接必须在 `send_timeout` 内失败。
+async fn send_json_bounded(shared: &Shared, sink: &mut WsSink, value: &Value) -> bool {
+    matches!(
+        tokio::time::timeout(shared.timing.send_timeout, send_json(sink, value)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// 关闭 socket 也必须有界：半开连接上的 Close 同样可能永久阻塞。
 async fn close_ws_sink(sink: &mut WsSink) {
-    let _ = sink.send(Message::Close(None)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), sink.send(Message::Close(None))).await;
 }
 
 async fn close_ws(mut socket: WsStream) {
@@ -1303,6 +1344,7 @@ mod tests {
             pair_window,
             connect_timeout: Duration::from_secs(2),
             shutdown_wait: Duration::from_secs(2),
+            send_timeout: Duration::from_secs(2),
         }
     }
 
@@ -1582,6 +1624,8 @@ mod tests {
         /// 配对后立即下发一条超过入站上限的帧（字节数，不含 JSON 信封）。
         oversized_after_match: Option<usize>,
         ack_gate: Option<Arc<Semaphore>>,
+        /// 配对后停止读取（半开连接：客户端写 socket 会阻塞）。
+        stall_after_match: bool,
     }
 
     impl Default for RelayScript {
@@ -1596,6 +1640,7 @@ mod tests {
                 data_after_match: None,
                 oversized_after_match: None,
                 ack_gate: None,
+                stall_after_match: false,
             }
         }
     }
@@ -1858,6 +1903,11 @@ mod tests {
                 state.lock().unwrap().connections_closed += 1;
                 return;
             }
+        }
+
+        if matched && script.stall_after_match {
+            // 半开连接：socket 保持打开但不再读取（客户端写满缓冲后阻塞）。
+            std::future::pending::<()>().await;
         }
 
         let mut heartbeat_count = 0usize;
@@ -3122,6 +3172,7 @@ mod tests {
             shutdown: shutdown_rx,
             handshake: None,
             closed: None,
+            terminal: false,
         };
         let _commands = commands;
 
@@ -3267,5 +3318,55 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), client.disconnect())
             .await
             .expect("失败后 disconnect 应立即返回");
+    }
+
+    /// 半开 WS：对端停止读取 → `send_data` 必须在上限内以离线终态返回，
+    /// 不得把 actor 无限挂死，也不得以 `not_ready` 冒充排队失败。
+    #[tokio::test]
+    async fn stalled_write_is_bounded_and_goes_offline() {
+        let fake_auth = FakeAuthHttp::start().await;
+        let auth = authorized_service(&fake_auth).await;
+        let fake_relay = FakeRelay::start(RelayScript {
+            handshake: HandshakeMode::Matched,
+            heartbeat: HeartbeatReply::Matched,
+            stall_after_match: true,
+            ..RelayScript::default()
+        })
+        .await;
+        let (events, log) = EventLog::start();
+        let timing = RelayTiming {
+            send_timeout: Duration::from_millis(120),
+            ..fast_timing(
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+        };
+        let client = relay_client_with_timing(auth, events, &fake_relay.origin, timing);
+        let view = client
+            .connect(route(Some(SYNTHETIC_MID)))
+            .await
+            .expect("paired");
+        assert_eq!(view.state, ConnectionState::Paired);
+
+        // 足够大，确保写满本机 socket 缓冲（对端完全不读）。
+        let payload = json!({"blob": "x".repeat(4 * 1024 * 1024)});
+        let started = Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(3), client.send_data(payload))
+            .await
+            .expect("写帧不得无限挂起")
+            .expect_err("半开连接必须失败");
+        assert!(error.is(codes::OFFLINE), "实际错误：{error:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "写超时必须及时收口"
+        );
+
+        log.wait_state(
+            |view| view.state == ConnectionState::Offline,
+            "半开写失败 → 离线终态",
+        )
+        .await;
+        assert_eq!(client.view().state, ConnectionState::Offline);
     }
 }

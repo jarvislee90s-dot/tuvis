@@ -416,7 +416,7 @@ fn crc32(bytes: &[u8]) -> u32 {
     crc ^ 0xffff_ffff
 }
 
-fn crc32_hex(bytes: &[u8]) -> String {
+pub(crate) fn crc32_hex(bytes: &[u8]) -> String {
     format!("{:08x}", crc32(bytes))
 }
 

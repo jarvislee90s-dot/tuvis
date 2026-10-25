@@ -26,7 +26,8 @@
 //!   绝不在状态锁内 await 网络。
 //! - `bind` 只认**精确相等**的 `taskId == TargetKey.sessionId`：标题/cwd 相似度、手工去
 //!   横杠、大小写归一一律不参与；两种 ID 形态（`sess_<uuid>` / `session_<32hex>`）原样
-//!   保留。同 taskId 命中多行（跨 workspace 或同 workspace 重复）→ `target_ambiguous`。
+//!   保留。**跨 workspace** 同 taskId 命中多行 → `target_ambiguous`；同 workspace 的
+//!   重复行按 `(workspacePath, taskId)` 折叠为同一目标。
 //! - 入站帧按 bridgeSessionId/身份、物理 `seq`/`messageSeq`、topic、subscriptionId、
 //!   代际逐层过滤；任何缺口/未知 schema/协议不符 → `ready=false`，重订阅取只读快照，
 //!   期间控制面零写。
@@ -36,13 +37,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 
 use super::codec::{
-    decode_channel, encode_ack, encode_call, encode_frame, encode_listen, ChannelMessage,
-    FrameAssembler, RpcIdentity, RESPONSE_TYPE_EVENT_FIRE, RESPONSE_TYPE_INITIALIZE,
-    RESPONSE_TYPE_PROMISE_ERROR, RESPONSE_TYPE_PROMISE_SUCCESS,
+    crc32_hex, decode_channel, encode_ack, encode_call, encode_frame, encode_listen,
+    ChannelMessage, FrameAssembler, RpcIdentity, RESPONSE_TYPE_EVENT_FIRE,
+    RESPONSE_TYPE_INITIALIZE, RESPONSE_TYPE_PROMISE_ERROR, RESPONSE_TYPE_PROMISE_SUCCESS,
 };
 use super::projection::{Projection, CONVERSATION_TOPIC_PREFIX};
 use super::types::{codes, BoundTarget, RelaySink, SessionView, TargetKey, ZResult, ZcodeError};
@@ -63,6 +65,10 @@ pub const AGENT_CONVERSATION_FRAME_EVENT: &str = "onDynamicConversationFrame";
 pub const CONTROLLER_DYNAMIC_FRAME_EVENT: &str = "onDynamicControllerFrame";
 /// controller 订阅方法。
 pub const CONTROLLER_SUBSCRIBE_METHOD: &str = "subscribeControllerV4";
+/// controller 退订方法（`windowController.ts:77`；窗闭/缺口后尽力退订）。
+pub const CONTROLLER_UNSUBSCRIBE_METHOD: &str = "unsubscribeControllerV4";
+/// 会话退订方法（`zcodeAgent.ts:940-946`；重订阅前释放旧订阅）。
+pub const AGENT_UNSUBSCRIBE_CONVERSATION_METHOD: &str = "unsubscribeConversationV4";
 /// controller 任务索引 topic（`controller.ts:9`）。
 pub const CONTROLLER_TASKS_INDEX_TOPIC: &str = "controller/tasks-index";
 /// v4 wire 协议版本（`core.ts:7`）。
@@ -79,8 +85,62 @@ pub const BOOTSTRAP_REQUEST: &str = "bootstrap-request";
 pub const WORKSPACE_LIST_REQUEST: &str = "workspace-list-request";
 /// 桥 Initialize 的 wire 字节（`serialize([200]) + serialize(undefined)`）。
 pub const INITIALIZE_BYTES: [u8; 6] = [0x04, 0x01, 0x06, 0xc8, 0x01, 0x00];
-/// 单条 conversation 帧暂存上限（ACK 前/重订阅窗口；防恶意帧撑爆内存）。
-pub const MAX_STAGED_FRAMES: usize = 1024;
+/// 单条 conversation 帧暂存条数上限（ACK 前/重订阅窗口；防恶意帧撑爆内存）。
+///
+/// 与 codec 的物理分片 `MAX_STAGED_FRAMES` 同名不同义（那是 physical wire 层），
+/// 这里限定的是已解包的 conversation logical frame。
+pub const MAX_STAGED_CONVERSATION_FRAMES: usize = 1024;
+/// controller 任务索引行数上限（合同 `maxRows=1024`，超出拒收并计数）。
+pub const MAX_TASK_ROWS: usize = 1024;
+/// 单代际最多枚举的 workspace 数（每个 workspace 一条枚举桥）。
+pub const MAX_ENUM_WORKSPACES: usize = 16;
+/// 单会话并发分片重组组数上限（参照实现 `CONVERSATION_MAX_FRAGMENT_ASSEMBLIES`）。
+pub const MAX_FRAGMENT_ASSEMBLIES: usize = 32;
+/// 单条 logical frame 的最大分片数（参照实现同值）。
+pub const MAX_LOGICAL_FRAGMENTS: u64 = 1024;
+/// 单会话连续重同步次数上限（超过即停在 `ready=false`，不无限重订阅）。
+pub const MAX_RESYNCS: u32 = 8;
+
+/// 桥接域的资源界限（与超时一起注入；生产默认值见 [`Default`]）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BridgeLimits {
+    /// 单会话 ACK 前暂存帧的总字节预算。
+    pub staged_bytes: usize,
+    /// 单条 conversational logical frame 进入投影的字节上限。
+    pub projection_bytes: usize,
+    /// 绑定会话总数上限。
+    pub sessions: usize,
+    /// 逻辑桥总数上限。
+    pub bridges: usize,
+    /// 出站命令队列深度上限（背压可见，避免无界内存）。
+    pub command_queue: usize,
+}
+
+impl Default for BridgeLimits {
+    fn default() -> Self {
+        Self {
+            staged_bytes: 16 * 1024 * 1024,
+            projection_bytes: super::projection::MAX_LOGICAL_FRAME_BYTES,
+            sessions: 256,
+            bridges: 512,
+            command_queue: 256,
+        }
+    }
+}
+
+impl BridgeLimits {
+    /// 测试界限（小预算，验证边界而不分配 MB 级负载）。
+    #[cfg(test)]
+    pub(crate) const fn test() -> Self {
+        Self {
+            staged_bytes: 64 * 1024,
+            projection_bytes: 64 * 1024,
+            sessions: 8,
+            bridges: 16,
+            command_queue: 8,
+        }
+    }
+}
 
 /// clientHello 的 Tuvis 客户端身份（web 终端；不伪装 desktop-continuous）。
 const CLIENT_KIND: &str = "web";
@@ -114,6 +174,8 @@ pub struct BridgeTiming {
     pub rpc: Duration,
     /// controller 快照收帧窗：8s。
     pub task_window: Duration,
+    /// 同一会话两次只读重同步的最小间隔（指数退避基数；防重订阅自激）。
+    pub resync_backoff: Duration,
 }
 
 impl Default for BridgeTiming {
@@ -123,6 +185,7 @@ impl Default for BridgeTiming {
             initialize: Duration::from_secs(15),
             rpc: Duration::from_secs(10),
             task_window: Duration::from_secs(8),
+            resync_backoff: Duration::from_secs(2),
         }
     }
 }
@@ -136,6 +199,7 @@ impl BridgeTiming {
             initialize: Duration::from_millis(500),
             rpc: Duration::from_millis(500),
             task_window: Duration::from_millis(120),
+            resync_backoff: Duration::from_millis(60),
         }
     }
 }
@@ -149,6 +213,8 @@ enum Command {
         channel: String,
         method: String,
         args: Vec<Value>,
+        /// 写前在 actor 内复核的会话就绪闸（`call` 专用；T3 写命令的前置）。
+        guard: Option<RpcGuard>,
         reply: oneshot::Sender<ZResult<()>>,
     },
     /// 发送一条事件订阅（EventListen）。
@@ -165,8 +231,24 @@ enum Command {
         payload: Value,
         reply: Option<oneshot::Sender<ZResult<()>>>,
     },
+    /// 尽力发送一条读面生命周期 RPC（退订）；无 waiter、失败静默。
+    SendRpcNowait {
+        bridge_id: String,
+        identity: RpcIdentity,
+        id: u32,
+        channel: String,
+        method: String,
+        args: Vec<Value>,
+    },
     /// 清空 seq/messageSeq 计数（代际变化后旧桥作废）。
     Reset,
+}
+
+/// `call` 的就绪闸：actor 在真正写帧前复核（gap 与 check 之间零写窗口）。
+#[derive(Debug, Clone)]
+struct RpcGuard {
+    session_id: String,
+    generation: u64,
 }
 
 /// 每桥出站计数（actor 独占；`seq`/`messageSeq` 从 1 起）。
@@ -205,14 +287,79 @@ impl Default for Inner {
 }
 
 /// 本代际的 workspace listing 与任务索引缓存（一次枚举，多次绑定共享）。
+///
+/// controller tasks-index 按**桥的 workspace 作用域**下发（官方订阅带
+/// `visibility:"foreground"`）。「单枚举桥返回全局任务索引」是**未验证假设**，
+/// 因此这里为每个候选 workspace 各开一条枚举桥并合并行（同键去重）；即使官方
+/// 实际返回全局列表，合并结果也只是重复行按 `workspacePath\0taskId` 折叠。
 struct WorkspaceCache {
     generation: u64,
     entries: Vec<WorkspaceEntry>,
     active_key: Option<String>,
-    enum_bridge: Option<String>,
-    controller_subscribed: bool,
+    /// workspaceKey → 枚举桥/订阅状态。
+    enum_bridges: BTreeMap<String, EnumBridge>,
     rows: BTreeMap<(String, String), TaskRow>,
+    /// 因 1024 行上限被拒的 controller 行数（证据计数）。
+    rows_rejected: u64,
+}
+
+/// 单个 workspace 的枚举桥状态。
+struct EnumBridge {
+    bridge_id: String,
+    workspace_path: String,
+    controller_subscription: Option<String>,
+    subscribed: bool,
     snapshot_seen: bool,
+}
+
+impl WorkspaceCache {
+    fn rows_ready(&self) -> bool {
+        !self.enum_bridges.is_empty()
+            && self
+                .enum_bridges
+                .values()
+                .all(|bridge| bridge.snapshot_seen)
+    }
+
+    /// 枚举顺序：active workspace 优先，其余按 listing 顺序；上限
+    /// [`MAX_ENUM_WORKSPACES`]（每 workspace 一条桥，防无界枚举）。
+    fn candidate_workspaces(&self) -> Vec<(String, String, Option<String>)> {
+        let mut candidates: Vec<(String, String, Option<String>)> = Vec::new();
+        let mut push = |entry: &WorkspaceEntry| {
+            if candidates.len() >= MAX_ENUM_WORKSPACES {
+                return;
+            }
+            if candidates
+                .iter()
+                .any(|(key, _, _)| key == &entry.workspace_key)
+            {
+                return;
+            }
+            candidates.push((
+                entry.workspace_key.clone(),
+                entry.workspace_path.clone(),
+                entry.workspace_identity.clone(),
+            ));
+        };
+        if let Some(active) = &self.active_key {
+            if let Some(entry) = self
+                .entries
+                .iter()
+                .find(|entry| &entry.workspace_key == active)
+                .or_else(|| {
+                    self.entries
+                        .iter()
+                        .find(|entry| &entry.workspace_path == active)
+                })
+            {
+                push(entry);
+            }
+        }
+        for entry in &self.entries {
+            push(entry);
+        }
+        candidates
+    }
 }
 
 /// 一条 workspace listing 条目（只读解析产物）。
@@ -284,19 +431,36 @@ struct SessionEntry {
     bridge_id: String,
     projection: Projection,
     staged: Vec<StagedFrame>,
+    staged_bytes: usize,
+    /// 暂存帧/在途分片的总字节预算（来自 [`BridgeLimits::staged_bytes`]）。
+    staged_budget: usize,
+    fragments: ConversationFragments,
     needs_resync: bool,
+    /// 连续重同步次数（成功后清零；超过 [`MAX_RESYNCS`] 停在 ready=false）。
+    resync_attempts: u32,
+    last_resync_at: Option<Instant>,
     stats: SessionStats,
 }
 
 impl SessionEntry {
-    fn new(target: BoundTarget, bridge_id: String) -> Self {
-        let projection = Projection::new(target.clone());
+    fn new(
+        target: BoundTarget,
+        bridge_id: String,
+        projection_bytes: usize,
+        staged_budget: usize,
+    ) -> Self {
+        let projection = Projection::with_limit(target.clone(), projection_bytes);
         Self {
             target,
             bridge_id,
             projection,
             staged: Vec::new(),
+            staged_bytes: 0,
+            staged_budget,
+            fragments: ConversationFragments::default(),
             needs_resync: false,
+            resync_attempts: 0,
+            last_resync_at: None,
             stats: SessionStats::default(),
         }
     }
@@ -308,6 +472,185 @@ struct StagedFrame {
     frame: Value,
 }
 
+/// 单会话的分片重组状态（第二层：应用级 logical frame 分片）。
+#[derive(Default)]
+struct ConversationFragments {
+    assemblies: HashMap<String, FragmentAssembly>,
+}
+
+impl ConversationFragments {
+    fn clear(&mut self) {
+        self.assemblies.clear();
+    }
+
+    /// 在途分片总字节（用于会话级预算）。
+    fn in_flight_bytes(&self) -> usize {
+        self.assemblies
+            .values()
+            .map(|assembly| usize::try_from(assembly.logical_bytes).unwrap_or(usize::MAX))
+            .fold(0usize, usize::saturating_add)
+    }
+
+    /// 接收一片 `kind:"fragment"` 的 wire candidate（TS `acceptFragment` 对位实现）。
+    ///
+    /// 键 = `topic\0subscriptionId\0logicalFrameId`；片数/总字节/CRC 冲突或片序号越界
+    /// 一律 fail-closed；缺片由一个更高的 `logicalFrameOrdinal` 到来时判定为缺口。
+    fn accept(
+        &mut self,
+        object: &Map<String, Value>,
+        topic: &str,
+        subscription: &str,
+        budget: usize,
+    ) -> FragmentOutcome {
+        let Some(logical_frame_id) = object
+            .get("logicalFrameId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return FragmentOutcome::Fault;
+        };
+        let Some(fragment_index) = object.get("fragmentIndex").and_then(Value::as_u64) else {
+            return FragmentOutcome::Fault;
+        };
+        let Some(fragment_count) = object.get("fragmentCount").and_then(Value::as_u64) else {
+            return FragmentOutcome::Fault;
+        };
+        let Some(logical_bytes) = object.get("logicalBytes").and_then(Value::as_u64) else {
+            return FragmentOutcome::Fault;
+        };
+        let Some(checksum) = object
+            .get("checksum")
+            .and_then(|checksum| checksum.get("value"))
+            .and_then(Value::as_str)
+        else {
+            return FragmentOutcome::Fault;
+        };
+        let Some(data_base64) = object.get("dataBase64").and_then(Value::as_str) else {
+            return FragmentOutcome::Fault;
+        };
+        let ordinal = object
+            .get("logicalFrameOrdinal")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if fragment_count == 0
+            || fragment_count > MAX_LOGICAL_FRAGMENTS
+            || fragment_index >= fragment_count
+            || logical_bytes == 0
+            || usize::try_from(logical_bytes).map_or(true, |bytes| bytes > budget)
+        {
+            return FragmentOutcome::Fault;
+        }
+        let Ok(chunk) = base64::engine::general_purpose::STANDARD.decode(data_base64) else {
+            return FragmentOutcome::Fault;
+        };
+        if chunk.is_empty() {
+            return FragmentOutcome::Fault;
+        }
+        let key = format!("{topic}\u{0}{subscription}\u{0}{logical_frame_id}");
+        // 缺口判定：同一订阅下更新的 logical frame 已开始，而旧的仍未收齐 →
+        // 旧帧必定缺片（wire 候选按 physical message 连续下发），不得无限等待。
+        let stale: Vec<String> = self
+            .assemblies
+            .iter()
+            .filter(|(known, assembly)| known.as_str() != key && assembly.ordinal < ordinal)
+            .map(|(known, _)| known.clone())
+            .collect();
+        if !stale.is_empty() {
+            for known in stale {
+                self.assemblies.remove(&known);
+            }
+            return FragmentOutcome::Fault;
+        }
+        if !self.assemblies.contains_key(&key) {
+            if self.assemblies.len() >= MAX_FRAGMENT_ASSEMBLIES
+                || self
+                    .in_flight_bytes()
+                    .saturating_add(usize::try_from(logical_bytes).unwrap_or(usize::MAX))
+                    > budget
+            {
+                return FragmentOutcome::Fault;
+            }
+            let chunks = (0..fragment_count).map(|_| None).collect();
+            self.assemblies.insert(
+                key.clone(),
+                FragmentAssembly {
+                    fragment_count,
+                    logical_bytes,
+                    checksum: checksum.to_owned(),
+                    ordinal,
+                    chunks,
+                    received: 0,
+                },
+            );
+        }
+        let Some(assembly) = self.assemblies.get_mut(&key) else {
+            return FragmentOutcome::Fault;
+        };
+        if assembly.fragment_count != fragment_count
+            || assembly.logical_bytes != logical_bytes
+            || assembly.checksum != checksum
+            || assembly.ordinal != ordinal
+        {
+            self.assemblies.remove(&key);
+            return FragmentOutcome::Fault;
+        }
+        let slot = usize::try_from(fragment_index).expect("fragment index fits usize");
+        if assembly.chunks[slot].is_some() {
+            // 重复片：静默忽略（内存状态不变）。
+            return FragmentOutcome::Incomplete;
+        }
+        assembly.chunks[slot] = Some(chunk);
+        assembly.received += 1;
+        if assembly.received < usize::try_from(fragment_count).expect("fragment count fits") {
+            return FragmentOutcome::Incomplete;
+        }
+        let Some(assembly) = self.assemblies.remove(&key) else {
+            return FragmentOutcome::Fault;
+        };
+        let expected = usize::try_from(assembly.logical_bytes).expect("logical bytes fit");
+        let mut joined = Vec::with_capacity(expected);
+        for piece in assembly.chunks.into_iter().flatten() {
+            joined.extend_from_slice(&piece);
+        }
+        if joined.len() != expected
+            || crc32_hex(&joined) != assembly.checksum
+            // UTF-8 校验：重组结果必须是合法 JSON 文本（官方按 UTF-8 字节拼接）。
+            || std::str::from_utf8(&joined).is_err()
+        {
+            return FragmentOutcome::Fault;
+        }
+        let Ok(frame) = serde_json::from_slice::<Value>(&joined) else {
+            return FragmentOutcome::Fault;
+        };
+        if frame.get("topic").and_then(Value::as_str) != Some(topic)
+            || frame.get("subscriptionId").and_then(Value::as_str) != Some(subscription)
+        {
+            return FragmentOutcome::Fault;
+        }
+        FragmentOutcome::Complete(frame)
+    }
+}
+
+/// 一组在途分片（键 = topic\0subscriptionId\0logicalFrameId）。
+struct FragmentAssembly {
+    fragment_count: u64,
+    logical_bytes: u64,
+    checksum: String,
+    ordinal: u64,
+    chunks: Vec<Option<Vec<u8>>>,
+    received: usize,
+}
+
+/// 一片分片的处理结果。
+enum FragmentOutcome {
+    /// 尚未收齐（或重复片）：静默忽略。
+    Incomplete,
+    /// 重组完成：logical frame。
+    Complete(Value),
+    /// schema/CRC/片数不符：fail-closed（会话置不新鲜 + 只读重同步）。
+    Fault,
+}
+
 /// 单会话证据计数（暂存放行 / 只读重订阅；值本身不含任何业务数据）。
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -316,6 +659,12 @@ pub(crate) struct SessionStats {
     pub staged_delivered: u64,
     /// 只读重订阅次数。
     pub resyncs: u64,
+    /// 成功重组的 logical frame 分片数。
+    pub fragments_reassembled: u64,
+    /// 分片 schema/CRC/缺口故障次数（每次都要求重同步）。
+    pub fragment_faults: u64,
+    /// 因条数/字节预算被拒的帧数。
+    pub frames_rejected: u64,
 }
 
 /// 桥管理器：同一 relay 上按 workspace/session 打开多个逻辑桥。
@@ -332,22 +681,37 @@ struct Shared {
     state: Mutex<Inner>,
     relay: Arc<dyn RelaySink>,
     timing: BridgeTiming,
-    commands: mpsc::UnboundedSender<Command>,
+    limits: BridgeLimits,
+    /// 有界命令队列：半开/拥塞时满队列立即以 `offline` 暴露，不无界增长。
+    commands: mpsc::Sender<Command>,
 }
 
 impl BridgeManager {
     /// 生产构造（时序取官方口径）。
+    ///
+    /// **必须在 Tokio runtime 内构造**：内部会 `tokio::spawn` 出站 actor；
+    /// 在 runtime 外调用会 panic（T7.1 Hub 在 Tauri runtime 中装配）。
     pub fn new(relay: Arc<dyn RelaySink>) -> Self {
         Self::with_timing(relay, BridgeTiming::default())
     }
 
     /// 注入时序（测试专用；生产不注册配置/IPC）。
     pub(crate) fn with_timing(relay: Arc<dyn RelaySink>, timing: BridgeTiming) -> Self {
-        let (commands, receiver) = mpsc::unbounded_channel();
+        Self::with_timing_limits(relay, timing, BridgeLimits::default())
+    }
+
+    /// 注入时序与资源界限（测试专用；生产取默认界限）。
+    pub(crate) fn with_timing_limits(
+        relay: Arc<dyn RelaySink>,
+        timing: BridgeTiming,
+        limits: BridgeLimits,
+    ) -> Self {
+        let (commands, receiver) = mpsc::channel(limits.command_queue.max(1));
         let shared = Arc::new(Shared {
             state: Mutex::new(Inner::default()),
             relay,
             timing,
+            limits,
             commands,
         });
         tokio::spawn(run_actor(shared.clone(), receiver));
@@ -363,33 +727,88 @@ impl BridgeManager {
     /// 只做解析/路由，**不 await 网络**（ACK 走 actor 队列），因此事件泵不会被慢路径拖住；
     /// 缺口/协议不符只置 `ready=false` 并标记重同步，读面下次访问时取新快照。
     pub async fn on_data(&self, payload: Value) -> ZResult<()> {
-        let (result, acks) = {
+        let (result, acks, releases) = {
             let mut inner = lock(&self.shared.state);
             inner.handle_data(&payload)
         };
         for ack in acks {
-            let _ = self.shared.commands.send(Command::SendFrame {
+            let _ = self.shared.commands.try_send(Command::SendFrame {
                 payload: ack,
                 reply: None,
             });
+        }
+        for release in releases {
+            let _ = self.shared.commands.try_send(release);
         }
         result
     }
 
     /// 连接代际变化：丢弃旧代际的全部桥/投影/临时绑定。
     pub async fn invalidate(&self, generation: u64) {
-        {
+        let releases = {
             let mut inner = lock(&self.shared.state);
             if generation < inner.generation {
                 return;
+            }
+            // 尽力退订（读面生命周期帧，零写）：会话订阅 + controller 订阅。
+            let session_subscriptions: Vec<(String, String)> = inner
+                .sessions
+                .values()
+                .filter_map(|entry| {
+                    entry
+                        .projection
+                        .subscription_id()
+                        .map(|subscription| (entry.bridge_id.clone(), subscription.to_owned()))
+                })
+                .collect();
+            let controller_subscriptions: Vec<(String, String)> = inner
+                .workspaces
+                .as_ref()
+                .map(|cache| {
+                    cache
+                        .enum_bridges
+                        .values()
+                        .filter_map(|bridge| {
+                            bridge
+                                .controller_subscription
+                                .clone()
+                                .map(|subscription| (bridge.bridge_id.clone(), subscription))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut releases = Vec::new();
+            for (bridge_id, subscription) in session_subscriptions {
+                if let Some(command) = inner.release_command(
+                    &bridge_id,
+                    AGENT_CHANNEL,
+                    AGENT_UNSUBSCRIBE_CONVERSATION_METHOD,
+                    &subscription,
+                ) {
+                    releases.push(command);
+                }
+            }
+            for (bridge_id, subscription) in controller_subscriptions {
+                if let Some(command) = inner.release_command(
+                    &bridge_id,
+                    WINDOW_CONTROLLER_CHANNEL,
+                    CONTROLLER_UNSUBSCRIBE_METHOD,
+                    &subscription,
+                ) {
+                    releases.push(command);
+                }
             }
             inner.generation = generation;
             inner.bridges.clear();
             inner.sessions.clear();
             inner.workspaces = None;
             inner.app_waiters.clear();
+            releases
+        };
+        for release in releases {
+            let _ = self.shared.commands.try_send(release);
         }
-        let _ = self.shared.commands.send(Command::Reset);
+        let _ = self.shared.commands.try_send(Command::Reset);
     }
 
     /// 精确绑定一个会话（bootstrap → 枚举 → 精确 taskId → 会话桥 → 会话订阅）。
@@ -410,6 +829,10 @@ impl BridgeManager {
                 .map(|entry| entry.target.clone())
         } {
             return Ok(target);
+        }
+        if lock(&self.shared.state).sessions.len() >= self.shared.limits.sessions {
+            // 会话数有界：必须由上层释放（换代）或显式回收，绝不无界增长。
+            return Err(ZcodeError::of(codes::PAYLOAD_TOO_LARGE));
         }
 
         let workspaces = self.shared.load_workspaces(generation).await?;
@@ -505,9 +928,22 @@ impl BridgeManager {
                 return Err(ZcodeError::of(codes::NOT_READY));
             }
         }
+        // 就绪闸随命令一起交给 actor，在真正写帧前复核：并发缺口 →
+        // 「检查通过、写前已失效」的窗口必须零写（quality I-4）。
+        let guard = RpcGuard {
+            session_id: target.session_id.clone(),
+            generation: target.generation,
+        };
         let message = self
             .shared
-            .rpc_call(&bridge_id, channel, method, args, self.shared.timing.rpc)
+            .rpc_call(
+                &bridge_id,
+                channel,
+                method,
+                args,
+                self.shared.timing.rpc,
+                Some(guard),
+            )
             .await?;
         Ok(message.body)
     }
@@ -528,6 +964,36 @@ impl BridgeManager {
             .sessions
             .get(session_id)
             .map(|entry| entry.projection.view())
+    }
+
+    /// 测试观测：在途 RPC waiter 数（超时清账/迟到应答用例）。
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        lock(&self.shared.state)
+            .bridges
+            .values()
+            .map(|bridge| bridge.pending.len())
+            .sum()
+    }
+
+    /// 测试观测：已收集的 controller 任务行数（1024 上限断言）。
+    #[cfg(test)]
+    pub(crate) fn task_rows(&self) -> usize {
+        lock(&self.shared.state)
+            .workspaces
+            .as_ref()
+            .map(|cache| cache.rows.len())
+            .unwrap_or(0)
+    }
+
+    /// 测试观测：因行数上限被拒的 controller 行数。
+    #[cfg(test)]
+    pub(crate) fn task_rows_rejected(&self) -> u64 {
+        lock(&self.shared.state)
+            .workspaces
+            .as_ref()
+            .map(|cache| cache.rows_rejected)
+            .unwrap_or(0)
     }
 }
 
@@ -557,6 +1023,7 @@ impl Shared {
                 payload: Value::Object(payload),
                 reply: Some(reply_sender),
             })
+            .await
             .is_err()
         {
             lock(&self.state).app_waiters.remove(&request_id);
@@ -647,18 +1114,20 @@ impl Shared {
                 generation,
                 entries: entries.clone(),
                 active_key,
-                enum_bridge: None,
-                controller_subscribed: false,
+                enum_bridges: BTreeMap::new(),
                 rows: BTreeMap::new(),
-                snapshot_seen: false,
+                rows_rejected: 0,
             });
         }
         Ok(entries)
     }
 
-    /// 主动任务索引（WindowController 订阅）枚举；一次枚举多会话绑定共享。
+    /// 主动任务索引（WindowController 订阅）枚举：按候选 workspace 各开一条枚举桥
+    /// 并合并行（同键去重）。「单枚举桥返回全局任务索引」是未验证假设（spec I2），
+    /// 因此不能只枚举 active workspace；fake 也按桥的 workspace 作用域下发。
+    /// 一次枚举多会话绑定共享；缺口后由 [`Self::mark_bridge_unready`] 失效并在此重订阅。
     async fn load_tasks(&self, generation: u64) -> ZResult<Vec<TaskRow>> {
-        let (existing_bridge, workspace_key) = {
+        let candidates = {
             let inner = lock(&self.state);
             let Some(cache) = &inner.workspaces else {
                 return Err(ZcodeError::of(codes::NOT_READY));
@@ -666,46 +1135,53 @@ impl Shared {
             if cache.generation != generation {
                 return Err(stale());
             }
-            if cache.snapshot_seen {
+            if cache.rows_ready() {
                 return Ok(cache.rows.values().cloned().collect());
             }
-            let active = cache.active_key.as_ref();
-            let workspace = cache
-                .entries
-                .iter()
-                .find(|entry| active == Some(&entry.workspace_key))
-                .or_else(|| {
-                    active.and_then(|key| {
-                        cache
-                            .entries
-                            .iter()
-                            .find(|entry| &entry.workspace_path == key)
-                    })
-                })
-                .unwrap_or(&cache.entries[0]);
-            (cache.enum_bridge.clone(), workspace.workspace_key.clone())
+            cache.candidate_workspaces()
         };
 
-        let bridge_id = match existing_bridge {
-            Some(bridge_id) => bridge_id,
-            None => {
-                let bridge_id = self
-                    .open_bridge(generation, &workspace_key, None, false)
-                    .await?;
-                let mut inner = lock(&self.state);
-                if let Some(cache) = inner.workspaces.as_mut() {
-                    cache.enum_bridge = Some(bridge_id.clone());
+        for (workspace_key, workspace_path, _identity) in &candidates {
+            let existing = {
+                let inner = lock(&self.state);
+                let Some(cache) = &inner.workspaces else {
+                    return Err(ZcodeError::of(codes::NOT_READY));
+                };
+                cache
+                    .enum_bridges
+                    .get(workspace_key)
+                    .filter(|bridge| inner.bridges.contains_key(&bridge.bridge_id))
+                    .map(|bridge| (bridge.bridge_id.clone(), bridge.subscribed))
+            };
+            let (bridge_id, subscribed) = match existing {
+                Some((bridge_id, subscribed)) => (bridge_id, subscribed),
+                None => {
+                    let bridge_id = self
+                        .open_bridge(generation, workspace_key, None, false)
+                        .await?;
+                    let mut inner = lock(&self.state);
+                    let Some(cache) = inner.workspaces.as_mut() else {
+                        return Err(ZcodeError::of(codes::NOT_READY));
+                    };
+                    if cache.generation != generation {
+                        return Err(stale());
+                    }
+                    cache.enum_bridges.insert(
+                        workspace_key.clone(),
+                        EnumBridge {
+                            bridge_id: bridge_id.clone(),
+                            workspace_path: workspace_path.clone(),
+                            controller_subscription: None,
+                            subscribed: false,
+                            snapshot_seen: false,
+                        },
+                    );
+                    (bridge_id, false)
                 }
-                bridge_id
+            };
+            if subscribed {
+                continue;
             }
-        };
-
-        let subscribed = lock(&self.state)
-            .workspaces
-            .as_ref()
-            .map(|cache| cache.controller_subscribed)
-            .unwrap_or(false);
-        if !subscribed {
             let listener_id = self.register_listener(&bridge_id, ListenerKind::Controller)?;
             self.send_listen(
                 &bridge_id,
@@ -733,28 +1209,33 @@ impl Shared {
                     CONTROLLER_SUBSCRIBE_METHOD,
                     vec![params],
                     self.timing.rpc,
+                    None,
                 )
                 .await?;
-            message
+            let subscription = message
                 .body
                 .get("ack")
                 .and_then(|ack| ack.get("subscriptionId"))
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
+                .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?
+                .to_owned();
             let mut inner = lock(&self.state);
             if let Some(cache) = inner.workspaces.as_mut() {
-                cache.controller_subscribed = true;
+                if let Some(bridge) = cache.enum_bridges.get_mut(workspace_key) {
+                    bridge.controller_subscription = Some(subscription);
+                    bridge.subscribed = true;
+                }
             }
         }
 
-        // 有界收帧窗：等首个 controller 帧（snapshot 或 deltas）。
+        // 有界收帧窗：等全部枚举桥的首个 controller 快照（或窗口到期）。
         let deadline = Instant::now() + self.timing.task_window;
         loop {
             if lock(&self.state)
                 .workspaces
                 .as_ref()
-                .map(|cache| cache.snapshot_seen)
+                .map(WorkspaceCache::rows_ready)
                 .unwrap_or(false)
             {
                 break;
@@ -764,7 +1245,16 @@ impl Shared {
                 break;
             }
             let notify = lock(&self.state).enum_notify.clone();
+            // 先登记通知再复查条件：快照落在两步之间时不会丢唤醒（M-4）。
             let notified = notify.notified();
+            if lock(&self.state)
+                .workspaces
+                .as_ref()
+                .map(WorkspaceCache::rows_ready)
+                .unwrap_or(false)
+            {
+                break;
+            }
             let _ = tokio::time::timeout(deadline.saturating_duration_since(now), notified).await;
         }
         let inner = lock(&self.state);
@@ -787,6 +1277,10 @@ impl Shared {
             let mut inner = lock(&self.state);
             if inner.generation != generation {
                 return Err(stale());
+            }
+            if inner.bridges.len() >= self.limits.bridges {
+                // 逻辑桥总数有界：超限直接拒绝，绝不无界增长。
+                return Err(ZcodeError::of(codes::PAYLOAD_TOO_LARGE));
             }
             inner.next_bridge_id = inner.next_bridge_id.wrapping_add(1);
             let bridge_id = format!("tuvis-bridge-{:08x}", inner.next_bridge_id);
@@ -880,6 +1374,7 @@ impl Shared {
                     AGENT_HELLO_METHOD,
                     Vec::new(),
                     self.timing.rpc,
+                    None,
                 )
                 .await?;
             let body = hello.body.as_object().ok_or_else(unsupported)?;
@@ -918,6 +1413,7 @@ impl Shared {
                 AGENT_CLIENT_HELLO_METHOD,
                 vec![client_hello],
                 self.timing.rpc,
+                None,
             )
             .await?;
         }
@@ -939,7 +1435,12 @@ impl Shared {
             if inner.generation == target.generation {
                 inner.sessions.insert(
                     target.session_id.clone(),
-                    SessionEntry::new(target.clone(), bridge_id.clone()),
+                    SessionEntry::new(
+                        target.clone(),
+                        bridge_id.clone(),
+                        self.limits.projection_bytes,
+                        self.limits.staged_bytes,
+                    ),
                 );
                 true
             } else {
@@ -1001,6 +1502,7 @@ impl Shared {
                 AGENT_SUBSCRIBE_CONVERSATION_METHOD,
                 vec![Value::Object(workspace)],
                 self.timing.rpc,
+                None,
             )
             .await?;
         message
@@ -1014,9 +1516,12 @@ impl Shared {
     }
 
     /// 缺口/协议不符后的只读重订阅（取新快照；不发送任何写命令）。
+    ///
+    /// 有界退避：连续失败按 `resync_backoff * 2^(n-1)` 冷却，超过 [`MAX_RESYNCS`]
+    /// 停在 `ready=false`，绝不让「读一次 → 重订阅一次」自激（C1）。
     async fn resync(&self, target: &BoundTarget, gate: &AsyncMutex<()>) -> ZResult<()> {
         let _guard = gate.lock().await;
-        let (bridge_id, needs_resync) = {
+        let (bridge_id, needs_resync, old_subscription) = {
             let inner = lock(&self.state);
             if inner.generation != target.generation {
                 return Err(stale());
@@ -1024,28 +1529,81 @@ impl Shared {
             let Some(entry) = inner.sessions.get(&target.session_id) else {
                 return Err(ZcodeError::of(codes::NO_SESSION));
             };
-            (entry.bridge_id.clone(), entry.needs_resync)
+            (
+                entry.bridge_id.clone(),
+                entry.needs_resync,
+                entry.projection.subscription_id().map(str::to_owned),
+            )
         };
         if !needs_resync {
             return Ok(());
         }
-        {
+        let _backoff = {
             let mut inner = lock(&self.state);
-            if let Some(entry) = inner.sessions.get_mut(&target.session_id) {
-                // 先解除旧订阅 barrier：新订阅的帧（新 subscriptionId）在 ACK 前暂存。
-                entry.projection.deactivate();
-                entry.staged.clear();
-                entry.needs_resync = false;
-                entry.stats.resyncs = entry.stats.resyncs.saturating_add(1);
+            let Some(entry) = inner.sessions.get_mut(&target.session_id) else {
+                return Err(ZcodeError::of(codes::NO_SESSION));
+            };
+            if entry.resync_attempts >= MAX_RESYNCS {
+                // 连续重同步耗尽：停在 ready=false，不再发订阅（防抖动放大）。
+                return Err(ZcodeError::of(codes::NOT_READY));
+            }
+            let backoff = self
+                .timing
+                .resync_backoff
+                .saturating_mul(1u32 << entry.resync_attempts.saturating_sub(1).min(16));
+            if let Some(last) = entry.last_resync_at {
+                let ready_at = last + backoff;
+                if Instant::now() < ready_at {
+                    return Err(ZcodeError::of(codes::NOT_READY));
+                }
+            }
+            // 先解除旧订阅 barrier：新订阅的帧（新 subscriptionId）在 ACK 前暂存。
+            entry.projection.deactivate();
+            entry.fragments.clear();
+            entry.staged.clear();
+            entry.staged_bytes = 0;
+            entry.needs_resync = false;
+            entry.resync_attempts = entry.resync_attempts.saturating_add(1);
+            entry.last_resync_at = Some(Instant::now());
+            entry.stats.resyncs = entry.stats.resyncs.saturating_add(1);
+            backoff
+        };
+        // 尽力退订旧订阅（读面生命周期帧；失败不影响重订阅）。
+        if let Some(subscription) = old_subscription {
+            let release = {
+                let mut inner = lock(&self.state);
+                inner.release_command(
+                    &bridge_id,
+                    AGENT_CHANNEL,
+                    AGENT_UNSUBSCRIBE_CONVERSATION_METHOD,
+                    &subscription,
+                )
+            };
+            if let Some(release) = release {
+                let _ = self.commands.try_send(release);
             }
         }
         match self.subscribe_conversation(target, &bridge_id).await {
             Ok(subscription) => {
                 let mut inner = lock(&self.state);
+                let mut still_unready = false;
                 if let Some(entry) = inner.sessions.get_mut(&target.session_id) {
                     activate_and_flush(entry, &subscription);
+                    if entry.projection.is_ready() {
+                        entry.resync_attempts = 0;
+                        entry.last_resync_at = None;
+                        entry.needs_resync = false;
+                    } else {
+                        // 新订阅也没能建立新鲜投影（例如快照仍是坏分片）：
+                        // 本次读不得把「重订阅成功」当成就绪。
+                        still_unready = true;
+                    }
                 }
-                Ok(())
+                if still_unready {
+                    Err(ZcodeError::of(codes::NOT_READY))
+                } else {
+                    Ok(())
+                }
             }
             Err(error) => {
                 let mut inner = lock(&self.state);
@@ -1090,21 +1648,40 @@ impl Shared {
         method: &str,
         args: Vec<Value>,
         timeout: Duration,
+        guard: Option<RpcGuard>,
     ) -> ZResult<ChannelMessage> {
         let (id, receiver) = self.register_rpc(bridge_id)?;
         let (reply_sender, reply_receiver) = oneshot::channel();
-        if self
-            .commands
-            .send(Command::SendRpc {
-                bridge_id: bridge_id.to_owned(),
-                id,
-                channel: channel.to_owned(),
-                method: method.to_owned(),
-                args,
-                reply: reply_sender,
-            })
-            .is_err()
-        {
+        let fail_fast = guard.is_some();
+        let queued = if fail_fast {
+            // 用户面调用：队列满必须立即以真实 offline 暴露（不伪造 not_ready）。
+            self.commands
+                .try_send(Command::SendRpc {
+                    bridge_id: bridge_id.to_owned(),
+                    id,
+                    channel: channel.to_owned(),
+                    method: method.to_owned(),
+                    args,
+                    guard,
+                    reply: reply_sender,
+                })
+                .is_ok()
+        } else {
+            // 握手/订阅等内部步骤：等容量（整体受各自超时约束）。
+            self.commands
+                .send(Command::SendRpc {
+                    bridge_id: bridge_id.to_owned(),
+                    id,
+                    channel: channel.to_owned(),
+                    method: method.to_owned(),
+                    args,
+                    guard,
+                    reply: reply_sender,
+                })
+                .await
+                .is_ok()
+        };
+        if !queued {
             self.unregister_rpc(bridge_id, id);
             return Err(ZcodeError::offline());
         }
@@ -1155,6 +1732,7 @@ impl Shared {
                 arg,
                 reply: reply_sender,
             })
+            .await
             .is_err()
         {
             return Err(ZcodeError::offline());
@@ -1173,26 +1751,49 @@ impl Shared {
             .sessions
             .retain(|_, entry| entry.bridge_id != bridge_id);
         if let Some(cache) = inner.workspaces.as_mut() {
-            if cache.enum_bridge.as_deref() == Some(bridge_id) {
-                cache.enum_bridge = None;
-                cache.controller_subscribed = false;
-            }
+            cache
+                .enum_bridges
+                .retain(|_, bridge| bridge.bridge_id != bridge_id);
         }
+        inner.enum_notify.notify_waiters();
     }
 }
 
 impl Inner {
-    /// 入站路由：只做纯内存工作，返回值 = 本次需要发出的 rpc-frame-ack。
-    fn handle_data(&mut self, payload: &Value) -> (ZResult<()>, Vec<Value>) {
+    /// 为一条读面生命周期 RPC（退订）分配 request id 并构造命令。
+    ///
+    /// 尽力而为：桥已不存在时返回 `None`（不重试、不报错）。
+    fn release_command(
+        &mut self,
+        bridge_id: &str,
+        channel: &str,
+        method: &str,
+        subscription_id: &str,
+    ) -> Option<Command> {
+        let bridge = self.bridges.get_mut(bridge_id)?;
+        bridge.next_request_id = bridge.next_request_id.wrapping_add(1).max(1);
+        Some(Command::SendRpcNowait {
+            bridge_id: bridge_id.to_owned(),
+            identity: RpcIdentity::new(bridge_id),
+            id: bridge.next_request_id,
+            channel: channel.to_owned(),
+            method: method.to_owned(),
+            args: vec![serde_json::json!({"subscriptionId": subscription_id})],
+        })
+    }
+
+    /// 入站路由：只做纯内存工作；返回值 = 本次要发出的 rpc-frame-ack 与生命周期命令。
+    fn handle_data(&mut self, payload: &Value) -> (ZResult<()>, Vec<Value>, Vec<Command>) {
         let mut acks = Vec::new();
+        let mut releases = Vec::new();
         let Some(object) = payload.as_object() else {
-            return (Ok(()), acks);
+            return (Ok(()), acks, releases);
         };
         match object.get("zcode_type").and_then(Value::as_str) {
-            Some("rpc-frame-ack") => (Ok(()), acks),
+            Some("rpc-frame-ack") => (Ok(()), acks, releases),
             Some("rpc-frame") => {
-                let result = self.handle_frame(object, &mut acks);
-                (result, acks)
+                let result = self.handle_frame(object, &mut acks, &mut releases);
+                (result, acks, releases)
             }
             _ => {
                 if let Some(request_id) = object.get("requestId").and_then(Value::as_str) {
@@ -1200,12 +1801,17 @@ impl Inner {
                         let _ = waiter.send(payload.clone());
                     }
                 }
-                (Ok(()), acks)
+                (Ok(()), acks, releases)
             }
         }
     }
 
-    fn handle_frame(&mut self, object: &Map<String, Value>, acks: &mut Vec<Value>) -> ZResult<()> {
+    fn handle_frame(
+        &mut self,
+        object: &Map<String, Value>,
+        acks: &mut Vec<Value>,
+        releases: &mut Vec<Command>,
+    ) -> ZResult<()> {
         let Some(bridge_id) = object
             .get("bridgeSessionId")
             .and_then(Value::as_str)
@@ -1224,7 +1830,7 @@ impl Inner {
             (Some(seq), Some(message_seq)) if seq > 0 && message_seq > 0 => (seq, message_seq),
             _ => {
                 // 缺 seq/messageSeq = 物理层不可重同步，置不新鲜。
-                self.mark_bridge_unready(&bridge_id);
+                self.mark_bridge_unready(&bridge_id, releases);
                 return Err(unsupported());
             }
         };
@@ -1248,7 +1854,7 @@ impl Inner {
         }
         if gap {
             // 物理缺口：本帧及之前丢失的消息都不可信 → 丢弃并重订阅取新快照。
-            self.mark_bridge_unready(&bridge_id);
+            self.mark_bridge_unready(&bridge_id, releases);
             return Ok(());
         }
 
@@ -1267,7 +1873,7 @@ impl Inner {
             Ok(delivered) => delivered,
             Err(error) => {
                 // 坏帧/超限/TTL：整桥置不新鲜，要求重同步（不吞错）。
-                self.mark_bridge_unready(&bridge_id);
+                self.mark_bridge_unready(&bridge_id, releases);
                 return Err(error);
             }
         };
@@ -1280,7 +1886,7 @@ impl Inner {
         let mut events: Vec<(ListenerKind, Value)> = Vec::new();
         for bytes in delivered {
             let Ok(message) = decode_channel(&bytes) else {
-                self.mark_bridge_unready(&bridge_id);
+                self.mark_bridge_unready(&bridge_id, releases);
                 return Err(unsupported());
             };
             match message.message_type {
@@ -1316,7 +1922,7 @@ impl Inner {
         }
         for (kind, body) in events {
             match kind {
-                ListenerKind::Controller => self.handle_controller_frame(&body),
+                ListenerKind::Controller => self.handle_controller_frame(&bridge_id, &body),
                 ListenerKind::Conversation => {
                     let session_id = self
                         .sessions
@@ -1332,8 +1938,8 @@ impl Inner {
         Ok(())
     }
 
-    /// controller 任务索引帧（snapshot 整体替换 / deltas upsert+removed）。
-    fn handle_controller_frame(&mut self, body: &Value) {
+    /// controller 任务索引帧（snapshot 整体替换本 workspace 的行 / deltas upsert+removed）。
+    fn handle_controller_frame(&mut self, bridge_id: &str, body: &Value) {
         let Some(object) = body.as_object() else {
             return;
         };
@@ -1343,6 +1949,27 @@ impl Inner {
         let Some(payload) = object.get("payload").and_then(Value::as_object) else {
             return;
         };
+        // 帧必须来自本枚举桥且 topic/subscription 对齐（同桥验证）。
+        let Some((workspace_path, subscription)) = self.workspaces.as_ref().and_then(|cache| {
+            cache
+                .enum_bridges
+                .values()
+                .find(|bridge| bridge.bridge_id == bridge_id)
+                .map(|bridge| {
+                    (
+                        bridge.workspace_path.clone(),
+                        bridge.controller_subscription.clone(),
+                    )
+                })
+        }) else {
+            return;
+        };
+        if let Some(subscription) = &subscription {
+            if object.get("subscriptionId").and_then(Value::as_str) != Some(subscription.as_str()) {
+                // 旧订阅（缺口重订阅后迟到）：零应用。
+                return;
+            }
+        }
         let mut changed = false;
         {
             let Some(cache) = self.workspaces.as_mut() else {
@@ -1357,15 +1984,20 @@ impl Inner {
                     else {
                         return;
                     };
-                    cache.rows.clear();
+                    // 只替换本 workspace 的行（其它枚举桥的行保持不变）。
+                    cache.rows.retain(|(path, _), _| path != &workspace_path);
                     for task in tasks {
                         if let Some(row) = parse_task_row(task) {
-                            cache
-                                .rows
-                                .insert((row.workspace_path.clone(), row.task_id.clone()), row);
+                            insert_task_row(cache, row);
                         }
                     }
-                    cache.snapshot_seen = true;
+                    if let Some(bridge) = cache
+                        .enum_bridges
+                        .values_mut()
+                        .find(|bridge| bridge.bridge_id == bridge_id)
+                    {
+                        bridge.snapshot_seen = true;
+                    }
                     changed = true;
                 }
                 Some("deltas") => {
@@ -1379,10 +2011,7 @@ impl Inner {
                         match record.get("op").and_then(Value::as_str) {
                             Some("task.upserted") => {
                                 if let Some(row) = record.get("task").and_then(parse_task_row) {
-                                    cache.rows.insert(
-                                        (row.workspace_path.clone(), row.task_id.clone()),
-                                        row,
-                                    );
+                                    insert_task_row(cache, row);
                                     changed = true;
                                 }
                             }
@@ -1411,7 +2040,8 @@ impl Inner {
         }
     }
 
-    /// conversation 事件帧：session/topic/subscription 三层过滤 + ACK 前暂存。
+    /// conversation 事件帧：session/topic/subscription 三层过滤 + 应用级分片重组 +
+    /// ACK 前暂存。
     fn handle_conversation_frame(&mut self, session_id: &str, body: Value) {
         let Some(entry) = self.sessions.get_mut(session_id) else {
             return;
@@ -1455,31 +2085,36 @@ impl Inner {
                     mark_session_unready(entry);
                     return;
                 }
-                match entry.projection.subscription_id().map(str::to_owned) {
-                    None => {
-                        if entry.staged.len() >= MAX_STAGED_FRAMES {
-                            mark_session_unready(entry);
-                            return;
-                        }
-                        entry.staged.push(StagedFrame {
-                            subscription_id: subscription,
-                            frame,
-                        });
+                stage_or_apply(entry, frame, subscription);
+            }
+            Some("fragment") => {
+                let budget = entry.staged_budget;
+                match entry
+                    .fragments
+                    .accept(object, &expected_topic, &subscription, budget)
+                {
+                    FragmentOutcome::Incomplete => {}
+                    FragmentOutcome::Complete(frame) => {
+                        entry.stats.fragments_reassembled =
+                            entry.stats.fragments_reassembled.saturating_add(1);
+                        stage_or_apply(entry, frame, subscription);
                     }
-                    Some(bound) if bound == subscription => {
-                        apply_frame(entry, frame);
+                    FragmentOutcome::Fault => {
+                        entry.fragments.clear();
+                        entry.stats.fragment_faults = entry.stats.fragment_faults.saturating_add(1);
+                        mark_session_unready(entry);
                     }
-                    // 旧 subscriptionId（换代/重订阅后迟到）：零应用。
-                    Some(_) => {}
                 }
             }
-            // 未支持的 wire 形态（fragment 等）：fail-closed，取新快照。
             _ => mark_session_unready(entry),
         }
     }
 
     /// 物理缺口/坏帧：整桥水位清空 + 所属会话置不新鲜（下次读触发重订阅）。
-    fn mark_bridge_unready(&mut self, bridge_id: &str) {
+    ///
+    /// 若该桥是枚举桥：任务索引立即失效（清行、清快照位、退订旧 controller 订阅），
+    /// 下一次 `load_tasks` 重新订阅取新快照，绝不把带洞的任务行当新鲜（spec I1）。
+    fn mark_bridge_unready(&mut self, bridge_id: &str, releases: &mut Vec<Command>) {
         if let Some(bridge) = self.bridges.get_mut(bridge_id) {
             bridge.assembler.reset();
             bridge.last_seq = None;
@@ -1490,6 +2125,93 @@ impl Inner {
                 mark_session_unready(entry);
             }
         }
+        let controller_subscription = self
+            .workspaces
+            .as_ref()
+            .and_then(|cache| {
+                cache
+                    .enum_bridges
+                    .values()
+                    .find(|bridge| bridge.bridge_id == bridge_id)
+                    .map(|bridge| bridge.controller_subscription.clone())
+            })
+            .flatten();
+        let mut enum_bridge_found = false;
+        if let Some(cache) = self.workspaces.as_mut() {
+            if let Some(bridge) = cache
+                .enum_bridges
+                .values_mut()
+                .find(|bridge| bridge.bridge_id == bridge_id)
+            {
+                enum_bridge_found = true;
+                bridge.snapshot_seen = false;
+                bridge.subscribed = false;
+                bridge.controller_subscription = None;
+            }
+            if enum_bridge_found {
+                // 行可能跨 workspace（合并视图）：任一缺口都整体失效。
+                cache.rows.clear();
+            }
+        }
+        if enum_bridge_found {
+            if let Some(subscription) = controller_subscription {
+                if let Some(command) = self.release_command(
+                    bridge_id,
+                    WINDOW_CONTROLLER_CHANNEL,
+                    CONTROLLER_UNSUBSCRIBE_METHOD,
+                    &subscription,
+                ) {
+                    releases.push(command);
+                }
+            }
+            self.enum_notify.notify_waiters();
+        }
+    }
+}
+
+/// 任务索引行入库：按 `workspacePath\0taskId` 去重，总行数受合同上限约束
+/// （`maxRows=1024`；超出拒收并计数，绝不无界增长）。
+fn insert_task_row(cache: &mut WorkspaceCache, row: TaskRow) {
+    let key = (row.workspace_path.clone(), row.task_id.clone());
+    if !cache.rows.contains_key(&key) && cache.rows.len() >= MAX_TASK_ROWS {
+        cache.rows_rejected = cache.rows_rejected.saturating_add(1);
+        return;
+    }
+    cache.rows.insert(key, row);
+}
+
+/// ACK 前暂存 / 已激活直通（应用级分片重组成功后也走这里）。
+fn stage_or_apply(entry: &mut SessionEntry, frame: Value, subscription: String) {
+    match entry.projection.subscription_id().map(str::to_owned) {
+        None => {
+            let frame_bytes = serde_json::to_vec(&frame).map(|bytes| bytes.len());
+            let frame_bytes = match frame_bytes {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    entry.stats.frames_rejected = entry.stats.frames_rejected.saturating_add(1);
+                    mark_session_unready(entry);
+                    return;
+                }
+            };
+            if entry.staged.len() >= MAX_STAGED_CONVERSATION_FRAMES
+                || entry.staged_bytes.saturating_add(frame_bytes) > entry.staged_budget
+            {
+                // 条数/字节双预算：超限即拒收并置不新鲜（绝不无界增长）。
+                entry.stats.frames_rejected = entry.stats.frames_rejected.saturating_add(1);
+                mark_session_unready(entry);
+                return;
+            }
+            entry.staged_bytes = entry.staged_bytes.saturating_add(frame_bytes);
+            entry.staged.push(StagedFrame {
+                subscription_id: subscription,
+                frame,
+            });
+        }
+        Some(bound) if bound == subscription => {
+            apply_frame(entry, frame);
+        }
+        // 旧 subscriptionId（换代/重订阅后迟到）：零应用。
+        Some(_) => {}
     }
 }
 
@@ -1497,6 +2219,7 @@ impl Inner {
 fn activate_and_flush(entry: &mut SessionEntry, subscription: &str) {
     entry.projection.activate(subscription);
     let staged = std::mem::take(&mut entry.staged);
+    entry.staged_bytes = 0;
     for item in staged {
         if item.subscription_id != subscription {
             continue;
@@ -1569,7 +2292,7 @@ fn parse_task_row(value: &Value) -> Option<TaskRow> {
 }
 
 /// 出站 actor：全部 seq/messageSeq 分配与 socket 写入的唯一串行点。
-async fn run_actor(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<Command>) {
+async fn run_actor(shared: Arc<Shared>, mut commands: mpsc::Receiver<Command>) {
     let mut counters: HashMap<String, SeqCounters> = HashMap::new();
     while let Some(command) = commands.recv().await {
         match command {
@@ -1579,19 +2302,60 @@ async fn run_actor(shared: Arc<Shared>, mut commands: mpsc::UnboundedReceiver<Co
                 channel,
                 method,
                 args,
+                guard,
                 reply,
             } => {
-                let result = send_rpc_frame(
+                // 就绪闸在 actor 内、真正写帧前复核：`call` 的预检之后若发生
+                // 并发缺口，这里必须以 `not_ready` 收口且零写（quality I-4）。
+                let ready = match &guard {
+                    Some(guard) => {
+                        let inner = lock(&shared.state);
+                        inner.generation == guard.generation
+                            && inner
+                                .sessions
+                                .get(&guard.session_id)
+                                .map(|entry| entry.projection.is_ready())
+                                .unwrap_or(false)
+                    }
+                    None => true,
+                };
+                let result = if ready {
+                    send_rpc_frame(
+                        &shared,
+                        &mut counters,
+                        &bridge_id,
+                        id,
+                        &channel,
+                        &method,
+                        args,
+                    )
+                    .await
+                } else {
+                    Err(ZcodeError::of(codes::NOT_READY))
+                };
+                let _ = reply.send(result);
+            }
+            Command::SendRpcNowait {
+                bridge_id,
+                identity,
+                id,
+                channel,
+                method,
+                args,
+            } => {
+                // 读面生命周期帧：无 waiter、失败静默（退订是尽力而为）。
+                // identity 随命令携带：invalidate 已清空 bridges，仍须发出退订帧。
+                let _ = emit_rpc_frame(
                     &shared,
                     &mut counters,
                     &bridge_id,
+                    &identity,
                     id,
                     &channel,
                     &method,
                     args,
                 )
                 .await;
-                let _ = reply.send(result);
             }
             Command::SendListen {
                 bridge_id,
@@ -1641,11 +2405,29 @@ async fn send_rpc_frame(
             .map(|bridge| bridge.identity.clone())
     }
     .ok_or_else(stale)?;
+    emit_rpc_frame(
+        shared, counters, bridge_id, &identity, id, channel, method, args,
+    )
+    .await
+}
+
+/// 用显式身份发一条 RPC 帧（退订路径：桥可能已被代际清理）。
+#[allow(clippy::too_many_arguments)]
+async fn emit_rpc_frame(
+    shared: &Shared,
+    counters: &mut HashMap<String, SeqCounters>,
+    bridge_id: &str,
+    identity: &RpcIdentity,
+    id: u32,
+    channel: &str,
+    method: &str,
+    args: Vec<Value>,
+) -> ZResult<()> {
     let bytes = encode_call(id, channel, method, args)?;
     let counter = counters.entry(bridge_id.to_owned()).or_default();
     counter.seq = counter.seq.saturating_add(1);
     counter.message_seq = counter.message_seq.saturating_add(1);
-    let frame = encode_frame(&identity, counter.seq, counter.message_seq, &bytes)?;
+    let frame = encode_frame(identity, counter.seq, counter.message_seq, &bytes)?;
     shared.relay.send_data(frame).await
 }
 
@@ -1681,12 +2463,12 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::Weak;
 
-    use base64::Engine as _;
     use futures::future::BoxFuture;
     use serde_json::json;
 
     use crate::services::zcode_control::codec::{
-        encode_frame, RpcIdentity, RESPONSE_TYPE_EVENT_FIRE, RESPONSE_TYPE_PROMISE_SUCCESS,
+        crc32_hex, encode_frame, RpcIdentity, RESPONSE_TYPE_EVENT_FIRE,
+        RESPONSE_TYPE_PROMISE_SUCCESS,
     };
     use crate::services::zcode_control::projection::CONVERSATION_TOPIC_PREFIX;
 
@@ -1842,7 +2624,19 @@ mod tests {
         hello_protocol: u64,
         refuse_open: bool,
         controller_snapshot: bool,
+        /// 同一枚举桥第 2 次 controller 订阅时返回的（全量）任务行。
+        controller_resubscribe_tasks: Option<Vec<Value>>,
         conversation_snapshot: Option<Value>,
+        /// 把首个快照拆成 `kind:"fragment"` 两片下发（CRC32 按 UTF-8 字节）。
+        fragmented_snapshot: bool,
+        /// 重订阅（第 2+ 次）的快照同样分片下发（退避/抖动用例）。
+        fragmented_resync: bool,
+        /// 分片发送顺序（可重复以制造 duplicate；缺片以制造 incomplete）。
+        fragment_order: Vec<usize>,
+        /// 覆盖分片 CRC（坏 checksum fail-closed 用例）。
+        fragment_checksum_override: Option<String>,
+        /// 这些 RPC 方法不应答（RPC 超时清账用例）。
+        silent_methods: Vec<String>,
         pre_ack_cards: Vec<Value>,
         /// 该桥第 N 个入站帧之后注入物理 seq 缺口。
         gap_after_frames: Option<usize>,
@@ -1860,7 +2654,13 @@ mod tests {
                 hello_protocol: V4_WIRE_PROTOCOL_VERSION,
                 refuse_open: false,
                 controller_snapshot: true,
+                controller_resubscribe_tasks: None,
                 conversation_snapshot: None,
+                fragmented_snapshot: false,
+                fragmented_resync: false,
+                fragment_order: vec![0, 1],
+                fragment_checksum_override: None,
+                silent_methods: Vec::new(),
                 pre_ack_cards: Vec::new(),
                 gap_after_frames: None,
                 resync_snapshot: None,
@@ -1876,14 +2676,29 @@ mod tests {
         initialized: HashSet<String>,
         listen: HashMap<String, u32>,
         conversation_subscriptions: u32,
+        /// 每桥 controller 订阅次数（第 2 次起用 resubscribe 行）。
+        controller_subscriptions: HashMap<String, u32>,
+        /// 每桥 controller 快照实际下发的 taskId（workspace 作用域断言）。
+        controller_rows_by_bridge: HashMap<String, Vec<String>>,
+        /// bridge → workspacePath（fake 的 workspace 作用域过滤依据）。
+        bridge_workspace: HashMap<String, String>,
+        /// 每桥物理 seq/messageSeq 单调校验（fake 自己验证出站帧）。
+        last_wire: HashMap<String, (u64, u64)>,
+        order_faults: u64,
+        /// 每次 RPC 请求的 (bridge, method, requestId)。
+        requests: Vec<(String, String, u32)>,
         frames_sent: HashMap<String, usize>,
         gap_injected: HashSet<String>,
+        wire_sequences: Vec<(String, u64, u64)>,
     }
 
     struct Peer {
         config: PeerConfig,
         inner: StdMutex<PeerInner>,
         manager: StdMutex<Weak<BridgeManager>>,
+        /// 下一次 `send_data` 的写闩（模拟半开 socket / actor 被占住）。
+        gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
+        stalled: std::sync::atomic::AtomicBool,
     }
 
     impl Peer {
@@ -1892,6 +2707,8 @@ mod tests {
                 config,
                 inner: StdMutex::new(PeerInner::default()),
                 manager: StdMutex::new(Weak::new()),
+                gate: StdMutex::new(None),
+                stalled: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -1903,7 +2720,82 @@ mod tests {
             self.inner.lock().expect("peer lock").sent.clone()
         }
 
+        /// 让下一条出站帧停在 actor 里（写闩），返回放行句柄。
+        fn hold_next_send(&self) -> Arc<tokio::sync::Semaphore> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            *self.gate.lock().expect("peer lock") = Some(gate.clone());
+            gate
+        }
+
+        fn stalled(&self) -> bool {
+            self.stalled.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn order_faults(&self) -> u64 {
+            self.inner.lock().expect("peer lock").order_faults
+        }
+
+        fn request_ids(&self, method: &str) -> Vec<u32> {
+            self.inner
+                .lock()
+                .expect("peer lock")
+                .requests
+                .iter()
+                .filter(|(_, known, _)| known == method)
+                .map(|(_, _, id)| *id)
+                .collect()
+        }
+
+        fn last_request_id(&self, method: &str) -> Option<u32> {
+            self.request_ids(method).last().copied()
+        }
+
+        fn controller_rows(&self, bridge: &str) -> Vec<String> {
+            self.inner
+                .lock()
+                .expect("peer lock")
+                .controller_rows_by_bridge
+                .get(bridge)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn enum_bridge_ids(&self) -> Vec<String> {
+            self.sent()
+                .iter()
+                .filter(|payload| {
+                    payload.get("zcode_type").and_then(Value::as_str) == Some(WORKSPACE_BRIDGE_OPEN)
+                        && payload.get("taskId").is_none()
+                })
+                .filter_map(|payload| payload.get("bridgeSessionId").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn session_bridge_id(&self, session_id: &str) -> String {
+            self.sent()
+                .iter()
+                .find(|payload| {
+                    payload.get("zcode_type").and_then(Value::as_str) == Some(WORKSPACE_BRIDGE_OPEN)
+                        && payload.get("taskId").and_then(Value::as_str) == Some(session_id)
+                })
+                .and_then(|payload| payload.get("bridgeSessionId").and_then(Value::as_str))
+                .map(str::to_owned)
+                .expect("session bridge opened")
+        }
+
+        fn wire_sequences(&self) -> Vec<(String, u64, u64)> {
+            self.inner.lock().expect("peer lock").wire_sequences.clone()
+        }
+
         async fn handle(&self, payload: Value) {
+            let gate = { self.gate.lock().expect("peer lock").take() };
+            if let Some(gate) = gate {
+                // 写闩：先让测试看见「actor 已停住」，再等放行。
+                self.stalled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = gate.acquire().await;
+            }
             let responses = {
                 let mut inner = self.inner.lock().expect("peer lock");
                 inner.sent.push(payload.clone());
@@ -1915,6 +2807,23 @@ mod tests {
                     manager.on_data(response).await.expect("inbound payload");
                 }
             }
+        }
+
+        /// 注入一条带新物理 seq 的入站帧（模拟迟到应答）。
+        async fn inject_frame(&self, bridge: &str, bytes: Vec<u8>) {
+            let frame = {
+                let mut inner = self.inner.lock().expect("peer lock");
+                self.frame(&mut inner, bridge, bytes)
+            };
+            let manager = self.manager.lock().expect("peer lock").upgrade();
+            if let Some(manager) = manager {
+                let _ = manager.on_data(frame).await;
+            }
+        }
+
+        /// 注入一条迟到/重复的 promise 应答（携带指定 requestId）。
+        async fn inject_response(&self, bridge: &str, id: u32, body: &Value) {
+            self.inject_frame(bridge, promise_success(id, body)).await;
         }
 
         fn respond(&self, inner: &mut PeerInner, payload: &Value) -> Vec<Value> {
@@ -1958,6 +2867,27 @@ mod tests {
                 .get("bridgeSessionId")
                 .and_then(Value::as_str)
                 .expect("bridgeSessionId");
+            // 记录该桥的 workspace：controller 任务索引按桥的 workspace 作用域下发
+            // （fake 不再把全局行无条件抹平，见 quality I-2）。
+            let workspace_key = payload
+                .get("workspaceKey")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(path) = self
+                .config
+                .workspaces
+                .iter()
+                .find(|entry| {
+                    entry.get("workspaceIdentity").and_then(Value::as_str) == Some(workspace_key)
+                        || entry.get("workspacePath").and_then(Value::as_str) == Some(workspace_key)
+                })
+                .and_then(|entry| entry.get("workspacePath"))
+                .and_then(Value::as_str)
+            {
+                inner
+                    .bridge_workspace
+                    .insert(requested.to_owned(), path.to_owned());
+            }
             let echoed = self
                 .config
                 .ready_echo
@@ -2008,6 +2938,24 @@ mod tests {
                 .and_then(Value::as_str)
                 .expect("bridgeSessionId")
                 .to_owned();
+            // 物理 seq/messageSeq 必须逐桥严格递增（fake 自带失败证据）。
+            let seq = payload.get("seq").and_then(Value::as_u64);
+            let message_seq = payload.get("messageSeq").and_then(Value::as_u64);
+            match (seq, message_seq) {
+                (Some(seq), Some(message_seq)) => {
+                    let previous = inner.last_wire.get(&bridge).copied().unwrap_or((0, 0));
+                    if seq != previous.0 + 1 || message_seq != previous.1 + 1 {
+                        inner.order_faults = inner.order_faults.saturating_add(1);
+                    }
+                    inner.last_wire.insert(bridge.clone(), (seq, message_seq));
+                    inner
+                        .wire_sequences
+                        .push((bridge.clone(), seq, message_seq));
+                }
+                _ => {
+                    inner.order_faults = inner.order_faults.saturating_add(1);
+                }
+            }
             let data = payload
                 .get("dataBase64")
                 .and_then(Value::as_str)
@@ -2025,8 +2973,25 @@ mod tests {
                 100 => {
                     let id = message.id.expect("request id");
                     let method = message.method.clone().unwrap_or_default();
+                    inner.requests.push((bridge.clone(), method.clone(), id));
+                    if self
+                        .config
+                        .silent_methods
+                        .iter()
+                        .any(|silent| silent == &method)
+                    {
+                        // 不应答：用于验证 RPC 超时清账与迟到应答丢弃。
+                        return;
+                    }
                     let first = message.body.get(0).cloned().unwrap_or(Value::Null);
                     match method.as_str() {
+                        AGENT_UNSUBSCRIBE_CONVERSATION_METHOD | CONTROLLER_UNSUBSCRIBE_METHOD => {
+                            out.push(self.frame(
+                                inner,
+                                &bridge,
+                                promise_success(id, &json!({"unsubscribed": true})),
+                            ));
+                        }
                         AGENT_HELLO_METHOD => {
                             let hello = json!({
                                 "kind": "hello",
@@ -2042,17 +3007,59 @@ mod tests {
                             out.push(self.frame(inner, &bridge, promise_success(id, &Value::Null)));
                         }
                         CONTROLLER_SUBSCRIBE_METHOD => {
+                            let subscription = format!("ctrl-sub-synthetic-{id}");
                             let ack = json!({"ack": {
-                                "subscriptionId": "ctrl-sub-synthetic-1",
+                                "subscriptionId": subscription,
                                 "mode": "snapshot",
                                 "logEpoch": "synthetic-epoch"
                             }});
                             out.push(self.frame(inner, &bridge, promise_success(id, &ack)));
                             if self.config.controller_snapshot {
+                                let attempt = inner
+                                    .controller_subscriptions
+                                    .entry(bridge.clone())
+                                    .or_insert(0);
+                                *attempt += 1;
+                                let attempt = *attempt;
+                                let source = if attempt >= 2 {
+                                    self.config
+                                        .controller_resubscribe_tasks
+                                        .as_ref()
+                                        .unwrap_or(&self.config.tasks)
+                                } else {
+                                    &self.config.tasks
+                                };
+                                // workspace 作用域过滤：只下发该桥所属 workspace 的行。
+                                let workspace_path = inner
+                                    .bridge_workspace
+                                    .get(&bridge)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let rows: Vec<Value> = source
+                                    .iter()
+                                    .filter(|row| {
+                                        row.get("address")
+                                            .and_then(|address| address.get("workspacePath"))
+                                            .and_then(Value::as_str)
+                                            == Some(workspace_path.as_str())
+                                    })
+                                    .cloned()
+                                    .collect();
+                                inner.controller_rows_by_bridge.insert(
+                                    bridge.clone(),
+                                    rows.iter()
+                                        .filter_map(|row| {
+                                            row.get("address")
+                                                .and_then(|address| address.get("taskId"))
+                                                .and_then(Value::as_str)
+                                                .map(str::to_owned)
+                                        })
+                                        .collect(),
+                                );
                                 let listen = inner.listen.get(&bridge).copied().unwrap_or(0);
                                 let event = json!({
                                     "topic": CONTROLLER_TASKS_INDEX_TOPIC,
-                                    "subscriptionId": "ctrl-sub-synthetic-1",
+                                    "subscriptionId": subscription,
                                     "logEpoch": "synthetic-epoch",
                                     "fromSeq": 0,
                                     "toSeq": 1,
@@ -2062,7 +3069,7 @@ mod tests {
                                         "snapshot": {
                                             "protocolVersion": 1,
                                             "logEpoch": "synthetic-epoch",
-                                            "tasks": self.config.tasks
+                                            "tasks": rows
                                         }
                                     }
                                 });
@@ -2117,19 +3124,22 @@ mod tests {
                                 self.config.resync_snapshot.clone()
                             };
                             if let Some(snapshot) = snapshot {
-                                let wire = test_wire(
-                                    &topic,
-                                    &subscription,
-                                    json!({"kind": "snapshot", "snapshot": snapshot}),
-                                );
-                                out.push(self.frame(
+                                let fragmented = if count == 1 {
+                                    self.config.fragmented_snapshot
+                                } else {
+                                    self.config.fragmented_resync
+                                };
+                                self.push_conversation_snapshot(
                                     inner,
                                     &bridge,
-                                    channel_message(
-                                        json!([RESPONSE_TYPE_EVENT_FIRE, listen]),
-                                        &wire,
-                                    ),
-                                ));
+                                    listen,
+                                    &topic,
+                                    &subscription,
+                                    &snapshot,
+                                    u64::from(count),
+                                    fragmented,
+                                    out,
+                                );
                             }
                         }
                         _ => {
@@ -2142,6 +3152,71 @@ mod tests {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        /// 会话快照下发：完整帧直通；`fragmented_snapshot` 时按 UTF-8 字节两片 + CRC32。
+        #[allow(clippy::too_many_arguments)]
+        fn push_conversation_snapshot(
+            &self,
+            inner: &mut PeerInner,
+            bridge: &str,
+            listen: u32,
+            topic: &str,
+            subscription: &str,
+            snapshot: &Value,
+            ordinal: u64,
+            fragmented: bool,
+            out: &mut Vec<Value>,
+        ) {
+            let payload = json!({"kind": "snapshot", "snapshot": snapshot});
+            if !fragmented {
+                let wire = test_wire(topic, subscription, payload);
+                out.push(self.frame(
+                    inner,
+                    bridge,
+                    channel_message(json!([RESPONSE_TYPE_EVENT_FIRE, listen]), &wire),
+                ));
+                return;
+            }
+            let logical = json!({
+                "topic": topic,
+                "subscriptionId": subscription,
+                "fromSeq": 0,
+                "toSeq": 1,
+                "sentAt": 0,
+                "payload": payload
+            });
+            let bytes = serde_json::to_vec(&logical).expect("logical frame json");
+            let split = (bytes.len() / 2).max(1);
+            let chunks = [&bytes[..split], &bytes[split..]];
+            let checksum = self
+                .config
+                .fragment_checksum_override
+                .clone()
+                .unwrap_or_else(|| crc32_hex(&bytes));
+            let logical_id = format!("synthetic-logical-{ordinal}");
+            for index in &self.config.fragment_order {
+                let chunk = chunks[*index];
+                let wire = json!({
+                    "wireVersion": V4_WIRE_PROTOCOL_VERSION,
+                    "kind": "fragment",
+                    "deliveryKind": "initial",
+                    "logicalFrameId": logical_id,
+                    "logicalFrameOrdinal": ordinal,
+                    "topic": topic,
+                    "subscriptionId": subscription,
+                    "fragmentIndex": *index,
+                    "fragmentCount": chunks.len(),
+                    "logicalBytes": bytes.len(),
+                    "checksum": {"algorithm": "crc32", "value": checksum},
+                    "dataBase64": base64::engine::general_purpose::STANDARD.encode(chunk)
+                });
+                out.push(self.frame(
+                    inner,
+                    bridge,
+                    channel_message(json!([RESPONSE_TYPE_EVENT_FIRE, listen]), &wire),
+                ));
             }
         }
     }
@@ -2342,8 +3417,9 @@ mod tests {
             .expect_err("title is not an id")
             .is(codes::NO_SESSION));
 
-        // 枚举桥共享：一次枚举 + 两个会话桥。
-        assert_eq!(app_payloads(&peer, WORKSPACE_BRIDGE_OPEN).len(), 3);
+        // 按候选 workspace 各一条枚举桥（合并索引才能发现跨 workspace 的重复 id），
+        // 再加两个会话桥。
+        assert_eq!(app_payloads(&peer, WORKSPACE_BRIDGE_OPEN).len(), 4);
     }
 
     #[tokio::test]
@@ -2396,32 +3472,39 @@ mod tests {
         assert_eq!(sent[2]["zcode_type"], json!(WORKSPACE_BRIDGE_OPEN));
 
         let opens = app_payloads(&peer, WORKSPACE_BRIDGE_OPEN);
-        assert_eq!(opens.len(), 2);
+        // 两个候选 workspace 各一条枚举桥（合并索引），最后一条是会话桥。
+        assert_eq!(opens.len(), 3);
         // 枚举期省略 taskId（官方 taskId? 可选；本模块只在绑定会话后携带）。
         assert!(opens[0].get("taskId").is_none());
+        assert!(opens[1].get("taskId").is_none());
         assert_eq!(opens[0]["workspaceKey"], json!("ws-a-identity"));
+        assert_eq!(opens[1]["workspaceKey"], json!("ws-b-identity"));
         // 会话桥携带精确 taskId + 宿主 workspaceKey。
-        assert_eq!(opens[1]["taskId"], json!(SESSION_A));
-        assert_eq!(opens[1]["workspaceKey"], json!("ws-a-identity"));
+        assert_eq!(opens[2]["taskId"], json!(SESSION_A));
+        assert_eq!(opens[2]["workspaceKey"], json!("ws-a-identity"));
 
         let frames = channel_frames(&peer);
         let sequence: Vec<(u32, Option<String>, Option<String>)> = frames
             .iter()
             .map(|frame| (frame.kind, frame.channel.clone(), frame.method.clone()))
             .collect();
+        let controller_listen = (
+            102,
+            Some(WINDOW_CONTROLLER_CHANNEL.to_owned()),
+            Some(CONTROLLER_DYNAMIC_FRAME_EVENT.to_owned()),
+        );
+        let controller_subscribe = (
+            100,
+            Some(WINDOW_CONTROLLER_CHANNEL.to_owned()),
+            Some(CONTROLLER_SUBSCRIBE_METHOD.to_owned()),
+        );
         assert_eq!(
             sequence,
             vec![
-                (
-                    102,
-                    Some(WINDOW_CONTROLLER_CHANNEL.to_owned()),
-                    Some(CONTROLLER_DYNAMIC_FRAME_EVENT.to_owned())
-                ),
-                (
-                    100,
-                    Some(WINDOW_CONTROLLER_CHANNEL.to_owned()),
-                    Some(CONTROLLER_SUBSCRIBE_METHOD.to_owned())
-                ),
+                controller_listen.clone(),
+                controller_subscribe.clone(),
+                controller_listen,
+                controller_subscribe,
                 (
                     100,
                     Some(AGENT_CHANNEL.to_owned()),
@@ -2451,17 +3534,17 @@ mod tests {
             json!([{"topic": CONTROLLER_TASKS_INDEX_TOPIC, "visibility": "foreground"}])
         );
         // hello 无参 = 空数组（官方 channel.call(..., []) 序列化）。
-        assert_eq!(frames[2].body, json!([]));
-        let client_hello = &frames[3].body[0];
+        assert_eq!(frames[4].body, json!([]));
+        let client_hello = &frames[5].body[0];
         assert_eq!(client_hello["protocolVersion"], json!(3));
         assert_eq!(client_hello["clientKind"], json!("web"));
         assert_eq!(client_hello["kind"], json!("clientHello"));
         assert_ne!(client_hello["clientKind"], json!("desktop"));
         // 会话 EventListen 携带 workspace 参数（无 identity 时保持缺席）。
-        let listen_arg = &frames[4].body;
+        let listen_arg = &frames[6].body;
         assert_eq!(listen_arg["workspacePath"], json!(WS_A));
         assert_eq!(listen_arg["workspaceIdentity"], json!("ws-a-identity"));
-        assert_eq!(frames[5].body[0]["sessionId"], json!(SESSION_A));
+        assert_eq!(frames[7].body[0]["sessionId"], json!(SESSION_A));
     }
 
     #[tokio::test]
@@ -2719,5 +3802,698 @@ mod tests {
             .await
             .expect_err("verbatim ids only")
             .is(codes::NO_SESSION));
+    }
+
+    // =======================================================================
+    // Fix round 1
+    // =======================================================================
+
+    async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+        for _ in 0..1000 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("等待条件超时：{what}");
+    }
+
+    async fn manager_with_limits(
+        config: PeerConfig,
+        limits: BridgeLimits,
+    ) -> (Arc<BridgeManager>, Arc<Peer>) {
+        let peer = Peer::new(config);
+        let manager = Arc::new(BridgeManager::with_timing_limits(
+            peer.clone(),
+            BridgeTiming::test(),
+            limits,
+        ));
+        peer.attach(&manager);
+        manager.invalidate(1).await;
+        (manager, peer)
+    }
+
+    fn single_workspace_config() -> PeerConfig {
+        PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(conversation_snapshot(SESSION_A, 2, Vec::new())),
+            ..PeerConfig::default()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // C1：应用级 conversation 分片重组
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn conversation_topic_fragments_reassembled() {
+        let config = PeerConfig {
+            fragmented_snapshot: true,
+            conversation_snapshot: Some(conversation_snapshot(
+                SESSION_A,
+                7,
+                vec![permission_card("pi-synthetic-fragment-1")],
+            )),
+            ..single_workspace_config()
+        };
+        let (manager, _peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let view = manager.session(&target).await.expect("session");
+        assert!(view.ready);
+        assert_eq!(view.revision, Some(7));
+        assert_eq!(view.pending.len(), 1);
+        assert_eq!(view.pending[0].interaction_id, "pi-synthetic-fragment-1");
+        let stats = manager.session_stats(SESSION_A).expect("stats");
+        assert!(stats.fragments_reassembled >= 1);
+        assert_eq!(stats.fragment_faults, 0);
+        assert_eq!(stats.resyncs, 0);
+    }
+
+    #[tokio::test]
+    async fn fragment_crc_fault_goes_unready() {
+        let config = PeerConfig {
+            fragmented_snapshot: true,
+            fragment_checksum_override: Some("00000000".to_owned()),
+            conversation_snapshot: Some(conversation_snapshot(SESSION_A, 7, Vec::new())),
+            resync_snapshot: Some(conversation_snapshot(
+                SESSION_A,
+                26,
+                vec![permission_card("pi-synthetic-after-fragment-fault")],
+            )),
+            ..single_workspace_config()
+        };
+        let (manager, _peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let stale = manager.peek_view(SESSION_A).expect("bound");
+        assert!(!stale.ready, "坏 checksum 不得进入 ready");
+        assert_eq!(stale.revision, None);
+        assert!(
+            manager
+                .session_stats(SESSION_A)
+                .expect("stats")
+                .fragment_faults
+                >= 1
+        );
+
+        // 读面触发一次只读重同步（重同步快照为完整帧）。
+        let recovered = manager.session(&target).await.expect("session");
+        assert!(recovered.ready);
+        assert_eq!(recovered.revision, Some(26));
+        assert_eq!(recovered.pending.len(), 1);
+        assert_eq!(manager.session_stats(SESSION_A).expect("stats").resyncs, 1);
+    }
+
+    #[tokio::test]
+    async fn fragment_gap_and_duplicate_are_handled() {
+        // 缺片（只有 index 0）：不得交付、不得 ready。
+        let gap_config = PeerConfig {
+            fragmented_snapshot: true,
+            fragment_order: vec![0],
+            conversation_snapshot: Some(conversation_snapshot(SESSION_A, 9, Vec::new())),
+            ..single_workspace_config()
+        };
+        let (gap_manager, _gap_peer) = manager_with(gap_config).await;
+        let gap_target = gap_manager.bind(&key(SESSION_A)).await.expect("bind");
+        let gap_view = gap_manager.peek_view(SESSION_A).expect("bound");
+        assert!(!gap_view.ready);
+        assert_eq!(gap_view.revision, None);
+        // 重订阅后仍无快照（fake 不下发）→ 保持不新鲜，绝不带半帧 ready。
+        assert!(
+            !gap_manager
+                .session(&gap_target)
+                .await
+                .expect("session view")
+                .ready
+        );
+
+        // 乱序 + 重复片（1,0,1）：仍应恰好重组一次并进册。
+        let config = PeerConfig {
+            fragmented_snapshot: true,
+            fragment_order: vec![1, 0, 1],
+            conversation_snapshot: Some(conversation_snapshot(
+                SESSION_A,
+                7,
+                vec![permission_card("pi-synthetic-fragment-out-of-order")],
+            )),
+            ..single_workspace_config()
+        };
+        let (manager, _peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let view = manager.session(&target).await.expect("session");
+        assert!(view.ready);
+        assert_eq!(view.pending.len(), 1);
+        assert_eq!(
+            manager
+                .session_stats(SESSION_A)
+                .expect("stats")
+                .fragment_faults,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn resync_backoff_prevents_tight_loop() {
+        let config = PeerConfig {
+            fragmented_snapshot: true,
+            fragmented_resync: true,
+            fragment_checksum_override: Some("00000000".to_owned()),
+            conversation_snapshot: Some(conversation_snapshot(SESSION_A, 7, Vec::new())),
+            resync_snapshot: Some(conversation_snapshot(SESSION_A, 8, Vec::new())),
+            ..single_workspace_config()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        assert!(!manager.peek_view(SESSION_A).expect("bound").ready);
+
+        // 第一次读：允许一次重订阅。
+        assert!(manager.session(&target).await.is_err());
+        let subscribes = |peer: &Peer| {
+            channel_frames(peer)
+                .into_iter()
+                .filter(|frame| {
+                    frame.method.as_deref() == Some(AGENT_SUBSCRIBE_CONVERSATION_METHOD)
+                })
+                .count()
+        };
+        assert_eq!(subscribes(&peer), 2);
+
+        // 冷却窗内的第二次读：不得再发订阅（无 tight loop）。
+        assert!(manager
+            .session(&target)
+            .await
+            .expect_err("backoff")
+            .is(codes::NOT_READY));
+        assert_eq!(subscribes(&peer), 2);
+        assert_eq!(manager.session_stats(SESSION_A).expect("stats").resyncs, 1);
+
+        // 冷却窗过去后允许下一次重订阅。
+        tokio::time::sleep(BridgeTiming::test().resync_backoff + Duration::from_millis(30)).await;
+        assert!(manager.session(&target).await.is_err());
+        assert_eq!(subscribes(&peer), 3);
+        assert_eq!(manager.session_stats(SESSION_A).expect("stats").resyncs, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // controller 索引失效（spec I1 / quality I-2）
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn controller_gap_reindexes_before_binding() {
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            controller_resubscribe_tasks: Some(vec![task_row(
+                WS_A,
+                "sess_0f9a1c0d-0000-4000-8000-0000000000c3",
+                "hi",
+            )]),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        assert!(manager.bind(&key(SESSION_A)).await.is_ok());
+        let enum_bridge = peer.enum_bridge_ids()[0].clone();
+
+        // controller 物理缺口（缺 seq）：必须让索引失效，而不是继续用旧行。
+        let gap = json!({"zcode_type": "rpc-frame", "bridgeSessionId": enum_bridge});
+        assert!(manager.on_data(gap).await.is_err());
+
+        // 旧行不得再被当成可绑定目标。
+        let stale = manager
+            .bind(&key("sess_0f9a1c0d-0000-4000-8000-0000000000c3"))
+            .await
+            .expect("fresh reindex finds new row");
+        assert_eq!(stale.workspace_path, WS_A);
+        let controller_subscribes = channel_frames(&peer)
+            .into_iter()
+            .filter(|frame| frame.method.as_deref() == Some(CONTROLLER_SUBSCRIBE_METHOD))
+            .count();
+        assert!(controller_subscribes >= 2, "缺口后必须重新订阅任务索引");
+        let rows = peer.controller_rows(&enum_bridge);
+        assert_eq!(
+            rows,
+            vec!["sess_0f9a1c0d-0000-4000-8000-0000000000c3".to_owned()],
+            "fresh snapshot replaces stale rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_rows_are_capped_per_contract() {
+        let mut tasks = Vec::new();
+        for index in 0..MAX_TASK_ROWS {
+            tasks.push(task_row(
+                WS_A,
+                &format!("sess_0f9a1c0d-0000-4000-8000-{index:012}"),
+                "hi",
+            ));
+        }
+        let overflow = "sess_0f9a1c0d-0000-4000-8000-00000000ffff";
+        tasks.push(task_row(WS_A, overflow, "hi"));
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks,
+            ..PeerConfig::default()
+        };
+        let (manager, _peer) = manager_with(config).await;
+        assert_eq!(
+            manager
+                .bind(&key(overflow))
+                .await
+                .expect_err("beyond 1024 rows")
+                .code,
+            codes::NO_SESSION
+        );
+        assert_eq!(manager.task_rows(), MAX_TASK_ROWS);
+        assert!(manager.task_rows_rejected() >= 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // 多 workspace：fake 按桥作用域（quality I-2 / spec I2）
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn workspace_scope_isolated_per_bridge() {
+        let config = PeerConfig {
+            active_workspace_key: Some("ws-b-identity".to_owned()),
+            workspaces: vec![
+                workspace_entry(WS_A, Some("ws-a-identity"), "A"),
+                workspace_entry(WS_B, Some("ws-b-identity"), "B"),
+            ],
+            tasks: vec![
+                task_row(WS_A, SESSION_A, "hi"),
+                task_row(WS_B, SESSION_B, "hi"),
+            ],
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let a = manager.bind(&key(SESSION_A)).await.expect("bind A");
+        let b = manager.bind(&key(SESSION_B)).await.expect("bind B");
+        assert_eq!(a.workspace_path, WS_A);
+        assert_eq!(b.workspace_path, WS_B);
+
+        // 每个枚举桥只看到自己 workspace 的行（fake 不再抹平作用域）。
+        let enum_bridges = peer.enum_bridge_ids();
+        assert_eq!(enum_bridges.len(), 2);
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for bridge in enum_bridges {
+            let path = if peer
+                .controller_rows(&bridge)
+                .contains(&SESSION_A.to_owned())
+            {
+                WS_A
+            } else {
+                WS_B
+            };
+            let rows = peer.controller_rows(&bridge);
+            assert!(
+                rows.iter().all(|row| {
+                    (path == WS_A && row == SESSION_A) || (path == WS_B && row == SESSION_B)
+                }),
+                "bridge rows must stay in one workspace: {rows:?}"
+            );
+            seen.push((path.to_owned(), bridge));
+        }
+        assert_eq!(seen.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Actor 内复核 ready（quality I-4）
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn gap_between_check_and_send_writes_zero_frames() {
+        let (manager, peer) = manager_with(single_workspace_config()).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let session_bridge = peer.session_bridge_id(SESSION_A);
+
+        let gate = peer.hold_next_send();
+        let first = {
+            let manager = manager.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                manager
+                    .call(&target, AGENT_CHANNEL, "firstWrite", vec![json!({})])
+                    .await
+            })
+        };
+        wait_until(|| peer.stalled(), "actor stalled on first write").await;
+
+        let second = {
+            let manager = manager.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                manager
+                    .call(&target, AGENT_CHANNEL, "syntheticWrite", vec![json!({})])
+                    .await
+            })
+        };
+        wait_until(
+            || manager.pending_count() >= 2,
+            "second call passed precheck",
+        )
+        .await;
+
+        // 预检之后、actor 写之前注入物理缺口（session 置 not ready）。
+        let gap = json!({"zcode_type": "rpc-frame", "bridgeSessionId": session_bridge});
+        assert!(manager.on_data(gap).await.is_err());
+        gate.add_permits(1);
+
+        let _ = first.await.expect("first task");
+        let error = second
+            .await
+            .expect("second task")
+            .expect_err("gap must zero the write");
+        assert!(error.is(codes::NOT_READY));
+        let writes = channel_frames(&peer)
+            .into_iter()
+            .filter(|frame| frame.method.as_deref() == Some("syntheticWrite"))
+            .count();
+        assert_eq!(writes, 0);
+        assert!(manager.pending_count() <= 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // 字节与会话数上限（quality I-5）
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn staged_bytes_are_bounded() {
+        let mut card = permission_card("pi-synthetic-huge");
+        card["payload"]["summary"] = json!("x".repeat(4096));
+        let config = PeerConfig {
+            pre_ack_cards: vec![card],
+            conversation_snapshot: None,
+            ..single_workspace_config()
+        };
+        let limits = BridgeLimits {
+            staged_bytes: 1024,
+            ..BridgeLimits::test()
+        };
+        let (manager, _peer) = manager_with_limits(config, limits).await;
+        let _target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let stats = manager.session_stats(SESSION_A).expect("stats");
+        assert_eq!(stats.staged_delivered, 0, "超字节预算的暂存帧必须拒收");
+        assert!(stats.frames_rejected >= 1);
+        assert!(!manager.peek_view(SESSION_A).expect("bound").ready);
+    }
+
+    #[tokio::test]
+    async fn session_cap_refuses_further_binds() {
+        let limits = BridgeLimits {
+            sessions: 1,
+            ..BridgeLimits::test()
+        };
+        let config = PeerConfig {
+            workspaces: vec![
+                workspace_entry(WS_A, Some("ws-a-identity"), "A"),
+                workspace_entry(WS_B, Some("ws-b-identity"), "B"),
+            ],
+            tasks: vec![
+                task_row(WS_A, SESSION_A, "hi"),
+                task_row(WS_B, SESSION_B, "hi"),
+            ],
+            ..PeerConfig::default()
+        };
+        let (manager, _peer) = manager_with_limits(config, limits).await;
+        assert!(manager.bind(&key(SESSION_A)).await.is_ok());
+        assert_eq!(
+            manager
+                .bind(&key(SESSION_B))
+                .await
+                .expect_err("session cap")
+                .code,
+            codes::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 有界命令队列（quality I-6）
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn full_command_queue_returns_offline() {
+        let limits = BridgeLimits {
+            command_queue: 1,
+            ..BridgeLimits::test()
+        };
+        let (manager, peer) = manager_with_limits(single_workspace_config(), limits).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+
+        let gate = peer.hold_next_send();
+        let first = {
+            let manager = manager.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                manager
+                    .call(&target, AGENT_CHANNEL, "firstWrite", vec![json!({})])
+                    .await
+            })
+        };
+        wait_until(|| peer.stalled(), "actor stalled").await;
+
+        let second = {
+            let manager = manager.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                manager
+                    .call(&target, AGENT_CHANNEL, "secondWrite", vec![json!({})])
+                    .await
+            })
+        };
+        let third = {
+            let manager = manager.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                manager
+                    .call(&target, AGENT_CHANNEL, "thirdWrite", vec![json!({})])
+                    .await
+            })
+        };
+        // 队列满的一方必须立即拿到真实的 offline（不是伪造 not_ready）。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            second.is_finished() || third.is_finished(),
+            "队列满必须立即失败"
+        );
+        gate.add_permits(1);
+
+        let first = first.await.expect("first task");
+        let second = second.await.expect("second task");
+        let third = third.await.expect("third task");
+        assert!(first.is_ok(), "in-flight 写应在放行后完成");
+        let errors: Vec<_> = [&second, &third]
+            .into_iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect();
+        assert_eq!(errors.len(), 1, "恰有一个排队命令被拒");
+        assert!(errors[0].is(codes::OFFLINE));
+        let written = channel_frames(&peer)
+            .into_iter()
+            .filter(|frame| {
+                matches!(
+                    frame.method.as_deref(),
+                    Some("firstWrite" | "secondWrite" | "thirdWrite")
+                )
+            })
+            .count();
+        assert_eq!(written, 2, "failed command zero writes");
+    }
+
+    // -----------------------------------------------------------------------
+    // 订阅释放（quality I-3）
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn invalidate_releases_conversation_and_controller_subscriptions() {
+        let (manager, peer) = manager_with(single_workspace_config()).await;
+        let _target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        assert!(manager.peek_view(SESSION_A).is_some());
+
+        manager.invalidate(2).await;
+        wait_until(
+            || {
+                channel_frames(&peer)
+                    .iter()
+                    .any(|frame| frame.method.as_deref() == Some(CONTROLLER_UNSUBSCRIBE_METHOD))
+            },
+            "controller unsubscribe",
+        )
+        .await;
+
+        let frames = channel_frames(&peer);
+        let conversation = frames
+            .iter()
+            .position(|frame| {
+                frame.method.as_deref() == Some(AGENT_UNSUBSCRIBE_CONVERSATION_METHOD)
+            })
+            .expect("conversation unsubscribe");
+        let controller = frames
+            .iter()
+            .position(|frame| frame.method.as_deref() == Some(CONTROLLER_UNSUBSCRIBE_METHOD))
+            .expect("controller unsubscribe");
+        assert!(
+            conversation < controller,
+            "先释放会话订阅，再释放 controller"
+        );
+        assert_eq!(frames[conversation].channel.as_deref(), Some(AGENT_CHANNEL));
+        assert_eq!(
+            frames[conversation].body,
+            json!([{"subscriptionId": "conv-sub-synthetic-1"}])
+        );
+        assert_eq!(
+            frames[controller].channel.as_deref(),
+            Some(WINDOW_CONTROLLER_CHANNEL)
+        );
+        assert_eq!(
+            frames[controller].body,
+            json!([{"subscriptionId": "ctrl-sub-synthetic-2"}])
+        );
+        assert!(manager.peek_view(SESSION_A).is_none(), "投影随代际释放");
+    }
+
+    #[tokio::test]
+    async fn resync_unsubscribes_old_subscription_first() {
+        let config = PeerConfig {
+            gap_after_frames: Some(4),
+            resync_snapshot: Some(conversation_snapshot(SESSION_A, 11, Vec::new())),
+            ..single_workspace_config()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        assert!(!manager.peek_view(SESSION_A).expect("bound").ready);
+        assert!(manager.session(&target).await.expect("session").ready);
+
+        let methods: Vec<String> = channel_frames(&peer)
+            .into_iter()
+            .filter(|frame| frame.channel.as_deref() == Some(AGENT_CHANNEL))
+            .filter_map(|frame| frame.method)
+            .collect();
+        let unsubscribe = methods
+            .iter()
+            .position(|method| method == AGENT_UNSUBSCRIBE_CONVERSATION_METHOD)
+            .expect("unsubscribe emitted");
+        let resubscribe = methods
+            .iter()
+            .enumerate()
+            .filter(|(index, method)| {
+                *index > unsubscribe && *method == AGENT_SUBSCRIBE_CONVERSATION_METHOD
+            })
+            .map(|(index, _)| index)
+            .next()
+            .expect("resubscribe");
+        assert!(unsubscribe < resubscribe, "退订必须先于重订阅");
+    }
+
+    // -----------------------------------------------------------------------
+    // 测试缺口（quality I-7）
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn rpc_timeout_clears_pending_and_late_reply_is_ignored() {
+        let config = PeerConfig {
+            silent_methods: vec!["silentRead".to_owned()],
+            ..single_workspace_config()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let session_bridge = peer.session_bridge_id(SESSION_A);
+
+        assert!(manager
+            .call(&target, AGENT_CHANNEL, "silentRead", vec![json!({})])
+            .await
+            .expect_err("timeout")
+            .is(codes::NOT_READY));
+        assert_eq!(manager.pending_count(), 0, "超时必须清账");
+
+        let late_id = peer.last_request_id("silentRead").expect("request id");
+        peer.inject_response(&session_bridge, late_id, &json!({"late": true}))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(manager.pending_count(), 0, "迟到应答不得复活 waiter");
+
+        // 后续调用不受迟到 id 影响。
+        let body = manager
+            .call(&target, AGENT_CHANNEL, "syntheticRead", vec![json!({})])
+            .await
+            .expect("read");
+        assert_eq!(body, json!({"method": "syntheticRead"}));
+    }
+
+    #[tokio::test]
+    async fn duplicate_response_after_success_is_ignored() {
+        let (manager, peer) = manager_with(single_workspace_config()).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let session_bridge = peer.session_bridge_id(SESSION_A);
+        let id = {
+            let body = manager
+                .call(&target, AGENT_CHANNEL, "syntheticRead", vec![json!({})])
+                .await
+                .expect("read");
+            assert_eq!(body, json!({"method": "syntheticRead"}));
+            peer.last_request_id("syntheticRead").expect("id")
+        };
+        // 重复应答（同一 requestId，新物理 seq）：静默丢弃。
+        peer.inject_response(&session_bridge, id, &json!({"duplicate": true}))
+            .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(manager.pending_count(), 0);
+        assert!(manager
+            .call(&target, AGENT_CHANNEL, "syntheticRead2", vec![])
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn request_ids_are_unique_under_concurrency() {
+        let (manager, peer) = manager_with(single_workspace_config()).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let calls = ["readA", "readB", "readC", "readD"].map(|method| {
+            let manager = manager.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                manager
+                    .call(&target, AGENT_CHANNEL, method, vec![json!({})])
+                    .await
+                    .map(|body| (method.to_owned(), body))
+            })
+        });
+        let mut ids = Vec::new();
+        for call in calls {
+            let (method, body) = call.await.expect("task").expect("call");
+            assert_eq!(body, json!({"method": method}));
+            ids.extend(peer.request_ids(&method));
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 4, "并发 requestId 必须唯一");
+        assert_eq!(peer.order_faults(), 0, "seq/messageSeq 必须严格递增");
+    }
+
+    #[tokio::test]
+    async fn physical_seq_and_message_seq_are_strictly_increasing() {
+        let (manager, peer) = manager_with(single_workspace_config()).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        assert!(manager
+            .call(&target, AGENT_CHANNEL, "readOne", vec![])
+            .await
+            .is_ok());
+        assert!(manager
+            .call(&target, AGENT_CHANNEL, "readTwo", vec![])
+            .await
+            .is_ok());
+        assert_eq!(peer.order_faults(), 0);
+        let mut per_bridge: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+        for (bridge, seq, message_seq) in peer.wire_sequences() {
+            per_bridge
+                .entry(bridge)
+                .or_default()
+                .push((seq, message_seq));
+        }
+        for (bridge, sequences) in per_bridge {
+            for (expected, (seq, message_seq)) in (1u64..).zip(sequences) {
+                assert_eq!(seq, expected, "bridge {bridge} seq");
+                assert_eq!(message_seq, expected, "bridge {bridge} messageSeq");
+            }
+        }
     }
 }

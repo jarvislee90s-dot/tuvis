@@ -26,6 +26,8 @@ use super::types::{
 
 /// conversation topic 前缀（`transport.ts:113,205`）。
 pub const CONVERSATION_TOPIC_PREFIX: &str = "conversation/";
+/// 单条 logical frame 的字节上限（= codec 的 channel 上限 16 MiB；超限拒收）。
+pub const MAX_LOGICAL_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 fn unsupported() -> ZcodeError {
     ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)
@@ -43,11 +45,18 @@ pub struct Projection {
     selection: Option<SelectionView>,
     capabilities: CapabilityView,
     applied_frames: usize,
+    /// 单帧字节上限（超限 = `payload_too_large`，绝不让单帧撑爆投影）。
+    byte_limit: usize,
 }
 
 impl Projection {
     /// 以精确绑定构造（尚未激活订阅、尚未就绪）。
     pub fn new(target: BoundTarget) -> Self {
+        Self::with_limit(target, MAX_LOGICAL_FRAME_BYTES)
+    }
+
+    /// 注入单帧字节上限（桥接层按自身预算构造；测试用更小值验证边界）。
+    pub fn with_limit(target: BoundTarget, byte_limit: usize) -> Self {
         let book = PendingBook::new(target.session_id.clone(), target.generation);
         Self {
             target,
@@ -59,6 +68,7 @@ impl Projection {
             selection: None,
             capabilities: CapabilityView::default(),
             applied_frames: 0,
+            byte_limit,
         }
     }
 
@@ -110,6 +120,12 @@ impl Projection {
         if generation != self.target.generation {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
+        // 字节上限（quality I-5）：单帧超预算即拒收，避免投影被单帧撑爆。
+        let frame_bytes = serde_json::to_vec(&frame).map(|bytes| bytes.len());
+        if frame_bytes.map_or(true, |bytes| bytes > self.byte_limit) {
+            self.ready = false;
+            return Err(ZcodeError::of(codes::PAYLOAD_TOO_LARGE));
+        }
         let object = frame.as_object().ok_or_else(unsupported)?;
         let expected_topic = format!("{CONVERSATION_TOPIC_PREFIX}{}", self.target.session_id);
         if object.get("topic").and_then(Value::as_str) != Some(expected_topic.as_str()) {
@@ -132,8 +148,14 @@ impl Projection {
                     self.ready = false;
                     return Err(unsupported());
                 };
+                // logical `toSeq` 是快照水位的必填字段：缺席 = schema 不符，不能
+                // 以「无水位」进入 ready（否则后续所有缺口/去重检查永久失效）。
+                let Some(to_seq) = object.get("toSeq").and_then(Value::as_u64) else {
+                    self.ready = false;
+                    return Err(unsupported());
+                };
                 self.apply_snapshot(snapshot)?;
-                self.last_to_seq = object.get("toSeq").and_then(Value::as_u64);
+                self.last_to_seq = Some(to_seq);
                 self.ready = true;
                 self.applied_frames = self.applied_frames.saturating_add(1);
                 Ok(())
@@ -147,19 +169,33 @@ impl Projection {
                     self.ready = false;
                     return Err(unsupported());
                 };
-                let from_seq = object.get("fromSeq").and_then(Value::as_u64);
-                let to_seq = object.get("toSeq").and_then(Value::as_u64);
-                if let (Some(last), Some(from)) = (self.last_to_seq, from_seq) {
-                    if from > last.saturating_add(1) {
-                        self.ready = false;
-                        return Err(ZcodeError::of(codes::NOT_READY));
-                    }
+                // 增量必须携带完整 logical 水位（fromSeq/toSeq）；任一缺席都不得
+                // 「照常应用 + 保持 ready」。
+                let (Some(from_seq), Some(to_seq)) = (
+                    object.get("fromSeq").and_then(Value::as_u64),
+                    object.get("toSeq").and_then(Value::as_u64),
+                ) else {
+                    self.ready = false;
+                    return Err(unsupported());
+                };
+                if from_seq > to_seq {
+                    self.ready = false;
+                    return Err(unsupported());
                 }
-                if let (Some(last), Some(to)) = (self.last_to_seq, to_seq) {
-                    if to <= last {
-                        // 重复帧：幂等忽略（不重复进账、不改 revision）。
-                        return Ok(());
-                    }
+                let Some(last) = self.last_to_seq else {
+                    self.ready = false;
+                    return Err(ZcodeError::of(codes::NOT_READY));
+                };
+                if to_seq <= last {
+                    // 重复帧（去重窗口内）：幂等忽略，不重复进账、不改 revision。
+                    return Ok(());
+                }
+                if from_seq != last {
+                    // 官方 logical 区间按 [fromSeq, toSeq] 闭合衔接：新帧必须从当前
+                    // 水位起（from == last）。缺口（from > last）或重叠乱序
+                    // （from < last 但 to > last）都不得带洞应用，等新快照。
+                    self.ready = false;
+                    return Err(ZcodeError::of(codes::NOT_READY));
                 }
                 for delta in deltas {
                     let Some(record) = delta.as_object() else {
@@ -177,9 +213,7 @@ impl Projection {
                     }
                     self.apply_patch(patch)?;
                 }
-                if let Some(to) = to_seq {
-                    self.last_to_seq = Some(to);
-                }
+                self.last_to_seq = Some(to_seq);
                 self.applied_frames = self.applied_frames.saturating_add(1);
                 Ok(())
             }
@@ -510,5 +544,75 @@ mod tests {
         let error = projection.apply(1, frame).expect_err("unknown schema");
         assert!(error.is(codes::UNSUPPORTED_PROTOCOL));
         assert!(!projection.view().ready);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix round 1：logical seq 必填（spec I3）与帧字节上限（quality I-5）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_without_to_seq_is_not_ready() {
+        let mut projection = Projection::new(target(1));
+        projection.activate(SUB);
+        let mut frame = snapshot_frame(SUB, base_snapshot(), 0, 1);
+        frame.as_object_mut().expect("object").remove("toSeq");
+        let error = projection
+            .apply(1, frame)
+            .expect_err("snapshot without toSeq");
+        assert!(!projection.view().ready);
+        assert_eq!(projection.applied_frames(), 0);
+        assert!(error.is(codes::UNSUPPORTED_PROTOCOL) || error.is(codes::NOT_READY));
+        // 之后到达的 deltas 不得在无水位的情况下被当作新鲜应用。
+        assert!(projection
+            .apply(1, delta_frame(SUB, json!({"revision": 5}), 1, 2))
+            .is_err());
+        assert!(!projection.view().ready);
+    }
+
+    #[test]
+    fn delta_without_to_seq_marks_not_ready() {
+        let mut projection = Projection::new(target(1));
+        projection.activate(SUB);
+        projection
+            .apply(1, snapshot_frame(SUB, base_snapshot(), 0, 1))
+            .expect("snapshot");
+        let mut delta = delta_frame(SUB, json!({"revision": 5}), 1, 2);
+        delta.as_object_mut().expect("object").remove("toSeq");
+        assert!(projection
+            .apply(1, delta)
+            .expect_err("delta without toSeq")
+            .is(codes::UNSUPPORTED_PROTOCOL));
+        assert!(!projection.view().ready);
+        assert_eq!(projection.view().revision, Some(4));
+    }
+
+    #[test]
+    fn out_of_order_delta_is_not_ready() {
+        let mut projection = Projection::new(target(1));
+        projection.activate(SUB);
+        projection
+            .apply(1, snapshot_frame(SUB, base_snapshot(), 0, 1))
+            .expect("snapshot");
+        // 已应用 1..2 后收到 fromSeq=5：既非重复也非衔接 → 缺口，不得带洞应用。
+        assert!(projection
+            .apply(1, delta_frame(SUB, json!({"revision": 9}), 5, 6))
+            .expect_err("gap")
+            .is(codes::NOT_READY));
+        assert!(!projection.view().ready);
+        assert_eq!(projection.view().revision, Some(4));
+    }
+
+    #[test]
+    fn oversized_frame_is_rejected() {
+        let mut projection = Projection::with_limit(target(1), 256);
+        projection.activate(SUB);
+        let mut snapshot = base_snapshot();
+        snapshot["blob"] = json!("x".repeat(1024));
+        let error = projection
+            .apply(1, snapshot_frame(SUB, snapshot, 0, 1))
+            .expect_err("oversized logical frame");
+        assert!(error.is(codes::PAYLOAD_TOO_LARGE));
+        assert!(!projection.view().ready);
+        assert_eq!(projection.applied_frames(), 0);
     }
 }
