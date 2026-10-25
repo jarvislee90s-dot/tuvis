@@ -52,8 +52,7 @@
 | 问答（resolveInteraction，原题/选项回传） | ✅ 实跑 | B3 answer 同上（RESOLVED） |
 | 打断（带守卫 stop） | ✅ 实跑 | B3 interrupt run `macos-B320261025T013128Z-X8HkPg`（STOPPED:interrupt-accepted） |
 | 审批（权限卡应答） | ⚠️ **未取证** | 指定测试会话为自动批准模式：无卡、文件被直接创建（B3 approve run `macos-B320261024T230311Z-aTrTIg`）；卡路径的 wire 形状已从源码取证，但**未实跑** |
-| 思考强度（switchModelConfig + CAS） | ✅ 实跑（切档+恢复） | `.superpowers/sdd/2026-10-24-zcode-official-bridge-validation/b4-source-notes.md`（READ `snapshot.config.*`；CHANGE `switchModelConfig{provider,model,thought}` + `baseRevision`；值源 `model-selection.getView()`/`thoughtLevels`）；B4 实跑延后 |
-| 模型切换（换 model id） | ⚠️ 未取证（目录需 getView；本项目前会话目录仅当前模型） | 待 `model-selection.getView()` 角色可见性验证后补测 |
+| 模型/思考强度（switchModelConfig + CAS） | ✅ 实跑（模型切换 + 切档 + 恢复原值） | `.superpowers/sdd/2026-10-24-zcode-official-bridge-validation/b4-source-notes.md`（READ `snapshot.config.*`；CHANGE `switchModelConfig{provider,model,thought}` + `baseRevision`；值源 `model-selection.getView()`/`thoughtLevels`）；B4 实跑延后 |
 | 两台配对手机并发 / 断线重连 / 链接失效流转 / 官方网页互踢实测 | ⚠️ 未覆盖 | 计划 T8 专门验收 |
 
 ## 4. 生产任务拆解（每任务：红测 → 实现 → 验证命令 → 通过条件 → 提交点）

@@ -779,3 +779,9 @@ node scripts/zcode-bridge-probe/interaction-probe.ts approve \
 - 切换 thought `max → low`：`switchModelConfig` 命令 ack `accepted`；等待新快照后 `config.thought` 确为 `low`（**ACK≠投影生效，必须等 snapshot/delta**，与 §9 笔记一致）。
 - 恢复原值 `low → max`：ack `accepted`，新快照确认恢复；全程未改全局默认、未影响其他会话。
 - **结论**：`capabilities.thoughtLevel=true`；`capabilities.model=false`（本次目录只暴露当前模型 id，模型切换需 `model-selection.getView()` 目录且其 mobileRemote 角色可见性未验证，未尝试——UI 保持关闭）。
+
+### 8.7 B4 模型切换实跑（补全）
+
+- run `macos-B320261025T030637Z-bS5dOg`：`model-selection.getView()` 对 terminal 角色**可用**（返回 `{revision, providers[], preferredSelection}`；providers 用 `providerId`/`models[].modelId` 字段，含 4 个 provider）。
+- 目标选择限定在同一 provider：`GLM-5.3-Flash → GLM-5.3`（`modelChanged:true`，thought 保持 `max`）；`switchModelConfig` ack `accepted`；新快照确认 `model=GLM-5.3, thought=max`；随后恢复 `GLM-5.3-Flash`（ack `accepted`）并确认恢复。
+- **结论**：`capabilities.model=true`、`capabilities.thoughtLevel=true`。跨 provider 切换未尝试（不属本轮授权范围，且目录暴露了其他账号 provider——生产实现必须限定用户当前账号 provider）。

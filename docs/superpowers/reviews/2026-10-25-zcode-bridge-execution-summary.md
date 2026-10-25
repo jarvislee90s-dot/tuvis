@@ -29,7 +29,7 @@ A 包（远程设置重排 + ZCode 读取恢复）全部完成并通过独立评
 | B1 官方身份/只读连接 | **PROVEN**：bigmodel 回环 OAuth 被接受；token 60s/一次性；`mid` 路由；自动配对（无 APP 确认）；只读两查询成功 | run `macos-B120261024T105940Z-NarmSw`；`4148cbc2` |
 | B2 单连接/会话映射/发送 | **闭环**：119 行任务索引、精确 id 归属、单帧发送 accepted、用户在 APP 亲见 marker 且 agent 已处理 | run `macos-B220261024T132316Z-prItvw`；`5f6e7cdb`；contract send=true |
 | B3 审批/问答/打断 | 问答 **RESOLVED**、打断 **accepted**；审批：本会话无 `permission` 类卡（用户所称"审批"实为 `userInput` 问答卡，已用 `--existing-pending` 应答 accepted） | runs `macos-B320261025T012945Z-aMtnqA`、`...T013128Z-X8HkPg`、`...T024812Z-zi883Q`；`b300d5b3` |
-| B4 模型/思考强度 | **思考强度实跑通过**（读→切 max→low→新快照确认→恢复 max→确认恢复，`COMPLETED:selection-switch-restored`）；模型切换未取证（目录仅当前模型，需 getView 角色验证）；合同层 82/82 | run `macos-B320261025T025928Z-3WyTFA`；`60dda0d5` `13152880` |
+| B4 模型/思考强度 | **全部实跑通过**：目录读取（getView）+ 模型切换（Flash→GLM-5.3）+ 思考档位切换（max→low）+ 新快照确认 + 恢复原值；合同层 82/82 | runs `...T030637Z-bS5dOg` / `...T025928Z-3WyTFA`；`60dda0d5` `13152880` `3eb47a14` |
 | B5 生产实施计划 | **已交付**（未执行）：冻结接口、T1–T8 任务卡、人机分工、风险、DoD | `docs/superpowers/plans/2026-10-25-zcode-official-bridge-implementation.md`；`d5245338` |
 
 ## 4. 关键发现（对后续生产最重要）
@@ -45,8 +45,7 @@ A 包（远程设置重排 + ZCode 读取恢复）全部完成并通过独立评
 
 | 待办 | 具体缺口 | 恢复动作 |
 | --- | --- | --- |
-| B4 模型切换 | 思考强度已证；模型切换需 `model-selection.getView()` 目录 | ①验证 getView 对 mobileRemote 角色可见 ②补一次 model 切换实跑 |
-| B4 原计划项（已部分完成） | 合同层已提交（`selectionBridge.ts` + 6 合同测试，82/82 绿）；缺探针接线与一次真实"读取→切换→确认→恢复原值" | ①在 session-probe 增加 `--interaction` 同族的 `--selection` 分支（复用连接/映射/topic 流，捕获 `snapshot.config`）②`selection-probe.ts` 薄包装 ③一次实跑（用户点授权）④按证据翻 `capabilities.model/thoughtLevel` |
+| B4 已完成 | 合同层已提交（`selectionBridge.ts` + 6 合同测试，82/82 绿）；缺探针接线与一次真实"读取→切换→确认→恢复原值" | ①在 session-probe 增加 `--interaction` 同族的 `--selection` 分支（复用连接/映射/topic 流，捕获 `snapshot.config`）②`selection-probe.ts` 薄包装 ③一次实跑（用户点授权）④按证据翻 `capabilities.model/thoughtLevel` |
 | 审批（`permission` 类卡） | 本会话无 `permission` 卡（自动批准或仅 `userInput` 卡）；卡路径 wire 形状已源码取证但未实跑 | 在一个会弹 permission 卡的环境（不同权限模式/工具）复跑 `approve`/`reject` 两轮；在此之前 UI 审批保持关闭 |
 | 双手机并发 / 断线重连 / 链接失效流转 / 官方网页互踢实测 / Windows 同口径 | 未覆盖 | 按 B5 计划 T8 验收清单执行 |
 | A8 平台验收 | Windows 六段/PIN/默认值实机；真机手机读取与发送区状态；真实链接生命周期 | 按 A8 报告 `awaiting_platform_validation` |
