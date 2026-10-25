@@ -347,6 +347,8 @@ type ProbeFlags = {
   sid: string | null;
   dbPath: string | null;
   provider: OAuthProviderChannel;
+  /** 提交模式（B3 审批取证）：build|edit|plan|yolo|guarded（command.ts:95-115）。 */
+  submissionMode: string | null;
   workspace: string;
   taskTitle: string;
   help: boolean;
@@ -368,6 +370,7 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
     sid: null,
     dbPath: null,
     provider: "bigmodel",
+    submissionMode: null,
     workspace: DEFAULT_WORKSPACE_DESIGNATION,
     taskTitle: DEFAULT_TASK_DESIGNATION,
     help: false,
@@ -2463,6 +2466,9 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           identity,
           target: bound,
           markerText: buildInteractionInstruction(interactionMode),
+          ...(parsed.submissionMode !== null
+            ? { payloadExtra: { mode: parsed.submissionMode } }
+            : {}),
           clientId,
           timeouts: { ackMs: SEND_ACK_TIMEOUT_MS, activityMs: SEND_ACTIVITY_TIMEOUT_MS },
           channelRequestId: bridgeId + 1,
