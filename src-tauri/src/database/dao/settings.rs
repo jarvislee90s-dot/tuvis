@@ -23,12 +23,23 @@ pub(crate) fn get_setting_conn(conn: &Connection, key: &str) -> Option<String> {
     .ok()
 }
 
-/// 连接级实现（供 DeviceStore.with 短临界区与单测直连内存库）
-pub(crate) fn set_setting_conn(conn: &Connection, key: &str, value: &str) {
-    let _ = conn.execute(
+/// 连接级可失败写入：需要「报成功 = 真的落库」的调用方必须用本函数并处理错误。
+pub(crate) fn try_set_setting_conn(
+    conn: &Connection,
+    key: &str,
+    value: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
         params![key, value],
-    );
+    )?;
+    Ok(())
+}
+
+/// 连接级 best-effort 写入（历史调用方语义：失败静默）。新代码若要区分成功/失败，
+/// 用 [`try_set_setting_conn`]——切配置这类「失败必须回传」的路径不得走本函数。
+pub(crate) fn set_setting_conn(conn: &Connection, key: &str, value: &str) {
+    let _ = try_set_setting_conn(conn, key, value);
 }
 
 #[cfg(test)]
