@@ -120,7 +120,7 @@ import {
   writeEvidenceFiles,
 } from "./sanitize.ts";
 import { readOfficialLinkFromSettings } from "./settingsLink.ts";
-import { readConfigFromSnapshot } from "./selectionBridge.ts";
+import { readConfigFromSnapshot, resolveCatalogFromView } from "./selectionBridge.ts";
 
 /** 探针安全闸（红线，工作包 B 全局约束）：全部硬编码，运行期不可放宽。 */
 export const PROBE_GUARDS = {
@@ -703,6 +703,8 @@ export class B2Channel {
     sender: { sendData(payload: unknown): boolean },
     args: {
       id: number;
+      /** 目标 channel（默认 zcode-agent；B4 目录读取用 model-selection）。 */
+      channel?: string;
       method: string;
       params?: unknown;
       identity: RpcFrameIdentity;
@@ -713,7 +715,7 @@ export class B2Channel {
   ): Promise<BridgeRpcOutcome> {
     const bytes = encodeChannelRequest({
       id: args.id,
-      channel: AGENT_CHANNEL,
+      channel: args.channel ?? AGENT_CHANNEL,
       method: args.method,
       params: args.params,
     });
@@ -2293,12 +2295,49 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           } else if (availability && availability.allowed === false) {
             sendVerdict = "UNAVAILABLE:switch-disabled";
           } else {
+            // 目录：先试 model-selection.getView()（mobileRemote 角色可见性未定），
+            // 失败/空则退回会话快照目录（provider + 当前 model + config.thoughtLevels）。
+            const viewOutcome = await sendChannel.bridgeRequest(
+              conn,
+              {
+                id: bridgeId + 1,
+                channel: "model-selection",
+                method: "getView",
+                identity,
+                seq: bridgeSeq + 1,
+                messageSeq: bridgeMessageSeq + 1,
+              },
+              BRIDGE_RPC_TIMEOUT_MS
+            );
+            bridgeId += 1;
+            bridgeSeq += 1;
+            bridgeMessageSeq += 1;
+            const viewCatalog =
+              viewOutcome.kind === "ok" ? resolveCatalogFromView(viewOutcome.decoded.body) : null;
+            selection.catalog = {
+              source: viewCatalog ? "model-selection.getView" : "snapshot.config",
+              outcome: viewOutcome.kind,
+              providers:
+                viewCatalog?.map((entry) => ({
+                  provider: entry.provider,
+                  models: entry.models,
+                })) ?? null,
+            };
+            const catalogEntry =
+              viewCatalog?.find((entry) => entry.provider === original.provider) ?? null;
+            const altModel = catalogEntry?.models.find((model) => model !== original.model) ?? null;
+            const targetModel = altModel ?? original.model;
             const targetThought =
-              original.thoughtLevels.find((level) => level !== original.thought) ?? null;
+              altModel === null
+                ? (original.thoughtLevels.find((level) => level !== original.thought) ?? null)
+                : original.thoughtLevels.includes(original.thought ?? "")
+                  ? original.thought
+                  : (original.thoughtLevels[0] ?? null);
             if (targetThought === null) {
               sendVerdict = "UNAVAILABLE:no-alternative";
             } else {
               const sendSwitch = async (
+                model: string,
                 thought: string,
                 revision: number
               ): Promise<{ kind: string; reasonCode?: string | null }> => {
@@ -2307,7 +2346,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
                   identity,
                   target: bound,
                   commandType: "switchModelConfig",
-                  payload: { provider: original.provider, model: original.model, thought },
+                  payload: { provider: original.provider, model, thought },
                   baseRevision: revision,
                   clientId,
                   ackMs: SEND_ACK_TIMEOUT_MS,
@@ -2325,25 +2364,38 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
               };
               selection.target = {
                 provider: original.provider,
-                model: original.model,
+                model: targetModel,
                 thought: targetThought,
+                modelChanged: targetModel !== original.model,
               };
-              selection.switch = await sendSwitch(targetThought, baseRevision);
+              selection.switch = await sendSwitch(targetModel, targetThought, baseRevision);
               const confirmed = await waitSnapshot(() => {
                 const current = readConfigFromSnapshot(latestSnapshot);
-                return current && current.thought === targetThought ? current : null;
+                return current && current.thought === targetThought && current.model === targetModel
+                  ? current
+                  : null;
               }, 15_000);
-              selection.confirmed = confirmed ? { thought: confirmed.thought } : null;
+              selection.confirmed = confirmed
+                ? { model: confirmed.model, thought: confirmed.thought }
+                : null;
               // 恢复原值（best-effort；即使确认失败也执行）
               const revisionNow = (latestSnapshot as { revision?: unknown } | null)?.revision;
               let restored = false;
               if (original.thought) {
                 const restoreRevision =
                   typeof revisionNow === "number" ? revisionNow : baseRevision;
-                selection.restore = await sendSwitch(original.thought, restoreRevision);
+                selection.restore = await sendSwitch(
+                  original.model,
+                  original.thought,
+                  restoreRevision
+                );
                 const restoredConfig = await waitSnapshot(() => {
                   const current = readConfigFromSnapshot(latestSnapshot);
-                  return current && current.thought === original.thought ? current : null;
+                  return current &&
+                    current.thought === original.thought &&
+                    current.model === original.model
+                    ? current
+                    : null;
                 }, 15_000);
                 restored = restoredConfig !== null;
               } else {
