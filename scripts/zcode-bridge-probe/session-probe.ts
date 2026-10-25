@@ -2339,7 +2339,9 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
                 })) ?? null,
             };
             const catalogEntry =
-              viewCatalog?.find((entry) => entry.provider === original.provider) ?? null;
+              viewCatalog?.find((entry) => entry.provider === original.provider) ??
+              viewCatalog?.find((entry) => entry.models.includes(original.model)) ??
+              null;
             const altModel = catalogEntry?.models.find((model) => model !== original.model) ?? null;
             const targetModel = altModel ?? original.model;
             const targetThought =

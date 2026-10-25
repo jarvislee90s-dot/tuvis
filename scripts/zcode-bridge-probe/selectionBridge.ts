@@ -90,7 +90,9 @@ export function resolveCatalogFromView(raw: unknown): CatalogEntry[] | null {
   for (const provider of providers) {
     if (!provider || typeof provider !== "object") return null;
     const record = provider as Record<string, unknown>;
-    const providerId = asString(record.id) ?? asString(record.provider);
+    // 官方 ModelSelectionView：providers[].providerId / models[].modelId（facades.ts:183-205）。
+    const providerId =
+      asString(record.providerId) ?? asString(record.id) ?? asString(record.provider);
     const models = Array.isArray(record.models) ? record.models : [];
     if (!providerId || models.length === 0) return null;
     const modelIds: string[] = [];
@@ -98,7 +100,8 @@ export function resolveCatalogFromView(raw: unknown): CatalogEntry[] | null {
     for (const model of models) {
       if (!model || typeof model !== "object") return null;
       const modelRecord = model as Record<string, unknown>;
-      const modelId = asString(modelRecord.id) ?? asString(modelRecord.model);
+      const modelId =
+        asString(modelRecord.modelId) ?? asString(modelRecord.id) ?? asString(modelRecord.model);
       if (!modelId) return null;
       modelIds.push(modelId);
       const levels =
