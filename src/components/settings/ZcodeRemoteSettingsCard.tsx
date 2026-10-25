@@ -79,6 +79,8 @@ export function ZcodeRemoteSettingsCard() {
 
   const savedUrl = config?.url ?? null;
   const configState = readFailed ? "readFailed" : (config?.configState ?? "loading");
+  // 首拍未回来之前禁止编辑/保存：否则用户刚粘贴的链接会被迟到的 GET 无条件覆盖。
+  const loading = config === null && !readFailed;
   // 卡头简短状态：四种形态各一句，全部只说「本机配置」，不说联机
   const stateLabel =
     configState === "saved"
@@ -183,7 +185,7 @@ export function ZcodeRemoteSettingsCard() {
             autoComplete="off"
             aria-invalid={error !== null}
             aria-describedby={error !== null ? `${HINT_ID} ${ERROR_ID}` : HINT_ID}
-            disabled={saving}
+            disabled={saving || loading}
             onChange={(e) => setDraft(e.target.value)}
             className="font-mono text-xs"
           />
@@ -191,7 +193,7 @@ export function ZcodeRemoteSettingsCard() {
             <Button
               size="sm"
               data-testid="zcode-save"
-              disabled={saving}
+              disabled={saving || loading}
               onClick={() => void persist(draft)}
             >
               {t("settings.remote.save")}
@@ -201,7 +203,7 @@ export function ZcodeRemoteSettingsCard() {
               size="sm"
               variant="outline"
               data-testid="zcode-delete"
-              disabled={saving || configState !== "saved"}
+              disabled={saving || loading || configState !== "saved"}
               onClick={() => void persist("")}
             >
               {t("settings.remote.zcode.delete")}

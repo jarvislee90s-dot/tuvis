@@ -204,7 +204,7 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
       if (raw === undefined) return "--wait-ms 需要一个毫秒值";
       const value = Number(raw);
       if (!Number.isFinite(value) || value <= 0 || value > 3_600_000) {
-        return `--wait-ms 必须是 (0, 3600000] 内的毫秒数，收到：${raw}`;
+        return "--wait-ms 必须是 (0, 3600000] 内的毫秒数";
       }
       flags.oauthWaitMs = value;
       if (arg === "--wait-ms") i += 1;
@@ -214,7 +214,7 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
       if (value === "zai" || value === "bigmodel") {
         flags.provider = value;
       } else {
-        return `--provider 只接受 zai | bigmodel，收到：${value || "(空)"}`;
+        return "--provider 只接受 zai | bigmodel";
       }
     } else if (arg === "--provider") {
       return "--provider 需要 =<值> 形式，例如 --provider=bigmodel";
@@ -503,6 +503,8 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           ? "请在浏览器打开下面的官方授权 URL，并用你的国内智谱（bigmodel.cn）账号完成授权（探针绝不代登）："
           : "请在浏览器打开下面的官方授权 URL，并用你的 ZCode 账号完成授权（探针绝不代登）："
       );
+      // 该行故意打印到 stdout 供用户点击；state/link 已登记 redactor，落入证据文件时
+      // 只会是别名。stdout 不属于证据落盘面，也不写仓库/日志文件。
       log(`  ${authorizeUrl}`);
       if (parsed.open) {
         log(

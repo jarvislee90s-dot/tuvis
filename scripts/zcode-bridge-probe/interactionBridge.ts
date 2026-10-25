@@ -166,6 +166,13 @@ export class PendingBook {
   private readonly consumedIds = new Set<string>();
   private lastControl: Record<string, unknown> | null = null;
   /**
+   * 宿主最近一次宣告的 pending id 集合（消费前快照）。本地 `consume()` 只改本地册，
+   * 不改这里——「已过三查闸」不等于「宿主已把卡撤掉」。终态确认必须看宿主集合。
+   */
+  private lastHostPendingIds = new Set<string>();
+  /** 宿主 pending 集合的观察代数：每次 snapshot / pendingInteractions patch +1。 */
+  private hostPendingRevisionCounter = 0;
+  /**
    * control 观察代数：每次收到带 control 的 snapshot / state.updated patch +1。
    * interrupt 关联（I1）用它做基线——只有**触发帧发出之后**收到的 control 更新
    * 观察到的 stop 目标才可被采用（触发前的旧执行 id 不得被误停）。
@@ -196,6 +203,30 @@ export class PendingBook {
   /** 最近一次观察到的 control 状态（stop 守卫 id 来源；未观察 = null）。 */
   get control(): Record<string, unknown> | null {
     return this.lastControl;
+  }
+
+  /** 宿主 pending 集合的观察代数（ACK 前后各取一次，用来证明收到过新帧）。 */
+  get hostPendingRevision(): number {
+    return this.hostPendingRevisionCounter;
+  }
+
+  /**
+   * 宿主最近一次宣告里是否仍有该卡。应答 ACK 后必须等到这里变 false（且代数前进）
+   * 才算终态清除；本地 consume 不参与判断。
+   */
+  hostHasPending(interactionId: string): boolean {
+    return this.lastHostPendingIds.has(interactionId);
+  }
+
+  /** control.activeWorks 里是否仍有该 foregroundExecutionId（stop 终态确认用）。 */
+  hasForegroundExecution(executionId: string): boolean {
+    if (!this.lastControl) return false;
+    const activeWorks = (this.lastControl as { activeWorks?: unknown }).activeWorks;
+    if (!Array.isArray(activeWorks)) return false;
+    return activeWorks.some((work) => {
+      if (!work || typeof work !== "object") return false;
+      return (work as { foregroundExecutionId?: unknown }).foregroundExecutionId === executionId;
+    });
   }
 
   /** control 观察代数（触发前取基线，observeStopTarget 只认基线之后的新值）。 */
@@ -333,6 +364,17 @@ export class PendingBook {
 
   /** 整体替换（键级语义：不深合并，delta.ts:8）；行形状校验不过的跳过计数。 */
   private replacePendings(incoming: unknown[]): void {
+    // 先记宿主宣告的 id 集合（含已本地消费的 id）：这是终态清除的唯一 wire 证据。
+    this.lastHostPendingIds = new Set(
+      incoming
+        .map((candidate) =>
+          candidate && typeof candidate === "object"
+            ? (candidate as { interactionId?: unknown }).interactionId
+            : null
+        )
+        .filter((id): id is string => typeof id === "string" && id.length > 0)
+    );
+    this.hostPendingRevisionCounter += 1;
     this.pendings.clear();
     for (const candidate of incoming) {
       if (!candidate || typeof candidate !== "object") {

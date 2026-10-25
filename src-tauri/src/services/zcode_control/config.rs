@@ -88,6 +88,8 @@ pub enum ConfigError {
     SidInvalid,
     /// 其他已知身份字段（如 mid）重复。
     ParamDuplicate,
+    /// settings KV 写入失败（磁盘/锁/表缺失等）——不得向调用方回传 Saved/Missing。
+    Storage,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -104,6 +106,7 @@ impl std::fmt::Display for ConfigError {
             Self::SidDuplicate => "ZCODE_URL_SID_DUPLICATE: 链接中 sid 参数重复",
             Self::SidInvalid => "ZCODE_URL_SID_INVALID: sid 不能为空且不得超过 128 字节",
             Self::ParamDuplicate => "ZCODE_URL_PARAM_DUPLICATE: 链接中身份参数重复",
+            Self::Storage => "ZCODE_URL_STORAGE: 设置写入失败，原配置未改变",
         })
     }
 }
@@ -198,13 +201,15 @@ pub fn get_config(conn: &Connection) -> ZcodeRemoteConfig {
 pub fn set_config(conn: &Connection, raw: &str) -> Result<ZcodeRemoteConfig, ConfigError> {
     match validate_official_url(raw)? {
         Some(url) => {
-            crate::database::dao::settings::set_setting_conn(conn, CONFIG_KEY, &url);
+            crate::database::dao::settings::try_set_setting_conn(conn, CONFIG_KEY, &url)
+                .map_err(|_| ConfigError::Storage)?;
             Ok(ZcodeRemoteConfig::saved(url))
         }
         None => {
             // 空白保存与删除同源：写空串，读取口径统一视为 Missing（复用既有 DAO，
             // 不引入行删除接口；行存在但值为空不构成配置）
-            crate::database::dao::settings::set_setting_conn(conn, CONFIG_KEY, "");
+            crate::database::dao::settings::try_set_setting_conn(conn, CONFIG_KEY, "")
+                .map_err(|_| ConfigError::Storage)?;
             Ok(ZcodeRemoteConfig::missing())
         }
     }
@@ -407,6 +412,17 @@ mod tests {
 
         // 存储空白 = 未配置（不判坏值）
         set_setting_conn(&conn, CONFIG_KEY, "   ");
+        assert_eq!(get_config(&conn).config_state, ConfigState::Missing);
+    }
+
+    /// 复审回归：DB 写失败必须回传 Storage，绝不能假报 Saved/Missing。
+    #[test]
+    fn storage_failure_never_reports_saved() {
+        // 无 schema 的空库：settings 表不存在 → INSERT 必失败
+        let conn = Connection::open_in_memory().unwrap();
+        let valid = "https://zcode.z.ai/remote/v4?sid=synthetic-sid-3001";
+        assert_eq!(set_config(&conn, valid), Err(ConfigError::Storage));
+        assert_eq!(set_config(&conn, ""), Err(ConfigError::Storage));
         assert_eq!(get_config(&conn).config_state, ConfigState::Missing);
     }
 }

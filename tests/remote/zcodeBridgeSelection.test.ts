@@ -46,7 +46,10 @@ const CATALOG: CatalogEntry[] = [
   {
     provider: "bigmodel",
     models: ["glm-5.3-flash", "glm-5.3-pro"],
-    thoughtLevels: ["low", "medium", "high", "max"],
+    thoughtLevelsByModel: {
+      "glm-5.3-flash": ["low", "medium", "high"],
+      "glm-5.3-pro": ["low", "medium", "high", "max"],
+    },
   },
 ];
 
@@ -61,9 +64,23 @@ describe("B4 selection contract", () => {
     expect(readConfigFromSnapshot({})).toBeNull();
     expect(readConfigFromSnapshot({ config: { provider: "x" } })).toBeNull();
     expect(resolveCatalogFromSnapshot(SNAPSHOT)).toEqual([
-      { provider: "bigmodel", models: ["glm-5.3-flash"], thoughtLevels: ["low", "medium", "high"] },
+      {
+        provider: "bigmodel",
+        models: ["glm-5.3-flash"],
+        thoughtLevelsByModel: { "glm-5.3-flash": ["low", "medium", "high"] },
+      },
     ]);
     expect(resolveCatalogFromView(VIEW)).toEqual(CATALOG);
+  });
+
+  it("thought_levels_are_validated_per_model", () => {
+    // flash 不支持 max（max 只属于 pro）——provider 级并集校验会误放行，逐模型校验必须拒绝
+    expect(() =>
+      assertSwitchable(CATALOG, { provider: "bigmodel", model: "glm-5.3-flash", thought: "max" })
+    ).toThrow(/unsupported-thought-level/);
+    expect(() =>
+      assertSwitchable(CATALOG, { provider: "bigmodel", model: "glm-5.3-pro", thought: "max" })
+    ).not.toThrow();
   });
 
   it("only_server_supported_ids_accepted", () => {

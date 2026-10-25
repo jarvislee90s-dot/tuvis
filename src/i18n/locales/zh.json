@@ -2102,7 +2102,8 @@
     "zcodeUrlSidMissing": "链接缺少 sid 参数",
     "zcodeUrlSidDuplicate": "链接中 sid 参数重复",
     "zcodeUrlSidInvalid": "sid 不能为空且不得超过 128 字节",
-    "zcodeUrlParamDuplicate": "链接中身份参数重复"
+    "zcodeUrlParamDuplicate": "链接中身份参数重复",
+    "zcodeUrlStorage": "设置写入失败，原配置未改变"
   },
   "mobile": {
     "common": {

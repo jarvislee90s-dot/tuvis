@@ -120,7 +120,12 @@ import {
   writeEvidenceFiles,
 } from "./sanitize.ts";
 import { readOfficialLinkFromSettings } from "./settingsLink.ts";
-import { readConfigFromSnapshot, resolveCatalogFromView } from "./selectionBridge.ts";
+import {
+  assertSwitchable,
+  readConfigFromSnapshot,
+  resolveCatalogFromSnapshot,
+  resolveCatalogFromView,
+} from "./selectionBridge.ts";
 
 /** 探针安全闸（红线，工作包 B 全局约束）：全部硬编码，运行期不可放宽。 */
 export const PROBE_GUARDS = {
@@ -188,13 +193,18 @@ const SEND_ACTIVITY_TIMEOUT_MS = 30_000;
 const INTERACTION_PENDING_WAIT_MS = 30_000;
 /** interrupt 模式下等待 control.activeWorks.foregroundExecutionId 的有界窗。 */
 const INTERACTION_FOREGROUND_WAIT_MS = 30_000;
+/**
+ * ACK 之后的**终态观察窗**：必须等到宿主撤卡（answer/approval）或守卫执行从
+ * control 消失（interrupt）才能报 RESOLVED/STOPPED；超窗只报 ACCEPTED:unconfirmed。
+ */
+const INTERACTION_TERMINAL_WAIT_MS = 10_000;
 
 /**
  * 按运行模式派生的安全闸（I5）：B3 交互 run 实际会发 2 个命令帧（触发 + 应答/stop），
  * 若沿用 B2 的 maxSendFrames:1 与 sendRequiresExplicitFlag，证据里的闸与实际行为不符。
  * 交互模式额外允许最多 1 个 autoResolution snooze 前置帧（I4；仅当卡上
  * autoResolution 在场，见 interaction.snooze 证据），总命令帧 ≤3。
- * 时长预算：B2 链 180s + 触发 ACK 20s + 观察窗 30s + 应答 ACK 20s = 250s。
+ * 时长预算：B2 链 180s + 触发 ACK 20s + 观察窗 30s + 应答 ACK 20s + 终态窗 10s = 260s。
  */
 export type ProbeGuardSet = {
   readonly singleConnection: true;
@@ -238,7 +248,8 @@ export function deriveProbeGuards(mode: InteractionMode | null): ProbeGuardSet {
       PROBE_GUARDS.maxDurationMs +
       SEND_ACK_TIMEOUT_MS +
       INTERACTION_PENDING_WAIT_MS +
-      SEND_ACK_TIMEOUT_MS,
+      SEND_ACK_TIMEOUT_MS +
+      INTERACTION_TERMINAL_WAIT_MS,
     credentialsInMemoryOnly: PROBE_GUARDS.credentialsInMemoryOnly,
   };
 }
@@ -384,7 +395,7 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
     else if (arg.startsWith("--interaction=")) {
       const value = arg.slice("--interaction=".length).trim();
       if (!INTERACTION_MODES.includes(value as InteractionMode)) {
-        return `--interaction 只接受 ${INTERACTION_MODES.join(" | ")}，收到：${value || "(空)"}`;
+        return `--interaction 只接受 ${INTERACTION_MODES.join(" | ")}`;
       }
       flags.interaction = value as InteractionMode;
     } else if (arg === "--interaction") {
@@ -393,7 +404,7 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
       const value = arg.slice("--submission-mode=".length).trim();
       const modes = ["build", "edit", "plan", "yolo", "guarded"];
       if (!modes.includes(value)) {
-        return `--submission-mode 只接受 ${modes.join(" | ")}，收到：${value || "(空)"}`;
+        return `--submission-mode 只接受 ${modes.join(" | ")}`;
       }
       flags.submissionMode = value;
     } else if (arg === "--open") flags.open = true;
@@ -412,14 +423,14 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
       if (raw === undefined) return "--wait-ms 需要一个毫秒值";
       const value = Number(raw);
       if (!Number.isFinite(value) || value <= 0 || value > 3_600_000) {
-        return `--wait-ms 必须是 (0, 3600000] 内的毫秒数，收到：${raw}`;
+        return "--wait-ms 必须是 (0, 3600000] 内的毫秒数";
       }
       flags.oauthWaitMs = value;
       if (arg === "--wait-ms") i += 1;
     } else if (arg.startsWith("--provider=")) {
       const value = arg.slice("--provider=".length).trim();
       if (value === "zai" || value === "bigmodel") flags.provider = value;
-      else return `--provider 只接受 zai | bigmodel，收到：${value || "(空)"}`;
+      else return "--provider 只接受 zai | bigmodel";
     } else if (arg === "--provider") {
       return "--provider 需要 =<值> 形式，例如 --provider=bigmodel";
     } else if (arg.startsWith("--sid=")) {
@@ -444,7 +455,7 @@ function printHelp(): void {
   lines.push("");
   lines.push("用法：node scripts/zcode-bridge-probe/session-probe.ts <flags>");
   lines.push(
-    "      node scripts/zcode-bridge-probe/interaction-probe.ts <approve|reject|answer|interrupt> <flags>"
+    "      node scripts/zcode-bridge-probe/interaction-probe.ts <approve|reject|answer|interrupt|select> <flags>"
   );
   lines.push("");
   lines.push("安全闸（硬编码，不可放宽）：");
@@ -457,7 +468,7 @@ function printHelp(): void {
   );
   lines.push("                             缺席时映射完成后只打印 WOULD-send 即停，绝不发送。");
   lines.push(
-    `  --interaction=<mode>      B3 交互半场：approve | reject | answer | interrupt（缺省无）。`
+    `  --interaction=<mode>      B3/B4 交互半场：approve | reject | answer | interrupt | select（缺省无）。`
   );
   lines.push(
     "                             仅与 --interaction-authorized 同时给出才执行；approve/reject 发无害"
@@ -467,6 +478,12 @@ function printHelp(): void {
   );
   lines.push(
     "                             长跑指令后按 activeWorks 守卫 id 精确 stop；证据落 macos-B3<run_id>。"
+  );
+  lines.push(
+    "                             select 走 B4：读 snapshot.config → 同 provider 内切模型/档位 →"
+  );
+  lines.push(
+    "                             新鲜快照确认 → 探针清理恢复原值（不触发会话指令，证据落 macos-B4<run_id>）。"
   );
   lines.push(
     "  --interaction-authorized  交互半场解锁（与 --interaction 成对；缺一即映射后只打印 WOULD-interact）。"
@@ -817,25 +834,36 @@ export class B2Channel {
   }
 
   /**
-   * 桥 Channel 消息证据：结构化记录（header 元数据 + body 预览），超过上限丢弃。
-   * B2 修复：此前存 `Buffer→utf8` 的 lossy 原文，二进制帧（Initialize =
-   * `04 01 06 C8 01 00`，channelServer.ts:45-47）在证据里变成乱码、且因
-   * decodeChannelMessage 旧门（Array ≥ 2）解不出而完全不可读。
+   * 桥 Channel 消息证据：只记结构头；正文一律不落盘（普通帧可能带会话正文），
+   * Initialize 固定握手用 hex 保留可诊断性。超过上限丢弃。
    */
   private recordBridgeMessage(decoded: DecodedChannelMessage | null, bytes: Uint8Array): void {
     if (this.bridgeMessages.length >= 64) return;
-    const entry = {
-      kind: "channel-message",
-      bytes: bytes.byteLength,
-      headerType: decoded?.headerType ?? null,
-      id: decoded?.id ?? null,
-      channelName: decoded?.channelName ?? null,
-      method: decoded?.method ?? null,
-      initialize: decoded?.headerType === RESPONSE_TYPE_INITIALIZE,
-      bodyPreview: Buffer.from(bytes).toString("utf8").slice(0, 2048),
-    };
-    this.bridgeMessages.push(JSON.stringify(entry));
+    this.bridgeMessages.push(JSON.stringify(bridgeMessageEvidence(decoded, bytes)));
   }
+}
+
+/**
+ * 桥消息证据（复审修正）：正文一律不落盘——普通帧可能携带会话正文/题干/身份，
+ * 字符串化后只做外层对象红查是挡不住的。只记结构元数据；Initialize 是固定二进制
+ * 握手（`04 01 06 C8 01 00`），用 hex 保留可诊断性且无秘密。
+ */
+export function bridgeMessageEvidence(
+  decoded: DecodedChannelMessage | null,
+  bytes: Uint8Array
+): Record<string, unknown> {
+  return {
+    kind: "channel-message",
+    bytes: bytes.byteLength,
+    headerType: decoded?.headerType ?? null,
+    id: decoded?.id ?? null,
+    channelName: decoded?.channelName ?? null,
+    method: decoded?.method ?? null,
+    initialize: decoded?.headerType === RESPONSE_TYPE_INITIALIZE,
+    ...(decoded?.headerType === RESPONSE_TYPE_INITIALIZE
+      ? { bodyHex: Buffer.from(bytes).toString("hex") }
+      : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,6 +1256,8 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
             ? "请在浏览器打开下面的官方授权 URL，并用你的国内智谱（bigmodel.cn）账号完成授权："
             : "请在浏览器打开下面的官方授权 URL，并用你的 ZCode 账号完成授权："
         );
+        // 该行故意打印到 stdout 供用户点击；state/link 已登记 redactor，落入证据文件时
+        // 只会是别名。stdout 不属于证据落盘面，也不写仓库/日志文件。
         log(`  ${authorizeUrl}`);
         if (parsed.open) {
           log(
@@ -2297,7 +2327,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
             snapshot as { availability?: { switchModelConfig?: { allowed?: unknown } } }
           ).availability?.switchModelConfig;
           const revisionRaw = (snapshot as { revision?: unknown }).revision;
-          let baseRevision = typeof revisionRaw === "number" ? revisionRaw : null;
+          const baseRevision = typeof revisionRaw === "number" ? revisionRaw : null;
           selection.original = original
             ? { provider: original.provider, model: original.model, thought: original.thought }
             : null;
@@ -2330,8 +2360,14 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
               viewOutcome.kind === "ok"
                 ? (viewOutcome.decoded.body as Record<string, unknown> | null)
                 : null;
+            // getView 会返回多个 provider（含其他账号）；只有当前会话 provider 的目录
+            // 才能用于选择。缺当前 provider → 退回会话快照目录（仅当前模型 + 档位）。
+            const snapshotCatalog = resolveCatalogFromSnapshot(snapshot);
+            const hasSessionProvider =
+              viewCatalog?.some((entry) => entry.provider === original.provider) ?? false;
+            const catalogForSession = hasSessionProvider ? viewCatalog : snapshotCatalog;
             selection.catalog = {
-              source: viewCatalog ? "model-selection.getView" : "snapshot.config",
+              source: hasSessionProvider ? "model-selection.getView" : "snapshot.config",
               outcome: viewOutcome.kind,
               shape: viewBody
                 ? {
@@ -2351,17 +2387,21 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
                 })) ?? null,
             };
             const catalogEntry =
-              viewCatalog?.find((entry) => entry.provider === original.provider) ??
-              viewCatalog?.find((entry) => entry.models.includes(original.model)) ??
-              null;
+              catalogForSession?.find((entry) => entry.provider === original.provider) ?? null;
             const altModel = catalogEntry?.models.find((model) => model !== original.model) ?? null;
             const targetModel = altModel ?? original.model;
+            // 档位必须取**目标模型自己的**列表（provider 级并集会把仅 pro 支持的
+            // max 误用到 flash 上）。
+            const targetLevels =
+              catalogEntry && altModel
+                ? (catalogEntry.thoughtLevelsByModel[altModel] ?? [])
+                : original.thoughtLevels;
             const targetThought =
               altModel === null
-                ? (original.thoughtLevels.find((level) => level !== original.thought) ?? null)
-                : original.thoughtLevels.includes(original.thought ?? "")
+                ? (targetLevels.find((level) => level !== original.thought) ?? null)
+                : targetLevels.includes(original.thought ?? "")
                   ? original.thought
-                  : (original.thoughtLevels[0] ?? null);
+                  : (targetLevels[0] ?? null);
             if (targetThought === null) {
               sendVerdict = "UNAVAILABLE:no-alternative";
             } else {
@@ -2370,6 +2410,21 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
                 thought: string,
                 revision: number
               ): Promise<{ kind: string; reasonCode?: string | null }> => {
+                if (catalogForSession === null) {
+                  return { kind: "rejected", reasonCode: "no-catalog" };
+                }
+                try {
+                  assertSwitchable(catalogForSession, {
+                    provider: original.provider,
+                    model,
+                    thought,
+                  });
+                } catch (e) {
+                  return {
+                    kind: "rejected",
+                    reasonCode: `unsupported-selection: ${(e as Error).message}`,
+                  };
+                }
                 const loop = new InteractionCommandLoop({
                   sender: conn,
                   identity,
@@ -2453,6 +2508,7 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           markerPrefix: INTERACTION_MARKER_PREFIX,
           pendingWaitMs: INTERACTION_PENDING_WAIT_MS,
           foregroundWaitMs: INTERACTION_FOREGROUND_WAIT_MS,
+          terminalWaitMs: INTERACTION_TERMINAL_WAIT_MS,
         };
         sendSummary.interaction = interaction;
         const sleepMs = (ms: number): Promise<void> =>
@@ -2756,6 +2812,70 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
           // 订阅链证据：EventFire / wire 帧 / fragment 重组 / 交付计数（不含 subscriptionId）。
           subscription: { ...topicSubscription.counters },
         };
+        // 终态观察（复审 C2）：ACK accepted ≠ 已生效。answer/approval 必须看到宿主
+        // 撤卡（host pending 集合代数前进且 id 不在其中）；interrupt 必须看到守卫执行
+        // 从 control 消失。超窗只报 ACCEPTED:unconfirmed，绝不把受理当成功。
+        const modeAtSend = interactionMode;
+        const observeTerminal = async (
+          baselineRevision: number
+        ): Promise<Record<string, unknown>> => {
+          const startedAt = Date.now();
+          const waited = () => Date.now() - startedAt;
+          if (modeAtSend === "interrupt") {
+            const guardId = observedStopTarget?.foregroundExecutionId ?? null;
+            if (guardId === null) {
+              return { observed: false, kind: "no-guard-id", waitedMs: 0 };
+            }
+            while (waited() < INTERACTION_TERMINAL_WAIT_MS) {
+              if (
+                book.controlRevision > baselineRevision &&
+                !book.hasForegroundExecution(guardId)
+              ) {
+                return {
+                  observed: true,
+                  kind: "guard-cleared",
+                  waitedMs: waited(),
+                  controlRevisionBefore: baselineRevision,
+                  controlRevisionAfter: book.controlRevision,
+                };
+              }
+              await sleepMs(25);
+            }
+            return {
+              observed: false,
+              kind: "guard-still-active",
+              waitedMs: waited(),
+              controlRevisionBefore: baselineRevision,
+              controlRevisionAfter: book.controlRevision,
+            };
+          }
+          const interactionId = pendingInteractionId;
+          if (interactionId === null) {
+            return { observed: false, kind: "no-interaction-id", waitedMs: 0 };
+          }
+          while (waited() < INTERACTION_TERMINAL_WAIT_MS) {
+            if (
+              book.hostPendingRevision > baselineRevision &&
+              !book.hostHasPending(interactionId)
+            ) {
+              return {
+                observed: true,
+                kind: "pending-cleared",
+                waitedMs: waited(),
+                hostPendingRevisionBefore: baselineRevision,
+                hostPendingRevisionAfter: book.hostPendingRevision,
+              };
+            }
+            await sleepMs(25);
+          }
+          return {
+            observed: false,
+            kind: "pending-still-present",
+            waitedMs: waited(),
+            hostPendingRevisionBefore: baselineRevision,
+            hostPendingRevisionAfter: book.hostPendingRevision,
+          };
+        };
         if (unavailable !== null) {
           sendVerdict = unavailable;
           interaction.resolution = { attempted: false, reason: unavailable };
@@ -2775,6 +2895,10 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
             commandType,
             payload,
           });
+          // 终态基线在发命令前取：只认命令之后宿主新宣告的 pending/control 状态。
+          const terminalBaseline =
+            interactionMode === "interrupt" ? book.controlRevision : book.hostPendingRevision;
+          let resolutionOutcome: { kind: string; reasonCode?: string | null } | null = null;
           for (const step of steps) {
             const loop = new InteractionCommandLoop({
               sender: conn,
@@ -2815,21 +2939,40 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
               autoResolution,
             };
             record(ctx, "interaction", "resolution", interaction.resolution);
-            sendVerdict =
-              outcome.kind === "accepted"
-                ? interactionMode === "interrupt"
-                  ? "STOPPED:interrupt-accepted"
-                  : "RESOLVED"
-                : outcome.kind === "noop"
-                  ? `NOOP:${outcome.reasonCode ?? "unknown"}`
-                  : outcome.kind === "rejected"
-                    ? `REJECTED:${outcome.reasonCode ?? "unknown"}`
-                    : outcome.kind === "send-failed"
-                      ? "STOPPED:interaction-send-failed"
-                      : "UNKNOWN";
+            resolutionOutcome = outcome;
             log(
               `interaction outcome = ${outcome.kind}；framesSent=${loop.framesSent}，peerAck=${loop.peerAcknowledged}。`
             );
+          }
+          if (resolutionOutcome !== null) {
+            if (resolutionOutcome.kind !== "accepted") {
+              sendVerdict =
+                resolutionOutcome.kind === "noop"
+                  ? `NOOP:${resolutionOutcome.reasonCode ?? "unknown"}`
+                  : resolutionOutcome.kind === "rejected"
+                    ? `REJECTED:${resolutionOutcome.reasonCode ?? "unknown"}`
+                    : resolutionOutcome.kind === "send-failed"
+                      ? "STOPPED:interaction-send-failed"
+                      : "UNKNOWN";
+            } else {
+              const terminal = await observeTerminal(terminalBaseline);
+              interaction.terminal = terminal;
+              record(ctx, "interaction", "terminal", terminal);
+              const confirmed = terminal.observed === true;
+              if (interactionMode === "interrupt") {
+                sendVerdict = confirmed
+                  ? "STOPPED:interrupt-confirmed"
+                  : "ACCEPTED:interrupt-unconfirmed";
+              } else {
+                sendVerdict = confirmed
+                  ? "RESOLVED:pending-cleared"
+                  : "ACCEPTED:pending-unconfirmed";
+              }
+              log(
+                `interaction terminal = ${String(terminal.kind)}（observed=${String(confirmed)}，` +
+                  `waitedMs=${String(terminal.waitedMs)}）。`
+              );
+            }
           }
         }
       }

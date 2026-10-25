@@ -30,7 +30,11 @@ export type SessionConfigView = {
 export type CatalogEntry = {
   provider: string;
   models: string[];
-  thoughtLevels: string[];
+  /**
+   * 每个模型**自己的**档位。禁止把同 provider 下所有模型的档位并成一份
+   * （模型 A 不得使用仅模型 B 支持的档位；实测目录里各模型档位可不同）。
+   */
+  thoughtLevelsByModel: Record<string, string[]>;
 };
 
 export type SwitchModelConfigCommand = {
@@ -96,7 +100,7 @@ export function resolveCatalogFromView(raw: unknown): CatalogEntry[] | null {
     const models = Array.isArray(record.models) ? record.models : [];
     if (!providerId || models.length === 0) return null;
     const modelIds: string[] = [];
-    const thoughtLevels = new Set<string>();
+    const thoughtLevelsByModel: Record<string, string[]> = {};
     for (const model of models) {
       if (!model || typeof model !== "object") return null;
       const modelRecord = model as Record<string, unknown>;
@@ -107,6 +111,7 @@ export function resolveCatalogFromView(raw: unknown): CatalogEntry[] | null {
       const levels =
         (modelRecord.config as { optionSpecs?: { reasoningLevel?: { values?: unknown } } })
           ?.optionSpecs?.reasoningLevel?.values ?? modelRecord.thoughtLevels;
+      const modelLevels: string[] = [];
       if (Array.isArray(levels)) {
         for (const level of levels) {
           const id =
@@ -115,11 +120,12 @@ export function resolveCatalogFromView(raw: unknown): CatalogEntry[] | null {
               : level && typeof level === "object"
                 ? asString((level as { value?: unknown }).value)
                 : null;
-          if (id) thoughtLevels.add(id);
+          if (id && !modelLevels.includes(id)) modelLevels.push(id);
         }
       }
+      thoughtLevelsByModel[modelId] = modelLevels;
     }
-    out.push({ provider: providerId, models: modelIds, thoughtLevels: [...thoughtLevels] });
+    out.push({ provider: providerId, models: modelIds, thoughtLevelsByModel });
   }
   return out;
 }
@@ -129,7 +135,11 @@ export function resolveCatalogFromSnapshot(snapshot: unknown): CatalogEntry[] | 
   const config = readConfigFromSnapshot(snapshot);
   if (!config) return null;
   return [
-    { provider: config.provider, models: [config.model], thoughtLevels: config.thoughtLevels },
+    {
+      provider: config.provider,
+      models: [config.model],
+      thoughtLevelsByModel: { [config.model]: config.thoughtLevels },
+    },
   ];
 }
 
@@ -147,8 +157,15 @@ export function assertSwitchable(
       `unsupported-model: ${target.model} is not a host model id (display names rejected)`
     );
   }
-  if (entry.thoughtLevels.length > 0 && !entry.thoughtLevels.includes(target.thought)) {
-    throw new Error(`unsupported-thought-level: ${target.thought} is not a host level id`);
+  const modelLevels = entry.thoughtLevelsByModel[target.model];
+  if (modelLevels === undefined) {
+    throw new Error(`unsupported-model: ${target.model} has no per-model thought-level entry`);
+  }
+  // 空数组 = 宿主未宣告该模型的档位（无法校验，沿用既有「不猜」语义）。
+  if (modelLevels.length > 0 && !modelLevels.includes(target.thought)) {
+    throw new Error(
+      `unsupported-thought-level: ${target.thought} is not supported by model ${target.model}`
+    );
   }
   return entry;
 }

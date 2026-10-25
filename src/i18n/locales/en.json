@@ -2102,7 +2102,8 @@
     "zcodeUrlSidMissing": "The link is missing the sid parameter",
     "zcodeUrlSidDuplicate": "The sid parameter appears more than once in the link",
     "zcodeUrlSidInvalid": "sid must not be empty and must not exceed 128 bytes",
-    "zcodeUrlParamDuplicate": "An identity parameter appears more than once in the link"
+    "zcodeUrlParamDuplicate": "An identity parameter appears more than once in the link",
+    "zcodeUrlStorage": "Failed to save settings — the previous configuration is unchanged"
   },
   "mobile": {
     "common": {

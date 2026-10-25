@@ -163,6 +163,31 @@ describe("ZcodeRemoteSettingsCard 默认收起（A5 zcode_card_starts_collapsed�
     expect(header()).toHaveAttribute("aria-expanded", "true");
   });
 
+  it("初始读取未回前禁止编辑/保存，迟到回填不会覆盖用户草稿", async () => {
+    let resolveGet!: (value: unknown) => void;
+    const pendingGet = new Promise<unknown>((resolve) => {
+      resolveGet = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "zcode_remote_config_get") return pendingGet;
+      return null;
+    });
+
+    render(<ToolRemoteSettingsSection />);
+    fireEvent.click(header());
+
+    // 读取未完成：输入框/保存/删除都不可操作（用户没有机会先粘贴再被覆盖）
+    expect(input()).toBeDisabled();
+    expect(screen.getByTestId("zcode-save")).toBeDisabled();
+    expect(screen.getByTestId("zcode-delete")).toBeDisabled();
+    expect(input().value).toBe("");
+
+    resolveGet(saved);
+    await waitFor(() => expect(input()).not.toBeDisabled());
+    expect(input().value).toBe(SAVED_URL);
+    expect(setCalls()).toHaveLength(0);
+  });
+
   it("未配置／历史坏值各给一句简短状态；读取只用 zcode_remote_config_get（不探测连接）", async () => {
     mockBackend(missing);
     const view = render(<ToolRemoteSettingsSection />);
