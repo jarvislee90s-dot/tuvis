@@ -974,7 +974,9 @@ function buildInteractionInstruction(mode: InteractionMode): string {
   switch (mode) {
     case "approve":
     case "reject":
-      return `${tag} 请创建一个名为 tuvis-b3-permission-test.txt 的临时文件（放在当前工作区根目录），内容写 tuvis-b3。完成后一句话说明结果。`;
+      // 文件写入在多数会话里免批（B3 实跑 230311Z 即直接建文件成功）；要触发
+      // permission 卡，用一条无害只读的 shell 命令（exec 审批最常见）。
+      return `${tag} 请在终端执行命令：pwd && echo tuvis-b3-shell-test。这是一条只读无害命令，执行后把输出原样告诉我。`;
     case "answer":
       return `${tag} 请用提问卡问我一个单选题，问题原文用「继续还是暂停？」，提供两个选项：继续 / 暂停。等我回答后再继续。`;
     case "interrupt":
