@@ -66,9 +66,25 @@ export function readConfigFromSnapshot(snapshot: unknown): SessionConfigView | n
 }
 
 /** 从 model-selection.getView() 应答解析目录（宿主值 only）。 */
-export function resolveCatalogFromView(view: unknown): CatalogEntry[] | null {
-  if (!view || typeof view !== "object") return null;
-  const providers = (view as { providers?: unknown }).providers;
+export function resolveCatalogFromView(raw: unknown): CatalogEntry[] | null {
+  if (!raw || typeof raw !== "object") return null;
+  // 官方 channel 应答可能带 {code,msg,data} 或 {result} 包装：逐层解包后找 providers。
+  const seen = new Set<unknown>();
+  let view: Record<string, unknown> | null = raw as Record<string, unknown>;
+  for (let depth = 0; view && depth < 3; depth += 1) {
+    if ("providers" in view && Array.isArray(view.providers)) break;
+    const next =
+      (view.data && typeof view.data === "object" ? view.data : null) ??
+      (view.result && typeof view.result === "object" ? view.result : null);
+    if (!next || seen.has(next)) {
+      view = null;
+      break;
+    }
+    seen.add(next);
+    view = next as Record<string, unknown>;
+  }
+  if (!view) return null;
+  const providers = view.providers;
   if (!Array.isArray(providers) || providers.length === 0) return null;
   const out: CatalogEntry[] = [];
   for (const provider of providers) {

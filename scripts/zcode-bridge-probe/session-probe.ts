@@ -2314,9 +2314,24 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
             bridgeMessageSeq += 1;
             const viewCatalog =
               viewOutcome.kind === "ok" ? resolveCatalogFromView(viewOutcome.decoded.body) : null;
+            const viewBody =
+              viewOutcome.kind === "ok"
+                ? (viewOutcome.decoded.body as Record<string, unknown> | null)
+                : null;
             selection.catalog = {
               source: viewCatalog ? "model-selection.getView" : "snapshot.config",
               outcome: viewOutcome.kind,
+              shape: viewBody
+                ? {
+                    keys: Object.keys(viewBody).slice(0, 12),
+                    providersType: Array.isArray(viewBody.providers)
+                      ? "array"
+                      : typeof viewBody.providers,
+                    nested: ["data", "result"].filter(
+                      (key) => viewBody[key] && typeof viewBody[key] === "object"
+                    ),
+                  }
+                : null,
               providers:
                 viewCatalog?.map((entry) => ({
                   provider: entry.provider,
