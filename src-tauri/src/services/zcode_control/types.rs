@@ -107,3 +107,50 @@ impl std::error::Error for ZcodeError {}
 
 /// 本域统一结果类型。
 pub type ZResult<T> = Result<T, ZcodeError>;
+
+/// relay 连接状态（wire 为 snake_case；与合同 [`ConnectionState`] 一一对应）。
+///
+/// - `connecting`：已开始握手、`pair_status=waiting` 等配对前态（**不是**已配对）；
+/// - `paired`：唯一「已配对」状态（官方 `pair_status=matched`）；
+/// - `offline`：网络掉线／路由窗超时／心跳超时／显式断开（终态，不自动重连）；
+/// - `conflict`：同 role 被踢（KICKED，终态，不自动重连）；
+/// - `needs_auth`：凭据缺失/失效（401/AUTH_FAILED）；
+/// - `unknown`：官方形态不符等无法归类的失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionState {
+    /// 未保存官方链接（由上层 Hub 判定；relay 自身不读取配置）。
+    NeedsConfig,
+    /// 需要（重新）授权。
+    NeedsAuth,
+    /// 握手中/等待配对（`waiting` 是合法配对前态）。
+    Connecting,
+    /// 已配对（官方 `pair_status=matched`）。
+    Paired,
+    /// 离线终态。
+    Offline,
+    /// 同 role 冲突终态（KICKED）。
+    Conflict,
+    /// 无法归类的状态。
+    Unknown,
+}
+
+/// 连接视图（wire camelCase）：`{state,generation,reasonCode,deviceLabel}`。
+///
+/// `deviceLabel` 仅供显示，**不能**用于绑定；`reasonCode` 只允许 [`codes`] 的冻结码。
+/// `generation` 随显式连接/断开推进，消费方必须丢弃旧代际的迟到结果。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionView {
+    pub state: ConnectionState,
+    pub generation: u64,
+    pub reason_code: Option<String>,
+    pub device_label: Option<String>,
+}
+
+impl ConnectionView {
+    /// 唯一「已配对」判定：`waiting`（connecting）不是人工批准，也不是 paired。
+    pub fn is_paired(&self) -> bool {
+        self.state == ConnectionState::Paired
+    }
+}
