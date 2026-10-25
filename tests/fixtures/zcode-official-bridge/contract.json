@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedBy": "B1（2026-10-24，source+fake 阶段；同日实连半场收官：auth.status 定案 proven，追加 live 证据）。2026-10-24 B2 准备阶段追加 operations 两条 live 已验只读操作（bootstrap-request / workspace-list-request）。2026-10-24 B2 实连收官：send 能力定案前移 true（run macos-B220261024T132316Z-prItvw 受理 accepted + 用户可见性确认，见 operations sendConversationCommandV4 行）；其余能力维持 false 待各自批次。2026-10-24/25 B3 实连收官：userInput / interrupt 定案前移 true（问答 run macos-B320261025T012945Z-aMtnqA、打断 run macos-B320261025T013128Z-X8HkPg），approval 维持 false 并记原因（run macos-B320261024T230311Z-aTrTIg：会话自动批准、指定测试会话无 pending 卡）；model / thoughtLevel 留 B4。2026-10-25 独立复审修正：按证据分层追加 approvalForTerminalSend=false、userInputMultiSelect/FreeText=false；answer/interrupt 的历史证据仅 ACK-only（未观察宿主撤卡/执行停止），探针现要求终态观察；补 switchModelConfig operation；token 一次性改为 source+fake 依据；桥消息证据停止记录正文。",
+  "generatedBy": "B1（2026-10-24，source+fake 阶段；同日实连半场收官：auth.status 定案 proven，追加 live 证据）。2026-10-24 B2 准备阶段追加 operations 两条 live 已验只读操作（bootstrap-request / workspace-list-request）。2026-10-24 B2 实连收官：send 能力定案前移 true（run macos-B220261024T132316Z-prItvw 受理 accepted + 用户可见性确认，见 operations sendConversationCommandV4 行）；其余能力维持 false 待各自批次。2026-10-24/25 B3 实连收官：userInput / interrupt 定案前移 true（问答 run macos-B320261025T012945Z-aMtnqA、打断 run macos-B320261025T013128Z-X8HkPg），approval 维持 false 并记原因（run macos-B320261024T230311Z-aTrTIg：会话自动批准、指定测试会话无 pending 卡）；model / thoughtLevel 留 B4。2026-10-25 独立复审修正：按证据分层追加 approvalForTerminalSend=false、userInputMultiSelect/FreeText=false；answer/interrupt 的历史证据仅 ACK-only（未观察宿主撤卡/执行停止），探针现要求终态观察；补 switchModelConfig operation；token 一次性改为 source+fake 依据；桥消息证据停止记录正文。 2026-10-25 第二轮复审：stop 绑定排除触发前执行（并要求触发 accepted/completed）、无可恢复档位拒绝切换、空档位列表 fail-closed、CLI 错误不再回显原值；route 绑定字段与 credentialPersistence 同步 B2/B5。",
   "evidenceRule": "本文件只收录已取证结论：source = 固定官方源码 zai-org/ZCode @ 3c5b227649371507ddc4eb46ac5133afe6db1cab 的客户端侧实现（行号引用）；fake = tests/remote/zcodeBridgeRelay.test.ts 的 in-test fake relay 锁形；live = 2026-10-24 B1 实连半场的脱敏私有证据（~/Documents/tuvis-verify-logs/zcode/<run_id>/，仓库内只引用 run id，真实值经 SecretRedactor fail-closed 闸从不入仓库/日志/夹具）。官方云 relay 服务端不在该仓库，服务端内部语义一律不得在本文件出现；未取证项不得以 TBD 或伪造 endpoint 占位。",
   "identity": {
     "platform": "macOS 27.0.1 arm64（B0 run_id macos-B20261024T142609+0800-k0zat1）",
@@ -14,7 +14,7 @@
     "interimMissing": "已解除（2026-10-24 实连半场）：interim 阶段的缺失项是「官方授权服务器是否接受 Tuvis 本地回环 redirect_uri」——用户在场浏览器实测，官方授权服务器（bigmodel.cn 通道，国内智谱账号）接受 127.0.0.1 回环 redirect，且共用交换端点签发有效账号 JWT，故定案 proven。共三次实连 OAuth 事件：①zai 通道 callback-timeout（run macos-B120261024T102434Z-SbxvWA）——用户账号在 BigModel 侧、通道不符，inconclusive 而非服务器拒绝；②bigmodel PROVEN；③bigmodel PROVEN（mid 修复后复跑）。",
     "flowName": "zai-web-oauth → zcode-jwt（POST /api/v1/oauth/token）→ 一次性 relay token（POST /api/v1/remote/token，Authorization: Bearer <jwt>，body {role:\"terminal\"}）→ WS /api/v1/remote/ws2?token=<一次性token> → auth_init{device_sid,meta,client_ts} → auth_ack{device_sid,pair_status:waiting|matched}",
     "tokenSourceKind": "relay 一次性短期 token：16 字节无填充 Base64URL 的 22 字符（末字符∈[AQgw]），带 expires_in（秒，正整数）；每次连接现取、不缓存、用后即弃；401 → auth-required 回登录。上游身份 = ZCode 账号 JWT（OAuth 换取，浏览器 localStorage 持有，过期即清空重登，无 refresh token 流）。live 实测（2026-10-24）：expires_in=60s、同一 run 两次申请值不同、每次连接现取新 token；「一次性」由 source+fake 约束（packages/shared/src/web-remote-relay/contract.ts:96-101；tests/remote/zcodeBridgeRelay.test.ts 过期/已消费 token 被拒），本轮未做重放拒绝实验。",
-    "credentialPersistence": "官方侧：桌面端仅持久化 device 注册记录（AppSettings.webRemoteControlRelayV2Device），JWT 在网页 localStorage、relay token 不落盘；Tuvis 侧：仍未定案——实连探针全程仅内存持有（JWT/一次性 token 随进程退出即弃，证据只见别名与掩码）；落盘候选方案留 B2 定案（工作包 B 计划 §B1 第 7 条约束维持）",
+    "credentialPersistence": "官方侧：桌面端仅持久化 device 注册记录（AppSettings.webRemoteControlRelayV2Device），JWT 在网页 localStorage、relay token 不落盘；Tuvis 侧已定案（B5 §2.3）：账号 JWT 仅本机内存、进程退出即弃；本轮不落 OS keychain（后续单列评估），不写 settings、不进日志、不进手机响应；relay token 同样内存持有、用后即弃；探针证据只见别名与掩码。",
     "evidence": [
       {
         "claim": "终端角色 token 请求：POST /api/v1/remote/token，Bearer jwt，body {role:\"terminal\"}，401→auth-required，一次性不缓存",
@@ -76,9 +76,9 @@
   "route": {
     "role": "terminal",
     "ownerScope": "同 device_sid 的 terminal 角色单 owner：新 terminal 连接会使旧连接收到 error{KICKED}（官方终端允许一次 2–5s 重连、60s 窗口内第二次即终态 session-conflict）；Tuvis 探针口径 = 收到 KICKED 直接终态停止，不自动重连、不夺 owner。2026-10-24 实连勘正：pair_status=waiting 是「终端尚未可路由到设备（缺 mid/设备离线）」状态，不是「等待用户在 APP 内批准」——官方流程没有 APP 侧配对确认步骤（用户观察与探针自动 matched 一致），「官方 30s 配对窗口（等待用户）」的旧假设就此勘正为「30s 路由窗口」；同 role 互踢语义不变（KICKED 证据维持）",
-    "workspaceBindingFields": [],
-    "sessionBindingFields": [],
-    "bindingNote": "relay 层唯一的绑定字段是 device_sid（官方链接的 sid 参数；auth_init/auth_ack 均以 device_sid 回显校验）；链接其余参数为 mid/name/app_version（展示与匹配辅助），legacy hash/t 参数被官方解析器直接拒绝。workspace/session 级绑定发生在 relay 之上的 RPC/APP 层，未取证——由 B2 以真实帧补齐，本文件保持空数组（不猜测字段）。2026-10-24 实连勘正（mid 绑定发现）：mid 不是「展示与匹配辅助」——relay 以 ws2 升级 URL 的 mid 查询参数把终端路由到目标设备：官方 web 终端在链接 mid 非空时条件性附加（webRemoteControlTransport.ts:107-110），APP 设备角色恒发自身 mid（desktop webRemoteControlTransport.ts:117-119）；探针缺 mid 时 pair_status 恒 waiting → 30s pair-timeout（run macos-B120261024T104607Z-iykCdg / macos-B120261024T104720Z-OMksKw），带 mid 时 auth 后约 131ms 即 matched、无任何 APP 侧人工介入（run macos-B120261024T105940Z-NarmSw）。即 relay 层路由绑定字段 = mid（设备路由）+ device_sid（auth_init 回显校验）",
+    "workspaceBindingFields": ["workspacePath", "workspaceIdentity?"],
+    "sessionBindingFields": ["address.taskId", "envelope.sessionId"],
+    "bindingNote": "relay 层唯一的绑定字段是 device_sid（官方链接的 sid 参数；auth_init/auth_ack 均以 device_sid 回显校验）；链接其余参数为 mid/name/app_version（展示与匹配辅助），legacy hash/t 参数被官方解析器直接拒绝。workspace/session 级绑定发生在 relay 之上的 RPC/APP 层；2026-10-24 B2 实连补齐：workspace = workspacePath（+可选 workspaceIdentity），session = listing address.taskId ≡ envelope.sessionId（同命名空间精确相等）；bridgeSessionId/workspaceKey 仅为 bridge 局部标识。2026-10-24 实连勘正（mid 绑定发现）：mid 不是「展示与匹配辅助」——relay 以 ws2 升级 URL 的 mid 查询参数把终端路由到目标设备：官方 web 终端在链接 mid 非空时条件性附加（webRemoteControlTransport.ts:107-110），APP 设备角色恒发自身 mid（desktop webRemoteControlTransport.ts:117-119）；探针缺 mid 时 pair_status 恒 waiting → 30s pair-timeout（run macos-B120261024T104607Z-iykCdg / macos-B120261024T104720Z-OMksKw），带 mid 时 auth 后约 131ms 即 matched、无任何 APP 侧人工介入（run macos-B120261024T105940Z-NarmSw）。即 relay 层路由绑定字段 = mid（设备路由）+ device_sid（auth_init 回显校验）",
     "evidence": [
       {
         "claim": "绑定字段与链接参数形状：sid/mid/name/app_version；hash/t 拒收；selectDevice 以 device_sid 选择目标",
@@ -94,6 +94,11 @@
         "claim": "live：mid 绑定与 waiting 语义勘正——无 mid → pair_status 恒 waiting → 30s pair-timeout（两轮复现）；带 mid → auth 后约 131ms matched、无 APP 侧人工介入；waiting = 终端尚未可路由到设备（缺 mid/设备离线），非等待用户批准；role=terminal 实连成立，relay 绑定字段 = mid（设备路由）+ device_sid（auth_init 回显）",
         "source": "私有脱敏证据 run macos-B120261024T104607Z-iykCdg / macos-B120261024T104720Z-OMksKw（无 mid，STOPPED:pair-timeout）、macos-B120261024T105940Z-NarmSw（带 mid，COMPLETED）；官方实现行号见本节前两条 source 证据",
         "class": "live"
+      },
+      {
+        "claim": "live：B2 发送闭环的 workspace/session 绑定——workspace 以精确 workspacePath（+可选 workspaceIdentity）指定；session 以 listing address.taskId 精确锁定，envelope.sessionId 必须与之同命名空间相等；bridgeSessionId/workspaceKey 为 bridge 局部标识；单帧只落入指定会话",
+        "source": "私有脱敏证据 run macos-B220261024T132316Z-prItvw（mapping MAPPED 119 行 → Travel/hi 精确锁定 → send accepted）",
+        "class": "live + user-testimony"
       }
     ]
   },

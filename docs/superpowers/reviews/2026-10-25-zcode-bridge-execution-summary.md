@@ -6,6 +6,8 @@
 
 A 包代码与自动门禁完成并通过独立评审，**平台验收（Windows/真机/链接生命周期）仍待完成**；B 包 B0–B5 完成：授权 / 只读 / 发送 / 模型 / 档位已实跑；审批仅"应答既有卡"（批准+拒绝+产物）已证，**Tuvis 发送→弹卡未证且有负结果**；问答仅单选且为 ACK-only，打断为 ACK-only——**终态未证**。合同已按证据分层标注 true/false，**B5 生产计划已交付（未执行）并按复审补了停止门**。
 
+> 2026-10-25 第二轮复审（`dc16eea2`）：上轮修复成立；新增 1 个 Critical（打断未排除触发前旧执行）与 3 个一般项（无可恢复档位、空档位列表、CLI 原值回显）已修正，合同 route/credential 已同步；详见决策 §8.10 第 9–13 条。工作树中的未提交探针回退已保存补丁并移出，不进入任何提交。
+
 ## 2. A 包（代码与门禁完成，平台验收待完成）
 
 | 项  | 内容                                                                                                                   | 提交                  |
@@ -19,7 +21,7 @@ A 包代码与自动门禁完成并通过独立评审，**平台验收（Windows
 | A7  | 附件锚点对齐最终显示序号（同源投影，file-only 中性 0）                                                                 | `893c27a4`            |
 | A8  | 双语手册/CHANGELOG/升级须知 + 全量门禁（pnpm 2213 通过；cargo 3423 通过）；**Windows/真机/链接生命周期平台验收待完成** | `55d9626b` `dce33a0f` |
 
-另有整分支终审修复波 `a8678a96`（注释/账本口径）与 2026-10-25 复审修复波 `71db44a6` / `33b8e6af` / `cf494594`（写入错误传播、草稿竞态、终态观察、逐模型档位、证据/合同口径）。
+另有整分支终审修复波 `a8678a96`（注释/账本口径）与 2026-10-25 两轮复审修复波 `71db44a6` / `33b8e6af` / `cf494594` / `187a8acc`（写入错误传播、草稿竞态、终态观察、逐模型档位、打断绑定、可恢复选择、CLI 回显、证据/合同口径）。
 
 ## 3. B 包（按门推进）
 
@@ -44,22 +46,24 @@ A 包代码与自动门禁完成并通过独立评审，**平台验收（Windows
 8. **提交模式是逐条消息的意图**：`sendText.payload.mode ∈ build|edit|plan|yolo|guarded`（command.ts:95-115；submission.ts:4），不是持久会话设置。
 9. **terminal 发送绕过 guarded**：本构建 terminal 发起（默认或 `mode:"guarded"`）直接执行、不弹 permission 卡；只有用户在 APP 亲发（guarded）才弹。故审批已证的是"应答既有卡"，**不是**"Tuvis 发送→弹卡→应答"；合同 `approvalForTerminalSend=false`，生产 T5 加停止门。
 10. **ACK ≠ 终态**：历史 answer/interrupt run 在 ACK 后 4–5ms 即 teardown，未观察宿主撤卡/执行停止；`RESOLVED` / `STOPPED:interrupt-accepted` 只能算"命令受理已证"。探针已加 10s 终态观察窗，未来 run 分别报 `RESOLVED:pending-cleared` / `STOPPED:interrupt-confirmed`，否则只报 `ACCEPTED:*:unconfirmed`。
+11. **打断目标必须排除触发前执行**：仅"收到新 control 帧"不够——若触发前已有执行 E、触发被拒绝/排队，新帧仍报告 E 就会误停 E。修正：触发前记录 `foregroundExecutionIds()` 基线并在观察时排除；触发结果非 accepted/completed 不进入 stop；`--existing-pending` 不支持 interrupt。
+12. **选择必须先证明可恢复**：原 `thought` 为空（未显式设置）时不得切换（无法恢复"未设置"）；宿主未宣告某模型档位（空列表）时，该模型任何 thought 都拒绝，不能靠"列表非空才校验"放行。
 
 ## 5. 未取证 / 待办（恢复点）
 
-| 待办                                                                     | 具体缺口                                                                | 恢复动作                                                          |
-| ------------------------------------------------------------------------ | ----------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| B3 终态补证                                                              | answer 未观察宿主撤卡；interrupt 未观察守卫执行消失                     | 用户再授权一次 OAuth + 一次会话触发，跑新终态观察窗（探针已就绪） |
-| 问答多选 / 自由文本                                                      | 仅 fake/合同层，无实跑入口                                              | 先补实跑取证，再开 `userInputMultiSelect/FreeText`                |
-| 双手机并发 / 断线重连 / 链接失效流转 / 官方网页互踢实测 / Windows 同口径 | 未覆盖                                                                  | 按 B5 计划 T8 验收清单执行                                        |
-| A8 平台验收                                                              | Windows 六段/PIN/默认值实机；真机手机读取与发送区状态；真实链接生命周期 | 按 A8 报告 `awaiting_platform_validation`                         |
+| 待办                                                                     | 具体缺口                                                                                                | 恢复动作                                                          |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| B3 终态补证                                                              | answer 未观察宿主撤卡；interrupt 未观察守卫执行消失；打断需实跑验证只停本次触发的新执行（基线排除已加） | 用户再授权一次 OAuth + 一次会话触发，跑新终态观察窗（探针已就绪） |
+| 问答多选 / 自由文本                                                      | 仅 fake/合同层，无实跑入口                                                                              | 先补实跑取证，再开 `userInputMultiSelect/FreeText`                |
+| 双手机并发 / 断线重连 / 链接失效流转 / 官方网页互踢实测 / Windows 同口径 | 未覆盖                                                                                                  | 按 B5 计划 T8 验收清单执行                                        |
+| A8 平台验收                                                              | Windows 六段/PIN/默认值实机；真机手机读取与发送区状态；真实链接生命周期                                 | 按 A8 报告 `awaiting_platform_validation`                         |
 
 ## 6. 交付物索引
 
 - 生产实施计划（B5）：`docs/superpowers/plans/2026-10-25-zcode-official-bridge-implementation.md`
 - 官方桥接合同与证据：`docs/superpowers/decisions/2026-10-24-zcode-official-bridge-contract.md`、`tests/fixtures/zcode-official-bridge/contract.json`
 - 探针工具：`scripts/zcode-bridge-probe/`（auth-check / session-probe / interaction-probe / selectionBridge / relayAuth / oauthFlow / sessionBridge / interactionBridge / sanitize）
-- 测试：`tests/remote/zcodeBridgeRelay|Probe|Session|Interaction|Selection.test.ts`（71 通过）；全量 `pnpm test` 2285 通过 / 5 skipped，`cargo test --features marker-helper` 3424 通过 / 46 ignored；`pnpm check`、`pnpm build:mobile`、`cargo fmt --check`、`cargo clippy -D warnings` 全绿
+- 测试：`tests/remote/zcodeBridgeRelay|Probe|Session|Interaction|Selection.test.ts`（74 通过）；全量 `pnpm test` 2288 通过 / 5 skipped，`cargo test --features marker-helper` 3424 通过 / 46 ignored；`pnpm check`、`pnpm build:mobile`、`cargo fmt --check`、`cargo clippy -D warnings` 全绿
 - 过程账本与逐任务报告：`.superpowers/sdd/2026-10-24-*/`（本地，gitignored）
 - 私有脱敏证据：`~/Documents/tuvis-verify-logs/zcode/<run_id>/`（不入库）
 
@@ -69,7 +73,7 @@ A 包代码与自动门禁完成并通过独立评审，**平台验收（Windows
 - 真实账号凭据：仅本机内存；**证据落盘面**脱敏（0700/0600 + fail-closed 断言），仓库内无真实链接/SID/JWT/token/会话正文。OAuth URL 连同 state 只打印到 **stdout** 供用户点击（state/link 已登记 redactor，不写证据文件）；桥消息证据只记结构头，正文不再入盘。此边界不等于"所有终端输出均脱敏"。
 - 真实动作授权：B2 一条 marker 发送、B3 问答/打断/既有卡应答，均在用户指定的 Travel/「hi」会话内、逐批授权；未使用 full-access、未改会话权限模式、未 kill 用户进程。
 - 官方登录/扫码均由用户本人在浏览器完成；审批卡的触发消息也由用户在 APP 手打（探针只应答）。
-- 最终代码提交：`cf494594`（复审修复三提交 `71db44a6` / `33b8e6af` / `cf494594`）；本文件口径更新随后单独提交。
+- 第二轮代码提交：`187a8acc`（probe：打断绑定新执行、可恢复选择、CLI 回显清理）；合同与文档同步见本提交；第一轮修复链 `71db44a6` / `33b8e6af` / `cf494594`。
 
 ## 8. 我代为作出的裁决（均可回溯到账本）
 
@@ -84,3 +88,4 @@ A 包代码与自动门禁完成并通过独立评审，**平台验收（Windows
 9. 审批催卡由用户亲发消息触发（探针不代造动作）；`reject` 轮在自动批准会话中曾按同结论跳过，后在「变更前确认」模式补跑完成。
 10. 2026-10-25 独立复审修正：answer/interrupt 历史证据降级为 ACK-only；`approvalForTerminalSend=false`；问答仅单打开放；档位逐模型校验；生产不得恢复用户选择；桥消息正文不再入证据。
 11. A8 口径改为"代码/门禁完成，平台验收待完成"（不把待验项写成全部完成）。
+12. 第二轮复审修正：打断目标排除触发前执行并要求触发 accepted/completed；`--existing-pending` 不支持 interrupt；无可恢复档位拒绝切换；空档位列表 fail-closed；CLI 未知参数/模式不再回显；合同 route 绑定字段与 credentialPersistence 同步。复核期间出现的未提交 `session-probe.ts` 回退已存至 `.superpowers/sdd/2026-10-24-zcode-official-bridge-validation/review2-uncommitted-session-probe.patch`，从工作树移除且不进入提交。

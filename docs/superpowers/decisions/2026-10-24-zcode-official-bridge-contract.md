@@ -838,3 +838,24 @@ ack-only 或新鲜快照确认。`model` / `thoughtLevel` 由 §8.7 补全为 tr
    已改为只记结构头、Initialize 仅记 hex；CLI 参数错误不再回显原值。
    JSON 证据文件仍经 fail-closed 断言，但"所有输出都已脱敏"只应理解为"证据落盘面"。
 8. **A8**：代码与自动门禁完成 ≠ 平台验收完成；Windows/真机/链接生命周期仍待验。
+9. **打断必须绑定本次触发（第二轮复审 Critical）**：原实现只要求 `controlRevision` 前进；
+   若触发前已有执行 E、触发被拒绝或排队，后续 control 帧仍报告 E 时会误停 E。修正：
+   触发前记录 `foregroundExecutionIds()` 基线，`observeStopTarget` 排除基线 id；触发结果
+   非 `accepted`/`completed` 不进入 stop；`--existing-pending + interrupt` 直接拒绝。
+   回归：`stop_target_excludes_pre_trigger_execution`（新帧仍带旧 id → null；旧+新并存只取新）。
+10. **无可恢复档位不得切换**：`thought` 空串读作 null；原实现仍可切模型但跳过恢复，
+    却能返回 `COMPLETED:selection-switch-restore-unconfirmed`。修正：select 预检
+    `original.thought === null` → `UNAVAILABLE:no-restorable-thought`（零写帧）；
+    `planRestore` 继续 fail-closed；`sendSwitch` 内同时校验**原选择**在目录里可恢复，
+    任一校验不过都零帧。回归：`restore_rejects_missing_original_thought`。
+11. **空档位列表不得放行**：`assertSwitchable` 原条件只在列表非空时校验，`[]` 接受任意值。
+    修正：空列表直接拒绝（宿主未宣告 = 无法证明目标合法）。回归：
+    `empty_level_list_rejects_any_thought`。
+12. **CLI 错误出口去原值**：未知参数 / 未知交互模式不再回显输入（auth-check /
+    session-probe / interaction-probe）；以合成值实测，输出不含该值。
+13. **合同文档同步**：`route` 的 workspace/session 绑定字段与 B2 实连一致
+    （`workspacePath` + 可选 `workspaceIdentity`；listing `address.taskId` ≡
+    `envelope.sessionId`），`credentialPersistence` 与 B5 §2.3 对齐（JWT 仅内存，
+    本轮不落 OS keychain）；补 B2 binding live evidence。复核期间出现的未提交
+    `session-probe.ts` 回退（撤掉终态观察/逐模型校验、恢复 `bodyPreview`）已保存为
+    补丁并从工作树移除，不进入任何提交。

@@ -83,10 +83,10 @@
 
 ### T4 问答与打断
 
-- 红测：`resolve_binds_turn_and_epoch`；`wrong_or_consumed_rejected`；`stop_requires_observed_guard`；`auto_resolution_snoozes_first`；`answer_confirms_only_after_pending_cleared`；`interrupt_confirms_only_after_guard_cleared`；`ack_without_terminal_stays_accepted`。
-- 实现：`command.rs` resolve/stop + `pending.rs` 三查闸 + snooze 前置 + **终态观察**（host pending 集合代数 / control 守卫消失）。
+- 红测：`resolve_binds_turn_and_epoch`；`wrong_or_consumed_rejected`；`stop_requires_observed_guard`；`auto_resolution_snoozes_first`；`answer_confirms_only_after_pending_cleared`；`interrupt_confirms_only_after_guard_cleared`；`ack_without_terminal_stays_accepted`；`stop_target_excludes_pre_trigger_execution`；`stop_requires_accepted_trigger`。
+- 实现：`command.rs` resolve/stop + `pending.rs` 三查闸 + snooze 前置 + **终态观察**（host pending 集合代数 / control 守卫消失）；stop 目标必须同时满足"control 代数前进 + 不在触发前执行基线"。
 - 验证：`cargo test --test zcode_interaction_remote`。
-- 通过：错 ID/过期/重复不消费他卡；stop 无守卫即拒；迟到结果不入新代际；**ACK 后未见终态 → ActionState=Accepted，UI 只显示"已受理"**；多选/自由文本在实跑取证前不开放（`userInputMultiSelect/FreeText=false`）。
+- 通过：错 ID/过期/重复不消费他卡；stop 无新守卫即拒；**旧执行 id 永不作为目标**；触发未被受理（unknown/send-failed）不进入 stop；`--existing-pending` 不支持 interrupt；迟到结果不入新代际；**ACK 后未见终态 → ActionState=Accepted，UI 只显示"已受理"**；多选/自由文本在实跑取证前不开放（`userInputMultiSelect/FreeText=false`）。
 - 提交点：`feat(zcode): resolve pending interactions with terminal confirmation`。
 
 ### T5 审批（应答既有卡已证；发送→弹卡未证）
@@ -106,10 +106,10 @@
 ### T6 模型/思考强度（B4 实跑已证）
 
 - 现状：runs `...T030637Z-bS5dOg`（模型切换）与 `...T025928Z-3WyTFA`（档位切换）；`getView()` 对 terminal 角色可用；新鲜快照确认。
-- 红测：`only_server_supported_ids`；`thought_levels_are_model_scoped`；`switch_requires_base_revision_and_forbids_base_log_epoch`；`production_keeps_user_selection`；`error_taxonomy_distinct`。
-- 实现：`command.rs` switchModelConfig + 目录解析（`model-selection.getView()` 或 `snapshot.config.thoughtLevels`）；**每个模型只接受自己的档位**。
+- 红测：`only_server_supported_ids`；`thought_levels_are_model_scoped`；`empty_levels_reject_any_thought`；`selection_refuses_non_restorable_thought`；`switch_requires_base_revision_and_forbids_base_log_epoch`；`production_keeps_user_selection`；`error_taxonomy_distinct`。
+- 实现：`command.rs` switchModelConfig + 目录解析（`model-selection.getView()` 或 `snapshot.config.thoughtLevels`）；**每个模型只接受自己的档位；空档位列表直接拒绝**。
 - 验证：`cargo test --test zcode_selection_remote`。
-- 通过：显示名不得作 wire 值；未知 id 拒绝；**生产切换后保留用户选择**（"恢复原值"只属于探针清理，不得进生产路径）；不改全局默认。
+- 通过：显示名不得作 wire 值；未知 id 拒绝；**空档位列表不得放行任意 thought**；**原档位未显式设置（空串/null）→ 零写帧拒绝，不得切了却回不去**；**生产切换后保留用户选择**（"恢复原值"只属于探针清理，不得进生产路径）；不改全局默认。
 - **安全约束（B4 实跑发现）**：`model-selection.getView()` 会返回**多个 provider**（含其他账号/open provider 目录）；生产实现必须把可选范围限定为当前会话所在 provider（账号），禁止跨账号模型切换；档位必须按目标模型自己的列表校验，禁止 provider 级并集。
 - 提交点：`feat(zcode): switch model and thought level within the session provider`。
 
