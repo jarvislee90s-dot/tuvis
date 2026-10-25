@@ -974,9 +974,9 @@ function buildInteractionInstruction(mode: InteractionMode): string {
   switch (mode) {
     case "approve":
     case "reject":
-      // 文件写入在多数会话里免批（B3 实跑 230311Z 即直接建文件成功）；要触发
-      // permission 卡，用一条无害只读的 shell 命令（exec 审批最常见）。
-      return `${tag} 请在终端执行命令：pwd && echo tuvis-b3-shell-test。这是一条只读无害命令，执行后把输出原样告诉我。`;
+      // 「变更前确认」模式只对**工作区外写入/高风险命令**弹审批（用户实机确认）：
+      // 用一条无害、可回滚的 /tmp 写入来触发 permission 卡。
+      return `${tag} 请在 /tmp 目录创建一个文件 /tmp/tuvis-b3-approval-test.txt，内容写 tuvis-b3。这是一次工作区外的临时文件写入，用于验证审批流程，完成后一句话说明结果。`;
     case "answer":
       return `${tag} 请用提问卡问我一个单选题，问题原文用「继续还是暂停？」，提供两个选项：继续 / 暂停。等我回答后再继续。`;
     case "interrupt":
