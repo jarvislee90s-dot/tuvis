@@ -83,6 +83,36 @@ describe("B4 selection contract", () => {
     ).not.toThrow();
   });
 
+  it("empty_level_list_rejects_any_thought", () => {
+    const empty: CatalogEntry[] = [
+      {
+        provider: "bigmodel",
+        models: ["glm-5.3-empty"],
+        thoughtLevelsByModel: { "glm-5.3-empty": [] },
+      },
+    ];
+    expect(() =>
+      assertSwitchable(empty, { provider: "bigmodel", model: "glm-5.3-empty", thought: "low" })
+    ).toThrow(/declared no levels/);
+  });
+
+  it("restore_rejects_missing_original_thought", () => {
+    const original = readConfigFromSnapshot({
+      config: { provider: "bigmodel", model: "glm-5.3-flash", thought: "", thoughtLevels: ["low"] },
+    })!;
+    expect(original.thought).toBeNull();
+    expect(() =>
+      planRestore({
+        original,
+        baseRevision: 1,
+        commandId: "cmd-empty",
+        clientId: "client-1",
+        sessionId: "sess-x",
+        issuedAt: 1,
+      })
+    ).toThrow(/restore-unavailable/);
+  });
+
   it("only_server_supported_ids_accepted", () => {
     expect(() =>
       assertSwitchable(CATALOG, { provider: "bigmodel", model: "glm-5.3-flash", thought: "high" })
