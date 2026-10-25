@@ -99,6 +99,7 @@
 - 实现：`command.rs` switchModelConfig + 目录解析（`model-selection.getView()` 或 `snapshot.config.thoughtLevels`）。
 - 验证：`cargo test --test zcode_selection_remote`。
 - 通过：显示名不得作 wire 值；未知 id 拒绝；结束恢复原值、不改全局默认。
+- **安全约束（B4 实跑发现）**：`model-selection.getView()` 会返回**多个 provider**（含其他账号/open provider 目录）；生产实现必须把可选范围限定为当前会话所在 provider（账号），禁止跨账号模型切换。
 - 提交点：`feat(zcode): switch model and thought level with restore`。
 
 ### T7 手机控制区（统一 UI）
