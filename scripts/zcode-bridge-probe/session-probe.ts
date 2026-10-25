@@ -2326,6 +2326,21 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         // unavailable。触发窗内落下的卡不会晚 20s 才被看见（C1 的另一半）。
         const observedPending = await pendingObservation;
         const observedStopTarget = await stopObservation;
+        // 诊断（B3 实跑 024023Z 教训）：请求 kind 未命中时，把场上**实际存在的卡**
+        // 的形状（kind/别名 id/payload 键名）如实落证——不猜、不消费、不发送。
+        if (observedPending === null && !isInterrupt) {
+          record(ctx, "interaction", "pending-inventory", {
+            count: book.size,
+            items: book.list().map((item) => ({
+              kind: item.kind,
+              interactionId: redactor.register("sid", item.interactionId),
+              payloadKeys: Object.keys(item.payload).slice(0, 24),
+              autoResolution: item.autoResolution,
+              createdAt: item.createdAt,
+            })),
+            bookCounters: book.counters,
+          });
+        }
         let commandType: InteractionCommandType | null = null;
         let payload: Record<string, unknown> | null = null;
         let unavailable: string | null = null;
