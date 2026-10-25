@@ -768,3 +768,7 @@ node scripts/zcode-bridge-probe/interaction-probe.ts approve \
 追加 `resolveInteraction`（userInput answer）与 `stop` 两行（wire 形状沿用 §8.1 /
 `interactionBridge.ts` 钉源行号，terminalEvidence = 上述 run id），既有 operations 行不动；
 `model` / `thoughtLevel` 维持 false，留 B4。
+
+## 10. 生产实施计划指针（B5）
+
+- 生产统一控制施工单：[2026-10-25-zcode-official-bridge-implementation.md](../plans/2026-10-25-zcode-official-bridge-implementation.md)。基于本文件 §6–§8.5 的已取证合同；审批（卡路径）与模型/思考强度明确标为未取证/延后，能力默认关闭。
