@@ -1,0 +1,285 @@
+{
+  "generatedFrom": "scripts/zcode-bridge-probe/sessionBridge.ts (pure functions, synthetic inputs; temporary node generator not committed)",
+  "initialize": {
+    "hex": "040106c80100"
+  },
+  "calls": [
+    {
+      "name": "send_text",
+      "id": 7,
+      "channel": "zcode-agent",
+      "method": "sendConversationCommandV4",
+      "args": [
+        {
+          "workspacePath": "/tmp/synthetic-workspace",
+          "sessionId": "session_test",
+          "envelope": {
+            "commandId": "00000000-0000-4000-8000-000000000000",
+            "clientId": "tuvis-test-client",
+            "sessionId": "session_test",
+            "type": "sendText",
+            "payload": {
+              "text": "hello from synthetic vector"
+            },
+            "issuedAt": 1700000000000
+          }
+        }
+      ],
+      "hex": "040406640607010b7a636f64652d6167656e74011973656e64436f6e766572736174696f6e436f6d6d616e6456340401059d027b22776f726b737061636550617468223a222f746d702f73796e7468657469632d776f726b7370616365222c2273657373696f6e4964223a2273657373696f6e5f74657374222c22656e76656c6f7065223a7b22636f6d6d616e644964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303030222c22636c69656e744964223a2274757669732d746573742d636c69656e74222c2273657373696f6e4964223a2273657373696f6e5f74657374222c2274797065223a2273656e6454657874222c227061796c6f6164223a7b2274657874223a2268656c6c6f2066726f6d2073796e74686574696320766563746f72227d2c226973737565644174223a313730303030303030303030307d7d"
+    },
+    {
+      "name": "unicode",
+      "id": 8,
+      "channel": "zcode-agent",
+      "method": "sendConversationCommandV4",
+      "args": [
+        {
+          "sessionId": "session_test",
+          "note": "兔维斯 🐰 会话测试 — emoji 🚀✨"
+        }
+      ],
+      "hex": "040406640608010b7a636f64652d6167656e74011973656e64436f6e766572736174696f6e436f6d6d616e645634040105537b2273657373696f6e4964223a2273657373696f6e5f74657374222c226e6f7465223a22e58594e7bbb4e696af20f09f90b020e4bc9ae8af9de6b58be8af9520e2809420656d6f6a6920f09f9a80e29ca8227d"
+    }
+  ],
+  "listens": [
+    {
+      "name": "conversation_with_arg",
+      "id": 2,
+      "channel": "zcode-agent",
+      "event": "onDynamicConversationFrame",
+      "arg": {
+        "workspacePath": "/tmp/synthetic-workspace",
+        "workspaceIdentity": "workspace-test-identity"
+      },
+      "hex": "040406660602010b7a636f64652d6167656e74011a6f6e44796e616d6963436f6e766572736174696f6e4672616d65055a7b22776f726b737061636550617468223a222f746d702f73796e7468657469632d776f726b7370616365222c22776f726b73706163654964656e74697479223a22776f726b73706163652d746573742d6964656e74697479227d"
+    },
+    {
+      "name": "controller_without_arg",
+      "id": 3,
+      "channel": "window-controller",
+      "event": "onDynamicControllerFrame",
+      "arg": null,
+      "hex": "040406660603011177696e646f772d636f6e74726f6c6c657201186f6e44796e616d6963436f6e74726f6c6c65724672616d6500"
+    }
+  ],
+  "responses": [
+    {
+      "name": "promise_success",
+      "responseType": 201,
+      "id": 7,
+      "body": {
+        "ack": {
+          "subscriptionId": "subscription_test",
+          "mode": "snapshot",
+          "logEpoch": 3
+        }
+      },
+      "hex": "040206c9010607054d7b2261636b223a7b22737562736372697074696f6e4964223a22737562736372697074696f6e5f74657374222c226d6f6465223a22736e617073686f74222c226c6f6745706f6368223a337d7d"
+    },
+    {
+      "name": "promise_error",
+      "responseType": 202,
+      "id": 7,
+      "body": {
+        "code": "unknown",
+        "message": "synthetic error"
+      },
+      "hex": "040206ca010607052e7b22636f6465223a22756e6b6e6f776e222c226d657373616765223a2273796e746865746963206572726f72227d"
+    },
+    {
+      "name": "event_fire",
+      "responseType": 204,
+      "id": 2,
+      "body": {
+        "topic": "conversation/session_test",
+        "subscriptionId": "subscription_test",
+        "fromSeq": 1,
+        "toSeq": 1,
+        "payload": {
+          "kind": "snapshot",
+          "messages": []
+        }
+      },
+      "hex": "040206cc010602058c017b22746f706963223a22636f6e766572736174696f6e2f73657373696f6e5f74657374222c22737562736372697074696f6e4964223a22737562736372697074696f6e5f74657374222c2266726f6d536571223a312c22746f536571223a312c227061796c6f6164223a7b226b696e64223a22736e617073686f74222c226d65737361676573223a5b5d7d7d"
+    }
+  ],
+  "frames": [
+    {
+      "name": "call_single_shard",
+      "identity": {
+        "bridgeSessionId": "bridge-test-0001"
+      },
+      "seq": 5,
+      "messageSeq": 9,
+      "messageHex": "040406640607010b7a636f64652d6167656e74011973656e64436f6e766572736174696f6e436f6d6d616e6456340401059d027b22776f726b737061636550617468223a222f746d702f73796e7468657469632d776f726b7370616365222c2273657373696f6e4964223a2273657373696f6e5f74657374222c22656e76656c6f7065223a7b22636f6d6d616e644964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303030222c22636c69656e744964223a2274757669732d746573742d636c69656e74222c2273657373696f6e4964223a2273657373696f6e5f74657374222c2274797065223a2273656e6454657874222c227061796c6f6164223a7b2274657874223a2268656c6c6f2066726f6d2073796e74686574696320766563746f72227d2c226973737565644174223a313730303030303030303030307d7d",
+      "frame": {
+        "zcode_type": "rpc-frame",
+        "bridgeSessionId": "bridge-test-0001",
+        "seq": 5,
+        "messageSeq": 9,
+        "fragmentIndex": 0,
+        "fragmentCount": 1,
+        "messageBytes": 336,
+        "checksum": {
+          "algorithm": "crc32",
+          "value": "1d35730a"
+        },
+        "dataBase64": "BAQGZAYHAQt6Y29kZS1hZ2VudAEZc2VuZENvbnZlcnNhdGlvbkNvbW1hbmRWNAQBBZ0CeyJ3b3Jrc3BhY2VQYXRoIjoiL3RtcC9zeW50aGV0aWMtd29ya3NwYWNlIiwic2Vzc2lvbklkIjoic2Vzc2lvbl90ZXN0IiwiZW52ZWxvcGUiOnsiY29tbWFuZElkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAwIiwiY2xpZW50SWQiOiJ0dXZpcy10ZXN0LWNsaWVudCIsInNlc3Npb25JZCI6InNlc3Npb25fdGVzdCIsInR5cGUiOiJzZW5kVGV4dCIsInBheWxvYWQiOnsidGV4dCI6ImhlbGxvIGZyb20gc3ludGhldGljIHZlY3RvciJ9LCJpc3N1ZWRBdCI6MTcwMDAwMDAwMDAwMH19"
+      }
+    },
+    {
+      "name": "listen_with_generation",
+      "identity": {
+        "bridgeSessionId": "bridge-test-0001",
+        "bridgeGeneration": 3,
+        "recoveryId": "recovery-test-0001"
+      },
+      "seq": 1,
+      "messageSeq": 1,
+      "messageHex": "040406660602010b7a636f64652d6167656e74011a6f6e44796e616d6963436f6e766572736174696f6e4672616d65055a7b22776f726b737061636550617468223a222f746d702f73796e7468657469632d776f726b7370616365222c22776f726b73706163654964656e74697479223a22776f726b73706163652d746573742d6964656e74697479227d",
+      "frame": {
+        "zcode_type": "rpc-frame",
+        "bridgeSessionId": "bridge-test-0001",
+        "bridgeGeneration": 3,
+        "recoveryId": "recovery-test-0001",
+        "seq": 1,
+        "messageSeq": 1,
+        "fragmentIndex": 0,
+        "fragmentCount": 1,
+        "messageBytes": 139,
+        "checksum": {
+          "algorithm": "crc32",
+          "value": "d17afc51"
+        },
+        "dataBase64": "BAQGZgYCAQt6Y29kZS1hZ2VudAEab25EeW5hbWljQ29udmVyc2F0aW9uRnJhbWUFWnsid29ya3NwYWNlUGF0aCI6Ii90bXAvc3ludGhldGljLXdvcmtzcGFjZSIsIndvcmtzcGFjZUlkZW50aXR5Ijoid29ya3NwYWNlLXRlc3QtaWRlbnRpdHkifQ=="
+      }
+    }
+  ],
+  "acks": [
+    {
+      "name": "with_generation",
+      "identity": {
+        "bridgeSessionId": "bridge-test-0001",
+        "bridgeGeneration": 3,
+        "recoveryId": "recovery-test-0001"
+      },
+      "ackMessageSeq": 9,
+      "payload": {
+        "zcode_type": "rpc-frame-ack",
+        "bridgeSessionId": "bridge-test-0001",
+        "bridgeGeneration": 3,
+        "recoveryId": "recovery-test-0001",
+        "ackMessageSeq": 9
+      }
+    },
+    {
+      "name": "bare",
+      "identity": {
+        "bridgeSessionId": "bridge-test-0001"
+      },
+      "ackMessageSeq": 1,
+      "payload": {
+        "zcode_type": "rpc-frame-ack",
+        "bridgeSessionId": "bridge-test-0001",
+        "ackMessageSeq": 1
+      }
+    }
+  ],
+  "fragments": [
+    {
+      "name": "two_fragments",
+      "identity": {
+        "bridgeSessionId": "bridge-test-0001",
+        "bridgeGeneration": 3
+      },
+      "seqBase": 1,
+      "messageSeq": 2,
+      "messageHex": "040406640607010b7a636f64652d6167656e74011973656e64436f6e766572736174696f6e436f6d6d616e6456340401059d027b22776f726b737061636550617468223a222f746d702f73796e7468657469632d776f726b7370616365222c2273657373696f6e4964223a2273657373696f6e5f74657374222c22656e76656c6f7065223a7b22636f6d6d616e644964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303030222c22636c69656e744964223a2274757669732d746573742d636c69656e74222c2273657373696f6e4964223a2273657373696f6e5f74657374222c2274797065223a2273656e6454657874222c227061796c6f6164223a7b2274657874223a2268656c6c6f2066726f6d2073796e74686574696320766563746f72227d2c226973737565644174223a313730303030303030303030307d7d",
+      "frames": [
+        {
+          "zcode_type": "rpc-frame",
+          "bridgeSessionId": "bridge-test-0001",
+          "bridgeGeneration": 3,
+          "seq": 1,
+          "messageSeq": 2,
+          "fragmentIndex": 0,
+          "fragmentCount": 2,
+          "messageBytes": 336,
+          "checksum": {
+            "algorithm": "crc32",
+            "value": "1d35730a"
+          },
+          "dataBase64": "BAQGZAYHAQt6Y29kZS1hZ2VudAEZc2VuZENvbnZlcnNhdGlvbkNvbW1hbmRWNAQBBZ0CeyJ3b3Jrc3BhY2VQYXRoIjoiL3RtcC9zeW50aGV0aWMtd29ya3NwYWNlIiwic2Vzc2lvbklkIjoic2Vzc2lvbl90ZXN0IiwiZW52ZWxvcGUiOnsiY29tbWFuZElkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgw"
+        },
+        {
+          "zcode_type": "rpc-frame",
+          "bridgeSessionId": "bridge-test-0001",
+          "bridgeGeneration": 3,
+          "seq": 2,
+          "messageSeq": 2,
+          "fragmentIndex": 1,
+          "fragmentCount": 2,
+          "messageBytes": 336,
+          "checksum": {
+            "algorithm": "crc32",
+            "value": "1d35730a"
+          },
+          "dataBase64": "MDAtMDAwMDAwMDAwMDAwIiwiY2xpZW50SWQiOiJ0dXZpcy10ZXN0LWNsaWVudCIsInNlc3Npb25JZCI6InNlc3Npb25fdGVzdCIsInR5cGUiOiJzZW5kVGV4dCIsInBheWxvYWQiOnsidGV4dCI6ImhlbGxvIGZyb20gc3ludGhldGljIHZlY3RvciJ9LCJpc3N1ZWRBdCI6MTcwMDAwMDAwMDAwMH19"
+        }
+      ]
+    },
+    {
+      "name": "three_fragments",
+      "identity": {
+        "bridgeSessionId": "bridge-test-0001"
+      },
+      "seqBase": 10,
+      "messageSeq": 5,
+      "messageHex": "040406640608010b7a636f64652d6167656e74011973656e64436f6e766572736174696f6e436f6d6d616e645634040105537b2273657373696f6e4964223a2273657373696f6e5f74657374222c226e6f7465223a22e58594e7bbb4e696af20f09f90b020e4bc9ae8af9de6b58be8af9520e2809420656d6f6a6920f09f9a80e29ca8227d",
+      "frames": [
+        {
+          "zcode_type": "rpc-frame",
+          "bridgeSessionId": "bridge-test-0001",
+          "seq": 10,
+          "messageSeq": 5,
+          "fragmentIndex": 0,
+          "fragmentCount": 3,
+          "messageBytes": 133,
+          "checksum": {
+            "algorithm": "crc32",
+            "value": "c83f0921"
+          },
+          "dataBase64": "BAQGZAYIAQt6Y29kZS1hZ2VudAEZc2VuZENvbnZlcnNhdGlvbkNvbW1hbmRW"
+        },
+        {
+          "zcode_type": "rpc-frame",
+          "bridgeSessionId": "bridge-test-0001",
+          "seq": 11,
+          "messageSeq": 5,
+          "fragmentIndex": 1,
+          "fragmentCount": 3,
+          "messageBytes": 133,
+          "checksum": {
+            "algorithm": "crc32",
+            "value": "c83f0921"
+          },
+          "dataBase64": "NAQBBVN7InNlc3Npb25JZCI6InNlc3Npb25fdGVzdCIsIm5vdGUiOiLlhZTn"
+        },
+        {
+          "zcode_type": "rpc-frame",
+          "bridgeSessionId": "bridge-test-0001",
+          "seq": 12,
+          "messageSeq": 5,
+          "fragmentIndex": 2,
+          "fragmentCount": 3,
+          "messageBytes": 133,
+          "checksum": {
+            "algorithm": "crc32",
+            "value": "c83f0921"
+          },
+          "dataBase64": "u7Tmlq8g8J+QsCDkvJror53mtYvor5Ug4oCUIGVtb2ppIPCfmoDinKgifQ=="
+        }
+      ]
+    }
+  ]
+}
