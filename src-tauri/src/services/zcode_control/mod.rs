@@ -13,9 +13,9 @@ pub mod config;
 pub mod types;
 
 pub use auth::{
-    build_authorize_url, AuthService, OAuthProvider, OpenAuthorize, TerminalToken,
-    AUTHORIZE_TIMEOUT, OAUTH_TOKEN_PATH, OFFICIAL_BIGMODEL_APP_ID, OFFICIAL_BIGMODEL_ORIGIN,
-    OFFICIAL_OAUTH_CLIENT_ID, OFFICIAL_ZAI_ORIGIN, OFFICIAL_ZCODE_ORIGIN, RELAY_TOKEN_PATH,
+    AuthService, OAuthProvider, OpenAuthorize, TerminalToken, AUTHORIZE_TIMEOUT, OAUTH_TOKEN_PATH,
+    OFFICIAL_BIGMODEL_APP_ID, OFFICIAL_BIGMODEL_ORIGIN, OFFICIAL_OAUTH_CLIENT_ID,
+    OFFICIAL_ZAI_ORIGIN, OFFICIAL_ZCODE_ORIGIN, RELAY_TOKEN_PATH,
 };
 pub use config::{
     get_config, set_config, validate_official_url, ConfigError, ConfigState, ZcodeRemoteConfig,

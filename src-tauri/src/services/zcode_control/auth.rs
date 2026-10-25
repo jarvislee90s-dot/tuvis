@@ -20,10 +20,13 @@
 //!   （[`TerminalToken`] 不实现 Debug/Serialize）。
 //! - 错误只含冻结码；`reqwest` 原始错误（可能携 URL／认证头）一律丢弃，不挂 cause。
 //! - 回环监听只 bind `127.0.0.1:0`；state 精确一次消费；错误/缺失 state 既不消费也不交换；
-//!   回调响应为静态文案、不回显任何参数；[`AUTHORIZE_TIMEOUT`] 到点关闭监听
+//!   回调响应为静态中文页（成功/失败两版），不回显任何参数；[`AUTHORIZE_TIMEOUT`] 到点关闭监听
 //!   （120s 是 **Tuvis 新策略**，不冒称官方 TTL）。
 //! - [`AuthService::clear`] 经授权 epoch + 取消通知让在途授权立即失效：clear 之后的迟到
 //!   回调不产生任何交换，交换已完成但 epoch 已变的 JWT 不落内存（review focus 1）。
+//! - **凭据代际**：JWT 落内存时同时登记所属 epoch；[`AuthService::terminal_token`] 带着该
+//!   epoch 走完全程——请求在途时 clear/新授权 → 结果丢弃（返回 `needs_auth`，token 不逃出）；
+//!   旧 JWT 的迟到 401 只允许清仍是同一代的凭据，绝不触碰新 JWT 或取消新授权。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,9 +72,29 @@ const MAX_CALLBACK_REQUEST_BYTES: usize = 8 * 1024;
 /// JWT 提前失效窗口（秒）：临期凭据不再发起请求。
 const JWT_EXPIRY_SKEW_SECS: u64 = 30;
 
-/// 回调响应的静态文案（绝不回显任何 query 参数值）。
-const CALLBACK_PAGE: &str = "<!doctype html><meta charset=\"utf-8\"><title>Tuvis</title>\
-<p>Tuvis received the sign-in callback. You can close this tab and return to Tuvis.</p>";
+/// 授权成功的静态中文页（不含任何参数；参数值绝不回显）。
+const CALLBACK_SUCCESS_PAGE: &str = "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\">\
+<title>兔维斯</title><p>兔维斯已收到授权回调，可以关闭此页面并返回应用。</p>";
+
+/// 授权失败/被拒的静态中文页（不含任何参数；参数值绝不回显）。
+const CALLBACK_ERROR_PAGE: &str = "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\">\
+<title>兔维斯</title><p>授权未完成，请关闭此页面并回到兔维斯重试。</p>";
+
+/// 回调静态页的选择（成功/失败）。
+#[derive(Clone, Copy)]
+enum CallbackPage {
+    Success,
+    Failed,
+}
+
+impl CallbackPage {
+    fn body(self) -> &'static str {
+        match self {
+            Self::Success => CALLBACK_SUCCESS_PAGE,
+            Self::Failed => CALLBACK_ERROR_PAGE,
+        }
+    }
+}
 
 /// OAuth 授权通道（对应官方 `WebOAuthProviderId` 两值）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +162,11 @@ pub struct AuthService {
 struct AuthState {
     /// 账号 JWT：只在内存，`clear`/失效即丢弃。
     jwt: Option<String>,
+    /// 该 JWT 落内存时的授权 epoch（凭据代际）。
+    ///
+    /// `terminal_token` 必须带着它一起使用：epoch 已变（clear/新授权）时，这份凭据
+    /// 及其 HTTP 结果一律作废，既不得返回 relay token，也不得清掉新凭据。
+    jwt_epoch: Option<u64>,
     /// 授权 epoch：clear/新授权递增，旧 epoch 的结果一律作废。
     epoch: u64,
     /// 在途授权的取消发送端（clear/新授权触发）。
@@ -247,18 +275,21 @@ impl AuthService {
 
     /// 以内存中的账号 JWT 现取一次性终端 token（逐连接新取，不缓存、用后即弃）。
     ///
-    /// 已过期 JWT 在任何 HTTP 请求之前返回 `needs_auth`；401 清空凭据并返回
-    /// `needs_auth`（不缓存、不重试、不携带服务端正文）。
+    /// 入口把 JWT 与它所属的授权 epoch **一起捕获**，此后只认这一代：
+    /// - 已过期 JWT 在任何 HTTP 请求之前返回 `needs_auth`；
+    /// - 请求在途时 clear/新授权发生（epoch 已变）→ 结果作废，返回 `needs_auth`，
+    ///   relay token 绝不逃出；
+    /// - 401 只清仍属本代的凭据（旧 JWT 的迟到 401 不得清掉新 JWT 或取消新授权）。
     pub async fn terminal_token(&self) -> ZResult<TerminalToken> {
-        let (jwt, epoch) = {
+        let (jwt, credential_epoch) = {
             let state = self.lock_state();
-            match state.jwt.clone() {
-                Some(jwt) => (jwt, state.epoch),
-                None => return Err(ZcodeError::needs_auth()),
+            match (state.jwt.clone(), state.jwt_epoch) {
+                (Some(jwt), Some(epoch)) => (jwt, epoch),
+                _ => return Err(ZcodeError::needs_auth()),
             }
         };
         if jwt_is_expired(&jwt, now_secs()) {
-            self.invalidate(epoch);
+            self.invalidate(credential_epoch);
             return Err(ZcodeError::needs_auth());
         }
 
@@ -272,9 +303,13 @@ impl AuthService {
             .await
             // reqwest 错误可能含 URL/认证头：整体丢弃，只映射常量码
             .map_err(|_| ZcodeError::offline())?;
+        // 请求在途时 clear/新授权：本结果属于旧代际，丢弃且不触碰当前凭据/授权
+        if !self.epoch_is_current(credential_epoch) {
+            return Err(ZcodeError::needs_auth());
+        }
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.invalidate(epoch);
+            self.invalidate(credential_epoch);
             return Err(ZcodeError::needs_auth());
         }
         if status == reqwest::StatusCode::FORBIDDEN {
@@ -291,6 +326,7 @@ impl AuthService {
     pub fn clear(&self) {
         let mut state = self.lock_state();
         state.jwt = None;
+        state.jwt_epoch = None;
         state.epoch = state.epoch.wrapping_add(1);
         if let Some(cancel) = state.cancel.take() {
             let _ = cancel.send(());
@@ -333,24 +369,32 @@ impl AuthService {
     }
 
     /// 落入内存的唯一入口：epoch 不符（clear/新授权已发生）即作废。
+    ///
+    /// 成功时把 JWT 与所属 epoch 一起登记（凭据代际），供 [`Self::terminal_token`]
+    /// 判定「这份凭据是否仍属于当前授权」。
     fn commit_jwt(&self, epoch: u64, jwt: String) -> ZResult<()> {
         let mut state = self.lock_state();
         if state.epoch != epoch {
             return Err(ZcodeError::needs_auth());
         }
         state.jwt = Some(jwt);
+        state.jwt_epoch = Some(epoch);
         Ok(())
     }
 
-    /// 凭据失效（过期/401）：只清仍属本 epoch 的凭据与在途授权。
-    fn invalidate(&self, epoch: u64) {
+    /// 凭据失效（过期/401）：只清仍属**同一代际**的凭据与在途授权。
+    ///
+    /// 旧 JWT 的迟到结果（epoch 已变）不得清掉新 JWT，也不得取消新授权。
+    fn invalidate(&self, credential_epoch: u64) {
         let mut state = self.lock_state();
-        if state.epoch == epoch {
-            state.jwt = None;
-            state.epoch = state.epoch.wrapping_add(1);
-            if let Some(cancel) = state.cancel.take() {
-                let _ = cancel.send(());
-            }
+        if state.epoch != credential_epoch || state.jwt_epoch != Some(credential_epoch) {
+            return;
+        }
+        state.jwt = None;
+        state.jwt_epoch = None;
+        state.epoch = state.epoch.wrapping_add(1);
+        if let Some(cancel) = state.cancel.take() {
+            let _ = cancel.send(());
         }
     }
 
@@ -418,7 +462,10 @@ impl AuthService {
 /// 按通道构造官方授权 URL（BigModel 与 ZAI 的**参数名不同**）：
 /// - BigModel：`{origin}/login?redirect&appId=zcode&state`（无 response_type/client_id）
 /// - ZAI：`{origin}/api/oauth/authorize?redirect_uri&response_type=code&client_id&state`
-pub fn build_authorize_url(
+///
+/// **仅模块内可见**（测试经此校验 URL 形状）：生产路径只允许传固定官方 origin，
+/// 不暴露给 settings/IPC/手机，避免任意 origin 注入。
+fn build_authorize_url(
     provider: OAuthProvider,
     origin: &str,
     redirect_uri: &str,
@@ -556,11 +603,11 @@ async fn handle_callback(
     outcomes: mpsc::Sender<CallbackOutcome>,
 ) {
     let Some(target) = read_request_target(&mut stream).await else {
-        respond(&mut stream, 400).await;
+        respond(&mut stream, 400, CallbackPage::Failed).await;
         return;
     };
     let Ok(parsed) = reqwest::Url::parse(&format!("http://127.0.0.1{target}")) else {
-        respond(&mut stream, 400).await;
+        respond(&mut stream, 400, CallbackPage::Failed).await;
         return;
     };
     let params: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
@@ -573,27 +620,27 @@ async fn handle_callback(
 
     // state 不匹配/缺失：忽略且**不消费**（继续等待真正的回调）
     if value("state").as_deref() != Some(expected_state) {
-        respond(&mut stream, 400).await;
+        respond(&mut stream, 400, CallbackPage::Failed).await;
         return;
     }
     let code = value("code").or_else(|| value("authCode"));
     let error = value("error");
     if code.is_none() && error.is_none() {
         // state 匹配但既无 code 也无 error：不消费，继续等待
-        respond(&mut stream, 400).await;
+        respond(&mut stream, 400, CallbackPage::Failed).await;
         return;
     }
     // state 精确一次消费：重复回调一律作废，不产生第二次交换
     if consumed.swap(true, Ordering::SeqCst) {
-        respond(&mut stream, 410).await;
+        respond(&mut stream, 410, CallbackPage::Failed).await;
         return;
     }
-    let outcome = match code {
-        Some(code) => CallbackOutcome::Code(code),
-        None => CallbackOutcome::Rejected,
+    let (outcome, page) = match code {
+        Some(code) => (CallbackOutcome::Code(code), CallbackPage::Success),
+        None => (CallbackOutcome::Rejected, CallbackPage::Failed),
     };
     let _ = outcomes.send(outcome).await;
-    respond(&mut stream, 200).await;
+    respond(&mut stream, 200, page).await;
 }
 
 /// 读回调请求行（只接受 GET + 绝对路径），带读取上限与超时。
@@ -627,23 +674,24 @@ async fn read_request_target(stream: &mut TcpStream) -> Option<String> {
     Some(target.to_string())
 }
 
-/// 静态回调响应：绝不回显任何 query 参数值（只区分状态码）。
-async fn respond(stream: &mut TcpStream, status: u16) {
+/// 静态回调响应：绝不回显任何 query 参数值（只区分状态码与成功/失败页）。
+async fn respond(stream: &mut TcpStream, status: u16, page: CallbackPage) {
     let reason = match status {
         200 => "OK",
         410 => "Gone",
         _ => "Bad Request",
     };
+    let body = page.body();
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n",
-        CALLBACK_PAGE.len()
+        body.len()
     );
     let write = async {
         let _ = stream.write_all(head.as_bytes()).await;
-        let _ = stream.write_all(CALLBACK_PAGE.as_bytes()).await;
+        let _ = stream.write_all(body.as_bytes()).await;
         let _ = stream.flush().await;
     };
     let _ = tokio::time::timeout(CALLBACK_READ_TIMEOUT, write).await;
@@ -653,6 +701,7 @@ async fn respond(stream: &mut TcpStream, status: u16) {
 mod tests {
     use super::super::types::codes;
     use super::*;
+    use tokio::sync::Semaphore;
 
     // ───────────────────────── 合成夹具（无真实账号/网络/DB） ─────────────────────────
 
@@ -704,9 +753,12 @@ mod tests {
         exchange_status: u16,
         exchange_body: String,
         exchange_delay: Duration,
+        /// 非零许可的闸门：请求已记录后挂起，直到测试显式放行（确定性时序）。
+        exchange_gate: Option<Arc<Semaphore>>,
         relay_status: u16,
         relay_body: String,
         relay_delay: Duration,
+        relay_gate: Option<Arc<Semaphore>>,
     }
 
     impl Default for FakeConfig {
@@ -715,9 +767,11 @@ mod tests {
                 exchange_status: 200,
                 exchange_body: exchange_ok(&valid_jwt()),
                 exchange_delay: Duration::ZERO,
+                exchange_gate: None,
                 relay_status: 200,
                 relay_body: relay_ok(SYNTHETIC_RELAY_TOKEN, 60),
                 relay_delay: Duration::ZERO,
+                relay_gate: None,
             }
         }
     }
@@ -772,6 +826,25 @@ mod tests {
             let mut config = self.config.lock().unwrap();
             config.relay_status = status;
             config.relay_body = body.into();
+        }
+
+        /// 挂起交换响应（测试放行前不返回），返回放行句柄。
+        fn hold_exchange(&self) -> Arc<Semaphore> {
+            let gate = Arc::new(Semaphore::new(0));
+            self.config.lock().unwrap().exchange_gate = Some(gate.clone());
+            gate
+        }
+
+        /// 挂起终端 token 响应（测试放行前不返回），返回放行句柄。
+        fn hold_relay(&self) -> Arc<Semaphore> {
+            let gate = Arc::new(Semaphore::new(0));
+            self.config.lock().unwrap().relay_gate = Some(gate.clone());
+            gate
+        }
+
+        /// 撤下终端 token 闸门（后续请求直接放行）。
+        fn clear_relay_gate(&self) {
+            self.config.lock().unwrap().relay_gate = None;
         }
 
         fn requests_matching(&self, path: &str) -> Vec<Recorded> {
@@ -848,24 +921,30 @@ mod tests {
             authorization,
             body: String::from_utf8_lossy(&body).to_string(),
         });
-        let (status, delay, response_body) = {
+        let (status, delay, response_body, gate) = {
             let config = config.lock().unwrap();
             if path.starts_with(OAUTH_TOKEN_PATH) {
                 (
                     config.exchange_status,
                     config.exchange_delay,
                     config.exchange_body.clone(),
+                    config.exchange_gate.clone(),
                 )
             } else if path.starts_with(RELAY_TOKEN_PATH) {
                 (
                     config.relay_status,
                     config.relay_delay,
                     config.relay_body.clone(),
+                    config.relay_gate.clone(),
                 )
             } else {
-                (404, Duration::ZERO, "{}".to_string())
+                (404, Duration::ZERO, "{}".to_string(), None)
             }
         };
+        // 请求已记录：测试可见，再挂起等待显式放行（不发真实等待/睡眠）
+        if let Some(gate) = gate {
+            let _ = gate.acquire().await;
+        }
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
@@ -1233,18 +1312,31 @@ mod tests {
             assert_eq!(exchange.path, OAUTH_TOKEN_PATH);
             let body = exchange.json();
             assert_eq!(body["provider"], provider.literal());
-            assert_eq!(body["code"], SYNTHETIC_CODE);
-            assert_eq!(body["state"], state);
+            // 断言用布尔比较：失败时不打印授权码/state 的合成值
+            assert!(
+                body["code"].as_str() == Some(SYNTHETIC_CODE),
+                "交换 body 必须携带授权码"
+            );
+            assert!(
+                body["state"].as_str() == Some(state.as_str()),
+                "交换 body 必须携带本次 state"
+            );
             assert_eq!(body["redirect_uri"], redirect);
 
             let token = auth.terminal_token().await.expect("终端 token 申请成功");
             // 返回值是短期 relay token（不是账号 JWT），逐次现取
-            assert_eq!(token.value, SYNTHETIC_RELAY_TOKEN);
+            assert!(
+                token.value == SYNTHETIC_RELAY_TOKEN,
+                "终端 token 必须是本次 relay 响应值"
+            );
             assert_eq!(token.expires_in, 60);
             let relay = fake.last_relay().expect("已记录终端 token 请求");
             assert_eq!(relay.method, "POST");
             assert_eq!(relay.path, RELAY_TOKEN_PATH);
-            assert_eq!(relay.authorization, Some(format!("Bearer {jwt}")));
+            assert!(
+                relay.authorization.as_deref() == Some(format!("Bearer {jwt}").as_str()),
+                "终端 token 请求必须携带 Bearer JWT"
+            );
             assert_eq!(relay.json()["role"], "terminal");
         }
     }
@@ -1431,5 +1523,153 @@ mod tests {
         );
         assert_eq!(err_code(auth.terminal_token().await), "needs_auth");
         assert_eq!(fake.relay_count(), 0, "clear 后的交换结果不得落内存");
+    }
+
+    // ───────────────────────── fix round 1：凭据生命周期 epoch 绑定 ─────────────────────────
+
+    /// 旧 JWT 的迟到 401 不得清掉新授权刚落地的新 JWT。
+    ///
+    /// 时序（全闸门控制，无真实睡眠）：旧 JWT 申请终端 token（响应挂起）→ 新授权开始
+    /// （epoch 已递增、旧 JWT 尚未被替换）→ 新授权完成并落地 JWT2 → 放行迟到的 401。
+    #[tokio::test]
+    async fn stale_terminal_token_cannot_clear_fresh_jwt() {
+        let fake = FakeZcode::start().await;
+        let first_jwt = valid_jwt();
+        let second_jwt = synthetic_jwt(now_secs() + 7200);
+        fake.set_exchange(200, exchange_ok(&first_jwt));
+        let auth = Arc::new(test_service(&fake));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("首次授权成功");
+
+        // 旧 JWT 的终端 token 请求：401，但响应先挂起
+        fake.set_relay(401, r#"{"code":401,"msg":"synthetic-upstream"}"#);
+        let relay_gate = fake.hold_relay();
+
+        // 新授权：交换响应先挂起（epoch 已递增，JWT2 尚未落内存）
+        fake.set_exchange(200, exchange_ok(&second_jwt));
+        let exchange_gate = fake.hold_exchange();
+        let slot = UrlSlot::new();
+        let reauth = spawn_authorize(auth.clone(), OAuthProvider::Bigmodel, slot.clone());
+        let (redirect, state) = oauth_params(&slot.wait().await);
+        let status =
+            deliver_status(&redirect, &format!("state={state}&code={SYNTHETIC_CODE}")).await;
+        assert_eq!(status, Some(200));
+        wait_until(|| fake.exchange_count() == 2).await;
+
+        // 旧 JWT 的 relay 请求在「新授权进行中」发出并挂起
+        let stale = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.terminal_token().await }
+        });
+        wait_until(|| fake.relay_count() == 1).await;
+
+        // 新授权完成：JWT2 落内存
+        exchange_gate.add_permits(1);
+        reauth
+            .await
+            .expect("授权任务不应 panic")
+            .expect("二次授权成功");
+
+        // 迟到的 401 到达：只允许作废它自己，不得清掉新 JWT
+        relay_gate.add_permits(1);
+        assert_eq!(
+            err_code(stale.await.expect("旧请求任务不应 panic")),
+            "needs_auth"
+        );
+
+        // 新 JWT 仍可用于下一次终端 token 申请
+        fake.clear_relay_gate();
+        fake.set_relay(200, relay_ok(SYNTHETIC_RELAY_TOKEN, 60));
+        match auth.terminal_token().await {
+            Ok(token) => assert!(
+                token.value == SYNTHETIC_RELAY_TOKEN,
+                "终端 token 必须来自本次 relay 响应"
+            ),
+            Err(err) => panic!("新 JWT 必须仍可用，实际失败码 {}", err.code),
+        }
+        assert_eq!(fake.relay_count(), 2);
+    }
+
+    /// clear 发生在终端 token 请求在途时：成功响应必须被丢弃，不得逃出 token。
+    #[tokio::test]
+    async fn clear_during_terminal_exchange_discards_result() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        let auth = Arc::new(test_service(&fake));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+
+        fake.set_relay(200, relay_ok(SYNTHETIC_RELAY_TOKEN, 60));
+        let relay_gate = fake.hold_relay();
+        let pending = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.terminal_token().await }
+        });
+        wait_until(|| fake.relay_count() == 1).await;
+
+        auth.clear();
+        relay_gate.add_permits(1);
+        assert_eq!(
+            err_code(pending.await.expect("请求任务不应 panic")),
+            "needs_auth"
+        );
+
+        // 结果已丢弃：凭据为空，且不得再发出请求
+        assert_eq!(err_code(auth.terminal_token().await), "needs_auth");
+        assert_eq!(fake.relay_count(), 1);
+    }
+
+    // ───────────────────────── fix round 1：回调静态页与日志卫生 ─────────────────────────
+
+    /// `error=` 回调：以 needs_auth 收尾、零交换，响应是固定中文错误页且不回显参数。
+    #[tokio::test]
+    async fn error_callback_requires_auth() {
+        let fake = FakeZcode::start().await;
+        let auth = Arc::new(test_service(&fake));
+        let slot = UrlSlot::new();
+        let handle = spawn_authorize(auth, OAuthProvider::Zai, slot.clone());
+        let (redirect, state) = oauth_params(&slot.wait().await);
+
+        let (status, body) = deliver(&redirect, &format!("state={state}&error=access_denied"))
+            .await
+            .expect("error 回调也应有静态响应");
+        assert_eq!(status, 200);
+        assert!(
+            body == CALLBACK_ERROR_PAGE,
+            "error 回调响应必须是固定的错误静态页"
+        );
+        assert!(!body.contains(&state), "响应不得回显 state");
+        assert!(!body.contains("access_denied"), "响应不得回显 error 值");
+
+        assert_eq!(
+            err_code(handle.await.expect("授权任务不应 panic")),
+            "needs_auth"
+        );
+        assert_eq!(fake.exchange_count(), 0);
+    }
+
+    /// 成功回调响应是固定中文页，且不含任何 state/code。
+    #[tokio::test]
+    async fn callback_success_page_is_static_and_does_not_echo() {
+        let fake = FakeZcode::start().await;
+        let auth = Arc::new(test_service(&fake));
+        let slot = UrlSlot::new();
+        let handle = spawn_authorize(auth, OAuthProvider::Bigmodel, slot.clone());
+        let (redirect, state) = oauth_params(&slot.wait().await);
+
+        let (status, body) = deliver(&redirect, &format!("state={state}&code={SYNTHETIC_CODE}"))
+            .await
+            .expect("成功回调应有静态响应");
+        assert_eq!(status, 200);
+        assert!(
+            body == CALLBACK_SUCCESS_PAGE,
+            "成功回调响应必须是固定的成功静态页"
+        );
+        assert!(!body.contains(&state), "响应不得回显 state");
+        assert!(!body.contains(SYNTHETIC_CODE), "响应不得回显 code");
+
+        handle.await.expect("授权任务不应 panic").expect("授权成功");
     }
 }
