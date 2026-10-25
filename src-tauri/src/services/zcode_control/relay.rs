@@ -59,7 +59,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::auth::AuthService;
 use super::config::validate_official_url;
-use super::types::{codes, ConnectionState, ConnectionView, ZResult, ZcodeError};
+use super::types::{codes, ConnectionState, ConnectionView, RelaySink, ZResult, ZcodeError};
 
 /// 官方 relay WebSocket 路径（固定源码 `shared/web-remote-relay/contract.ts:102`）。
 pub const OFFICIAL_RELAY_WS_PATH: &str = "/api/v1/remote/ws2";
@@ -613,6 +613,13 @@ impl RelayClient {
     #[cfg(test)]
     fn actors_finished(&self) -> usize {
         self.shared.actor_exits.load(Ordering::SeqCst)
+    }
+}
+
+/// 桥接域的窄端口实现：只暴露 `send_data`（未配对 → 冻结码 `not_ready`，零写帧）。
+impl RelaySink for RelayClient {
+    fn send_data(&self, payload: Value) -> futures::future::BoxFuture<'_, ZResult<()>> {
+        Box::pin(async move { RelayClient::send_data(self, payload).await })
     }
 }
 
