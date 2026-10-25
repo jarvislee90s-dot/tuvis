@@ -229,6 +229,20 @@ export class PendingBook {
     });
   }
 
+  /** 最近一次 control 中的全部 foregroundExecutionId（触发前基线；用于排除旧执行）。 */
+  foregroundExecutionIds(): Set<string> {
+    const ids = new Set<string>();
+    if (!this.lastControl) return ids;
+    const activeWorks = (this.lastControl as { activeWorks?: unknown }).activeWorks;
+    if (!Array.isArray(activeWorks)) return ids;
+    for (const work of activeWorks) {
+      if (!work || typeof work !== "object") continue;
+      const id = (work as { foregroundExecutionId?: unknown }).foregroundExecutionId;
+      if (typeof id === "string" && id.length > 0) ids.add(id);
+    }
+    return ids;
+  }
+
   /** control 观察代数（触发前取基线，observeStopTarget 只认基线之后的新值）。 */
   get controlRevision(): number {
     return this.controlRevisionCounter;
@@ -334,11 +348,14 @@ export class PendingBook {
    * 53-64 ActiveWorkSummary{kind, foregroundExecutionId?}）。只有 primaryTurn 条目
    * 可作为目标（前台子 agent / compact 等不是本轮 turn 的守卫点，宁不 stop 不误杀）。
    * afterRevision = 触发帧发出前的 controlRevision 基线：control 观察代数未前进
-   * （没有触发后新 control）→ null——触发前的旧执行 id 绝不可被采用。
-   * 未观察到 → null（调用方必须 fail-closed：没有守卫 id 就不做 stop）。
+   * （没有触发后新 control）→ null。
+   * excludeExecutionIds = 触发前已存在的执行 id 基线：新 control 帧若仍报告旧 id，
+   * 同样返回 null——**光有「新帧」不等于「新执行」**，旧 E 不得被误停。
+   * 未观察到新的可绑定执行 → null（调用方必须 fail-closed：没有新守卫 id 就不做 stop）。
    */
   observeStopTarget(options?: {
     afterRevision?: number;
+    excludeExecutionIds?: ReadonlySet<string>;
   }): { kind: string; foregroundExecutionId: string } | null {
     if (
       options?.afterRevision !== undefined &&
@@ -355,6 +372,7 @@ export class PendingBook {
       if (typeof record.foregroundExecutionId !== "string" || !record.foregroundExecutionId) {
         continue;
       }
+      if (options?.excludeExecutionIds?.has(record.foregroundExecutionId)) continue;
       if (record.kind === "primaryTurn") {
         return { kind: "primaryTurn", foregroundExecutionId: record.foregroundExecutionId };
       }

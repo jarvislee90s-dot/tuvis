@@ -228,7 +228,7 @@ function parseFlags(argv: readonly string[]): ProbeFlags | string {
       if (!value) return "--db 需要一个 SQLite 路径";
       flags.dbPath = value;
     } else {
-      return `未知参数：${arg}`;
+      return "未知参数（仅支持 --help 列出的参数）";
     }
   }
   return flags;

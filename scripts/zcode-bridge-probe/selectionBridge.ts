@@ -161,8 +161,11 @@ export function assertSwitchable(
   if (modelLevels === undefined) {
     throw new Error(`unsupported-model: ${target.model} has no per-model thought-level entry`);
   }
-  // 空数组 = 宿主未宣告该模型的档位（无法校验，沿用既有「不猜」语义）。
-  if (modelLevels.length > 0 && !modelLevels.includes(target.thought)) {
+  // 空数组 = 宿主未宣告该模型的档位 → 无法证明目标档位合法，拒绝（不猜）。
+  if (modelLevels.length === 0) {
+    throw new Error(`unsupported-thought-level: host declared no levels for model ${target.model}`);
+  }
+  if (!modelLevels.includes(target.thought)) {
     throw new Error(
       `unsupported-thought-level: ${target.thought} is not supported by model ${target.model}`
     );

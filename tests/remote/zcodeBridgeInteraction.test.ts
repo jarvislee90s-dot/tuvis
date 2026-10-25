@@ -1447,6 +1447,54 @@ describe("B3 修复轮：C2 判别式 / I3 选项闸 / I2 消费复活 / I4 snoo
     expect(book.observeStopTarget({ afterRevision: revisionBeforeTrigger })).toBeNull();
   });
 
+  it("stop_target_excludes_pre_trigger_execution：新 control 仍报告旧 id 时不得停旧执行", () => {
+    const book = new PendingBook({ sessionId: FAKE_TARGET.taskId, generation: 1 });
+    const control = (id: string) => ({
+      activeWorks: [{ kind: "primaryTurn", foregroundExecutionId: id, startedAt: 0 }],
+    });
+    book.acceptTopicFrame(
+      topicFrame({ sessionId: FAKE_TARGET.taskId, control: control("b3-fake-exec-old") })
+    );
+    const revisionBeforeTrigger = book.controlRevision;
+    const baseline = book.foregroundExecutionIds();
+    expect([...baseline]).toEqual(["b3-fake-exec-old"]);
+
+    // 新 control 帧仍只报告旧 id → 不得采用（“新帧”不等于“新执行”）。
+    book.acceptTopicFrame(
+      deltasTopicFrame({
+        sessionId: FAKE_TARGET.taskId,
+        patch: { control: control("b3-fake-exec-old") },
+      })
+    );
+    expect(
+      book.observeStopTarget({
+        afterRevision: revisionBeforeTrigger,
+        excludeExecutionIds: baseline,
+      })
+    ).toBeNull();
+
+    // 旧 + 新并存：跳过旧 id，只取新 id。
+    book.acceptTopicFrame(
+      deltasTopicFrame({
+        sessionId: FAKE_TARGET.taskId,
+        patch: {
+          control: {
+            activeWorks: [
+              { kind: "primaryTurn", foregroundExecutionId: "b3-fake-exec-old", startedAt: 0 },
+              { kind: "primaryTurn", foregroundExecutionId: "b3-fake-exec-new", startedAt: 1 },
+            ],
+          },
+        },
+      })
+    );
+    expect(
+      book.observeStopTarget({
+        afterRevision: revisionBeforeTrigger,
+        excludeExecutionIds: baseline,
+      })
+    ).toEqual({ kind: "primaryTurn", foregroundExecutionId: "b3-fake-exec-new" });
+  });
+
   it("autoResolution_snooze_ordering：snooze 必在 resolve 之前，无 autoResolution 时只发 resolve", () => {
     const resolvePayload = {
       interactionId: "b3-fake-rule-1",
