@@ -25,17 +25,17 @@
 
 本轮**不启动任何进程**，因此运行版本沿用既有 PACKAGE 证据并显式标注；静态事实为本轮新测，不覆盖旧记录：
 
-| 项 | 值 | 证据级别 | 来源与本轮状态 |
-| --- | --- | --- | --- |
-| ZCode.app 版本／build | CFBundleShortVersionString `3.16.2`，CFBundleVersion `3.16.2.8769` | PACKAGE（本轮直读） | `/Applications/ZCode.app/Contents/Info.plist`（PlistBuddy 只读）；与 Mac P0 记录（`macos-20261023T2246+0800-acdb`，APP 3.16.2.8769）**一致，未升级** |
-| 随包 CLI 入口文件 | `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`，15,243,891 B，mtime 2026-10-19 20:37 | PACKAGE（本轮直读） | 同目录 `.node-bundle-meta.json`：`entry=zcode.cjs`、`runtime=electron-node`、`platform=darwin-arm64`、`source=apps/zcode-cli/packages/cli/dist/zcode.cjs`——随包文件自述其源码路径位于本固定 SHA 仓库内 |
-| 随包 CLI SHA256（本轮新增） | `a055234a6ca3da0172616d3987cf3c617b6a26deb1332d69035300c2a0ae0de1` | PACKAGE（本轮直取） | `shasum -a 256`；旧探测文档未记录该哈希，属**追加**新指纹，不改写旧证据 |
-| 随包 CLI 静态版本串 | `0.16.9` | PACKAGE（本轮复测命中） | 对 zcode.cjs 的静态 grep 命中；与 P0 复核「随包 CLI 静态串 0.16.9」一致，文件未变 |
-| 随包 CLI 运行版本 | **未运行本轮** | UNPROVEN（Mac 侧） | 沿用 `2026-10-24-capability-status.md` §4.1 口径：Windows 运行 help 为 `0.17.0`、DB 迁移版本 `0.16.9`、静态包字符串 `0.16.9`、APP `3.16.3.8992` **四者不可互推**；Mac 的 `0.16.9` 目前只是静态指纹，不能推断 Mac 运行版本 |
-| 独立 PATH CLI | 无（`zcode` 不在 PATH） | PACKAGE（本轮直查） | `which zcode` 未命中 |
-| Tuvis.app 已安装版本 | `0.6.1`（CFBundleShortVersionString/CFBundleVersion） | PACKAGE（本轮直读） | `/Applications/Tuvis.app/Contents/Info.plist`；与 P0 记录（Tuvis 0.6.1）一致 |
-| Tuvis 源码身份 | 分支 `codex/zcode-unified-remote`，HEAD `131346083f0f1112d4b53843d0905d72826ed430`，工作树 `/Users/jarvis/Documents/tuvis-worktree2` | SOURCE（本轮直查） | `git rev-parse HEAD`（只读）；A 包由并行代理续提交，本文件只钉住 B0 取证时点 |
-| Windows 安装身份（沿用） | APP `3.16.3.8992`、随包静态串 `0.16.9`、run_id `windows-20261023T2247+0800-1rn60k`、P0-R+E1—E4 包 `zcode-windows-P0R-E1-E4-20261024` | PACKAGE/RELAY | 沿用 P0 复核 §1 与 capability-status §1／§4.1；**本轮未在 Windows 机器重测** |
+| 项                          | 值                                                                                                                                   | 证据级别                | 来源与本轮状态                                                                                                                                                                                                            |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ZCode.app 版本／build       | CFBundleShortVersionString `3.16.2`，CFBundleVersion `3.16.2.8769`                                                                   | PACKAGE（本轮直读）     | `/Applications/ZCode.app/Contents/Info.plist`（PlistBuddy 只读）；与 Mac P0 记录（`macos-20261023T2246+0800-acdb`，APP 3.16.2.8769）**一致，未升级**                                                                      |
+| 随包 CLI 入口文件           | `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`，15,243,891 B，mtime 2026-10-19 20:37                                     | PACKAGE（本轮直读）     | 同目录 `.node-bundle-meta.json`：`entry=zcode.cjs`、`runtime=electron-node`、`platform=darwin-arm64`、`source=apps/zcode-cli/packages/cli/dist/zcode.cjs`——随包文件自述其源码路径位于本固定 SHA 仓库内                    |
+| 随包 CLI SHA256（本轮新增） | `a055234a6ca3da0172616d3987cf3c617b6a26deb1332d69035300c2a0ae0de1`                                                                   | PACKAGE（本轮直取）     | `shasum -a 256`；旧探测文档未记录该哈希，属**追加**新指纹，不改写旧证据                                                                                                                                                   |
+| 随包 CLI 静态版本串         | `0.16.9`                                                                                                                             | PACKAGE（本轮复测命中） | 对 zcode.cjs 的静态 grep 命中；与 P0 复核「随包 CLI 静态串 0.16.9」一致，文件未变                                                                                                                                         |
+| 随包 CLI 运行版本           | **未运行本轮**                                                                                                                       | UNPROVEN（Mac 侧）      | 沿用 `2026-10-24-capability-status.md` §4.1 口径：Windows 运行 help 为 `0.17.0`、DB 迁移版本 `0.16.9`、静态包字符串 `0.16.9`、APP `3.16.3.8992` **四者不可互推**；Mac 的 `0.16.9` 目前只是静态指纹，不能推断 Mac 运行版本 |
+| 独立 PATH CLI               | 无（`zcode` 不在 PATH）                                                                                                              | PACKAGE（本轮直查）     | `which zcode` 未命中                                                                                                                                                                                                      |
+| Tuvis.app 已安装版本        | `0.6.1`（CFBundleShortVersionString/CFBundleVersion）                                                                                | PACKAGE（本轮直读）     | `/Applications/Tuvis.app/Contents/Info.plist`；与 P0 记录（Tuvis 0.6.1）一致                                                                                                                                              |
+| Tuvis 源码身份              | 分支 `codex/zcode-unified-remote`，HEAD `131346083f0f1112d4b53843d0905d72826ed430`，工作树 `/Users/jarvis/Documents/tuvis-worktree2` | SOURCE（本轮直查）      | `git rev-parse HEAD`（只读）；A 包由并行代理续提交，本文件只钉住 B0 取证时点                                                                                                                                              |
+| Windows 安装身份（沿用）    | APP `3.16.3.8992`、随包静态串 `0.16.9`、run_id `windows-20261023T2247+0800-1rn60k`、P0-R+E1—E4 包 `zcode-windows-P0R-E1-E4-20261024` | PACKAGE/RELAY           | 沿用 P0 复核 §1 与 capability-status §1／§4.1；**本轮未在 Windows 机器重测**                                                                                                                                              |
 
 历史安装指纹（Mac P0：3.16.2.8769／静态串 0.16.9；Windows P0：3.16.3.8992）保持原文不变；
 若未来版本升级，只**追加**新 fingerprint 行，不改写本节旧记录。
@@ -63,19 +63,19 @@
 
 本轮**不重跑 P0 探测**；下表把决策文档后续各节将依赖的每一类论断钉到既有条目上。
 
-| # | 论断（桥接依赖） | 支撑材料与路径 | 证据级别 |
-| --- | --- | --- | --- |
-| E1 | 旧 v1 设计「协议未支持审批／问答」的结论**已被同提交实现反证**，不得再引用 v1 措辞当作当前事实 | `docs/superpowers/plans/2026-10-23-zcode-probe/2026-10-24-p0-review.md` §2.2（撤销定论及修正表） | SOURCE（固定 SHA 行号，见 E2） |
-| E2 | 固定 SHA 上的审批／问答／stop 实现入口（桥接模块边界依据） | 同 §2.2 表：`apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-operations.ts:3513`（注入 `createProtocolInteractionBroker`）、`interaction-broker.ts:105`（requestPermission 反向请求，含 requestId/sessionId/turnId/toolCallId）、`interaction-broker.ts:306`（interactionRequestUserInput）、`zcode-protocol-v4/interaction-registry.ts:1`（broker 与 v4 resolveInteraction 汇合）、`zcode-protocol-v4/commands/handlers/interaction-background.ts:45`（answer 消费；存在 full-access 特权分支，禁止探测误触）、`zcode-protocol/server.ts:677` 与 `server-operations.ts:2702`（session/stop 路由、`requireSession` 后中止 `record.activeAbortController`） | SOURCE |
-| E3 | 上述方法在**本机安装版随包 CLI** 中存在（PACKAGE，不升级运行 PASS） | P0 复核 §2.2 末段静态计数：interaction/requestPermission×1、interaction/requestUserInput×1、resolveInteraction×5、session/stop×4；本轮确认 zcode.cjs 哈希（§1.2）使该计数对应当前文件。注意：哈希↔静态计数的对应关系目前依托 P0 以来该文件的 (mtime,size) 同一性支撑（15,243,891 B / 2026-10-19 20:37），下次指纹复核须以内容哈希重算再确认 | PACKAGE |
-| E4 | Mac P0-R 已追出「APP host 独占本地 stdio；官方 Web 远控经账号→SID→短期 token→relay→RPC bridge 到 APP」的链路与 broker/server-operations 入口 | `mac-agent-supplement-prompt.md`（R-01 定义）、`mac-agent-prompt.md`（P0-05 定义）；回报本体在私有目录 `~/Documents/tuvis-verify-logs/zcode/macos-P0R20261024T002051+0800-5n1lm/`（留机不入库）；仓库内摘要见 `2026-10-24-capability-status.md` §3「已有 APP 回合审批／问答／打断」行与 §4.5 | RELAY（私有原件）＋SOURCE |
-| E5 | 官方远控（网页面）的发送／审批／打断／切模型／链接复用有用户约两个月长期实测；本包**不重复证明**，对象是 Tuvis 独立客户端身份／连接／逐动作映射 | `2026-10-24-capability-status.md` §7；设计 v3 §1「官方页面这些功能已有用户约两个月的真实使用证据」 | 用户直接陈述（登记于 capability-status） |
-| E6 | 读取断点根因（新旧 ID 双形态）与修复归属 A 包、不属桥接证据 | P0 复核 §2.1；设计 v3 §6 | OBSERVED（两平台） |
-| E7 | 配置 URL 格式合同（A4，输入给 B）：`https`＋主机 `zcode.z.ai`＋`/remote/vN` 版本化路径＋非空唯一 `sid`（≤128 UTF-8 字节）、无 userinfo／非默认端口、≤4096、未知 query 保留；存储 key `remote.zcode_official_url`；`ConfigState=Missing|Saved|Invalid`，**Saved≠Connected**；完整链接不入日志／文档／夹具 | A 包计划 §A4（`docs/superpowers/plans/2026-10-24-remote-settings-and-zcode-read-recovery.md`）＋设计 v3 §4.3；实现 commit `ae3e3353 feat(zcode): persist and validate official remote configuration` | SOURCE（本仓库实现） |
-| E8 | #117 最终 head 与其 provider env 处理结论（发送线历史素材的审计边界） | `2026-10-24-p0-review.md` §2.3：head `289b20db4d6bdfba50ecfdeb67f1ef6f47ab583f`，gate.rs:130–147；旧合流点 `d5cc28b1` 结论作废 | SOURCE |
-| E9 | 「真实 `hi` 自动探针不进入本路线」 | `2026-10-24-capability-status.md` §4.3；工作包 B 计划全局约束「#117 hi gate 不加入本包」；设计 v3 §2 | 决定（用户裁决） |
-| E10 | Windows 运行证据（E2 无头 marker、E4 取消）仅覆盖 Windows 特定构建＋provider 组合，不解锁 Mac、不解锁手机闭环 | capability-status §1／§3 矩阵各行 | OBSERVED（Windows 单机） |
-| E11 | 同 SID／role 单 owner、KICKED／冲突须停自动重连的约束 | 设计 v3 §5.2；capability-status §6（mobile allowlist／设备列表／多 SID／每 SID-role 单 owner 的开源证据） | SOURCE＋待 B1 实连核验 |
+| #   | 论断（桥接依赖）                                                                                                                                                                                                                       | 支撑材料与路径                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | 证据级别                                                    |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| E1  | 旧 v1 设计「协议未支持审批／问答」的结论**已被同提交实现反证**，不得再引用 v1 措辞当作当前事实                                                                                                                                         | `docs/superpowers/plans/2026-10-23-zcode-probe/2026-10-24-p0-review.md` §2.2（撤销定论及修正表）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | SOURCE（固定 SHA 行号，见 E2）                              |
+| E2  | 固定 SHA 上的审批／问答／stop 实现入口（桥接模块边界依据）                                                                                                                                                                             | 同 §2.2 表：`apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-operations.ts:3513`（注入 `createProtocolInteractionBroker`）、`interaction-broker.ts:105`（requestPermission 反向请求，含 requestId/sessionId/turnId/toolCallId）、`interaction-broker.ts:306`（interactionRequestUserInput）、`zcode-protocol-v4/interaction-registry.ts:1`（broker 与 v4 resolveInteraction 汇合）、`zcode-protocol-v4/commands/handlers/interaction-background.ts:45`（answer 消费；存在 full-access 特权分支，禁止探测误触）、`zcode-protocol/server.ts:677` 与 `server-operations.ts:2702`（session/stop 路由、`requireSession` 后中止 `record.activeAbortController`） | SOURCE                                                      |
+| E3  | 上述方法在**本机安装版随包 CLI** 中存在（PACKAGE，不升级运行 PASS）                                                                                                                                                                    | P0 复核 §2.2 末段静态计数：interaction/requestPermission×1、interaction/requestUserInput×1、resolveInteraction×5、session/stop×4；本轮确认 zcode.cjs 哈希（§1.2）使该计数对应当前文件。注意：哈希↔静态计数的对应关系目前依托 P0 以来该文件的 (mtime,size) 同一性支撑（15,243,891 B / 2026-10-19 20:37），下次指纹复核须以内容哈希重算再确认                                                                                                                                                                                                                                                                                                                            | PACKAGE                                                     |
+| E4  | Mac P0-R 已追出「APP host 独占本地 stdio；官方 Web 远控经账号→SID→短期 token→relay→RPC bridge 到 APP」的链路与 broker/server-operations 入口                                                                                           | `mac-agent-supplement-prompt.md`（R-01 定义）、`mac-agent-prompt.md`（P0-05 定义）；回报本体在私有目录 `~/Documents/tuvis-verify-logs/zcode/macos-P0R20261024T002051+0800-5n1lm/`（留机不入库）；仓库内摘要见 `2026-10-24-capability-status.md` §3「已有 APP 回合审批／问答／打断」行与 §4.5                                                                                                                                                                                                                                                                                                                                                                           | RELAY（私有原件）＋SOURCE                                   |
+| E5  | 官方远控（网页面）的发送／审批／打断／切模型／链接复用有用户约两个月长期实测；本包**不重复证明**，对象是 Tuvis 独立客户端身份／连接／逐动作映射                                                                                        | `2026-10-24-capability-status.md` §7；设计 v3 §1「官方页面这些功能已有用户约两个月的真实使用证据」                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | 用户直接陈述（登记于 capability-status）                    |
+| E6  | 读取断点根因（新旧 ID 双形态）与修复归属 A 包、不属桥接证据                                                                                                                                                                            | P0 复核 §2.1；设计 v3 §6                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | OBSERVED（两平台）                                          |
+| E7  | 配置 URL 格式合同（A4，输入给 B）：`https`＋主机 `zcode.z.ai`＋`/remote/vN` 版本化路径＋非空唯一 `sid`（≤128 UTF-8 字节）、无 userinfo／非默认端口、≤4096、未知 query 保留；存储 key `remote.zcode_official_url`；`ConfigState=Missing | Saved                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Invalid`，**Saved≠Connected**；完整链接不入日志／文档／夹具 | A 包计划 §A4（`docs/superpowers/plans/2026-10-24-remote-settings-and-zcode-read-recovery.md`）＋设计 v3 §4.3；实现 commit `ae3e3353 feat(zcode): persist and validate official remote configuration` | SOURCE（本仓库实现） |
+| E8  | #117 最终 head 与其 provider env 处理结论（发送线历史素材的审计边界）                                                                                                                                                                  | `2026-10-24-p0-review.md` §2.3：head `289b20db4d6bdfba50ecfdeb67f1ef6f47ab583f`，gate.rs:130–147；旧合流点 `d5cc28b1` 结论作废                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | SOURCE                                                      |
+| E9  | 「真实 `hi` 自动探针不进入本路线」                                                                                                                                                                                                     | `2026-10-24-capability-status.md` §4.3；工作包 B 计划全局约束「#117 hi gate 不加入本包」；设计 v3 §2                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | 决定（用户裁决）                                            |
+| E10 | Windows 运行证据（E2 无头 marker、E4 取消）仅覆盖 Windows 特定构建＋provider 组合，不解锁 Mac、不解锁手机闭环                                                                                                                          | capability-status §1／§3 矩阵各行                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | OBSERVED（Windows 单机）                                    |
+| E11 | 同 SID／role 单 owner、KICKED／冲突须停自动重连的约束                                                                                                                                                                                  | 设计 v3 §5.2；capability-status §6（mobile allowlist／设备列表／多 SID／每 SID-role 单 owner 的开源证据）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | SOURCE＋待 B1 实连核验                                      |
 
 ---
 
@@ -94,13 +94,13 @@
 
 ### 3.2 模块边界（相对固定 SHA `3c5b2276…`）
 
-| 模块 | 边界与桥接角色 | 现有证据 |
-| --- | --- | --- |
-| `apps/zcode-cli/packages/bootstrap/src/zcode-protocol/`（协议服务端面） | `server.ts`、`server-operations.ts`、`interaction-broker.ts`、`transport.ts`（传输层实现，B1 需通读双面）、`session-residency.ts`／`session-resident-pool.ts`（实例持有）、`official-mcp-auth-port.ts`（名称指向外部 MCP 认证端口，**是否涉及远控授权未验证，留给 B1，不预设为登录通路**） | E2、E3 |
-| `apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/` | `interaction-registry.ts`、`commands/handlers/interaction-background.ts`、`v4-gateway.ts`、`replay.ts`、`cold-session-resume.ts`（v4 应答／事件／恢复面；具体命令 wire 值必须来自实现＋真实脱敏帧） | E2 |
-| `apps/zcode-cli/packages/contracts/` | 跨端类型契约目录（`commands/`、`events/`、`interfaces/`、`network/` 等），B1 评估为 wire schema 的**参考源**；引用≠复制（见 3.3） | 本轮目录列表（GitHub API） |
-| `apps/zcode-cli/packages/cli/`（`src/resume.ts`、`src/protocol-lifecycle.ts`）、`packages/core/src/permission/service.ts` | P0 已读发送／恢复／权限面文档；CLI prompt 通道**没有**双向审批客户端，不能据此推导协议面能力 | P0 复核 §2.2 结论、手册 §2 表 |
-| 官方 Web 远控前端与云 relay 服务 | **不在本仓库**：固定 SHA 的 `apps/` 仅含 `zcode-cli` 与 `dev-docs`（本轮 API 列目录核实）。即 `zcode.z.ai` 远端与 relay 是托管服务，仓库只有其**对端实现**（协议服务端与随包 CLI）；B1 的 relay wire 证据只能来自客户端侧实现、授权流程返回与真实脱敏帧，**不得以“读官方服务端源码”补齐合同** | 本轮目录核实 |
+| 模块                                                                                                                      | 边界与桥接角色                                                                                                                                                                                                                                                                                | 现有证据                      |
+| ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| `apps/zcode-cli/packages/bootstrap/src/zcode-protocol/`（协议服务端面）                                                   | `server.ts`、`server-operations.ts`、`interaction-broker.ts`、`transport.ts`（传输层实现，B1 需通读双面）、`session-residency.ts`／`session-resident-pool.ts`（实例持有）、`official-mcp-auth-port.ts`（名称指向外部 MCP 认证端口，**是否涉及远控授权未验证，留给 B1，不预设为登录通路**）    | E2、E3                        |
+| `apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/`                                                                | `interaction-registry.ts`、`commands/handlers/interaction-background.ts`、`v4-gateway.ts`、`replay.ts`、`cold-session-resume.ts`（v4 应答／事件／恢复面；具体命令 wire 值必须来自实现＋真实脱敏帧）                                                                                           | E2                            |
+| `apps/zcode-cli/packages/contracts/`                                                                                      | 跨端类型契约目录（`commands/`、`events/`、`interfaces/`、`network/` 等），B1 评估为 wire schema 的**参考源**；引用≠复制（见 3.3）                                                                                                                                                             | 本轮目录列表（GitHub API）    |
+| `apps/zcode-cli/packages/cli/`（`src/resume.ts`、`src/protocol-lifecycle.ts`）、`packages/core/src/permission/service.ts` | P0 已读发送／恢复／权限面文档；CLI prompt 通道**没有**双向审批客户端，不能据此推导协议面能力                                                                                                                                                                                                  | P0 复核 §2.2 结论、手册 §2 表 |
+| 官方 Web 远控前端与云 relay 服务                                                                                          | **不在本仓库**：固定 SHA 的 `apps/` 仅含 `zcode-cli` 与 `dev-docs`（本轮 API 列目录核实）。即 `zcode.z.ai` 远端与 relay 是托管服务，仓库只有其**对端实现**（协议服务端与随包 CLI）；B1 的 relay wire 证据只能来自客户端侧实现、授权流程返回与真实脱敏帧，**不得以“读官方服务端源码”补齐合同** | 本轮目录核实                  |
 
 ### 3.3 复用方式（登记；逐模块裁决留 B1）
 
@@ -131,12 +131,12 @@
 
 ### 4.1 测试目标登记（2026-10-24 追加，B1 实连半场；别名制，真实 ID/路径只存私有映射）
 
-| 项 | 登记值（别名） | 说明 |
-| --- | --- | --- |
-| 测试 workspace 别名 | `Travel` | 用户指定的专用测试工作区；真实路径/ID 不入本文档，只存私有映射 |
-| 测试 session 别名 | `hi` | 该 workspace 内的专用测试会话；真实 session ID 同上 |
-| 已授权批次（batch 1） | 在会话 `hi` 中**发送消息** | 唯一获批的真实写动作 |
-| 未授权批次 | 审批 / 问答（自由作答与选项） / 打断（session/stop） / 模型切换 | 逐批授权制：未列即禁止，探针与后续批次不得触碰 |
+| 项                    | 登记值（别名）                                                  | 说明                                                           |
+| --------------------- | --------------------------------------------------------------- | -------------------------------------------------------------- |
+| 测试 workspace 别名   | `Travel`                                                        | 用户指定的专用测试工作区；真实路径/ID 不入本文档，只存私有映射 |
+| 测试 session 别名     | `hi`                                                            | 该 workspace 内的专用测试会话；真实 session ID 同上            |
+| 已授权批次（batch 1） | 在会话 `hi` 中**发送消息**                                      | 唯一获批的真实写动作                                           |
+| 未授权批次            | 审批 / 问答（自由作答与选项） / 打断（session/stop） / 模型切换 | 逐批授权制：未列即禁止，探针与后续批次不得触碰                 |
 
 - 本登记只解除「测试目标未指定」的等待项（§4 第 2 条）；B1 实连仍受 §6.7 其余停等项
   （有效链接、凭据通路探测授权、同 role 互踢知情确认）约束。
@@ -144,14 +144,12 @@
 
 ### 4.2 等待项收官登记（2026-10-24 追加，B1 实连半场；按 §6.7 编号逐项销账，不改写上文）
 
-| §6.7 等待项 | 状态 | 日期与依据 |
-| --- | --- | --- |
-| ① 有效官方链接（阻塞实连） | **DONE（2026-10-24）** | 用户本人在 ZCode APP 开启移动远控并经 Tuvis A4 设置卡保存当前有效链接；探针自 `~/.tuvis/tuvis.db` 只读读取成功并解析 sid/mid（`linkSource=settings`，见 §6.9 run 引用） |
-| ② 专用测试目标（阻塞真实写） | **部分完成（2026-10-24）** | 测试目标已指定并登记 §4.1（workspace `Travel` / session `hi`），batch 1 = 发送消息已授权；审批／问答／打断／切模型批次仍未授权，B2 起逐批申请 |
-| ③ 账号凭据通路探测授权 | **DONE（2026-10-24）** | 用户在场完成浏览器 OAuth 通路探测：bigmodel 通道回环 redirect 被接受、交换端点签发有效账号 JWT → `auth.status=proven` 定案（详见 §6.9 第 1 条） |
-| ④ 同 role 互踢知情确认 | **已消解（2026-10-24）** | 实连证实官方流程**不存在 APP 侧配对确认**（waiting = 路由不可达/设备离线态，§6.9 第 3/4 条）；互踢语义维持原判——同一链接第二条 terminal 连接会把第一条踢成 KICKED（官方源码注释 + fake 锁形维持），探针 KICKED 即停口径不变；实连时段用户知情且未依赖网页会话 |
-
-
+| §6.7 等待项                  | 状态                       | 日期与依据                                                                                                                                                                                                                                                    |
+| ---------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ① 有效官方链接（阻塞实连）   | **DONE（2026-10-24）**     | 用户本人在 ZCode APP 开启移动远控并经 Tuvis A4 设置卡保存当前有效链接；探针自 `~/.tuvis/tuvis.db` 只读读取成功并解析 sid/mid（`linkSource=settings`，见 §6.9 run 引用）                                                                                       |
+| ② 专用测试目标（阻塞真实写） | **部分完成（2026-10-24）** | 测试目标已指定并登记 §4.1（workspace `Travel` / session `hi`），batch 1 = 发送消息已授权；审批／问答／打断／切模型批次仍未授权，B2 起逐批申请                                                                                                                 |
+| ③ 账号凭据通路探测授权       | **DONE（2026-10-24）**     | 用户在场完成浏览器 OAuth 通路探测：bigmodel 通道回环 redirect 被接受、交换端点签发有效账号 JWT → `auth.status=proven` 定案（详见 §6.9 第 1 条）                                                                                                               |
+| ④ 同 role 互踢知情确认       | **已消解（2026-10-24）**   | 实连证实官方流程**不存在 APP 侧配对确认**（waiting = 路由不可达/设备离线态，§6.9 第 3/4 条）；互踢语义维持原判——同一链接第二条 terminal 连接会把第一条踢成 KICKED（官方源码注释 + fake 锁形维持），探针 KICKED 即停口径不变；实连时段用户知情且未依赖网页会话 |
 
 ## 5. 纪律声明（B 包约束登记）
 
@@ -186,11 +184,11 @@ B0 §3.2 末行「官方 Web 远控前端与云 relay 服务**不在本仓库**�
 （固定 SHA 的 `apps/` 确实只有 `zcode-cli` 与 `dev-docs`），但仓库级判断不完整。本轮树清查
 （`git trees?recursive=1` @ 同 SHA）证实以下三组**客户端侧实现就在本仓库**：
 
-| 目录 | 角色 | B1 用途 |
-| --- | --- | --- |
-| `packages/shared/src/web-remote-relay/` | relay V2 wire 契约（zod schema：HTTP 路径表、WS 消息、token 形状、错误码） | 本轮 wire 引用的第一权威 |
-| `packages/web/src/web-remote-control/`（含 `auth/`） | 官方网页远控前端（终端角色）+ 其 OAuth 登录模块 | 终端授权流与账号 JWT 来源的证据源 |
-| `packages/desktop/src/main/web-remote-relay/` | 官方桌面端（设备角色）relay 客户端 | 设备注册/注销与凭据持久化对照面 |
+| 目录                                                 | 角色                                                                       | B1 用途                           |
+| ---------------------------------------------------- | -------------------------------------------------------------------------- | --------------------------------- |
+| `packages/shared/src/web-remote-relay/`              | relay V2 wire 契约（zod schema：HTTP 路径表、WS 消息、token 形状、错误码） | 本轮 wire 引用的第一权威          |
+| `packages/web/src/web-remote-control/`（含 `auth/`） | 官方网页远控前端（终端角色）+ 其 OAuth 登录模块                            | 终端授权流与账号 JWT 来源的证据源 |
+| `packages/desktop/src/main/web-remote-relay/`        | 官方桌面端（设备角色）relay 客户端                                         | 设备注册/注销与凭据持久化对照面   |
 
 **仍然不在仓库**：云 relay/hub 服务端本体与 `zcode.z.ai` 站点部署配置。因此 B0 的结论
 「relay wire 证据只能来自客户端侧实现 + 授权返回 + 真实脱敏帧」**维持成立**，且本轮起
@@ -363,12 +361,12 @@ B0 §3.2 末行「官方 Web 远控前端与云 relay 服务**不在本仓库**�
 
 实连 run 索引（私有，只读引用）：
 
-| run id | oauth | connect | 说明 |
-| --- | --- | --- | --- |
-| `macos-B120261024T102434Z-SbxvWA` | UNSUPPORTED（callback-timeout） | SKIPPED | zai 通道——用户账号在 BigModel 侧，通道不符；inconclusive，**非**服务器拒绝 |
-| `macos-B120261024T104607Z-iykCdg` | PROVEN（bigmodel） | STOPPED:pair-timeout | 探针缺 mid → pair_status 恒 waiting → 30s 超时 |
-| `macos-B120261024T104720Z-OMksKw` | PROVEN（bigmodel） | STOPPED:pair-timeout | 同上（复跑） |
-| `macos-B120261024T105940Z-NarmSw` | PROVEN（bigmodel） | **COMPLETED** | mid 修复后收官 run：paired + 两只读查询 ok |
+| run id                            | oauth                           | connect              | 说明                                                                       |
+| --------------------------------- | ------------------------------- | -------------------- | -------------------------------------------------------------------------- |
+| `macos-B120261024T102434Z-SbxvWA` | UNSUPPORTED（callback-timeout） | SKIPPED              | zai 通道——用户账号在 BigModel 侧，通道不符；inconclusive，**非**服务器拒绝 |
+| `macos-B120261024T104607Z-iykCdg` | PROVEN（bigmodel）              | STOPPED:pair-timeout | 探针缺 mid → pair_status 恒 waiting → 30s 超时                             |
+| `macos-B120261024T104720Z-OMksKw` | PROVEN（bigmodel）              | STOPPED:pair-timeout | 同上（复跑）                                                               |
+| `macos-B120261024T105940Z-NarmSw` | PROVEN（bigmodel）              | **COMPLETED**        | mid 修复后收官 run：paired + 两只读查询 ok                                 |
 
 六项判定（逐条挂证据级别）：
 
@@ -379,8 +377,8 @@ B0 §3.2 末行「官方 Web 远控前端与云 relay 服务**不在本仓库**�
    【live-sanitized】；②bigmodel PROVEN【live-sanitized】；③bigmodel PROVEN（mid 修复后复跑）
    【live-sanitized】。
 2. **终端 token 实测。**【live-sanitized】`POST /api/v1/remote/token` Bearer JWT
-   `{role:"terminal"}` → 22 字符 token、`expires_in=60s`；一次性核验通过（同一 run 两次申请值
-   不同）、每次连接现取新 token；两条独立 run 复现。
+   `{role:"terminal"}` → 22 字符 token、`expires_in=60s`；同一 run 两次申请值不同（一次性由
+   source+fake 约束，未做重放拒绝）、每次连接现取新 token；两条独立 run 复现。
 3. **mid 绑定发现。**【live-sanitized + source】relay 以 ws2 升级 URL 的 `mid` 查询参数把终端
    路由到目标设备：官方 web 终端在链接 mid 非空时**条件性**附加（`webRemoteControlTransport.ts:107-110`）
    【source】；APP（设备角色）**恒发**自身 mid（desktop `webRemoteControlTransport.ts:117-119`）
@@ -403,8 +401,8 @@ B0 §3.2 末行「官方 Web 远控前端与云 relay 服务**不在本仓库**�
 合同落点：`tests/fixtures/zcode-official-bridge/contract.json` 的 `auth.status=proven`、
 `interimMissing` 改记解除过程、`auth.evidence`/`route.evidence` 追加 live 条目、
 route `ownerScope`/`bindingNote` 勘正如上；`capabilities` 维持全 false、`operations` 维持
-空数组（send 等属 B2+，未取得各自真实帧证据不得前移）。
-
+空数组（send 等属 B2+，未取得各自真实帧证据不得前移）。**历史状态；最终能力状态以 §8.10 与
+contract.json 为准。**
 
 ---
 
@@ -413,41 +411,42 @@ route `ownerScope`/`bindingNote` 勘正如上；`capabilities` 维持全 false�
 > 本节登记 B2 的**准备阶段**产物：发送链 wire 定案（source 级，逐条行号）、会话映射方案、
 > 合成 marker 设计与 fake 合同。**send 能力未前移**：`contract.capabilities.send` 维持 false，
 > 须待 B2 实连半场（controller 与用户在场按批准次数执行）取得受理/归属/结果证据后再裁。
+> **历史状态；send 已由 §7.9 前移为 true。**
 > 本节不含任何真实会话 id / 路径 / SID / token；私有证据目录
 > `~/Documents/tuvis-verify-logs/zcode/macos-B2<UTC>-<短码>/`（0700/0600，脱敏 fail-closed）。
 
 ## 7.1 新增资产
 
-| 文件 | 职责 |
-| --- | --- |
-| `scripts/zcode-bridge-probe/sessionBridge.ts` | Tuvis 侧参照实现：二进制 Channel 序列化、CRC32、rpc-frame 编解码/组装器、SingleConnectionGate、SessionTargetMapper（精确归属+代际绑定）、SendOnceLoop（单帧发送闭环）。不在产品运行链上。 |
+| 文件                                          | 职责                                                                                                                                                                                                             |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scripts/zcode-bridge-probe/sessionBridge.ts` | Tuvis 侧参照实现：二进制 Channel 序列化、CRC32、rpc-frame 编解码/组装器、SingleConnectionGate、SessionTargetMapper（精确归属+代际绑定）、SendOnceLoop（单帧发送闭环）。不在产品运行链上。                        |
 | `scripts/zcode-bridge-probe/session-probe.ts` | B2 实连半场探针（OAuth → token → ws2+mid 单连接 → 只读映射 → designate → 受闸单次发送 → 脱敏落证）。`--i-know-this-connects` 解锁连接；`--send-authorized` 单独解锁发送（缺省 map-only，打印 WOULD-send 即停）。 |
-| `tests/remote/zcodeBridgeSession.test.ts` | B2 fake 合同六用例（见 §7.4）。 |
-| `scripts/zcode-bridge-probe/sanitize.ts` | `createEvidenceRunDir` 增加 batchPrefix（B2 运行目录 `macos-B2…`）。 |
+| `tests/remote/zcodeBridgeSession.test.ts`     | B2 fake 合同六用例（见 §7.4）。                                                                                                                                                                                  |
+| `scripts/zcode-bridge-probe/sanitize.ts`      | `createEvidenceRunDir` 增加 batchPrefix（B2 运行目录 `macos-B2…`）。                                                                                                                                             |
 
 ## 7.2 发送链 wire 定案（source 级；全部行号 @ 固定 SHA `3c5b2276…`）
 
 发送一条消息的完整链（官方 web 远控客户端同款）：
 
 1. **app payload**：`workspace-bridge-open{requestId, bridgeSessionId, workspaceKey,
-   taskId}`（形状 `packages/shared/src/web-remote-control.ts:435-447`）→ 宿主
+taskId}`（形状 `packages/shared/src/web-remote-control.ts:435-447`）→ 宿主
    workspace-bridge-ready（`bridgeSessionId`/`bridgeGeneration` 回显，同文件 :449-456）。
    workspaceKey 口径 = `resolveWebRemoteControlWorkspaceKey` =
    `workspaceIdentity?.trim() || workspacePath`（同文件 :743-747）。
 2. **rpc-frame 通道握手**（Channel = `"zcode-agent"`，`packages/shared/src/channels.ts:114`；
    顺序钉 `packages/ui/src/v4/agentV4ConnectionHandshake.ts:30-46`）：
    `helloConversationV4()` → `HelloMessage{kind:"hello", protocolVersion, connectionId,
-   clientMode:"desktop-continuous"|"web-remote-replayable", deliveryProfile, serverTime,
-   capabilities, auth}`（`packages/shared/src/zcode-protocol-v4/transport.ts:42-65`）→
+clientMode:"desktop-continuous"|"web-remote-replayable", deliveryProfile, serverTime,
+capabilities, auth}`（`packages/shared/src/zcode-protocol-v4/transport.ts:42-65`）→
    `initializeConversationV4(clientHello)`，clientHello =
    `{kind:"clientHello", protocolVersion:3, clientId, clientKind:"desktop"|"web",
-   appVersion, capabilities?}`（同文件 :69-92，capabilities 可选；clientKind 映射见
+appVersion, capabilities?}`（同文件 :69-92，capabilities 可选；clientKind 映射见
    handshake 文件 :43）。
 3. **订阅**（仅为打开活动帧证据流；官方发送本身只依赖握手）：
    `subscribeConversationV4{workspacePath, workspaceIdentity?, sessionId}`——
    参数面钉 `packages/ui/src/v4/agentConversationTransport.ts:207-214`（`{...workspace,
-   sessionId, base?, visibility?, retryInitialization?}`；workspace = `{workspacePath,
-   workspaceIdentity?}` 同文件 :94-97）+ `packages/services/src/zcode-agent/zcodeAgent.ts:400-405`
+sessionId, base?, visibility?, retryInitialization?}`；workspace = `{workspacePath,
+workspaceIdentity?}` 同文件 :94-97）+ `packages/services/src/zcode-agent/zcodeAgent.ts:400-405`
    （`ZCodeAgentConversationSubscribeParams extends ZCodeAgentSessionTarget`）；
    sessionId = `"conversation/<sessionId>"` topic 的精确后缀
    （`packages/shared/src/zcode-protocol-v4/transport.ts:113,205`）。
@@ -474,7 +473,7 @@ route `ownerScope`/`bindingNote` 勘正如上；`capabilities` 维持全 false�
   `WebRemoteControlWorkspaceTarget{workspacePath, workspaceIdentity?, label, kind,…}`
   （`web-remote-control.ts:628-635`，B1 实连已验）；task 行来自宿主推送
   `controller/tasks-index` 帧的 `WindowHostControllerTaskRow{address:{workspacePath, taskId},
-  meta:{title,…}}`（`packages/shared/src/zcode-protocol-v4/controller.ts:17-35,93-123`；
+meta:{title,…}}`（`packages/shared/src/zcode-protocol-v4/controller.ts:17-35,93-123`；
   B1 实连观察到同形状增量推送）。
 - **designate**：操作员指称（`--workspace` 默认 Travel、`--task-title` 默认 hi）只用于
   在 listing 里**精确唯一**匹配出真实 id；不唯一/不命中一律中止。**发送授权只认
@@ -514,7 +513,7 @@ route `ownerScope`/`bindingNote` 勘正如上；`capabilities` 维持全 false�
 
 `operations` 追加且仅追加两条 live 已验**只读**操作（`bootstrap-request` /
 `workspace-list-request`，B1 run `macos-B120261024T105940Z-NarmSw`）；`capabilities.send`
-维持 false——实发取证前不得前移；schema 其余不动。
+维持 false——实发取证前不得前移；schema 其余不动。**历史状态；send 已由 §7.9 前移为 true。**
 
 ## 7.7 追加与勘误（2026-10-24，B2 发送前评审修复；不改写上文）
 
@@ -565,9 +564,9 @@ designate 在 workspace 阶段 `workspace-ambiguous` fail-closed（**未发送�
   打开读面桥拿到 bridge 身份 → 在 channel **`"window-controller"`**
   （`packages/shared/src/channels.ts:112` ServiceChannels.WindowController；该服务只在
   workspace bridge 的 relay 通道上发布——`packages/client/src/remoteServiceAccess.ts
-  :181-185` + `websocket.ts:102-108` connectViaProtocol +
+:181-185` + `websocket.ts:102-108` connectViaProtocol +
   `packages/web/src/web-remote-control/app/webRemoteControlWorkspaceBridgeSession.ts
-  :39-74`）上：
+:39-74`）上：
   1. `EventListen(102)` 事件 `"onDynamicControllerFrame"`
      （`packages/services/src/window-controller/windowController.ts:78`；wire =
      `serialize([102, id, channel, event]) + serialize(undefined)`，
@@ -588,12 +587,12 @@ designate 在 workspace 阶段 `workspace-ambiguous` fail-closed（**未发送�
      （`:187-191`）；行形状 `WindowHostControllerTaskRow`
      `:17-35,93-123`（`address{workspacePath, taskId, workspaceIdentity?}` +
      `meta.title`）。行按 `workspacePath\0taskId` upsert 去重，上限 1024 行防巨库。
-  实现 = `ControllerTaskIndexReader`（sessionBridge.ts）+ session-probe 新 s5b 阶段；
-  全部出站帧为**读面控制帧**（监听/订阅/退订），`maxSendFrames=1` 闸仍只数会话发送帧，
-  发送路径零改动。`unsubscribeControllerV4{subscriptionId}`（`windowController.ts:77`）
-  在窗闭后尽力退订（失败不影响结果）。subscribe 失败/超窗 = 结构性失败
-  （`ABORTED:designate-task-subscribe-*`），零行 = `task-not-found`，
-  多行 = `task-ambiguous`（沿用原中止语义，绝不按标题发送）。
+     实现 = `ControllerTaskIndexReader`（sessionBridge.ts）+ session-probe 新 s5b 阶段；
+     全部出站帧为**读面控制帧**（监听/订阅/退订），`maxSendFrames=1` 闸仍只数会话发送帧，
+     发送路径零改动。`unsubscribeControllerV4{subscriptionId}`（`windowController.ts:77`）
+     在窗闭后尽力退订（失败不影响结果）。subscribe 失败/超窗 = 结构性失败
+     （`ABORTED:designate-task-subscribe-*`），零行 = `task-not-found`，
+     多行 = `task-ambiguous`（沿用原中止语义，绝不按标题发送）。
 - **fake 合同追加（tests/remote/zcodeBridgeSession.test.ts）**：阶梯七断言（去重复现
   28→14、bootstrap 优先/回落、purpose 收窄、activeWorkspaceKey 收窄 + confirmed、
   空集回退、不唯一/零命中中止、exact-label）+ 枚举三断言（subscribe→snapshot/deltas→
@@ -663,7 +662,8 @@ peerAckedFrames=0、bridge-messages 出现 6 字节"乱码"帧）对照钉源复
    sendConversationCommandV4 行（kind=write），含 unknownRule（受理但无结果 → unknown、
    绝不重发——实现于 SendOnceLoop、fake 锁形 `unknown_not_resent` 用例）。其余能力
    （approval / userInput / interrupt / model / thoughtLevel）维持 false，等各自批次
-   授权后取证，本节不解锁。
+   授权后取证，本节不解锁。**历史状态；B3/B4 已由 §8.5–§8.7 逐项前移，最终以 §8.10 与
+   contract.json 为准。**
 5. **stdout 泄漏缺口（本轮发现并修复）**：收官 run 的「目标已锁定」一行把**真实**
    taskId/workspaceKey 打上了 stdout——证据文件经 SecretRedactor fail-closed 落盘闸，
    但 stdout 不在其内（别名制只护了文件面）。修复 = 该行改经
@@ -739,14 +739,17 @@ node scripts/zcode-bridge-probe/interaction-probe.ts approve \
    "session auto-approves; no pending card exists in the designated test session"。
    早前 run `macos-B320261024T151206Z-JWXiGw`（pre-fix，trigger unknown、未发任何应答帧）
    标 **preliminary/invalid**，不计入裁决。
-2. **问答 = RESOLVED（`capabilities.userInput = true`）。**【live-sanitized】run
+2. **问答 = 受理 accepted（`capabilities.userInput = true`，仅限单选；终态未证）。**【live-sanitized】run
    `macos-B320261025T012945Z-aMtnqA`：触发 completed → userInput pending 观察到
    （interactionId / 题干 / 选项 value 全部取自卡上原值）→ resolveInteraction 应答 →
-   outcome accepted（ackStatus accepted、framesSent=1、peerAck=true）→ verdict RESOLVED。
-3. **打断 = STOPPED:interrupt-accepted（`capabilities.interrupt = true`）。**【live-sanitized】run
+   outcome accepted（ackStatus accepted、framesSent=1、peerAck=true）→ 历史 verdict RESOLVED。
+   **2026-10-25 复审勘正**：该 run 在 ACK 后约 5ms teardown，未收到宿主撤卡帧；
+   "RESOLVED" 仅按 ACK 得出，不能作为终态证据（见 §8.10）。
+3. **打断 = 受理 accepted（`capabilities.interrupt = true`；执行停止未证）。**【live-sanitized】run
    `macos-B320261025T013128Z-X8HkPg`：触发 completed → `control.activeWorks` 观察到
    守卫 id（kind=primaryTurn）→ stop 帧受理 accepted（framesSent=1、peerAck=true）→
-   verdict STOPPED:interrupt-accepted。
+   历史 verdict STOPPED:interrupt-accepted。**2026-10-25 复审勘正**：该 run 在 ACK 后约
+   4ms teardown，未观察守卫执行从 control 消失（见 §8.10）。
 
 跨项事实：
 
@@ -763,28 +766,32 @@ node scripts/zcode-bridge-probe/interaction-probe.ts approve \
   后 topic 帧入册（eventFramesSeen=6、snapshotsApplied=1、deltasApplied=2），pending
   才出现在 `PendingBook`——该 run 即修正后订阅链在真实环境的首证。
 
-合同落点：`tests/fixtures/zcode-official-bridge/contract.json`——`capabilities.userInput=true`、
-`capabilities.interrupt=true`、`capabilities.approval=false`（reason 如上）；`operations`
-追加 `resolveInteraction`（userInput answer）与 `stop` 两行（wire 形状沿用 §8.1 /
-`interactionBridge.ts` 钉源行号，terminalEvidence = 上述 run id），既有 operations 行不动；
-`model` / `thoughtLevel` 维持 false，留 B4。
+合同落点（2026-10-25 复审后）：`tests/fixtures/zcode-official-bridge/contract.json`——
+`capabilities.userInput=true`（仅单选 AskUserQuestion，ACK-only）、`capabilities.interrupt=true`
+（有守卫 stop，ACK-only）、`capabilities.approval=true`（仅应答既有 permission 卡；
+`approvalForTerminalSend=false`）、`userInputMultiSelect=false`、`userInputFreeText=false`；
+`operations` 含 `resolveInteraction` / `stop` / `switchModelConfig`，terminalEvidence 逐条注明
+ack-only 或新鲜快照确认。`model` / `thoughtLevel` 由 §8.7 补全为 true；恢复原值仅探针清理。
 
 ## 10. 生产实施计划指针（B5）
 
-- 生产统一控制施工单：[2026-10-25-zcode-official-bridge-implementation.md](../plans/2026-10-25-zcode-official-bridge-implementation.md)。基于本文件 §6–§8.5 的已取证合同；审批（卡路径）与模型/思考强度明确标为未取证/延后，能力默认关闭。
+- 生产统一控制施工单：[2026-10-25-zcode-official-bridge-implementation.md](../plans/2026-10-25-zcode-official-bridge-implementation.md)。基于本文件 §6–§8.10 的已取证合同：发送、只读、单选问答、有守卫打断、模型/档位已实跑；审批仅"应答既有卡"已证，Tuvis 发送→弹卡未证（negative evidence），生产门保持关闭；问答/打断的 ACK 不等于终态，生产 UI 必须区分 Accepted / Confirmed。
 
 ### 8.6 B4 实跑（thoughtLevel 已证 / model 未证）
 
 - run `macos-B320261025T025928Z-3WyTFA`（脱敏证据私有目录）：读取 `snapshot.config` = provider `account:bigmodel-individual-coding-plan` / model `GLM-5.3-Flash` / thought `max`；`availability.switchModelConfig.allowed=true`。
 - 切换 thought `max → low`：`switchModelConfig` 命令 ack `accepted`；等待新快照后 `config.thought` 确为 `low`（**ACK≠投影生效，必须等 snapshot/delta**，与 §9 笔记一致）。
 - 恢复原值 `low → max`：ack `accepted`，新快照确认恢复；全程未改全局默认、未影响其他会话。
-- **结论**：`capabilities.thoughtLevel=true`；`capabilities.model=false`（本次目录只暴露当前模型 id，模型切换需 `model-selection.getView()` 目录且其 mobileRemote 角色可见性未验证，未尝试——UI 保持关闭）。
+  **边界**：恢复原值只是探针清理，不是生产行为；生产必须保留用户刚选的档位。
+- **结论**：`capabilities.thoughtLevel=true`；`capabilities.model=false`（本次目录只暴露当前模型 id，模型切换需 `model-selection.getView()` 目录且其 mobileRemote 角色可见性未验证，未尝试——UI 保持关闭）。**该 model=false 已被 §8.7 补全为 true。**
 
 ### 8.7 B4 模型切换实跑（补全）
 
 - run `macos-B320261025T030637Z-bS5dOg`：`model-selection.getView()` 对 terminal 角色**可用**（返回 `{revision, providers[], preferredSelection}`；providers 用 `providerId`/`models[].modelId` 字段，含 4 个 provider）。
 - 目标选择限定在同一 provider：`GLM-5.3-Flash → GLM-5.3`（`modelChanged:true`，thought 保持 `max`）；`switchModelConfig` ack `accepted`；新快照确认 `model=GLM-5.3, thought=max`；随后恢复 `GLM-5.3-Flash`（ack `accepted`）并确认恢复。
+  **边界**：恢复只是探针清理；生产保留用户选择。
 - **结论**：`capabilities.model=true`、`capabilities.thoughtLevel=true`。跨 provider 切换未尝试（不属本轮授权范围，且目录暴露了其他账号 provider——生产实现必须限定用户当前账号 provider）。
+- **复审补强（2026-10-25）**：目录里同一 provider 下各模型的档位可以不同；校验必须按**目标模型自己的** `reasoningLevel.values`，不得把同 provider 所有模型并成一份（`selectionBridge.ts` 已改为 `thoughtLevelsByModel`；探针选择目标模型时也只从该模型档位里挑）。
 
 ### 8.8 审批卡负结果（2026-10-25，两轮）
 
@@ -792,10 +799,42 @@ node scripts/zcode-bridge-probe/interaction-probe.ts approve \
 - run `macos-B320261025T031402Z-QjC2hA`（shell 触发：`pwd && echo tuvis-b3-shell-test`）：无 pending；turn 正常完成。
 - 结论：**该会话权限策略为全部放行**（文件写入与 exec 均不产生 `permission` 卡），探针实现无缺陷（`pendingSize` 摄入正常，userInput 卡可收可答）。
 - 取证前提（用户动作）：在 ZCode APP 把测试会话切到「需要确认 / Default / Ask」模式后复跑 approve/reject 两轮；若该构建无此模式，则 `capabilities.approval=false` 定案（原因：宿主不产生权限卡）。
+  **该推论已被 §8.9 修正**：本构建没有"切模式"入口，但用户亲发的「变更前确认」提交可以弹卡；因此 approval 的已证范围仅限"应答既有卡"，不是"发送会弹卡"。
 
 ### 8.9 审批卡双向实跑（approve / reject 均通过）
 
 - **催卡前提（实跑结论）**：本构建下，仅**用户在 APP 输入框亲发**的提交（模式「变更前确认/guarded」）会拦截并弹 `kind="permission"` 卡；探针替会话合成的 sendText（默认或 `mode:"guarded"`）均直接执行不弹卡（4 轮负结果见 §8.8）。
 - **approve**（run `macos-B320261025T032425Z-K7I6ZA`）：用户 APP 发「删除 /tmp/tuvis-b3-approval-test.txt」→ 卡 3 选项（含 fullAccess，客户端硬闸排除）→ 探针 `--existing-pending` 选 allow-once → CommandAck `accepted` → **文件被删除**（产物核对）。
 - **reject**（run `macos-B320261025T034803Z-noorSA`）：同法再开一卡 → 选 deny → `accepted` → **文件仍在**（拒绝生效）。
-- **结论**：`capabilities.approval=true`；卡形状/选项/回执与源码取证一致；探针从不选择 fullAccess、不改会话权限模式。
+- **结论**：`capabilities.approval=true`，但**只表示"应答既有 permission 卡"**；卡形状/选项/回执与源码取证一致；探针从不选择 fullAccess、不改会话权限模式。
+- **关键边界（2026-10-25 复审确认）**：`approvalForTerminalSend=false`。Tuvis/探针走的是 terminal 发起的 sendText，本构建实测（默认与 `mode:"guarded"`）**不会弹卡、直接执行**（§8.8 四轮负结果）。因此生产不能把"guarded 模式"宣传为对手机发送的审批保护；在"Tuvis 发送→弹卡→应答"整链取证前，审批 UI 只能应答外部（APP 亲发）产生的卡，或保持关闭。
+- **终态证据**：approve/reject 的产物（文件删除/保留）由用户侧核对，强于 ACK；探针 transcript 本身仍在 ACK 后立即 teardown，未观察撤卡帧。
+
+### 8.10 独立复审后的证据分层与修正（2026-10-25）
+
+> 触发：对 HEAD `90236b12` 的独立只读复审。结论：不按"A/B 全部完成、九项能力全部闭环"合并。
+> 以下为逐项核对后的定案；全部可在源码/私有 transcript 复核。
+
+1. **ACK ≠ 终态（Critical）**：answer run `…T012945Z-aMtnqA` 在 ACK 后约 5ms、interrupt
+   run `…T013128Z-X8HkPg` 在 ACK 后约 4ms 即 teardown；没有宿主撤卡/执行停止的后续帧。
+   历史 verdict `RESOLVED` / `STOPPED:interrupt-accepted` 降级为**命令受理已证**。
+   探针已加终态观察窗（`INTERACTION_TERMINAL_WAIT_MS=10s`）：answer/approval 必须等
+   `hostPendingRevision` 前进且 interactionId 不在宿主集合；interrupt 必须等
+   `controlRevision` 前进且守卫 id 不在 `activeWorks`。否则只报
+   `ACCEPTED:pending-unconfirmed` / `ACCEPTED:interrupt-unconfirmed`。
+2. **发送→审批未证（Critical）**：审批卡只由用户 APP 亲发（guarded）触发；terminal
+   sendText 默认与 guarded 均直接执行。已证的是"应答既有卡"，不是"Tuvis 发送→弹卡→应答"。
+   合同新增 `approvalForTerminalSend=false`；B5 T5 加生产停止门。
+3. **问答形态**：实跑只覆盖单选 AskUserQuestion；多选与自由文本仅有 fake/合同层。
+   合同新增 `userInputMultiSelect=false`、`userInputFreeText=false`；B3 不能据此宣称全部形态闭合。
+4. **token 一次性**：实跑只证 `expires_in=60` 与两次申请值不同；"一次性"来自源码/fake
+   （过期/已消费 token 被拒），未做重放拒绝实验。合同措辞已改为 source+fake 依据。
+5. **模型档位归属**：原 `selectionBridge` 把同 provider 各模型档位并成一份，可能放行
+   "模型 A + 仅模型 B 支持的档位"；已改为逐模型 `thoughtLevelsByModel`，探针目标选择只取
+   目标模型自己的档位，且只使用当前会话 provider 的目录。
+6. **恢复原值**：只是探针清理；生产保留用户选择（B5 T6 已改）。
+7. **证据脱敏边界**：OAuth URL 连同 state 故意打印到 **stdout** 供用户点击，不写证据文件
+   （state/link 已登记 redactor）；此前桥消息 `bodyPreview` 会把普通帧正文原样写入证据，
+   已改为只记结构头、Initialize 仅记 hex；CLI 参数错误不再回显原值。
+   JSON 证据文件仍经 fail-closed 断言，但"所有输出都已脱敏"只应理解为"证据落盘面"。
+8. **A8**：代码与自动门禁完成 ≠ 平台验收完成；Windows/真机/链接生命周期仍待验。
