@@ -785,3 +785,10 @@ node scripts/zcode-bridge-probe/interaction-probe.ts approve \
 - run `macos-B320261025T030637Z-bS5dOg`：`model-selection.getView()` 对 terminal 角色**可用**（返回 `{revision, providers[], preferredSelection}`；providers 用 `providerId`/`models[].modelId` 字段，含 4 个 provider）。
 - 目标选择限定在同一 provider：`GLM-5.3-Flash → GLM-5.3`（`modelChanged:true`，thought 保持 `max`）；`switchModelConfig` ack `accepted`；新快照确认 `model=GLM-5.3, thought=max`；随后恢复 `GLM-5.3-Flash`（ack `accepted`）并确认恢复。
 - **结论**：`capabilities.model=true`、`capabilities.thoughtLevel=true`。跨 provider 切换未尝试（不属本轮授权范围，且目录暴露了其他账号 provider——生产实现必须限定用户当前账号 provider）。
+
+### 8.8 审批卡负结果（2026-10-25，两轮）
+
+- run `macos-B320261024T230311Z-aTrTIg`（文件写入触发）：无 pending；临时文件被**直接创建**。
+- run `macos-B320261025T031402Z-QjC2hA`（shell 触发：`pwd && echo tuvis-b3-shell-test`）：无 pending；turn 正常完成。
+- 结论：**该会话权限策略为全部放行**（文件写入与 exec 均不产生 `permission` 卡），探针实现无缺陷（`pendingSize` 摄入正常，userInput 卡可收可答）。
+- 取证前提（用户动作）：在 ZCode APP 把测试会话切到「需要确认 / Default / Ask」模式后复跑 approve/reject 两轮；若该构建无此模式，则 `capabilities.approval=false` 定案（原因：宿主不产生权限卡）。
