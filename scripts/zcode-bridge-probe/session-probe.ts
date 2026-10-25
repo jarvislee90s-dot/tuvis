@@ -120,6 +120,7 @@ import {
   writeEvidenceFiles,
 } from "./sanitize.ts";
 import { readOfficialLinkFromSettings } from "./settingsLink.ts";
+import { readConfigFromSnapshot } from "./selectionBridge.ts";
 
 /** 探针安全闸（红线，工作包 B 全局约束）：全部硬编码，运行期不可放宽。 */
 export const PROBE_GUARDS = {
@@ -330,7 +331,7 @@ export const SESSION_PROBE_STEPS: readonly SessionProbeStep[] = [
 ];
 
 /** B3 交互模式（--interaction=<mode>；逐能力一条链路，绝不混用）。 */
-export const INTERACTION_MODES = ["approve", "reject", "answer", "interrupt"] as const;
+export const INTERACTION_MODES = ["approve", "reject", "answer", "interrupt", "select"] as const;
 export type InteractionMode = (typeof INTERACTION_MODES)[number];
 
 type ProbeFlags = {
@@ -976,6 +977,9 @@ function buildInteractionInstruction(mode: InteractionMode): string {
       return `${tag} 请用提问卡问我一个单选题，问题原文用「继续还是暂停？」，提供两个选项：继续 / 暂停。等我回答后再继续。`;
     case "interrupt":
       return `${tag} 请顺序执行一个耗时任务：从 1 数到 80，每一步把当前数字单独写一行追加到临时文件 tuvis-b3-interrupt-test.txt，逐行进行，不要合并、不要跳步，完成后简短总结。`;
+    case "select":
+      // select 模式不触发任何会话指令（只切档/恢复）；保留穷尽性。
+      return `${tag} selection-mode has no trigger instruction`;
   }
 }
 
@@ -2161,6 +2165,8 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         sessionId: bound.taskId,
         generation: CONNECTION_GENERATION,
       });
+      /** B4：最近一次会话快照（topic snapshot/deltas 合并视图；select 模式读配置）。 */
+      let latestSnapshot: Record<string, unknown> | null = null;
       // 单一入站帧汇（C1）：trigger 运行期间也必须收到 rpc-frame-ack / CommandAck，
       // 否则 trigger 永远 unknown、观察窗还会晚 20s 才开始。currentLoop 在 trigger
       // run 之前指向 trigger，resolution run 之前换成 resolution；topic 订阅器照旧
@@ -2182,6 +2188,30 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
         firstMessageSeq: bridgeMessageSeq + 1,
         onFrame: (frame) => {
           book.acceptTopicFrame(frame);
+          // B4：会话快照/增量同时供 select 模式读 config/revision/availability
+          // （snapshot.config.{provider,model,thought,thoughtLevels}，snapshot.ts:506；
+          //  deltas patch 键级整体替换，delta.ts:2-9,49）。
+          const framePayload = (frame as { payload?: unknown }).payload;
+          if (!framePayload || typeof framePayload !== "object") return;
+          const kind = (framePayload as { kind?: unknown }).kind;
+          if (kind === "snapshot") {
+            const snap = (framePayload as { snapshot?: unknown }).snapshot;
+            if (snap && typeof snap === "object") latestSnapshot = snap as Record<string, unknown>;
+          } else if (kind === "deltas") {
+            const deltas = (framePayload as { deltas?: unknown }).deltas;
+            if (!Array.isArray(deltas) || latestSnapshot === null) return;
+            for (const delta of deltas) {
+              if (!delta || typeof delta !== "object") continue;
+              const patch = (delta as { patch?: unknown }).patch;
+              if (!patch || typeof patch !== "object") continue;
+              const patchRecord = patch as Record<string, unknown>;
+              const merged: Record<string, unknown> = { ...latestSnapshot };
+              for (const key of ["config", "revision", "availability", "modelTransition"]) {
+                if (key in patchRecord) merged[key] = patchRecord[key];
+              }
+              latestSnapshot = merged;
+            }
+          }
         },
       });
       // 钩子必须在 run() 之前接好：EventFire 与 subscribe ack 都可能先于轮询到达。
@@ -2225,7 +2255,117 @@ export async function runProbe(argv: readonly string[]): Promise<ProbeOutcome> {
       // resolveInteraction/stop 帧；unknown 不重发（InteractionCommandLoop 结构性
       // 无重发路径）。所有应答只回传 pending 卡原值（optionId/题干/选项 value），
       // fullAccess 特权项在客户端硬闸排除。
-      if (interactionMode !== null) {
+
+      // —— B4 选择半场（--interaction=select）：读配置 → 切档 → 确认 → 恢复原值 ——
+      // 走的仍是同一条已验证命令通道（sendConversationCommandV4 信封 +
+      // switchModelConfig，command.ts:254-258；CAS baseRevision :315-331）。
+      // 时长约束：switch 一个命令帧 + restore 一个命令帧（各自有界 ACK 窗，未知不重发）。
+      if (interactionMode === "select") {
+        const selection: Record<string, unknown> = { mode: "select", attempted: true };
+        sendSummary.interaction = selection;
+        const sleepMs = (ms: number): Promise<void> =>
+          new Promise((resolve) => setTimeout(resolve, ms));
+        const waitSnapshot = async <T>(probe: () => T | null, ms: number): Promise<T | null> => {
+          const deadline = Date.now() + ms;
+          for (;;) {
+            const hit = probe();
+            if (hit !== null) return hit;
+            if (Date.now() >= deadline) return null;
+            await sleepMs(25);
+          }
+        };
+        const snapshot = await waitSnapshot(() => latestSnapshot, BRIDGE_RPC_TIMEOUT_MS + 5_000);
+        if (snapshot === null) {
+          sendVerdict = "UNAVAILABLE:no-snapshot";
+        } else {
+          const original = readConfigFromSnapshot(snapshot);
+          const availability = (
+            snapshot as { availability?: { switchModelConfig?: { allowed?: unknown } } }
+          ).availability?.switchModelConfig;
+          const revisionRaw = (snapshot as { revision?: unknown }).revision;
+          let baseRevision = typeof revisionRaw === "number" ? revisionRaw : null;
+          selection.original = original
+            ? { provider: original.provider, model: original.model, thought: original.thought }
+            : null;
+          selection.availability = availability ?? null;
+          if (original === null || baseRevision === null) {
+            sendVerdict = "UNAVAILABLE:config-unreadable";
+          } else if (availability && availability.allowed === false) {
+            sendVerdict = "UNAVAILABLE:switch-disabled";
+          } else {
+            const targetThought =
+              original.thoughtLevels.find((level) => level !== original.thought) ?? null;
+            if (targetThought === null) {
+              sendVerdict = "UNAVAILABLE:no-alternative";
+            } else {
+              const sendSwitch = async (
+                thought: string,
+                revision: number
+              ): Promise<{ kind: string; reasonCode?: string | null }> => {
+                const loop = new InteractionCommandLoop({
+                  sender: conn,
+                  identity,
+                  target: bound,
+                  commandType: "switchModelConfig",
+                  payload: { provider: original.provider, model: original.model, thought },
+                  baseRevision: revision,
+                  clientId,
+                  ackMs: SEND_ACK_TIMEOUT_MS,
+                  channelRequestId: bridgeId + 1,
+                  firstSeq: bridgeSeq + 1,
+                  firstMessageSeq: bridgeMessageSeq + 1,
+                });
+                currentLoop = loop;
+                const outcome = await loop.run();
+                currentLoop = null;
+                bridgeId += 1;
+                bridgeSeq += 1;
+                bridgeMessageSeq += 1;
+                return outcome;
+              };
+              selection.target = {
+                provider: original.provider,
+                model: original.model,
+                thought: targetThought,
+              };
+              selection.switch = await sendSwitch(targetThought, baseRevision);
+              const confirmed = await waitSnapshot(() => {
+                const current = readConfigFromSnapshot(latestSnapshot);
+                return current && current.thought === targetThought ? current : null;
+              }, 15_000);
+              selection.confirmed = confirmed ? { thought: confirmed.thought } : null;
+              // 恢复原值（best-effort；即使确认失败也执行）
+              const revisionNow = (latestSnapshot as { revision?: unknown } | null)?.revision;
+              let restored = false;
+              if (original.thought) {
+                const restoreRevision =
+                  typeof revisionNow === "number" ? revisionNow : baseRevision;
+                selection.restore = await sendSwitch(original.thought, restoreRevision);
+                const restoredConfig = await waitSnapshot(() => {
+                  const current = readConfigFromSnapshot(latestSnapshot);
+                  return current && current.thought === original.thought ? current : null;
+                }, 15_000);
+                restored = restoredConfig !== null;
+              } else {
+                selection.restore = { kind: "skipped", reasonCode: "no-original-thought" };
+              }
+              selection.restored = restored;
+              if (confirmed === null) {
+                sendVerdict =
+                  selection.switch && (selection.switch as { kind: string }).kind === "accepted"
+                    ? "UNKNOWN:config-not-observed"
+                    : `REJECTED:${String((selection.switch as { reasonCode?: unknown })?.reasonCode ?? "switch-failed")}`;
+              } else {
+                sendVerdict = restored
+                  ? "COMPLETED:selection-switch-restored"
+                  : "COMPLETED:selection-switch-restore-unconfirmed";
+              }
+            }
+          }
+        }
+        record(ctx, "interaction", "selection", selection);
+        log(`selection verdict = ${sendVerdict}`);
+      } else if (interactionMode !== null) {
         const interaction: Record<string, unknown> = {
           mode: interactionMode,
           attempted: true,
