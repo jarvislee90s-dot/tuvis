@@ -201,6 +201,13 @@ pub fn run() {
             // KV，此处句柄就绪后消费：pending 且未销账（shown）才弹；销账只发生在
             // 用户点「复制命令」/「不再提醒」（codex_trust_notice_ack 命令）
             monitor::hooks::consume_codex_trust_notice(app.handle());
+            // T7.1 C2b：进程内唯一 ZCode 控制 Hub——Tauri managed state（桌面 IPC）
+            // 与远程 STATE（/m/api/v1）共用同一 Arc（无第二 Hub、无第二 relay）。
+            // `ZcodeHub::new` 必须在 Tokio runtime 内构造（relay 事件泵/桥 actor）；
+            // 构造零授权、零连接、零浏览器：状态按保存链接 = needs_config/needs_auth。
+            let zcode_hub =
+                tauri::async_runtime::block_on(async { crate::remote::install_zcode_hub() });
+            app.manage(zcode_hub);
             // M2 远程接入：按设置恢复远程服务器（开机自启语义；内部用
             // tauri::async_runtime，无 runtime 上下文的主线程可安全调用）
             crate::remote::restore_on_launch();
@@ -452,6 +459,9 @@ pub fn run() {
 /// 的 `on_before_exit` 钩子调用本函数，保证不留孤儿进程、不失电源锁。
 pub(crate) fn exit_cleanup() {
     crate::remote::tunnel::stop_all();
+    // T7.1 C2b：退出断开唯一 ZCode 控制 Hub（推进代际、关 relay/计时器）。
+    // 与远程停止同一断开口；重启需显式 connect（不自动重连）。
+    crate::remote::disconnect_zcode_hub();
     // §C1 修复轮 1 Finding 2②：Funnel 无子进程可 kill_on_drop（守护 =
     // 轮询线程 + tailscaled 常驻配置），进程退出必须显式撤 + 收 DESIRED
     crate::remote::tailscale::stop_all();

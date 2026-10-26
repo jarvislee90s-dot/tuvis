@@ -715,6 +715,67 @@ static STATE: Lazy<std::sync::Arc<server::RemoteState>> = Lazy::new(|| {
     })
 });
 
+// ============================================================
+// ZCode 统一控制 Hub 装配（T7.1 C2b）
+// ============================================================
+
+/// 装配内核（可测）：构造**唯一** Hub，先交给远程 HTTP 状态（`/m/api/v1`），
+/// 再把同一个 Arc 交回调用方（`lib.rs` 的 `app.manage` = 桌面 IPC）。
+/// 构造闭包是唯一测试缝：生产只经 [`install_zcode_hub`]。
+fn install_zcode_hub_core(
+    build: impl FnOnce() -> std::sync::Arc<crate::services::zcode_control::ZcodeHub>,
+    attach_remote: impl FnOnce(std::sync::Arc<crate::services::zcode_control::ZcodeHub>),
+) -> std::sync::Arc<crate::services::zcode_control::ZcodeHub> {
+    let hub = build();
+    attach_remote(hub.clone());
+    hub
+}
+
+/// 生产装配：构造唯一 Hub 并挂进远程 STATE，返回给 Tauri `manage`。
+///
+/// **必须在 Tokio runtime 内调用**（`ZcodeHub::new` 会 spawn relay 事件泵与桥
+/// 出站 actor）。启动零授权/零连接/零浏览器：状态按已保存链接 = `needs_config`
+/// 或 `needs_auth`，直到用户显式授权/连接。
+pub(crate) fn install_zcode_hub() -> std::sync::Arc<crate::services::zcode_control::ZcodeHub> {
+    use crate::services::zcode_control::ZcodeHub;
+
+    install_zcode_hub_core(
+        || std::sync::Arc::new(ZcodeHub::new(pairing::DeviceStore::global())),
+        |hub| STATE.set_zcode_hub(hub),
+    )
+}
+
+/// 停服/退出断开内核（可测）：有 Hub 才显式断开（推进代际、关 relay 与全部计时器）；
+/// 未装配 = no-op。断开保留内存 JWT，但**不自动重连**——重启远程后仍需显式 connect。
+async fn disconnect_zcode_hub_core(
+    hub: Option<std::sync::Arc<crate::services::zcode_control::ZcodeHub>>,
+) -> bool {
+    match hub {
+        Some(hub) => {
+            hub.disconnect().await;
+            true
+        }
+        None => false,
+    }
+}
+
+/// 远程显性关闭与应用退出的断开口（T7.1 C2b）。
+///
+/// 调用点（同步命令 / `RunEvent::Exit` / 升级前 `on_before_exit`）没有 runtime
+/// 上下文保证：不在 runtime 内时经 Tauri 全局 runtime `block_on`（断开内部有界
+/// 等待 ≤15s）；已在 runtime 内则 spawn（不嵌套 `block_on`；进程退出由 OS 收 socket）。
+pub(crate) fn disconnect_zcode_hub() {
+    let hub = STATE.zcode_hub();
+    if hub.is_none() {
+        return;
+    }
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tauri::async_runtime::spawn(disconnect_zcode_hub_core(hub));
+        return;
+    }
+    tauri::async_runtime::block_on(disconnect_zcode_hub_core(hub));
+}
+
 /// 从看板地址抽域名（纯函数）：快照 url 契约恒为含 /m 的完整地址（board_url 归一），
 /// 取 scheme 后、首个 / 前的 host 段，过 gate::normalize_host 归一（小写+剥端口）
 fn host_of_board_url(url: &str) -> Option<String> {
@@ -1084,6 +1145,9 @@ fn stop_server(revoke: bool) {
 /// 修订后误接回 true 会让「开关切换掉线」复活——评审时对照本矩阵逐行核对）
 fn stop_server_explicit_close() {
     stop_server(false);
+    // T7.1 C2b：远程关闭 = 断开唯一控制 Hub（推进代际、关 relay/计时器）。
+    // 重启远程不自动重连：仍需用户在桌面显式 connect。
+    disconnect_zcode_hub();
 }
 
 /// 热重启的停止路径（restart_listener 专用；M5 A4 遗留命名化——原为 restart_listener
@@ -4618,5 +4682,193 @@ mod host_tests {
         } else {
             assert_eq!(p, "linux");
         }
+    }
+}
+
+/// T7.1 C2b 装配测试：单 Hub Arc（桌面 managed state ↔ `/m/api/v1`）、启动零
+/// 授权/零连接、停服断开。fixture 全部合成（内存 DeviceStore + fake HubBackend），
+/// 不触真实账号/DB/网络。
+#[cfg(test)]
+mod zcode_wiring_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use futures::future::BoxFuture;
+
+    use crate::remote::pairing::DeviceStore;
+    use crate::services::zcode_control::{
+        codes, set_config, ActionContext, ActionReceipt, BoundTarget, CapabilityView,
+        ConnectionState, ConnectionView, ControlAction, DeviceRoute, HubBackend, OAuthProvider,
+        OpenAuthorize, SessionView, TargetKey, ZResult, ZcodeError, ZcodeHub,
+    };
+
+    const URL: &str = "https://zcode.z.ai/remote/v4?sid=synthetic-wire-0001&name=SyntheticWire";
+
+    /// 记录型后端：所有方法只计数（装配/断开断言零授权、零连接）。
+    #[derive(Default)]
+    struct FakeBackend {
+        authorize_calls: AtomicUsize,
+        connect_calls: AtomicUsize,
+        disconnect_calls: AtomicUsize,
+        reset_calls: AtomicUsize,
+    }
+
+    impl FakeBackend {
+        fn counters(&self) -> [usize; 4] {
+            [
+                self.authorize_calls.load(Ordering::SeqCst),
+                self.connect_calls.load(Ordering::SeqCst),
+                self.disconnect_calls.load(Ordering::SeqCst),
+                self.reset_calls.load(Ordering::SeqCst),
+            ]
+        }
+    }
+
+    impl HubBackend for FakeBackend {
+        fn authorize<'a>(
+            &'a self,
+            _provider: OAuthProvider,
+            _open: OpenAuthorize,
+        ) -> BoxFuture<'a, ZResult<()>> {
+            self.authorize_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn connect<'a>(&'a self, _route: DeviceRoute) -> BoxFuture<'a, ZResult<ConnectionView>> {
+            self.connect_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(ConnectionView {
+                    state: ConnectionState::Paired,
+                    generation: 1,
+                    reason_code: None,
+                    device_label: Some("synthetic-wire".into()),
+                })
+            })
+        }
+
+        fn disconnect<'a>(&'a self) -> BoxFuture<'a, ()> {
+            self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+
+        fn reset<'a>(&'a self, _generation: u64) -> BoxFuture<'a, ()> {
+            self.reset_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+
+        fn bind_session<'a>(&'a self, _key: &'a TargetKey) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            Box::pin(async { Err(ZcodeError::of(codes::NO_SESSION)) })
+        }
+
+        fn session<'a>(&'a self, _target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>> {
+            Box::pin(async { Err(ZcodeError::of(codes::NOT_READY)) })
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ActionContext,
+            _target: &'a BoundTarget,
+            _action: &'a ControlAction,
+        ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
+            Box::pin(async { Err(ZcodeError::of(codes::NOT_READY)) })
+        }
+
+        fn policy(&self) -> CapabilityView {
+            CapabilityView::default()
+        }
+    }
+
+    /// 内存库 + 合成保存链接（不落真实 ~/.tuvis）。
+    fn stored(url: &str) -> DeviceStore {
+        let store = DeviceStore::memory();
+        store.with(|conn| set_config(conn, url).unwrap());
+        store
+    }
+
+    fn fake_hub(fake: Arc<FakeBackend>, store: DeviceStore) -> Arc<ZcodeHub> {
+        Arc::new(ZcodeHub::with_parts(store, fake, CapabilityView::default()))
+    }
+
+    fn noop_open() -> OpenAuthorize {
+        Arc::new(|_| Ok(()))
+    }
+
+    /// 装配只产出**一个** Arc：远程状态（`/m/api/v1`）与桌面 managed state 是同一份。
+    #[test]
+    fn remote_and_desktop_share_one_hub_arc() {
+        let fake = Arc::new(FakeBackend::default());
+        let remote_slot: Arc<Mutex<Option<Arc<ZcodeHub>>>> = Arc::new(Mutex::new(None));
+        let attach = remote_slot.clone();
+        let build_fake = fake.clone();
+        let managed = install_zcode_hub_core(
+            move || fake_hub(build_fake, stored(URL)),
+            move |hub| *attach.lock().unwrap() = Some(hub),
+        );
+
+        let guard = remote_slot.lock().unwrap();
+        let remote = guard.as_ref().expect("远程 /m/api/v1 必须拿到 Hub");
+        assert!(Arc::ptr_eq(&managed, remote), "桌面与手机必须共用同一 Arc");
+        assert_eq!(Arc::strong_count(&managed), 2, "全进程只允许一个 Hub 实例");
+        assert_eq!(remote.connection().state, ConnectionState::NeedsAuth);
+        drop(guard);
+        assert_eq!(fake.counters(), [0; 4], "装配不得授权/连接/断开");
+    }
+
+    /// 启动零副作用：已保存链接 → needs_auth、未保存 → needs_config；
+    /// 两态都零授权、零连接、零事件广播（不开浏览器、不开第二条 relay）。
+    #[test]
+    fn startup_does_not_authorize_or_connect() {
+        let fake = Arc::new(FakeBackend::default());
+        let build_fake = fake.clone();
+        let hub = install_zcode_hub_core(move || fake_hub(build_fake, stored(URL)), |_| {});
+        assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
+        assert_eq!(fake.counters(), [0; 4]);
+        assert!(
+            hub.subscribe().try_recv().is_err(),
+            "装配不得广播任何连接事件"
+        );
+
+        let build_fake = fake.clone();
+        let unconfigured =
+            install_zcode_hub_core(move || fake_hub(build_fake, DeviceStore::memory()), |_| {});
+        assert_eq!(
+            unconfigured.connection().state,
+            ConnectionState::NeedsConfig
+        );
+        assert_eq!(fake.counters(), [0; 4], "两态都不得触达后端");
+    }
+
+    /// 停服 = 显式断开 Hub（关 relay/计时器、状态 offline），**绝不自动重连**；
+    /// 未装配时 no-op。
+    #[tokio::test]
+    async fn remote_stop_disconnects_hub() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = fake_hub(fake.clone(), stored(URL));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert!(hub.connection().is_paired());
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        assert!(disconnect_zcode_hub_core(Some(hub.clone())).await);
+        assert_eq!(fake.disconnect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before,
+            "停服不得自动重连"
+        );
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::Offline,
+            "无人显式 connect 前必须保持 offline"
+        );
+
+        assert!(!disconnect_zcode_hub_core(None).await, "未装配 = no-op");
     }
 }
