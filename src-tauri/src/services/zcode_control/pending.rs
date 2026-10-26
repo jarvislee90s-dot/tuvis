@@ -117,6 +117,14 @@ impl PendingBook {
         self.pendings.values().cloned().collect()
     }
 
+    /// 只读查询单张 pending 卡（不校验目标、不置本地在途、不消费）。
+    ///
+    /// 调用方必须先完成会话/代际/workspace 绑定与 `is_ready` 校验；本访问器只回答
+    /// 「这张卡此刻是否仍在本册」，绝不把「在册」当成「可提交」。
+    pub fn pending(&self, interaction_id: &str) -> Option<&PendingView> {
+        self.pendings.get(interaction_id)
+    }
+
     /// 宿主 pending 集合的观察代数（每次整体替换 +1；T4.1 用它确认终态）。
     pub fn host_pending_revision(&self) -> u64 {
         self.host_pending_revision
@@ -829,6 +837,25 @@ mod tests {
         book.accept_snapshot(&snapshot(None, json!([card])))
             .expect("snapshot shape");
         assert!(book.pendings()[0].sensitive);
+    }
+
+    #[test]
+    fn pending_accessor_is_read_only() {
+        let mut book = book_with(permission_card("pi-synthetic-view"));
+        {
+            let card = book
+                .pending("pi-synthetic-view")
+                .expect("host card is in the book");
+            assert_eq!(card.interaction_id, "pi-synthetic-view");
+            assert_eq!(card.kind, PendingKind::Permission);
+        }
+        assert!(book.pending("pi-synthetic-missing").is_none());
+        // 读取不置本地在途：同一张卡随后仍可授权。
+        let target = answer_target(SESSION, 1);
+        let authorized = book
+            .authorize(&target, "pi-synthetic-view")
+            .expect("read-only accessor must not set in-flight");
+        assert_eq!(authorized.interaction_id, "pi-synthetic-view");
     }
 
     #[test]

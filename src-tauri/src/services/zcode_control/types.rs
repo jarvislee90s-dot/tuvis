@@ -333,6 +333,11 @@ pub enum ControlAction {
         text: String,
     },
     /// 暂停问答卡自动结束计时（T4）。
+    ///
+    /// **不是**免闸辅助操作：与 [`Self::Answer`] 一样按宿主 pending 卡题型逐项过
+    /// 能力闸（`single_select`/`multi_select`/`free_text`/`approval_reply` 中至少
+    /// 一项开闸或存在匹配许可）。生产政策全关时服务端拒绝、零 bind、零执行；
+    /// 手机端按钮由同一能力矩阵禁用，不发送请求。
     #[serde(rename_all = "camelCase")]
     Snooze {
         session_id: String,
@@ -480,6 +485,22 @@ pub trait PendingPort: Send + Sync {
         target: &'a BoundTarget,
         interaction_id: &'a str,
     ) -> BoxFuture<'a, ZResult<PendingView>>;
+
+    /// **精确目标**上该 pending 卡按宿主题型要求的全部能力名（只读，稳定顺序）。
+    ///
+    /// 生产实现（[`BridgeManager`](super::bridge::BridgeManager)）只读投影里的宿主卡：
+    /// 同会话 + 同代际 + 同 workspace 绑定 + 投影新鲜 + 卡仍在册；**不**置本地
+    /// in-flight、**不**消费许可。缺卡/错代际/未绑定/不新鲜 → 与 `authorize_pending`
+    /// 同语义的冻结码（`stale_pending`/`stale_generation`/`no_session`/`not_ready`）。
+    /// 默认实现（无宿主证据的端口）一律 `not_ready`，绝不按客户端自报推断能力。
+    fn required_capabilities<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        interaction_id: &'a str,
+    ) -> BoxFuture<'a, ZResult<Vec<&'static str>>> {
+        let _ = (target, interaction_id);
+        Box::pin(async { Err(ZcodeError::of(codes::NOT_READY)) })
+    }
 
     /// 暂停问答卡自动结束计时（恰一帧；`timeout` 是本次 ACK 窗）。
     fn snooze<'a>(

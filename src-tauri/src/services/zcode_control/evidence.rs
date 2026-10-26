@@ -194,6 +194,43 @@ impl EvidencePermitStore {
         )
     }
 
+    /// 只读查询：该 `(session, generation, capability)` 许可**此刻可被该题 answer 消费**。
+    ///
+    /// 条件与 [`Self::consume_answer`] 完全一致（存在、未过期、未绑题或绑定到本题），
+    /// 但**不消费、不改绑定**。Hub 用它先完成多能力全量检查，再统一消费，避免
+    /// 「第一项许可已消费、第二项缺失」的部分放行。
+    pub fn available_answer(
+        &self,
+        session_id: &str,
+        generation: u64,
+        capability: &str,
+        interaction_id: &str,
+    ) -> bool {
+        let capability = capability.trim();
+        if capability.is_empty() || interaction_id.trim().is_empty() {
+            return false;
+        }
+        let now = self.now();
+        let mut permits = lock_permits(&self.permits);
+        let key = PermitKey {
+            session_id: session_id.to_owned(),
+            generation,
+            capability: capability.to_owned(),
+        };
+        let Some(entry) = permits.get(&key) else {
+            return false;
+        };
+        if entry.expires_at_ms <= now {
+            // 过期项视为不存在，并顺带清理（与 `take` 同口径）。
+            permits.remove(&key);
+            return false;
+        }
+        match entry.snoozed_interaction.as_deref() {
+            None => true,
+            Some(bound) => bound == interaction_id,
+        }
+    }
+
     /// snooze 辅助锁：首次 snooze 绑定 `interactionId` 且**不消费**许可。
     ///
     /// 同一题重复 snooze 幂等（绑定态不变）；其他题、已消费、已过期、换代或未发放
@@ -482,6 +519,36 @@ mod tests {
         let empty = store.arm(SESSION, 9, "   ");
         assert!(empty.capability.is_empty());
         assert!(!store.consume(SESSION, 9, ""));
+    }
+
+    #[test]
+    fn available_answer_is_read_only_and_respects_binding() {
+        let (store, clock) = store_with_clock();
+        // 未发放：不可用。
+        assert!(!store.available_answer(SESSION, 7, "multi_select", "interaction-1"));
+
+        let _ = store.arm(SESSION, 7, "multi_select");
+        // 只读查询不消费：连续两次都可用。
+        assert!(store.available_answer(SESSION, 7, "multi_select", "interaction-1"));
+        assert!(store.available_answer(SESSION, 7, "multi_select", "interaction-1"));
+        // 错会话/错代际/错能力一律不可用。
+        assert!(!store.available_answer("sess_other", 7, "multi_select", "interaction-1"));
+        assert!(!store.available_answer(SESSION, 8, "multi_select", "interaction-1"));
+        assert!(!store.available_answer(SESSION, 7, "single_select", "interaction-1"));
+
+        // snooze 绑题后：只有本题 answer 可用；别的题不可借用。
+        assert!(store.snooze(SESSION, 7, "multi_select", "interaction-1"));
+        assert!(store.available_answer(SESSION, 7, "multi_select", "interaction-1"));
+        assert!(!store.available_answer(SESSION, 7, "multi_select", "interaction-2"));
+
+        // 真正消费后不可再用；过期同样不可用且被清理。
+        assert!(store.consume_answer(SESSION, 7, "multi_select", "interaction-1"));
+        assert!(!store.available_answer(SESSION, 7, "multi_select", "interaction-1"));
+
+        let _ = store.arm(SESSION, 7, "free_text");
+        assert!(store.available_answer(SESSION, 7, "free_text", "interaction-1"));
+        clock.advance(EVIDENCE_PERMIT_TTL_MS);
+        assert!(!store.available_answer(SESSION, 7, "free_text", "interaction-1"));
     }
 
     /// 最小调用方守卫（模拟 Hub 命令派发的检查顺序）。

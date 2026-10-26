@@ -106,6 +106,31 @@ pub trait HubBackend: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// 本动作在**宿主卡语义**下需要的全部能力名（只读；不消费许可）。
+    ///
+    /// 生产 [`PartsBackend`] 委托 `CommandSender::required_capabilities`（Answer/
+    /// Snooze 会读取精确目标上的宿主 pending 卡题型）。默认实现只覆盖静态动作；
+    /// `Answer`/`Snooze` 无法在没有宿主卡时推导，一律 `not_ready`——绝不按客户端
+    /// 自报的选中值数量猜测，也绝不因缺少能力证据而放行。
+    fn required_capabilities<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        action: &'a ControlAction,
+    ) -> BoxFuture<'a, ZResult<Vec<&'static str>>> {
+        let _ = target;
+        Box::pin(async move {
+            match action {
+                ControlAction::Send { .. } => Ok(vec!["send"]),
+                ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
+                ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
+                ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
+                ControlAction::Answer { .. } | ControlAction::Snooze { .. } => {
+                    Err(ZcodeError::of(codes::NOT_READY))
+                }
+            }
+        })
+    }
+
     /// 带**验收许可**的派发（T8.2 debug 证据构建专用；普通构建永远不会传入非空
     /// `permits`）。默认实现忽略许可并退回 [`Self::execute`]，保持既有 fake 零改动。
     ///
@@ -292,6 +317,14 @@ impl HubBackend for PartsBackend {
         Box::pin(async move { self.sender.existing_receipt(ctx, action).await })
     }
 
+    fn required_capabilities<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        action: &'a ControlAction,
+    ) -> BoxFuture<'a, ZResult<Vec<&'static str>>> {
+        Box::pin(async move { self.sender.required_capabilities(target, action).await })
+    }
+
     fn execute_with_permits<'a>(
         &'a self,
         ctx: &'a ActionContext,
@@ -348,6 +381,24 @@ fn overlay_permit(view: &mut CapabilityView, capability: &str) -> bool {
     flag.enabled = true;
     flag.reason_code = None;
     true
+}
+
+/// 能力名 → 策略矩阵里的单项开关（未知名字返回 `None`，一律按能力关闭处理）。
+fn capability_flag<'a>(
+    policy: &'a CapabilityView,
+    capability: &str,
+) -> Option<&'a super::types::CapabilityFlag> {
+    Some(match capability {
+        "send" => &policy.send,
+        "single_select" => &policy.single_select,
+        "multi_select" => &policy.multi_select,
+        "free_text" => &policy.free_text,
+        "interrupt" => &policy.interrupt,
+        "approval_reply" => &policy.approval_reply,
+        "model" => &policy.model,
+        "thought_level" => &policy.thought_level,
+        _ => return None,
+    })
 }
 
 /// 广播一条控制事件（先取号再发送；调用方不得持内锁）。
@@ -1295,9 +1346,22 @@ impl ZcodeHub {
             return Ok(existing);
         }
         self.control_generation()?;
-        // 能力闸：返回本次动作凭**验收许可**放宽的能力名（普通构建恒为空）。
-        // 许可在通过闸门时即原子消费——一次动作一条，第二个动作回到 needs_evidence。
-        let permits = self.check_policy(&action)?;
+        // 能力闸分三段：
+        // - 静态动作（Send/Stop/Permission/Selection）在 bind 前按策略/许可检查；
+        // - Answer/Snooze 在 bind 前先做**廉价否决**：四项问答/审批能力全关且无
+        //   任何匹配许可 → needs_evidence（零 bind、零 I/O）；
+        // - 否则绑定公开目标，再读宿主 pending 卡的题型推导**全部**所需能力
+        //   （客户端 selectedValues 数量不参与判定），逐项过闸后才消费许可。
+        let host_aware = matches!(
+            &action,
+            ControlAction::Answer { .. } | ControlAction::Snooze { .. }
+        );
+        let mut permits = if host_aware {
+            self.check_answer_precheck(&action)?;
+            Vec::new()
+        } else {
+            self.check_policy(&action)?
+        };
         let key = TargetKey {
             session_id: action.session_id().to_owned(),
         };
@@ -1308,6 +1372,14 @@ impl ZcodeHub {
         }
         // CommandSender 只认公开代际（校验/落账/回执）；桥投影代际留在目标内部。
         let target = public_target(target, generation);
+        if host_aware {
+            let required = self.backend.required_capabilities(&target, &action).await?;
+            // 读宿主卡期间可能发生换代：旧代际动作零执行（与 `session` 同纪律）。
+            if self.lock().generation != generation {
+                return Err(ZcodeError::of(codes::STALE_GENERATION));
+            }
+            permits = self.check_required_policy(&action, &required)?;
+        }
         let mut receipt = self
             .backend
             .execute_with_permits(&ctx, &target, &action, &permits)
@@ -1348,12 +1420,64 @@ impl ZcodeHub {
         Ok(inner.generation)
     }
 
-    /// 能力闸：未开闸 → 冻结原因码（默认 `needs_evidence`），零绑定零执行。
+    /// Answer/Snooze 绑定前的**廉价否决**（零 bind、零 I/O、不消费许可）。
+    ///
+    /// 当前策略的四项问答/审批能力（`single_select`/`multi_select`/`free_text`/
+    /// `approval_reply`）全关，且（证据构建）没有任何匹配本会话/代际/本题的可用
+    /// 许可 → 直接 `needs_evidence`。任一能力开闸或存在可用许可才继续 bind，由宿主
+    /// pending 卡推导精确能力集合后再逐项过闸。
+    ///
+    /// Snooze **不是**免闸辅助操作：它同样必须过宿主题型能力闸。生产政策全关时
+    /// 服务端直接拒绝（零 bind/零执行），手机端按钮由同一 `SessionView.capabilities`
+    /// 矩阵禁用，不会发出请求。
+    fn check_answer_precheck(&self, action: &ControlAction) -> ZResult<()> {
+        let policy = self.current_policy();
+        if policy.single_select.enabled
+            || policy.multi_select.enabled
+            || policy.free_text.enabled
+            || policy.approval_reply.enabled
+        {
+            return Ok(());
+        }
+        #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+        {
+            let interaction_id = match action {
+                ControlAction::Answer { interaction_id, .. }
+                | ControlAction::Snooze { interaction_id, .. } => interaction_id.as_str(),
+                _ => return Err(ZcodeError::of(codes::INVALID_ACTION)),
+            };
+            for capability in [
+                "single_select",
+                "multi_select",
+                "free_text",
+                "approval_reply",
+            ] {
+                if self.evidence.available_answer(
+                    action.session_id(),
+                    action.generation(),
+                    capability,
+                    interaction_id,
+                ) {
+                    return Ok(());
+                }
+            }
+        }
+        #[cfg(not(all(feature = "zcode-bridge-evidence", debug_assertions)))]
+        {
+            let _ = action;
+        }
+        Err(ZcodeError::of(codes::NEEDS_EVIDENCE))
+    }
+
+    /// 静态动作能力闸（bind 前）：Send/Stop/Permission/Selection。
     ///
     /// T8.2 证据构建：能力被策略关闭时，若存在**匹配本次会话/代际/能力**的有效许可，
     /// 恰好放行这一次动作并原子消费（answer/permission 走 snooze 绑题消费）；返回
     /// 被许可放宽的能力名，供 `CommandSender` 的同级闸放行同一动作。普通构建没有
     /// 许可册，能力关闭即拒绝，行为与旧版完全一致。
+    ///
+    /// Answer/Snooze 不在此列：它们必须在目标绑定后按宿主卡题型推导全部能力，
+    /// 见 [`Self::check_required_policy`]。
     fn check_policy(&self, action: &ControlAction) -> ZResult<Vec<&'static str>> {
         // 与 `session_capabilities` 同一现算源：手机矩阵与执行闸不允许不同步。
         let policy = self.current_policy();
@@ -1361,46 +1485,6 @@ impl ZcodeHub {
             Vec::new();
         match action {
             ControlAction::Send { .. } => required.push(("send", &policy.send, None)),
-            // snooze 只暂停本机卡的自动结束计时，无语义能力位；它是许可的一次
-            // **辅助**操作：首次 snooze 把本会话/本代际的许可绑到该题，不消费。
-            ControlAction::Snooze { interaction_id, .. } => {
-                #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
-                {
-                    let _ = self.evidence.snooze_interaction(
-                        action.session_id(),
-                        action.generation(),
-                        interaction_id,
-                    );
-                }
-                #[cfg(not(all(feature = "zcode-bridge-evidence", debug_assertions)))]
-                {
-                    let _ = interaction_id;
-                }
-                return Ok(Vec::new());
-            }
-            ControlAction::Answer {
-                interaction_id,
-                answers,
-                ..
-            } => {
-                let free = answers.iter().any(|answer| {
-                    answer
-                        .free_text
-                        .as_deref()
-                        .is_some_and(|text| !text.trim().is_empty())
-                });
-                let multi = answers
-                    .iter()
-                    .any(|answer| answer.selected_values.len() > 1);
-                let (name, flag) = if free {
-                    ("free_text", &policy.free_text)
-                } else if multi {
-                    ("multi_select", &policy.multi_select)
-                } else {
-                    ("single_select", &policy.single_select)
-                };
-                required.push((name, flag, Some(interaction_id)));
-            }
             ControlAction::Permission { interaction_id, .. } => required.push((
                 "approval_reply",
                 &policy.approval_reply,
@@ -1410,6 +1494,11 @@ impl ZcodeHub {
             ControlAction::Selection { .. } => {
                 required.push(("model", &policy.model, None));
                 required.push(("thought_level", &policy.thought_level, None));
+            }
+            // Answer/Snooze 的所需能力只能来自宿主 pending 卡：必须先绑定目标再走
+            // `check_required_policy`。走到这里说明调用顺序错误，保守零执行。
+            ControlAction::Answer { .. } | ControlAction::Snooze { .. } => {
+                return Err(ZcodeError::of(codes::INVALID_ACTION));
             }
         }
         #[cfg_attr(
@@ -1453,6 +1542,96 @@ impl ZcodeHub {
             return Err(ZcodeError { code });
         }
         Ok(permitted)
+    }
+
+    /// Answer/Snooze 的宿主题型能力闸：逐项检查**全部**所需能力（策略开启，或
+    /// 本会话/本代际/本题存在可消费的验收许可），全部通过后才消费许可。
+    ///
+    /// 能力名由 [`HubBackend::required_capabilities`] 读取宿主 pending 卡推导；
+    /// 客户端 `selectedValues` 的数量/freeText 内容**不**参与判定（否则多选卡只
+    /// 传一个值即可借单选许可放行，混合题也会漏检）。Answer 采用 all-or-nothing：
+    /// 先只读检查全部项，再逐项原子消费；任一项缺失时零消费、零执行。
+    fn check_required_policy(
+        &self,
+        action: &ControlAction,
+        required: &[&'static str],
+    ) -> ZResult<Vec<&'static str>> {
+        let policy = self.current_policy();
+        let session_id = action.session_id();
+        let generation = action.generation();
+        let interaction_id = match action {
+            ControlAction::Answer { interaction_id, .. }
+            | ControlAction::Snooze { interaction_id, .. } => interaction_id.as_str(),
+            _ => return Err(ZcodeError::of(codes::INVALID_ACTION)),
+        };
+        #[cfg_attr(
+            not(all(feature = "zcode-bridge-evidence", debug_assertions)),
+            allow(unused_mut)
+        )]
+        let mut permit_backed: Vec<&'static str> = Vec::new();
+        for capability in required {
+            let Some(flag) = capability_flag(&policy, capability) else {
+                return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
+            };
+            if flag.enabled {
+                continue;
+            }
+            #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+            {
+                // 只读预检：所有能力都确认可用后才消费，避免「第一项已消费、
+                // 第二项缺失」的部分放行。
+                if self.evidence.available_answer(
+                    session_id,
+                    generation,
+                    capability,
+                    interaction_id,
+                ) {
+                    permit_backed.push(*capability);
+                    continue;
+                }
+            }
+            let code = flag
+                .reason_code
+                .clone()
+                .unwrap_or_else(|| codes::NEEDS_EVIDENCE.to_owned());
+            return Err(ZcodeError { code });
+        }
+        // 全量检查通过后才动许可：Answer 消费；Snooze 只绑题不消费。
+        #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+        {
+            match action {
+                ControlAction::Answer { .. } => {
+                    for capability in &permit_backed {
+                        if !self.evidence.consume_answer(
+                            session_id,
+                            generation,
+                            capability,
+                            interaction_id,
+                        ) {
+                            // 并发调用抢走其中一项：整体拒绝，绝不放行半套。
+                            return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
+                        }
+                    }
+                }
+                // 首次 snooze 把本会话/本代际的许可绑到该题，不消费。
+                // #4 将替换为只绑定本次 required 能力集合的 limited 版本。
+                ControlAction::Snooze { .. } => {
+                    let bound = permit_backed.is_empty()
+                        || self
+                            .evidence
+                            .snooze_interaction(session_id, generation, interaction_id);
+                    if !bound {
+                        return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
+                    }
+                }
+                _ => {}
+            }
+        }
+        #[cfg(not(all(feature = "zcode-bridge-evidence", debug_assertions)))]
+        {
+            let _ = (session_id, generation, interaction_id);
+        }
+        Ok(permit_backed)
     }
 
     /// 失败收口：代际未变才写状态并广播；旧代际失败一律 `stale_generation`。
@@ -1523,6 +1702,10 @@ mod tests {
         reset_generations: Mutex<Vec<u64>>,
         /// 每次 execute 收到的目标（证明 Hub 已把公开/桥两套代际分开盖好）。
         executed_targets: Mutex<Vec<BoundTarget>>,
+        /// `required_capabilities` 的替身应答（`None` = 默认 `["single_select"]`）。
+        required_result: Mutex<Option<ZResult<Vec<&'static str>>>>,
+        /// `required_capabilities` 被调用次数（证明 Hub 在绑定后读取宿主题型）。
+        required_calls: AtomicUsize,
     }
 
     impl FakeBackend {
@@ -1537,6 +1720,12 @@ mod tests {
 
         fn set_connect(&self, result: ZResult<ConnectionView>) {
             self.connect_result.lock().unwrap().replace(result);
+        }
+
+        /// 设定 `required_capabilities` 的应答（缺省 = `["single_select"]`，与既有
+        /// Answer/Snooze 用例的合成卡兼容）。
+        fn set_required(&self, result: ZResult<Vec<&'static str>>) {
+            self.required_result.lock().unwrap().replace(result);
         }
 
         /// 设定持久幂等查询的应答（`Some(Err(..))` = 冲突；缺省 = 无既有回执）。
@@ -1652,6 +1841,21 @@ mod tests {
             Box::pin(async move { result })
         }
 
+        fn required_capabilities<'a>(
+            &'a self,
+            _target: &'a BoundTarget,
+            _action: &'a ControlAction,
+        ) -> BoxFuture<'a, ZResult<Vec<&'static str>>> {
+            self.required_calls.fetch_add(1, Ordering::SeqCst);
+            let result = self
+                .required_result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| Ok(vec!["single_select"]));
+            Box::pin(async move { result })
+        }
+
         fn policy(&self) -> CapabilityView {
             CapabilityView::default()
         }
@@ -1665,6 +1869,47 @@ mod tests {
             },
             ..CapabilityView::default()
         }
+    }
+
+    /// 测试用：按名称开启策略里的能力项（其余保持默认关闭 + 冻结原因码）。
+    fn open_capability(view: &mut CapabilityView, name: &str) {
+        let flag = match name {
+            "send" => &mut view.send,
+            "single_select" => &mut view.single_select,
+            "multi_select" => &mut view.multi_select,
+            "free_text" => &mut view.free_text,
+            "interrupt" => &mut view.interrupt,
+            "approval_reply" => &mut view.approval_reply,
+            "model" => &mut view.model,
+            "thought_level" => &mut view.thought_level,
+            other => panic!("unknown capability {other}"),
+        };
+        flag.enabled = true;
+        flag.reason_code = None;
+    }
+
+    fn policy_with(names: &[&str]) -> CapabilityView {
+        let mut view = CapabilityView::default();
+        for name in names {
+            open_capability(&mut view, name);
+        }
+        view
+    }
+
+    /// 可动态翻转的策略源 + 假后端（不依赖 static `with_parts` 的单份快照）。
+    fn hub_with_policy(
+        fake: Arc<FakeBackend>,
+        policy: Arc<Mutex<CapabilityView>>,
+    ) -> Arc<ZcodeHub> {
+        let source: CapabilitySource = {
+            let policy = policy.clone();
+            Arc::new(move || policy.lock().unwrap().clone())
+        };
+        Arc::new(ZcodeHub::with_parts_and_policy_source(
+            stored(URL),
+            fake,
+            source,
+        ))
     }
 
     fn stored(url: &str) -> DeviceStore {
@@ -1690,6 +1935,32 @@ mod tests {
             session_id: "sess_synthetic0000".into(),
             generation,
             text: "synthetic text".into(),
+        }
+    }
+
+    fn answer_action(
+        generation: u64,
+        interaction_id: &str,
+        selected_values: Vec<&str>,
+        free_text: Option<&str>,
+    ) -> ControlAction {
+        ControlAction::Answer {
+            session_id: "sess_synthetic0000".into(),
+            generation,
+            interaction_id: interaction_id.into(),
+            answers: vec![AnswerEntry {
+                question_text: "synthetic host question".into(),
+                selected_values: selected_values.into_iter().map(str::to_owned).collect(),
+                free_text: free_text.map(str::to_owned),
+            }],
+        }
+    }
+
+    fn snooze_action(generation: u64, interaction_id: &str) -> ControlAction {
+        ControlAction::Snooze {
+            session_id: "sess_synthetic0000".into(),
+            generation,
+            interaction_id: interaction_id.into(),
         }
     }
 
@@ -2465,6 +2736,310 @@ mod tests {
             .unwrap_err();
         assert!(err.is(codes::NEEDS_EVIDENCE));
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fake.bind_calls.load(Ordering::SeqCst),
+            0,
+            "四项问答/审批能力全关时必须 bind 前否决（零 I/O）"
+        );
+        assert_eq!(fake.required_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Answer 全关时在 bind 前否决：不绑定、不读宿主卡、不执行（默认策略）。
+    #[tokio::test]
+    async fn answer_all_capabilities_closed_rejected_before_bind() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_required(Ok(vec!["multi_select"]));
+        let hub = hub_with_policy(
+            fake.clone(),
+            Arc::new(Mutex::new(CapabilityView::default())),
+        );
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let generation = hub.connection().generation;
+
+        // 客户端只传一个值；宿主卡是多选题。默认策略四项全关。
+        let err = hub
+            .execute(
+                ctx("closed-answer-1"),
+                answer_action(generation, "pi-closed-answer", vec!["one"], None),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::NEEDS_EVIDENCE));
+        assert_eq!(
+            fake.bind_calls.load(Ordering::SeqCst),
+            0,
+            "全关时必须 bind 前拒绝（旧实现会先 bind 再拒）"
+        );
+        assert_eq!(fake.required_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Snooze 不是免闸辅助操作：默认策略（四项问答/审批全关）下必须在 bind 前
+    /// 拒绝，零绑定、零执行；与手机端同一能力矩阵的禁用一致。
+    #[tokio::test]
+    async fn snooze_all_capabilities_closed_rejected_before_bind() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_required(Ok(vec!["single_select"]));
+        let hub = hub_with_policy(
+            fake.clone(),
+            Arc::new(Mutex::new(CapabilityView::default())),
+        );
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let generation = hub.connection().generation;
+
+        let err = hub
+            .execute(
+                ctx("closed-snooze-1"),
+                snooze_action(generation, "pi-closed-snooze"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.is(codes::NEEDS_EVIDENCE),
+            "Snooze 不得绕开能力闸：全关时服务端必须拒绝"
+        );
+        assert_eq!(
+            fake.bind_calls.load(Ordering::SeqCst),
+            0,
+            "Snooze 全关时也必须 bind 前拒绝（零 I/O）"
+        );
+        assert_eq!(fake.required_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 问答所需能力来自**宿主卡题型**：多选卡即便客户端只传 1 个值，也必须
+    /// `multi_select` 开闸/许可；客户端值数量绝不参与推断。
+    #[tokio::test]
+    async fn answer_capability_comes_from_host_card_not_client_count() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_required(Ok(vec!["multi_select"]));
+        let policy = Arc::new(Mutex::new(policy_with(&["single_select"])));
+        let hub = hub_with_policy(fake.clone(), policy.clone());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let generation = hub.connection().generation;
+
+        // 宿主卡是多选题；客户端只勾了一个值。单选取向的开闸不得放行。
+        let err = hub
+            .execute(
+                ctx("host-multi-1"),
+                answer_action(generation, "pi-host-multi", vec!["only-one"], None),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::NEEDS_EVIDENCE));
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fake.required_calls.load(Ordering::SeqCst),
+            1,
+            "必须在绑定后读取宿主卡题型，而不是看客户端值数量"
+        );
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 1);
+
+        // 打开宿主卡真正要求的 multi_select（single_select 保持开着）→ 放行。
+        open_capability(&mut policy.lock().unwrap(), "multi_select");
+        let receipt = hub
+            .execute(
+                ctx("host-multi-2"),
+                answer_action(generation, "pi-host-multi", vec!["only-one"], None),
+            )
+            .await
+            .expect("宿主多选卡在 multi_select 开闸后必须放行");
+        assert_eq!(receipt.state, ActionState::Accepted);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.required_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// 混合题（单选 + 自由文本）逐项检查**全部**宿主所需能力，缺任一即拒。
+    #[tokio::test]
+    async fn mixed_question_requires_all_host_capabilities() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_required(Ok(vec!["single_select", "free_text"]));
+        let policy = Arc::new(Mutex::new(policy_with(&["single_select"])));
+        let hub = hub_with_policy(fake.clone(), policy.clone());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let generation = hub.connection().generation;
+
+        // 只开了单选：混合题缺 free_text，零执行。
+        let err = hub
+            .execute(
+                ctx("mixed-1"),
+                answer_action(generation, "pi-host-mixed", vec!["one"], None),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::NEEDS_EVIDENCE));
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.required_calls.load(Ordering::SeqCst), 1);
+
+        // 两项都开 → 放行。
+        open_capability(&mut policy.lock().unwrap(), "free_text");
+        let receipt = hub
+            .execute(
+                ctx("mixed-2"),
+                answer_action(generation, "pi-host-mixed", vec!["one"], None),
+            )
+            .await
+            .expect("全部所需能力开闸后必须放行");
+        assert_eq!(receipt.state, ActionState::Accepted);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Snooze 同样按宿主卡题型过能力闸：多选卡缺 `multi_select` 时零执行。
+    #[tokio::test]
+    async fn snooze_capability_comes_from_host_card() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_required(Ok(vec!["multi_select"]));
+        let policy = Arc::new(Mutex::new(policy_with(&["single_select"])));
+        let hub = hub_with_policy(fake.clone(), policy.clone());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let generation = hub.connection().generation;
+
+        let err = hub
+            .execute(
+                ctx("snooze-host-1"),
+                snooze_action(generation, "pi-host-snooze"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::NEEDS_EVIDENCE));
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.required_calls.load(Ordering::SeqCst), 1);
+
+        open_capability(&mut policy.lock().unwrap(), "multi_select");
+        hub.execute(
+            ctx("snooze-host-2"),
+            snooze_action(generation, "pi-host-snooze"),
+        )
+        .await
+        .expect("host multi_select 开闸后 snooze 应放行");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 证据构建：多选卡的所需能力是 `multi_select`；`single_select` 许可绝不能
+    /// 放行多选卡（许可只放宽它自己那项能力），多选许可才放行。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    #[tokio::test]
+    async fn host_multi_select_requires_multi_select_permit() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_required(Ok(vec!["multi_select"]));
+        let policy = Arc::new(Mutex::new(CapabilityView::default()));
+        let hub = hub_with_policy(fake.clone(), policy);
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let generation = hub.connection().generation;
+        let key = TargetKey {
+            session_id: EVIDENCE_SESSION.into(),
+        };
+
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "single_select")
+            .unwrap();
+        let err = hub
+            .execute(
+                ctx("permit-multi-1"),
+                answer_action(generation, "pi-permit-multi", vec!["one"], None),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.is(codes::NEEDS_EVIDENCE),
+            "single_select 许可不得放行多选卡"
+        );
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+
+        // 失败的能力闸不得消费任何许可：单选许可仍可用于它自己的能力。
+        let armed = hub.session(&key).await.expect("会话投影应可读");
+        assert!(armed.capabilities.single_select.enabled);
+        assert!(!armed.capabilities.multi_select.enabled);
+
+        // 发放真正的多选许可：放行，且只消费 multi_select。
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "multi_select")
+            .unwrap();
+        hub.execute(
+            ctx("permit-multi-2"),
+            answer_action(generation, "pi-permit-multi", vec!["one"], None),
+        )
+        .await
+        .expect("multi_select 许可应放行多选卡");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+        let after = hub.session(&key).await.expect("会话投影应可读");
+        assert!(
+            after.capabilities.single_select.enabled,
+            "未参与本次检查的许可不得被消费"
+        );
+        assert!(
+            !after.capabilities.multi_select.enabled,
+            "多选许可恰消费一次"
+        );
+    }
+
+    /// 证据构建：混合题缺任一所需许可时，**任何**许可都不得被提前消费
+    /// （all-or-nothing）；补齐后才一次性消费并放行。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    #[tokio::test]
+    async fn mixed_question_permit_check_is_all_or_nothing() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_required(Ok(vec!["single_select", "free_text"]));
+        let policy = Arc::new(Mutex::new(CapabilityView::default()));
+        let hub = hub_with_policy(fake.clone(), policy);
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let generation = hub.connection().generation;
+        let key = TargetKey {
+            session_id: EVIDENCE_SESSION.into(),
+        };
+
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "single_select")
+            .unwrap();
+        let err = hub
+            .execute(
+                ctx("permit-mixed-1"),
+                answer_action(generation, "pi-permit-mixed", vec!["one"], None),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.is(codes::NEEDS_EVIDENCE),
+            "缺 free_text 许可必须整单拒绝"
+        );
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+
+        let armed = hub.session(&key).await.expect("会话投影应可读");
+        assert!(
+            armed.capabilities.single_select.enabled,
+            "全量检查失败时 single_select 许可必须原样保留（不得部分消费）"
+        );
+
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "free_text")
+            .unwrap();
+        hub.execute(
+            ctx("permit-mixed-2"),
+            answer_action(generation, "pi-permit-mixed", vec!["one"], None),
+        )
+        .await
+        .expect("两项许可齐全后必须放行");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+        let after = hub.session(&key).await.expect("会话投影应可读");
+        assert!(!after.capabilities.single_select.enabled);
+        assert!(!after.capabilities.free_text.enabled);
     }
 
     /// 会话能力矩阵的逐项断言：未取得产品级实机证据时八项必须全关且带冻结原因码。
@@ -2759,8 +3334,15 @@ mod tests {
         // 首次 snooze 绑题（不消费）；重复同题幂等。
         hub.execute(ctx("snooze-1"), snooze("ix-1")).await.unwrap();
         hub.execute(ctx("snooze-2"), snooze("ix-1")).await.unwrap();
-        // 其他题的 snooze 不得改绑/借用（动作本身照常放行，但许可仍绑在 ix-1）。
-        hub.execute(ctx("snooze-3"), snooze("ix-2")).await.unwrap();
+        // 许可已绑定 ix-1：其他题的 snooze 不得改绑/借用 → 能力闸拒绝（零执行）。
+        let err = hub
+            .execute(ctx("snooze-3"), snooze("ix-2"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.is(codes::NEEDS_EVIDENCE),
+            "许可绑定到其他题时 snooze 必须拒绝，绝不得借用"
+        );
 
         // 其他题的最终 answer 不能借用许可。
         let err = hub
@@ -2770,15 +3352,15 @@ mod tests {
         assert!(err.is(codes::NEEDS_EVIDENCE), "其他交互不得借用许可");
         assert_eq!(
             fake.execute_calls.load(Ordering::SeqCst),
-            3,
-            "被拒绝的 answer 零 execute（三次 snooze 各自一次）"
+            2,
+            "被拒绝的 snooze/answer 零 execute（前两次 snooze 各自一次）"
         );
 
         // 绑定题的 answer 原子消费许可。
         hub.execute(ctx("answer-1"), answer("ix-1"))
             .await
             .expect("snooze 绑定的题必须能消费许可");
-        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 3);
 
         // 消费后回到闸门关闭。
         let err = hub
@@ -2786,7 +3368,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is(codes::NEEDS_EVIDENCE));
-        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 3);
     }
 
     /// 事件泵的 fake 桥：记录 `on_data`/`invalidate`，可注入一次瞬时错误与

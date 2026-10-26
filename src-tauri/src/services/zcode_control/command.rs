@@ -535,6 +535,31 @@ impl CommandSender {
         }
     }
 
+    /// 本动作在**宿主卡语义**下需要的全部能力名（只读，不消费许可、不改状态）。
+    ///
+    /// 静态动作直接给出固定集合；`Answer`/`Snooze` 必须经 [`PendingPort`] 读取精确
+    /// 目标上的宿主 pending 卡题型（未装配端口 / 卡不可读 → `not_ready`）。Hub 用它
+    /// 在执行前逐项过能力闸；客户端 `selectedValues` 的数量**不**参与判定。
+    pub(crate) async fn required_capabilities(
+        &self,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<Vec<&'static str>> {
+        match action {
+            ControlAction::Send { .. } => Ok(vec!["send"]),
+            ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
+            ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
+            ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
+            ControlAction::Answer { interaction_id, .. }
+            | ControlAction::Snooze { interaction_id, .. } => {
+                let Some(pending) = self.pending.as_ref() else {
+                    return Err(ZcodeError::of(codes::NOT_READY));
+                };
+                pending.required_capabilities(target, interaction_id).await
+            }
+        }
+    }
+
     /// 动作身份校验（所有变体共用）：空 actionId 会成为全局幂等键，必须拒绝。
     fn check_action(
         &self,
@@ -2672,6 +2697,21 @@ mod tests {
                 })
             }
 
+            fn required_capabilities<'a>(
+                &'a self,
+                target: &'a BoundTarget,
+                interaction_id: &'a str,
+            ) -> BoxFuture<'a, ZResult<Vec<&'static str>>> {
+                Box::pin(async move {
+                    let state = self.inner.lock().unwrap();
+                    if *target != state.target || state.card.interaction_id != interaction_id {
+                        return Err(ZcodeError::of(codes::STALE_PENDING));
+                    }
+                    // 本替身只建模单选问答卡；多选/自由文本由 bridge 真卡用例覆盖。
+                    Ok(vec!["single_select"])
+                })
+            }
+
             fn snooze<'a>(
                 &'a self,
                 target: &'a BoundTarget,
@@ -2901,6 +2941,105 @@ mod tests {
                 }
                 dump
             })
+        }
+
+        /// `required_capabilities`：静态动作固定集合；Answer/Snooze 只经 pending 端口
+        /// 读宿主卡题型（未装配端口 → not_ready，绝不按客户端值数量推断）。
+        #[tokio::test]
+        async fn required_capabilities_delegates_answer_to_pending() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let answer = answer_action("ix-1", vec![answer_entry("原题？", &["A"])]);
+            let snooze = ControlAction::Snooze {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                interaction_id: "ix-1".to_owned(),
+            };
+
+            // 未装配 pending：不能证明宿主卡在场 → not_ready（零推断）。
+            let no_pending =
+                CommandSender::with_timeout(fake.clone(), store.clone(), Duration::from_millis(20));
+            assert!(no_pending
+                .required_capabilities(&target(), &answer)
+                .await
+                .expect_err("no pending port")
+                .is(codes::NOT_READY));
+            assert!(no_pending
+                .required_capabilities(&target(), &snooze)
+                .await
+                .expect_err("no pending port")
+                .is(codes::NOT_READY));
+
+            // 装配后：Answer/Snooze 都委托 pending 的宿主卡推导。
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+            assert_eq!(
+                sender
+                    .required_capabilities(&target(), &answer)
+                    .await
+                    .unwrap(),
+                vec!["single_select"]
+            );
+            assert_eq!(
+                sender
+                    .required_capabilities(&target(), &snooze)
+                    .await
+                    .unwrap(),
+                vec!["single_select"]
+            );
+            let unknown = answer_action("ix-2", vec![answer_entry("原题？", &["A"])]);
+            assert!(sender
+                .required_capabilities(&target(), &unknown)
+                .await
+                .expect_err("unknown host card")
+                .is(codes::STALE_PENDING));
+
+            // 静态动作不读宿主卡，固定集合原样返回。
+            let static_cases = [
+                (
+                    ControlAction::Send {
+                        session_id: SESSION.to_owned(),
+                        generation: GEN,
+                        text: "synthetic".to_owned(),
+                    },
+                    vec!["send"],
+                ),
+                (
+                    ControlAction::Stop {
+                        session_id: SESSION.to_owned(),
+                        generation: GEN,
+                        expected_foreground_execution_id: "fx-1".to_owned(),
+                    },
+                    vec!["interrupt"],
+                ),
+                (
+                    ControlAction::Permission {
+                        session_id: SESSION.to_owned(),
+                        generation: GEN,
+                        interaction_id: "ix-1".to_owned(),
+                        option_id: "allowOnce".to_owned(),
+                    },
+                    vec!["approval_reply"],
+                ),
+                (
+                    ControlAction::Selection {
+                        session_id: SESSION.to_owned(),
+                        generation: GEN,
+                        model: "synthetic-model".to_owned(),
+                        thought: "high".to_owned(),
+                    },
+                    vec!["model", "thought_level"],
+                ),
+            ];
+            for (action, expected) in static_cases {
+                assert_eq!(
+                    sender
+                        .required_capabilities(&target(), &action)
+                        .await
+                        .unwrap(),
+                    expected
+                );
+            }
         }
 
         /// 已消费/不在册的卡：零帧，绝不复用另一张卡。
