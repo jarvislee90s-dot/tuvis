@@ -1613,13 +1613,16 @@ impl ZcodeHub {
                         }
                     }
                 }
-                // 首次 snooze 把本会话/本代际的许可绑到该题，不消费。
-                // #4 将替换为只绑定本次 required 能力集合的 limited 版本。
+                // 首次 snooze 只把本题 required 的答案/审批许可绑到该题，不消费，
+                // 绝不绑定 send/model 等非答案许可。
                 ControlAction::Snooze { .. } => {
                     let bound = permit_backed.is_empty()
-                        || self
-                            .evidence
-                            .snooze_interaction(session_id, generation, interaction_id);
+                        || self.evidence.snooze_interaction_limited(
+                            session_id,
+                            generation,
+                            interaction_id,
+                            &permit_backed,
+                        );
                     if !bound {
                         return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
                     }
@@ -1910,6 +1913,22 @@ mod tests {
             fake,
             source,
         ))
+    }
+
+    /// 证据构建测试：默认策略（全关）+ 指定宿主所需能力的已配对 Hub。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    async fn closed_evidence_hub(
+        fake: Arc<FakeBackend>,
+        required: Vec<&'static str>,
+    ) -> (Arc<ZcodeHub>, u64) {
+        fake.set_required(Ok(required));
+        let hub = hub_with_policy(fake, Arc::new(Mutex::new(CapabilityView::default())));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let generation = hub.connection().generation;
+        (hub, generation)
     }
 
     fn stored(url: &str) -> DeviceStore {
@@ -2811,6 +2830,171 @@ mod tests {
         );
         assert_eq!(fake.required_calls.load(Ordering::SeqCst), 0);
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Snooze 只绑本次 required 的答案许可：`send` 许可保持未绑，仍可被普通
+    /// `consume` 使用；绑定的 `single_select` 留给该题最终 Answer 消费。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    #[tokio::test]
+    async fn snooze_binds_only_required_capability_not_other_permits() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, generation) = closed_evidence_hub(fake.clone(), vec!["single_select"]).await;
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "single_select")
+            .unwrap();
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "send")
+            .unwrap();
+
+        hub.execute(
+            ctx("snooze-limit-1"),
+            snooze_action(generation, "ix-limit-1"),
+        )
+        .await
+        .expect("single_select 许可应允许 snooze");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+
+        // 旧的全量绑定会把 send 一并绑到该题 → 普通 consume 失败。
+        let sent = hub
+            .execute(ctx("snooze-limit-send"), send_action(generation))
+            .await
+            .expect("send 许可不得被 snooze 绑定");
+        assert_eq!(sent.state, ActionState::Accepted);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 2);
+
+        // snooze 不消费：同题最终 Answer 仍能用该许可。
+        let answer = hub
+            .execute(
+                ctx("snooze-limit-answer"),
+                answer_action(generation, "ix-limit-1", vec!["one"], None),
+            )
+            .await
+            .expect("snooze 绑定的题必须能最终消费许可");
+        assert_eq!(answer.state, ActionState::Accepted);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// 只有 `send` 许可、宿主 required 为 `single_select`：Snooze 拒绝，零 bind、
+    /// 零执行，且 `send` 许可完全未被碰（仍可正常发送）。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    #[tokio::test]
+    async fn snooze_ignores_send_permit_and_makes_no_binding() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, generation) = closed_evidence_hub(fake.clone(), vec!["single_select"]).await;
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "send")
+            .unwrap();
+
+        let err = hub
+            .execute(
+                ctx("snooze-send-only-1"),
+                snooze_action(generation, "ix-send-only"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::NEEDS_EVIDENCE), "send 许可不得放宽问答能力");
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+
+        let sent = hub
+            .execute(ctx("snooze-send-only-send"), send_action(generation))
+            .await
+            .expect("send 许可必须原样可用");
+        assert_eq!(sent.state, ActionState::Accepted);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 许可已绑 ix-1：ix-2 的 snooze 拒绝且不改绑；ix-1 仍可最终作答。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    #[tokio::test]
+    async fn snooze_other_interaction_rejected_without_stealing_binding() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, generation) = closed_evidence_hub(fake.clone(), vec!["single_select"]).await;
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "single_select")
+            .unwrap();
+
+        hub.execute(ctx("snooze-bind-1"), snooze_action(generation, "ix-1"))
+            .await
+            .expect("首次 snooze 应绑定 ix-1");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 1);
+
+        let err = hub
+            .execute(ctx("snooze-steal-2"), snooze_action(generation, "ix-2"))
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::NEEDS_EVIDENCE), "其他题不得借用/抢走已绑许可");
+        assert_eq!(
+            fake.bind_calls.load(Ordering::SeqCst),
+            1,
+            "能力闸拒绝必须发生在 bind 之前"
+        );
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+
+        // ix-1 的绑定未被改写：最终 answer 仍能消费。
+        let answer = hub
+            .execute(
+                ctx("snooze-bind-answer"),
+                answer_action(generation, "ix-1", vec!["one"], None),
+            )
+            .await
+            .expect("ix-1 的绑定必须原样保留");
+        assert_eq!(answer.state, ActionState::Accepted);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// 两项 required 只 arm 一项：Snooze 整单拒绝且**不得部分绑定**；补齐后
+    /// 换一题仍可成功（证明第一次失败没有把 single_select 绑到 ix-1）。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    #[tokio::test]
+    async fn snooze_multi_required_missing_permit_leaves_no_partial_binding() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, generation) =
+            closed_evidence_hub(fake.clone(), vec!["single_select", "free_text"]).await;
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "single_select")
+            .unwrap();
+
+        let err = hub
+            .execute(ctx("snooze-partial-1"), snooze_action(generation, "ix-1"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.is(codes::NEEDS_EVIDENCE),
+            "缺 free_text 许可必须整单拒绝"
+        );
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "free_text")
+            .unwrap();
+        hub.execute(ctx("snooze-partial-2"), snooze_action(generation, "ix-2"))
+            .await
+            .expect("失败调用不得留下部分绑定；补齐后换题应成功");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 权限卡 snooze：只绑 `approval_reply` 且不消费，最终 Permission 仍可用。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    #[tokio::test]
+    async fn snooze_permission_binds_approval_reply_without_consuming() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, generation) = closed_evidence_hub(fake.clone(), vec!["approval_reply"]).await;
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "approval_reply")
+            .unwrap();
+
+        hub.execute(ctx("snooze-perm-1"), snooze_action(generation, "ix-perm"))
+            .await
+            .expect("approval_reply 许可应允许 snooze 权限卡");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+
+        let permission = ControlAction::Permission {
+            session_id: "sess_synthetic0000".into(),
+            generation,
+            interaction_id: "ix-perm".into(),
+            option_id: "allowOnce".into(),
+        };
+        let receipt = hub
+            .execute(ctx("snooze-perm-resolve"), permission)
+            .await
+            .expect("snooze 不消费许可，最终审批仍应可用");
+        assert_eq!(receipt.state, ActionState::Accepted);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 2);
     }
 
     /// 问答所需能力来自**宿主卡题型**：多选卡即便客户端只传 1 个值，也必须

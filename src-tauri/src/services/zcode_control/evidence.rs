@@ -47,6 +47,14 @@ pub const CAPABILITY_NAMES: [&str; 8] = [
     "thought_level",
 ];
 
+/// snooze 允许绑定的四类答案/审批许可（其余能力绝不由 snooze 绑定）。
+const ANSWER_CAPABILITIES: [&str; 4] = [
+    "single_select",
+    "multi_select",
+    "free_text",
+    "approval_reply",
+];
+
 /// 能力名是否属于八项受证据闸约束的能力（去空白后精确匹配）。
 pub fn is_known_capability(name: &str) -> bool {
     CAPABILITY_NAMES.contains(&name.trim())
@@ -274,8 +282,75 @@ impl EvidencePermitStore {
         }
     }
 
-    /// snooze 辅助锁（**动作路径入口**）：把本会话/本代际下所有尚可用的许可绑定到
-    /// 同一 `interactionId`，且**不消费**任何许可。
+    /// snooze 辅助锁（**限定能力集合**，生产动作路径唯一入口）。
+    ///
+    /// 只处理 `capabilities` 中列出的四类答案/审批许可（`single_select`/
+    /// `multi_select`/`free_text`/`approval_reply`），且**不消费**任何许可：
+    ///
+    /// - 两阶段：先逐项校验许可存在、未过期、未绑题或已绑定本题；任意一项缺失/
+    ///   过期/绑定到其他题 → `false`，且**不改写任何绑定**；
+    /// - 全部通过后才把该集合中未绑定的许可统一绑定到 `interaction_id`；已绑定
+    ///   本题的项幂等保留；
+    /// - `capabilities` 为空、`interaction_id` 为空、或包含非答案/未知能力名
+    ///   （如 `send`/`model`）→ `false`，绝不触碰集合外的许可；
+    /// - 成功返回 `true`（集合非空且每项都可用）。
+    pub fn snooze_interaction_limited(
+        &self,
+        session_id: &str,
+        generation: u64,
+        interaction_id: &str,
+        capabilities: &[&str],
+    ) -> bool {
+        if interaction_id.trim().is_empty() || capabilities.is_empty() {
+            return false;
+        }
+        let now = self.now();
+        let mut permits = lock_permits(&self.permits);
+        // 第一阶段：全量校验；失败时零改写（不清理、不绑定）。
+        let mut to_bind: Vec<PermitKey> = Vec::new();
+        for capability in capabilities {
+            let capability = capability.trim();
+            if !ANSWER_CAPABILITIES.contains(&capability) {
+                return false;
+            }
+            let key = PermitKey {
+                session_id: session_id.to_owned(),
+                generation,
+                capability: capability.to_owned(),
+            };
+            let Some(entry) = permits.get(&key) else {
+                return false;
+            };
+            if entry.expires_at_ms <= now {
+                return false;
+            }
+            match entry.snoozed_interaction.as_deref() {
+                // 已绑定到其他题：整单拒绝，绝不改写。
+                Some(bound) if bound != interaction_id => return false,
+                // 已绑定本题：幂等，不需要重复写。
+                Some(_) => {}
+                None => {
+                    if !to_bind.iter().any(|pending| pending == &key) {
+                        to_bind.push(key);
+                    }
+                }
+            }
+        }
+        // 第二阶段：全部通过后才统一绑题（只动本次集合内的项）。
+        for key in to_bind {
+            if let Some(entry) = permits.get_mut(&key) {
+                entry.snoozed_interaction = Some(interaction_id.to_owned());
+            }
+        }
+        true
+    }
+
+    /// snooze 辅助锁（**旧全量兼容入口**，生产动作路径已不再使用）。
+    ///
+    /// 把本会话/本代际下**所有**尚可用的许可绑定到同一 `interactionId`，且不消费。
+    /// 该行为会把 `send`/`model` 等非答案许可一并绑死，生产路径改用
+    /// [`Self::snooze_interaction_limited`]（只绑定本题 required 的答案/审批能力）。
+    /// 保留本方法仅供既有测试/兼容调用。
     ///
     /// - 首次 snooze：绑定所有未绑定许可，返回 `true`；
     /// - 同一题重复 snooze：幂等（绑定态不变），返回 `true`；
@@ -549,6 +624,78 @@ mod tests {
         assert!(store.available_answer(SESSION, 7, "free_text", "interaction-1"));
         clock.advance(EVIDENCE_PERMIT_TTL_MS);
         assert!(!store.available_answer(SESSION, 7, "free_text", "interaction-1"));
+    }
+
+    #[test]
+    fn snooze_interaction_limited_binds_only_requested_capabilities() {
+        let (store, _clock) = store_with_clock();
+        let _ = store.arm(SESSION, 7, "single_select");
+        let _ = store.arm(SESSION, 7, "free_text");
+        let _ = store.arm(SESSION, 7, "send");
+
+        assert!(store.snooze_interaction_limited(SESSION, 7, "ix-1", &["single_select"]));
+        // 指定能力已绑本题，且不消费。
+        assert!(store.available_answer(SESSION, 7, "single_select", "ix-1"));
+        assert!(!store.available_answer(SESSION, 7, "single_select", "ix-2"));
+        // 集合外的许可绝不被 snooze 绑死：send 仍可按普通 consume 使用。
+        assert!(
+            store.consume(SESSION, 7, "send"),
+            "send 许可不得被 snooze 绑定（否则普通消费会因绑题被拒）"
+        );
+        // free_text 未被本次 snooze 触碰：仍可被任意题的 answer 消费。
+        assert!(store.consume_answer(SESSION, 7, "free_text", "ix-2"));
+        // 最终 answer 由本题消费该许可（snooze 只绑不消费）。
+        assert!(store.consume_answer(SESSION, 7, "single_select", "ix-1"));
+        assert!(!store.consume_answer(SESSION, 7, "single_select", "ix-1"));
+
+        // 同一题重复 snooze：幂等 true；已绑本题不算失败。
+        let _ = store.arm(SESSION, 7, "single_select");
+        assert!(store.snooze_interaction_limited(SESSION, 7, "ix-1", &["single_select"]));
+        assert!(store.snooze_interaction_limited(SESSION, 7, "ix-1", &["single_select"]));
+        assert!(store.available_answer(SESSION, 7, "single_select", "ix-1"));
+
+        // 审批许可属于允许绑定的四类。
+        let _ = store.arm(SESSION, 7, "approval_reply");
+        assert!(store.snooze_interaction_limited(SESSION, 7, "ix-perm", &["approval_reply"]));
+        assert!(store.consume_answer(SESSION, 7, "approval_reply", "ix-perm"));
+
+        // 空集合/空题/非答案能力/未发放能力：一律 false。
+        assert!(!store.snooze_interaction_limited(SESSION, 7, "ix-1", &[]));
+        assert!(!store.snooze_interaction_limited(SESSION, 7, "  ", &["single_select"]));
+        assert!(!store.snooze_interaction_limited(SESSION, 7, "ix-1", &["send"]));
+        assert!(!store.snooze_interaction_limited(SESSION, 7, "ix-1", &["model"]));
+        assert!(!store.snooze_interaction_limited(SESSION, 8, "ix-1", &["single_select"]));
+        assert!(!store.snooze_interaction_limited(SESSION, 7, "ix-1", &["multi_select"]));
+    }
+
+    #[test]
+    fn snooze_interaction_limited_is_all_or_nothing() {
+        let (store, clock) = store_with_clock();
+        let _ = store.arm(SESSION, 7, "single_select");
+
+        // 缺 free_text：整单拒绝，single_select 不得被提前绑定到 ix-2。
+        assert!(!store.snooze_interaction_limited(
+            SESSION,
+            7,
+            "ix-2",
+            &["single_select", "free_text"]
+        ));
+        assert!(
+            store.snooze_interaction_limited(SESSION, 7, "ix-1", &["single_select"]),
+            "失败调用不得留下部分绑定（single_select 必须仍可绑到 ix-1）"
+        );
+
+        // 已绑定 ix-1：ix-2 的 snooze 拒绝且不改绑；ix-1 仍可答。
+        assert!(!store.snooze_interaction_limited(SESSION, 7, "ix-2", &["single_select"]));
+        assert!(store.available_answer(SESSION, 7, "single_select", "ix-1"));
+        assert!(!store.available_answer(SESSION, 7, "single_select", "ix-2"));
+        assert!(store.consume_answer(SESSION, 7, "single_select", "ix-1"));
+
+        // 已过期：拒绝且不绑定。
+        let _ = store.arm(SESSION, 7, "multi_select");
+        clock.advance(EVIDENCE_PERMIT_TTL_MS);
+        assert!(!store.snooze_interaction_limited(SESSION, 7, "ix-expired", &["multi_select"]));
+        assert!(!store.available_answer(SESSION, 7, "multi_select", "ix-expired"));
     }
 
     /// 最小调用方守卫（模拟 Hub 命令派发的检查顺序）。
