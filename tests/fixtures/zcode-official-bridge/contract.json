@@ -189,5 +189,26 @@
     "interrupt": "guarded stop live ACK accepted; execution-stopped not observed",
     "model": "same-provider switch live-proven with fresh snapshot; getView exposes other providers and must be filtered to the current session provider",
     "thoughtLevel": "live-proven on the current model; validate against the target model's own levels, never a provider-level union"
+  },
+  "production": {
+    "status": "code_complete_live_blocked",
+    "statusNote": "T8.2 判定：本批代码完成（CapabilityPolicy / evidence.rs / 桌面 IPC / Hub 与 CommandSender 闸门 / 无许可全关已落地，自动门禁全绿），但平台验收未开始——仅有 macOS 探针级实机证据 B1–B4（探针 ≠ 产品链），T8.2 产品 UI 验收行全部 not_ran/未执行，Windows 未构建未连接。T8.1 已知缺口 I1 仍在：brief 要求的 loopback HTTP+WS 假官方端未交付，RelayClient ↔ BridgeManager ↔ CommandSender 组合只有构造冒烟。本状态不表示任何控制能力已交付；不得把「闸门按预期关闭」写成功能可用。",
+    "capabilitiesOpened": [],
+    "openingRule": "上表 capabilities 只记录探针观察（含仅 ACK 的弱证据），CapabilityPolicy 不复制该宽泛 true；八项控制能力在普通构建中一律 enabled=false / needs_evidence，只有取得产品级实机证据（T8.2 强制矩阵逐行 PASS）后才允许逐项开闸。",
+    "evidenceGate": {
+      "buildScope": "仅 debug 构建 + zcode-bridge-evidence feature（cfg(all(feature = \"zcode-bridge-evidence\", debug_assertions))）；普通构建恒为全关，不可只改布尔值开闸。",
+      "permit": "单次验收许可：TTL 120,000ms（120s），一次用户动作后即失效；换代/换服务/超时即作废；只放宽能力闸，不放宽目标绑定、权限与 fullAccess 守卫。",
+      "releaseRejected": "release + zcode-bridge-evidence 直接 compile_error!（src-tauri/src/services/zcode_control/mod.rs 编译门），发行包不可能携带验收许可。"
+    },
+    "knownGaps": [
+      "T8.1 I1：loopback HTTP+WS 假官方端未交付，RelayClient ↔ BridgeManager ↔ CommandSender 组合只有构造冒烟，不得以进程内 FakeOfficial 冒充整条生产链。",
+      "审批催卡为负结果：terminal sendText（默认与 mode=guarded）直接执行、不弹 permission 卡（共 4 轮），故 approvalForTerminalSend=false；生产不得把 guarded 模式宣传为对 Tuvis 发送的审批保护。",
+      "问答多选 / 自由文本仅 fake/合同层，无 live 证据，对应能力保持 false。",
+      "问答单选与打断的历史 live 证据仅 ACK accepted（ACK 后约 4–5ms teardown），未观察宿主撤卡 / 执行停止，终态未证。",
+      "ZAI 通道未验（用户账号在 BigModel 侧，仅 callback-timeout）；官方网页第二 terminal 并发 / KICKED 语义仅 source+fake。",
+      "Windows 全部未验（无 Windows 主机，未构建、未连接、未跑），不以 macOS 探针结果替代 Windows 产品验收。",
+      "T8.2 产品验收行（发送 / 单选 / 多选 / 自由文本 / 打断 / 审批 / 模型档位 / 双手机 / 断线重连 / 吊销 / 并发连接 / A 包回归）全部未执行；手机侧体验未经用户确认。"
+    ],
+    "acceptanceReport": "docs/superpowers/reviews/2026-10-25-zcode-production-acceptance.md"
   }
 }
