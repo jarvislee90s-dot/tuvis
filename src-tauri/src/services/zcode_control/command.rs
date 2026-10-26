@@ -58,16 +58,20 @@
 //! actionId 的重复点击不做跨 id 去重：第二帧照发，由宿主守卫幂等回 noop 并如实
 //! 显示（已知边界，见 `double_tap_new_action_id_defers_to_host_noop`）。
 //!
-//! # 审批既有卡（T5）
+//! # 审批既有卡（T5 + Fix round 1）
 //!
-//! `Permission` 走「能力闸 → 只读幂等预检 → 宿主授权 → 原值白名单 → 写前预留 →
-//! 恰一帧 `resolveInteraction`」：`capabilities.approval_reply` **默认关闭**
-//! （[`CapabilityView::default`]），关闭时 `needs_evidence` 且零帧零行——一次成功的
-//! `sendText` 绝不推断审批可用。只答 `kind=permission` 且 option kind ∈
-//! {`allowOnce`,`deny`} 的卡，optionId 原样回传本卡原值；`fullAccess` 无论 kind、
-//! `allowAlways`/常驻/未知 kind 一律 `forbidden_option`。ACK accepted/duplicate 只算
-//! `accepted`，10s 内宿主 pending 代数前进且 id 消失才 `confirmed`；宿主 ACK 前撤卡
-//! → `unknown`。绝不改会话权限模式、绝不用 fullAccess、绝无 sendText 合成或重发。
+//! `Permission` 走「只读幂等预检 → 能力闸 → 宿主授权 → 原值白名单 → 写前预留 →
+//! （autoResolution 在场时 snooze）→ 恰一帧 `resolveInteraction`」：已存储的
+//! 同 actionId 动作按重放处理，即使闸后来收回也回既有回执；只有**新**动作在
+//! `capabilities.approval_reply` **默认关闭**（[`CapabilityView::default`]）时
+//! `needs_evidence` 且零帧零行——一次成功的 `sendText` 绝不推断审批可用。只答
+//! `kind=permission` 且 option kind ∈ {`allowOnce`,`deny`} 的卡，optionId 原样回传
+//! 本卡原值；`fullAccess` 无论 kind、`allowAlways`/常驻/未知 kind 一律
+//! `forbidden_option`。autoResolution 卡与问答同款先 snooze（Ok 且卡仍在宿主集合）
+//! 再 resolve。ACK accepted/duplicate 只算 `accepted`，10s 内宿主 pending 代数前进
+//! 且 id 消失才 `confirmed`；宿主 ACK 前撤卡 → `unknown`。终态收口与 `Answer`
+//! 共用 `finish_resolve`（一套回归用例护两侧）。绝不改会话权限模式、绝不用
+//! fullAccess、绝无 sendText 合成或重发。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -314,7 +318,8 @@ pub struct CommandSender {
     actions: ActionStore,
     store: DeviceStore,
     ack_timeout: Duration,
-    /// pending 授权 / snooze / 宿主终态端口：`Answer`/`Snooze` 必需，生产接线在 T7.1。
+    /// pending 授权 / snooze / 宿主终态端口：`Answer`/`Snooze`/`Permission` 必需，
+    /// 生产接线在 T7.1。
     pending: Option<Arc<dyn PendingPort>>,
     /// stop 授权 / 宿主停止终态端口：`Stop` 必需，生产接线在 T7.1
     /// （`Arc<BridgeManager>`）；未装配时 Stop 一律 `not_ready`（零帧零行）。
@@ -325,8 +330,12 @@ pub struct CommandSender {
     initial_control_timeout: Duration,
     /// 未知 control 的轮询间隔（生产 [`INITIAL_CONTROL_POLL`]）。
     initial_control_poll: Duration,
-    /// 本会话能力矩阵（T5 起 `Permission` 的写前闸；默认矩阵全部关闭 =
+    /// 本派发器装配的能力矩阵（T5 起 `Permission` 的写前闸；默认矩阵全部关闭 =
     /// 审批应答 `needs_evidence`，零帧）。
+    ///
+    /// **粒度注意**：这是 **sender 级**装配，会话级 DTO 在 `SessionView.capabilities`
+    /// （投影侧仍用 [`CapabilityView::default`]）。T7.1 必须按 target 取证据矩阵，
+    /// 并同时喂给投影与 sender，避免「手机显示可点、后端 needs_evidence」。
     capabilities: CapabilityView,
 }
 
@@ -569,65 +578,24 @@ impl CommandSender {
         }
         // autoResolution 在场：先 snooze（恰一帧）且必须 Ok（accepted/duplicate/
         // noop=已暂停）且卡仍在宿主集合，否则零 resolve。
-        if card.auto_resolution {
-            if let Err(error) = pending
-                .snooze(target, interaction_id, &ctx.device_id, self.ack_timeout)
-                .await
-            {
-                // resolve 从未写出（可证明零写）：释放在途允许重试；snooze 本身
-                // 幂等（重复/迟到 noop 属已暂停），不会造成双暂停副作用。
-                pending.clear_local_inflight(target, interaction_id);
-                let (state, reason_code) = classify_port_error(&error);
-                let receipt = self.make_receipt(ctx, target, state, reason_code);
-                self.record(&receipt);
-                return Ok(receipt);
-            }
-            if !pending.host_has_pending(target, interaction_id) {
-                // snooze 已写出但宿主集合已无此卡：不猜是否受理，零 resolve。
-                pending.clear_local_inflight(target, interaction_id);
-                let receipt = self.make_receipt(
-                    ctx,
-                    target,
-                    ActionState::Unknown,
-                    Some(codes::STALE_PENDING.to_owned()),
-                );
-                self.record(&receipt);
-                return Ok(receipt);
-            }
+        if let Some(receipt) = self
+            .snooze_before_resolve(
+                ctx,
+                target,
+                pending.as_ref(),
+                interaction_id,
+                card.auto_resolution,
+            )
+            .await
+        {
+            return Ok(receipt);
         }
-
-        let mut receipt = self
+        let receipt = self
             .dispatch_resolve(ctx, target, interaction_id, answer)
             .await;
-        if receipt.state != ActionState::Accepted
-            && !pending.host_has_pending(target, interaction_id)
-        {
-            receipt.state = ActionState::Unknown;
-            receipt.reason_code = Some(codes::STALE_PENDING.to_owned());
-        }
-        if receipt.state == ActionState::Accepted {
-            // 本地消费 ≠ 宿主撤卡：先收口在途，再等宿主自己的整体替换。
-            pending.mark_resolved_local(target, interaction_id);
-            self.record(&receipt);
-            if pending
-                .wait_host_cleared(target, interaction_id, baseline, self.confirm_timeout)
-                .await
-            {
-                // 只有「代数前进 + 卡消失」才是因果终态；超时停在 accepted。
-                receipt.state = ActionState::Confirmed;
-                receipt.reason_code = None;
-            }
-        } else if receipt.state == ActionState::SendFailed {
-            // 确证零写：释放本地在途，用户可重试同一张卡。
-            pending.clear_local_inflight(target, interaction_id);
-        } else if matches!(receipt.state, ActionState::Rejected | ActionState::Noop) {
-            // 宿主显式拒绝/无需处理且卡仍在：本次应答可证明未生效，放开重试；
-            // 写后 unknown（含 ACK 超窗）保持闸（防双目重复作答），只由宿主
-            // 后续撤卡帧或换代释放。
-            pending.clear_local_inflight(target, interaction_id);
-        }
-        self.record(&receipt);
-        Ok(receipt)
+        Ok(self
+            .finish_resolve(target, pending.as_ref(), interaction_id, baseline, receipt)
+            .await)
     }
 
     /// 暂停问答卡自动结束计时（独立动作）：只读幂等预检 → 授权 → 写前预留 →
@@ -755,15 +723,19 @@ impl CommandSender {
         Ok(receipt)
     }
 
-    /// 审批既有卡的安全应答（T5）：能力闸 → 只读幂等预检 → 宿主授权 →
-    /// 原值白名单 → **写前才预留** → 恰一帧 `resolveInteraction`。
+    /// 审批既有卡的安全应答（T5）：只读幂等预检 → 能力闸 → 宿主授权 →
+    /// 原值白名单 → **写前才预留** →（必要时 snooze）→ 恰一帧 `resolveInteraction`。
     ///
     /// 顺序纪律：
-    /// - `capabilities.approval_reply`（默认关闭）关闭 → `needs_evidence`，
-    ///   **零帧零行零审计**（不因一次成功 sendText 推断审批可用）；
+    /// - **幂等重放优先于能力闸**：同 actionId 同载荷的已存储动作即使闸已收回也回
+    ///   既有回执（零帧零行）；只有**新**动作在 `capabilities.approval_reply`
+    ///   （默认关闭）关闭时才 `needs_evidence`、零帧零行零审计（不因一次成功
+    ///   sendText 推断审批可用）；
     /// - 卡授权/选项校验失败发生在预留之前：零帧零行，actionId 不被占死；
     /// - 只答 `kind=permission` 且 option kind ∈ {allowOnce, deny} 的卡；
     ///   fullAccess/常驻授权一律 `forbidden_option`（[`build_permission_answer`]）；
+    /// - `autoResolution` 在场时与问答同款前置 snooze（决策 §8.2：每个交互 run
+    ///   至多一帧 snooze）：必须 Ok（含 noop=已暂停）且卡仍在宿主集合，否则零 resolve；
     /// - ACK accepted/duplicate 只算 `accepted`；ACK 后 [`CONFIRM_TIMEOUT`] 内观察到
     ///   精确目标的宿主 pending 代数前进**且**该 id 消失才升级 `confirmed`；
     ///   宿主在 ACK 前撤卡 → `unknown`；无第二帧、无重发、绝不改会话权限模式。
@@ -781,7 +753,12 @@ impl CommandSender {
         else {
             return Err(invalid_action());
         };
-        // 证据闸优先：审批应答默认关闭，关闭时连 pending 端口都不触碰（零帧）。
+        // 幂等重放（同 actionId 同载荷）：只回既有回执，零新行、零帧。先于能力闸，
+        // 避免闸收回后把「做过」误报成「没做过」。
+        if let Some(existing) = self.lookup_action(ctx, target, action)? {
+            return Ok(existing);
+        }
+        // 证据闸：审批应答默认关闭，关闭时连 pending 端口都不触碰（零帧）。
         if !self.capabilities.approval_reply_enabled() {
             return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
         }
@@ -789,10 +766,6 @@ impl CommandSender {
             // 未装配 pending 端口：不能证明卡在宿主在场，零帧零行。
             return Err(ZcodeError::of(codes::NOT_READY));
         };
-        // 幂等重放（同 actionId 同载荷）：只回既有回执，零新行、零帧。
-        if let Some(existing) = self.lookup_action(ctx, target, action)? {
-            return Ok(existing);
-        }
         // 宿主观察基线（精确目标）：终态要求「该目标代数前进且该 id 不在其集合」。
         let baseline = pending.host_pending_revision(target);
         let card = pending.authorize_pending(target, interaction_id).await?;
@@ -817,10 +790,86 @@ impl CommandSender {
                 return Err(error);
             }
         }
+        // autoResolution 在权限卡上同样生效：先暂停计时，未证实零 resolve。
+        if let Some(receipt) = self
+            .snooze_before_resolve(
+                ctx,
+                target,
+                pending.as_ref(),
+                interaction_id,
+                card.auto_resolution,
+            )
+            .await
+        {
+            return Ok(receipt);
+        }
 
-        let mut receipt = self
+        let receipt = self
             .dispatch_resolve(ctx, target, interaction_id, answer)
             .await;
+        Ok(self
+            .finish_resolve(target, pending.as_ref(), interaction_id, baseline, receipt)
+            .await)
+    }
+
+    /// autoResolution 前置（答案与权限共用）：恰一帧 snooze，必须 Ok
+    /// （accepted/duplicate/**noop** = 已暂停）**且**卡仍在宿主集合，否则零 resolve。
+    ///
+    /// 返回 `Some(receipt)` = 已落账的保守回执（调用方直接返回）；`None` = 计时已
+    /// 暂停且卡仍在，可以 resolve。
+    async fn snooze_before_resolve(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        pending: &dyn PendingPort,
+        interaction_id: &str,
+        auto_resolution: bool,
+    ) -> Option<ActionReceipt> {
+        if !auto_resolution {
+            return None;
+        }
+        if let Err(error) = pending
+            .snooze(target, interaction_id, &ctx.device_id, self.ack_timeout)
+            .await
+        {
+            // resolve 从未写出（可证明零写）：释放在途允许重试；snooze 本身幂等
+            // （重复/迟到 noop 属已暂停），不会造成双暂停副作用。
+            pending.clear_local_inflight(target, interaction_id);
+            let (state, reason_code) = classify_port_error(&error);
+            let receipt = self.make_receipt(ctx, target, state, reason_code);
+            self.record(&receipt);
+            return Some(receipt);
+        }
+        if !pending.host_has_pending(target, interaction_id) {
+            // snooze 已写出但宿主集合已无此卡：不猜是否受理，零 resolve。
+            pending.clear_local_inflight(target, interaction_id);
+            let receipt = self.make_receipt(
+                ctx,
+                target,
+                ActionState::Unknown,
+                Some(codes::STALE_PENDING.to_owned()),
+            );
+            self.record(&receipt);
+            return Some(receipt);
+        }
+        None
+    }
+
+    /// resolve 之后的共享收口（答案与权限同一状态机：回归共用一套用例）。
+    ///
+    /// - 写后非 `accepted` 且宿主已撤卡 → `unknown/stale_pending`（绝不谎称受理）；
+    /// - `accepted` → 本地消费并落账，[`CONFIRM_TIMEOUT`] 内观察到宿主撤卡才
+    ///   `confirmed`，超时停在 `accepted`；
+    /// - `send_failed`（桥保证零写）与 `rejected`/`noop`（可证明未生效）释放在途；
+    ///   写后 `unknown`（含 ACK 超窗）保持在途闸，防重复审批。
+    async fn finish_resolve(
+        &self,
+        target: &BoundTarget,
+        pending: &dyn PendingPort,
+        interaction_id: &str,
+        baseline: u64,
+        mut receipt: ActionReceipt,
+    ) -> ActionReceipt {
         if receipt.state != ActionState::Accepted
             && !pending.host_has_pending(target, interaction_id)
         {
@@ -844,12 +893,13 @@ impl CommandSender {
             // 确证零写：释放本地在途，用户可重试同一张卡。
             pending.clear_local_inflight(target, interaction_id);
         } else if matches!(receipt.state, ActionState::Rejected | ActionState::Noop) {
-            // 宿主显式拒绝/无需处理且卡仍在：放开重试；写后 unknown（含 ACK 超窗）
-            // 保持闸（防双目重复审批），只由宿主后续撤卡帧或换代释放。
+            // 宿主显式拒绝/无需处理且卡仍在：本次应答可证明未生效，放开重试；
+            // 写后 unknown（含 ACK 超窗）保持闸（防双目重复作答），只由宿主
+            // 后续撤卡帧或换代释放。
             pending.clear_local_inflight(target, interaction_id);
         }
         self.record(&receipt);
-        Ok(receipt)
+        receipt
     }
 
     /// 等**已确认**的 control（`activeWorks` 是数组）到达：宿主 control 帧迟到/
@@ -2100,11 +2150,11 @@ mod tests {
                 })
             }
 
-            fn set_snooze_error(&self, code: &'static str) {
+            pub(super) fn set_snooze_error(&self, code: &'static str) {
                 self.inner.lock().unwrap().snooze_result = Err(code);
             }
 
-            fn set_snooze_ok(&self) {
+            pub(super) fn set_snooze_ok(&self) {
                 self.inner.lock().unwrap().snooze_result = Ok(());
             }
 
@@ -2139,7 +2189,7 @@ mod tests {
                 self.inner.lock().unwrap().clear_on_wait = true;
             }
 
-            fn snooze_calls(&self) -> usize {
+            pub(super) fn snooze_calls(&self) -> usize {
                 self.inner.lock().unwrap().snooze_calls
             }
 
@@ -4207,6 +4257,14 @@ mod tests {
             )
         }
 
+        /// 带倒计时的权限卡（投影层对所有 kind 都会读 `autoResolution`）。
+        fn auto_resolution_card(interaction_id: &str) -> PendingView {
+            let mut auto = once_card(interaction_id);
+            auto.auto_resolution = true;
+            auto.auto_resolution_state = Some("visibleCountdown".to_owned());
+            auto
+        }
+
         fn permission_action(interaction_id: &str, option_id: &str) -> ControlAction {
             ControlAction::Permission {
                 session_id: SESSION.to_owned(),
@@ -4473,6 +4531,251 @@ mod tests {
             assert!(!pending.inflight("ix-1"));
         }
 
+        /// autoResolution 卡（决策 §8.2：每个交互 run 先暂停计时）：必须先 snooze
+        /// 恰一次，且已暂停（accepted/duplicate/noop 均由端口折叠为 Ok）后才 resolve。
+        #[tokio::test]
+        async fn auto_resolution_permission_snoozes_once_then_resolves() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = pending_with(auto_resolution_card("ix-1"));
+            let sender = permission_sender(&fake, &pending, &store);
+
+            let receipt = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &permission_action("ix-1", "once-id-9"),
+                )
+                .await
+                .expect("autoResolution permission replies must snooze first");
+
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(
+                pending.snooze_calls(),
+                1,
+                "autoResolution 在场恰一次 snooze"
+            );
+            assert_eq!(
+                resolve_envelopes(&fake).len(),
+                1,
+                "snooze 证实后恰一帧 resolve"
+            );
+        }
+
+        /// snooze 未证实（失败/宿主已撤卡）：零 resolve，绝不与倒计时竞速。
+        #[tokio::test]
+        async fn permission_snooze_unconfirmed_zero_resolve() {
+            // ① snooze 失败（超窗/unknown）：回执保守 unknown，零 resolve、释放在途。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = pending_with(auto_resolution_card("ix-1"));
+            pending.set_snooze_error(codes::UNKNOWN);
+            let sender = permission_sender(&fake, &pending, &store);
+
+            let receipt = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &permission_action("ix-1", "once-id-9"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Unknown);
+            assert_eq!(receipt.reason_code.as_deref(), Some(codes::UNKNOWN));
+            assert_eq!(pending.snooze_calls(), 1, "snooze 恰一帧");
+            assert_eq!(resolve_envelopes(&fake).len(), 0, "snooze 失败不得 resolve");
+            assert!(!pending.inflight("ix-1"), "resolve 零写必须释放在途");
+
+            // ② snooze 受理但宿主集合已无该卡：仍零 resolve。
+            let store2 = DeviceStore::memory();
+            let fake2 = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending2 = pending_with(auto_resolution_card("ix-1"));
+            pending2.clear_host_card();
+            let sender2 = permission_sender(&fake2, &pending2, &store2);
+            let receipt2 = sender2
+                .execute(
+                    &ctx("a-2"),
+                    &target(),
+                    &permission_action("ix-1", "once-id-9"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt2.state, ActionState::Unknown);
+            assert_eq!(receipt2.reason_code.as_deref(), Some(codes::STALE_PENDING));
+            assert_eq!(pending2.snooze_calls(), 1);
+            assert_eq!(resolve_envelopes(&fake2).len(), 0);
+        }
+
+        /// 宿主在 ACK 前撤卡且无 accepted：只能 unknown/stale，不消费。
+        #[tokio::test]
+        async fn host_withdraw_before_ack_is_unknown() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(json!({ "status": "noop" })));
+            let pending = pending_with(once_card("ix-1"));
+            // 宿主已撤卡（本地投影尚未跟上）。
+            pending.clear_host_card();
+            let sender = permission_sender(&fake, &pending, &store);
+
+            let receipt = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &permission_action("ix-1", "once-id-9"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Unknown);
+            assert_eq!(receipt.reason_code.as_deref(), Some(codes::STALE_PENDING));
+            assert_eq!(
+                resolve_envelopes(&fake).len(),
+                1,
+                "帧已写出，只收口为 unknown"
+            );
+            assert!(!pending.consumed("ix-1"), "未受理不得本地消费");
+        }
+
+        /// resolve ACK rejected/noop 且卡仍在宿主集合：释放在途，换新 actionId 可重试。
+        #[tokio::test]
+        async fn rejected_or_noop_resolve_releases_inflight() {
+            for (index, status) in ["rejected", "noop"].into_iter().enumerate() {
+                let store = DeviceStore::memory();
+                let fake = FakeBridge::new(Reply::Body(json!({ "status": status })));
+                let pending = pending_with(once_card("ix-1"));
+                let sender = permission_sender(&fake, &pending, &store);
+                let first = sender
+                    .execute(
+                        &ctx(&format!("a-{index}-1")),
+                        &target(),
+                        &permission_action("ix-1", "once-id-9"),
+                    )
+                    .await
+                    .unwrap();
+                let expected = if status == "rejected" {
+                    ActionState::Rejected
+                } else {
+                    ActionState::Noop
+                };
+                assert_eq!(first.state, expected, "{status} 如实分类");
+                assert!(
+                    !pending.inflight("ix-1"),
+                    "{status} 可证明未生效必须释放在途"
+                );
+                assert_eq!(resolve_envelopes(&fake).len(), 1);
+
+                // 宿主仍列卡：新 actionId 可重试，绝不自动重发。
+                fake.set_reply(Reply::Body(accepted_body()));
+                let retry = sender
+                    .execute(
+                        &ctx(&format!("a-{index}-2")),
+                        &target(),
+                        &permission_action("ix-1", "once-id-9"),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(retry.state, ActionState::Accepted, "{status} 后可重试");
+                assert_eq!(resolve_envelopes(&fake).len(), 2);
+            }
+        }
+
+        /// 桥确证零写（绑定/编码拒绝）→ `send_failed` 且释放在途，用户可重试。
+        #[tokio::test]
+        async fn send_failed_resolve_releases_inflight() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Error(codes::STALE_GENERATION));
+            let pending = pending_with(once_card("ix-1"));
+            let sender = permission_sender(&fake, &pending, &store);
+
+            let failed = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &permission_action("ix-1", "once-id-9"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(failed.state, ActionState::SendFailed);
+            assert_eq!(failed.reason_code.as_deref(), Some(codes::STALE_GENERATION));
+            assert!(!pending.inflight("ix-1"), "确证零写必须释放在途");
+
+            fake.set_reply(Reply::Body(accepted_body()));
+            let retry = sender
+                .execute(
+                    &ctx("a-2"),
+                    &target(),
+                    &permission_action("ix-1", "once-id-9"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry.state, ActionState::Accepted);
+            assert_eq!(resolve_envelopes(&fake).len(), 2, "恰一帧/次，无自动重发");
+        }
+
+        /// 闸开启但未装配 pending 端口：`not_ready` 且零帧零行零审计。
+        #[tokio::test]
+        async fn gate_open_without_pending_port_is_not_ready_zero_frames() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let sender =
+                CommandSender::with_timeout(fake.clone(), store.clone(), Duration::from_millis(20))
+                    .with_capabilities(enabled_approval());
+
+            let error = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &permission_action("ix-1", "once-id-9"),
+                )
+                .await
+                .expect_err("no pending port can prove the card exists");
+            assert_eq!(error.code, "not_ready");
+            assert_eq!(fake.wire(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert!(audits(&store).is_empty());
+        }
+
+        /// 闸收回后重放已存储的动作：仍回既有回执（同 actionId 幂等优先于闸的
+        /// 开启状态）；只有**新**动作在闸关闭时才 `needs_evidence`。
+        #[tokio::test]
+        async fn gate_closed_replay_returns_stored_receipt() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = pending_with(once_card("ix-1"));
+            let action = permission_action("ix-1", "once-id-9");
+            let open = permission_sender(&fake, &pending, &store);
+            let first = open
+                .execute(&ctx("a-1"), &target(), &action)
+                .await
+                .expect("enabled approval");
+            assert_eq!(first.state, ActionState::Accepted);
+
+            let frames_after_first = fake.wire();
+            let rows_after_first = row_count(&store);
+            // 闸收回后的派发器：同一持久库、同一 pending 端口，不调用 with_capabilities。
+            let closed =
+                CommandSender::with_timeout(fake.clone(), store.clone(), Duration::from_millis(20))
+                    .with_pending(pending.clone());
+            let replay = closed
+                .execute(&ctx("a-1"), &target(), &action)
+                .await
+                .expect("stored receipt must be replayed even with the gate closed");
+            assert_eq!(replay, first, "同 actionId 同载荷必须回既有回执");
+            assert_eq!(fake.wire(), frames_after_first, "重放零新帧");
+            assert_eq!(row_count(&store), rows_after_first, "重放零新行");
+
+            // 新 actionId 仍被闸拦下：零帧零行。
+            let blocked = closed
+                .execute(
+                    &ctx("a-2"),
+                    &target(),
+                    &permission_action("ix-1", "once-id-9"),
+                )
+                .await
+                .expect_err("new actions stay closed");
+            assert_eq!(blocked.code, "needs_evidence");
+            assert_eq!(fake.wire(), frames_after_first, "关闭闸零新帧");
+            assert_eq!(row_count(&store), rows_after_first, "关闭闸零新行");
+        }
+
         /// 已消费/已撤的旧卡：零新帧，绝不复用另一个 actionId 重发。
         #[tokio::test]
         async fn stale_permission_card_is_zero_frames() {
@@ -4602,8 +4905,13 @@ mod tests {
                 .unwrap()
             });
             assert_eq!(summary, "permission options=1");
+            let audit_rows = audits(&store);
             assert!(
-                audits(&store)
+                !audit_rows.is_empty(),
+                "审批必须真的写过审计（空表上的 all() 是空洞的真）"
+            );
+            assert!(
+                audit_rows
                     .iter()
                     .all(|row| row.summary == "permission options=1"),
                 "审计摘要只含类别与选项数"

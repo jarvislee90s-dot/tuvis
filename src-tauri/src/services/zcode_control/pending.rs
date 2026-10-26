@@ -354,12 +354,12 @@ pub fn build_user_answer(pending: &PendingView, answers: &[AnswerEntry]) -> ZRes
 
 /// fullAccess 特权选项 id（探针 `PERMISSION_FULL_ACCESS_OPTION_ID`，
 /// 固定源码 `snapshot.ts:234`）：无论宿主给的 kind 是什么都硬闸拒绝。
-pub const PERMISSION_FULL_ACCESS_OPTION_ID: &str = "fullAccess";
+const PERMISSION_FULL_ACCESS_OPTION_ID: &str = "fullAccess";
 
 /// 可回传的权限选项 kind 白名单（探针 `pickPermissionOption` 的 once/deny 闭集）。
-pub const PERMISSION_ALLOW_ONCE_KIND: &str = "allowOnce";
+const PERMISSION_ALLOW_ONCE_KIND: &str = "allowOnce";
 /// 拒绝型权限选项 kind（一次性拒绝，不是常驻授权）。
-pub const PERMISSION_DENY_KIND: &str = "deny";
+const PERMISSION_DENY_KIND: &str = "deny";
 
 /// 按宿主原值构造 `resolveInteraction.answer` 的权限应答（T5；纯映射，不落盘）。
 ///
@@ -373,7 +373,7 @@ pub const PERMISSION_DENY_KIND: &str = "deny";
 /// - optionId 必须非空且**精确属于本卡**，且本卡选项 id 无重复（歧义 → `forbidden_option`）；
 /// - `fullAccess` 特权项无论 kind 一律拒绝（`forbidden_option`）——绝不走宿主
 ///   resolveFullAccess 特权分支；
-/// - 只放行宿主 kind 白名单 [`PERMISSION_ALLOW_ONCE_KIND`] / [`PERMISSION_DENY_KIND`]；
+/// - 只放行宿主 kind 白名单 `PERMISSION_ALLOW_ONCE_KIND` / `PERMISSION_DENY_KIND`；
 ///   `allowAlways`（常驻授权）/ `allow_session` / `allow_project` / `custom` 及未知
 ///   kind 一律拒绝（`forbidden_option`）。
 ///

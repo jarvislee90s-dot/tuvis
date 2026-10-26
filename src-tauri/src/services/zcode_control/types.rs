@@ -294,8 +294,10 @@ pub struct AnswerEntry {
 
 /// 统一控制动作（tagged `kind`；**全部**携 `sessionId,generation`）。
 ///
-/// 已接入 `Send`/`Answer`/`Snooze`/`Stop`；其余变体在 `CommandSender::execute` 一律
-/// `invalid_action` 且零帧零写（不伪造成功），由 T5–T6 逐个分支接入。
+/// 已接入 `Send`/`Answer`/`Snooze`/`Stop`/`Permission`；`Selection` 仍未接入，在
+/// `CommandSender::execute` 一律 `invalid_action` 且零帧零写（不伪造成功）。
+/// `Permission` 另受能力闸（默认关闭 → `needs_evidence`），且需要 pending 端口
+/// （未装配 → `not_ready`；已存储的同 actionId 重放不受闸影响）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ControlAction {
