@@ -8,6 +8,7 @@
 //! 内部 cause 不得自动 Debug 到日志（[`ZcodeError`] 因此不携带 cause）。
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -922,6 +923,50 @@ impl CapabilityPolicy {
     }
 }
 
+/// 宿主运行时证据：APP build 探针 + 本轮运行真实观测到的握手/协议/schema 事实。
+///
+/// 这是**唯一**把运行时事实喂给 [`CapabilityPolicy::for_host`] 的载体：桥在
+/// hello 校验通过、有效 conversation 快照/增量应用成功后才置位对应标志；
+/// 未知（未 bind / 已 `invalidate`）= `None`/`false`，绝不猜测兼容。
+///
+/// 证据只证明协议面可读：即使四项全部匹配，[`Self::policy`] 也只返回
+/// [`CapabilityPolicy::production_unverified`]（八项全关）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostEvidence {
+    /// 宿主 APP build（macOS `Info.plist`；非 macOS 或读不到 = `None`）。
+    pub app_build: Option<String>,
+    /// 已校验的 v4 wire 协议版本（hello 前 = `None`）。
+    pub protocol_version: Option<u32>,
+    /// 已成功应用过有效 conversation schema 帧。
+    pub schema_known: bool,
+    /// 已通过 `helloConversationV4` 的 kind/协议/connectionId 校验。
+    pub hello_known: bool,
+}
+
+impl HostEvidence {
+    /// 按本证据调用 [`CapabilityPolicy::for_host`]（缺失项按未知/未识别处理）。
+    pub fn policy(&self) -> CapabilityView {
+        CapabilityPolicy::for_host(
+            self.app_build.as_deref().unwrap_or(""),
+            self.protocol_version.unwrap_or(0),
+            self.schema_known,
+            self.hello_known,
+        )
+    }
+}
+
+/// 宿主 APP build 探针（生产 = `host::installed_zcode_build`；测试注入固定值）。
+///
+/// 每次调用现读（不缓存）：APP 升级/卸载立即反映为 `None` 或新 build，
+/// 绝不让启动时的旧值长期冒充当前宿主。
+pub type HostBuildProbe = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// 能力策略的**唯一**现算源（会话能力矩阵与执行闸共用同一实例）。
+///
+/// 生产由 `BridgeManager::host_evidence().policy()` 提供；测试注入动态开关，
+/// 验证「矩阵翻转」与「执行闸翻转」来自同一来源。
+pub type CapabilitySource = Arc<dyn Fn() -> CapabilityView + Send + Sync>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1057,84 @@ mod tests {
                 fixture,
                 CapabilityPolicy::for_host(KNOWN_BUILD, KNOWN_PROTOCOL, true, true)
             );
+        }
+    }
+
+    mod host_evidence {
+        use super::*;
+
+        fn assert_all_closed(view: &CapabilityView) {
+            for flag in [
+                &view.send,
+                &view.single_select,
+                &view.multi_select,
+                &view.free_text,
+                &view.interrupt,
+                &view.approval_reply,
+                &view.model,
+                &view.thought_level,
+            ] {
+                assert!(!flag.enabled, "宿主证据不得开启任何生产能力");
+                assert_eq!(flag.reason_code.as_deref(), Some(codes::NEEDS_EVIDENCE));
+            }
+        }
+
+        #[test]
+        fn default_evidence_is_unknown_and_closed() {
+            let evidence = HostEvidence::default();
+            assert_eq!(evidence.app_build, None);
+            assert_eq!(evidence.protocol_version, None);
+            assert!(!evidence.schema_known);
+            assert!(!evidence.hello_known);
+            assert_eq!(evidence.policy(), CapabilityView::default());
+            assert_all_closed(&evidence.policy());
+        }
+
+        #[test]
+        fn policy_delegates_to_for_host_contract() {
+            // 已知宿主四要素齐全：仍全关（for_host 语义不变，没有生产能力放行）。
+            let evidence = HostEvidence {
+                app_build: Some(EVIDENCED_APP_BUILD.to_owned()),
+                protocol_version: Some(EVIDENCED_PROTOCOL_VERSION),
+                schema_known: true,
+                hello_known: true,
+            };
+            assert_eq!(
+                evidence.policy(),
+                CapabilityPolicy::for_host(
+                    EVIDENCED_APP_BUILD,
+                    EVIDENCED_PROTOCOL_VERSION,
+                    true,
+                    true
+                )
+            );
+            assert_eq!(evidence.policy(), CapabilityPolicy::production_unverified());
+            assert_all_closed(&evidence.policy());
+        }
+
+        #[test]
+        fn missing_runtime_flags_stay_closed() {
+            for (schema_known, hello_known, protocol_version) in [
+                (true, true, None),
+                (true, false, Some(EVIDENCED_PROTOCOL_VERSION)),
+                (false, true, Some(EVIDENCED_PROTOCOL_VERSION)),
+            ] {
+                let evidence = HostEvidence {
+                    app_build: Some(EVIDENCED_APP_BUILD.to_owned()),
+                    protocol_version,
+                    schema_known,
+                    hello_known,
+                };
+                assert_all_closed(&evidence.policy());
+            }
+            // 未知 build（读取成功但非取证构建）同样只缺证据，不是兼容放行。
+            let unknown_build = HostEvidence {
+                app_build: Some("9.9.9.9999".to_owned()),
+                protocol_version: Some(EVIDENCED_PROTOCOL_VERSION),
+                schema_known: true,
+                hello_known: true,
+            };
+            assert_all_closed(&unknown_build.policy());
         }
     }
 }

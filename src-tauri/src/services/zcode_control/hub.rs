@@ -32,7 +32,7 @@ use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
 use super::relay::{DeviceRoute, RelayClient, RelayEvent, RelayLag};
 use super::types::{
-    codes, ActionContext, ActionReceipt, BoundTarget, CapabilityPolicy, CapabilityView,
+    codes, ActionContext, ActionReceipt, BoundTarget, CapabilitySource, CapabilityView,
     ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind, SessionView,
     TargetKey, ZResult, ZcodeError,
 };
@@ -47,13 +47,10 @@ const EVENT_CAPACITY: usize = 64;
 /// 置位 lag 并触发投影失效，消费方绝不把旧缓存当权威）。
 const RELAY_EVENT_CAPACITY: usize = 64;
 
-/// 生产宿主证据基线：本分支**没有**宿主 APP build / wire 协议 / schema / hello 的
-/// 运行时取证来源（`tests/fixtures/zcode-official-bridge/contract.json`
-/// `production.knownGaps` 已登记）。因此下发给手机的会话能力矩阵一律以「未知宿主」
-/// 调用 [`CapabilityPolicy::for_host`]：未经 live 验收前，生产不得声称已取证构建，
-/// 八项能力恒为全关（原因码 `needs_evidence`）。
-const UNVERIFIED_HOST_BUILD: &str = "";
-const UNVERIFIED_HOST_PROTOCOL: u32 = 0;
+/// 把静态矩阵包装成现算源（测试/固定夹具；生产源来自桥的宿主证据）。
+fn static_policy_source(policy: CapabilityView) -> CapabilitySource {
+    Arc::new(move || policy.clone())
+}
 
 /// Hub 依赖的窄后端端口（测试注入 fake；生产 [`PartsBackend`]）。
 ///
@@ -171,7 +168,9 @@ pub struct PartsBackend {
     relay: Arc<RelayClient>,
     bridge: Arc<BridgeManager>,
     sender: Arc<CommandSender>,
-    policy: CapabilityView,
+    /// 能力策略的**唯一**现算源：`bridge.host_evidence().policy()`。
+    /// 会话矩阵（Hub）与执行闸（CommandSender）共用同一实例，禁止各存一份快照。
+    policy_source: CapabilitySource,
     /// 投影代际：`reset`/重新连接/冲突时单调推进，保证 `BridgeManager::invalidate`
     /// 一定生效（事件泵与后端共用同一个计数器）。
     projection_generation: Arc<AtomicU64>,
@@ -188,10 +187,15 @@ impl PartsBackend {
         let relay = Arc::new(RelayClient::new(auth.clone(), events));
         let lag = relay.lag_watcher();
         let bridge = Arc::new(BridgeManager::new(relay.clone()));
-        let policy = CapabilityView::default();
+        // 单一策略源：桥的运行时证据（build/hello/协议/schema）→ for_host。
+        // sender 与会话 DTO 共用同一 source：证据变化后两边同时翻转。
+        let policy_source: CapabilitySource = {
+            let bridge = bridge.clone();
+            Arc::new(move || bridge.host_evidence().policy())
+        };
         let sender = Arc::new(
             CommandSender::new(bridge.clone(), store)
-                .with_capabilities(policy.clone())
+                .with_capability_source(policy_source.clone())
                 .with_pending(bridge.clone())
                 .with_stop(bridge.clone())
                 .with_selection(bridge.clone()),
@@ -202,12 +206,17 @@ impl PartsBackend {
                 relay,
                 bridge,
                 sender,
-                policy,
+                policy_source,
                 projection_generation: Arc::new(AtomicU64::new(0)),
             },
             events_rx,
             lag,
         )
+    }
+
+    /// Hub 与会话能力矩阵使用的同一策略源（clone 只复制 `Arc`，不是矩阵快照）。
+    fn policy_source(&self) -> CapabilitySource {
+        self.policy_source.clone()
     }
 
     /// 事件泵的桥端（与后端共用同一个 `BridgeManager` 与投影代际）。
@@ -298,7 +307,8 @@ impl HubBackend for PartsBackend {
     }
 
     fn policy(&self) -> CapabilityView {
-        self.policy.clone()
+        // 现算（不是构造时快照）：运行时证据变化立即反映到 Hub 闸门与手机矩阵。
+        (self.policy_source)()
     }
 }
 
@@ -618,7 +628,8 @@ impl Drop for CloseGuard {
 pub struct ZcodeHub {
     store: DeviceStore,
     backend: Arc<dyn HubBackend>,
-    policy: CapabilityView,
+    /// 与 [`PartsBackend`] 共用的能力策略现算源：会话矩阵与执行闸同源。
+    policy_source: CapabilitySource,
     events: broadcast::Sender<ControlEvent>,
     inner: Arc<Mutex<Inner>>,
     /// 连接单飞：并发 `connect` 只让一个真正开始新连接，其余复用当前视图。
@@ -636,13 +647,14 @@ impl ZcodeHub {
     /// （`BridgeManager` 会 spawn 出站 actor）。
     pub fn new(store: DeviceStore) -> Self {
         let (parts, relay_events, lag) = PartsBackend::production(store.clone());
-        let policy = parts.policy();
+        // 生产唯一来源：桥的运行时证据 → `CapabilityPolicy::for_host`。
+        let policy_source = parts.policy_source();
         let bridge = parts.pump_bridge();
         let backend: Arc<dyn HubBackend> = Arc::new(parts);
         Self::assemble(
             store,
             backend,
-            policy,
+            policy_source,
             Some((relay_events, bridge, Some(lag))),
         )
     }
@@ -657,7 +669,17 @@ impl ZcodeHub {
         backend: Arc<dyn HubBackend>,
         policy: CapabilityView,
     ) -> Self {
-        Self::assemble(store, backend, policy, None)
+        Self::assemble(store, backend, static_policy_source(policy), None)
+    }
+
+    /// 测试专用：注入**动态**策略源，验证会话矩阵与执行闸来自同一来源。
+    #[doc(hidden)]
+    pub fn with_parts_and_policy_source(
+        store: DeviceStore,
+        backend: Arc<dyn HubBackend>,
+        policy_source: CapabilitySource,
+    ) -> Self {
+        Self::assemble(store, backend, policy_source, None)
     }
 
     /// 事件泵测试构造（fake relay 通道 + fake bridge；零网络；无 lag 观察口）。
@@ -669,7 +691,12 @@ impl ZcodeHub {
         events: mpsc::Receiver<RelayEvent>,
         bridge: Arc<dyn BridgePump>,
     ) -> Self {
-        Self::assemble(store, backend, policy, Some((events, bridge, None)))
+        Self::assemble(
+            store,
+            backend,
+            static_policy_source(policy),
+            Some((events, bridge, None)),
+        )
     }
 
     /// 事件泵测试构造 + Data 溢出观察口（验证 lag → 投影失效接线）。
@@ -682,19 +709,24 @@ impl ZcodeHub {
         bridge: Arc<dyn BridgePump>,
         lag: RelayLag,
     ) -> Self {
-        Self::assemble(store, backend, policy, Some((events, bridge, Some(lag))))
+        Self::assemble(
+            store,
+            backend,
+            static_policy_source(policy),
+            Some((events, bridge, Some(lag))),
+        )
     }
 
     fn assemble(
         store: DeviceStore,
         backend: Arc<dyn HubBackend>,
-        policy: CapabilityView,
+        policy_source: CapabilitySource,
         pump: Option<PumpParts>,
     ) -> Self {
         let hub = Self {
             store,
             backend,
-            policy,
+            policy_source,
             events: broadcast::channel(EVENT_CAPACITY).0,
             inner: Arc::new(Mutex::new(Inner {
                 generation: 0,
@@ -899,25 +931,29 @@ impl ZcodeHub {
         self.events.subscribe()
     }
 
-    /// 本 Hub 的能力矩阵（默认全关）。
-    pub fn policy(&self) -> &CapabilityView {
-        &self.policy
+    /// 本 Hub 当前能力矩阵（现算；与执行闸同一个 source）。
+    pub fn policy(&self) -> CapabilityView {
+        self.current_policy()
     }
 
-    /// 下发给手机的会话能力矩阵：宿主证据基线 + 本会话/本代际的有效验收许可。
+    /// 当前策略的唯一读取点：会话矩阵与 [`Self::check_policy`] 共用。
     ///
-    /// 基线恒为「未知宿主」组合的全关矩阵（见 [`UNVERIFIED_HOST_BUILD`]）；证据构建
-    /// 下再叠加本会话/本代际**尚未消费且未过期**的许可（每项只放宽一次动作）。不跨
-    /// 会话、不跨代际、不缓存：许可被消费/过期/换代后，下一次 `session()` GET 立即
-    /// 回到全关。普通构建没有许可册，行为恒为全关。
+    /// 生产 source = `BridgeManager::host_evidence().policy()`（build/hello/协议/
+    /// schema 运行时证据 → `CapabilityPolicy::for_host`）；测试可注入动态开关。
+    fn current_policy(&self) -> CapabilityView {
+        (self.policy_source)()
+    }
+
+    /// 下发给手机的会话能力矩阵：当前策略 + 本会话/本代际的有效验收许可。
+    ///
+    /// 基线**就是** [`Self::current_policy`]（与 `execute` 的能力闸同一来源），不再
+    /// 另读一份「未知宿主」硬编码策略；证据构建下再叠加本会话/本代际**尚未消费且
+    /// 未过期**的许可（每项只放宽一次动作）。不跨会话、不跨代际、不缓存：许可被
+    /// 消费/过期/换代后，下一次 `session()` GET 立即回到当前策略。普通构建没有许可
+    /// 册，行为恒为当前策略（生产默认全关）。
     fn session_capabilities(&self, session_id: &str, generation: u64) -> CapabilityView {
         #[allow(unused_mut)]
-        let mut view = CapabilityPolicy::for_host(
-            UNVERIFIED_HOST_BUILD,
-            UNVERIFIED_HOST_PROTOCOL,
-            false,
-            false,
-        );
+        let mut view = self.current_policy();
         #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
         {
             for capability in self.evidence.armed_capabilities(session_id, generation) {
@@ -1229,9 +1265,9 @@ impl ZcodeHub {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
         view.generation = generation;
-        // 能力矩阵：宿主证据基线（未知宿主 → 全关）叠加本会话/本代际仍有效的验收
-        // 许可（仅 debug 证据构建）。每次 GET 现算：策略或许可变化（消费/过期/换代）
-        // 在下一次 `session()` 立即可见——手机按该字段硬门。
+        // 能力矩阵：与 `execute` 闸同一现算源（生产 = 桥的宿主证据）叠加本会话/
+        // 本代际仍有效的验收许可（仅 debug 证据构建）。每次 GET 现算：策略或许可
+        // 变化（消费/过期/换代）在下一次 `session()` 立即可见——手机按该字段硬门。
         view.capabilities = self.session_capabilities(&view.session_id, generation);
         self.lock().last_session = Some(view.clone());
         self.emit_session(&view);
@@ -1319,10 +1355,12 @@ impl ZcodeHub {
     /// 被许可放宽的能力名，供 `CommandSender` 的同级闸放行同一动作。普通构建没有
     /// 许可册，能力关闭即拒绝，行为与旧版完全一致。
     fn check_policy(&self, action: &ControlAction) -> ZResult<Vec<&'static str>> {
+        // 与 `session_capabilities` 同一现算源：手机矩阵与执行闸不允许不同步。
+        let policy = self.current_policy();
         let mut required: Vec<(&'static str, &super::types::CapabilityFlag, Option<&str>)> =
             Vec::new();
         match action {
-            ControlAction::Send { .. } => required.push(("send", &self.policy.send, None)),
+            ControlAction::Send { .. } => required.push(("send", &policy.send, None)),
             // snooze 只暂停本机卡的自动结束计时，无语义能力位；它是许可的一次
             // **辅助**操作：首次 snooze 把本会话/本代际的许可绑到该题，不消费。
             ControlAction::Snooze { interaction_id, .. } => {
@@ -1355,25 +1393,23 @@ impl ZcodeHub {
                     .iter()
                     .any(|answer| answer.selected_values.len() > 1);
                 let (name, flag) = if free {
-                    ("free_text", &self.policy.free_text)
+                    ("free_text", &policy.free_text)
                 } else if multi {
-                    ("multi_select", &self.policy.multi_select)
+                    ("multi_select", &policy.multi_select)
                 } else {
-                    ("single_select", &self.policy.single_select)
+                    ("single_select", &policy.single_select)
                 };
                 required.push((name, flag, Some(interaction_id)));
             }
             ControlAction::Permission { interaction_id, .. } => required.push((
                 "approval_reply",
-                &self.policy.approval_reply,
+                &policy.approval_reply,
                 Some(interaction_id),
             )),
-            ControlAction::Stop { .. } => {
-                required.push(("interrupt", &self.policy.interrupt, None))
-            }
+            ControlAction::Stop { .. } => required.push(("interrupt", &policy.interrupt, None)),
             ControlAction::Selection { .. } => {
-                required.push(("model", &self.policy.model, None));
-                required.push(("thought_level", &self.policy.thought_level, None));
+                required.push(("model", &policy.model, None));
+                required.push(("thought_level", &policy.thought_level, None));
             }
         }
         #[cfg_attr(
@@ -2452,14 +2488,22 @@ mod tests {
         }
     }
 
-    /// 默认（普通构建 / 证据构建未发放许可）：会话能力矩阵全关。
+    /// 默认策略（生产未知宿主 / 静态全关夹具）：会话能力矩阵全关。
     ///
-    /// 刻意让 Hub 内部策略显式开着 `send`（`paired_hub`）：会话 DTO 的手机硬门
-    /// **不得**复用 Hub 内部策略，必须走宿主证据基线（未知宿主 → 全关）。
+    /// 会话 DTO 的基线就是执行闸的同一 `current_policy()`：默认 source 全关时，
+    /// 手机矩阵不得出现任何开闸项。
     #[tokio::test]
     async fn session_capabilities_are_closed_by_default() {
         let fake = Arc::new(FakeBackend::default());
-        let hub = paired_hub(fake).await;
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
         let view = hub
             .session(&TargetKey {
                 session_id: "sess_synthetic0000".into(),
@@ -2468,6 +2512,69 @@ mod tests {
             .unwrap();
         assert!(view.ready, "只读投影本身必须就绪");
         assert_capabilities_closed(&view.capabilities);
+    }
+
+    /// 同一动态策略源同时喂会话矩阵与执行闸：翻转开/关，两者同步变化。
+    #[tokio::test]
+    async fn session_matrix_and_execute_gate_share_one_policy_source() {
+        use std::sync::atomic::AtomicBool;
+
+        let open = Arc::new(AtomicBool::new(false));
+        let flag = open.clone();
+        let source: CapabilitySource = Arc::new(move || {
+            if flag.load(Ordering::SeqCst) {
+                send_policy()
+            } else {
+                CapabilityView::default()
+            }
+        });
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts_and_policy_source(
+            stored(URL),
+            fake.clone(),
+            source,
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let generation = hub.connection().generation;
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+
+        // ① 全关：矩阵关 + 闸拒绝（零绑定零执行）。
+        let closed = hub.session(&key).await.expect("会话投影应可读");
+        assert_capabilities_closed(&closed.capabilities);
+        let refused = hub
+            .execute(ctx("policy-source-closed-1"), send_action(generation))
+            .await
+            .unwrap_err();
+        assert!(refused.is(codes::NEEDS_EVIDENCE));
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+
+        // ② 翻转开：会话矩阵与 execute 闸同时放行。
+        open.store(true, Ordering::SeqCst);
+        let opened = hub.session(&key).await.expect("会话投影应可读");
+        assert!(opened.capabilities.send.enabled);
+        assert_eq!(opened.capabilities.send.reason_code, None);
+        let receipt = hub
+            .execute(ctx("policy-source-open"), send_action(generation))
+            .await
+            .expect("同一 source 开闸后 execute 必须放行");
+        assert_eq!(receipt.state, ActionState::Accepted);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+
+        // ③ 翻转回全关：矩阵与闸同时收回，下一次动作零执行。
+        open.store(false, Ordering::SeqCst);
+        let closed_again = hub.session(&key).await.expect("会话投影应可读");
+        assert_capabilities_closed(&closed_again.capabilities);
+        let refused = hub
+            .execute(ctx("policy-source-closed-2"), send_action(generation))
+            .await
+            .unwrap_err();
+        assert!(refused.is(codes::NEEDS_EVIDENCE));
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
     }
 
     // ---------------------------------------------------------------------
@@ -3072,7 +3179,7 @@ mod tests {
         // 生产链构造：只装配零件与空转事件泵，不取 token、不开 WS、不广播。
         let production = ZcodeHub::new(stored(URL));
         assert_eq!(production.connection().state, ConnectionState::NeedsAuth);
-        assert_eq!(production.policy(), &CapabilityView::default());
+        assert_eq!(production.policy(), CapabilityView::default());
         assert!(production.subscribe().try_recv().is_err());
     }
 
