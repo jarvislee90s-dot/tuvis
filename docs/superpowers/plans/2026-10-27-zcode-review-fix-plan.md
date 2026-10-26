@@ -36,7 +36,7 @@
 | 5 | 一般 | 待修 | 问答能力按客户端 `selectedValues` 数量挑单选/多选（`hub.rs:1046-1070`），未看宿主题型；混合题只查一项 | 以宿主 pending 卡题型推导**全部**所需能力（每题单选/多选/自由文本），逐项过闸；客户端声明只做形状校验 | 多选卡只传 1 个值不得借单选许可；混合题缺任一能力即拒 |
 | 6 | 一般 | 已审已提交 `0b5e5dda` | `Hub::execute` 先 `control_generation`/`check_policy`，而持久幂等查询在 `CommandSender` 内部（`hub.rs:953-985`） | 代际判定后先做只读幂等识别（device+session+generation+kind+hash），命中直接返回既有回执（不发 Action 事件）；冲突先上抛；未命中再判连接/许可/新投递 | Hub needs_auth 重放/冲突/stale-first；真实 ActionStore accepted/unknown 取回且零帧零行零审计；换载荷/跨设备/换代 conflict |
 | 7 | 一般 | 已审已提交 `89c61231` | 关停用 5s `timeout` 等待 `hub.disconnect()`（`remote/mod.rs:751-770`）；`disconnect` 先等 `connect_lock`（`hub.rs:863-880`），超时取消清理，在途 connect 仍可成功 | 两段式：`begin_disconnect` 同步推进代际/Offline/`relay_floor`/`closing`（`CloseGuard` 按 epoch 归属、Drop 兜底）；`finish` 立即取消后端→等锁→再断→清位；remote 同步 begin + detached finish，timeout 只停止等待；`settle_if_current` 封死 settle 竞态 | connect 持锁时立即 Offline、旧 connect stale；超时清理继续；取消/重复 begin 不永久锁死；closing 窗旧 relay State 不回写 |
-| 8 | 一般 | 待修 | relay 状态/数据事件用 `try_send` 静默丢（`relay.rs:609,698,729,742`）；Data 丢失无显式失效，GET 可能继续读旧投影 | 终态 State 必达（不丢）；Data 溢出显式标记投影失效并通知 Hub；GET 不得返回错误缓存 | 队列满丢终态 → Hub 不会永久 paired；Data 溢出 → 投影 ready=false，GET 不返回旧缓存 |
+| 8 | 一般 | 已审已提交 `ba43b6f7` | relay 状态/数据事件用 `try_send` 静默丢（`relay.rs:609,698,729,742`）；Data 丢失无显式失效，GET 可能继续读旧投影 | State 终态-critical：满队时 `send().await` 无超时（不丢，承认可能阻塞 Data/心跳）；Data 保持 `try_send`，满队置 `RelayLag` 唤醒 Hub；Hub 作废桥投影、降级 `last_session`、GET 重新 bind | State 队列满→disconnect 背压且 Offline 必达；Data burst→lag 置位、actor 不卡；Hub lag→invalidate+ready=false；旧 bridgeSessionId 迟到帧不复活 |
 | 9 | 一般 | 待修 | 问答 UI 的选中值与自由文本互不清除（`ZcodeControlPanel.tsx:231-235,307-343`），同题同时提交两类答案 | 选选项清同题 freeText/sensitiveRef；输入自由文本清同题 picked；敏感引用同步清理 | 先选后输入/先输入后选，提交只含一类答案；敏感输入切换后旧值不提交 |
 | 10 | 一般 | 待修 | 设置卡只在挂载与按钮操作后 `refreshConnection`（`ZcodeRemoteSettingsCard.tsx:147-150,177-200`），无异步状态源 | 挂载期间轮询/焦点或可见性刷新连接态；不改变按钮语义 | 外部进入 paired/offline/conflict 后卡片在有限时间内更新，重连按钮恢复可用 |
 | 11 | 交付缺口 | 待修 | Hub 固定未知宿主常量（`hub.rs:47-53,688-699`），`CapabilityPolicy::for_host` 无运行时输入；`session_capabilities` 与实际执行门各用一套策略 | 采集 wire 协议/hello/schema（桥握手）＋宿主 build（本地来源）；统一策略源同时供 session 能力矩阵与执行门（含 CommandSender） | 合成宿主证据进入后，策略构造函数被实际调用；未知/升级仍全关 |
@@ -83,3 +83,8 @@
   首轮审查判定需修（closing 无主/永久锁死、旧 relay State 回写）→ 修复后
   scoped re-review 0 Critical/Important（3 Minor：needs_* 同步窗口、relay_floor 直接
   用例、弱 bounded 用例）→ hub 29/0、remote 5/0；提交 `89c61231`。
+- #8 队列语义：RED（State 队列满时 Offline 被丢；lag 不触发失效）→ State 无超时
+  背压 + RelayLag + Hub invalidate/降级；首轮审查指出 diff 为 RED 快照、文档“有界”
+  不实、Hub GET 断言假阳性 → 修正文档、换真实断言、补 Closed 与旧桥帧用例 →
+  scoped re-review 可提交（2 Minor 注释已修）→ relay 37/0、hub 30/0、bridge 50/0；
+  提交 `ba43b6f7`。
