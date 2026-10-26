@@ -40,7 +40,7 @@
 | 9 | 一般 | 已审已提交 `10080c13` | 问答 UI 的选中值与自由文本互不清除（`ZcodeControlPanel.tsx:231-235,307-343`），同题同时提交两类答案 | 选选项清同题 freeText/sensitiveRef；输入自由文本清同题 picked；提交兜底有文本则 selectedValues=[] | 先选后输入/先输入后选，提交只含一类；敏感输入点选项后旧值清空且不上行 |
 | 10 | 一般 | 已审已提交 `1a0453c1` | 设置卡只在挂载与按钮操作后 `refreshConnection`（`ZcodeRemoteSettingsCard.tsx:147-150,177-200`），无异步状态源 | 挂载期 1.5s 轮询 + focus/visibility 刷新；in-flight 改 trailing 合并；可注入 `statusPollMs`（默认 1500）供测试；只写 connection，不碰草稿/config | 外部 paired→offline→conflict 卡片更新、connect 可用性恢复；精确计数用例用 60s 窗脱敏；trailing 合并用例 |
 | 11 | 交付缺口 | 已审已提交 `de25937e` | Hub 固定未知宿主常量（`hub.rs:47-53,688-699`），`CapabilityPolicy::for_host` 无运行时输入；`session_capabilities` 与实际执行门各用一套策略 | 新增 `HostEvidence`/`HostBuildProbe`；macOS 读 Info.plist build（非 macOS None）；桥在 hello 校验/有效 schema 应用后置位、invalidate 清零；`PartsBackend` 单一 `CapabilitySource` 同喂 Hub 矩阵/闸与 CommandSender（现算）；删除未知宿主硬编码 | bridge 证据置位/清零/坏帧不置位；Hub 动态 source 翻转时矩阵与 execute 同步；CommandSender 审批闸现算；plist 解析；3 条行为 RED |
-| 12 | 交付缺口 | 待修 | T8.1 缺完整生产假链：现有 loopback 只到 auth/WS/data/bridge bootstrap/ready-hello；无 CommandSender send/回执/审计经 Hub+HTTP | 在 loopback 假官方端上组装真实 `AuthService/RelayClient/codec/BridgeManager/CommandSender/Hub/HTTP`，跑通发送、回执、审计与关键失败 | 成功链 + 幂等重试/能力关闭/断线/溢出等失败场景（不手推 SSE、不改结果变量） |
+| 12 | 交付缺口 | 已审已提交 `3d85d4bb` | T8.1 缺完整生产假链：现有 loopback 只到 auth/WS/data/bridge bootstrap/ready-hello；无 CommandSender send/回执/审计经 Hub+HTTP | 在 loopback 假官方端上组装真实 `AuthService/RelayClient/codec/BridgeManager/CommandSender/Hub/router/RemoteState/SSE`；假体仅官方端点；4 例成功+失败 | SSE 首帧 paired、真实 bind/快照 ready、真实 session/action SSE；send 恰一帧、accepted 回执、账本+审计无正文；断链重放零新请求/账本/审计；rejected/malformed 终态不重发；默认全关 bind 前 409 零副作用 |
 
 ### 未提交补测的处置
 
@@ -112,3 +112,10 @@
   复现（send 被绑死/缺项未整单失败）→ 证据构建 hub 47/0、evidence 7/0；普通 hub 36/0；
   审查可提交（Minor：旧全量入口无调用方仍公开、两条集成用例未走到 limited 失败分支、
   时间采样早于取锁）→ 提交 `d8d92fa5`。
+- #12 全链：`production_test` 复用已授权真实 AuthService + 回环端点，
+  `mark_authorized_for_test` 只跳过二次 OAuth；wire_e2e 扩 fake WS send ACK/命令日志/
+  conversation snapshot + RemoteState/SSE 夹具。4 例：成功 send/回执/账本/审计/SSE +
+  断链重放零新增；rejected/malformed 终态不重发；默认全关 bind 前 409 零副作用。
+  RED 删除 send ACK 后 receipt=unknown；新 4 例 5 轮稳定、wire_e2e 9/0、zcode_control
+  351/0、fmt/check all-targets 0；审查可提交（2 条非阻塞：重放整份 WS 日志已补断言、
+  test 授权落定与生产 authorize 有重复手抄）→ 提交 `3d85d4bb`。
