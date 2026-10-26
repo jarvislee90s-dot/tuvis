@@ -54,6 +54,10 @@ fn stale_pending() -> ZcodeError {
     ZcodeError::of(codes::STALE_PENDING)
 }
 
+fn forbidden_option() -> ZcodeError {
+    ZcodeError::of(codes::FORBIDDEN_OPTION)
+}
+
 /// 单会话 pending 册（绑定 sessionId + 连接代际）。
 #[derive(Debug, Clone)]
 pub struct PendingBook {
@@ -346,6 +350,67 @@ pub fn build_user_answer(pending: &PendingView, answers: &[AnswerEntry]) -> ZRes
     root.insert("action".to_owned(), Value::from("accept"));
     root.insert("content".to_owned(), Value::Object(payload));
     Ok(Value::Object(root))
+}
+
+/// fullAccess 特权选项 id（探针 `PERMISSION_FULL_ACCESS_OPTION_ID`，
+/// 固定源码 `snapshot.ts:234`）：无论宿主给的 kind 是什么都硬闸拒绝。
+pub const PERMISSION_FULL_ACCESS_OPTION_ID: &str = "fullAccess";
+
+/// 可回传的权限选项 kind 白名单（探针 `pickPermissionOption` 的 once/deny 闭集）。
+pub const PERMISSION_ALLOW_ONCE_KIND: &str = "allowOnce";
+/// 拒绝型权限选项 kind（一次性拒绝，不是常驻授权）。
+pub const PERMISSION_DENY_KIND: &str = "deny";
+
+/// 按宿主原值构造 `resolveInteraction.answer` 的权限应答（T5；纯映射，不落盘）。
+///
+/// 形状钉固定探针 `buildPermissionAnswer`（`interactionBridge.ts:509-528`）与决策
+/// §8.10：应答值是 `{optionId: <宿主原值>}`，**绝不**把 kind 名（`allowOnce`/`deny`）
+/// 硬编码成真正下发的 optionId。`ControlAction::Permission` 不携带自由文本，因此
+/// 本函数不产出 `freeText`（探针的可选字段在没有正文时不写）。
+///
+/// 冻结闸（任何一条不满足都零 value，绝不猜测）：
+/// - 只答 `kind=permission` 的卡（userInput / workspaceHookReview → `invalid_answer`）；
+/// - optionId 必须非空且**精确属于本卡**，且本卡选项 id 无重复（歧义 → `forbidden_option`）；
+/// - `fullAccess` 特权项无论 kind 一律拒绝（`forbidden_option`）——绝不走宿主
+///   resolveFullAccess 特权分支；
+/// - 只放行宿主 kind 白名单 [`PERMISSION_ALLOW_ONCE_KIND`] / [`PERMISSION_DENY_KIND`]；
+///   `allowAlways`（常驻授权）/ `allow_session` / `allow_project` / `custom` 及未知
+///   kind 一律拒绝（`forbidden_option`）。
+///
+/// 本函数**不**读改会话权限模式、不写账本正文：选项原值只穿过返回值上 wire。
+pub fn build_permission_answer(pending: &PendingView, option_id: &str) -> ZResult<Value> {
+    if pending.kind != PendingKind::Permission {
+        return Err(invalid_answer());
+    }
+    if option_id.is_empty() {
+        return Err(invalid_answer());
+    }
+    // fullAccess 特权项：无论宿主 kind（甚至卡内不存在该项）都硬闸拒绝。
+    if option_id == PERMISSION_FULL_ACCESS_OPTION_ID {
+        return Err(forbidden_option());
+    }
+    // 同一 optionId 重复 = 歧义卡：无法证明回传的是哪个选项，整卡拒绝。
+    let mut seen = BTreeSet::new();
+    for option in &pending.options {
+        if !seen.insert(option.option_id.as_str()) {
+            return Err(forbidden_option());
+        }
+    }
+    // optionId 必须精确属于本卡；绝不按 label/相似度猜，也不回退到第一个选项。
+    let option = pending
+        .options
+        .iter()
+        .find(|option| option.option_id == option_id)
+        .ok_or_else(forbidden_option)?;
+    // kind 是白名单依据：只放行一次性放行/拒绝；常驻与未知 kind 一律拒绝。
+    match option.kind.as_str() {
+        PERMISSION_ALLOW_ONCE_KIND | PERMISSION_DENY_KIND => {}
+        _ => return Err(forbidden_option()),
+    }
+    // ControlAction::Permission 不携带自由文本：应答恰好只有一个 optionId 键。
+    let mut answer = Map::new();
+    answer.insert("optionId".to_owned(), Value::from(option_id));
+    Ok(Value::Object(answer))
 }
 
 /// 解析 control：`activeWorks` 必须是数组；任何元素形状不符 → `None`（未知，不猜）。
@@ -1229,5 +1294,138 @@ mod tests {
         assert!(!serde_json::to_string(pending)
             .expect("serialize pending")
             .contains("机密文本"));
+    }
+
+    // -----------------------------------------------------------------------
+    // T5：审批既有卡的应答映射（合成夹具，不读真实账号/DB）
+    // -----------------------------------------------------------------------
+
+    fn permission_view(interaction_id: &str, options: &[(&str, &str, &str)]) -> PendingView {
+        PendingView {
+            interaction_id: interaction_id.to_owned(),
+            kind: PendingKind::Permission,
+            anchor_row_id: Some(31),
+            tool_call_id: Some("call_synthetic_3101".to_owned()),
+            created_at: Some(1_700_000_000_100),
+            summary: Some("synthetic: write a scratch file".to_owned()),
+            tool_name: Some("Write".to_owned()),
+            schema_interaction: None,
+            sensitive: false,
+            auto_resolution: false,
+            auto_resolution_state: None,
+            questions: Vec::new(),
+            options: options
+                .iter()
+                .map(|(option_id, label, kind)| PermissionOptionView {
+                    option_id: (*option_id).to_owned(),
+                    label: (*label).to_owned(),
+                    kind: (*kind).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn permission_answer_preserves_custom_option_ids() {
+        // optionId 是宿主原值：kind 只是白名单依据，绝不把 "allowOnce"/"deny"
+        // 当成真正的 optionId 下发。
+        let card = permission_view(
+            "pi-synthetic-3101",
+            &[
+                ("once-id-9", "Allow once", "allowOnce"),
+                ("deny-id-7", "Deny", "deny"),
+            ],
+        );
+
+        let allow = build_permission_answer(&card, "once-id-9").expect("allowOnce option");
+        assert_eq!(allow["optionId"], json!("once-id-9"));
+        assert_eq!(
+            allow.as_object().expect("answer object").len(),
+            1,
+            "ControlAction::Permission 不带自由文本：不得虚构 freeText"
+        );
+        assert_eq!(allow, json!({ "optionId": "once-id-9" }));
+
+        let deny = build_permission_answer(&card, "deny-id-7").expect("deny option");
+        assert_eq!(deny["optionId"], json!("deny-id-7"));
+    }
+
+    #[test]
+    fn permission_answer_rejects_full_access_regardless_of_kind() {
+        // fullAccess 特权项即使被宿主标成 allowOnce（或卡内根本没有该项）也硬闸。
+        let card = permission_view(
+            "pi-synthetic-3102",
+            &[
+                ("fullAccess", "Full access", "allowOnce"),
+                ("once-id-9", "Allow once", "allowOnce"),
+            ],
+        );
+        let error = build_permission_answer(&card, "fullAccess")
+            .expect_err("fullAccess is never answerable");
+        assert!(error.is(codes::FORBIDDEN_OPTION));
+    }
+
+    #[test]
+    fn permission_answer_rejects_standing_and_unknown_kinds() {
+        for (option_id, kind) in [
+            ("always-id", "allowAlways"),
+            ("session-id", "allow_session"),
+            ("project-id", "allow_project"),
+            ("custom-id", "custom"),
+            ("mystery-id", "whatever"),
+        ] {
+            let card = permission_view("pi-synthetic-3103", &[(option_id, "Standing", kind)]);
+            let error = build_permission_answer(&card, option_id)
+                .expect_err("standing/unknown permission kinds are never sent");
+            assert!(
+                error.is(codes::FORBIDDEN_OPTION),
+                "kind {kind} must be forbidden"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_answer_rejects_foreign_or_ambiguous_options() {
+        let card = permission_view(
+            "pi-synthetic-3104",
+            &[("once-id-9", "Allow once", "allowOnce")],
+        );
+        // 不在本卡上的 optionId（含字面 kind 名）一律零 value。
+        for foreign in ["once-id-other", "allowOnce", "deny", ""] {
+            let error = build_permission_answer(&card, foreign)
+                .expect_err("foreign option id is never answerable");
+            assert!(
+                error.is(codes::FORBIDDEN_OPTION) || error.is(codes::INVALID_ANSWER),
+                "foreign {foreign:?} must be rejected"
+            );
+        }
+
+        // 同一 optionId 重复 = 歧义卡：整卡拒绝，绝不猜第一条。
+        let ambiguous = permission_view(
+            "pi-synthetic-3105",
+            &[
+                ("once-id-9", "Allow once", "allowOnce"),
+                ("once-id-9", "Allow once (dup)", "allowOnce"),
+            ],
+        );
+        let error = build_permission_answer(&ambiguous, "once-id-9")
+            .expect_err("duplicate option ids are ambiguous");
+        assert!(error.is(codes::FORBIDDEN_OPTION));
+    }
+
+    #[test]
+    fn permission_answer_rejects_non_permission_card() {
+        let book = book_with(single_question_card());
+        let cards = book.pendings();
+        let error = build_permission_answer(&cards[0], "once-id-9")
+            .expect_err("userInput cards are not permission cards");
+        assert!(error.is(codes::INVALID_ANSWER));
+
+        // workspaceHookReview 同理：审批只认 kind=permission。
+        let mut hook = permission_view("pi-synthetic-3106", &[("once-id-9", "Allow", "allowOnce")]);
+        hook.kind = PendingKind::WorkspaceHookReview;
+        let error = build_permission_answer(&hook, "once-id-9")
+            .expect_err("hook review is read-only for approval");
+        assert!(error.is(codes::INVALID_ANSWER));
     }
 }

@@ -673,6 +673,16 @@ pub struct CapabilityView {
     pub thought_level: CapabilityFlag,
 }
 
+impl CapabilityView {
+    /// 审批应答闸（默认关闭）：`CommandSender` 对 `Permission` 动作的写前唯一读取点。
+    ///
+    /// 只有 T8.2 取得「Tuvis 发送 → 弹卡 → 应答」的实机证据后才会由证据层置
+    /// `enabled=true`；本任务只交付受测实现，不据此宣称 guarded 保护。
+    pub fn approval_reply_enabled(&self) -> bool {
+        self.approval_reply.enabled
+    }
+}
+
 impl Default for CapabilityView {
     /// 默认矩阵：全部关闭且 `reasonCode=needs_evidence`（不把宽泛 true 下发手机）。
     fn default() -> Self {
