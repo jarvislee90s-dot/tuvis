@@ -31,14 +31,14 @@
 | --- | --- | --- | --- | --- | --- |
 | 1 | 严重 | 已审已提交 `b94be0e0` | 物理分片去重只看 `messageSeq` 单调，首片即把 `last_message_seq` 推进（`bridge.rs:2526-2542`），同一逻辑消息后续物理分片被当重复丢弃 | 只丢弃**严格更旧**的 `messageSeq`；同值交给 `FrameAssembler` 按 `(messageSeq, fragmentIndex)` 去重/组装；物理 `seq` 重复/缺口仍由原检查负责 | 经 `BridgeManager::on_data` 注入同 `messageSeq`、递增 `seq` 的双物理分片，断言 ready/revision/pending、首片 0 ACK、整条恰好 1 ACK |
 | 2 | 严重 | 已审已提交 `0d36d516` | Hub 事件泵 `RelayEvent::Data` 只调 `bridge.on_data`，不发布 Session 事件（`hub.rs:585-588`） | `on_data` 同锁前后快照返回变化 `SessionView`；Hub 泵校验同代际+paired、覆写 Hub 代际、同会话沿用能力后锁外广播 Session | bridge：真实 `on_data` delta 恰返回 1 条变化视图、重放空；hub：FakePump 变化视图发布 Session（pending/control/能力/无变化不发） |
-| 3 | 严重 | 待修 | hook 连接事件只在 generation 增大时 `refresh()`（`useZcodeControl.ts` connection 分支）；同代 `waiting/needs_auth → paired` 不拉会话 | 连接态从非 paired 进入 paired（或首次 paired 且 session 为空）时静默重拉；snapshot 同规 | 手机先打开、桌面后连接，断言 session 由 null 变非空 |
+| 3 | 严重 | 已审已提交 `5c531b17` | hook 连接事件只在 generation 增大时 `refresh()`（`useZcodeControl.ts` connection 分支）；同代 `waiting/needs_auth → paired` 不拉会话 | 用已落地 ConnectionView（state+generation）判跃迁：同代首次进入 paired 也 refresh；换代保留清 session；重复 paired 不重拉；snapshot paired 无有效 session 也补拉 | 手机先打开（needs_auth + session GET 失败）、桌面同代 paired → session 非空；重复 paired 不增 GET |
 | 4 | 一般 | 待修 | `Snooze` 在 `check_policy` 直接 `return Ok(Vec::new())`（`hub.rs:1029-1045`）；`snooze_interaction` 返回值被忽略 | snooze 只允许：匹配的问答/审批能力已开启，或存在本会话/本代际可绑题许可；绑题失败即拒（零动作） | 能力全关 + 无许可时 snooze 拒绝；有合法许可时绑定成功；错题/过期拒绝 |
 | 5 | 一般 | 待修 | 问答能力按客户端 `selectedValues` 数量挑单选/多选（`hub.rs:1046-1070`），未看宿主题型；混合题只查一项 | 以宿主 pending 卡题型推导**全部**所需能力（每题单选/多选/自由文本），逐项过闸；客户端声明只做形状校验 | 多选卡只传 1 个值不得借单选许可；混合题缺任一能力即拒 |
 | 6 | 一般 | 已审已提交 `0b5e5dda` | `Hub::execute` 先 `control_generation`/`check_policy`，而持久幂等查询在 `CommandSender` 内部（`hub.rs:953-985`） | 代际判定后先做只读幂等识别（device+session+generation+kind+hash），命中直接返回既有回执（不发 Action 事件）；冲突先上抛；未命中再判连接/许可/新投递 | Hub needs_auth 重放/冲突/stale-first；真实 ActionStore accepted/unknown 取回且零帧零行零审计；换载荷/跨设备/换代 conflict |
 | 7 | 一般 | 已审已提交 `89c61231` | 关停用 5s `timeout` 等待 `hub.disconnect()`（`remote/mod.rs:751-770`）；`disconnect` 先等 `connect_lock`（`hub.rs:863-880`），超时取消清理，在途 connect 仍可成功 | 两段式：`begin_disconnect` 同步推进代际/Offline/`relay_floor`/`closing`（`CloseGuard` 按 epoch 归属、Drop 兜底）；`finish` 立即取消后端→等锁→再断→清位；remote 同步 begin + detached finish，timeout 只停止等待；`settle_if_current` 封死 settle 竞态 | connect 持锁时立即 Offline、旧 connect stale；超时清理继续；取消/重复 begin 不永久锁死；closing 窗旧 relay State 不回写 |
 | 8 | 一般 | 已审已提交 `ba43b6f7` | relay 状态/数据事件用 `try_send` 静默丢（`relay.rs:609,698,729,742`）；Data 丢失无显式失效，GET 可能继续读旧投影 | State 终态-critical：满队时 `send().await` 无超时（不丢，承认可能阻塞 Data/心跳）；Data 保持 `try_send`，满队置 `RelayLag` 唤醒 Hub；Hub 作废桥投影、降级 `last_session`、GET 重新 bind | State 队列满→disconnect 背压且 Offline 必达；Data burst→lag 置位、actor 不卡；Hub lag→invalidate+ready=false；旧 bridgeSessionId 迟到帧不复活 |
-| 9 | 一般 | 待修 | 问答 UI 的选中值与自由文本互不清除（`ZcodeControlPanel.tsx:231-235,307-343`），同题同时提交两类答案 | 选选项清同题 freeText/sensitiveRef；输入自由文本清同题 picked；敏感引用同步清理 | 先选后输入/先输入后选，提交只含一类答案；敏感输入切换后旧值不提交 |
-| 10 | 一般 | 待修 | 设置卡只在挂载与按钮操作后 `refreshConnection`（`ZcodeRemoteSettingsCard.tsx:147-150,177-200`），无异步状态源 | 挂载期间轮询/焦点或可见性刷新连接态；不改变按钮语义 | 外部进入 paired/offline/conflict 后卡片在有限时间内更新，重连按钮恢复可用 |
+| 9 | 一般 | 已审已提交 `10080c13` | 问答 UI 的选中值与自由文本互不清除（`ZcodeControlPanel.tsx:231-235,307-343`），同题同时提交两类答案 | 选选项清同题 freeText/sensitiveRef；输入自由文本清同题 picked；提交兜底有文本则 selectedValues=[] | 先选后输入/先输入后选，提交只含一类；敏感输入点选项后旧值清空且不上行 |
+| 10 | 一般 | 已审已提交 `1a0453c1` | 设置卡只在挂载与按钮操作后 `refreshConnection`（`ZcodeRemoteSettingsCard.tsx:147-150,177-200`），无异步状态源 | 挂载期 1.5s 轮询 + focus/visibility 刷新；in-flight 改 trailing 合并；可注入 `statusPollMs`（默认 1500）供测试；只写 connection，不碰草稿/config | 外部 paired→offline→conflict 卡片更新、connect 可用性恢复；精确计数用例用 60s 窗脱敏；trailing 合并用例 |
 | 11 | 交付缺口 | 已审已提交 `de25937e` | Hub 固定未知宿主常量（`hub.rs:47-53,688-699`），`CapabilityPolicy::for_host` 无运行时输入；`session_capabilities` 与实际执行门各用一套策略 | 新增 `HostEvidence`/`HostBuildProbe`；macOS 读 Info.plist build（非 macOS None）；桥在 hello 校验/有效 schema 应用后置位、invalidate 清零；`PartsBackend` 单一 `CapabilitySource` 同喂 Hub 矩阵/闸与 CommandSender（现算）；删除未知宿主硬编码 | bridge 证据置位/清零/坏帧不置位；Hub 动态 source 翻转时矩阵与 execute 同步；CommandSender 审批闸现算；plist 解析；3 条行为 RED |
 | 12 | 交付缺口 | 待修 | T8.1 缺完整生产假链：现有 loopback 只到 auth/WS/data/bridge bootstrap/ready-hello；无 CommandSender send/回执/审计经 Hub+HTTP | 在 loopback 假官方端上组装真实 `AuthService/RelayClient/codec/BridgeManager/CommandSender/Hub/HTTP`，跑通发送、回执、审计与关键失败 | 成功链 + 幂等重试/能力关闭/断线/溢出等失败场景（不手推 SSE、不改结果变量） |
 
@@ -93,3 +93,10 @@
   让 CI clippy -D warnings 红 → 加 cfg 后 bridge 53/0、hub 31/0、command 89/0、
   types 7/0、host 4/0、cargo check --all-targets 0 → 提交 `de25937e`。事件泵能力回落
   与“生产装配同 source”断言记为 Minor。
+- #3/#9/#10 前端：三项按 TDD 完成，vitest 53/53；#3 同代 paired 补拉、#9 选项/文本
+  双向互斥 + sensitive 清理、#10 挂载轮询。审查：#3/#9 可提交，分别提交 `5c531b17` /
+  `10080c13`；#10 首轮判定需修（in-flight 丢刷新、既有精确计数断言被轮询破坏/假阳性）
+  → trailing 合并 + 可注入 `statusPollMs`（既有精确计数用 60s 窗、轮询用 40ms）+ 新
+  trailing 回归用例 → scoped re-review 可提交（Minor：默认 1.5s 无直接用例、
+  `statusPollMs` 无下限钳制、卸载不取消在途读）→ settings 15/0、hook 12/0、panel 27/0；
+  提交 `1a0453c1`。
