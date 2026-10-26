@@ -867,3 +867,43 @@ ack-only 或新鲜快照确认。`model` / `thoughtLevel` 由 §8.7 补全为 tr
     `UNAVAILABLE:no-initial-control`，**零触发、零 stop**；基线只在确认后取。回归：
     `initial_control_must_be_confirmed_before_baseline`（ACK-only → pending-only
     snapshot → control 缺 activeWorks → 延迟 control 含 E → 基线含 E → 后续 E 被排除）。
+
+### 8.11 生产硬化状态与剩余缺口（T8.2，2026-10-26，HEAD `981ee02b`）
+
+> 触发：T8.2 代码完成后的验收收口。基线 `8e663f09`，分支
+> `codex/zcode-unified-remote`。完整逐项结果见
+> [生产验收报告](../reviews/2026-10-25-zcode-production-acceptance.md)。
+
+1. **能力闸默认全关（已落地）**：`CapabilityPolicy::for_host(appVersion, protocolVersion,
+   schemaKnown, helloKnown)` 只在 APP build `3.16.2.8769` + 协议 v3 + schema/hello 全部
+   识别时才认为宿主已取证；即便如此仍返回 `production_unverified()`（八项全关，
+   `needs_evidence`）。未知 build/协议/schema/hello 同样全关。生产装配当前直接使用
+   `CapabilityView::default()`；`for_host` 尚无运行时宿主元数据来源，开闸前必须接线。
+2. **证据许可仅 debug（已落地）**：`evidence.rs` 只在
+   `all(debug_assertions, feature="zcode-bridge-evidence")` 编译；release + 该 feature
+   由 `mod.rs` 的 `compile_error!` 拒绝。桌面专用 IPC
+   `zcode_control_arm_evidence(session, generation, capability)` 发放内存许可：
+   120,000ms 有效、一次动作消费、换代/关服务失效、snooze 首次绑题不消费、其他题不得
+   借用；目标/代际/pending/`fullAccess`/option kind 守卫全部原样执行。手机无发放入口，
+   许可不落 settings/DB/日志。回归覆盖单次与过期、换代失效、`fullAccess`/错目标拒绝、
+   snooze 绑题、release 编译门。
+3. **T8.1 loopback 缺口仍在（Important，未闭合）**：brief 要求的 loopback HTTP+WS
+   假官方端未交付；`PartsBackend` 的 `RelayClient ↔ BridgeManager ↔ CommandSender`
+   组合只有构造冒烟，进程内假体停在 `HubBackend`/`CommandPort` 边界。不得把 T8.1
+   描述为覆盖“整条生产链”；需补 loopback fake 或书面移交，二者必居其一。
+4. **T8.2 产品验收行全部 blocked/not_run**：当前无用户本人官方登录的专用测试会话、
+   无用户指定目标、无 Windows 主机，macOS 产品 UI 行与 Windows 全部行均未执行。
+   探针证据 B1–B4（B1 `…T105940Z-NarmSw`；B2 `…T132316Z-prItvw`；B3
+   `…T012945Z-aMtnqA`、`…T013128Z-X8HkPg`、approve `…T032425Z-K7I6ZA`、reject
+   `…T034803Z-noorSA`；B4 `…T025928Z-3WyTFA`、`…T030637Z-bS5dOg`）只证明该形态，
+   不替代产品验收：单选用例与 interrupt 仅 ACK（未观察宿主撤卡/执行停止），多选与
+   自由文本只有 fake/合同层，审批只证“应答既有卡”，`approvalForTerminalSend=false`
+   （terminal sendText 默认与 guarded 均不弹卡，4 轮负结果）。
+5. **开闸规则（本批定案）**：**任何能力都不得在没有“该宿主 + 该动作 + 该 APP build”
+   的实机产品证据时开闸**。合同 `capabilities` 的宽泛 `true`、探针 run、fake/合同层
+   结论均不能作为生产开闸依据；只能先经 debug 证据许可跑出产品证据，再最小更新
+   policy 并保留失败行的 `blocked`/`not_run`。`T5` 显示催卡负结果未消除前，
+   `approvalReply` 保持关闭；问答/打断终态、多选/自由文本、Windows、双手机、断线/
+   失效/互踢未跑前，整批只能标“部分实现/能力受限”，不得称 `spec_complete`。
+6. **边界**：本记录与验收报告不改 `docs/MASTER-PLAN.md`；不 push、不合并、不打 tag、
+   不发版；未开放任何生产能力，普通构建八项控制能力仍全部 `enabled=false`。
