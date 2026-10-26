@@ -26,6 +26,7 @@ pub mod config;
 pub mod pending;
 pub mod projection;
 pub mod relay;
+pub mod selection;
 pub mod types;
 
 pub use action::{
@@ -56,6 +57,7 @@ pub use config::{
 pub use relay::{
     DeviceRoute, RelayClient, RelayEvent, OFFICIAL_RELAY_WS_ORIGIN, OFFICIAL_RELAY_WS_PATH,
 };
+pub use selection::build_selection_command;
 pub use types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, AnswerEntry, BoundTarget,
     CapabilityFlag, CapabilityView, CommandPort, ConnectionState, ConnectionView, ControlAction,

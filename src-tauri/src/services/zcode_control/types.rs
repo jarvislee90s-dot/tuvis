@@ -294,8 +294,10 @@ pub struct AnswerEntry {
 
 /// 统一控制动作（tagged `kind`；**全部**携 `sessionId,generation`）。
 ///
-/// 已接入 `Send`/`Answer`/`Snooze`/`Stop`；其余变体在 `CommandSender::execute` 一律
-/// `invalid_action` 且零帧零写（不伪造成功），由 T5–T6 逐个分支接入。
+/// 已接入 `Send`/`Answer`/`Snooze`/`Stop`/`Permission`；`Selection` 仍未接入，在
+/// `CommandSender::execute` 一律 `invalid_action` 且零帧零写（不伪造成功）。
+/// `Permission` 另受能力闸（默认关闭 → `needs_evidence`），且需要 pending 端口
+/// （未装配 → `not_ready`；已存储的同 actionId 重放不受闸影响）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ControlAction {
@@ -507,18 +509,30 @@ pub const PENDING_CLEARED_POLL: Duration = Duration::from_millis(50);
 /// # 语义（生产实现保证）
 ///
 /// - `session`：返回该**精确目标**的投影视图（必要时先按只读方式重取快照）；
-///   目标未绑定 → `no_session`，代际前进/workspace 绑定不符 → `stale_generation`。
-///   绝不返回兄弟会话的视图，也绝不把多个会话的 control 合并。
+///   目标未绑定 → `no_session`，代际前进/workspace 绑定不符 → `stale_generation`，
+///   缺口/重订阅窗口内可返回 `not_ready`/`offline`（**瞬时**：调用方应继续轮询）。
+///   绝不返回兄弟会话的视图，也绝不把多个会话的 control 合并。`timeout` 是一次读
+///   的**硬预算**（生产实现把它分给内部重订阅 RPC，到期 → `not_ready`，绝不超窗）；
+///   有界等待因此是端到端的，调用方无需再外套取消式超时（那会绕过桥的 pending
+///   清理并可能让重订阅停在未激活态）。
 /// - `wait_stop_cleared`：有界轮询（每次判定在状态锁内完成、锁外 sleep，
 ///   ≤ [`STOP_CLEARED_POLL`]，绝不持锁 await）。**只有**该目标宿主 `revision`
-///   前进**且**该 execution id 已不在其 control 观测里才 `true`；超时、control
-///   仍未知（`None`）、投影不新鲜、目标换代/绑定消失 → `false`。
+///   前进**且**该 execution id 已不在其 control 观测里才 `true`；其余情形
+///   （control 仍未知 `None`、投影不新鲜、目标换代/绑定消失）一律轮询到期限后
+///   `false`——第一个「无证据」不是结论，但也绝不用兄弟会话/旧代际的证据确认。
 pub trait StopPort: Send + Sync {
     /// **精确目标**的会话投影（只读；不触发任何写命令）。
-    fn session<'a>(&'a self, target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>>;
+    ///
+    /// `timeout` 是本次读的硬上界：实现必须在预算内返回（含内部只读重订阅），
+    /// 到期以 `not_ready` 收口；不得把调用方拖过预算。
+    fn session<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        timeout: Duration,
+    ) -> BoxFuture<'a, ZResult<SessionView>>;
 
     /// 等**精确目标**的宿主停止终态：`revision` 前进**且**目标 execution 缺席 →
-    /// `true`；超时或等待期间目标换代/绑定消失 → `false`。
+    /// `true`；超时（含 control 未知/换代/绑定消失，轮询到期限）→ `false`。
     fn wait_stop_cleared<'a>(
         &'a self,
         target: &'a BoundTarget,
@@ -659,6 +673,16 @@ pub struct CapabilityView {
     pub approval_reply: CapabilityFlag,
     pub model: CapabilityFlag,
     pub thought_level: CapabilityFlag,
+}
+
+impl CapabilityView {
+    /// 审批应答闸（默认关闭）：`CommandSender` 对 `Permission` 动作的写前唯一读取点。
+    ///
+    /// 只有 T8.2 取得「Tuvis 发送 → 弹卡 → 应答」的实机证据后才会由证据层置
+    /// `enabled=true`；本任务只交付受测实现，不据此宣称 guarded 保护。
+    pub fn approval_reply_enabled(&self) -> bool {
+        self.approval_reply.enabled
+    }
 }
 
 impl Default for CapabilityView {
