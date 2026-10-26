@@ -100,6 +100,10 @@ interface PendingCardProps {
   capabilities: CapabilityView;
   /** 写面硬门原因（paired + ready）；null = 门开。陈旧投影绝不可点。 */
   gateReason: string | null;
+  /** 全局动作在途（hook.submitting）：在途期间作答/审批面一并禁用。 */
+  submitting: boolean;
+  /** 宿主会话投影修订号：变化 = 宿主已推进，受理锁定随新投影重开。 */
+  revision: number | null;
   submit: (action: ControlAction) => Promise<ActionReceipt>;
 }
 
@@ -110,6 +114,8 @@ function PendingCard({
   generation,
   capabilities,
   gateReason,
+  submitting,
+  revision,
   submit,
 }: PendingCardProps) {
   const [picked, setPicked] = useState<Record<string, string>>({});
@@ -119,16 +125,40 @@ function PendingCard({
   const inFlightRef = useRef(false);
   /** 敏感作答的即时值：失焦清可见态，提交仍能带上本次输入（仅内存，不落存储）。 */
   const sensitiveRef = useRef<Record<string, string>>({});
+  /**
+   * 本卡已受理/已生效的锁定：在宿主 pending/session 推进（revision 变化）前，
+   * 作答/审批面一律不可再点——同一份答案绝不换新 actionId 重发。
+   */
+  const [settledState, setSettledState] = useState<"accepted" | "confirmed" | null>(null);
+  const settledRef = useRef(false);
+  /** snooze POST 在途：提交禁用并显示「正在暂停计时」（不静默吞掉用户点击）。 */
+  const [snoozeInFlight, setSnoozeInFlight] = useState(false);
 
-  /** 一次动作一个在途槽：同帧重入直接丢弃，不产生第二个 actionId。 */
-  const submitOnce = (action: ControlAction) => {
-    if (inFlightRef.current) return;
+  // 宿主投影推进才解锁受理态；初始挂载（settled 为空）是幂等的。
+  useEffect(() => {
+    settledRef.current = false;
+    setSettledState(null);
+  }, [revision]);
+
+  /** 一次动作一个在途槽：同帧重入/受理后重入一律丢弃，不产生第二个 actionId。 */
+  const submitOnce = (action: ControlAction, onSettled?: () => void): boolean => {
+    if (inFlightRef.current || settledRef.current) return false;
     inFlightRef.current = true;
     void submit(action)
+      .then((receipt) => {
+        // snooze 只暂停计时，不锁卡；作答/审批的受理/生效才进入锁定态。
+        if (action.kind === "snooze") return;
+        if (receipt.state === "accepted" || receipt.state === "confirmed") {
+          settledRef.current = true;
+          setSettledState(receipt.state);
+        }
+      })
       .catch(() => {})
       .finally(() => {
         inFlightRef.current = false;
+        onSettled?.();
       });
+    return true;
   };
 
   const isPermission = pending.kind === "permission";
@@ -163,17 +193,24 @@ function PendingCard({
   const snoozeOnce = () => {
     if (gateReason !== null) return; // 陈旧投影不发 snooze（写面硬门）
     if (!pending.autoResolution || snoozedRef.current) return;
+    if (inFlightRef.current || settledRef.current) return;
     snoozedRef.current = true;
-    submitOnce({
-      kind: "snooze",
-      sessionId,
-      generation,
-      interactionId: pending.interactionId,
-    });
+    setSnoozeInFlight(true);
+    // 与最终提交共用卡片级在途槽；结束（无论成败）复位可见提示。
+    const started = submitOnce(
+      {
+        kind: "snooze",
+        sessionId,
+        generation,
+        interactionId: pending.interactionId,
+      },
+      () => setSnoozeInFlight(false)
+    );
+    if (!started) setSnoozeInFlight(false);
   };
 
   const submitAnswer = () => {
-    if (blocked !== null) return;
+    if (blocked !== null || submitting || settledRef.current || inFlightRef.current) return;
     const answers = pending.questions
       .map((question) => {
         // 敏感作答失焦后可见态已清空，提交取本次挂载的内存值（不落任何存储）。
@@ -217,9 +254,9 @@ function PendingCard({
             key={option.optionId}
             type="button"
             data-testid={`zcode-permission-option-${option.optionId}`}
-            disabled={blocked !== null}
+            disabled={blocked !== null || submitting || settledState !== null}
             onClick={() => {
-              if (blocked !== null) return;
+              if (blocked !== null || submitting || settledRef.current) return;
               submitOnce({
                 kind: "permission",
                 sessionId,
@@ -243,21 +280,29 @@ function PendingCard({
               <div className="mt-1 flex flex-wrap gap-1">
                 {question.options.map((option) => {
                   const index = optionIndex++;
+                  const selected = picked[question.questionText] === option.value;
                   return (
                     <button
                       key={option.value}
                       type="button"
                       data-testid={`zcode-pending-option-${index}`}
-                      disabled={blocked !== null || !flag.enabled}
+                      aria-pressed={selected}
+                      disabled={
+                        blocked !== null || submitting || settledState !== null || !flag.enabled
+                      }
                       onClick={() => {
-                        if (blocked !== null || !flag.enabled) return;
+                        if (blocked !== null || submitting || settledRef.current || !flag.enabled) {
+                          return;
+                        }
                         setPicked((prev) => ({
                           ...prev,
                           [question.questionText]: option.value,
                         }));
                         snoozeOnce();
                       }}
-                      className="rounded-lg border border-[var(--cb)] px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+                      className={`rounded-lg border px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40 ${
+                        selected ? "border-[var(--btnp)] bg-[var(--btnp)]/10" : "border-[var(--cb)]"
+                      }`}
                     >
                       {option.label}
                     </button>
@@ -269,7 +314,9 @@ function PendingCard({
                   type={pending.sensitive ? "password" : "text"}
                   data-testid={pending.sensitive ? "zcode-pending-sensitive-input" : undefined}
                   value={freeAnswers[question.questionText] ?? ""}
-                  disabled={blocked !== null || !capabilities.freeText.enabled}
+                  disabled={
+                    blocked !== null || !capabilities.freeText.enabled || settledState !== null
+                  }
                   onChange={(event) => {
                     if (blocked !== null || !capabilities.freeText.enabled) return;
                     const value = event.target.value;
@@ -297,7 +344,7 @@ function PendingCard({
         <button
           type="button"
           data-testid="zcode-pending-submit"
-          disabled={blocked !== null}
+          disabled={blocked !== null || submitting || settledState !== null}
           onClick={submitAnswer}
           className="mt-1 rounded-full bg-[var(--btnp)]/10 px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
         >
@@ -311,6 +358,24 @@ function PendingCard({
           className="mt-1 text-xs text-[var(--mut)]"
         >
           {blockedText}
+        </p>
+      )}
+      {blocked === null && settledState !== null && (
+        <p
+          data-testid="zcode-pending-notice"
+          data-state={settledState}
+          className="mt-1 text-xs text-[var(--mut)]"
+        >
+          {i18n.t(STATUS_KEYS[settledState])}
+        </p>
+      )}
+      {blocked === null && settledState === null && snoozeInFlight && (
+        <p
+          data-testid="zcode-pending-notice"
+          data-state="snoozing"
+          className="mt-1 text-xs text-[var(--mut)]"
+        >
+          {i18n.t("mobile.zcodeControl.pendingSnoozing")}
         </p>
       )}
     </div>
@@ -515,6 +580,8 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             generation={session.generation}
             capabilities={session.capabilities}
             gateReason={gateReason}
+            submitting={submitting}
+            revision={session.revision}
             submit={submit}
           />
         ))}

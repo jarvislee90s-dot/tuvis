@@ -2265,6 +2265,7 @@
       "modelAria": "模型",
       "thoughtAria": "思考强度",
       "pendingBlocked": "该作答形态暂未开放，请在终端处理",
+      "pendingSnoozing": "正在暂停计时…",
       "selectionBlocked": "模型/档位切换暂未开放，请在终端调整",
       "actionBlocked": "控制未就绪（连接未配对或会话未就绪），请在电脑端完成连接后再试",
       "interruptBlocked": "当前无法打断，请在终端处理"
