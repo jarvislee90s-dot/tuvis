@@ -515,24 +515,22 @@ export async function fetchSendInfo(sessionId: string): Promise<SendInfo | null>
 /**
  * ZCode 官方远控配置的手机侧读面（A5，设计 §4.2/§4.3/§5.1）。
  *
- * **三个面分开持有，绝不合并成一个「可用」布尔**：
+ * **两个面分开持有，绝不合并成一个「可用」布尔**：
  * - `readState`：本机配置**读到了没有**（checking / ok / failed）——读失败**不等于**
  *   未配置或删除（§4.3 最后一行：外跳只看到 Not Found 时 Tuvis 也无权据此判定）；
  * - `configState`：A4 的 wire 值（missing / saved / invalid）。`saved` 只表示**格式已
- *   校验并落库**，永不表示已联机；
- * - `connectionState`：官方连接态。**首版没有 ZCode 控制适配器 ⇒ 唯一可能值是
- *   needs_connection**；B 包（官方身份/relay 就绪）落地后才扩枚举，本文件不预先伪造
- *   其他值，也不由 configState 推导（两面证据源不同）。
+ *   校验并落库**，永不表示已联机。
+ *
+ * 官方连接态**不在本读面**：它只由 `ZcodeControlPanel` 通过官方
+ * `GET /m/api/v1/zcode/connection` 持有（T7.2）。本读面不预置 `needs_connection`
+ * 之类的占位字段——没有消费方的死字段只会诱导把「配置已保存」当「已连接」。
  *
  * 手机侧**没有写接口**（首版桌面编辑，设计 §4.2）：这里只有 GET。
  */
-export type ZcodeConnectionState = "needs_connection";
-
 export type ZcodeControlAvailability = {
   readState: "checking" | "ok" | "failed";
   /** readState=ok 时的本机配置态；其余为 null（不猜） */
   configState: ZcodeRemoteConfig["configState"] | null;
-  connectionState: ZcodeConnectionState;
   /** 官方远控链接（仅 saved 才有；invalid/missing/读失败恒 null——坏值不下发） */
   url: string | null;
 };
@@ -544,7 +542,6 @@ const zcodeAvailability = (
 ): ZcodeControlAvailability => ({
   readState,
   configState,
-  connectionState: "needs_connection",
   url,
 });
 

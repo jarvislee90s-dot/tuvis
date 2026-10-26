@@ -118,7 +118,8 @@ function PendingCard({
   revision,
   submit,
 }: PendingCardProps) {
-  const [picked, setPicked] = useState<Record<string, string>>({});
+  /** 每题的宿主选项原值集合：单选恒 0/1 个，多选按点击顺序累加（toggle 增删）。 */
+  const [picked, setPicked] = useState<Record<string, string[]>>({});
   const [freeAnswers, setFreeAnswers] = useState<Record<string, string>>({});
   const snoozedRef = useRef(false);
   /** 同帧双击闸：一次用户动作只允许一个在途 POST（actionId 不重复生成）。 */
@@ -165,12 +166,20 @@ function PendingCard({
   const isUserInput = pending.kind === "userInput";
   const flagFor = (question: QuestionView): CapabilityFlag =>
     question.multiSelect ? capabilities.multiSelect : capabilities.singleSelect;
+  // 仅 allowOnce/deny 可回传；fullAccess 及其他永久/未知 kind 不渲染。
+  const permissionOptions = pending.options.filter(
+    (option) => option.kind === "allowOnce" || option.kind === "deny"
+  );
 
   // 卡片级只展示首个关闭原因：阅读面照常，作答面禁用。
   // 写面硬门优先于能力矩阵：连接未配对 / 投影 ready=false → 全套作答面零写。
+  // 审批卡过滤后无可选 option（宿主只给 fullAccess/未知 kind）→ 一样要就地说明，
+  // 否则卡片只剩摘要、无按钮也无原因（用户只会以为卡坏了）。
   const capabilityBlocked: CapabilityFlag | null = isPermission
     ? capabilities.approvalReply.enabled
-      ? null
+      ? permissionOptions.length === 0
+        ? { enabled: false, reasonCode: "unsupported_protocol" }
+        : null
       : capabilities.approvalReply
     : isUserInput
       ? (pending.questions
@@ -219,7 +228,7 @@ function PendingCard({
           : freeAnswers[question.questionText];
         return {
           questionText: question.questionText,
-          selectedValues: picked[question.questionText] ? [picked[question.questionText]] : [],
+          selectedValues: picked[question.questionText] ?? [],
           freeText: value?.length ? value : null,
         };
       })
@@ -234,10 +243,8 @@ function PendingCard({
     });
   };
 
-  // 仅 allowOnce/deny 可回传；fullAccess 及其他永久/未知 kind 不渲染。
-  const permissionOptions = pending.options.filter(
-    (option) => option.kind === "allowOnce" || option.kind === "deny"
-  );
+  // 仅 allowOnce/deny 可回传（`permissionOptions` 已在能力闸处算好）；
+  // fullAccess 及其他永久/未知 kind 不渲染。
   let optionIndex = 0;
 
   return (
@@ -280,7 +287,7 @@ function PendingCard({
               <div className="mt-1 flex flex-wrap gap-1">
                 {question.options.map((option) => {
                   const index = optionIndex++;
-                  const selected = picked[question.questionText] === option.value;
+                  const selected = picked[question.questionText]?.includes(option.value) === true;
                   return (
                     <button
                       key={option.value}
@@ -294,10 +301,16 @@ function PendingCard({
                         if (blocked !== null || submitting || settledRef.current || !flag.enabled) {
                           return;
                         }
-                        setPicked((prev) => ({
-                          ...prev,
-                          [question.questionText]: option.value,
-                        }));
+                        setPicked((prev) => {
+                          const current = prev[question.questionText] ?? [];
+                          // 多选 = toggle（增删，保留点击顺序）；单选 = 替换为本次点击项。
+                          const next = question.multiSelect
+                            ? current.includes(option.value)
+                              ? current.filter((value) => value !== option.value)
+                              : [...current, option.value]
+                            : [option.value];
+                          return { ...prev, [question.questionText]: next };
+                        });
                         snoozeOnce();
                       }}
                       className={`rounded-lg border px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40 ${
@@ -391,16 +404,29 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const [officialUrl, setOfficialUrl] = useState<string | null>(null);
   /** 同帧双击闸：一次用户动作只允许一个在途 POST（双击不产生第二个 actionId）。 */
   const inFlightRef = useRef(false);
+  /** 最近一次 send 提交的原文：accepted 迟到时只清这份，不碰回执到达前续写的草稿。 */
+  const submittedDraftRef = useRef<string | null>(null);
+  /** 草稿即时值（effect 之外也要读最新值，避免闭包拿到旧草稿）。 */
+  const draftRef = useRef(draft);
 
   // 仅 send 的 accepted 允许清本次草稿（hook 语义）；失败/拒绝/未知一律保留。
+  // 迟到回执竞态：accepted 到达时若草稿已被续写成别的内容，那是**新**输入，必须保留——
+  // 只有草稿仍等于本次提交原文才清空（连点两次发送的场景由 hook 复位标记兜底）。
   useEffect(() => {
-    if (draftCleared) setDraft("");
+    if (!draftCleared) return;
+    const submitted = submittedDraftRef.current;
+    if (submitted !== null && draftRef.current === submitted) {
+      draftRef.current = "";
+      setDraft("");
+    }
   }, [draftCleared]);
 
   // 换会话清旧回执与旧草稿：上一次会话的受理状态不得贴到新会话。
   useEffect(() => {
     setReceipt(null);
     setDraft("");
+    draftRef.current = "";
+    submittedDraftRef.current = null;
   }, [sessionId]);
 
   // A5 基线「打开官方页面」的显式辅助入口：只读已保存链接（不自动打开、不代理点击）。
@@ -456,6 +482,8 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const handleSend = () => {
     if (!canSend || session === null || draft.trim().length === 0) return;
     if (inFlightRef.current) return;
+    // 记下本次提交原文：accepted 迟到时据此判断草稿是否仍是「同一份」。
+    submittedDraftRef.current = draft;
     runOnce({
       kind: "send",
       sessionId,
@@ -654,7 +682,10 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           aria-label={i18n.t("mobile.zcodeControl.draftAria")}
           value={draft}
           rows={2}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => {
+            draftRef.current = e.target.value;
+            setDraft(e.target.value);
+          }}
           placeholder={i18n.t("mobile.zcodeControl.draftPlaceholder")}
           className="min-h-0 flex-1 resize-none rounded-lg border border-[var(--cb)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none"
         />
