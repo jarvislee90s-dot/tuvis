@@ -1241,7 +1241,10 @@ impl StopPort for BridgeManager {
     }
 
     /// 有界轮询精确目标的停止终态：revision 前进**且**目标 execution 缺席才 `true`；
-    /// 目标换代/绑定消失/control 未知 → `false`。锁内判定、锁外 sleep，绝不持锁 await。
+    /// 其余情形（含 control 未知、投影不新鲜、目标换代/绑定消失）一律轮询到期限后
+    /// `false`——绝不拿兄弟会话/旧代际的证据确认，也不把第一个「无证据」当结论
+    /// （重同步/缺口期间恢复的已确认 control 仍可在窗前完成判定）。锁内判定、锁外
+    /// sleep，绝不持锁 await。
     fn wait_stop_cleared<'a>(
         &'a self,
         target: &'a BoundTarget,
@@ -1254,14 +1257,10 @@ impl StopPort for BridgeManager {
                 .checked_add(timeout)
                 .unwrap_or_else(Instant::now);
             loop {
-                match self.stop_observation(target, execution_id) {
-                    Some((revision, present)) => {
-                        if revision > baseline_revision && !present {
-                            return true;
-                        }
+                if let Some((revision, present)) = self.stop_observation(target, execution_id) {
+                    if revision > baseline_revision && !present {
+                        return true;
                     }
-                    // 无证据（未就绪/control 未知/目标换代）：绝不拿别的观察确认。
-                    None => return false,
                 }
                 let now = Instant::now();
                 if now >= deadline {
@@ -5680,6 +5679,161 @@ mod tests {
         assert!(
             waiter.await.expect("waiter task"),
             "advance + absent is confirmed by bounded polling"
+        );
+    }
+
+    /// control 未知不是结论：`wait_stop_cleared` 必须轮询到期限（首个 `None` 不提前
+    /// 返回），且等待中恢复的已确认 control 必须能完成判定。
+    #[tokio::test]
+    async fn wait_stop_cleared_polls_unknown_control_to_deadline() {
+        const EXEC: &str = "E-synthetic-stop-2";
+        const SUB: &str = "conv-sub-synthetic-1";
+        let mut without_control = conversation_snapshot(SESSION_A, 2, Vec::new());
+        without_control
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("control");
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(without_control),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let view = StopPort::session(manager.as_ref(), &target)
+            .await
+            .expect("session");
+        assert!(view.control.is_none(), "夹具必须是未知 control");
+        let baseline = view.revision.expect("host revision");
+
+        // ① 一直未知：false 只由期限给出（首个 None 不是结论）。
+        let started = Instant::now();
+        assert!(
+            !manager
+                .wait_stop_cleared(&target, EXEC, baseline, Duration::from_millis(80))
+                .await
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "unknown control 必须轮询到期限，不能首个 None 就返回"
+        );
+
+        // ② 等待中恢复已确认 control（目标不在场）且 revision 前进 → true。
+        let waiter = {
+            let manager = manager.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                manager
+                    .wait_stop_cleared(&target, EXEC, baseline, Duration::from_millis(600))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        push_control_delta_on(&peer, SESSION_A, SUB, 1, 2, Some(3), json!([])).await;
+        assert!(
+            waiter.await.expect("waiter task"),
+            "恢复的已确认 control 必须能完成判定"
+        );
+    }
+
+    /// 停止终态严格按**精确目标**取证：兄弟会话撤掉自己的执行不得确认本目标；
+    /// 本目标仍在 control 里（哪怕多了新执行）不得确认；只有原目标确已消失才确认。
+    #[tokio::test]
+    async fn wait_stop_cleared_is_target_scoped_for_stop() {
+        const EXEC_A: &str = "E-synthetic-stop-a";
+        const EXEC_B: &str = "E-synthetic-stop-b";
+        const NEW: &str = "E-synthetic-stop-new";
+        const SUB_A: &str = "conv-sub-synthetic-1";
+        const SUB_B: &str = "conv-sub-synthetic-2";
+        let config = PeerConfig {
+            workspaces: vec![
+                workspace_entry(WS_A, Some("ws-a-identity"), "A"),
+                workspace_entry(WS_B, Some("ws-b-identity"), "B"),
+            ],
+            tasks: vec![
+                task_row(WS_A, SESSION_A, "hi"),
+                task_row(WS_B, SESSION_B, "hi"),
+            ],
+            conversation_snapshot: Some(control_snapshot(SESSION_A, 2, &[EXEC_A])),
+            resync_snapshot: Some(control_snapshot(SESSION_B, 2, &[EXEC_B])),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let target_a = manager.bind(&key(SESSION_A)).await.expect("bind A");
+        let _target_b = manager.bind(&key(SESSION_B)).await.expect("bind B");
+        let baseline = StopPort::session(manager.as_ref(), &target_a)
+            .await
+            .expect("A session")
+            .revision
+            .expect("A revision");
+
+        // ① 兄弟会话（B）撤掉自己的执行：A 的目标仍在 → 不得确认（轮询到期限）。
+        push_control_delta_on(&peer, SESSION_B, SUB_B, 1, 2, Some(3), json!([])).await;
+        assert!(
+            !manager
+                .wait_stop_cleared(&target_a, EXEC_A, baseline, Duration::from_millis(60))
+                .await,
+            "other session's clear must not confirm A"
+        );
+        let view_a = StopPort::session(manager.as_ref(), &target_a)
+            .await
+            .expect("A session");
+        assert!(
+            view_a
+                .control
+                .expect("A control")
+                .active_works
+                .iter()
+                .any(|work| work.foreground_execution_id.as_deref() == Some(EXEC_A)),
+            "B 的帧不得污染 A 的 control"
+        );
+
+        // ② revision 前进、原目标仍在、场上多了新执行 → 不得确认。
+        push_control_delta_on(
+            &peer,
+            SESSION_A,
+            SUB_A,
+            1,
+            2,
+            Some(3),
+            json!([
+                {"kind": "primaryTurn", "foregroundExecutionId": EXEC_A},
+                {"kind": "primaryTurn", "foregroundExecutionId": NEW}
+            ]),
+        )
+        .await;
+        assert!(
+            !manager
+                .wait_stop_cleared(&target_a, EXEC_A, baseline, Duration::from_millis(60))
+                .await,
+            "revision advance with the target still observed must not confirm"
+        );
+
+        // ③ 原目标确已消失（新执行仍在场）且 revision 再前进 → 确认。
+        let waiter = {
+            let manager = manager.clone();
+            let target_a = target_a.clone();
+            tokio::spawn(async move {
+                manager
+                    .wait_stop_cleared(&target_a, EXEC_A, 3, Duration::from_millis(600))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        push_control_delta_on(
+            &peer,
+            SESSION_A,
+            SUB_A,
+            2,
+            3,
+            Some(4),
+            json!([{"kind": "primaryTurn", "foregroundExecutionId": NEW}]),
+        )
+        .await;
+        assert!(
+            waiter.await.expect("waiter task"),
+            "原目标确已消失时（即便新执行在场）必须确认"
         );
     }
 

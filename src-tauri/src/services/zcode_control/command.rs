@@ -42,13 +42,16 @@
 //! # 打断（T4.2 Slice B）
 //!
 //! `Stop` 只停「用户点击时新鲜 control 已观察到的既有前台执行」：`StopPort::session`
-//! 取精确目标视图 → [`authorize_stop`] → **写前重取**并复核 session/generation/id →
+//! 取精确目标视图（**拿不到已确认 control 时最多等 [`INITIAL_CONTROL_TIMEOUT`]
+//! 10s**，超时零 stop `not_ready`；显式 `[]` 立即按空闲拒绝）→ [`authorize_stop`] →
+//! **写前重取**并复核 session/generation/id →
 //! 写前才预留 → 恰一帧 `type=stop`、`payload={expectedForegroundExecutionId}`
 //! （[`AGENT_SEND_COMMAND_METHOD`] + 20s ACK 窗）。**永不**为打断合成 `sendText`，
 //! 无第二帧、无重试、无 CLI 降级。ACK accepted/duplicate 只算 `accepted`；noop
 //! （`guard.stopTargetChanged`）如实显示未停止；没有 accepted ACK 时即使宿主已清空
 //! 目标也停在 `unknown`。只有 ACK 后 [`CONFIRM_TIMEOUT`] 内观察到 control revision
-//! 前进**且**目标 id 缺席才升级 `confirmed`（新执行单独出现不算）。
+//! 前进**且**目标 id 缺席才升级 `confirmed`（新执行单独出现不算）。已受理后宿主
+//! 终态观察**轮询到期限**（首个「无证据」不是结论），绝不拿兄弟会话/旧代际确认。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,6 +92,14 @@ pub const ACK_TIMEOUT: Duration = Duration::from_secs(20);
 /// 应答 ACK 后等待宿主撤卡的观察窗（10s，探针 `INTERACTION_TERMINAL_WAIT_MS`）：
 /// 只有宿主 pending 代数前进且该 id 消失才升级 `confirmed`，否则停在 `accepted`。
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 打断时等待**已确认 control**（`activeWorks` 是数组）到达的有界窗（10s，生产计划
+/// T4.2 Step 3）：宿主 control 帧迟到/重订阅窗口内，用户点击最多等到窗前；
+/// 超时零 stop、`not_ready`（写没写出不可证 → 上游按保守 `unknown` 收口）。
+pub const INITIAL_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 等待已确认 control 的轮询间隔（50ms；有界、不忙等）。
+pub const INITIAL_CONTROL_POLL: Duration = Duration::from_millis(50);
 
 /// 单条正文的 UTF-8 字节预算。
 ///
@@ -256,6 +267,10 @@ pub struct CommandSender {
     stop: Option<Arc<dyn StopPort>>,
     /// 宿主撤卡观察窗（测试注入短窗；生产 [`CONFIRM_TIMEOUT`]）。
     confirm_timeout: Duration,
+    /// 未知 control 的有界等待窗（测试注入短窗；生产 [`INITIAL_CONTROL_TIMEOUT`]）。
+    initial_control_timeout: Duration,
+    /// 未知 control 的轮询间隔（生产 [`INITIAL_CONTROL_POLL`]）。
+    initial_control_poll: Duration,
 }
 
 impl CommandSender {
@@ -279,6 +294,8 @@ impl CommandSender {
             pending: None,
             stop: None,
             confirm_timeout: CONFIRM_TIMEOUT,
+            initial_control_timeout: INITIAL_CONTROL_TIMEOUT,
+            initial_control_poll: INITIAL_CONTROL_POLL,
         }
     }
 
@@ -298,6 +315,14 @@ impl CommandSender {
     #[cfg(test)]
     pub(crate) fn with_confirm_timeout(mut self, confirm_timeout: Duration) -> Self {
         self.confirm_timeout = confirm_timeout;
+        self
+    }
+
+    /// 注入未知 control 的等待窗与轮询间隔（测试专用：10s 用例不真等 10s）。
+    #[cfg(test)]
+    pub(crate) fn with_initial_control_wait(mut self, timeout: Duration, poll: Duration) -> Self {
+        self.initial_control_timeout = timeout;
+        self.initial_control_poll = poll;
         self
     }
 
@@ -618,8 +643,10 @@ impl CommandSender {
         let request = StopRequest {
             expected_foreground_execution_id: Some(expected_foreground_execution_id.clone()),
         };
-        // 新鲜 control（精确目标，必要时由端口只读重同步）：授权失败零帧零行。
-        let view = stop.session(target).await?;
+        // 新鲜 control（精确目标，必要时由端口只读重同步）：拿不到**已确认**
+        // control（`activeWorks` 是数组）时最多等 [`INITIAL_CONTROL_TIMEOUT`]；
+        // 超时零帧零行。授权失败同样零帧零行。
+        let view = self.wait_for_stop_control(stop.as_ref(), target).await?;
         authorize_stop_on(&view, target, &request)?;
         // 写前立即复核同一目标的 control：按钮已过时（执行换了/空闲/换代）→ 零 stop。
         let confirm_view = stop.session(target).await?;
@@ -652,6 +679,44 @@ impl CommandSender {
         }
         self.record(&receipt);
         Ok(receipt)
+    }
+
+    /// 等**已确认**的 control（`activeWorks` 是数组）到达：宿主 control 帧迟到/
+    /// 重订阅窗口内最多等 `initial_control_timeout`（生产 [`INITIAL_CONTROL_TIMEOUT`]）。
+    ///
+    /// - 已确认（含显式 `[]`）→ 立即返回视图（`[]` 由授权层给 `stale_pending`）；
+    /// - 一直未知 → 窗尽 `not_ready`（零 stop；上游按保守 `unknown` 收口）；
+    /// - 视图不再属于精确目标（兄弟会话/旧代际）→ 立即 `no_session` /
+    ///   `stale_generation`，绝不空转到窗尽、也绝不拿它授权。
+    ///
+    /// 轮询间隔 ≤ `initial_control_poll`（有界、不忙等）。
+    async fn wait_for_stop_control(
+        &self,
+        stop: &dyn StopPort,
+        target: &BoundTarget,
+    ) -> ZResult<SessionView> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.initial_control_timeout)
+            .unwrap_or_else(tokio::time::Instant::now);
+        loop {
+            let view = stop.session(target).await?;
+            // 端口契约保证视图属于精确目标；仍在此复核，绝不拿兄弟/旧代际视图等待或授权。
+            if view.session_id != target.session_id {
+                return Err(ZcodeError::of(codes::NO_SESSION));
+            }
+            if view.generation != target.generation {
+                return Err(ZcodeError::of(codes::STALE_GENERATION));
+            }
+            if view.control.is_some() {
+                return Ok(view);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(ZcodeError::of(codes::NOT_READY));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            tokio::time::sleep(self.initial_control_poll.min(remaining)).await;
+        }
     }
 
     /// 构造并**恰一次**调用 resolveInteraction 端口（channel/method/信封与探针一致）。
@@ -3019,6 +3084,8 @@ mod tests {
             sender(fake, store)
                 .with_stop(stop.clone())
                 .with_confirm_timeout(Duration::from_millis(50))
+                // 未知 control 的等待窗压到毫秒级（生产 10s）。
+                .with_initial_control_wait(Duration::from_millis(60), Duration::from_millis(5))
         }
 
         /// 出站帧按信封 `type` 过滤（只读观测）。
@@ -3394,6 +3461,141 @@ mod tests {
             );
             assert_eq!(stop.session_calls(), 2, "重放不得重新读取 control");
             assert_eq!(row_count(&store), 1);
+        }
+
+        /// 未知 control：最多等到有界窗（生产 10s），超时零 stop、`not_ready`
+        /// （上游按 `unknown` 收口——没有可证明零写的 stop），绝不立刻拒绝。
+        #[tokio::test]
+        async fn unknown_control_waits_then_zero_stop() {
+            assert_eq!(
+                INITIAL_CONTROL_TIMEOUT,
+                Duration::from_secs(10),
+                "生产等待窗必须 ≤10s"
+            );
+            let probe = CommandSender::new(
+                FakeBridge::new(Reply::Body(accepted_body())),
+                DeviceStore::memory(),
+            );
+            assert_eq!(
+                probe.initial_control_timeout, INITIAL_CONTROL_TIMEOUT,
+                "生产构造必须用 10s 等待窗"
+            );
+            assert_eq!(probe.initial_control_poll, INITIAL_CONTROL_POLL);
+
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::unknown();
+            let started = std::time::Instant::now();
+            let error = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap_err();
+
+            assert!(
+                error.is(codes::NOT_READY),
+                "等待窗耗尽如实回 not_ready，got {error:?}"
+            );
+            assert_eq!(
+                classify_port_error(&error).0,
+                ActionState::Unknown,
+                "未知 control 的等待超时是保守 unknown（没有任何写出的证据）"
+            );
+            assert!(
+                started.elapsed() >= Duration::from_millis(40),
+                "必须在窗前轮询，而不是首个未知视图就拒绝"
+            );
+            assert!(
+                stop.session_calls() >= 2,
+                "窗内必须反复读同一目标的 control，got {}",
+                stop.session_calls()
+            );
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert!(audits(&store).is_empty());
+        }
+
+        /// 未知 control 在窗外前变为已确认：照常授权并恰一帧 stop（仍零 sendText）。
+        #[tokio::test]
+        async fn unknown_control_becomes_confirmed_then_stops() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::sequence(vec![
+                view(None),
+                view(None),
+                view(Some(observed(&["E-existing"]))),
+            ]);
+            stop.set_wait_result(true);
+            let receipt = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Confirmed);
+            let stop_frames = envelopes_of_type(&fake, "stop");
+            assert_eq!(stop_frames.len(), 1, "全生命周期恰一帧");
+            assert_eq!(
+                stop_frames[0]["payload"]["expectedForegroundExecutionId"],
+                serde_json::json!("E-existing")
+            );
+            assert_eq!(
+                stop.session_calls(),
+                4,
+                "窗前两次未知 + 一次已确认 + 写前复核一次"
+            );
+            assert_eq!(envelopes_of_type(&fake, "sendText").len(), 0);
+            assert_eq!(row_count(&store), 1);
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("confirmed"));
+        }
+
+        /// stop 的 rejected ACK：如实 `Rejected`，不观察宿主终态、不重发。
+        #[tokio::test]
+        async fn rejected_ack_stays_rejected_without_host_observation() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({
+                "status": "rejected",
+            })));
+            let stop = FakeStop::observed(&["E-existing"]);
+            stop.set_wait_result(true);
+            let receipt = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Rejected);
+            assert_ne!(receipt.state, ActionState::Accepted);
+            assert_ne!(receipt.state, ActionState::Confirmed);
+            assert!(stop.wait_calls().is_empty(), "rejected 不是停止证明");
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 1, "拒绝后绝不重发");
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("rejected"));
+        }
+
+        /// 等待已确认 control 期间目标换代：立即零 stop（绝不拿旧代际视图授权，
+        /// 也不空转到窗尽）；端口在写前拒绝 = 可证零写（`send_failed`）。
+        #[tokio::test]
+        async fn mid_wait_generation_change_is_zero_stop() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let mut moved = view(None);
+            moved.generation = GEN + 1;
+            let stop = FakeStop::sequence(vec![view(None), moved]);
+            let error = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap_err();
+
+            assert!(
+                error.is(codes::STALE_GENERATION),
+                "换代必须如实拒绝，got {error:?}"
+            );
+            assert_eq!(
+                classify_port_error(&error).0,
+                ActionState::SendFailed,
+                "写前拒绝是可证零写（不是写后 unknown）"
+            );
+            assert_eq!(stop.session_calls(), 2, "第二次轮询即终止，不空转");
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert!(audits(&store).is_empty());
         }
     }
 }

@@ -511,14 +511,15 @@ pub const PENDING_CLEARED_POLL: Duration = Duration::from_millis(50);
 ///   绝不返回兄弟会话的视图，也绝不把多个会话的 control 合并。
 /// - `wait_stop_cleared`：有界轮询（每次判定在状态锁内完成、锁外 sleep，
 ///   ≤ [`STOP_CLEARED_POLL`]，绝不持锁 await）。**只有**该目标宿主 `revision`
-///   前进**且**该 execution id 已不在其 control 观测里才 `true`；超时、control
-///   仍未知（`None`）、投影不新鲜、目标换代/绑定消失 → `false`。
+///   前进**且**该 execution id 已不在其 control 观测里才 `true`；其余情形
+///   （control 仍未知 `None`、投影不新鲜、目标换代/绑定消失）一律轮询到期限后
+///   `false`——第一个「无证据」不是结论，但也绝不用兄弟会话/旧代际的证据确认。
 pub trait StopPort: Send + Sync {
     /// **精确目标**的会话投影（只读；不触发任何写命令）。
     fn session<'a>(&'a self, target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>>;
 
     /// 等**精确目标**的宿主停止终态：`revision` 前进**且**目标 execution 缺席 →
-    /// `true`；超时或等待期间目标换代/绑定消失 → `false`。
+    /// `true`；超时（含 control 未知/换代/绑定消失，轮询到期限）→ `false`。
     fn wait_stop_cleared<'a>(
         &'a self,
         target: &'a BoundTarget,
