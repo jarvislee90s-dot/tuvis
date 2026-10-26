@@ -112,8 +112,11 @@ interface ControlEventFrame {
   data: unknown;
 }
 
-/** 断流后的重连基线（毫秒）：线性退避，无上限（纠偏 GET 已先补状态）。 */
+/** 断流重连的指数退避：1s → 2s → 4s → 8s → 16s → 30s（封顶后维持 30s）。
+ *  每次断流只做**一次**纠偏 GET（连接 + 会话各一发），随后按本退避等待重连；
+ *  退避在「流恢复」时复位——任一帧落地即算恢复（服务端连上必先发 snapshot）。 */
 const SSE_RECONNECT_BASE_MS = 1000;
+const SSE_RECONNECT_MAX_MS = 30_000;
 
 export default function useZcodeControl(sessionId: string): UseZcodeControlResult {
   const [connection, setConnection] = useState<ConnectionView | null>(null);
@@ -226,6 +229,8 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
     let stopped = false;
     let source: EventSource | null = null;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    /** 下一次断流后的等待毫秒数（指数退避；流恢复即复位）。 */
+    let retryDelay = SSE_RECONNECT_BASE_MS;
 
     /** 解析并落地一帧；坏帧/残缺 DTO/旧代次/别的会话一律跳过（不断流）。 */
     const dispatch = (name: string, event: Event) => {
@@ -289,6 +294,10 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
 
     const connect = () => {
       if (stopped) return;
+      if (retryTimer) {
+        clearTimeout(retryTimer); // 单定时器纪律：同一时刻只允许一条待重连
+        retryTimer = null;
+      }
       let next: EventSource;
       try {
         next = new EventSource(zcodeEventsUrl(sessionId));
@@ -296,17 +305,30 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
         return; // 构造失败：GET 首拍仍权威，不做注定失败的退避
       }
       source = next;
-      next.addEventListener("snapshot", (e) => dispatch("snapshot", e));
-      next.addEventListener("connection", (e) => dispatch("connection", e));
-      next.addEventListener("session", (e) => dispatch("session", e));
-      next.addEventListener("action", (e) => dispatch("action", e));
-      next.addEventListener("resync", (e) => dispatch("resync", e));
+      // 帧即恢复证据：任一帧落地才把退避复位（连接刚建立但立刻再失败时不复位，
+      // 否则会退化成 1s 恒定的重连热循环）。
+      const handle = (name: string, event: Event) => {
+        if (stopped || source !== next) return; // 已换连接/已卸载：迟到帧作废
+        retryDelay = SSE_RECONNECT_BASE_MS;
+        dispatch(name, event);
+      };
+      next.addEventListener("snapshot", (e) => handle("snapshot", e));
+      next.addEventListener("connection", (e) => handle("connection", e));
+      next.addEventListener("session", (e) => handle("session", e));
+      next.addEventListener("action", (e) => handle("action", e));
+      next.addEventListener("resync", (e) => handle("resync", e));
       next.onerror = () => {
-        if (stopped) return;
-        next.close(); // 自管重连：断流后先 GET 纠偏，再按基线退避
-        if (source === next) source = null;
-        void refresh();
-        retryTimer = setTimeout(connect, SSE_RECONNECT_BASE_MS);
+        if (stopped || source !== next) return;
+        next.close(); // 自管重连：同一次断流只算一次（关流后不再收 error）
+        source = null;
+        void refresh(); // 一次断流 = 一次纠偏 GET（connection + session 各一发）
+        if (retryTimer) clearTimeout(retryTimer);
+        const delay = retryDelay;
+        retryDelay = Math.min(retryDelay * 2, SSE_RECONNECT_MAX_MS);
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          connect();
+        }, delay);
       };
     };
 
@@ -315,7 +337,10 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
       stopped = true;
       source?.close();
       source = null;
-      if (retryTimer) clearTimeout(retryTimer);
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
     };
   }, [sessionId, applyConnection, applySessionView, refresh]);
 
