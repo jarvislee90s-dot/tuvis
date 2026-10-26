@@ -12,8 +12,9 @@
 //!    早退——「会话在册但无存活进程」正是无头主场景；
 //! 2. **判定只有一个出口**：`route()` 的结论即真相，H3 门与端点分派经
 //!    [`headless_kind_of`] 读取，不得另立工具/形态表；
-//! 3. 其他工具（zcode / workbuddy / dsh / claude-kimi-opencode 无头、codex app-server）
-//!    的变体留在 PR #117 续作，不在此注册。
+//! 3. 其他工具（workbuddy / dsh / claude-kimi-opencode 无头、codex app-server）
+//!    的变体留在 PR #117 续作，不在此注册；**ZCode 不注册任何注入通道**——
+//!    只走官方控制接口（工具门 = `official_control_required`）。
 
 use crate::session::model::ProcessForm;
 
@@ -87,13 +88,18 @@ pub enum RouteOutcome {
 }
 
 /// 黑盒/另评工具（宪法附 A 矩阵）：WorkBuddy ❌、dsh ◐ 另评、OpenClaw ◐ gateway、
-/// ZCode 固定走无头（D6 在册限定，M11）。**Codex 不在此表**——它按形态分派。
+/// ZCode 改走官方控制接口（永不注入终端/CLI，M11 已退役）。**Codex 不在此表**——
+/// 它按形态分派。
 fn tool_gate(tool: &str) -> Option<(&'static str, String)> {
     match tool {
         "workbuddy" => Some(("blackbox", "WorkBuddy 黑盒，无外部写 API".into())),
         "dsh" => Some(("blackbox", "dsh 写通道另评（web API/插件生态）".into())),
         "openclaw" => Some(("blackbox", "OpenClaw 走 gateway，另评".into())),
-        "zcode" => Some(("headless_only", "ZCode 走无头通道（M11）".into())),
+        // 官方配对远控是唯一写通道：不注册 HeadlessKind、不落终端注入
+        "zcode" => Some((
+            "official_control_required",
+            "ZCode 需使用配对后的官方控制接口（不支持终端/无头注入）".into(),
+        )),
         _ => None,
     }
 }
@@ -230,13 +236,13 @@ mod tests {
         ));
     }
 
-    /// WorkBuddy 黑盒 / dsh 另评 / ZCode 走无头（M11）/ OpenClaw gateway 另评
+    /// WorkBuddy 黑盒 / dsh 另评 / ZCode 走官方控制接口 / OpenClaw gateway 另评
     #[test]
     fn tool_gates() {
         for (tool, code) in [
             ("workbuddy", "blackbox"),
             ("dsh", "blackbox"),
-            ("zcode", "headless_only"),
+            ("zcode", "official_control_required"),
             ("openclaw", "blackbox"),
         ] {
             let r = route(tool, cli(), 100, "macos");
@@ -245,6 +251,44 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    /// **ZCode 永不回退终端/CLI 注入**（M11 已退役）：任何形态/平台都判不可注入，
+    /// 原因码指向官方控制接口；绝不注册 ZCode HeadlessKind，也没有终端候选。
+    #[test]
+    fn zcode_never_falls_back_to_headless() {
+        for (form, pid, platform) in [
+            (cli(), 42, "macos"),
+            (cli(), 42, "windows"),
+            (app(), 42, "macos"),
+        ] {
+            let r = route("zcode", form, pid, platform);
+            let RouteOutcome::NotInjectable {
+                reason_code,
+                reason,
+            } = r.clone()
+            else {
+                panic!("ZCode 必须不可注入（无终端/CLI 回退）: {r:?}");
+            };
+            assert_eq!(
+                reason_code, "official_control_required",
+                "ZCode 原因码指向官方控制接口"
+            );
+            assert!(!reason_code.contains("headless_only"));
+            assert!(!reason.contains("M11"), "M11 已退役：{reason}");
+            assert!(!reason.contains("headless_only"), "不得再提无头通道");
+            // NotInjectable 无语义候选；终端候选恒空 = 不存在回退通道
+            assert!(!has_terminal_candidate(&r), "ZCode 不得有终端候选");
+            assert!(
+                headless_kind_of(&r).is_none(),
+                "不得为 ZCode 注册 HeadlessKind"
+            );
+        }
+        // pid=0 仍先判 no_process（不可注入、无回退），不构成可注入出口
+        let dead = route("zcode", cli(), 0, "macos");
+        assert!(matches!(dead, RouteOutcome::NotInjectable { .. }));
+        assert!(headless_kind_of(&dead).is_none());
+        assert!(!has_terminal_candidate(&dead));
     }
 
     /// pid=0（未读卡兜底/进程不在）不可注入——**终端家**；Codex APP 例外见下

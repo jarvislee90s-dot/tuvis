@@ -5513,7 +5513,8 @@ mod tests {
         assert_eq!(audits[0].result, "ok");
     }
 
-    /// 拒绝矩阵：workbuddy → 403 blackbox；zcode → 403 headless_only（均不入队）；
+    /// 拒绝矩阵：workbuddy → 403 blackbox；zcode → 409 official_control_required
+    /// （T7.1：官方控制接口是唯一写通道，有意兼容拒绝；均不入队）；
     /// 未知会话 → 404 no_session；空/全空白 text 与超长（MAX_SEND_CHARS+1）→ 400
     #[tokio::test]
     async fn send_rejects_not_injectable_and_missing() {
@@ -5539,7 +5540,7 @@ mod tests {
             body.contains("not_injectable") && body.contains("blackbox"),
             "403 体必须带 not_injectable + reasonCode：{body}"
         );
-        // zcode 走无头（M11）→ 403 headless_only
+        // zcode 走官方控制接口（T7.1：M11 无头门退役）→ 409 official_control_required
         let r = app
             .clone()
             .oneshot(req(
@@ -5550,8 +5551,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(r.status(), 403);
-        assert!(body_string(r).await.contains("headless_only"));
+        assert_eq!(r.status(), 409);
+        assert!(body_string(r).await.contains("official_control_required"));
         // 不存在的会话 → 404 no_session（W1：定位失败不入队）
         let r = app
             .clone()
