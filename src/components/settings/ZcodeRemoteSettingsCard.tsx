@@ -17,6 +17,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ToolIcon } from "@/components/common/ToolIcon";
@@ -35,6 +36,71 @@ const INPUT_ID = "zcode-remote-url";
 const HINT_ID = `${INPUT_ID}-hint`;
 const ERROR_ID = `${INPUT_ID}-error`;
 const TUTORIAL_ID = "zcode-remote-tutorial";
+const PROVIDER_ID = "zcode-remote-provider";
+
+// 官方授权通道（T7.2）：BigModel 已实跑回环授权；ZAI 目前只有官方源码/模拟证据，
+// **没有** live 实跑证据，因此选项禁用且授权按钮一律不开闸（证据门，不是偏好）。
+const PROVIDER_BIGMODEL = "bigmodel";
+const PROVIDER_ZAI = "zai";
+const ZAI_LIVE_VERIFIED = false;
+type ProviderId = typeof PROVIDER_BIGMODEL | typeof PROVIDER_ZAI;
+
+// relay 连接态（与 Rust `ConnectionState` 逐字对应；`connecting` 是配对前态）。
+const CONNECTION_STATES = [
+  "needs_config",
+  "needs_auth",
+  "connecting",
+  "paired",
+  "offline",
+  "conflict",
+  "unknown",
+] as const;
+type ZcodeConnectionState = (typeof CONNECTION_STATES)[number];
+
+// `ConnectionView` 的**白名单**消费形态：只抄四字段，后端多给的 URL/token 一律丢弃，
+// 因此任何凭据都不会因为 IPC 回执而被渲染或缓存。`deviceLabel` 仅供显示，不做绑定。
+type ZcodeConnection = {
+  state: ZcodeConnectionState;
+  generation: number;
+  reasonCode: string | null;
+  deviceLabel: string | null;
+};
+
+/** 严格解析连接视图：形态不符 → null（= 未知），绝不猜成 needs_auth/paired。 */
+function parseConnection(raw: unknown): ZcodeConnection | null {
+  if (!raw || typeof raw !== "object") return null;
+  const view = raw as Record<string, unknown>;
+  const state = view.state;
+  if (typeof state !== "string" || !(CONNECTION_STATES as readonly string[]).includes(state)) {
+    return null;
+  }
+  return {
+    state: state as ZcodeConnectionState,
+    generation: typeof view.generation === "number" ? view.generation : 0,
+    reasonCode: typeof view.reasonCode === "string" ? view.reasonCode : null,
+    deviceLabel: typeof view.deviceLabel === "string" ? view.deviceLabel : null,
+  };
+}
+
+// 连接态 → 本地化键（每态一句，绝不靠「是否有链接」推导配对）
+const CONNECTION_LABEL_KEYS: Record<ZcodeConnectionState, string> = {
+  needs_config: "settings.remote.zcode.connNeedsConfig",
+  needs_auth: "settings.remote.zcode.connNeedsAuth",
+  connecting: "settings.remote.zcode.connConnecting",
+  paired: "settings.remote.zcode.connPaired",
+  offline: "settings.remote.zcode.connOffline",
+  conflict: "settings.remote.zcode.connConflict",
+  unknown: "settings.remote.zcode.connUnknown",
+};
+
+// 冻结错误码 → 本卡原因键（词表外的码回退域入口文案，不展示码原文）
+const CONNECTION_REASON_KEYS: Record<string, string> = {
+  needs_config: "settings.remote.zcode.reasonNeedsConfig",
+  needs_auth: "settings.remote.zcode.reasonNeedsAuth",
+  offline: "settings.remote.zcode.reasonOffline",
+  conflict: "settings.remote.zcode.reasonConflict",
+  unknown: "settings.remote.zcode.reasonUnknown",
+};
 
 export function ZcodeRemoteSettingsCard() {
   const { t } = useAppTranslation();
@@ -50,6 +116,61 @@ export function ZcodeRemoteSettingsCard() {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [tutorialOpen, setTutorialOpen] = useState(false);
+  // ---- T7.2 官方账号授权/连接 ----
+  // 授权通道：默认 BigModel（唯一有 live 证据的通道）；ZAI 未 live 不开闸。
+  const [provider, setProvider] = useState<ProviderId>(PROVIDER_BIGMODEL);
+  // 真实连接态（null = 首拍未到/读取失败 = **未知**，不是 needs_auth 也不是 paired）
+  const [connection, setConnection] = useState<ZcodeConnection | null>(null);
+  // 授权/连接/断开进行中（同一时刻只允许一个控制动作）
+  const [controlBusy, setControlBusy] = useState<"authorize" | "connect" | "disconnect" | null>(
+    null
+  );
+  // 控制动作失败的就地错误（已本地化；不弹 toast 重复播报）
+  const [controlError, setControlError] = useState<string | null>(null);
+
+  // 连接态唯一来源 = 后端 `zcode_control_status`（同 Hub 视图，桌面与手机一致）。
+  // 链接已保存**从不**被推导成已配对；读取失败按「未知」显示，不猜。
+  const refreshConnection = useCallback(async () => {
+    try {
+      setConnection(parseConnection(await invoke<unknown>("zcode_control_status")));
+    } catch (e) {
+      console.error("zcode control status read failed:", e);
+      setConnection(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshConnection();
+  }, [refreshConnection]);
+
+  const providerVerified = provider === PROVIDER_BIGMODEL || ZAI_LIVE_VERIFIED;
+  const connectionState: ZcodeConnectionState = connection?.state ?? "unknown";
+  const busy = saving || controlBusy !== null;
+
+  // 授权 / 连接 / 断开：只走 IPC，参数里没有 URL/token（凭据只在本机 Rust 内存里）；
+  // 回执按四字段白名单消费。失败就地报错并照实重读后端状态。
+  const runControl = useCallback(
+    async (action: "authorize" | "connect" | "disconnect") => {
+      if (action === "authorize" && !providerVerified) return;
+      setControlBusy(action);
+      setControlError(null);
+      try {
+        const raw =
+          action === "authorize"
+            ? await invoke<unknown>("zcode_control_authorize", { provider })
+            : action === "connect"
+              ? await invoke<unknown>("zcode_control_connect")
+              : await invoke<unknown>("zcode_control_disconnect");
+        setConnection(parseConnection(raw));
+      } catch (e) {
+        setControlError(formatInvokeError(e, t));
+        await refreshConnection();
+      } finally {
+        setControlBusy(null);
+      }
+    },
+    [provider, providerVerified, refreshConnection, t]
+  );
 
   // 挂载读一次（只读 settings，不触网、不探测连接——§4.3 的「读取即复验」在服务端）
   useEffect(() => {
@@ -103,19 +224,22 @@ export function ZcodeRemoteSettingsCard() {
         setConfig(next);
         setReadFailed(false);
         setDraft(next.url ?? "");
+        // 保存成功只**刷新**后端连接态：改链接会让 Hub 推进代际并断旧连接，
+        // 新态由后端说了算——不在这里凭「Saved」自证任何联机状态。
+        await refreshConnection();
         toast.success(
           next.configState === "missing"
             ? t("settings.remote.zcode.deletedToast")
             : t("settings.remote.zcode.savedToast")
         );
       } catch (e) {
-        // 失败**不**动已存值、不清草稿（用户可就地改几个字符再试）
+        // 失败**不**动已存值、不清草稿（用户可就地改几个字符再试），也不刷新连接态
         setError(formatInvokeError(e, t));
       } finally {
         setSaving(false);
       }
     },
-    [t]
+    [refreshConnection, t]
   );
 
   // 复制 = 已保存值（草稿没保存出去就不该出现在剪贴板里）；无已存值时钮本就更disabled
@@ -244,6 +368,118 @@ export function ZcodeRemoteSettingsCard() {
             </p>
           )}
           <p className={SETTINGS_NOTE}>{t("settings.remote.zcode.deleteNote")}</p>
+
+          {/* ---- 官方账号授权与连接（T7.2）：授权走本机 IPC，手机永不持有凭据 ---- */}
+          <div
+            data-testid="zcode-account"
+            className="bg-muted/20 space-y-2 rounded-lg border border-dashed p-3"
+          >
+            <p className={SETTINGS_FIELD}>{t("settings.remote.zcode.accountTitle")}</p>
+            <p className={SETTINGS_HINT}>{t("settings.remote.zcode.accountDesc")}</p>
+
+            <label htmlFor={PROVIDER_ID} className={`block ${SETTINGS_FIELD}`}>
+              {t("settings.remote.zcode.providerLabel")}
+            </label>
+            <select
+              id={PROVIDER_ID}
+              data-testid="zcode-provider"
+              value={provider}
+              disabled={busy}
+              onChange={(e) =>
+                setProvider(e.target.value === PROVIDER_ZAI ? PROVIDER_ZAI : PROVIDER_BIGMODEL)
+              }
+              className="border-input bg-background focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-input/30 h-8 w-full rounded-md border px-2 text-sm outline-none focus-visible:ring-[3px] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <option value={PROVIDER_BIGMODEL}>
+                {t("settings.remote.zcode.providerBigmodel")}
+              </option>
+              <option value={PROVIDER_ZAI} disabled={!ZAI_LIVE_VERIFIED}>
+                {t("settings.remote.zcode.providerZai")}
+              </option>
+            </select>
+            {/* ZAI 禁用的**可见原因**：未验证 + live 未证（证据门，不是隐藏开关） */}
+            {!ZAI_LIVE_VERIFIED && (
+              <p data-testid="zcode-zai-reason" className={SETTINGS_HINT}>
+                {t("settings.remote.zcode.providerZaiReason")}
+              </p>
+            )}
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                size="sm"
+                data-testid="zcode-authorize"
+                aria-busy={controlBusy === "authorize"}
+                disabled={busy || !providerVerified}
+                onClick={() => void runControl("authorize")}
+              >
+                {t("settings.remote.zcode.authorize")}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                data-testid="zcode-connect"
+                aria-busy={controlBusy === "connect"}
+                disabled={
+                  busy ||
+                  connectionState === "paired" ||
+                  connectionState === "connecting" ||
+                  connectionState === "conflict"
+                }
+                onClick={() => void runControl("connect")}
+              >
+                {t("settings.remote.zcode.connect")}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                data-testid="zcode-disconnect"
+                aria-busy={controlBusy === "disconnect"}
+                disabled={busy || connection === null}
+                onClick={() => void runControl("disconnect")}
+              >
+                {t("settings.remote.zcode.disconnect")}
+              </Button>
+            </div>
+
+            {/* 真实连接态：唯一权威 = 后端 status；已保存链接不参与判定 */}
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+              <span className={SETTINGS_HINT}>{t("settings.remote.zcode.connectionLabel")}</span>
+              <span
+                data-testid="zcode-connection-state"
+                data-connection-state={connectionState}
+                aria-live="polite"
+                className={SETTINGS_FIELD}
+              >
+                {t(CONNECTION_LABEL_KEYS[connectionState])}
+              </span>
+              {connection?.deviceLabel !== null && connection?.deviceLabel !== undefined && (
+                <span data-testid="zcode-device-label" className={SETTINGS_HINT}>
+                  {t("settings.remote.zcode.deviceLabel", { label: connection.deviceLabel })}
+                </span>
+              )}
+            </div>
+            {connection?.reasonCode !== null && connection?.reasonCode !== undefined && (
+              <p
+                data-testid="zcode-connection-reason"
+                data-reason-code={connection.reasonCode}
+                className={SETTINGS_HINT}
+              >
+                {CONNECTION_REASON_KEYS[connection.reasonCode]
+                  ? t(CONNECTION_REASON_KEYS[connection.reasonCode])
+                  : t("errors.zcodeControl")}
+              </p>
+            )}
+            {controlError !== null && (
+              <p
+                data-testid="zcode-control-error"
+                role="alert"
+                className="rounded-lg bg-rose-50 px-2.5 py-1.5 text-xs text-rose-600 dark:bg-rose-500/10 dark:text-rose-400"
+              >
+                {controlError}
+              </p>
+            )}
+            <p className={SETTINGS_NOTE}>{t("settings.remote.zcode.authorizeNote")}</p>
+          </div>
 
           {/* 获取教程：显式动作才展开；应用内取链四步，不承诺自动登录／网页引导／固定有效期 */}
           <Button

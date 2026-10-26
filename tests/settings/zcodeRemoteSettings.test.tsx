@@ -54,8 +54,30 @@ const missing = { configState: "missing", url: null };
 const saved = { configState: "saved", url: SAVED_URL };
 const invalid = { configState: "invalid", url: null };
 
-/** 默认后端行为：读 saved；写回显（空白 → missing，其余 → saved） */
-function mockBackend(getPayload: unknown = saved) {
+// ---- T7.2 官方账号授权/连接夹具（`ConnectionView` 四字段，全合成值）----
+const CONNECTION_NEEDS_AUTH = {
+  state: "needs_auth",
+  generation: 1,
+  reasonCode: null,
+  deviceLabel: null,
+};
+const CONNECTION_CONNECTING = {
+  state: "connecting",
+  generation: 2,
+  reasonCode: null,
+  deviceLabel: null,
+};
+
+type ControlFixture = {
+  status?: unknown;
+  authorize?: unknown;
+  connect?: unknown;
+  disconnect?: unknown;
+};
+
+/** 默认后端行为：读 saved；写回显（空白 → missing，其余 → saved）；
+ *  T7.2 控制命令默认回 needs_auth 连接视图（绝不默认 paired）。 */
+function mockBackend(getPayload: unknown = saved, control: ControlFixture = {}) {
   invokeMock.mockImplementation(async (cmd: string, args?: { rawUrl?: string }) => {
     if (cmd === "zcode_remote_config_get") return getPayload;
     if (cmd === "zcode_remote_config_set") {
@@ -66,12 +88,36 @@ function mockBackend(getPayload: unknown = saved) {
       }
       return { configState: "saved", url: raw };
     }
+    if (cmd === "zcode_control_status") return control.status ?? CONNECTION_NEEDS_AUTH;
+    if (cmd === "zcode_control_authorize") return control.authorize ?? CONNECTION_CONNECTING;
+    if (cmd === "zcode_control_connect") {
+      return (
+        control.connect ?? {
+          state: "paired",
+          generation: 3,
+          reasonCode: null,
+          deviceLabel: "Synthetic device",
+        }
+      );
+    }
+    if (cmd === "zcode_control_disconnect") {
+      return (
+        control.disconnect ?? {
+          state: "offline",
+          generation: 4,
+          reasonCode: null,
+          deviceLabel: null,
+        }
+      );
+    }
     return null;
   });
 }
 
 const setCalls = () => invokeMock.mock.calls.filter((c) => c[0] === "zcode_remote_config_set");
 const getCalls = () => invokeMock.mock.calls.filter((c) => c[0] === "zcode_remote_config_get");
+const statusCalls = () => invokeMock.mock.calls.filter((c) => c[0] === "zcode_control_status");
+const controlCall = (name: string) => invokeMock.mock.calls.filter((c) => c[0] === name);
 
 const header = () => screen.getByTestId("zcode-card-header");
 const panel = () => document.querySelector('[data-testid="zcode-card-panel"]');
@@ -324,6 +370,164 @@ describe("ZcodeRemoteSettingsCard 教程与外跳（A5 §4.2）", () => {
     expect(openUrlMock).not.toHaveBeenCalled();
     expect(screen.queryByText("Claude")).toBeNull();
     expect(screen.queryByText("Codex")).toBeNull();
+  });
+});
+
+// T7.2：设置卡内的官方账号授权/连接（provider 选择、授权/连接/断开、真实连接态）。
+describe("ZcodeRemoteSettingsCard 官方账号授权与连接（T7.2）", () => {
+  const connectionState = () => screen.getByTestId("zcode-connection-state");
+  const providerSelect = () => screen.getByLabelText(/authorization channel/i) as HTMLSelectElement;
+
+  it("saved_never_implies_connected：保存链接只刷新后端连接态，never 凭链接自证已配对", async () => {
+    mockBackend(saved, { status: CONNECTION_NEEDS_AUTH });
+    render(<ToolRemoteSettingsSection />);
+    await waitFor(() => expect(getCalls()).toHaveLength(1));
+    fireEvent.click(header());
+
+    // 挂载即从后端读真实连接态（挂载一次）
+    await waitFor(() => expect(statusCalls()).toHaveLength(1));
+    await waitFor(() =>
+      expect(connectionState()).toHaveAttribute("data-connection-state", "needs_auth")
+    );
+    // 已保存链接 ≠ 已连接
+    expect(stateText()).toContain("Saved");
+    expect(document.body.textContent).not.toMatch(/connected/i);
+    expect(document.body.textContent).not.toContain("已联机");
+
+    // 保存**失败**：不动草稿/已存值，也不向后端刷新连接态（仍只有挂载那一次）
+    fireEvent.change(input(), { target: { value: BAD_DRAFT } });
+    fireEvent.click(screen.getByTestId("zcode-save"));
+    await waitFor(() => expect(setCalls()).toHaveLength(1));
+    expect(await screen.findByTestId("zcode-url-error")).toBeTruthy();
+    expect(input().value).toBe(BAD_DRAFT);
+    expect(statusCalls()).toHaveLength(1);
+    expect(connectionState()).toHaveAttribute("data-connection-state", "needs_auth");
+
+    // 保存**成功**：向后端重读连接态；后端仍说 needs_auth 就照实显示 needs_auth
+    fireEvent.change(input(), { target: { value: DRAFT_URL } });
+    fireEvent.click(screen.getByTestId("zcode-save"));
+    await waitFor(() => expect(setCalls()).toHaveLength(2));
+    await waitFor(() => expect(statusCalls()).toHaveLength(2));
+    expect(connectionState()).toHaveAttribute("data-connection-state", "needs_auth");
+    expect(document.body.textContent).not.toMatch(/connected/i);
+  });
+
+  it("zai_authorize_is_disabled_until_live：ZAI 未经 live 验证 → 选项禁用 + 原因可见 + 授权禁用且零 IPC", async () => {
+    mockBackend(saved, { status: CONNECTION_NEEDS_AUTH });
+    render(<ToolRemoteSettingsSection />);
+    await waitFor(() => expect(getCalls()).toHaveLength(1));
+    fireEvent.click(header());
+
+    const select = providerSelect();
+    expect(select.value).toBe("bigmodel");
+    const zai = within(select).getByRole("option", { name: /ZAI/ }) as HTMLOptionElement;
+    expect(zai.disabled).toBe(true);
+    // 禁用原因就地可见：未验证 + live 未证
+    const reason = screen.getByTestId("zcode-zai-reason");
+    expect(reason).toBeVisible();
+    expect(reason.textContent).toMatch(/ZAI/);
+    expect(reason.textContent).toMatch(/unverified/i);
+    expect(reason.textContent).toMatch(/live/i);
+
+    // BigModel 已验证：授权可用
+    const authorize = screen.getByTestId("zcode-authorize");
+    expect(authorize).not.toBeDisabled();
+
+    // 即便被程序性切到 ZAI，授权也必须禁用且不调 IPC（未 live 不开闸）
+    fireEvent.change(select, { target: { value: "zai" } });
+    expect(screen.getByTestId("zcode-authorize")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("zcode-authorize"));
+    await Promise.resolve();
+    expect(controlCall("zcode_control_authorize")).toHaveLength(0);
+  });
+
+  it("authorize_calls_ipc_without_url_token：授权只传 provider，回执/渲染绝不带 URL 或 token", async () => {
+    mockBackend(saved, {
+      status: CONNECTION_NEEDS_AUTH,
+      // 后端本应只回四字段；这里故意塞 url/token，验证前端白名单消费、绝不外显
+      authorize: {
+        state: "connecting",
+        generation: 2,
+        reasonCode: null,
+        deviceLabel: "Synthetic device A",
+        url: SAVED_URL,
+        token: "synthetic-token-never-render",
+      },
+    });
+    render(<ToolRemoteSettingsSection />);
+    await waitFor(() => expect(getCalls()).toHaveLength(1));
+    fireEvent.click(header());
+    await waitFor(() => expect(statusCalls()).toHaveLength(1));
+
+    fireEvent.click(screen.getByTestId("zcode-authorize"));
+    await waitFor(() => expect(controlCall("zcode_control_authorize")).toHaveLength(1));
+    // 唯一参数 = 通道字面量；不向 JS 要 URL/token，也不把链接当授权凭据
+    expect(controlCall("zcode_control_authorize")[0][1]).toEqual({ provider: "bigmodel" });
+
+    // 所有控制 IPC 的参数都不含 url/token
+    for (const call of invokeMock.mock.calls) {
+      const args = call[1] as Record<string, unknown> | undefined;
+      if (!args) continue;
+      expect(Object.keys(args)).not.toContain("url");
+      expect(Object.keys(args)).not.toContain("token");
+    }
+
+    await waitFor(() =>
+      expect(connectionState()).toHaveAttribute("data-connection-state", "connecting")
+    );
+    // 回执里的 URL/token 不外显（只认四字段白名单）
+    const text = document.body.textContent ?? "";
+    expect(text).not.toContain("synthetic-token-never-render");
+    expect(text).not.toContain("sid=synthetic-sid-a5-0001");
+    expect(text).toContain("Synthetic device A");
+  });
+
+  it("connection_status_is_rendered_truthfully：七种连接态逐一照实渲染，只有 paired 说已配对", async () => {
+    const cases: Array<[string, RegExp]> = [
+      ["needs_config", /not configured|link is not saved/i],
+      ["needs_auth", /authoriz/i],
+      ["connecting", /connecting/i],
+      ["paired", /paired/i],
+      ["offline", /offline/i],
+      ["conflict", /conflict/i],
+      ["unknown", /unknown/i],
+    ];
+
+    for (const [state, expected] of cases) {
+      cleanup();
+      invokeMock.mockReset();
+      mockBackend(saved, {
+        status: {
+          state,
+          generation: 7,
+          reasonCode: state === "offline" ? "offline" : null,
+          deviceLabel: state === "paired" ? "Synthetic laptop" : null,
+        },
+      });
+      render(<ToolRemoteSettingsSection />);
+      await waitFor(() => expect(getCalls()).toHaveLength(1));
+      fireEvent.click(header());
+
+      await waitFor(() =>
+        expect(connectionState()).toHaveAttribute("data-connection-state", state)
+      );
+      expect(connectionState().textContent).toMatch(expected);
+      // 任何状态都不说「已联机/connected」以外的胡话：未配对态一律不得出现 paired 文案
+      if (state !== "paired") {
+        expect(connectionState().textContent).not.toMatch(/paired/i);
+      }
+      expect(document.body.textContent).not.toMatch(/connected/i);
+      expect(document.body.textContent).not.toContain("已联机");
+      // 设备标签只显示后端给的显示值，不做绑定依据
+      if (state === "paired") {
+        expect(document.body.textContent).toContain("Synthetic laptop");
+      } else {
+        expect(document.body.textContent).not.toContain("Synthetic laptop");
+      }
+    }
+
+    // 连接态来源是后端 status（每轮一次），不是保存链接推导
+    expect(statusCalls()).toHaveLength(1);
   });
 });
 
