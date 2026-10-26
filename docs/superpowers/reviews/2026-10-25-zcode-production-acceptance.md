@@ -51,7 +51,7 @@
 | 思考强度 thought | 是（T6，按目标模型自己的档位） | **关闭** | B4 live：`max → low → max` 新鲜快照确认 | `not_run` |
 | 只读阅读 | 既有 A + T7.1/T8.1 | 不受能力闸限制 | B1 live：bootstrap/workspace-list ok；T8.1 e2e 读链 200；A 回归绿 | 自动回归通过；真机未跑 |
 
-补充：`CapabilityPolicy::for_host` 已产出（APP build + 协议 + schema/hello 任一不匹配 → 全关），但生产装配 `PartsBackend::production` 目前直接使用 `CapabilityView::default()`，`for_host` 仅由测试覆盖；宿主 build/协议/schema/hello 的运行时来源尚未接线。开闸前必须先接线，不能只改布尔值。
+补充：`CapabilityPolicy::for_host` 已产出（APP build + 协议 + schema/hello 任一不匹配 → 全关）。`Hub::session` 现按下发手机的会话能力矩阵现算：基线为「未知宿主」组合（八项全关），debug 证据构建再叠加本会话/本代际**尚未消费**的单次许可（消费/过期/换代后下一次 GET 立即回到全关，手机按该字段硬门）。但宿主 build/协议/schema/hello 的**运行时来源仍未接线**（`contract.json` `production.knownGaps` 已登记 I-C）：即便拿到真实证据，也没有代码路径据此开闸。开闸前必须先接线，不能只改布尔值。
 
 ## 四、实机证据（B1–B4，macOS 探针）
 

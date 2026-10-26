@@ -286,6 +286,29 @@ impl EvidencePermitStore {
         bound_any
     }
 
+    /// 只读查询：本会话/本代际下**仍可用**（未消费、未过期）的许可能力名。
+    ///
+    /// 供 `Hub::session` 在下发手机前覆盖 `SessionView.capabilities`：查询**不消费**
+    /// 许可（动作路径仍由 [`Self::consume`]/[`Self::consume_answer`] 原子消费），
+    /// 过期项顺带清理。返回顺序固定为 [`CAPABILITY_NAMES`] 的顺序。
+    pub fn armed_capabilities(&self, session_id: &str, generation: u64) -> Vec<String> {
+        let now = self.now();
+        let mut permits = lock_permits(&self.permits);
+        permits.retain(|_, entry| entry.expires_at_ms > now);
+        let mut armed = Vec::new();
+        for capability in CAPABILITY_NAMES {
+            let key = PermitKey {
+                session_id: session_id.to_owned(),
+                generation,
+                capability: capability.to_owned(),
+            };
+            if permits.contains_key(&key) {
+                armed.push(capability.to_owned());
+            }
+        }
+        armed
+    }
+
     /// 换服务/关连接：清空全部许可（Hub 换代或 relay 关闭时调用）。
     pub fn invalidate_all(&self) {
         lock_permits(&self.permits).clear();

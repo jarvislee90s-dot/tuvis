@@ -30,9 +30,9 @@ use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
 use super::relay::{DeviceRoute, RelayClient, RelayEvent};
 use super::types::{
-    codes, ActionContext, ActionReceipt, BoundTarget, CapabilityView, ConnectionState,
-    ConnectionView, ControlAction, ControlEvent, ControlEventKind, SessionView, TargetKey, ZResult,
-    ZcodeError,
+    codes, ActionContext, ActionReceipt, BoundTarget, CapabilityPolicy, CapabilityView,
+    ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind, SessionView,
+    TargetKey, ZResult, ZcodeError,
 };
 use crate::remote::pairing::DeviceStore;
 
@@ -43,6 +43,14 @@ use super::evidence::{EvidencePermit, EvidencePermitStore};
 const EVENT_CAPACITY: usize = 64;
 /// relay→Hub 事件泵队列（满时 relay 侧丢事件；Data 丢失由上层超时/重试兜底）。
 const RELAY_EVENT_CAPACITY: usize = 64;
+
+/// 生产宿主证据基线：本分支**没有**宿主 APP build / wire 协议 / schema / hello 的
+/// 运行时取证来源（`tests/fixtures/zcode-official-bridge/contract.json`
+/// `production.knownGaps` 已登记）。因此下发给手机的会话能力矩阵一律以「未知宿主」
+/// 调用 [`CapabilityPolicy::for_host`]：未经 live 验收前，生产不得声称已取证构建，
+/// 八项能力恒为全关（原因码 `needs_evidence`）。
+const UNVERIFIED_HOST_BUILD: &str = "";
+const UNVERIFIED_HOST_PROTOCOL: u32 = 0;
 
 /// Hub 依赖的窄后端端口（测试注入 fake；生产 [`PartsBackend`]）。
 ///
@@ -270,6 +278,28 @@ fn public_target(mut target: BoundTarget, generation: u64) -> BoundTarget {
     target
 }
 
+/// 把一条有效验收许可覆盖到会话能力矩阵（**仅 debug 证据构建**）。
+///
+/// 只把该能力一项置 `enabled=true` / `reasonCode=None`；其余能力保持基线全关。
+/// 未知能力名不做任何修改（返回 `false`）。本函数不编入普通/发布构建。
+#[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+fn overlay_permit(view: &mut CapabilityView, capability: &str) -> bool {
+    let flag = match capability {
+        "send" => &mut view.send,
+        "single_select" => &mut view.single_select,
+        "multi_select" => &mut view.multi_select,
+        "free_text" => &mut view.free_text,
+        "interrupt" => &mut view.interrupt,
+        "approval_reply" => &mut view.approval_reply,
+        "model" => &mut view.model,
+        "thought_level" => &mut view.thought_level,
+        _ => return false,
+    };
+    flag.enabled = true;
+    flag.reason_code = None;
+    true
+}
+
 /// 广播一条控制事件（先取号再发送；调用方不得持内锁）。
 ///
 /// `device_id` 只留在进程内供 SSE 过滤同会话动作（`ControlEvent` 序列化时跳过），
@@ -437,6 +467,8 @@ impl Inner {
         }
         view.generation = generation;
         view.ready = false;
+        // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新代际事件。
+        view.capabilities = CapabilityView::default();
         self.last_session = Some(view.clone());
         Some(view)
     }
@@ -649,6 +681,32 @@ impl ZcodeHub {
     /// 本 Hub 的能力矩阵（默认全关）。
     pub fn policy(&self) -> &CapabilityView {
         &self.policy
+    }
+
+    /// 下发给手机的会话能力矩阵：宿主证据基线 + 本会话/本代际的有效验收许可。
+    ///
+    /// 基线恒为「未知宿主」组合的全关矩阵（见 [`UNVERIFIED_HOST_BUILD`]）；证据构建
+    /// 下再叠加本会话/本代际**尚未消费且未过期**的许可（每项只放宽一次动作）。不跨
+    /// 会话、不跨代际、不缓存：许可被消费/过期/换代后，下一次 `session()` GET 立即
+    /// 回到全关。普通构建没有许可册，行为恒为全关。
+    fn session_capabilities(&self, session_id: &str, generation: u64) -> CapabilityView {
+        let mut view = CapabilityPolicy::for_host(
+            UNVERIFIED_HOST_BUILD,
+            UNVERIFIED_HOST_PROTOCOL,
+            false,
+            false,
+        );
+        #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+        {
+            for capability in self.evidence.armed_capabilities(session_id, generation) {
+                overlay_permit(&mut view, &capability);
+            }
+        }
+        #[cfg(not(all(feature = "zcode-bridge-evidence", debug_assertions)))]
+        {
+            let _ = (session_id, generation);
+        }
+        view
     }
 
     /// T8.2 **仅 debug 证据构建**：桌面发放一条单次验收许可（唯一发放入口）。
@@ -881,6 +939,10 @@ impl ZcodeHub {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
         view.generation = generation;
+        // 能力矩阵：宿主证据基线（未知宿主 → 全关）叠加本会话/本代际仍有效的验收
+        // 许可（仅 debug 证据构建）。每次 GET 现算：策略或许可变化（消费/过期/换代）
+        // 在下一次 `session()` 立即可见——手机按该字段硬门。
+        view.capabilities = self.session_capabilities(&view.session_id, generation);
         self.lock().last_session = Some(view.clone());
         self.emit_session(&view);
         Ok(view)
@@ -1759,6 +1821,45 @@ mod tests {
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
     }
 
+    /// 会话能力矩阵的逐项断言：未取得产品级实机证据时八项必须全关且带冻结原因码。
+    fn assert_capabilities_closed(view: &CapabilityView) {
+        for (name, flag) in [
+            ("send", &view.send),
+            ("single_select", &view.single_select),
+            ("multi_select", &view.multi_select),
+            ("free_text", &view.free_text),
+            ("interrupt", &view.interrupt),
+            ("approval_reply", &view.approval_reply),
+            ("model", &view.model),
+            ("thought_level", &view.thought_level),
+        ] {
+            assert!(!flag.enabled, "{name} 未经 live 验收不得开闸");
+            assert_eq!(
+                flag.reason_code.as_deref(),
+                Some(codes::NEEDS_EVIDENCE),
+                "{name} 必须带冻结原因码"
+            );
+        }
+    }
+
+    /// 默认（普通构建 / 证据构建未发放许可）：会话能力矩阵全关。
+    ///
+    /// 刻意让 Hub 内部策略显式开着 `send`（`paired_hub`）：会话 DTO 的手机硬门
+    /// **不得**复用 Hub 内部策略，必须走宿主证据基线（未知宿主 → 全关）。
+    #[tokio::test]
+    async fn session_capabilities_are_closed_by_default() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake).await;
+        let view = hub
+            .session(&TargetKey {
+                session_id: "sess_synthetic0000".into(),
+            })
+            .await
+            .unwrap();
+        assert!(view.ready, "只读投影本身必须就绪");
+        assert_capabilities_closed(&view.capabilities);
+    }
+
     // ---------------------------------------------------------------------
     // T8.2 debug 证据许可：桌面发放 → 手机恰好一次动作 → 闸门重新关闭。
     // 普通构建（无 feature）不编入这些用例。
@@ -1780,6 +1881,80 @@ mod tests {
 
     #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
     const EVIDENCE_SESSION: &str = "sess_synthetic0000";
+
+    /// 许可只开自己那一项能力、只开本会话；一次动作消费后下一次 GET 立即全关。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    #[tokio::test]
+    async fn armed_permit_enables_only_that_capability_for_one_session() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub_closed(fake.clone()).await;
+        let generation = hub.connection().generation;
+        let key = TargetKey {
+            session_id: EVIDENCE_SESSION.into(),
+        };
+
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "send")
+            .expect("当前代际应可发放许可");
+
+        // 发放后下一次 GET：只有被许可的那一项开闸，其余仍全关。
+        let armed = hub.session(&key).await.expect("会话投影应可读");
+        assert!(armed.capabilities.send.enabled, "已发放许可必须反映到 GET");
+        assert_eq!(armed.capabilities.send.reason_code, None);
+        for (name, flag) in [
+            ("single_select", &armed.capabilities.single_select),
+            ("multi_select", &armed.capabilities.multi_select),
+            ("free_text", &armed.capabilities.free_text),
+            ("interrupt", &armed.capabilities.interrupt),
+            ("approval_reply", &armed.capabilities.approval_reply),
+            ("model", &armed.capabilities.model),
+            ("thought_level", &armed.capabilities.thought_level),
+        ] {
+            assert!(!flag.enabled, "{name} 未被许可，不得开闸");
+        }
+
+        // 恰一次动作消费许可；下一次 GET 回到全关（手机硬门随之关闭）。
+        hub.execute(ctx("evidence-view-1"), send_action(generation))
+            .await
+            .expect("有效许可必须放行一次动作");
+        let consumed = hub.session(&key).await.expect("会话投影应可读");
+        assert_capabilities_closed(&consumed.capabilities);
+    }
+
+    /// 许可不跨会话、不跨代际：其他会话同代际与同会话新代际的 GET 都必须全关。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    #[tokio::test]
+    async fn permit_does_not_leak_to_other_session_or_generation() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub_closed(fake.clone()).await;
+        let generation = hub.connection().generation;
+        let key = TargetKey {
+            session_id: EVIDENCE_SESSION.into(),
+        };
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "send")
+            .unwrap();
+
+        // 前提：本会话当前代际确实能看到许可。
+        let armed = hub.session(&key).await.unwrap();
+        assert!(armed.capabilities.send.enabled);
+
+        // 其他会话：同一代际也不得借用。
+        let other = hub
+            .session(&TargetKey {
+                session_id: "sess_synthetic_other".into(),
+            })
+            .await
+            .unwrap();
+        assert_capabilities_closed(&other.capabilities);
+
+        // 换代（显式断开推进 Hub 代际）后重连：旧许可不得在新代际的 GET 上复活。
+        hub.disconnect().await;
+        hub.connect().await.expect("重连应成功");
+        let new_generation = hub.connection().generation;
+        assert!(new_generation > generation, "断开必须推进代际");
+        let after = hub.session(&key).await.unwrap();
+        assert_eq!(after.generation, new_generation);
+        assert_capabilities_closed(&after.capabilities);
+    }
 
     /// 一次许可恰放行一次动作；第二个动作、其他会话、旧代际都回到原闸。
     #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]

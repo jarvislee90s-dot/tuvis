@@ -207,7 +207,8 @@
       "问答单选与打断的历史 live 证据仅 ACK accepted（ACK 后约 4–5ms teardown），未观察宿主撤卡 / 执行停止，终态未证。",
       "ZAI 通道未验（用户账号在 BigModel 侧，仅 callback-timeout）；官方网页第二 terminal 并发 / KICKED 语义仅 source+fake。",
       "Windows 全部未验（无 Windows 主机，未构建、未连接、未跑），不以 macOS 探针结果替代 Windows 产品验收。",
-      "T8.2 产品验收行（发送 / 单选 / 多选 / 自由文本 / 打断 / 审批 / 模型档位 / 双手机 / 断线重连 / 吊销 / 并发连接 / A 包回归）全部未执行；手机侧体验未经用户确认。"
+      "T8.2 产品验收行（发送 / 单选 / 多选 / 自由文本 / 打断 / 审批 / 模型档位 / 双手机 / 断线重连 / 吊销 / 并发连接 / A 包回归）全部未执行；手机侧体验未经用户确认。",
+      "T8.2 I-C：宿主证据来源未接线（无任务承接）。CapabilityPolicy::for_host 只由自身测试引用，生产无 APP build / wire 协议 / schema / hello 的运行时取证来源；Hub::session 现按「未知宿主」组合（全关）现算会话能力矩阵，debug 证据构建再叠加本会话/本代际的单次许可，但真实宿主证据到手后仍没有代码路径据此开闸。开闸前必须补运行时宿主证据来源并逐项验收。"
     ],
     "acceptanceReport": "docs/superpowers/reviews/2026-10-25-zcode-production-acceptance.md"
   }
