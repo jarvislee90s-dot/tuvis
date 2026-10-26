@@ -29,7 +29,7 @@
 
 | # | 级别 | 状态 | 根因（源码位置） | 最小修复方向 | 回归测试 |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 严重 | 待修 | 物理分片去重只看 `messageSeq` 单调，首片即把 `last_message_seq` 推进（`bridge.rs:2526-2542`），同一逻辑消息后续物理分片被当重复丢弃 | 物理 `seq` 去重/缺口与逻辑 `messageSeq` 分离；只有**完整逻辑消息**交付后才推进 `last_message_seq`（或按分片集合记录） | `BridgeManager::on_data` 注入同 `messageSeq`、递增 `seq` 的双分片，断言两条都交付 |
+| 1 | 严重 | 已审已提交 `b94be0e0` | 物理分片去重只看 `messageSeq` 单调，首片即把 `last_message_seq` 推进（`bridge.rs:2526-2542`），同一逻辑消息后续物理分片被当重复丢弃 | 只丢弃**严格更旧**的 `messageSeq`；同值交给 `FrameAssembler` 按 `(messageSeq, fragmentIndex)` 去重/组装；物理 `seq` 重复/缺口仍由原检查负责 | 经 `BridgeManager::on_data` 注入同 `messageSeq`、递增 `seq` 的双物理分片，断言 ready/revision/pending、首片 0 ACK、整条恰好 1 ACK |
 | 2 | 严重 | 待修 | Hub 事件泵 `RelayEvent::Data` 只调 `bridge.on_data`，不发布 Session 事件（`hub.rs:585-588`） | `on_data` 返回发生变化的会话投影；Hub 按绑定目标刷新并广播 Session（含 `ready=false` 降级） | 真实桥 Data → Hub → SSE 帧 → 手机 hook 状态更新（至少两层测试） |
 | 3 | 严重 | 待修 | hook 连接事件只在 generation 增大时 `refresh()`（`useZcodeControl.ts` connection 分支）；同代 `waiting/needs_auth → paired` 不拉会话 | 连接态从非 paired 进入 paired（或首次 paired 且 session 为空）时静默重拉；snapshot 同规 | 手机先打开、桌面后连接，断言 session 由 null 变非空 |
 | 4 | 一般 | 待修 | `Snooze` 在 `check_policy` 直接 `return Ok(Vec::new())`（`hub.rs:1029-1045`）；`snooze_interaction` 返回值被忽略 | snooze 只允许：匹配的问答/审批能力已开启，或存在本会话/本代际可绑题许可；绑题失败即拒（零动作） | 能力全关 + 无许可时 snooze 拒绝；有合法许可时绑定成功；错题/过期拒绝 |
@@ -62,3 +62,10 @@
 
 - 2026-10-27：建立本清单；核对 12 项源码根因，全部成立；工作树仍只有两个未提交
   补测；开始验证补测。
+- #0 基线补测：独立审查通过（0 Critical；I-2/I-3 留 #12），按建议修正“200 门已证明”
+  的注释口径、协议常量、超时与订阅断言后，作为 test-only 基线提交 `0ec5d5bc`；
+  `wire_e2e` 5/0。
+- #1 物理分片：RED（第二片被旧 `<=` 丢弃）→ 修复为 `<`（同值交给 assembler）→
+  独立审查 0 Critical/Important（要求加强 ACK 断言）→ 首片 0 ACK、整条恰好 1 ACK；
+  bridge 48/0；提交 `b94be0e0`。同 messageSeq 不同布局重放为 fail-closed（unready），
+  不是二次交付；消息间交错的 messageGap 硬化留待后续。
