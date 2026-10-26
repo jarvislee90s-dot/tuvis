@@ -10,7 +10,10 @@
 //! - **事件面**：`subscribe` 广播 [`ControlEvent`]（连接/会话/动作），事件体只含 Tuvis
 //!   DTO，**绝无** JWT/token/官方原文。
 //!
-//! HTTP/IPC 接线与 relay 事件泵在后续切片完成；本文件只交付可测的 Hub 核心。
+//! 构造即装配生产链（AuthService → RelayClient → BridgeManager → CommandSender）并启动
+//! 一条常驻 relay 事件泵：`Data` 逐帧进桥，`State` 更新连接态、`conflict`（KICKED）
+//! 推进控制代际并作废旧桥/投影。构造**不**自动 OAuth、**不**自动连接。
+//! HTTP/IPC 接线在后续切片完成；本文件只交付可测的 Hub 核心。
 //! DB 读写失败由调用方处置：`config_changed` 只在保存/删除**成功后**被调用，
 //! 失败保存不得断开旧连接（本函数不读写入结果、不自行落库）。
 
@@ -25,7 +28,7 @@ use super::auth::{AuthService, OAuthProvider, OpenAuthorize};
 use super::bridge::BridgeManager;
 use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
-use super::relay::{DeviceRoute, RelayClient};
+use super::relay::{DeviceRoute, RelayClient, RelayEvent};
 use super::types::{
     codes, ActionContext, ActionReceipt, BoundTarget, CapabilityView, ConnectionState,
     ConnectionView, ControlAction, ControlEvent, ControlEventKind, SessionView, TargetKey, ZResult,
@@ -35,6 +38,8 @@ use crate::remote::pairing::DeviceStore;
 
 /// Hub 广播缓冲（事件只做通知，缺口由消费方重 GET 兜底）。
 const EVENT_CAPACITY: usize = 64;
+/// relay→Hub 事件泵队列（满时 relay 侧丢事件；Data 丢失由上层超时/重试兜底）。
+const RELAY_EVENT_CAPACITY: usize = 64;
 
 /// Hub 依赖的窄后端端口（测试注入 fake；生产 [`PartsBackend`]）。
 ///
@@ -77,6 +82,32 @@ pub trait HubBackend: Send + Sync {
     fn policy(&self) -> CapabilityView;
 }
 
+/// 事件泵所需的桥窄口（生产 = [`BridgeManager`]，测试注入 fake）。
+///
+/// 只含 `on_data`/`invalidate` 两个入口：泵因此拿不到 relay 生命周期或配置入口。
+trait BridgePump: Send + Sync {
+    fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<()>>;
+    /// 作废旧桥/投影（实现内部推进自己的投影代际，不接受外部代际，避免代际空间混用）。
+    fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()>;
+}
+
+/// 生产泵口：与 [`PartsBackend`] 共用同一个投影代际计数器。
+struct ProjectionBridge {
+    bridge: Arc<BridgeManager>,
+    generation: Arc<AtomicU64>,
+}
+
+impl BridgePump for ProjectionBridge {
+    fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<()>> {
+        Box::pin(async move { BridgeManager::on_data(&self.bridge, payload).await })
+    }
+
+    fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()> {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        Box::pin(async move { BridgeManager::invalidate(&self.bridge, generation).await })
+    }
+}
+
 /// 生产后端：一条 relay + 一个 bridge + 一个命令派发器（进程内单实例）。
 pub struct PartsBackend {
     auth: Arc<AuthService>,
@@ -84,17 +115,18 @@ pub struct PartsBackend {
     bridge: Arc<BridgeManager>,
     sender: Arc<CommandSender>,
     policy: CapabilityView,
-    /// 投影代际：`reset`/重新连接时单调推进，保证 `BridgeManager::invalidate` 一定生效。
-    projection_generation: AtomicU64,
+    /// 投影代际：`reset`/重新连接/冲突时单调推进，保证 `BridgeManager::invalidate`
+    /// 一定生效（事件泵与后端共用同一个计数器）。
+    projection_generation: Arc<AtomicU64>,
 }
 
 impl PartsBackend {
-    /// 组装生产链（不触发 OAuth、不自动连接）。
-    fn production(store: DeviceStore) -> Self {
+    /// 组装生产链（不触发 OAuth、不自动连接），返回 relay 事件接收端供 Hub 事件泵消费。
+    fn production(store: DeviceStore) -> (Self, mpsc::Receiver<RelayEvent>) {
         let auth = Arc::new(AuthService::new(reqwest::Client::new()));
-        // relay 事件泵在 HTTP/IPC 接线切片装配；本切片先丢弃接收端（try_send 失败即丢，
-        // 不会挂死 relay actor），因此这里不产生任何自动行为。
-        let (events, _events_rx) = mpsc::channel(1);
+        // 泵由 Hub 持有；通道满时 relay 侧 `try_send` 丢事件（lag 由消费方重 GET 兜底），
+        // 绝不阻塞 relay actor。
+        let (events, events_rx) = mpsc::channel(RELAY_EVENT_CAPACITY);
         let relay = Arc::new(RelayClient::new(auth.clone(), events));
         let bridge = Arc::new(BridgeManager::new(relay.clone()));
         let policy = CapabilityView::default();
@@ -105,14 +137,25 @@ impl PartsBackend {
                 .with_stop(bridge.clone())
                 .with_selection(bridge.clone()),
         );
-        Self {
-            auth,
-            relay,
-            bridge,
-            sender,
-            policy,
-            projection_generation: AtomicU64::new(0),
-        }
+        (
+            Self {
+                auth,
+                relay,
+                bridge,
+                sender,
+                policy,
+                projection_generation: Arc::new(AtomicU64::new(0)),
+            },
+            events_rx,
+        )
+    }
+
+    /// 事件泵的桥端（与后端共用同一个 `BridgeManager` 与投影代际）。
+    fn pump_bridge(&self) -> Arc<dyn BridgePump> {
+        Arc::new(ProjectionBridge {
+            bridge: self.bridge.clone(),
+            generation: self.projection_generation.clone(),
+        })
     }
 
     fn advance_projection(&self) -> u64 {
@@ -177,6 +220,81 @@ impl HubBackend for PartsBackend {
     }
 }
 
+fn lock_inner(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
+    inner
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 广播一条连接事件（先取号再发送；调用方不得持内锁）。
+fn emit_connection(
+    inner: &Mutex<Inner>,
+    events: &broadcast::Sender<ControlEvent>,
+    view: &ConnectionView,
+) {
+    let seq = {
+        let mut state = lock_inner(inner);
+        state.seq = state.seq.wrapping_add(1);
+        state.seq
+    };
+    let event = ControlEvent {
+        seq,
+        generation: view.generation,
+        session_id: None,
+        kind: ControlEventKind::Connection,
+        data: serde_json::to_value(view).unwrap_or(Value::Null),
+    };
+    let _ = events.send(event);
+}
+
+/// 事件泵的 State 处理：锁内改状态/代际，锁外作废旧桥投影并广播。
+///
+/// - `conflict`（KICKED）是终态：推进 Hub 控制代际（旧动作立即 `stale_generation`），
+///   作废桥/投影后广播；
+/// - `needs_auth` 同时清 `authorized`（JWT 已失效）；
+/// - Hub 处于 `needs_config`/`needs_auth` 时只接受 `needs_auth`/`conflict`：
+///   配置变更后的旧连接离线/握手事件不得把 Hub 拉回 `offline`/`connecting`；
+/// - `generation <= relay_floor` 的迟到状态一律丢弃。
+async fn apply_relay_state(
+    inner: &Mutex<Inner>,
+    events: &broadcast::Sender<ControlEvent>,
+    bridge: &dyn BridgePump,
+    view: ConnectionView,
+) {
+    let (out, invalidate) = {
+        let mut state = lock_inner(inner);
+        if view.generation <= state.relay_floor {
+            return;
+        }
+        state.relay_generation = state.relay_generation.max(view.generation);
+        let conflict = view.state == ConnectionState::Conflict;
+        let entering_conflict = conflict && state.state != ConnectionState::Conflict;
+        if entering_conflict {
+            // 只在进入冲突时推进一次（重复冲突事件不再推代际）。
+            state.generation = state.generation.wrapping_add(1);
+        } else if matches!(
+            state.state,
+            ConnectionState::NeedsConfig | ConnectionState::NeedsAuth
+        ) && view.state != ConnectionState::NeedsAuth
+        {
+            return;
+        }
+        state.state = view.state;
+        state.reason_code = view.reason_code;
+        if view.device_label.is_some() {
+            state.device_label = view.device_label;
+        }
+        if view.state == ConnectionState::NeedsAuth {
+            state.authorized = false;
+        }
+        (state.view(), entering_conflict)
+    };
+    if invalidate {
+        bridge.invalidate().await;
+    }
+    emit_connection(inner, events, &out);
+}
+
 /// Hub 内部状态（全部字段由同一把 std 锁保护，锁外不做网络 await）。
 struct Inner {
     /// 控制代际：配置保存/删除与显式断开推进；动作/目标必须匹配它。
@@ -190,6 +308,11 @@ struct Inner {
     device_label: Option<String>,
     /// 事件序号（单调递增，发现缺口用）。
     seq: u64,
+    /// 已应用到 Hub 的 relay 事件代际（relay 自己的 generation，不是控制代际）。
+    relay_generation: u64,
+    /// 事件泵地板：`generation <= relay_floor` 的 relay 状态一律忽略（配置变更/断开
+    /// 之后迟到的旧代际状态不得回写新状态）。
+    relay_floor: u64,
 }
 
 impl Inner {
@@ -209,7 +332,7 @@ pub struct ZcodeHub {
     backend: Arc<dyn HubBackend>,
     policy: CapabilityView,
     events: broadcast::Sender<ControlEvent>,
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
     /// 连接单飞：并发 `connect` 只让一个真正开始新连接，其余复用当前视图。
     connect_lock: AsyncMutex<()>,
 }
@@ -217,11 +340,15 @@ pub struct ZcodeHub {
 impl ZcodeHub {
     /// 生产构造：固定官方端点，不自动 OAuth、不自动连接；策略默认全关（`needs_evidence`）。
     ///
-    /// 必须在 Tokio runtime 内构造（`BridgeManager` 会 spawn 出站 actor）。
+    /// 构造即启动一条 relay 事件泵（`Weak` 持有 Hub 状态：Hub 释放或事件通道关闭即退出），
+    /// 因此无任何自动授权/自动连接副作用。必须在 Tokio runtime 内构造
+    /// （`BridgeManager` 会 spawn 出站 actor）。
     pub fn new(store: DeviceStore) -> Self {
-        let backend: Arc<dyn HubBackend> = Arc::new(PartsBackend::production(store.clone()));
-        let policy = backend.policy();
-        Self::assemble(store, backend, policy)
+        let (parts, relay_events) = PartsBackend::production(store.clone());
+        let policy = parts.policy();
+        let bridge = parts.pump_bridge();
+        let backend: Arc<dyn HubBackend> = Arc::new(parts);
+        Self::assemble(store, backend, policy, Some((relay_events, bridge)))
     }
 
     /// 测试专用：注入 fake 后端与能力矩阵（不注册任何设置/IPC 入口）。
@@ -234,16 +361,33 @@ impl ZcodeHub {
         backend: Arc<dyn HubBackend>,
         policy: CapabilityView,
     ) -> Self {
-        Self::assemble(store, backend, policy)
+        Self::assemble(store, backend, policy, None)
     }
 
-    fn assemble(store: DeviceStore, backend: Arc<dyn HubBackend>, policy: CapabilityView) -> Self {
+    /// 事件泵测试构造（fake relay 通道 + fake bridge；零网络）。
+    #[cfg(test)]
+    fn with_pump(
+        store: DeviceStore,
+        backend: Arc<dyn HubBackend>,
+        policy: CapabilityView,
+        events: mpsc::Receiver<RelayEvent>,
+        bridge: Arc<dyn BridgePump>,
+    ) -> Self {
+        Self::assemble(store, backend, policy, Some((events, bridge)))
+    }
+
+    fn assemble(
+        store: DeviceStore,
+        backend: Arc<dyn HubBackend>,
+        policy: CapabilityView,
+        pump: Option<(mpsc::Receiver<RelayEvent>, Arc<dyn BridgePump>)>,
+    ) -> Self {
         let hub = Self {
             store,
             backend,
             policy,
             events: broadcast::channel(EVENT_CAPACITY).0,
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 generation: 0,
                 configured: false,
                 authorized: false,
@@ -251,7 +395,9 @@ impl ZcodeHub {
                 reason_code: None,
                 device_label: None,
                 seq: 0,
-            }),
+                relay_generation: 0,
+                relay_floor: 0,
+            })),
             connect_lock: AsyncMutex::new(()),
         };
         let configured = hub.read_configured();
@@ -264,13 +410,37 @@ impl ZcodeHub {
                 ConnectionState::NeedsConfig
             };
         }
+        if let Some((events, bridge)) = pump {
+            hub.spawn_pump(events, bridge);
+        }
         hub
     }
 
+    /// 常驻事件泵：`Data` 进桥，`State` 更新连接态并按需作废旧桥/投影。
+    ///
+    /// 只持有 Hub 状态的 `Weak`：Hub 释放或 relay 通道关闭（sender 全丢）即退出；
+    /// 单帧坏数据/桥错误只记一次降级，绝不拆泵（T2.2 M-10）。
+    fn spawn_pump(&self, mut events: mpsc::Receiver<RelayEvent>, bridge: Arc<dyn BridgePump>) {
+        let inner = Arc::downgrade(&self.inner);
+        let out = self.events.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let Some(inner) = inner.upgrade() else { break };
+                match event {
+                    RelayEvent::Data(payload) => {
+                        // 错误只代表本帧未吸收，不改变连接终态。
+                        let _ = bridge.on_data(payload).await;
+                    }
+                    RelayEvent::State(view) => {
+                        apply_relay_state(&inner, &out, bridge.as_ref(), view).await;
+                    }
+                }
+            }
+        });
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_inner(&self.inner)
     }
 
     /// 从 settings 读取配置形态：只有 `Saved` 才算已配置（坏值/空白 = 未配置）。
@@ -288,19 +458,7 @@ impl ZcodeHub {
 
     /// 广播一条连接事件（持有内锁时不可调用）。
     fn emit_connection(&self, view: &ConnectionView) {
-        let seq = {
-            let mut inner = self.lock();
-            inner.seq = inner.seq.wrapping_add(1);
-            inner.seq
-        };
-        let event = ControlEvent {
-            seq,
-            generation: view.generation,
-            session_id: None,
-            kind: ControlEventKind::Connection,
-            data: serde_json::to_value(view).unwrap_or(Value::Null),
-        };
-        let _ = self.events.send(event);
+        emit_connection(&self.inner, &self.events, view);
     }
 
     /// 设置连接状态并返回视图（调用方负责随后广播）。
@@ -478,6 +636,9 @@ impl ZcodeHub {
             }
             inner.configured = configured;
             inner.authorized = false;
+            // reset 已断开 relay：此前到达的状态事件（含 reset 触发的 offline）不再回写，
+            // 只在事件泵地板之内；后续新连接代际更高，照常接受。
+            inner.relay_floor = inner.relay_generation;
         }
         let state = if configured {
             ConnectionState::NeedsAuth
@@ -611,10 +772,11 @@ mod tests {
     use super::*;
     use crate::services::zcode_control::config::set_config;
     use crate::services::zcode_control::types::{ActionState, AnswerEntry, CapabilityFlag};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::Notify;
 
     const URL: &str = "https://zcode.z.ai/remote/v4?sid=synthetic-hub-0001&name=SyntheticHub";
+    const URL_WITH_MID: &str = "https://zcode.z.ai/remote/v4?sid=synthetic-hub-0001&mid=synthetic-mid-0002&name=SyntheticHub";
 
     #[derive(Default)]
     struct FakeBackend {
@@ -628,6 +790,10 @@ mod tests {
         gate: Mutex<Option<Arc<Notify>>>,
         connect_result: Mutex<Option<ZResult<ConnectionView>>>,
         bind_generation: AtomicU64,
+        /// 每次 connect 收到的目标（`sid` + `mid`），用于证明只从保存链接解析。
+        routes: Mutex<Vec<(String, Option<String>)>>,
+        /// 每次 reset 收到的目标代际。
+        reset_generations: Mutex<Vec<u64>>,
     }
 
     impl FakeBackend {
@@ -655,8 +821,9 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn connect<'a>(&'a self, _route: DeviceRoute) -> BoxFuture<'a, ZResult<ConnectionView>> {
+        fn connect<'a>(&'a self, route: DeviceRoute) -> BoxFuture<'a, ZResult<ConnectionView>> {
             self.connect_calls.fetch_add(1, Ordering::SeqCst);
+            self.routes.lock().unwrap().push((route.sid, route.mid));
             Box::pin(async move {
                 let gate = self.gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
@@ -675,8 +842,9 @@ mod tests {
             Box::pin(async {})
         }
 
-        fn reset<'a>(&'a self, _generation: u64) -> BoxFuture<'a, ()> {
+        fn reset<'a>(&'a self, generation: u64) -> BoxFuture<'a, ()> {
             self.reset_calls.fetch_add(1, Ordering::SeqCst);
+            self.reset_generations.lock().unwrap().push(generation);
             Box::pin(async {})
         }
 
@@ -983,5 +1151,235 @@ mod tests {
             .unwrap_err();
         assert!(err.is(codes::NEEDS_EVIDENCE));
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 事件泵的 fake 桥：记录 `on_data`/`invalidate`，可注入一次瞬时错误。
+    #[derive(Default)]
+    struct FakePump {
+        data: Mutex<Vec<Value>>,
+        invalidations: AtomicUsize,
+        fail_next: AtomicBool,
+    }
+
+    impl BridgePump for FakePump {
+        fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<()>> {
+            self.data.lock().unwrap().push(payload);
+            let fail = self.fail_next.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    Err(ZcodeError::offline())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()> {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    fn relay_view(state: ConnectionState, generation: u64) -> ConnectionView {
+        ConnectionView {
+            state,
+            generation,
+            reason_code: None,
+            device_label: Some("synthetic-relay".into()),
+        }
+    }
+
+    /// 带事件泵的 Hub（fake relay 通道 + fake 桥，零网络）。
+    fn pumped(
+        store: DeviceStore,
+        backend: Arc<FakeBackend>,
+        policy: CapabilityView,
+    ) -> (Arc<ZcodeHub>, mpsc::Sender<RelayEvent>, Arc<FakePump>) {
+        let (events, receiver) = mpsc::channel(8);
+        let pump = Arc::new(FakePump::default());
+        let hub = Arc::new(ZcodeHub::with_pump(
+            store,
+            backend,
+            policy,
+            receiver,
+            pump.clone(),
+        ));
+        (hub, events, pump)
+    }
+
+    /// relay `Data` 逐帧进桥；单帧错误只丢该帧，泵继续。
+    #[tokio::test]
+    async fn relay_data_is_pumped_into_bridge() {
+        let fake = Arc::new(FakeBackend::default());
+        let (_hub, events, pump) = pumped(stored(URL), fake, send_policy());
+
+        pump.fail_next.store(true, Ordering::SeqCst);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 2})))
+            .await
+            .unwrap();
+        wait_until(|| pump.data.lock().unwrap().len() == 2).await;
+
+        let seen = pump.data.lock().unwrap().clone();
+        assert_eq!(seen[0]["seq"], 1);
+        assert_eq!(seen[1]["seq"], 2, "首帧错误后泵必须继续");
+    }
+
+    /// relay `KICKED` → Hub `conflict` 终态：推进代际、作废桥/投影、旧动作零执行。
+    #[tokio::test]
+    async fn relay_kicked_state_is_conflict_and_invalidates_old_generation() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump) = pumped(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let old_generation = hub.connection().generation;
+        let mut subscriber = hub.subscribe();
+
+        events
+            .send(RelayEvent::State(relay_view(ConnectionState::Conflict, 7)))
+            .await
+            .unwrap();
+        wait_until(|| hub.connection().state == ConnectionState::Conflict).await;
+
+        let new_generation = hub.connection().generation;
+        assert!(new_generation > old_generation);
+        assert_eq!(
+            pump.invalidations.load(Ordering::SeqCst),
+            1,
+            "冲突必须作废旧桥/投影（一次）"
+        );
+
+        let err = hub
+            .execute(ctx("synthetic-action-kicked"), send_action(old_generation))
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::STALE_GENERATION));
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 0);
+
+        let mut saw_conflict = false;
+        while let Ok(event) = subscriber.try_recv() {
+            if event.kind == ControlEventKind::Connection
+                && event.generation == new_generation
+                && event.data["state"] == serde_json::json!("conflict")
+            {
+                saw_conflict = true;
+            }
+        }
+        assert!(saw_conflict, "Hub 必须广播新代际的 conflict 连接事件");
+    }
+
+    /// 构造（生产与 fake）都不得自动 OAuth/自动连接；生产策略默认全关。
+    #[tokio::test]
+    async fn hub_construction_does_not_authorize_or_connect() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = ZcodeHub::with_parts(stored(URL), fake.clone(), send_policy());
+        assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.disconnect_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.reset_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+
+        let unconfigured = ZcodeHub::with_parts(DeviceStore::memory(), fake, send_policy());
+        assert_eq!(
+            unconfigured.connection().state,
+            ConnectionState::NeedsConfig
+        );
+
+        // 生产链构造：只装配零件与空转事件泵，不取 token、不开 WS、不广播。
+        let production = ZcodeHub::new(stored(URL));
+        assert_eq!(production.connection().state, ConnectionState::NeedsAuth);
+        assert_eq!(production.policy(), &CapabilityView::default());
+        assert!(production.subscribe().try_recv().is_err());
+    }
+
+    /// `connect` 只从保存链接解析目标（sid + 可选 mid，不猜测），并使用 Hub 新代际。
+    #[tokio::test]
+    async fn connect_uses_saved_route_and_new_generation() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, _events, _pump) = pumped(stored(URL_WITH_MID), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        let first = hub.connect().await.unwrap();
+        assert!(first.is_paired());
+        assert_eq!(first.generation, hub.connection().generation);
+        {
+            let routes = fake.routes.lock().unwrap();
+            let route = routes.last().expect("必须收到连接目标");
+            assert_eq!(route.0, "synthetic-hub-0001");
+            assert_eq!(route.1.as_deref(), Some("synthetic-mid-0002"));
+        }
+
+        // 配置变更推进新代际：重连结果用新代际，不回传后端自己的旧 generation。
+        let old_generation = first.generation;
+        hub.config_changed().await;
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        let second = hub.connect().await.unwrap();
+        assert!(second.generation > old_generation);
+        assert_eq!(second.generation, hub.connection().generation);
+
+        // 无 mid 的保存链接：原样缺失（不合成、不猜测）。
+        let (plain, _plain_events, _plain_pump) = pumped(stored(URL), fake.clone(), send_policy());
+        plain
+            .authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        plain.connect().await.unwrap();
+        let routes = fake.routes.lock().unwrap();
+        assert_eq!(routes.last().expect("必须收到连接目标").1, None);
+    }
+
+    /// 配置保存/删除：推进代际 → 清凭据/投影 → 旧动作与旧 relay 状态不得复活。
+    #[tokio::test]
+    async fn config_changed_clears_credentials_and_projection() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, _pump) = pumped(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let old_generation = hub.connection().generation;
+
+        let view = hub.config_changed().await;
+        assert_eq!(view.state, ConnectionState::NeedsAuth);
+        assert!(view.generation > old_generation);
+        assert_eq!(
+            *fake.reset_generations.lock().unwrap(),
+            vec![view.generation],
+            "reset 必须拿到新代际（清 JWT/投影）"
+        );
+        assert_eq!(fake.reset_calls.load(Ordering::SeqCst), 1);
+
+        // 凭据已清：再次连接必须重新授权，零新连接。
+        assert!(hub.connect().await.unwrap_err().is(codes::NEEDS_AUTH));
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 1);
+
+        // 旧代际动作：零执行。
+        let err = hub
+            .execute(ctx("synthetic-action-reset"), send_action(old_generation))
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::STALE_GENERATION));
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+
+        // reset 前旧连接的迟到状态不得把 Hub 拉回 paired/offline。
+        events
+            .send(RelayEvent::State(relay_view(ConnectionState::Paired, 3)))
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
     }
 }
