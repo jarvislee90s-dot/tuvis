@@ -296,7 +296,9 @@ pub struct AnswerEntry {
 ///
 /// 已接入 `Send`/`Answer`/`Snooze`/`Stop`/`Permission`/`Selection`。
 /// `Permission` 与 `Selection` 各受能力闸（默认关闭 → `needs_evidence`）与端口装配
-/// 约束（未装配 → `not_ready`；已存储的同 actionId 重放不受闸影响）。
+/// 约束（未装配 → `not_ready`）。两者都**先**做只读幂等预检：已存储的同 actionId
+/// 同载荷动作直接回既有回执，先于能力闸/端口/目录读取（闸收回或目录暂不可读不会
+/// 把「做过」误报成「没做过」）；只有新动作才受上述闸约束。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ControlAction {
@@ -561,10 +563,11 @@ pub const STOP_CLEARED_POLL: Duration = Duration::from_millis(50);
 /// - `load`：目标未绑定 → `no_session`；代际前进/workspace 绑定不符 →
 ///   `stale_generation`；投影不新鲜或选择视图缺失 → `not_ready`；目录 RPC 失败按其
 ///   冻结码返回。**绝不**返回其他账号的 provider 目录，也绝不触发任何写命令。
-/// - `wait_selection`：只有该目标 `revision` **前进**（> `baseline_revision`，新鲜证据）
-///   且 `provider`/`model`/`thought` 三者与目标精确相等才 `true`；超时、目标换代/
-///   绑定消失或读错误 → `false`。每次判定后锁外 sleep（≤ [`SELECTION_POLL`]），
-///   绝不持锁 await、绝不忙等。
+/// - `wait_selection`：只有该目标投影 `ready`（新鲜证据）、`revision` **前进**
+///   （> `baseline_revision`）且 `provider`/`model`/`thought` 三者与目标精确相等才
+///   `true`；超时、目标换代/绑定不符、投影缺口（not ready）或读错误 → `false`——
+///   not ready 期间即便旧值恰等于目标也不得假确认。每次判定后锁外 sleep
+///   （≤ [`SELECTION_POLL`]），绝不持锁 await、绝不忙等。
 pub trait SelectionPort: Send + Sync {
     /// 读取精确目标的会话视图与**当前 provider** 的模型目录（只读，零写命令）。
     fn load<'a>(

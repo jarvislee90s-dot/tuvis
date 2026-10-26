@@ -73,13 +73,15 @@
 //! 共用 `finish_resolve`（一套回归用例护两侧）。绝不改会话权限模式、绝不用
 //! fullAccess、绝无 sendText 合成或重发。
 //!
-//! # 模型/思考档位（T6 Slice B）
+//! # 模型/思考档位（T6 Slice B + Fix round 1）
 //!
-//! `Selection` 走「能力闸（`model`/`thought_level` 默认关闭 → `needs_evidence`，
-//! 零帧且不读目录）→ **新鲜**只读视图 + 官方 `model-selection.getView()` 目录 →
-//! [`build_selection_command`]（CAS 必带 `baseRevision`、禁 `baseLogEpoch`）→
-//! **写前才预留**（指纹覆盖 provider/model/thought/baseRevision）→ 恰一帧
-//! `type=switchModelConfig`（20s ACK 窗）」。陈旧 CAS（`status=stale` /
+//! `Selection` 走「只读幂等预检（同 actionId 同载荷 → 既有回执，先于能力闸/
+//! 端口/目录读取，重放不受闸/新鲜度/revision 影响）→ 能力闸（`model`/
+//! `thought_level` 默认关闭 → `needs_evidence`，零帧且不读目录）→ **新鲜**只读视图 +
+//! 官方 `model-selection.getView()` 目录 → [`build_selection_command`]（CAS 必带
+//! `baseRevision`、禁 `baseLogEpoch`）→ **写前才预留**（指纹 = kind + 会话 + 代际 +
+//! model/thought；`baseRevision` 是执行态、provider 是服务端派生的会话属性，均不入
+//! 身份）→ 恰一帧 `type=switchModelConfig`（20s ACK 窗）」。陈旧 CAS（`status=stale` /
 //! `reasonCode=*staleRevision*`）→ `not_ready` 刷新提示，**绝不**自动换新 revision
 //! 重发；宿主显式拒绝 → `rejected`。ACK accepted/duplicate 只算 `accepted`，
 //! [`SELECTION_CONFIRM_TIMEOUT`] 内观察到 revision 前进**且** provider/model/thought
@@ -885,12 +887,20 @@ impl CommandSender {
             .await)
     }
 
-    /// 模型/思考档位切换（T6）：能力闸 → 新鲜选择视图 → 纯构造器 → 写前预留 →
-    /// 恰一帧 `switchModelConfig`（CAS 只带 baseRevision）→ ACK 受理后等新鲜选择确认。
+    /// 模型/思考档位切换（T6）：只读幂等预检 → 能力闸 → 新鲜选择视图 → 纯构造器 →
+    /// 写前预留 → 恰一帧 `switchModelConfig`（CAS 只带 baseRevision）→ ACK 受理后等新鲜
+    /// 选择确认。
     ///
     /// 纪律：
+    /// - **幂等重放优先于能力闸/端口/目录读取**：同 actionId 同载荷（kind + 会话 +
+    ///   代际 + model/thought）的已存储动作直接回既有回执（零帧零行），即使闸已收回、
+    ///   端口未装配、目录暂不可读或宿主 revision 已前进也如此——绝不把「做过」误报成
+    ///   「没做过」；
     /// - `model`/`thought_level` 闸默认关闭（`needs_evidence`，零帧零行、不读目录）；
     ///   provider 只取会话视图，绝不接受客户端指定；
+    /// - 幂等指纹**不含** `baseRevision`（CAS 水位是执行态，不是用户载荷；切换生效后
+    ///   revision 前进，含它会把同 actionId 重试误判成载荷冲突），也不含服务端派生的
+    ///   provider（会话归属即 provider，重放时无从在读取目录前取得）；
     /// - 陈旧 CAS（宿主 `status=stale` / `reasonCode=*staleRevision*`）→ `not_ready`
     ///   （刷新后由用户重试），**绝不**自动换新 revision 重发；宿主显式拒绝 →
     ///   `rejected`；两者都不进入确认观察；
@@ -906,6 +916,11 @@ impl CommandSender {
         let ControlAction::Selection { model, thought, .. } = action else {
             return Err(invalid_action());
         };
+        // 幂等重放（同 actionId 同载荷）：只回既有回执，零新行、零帧、零目录读取。
+        // 先于能力闸/端口/load：闸收回、断网重启、revision 前进都不得吞掉既有回执。
+        if let Some(existing) = self.lookup_action(ctx, target, action)? {
+            return Ok(existing);
+        }
         // 证据闸：切换能力默认关闭，关闭时连目录都不读（零帧零行零审计）。
         if !self.capabilities.model.enabled || !self.capabilities.thought_level.enabled {
             return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
@@ -933,14 +948,11 @@ impl CommandSender {
         let base_revision = view
             .revision
             .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
-        // 写即将发生：此时才预留。指纹覆盖 provider/model/thought/baseRevision，
-        // 不含正文（切换没有正文面）；审计摘要只记类别。
-        let params = serde_json::json!({
-            "provider": provider,
-            "model": model,
-            "thought": thought,
-            "baseRevision": base_revision,
-        });
+        // 写即将发生：此时才预留。指纹只覆盖稳定意图（kind + 会话 + 代际 +
+        // model/thought），与 `lookup_action`/`action_params` 同一口径：`baseRevision`
+        // 是 CAS 执行态（成功后必变），provider 是服务端派生的会话属性，二者都不参与
+        // 身份，否则同 actionId 重试会落成 `action_payload_conflict`。审计摘要只记类别。
+        let params = serde_json::json!({ "model": model, "thought": thought });
         let hash = payload_hash(
             action.kind(),
             &target.session_id,
@@ -5240,6 +5252,12 @@ mod tests {
                 self.wait_result.store(result, Ordering::SeqCst);
             }
 
+            /// 模拟宿主已生效：revision 前进、当前 provider/model/thought 变为目标值。
+            fn set_state(&self, view: SessionView, selection: SelectionView) {
+                *self.view.lock().unwrap() = view;
+                *self.selection.lock().unwrap() = selection;
+            }
+
             fn load_calls(&self) -> usize {
                 self.load_calls.load(Ordering::SeqCst)
             }
@@ -5321,6 +5339,17 @@ mod tests {
                 .collect()
         }
 
+        fn stored_reason(store: &DeviceStore, action_id: &str) -> Option<String> {
+            store.with(|conn| {
+                conn.query_row(
+                    "SELECT reason_code FROM zcode_actions WHERE action_id = ?1",
+                    [action_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            })
+        }
+
         /// CAS 只带 baseRevision、provider 只取自视图、绝不恢复原 thought。
         #[tokio::test]
         async fn selection_uses_cas_and_never_restores() {
@@ -5383,13 +5412,20 @@ mod tests {
             assert_eq!(switch_frames(&fake).len(), 1, "绝不自动换新 revision 重发");
             assert!(port.wait_calls().is_empty(), "陈旧 CAS 不得进入确认观察");
             assert_eq!(stored_state(&store, "a-1").as_deref(), Some("rejected"));
+            // 账本原因与返回码同源：rejected 终态的解释是「刷新后重试」。
+            assert_eq!(
+                stored_reason(&store, "a-1").as_deref(),
+                Some(codes::NOT_READY),
+                "落账原因必须与返回的 not_ready 一致"
+            );
 
-            // 同 actionId 重放：只回既有回执，零新帧、零等待。
+            // 同 actionId 重放：只回既有回执（state/reason 与落账一致），零新帧、零等待。
             let replay = sender
                 .execute(&ctx("a-1"), &target(), &action)
                 .await
                 .unwrap();
             assert_eq!(replay.state, ActionState::Rejected);
+            assert_eq!(replay.reason_code.as_deref(), Some(codes::NOT_READY));
             assert_eq!(switch_frames(&fake).len(), 1);
             assert!(port.wait_calls().is_empty());
         }
@@ -5573,12 +5609,67 @@ mod tests {
             assert_eq!(port.wait_calls().len(), 1, "重放不得再次等待确认");
             assert_eq!(row_count(&store), 1);
 
-            // 同 id 换 thought：载荷冲突（指纹覆盖 provider/model/thought/baseRevision）。
+            // 同 id 换 thought：载荷冲突（身份 = 会话 + 代际 + model/thought）。
             let conflict = sender
                 .execute(&ctx("a-1"), &target(), &selection_action("model-a", "low"))
                 .await
                 .unwrap_err();
             assert_eq!(conflict.code, codes::ACTION_PAYLOAD_CONFLICT);
+            assert_eq!(switch_frames(&fake).len(), 1);
+            assert_eq!(row_count(&store), 1);
+        }
+
+        /// 切换已生效（revision 前进）后，同 actionId 同载荷重试必须回既有回执：
+        /// 零新帧、零新目录读取、零第二次等待；当前闸/端口新鲜度不再参与。
+        #[tokio::test]
+        async fn same_action_id_retry_after_revision_advance_returns_receipt() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let port = FakeSelection::new(view(Some(REVISION), catalog()), catalog());
+            port.set_wait_result(true);
+            let open = selection_sender(&fake, &port, &store);
+            let action = selection_action("model-a", "high");
+
+            let first = open.execute(&ctx("a-1"), &target(), &action).await.unwrap();
+            assert_eq!(first.state, ActionState::Confirmed);
+            assert_eq!(switch_frames(&fake).len(), 1);
+            assert_eq!(port.load_calls(), 1);
+
+            // 宿主已生效：revision 前进，当前值已是目标。
+            let applied = selection(
+                "model-a",
+                Some("high"),
+                vec![
+                    choice("model-a", &["low", "high"]),
+                    choice("model-b", &["low"]),
+                ],
+            );
+            port.set_state(view(Some(REVISION + 1), applied.clone()), applied.clone());
+
+            // 同 actionId 同载荷重放：命中账本，不得重新构造（baseRevision 已变）。
+            let replay = open.execute(&ctx("a-1"), &target(), &action).await.unwrap();
+            assert_eq!(replay, first, "重放必须回既有回执（confirmed）");
+            assert_eq!(switch_frames(&fake).len(), 1, "重放不得产生第二帧");
+            assert_eq!(port.load_calls(), 1, "重放不得再次读取目录");
+            assert_eq!(port.wait_calls().len(), 1, "重放不得再次等待确认");
+            assert_eq!(row_count(&store), 1);
+
+            // 端口视图暂不可用（not ready）：重放仍须回既有回执，不得报 not_ready。
+            let mut not_ready = view(Some(REVISION + 2), applied.clone());
+            not_ready.ready = false;
+            port.set_state(not_ready, applied.clone());
+            let replay = open.execute(&ctx("a-1"), &target(), &action).await.unwrap();
+            assert_eq!(replay, first, "视图 not_ready 不得吞掉既有回执");
+            assert_eq!(switch_frames(&fake).len(), 1);
+            assert_eq!(port.load_calls(), 1);
+
+            // 能力闸收回且端口未装配：只读查询先行，仍回既有回执。
+            let closed = sender(&fake, &store);
+            let replay = closed
+                .execute(&ctx("a-1"), &target(), &action)
+                .await
+                .unwrap();
+            assert_eq!(replay, first, "闸收回不得把「做过」误报成「没做过」");
             assert_eq!(switch_frames(&fake).len(), 1);
             assert_eq!(row_count(&store), 1);
         }

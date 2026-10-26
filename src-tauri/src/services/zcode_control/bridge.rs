@@ -1334,6 +1334,9 @@ impl SelectionPort for BridgeManager {
                 return Err(ZcodeError::of(codes::NOT_READY));
             }
             // 当前选择三项只来自精确目标的快照 config（绝不取客户端自报/目录显示名）。
+            // 快照把官方扁平 `config.thoughtLevels` 只挂在当前模型名下（projection
+            // `parse_selection`）：这里合成 `config.thoughtLevels`，供解析层在 getView
+            // 未宣告当前模型档位时回退；其他模型拿不到这份档位。
             let (provider, model, thought, thought_levels) = {
                 let current = view
                     .selection
@@ -1377,15 +1380,15 @@ impl SelectionPort for BridgeManager {
             if let Some(object) = raw.as_object_mut() {
                 object.insert("config".to_owned(), config);
             }
-            let selection =
-                parse_selection_view(&target.session_id, target.generation, view.revision, &raw)?;
+            let selection = parse_selection_view(&raw)?;
             Ok((view, selection))
         })
     }
 
-    /// 有界轮询**新鲜**选择：revision 前进且 provider/model/thought 精确相等 → `true`；
-    /// 超时、目标换代/绑定消失 → `false`。只读本地投影（不重复打目录 RPC），每次读
-    /// 只拿剩余期限作预算（端口不取消 future、不留未激活订阅）。锁内判定、锁外 sleep。
+    /// 有界轮询**新鲜**选择：只有投影 `ready`、revision 前进且 provider/model/thought
+    /// 精确相等才 `true`；超时、目标换代/绑定不符、投影缺口（not ready）→ `false`
+    /// （not ready 期间即便旧值恰等于目标也不是新鲜证据）。只读本地投影（不重复打
+    /// 目录 RPC），每次读只拿剩余期限作预算；锁内判定、锁外 sleep。
     fn wait_selection<'a>(
         &'a self,
         target: &'a BoundTarget,
@@ -1396,31 +1399,29 @@ impl SelectionPort for BridgeManager {
         timeout: Duration,
     ) -> futures::future::BoxFuture<'a, bool> {
         Box::pin(async move {
-            {
-                let inner = lock(&self.shared.state);
-                if inner.generation != target.generation {
-                    return false;
-                }
-                let Some(entry) = inner.sessions.get(&target.session_id) else {
-                    return false;
-                };
-                if entry.target != *target {
-                    return false;
-                }
+            if !self.exact_session_bound(target) {
+                return false;
             }
             let deadline = Instant::now()
                 .checked_add(timeout)
                 .unwrap_or_else(Instant::now);
             loop {
+                // 绑定可能在等待期间被同代际改写：每轮都按精确目标复核。
+                if !self.exact_session_bound(target) {
+                    return false;
+                }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return false;
                 }
                 match self.session_within(target, Some(remaining)).await {
                     Ok(view) => {
-                        let fresh = view
-                            .revision
-                            .is_some_and(|revision| revision > baseline_revision);
+                        let fresh = view.ready
+                            && view.session_id == target.session_id
+                            && view.generation == target.generation
+                            && view
+                                .revision
+                                .is_some_and(|revision| revision > baseline_revision);
                         if fresh {
                             if let Some(current) = view.selection.as_ref() {
                                 if current.provider == provider
@@ -1453,6 +1454,21 @@ impl SelectionPort for BridgeManager {
 }
 
 impl BridgeManager {
+    /// 精确绑定复核（锁内、零 IO）：代际一致且同 session 的绑定完全相等。
+    ///
+    /// `session_within` 只校验代际（同代际改写绑定在正常流程不可达），等待类端口
+    /// 需要更严的「同 workspace/identity 绑定」口径，避免拿兄弟投影确认。
+    fn exact_session_bound(&self, target: &BoundTarget) -> bool {
+        let inner = lock(&self.shared.state);
+        if inner.generation != target.generation {
+            return false;
+        }
+        inner
+            .sessions
+            .get(&target.session_id)
+            .is_some_and(|entry| entry.target == *target)
+    }
+
     /// 状态锁内读**精确目标**的（投影 revision，目标 execution 是否仍在 control 观测里）。
     ///
     /// 目标换代/绑定不符/投影不新鲜/control 未知/revision 未知 → `None`（无证据，
@@ -3324,6 +3340,8 @@ mod tests {
         /// accepted/duplicate/noop/rejected 分类）；`None` = 既有的
         /// `{"method": <method>}` 回显（未知状态）。
         command_ack: Option<Value>,
+        /// `model-selection.getView` 的应答体（T6 SelectionPort.load；合成目录）。
+        model_selection_view: Option<Value>,
     }
 
     impl Default for PeerConfig {
@@ -3350,6 +3368,7 @@ mod tests {
                 gap_after_frames: None,
                 resync_snapshot: None,
                 command_ack: None,
+                model_selection_view: None,
             }
         }
     }
@@ -3853,11 +3872,12 @@ mod tests {
                             }
                         }
                         _ => {
-                            let body = self
-                                .config
-                                .command_ack
-                                .clone()
-                                .unwrap_or_else(|| json!({"method": method}));
+                            let body = if method == MODEL_SELECTION_GET_VIEW_METHOD {
+                                self.config.model_selection_view.clone()
+                            } else {
+                                self.config.command_ack.clone()
+                            }
+                            .unwrap_or_else(|| json!({"method": method}));
                             out.push(self.frame(inner, &bridge, promise_success(id, &body)));
                         }
                     }
@@ -5764,6 +5784,76 @@ mod tests {
         .await;
     }
 
+    // =======================================================================
+    // T6：SelectionPort 生产实现（合成夹具，不读真实账号/DB）
+    // =======================================================================
+
+    /// 带官方扁平 `config.thoughtLevels` 的会话快照（B4 形状，无 `config.models`）。
+    fn selection_snapshot(
+        session_id: &str,
+        revision: u64,
+        provider: &str,
+        model: &str,
+        thought: Option<&str>,
+        levels: &[&str],
+    ) -> Value {
+        let mut snapshot = conversation_snapshot(session_id, revision, Vec::new());
+        snapshot["config"] = json!({
+            "provider": provider,
+            "model": model,
+            "thought": thought,
+            "thoughtLevels": levels,
+        });
+        snapshot
+    }
+
+    /// 注入一条选择增量（config 键级整体替换 + revision 前进）。
+    #[allow(clippy::too_many_arguments)]
+    async fn push_selection_delta_on(
+        peer: &Peer,
+        session_id: &str,
+        subscription: &str,
+        from: u64,
+        to: u64,
+        revision: u64,
+        provider: &str,
+        model: &str,
+        thought: &str,
+    ) {
+        let bridge = peer.session_bridge_id(session_id);
+        let listen = peer.listen_id(&bridge);
+        let topic = format!("{CONVERSATION_TOPIC_PREFIX}{session_id}");
+        let patch = json!({
+            "revision": revision,
+            "config": {"provider": provider, "model": model, "thought": thought},
+        });
+        let wire = json!({
+            "wireVersion": V4_WIRE_PROTOCOL_VERSION,
+            "kind": "complete",
+            "deliveryKind": "initial",
+            "logicalFrameId": format!("synthetic-selection-{to}"),
+            "logicalFrameOrdinal": to,
+            "topic": topic,
+            "subscriptionId": subscription,
+            "frame": {
+                "topic": topic,
+                "subscriptionId": subscription,
+                "fromSeq": from,
+                "toSeq": to,
+                "sentAt": 0,
+                "payload": {
+                    "kind": "deltas",
+                    "deltas": [{"op": "state.updated", "patch": patch}]
+                }
+            }
+        });
+        peer.inject_frame(
+            &bridge,
+            channel_message(json!([RESPONSE_TYPE_EVENT_FIRE, listen]), &wire),
+        )
+        .await;
+    }
+
     /// stop 端口的会话视图必须按**精确目标**取：兄弟会话的 control 绝不冒充本目标，
     /// 伪造 workspace 绑定/未绑定会话一律拒绝。
     #[tokio::test]
@@ -6145,5 +6235,237 @@ mod tests {
                 assert_eq!(message_seq, expected, "bridge {bridge} messageSeq");
             }
         }
+    }
+
+    // =======================================================================
+    // T6 Fix round 1：SelectionPort 生产实现（load / wait_selection）
+    // =======================================================================
+
+    /// `load` 走官方 `model-selection.getView`（无参只读）并只保留当前 provider 目录。
+    #[tokio::test]
+    async fn selection_load_queries_get_view_and_filters_current_provider() {
+        const PROVIDER: &str = "synthetic-provider";
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(selection_snapshot(
+                SESSION_A,
+                2,
+                PROVIDER,
+                "synthetic-model-a",
+                Some("low"),
+                &["low", "high"],
+            )),
+            model_selection_view: Some(json!({
+                "data": {"providers": [
+                    {"providerId": "acct-other", "models": [
+                        {"modelId": "other-1", "config": {"optionSpecs": {"reasoningLevel": {"values": ["x"]}}}}
+                    ]},
+                    {"providerId": PROVIDER, "models": [
+                        {"modelId": "synthetic-model-a", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low", "high"]}}}},
+                        {"modelId": "synthetic-model-b", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low"]}}}}
+                    ]}
+                ]}
+            })),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let (view, selection) = SelectionPort::load(manager.as_ref(), &target)
+            .await
+            .expect("load");
+        assert_eq!(view.session_id, SESSION_A);
+        assert!(view.ready);
+        assert_eq!(selection.provider, PROVIDER);
+        assert_eq!(selection.model, "synthetic-model-a");
+        assert_eq!(selection.thought.as_deref(), Some("low"));
+        let ids: Vec<&str> = selection
+            .models
+            .iter()
+            .map(|choice| choice.model_id.as_str())
+            .collect();
+        assert_eq!(ids, ["synthetic-model-a", "synthetic-model-b"]);
+        assert!(!ids.contains(&"other-1"), "其他账号 provider 目录绝不下发");
+
+        let requests: Vec<TestMessage> = channel_frames(&peer)
+            .into_iter()
+            .filter(|message| message.method.as_deref() == Some(MODEL_SELECTION_GET_VIEW_METHOD))
+            .collect();
+        assert_eq!(requests.len(), 1, "恰一次只读 getView");
+        assert_eq!(
+            requests[0].channel.as_deref(),
+            Some(MODEL_SELECTION_CHANNEL)
+        );
+        assert_eq!(requests[0].body, json!([]), "getView 必须无参");
+    }
+
+    /// 快照扁平 `config.thoughtLevels` 必须经**生产** `BridgeManager::load` 回退到
+    /// 当前模型（getView 未宣告该模型档位时）；不是只在纯解析器里成立。
+    #[tokio::test]
+    async fn snapshot_thought_levels_fallback_works_through_bridge_load() {
+        const PROVIDER: &str = "synthetic-provider";
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(selection_snapshot(
+                SESSION_A,
+                2,
+                PROVIDER,
+                "synthetic-model-a",
+                Some("high"),
+                &["low", "high"],
+            )),
+            // 当前 provider 目录在，但当前模型没有 optionSpecs：唯一合法来源是快照。
+            model_selection_view: Some(json!({
+                "providers": [{
+                    "providerId": PROVIDER,
+                    "models": [{"modelId": "synthetic-model-a"}],
+                }]
+            })),
+            ..PeerConfig::default()
+        };
+        let (manager, _peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let (_, selection) = SelectionPort::load(manager.as_ref(), &target)
+            .await
+            .expect("load");
+        let current = selection
+            .models
+            .iter()
+            .find(|choice| choice.model_id == selection.model)
+            .expect("current model");
+        assert_eq!(
+            current.thought_levels,
+            vec!["low", "high"],
+            "快照扁平档位必须经生产 load 回退到当前模型"
+        );
+    }
+
+    /// 生效确认必须有**新鲜且 ready** 的精确选择：revision 未前进、模型不等、
+    /// 投影 not ready 一律 false；目标换代/绑定不符立即收口。
+    #[tokio::test]
+    async fn wait_selection_requires_ready_and_exact_match() {
+        const PROVIDER: &str = "synthetic-provider";
+        const SUB: &str = "conv-sub-synthetic-1";
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(selection_snapshot(
+                SESSION_A,
+                2,
+                PROVIDER,
+                "synthetic-model-a",
+                Some("low"),
+                &["low", "high"],
+            )),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let baseline = manager
+            .session(&target)
+            .await
+            .expect("session")
+            .revision
+            .expect("revision");
+        assert_eq!(baseline, 2);
+
+        // ① revision 未前进：即便已在目标值也不是「已生效」的新鲜证据。
+        assert!(
+            !manager
+                .wait_selection(
+                    &target,
+                    PROVIDER,
+                    "synthetic-model-a",
+                    "low",
+                    baseline,
+                    Duration::from_millis(40),
+                )
+                .await
+        );
+
+        // ② 等待中 revision 前进 + 三项精确 → true。
+        let waiter = {
+            let manager = manager.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                manager
+                    .wait_selection(
+                        &target,
+                        "synthetic-provider",
+                        "synthetic-model-b",
+                        "low",
+                        baseline,
+                        Duration::from_millis(600),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        push_selection_delta_on(
+            &peer,
+            SESSION_A,
+            SUB,
+            1,
+            2,
+            3,
+            PROVIDER,
+            "synthetic-model-b",
+            "low",
+        )
+        .await;
+        assert!(waiter.await.expect("waiter task"), "新鲜精确选择必须确认");
+
+        // ③ 模型不等：false（当前已是 model-b）。
+        assert!(
+            !manager
+                .wait_selection(
+                    &target,
+                    PROVIDER,
+                    "synthetic-model-a",
+                    "low",
+                    baseline,
+                    Duration::from_millis(40),
+                )
+                .await
+        );
+
+        // ④ 投影 not ready（revision 已前进且三项精确）：绝不假确认。
+        lock(&manager.shared.state)
+            .sessions
+            .get_mut(SESSION_A)
+            .expect("bound session")
+            .projection
+            .set_ready(false);
+        assert!(
+            !manager
+                .wait_selection(
+                    &target,
+                    PROVIDER,
+                    "synthetic-model-b",
+                    "low",
+                    baseline,
+                    Duration::from_millis(40),
+                )
+                .await,
+            "not ready must never confirm"
+        );
+
+        // ⑤ 同 sessionId 但 workspace 绑定不符：立即 false（绝不读兄弟投影）。
+        let mut forged = target.clone();
+        forged.workspace_key = "ws-b-identity".to_owned();
+        assert!(
+            !manager
+                .wait_selection(
+                    &forged,
+                    PROVIDER,
+                    "synthetic-model-b",
+                    "low",
+                    baseline,
+                    Duration::from_millis(120),
+                )
+                .await,
+            "forged binding must never confirm"
+        );
     }
 }

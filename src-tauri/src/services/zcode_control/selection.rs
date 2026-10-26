@@ -76,17 +76,14 @@ pub fn build_selection_command(view: &SessionView, model: &str, thought: &str) -
 /// - `config.thoughtLevels` 只作**当前模型**的回退（目录未给该模型档位时），不喂其他模型；
 /// - `providers` 缺失/为空/无当前 provider → 退化为「当前模型 + 快照档位」；
 /// - 模型 id 与档位都去重（保留首次出现，不合并重复项的档位），字符串有长度与数量上界；
-/// - 形状不符 → `needs_evidence`（目录不可信）／`unsupported_protocol`（wire 形状不符），
+/// - 只对**命中当前 provider** 的条目做严格校验（缺失/形状不符 → `needs_evidence`）；
+///   兄弟/其他账号 provider 的坏形状直接跳过，不据此丢弃当前会话目录；
+/// - wire 顶层形状不符（raw 非对象、`providers` 非数组）→ `unsupported_protocol`，
 ///   绝不 panic、不猜。
 ///
-/// `_session_id` / `_generation` / `_revision` 是调用方上下文：`SelectionView` 不携带它们
-/// （命令构造另取 `SessionView` 的 revision 作 CAS 基线），本函数保持纯解析。
-pub fn parse_selection_view(
-    _session_id: &str,
-    _generation: u64,
-    _revision: Option<u64>,
-    raw: &Value,
-) -> ZResult<SelectionView> {
+/// 本函数是**纯解析**：会话/代际/revision 由调用方持有（CAS 基线另取 `SessionView`），
+/// 不参与目录解析。
+pub fn parse_selection_view(raw: &Value) -> ZResult<SelectionView> {
     if !raw.is_object() {
         return Err(unsupported());
     }
@@ -208,18 +205,25 @@ fn catalog_models(raw: &Value, config: &SessionConfig<'_>) -> ZResult<Vec<ModelC
     if providers.is_empty() {
         return Ok(fallback_models(config));
     }
+    // 只对**命中当前 provider** 的条目做严格校验：兄弟/其他账号 provider 的坏形状
+    // 不得否决当前会话可用的目录（它们本来就会被丢弃）。
     let mut current_models: Option<&[Value]> = None;
     for provider in providers.iter().take(MAX_PROVIDERS) {
-        let record = provider.as_object().ok_or_else(needs_evidence)?;
+        let Some(record) = provider.as_object() else {
+            continue;
+        };
         // 官方 ModelSelectionView：providers[].providerId / models[].modelId。
-        let provider_id = non_empty_id(record.get("providerId")).ok_or_else(needs_evidence)?;
+        let Some(provider_id) = non_empty_id(record.get("providerId")) else {
+            continue;
+        };
+        if provider_id != config.provider {
+            continue;
+        }
         let models = record
             .get("models")
             .and_then(Value::as_array)
             .ok_or_else(needs_evidence)?;
-        if provider_id == config.provider {
-            current_models = Some(models);
-        }
+        current_models = Some(models);
     }
     let Some(models) = current_models else {
         // 目录里没有当前会话 provider（可能只暴露了其他账号）：退化，绝不借用别家目录。
@@ -344,12 +348,26 @@ mod tests {
         assert_eq!(envelope.get("baseRevision"), Some(&Value::from(7_u64)));
         assert!(envelope.get("baseRevision").is_some());
         assert!(envelope.get("baseLogEpoch").is_none());
-        // 产品只有用户显式选择这一条写帧：不回带恢复原 thought 的命令。
-        let restore_frames = ["restore", "previousThought", "originalThought"]
-            .iter()
-            .filter(|key| envelope.get(**key).is_some())
-            .count();
-        assert_eq!(restore_frames, 0);
+        // 信封键集合恰为 {type,payload,baseRevision}（不是「找不到 restore 键」的空断言）：
+        // 任何恢复原值的附加字段都会破坏这个集合。
+        let mut keys: Vec<&str> = envelope
+            .as_object()
+            .expect("envelope object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["baseRevision", "payload", "type"]);
+        let mut payload_keys: Vec<&str> = envelope["payload"]
+            .as_object()
+            .expect("payload object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        payload_keys.sort_unstable();
+        assert_eq!(payload_keys, ["model", "provider", "thought"]);
+        // 目标 thought=high，原值 low 绝不回写。
+        assert_eq!(envelope["payload"]["thought"], Value::from("high"));
     }
 
     #[test]
@@ -470,7 +488,7 @@ mod tests {
     }
 
     fn parse(raw: &Value) -> ZResult<SelectionView> {
-        parse_selection_view("sess_test", 2, Some(5), raw)
+        parse_selection_view(raw)
     }
 
     fn levels_of(view: &SelectionView, model_id: &str) -> Vec<String> {
@@ -557,13 +575,13 @@ mod tests {
 
     #[test]
     fn malformed_catalog_is_needs_evidence() {
-        // provider 条目缺 providerId。
-        let without_provider_id = raw_view(
+        // 当前 provider 条目自身形状不符（models 不是数组）→ 目录不可信。
+        let bad_current = raw_view(
             session_config("model-a", None, &[]),
-            Some(json!([{ "models": [model_entry("model-a", None)] }])),
+            Some(json!([{ "providerId": CURRENT_PROVIDER, "models": "not-an-array" }])),
         );
-        assert!(parse(&without_provider_id)
-            .expect_err("no providerId")
+        assert!(parse(&bad_current)
+            .expect_err("bad current provider")
             .is(codes::NEEDS_EVIDENCE));
         // 模型条目缺 modelId。
         let without_model_id = raw_view(
@@ -584,6 +602,36 @@ mod tests {
         assert!(parse(&not_an_array)
             .expect_err("providers shape")
             .is(codes::UNSUPPORTED_PROTOCOL));
+    }
+
+    #[test]
+    fn malformed_sibling_provider_does_not_discard_current_catalog() {
+        // 其他账号/兄弟 provider 的坏形状不得否决当前会话可用的目录。
+        let raw = raw_view(
+            session_config("model-a", Some("low"), &["low"]),
+            Some(json!([
+                "not-an-object",
+                { "models": [{ "modelId": "sibling-model" }] },
+                { "providerId": "acct-other", "models": "not-an-array" },
+                {
+                    "providerId": CURRENT_PROVIDER,
+                    "models": [
+                        model_entry("model-a", Some(&["low", "high"])),
+                        model_entry("model-b", Some(&["low"])),
+                    ],
+                },
+            ])),
+        );
+
+        let view = parse(&raw).expect("malformed siblings must not discard the catalog");
+        assert_eq!(view.provider, CURRENT_PROVIDER);
+        let ids: Vec<&str> = view
+            .models
+            .iter()
+            .map(|choice| choice.model_id.as_str())
+            .collect();
+        assert_eq!(ids, ["model-a", "model-b"]);
+        assert_eq!(levels_of(&view, "model-a"), strings(&["low", "high"]));
     }
 
     #[test]
