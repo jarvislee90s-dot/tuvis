@@ -362,6 +362,46 @@ describe("ZCode 控制面板：回执文案不越级", () => {
     expect(unknown.textContent).not.toContain("已受理");
   });
 
+  it("newly_typed_text_survives_late_accepted", async () => {
+    // 发送 A 后在 accepted 回执到达前续写 B：迟到的 accepted 只能清掉「已提交的 A」，
+    // 绝不能把回执到达时的新草稿 B 一并清掉（在途续写竞态）。
+    const gate = deferred<Response>();
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return gate.promise.then(() => json(receipt(body.actionId, "accepted")));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const draft = (await screen.findByTestId("zcode-draft")) as HTMLTextAreaElement;
+    const send = screen.getByTestId("zcode-send") as HTMLButtonElement;
+    await waitFor(() => expect(send).toBeEnabled());
+
+    fireEvent.change(draft, { target: { value: "已提交的 A" } });
+    fireEvent.click(send);
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(postedActions()[0].action).toMatchObject({ kind: "send", text: "已提交的 A" });
+
+    // 回执尚未到达：用户继续写 B
+    fireEvent.change(draft, { target: { value: "回执到达前续写的 B" } });
+    await act(async () => {
+      gate.resolve(json(receipt(postedActions()[0].actionId, "accepted")));
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("zcode-action-status").getAttribute("data-action-state")).toBe(
+        "accepted"
+      )
+    );
+
+    // 迟到的 accepted 不得清掉 B（草稿与已提交文本不同 → 保留）
+    expect(draft).toHaveValue("回执到达前续写的 B");
+  });
+
   it("previous_receipt_is_cleared_on_new_submit", async () => {
     let posts = 0;
     const secondGate = deferred<Response>();
@@ -629,6 +669,44 @@ describe("ZCode 控制面板：审批选项回传宿主原值", () => {
     });
     expect(permissionActions()[0].optionId).not.toBe("allowOnce");
     expect(legacySendCalls()).toBe(0);
+  });
+});
+
+describe("ZCode 控制面板：无可选审批项时就地说明原因", () => {
+  it("permission_card_without_selectable_option_shows_reason", async () => {
+    // 宿主只给了 fullAccess / 未知 kind：面板一律不回传永久授权，但也不能让卡片
+    // 只剩摘要、无按钮也无原因（用户会以为卡坏了）。就地原因走冻结码属性。
+    const pending = pendingView({
+      kind: "permission",
+      toolName: "Bash",
+      summary: "执行合成命令",
+      questions: [],
+      options: [
+        { optionId: "host-full-access-9", label: "始终允许", kind: "fullAccess" },
+        { optionId: "host-unknown-9", label: "未知项", kind: "other" },
+      ],
+    });
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(sessionView({ pending: [pending] }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    expect(await screen.findByText("执行合成命令")).toBeVisible();
+
+    // 不可回传的选项一个按钮都不渲染（永久授权绝不落成可点按钮）
+    expect(screen.queryByTestId("zcode-permission-option-host-full-access-9")).toBeNull();
+    expect(screen.queryByTestId("zcode-permission-option-host-unknown-9")).toBeNull();
+
+    // 就地原因：可见的本地化文案 + 冻结码属性（码本身不是给用户看的）
+    const reason = screen.getByTestId("zcode-pending-reason");
+    expect(reason).toBeVisible();
+    expect(reason.getAttribute("data-reason-code")).toBe("unsupported_protocol");
+    expect(reason.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+    expect(reason.textContent).not.toContain("unsupported_protocol");
   });
 });
 
@@ -1004,6 +1082,62 @@ describe("ZCode 控制面板：pending 卡提交防重与选中态", () => {
         {
           questionText: "这个任务接下来要做什么？",
           selectedValues: ["opt-continue"],
+          freeText: null,
+        },
+      ],
+    });
+  });
+
+  it("multi_select_submits_multiple_host_values", async () => {
+    // multiSelect=true：点选是 toggle（多值），提交上行 selectedValues 数组
+    // （宿主原值，不是 kind/index）；全部取消后提交零动作（空数组绝不上行）。
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            pending: [pendingView({ questions: [questionView({ multiSelect: true })] })],
+          })
+        );
+      }
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const first = (await screen.findByTestId("zcode-pending-option-0")) as HTMLButtonElement;
+    const second = screen.getByTestId("zcode-pending-option-1") as HTMLButtonElement;
+    const submit = screen.getByTestId("zcode-pending-submit") as HTMLButtonElement;
+
+    // 选中再取消 → 空选择：提交零动作（空 selectedValues 不得冒充作答）
+    fireEvent.click(first);
+    await waitFor(() => expect(first).toHaveAttribute("aria-pressed", "true"));
+    fireEvent.click(first);
+    await waitFor(() => expect(first).toHaveAttribute("aria-pressed", "false"));
+    fireEvent.click(submit);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
+
+    // 多选是累加（不是替换）：两项同时选中，提交带上两项宿主原值
+    fireEvent.click(first);
+    fireEvent.click(second);
+    await waitFor(() => expect(first).toHaveAttribute("aria-pressed", "true"));
+    expect(second).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(submit);
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(postedActions()[0].action).toEqual({
+      kind: "answer",
+      sessionId: SID,
+      generation: GEN,
+      interactionId: PENDING_ID,
+      answers: [
+        {
+          questionText: "这个任务接下来要做什么？",
+          selectedValues: ["opt-continue", "opt-test-first"],
           freeText: null,
         },
       ],

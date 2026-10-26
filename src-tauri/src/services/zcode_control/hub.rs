@@ -690,6 +690,7 @@ impl ZcodeHub {
     /// 会话、不跨代际、不缓存：许可被消费/过期/换代后，下一次 `session()` GET 立即
     /// 回到全关。普通构建没有许可册，行为恒为全关。
     fn session_capabilities(&self, session_id: &str, generation: u64) -> CapabilityView {
+        #[allow(unused_mut)]
         let mut view = CapabilityPolicy::for_host(
             UNVERIFIED_HOST_BUILD,
             UNVERIFIED_HOST_PROTOCOL,

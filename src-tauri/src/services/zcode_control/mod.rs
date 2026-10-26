@@ -36,6 +36,10 @@ pub mod relay;
 pub mod selection;
 pub mod types;
 
+// T8.1 生产链假服务（HTTP 切片）：真实回环 axum 端点的端到端用例，仅测试编译。
+#[cfg(test)]
+mod wire_e2e;
+
 // T8.2 未开闸能力的「单次验收许可」（默认关）：只允许 **debug 证据构建** 启用。
 // 编译门必须放在始终编译的 mod.rs（不能放进仅 debug 注册的 evidence 模块里）——
 // release + 该 feature 显式拒绝，杜绝验收许可带进发行包（同 `codex-ipc-e2e-stop`）。

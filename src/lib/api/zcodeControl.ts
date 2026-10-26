@@ -4,7 +4,9 @@
 // 输出**逐字段相同**（`#[serde(rename_all = "camelCase")]` 的字段名；枚举按各自
 // `rename_all` 的原值：`ConnectionState`/`ActionState` 为 snake_case，
 // `PendingKind`/`ControlEventKind` 为 camelCase）。TS 不能 import Rust 类型，任一侧
-// 漂移都是契约破坏——由 tests/mobile/zcodeControlApi.test.ts 的金标 JSON 对拍。
+// 漂移都是契约破坏——由 tests/mobile/zcodeControlApi.test.ts 的 **TS 手写契约测试**
+// 锁定（合成 DTO 夹具，**不是** Rust golden JSON 对拍：Rust 侧改名不会让该测试变红，
+// 跨语言漂移仍需人工/端到端核对）。
 //
 // 纪律：只走官方 `/m/api/v1/zcode/*`（T7.1 冻结入口）；**绝不**回退旧 `session-send`
 // 或无头 CLI 通道（那会把官方动作变成终端按键/伪造投递）。错误体只有冻结码
