@@ -1343,7 +1343,7 @@ mod tests {
 
     /// 全链装配：回环假官方（OAuth token / terminal token / relay WS / bridge RPC）
     /// + 生产 AuthService（真实 OAuth 回调）→ 生产 RelayClient → 生产 BridgeManager →
-    /// 生产 CommandSender → 生产 ZcodeHub → 生产事件泵。端点之外零替身。
+    ///   生产 CommandSender → 生产 ZcodeHub → 生产事件泵。端点之外零替身。
     struct Chain {
         /// 回环假官方 HTTP 服务：Drop 即停止（保活到用例结束）。
         _fake: FakeOfficialHttp,
