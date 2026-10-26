@@ -1,4 +1,4 @@
-// T7.2 Slice A2a：ZCode 统一控制状态 hook 行为锁（无 SSE；全合成夹具）。
+// T7.2 Slice A2a/A2b：ZCode 统一控制状态 hook 行为锁（全合成夹具）。
 //
 // 锁四件事：
 // 1. 连接态唯一来自 GET /zcode/connection——已保存链接/可读会话绝不等于已连接，
@@ -16,12 +16,14 @@ import {
   ZCODE_CONNECTION_PATH,
   ZCODE_SESSION_PATH,
   ZcodeControlApiError,
+  zcodeEventsUrl,
   type ActionReceipt,
   type CapabilityView,
   type ConnectionView,
   type ControlAction,
   type SessionView,
 } from "@/lib/api/zcodeControl";
+import { MockEventSource } from "./eventSourceMock";
 
 const SID = "session_0000000000000000000000000000000a";
 
@@ -118,13 +120,15 @@ function deferred<T>() {
 }
 
 beforeEach(() => {
-  vi.stubGlobal("EventSource", vi.fn());
+  MockEventSource.reset();
+  vi.stubGlobal("EventSource", MockEventSource);
 });
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  MockEventSource.reset();
 });
 
 describe("useZcodeControl：连接态唯一来自服务端 GET", () => {
@@ -155,9 +159,9 @@ describe("useZcodeControl：连接态唯一来自服务端 GET", () => {
     expect(result.current.connection?.state).not.toBe("paired");
     expect(result.current.reason).toBe("needs_auth");
     expect(result.current.loading).toBe(false);
-    // 保存链接不是客户端输入：加载阶段零写、零 SSE（SSE 是下一片）
+    // 保存链接不是客户端输入：加载阶段零写；SSE 只订阅本会话事件流
     expect(postedActions()).toHaveLength(0);
-    expect(EventSource).not.toHaveBeenCalled();
+    expect(MockEventSource.latest().url).toBe(zcodeEventsUrl(SID));
   });
 });
 
@@ -334,5 +338,124 @@ describe("useZcodeControl：回执语义", () => {
     expect(result.current.draftCleared).toBe(false);
     expect(result.current.reason).toBe("offline"); // 网络层失败按 offline 呈现
     expect(postedActions()).toHaveLength(3);
+  });
+});
+
+describe("useZcodeControl：SSE 纠偏（不重放动作）", () => {
+  it("sse_lag_triggers_get_resync", async () => {
+    let revision = 12;
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView({ revision }));
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    expect(result.current.session?.revision).toBe(12);
+    const connectionGets = () => calledUrls().filter((url) => url === ZCODE_CONNECTION_PATH).length;
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    expect(connectionGets()).toBe(1);
+    expect(sessionGets()).toBe(1);
+
+    revision = 13;
+    await act(async () => {
+      MockEventSource.latest().emit("resync", { reason: "lag" });
+      await Promise.resolve();
+    });
+    await flush();
+
+    // lag = 中间事件已丢：只重 GET 连接 + 会话纠偏，绝不重放动作
+    expect(connectionGets()).toBe(2);
+    expect(sessionGets()).toBe(2);
+    expect(result.current.session?.revision).toBe(13);
+    expect(postedActions()).toHaveLength(0);
+  });
+
+  it("sse_unsubscribes_on_unmount_and_session_change", async () => {
+    const SID2 = "sess_0000000000000000000000000000000b";
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { rerender, unmount } = renderHook(({ sid }: { sid: string }) => useZcodeControl(sid), {
+      initialProps: { sid: SID },
+    });
+    await flush();
+    expect(MockEventSource.instances).toHaveLength(1);
+    const first = MockEventSource.latest();
+    expect(first.url).toBe(zcodeEventsUrl(SID));
+
+    rerender({ sid: SID2 });
+    await flush();
+    // 换会话：旧流立即关闭，新流只订阅新会话（不共享旧事件面）
+    expect(first.closed).toBe(true);
+    expect(MockEventSource.instances).toHaveLength(2);
+    const second = MockEventSource.latest();
+    expect(second.url).toBe(zcodeEventsUrl(SID2));
+    expect(second.closed).toBe(false);
+
+    unmount();
+    expect(second.closed).toBe(true);
+  });
+
+  it("sse_stale_session_event_is_ignored", async () => {
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection({ generation: 3 }));
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(sessionView({ generation: 3, revision: 12 }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    const es = MockEventSource.latest();
+
+    // 旧代际帧：同会话但 generation=2，不得覆盖当前 generation=3 的投影
+    await act(async () => {
+      es.emit("session", {
+        seq: 1,
+        generation: 2,
+        sessionId: SID,
+        kind: "session",
+        data: sessionView({ generation: 2, revision: 99 }),
+      });
+    });
+    expect(result.current.session?.generation).toBe(3);
+    expect(result.current.session?.revision).toBe(12);
+
+    // 别的会话的帧：即使代际更高也不得污染本会话
+    await act(async () => {
+      es.emit("session", {
+        seq: 2,
+        generation: 9,
+        sessionId: "sess_0000000000000000000000000000000c",
+        kind: "session",
+        data: sessionView({
+          sessionId: "sess_0000000000000000000000000000000c",
+          generation: 9,
+          revision: 77,
+        }),
+      });
+    });
+    expect(result.current.session?.sessionId).toBe(SID);
+    expect(result.current.session?.revision).toBe(12);
+
+    // 当前代际的正常帧照常落地（不是一刀切丢弃）
+    await act(async () => {
+      es.emit("session", {
+        seq: 3,
+        generation: 3,
+        sessionId: SID,
+        kind: "session",
+        data: sessionView({ generation: 3, revision: 14 }),
+      });
+    });
+    expect(result.current.session?.revision).toBe(14);
+    expect(postedActions()).toHaveLength(0);
   });
 });

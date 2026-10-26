@@ -9,15 +9,19 @@
 // - 回执状态如实透传：`accepted` 只是宿主已受理（≠ 已生效）；`confirmed` 才是
 //   已生效。只有 `send` 的 `accepted` 允许清本次草稿；`send_failed`/`rejected`/
 //   `unknown` 一律保留草稿。网络/非 2xx 不伪造回执（抛出，`reason` 已置码）。
-// - `refresh` 是后续 SSE 片的纠偏入口：只重拉 GET（连接 + 会话），不置 loading，
-//   不清已有视图；迟到的旧会话/旧轮次响应一律作废。
-// - 本片**不**建立 EventSource；阅读链（看板/正文/文件预览）不依赖本 hook 成功。
+// - `refresh` 是 SSE 的纠偏入口：lag/断流/换代只重拉 GET（连接 + 会话），不置
+//   loading，不清已有视图；迟到的旧会话/旧代次事件一律作废。
+// - SSE（`/zcode/events?sessionId=`）：`snapshot`/`connection`/`session` 帧直接落地
+//   DTO；`action` 只作纠偏信号（重拉 GET，**绝不重放动作**）；`resync`（lag）同样
+//   只重拉 GET。卸载/切会话关闭流；别的会话或旧代次帧忽略。
+// - 阅读链（看板/正文/文件预览）不依赖本 hook 成功。
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ZcodeControlApiError,
   getZcodeConnection,
   getZcodeSession,
   postZcodeAction,
+  zcodeEventsUrl,
   type ActionReceipt,
   type ConnectionView,
   type ControlAction,
@@ -76,6 +80,38 @@ function receiptReason(receipt: ActionReceipt): string | null {
   return receipt.reasonCode ?? "unknown";
 }
 
+/** 帧形状守卫：坏帧/残缺 DTO 一律跳过（不因单帧异常断流或写入假视图）。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isConnectionView(value: unknown): value is ConnectionView {
+  return (
+    isRecord(value) && typeof value.state === "string" && Number.isSafeInteger(value.generation)
+  );
+}
+
+function isSessionView(value: unknown): value is SessionView {
+  return (
+    isRecord(value) &&
+    typeof value.sessionId === "string" &&
+    Number.isSafeInteger(value.generation) &&
+    typeof value.ready === "boolean"
+  );
+}
+
+/** `ControlEvent` 的线上形状（`snapshot`/`resync` 帧无此包裹，单独处理）。 */
+interface ControlEventFrame {
+  seq: number;
+  generation: number;
+  sessionId: string | null;
+  kind: string;
+  data: unknown;
+}
+
+/** 断流后的重连基线（毫秒）：线性退避，无上限（纠偏 GET 已先补状态）。 */
+const SSE_RECONNECT_BASE_MS = 1000;
+
 export default function useZcodeControl(sessionId: string): UseZcodeControlResult {
   const [connection, setConnection] = useState<ConnectionView | null>(null);
   const [session, setSession] = useState<SessionView | null>(null);
@@ -90,42 +126,66 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
   const readRunRef = useRef(0);
   /** 在途提交计数：并发提交时最后一个结束才复位 submitting。 */
   const inflightSubmitsRef = useRef(0);
+  /** 已落地的代次（连接/会话各自）：SSE/GET 帧低于它 = 迟到旧代，丢弃。 */
+  const generationRef = useRef({ connection: -1, session: -1 });
 
-  /** 读连接 + 会话并落地；返回是否真正生效（旧会话/旧轮次 → false，不写 state）。 */
-  const applyRead = useCallback(async (sid: string, run: number): Promise<boolean> => {
-    const isCurrent = () => sessionRef.current === sid && readRunRef.current === run;
-    // 两面分开读：任一失败不拖累另一面（控制失败时阅读链照常）。
-    const connectionRead = getZcodeConnection().then(
-      (value) => ({ ok: true as const, value }),
-      (error: unknown) => ({ ok: false as const, error })
-    );
-    const sessionRead = getZcodeSession(sid).then(
-      (value) => ({ ok: true as const, value }),
-      (error: unknown) => ({ ok: false as const, error })
-    );
-    // 各自先落地：连接 GET 挂起时，会话投影仍可先显示（不被慢面拖住）。
-    void connectionRead.then((outcome) => {
-      if (outcome.ok && isCurrent()) setConnection(outcome.value);
-    });
-    void sessionRead.then((outcome) => {
-      if (outcome.ok && isCurrent()) setSession(outcome.value);
-    });
-    const [connectionResult, sessionResult] = await Promise.all([connectionRead, sessionRead]);
-    if (!isCurrent()) return false;
-    // 原因面等两面都到齐再定：连接错误优先，连接正常时取会话错误。
-    let nextReason = connectionResult.ok
-      ? connectionReason(connectionResult.value)
-      : errorReason(connectionResult.error);
-    if (!sessionResult.ok && nextReason === null) {
-      nextReason = errorReason(sessionResult.error);
-    }
-    setReason(nextReason);
+  /** 落地连接视图并推进代次；返回 false = 旧代次（不写 state）。 */
+  const applyConnection = useCallback((view: ConnectionView): boolean => {
+    if (view.generation < generationRef.current.connection) return false;
+    generationRef.current.connection = view.generation;
+    setConnection(view);
     return true;
   }, []);
+
+  /** 落地会话投影并推进代次；别的会话/旧代次 → false（不写 state）。 */
+  const applySessionView = useCallback((view: SessionView): boolean => {
+    if (view.sessionId !== sessionRef.current) return false;
+    if (view.generation < generationRef.current.session) return false;
+    generationRef.current.session = view.generation;
+    setSession(view);
+    return true;
+  }, []);
+
+  /** 读连接 + 会话并落地；返回是否真正生效（旧会话/旧轮次 → false，不写 state）。 */
+  const applyRead = useCallback(
+    async (sid: string, run: number): Promise<boolean> => {
+      const isCurrent = () => sessionRef.current === sid && readRunRef.current === run;
+      // 两面分开读：任一失败不拖累另一面（控制失败时阅读链照常）。
+      const connectionRead = getZcodeConnection().then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error })
+      );
+      const sessionRead = getZcodeSession(sid).then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error })
+      );
+      // 各自先落地：连接 GET 挂起时，会话投影仍可先显示（不被慢面拖住）。
+      void connectionRead.then((outcome) => {
+        if (outcome.ok && isCurrent()) applyConnection(outcome.value);
+      });
+      void sessionRead.then((outcome) => {
+        if (outcome.ok && isCurrent()) applySessionView(outcome.value);
+      });
+      const [connectionResult, sessionResult] = await Promise.all([connectionRead, sessionRead]);
+      if (!isCurrent()) return false;
+      // 原因面等两面都到齐再定：连接错误优先，连接正常时取会话错误。
+      let nextReason = connectionResult.ok
+        ? connectionReason(connectionResult.value)
+        : errorReason(connectionResult.error);
+      if (!sessionResult.ok && nextReason === null) {
+        nextReason = errorReason(sessionResult.error);
+      }
+      setReason(nextReason);
+      return true;
+    },
+    [applyConnection, applySessionView]
+  );
 
   useEffect(() => {
     let alive = true;
     sessionRef.current = sessionId;
+    // 换会话：旧代次一律作废（新会话从自己的首个快照重新起算）。
+    generationRef.current = { connection: -1, session: -1 };
     const run = ++readRunRef.current;
     // 换会话先清旧视图：旧连接/旧原因/旧草稿标记不得跨会话显示。
     setConnection(null);
@@ -148,6 +208,105 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
     const applied = await applyRead(sid, ++readRunRef.current);
     if (applied) setLoading(false);
   }, [applyRead]);
+
+  // ==== SSE：会话作用域事件流（DTO 直接落地；lag/断流只重 GET）====
+  useEffect(() => {
+    if (typeof EventSource === "undefined") return; // 无 SSE 运行时：GET 首拍仍权威
+    let stopped = false;
+    let source: EventSource | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /** 解析并落地一帧；坏帧/残缺 DTO/旧代次/别的会话一律跳过（不断流）。 */
+    const dispatch = (name: string, event: Event) => {
+      let frame: unknown;
+      try {
+        frame = JSON.parse((event as MessageEvent).data);
+      } catch {
+        return;
+      }
+      if (!isRecord(frame)) return;
+
+      if (name === "snapshot") {
+        // 首帧/重连基线：连接与（可绑定时的）会话投影一起纠偏
+        if (isConnectionView(frame.connection)) applyConnection(frame.connection);
+        if (isSessionView(frame.session)) applySessionView(frame.session);
+        return;
+      }
+      if (name === "resync") {
+        // lag = 中间事件已丢：只重 GET 自愈，**绝不重放动作**
+        void refresh();
+        return;
+      }
+
+      const envelope = frame as unknown as ControlEventFrame;
+      if (!Number.isSafeInteger(envelope.generation)) return;
+      const foreign =
+        envelope.sessionId !== null &&
+        envelope.sessionId !== undefined &&
+        envelope.sessionId !== sessionId;
+      if (foreign) return;
+
+      if (name === "connection") {
+        if (!isConnectionView(envelope.data)) return;
+        const previous = generationRef.current.connection;
+        if (!applyConnection(envelope.data)) return;
+        if (previous >= 0 && envelope.data.generation > previous) {
+          // 换代：旧代 pending 失效（新投影由重 GET / 后续 session 帧补上）
+          setSession(null);
+          void refresh();
+        }
+        return;
+      }
+      if (name === "session") {
+        if (envelope.sessionId !== sessionId) return; // 缺会话维度的会话帧保守丢弃
+        if (envelope.generation < generationRef.current.session) return; // 旧代次
+        if (isSessionView(envelope.data)) applySessionView(envelope.data);
+        return;
+      }
+      if (name === "action") {
+        if (envelope.sessionId !== sessionId) return;
+        if (
+          envelope.generation <
+          Math.max(generationRef.current.connection, generationRef.current.session)
+        ) {
+          return;
+        }
+        // 回执帧只作纠偏信号：重拉 GET，不重放动作/不伪造本端回执
+        void refresh();
+      }
+    };
+
+    const connect = () => {
+      if (stopped) return;
+      let next: EventSource;
+      try {
+        next = new EventSource(zcodeEventsUrl(sessionId));
+      } catch {
+        return; // 构造失败：GET 首拍仍权威，不做注定失败的退避
+      }
+      source = next;
+      next.addEventListener("snapshot", (e) => dispatch("snapshot", e));
+      next.addEventListener("connection", (e) => dispatch("connection", e));
+      next.addEventListener("session", (e) => dispatch("session", e));
+      next.addEventListener("action", (e) => dispatch("action", e));
+      next.addEventListener("resync", (e) => dispatch("resync", e));
+      next.onerror = () => {
+        if (stopped) return;
+        next.close(); // 自管重连：断流后先 GET 纠偏，再按基线退避
+        if (source === next) source = null;
+        void refresh();
+        retryTimer = setTimeout(connect, SSE_RECONNECT_BASE_MS);
+      };
+    };
+
+    connect();
+    return () => {
+      stopped = true;
+      source?.close();
+      source = null;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
+  }, [sessionId, applyConnection, applySessionView, refresh]);
 
   const submit = useCallback(async (action: ControlAction): Promise<ActionReceipt> => {
     // 一次提交 = 一个 actionId：请求体与回执同一个；重试是新提交 → 新 ID。
