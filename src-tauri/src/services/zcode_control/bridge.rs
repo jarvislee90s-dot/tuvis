@@ -917,6 +917,23 @@ impl BridgeManager {
         method: &str,
         args: Vec<Value>,
     ) -> ZResult<Value> {
+        self.call_with_timeout(target, channel, method, args, self.shared.timing.rpc)
+            .await
+    }
+
+    /// 带显式应答窗的 RPC（T3 写命令：ACK 窗由调用方给出，如 `command::ACK_TIMEOUT` 20s）。
+    ///
+    /// `timeout` 直接作为本调用 RPC 待答条目的期限：超窗时**本层**清账
+    /// （`unregister_rpc`）并返回 `not_ready`——因此调用方不得再外套超时，
+    /// 否则取消 future 会绕过清理，在 pending 里留下永不回收的 waiter。
+    pub async fn call_with_timeout(
+        &self,
+        target: &BoundTarget,
+        channel: &str,
+        method: &str,
+        args: Vec<Value>,
+        timeout: Duration,
+    ) -> ZResult<Value> {
         let (bridge_id, needs_resync) = {
             let inner = lock(&self.shared.state);
             if inner.generation != target.generation {
@@ -949,14 +966,7 @@ impl BridgeManager {
         };
         let message = self
             .shared
-            .rpc_call(
-                &bridge_id,
-                channel,
-                method,
-                args,
-                self.shared.timing.rpc,
-                Some(guard),
-            )
+            .rpc_call(&bridge_id, channel, method, args, timeout, Some(guard))
             .await?;
         Ok(message.body)
     }

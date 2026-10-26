@@ -8,6 +8,7 @@
 //! 内部 cause 不得自动 Debug 到日志（[`ZcodeError`] 因此不携带 cause）。
 
 use std::fmt;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -270,7 +271,11 @@ pub struct ActionReceipt {
 
 /// 动作调用方上下文：`device_id`/`device_name` 只能来自配对门／本机 DB，
 /// 客户端仅提交 `actionId`（共享合同表）。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// **只由服务端构造**：故意不实现 `Deserialize`——HTTP 面不得把请求体直接映射成
+/// 本类型（T7.1 的 DTO 只接受 `actionId`，`device_id`/`device_name` 由配对门与本机
+/// DB 填充；T8.1 接线时须复核这一点）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionContext {
     pub action_id: String,
@@ -390,6 +395,11 @@ impl ControlAction {
 /// HTTP 层也无法传入任意 wire（信封只在模块内生成）。测试 fake 记录出站调用并注入
 /// 应答/超窗/断线。
 ///
+/// `timeout` 是**本次调用的应答窗**，由调用方（写命令 = 20s ACK 窗）给出，生产实现
+/// 必须把它作为该 RPC pending 条目的期限，并在超窗时自行清理 waiter（迟到应答丢弃）。
+/// 调用方**不得**再对返回的 future 外套超时：取消会绕过实现侧的 pending 清理，
+/// 留下永不回收的条目。
+///
 /// 错误码语义（生产实现保证）：
 /// - `stale_generation` / `no_session`：**确证零写**（绑定代际/会话在写前被拒）；
 /// - `not_ready`：就绪闸拒绝（零写）**或**已写出但等应答超窗——调用方按保守
@@ -404,6 +414,7 @@ pub trait CommandPort: Send + Sync {
         channel: &'a str,
         method: &'a str,
         args: Vec<Value>,
+        timeout: Duration,
     ) -> BoxFuture<'a, ZResult<Value>>;
 }
 

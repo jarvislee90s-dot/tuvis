@@ -33,6 +33,57 @@ pub fn record_start_conn(
     kind: &str,
     summary: &str,
 ) -> rusqlite::Result<()> {
+    record_conn(
+        conn,
+        ts,
+        device_id,
+        device_name,
+        session_id,
+        kind,
+        summary,
+        "started",
+    )
+}
+
+/// 记录一条终态审计（`accepted` / `unknown` / `send_failed` / …，与账本落账**同一
+/// 事务**：审计失败 ⇒ 账本状态一并回滚，行保持 `reserved` 的保守可见态）。
+///
+/// `summary` 必须沿用预留时落库的同一条摘要（类别 + 计数，无正文），这样审计页
+/// 能靠「session + 时间 + 摘要」把 started 与终态对上账本行。
+#[allow(clippy::too_many_arguments)]
+pub fn record_terminal_conn(
+    conn: &Connection,
+    ts: i64,
+    device_id: &str,
+    device_name: &str,
+    session_id: &str,
+    kind: &str,
+    summary: &str,
+    result: &str,
+) -> rusqlite::Result<()> {
+    record_conn(
+        conn,
+        ts,
+        device_id,
+        device_name,
+        session_id,
+        kind,
+        summary,
+        result,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_conn(
+    conn: &Connection,
+    ts: i64,
+    device_id: &str,
+    device_name: &str,
+    session_id: &str,
+    kind: &str,
+    summary: &str,
+    result: &str,
+) -> rusqlite::Result<()> {
     let action = format!("{ACTION_PREFIX}{kind}");
     write_audit::record_conn_checked(
         conn,
@@ -44,6 +95,6 @@ pub fn record_start_conn(
         CHANNEL,
         &action,
         summary,
-        "started",
+        result,
     )
 }

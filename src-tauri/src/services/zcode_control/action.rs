@@ -28,6 +28,14 @@ use super::types::{
 /// T3 唯一实际写出的动作类别（其余 `ControlAction` 变体由后续任务接入）。
 pub const T3_ACTION_KIND: &str = "send";
 
+/// DB 专用的「已预留、尚未落账」状态。
+///
+/// **不**出现在 wire 上：`ActionState` 没有该变体，读取侧一律映射为保守
+/// `unknown`（[`ActionState::from_db`] 对未知字面量返回 `None` → `unknown`）。
+/// 独立前态让 [`ActionStore::record_result`] 能以 CAS（`state='reserved'`）实现
+/// 「一次派发恰好一次落账」——预留态与合法终态 `unknown` 不再是同一个字面量。
+const RESERVED_STATE: &str = "reserved";
+
 /// 预留结果：首次写入 vs 幂等命中既有回执。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reservation {
@@ -47,12 +55,18 @@ pub struct ActionStore {
 struct ActionRow {
     action_id: String,
     device_id: String,
+    device_name: String,
     session_id: String,
     generation: u64,
     kind: String,
     payload_hash: String,
+    /// 对外可见状态（`reserved` 已映射为保守 `unknown`）。
     state: ActionState,
+    /// 原始 DB 字面量：落账 CAS 需要区分 `reserved` 与合法终态 `unknown`。
+    db_state: String,
     reason_code: Option<String>,
+    /// 审计摘要（类别 + 计数，无正文）：终态审计沿用同一条。
+    summary: String,
 }
 
 impl ActionRow {
@@ -100,7 +114,13 @@ fn conflict() -> ZcodeError {
 // ============================================================
 
 /// 规范 JSON：对象键递归排序、无空白（`preserve_order` 下也必须显式排序）。
-fn canonical_json(value: &Value) -> String {
+///
+/// **可失败**：序列化错误必须上抛，绝不以空串兜底——否则两个不同载荷会折叠成
+/// 同一指纹，幂等判定会把「换了正文」误判成重放。
+///
+/// 已知边界（T3 参数全是字符串，暂不可见）：数字未归一（`1` 与 `1.0` 指纹不同）、
+/// Unicode 未归一（NFC/NFD 指纹不同）。T4+ 引入数值参数时必须统一用整数构造。
+fn canonical_json(value: &Value) -> Result<String, serde_json::Error> {
     match value {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
@@ -110,12 +130,12 @@ fn canonical_json(value: &Value) -> String {
                 if i > 0 {
                     out.push(',');
                 }
-                out.push_str(&serde_json::to_string(key).unwrap_or_default());
+                out.push_str(&serde_json::to_string(key)?);
                 out.push(':');
-                out.push_str(&canonical_json(&map[*key]));
+                out.push_str(&canonical_json(&map[*key])?);
             }
             out.push('}');
-            out
+            Ok(out)
         }
         Value::Array(items) => {
             let mut out = String::from("[");
@@ -123,25 +143,37 @@ fn canonical_json(value: &Value) -> String {
                 if i > 0 {
                     out.push(',');
                 }
-                out.push_str(&canonical_json(item));
+                out.push_str(&canonical_json(item)?);
             }
             out.push(']');
-            out
+            Ok(out)
         }
-        _ => serde_json::to_string(value).unwrap_or_default(),
+        _ => serde_json::to_string(value),
     }
 }
 
 /// 动作载荷指纹：`kind + sessionId + generation + 全部动作参数` 的规范 JSON 后
 /// sha256 hex。**只存指纹，不存正文**；跨设备同 actionId 不泄漏旧回执。
-pub fn payload_hash(kind: &str, session_id: &str, generation: u64, params: &Value) -> String {
+///
+/// 规范 JSON 无法序列化时返回 `invalid_action`（绝不退回空串/默认值）。
+pub fn payload_hash(
+    kind: &str,
+    session_id: &str,
+    generation: u64,
+    params: &Value,
+) -> ZResult<String> {
     let doc = serde_json::json!({
         "kind": kind,
         "sessionId": session_id,
         "generation": generation,
         "params": params,
     });
-    sha256_hex(canonical_json(&doc).as_bytes())
+    let canonical = canonical_json(&doc).map_err(|error| {
+        // 只记录 serde_json 自身的错误（Value 无正文输出面，错误不含载荷）。
+        log::error!("zcode_actions: canonical json failed: {error}");
+        ZcodeError::of(codes::INVALID_ACTION)
+    })?;
+    Ok(sha256_hex(canonical.as_bytes()))
 }
 
 /// 从统一动作提取参与指纹的全部参数（Slice B 的 `CommandSender` 与审计共用）。
@@ -207,22 +239,25 @@ pub fn audit_summary(kind: &str, params: &Value) -> String {
 // 行读取
 // ============================================================
 
-const SELECT_COLS: &str = "action_id, device_id, session_id, generation, kind, payload_hash, \
-     state, reason_code";
+const SELECT_COLS: &str = "action_id, device_id, device_name, session_id, generation, kind, \
+     payload_hash, state, reason_code, summary";
 
 fn row_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionRow> {
-    let state: String = row.get(6)?;
+    let db_state: String = row.get(7)?;
     Ok(ActionRow {
         action_id: row.get(0)?,
         device_id: row.get(1)?,
-        session_id: row.get(2)?,
+        device_name: row.get(2)?,
+        session_id: row.get(3)?,
         // rusqlite 0.40 无 u64 FromSql：generation 恒为非负，经 i64 存取。
-        generation: row.get::<_, i64>(3)?.max(0) as u64,
-        kind: row.get(4)?,
-        payload_hash: row.get(5)?,
-        // 坏值按 unknown 保守处置（绝不猜测成已受理）。
-        state: ActionState::from_db(&state).unwrap_or(ActionState::Unknown),
-        reason_code: row.get(7)?,
+        generation: row.get::<_, i64>(4)?.max(0) as u64,
+        kind: row.get(5)?,
+        payload_hash: row.get(6)?,
+        // 坏值按 unknown 保守处置（绝不猜测成已受理）；`reserved` 同样映射为 unknown。
+        state: ActionState::from_db(&db_state).unwrap_or(ActionState::Unknown),
+        db_state,
+        reason_code: row.get(8)?,
+        summary: row.get(9)?,
     })
 }
 
@@ -246,19 +281,24 @@ impl ActionStore {
     }
 
     /// 预留动作（T3 的发送路径，kind 固定 `send`）。
+    ///
+    /// `summary` 由调用方按 [`audit_summary`] 生成（类别 + 字数/选项数，**不含正文**），
+    /// 与预留行一起落库：起始审计与终态审计都沿用它。
     pub fn reserve(
         &self,
         ctx: &ActionContext,
         target: &BoundTarget,
         payload_hash: &str,
+        summary: &str,
     ) -> ZResult<Reservation> {
-        self.reserve_with_kind(ctx, target, T3_ACTION_KIND, payload_hash)
+        self.reserve_with_kind(ctx, target, T3_ACTION_KIND, payload_hash, summary)
     }
 
     /// 预留任意类别（后续任务接入 answer/permission/… 时使用；T3 发送走 [`reserve`]）。
     ///
     /// 行为（单次 `with()`，SQL 全在闭包内）：
-    /// - 行不存在：插入保守 `unknown` 行 + 起始审计（**同一事务**），提交后返回 New；
+    /// - 行不存在：插入 `reserved` 行（DB 专用前态，回执映射为 `unknown`）+
+    ///   起始审计（**同一事务**），提交后返回 New；
     /// - 同 id 且 device/session/generation/kind/payload_hash 全同：Existing（零新行）；
     /// - 上述任一不同（含跨设备同 id）：`action_payload_conflict`，零写入。
     ///
@@ -269,8 +309,9 @@ impl ActionStore {
         target: &BoundTarget,
         kind: &str,
         payload_hash: &str,
+        summary: &str,
     ) -> ZResult<Reservation> {
-        if kind.is_empty() {
+        if kind.is_empty() || summary.is_empty() {
             return Err(ZcodeError::of(codes::INVALID_ACTION));
         }
         let now = now_ms();
@@ -290,16 +331,18 @@ impl ActionStore {
             }
             tx.execute(
                 "INSERT INTO zcode_actions
-                    (action_id, device_id, session_id, generation, kind, payload_hash,
-                     state, reason_code, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unknown', NULL, ?7, ?7)",
+                    (action_id, device_id, device_name, session_id, generation, kind,
+                     payload_hash, state, reason_code, summary, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'reserved', NULL, ?8, ?9, ?9)",
                 params![
                     ctx.action_id,
                     ctx.device_id,
+                    ctx.device_name,
                     session_id,
                     target.generation as i64,
                     kind,
                     payload_hash,
+                    summary,
                     now
                 ],
             )
@@ -312,7 +355,7 @@ impl ActionStore {
                 &ctx.device_name,
                 &session_id,
                 kind,
-                &audit_summary(kind, &Value::Null),
+                summary,
             )
             .map_err(db_err)?;
             tx.commit().map_err(db_err)?;
@@ -320,12 +363,18 @@ impl ActionStore {
         })
     }
 
-    /// 落账回执：只更新匹配行；`accepted` 绝不被无因果证据降级。
+    /// 落账回执：**恰好一次** CAS 收口，终态绝不被第二次 finish 改写。
     ///
-    /// 规则：当前为 `accepted` 时，只有 `confirmed`（宿主撤卡/守卫消失等因果终态）
-    /// 允许改写；`send_failed`/`unknown`/`rejected`/`noop` 一律零写入（保持 accepted
-    /// 与原因码）。其余状态按回执落库。回执与行身份（session/generation）不符或行
-    /// 不存在 ⇒ `storage_failed`（不伪造成功）。
+    /// 转移表（`state` 为原始 DB 字面量）：
+    /// - `reserved` → 回执状态（首次 finish 唯一允许的改写）；
+    /// - `accepted` → `confirmed`（因果升级：宿主撤卡/守卫消失；仍是合法终态）；
+    /// - 其余（已 `accepted` 的降级尝试、已 `send_failed`/`unknown`/`noop`/`rejected`、
+    ///   已 `confirmed`）一律**零写入、零审计**，直接 `Ok(())`——重复 finish 是无害
+    ///   幂等空操作，绝不把终态改写成另一次观测。
+    ///
+    /// 终态审计与状态更新**同一事务**：审计写失败 ⇒ 事务回滚，账本行保持
+    /// `reserved`（对外仍可见为保守 `unknown`），由调用方上报，不谎报成功。
+    /// 回执与行身份（session/generation）不符或行不存在 ⇒ `storage_failed`。
     pub fn record_result(&self, receipt: &ActionReceipt) -> ZResult<()> {
         let now = now_ms();
         self.store.with(|conn| {
@@ -336,27 +385,47 @@ impl ActionStore {
             if row.session_id != receipt.session_id || row.generation != receipt.generation {
                 return Err(storage_failed());
             }
-            if row.state == ActionState::Accepted && receipt.state != ActionState::Confirmed {
-                // 已受理是权威终态：无因果证据的失败/未知不得降级（零写入）。
+            // CAS 前态：只有「预留」可被任意回执收口；accepted 只允许因果升级。
+            let expected = if row.db_state == RESERVED_STATE {
+                RESERVED_STATE
+            } else if row.db_state == ActionState::Accepted.as_str()
+                && receipt.state == ActionState::Confirmed
+            {
+                ActionState::Accepted.as_str()
+            } else {
+                // 已是终态：恰好一次 = 第二次 finish 影响零行，绝不改写。
                 return Ok(());
-            }
+            };
             let changed = tx
                 .execute(
                     "UPDATE zcode_actions SET state = ?2, reason_code = ?3, updated_at = ?4
-                     WHERE action_id = ?1 AND session_id = ?5 AND generation = ?6",
+                     WHERE action_id = ?1 AND session_id = ?5 AND generation = ?6 AND state = ?7",
                     params![
                         receipt.action_id,
                         receipt.state.as_str(),
                         receipt.reason_code,
                         now,
                         receipt.session_id,
-                        receipt.generation as i64
+                        receipt.generation as i64,
+                        expected
                     ],
                 )
                 .map_err(db_err)?;
-            if changed != 1 {
-                return Err(storage_failed());
+            if changed == 0 {
+                // 跨进程竞态：前态已被别人收口 → 同样零写入、零审计。
+                return Ok(());
             }
+            audit::record_terminal_conn(
+                &tx,
+                now,
+                &row.device_id,
+                &row.device_name,
+                &row.session_id,
+                &row.kind,
+                &row.summary,
+                receipt.state.as_str(),
+            )
+            .map_err(db_err)?;
             tx.commit().map_err(db_err)?;
             Ok(())
         })
@@ -449,17 +518,30 @@ mod tests {
         })
     }
 
-    /// 首次预留：保守 unknown 行 + started 审计同事务落库。
+    /// 首次预留：`reserved` 行（对外映射 unknown）+ started 审计同事务落库。
     #[test]
     fn reserve_new_writes_started_audit_in_same_transaction() {
         let store = DeviceStore::memory();
         let actions = ActionStore::new(store.clone());
         let got = actions
-            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1")
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
             .unwrap();
         assert_eq!(got, Reservation::New);
         assert_eq!(row_count(&store), 1);
-        assert_eq!(stored_state(&store, "a-1"), "unknown");
+        assert_eq!(
+            stored_state(&store, "a-1"),
+            "reserved",
+            "DB 专用前态：与合法终态 unknown 区分，才能做恰好一次 CAS"
+        );
+        assert_eq!(
+            actions
+                .lookup("a-1", "dev-1", SESSION, GEN)
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Unknown,
+            "reserved 对外必须映射为保守 unknown"
+        );
         let rows = audits(&store);
         assert_eq!(rows.len(), 1, "起始审计必须随预留同事务落库");
         assert_eq!(rows[0].channel, "zcode_official");
@@ -468,7 +550,7 @@ mod tests {
         assert_eq!(rows[0].result, "started");
         assert_eq!(rows[0].session_id, SESSION);
         assert_eq!(rows[0].device_name, "iPhone");
-        assert_eq!(rows[0].summary, "send", "摘要只含类别与计数");
+        assert_eq!(rows[0].summary, "send chars=2", "摘要只含类别与字数");
     }
 
     /// 审计表不可写：预留整体回滚——零行、零审计、storage_failed。
@@ -478,7 +560,7 @@ mod tests {
         let actions = ActionStore::new(store.clone());
         store.with(|c| c.execute_batch("DROP TABLE write_audit;").unwrap());
         let err = actions
-            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1")
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
             .unwrap_err();
         assert_eq!(err.code, "storage_failed");
         assert_eq!(row_count(&store), 0, "审计失败必须整体回滚（零行）");
@@ -490,11 +572,11 @@ mod tests {
         let store = DeviceStore::memory();
         let actions = ActionStore::new(store.clone());
         let first = actions
-            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1")
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
             .unwrap();
         assert_eq!(first, Reservation::New);
         let second = actions
-            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1")
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
             .unwrap();
         match second {
             Reservation::Existing(r) => {
@@ -515,10 +597,10 @@ mod tests {
         let store = DeviceStore::memory();
         let actions = ActionStore::new(store.clone());
         actions
-            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1")
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
             .unwrap();
         let err = actions
-            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-2")
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-2", "send chars=2")
             .unwrap_err();
         assert_eq!(err.code, "action_payload_conflict");
         assert_eq!(row_count(&store), 1, "冲突不得新增行");
@@ -531,10 +613,10 @@ mod tests {
         let store = DeviceStore::memory();
         let actions = ActionStore::new(store.clone());
         actions
-            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1")
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
             .unwrap();
         let err = actions
-            .reserve(&ctx("a-1", "dev-2"), &target(), "hash-1")
+            .reserve(&ctx("a-1", "dev-2"), &target(), "hash-1", "send chars=2")
             .unwrap_err();
         assert_eq!(err.code, "action_payload_conflict");
         assert_eq!(row_count(&store), 1);
@@ -565,12 +647,12 @@ mod tests {
         let store = DeviceStore::memory();
         let before = ActionStore::new(store.clone());
         before
-            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1")
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
             .unwrap();
         // 新实例 = 重启后的进程视图（同一持久库）
         let after = ActionStore::new(store.clone());
         match after
-            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1")
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
             .unwrap()
         {
             Reservation::Existing(r) => assert_eq!(r.state, ActionState::Unknown),
@@ -585,7 +667,7 @@ mod tests {
         let store = DeviceStore::memory();
         let actions = ActionStore::new(store.clone());
         actions
-            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1")
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
             .unwrap();
         actions
             .record_result(&receipt("a-1", ActionState::Accepted, None))
@@ -625,6 +707,162 @@ mod tests {
         );
     }
 
+    /// 恰好一次落账：只有预留行能被**第一次** finish 改写；已受理/已零写/已确认等
+    /// 终态不被第二次 finish 覆盖，也不重复写终态审计（T4+ 的「超时收口」与迟到
+    /// ACK 同时收口同一行时不得互相改写）。
+    #[test]
+    fn record_result_is_cas_and_never_rewrites_terminal() {
+        let store = DeviceStore::memory();
+        let actions = ActionStore::new(store.clone());
+        actions
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
+            .unwrap();
+        actions
+            .record_result(&receipt("a-1", ActionState::Accepted, None))
+            .unwrap();
+        let audits_after_first_finish = audits(&store).len();
+        assert_eq!(
+            audits_after_first_finish, 2,
+            "起始 + 终态各一条审计（started + accepted）"
+        );
+
+        // 第二次 finish（更晚的失败证据）不得改写已受理终态，也不得二次审计。
+        actions
+            .record_result(&receipt("a-1", ActionState::SendFailed, Some("late_zero")))
+            .unwrap();
+        actions
+            .record_result(&receipt("a-1", ActionState::Unknown, Some("unknown")))
+            .unwrap();
+        let accepted = actions
+            .lookup("a-1", "dev-1", SESSION, GEN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.state, ActionState::Accepted);
+        assert_eq!(accepted.reason_code, None, "重复 finish 不得污染原因码");
+        assert_eq!(
+            audits(&store).len(),
+            audits_after_first_finish,
+            "重复 finish 不得新增终态审计"
+        );
+
+        // 确证零写（send_failed）同样是终态：后续 accepted 不得把它改写成成功。
+        actions
+            .reserve(&ctx("a-2", "dev-1"), &target(), "hash-2", "send chars=2")
+            .unwrap();
+        actions
+            .record_result(&receipt("a-2", ActionState::SendFailed, Some("write_zero")))
+            .unwrap();
+        actions
+            .record_result(&receipt("a-2", ActionState::Accepted, None))
+            .unwrap();
+        let failed = actions
+            .lookup("a-2", "dev-1", SESSION, GEN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, ActionState::SendFailed);
+        assert_eq!(failed.reason_code.as_deref(), Some("write_zero"));
+
+        // 已受理的因果升级（accepted → confirmed）仍是唯一允许的二次转移。
+        actions
+            .record_result(&receipt("a-1", ActionState::Confirmed, None))
+            .unwrap();
+        assert_eq!(
+            actions
+                .lookup("a-1", "dev-1", SESSION, GEN)
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Confirmed
+        );
+        // confirmed 也不得再被降级。
+        actions
+            .record_result(&receipt("a-1", ActionState::SendFailed, Some("late_zero")))
+            .unwrap();
+        assert_eq!(
+            actions
+                .lookup("a-1", "dev-1", SESSION, GEN)
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Confirmed
+        );
+    }
+
+    /// 终态审计写失败：状态更新随同事务回滚——行保持 `reserved`（对外 unknown），
+    /// 绝不出现「账本已 accepted、审计缺失」的半写状态。
+    #[test]
+    fn terminal_audit_failure_keeps_action_reserved() {
+        let store = DeviceStore::memory();
+        let actions = ActionStore::new(store.clone());
+        actions
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
+            .unwrap();
+        store.with(|c| c.execute_batch("DROP TABLE write_audit;").unwrap());
+
+        let err = actions
+            .record_result(&receipt("a-1", ActionState::Accepted, None))
+            .unwrap_err();
+        assert_eq!(err.code, "storage_failed");
+        assert_eq!(
+            stored_state(&store, "a-1"),
+            "reserved",
+            "终态审计失败必须回滚状态更新（不得半写 accepted）"
+        );
+        assert_eq!(
+            actions
+                .lookup("a-1", "dev-1", SESSION, GEN)
+                .unwrap()
+                .unwrap()
+                .state,
+            ActionState::Unknown,
+            "回滚后对外仍是保守 unknown"
+        );
+    }
+
+    /// 同 actionId 换 session：账本层直接判冲突（不经 command 层的绑定校验）。
+    #[test]
+    fn same_action_id_with_different_session_is_conflict() {
+        let store = DeviceStore::memory();
+        let actions = ActionStore::new(store.clone());
+        actions
+            .reserve(&ctx("a-1", "dev-1"), &target(), "hash-1", "send chars=2")
+            .unwrap();
+        let mut other = target();
+        other.session_id = "sess_other_0123456789abcdef01234567".to_string();
+        let err = actions
+            .reserve(&ctx("a-1", "dev-1"), &other, "hash-1", "send chars=2")
+            .unwrap_err();
+        assert_eq!(err.code, "action_payload_conflict");
+        assert_eq!(row_count(&store), 1, "冲突不得新增行");
+        assert_eq!(audits(&store).len(), 1, "冲突不得新增审计");
+    }
+
+    /// 规范 JSON 编码**可失败**（不再 `unwrap_or_default()`）：序列化错误必须上抛，
+    /// 否则两个不同载荷会折叠成同一指纹，把「换了正文」误判成幂等重放。
+    #[test]
+    fn payload_hash_is_fallible_and_distinguishes_payloads() {
+        let canonical =
+            canonical_json(&serde_json::json!({ "b": 1, "a": [true, null, "x"] })).unwrap();
+        assert_eq!(canonical, r#"{"a":[true,null,"x"],"b":1}"#);
+
+        let a = payload_hash("send", SESSION, GEN, &serde_json::json!({ "text": "甲" })).unwrap();
+        let b = payload_hash("send", SESSION, GEN, &serde_json::json!({ "text": "乙" })).unwrap();
+        let c = payload_hash("send", SESSION, GEN, &serde_json::json!({ "text": "" })).unwrap();
+        assert_ne!(a, b, "不同正文绝不折叠成同一指纹");
+        assert_ne!(a, c);
+        // 值相同、键序不同仍是同一指纹（对象键递归排序）。
+        assert_eq!(
+            payload_hash("send", SESSION, GEN, &serde_json::json!({ "x": 1, "y": 2 })).unwrap(),
+            payload_hash(
+                "send",
+                SESSION,
+                GEN,
+                &serde_json::from_str::<Value>(r#"{"y":2,"x":1}"#).unwrap()
+            )
+            .unwrap()
+        );
+    }
+
     /// 指纹规范化：键序无关、覆盖全部动作参数、含 kind/session/generation。
     #[test]
     fn payload_hash_is_canonical_and_covers_all_params() {
@@ -633,27 +871,29 @@ mod tests {
             SESSION,
             GEN,
             &serde_json::json!({ "text": "你好", "meta": { "b": 2, "a": 1 } }),
-        );
+        )
+        .unwrap();
         let b = payload_hash(
             "send",
             SESSION,
             GEN,
             &serde_json::from_str::<Value>(r#"{"meta":{"a":1,"b":2},"text":"你好"}"#).unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(a, b, "键序不同必须同指纹");
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(
             a,
-            payload_hash("answer", SESSION, GEN, &serde_json::json!({}))
+            payload_hash("answer", SESSION, GEN, &serde_json::json!({})).unwrap()
         );
         assert_ne!(
             a,
-            payload_hash("send", "sess_other", GEN, &serde_json::json!({}))
+            payload_hash("send", "sess_other", GEN, &serde_json::json!({})).unwrap()
         );
         assert_ne!(
             a,
-            payload_hash("send", SESSION, GEN + 1, &serde_json::json!({}))
+            payload_hash("send", SESSION, GEN + 1, &serde_json::json!({})).unwrap()
         );
 
         // 每个变体的每个顶层参数都必须改变指纹（防止漏参数导致误幂等）
@@ -704,7 +944,8 @@ mod tests {
                 action.session_id(),
                 action.generation(),
                 &params,
-            );
+            )
+            .unwrap();
             let obj = params.as_object().expect("动作参数必须是对象");
             assert!(!obj.is_empty());
             for key in obj.keys() {
@@ -726,7 +967,8 @@ mod tests {
                         action.session_id(),
                         action.generation(),
                         &Value::Object(mutated)
-                    ),
+                    )
+                    .unwrap(),
                     "{}.{} 必须参与指纹",
                     action.kind(),
                     key
@@ -741,8 +983,8 @@ mod tests {
             "freeText": "另一个补充",
         }]);
         assert_ne!(
-            payload_hash("answer", SESSION, GEN, &action_params(&actions[2])),
-            payload_hash("answer", SESSION, GEN, &nested),
+            payload_hash("answer", SESSION, GEN, &action_params(&actions[2])).unwrap(),
+            payload_hash("answer", SESSION, GEN, &nested).unwrap(),
             "自由作答内容必须参与指纹"
         );
     }
@@ -837,21 +1079,39 @@ mod tests {
             vec![
                 "action_id",
                 "device_id",
+                "device_name",
                 "session_id",
                 "generation",
                 "kind",
                 "payload_hash",
                 "state",
                 "reason_code",
+                "summary",
                 "created_at",
                 "updated_at",
             ],
             "账本列集只允许最小面（无正文/JWT/URL 列）"
         );
+        // 保留清理选路：终态行按 updated_at 分批挑选（与 codex_actions 同口径）。
+        let indexes: Vec<String> = conn
+            .prepare("PRAGMA index_list(zcode_actions)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            indexes
+                .iter()
+                .any(|name| name == "idx_zcode_actions_updated_at"),
+            "必须为保留清理建 updated_at 索引: {indexes:?}"
+        );
         conn.execute(
             "INSERT INTO zcode_actions
-                (action_id, device_id, session_id, generation, kind, payload_hash, state, created_at, updated_at)
-             VALUES ('a', 'd', 's', 1, 'send', 'h', 'unknown', 1, 1)",
+                (action_id, device_id, device_name, session_id, generation, kind,
+                 payload_hash, state, reason_code, summary, created_at, updated_at)
+             VALUES ('a', 'd', 'iPhone', 's', 1, 'send', 'h', 'reserved', NULL,
+                     'send chars=2', 1, 1)",
             [],
         )
         .unwrap();

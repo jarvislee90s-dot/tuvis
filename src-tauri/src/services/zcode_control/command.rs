@@ -5,15 +5,19 @@
 //!
 //! # 单次语义（E3 证据：`SendOnceLoop` @ 固定 SHA）
 //!
-//! - 一个动作在派发前先经 [`ActionStore::reserve`] 落保守 `unknown` 行（Slice A）：
-//!   同 actionId 同载荷 → 直接返回既有回执，**零帧**；载荷不同 → `action_payload_conflict`；
+//! - 一个动作在派发前先经 [`ActionStore::reserve`] 落 `reserved` 行（Slice A；
+//!   回执一律映射为保守 `unknown`）：同 actionId 同载荷 → 直接返回既有回执，
+//!   **零帧**；载荷不同 → `action_payload_conflict`；
 //! - 只有 `New` 才构造**恰一个** `sendConversationCommandV4` 帧；无重发计时器、
 //!   无第二次 sendText、无 CLI 降级路径；
-//! - ACK 窗 20s（[`ACK_TIMEOUT`]）：窗内无应答 → `unknown`（写没写出未知），
-//!   绝不自动重发；只有桥**确证零写**的绑定/编码拒绝（`stale_generation` /
-//!   `no_session` / `payload_too_large`）才给 `send_failed`（`not_ready` 同时覆盖
-//!   「就绪闸拒写」与「写后等应答超窗」，不可区分 → 保守 `unknown`）；
-//! - 已 `accepted` 不被无关活动/迟到的失败证据降级（`ActionStore::record_result` 守卫）。
+//! - ACK 窗 20s（[`ACK_TIMEOUT`]）：该窗口**原样交给端口**，由桥的 RPC 待答条目
+//!   按同一期限收口并清账（`not_ready`）；本层**不**再外套超时（外层取消会绕过
+//!   桥的 pending 清理）。窗内无应答 → `unknown`（写没写出未知），绝不自动重发；
+//!   只有桥**确证零写**的绑定/编码拒绝（`stale_generation` / `no_session` /
+//!   `payload_too_large`）才给 `send_failed`（`not_ready` 同时覆盖「就绪闸拒写」
+//!   与「写后等应答超窗」，不可区分 → 保守 `unknown`）；
+//! - 已 `accepted` 不被无关活动/迟到的失败证据降级（`ActionStore::record_result`
+//!   的恰好一次 CAS）。
 //!
 //! # 正文纪律
 //!
@@ -32,7 +36,7 @@ use crate::inject::normalize::message_signature_enabled_conn;
 use crate::remote::pairing::DeviceStore;
 use crate::services::codex_desktop_ipc::types::new_uuid;
 
-use super::action::{action_params, payload_hash, ActionStore, Reservation};
+use super::action::{action_params, audit_summary, payload_hash, ActionStore, Reservation};
 use super::bridge::{BridgeManager, AGENT_CHANNEL};
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, BoundTarget, CommandPort, ControlAction,
@@ -45,17 +49,20 @@ pub const AGENT_SEND_COMMAND_METHOD: &str = "sendConversationCommandV4";
 /// 信封 `type`（普通文本；`command.ts:95-135` 的 `sendText` 只必带 `text`）。
 pub const SEND_TEXT_TYPE: &str = "sendText";
 
-/// ACK 等待窗（20s，与生产计划一致）：窗内无应答按保守 `unknown`，绝不重发。
+/// ACK 等待窗（20s，与生产计划一致）：原样交给端口（桥的 RPC 待答条目按它收口
+/// 并清账），窗内无应答按保守 `unknown`，绝不重发。
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 单条正文的 UTF-8 字节预算。
 ///
-/// 推导：官方物理信封上限 `MAX_PHYSICAL_FRAME_BYTES` = 1 MiB（[`super::codec`]）；
-/// 信封 JSON 最坏转义膨胀 6×（每个字节写成 `\u00XX`），再预留 8 KiB 给
-/// header/方法名/workspace 路径/时间戳等固定开销，余量除以 6 即正文预算。
+/// 推导（最坏物理路径）：正文进入消息 JSON 后最坏按 `\u00XX` 转义膨胀 6×
+/// （控制字符密集），整条消息随后被 [`super::codec::encode_frame`] Base64 进
+/// `dataBase64` 再按 1 MiB 物理信封计量，Base64 再膨胀 4/3 → 合计最坏 8×。
+/// 因此预算 = (`MAX_PHYSICAL_FRAME_BYTES` − 8 KiB 固定开销) / 8：**通过本预算的
+/// 正文必然能通过编码**（不会出现「预检放行、编码期 `payload_too_large`」）。
 /// 超预算在**写帧之前**以 `payload_too_large` 拒绝（零帧零行）。
 pub const MAX_TEXT_BYTES: usize =
-    (super::codec::MAX_PHYSICAL_FRAME_BYTES.saturating_sub(8_192)) / 6;
+    (super::codec::MAX_PHYSICAL_FRAME_BYTES.saturating_sub(8_192)) / 8;
 
 /// 生成一次命令 id：rand 128-bit UUIDv4（复用既有 `new_uuid`，不新增依赖）。
 pub fn new_command_id() -> String {
@@ -172,6 +179,10 @@ impl CommandSender {
         let ControlAction::Send { text, .. } = action else {
             return Err(invalid_action());
         };
+        if ctx.action_id.trim().is_empty() {
+            // 空 actionId 会成为全局幂等键（第一个空 id 动作占位，后续一律冲突）。
+            return Err(invalid_action());
+        }
         if action.session_id() != target.session_id {
             return Err(invalid_action());
         }
@@ -185,13 +196,19 @@ impl CommandSender {
 
         // 幂等指纹只取原始动作参数（不含签名产物）：签名开关变化不改变同一
         // actionId 的语义身份，也绝不因此产生第二次写出。
+        let params = action_params(action);
         let hash = payload_hash(
-            super::action::T3_ACTION_KIND,
+            action.kind(),
             &target.session_id,
             target.generation,
-            &action_params(action),
-        );
-        match self.actions.reserve(ctx, target, &hash)? {
+            &params,
+        )?;
+        // 审计摘要只含类别 + 字数（answer/permission 为答案/选项数），不含正文。
+        let summary = audit_summary(action.kind(), &params);
+        match self
+            .actions
+            .reserve_with_kind(ctx, target, action.kind(), &hash, &summary)?
+        {
             Reservation::Existing(receipt) => return Ok(receipt),
             Reservation::New => {}
         }
@@ -206,6 +223,10 @@ impl CommandSender {
     }
 
     /// 构造信封并**恰一次**调用发送端口（无重发、无第二次 sendText、无 CLI 降级）。
+    ///
+    /// 超时由端口拥有：`ack_timeout` 原样传入，桥按它给 RPC 待答条目设期限并在超窗时
+    /// 自行清账；这里**不**外套 `tokio::time::timeout`（取消 future 会绕过桥的
+    /// `unregister_rpc`，留下永不回收的 pending waiter）。
     async fn dispatch_send(
         &self,
         ctx: &ActionContext,
@@ -221,21 +242,19 @@ impl CommandSender {
             "payload": { "text": text },
             "issuedAt": now_ms(),
         });
-        let (state, reason_code) = match tokio::time::timeout(
-            self.ack_timeout,
-            self.bridge.call(
+        let (state, reason_code) = match self
+            .bridge
+            .call(
                 target,
                 AGENT_CHANNEL,
                 AGENT_SEND_COMMAND_METHOD,
                 vec![envelope],
-            ),
-        )
-        .await
+                self.ack_timeout,
+            )
+            .await
         {
-            // 超窗：写没写出/受理与否未知，绝不重发。
-            Err(_) => (ActionState::Unknown, Some(codes::UNKNOWN.to_owned())),
-            Ok(Err(error)) => classify_port_error(&error),
-            Ok(Ok(ack)) => classify_ack(&ack),
+            Err(error) => classify_port_error(&error),
+            Ok(ack) => classify_ack(&ack),
         };
         ActionReceipt {
             action_id: ctx.action_id.clone(),
@@ -263,6 +282,7 @@ impl CommandPort for BridgeManager {
         channel: &'a str,
         method: &'a str,
         args: Vec<Value>,
+        timeout: Duration,
     ) -> BoxFuture<'a, ZResult<Value>> {
         Box::pin(async move {
             let mut args = args.into_iter();
@@ -285,7 +305,16 @@ impl CommandPort for BridgeManager {
                 );
             }
             params.insert("envelope".to_owned(), envelope);
-            BridgeManager::call(self, target, channel, method, vec![Value::Object(params)]).await
+            // ACK 窗原样交给桥的 RPC 待答条目：生产 20s 由桥自己的期限收口并清账。
+            BridgeManager::call_with_timeout(
+                self,
+                target,
+                channel,
+                method,
+                vec![Value::Object(params)],
+                timeout,
+            )
+            .await
         })
     }
 }
@@ -297,7 +326,7 @@ impl CommandPort for BridgeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::Semaphore;
 
@@ -352,8 +381,45 @@ mod tests {
     enum Reply {
         Body(Value),
         Error(&'static str),
-        /// 永不应答：模拟写后断网/ACK 丢失（只能靠调用方超窗收口）。
-        Pending,
+        /// 桥自己的 RPC 待答窗到期（写后无应答/ACK 丢失）：按真实桥口径在窗到期时
+        /// 返回 `not_ready`（并自行清账），调用方只能靠这个期限收口。
+        AckLost,
+        /// 在应答窗的 `num/den` 比例后返回成功（模拟 15s/20s 的宿主 accepted）。
+        BodyAfter {
+            body: Value,
+            num: u32,
+            den: u32,
+        },
+        /// 在应答窗的 `num/den` 比例后返回端口错误（模拟桥内期限先到的竞态）。
+        ErrorAfter {
+            code: &'static str,
+            num: u32,
+            den: u32,
+        },
+    }
+
+    /// 在途 future 的取消探针：只有 future 被 **drop**（而非正常返回）才会置位。
+    struct CancelProbe<'a> {
+        flag: &'a AtomicBool,
+        armed: bool,
+    }
+
+    impl<'a> CancelProbe<'a> {
+        fn new(flag: &'a AtomicBool) -> Self {
+            Self { flag, armed: true }
+        }
+
+        fn disarm(mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for CancelProbe<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                self.flag.store(true, Ordering::SeqCst);
+            }
+        }
     }
 
     struct FakeBridge {
@@ -365,6 +431,10 @@ mod tests {
         /// 门控模式：记录后等 release permit 才应答。
         release: Semaphore,
         gated: bool,
+        /// 每次调用收到的应答窗（断言「窗口原样交给端口」）。
+        observed_timeouts: Mutex<Vec<Duration>>,
+        /// 在途 future 被调用方取消过（生产上等价于桥 pending 泄漏）。
+        cancelled: AtomicBool,
     }
 
     impl FakeBridge {
@@ -376,6 +446,8 @@ mod tests {
                 recorded: Semaphore::new(0),
                 release: Semaphore::new(0),
                 gated: false,
+                observed_timeouts: Mutex::new(Vec::new()),
+                cancelled: AtomicBool::new(false),
             })
         }
 
@@ -387,6 +459,8 @@ mod tests {
                 recorded: Semaphore::new(0),
                 release: Semaphore::new(0),
                 gated: true,
+                observed_timeouts: Mutex::new(Vec::new()),
+                cancelled: AtomicBool::new(false),
             })
         }
 
@@ -405,6 +479,14 @@ mod tests {
         fn envelope(&self, index: usize) -> Value {
             self.frames()[index].args[0].clone()
         }
+
+        fn observed_timeouts(&self) -> Vec<Duration> {
+            self.observed_timeouts.lock().unwrap().clone()
+        }
+
+        fn cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
     }
 
     impl CommandPort for FakeBridge {
@@ -414,8 +496,10 @@ mod tests {
             channel: &'a str,
             method: &'a str,
             args: Vec<Value>,
+            timeout: Duration,
         ) -> BoxFuture<'a, ZResult<Value>> {
             Box::pin(async move {
+                self.observed_timeouts.lock().unwrap().push(timeout);
                 {
                     self.frames.lock().unwrap().push(Frame {
                         target: target.clone(),
@@ -429,12 +513,27 @@ mod tests {
                 if self.gated {
                     let _ = self.release.acquire().await;
                 }
+                let probe = CancelProbe::new(&self.cancelled);
                 let reply = self.reply.lock().unwrap().clone();
-                match reply {
+                let scale = |num: u32, den: u32| timeout.mul_f64(f64::from(num) / f64::from(den));
+                let outcome = match reply {
                     Reply::Body(body) => Ok(body),
                     Reply::Error(code) => Err(ZcodeError::of(code)),
-                    Reply::Pending => std::future::pending().await,
-                }
+                    Reply::AckLost => {
+                        tokio::time::sleep(timeout).await;
+                        Err(ZcodeError::of(codes::NOT_READY))
+                    }
+                    Reply::BodyAfter { body, num, den } => {
+                        tokio::time::sleep(scale(num, den)).await;
+                        Ok(body)
+                    }
+                    Reply::ErrorAfter { code, num, den } => {
+                        tokio::time::sleep(scale(num, den)).await;
+                        Err(ZcodeError::of(code))
+                    }
+                };
+                probe.disarm();
+                outcome
             })
         }
     }
@@ -448,6 +547,10 @@ mod tests {
             c.query_row("SELECT COUNT(*) FROM zcode_actions", [], |r| r.get(0))
                 .unwrap()
         })
+    }
+
+    fn audits(store: &DeviceStore) -> Vec<crate::database::dao::write_audit::AuditRow> {
+        store.with(|c| crate::database::dao::write_audit::recent_conn(c, 100))
     }
 
     /// 同 actionId 同载荷：第二次只返回既有回执，线上恰一帧。
@@ -497,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_ack_after_write_is_unknown_and_never_resent() {
         let store = DeviceStore::memory();
-        let fake = FakeBridge::new(Reply::Pending);
+        let fake = FakeBridge::new(Reply::AckLost);
         let sender = sender(&fake, &store);
         let (ctx, action) = (ctx("a-1"), send_action("写后断网"));
 
@@ -647,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn restart_recovery_returns_unknown_without_send() {
         let store = DeviceStore::memory();
-        let before = FakeBridge::new(Reply::Pending);
+        let before = FakeBridge::new(Reply::AckLost);
         let before_sender = sender(&before, &store);
         let (ctx, action) = (ctx("a-1"), send_action("重启前"));
         let crashed = before_sender
@@ -980,5 +1083,135 @@ mod tests {
             "UUIDv4 变体位"
         );
         assert_ne!(new_command_id(), new_command_id(), "commandId 必须随机");
+    }
+
+    /// ACK 窗必须是 20s，而且必须**原样交给端口**（桥的 RPC 待答条目按它收口）：
+    /// 15s 的宿主 accepted 仍在窗内 → Accepted；21s 才到的应答已超窗 → Unknown。
+    #[tokio::test]
+    async fn send_ack_window_is_twenty_seconds() {
+        // 生产窗：20s（brief 写死；桥内 rpc 窗不再是有效上限）。
+        assert_eq!(ACK_TIMEOUT, Duration::from_secs(20));
+
+        let store = DeviceStore::memory();
+        let production = FakeBridge::new(Reply::AckLost);
+        let sender = CommandSender::new(production.clone(), store.clone());
+        assert_eq!(sender.ack_timeout, ACK_TIMEOUT, "生产构造必须用 20s ACK 窗");
+
+        // 用注入窗把 20s 时序压到毫秒：fake 按「自身窗的 15/20、21/20」应答，
+        // 比例语义与真实的 15s/21s 完全一致。
+        let fast = FakeBridge::new(Reply::BodyAfter {
+            body: accepted_body(),
+            num: 15,
+            den: 20,
+        });
+        let sender =
+            CommandSender::with_timeout(fast.clone(), store.clone(), Duration::from_millis(40));
+        let within = sender
+            .execute(&ctx("a-15"), &target(), &send_action("十五秒的 ACK"))
+            .await
+            .unwrap();
+        assert_eq!(
+            within.state,
+            ActionState::Accepted,
+            "窗内（15/20）的宿主 accepted 必须判已受理"
+        );
+        assert_eq!(
+            fast.observed_timeouts(),
+            vec![Duration::from_millis(40)],
+            "ACK 窗必须原样交给端口（不得被桥内 rpc 窗抢先收口）"
+        );
+
+        let late = FakeBridge::new(Reply::ErrorAfter {
+            code: codes::NOT_READY,
+            num: 21,
+            den: 20,
+        });
+        let sender = CommandSender::with_timeout(late.clone(), store, Duration::from_millis(40));
+        let beyond = sender
+            .execute(&ctx("a-21"), &target(), &send_action("二十一秒的 ACK"))
+            .await
+            .unwrap();
+        assert_eq!(
+            beyond.state,
+            ActionState::Unknown,
+            "超出 ACK 窗的应答（桥先收口）只能是保守 unknown"
+        );
+        assert_eq!(late.wire(), 1, "超窗也不得重发");
+    }
+
+    /// 超窗收口由**端口自己的期限**完成：调用方绝不取消在途 future。
+    ///
+    /// 取消（外层 `tokio::time::timeout` 早于端口期限触发）会绕过桥的
+    /// `unregister_rpc` 清理，在 pending 里留下永不回收的 waiter；本用例用
+    /// drop 探针锁死「future 正常返回而非被 drop」。
+    #[tokio::test]
+    async fn timeout_cleans_bridge_pending() {
+        let store = DeviceStore::memory();
+        // 端口在自身窗的 2 倍处才收口：若调用方还外套 20ms 超时，future 会在
+        // 半途被 drop（cancelled 置位），正好复现 pending 泄漏形态。
+        let fake = FakeBridge::new(Reply::ErrorAfter {
+            code: codes::NOT_READY,
+            num: 2,
+            den: 1,
+        });
+        let sender = CommandSender::with_timeout(fake.clone(), store, Duration::from_millis(20));
+
+        let receipt = sender
+            .execute(&ctx("a-1"), &target(), &send_action("等端口收口"))
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.state, ActionState::Unknown);
+        assert!(
+            !fake.cancelled(),
+            "调用方不得取消端口 future：桥必须自行 unregister pending 条目"
+        );
+        assert_eq!(fake.wire(), 1);
+    }
+
+    /// 起始审计与终态审计都带「类别 + 字数」，但绝不摘正文。
+    #[tokio::test]
+    async fn audit_start_and_terminal_include_count_without_body() {
+        let store = DeviceStore::memory();
+        let fake = FakeBridge::new(Reply::Body(accepted_body()));
+        let sender = sender(&fake, &store);
+        sender
+            .execute(&ctx("a-1"), &target(), &send_action("你好世界"))
+            .await
+            .unwrap();
+
+        let rows = audits(&store);
+        assert_eq!(rows.len(), 2, "起始 + 终态各一条审计");
+        // recent_conn 最新在前：终态 accepted，随后是 started。
+        assert_eq!(rows[0].result, "accepted");
+        assert_eq!(rows[1].result, "started");
+        for row in &rows {
+            assert_eq!(row.channel, "zcode_official");
+            assert_eq!(row.agent_type, "zcode");
+            assert_eq!(row.action, "zcode_send");
+            assert_eq!(row.summary, "send chars=4", "摘要只记类别与字数");
+            assert!(!row.summary.contains("你好"), "摘要绝不摘正文");
+        }
+    }
+
+    /// 预算按物理帧最坏膨胀推导（JSON `\u00XX` 6× × Base64 4/3）：
+    /// 预算内的控制字符密集正文必须真的能通过编码，否则预检形同虚设。
+    #[test]
+    fn byte_budget_survives_worst_case_base64_encoding() {
+        let boundary = "\u{1}".repeat(MAX_TEXT_BYTES);
+        let composed =
+            compose_official_text("phone", &boundary, false).expect("预算内必须可以组合");
+        let message = serde_json::to_vec(&serde_json::json!({
+            "type": SEND_TEXT_TYPE,
+            "payload": { "text": composed },
+        }))
+        .expect("message json");
+        super::super::codec::encode_frame(
+            &super::super::codec::RpcIdentity::new("bridge-1"),
+            1,
+            1,
+            &message,
+        )
+        .expect("预算内的最坏转义正文必须可以通过物理帧编码（1 MiB 含 Base64）");
     }
 }

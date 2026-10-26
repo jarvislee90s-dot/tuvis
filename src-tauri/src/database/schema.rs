@@ -232,19 +232,28 @@ pub fn init(conn: &Connection) {
         -- 正文/答案/JWT/URL 一律不落库（正文只以 sha256 payload_hash 参与幂等判定）。
         -- action_id 是幂等键：同 id 同哈希同设备同会话 → 返回既有回执、零重发；
         -- 任一不同 → action_payload_conflict（跨设备同 id 绝不泄漏旧回执）。
-        -- state 写前即 'unknown'（保守：崩溃/重启后重放只返回 unknown，不再派发）。
+        -- state 写前即 'reserved'（DB 专用的「已预留未落账」，回执一律映射为保守
+        -- unknown）：崩溃/重启后重放只返回 unknown，不再派发；只有 reserved 行能被
+        -- 第一次 finish 改写（CAS），终态行绝不被第二次 finish 覆盖。
+        -- summary 只存审计摘要（类别 + 字数/选项数），同样不含正文。
         CREATE TABLE IF NOT EXISTS zcode_actions (
             action_id    TEXT PRIMARY KEY,
             device_id    TEXT NOT NULL,
+            device_name  TEXT NOT NULL,
             session_id   TEXT NOT NULL,
             generation   INTEGER NOT NULL,
             kind         TEXT NOT NULL,
             payload_hash TEXT NOT NULL,
             state        TEXT NOT NULL,
             reason_code  TEXT,
+            summary      TEXT NOT NULL,
             created_at   INTEGER NOT NULL,
             updated_at   INTEGER NOT NULL
         );
+        -- 保留清理选路（终态行按更新时间分批挑选；与 codex_actions 的
+        -- terminal_retention 同口径，清理入口由后续任务接入）。
+        CREATE INDEX IF NOT EXISTS idx_zcode_actions_updated_at
+            ON zcode_actions(updated_at);
         CREATE TABLE IF NOT EXISTS write_audit (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          INTEGER NOT NULL,
