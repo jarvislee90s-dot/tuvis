@@ -113,8 +113,10 @@ pub trait HubBackend: Send + Sync {
 /// 事件泵所需的桥窄口（生产 = [`BridgeManager`]，测试注入 fake）。
 ///
 /// 只含 `on_data`/`invalidate` 两个入口：泵因此拿不到 relay 生命周期或配置入口。
+/// `on_data` 返回本帧内**发生变化的会话视图**（桥侧前后快照对比）；泵据此发布
+/// `Session` 事件，而不是只让桥内投影悄悄前进。
 trait BridgePump: Send + Sync {
-    fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<()>>;
+    fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<Vec<SessionView>>>;
     /// 作废旧桥/投影（实现内部推进自己的投影代际，不接受外部代际，避免代际空间混用）。
     fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()>;
 }
@@ -126,7 +128,7 @@ struct ProjectionBridge {
 }
 
 impl BridgePump for ProjectionBridge {
-    fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<()>> {
+    fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<Vec<SessionView>>> {
         Box::pin(async move { BridgeManager::on_data(&self.bridge, payload).await })
     }
 
@@ -424,6 +426,41 @@ async fn apply_relay_state(
     }
 }
 
+/// 事件泵的 Data 会话变化：锁内校验代际/配对并落 `last_session`，锁外广播。
+///
+/// - `hub_generation` 是本帧进入桥之前的 Hub 代际：桥处理在途若发生换代（配置变更/
+///   断开/冲突），旧代际的投影绝不得贴上新代际，一律丢弃；
+/// - `view.generation` 是**桥投影代际**，仅作诊断（不参与对外比较）：对外事件恒用
+///   Hub 代际；
+/// - 能力矩阵：桥投影不携带 Hub 能力（基线全关，证据层由 Hub 在 GET 时现算）。只有
+///   `last_session` 恰好是同一会话时才沿用它的矩阵（GET 时现算的权威值），否则回到
+///   基线全关——绝不把别的会话或桥投影的能力扣到本会话上（不伪造开闸）。
+///
+/// 调用方不得持内锁调用：本函数自己取锁，且广播在锁外进行。
+fn apply_relay_session(
+    inner: &Mutex<Inner>,
+    events: &broadcast::Sender<ControlEvent>,
+    hub_generation: u64,
+    mut view: SessionView,
+) {
+    let view = {
+        let mut state = lock_inner(inner);
+        if state.generation != hub_generation || state.state != ConnectionState::Paired {
+            return;
+        }
+        view.generation = state.generation;
+        view.capabilities = state
+            .last_session
+            .as_ref()
+            .filter(|last| last.session_id == view.session_id)
+            .map(|last| last.capabilities.clone())
+            .unwrap_or_default();
+        state.last_session = Some(view.clone());
+        view
+    };
+    emit_session_event(inner, events, &view);
+}
+
 /// Hub 内部状态（全部字段由同一把 std 锁保护，锁外不做网络 await）。
 struct Inner {
     /// 控制代际：配置保存/删除与显式断开推进；动作/目标必须匹配它。
@@ -571,7 +608,8 @@ impl ZcodeHub {
         hub
     }
 
-    /// 常驻事件泵：`Data` 进桥，`State` 更新连接态并按需作废旧桥/投影。
+    /// 常驻事件泵：`Data` 进桥并发布本帧的会话变化，`State` 更新连接态并按需作废
+    /// 旧桥/投影。
     ///
     /// 只持有 Hub 状态的 `Weak`：Hub 释放或 relay 通道关闭（sender 全丢）即退出；
     /// 单帧坏数据/桥错误只记一次降级，绝不拆泵（T2.2 M-10）。
@@ -583,8 +621,14 @@ impl ZcodeHub {
                 let Some(inner) = inner.upgrade() else { break };
                 match event {
                     RelayEvent::Data(payload) => {
-                        // 错误只代表本帧未吸收，不改变连接终态。
-                        let _ = bridge.on_data(payload).await;
+                        // 本帧进入桥之前的 Hub 代际：桥处理在途若发生换代，视图作废。
+                        let hub_generation = lock_inner(&inner).generation;
+                        // 错误只代表本帧未吸收，不改变连接终态，也不发布任何视图。
+                        if let Ok(views) = bridge.on_data(payload).await {
+                            for view in views {
+                                apply_relay_session(&inner, &out, hub_generation, view);
+                            }
+                        }
                     }
                     RelayEvent::State(view) => {
                         apply_relay_state(&inner, &out, bridge.as_ref(), view).await;
@@ -1157,7 +1201,9 @@ impl ZcodeHub {
 mod tests {
     use super::*;
     use crate::services::zcode_control::config::set_config;
-    use crate::services::zcode_control::types::{ActionState, AnswerEntry, CapabilityFlag};
+    use crate::services::zcode_control::types::{
+        ActionState, ActiveWork, AnswerEntry, CapabilityFlag, ControlView, PendingKind, PendingView,
+    };
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::Notify;
 
@@ -2073,23 +2119,27 @@ mod tests {
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 4);
     }
 
-    /// 事件泵的 fake 桥：记录 `on_data`/`invalidate`，可注入一次瞬时错误。
+    /// 事件泵的 fake 桥：记录 `on_data`/`invalidate`，可注入一次瞬时错误与
+    /// 「本帧变化」的合成会话视图（取走一次；空 = 无变化）。
     #[derive(Default)]
     struct FakePump {
         data: Mutex<Vec<Value>>,
         invalidations: AtomicUsize,
         fail_next: AtomicBool,
+        /// 下一次 `on_data` 报告的会话变化（合成视图，不来自真实投影）。
+        views: Mutex<Vec<SessionView>>,
     }
 
     impl BridgePump for FakePump {
-        fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<()>> {
+        fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<Vec<SessionView>>> {
             self.data.lock().unwrap().push(payload);
             let fail = self.fail_next.swap(false, Ordering::SeqCst);
+            let views = std::mem::take(&mut *self.views.lock().unwrap());
             Box::pin(async move {
                 if fail {
                     Err(ZcodeError::offline())
                 } else {
-                    Ok(())
+                    Ok(views)
                 }
             })
         }
@@ -2097,6 +2147,17 @@ mod tests {
         fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()> {
             self.invalidations.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
+        }
+    }
+
+    /// 等到下一条 `Session` 事件（跳过连接/动作事件；广播通道会缓冲未读事件）。
+    async fn next_session_event(receiver: &mut broadcast::Receiver<ControlEvent>) -> ControlEvent {
+        loop {
+            match receiver.recv().await {
+                Ok(event) if event.kind == ControlEventKind::Session => return event,
+                Ok(_) => continue,
+                Err(error) => panic!("事件通道关闭：{error}"),
+            }
         }
     }
 
@@ -2147,6 +2208,135 @@ mod tests {
         let seen = pump.data.lock().unwrap().clone();
         assert_eq!(seen[0]["seq"], 1);
         assert_eq!(seen[1]["seq"], 2, "首帧错误后泵必须继续");
+    }
+
+    /// Data 帧的会话变化必须由 Hub 发布为 `Session` 事件（不手工写 SSE）：
+    /// 代际由 Hub 覆写、能力矩阵只在同会话时沿用（否则回到基线全关），
+    /// 无变化的 Data 不重复发事件。
+    #[tokio::test]
+    async fn relay_data_publishes_changed_session_event() {
+        const SYNCED: &str = "sess_synthetic_pump_change";
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump) = pumped(stored(URL), fake, send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let generation = hub.connection().generation;
+        let mut subscriber = hub.subscribe();
+
+        // 合成变化视图：桥投影代际 ≠ Hub 代际、带一张 pending 卡与一条 control，
+        // 能力矩阵故意全开（桥投影不携带 Hub 能力，发布时绝不得沿用）。
+        let synthetic =
+            |revision: u64, view_generation: u64, capabilities: CapabilityView| SessionView {
+                session_id: SYNCED.into(),
+                generation: view_generation,
+                revision: Some(revision),
+                ready: true,
+                pending: vec![PendingView {
+                    interaction_id: "pi-synthetic-pump-change".into(),
+                    kind: PendingKind::Permission,
+                    anchor_row_id: Some(3),
+                    tool_call_id: Some("call_synthetic_pump_change".into()),
+                    created_at: Some(1_700_000_000_000),
+                    summary: Some("synthetic: pump change".into()),
+                    tool_name: Some("Write".into()),
+                    schema_interaction: None,
+                    sensitive: false,
+                    auto_resolution: false,
+                    auto_resolution_state: None,
+                    questions: Vec::new(),
+                    options: Vec::new(),
+                }],
+                control: Some(ControlView {
+                    active_works: vec![ActiveWork {
+                        kind: "primaryTurn".into(),
+                        foreground_execution_id: Some("E-synthetic-pump-change".into()),
+                    }],
+                }),
+                selection: None,
+                capabilities,
+            };
+        // ① 未 GET 过的会话：能力矩阵回基线全关，代际/会话/卡面全部按视图落事件。
+        pump.views
+            .lock()
+            .unwrap()
+            .push(synthetic(7, generation + 9, send_policy()));
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("Data 的会话变化必须发布 Session 事件");
+        assert_eq!(event.session_id.as_deref(), Some(SYNCED));
+        assert_eq!(event.generation, generation, "Hub 代际覆写桥投影代际");
+        assert_eq!(event.device_id, None, "会话事件无设备维度");
+        assert_eq!(event.data["sessionId"], SYNCED);
+        assert_eq!(event.data["generation"], generation);
+        assert_eq!(event.data["revision"], 7);
+        assert_eq!(event.data["ready"], true);
+        assert_eq!(
+            event.data["pending"][0]["interactionId"],
+            "pi-synthetic-pump-change"
+        );
+        assert_eq!(
+            event.data["control"]["activeWorks"][0]["foregroundExecutionId"],
+            "E-synthetic-pump-change"
+        );
+        assert_eq!(
+            event.data["capabilities"],
+            serde_json::to_value(CapabilityView::default()).unwrap(),
+            "未知会话的能力矩阵必须回到基线全关（不伪造开闸）"
+        );
+
+        // ② 同一会话的后续变化：沿用 Hub 已持有的能力矩阵（GET 时现算的权威值）。
+        //    公开 GET 在普通构建只会给全关矩阵，这里直接播种上一条已发布视图。
+        {
+            let mut inner = hub.lock();
+            let mut authoritative = inner.last_session.clone().expect("已发布会话视图");
+            authoritative.capabilities = send_policy();
+            inner.last_session = Some(authoritative);
+        }
+        pump.views
+            .lock()
+            .unwrap()
+            .push(synthetic(8, generation + 9, CapabilityView::default()));
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 2})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("同会话的 Data 变化同样必须发布");
+        assert_eq!(event.data["revision"], 8);
+        assert_eq!(
+            event.data["capabilities"]["send"]["enabled"], true,
+            "同会话必须沿用 Hub 的能力矩阵"
+        );
+
+        // ③ 无变化的 Data：泵继续吸收，但绝不新增 Session 事件。
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 3})))
+            .await
+            .unwrap();
+        wait_until(|| pump.data.lock().unwrap().len() == 3).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(event) = subscriber.try_recv() {
+            assert_ne!(
+                event.kind,
+                ControlEventKind::Session,
+                "无变化的 Data 不得发布 Session 事件"
+            );
+        }
     }
 
     /// relay `KICKED` → Hub `conflict` 终态：推进代际、作废桥/投影、旧动作零执行。
