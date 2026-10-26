@@ -20,6 +20,7 @@ import {
   type PendingView,
   type QuestionView,
   type SessionView,
+  type ZcodeErrorCode,
 } from "@/lib/api/zcodeControl";
 import useZcodeControl from "./useZcodeControl";
 import { fetchZcodeControl } from "./api";
@@ -29,15 +30,39 @@ interface ZcodeControlPanelProps {
   sessionId: string;
 }
 
-/** 冻结原因码 → 本地化文案键；表外码统一中性兜底（码本身只进 data-reason-code） */
-const REASON_KEYS: Record<string, string> = {
+/**
+ * 冻结原因码 → 本地化文案键（19 码全覆盖；`Record<ZcodeErrorCode, string>` 保证漏码
+ * 在编译期报错）。码本身只进 `data-reason-code`，用户只看到这里的本地化文案。
+ */
+export const ZCODE_REASON_KEYS: Record<ZcodeErrorCode, string> = {
   needs_config: "mobile.zcodeControl.reasonNeedsConfig",
   needs_auth: "mobile.zcodeControl.reasonNeedsAuth",
   offline: "mobile.zcodeControl.reasonOffline",
   conflict: "mobile.zcodeControl.reasonConflict",
-  not_ready: "mobile.zcodeControl.reasonNotReady",
   unknown: "mobile.zcodeControl.reasonUnknown",
+  not_ready: "mobile.zcodeControl.reasonNotReady",
+  unsupported_protocol: "mobile.zcodeControl.reasonUnsupportedProtocol",
+  needs_evidence: "mobile.zcodeControl.reasonNeedsEvidence",
+  no_session: "mobile.zcodeControl.reasonNoSession",
+  target_ambiguous: "mobile.zcodeControl.reasonTargetAmbiguous",
+  stale_generation: "mobile.zcodeControl.reasonStaleGeneration",
+  stale_pending: "mobile.zcodeControl.reasonStalePending",
+  invalid_action: "mobile.zcodeControl.reasonInvalidAction",
+  invalid_answer: "mobile.zcodeControl.reasonInvalidAnswer",
+  forbidden_option: "mobile.zcodeControl.reasonForbiddenOption",
+  action_payload_conflict: "mobile.zcodeControl.reasonActionPayloadConflict",
+  storage_failed: "mobile.zcodeControl.reasonStorageFailed",
+  payload_too_large: "mobile.zcodeControl.reasonPayloadTooLarge",
+  stop_target_changed: "mobile.zcodeControl.reasonStopTargetChanged",
 };
+
+/** 原因码 → 当前语言的用户文案；词表外的码一律中性兜底（绝不回显码原文）。 */
+export function zcodeReasonText(code: string): string {
+  const key = isZcodeErrorCode(code)
+    ? ZCODE_REASON_KEYS[code]
+    : "mobile.zcodeControl.reasonUnknown";
+  return i18n.t(key);
+}
 
 /** 回执状态 → 本地化文案键：accepted/confirmed/unknown 三种语义互不冒充 */
 const STATUS_KEYS: Record<string, string> = {
@@ -127,9 +152,11 @@ function PendingCard({
       : { enabled: false, reasonCode: "unsupported_protocol" };
   const blocked: CapabilityFlag | null =
     gateReason !== null ? { enabled: false, reasonCode: gateReason } : capabilityBlocked;
+  // 按码如实呈现：每个冻结原因码都有独立 zh/en 文案（表外码才用中性兜底）；
+  // 仅当服务端未给原因码时退回「该作答形态暂未开放」的上下文说明。
   const blockedText =
-    gateReason !== null
-      ? i18n.t("mobile.zcodeControl.actionBlocked")
+    blocked?.reasonCode != null
+      ? zcodeReasonText(blocked.reasonCode)
       : i18n.t("mobile.zcodeControl.pendingBlocked");
 
   /** auto_resolution：首次有效编辑补发一次 snooze（尽力而为，不阻塞渲染）。 */
@@ -447,7 +474,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           data-reason-code={displayReason}
           className="mb-2 text-xs text-[var(--mut)]"
         >
-          {i18n.t(REASON_KEYS[displayReason] ?? "mobile.zcodeControl.reasonUnknown")}
+          {zcodeReasonText(displayReason)}
         </p>
       )}
       {/* A5 显式辅助入口：只打开**已保存**的官方链接（挂载不自动外跳、不代理点击）。 */}
@@ -518,9 +545,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
               data-reason-code={selectionReason}
               className="text-xs text-[var(--mut)]"
             >
-              {gateReason !== null
-                ? i18n.t("mobile.zcodeControl.actionBlocked")
-                : i18n.t("mobile.zcodeControl.selectionBlocked")}
+              {zcodeReasonText(selectionReason)}
             </p>
           )}
         </div>
@@ -542,9 +567,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
               data-reason-code={interruptReason}
               className="text-xs text-[var(--mut)]"
             >
-              {gateReason !== null
-                ? i18n.t("mobile.zcodeControl.actionBlocked")
-                : i18n.t("mobile.zcodeControl.interruptBlocked")}
+              {zcodeReasonText(interruptReason)}
             </p>
           )}
         </div>
