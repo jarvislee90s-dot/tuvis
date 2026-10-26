@@ -55,6 +55,7 @@ import BookmarkBar from "./BookmarkBar";
 import FilePanel, { type FilePanelEntry } from "./FilePanel";
 import FilePreview from "./FilePreview";
 import MessageComposer from "./MessageComposer";
+import ZcodeControlPanel from "./ZcodeControlPanel";
 import PreviewModeSwitcher, { type PreviewMode } from "./PreviewModeSwitcher";
 import SplitHandle from "./SplitHandle";
 import {
@@ -1327,6 +1328,27 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     </div>
   );
 
+  // ===== 发送区（T7.2 集成，2026-10-25）=====
+  // **ZCode 会话挂统一控制面板**，不再挂旧终端 composer：
+  // - 旧 composer 的 ZCode 档只是 A5 的只读占位（控制未接上时发送恒禁用），B 包接上
+  //   官方连接后由本面板接管写面；旧 `/session-send`、无头 CLI、终端按键对 ZCode
+  //   一律不可达（面板只 POST `/m/api/v1/zcode/actions`）；
+  // - 阅读链与发送区解耦：面板自己的连接/会话 GET 失败只影响控制区（就地原因），
+  //   正文/文件/子 agent 这条既有读取链完全不受影响（本页照常渲染）；
+  // - 非 ZCode 会话逐字走原 MessageComposer（零回归）。
+  // 两处布局分支（分屏对话列 / 正文列）共用同一份选择逻辑，钥匙前缀互异。
+  const composerArea =
+    session.agentType === "zcode" ? (
+      <ZcodeControlPanel key={`zcode-composer-${session.id}`} sessionId={session.id} />
+    ) : (
+      <MessageComposer
+        key={`composer-${session.id}`}
+        session={session}
+        agentType={session.agentType}
+        onQueueChanged={bumpQueue}
+      />
+    );
+
   // 消息区（split 布局复用同一份 JSX）
   const messageArea = (
     <>
@@ -1835,12 +1857,7 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               {messageArea}
             </MessageScrollArea>
             {cardDock}
-            <MessageComposer
-              key={`composer-${session.id}`}
-              session={session}
-              agentType={session.agentType}
-              onQueueChanged={bumpQueue}
-            />
+            {composerArea}
           </div>
           <SplitHandle
             orientation={preview.mode === "split-h" ? "horizontal" : "vertical"}
@@ -1912,13 +1929,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
               2026-09-19 用户裁决）——分屏时对话列同样可发消息；
               send-info 拉取失败时组件自静默，不影响对话渲染；钥匙口径同上。
               A5：把 agentType 交给 composer——只有 ZCode 会话才去读本机官方远控配置并在
-              发送区给就地原因（正文/文件预览这条读链完全不受它影响）。 */}
-          <MessageComposer
-            key={`composer-${session.id}`}
-            session={session}
-            agentType={session.agentType}
-            onQueueChanged={bumpQueue}
-          />
+              发送区给就地原因（正文/文件预览这条读链完全不受它影响）。
+              T7.2：ZCode 会话改挂统一控制面板（composerArea 的选择逻辑见其定义处）。 */}
+          {composerArea}
         </div>
       )}
 

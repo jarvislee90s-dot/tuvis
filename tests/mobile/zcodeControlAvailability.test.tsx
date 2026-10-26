@@ -98,6 +98,40 @@ function installDetailFetch() {
             : { configState: "saved", url: SAVED_URL };
       return new Response(JSON.stringify(body), { status: 200 });
     }
+    if (url === "/m/api/v1/zcode/connection") {
+      // T7.2 统一控制：连接态只来自官方 GET；网络失败 → 面板按 offline 就地申报
+      if (controlRoute.kind === "networkFail") throw new TypeError("network down");
+      const state = controlRoute.kind === "saved" ? "needs_auth" : "needs_config";
+      return new Response(
+        JSON.stringify({ state, generation: 1, reasonCode: state, deviceLabel: null }),
+        { status: 200 }
+      );
+    }
+    if (url.startsWith("/m/api/v1/zcode/session?")) {
+      const flag = { enabled: true, reasonCode: null };
+      return new Response(
+        JSON.stringify({
+          sessionId: "sess-zc",
+          generation: 1,
+          revision: 1,
+          ready: true,
+          pending: [],
+          control: { activeWorks: [] },
+          selection: null,
+          capabilities: {
+            send: flag,
+            singleSelect: flag,
+            multiSelect: flag,
+            freeText: flag,
+            interrupt: flag,
+            approvalReply: flag,
+            model: flag,
+            thoughtLevel: flag,
+          },
+        }),
+        { status: 200 }
+      );
+    }
     if (url.includes("/session-messages")) {
       return new Response(
         JSON.stringify({
@@ -218,44 +252,60 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("ZCode 控制不可用时阅读面继续工作（A5 read_view_survives_control_unavailable）", () => {
-  it.each<[string, ControlRoute, string | RegExp, string]>([
-    ["未配置", { kind: "missing" }, "请在电脑端配置 ZCode 远控链接", "missing"],
-    ["格式错误", { kind: "invalid" }, "请在电脑端更新 ZCode 远控链接", "invalid"],
-    ["待连接", { kind: "saved" }, /连接待确认/, "saved"],
-    ["读取失败", { kind: "networkFail" }, /暂时读不到/, ""],
-  ])("%s：正文与文件仍在，发送区给就地原因", async (_label, route, expected, expectedConfig) => {
-    controlRoute = route;
-    installDetailFetch();
-    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+describe("ZCode 统一控制不可用时阅读面继续工作（A5 read_view_survives_control_unavailable）", () => {
+  // T7.2 起 ZCode 会话的发送区由统一控制面板接管（连接态只来自 GET /zcode/*，
+  // 已保存链接绝不等于已连接）。原 A5 的 official-control 占位档随之迁移：
+  // missing/invalid → needs_config；saved → needs_auth；网络失败 → offline。
+  it.each<[string, ControlRoute, string, string, RegExp]>([
+    ["未配置", { kind: "missing" }, "needs_config", "needs_config", /配置/],
+    ["格式错误", { kind: "invalid" }, "needs_config", "needs_config", /配置/],
+    ["链接已保存但未授权", { kind: "saved" }, "needs_auth", "needs_auth", /授权/],
+    // 连接 GET 网络失败：没有连接视图（state 保持 unknown），就地原因按 offline 申报
+    ["读取失败", { kind: "networkFail" }, "unknown", "offline", /离线/],
+  ])(
+    "%s：正文与文件仍在，控制区给就地原因",
+    async (_label, route, expectedState, expectedReason, expected) => {
+      controlRoute = route;
+      installDetailFetch();
+      render(<SessionDetail session={makeSession()} onBack={() => {}} />);
 
-    // ① 读取链不受控制态影响：正文在、页头没有整页报错
-    expect(await screen.findByText("合成正文乙")).toBeTruthy();
-    expect(screen.queryByTestId("detail-error")).toBeNull();
+      // ① 读取链不受控制态影响：正文在、页头没有整页报错
+      expect(await screen.findByText("合成正文乙")).toBeTruthy();
+      expect(screen.queryByTestId("detail-error")).toBeNull();
 
-    // ② 文件面板仍可打开并列出条目（既有 /session-files 数据源）
-    fireEvent.click(await screen.findByTestId("file-panel-button"));
-    const fileRow = await screen.findByTestId("file-row-0-open");
-    expect(fileRow.textContent).toContain("synthetic.rs");
+      // ② 文件面板仍可打开并列出条目（既有 /session-files 数据源）
+      fireEvent.click(await screen.findByTestId("file-panel-button"));
+      const fileRow = await screen.findByTestId("file-row-0-open");
+      expect(fileRow.textContent).toContain("synthetic.rs");
 
-    // ③ 发送区就地给原因（沿用既有 send-disabled-reason 机制，不另建第二套禁用）。
-    // 等**收敛后**的那一档：首拍是「正在确认…」（读取在途），不能拿它当结果断言。
-    const reason = await screen.findByTestId("send-disabled-reason");
-    await waitFor(() => expect(reason.textContent).toMatch(expected));
-    // 两面分开申报：连接态恒 needs_connection（首版无适配器），配置态随档位
-    expect(reason.getAttribute("data-connection-state")).toBe("needs_connection");
-    expect(reason.getAttribute("data-config-state")).toBe(expectedConfig);
-  });
+      // ③ 发送区 = 统一控制面板，就地给原因（等收敛后的连接态，不拿首拍当结果）
+      const panel = await screen.findByTestId("zcode-control-panel");
+      await waitFor(() => expect(panel.getAttribute("data-connection-state")).toBe(expectedState));
+      const reason = await screen.findByTestId("zcode-control-reason");
+      expect(reason.getAttribute("data-reason-code")).toBe(expectedReason);
+      expect(reason.textContent).toMatch(expected);
+
+      // ④ 控制未就绪时发送是硬门：草稿保留、零动作 POST
+      const draft = screen.getByTestId("zcode-draft") as HTMLTextAreaElement;
+      fireEvent.change(draft, { target: { value: "这段草稿不能丢" } });
+      const send = screen.getByTestId("zcode-send") as HTMLButtonElement;
+      expect(send.disabled).toBe(true);
+      fireEvent.click(send);
+      await act(async () => {});
+      expect(draft.value).toBe("这段草稿不能丢");
+      expect(postedTo("/m/api/v1/zcode/actions")).toBe(0);
+    }
+  );
 
   it("读取失败不被当成「未配置／已删除」，且只读不写", async () => {
     controlRoute = { kind: "networkFail" };
     installDetailFetch();
     render(<SessionDetail session={makeSession()} onBack={() => {}} />);
-    const reason = await screen.findByTestId("send-disabled-reason");
-    await waitFor(() => expect(reason.textContent).toMatch(/暂时读不到/));
+    const reason = await screen.findByTestId("zcode-control-reason");
+    await waitFor(() => expect(reason.textContent).toMatch(/离线/));
     // 读取失败 ≠ 未配置/已删除（不把失败说成「去电脑端配置」）
-    expect(reason.textContent).not.toContain("请在电脑端配置");
-    expect(fetched("/m/api/v1/official-control")).toBeGreaterThan(0);
+    expect(reason.textContent).not.toMatch(/配置/);
+    expect(fetched("/m/api/v1/zcode/connection")).toBeGreaterThan(0);
     for (const call of fetchMock.mock.calls) {
       const init = call[1] as RequestInit | undefined;
       expect(init?.method ?? "GET").toBe("GET");
