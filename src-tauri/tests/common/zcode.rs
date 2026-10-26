@@ -89,6 +89,8 @@ struct Inner {
     ack: Value,
     /// 官方链路是否在线：断开后写帧**不记录**且返回 `offline`（模拟真正离不了机）。
     link_up: bool,
+    /// 绑定期错误注入（模拟桥重订阅窗口：`bind` 在投影未就绪时 `not_ready`）。
+    bind_error: Option<ZcodeError>,
 }
 
 impl Default for Inner {
@@ -114,6 +116,7 @@ impl Default for Inner {
             selection_confirmed: true,
             ack: json!({ "status": "accepted" }),
             link_up: true,
+            bind_error: None,
         }
     }
 }
@@ -223,11 +226,26 @@ impl FakeOfficial {
         lock(&self.inner).link_up = true;
     }
 
+    /// 注入绑定期错误（`Some(not_ready)` 模拟桥重订阅窗口：投影未就绪时绑定拒绝，
+    /// 写动作因此零帧；`None` 恢复正常精确绑定）。
+    pub fn set_bind_error(&self, error: Option<ZcodeError>) {
+        lock(&self.inner).bind_error = error;
+    }
+
     // ---- 观测面 ----
 
     /// 全部已离机写帧（快照）。
     pub fn frames(&self) -> Vec<Frame> {
         lock(&self.inner).frames.clone()
+    }
+
+    /// 指定信封 `type` 的已离机帧数（如 `stop` / `sendText`）。
+    pub fn frame_count(&self, envelope_type: &str) -> usize {
+        lock(&self.inner)
+            .frames
+            .iter()
+            .filter(|frame| frame.envelope_type() == Some(envelope_type))
+            .count()
     }
 
     /// 已离机的 `sendText` 帧数（T8.1「恰一帧」断言的唯一计数口径）。
@@ -313,12 +331,15 @@ impl HubBackend for FakeOfficial {
     }
 
     fn bind_session<'a>(&'a self, key: &'a TargetKey) -> BoxFuture<'a, ZResult<BoundTarget>> {
-        let session_id = {
+        let (session_id, bind_error) = {
             let mut inner = lock(&self.inner);
             inner.bind_calls.push(key.clone());
-            key.session_id.clone()
+            (key.session_id.clone(), inner.bind_error.clone())
         };
         Box::pin(async move {
+            if let Some(error) = bind_error {
+                return Err(error);
+            }
             Ok(BoundTarget {
                 session_id,
                 workspace_path: "/synthetic/workspace".to_owned(),
@@ -559,5 +580,16 @@ pub fn send_policy() -> CapabilityView {
             reason_code: None,
         },
         ..CapabilityView::default()
+    }
+}
+
+/// 开启 `send` + `interrupt`：打断用例需要 stop 能力闸放行（其余仍关闭）。
+pub fn stop_policy() -> CapabilityView {
+    CapabilityView {
+        interrupt: CapabilityFlag {
+            enabled: true,
+            reason_code: None,
+        },
+        ..send_policy()
     }
 }
