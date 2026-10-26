@@ -34,7 +34,7 @@
 | 3 | 严重 | 待修 | hook 连接事件只在 generation 增大时 `refresh()`（`useZcodeControl.ts` connection 分支）；同代 `waiting/needs_auth → paired` 不拉会话 | 连接态从非 paired 进入 paired（或首次 paired 且 session 为空）时静默重拉；snapshot 同规 | 手机先打开、桌面后连接，断言 session 由 null 变非空 |
 | 4 | 一般 | 待修 | `Snooze` 在 `check_policy` 直接 `return Ok(Vec::new())`（`hub.rs:1029-1045`）；`snooze_interaction` 返回值被忽略 | snooze 只允许：匹配的问答/审批能力已开启，或存在本会话/本代际可绑题许可；绑题失败即拒（零动作） | 能力全关 + 无许可时 snooze 拒绝；有合法许可时绑定成功；错题/过期拒绝 |
 | 5 | 一般 | 待修 | 问答能力按客户端 `selectedValues` 数量挑单选/多选（`hub.rs:1046-1070`），未看宿主题型；混合题只查一项 | 以宿主 pending 卡题型推导**全部**所需能力（每题单选/多选/自由文本），逐项过闸；客户端声明只做形状校验 | 多选卡只传 1 个值不得借单选许可；混合题缺任一能力即拒 |
-| 6 | 一般 | 待修 | `Hub::execute` 先 `control_generation`/`check_policy`，而持久幂等查询在 `CommandSender` 内部（`hub.rs:953-985`） | 先按 actionId 做只读幂等识别（身份/载荷/代际校验），命中直接返回既有回执；未命中再判连接/许可/新投递 | 断开或能力关闭后同 actionId 重试，仍返回 accepted/confirmed/unknown 原回执且零新帧 |
+| 6 | 一般 | 已审已提交 `0b5e5dda` | `Hub::execute` 先 `control_generation`/`check_policy`，而持久幂等查询在 `CommandSender` 内部（`hub.rs:953-985`） | 代际判定后先做只读幂等识别（device+session+generation+kind+hash），命中直接返回既有回执（不发 Action 事件）；冲突先上抛；未命中再判连接/许可/新投递 | Hub needs_auth 重放/冲突/stale-first；真实 ActionStore accepted/unknown 取回且零帧零行零审计；换载荷/跨设备/换代 conflict |
 | 7 | 一般 | 待修 | 关停用 5s `timeout` 等待 `hub.disconnect()`（`remote/mod.rs:751-770`）；`disconnect` 先等 `connect_lock`（`hub.rs:863-880`），超时取消清理，在途 connect 仍可成功 | 关闭意图先原子推进代际/离线并使连接尝试失效；清理任务不被超时取消（超时只停止等待） | connect 持锁跨网络等待时触发关闭：状态立即离线、旧 connect 不得 paired、relay 被关闭 |
 | 8 | 一般 | 待修 | relay 状态/数据事件用 `try_send` 静默丢（`relay.rs:609,698,729,742`）；Data 丢失无显式失效，GET 可能继续读旧投影 | 终态 State 必达（不丢）；Data 溢出显式标记投影失效并通知 Hub；GET 不得返回错误缓存 | 队列满丢终态 → Hub 不会永久 paired；Data 溢出 → 投影 ready=false，GET 不返回旧缓存 |
 | 9 | 一般 | 待修 | 问答 UI 的选中值与自由文本互不清除（`ZcodeControlPanel.tsx:231-235,307-343`），同题同时提交两类答案 | 选选项清同题 freeText/sensitiveRef；输入自由文本清同题 picked；敏感引用同步清理 | 先选后输入/先输入后选，提交只含一类答案；敏感输入切换后旧值不提交 |
@@ -73,3 +73,8 @@
   发布 Session → 独立审查 0 Critical/Important（3 Minor：错误帧不发事件、单槽
   `last_session`、测试白盒点；留后续/#8）→ 2 个新用例 + bridge 49/0 + hub 21/0；
   提交 `0d36d516`。
+- #6 幂等前置：RED（旧顺序 needs_auth 挡住既有回执；command 用例编译缺方法）→
+  ActionStore 显式身份查询 + CommandSender 复用 lookup + Hub 代际后立即查询 →
+  独立审查 0 Critical/Important（4 Minor：replay 后不复核代际、仅同代际可重放文档、
+  冲突先于 needs_auth 的有限信息、默认实现需注意）→ hub 24/0、command 88/0、
+  action 15/0；提交 `0b5e5dda`。
