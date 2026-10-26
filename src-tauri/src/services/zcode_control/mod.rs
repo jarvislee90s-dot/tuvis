@@ -9,10 +9,14 @@
 //! - `codec`：官方二进制 RPC 编解码（类型标签/VQL、rpc-frame Base64+CRC32）与可靠收帧；
 //! - `bridge`：工作区桥、任务索引与会话精确绑定（只读）；
 //! - `projection`：会话 topic 的精确投影（snapshot/deltas，跨会话零泄漏）；
-//! - `pending`：本会话 pending 册与 control 观察（ACK ≠ control 已到）。
+//! - `pending`：本会话 pending 册与 control 观察（ACK ≠ control 已到）；
+//! - `action`：写动作的持久去重账本（`zcode_actions`，actionId 幂等 + 保守 unknown）；
+//! - `audit`：动作起始审计（`zcode_official` 通道，只记类别与计数，不摘正文）。
 //!
 //! 官方授权、适配器与写能力由生产计划逐任务装配；授权不塞进 config，也不进 IPC 大文件。
 
+pub mod action;
+pub mod audit;
 pub mod auth;
 pub mod bridge;
 pub mod codec;
@@ -22,6 +26,10 @@ pub mod projection;
 pub mod relay;
 pub mod types;
 
+pub use action::{
+    action_params, audit_summary, payload_hash, ActionStore, Reservation, T3_ACTION_KIND,
+};
+pub use audit::{AGENT as AUDIT_AGENT, CHANNEL as AUDIT_CHANNEL};
 pub use auth::{
     AuthService, OAuthProvider, OpenAuthorize, TerminalToken, AUTHORIZE_TIMEOUT, OAUTH_TOKEN_PATH,
     OFFICIAL_BIGMODEL_APP_ID, OFFICIAL_BIGMODEL_ORIGIN, OFFICIAL_OAUTH_CLIENT_ID,
@@ -43,8 +51,8 @@ pub use relay::{
     DeviceRoute, RelayClient, RelayEvent, OFFICIAL_RELAY_WS_ORIGIN, OFFICIAL_RELAY_WS_PATH,
 };
 pub use types::{
-    codes, ActiveWork, BoundTarget, CapabilityFlag, CapabilityView, ConnectionState,
-    ConnectionView, ControlView, ModelChoice, PendingKind, PendingView, PermissionOptionView,
-    QuestionOption, QuestionView, RelaySink, SelectionView, SessionView, TargetKey, ZResult,
-    ZcodeError,
+    codes, ActionContext, ActionReceipt, ActionState, ActiveWork, AnswerEntry, BoundTarget,
+    CapabilityFlag, CapabilityView, CommandPort, ConnectionState, ConnectionView, ControlAction,
+    ControlView, ModelChoice, PendingKind, PendingView, PermissionOptionView, QuestionOption,
+    QuestionView, RelaySink, SelectionView, SessionView, TargetKey, ZResult, ZcodeError,
 };

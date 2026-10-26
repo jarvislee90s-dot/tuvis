@@ -228,6 +228,23 @@ pub fn init(conn: &Connection) {
         CREATE INDEX IF NOT EXISTS idx_codex_actions_terminal_retention
             ON codex_actions(updated_at)
             WHERE state IN ('accepted', 'rejected', 'cancelled') AND compat_outstanding = 0;
+        -- ZCode 官方桥控制动作账本（生产计划 T3）。只存去重与终态所需的最小面：
+        -- 正文/答案/JWT/URL 一律不落库（正文只以 sha256 payload_hash 参与幂等判定）。
+        -- action_id 是幂等键：同 id 同哈希同设备同会话 → 返回既有回执、零重发；
+        -- 任一不同 → action_payload_conflict（跨设备同 id 绝不泄漏旧回执）。
+        -- state 写前即 'unknown'（保守：崩溃/重启后重放只返回 unknown，不再派发）。
+        CREATE TABLE IF NOT EXISTS zcode_actions (
+            action_id    TEXT PRIMARY KEY,
+            device_id    TEXT NOT NULL,
+            session_id   TEXT NOT NULL,
+            generation   INTEGER NOT NULL,
+            kind         TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            state        TEXT NOT NULL,
+            reason_code  TEXT,
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS write_audit (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          INTEGER NOT NULL,

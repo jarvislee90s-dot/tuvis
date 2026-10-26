@@ -201,6 +201,212 @@ pub struct BoundTarget {
     pub generation: u64,
 }
 
+// ---------------------------------------------------------------------------
+// 动作（T3：一次性发送、去重账本与审计）
+// ---------------------------------------------------------------------------
+
+/// 动作终态／中间态（wire snake_case，与合同表一致）。
+///
+/// - `accepted`：宿主 ACK 受理（**不是**「已生效」——生效另有证据，T4+ 才判）；
+/// - `confirmed`：宿主撤卡/守卫消失等因果终态（本批不产生，预留变体）；
+/// - `noop`：宿主明确回放「无需处理」（如已收口），语义上不是成功；
+/// - `rejected`：宿主显式拒绝/命令失败；
+/// - `send_failed`：**确证未写出**（零写的绑定/就绪闸失败），用户可换新 actionId 重试；
+/// - `unknown`：写出与否/受理与否未知（含 ACK 超窗、写后断线、崩溃恢复）——绝不自动重发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionState {
+    /// 宿主 ACK accepted/duplicate：只表示已受理。
+    Accepted,
+    /// 因果终态（T4+ 由宿主撤卡/守卫消失证明；T3 不产生）。
+    Confirmed,
+    /// 宿主明确 noop（不是成功）。
+    Noop,
+    /// 宿主显式拒绝。
+    Rejected,
+    /// 确证未写出（可换 actionId 重试）。
+    SendFailed,
+    /// 保守未知（绝不自动重发）。
+    Unknown,
+}
+
+impl ActionState {
+    /// DB/审计用的稳定字面量（与 wire 同形）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Confirmed => "confirmed",
+            Self::Noop => "noop",
+            Self::Rejected => "rejected",
+            Self::SendFailed => "send_failed",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// 从 DB 列还原（未知值返回 `None`，调用方按 `unknown` 保守处置）。
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "accepted" => Some(Self::Accepted),
+            "confirmed" => Some(Self::Confirmed),
+            "noop" => Some(Self::Noop),
+            "rejected" => Some(Self::Rejected),
+            "send_failed" => Some(Self::SendFailed),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// 动作回执（发给手机；**不携带**正文/答案/官方原值）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionReceipt {
+    pub action_id: String,
+    pub session_id: String,
+    pub generation: u64,
+    pub state: ActionState,
+    pub reason_code: Option<String>,
+}
+
+/// 动作调用方上下文：`device_id`/`device_name` 只能来自配对门／本机 DB，
+/// 客户端仅提交 `actionId`（共享合同表）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionContext {
+    pub action_id: String,
+    pub device_id: String,
+    pub device_name: String,
+}
+
+/// 问答答案条目（T4 使用；T3 只参与 `ControlAction` 的载荷形状）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerEntry {
+    pub question_text: String,
+    pub selected_values: Vec<String>,
+    pub free_text: Option<String>,
+}
+
+/// 统一控制动作（tagged `kind`；**全部**携 `sessionId,generation`）。
+///
+/// 本批只实现 `Send`；其余变体在 `CommandSender::execute` 一律 `invalid_action`
+/// 且零帧零写（不伪造成功），由 T4–T6 逐个分支接入。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ControlAction {
+    /// 普通文本发送（`sendText`）。
+    #[serde(rename_all = "camelCase")]
+    Send {
+        session_id: String,
+        generation: u64,
+        text: String,
+    },
+    /// 暂停问答卡自动结束计时（T4）。
+    #[serde(rename_all = "camelCase")]
+    Snooze {
+        session_id: String,
+        generation: u64,
+        interaction_id: String,
+    },
+    /// 问答应答（T4）。
+    #[serde(rename_all = "camelCase")]
+    Answer {
+        session_id: String,
+        generation: u64,
+        interaction_id: String,
+        answers: Vec<AnswerEntry>,
+    },
+    /// 权限审批应答（T5）。
+    #[serde(rename_all = "camelCase")]
+    Permission {
+        session_id: String,
+        generation: u64,
+        interaction_id: String,
+        option_id: String,
+    },
+    /// 打断（T4）。
+    #[serde(rename_all = "camelCase")]
+    Stop {
+        session_id: String,
+        generation: u64,
+        expected_foreground_execution_id: String,
+    },
+    /// 模型/思考档位切换（T6）。
+    #[serde(rename_all = "camelCase")]
+    Selection {
+        session_id: String,
+        generation: u64,
+        model: String,
+        thought: String,
+    },
+}
+
+impl ControlAction {
+    /// 动作类别字面量（账本 `kind` 列与审计 `action` 词干）。
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Send { .. } => "send",
+            Self::Snooze { .. } => "snooze",
+            Self::Answer { .. } => "answer",
+            Self::Permission { .. } => "permission",
+            Self::Stop { .. } => "stop",
+            Self::Selection { .. } => "selection",
+        }
+    }
+
+    /// 动作携带的目标会话 id。
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::Send { session_id, .. }
+            | Self::Snooze { session_id, .. }
+            | Self::Answer { session_id, .. }
+            | Self::Permission { session_id, .. }
+            | Self::Stop { session_id, .. }
+            | Self::Selection { session_id, .. } => session_id,
+        }
+    }
+
+    /// 动作携带的连接代际。
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Send { generation, .. }
+            | Self::Snooze { generation, .. }
+            | Self::Answer { generation, .. }
+            | Self::Permission { generation, .. }
+            | Self::Stop { generation, .. }
+            | Self::Selection { generation, .. } => *generation,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 端口：写命令发送面（T3 裁决的最小抽象）
+// ---------------------------------------------------------------------------
+
+/// 写命令发送面的最小能力：在已绑定的会话桥上发一次 RPC 并等待应答。
+///
+/// 生产实现 = [`BridgeManager`](super::bridge::BridgeManager)（`command.rs` 的
+/// `impl CommandPort`）：`CommandSender` 因此**拿不到** relay 生命周期、JWT 或配置入口，
+/// HTTP 层也无法传入任意 wire（信封只在模块内生成）。测试 fake 记录出站调用并注入
+/// 应答/超窗/断线。
+///
+/// 错误码语义（生产实现保证）：
+/// - `stale_generation` / `no_session`：**确证零写**（绑定代际/会话在写前被拒）；
+/// - `not_ready`：就绪闸拒绝（零写）**或**已写出但等应答超窗——调用方按保守
+///   `unknown` 处置；
+/// - `offline`：relay/桥不可达（可能发生在写完前后）——同样按保守 `unknown`；
+/// - `unknown`：官方 PromiseError 等（帧已写出，宿主失败）。
+pub trait CommandPort: Send + Sync {
+    /// 发一次命令调用（未写/超窗/上游失败均以冻结码返回，不携带原文）。
+    fn call<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        channel: &'a str,
+        method: &'a str,
+        args: Vec<Value>,
+    ) -> BoxFuture<'a, ZResult<Value>>;
+}
+
 /// pending 卡种类（官方 `PendingInteraction.kind` 三元）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
