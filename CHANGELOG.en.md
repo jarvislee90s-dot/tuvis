@@ -17,6 +17,28 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Added
 
+- **ZCode unified control (official bridge)**: ZCode now drives sessions through the
+  official bridge — the desktop completes **BigModel** authorization and connection in the
+  ZCode card under **Settings → Remote Access → ④ Tool-specific configuration** (official
+  credentials stay on this machine, **the JWT lives in memory only**, terminal tokens are
+  fetched fresh each time, and the phone holds no credential or short-lived token), connects
+  to the official host over a **single relay**, projects workspaces / sessions onto the board
+  with exact session binding, and on the phone reuses the same composer, question cards,
+  approval cards, interrupt and model / thought controls as the other tools. Every control
+  action goes through an **action ledger with actionId idempotency** (single-send, an ACK
+  timeout conservatively recorded as "result unknown", never auto-resent); sending, Q&A
+  (single / multiple choice / free text), approval replies, interrupt, and model /
+  thought-level switching are all wired in; the board, messages and file previews never
+  depend on control succeeding — losing control never blocks reading.
+- **ZCode unified control opens per host evidence (capability boundary, stated honestly)**:
+  all eight control capabilities **stay closed by default** in production builds and open one
+  by one only after host evidence; approvals cover only **replying to an existing card** —
+  sending from Tuvis to trigger a permission card produced a **negative result** across
+  repeated runs (no card appeared), so that send is not treated as approval protection; the
+  host end state for multi-select / free text / interrupt is not live-verified (single-select
+  and interrupt currently have an acceptance receipt only), the ZAI channel has source and
+  simulated evidence only, and Windows has not been built or run; unverified capabilities say
+  so in place and never open just because sending works.
 - **ZCode official remote link configuration with per-state phone hints**: the remote
   settings gained a "④ Tool-specific configuration" section whose first release is a
   single collapsed ZCode card — it stores the official remote-control link produced by
@@ -39,6 +61,11 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Changed
 
+- **ZCode sends now go through official unified control (behavior change)**: the legacy
+  ZCode session-send path is retired (M11) — old channel requests to send into a ZCode
+  session now return **409 `official_control_required`**, pointing at official-bridge
+  unified control; there is no headless-injection fallback and no silent downgrade to
+  "delivered". The board, messages and file reading paths are unaffected.
 - **Headless injection and compatibility send default to on (upgrade note)**:
   `remote.headless_enabled` and `remote.compat_send_enabled` now resolve to **on** when
   the settings hold no choice of yours (key absent — fresh installs or upgrades without
