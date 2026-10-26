@@ -7,10 +7,11 @@
 use multi_agents_manager_lib::remote::codex_ipc::CodexControlHub;
 use multi_agents_manager_lib::remote::pairing::{persist_device, DeviceStore, NewDevice};
 use multi_agents_manager_lib::remote::server::{router, RemoteState};
+use multi_agents_manager_lib::remote::zcode::control_frame;
 use multi_agents_manager_lib::services::zcode_control::{
     codes, set_config, ActionContext, ActionReceipt, ActionState, BoundTarget, CapabilityFlag,
-    CapabilityView, ConnectionState, ConnectionView, ControlAction, DeviceRoute, HubBackend,
-    OAuthProvider, SessionView, TargetKey, ZResult, ZcodeError, ZcodeHub,
+    CapabilityView, ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind,
+    DeviceRoute, HubBackend, OAuthProvider, SessionView, TargetKey, ZResult, ZcodeError, ZcodeHub,
 };
 use multi_agents_manager_lib::session::{
     AgentType, ProcessForm, Session, SessionStatus, SessionsResponse,
@@ -469,6 +470,7 @@ async fn unpaired_zcode_endpoints_return_403() {
     for route in [
         "/m/api/v1/zcode/connection".to_string(),
         format!("/m/api/v1/zcode/session?sessionId={ZCODE_SESSION}"),
+        format!("{EVENTS_ROUTE}?sessionId={ZCODE_SESSION}"),
     ] {
         let resp = app
             .clone()
@@ -923,4 +925,231 @@ async fn workspace_path_in_body_is_rejected_or_ignored() {
         !wire.to_string().contains("/evil"),
         "响应不得回显客户端自报 workspace"
     );
+}
+
+// ============================================================
+// T7.1 B3：配对视角的 ZCode 事件流（GET /zcode/events，SSE）
+// ============================================================
+
+const EVENTS_ROUTE: &str = "/m/api/v1/zcode/events";
+const OTHER_SESSION: &str = "zcode-B3-0002";
+
+/// 读一帧 SSE 数据（2s 超时；流结束返回 None）。与既有 /events 测试同一读法。
+async fn next_frame(stream: &mut axum::body::BodyDataStream) -> Option<String> {
+    use futures::StreamExt as _;
+    let next = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("SSE 帧读取超时");
+    next.map(|chunk| String::from_utf8(chunk.expect("SSE 帧读取失败").to_vec()).expect("UTF-8"))
+}
+
+/// 帧的 data 行 JSON（axum 固定写 `data: <json>`）。
+fn frame_json(frame: &str) -> serde_json::Value {
+    let data = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("SSE 帧必须含 data 行");
+    serde_json::from_str(data).expect("data 行必须是 JSON")
+}
+
+/// 建立配对状态 + Hub 并返回 (router, hub, registry) 三元组。
+async fn sse_app(
+    conn: &SharedConn,
+    backend: Arc<FakeHubBackend>,
+) -> (
+    axum::Router,
+    Arc<ZcodeHub>,
+    Arc<multi_agents_manager_lib::remote::server::SseRegistry>,
+) {
+    seed_device(conn);
+    let hub = paired_hub(conn, backend).await;
+    let st = state(conn, Arc::new(RecordingInjector::default()));
+    st.set_zcode_hub(hub.clone());
+    let registry = st.sse_registry.clone();
+    (router(st), hub, registry)
+}
+
+fn sse_req(session_id: &str) -> axum::http::Request<axum::body::Body> {
+    get_req(&format!("{EVENTS_ROUTE}?sessionId={session_id}"))
+}
+
+/// 首帧 = 当前连接视图 + 会话就绪快照；no-store + text/event-stream。
+#[tokio::test]
+async fn sse_first_frame_is_connection_state() {
+    let conn = shared_conn();
+    let (app, hub, _registry) = sse_app(&conn, Arc::new(FakeHubBackend::default())).await;
+    let view = hub.connection();
+
+    let resp = app.oneshot(sse_req(ZCODE_SESSION)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert_eq!(no_store(&resp), Some("no-store"), "控制事件流必须 no-store");
+
+    let mut stream = resp.into_body().into_data_stream();
+    let first = next_frame(&mut stream).await.expect("首帧不得缺失");
+    assert!(
+        first.starts_with("event: snapshot\n"),
+        "首帧必须是 snapshot，实际 {first:?}"
+    );
+    let body = frame_json(&first);
+    assert_eq!(body["connection"]["state"], "paired");
+    assert_eq!(body["connection"]["generation"], view.generation);
+    assert_eq!(body["connection"]["deviceLabel"], "fake-device");
+    assert_eq!(body["session"]["sessionId"], ZCODE_SESSION);
+    assert_eq!(body["session"]["ready"], true, "会话就绪随首帧下发");
+}
+
+/// 只转发本会话事件：别的会话 session/action 事件不产帧；连接事件恒转发。
+#[tokio::test]
+async fn sse_filters_other_sessions() {
+    let conn = shared_conn();
+    let (app, hub, _registry) = sse_app(&conn, Arc::new(FakeHubBackend::default())).await;
+    let resp = app.oneshot(sse_req(ZCODE_SESSION)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let mut stream = resp.into_body().into_data_stream();
+    next_frame(&mut stream).await.expect("首帧");
+
+    // 过滤器单点（SSE 每帧都经它产出，见 remote::zcode::control_frame）
+    let foreign_session = ControlEvent {
+        seq: 1,
+        generation: 1,
+        session_id: Some(OTHER_SESSION.into()),
+        kind: ControlEventKind::Session,
+        data: serde_json::json!({ "sessionId": OTHER_SESSION }),
+    };
+    let foreign_action = ControlEvent {
+        seq: 2,
+        generation: 1,
+        session_id: Some(OTHER_SESSION.into()),
+        kind: ControlEventKind::Action,
+        data: serde_json::json!({ "actionId": "action-other-session" }),
+    };
+    let own_session = ControlEvent {
+        seq: 3,
+        generation: 1,
+        session_id: Some(ZCODE_SESSION.into()),
+        kind: ControlEventKind::Session,
+        data: serde_json::json!({ "sessionId": ZCODE_SESSION }),
+    };
+    assert!(control_frame(&foreign_session, ZCODE_SESSION).is_none());
+    assert!(control_frame(&foreign_action, ZCODE_SESSION).is_none());
+    assert!(matches!(
+        control_frame(&own_session, ZCODE_SESSION),
+        Some(("session", _))
+    ));
+
+    // 活流：Hub 广播一条连接事件 → 连接帧（非本会话事件不混入）
+    hub.disconnect().await;
+    let frame = next_frame(&mut stream).await.expect("连接事件帧");
+    assert!(
+        frame.starts_with("event: connection\n"),
+        "连接事件必须转发，实际 {frame:?}"
+    );
+    let body = frame_json(&frame);
+    assert_eq!(body["kind"], "connection");
+    assert_eq!(body["data"]["state"], "offline");
+    assert!(
+        !frame.contains(OTHER_SESSION),
+        "不得混入其它会话帧，实际 {frame:?}"
+    );
+}
+
+/// 广播落后（lag）→ 只发 `resync` 帧（客户端重 GET），绝不重放动作。
+#[tokio::test]
+async fn sse_lag_emits_resync_not_replay() {
+    let conn = shared_conn();
+    let (app, hub, _registry) = sse_app(&conn, Arc::new(FakeHubBackend::default())).await;
+    let resp = app.oneshot(sse_req(ZCODE_SESSION)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let mut stream = resp.into_body().into_data_stream();
+    next_frame(&mut stream).await.expect("首帧");
+
+    // 停止读帧，制造 >64 条积压（每轮 disconnect+connect 共 3 条连接事件）
+    for _ in 0..25 {
+        hub.disconnect().await;
+        hub.connect().await.expect("fake 重连");
+    }
+    let lagged = next_frame(&mut stream)
+        .await
+        .expect("lag 后必须有 resync 帧");
+    assert!(
+        lagged.starts_with("event: resync\n"),
+        "lag 必须发 resync，实际 {lagged:?}"
+    );
+    assert!(
+        !lagged.contains("actionId"),
+        "resync 帧不得重放动作，实际 {lagged:?}"
+    );
+
+    // resync 之后只回放缓冲里的连接事件，绝不出现动作帧
+    for _ in 0..3 {
+        let frame = next_frame(&mut stream).await.expect("积压连接帧");
+        assert!(
+            !frame.starts_with("event: action\n"),
+            "lag 后不得重放动作，实际 {frame:?}"
+        );
+    }
+}
+
+/// 设备吊销 → SSE 立即关闭；吊销后帧数恒为 0。
+#[tokio::test]
+async fn revoked_device_sse_closes_and_frames_after_revoke_are_zero() {
+    let conn = shared_conn();
+    let (app, _hub, registry) = sse_app(&conn, Arc::new(FakeHubBackend::default())).await;
+    let resp = app.oneshot(sse_req(ZCODE_SESSION)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let mut stream = resp.into_body().into_data_stream();
+    next_frame(&mut stream).await.expect("首帧");
+
+    let mut frames_after_revoke = 0;
+    assert_eq!(registry.disconnect_device("dev-z1"), 1, "应关闭 1 条连接");
+    while next_frame(&mut stream).await.is_some() {
+        frames_after_revoke += 1;
+    }
+    assert_eq!(frames_after_revoke, 0, "吊销后不得再发任何帧");
+}
+
+/// 流内绝无凭据；别的设备在别的会话上的动作 id 不外泄。
+#[tokio::test]
+async fn sse_never_exposes_tokens_or_other_device_actions() {
+    let conn = shared_conn();
+    let (app, hub, _registry) = sse_app(&conn, Arc::new(FakeHubBackend::default())).await;
+    let resp = app.oneshot(sse_req(ZCODE_SESSION)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let mut stream = resp.into_body().into_data_stream();
+    let first = next_frame(&mut stream).await.expect("首帧");
+    let wire = first.to_lowercase();
+    for needle in ["jwt", "token", "secret", "credential", "authorization"] {
+        assert!(!wire.contains(needle), "首帧不得携带凭据（命中 {needle}）");
+    }
+
+    // 另一台手机在另一会话上的动作回执：过滤后不产帧（actionId 不外泄）
+    let foreign_action = ControlEvent {
+        seq: 7,
+        generation: 1,
+        session_id: Some(OTHER_SESSION.into()),
+        kind: ControlEventKind::Action,
+        data: serde_json::json!({
+            "actionId": "action-other-device-0001",
+            "sessionId": OTHER_SESSION,
+        }),
+    };
+    assert!(control_frame(&foreign_action, ZCODE_SESSION).is_none());
+
+    // 活流：连接事件帧同样不得含凭据/他机动作 id
+    hub.disconnect().await;
+    let frame = next_frame(&mut stream).await.expect("连接帧");
+    let wire = frame.to_lowercase();
+    assert!(!wire.contains("action-other-device-0001"));
+    for needle in ["jwt", "token", "secret", "credential", "authorization"] {
+        assert!(
+            !wire.contains(needle),
+            "事件帧不得携带凭据（命中 {needle}）"
+        );
+    }
 }

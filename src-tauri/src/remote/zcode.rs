@@ -5,10 +5,12 @@
 //! - `GET /m/api/v1/zcode/session?sessionId=<原 ID>` →
 //!   [`SessionView`](crate::services::zcode_control::SessionView)；
 //! - `POST /m/api/v1/zcode/actions` `{actionId, action}` →
-//!   [`ActionReceipt`](crate::services::zcode_control::ActionReceipt)。
+//!   [`ActionReceipt`](crate::services::zcode_control::ActionReceipt)；
+//! - `GET /m/api/v1/zcode/events?sessionId=<原 ID>` → SSE（首帧连接+会话状态，
+//!   随后连接/本会话事件；lag 只发 `resync`；吊销/停服即时断流）。
 //!
 //! 契约（T7.1 接口冻结节）：
-//! - 三条路由都注册在既有 `/m/api/v1` 配对 gate 的 nest 内——未配对在 handler 之前
+//! - 各路由都注册在既有 `/m/api/v1` 配对 gate 的 nest 内——未配对在 handler 之前
 //!   403，绝不触达 Hub／后端；
 //! - `Cache-Control: no-store`（门禁下私有状态，与 sessions/official-control 同规）；
 //! - GET **不**触发 OAuth、**不**隐式新建 relay；Hub 未装配 → 503 `not_ready`，
@@ -23,17 +25,21 @@
 use axum::{
     extract::{rejection::JsonRejection, Query, State},
     http::{header::CACHE_CONTROL, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{sse, IntoResponse, Response, Sse},
     Json,
 };
+use futures::stream::StreamExt as _;
 use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
-use super::server::{RemoteState, SseRegistry};
+use super::server::{CleanupStream, RemoteState, SseRegistry};
 use crate::services::zcode_control::{
-    codes, ActionContext, ControlAction, TargetKey, ZcodeError, ZcodeHub,
+    codes, ActionContext, ControlAction, ControlEvent, ControlEventKind, TargetKey, ZcodeError,
+    ZcodeHub,
 };
 use crate::session::AgentType;
 
@@ -94,6 +100,29 @@ pub async fn connection(State(st): State<Arc<RemoteState>>) -> Response {
     ([(CACHE_CONTROL, "no-store")], Json(hub.connection())).into_response()
 }
 
+/// 当前 Tuvis 会话快照里按原 ID 对位出的 ZCode 会话。
+///
+/// 只认**快照里活着的** `agent_type=zcode` 会话：未知 ID、非 ZCode、已离开快照
+/// （旧会话/隐藏归档）一律 None——手机不能凭自报 ID 越权恢复任何会话。
+/// 快照扫描是同步阻塞活（与 /sessions 同源），按既有惯例进阻塞池。
+async fn current_zcode_session(
+    st: &Arc<RemoteState>,
+    session_id: &str,
+) -> Option<crate::session::Session> {
+    let scan = st.clone();
+    let wanted = session_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        (scan.session_source)()
+            .sessions
+            .into_iter()
+            .find(|s| s.id == wanted)
+    })
+    .await
+    .ok()
+    .flatten()
+    .filter(|session| session.agent_type == AgentType::ZCode)
+}
+
 /// GET /m/api/v1/zcode/session?sessionId=<原 ID>：当前 Tuvis ZCode 会话投影。
 ///
 /// 绑定权限全在服务端：
@@ -117,26 +146,11 @@ pub async fn session(
         );
     };
 
-    // 快照扫描是同步阻塞活（与 /sessions 同源），按既有惯例进阻塞池。
-    let scan = st.clone();
-    let wanted = session_id.clone();
-    let current = tokio::task::spawn_blocking(move || {
-        (scan.session_source)()
-            .sessions
-            .into_iter()
-            .find(|s| s.id == wanted)
-    })
-    .await
-    .ok()
-    .flatten();
-    match current {
-        Some(session) if session.agent_type == AgentType::ZCode => {}
-        _ => {
-            return json_no_store(
-                StatusCode::NOT_FOUND,
-                serde_json::json!({ "error": codes::NO_SESSION }),
-            )
-        }
+    if current_zcode_session(&st, &session_id).await.is_none() {
+        return json_no_store(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": codes::NO_SESSION }),
+        );
     }
 
     let Some(hub) = st.zcode_hub() else {
@@ -161,6 +175,123 @@ fn session_error(error: ZcodeError) -> Response {
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     json_no_store(status, serde_json::json!({ "error": error.code }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /m/api/v1/zcode/events（T7.1 B3，SSE）
+// ---------------------------------------------------------------------------
+
+/// 事件 → SSE 帧的过滤单点（handler 与跨 crate 集成测试共用同一实现）。
+///
+/// `pub` 仅为 `tests/` 可见（`doc(hidden)`，不向设置/IPC 暴露）：
+/// - 连接事件（`sessionId = None`）恒转发——两台手机共享同一条连接的状态；
+/// - 会话/动作事件只转发**请求的那个会话**——别的会话（可能由另一台手机驱动）
+///   的动作 id/投影一律不出网；缺 `sessionId` 的会话类事件保守丢弃；
+/// - 事件体只序列化 Hub 的 Tuvis DTO（`ControlEvent`），绝无 JWT/token/官方原文。
+#[doc(hidden)]
+pub fn control_frame(event: &ControlEvent, session_id: &str) -> Option<(&'static str, String)> {
+    let name = match event.kind {
+        ControlEventKind::Connection => "connection",
+        ControlEventKind::Session | ControlEventKind::Action => {
+            if event.session_id.as_deref() != Some(session_id) {
+                return None;
+            }
+            if event.kind == ControlEventKind::Session {
+                "session"
+            } else {
+                "action"
+            }
+        }
+    };
+    serde_json::to_string(event).ok().map(|data| (name, data))
+}
+
+/// GET /m/api/v1/zcode/events?sessionId=<原 ID>：配对手机的控制事件流（SSE）。
+///
+/// - 首帧 `snapshot` = 当前 [`ConnectionView`](crate::services::zcode_control::ConnectionView)
+///   与（可绑定时）当前会话投影（含 `ready`）；随后转发 Hub 的
+///   [`ControlEvent`](crate::services::zcode_control::ControlEvent)（连接恒转发，
+///   会话/动作只发本会话，见 [`control_frame`]）；
+/// - 广播落后（lag）只发 `resync` 帧，客户端据此重 GET connection/session，
+///   **绝不重放动作**；
+/// - 注册进既有 [`SseRegistry`]：设备吊销/停服经 `take_until` 立即断流；
+///   客户端断开由 [`CleanupStream`] 反注册；keep-alive 沿用 axum 15s 空注释帧；
+/// - 与 GET 同规：不触发 OAuth、不隐式连接；未配对在 gate 层 403（结构化覆盖），
+///   Hub 未装配 503 `not_ready`，未知/非 ZCode/已离开快照的会话 404 `no_session`。
+pub async fn events(
+    State(st): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(session_id) = params
+        .get("sessionId")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return json_no_store(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "bad_request" }),
+        );
+    };
+    // 会话归属授权在订阅之前完成：自报 ID 不能拉起任何不在快照里的会话事件面。
+    if current_zcode_session(&st, &session_id).await.is_none() {
+        return json_no_store(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": codes::NO_SESSION }),
+        );
+    }
+    let Some(hub) = st.zcode_hub() else {
+        return json_no_store(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "error": codes::NOT_READY }),
+        );
+    };
+    // M4 T0a 同规：注册连接，吊销/停服信号经 take_until 终止流。
+    let device = super::gate::extract_device(&headers).unwrap_or_default();
+    let (conn_id, close_rx) = st.sse_registry.register(&device);
+    let registry = st.sse_registry.clone();
+    // 先订阅、后取首帧（顺序刻意，勿换）：订阅与首帧之间产生的跃迁落进广播缓冲，
+    // 在首帧之后依次送出；反序会永久漏掉窗口内的更新。
+    let rx = hub.subscribe();
+    let initial = serde_json::json!({
+        "connection": hub.connection(),
+        "session": hub
+            .session(&TargetKey {
+                session_id: session_id.clone(),
+            })
+            .await
+            .ok(),
+    });
+    let initial_json = serde_json::to_string(&initial).unwrap_or_else(|_| "{}".to_string());
+    let first = futures::stream::once(async move {
+        Ok::<sse::Event, Infallible>(sse::Event::default().event("snapshot").data(initial_json))
+    });
+    let wanted = session_id.clone();
+    let updates = BroadcastStream::new(rx).filter_map(move |msg| {
+        let wanted = wanted.clone();
+        async move {
+            match msg {
+                Ok(event) => control_frame(&event, &wanted)
+                    .map(|(name, data)| Ok(sse::Event::default().event(name).data(data))),
+                // lag = 中间事件已丢：只报 resync，由客户端重 GET 自愈；不重放动作。
+                Err(BroadcastStreamRecvError::Lagged(_)) => Some(Ok(sse::Event::default()
+                    .event("resync")
+                    .data(r#"{"reason":"lag"}"#))),
+            }
+        }
+    });
+    let guarded = first.chain(updates).take_until(close_rx);
+    let cleaned = CleanupStream {
+        inner: guarded,
+        reg: registry,
+        device,
+        conn_id,
+    };
+    (
+        [(CACHE_CONTROL, "no-store")],
+        Sse::new(cleaned).keep_alive(sse::KeepAlive::default()),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

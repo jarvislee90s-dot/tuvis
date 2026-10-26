@@ -641,6 +641,10 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // 设备身份只取 cookie/DB（请求体多字段即 400 `invalid_action`）；回执一律
         // no-store，accepted/confirmed/noop/unknown 均 200 并按 state 区分。
         .route("/zcode/actions", post(super::zcode::actions))
+        // ZCode 控制事件流（T7.1 B3）：SSE 首帧连接+会话状态，随后转发连接/本会话
+        // 事件；lag 只发 resync（客户端重 GET），设备吊销/停服经 SseRegistry 即时断流。
+        // PIN 门禁内层 gate 结构性覆盖——未配对在 handler 之前 403。
+        .route("/zcode/events", get(super::zcode::events))
         // /channel（§C5，Task 10）：通道能力**装饰**端点（走哪条通道/带宽受限 +
         // 实测速率）。读 Host 推断、可被伪造、允许不准、**永不得进安全判定**
         // （不变量 §G1 推论③，见 api::channel_info 注释）；gate 由本子路由的
