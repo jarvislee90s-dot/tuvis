@@ -747,10 +747,35 @@ impl BridgeManager {
     ///
     /// 只做解析/路由，**不 await 网络**（ACK 走 actor 队列），因此事件泵不会被慢路径拖住；
     /// 缺口/协议不符只置 `ready=false` 并标记重同步，读面下次访问时取新快照。
-    pub async fn on_data(&self, payload: Value) -> ZResult<()> {
-        let (result, acks, releases) = {
+    ///
+    /// 返回**本帧内发生变化的会话视图**（同一把状态锁内前后快照对比，按 sessionId
+    /// 判定；无变化 = 空）。上层（Hub 事件泵）据此把会话变化发布给手机，而不是只在
+    /// 桥内更新投影。错误时返回 `Err`（ACK/退订仍照常尽力发出）。
+    pub async fn on_data(&self, payload: Value) -> ZResult<Vec<SessionView>> {
+        let (result, acks, releases, views) = {
             let mut inner = lock(&self.shared.state);
-            inner.handle_data(&payload)
+            // 前/后快照与 `handle_data` 在同一把状态锁内：视图差异就是「本帧」
+            // 的效果，不会混入锁外其它调用者的读写。
+            let before: HashMap<String, SessionView> = inner
+                .sessions
+                .iter()
+                .map(|(session_id, entry)| (session_id.clone(), entry.projection.view()))
+                .collect();
+            let (result, acks, releases) = inner.handle_data(&payload);
+            let mut views = Vec::new();
+            // 错误帧不报告变化（上层丢弃本帧；会话降级由连接态/读面重同步处理）；
+            // 成功帧按 sessionId 对比视图。
+            if result.is_ok() {
+                for (session_id, entry) in inner.sessions.iter() {
+                    let after = entry.projection.view();
+                    if before.get(session_id) != Some(&after) {
+                        views.push(after);
+                    }
+                }
+            }
+            // 稳定顺序（HashMap 迭代序随机）：同一批变化的事件顺序可复现。
+            views.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+            (result, acks, releases, views)
         };
         for ack in acks {
             let _ = self.shared.commands.try_send(Command::SendFrame {
@@ -761,7 +786,7 @@ impl BridgeManager {
         for release in releases {
             let _ = self.shared.commands.try_send(release);
         }
-        result
+        result.map(|()| views)
     }
 
     /// 连接代际变化：丢弃旧代际的全部桥/投影/临时绑定。
@@ -3541,15 +3566,17 @@ mod tests {
             }
         }
 
-        /// 注入一条带新物理 seq 的入站帧（模拟迟到应答）。
-        async fn inject_frame(&self, bridge: &str, bytes: Vec<u8>) {
+        /// 注入一条带新物理 seq 的入站帧（模拟迟到应答）；返回本次变化的会话视图。
+        async fn inject_frame(&self, bridge: &str, bytes: Vec<u8>) -> Vec<SessionView> {
             let frame = {
                 let mut inner = self.inner.lock().expect("peer lock");
                 self.frame(&mut inner, bridge, bytes)
             };
             let manager = self.manager.lock().expect("peer lock").upgrade();
             if let Some(manager) = manager {
-                let _ = manager.on_data(frame).await;
+                manager.on_data(frame).await.unwrap_or_default()
+            } else {
+                Vec::new()
             }
         }
 
@@ -5551,19 +5578,20 @@ mod tests {
         }
     }
 
-    /// 注入一帧宿主 `snapshot`（pending 集合整体替换 → 观察代数 +1）。
-    async fn push_pending_snapshot(peer: &Peer, cards: Vec<Value>) {
-        push_pending_snapshot_on(peer, SESSION_A, "conv-sub-synthetic-1", 5, cards).await;
+    /// 注入一帧宿主 `snapshot`（pending 集合整体替换 → 观察代数 +1）；
+    /// 返回本次变化的会话视图。
+    async fn push_pending_snapshot(peer: &Peer, cards: Vec<Value>) -> Vec<SessionView> {
+        push_pending_snapshot_on(peer, SESSION_A, "conv-sub-synthetic-1", 5, cards).await
     }
 
-    /// 向指定会话的当前订阅注入一帧宿主 `snapshot`。
+    /// 向指定会话的当前订阅注入一帧宿主 `snapshot`；返回本次变化的会话视图。
     async fn push_pending_snapshot_on(
         peer: &Peer,
         session_id: &str,
         subscription: &str,
         revision: u64,
         cards: Vec<Value>,
-    ) {
+    ) -> Vec<SessionView> {
         let bridge = peer.session_bridge_id(session_id);
         let listen = peer.listen_id(&bridge);
         let topic = format!("{CONVERSATION_TOPIC_PREFIX}{session_id}");
@@ -5579,7 +5607,7 @@ mod tests {
             &bridge,
             channel_message(json!([RESPONSE_TYPE_EVENT_FIRE, listen]), &wire),
         )
-        .await;
+        .await
     }
 
     fn command_frames(peer: &Peer, method: &str) -> Vec<TestMessage> {
@@ -5920,7 +5948,7 @@ mod tests {
     /// 注入一条 control 增量（只有 `state.updated` 的键级整体替换）。
     ///
     /// `revision = None` 模拟「撤项但宿主 revision 未前进」的迟到/迟滞帧：观察到的
-    /// control 变了，但没有任何可确认的宿主水位。
+    /// control 变了，但没有任何可确认的宿主水位。返回本次变化的会话视图。
     #[allow(clippy::too_many_arguments)]
     async fn push_control_delta_on(
         peer: &Peer,
@@ -5930,7 +5958,7 @@ mod tests {
         to: u64,
         revision: Option<u64>,
         active_works: Value,
-    ) {
+    ) -> Vec<SessionView> {
         let bridge = peer.session_bridge_id(session_id);
         let listen = peer.listen_id(&bridge);
         let topic = format!("{CONVERSATION_TOPIC_PREFIX}{session_id}");
@@ -5962,7 +5990,53 @@ mod tests {
             &bridge,
             channel_message(json!([RESPONSE_TYPE_EVENT_FIRE, listen]), &wire),
         )
-        .await;
+        .await
+    }
+
+    // =======================================================================
+    // Data 变化的会话视图（Hub 发布面的桥侧证据）
+    // =======================================================================
+
+    /// Data 帧必须报告**本次变化**的会话视图：绑定后一条 conversation delta 返回恰好
+    /// 一条该会话的视图（revision/control 已更新）；重放同一帧（投影不变）返回空。
+    ///
+    /// 上层（Hub 事件泵）就是靠这份返回值把会话变化发布给手机；只更新桥内投影而
+    /// 不报告变化的实现必须在这里失败。
+    #[tokio::test]
+    async fn on_data_reports_changed_session_views() {
+        const EXEC: &str = "E-synthetic-view-change";
+        const SUB: &str = "conv-sub-synthetic-1";
+        let (manager, peer) = manager_with(single_workspace_config()).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let baseline = manager.session(&target).await.expect("session");
+        assert!(baseline.ready, "订阅快照必须先建立就绪投影");
+        assert_eq!(baseline.revision, Some(2));
+
+        // revision 前进 + control 出现：必须恰好报告一条本会话视图。
+        let active_works = json!([{"kind": "primaryTurn", "foregroundExecutionId": EXEC}]);
+        let changed =
+            push_control_delta_on(&peer, SESSION_A, SUB, 1, 2, Some(3), active_works.clone()).await;
+        assert_eq!(changed.len(), 1, "一帧只改变一个已绑定会话");
+        let view = &changed[0];
+        assert_eq!(view.session_id, SESSION_A);
+        assert!(view.ready);
+        assert_eq!(view.revision, Some(3), "变化视图必须带新 revision");
+        let control = view.control.as_ref().expect("control 已观测");
+        assert_eq!(control.active_works.len(), 1);
+        assert_eq!(
+            control.active_works[0].foreground_execution_id.as_deref(),
+            Some(EXEC)
+        );
+        assert_eq!(view.generation, baseline.generation, "桥投影代际不变");
+
+        // 重放同一 logical frame（toSeq 不前进）：投影守恒 → 空（不得重复上报）。
+        let unchanged =
+            push_control_delta_on(&peer, SESSION_A, SUB, 1, 2, Some(3), active_works).await;
+        assert!(unchanged.is_empty(), "无变化的帧不得报告会话变化");
+        assert_eq!(
+            manager.session(&target).await.expect("session").revision,
+            Some(3)
+        );
     }
 
     // =======================================================================
@@ -5988,7 +6062,7 @@ mod tests {
         snapshot
     }
 
-    /// 注入一条选择增量（config 键级整体替换 + revision 前进）。
+    /// 注入一条选择增量（config 键级整体替换 + revision 前进）；返回变化的会话视图。
     #[allow(clippy::too_many_arguments)]
     async fn push_selection_delta_on(
         peer: &Peer,
@@ -6000,7 +6074,7 @@ mod tests {
         provider: &str,
         model: &str,
         thought: &str,
-    ) {
+    ) -> Vec<SessionView> {
         let bridge = peer.session_bridge_id(session_id);
         let listen = peer.listen_id(&bridge);
         let topic = format!("{CONVERSATION_TOPIC_PREFIX}{session_id}");
@@ -6032,7 +6106,7 @@ mod tests {
             &bridge,
             channel_message(json!([RESPONSE_TYPE_EVENT_FIRE, listen]), &wire),
         )
-        .await;
+        .await
     }
 
     /// stop 端口的会话视图必须按**精确目标**取：兄弟会话的 control 绝不冒充本目标，
