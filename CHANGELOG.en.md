@@ -13,7 +13,7 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
-## [0.6.2] - Unreleased
+## [0.6.2] - 2026-10-26
 
 ### Upgrade Notes
 
