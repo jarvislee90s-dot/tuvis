@@ -8,9 +8,9 @@ use multi_agents_manager_lib::remote::codex_ipc::CodexControlHub;
 use multi_agents_manager_lib::remote::pairing::{persist_device, DeviceStore, NewDevice};
 use multi_agents_manager_lib::remote::server::{router, RemoteState};
 use multi_agents_manager_lib::services::zcode_control::{
-    set_config, ActionContext, ActionReceipt, ActionState, BoundTarget, CapabilityView,
-    ConnectionState, ConnectionView, ControlAction, DeviceRoute, HubBackend, OAuthProvider,
-    SessionView, TargetKey, ZResult, ZcodeHub,
+    codes, set_config, ActionContext, ActionReceipt, ActionState, BoundTarget, CapabilityFlag,
+    CapabilityView, ConnectionState, ConnectionView, ControlAction, DeviceRoute, HubBackend,
+    OAuthProvider, SessionView, TargetKey, ZResult, ZcodeError, ZcodeHub,
 };
 use multi_agents_manager_lib::session::{
     AgentType, ProcessForm, Session, SessionStatus, SessionsResponse,
@@ -252,6 +252,10 @@ async fn send_info_advertises_official_control_without_connected() {
 struct FakeHubBackend {
     connect_calls: AtomicUsize,
     bind_calls: Mutex<Vec<TargetKey>>,
+    execute_calls: AtomicUsize,
+    contexts: Mutex<Vec<ActionContext>>,
+    actions: Mutex<Vec<ControlAction>>,
+    execute_result: Mutex<Option<ZResult<ActionReceipt>>>,
 }
 
 impl FakeHubBackend {
@@ -261,6 +265,22 @@ impl FakeHubBackend {
 
     fn bind_calls(&self) -> Vec<TargetKey> {
         self.bind_calls.lock().unwrap().clone()
+    }
+
+    fn execute_calls(&self) -> usize {
+        self.execute_calls.load(Ordering::SeqCst)
+    }
+
+    fn contexts(&self) -> Vec<ActionContext> {
+        self.contexts.lock().unwrap().clone()
+    }
+
+    fn actions(&self) -> Vec<ControlAction> {
+        self.actions.lock().unwrap().clone()
+    }
+
+    fn set_execute_result(&self, result: ZResult<ActionReceipt>) {
+        self.execute_result.lock().unwrap().replace(result);
     }
 }
 
@@ -336,6 +356,9 @@ impl HubBackend for FakeHubBackend {
         target: &'a BoundTarget,
         action: &'a ControlAction,
     ) -> futures::future::BoxFuture<'a, ZResult<ActionReceipt>> {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        self.contexts.lock().unwrap().push(ctx.clone());
+        self.actions.lock().unwrap().push(action.clone());
         let receipt = ActionReceipt {
             action_id: ctx.action_id.clone(),
             session_id: target.session_id.clone(),
@@ -343,7 +366,8 @@ impl HubBackend for FakeHubBackend {
             state: ActionState::Accepted,
             reason_code: None,
         };
-        Box::pin(async move { Ok(receipt) })
+        let injected = self.execute_result.lock().unwrap().clone();
+        Box::pin(async move { injected.unwrap_or(Ok(receipt)) })
     }
 
     fn policy(&self) -> CapabilityView {
@@ -353,17 +377,67 @@ impl HubBackend for FakeHubBackend {
 
 /// 合成配对 Hub：保存格式合法的合成链接 → fake 授权 → fake 连接（零网络零账号）。
 async fn paired_hub(conn: &SharedConn, backend: Arc<FakeHubBackend>) -> Arc<ZcodeHub> {
+    paired_hub_with(conn, backend, CapabilityView::default()).await
+}
+
+async fn paired_hub_with(
+    conn: &SharedConn,
+    backend: Arc<FakeHubBackend>,
+    policy: CapabilityView,
+) -> Arc<ZcodeHub> {
     set_config(&conn.lock().unwrap(), SYNTH_URL).expect("save synthetic url");
     let hub = Arc::new(ZcodeHub::with_parts(
         DeviceStore::Owned(conn.clone()),
         backend,
-        CapabilityView::default(),
+        policy,
     ));
     hub.authorize(OAuthProvider::Bigmodel, Arc::new(|_url: String| Ok(())))
         .await
         .expect("fake 授权应成功");
     hub.connect().await.expect("fake 连接应成功");
     hub
+}
+
+/// 仅开启 send 能力（其余保持默认关闭）——用于动作端点正向/错误映射用例。
+fn send_policy() -> CapabilityView {
+    CapabilityView {
+        send: CapabilityFlag {
+            enabled: true,
+            reason_code: None,
+        },
+        ..CapabilityView::default()
+    }
+}
+
+async fn paired_hub_open(conn: &SharedConn, backend: Arc<FakeHubBackend>) -> Arc<ZcodeHub> {
+    paired_hub_with(conn, backend, send_policy()).await
+}
+
+/// POST /m/api/v1/zcode/actions（cookie 可选：未配对用例去掉 cookie 走 gate 403）。
+fn action_req(body: &serde_json::Value, cookie: bool) -> axum::http::Request<axum::body::Body> {
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/actions")
+        .header("content-type", "application/json");
+    if cookie {
+        builder = builder.header("cookie", COOKIE);
+    }
+    builder
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// 合法提交形状：`{actionId, action}`，动作只携合同字段（无设备/路径字段）。
+fn send_body(action_id: &str, generation: u64) -> serde_json::Value {
+    serde_json::json!({
+        "actionId": action_id,
+        "action": {
+            "kind": "send",
+            "sessionId": ZCODE_SESSION,
+            "generation": generation,
+            "text": "合成正文",
+        },
+    })
 }
 
 fn get_req_without_cookie(uri: &str) -> axum::http::Request<axum::body::Body> {
@@ -536,5 +610,317 @@ async fn zcode_session_does_not_accept_workspace_path() {
     assert!(
         !body.to_string().contains("/evil"),
         "响应/绑定不得回显客户端自报 workspace"
+    );
+}
+
+// ============================================================
+// T7.1 B2b：配对视角的 ZCode 写动作（POST /zcode/actions）
+// ============================================================
+
+/// 未配对：动作端点必须在 gate 层 403，hub/后端零执行零绑定。
+#[tokio::test]
+async fn unpaired_action_is_403_zero_calls() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, injector.clone());
+    st.set_zcode_hub(hub);
+
+    let resp = router(st)
+        .oneshot(action_req(
+            &send_body("action-B2b-unpaired", generation),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::FORBIDDEN,
+        "未配对动作必须 403"
+    );
+    assert_eq!(backend.execute_calls(), 0, "403 必须先于 hub 执行");
+    assert!(backend.contexts().is_empty());
+    assert!(backend.bind_calls().is_empty());
+    assert_eq!(injector.calls(), 0, "零终端注入");
+}
+
+/// 设备身份只来自配对门 + 本机 DB：请求体里任何 deviceId/deviceName/capability/
+/// provider 一律 400；干净提交时 Hub 收到的 ctx 仍是 DB 花名册身份。
+#[tokio::test]
+async fn action_body_cannot_override_device_identity() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, injector);
+    st.set_zcode_hub(hub);
+    let app = router(st);
+
+    let mut spoofed = send_body("action-B2b-spoof", generation);
+    let object = spoofed.as_object_mut().unwrap();
+    object.insert("deviceId".into(), "dev-evil".into());
+    object.insert("deviceName".into(), "Evil Phone".into());
+    object.insert("device_id".into(), "dev-evil".into());
+    object.insert("capability".into(), serde_json::json!({ "send": true }));
+    object.insert("provider".into(), "bigmodel".into());
+    let resp = app
+        .clone()
+        .oneshot(action_req(&spoofed, true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({ "error": "invalid_action" })
+    );
+    assert_eq!(backend.execute_calls(), 0, "越权字段不得透传到 hub");
+    assert!(backend.contexts().is_empty());
+
+    let resp = app
+        .oneshot(action_req(&send_body("action-B2b-ok", generation), true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        backend.contexts(),
+        vec![ActionContext {
+            action_id: "action-B2b-ok".into(),
+            device_id: "dev-z1".into(),
+            device_name: "iPhone".into(),
+        }],
+        "ctx 身份只来自 cookie + 本机 DB"
+    );
+}
+
+/// 非法动作载荷（未知 kind / 缺字段 / 缺 actionId）→ 400 invalid_action，零执行。
+#[tokio::test]
+async fn invalid_action_is_400() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, injector);
+    st.set_zcode_hub(hub);
+    let app = router(st);
+
+    let cases = [
+        serde_json::json!({
+            "actionId": "action-B2b-bad-kind",
+            "action": { "kind": "reboot", "sessionId": ZCODE_SESSION, "generation": generation },
+        }),
+        serde_json::json!({
+            "actionId": "action-B2b-missing-gen",
+            "action": { "kind": "send", "sessionId": ZCODE_SESSION, "text": "合成正文" },
+        }),
+        serde_json::json!({
+            "action": {
+                "kind": "send",
+                "sessionId": ZCODE_SESSION,
+                "generation": generation,
+                "text": "合成正文",
+            },
+        }),
+    ];
+    for body in cases {
+        let resp = app.clone().oneshot(action_req(&body, true)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "{body} 必须 400"
+        );
+        assert_eq!(
+            body_json(resp).await,
+            serde_json::json!({ "error": "invalid_action" })
+        );
+    }
+    assert_eq!(backend.execute_calls(), 0);
+    assert!(backend.bind_calls().is_empty());
+}
+
+/// 旧代际：409 stale_generation，且零绑定零执行（不得在旧目标上重试）。
+#[tokio::test]
+async fn stale_generation_is_409() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let stale = hub.connection().generation + 7;
+    let st = state(&conn, injector);
+    st.set_zcode_hub(hub);
+
+    let resp = router(st)
+        .oneshot(action_req(&send_body("action-B2b-stale", stale), true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({ "error": "stale_generation" })
+    );
+    assert_eq!(backend.execute_calls(), 0);
+    assert!(backend.bind_calls().is_empty());
+}
+
+/// 能力未开闸（默认全关）：409 needs_evidence，零执行（手机不可自报能力）。
+#[tokio::test]
+async fn capability_closed_is_409() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, injector);
+    st.set_zcode_hub(hub);
+
+    let resp = router(st)
+        .oneshot(action_req(
+            &send_body("action-B2b-closed", generation),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({ "error": "needs_evidence" })
+    );
+    assert_eq!(backend.execute_calls(), 0);
+}
+
+/// 审计/账本持久化失败：500 storage_failed，错误体只含冻结码。
+#[tokio::test]
+async fn storage_failure_is_500() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    backend.set_execute_result(Err(ZcodeError {
+        code: codes::STORAGE_FAILED.into(),
+    }));
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, injector);
+    st.set_zcode_hub(hub);
+
+    let resp = router(st)
+        .oneshot(action_req(
+            &send_body("action-B2b-storage", generation),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_json(resp).await;
+    assert_eq!(body, serde_json::json!({ "error": "storage_failed" }));
+    assert_eq!(backend.execute_calls(), 1);
+    let wire = body.to_string().to_lowercase();
+    for needle in ["jwt", "token", "secret", "credential"] {
+        assert!(
+            !wire.contains(needle),
+            "错误体不得携带凭据（命中 {needle}）"
+        );
+    }
+}
+
+/// 受理：200 + no-store，回执按 state 区分；正文/答案不回显，无凭据字段。
+#[tokio::test]
+async fn accepted_receipt_is_200() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, injector);
+    st.set_zcode_hub(hub);
+
+    let resp = router(st)
+        .oneshot(action_req(&send_body("action-B2b-0001", generation), true))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(no_store(&resp), Some("no-store"), "动作回执必须 no-store");
+    let body = body_json(resp).await;
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "actionId": "action-B2b-0001",
+            "sessionId": ZCODE_SESSION,
+            "generation": generation,
+            "state": "accepted",
+            "reasonCode": null,
+        }),
+        "回执只含冻结字段"
+    );
+    assert_eq!(backend.execute_calls(), 1);
+    let wire = body.to_string().to_lowercase();
+    for needle in ["jwt", "token", "secret", "credential", "合成正文"] {
+        assert!(
+            !wire.contains(needle),
+            "回执不得回显正文/凭据（命中 {needle}）"
+        );
+    }
+}
+
+/// workspacePath（顶层或动作内）只能被拒绝或被忽略；无论哪条路都**绝不**传给 Hub
+/// （绑定只按 sessionId，动作里没有路径字段）。
+#[tokio::test]
+async fn workspace_path_in_body_is_rejected_or_ignored() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, injector);
+    st.set_zcode_hub(hub);
+
+    let mut body = send_body("action-B2b-ws", generation);
+    body.as_object_mut()
+        .unwrap()
+        .insert("workspacePath".into(), serde_json::json!("/evil/workspace"));
+    body["action"]
+        .as_object_mut()
+        .unwrap()
+        .insert("workspacePath".into(), serde_json::json!("/evil/workspace"));
+
+    let resp = router(st).oneshot(action_req(&body, true)).await.unwrap();
+    let status = resp.status();
+    let wire = body_json(resp).await;
+    assert!(
+        status == axum::http::StatusCode::BAD_REQUEST || status == axum::http::StatusCode::OK,
+        "只允许拒绝（400）或忽略（200），实际 {status}"
+    );
+    if status == axum::http::StatusCode::BAD_REQUEST {
+        assert_eq!(wire, serde_json::json!({ "error": "invalid_action" }));
+        assert_eq!(backend.execute_calls(), 0);
+        assert!(backend.bind_calls().is_empty());
+    }
+    assert!(
+        backend
+            .bind_calls()
+            .iter()
+            .all(|key| key.session_id == ZCODE_SESSION),
+        "绑定只按 sessionId"
+    );
+    assert!(
+        backend
+            .actions()
+            .iter()
+            .all(|action| !format!("{action:?}").contains("/evil")),
+        "hub 收到的动作不得含客户端自报 workspace"
+    );
+    assert!(
+        !wire.to_string().contains("/evil"),
+        "响应不得回显客户端自报 workspace"
     );
 }

@@ -637,6 +637,10 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // 内层 gate 结构性覆盖——未配对在 handler 之前 403。
         .route("/zcode/connection", get(super::zcode::connection))
         .route("/zcode/session", get(super::zcode::session))
+        // ZCode 官方控制写动作（T7.1 B2b）：`{actionId, action}` → ActionReceipt。
+        // 设备身份只取 cookie/DB（请求体多字段即 400 `invalid_action`）；回执一律
+        // no-store，accepted/confirmed/noop/unknown 均 200 并按 state 区分。
+        .route("/zcode/actions", post(super::zcode::actions))
         // /channel（§C5，Task 10）：通道能力**装饰**端点（走哪条通道/带宽受限 +
         // 实测速率）。读 Host 推断、可被伪造、允许不准、**永不得进安全判定**
         // （不变量 §G1 推论③，见 api::channel_info 注释）；gate 由本子路由的
