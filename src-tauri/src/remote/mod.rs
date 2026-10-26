@@ -745,9 +745,10 @@ pub(crate) fn install_zcode_hub() -> std::sync::Arc<crate::services::zcode_contr
     )
 }
 
-/// 停服/退出断开内核（可测）：有 Hub 才显式断开（推进代际、关 relay 与全部计时器）；
-/// 未装配 = no-op。整次断开以 `wait` 为上限：到期限即返回 `false`（后台任务绝不
-/// 无限悬住——connect 持锁时 disconnect 只能等到锁释放）。
+/// 停服/退出断开内核（**仅测试缝**）：生产同步入口自己先 `begin_disconnect`，
+/// 再把 `finish_zcode_hub` 交给 runtime；本函数保留给测试一次调用断言「begin +
+/// 有界等待」的组合语义（`wait` 只约束等待，超时返回 `false` 且不取消清理）。
+#[cfg(test)]
 async fn disconnect_zcode_hub_core(
     hub: Option<std::sync::Arc<crate::services::zcode_control::ZcodeHub>>,
     wait: std::time::Duration,
@@ -755,12 +756,35 @@ async fn disconnect_zcode_hub_core(
     let Some(hub) = hub else {
         return false;
     };
-    // `disconnect` 会先等 `connect_lock`：连接握手在途时只能等到锁释放。整次断开
-    // 以 `wait` 为硬上限，超时如实记日志并放弃（后台任务绝不无限悬住）。
-    match tokio::time::timeout(wait, hub.disconnect()).await {
-        Ok(_) => true,
+    // 前半段：同步、不持 connect_lock、不 await——到点前 Hub 必须已经 offline。
+    let (_view, guard) = hub.begin_disconnect();
+    finish_zcode_hub(hub, guard, wait).await
+}
+
+/// 清理 + 有界等待（同步入口与可测内核共用）。
+///
+/// `guard` 随 detached 任务移动：任务被取消、runtime 关停或 future 从未被调度时，
+/// future 析构会让 [`CloseGuard`](crate::services::zcode_control::hub::CloseGuard)
+/// 按 epoch 清位——绝不把 Hub 永久锁在拒绝连接态。
+async fn finish_zcode_hub(
+    hub: std::sync::Arc<crate::services::zcode_control::ZcodeHub>,
+    guard: crate::services::zcode_control::hub::CloseGuard,
+    wait: std::time::Duration,
+) -> bool {
+    // 后半段：detached 清理（超时只影响下面的等待，不 abort 本任务）。
+    let mut cleanup = tauri::async_runtime::spawn(async move {
+        hub.finish_disconnect(guard).await;
+    });
+    match tokio::time::timeout(wait, &mut cleanup).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            log::warn!("ZCode Hub 关停清理任务异常结束：{error}");
+            false
+        }
         Err(_) => {
-            log::warn!("ZCode Hub 关停未在期限内完成（在途 connect 持锁，relay 由进程收尸）");
+            log::warn!(
+                "ZCode Hub 关停未在期限内完成（Hub 已 offline；清理任务继续在后台收尾，不取消）"
+            );
             false
         }
     }
@@ -772,14 +796,15 @@ const ZCODE_HUB_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_s
 /// 远程显性关闭与应用退出的断开口（T7.1 C2b / Fix round 2）。
 ///
 /// 调用点（同步 Tauri 命令 / `RunEvent::Exit` / 升级前 `on_before_exit`）都在主线程
-/// 或同步上下文：这里**不在调用线程等待**，只把断开交给 async runtime；任务内部
-/// 自带 [`ZCODE_HUB_SHUTDOWN_WAIT`] 上限，保证有界完成、绝不无限悬住。
+/// 或同步上下文：这里**在调用线程只做同步前半段**（`begin_disconnect`：不 await、
+/// 不持 connect_lock，立即 Offline 并拿到关闭凭据），再把清理+有界等待交给 async
+/// runtime。即使 runtime 从未调度清理任务，凭据也会随 future 析构清位（不锁死 connect）。
 pub(crate) fn disconnect_zcode_hub() {
-    let hub = STATE.zcode_hub();
-    if hub.is_none() {
+    let Some(hub) = STATE.zcode_hub() else {
         return;
-    }
-    tauri::async_runtime::spawn(disconnect_zcode_hub_core(hub, ZCODE_HUB_SHUTDOWN_WAIT));
+    };
+    let (_view, guard) = hub.begin_disconnect();
+    tauri::async_runtime::spawn(finish_zcode_hub(hub, guard, ZCODE_HUB_SHUTDOWN_WAIT));
 }
 
 /// 从看板地址抽域名（纯函数）：快照 url 契约恒为含 /m 的完整地址（board_url 归一），
@@ -4720,6 +4745,8 @@ mod zcode_wiring_tests {
         reset_calls: AtomicUsize,
         /// 模拟 connect 持锁时 disconnect 被挂住（关停有界测试）。
         disconnect_hangs: AtomicBool,
+        /// 首次 disconnect 的闸：模拟「清理在超时之后才继续」（默认放行）。
+        disconnect_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     impl FakeBackend {
@@ -4756,11 +4783,21 @@ mod zcode_wiring_tests {
         }
 
         fn disconnect<'a>(&'a self) -> BoxFuture<'a, ()> {
-            self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
             if self.disconnect_hangs.load(Ordering::SeqCst) {
                 return Box::pin(futures::future::pending());
             }
-            Box::pin(async {})
+            // 只挂住首次断开（模拟超时后的清理窗口）；第二次断开（锁后收尾）直接放行。
+            let gate = if call == 0 {
+                self.disconnect_gate.lock().unwrap().take()
+            } else {
+                None
+            };
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+            })
         }
 
         fn reset<'a>(&'a self, _generation: u64) -> BoxFuture<'a, ()> {
@@ -4803,6 +4840,18 @@ mod zcode_wiring_tests {
 
     fn noop_open() -> OpenAuthorize {
         Arc::new(|_| Ok(()))
+    }
+
+    /// 有界等待（detached 清理跑在 tauri 全局 runtime 上，不忙等也不无限等）。
+    async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "清理未在 2s 内推进：{what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     /// 装配只产出**一个** Arc：远程状态（`/m/api/v1`）与桌面 managed state 是同一份。
@@ -4867,7 +4916,11 @@ mod zcode_wiring_tests {
             disconnect_zcode_hub_core(Some(hub.clone()), ZCODE_HUB_SHUTDOWN_WAIT).await,
             "正常断开应完成"
         );
-        assert_eq!(fake.disconnect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            2,
+            "断开 = 先取消在途 + 锁后再关一次"
+        );
         assert_eq!(hub.connection().state, ConnectionState::Offline);
         assert_eq!(
             fake.connect_calls.load(Ordering::SeqCst),
@@ -4889,7 +4942,7 @@ mod zcode_wiring_tests {
         );
     }
 
-    /// 关停任务必须有界：disconnect 被 connect 锁挂住时，内核按上限返回 false，
+    /// 关停任务必须有界：清理被挂住时，内核按上限返回 false，Hub 仍**立即** offline，
     /// 绝不无限悬住（调用线程不等待，后台任务也不许永久占着）。
     #[tokio::test]
     async fn shutdown_disconnect_is_bounded_even_when_disconnect_hangs() {
@@ -4903,7 +4956,7 @@ mod zcode_wiring_tests {
         let started = std::time::Instant::now();
         let completed = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            disconnect_zcode_hub_core(Some(hub), std::time::Duration::from_millis(50)),
+            disconnect_zcode_hub_core(Some(hub.clone()), std::time::Duration::from_millis(50)),
         )
         .await
         .expect("关停内核必须在有界时间内返回");
@@ -4912,6 +4965,76 @@ mod zcode_wiring_tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "超时不得超过上限太多"
         );
-        assert_eq!(fake.disconnect_calls.load(Ordering::SeqCst), 1);
+        // 同步前半段已落定：即便清理永远挂住，状态也不得以 paired 挂账。
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        wait_until(
+            || fake.disconnect_calls.load(Ordering::SeqCst) >= 1,
+            "detached 清理必须已发起 backend.disconnect",
+        )
+        .await;
+    }
+
+    /// 超时只放弃**等待**，绝不取消清理：首次 disconnect 被挂住时内核按上限返回
+    /// false，此时 Hub 已 Offline；放行后 detached 清理继续（拿到 connect_lock →
+    /// 第二次 backend.disconnect），证明没有被 timeout 连根取消。
+    #[tokio::test]
+    async fn shutdown_timeout_does_not_cancel_cleanup() {
+        let fake = Arc::new(FakeBackend::default());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        fake.disconnect_gate.lock().unwrap().replace(gate.clone());
+        let hub = fake_hub(fake.clone(), stored(URL));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert!(hub.connection().is_paired());
+
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            disconnect_zcode_hub_core(Some(hub.clone()), std::time::Duration::from_millis(50)),
+        )
+        .await
+        .expect("关停内核必须在有界时间内返回");
+        assert!(!completed, "清理被挂住 ⇒ 有界返回 false");
+        // begin 是同步的：超时返回时 Hub 必须已经 Offline（旧实现会等到清理完成）。
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        wait_until(
+            || fake.disconnect_calls.load(Ordering::SeqCst) >= 1,
+            "detached 清理必须已发起 backend.disconnect",
+        )
+        .await;
+
+        // 放行首次断开：清理继续跑完（第二次断开证明超时没有取消它）。
+        gate.notify_one();
+        wait_until(
+            || fake.disconnect_calls.load(Ordering::SeqCst) >= 2,
+            "超时后清理必须继续到锁后收尾",
+        )
+        .await;
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::Offline,
+            "清理不得自动重连"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            1,
+            "关停不得触发新的后端连接"
+        );
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 1); // 前置：仅首次授权
+
+        // 清理收尾后 CloseGuard 已清位：显式 connect 可达且保留 JWT（不重授权）。
+        let reconnected = hub.connect().await.expect("closing 已清位，显式重连应成功");
+        assert!(reconnected.is_paired());
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            2,
+            "只有用户显式 connect 才允许再连"
+        );
+        assert_eq!(
+            fake.authorize_calls.load(Ordering::SeqCst),
+            1,
+            "关停/重连不得重新授权（JWT 保留）"
+        );
     }
 }

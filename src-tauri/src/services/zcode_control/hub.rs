@@ -396,6 +396,8 @@ fn emit_session_event(
 /// - `needs_auth` 同时清 `authorized`（JWT 已失效）；
 /// - Hub 处于 `needs_config`/`needs_auth` 时只接受 `needs_auth`/`conflict`：
 ///   配置变更后的旧连接离线/握手事件不得把 Hub 拉回 `offline`/`connecting`；
+/// - 关闭窗口（`closing` 置位）内一律忽略：旧 attempt 的 relay 状态不得回写
+///   `begin_disconnect` 已同步落定的 Offline；
 /// - `generation <= relay_floor` 的迟到状态一律丢弃。
 async fn apply_relay_state(
     inner: &Mutex<Inner>,
@@ -405,6 +407,12 @@ async fn apply_relay_state(
 ) {
     let (out, invalidate, stale) = {
         let mut state = lock_inner(inner);
+        // 关闭窗口：`begin_disconnect` 已在锁内同步落定 Offline。旧 attempt 的迟到
+        // relay 状态（Connecting/Paired/Offline 乃至 Conflict/NeedsAuth）一律忽略，
+        // 关闭态在窗口内是唯一权威；关闭结束后的新连接自会带来新 relay 代际。
+        if state.closing.is_some() {
+            return;
+        }
         if view.generation <= state.relay_floor {
             return;
         }
@@ -494,6 +502,10 @@ struct Inner {
     configured: bool,
     /// 本进程是否持有账号 JWT（只在内存；重启即失效）。
     authorized: bool,
+    /// 关闭窗口的持有 epoch（`None` = 无关闭在途）：`begin_disconnect` 在锁内置为
+    /// 本次代际；对应的 [`CloseGuard`] Drop 时**仅当仍匹配本 epoch** 才清除。
+    /// 置位期间 `connect`/relay 状态回写一律拒绝（关闭已同步落定 Offline）。
+    closing: Option<u64>,
     state: ConnectionState,
     reason_code: Option<String>,
     device_label: Option<String>,
@@ -533,6 +545,28 @@ impl Inner {
         view.capabilities = CapabilityView::default();
         self.last_session = Some(view.clone());
         Some(view)
+    }
+}
+
+/// 关闭窗口的 RAII 凭据：由 [`ZcodeHub::begin_disconnect`] **同步**创建并随返回值
+/// 交出，不含任何 await 点。
+///
+/// 清理（[`ZcodeHub::finish_disconnect`]）消费它：正常结束即 Drop 清位；若清理
+/// future 被取消 / panic / 从未被 poll，凭据随 future 一起 Drop——只要 `closing`
+/// 仍是本次 epoch 就清位，绝不把 Hub 永久锁在「拒绝连接」态。重复 `begin` 会写入
+/// 新 epoch，因此旧凭据 Drop 时不会误清新窗口。
+#[must_use = "CloseGuard 必须交给 finish_disconnect，或作为取消语义被显式丢弃"]
+pub(crate) struct CloseGuard {
+    inner: Arc<Mutex<Inner>>,
+    epoch: u64,
+}
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        let mut inner = lock_inner(&self.inner);
+        if inner.closing == Some(self.epoch) {
+            inner.closing = None;
+        }
     }
 }
 
@@ -604,6 +638,7 @@ impl ZcodeHub {
                 generation: 0,
                 configured: false,
                 authorized: false,
+                closing: None,
                 state: ConnectionState::NeedsConfig,
                 reason_code: None,
                 device_label: None,
@@ -712,6 +747,39 @@ impl ZcodeHub {
             self.emit_session(&stale);
         }
         (view, attempt)
+    }
+
+    /// 握手前落定 `connecting`：**同一把锁**内先复核「代际未变且不在关闭窗口」，
+    /// 不满足则**不写任何状态**、直接返回 stale/offline。
+    ///
+    /// 用于封死 `connect` 的 closing 检查与 `settle` 之间的窗口：`begin_disconnect`
+    /// 若抢先落定 Offline，这里的复核会让本次握手尝试直接作废，绝不把刚落的
+    /// Offline（或 config_changed 的 needs_auth）覆盖成 `connecting`。
+    fn settle_if_current(
+        &self,
+        generation: u64,
+        device_label: Option<String>,
+    ) -> ZResult<(ConnectionView, u64)> {
+        let (view, stale, attempt) = {
+            let mut inner = self.lock();
+            if inner.generation != generation {
+                return Err(ZcodeError::of(codes::STALE_GENERATION));
+            }
+            if inner.closing.is_some() {
+                return Err(ZcodeError::of(codes::OFFLINE));
+            }
+            inner.state = ConnectionState::Connecting;
+            inner.reason_code = None;
+            inner.device_label = device_label;
+            let view = inner.view();
+            let stale = inner.stale_session(view.generation);
+            (view, stale, inner.state_epoch)
+        };
+        self.emit_connection(&view);
+        if let Some(stale) = stale {
+            self.emit_session(&stale);
+        }
+        Ok((view, attempt))
     }
 
     fn state_of(error: &ZcodeError) -> ConnectionState {
@@ -844,6 +912,12 @@ impl ZcodeHub {
     /// 建立唯一物理连接（已配对/连接中幂等；`conflict` 为终态，不自动重试）。
     pub async fn connect(&self) -> ZResult<ConnectionView> {
         let _single = self.connect_lock.lock().await;
+        // 断开清理窗口（`begin_disconnect` 已置 Offline、`finish_disconnect` 尚未收尾）：
+        // 立即回 Offline 错误且**不**调 `backend.connect`——否则在清理最后一次
+        // `backend.disconnect` 之后仍可能新开一条连接，把已断开的 Hub 留在 paired。
+        if self.lock().closing.is_some() {
+            return Err(ZcodeError::of(codes::OFFLINE));
+        }
         let (state, configured, authorized, generation) = {
             let inner = self.lock();
             (
@@ -887,7 +961,24 @@ impl ZcodeHub {
         };
         let label = route.label.clone();
         // 握手中：离开 paired，已读投影同步降级广播；attempt 纪元与状态同锁取得。
-        let (_, attempt) = self.settle(ConnectionState::Connecting, None, label.clone());
+        // 关闭/换代复核也在这把锁内（settle_if_current）：begin_disconnect 若恰好
+        // 抢在 closing 检查与这一步之间，绝不覆盖它刚落的 Offline，且零后端连接。
+        let (_, attempt) = match self.settle_if_current(generation, label.clone()) {
+            Ok(pair) => pair,
+            Err(error) => return Err(error),
+        };
+        // settle 之后、真正触达后端之前再复核一次（只读，不改状态）：关闭/换代恰好
+        // 插在 settle 与这里时，状态已由 begin_disconnect/config_changed 自己落定，
+        // 本次尝试直接作废且不调 backend.connect。
+        {
+            let inner = self.lock();
+            if inner.generation != generation {
+                return Err(ZcodeError::of(codes::STALE_GENERATION));
+            }
+            if inner.closing.is_some() {
+                return Err(ZcodeError::of(codes::OFFLINE));
+            }
+        }
         match self.backend.connect(route).await {
             Err(error) => Err(self.apply_failure(generation, error)),
             Ok(view) => {
@@ -925,27 +1016,72 @@ impl ZcodeHub {
         }
     }
 
-    /// 用户显式断开：推进代际、保留 JWT，可再次连接。
+    /// 断开第一阶段（同步、不持 `connect_lock`、不 await）：推进代际、置 Offline、
+    /// 清原因/设备标签、抬高 relay 地板并广播连接与投影降级事件；同时把关闭窗口
+    /// 置为本次 epoch。返回 `(视图, 关闭凭据)`。
     ///
-    /// 与配置变更同规：代际推进与「不可控」状态在**同一把锁**内落定，
-    /// `backend.disconnect` 在途期间不得再读到旧配对/旧投影。
-    pub async fn disconnect(&self) -> ConnectionView {
-        let _single = self.connect_lock.lock().await;
-        let (view, stale) = {
+    /// 关闭凭据 [`CloseGuard`] 在**本函数内**（锁内）创建并随返回值交出：调用方
+    /// 立即持有取消兜底——即便后续清理 future 被取消/从未 poll/panic，凭据 Drop 也
+    /// 会清位。
+    ///
+    /// 远端关停先调它：手机/桌面立刻看到「已断开」，不必等在途握手的网络超时；
+    /// 昂贵的清理交给 [`Self::finish_disconnect`] 在后台完成。
+    pub(crate) fn begin_disconnect(&self) -> (ConnectionView, CloseGuard) {
+        let (view, stale, epoch) = {
             let mut inner = self.lock();
             inner.generation = inner.generation.wrapping_add(1);
             inner.state = ConnectionState::Offline;
             inner.reason_code = None;
             inner.device_label = None;
+            // 与 config_changed 同规：关闭前的旧 relay 状态（已应用代际）不得回写；
+            // 关闭窗口内仍在途的旧 attempt 由 `apply_relay_state` 的 closing 闸拦下。
+            inner.relay_floor = inner.relay_generation;
+            let epoch = inner.generation;
+            inner.closing = Some(epoch);
             let view = inner.view();
             let stale = inner.stale_session(view.generation);
-            (view, stale)
+            (view, stale, epoch)
         };
         self.emit_connection(&view);
         if let Some(stale) = stale {
             self.emit_session(&stale);
         }
+        (
+            view,
+            CloseGuard {
+                inner: self.inner.clone(),
+                epoch,
+            },
+        )
+    }
+
+    /// 断开第二阶段（清理，调用方不可用超时取消它）：立即断后端（取消在途 relay
+    /// connect）→ 取得 `connect_lock`（等在途 connect 收尾）→ 再断一次后端（关掉
+    /// 竞态窗口内新建立的连接）→ 持锁 Drop 关闭凭据清位。
+    ///
+    /// `closing` 在整个清理期间为置位（见 [`Self::connect`] 与
+    /// [`apply_relay_state`]）：即便新 connect 在这两次 `backend.disconnect` 之间
+    /// 拿到锁，也不会真的开连接；旧 attempt 的 relay 状态也不会回写 Offline。
+    ///
+    /// 本 future 被取消/panic 时，`guard` 随栈帧 Drop，按 epoch 兜底清位。
+    pub(crate) async fn finish_disconnect(&self, guard: CloseGuard) {
+        // 先取消在途握手：relay connect 等网络的 await 会就此收尾、释放 connect_lock。
         self.backend.disconnect().await;
+        // 等在途 connect 收尾（此后再无持锁的旧代际握手）。
+        let _single = self.connect_lock.lock().await;
+        // 关掉竞态窗口内可能已建立的连接（本 Hub 期间绝不留下 paired）。
+        self.backend.disconnect().await;
+        // 持锁清位：新 connect 只可能在清理完全结束后才被允许。
+        drop(guard);
+    }
+
+    /// 用户显式断开：推进代际、保留 JWT，可再次连接。
+    ///
+    /// 与配置变更同规：代际推进与「不可控」状态在**同一把锁**内落定，
+    /// `backend.disconnect` 在途期间不得再读到旧配对/旧投影。
+    pub async fn disconnect(&self) -> ConnectionView {
+        let (view, guard) = self.begin_disconnect();
+        self.finish_disconnect(guard).await;
         view
     }
 
@@ -1579,12 +1715,204 @@ mod tests {
         assert_eq!(view.state, ConnectionState::Offline);
         assert_eq!(view.reason_code, None);
         assert_eq!(hub.connection().state, ConnectionState::Offline);
-        assert_eq!(fake.disconnect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            2,
+            "断开 = 先取消在途 + 锁后再关一次（竞态窗口）"
+        );
 
         let reconnected = hub.connect().await.unwrap();
         assert!(reconnected.is_paired());
         assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 1, "不重新授权");
         assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// 握手在途时断开：Offline/代际必须**立即**落定（不得先等 `connect_lock`），
+    /// 在途 connect 被作废（stale_generation），后端断开至少调用一次。
+    #[tokio::test]
+    async fn disconnect_invalidates_inflight_connect_without_waiting_for_lock() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        let gate = Arc::new(Notify::new());
+        fake.gate.lock().unwrap().replace(gate.clone());
+
+        let in_flight = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.connect().await })
+        };
+        wait_until(|| fake.connect_calls.load(Ordering::SeqCst) == 1).await;
+
+        let disconnecting = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.disconnect().await })
+        };
+
+        // 旧实现先等 connect_lock（被在途握手占着）→ 这里会一直停在 connecting。
+        wait_until(|| hub.connection().state == ConnectionState::Offline).await;
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            1,
+            "断开不得触发新的后端连接"
+        );
+
+        gate.notify_one();
+        let late = in_flight.await.expect("spawn 不应 panic");
+        assert!(
+            matches!(&late, Err(err) if err.is(codes::STALE_GENERATION)),
+            "在途 connect 必须作废，实际 {late:?}"
+        );
+
+        let view = disconnecting.await.expect("spawn 不应 panic");
+        assert_eq!(view.state, ConnectionState::Offline);
+        assert!(
+            fake.disconnect_calls.load(Ordering::SeqCst) >= 1,
+            "清理必须调用后端断开"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        // 不粘死：清理结束后显式重连仍可达（用户断开保留 JWT，不重授权）。
+        fake.gate.lock().unwrap().take();
+        assert!(hub.connect().await.expect("显式重连应成功").is_paired());
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 断开清理窗口内的新 connect：`closing` 一置位就立即回 Offline 错误且不触达
+    /// `backend.connect`（覆盖「begin 已落定、finish 尚未收尾」的竞态窗口）；
+    /// 清理完成后 `closing` 复位，显式重连仍可达。
+    #[tokio::test]
+    async fn connect_during_disconnect_cleanup_is_rejected_without_backend_call() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        // begin = 远端关停的同步前半段：此时清理尚未开始（closing = Some(epoch)）。
+        let (view, guard) = hub.begin_disconnect();
+        assert_eq!(view.state, ConnectionState::Offline);
+
+        let err = hub.connect().await.unwrap_err();
+        assert!(
+            err.is(codes::OFFLINE),
+            "清理窗口内必须立刻回 offline 错误，实际 {err:?}"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before,
+            "清理窗口内不得真的开新连接"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        hub.finish_disconnect(guard).await;
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            2,
+            "finish = 先取消在途 + 锁后再关一次"
+        );
+        let reconnected = hub.connect().await.expect("清理完成后显式重连应成功");
+        assert!(reconnected.is_paired());
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before + 1,
+            "closing 必须已复位"
+        );
+    }
+
+    /// 清理 future 被取消（guard 直接 Drop）也要清位：`closing` 绝不永久锁死 connect。
+    /// 凭据在 `begin_disconnect` 内同步创建，所以「从未 poll 就丢弃 future」同样覆盖。
+    #[tokio::test]
+    async fn dropped_close_guard_reopens_connect() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        let (_view, guard) = hub.begin_disconnect();
+        // 窗口内：拒绝新连接（零 backend.connect）。
+        assert!(hub.connect().await.unwrap_err().is(codes::OFFLINE));
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), connects_before);
+
+        // 模拟清理 future 被取消/从未被调度：凭据随 future 析构而 Drop。
+        drop(guard);
+        let reconnected = hub.connect().await.expect("closing 必须已清位");
+        assert!(reconnected.is_paired());
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before + 1,
+            "Drop 后必须允许显式重连"
+        );
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 1, "不重授权");
+    }
+
+    /// 重复 begin 会写新 epoch：旧 guard Drop 不得误清后来者的关闭窗口。
+    #[tokio::test]
+    async fn stale_close_guard_cannot_clear_newer_closing() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        let (_first, first_guard) = hub.begin_disconnect();
+        let (_second, second_guard) = hub.begin_disconnect();
+        // 旧 epoch 的凭据先 Drop：不得把新窗口清掉。
+        drop(first_guard);
+        let err = hub.connect().await.unwrap_err();
+        assert!(err.is(codes::OFFLINE), "新关闭窗口必须仍生效，实际 {err:?}");
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), connects_before);
+
+        // 新 epoch 的凭据 Drop 才清位。
+        drop(second_guard);
+        assert!(hub
+            .connect()
+            .await
+            .expect("新窗口关闭后应可重连")
+            .is_paired());
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before + 1
+        );
+    }
+
+    /// 关闭窗口内旧 attempt 的 relay 状态不得回写：begin 之后事件泵即使收到更高
+    /// relay 代际的 Paired/Connecting，Hub 也必须保持 begin 落定的 Offline。
+    #[tokio::test]
+    async fn relay_state_cannot_overwrite_closing_offline() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump) = pumped(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let (_view, guard) = hub.begin_disconnect();
+
+        // 旧 attempt 的迟到状态（relay 代际远高于地板 0）：绝不能把 Hub 拉回 paired。
+        events
+            .send(RelayEvent::State(relay_view(ConnectionState::Paired, 99)))
+            .await
+            .unwrap();
+        events
+            .send(RelayEvent::State(relay_view(
+                ConnectionState::Connecting,
+                100,
+            )))
+            .await
+            .unwrap();
+        // 同一 mpsc FIFO 上的哨兵帧：它进了桥即证明前面两条 State 已被泵处理。
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+        wait_until(|| pump.data.lock().unwrap().len() == 1).await;
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::Offline,
+            "关闭窗口内 relay 状态不得回写"
+        );
+
+        drop(guard);
     }
 
     /// 旧代际动作：拒绝且零后端执行；同代际动作才派发。
