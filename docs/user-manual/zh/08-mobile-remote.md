@@ -98,9 +98,9 @@
 
 |                    会话详情 · 消息查看                     |                   发消息 · 排队与插队                    |
 | :--------------------------------------------------------: | :------------------------------------------------------: |
-| ![会话详情·消息查看](../../images/mobile-detail-v0.5.0.png) | ![发消息·排队与插队](../../images/mobile-send-v0.5.0.png) |
+| ![会话详情·消息查看](../img/mobile-detail-v0.5.0.png) | ![发消息·排队与插队](../img/mobile-send-v0.5.0.png) |
 |                    **审批 · 计划确认**                     |                **问答 · 多选题与确认卡**                 |
-|  ![审批·计划确认](../../images/mobile-approve-v0.5.0.png)   |  ![问答·多选题](../../images/mobile-question-v0.5.0.png)  |
+|  ![审批·计划确认](../img/mobile-approve-v0.5.0.png)   |  ![问答·多选题](../img/mobile-question-v0.5.0.png)  |
 
 ### Codex 桌面 APP 远程控制（实验性 · 按 Desktop build 精确解锁）
 

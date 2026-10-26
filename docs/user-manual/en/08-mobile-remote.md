@@ -98,9 +98,9 @@ Not just looking — you can **act**: send messages, approve tool calls, answer 
 
 |                Session detail · messages                |              Send · queue & jump               |
 | :-----------------------------------------------------: | :--------------------------------------------: |
-| ![Session detail](../../images/mobile-detail-v0.5.0.png) |  ![Send](../../images/mobile-send-v0.5.0.png)   |
+| ![Session detail](../img/mobile-detail-v0.5.0.png) |  ![Send](../img/mobile-send-v0.5.0.png)   |
 |                  **Approvals · plan**                   |             **Q&A · multi-select**             |
-|   ![Approvals](../../images/mobile-approve-v0.5.0.png)   | ![Q&A](../../images/mobile-question-v0.5.0.png) |
+|   ![Approvals](../img/mobile-approve-v0.5.0.png)   | ![Q&A](../img/mobile-question-v0.5.0.png) |
 
 **Mobile remote control status (v0.5.0, experimental)**: message viewing and file preview cover 7 of the 8 tools (OpenClaw's black-box build is not remotely readable yet); **sending messages to CLI sessions and creating sessions from your phone are experimental**, currently supporting Claude Code / Codex CLI / OpenCode / Kimi Code. Messages are injected as keystrokes into the terminal and verified by screen-reading receipts (no false "delivered"); queueing, interrupt-and-jump, remote approvals, question answering, permission-mode switching, and session creation are included. Illustrated walkthroughs live in the Chinese manual; per-tool statuses and limitations are listed below.
 
