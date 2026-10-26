@@ -226,25 +226,66 @@ fn lock_inner(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 广播一条连接事件（先取号再发送；调用方不得持内锁）。
-fn emit_connection(
+/// 广播一条控制事件（先取号再发送；调用方不得持内锁）。
+///
+/// `device_id` 只留在进程内供 SSE 过滤同会话动作（`ControlEvent` 序列化时跳过），
+/// 连接/会话事件的调用方一律传 `None`。
+fn emit_event(
     inner: &Mutex<Inner>,
     events: &broadcast::Sender<ControlEvent>,
-    view: &ConnectionView,
+    kind: ControlEventKind,
+    generation: u64,
+    session_id: Option<String>,
+    device_id: Option<String>,
+    data: Value,
 ) {
     let seq = {
         let mut state = lock_inner(inner);
         state.seq = state.seq.wrapping_add(1);
         state.seq
     };
-    let event = ControlEvent {
+    let _ = events.send(ControlEvent {
         seq,
-        generation: view.generation,
-        session_id: None,
-        kind: ControlEventKind::Connection,
-        data: serde_json::to_value(view).unwrap_or(Value::Null),
-    };
-    let _ = events.send(event);
+        generation,
+        session_id,
+        kind,
+        data,
+        device_id,
+    });
+}
+
+/// 广播一条连接事件。
+fn emit_connection(
+    inner: &Mutex<Inner>,
+    events: &broadcast::Sender<ControlEvent>,
+    view: &ConnectionView,
+) {
+    emit_event(
+        inner,
+        events,
+        ControlEventKind::Connection,
+        view.generation,
+        None,
+        None,
+        serde_json::to_value(view).unwrap_or(Value::Null),
+    );
+}
+
+/// 广播一条会话投影事件（本会话；设备维度为 None）。
+fn emit_session_event(
+    inner: &Mutex<Inner>,
+    events: &broadcast::Sender<ControlEvent>,
+    view: &SessionView,
+) {
+    emit_event(
+        inner,
+        events,
+        ControlEventKind::Session,
+        view.generation,
+        Some(view.session_id.clone()),
+        None,
+        serde_json::to_value(view).unwrap_or(Value::Null),
+    );
 }
 
 /// 事件泵的 State 处理：锁内改状态/代际，锁外作废旧桥投影并广播。
@@ -261,7 +302,7 @@ async fn apply_relay_state(
     bridge: &dyn BridgePump,
     view: ConnectionView,
 ) {
-    let (out, invalidate) = {
+    let (out, invalidate, stale) = {
         let mut state = lock_inner(inner);
         if view.generation <= state.relay_floor {
             return;
@@ -287,12 +328,21 @@ async fn apply_relay_state(
         if view.state == ConnectionState::NeedsAuth {
             state.authorized = false;
         }
-        (state.view(), entering_conflict)
+        let out = state.view();
+        let stale = if out.state == ConnectionState::Paired {
+            None
+        } else {
+            state.stale_session(out.generation)
+        };
+        (out, entering_conflict, stale)
     };
     if invalidate {
         bridge.invalidate().await;
     }
     emit_connection(inner, events, &out);
+    if let Some(stale) = stale {
+        emit_session_event(inner, events, &stale);
+    }
 }
 
 /// Hub 内部状态（全部字段由同一把 std 锁保护，锁外不做网络 await）。
@@ -313,6 +363,8 @@ struct Inner {
     /// 事件泵地板：`generation <= relay_floor` 的 relay 状态一律忽略（配置变更/断开
     /// 之后迟到的旧代际状态不得回写新状态）。
     relay_floor: u64,
+    /// 最近一次经 `session()` 读取的投影；连接离开 paired 时据此广播降级事件。
+    last_session: Option<SessionView>,
 }
 
 impl Inner {
@@ -323,6 +375,18 @@ impl Inner {
             reason_code: self.reason_code.clone(),
             device_label: self.device_label.clone(),
         }
+    }
+
+    /// 连接离开 paired：已读投影如实降级为不新鲜（只降一次，不猜测内容）。
+    fn stale_session(&mut self, generation: u64) -> Option<SessionView> {
+        let mut view = self.last_session.clone()?;
+        if !view.ready {
+            return None;
+        }
+        view.generation = generation;
+        view.ready = false;
+        self.last_session = Some(view.clone());
+        Some(view)
     }
 }
 
@@ -397,6 +461,7 @@ impl ZcodeHub {
                 seq: 0,
                 relay_generation: 0,
                 relay_floor: 0,
+                last_session: None,
             })),
             connect_lock: AsyncMutex::new(()),
         };
@@ -449,30 +514,42 @@ impl ZcodeHub {
             .with(|conn| get_config(conn).config_state == ConfigState::Saved)
     }
 
-    /// 推进代际并返回新值（必须在清 relay/JWT/投影**之前**调用）。
-    fn advance_generation(&self) -> u64 {
-        let mut inner = self.lock();
-        inner.generation = inner.generation.wrapping_add(1);
-        inner.generation
-    }
-
     /// 广播一条连接事件（持有内锁时不可调用）。
     fn emit_connection(&self, view: &ConnectionView) {
         emit_connection(&self.inner, &self.events, view);
     }
 
-    /// 设置连接状态并返回视图（调用方负责随后广播）。
-    fn set_state(
+    /// 广播一条会话投影事件（持有内锁时不可调用）。
+    fn emit_session(&self, view: &SessionView) {
+        emit_session_event(&self.inner, &self.events, view);
+    }
+
+    /// 落定连接状态并广播：先连接事件，再在离开 paired 时广播一次投影降级
+    /// （`ready=false`）——手机据 Session 事件得知旧投影已不可用。
+    fn settle(
         &self,
         state: ConnectionState,
         reason_code: Option<String>,
         device_label: Option<String>,
     ) -> ConnectionView {
-        let mut inner = self.lock();
-        inner.state = state;
-        inner.reason_code = reason_code;
-        inner.device_label = device_label;
-        inner.view()
+        let (view, stale) = {
+            let mut inner = self.lock();
+            inner.state = state;
+            inner.reason_code = reason_code;
+            inner.device_label = device_label;
+            let view = inner.view();
+            let stale = if state == ConnectionState::Paired {
+                None
+            } else {
+                inner.stale_session(view.generation)
+            };
+            (view, stale)
+        };
+        self.emit_connection(&view);
+        if let Some(stale) = stale {
+            self.emit_session(&stale);
+        }
+        view
     }
 
     fn state_of(error: &ZcodeError) -> ConnectionState {
@@ -541,8 +618,12 @@ impl ZcodeHub {
         inner.reason_code = None;
         inner.device_label = None;
         let view = inner.view();
+        let stale = inner.stale_session(view.generation);
         drop(inner);
         self.emit_connection(&view);
+        if let Some(stale) = stale {
+            self.emit_session(&stale);
+        }
         Ok(view)
     }
 
@@ -591,71 +672,122 @@ impl ZcodeHub {
             }
         };
         let label = route.label.clone();
-        let connecting = self.set_state(ConnectionState::Connecting, None, label.clone());
-        self.emit_connection(&connecting);
+        // 握手中：离开 paired，已读投影同步降级广播。
+        self.settle(ConnectionState::Connecting, None, label.clone());
         match self.backend.connect(route).await {
             Err(error) => Err(self.apply_failure(generation, error)),
             Ok(view) => {
-                let mut inner = self.lock();
-                // 迟到结果（配置变更/断开已推进代际）一律丢弃，不得回退状态。
-                if inner.generation != generation {
-                    return Err(ZcodeError::of(codes::STALE_GENERATION));
-                }
-                inner.state = view.state;
-                inner.reason_code = view.reason_code.clone();
-                inner.device_label = view.device_label.clone().or(label);
-                let out = inner.view();
-                drop(inner);
+                let (out, stale) = {
+                    let mut inner = self.lock();
+                    // 迟到结果（配置变更/断开已推进代际）一律丢弃，不得回退状态。
+                    if inner.generation != generation {
+                        return Err(ZcodeError::of(codes::STALE_GENERATION));
+                    }
+                    inner.state = view.state;
+                    inner.reason_code = view.reason_code.clone();
+                    inner.device_label = view.device_label.clone().or(label);
+                    let out = inner.view();
+                    let stale = if out.state == ConnectionState::Paired {
+                        None
+                    } else {
+                        inner.stale_session(out.generation)
+                    };
+                    (out, stale)
+                };
                 self.emit_connection(&out);
+                if let Some(stale) = stale {
+                    self.emit_session(&stale);
+                }
                 Ok(out)
             }
         }
     }
 
     /// 用户显式断开：推进代际、保留 JWT，可再次连接。
+    ///
+    /// 与配置变更同规：代际推进与「不可控」状态在**同一把锁**内落定，
+    /// `backend.disconnect` 在途期间不得再读到旧配对/旧投影。
     pub async fn disconnect(&self) -> ConnectionView {
         let _single = self.connect_lock.lock().await;
-        self.advance_generation();
+        let (view, stale) = {
+            let mut inner = self.lock();
+            inner.generation = inner.generation.wrapping_add(1);
+            inner.state = ConnectionState::Offline;
+            inner.reason_code = None;
+            inner.device_label = None;
+            let view = inner.view();
+            let stale = inner.stale_session(view.generation);
+            (view, stale)
+        };
+        self.emit_connection(&view);
+        if let Some(stale) = stale {
+            self.emit_session(&stale);
+        }
         self.backend.disconnect().await;
-        self.publish(ConnectionState::Offline, None)
+        view
     }
 
-    /// 配置保存/删除成功后的唯一入口：先推进代际，再清 relay/JWT/投影。
+    /// 配置保存/删除成功后的唯一入口：**原子**推进代际并退出配对，再清 relay/JWT/投影。
     ///
     /// 调用方只在 DB 保存**成功后**调用；保存失败保持原连接，不由本函数处置。
+    /// 代际推进与「不可控」状态在**同一把锁**内落定：`reset` 在途的窗口里
+    /// `connection()`/`session()` 绝不会看到「新代际 + 旧配对/旧投影/旧标签」。
     pub async fn config_changed(&self) -> ConnectionView {
-        // 顺序固定：先推进代际（旧目标/旧动作立即失效），再清 relay/JWT/投影。
-        let generation = self.advance_generation();
-        self.backend.reset(generation).await;
+        // 新配置已由调用方落库；先读形态（本地 KV，非网络、不持锁）。
         let configured = self.read_configured();
-        {
+        let (view, stale) = {
             let mut inner = self.lock();
-            // 期间又发生了更新的配置变更/断开：以更新者的状态为准。
-            if inner.generation != generation {
-                return inner.view();
-            }
+            inner.generation = inner.generation.wrapping_add(1);
+            let generation = inner.generation;
             inner.configured = configured;
             inner.authorized = false;
-            // reset 已断开 relay：此前到达的状态事件（含 reset 触发的 offline）不再回写，
-            // 只在事件泵地板之内；后续新连接代际更高，照常接受。
+            inner.state = if configured {
+                ConnectionState::NeedsAuth
+            } else {
+                ConnectionState::NeedsConfig
+            };
+            inner.reason_code = None;
+            inner.device_label = None;
+            // reset 之前到达的旧 relay 状态（含 reset 触发的 offline）一律丢弃。
             inner.relay_floor = inner.relay_generation;
-        }
-        let state = if configured {
-            ConnectionState::NeedsAuth
-        } else {
-            ConnectionState::NeedsConfig
+            let view = inner.view();
+            let stale = inner.stale_session(generation);
+            (view, stale)
         };
-        self.publish(state, None)
+        self.emit_connection(&view);
+        if let Some(stale) = stale {
+            self.emit_session(&stale);
+        }
+        // 锁外清凭据、断 relay、作废旧投影（不在任何锁内 await 网络）。
+        self.backend.reset(view.generation).await;
+        let mut inner = self.lock();
+        // 期间又发生了更新的配置变更/断开：以更新者的状态为准。
+        if inner.generation != view.generation {
+            return inner.view();
+        }
+        inner.relay_floor = inner.relay_generation;
+        view
     }
 
     /// 读取精确目标的会话投影（只接受当前代际内可精确绑定的 Tuvis sessionId）。
+    ///
+    /// 公开代际唯一：投影的 `generation` 恒为 Hub 代际（bridge 投影代际内部使用，
+    /// 不外泄）；读取成功即广播一条本会话的 [`ControlEventKind::Session`]。
     pub async fn session(&self, key: &TargetKey) -> ZResult<SessionView> {
         let generation = self.control_generation()?;
         let target = self.backend.bind_session(key).await?;
         if self.lock().generation != generation {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
-        self.backend.session(&target).await
+        let mut view = self.backend.session(&target).await?;
+        // 读在途时代际已变：旧投影不得贴上新代际。
+        if self.lock().generation != generation {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        view.generation = generation;
+        self.lock().last_session = Some(view.clone());
+        self.emit_session(&view);
+        Ok(view)
     }
 
     /// 执行一次控制动作：代际 + 能力闸 + 目标绑定全部通过才派发。
@@ -680,7 +812,25 @@ impl ZcodeHub {
         if self.lock().generation != generation {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
-        self.backend.execute(&ctx, &target, &action).await
+        let mut receipt = self.backend.execute(&ctx, &target, &action).await?;
+        // 公开代际唯一：回执盖本次校验过的 Hub 代际（生产后端盖的是投影代际）。
+        // 若执行在途发生了换代，回执仍是旧代际——客户端据 connection 发现并重取。
+        receipt.generation = generation;
+        self.emit_action(&receipt, &ctx.device_id);
+        Ok(receipt)
+    }
+
+    /// 广播一条动作回执事件；设备 id 只留在进程内供 SSE 同会话过滤。
+    fn emit_action(&self, receipt: &ActionReceipt, device_id: &str) {
+        emit_event(
+            &self.inner,
+            &self.events,
+            ControlEventKind::Action,
+            receipt.generation,
+            Some(receipt.session_id.clone()),
+            Some(device_id.to_owned()),
+            serde_json::to_value(receipt).unwrap_or(Value::Null),
+        );
     }
 
     /// 当前代际的「可控制」门（未配置→needs_config，未授权→needs_auth，未配对→状态码）。
@@ -742,28 +892,32 @@ impl ZcodeHub {
 
     /// 失败收口：代际未变才写状态并广播；旧代际失败一律 `stale_generation`。
     fn apply_failure(&self, generation: u64, error: ZcodeError) -> ZcodeError {
-        let mut inner = self.lock();
-        if inner.generation != generation {
-            return ZcodeError::of(codes::STALE_GENERATION);
-        }
-        let state = Self::state_of(&error);
-        if state == ConnectionState::NeedsAuth {
-            inner.authorized = false;
-        }
-        inner.state = state;
-        inner.reason_code = Some(error.code.clone());
-        inner.device_label = None;
-        let view = inner.view();
-        drop(inner);
+        let (view, stale) = {
+            let mut inner = self.lock();
+            if inner.generation != generation {
+                return ZcodeError::of(codes::STALE_GENERATION);
+            }
+            let state = Self::state_of(&error);
+            if state == ConnectionState::NeedsAuth {
+                inner.authorized = false;
+            }
+            inner.state = state;
+            inner.reason_code = Some(error.code.clone());
+            inner.device_label = None;
+            let view = inner.view();
+            let stale = inner.stale_session(view.generation);
+            (view, stale)
+        };
         self.emit_connection(&view);
+        if let Some(stale) = stale {
+            self.emit_session(&stale);
+        }
         error
     }
 
-    /// 写状态并广播一条连接事件。
+    /// 写状态并广播一条连接事件（离开 paired 时附带投影降级事件）。
     fn publish(&self, state: ConnectionState, reason_code: Option<String>) -> ConnectionView {
-        let view = self.set_state(state, reason_code, None);
-        self.emit_connection(&view);
-        view
+        self.settle(state, reason_code, None)
     }
 }
 
@@ -788,6 +942,8 @@ mod tests {
         execute_calls: AtomicUsize,
         /// 在途 connect 的闸（迟到结果测试用）。
         gate: Mutex<Option<Arc<Notify>>>,
+        /// 在途 reset 的闸（配置变更窗口测试用）。
+        reset_gate: Mutex<Option<Arc<Notify>>>,
         connect_result: Mutex<Option<ZResult<ConnectionView>>>,
         bind_generation: AtomicU64,
         /// 每次 connect 收到的目标（`sid` + `mid`），用于证明只从保存链接解析。
@@ -845,7 +1001,12 @@ mod tests {
         fn reset<'a>(&'a self, generation: u64) -> BoxFuture<'a, ()> {
             self.reset_calls.fetch_add(1, Ordering::SeqCst);
             self.reset_generations.lock().unwrap().push(generation);
-            Box::pin(async {})
+            Box::pin(async move {
+                let gate = self.reset_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+            })
         }
 
         fn bind_session<'a>(&'a self, key: &'a TargetKey) -> BoxFuture<'a, ZResult<BoundTarget>> {
@@ -882,13 +1043,14 @@ mod tests {
             &'a self,
             ctx: &'a ActionContext,
             target: &'a BoundTarget,
-            action: &'a ControlAction,
+            _action: &'a ControlAction,
         ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
             let receipt = ActionReceipt {
                 action_id: ctx.action_id.clone(),
                 session_id: target.session_id.clone(),
-                generation: action.generation(),
+                // 生产回执盖的是投影代际（≠ Hub 代际）：Hub 必须覆写为公开代际。
+                generation: target.generation,
                 state: ActionState::Accepted,
                 reason_code: None,
             };
@@ -1107,6 +1269,182 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.state, ActionState::Accepted);
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 公开代际唯一：SessionView/ActionReceipt 只暴露 Hub 代际（投影代际不外泄）。
+    #[tokio::test]
+    async fn public_generation_is_hub_generation_after_connect() {
+        let fake = Arc::new(FakeBackend::default());
+        // 生产 connect 会让 bridge 推进自己的投影代际；这里刻意造出分叉。
+        fake.bind_generation.store(41, Ordering::SeqCst);
+        let hub = paired_hub(fake.clone()).await;
+        let generation = hub.connection().generation;
+
+        let view = hub
+            .session(&TargetKey {
+                session_id: "sess_synthetic0000".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(view.generation, generation, "会话视图只暴露 Hub 代际");
+
+        let receipt = hub
+            .execute(ctx("synthetic-action-public"), send_action(generation))
+            .await
+            .unwrap();
+        assert_eq!(receipt.generation, generation, "动作回执只暴露 Hub 代际");
+    }
+
+    /// 配置变更后：旧代际动作零执行；重连后的会话/回执与连接视图同一代际。
+    #[tokio::test]
+    async fn old_generation_action_rejected_after_config_change() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let old_generation = hub.connection().generation;
+
+        let view = hub.config_changed().await;
+        let new_generation = view.generation;
+        assert!(new_generation > old_generation);
+        assert_eq!(view.state, ConnectionState::NeedsAuth);
+
+        let err = hub
+            .execute(ctx("synthetic-action-old"), send_action(old_generation))
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::STALE_GENERATION));
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 0);
+
+        // 重新授权/连接：动作、会话、回执必须共用 Hub 新代际（不是投影代际）。
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let session = hub
+            .session(&TargetKey {
+                session_id: "sess_synthetic0000".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.generation, new_generation);
+        let receipt = hub
+            .execute(ctx("synthetic-action-new"), send_action(new_generation))
+            .await
+            .unwrap();
+        assert_eq!(receipt.generation, new_generation);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 成功绑定会话后广播 Session 事件（本会话、无设备维度、无凭据）。
+    #[tokio::test]
+    async fn session_emits_session_event() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake).await;
+        let generation = hub.connection().generation;
+        let mut events = hub.subscribe();
+
+        hub.session(&TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        })
+        .await
+        .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("必须广播 session 事件")
+            .expect("广播通道未关闭");
+        assert_eq!(event.kind, ControlEventKind::Session);
+        assert_eq!(event.session_id.as_deref(), Some("sess_synthetic0000"));
+        assert_eq!(event.generation, generation);
+        assert_eq!(event.device_id, None, "会话事件无设备维度");
+        assert_eq!(event.data["sessionId"], "sess_synthetic0000");
+        assert_eq!(event.data["ready"], true);
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(!wire.contains("jwt") && !wire.contains("token"));
+    }
+
+    /// 成功动作后广播 Action 事件：带发起设备（仅进程内，序列化不可见）。
+    #[tokio::test]
+    async fn execute_emits_action_event_with_device_id() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake).await;
+        let generation = hub.connection().generation;
+        let mut events = hub.subscribe();
+
+        hub.execute(ctx("synthetic-action-event"), send_action(generation))
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("必须广播 action 事件")
+            .expect("广播通道未关闭");
+        assert_eq!(event.kind, ControlEventKind::Action);
+        assert_eq!(event.session_id.as_deref(), Some("sess_synthetic0000"));
+        assert_eq!(event.generation, generation);
+        assert_eq!(event.device_id.as_deref(), Some("synthetic-device"));
+        assert_eq!(event.data["actionId"], "synthetic-action-event");
+        assert_eq!(event.data["state"], "accepted");
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(!wire.contains("deviceId"), "设备 id 绝不序列化: {wire}");
+        assert!(
+            !wire.contains("synthetic-device"),
+            "设备 id 绝不序列化: {wire}"
+        );
+    }
+
+    /// 配置变更窗口：新代际绝不与旧投影/旧标签同框（reset 在途也如此）。
+    #[tokio::test]
+    async fn config_change_never_exposes_new_generation_with_old_projection() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let key = TargetKey {
+            session_id: "sess_synthetic0000".into(),
+        };
+        // 先读一次投影（旧链接下可读），让 Hub 持有可降级的会话视图。
+        hub.session(&key).await.unwrap();
+        let old = hub.connection();
+        assert!(old.is_paired());
+
+        let gate = Arc::new(Notify::new());
+        fake.reset_gate.lock().unwrap().replace(gate.clone());
+        let mut events = hub.subscribe();
+        let changing = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.config_changed().await })
+        };
+        wait_until(|| fake.reset_calls.load(Ordering::SeqCst) == 1).await;
+
+        // reset 尚在途：连接面必须是「新代际 + 不可控」，绝不复用旧配对/旧标签。
+        let during = hub.connection();
+        assert!(during.generation > old.generation);
+        assert_eq!(during.state, ConnectionState::NeedsAuth);
+        assert_eq!(during.device_label, None);
+        // 旧投影不得以新代际出现：控制门直接拒绝，零新绑定。
+        let err = hub.session(&key).await.unwrap_err();
+        assert!(err.is(codes::NEEDS_AUTH));
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 1);
+
+        // 已广播帧同样不得出现「新代际 + paired / ready=true」。
+        while let Ok(event) = events.try_recv() {
+            if event.generation != during.generation {
+                continue;
+            }
+            match event.kind {
+                ControlEventKind::Connection => {
+                    assert_ne!(event.data["state"], serde_json::json!("paired"))
+                }
+                ControlEventKind::Session => {
+                    assert_eq!(event.data["ready"], false, "旧投影只能降级广播")
+                }
+                ControlEventKind::Action => {}
+            }
+        }
+
+        gate.notify_one();
+        let done = changing.await.unwrap();
+        assert_eq!(done.state, ConnectionState::NeedsAuth);
+        assert_eq!(done.generation, during.generation);
     }
 
     /// KICKED（conflict）是终态：不自动重连，只有显式断开/配置变更才复位。

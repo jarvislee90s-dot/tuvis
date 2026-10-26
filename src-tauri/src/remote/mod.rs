@@ -759,21 +759,38 @@ async fn disconnect_zcode_hub_core(
     }
 }
 
+/// 关闭等待上限：只兜住调用线程不被无限阻塞（relay 断开自身另有界）。
+const ZCODE_HUB_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 远程显性关闭与应用退出的断开口（T7.1 C2b）。
 ///
 /// 调用点（同步命令 / `RunEvent::Exit` / 升级前 `on_before_exit`）没有 runtime
-/// 上下文保证：不在 runtime 内时经 Tauri 全局 runtime `block_on`（断开内部有界
-/// 等待 ≤15s）；已在 runtime 内则 spawn（不嵌套 `block_on`；进程退出由 OS 收 socket）。
+/// 上下文保证：统一在**独立线程**上 `block_on`（不嵌套 runtime、不依赖调用线程），
+/// 调用方有界等待断开真正落地（≤ [`ZCODE_HUB_SHUTDOWN_WAIT`]）——停服/退出前
+/// 断开不再「spawn 后立即返回」；超时如实记日志放弃，不把退出卡死。
 pub(crate) fn disconnect_zcode_hub() {
     let hub = STATE.zcode_hub();
     if hub.is_none() {
         return;
     }
-    if tokio::runtime::Handle::try_current().is_ok() {
+    let (done, wait) = std::sync::mpsc::channel();
+    let shutdown_hub = hub.clone();
+    let spawned = std::thread::Builder::new()
+        .name("zcode-hub-shutdown".into())
+        .spawn(move || {
+            tauri::async_runtime::block_on(disconnect_zcode_hub_core(shutdown_hub));
+            let _ = done.send(());
+        });
+    if spawned.is_err() {
+        // 极端资源耗尽：退回 runtime 内 spawn（不阻塞调用线程，进程退出由 OS 收 socket）。
+        log::warn!("ZCode Hub 关停线程创建失败，改为后台 spawn");
         tauri::async_runtime::spawn(disconnect_zcode_hub_core(hub));
         return;
     }
-    tauri::async_runtime::block_on(disconnect_zcode_hub_core(hub));
+    match wait.recv_timeout(ZCODE_HUB_SHUTDOWN_WAIT) {
+        Ok(()) => {}
+        Err(error) => log::warn!("ZCode Hub 关停未在期限内确认：{error}"),
+    }
 }
 
 /// 从看板地址抽域名（纯函数）：快照 url 契约恒为含 /m 的完整地址（board_url 归一），

@@ -1021,6 +1021,7 @@ async fn sse_filters_other_sessions() {
         session_id: Some(OTHER_SESSION.into()),
         kind: ControlEventKind::Session,
         data: serde_json::json!({ "sessionId": OTHER_SESSION }),
+        device_id: None,
     };
     let foreign_action = ControlEvent {
         seq: 2,
@@ -1028,6 +1029,7 @@ async fn sse_filters_other_sessions() {
         session_id: Some(OTHER_SESSION.into()),
         kind: ControlEventKind::Action,
         data: serde_json::json!({ "actionId": "action-other-session" }),
+        device_id: None,
     };
     let own_session = ControlEvent {
         seq: 3,
@@ -1035,6 +1037,7 @@ async fn sse_filters_other_sessions() {
         session_id: Some(ZCODE_SESSION.into()),
         kind: ControlEventKind::Session,
         data: serde_json::json!({ "sessionId": ZCODE_SESSION }),
+        device_id: None,
     };
     assert!(control_frame(&foreign_session, ZCODE_SESSION).is_none());
     assert!(control_frame(&foreign_action, ZCODE_SESSION).is_none());
@@ -1042,6 +1045,18 @@ async fn sse_filters_other_sessions() {
         control_frame(&own_session, ZCODE_SESSION),
         Some(("session", _))
     ));
+
+    // 活流：首帧快照内的 session() 读取已广播一条本会话 Session 事件，端到端经
+    // BroadcastStream 送达（不只是直调过滤函数）。
+    let own = next_frame(&mut stream)
+        .await
+        .expect("本会话 session 事件帧");
+    assert!(
+        own.starts_with("event: session\n"),
+        "本会话 session 事件必须成帧，实际 {own:?}"
+    );
+    assert_eq!(frame_json(&own)["data"]["sessionId"], ZCODE_SESSION);
+    assert_eq!(frame_json(&own)["data"]["ready"], true);
 
     // 活流：Hub 广播一条连接事件 → 连接帧（非本会话事件不混入）
     hub.disconnect().await;
@@ -1138,6 +1153,7 @@ async fn sse_never_exposes_tokens_or_other_device_actions() {
             "actionId": "action-other-device-0001",
             "sessionId": OTHER_SESSION,
         }),
+        device_id: None,
     };
     assert!(control_frame(&foreign_action, ZCODE_SESSION).is_none());
 

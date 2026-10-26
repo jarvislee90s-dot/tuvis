@@ -767,6 +767,9 @@ pub enum ControlEventKind {
 /// `data` 只承载对应 Tuvis DTO（[`ConnectionView`]／[`SessionView`]／
 /// [`ActionReceipt`]），**绝无** JWT/token/官方原文；`seq` 在单个 Hub 生命周期内
 /// 单调递增，消费方据它发现缺口（缺口后重 GET，不重放动作）。
+///
+/// `device_id` 是**进程内**字段：SSE 据此只转发本设备动作，绝不序列化给手机
+/// （`#[serde(skip)]`）；连接/会话事件与生产侧无关，恒为 `None`。
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlEvent {
@@ -775,6 +778,9 @@ pub struct ControlEvent {
     pub session_id: Option<String>,
     pub kind: ControlEventKind,
     pub data: Value,
+    /// 动作发起设备（仅 SSE 同会话过滤；永不序列化）。
+    #[serde(skip)]
+    pub device_id: Option<String>,
 }
 
 /// 会话投影视图（手机唯一可见的会话状态面）。
