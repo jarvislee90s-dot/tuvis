@@ -5,7 +5,9 @@
 //! 注入器全为合成/记录型假体，绝不接触真实 ~/.tuvis，绝不发起任何官方 HTTP。
 
 use multi_agents_manager_lib::remote::codex_ipc::CodexControlHub;
-use multi_agents_manager_lib::remote::pairing::{persist_device, DeviceStore, NewDevice};
+use multi_agents_manager_lib::remote::pairing::{
+    persist_device, revoke_device, DeviceStore, NewDevice,
+};
 use multi_agents_manager_lib::remote::server::{router, RemoteState};
 use multi_agents_manager_lib::remote::zcode::control_frame;
 use multi_agents_manager_lib::services::zcode_control::{
@@ -274,10 +276,6 @@ impl FakeHubBackend {
 
     fn contexts(&self) -> Vec<ActionContext> {
         self.contexts.lock().unwrap().clone()
-    }
-
-    fn actions(&self) -> Vec<ControlAction> {
-        self.actions.lock().unwrap().clone()
     }
 
     fn set_execute_result(&self, result: ZResult<ActionReceipt>) {
@@ -619,6 +617,87 @@ async fn zcode_session_does_not_accept_workspace_path() {
 // T7.1 B2b：配对视角的 ZCode 写动作（POST /zcode/actions）
 // ============================================================
 
+/// 动作端点与 GET 同级授权门：只接受当前 Tuvis 快照里 `agent_type=zcode` 的会话；
+/// 隐藏/归档（已离开快照）或非 ZCode 的会话凭手机自报 ID → 404 no_session，
+/// 零绑定零执行（不得绕过看板可见性边界）。
+#[tokio::test]
+async fn action_on_hidden_or_archived_zcode_session_is_404() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let mut claude = zcode_session();
+    claude.id = "claude-hidden-0001".into();
+    claude.agent_type = AgentType::Claude;
+    let st = state_with_sessions(&conn, injector, vec![zcode_session(), claude]);
+    st.set_zcode_hub(hub);
+    let app = router(st);
+
+    for target in ["zcode-archived-0001", "claude-hidden-0001"] {
+        let mut body = send_body("action-hidden-0001", generation);
+        body["action"]["sessionId"] = serde_json::json!(target);
+        let resp = app.clone().oneshot(action_req(&body, true)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "{target} 必须 404"
+        );
+        assert_eq!(
+            body_json(resp).await,
+            serde_json::json!({ "error": "no_session" })
+        );
+    }
+    assert_eq!(backend.execute_calls(), 0, "看不见的会话不得执行");
+    assert!(backend.bind_calls().is_empty(), "看不见的会话不得绑定");
+}
+
+/// brief Step 1 冻结名：四条控制端点（connection/session/actions/events）未配对
+/// 一律 gate 层 403，先于任何 hub 调用；零帧（无绑定/无执行/无新增连接/无 SSE 注册）。
+#[tokio::test]
+async fn unpaired_all_control_endpoints_reject() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, injector.clone());
+    st.set_zcode_hub(hub);
+    let registry = st.sse_registry.clone();
+    let app = router(st);
+
+    for route in [
+        "/m/api/v1/zcode/connection".to_string(),
+        format!("/m/api/v1/zcode/session?sessionId={ZCODE_SESSION}"),
+        format!("{EVENTS_ROUTE}?sessionId={ZCODE_SESSION}"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(get_req_without_cookie(&route))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{route} 未配对必须 403");
+    }
+    let resp = app
+        .clone()
+        .oneshot(action_req(
+            &send_body("action-unpaired-all", generation),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "未配对动作必须 403");
+
+    // wire frames = 0：零绑定/零执行/零新增连接/零 SSE 注册（gate 先于一切 hub 面）
+    assert_eq!(backend.execute_calls(), 0, "403 必须先于 hub 执行");
+    assert!(backend.bind_calls().is_empty(), "403 必须先于 hub 绑定");
+    assert_eq!(backend.connect_calls(), 1, "未配对请求不得新增连接");
+    assert!(!registry.has("dev-z1"), "未配对不得注册任何事件流");
+    assert_eq!(injector.calls(), 0, "零终端注入");
+}
+
 /// 未配对：动作端点必须在 gate 层 403，hub/后端零执行零绑定。
 #[tokio::test]
 async fn unpaired_action_is_403_zero_calls() {
@@ -873,8 +952,8 @@ async fn accepted_receipt_is_200() {
     }
 }
 
-/// workspacePath（顶层或动作内）只能被拒绝或被忽略；无论哪条路都**绝不**传给 Hub
-/// （绑定只按 sessionId，动作里没有路径字段）。
+/// workspacePath（顶层或动作内）一律 400 invalid_action：白名单是安全合同，
+/// 不接受任何客户端自报字段；两种位置都零绑定零执行。
 #[tokio::test]
 async fn workspace_path_in_body_is_rejected_or_ignored() {
     let conn = shared_conn();
@@ -885,46 +964,34 @@ async fn workspace_path_in_body_is_rejected_or_ignored() {
     let generation = hub.connection().generation;
     let st = state(&conn, injector);
     st.set_zcode_hub(hub);
+    let app = router(st);
 
-    let mut body = send_body("action-B2b-ws", generation);
-    body.as_object_mut()
+    // ① 顶层多余字段
+    let mut top = send_body("action-B2b-ws-top", generation);
+    top.as_object_mut()
         .unwrap()
         .insert("workspacePath".into(), serde_json::json!("/evil/workspace"));
-    body["action"]
+    // ② 动作内多余字段
+    let mut inner = send_body("action-B2b-ws-inner", generation);
+    inner["action"]
         .as_object_mut()
         .unwrap()
         .insert("workspacePath".into(), serde_json::json!("/evil/workspace"));
 
-    let resp = router(st).oneshot(action_req(&body, true)).await.unwrap();
-    let status = resp.status();
-    let wire = body_json(resp).await;
-    assert!(
-        status == axum::http::StatusCode::BAD_REQUEST || status == axum::http::StatusCode::OK,
-        "只允许拒绝（400）或忽略（200），实际 {status}"
-    );
-    if status == axum::http::StatusCode::BAD_REQUEST {
-        assert_eq!(wire, serde_json::json!({ "error": "invalid_action" }));
-        assert_eq!(backend.execute_calls(), 0);
-        assert!(backend.bind_calls().is_empty());
+    for body in [top, inner] {
+        let resp = app.clone().oneshot(action_req(&body, true)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "契约外字段必须 400，实际 {body}"
+        );
+        assert_eq!(
+            body_json(resp).await,
+            serde_json::json!({ "error": "invalid_action" })
+        );
     }
-    assert!(
-        backend
-            .bind_calls()
-            .iter()
-            .all(|key| key.session_id == ZCODE_SESSION),
-        "绑定只按 sessionId"
-    );
-    assert!(
-        backend
-            .actions()
-            .iter()
-            .all(|action| !format!("{action:?}").contains("/evil")),
-        "hub 收到的动作不得含客户端自报 workspace"
-    );
-    assert!(
-        !wire.to_string().contains("/evil"),
-        "响应不得回显客户端自报 workspace"
-    );
+    assert_eq!(backend.execute_calls(), 0, "多余字段不得触达 hub");
+    assert!(backend.bind_calls().is_empty(), "不得按自报 workspace 绑定");
 }
 
 // ============================================================
@@ -1039,10 +1106,10 @@ async fn sse_filters_other_sessions() {
         data: serde_json::json!({ "sessionId": ZCODE_SESSION }),
         device_id: None,
     };
-    assert!(control_frame(&foreign_session, ZCODE_SESSION).is_none());
-    assert!(control_frame(&foreign_action, ZCODE_SESSION).is_none());
+    assert!(control_frame(&foreign_session, ZCODE_SESSION, "dev-z1").is_none());
+    assert!(control_frame(&foreign_action, ZCODE_SESSION, "dev-z1").is_none());
     assert!(matches!(
-        control_frame(&own_session, ZCODE_SESSION),
+        control_frame(&own_session, ZCODE_SESSION, "dev-z1"),
         Some(("session", _))
     ));
 
@@ -1155,7 +1222,24 @@ async fn sse_never_exposes_tokens_or_other_device_actions() {
         }),
         device_id: None,
     };
-    assert!(control_frame(&foreign_action, ZCODE_SESSION).is_none());
+    assert!(control_frame(&foreign_action, ZCODE_SESSION, "dev-z1").is_none());
+
+    // 同一会话、另一台手机的动作回执：按设备过滤，同样不产帧
+    let other_device_same_session = ControlEvent {
+        seq: 8,
+        generation: 1,
+        session_id: Some(ZCODE_SESSION.into()),
+        kind: ControlEventKind::Action,
+        data: serde_json::json!({
+            "actionId": "action-other-device-0001",
+            "sessionId": ZCODE_SESSION,
+        }),
+        device_id: Some("dev-other".into()),
+    };
+    assert!(
+        control_frame(&other_device_same_session, ZCODE_SESSION, "dev-z1").is_none(),
+        "同会话他机动作 id 不得出网"
+    );
 
     // 活流：连接事件帧同样不得含凭据/他机动作 id
     hub.disconnect().await;
@@ -1168,4 +1252,138 @@ async fn sse_never_exposes_tokens_or_other_device_actions() {
             "事件帧不得携带凭据（命中 {needle}）"
         );
     }
+}
+
+/// 同会话他机动作 id 不得出网：真实 Hub 广播 → SSE 端到端过滤（非直调纯函数）。
+#[tokio::test]
+async fn sse_does_not_leak_other_device_action_ids() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_open(&conn, backend).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, Arc::new(RecordingInjector::default()));
+    st.set_zcode_hub(hub.clone());
+    let app = router(st);
+
+    let resp = app.oneshot(sse_req(ZCODE_SESSION)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let mut stream = resp.into_body().into_data_stream();
+    next_frame(&mut stream).await.expect("首帧");
+
+    // 另一台配对手机在同一会话执行动作：事件带 device_id=dev-other，不得出网
+    hub.execute(
+        ActionContext {
+            action_id: "action-other-device-0001".into(),
+            device_id: "dev-other".into(),
+            device_name: "Pixel".into(),
+        },
+        ControlAction::Send {
+            session_id: ZCODE_SESSION.into(),
+            generation,
+            text: "他机正文".into(),
+        },
+    )
+    .await
+    .expect("他机动作应由 Hub 受理");
+
+    // 本机动作：应在同一流上成帧（证明广播路径真实，过滤不是整体丢弃）
+    hub.execute(
+        ActionContext {
+            action_id: "action-own-device-0001".into(),
+            device_id: "dev-z1".into(),
+            device_name: "iPhone".into(),
+        },
+        ControlAction::Send {
+            session_id: ZCODE_SESSION.into(),
+            generation,
+            text: "本机正文".into(),
+        },
+    )
+    .await
+    .expect("本机动作应由 Hub 受理");
+
+    // 首帧快照内的 session() 会先播一条 session 帧；此后只应见到本机 action 帧。
+    let mut seen = Vec::new();
+    loop {
+        let frame = next_frame(&mut stream).await.expect("本机动作帧");
+        let is_action = frame.starts_with("event: action\n");
+        seen.push(frame);
+        if is_action {
+            break;
+        }
+    }
+    let all = seen.join("");
+    assert!(
+        !all.contains("action-other-device-0001"),
+        "同会话他机动作 id 不得出网，实际 {all}"
+    );
+    let own = frame_json(seen.last().unwrap());
+    assert_eq!(own["data"]["actionId"], "action-own-device-0001");
+    assert_eq!(own["data"]["sessionId"], ZCODE_SESSION);
+}
+
+/// brief Step 1 冻结名：停服/吊销后不能再写或收事件——动作 403 零执行（零动作帧），
+/// SSE 立即关闭且关闭后帧数恒 0。
+#[tokio::test]
+async fn stopped_remote_or_revoked_device_cannot_write_or_receive_events() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let st = state(&conn, Arc::new(RecordingInjector::default()));
+    st.set_zcode_hub(hub);
+    let registry = st.sse_registry.clone();
+    let app = router(st);
+
+    // 停服半场：disconnect_all（stop_server_core 的同一注册表动作）立即断流
+    let resp = app.clone().oneshot(sse_req(ZCODE_SESSION)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let mut stream = resp.into_body().into_data_stream();
+    next_frame(&mut stream).await.expect("首帧");
+    assert_eq!(registry.disconnect_all(), 1, "停服应关闭 1 条事件流");
+    let mut frames_after_stop = 0;
+    while next_frame(&mut stream).await.is_some() {
+        frames_after_stop += 1;
+    }
+    assert_eq!(frames_after_stop, 0, "停服后不得再发帧");
+
+    // 吊销半场：设备表失效 → SSE 断流 + 动作 gate 403（零执行 = 零动作帧）
+    let resp = app.clone().oneshot(sse_req(ZCODE_SESSION)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let mut stream = resp.into_body().into_data_stream();
+    next_frame(&mut stream).await.expect("首帧");
+    // 首帧快照的 session() 会绑定一次；动作被 gate 拦下后不得新增绑定。
+    let binds_before = backend.bind_calls().len();
+    DeviceStore::Owned(conn.clone()).with(|c| revoke_device(c, "dev-z1").expect("revoke"));
+    assert_eq!(
+        registry.disconnect_device("dev-z1"),
+        1,
+        "吊销应关闭 1 条连接"
+    );
+    let mut frames_after_revoke = 0;
+    while next_frame(&mut stream).await.is_some() {
+        frames_after_revoke += 1;
+    }
+    assert_eq!(frames_after_revoke, 0, "吊销后不得再发任何帧");
+
+    let resp = app
+        .oneshot(action_req(
+            &send_body("action-after-revoke", generation),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::FORBIDDEN,
+        "吊销后动作必须 403"
+    );
+    assert_eq!(backend.execute_calls(), 0, "吊销后零执行（零动作帧）");
+    assert_eq!(
+        backend.bind_calls().len(),
+        binds_before,
+        "吊销后动作不得新增绑定"
+    );
 }
