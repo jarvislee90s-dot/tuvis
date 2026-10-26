@@ -613,15 +613,37 @@ impl CommandSender {
         target: &BoundTarget,
         action: &ControlAction,
     ) -> ZResult<Option<ActionReceipt>> {
+        self.lookup_by_action(ctx, &target.session_id, target.generation, action)
+    }
+
+    /// 只读查询既有回执（**不需要已绑定目标**）：Hub 在连接/能力闸与 bind 之前调用，
+    /// 断开/未配对/能力关闭后重试同一 actionId 仍能取回既有 accepted/confirmed/
+    /// unknown 回执；冲突错误同样在此直接返回。
+    ///
+    /// 身份与 [`Self::lookup_action`] **同源**（kind/params/hash 同一派生），会话/代际
+    /// 取自动作自身；纯读：零出站帧、零新行、零审计。
+    pub(crate) async fn existing_receipt(
+        &self,
+        ctx: &ActionContext,
+        action: &ControlAction,
+    ) -> ZResult<Option<ActionReceipt>> {
+        self.lookup_by_action(ctx, action.session_id(), action.generation(), action)
+    }
+
+    /// 幂等查询的唯一实现：身份 = actionId + device + session + generation + kind +
+    /// payload_hash（由动作参数现算，不读正文）。绑定前后的两个查询入口都走这里，
+    /// 避免两套判定口径漂移。
+    fn lookup_by_action(
+        &self,
+        ctx: &ActionContext,
+        session_id: &str,
+        generation: u64,
+        action: &ControlAction,
+    ) -> ZResult<Option<ActionReceipt>> {
         let params = action_params(action);
-        let hash = payload_hash(
-            action.kind(),
-            &target.session_id,
-            target.generation,
-            &params,
-        )?;
+        let hash = payload_hash(action.kind(), session_id, generation, &params)?;
         self.actions
-            .existing_receipt(ctx, target, action.kind(), &hash)
+            .existing_receipt_for(ctx, session_id, generation, action.kind(), &hash)
     }
 
     /// 问答应答：只读幂等预检 → 宿主授权 → 原值映射 → **写前才预留** →
@@ -1690,6 +1712,108 @@ mod tests {
         assert_eq!(second.session_id, SESSION);
         assert_eq!(second.generation, GEN);
         assert_eq!(row_count(&store), 1);
+    }
+
+    /// 生产只读查询路径（Hub 在连接/许可闸之前依赖的真实实现，不是 Hub fake）：
+    /// 账本已有 accepted/unknown 时 `CommandSender::existing_receipt` 原样取回；
+    /// 全程零出站帧、零新行、零新审计；跨设备/换载荷/换代际一律冲突。
+    #[tokio::test]
+    async fn existing_receipt_reads_ledger_without_frames_or_writes() {
+        let store = DeviceStore::memory();
+        let fake = FakeBridge::new(Reply::Body(accepted_body()));
+        let sender = sender(&fake, &store);
+
+        // 无行 → None，零帧零行（查询绝不写入）。
+        assert!(sender
+            .existing_receipt(&ctx("a-none"), &send_action("从未提交"))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(fake.wire(), 0);
+        assert_eq!(row_count(&store), 0);
+
+        // accepted：真实派发路径（reserve + record_result）落库，恰一帧。
+        let accepted_action = send_action("已经被接下");
+        let accepted = sender
+            .execute(&ctx("a-accepted"), &target(), &accepted_action)
+            .await
+            .unwrap();
+        assert_eq!(accepted.state, ActionState::Accepted);
+        assert_eq!(fake.wire(), 1);
+
+        // unknown：以真实账本 API 预留并落未知终态（ACK 窗尽/断网的生产收口）。
+        let unknown_action = send_action("结果未知");
+        let params = action_params(&unknown_action);
+        let hash = payload_hash(unknown_action.kind(), SESSION, GEN, &params).unwrap();
+        let summary = audit_summary(unknown_action.kind(), &params);
+        assert_eq!(
+            sender
+                .actions
+                .reserve_with_kind(
+                    &ctx("a-unknown"),
+                    &target(),
+                    unknown_action.kind(),
+                    &hash,
+                    &summary,
+                )
+                .unwrap(),
+            Reservation::New
+        );
+        let unknown = ActionReceipt {
+            action_id: "a-unknown".into(),
+            session_id: SESSION.into(),
+            generation: GEN,
+            state: ActionState::Unknown,
+            reason_code: Some(codes::OFFLINE.into()),
+        };
+        sender.actions.record_result(&unknown).unwrap();
+
+        let rows_before = row_count(&store);
+        let audits_before = audits(&store).len();
+        let wire_before = fake.wire();
+
+        // 两种终态都能取回；查询本身零帧、零新行、零新审计。
+        for (action_id, action, expected) in [
+            ("a-accepted", &accepted_action, &accepted),
+            ("a-unknown", &unknown_action, &unknown),
+        ] {
+            let got = sender
+                .existing_receipt(&ctx(action_id), action)
+                .await
+                .unwrap()
+                .expect("账本已有行必须命中");
+            assert_eq!(&got, expected, "{action_id} 必须原样取回");
+        }
+        assert_eq!(fake.wire(), wire_before, "只读查询绝不产生出站帧");
+        assert_eq!(row_count(&store), rows_before, "查询绝不新增行");
+        assert_eq!(audits(&store).len(), audits_before, "查询绝不新增审计");
+
+        // 同 id 换载荷 → 冲突（绝不返回旧回执）。
+        let err = sender
+            .existing_receipt(&ctx("a-accepted"), &send_action("换了正文"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, codes::ACTION_PAYLOAD_CONFLICT);
+        // 跨设备同 id → 冲突（不泄漏别的设备的回执）。
+        let other_device = ActionContext {
+            action_id: "a-accepted".into(),
+            device_id: "phone-2".into(),
+            device_name: "iPad".into(),
+        };
+        let err = sender
+            .existing_receipt(&other_device, &accepted_action)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, codes::ACTION_PAYLOAD_CONFLICT);
+        // 换代际同 id → 冲突（绝不返回旧代际回执）。
+        let err = sender
+            .existing_receipt(&ctx("a-accepted"), &send_action_at(GEN + 1, "已经被接下"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, codes::ACTION_PAYLOAD_CONFLICT);
+        assert_eq!(fake.wire(), wire_before, "冲突判定同样零帧");
+        assert_eq!(row_count(&store), rows_before);
+        assert_eq!(audits(&store).len(), audits_before);
     }
 
     /// Hub 盖好的精确目标：公开代际（Hub）用于校验/落账，桥投影代际只给桥内部。

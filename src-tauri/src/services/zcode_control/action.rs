@@ -293,17 +293,39 @@ impl ActionStore {
         kind: &str,
         payload_hash: &str,
     ) -> ZResult<Option<ActionReceipt>> {
+        self.existing_receipt_for(
+            ctx,
+            &target.session_id,
+            target.generation,
+            kind,
+            payload_hash,
+        )
+    }
+
+    /// 按**显式身份**查询既有回执（不要求已绑定 `BoundTarget`）：连接/绑定之前也
+    /// 能只读查询，判定口径与 [`Self::existing_receipt`] 完全一致。
+    ///
+    /// 语义：同 actionId 同 device/session/generation/kind/payload_hash → `Some(既有
+    /// 回执)`；任一不同（含跨设备同 id、换代际）→ `action_payload_conflict`；无行 →
+    /// `None`。纯读：零写行、零审计。
+    pub fn existing_receipt_for(
+        &self,
+        ctx: &ActionContext,
+        session_id: &str,
+        generation: u64,
+        kind: &str,
+        payload_hash: &str,
+    ) -> ZResult<Option<ActionReceipt>> {
         if kind.is_empty() {
             return Err(ZcodeError::of(codes::INVALID_ACTION));
         }
-        let session_id = target.session_id.clone();
         self.store.with(|conn| {
             let Some(existing) = get_row(conn, &ctx.action_id).map_err(db_err)? else {
                 return Ok(None);
             };
             let same = existing.device_id == ctx.device_id
                 && existing.session_id == session_id
-                && existing.generation == target.generation
+                && existing.generation == generation
                 && existing.kind == kind
                 && existing.payload_hash == payload_hash;
             if !same {
@@ -623,6 +645,89 @@ mod tests {
         }
         assert_eq!(row_count(&store), 1);
         assert_eq!(audits(&store).len(), 1, "幂等命中不得重复审计");
+    }
+
+    /// 新查询入口（按显式身份，连接/绑定之前可用）与既有入口（按绑定目标）同口径：
+    /// 只读命中 / 冲突 / 无行三态一致，且查询本身零新行、零新审计。
+    #[test]
+    fn existing_receipt_by_identity_matches_bound_target_semantics() {
+        let store = DeviceStore::memory();
+        let actions = ActionStore::new(store.clone());
+        let me = ctx("a-1", "dev-1");
+
+        // 无行：两个入口都回 None，零行零审计（查询不是写）。
+        assert!(actions
+            .existing_receipt(&me, &target(), "send", "hash-1")
+            .unwrap()
+            .is_none());
+        assert!(actions
+            .existing_receipt_for(&me, SESSION, GEN, "send", "hash-1")
+            .unwrap()
+            .is_none());
+        assert_eq!(row_count(&store), 0);
+        assert_eq!(audits(&store).len(), 0);
+
+        actions
+            .reserve(&me, &target(), "hash-1", "send chars=2")
+            .unwrap();
+        let bound = actions
+            .existing_receipt(&me, &target(), "send", "hash-1")
+            .unwrap()
+            .expect("预留后必须命中");
+        let by_identity = actions
+            .existing_receipt_for(&me, SESSION, GEN, "send", "hash-1")
+            .unwrap()
+            .expect("预留后必须命中（显式身份）");
+        assert_eq!(bound, by_identity, "两个入口必须返回同一既有回执");
+
+        // 载荷/代际/设备任一不同 → 冲突（既有行不被改写）。
+        assert_eq!(
+            actions
+                .existing_receipt(&me, &target(), "send", "hash-2")
+                .unwrap_err()
+                .code,
+            "action_payload_conflict"
+        );
+        assert_eq!(
+            actions
+                .existing_receipt_for(&me, SESSION, GEN, "send", "hash-2")
+                .unwrap_err()
+                .code,
+            "action_payload_conflict"
+        );
+        assert_eq!(
+            actions
+                .existing_receipt_for(&me, SESSION, GEN + 1, "send", "hash-1")
+                .unwrap_err()
+                .code,
+            "action_payload_conflict"
+        );
+        assert_eq!(
+            actions
+                .existing_receipt_for(&ctx("a-1", "dev-2"), SESSION, GEN, "send", "hash-1")
+                .unwrap_err()
+                .code,
+            "action_payload_conflict"
+        );
+        assert_eq!(
+            actions
+                .existing_receipt_for(&me, SESSION, GEN, "", "hash-1")
+                .unwrap_err()
+                .code,
+            "invalid_action"
+        );
+        // 跨会话（绑定入口）同样是冲突，而不是 None。
+        let mut other = target();
+        other.session_id = "sess_other_0123456789abcdef01234567".to_string();
+        assert_eq!(
+            actions
+                .existing_receipt(&me, &other, "send", "hash-1")
+                .unwrap_err()
+                .code,
+            "action_payload_conflict"
+        );
+        assert_eq!(row_count(&store), 1, "查询/冲突都不得新增行");
+        assert_eq!(audits(&store).len(), 1, "查询/冲突都不得新增审计");
     }
 
     /// 同 id 换载荷：action_payload_conflict，既有行不被覆盖。

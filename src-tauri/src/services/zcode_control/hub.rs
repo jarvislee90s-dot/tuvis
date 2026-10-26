@@ -89,6 +89,23 @@ pub trait HubBackend: Send + Sync {
         action: &'a ControlAction,
     ) -> BoxFuture<'a, ZResult<ActionReceipt>>;
 
+    /// 只读查询持久账本里的既有回执（**先于**连接/能力闸与目标绑定）。
+    ///
+    /// 语义与派发路径的幂等命中一致：同 actionId 同 device/session/generation/kind/
+    /// payload_hash → 既有回执；任一不同 → `action_payload_conflict`；无行 → `None`。
+    /// 实现必须是**纯读**：零出站帧、零新行、零审计。
+    ///
+    /// 默认 `Ok(None)`：没有持久账本的后端与既有测试 fake 零改动；生产
+    /// [`PartsBackend`] 委托 `CommandSender::existing_receipt`。
+    fn existing_receipt<'a>(
+        &'a self,
+        ctx: &'a ActionContext,
+        action: &'a ControlAction,
+    ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+        let _ = (ctx, action);
+        Box::pin(async { Ok(None) })
+    }
+
     /// 带**验收许可**的派发（T8.2 debug 证据构建专用；普通构建永远不会传入非空
     /// `permits`）。默认实现忽略许可并退回 [`Self::execute`]，保持既有 fake 零改动。
     ///
@@ -243,6 +260,14 @@ impl HubBackend for PartsBackend {
         action: &'a ControlAction,
     ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
         Box::pin(async move { self.sender.execute(ctx, target, action).await })
+    }
+
+    fn existing_receipt<'a>(
+        &'a self,
+        ctx: &'a ActionContext,
+        action: &'a ControlAction,
+    ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+        Box::pin(async move { self.sender.existing_receipt(ctx, action).await })
     }
 
     fn execute_with_permits<'a>(
@@ -993,17 +1018,25 @@ impl ZcodeHub {
         Ok(view)
     }
 
-    /// 执行一次控制动作：代际 + 能力闸 + 目标绑定全部通过才派发。
+    /// 执行一次控制动作：代际 + 持久幂等 → 连接门 + 能力闸 + 目标绑定通过才派发。
     pub async fn execute(
         &self,
         ctx: ActionContext,
         action: ControlAction,
     ) -> ZResult<ActionReceipt> {
-        // 代际判定先于状态门：旧代际动作即便当前未就绪也必须回 `stale_generation`
-        // （调用方据此丢弃本地卡面，而不是误以为「重连后还能重试」）。
+        // 代际判定先于一切：旧代际动作即便当前未就绪也必须回 `stale_generation`
+        // （调用方据此丢弃本地卡面，而不是误以为「重连后还能重试」），也绝不
+        // 从账本取回旧代际回执。
         let generation = self.lock().generation;
         if action.generation() != generation {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        // 持久幂等查询紧随代际判定、**先于**连接门/能力闸/bind：断开、未配对或
+        // 能力关闭后重试同一 actionId，仍取回既有 accepted/confirmed/unknown 回执；
+        // 冲突（同 id 换载荷/跨设备）也在此直接上抛，而不是误报 needs_auth/offline。
+        // 重放命中不 emit 新的 Action 事件（否则手机会看到重复回执）。
+        if let Some(existing) = self.backend.existing_receipt(&ctx, &action).await? {
+            return Ok(existing);
         }
         self.control_generation()?;
         // 能力闸：返回本次动作凭**验收许可**放宽的能力名（普通构建恒为空）。
@@ -1223,6 +1256,10 @@ mod tests {
         /// 在途 reset 的闸（配置变更窗口测试用）。
         reset_gate: Mutex<Option<Arc<Notify>>>,
         connect_result: Mutex<Option<ZResult<ConnectionView>>>,
+        /// 持久幂等查询的替身结果（`None` = 无既有回执，即默认语义）。
+        existing_result: Mutex<Option<ZResult<Option<ActionReceipt>>>>,
+        /// 持久幂等查询被调用次数（证明查询先于连接/许可闸）。
+        existing_calls: AtomicUsize,
         bind_generation: AtomicU64,
         /// 每次 connect 收到的目标（`sid` + `mid`），用于证明只从保存链接解析。
         routes: Mutex<Vec<(String, Option<String>)>>,
@@ -1244,6 +1281,11 @@ mod tests {
 
         fn set_connect(&self, result: ZResult<ConnectionView>) {
             self.connect_result.lock().unwrap().replace(result);
+        }
+
+        /// 设定持久幂等查询的应答（`Some(Err(..))` = 冲突；缺省 = 无既有回执）。
+        fn set_existing(&self, result: ZResult<Option<ActionReceipt>>) {
+            self.existing_result.lock().unwrap().replace(result);
         }
     }
 
@@ -1337,6 +1379,21 @@ mod tests {
                 reason_code: None,
             };
             Box::pin(async move { Ok(receipt) })
+        }
+
+        fn existing_receipt<'a>(
+            &'a self,
+            _ctx: &'a ActionContext,
+            _action: &'a ControlAction,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            self.existing_calls.fetch_add(1, Ordering::SeqCst);
+            let result = self
+                .existing_result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(Ok(None));
+            Box::pin(async move { result })
         }
 
         fn policy(&self) -> CapabilityView {
@@ -1551,6 +1608,100 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.state, ActionState::Accepted);
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 未授权/断开（needs_auth）时重试同一 actionId：持久账本查询先于连接/许可闸，
+    /// 直接回既有 accepted 回执——零 bind、零 execute，也不重复广播 Action 事件。
+    #[tokio::test]
+    async fn replay_returns_stored_receipt_before_needs_auth() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = ZcodeHub::with_parts(stored(URL), fake.clone(), send_policy());
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::NeedsAuth,
+            "前置：已保存链接但未授权"
+        );
+        let generation = hub.connection().generation;
+        let stored_receipt = ActionReceipt {
+            action_id: "synthetic-replay-accepted".into(),
+            session_id: "sess_synthetic0000".into(),
+            generation,
+            state: ActionState::Accepted,
+            reason_code: None,
+        };
+        fake.set_existing(Ok(Some(stored_receipt.clone())));
+        let mut events = hub.subscribe();
+
+        let got = hub
+            .execute(ctx("synthetic-replay-accepted"), send_action(generation))
+            .await
+            .expect("既有回执重放不得被 needs_auth 拦下");
+        assert_eq!(got, stored_receipt, "必须原样返回既定终态回执");
+        assert_eq!(
+            fake.existing_calls.load(Ordering::SeqCst),
+            1,
+            "必须先查持久账本"
+        );
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 0, "重放零绑定");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0, "重放零派发");
+        // 重放不得广播新的 Action 事件（否则手机会看到重复回执）。
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(
+                event.kind,
+                ControlEventKind::Action,
+                "重放不得 emit 新 Action 事件"
+            );
+        }
+    }
+
+    /// 账本判定载荷冲突：错误必须在连接闸之前上抛（同 id 换载荷不是「未授权」），
+    /// 且零 bind/零 execute。
+    #[tokio::test]
+    async fn replay_conflict_is_returned_before_needs_auth() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = ZcodeHub::with_parts(stored(URL), fake.clone(), send_policy());
+        let generation = hub.connection().generation;
+        fake.set_existing(Err(ZcodeError::of(codes::ACTION_PAYLOAD_CONFLICT)));
+
+        let err = hub
+            .execute(ctx("synthetic-replay-conflict"), send_action(generation))
+            .await
+            .unwrap_err();
+        assert!(
+            err.is(codes::ACTION_PAYLOAD_CONFLICT),
+            "必须先回 action_payload_conflict 而不是 needs_auth: {err:?}"
+        );
+        assert_eq!(fake.existing_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 代际判定仍先于持久查询：旧代际动作即使账本有回执也不得取回（零查询）。
+    #[tokio::test]
+    async fn stale_generation_is_rejected_before_existing_receipt() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = ZcodeHub::with_parts(stored(URL), fake.clone(), send_policy());
+        let generation = hub.connection().generation;
+        fake.set_existing(Ok(Some(ActionReceipt {
+            action_id: "synthetic-replay-stale".into(),
+            session_id: "sess_synthetic0000".into(),
+            generation,
+            state: ActionState::Accepted,
+            reason_code: None,
+        })));
+
+        let err = hub
+            .execute(ctx("synthetic-replay-stale"), send_action(generation + 1))
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::STALE_GENERATION));
+        assert_eq!(
+            fake.existing_calls.load(Ordering::SeqCst),
+            0,
+            "旧代际不得查询/返回账本回执"
+        );
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
     }
 
     /// 公开代际唯一：SessionView/ActionReceipt 只暴露 Hub 代际（投影代际不外泄）。
