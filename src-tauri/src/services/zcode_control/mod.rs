@@ -59,6 +59,7 @@ pub use relay::{
 pub use types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, AnswerEntry, BoundTarget,
     CapabilityFlag, CapabilityView, CommandPort, ConnectionState, ConnectionView, ControlAction,
-    ControlView, ModelChoice, PendingKind, PendingView, PermissionOptionView, QuestionOption,
-    QuestionView, RelaySink, SelectionView, SessionView, TargetKey, ZResult, ZcodeError,
+    ControlView, ModelChoice, PendingKind, PendingPort, PendingView, PermissionOptionView,
+    QuestionOption, QuestionView, RelaySink, SelectionView, SessionView, TargetKey, ZResult,
+    ZcodeError, PENDING_CLEARED_POLL,
 };

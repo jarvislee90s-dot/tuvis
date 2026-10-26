@@ -418,6 +418,65 @@ pub trait CommandPort: Send + Sync {
     ) -> BoxFuture<'a, ZResult<Value>>;
 }
 
+// ---------------------------------------------------------------------------
+// 端口：pending 授权与自动结束计时（T4.1 Slice B1 裁决的最小抽象）
+// ---------------------------------------------------------------------------
+
+/// pending 卡授权与 snooze 的最小能力（答案映射仍是纯函数，见 `pending::build_user_answer`）。
+///
+/// 生产实现 = [`BridgeManager`](super::bridge::BridgeManager)：授权在状态锁内对**精确
+/// 目标**的 pending 册做（同会话 + 同代际 + 卡仍在册 + 未本地消费/在途），并原子置本地
+/// in-flight；`snooze` 只发**恰一帧**官方 `snoozeInteractionAutoResolution`
+/// `{interactionId}`，ACK 窗由调用方给出。命令层因此拿不到 relay/配置入口。
+///
+/// # 语义（生产实现保证）
+///
+/// - `authorize_pending`：只证明「本进程尚未提交这张卡」，**不**代表宿主已收口；
+///   错会话/错代际/卡已撤/重复提交 → `stale_pending`（零副作用）；投影不新鲜 →
+///   `not_ready`（零副作用）。
+/// - `snooze`：ACK `accepted`/`duplicate` → `Ok`；`noop` → `Err(stale_pending)`
+///   （宿主不需要暂停计时了，不是成功）；`rejected` → `Err(invalid_action)`；
+///   应答窗超窗（`not_ready`，与就绪闸不可区分）→ `Err(unknown)`；绝不重发。
+/// - `host_pending_revision` / `host_has_pending`：宿主观察代数与宿主集合
+///   （**与本地消费/在途无关**；本地消费不等于宿主撤卡）。多会话管理器下按当前
+///   绑定会话的 pending 册聚合（代数求和）：同一绑定生命周期内每次宿主整体替换 +1
+///   且不减；换代/失效会清空册，调用方必须**重取基线**后才等终态。
+/// - `wait_host_cleared`：有界轮询，**只有**代数前进**且**该 id 不在宿主集合时才
+///   `true`；超时 `false`。绝不持锁 await，绝不忙等（≤ [`PENDING_CLEARED_POLL`]）。
+pub trait PendingPort: Send + Sync {
+    /// 精确目标上的应答授权（返回卡的原值克隆；不触碰宿主集合）。
+    fn authorize_pending<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        interaction_id: &'a str,
+    ) -> BoxFuture<'a, ZResult<PendingView>>;
+
+    /// 暂停问答卡自动结束计时（恰一帧；`timeout` 是本次 ACK 窗）。
+    fn snooze<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        interaction_id: &'a str,
+        timeout: Duration,
+    ) -> BoxFuture<'a, ZResult<()>>;
+
+    /// 宿主 pending 集合的观察代数（每次整体替换 +1；同一绑定生命周期内不减）。
+    fn host_pending_revision(&self) -> u64;
+
+    /// 宿主最近一帧里是否仍有这张卡（与本地消费/在途无关）。
+    fn host_has_pending(&self, interaction_id: &str) -> bool;
+
+    /// 等宿主撤卡终态：代数前进**且**该 id 不在宿主集合 → `true`；超时 → `false`。
+    fn wait_host_cleared<'a>(
+        &'a self,
+        interaction_id: &'a str,
+        baseline_revision: u64,
+        timeout: Duration,
+    ) -> BoxFuture<'a, bool>;
+}
+
+/// `wait_host_cleared` 的轮询上限（50ms；有界、不忙等）。
+pub const PENDING_CLEARED_POLL: Duration = Duration::from_millis(50);
+
 /// pending 卡种类（官方 `PendingInteraction.kind` 三元）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
