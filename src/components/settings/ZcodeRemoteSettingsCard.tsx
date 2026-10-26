@@ -13,7 +13,9 @@
 //   回填到同一张卡。链接状态由本卡持有，不上传到别处。
 // - 失效证据分层里「仅打开外部页看到 Not Found」这一档：外跳后 Tuvis 读不到那个页面，
 //   因此外跳**不改变**卡上任何状态，也不自动删设置（用户可手工替换）。
-import { useCallback, useEffect, useState } from "react";
+// - 连接态挂载期间按 1.5s 轮询后端 `zcode_control_status`（回到前台也即时刷新），
+//   只更新连接显示/按钮可用性；不碰配置、草稿、保存与错误态，读取失败仍按「未知」。
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -44,6 +46,11 @@ const HINT_ID = `${INPUT_ID}-hint`;
 const ERROR_ID = `${INPUT_ID}-error`;
 const TUTORIAL_ID = "zcode-remote-tutorial";
 const PROVIDER_ID = "zcode-remote-provider";
+
+// 连接态轮询间隔：设置卡挂载期间跟随 Hub 视图（手机/远端可异步把连接推进成
+// paired/offline/conflict）。1.5s 取「变化够快看见、IPC 又不过载」的折中；
+// 事件驱动的手机端 SSE 是另一条通道，本卡只读 status，不替代、不写状态。
+const ZCODE_STATUS_POLL_MS = 1500;
 
 // 官方授权通道（T7.2）：BigModel 已实跑回环授权；ZAI 目前只有官方源码/模拟证据，
 // **没有** live 实跑证据，因此选项禁用且授权按钮一律不开闸（证据门，不是偏好）。
@@ -88,7 +95,17 @@ const CONNECTION_REASON_KEYS: Record<string, string> = {
   unknown: "settings.remote.zcode.reasonUnknown",
 };
 
-export function ZcodeRemoteSettingsCard() {
+interface ZcodeRemoteSettingsCardProps {
+  /**
+   * 连接态轮询间隔（毫秒），默认 1500。只影响挂载期 `zcode_control_status` 的读取节奏：
+   * 测试可注入长窗口（避免轮询干扰精确计数）或短窗口（亚秒验证轮询）。
+   */
+  statusPollMs?: number;
+}
+
+export function ZcodeRemoteSettingsCard({
+  statusPollMs = ZCODE_STATUS_POLL_MS,
+}: ZcodeRemoteSettingsCardProps = {}) {
   const { t } = useAppTranslation();
   // 展开态 = 页内临时状态（不落库、不进 i18n、不参与任何判定）
   const [expanded, setExpanded] = useState(false);
@@ -113,21 +130,61 @@ export function ZcodeRemoteSettingsCard() {
   );
   // 控制动作失败的就地错误（已本地化；不弹 toast 重复播报）
   const [controlError, setControlError] = useState<string | null>(null);
+  /** status 读取在途守卫 + trailing 合并：在途期间的新请求只排一次，读完后补一发。 */
+  const statusReadInFlightRef = useRef(false);
+  const statusReadQueuedRef = useRef(false);
 
   // 连接态唯一来源 = 后端 `zcode_control_status`（同 Hub 视图，桌面与手机一致）。
   // 链接已保存**从不**被推导成已配对；读取失败按「未知」显示，不猜。
+  // 只写 connection：绝不碰 config / draft / saving / error（草稿与保存面不受轮询影响）。
   const refreshConnection = useCallback(async () => {
+    if (statusReadInFlightRef.current) {
+      // 在途：不能丢调用——persist 保存成功后的强制刷新、runControl 失败后的权威
+      // 重读都必须落地。合并成一次 queued，当前读取结束后补一发（不叠发 IPC）。
+      statusReadQueuedRef.current = true;
+      return;
+    }
+    statusReadInFlightRef.current = true;
     try {
-      setConnection(parseConnection(await invoke<unknown>("zcode_control_status")));
-    } catch (e) {
-      console.error("zcode control status read failed:", e);
-      setConnection(null);
+      do {
+        // 进入本轮即消费 queued：读取期间再来的请求会重新置 true，从而最多再补一轮。
+        statusReadQueuedRef.current = false;
+        try {
+          setConnection(parseConnection(await invoke<unknown>("zcode_control_status")));
+        } catch (e) {
+          console.error("zcode control status read failed:", e);
+          setConnection(null);
+        }
+      } while (statusReadQueuedRef.current);
+    } finally {
+      statusReadInFlightRef.current = false;
+      statusReadQueuedRef.current = false;
     }
   }, []);
 
   useEffect(() => {
     void refreshConnection();
   }, [refreshConnection]);
+
+  // 挂载期间轮询 + 回到前台立即刷新：连接态由 Hub/手机侧异步推进，卡片不能只认首拍
+  // （否则卡片文案与「重连」按钮可用性会一直冻在旧态）。卸载清理定时器与监听。
+  useEffect(() => {
+    const read = () => {
+      void refreshConnection();
+    };
+    const timer = window.setInterval(read, statusPollMs);
+    const onFocus = () => read();
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") read();
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [refreshConnection, statusPollMs]);
 
   const providerVerified = provider === PROVIDER_BIGMODEL || ZAI_LIVE_VERIFIED;
   const connectionState: ConnectionState = connection?.state ?? "unknown";

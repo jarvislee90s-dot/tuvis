@@ -49,8 +49,9 @@ use super::codec::{
 use super::projection::{Projection, CONVERSATION_TOPIC_PREFIX};
 use super::selection::parse_selection_view;
 use super::types::{
-    codes, BoundTarget, CommandPort, HostBuildProbe, HostEvidence, PendingPort, PendingView,
-    RelaySink, SelectionPort, SelectionView, SessionView, StopPort, TargetKey, ZResult, ZcodeError,
+    codes, BoundTarget, CommandPort, HostBuildProbe, HostEvidence, PendingKind, PendingPort,
+    PendingView, RelaySink, SelectionPort, SelectionView, SessionView, StopPort, TargetKey,
+    ZResult, ZcodeError,
 };
 
 /// agent 服务 channel（`channels.ts:114`）。
@@ -1159,6 +1160,49 @@ impl BridgeManager {
     }
 }
 
+/// 按**宿主 pending 卡**的题型推导本次应答所需的全部能力名。
+///
+/// 稳定顺序固定为 `single_select` → `multi_select` → `free_text`（去重）：
+/// 单选/多选按每题的 `multi_select` 归类（客户端选了几个值与此无关），
+/// `free_text_allowed` 再叠加自由文本。只有宿主明确建模的问答/审批卡能给出能力名；
+/// 其他子类（workspace hook 复核等）一律 `needs_evidence`，绝不按客户端自报猜测。
+fn required_capabilities_for_card(card: &PendingView) -> ZResult<Vec<&'static str>> {
+    match card.kind {
+        PendingKind::Permission => Ok(vec!["approval_reply"]),
+        PendingKind::UserInput => {
+            // 官方 schema 要求问答至少一题；缺题形状无法推导所需能力 → 保守拒绝。
+            if card.questions.is_empty() {
+                return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
+            }
+            let mut single = false;
+            let mut multi = false;
+            let mut free_text = false;
+            for question in &card.questions {
+                if question.multi_select {
+                    multi = true;
+                } else {
+                    single = true;
+                }
+                if question.free_text_allowed {
+                    free_text = true;
+                }
+            }
+            let mut required = Vec::with_capacity(3);
+            if single {
+                required.push("single_select");
+            }
+            if multi {
+                required.push("multi_select");
+            }
+            if free_text {
+                required.push("free_text");
+            }
+            Ok(required)
+        }
+        PendingKind::WorkspaceHookReview => Err(ZcodeError::of(codes::NEEDS_EVIDENCE)),
+    }
+}
+
 impl PendingPort for BridgeManager {
     /// 精确目标授权：同会话 + 同代际 + 同 workspace 绑定 + 卡仍在册 + 未消费/在途。
     ///
@@ -1189,6 +1233,39 @@ impl PendingPort for BridgeManager {
                 .projection
                 .pending_book_mut()
                 .authorize(target, interaction_id)
+        })
+    }
+
+    /// 只读推导**精确目标**上宿主卡要求的全部能力（不置在途、不消费、不发帧）。
+    ///
+    /// 目标校验与 [`Self::authorize_pending`] 同序同码：错代际/错绑定 → `stale`、
+    /// 未绑定 → `no_session`、投影不新鲜 → `not_ready`、卡不在册 → `stale_pending`。
+    /// 差别只在**不**改写任何状态：本方法可在能力闸判定阶段反复调用。
+    fn required_capabilities<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        interaction_id: &'a str,
+    ) -> futures::future::BoxFuture<'a, ZResult<Vec<&'static str>>> {
+        Box::pin(async move {
+            let inner = lock(&self.shared.state);
+            if inner.generation != target.bridge_generation() {
+                return Err(stale());
+            }
+            let Some(entry) = inner.sessions.get(&target.session_id) else {
+                return Err(ZcodeError::of(codes::NO_SESSION));
+            };
+            if !entry.target.same_binding(target) {
+                return Err(stale());
+            }
+            if !entry.projection.is_ready() {
+                return Err(ZcodeError::of(codes::NOT_READY));
+            }
+            let card = entry
+                .projection
+                .pending_book()
+                .pending(interaction_id)
+                .ok_or_else(|| ZcodeError::of(codes::STALE_PENDING))?;
+            required_capabilities_for_card(card)
         })
     }
 
@@ -5817,6 +5894,69 @@ mod tests {
         }
     }
 
+    /// 多选题卡（`multiSelect=true`，`freeText=false`）。
+    fn multi_select_card(interaction_id: &str) -> Value {
+        json!({
+            "interactionId": interaction_id,
+            "kind": "userInput",
+            "anchorRowId": 32,
+            "createdAt": 1_700_000_000_600u64,
+            "payload": {
+                "kind": "userInput",
+                "prompt": "synthetic: pick many",
+                "freeText": false,
+                "toolCallId": "call_synthetic_multi",
+                "toolName": "AskUserQuestion",
+                "schema": {"interaction": "AskUserQuestion"},
+                "questions": [{
+                    "question": "Which colors?",
+                    "header": "Colors",
+                    "multiSelect": true,
+                    "options": [
+                        {"value": "Red", "label": "Red"},
+                        {"value": "Blue", "label": "Blue"}
+                    ]
+                }]
+            }
+        })
+    }
+
+    /// 混合题卡：单选题 + 宿主允许自由文本（`freeText=true`）。
+    fn mixed_free_text_card(interaction_id: &str) -> Value {
+        json!({
+            "interactionId": interaction_id,
+            "kind": "userInput",
+            "anchorRowId": 33,
+            "createdAt": 1_700_000_000_700u64,
+            "payload": {
+                "kind": "userInput",
+                "prompt": "synthetic: pick one or type",
+                "freeText": true,
+                "toolCallId": "call_synthetic_mixed",
+                "toolName": "AskUserQuestion",
+                "schema": {"interaction": "AskUserQuestion"},
+                "questions": [
+                    {
+                        "question": "Which color?",
+                        "header": "Color",
+                        "options": [
+                            {"value": "Red", "label": "Red"},
+                            {"value": "Blue", "label": "Blue"}
+                        ]
+                    },
+                    {
+                        "question": "Sizes?",
+                        "header": "Size",
+                        "options": [
+                            {"value": "S", "label": "S"},
+                            {"value": "M", "label": "M"}
+                        ]
+                    }
+                ]
+            }
+        })
+    }
+
     /// 注入一帧宿主 `snapshot`（pending 集合整体替换 → 观察代数 +1）；
     /// 返回本次变化的会话视图。
     async fn push_pending_snapshot(peer: &Peer, cards: Vec<Value>) -> Vec<SessionView> {
@@ -5916,6 +6056,97 @@ mod tests {
             manager.host_has_pending(&target, PENDING),
             "stale attempts must not clear the host set"
         );
+    }
+
+    /// 宿主卡题型推导**全部**所需能力；读取只读（不置本地在途）。
+    #[tokio::test]
+    async fn required_capabilities_follow_host_card_types() {
+        const MULTI: &str = "pi-synthetic-caps-multi";
+        const MIXED: &str = "pi-synthetic-caps-mixed";
+        const PERMISSION: &str = "pi-synthetic-caps-permission";
+
+        // 多选题卡 → 只需 multi_select（与客户端勾选数量无关）。
+        let (manager, _peer) = manager_with(pending_config(vec![multi_select_card(MULTI)])).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        assert_eq!(
+            manager
+                .required_capabilities(&target, MULTI)
+                .await
+                .expect("host card caps"),
+            vec!["multi_select"]
+        );
+        // 只读：同一张卡随后仍可正常授权（证明没有偷偷置 in-flight）。
+        manager
+            .authorize_pending(&target, MULTI)
+            .await
+            .expect("required_capabilities must not set local in-flight");
+
+        // 混合单选 + 自由文本 → 两项都要，稳定顺序 single_select、free_text。
+        let (manager, _peer) =
+            manager_with(pending_config(vec![mixed_free_text_card(MIXED)])).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        assert_eq!(
+            manager
+                .required_capabilities(&target, MIXED)
+                .await
+                .expect("host card caps"),
+            vec!["single_select", "free_text"]
+        );
+
+        // 权限审批卡 → approval_reply（与问答题型无关）。
+        let (manager, _peer) =
+            manager_with(pending_config(vec![permission_card(PERMISSION)])).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        assert_eq!(
+            manager
+                .required_capabilities(&target, PERMISSION)
+                .await
+                .expect("host card caps"),
+            vec!["approval_reply"]
+        );
+    }
+
+    /// 缺卡/错代际/未绑定/投影不新鲜：能力推导按 `authorize_pending` 同语义报错，
+    /// 绝不按「没有卡」放行成空能力集。
+    #[tokio::test]
+    async fn required_capabilities_reject_missing_stale_or_unready() {
+        const PENDING: &str = "pi-synthetic-caps-errors";
+        let (manager, _peer) =
+            manager_with(pending_config(vec![ask_user_question_card(PENDING)])).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+
+        let missing = manager
+            .required_capabilities(&target, "pi-synthetic-caps-absent")
+            .await
+            .expect_err("missing card");
+        assert!(missing.is(codes::STALE_PENDING));
+
+        let mut stale_generation = target.clone();
+        stale_generation.generation += 1;
+        assert!(manager
+            .required_capabilities(&stale_generation, PENDING)
+            .await
+            .expect_err("generation moved on")
+            .is(codes::STALE_GENERATION));
+
+        let mut sibling = target.clone();
+        sibling.session_id = SESSION_B.to_owned();
+        assert!(manager
+            .required_capabilities(&sibling, PENDING)
+            .await
+            .expect_err("unbound sibling session")
+            .is(codes::NO_SESSION));
+
+        // 无会话快照 = 投影不新鲜：不得返回任何能力名（不猜题型）。
+        let mut unready_config = pending_config(Vec::new());
+        unready_config.conversation_snapshot = None;
+        let (unready_manager, _peer) = manager_with(unready_config).await;
+        let unready_target = unready_manager.bind(&key(SESSION_A)).await.expect("bind");
+        assert!(unready_manager
+            .required_capabilities(&unready_target, PENDING)
+            .await
+            .expect_err("unready projection")
+            .is(codes::NOT_READY));
     }
 
     /// snooze 恰一帧官方 `snoozeInteractionAutoResolution{interactionId}`；ACK 映射固定。
