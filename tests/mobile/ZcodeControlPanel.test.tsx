@@ -36,7 +36,7 @@
 // 网络层替身：GET connection / GET session / POST actions 全部为合成 DTO；不读真实
 // 账号、DB 或链接。断言「零旧 session-send / 零无头通道」= 旧发送链从未被触碰。
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import enLocale from "@/i18n/locales/en.json";
@@ -1168,6 +1168,120 @@ describe("ZCode 控制面板：pending 卡提交防重与选中态", () => {
     fireEvent.click(first);
     await waitFor(() => expect(first).toHaveAttribute("aria-pressed", "true"));
     expect(second).toHaveAttribute("aria-pressed", "false");
+  });
+});
+
+describe("ZCode 控制面板：选项与自由文本互斥", () => {
+  /** 单题（freeTextAllowed）作答卡网络替身：POST 一律 accepted，便于断言上行载荷。 */
+  function installAnswerBackend(options: { sensitive?: boolean } = {}) {
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            pending: [
+              pendingView({
+                sensitive: options.sensitive ?? false,
+                questions: [questionView({ freeTextAllowed: true })],
+              }),
+            ],
+          })
+        );
+      }
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+  }
+
+  /** 已 POST 的 answer 动作（唯一允许的作答出口）里的 answers 数组。 */
+  function submittedAnswers() {
+    const answer = postedActions().find(({ action }) => action.kind === "answer");
+    expect(answer).toBeDefined();
+    return (answer!.action as Extract<ControlAction, { kind: "answer" }>).answers;
+  }
+
+  it("typing_free_text_replaces_selected_option", async () => {
+    // 先点选项再打字：自由文本 = 本题唯一答案，选中项必须被清掉（不能两类同时上行，
+    // 后端会以 invalid_answer 拒绝整次提交）。
+    installAnswerBackend();
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const card = await screen.findByTestId("zcode-pending-card");
+    const freeText = within(card).getByRole("textbox") as HTMLInputElement;
+    const option = screen.getByTestId("zcode-pending-option-0") as HTMLButtonElement;
+
+    fireEvent.click(option);
+    await waitFor(() => expect(option).toHaveAttribute("aria-pressed", "true"));
+    fireEvent.change(freeText, { target: { value: "自由补充说明" } });
+    // 自由文本生效后同题选中项立即失效（不是只在提交时兜底）
+    await waitFor(() => expect(option).toHaveAttribute("aria-pressed", "false"));
+
+    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(submittedAnswers()).toEqual([
+      {
+        questionText: "这个任务接下来要做什么？",
+        selectedValues: [],
+        freeText: "自由补充说明",
+      },
+    ]);
+  });
+
+  it("selecting_option_replaces_typed_free_text", async () => {
+    // 先打字再点选项：选中项 = 本题唯一答案，自由文本必须被清空（含可见输入框）。
+    installAnswerBackend();
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const card = await screen.findByTestId("zcode-pending-card");
+    const freeText = within(card).getByRole("textbox") as HTMLInputElement;
+    const option = screen.getByTestId("zcode-pending-option-1") as HTMLButtonElement;
+
+    fireEvent.change(freeText, { target: { value: "自由补充说明" } });
+    fireEvent.click(option);
+    await waitFor(() => expect(option).toHaveAttribute("aria-pressed", "true"));
+    await waitFor(() => expect(freeText.value).toBe(""));
+
+    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(submittedAnswers()).toEqual([
+      {
+        questionText: "这个任务接下来要做什么？",
+        selectedValues: ["opt-test-first"],
+        freeText: null,
+      },
+    ]);
+  });
+
+  it("sensitive_free_text_is_dropped_after_option_switch", async () => {
+    // 敏感输入后改点选项：敏感值既不能留在可见输入框，也不能随答案上行。
+    installAnswerBackend({ sensitive: true });
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const sensitive = (await screen.findByTestId(
+      "zcode-pending-sensitive-input"
+    )) as HTMLInputElement;
+    fireEvent.change(sensitive, { target: { value: "合成敏感答案" } });
+    expect(sensitive.value).toBe("合成敏感答案");
+
+    fireEvent.click(screen.getByTestId("zcode-pending-option-0"));
+    await waitFor(() =>
+      expect(screen.getByTestId("zcode-pending-option-0")).toHaveAttribute("aria-pressed", "true")
+    );
+    expect(sensitive.value).toBe("");
+
+    fireEvent.click(screen.getByTestId("zcode-pending-submit"));
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(submittedAnswers()).toEqual([
+      {
+        questionText: "这个任务接下来要做什么？",
+        selectedValues: ["opt-continue"],
+        freeText: null,
+      },
+    ]);
+    expect(JSON.stringify(postedActions()[0].action)).not.toContain("合成敏感答案");
   });
 });
 

@@ -226,10 +226,13 @@ function PendingCard({
         const value = pending.sensitive
           ? (sensitiveRef.current[question.questionText] ?? freeAnswers[question.questionText])
           : freeAnswers[question.questionText];
+        const text = value?.length ? value : null;
+        // 兜底：一次作答只允许一类——有文本就丢弃选中项，否则 freeText 恒 null。
+        // （交互层已互斥；这里防历史状态/异常路径把两类混着上送给宿主。）
         return {
           questionText: question.questionText,
-          selectedValues: picked[question.questionText] ?? [],
-          freeText: value?.length ? value : null,
+          selectedValues: text !== null ? [] : (picked[question.questionText] ?? []),
+          freeText: text,
         };
       })
       .filter((answer) => answer.selectedValues.length > 0 || answer.freeText !== null);
@@ -311,6 +314,15 @@ function PendingCard({
                             : [option.value];
                           return { ...prev, [question.questionText]: next };
                         });
+                        // 互斥：选项生效即清同题自由作答（敏感内存值一并删），
+                        // 否则提交会同时带 selectedValues 与 freeText（宿主要求二选一）。
+                        setFreeAnswers((prev) => {
+                          if (!(question.questionText in prev)) return prev;
+                          const next = { ...prev };
+                          delete next[question.questionText];
+                          return next;
+                        });
+                        delete sensitiveRef.current[question.questionText];
                         snoozeOnce();
                       }}
                       className={`rounded-lg border px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40 ${
@@ -334,8 +346,18 @@ function PendingCard({
                     if (blocked !== null || !capabilities.freeText.enabled) return;
                     const value = event.target.value;
                     // 敏感作答只存本次挂载的组件状态，不落任何草稿缓存。
-                    if (pending.sensitive) sensitiveRef.current[question.questionText] = value;
+                    if (pending.sensitive) {
+                      if (value.length > 0) sensitiveRef.current[question.questionText] = value;
+                      else delete sensitiveRef.current[question.questionText];
+                    }
                     setFreeAnswers((prev) => ({ ...prev, [question.questionText]: value }));
+                    // 互斥：一开始自由作答，同题已选中的选项即失效（只能提交一类）。
+                    setPicked((prev) => {
+                      if (!(question.questionText in prev)) return prev;
+                      const next = { ...prev };
+                      delete next[question.questionText];
+                      return next;
+                    });
                     snoozeOnce();
                   }}
                   onBlur={() => {
