@@ -72,6 +72,19 @@
 //! 且 id 消失才 `confirmed`；宿主 ACK 前撤卡 → `unknown`。终态收口与 `Answer`
 //! 共用 `finish_resolve`（一套回归用例护两侧）。绝不改会话权限模式、绝不用
 //! fullAccess、绝无 sendText 合成或重发。
+//!
+//! # 模型/思考档位（T6 Slice B）
+//!
+//! `Selection` 走「能力闸（`model`/`thought_level` 默认关闭 → `needs_evidence`，
+//! 零帧且不读目录）→ **新鲜**只读视图 + 官方 `model-selection.getView()` 目录 →
+//! [`build_selection_command`]（CAS 必带 `baseRevision`、禁 `baseLogEpoch`）→
+//! **写前才预留**（指纹覆盖 provider/model/thought/baseRevision）→ 恰一帧
+//! `type=switchModelConfig`（20s ACK 窗）」。陈旧 CAS（`status=stale` /
+//! `reasonCode=*staleRevision*`）→ `not_ready` 刷新提示，**绝不**自动换新 revision
+//! 重发；宿主显式拒绝 → `rejected`。ACK accepted/duplicate 只算 `accepted`，
+//! [`SELECTION_CONFIRM_TIMEOUT`] 内观察到 revision 前进**且** provider/model/thought
+//! 精确等于目标才 `confirmed`。产品保留用户选择，**绝不**回带恢复原值/原模型的写帧，
+//! 也绝无 sendText 或第二帧。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,10 +99,11 @@ use crate::services::codex_desktop_ipc::types::new_uuid;
 use super::action::{action_params, audit_summary, payload_hash, ActionStore, Reservation};
 use super::bridge::{BridgeManager, AGENT_CHANNEL};
 use super::pending::{build_permission_answer, build_user_answer};
+use super::selection::build_selection_command;
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, BoundTarget, CapabilityView,
-    CommandPort, ControlAction, PendingPort, SessionView, StopPort, StopRequest, ZResult,
-    ZcodeError,
+    CommandPort, ControlAction, PendingPort, SelectionPort, SessionView, StopPort, StopRequest,
+    ZResult, ZcodeError,
 };
 
 /// 官方发送方法名（`zcodeAgent.ts:937`、探针 `SendOnceLoop`）。
@@ -113,6 +127,11 @@ pub const ACK_TIMEOUT: Duration = Duration::from_secs(20);
 /// 应答 ACK 后等待宿主撤卡的观察窗（10s，探针 `INTERACTION_TERMINAL_WAIT_MS`）：
 /// 只有宿主 pending 代数前进且该 id 消失才升级 `confirmed`，否则停在 `accepted`。
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 模型/档位切换 ACK 后等待**新鲜**选择的观察窗（10s，生产计划 T6）：ACK
+/// accepted/duplicate 只算受理，只有 revision 前进且 provider/model/thought 精确
+/// 等于目标才升级 `confirmed`，否则停在 `accepted`。
+pub const SELECTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 打断时等待**已确认 control**（`activeWorks` 是数组）到达的有界窗（10s，生产计划
 /// T4.2 Step 3）：宿主 control 帧迟到/重订阅窗口内，用户点击最多等到窗前；
@@ -287,6 +306,40 @@ fn classify_ack(ack: &Value) -> (ActionState, Option<String>) {
     }
 }
 
+/// `switchModelConfig` 的 ACK 分类（官方 `CommandAck.status`；B4 源码口径）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionAck {
+    /// accepted/duplicate：只表示已受理（不等于已生效）。
+    Accepted,
+    /// CAS 陈旧（`status=stale` 或 `reasonCode` 含 `staleRevision`）：刷新后由用户重试。
+    Stale,
+    /// 宿主显式拒绝/失败（`rejected`/`failed`）。
+    Rejected,
+    /// 宿主 noop（如守卫不匹配；不是成功）。
+    Noop,
+    /// 无法解释的应答：保守未知。
+    Unknown,
+}
+
+/// `switchModelConfig` ACK 分类：陈旧 CAS 必须先于通用 rejected 识别（B4：CAS
+/// `stale` + `proto.staleRevision` 应带 `revisionAtDecision` 由调用方刷新重试）。
+fn classify_selection_ack(ack: &Value) -> SelectionAck {
+    let status = ack.get("status").and_then(Value::as_str).unwrap_or("");
+    let stale_reason = ack
+        .get("reasonCode")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| reason.to_ascii_lowercase().contains("stalerevision"));
+    if status == "stale" || stale_reason {
+        return SelectionAck::Stale;
+    }
+    match status {
+        "accepted" | "duplicate" => SelectionAck::Accepted,
+        "rejected" | "failed" => SelectionAck::Rejected,
+        "noop" => SelectionAck::Noop,
+        _ => SelectionAck::Unknown,
+    }
+}
+
 /// 端口错误分类。
 ///
 /// 只有桥**保证零写**的失败（写前绑定/编码拒绝）才是 `send_failed`；
@@ -324,8 +377,13 @@ pub struct CommandSender {
     /// stop 授权 / 宿主停止终态端口：`Stop` 必需，生产接线在 T7.1
     /// （`Arc<BridgeManager>`）；未装配时 Stop 一律 `not_ready`（零帧零行）。
     stop: Option<Arc<dyn StopPort>>,
+    /// 模型目录 / 选择生效端口：`Selection` 必需，生产接线在 T7.1
+    /// （`Arc<BridgeManager>`）；未装配时 Selection 一律 `not_ready`（零帧零行）。
+    selection: Option<Arc<dyn SelectionPort>>,
     /// 宿主撤卡观察窗（测试注入短窗；生产 [`CONFIRM_TIMEOUT`]）。
     confirm_timeout: Duration,
+    /// 选择生效观察窗（测试注入短窗；生产 [`SELECTION_CONFIRM_TIMEOUT`]）。
+    selection_confirm_timeout: Duration,
     /// 未知 control 的有界等待窗（测试注入短窗；生产 [`INITIAL_CONTROL_TIMEOUT`]）。
     initial_control_timeout: Duration,
     /// 未知 control 的轮询间隔（生产 [`INITIAL_CONTROL_POLL`]）。
@@ -359,7 +417,9 @@ impl CommandSender {
             ack_timeout,
             pending: None,
             stop: None,
+            selection: None,
             confirm_timeout: CONFIRM_TIMEOUT,
+            selection_confirm_timeout: SELECTION_CONFIRM_TIMEOUT,
             initial_control_timeout: INITIAL_CONTROL_TIMEOUT,
             initial_control_poll: INITIAL_CONTROL_POLL,
             capabilities: CapabilityView::default(),
@@ -387,6 +447,19 @@ impl CommandSender {
         self
     }
 
+    /// 装配模型目录 / 选择生效端口（生产 = `BridgeManager`，T7.1 接线）。
+    pub fn with_selection(mut self, selection: Arc<dyn SelectionPort>) -> Self {
+        self.selection = Some(selection);
+        self
+    }
+
+    /// 注入选择生效观察窗（测试专用：10s 用例不真等 10s）。
+    #[cfg(test)]
+    pub(crate) fn with_selection_confirm_timeout(mut self, timeout: Duration) -> Self {
+        self.selection_confirm_timeout = timeout;
+        self
+    }
+
     /// 注入宿主撤卡观察窗（测试专用：10s 用例不真等 10s）。
     #[cfg(test)]
     pub(crate) fn with_confirm_timeout(mut self, confirm_timeout: Duration) -> Self {
@@ -404,10 +477,10 @@ impl CommandSender {
 
     /// 执行一次控制动作。
     ///
-    /// 已接入 `Send`/`Answer`/`Snooze`/`Stop`/`Permission`；其余 `ControlAction`
-    /// 变体一律 `invalid_action` 且零帧零行（T6 接入，绝不伪造成功）。Answer/Snooze/
-    /// Stop/Permission 在未装配对应端口时一律 `not_ready`（零帧零行，生产接线在
-    /// T7.1）；`Permission` 还受 `capabilities.approval_reply` 闸（默认关闭）。
+    /// 已接入 `Send`/`Answer`/`Snooze`/`Stop`/`Permission`/`Selection`；其余变体一律
+    /// `invalid_action` 且零帧零行。Answer/Snooze/Stop/Permission/Selection 在未装配
+    /// 对应端口时一律 `not_ready`（零帧零行，生产接线在 T7.1）；`Permission` 与
+    /// `Selection` 各受能力闸（默认关闭 → `needs_evidence`）。
     pub async fn execute(
         &self,
         ctx: &ActionContext,
@@ -421,7 +494,7 @@ impl CommandSender {
             ControlAction::Snooze { .. } => self.execute_snooze(ctx, target, action).await,
             ControlAction::Stop { .. } => self.execute_stop(ctx, target, action).await,
             ControlAction::Permission { .. } => self.execute_permission(ctx, target, action).await,
-            _ => Err(invalid_action()),
+            ControlAction::Selection { .. } => self.execute_selection(ctx, target, action).await,
         }
     }
 
@@ -810,6 +883,155 @@ impl CommandSender {
         Ok(self
             .finish_resolve(target, pending.as_ref(), interaction_id, baseline, receipt)
             .await)
+    }
+
+    /// 模型/思考档位切换（T6）：能力闸 → 新鲜选择视图 → 纯构造器 → 写前预留 →
+    /// 恰一帧 `switchModelConfig`（CAS 只带 baseRevision）→ ACK 受理后等新鲜选择确认。
+    ///
+    /// 纪律：
+    /// - `model`/`thought_level` 闸默认关闭（`needs_evidence`，零帧零行、不读目录）；
+    ///   provider 只取会话视图，绝不接受客户端指定；
+    /// - 陈旧 CAS（宿主 `status=stale` / `reasonCode=*staleRevision*`）→ `not_ready`
+    ///   （刷新后由用户重试），**绝不**自动换新 revision 重发；宿主显式拒绝 →
+    ///   `rejected`；两者都不进入确认观察；
+    /// - ACK accepted/duplicate 只算 `accepted`；[`SELECTION_CONFIRM_TIMEOUT`] 内观察到
+    ///   revision 前进**且** provider/model/thought 精确等于目标才 `confirmed`；
+    /// - 产品保留用户选择：绝不回带「恢复原 thought/原模型」的第二帧。
+    async fn execute_selection(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<ActionReceipt> {
+        let ControlAction::Selection { model, thought, .. } = action else {
+            return Err(invalid_action());
+        };
+        // 证据闸：切换能力默认关闭，关闭时连目录都不读（零帧零行零审计）。
+        if !self.capabilities.model.enabled || !self.capabilities.thought_level.enabled {
+            return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
+        }
+        let Some(port) = self.selection.as_ref() else {
+            // 未装配选择端口：不能证明目录/新鲜视图在场，零帧零行。
+            return Err(ZcodeError::of(codes::NOT_READY));
+        };
+        // 写前新鲜视图 + 当前 provider 目录（端口只读；绝不接受客户端 provider）。
+        let (mut view, selection) = port.load(target).await?;
+        if view.session_id != target.session_id {
+            return Err(ZcodeError::of(codes::NO_SESSION));
+        }
+        if view.generation != target.generation {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        if !view.ready {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        }
+        let provider = selection.provider.clone();
+        // 选择视图随新鲜视图一起交给构造器：CAS revision 必填、模型/档位必须属于
+        // **当前 provider 目录**（空档位/他模型档位/未知值 → invalid_action）。
+        view.selection = Some(selection);
+        let command = build_selection_command(&view, model, thought)?;
+        let base_revision = view
+            .revision
+            .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
+        // 写即将发生：此时才预留。指纹覆盖 provider/model/thought/baseRevision，
+        // 不含正文（切换没有正文面）；审计摘要只记类别。
+        let params = serde_json::json!({
+            "provider": provider,
+            "model": model,
+            "thought": thought,
+            "baseRevision": base_revision,
+        });
+        let hash = payload_hash(
+            action.kind(),
+            &target.session_id,
+            target.generation,
+            &params,
+        )?;
+        let summary = audit_summary(action.kind(), &params);
+        match self
+            .actions
+            .reserve_with_kind(ctx, target, action.kind(), &hash, &summary)?
+        {
+            Reservation::Existing(receipt) => return Ok(receipt),
+            Reservation::New => {}
+        }
+        // 恰一帧：信封 = 纯构造器产物（type/payload/baseRevision，无 baseLogEpoch）
+        // + 可信上下文的 commandId/clientId/sessionId/issuedAt。
+        let mut envelope = command;
+        let Some(object) = envelope.as_object_mut() else {
+            return Err(invalid_action());
+        };
+        object.insert("commandId".to_owned(), Value::from(new_command_id()));
+        object.insert("clientId".to_owned(), Value::from(ctx.device_id.clone()));
+        object.insert(
+            "sessionId".to_owned(),
+            Value::from(target.session_id.clone()),
+        );
+        object.insert("issuedAt".to_owned(), Value::from(now_ms()));
+
+        let mut receipt = match self
+            .bridge
+            .call(
+                target,
+                AGENT_CHANNEL,
+                AGENT_SEND_COMMAND_METHOD,
+                vec![envelope],
+                self.ack_timeout,
+            )
+            .await
+        {
+            Err(error) => {
+                let (state, reason_code) = classify_port_error(&error);
+                self.make_receipt(ctx, target, state, reason_code)
+            }
+            Ok(ack) => match classify_selection_ack(&ack) {
+                SelectionAck::Accepted => {
+                    self.make_receipt(ctx, target, ActionState::Accepted, None)
+                }
+                SelectionAck::Noop => self.make_receipt(ctx, target, ActionState::Noop, None),
+                SelectionAck::Rejected => {
+                    self.make_receipt(ctx, target, ActionState::Rejected, None)
+                }
+                SelectionAck::Unknown => self.make_receipt(
+                    ctx,
+                    target,
+                    ActionState::Unknown,
+                    Some(codes::UNKNOWN.to_owned()),
+                ),
+                SelectionAck::Stale => {
+                    // 陈旧 CAS：命令已写出但被宿主拒绝（零生效）。如实落账、向手机
+                    // 返回刷新提示；**绝不**换新 revision 自动重发。
+                    let receipt = self.make_receipt(
+                        ctx,
+                        target,
+                        ActionState::Rejected,
+                        Some(codes::NOT_READY.to_owned()),
+                    );
+                    self.record(&receipt);
+                    return Err(ZcodeError::of(codes::NOT_READY));
+                }
+            },
+        };
+        if receipt.state == ActionState::Accepted {
+            // 已受理 ≠ 已生效：先落 accepted，再等新鲜选择（revision 前进 + 三项精确）。
+            self.record(&receipt);
+            if port
+                .wait_selection(
+                    target,
+                    &provider,
+                    model,
+                    thought,
+                    base_revision,
+                    self.selection_confirm_timeout,
+                )
+                .await
+            {
+                receipt.state = ActionState::Confirmed;
+                receipt.reason_code = None;
+            }
+        }
+        self.record(&receipt);
+        Ok(receipt)
     }
 
     /// autoResolution 前置（答案与权限共用）：恰一帧 snooze，必须 Ok
@@ -1787,39 +2009,28 @@ mod tests {
         assert_eq!(failed.reason_code.as_deref(), Some(codes::STALE_GENERATION));
     }
 
-    /// 未接入变体：invalid_action 且零帧零行；Answer/Snooze/Stop 已接入命令层，但未
-    /// 装配对应端口时一律 not_ready；Permission 已接入但默认能力矩阵关闭审批闸
-    /// （needs_evidence，零帧零行，开闸证据由 T8.2 单独发放）。
+    /// 全部变体已接入命令层：未装配端口时一律 not_ready；Permission/Selection
+    /// 默认能力矩阵关闭对应闸（needs_evidence，零帧零行；开闸证据由 T8.2 单独发放）。
     #[tokio::test]
     async fn non_send_actions_are_invalid_and_zero_wire() {
         let store = DeviceStore::memory();
         let fake = FakeBridge::new(Reply::Body(accepted_body()));
         let sender = sender(&fake, &store);
-        let unsupported = [ControlAction::Selection {
-            session_id: SESSION.to_string(),
-            generation: GEN,
-            model: "model-a".to_string(),
-            thought: "high".to_string(),
-        }];
-        for (index, action) in unsupported.iter().enumerate() {
-            let err = sender
-                .execute(&ctx(&format!("a-{index}")), &target(), action)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                err.code,
-                "invalid_action",
-                "{} 未接入必须拒绝",
-                action.kind()
-            );
-        }
-        // Permission 默认关闭：即使未装配 pending 端口也必须先被能力闸拦下。
-        let closed = [ControlAction::Permission {
-            session_id: SESSION.to_string(),
-            generation: GEN,
-            interaction_id: "ix-1".to_string(),
-            option_id: "allowOnce".to_string(),
-        }];
+        // Permission/Selection 默认关闭：即使未装配端口也必须先被能力闸拦下。
+        let closed = [
+            ControlAction::Permission {
+                session_id: SESSION.to_string(),
+                generation: GEN,
+                interaction_id: "ix-1".to_string(),
+                option_id: "allowOnce".to_string(),
+            },
+            ControlAction::Selection {
+                session_id: SESSION.to_string(),
+                generation: GEN,
+                model: "model-a".to_string(),
+                thought: "high".to_string(),
+            },
+        ];
         for action in &closed {
             let err = sender
                 .execute(&ctx("a-closed"), &target(), action)
@@ -4923,6 +5134,453 @@ mod tests {
                     "选项原值/标签不得落库: {forbidden}"
                 );
             }
+        }
+    }
+
+    // ============================================================
+    // T6 Slice B：同账号模型/思考档位切换（tests::selection）
+    // ============================================================
+
+    mod selection {
+        use super::*;
+
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use serde_json::json;
+
+        use crate::services::zcode_control::selection::SWITCH_MODEL_CONFIG_TYPE;
+        use crate::services::zcode_control::types::{
+            CapabilityFlag, CapabilityView, ModelChoice, SelectionView, SessionView,
+        };
+
+        use super::answer::stored_state;
+
+        const PROVIDER: &str = "acct-current";
+        const REVISION: u64 = 7;
+        const WAIT_WINDOW: Duration = Duration::from_millis(20);
+
+        /// 一次 `wait_selection` 观测（provider, model, thought, baseline, timeout）。
+        type WaitCall = (String, String, String, u64, Duration);
+
+        fn choice(model_id: &str, levels: &[&str]) -> ModelChoice {
+            ModelChoice {
+                model_id: model_id.to_owned(),
+                thought_levels: levels.iter().map(|level| (*level).to_owned()).collect(),
+            }
+        }
+
+        fn selection(
+            model: &str,
+            thought: Option<&str>,
+            models: Vec<ModelChoice>,
+        ) -> SelectionView {
+            SelectionView {
+                provider: PROVIDER.to_owned(),
+                model: model.to_owned(),
+                thought: thought.map(str::to_owned),
+                models,
+            }
+        }
+
+        /// 当前 provider 目录：model-a 支持 low/high，model-b 支持 low。
+        fn catalog() -> SelectionView {
+            selection(
+                "model-a",
+                Some("low"),
+                vec![
+                    choice("model-a", &["low", "high"]),
+                    choice("model-b", &["low"]),
+                ],
+            )
+        }
+
+        fn view(revision: Option<u64>, selection: SelectionView) -> SessionView {
+            SessionView {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                revision,
+                ready: true,
+                pending: Vec::new(),
+                control: None,
+                selection: Some(selection),
+                capabilities: CapabilityView::default(),
+            }
+        }
+
+        fn selection_action(model: &str, thought: &str) -> ControlAction {
+            ControlAction::Selection {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                model: model.to_owned(),
+                thought: thought.to_owned(),
+            }
+        }
+
+        /// 选择端口 fake：脚本化的（视图, 目录）+ 脚本化的新鲜确认结果。
+        struct FakeSelection {
+            view: Mutex<SessionView>,
+            selection: Mutex<SelectionView>,
+            load_calls: AtomicUsize,
+            wait_result: AtomicBool,
+            wait_calls: Mutex<Vec<WaitCall>>,
+        }
+
+        impl FakeSelection {
+            fn new(view: SessionView, selection: SelectionView) -> Arc<Self> {
+                Arc::new(Self {
+                    view: Mutex::new(view),
+                    selection: Mutex::new(selection),
+                    load_calls: AtomicUsize::new(0),
+                    wait_result: AtomicBool::new(false),
+                    wait_calls: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn set_wait_result(&self, result: bool) {
+                self.wait_result.store(result, Ordering::SeqCst);
+            }
+
+            fn load_calls(&self) -> usize {
+                self.load_calls.load(Ordering::SeqCst)
+            }
+
+            fn wait_calls(&self) -> Vec<WaitCall> {
+                self.wait_calls.lock().unwrap().clone()
+            }
+        }
+
+        impl SelectionPort for FakeSelection {
+            fn load<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+            ) -> BoxFuture<'a, ZResult<(SessionView, SelectionView)>> {
+                Box::pin(async move {
+                    self.load_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok((
+                        self.view.lock().unwrap().clone(),
+                        self.selection.lock().unwrap().clone(),
+                    ))
+                })
+            }
+
+            fn wait_selection<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+                provider: &'a str,
+                model: &'a str,
+                thought: &'a str,
+                baseline_revision: u64,
+                timeout: Duration,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async move {
+                    self.wait_calls.lock().unwrap().push((
+                        provider.to_owned(),
+                        model.to_owned(),
+                        thought.to_owned(),
+                        baseline_revision,
+                        timeout,
+                    ));
+                    self.wait_result.load(Ordering::SeqCst)
+                })
+            }
+        }
+
+        fn open_capabilities() -> CapabilityView {
+            CapabilityView {
+                model: CapabilityFlag {
+                    enabled: true,
+                    reason_code: None,
+                },
+                thought_level: CapabilityFlag {
+                    enabled: true,
+                    reason_code: None,
+                },
+                ..CapabilityView::default()
+            }
+        }
+
+        fn selection_sender(
+            fake: &Arc<FakeBridge>,
+            port: &Arc<FakeSelection>,
+            store: &DeviceStore,
+        ) -> CommandSender {
+            sender(fake, store)
+                .with_capabilities(open_capabilities())
+                .with_selection(port.clone())
+                .with_selection_confirm_timeout(WAIT_WINDOW)
+        }
+
+        fn switch_frames(fake: &FakeBridge) -> Vec<Value> {
+            fake.frames()
+                .into_iter()
+                .filter_map(|frame| {
+                    let envelope = frame.args.first()?.clone();
+                    (envelope.get("type").and_then(Value::as_str) == Some(SWITCH_MODEL_CONFIG_TYPE))
+                        .then_some(envelope)
+                })
+                .collect()
+        }
+
+        /// CAS 只带 baseRevision、provider 只取自视图、绝不恢复原 thought。
+        #[tokio::test]
+        async fn selection_uses_cas_and_never_restores() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let port = FakeSelection::new(view(Some(REVISION), catalog()), catalog());
+            port.set_wait_result(true);
+            let sender = selection_sender(&fake, &port, &store);
+
+            let receipt = sender
+                .execute(&ctx("a-1"), &target(), &selection_action("model-a", "high"))
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Confirmed);
+            let frames = switch_frames(&fake);
+            assert_eq!(frames.len(), 1, "恰一帧：绝不回带恢复原值的写帧");
+            let envelope = &frames[0];
+            assert_eq!(envelope.get("baseRevision"), Some(&Value::from(REVISION)));
+            assert!(envelope.get("baseLogEpoch").is_none());
+            assert_eq!(envelope["payload"]["provider"], Value::from(PROVIDER));
+            assert_eq!(envelope["payload"]["model"], Value::from("model-a"));
+            assert_eq!(envelope["payload"]["thought"], Value::from("high"));
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| frame["payload"]["thought"].as_str() != Some("low")),
+                "产品保留用户选择：任何帧都不得把原 thought 写回"
+            );
+            // 确认基线 = 写前视图 revision，等待目标 = 精确三项。
+            assert_eq!(
+                port.wait_calls(),
+                vec![(
+                    PROVIDER.to_owned(),
+                    "model-a".to_owned(),
+                    "high".to_owned(),
+                    REVISION,
+                    WAIT_WINDOW
+                )]
+            );
+        }
+
+        /// 陈旧 CAS：not_ready（刷新提示），零重发、零确认观察，同 id 重放也只回既有回执。
+        #[tokio::test]
+        async fn stale_cas_is_not_retried() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(json!({
+                "status": "stale",
+                "reasonCode": "proto.staleRevision",
+            })));
+            let port = FakeSelection::new(view(Some(REVISION), catalog()), catalog());
+            let sender = selection_sender(&fake, &port, &store);
+            let action = selection_action("model-a", "high");
+
+            let error = sender
+                .execute(&ctx("a-1"), &target(), &action)
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::NOT_READY), "陈旧 CAS 只提示刷新");
+            assert_eq!(switch_frames(&fake).len(), 1, "绝不自动换新 revision 重发");
+            assert!(port.wait_calls().is_empty(), "陈旧 CAS 不得进入确认观察");
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("rejected"));
+
+            // 同 actionId 重放：只回既有回执，零新帧、零等待。
+            let replay = sender
+                .execute(&ctx("a-1"), &target(), &action)
+                .await
+                .unwrap();
+            assert_eq!(replay.state, ActionState::Rejected);
+            assert_eq!(switch_frames(&fake).len(), 1);
+            assert!(port.wait_calls().is_empty());
+        }
+
+        /// ACK 只算 accepted；只有新鲜且精确相等才 confirmed。
+        #[tokio::test]
+        async fn ack_only_is_accepted_fresh_selection_is_confirmed() {
+            // 窗内没有新鲜目标 → accepted。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let port = FakeSelection::new(view(Some(REVISION), catalog()), catalog());
+            let sender = selection_sender(&fake, &port, &store);
+            let receipt = sender
+                .execute(&ctx("a-1"), &target(), &selection_action("model-a", "high"))
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("accepted"));
+            assert_eq!(port.wait_calls().len(), 1);
+
+            // 新鲜 revision + 三项精确相等 → confirmed。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let port = FakeSelection::new(view(Some(REVISION), catalog()), catalog());
+            port.set_wait_result(true);
+            let sender = selection_sender(&fake, &port, &store);
+            let receipt = sender
+                .execute(&ctx("a-1"), &target(), &selection_action("model-a", "high"))
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Confirmed);
+            assert!(receipt.reason_code.is_none());
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("confirmed"));
+        }
+
+        /// 默认能力矩阵关闭：needs_evidence、零帧零行、连目录都不读。
+        #[tokio::test]
+        async fn selection_gate_default_closed_zero_frames() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let port = FakeSelection::new(view(Some(REVISION), catalog()), catalog());
+            let closed = sender(&fake, &store).with_selection(port.clone());
+
+            let error = closed
+                .execute(&ctx("a-1"), &target(), &selection_action("model-a", "high"))
+                .await
+                .unwrap_err();
+
+            assert!(error.is(codes::NEEDS_EVIDENCE));
+            assert_eq!(fake.wire(), 0);
+            assert_eq!(port.load_calls(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert!(audits(&store).is_empty());
+
+            // 只开 model、thought_level 仍关：同样拒绝（两闸同时开启才放行）。
+            let half = CapabilityView {
+                model: CapabilityFlag {
+                    enabled: true,
+                    reason_code: None,
+                },
+                ..CapabilityView::default()
+            };
+            let sender = sender(&fake, &store)
+                .with_capabilities(half)
+                .with_selection(port.clone());
+            let error = sender
+                .execute(&ctx("a-2"), &target(), &selection_action("model-a", "high"))
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::NEEDS_EVIDENCE));
+            assert_eq!(fake.wire(), 0);
+            assert_eq!(row_count(&store), 0);
+        }
+
+        /// 跨 provider 模型与空档位列表：构造器拒绝，零帧零行（预留之前）。
+        #[tokio::test]
+        async fn selection_rejects_cross_provider_or_empty_levels() {
+            // 视图只含当前 provider 目录：另一 provider 的模型名不可见。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let port = FakeSelection::new(view(Some(REVISION), catalog()), catalog());
+            let sender = selection_sender(&fake, &port, &store);
+            let error = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &selection_action("model-other-account", "low"),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::INVALID_ACTION));
+            assert_eq!(fake.wire(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert!(audits(&store).is_empty());
+
+            // 空档位列表 = 宿主未宣告：任何 thought 都拒绝。
+            let empty = selection("model-a", None, vec![choice("model-a", &[])]);
+            let port = FakeSelection::new(view(Some(REVISION), empty.clone()), empty);
+            let sender = selection_sender(&fake, &port, &store);
+            let error = sender
+                .execute(&ctx("a-2"), &target(), &selection_action("model-a", "low"))
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::INVALID_ACTION));
+            assert_eq!(fake.wire(), 0);
+            assert_eq!(row_count(&store), 0);
+
+            // 正对照：同一目录里的合法目标仍可构造并写出（拒绝不是因为整体失效）。
+            let port = FakeSelection::new(view(Some(REVISION), catalog()), catalog());
+            let sender = selection_sender(&fake, &port, &store);
+            let accepted = sender
+                .execute(&ctx("a-3"), &target(), &selection_action("model-a", "low"))
+                .await
+                .unwrap();
+            assert_eq!(accepted.state, ActionState::Accepted);
+            assert_eq!(fake.wire(), 1);
+        }
+
+        /// 恰一帧官方 switchModelConfig：channel/method/信封/窗口都与探针一致。
+        #[tokio::test]
+        async fn selection_sends_one_switch_command() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let port = FakeSelection::new(view(Some(REVISION), catalog()), catalog());
+            let sender = selection_sender(&fake, &port, &store);
+
+            sender
+                .execute(&ctx("a-1"), &target(), &selection_action("model-a", "high"))
+                .await
+                .unwrap();
+
+            let frames = fake.frames();
+            assert_eq!(frames.len(), 1, "全生命周期只允许一个命令信封");
+            assert_eq!(frames[0].channel, AGENT_CHANNEL);
+            assert_eq!(frames[0].method, AGENT_SEND_COMMAND_METHOD);
+            assert_eq!(frames[0].args.len(), 1);
+            let envelope = &frames[0].args[0];
+            assert_eq!(
+                envelope.get("type").and_then(Value::as_str),
+                Some(SWITCH_MODEL_CONFIG_TYPE)
+            );
+            assert_eq!(
+                envelope["payload"],
+                json!({ "provider": PROVIDER, "model": "model-a", "thought": "high" })
+            );
+            assert_eq!(envelope.get("baseRevision"), Some(&Value::from(REVISION)));
+            assert!(envelope.get("baseLogEpoch").is_none());
+            assert_eq!(envelope["clientId"], Value::from(DEVICE));
+            assert_eq!(envelope["sessionId"], Value::from(SESSION));
+            assert!(envelope["commandId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()));
+            assert!(envelope["issuedAt"].as_u64().is_some());
+            // 20s ACK 窗原样交给端口。
+            assert_eq!(fake.observed_timeouts(), vec![Duration::from_millis(20)]);
+            assert_eq!(fake.wire(), 1, "绝无 sendText/恢复帧");
+        }
+
+        /// 同 actionId 同载荷：只回既有回执，零第二帧；换载荷 → 载荷冲突。
+        #[tokio::test]
+        async fn selection_reuses_action_id_idempotently() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let port = FakeSelection::new(view(Some(REVISION), catalog()), catalog());
+            port.set_wait_result(true);
+            let sender = selection_sender(&fake, &port, &store);
+            let action = selection_action("model-a", "high");
+
+            let first = sender
+                .execute(&ctx("a-1"), &target(), &action)
+                .await
+                .unwrap();
+            let second = sender
+                .execute(&ctx("a-1"), &target(), &action)
+                .await
+                .unwrap();
+
+            assert_eq!(first.state, ActionState::Confirmed);
+            assert_eq!(second.state, ActionState::Confirmed);
+            assert_eq!(switch_frames(&fake).len(), 1, "重放不得产生第二帧");
+            assert_eq!(port.wait_calls().len(), 1, "重放不得再次等待确认");
+            assert_eq!(row_count(&store), 1);
+
+            // 同 id 换 thought：载荷冲突（指纹覆盖 provider/model/thought/baseRevision）。
+            let conflict = sender
+                .execute(&ctx("a-1"), &target(), &selection_action("model-a", "low"))
+                .await
+                .unwrap_err();
+            assert_eq!(conflict.code, codes::ACTION_PAYLOAD_CONFLICT);
+            assert_eq!(switch_frames(&fake).len(), 1);
+            assert_eq!(row_count(&store), 1);
         }
     }
 }

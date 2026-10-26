@@ -47,9 +47,10 @@ use super::codec::{
     RESPONSE_TYPE_INITIALIZE, RESPONSE_TYPE_PROMISE_ERROR, RESPONSE_TYPE_PROMISE_SUCCESS,
 };
 use super::projection::{Projection, CONVERSATION_TOPIC_PREFIX};
+use super::selection::parse_selection_view;
 use super::types::{
-    codes, BoundTarget, CommandPort, PendingPort, PendingView, RelaySink, SessionView, StopPort,
-    TargetKey, ZResult, ZcodeError,
+    codes, BoundTarget, CommandPort, PendingPort, PendingView, RelaySink, SelectionPort,
+    SelectionView, SessionView, StopPort, TargetKey, ZResult, ZcodeError,
 };
 
 /// agent 服务 channel（`channels.ts:114`）。
@@ -1288,6 +1289,164 @@ impl StopPort for BridgeManager {
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 tokio::time::sleep(super::types::STOP_CLEARED_POLL.min(remaining)).await;
+            }
+        })
+    }
+}
+
+/// 官方模型目录 channel（`channels.ts:133`；探针 `selectionBridge.ts`）。
+pub const MODEL_SELECTION_CHANNEL: &str = "model-selection";
+/// 官方模型目录方法（无参 `getView()`）。
+pub const MODEL_SELECTION_GET_VIEW_METHOD: &str = "getView";
+
+impl SelectionPort for BridgeManager {
+    /// 精确目标的只读视图 + `model-selection.getView()` 目录（只保留当前会话 provider）。
+    ///
+    /// 顺序：绑定/代际复核（零副作用）→ 有界只读投影（必要时重订阅取新快照）→
+    /// `getView`（显式 `timing.rpc` 预算）→ [`parse_selection_view`] 组装。任一失败按
+    /// 冻结码返回；**绝不**返回其他账号的 provider 目录，也绝不写任何命令帧。
+    fn load<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+    ) -> futures::future::BoxFuture<'a, ZResult<(SessionView, SelectionView)>> {
+        Box::pin(async move {
+            {
+                let inner = lock(&self.shared.state);
+                if inner.generation != target.generation {
+                    return Err(stale());
+                }
+                let Some(entry) = inner.sessions.get(&target.session_id) else {
+                    return Err(ZcodeError::of(codes::NO_SESSION));
+                };
+                if entry.target != *target {
+                    return Err(stale());
+                }
+            }
+            let budget = self.shared.timing.rpc;
+            let view = self.session_within(target, Some(budget)).await?;
+            if view.session_id != target.session_id {
+                return Err(ZcodeError::of(codes::NO_SESSION));
+            }
+            if view.generation != target.generation {
+                return Err(stale());
+            }
+            if !view.ready {
+                return Err(ZcodeError::of(codes::NOT_READY));
+            }
+            // 当前选择三项只来自精确目标的快照 config（绝不取客户端自报/目录显示名）。
+            let (provider, model, thought, thought_levels) = {
+                let current = view
+                    .selection
+                    .as_ref()
+                    .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?;
+                let levels = current
+                    .models
+                    .iter()
+                    .find(|choice| choice.model_id == current.model)
+                    .map(|choice| choice.thought_levels.clone())
+                    .unwrap_or_default();
+                (
+                    current.provider.clone(),
+                    current.model.clone(),
+                    current.thought.clone(),
+                    levels,
+                )
+            };
+            let config = serde_json::json!({
+                "provider": provider,
+                "model": model,
+                "thought": thought,
+                "thoughtLevels": thought_levels,
+            });
+            // 官方 getView 无参（探针 `bridgeRequest(..., {channel:"model-selection",
+            // method:"getView"})`）；应答可能带 data/result 包装，解析层同规则解包。
+            let body = self
+                .call_with_timeout(
+                    target,
+                    MODEL_SELECTION_CHANNEL,
+                    MODEL_SELECTION_GET_VIEW_METHOD,
+                    Vec::new(),
+                    budget,
+                )
+                .await?;
+            let mut raw = if body.is_object() {
+                body
+            } else {
+                serde_json::json!({})
+            };
+            if let Some(object) = raw.as_object_mut() {
+                object.insert("config".to_owned(), config);
+            }
+            let selection =
+                parse_selection_view(&target.session_id, target.generation, view.revision, &raw)?;
+            Ok((view, selection))
+        })
+    }
+
+    /// 有界轮询**新鲜**选择：revision 前进且 provider/model/thought 精确相等 → `true`；
+    /// 超时、目标换代/绑定消失 → `false`。只读本地投影（不重复打目录 RPC），每次读
+    /// 只拿剩余期限作预算（端口不取消 future、不留未激活订阅）。锁内判定、锁外 sleep。
+    fn wait_selection<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        provider: &'a str,
+        model: &'a str,
+        thought: &'a str,
+        baseline_revision: u64,
+        timeout: Duration,
+    ) -> futures::future::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            {
+                let inner = lock(&self.shared.state);
+                if inner.generation != target.generation {
+                    return false;
+                }
+                let Some(entry) = inner.sessions.get(&target.session_id) else {
+                    return false;
+                };
+                if entry.target != *target {
+                    return false;
+                }
+            }
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                match self.session_within(target, Some(remaining)).await {
+                    Ok(view) => {
+                        let fresh = view
+                            .revision
+                            .is_some_and(|revision| revision > baseline_revision);
+                        if fresh {
+                            if let Some(current) = view.selection.as_ref() {
+                                if current.provider == provider
+                                    && current.model == model
+                                    && current.thought.as_deref() == Some(thought)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    // 目标已换代/绑定消失：旧基线不可比，立即收口（绝不拿兄弟会话确认）。
+                    Err(error)
+                        if error.is(codes::NO_SESSION) || error.is(codes::STALE_GENERATION) =>
+                    {
+                        return false;
+                    }
+                    // 瞬时不可读（缺口/重订阅窗口）：不是结论，继续轮询到期限。
+                    Err(_) => {}
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                tokio::time::sleep(super::types::SELECTION_POLL.min(remaining)).await;
             }
         })
     }

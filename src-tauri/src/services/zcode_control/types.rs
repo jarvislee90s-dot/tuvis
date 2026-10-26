@@ -294,10 +294,9 @@ pub struct AnswerEntry {
 
 /// 统一控制动作（tagged `kind`；**全部**携 `sessionId,generation`）。
 ///
-/// 已接入 `Send`/`Answer`/`Snooze`/`Stop`/`Permission`；`Selection` 仍未接入，在
-/// `CommandSender::execute` 一律 `invalid_action` 且零帧零写（不伪造成功）。
-/// `Permission` 另受能力闸（默认关闭 → `needs_evidence`），且需要 pending 端口
-/// （未装配 → `not_ready`；已存储的同 actionId 重放不受闸影响）。
+/// 已接入 `Send`/`Answer`/`Snooze`/`Stop`/`Permission`/`Selection`。
+/// `Permission` 与 `Selection` 各受能力闸（默认关闭 → `needs_evidence`）与端口装配
+/// 约束（未装配 → `not_ready`；已存储的同 actionId 重放不受闸影响）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ControlAction {
@@ -544,6 +543,49 @@ pub trait StopPort: Send + Sync {
 
 /// `wait_stop_cleared` 的轮询上限（50ms；有界、不忙等）。
 pub const STOP_CLEARED_POLL: Duration = Duration::from_millis(50);
+
+// ---------------------------------------------------------------------------
+// 端口：模型/思考档位的目录读取与生效观察（T6 Slice B 裁决的最小抽象）
+// ---------------------------------------------------------------------------
+
+/// 模型目录读取与切换生效观察的最小能力（切换命令本身仍走 [`CommandPort`]）。
+///
+/// 生产实现 = [`BridgeManager`](super::bridge::BridgeManager)：`load` 先读**精确目标**
+/// 的只读投影，再按官方 `model-selection.getView()`（无参）取目录，并用
+/// [`parse_selection_view`](super::selection::parse_selection_view) 只保留**当前会话
+/// provider** 的目录；`wait_selection` 有界轮询「revision 前进 + 目标三项精确相等」。
+/// 命令层因此拿不到 relay 生命周期、JWT 或配置入口，手机也无法指定目录来源。
+///
+/// # 语义（生产实现保证）
+///
+/// - `load`：目标未绑定 → `no_session`；代际前进/workspace 绑定不符 →
+///   `stale_generation`；投影不新鲜或选择视图缺失 → `not_ready`；目录 RPC 失败按其
+///   冻结码返回。**绝不**返回其他账号的 provider 目录，也绝不触发任何写命令。
+/// - `wait_selection`：只有该目标 `revision` **前进**（> `baseline_revision`，新鲜证据）
+///   且 `provider`/`model`/`thought` 三者与目标精确相等才 `true`；超时、目标换代/
+///   绑定消失或读错误 → `false`。每次判定后锁外 sleep（≤ [`SELECTION_POLL`]），
+///   绝不持锁 await、绝不忙等。
+pub trait SelectionPort: Send + Sync {
+    /// 读取精确目标的会话视图与**当前 provider** 的模型目录（只读，零写命令）。
+    fn load<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+    ) -> BoxFuture<'a, ZResult<(SessionView, SelectionView)>>;
+
+    /// 等**新鲜**选择（revision 前进且三项精确相等）→ `true`；超时/换代 → `false`。
+    fn wait_selection<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        provider: &'a str,
+        model: &'a str,
+        thought: &'a str,
+        baseline_revision: u64,
+        timeout: Duration,
+    ) -> BoxFuture<'a, bool>;
+}
+
+/// `wait_selection` 的轮询上限（50ms；有界、不忙等）。
+pub const SELECTION_POLL: Duration = Duration::from_millis(50);
 
 /// pending 卡种类（官方 `PendingInteraction.kind` 三元）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

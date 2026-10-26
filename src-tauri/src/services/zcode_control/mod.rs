@@ -12,7 +12,9 @@
 //! - `pending`：本会话 pending 册与 control 观察（ACK ≠ control 已到）；
 //! - `action`：写动作的持久去重账本（`zcode_actions`，actionId 幂等 + 保守 unknown）；
 //! - `audit`：动作起始审计（`zcode_official` 通道，只记类别与计数，不摘正文）；
-//! - `command`：写命令派发（唯一信封/正文出口，一次 sendText、ACK 20s、绝不重发）。
+//! - `command`：写命令派发（唯一信封/正文出口，一次 sendText、ACK 20s、绝不重发）；
+//! - `selection`：同账号模型/思考档位的纯构造与目录解析（CAS `baseRevision`、
+//!   绝不恢复原值）。
 //!
 //! 官方授权、适配器与写能力由生产计划逐任务装配；授权不塞进 config，也不进 IPC 大文件。
 
@@ -48,7 +50,8 @@ pub use codec::{
 };
 pub use command::{
     compose_official_text, new_command_id, CommandSender, ACK_TIMEOUT, AGENT_SEND_COMMAND_METHOD,
-    CONFIRM_TIMEOUT, MAX_TEXT_BYTES, RESOLVE_INTERACTION_TYPE, STOP_TYPE,
+    CONFIRM_TIMEOUT, MAX_TEXT_BYTES, RESOLVE_INTERACTION_TYPE, SELECTION_CONFIRM_TIMEOUT,
+    STOP_TYPE,
 };
 pub use config::{
     get_config, set_config, validate_official_url, ConfigError, ConfigState, ZcodeRemoteConfig,
@@ -57,11 +60,12 @@ pub use config::{
 pub use relay::{
     DeviceRoute, RelayClient, RelayEvent, OFFICIAL_RELAY_WS_ORIGIN, OFFICIAL_RELAY_WS_PATH,
 };
-pub use selection::build_selection_command;
+pub use selection::{build_selection_command, parse_selection_view, SWITCH_MODEL_CONFIG_TYPE};
 pub use types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, AnswerEntry, BoundTarget,
     CapabilityFlag, CapabilityView, CommandPort, ConnectionState, ConnectionView, ControlAction,
     ControlView, ModelChoice, PendingKind, PendingPort, PendingView, PermissionOptionView,
-    QuestionOption, QuestionView, RelaySink, SelectionView, SessionView, StopPort, StopRequest,
-    TargetKey, ZResult, ZcodeError, PENDING_CLEARED_POLL, STOP_CLEARED_POLL,
+    QuestionOption, QuestionView, RelaySink, SelectionPort, SelectionView, SessionView, StopPort,
+    StopRequest, TargetKey, ZResult, ZcodeError, PENDING_CLEARED_POLL, SELECTION_POLL,
+    STOP_CLEARED_POLL,
 };
