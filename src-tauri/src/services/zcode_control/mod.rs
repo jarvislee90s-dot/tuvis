@@ -14,7 +14,9 @@
 //! - `audit`：动作起始审计（`zcode_official` 通道，只记类别与计数，不摘正文）；
 //! - `command`：写命令派发（唯一信封/正文出口，一次 sendText、ACK 20s、绝不重发）；
 //! - `selection`：同账号模型/思考档位的纯构造与目录解析（CAS `baseRevision`、
-//!   绝不恢复原值）。
+//!   绝不恢复原值）；
+//! - `hub`：进程内**单实例**控制 Hub（桌面与配对手机共享一条物理连接、代际权威、
+//!   能力闸与事件广播）。
 //!
 //! 官方授权、适配器与写能力由生产计划逐任务装配；授权不塞进 config，也不进 IPC 大文件。
 
@@ -25,6 +27,7 @@ pub mod bridge;
 pub mod codec;
 pub mod command;
 pub mod config;
+pub mod hub;
 pub mod pending;
 pub mod projection;
 pub mod relay;
@@ -57,6 +60,7 @@ pub use config::{
     get_config, set_config, validate_official_url, ConfigError, ConfigState, ZcodeRemoteConfig,
     CONFIG_KEY,
 };
+pub use hub::{HubBackend, PartsBackend, ZcodeHub};
 pub use relay::{
     DeviceRoute, RelayClient, RelayEvent, OFFICIAL_RELAY_WS_ORIGIN, OFFICIAL_RELAY_WS_PATH,
 };
@@ -64,8 +68,8 @@ pub use selection::{build_selection_command, parse_selection_view, SWITCH_MODEL_
 pub use types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, AnswerEntry, BoundTarget,
     CapabilityFlag, CapabilityView, CommandPort, ConnectionState, ConnectionView, ControlAction,
-    ControlView, ModelChoice, PendingKind, PendingPort, PendingView, PermissionOptionView,
-    QuestionOption, QuestionView, RelaySink, SelectionPort, SelectionView, SessionView, StopPort,
-    StopRequest, TargetKey, ZResult, ZcodeError, PENDING_CLEARED_POLL, SELECTION_POLL,
-    STOP_CLEARED_POLL,
+    ControlEvent, ControlEventKind, ControlView, ModelChoice, PendingKind, PendingPort,
+    PendingView, PermissionOptionView, QuestionOption, QuestionView, RelaySink, SelectionPort,
+    SelectionView, SessionView, StopPort, StopRequest, TargetKey, ZResult, ZcodeError,
+    PENDING_CLEARED_POLL, SELECTION_POLL, STOP_CLEARED_POLL,
 };

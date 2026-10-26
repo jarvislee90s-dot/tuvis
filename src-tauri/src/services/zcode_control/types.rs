@@ -750,6 +750,33 @@ impl Default for CapabilityView {
     }
 }
 
+/// 控制事件类别（Hub 订阅面；SSE 首帧与后续更新共用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ControlEventKind {
+    /// 连接状态变化（`data` = `ConnectionView`）。
+    Connection,
+    /// 会话投影变化（`data` = `SessionView`）。
+    Session,
+    /// 动作回执（`data` = `ActionReceipt`）。
+    Action,
+}
+
+/// Hub 对外广播的一条控制事件（`{seq,generation,sessionId,kind,data}`）。
+///
+/// `data` 只承载对应 Tuvis DTO（[`ConnectionView`]／[`SessionView`]／
+/// [`ActionReceipt`]），**绝无** JWT/token/官方原文；`seq` 在单个 Hub 生命周期内
+/// 单调递增，消费方据它发现缺口（缺口后重 GET，不重放动作）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlEvent {
+    pub seq: u64,
+    pub generation: u64,
+    pub session_id: Option<String>,
+    pub kind: ControlEventKind,
+    pub data: Value,
+}
+
 /// 会话投影视图（手机唯一可见的会话状态面）。
 ///
 /// 只包含**已按本会话 topic + 当前 subscriptionId + 当前代际**过滤后的数据；
