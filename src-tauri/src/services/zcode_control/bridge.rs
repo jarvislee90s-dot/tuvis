@@ -842,7 +842,7 @@ impl BridgeManager {
             inner
                 .sessions
                 .get(session_id)
-                .filter(|entry| entry.target.generation == generation)
+                .filter(|entry| entry.target.bridge_generation() == generation)
                 .map(|entry| entry.target.clone())
         } {
             return Ok(target);
@@ -877,6 +877,7 @@ impl BridgeManager {
             workspace_identity,
             workspace_key,
             generation,
+            bridge_generation: None,
         };
         if lock(&self.shared.state).generation != generation {
             return Err(stale());
@@ -904,13 +905,13 @@ impl BridgeManager {
         });
         let needs_resync = {
             let inner = lock(&self.shared.state);
-            if inner.generation != target.generation {
+            if inner.generation != target.bridge_generation() {
                 return Err(stale());
             }
             let Some(entry) = inner.sessions.get(&target.session_id) else {
                 return Err(ZcodeError::of(codes::NO_SESSION));
             };
-            if entry.target.generation != target.generation {
+            if entry.target.bridge_generation() != target.bridge_generation() {
                 return Err(stale());
             }
             entry.needs_resync
@@ -957,7 +958,7 @@ impl BridgeManager {
     ) -> ZResult<Value> {
         let (bridge_id, needs_resync) = {
             let inner = lock(&self.shared.state);
-            if inner.generation != target.generation {
+            if inner.generation != target.bridge_generation() {
                 return Err(stale());
             }
             let Some(entry) = inner.sessions.get(&target.session_id) else {
@@ -983,7 +984,7 @@ impl BridgeManager {
         // 「检查通过、写前已失效」的窗口必须零写（quality I-4）。
         let guard = RpcGuard {
             session_id: target.session_id.clone(),
-            generation: target.generation,
+            generation: target.bridge_generation(),
         };
         let message = self
             .shared
@@ -1077,11 +1078,11 @@ impl BridgeManager {
         interaction_id: &str,
     ) -> Option<(u64, bool)> {
         let inner = lock(&self.shared.state);
-        if inner.generation != target.generation {
+        if inner.generation != target.bridge_generation() {
             return None;
         }
         let entry = inner.sessions.get(&target.session_id)?;
-        if entry.target != *target {
+        if !entry.target.same_binding(target) {
             return None;
         }
         let book = entry.projection.pending_book();
@@ -1104,7 +1105,7 @@ impl PendingPort for BridgeManager {
     ) -> futures::future::BoxFuture<'a, ZResult<PendingView>> {
         Box::pin(async move {
             let mut inner = lock(&self.shared.state);
-            if inner.generation != target.generation {
+            if inner.generation != target.bridge_generation() {
                 return Err(stale());
             }
             let Some(entry) = inner.sessions.get_mut(&target.session_id) else {
@@ -1112,7 +1113,7 @@ impl PendingPort for BridgeManager {
             };
             // 精确目标：workspace 归属/代际都必须与绑定产物逐字段相等
             // （手机自报的路径不得成为锚）。
-            if entry.target != *target {
+            if !entry.target.same_binding(target) {
                 return Err(stale());
             }
             if !entry.projection.is_ready() {
@@ -1245,13 +1246,13 @@ impl StopPort for BridgeManager {
         Box::pin(async move {
             {
                 let inner = lock(&self.shared.state);
-                if inner.generation != target.generation {
+                if inner.generation != target.bridge_generation() {
                     return Err(stale());
                 }
                 let Some(entry) = inner.sessions.get(&target.session_id) else {
                     return Err(ZcodeError::of(codes::NO_SESSION));
                 };
-                if entry.target != *target {
+                if !entry.target.same_binding(target) {
                     return Err(stale());
                 }
             }
@@ -1312,13 +1313,13 @@ impl SelectionPort for BridgeManager {
         Box::pin(async move {
             {
                 let inner = lock(&self.shared.state);
-                if inner.generation != target.generation {
+                if inner.generation != target.bridge_generation() {
                     return Err(stale());
                 }
                 let Some(entry) = inner.sessions.get(&target.session_id) else {
                     return Err(ZcodeError::of(codes::NO_SESSION));
                 };
-                if entry.target != *target {
+                if !entry.target.same_binding(target) {
                     return Err(stale());
                 }
             }
@@ -1327,7 +1328,7 @@ impl SelectionPort for BridgeManager {
             if view.session_id != target.session_id {
                 return Err(ZcodeError::of(codes::NO_SESSION));
             }
-            if view.generation != target.generation {
+            if view.generation != target.bridge_generation() {
                 return Err(stale());
             }
             if !view.ready {
@@ -1418,7 +1419,7 @@ impl SelectionPort for BridgeManager {
                     Ok(view) => {
                         let fresh = view.ready
                             && view.session_id == target.session_id
-                            && view.generation == target.generation
+                            && view.generation == target.bridge_generation()
                             && view
                                 .revision
                                 .is_some_and(|revision| revision > baseline_revision);
@@ -1460,13 +1461,13 @@ impl BridgeManager {
     /// 需要更严的「同 workspace/identity 绑定」口径，避免拿兄弟投影确认。
     fn exact_session_bound(&self, target: &BoundTarget) -> bool {
         let inner = lock(&self.shared.state);
-        if inner.generation != target.generation {
+        if inner.generation != target.bridge_generation() {
             return false;
         }
         inner
             .sessions
             .get(&target.session_id)
-            .is_some_and(|entry| entry.target == *target)
+            .is_some_and(|entry| entry.target.same_binding(target))
     }
 
     /// 状态锁内读**精确目标**的（投影 revision，目标 execution 是否仍在 control 观测里）。
@@ -1475,11 +1476,11 @@ impl BridgeManager {
     /// 绝不把兄弟会话或旧代际的 control 当成本目标的停止终态）。
     fn stop_observation(&self, target: &BoundTarget, execution_id: &str) -> Option<(u64, bool)> {
         let inner = lock(&self.shared.state);
-        if inner.generation != target.generation {
+        if inner.generation != target.bridge_generation() {
             return None;
         }
         let entry = inner.sessions.get(&target.session_id)?;
-        if entry.target != *target {
+        if !entry.target.same_binding(target) {
             return None;
         }
         let view = entry.projection.view();
@@ -1505,13 +1506,13 @@ impl BridgeManager {
         f: impl FnOnce(&mut super::pending::PendingBook),
     ) {
         let mut inner = lock(&self.shared.state);
-        if inner.generation != target.generation {
+        if inner.generation != target.bridge_generation() {
             return;
         }
         let Some(entry) = inner.sessions.get_mut(&target.session_id) else {
             return;
         };
-        if entry.target != *target {
+        if !entry.target.same_binding(target) {
             return;
         }
         f(entry.projection.pending_book_mut());
@@ -2048,7 +2049,7 @@ impl Shared {
     async fn open_session(&self, target: &BoundTarget) -> ZResult<()> {
         let bridge_id = self
             .open_bridge(
-                target.generation,
+                target.bridge_generation(),
                 &target.workspace_key,
                 Some(&target.session_id),
                 true,
@@ -2056,7 +2057,7 @@ impl Shared {
             .await?;
         let inserted = {
             let mut inner = lock(&self.state);
-            if inner.generation == target.generation {
+            if inner.generation == target.bridge_generation() {
                 inner.sessions.insert(
                     target.session_id.clone(),
                     SessionEntry::new(
@@ -2193,7 +2194,7 @@ impl Shared {
         };
         let (bridge_id, needs_resync, old_subscription) = {
             let inner = lock(&self.state);
-            if inner.generation != target.generation {
+            if inner.generation != target.bridge_generation() {
                 return Err(stale());
             }
             let Some(entry) = inner.sessions.get(&target.session_id) else {
@@ -2921,7 +2922,10 @@ fn activate_and_flush(entry: &mut SessionEntry, subscription: &str) {
 
 /// 应用一帧；缺口/未知 schema 时标记重同步（stale/异会话只丢弃）。
 fn apply_frame(entry: &mut SessionEntry, frame: Value) -> bool {
-    match entry.projection.apply(entry.target.generation, frame) {
+    match entry
+        .projection
+        .apply(entry.target.bridge_generation(), frame)
+    {
         Ok(()) => true,
         Err(error) => {
             if error.is(codes::NOT_READY) || error.is(codes::UNSUPPORTED_PROTOCOL) {
@@ -4409,6 +4413,46 @@ mod tests {
         // 新代际必须重新绑定（旧映射不授权新连接）。
         let rebound = manager.bind(&key(SESSION_A)).await.expect("rebind");
         assert_eq!(rebound.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn bridge_call_uses_bridge_generation() {
+        let (manager, _peer) = manager_with(basic_config()).await;
+        let bound = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let bridge_generation = bound.generation;
+
+        // 公开代际被覆写、但没有 bridge_generation：桥按投影代际判旧 → stale。
+        let mut public_only = bound.clone();
+        public_only.generation = bridge_generation + 100;
+        assert!(manager
+            .call(
+                &public_only,
+                AGENT_CHANNEL,
+                "syntheticRead",
+                vec![json!({})],
+            )
+            .await
+            .expect_err("公开代际不得冒充桥代际")
+            .is(codes::STALE_GENERATION));
+
+        // Hub 盖好的目标：公开代际分叉，桥内 call/session/精确绑定一律按 bridge_generation。
+        let mut stamped = bound.clone();
+        stamped.bridge_generation = Some(bridge_generation);
+        stamped.generation = bridge_generation + 100;
+        let body = manager
+            .call(&stamped, AGENT_CHANNEL, "syntheticRead", vec![json!({})])
+            .await
+            .expect("按桥代际必须可读");
+        assert_eq!(body, json!({"method": "syntheticRead"}));
+        let view = manager
+            .session(&stamped)
+            .await
+            .expect("按桥代际必须可读投影");
+        assert_eq!(view.session_id, SESSION_A);
+        assert!(
+            manager.exact_session_bound(&stamped),
+            "精确绑定复核按桥代际"
+        );
     }
 
     #[tokio::test]

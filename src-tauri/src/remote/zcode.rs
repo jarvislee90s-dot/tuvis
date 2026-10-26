@@ -102,9 +102,9 @@ pub async fn connection(State(st): State<Arc<RemoteState>>) -> Response {
 
 /// 当前 Tuvis 会话快照里按原 ID 对位出的 ZCode 会话。
 ///
-/// 只认**快照里活着的** `agent_type=zcode` 会话：未知 ID、非 ZCode、已离开快照
-/// （旧会话/隐藏归档）一律 None——手机不能凭自报 ID 越权恢复任何会话。
-/// 快照扫描是同步阻塞活（与 /sessions 同源），按既有惯例进阻塞池。
+/// 只认**快照里活着的** `agent_type=zcode` 会话：未知 ID、非 ZCode、已离开快照、
+/// **或已被看板「叉掉」（`board_hidden_ids` 软归档）** 一律 None——手机不能凭自报
+/// ID 越权恢复/控制任何会话。快照扫描与看板隐藏集合同源，均按既有惯例进阻塞池。
 async fn current_zcode_session(
     st: &Arc<RemoteState>,
     session_id: &str,
@@ -112,6 +112,10 @@ async fn current_zcode_session(
     let scan = st.clone();
     let wanted = session_id.to_string();
     tokio::task::spawn_blocking(move || {
+        // 看板隐藏 = 用户已从可见面移除：隐藏/归档的活会话同样不进入控制面。
+        if (scan.board_hidden_ids)().iter().any(|id| id == &wanted) {
+            return None;
+        }
         (scan.session_source)()
             .sessions
             .into_iter()

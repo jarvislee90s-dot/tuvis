@@ -199,7 +199,29 @@ pub struct BoundTarget {
     pub workspace_path: String,
     pub workspace_identity: Option<String>,
     pub workspace_key: String,
+    /// 公开代际（对手机/桌面唯一的代际口径 = Hub 代际）。
     pub generation: u64,
+    /// 桥投影代际（内部，永不下发）：`bind` 产物只带投影代际，Hub 在把目标交回
+    /// 公开面时把原值收在这里；桥内 call/pending/stop/selection 一律按它核对。
+    #[serde(skip)]
+    pub bridge_generation: Option<u64>,
+}
+
+impl BoundTarget {
+    /// 桥内核对用的投影代际：Hub 覆写公开 `generation` 后回落到原值。
+    pub fn bridge_generation(&self) -> u64 {
+        self.bridge_generation.unwrap_or(self.generation)
+    }
+
+    /// 同一物理绑定（忽略公开/桥两套代际口径的差异）：会话、workspace 归属与
+    /// 桥投影代际全等。桥内精确目标比较一律走它，绝不因公开代际覆写而失配。
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.workspace_path == other.workspace_path
+            && self.workspace_identity == other.workspace_identity
+            && self.workspace_key == other.workspace_key
+            && self.bridge_generation() == other.bridge_generation()
+    }
 }
 
 // ---------------------------------------------------------------------------

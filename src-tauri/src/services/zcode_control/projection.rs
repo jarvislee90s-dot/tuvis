@@ -362,6 +362,7 @@ mod tests {
             workspace_identity: None,
             workspace_key: "/tmp/synthetic-workspace".to_owned(),
             generation,
+            bridge_generation: None,
         }
     }
 

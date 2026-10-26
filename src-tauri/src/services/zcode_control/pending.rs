@@ -136,7 +136,7 @@ impl PendingBook {
         target: &BoundTarget,
         interaction_id: &str,
     ) -> ZResult<PendingView> {
-        if target.session_id != self.session_id || target.generation != self.generation {
+        if target.session_id != self.session_id || target.bridge_generation() != self.generation {
             return Err(stale_pending());
         }
         if self.consumed.contains(interaction_id) || self.inflight.contains(interaction_id) {
@@ -882,6 +882,7 @@ mod tests {
             workspace_identity: None,
             workspace_key: "/tmp/synthetic-workspace".to_owned(),
             generation,
+            bridge_generation: None,
         }
     }
 

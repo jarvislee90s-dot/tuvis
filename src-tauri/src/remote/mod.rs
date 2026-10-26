@@ -746,51 +746,40 @@ pub(crate) fn install_zcode_hub() -> std::sync::Arc<crate::services::zcode_contr
 }
 
 /// 停服/退出断开内核（可测）：有 Hub 才显式断开（推进代际、关 relay 与全部计时器）；
-/// 未装配 = no-op。断开保留内存 JWT，但**不自动重连**——重启远程后仍需显式 connect。
+/// 未装配 = no-op。整次断开以 `wait` 为上限：到期限即返回 `false`（后台任务绝不
+/// 无限悬住——connect 持锁时 disconnect 只能等到锁释放）。
 async fn disconnect_zcode_hub_core(
     hub: Option<std::sync::Arc<crate::services::zcode_control::ZcodeHub>>,
+    wait: std::time::Duration,
 ) -> bool {
-    match hub {
-        Some(hub) => {
-            hub.disconnect().await;
-            true
+    let Some(hub) = hub else {
+        return false;
+    };
+    // `disconnect` 会先等 `connect_lock`：连接握手在途时只能等到锁释放。整次断开
+    // 以 `wait` 为硬上限，超时如实记日志并放弃（后台任务绝不无限悬住）。
+    match tokio::time::timeout(wait, hub.disconnect()).await {
+        Ok(_) => true,
+        Err(_) => {
+            log::warn!("ZCode Hub 关停未在期限内完成（在途 connect 持锁，relay 由进程收尸）");
+            false
         }
-        None => false,
     }
 }
 
-/// 关闭等待上限：只兜住调用线程不被无限阻塞（relay 断开自身另有界）。
+/// 关停任务上限：兜住后台断开不无限悬住（relay 断开自身另有界）。
 const ZCODE_HUB_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 远程显性关闭与应用退出的断开口（T7.1 C2b）。
+/// 远程显性关闭与应用退出的断开口（T7.1 C2b / Fix round 2）。
 ///
-/// 调用点（同步命令 / `RunEvent::Exit` / 升级前 `on_before_exit`）没有 runtime
-/// 上下文保证：统一在**独立线程**上 `block_on`（不嵌套 runtime、不依赖调用线程），
-/// 调用方有界等待断开真正落地（≤ [`ZCODE_HUB_SHUTDOWN_WAIT`]）——停服/退出前
-/// 断开不再「spawn 后立即返回」；超时如实记日志放弃，不把退出卡死。
+/// 调用点（同步 Tauri 命令 / `RunEvent::Exit` / 升级前 `on_before_exit`）都在主线程
+/// 或同步上下文：这里**不在调用线程等待**，只把断开交给 async runtime；任务内部
+/// 自带 [`ZCODE_HUB_SHUTDOWN_WAIT`] 上限，保证有界完成、绝不无限悬住。
 pub(crate) fn disconnect_zcode_hub() {
     let hub = STATE.zcode_hub();
     if hub.is_none() {
         return;
     }
-    let (done, wait) = std::sync::mpsc::channel();
-    let shutdown_hub = hub.clone();
-    let spawned = std::thread::Builder::new()
-        .name("zcode-hub-shutdown".into())
-        .spawn(move || {
-            tauri::async_runtime::block_on(disconnect_zcode_hub_core(shutdown_hub));
-            let _ = done.send(());
-        });
-    if spawned.is_err() {
-        // 极端资源耗尽：退回 runtime 内 spawn（不阻塞调用线程，进程退出由 OS 收 socket）。
-        log::warn!("ZCode Hub 关停线程创建失败，改为后台 spawn");
-        tauri::async_runtime::spawn(disconnect_zcode_hub_core(hub));
-        return;
-    }
-    match wait.recv_timeout(ZCODE_HUB_SHUTDOWN_WAIT) {
-        Ok(()) => {}
-        Err(error) => log::warn!("ZCode Hub 关停未在期限内确认：{error}"),
-    }
+    tauri::async_runtime::spawn(disconnect_zcode_hub_core(hub, ZCODE_HUB_SHUTDOWN_WAIT));
 }
 
 /// 从看板地址抽域名（纯函数）：快照 url 契约恒为含 /m 的完整地址（board_url 归一），
@@ -4708,7 +4697,7 @@ mod host_tests {
 #[cfg(test)]
 mod zcode_wiring_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use futures::future::BoxFuture;
@@ -4729,6 +4718,8 @@ mod zcode_wiring_tests {
         connect_calls: AtomicUsize,
         disconnect_calls: AtomicUsize,
         reset_calls: AtomicUsize,
+        /// 模拟 connect 持锁时 disconnect 被挂住（关停有界测试）。
+        disconnect_hangs: AtomicBool,
     }
 
     impl FakeBackend {
@@ -4766,6 +4757,9 @@ mod zcode_wiring_tests {
 
         fn disconnect<'a>(&'a self) -> BoxFuture<'a, ()> {
             self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
+            if self.disconnect_hangs.load(Ordering::SeqCst) {
+                return Box::pin(futures::future::pending());
+            }
             Box::pin(async {})
         }
 
@@ -4869,7 +4863,10 @@ mod zcode_wiring_tests {
         assert!(hub.connection().is_paired());
         let connects_before = fake.connect_calls.load(Ordering::SeqCst);
 
-        assert!(disconnect_zcode_hub_core(Some(hub.clone())).await);
+        assert!(
+            disconnect_zcode_hub_core(Some(hub.clone()), ZCODE_HUB_SHUTDOWN_WAIT).await,
+            "正常断开应完成"
+        );
         assert_eq!(fake.disconnect_calls.load(Ordering::SeqCst), 1);
         assert_eq!(hub.connection().state, ConnectionState::Offline);
         assert_eq!(
@@ -4886,6 +4883,35 @@ mod zcode_wiring_tests {
             "无人显式 connect 前必须保持 offline"
         );
 
-        assert!(!disconnect_zcode_hub_core(None).await, "未装配 = no-op");
+        assert!(
+            !disconnect_zcode_hub_core(None, ZCODE_HUB_SHUTDOWN_WAIT).await,
+            "未装配 = no-op"
+        );
+    }
+
+    /// 关停任务必须有界：disconnect 被 connect 锁挂住时，内核按上限返回 false，
+    /// 绝不无限悬住（调用线程不等待，后台任务也不许永久占着）。
+    #[tokio::test]
+    async fn shutdown_disconnect_is_bounded_even_when_disconnect_hangs() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.disconnect_hangs.store(true, Ordering::SeqCst);
+        let hub = fake_hub(fake.clone(), stored(URL));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            disconnect_zcode_hub_core(Some(hub), std::time::Duration::from_millis(50)),
+        )
+        .await
+        .expect("关停内核必须在有界时间内返回");
+        assert!(!completed, "超时必须有界返回 false");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "超时不得超过上限太多"
+        );
+        assert_eq!(fake.disconnect_calls.load(Ordering::SeqCst), 1);
     }
 }

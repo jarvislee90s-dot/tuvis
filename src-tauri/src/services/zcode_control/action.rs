@@ -508,6 +508,7 @@ mod tests {
             workspace_identity: None,
             workspace_key: "/tmp/ws".to_string(),
             generation: GEN,
+            bridge_generation: None,
         }
     }
 

@@ -108,6 +108,16 @@ fn state_with_sessions(
     injector: Arc<RecordingInjector>,
     sessions: Vec<Session>,
 ) -> Arc<RemoteState> {
+    state_with_hidden(conn, injector, sessions, Vec::new())
+}
+
+/// 同上，并注入看板「叉掉」（软归档）的会话集合（`board_hidden_ids`）。
+fn state_with_hidden(
+    conn: &SharedConn,
+    injector: Arc<RecordingInjector>,
+    sessions: Vec<Session>,
+    hidden: Vec<String>,
+) -> Arc<RemoteState> {
     Arc::new(RemoteState {
         ui_config_source: Box::new(|| None),
         subagent_source: std::collections::HashMap::new(),
@@ -119,7 +129,7 @@ fn state_with_sessions(
             waiting_count: 0,
         }),
         pairing_counter: Box::new(Vec::new),
-        board_hidden_ids: Box::new(Vec::new),
+        board_hidden_ids: Box::new(move || hidden.clone()),
         board_hidden_hide: Arc::new(|_| 0usize),
         board_hidden_unhide: Arc::new(|_| 0usize),
         unread_mark_read: Arc::new(|_, _| ()),
@@ -328,6 +338,7 @@ impl HubBackend for FakeHubBackend {
                 workspace_identity: None,
                 workspace_key: "/synthetic/workspace".into(),
                 generation: 1,
+                bridge_generation: None,
             })
         })
     }
@@ -651,6 +662,62 @@ async fn action_on_hidden_or_archived_zcode_session_is_404() {
     }
     assert_eq!(backend.execute_calls(), 0, "看不见的会话不得执行");
     assert!(backend.bind_calls().is_empty(), "看不见的会话不得绑定");
+}
+
+/// 看板已「叉掉」（软归档）的活 ZCode 会话：GET session/events 与 POST actions
+/// 一律 404，零绑定零执行零事件流注册（隐藏 ≠ 可控制）。
+#[tokio::test]
+async fn hidden_live_zcode_session_is_404_everywhere() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    let hub = paired_hub_open(&conn, backend.clone()).await;
+    let generation = hub.connection().generation;
+    let st = state_with_hidden(
+        &conn,
+        injector,
+        vec![zcode_session()],
+        vec![ZCODE_SESSION.into()],
+    );
+    st.set_zcode_hub(hub);
+    let registry = st.sse_registry.clone();
+    let app = router(st);
+
+    // GET session：隐藏的活会话 404。
+    let resp = app
+        .clone()
+        .oneshot(get_req(&format!(
+            "/m/api/v1/zcode/session?sessionId={ZCODE_SESSION}"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({ "error": "no_session" })
+    );
+
+    // GET events：不得注册事件流。
+    let resp = app.clone().oneshot(sse_req(ZCODE_SESSION)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    assert!(!registry.has("dev-z1"), "隐藏会话不得注册事件流");
+
+    // POST actions：404 且零绑定零执行。
+    let resp = app
+        .oneshot(action_req(
+            &send_body("action-hidden-live-0001", generation),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({ "error": "no_session" })
+    );
+    assert_eq!(backend.execute_calls(), 0, "隐藏会话不得执行");
+    assert!(backend.bind_calls().is_empty(), "隐藏会话不得绑定");
 }
 
 /// brief Step 1 冻结名：四条控制端点（connection/session/actions/events）未配对

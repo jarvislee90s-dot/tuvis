@@ -226,6 +226,16 @@ fn lock_inner(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// 后端 `bind_session` 只产出桥投影代际；公开面一律用 Hub 代际：
+/// 原值收进 `bridge_generation`（桥内 call/pending/stop/selection 对拍），
+/// `generation` 覆写为 Hub 代际（CommandSender 校验/落账/回执用公开代际）。
+fn public_target(mut target: BoundTarget, generation: u64) -> BoundTarget {
+    let bridge_generation = target.bridge_generation.unwrap_or(target.generation);
+    target.bridge_generation = Some(bridge_generation);
+    target.generation = generation;
+    target
+}
+
 /// 广播一条控制事件（先取号再发送；调用方不得持内锁）。
 ///
 /// `device_id` 只留在进程内供 SSE 过滤同会话动作（`ControlEvent` 序列化时跳过），
@@ -322,6 +332,11 @@ async fn apply_relay_state(
         }
         state.state = view.state;
         state.reason_code = view.reason_code;
+        if view.state != ConnectionState::Connecting {
+            // 非 connecting 的落定 = 本 attempt 的新状态：`connect` 据它判断迟到的
+            // 握手结果是否已被事件泵取代（新状态胜出，绝不回写假 paired）。
+            state.state_epoch = state.state_epoch.wrapping_add(1);
+        }
         if view.device_label.is_some() {
             state.device_label = view.device_label;
         }
@@ -358,6 +373,9 @@ struct Inner {
     device_label: Option<String>,
     /// 事件序号（单调递增，发现缺口用）。
     seq: u64,
+    /// 事件泵落定非 `connecting` 状态的纪元：`connect` 用它识别「握手期间已被
+    /// 更新的状态取代」（新状态胜出）。
+    state_epoch: u64,
     /// 已应用到 Hub 的 relay 事件代际（relay 自己的 generation，不是控制代际）。
     relay_generation: u64,
     /// 事件泵地板：`generation <= relay_floor` 的 relay 状态一律忽略（配置变更/断开
@@ -459,6 +477,7 @@ impl ZcodeHub {
                 reason_code: None,
                 device_label: None,
                 seq: 0,
+                state_epoch: 0,
                 relay_generation: 0,
                 relay_floor: 0,
                 last_session: None,
@@ -526,13 +545,16 @@ impl ZcodeHub {
 
     /// 落定连接状态并广播：先连接事件，再在离开 paired 时广播一次投影降级
     /// （`ready=false`）——手机据 Session 事件得知旧投影已不可用。
+    ///
+    /// 返回 `(视图, attempt 纪元)`：纪元与状态在同一把锁内取得，`connect` 据它在
+    /// 提交握手结果前判断事件泵是否已落定更新的状态。
     fn settle(
         &self,
         state: ConnectionState,
         reason_code: Option<String>,
         device_label: Option<String>,
-    ) -> ConnectionView {
-        let (view, stale) = {
+    ) -> (ConnectionView, u64) {
+        let (view, stale, attempt) = {
             let mut inner = self.lock();
             inner.state = state;
             inner.reason_code = reason_code;
@@ -543,13 +565,13 @@ impl ZcodeHub {
             } else {
                 inner.stale_session(view.generation)
             };
-            (view, stale)
+            (view, stale, inner.state_epoch)
         };
         self.emit_connection(&view);
         if let Some(stale) = stale {
             self.emit_session(&stale);
         }
-        view
+        (view, attempt)
     }
 
     fn state_of(error: &ZcodeError) -> ConnectionState {
@@ -672,28 +694,36 @@ impl ZcodeHub {
             }
         };
         let label = route.label.clone();
-        // 握手中：离开 paired，已读投影同步降级广播。
-        self.settle(ConnectionState::Connecting, None, label.clone());
+        // 握手中：离开 paired，已读投影同步降级广播；attempt 纪元与状态同锁取得。
+        let (_, attempt) = self.settle(ConnectionState::Connecting, None, label.clone());
         match self.backend.connect(route).await {
             Err(error) => Err(self.apply_failure(generation, error)),
             Ok(view) => {
-                let (out, stale) = {
-                    let mut inner = self.lock();
-                    // 迟到结果（配置变更/断开已推进代际）一律丢弃，不得回退状态。
-                    if inner.generation != generation {
-                        return Err(ZcodeError::of(codes::STALE_GENERATION));
-                    }
-                    inner.state = view.state;
-                    inner.reason_code = view.reason_code.clone();
-                    inner.device_label = view.device_label.clone().or(label);
-                    let out = inner.view();
-                    let stale = if out.state == ConnectionState::Paired {
-                        None
-                    } else {
-                        inner.stale_session(out.generation)
+                let mut inner = self.lock();
+                // 迟到结果（配置变更/断开已推进代际）一律丢弃，不得回退状态。
+                if inner.generation != generation {
+                    return Err(ZcodeError::of(codes::STALE_GENERATION));
+                }
+                // 事件泵在本 attempt 期间已落定更新的非 connecting 状态（如握手后
+                // 立即掉线）：新状态胜出，绝不把迟到的握手成功写成假 paired。
+                if inner.state_epoch != attempt {
+                    let current = inner.view();
+                    drop(inner);
+                    return match current.state {
+                        ConnectionState::Paired => Ok(current),
+                        state => Err(Self::state_error(state)),
                     };
-                    (out, stale)
+                }
+                inner.state = view.state;
+                inner.reason_code = view.reason_code.clone();
+                inner.device_label = view.device_label.clone().or(label);
+                let out = inner.view();
+                let stale = if out.state == ConnectionState::Paired {
+                    None
+                } else {
+                    inner.stale_session(out.generation)
                 };
+                drop(inner);
                 self.emit_connection(&out);
                 if let Some(stale) = stale {
                     self.emit_session(&stale);
@@ -779,6 +809,8 @@ impl ZcodeHub {
         if self.lock().generation != generation {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
+        // 公开代际 = Hub 代际；桥投影代际收进目标内部字段（桥内对拍用）。
+        let target = public_target(target, generation);
         let mut view = self.backend.session(&target).await?;
         // 读在途时代际已变：旧投影不得贴上新代际。
         if self.lock().generation != generation {
@@ -812,8 +844,11 @@ impl ZcodeHub {
         if self.lock().generation != generation {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
+        // CommandSender 只认公开代际（校验/落账/回执）；桥投影代际留在目标内部。
+        let target = public_target(target, generation);
         let mut receipt = self.backend.execute(&ctx, &target, &action).await?;
-        // 公开代际唯一：回执盖本次校验过的 Hub 代际（生产后端盖的是投影代际）。
+        // 公开代际唯一：回执盖本次校验过的 Hub 代际（CommandSender 用公开代际
+        // 校验/落账，桥投影代际只在目标内部）。
         // 若执行在途发生了换代，回执仍是旧代际——客户端据 connection 发现并重取。
         receipt.generation = generation;
         self.emit_action(&receipt, &ctx.device_id);
@@ -917,7 +952,7 @@ impl ZcodeHub {
 
     /// 写状态并广播一条连接事件（离开 paired 时附带投影降级事件）。
     fn publish(&self, state: ConnectionState, reason_code: Option<String>) -> ConnectionView {
-        self.settle(state, reason_code, None)
+        self.settle(state, reason_code, None).0
     }
 }
 
@@ -950,6 +985,8 @@ mod tests {
         routes: Mutex<Vec<(String, Option<String>)>>,
         /// 每次 reset 收到的目标代际。
         reset_generations: Mutex<Vec<u64>>,
+        /// 每次 execute 收到的目标（证明 Hub 已把公开/桥两套代际分开盖好）。
+        executed_targets: Mutex<Vec<BoundTarget>>,
     }
 
     impl FakeBackend {
@@ -1020,6 +1057,7 @@ mod tests {
                     workspace_identity: None,
                     workspace_key: "/synthetic/workspace".into(),
                     generation,
+                    bridge_generation: None,
                 })
             })
         }
@@ -1046,6 +1084,7 @@ mod tests {
             _action: &'a ControlAction,
         ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            self.executed_targets.lock().unwrap().push(target.clone());
             let receipt = ActionReceipt {
                 action_id: ctx.action_id.clone(),
                 session_id: target.session_id.clone(),
@@ -1293,6 +1332,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receipt.generation, generation, "动作回执只暴露 Hub 代际");
+        // 交到后端的精确目标：公开代际 = Hub 代际，桥投影代际 41 收进内部字段。
+        let executed = fake.executed_targets.lock().unwrap().last().cloned();
+        let executed = executed.expect("fake 必须收到一次 execute 目标");
+        assert_eq!(executed.generation, generation, "目标公开代际 = Hub 代际");
+        assert_eq!(
+            executed.bridge_generation,
+            Some(41),
+            "桥投影代际必须原样收进 bridge_generation"
+        );
+    }
+
+    /// 握手成功与 relay 掉线交错：事件泵先落定的离线态必须胜出，绝不回写假 paired。
+    #[tokio::test]
+    async fn late_connect_success_cannot_overwrite_offline() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, _pump) = pumped(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        let gate = Arc::new(Notify::new());
+        fake.gate.lock().unwrap().replace(gate.clone());
+        let late = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.connect().await })
+        };
+        wait_until(|| fake.connect_calls.load(Ordering::SeqCst) == 1).await;
+
+        // relay 在同一 relay 代际先报 paired 再掉线：泵把 Hub 落定 offline。
+        events
+            .send(RelayEvent::State(relay_view(ConnectionState::Paired, 1)))
+            .await
+            .unwrap();
+        events
+            .send(RelayEvent::State(relay_view(ConnectionState::Offline, 1)))
+            .await
+            .unwrap();
+        wait_until(|| hub.connection().state == ConnectionState::Offline).await;
+
+        gate.notify_one();
+        let result = late.await.expect("spawn 不应 panic");
+        assert!(
+            matches!(&result, Err(error) if error.is(codes::OFFLINE)),
+            "迟到的握手成功必须被更新的离线态收口，实际 {result:?}"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        assert!(!hub.connection().is_paired(), "绝不粘在假 paired");
+
+        // 不粘死：下一次显式 connect 仍会真的再开一次后端连接。
+        fake.gate.lock().unwrap().take();
+        hub.connect().await.expect("显式重连仍应可达");
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// 真并发双 connect：只有一个真正开始后端连接，另一个排队后复用同一配对。
+    #[tokio::test]
+    async fn concurrent_connect_opens_one_backend_connect() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        let gate = Arc::new(Notify::new());
+        fake.gate.lock().unwrap().replace(gate.clone());
+
+        let first = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.connect().await })
+        };
+        wait_until(|| fake.connect_calls.load(Ordering::SeqCst) == 1).await;
+        // 第二个调用在 connect_lock 上排队（不会进入后端 connect）。
+        let second = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.connect().await })
+        };
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            1,
+            "在途期间双 connect 只允许一次后端连接"
+        );
+
+        gate.notify_one();
+        assert!(first.await.unwrap().unwrap().is_paired());
+        assert!(second.await.unwrap().unwrap().is_paired());
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            1,
+            "后到的调用必须复用同一物理连接"
+        );
     }
 
     /// 配置变更后：旧代际动作零执行；重连后的会话/回执与连接视图同一代际。
