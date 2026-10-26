@@ -12,6 +12,20 @@
 // - 回执状态 `zcode-action-status`（收到回执后渲染），`data-action-state` =
 //   ActionState；`accepted` 文案恰为「已受理」，`unknown` 不得出现「已生效」。
 //
+// pending 卡（问答 / 审批，Slice B1b 契约；数据只来自新 SessionView，不进旧终端
+// 按键 API）：
+// - 卡片根 `zcode-pending-card`，`data-interaction-id` = PendingView.interactionId。
+// - 题干文本照常可读（能力关闭只锁作答面，不锁阅读面）。
+// - 问答选项 `zcode-pending-option-<index>`（0 起）；能力关闭时只读禁用（按钮
+//   disabled 或 aria-disabled），点击零动作 POST。
+// - 只读原因 `zcode-pending-reason`：`data-reason-code` = 冻结原因码，文本为按码
+//   本地化的可见文案（不是码原文）。
+// - 问答最终提交 `zcode-pending-submit`（不支持的形态下缺失或 disabled）。
+// - `sensitive: true` 的自由作答 `zcode-pending-sensitive-input` 必须是
+//   `type=password`，且不落任何草稿缓存（卸载/重挂后值为空）。
+// - 审批选项 `zcode-permission-option-<optionId>`：label 用宿主原文，点击回传的
+//   optionId 是宿主原值；fullAccess（及其他永久/未知 kind）不渲染或禁用。
+//
 // 网络层替身：GET connection / GET session / POST actions 全部为合成 DTO；不读真实
 // 账号、DB 或链接。断言「零旧 session-send / 零无头通道」= 旧发送链从未被触碰。
 
@@ -27,12 +41,16 @@ import {
   type CapabilityView,
   type ConnectionView,
   type ControlAction,
+  type PendingView,
+  type QuestionView,
   type SessionView,
 } from "@/lib/api/zcodeControl";
 import { pinZhNavigator } from "./pinZhNavigator";
 
 const SID = "session_0000000000000000000000000000000a";
 const GEN = 3;
+/** pending 卡合成 interaction id（会话 + 行/工具锚 + interaction + generation 四元组）。 */
+const PENDING_ID = "int_00000000000000000000000000000001";
 
 let unpinZh: () => void;
 
@@ -80,6 +98,41 @@ function sessionView(overrides: Partial<SessionView> = {}): SessionView {
     control: { activeWorks: [] },
     selection: null,
     capabilities: capabilities(),
+    ...overrides,
+  };
+}
+
+/** pending 卡夹具：全合成值（interaction/锚/tool 名均为假数据，不读真实账号）。 */
+function pendingView(overrides: Partial<PendingView> = {}): PendingView {
+  return {
+    interactionId: PENDING_ID,
+    kind: "userInput",
+    anchorRowId: 7,
+    toolCallId: "call_00000000000000000000000000000001",
+    createdAt: 1760000000000,
+    summary: null,
+    toolName: "AskUserQuestion",
+    schemaInteraction: "ask_user_question",
+    sensitive: false,
+    autoResolution: false,
+    autoResolutionState: null,
+    questions: [],
+    options: [],
+    ...overrides,
+  };
+}
+
+/** 单个问答问题夹具（单选；自由作答按用例覆盖）。 */
+function questionView(overrides: Partial<QuestionView> = {}): QuestionView {
+  return {
+    header: "下一步",
+    questionText: "这个任务接下来要做什么？",
+    options: [
+      { value: "opt-continue", label: "继续实现", description: null, preview: null },
+      { value: "opt-test-first", label: "先写测试", description: null, preview: null },
+    ],
+    multiSelect: false,
+    freeTextAllowed: false,
     ...overrides,
   };
 }
@@ -134,6 +187,29 @@ function postedActions(): { actionId: string; action: ControlAction }[] {
 /** 旧发送/无头入口计数：本任务任何路径都不得回退它们。 */
 const legacySendCalls = () =>
   calledUrls().filter((url) => url.includes("/session-send") || /headless/i.test(url)).length;
+
+/** 已 POST 的审批动作（按 kind 过滤：允许实现先发 snooze 前缀，不把实现细节当断言）。 */
+function permissionActions(): Extract<ControlAction, { kind: "permission" }>[] {
+  return postedActions()
+    .map(({ action }) => action)
+    .filter((action): action is Extract<ControlAction, { kind: "permission" }> => {
+      return action.kind === "permission";
+    });
+}
+
+/** 浏览器存储快照：敏感作答不得落任何草稿缓存（localStorage/sessionStorage）。 */
+function storageDump(): string {
+  return [window.localStorage, window.sessionStorage]
+    .map((storage) => {
+      const entries: Array<[string, string]> = [];
+      for (let i = 0; i < storage.length; i += 1) {
+        const key = storage.key(i);
+        if (key !== null) entries.push([key, storage.getItem(key) ?? ""]);
+      }
+      return JSON.stringify(entries);
+    })
+    .join("\n");
+}
 
 beforeEach(() => {
   // jsdom 无 EventSource；显式置空让 hook 走「GET 首拍权威」路径（本文件只测面板）。
@@ -313,5 +389,143 @@ describe("ZCode 控制面板：失败不吞草稿、不拖垮阅读面", () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
     });
     expect(postedActions()).toHaveLength(1);
+  });
+});
+
+describe("ZCode 控制面板：不受支持的问答形态只读并说明原因", () => {
+  it("unsupported_shape_is_disabled_with_reason", async () => {
+    // singleSelect 能力关闭（reasonCode = needs_evidence）：题目仍可读，作答面只读。
+    const caps = capabilities();
+    caps.singleSelect = flag(false);
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            capabilities: caps,
+            pending: [pendingView({ questions: [questionView()] })],
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    // 阅读面照常：题干文本可见（不支持的是作答通道，不是题目本身）
+    const card = await screen.findByTestId("zcode-pending-card");
+    expect(card.getAttribute("data-interaction-id")).toBe(PENDING_ID);
+    expect(screen.getByText(/这个任务接下来要做什么？/)).toBeVisible();
+
+    // 选项只读：按钮禁用，点击零动作（不把官方 pending 喂给旧终端按键链）
+    const option = screen.getByTestId("zcode-pending-option-0") as HTMLButtonElement;
+    expect(option).toBeDisabled();
+    fireEvent.click(option);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
+    expect(legacySendCalls()).toBe(0);
+
+    // 就地原因：可见的本地化文案 + 冻结码属性（码本身不是给用户看的）
+    const reason = screen.getByTestId("zcode-pending-reason");
+    expect(reason).toBeVisible();
+    expect(reason.getAttribute("data-reason-code")).toBe("needs_evidence");
+    expect(reason.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+    expect(reason.textContent).not.toContain("needs_evidence");
+
+    // 没有可用的最终提交钮（不支持的形态下缺失或 disabled——绝不假装能提交）
+    const submit = screen.queryByTestId("zcode-pending-submit");
+    if (submit !== null) expect(submit).toBeDisabled();
+  });
+});
+
+describe("ZCode 控制面板：敏感作答用密码框且不留草稿", () => {
+  it("sensitive_answer_is_password_and_not_cached", async () => {
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            pending: [
+              pendingView({
+                sensitive: true,
+                questions: [questionView({ freeTextAllowed: true })],
+              }),
+            ],
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const first = render(<ZcodeControlPanel sessionId={SID} />);
+    const input = (await screen.findByTestId("zcode-pending-sensitive-input")) as HTMLInputElement;
+    // 敏感值只走密码框，不在明文输入面回显
+    expect(input.type).toBe("password");
+
+    fireEvent.change(input, { target: { value: "合成敏感答案" } });
+    expect(input.value).toBe("合成敏感答案");
+    // 敏感作答不落任何浏览器存储（普通 composer 的草稿缓存不得染指这里）
+    expect(storageDump()).not.toContain("合成敏感答案");
+
+    // 卸载重挂：没有草稿缓存，输入从空开始（事实源只在终端/宿主）
+    first.unmount();
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const remounted = (await screen.findByTestId(
+      "zcode-pending-sensitive-input"
+    )) as HTMLInputElement;
+    expect(remounted.value).toBe("");
+    expect(storageDump()).not.toContain("合成敏感答案");
+  });
+});
+
+describe("ZCode 控制面板：审批选项回传宿主原值", () => {
+  it("permission_options_use_host_values_and_hide_full_access", async () => {
+    const pending = pendingView({
+      kind: "permission",
+      toolName: "Bash",
+      summary: "执行合成命令",
+      questions: [],
+      options: [
+        { optionId: "host-allow-once-9", label: "允许一次", kind: "allowOnce" },
+        { optionId: "host-deny-9", label: "拒绝", kind: "deny" },
+        { optionId: "host-full-access-9", label: "始终允许", kind: "fullAccess" },
+      ],
+    });
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(sessionView({ pending: [pending] }));
+      }
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    // 展示文案保留宿主原文；选项从卡渲染之后才可点
+    expect(await screen.findByText("允许一次")).toBeVisible();
+    expect(screen.getByText("拒绝")).toBeVisible();
+
+    // fullAccess（永久授权）不可用：不渲染，或渲染为禁用按钮——绝不能可点
+    const fullAccess = screen.queryByTestId("zcode-permission-option-host-full-access-9");
+    if (fullAccess !== null) expect(fullAccess).toBeDisabled();
+    const fullAccessLabel = screen.queryByText("始终允许");
+    if (fullAccessLabel !== null) expect(fullAccessLabel.closest("button")).toBeDisabled();
+
+    // 点击 allowOnce：回传宿主原 optionId（不是 kind 字面量，也不是 index）
+    fireEvent.click(screen.getByTestId("zcode-permission-option-host-allow-once-9"));
+    await waitFor(() => expect(permissionActions()).toHaveLength(1));
+    expect(permissionActions()[0]).toEqual({
+      kind: "permission",
+      sessionId: SID,
+      generation: GEN,
+      interactionId: PENDING_ID,
+      optionId: "host-allow-once-9",
+    });
+    expect(permissionActions()[0].optionId).not.toBe("allowOnce");
+    expect(legacySendCalls()).toBe(0);
   });
 });

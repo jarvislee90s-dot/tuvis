@@ -8,9 +8,16 @@
 // - 回执如实：accepted=已受理（≠ 已生效），confirmed 才显示已生效，unknown 保持中性；
 //   send_failed/rejected/unknown 保留草稿、不自动重发。就地原因只展示本地化文案，
 //   `data-reason-code` 才是冻结错误码本身。
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import i18n from "@/i18n";
-import type { ActionReceipt } from "@/lib/api/zcodeControl";
+import type {
+  ActionReceipt,
+  CapabilityFlag,
+  CapabilityView,
+  ControlAction,
+  PendingView,
+  QuestionView,
+} from "@/lib/api/zcodeControl";
 import useZcodeControl from "./useZcodeControl";
 
 interface ZcodeControlPanelProps {
@@ -36,6 +43,184 @@ const STATUS_KEYS: Record<string, string> = {
   send_failed: "mobile.zcodeControl.statusSendFailed",
   unknown: "mobile.zcodeControl.statusUnknown",
 };
+
+/** 能力关闭时的可见原因（短中文；冻结码只进 data-reason-code，不展示码原文）。 */
+const PENDING_BLOCKED_TEXT = "该作答形态暂未开放，请在终端处理";
+
+interface PendingCardProps {
+  pending: PendingView;
+  sessionId: string;
+  generation: number;
+  capabilities: CapabilityView;
+  submit: (action: ControlAction) => Promise<ActionReceipt>;
+}
+
+/** 单张 pending 卡：只读呈现 + 宿主原值回传；关闭的能力面禁用并说明原因。 */
+function PendingCard({ pending, sessionId, generation, capabilities, submit }: PendingCardProps) {
+  const [picked, setPicked] = useState<Record<string, string>>({});
+  const [freeAnswers, setFreeAnswers] = useState<Record<string, string>>({});
+  const snoozedRef = useRef(false);
+
+  const isPermission = pending.kind === "permission";
+  const isUserInput = pending.kind === "userInput";
+  const flagFor = (question: QuestionView): CapabilityFlag =>
+    question.multiSelect ? capabilities.multiSelect : capabilities.singleSelect;
+
+  // 卡片级只展示首个关闭原因：阅读面照常，作答面禁用。
+  const blocked: CapabilityFlag | null = isPermission
+    ? capabilities.approvalReply.enabled
+      ? null
+      : capabilities.approvalReply
+    : isUserInput
+      ? (pending.questions
+          .flatMap((question) => [
+            flagFor(question),
+            ...(question.freeTextAllowed ? [capabilities.freeText] : []),
+          ])
+          .find((flag) => !flag.enabled) ?? null)
+      : { enabled: false, reasonCode: "unsupported_protocol" };
+
+  /** auto_resolution：首次有效编辑补发一次 snooze（尽力而为，不阻塞渲染）。 */
+  const snoozeOnce = () => {
+    if (!pending.autoResolution || snoozedRef.current) return;
+    snoozedRef.current = true;
+    void submit({
+      kind: "snooze",
+      sessionId,
+      generation,
+      interactionId: pending.interactionId,
+    }).catch(() => {});
+  };
+
+  const submitAnswer = () => {
+    const answers = pending.questions
+      .map((question) => ({
+        questionText: question.questionText,
+        selectedValues: picked[question.questionText] ? [picked[question.questionText]] : [],
+        freeText: freeAnswers[question.questionText]?.length
+          ? freeAnswers[question.questionText]
+          : null,
+      }))
+      .filter((answer) => answer.selectedValues.length > 0 || answer.freeText !== null);
+    if (answers.length === 0) return;
+    void submit({
+      kind: "answer",
+      sessionId,
+      generation,
+      interactionId: pending.interactionId,
+      answers,
+    }).catch(() => {});
+  };
+
+  // 仅 allowOnce/deny 可回传；fullAccess 及其他永久/未知 kind 不渲染。
+  const permissionOptions = pending.options.filter(
+    (option) => option.kind === "allowOnce" || option.kind === "deny"
+  );
+  let optionIndex = 0;
+
+  return (
+    <div
+      data-testid="zcode-pending-card"
+      data-interaction-id={pending.interactionId}
+      className="mb-2 rounded-lg border border-[var(--cb)] px-3 py-2"
+    >
+      {pending.toolName !== null && <p className="text-xs text-[var(--mut)]">{pending.toolName}</p>}
+      {pending.summary !== null && <p className="text-sm text-[var(--tx)]">{pending.summary}</p>}
+      {isPermission &&
+        permissionOptions.map((option) => (
+          <button
+            key={option.optionId}
+            type="button"
+            data-testid={`zcode-permission-option-${option.optionId}`}
+            disabled={blocked !== null}
+            onClick={() => {
+              if (blocked !== null) return;
+              void submit({
+                kind: "permission",
+                sessionId,
+                generation,
+                interactionId: pending.interactionId,
+                optionId: option.optionId,
+              }).catch(() => {});
+            }}
+            className="mt-1 mr-2 rounded-lg border border-[var(--cb)] px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+          >
+            {option.label}
+          </button>
+        ))}
+      {isUserInput &&
+        pending.questions.map((question, questionIndex) => {
+          const flag = flagFor(question);
+          return (
+            <div key={`${questionIndex}-${question.questionText}`} className="mt-1">
+              <p className="text-sm text-[var(--tx)]">{question.header}</p>
+              <p className="text-sm text-[var(--tx)]">{question.questionText}</p>
+              <div className="mt-1 flex flex-wrap gap-1">
+                {question.options.map((option) => {
+                  const index = optionIndex++;
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      data-testid={`zcode-pending-option-${index}`}
+                      disabled={!flag.enabled}
+                      onClick={() => {
+                        if (!flag.enabled) return;
+                        setPicked((prev) => ({
+                          ...prev,
+                          [question.questionText]: option.value,
+                        }));
+                        snoozeOnce();
+                      }}
+                      className="rounded-lg border border-[var(--cb)] px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+                    >
+                      {option.label}
+                    </button>
+                  );
+                })}
+              </div>
+              {question.freeTextAllowed && (
+                <input
+                  type={pending.sensitive ? "password" : "text"}
+                  data-testid={pending.sensitive ? "zcode-pending-sensitive-input" : undefined}
+                  value={freeAnswers[question.questionText] ?? ""}
+                  disabled={!capabilities.freeText.enabled}
+                  onChange={(event) => {
+                    if (!capabilities.freeText.enabled) return;
+                    const value = event.target.value;
+                    // 敏感作答只存本次挂载的组件状态，不落任何草稿缓存。
+                    setFreeAnswers((prev) => ({ ...prev, [question.questionText]: value }));
+                    snoozeOnce();
+                  }}
+                  className="mt-1 w-full rounded-lg border border-[var(--cb)] px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+                />
+              )}
+            </div>
+          );
+        })}
+      {isUserInput && (
+        <button
+          type="button"
+          data-testid="zcode-pending-submit"
+          disabled={blocked !== null}
+          onClick={submitAnswer}
+          className="mt-1 rounded-full bg-[var(--btnp)]/10 px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+        >
+          提交
+        </button>
+      )}
+      {blocked !== null && (
+        <p
+          data-testid="zcode-pending-reason"
+          data-reason-code={blocked.reasonCode ?? "unknown"}
+          className="mt-1 text-xs text-[var(--mut)]"
+        >
+          {PENDING_BLOCKED_TEXT}
+        </p>
+      )}
+    </div>
+  );
+}
 
 export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps) {
   const { connection, session, reason, submitting, draftCleared, submit } =
@@ -102,6 +287,17 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           {i18n.t(STATUS_KEYS[receipt.state] ?? "mobile.zcodeControl.statusUnknown")}
         </p>
       )}
+      {session !== null &&
+        session.pending.map((pending) => (
+          <PendingCard
+            key={pending.interactionId}
+            pending={pending}
+            sessionId={sessionId}
+            generation={session.generation}
+            capabilities={session.capabilities}
+            submit={submit}
+          />
+        ))}
       <div className="flex items-end gap-2">
         <textarea
           data-testid="zcode-draft"
