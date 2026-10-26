@@ -26,6 +26,13 @@
 // - 审批选项 `zcode-permission-option-<optionId>`：label 用宿主原文，点击回传的
 //   optionId 是宿主原值；fullAccess（及其他永久/未知 kind）不渲染或禁用。
 //
+// 打断 / 模型档位（Slice B1c 契约；数据只来自新 SessionView.control/selection）：
+// - 打断按钮 `zcode-interrupt`：只认唯一 primaryTurn 的前台执行 id，提交 tagged stop
+//   （`expectedForegroundExecutionId` 精确等于该 id），绝不夹带 sendText。
+// - 模型选择 `zcode-model-select`（选项 = 当前 provider 的 models）、思考档位
+//   `zcode-thought-select`（选项 = 所选模型的 thoughtLevels）；model/thoughtLevel
+//   任一能力关闭 → 两个控件都禁用并给出可见原因，改值/点击零动作 POST。
+//
 // 网络层替身：GET connection / GET session / POST actions 全部为合成 DTO；不读真实
 // 账号、DB 或链接。断言「零旧 session-send / 零无头通道」= 旧发送链从未被触碰。
 
@@ -527,5 +534,118 @@ describe("ZCode 控制面板：审批选项回传宿主原值", () => {
     });
     expect(permissionActions()[0].optionId).not.toBe("allowOnce");
     expect(legacySendCalls()).toBe(0);
+  });
+});
+
+describe("ZCode 控制面板：打断只针对唯一的既有前台执行", () => {
+  it("interrupt_only_targets_user_selected_primary_execution", async () => {
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            control: { activeWorks: [{ kind: "primaryTurn", foregroundExecutionId: "E1" }] },
+          })
+        );
+      }
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    const interrupt = (await screen.findByTestId("zcode-interrupt")) as HTMLButtonElement;
+    await waitFor(() => expect(interrupt).toBeEnabled());
+    fireEvent.click(interrupt);
+
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    // 打断目标 = 新鲜 control 里唯一 primaryTurn 的执行 id（不是最新执行、不是猜）
+    expect(postedActions()[0].action).toEqual({
+      kind: "stop",
+      sessionId: SID,
+      generation: GEN,
+      expectedForegroundExecutionId: "E1",
+    });
+    // 打断绝不夹带 sendText：不发任何 send 动作，也不回退旧发送链
+    expect(postedActions().filter(({ action }) => action.kind === "send")).toHaveLength(0);
+    expect(legacySendCalls()).toBe(0);
+  });
+});
+
+describe("ZCode 控制面板：模型/档位按能力开放", () => {
+  it("model_thought_controls_are_capability_gated", async () => {
+    const selection = {
+      provider: "zai",
+      model: "model-a",
+      thought: "high",
+      models: [
+        { modelId: "model-a", thoughtLevels: ["low", "high"] },
+        { modelId: "model-b", thoughtLevels: ["medium"] },
+      ],
+    };
+    let caps = capabilities();
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(sessionView({ capabilities: caps, selection }));
+      }
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const first = render(<ZcodeControlPanel sessionId={SID} />);
+    const model = (await screen.findByTestId("zcode-model-select")) as HTMLSelectElement;
+    const thought = screen.getByTestId("zcode-thought-select") as HTMLSelectElement;
+    // 模型目录只含当前 provider；档位目录只含当前模型的合法值
+    expect([...model.options].map((option) => option.value)).toEqual(["model-a", "model-b"]);
+    expect(model.value).toBe("model-a");
+    expect([...thought.options].map((option) => option.value)).toEqual(["low", "high"]);
+    expect(thought.value).toBe("high");
+
+    fireEvent.change(thought, { target: { value: "low" } });
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(postedActions()[0].action).toEqual({
+      kind: "selection",
+      sessionId: SID,
+      generation: GEN,
+      model: "model-a",
+      thought: "low",
+    });
+    first.unmount();
+
+    // model 能力关闭：两个控件都禁用并给出可见原因，改值/点击零动作 POST
+    caps = capabilities();
+    caps.model = flag(false);
+    const gatedModel = render(<ZcodeControlPanel sessionId={SID} />);
+    const modelSelect = (await screen.findByTestId("zcode-model-select")) as HTMLSelectElement;
+    const thoughtSelect = screen.getByTestId("zcode-thought-select") as HTMLSelectElement;
+    expect(modelSelect).toBeDisabled();
+    expect(thoughtSelect).toBeDisabled();
+    const reason = screen.getByTestId("zcode-selection-reason");
+    expect(reason).toBeVisible();
+    expect(reason.textContent).not.toContain("needs_evidence");
+    expect(reason.textContent).toMatch(/暂未开放/);
+    fireEvent.change(modelSelect, { target: { value: "model-b" } });
+    fireEvent.change(thoughtSelect, { target: { value: "low" } });
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(1);
+    gatedModel.unmount();
+
+    // thoughtLevel 能力关闭：同样的禁用 + 原因，零动作
+    caps = capabilities();
+    caps.thoughtLevel = flag(false);
+    render(<ZcodeControlPanel sessionId={SID} />);
+    expect(await screen.findByTestId("zcode-model-select")).toBeDisabled();
+    expect(screen.getByTestId("zcode-thought-select")).toBeDisabled();
+    expect(screen.getByTestId("zcode-selection-reason")).toBeVisible();
+    fireEvent.change(screen.getByTestId("zcode-thought-select"), { target: { value: "low" } });
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(1);
   });
 });

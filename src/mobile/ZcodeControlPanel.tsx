@@ -46,6 +46,8 @@ const STATUS_KEYS: Record<string, string> = {
 
 /** 能力关闭时的可见原因（短中文；冻结码只进 data-reason-code，不展示码原文）。 */
 const PENDING_BLOCKED_TEXT = "该作答形态暂未开放，请在终端处理";
+/** 模型/档位任一能力关闭时的可见原因（两闸同开才放行，见 Rust command 授权）。 */
+const SELECTION_BLOCKED_TEXT = "模型/档位切换暂未开放，请在终端调整";
 
 interface PendingCardProps {
   pending: PendingView;
@@ -263,6 +265,68 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     }
   };
 
+  // 打断：只认新鲜 control 里唯一的 primaryTurn（多目标拒绝，禁止随取第一个）；
+  // 只发 stop，绝不夹带 sendText。
+  const stopTargets = (session?.control?.activeWorks ?? []).filter(
+    (work) => work.kind === "primaryTurn" && work.foregroundExecutionId !== null
+  );
+  const stopTarget = stopTargets.length === 1 ? stopTargets[0].foregroundExecutionId : null;
+  const canInterrupt =
+    connection?.state === "paired" &&
+    session?.ready === true &&
+    session.capabilities.interrupt.enabled &&
+    stopTarget !== null &&
+    !submitting;
+
+  const handleInterrupt = () => {
+    if (!canInterrupt || session === null || stopTarget === null) return;
+    void submit({
+      kind: "stop",
+      sessionId,
+      generation: session.generation,
+      expectedForegroundExecutionId: stopTarget,
+    })
+      .then(setReceipt)
+      .catch(() => {});
+  };
+
+  // 模型/档位：目录只来自 session.selection（当前 provider）；两闸同开才可提交，
+  // 任一关闭 → 两个控件都禁用并显示可见原因。
+  const selection = session?.selection ?? null;
+  const currentChoice =
+    selection?.models.find((choice) => choice.modelId === selection.model) ?? null;
+  const selectionEnabled =
+    session?.capabilities.model.enabled === true &&
+    session.capabilities.thoughtLevel.enabled === true;
+  const currentThought =
+    selection?.thought != null && currentChoice?.thoughtLevels.includes(selection.thought)
+      ? selection.thought
+      : (currentChoice?.thoughtLevels[0] ?? "");
+
+  const submitSelection = (model: string, thought: string) => {
+    if (session === null || !selectionEnabled || thought === "") return;
+    void submit({ kind: "selection", sessionId, generation: session.generation, model, thought })
+      .then(setReceipt)
+      .catch(() => {});
+  };
+
+  const handleModelChange = (modelId: string) => {
+    const choice = selection?.models.find((candidate) => candidate.modelId === modelId);
+    if (choice === undefined) return;
+    // 换模型时档位落在新模型的合法值里：保持旧档位，否则取首档。
+    const thought = selection?.thought;
+    const kept =
+      thought != null && choice.thoughtLevels.includes(thought)
+        ? thought
+        : (choice.thoughtLevels[0] ?? "");
+    submitSelection(modelId, kept);
+  };
+
+  const handleThoughtChange = (thought: string) => {
+    if (selection === null || currentChoice?.thoughtLevels.includes(thought) !== true) return;
+    submitSelection(selection.model, thought);
+  };
+
   return (
     <div
       data-testid="zcode-control-panel"
@@ -298,6 +362,64 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             submit={submit}
           />
         ))}
+      {selection !== null && (
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <select
+            data-testid="zcode-model-select"
+            aria-label="模型"
+            value={selection.model}
+            disabled={!selectionEnabled}
+            onChange={(e) => handleModelChange(e.target.value)}
+            className="rounded-lg border border-[var(--cb)] px-2 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+          >
+            {selection.models.map((choice) => (
+              <option key={choice.modelId} value={choice.modelId}>
+                {choice.modelId}
+              </option>
+            ))}
+          </select>
+          <select
+            data-testid="zcode-thought-select"
+            aria-label="思考强度"
+            value={currentThought}
+            disabled={!selectionEnabled}
+            onChange={(e) => handleThoughtChange(e.target.value)}
+            className="rounded-lg border border-[var(--cb)] px-2 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+          >
+            {(currentChoice?.thoughtLevels ?? []).map((level) => (
+              <option key={level} value={level}>
+                {level}
+              </option>
+            ))}
+          </select>
+          {!selectionEnabled && (
+            <p
+              data-testid="zcode-selection-reason"
+              data-reason-code={
+                session?.capabilities.model.reasonCode ??
+                session?.capabilities.thoughtLevel.reasonCode ??
+                "unknown"
+              }
+              className="text-xs text-[var(--mut)]"
+            >
+              {SELECTION_BLOCKED_TEXT}
+            </p>
+          )}
+        </div>
+      )}
+      {stopTargets.length > 0 && (
+        <div className="mb-2">
+          <button
+            type="button"
+            data-testid="zcode-interrupt"
+            disabled={!canInterrupt}
+            onClick={() => void handleInterrupt()}
+            className="rounded-full border border-[var(--cb)] px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
+          >
+            打断
+          </button>
+        </div>
+      )}
       <div className="flex items-end gap-2">
         <textarea
           data-testid="zcode-draft"
