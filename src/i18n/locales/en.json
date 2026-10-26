@@ -2092,6 +2092,7 @@
     "tswizDownloadDirFail": "Could not create the downloads folder — check permissions or download and install manually",
     "tswizInstallerCopyFail": "Could not copy the existing installer — check downloads folder permissions",
     "tswizInstallerSaveFail": "Could not save the installer — check permissions or download and install manually",
+    "zcodeControl": "ZCode official control is currently unavailable. Please try again later.",
     "zcodeUrlInvalid": "Invalid remote-control link format — paste the full link copied from the ZCode app",
     "zcodeUrlScheme": "Only official https links are supported",
     "zcodeUrlHost": "Only the official zcode.z.ai host is supported",

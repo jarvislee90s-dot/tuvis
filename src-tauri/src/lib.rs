@@ -415,6 +415,13 @@ pub fn run() {
         // 手机只经配对门内 GET /m/api/v1/official-control 读取，无写接口
         commands::zcode_remote::zcode_remote_config_get,
         commands::zcode_remote::zcode_remote_config_set,
+        // ZCode 统一控制（T7.1 C2a）：桌面入口只回 ConnectionView，绝不回凭据。
+        // `manage(Arc<ZcodeHub>)`（与 RemoteState 共用同一 Arc）在 C2b 装配；
+        // 在此之前控制命令由 Tauri 报「state not managed」，config_set 照常保存。
+        commands::zcode_remote::zcode_control_authorize,
+        commands::zcode_remote::zcode_control_connect,
+        commands::zcode_remote::zcode_control_disconnect,
+        commands::zcode_remote::zcode_control_status,
     ]);
 
     // 仅 release 构建注册 updater（评审 I3 修正，2026-10-08）：

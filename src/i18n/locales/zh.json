@@ -2092,6 +2092,7 @@
     "tswizDownloadDirFail": "创建下载目录失败——请检查目录权限或手动下载安装",
     "tswizInstallerCopyFail": "复制已有安装包失败——请检查下载目录权限",
     "tswizInstallerSaveFail": "保存安装包失败——请检查下载目录权限或手动下载安装",
+    "zcodeControl": "ZCode 官方控制暂不可用，请稍后重试",
     "zcodeUrlInvalid": "远控链接格式无效，请粘贴 ZCode 应用内复制的完整链接",
     "zcodeUrlScheme": "仅支持 https 官方链接",
     "zcodeUrlHost": "仅支持 zcode.z.ai 官方主机",
