@@ -1,14 +1,17 @@
-//! T8.1 生产链 e2e 的**进程内官方宿主假体**（`FakeOfficial`）。
+//! T8.1 e2e 的**进程内官方宿主假体**（`FakeOfficial`）。
 //!
-//! # 偏差申报（与 T8.1 brief 的「loopback HTTP+WS」相比）
+//! # 偏差申报（与 T8.1 brief 的「loopback HTTP+WS」相比）——如实范围
 //!
 //! brief 原拟 `FakeOfficialServer`（loopback HTTP+WS）。实际官方 wire（relay socket、
-//! RPC 帧编解码、桥握手、ACK 关联）已由 T1/T2 的 fake 与固定 SHA 源码证据覆盖；
-//! 本文件在 **HubBackend / 端口边界（进程内）** 扮演「官方宿主」，因此：
+//! RPC 帧编解码、桥握手、ACK 关联）由 T1/T2 的 fake 与源码证据单独覆盖；本文件在
+//! **HubBackend / 端口边界（进程内）** 扮演「官方宿主」，因此：
 //!
-//! - 不重建 HTTP/WS 与 codec——那层再假一遍只会测到自己的假实现；
-//! - 仍然记录**每一条真正离开本进程的写帧**（`Frame`：channel/method/args），
-//!   供「恰一帧 / 零帧」断言；
+//! - **不**重建 HTTP/WS 与 codec；`RelayClient ↔ BridgeManager ↔ CommandSender` 的
+//!   生产组合、以及「真实 relay 帧 → 桥 assembler → 命令信封编码」**不在本文件覆盖内**
+//!   （见 T8.1 规格评审 I1 的已知缺口）；
+//! - `Frame` 是在 [`CommandPort::call`] 入口记录的**命令层信封**
+//!   （channel/method/args），未经过 relay/codec/WS，也**没有离开本进程**；
+//!   「恰一帧 / 零帧」只证明命令层只调用一次端口，不证明 wire 形态；
 //! - 可注入宿主状态（连接态、会话投影、control、selection、ACK 正文、断链）。
 //!
 //! 端点注入纪律不变：本假体只经 `ZcodeHub::with_parts` / `CommandSender::new`
@@ -21,11 +24,12 @@
 //! | 角色 | trait | 作用 |
 //! | --- | --- | --- |
 //! | Hub 后端 | [`HubBackend`] | 授权/连接/精确绑定/投影/写动作（内部装配**真实** `CommandSender`） |
-//! | 官方命令面 | [`CommandPort`] | 记录出站帧；断链时零帧 + `offline` |
+//! | 官方命令面 | [`CommandPort`] | 记录命令层信封；断链时零帧 + `offline` |
 //! | 卡面/打断/档位端口 | `PendingPort`/`StopPort`/`SelectionPort` | 宿主观察面注入 |
 //!
 //! `HubBackend::execute` 内部用真实 [`CommandSender`]（真实 `ActionStore`）派发，
-//! 因而 e2e 覆盖「Hub → 账本去重 → 命令层 → 官方帧」整条生产链，而非绕过命令层。
+//! 因而本文件覆盖「Hub 逻辑 → 账本去重/审计 → 命令层 → 端口调用」；HTTP 装配与读链
+//! 由 `tests/zcode_control_e2e.rs` 另行覆盖。
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -41,7 +45,9 @@ use multi_agents_manager_lib::services::zcode_control::{
     SelectionView, SessionView, StopPort, TargetKey, ZResult, ZcodeError,
 };
 
-/// 一条真正离开本进程的官方写帧（`args` 是命令层信封，`args[0]`）。
+/// 命令层 `CommandPort::call` 入口的一条信封记录（`args[0]` 是命令层信封）。
+///
+/// **不等于 wire 帧**：记录发生在 relay/codec/WS 之前，帧从未离开本进程。
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub target: BoundTarget,
@@ -87,6 +93,12 @@ struct Inner {
     stop_cleared: bool,
     selection_confirmed: bool,
     ack: Value,
+    /// `StopPort::session` 每次读取的**剩余预算**（证明有界等待真的轮询到期）。
+    stop_reads: Vec<Duration>,
+    /// 宿主终态观察端口被调用的次数（证明 accepted → confirmed 走了撤卡观察）。
+    wait_host_cleared_calls: usize,
+    wait_stop_cleared_calls: usize,
+    wait_selection_calls: usize,
     /// 官方链路是否在线：断开后写帧**不记录**且返回 `offline`（模拟真正离不了机）。
     link_up: bool,
     /// 绑定期错误注入（模拟桥重订阅窗口：`bind` 在投影未就绪时 `not_ready`）。
@@ -115,6 +127,10 @@ impl Default for Inner {
             stop_cleared: true,
             selection_confirmed: true,
             ack: json!({ "status": "accepted" }),
+            stop_reads: Vec::new(),
+            wait_host_cleared_calls: 0,
+            wait_stop_cleared_calls: 0,
+            wait_selection_calls: 0,
             link_up: true,
             bind_error: None,
         }
@@ -216,6 +232,21 @@ impl FakeOfficial {
         lock(&self.inner).ack = ack;
     }
 
+    /// 注入宿主是否已撤卡（`PendingPort::wait_host_cleared` 的返回值）。
+    pub fn set_host_cleared(&self, cleared: bool) {
+        lock(&self.inner).host_cleared = cleared;
+    }
+
+    /// 注入宿主是否已停止目标执行（`StopPort::wait_stop_cleared` 的返回值）。
+    pub fn set_stop_cleared(&self, cleared: bool) {
+        lock(&self.inner).stop_cleared = cleared;
+    }
+
+    /// 注入档位是否已在宿主生效（`SelectionPort::wait_selection` 的返回值）。
+    pub fn set_selection_confirmed(&self, confirmed: bool) {
+        lock(&self.inner).selection_confirmed = confirmed;
+    }
+
     /// 模拟官方链路断开：此后任何写帧都不离机（`offline`），也不被记录。
     pub fn drop_link(&self) {
         lock(&self.inner).link_up = false;
@@ -292,6 +323,26 @@ impl FakeOfficial {
 
     pub fn inflight_cleared(&self) -> Vec<String> {
         lock(&self.inner).inflight_cleared.clone()
+    }
+
+    /// `StopPort::session` 的每次读取预算（顺序 = 轮询顺序）。
+    ///
+    /// 首个预算 ≈ 总窗，其后单调收紧：这是「有界等待真的轮询到期、且单次读只拿
+    /// 剩余期限」的直接证据；只断言零帧不足以证明等待发生过。
+    pub fn stop_reads(&self) -> Vec<Duration> {
+        lock(&self.inner).stop_reads.clone()
+    }
+
+    pub fn wait_host_cleared_calls(&self) -> usize {
+        lock(&self.inner).wait_host_cleared_calls
+    }
+
+    pub fn wait_stop_cleared_calls(&self) -> usize {
+        lock(&self.inner).wait_stop_cleared_calls
+    }
+
+    pub fn wait_selection_calls(&self) -> usize {
+        lock(&self.inner).wait_selection_calls
     }
 }
 
@@ -493,7 +544,11 @@ impl PendingPort for FakeOfficial {
         _baseline_revision: u64,
         _timeout: Duration,
     ) -> BoxFuture<'a, bool> {
-        let cleared = lock(&self.inner).host_cleared;
+        let cleared = {
+            let mut inner = lock(&self.inner);
+            inner.wait_host_cleared_calls += 1;
+            inner.host_cleared
+        };
         Box::pin(async move { cleared })
     }
 
@@ -517,8 +572,9 @@ impl StopPort for FakeOfficial {
     fn session<'a>(
         &'a self,
         target: &'a BoundTarget,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> BoxFuture<'a, ZResult<SessionView>> {
+        lock(&self.inner).stop_reads.push(timeout);
         HubBackend::session(self, target)
     }
 
@@ -529,7 +585,11 @@ impl StopPort for FakeOfficial {
         _baseline_revision: u64,
         _timeout: Duration,
     ) -> BoxFuture<'a, bool> {
-        let cleared = lock(&self.inner).stop_cleared;
+        let cleared = {
+            let mut inner = lock(&self.inner);
+            inner.wait_stop_cleared_calls += 1;
+            inner.stop_cleared
+        };
         Box::pin(async move { cleared })
     }
 }
@@ -567,7 +627,11 @@ impl SelectionPort for FakeOfficial {
         _baseline_revision: u64,
         _timeout: Duration,
     ) -> BoxFuture<'a, bool> {
-        let confirmed = lock(&self.inner).selection_confirmed;
+        let confirmed = {
+            let mut inner = lock(&self.inner);
+            inner.wait_selection_calls += 1;
+            inner.selection_confirmed
+        };
         Box::pin(async move { confirmed })
     }
 }
@@ -591,5 +655,25 @@ pub fn stop_policy() -> CapabilityView {
             reason_code: None,
         },
         ..send_policy()
+    }
+}
+
+/// 全开矩阵：只用于**正向**卡动作/档位用例（问答、审批、选择）。
+///
+/// 生产默认矩阵仍全部关闭；这里的开闸只代表测试显式装配，不是证据发放。
+pub fn all_policy() -> CapabilityView {
+    let on = || CapabilityFlag {
+        enabled: true,
+        reason_code: None,
+    };
+    CapabilityView {
+        send: on(),
+        single_select: on(),
+        multi_select: on(),
+        free_text: on(),
+        interrupt: on(),
+        approval_reply: on(),
+        model: on(),
+        thought_level: on(),
     }
 }
