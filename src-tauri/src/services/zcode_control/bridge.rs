@@ -1186,6 +1186,38 @@ impl PendingPort for BridgeManager {
             }
         })
     }
+
+    /// 本地消费：只改**精确绑定会话**的册（错会话/错代际/卡不在册 → 零副作用）。
+    fn mark_resolved_local(&self, target: &BoundTarget, interaction_id: &str) {
+        self.with_exact_book(target, |book| book.mark_resolved_local(interaction_id));
+    }
+
+    /// 确证零写后释放本地在途（写后未知不调用）。
+    fn clear_local_inflight(&self, target: &BoundTarget, interaction_id: &str) {
+        self.with_exact_book(target, |book| book.clear_local_inflight(interaction_id));
+    }
+}
+
+impl BridgeManager {
+    /// 在状态锁内对**精确目标**（同会话 + 同代际 + 同 workspace 绑定）的 pending
+    /// 册做一次本地状态变更；任一不匹配 → 不做任何事。
+    fn with_exact_book(
+        &self,
+        target: &BoundTarget,
+        f: impl FnOnce(&mut super::pending::PendingBook),
+    ) {
+        let mut inner = lock(&self.shared.state);
+        if inner.generation != target.generation {
+            return;
+        }
+        let Some(entry) = inner.sessions.get_mut(&target.session_id) else {
+            return;
+        };
+        if entry.target != *target {
+            return;
+        }
+        f(entry.projection.pending_book_mut());
+    }
 }
 
 impl Shared {

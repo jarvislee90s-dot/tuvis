@@ -472,6 +472,14 @@ pub trait PendingPort: Send + Sync {
         baseline_revision: u64,
         timeout: Duration,
     ) -> BoxFuture<'a, bool>;
+
+    /// 本地消费（resolve 已被宿主 ACK 受理）：移出展示与本地在途，**不**代表宿主
+    /// 撤卡（宿主集合由下一帧整体替换独立推进）。错会话/错代际/卡不存在 → 零副作用。
+    fn mark_resolved_local(&self, target: &BoundTarget, interaction_id: &str);
+
+    /// 确证零写（绑定/编码拒绝、答案校验失败）后释放本地在途：用户可以同一张卡重试。
+    /// 写后结果未知时**不得**调用（那会放开重复提交闸）。
+    fn clear_local_inflight(&self, target: &BoundTarget, interaction_id: &str);
 }
 
 /// `wait_host_cleared` 的轮询上限（50ms；有界、不忙等）。

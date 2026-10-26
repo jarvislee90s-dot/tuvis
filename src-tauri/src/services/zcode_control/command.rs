@@ -25,6 +25,15 @@
 //! （绝不走终端注入的 `normalize_newlines`，那会把换行变字面 `\n` 两个字符）；
 //! 签名开关单点复用 [`message_signature_enabled_conn`]（设置缺省 off），`/` 开头
 //! 不加后缀。审计/日志/错误只含类别与计数，不摘正文。
+//!
+//! # 问答与 snooze（T4.1 Slice B2）
+//!
+//! `Answer` 走「预留 → 宿主授权 → 原值映射 →（必要时 snooze）→ 恰一帧
+//! `resolveInteraction`」：授权/映射失败零帧；`autoResolution` 在场的卡必须先收到
+//! snooze 的 accepted ACK **且**卡仍在宿主集合，否则零 resolve。ACK accepted/duplicate
+//! 只算 `accepted`（本地消费，**不等于**宿主撤卡），只有 ACK 后 10s 内观察到宿主
+//! pending 代数前进且该 id 消失才升级 `confirmed`。`Snooze` 独立动作只暂停计时，
+//! 不消费卡（结果无论如何都释放本地在途）。答案正文只穿过 wire 与内存，账本只存指纹。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,9 +47,10 @@ use crate::services::codex_desktop_ipc::types::new_uuid;
 
 use super::action::{action_params, audit_summary, payload_hash, ActionStore, Reservation};
 use super::bridge::{BridgeManager, AGENT_CHANNEL};
+use super::pending::build_user_answer;
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, BoundTarget, CommandPort, ControlAction,
-    ZResult, ZcodeError,
+    PendingPort, ZResult, ZcodeError,
 };
 
 /// 官方发送方法名（`zcodeAgent.ts:937`、探针 `SendOnceLoop`）。
@@ -49,9 +59,17 @@ pub const AGENT_SEND_COMMAND_METHOD: &str = "sendConversationCommandV4";
 /// 信封 `type`（普通文本；`command.ts:95-135` 的 `sendText` 只必带 `text`）。
 pub const SEND_TEXT_TYPE: &str = "sendText";
 
+/// 信封 `type`（问答应答；探针 `INTERACTION_COMMAND_TYPES.resolve`，
+/// `command.ts:221-234`：payload `{interactionId, answer}`）。
+pub const RESOLVE_INTERACTION_TYPE: &str = "resolveInteraction";
+
 /// ACK 等待窗（20s，与生产计划一致）：原样交给端口（桥的 RPC 待答条目按它收口
 /// 并清账），窗内无应答按保守 `unknown`，绝不重发。
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 应答 ACK 后等待宿主撤卡的观察窗（10s，探针 `INTERACTION_TERMINAL_WAIT_MS`）：
+/// 只有宿主 pending 代数前进且该 id 消失才升级 `confirmed`，否则停在 `accepted`。
+pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 单条正文的 UTF-8 字节预算。
 ///
@@ -144,10 +162,15 @@ pub struct CommandSender {
     actions: ActionStore,
     store: DeviceStore,
     ack_timeout: Duration,
+    /// pending 授权 / snooze / 宿主终态端口：`Answer`/`Snooze` 必需，生产接线在 T7.1。
+    pending: Option<Arc<dyn PendingPort>>,
+    /// 宿主撤卡观察窗（测试注入短窗；生产 [`CONFIRM_TIMEOUT`]）。
+    confirm_timeout: Duration,
 }
 
 impl CommandSender {
-    /// 生产构造：ACK 窗取 [`ACK_TIMEOUT`]。
+    /// 生产构造：ACK 窗取 [`ACK_TIMEOUT`]；尚未接 pending 端口（T7.1 用
+    /// [`Self::with_pending`] 装配，未装配时 Answer/Snooze 一律 `not_ready`）。
     pub fn new(bridge: Arc<dyn CommandPort>, store: DeviceStore) -> Self {
         Self::with_timeout(bridge, store, ACK_TIMEOUT)
     }
@@ -163,22 +186,51 @@ impl CommandSender {
             actions: ActionStore::new(store.clone()),
             store,
             ack_timeout,
+            pending: None,
+            confirm_timeout: CONFIRM_TIMEOUT,
         }
+    }
+
+    /// 装配 pending 授权 / snooze / 宿主终态端口（生产 = `BridgeManager`，T7.1 接线）。
+    pub fn with_pending(mut self, pending: Arc<dyn PendingPort>) -> Self {
+        self.pending = Some(pending);
+        self
+    }
+
+    /// 注入宿主撤卡观察窗（测试专用：10s 用例不真等 10s）。
+    #[cfg(test)]
+    pub(crate) fn with_confirm_timeout(mut self, confirm_timeout: Duration) -> Self {
+        self.confirm_timeout = confirm_timeout;
+        self
     }
 
     /// 执行一次控制动作。
     ///
-    /// 本批只实现 `Send`；其余 `ControlAction` 变体一律 `invalid_action` 且零帧零行
-    /// （T4–T6 逐个接入，绝不伪造成功）。
+    /// 已接入 `Send`/`Answer`/`Snooze`；其余 `ControlAction` 变体一律 `invalid_action`
+    /// 且零帧零行（T4.2–T6 逐个接入，绝不伪造成功）。Answer/Snooze 在未装配 pending
+    /// 端口时一律 `not_ready`（零帧零行，生产接线在 T7.1）。
     pub async fn execute(
         &self,
         ctx: &ActionContext,
         target: &BoundTarget,
         action: &ControlAction,
     ) -> ZResult<ActionReceipt> {
-        let ControlAction::Send { text, .. } = action else {
-            return Err(invalid_action());
-        };
+        self.check_action(ctx, target, action)?;
+        match action {
+            ControlAction::Send { .. } => self.execute_send(ctx, target, action).await,
+            ControlAction::Answer { .. } => self.execute_answer(ctx, target, action).await,
+            ControlAction::Snooze { .. } => self.execute_snooze(ctx, target, action).await,
+            _ => Err(invalid_action()),
+        }
+    }
+
+    /// 动作身份校验（所有变体共用）：空 actionId 会成为全局幂等键，必须拒绝。
+    fn check_action(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<()> {
         if ctx.action_id.trim().is_empty() {
             // 空 actionId 会成为全局幂等键（第一个空 id 动作占位，后续一律冲突）。
             return Err(invalid_action());
@@ -189,7 +241,19 @@ impl CommandSender {
         if action.generation() != target.generation {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
+        Ok(())
+    }
 
+    /// 普通文本发送。
+    async fn execute_send(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<ActionReceipt> {
+        let ControlAction::Send { text, .. } = action else {
+            return Err(invalid_action());
+        };
         // 正文出口（含空白/预算校验）：校验失败零帧零行，不去碰账本。
         let signature_on = self.store.with(message_signature_enabled_conn);
         let composed = compose_official_text(&ctx.device_name, text, signature_on)?;
@@ -214,12 +278,219 @@ impl CommandSender {
         }
 
         let receipt = self.dispatch_send(ctx, target, composed).await;
-        if let Err(error) = self.actions.record_result(&receipt) {
-            // 已写出后账本更新失败：不得对手机谎报失败；该行保持保守 unknown，
-            // 同 actionId 重放只会拿到 unknown 且不重发。
+        self.record(&receipt);
+        Ok(receipt)
+    }
+
+    /// 预留动作（幂等指纹 = kind + 会话 + 代际 + 全部参数，只落指纹不落正文）。
+    ///
+    /// 同 actionId 同载荷 → 既有回执（调用方直接返回，零帧）；不同载荷/跨设备 → 冲突。
+    fn reserve_action(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<Option<ActionReceipt>> {
+        let params = action_params(action);
+        let hash = payload_hash(
+            action.kind(),
+            &target.session_id,
+            target.generation,
+            &params,
+        )?;
+        let summary = audit_summary(action.kind(), &params);
+        match self
+            .actions
+            .reserve_with_kind(ctx, target, action.kind(), &hash, &summary)?
+        {
+            Reservation::Existing(receipt) => Ok(Some(receipt)),
+            Reservation::New => Ok(None),
+        }
+    }
+
+    /// 问答应答：预留 → 宿主授权 → 原值映射 →（必要时 snooze）→ 恰一帧 resolve。
+    async fn execute_answer(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<ActionReceipt> {
+        let ControlAction::Answer {
+            interaction_id,
+            answers,
+            ..
+        } = action
+        else {
+            return Err(invalid_action());
+        };
+        let Some(pending) = self.pending.as_ref() else {
+            // 未装配 pending 端口：不能证明卡在宿主在场，零帧零行。
+            return Err(ZcodeError::of(codes::NOT_READY));
+        };
+        if let Some(existing) = self.reserve_action(ctx, target, action)? {
+            return Ok(existing);
+        }
+        // 宿主观察基线：终态要求「代数前进且该 id 不在宿主集合」。
+        let baseline = pending.host_pending_revision();
+        let card = pending.authorize_pending(target, interaction_id).await?;
+        // 原值映射（含 schema 冻结闸/选项集合/重名题干）：失败零帧、释放本地在途。
+        let answer = match build_user_answer(&card, answers) {
+            Ok(answer) => answer,
+            Err(error) => {
+                pending.clear_local_inflight(target, interaction_id);
+                return Err(error);
+            }
+        };
+        // autoResolution 在场：先 snooze（恰一帧）且必须 accepted + 卡仍在宿主集合，
+        // 否则零 resolve（失败按可证明性收口：确证零写 → send_failed，其余 unknown）。
+        if card.auto_resolution {
+            if let Err(error) = pending
+                .snooze(target, interaction_id, self.ack_timeout)
+                .await
+            {
+                let (state, reason_code) = classify_port_error(&error);
+                if state == ActionState::SendFailed {
+                    pending.clear_local_inflight(target, interaction_id);
+                }
+                let receipt = self.make_receipt(ctx, target, state, reason_code);
+                self.record(&receipt);
+                return Ok(receipt);
+            }
+            if !pending.host_has_pending(interaction_id) {
+                // snooze 已写出但宿主集合已无此卡：不猜是否受理，零 resolve。
+                let receipt = self.make_receipt(
+                    ctx,
+                    target,
+                    ActionState::Unknown,
+                    Some(codes::STALE_PENDING.to_owned()),
+                );
+                self.record(&receipt);
+                return Ok(receipt);
+            }
+        }
+
+        let mut receipt = self
+            .dispatch_resolve(ctx, target, interaction_id, answer)
+            .await;
+        if receipt.state != ActionState::Accepted && !pending.host_has_pending(interaction_id) {
+            receipt.state = ActionState::Unknown;
+            receipt.reason_code = Some(codes::STALE_PENDING.to_owned());
+        }
+        if receipt.state == ActionState::Accepted {
+            // 本地消费 ≠ 宿主撤卡：先收口在途，再等宿主自己的整体替换。
+            pending.mark_resolved_local(target, interaction_id);
+            self.record(&receipt);
+            if pending
+                .wait_host_cleared(interaction_id, baseline, self.confirm_timeout)
+                .await
+            {
+                // 只有「代数前进 + 卡消失」才是因果终态；超时停在 accepted。
+                receipt.state = ActionState::Confirmed;
+                receipt.reason_code = None;
+            }
+        } else if receipt.state == ActionState::SendFailed {
+            // 确证零写：释放本地在途，用户可重试同一张卡。
+            pending.clear_local_inflight(target, interaction_id);
+        }
+        self.record(&receipt);
+        Ok(receipt)
+    }
+
+    /// 暂停问答卡自动结束计时（独立动作）：不消费卡，结果无论如何都释放本地在途。
+    async fn execute_snooze(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<ActionReceipt> {
+        let ControlAction::Snooze { interaction_id, .. } = action else {
+            return Err(invalid_action());
+        };
+        let Some(pending) = self.pending.as_ref() else {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        };
+        if let Some(existing) = self.reserve_action(ctx, target, action)? {
+            return Ok(existing);
+        }
+        pending.authorize_pending(target, interaction_id).await?;
+        let result = pending
+            .snooze(target, interaction_id, self.ack_timeout)
+            .await;
+        // snooze 不消费卡：用户之后仍要作答，必须放开本地在途闸。
+        pending.clear_local_inflight(target, interaction_id);
+        match result {
+            Ok(()) => {
+                let receipt = self.make_receipt(ctx, target, ActionState::Accepted, None);
+                self.record(&receipt);
+                Ok(receipt)
+            }
+            Err(error) => {
+                // 冻结映射：noop → stale_pending、rejected → invalid_action、超窗 → unknown；
+                // 三类都按错误上抛（不是成功回执），账本按可证明性保守收口。
+                let (state, reason_code) = classify_port_error(&error);
+                let receipt = self.make_receipt(ctx, target, state, reason_code);
+                self.record(&receipt);
+                Err(error)
+            }
+        }
+    }
+
+    /// 构造并**恰一次**调用 resolveInteraction 端口（channel/method/信封与探针一致）。
+    async fn dispatch_resolve(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        interaction_id: &str,
+        answer: Value,
+    ) -> ActionReceipt {
+        let envelope = serde_json::json!({
+            "commandId": new_command_id(),
+            // clientId 只来自可信调用方上下文（配对门/本机 DB）。
+            "clientId": ctx.device_id,
+            "sessionId": target.session_id,
+            "type": RESOLVE_INTERACTION_TYPE,
+            "payload": { "interactionId": interaction_id, "answer": answer },
+            "issuedAt": now_ms(),
+        });
+        let (state, reason_code) = match self
+            .bridge
+            .call(
+                target,
+                AGENT_CHANNEL,
+                AGENT_SEND_COMMAND_METHOD,
+                vec![envelope],
+                self.ack_timeout,
+            )
+            .await
+        {
+            Err(error) => classify_port_error(&error),
+            Ok(ack) => classify_ack(&ack),
+        };
+        self.make_receipt(ctx, target, state, reason_code)
+    }
+
+    /// 组装回执（actionId/session/generation 只来自可信上下文）。
+    fn make_receipt(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        state: ActionState,
+        reason_code: Option<String>,
+    ) -> ActionReceipt {
+        ActionReceipt {
+            action_id: ctx.action_id.clone(),
+            session_id: target.session_id.clone(),
+            generation: target.generation,
+            state,
+            reason_code,
+        }
+    }
+
+    /// 落账回执；失败时只记错误码（不得对手机谎报失败）。
+    fn record(&self, receipt: &ActionReceipt) {
+        if let Err(error) = self.actions.record_result(receipt) {
             log::error!("zcode_actions: receipt not persisted: {error:?}");
         }
-        Ok(receipt)
     }
 
     /// 构造信封并**恰一次**调用发送端口（无重发、无第二次 sendText、无 CLI 降级）。
@@ -938,28 +1209,14 @@ mod tests {
         assert_eq!(failed.reason_code.as_deref(), Some(codes::STALE_GENERATION));
     }
 
-    /// 非 send 变体：invalid_action 且零帧零行（T4–T6 才接入，不伪造成功）。
+    /// 未接入变体：invalid_action 且零帧零行；Answer/Snooze 已接入命令层，但未装配
+    /// pending 端口时一律 not_ready（零帧零行，生产接线在 T7.1）。
     #[tokio::test]
     async fn non_send_actions_are_invalid_and_zero_wire() {
         let store = DeviceStore::memory();
         let fake = FakeBridge::new(Reply::Body(accepted_body()));
         let sender = sender(&fake, &store);
-        let actions = [
-            ControlAction::Snooze {
-                session_id: SESSION.to_string(),
-                generation: GEN,
-                interaction_id: "ix-1".to_string(),
-            },
-            ControlAction::Answer {
-                session_id: SESSION.to_string(),
-                generation: GEN,
-                interaction_id: "ix-1".to_string(),
-                answers: vec![AnswerEntry {
-                    question_text: "题".to_string(),
-                    selected_values: vec!["A".to_string()],
-                    free_text: None,
-                }],
-            },
+        let unsupported = [
             ControlAction::Permission {
                 session_id: SESSION.to_string(),
                 generation: GEN,
@@ -978,7 +1235,7 @@ mod tests {
                 thought: "high".to_string(),
             },
         ];
-        for (index, action) in actions.iter().enumerate() {
+        for (index, action) in unsupported.iter().enumerate() {
             let err = sender
                 .execute(&ctx(&format!("a-{index}")), &target(), action)
                 .await
@@ -987,6 +1244,35 @@ mod tests {
                 err.code,
                 "invalid_action",
                 "{} 未接入必须拒绝",
+                action.kind()
+            );
+        }
+        let needs_port = [
+            ControlAction::Snooze {
+                session_id: SESSION.to_string(),
+                generation: GEN,
+                interaction_id: "ix-1".to_string(),
+            },
+            ControlAction::Answer {
+                session_id: SESSION.to_string(),
+                generation: GEN,
+                interaction_id: "ix-1".to_string(),
+                answers: vec![AnswerEntry {
+                    question_text: "题".to_string(),
+                    selected_values: vec!["A".to_string()],
+                    free_text: None,
+                }],
+            },
+        ];
+        for (index, action) in needs_port.iter().enumerate() {
+            let err = sender
+                .execute(&ctx(&format!("a-p{index}")), &target(), action)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                "not_ready",
+                "{} 未装配 pending 端口必须拒绝",
                 action.kind()
             );
         }
@@ -1213,5 +1499,767 @@ mod tests {
             &message,
         )
         .expect("预算内的最坏转义正文必须可以通过物理帧编码（1 MiB 含 Base64）");
+    }
+
+    // ============================================================
+    // T4.1 Slice B2：问答应答 / snooze / 宿主终态（tests::answer）
+    // ============================================================
+
+    mod answer {
+        use super::*;
+        use std::collections::BTreeSet;
+        use std::time::Instant;
+
+        use serde_json::json;
+
+        use crate::services::zcode_control::types::{
+            PendingKind, PendingView, QuestionOption, QuestionView,
+        };
+
+        /// 宿主 pending 侧的测试替身（与出站 `FakeBridge` 分开：授权/snooze/终态
+        /// 是独立端口；生产两者都是 `BridgeManager`）。
+        struct FakePending {
+            inner: Mutex<PendingState>,
+        }
+
+        struct PendingState {
+            target: BoundTarget,
+            card: PendingView,
+            /// 本地仍在册（authorize 可过）：与宿主集合独立。
+            local_present: bool,
+            /// 宿主最近一帧的卡集合。
+            host_ids: BTreeSet<String>,
+            host_revision: u64,
+            inflight: BTreeSet<String>,
+            consumed: BTreeSet<String>,
+            snooze_result: Result<(), &'static str>,
+            snooze_calls: usize,
+            /// `wait_host_cleared` 首次轮询时模拟宿主撤卡（推进代数 + 移出集合）。
+            clear_on_wait: bool,
+        }
+
+        impl FakePending {
+            fn new(target: BoundTarget, card: PendingView) -> Arc<Self> {
+                let interaction_id = card.interaction_id.clone();
+                Arc::new(Self {
+                    inner: Mutex::new(PendingState {
+                        target,
+                        card,
+                        local_present: true,
+                        host_ids: [interaction_id].into_iter().collect(),
+                        host_revision: 1,
+                        inflight: BTreeSet::new(),
+                        consumed: BTreeSet::new(),
+                        snooze_result: Ok(()),
+                        snooze_calls: 0,
+                        clear_on_wait: false,
+                    }),
+                })
+            }
+
+            fn set_snooze_error(&self, code: &'static str) {
+                self.inner.lock().unwrap().snooze_result = Err(code);
+            }
+
+            fn clear_host_card(&self) {
+                let mut state = self.inner.lock().unwrap();
+                let interaction_id = state.card.interaction_id.clone();
+                state.host_ids.remove(&interaction_id);
+                state.host_revision += 1;
+            }
+
+            fn clear_on_wait(&self) {
+                self.inner.lock().unwrap().clear_on_wait = true;
+            }
+
+            fn snooze_calls(&self) -> usize {
+                self.inner.lock().unwrap().snooze_calls
+            }
+
+            fn consumed(&self, interaction_id: &str) -> bool {
+                self.inner.lock().unwrap().consumed.contains(interaction_id)
+            }
+        }
+
+        impl PendingPort for FakePending {
+            fn authorize_pending<'a>(
+                &'a self,
+                target: &'a BoundTarget,
+                interaction_id: &'a str,
+            ) -> BoxFuture<'a, ZResult<PendingView>> {
+                Box::pin(async move {
+                    let mut state = self.inner.lock().unwrap();
+                    if *target != state.target {
+                        return Err(ZcodeError::of(codes::STALE_PENDING));
+                    }
+                    if state.consumed.contains(interaction_id)
+                        || state.inflight.contains(interaction_id)
+                    {
+                        return Err(ZcodeError::of(codes::STALE_PENDING));
+                    }
+                    if !state.local_present || state.card.interaction_id != interaction_id {
+                        return Err(ZcodeError::of(codes::STALE_PENDING));
+                    }
+                    state.inflight.insert(interaction_id.to_owned());
+                    Ok(state.card.clone())
+                })
+            }
+
+            fn snooze<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+                _interaction_id: &'a str,
+                _timeout: Duration,
+            ) -> BoxFuture<'a, ZResult<()>> {
+                Box::pin(async move {
+                    let mut state = self.inner.lock().unwrap();
+                    state.snooze_calls += 1;
+                    state.snooze_result.map_err(ZcodeError::of)
+                })
+            }
+
+            fn host_pending_revision(&self) -> u64 {
+                self.inner.lock().unwrap().host_revision
+            }
+
+            fn host_has_pending(&self, interaction_id: &str) -> bool {
+                self.inner.lock().unwrap().host_ids.contains(interaction_id)
+            }
+
+            fn wait_host_cleared<'a>(
+                &'a self,
+                interaction_id: &'a str,
+                baseline_revision: u64,
+                timeout: Duration,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async move {
+                    let deadline = Instant::now()
+                        .checked_add(timeout)
+                        .unwrap_or_else(Instant::now);
+                    loop {
+                        {
+                            let mut state = self.inner.lock().unwrap();
+                            if state.clear_on_wait && state.host_revision == baseline_revision {
+                                state.clear_on_wait = false;
+                                state.host_ids.remove(interaction_id);
+                                state.host_revision += 1;
+                            }
+                            if state.host_revision > baseline_revision
+                                && !state.host_ids.contains(interaction_id)
+                            {
+                                return true;
+                            }
+                        }
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return false;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+            }
+
+            fn mark_resolved_local(&self, target: &BoundTarget, interaction_id: &str) {
+                let mut state = self.inner.lock().unwrap();
+                if *target != state.target {
+                    return;
+                }
+                state.inflight.remove(interaction_id);
+                state.consumed.insert(interaction_id.to_owned());
+                state.local_present = false;
+            }
+
+            fn clear_local_inflight(&self, target: &BoundTarget, interaction_id: &str) {
+                let mut state = self.inner.lock().unwrap();
+                if *target != state.target {
+                    return;
+                }
+                state.inflight.remove(interaction_id);
+            }
+        }
+
+        fn question(
+            question_text: &str,
+            values: &[&str],
+            multi_select: bool,
+            free_text_allowed: bool,
+        ) -> QuestionView {
+            QuestionView {
+                header: "H".to_owned(),
+                question_text: question_text.to_owned(),
+                options: values
+                    .iter()
+                    .map(|value| QuestionOption {
+                        value: (*value).to_owned(),
+                        label: (*value).to_owned(),
+                        description: None,
+                        preview: None,
+                    })
+                    .collect(),
+                multi_select,
+                free_text_allowed,
+            }
+        }
+
+        fn card(
+            interaction_id: &str,
+            auto_resolution: bool,
+            questions: Vec<QuestionView>,
+        ) -> PendingView {
+            PendingView {
+                interaction_id: interaction_id.to_owned(),
+                kind: PendingKind::UserInput,
+                anchor_row_id: Some(7),
+                tool_call_id: Some("call_synthetic_0002".to_owned()),
+                created_at: Some(1_700_000_000_000),
+                summary: Some("synthetic: pick answers".to_owned()),
+                tool_name: Some("AskUserQuestion".to_owned()),
+                schema_interaction: None,
+                sensitive: false,
+                auto_resolution,
+                auto_resolution_state: auto_resolution.then(|| "visibleCountdown".to_owned()),
+                questions,
+                options: Vec::new(),
+            }
+        }
+
+        fn single_card(interaction_id: &str) -> PendingView {
+            card(
+                interaction_id,
+                false,
+                vec![question("原题？", &["A", "B"], false, false)],
+            )
+        }
+
+        fn fake_pending(card: PendingView) -> Arc<FakePending> {
+            FakePending::new(target(), card)
+        }
+
+        fn answer_entry(question_text: &str, values: &[&str]) -> AnswerEntry {
+            AnswerEntry {
+                question_text: question_text.to_owned(),
+                selected_values: values.iter().map(|value| (*value).to_owned()).collect(),
+                free_text: None,
+            }
+        }
+
+        fn free_text_entry(question_text: &str, text: &str) -> AnswerEntry {
+            AnswerEntry {
+                question_text: question_text.to_owned(),
+                selected_values: Vec::new(),
+                free_text: Some(text.to_owned()),
+            }
+        }
+
+        fn answer_action(interaction_id: &str, answers: Vec<AnswerEntry>) -> ControlAction {
+            answer_action_for(SESSION, GEN, interaction_id, answers)
+        }
+
+        fn answer_action_for(
+            session_id: &str,
+            generation: u64,
+            interaction_id: &str,
+            answers: Vec<AnswerEntry>,
+        ) -> ControlAction {
+            ControlAction::Answer {
+                session_id: session_id.to_owned(),
+                generation,
+                interaction_id: interaction_id.to_owned(),
+                answers,
+            }
+        }
+
+        fn answer_sender(
+            fake: &Arc<FakeBridge>,
+            pending: &Arc<FakePending>,
+            store: &DeviceStore,
+        ) -> CommandSender {
+            CommandSender::with_timeout(fake.clone(), store.clone(), Duration::from_millis(20))
+                .with_pending(pending.clone())
+                .with_confirm_timeout(Duration::from_millis(40))
+        }
+
+        fn resolve_frames(fake: &FakeBridge) -> Vec<Frame> {
+            fake.frames()
+                .into_iter()
+                .filter(|frame| {
+                    frame
+                        .args
+                        .first()
+                        .map(|envelope| envelope["type"] == json!("resolveInteraction"))
+                        .unwrap_or(false)
+                })
+                .collect()
+        }
+
+        fn stored_state(store: &DeviceStore, action_id: &str) -> Option<String> {
+            store.with(|conn| {
+                conn.query_row(
+                    "SELECT state FROM zcode_actions WHERE action_id = ?1",
+                    [action_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            })
+        }
+
+        /// 账本 + 审计的全列 dump（断言敏感正文从不落库）。
+        fn db_dump(store: &DeviceStore) -> String {
+            store.with(|conn| {
+                let mut dump = String::new();
+                for table in ["zcode_actions", "write_audit"] {
+                    let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+                    let columns = statement.column_count();
+                    let mut rows = statement.query([]).unwrap();
+                    while let Some(row) = rows.next().unwrap() {
+                        for index in 0..columns {
+                            let value: rusqlite::types::Value = row.get(index).unwrap();
+                            dump.push_str(&format!("{value:?}|"));
+                        }
+                    }
+                }
+                dump
+            })
+        }
+
+        /// 已消费/不在册的卡：零帧，绝不复用另一张卡。
+        #[tokio::test]
+        async fn stale_or_consumed_pending_never_sends() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+            let action = answer_action("ix-1", vec![answer_entry("原题？", &["A"])]);
+
+            let first = sender
+                .execute(&ctx("a-1"), &target(), &action)
+                .await
+                .unwrap();
+            assert_eq!(first.state, ActionState::Accepted);
+            assert_eq!(resolve_frames(&fake).len(), 1);
+
+            // 同一张卡第二次提交（新 actionId）：本地已消费 → stale_pending，零新帧。
+            let err = sender
+                .execute(&ctx("a-2"), &target(), &action)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, "stale_pending");
+            assert_eq!(resolve_frames(&fake).len(), 1, "已消费卡不得再次 resolve");
+
+            // 不存在的卡：同样零帧（不得顺手消费别的卡）。
+            let missing = answer_action("ix-missing", vec![answer_entry("原题？", &["A"])]);
+            let err = sender
+                .execute(&ctx("a-3"), &target(), &missing)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, "stale_pending");
+            assert_eq!(resolve_frames(&fake).len(), 1);
+        }
+
+        /// 本地消费 ≠ 宿主撤卡：ACK-only 时宿主集合仍列着卡。
+        #[tokio::test]
+        async fn local_consume_is_not_host_cleared() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+            let receipt = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert!(pending.consumed("ix-1"), "ACK 受理后本地必须消费");
+            assert!(pending.host_has_pending("ix-1"), "本地消费不得改动宿主集合");
+            // 宿主集合没动 → 观察窗内不可能 confirmed。
+            let baseline = pending.host_pending_revision();
+            assert!(
+                !pending
+                    .wait_host_cleared("ix-1", baseline, Duration::from_millis(20))
+                    .await
+            );
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("accepted"));
+        }
+
+        /// 敏感卡：答案只上 wire，账本只有指纹，审计只有计数。
+        #[tokio::test]
+        async fn sensitive_question_never_persists_draft() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let mut sensitive = card(
+                "ix-secret",
+                false,
+                vec![question("口令？", &[], false, true)],
+            );
+            sensitive.sensitive = true;
+            let pending = fake_pending(sensitive);
+            let sender = answer_sender(&fake, &pending, &store);
+            let receipt = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action(
+                        "ix-secret",
+                        vec![free_text_entry("口令？", "机密-草稿-ABC")],
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+
+            // wire 上必须有答案（送达宿主），本地库不得有任何正文/题干痕迹。
+            let envelope = fake.envelope(0);
+            assert_eq!(
+                envelope["payload"]["answer"]["content"]["answers"]["口令？"],
+                json!("机密-草稿-ABC")
+            );
+            let dump = db_dump(&store);
+            for forbidden in ["机密", "草稿", "ABC", "口令？"] {
+                assert!(
+                    !dump.contains(forbidden),
+                    "敏感正文/题干不得落库: {forbidden} in {dump}"
+                );
+            }
+            let hash: String = store.with(|conn| {
+                conn.query_row(
+                    "SELECT payload_hash FROM zcode_actions WHERE action_id = 'a-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            });
+            assert_eq!(hash.len(), 64, "账本只存指纹");
+            assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+            let summary: String = store.with(|conn| {
+                conn.query_row(
+                    "SELECT summary FROM zcode_actions WHERE action_id = 'a-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            });
+            assert_eq!(summary, "answer answers=1 selected=0");
+            assert!(
+                audits(&store)
+                    .iter()
+                    .all(|row| row.summary == "answer answers=1 selected=0"),
+                "审计摘要只含类别与计数"
+            );
+        }
+
+        /// 计划审批（plan_approval）不是问答：看见 Approve 选项也不得代批。
+        #[tokio::test]
+        async fn plan_approval_is_not_a_question_auto_approval() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let mut plan = card(
+                "ix-plan",
+                true,
+                vec![question(
+                    "Approve plan?",
+                    &["Approve", "Reject"],
+                    false,
+                    false,
+                )],
+            );
+            plan.schema_interaction = Some("plan_approval".to_owned());
+            let pending = fake_pending(plan);
+            let sender = answer_sender(&fake, &pending, &store);
+
+            let err = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-plan", vec![answer_entry("Approve plan?", &["Approve"])]),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, "needs_evidence", "计划审批绝不能按问答代批");
+            assert_eq!(fake.wire(), 0, "未支持 schema 必须零 resolve 帧");
+            assert_eq!(pending.snooze_calls(), 0, "未支持 schema 也不得先 snooze");
+            assert!(!pending.consumed("ix-plan"), "零 value 不得消费卡");
+            assert_eq!(
+                stored_state(&store, "a-1").as_deref(),
+                Some("reserved"),
+                "失败不得落成受理"
+            );
+        }
+
+        /// snooze 未证实（失败或卡已不在宿主集合）：零 resolve。
+        #[tokio::test]
+        async fn snooze_unconfirmed_zero_resolve() {
+            let store = DeviceStore::memory();
+
+            // ① snooze 失败（超窗/unknown）：零 resolve，回执保守 unknown。
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(card(
+                "ix-1",
+                true,
+                vec![question("原题？", &["A"], false, false)],
+            ));
+            pending.set_snooze_error(codes::UNKNOWN);
+            let sender = answer_sender(&fake, &pending, &store);
+            let receipt = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Unknown);
+            assert_eq!(pending.snooze_calls(), 1, "snooze 恰一帧");
+            assert_eq!(resolve_frames(&fake).len(), 0, "snooze 未证实不得 resolve");
+
+            // ② snooze 受理但卡不在宿主集合：仍零 resolve。
+            let fake2 = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending2 = fake_pending(card(
+                "ix-2",
+                true,
+                vec![question("原题？", &["A"], false, false)],
+            ));
+            pending2.clear_host_card();
+            let sender2 = answer_sender(&fake2, &pending2, &store);
+            let receipt2 = sender2
+                .execute(
+                    &ctx("a-2"),
+                    &target(),
+                    &answer_action("ix-2", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt2.state, ActionState::Unknown);
+            assert_eq!(pending2.snooze_calls(), 1);
+            assert_eq!(resolve_frames(&fake2).len(), 0);
+        }
+
+        /// snooze 受理且卡仍在本帧宿主集合：恰一帧 resolve，形状对齐探针。
+        #[tokio::test]
+        async fn snooze_accepted_then_resolve_single_frame() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(card(
+                "ix-1",
+                true,
+                vec![question("原题？", &["A", "B"], false, false)],
+            ));
+            let sender = answer_sender(&fake, &pending, &store);
+            let receipt = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(
+                pending.snooze_calls(),
+                1,
+                "autoResolution 在场恰一次 snooze"
+            );
+            let frames = resolve_frames(&fake);
+            assert_eq!(frames.len(), 1, "恰一帧 resolveInteraction");
+            let frame = &frames[0];
+            assert_eq!(frame.channel, "zcode-agent");
+            assert_eq!(frame.method, "sendConversationCommandV4");
+            let envelope = &frame.args[0];
+            assert_eq!(envelope["type"], json!("resolveInteraction"));
+            assert_eq!(envelope["payload"]["interactionId"], json!("ix-1"));
+            assert_eq!(
+                envelope["payload"]["answer"],
+                json!({
+                    "action": "accept",
+                    "content": {
+                        "answers": { "原题？": "A" },
+                        "answer_0": "A",
+                        "answer": "A"
+                    }
+                }),
+                "resolve 载荷必须是宿主原值形状"
+            );
+            assert_eq!(envelope["clientId"], json!(DEVICE));
+            assert_eq!(envelope["sessionId"], json!(SESSION));
+            assert!(envelope["issuedAt"].as_i64().unwrap() >= 1_700_000_000_000);
+            assert_eq!(
+                fake.observed_timeouts(),
+                vec![Duration::from_millis(20)],
+                "ACK 窗原样交给端口"
+            );
+        }
+
+        /// ACK 只算 accepted；宿主撤卡（代数前进 + id 消失）才升级 confirmed。
+        #[tokio::test]
+        async fn ack_only_is_accepted_host_clear_is_confirmed() {
+            let store = DeviceStore::memory();
+
+            // ① ACK 受理但宿主没撤卡：只报 accepted（绝不伪造 confirmed）。
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+            let ack_only = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ack_only.state, ActionState::Accepted);
+            assert!(pending.host_has_pending("ix-1"));
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("accepted"));
+
+            // ② ACK 后宿主撤卡（代数前进 + id 消失）才是 confirmed。
+            let fake2 = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending2 = fake_pending(single_card("ix-1"));
+            pending2.clear_on_wait();
+            let sender2 = answer_sender(&fake2, &pending2, &store);
+            let confirmed = sender2
+                .execute(
+                    &ctx("a-2"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(confirmed.state, ActionState::Confirmed);
+            assert!(!pending2.host_has_pending("ix-1"));
+            assert_eq!(stored_state(&store, "a-2").as_deref(), Some("confirmed"));
+        }
+
+        /// 宿主卡在 ACK 前已消失且没有 accepted ACK：只能 unknown，不得消费。
+        #[tokio::test]
+        async fn host_clear_before_ack_is_unknown() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(json!({ "status": "noop" })));
+            let pending = fake_pending(single_card("ix-1"));
+            // 宿主已撤卡（本地投影尚未跟上）。
+            pending.clear_host_card();
+            let sender = answer_sender(&fake, &pending, &store);
+
+            let receipt = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                receipt.state,
+                ActionState::Unknown,
+                "无 accepted ACK 且宿主已撤卡只能 unknown"
+            );
+            assert_eq!(receipt.reason_code.as_deref(), Some("stale_pending"));
+            assert_eq!(resolve_frames(&fake).len(), 1, "帧已写出，只收口为 unknown");
+            assert!(!pending.consumed("ix-1"), "未受理不得本地消费");
+        }
+
+        /// 错会话/错代际：零帧且不消费这张卡（正确目标随后仍可作答）。
+        #[tokio::test]
+        async fn wrong_session_or_anchor_does_not_consume_other_card() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+            let answers = vec![answer_entry("原题？", &["A"])];
+
+            let other = BoundTarget {
+                session_id: "sess_ffffffffffffffffffffffffffffffff".to_owned(),
+                ..target()
+            };
+            let err = sender
+                .execute(
+                    &ctx("a-1"),
+                    &other,
+                    &answer_action_for(&other.session_id, GEN, "ix-1", answers.clone()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, "stale_pending");
+            assert_eq!(fake.wire(), 0);
+
+            let newer = BoundTarget {
+                generation: GEN + 1,
+                ..target()
+            };
+            let err = sender
+                .execute(
+                    &ctx("a-2"),
+                    &newer,
+                    &answer_action_for(SESSION, GEN + 1, "ix-1", answers.clone()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, "stale_pending");
+            assert_eq!(fake.wire(), 0);
+
+            // 正确目标仍可作答：错目标尝试没有消费/在途锁死这张卡。
+            let receipt = sender
+                .execute(&ctx("a-3"), &target(), &answer_action("ix-1", answers))
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(resolve_frames(&fake).len(), 1);
+        }
+
+        /// 多题答案合并成**一次** resolve；多选回传宿主 value 数组。
+        #[tokio::test]
+        async fn multi_question_resolves_once() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let questions = vec![
+                question("颜色？", &["Red", "Blue"], false, false),
+                question("尺寸？", &["S", "M"], true, false),
+            ];
+            let pending = fake_pending(card("ix-1", false, questions));
+            let sender = answer_sender(&fake, &pending, &store);
+            let answers = vec![
+                answer_entry("颜色？", &["Red"]),
+                answer_entry("尺寸？", &["S", "M"]),
+            ];
+            let receipt = sender
+                .execute(&ctx("a-1"), &target(), &answer_action("ix-1", answers))
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+            let frames = resolve_frames(&fake);
+            assert_eq!(frames.len(), 1, "多题合并为恰一次 resolve");
+            let content = &frames[0].args[0]["payload"]["answer"]["content"];
+            assert_eq!(content["answers"]["颜色？"], json!("Red"));
+            assert_eq!(content["answers"]["尺寸？"], json!("S, M"));
+            assert_eq!(content["answer_0"], json!("Red"));
+            assert_eq!(content["answer_1"], json!(["S", "M"]));
+            assert!(content.get("answer").is_none(), "多题不带单题兼容字段");
+        }
+
+        /// 同 actionId 同载荷重放：零第二帧，只回既有回执。
+        #[tokio::test]
+        async fn answer_reuses_action_id_idempotently() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+            let action = answer_action("ix-1", vec![answer_entry("原题？", &["A"])]);
+
+            let first = sender
+                .execute(&ctx("a-1"), &target(), &action)
+                .await
+                .unwrap();
+            let second = sender
+                .execute(&ctx("a-1"), &target(), &action)
+                .await
+                .unwrap();
+
+            assert_eq!(first.state, ActionState::Accepted);
+            assert_eq!(second, first, "同 actionId 同载荷必须返回既有回执");
+            assert_eq!(resolve_frames(&fake).len(), 1, "重放零第二帧");
+            assert_eq!(row_count(&store), 1);
+        }
     }
 }
