@@ -29,6 +29,7 @@ pub mod bridge;
 pub mod codec;
 pub mod command;
 pub mod config;
+mod host;
 pub mod hub;
 pub mod pending;
 pub mod projection;
@@ -85,9 +86,9 @@ pub use relay::{
 pub use selection::{build_selection_command, parse_selection_view, SWITCH_MODEL_CONFIG_TYPE};
 pub use types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, AnswerEntry, BoundTarget,
-    CapabilityFlag, CapabilityView, CommandPort, ConnectionState, ConnectionView, ControlAction,
-    ControlEvent, ControlEventKind, ControlView, ModelChoice, PendingKind, PendingPort,
-    PendingView, PermissionOptionView, QuestionOption, QuestionView, RelaySink, SelectionPort,
-    SelectionView, SessionView, StopPort, StopRequest, TargetKey, ZResult, ZcodeError,
-    PENDING_CLEARED_POLL, SELECTION_POLL, STOP_CLEARED_POLL,
+    CapabilityFlag, CapabilitySource, CapabilityView, CommandPort, ConnectionState, ConnectionView,
+    ControlAction, ControlEvent, ControlEventKind, ControlView, HostBuildProbe, HostEvidence,
+    ModelChoice, PendingKind, PendingPort, PendingView, PermissionOptionView, QuestionOption,
+    QuestionView, RelaySink, SelectionPort, SelectionView, SessionView, StopPort, StopRequest,
+    TargetKey, ZResult, ZcodeError, PENDING_CLEARED_POLL, SELECTION_POLL, STOP_CLEARED_POLL,
 };

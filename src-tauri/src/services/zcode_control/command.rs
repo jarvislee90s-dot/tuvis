@@ -103,9 +103,9 @@ use super::bridge::{BridgeManager, AGENT_CHANNEL};
 use super::pending::{build_permission_answer, build_user_answer};
 use super::selection::build_selection_command;
 use super::types::{
-    codes, ActionContext, ActionReceipt, ActionState, ActiveWork, BoundTarget, CapabilityView,
-    CommandPort, ControlAction, PendingPort, SelectionPort, SessionView, StopPort, StopRequest,
-    ZResult, ZcodeError,
+    codes, ActionContext, ActionReceipt, ActionState, ActiveWork, BoundTarget, CapabilitySource,
+    CapabilityView, CommandPort, ControlAction, PendingPort, SelectionPort, SessionView, StopPort,
+    StopRequest, ZResult, ZcodeError,
 };
 
 /// 官方发送方法名（`zcodeAgent.ts:937`、探针 `SendOnceLoop`）。
@@ -390,13 +390,15 @@ pub struct CommandSender {
     initial_control_timeout: Duration,
     /// 未知 control 的轮询间隔（生产 [`INITIAL_CONTROL_POLL`]）。
     initial_control_poll: Duration,
-    /// 本派发器装配的能力矩阵（T5 起 `Permission` 的写前闸；默认矩阵全部关闭 =
-    /// 审批应答 `needs_evidence`，零帧）。
+    /// 能力矩阵的**现算源**（T11：会话矩阵与执行闸共用同一个来源）。
     ///
-    /// **粒度注意**：这是 **sender 级**装配，会话级 DTO 在 `SessionView.capabilities`
-    /// （投影侧仍用 [`CapabilityView::default`]）。T7.1 必须按 target 取证据矩阵，
-    /// 并同时喂给投影与 sender，避免「手机显示可点、后端 needs_evidence」。
-    capabilities: CapabilityView,
+    /// 生产由 Hub 注入 `BridgeManager::host_evidence().policy()`；每次闸门判定现取，
+    /// 不做写时快照——宿主证据/验收许可翻转后，下一次动作立即按新矩阵执行。
+    /// 默认 = [`CapabilityView::default`]（审批应答关闭，零帧）。
+    ///
+    /// **粒度注意**：这是 **sender 级**装配，会话级 DTO 在 `SessionView.capabilities`；
+    /// 生产必须传同一个 source，避免「手机显示可点、后端 needs_evidence」。
+    capability_source: CapabilitySource,
 }
 
 impl CommandSender {
@@ -424,17 +426,28 @@ impl CommandSender {
             selection_confirm_timeout: SELECTION_CONFIRM_TIMEOUT,
             initial_control_timeout: INITIAL_CONTROL_TIMEOUT,
             initial_control_poll: INITIAL_CONTROL_POLL,
-            capabilities: CapabilityView::default(),
+            capability_source: Arc::new(CapabilityView::default),
         }
     }
 
-    /// 装配本会话能力矩阵（T7.1 生产接线；T5 测试用开闸矩阵）。
+    /// 装配**静态**能力矩阵（测试/固定夹具用；生产走 [`Self::with_capability_source`]）。
     ///
     /// 默认矩阵 = [`CapabilityView::default`]（审批应答关闭），调用方**不得**因
     /// 某次发送成功就推断审批可用——证据面由 T8.2 单独发放。
     pub fn with_capabilities(mut self, capabilities: CapabilityView) -> Self {
-        self.capabilities = capabilities;
+        self.capability_source = Arc::new(move || capabilities.clone());
         self
+    }
+
+    /// 装配能力矩阵的**现算源**（生产：与会话能力矩阵同一个 source）。
+    pub fn with_capability_source(mut self, capability_source: CapabilitySource) -> Self {
+        self.capability_source = capability_source;
+        self
+    }
+
+    /// 现算当前能力矩阵（每次闸门判定调用；不做缓存）。
+    fn current_capabilities(&self) -> CapabilityView {
+        (self.capability_source)()
     }
 
     /// 装配 pending 授权 / snooze / 宿主终态端口（生产 = `BridgeManager`，T7.1 接线）。
@@ -881,7 +894,10 @@ impl CommandSender {
         // 证据闸：审批应答默认关闭，关闭时连 pending 端口都不触碰（零帧）。
         // T8.2 debug 证据构建：Hub 已按会话/代际/能力消费的许可只放宽本闸，
         // 后面的卡授权与 option 白名单（含 fullAccess 拒绝）照常执行。
-        if !self.capabilities.approval_reply_enabled() && !permits.contains(&"approval_reply") {
+        // T11：矩阵每次现算（同一 source 喂会话 DTO 与本闸），策略翻转立即生效。
+        if !self.current_capabilities().approval_reply_enabled()
+            && !permits.contains(&"approval_reply")
+        {
             return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
         }
         let Some(pending) = self.pending.as_ref() else {
@@ -971,9 +987,10 @@ impl CommandSender {
         }
         // 证据闸：切换能力默认关闭，关闭时连目录都不读（零帧零行零审计）。
         // T8.2 debug 证据构建：Hub 已消费的许可只放宽本闸（每个关闭项各需一条许可）。
-        let model_open = self.capabilities.model.enabled || permits.contains(&"model");
-        let thought_open =
-            self.capabilities.thought_level.enabled || permits.contains(&"thought_level");
+        // T11：矩阵每次现算（同一 source 喂会话 DTO 与本闸）。
+        let capabilities = self.current_capabilities();
+        let model_open = capabilities.model.enabled || permits.contains(&"model");
+        let thought_open = capabilities.thought_level.enabled || permits.contains(&"thought_level");
         if !model_open || !thought_open {
             return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
         }
@@ -4865,6 +4882,68 @@ mod tests {
             assert_eq!(resolve_envelopes(&fake).len(), 0);
             assert!(!pending.inflight("ix-1"));
             assert_eq!(stored_state(&store, "a-perm"), None, "关闭路径零账本行");
+        }
+
+        /// 动态能力源：审批闸每次现算——打开放行、收回拒绝，不是装配时快照。
+        #[tokio::test]
+        async fn capability_source_flips_approval_gate_live() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = pending_with(once_card("ix-1"));
+            let open = Arc::new(AtomicBool::new(false));
+            let flag = open.clone();
+            let source: CapabilitySource = Arc::new(move || {
+                if flag.load(Ordering::SeqCst) {
+                    enabled_approval()
+                } else {
+                    CapabilityView::default()
+                }
+            });
+            let sender =
+                CommandSender::with_timeout(fake.clone(), store.clone(), Duration::from_millis(20))
+                    .with_pending(pending.clone())
+                    .with_capability_source(source)
+                    .with_confirm_timeout(Duration::from_millis(40));
+
+            // ① 全关：needs_evidence，零帧零行。
+            let refused = sender
+                .execute(
+                    &ctx("dyn-closed-1"),
+                    &target(),
+                    &permission_action("ix-1", "once-id-9"),
+                )
+                .await
+                .unwrap_err();
+            assert!(refused.is(codes::NEEDS_EVIDENCE));
+            assert_eq!(resolve_envelopes(&fake).len(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert!(!pending.inflight("ix-1"));
+
+            // ② 翻转打开：同一派发器立即放行，恰一帧 resolve。
+            open.store(true, Ordering::SeqCst);
+            let accepted = sender
+                .execute(
+                    &ctx("dyn-open"),
+                    &target(),
+                    &permission_action("ix-1", "once-id-9"),
+                )
+                .await
+                .expect("动态 source 打开后审批闸必须放行");
+            assert_eq!(accepted.state, ActionState::Accepted);
+            assert_eq!(resolve_envelopes(&fake).len(), 1);
+
+            // ③ 翻转回全关：新动作重新被拒，绝不因上次成功而保持开闸。
+            open.store(false, Ordering::SeqCst);
+            let refused = sender
+                .execute(
+                    &ctx("dyn-closed-2"),
+                    &target(),
+                    &permission_action("ix-1", "once-id-9"),
+                )
+                .await
+                .unwrap_err();
+            assert!(refused.is(codes::NEEDS_EVIDENCE));
+            assert_eq!(resolve_envelopes(&fake).len(), 1, "收回后零新帧");
         }
 
         /// T8.2 证据许可只放宽能力闸：`fullAccess`/常驻选项与目标/代际守卫全部原样拒绝。

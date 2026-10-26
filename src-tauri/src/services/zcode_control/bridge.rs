@@ -49,8 +49,8 @@ use super::codec::{
 use super::projection::{Projection, CONVERSATION_TOPIC_PREFIX};
 use super::selection::parse_selection_view;
 use super::types::{
-    codes, BoundTarget, CommandPort, PendingPort, PendingView, RelaySink, SelectionPort,
-    SelectionView, SessionView, StopPort, TargetKey, ZResult, ZcodeError,
+    codes, BoundTarget, CommandPort, HostBuildProbe, HostEvidence, PendingPort, PendingView,
+    RelaySink, SelectionPort, SelectionView, SessionView, StopPort, TargetKey, ZResult, ZcodeError,
 };
 
 /// agent 服务 channel（`channels.ts:114`）。
@@ -282,6 +282,12 @@ struct Inner {
     next_bridge_id: u64,
     /// controller 任务索引帧到达通知（收帧窗等待用）。
     enum_notify: Arc<Notify>,
+    /// 已通过 `helloConversationV4` 校验（本代际真实观测）。
+    hello_known: bool,
+    /// 已成功应用有效 conversation snapshot/delta（schema 已识别）。
+    schema_known: bool,
+    /// hello 校验到的 v4 wire 协议版本（未握手 = `None`）。
+    protocol_version: Option<u32>,
 }
 
 impl Default for Inner {
@@ -295,6 +301,9 @@ impl Default for Inner {
             next_app_request: 0,
             next_bridge_id: 0,
             enum_notify: Arc::new(Notify::new()),
+            hello_known: false,
+            schema_known: false,
+            protocol_version: None,
         }
     }
 }
@@ -691,6 +700,8 @@ pub(crate) struct SessionStats {
 /// 桥管理器：同一 relay 上按 workspace/session 打开多个逻辑桥。
 pub struct BridgeManager {
     shared: Arc<Shared>,
+    /// 宿主 APP build 探针（默认读本机安装；测试注入固定值）。
+    host_build: HostBuildProbe,
     /// 串行化绑定流程（bootstrap/枚举只做一次；并发 bind 不重复开桥）。
     setup: AsyncMutex<()>,
     /// 串行化只读重订阅（缺口后的 snapshot 刷新）。
@@ -738,8 +749,30 @@ impl BridgeManager {
         tokio::spawn(run_actor(shared.clone(), receiver));
         Self {
             shared,
+            host_build: super::host::default_probe(),
             setup: AsyncMutex::new(()),
             resync: AsyncMutex::new(()),
+        }
+    }
+
+    /// 注入宿主 build 探针（测试专用；生产固定读本机安装）。
+    #[cfg(test)]
+    pub(crate) fn with_host_build(mut self, host_build: HostBuildProbe) -> Self {
+        self.host_build = host_build;
+        self
+    }
+
+    /// 本轮运行真实观测到的宿主证据（未握手/未应用 schema = 未知）。
+    ///
+    /// `app_build` 每次调用现读（锁外读 plist，绝不在状态锁内做文件 IO）。
+    pub fn host_evidence(&self) -> HostEvidence {
+        let app_build = (self.host_build)();
+        let inner = lock(&self.shared.state);
+        HostEvidence {
+            app_build,
+            protocol_version: inner.protocol_version,
+            schema_known: inner.schema_known,
+            hello_known: inner.hello_known,
         }
     }
 
@@ -849,6 +882,10 @@ impl BridgeManager {
             inner.sessions.clear();
             inner.workspaces = None;
             inner.app_waiters.clear();
+            // 证据只属本代际：换代后握手/schema 事实全部作废（未重新取证 = 未知）。
+            inner.hello_known = false;
+            inner.schema_known = false;
+            inner.protocol_version = None;
             releases
         };
         for release in releases {
@@ -2035,8 +2072,11 @@ impl Shared {
             if body.get("kind").and_then(Value::as_str) != Some("hello") {
                 return Err(unsupported());
             }
-            if body.get("protocolVersion").and_then(Value::as_u64) != Some(V4_WIRE_PROTOCOL_VERSION)
-            {
+            let protocol_version = body
+                .get("protocolVersion")
+                .and_then(Value::as_u64)
+                .ok_or_else(unsupported)?;
+            if protocol_version != V4_WIRE_PROTOCOL_VERSION {
                 return Err(unsupported());
             }
             if body
@@ -2046,6 +2086,16 @@ impl Shared {
                 .is_none()
             {
                 return Err(unsupported());
+            }
+            // 只有 kind/协议/connectionId 全部校验通过才记证据；迟到的旧桥握手
+            // （换代/已丢弃）不得为当前代际背书。
+            {
+                let mut inner = lock(&self.state);
+                if inner.bridges.contains_key(bridge_id) {
+                    inner.hello_known = true;
+                    inner.protocol_version =
+                        Some(u32::try_from(protocol_version).map_err(|_| unsupported())?);
+                }
             }
             let client_hello = Value::Object(
                 [
@@ -2113,8 +2163,12 @@ impl Shared {
             }
         };
         let mut inner = lock(&self.state);
-        if let Some(entry) = inner.sessions.get_mut(&target.session_id) {
-            activate_and_flush(entry, &subscription);
+        let applied = inner
+            .sessions
+            .get_mut(&target.session_id)
+            .is_some_and(|entry| activate_and_flush(entry, &subscription));
+        if applied {
+            inner.schema_known = true;
         }
         Ok(())
     }
@@ -2290,17 +2344,24 @@ impl Shared {
             Ok(subscription) => {
                 let mut inner = lock(&self.state);
                 let mut still_unready = false;
-                if let Some(entry) = inner.sessions.get_mut(&target.session_id) {
-                    activate_and_flush(entry, &subscription);
-                    if entry.projection.is_ready() {
-                        entry.resync_attempts = 0;
-                        entry.last_resync_at = None;
-                        entry.needs_resync = false;
-                    } else {
-                        // 新订阅也没能建立新鲜投影（例如快照仍是坏分片）：
-                        // 本次读不得把「重订阅成功」当成就绪。
-                        still_unready = true;
-                    }
+                let applied = inner
+                    .sessions
+                    .get_mut(&target.session_id)
+                    .is_some_and(|entry| {
+                        let applied = activate_and_flush(entry, &subscription);
+                        if entry.projection.is_ready() {
+                            entry.resync_attempts = 0;
+                            entry.last_resync_at = None;
+                            entry.needs_resync = false;
+                        } else {
+                            // 新订阅也没能建立新鲜投影（例如快照仍是坏分片）：
+                            // 本次读不得把「重订阅成功」当成就绪。
+                            still_unready = true;
+                        }
+                        applied
+                    });
+                if applied {
+                    inner.schema_known = true;
                 }
                 if still_unready {
                     Err(ZcodeError::of(codes::NOT_READY))
@@ -2782,6 +2843,7 @@ impl Inner {
             mark_session_unready(entry);
             return;
         };
+        let mut applied = false;
         match object.get("kind").and_then(Value::as_str) {
             Some("complete") => {
                 let Some(frame) = object.get("frame").cloned() else {
@@ -2800,7 +2862,7 @@ impl Inner {
                     mark_session_unready(entry);
                     return;
                 }
-                stage_or_apply(entry, frame, subscription);
+                applied = stage_or_apply(entry, frame, subscription);
             }
             Some("fragment") => {
                 let budget = entry.staged_budget;
@@ -2812,7 +2874,7 @@ impl Inner {
                     FragmentOutcome::Complete(frame) => {
                         entry.stats.fragments_reassembled =
                             entry.stats.fragments_reassembled.saturating_add(1);
-                        stage_or_apply(entry, frame, subscription);
+                        applied = stage_or_apply(entry, frame, subscription);
                     }
                     FragmentOutcome::Fault => {
                         entry.fragments.clear();
@@ -2822,6 +2884,10 @@ impl Inner {
                 }
             }
             _ => mark_session_unready(entry),
+        }
+        // 只有 schema 解析成功并进入投影才算识别（坏帧/暂存/异订阅不算）。
+        if applied {
+            self.schema_known = true;
         }
     }
 
@@ -2907,7 +2973,9 @@ fn insert_task_row(cache: &mut WorkspaceCache, row: TaskRow) {
 }
 
 /// ACK 前暂存 / 已激活直通（应用级分片重组成功后也走这里）。
-fn stage_or_apply(entry: &mut SessionEntry, frame: Value, subscription: String) {
+///
+/// 返回 `true` = 本帧已进入投影（schema 解析成功）；暂存/异订阅不产生证据。
+fn stage_or_apply(entry: &mut SessionEntry, frame: Value, subscription: String) -> bool {
     match entry.projection.subscription_id().map(str::to_owned) {
         None => {
             let frame_bytes = serde_json::to_vec(&frame).map(|bytes| bytes.len());
@@ -2916,7 +2984,7 @@ fn stage_or_apply(entry: &mut SessionEntry, frame: Value, subscription: String) 
                 Err(_) => {
                     entry.stats.frames_rejected = entry.stats.frames_rejected.saturating_add(1);
                     mark_session_unready(entry);
-                    return;
+                    return false;
                 }
             };
             if entry.staged.len() >= MAX_STAGED_CONVERSATION_FRAMES
@@ -2925,35 +2993,39 @@ fn stage_or_apply(entry: &mut SessionEntry, frame: Value, subscription: String) 
                 // 条数/字节双预算：超限即拒收并置不新鲜（绝不无界增长）。
                 entry.stats.frames_rejected = entry.stats.frames_rejected.saturating_add(1);
                 mark_session_unready(entry);
-                return;
+                return false;
             }
             entry.staged_bytes = entry.staged_bytes.saturating_add(frame_bytes);
             entry.staged.push(StagedFrame {
                 subscription_id: subscription,
                 frame,
             });
+            false
         }
-        Some(bound) if bound == subscription => {
-            apply_frame(entry, frame);
-        }
+        Some(bound) if bound == subscription => apply_frame(entry, frame),
         // 旧 subscriptionId（换代/重订阅后迟到）：零应用。
-        Some(_) => {}
+        Some(_) => false,
     }
 }
 
 /// ACK 到达后的本地 barrier 放行：只交付匹配 subscriptionId 的暂存帧。
-fn activate_and_flush(entry: &mut SessionEntry, subscription: &str) {
+///
+/// 返回 `true` = 至少一帧 schema 解析成功并进入投影（供宿主证据置位）。
+fn activate_and_flush(entry: &mut SessionEntry, subscription: &str) -> bool {
     entry.projection.activate(subscription);
     let staged = std::mem::take(&mut entry.staged);
     entry.staged_bytes = 0;
+    let mut applied = false;
     for item in staged {
         if item.subscription_id != subscription {
             continue;
         }
         if apply_frame(entry, item.frame) {
             entry.stats.staged_delivered = entry.stats.staged_delivered.saturating_add(1);
+            applied = true;
         }
     }
+    applied
 }
 
 /// 应用一帧；缺口/未知 schema 时标记重同步（stale/异会话只丢弃）。
@@ -3201,6 +3273,7 @@ mod tests {
     };
     use crate::services::zcode_control::command::AGENT_SEND_COMMAND_METHOD;
     use crate::services::zcode_control::projection::CONVERSATION_TOPIC_PREFIX;
+    use crate::services::zcode_control::types::{CapabilityPolicy, CapabilityView};
 
     const SESSION_A: &str = "sess_0f9a1c0d-0000-4000-8000-000000000001";
     const SESSION_B: &str = "sess_0f9a1c0d-0000-4000-8000-000000000002";
@@ -4095,6 +4168,21 @@ mod tests {
         (manager, peer)
     }
 
+    /// 注入宿主 build 探针的 fake 对端（证据用例；不读真实 `/Applications`）。
+    async fn manager_with_host_build(
+        config: PeerConfig,
+        host_build: HostBuildProbe,
+    ) -> (Arc<BridgeManager>, Arc<Peer>) {
+        let peer = Peer::new(config);
+        let manager = Arc::new(
+            BridgeManager::with_timing(peer.clone(), BridgeTiming::test())
+                .with_host_build(host_build),
+        );
+        peer.attach(&manager);
+        manager.invalidate(1).await;
+        (manager, peer)
+    }
+
     fn app_payloads(peer: &Peer, zcode_type: &str) -> Vec<Value> {
         peer.sent()
             .into_iter()
@@ -4391,6 +4479,86 @@ mod tests {
         assert!(frames
             .iter()
             .all(|frame| frame.method.as_deref() != Some(AGENT_CONVERSATION_FRAME_EVENT)));
+    }
+
+    /// 宿主证据只来自本代际的真实握手/快照：bind 前未知，握手+快照后全面置位，
+    /// 换代（invalidate）立即回到未知；已取证宿主策略仍全关。
+    #[tokio::test]
+    async fn host_evidence_tracks_real_handshake_and_resets_on_invalidate() {
+        let host_build: HostBuildProbe = Arc::new(|| Some("3.16.2.8769".to_owned()));
+        let (manager, _peer) = manager_with_host_build(basic_config(), host_build).await;
+
+        let before = manager.host_evidence();
+        assert_eq!(before.app_build.as_deref(), Some("3.16.2.8769"));
+        assert_eq!(before.protocol_version, None);
+        assert!(!before.hello_known);
+        assert!(!before.schema_known);
+        assert_eq!(
+            before.policy(),
+            CapabilityView::default(),
+            "bind 前不得带宿主证据"
+        );
+
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        assert!(manager.session(&target).await.expect("session").ready);
+        let after = manager.host_evidence();
+        assert!(after.hello_known, "hello 校验通过必须置位");
+        assert_eq!(
+            after.protocol_version,
+            Some(3),
+            "协议版本取自校验过的 hello"
+        );
+        assert!(after.schema_known, "有效快照应用后 schema 必须置位");
+        assert_eq!(
+            after.policy(),
+            CapabilityPolicy::for_host("3.16.2.8769", 3, true, true)
+        );
+        assert_eq!(
+            after.policy(),
+            CapabilityView::default(),
+            "已知宿主仍不得开启生产能力"
+        );
+
+        manager.invalidate(2).await;
+        let reset = manager.host_evidence();
+        assert_eq!(reset.app_build.as_deref(), Some("3.16.2.8769"));
+        assert_eq!(reset.protocol_version, None);
+        assert!(!reset.hello_known);
+        assert!(!reset.schema_known);
+        assert_eq!(reset.policy(), CapabilityView::default());
+    }
+
+    /// 握手被拒（协议不符）不得留下 hello 证据；schema 未应用即不清零为 true。
+    #[tokio::test]
+    async fn rejected_hello_records_no_evidence() {
+        let host_build: HostBuildProbe = Arc::new(|| Some("3.16.2.8769".to_owned()));
+        let config = PeerConfig {
+            hello_protocol: 2,
+            ..basic_config()
+        };
+        let (manager, _peer) = manager_with_host_build(config, host_build).await;
+        assert!(manager.bind(&key(SESSION_A)).await.is_err());
+        let evidence = manager.host_evidence();
+        assert!(!evidence.hello_known);
+        assert_eq!(evidence.protocol_version, None);
+        assert!(!evidence.schema_known);
+    }
+
+    /// 坏快照（CRC 故障）不算 schema 已识别：hello 已过但 schema_known 仍为 false。
+    #[tokio::test]
+    async fn schema_fault_does_not_mark_schema_known() {
+        let host_build: HostBuildProbe = Arc::new(|| Some("3.16.2.8769".to_owned()));
+        let config = PeerConfig {
+            fragmented_snapshot: true,
+            fragment_checksum_override: Some("00000000".to_owned()),
+            conversation_snapshot: Some(conversation_snapshot(SESSION_A, 7, Vec::new())),
+            ..single_workspace_config()
+        };
+        let (manager, _peer) = manager_with_host_build(config, host_build).await;
+        manager.bind(&key(SESSION_A)).await.expect("bind");
+        let evidence = manager.host_evidence();
+        assert!(evidence.hello_known, "hello 本身已通过校验");
+        assert!(!evidence.schema_known, "坏快照不得冒充 schema 已识别");
     }
 
     #[tokio::test]

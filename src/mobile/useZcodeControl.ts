@@ -134,11 +134,18 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
   const inflightSubmitsRef = useRef(0);
   /** 已落地的代次（连接/会话各自）：SSE/GET 帧低于它 = 迟到旧代，丢弃。 */
   const generationRef = useRef({ connection: -1, session: -1 });
+  /**
+   * 最近一次**成功落地**的连接视图（state + generation）：判「同代状态跃迁」用。
+   * 只在 applyConnection 真正写入 state 时更新——同代 `needs_auth/connecting → paired`
+   * 也必须补拉会话，仅靠代次会漏掉（代次没变的配对完成是合法场景）。
+   */
+  const appliedConnectionRef = useRef<ConnectionView | null>(null);
 
   /** 落地连接视图并推进代次；返回 false = 旧代次（不写 state）。 */
   const applyConnection = useCallback((view: ConnectionView): boolean => {
     if (view.generation < generationRef.current.connection) return false;
     generationRef.current.connection = view.generation;
+    appliedConnectionRef.current = view;
     setConnection(view);
     return true;
   }, []);
@@ -198,8 +205,9 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
   useEffect(() => {
     let alive = true;
     sessionRef.current = sessionId;
-    // 换会话：旧代次一律作废（新会话从自己的首个快照重新起算）。
+    // 换会话：旧代次与旧「已落地连接视图」一律作废（新会话从自己的首个快照重新起算）。
     generationRef.current = { connection: -1, session: -1 };
+    appliedConnectionRef.current = null;
     const run = ++readRunRef.current;
     // 换会话先清旧视图：旧连接/旧原因/旧草稿标记不得跨会话显示。
     setConnection(null);
@@ -244,8 +252,16 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
 
       if (name === "snapshot") {
         // 首帧/重连基线：连接与（可绑定时的）会话投影一起纠偏
-        if (isConnectionView(frame.connection)) applyConnection(frame.connection);
-        if (isSessionView(frame.session)) applySessionView(frame.session);
+        const connectionView = isConnectionView(frame.connection) ? frame.connection : null;
+        const sessionApplied = isSessionView(frame.session)
+          ? applySessionView(frame.session)
+          : false;
+        const connectionApplied = connectionView !== null ? applyConnection(connectionView) : false;
+        // 基线说已配对，却没带本会话的有效会话投影（缺失/别的会话/旧代次）：补一次
+        // GET 把会话拉齐——首拍会话读失败后仅靠 connection 帧仍可能留下空投影。
+        if (connectionApplied && connectionView?.state === "paired" && !sessionApplied) {
+          void refresh();
+        }
         return;
       }
       if (name === "resync") {
@@ -264,11 +280,21 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
 
       if (name === "connection") {
         if (!isConnectionView(envelope.data)) return;
-        const previous = generationRef.current.connection;
+        // 判据 = 上次成功落地的连接视图（state + generation），不是只比代次：
+        // 同代 needs_auth/connecting → paired 也是必须补拉会话的合法跃迁。
+        const previous = appliedConnectionRef.current;
         if (!applyConnection(envelope.data)) return;
-        if (previous >= 0 && envelope.data.generation > previous) {
+        const advanced = previous !== null && envelope.data.generation > previous.generation;
+        if (advanced) {
           // 换代：旧代 pending 失效（新投影由重 GET / 后续 session 帧补上）
           setSession(null);
+          void refresh();
+        } else if (
+          envelope.data.state === "paired" &&
+          (previous === null || previous.state !== "paired")
+        ) {
+          // 同一代次内配对完成：代次没变但连接已就绪，必须重拉会话；
+          // 已有会话一律保留（只补读，不清视图）。重复 paired（已是 paired）不重拉。
           void refresh();
         }
         return;
