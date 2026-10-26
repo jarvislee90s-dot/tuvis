@@ -886,6 +886,21 @@ impl BridgeManager {
 
     /// 读取绑定会话的投影（必要时先按只读方式重取快照）。
     pub async fn session(&self, target: &BoundTarget) -> ZResult<SessionView> {
+        self.session_within(target, None).await
+    }
+
+    /// 有界只读视图：`budget = Some(t)` 时整次读（含内部重订阅的每个 RPC）不超过
+    /// `t`，到期以 `not_ready` 收口（不取消 future、不留下未激活的重订阅）。
+    async fn session_within(
+        &self,
+        target: &BoundTarget,
+        budget: Option<Duration>,
+    ) -> ZResult<SessionView> {
+        let deadline = budget.map(|budget| {
+            Instant::now()
+                .checked_add(budget)
+                .unwrap_or_else(Instant::now)
+        });
         let needs_resync = {
             let inner = lock(&self.shared.state);
             if inner.generation != target.generation {
@@ -900,7 +915,9 @@ impl BridgeManager {
             entry.needs_resync
         };
         if needs_resync {
-            self.shared.resync(target, &self.resync).await?;
+            self.shared
+                .resync_until(target, &self.resync, deadline)
+                .await?;
         }
         let inner = lock(&self.shared.state);
         let entry = inner
@@ -1217,10 +1234,12 @@ impl StopPort for BridgeManager {
     /// 精确目标（会话 + 代际 + workspace 绑定）的只读视图；缺口时按只读方式重取快照。
     ///
     /// 任一不匹配都拒绝，绝不退化为「按 sessionId 找一张能读的投影」——兄弟会话的
-    /// control 不得成为 stop 守卫来源。
+    /// control 不得成为 stop 守卫来源。`timeout` 是整次读的硬预算：内部重订阅的
+    /// 每个 RPC 只拿剩余时间，到期以 `not_ready` 收口（不取消、不留下未激活订阅）。
     fn session<'a>(
         &'a self,
         target: &'a BoundTarget,
+        timeout: Duration,
     ) -> futures::future::BoxFuture<'a, ZResult<SessionView>> {
         Box::pin(async move {
             {
@@ -1235,8 +1254,9 @@ impl StopPort for BridgeManager {
                     return Err(stale());
                 }
             }
-            // 复用既有只读读面：必要时重订阅取新快照；视图仍由精确会话投影产出。
-            BridgeManager::session(self, target).await
+            // 复用既有只读读面：必要时重订阅取新快照（预算内）；视图仍由精确会话
+            // 投影产出。
+            BridgeManager::session_within(self, target, Some(timeout)).await
         })
     }
 
@@ -1660,6 +1680,7 @@ impl Shared {
             WINDOW_CONTROLLER_CHANNEL,
             CONTROLLER_DYNAMIC_FRAME_EVENT,
             Value::Null,
+            self.timing.rpc,
         )
         .await?;
         let params = Value::Object(
@@ -1879,7 +1900,7 @@ impl Shared {
             self.drop_bridge(&bridge_id);
             return Err(stale());
         }
-        let subscription = match self.subscribe_conversation(target, &bridge_id).await {
+        let subscription = match self.subscribe_conversation(target, &bridge_id, None).await {
             Ok(subscription) => subscription,
             Err(error) => {
                 self.drop_bridge(&bridge_id);
@@ -1894,10 +1915,13 @@ impl Shared {
     }
 
     /// EventListen(onDynamicConversationFrame, workspace) → subscribeConversationV4 → ACK。
+    ///
+    /// `deadline = Some(d)` 时两个 RPC 各自只拿剩余预算（到期 → `not_ready`）。
     async fn subscribe_conversation(
         &self,
         target: &BoundTarget,
         bridge_id: &str,
+        deadline: Option<Instant>,
     ) -> ZResult<String> {
         let listener_id = self.register_listener(bridge_id, ListenerKind::Conversation)?;
         let mut workspace = Map::new();
@@ -1911,25 +1935,28 @@ impl Shared {
                 Value::from(identity.clone()),
             );
         }
+        let listen_budget = self.step_budget(deadline)?;
         self.send_listen(
             bridge_id,
             listener_id,
             AGENT_CHANNEL,
             AGENT_CONVERSATION_FRAME_EVENT,
             Value::Object(workspace.clone()),
+            listen_budget,
         )
         .await?;
         workspace.insert(
             "sessionId".to_owned(),
             Value::from(target.session_id.clone()),
         );
+        let subscribe_budget = self.step_budget(deadline)?;
         let message = self
             .rpc_call(
                 bridge_id,
                 AGENT_CHANNEL,
                 AGENT_SUBSCRIBE_CONVERSATION_METHOD,
                 vec![Value::Object(workspace)],
-                self.timing.rpc,
+                subscribe_budget,
                 None,
             )
             .await?;
@@ -1943,12 +1970,52 @@ impl Shared {
             .ok_or_else(|| ZcodeError::of(codes::NOT_READY))
     }
 
+    /// 单步 RPC 预算：无 deadline 沿用 `timing.rpc`；有 deadline 时取剩余（到期即
+    /// `not_ready`，绝不发一个必然超期的请求）。
+    fn step_budget(&self, deadline: Option<Instant>) -> ZResult<Duration> {
+        let Some(deadline) = deadline else {
+            return Ok(self.timing.rpc);
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ZcodeError::of(codes::NOT_READY));
+        }
+        Ok(remaining.min(self.timing.rpc))
+    }
+
     /// 缺口/协议不符后的只读重订阅（取新快照；不发送任何写命令）。
     ///
     /// 有界退避：连续失败按 `resync_backoff * 2^(n-1)` 冷却，超过 [`MAX_RESYNCS`]
     /// 停在 `ready=false`，绝不让「读一次 → 重订阅一次」自激（C1）。
     async fn resync(&self, target: &BoundTarget, gate: &AsyncMutex<()>) -> ZResult<()> {
-        let _guard = gate.lock().await;
+        self.resync_until(target, gate, None).await
+    }
+
+    /// [`Self::resync`] 的有界版本：`deadline = Some(d)` 时等重订阅闸与每个内部
+    /// RPC 都只拿剩余预算（到期 → `not_ready`，由 Err 分支把 `needs_resync` 置回
+    /// true，下一次读可继续重试）。绝不把调用方拖过 deadline，也不依赖取消
+    /// 在途重订阅来收口（只取消「等闸」这种无副作用的等待）。
+    async fn resync_until(
+        &self,
+        target: &BoundTarget,
+        gate: &AsyncMutex<()>,
+        deadline: Option<Instant>,
+    ) -> ZResult<()> {
+        // 另一个重订阅在途时，等闸也必须受预算约束（否则单读会被别人的 2×10s
+        // 拖长）。等闸 future 无副作用，超时丢弃安全。
+        let _guard = match deadline {
+            None => gate.lock().await,
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(ZcodeError::of(codes::NOT_READY));
+                }
+                match tokio::time::timeout(remaining, gate.lock()).await {
+                    Ok(guard) => guard,
+                    Err(_) => return Err(ZcodeError::of(codes::NOT_READY)),
+                }
+            }
+        };
         let (bridge_id, needs_resync, old_subscription) = {
             let inner = lock(&self.state);
             if inner.generation != target.generation {
@@ -2011,7 +2078,10 @@ impl Shared {
                 let _ = self.commands.try_send(release);
             }
         }
-        match self.subscribe_conversation(target, &bridge_id).await {
+        match self
+            .subscribe_conversation(target, &bridge_id, deadline)
+            .await
+        {
             Ok(subscription) => {
                 let mut inner = lock(&self.state);
                 let mut still_unready = false;
@@ -2148,6 +2218,7 @@ impl Shared {
         channel: &str,
         event: &str,
         arg: Value,
+        timeout: Duration,
     ) -> ZResult<()> {
         let (reply_sender, reply_receiver) = oneshot::channel();
         if self
@@ -2165,7 +2236,7 @@ impl Shared {
         {
             return Err(ZcodeError::offline());
         }
-        match tokio::time::timeout(self.timing.rpc, reply_receiver).await {
+        match tokio::time::timeout(timeout, reply_receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ZcodeError::offline()),
             Err(_) => Err(ZcodeError::of(codes::NOT_READY)),
@@ -3083,6 +3154,9 @@ mod tests {
         fragment_checksum_override: Option<String>,
         /// 这些 RPC 方法不应答（RPC 超时清账用例）。
         silent_methods: Vec<String>,
+        /// 第 N 次（1-based）及之后才静默的方法（重订阅有界读用例：首次绑定订阅
+        /// 必须成功，后续重订阅不应答）。
+        silent_methods_from_call: Vec<(String, u32)>,
         pre_ack_cards: Vec<Value>,
         /// 该桥第 N 个入站帧之后注入物理 seq 缺口。
         gap_after_frames: Option<usize>,
@@ -3112,6 +3186,7 @@ mod tests {
                 fragment_order: vec![0, 1],
                 fragment_checksum_override: None,
                 silent_methods: Vec::new(),
+                silent_methods_from_call: Vec::new(),
                 pre_ack_cards: Vec::new(),
                 gap_after_frames: None,
                 resync_snapshot: None,
@@ -3438,12 +3513,20 @@ mod tests {
                     let id = message.id.expect("request id");
                     let method = message.method.clone().unwrap_or_default();
                     inner.requests.push((bridge.clone(), method.clone(), id));
-                    if self
+                    let call_index = inner
+                        .requests
+                        .iter()
+                        .filter(|(_, seen, _)| seen == &method)
+                        .count() as u32;
+                    let silenced = self
                         .config
                         .silent_methods
                         .iter()
                         .any(|silent| silent == &method)
-                    {
+                        || self.config.silent_methods_from_call.iter().any(
+                            |(silent, from_call)| silent == &method && call_index >= *from_call,
+                        );
+                    if silenced {
                         // 不应答：用于验证 RPC 超时清账与迟到应答丢弃。
                         return;
                     }
@@ -5546,10 +5629,10 @@ mod tests {
         let target_a = manager.bind(&key(SESSION_A)).await.expect("bind A");
         let target_b = manager.bind(&key(SESSION_B)).await.expect("bind B");
 
-        let view_a = StopPort::session(manager.as_ref(), &target_a)
+        let view_a = StopPort::session(manager.as_ref(), &target_a, Duration::from_secs(1))
             .await
             .expect("A session");
-        let view_b = StopPort::session(manager.as_ref(), &target_b)
+        let view_b = StopPort::session(manager.as_ref(), &target_b, Duration::from_secs(1))
             .await
             .expect("B session");
         assert_eq!(view_a.session_id, SESSION_A);
@@ -5583,7 +5666,7 @@ mod tests {
         let mut forged = target_a.clone();
         forged.workspace_key = "ws-b-identity".to_owned();
         assert!(
-            StopPort::session(manager.as_ref(), &forged)
+            StopPort::session(manager.as_ref(), &forged, Duration::from_secs(1))
                 .await
                 .expect_err("forged workspace binding")
                 .is(codes::STALE_GENERATION),
@@ -5593,10 +5676,12 @@ mod tests {
         // 未绑定的会话：no_session（绝不借 A 的投影顶替）。
         let mut unbound = target_a.clone();
         unbound.session_id = "sess_0f9a1c0d-0000-4000-8000-00000000ffff".to_owned();
-        assert!(StopPort::session(manager.as_ref(), &unbound)
-            .await
-            .expect_err("unbound sibling")
-            .is(codes::NO_SESSION));
+        assert!(
+            StopPort::session(manager.as_ref(), &unbound, Duration::from_secs(1))
+                .await
+                .expect_err("unbound sibling")
+                .is(codes::NO_SESSION)
+        );
     }
 
     /// 停止终态必须**同时**满足「该目标 revision 前进」且「目标 execution 缺席」：
@@ -5613,7 +5698,7 @@ mod tests {
         };
         let (manager, peer) = manager_with(config).await;
         let target = manager.bind(&key(SESSION_A)).await.expect("bind");
-        let view = StopPort::session(manager.as_ref(), &target)
+        let view = StopPort::session(manager.as_ref(), &target, Duration::from_secs(1))
             .await
             .expect("session");
         let baseline = view.revision.expect("host revision");
@@ -5701,7 +5786,7 @@ mod tests {
         };
         let (manager, peer) = manager_with(config).await;
         let target = manager.bind(&key(SESSION_A)).await.expect("bind");
-        let view = StopPort::session(manager.as_ref(), &target)
+        let view = StopPort::session(manager.as_ref(), &target, Duration::from_secs(1))
             .await
             .expect("session");
         assert!(view.control.is_none(), "夹具必须是未知 control");
@@ -5762,7 +5847,7 @@ mod tests {
         let (manager, peer) = manager_with(config).await;
         let target_a = manager.bind(&key(SESSION_A)).await.expect("bind A");
         let _target_b = manager.bind(&key(SESSION_B)).await.expect("bind B");
-        let baseline = StopPort::session(manager.as_ref(), &target_a)
+        let baseline = StopPort::session(manager.as_ref(), &target_a, Duration::from_secs(1))
             .await
             .expect("A session")
             .revision
@@ -5776,7 +5861,7 @@ mod tests {
                 .await,
             "other session's clear must not confirm A"
         );
-        let view_a = StopPort::session(manager.as_ref(), &target_a)
+        let view_a = StopPort::session(manager.as_ref(), &target_a, Duration::from_secs(1))
             .await
             .expect("A session");
         assert!(
@@ -5834,6 +5919,44 @@ mod tests {
         assert!(
             waiter.await.expect("waiter task"),
             "原目标确已消失时（即便新执行在场）必须确认"
+        );
+    }
+
+    /// 精确目标的会话读把**硬预算**分给内部重订阅 RPC：宿主静默时按预算
+    /// `not_ready` 收口，绝不把调用方拖过窗（I-1：10s 窗不得被单读拖成 ~30s）。
+    #[tokio::test]
+    async fn stop_port_session_honours_budget_during_resync() {
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, None, "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(conversation_snapshot(SESSION_A, 2, Vec::new())),
+            // 首个快照物理 seq 跳号 → 投影不新鲜，下一次读触发只读重订阅。
+            gap_after_frames: Some(4),
+            // 首次绑定订阅必须成功；第 2 次（读触发的重订阅）起宿主静默，
+            // 只有读预算能收口。
+            silent_methods_from_call: vec![(AGENT_SUBSCRIBE_CONVERSATION_METHOD.to_owned(), 2)],
+            ..PeerConfig::default()
+        };
+        let (manager, _peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        assert!(!manager.peek_view(SESSION_A).expect("bound").ready);
+
+        let started = Instant::now();
+        let error = StopPort::session(manager.as_ref(), &target, Duration::from_millis(80))
+            .await
+            .expect_err("a silent resubscribe must not outlive the read budget");
+        let elapsed = started.elapsed();
+        assert!(
+            error.is(codes::NOT_READY),
+            "预算到期如实收口, got {error:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "应等到预算到期而不是立刻失败，got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "单次读不得超过自己的预算（80ms），got {elapsed:?}"
         );
     }
 

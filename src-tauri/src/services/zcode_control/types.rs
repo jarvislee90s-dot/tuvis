@@ -507,8 +507,12 @@ pub const PENDING_CLEARED_POLL: Duration = Duration::from_millis(50);
 /// # 语义（生产实现保证）
 ///
 /// - `session`：返回该**精确目标**的投影视图（必要时先按只读方式重取快照）；
-///   目标未绑定 → `no_session`，代际前进/workspace 绑定不符 → `stale_generation`。
-///   绝不返回兄弟会话的视图，也绝不把多个会话的 control 合并。
+///   目标未绑定 → `no_session`，代际前进/workspace 绑定不符 → `stale_generation`，
+///   缺口/重订阅窗口内可返回 `not_ready`/`offline`（**瞬时**：调用方应继续轮询）。
+///   绝不返回兄弟会话的视图，也绝不把多个会话的 control 合并。`timeout` 是一次读
+///   的**硬预算**（生产实现把它分给内部重订阅 RPC，到期 → `not_ready`，绝不超窗）；
+///   有界等待因此是端到端的，调用方无需再外套取消式超时（那会绕过桥的 pending
+///   清理并可能让重订阅停在未激活态）。
 /// - `wait_stop_cleared`：有界轮询（每次判定在状态锁内完成、锁外 sleep，
 ///   ≤ [`STOP_CLEARED_POLL`]，绝不持锁 await）。**只有**该目标宿主 `revision`
 ///   前进**且**该 execution id 已不在其 control 观测里才 `true`；其余情形
@@ -516,7 +520,14 @@ pub const PENDING_CLEARED_POLL: Duration = Duration::from_millis(50);
 ///   `false`——第一个「无证据」不是结论，但也绝不用兄弟会话/旧代际的证据确认。
 pub trait StopPort: Send + Sync {
     /// **精确目标**的会话投影（只读；不触发任何写命令）。
-    fn session<'a>(&'a self, target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>>;
+    ///
+    /// `timeout` 是本次读的硬上界：实现必须在预算内返回（含内部只读重订阅），
+    /// 到期以 `not_ready` 收口；不得把调用方拖过预算。
+    fn session<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        timeout: Duration,
+    ) -> BoxFuture<'a, ZResult<SessionView>>;
 
     /// 等**精确目标**的宿主停止终态：`revision` 前进**且**目标 execution 缺席 →
     /// `true`；超时（含 control 未知/换代/绑定消失，轮询到期限）→ `false`。
