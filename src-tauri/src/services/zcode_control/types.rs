@@ -461,6 +461,10 @@ pub struct PermissionOptionView {
 }
 
 /// pending 卡视图（四元组锚：session + 真实行/toolCall 锚 + interaction + generation）。
+///
+/// `schema_interaction` 是 `payload.schema.interaction` 的原值（`plan_approval`、
+/// MCP elicitation 等子类对 Tuvis 是**只读**的）：只有 AskUserQuestion 形态可答，
+/// 计划审批即便带着 `Approve` 选项也绝不是问答。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingView {
@@ -471,6 +475,7 @@ pub struct PendingView {
     pub created_at: Option<u64>,
     pub summary: Option<String>,
     pub tool_name: Option<String>,
+    pub schema_interaction: Option<String>,
     pub sensitive: bool,
     pub auto_resolution: bool,
     pub auto_resolution_state: Option<String>,
