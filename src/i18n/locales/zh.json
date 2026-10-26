@@ -2206,6 +2206,23 @@
       "send": "发送",
       "attachHint": "附件将保存到用户项目目录 .tuvis-attachments/<会话>/（已在本地 git 排除，不会提交）；项目收尾时可整目录清理。"
     },
+    "zcodeControl": {
+      "draftAria": "发送到 ZCode 的内容",
+      "draftPlaceholder": "输入要发送到 ZCode 的内容",
+      "send": "发送",
+      "sending": "发送中…",
+      "reasonNeedsConfig": "请在电脑端配置 ZCode 官方远控链接",
+      "reasonNeedsAuth": "请在电脑端完成 ZCode 官方授权",
+      "reasonOffline": "与电脑端的连接已离线，请检查网络后重试",
+      "reasonConflict": "电脑端的连接存在冲突，请先在电脑端处理",
+      "reasonUnknown": "控制暂时不可用，请稍后重试",
+      "statusAccepted": "已受理",
+      "statusConfirmed": "已生效",
+      "statusNoop": "无需变更",
+      "statusRejected": "已拒绝",
+      "statusSendFailed": "发送失败",
+      "statusUnknown": "结果未知，请到电脑端核对"
+    },
     "question": {
       "cancelInterrupt": "中断回合（破坏性）",
       "waiting": "等待回答",

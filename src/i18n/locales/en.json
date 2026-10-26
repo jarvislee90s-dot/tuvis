@@ -2206,6 +2206,23 @@
       "send": "Send",
       "attachHint": "Attachments are saved to the project directory .tuvis-attachments/<session>/ (excluded from local git, never committed); you can delete the whole folder when wrapping up."
     },
+    "zcodeControl": {
+      "draftAria": "Message for ZCode",
+      "draftPlaceholder": "Type a message to send to ZCode",
+      "send": "Send",
+      "sending": "Sending…",
+      "reasonNeedsConfig": "Configure the ZCode official remote link on your computer",
+      "reasonNeedsAuth": "Complete ZCode official authorization on your computer",
+      "reasonOffline": "The connection to your computer is offline — check your network and retry",
+      "reasonConflict": "The connection on your computer is in conflict — resolve it there first",
+      "reasonUnknown": "Control is unavailable right now — try again later",
+      "statusAccepted": "Accepted",
+      "statusConfirmed": "Applied",
+      "statusNoop": "No change needed",
+      "statusRejected": "Rejected",
+      "statusSendFailed": "Send failed",
+      "statusUnknown": "Result unknown — verify on your computer"
+    },
     "question": {
       "cancelInterrupt": "Interrupt turn (destructive)",
       "waiting": "Awaiting answer",
