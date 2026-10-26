@@ -271,6 +271,11 @@ impl Projection {
 }
 
 /// 解析 snapshot/patch 的 `config`（只读展示面；模型目录由 T6 的独立读取面填充）。
+///
+/// 官方快照 config 的形状是扁平的 `{provider, model, thought, thoughtLevels}`
+/// （B4，无 `config.models`）：`thoughtLevels` 只属于**当前模型**，必须挂到当前模型
+/// 名下保存，供 `BridgeManager::load` 在 getView 未宣告该模型档位时回退；其他模型
+/// 不获得任何档位（绝不做 provider 级并集，也不虚构候选项）。
 fn parse_selection(config: &Value) -> Option<SelectionView> {
     let object: &Map<String, Value> = config.as_object()?;
     let provider = object
@@ -285,6 +290,18 @@ fn parse_selection(config: &Value) -> Option<SelectionView> {
         .get("thought")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    // 扁平档位（仅当前模型）：去重、跳过非字符串/空串，绝不带入其他模型。
+    let mut snapshot_levels: Vec<String> = Vec::new();
+    if let Some(levels) = object.get("thoughtLevels").and_then(Value::as_array) {
+        for level in levels {
+            let Some(level) = level.as_str().filter(|text| !text.is_empty()) else {
+                continue;
+            };
+            if !snapshot_levels.iter().any(|seen| seen == level) {
+                snapshot_levels.push(level.to_owned());
+            }
+        }
+    }
     let mut models = Vec::new();
     if let Some(items) = object.get("models").and_then(Value::as_array) {
         for item in items {
@@ -310,6 +327,16 @@ fn parse_selection(config: &Value) -> Option<SelectionView> {
                 thought_levels,
             });
         }
+    }
+    match models.iter_mut().find(|choice| choice.model_id == model) {
+        Some(current) if current.thought_levels.is_empty() => {
+            current.thought_levels = snapshot_levels;
+        }
+        Some(_) => {}
+        None => models.push(ModelChoice {
+            model_id: model.to_owned(),
+            thought_levels: snapshot_levels,
+        }),
     }
     Some(SelectionView {
         provider: provider.to_owned(),
@@ -456,8 +483,12 @@ mod tests {
         assert_eq!(selection.provider, "synthetic-provider");
         assert_eq!(selection.model, "synthetic-model-a");
         assert_eq!(selection.thought.as_deref(), Some("high"));
-        // 模型目录来自独立的 model-selection 读取面（T6）；本层不虚构候选项。
-        assert!(selection.models.is_empty());
+        // 官方快照 config 只有扁平的当前模型档位（无 models 目录）：投影只把这份
+        // 档位挂到**当前模型**名下，绝不虚构其他模型。BridgeManager::load 以它为
+        // getView 缺档位时的当前模型回退。
+        assert_eq!(selection.models.len(), 1);
+        assert_eq!(selection.models[0].model_id, "synthetic-model-a");
+        assert_eq!(selection.models[0].thought_levels, vec!["low", "high"]);
         assert!(!view.capabilities.send.enabled);
 
         projection

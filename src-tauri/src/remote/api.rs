@@ -1045,7 +1045,9 @@ pub async fn session_messages(
 // 契约（JSON camelCase；所有 Json 响应带 Cache-Control: no-store——门禁下私有写路径）：
 //   POST /session-send          → delivered{pairingHint} | queued{itemId,position} | failed{error} | 400 | 404 | 403
 //                                 （pairingHint = C7 配对不确定提示，恒在场 true/false，不拦截）
+//                                 （ZCode 恒 409 official_control_required：官方控制接口是唯一写通道）
 //   GET  /session-send-info     → {injectable, reasonCode?, reason?, channels, visibility}
+//                                 （ZCode：injectable=false + officialControl + configState，不宣称已连接）
 //   GET  /session-queue         → {items:[{id,content,enqueuedAt,position}]}
 //   POST /session-queue/jump    → delivered | queued{itemId,position} | failed{error} | 400 | 404 | 403
 //   POST /session-queue/retract → {ok:true} | failed{error}（守卫忙让位） | 400 | 404 | 403
@@ -1279,6 +1281,14 @@ const APP_FORM_PENDING_REASON: &str = "APP 会话该操作走协议通道，开�
 /// 止血门审计 result（「开发中」状态对账本可查：refused + 拒绝码，形如 failed:{e}）
 const APP_FORM_PENDING_AUDIT_RESULT: &str = "refused:app_form_pending";
 
+/// **ZCode 旧 session-send 的兼容拒绝码（T7.1）**：官方控制接口是唯一写通道——
+/// M11 无头门退役后，旧入口在路由/注入/入队之前返回 409，绝不回退终端/CLI。
+const ZCODE_OFFICIAL_CONTROL_REQUIRED: &str = "official_control_required";
+
+/// send-info 对 ZCode 的原因文案（前端按 reasonCode 本地化，reason 仅兜底）。
+const ZCODE_OFFICIAL_CONTROL_REASON: &str =
+    "ZCode 请使用配对后的官方控制接口（旧发送入口不提供终端/无头注入）";
+
 /// 止血门 409 回执（四处写入口共用同一形态：409 + error + reason）
 fn app_form_pending_response() -> Response {
     json_no_store(
@@ -1390,6 +1400,15 @@ pub async fn session_send(
             serde_json::json!({ "error": "no_session" }),
         );
     };
+    // ③b **ZCode 路由边界（T7.1）**：官方控制接口是唯一写通道——旧 session-send
+    //     在路由/注入/入队**之前** 409 兼容拒绝（M11 无头门已退役，绝不让 ZCode
+    //     回退终端/CLI 注入）。判据只看会话工具，与形态/pid/平台无关。
+    if session.agent_type.tool_id() == "zcode" {
+        return json_no_store(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "error": ZCODE_OFFICIAL_CONTROL_REQUIRED }),
+        );
+    }
     // ④ Codex APP → Desktop IPC control hub：**必须在 H3 门之前交给 hub**——只有
     //    兼容分支受 H3（A 可用时 H3 关闭不挡 IPC）。判据：codex APP 形态 ∧ thread 可
     //    解析。hub 分支内自管 actionId 契约 / desktop_ipc/codex_queued 回执 / 兜底交接
@@ -2079,6 +2098,25 @@ pub async fn session_send_info(
         );
     };
     let tool = session.agent_type.tool_id().to_string();
+    // **ZCode 边界（T7.1）**：只广告官方控制路径（旧注入入口不可用），携带本机
+    // 已保存的配置状态。`configState=saved` 仅表示格式已落库——**绝不等于已连接/
+    // 已授权**，故不携带 connected/authorized 之类联机旗标。
+    if tool == "zcode" {
+        let config = st.store.with(crate::services::zcode_control::get_config);
+        let official_control =
+            config.config_state == crate::services::zcode_control::ConfigState::Saved;
+        return json_no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "injectable": false,
+                "reasonCode": ZCODE_OFFICIAL_CONTROL_REQUIRED,
+                "reason": ZCODE_OFFICIAL_CONTROL_REASON,
+                "officialControl": official_control,
+                "configState": config.config_state,
+                "url": config.url,
+            }),
+        );
+    }
     // #172/T8：兼容发送放行判据（与 session-send **同一判据**：同一个设置键 + 同一个
     // `build_send_verified` 事实）——两端口径因此同源同码（不会「send-info 说可发、
     // 真发却 403」）。
