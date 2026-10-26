@@ -13,7 +13,43 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
-## [Unreleased]
+## [0.6.2] - Unreleased
+
+### Upgrade Notes
+
+- **One-time UI language reset**: older versions cached the auto-detected system
+  language in the same local key as manual choices, so the two could not be told
+  apart. From this version on, only manual choices are remembered. After
+  upgrading, desktop users who had manually switched the UI language will fall
+  back to the system language once — pick your language again and it sticks
+  (no longer overridden by system-language changes). Users who never switched
+  manually will notice no difference.
+- **Compatibility path for unknown Codex desktop builds (experimental) is on by
+  default**: unknown Desktop builds used to be a flat "not unlocked". The mobile
+  app now defaults to "Compatibility sending (experimental)" for them and runs an
+  automatic **read-only probe** first (15-second server-side hard cap, evidence
+  via the bundled schema) before unlocking send/status — while the probe runs the
+  UI only shows a "probing" skeleton and never concludes "not unlocked" up front.
+  Disable "Compatibility sending" in Settings if you do not want it. Destructive
+  capabilities such as interrupt and approvals are not part of the default and
+  remain evidence-gated.
+
+### Added
+
+- **Compatibility path for unknown Codex desktop builds (experimental)**: mobile
+  capabilities are reported honestly via a three-state badge — **verified** (that
+  Desktop build has real-device evidence), **compatibility sending (experimental)**
+  (unknown builds: send/status on by default; destructive capabilities such as
+  interrupt and approvals remain evidence-gated), and **locked** (the server
+  explicitly states it is unavailable). The compatibility path ships with the
+  read-only probe and "probing" skeleton; Settings offers a "Compatibility sending
+  (experimental)" switch with the risk note (messages may be delivered to the
+  wrong session — use at your own risk).
+- **UI language auto-follow**: the desktop app follows the system language by
+  default and tracks system-language changes live; a manual choice always wins
+  and is no longer overridden. The phone's UI language is delivered from the
+  desktop and can be overridden on the phone (manual choice wins).
+- **Stop the Codex desktop turn from the phone**: while a desktop turn keeps running, the mobile outgoing-queue panel gains a "Stop the desktop turn & continue" action — it interrupts the turn currently running in desktop Codex, and **work that turn has not finished is lost** (the confirmation says so before anything is sent); once the turn stops, the queue continues on its own. Verified on macOS `26.1013.40934`; other Desktop builds are unverified and stay disabled.
 
 ### Changed
 
@@ -50,18 +86,6 @@ _Only versions translated so far are listed here; the full history lives in the
   release asset hosts. Errors are flattened through the full source chain, so the
   failure toast shows the actual cause.
 
-## [0.6.2] - Unreleased
-
-### Upgrade Notes
-
-- **One-time UI language reset**: older versions cached the auto-detected system
-  language in the same local key as manual choices, so the two could not be told
-  apart. From this version on, only manual choices are remembered. After
-  upgrading, desktop users who had manually switched the UI language will fall
-  back to the system language once — pick your language again and it sticks
-  (no longer overridden by system-language changes). Users who never switched
-  manually will notice no difference.
-
 ## [0.6.1] - 2026-10-22
 
 ### Changed
@@ -78,18 +102,6 @@ _Only versions translated so far are listed here; the full history lives in the
 - **Separate DNS waiting from repair**: confirmed missing public records show continuous elapsed time and an estimate of around ten minutes, with automatic read-only checks and no repeated retry action. Ordinary verification no longer resets Funnel; an explicitly confirmed re-enable performs repair. Enabled macOS extensions require no further action, and a stopped backend no longer implies missing approval.
 - **macOS Tailscale installation**: the install action opens the system installer and rechecks status when Tuvis regains focus. Cancellation stays incomplete; installer failures retain exit codes and stdout/stderr instead of showing a blank error.
 - **Re-verification process hint**: while the automatic re-check runs after a channel is re-enabled, the summary shows a spinner with the expected timing (usually within a minute); it clears itself once verification passes, letting users tell normal waiting from a fault.
-
-### Added
-
-- **Stop the Codex desktop turn from the phone**: while a desktop turn keeps running, the mobile outgoing-queue panel gains a "Stop the desktop turn & continue" action — it interrupts the turn currently running in desktop Codex, and **work that turn has not finished is lost** (the confirmation says so before anything is sent); once the turn stops, the queue continues on its own. Verified on macOS `26.1013.40934`; other Desktop builds are unverified and stay disabled.
-
-### Changed
-
-- **Default README switched to English**: `README.md` is now the English version
-  (content moved in from `README.en.md`); the Chinese source-of-truth moved to
-  `README.zh-CN.md`, with language-switcher links at the top of both files. The
-  `AGENTS.md` bilingual asset table, project tree, and the README pin in the
-  `usage-partial-coverage-lock` test were updated accordingly.
 
 ## [0.6.0] - 2026-10-21
 

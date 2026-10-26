@@ -28,3 +28,9 @@ Tuvis supports eight AI coding tools today. Each tool differs in how open it is,
 > 💡 🧪 in the table marks an experimental capability: phone injection (sending messages / creating sessions) is currently open to four tools only — Claude Code, Codex CLI, OpenCode and Kimi Code. OpenClaw / WorkBuddy are black-box forms with no external write channel, so they can be watched but not written to (OpenClaw cannot be viewed remotely from the phone, only on the desktop board) — a real difference in how open each tool is, not a malfunction; OpenClaw does not support token-usage collection yet.
 
 Want to try the interactions first? Open the [interactive demo](/demo) — no install needed to get a feel for the board and the phone-side flows.
+
+### Interface language
+
+- The desktop app **follows your system language** by default: when the system language changes, the UI follows automatically — no setup needed.
+- Once you pick a language in Settings, the **manual choice wins** — later system-language changes no longer override it.
+- Upgrading from an older version: older builds also cached the auto-detected system language, indistinguishable from a manual choice. This version only remembers **manual** switches — if you had manually switched the UI language, it **falls back to the system language once** after upgrading; pick it again and it sticks.
