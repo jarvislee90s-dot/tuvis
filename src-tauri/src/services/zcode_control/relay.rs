@@ -36,14 +36,22 @@
 //! # 并发
 //!
 //! `connect` 用一把异步单飞锁串行化「开始新连接」，且 WS 升级 + `auth_init`→`auth_ack`
-//! 共用 15s 总预算，任何情况都不会无限占用该锁。`disconnect` 不等待该锁，但会**有界等待
-//! 连接任务收尸**（生产 15s）后才返回：保证紧随的 `connect` 不会与尚未关闭的旧 socket
-//! 重叠而被官方 KICK；若 `live` 尚未登记（仍停在 WS 升级前的握手），断开立即返回。
+//! 共用 15s 总预算。`disconnect` 不等待该锁，已登记活连接时**有界等待连接任务收尸**
+//! （生产 15s）后才返回：保证紧随的 `connect` 不会与尚未关闭的旧 socket 重叠而被官方
+//! KICK；若 `live` 尚未登记（仍停在 WS 升级前的握手），断开立即返回。注意 actor 收尸
+//! 等待有界（15s），但终态事件发送本身没有超时（见下），因此 `disconnect` 的总耗时
+//! 仍可能超过该窗。
 //! 连接任务独占 socket（split 成 sink/source），`send_data` 只经有界命令通道投递，绝不并发
 //! 写 socket。
 //!
-//! 事件通道是**尽力而为**：状态/数据事件一律 `try_send`，队列满时丢事件（lag），绝不阻塞
-//! `connect`/`disconnect`/actor；消费方以「重拉当前视图（GET）」兜底重同步。
+//! 事件通道是**有界**的，但 State 与 Data 的溢出语义不同：
+//! - **State（终态-critical）**：先 `try_send`，队列满时**无超时**地 `send().await`
+//!   等待消费端，绝不静默丢弃——终态丢失会让 Hub 永远停在 `paired`。代价如实计入：
+//!   等待期间 `emit_lock` 被持有，同一连接的 Data 与心跳状态发送一并阻塞；`connect`
+//!   可能在单飞锁内等待消费端，`disconnect` 也可能等待任意久（无超时兜底，终态不丢是
+//!   有意取舍）。
+//! - **Data（非阻塞）**：保持 `try_send`，队列满时**置位 [`RelayLag`] 并唤醒**消费方，
+//!   然后丢弃该帧（绝不阻塞 actor）；消费方据 lag 显式作废投影并重 GET，绝不只读旧缓存。
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -53,7 +61,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -144,6 +152,43 @@ pub enum RelayEvent {
     State(ConnectionView),
 }
 
+/// Data 事件溢出信号（可克隆，跨任务共享；不含任何 payload）。
+///
+/// Data 走 `try_send` 绝不阻塞 actor；队列满时 [`RelayClient`] 只置位本信号并唤醒
+/// 消费方。消费方（Hub 事件泵）必须把它当作**投影失效**：作废旧桥投影、把已发布视图
+/// 降级为 `ready=false`，下一次 GET 重新 bind/现读，绝不把旧缓存继续当权威。
+#[derive(Clone, Default)]
+pub struct RelayLag {
+    lagged: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl RelayLag {
+    /// 新建（未溢出）观察口。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 置位溢出标记并唤醒等待方（只唤醒当前已注册的等待者）。
+    pub fn set(&self) {
+        self.lagged.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+        // 再留一枚 permit：若等待者在 `notify_waiters` 之后才注册，下一次
+        // `changed()` 会立即返回，避免丢唤醒。
+        self.notify.notify_one();
+    }
+
+    /// 取走溢出标记（`true` = 上一次取走之后发生过 Data 溢出）。
+    pub fn take(&self) -> bool {
+        self.lagged.swap(false, Ordering::SeqCst)
+    }
+
+    /// 等待下一次溢出信号（与 [`Self::take`] 配合：先 take 再 changed，防漏）。
+    pub async fn changed(&self) {
+        self.notify.notified().await;
+    }
+}
+
 /// 连接任务命令（唯一写 socket 的路径；有界通道，不在状态锁内 await 网络）。
 enum Command {
     SendData {
@@ -206,6 +251,8 @@ pub struct RelayClient {
 struct Shared {
     auth: Arc<AuthService>,
     events: mpsc::Sender<RelayEvent>,
+    /// Data 溢出信号（State 溢出走背压，不置位）。
+    lag: RelayLag,
     ws_origin: String,
     timing: RelayTiming,
     state: Mutex<InnerState>,
@@ -354,6 +401,7 @@ impl RelayClient {
             shared: Arc::new(Shared {
                 auth,
                 events,
+                lag: RelayLag::default(),
                 ws_origin,
                 timing,
                 state: Mutex::new(InnerState {
@@ -373,6 +421,11 @@ impl RelayClient {
                 actor_exits: AtomicUsize::new(0),
             }),
         }
+    }
+
+    /// Data 溢出观察口（可克隆；Hub 事件泵据此作废旧投影并唤醒重 GET）。
+    pub fn lag_watcher(&self) -> RelayLag {
+        self.shared.lag.clone()
     }
 
     /// 建立单条 relay 连接（先取新 token，再走官方握手）。
@@ -589,6 +642,8 @@ impl RelayClient {
     /// 不等待 `connect` 的单飞锁（若连接仍停在 WS 升级前的握手，`live` 尚未登记，立即返回）；
     /// 已登记活连接时**有界等待 actor 收尸**（生产 15s）后才返回，保证紧接着的 `connect`
     /// 不会与尚未关闭的旧 socket 重叠。只有状态真正变化（非 `offline`）时才发 State 事件。
+    /// 注意：终态 State 发送**没有超时**——事件队列满时本调用会无期限等待消费端，
+    /// 因此整体返回时间不以上述 15s 为上界（终态不丢是有意取舍）。
     pub async fn disconnect(&self) {
         let live = {
             let _emit = self.shared.emit_lock.lock().await;
@@ -605,8 +660,9 @@ impl RelayClient {
                 live.signal_shutdown();
             }
             if previous_state != ConnectionState::Offline {
-                // 非阻塞：事件泵停摆不得拖住断开；消费方以当前视图兜底。
-                let _ = self.shared.events.try_send(RelayEvent::State(view));
+                // 终态-critical：队列满时无超时等待消费端，绝不静默丢弃 Offline
+                //（丢失终态会让 Hub 永远停在 paired；等待时间不设上界）。
+                self.shared.send_state(view).await;
             }
             live
         };
@@ -686,7 +742,7 @@ impl Shared {
 
     /// 发出 `connecting` 事件（若代际/视图已被更新的动作取代则丢弃）。
     ///
-    /// 非阻塞：队列满时丢事件（lag），消费方以当前视图 GET 兜底。
+    /// State 是终态-critical：队列满时无超时等待消费端（Data 仍非阻塞）。
     async fn announce_connecting(&self, view: ConnectionView) {
         let _emit = self.emit_lock.lock().await;
         {
@@ -695,12 +751,13 @@ impl Shared {
                 return;
             }
         }
-        let _ = self.events.try_send(RelayEvent::State(view));
+        self.send_state(view).await;
     }
 
     /// 线性化状态更新与事件发送；只有状态真的变化才发事件。
     ///
-    /// 发送为 `try_send`：事件泵停摆只造成丢事件，不得把 actor/`connect`/`disconnect` 挂死。
+    /// State 是终态-critical：发送先 `try_send`，队列满时**无超时**等待消费端；
+    /// 绝不静默丢弃终态（Data 走非阻塞 + 溢出失效，见 [`Self::emit_data`]）。
     async fn transition_state(
         &self,
         generation: u64,
@@ -726,10 +783,31 @@ impl Shared {
             }
             inner.view.clone()
         };
-        let _ = self.events.try_send(RelayEvent::State(view));
+        self.send_state(view).await;
         true
     }
 
+    /// 发送 State 事件：先 `try_send`；只有队列满才 `send().await`——**没有超时**。
+    ///
+    /// 终态不可丢（丢失会让 Hub 永远停在 `paired`），因此等待消费端的时间不设上界。
+    /// 代价必须如实计入：调用方（`announce_connecting`/`transition_state`/`disconnect`）
+    /// 在等待期间持有 `emit_lock`，同一连接的 Data 与心跳状态发送一并排队；`connect`
+    /// 可能在单飞锁内等待、`disconnect` 可能等待任意久。`Closed`（消费端已消失）则丢弃。
+    async fn send_state(&self, view: ConnectionView) {
+        match self.events.try_send(RelayEvent::State(view)) {
+            Ok(()) => {}
+            // 终态-critical：只对罕见的 State 无超时等待消费端腾位（emit_lock 跨等待持有）。
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                let _ = self.events.send(event).await;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    /// 发送 Data 事件：**非阻塞**（`try_send`）；队列满时置位 lag + 唤醒消费方后丢帧。
+    ///
+    /// Data 丢失由消费方（Hub 事件泵）显式作废投影 + 重 GET 兜底；绝不阻塞连接 actor，
+    /// 也绝不把 Data 改成 `send().await`。
     async fn emit_data(&self, generation: u64, payload: Value) {
         // 数据与状态事件共用排序锁：断开/终态之后绝不把旧代际 data 上报给桥。
         let _emit = self.emit_lock.lock().await;
@@ -739,7 +817,12 @@ impl Shared {
                 return;
             }
         }
-        let _ = self.events.try_send(RelayEvent::Data(payload));
+        match self.events.try_send(RelayEvent::Data(payload)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => self.lag.set(),
+            // 消费端已消失：无人可通知，忽略。
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 
     async fn fail_attempt(&self, generation: u64, state: ConnectionState, reason: &str) {
@@ -1377,6 +1460,16 @@ mod tests {
         panic!("等待条件超时：{what}");
     }
 
+    /// 从事件通道取下一条 State（有界 timeout；Data/关闭都视为失败）。
+    async fn recv_state(receiver: &mut mpsc::Receiver<RelayEvent>) -> ConnectionView {
+        match tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await {
+            Ok(Some(RelayEvent::State(view))) => view,
+            Ok(Some(RelayEvent::Data(_))) => panic!("期望 State 事件，收到 Data"),
+            Ok(None) => panic!("事件通道在 State 到达前关闭"),
+            Err(_) => panic!("等待 State 事件超时"),
+        }
+    }
+
     // ───────────────────────── fake 授权/令牌 HTTP ─────────────────────────
 
     struct FakeAuthState {
@@ -1640,6 +1733,8 @@ mod tests {
         close_after_match: bool,
         data_before_ack: Option<Value>,
         data_after_match: Option<Value>,
+        /// 配对后立即连发的 `data` 帧数（容量 1 的队列会被撞满，验证 Data 溢出）。
+        data_burst_after_match: Option<usize>,
         /// 配对后立即下发一条超过入站上限的帧（字节数，不含 JSON 信封）。
         oversized_after_match: Option<usize>,
         ack_gate: Option<Arc<Semaphore>>,
@@ -1657,6 +1752,7 @@ mod tests {
                 close_after_match: false,
                 data_before_ack: None,
                 data_after_match: None,
+                data_burst_after_match: None,
                 oversized_after_match: None,
                 ack_gate: None,
                 stall_after_match: false,
@@ -1916,6 +2012,16 @@ mod tests {
             }
             if let Some(payload) = script.data_after_match.clone() {
                 send_server_json(&mut socket, &json!({"type": "data", "payload": payload})).await;
+            }
+            if let Some(count) = script.data_burst_after_match {
+                // 连发多帧：消费端停摆时容量 1 的队列必然溢出（Data 不得阻塞 actor）。
+                for seq in 0..count {
+                    send_server_json(
+                        &mut socket,
+                        &json!({"type": "data", "payload": {"burstSeq": seq}}),
+                    )
+                    .await;
+                }
             }
             if script.close_after_match {
                 close_server_socket(&mut socket).await;
@@ -3093,9 +3199,113 @@ mod tests {
         assert_eq!(fake_relay.kicks_sent(), 1);
     }
 
-    /// 事件消费者停摆（队列满且无人消费）时，connect/disconnect 必须仍有界返回。
+    /// 终态 State 不得被有界队列静默丢弃：队列满时 `disconnect` 必须等消费端腾位，
+    /// drain 后仍能收到 Offline（旧实现 `try_send` 丢掉终态并立刻返回）。
     #[tokio::test]
-    async fn stalled_event_consumer_does_not_block_connect() {
+    async fn full_state_queue_backpressures_disconnect_until_offline_is_queued() {
+        let fake_auth = FakeAuthHttp::start().await;
+        let auth = authorized_service(&fake_auth).await;
+        // waiting 握手只产生一条 State（Connecting），容量 1 恰好留满。
+        let fake_relay = FakeRelay::start(RelayScript::default()).await;
+        let (events, mut receiver) = mpsc::channel(1);
+        let client = Arc::new(relay_client(auth, events, &fake_relay.origin));
+
+        let view = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.connect(route(Some(SYNTHETIC_MID))),
+        )
+        .await
+        .expect("waiting 握手不得被事件队列拖死")
+        .expect("waiting 应建立连接");
+        assert_eq!(view.state, ConnectionState::Connecting);
+
+        let disconnect = tokio::spawn({
+            let client = client.clone();
+            async move { client.disconnect().await }
+        });
+        // 消费者停摆：Offline 必须被背压住（等队列腾位），而不是静默丢弃后立刻返回。
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !disconnect.is_finished(),
+            "队列满时 Offline 必须背压等待消费端，不得 try_send 丢弃"
+        );
+
+        let queued = recv_state(&mut receiver).await;
+        assert_eq!(queued.state, ConnectionState::Connecting, "握手状态在队首");
+
+        tokio::time::timeout(Duration::from_secs(2), disconnect)
+            .await
+            .expect("消费端腾位后 disconnect 必须完成")
+            .expect("disconnect 任务不得 panic");
+        let offline = recv_state(&mut receiver).await;
+        assert_eq!(
+            offline.state,
+            ConnectionState::Offline,
+            "终态 Offline 不得被队列丢弃"
+        );
+    }
+
+    /// Data 溢出必须显式置位 lag 且不阻塞连接 actor（消费端停摆时连发两帧）。
+    #[tokio::test]
+    async fn data_overflow_sets_lag_without_blocking_actor() {
+        let fake_auth = FakeAuthHttp::start().await;
+        let auth = authorized_service(&fake_auth).await;
+        let fake_relay = FakeRelay::start(RelayScript {
+            handshake: HandshakeMode::Matched,
+            data_burst_after_match: Some(2),
+            ..RelayScript::default()
+        })
+        .await;
+        // 容量 1：把握手的两条 State 先取空，随后两帧 data 必然撞满队列。
+        let (events, mut receiver) = mpsc::channel(1);
+        let client = Arc::new(relay_client(auth, events, &fake_relay.origin));
+        let lag = client.lag_watcher();
+
+        let connect = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect(route(Some(SYNTHETIC_MID))).await }
+        });
+        assert_eq!(
+            recv_state(&mut receiver).await.state,
+            ConnectionState::Connecting
+        );
+        assert_eq!(
+            recv_state(&mut receiver).await.state,
+            ConnectionState::Paired
+        );
+        tokio::time::timeout(Duration::from_secs(2), connect)
+            .await
+            .expect("握手不得被事件队列拖死")
+            .expect("connect 任务不得 panic")
+            .expect("matched 应建立连接");
+
+        // 消费端保持停摆：第一帧入队（满），第二帧溢出 → lag 置位。
+        wait_until(|| lag.take(), "Data 溢出置位 lag").await;
+
+        // Data 溢出不得卡死 actor：已配对连接仍可写帧。
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.send_data(json!({"probe": "lag"})),
+        )
+        .await
+        .expect("Data 溢出不得阻塞连接 actor")
+        .expect("溢出后写帧仍应成功");
+        wait_until(
+            || {
+                fake_relay
+                    .data_payloads()
+                    .iter()
+                    .any(|p| p["probe"] == "lag")
+            },
+            "溢出后 actor 仍处理写命令",
+        )
+        .await;
+        assert_eq!(client.view().state, ConnectionState::Paired);
+    }
+
+    /// 事件接收端消失时，`send_state` 的 Closed 分支不得把 connect/disconnect 挂死。
+    #[tokio::test]
+    async fn dropped_event_receiver_never_blocks_connect_or_disconnect() {
         let fake_auth = FakeAuthHttp::start().await;
         let auth = authorized_service(&fake_auth).await;
         let fake_relay = FakeRelay::start(RelayScript {
@@ -3103,8 +3313,9 @@ mod tests {
             ..RelayScript::default()
         })
         .await;
-        // 容量 1 且保留接收端不消费：第二条事件必然满队。
-        let (events, _receiver) = mpsc::channel(1);
+        // 容量 1 且接收端立即 drop：所有 State 发送都命中 Closed（无消费者可等）。
+        let (events, receiver) = mpsc::channel(1);
+        drop(receiver);
         let client = relay_client(auth, events, &fake_relay.origin);
 
         let view = tokio::time::timeout(
@@ -3112,13 +3323,13 @@ mod tests {
             client.connect(route(Some(SYNTHETIC_MID))),
         )
         .await
-        .expect("事件消费者停摆不得阻塞 connect")
-        .expect("connect 应成功");
+        .expect("接收端已 drop 时 connect 不得挂死")
+        .expect("matched 应建立连接");
         assert!(view.is_paired());
 
         tokio::time::timeout(Duration::from_secs(2), client.disconnect())
             .await
-            .expect("事件消费者停摆不得阻塞 disconnect");
+            .expect("接收端已 drop 时 disconnect 不得挂死");
         assert_eq!(client.view().state, ConnectionState::Offline);
     }
 

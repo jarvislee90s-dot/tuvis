@@ -4590,6 +4590,77 @@ mod tests {
         assert!(!peer.sent().is_empty());
     }
 
+    /// 换代后（Hub 的 Data-lag 失效/KICKED 冲突都走同一条 `invalidate` 路径）：
+    /// 旧 `bridgeSessionId` 的迟到合法帧必须被忽略、不得复活旧投影；重新 bind 必须
+    /// 开一条**新**桥（bridge id 单调递增）。
+    #[tokio::test]
+    async fn invalidate_drops_old_bridge_frames_and_rebind_uses_fresh_bridge() {
+        let config = PeerConfig {
+            // 重新订阅需要一份快照，重绑后才能恢复 ready。
+            resync_snapshot: Some(conversation_snapshot(SESSION_A, 5, Vec::new())),
+            ..basic_config()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let _first = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let old_bridge = peer.session_bridge_id(SESSION_A);
+        assert!(
+            manager.peek_view(SESSION_A).expect("bound").ready,
+            "初始快照已就绪"
+        );
+
+        // Hub Data 溢出（apply_relay_lag）与 KICKED 冲突都推进投影代际并作废旧桥。
+        manager.invalidate(2).await;
+        assert!(manager.peek_view(SESSION_A).is_none(), "换代必须释放旧投影");
+
+        // 旧桥的迟到快照（revision 99）：若旧桥未被作废，它会把投影复活成 revision 99。
+        let stale = encode_frame(
+            &RpcIdentity::new(&old_bridge),
+            1,
+            1,
+            &channel_message(
+                json!([RESPONSE_TYPE_EVENT_FIRE, 7]),
+                &test_wire(
+                    &format!("{CONVERSATION_TOPIC_PREFIX}{SESSION_A}"),
+                    "conv-sub-synthetic-1",
+                    json!({
+                        "kind": "snapshot",
+                        "snapshot": conversation_snapshot(SESSION_A, 99, Vec::new())
+                    }),
+                ),
+            ),
+        )
+        .expect("stale frame");
+        manager
+            .on_data(stale)
+            .await
+            .expect("旧 bridgeSessionId 按未知桥忽略");
+        assert!(
+            manager.peek_view(SESSION_A).is_none(),
+            "旧 bridgeSessionId 的迟到帧不得复活投影"
+        );
+
+        let second = manager.bind(&key(SESSION_A)).await.expect("rebind");
+        let new_bridge = peer.session_bridge_id(SESSION_A);
+        assert_ne!(new_bridge, old_bridge, "重新 bind 必须开新桥");
+        assert!(
+            bridge_ordinal(&new_bridge) > bridge_ordinal(&old_bridge),
+            "新 bridge id 必须单调递增（{old_bridge} -> {new_bridge}）"
+        );
+        let view = manager.session(&second).await.expect("session");
+        assert!(view.ready, "重绑后由 resync 快照恢复 ready");
+        assert_eq!(view.revision, Some(5), "新投影来自新桥的快照");
+    }
+
+    fn bridge_ordinal(bridge_id: &str) -> u32 {
+        u32::from_str_radix(
+            bridge_id
+                .strip_prefix("tuvis-bridge-")
+                .expect("bridge id prefix"),
+            16,
+        )
+        .expect("bridge id hex")
+    }
+
     #[tokio::test]
     async fn refused_bridge_open_maps_to_not_ready() {
         let config = PeerConfig {

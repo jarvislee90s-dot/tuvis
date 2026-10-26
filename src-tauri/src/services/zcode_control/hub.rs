@@ -12,7 +12,9 @@
 //!
 //! 构造即装配生产链（AuthService → RelayClient → BridgeManager → CommandSender）并启动
 //! 一条常驻 relay 事件泵：`Data` 逐帧进桥，`State` 更新连接态、`conflict`（KICKED）
-//! 推进控制代际并作废旧桥/投影。构造**不**自动 OAuth、**不**自动连接。
+//! 推进控制代际并作废旧桥/投影；`Data` 溢出（`RelayLag`）显式作废旧投影并发布
+//! `ready=false` 的降级事件，下一次 GET 重新 bind/现读（绝不返回旧缓存）。
+//! 构造**不**自动 OAuth、**不**自动连接。
 //! HTTP/IPC 接线在后续切片完成；本文件只交付可测的 Hub 核心。
 //! DB 读写失败由调用方处置：`config_changed` 只在保存/删除**成功后**被调用，
 //! 失败保存不得断开旧连接（本函数不读写入结果、不自行落库）。
@@ -28,7 +30,7 @@ use super::auth::{AuthService, OAuthProvider, OpenAuthorize};
 use super::bridge::BridgeManager;
 use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
-use super::relay::{DeviceRoute, RelayClient, RelayEvent};
+use super::relay::{DeviceRoute, RelayClient, RelayEvent, RelayLag};
 use super::types::{
     codes, ActionContext, ActionReceipt, BoundTarget, CapabilityPolicy, CapabilityView,
     ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind, SessionView,
@@ -41,7 +43,8 @@ use super::evidence::{EvidencePermit, EvidencePermitStore};
 
 /// Hub 广播缓冲（事件只做通知，缺口由消费方重 GET 兜底）。
 const EVENT_CAPACITY: usize = 64;
-/// relay→Hub 事件泵队列（满时 relay 侧丢事件；Data 丢失由上层超时/重试兜底）。
+/// relay→Hub 事件泵队列（有界：State 满时 relay 侧**无超时**等待消费端，Data 满时
+/// 置位 lag 并触发投影失效，消费方绝不把旧缓存当权威）。
 const RELAY_EVENT_CAPACITY: usize = 64;
 
 /// 生产宿主证据基线：本分支**没有**宿主 APP build / wire 协议 / schema / hello 的
@@ -138,6 +141,13 @@ trait BridgePump: Send + Sync {
     fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()>;
 }
 
+/// 事件泵装配口：relay 事件接收端 + 泵桥 + 可选 Data 溢出观察口（测试可缺省）。
+type PumpParts = (
+    mpsc::Receiver<RelayEvent>,
+    Arc<dyn BridgePump>,
+    Option<RelayLag>,
+);
+
 /// 生产泵口：与 [`PartsBackend`] 共用同一个投影代际计数器。
 struct ProjectionBridge {
     bridge: Arc<BridgeManager>,
@@ -168,13 +178,15 @@ pub struct PartsBackend {
 }
 
 impl PartsBackend {
-    /// 组装生产链（不触发 OAuth、不自动连接），返回 relay 事件接收端供 Hub 事件泵消费。
-    fn production(store: DeviceStore) -> (Self, mpsc::Receiver<RelayEvent>) {
+    /// 组装生产链（不触发 OAuth、不自动连接），返回 relay 事件接收端与 Data 溢出观察口
+    /// 供 Hub 事件泵消费。
+    fn production(store: DeviceStore) -> (Self, mpsc::Receiver<RelayEvent>, RelayLag) {
         let auth = Arc::new(AuthService::new(reqwest::Client::new()));
-        // 泵由 Hub 持有；通道满时 relay 侧 `try_send` 丢事件（lag 由消费方重 GET 兜底），
-        // 绝不阻塞 relay actor。
+        // 泵由 Hub 持有：State 溢出由 relay 无超时等待消费端（终态不丢），Data 溢出只
+        // 置位 lag，由事件泵作废旧投影并让下一次 GET 重新 bind/现读（绝不阻塞 relay actor）。
         let (events, events_rx) = mpsc::channel(RELAY_EVENT_CAPACITY);
         let relay = Arc::new(RelayClient::new(auth.clone(), events));
+        let lag = relay.lag_watcher();
         let bridge = Arc::new(BridgeManager::new(relay.clone()));
         let policy = CapabilityView::default();
         let sender = Arc::new(
@@ -194,6 +206,7 @@ impl PartsBackend {
                 projection_generation: Arc::new(AtomicU64::new(0)),
             },
             events_rx,
+            lag,
         )
     }
 
@@ -459,6 +472,37 @@ async fn apply_relay_state(
     }
 }
 
+/// 事件泵的 Data 溢出处理：旧投影**显式失效**，绝不把旧缓存继续当权威。
+///
+/// relay 侧对 Data 只置位 [`RelayLag`] + 唤醒（不阻塞 actor），因此泵在此承担「失效」
+/// 语义：先作废桥内投影（下一次 GET 必然重新 bind/现读），再在 paired 且已发布过
+/// `last_session` 时把它降级为 `ready=false`、能力回到基线全关，并在锁外广播一次
+/// `Session` 事件——手机据它丢弃卡面，下一次 GET 重新取数。不伪造任何数据内容。
+async fn apply_relay_lag(
+    inner: &Mutex<Inner>,
+    events: &broadcast::Sender<ControlEvent>,
+    bridge: &dyn BridgePump,
+) {
+    // 先作废桥投影：旧缓存不得在失效窗口内被继续读取。
+    bridge.invalidate().await;
+    let stale = {
+        let mut state = lock_inner(inner);
+        if state.state != ConnectionState::Paired {
+            return;
+        }
+        let Some(mut view) = state.last_session.clone() else {
+            return;
+        };
+        view.generation = state.generation;
+        view.ready = false;
+        // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新事件。
+        view.capabilities = CapabilityView::default();
+        state.last_session = Some(view.clone());
+        view
+    };
+    emit_session_event(inner, events, &stale);
+}
+
 /// 事件泵的 Data 会话变化：锁内校验代际/配对并落 `last_session`，锁外广播。
 ///
 /// - `hub_generation` 是本帧进入桥之前的 Hub 代际：桥处理在途若发生换代（配置变更/
@@ -591,11 +635,16 @@ impl ZcodeHub {
     /// 因此无任何自动授权/自动连接副作用。必须在 Tokio runtime 内构造
     /// （`BridgeManager` 会 spawn 出站 actor）。
     pub fn new(store: DeviceStore) -> Self {
-        let (parts, relay_events) = PartsBackend::production(store.clone());
+        let (parts, relay_events, lag) = PartsBackend::production(store.clone());
         let policy = parts.policy();
         let bridge = parts.pump_bridge();
         let backend: Arc<dyn HubBackend> = Arc::new(parts);
-        Self::assemble(store, backend, policy, Some((relay_events, bridge)))
+        Self::assemble(
+            store,
+            backend,
+            policy,
+            Some((relay_events, bridge, Some(lag))),
+        )
     }
 
     /// 测试专用：注入 fake 后端与能力矩阵（不注册任何设置/IPC 入口）。
@@ -611,7 +660,7 @@ impl ZcodeHub {
         Self::assemble(store, backend, policy, None)
     }
 
-    /// 事件泵测试构造（fake relay 通道 + fake bridge；零网络）。
+    /// 事件泵测试构造（fake relay 通道 + fake bridge；零网络；无 lag 观察口）。
     #[cfg(test)]
     fn with_pump(
         store: DeviceStore,
@@ -620,14 +669,27 @@ impl ZcodeHub {
         events: mpsc::Receiver<RelayEvent>,
         bridge: Arc<dyn BridgePump>,
     ) -> Self {
-        Self::assemble(store, backend, policy, Some((events, bridge)))
+        Self::assemble(store, backend, policy, Some((events, bridge, None)))
+    }
+
+    /// 事件泵测试构造 + Data 溢出观察口（验证 lag → 投影失效接线）。
+    #[cfg(test)]
+    fn with_pump_and_lag(
+        store: DeviceStore,
+        backend: Arc<dyn HubBackend>,
+        policy: CapabilityView,
+        events: mpsc::Receiver<RelayEvent>,
+        bridge: Arc<dyn BridgePump>,
+        lag: RelayLag,
+    ) -> Self {
+        Self::assemble(store, backend, policy, Some((events, bridge, Some(lag))))
     }
 
     fn assemble(
         store: DeviceStore,
         backend: Arc<dyn HubBackend>,
         policy: CapabilityView,
-        pump: Option<(mpsc::Receiver<RelayEvent>, Arc<dyn BridgePump>)>,
+        pump: Option<PumpParts>,
     ) -> Self {
         let hub = Self {
             store,
@@ -662,22 +724,44 @@ impl ZcodeHub {
                 ConnectionState::NeedsConfig
             };
         }
-        if let Some((events, bridge)) = pump {
-            hub.spawn_pump(events, bridge);
+        if let Some((events, bridge, lag)) = pump {
+            hub.spawn_pump(events, bridge, lag);
         }
         hub
     }
 
     /// 常驻事件泵：`Data` 进桥并发布本帧的会话变化，`State` 更新连接态并按需作废
-    /// 旧桥/投影。
+    /// 旧桥/投影；`RelayLag`（Data 溢出）**显式**作废旧投影并让下一次 GET 重新现读。
     ///
     /// 只持有 Hub 状态的 `Weak`：Hub 释放或 relay 通道关闭（sender 全丢）即退出；
     /// 单帧坏数据/桥错误只记一次降级，绝不拆泵（T2.2 M-10）。
-    fn spawn_pump(&self, mut events: mpsc::Receiver<RelayEvent>, bridge: Arc<dyn BridgePump>) {
+    ///
+    /// 每轮先 `lag.take()`：Data 溢出（relay 侧只置位 + 唤醒，不阻塞 actor）后，旧投影
+    /// 已不可信——先作废桥/投影并发布降级事件，再继续消费队列，绝不让 GET 读到旧缓存。
+    fn spawn_pump(
+        &self,
+        mut events: mpsc::Receiver<RelayEvent>,
+        bridge: Arc<dyn BridgePump>,
+        lag: Option<RelayLag>,
+    ) {
         let inner = Arc::downgrade(&self.inner);
         let out = self.events.clone();
         tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
+            loop {
+                if let Some(lag) = &lag {
+                    if lag.take() {
+                        let Some(inner) = inner.upgrade() else { break };
+                        apply_relay_lag(&inner, &out, bridge.as_ref()).await;
+                    }
+                }
+                let event = match &lag {
+                    Some(lag) => tokio::select! {
+                        event = events.recv() => event,
+                        _ = lag.changed() => continue,
+                    },
+                    None => events.recv().await,
+                };
+                let Some(event) = event else { break };
                 let Some(inner) = inner.upgrade() else { break };
                 match event {
                     RelayEvent::Data(payload) => {
@@ -2667,6 +2751,31 @@ mod tests {
         (hub, events, pump)
     }
 
+    /// 带事件泵 + Data 溢出观察口（`RelayLag`）的 Hub，用于验证溢出失效接线。
+    fn pumped_with_lag(
+        store: DeviceStore,
+        backend: Arc<FakeBackend>,
+        policy: CapabilityView,
+    ) -> (
+        Arc<ZcodeHub>,
+        mpsc::Sender<RelayEvent>,
+        Arc<FakePump>,
+        RelayLag,
+    ) {
+        let (events, receiver) = mpsc::channel(8);
+        let pump = Arc::new(FakePump::default());
+        let lag = RelayLag::new();
+        let hub = Arc::new(ZcodeHub::with_pump_and_lag(
+            store,
+            backend,
+            policy,
+            receiver,
+            pump.clone(),
+            lag.clone(),
+        ));
+        (hub, events, pump, lag)
+    }
+
     /// relay `Data` 逐帧进桥；单帧错误只丢该帧，泵继续。
     #[tokio::test]
     async fn relay_data_is_pumped_into_bridge() {
@@ -2816,6 +2925,84 @@ mod tests {
                 "无变化的 Data 不得发布 Session 事件"
             );
         }
+    }
+
+    /// Data 溢出必须显式让投影失效：invalidate 一次 + 发布 ready=false/能力全关。
+    ///
+    /// 注意：`hub.session()` 本来每次都会 `bind_session` + `session`，故本用例不断言
+    /// 「GET 重新 bind」（那没有判别力）；旧桥帧不得复活投影由 bridge 层用例
+    /// `invalidate_drops_old_bridge_frames_and_rebind_uses_fresh_bridge` 覆盖。
+    #[tokio::test]
+    async fn relay_lag_invalidates_projection_and_publishes_stale_session() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump, lag) = pumped_with_lag(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+
+        let key = TargetKey {
+            session_id: "sess_lag_stale".into(),
+        };
+        // 先 GET 播种 last_session（计数 = 1），并把能力矩阵伪造成全开：lag 必须清回基线。
+        let primed = hub.session(&key).await.expect("首次 GET");
+        assert!(primed.ready);
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 1);
+        {
+            let mut inner = hub.lock();
+            let mut seeded = inner.last_session.clone().expect("GET 已播种 last_session");
+            seeded.capabilities = send_policy();
+            inner.last_session = Some(seeded);
+        }
+        let generation = hub.connection().generation;
+        let mut subscriber = hub.subscribe();
+
+        // 触发 relay 侧 Data 溢出信号。溢出发生时队列本就积压着待处理事件，这里补一帧
+        // 唤醒泵；泵会在下一轮先处理 lag 标记（本用例只断言失效结果，不断言两者顺序）。
+        lag.set();
+        events
+            .send(RelayEvent::Data(serde_json::json!({"nudge": 1})))
+            .await
+            .unwrap();
+        wait_until(|| pump.data.lock().unwrap().len() == 1).await;
+        wait_until(|| pump.invalidations.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(
+            pump.invalidations.load(Ordering::SeqCst),
+            1,
+            "lag 必须作废一次桥投影"
+        );
+
+        let downgraded = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("lag 必须发布投影降级 Session 事件");
+        assert_eq!(
+            downgraded.session_id.as_deref(),
+            Some(key.session_id.as_str())
+        );
+        assert_eq!(downgraded.generation, generation);
+        assert_eq!(
+            downgraded.data["ready"], false,
+            "Data 溢出后旧投影必须显式失效"
+        );
+        assert_eq!(
+            downgraded.data["capabilities"],
+            serde_json::to_value(CapabilityView::default()).unwrap(),
+            "失效投影的能力矩阵必须回到基线全关（不得沿用旧缓存）"
+        );
+
+        // 缓存中的 last_session 已被就地降级（不是只在事件里装样子）。
+        assert!(
+            !hub.lock()
+                .last_session
+                .as_ref()
+                .expect("降级后仍有 last_session")
+                .ready,
+            "last_session 必须写回 ready=false"
+        );
     }
 
     /// relay `KICKED` → Hub `conflict` 终态：推进代际、作废桥/投影、旧动作零执行。
