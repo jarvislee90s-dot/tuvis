@@ -271,6 +271,17 @@ pub fn encode_listen(id: u32, channel: &str, event: &str, arg: Value) -> ZResult
     Ok(out)
 }
 
+/// 测试专用：编码一条 201 应答（header `[201, id]` + body）。
+///
+/// 生产侧是客户端，**从不发送**应答；本函数只为 T8.1 回环假服务合成官方方向的
+/// 业务应答。复用同一个私有 [`encode_message`]，保证假体字节与生产解码面同源
+/// （不另写一套编码，避免夹具与生产编码漂移）。
+#[cfg(test)]
+pub(crate) fn encode_response_for_test(id: u32, body: Value) -> ZResult<Vec<u8>> {
+    let header = vec![Value::from(RESPONSE_TYPE_PROMISE_SUCCESS), Value::from(id)];
+    encode_message(&header, &body)
+}
+
 // ---------------------------------------------------------------------------
 // 反序列化
 // ---------------------------------------------------------------------------

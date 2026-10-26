@@ -17,6 +17,7 @@ mod tests {
 
     use axum::routing::post;
     use axum::{Json, Router};
+    use base64::Engine as _;
     use futures::{SinkExt, StreamExt};
     use tokio::sync::mpsc;
     use tokio_tungstenite::tungstenite::Message;
@@ -25,8 +26,14 @@ mod tests {
         AuthService, OAuthProvider, OpenAuthorize, OAUTH_TOKEN_PATH, RELAY_TOKEN_PATH,
     };
     use super::super::bridge::{
-        BridgeManager, BridgeTiming, BOOTSTRAP_REQUEST, WORKSPACE_BRIDGE_OPEN,
-        WORKSPACE_LIST_REQUEST,
+        BridgeManager, BridgeTiming, AGENT_CLIENT_HELLO_METHOD, AGENT_HELLO_METHOD,
+        AGENT_SUBSCRIBE_CONVERSATION_METHOD, BOOTSTRAP_REQUEST, CONTROLLER_SUBSCRIBE_METHOD,
+        CONTROLLER_TASKS_INDEX_TOPIC, INITIALIZE_BYTES, V4_WIRE_PROTOCOL_VERSION,
+        WORKSPACE_BRIDGE_OPEN, WORKSPACE_BRIDGE_READY, WORKSPACE_LIST_REQUEST,
+    };
+    use super::super::codec::{
+        encode_frame, encode_response_for_test, RpcIdentity, REQUEST_TYPE_EVENT_LISTEN,
+        REQUEST_TYPE_PROMISE, RESPONSE_TYPE_EVENT_FIRE,
     };
     use super::super::relay::{DeviceRoute, RelayClient, RelayEvent};
     use super::super::types::{ConnectionState, TargetKey, ZResult};
@@ -84,7 +91,8 @@ mod tests {
     /// 回环 WS 握手假体句柄：`origin` 为客户端应注入的 ws 源（`ws://127.0.0.1:<port>`），
     /// `accepted()` 为 TCP 层已接受的连接数（断言「恰好一条 socket」与「断开后零重连」），
     /// `echoes()` 为已回显的数据面帧数（断言「一帧一次、不重复」），
-    /// `log()` 为收到的 app 业务请求的 `zcode_type` 序列（断言生产端请求顺序）。
+    /// `log()` 为收到的 app 业务请求的顺序记录：`zcode_type` 业务请求记其类型，
+    /// `rpc-frame` 记解出的 channel 方法名，两者**混在同一序列**。
     struct FakeWsHandshake {
         origin: String,
         accepted: Arc<AtomicUsize>,
@@ -102,7 +110,8 @@ mod tests {
             self.echoes.load(Ordering::SeqCst)
         }
 
-        /// 已收到的 app 业务请求 `zcode_type`（按到达顺序）。
+        /// 已收到的 app 业务请求记录（按到达顺序）：`data` 信封的业务请求记
+        /// `zcode_type`，`rpc-frame` 记解出的 channel 方法名；两者混在同一序列。
         fn log(&self) -> Vec<String> {
             self.log.lock().expect("app 请求日志锁").clone()
         }
@@ -121,7 +130,10 @@ mod tests {
     ///
     /// `data` 信封内的 app 业务请求按 `zcode_type` 分派并**逐条记账**：
     /// `bootstrap-request` / `workspace-list-request` 回合成 listing（回显 `requestId`）；
-    /// `workspace-bridge-open` 只记账、**不回** `workspace-bridge-ready`（bind 停在开桥）。
+    /// `workspace-bridge-open` 先回 `workspace-bridge-ready`（只回显请求声明过的身份），
+    /// 紧接着推该桥 ChannelServer 的 `Initialize(200)`（每桥首帧 seq=1 / messageSeq=1）；
+    /// 入站 `rpc-frame` 解出 channel 方法后记账方法名，并逐条回 201
+    /// （`helloConversationV4` / `initializeConversationV4` / 两个订阅）。
     /// 其余 JSON 文本帧（数据面 `data` 探针）**原样回显一次**（不改写、不重复）；
     /// socket 保持到对端关闭。
     ///
@@ -169,6 +181,215 @@ mod tests {
         value.get("payload")
     }
 
+    /// 假体 controller 订阅 ack 的 `subscriptionId`（合成值）。
+    const CONTROLLER_SUBSCRIPTION: &str = "sub-controller-synthetic";
+    /// 假体会话订阅 ack 的 `subscriptionId`（合成值）。
+    const CONVERSATION_SUBSCRIPTION: &str = "sub-conversation-synthetic";
+    /// 假体任务索引里的单行任务（与 `TargetKey.session_id` 精确相等）。
+    const SYNTHETIC_TASK_ID: &str = "session_synthetic";
+    /// 假体 listing / 任务索引共用的 workspace 路径。
+    const SYNTHETIC_WORKSPACE_PATH: &str = "/tmp/travel";
+
+    /// 写一个 VQL（7 bit 小端变长）；仅供假体的 204 事件帧成形。
+    fn push_vql(out: &mut Vec<u8>, value: u32) {
+        let mut value = value;
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value > 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                return;
+            }
+        }
+    }
+
+    /// 合成一条事件推送（204）的 wire 字节：header `[204, id]` + JSON body（Object 标签）。
+    ///
+    /// 生产侧只发请求，204 只出现在假体方向；这里与 [`encode_response_for_test`] 同样
+    /// 按官方类型标签成形（不含任何业务改写）。
+    fn encode_event_fire(id: u32, body: &serde_json::Value) -> Vec<u8> {
+        let text = serde_json::to_vec(body).expect("事件 body 应可序列化");
+        let mut out = vec![4, 2, 6];
+        push_vql(&mut out, RESPONSE_TYPE_EVENT_FIRE);
+        out.push(6);
+        push_vql(&mut out, id);
+        out.push(5);
+        push_vql(&mut out, u32::try_from(text.len()).expect("事件 body 长度"));
+        out.extend_from_slice(&text);
+        out
+    }
+
+    /// 读一个 VQL，返回 `(值, 下一位置)`。
+    fn read_vql(bytes: &[u8], mut pos: usize) -> Option<(u32, usize)> {
+        let mut value: u64 = 0;
+        for shift in (0..35).step_by(7) {
+            let byte = *bytes.get(pos)?;
+            pos += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return u32::try_from(value).ok().map(|value| (value, pos));
+            }
+        }
+        None
+    }
+
+    /// 读一个 Int 标签元素（6 + VQL），返回 `(值, 下一位置)`。
+    fn read_tagged_int(bytes: &[u8], pos: usize) -> Option<(u32, usize)> {
+        if *bytes.get(pos)? != 6 {
+            return None;
+        }
+        read_vql(bytes, pos + 1)
+    }
+
+    /// 读一个 String 标签元素（1 + VQL 长度 + UTF-8），返回 `(文本, 下一位置)`。
+    fn read_tagged_text(bytes: &[u8], pos: usize) -> Option<(String, usize)> {
+        if *bytes.get(pos)? != 1 {
+            return None;
+        }
+        let (len, next) = read_vql(bytes, pos + 1)?;
+        let end = next.checked_add(len as usize)?;
+        let text = std::str::from_utf8(bytes.get(next..end)?).ok()?;
+        Some((text.to_owned(), end))
+    }
+
+    /// 解出 Channel 请求头 `[类型, id, channel, method]`（假体只需 Promise 100）。
+    fn request_head(bytes: &[u8]) -> Option<(u32, u32, String, String)> {
+        // header 是数组：标签 4 + 元素数。
+        if bytes.first() != Some(&4) {
+            return None;
+        }
+        let (_, pos) = read_vql(bytes, 1)?;
+        let (message_type, pos) = read_tagged_int(bytes, pos)?;
+        let (id, pos) = read_tagged_int(bytes, pos)?;
+        let (channel, pos) = read_tagged_text(bytes, pos)?;
+        let (method, _) = read_tagged_text(bytes, pos)?;
+        Some((message_type, id, channel, method))
+    }
+
+    /// 处理一条入站 `rpc-frame`：解 header 记账 channel 方法，再按方法回 201。
+    ///
+    /// - `helloConversationV4` → `{"kind":"hello","protocolVersion":V4_WIRE_PROTOCOL_VERSION,"connectionId":...}`；
+    /// - `initializeConversationV4` → `{}`；
+    /// - `subscribeControllerV4` → 订阅 ack，并补一条 controller 任务索引快照（204）；
+    /// - `subscribeConversationV4` → 订阅 ack；
+    /// - 其余 → 空 body（不猜业务语义）。
+    async fn serve_rpc_frame(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        peer: &mut FakePeer,
+        log: &Arc<Mutex<Vec<String>>>,
+        payload: &serde_json::Value,
+    ) {
+        let bridge = payload
+            .get("bridgeSessionId")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let Some(bytes) = payload
+            .get("dataBase64")
+            .and_then(|value| value.as_str())
+            .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
+        else {
+            return;
+        };
+        let Some((message_type, id, _channel, method)) = request_head(&bytes) else {
+            return;
+        };
+        match message_type {
+            REQUEST_TYPE_PROMISE => {
+                log.lock().expect("app 请求日志锁").push(method.clone());
+                let body = match method.as_str() {
+                    AGENT_HELLO_METHOD => serde_json::json!({
+                        "kind": "hello",
+                        "protocolVersion": V4_WIRE_PROTOCOL_VERSION,
+                        "connectionId": "conn-synthetic",
+                    }),
+                    AGENT_CLIENT_HELLO_METHOD => serde_json::json!({}),
+                    CONTROLLER_SUBSCRIBE_METHOD => {
+                        serde_json::json!({"ack": {"subscriptionId": CONTROLLER_SUBSCRIPTION}})
+                    }
+                    AGENT_SUBSCRIBE_CONVERSATION_METHOD => {
+                        serde_json::json!({"ack": {"subscriptionId": CONVERSATION_SUBSCRIPTION}})
+                    }
+                    _ => serde_json::json!({}),
+                };
+                let Ok(reply) = encode_response_for_test(id, body) else {
+                    return;
+                };
+                send_data(socket, peer.frame(&bridge, reply)).await;
+                if method == CONTROLLER_SUBSCRIBE_METHOD {
+                    if let Some(listen) = peer.listen.get(&bridge).copied() {
+                        let snapshot = serde_json::json!({
+                            "wireVersion": V4_WIRE_PROTOCOL_VERSION,
+                            "topic": CONTROLLER_TASKS_INDEX_TOPIC,
+                            "subscriptionId": CONTROLLER_SUBSCRIPTION,
+                            "payload": {
+                                "kind": "snapshot",
+                                "snapshot": {"tasks": [{
+                                    "address": {
+                                        "workspacePath": SYNTHETIC_WORKSPACE_PATH,
+                                        "taskId": SYNTHETIC_TASK_ID,
+                                    },
+                                }]},
+                            },
+                        });
+                        send_data(
+                            socket,
+                            peer.frame(&bridge, encode_event_fire(listen, &snapshot)),
+                        )
+                        .await;
+                    }
+                }
+            }
+            REQUEST_TYPE_EVENT_LISTEN => {
+                // 事件推送按最近的 listen id 路由（controller / conversation 各一）。
+                peer.listen.insert(bridge, id);
+            }
+            _ => {}
+        }
+    }
+
+    /// 单条回环连接的假体出站账本：每桥物理 `seq`/`messageSeq` 与最近的 EventListen id。
+    ///
+    /// 官方组建器要求 `seq`/`messageSeq` **逐桥**严格递增，且每桥首帧必须是
+    /// Initialize（seq=1 / messageSeq=1），因此计数按 `bridgeSessionId` 分开记。
+    #[derive(Default)]
+    struct FakePeer {
+        seq: HashMap<String, u64>,
+        message_seq: HashMap<String, u64>,
+        /// bridgeSessionId → 最近一次 `EventListen` 的请求 id（事件推送按它路由）。
+        listen: HashMap<String, u32>,
+    }
+
+    impl FakePeer {
+        /// 编码一条本桥的 rpc-frame（计数逐桥递增，首帧即 seq=1 / messageSeq=1）。
+        fn frame(&mut self, bridge: &str, bytes: Vec<u8>) -> serde_json::Value {
+            let seq = {
+                let counter = self.seq.entry(bridge.to_owned()).or_insert(0);
+                *counter += 1;
+                *counter
+            };
+            let message_seq = {
+                let counter = self.message_seq.entry(bridge.to_owned()).or_insert(0);
+                *counter += 1;
+                *counter
+            };
+            encode_frame(&RpcIdentity::new(bridge), seq, message_seq, &bytes)
+                .expect("假体 rpc-frame 应可编码")
+        }
+    }
+
+    /// 以 `data` 信封写一条业务回执/帧（`payload` 为业务载荷，非整帧）。
+    async fn send_data(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        payload: serde_json::Value,
+    ) {
+        let frame = serde_json::json!({"type": "data", "payload": payload, "client_ts": 0});
+        let _ = socket.send(Message::text(frame.to_string())).await;
+    }
+
     /// 合成 listing 回执：回显 `requestId`，单 workspace（`/tmp/travel`，无 identity）。
     fn app_listing_reply(payload: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({
@@ -176,10 +397,23 @@ mod tests {
             "result": {
                 "activeWorkspaceKey": "ws-synthetic",
                 "workspaces": [{
-                    "workspacePath": "/tmp/travel",
+                    "workspacePath": SYNTHETIC_WORKSPACE_PATH,
                     "workspaceIdentity": null,
                 }],
             },
+        })
+    }
+
+    /// 合成 `workspace-bridge-ready`：回显 requestId / bridgeSessionId / workspaceKey。
+    ///
+    /// 请求未声明 `bridgeGeneration`/`recoveryId`，ready 也**不得**带这两个字段
+    /// （生产对多余身份字段 fail-closed）。
+    fn app_bridge_ready(payload: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "zcode_type": WORKSPACE_BRIDGE_READY,
+            "requestId": payload.get("requestId").cloned().unwrap_or_default(),
+            "bridgeSessionId": payload.get("bridgeSessionId").cloned().unwrap_or_default(),
+            "workspaceKey": payload.get("workspaceKey").cloned().unwrap_or_default(),
         })
     }
 
@@ -193,6 +427,7 @@ mod tests {
             return;
         };
         let mut device_sid: Option<String> = None;
+        let mut peer = FakePeer::default();
         while let Some(frame) = socket.next().await {
             let Ok(frame) = frame else {
                 break;
@@ -213,14 +448,17 @@ mod tests {
             let Some(value) = value else {
                 continue;
             };
-            // 握手完成后的 app 业务请求：先记账 `zcode_type`，再按类型应答。
-            // bootstrap/workspace-list 回合成 listing；workspace-bridge-open 只记账
-            // （无 ready → 生产 bind 停在开桥，不会虚构后续身份）。
+            // 握手完成后的 app 业务请求：`rpc-frame` 解方法名并逐条回 201；
+            // bootstrap/workspace-list 回合成 listing；workspace-bridge-open 回 ready
+            // 并紧接着推该桥的 Initialize(200)（官方在 200 之前不发任何请求）。
             if device_sid.is_some() {
                 if let Some(payload) = app_payload(&value) {
-                    if let Some(zcode_type) =
-                        payload.get("zcode_type").and_then(|kind| kind.as_str())
-                    {
+                    let zcode_type = payload.get("zcode_type").and_then(|kind| kind.as_str());
+                    if zcode_type == Some("rpc-frame") {
+                        serve_rpc_frame(&mut socket, &mut peer, &log, payload).await;
+                        continue;
+                    }
+                    if let Some(zcode_type) = zcode_type {
                         log.lock()
                             .expect("app 请求日志锁")
                             .push(zcode_type.to_owned());
@@ -228,11 +466,19 @@ mod tests {
                             BOOTSTRAP_REQUEST | WORKSPACE_LIST_REQUEST => {
                                 Some(app_listing_reply(payload))
                             }
+                            WORKSPACE_BRIDGE_OPEN => Some(app_bridge_ready(payload)),
                             _ => None,
                         };
                         if let Some(reply) = reply {
-                            let frame = serde_json::json!({"type": "data", "payload": reply});
-                            let _ = socket.send(Message::text(frame.to_string())).await;
+                            send_data(&mut socket, reply).await;
+                            if zcode_type == WORKSPACE_BRIDGE_OPEN {
+                                let bridge = payload
+                                    .get("bridgeSessionId")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or_default();
+                                let initialize = peer.frame(bridge, INITIALIZE_BYTES.to_vec());
+                                send_data(&mut socket, initialize).await;
+                            }
                         }
                         continue;
                     }
@@ -456,17 +702,16 @@ mod tests {
         assert_eq!(ws.echoes(), 1, "一条 data 帧只允许一次回显");
     }
 
-    /// 真实回环 relay 上的桥 bootstrap 全链：真实 [`AuthService`]（回环 HTTP 取 token）+
-    /// 真实 [`RelayClient`]（回环 WS 配对）+ 真实 [`BridgeManager`]（默认生产时序）。
+    /// 回环配对 + 桥装配：真实 [`AuthService`]（回环 HTTP 取 token）+ 真实
+    /// [`RelayClient`]（回环 WS 配对）+ 真实 [`BridgeManager`]（默认生产时序）。
     ///
-    /// 回环假体按 `zcode_type` 应答：`bootstrap-request` / `workspace-list-request` 回
-    /// 合成 listing（`/tmp/travel`），`workspace-bridge-open` 只记账、不回 ready。
-    /// 因此 `bind` 必然停在开桥（2s 超时收口）；而出站日志里
-    /// `bootstrap-request → workspace-list-request → workspace-bridge-open` 的**顺序**
-    /// 证明：生产桥真的解析了假体回的合成 workspace，并接着在**同一条真实 relay 连接**上
-    /// 发下一条请求（不是假体自导自演）。
-    #[tokio::test]
-    async fn bridge_bootstrap_runs_over_real_loopback_relay() {
+    /// 事件通道兼作生产事件泵的输入：`Data` 逐条转给桥（状态事件忽略）。
+    /// 返回的假体句柄必须由调用方持有（Drop 即中止回环 WS 服务）。
+    async fn paired_bridge_over_loopback() -> (
+        FakeWsHandshake,
+        Arc<BridgeManager>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let fake = FakeOfficialHttp::start().await;
         let http = reqwest::Client::builder()
             .no_proxy()
@@ -479,7 +724,6 @@ mod tests {
             .expect("回环 WS 端口应可绑定");
         let ws = spawn_ws_handshake(listener);
 
-        // 事件通道兼作生产事件泵的输入：状态事件占少量槽位，Data 逐条转给桥。
         let (events_tx, mut events_rx) = mpsc::channel(32);
         let relay = Arc::new(RelayClient::with_endpoint(
             auth,
@@ -499,10 +743,7 @@ mod tests {
         .expect("真实回环 relay 应配对成功");
         assert_eq!(paired.state, ConnectionState::Paired, "桥要求已配对");
 
-        let bridge = Arc::new(BridgeManager::with_timing(
-            relay.clone(),
-            BridgeTiming::default(),
-        ));
+        let bridge = Arc::new(BridgeManager::with_timing(relay, BridgeTiming::default()));
         let pump = {
             let bridge = bridge.clone();
             tokio::spawn(async move {
@@ -513,23 +754,34 @@ mod tests {
                 }
             })
         };
+        (ws, bridge, pump)
+    }
 
-        // 假体不回 `workspace-bridge-ready`：bind 停在开桥，由 2s 超时收口。
-        let bound = tokio::time::timeout(
-            Duration::from_secs(2),
-            bridge.bind(&TargetKey {
-                session_id: "session_synthetic".into(),
-            }),
-        )
-        .await;
+    /// 真实回环 relay 上的桥 bootstrap 全链。
+    ///
+    /// 假体按 `zcode_type` 应答：`bootstrap-request` / `workspace-list-request` 回
+    /// 合成 listing（`/tmp/travel`），`workspace-bridge-open` 回 ready 并推 Initialize。
+    /// 出站日志前三条 `bootstrap-request → workspace-list-request → workspace-bridge-open`
+    /// 的**顺序**证明：生产桥真的解析了假体回的合成 workspace，并接着在**同一条真实
+    /// relay 连接**上发下一条请求（不是假体自导自演）。
+    #[tokio::test]
+    async fn bridge_bootstrap_runs_over_real_loopback_relay() {
+        let (ws, bridge, pump) = paired_bridge_over_loopback().await;
+
+        let bound =
+            tokio::time::timeout(Duration::from_secs(5), bridge.bind(&synthetic_target())).await;
         assert!(
-            bound.is_err(),
-            "无 ready 应答时 bind 必须停在 bridge-open（不得自造回执继续）"
+            matches!(bound, Ok(Ok(_))),
+            "ready/Initialize 齐备后 bind 应在窗口内完成"
         );
         pump.abort();
 
+        let log = ws.log();
         assert_eq!(
-            ws.log(),
+            log.iter()
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<&str>>(),
             vec![
                 BOOTSTRAP_REQUEST,
                 WORKSPACE_LIST_REQUEST,
@@ -538,5 +790,72 @@ mod tests {
             "生产桥必须按 bootstrap → listing → 开桥 的顺序发出请求"
         );
         assert_eq!(ws.accepted(), 1, "整条 bootstrap 只需一条 relay 连接");
+    }
+
+    /// 真实回环 relay 上的 ready → Initialize → hello happy path（T8.1）。
+    ///
+    /// 假体在 `workspace-bridge-open` 后回 `workspace-bridge-ready`（只回显请求声明过的
+    /// 身份），并紧接着推该桥的 `Initialize(200)`（每桥首帧 seq=1 / messageSeq=1）；
+    /// 之后对生产发出的每条 rpc-frame 解码 channel 方法并回 201。本测试断言的是**正向
+    /// 路径**：ready 回显被生产接受；收到 `Initialize(200)` 后，生产在**同一条真实
+    /// relay 连接**上发出 `helloConversationV4` / `initializeConversationV4`，并订阅
+    /// controller 与 conversation 两条 topic。
+    ///
+    /// **本测试不证明**「等 200」这道门真的起作用：去掉该门后生产是否会提前发帧、
+    /// 或行为是否失败，属于负向门测试，留 Task 12；此处只覆盖门存在时的 happy path。
+    #[tokio::test]
+    async fn bridge_ready_initialize_hello_over_loopback_relay() {
+        let (ws, bridge, pump) = paired_bridge_over_loopback().await;
+
+        let bound =
+            tokio::time::timeout(Duration::from_secs(5), bridge.bind(&synthetic_target())).await;
+        match bound {
+            Ok(Ok(target)) => assert_eq!(target.session_id, SYNTHETIC_TASK_ID),
+            Ok(Err(error)) => panic!("bind 应完成，实际 {}", error.code),
+            Err(_) => panic!("bind 未在 5s 内完成"),
+        }
+        pump.abort();
+
+        let log = ws.log();
+        assert!(
+            log.iter()
+                .any(|method| method.as_str() == AGENT_HELLO_METHOD),
+            "helloConversationV4 必须经真实 relay 走通：{log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|method| method.as_str() == AGENT_CLIENT_HELLO_METHOD),
+            "initializeConversationV4 必须经真实 relay 走通：{log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|method| method.as_str() == CONTROLLER_SUBSCRIBE_METHOD),
+            "subscribeControllerV4 必须经真实 relay 发出：{log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|method| method.as_str() == AGENT_SUBSCRIBE_CONVERSATION_METHOD),
+            "subscribeConversationV4 必须经真实 relay 发出：{log:?}"
+        );
+        // 枚举桥 + 会话桥各开一次（两次 ready/Initialize 都被生产接受）。
+        assert_eq!(
+            log.iter()
+                .filter(|zcode_type| zcode_type.as_str() == WORKSPACE_BRIDGE_OPEN)
+                .count(),
+            2,
+            "枚举桥与会话桥各需一次 workspace-bridge-open：{log:?}"
+        );
+        assert_eq!(
+            ws.accepted(),
+            1,
+            "整条 ready/Initialize/hello 只需一条 relay 连接"
+        );
+    }
+
+    /// 假体任务索引里的唯一目标（与 `SYNTHETIC_TASK_ID` 精确相等）。
+    fn synthetic_target() -> TargetKey {
+        TargetKey {
+            session_id: SYNTHETIC_TASK_ID.into(),
+        }
     }
 }
