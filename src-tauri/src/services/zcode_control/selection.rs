@@ -13,7 +13,7 @@
 
 use serde_json::{json, Value};
 
-use super::types::{codes, SessionView, ZResult, ZcodeError};
+use super::types::{codes, ModelChoice, SelectionView, SessionView, ZResult, ZcodeError};
 
 /// 官方模型配置切换命令类型（`command.ts:254`）。
 pub const SWITCH_MODEL_CONFIG_TYPE: &str = "switchModelConfig";
@@ -56,6 +56,205 @@ pub fn build_selection_command(view: &SessionView, model: &str, thought: &str) -
         },
         "baseRevision": revision,
     }))
+}
+
+/// 解析官方 `model-selection.getView` 目录（T6 Slice A2；纯函数：零 IO、零帧）。
+///
+/// `raw` 是调用方组装的会话选择载荷（Tuvis 内部形状，绝不原样下发手机）：
+///
+/// ```json
+/// {
+///   "config": {"provider": "...", "model": "...", "thought": "..."?, "thoughtLevels": ["..."]},
+///   "providers": [{"providerId": "...", "models": [{"modelId": "...", "config": {
+///     "optionSpecs": {"reasoningLevel": {"values": ["..."]}}}}]}]
+/// }
+/// ```
+///
+/// 规则：
+/// - 只保留**当前会话 provider**（`config.provider`）的目录；其他账号 provider 一律丢弃；
+/// - 档位逐模型取自 `config.optionSpecs.reasoningLevel.values`，**绝不**做 provider 级并集；
+/// - `config.thoughtLevels` 只作**当前模型**的回退（目录未给该模型档位时），不喂其他模型；
+/// - `providers` 缺失/为空/无当前 provider → 退化为「当前模型 + 快照档位」；
+/// - 模型 id 与档位都去重（保留首次出现，不合并重复项的档位），字符串有长度与数量上界；
+/// - 形状不符 → `needs_evidence`（目录不可信）／`unsupported_protocol`（wire 形状不符），
+///   绝不 panic、不猜。
+///
+/// `_session_id` / `_generation` / `_revision` 是调用方上下文：`SelectionView` 不携带它们
+/// （命令构造另取 `SessionView` 的 revision 作 CAS 基线），本函数保持纯解析。
+pub fn parse_selection_view(
+    _session_id: &str,
+    _generation: u64,
+    _revision: Option<u64>,
+    raw: &Value,
+) -> ZResult<SelectionView> {
+    if !raw.is_object() {
+        return Err(unsupported());
+    }
+    let config = parse_session_config(raw)?;
+    let models = catalog_models(raw, &config)?;
+    Ok(SelectionView {
+        provider: config.provider.to_owned(),
+        model: config.model.to_owned(),
+        thought: config.thought.map(str::to_owned),
+        models,
+    })
+}
+
+/// 目录最多扫描的 provider / 模型 / 档位数量与 id 长度上界（有界，防巨帧撑爆内存）。
+const MAX_PROVIDERS: usize = 16;
+const MAX_MODELS: usize = 64;
+const MAX_LEVELS: usize = 16;
+const MAX_ID_CHARS: usize = 128;
+const MAX_LEVEL_CHARS: usize = 64;
+
+fn needs_evidence() -> ZcodeError {
+    ZcodeError::of(codes::NEEDS_EVIDENCE)
+}
+
+fn unsupported() -> ZcodeError {
+    ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)
+}
+
+/// 会话快照 `config` 的只读解析结果（权威当前值；provider/model 必填）。
+struct SessionConfig<'a> {
+    provider: &'a str,
+    model: &'a str,
+    thought: Option<&'a str>,
+    thought_levels: Vec<String>,
+}
+
+fn parse_session_config(raw: &Value) -> ZResult<SessionConfig<'_>> {
+    let config = raw
+        .get("config")
+        .and_then(Value::as_object)
+        .ok_or_else(needs_evidence)?;
+    let provider = non_empty_id(config.get("provider")).ok_or_else(needs_evidence)?;
+    let model = non_empty_id(config.get("model")).ok_or_else(needs_evidence)?;
+    // 官方空串 = 无显式档位；非字符串同样按「无」处理（默认命令路径仍要求显式值）。
+    let thought = config
+        .get("thought")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty());
+    Ok(SessionConfig {
+        provider,
+        model,
+        thought,
+        thought_levels: level_ids(config.get("thoughtLevels")),
+    })
+}
+
+/// 非空且不超长的 id 字符串（只认 wire id，不认显示名）。
+fn non_empty_id(value: Option<&Value>) -> Option<&str> {
+    let text = value?.as_str()?;
+    if text.is_empty() || text.chars().count() > MAX_ID_CHARS {
+        return None;
+    }
+    Some(text)
+}
+
+/// 档位 id 列表：只收非空短字符串，去重（保留首次出现），有界。
+fn level_ids(value: Option<&Value>) -> Vec<String> {
+    let mut levels: Vec<String> = Vec::new();
+    let Some(items) = value.and_then(Value::as_array) else {
+        return levels;
+    };
+    for item in items {
+        let Some(level) = item
+            .as_str()
+            .filter(|text| !text.is_empty() && text.chars().count() <= MAX_LEVEL_CHARS)
+        else {
+            continue;
+        };
+        if !levels.iter().any(|seen| seen == level) {
+            levels.push(level.to_owned());
+        }
+        if levels.len() >= MAX_LEVELS {
+            break;
+        }
+    }
+    levels
+}
+
+/// 定位 getView 的 `providers`：官方 channel 应答可能带 `data`/`result` 包装
+/// （与探针 `resolveCatalogFromView` 同规则，最多解 3 层）。
+fn providers_value(raw: &Value) -> Option<&Value> {
+    let mut current = raw;
+    for _ in 0..3 {
+        if let Some(providers) = current.get("providers") {
+            return Some(providers);
+        }
+        let next = current
+            .get("data")
+            .filter(|value| value.is_object())
+            .or_else(|| current.get("result").filter(|value| value.is_object()))?;
+        current = next;
+    }
+    current.get("providers")
+}
+
+/// 目录不可用（缺失/空/无当前 provider）时的退化目录：只含当前模型 + 快照档位。
+fn fallback_models(config: &SessionConfig<'_>) -> Vec<ModelChoice> {
+    vec![ModelChoice {
+        model_id: config.model.to_owned(),
+        thought_levels: config.thought_levels.clone(),
+    }]
+}
+
+fn catalog_models(raw: &Value, config: &SessionConfig<'_>) -> ZResult<Vec<ModelChoice>> {
+    let Some(providers) = providers_value(raw) else {
+        return Ok(fallback_models(config));
+    };
+    let providers = providers.as_array().ok_or_else(unsupported)?;
+    if providers.is_empty() {
+        return Ok(fallback_models(config));
+    }
+    let mut current_models: Option<&[Value]> = None;
+    for provider in providers.iter().take(MAX_PROVIDERS) {
+        let record = provider.as_object().ok_or_else(needs_evidence)?;
+        // 官方 ModelSelectionView：providers[].providerId / models[].modelId。
+        let provider_id = non_empty_id(record.get("providerId")).ok_or_else(needs_evidence)?;
+        let models = record
+            .get("models")
+            .and_then(Value::as_array)
+            .ok_or_else(needs_evidence)?;
+        if provider_id == config.provider {
+            current_models = Some(models);
+        }
+    }
+    let Some(models) = current_models else {
+        // 目录里没有当前会话 provider（可能只暴露了其他账号）：退化，绝不借用别家目录。
+        return Ok(fallback_models(config));
+    };
+    if models.is_empty() {
+        return Ok(fallback_models(config));
+    }
+    let mut choices: Vec<ModelChoice> = Vec::new();
+    for model in models.iter().take(MAX_MODELS) {
+        let record = model.as_object().ok_or_else(needs_evidence)?;
+        let model_id = non_empty_id(record.get("modelId")).ok_or_else(needs_evidence)?;
+        let declared = level_ids(
+            record
+                .get("config")
+                .and_then(|config| config.get("optionSpecs"))
+                .and_then(|specs| specs.get("reasoningLevel"))
+                .and_then(|level| level.get("values")),
+        );
+        // 快照档位只回退给**当前模型**；其他模型保持空列表（命令构造会拒绝其任何档位）。
+        let thought_levels = if declared.is_empty() && model_id == config.model {
+            config.thought_levels.clone()
+        } else {
+            declared
+        };
+        // 重复 id 保留首次出现，且不合并重复项的档位（合并即 provider 级并集）。
+        if choices.iter().any(|choice| choice.model_id == model_id) {
+            continue;
+        }
+        choices.push(ModelChoice {
+            model_id: model_id.to_owned(),
+            thought_levels,
+        });
+    }
+    Ok(choices)
 }
 
 #[cfg(test)]
@@ -237,5 +436,190 @@ mod tests {
             )),
             codes::NOT_READY
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // T6 Slice A2：官方 model-selection.getView 目录解析
+    // -----------------------------------------------------------------------
+
+    const CURRENT_PROVIDER: &str = "acct-current";
+
+    fn model_entry(model_id: &str, levels: Option<&[&str]>) -> Value {
+        let mut entry = json!({ "modelId": model_id });
+        if let Some(levels) = levels {
+            entry["config"] = json!({ "optionSpecs": { "reasoningLevel": { "values": levels } } });
+        }
+        entry
+    }
+
+    fn session_config(model: &str, thought: Option<&str>, levels: &[&str]) -> Value {
+        json!({
+            "provider": CURRENT_PROVIDER,
+            "model": model,
+            "thought": thought,
+            "thoughtLevels": levels,
+        })
+    }
+
+    fn raw_view(config: Value, providers: Option<Value>) -> Value {
+        let mut raw = json!({ "config": config });
+        if let Some(providers) = providers {
+            raw["providers"] = providers;
+        }
+        raw
+    }
+
+    fn parse(raw: &Value) -> ZResult<SelectionView> {
+        parse_selection_view("sess_test", 2, Some(5), raw)
+    }
+
+    fn levels_of(view: &SelectionView, model_id: &str) -> Vec<String> {
+        view.models
+            .iter()
+            .find(|choice| choice.model_id == model_id)
+            .map(|choice| choice.thought_levels.clone())
+            .unwrap_or_default()
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn parse_selection_view_keeps_only_current_provider() {
+        let raw = raw_view(
+            session_config("model-a", Some("low"), &["low"]),
+            Some(json!([
+                {
+                    "providerId": "acct-other-account",
+                    "models": [model_entry("other-1", Some(&["x"]))],
+                },
+                {
+                    "providerId": CURRENT_PROVIDER,
+                    "models": [
+                        model_entry("model-a", Some(&["low", "high"])),
+                        model_entry("model-b", Some(&["low"])),
+                    ],
+                },
+            ])),
+        );
+
+        let view = parse(&raw).expect("catalog");
+        assert_eq!(view.provider, CURRENT_PROVIDER);
+        assert_eq!(view.model, "model-a");
+        assert_eq!(view.thought.as_deref(), Some("low"));
+        let ids: Vec<&str> = view
+            .models
+            .iter()
+            .map(|choice| choice.model_id.as_str())
+            .collect();
+        assert_eq!(ids, ["model-a", "model-b"]);
+        assert!(!ids.contains(&"other-1"));
+    }
+
+    #[test]
+    fn per_model_levels_are_not_unioned() {
+        let raw = raw_view(
+            session_config("model-a", Some("low"), &["low"]),
+            Some(json!([{
+                "providerId": CURRENT_PROVIDER,
+                "models": [
+                    model_entry("model-a", Some(&["low"])),
+                    model_entry("model-b", Some(&["low", "max"])),
+                ],
+            }])),
+        );
+
+        let view = parse(&raw).expect("catalog");
+        assert_eq!(levels_of(&view, "model-a"), strings(&["low"]));
+        assert_eq!(levels_of(&view, "model-b"), strings(&["low", "max"]));
+    }
+
+    #[test]
+    fn fallback_thought_levels_apply_only_to_current_model() {
+        let raw = raw_view(
+            session_config("model-a", Some("low"), &["low", "high"]),
+            Some(json!([{
+                "providerId": CURRENT_PROVIDER,
+                "models": [
+                    // 目录未宣告当前模型档位：可用快照档位回退。
+                    model_entry("model-a", None),
+                    // 另一个模型不得借用当前模型的快照档位。
+                    model_entry("model-b", None),
+                ],
+            }])),
+        );
+
+        let view = parse(&raw).expect("catalog");
+        assert_eq!(levels_of(&view, "model-a"), strings(&["low", "high"]));
+        assert!(levels_of(&view, "model-b").is_empty());
+    }
+
+    #[test]
+    fn malformed_catalog_is_needs_evidence() {
+        // provider 条目缺 providerId。
+        let without_provider_id = raw_view(
+            session_config("model-a", None, &[]),
+            Some(json!([{ "models": [model_entry("model-a", None)] }])),
+        );
+        assert!(parse(&without_provider_id)
+            .expect_err("no providerId")
+            .is(codes::NEEDS_EVIDENCE));
+        // 模型条目缺 modelId。
+        let without_model_id = raw_view(
+            session_config("model-a", None, &[]),
+            Some(json!([{
+                "providerId": CURRENT_PROVIDER,
+                "models": [{ "config": { "optionSpecs": {} } }],
+            }])),
+        );
+        assert!(parse(&without_model_id)
+            .expect_err("no modelId")
+            .is(codes::NEEDS_EVIDENCE));
+        // wire 形状不符（providers 不是数组）→ unsupported_protocol。
+        let not_an_array = raw_view(
+            session_config("model-a", None, &[]),
+            Some(json!("not-an-array")),
+        );
+        assert!(parse(&not_an_array)
+            .expect_err("providers shape")
+            .is(codes::UNSUPPORTED_PROTOCOL));
+    }
+
+    #[test]
+    fn duplicate_model_ids_are_deduped() {
+        let raw = raw_view(
+            session_config("model-a", Some("low"), &["low"]),
+            Some(json!([{
+                "providerId": CURRENT_PROVIDER,
+                "models": [
+                    // 同一 id 的重复档位先去重；重复模型 id 只保留首次出现。
+                    model_entry("model-a", Some(&["low", "low", "high"])),
+                    model_entry("model-a", Some(&["max"])),
+                ],
+            }])),
+        );
+
+        let view = parse(&raw).expect("catalog");
+        assert_eq!(view.models.len(), 1);
+        assert_eq!(levels_of(&view, "model-a"), strings(&["low", "high"]));
+    }
+
+    #[test]
+    fn current_thought_may_be_absent() {
+        // thought 缺失 → None，不构造空串。
+        let absent = raw_view(
+            json!({
+                "provider": CURRENT_PROVIDER,
+                "model": "model-a",
+                "thoughtLevels": ["low"],
+            }),
+            None,
+        );
+        let view = parse(&absent).expect("catalog");
+        assert_eq!(view.thought, None);
+        // thought 为空串 → None（官方空串 = 无显式档位）。
+        let empty = raw_view(session_config("model-a", Some(""), &["low"]), None);
+        assert_eq!(parse(&empty).expect("catalog").thought, None);
     }
 }
