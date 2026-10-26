@@ -20,6 +20,8 @@ pub mod server;
 pub mod tailscale;
 pub mod tunnel;
 pub mod watcher;
+// ZCode 官方控制手机 API（T7.1 B2a）：连接/会话只读投影，注册在既有配对 gate nest 内
+pub mod zcode;
 
 pub const KEY_ENABLED: &str = "remote.enabled";
 /// **M5 A5 起废弃**：bind 由 chan_lan 派生（bind_from_channels），生产路径不再读取；
