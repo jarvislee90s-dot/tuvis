@@ -225,7 +225,10 @@ impl ZcodeHub {
     }
 
     /// 测试专用：注入 fake 后端与能力矩阵（不注册任何设置/IPC 入口）。
-    #[cfg(test)]
+    ///
+    /// 不设 `cfg(test)` 门：本仓库集成测试（`tests/`）以独立 crate 编译库，看不到
+    /// 单元测试配置；生产装配只经 [`Self::new`]，本入口不向设置/IPC 暴露。
+    #[doc(hidden)]
     pub fn with_parts(
         store: DeviceStore,
         backend: Arc<dyn HubBackend>,

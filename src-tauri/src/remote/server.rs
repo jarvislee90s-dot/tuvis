@@ -632,6 +632,11 @@ fn api_router(state: Arc<RemoteState>) -> Router<Arc<RemoteState>> {
         // 读取即复验）。PIN 门禁内层 gate 结构性覆盖；移动端无写接口——
         // 保存只走桌面端 Tauri 命令（设计 §4.2「首版桌面编辑」）
         .route("/official-control", get(api::official_control))
+        // ZCode 官方控制只读投影（T7.1 B2a）：连接视图 + 单会话投影。GET 不触发
+        // OAuth/连接；会话绑定只认服务端快照 + 手机提交的原始 sessionId。PIN 门禁
+        // 内层 gate 结构性覆盖——未配对在 handler 之前 403。
+        .route("/zcode/connection", get(super::zcode::connection))
+        .route("/zcode/session", get(super::zcode::session))
         // /channel（§C5，Task 10）：通道能力**装饰**端点（走哪条通道/带宽受限 +
         // 实测速率）。读 Host 推断、可被伪造、允许不准、**永不得进安全判定**
         // （不变量 §G1 推论③，见 api::channel_info 注释）；gate 由本子路由的
