@@ -29,6 +29,13 @@ import {
   setZcodeRemoteConfig,
   type ZcodeRemoteConfig,
 } from "@/lib/api/zcodeRemote";
+// 连接 DTO 唯一定义处（`src/lib/api/zcodeControl.ts`，与 Rust golden JSON 对拍）：
+// 设置卡只 import，不再本地复制枚举/字段，避免契约漂移。
+import {
+  isConnectionState,
+  type ConnectionState,
+  type ConnectionView,
+} from "@/lib/api/zcodeControl";
 
 // DOM id 单点（label 关联／aria-controls／错误关联都引它，改一处即可）
 const PANEL_ID = "zcode-remote-card-panel";
@@ -45,37 +52,16 @@ const PROVIDER_ZAI = "zai";
 const ZAI_LIVE_VERIFIED = false;
 type ProviderId = typeof PROVIDER_BIGMODEL | typeof PROVIDER_ZAI;
 
-// relay 连接态（与 Rust `ConnectionState` 逐字对应；`connecting` 是配对前态）。
-const CONNECTION_STATES = [
-  "needs_config",
-  "needs_auth",
-  "connecting",
-  "paired",
-  "offline",
-  "conflict",
-  "unknown",
-] as const;
-type ZcodeConnectionState = (typeof CONNECTION_STATES)[number];
-
-// `ConnectionView` 的**白名单**消费形态：只抄四字段，后端多给的 URL/token 一律丢弃，
-// 因此任何凭据都不会因为 IPC 回执而被渲染或缓存。`deviceLabel` 仅供显示，不做绑定。
-type ZcodeConnection = {
-  state: ZcodeConnectionState;
-  generation: number;
-  reasonCode: string | null;
-  deviceLabel: string | null;
-};
-
+// `ConnectionView` 的**白名单**消费形态：只取公共 DTO 的四个字段，后端多给的
+// URL/token 一律丢弃，因此任何凭据都不会因为 IPC 回执而被渲染或缓存。
+// `deviceLabel` 仅供显示，不做绑定。枚举/字段类型来自 `@/lib/api/zcodeControl`。
 /** 严格解析连接视图：形态不符 → null（= 未知），绝不猜成 needs_auth/paired。 */
-function parseConnection(raw: unknown): ZcodeConnection | null {
+function parseConnection(raw: unknown): ConnectionView | null {
   if (!raw || typeof raw !== "object") return null;
   const view = raw as Record<string, unknown>;
-  const state = view.state;
-  if (typeof state !== "string" || !(CONNECTION_STATES as readonly string[]).includes(state)) {
-    return null;
-  }
+  if (!isConnectionState(view.state)) return null;
   return {
-    state: state as ZcodeConnectionState,
+    state: view.state,
     generation: typeof view.generation === "number" ? view.generation : 0,
     reasonCode: typeof view.reasonCode === "string" ? view.reasonCode : null,
     deviceLabel: typeof view.deviceLabel === "string" ? view.deviceLabel : null,
@@ -83,7 +69,7 @@ function parseConnection(raw: unknown): ZcodeConnection | null {
 }
 
 // 连接态 → 本地化键（每态一句，绝不靠「是否有链接」推导配对）
-const CONNECTION_LABEL_KEYS: Record<ZcodeConnectionState, string> = {
+const CONNECTION_LABEL_KEYS: Record<ConnectionState, string> = {
   needs_config: "settings.remote.zcode.connNeedsConfig",
   needs_auth: "settings.remote.zcode.connNeedsAuth",
   connecting: "settings.remote.zcode.connConnecting",
@@ -120,7 +106,7 @@ export function ZcodeRemoteSettingsCard() {
   // 授权通道：默认 BigModel（唯一有 live 证据的通道）；ZAI 未 live 不开闸。
   const [provider, setProvider] = useState<ProviderId>(PROVIDER_BIGMODEL);
   // 真实连接态（null = 首拍未到/读取失败 = **未知**，不是 needs_auth 也不是 paired）
-  const [connection, setConnection] = useState<ZcodeConnection | null>(null);
+  const [connection, setConnection] = useState<ConnectionView | null>(null);
   // 授权/连接/断开进行中（同一时刻只允许一个控制动作）
   const [controlBusy, setControlBusy] = useState<"authorize" | "connect" | "disconnect" | null>(
     null
@@ -144,7 +130,7 @@ export function ZcodeRemoteSettingsCard() {
   }, [refreshConnection]);
 
   const providerVerified = provider === PROVIDER_BIGMODEL || ZAI_LIVE_VERIFIED;
-  const connectionState: ZcodeConnectionState = connection?.state ?? "unknown";
+  const connectionState: ConnectionState = connection?.state ?? "unknown";
   const busy = saving || controlBusy !== null;
 
   // 授权 / 连接 / 断开：只走 IPC，参数里没有 URL/token（凭据只在本机 Rust 内存里）；

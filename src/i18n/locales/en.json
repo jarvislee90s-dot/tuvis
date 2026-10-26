@@ -2240,12 +2240,21 @@
       "reasonOffline": "The connection to your computer is offline — check your network and retry",
       "reasonConflict": "The connection on your computer is in conflict — resolve it there first",
       "reasonUnknown": "Control is unavailable right now — try again later",
+      "reasonNotReady": "Control is not ready yet — try again shortly",
       "statusAccepted": "Accepted",
       "statusConfirmed": "Applied",
       "statusNoop": "No change needed",
       "statusRejected": "Rejected",
       "statusSendFailed": "Send failed",
-      "statusUnknown": "Result unknown — verify on your computer"
+      "statusUnknown": "Result unknown — verify on your computer",
+      "submit": "Submit",
+      "interrupt": "Interrupt",
+      "modelAria": "Model",
+      "thoughtAria": "Thinking level",
+      "pendingBlocked": "This answer form is not available yet — handle it in the terminal",
+      "selectionBlocked": "Model/thinking-level switching is not available yet — adjust it in the terminal",
+      "actionBlocked": "Control is not ready (connection not paired or session not ready) — finish connecting on your computer and retry",
+      "interruptBlocked": "Interrupt is unavailable right now — handle it in the terminal"
     },
     "question": {
       "cancelInterrupt": "Interrupt turn (destructive)",

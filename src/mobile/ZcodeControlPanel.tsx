@@ -10,15 +10,19 @@
 //   `data-reason-code` 才是冻结错误码本身。
 import { useEffect, useRef, useState } from "react";
 import i18n from "@/i18n";
-import type {
-  ActionReceipt,
-  CapabilityFlag,
-  CapabilityView,
-  ControlAction,
-  PendingView,
-  QuestionView,
+import {
+  isZcodeErrorCode,
+  type ActionReceipt,
+  type CapabilityFlag,
+  type CapabilityView,
+  type ConnectionView,
+  type ControlAction,
+  type PendingView,
+  type QuestionView,
+  type SessionView,
 } from "@/lib/api/zcodeControl";
 import useZcodeControl from "./useZcodeControl";
+import { fetchZcodeControl } from "./api";
 
 interface ZcodeControlPanelProps {
   /** 会话原 ID（服务端按它绑定 ZCode 会话；手机不自报 workspace） */
@@ -31,6 +35,7 @@ const REASON_KEYS: Record<string, string> = {
   needs_auth: "mobile.zcodeControl.reasonNeedsAuth",
   offline: "mobile.zcodeControl.reasonOffline",
   conflict: "mobile.zcodeControl.reasonConflict",
+  not_ready: "mobile.zcodeControl.reasonNotReady",
   unknown: "mobile.zcodeControl.reasonUnknown",
 };
 
@@ -44,24 +49,62 @@ const STATUS_KEYS: Record<string, string> = {
   unknown: "mobile.zcodeControl.statusUnknown",
 };
 
-/** 能力关闭时的可见原因（短中文；冻结码只进 data-reason-code，不展示码原文）。 */
-const PENDING_BLOCKED_TEXT = "该作答形态暂未开放，请在终端处理";
-/** 模型/档位任一能力关闭时的可见原因（两闸同开才放行，见 Rust command 授权）。 */
-const SELECTION_BLOCKED_TEXT = "模型/档位切换暂未开放，请在终端调整";
+/**
+ * 写面硬门：`connection.state === "paired"` **且** `session.ready === true` 才放行。
+ * 返回 null = 可写；否则返回冻结原因码（陈旧投影/未配对连接一律零写）。
+ * `connecting` 等配对前态不在冻结码表内 → 统一按 `not_ready` 呈现。
+ */
+function actionGateReason(
+  connection: ConnectionView | null,
+  session: SessionView | null
+): string | null {
+  if (connection === null) return "unknown";
+  if (connection.state !== "paired") {
+    if (isZcodeErrorCode(connection.reasonCode)) return connection.reasonCode;
+    if (isZcodeErrorCode(connection.state)) return connection.state;
+    return "not_ready";
+  }
+  if (session === null || !session.ready) return "not_ready";
+  return null;
+}
 
 interface PendingCardProps {
   pending: PendingView;
   sessionId: string;
   generation: number;
   capabilities: CapabilityView;
+  /** 写面硬门原因（paired + ready）；null = 门开。陈旧投影绝不可点。 */
+  gateReason: string | null;
   submit: (action: ControlAction) => Promise<ActionReceipt>;
 }
 
 /** 单张 pending 卡：只读呈现 + 宿主原值回传；关闭的能力面禁用并说明原因。 */
-function PendingCard({ pending, sessionId, generation, capabilities, submit }: PendingCardProps) {
+function PendingCard({
+  pending,
+  sessionId,
+  generation,
+  capabilities,
+  gateReason,
+  submit,
+}: PendingCardProps) {
   const [picked, setPicked] = useState<Record<string, string>>({});
   const [freeAnswers, setFreeAnswers] = useState<Record<string, string>>({});
   const snoozedRef = useRef(false);
+  /** 同帧双击闸：一次用户动作只允许一个在途 POST（actionId 不重复生成）。 */
+  const inFlightRef = useRef(false);
+  /** 敏感作答的即时值：失焦清可见态，提交仍能带上本次输入（仅内存，不落存储）。 */
+  const sensitiveRef = useRef<Record<string, string>>({});
+
+  /** 一次动作一个在途槽：同帧重入直接丢弃，不产生第二个 actionId。 */
+  const submitOnce = (action: ControlAction) => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    void submit(action)
+      .catch(() => {})
+      .finally(() => {
+        inFlightRef.current = false;
+      });
+  };
 
   const isPermission = pending.kind === "permission";
   const isUserInput = pending.kind === "userInput";
@@ -69,7 +112,8 @@ function PendingCard({ pending, sessionId, generation, capabilities, submit }: P
     question.multiSelect ? capabilities.multiSelect : capabilities.singleSelect;
 
   // 卡片级只展示首个关闭原因：阅读面照常，作答面禁用。
-  const blocked: CapabilityFlag | null = isPermission
+  // 写面硬门优先于能力矩阵：连接未配对 / 投影 ready=false → 全套作答面零写。
+  const capabilityBlocked: CapabilityFlag | null = isPermission
     ? capabilities.approvalReply.enabled
       ? null
       : capabilities.approvalReply
@@ -81,37 +125,49 @@ function PendingCard({ pending, sessionId, generation, capabilities, submit }: P
           ])
           .find((flag) => !flag.enabled) ?? null)
       : { enabled: false, reasonCode: "unsupported_protocol" };
+  const blocked: CapabilityFlag | null =
+    gateReason !== null ? { enabled: false, reasonCode: gateReason } : capabilityBlocked;
+  const blockedText =
+    gateReason !== null
+      ? i18n.t("mobile.zcodeControl.actionBlocked")
+      : i18n.t("mobile.zcodeControl.pendingBlocked");
 
   /** auto_resolution：首次有效编辑补发一次 snooze（尽力而为，不阻塞渲染）。 */
   const snoozeOnce = () => {
+    if (gateReason !== null) return; // 陈旧投影不发 snooze（写面硬门）
     if (!pending.autoResolution || snoozedRef.current) return;
     snoozedRef.current = true;
-    void submit({
+    submitOnce({
       kind: "snooze",
       sessionId,
       generation,
       interactionId: pending.interactionId,
-    }).catch(() => {});
+    });
   };
 
   const submitAnswer = () => {
+    if (blocked !== null) return;
     const answers = pending.questions
-      .map((question) => ({
-        questionText: question.questionText,
-        selectedValues: picked[question.questionText] ? [picked[question.questionText]] : [],
-        freeText: freeAnswers[question.questionText]?.length
-          ? freeAnswers[question.questionText]
-          : null,
-      }))
+      .map((question) => {
+        // 敏感作答失焦后可见态已清空，提交取本次挂载的内存值（不落任何存储）。
+        const value = pending.sensitive
+          ? (sensitiveRef.current[question.questionText] ?? freeAnswers[question.questionText])
+          : freeAnswers[question.questionText];
+        return {
+          questionText: question.questionText,
+          selectedValues: picked[question.questionText] ? [picked[question.questionText]] : [],
+          freeText: value?.length ? value : null,
+        };
+      })
       .filter((answer) => answer.selectedValues.length > 0 || answer.freeText !== null);
     if (answers.length === 0) return;
-    void submit({
+    submitOnce({
       kind: "answer",
       sessionId,
       generation,
       interactionId: pending.interactionId,
       answers,
-    }).catch(() => {});
+    });
   };
 
   // 仅 allowOnce/deny 可回传；fullAccess 及其他永久/未知 kind 不渲染。
@@ -137,13 +193,13 @@ function PendingCard({ pending, sessionId, generation, capabilities, submit }: P
             disabled={blocked !== null}
             onClick={() => {
               if (blocked !== null) return;
-              void submit({
+              submitOnce({
                 kind: "permission",
                 sessionId,
                 generation,
                 interactionId: pending.interactionId,
                 optionId: option.optionId,
-              }).catch(() => {});
+              });
             }}
             className="mt-1 mr-2 rounded-lg border border-[var(--cb)] px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
           >
@@ -165,9 +221,9 @@ function PendingCard({ pending, sessionId, generation, capabilities, submit }: P
                       key={option.value}
                       type="button"
                       data-testid={`zcode-pending-option-${index}`}
-                      disabled={!flag.enabled}
+                      disabled={blocked !== null || !flag.enabled}
                       onClick={() => {
-                        if (!flag.enabled) return;
+                        if (blocked !== null || !flag.enabled) return;
                         setPicked((prev) => ({
                           ...prev,
                           [question.questionText]: option.value,
@@ -186,13 +242,23 @@ function PendingCard({ pending, sessionId, generation, capabilities, submit }: P
                   type={pending.sensitive ? "password" : "text"}
                   data-testid={pending.sensitive ? "zcode-pending-sensitive-input" : undefined}
                   value={freeAnswers[question.questionText] ?? ""}
-                  disabled={!capabilities.freeText.enabled}
+                  disabled={blocked !== null || !capabilities.freeText.enabled}
                   onChange={(event) => {
-                    if (!capabilities.freeText.enabled) return;
+                    if (blocked !== null || !capabilities.freeText.enabled) return;
                     const value = event.target.value;
                     // 敏感作答只存本次挂载的组件状态，不落任何草稿缓存。
+                    if (pending.sensitive) sensitiveRef.current[question.questionText] = value;
                     setFreeAnswers((prev) => ({ ...prev, [question.questionText]: value }));
                     snoozeOnce();
+                  }}
+                  onBlur={() => {
+                    // 敏感输入失焦即清可见值（防肩窥/留屏）；提交值仍取本次内存副本。
+                    if (!pending.sensitive) return;
+                    setFreeAnswers((prev) => {
+                      const next = { ...prev };
+                      delete next[question.questionText];
+                      return next;
+                    });
                   }}
                   className="mt-1 w-full rounded-lg border border-[var(--cb)] px-3 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
                 />
@@ -208,7 +274,7 @@ function PendingCard({ pending, sessionId, generation, capabilities, submit }: P
           onClick={submitAnswer}
           className="mt-1 rounded-full bg-[var(--btnp)]/10 px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
         >
-          提交
+          {i18n.t("mobile.zcodeControl.submit")}
         </button>
       )}
       {blocked !== null && (
@@ -217,7 +283,7 @@ function PendingCard({ pending, sessionId, generation, capabilities, submit }: P
           data-reason-code={blocked.reasonCode ?? "unknown"}
           className="mt-1 text-xs text-[var(--mut)]"
         >
-          {PENDING_BLOCKED_TEXT}
+          {blockedText}
         </p>
       )}
     </div>
@@ -229,6 +295,10 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     useZcodeControl(sessionId);
   const [draft, setDraft] = useState("");
   const [receipt, setReceipt] = useState<ActionReceipt | null>(null);
+  /** 已保存的官方链接（只读 GET /m/api/v1/official-control；读不到 → null = 不挂入口）。 */
+  const [officialUrl, setOfficialUrl] = useState<string | null>(null);
+  /** 同帧双击闸：一次用户动作只允许一个在途 POST（双击不产生第二个 actionId）。 */
+  const inFlightRef = useRef(false);
 
   // 仅 send 的 accepted 允许清本次草稿（hook 语义）；失败/拒绝/未知一律保留。
   useEffect(() => {
@@ -241,28 +311,56 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
     setDraft("");
   }, [sessionId]);
 
+  // A5 基线「打开官方页面」的显式辅助入口：只读已保存链接（不自动打开、不代理点击）。
+  useEffect(() => {
+    let alive = true;
+    setOfficialUrl(null);
+    void fetchZcodeControl().then((availability) => {
+      if (alive) setOfficialUrl(availability.url);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [sessionId]);
+
+  const openOfficial = () => {
+    if (officialUrl === null) return;
+    window.open(officialUrl, "_blank", "noopener,noreferrer");
+  };
+
+  // 写面硬门：连接已配对 + 会话就绪（陈旧投影 ready=false 一律零写）。
+  const gateReason = actionGateReason(connection, session);
+  // 发送区原因优先取 hook 的如实连接/回执原因；连接正常但投影未就绪时显示 not_ready。
+  const displayReason = reason ?? gateReason;
+
+  /** 一次动作一个在途槽：同帧重入直接丢弃，回执只认第一次提交。 */
+  const runOnce = (action: ControlAction) => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    void submit(action)
+      .then(setReceipt)
+      .catch(() => {
+        // 传输层失败：hook 已置冻结原因码；草稿保留，绝不自动重发。
+      })
+      .finally(() => {
+        inFlightRef.current = false;
+      });
+  };
+
   // 硬门：连接已配对 + 会话就绪 + send 能力开启 + 无在途提交。空草稿不阻挡按钮
   // （按钮代表控制通道就绪），但点击时判空、绝不 POST 空动作。
   const canSend =
-    connection?.state === "paired" &&
-    session !== null &&
-    session.ready &&
-    session.capabilities.send.enabled &&
-    !submitting;
+    gateReason === null && session !== null && session.capabilities.send.enabled && !submitting;
 
-  const handleSend = async () => {
+  const handleSend = () => {
     if (!canSend || session === null || draft.trim().length === 0) return;
-    try {
-      const result = await submit({
-        kind: "send",
-        sessionId,
-        generation: session.generation,
-        text: draft, // 多行原样上行；trim 只用于判空
-      });
-      setReceipt(result);
-    } catch {
-      // 传输层失败：hook 已置冻结原因码；草稿保留，绝不自动重发。
-    }
+    if (inFlightRef.current) return;
+    runOnce({
+      kind: "send",
+      sessionId,
+      generation: session.generation,
+      text: draft, // 多行原样上行；trim 只用于判空
+    });
   };
 
   // 打断：只认新鲜 control 里唯一的 primaryTurn（多目标拒绝，禁止随取第一个）；
@@ -272,32 +370,44 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   );
   const stopTarget = stopTargets.length === 1 ? stopTargets[0].foregroundExecutionId : null;
   const canInterrupt =
-    connection?.state === "paired" &&
-    session?.ready === true &&
+    gateReason === null &&
+    session !== null &&
     session.capabilities.interrupt.enabled &&
     stopTarget !== null &&
     !submitting;
+  // 不可打断的就地原因：写面硬门 > 能力关闭 > 多目标歧义。
+  const interruptReason =
+    gateReason ??
+    (session?.capabilities.interrupt.enabled === false
+      ? session.capabilities.interrupt.reasonCode
+      : stopTarget === null
+        ? "target_ambiguous"
+        : null);
 
   const handleInterrupt = () => {
     if (!canInterrupt || session === null || stopTarget === null) return;
-    void submit({
+    runOnce({
       kind: "stop",
       sessionId,
       generation: session.generation,
       expectedForegroundExecutionId: stopTarget,
-    })
-      .then(setReceipt)
-      .catch(() => {});
+    });
   };
 
-  // 模型/档位：目录只来自 session.selection（当前 provider）；两闸同开才可提交，
-  // 任一关闭 → 两个控件都禁用并显示可见原因。
+  // 模型/档位：目录只来自 session.selection（当前 provider）；写面硬门 + 能力两闸
+  // 同开才可提交，任一关闭 → 两个控件都禁用并显示可见原因。
   const selection = session?.selection ?? null;
   const currentChoice =
     selection?.models.find((choice) => choice.modelId === selection.model) ?? null;
   const selectionEnabled =
+    gateReason === null &&
     session?.capabilities.model.enabled === true &&
     session.capabilities.thoughtLevel.enabled === true;
+  const selectionReason =
+    gateReason ??
+    session?.capabilities.model.reasonCode ??
+    session?.capabilities.thoughtLevel.reasonCode ??
+    "unknown";
   const currentThought =
     selection?.thought != null && currentChoice?.thoughtLevels.includes(selection.thought)
       ? selection.thought
@@ -305,9 +415,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
 
   const submitSelection = (model: string, thought: string) => {
     if (session === null || !selectionEnabled || thought === "") return;
-    void submit({ kind: "selection", sessionId, generation: session.generation, model, thought })
-      .then(setReceipt)
-      .catch(() => {});
+    runOnce({ kind: "selection", sessionId, generation: session.generation, model, thought });
   };
 
   const handleModelChange = (modelId: string) => {
@@ -333,14 +441,25 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
       data-connection-state={connection?.state ?? "unknown"}
       className="shrink-0 border-t border-[var(--cb)] px-3 py-2"
     >
-      {reason !== null && (
+      {displayReason !== null && (
         <p
           data-testid="zcode-control-reason"
-          data-reason-code={reason}
+          data-reason-code={displayReason}
           className="mb-2 text-xs text-[var(--mut)]"
         >
-          {i18n.t(REASON_KEYS[reason] ?? "mobile.zcodeControl.reasonUnknown")}
+          {i18n.t(REASON_KEYS[displayReason] ?? "mobile.zcodeControl.reasonUnknown")}
         </p>
+      )}
+      {/* A5 显式辅助入口：只打开**已保存**的官方链接（挂载不自动外跳、不代理点击）。 */}
+      {officialUrl !== null && (
+        <button
+          type="button"
+          data-testid="zcode-open-official"
+          onClick={openOfficial}
+          className="mb-2 rounded-full border border-[var(--cb)] px-3 py-1 text-xs text-[var(--mut)]"
+        >
+          {i18n.t("mobile.composer.zcodeOpenOfficial")}
+        </button>
       )}
       {receipt !== null && (
         <p
@@ -359,6 +478,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
             sessionId={sessionId}
             generation={session.generation}
             capabilities={session.capabilities}
+            gateReason={gateReason}
             submit={submit}
           />
         ))}
@@ -366,7 +486,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
         <div className="mb-2 flex flex-wrap items-center gap-2">
           <select
             data-testid="zcode-model-select"
-            aria-label="模型"
+            aria-label={i18n.t("mobile.zcodeControl.modelAria")}
             value={selection.model}
             disabled={!selectionEnabled}
             onChange={(e) => handleModelChange(e.target.value)}
@@ -380,7 +500,7 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           </select>
           <select
             data-testid="zcode-thought-select"
-            aria-label="思考强度"
+            aria-label={i18n.t("mobile.zcodeControl.thoughtAria")}
             value={currentThought}
             disabled={!selectionEnabled}
             onChange={(e) => handleThoughtChange(e.target.value)}
@@ -395,29 +515,38 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           {!selectionEnabled && (
             <p
               data-testid="zcode-selection-reason"
-              data-reason-code={
-                session?.capabilities.model.reasonCode ??
-                session?.capabilities.thoughtLevel.reasonCode ??
-                "unknown"
-              }
+              data-reason-code={selectionReason}
               className="text-xs text-[var(--mut)]"
             >
-              {SELECTION_BLOCKED_TEXT}
+              {gateReason !== null
+                ? i18n.t("mobile.zcodeControl.actionBlocked")
+                : i18n.t("mobile.zcodeControl.selectionBlocked")}
             </p>
           )}
         </div>
       )}
       {stopTargets.length > 0 && (
-        <div className="mb-2">
+        <div className="mb-2 flex flex-wrap items-center gap-2">
           <button
             type="button"
             data-testid="zcode-interrupt"
             disabled={!canInterrupt}
-            onClick={() => void handleInterrupt()}
+            onClick={handleInterrupt}
             className="rounded-full border border-[var(--cb)] px-4 py-1 text-sm text-[var(--tx)] disabled:opacity-40"
           >
-            打断
+            {i18n.t("mobile.zcodeControl.interrupt")}
           </button>
+          {!canInterrupt && interruptReason !== null && (
+            <p
+              data-testid="zcode-interrupt-reason"
+              data-reason-code={interruptReason}
+              className="text-xs text-[var(--mut)]"
+            >
+              {gateReason !== null
+                ? i18n.t("mobile.zcodeControl.actionBlocked")
+                : i18n.t("mobile.zcodeControl.interruptBlocked")}
+            </p>
+          )}
         </div>
       )}
       <div className="flex items-end gap-2">

@@ -575,6 +575,199 @@ describe("ZCode 控制面板：打断只针对唯一的既有前台执行", () =
   });
 });
 
+describe("ZCode 控制面板：写面门禁（paired + ready）", () => {
+  it("stale_projection_actions_are_disabled_when_not_ready", async () => {
+    // 连接仍 paired，但服务端把同一投影置 ready=false（relay 掉线/`stale_session`）：
+    // 陈旧投影一律不可点——作答/审批/模型档位/打断零动作 POST。
+    const selection = {
+      provider: "zai",
+      model: "model-a",
+      thought: "high",
+      models: [{ modelId: "model-a", thoughtLevels: ["low", "high"] }],
+    };
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            ready: false,
+            pending: [
+              pendingView({
+                kind: "permission",
+                toolName: "Bash",
+                summary: "执行合成命令",
+                options: [{ optionId: "host-allow-once-9", label: "允许一次", kind: "allowOnce" }],
+              }),
+              pendingView({
+                interactionId: "int_00000000000000000000000000000002",
+                questions: [questionView({ freeTextAllowed: true })],
+              }),
+            ],
+            control: { activeWorks: [{ kind: "primaryTurn", foregroundExecutionId: "E1" }] },
+            selection,
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    // 阅读面照常（题干/审批摘要可见），作答面全部禁用。
+    expect(await screen.findByText("这个任务接下来要做什么？")).toBeVisible();
+    const permission = screen.getByTestId(
+      "zcode-permission-option-host-allow-once-9"
+    ) as HTMLButtonElement;
+    const option = screen.getByTestId("zcode-pending-option-0") as HTMLButtonElement;
+    const submit = screen.getByTestId("zcode-pending-submit") as HTMLButtonElement;
+    const model = screen.getByTestId("zcode-model-select") as HTMLSelectElement;
+    const thought = screen.getByTestId("zcode-thought-select") as HTMLSelectElement;
+    const interrupt = screen.getByTestId("zcode-interrupt") as HTMLButtonElement;
+    for (const control of [permission, option, submit, model, thought, interrupt]) {
+      expect(control).toBeDisabled();
+    }
+
+    // 可见原因统一为 not_ready（冻结码只进 data-reason-code）。
+    for (const reason of screen.getAllByTestId("zcode-pending-reason")) {
+      expect(reason.getAttribute("data-reason-code")).toBe("not_ready");
+      expect(reason.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+      expect(reason.textContent).not.toContain("not_ready");
+    }
+    expect(screen.getByTestId("zcode-selection-reason").getAttribute("data-reason-code")).toBe(
+      "not_ready"
+    );
+    expect(screen.getByTestId("zcode-interrupt-reason").getAttribute("data-reason-code")).toBe(
+      "not_ready"
+    );
+
+    // 点击/改值均零动作 POST。
+    fireEvent.click(permission);
+    fireEvent.click(option);
+    fireEvent.click(submit);
+    fireEvent.click(interrupt);
+    fireEvent.change(model, { target: { value: "model-a" } });
+    fireEvent.change(thought, { target: { value: "low" } });
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
+    expect(legacySendCalls()).toBe(0);
+  });
+});
+
+describe("ZCode 控制面板：官方页面是显式辅助动作", () => {
+  const OFFICIAL_URL = "https://zcode.z.ai/remote/v4?sid=synthetic-panel-official-0001";
+
+  it("official_page_is_an_explicit_auxiliary_action", async () => {
+    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+    installFetch((url) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "saved", url: OFFICIAL_URL });
+      }
+      if (url === ZCODE_CONNECTION_PATH) {
+        return json(connection({ state: "needs_auth", reasonCode: "needs_auth" }));
+      }
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    // 挂载不自动外跳：入口必须由用户显式点击。
+    const link = await screen.findByTestId("zcode-open-official");
+    expect(openSpy).not.toHaveBeenCalled();
+
+    // 点击：用**已保存**链接在新标签页打开，且不代理任何控制/读取请求。
+    const callsBefore = fetchMock.mock.calls.length;
+    fireEvent.click(link);
+    expect(openSpy).toHaveBeenCalledWith(OFFICIAL_URL, "_blank", "noopener,noreferrer");
+    expect(fetchMock.mock.calls).toHaveLength(callsBefore);
+    expect(postedActions()).toHaveLength(0);
+
+    // 无已存链接（未配置/坏值）→ 没有可开的入口。
+    cleanup();
+    installFetch((url) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "missing", url: null });
+      }
+      if (url === ZCODE_CONNECTION_PATH) {
+        return json(connection({ state: "needs_config", reasonCode: "needs_config" }));
+      }
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await screen.findByTestId("zcode-control-panel");
+    await act(async () => {});
+    expect(screen.queryByTestId("zcode-open-official")).toBeNull();
+  });
+});
+
+describe("ZCode 控制面板：同帧双击与敏感输入清理", () => {
+  it("double_click_sends_one_action", async () => {
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const draft = (await screen.findByTestId("zcode-draft")) as HTMLTextAreaElement;
+    const send = screen.getByTestId("zcode-send") as HTMLButtonElement;
+    await waitFor(() => expect(send).toBeEnabled());
+    fireEvent.change(draft, { target: { value: "只发一次" } });
+
+    // 同一渲染帧双击（两次点击之间没有重渲染）：同步闸必须只放行一次提交。
+    await act(async () => {
+      send.click();
+      send.click();
+    });
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(postedActions()).toHaveLength(1);
+  });
+
+  it("sensitive_input_clears_on_unmount_or_blur", async () => {
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            pending: [
+              pendingView({
+                sensitive: true,
+                questions: [questionView({ freeTextAllowed: true })],
+              }),
+            ],
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const first = render(<ZcodeControlPanel sessionId={SID} />);
+    const input = (await screen.findByTestId("zcode-pending-sensitive-input")) as HTMLInputElement;
+    expect(input.type).toBe("password");
+    fireEvent.change(input, { target: { value: "合成敏感答案" } });
+    expect(input.value).toBe("合成敏感答案");
+
+    // 失焦即清空可见值，且不落任何浏览器存储。
+    fireEvent.blur(input);
+    expect(input.value).toBe("");
+    expect(storageDump()).not.toContain("合成敏感答案");
+
+    // 重挂同样从空开始（事实源只在终端/宿主）。
+    first.unmount();
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const remounted = (await screen.findByTestId(
+      "zcode-pending-sensitive-input"
+    )) as HTMLInputElement;
+    expect(remounted.value).toBe("");
+    expect(storageDump()).not.toContain("合成敏感答案");
+  });
+});
+
 describe("ZCode 控制面板：模型/档位按能力开放", () => {
   it("model_thought_controls_are_capability_gated", async () => {
     const selection = {

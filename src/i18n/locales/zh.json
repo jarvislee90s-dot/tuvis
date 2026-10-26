@@ -2240,12 +2240,21 @@
       "reasonOffline": "与电脑端的连接已离线，请检查网络后重试",
       "reasonConflict": "电脑端的连接存在冲突，请先在电脑端处理",
       "reasonUnknown": "控制暂时不可用，请稍后重试",
+      "reasonNotReady": "控制尚未就绪，请稍后重试",
       "statusAccepted": "已受理",
       "statusConfirmed": "已生效",
       "statusNoop": "无需变更",
       "statusRejected": "已拒绝",
       "statusSendFailed": "发送失败",
-      "statusUnknown": "结果未知，请到电脑端核对"
+      "statusUnknown": "结果未知，请到电脑端核对",
+      "submit": "提交",
+      "interrupt": "打断",
+      "modelAria": "模型",
+      "thoughtAria": "思考强度",
+      "pendingBlocked": "该作答形态暂未开放，请在终端处理",
+      "selectionBlocked": "模型/档位切换暂未开放，请在终端调整",
+      "actionBlocked": "控制未就绪（连接未配对或会话未就绪），请在电脑端完成连接后再试",
+      "interruptBlocked": "当前无法打断，请在终端处理"
     },
     "question": {
       "cancelInterrupt": "中断回合（破坏性）",

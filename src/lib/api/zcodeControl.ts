@@ -95,9 +95,26 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 // ==== DTO（camelCase / 枚举原值；来源：types.rs）====
 
-/** relay 连接状态（snake_case）。`connecting` 是配对**前**态，唯一「已配对」= `paired`。 */
-export type ConnectionState =
-  "needs_config" | "needs_auth" | "connecting" | "paired" | "offline" | "conflict" | "unknown";
+/** relay 连接状态原值表（snake_case；运行时白名单，与 Rust 枚举逐字对应）。
+ *  `connecting` 是配对**前**态，唯一「已配对」= `paired`。 */
+export const ZCODE_CONNECTION_STATES = [
+  "needs_config",
+  "needs_auth",
+  "connecting",
+  "paired",
+  "offline",
+  "conflict",
+  "unknown",
+] as const;
+
+export type ConnectionState = (typeof ZCODE_CONNECTION_STATES)[number];
+
+const ZCODE_CONNECTION_STATE_SET: ReadonlySet<string> = new Set(ZCODE_CONNECTION_STATES);
+
+/** 连接态词表守卫：设置卡等白名单消费方复用同一张表（不再本地复制枚举）。 */
+export function isConnectionState(value: unknown): value is ConnectionState {
+  return typeof value === "string" && ZCODE_CONNECTION_STATE_SET.has(value);
+}
 
 /** 连接视图：`deviceLabel` 仅供显示，不能用于绑定；`reasonCode` ∈ 冻结码。 */
 export interface ConnectionView {
