@@ -9,31 +9,31 @@
 
 ## 一、总判定
 
-| 维度                 | 判定               | 依据                                                                                                                                                              |
-| -------------------- | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `code_complete`      | **是（本批代码）** | T1.1–T7.2 全部落地；T8.1 代码/测试落地（含已申报偏差）；T8.2 能力策略、证据许可、桌面许可入口与闸门接线落地；全量自动门禁绿                                       |
-| `platform_validated` | **否（部分）**     | 仅有 macOS 探针级实机证据 B1–B4；T8.2 产品 UI 验收行未跑；Windows 未验；手机体验未由用户确认                                                                      |
-| `spec_complete`      | **否**             | T8.1 已补 loopback HTTP 授权/token、WS 握手与真实 RelayClient 数据回环，但桥/发送经真实 relay 的拼装仍缺口；T8.2 强制实机矩阵无产品证据；八项控制能力全部保持关闭 |
+| 维度                 | 判定               | 依据                                                                                                                                                                                                                                  |
+| -------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `code_complete`      | **是（本批代码）** | T1.1–T7.2 全部落地；T8.1 代码/测试落地（含已申报偏差）；T8.2 能力策略、证据许可、桌面许可入口与闸门接线落地；全量自动门禁绿                                                                                                           |
+| `platform_validated` | **否（部分）**     | 仅有 macOS 探针级实机证据 B1–B4；T8.2 产品 UI 验收行未跑；Windows 未验；手机体验未由用户确认                                                                                                                                          |
+| `spec_complete`      | **否**             | T8.1 已补 loopback HTTP 授权/token、WS 握手、真实 RelayClient 数据回环与真实 BridgeManager bootstrap/bridge-open，但 ready/Initialize/hello/订阅/发送经真实 relay 的拼装仍缺口；T8.2 强制实机矩阵无产品证据；八项控制能力全部保持关闭 |
 
 **结论一句话：代码与自动门禁完成，平台验收与 spec 闭合未完成；不把「门按预期关闭」写成功能已交付。**
 
 ## 二、任务状态（T1.1–T8.2）
 
-| 任务 | 状态                                 | 交付与边界                                                                                                                                                                                                                  |
-| ---- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| T1.1 | 完成                                 | OAuth（BigModel 回环已实跑）、JWT 仅内存、terminal token 每次现取；B1 只读连接已证                                                                                                                                          |
-| T1.2 | 完成                                 | 单连接 relay、KICKED 终态不自动重连、心跳/断线/代际；无自动重发                                                                                                                                                             |
-| T2.1 | 完成                                 | 二进制 RPC 编解码、CRC32、分片/重组/上限、Initialize 向量                                                                                                                                                                   |
-| T2.2 | 完成                                 | workspace bridge、任务索引、精确 session 绑定、投影/恢复；会话扫描预算遵守                                                                                                                                                  |
-| T3   | 完成                                 | 动作账本（`zcode_actions`）、actionId 幂等、单发、ACK 20s、保守 unknown                                                                                                                                                     |
-| T4.1 | 完成                                 | pending 册、单选/多选/自由文本答案构造、snooze 绑题、宿主撤卡才 confirmed                                                                                                                                                   |
-| T4.2 | 完成                                 | 有守卫 stop、`primaryTurn` 限定、初始 control 未确认零触发/零 stop                                                                                                                                                          |
-| T5   | 完成                                 | 既有 permission 卡应答、`allowOnce`/`deny` 白名单、`fullAccess` 硬拒绝；发送催卡仍为负结果                                                                                                                                  |
-| T6   | 完成                                 | 同 provider 模型/档位切换、按目标模型校验档位、CAS、新鲜快照确认、保留用户选择                                                                                                                                              |
-| T7.1 | 完成                                 | 单实例 Hub、GET/actions/SSE、配对门、代际、吊销、读链不依赖控制成功                                                                                                                                                         |
-| T7.2 | 完成                                 | 手机控制面板、发送/卡面/打断/档位、19 个冻结错误码 zh/en、无 legacy/无头回退                                                                                                                                                |
-| T8.1 | **部分完成（缺口收窄）**             | 进程内 `FakeOfficial` 覆盖 Hub+HTTP+命令层；另补 loopback HTTP 授权/token、WS `auth_init/auth_ack`、真实 `RelayClient` 数据回环 3 用例；`BridgeManager/CommandSender` 经真实 relay 的成功 bind/发送仍为构造冒烟与进程内假体 |
-| T8.2 | **代码完成；实机行 blocked/not_run** | `CapabilityPolicy`（宿主 key 全关）、`evidence.rs`（debug 单次许可）、桌面 IPC、Hub/CommandSender 闸门、无许可全关；产品实跑未执行，未开任何能力                                                                            |
+| 任务 | 状态                                 | 交付与边界                                                                                                                                                                                                                                           |
+| ---- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| T1.1 | 完成                                 | OAuth（BigModel 回环已实跑）、JWT 仅内存、terminal token 每次现取；B1 只读连接已证                                                                                                                                                                   |
+| T1.2 | 完成                                 | 单连接 relay、KICKED 终态不自动重连、心跳/断线/代际；无自动重发                                                                                                                                                                                      |
+| T2.1 | 完成                                 | 二进制 RPC 编解码、CRC32、分片/重组/上限、Initialize 向量                                                                                                                                                                                            |
+| T2.2 | 完成                                 | workspace bridge、任务索引、精确 session 绑定、投影/恢复；会话扫描预算遵守                                                                                                                                                                           |
+| T3   | 完成                                 | 动作账本（`zcode_actions`）、actionId 幂等、单发、ACK 20s、保守 unknown                                                                                                                                                                              |
+| T4.1 | 完成                                 | pending 册、单选/多选/自由文本答案构造、snooze 绑题、宿主撤卡才 confirmed                                                                                                                                                                            |
+| T4.2 | 完成                                 | 有守卫 stop、`primaryTurn` 限定、初始 control 未确认零触发/零 stop                                                                                                                                                                                   |
+| T5   | 完成                                 | 既有 permission 卡应答、`allowOnce`/`deny` 白名单、`fullAccess` 硬拒绝；发送催卡仍为负结果                                                                                                                                                           |
+| T6   | 完成                                 | 同 provider 模型/档位切换、按目标模型校验档位、CAS、新鲜快照确认、保留用户选择                                                                                                                                                                       |
+| T7.1 | 完成                                 | 单实例 Hub、GET/actions/SSE、配对门、代际、吊销、读链不依赖控制成功                                                                                                                                                                                  |
+| T7.2 | 完成                                 | 手机控制面板、发送/卡面/打断/档位、19 个冻结错误码 zh/en、无 legacy/无头回退                                                                                                                                                                         |
+| T8.1 | **部分完成（缺口收窄）**             | 进程内 `FakeOfficial` 覆盖 Hub+HTTP+命令层；另补 loopback HTTP 授权/token、WS `auth_init/auth_ack`、真实 `RelayClient` 数据回环、真实 `BridgeManager` bootstrap→listing→bridge-open 4 用例；ready/Initialize/hello/订阅/发送仍为构造冒烟与进程内假体 |
+| T8.2 | **代码完成；实机行 blocked/not_run** | `CapabilityPolicy`（宿主 key 全关）、`evidence.rs`（debug 单次许可）、桌面 IPC、Hub/CommandSender 闸门、无许可全关；产品实跑未执行，未开任何能力                                                                                                     |
 
 ## 三、能力矩阵（HEAD `981ee02b`）
 
@@ -111,7 +111,7 @@ Windows：全部行 `blocked`（无 Windows 主机，未构建、未连接、未
 | 命令                                                                                       | 结果                                                                         |
 | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
 | `pnpm test`                                                                                | **2340 passed / 5 skipped（194 文件）**                                      |
-| `cd src-tauri && cargo test --features marker-helper`                                      | **3769 passed / 0 failed / 46 ignored**（含 loopback 3 用例；证据构建 3778） |
+| `cd src-tauri && cargo test --features marker-helper`                                      | **3770 passed / 0 failed / 46 ignored**（含 loopback 4 用例；证据构建 3779） |
 | `cd src-tauri && cargo test --features marker-helper,zcode-bridge-evidence`                | **3772 passed / 0 failed / 46 ignored**（T8.2 证据特性 +7）                  |
 | `cargo test --lib services::zcode_control::types::tests::policy`（evidence 构建）          | 4 passed / 0 failed                                                          |
 | `cargo test --lib services::zcode_control::evidence::tests`（evidence 构建）               | 4 passed / 0 failed                                                          |
@@ -135,7 +135,7 @@ Windows：全部行 `blocked`（无 Windows 主机，未构建、未连接、未
 
 ### 工程侧未闭合
 
-1. **T8.1 I1（收窄）**：loopback HTTP 授权/token、WS 握手与真实 RelayClient 数据回环已交付；`BridgeManager ↔ CommandSender` 经真实 relay 的成功 bind/发送仍只有构造冒烟与进程内假体。不得以进程内假体冒充「整条生产链」；桥/发送拼装仍需补证或书面移交。
+1. **T8.1 I1（收窄）**：loopback HTTP 授权/token、WS 握手、真实 RelayClient 数据回环、真实 BridgeManager bootstrap→listing→bridge-open 已交付；ready/Initialize/hello/订阅/发送仍只有构造冒烟与进程内假体。不得以进程内假体冒充「整条生产链」；桥/发送拼装仍需补证或书面移交。
 2. **问答/打断终态**：单选 answer 与 interrupt 仅有 ACK，未观察宿主撤卡/执行停止；需产品实跑补终态。
 3. **多选/自由文本**：仅 fake/合同层，无 live。
 4. **审批范围**：仅「应答既有卡」已证；`approvalForTerminalSend=false`，不得把 guarded 模式宣传为对 Tuvis 发送的保护。
