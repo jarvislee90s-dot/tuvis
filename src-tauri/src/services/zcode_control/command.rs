@@ -492,14 +492,33 @@ impl CommandSender {
         target: &BoundTarget,
         action: &ControlAction,
     ) -> ZResult<ActionReceipt> {
+        self.execute_with_permits(ctx, target, action, &[]).await
+    }
+
+    /// 带**验收许可**的执行入口（T8.2 仅 debug 证据构建调用）。
+    ///
+    /// `permits` 只含 Hub 已按会话/代际/能力原子消费过的能力名（普通构建恒为空）。
+    /// 它只放宽本派发器的**能力闸**一项（`approval_reply` / `model` / `thought_level`）；
+    /// 目标、pending 授权、`fullAccess`/常驻 option、stop kind 等守卫全部原样执行。
+    pub(crate) async fn execute_with_permits(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+        permits: &[&str],
+    ) -> ZResult<ActionReceipt> {
         self.check_action(ctx, target, action)?;
         match action {
             ControlAction::Send { .. } => self.execute_send(ctx, target, action).await,
             ControlAction::Answer { .. } => self.execute_answer(ctx, target, action).await,
             ControlAction::Snooze { .. } => self.execute_snooze(ctx, target, action).await,
             ControlAction::Stop { .. } => self.execute_stop(ctx, target, action).await,
-            ControlAction::Permission { .. } => self.execute_permission(ctx, target, action).await,
-            ControlAction::Selection { .. } => self.execute_selection(ctx, target, action).await,
+            ControlAction::Permission { .. } => {
+                self.execute_permission(ctx, target, action, permits).await
+            }
+            ControlAction::Selection { .. } => {
+                self.execute_selection(ctx, target, action, permits).await
+            }
         }
     }
 
@@ -822,6 +841,7 @@ impl CommandSender {
         ctx: &ActionContext,
         target: &BoundTarget,
         action: &ControlAction,
+        permits: &[&str],
     ) -> ZResult<ActionReceipt> {
         let ControlAction::Permission {
             interaction_id,
@@ -837,7 +857,9 @@ impl CommandSender {
             return Ok(existing);
         }
         // 证据闸：审批应答默认关闭，关闭时连 pending 端口都不触碰（零帧）。
-        if !self.capabilities.approval_reply_enabled() {
+        // T8.2 debug 证据构建：Hub 已按会话/代际/能力消费的许可只放宽本闸，
+        // 后面的卡授权与 option 白名单（含 fullAccess 拒绝）照常执行。
+        if !self.capabilities.approval_reply_enabled() && !permits.contains(&"approval_reply") {
             return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
         }
         let Some(pending) = self.pending.as_ref() else {
@@ -915,6 +937,7 @@ impl CommandSender {
         ctx: &ActionContext,
         target: &BoundTarget,
         action: &ControlAction,
+        permits: &[&str],
     ) -> ZResult<ActionReceipt> {
         let ControlAction::Selection { model, thought, .. } = action else {
             return Err(invalid_action());
@@ -925,7 +948,11 @@ impl CommandSender {
             return Ok(existing);
         }
         // 证据闸：切换能力默认关闭，关闭时连目录都不读（零帧零行零审计）。
-        if !self.capabilities.model.enabled || !self.capabilities.thought_level.enabled {
+        // T8.2 debug 证据构建：Hub 已消费的许可只放宽本闸（每个关闭项各需一条许可）。
+        let model_open = self.capabilities.model.enabled || permits.contains(&"model");
+        let thought_open =
+            self.capabilities.thought_level.enabled || permits.contains(&"thought_level");
+        if !model_open || !thought_open {
             return Err(ZcodeError::of(codes::NEEDS_EVIDENCE));
         }
         let Some(port) = self.selection.as_ref() else {
@@ -4714,6 +4741,79 @@ mod tests {
             assert_eq!(resolve_envelopes(&fake).len(), 0);
             assert!(!pending.inflight("ix-1"));
             assert_eq!(stored_state(&store, "a-perm"), None, "关闭路径零账本行");
+        }
+
+        /// T8.2 证据许可只放宽能力闸：`fullAccess`/常驻选项与目标/代际守卫全部原样拒绝。
+        #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+        #[tokio::test]
+        async fn evidence_permit_does_not_bypass_full_access_or_target_guards() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = pending_with(card(
+                "ix-1",
+                vec![option("fullAccess", "Full access", "fullAccess")],
+            ));
+            // 默认矩阵 = 审批关闭；许可由 Hub 消费后以 `permits` 传入本派发器。
+            let sender =
+                CommandSender::with_timeout(fake.clone(), store.clone(), Duration::from_millis(20))
+                    .with_pending(pending.clone())
+                    .with_confirm_timeout(Duration::from_millis(40));
+            let permits = ["approval_reply"];
+
+            // fullAccess 特权项：许可在场也必须 forbidden_option，零帧零行零审计。
+            let error = sender
+                .execute_with_permits(
+                    &ctx("evidence-full"),
+                    &target(),
+                    &permission_action("ix-1", "fullAccess"),
+                    &permits,
+                )
+                .await
+                .expect_err("fullAccess 不因许可而放宽");
+            assert!(error.is(codes::FORBIDDEN_OPTION), "{:?}", error.code);
+            assert_eq!(resolve_envelopes(&fake).len(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert!(audits(&store).is_empty());
+            assert!(!pending.inflight("ix-1"), "本地拒绝必须释放在途");
+
+            // 目标/代际守卫先于能力闸：旧代际动作即便带许可也 stale_generation。
+            let stale = ControlAction::Permission {
+                session_id: SESSION.to_owned(),
+                generation: GEN + 1,
+                interaction_id: "ix-1".to_owned(),
+                option_id: "fullAccess".to_owned(),
+            };
+            let error = sender
+                .execute_with_permits(&ctx("evidence-stale"), &target(), &stale, &permits)
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::STALE_GENERATION));
+
+            // 他会话动作同样先被目标校验拒绝（invalid_action），许可不参与。
+            let wrong_session = ControlAction::Permission {
+                session_id: "sess_other".to_owned(),
+                generation: GEN,
+                interaction_id: "ix-1".to_owned(),
+                option_id: "fullAccess".to_owned(),
+            };
+            let error = sender
+                .execute_with_permits(&ctx("evidence-other"), &target(), &wrong_session, &permits)
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::INVALID_ACTION));
+
+            // 许可只属于它自己的能力：别的能力名不得开审批闸。
+            let error = sender
+                .execute_with_permits(
+                    &ctx("evidence-wrong-cap"),
+                    &target(),
+                    &permission_action("ix-1", "fullAccess"),
+                    &["single_select"],
+                )
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::NEEDS_EVIDENCE));
+            assert_eq!(fake.wire(), 0, "所有拒绝路径零帧");
         }
 
         /// 开闸后：恰一帧 resolve；ACK 只算 accepted，宿主撤卡才升级 confirmed。
