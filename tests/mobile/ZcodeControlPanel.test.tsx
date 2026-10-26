@@ -38,10 +38,14 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import ZcodeControlPanel from "@/mobile/ZcodeControlPanel";
+import i18n from "@/i18n";
+import enLocale from "@/i18n/locales/en.json";
+import zhLocale from "@/i18n/locales/zh.json";
+import ZcodeControlPanel, { ZCODE_REASON_KEYS } from "@/mobile/ZcodeControlPanel";
 import {
   ZCODE_ACTIONS_PATH,
   ZCODE_CONNECTION_PATH,
+  ZCODE_ERROR_CODES,
   ZCODE_SESSION_PATH,
   type ActionReceipt,
   type ActionState,
@@ -151,6 +155,14 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 function receipt(actionId: string, state: ActionState, reasonCode: string | null = null) {
   return {
     actionId,
@@ -223,10 +235,12 @@ beforeEach(() => {
   vi.stubGlobal("EventSource", undefined);
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  // 双语用例会临时切到 en：逐例还原 zh，避免污染后续以 zh 文案断言的文件内用例。
+  if (i18n.language !== "zh") await i18n.changeLanguage("zh");
 });
 
 describe("ZCode 控制面板：连接态与发送门", () => {
@@ -346,6 +360,87 @@ describe("ZCode 控制面板：回执文案不越级", () => {
     expect(unknown.textContent?.trim().length ?? 0).toBeGreaterThan(0);
     expect(unknown.textContent).not.toContain("已生效");
     expect(unknown.textContent).not.toContain("已受理");
+  });
+
+  it("previous_receipt_is_cleared_on_new_submit", async () => {
+    let posts = 0;
+    const secondGate = deferred<Response>();
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        posts += 1;
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        if (posts === 1) return json(receipt(body.actionId, "accepted"));
+        return secondGate.promise;
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const draft = (await screen.findByTestId("zcode-draft")) as HTMLTextAreaElement;
+    const send = screen.getByTestId("zcode-send") as HTMLButtonElement;
+    await waitFor(() => expect(send).toBeEnabled());
+
+    // 第一次：accepted（已受理）留在屏上
+    fireEvent.change(draft, { target: { value: "第一条草稿" } });
+    fireEvent.click(send);
+    const accepted = await screen.findByTestId("zcode-action-status");
+    await waitFor(() => expect(accepted.getAttribute("data-action-state")).toBe("accepted"));
+
+    // 第二次：新提交一开始，旧回执必须消失——上一次的「已受理」不得贴在
+    // 在途/失败/未知的新动作上（accepted 越级 = 本任务重点防的失真）。
+    fireEvent.change(draft, { target: { value: "第二条草稿" } });
+    await act(async () => {
+      fireEvent.click(send);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(postedActions()).toHaveLength(2));
+    expect(screen.queryByTestId("zcode-action-status")).toBeNull();
+
+    // 失败结果落地：只显示 send_failed，绝不与旧「已受理」并存
+    await act(async () => {
+      secondGate.resolve(json(receipt(postedActions()[1].actionId, "send_failed", "offline")));
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("zcode-action-status").getAttribute("data-action-state")).toBe(
+        "send_failed"
+      )
+    );
+    const status = screen.getByTestId("zcode-action-status");
+    expect(status.textContent).not.toContain("已受理");
+    expect(draft).toHaveValue("第二条草稿");
+  });
+});
+
+describe("ZCode 控制面板：发送能力关闭时就地说明原因", () => {
+  it("send_capability_disabled_shows_reason", async () => {
+    // paired + ready，但 send 能力关闭（reasonCode = needs_evidence）：
+    // 禁用按钮之外必须有一句可见解释，而不是让用户以为按钮坏了。
+    const caps = capabilities();
+    caps.send = flag(false);
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(sessionView({ capabilities: caps }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const send = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    await waitFor(() => expect(send).toBeDisabled());
+
+    const reason = screen.getByTestId("zcode-send-reason");
+    expect(reason).toBeVisible();
+    expect(reason.getAttribute("data-reason-code")).toBe("needs_evidence");
+    expect(reason.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+    expect(reason.textContent).not.toContain("needs_evidence");
+
+    fireEvent.click(send);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
   });
 });
 
@@ -575,6 +670,199 @@ describe("ZCode 控制面板：打断只针对唯一的既有前台执行", () =
   });
 });
 
+describe("ZCode 控制面板：写面门禁（paired + ready）", () => {
+  it("stale_projection_actions_are_disabled_when_not_ready", async () => {
+    // 连接仍 paired，但服务端把同一投影置 ready=false（relay 掉线/`stale_session`）：
+    // 陈旧投影一律不可点——作答/审批/模型档位/打断零动作 POST。
+    const selection = {
+      provider: "zai",
+      model: "model-a",
+      thought: "high",
+      models: [{ modelId: "model-a", thoughtLevels: ["low", "high"] }],
+    };
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            ready: false,
+            pending: [
+              pendingView({
+                kind: "permission",
+                toolName: "Bash",
+                summary: "执行合成命令",
+                options: [{ optionId: "host-allow-once-9", label: "允许一次", kind: "allowOnce" }],
+              }),
+              pendingView({
+                interactionId: "int_00000000000000000000000000000002",
+                questions: [questionView({ freeTextAllowed: true })],
+              }),
+            ],
+            control: { activeWorks: [{ kind: "primaryTurn", foregroundExecutionId: "E1" }] },
+            selection,
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    // 阅读面照常（题干/审批摘要可见），作答面全部禁用。
+    expect(await screen.findByText("这个任务接下来要做什么？")).toBeVisible();
+    const permission = screen.getByTestId(
+      "zcode-permission-option-host-allow-once-9"
+    ) as HTMLButtonElement;
+    const option = screen.getByTestId("zcode-pending-option-0") as HTMLButtonElement;
+    const submit = screen.getByTestId("zcode-pending-submit") as HTMLButtonElement;
+    const model = screen.getByTestId("zcode-model-select") as HTMLSelectElement;
+    const thought = screen.getByTestId("zcode-thought-select") as HTMLSelectElement;
+    const interrupt = screen.getByTestId("zcode-interrupt") as HTMLButtonElement;
+    for (const control of [permission, option, submit, model, thought, interrupt]) {
+      expect(control).toBeDisabled();
+    }
+
+    // 可见原因统一为 not_ready（冻结码只进 data-reason-code）。
+    for (const reason of screen.getAllByTestId("zcode-pending-reason")) {
+      expect(reason.getAttribute("data-reason-code")).toBe("not_ready");
+      expect(reason.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+      expect(reason.textContent).not.toContain("not_ready");
+    }
+    expect(screen.getByTestId("zcode-selection-reason").getAttribute("data-reason-code")).toBe(
+      "not_ready"
+    );
+    expect(screen.getByTestId("zcode-interrupt-reason").getAttribute("data-reason-code")).toBe(
+      "not_ready"
+    );
+
+    // 点击/改值均零动作 POST。
+    fireEvent.click(permission);
+    fireEvent.click(option);
+    fireEvent.click(submit);
+    fireEvent.click(interrupt);
+    fireEvent.change(model, { target: { value: "model-a" } });
+    fireEvent.change(thought, { target: { value: "low" } });
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
+    expect(legacySendCalls()).toBe(0);
+  });
+});
+
+describe("ZCode 控制面板：官方页面是显式辅助动作", () => {
+  const OFFICIAL_URL = "https://zcode.z.ai/remote/v4?sid=synthetic-panel-official-0001";
+
+  it("official_page_is_an_explicit_auxiliary_action", async () => {
+    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+    installFetch((url) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "saved", url: OFFICIAL_URL });
+      }
+      if (url === ZCODE_CONNECTION_PATH) {
+        return json(connection({ state: "needs_auth", reasonCode: "needs_auth" }));
+      }
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+
+    // 挂载不自动外跳：入口必须由用户显式点击。
+    const link = await screen.findByTestId("zcode-open-official");
+    expect(openSpy).not.toHaveBeenCalled();
+
+    // 点击：用**已保存**链接在新标签页打开，且不代理任何控制/读取请求。
+    const callsBefore = fetchMock.mock.calls.length;
+    fireEvent.click(link);
+    expect(openSpy).toHaveBeenCalledWith(OFFICIAL_URL, "_blank", "noopener,noreferrer");
+    expect(fetchMock.mock.calls).toHaveLength(callsBefore);
+    expect(postedActions()).toHaveLength(0);
+
+    // 无已存链接（未配置/坏值）→ 没有可开的入口。
+    cleanup();
+    installFetch((url) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "missing", url: null });
+      }
+      if (url === ZCODE_CONNECTION_PATH) {
+        return json(connection({ state: "needs_config", reasonCode: "needs_config" }));
+      }
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await screen.findByTestId("zcode-control-panel");
+    await act(async () => {});
+    expect(screen.queryByTestId("zcode-open-official")).toBeNull();
+  });
+});
+
+describe("ZCode 控制面板：同帧双击与敏感输入清理", () => {
+  it("double_click_sends_one_action", async () => {
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const draft = (await screen.findByTestId("zcode-draft")) as HTMLTextAreaElement;
+    const send = screen.getByTestId("zcode-send") as HTMLButtonElement;
+    await waitFor(() => expect(send).toBeEnabled());
+    fireEvent.change(draft, { target: { value: "只发一次" } });
+
+    // 同一渲染帧双击（两次点击之间没有重渲染）：同步闸必须只放行一次提交。
+    await act(async () => {
+      send.click();
+      send.click();
+    });
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+    expect(postedActions()).toHaveLength(1);
+  });
+
+  it("sensitive_input_clears_on_unmount_or_blur", async () => {
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            pending: [
+              pendingView({
+                sensitive: true,
+                questions: [questionView({ freeTextAllowed: true })],
+              }),
+            ],
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const first = render(<ZcodeControlPanel sessionId={SID} />);
+    const input = (await screen.findByTestId("zcode-pending-sensitive-input")) as HTMLInputElement;
+    expect(input.type).toBe("password");
+    fireEvent.change(input, { target: { value: "合成敏感答案" } });
+    expect(input.value).toBe("合成敏感答案");
+
+    // 失焦即清空可见值，且不落任何浏览器存储。
+    fireEvent.blur(input);
+    expect(input.value).toBe("");
+    expect(storageDump()).not.toContain("合成敏感答案");
+
+    // 重挂同样从空开始（事实源只在终端/宿主）。
+    first.unmount();
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const remounted = (await screen.findByTestId(
+      "zcode-pending-sensitive-input"
+    )) as HTMLInputElement;
+    expect(remounted.value).toBe("");
+    expect(storageDump()).not.toContain("合成敏感答案");
+  });
+});
+
 describe("ZCode 控制面板：模型/档位按能力开放", () => {
   it("model_thought_controls_are_capability_gated", async () => {
     const selection = {
@@ -630,7 +918,8 @@ describe("ZCode 控制面板：模型/档位按能力开放", () => {
     const reason = screen.getByTestId("zcode-selection-reason");
     expect(reason).toBeVisible();
     expect(reason.textContent).not.toContain("needs_evidence");
-    expect(reason.textContent).toMatch(/暂未开放/);
+    // 按码如实呈现：needs_evidence 有自己的 zh 文案，不再与其他原因共用同一句
+    expect(reason.textContent).toBe("该操作还需终端侧确认，请在终端处理");
     fireEvent.change(modelSelect, { target: { value: "model-b" } });
     fireEvent.change(thoughtSelect, { target: { value: "low" } });
     await act(async () => {});
@@ -647,5 +936,160 @@ describe("ZCode 控制面板：模型/档位按能力开放", () => {
     fireEvent.change(screen.getByTestId("zcode-thought-select"), { target: { value: "low" } });
     await act(async () => {});
     expect(postedActions()).toHaveLength(1);
+  });
+});
+
+/** 按点路径读取语言包字符串（缺键 → undefined）。 */
+function localeText(bundle: unknown, path: string): string | undefined {
+  let node: unknown = bundle;
+  for (const segment of path.split(".")) {
+    if (typeof node !== "object" || node === null) return undefined;
+    node = (node as Record<string, unknown>)[segment];
+  }
+  return typeof node === "string" ? node : undefined;
+}
+
+describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
+  it("all_reason_codes_have_zh_en_copy", () => {
+    // 冻结码表（19 码）每一码都必须映射到 zh/en 都存在的文案键（键集 = 码集）。
+    expect(Object.keys(ZCODE_REASON_KEYS).sort()).toEqual([...ZCODE_ERROR_CODES].sort());
+    for (const code of ZCODE_ERROR_CODES) {
+      const key = ZCODE_REASON_KEYS[code];
+      const zhText = localeText(zhLocale, key);
+      const enText = localeText(enLocale, key);
+      expect(zhText, `zh copy missing for ${code}`).toBeTruthy();
+      expect(enText, `en copy missing for ${code}`).toBeTruthy();
+      expect(i18n.exists(key, { lng: "zh" }), `zh key missing for ${code}`).toBe(true);
+      expect(i18n.exists(key, { lng: "en" }), `en key missing for ${code}`).toBe(true);
+    }
+  });
+
+  it("zh_and_en_reason_copy_differ", () => {
+    for (const code of ZCODE_ERROR_CODES) {
+      const key = ZCODE_REASON_KEYS[code];
+      const zhText = localeText(zhLocale, key) ?? "";
+      const enText = localeText(enLocale, key) ?? "";
+      expect(zhText.trim().length, `zh copy empty for ${code}`).toBeGreaterThan(0);
+      expect(enText.trim().length, `en copy empty for ${code}`).toBeGreaterThan(0);
+      // 两侧各有独立文案（不是把中文抄到英文侧，也不是同一句泛化兜底）
+      expect(zhText, `zh/en copy identical for ${code}`).not.toBe(enText);
+      // 英文侧不得混入中文，否则英文界面会漏出中文原因
+      expect(enText, `en copy contains chinese for ${code}`).not.toMatch(/[\u4e00-\u9fff]/);
+    }
+  });
+
+  it("en_panel_has_no_hardcoded_chinese", async () => {
+    await i18n.changeLanguage("en");
+
+    // 第一面：连接需授权 → 顶部原因、发送/草稿等控件文案全部英文。
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) {
+        return json(connection({ state: "needs_auth", reasonCode: "needs_auth" }));
+      }
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    const first = render(<ZcodeControlPanel sessionId={SID} />);
+    const topReason = await screen.findByTestId("zcode-control-reason");
+    await waitFor(() => expect(topReason.getAttribute("data-reason-code")).toBe("needs_auth"));
+    expect(topReason.textContent).toBe("Complete ZCode official authorization on your computer");
+    expect(screen.getByTestId("zcode-send").textContent).toBe("Send");
+    expect(screen.getByTestId("zcode-draft").getAttribute("placeholder")).toBe(
+      "Type a message to send to ZCode"
+    );
+    expect(screen.getByTestId("zcode-control-panel").textContent ?? "").not.toMatch(
+      /[\u4e00-\u9fff]/
+    );
+    first.unmount();
+
+    // 第二面：已配对 + ready → pending/selection/interrupt 的就地原因按码取英文文案。
+    const caps = capabilities();
+    caps.singleSelect = flag(false);
+    caps.model = flag(false);
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            capabilities: caps,
+            pending: [
+              pendingView({
+                questions: [
+                  questionView({
+                    header: "Next step",
+                    questionText: "What should the task do next?",
+                    options: [
+                      {
+                        value: "opt-continue",
+                        label: "Continue",
+                        description: null,
+                        preview: null,
+                      },
+                    ],
+                  }),
+                ],
+              }),
+            ],
+            control: {
+              activeWorks: [
+                { kind: "primaryTurn", foregroundExecutionId: "E1" },
+                { kind: "primaryTurn", foregroundExecutionId: "E2" },
+              ],
+            },
+            selection: {
+              provider: "zai",
+              model: "model-a",
+              thought: "high",
+              models: [{ modelId: "model-a", thoughtLevels: ["low", "high"] }],
+            },
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await screen.findByTestId("zcode-pending-card");
+
+    const pendingReason = screen.getByTestId("zcode-pending-reason");
+    expect(pendingReason.getAttribute("data-reason-code")).toBe("needs_evidence");
+    expect(pendingReason.textContent).toBe(
+      "This action still needs confirmation in the terminal — continue there"
+    );
+    const selectionReason = screen.getByTestId("zcode-selection-reason");
+    expect(selectionReason.getAttribute("data-reason-code")).toBe("needs_evidence");
+    expect(selectionReason.textContent).toBe(
+      "This action still needs confirmation in the terminal — continue there"
+    );
+    const interruptReason = screen.getByTestId("zcode-interrupt-reason");
+    expect(interruptReason.getAttribute("data-reason-code")).toBe("target_ambiguous");
+    expect(interruptReason.textContent).toBe(
+      "Multiple tasks can be interrupted — choose one in the terminal"
+    );
+
+    // 控件/无障碍文案同样走英文
+    expect(screen.getByTestId("zcode-pending-submit").textContent).toBe("Submit");
+    expect(screen.getByTestId("zcode-interrupt").textContent).toBe("Interrupt");
+    expect(screen.getByTestId("zcode-model-select").getAttribute("aria-label")).toBe("Model");
+    expect(screen.getByTestId("zcode-thought-select").getAttribute("aria-label")).toBe(
+      "Thinking level"
+    );
+
+    // 英文界面整屏无中文；常见中文短语一个都不应出现（宿主数据本身为英文）。
+    const panel = screen.getByTestId("zcode-control-panel");
+    expect(panel.textContent ?? "").not.toMatch(/[\u4e00-\u9fff]/);
+    for (const phrase of [
+      "发送",
+      "提交",
+      "打断",
+      "已受理",
+      "已生效",
+      "暂时不可用",
+      "请在电脑端",
+      "请在终端",
+      "模型",
+      "思考强度",
+    ]) {
+      expect(panel.textContent ?? "", phrase).not.toContain(phrase);
+    }
   });
 });
