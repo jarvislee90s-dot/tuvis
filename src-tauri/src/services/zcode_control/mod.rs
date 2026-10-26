@@ -47,7 +47,7 @@ pub use codec::{
 };
 pub use command::{
     compose_official_text, new_command_id, CommandSender, ACK_TIMEOUT, AGENT_SEND_COMMAND_METHOD,
-    MAX_TEXT_BYTES,
+    CONFIRM_TIMEOUT, MAX_TEXT_BYTES, RESOLVE_INTERACTION_TYPE, STOP_TYPE,
 };
 pub use config::{
     get_config, set_config, validate_official_url, ConfigError, ConfigState, ZcodeRemoteConfig,
@@ -59,6 +59,7 @@ pub use relay::{
 pub use types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, AnswerEntry, BoundTarget,
     CapabilityFlag, CapabilityView, CommandPort, ConnectionState, ConnectionView, ControlAction,
-    ControlView, ModelChoice, PendingKind, PendingView, PermissionOptionView, QuestionOption,
-    QuestionView, RelaySink, SelectionView, SessionView, TargetKey, ZResult, ZcodeError,
+    ControlView, ModelChoice, PendingKind, PendingPort, PendingView, PermissionOptionView,
+    QuestionOption, QuestionView, RelaySink, SelectionView, SessionView, StopPort, StopRequest,
+    TargetKey, ZResult, ZcodeError, PENDING_CLEARED_POLL, STOP_CLEARED_POLL,
 };

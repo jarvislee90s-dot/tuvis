@@ -104,6 +104,17 @@ impl Projection {
         self.applied_frames
     }
 
+    /// 本会话 pending 册（只读；`BridgeManager` 的 `PendingPort` 用它读宿主观察代数）。
+    pub(crate) fn pending_book(&self) -> &PendingBook {
+        &self.book
+    }
+
+    /// 本会话 pending 册（可写；`BridgeManager` 的 `PendingPort` 授权入口在这里置
+    /// 本地 in-flight，**不**触碰宿主集合）。
+    pub(crate) fn pending_book_mut(&mut self) -> &mut PendingBook {
+        &mut self.book
+    }
+
     /// 显式置就绪位（缺序/协议不符时由桥置 false，取新快照后由 apply 恢复）。
     pub fn set_ready(&mut self, ready: bool) {
         self.ready = ready;

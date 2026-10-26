@@ -280,6 +280,39 @@ impl ActionStore {
         Self { store }
     }
 
+    /// 只读幂等命中（**不写行、不写审计**）：在授权/映射等本地校验之前调用。
+    ///
+    /// 语义与 [`Self::reserve_with_kind`] 的命中分支一致：同 actionId 同身份同载荷
+    /// → `Some(既有回执)`；身份/载荷不同 → `action_payload_conflict`；不存在 → `None`。
+    /// 这样本地拒绝（stale/invalid/needs_evidence）绝不留下 `reserved` 行与
+    /// `started` 审计，也就不会把 actionId 永久占死。
+    pub fn existing_receipt(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        kind: &str,
+        payload_hash: &str,
+    ) -> ZResult<Option<ActionReceipt>> {
+        if kind.is_empty() {
+            return Err(ZcodeError::of(codes::INVALID_ACTION));
+        }
+        let session_id = target.session_id.clone();
+        self.store.with(|conn| {
+            let Some(existing) = get_row(conn, &ctx.action_id).map_err(db_err)? else {
+                return Ok(None);
+            };
+            let same = existing.device_id == ctx.device_id
+                && existing.session_id == session_id
+                && existing.generation == target.generation
+                && existing.kind == kind
+                && existing.payload_hash == payload_hash;
+            if !same {
+                return Err(conflict());
+            }
+            Ok(Some(existing.receipt()))
+        })
+    }
+
     /// 预留动作（T3 的发送路径，kind 固定 `send`）。
     ///
     /// `summary` 由调用方按 [`audit_summary`] 生成（类别 + 字数/选项数，**不含正文**），

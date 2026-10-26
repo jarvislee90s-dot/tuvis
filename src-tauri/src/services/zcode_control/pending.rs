@@ -218,6 +218,10 @@ impl PendingBook {
             }
             self.pendings.insert(parsed.interaction_id.clone(), parsed);
         }
+        // 写后结果未知的在途闸只由宿主自己解除：该帧缺席（撤卡/换卡）= 宿主已
+        // 不再等这张卡，释放闸允许重试；仍在本帧 = 保留（绝不自动重发）。
+        self.inflight
+            .retain(|interaction_id| self.host_pending_ids.contains(interaction_id));
     }
 }
 
@@ -1170,6 +1174,36 @@ mod tests {
             .expect("delta shape");
         assert!(!book.host_has_pending(id));
         assert!(book.host_pending_revision() > revision);
+    }
+
+    #[test]
+    fn host_removal_clears_inflight() {
+        let id = "pi-synthetic-3004";
+        let mut book = book_with(permission_card(id));
+        let target = answer_target(SESSION, 1);
+        book.authorize(&target, id).expect("first authorization");
+
+        // 写后 unknown：宿主下一帧仍列该卡 → 在途闸保留（不自动放开重复提交）。
+        book.accept_delta_patch(&json!({"pendingInteractions": [permission_card(id)]}))
+            .expect("delta shape");
+        assert!(book
+            .authorize(&target, id)
+            .expect_err("host still lists the card: in-flight gate must hold")
+            .is(codes::STALE_PENDING));
+
+        // 宿主帧撤卡（本帧缺席）→ 释放该 id 的在途闸；本地展示同步撤下。
+        book.accept_delta_patch(&json!({"pendingInteractions": []}))
+            .expect("delta shape");
+        assert!(!book.host_has_pending(id));
+        assert!(book
+            .authorize(&target, id)
+            .expect_err("removed card is not displayed/authorizable")
+            .is(codes::STALE_PENDING));
+
+        // 宿主后续帧重新列出同一 id（迟到观测/宿主未消费）：无需人工清闸即可重试。
+        book.accept_delta_patch(&json!({"pendingInteractions": [permission_card(id)]}))
+            .expect("delta shape");
+        assert!(book.authorize(&target, id).is_ok());
     }
 
     #[test]
