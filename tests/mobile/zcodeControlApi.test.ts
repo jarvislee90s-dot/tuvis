@@ -1,6 +1,7 @@
 // T7.2 Slice A1：ZCode 统一控制手机 API 客户端契约锁（fetch 全量 stub，合成夹具）。
 // 锁定四件事：只走官方 `/m/api/v1/zcode/*`（绝不落旧 session-send/无头）、路径精确、
-// 错误体 `{error}` → 冻结码、DTO 与 Rust serde 输出逐字段相同（camelCase）。
+// 错误体 `{error}` → 冻结码、DTO 形状（TS 侧手写夹具；**不是** Rust 生成的 golden
+// 夹具，Rust 侧改名不会让本文件变红——跨语言对拍见 T7.2 报告「已知边界」）。
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ZCODE_ACTIONS_PATH,
@@ -194,8 +195,10 @@ describe("zcodeControlApi：官方动作发送面", () => {
       throw new Error(`unexpected fetch: ${url}`);
     });
 
-    // 金标 JSON 逐字转写自 Rust types.rs 的 serde 输出（camelCase；枚举原值）：
-    // 用 toEqual（非 matchObject）锁住字段名与嵌套形状，任一侧漂移即失败。
+    // 夹具是**手工转写**自 Rust types.rs（camelCase；枚举原值），不是 types.rs 产出的
+    // golden JSON：toEqual 只锁本侧（客户端 + TS 类型）的字段名/嵌套形状，Rust serde
+    // 改名或改枚举值不会触发本用例。跨语言防漂移需 Rust 单测导出固定 JSON 到
+    // tests/fixtures/（未做，见 T7.2 报告「已知边界」）。
     expect(await getZcodeConnection()).toEqual(goldenConnection);
     expect(await getZcodeSession(SID)).toEqual(goldenSession);
     expect(await postZcodeAction("act-1", sendAction)).toEqual(goldenReceipt);

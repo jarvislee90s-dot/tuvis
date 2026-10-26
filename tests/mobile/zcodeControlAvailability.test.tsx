@@ -1,10 +1,12 @@
 // tests/mobile/zcodeControlAvailability.test.tsx — A5（设计 §4.3/§5.1）：
-// 手机侧对 ZCode 官方远控**只读配置**（configState），并与未来 B 的 connectionState
-// 分开；没有适配器 ⇒ 控制态恒为 needs_connection，发送区就地给原因、不伪造可写按钮。
+// ZCode 手机控制面的可用性只由**活的统一控制路径**承担：SessionDetail 对 zcode 会话
+// 路由到 ZcodeControlPanel（连接态只来自官方 GET），旧 composer 的 ZCode 只读分支
+// 已删除（质量评审 I7 死码）。本文件测的就是这条活路径，不再渲染死分支。
 // 三条底线：
 //  1. 未配置／格式错误／待连接／读取失败——**正文与文件预览继续走既有读取链**，
 //     不整页报错、不把「未联机」当「无消息」、不把读取失败当「链接已删除」；
-//  2. 发送区保留草稿、给配置／连接提示，不调用发送／审批 API；
+//  2. 控制区保留草稿、给官方原因码，不调用旧发送／审批 API（零 session-send /
+//     零无头通道），写面只允许官方 `/m/api/v1/zcode/actions`；
 //  3. 「打开官方页面」是用户主动选择的辅助动作：新标签页打开已存链接，
 //     不标已读、不改本页、不把外跳冒充统一控制。
 // 夹具只用合成 sid（完整链接不入真实日志/夹具）。
@@ -12,6 +14,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import SessionDetail from "@/mobile/SessionDetail";
 import MessageComposer from "@/mobile/MessageComposer";
+import ZcodeControlPanel from "@/mobile/ZcodeControlPanel";
 import type { SessionFileEntry, SessionMessage, SendInfo } from "@/mobile/api";
 import type { Session } from "@/types/session";
 import { pinZhNavigator } from "./pinZhNavigator";
@@ -244,8 +247,17 @@ const postedTo = (path: string) =>
     (c) => String(c[0]) === path && (c[1] as RequestInit | undefined)?.method === "POST"
   ).length;
 
+/** 旧发送 / 无头通道请求数：ZCode 活路径（面板）零回退——含 GET send-info。 */
+const legacySendCalls = () =>
+  fetchMock.mock.calls.filter((c) => {
+    const url = String(c[0]);
+    return url.includes("/session-send") || /headless/i.test(url);
+  }).length;
+
 beforeEach(() => {
   controlRoute = { kind: "missing" };
+  // jsdom 无 EventSource；显式置空让 hook 走「GET 首拍权威」路径（本文件只测可用性）。
+  vi.stubGlobal("EventSource", undefined);
 });
 afterEach(() => {
   cleanup();
@@ -313,85 +325,125 @@ describe("ZCode 统一控制不可用时阅读面继续工作（A5 read_view_sur
   });
 });
 
-describe("ZCode 发送区：保留草稿、不调发送／审批 API、外跳是显式动作", () => {
-  /** composer 单挂（SessionDetail 在详情页就是把它挂在正文之下）+ 等原因收敛到位 */
-  const renderComposer = async (expected: RegExp) => {
+describe("ZCode 发送区（活路径 = 统一控制面板）：保留草稿、不调旧发送／审批 API、外跳是显式动作", () => {
+  /** 面板单挂（SessionDetail 对 zcode 会话挂的就是它）+ 等原因码收敛到位 */
+  const renderPanel = async (expectedReason: string) => {
     installDetailFetch();
-    render(<MessageComposer session={{ id: "sess-zc" }} agentType="zcode" />);
-    const reason = await screen.findByTestId("send-disabled-reason");
-    // 首拍是「正在确认…」（读取在途），断言要等收敛后的那一档
-    await waitFor(() => expect(reason.textContent).toMatch(expected));
+    render(<ZcodeControlPanel sessionId="sess-zc" />);
+    const reason = await screen.findByTestId("zcode-control-reason");
+    await waitFor(() => expect(reason.getAttribute("data-reason-code")).toBe(expectedReason));
     return reason;
   };
 
+  it("a5_availability_uses_live_zcode_path", async () => {
+    // 生产挂载点 = SessionDetail；ZCode 只允许走面板，旧 composer 的只读分支已删除。
+    controlRoute = { kind: "saved" };
+    installDetailFetch();
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    const panel = await screen.findByTestId("zcode-control-panel");
+    await waitFor(() => expect(panel.getAttribute("data-connection-state")).toBe("needs_auth"));
+    // 死分支不可达：composer 与其 ZCode 占位面都不在 DOM 里
+    expect(screen.queryByTestId("message-composer")).toBeNull();
+    expect(screen.queryByTestId("composer-input")).toBeNull();
+    expect(screen.queryByTestId("send-disabled-reason")).toBeNull();
+
+    // 显式辅助入口挂在活路径（面板）上：只开已保存链接，不带任何接口调用
+    const openSpy = vi.fn(() => null);
+    vi.spyOn(window, "open").mockImplementation(openSpy);
+    const draft = screen.getByTestId("zcode-draft") as HTMLTextAreaElement;
+    fireEvent.change(draft, { target: { value: "活路径上的草稿" } });
+    const callsBefore = fetchMock.mock.calls.length;
+    fireEvent.click(await screen.findByTestId("zcode-open-official"));
+    expect(openSpy).toHaveBeenCalledWith(SAVED_URL, "_blank", "noopener,noreferrer");
+    expect(fetchMock.mock.calls).toHaveLength(callsBefore);
+    expect(draft.value).toBe("活路径上的草稿");
+    vi.spyOn(window, "open").mockRestore();
+
+    // 未配对 → 发送是硬门：零动作 POST、零旧 send/无头通道
+    fireEvent.click(screen.getByTestId("zcode-send"));
+    await act(async () => {});
+    expect(draft.value).toBe("活路径上的草稿");
+    expect(postedTo("/m/api/v1/zcode/actions")).toBe(0);
+    expect(postedTo("/m/api/v1/session-send")).toBe(0);
+    expect(postedTo("/m/api/v1/session-approve")).toBe(0);
+    expect(legacySendCalls()).toBe(0);
+  });
+
   it("输入区仍可编辑（草稿保留），发送钮禁用且点击不发请求", async () => {
     controlRoute = { kind: "missing" };
-    await renderComposer(/请在电脑端配置 ZCode 远控链接/);
-    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
-    expect(input.disabled).toBe(false);
-    fireEvent.change(input, { target: { value: "这段草稿不能丢" } });
-    const send = screen.getByTestId("composer-send") as HTMLButtonElement;
+    const reason = await renderPanel("needs_config");
+    expect(reason.textContent).toMatch(/配置/);
+    const draft = screen.getByTestId("zcode-draft") as HTMLTextAreaElement;
+    expect(draft.disabled).toBe(false);
+    fireEvent.change(draft, { target: { value: "这段草稿不能丢" } });
+    const send = screen.getByTestId("zcode-send") as HTMLButtonElement;
     expect(send.disabled).toBe(true);
     fireEvent.click(send);
     await act(async () => {});
     // 草稿不丢：禁用的是「发送」这个动作，不是把用户输入清掉
-    expect(input.value).toBe("这段草稿不能丢");
-    // 不碰注入/审批面：POST 一条没有，连审批探针 GET 也不发
+    expect(draft.value).toBe("这段草稿不能丢");
+    // 不碰注入/审批面：零写、零旧 send/无头通道，连旧卡片探针也不发
     expect(postedTo("/m/api/v1/session-send")).toBe(0);
     expect(postedTo("/m/api/v1/session-approve")).toBe(0);
+    expect(postedTo("/m/api/v1/zcode/actions")).toBe(0);
+    expect(legacySendCalls()).toBe(0);
     expect(fetched("/m/api/v1/session-approve-options")).toBe(0);
     expect(fetched("/m/api/v1/session-question")).toBe(0);
   });
 
-  it("已配置（待连接）同样不调用发送／审批 API，原因说「连接待确认」", async () => {
+  it("已配置（待授权）同样不调用发送／审批 API，原因说「连接待授权」", async () => {
     controlRoute = { kind: "saved" };
-    await renderComposer(/连接待确认/);
-    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
-    fireEvent.change(input, { target: { value: "留着" } });
-    fireEvent.click(screen.getByTestId("composer-send"));
+    const reason = await renderPanel("needs_auth");
+    expect(reason.textContent).toMatch(/授权/);
+    const draft = screen.getByTestId("zcode-draft") as HTMLTextAreaElement;
+    fireEvent.change(draft, { target: { value: "留着" } });
+    fireEvent.click(screen.getByTestId("zcode-send"));
     await act(async () => {});
-    expect(input.value).toBe("留着");
+    expect(draft.value).toBe("留着");
     expect(postedTo("/m/api/v1/session-send")).toBe(0);
     expect(postedTo("/m/api/v1/session-approve")).toBe(0);
+    expect(postedTo("/m/api/v1/zcode/actions")).toBe(0);
+    expect(legacySendCalls()).toBe(0);
   });
 
   it("「打开官方页面」只在用户点击时新标签页打开，且不标已读／不离开本页", async () => {
     controlRoute = { kind: "saved" };
     const openSpy = vi.fn(() => null);
     vi.spyOn(window, "open").mockImplementation(openSpy);
-    const reason = await renderComposer(/连接待确认/);
+    const reason = await renderPanel("needs_auth");
     // 草稿先打在输入框里（外跳不该把它冲掉）
-    const input = screen.getByTestId("composer-input") as HTMLTextAreaElement;
-    fireEvent.change(input, { target: { value: "外跳前就写好的草稿" } });
+    const draft = screen.getByTestId("zcode-draft") as HTMLTextAreaElement;
+    fireEvent.change(draft, { target: { value: "外跳前就写好的草稿" } });
     const callsBefore = fetchMock.mock.calls.length;
-    fireEvent.click(screen.getByTestId("zcode-open-official"));
+    fireEvent.click(await screen.findByTestId("zcode-open-official"));
     // 用户主动选择的辅助动作：新标签页 + noopener，不带任何接口调用
     expect(openSpy).toHaveBeenCalledWith(SAVED_URL, "_blank", "noopener,noreferrer");
     expect(fetchMock.mock.calls).toHaveLength(callsBefore);
-    expect(input.value).toBe("外跳前就写好的草稿");
+    expect(draft.value).toBe("外跳前就写好的草稿");
     // 尤其不是「标已读／归档／打开」这类会动未读池的写接口，也不是发送/审批
     expect(postedTo("/m/api/v1/session-hide")).toBe(0);
     expect(postedTo("/m/api/v1/session-open")).toBe(0);
     expect(postedTo("/m/api/v1/session-send")).toBe(0);
     expect(postedTo("/m/api/v1/session-approve")).toBe(0);
+    expect(legacySendCalls()).toBe(0);
     // 本页原样：原因仍在（外跳不冒充统一控制完成）
-    expect(reason.textContent).toMatch(/连接待确认/);
-    vi.spyOn(window, "open").mockRestore();
+    expect(reason.textContent).toMatch(/授权/);
   });
 
   it("未配置／读取失败时不给「打开官方页面」（坏值与空值都没有可开链接）", async () => {
     controlRoute = { kind: "missing" };
-    await renderComposer(/请在电脑端配置/);
+    await renderPanel("needs_config");
     expect(screen.queryByTestId("zcode-open-official")).toBeNull();
     cleanup();
     controlRoute = { kind: "networkFail" };
-    await renderComposer(/暂时读不到/);
+    await renderPanel("offline");
     expect(screen.queryByTestId("zcode-open-official")).toBeNull();
   });
 
   it("非 ZCode 会话不读远控配置，也不禁用输入区（既有注入路径零回归）", async () => {
     installInjectableFetch();
-    render(<MessageComposer session={{ id: "sess-cl" }} agentType="claude" />);
+    render(<MessageComposer session={{ id: "sess-cl" }} />);
     await screen.findByTestId("composer-input");
     expect(fetched("/m/api/v1/official-control")).toBe(0);
     expect(screen.queryByTestId("send-disabled-reason")).toBeNull();

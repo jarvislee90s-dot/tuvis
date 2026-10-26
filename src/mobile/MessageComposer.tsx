@@ -69,19 +69,15 @@ import {
   fetchQueue,
   fetchSendInfo,
   fetchSessionQuestion,
-  fetchZcodeControl,
   queueJump,
   queueRetract,
   questionAnswerErrorCopy,
   sessionQuestionAnswer,
   sessionSend,
   uploadAttachment,
-  zcodeControlChecking,
-  zcodeSendReasonKey,
   type ChannelInfo,
   type QueueItemView,
   type SendInfo,
-  type ZcodeControlAvailability,
 } from "./api";
 import { ChannelBwNote } from "./FilePanel";
 import { etaRemainingText, formatBytes, transferRateBps, type TransferSample } from "./board-logic";
@@ -99,9 +95,6 @@ interface MessageComposerProps {
   onQueueChanged?: () => void;
   /** 会话（本组件只消费 id；结构化类型，完整 Session 可直接传入） */
   session: { id: string };
-  /** 会话归属工具（A5）：只有 `zcode` 会话才去读本机官方远控配置并据此在发送区给
-   *  就地原因；其余工具行为逐字不变（不读、不禁用、不多打一次 GET）。 */
-  agentType?: string;
 }
 
 /** 待发附件条目（组件内态）：status=uploading → ready/failed；
@@ -273,20 +266,10 @@ function upsertQueueItem(items: QueueItemView[], item: QueueItemView): QueueItem
   return next;
 }
 
-export default function MessageComposer({
-  session,
-  onQueueChanged,
-  agentType,
-}: MessageComposerProps) {
+export default function MessageComposer({ session, onQueueChanged }: MessageComposerProps) {
   // 可用性：sendInfo=null 且未就绪 → 不渲染（加载中 / 拉取失败 / 403）
   const [sendInfo, setSendInfo] = useState<SendInfo | null>(null);
   const [infoReady, setInfoReady] = useState(false);
-  // A5（设计 §4.3/§5.1）：ZCode 会话的官方远控**只读**可用性。初值即 checking（不是
-  // null）——首拍未达时发送区就在「正在确认」这一档，避免「先亮一下可发送再禁用」。
-  // 非 ZCode 会话恒 null：本机制完全不参与。
-  const [zcodeControl, setZcodeControl] = useState<ZcodeControlAvailability | null>(
-    agentType === "zcode" ? zcodeControlChecking() : null
-  );
   const [text, setText] = useState("");
   /** 输入框 ref：「修改」确认出队后把正文放回输入框时聚焦（移动端直接可改） */
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -448,12 +431,6 @@ export default function MessageComposer({
   // 行为，不会因多打而误判）。发送时刻另有复探（见 handleSend）——两发探针的成本
   // 换来「对话框出现后不必等重挂即被发现」。
   useEffect(() => {
-    // A5：ZCode 会话不发这两发探针——首版没有官方控制适配器，卡片在场分流对它没有
-    // 意义，而「审批 API」在控制未就绪时本就不该被调用（B 包有逐能力证据后再开）。
-    if (agentType === "zcode") {
-      setCardPresence("none");
-      return;
-    }
     let alive = true;
     setCardPresence("none");
     void probeCardPresence().then((p) => {
@@ -462,7 +439,7 @@ export default function MessageComposer({
     return () => {
       alive = false;
     };
-  }, [agentType, probeCardPresence]);
+  }, [probeCardPresence]);
 
   // D8 排队列 3s 轮询（复用既有 3s 通道，不另起轮询）：有排队回执 **或** 列表非空
   // 即持续；列表变空（且无排队回执）→ 停轮询。依赖是布尔量而非列表本体——位次
@@ -542,44 +519,12 @@ export default function MessageComposer({
     };
   }, [codexQueuedTracked, session.id]);
 
-  // A5（设计 §4.2/§4.3）：ZCode 会话挂载/换会话**只读**拉一次本机官方远控配置
-  // （GET /m/api/v1/official-control?agent_type=zcode，配对门 + no-store 在服务端；
-  // 手机侧没有写接口）。其余工具连这一枪都不发（行为逐字不变）。
-  // 读失败落 readState=failed：正文与文件继续走既有读取链，发送区只说「暂时读不到」，
-  // 不把它当成「链接已删除／未配置」（§4.3 失效证据分层的最后一行）。
-  useEffect(() => {
-    if (agentType !== "zcode") return;
-    let alive = true;
-    setZcodeControl(zcodeControlChecking());
-    void fetchZcodeControl().then((a) => {
-      if (alive) setZcodeControl(a);
-    });
-    return () => {
-      alive = false;
-    };
-  }, [agentType, session.id]);
-
+  // A5：ZCode 会话的只读控制面已迁移到 ZcodeControlPanel（SessionDetail 的 ZCode
+  // 挂载点不再走本组件）——本组件保留的是非 ZCode 会话的既有终端注入路径。
   const injectable = sendInfo !== null && sendInfo.injectable;
-  // 发送区就地原因（§4.3「手机控制区」列）：configState 与 connectionState 两面分开
-  // 持有，首版没有适配器 ⇒ 这一档恒非 null（**不伪造可写按钮**；B 包接上真连接态后
-  // 由那一档放行）。null = 本机制不适用（非 ZCode 会话）。
-  const zcodeReasonKey = zcodeSendReasonKey(zcodeControl);
-  const controlBlocked = zcodeReasonKey !== null;
-  const blockedPlaceholder = zcodeReasonKey === null ? null : i18n.t(zcodeReasonKey);
-
-  // 显式辅助动作（§5.1「打开官方页面」）：用户点了才在新标签页打开**已保存的**官方链接；
-  // 不标已读、不离开本页、不动任何控制接口——外跳不等于统一控制完成（B 才是）。
-  const openOfficialPage = useCallback(() => {
-    const url = zcodeControl?.url;
-    if (!url) return;
-    window.open(url, "_blank", "noopener,noreferrer");
-  }, [zcodeControl]);
 
   const handleSend = useCallback(async () => {
     const body = text.trim();
-    // A5：控制未就绪（未配置／格式错误／待连接／读不到）时**不发**任何注入/应答请求；
-    // 正文留在输入框（草稿不丢），原因由发送区就地呈现。
-    if (controlBlocked) return;
     if (!body || sending || busy || sendInfo === null || !sendInfo.injectable) return;
     if (attachments.some((a) => a.status === "uploading")) return; // 上传中禁发（防消息先于落盘）
     setSending(true);
@@ -780,7 +725,6 @@ export default function MessageComposer({
     sending,
     busy,
     sendInfo,
-    controlBlocked,
     session.id,
     queueOnlyNext,
     probeCardPresence,
@@ -1063,7 +1007,6 @@ export default function MessageComposer({
 
   const canSend =
     injectable &&
-    !controlBlocked &&
     !sending &&
     !busy &&
     text.trim().length > 0 &&
@@ -1071,43 +1014,18 @@ export default function MessageComposer({
 
   return (
     <div data-testid="message-composer" className="shrink-0 border-t border-[var(--cb)] px-3 py-2">
-      {/* 不可注入：**同一处**原因呈现（A5 把 ZCode 控制未就绪并进来，不建第二套禁用机制）。
-          ZCode 档刻意**保留输入框可编辑**——§4.3「保留草稿，显示连接原因」：链接没配好或
-          待联机时，用户正在打的字不该丢，只把「发送」这个动作挡住（不发注入/审批请求）。
-          data-* 是申报面：configState 与 connectionState 两面分开可见（B 包的连接态
-          将来只改 connectionState，不由配置推导）。 */}
-      {(controlBlocked || !injectable) && (
-        <p
-          data-testid="send-disabled-reason"
-          data-config-state={zcodeControl?.configState ?? ""}
-          data-connection-state={zcodeControl?.connectionState ?? ""}
-          className="mb-2 text-xs text-[var(--mut)]"
-        >
-          {controlBlocked ? (
-            blockedPlaceholder
-          ) : (
-            <>
-              {i18n.t("mobile.composer.sendDisabledPrefix")}
-              {sendInfo.reason ?? i18n.t("mobile.composer.sendDisabledFallback")}
-              {sendInfo.reasonCode
-                ? i18n.t("mobile.composer.sendDisabledCode", { code: sendInfo.reasonCode })
-                : ""}
-            </>
-          )}
+      {/* 不可注入：同一处原因呈现（send-info 的 reason/reasonCode）。
+          ZCode 会话不挂本组件（SessionDetail 路由到 ZcodeControlPanel），其只读原因
+          面（配置/连接/离线）由面板就地申报。 */}
+      {!injectable && (
+        <p data-testid="send-disabled-reason" className="mb-2 text-xs text-[var(--mut)]">
+          {i18n.t("mobile.composer.sendDisabledPrefix")}
+          {sendInfo.reason ?? i18n.t("mobile.composer.sendDisabledFallback")}
+          {sendInfo.reasonCode
+            ? i18n.t("mobile.composer.sendDisabledCode", { code: sendInfo.reasonCode })
+            : ""}
         </p>
       )}
-      {/* 「打开官方页面」（§5.1）：只在**已存链接在手**时挂出的显式辅助动作。点了就在新
-          标签页打开，不标已读、不离开本页、不改上面这一行原因——外跳不冒充统一控制。 */}
-      {controlBlocked && zcodeControl?.url ? (
-        <button
-          type="button"
-          data-testid="zcode-open-official"
-          onClick={openOfficialPage}
-          className="mb-2 rounded-full border border-[var(--cb)] px-3 py-1 text-xs text-[var(--mut)]"
-        >
-          {i18n.t("mobile.composer.zcodeOpenOfficial")}
-        </button>
-      ) : null}
       {/* 丁T3 接入② / 丁T6 复评：终端卡片在场提示条（**输入区仍可用**——不把输入框
           整个禁用是刻意的：用户可能正想把内容复制到卡片输入框；发送按钮仍可点，
           点了会按分流走。四态各一句话：可自由作答 → 承诺「作为回答发送」；
@@ -1477,19 +1395,17 @@ export default function MessageComposer({
           onChange={(e) => setText(e.target.value.slice(0, MAX_SEND_CHARS))}
           onPaste={handlePaste}
           rows={2}
-          disabled={!injectable && !controlBlocked}
+          disabled={!injectable}
           placeholder={
-            blockedPlaceholder !== null
-              ? blockedPlaceholder
-              : !injectable
-                ? i18n.t("mobile.composer.sendDisabledFallback")
-                : cardPresence === "questionFreeText"
-                  ? i18n.t(QUESTION_FREETEXT_PLACEHOLDER)
-                  : cardPresence === "questionBlocked"
-                    ? i18n.t("mobile.composer.placeholderBlocked")
-                    : cardPresence === "approve"
-                      ? i18n.t(APPROVE_PRESENT_RECEIPT)
-                      : i18n.t("mobile.composer.placeholder")
+            !injectable
+              ? i18n.t("mobile.composer.sendDisabledFallback")
+              : cardPresence === "questionFreeText"
+                ? i18n.t(QUESTION_FREETEXT_PLACEHOLDER)
+                : cardPresence === "questionBlocked"
+                  ? i18n.t("mobile.composer.placeholderBlocked")
+                  : cardPresence === "approve"
+                    ? i18n.t(APPROVE_PRESENT_RECEIPT)
+                    : i18n.t("mobile.composer.placeholder")
           }
           className="min-h-0 flex-1 resize-none rounded-lg border border-[var(--cb)] px-3 py-2 text-sm text-[var(--tx)] placeholder:text-[var(--mut)] focus:ring-2 focus:ring-[var(--btnp)] focus:outline-none disabled:opacity-50"
         />
