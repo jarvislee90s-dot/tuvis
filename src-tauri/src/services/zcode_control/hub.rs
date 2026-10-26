@@ -157,7 +157,7 @@ pub trait HubBackend: Send + Sync {
 /// 只含 `on_data`/`invalidate` 两个入口：泵因此拿不到 relay 生命周期或配置入口。
 /// `on_data` 返回本帧内**发生变化的会话视图**（桥侧前后快照对比）；泵据此发布
 /// `Session` 事件，而不是只让桥内投影悄悄前进。
-trait BridgePump: Send + Sync {
+pub(crate) trait BridgePump: Send + Sync {
     fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<Vec<SessionView>>>;
     /// 作废旧桥/投影（实现内部推进自己的投影代际，不接受外部代际，避免代际空间混用）。
     fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()>;
@@ -205,11 +205,36 @@ impl PartsBackend {
     /// 组装生产链（不触发 OAuth、不自动连接），返回 relay 事件接收端与 Data 溢出观察口
     /// 供 Hub 事件泵消费。
     fn production(store: DeviceStore) -> (Self, mpsc::Receiver<RelayEvent>, RelayLag) {
-        let auth = Arc::new(AuthService::new(reqwest::Client::new()));
+        Self::assemble_parts(
+            store,
+            Arc::new(AuthService::new(reqwest::Client::new())),
+            None,
+        )
+    }
+
+    /// 测试专用生产装配：复用测试里**真实**授权完成的 [`AuthService`]（同一 JWT 不
+    /// 二次 OAuth），只把 relay 端点换成本机回环假官方（[`RelayClient::with_endpoint`]）。
+    /// Auth/Relay/Bridge/CommandSender 全部是生产实现，端点之外零替身。
+    #[cfg(test)]
+    pub(crate) fn production_test(
+        store: DeviceStore,
+        auth: Arc<AuthService>,
+        ws_origin: String,
+    ) -> (Self, mpsc::Receiver<RelayEvent>, RelayLag) {
+        Self::assemble_parts(store, auth, Some(ws_origin))
+    }
+
+    /// 生产装配的唯一实现：`ws_origin = None` 恒走固定官方端点
+    /// （[`RelayClient::new`]）；回环端点只在 `#[cfg(test)]` 下可注入。
+    fn assemble_parts(
+        store: DeviceStore,
+        auth: Arc<AuthService>,
+        ws_origin: Option<String>,
+    ) -> (Self, mpsc::Receiver<RelayEvent>, RelayLag) {
         // 泵由 Hub 持有：State 溢出由 relay 无超时等待消费端（终态不丢），Data 溢出只
         // 置位 lag，由事件泵作废旧投影并让下一次 GET 重新 bind/现读（绝不阻塞 relay actor）。
         let (events, events_rx) = mpsc::channel(RELAY_EVENT_CAPACITY);
-        let relay = Arc::new(RelayClient::new(auth.clone(), events));
+        let relay = Arc::new(relay_for(auth.clone(), events, ws_origin));
         let lag = relay.lag_watcher();
         let bridge = Arc::new(BridgeManager::new(relay.clone()));
         // 单一策略源：桥的运行时证据（build/hello/协议/schema）→ for_host。
@@ -245,7 +270,7 @@ impl PartsBackend {
     }
 
     /// 事件泵的桥端（与后端共用同一个 `BridgeManager` 与投影代际）。
-    fn pump_bridge(&self) -> Arc<dyn BridgePump> {
+    pub(crate) fn pump_bridge(&self) -> Arc<dyn BridgePump> {
         Arc::new(ProjectionBridge {
             bridge: self.bridge.clone(),
             generation: self.projection_generation.clone(),
@@ -254,6 +279,20 @@ impl PartsBackend {
 
     fn advance_projection(&self) -> u64 {
         self.projection_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+/// 装配形态 → relay 构造：生产恒固定官方端点；只有 `#[cfg(test)]` 且显式给出来源时
+/// 才走回环端点注入（生产参数恒 `None`）。
+fn relay_for(
+    auth: Arc<AuthService>,
+    events: mpsc::Sender<RelayEvent>,
+    ws_origin: Option<String>,
+) -> RelayClient {
+    match ws_origin {
+        #[cfg(test)]
+        Some(origin) => RelayClient::with_endpoint(auth, events, origin),
+        _ => RelayClient::new(auth, events),
     }
 }
 
@@ -752,7 +791,7 @@ impl ZcodeHub {
 
     /// 事件泵测试构造 + Data 溢出观察口（验证 lag → 投影失效接线）。
     #[cfg(test)]
-    fn with_pump_and_lag(
+    pub(crate) fn with_pump_and_lag(
         store: DeviceStore,
         backend: Arc<dyn HubBackend>,
         policy: CapabilityView,
@@ -1078,6 +1117,31 @@ impl ZcodeHub {
             self.emit_session(&stale);
         }
         Ok(view)
+    }
+
+    /// 测试专用：把 Hub 标记为「已授权」，复用测试里真实 [`AuthService`] 已取得的
+    /// JWT，**不**再走一次 OAuth（不重复授权、不等待回调）。
+    ///
+    /// 状态落点**逐字段镜像** [`Self::authorize`] 成功分支（`authorized=true`、
+    /// `offline`、清原因与设备标签、广播连接事件并按需降级旧投影），只是不触达
+    /// 后端、不发网络。随后 [`Self::connect`] 仍走真实 relay token + WebSocket 握手。
+    #[cfg(test)]
+    pub(crate) fn mark_authorized_for_test(&self) -> ConnectionView {
+        let (view, stale) = {
+            let mut inner = self.lock();
+            inner.authorized = true;
+            inner.state = ConnectionState::Offline;
+            inner.reason_code = None;
+            inner.device_label = None;
+            let view = inner.view();
+            let stale = inner.stale_session(view.generation);
+            (view, stale)
+        };
+        self.emit_connection(&view);
+        if let Some(stale) = stale {
+            self.emit_session(&stale);
+        }
+        view
     }
 
     /// 建立唯一物理连接（已配对/连接中幂等；`conflict` 为终态，不自动重试）。

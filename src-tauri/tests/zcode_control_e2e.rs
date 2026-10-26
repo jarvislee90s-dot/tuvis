@@ -1296,7 +1296,9 @@ async fn link_change_invalidates_old_pending_and_actions() {
     seed(&conn);
     let (_tmp, home) = read_fixture();
     let state = read_state(&conn, &home);
-    let (hub, official) = paired_hub(&conn, send_policy()).await;
+    // 用全开策略让卡动作走到宿主题型/旧卡判定；本用例证明换链接作废旧 pending，
+    // 不是证明能力闸（能力闸由 #5/#4 的专门用例覆盖）。
+    let (hub, official) = paired_hub(&conn, all_policy()).await;
     state.set_zcode_hub(hub.clone());
     let app = router(state);
 

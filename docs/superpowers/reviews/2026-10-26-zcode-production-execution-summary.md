@@ -1,13 +1,25 @@
 # ZCode 官方桥接生产实施：执行总结（2026-10-26）
 
-> 供独立复审。分支 `codex/zcode-unified-remote`，基线 `8e663f09`，计划/核查文档提交 `06b7f759`，最终 HEAD `c53d8010`。工作树干净；未 push、未合并、未发版、未打 tag；`docs/MASTER-PLAN.md` 零改动。实施方式：subagent-driven-development + TDD，每任务独立实现子代理＋规格/质量审查代理。
+> 供独立复审。分支 `codex/zcode-unified-remote`，基线 `8e663f09`；2026-10-27 复审修复
+> 基线 `90ae20be`，最终代码提交 `ee63d644`（本文档提交紧随其后）。工作树干净；未 push、
+> 未合并、未发版、未打 tag；`docs/MASTER-PLAN.md` 零改动。实施方式：
+> subagent-driven-development + TDD，每任务独立实现子代理＋独立审查代理。
 
 ## 1. 结论（先说不满足的部分）
 
-- **T1.1–T7.2 与 T8.2 的能力门/证据设施：code_complete，自动门禁全绿。**
-- **T8.1：partial（缺口已收窄）。** 约 8 个 Rust e2e 用例与 4 个手机流用例已交付；另新增 **loopback HTTP OAuth/terminal token、WS auth_init/auth_ack、真实 RelayClient 数据回环、真实 BridgeManager bootstrap/workspace-list/workspace-bridge-open** 4 个 wire 用例。仍缺的是 **ready/Initialize/hello/订阅/发送经真实 relay 的成功拼装**：四个 brief 指定用例仍走进程内假体。最终复审将该项列为 Important，**未冒充通过**。
-- **T8.2：code_complete，platform_validated=false，spec_complete=false。** 策略、证据许可、文档与验收表已交付；真实登录/专用会话/Windows 行全部 `blocked/not_run`，未伪造 PASS。普通构建八项控制能力全部关闭。
-- **因此：不满足完整 spec。** 可交付的是“统一 UI＋官方桥接生产链＋按证据开闸的封闭底座”；ZCode 手机控制尚未在真实产品链上开闸。
+- **更正：此前把 T1.1–T7.2 与 T8.2 写成“code_complete”是过早表述。** 准确口径是
+  **代码层完成（code-layer complete）**：自动门禁全绿，但未经真实登录、真实手机、
+  真实 Windows/宿主的平台验收。**platform_validated=false、spec_complete=false 不变。**
+- **T8.1：代码层完成（假服务/回环），真实产品链未验收。** 2026-10-27 复审补齐了
+  **ready/Initialize/hello/订阅/发送经真实 relay 的成功拼装**：新增 4 个全链用例，
+  在回环假官方端上组装真实 `AuthService/RelayClient/codec/BridgeManager/CommandSender/
+  ZcodeHub/router/RemoteState/SSE`，覆盖发送、回执、账本、审计、真实 SSE 与断链重放；
+  另覆盖 rejected/malformed ACK 与默认全关零副作用。**仍未经真实 ZCode 账号/会话实跑。**
+- **T8.2：代码层完成，platform_validated=false，spec_complete=false。** 策略、证据许可、
+  文档与验收表已交付；真实登录/专用会话/Windows 行全部 `blocked/not_run`，未伪造 PASS。
+  普通构建八项控制能力全部关闭。
+- **因此：不满足完整 spec。** 可交付的是“统一 UI＋官方桥接生产链＋按证据开闸的封闭
+  底座＋生产组件假链回归”；ZCode 手机控制尚未在真实产品链上开闸。
 
 ## 2. 任务逐项状态
 
@@ -24,20 +36,20 @@
 | T6 模型/档位         | 完成（门关闭）              | `e93a370e` `10e0f3b8` `4b73fb1c` `37a46ba1`                                                        | 当前 provider、逐模型档位、CAS、无 baseLogEpoch、无恢复；selection 14/command 7                                                                                                                            |
 | T7.1 Hub/HTTP/M11    | 完成                        | `059bbc9e`…`3c2880bc`（11 提交）                                                                   | `hub.rs`、`remote/zcode.rs`、409 旧发送、SSE、Tauri 命令、M11 退役、按设备过滤、隐藏会话 404；remote 25/hub 17                                                                                             |
 | T7.2 统一 UI         | 完成                        | `7e04ef2b`…`503b94ef`（14 提交）                                                                   | DTO/hook/panel、真实回执文案、能力门、19 码 zh/en、设置授权/连接、多选与草稿修复；手机 2343 通过                                                                                                           |
-| T8.1 假服务集成      | **partial（缺口收窄）**     | `feb821ff` `88662f9c` `79721b96` `e7b56a0c` `2ba2fb9b` `3b19c190` `e8f7260f` `baf91164` `26ca7fda` | 进程内 FakeOfficial＋8 Rust e2e＋4 手机流＋A 回归；loopback HTTP 授权/token、WS 握手、真实 RelayClient 数据回环、真实 BridgeManager bootstrap/bridge-open 4 用例；ready/Initialize/hello/订阅/发送仍未覆盖 |
-| T8.2 验收/开闸       | code_complete；live blocked | `2829d35e` `e450bf0e` `981ee02b` `926a250f` `6c7239e4` `f6833952` `049af5e3` `9ef86037`            | 能力策略、debug 许可、release 编译拒绝、验收表、双语手册/CHANGELOG、contract `production` 段                                                                                                               |
+| T8.1 假服务集成      | **代码层完成；真实链未验收** | 前序 + `0ec5d5bc` `3d85d4bb` | 进程内 FakeOfficial＋回环 HTTP/WS 真实组件链；4 个全链用例覆盖 SSE paired、真实 bind/订阅/快照、发送恰一帧、HTTP accepted、账本/审计无正文、真实 session/action SSE、断链重放零新增；rejected/malformed 终态不重发；默认全关 bind 前 409 零副作用。真机/真实账号仍未跑 |
+| T8.2 验收/开闸       | 代码层完成；live blocked    | `2829d35e` `e450bf0e` `981ee02b` `926a250f` `6c7239e4` `f6833952` `049af5e3` `9ef86037`            | 能力策略、debug 许可、release 编译拒绝、验收表、双语手册/CHANGELOG、contract `production` 段；`platform_validated=false`、`spec_complete=false`                                                              |
 
 ## 3. Spec 逐项覆盖
 
 - **产品已可用**：ZCode 看板/正文/文件预览；官方链接保存/替换/删除与严格校验；设置六段顺序、PIN 遮罩、H3/兼容缺键默认 true；ZCode 设置卡的 BigModel 授权/连接/断开/真实状态；手机 ZCode 发送区/问答卡/审批卡/打断/模型控件的统一 UI（能力关时只读并就地说明）。
 - **实现但默认关闭（按证据开闸）**：send、单选/多选/自由文本问答、审批既有卡、打断、模型、思考强度。普通构建 `SessionView.capabilities` 全关；仅 debug+`zcode-bridge-evidence` 构建可逐次发放 120s 单次许可（不绕过目标/权限/fullAccess 守卫）。
-- **尚未实现/未取证**：T8.1 的 ready/Initialize/hello/订阅/发送经真实 relay 的成功拼装（loopback 已覆盖 auth/WS/data/桥 bootstrap 与 bridge-open 请求，四个 brief 用例仍走进程内假体）；产品 UI 真实登录→发送→终态；Windows 构建/实跑；ZAI 实跑；多选/自由文本/打断宿主终态；审批催卡（Tuvis 发送→弹卡）仍为负结果；双手机并发、断线/链接失效、官方页互踢的真机流；`zcode_actions` 保留策略。
+- **尚未实现/未取证（真实产品链）**：T8.1 的回环假链已覆盖 ready/Initialize/hello/订阅/发送经真实 relay 的成功拼装，但**真实 ZCode 账号/会话/手机**的登录→发送→终态仍未跑；Windows 构建/实跑；ZAI 实跑；多选/自由文本/打断宿主终态；审批催卡（Tuvis 发送→弹卡）仍为负结果；双手机并发、断线/链接失效、官方页互踢的真机流；`zcode_actions` 保留策略。
 
 ## 4. 最终接口与计划差异
 
 | 差异                                                                                               | 原因/源码依据                                                                                      | 影响                                          |
 | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| `HubBackend` 测试端口；`RelaySink`/`CommandPort`/`PendingPort`/`StopPort`/`SelectionPort` 窄 trait | 避免每个测试起真实 WS/桥；生产均以真实组件实现                                                     | 接口可替换，但 T8.1 因此停在端口边界          |
+| `HubBackend` 测试端口；`RelaySink`/`CommandPort`/`PendingPort`/`StopPort`/`SelectionPort` 窄 trait | 避免每个测试起真实 WS/桥；生产均以真实组件实现                                                     | 接口可替换；T8.1 已用回环全链覆盖真实组件，真实产品链仍待验收 |
 | `BoundTarget.bridge_generation`（内部）＋公开 Hub `generation`                                     | 桥投影代际与配置代际从首连即分叉；真实动作曾全判 stale                                             | 已修；公开回执/手机只用 Hub 代际              |
 | `CapabilityPolicy` 未知宿主基线＋证据许可并不能直接开闸                                            | 无真实产品证据不得填 true                                                                          | 普通构建全关；debug 许可逐次                  |
 | 设置卡改用 `src/lib/api/zcodeControl.ts` 单一 DTO                                                  | 消除本地重复 `ConnectionState/View`                                                                | 已对齐                                        |
@@ -90,20 +102,51 @@
 
 - **B 包三轮复审（历史）**：ACK≠终态、审批催卡负结果、问答形态、token 一次性、逐模型档位、恢复语义、脱敏、stop 绑定新执行、初始 control 门——均已在探针/合同修复。
 - **本批逐任务复审**：T1.1 epoch 竞态 2 轮；T1.2 所有权/liveness 1 轮；T2.1 逻辑/物理限额 1 轮；T2.2 fragment/失效/工作区 3 轮；T3 20s ACK/ exactly-once/审计 1 轮；T4.1 snooze noop/inflight/目标作用域 1 轮；T4.2 控制等待/kind 2 轮；T5 snooze/尾部/回放 1 轮；T6 回放/hash/fallback 1 轮；T7.1 generation/事件/隐藏会话 2 轮；T7.2 门控/DTO/官方页/i18n/actionId/SSE/多选/草稿多轮。
-- **最终复审**：Rust 0 Critical；已修 I-A（策略/许可经 `SessionView.capabilities` 下发）与 I-C（宿主证据源缺口入 contract）；**I-B 已收窄**：loopback HTTP 授权/token、WS 握手、真实 RelayClient 数据回环、真实 BridgeManager bootstrap/bridge-open 已交付；ready/Initialize/hello/订阅/发送经真实 relay 的拼装仍未覆盖。UI 0 合并阻断；多选/草稿已修。
+- **最终复审**：Rust 0 Critical；已修 I-A（策略/许可经 `SessionView.capabilities` 下发）与 I-C（宿主证据源缺口入 contract）；**I-B 已由 2026-10-27 复审闭环**：ready/Initialize/hello/订阅/发送经真实 relay 的拼装已在回环假官方链上覆盖（`3d85d4bb`）。UI 0 合并阻断；多选/草稿已修。
+- **2026-10-27 独立复审修复（12 项，基线 `90ae20be`）**：物理分片去重 `b94be0e0`；Hub
+  Data→Session 事件 `0d36d516`；幂等前置 `0b5e5dda`；断链意图/清理 `89c61231`；
+  relay 队列 State 必达/Data lag 失效 `ba43b6f7`；宿主证据策略源 `de25937e`；同代
+  paired 刷新 `5c531b17`；问答选项/文本互斥 `10080c13`；设置卡轮询 `1a0453c1`；宿主
+  题型能力闸 `955b380d`；snooze 限定绑定 `d8d92fa5`；生产假链 `3d85d4bb`。每项独立
+  审查，门禁见第 11 节。
 - **剩余阻塞/待裁决**：
-  1. T8.1 桥/发送经真实 relay 的成功拼装（loopback auth/WS/data 已交付；四个 brief 用例仍为进程内假体）。
+  1. 真实产品链验收（真实 ZCode 登录/专用会话/手机收发/Windows）；回环假链已闭环。
   2. T8.2 真机/平台验收（用户登录、专用会话、Windows）。
   3. 审批催卡负结果未消除（approval 保持关闭）。
   4. 多选/自由文本/打断终态、ZAI、双手机、链接失效、官方页互踢未实跑。
-  5. 次要：SSE 在会话隐藏后仍开、`zcode_actions` 无保留策略、`with_parts` release 可见、部分 UI 残项。
+  5. 次要：SSE 在会话隐藏后仍开、`zcode_actions` 无保留策略、`with_parts` release 可见、部分 UI 残项、事件泵能力回落未接实时策略源。
 
 ## 10. 合规与最小协助请求
 
 - 未 push、未合并、未发版、未打 tag；`docs/MASTER-PLAN.md` 未改；真实链接/SID/JWT/正文未入库；真实账号凭据仅在用户浏览器与本机内存。
-- **满足完整 spec？否。** 当前是 code_complete 的封闭底座；platform_validated/spec_complete 均未达成。
+- **满足完整 spec？否。** 当前是**代码层完成、未经平台验证**的封闭底座；
+  **platform_validated=false、spec_complete=false 均未达成**；此前 `code_complete`
+  表述已按 2026-10-27 复审口径更正。
 - 需用户本人完成的最小动作（之后 Agent 可继续 T8.2）：
   1. 在 debug 验收构建（`pnpm tauri dev --features hook-listener,zcode-bridge-evidence`）完成 BigModel 官方登录/配对并连接；
   2. 指定一个专用测试工作区/会话（当前约定 Travel/「hi」）与允许的真实动作范围；
   3. 提供 Mac 真机与 Windows 运行环境；ZAI 若要标支持需单独实跑；
   4. 审批催卡需用户亲发 guarded 消息触发；若仍不弹卡，保持 approval 关闭并记录负结果。
+
+## 11. 2026-10-27 复审修复门禁（实测证据）
+
+- **范围**：`90ae20be..ee63d644`（12 项修复 + 文档/测试夹具提交）；逐项 RED→GREEN→
+  独立审查；每项提交见修复计划 `docs/superpowers/plans/2026-10-27-zcode-review-fix-plan.md`。
+- **Rust 单测**：普通 `cargo test --lib --features marker-helper` **3300 passed / 0 failed /
+  38 ignored**；证据构建 `--features marker-helper,zcode-bridge-evidence`
+  **3319 passed / 0 failed / 38 ignored**。
+- **Rust 集成**：`cargo test --features marker-helper` 与
+  `cargo test --features marker-helper,zcode-bridge-evidence` 全部套件 0 failed
+  （含 `zcode_control_e2e` 8/8、`zcode_control_remote` 25/25、全链 4 例；后两者为
+  2026-10-27 新增/修正夹具）。
+- **静态门禁**：`cargo fmt --check` 0；普通与证据构建
+  `cargo clippy --all-targets ... -- -D warnings` 0；`cargo check --all-targets` 0。
+- **前端**：`pnpm test` **194 files / 2349 passed / 5 skipped / 0 failed**；
+  `pnpm check`（format/lint/i18n/error-codes/build）0；`pnpm build:mobile` 0。
+- **未做（按要求留待用户在场）**：真实 ZCode 登录/配对/连接、真实手机收发、Windows
+  实跑、真实问答/审批/打断终态、真机 SSE/断链。**platform_validated=false、
+  spec_complete=false**；`code_complete` 已改为“代码层完成”。
+- **已知非阻塞风险**：事件泵在 `last_session` 缺失/异会话时回落 `CapabilityView::default()`
+  （未接实时策略源）；`host_evidence()` 每次读 Info.plist（小文件同步读）；旧公开
+  `snooze_interaction` 全量绑定入口无生产调用；`mark_authorized_for_test` 与生产
+  authorize 落定逻辑重复；accepted 回执的 proof 仍非终态（ACK≠终态）。
