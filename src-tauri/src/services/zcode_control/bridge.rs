@@ -407,6 +407,10 @@ struct Bridge {
     listener: Option<Listener>,
     /// 最近一次入站物理 `seq`（`None` = 尚未绑定，首帧任意）。
     last_seq: Option<u64>,
+    /// 最近一次入站的逻辑消息号 `messageSeq`。同一逻辑消息的全部物理分片共享
+    /// 该值（只有物理 `seq` 逐片递增），因此水位只能用于丢弃**严格更旧**的
+    /// 消息；同值必须交给 [`FrameAssembler`] 按 `(messageSeq, fragmentIndex)`
+    /// 去重/组装，否则首片之后的物理分片会被整条丢弃。
     last_message_seq: u64,
 }
 
@@ -2523,7 +2527,14 @@ impl Inner {
                     gap = true;
                 }
             }
-            if message_seq <= bridge.last_message_seq {
+            // `messageSeq` 是**逻辑消息号**：一条逻辑消息可拆成多条物理帧下发，
+            // 全部共享同一 `messageSeq`，只有物理 `seq` 递增。只有严格更旧的消息
+            // 才是重复/迟到；同值必须放行给 `FrameAssembler`（它按
+            // `(messageSeq, fragmentIndex)` 指纹去重与组装），否则首片之后的
+            // 物理分片会被整条丢弃。物理 `seq` 的重复/缺口由上面的 `seq` 检查
+            // 拦截；同一 `messageSeq` 换新 `seq` 的重传帧由 `FrameAssembler`
+            // 的分片指纹去重。
+            if message_seq < bridge.last_message_seq {
                 return Ok(());
             }
         }
@@ -4643,6 +4654,132 @@ mod tests {
         assert!(stats.fragments_reassembled >= 1);
         assert_eq!(stats.fragment_faults, 0);
         assert_eq!(stats.resyncs, 0);
+    }
+
+    /// 物理层回归（复审 #1）：同一条逻辑消息的所有物理分片共享 `messageSeq`，
+    /// 只有物理 `seq` 逐片递增。旧实现把「`messageSeq` 不大于水位」整帧丢弃，
+    /// 且首片到达就推进水位 → 第二片起被误判为重复，整条消息永远无法重组。
+    #[tokio::test]
+    async fn physical_fragments_sharing_message_seq_are_both_delivered() {
+        const SUBSCRIPTION: &str = "conv-sub-synthetic-1";
+        let config = PeerConfig {
+            // 初始 bind 不下发快照：下面手工注入一条完整的物理分片消息。
+            conversation_snapshot: None,
+            ..single_workspace_config()
+        };
+        let (manager, peer) = manager_with(config).await;
+        manager.bind(&key(SESSION_A)).await.expect("bind");
+        let bridge = peer.session_bridge_id(SESSION_A);
+        let listen = peer.listen_id(&bridge);
+        let topic = format!("{CONVERSATION_TOPIC_PREFIX}{SESSION_A}");
+
+        // 完整 logical snapshot（revision=42，带一张权限卡）。
+        let wire = test_wire(
+            &topic,
+            SUBSCRIPTION,
+            json!({
+                "kind": "snapshot",
+                "snapshot": conversation_snapshot(
+                    SESSION_A,
+                    42,
+                    vec![permission_card("pi-physical-frag-1")],
+                ),
+            }),
+        );
+        // 一条 Channel 消息 = 一条逻辑消息，在**物理层**按字节切成两片：
+        // 两片共享 messageSeq，fragmentIndex 0/1，物理 seq 连续递增。
+        let channel = channel_message(json!([RESPONSE_TYPE_EVENT_FIRE, listen]), &wire);
+        assert!(
+            channel.len() > 1,
+            "fixture must split into two non-empty chunks"
+        );
+        let split = (channel.len() / 2).max(1);
+        let chunks = [&channel[..split], &channel[split..]];
+
+        // 取桥当前已见水位：两片都必须严格大于它（否则会被物理 seq 去重挡掉）。
+        let (seq_base, message_seq) = {
+            let inner = lock(&manager.shared.state);
+            let bridge_state = inner.bridges.get(&bridge).expect("bridge registered");
+            (
+                bridge_state.last_seq.unwrap_or(0),
+                bridge_state.last_message_seq.saturating_add(1),
+            )
+        };
+        let template = encode_frame(
+            &RpcIdentity::new(&bridge),
+            seq_base + 1,
+            message_seq,
+            &channel,
+        )
+        .expect("encode physical frame");
+        let mut payloads = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut payload = template.clone();
+            payload["seq"] = json!(seq_base + 1 + index as u64);
+            payload["fragmentIndex"] = json!(index);
+            payload["fragmentCount"] = json!(2);
+            payload["messageBytes"] = json!(channel.len());
+            payload["checksum"]["value"] = json!(crc32_hex(&channel));
+            payload["dataBase64"] = json!(base64::engine::general_purpose::STANDARD.encode(chunk));
+            payloads.push(payload);
+        }
+
+        // 该逻辑消息（同桥同 messageSeq）的 ACK 计数：一条逻辑消息只允许一次。
+        let acks = |peer: &Peer| {
+            peer.sent()
+                .into_iter()
+                .filter(|payload| {
+                    payload.get("zcode_type").and_then(Value::as_str) == Some("rpc-frame-ack")
+                        && payload.get("bridgeSessionId").and_then(Value::as_str)
+                            == Some(bridge.as_str())
+                        && payload.get("ackMessageSeq").and_then(Value::as_u64) == Some(message_seq)
+                })
+                .count()
+        };
+
+        // 第一片只进入物理重组：半条消息绝不进册，也不得 ACK。
+        manager
+            .on_data(payloads[0].clone())
+            .await
+            .expect("first physical fragment accepted");
+        assert!(
+            !manager.peek_view(SESSION_A).expect("bound").ready,
+            "half a logical message must not be ready"
+        );
+        // 让出若干次：若实现错误地对首片发 ACK，必须在这里可见。
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(acks(&peer), 0, "half a logical message must not be acked");
+
+        // 第二片共享同一 messageSeq：旧实现会在这里静默丢弃。
+        manager
+            .on_data(payloads[1].clone())
+            .await
+            .expect("second physical fragment accepted");
+        let view = manager.peek_view(SESSION_A).expect("bound");
+        assert!(view.ready, "both physical fragments must be reassembled");
+        assert_eq!(view.revision, Some(42));
+        assert_eq!(view.pending.len(), 1);
+        assert_eq!(view.pending[0].interaction_id, "pi-physical-frag-1");
+
+        // 先等第一条 ACK 出现，再留稳定窗：若误发第二条（例如首片也 ACK），
+        // 它必须在稳定窗内到达并被下面的精确计数抓住。
+        wait_until(|| acks(&peer) >= 1, "logical message ack").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            acks(&peer),
+            1,
+            "one logical message must be acked exactly once"
+        );
+        assert_eq!(
+            manager
+                .session_stats(SESSION_A)
+                .expect("stats")
+                .fragment_faults,
+            0,
+            "sharing messageSeq is not a fragment fault"
+        );
     }
 
     #[tokio::test]
