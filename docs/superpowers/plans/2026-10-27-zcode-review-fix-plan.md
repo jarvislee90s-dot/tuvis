@@ -39,7 +39,7 @@
 | 8 | 一般 | 已审已提交 `ba43b6f7` | relay 状态/数据事件用 `try_send` 静默丢（`relay.rs:609,698,729,742`）；Data 丢失无显式失效，GET 可能继续读旧投影 | State 终态-critical：满队时 `send().await` 无超时（不丢，承认可能阻塞 Data/心跳）；Data 保持 `try_send`，满队置 `RelayLag` 唤醒 Hub；Hub 作废桥投影、降级 `last_session`、GET 重新 bind | State 队列满→disconnect 背压且 Offline 必达；Data burst→lag 置位、actor 不卡；Hub lag→invalidate+ready=false；旧 bridgeSessionId 迟到帧不复活 |
 | 9 | 一般 | 待修 | 问答 UI 的选中值与自由文本互不清除（`ZcodeControlPanel.tsx:231-235,307-343`），同题同时提交两类答案 | 选选项清同题 freeText/sensitiveRef；输入自由文本清同题 picked；敏感引用同步清理 | 先选后输入/先输入后选，提交只含一类答案；敏感输入切换后旧值不提交 |
 | 10 | 一般 | 待修 | 设置卡只在挂载与按钮操作后 `refreshConnection`（`ZcodeRemoteSettingsCard.tsx:147-150,177-200`），无异步状态源 | 挂载期间轮询/焦点或可见性刷新连接态；不改变按钮语义 | 外部进入 paired/offline/conflict 后卡片在有限时间内更新，重连按钮恢复可用 |
-| 11 | 交付缺口 | 待修 | Hub 固定未知宿主常量（`hub.rs:47-53,688-699`），`CapabilityPolicy::for_host` 无运行时输入；`session_capabilities` 与实际执行门各用一套策略 | 采集 wire 协议/hello/schema（桥握手）＋宿主 build（本地来源）；统一策略源同时供 session 能力矩阵与执行门（含 CommandSender） | 合成宿主证据进入后，策略构造函数被实际调用；未知/升级仍全关 |
+| 11 | 交付缺口 | 已审已提交 `de25937e` | Hub 固定未知宿主常量（`hub.rs:47-53,688-699`），`CapabilityPolicy::for_host` 无运行时输入；`session_capabilities` 与实际执行门各用一套策略 | 新增 `HostEvidence`/`HostBuildProbe`；macOS 读 Info.plist build（非 macOS None）；桥在 hello 校验/有效 schema 应用后置位、invalidate 清零；`PartsBackend` 单一 `CapabilitySource` 同喂 Hub 矩阵/闸与 CommandSender（现算）；删除未知宿主硬编码 | bridge 证据置位/清零/坏帧不置位；Hub 动态 source 翻转时矩阵与 execute 同步；CommandSender 审批闸现算；plist 解析；3 条行为 RED |
 | 12 | 交付缺口 | 待修 | T8.1 缺完整生产假链：现有 loopback 只到 auth/WS/data/bridge bootstrap/ready-hello；无 CommandSender send/回执/审计经 Hub+HTTP | 在 loopback 假官方端上组装真实 `AuthService/RelayClient/codec/BridgeManager/CommandSender/Hub/HTTP`，跑通发送、回执、审计与关键失败 | 成功链 + 幂等重试/能力关闭/断线/溢出等失败场景（不手推 SSE、不改结果变量） |
 
 ### 未提交补测的处置
@@ -88,3 +88,8 @@
   不实、Hub GET 断言假阳性 → 修正文档、换真实断言、补 Closed 与旧桥帧用例 →
   scoped re-review 可提交（2 Minor 注释已修）→ relay 37/0、hub 30/0、bridge 50/0；
   提交 `ba43b6f7`。
+- #11 宿主证据：实现先行被要求补 3 条行为 RED（矩阵回旧全关、sender 回静态默认、
+  证据回固定未知）→ 全部复现并还原；审查指出非 macOS 非 test 构建 unused_import 会
+  让 CI clippy -D warnings 红 → 加 cfg 后 bridge 53/0、hub 31/0、command 89/0、
+  types 7/0、host 4/0、cargo check --all-targets 0 → 提交 `de25937e`。事件泵能力回落
+  与“生产装配同 source”断言记为 Minor。
