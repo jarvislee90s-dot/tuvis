@@ -67,7 +67,7 @@ function connection(state: ConnectionState = "paired"): ConnectionView {
   };
 }
 
-function sessionView(): SessionView {
+function sessionView(overrides: Partial<SessionView> = {}): SessionView {
   return {
     sessionId: SID,
     generation: GEN,
@@ -77,7 +77,15 @@ function sessionView(): SessionView {
     control: { activeWorks: [] },
     selection: null,
     capabilities: capabilities(),
+    ...overrides,
   };
+}
+
+/** 残缺 DTO：整个 control 键缺失（守卫只要求 sessionId/generation/ready）。 */
+function sessionWithoutControl(): SessionView {
+  const view = sessionView();
+  delete (view as Partial<SessionView>).control;
+  return view;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -301,3 +309,137 @@ function ledgerPosts(): unknown[] {
       String(input) === ZCODE_ACTIONS_PATH && (init as RequestInit | undefined)?.method === "POST"
   );
 }
+
+/** 已发生的动作 POST 请求体（零写断言与「stop 不夹带 sendText」取证）。 */
+function postedActions(): ActionPostBody[] {
+  return fetchMock.mock.calls
+    .filter(
+      ([input, init]) =>
+        String(input) === ZCODE_ACTIONS_PATH && (init as RequestInit | undefined)?.method === "POST"
+    )
+    .map(([, init]) => JSON.parse(String((init as RequestInit).body)) as ActionPostBody);
+}
+
+describe("ZCode 生产流：初始 control 缺失时零 stop 触发", () => {
+  it("no_initial_control_timeout_zero_stop_and_no_trigger", async () => {
+    // 初始 control 的三种不可用形态：显式 null / 整个键缺失 / 会话读取超时。
+    // 三者都不得被猜成打断目标：不渲染可点的打断入口，任何点击零动作 POST。
+    const shapes: Array<{ label: string; session: SessionView | "timeout" }> = [
+      { label: "control-null", session: sessionView({ control: null }) },
+      { label: "control-missing", session: sessionWithoutControl() },
+      { label: "session-timeout", session: "timeout" },
+    ];
+
+    for (const shape of shapes) {
+      installFetch((url) => {
+        if (url === ZCODE_CONNECTION_PATH) return json(connection());
+        if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+          if (shape.session === "timeout") return Promise.reject(new Error("timeout"));
+          return json(shape.session);
+        }
+        if (url.includes("/official-control")) return json({ configState: "missing", url: null });
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+
+      const view = render(<ZcodeControlPanel sessionId={SID} />);
+      const panel = await screen.findByTestId("zcode-control-panel");
+      await waitFor(() => expect(panel.getAttribute("data-connection-state")).toBe("paired"));
+
+      if (shape.session === "timeout") {
+        // 超时按 offline 如实申报（不装成「控制可用」）。
+        await waitFor(() =>
+          expect(screen.getByTestId("zcode-control-reason").getAttribute("data-reason-code")).toBe(
+            "offline"
+          )
+        );
+      } else {
+        await waitFor(() => expect(screen.getByTestId("zcode-send")).toBeEnabled());
+      }
+
+      // 没有确认过的前台执行 = 没有打断入口（绝不随取/猜测 stop 目标）。
+      const interrupt = screen.queryByTestId("zcode-interrupt");
+      expect(interrupt, `${shape.label}: interrupt must not be rendered`).toBeNull();
+      if (interrupt !== null) fireEvent.click(interrupt);
+
+      // 发送面同样零写：空草稿点击不产生动作。
+      fireEvent.click(screen.getByTestId("zcode-send"));
+      await act(async () => {});
+
+      const actions = postedActions();
+      expect(actions, `${shape.label}: zero action POSTs`).toHaveLength(0);
+      expect(actions.filter(({ action }) => action.kind === "stop")).toHaveLength(0);
+      // stop 绝不夹带 sendText：本场景连 send 动作都不允许出现。
+      expect(actions.filter(({ action }) => action.kind === "send")).toHaveLength(0);
+      expect(legacySendCalls()).toBe(0);
+      view.unmount();
+    }
+  });
+});
+
+describe("ZCode 生产流：SSE lag 先纠偏 GET 再放写", () => {
+  it("sse_lag_resyncs_before_next_write", async () => {
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    // 宿主投影：lag 前 ready=true 且有唯一 primaryTurn；lag 后同一目标仍在，
+    // 但投影退回 ready=false（relay 掉线 / stale_session）——写面必须随之关闭。
+    let ready = true;
+    let revision = 12;
+    const control = { activeWorks: [{ kind: "primaryTurn", foregroundExecutionId: "E1" }] };
+    const ledger = actionLedger();
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(sessionView({ ready, revision, control }));
+      }
+      if (url.includes("/official-control")) return json({ configState: "missing", url: null });
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        return handleActionPost(ledger, init);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const initialInterrupt = (await screen.findByTestId("zcode-interrupt")) as HTMLButtonElement;
+    await waitFor(() => expect(initialInterrupt).toBeEnabled());
+
+    const connectionGets = () => calledUrls().filter((url) => url === ZCODE_CONNECTION_PATH).length;
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    const connectionGetsBefore = connectionGets();
+    const sessionGetsBefore = sessionGets();
+
+    // 事件流 lag：中间事件已丢，宿主已退回未就绪，手机侧尚未读到。
+    ready = false;
+    revision = 13;
+    await act(async () => {
+      MockEventSource.latest().emit("resync", { reason: "lag" });
+      await Promise.resolve();
+    });
+
+    // 只读纠偏：连接 + 会话各重拉一次 GET（lag 不得被当成写信号）。
+    await waitFor(() => expect(connectionGets()).toBe(connectionGetsBefore + 1));
+    await waitFor(() => expect(sessionGets()).toBe(sessionGetsBefore + 1));
+
+    // 纠偏落地 ready=false：打断入口仍在（目标仍存在）但禁用并申报 not_ready。
+    const interrupt = (await screen.findByTestId("zcode-interrupt")) as HTMLButtonElement;
+    await waitFor(() => expect(interrupt).toBeDisabled());
+    expect(screen.getByTestId("zcode-interrupt-reason").getAttribute("data-reason-code")).toBe(
+      "not_ready"
+    );
+
+    // ready=false 期间：点击打断 / 发送零动作 POST（写面硬门先于任何写）。
+    fireEvent.click(interrupt);
+    fireEvent.change(screen.getByTestId("zcode-draft"), { target: { value: "lag 后草稿" } });
+    fireEvent.click(screen.getByTestId("zcode-send"));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    expect(ledger.posts).toHaveLength(0);
+    expect(postedActions().filter(({ action }) => action.kind === "stop")).toHaveLength(0);
+    expect(postedActions().filter(({ action }) => action.kind === "send")).toHaveLength(0);
+    expect(legacySendCalls()).toBe(0);
+    // 草稿不被吞：写面关闭不是清空用户输入。
+    expect(screen.getByTestId("zcode-draft")).toHaveValue("lag 后草稿");
+  });
+});
