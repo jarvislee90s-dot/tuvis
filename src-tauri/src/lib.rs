@@ -429,6 +429,10 @@ pub fn run() {
         commands::zcode_remote::zcode_control_connect,
         commands::zcode_remote::zcode_control_disconnect,
         commands::zcode_remote::zcode_control_status,
+        // T8.2 仅 debug 证据构建：桌面发放单次验收许可（普通构建不编入本命令，
+        // generate_handler 对条目上的 cfg 属性生效；手机侧无对应 HTTP 入口）。
+        #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+        commands::zcode_remote::zcode_control_arm_evidence,
     ]);
 
     // 仅 release 构建注册 updater（评审 I3 修正，2026-10-08）：

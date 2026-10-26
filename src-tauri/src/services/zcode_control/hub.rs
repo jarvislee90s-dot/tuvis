@@ -36,6 +36,9 @@ use super::types::{
 };
 use crate::remote::pairing::DeviceStore;
 
+#[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+use super::evidence::{EvidencePermit, EvidencePermitStore};
+
 /// Hub 广播缓冲（事件只做通知，缺口由消费方重 GET 兜底）。
 const EVENT_CAPACITY: usize = 64;
 /// relay→Hub 事件泵队列（满时 relay 侧丢事件；Data 丢失由上层超时/重试兜底）。
@@ -77,6 +80,23 @@ pub trait HubBackend: Send + Sync {
         target: &'a BoundTarget,
         action: &'a ControlAction,
     ) -> BoxFuture<'a, ZResult<ActionReceipt>>;
+
+    /// 带**验收许可**的派发（T8.2 debug 证据构建专用；普通构建永远不会传入非空
+    /// `permits`）。默认实现忽略许可并退回 [`Self::execute`]，保持既有 fake 零改动。
+    ///
+    /// `permits` 只含 Hub 已按会话/代际/能力校验并消费过的能力名；实现方只允许用
+    /// 它放宽**能力闸**一项，目标/权限 option kind/`fullAccess`/pending/stop 等守卫
+    /// 必须原样执行。
+    fn execute_with_permits<'a>(
+        &'a self,
+        ctx: &'a ActionContext,
+        target: &'a BoundTarget,
+        action: &'a ControlAction,
+        permits: &'a [&'a str],
+    ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
+        let _ = permits;
+        self.execute(ctx, target, action)
+    }
 
     /// 本后端的证据能力矩阵（生产默认全关）。
     fn policy(&self) -> CapabilityView;
@@ -213,6 +233,20 @@ impl HubBackend for PartsBackend {
         action: &'a ControlAction,
     ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
         Box::pin(async move { self.sender.execute(ctx, target, action).await })
+    }
+
+    fn execute_with_permits<'a>(
+        &'a self,
+        ctx: &'a ActionContext,
+        target: &'a BoundTarget,
+        action: &'a ControlAction,
+        permits: &'a [&'a str],
+    ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
+        Box::pin(async move {
+            self.sender
+                .execute_with_permits(ctx, target, action, permits)
+                .await
+        })
     }
 
     fn policy(&self) -> CapabilityView {
@@ -417,6 +451,9 @@ pub struct ZcodeHub {
     inner: Arc<Mutex<Inner>>,
     /// 连接单飞：并发 `connect` 只让一个真正开始新连接，其余复用当前视图。
     connect_lock: AsyncMutex<()>,
+    /// T8.2 debug 证据构建的单次验收许可册（进程内存；不落 settings/DB）。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    evidence: EvidencePermitStore,
 }
 
 impl ZcodeHub {
@@ -483,6 +520,8 @@ impl ZcodeHub {
                 last_session: None,
             })),
             connect_lock: AsyncMutex::new(()),
+            #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+            evidence: EvidencePermitStore::new(),
         };
         let configured = hub.read_configured();
         {
@@ -610,6 +649,31 @@ impl ZcodeHub {
     /// 本 Hub 的能力矩阵（默认全关）。
     pub fn policy(&self) -> &CapabilityView {
         &self.policy
+    }
+
+    /// T8.2 **仅 debug 证据构建**：桌面发放一条单次验收许可（唯一发放入口）。
+    ///
+    /// 只登记进程内存（不写 settings/DB/日志）；空会话、未知能力名一律
+    /// `invalid_action`，非当前代际一律 `stale_generation`（发放了也永远不会命中）。
+    /// 手机侧没有对应 HTTP 入口，只能经桌面 IPC 调用本方法。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    pub fn arm_evidence(
+        &self,
+        session_id: &str,
+        generation: u64,
+        capability: &str,
+    ) -> ZResult<EvidencePermit> {
+        let capability = capability.trim();
+        if session_id.trim().is_empty()
+            || capability.is_empty()
+            || !super::evidence::is_known_capability(capability)
+        {
+            return Err(ZcodeError::of(codes::INVALID_ACTION));
+        }
+        if generation != self.lock().generation {
+            return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        Ok(self.evidence.arm(session_id, generation, capability))
     }
 
     /// 走官方授权。成功后仍需显式 [`Self::connect`]（不自动连接）。
@@ -835,7 +899,9 @@ impl ZcodeHub {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
         self.control_generation()?;
-        self.check_policy(&action)?;
+        // 能力闸：返回本次动作凭**验收许可**放宽的能力名（普通构建恒为空）。
+        // 许可在通过闸门时即原子消费——一次动作一条，第二个动作回到 needs_evidence。
+        let permits = self.check_policy(&action)?;
         let key = TargetKey {
             session_id: action.session_id().to_owned(),
         };
@@ -846,7 +912,10 @@ impl ZcodeHub {
         }
         // CommandSender 只认公开代际（校验/落账/回执）；桥投影代际留在目标内部。
         let target = public_target(target, generation);
-        let mut receipt = self.backend.execute(&ctx, &target, &action).await?;
+        let mut receipt = self
+            .backend
+            .execute_with_permits(&ctx, &target, &action, &permits)
+            .await?;
         // 公开代际唯一：回执盖本次校验过的 Hub 代际（CommandSender 用公开代际
         // 校验/落账，桥投影代际只在目标内部）。
         // 若执行在途发生了换代，回执仍是旧代际——客户端据 connection 发现并重取。
@@ -884,12 +953,38 @@ impl ZcodeHub {
     }
 
     /// 能力闸：未开闸 → 冻结原因码（默认 `needs_evidence`），零绑定零执行。
-    fn check_policy(&self, action: &ControlAction) -> ZResult<()> {
-        let flags: Vec<&super::types::CapabilityFlag> = match action {
-            ControlAction::Send { .. } => vec![&self.policy.send],
-            // snooze 只暂停本机卡的自动结束计时，无语义能力位。
-            ControlAction::Snooze { .. } => return Ok(()),
-            ControlAction::Answer { answers, .. } => {
+    ///
+    /// T8.2 证据构建：能力被策略关闭时，若存在**匹配本次会话/代际/能力**的有效许可，
+    /// 恰好放行这一次动作并原子消费（answer/permission 走 snooze 绑题消费）；返回
+    /// 被许可放宽的能力名，供 `CommandSender` 的同级闸放行同一动作。普通构建没有
+    /// 许可册，能力关闭即拒绝，行为与旧版完全一致。
+    fn check_policy(&self, action: &ControlAction) -> ZResult<Vec<&'static str>> {
+        let mut required: Vec<(&'static str, &super::types::CapabilityFlag, Option<&str>)> =
+            Vec::new();
+        match action {
+            ControlAction::Send { .. } => required.push(("send", &self.policy.send, None)),
+            // snooze 只暂停本机卡的自动结束计时，无语义能力位；它是许可的一次
+            // **辅助**操作：首次 snooze 把本会话/本代际的许可绑到该题，不消费。
+            ControlAction::Snooze { interaction_id, .. } => {
+                #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+                {
+                    let _ = self.evidence.snooze_interaction(
+                        action.session_id(),
+                        action.generation(),
+                        interaction_id,
+                    );
+                }
+                #[cfg(not(all(feature = "zcode-bridge-evidence", debug_assertions)))]
+                {
+                    let _ = interaction_id;
+                }
+                return Ok(Vec::new());
+            }
+            ControlAction::Answer {
+                interaction_id,
+                answers,
+                ..
+            } => {
                 let free = answers.iter().any(|answer| {
                     answer
                         .free_text
@@ -899,30 +994,69 @@ impl ZcodeHub {
                 let multi = answers
                     .iter()
                     .any(|answer| answer.selected_values.len() > 1);
-                vec![if free {
-                    &self.policy.free_text
+                let (name, flag) = if free {
+                    ("free_text", &self.policy.free_text)
                 } else if multi {
-                    &self.policy.multi_select
+                    ("multi_select", &self.policy.multi_select)
                 } else {
-                    &self.policy.single_select
-                }]
+                    ("single_select", &self.policy.single_select)
+                };
+                required.push((name, flag, Some(interaction_id)));
             }
-            ControlAction::Permission { .. } => vec![&self.policy.approval_reply],
-            ControlAction::Stop { .. } => vec![&self.policy.interrupt],
+            ControlAction::Permission { interaction_id, .. } => required.push((
+                "approval_reply",
+                &self.policy.approval_reply,
+                Some(interaction_id),
+            )),
+            ControlAction::Stop { .. } => {
+                required.push(("interrupt", &self.policy.interrupt, None))
+            }
             ControlAction::Selection { .. } => {
-                vec![&self.policy.model, &self.policy.thought_level]
-            }
-        };
-        for flag in flags {
-            if !flag.enabled {
-                let code = flag
-                    .reason_code
-                    .clone()
-                    .unwrap_or_else(|| codes::NEEDS_EVIDENCE.to_owned());
-                return Err(ZcodeError { code });
+                required.push(("model", &self.policy.model, None));
+                required.push(("thought_level", &self.policy.thought_level, None));
             }
         }
-        Ok(())
+        #[cfg_attr(
+            not(all(feature = "zcode-bridge-evidence", debug_assertions)),
+            allow(unused_mut)
+        )]
+        let mut permitted: Vec<&'static str> = Vec::new();
+        #[cfg_attr(
+            not(all(feature = "zcode-bridge-evidence", debug_assertions)),
+            allow(unused_variables)
+        )]
+        for (capability, flag, interaction_id) in required {
+            if flag.enabled {
+                continue;
+            }
+            #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+            {
+                // 许可只放宽「能力闸」一项：会话/代际/能力/绑题必须全部匹配；
+                // 已 snooze 绑题的许可只能由该题的最终 answer/permission 消费。
+                let matched = match interaction_id {
+                    Some(interaction_id) => self.evidence.consume_answer(
+                        action.session_id(),
+                        action.generation(),
+                        capability,
+                        interaction_id,
+                    ),
+                    None => {
+                        self.evidence
+                            .consume(action.session_id(), action.generation(), capability)
+                    }
+                };
+                if matched {
+                    permitted.push(capability);
+                    continue;
+                }
+            }
+            let code = flag
+                .reason_code
+                .clone()
+                .unwrap_or_else(|| codes::NEEDS_EVIDENCE.to_owned());
+            return Err(ZcodeError { code });
+        }
+        Ok(permitted)
     }
 
     /// 失败收口：代际未变才写状态并广播；旧代际失败一律 `stale_generation`。
@@ -1623,6 +1757,144 @@ mod tests {
             .unwrap_err();
         assert!(err.is(codes::NEEDS_EVIDENCE));
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // T8.2 debug 证据许可：桌面发放 → 手机恰好一次动作 → 闸门重新关闭。
+    // 普通构建（无 feature）不编入这些用例。
+    // ---------------------------------------------------------------------
+
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    async fn paired_hub_closed(fake: Arc<FakeBackend>) -> Arc<ZcodeHub> {
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        hub
+    }
+
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    const EVIDENCE_SESSION: &str = "sess_synthetic0000";
+
+    /// 一次许可恰放行一次动作；第二个动作、其他会话、旧代际都回到原闸。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    #[tokio::test]
+    async fn evidence_permit_allows_one_action_then_closes() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub_closed(fake.clone()).await;
+        let generation = hub.connection().generation;
+
+        // 桌面发放（当前代际 + 已知能力名）。
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "send")
+            .expect("当前代际应可发放许可");
+
+        // 第一次动作：许可匹配 → 放行。
+        let first = hub
+            .execute(ctx("evidence-1"), send_action(generation))
+            .await
+            .expect("有效许可必须放行一次动作");
+        assert_eq!(first.state, ActionState::Accepted);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+
+        // 第二次动作（新 actionId）：许可已消费 → 回到 needs_evidence 且零 execute。
+        let second = hub
+            .execute(ctx("evidence-2"), send_action(generation))
+            .await
+            .unwrap_err();
+        assert!(second.is(codes::NEEDS_EVIDENCE), "许可是单次的");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+
+        // 目标守卫不变：许可只属于发放时的会话，其他会话不得借用。
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "send")
+            .unwrap();
+        let other = ControlAction::Send {
+            session_id: "sess_synthetic_other".into(),
+            generation,
+            text: "synthetic other".into(),
+        };
+        let err = hub.execute(ctx("evidence-3"), other).await.unwrap_err();
+        assert!(err.is(codes::NEEDS_EVIDENCE));
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+
+        // 旧代际动作即便许可在场也先被代际门拒绝。
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "send")
+            .unwrap();
+        let stale = hub
+            .execute(ctx("evidence-4"), send_action(generation + 1))
+            .await
+            .unwrap_err();
+        assert!(stale.is(codes::STALE_GENERATION));
+
+        // 原会话的许可未被其他会话/旧代际消耗：仍可放行一次。
+        hub.execute(ctx("evidence-5"), send_action(generation))
+            .await
+            .expect("原会话许可应仍有效");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// snooze 只把许可绑到该 interactionId（不消费）；其他题不得借用，最终 answer 消费。
+    #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+    #[tokio::test]
+    async fn snooze_binds_permit_without_consuming() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub_closed(fake.clone()).await;
+        let generation = hub.connection().generation;
+
+        hub.arm_evidence(EVIDENCE_SESSION, generation, "single_select")
+            .unwrap();
+
+        let snooze = |interaction: &str| ControlAction::Snooze {
+            session_id: EVIDENCE_SESSION.into(),
+            generation,
+            interaction_id: interaction.into(),
+        };
+        let answer = |interaction: &str| ControlAction::Answer {
+            session_id: EVIDENCE_SESSION.into(),
+            generation,
+            interaction_id: interaction.into(),
+            answers: vec![AnswerEntry {
+                question_text: "synthetic question".into(),
+                selected_values: vec!["synthetic option".into()],
+                free_text: None,
+            }],
+        };
+
+        // 首次 snooze 绑题（不消费）；重复同题幂等。
+        hub.execute(ctx("snooze-1"), snooze("ix-1")).await.unwrap();
+        hub.execute(ctx("snooze-2"), snooze("ix-1")).await.unwrap();
+        // 其他题的 snooze 不得改绑/借用（动作本身照常放行，但许可仍绑在 ix-1）。
+        hub.execute(ctx("snooze-3"), snooze("ix-2")).await.unwrap();
+
+        // 其他题的最终 answer 不能借用许可。
+        let err = hub
+            .execute(ctx("answer-other"), answer("ix-2"))
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::NEEDS_EVIDENCE), "其他交互不得借用许可");
+        assert_eq!(
+            fake.execute_calls.load(Ordering::SeqCst),
+            3,
+            "被拒绝的 answer 零 execute（三次 snooze 各自一次）"
+        );
+
+        // 绑定题的 answer 原子消费许可。
+        hub.execute(ctx("answer-1"), answer("ix-1"))
+            .await
+            .expect("snooze 绑定的题必须能消费许可");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 4);
+
+        // 消费后回到闸门关闭。
+        let err = hub
+            .execute(ctx("answer-2"), answer("ix-1"))
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::NEEDS_EVIDENCE));
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 4);
     }
 
     /// 事件泵的 fake 桥：记录 `on_data`/`invalidate`，可注入一次瞬时错误。

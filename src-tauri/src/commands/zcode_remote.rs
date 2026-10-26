@@ -108,6 +108,27 @@ pub async fn zcode_control_status(
     Ok(status_with(&state))
 }
 
+/// T8.2 **仅 debug 证据构建**：桌面为指定会话/代际/能力发放一条内存验收许可。
+///
+/// - 只存在于 `zcode-bridge-evidence` + debug 构建（release 由 zcode_control/mod.rs
+///   编译门直接拒绝；普通构建不存在本命令）；
+/// - 不写 settings/DB、不写日志，也不提供任何手机 HTTP 入口；
+/// - 许可 120 秒有效、一次用户动作即消费（snooze 只绑题不消费）；
+/// - 只放宽能力闸，目标/权限 `fullAccess`/pending 等守卫全部照常执行。
+#[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+#[tauri::command]
+pub fn zcode_control_arm_evidence(
+    state: State<'_, Arc<ZcodeHub>>,
+    session_id: String,
+    generation: u64,
+    capability: String,
+) -> Result<(), String> {
+    state
+        .arm_evidence(&session_id, generation, &capability)
+        .map(|_| ())
+        .map_err(ipc_error)
+}
+
 /// provider 解析单点：只认 `bigmodel`/`zai`，大小写/别名/空串一律拒绝。
 fn parse_provider(raw: &str) -> ZResult<OAuthProvider> {
     match raw {

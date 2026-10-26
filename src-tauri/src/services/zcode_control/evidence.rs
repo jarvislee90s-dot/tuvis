@@ -34,6 +34,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 许可有效期（毫秒）：一次用户动作的窗口，过期即失效。
 pub const EVIDENCE_PERMIT_TTL_MS: u64 = 120_000;
 
+/// 可发放许可的能力名（与 [`CapabilityView`](super::types::CapabilityView) 的八项
+/// 字段一一对应；桌面命令只接受这些字面量，避免发放永远匹配不到闸门的空许可）。
+pub const CAPABILITY_NAMES: [&str; 8] = [
+    "send",
+    "single_select",
+    "multi_select",
+    "free_text",
+    "interrupt",
+    "approval_reply",
+    "model",
+    "thought_level",
+];
+
+/// 能力名是否属于八项受证据闸约束的能力（去空白后精确匹配）。
+pub fn is_known_capability(name: &str) -> bool {
+    CAPABILITY_NAMES.contains(&name.trim())
+}
+
 /// 一条内存验收许可的快照（只用于回执/显示；真值在
 /// [`EvidencePermitStore`] 内，`consumed` 反映发放瞬间的状态）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -217,6 +235,55 @@ impl EvidencePermitStore {
                 true
             }
         }
+    }
+
+    /// snooze 辅助锁（**动作路径入口**）：把本会话/本代际下所有尚可用的许可绑定到
+    /// 同一 `interactionId`，且**不消费**任何许可。
+    ///
+    /// - 首次 snooze：绑定所有未绑定许可，返回 `true`；
+    /// - 同一题重复 snooze：幂等（绑定态不变），返回 `true`；
+    /// - 已有许可绑定到**其他**题：整体拒绝（`false`），且不改写任何绑定——
+    ///   其他交互不得借用或抢走已绑定的许可；
+    /// - 未发放、已过期、换代：不绑定（无可绑项时返回 `false`）。
+    pub fn snooze_interaction(
+        &self,
+        session_id: &str,
+        generation: u64,
+        interaction_id: &str,
+    ) -> bool {
+        if interaction_id.trim().is_empty() {
+            return false;
+        }
+        let now = self.now();
+        let mut permits = lock_permits(&self.permits);
+        let mut bound_any = false;
+        for (key, entry) in permits.iter() {
+            if key.session_id != session_id || key.generation != generation {
+                continue;
+            }
+            if entry.expires_at_ms <= now {
+                continue;
+            }
+            if let Some(bound) = entry.snoozed_interaction.as_deref() {
+                // 已绑定到别的题：整体拒绝（不猜、不改写）。
+                if bound != interaction_id {
+                    return false;
+                }
+            }
+        }
+        for (key, entry) in permits.iter_mut() {
+            if key.session_id != session_id || key.generation != generation {
+                continue;
+            }
+            if entry.expires_at_ms <= now {
+                continue;
+            }
+            if entry.snoozed_interaction.is_none() {
+                entry.snoozed_interaction = Some(interaction_id.to_owned());
+            }
+            bound_any = true;
+        }
+        bound_any
     }
 
     /// 换服务/关连接：清空全部许可（Hub 换代或 relay 关闭时调用）。
