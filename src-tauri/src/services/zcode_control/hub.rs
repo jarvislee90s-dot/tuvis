@@ -12,7 +12,9 @@
 //!
 //! 构造即装配生产链（AuthService → RelayClient → BridgeManager → CommandSender）并启动
 //! 一条常驻 relay 事件泵：`Data` 逐帧进桥，`State` 更新连接态、`conflict`（KICKED）
-//! 推进控制代际并作废旧桥/投影。构造**不**自动 OAuth、**不**自动连接。
+//! 推进控制代际并作废旧桥/投影；`Data` 溢出（`RelayLag`）显式作废旧投影并发布
+//! `ready=false` 的降级事件，下一次 GET 重新 bind/现读（绝不返回旧缓存）。
+//! 构造**不**自动 OAuth、**不**自动连接。
 //! HTTP/IPC 接线在后续切片完成；本文件只交付可测的 Hub 核心。
 //! DB 读写失败由调用方处置：`config_changed` 只在保存/删除**成功后**被调用，
 //! 失败保存不得断开旧连接（本函数不读写入结果、不自行落库）。
@@ -28,7 +30,7 @@ use super::auth::{AuthService, OAuthProvider, OpenAuthorize};
 use super::bridge::BridgeManager;
 use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
-use super::relay::{DeviceRoute, RelayClient, RelayEvent};
+use super::relay::{DeviceRoute, RelayClient, RelayEvent, RelayLag};
 use super::types::{
     codes, ActionContext, ActionReceipt, BoundTarget, CapabilityPolicy, CapabilityView,
     ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind, SessionView,
@@ -41,7 +43,8 @@ use super::evidence::{EvidencePermit, EvidencePermitStore};
 
 /// Hub 广播缓冲（事件只做通知，缺口由消费方重 GET 兜底）。
 const EVENT_CAPACITY: usize = 64;
-/// relay→Hub 事件泵队列（满时 relay 侧丢事件；Data 丢失由上层超时/重试兜底）。
+/// relay→Hub 事件泵队列（有界：State 满时 relay 侧**无超时**等待消费端，Data 满时
+/// 置位 lag 并触发投影失效，消费方绝不把旧缓存当权威）。
 const RELAY_EVENT_CAPACITY: usize = 64;
 
 /// 生产宿主证据基线：本分支**没有**宿主 APP build / wire 协议 / schema / hello 的
@@ -89,6 +92,23 @@ pub trait HubBackend: Send + Sync {
         action: &'a ControlAction,
     ) -> BoxFuture<'a, ZResult<ActionReceipt>>;
 
+    /// 只读查询持久账本里的既有回执（**先于**连接/能力闸与目标绑定）。
+    ///
+    /// 语义与派发路径的幂等命中一致：同 actionId 同 device/session/generation/kind/
+    /// payload_hash → 既有回执；任一不同 → `action_payload_conflict`；无行 → `None`。
+    /// 实现必须是**纯读**：零出站帧、零新行、零审计。
+    ///
+    /// 默认 `Ok(None)`：没有持久账本的后端与既有测试 fake 零改动；生产
+    /// [`PartsBackend`] 委托 `CommandSender::existing_receipt`。
+    fn existing_receipt<'a>(
+        &'a self,
+        ctx: &'a ActionContext,
+        action: &'a ControlAction,
+    ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+        let _ = (ctx, action);
+        Box::pin(async { Ok(None) })
+    }
+
     /// 带**验收许可**的派发（T8.2 debug 证据构建专用；普通构建永远不会传入非空
     /// `permits`）。默认实现忽略许可并退回 [`Self::execute`]，保持既有 fake 零改动。
     ///
@@ -121,6 +141,13 @@ trait BridgePump: Send + Sync {
     fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()>;
 }
 
+/// 事件泵装配口：relay 事件接收端 + 泵桥 + 可选 Data 溢出观察口（测试可缺省）。
+type PumpParts = (
+    mpsc::Receiver<RelayEvent>,
+    Arc<dyn BridgePump>,
+    Option<RelayLag>,
+);
+
 /// 生产泵口：与 [`PartsBackend`] 共用同一个投影代际计数器。
 struct ProjectionBridge {
     bridge: Arc<BridgeManager>,
@@ -151,13 +178,15 @@ pub struct PartsBackend {
 }
 
 impl PartsBackend {
-    /// 组装生产链（不触发 OAuth、不自动连接），返回 relay 事件接收端供 Hub 事件泵消费。
-    fn production(store: DeviceStore) -> (Self, mpsc::Receiver<RelayEvent>) {
+    /// 组装生产链（不触发 OAuth、不自动连接），返回 relay 事件接收端与 Data 溢出观察口
+    /// 供 Hub 事件泵消费。
+    fn production(store: DeviceStore) -> (Self, mpsc::Receiver<RelayEvent>, RelayLag) {
         let auth = Arc::new(AuthService::new(reqwest::Client::new()));
-        // 泵由 Hub 持有；通道满时 relay 侧 `try_send` 丢事件（lag 由消费方重 GET 兜底），
-        // 绝不阻塞 relay actor。
+        // 泵由 Hub 持有：State 溢出由 relay 无超时等待消费端（终态不丢），Data 溢出只
+        // 置位 lag，由事件泵作废旧投影并让下一次 GET 重新 bind/现读（绝不阻塞 relay actor）。
         let (events, events_rx) = mpsc::channel(RELAY_EVENT_CAPACITY);
         let relay = Arc::new(RelayClient::new(auth.clone(), events));
+        let lag = relay.lag_watcher();
         let bridge = Arc::new(BridgeManager::new(relay.clone()));
         let policy = CapabilityView::default();
         let sender = Arc::new(
@@ -177,6 +206,7 @@ impl PartsBackend {
                 projection_generation: Arc::new(AtomicU64::new(0)),
             },
             events_rx,
+            lag,
         )
     }
 
@@ -243,6 +273,14 @@ impl HubBackend for PartsBackend {
         action: &'a ControlAction,
     ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
         Box::pin(async move { self.sender.execute(ctx, target, action).await })
+    }
+
+    fn existing_receipt<'a>(
+        &'a self,
+        ctx: &'a ActionContext,
+        action: &'a ControlAction,
+    ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+        Box::pin(async move { self.sender.existing_receipt(ctx, action).await })
     }
 
     fn execute_with_permits<'a>(
@@ -371,6 +409,8 @@ fn emit_session_event(
 /// - `needs_auth` 同时清 `authorized`（JWT 已失效）；
 /// - Hub 处于 `needs_config`/`needs_auth` 时只接受 `needs_auth`/`conflict`：
 ///   配置变更后的旧连接离线/握手事件不得把 Hub 拉回 `offline`/`connecting`；
+/// - 关闭窗口（`closing` 置位）内一律忽略：旧 attempt 的 relay 状态不得回写
+///   `begin_disconnect` 已同步落定的 Offline；
 /// - `generation <= relay_floor` 的迟到状态一律丢弃。
 async fn apply_relay_state(
     inner: &Mutex<Inner>,
@@ -380,6 +420,12 @@ async fn apply_relay_state(
 ) {
     let (out, invalidate, stale) = {
         let mut state = lock_inner(inner);
+        // 关闭窗口：`begin_disconnect` 已在锁内同步落定 Offline。旧 attempt 的迟到
+        // relay 状态（Connecting/Paired/Offline 乃至 Conflict/NeedsAuth）一律忽略，
+        // 关闭态在窗口内是唯一权威；关闭结束后的新连接自会带来新 relay 代际。
+        if state.closing.is_some() {
+            return;
+        }
         if view.generation <= state.relay_floor {
             return;
         }
@@ -426,6 +472,37 @@ async fn apply_relay_state(
     }
 }
 
+/// 事件泵的 Data 溢出处理：旧投影**显式失效**，绝不把旧缓存继续当权威。
+///
+/// relay 侧对 Data 只置位 [`RelayLag`] + 唤醒（不阻塞 actor），因此泵在此承担「失效」
+/// 语义：先作废桥内投影（下一次 GET 必然重新 bind/现读），再在 paired 且已发布过
+/// `last_session` 时把它降级为 `ready=false`、能力回到基线全关，并在锁外广播一次
+/// `Session` 事件——手机据它丢弃卡面，下一次 GET 重新取数。不伪造任何数据内容。
+async fn apply_relay_lag(
+    inner: &Mutex<Inner>,
+    events: &broadcast::Sender<ControlEvent>,
+    bridge: &dyn BridgePump,
+) {
+    // 先作废桥投影：旧缓存不得在失效窗口内被继续读取。
+    bridge.invalidate().await;
+    let stale = {
+        let mut state = lock_inner(inner);
+        if state.state != ConnectionState::Paired {
+            return;
+        }
+        let Some(mut view) = state.last_session.clone() else {
+            return;
+        };
+        view.generation = state.generation;
+        view.ready = false;
+        // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新事件。
+        view.capabilities = CapabilityView::default();
+        state.last_session = Some(view.clone());
+        view
+    };
+    emit_session_event(inner, events, &stale);
+}
+
 /// 事件泵的 Data 会话变化：锁内校验代际/配对并落 `last_session`，锁外广播。
 ///
 /// - `hub_generation` 是本帧进入桥之前的 Hub 代际：桥处理在途若发生换代（配置变更/
@@ -469,6 +546,10 @@ struct Inner {
     configured: bool,
     /// 本进程是否持有账号 JWT（只在内存；重启即失效）。
     authorized: bool,
+    /// 关闭窗口的持有 epoch（`None` = 无关闭在途）：`begin_disconnect` 在锁内置为
+    /// 本次代际；对应的 [`CloseGuard`] Drop 时**仅当仍匹配本 epoch** 才清除。
+    /// 置位期间 `connect`/relay 状态回写一律拒绝（关闭已同步落定 Offline）。
+    closing: Option<u64>,
     state: ConnectionState,
     reason_code: Option<String>,
     device_label: Option<String>,
@@ -511,6 +592,28 @@ impl Inner {
     }
 }
 
+/// 关闭窗口的 RAII 凭据：由 [`ZcodeHub::begin_disconnect`] **同步**创建并随返回值
+/// 交出，不含任何 await 点。
+///
+/// 清理（[`ZcodeHub::finish_disconnect`]）消费它：正常结束即 Drop 清位；若清理
+/// future 被取消 / panic / 从未被 poll，凭据随 future 一起 Drop——只要 `closing`
+/// 仍是本次 epoch 就清位，绝不把 Hub 永久锁在「拒绝连接」态。重复 `begin` 会写入
+/// 新 epoch，因此旧凭据 Drop 时不会误清新窗口。
+#[must_use = "CloseGuard 必须交给 finish_disconnect，或作为取消语义被显式丢弃"]
+pub(crate) struct CloseGuard {
+    inner: Arc<Mutex<Inner>>,
+    epoch: u64,
+}
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        let mut inner = lock_inner(&self.inner);
+        if inner.closing == Some(self.epoch) {
+            inner.closing = None;
+        }
+    }
+}
+
 /// 单实例 ZCode 控制 Hub（桌面与手机共享）。
 pub struct ZcodeHub {
     store: DeviceStore,
@@ -532,11 +635,16 @@ impl ZcodeHub {
     /// 因此无任何自动授权/自动连接副作用。必须在 Tokio runtime 内构造
     /// （`BridgeManager` 会 spawn 出站 actor）。
     pub fn new(store: DeviceStore) -> Self {
-        let (parts, relay_events) = PartsBackend::production(store.clone());
+        let (parts, relay_events, lag) = PartsBackend::production(store.clone());
         let policy = parts.policy();
         let bridge = parts.pump_bridge();
         let backend: Arc<dyn HubBackend> = Arc::new(parts);
-        Self::assemble(store, backend, policy, Some((relay_events, bridge)))
+        Self::assemble(
+            store,
+            backend,
+            policy,
+            Some((relay_events, bridge, Some(lag))),
+        )
     }
 
     /// 测试专用：注入 fake 后端与能力矩阵（不注册任何设置/IPC 入口）。
@@ -552,7 +660,7 @@ impl ZcodeHub {
         Self::assemble(store, backend, policy, None)
     }
 
-    /// 事件泵测试构造（fake relay 通道 + fake bridge；零网络）。
+    /// 事件泵测试构造（fake relay 通道 + fake bridge；零网络；无 lag 观察口）。
     #[cfg(test)]
     fn with_pump(
         store: DeviceStore,
@@ -561,14 +669,27 @@ impl ZcodeHub {
         events: mpsc::Receiver<RelayEvent>,
         bridge: Arc<dyn BridgePump>,
     ) -> Self {
-        Self::assemble(store, backend, policy, Some((events, bridge)))
+        Self::assemble(store, backend, policy, Some((events, bridge, None)))
+    }
+
+    /// 事件泵测试构造 + Data 溢出观察口（验证 lag → 投影失效接线）。
+    #[cfg(test)]
+    fn with_pump_and_lag(
+        store: DeviceStore,
+        backend: Arc<dyn HubBackend>,
+        policy: CapabilityView,
+        events: mpsc::Receiver<RelayEvent>,
+        bridge: Arc<dyn BridgePump>,
+        lag: RelayLag,
+    ) -> Self {
+        Self::assemble(store, backend, policy, Some((events, bridge, Some(lag))))
     }
 
     fn assemble(
         store: DeviceStore,
         backend: Arc<dyn HubBackend>,
         policy: CapabilityView,
-        pump: Option<(mpsc::Receiver<RelayEvent>, Arc<dyn BridgePump>)>,
+        pump: Option<PumpParts>,
     ) -> Self {
         let hub = Self {
             store,
@@ -579,6 +700,7 @@ impl ZcodeHub {
                 generation: 0,
                 configured: false,
                 authorized: false,
+                closing: None,
                 state: ConnectionState::NeedsConfig,
                 reason_code: None,
                 device_label: None,
@@ -602,22 +724,44 @@ impl ZcodeHub {
                 ConnectionState::NeedsConfig
             };
         }
-        if let Some((events, bridge)) = pump {
-            hub.spawn_pump(events, bridge);
+        if let Some((events, bridge, lag)) = pump {
+            hub.spawn_pump(events, bridge, lag);
         }
         hub
     }
 
     /// 常驻事件泵：`Data` 进桥并发布本帧的会话变化，`State` 更新连接态并按需作废
-    /// 旧桥/投影。
+    /// 旧桥/投影；`RelayLag`（Data 溢出）**显式**作废旧投影并让下一次 GET 重新现读。
     ///
     /// 只持有 Hub 状态的 `Weak`：Hub 释放或 relay 通道关闭（sender 全丢）即退出；
     /// 单帧坏数据/桥错误只记一次降级，绝不拆泵（T2.2 M-10）。
-    fn spawn_pump(&self, mut events: mpsc::Receiver<RelayEvent>, bridge: Arc<dyn BridgePump>) {
+    ///
+    /// 每轮先 `lag.take()`：Data 溢出（relay 侧只置位 + 唤醒，不阻塞 actor）后，旧投影
+    /// 已不可信——先作废桥/投影并发布降级事件，再继续消费队列，绝不让 GET 读到旧缓存。
+    fn spawn_pump(
+        &self,
+        mut events: mpsc::Receiver<RelayEvent>,
+        bridge: Arc<dyn BridgePump>,
+        lag: Option<RelayLag>,
+    ) {
         let inner = Arc::downgrade(&self.inner);
         let out = self.events.clone();
         tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
+            loop {
+                if let Some(lag) = &lag {
+                    if lag.take() {
+                        let Some(inner) = inner.upgrade() else { break };
+                        apply_relay_lag(&inner, &out, bridge.as_ref()).await;
+                    }
+                }
+                let event = match &lag {
+                    Some(lag) => tokio::select! {
+                        event = events.recv() => event,
+                        _ = lag.changed() => continue,
+                    },
+                    None => events.recv().await,
+                };
+                let Some(event) = event else { break };
                 let Some(inner) = inner.upgrade() else { break };
                 match event {
                     RelayEvent::Data(payload) => {
@@ -687,6 +831,39 @@ impl ZcodeHub {
             self.emit_session(&stale);
         }
         (view, attempt)
+    }
+
+    /// 握手前落定 `connecting`：**同一把锁**内先复核「代际未变且不在关闭窗口」，
+    /// 不满足则**不写任何状态**、直接返回 stale/offline。
+    ///
+    /// 用于封死 `connect` 的 closing 检查与 `settle` 之间的窗口：`begin_disconnect`
+    /// 若抢先落定 Offline，这里的复核会让本次握手尝试直接作废，绝不把刚落的
+    /// Offline（或 config_changed 的 needs_auth）覆盖成 `connecting`。
+    fn settle_if_current(
+        &self,
+        generation: u64,
+        device_label: Option<String>,
+    ) -> ZResult<(ConnectionView, u64)> {
+        let (view, stale, attempt) = {
+            let mut inner = self.lock();
+            if inner.generation != generation {
+                return Err(ZcodeError::of(codes::STALE_GENERATION));
+            }
+            if inner.closing.is_some() {
+                return Err(ZcodeError::of(codes::OFFLINE));
+            }
+            inner.state = ConnectionState::Connecting;
+            inner.reason_code = None;
+            inner.device_label = device_label;
+            let view = inner.view();
+            let stale = inner.stale_session(view.generation);
+            (view, stale, inner.state_epoch)
+        };
+        self.emit_connection(&view);
+        if let Some(stale) = stale {
+            self.emit_session(&stale);
+        }
+        Ok((view, attempt))
     }
 
     fn state_of(error: &ZcodeError) -> ConnectionState {
@@ -819,6 +996,12 @@ impl ZcodeHub {
     /// 建立唯一物理连接（已配对/连接中幂等；`conflict` 为终态，不自动重试）。
     pub async fn connect(&self) -> ZResult<ConnectionView> {
         let _single = self.connect_lock.lock().await;
+        // 断开清理窗口（`begin_disconnect` 已置 Offline、`finish_disconnect` 尚未收尾）：
+        // 立即回 Offline 错误且**不**调 `backend.connect`——否则在清理最后一次
+        // `backend.disconnect` 之后仍可能新开一条连接，把已断开的 Hub 留在 paired。
+        if self.lock().closing.is_some() {
+            return Err(ZcodeError::of(codes::OFFLINE));
+        }
         let (state, configured, authorized, generation) = {
             let inner = self.lock();
             (
@@ -862,7 +1045,24 @@ impl ZcodeHub {
         };
         let label = route.label.clone();
         // 握手中：离开 paired，已读投影同步降级广播；attempt 纪元与状态同锁取得。
-        let (_, attempt) = self.settle(ConnectionState::Connecting, None, label.clone());
+        // 关闭/换代复核也在这把锁内（settle_if_current）：begin_disconnect 若恰好
+        // 抢在 closing 检查与这一步之间，绝不覆盖它刚落的 Offline，且零后端连接。
+        let (_, attempt) = match self.settle_if_current(generation, label.clone()) {
+            Ok(pair) => pair,
+            Err(error) => return Err(error),
+        };
+        // settle 之后、真正触达后端之前再复核一次（只读，不改状态）：关闭/换代恰好
+        // 插在 settle 与这里时，状态已由 begin_disconnect/config_changed 自己落定，
+        // 本次尝试直接作废且不调 backend.connect。
+        {
+            let inner = self.lock();
+            if inner.generation != generation {
+                return Err(ZcodeError::of(codes::STALE_GENERATION));
+            }
+            if inner.closing.is_some() {
+                return Err(ZcodeError::of(codes::OFFLINE));
+            }
+        }
         match self.backend.connect(route).await {
             Err(error) => Err(self.apply_failure(generation, error)),
             Ok(view) => {
@@ -900,27 +1100,72 @@ impl ZcodeHub {
         }
     }
 
-    /// 用户显式断开：推进代际、保留 JWT，可再次连接。
+    /// 断开第一阶段（同步、不持 `connect_lock`、不 await）：推进代际、置 Offline、
+    /// 清原因/设备标签、抬高 relay 地板并广播连接与投影降级事件；同时把关闭窗口
+    /// 置为本次 epoch。返回 `(视图, 关闭凭据)`。
     ///
-    /// 与配置变更同规：代际推进与「不可控」状态在**同一把锁**内落定，
-    /// `backend.disconnect` 在途期间不得再读到旧配对/旧投影。
-    pub async fn disconnect(&self) -> ConnectionView {
-        let _single = self.connect_lock.lock().await;
-        let (view, stale) = {
+    /// 关闭凭据 [`CloseGuard`] 在**本函数内**（锁内）创建并随返回值交出：调用方
+    /// 立即持有取消兜底——即便后续清理 future 被取消/从未 poll/panic，凭据 Drop 也
+    /// 会清位。
+    ///
+    /// 远端关停先调它：手机/桌面立刻看到「已断开」，不必等在途握手的网络超时；
+    /// 昂贵的清理交给 [`Self::finish_disconnect`] 在后台完成。
+    pub(crate) fn begin_disconnect(&self) -> (ConnectionView, CloseGuard) {
+        let (view, stale, epoch) = {
             let mut inner = self.lock();
             inner.generation = inner.generation.wrapping_add(1);
             inner.state = ConnectionState::Offline;
             inner.reason_code = None;
             inner.device_label = None;
+            // 与 config_changed 同规：关闭前的旧 relay 状态（已应用代际）不得回写；
+            // 关闭窗口内仍在途的旧 attempt 由 `apply_relay_state` 的 closing 闸拦下。
+            inner.relay_floor = inner.relay_generation;
+            let epoch = inner.generation;
+            inner.closing = Some(epoch);
             let view = inner.view();
             let stale = inner.stale_session(view.generation);
-            (view, stale)
+            (view, stale, epoch)
         };
         self.emit_connection(&view);
         if let Some(stale) = stale {
             self.emit_session(&stale);
         }
+        (
+            view,
+            CloseGuard {
+                inner: self.inner.clone(),
+                epoch,
+            },
+        )
+    }
+
+    /// 断开第二阶段（清理，调用方不可用超时取消它）：立即断后端（取消在途 relay
+    /// connect）→ 取得 `connect_lock`（等在途 connect 收尾）→ 再断一次后端（关掉
+    /// 竞态窗口内新建立的连接）→ 持锁 Drop 关闭凭据清位。
+    ///
+    /// `closing` 在整个清理期间为置位（见 [`Self::connect`] 与
+    /// [`apply_relay_state`]）：即便新 connect 在这两次 `backend.disconnect` 之间
+    /// 拿到锁，也不会真的开连接；旧 attempt 的 relay 状态也不会回写 Offline。
+    ///
+    /// 本 future 被取消/panic 时，`guard` 随栈帧 Drop，按 epoch 兜底清位。
+    pub(crate) async fn finish_disconnect(&self, guard: CloseGuard) {
+        // 先取消在途握手：relay connect 等网络的 await 会就此收尾、释放 connect_lock。
         self.backend.disconnect().await;
+        // 等在途 connect 收尾（此后再无持锁的旧代际握手）。
+        let _single = self.connect_lock.lock().await;
+        // 关掉竞态窗口内可能已建立的连接（本 Hub 期间绝不留下 paired）。
+        self.backend.disconnect().await;
+        // 持锁清位：新 connect 只可能在清理完全结束后才被允许。
+        drop(guard);
+    }
+
+    /// 用户显式断开：推进代际、保留 JWT，可再次连接。
+    ///
+    /// 与配置变更同规：代际推进与「不可控」状态在**同一把锁**内落定，
+    /// `backend.disconnect` 在途期间不得再读到旧配对/旧投影。
+    pub async fn disconnect(&self) -> ConnectionView {
+        let (view, guard) = self.begin_disconnect();
+        self.finish_disconnect(guard).await;
         view
     }
 
@@ -993,17 +1238,25 @@ impl ZcodeHub {
         Ok(view)
     }
 
-    /// 执行一次控制动作：代际 + 能力闸 + 目标绑定全部通过才派发。
+    /// 执行一次控制动作：代际 + 持久幂等 → 连接门 + 能力闸 + 目标绑定通过才派发。
     pub async fn execute(
         &self,
         ctx: ActionContext,
         action: ControlAction,
     ) -> ZResult<ActionReceipt> {
-        // 代际判定先于状态门：旧代际动作即便当前未就绪也必须回 `stale_generation`
-        // （调用方据此丢弃本地卡面，而不是误以为「重连后还能重试」）。
+        // 代际判定先于一切：旧代际动作即便当前未就绪也必须回 `stale_generation`
+        // （调用方据此丢弃本地卡面，而不是误以为「重连后还能重试」），也绝不
+        // 从账本取回旧代际回执。
         let generation = self.lock().generation;
         if action.generation() != generation {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
+        }
+        // 持久幂等查询紧随代际判定、**先于**连接门/能力闸/bind：断开、未配对或
+        // 能力关闭后重试同一 actionId，仍取回既有 accepted/confirmed/unknown 回执；
+        // 冲突（同 id 换载荷/跨设备）也在此直接上抛，而不是误报 needs_auth/offline。
+        // 重放命中不 emit 新的 Action 事件（否则手机会看到重复回执）。
+        if let Some(existing) = self.backend.existing_receipt(&ctx, &action).await? {
+            return Ok(existing);
         }
         self.control_generation()?;
         // 能力闸：返回本次动作凭**验收许可**放宽的能力名（普通构建恒为空）。
@@ -1223,6 +1476,10 @@ mod tests {
         /// 在途 reset 的闸（配置变更窗口测试用）。
         reset_gate: Mutex<Option<Arc<Notify>>>,
         connect_result: Mutex<Option<ZResult<ConnectionView>>>,
+        /// 持久幂等查询的替身结果（`None` = 无既有回执，即默认语义）。
+        existing_result: Mutex<Option<ZResult<Option<ActionReceipt>>>>,
+        /// 持久幂等查询被调用次数（证明查询先于连接/许可闸）。
+        existing_calls: AtomicUsize,
         bind_generation: AtomicU64,
         /// 每次 connect 收到的目标（`sid` + `mid`），用于证明只从保存链接解析。
         routes: Mutex<Vec<(String, Option<String>)>>,
@@ -1244,6 +1501,11 @@ mod tests {
 
         fn set_connect(&self, result: ZResult<ConnectionView>) {
             self.connect_result.lock().unwrap().replace(result);
+        }
+
+        /// 设定持久幂等查询的应答（`Some(Err(..))` = 冲突；缺省 = 无既有回执）。
+        fn set_existing(&self, result: ZResult<Option<ActionReceipt>>) {
+            self.existing_result.lock().unwrap().replace(result);
         }
     }
 
@@ -1337,6 +1599,21 @@ mod tests {
                 reason_code: None,
             };
             Box::pin(async move { Ok(receipt) })
+        }
+
+        fn existing_receipt<'a>(
+            &'a self,
+            _ctx: &'a ActionContext,
+            _action: &'a ControlAction,
+        ) -> BoxFuture<'a, ZResult<Option<ActionReceipt>>> {
+            self.existing_calls.fetch_add(1, Ordering::SeqCst);
+            let result = self
+                .existing_result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(Ok(None));
+            Box::pin(async move { result })
         }
 
         fn policy(&self) -> CapabilityView {
@@ -1522,12 +1799,204 @@ mod tests {
         assert_eq!(view.state, ConnectionState::Offline);
         assert_eq!(view.reason_code, None);
         assert_eq!(hub.connection().state, ConnectionState::Offline);
-        assert_eq!(fake.disconnect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            2,
+            "断开 = 先取消在途 + 锁后再关一次（竞态窗口）"
+        );
 
         let reconnected = hub.connect().await.unwrap();
         assert!(reconnected.is_paired());
         assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 1, "不重新授权");
         assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// 握手在途时断开：Offline/代际必须**立即**落定（不得先等 `connect_lock`），
+    /// 在途 connect 被作废（stale_generation），后端断开至少调用一次。
+    #[tokio::test]
+    async fn disconnect_invalidates_inflight_connect_without_waiting_for_lock() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        let gate = Arc::new(Notify::new());
+        fake.gate.lock().unwrap().replace(gate.clone());
+
+        let in_flight = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.connect().await })
+        };
+        wait_until(|| fake.connect_calls.load(Ordering::SeqCst) == 1).await;
+
+        let disconnecting = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.disconnect().await })
+        };
+
+        // 旧实现先等 connect_lock（被在途握手占着）→ 这里会一直停在 connecting。
+        wait_until(|| hub.connection().state == ConnectionState::Offline).await;
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            1,
+            "断开不得触发新的后端连接"
+        );
+
+        gate.notify_one();
+        let late = in_flight.await.expect("spawn 不应 panic");
+        assert!(
+            matches!(&late, Err(err) if err.is(codes::STALE_GENERATION)),
+            "在途 connect 必须作废，实际 {late:?}"
+        );
+
+        let view = disconnecting.await.expect("spawn 不应 panic");
+        assert_eq!(view.state, ConnectionState::Offline);
+        assert!(
+            fake.disconnect_calls.load(Ordering::SeqCst) >= 1,
+            "清理必须调用后端断开"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        // 不粘死：清理结束后显式重连仍可达（用户断开保留 JWT，不重授权）。
+        fake.gate.lock().unwrap().take();
+        assert!(hub.connect().await.expect("显式重连应成功").is_paired());
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 断开清理窗口内的新 connect：`closing` 一置位就立即回 Offline 错误且不触达
+    /// `backend.connect`（覆盖「begin 已落定、finish 尚未收尾」的竞态窗口）；
+    /// 清理完成后 `closing` 复位，显式重连仍可达。
+    #[tokio::test]
+    async fn connect_during_disconnect_cleanup_is_rejected_without_backend_call() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        // begin = 远端关停的同步前半段：此时清理尚未开始（closing = Some(epoch)）。
+        let (view, guard) = hub.begin_disconnect();
+        assert_eq!(view.state, ConnectionState::Offline);
+
+        let err = hub.connect().await.unwrap_err();
+        assert!(
+            err.is(codes::OFFLINE),
+            "清理窗口内必须立刻回 offline 错误，实际 {err:?}"
+        );
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before,
+            "清理窗口内不得真的开新连接"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        hub.finish_disconnect(guard).await;
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            2,
+            "finish = 先取消在途 + 锁后再关一次"
+        );
+        let reconnected = hub.connect().await.expect("清理完成后显式重连应成功");
+        assert!(reconnected.is_paired());
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before + 1,
+            "closing 必须已复位"
+        );
+    }
+
+    /// 清理 future 被取消（guard 直接 Drop）也要清位：`closing` 绝不永久锁死 connect。
+    /// 凭据在 `begin_disconnect` 内同步创建，所以「从未 poll 就丢弃 future」同样覆盖。
+    #[tokio::test]
+    async fn dropped_close_guard_reopens_connect() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        let (_view, guard) = hub.begin_disconnect();
+        // 窗口内：拒绝新连接（零 backend.connect）。
+        assert!(hub.connect().await.unwrap_err().is(codes::OFFLINE));
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), connects_before);
+
+        // 模拟清理 future 被取消/从未被调度：凭据随 future 析构而 Drop。
+        drop(guard);
+        let reconnected = hub.connect().await.expect("closing 必须已清位");
+        assert!(reconnected.is_paired());
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before + 1,
+            "Drop 后必须允许显式重连"
+        );
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 1, "不重授权");
+    }
+
+    /// 重复 begin 会写新 epoch：旧 guard Drop 不得误清后来者的关闭窗口。
+    #[tokio::test]
+    async fn stale_close_guard_cannot_clear_newer_closing() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        let connects_before = fake.connect_calls.load(Ordering::SeqCst);
+
+        let (_first, first_guard) = hub.begin_disconnect();
+        let (_second, second_guard) = hub.begin_disconnect();
+        // 旧 epoch 的凭据先 Drop：不得把新窗口清掉。
+        drop(first_guard);
+        let err = hub.connect().await.unwrap_err();
+        assert!(err.is(codes::OFFLINE), "新关闭窗口必须仍生效，实际 {err:?}");
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), connects_before);
+
+        // 新 epoch 的凭据 Drop 才清位。
+        drop(second_guard);
+        assert!(hub
+            .connect()
+            .await
+            .expect("新窗口关闭后应可重连")
+            .is_paired());
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects_before + 1
+        );
+    }
+
+    /// 关闭窗口内旧 attempt 的 relay 状态不得回写：begin 之后事件泵即使收到更高
+    /// relay 代际的 Paired/Connecting，Hub 也必须保持 begin 落定的 Offline。
+    #[tokio::test]
+    async fn relay_state_cannot_overwrite_closing_offline() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump) = pumped(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let (_view, guard) = hub.begin_disconnect();
+
+        // 旧 attempt 的迟到状态（relay 代际远高于地板 0）：绝不能把 Hub 拉回 paired。
+        events
+            .send(RelayEvent::State(relay_view(ConnectionState::Paired, 99)))
+            .await
+            .unwrap();
+        events
+            .send(RelayEvent::State(relay_view(
+                ConnectionState::Connecting,
+                100,
+            )))
+            .await
+            .unwrap();
+        // 同一 mpsc FIFO 上的哨兵帧：它进了桥即证明前面两条 State 已被泵处理。
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+        wait_until(|| pump.data.lock().unwrap().len() == 1).await;
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::Offline,
+            "关闭窗口内 relay 状态不得回写"
+        );
+
+        drop(guard);
     }
 
     /// 旧代际动作：拒绝且零后端执行；同代际动作才派发。
@@ -1551,6 +2020,100 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.state, ActionState::Accepted);
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 未授权/断开（needs_auth）时重试同一 actionId：持久账本查询先于连接/许可闸，
+    /// 直接回既有 accepted 回执——零 bind、零 execute，也不重复广播 Action 事件。
+    #[tokio::test]
+    async fn replay_returns_stored_receipt_before_needs_auth() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = ZcodeHub::with_parts(stored(URL), fake.clone(), send_policy());
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::NeedsAuth,
+            "前置：已保存链接但未授权"
+        );
+        let generation = hub.connection().generation;
+        let stored_receipt = ActionReceipt {
+            action_id: "synthetic-replay-accepted".into(),
+            session_id: "sess_synthetic0000".into(),
+            generation,
+            state: ActionState::Accepted,
+            reason_code: None,
+        };
+        fake.set_existing(Ok(Some(stored_receipt.clone())));
+        let mut events = hub.subscribe();
+
+        let got = hub
+            .execute(ctx("synthetic-replay-accepted"), send_action(generation))
+            .await
+            .expect("既有回执重放不得被 needs_auth 拦下");
+        assert_eq!(got, stored_receipt, "必须原样返回既定终态回执");
+        assert_eq!(
+            fake.existing_calls.load(Ordering::SeqCst),
+            1,
+            "必须先查持久账本"
+        );
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 0, "重放零绑定");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0, "重放零派发");
+        // 重放不得广播新的 Action 事件（否则手机会看到重复回执）。
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(
+                event.kind,
+                ControlEventKind::Action,
+                "重放不得 emit 新 Action 事件"
+            );
+        }
+    }
+
+    /// 账本判定载荷冲突：错误必须在连接闸之前上抛（同 id 换载荷不是「未授权」），
+    /// 且零 bind/零 execute。
+    #[tokio::test]
+    async fn replay_conflict_is_returned_before_needs_auth() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = ZcodeHub::with_parts(stored(URL), fake.clone(), send_policy());
+        let generation = hub.connection().generation;
+        fake.set_existing(Err(ZcodeError::of(codes::ACTION_PAYLOAD_CONFLICT)));
+
+        let err = hub
+            .execute(ctx("synthetic-replay-conflict"), send_action(generation))
+            .await
+            .unwrap_err();
+        assert!(
+            err.is(codes::ACTION_PAYLOAD_CONFLICT),
+            "必须先回 action_payload_conflict 而不是 needs_auth: {err:?}"
+        );
+        assert_eq!(fake.existing_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 代际判定仍先于持久查询：旧代际动作即使账本有回执也不得取回（零查询）。
+    #[tokio::test]
+    async fn stale_generation_is_rejected_before_existing_receipt() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = ZcodeHub::with_parts(stored(URL), fake.clone(), send_policy());
+        let generation = hub.connection().generation;
+        fake.set_existing(Ok(Some(ActionReceipt {
+            action_id: "synthetic-replay-stale".into(),
+            session_id: "sess_synthetic0000".into(),
+            generation,
+            state: ActionState::Accepted,
+            reason_code: None,
+        })));
+
+        let err = hub
+            .execute(ctx("synthetic-replay-stale"), send_action(generation + 1))
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::STALE_GENERATION));
+        assert_eq!(
+            fake.existing_calls.load(Ordering::SeqCst),
+            0,
+            "旧代际不得查询/返回账本回执"
+        );
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
     }
 
     /// 公开代际唯一：SessionView/ActionReceipt 只暴露 Hub 代际（投影代际不外泄）。
@@ -2188,6 +2751,31 @@ mod tests {
         (hub, events, pump)
     }
 
+    /// 带事件泵 + Data 溢出观察口（`RelayLag`）的 Hub，用于验证溢出失效接线。
+    fn pumped_with_lag(
+        store: DeviceStore,
+        backend: Arc<FakeBackend>,
+        policy: CapabilityView,
+    ) -> (
+        Arc<ZcodeHub>,
+        mpsc::Sender<RelayEvent>,
+        Arc<FakePump>,
+        RelayLag,
+    ) {
+        let (events, receiver) = mpsc::channel(8);
+        let pump = Arc::new(FakePump::default());
+        let lag = RelayLag::new();
+        let hub = Arc::new(ZcodeHub::with_pump_and_lag(
+            store,
+            backend,
+            policy,
+            receiver,
+            pump.clone(),
+            lag.clone(),
+        ));
+        (hub, events, pump, lag)
+    }
+
     /// relay `Data` 逐帧进桥；单帧错误只丢该帧，泵继续。
     #[tokio::test]
     async fn relay_data_is_pumped_into_bridge() {
@@ -2337,6 +2925,84 @@ mod tests {
                 "无变化的 Data 不得发布 Session 事件"
             );
         }
+    }
+
+    /// Data 溢出必须显式让投影失效：invalidate 一次 + 发布 ready=false/能力全关。
+    ///
+    /// 注意：`hub.session()` 本来每次都会 `bind_session` + `session`，故本用例不断言
+    /// 「GET 重新 bind」（那没有判别力）；旧桥帧不得复活投影由 bridge 层用例
+    /// `invalidate_drops_old_bridge_frames_and_rebind_uses_fresh_bridge` 覆盖。
+    #[tokio::test]
+    async fn relay_lag_invalidates_projection_and_publishes_stale_session() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump, lag) = pumped_with_lag(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+
+        let key = TargetKey {
+            session_id: "sess_lag_stale".into(),
+        };
+        // 先 GET 播种 last_session（计数 = 1），并把能力矩阵伪造成全开：lag 必须清回基线。
+        let primed = hub.session(&key).await.expect("首次 GET");
+        assert!(primed.ready);
+        assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 1);
+        {
+            let mut inner = hub.lock();
+            let mut seeded = inner.last_session.clone().expect("GET 已播种 last_session");
+            seeded.capabilities = send_policy();
+            inner.last_session = Some(seeded);
+        }
+        let generation = hub.connection().generation;
+        let mut subscriber = hub.subscribe();
+
+        // 触发 relay 侧 Data 溢出信号。溢出发生时队列本就积压着待处理事件，这里补一帧
+        // 唤醒泵；泵会在下一轮先处理 lag 标记（本用例只断言失效结果，不断言两者顺序）。
+        lag.set();
+        events
+            .send(RelayEvent::Data(serde_json::json!({"nudge": 1})))
+            .await
+            .unwrap();
+        wait_until(|| pump.data.lock().unwrap().len() == 1).await;
+        wait_until(|| pump.invalidations.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(
+            pump.invalidations.load(Ordering::SeqCst),
+            1,
+            "lag 必须作废一次桥投影"
+        );
+
+        let downgraded = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("lag 必须发布投影降级 Session 事件");
+        assert_eq!(
+            downgraded.session_id.as_deref(),
+            Some(key.session_id.as_str())
+        );
+        assert_eq!(downgraded.generation, generation);
+        assert_eq!(
+            downgraded.data["ready"], false,
+            "Data 溢出后旧投影必须显式失效"
+        );
+        assert_eq!(
+            downgraded.data["capabilities"],
+            serde_json::to_value(CapabilityView::default()).unwrap(),
+            "失效投影的能力矩阵必须回到基线全关（不得沿用旧缓存）"
+        );
+
+        // 缓存中的 last_session 已被就地降级（不是只在事件里装样子）。
+        assert!(
+            !hub.lock()
+                .last_session
+                .as_ref()
+                .expect("降级后仍有 last_session")
+                .ready,
+            "last_session 必须写回 ready=false"
+        );
     }
 
     /// relay `KICKED` → Hub `conflict` 终态：推进代际、作废桥/投影、旧动作零执行。
