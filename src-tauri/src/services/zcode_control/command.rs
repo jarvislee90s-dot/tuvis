@@ -26,14 +26,18 @@
 //! 签名开关单点复用 [`message_signature_enabled_conn`]（设置缺省 off），`/` 开头
 //! 不加后缀。审计/日志/错误只含类别与计数，不摘正文。
 //!
-//! # 问答与 snooze（T4.1 Slice B2）
+//! # 问答与 snooze（T4.1 Slice B2 + Fix round 1）
 //!
-//! `Answer` 走「预留 → 宿主授权 → 原值映射 →（必要时 snooze）→ 恰一帧
-//! `resolveInteraction`」：授权/映射失败零帧；`autoResolution` 在场的卡必须先收到
-//! snooze 的 accepted ACK **且**卡仍在宿主集合，否则零 resolve。ACK accepted/duplicate
-//! 只算 `accepted`（本地消费，**不等于**宿主撤卡），只有 ACK 后 10s 内观察到宿主
-//! pending 代数前进且该 id 消失才升级 `confirmed`。`Snooze` 独立动作只暂停计时，
-//! 不消费卡（结果无论如何都释放本地在途）。答案正文只穿过 wire 与内存，账本只存指纹。
+//! `Answer` 走「只读幂等预检 → 宿主授权 → 原值映射 → **写前才预留** →（必要时
+//! snooze）→ 恰一帧 `resolveInteraction`」：授权/映射失败零帧、零账本行、零审计。
+//! `autoResolution` 在场的卡必须先收到 snooze 的 accepted/duplicate/**noop**
+//! ACK（noop = 已暂停的幂等回放）**且**卡仍在宿主集合，否则零 resolve。
+//! ACK accepted/duplicate 只算 `accepted`（本地消费，**不等于**宿主撤卡），只有
+//! ACK 后 10s 内观察到**精确目标**的 pending 代数前进且该 id 消失才升级
+//! `confirmed`。`Snooze` 独立动作只暂停计时，不消费卡（结果无论如何都释放本地
+//! 在途）。在途闸只在确证零写（send_failed / snooze 失败）、resolve
+//! rejected/noop、或宿主撤卡帧（`PendingBook` 整体替换时缺席）时释放；写后
+//! unknown 保留闸（绝不自动重发）。答案正文只穿过 wire 与内存，账本只存指纹。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -308,7 +312,28 @@ impl CommandSender {
         }
     }
 
-    /// 问答应答：预留 → 宿主授权 → 原值映射 →（必要时 snooze）→ 恰一帧 resolve。
+    /// 只读查询既有回执（不写行/审计）：本地校验与授权之前先判幂等重放。
+    fn lookup_action(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<Option<ActionReceipt>> {
+        let params = action_params(action);
+        let hash = payload_hash(
+            action.kind(),
+            &target.session_id,
+            target.generation,
+            &params,
+        )?;
+        self.actions
+            .existing_receipt(ctx, target, action.kind(), &hash)
+    }
+
+    /// 问答应答：只读幂等预检 → 宿主授权 → 原值映射 → **写前才预留** →
+    /// （必要时 snooze）→ 恰一帧 resolve。
+    ///
+    /// 授权/映射失败发生在预留之前：零帧、零账本行、零审计，actionId 不被占死。
     async fn execute_answer(
         &self,
         ctx: &ActionContext,
@@ -327,13 +352,14 @@ impl CommandSender {
             // 未装配 pending 端口：不能证明卡在宿主在场，零帧零行。
             return Err(ZcodeError::of(codes::NOT_READY));
         };
-        if let Some(existing) = self.reserve_action(ctx, target, action)? {
+        // 幂等重放（同 actionId 同载荷）：只回既有回执，零新行、零帧。
+        if let Some(existing) = self.lookup_action(ctx, target, action)? {
             return Ok(existing);
         }
-        // 宿主观察基线：终态要求「代数前进且该 id 不在宿主集合」。
-        let baseline = pending.host_pending_revision();
+        // 宿主观察基线（精确目标）：终态要求「该目标代数前进且该 id 不在其集合」。
+        let baseline = pending.host_pending_revision(target);
         let card = pending.authorize_pending(target, interaction_id).await?;
-        // 原值映射（含 schema 冻结闸/选项集合/重名题干）：失败零帧、释放本地在途。
+        // 原值映射（含 schema 冻结闸/选项集合/重名题干）：失败零帧零行、释放本地在途。
         let answer = match build_user_answer(&card, answers) {
             Ok(answer) => answer,
             Err(error) => {
@@ -341,23 +367,36 @@ impl CommandSender {
                 return Err(error);
             }
         };
-        // autoResolution 在场：先 snooze（恰一帧）且必须 accepted + 卡仍在宿主集合，
-        // 否则零 resolve（失败按可证明性收口：确证零写 → send_failed，其余 unknown）。
+        // 写即将发生：此时才预留（审计的 started 只属于真正会离机的动作）。
+        match self.reserve_action(ctx, target, action) {
+            Ok(None) => {}
+            Ok(Some(existing)) => {
+                pending.clear_local_inflight(target, interaction_id);
+                return Ok(existing);
+            }
+            Err(error) => {
+                pending.clear_local_inflight(target, interaction_id);
+                return Err(error);
+            }
+        }
+        // autoResolution 在场：先 snooze（恰一帧）且必须 Ok（accepted/duplicate/
+        // noop=已暂停）且卡仍在宿主集合，否则零 resolve。
         if card.auto_resolution {
             if let Err(error) = pending
-                .snooze(target, interaction_id, self.ack_timeout)
+                .snooze(target, interaction_id, &ctx.device_id, self.ack_timeout)
                 .await
             {
+                // resolve 从未写出（可证明零写）：释放在途允许重试；snooze 本身
+                // 幂等（重复/迟到 noop 属已暂停），不会造成双暂停副作用。
+                pending.clear_local_inflight(target, interaction_id);
                 let (state, reason_code) = classify_port_error(&error);
-                if state == ActionState::SendFailed {
-                    pending.clear_local_inflight(target, interaction_id);
-                }
                 let receipt = self.make_receipt(ctx, target, state, reason_code);
                 self.record(&receipt);
                 return Ok(receipt);
             }
-            if !pending.host_has_pending(interaction_id) {
+            if !pending.host_has_pending(target, interaction_id) {
                 // snooze 已写出但宿主集合已无此卡：不猜是否受理，零 resolve。
+                pending.clear_local_inflight(target, interaction_id);
                 let receipt = self.make_receipt(
                     ctx,
                     target,
@@ -372,7 +411,9 @@ impl CommandSender {
         let mut receipt = self
             .dispatch_resolve(ctx, target, interaction_id, answer)
             .await;
-        if receipt.state != ActionState::Accepted && !pending.host_has_pending(interaction_id) {
+        if receipt.state != ActionState::Accepted
+            && !pending.host_has_pending(target, interaction_id)
+        {
             receipt.state = ActionState::Unknown;
             receipt.reason_code = Some(codes::STALE_PENDING.to_owned());
         }
@@ -381,7 +422,7 @@ impl CommandSender {
             pending.mark_resolved_local(target, interaction_id);
             self.record(&receipt);
             if pending
-                .wait_host_cleared(interaction_id, baseline, self.confirm_timeout)
+                .wait_host_cleared(target, interaction_id, baseline, self.confirm_timeout)
                 .await
             {
                 // 只有「代数前进 + 卡消失」才是因果终态；超时停在 accepted。
@@ -391,12 +432,18 @@ impl CommandSender {
         } else if receipt.state == ActionState::SendFailed {
             // 确证零写：释放本地在途，用户可重试同一张卡。
             pending.clear_local_inflight(target, interaction_id);
+        } else if matches!(receipt.state, ActionState::Rejected | ActionState::Noop) {
+            // 宿主显式拒绝/无需处理且卡仍在：本次应答可证明未生效，放开重试；
+            // 写后 unknown（含 ACK 超窗）保持闸（防双目重复作答），只由宿主
+            // 后续撤卡帧或换代释放。
+            pending.clear_local_inflight(target, interaction_id);
         }
         self.record(&receipt);
         Ok(receipt)
     }
 
-    /// 暂停问答卡自动结束计时（独立动作）：不消费卡，结果无论如何都释放本地在途。
+    /// 暂停问答卡自动结束计时（独立动作）：只读幂等预检 → 授权 → 写前预留 →
+    /// 恰一帧 snooze。不消费卡，结果无论如何都释放本地在途。
     async fn execute_snooze(
         &self,
         ctx: &ActionContext,
@@ -409,12 +456,23 @@ impl CommandSender {
         let Some(pending) = self.pending.as_ref() else {
             return Err(ZcodeError::of(codes::NOT_READY));
         };
-        if let Some(existing) = self.reserve_action(ctx, target, action)? {
+        if let Some(existing) = self.lookup_action(ctx, target, action)? {
             return Ok(existing);
         }
         pending.authorize_pending(target, interaction_id).await?;
+        match self.reserve_action(ctx, target, action) {
+            Ok(None) => {}
+            Ok(Some(existing)) => {
+                pending.clear_local_inflight(target, interaction_id);
+                return Ok(existing);
+            }
+            Err(error) => {
+                pending.clear_local_inflight(target, interaction_id);
+                return Err(error);
+            }
+        }
         let result = pending
-            .snooze(target, interaction_id, self.ack_timeout)
+            .snooze(target, interaction_id, &ctx.device_id, self.ack_timeout)
             .await;
         // snooze 不消费卡：用户之后仍要作答，必须放开本地在途闸。
         pending.clear_local_inflight(target, interaction_id);
@@ -425,8 +483,9 @@ impl CommandSender {
                 Ok(receipt)
             }
             Err(error) => {
-                // 冻结映射：noop → stale_pending、rejected → invalid_action、超窗 → unknown；
-                // 三类都按错误上抛（不是成功回执），账本按可证明性保守收口。
+                // 冻结映射：rejected → invalid_action、超窗 → unknown（noop 已是
+                // 幂等成功）；两类都按错误上抛（不是成功回执），账本按可证明性
+                // 保守收口。
                 let (state, reason_code) = classify_port_error(&error);
                 let receipt = self.make_receipt(ctx, target, state, reason_code);
                 self.record(&receipt);
@@ -1534,6 +1593,8 @@ mod tests {
             consumed: BTreeSet<String>,
             snooze_result: Result<(), &'static str>,
             snooze_calls: usize,
+            /// 每次 snooze 收到的 clientId（断言与 resolve/send 同源）。
+            snooze_clients: Vec<String>,
             /// `wait_host_cleared` 首次轮询时模拟宿主撤卡（推进代数 + 移出集合）。
             clear_on_wait: bool,
         }
@@ -1552,6 +1613,7 @@ mod tests {
                         consumed: BTreeSet::new(),
                         snooze_result: Ok(()),
                         snooze_calls: 0,
+                        snooze_clients: Vec::new(),
                         clear_on_wait: false,
                     }),
                 })
@@ -1561,11 +1623,35 @@ mod tests {
                 self.inner.lock().unwrap().snooze_result = Err(code);
             }
 
+            fn set_snooze_ok(&self) {
+                self.inner.lock().unwrap().snooze_result = Ok(());
+            }
+
             fn clear_host_card(&self) {
                 let mut state = self.inner.lock().unwrap();
                 let interaction_id = state.card.interaction_id.clone();
                 state.host_ids.remove(&interaction_id);
                 state.host_revision += 1;
+            }
+
+            /// 宿主帧整体替换为「不含该卡」（镜像 `PendingBook::replace_pendings`：
+            /// 撤卡帧同时释放写后未知的在途闸，本地展示同步撤卡）。
+            fn host_frame_without_card(&self) {
+                let mut state = self.inner.lock().unwrap();
+                let interaction_id = state.card.interaction_id.clone();
+                state.host_ids.remove(&interaction_id);
+                state.host_revision += 1;
+                state.inflight.remove(&interaction_id);
+                state.local_present = false;
+            }
+
+            /// 宿主后续帧重新列出该 id（同一卡回到展示面）。
+            fn host_frame_relists_card(&self) {
+                let mut state = self.inner.lock().unwrap();
+                let interaction_id = state.card.interaction_id.clone();
+                state.host_ids.insert(interaction_id);
+                state.host_revision += 1;
+                state.local_present = true;
             }
 
             fn clear_on_wait(&self) {
@@ -1574,6 +1660,14 @@ mod tests {
 
             fn snooze_calls(&self) -> usize {
                 self.inner.lock().unwrap().snooze_calls
+            }
+
+            fn snooze_clients(&self) -> Vec<String> {
+                self.inner.lock().unwrap().snooze_clients.clone()
+            }
+
+            fn inflight(&self, interaction_id: &str) -> bool {
+                self.inner.lock().unwrap().inflight.contains(interaction_id)
             }
 
             fn consumed(&self, interaction_id: &str) -> bool {
@@ -1607,27 +1701,38 @@ mod tests {
 
             fn snooze<'a>(
                 &'a self,
-                _target: &'a BoundTarget,
+                target: &'a BoundTarget,
                 _interaction_id: &'a str,
+                client_id: &'a str,
                 _timeout: Duration,
             ) -> BoxFuture<'a, ZResult<()>> {
                 Box::pin(async move {
                     let mut state = self.inner.lock().unwrap();
+                    if *target != state.target {
+                        return Err(ZcodeError::of(codes::STALE_PENDING));
+                    }
                     state.snooze_calls += 1;
+                    state.snooze_clients.push(client_id.to_owned());
                     state.snooze_result.map_err(ZcodeError::of)
                 })
             }
 
-            fn host_pending_revision(&self) -> u64 {
-                self.inner.lock().unwrap().host_revision
+            fn host_pending_revision(&self, target: &BoundTarget) -> u64 {
+                let state = self.inner.lock().unwrap();
+                if *target != state.target {
+                    return 0;
+                }
+                state.host_revision
             }
 
-            fn host_has_pending(&self, interaction_id: &str) -> bool {
-                self.inner.lock().unwrap().host_ids.contains(interaction_id)
+            fn host_has_pending(&self, target: &BoundTarget, interaction_id: &str) -> bool {
+                let state = self.inner.lock().unwrap();
+                *target == state.target && state.host_ids.contains(interaction_id)
             }
 
             fn wait_host_cleared<'a>(
                 &'a self,
+                target: &'a BoundTarget,
                 interaction_id: &'a str,
                 baseline_revision: u64,
                 timeout: Duration,
@@ -1639,6 +1744,9 @@ mod tests {
                     loop {
                         {
                             let mut state = self.inner.lock().unwrap();
+                            if *target != state.target {
+                                return false;
+                            }
                             if state.clear_on_wait && state.host_revision == baseline_revision {
                                 state.clear_on_wait = false;
                                 state.host_ids.remove(interaction_id);
@@ -1874,14 +1982,12 @@ mod tests {
 
             assert_eq!(receipt.state, ActionState::Accepted);
             assert!(pending.consumed("ix-1"), "ACK 受理后本地必须消费");
-            assert!(pending.host_has_pending("ix-1"), "本地消费不得改动宿主集合");
-            // 宿主集合没动 → 观察窗内不可能 confirmed。
-            let baseline = pending.host_pending_revision();
             assert!(
-                !pending
-                    .wait_host_cleared("ix-1", baseline, Duration::from_millis(20))
-                    .await
+                pending.host_has_pending(&target(), "ix-1"),
+                "本地消费不得改动宿主集合"
             );
+            // 线上恰一帧 resolve（不依赖测试替身自己的轮询循环）。
+            assert_eq!(resolve_frames(&fake).len(), 1);
             assert_eq!(stored_state(&store, "a-1").as_deref(), Some("accepted"));
         }
 
@@ -1982,11 +2088,8 @@ mod tests {
             assert_eq!(fake.wire(), 0, "未支持 schema 必须零 resolve 帧");
             assert_eq!(pending.snooze_calls(), 0, "未支持 schema 也不得先 snooze");
             assert!(!pending.consumed("ix-plan"), "零 value 不得消费卡");
-            assert_eq!(
-                stored_state(&store, "a-1").as_deref(),
-                Some("reserved"),
-                "失败不得落成受理"
-            );
+            assert_eq!(stored_state(&store, "a-1"), None, "本地拒绝不得留下账本行");
+            assert!(audits(&store).is_empty(), "本地拒绝不得写 started 审计");
         }
 
         /// snooze 未证实（失败或卡已不在宿主集合）：零 resolve。
@@ -2111,7 +2214,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(ack_only.state, ActionState::Accepted);
-            assert!(pending.host_has_pending("ix-1"));
+            assert!(pending.host_has_pending(&target(), "ix-1"));
             assert_eq!(stored_state(&store, "a-1").as_deref(), Some("accepted"));
 
             // ② ACK 后宿主撤卡（代数前进 + id 消失）才是 confirmed。
@@ -2128,7 +2231,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(confirmed.state, ActionState::Confirmed);
-            assert!(!pending2.host_has_pending("ix-1"));
+            assert!(!pending2.host_has_pending(&target(), "ix-1"));
             assert_eq!(stored_state(&store, "a-2").as_deref(), Some("confirmed"));
         }
 
@@ -2260,6 +2363,309 @@ mod tests {
             assert_eq!(second, first, "同 actionId 同载荷必须返回既有回执");
             assert_eq!(resolve_frames(&fake).len(), 1, "重放零第二帧");
             assert_eq!(row_count(&store), 1);
+        }
+
+        // ============================================================
+        // Fix round 1：snooze 幂等 noop / 在途闸释放 / 预留顺序 / 失败面
+        // ============================================================
+
+        /// snooze 的 `noop`（宿主「已暂停」）是幂等成功：卡仍在宿主集合 → 照常
+        /// 恰一帧 resolve（重复 snooze 不得把卡锁死）。
+        #[tokio::test]
+        async fn snooze_noop_is_already_snoozed_then_resolves() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            // FakePending 的 `Ok` 即端口语义「accepted/duplicate/noop 均已暂停」。
+            let pending = fake_pending(card(
+                "ix-1",
+                true,
+                vec![question("原题？", &["A"], false, false)],
+            ));
+            let sender = answer_sender(&fake, &pending, &store);
+
+            let receipt = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(pending.snooze_calls(), 1, "snooze 恰一帧");
+            assert_eq!(
+                pending.snooze_clients(),
+                vec![DEVICE.to_owned()],
+                "snooze 的 clientId 必须与 resolve 同源（可信设备 id）"
+            );
+            assert_eq!(resolve_frames(&fake).len(), 1, "noop 后仍必须 resolve");
+            assert_eq!(fake.envelope(0)["clientId"], json!(DEVICE));
+        }
+
+        /// snooze 被宿主显式拒绝：硬失败，零 resolve，释放在途（可重试）。
+        #[tokio::test]
+        async fn snooze_rejected_zero_resolve() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(card(
+                "ix-1",
+                true,
+                vec![question("原题？", &["A"], false, false)],
+            ));
+            pending.set_snooze_error(codes::INVALID_ACTION);
+            let sender = answer_sender(&fake, &pending, &store);
+
+            let receipt = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Unknown);
+            assert_eq!(receipt.reason_code.as_deref(), Some(codes::INVALID_ACTION));
+            assert_eq!(pending.snooze_calls(), 1, "snooze 恰一帧");
+            assert_eq!(resolve_frames(&fake).len(), 0, "rejected 必须零 resolve");
+            assert!(
+                !pending.inflight("ix-1"),
+                "resolve 未写出（可证明零写）必须释放在途"
+            );
+
+            // 释放后可重试：宿主下次接受 snooze → 恰一帧 resolve。
+            pending.set_snooze_ok();
+            let retry = sender
+                .execute(
+                    &ctx("a-2"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry.state, ActionState::Accepted);
+            assert_eq!(resolve_frames(&fake).len(), 1);
+        }
+
+        /// resolve ACK `rejected` 且卡仍在宿主集合：释放本地在途，用户可换新
+        /// actionId 重试（宿主 alreadyResolved 幂等是最后防线）。
+        #[tokio::test]
+        async fn rejected_resolve_releases_inflight() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(json!({"status": "rejected"})));
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+
+            let rejected = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rejected.state, ActionState::Rejected);
+            assert!(!pending.inflight("ix-1"), "rejected 必须释放在途闸");
+            assert_eq!(resolve_frames(&fake).len(), 1);
+
+            fake.set_reply(Reply::Body(accepted_body()));
+            let retry = sender
+                .execute(
+                    &ctx("a-2"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry.state, ActionState::Accepted, "新 actionId 可重试");
+            assert_eq!(resolve_frames(&fake).len(), 2, "恰一帧/次，无自动重发");
+            assert_eq!(row_count(&store), 2);
+        }
+
+        /// 写后 unknown 保留在途闸（不自动重试）；只有宿主撤卡帧才释放。
+        #[tokio::test]
+        async fn unknown_keeps_gate_until_host_frame() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Error(codes::NOT_READY));
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+            let answers = vec![answer_entry("原题？", &["A"])];
+
+            let unknown = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-1", answers.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(unknown.state, ActionState::Unknown);
+            assert!(pending.inflight("ix-1"), "写后未知不得自动放开在途闸");
+            assert_eq!(resolve_frames(&fake).len(), 1);
+
+            // 宿主帧仍列该卡：闸保持，重试 stale 且零新帧。
+            let blocked = sender
+                .execute(
+                    &ctx("a-2"),
+                    &target(),
+                    &answer_action("ix-1", answers.clone()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(blocked.code, "stale_pending");
+            assert_eq!(resolve_frames(&fake).len(), 1, "未知结果绝不自动重发");
+
+            // 宿主帧撤卡（册整体替换缺席）→ 闸释放、展示同步撤下。
+            pending.host_frame_without_card();
+            assert!(!pending.inflight("ix-1"));
+            let hidden = sender
+                .execute(
+                    &ctx("a-3"),
+                    &target(),
+                    &answer_action("ix-1", answers.clone()),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(hidden.code, "stale_pending", "撤卡后本地展示不得复活");
+
+            // 宿主后续帧重新列出该 id：无需人工清闸即可重新作答。
+            pending.host_frame_relists_card();
+            fake.set_reply(Reply::Body(accepted_body()));
+            let retried = sender
+                .execute(&ctx("a-4"), &target(), &answer_action("ix-1", answers))
+                .await
+                .unwrap();
+            assert_eq!(retried.state, ActionState::Accepted);
+            assert_eq!(resolve_frames(&fake).len(), 2);
+        }
+
+        /// 本地答案校验失败：零 resolve、零账本行、零审计（预留晚于校验）。
+        #[tokio::test]
+        async fn invalid_answer_leaves_no_reservation() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+
+            let error = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-1", vec![answer_entry("原题？", &["Z"])]),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_answer");
+            assert_eq!(resolve_frames(&fake).len(), 0);
+            assert_eq!(row_count(&store), 0, "本地拒绝不得留下 reserved 行");
+            assert!(audits(&store).is_empty(), "本地拒绝不得写 started 审计");
+            assert!(!pending.inflight("ix-1"), "校验失败必须释放在途");
+        }
+
+        /// 授权失败（卡已撤/锚过期）：零 resolve、零账本行、零审计。
+        #[tokio::test]
+        async fn stale_pending_leaves_no_reservation() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+
+            let error = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-missing", vec![answer_entry("原题？", &["A"])]),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "stale_pending");
+            assert_eq!(resolve_frames(&fake).len(), 0);
+            assert_eq!(row_count(&store), 0, "授权失败不得留下 reserved 行");
+            assert!(audits(&store).is_empty(), "授权失败不得写 started 审计");
+        }
+
+        /// resolve 确证零写（桥绑定拒绝）：send_failed 释放在途并允许新 actionId 重试。
+        #[tokio::test]
+        async fn resolve_zero_write_releases_inflight() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Error(codes::STALE_GENERATION));
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+            let answers = vec![answer_entry("原题？", &["A"])];
+
+            let failed = sender
+                .execute(
+                    &ctx("a-1"),
+                    &target(),
+                    &answer_action("ix-1", answers.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(failed.state, ActionState::SendFailed);
+            assert!(!pending.inflight("ix-1"), "确证零写必须释放在途闸");
+
+            fake.set_reply(Reply::Body(accepted_body()));
+            let retry = sender
+                .execute(&ctx("a-2"), &target(), &answer_action("ix-1", answers))
+                .await
+                .unwrap();
+            assert_eq!(retry.state, ActionState::Accepted);
+            assert_eq!(resolve_frames(&fake).len(), 2, "两次各恰一帧");
+        }
+
+        /// 独立 Snooze 动作：accepted / rejected / timeout 的收口与零 resolve。
+        #[tokio::test]
+        async fn standalone_snooze_execute_outcomes() {
+            let snooze = ControlAction::Snooze {
+                session_id: SESSION.to_string(),
+                generation: GEN,
+                interaction_id: "ix-1".to_string(),
+            };
+
+            // accepted：受理回执，账本 accepted，不消费卡且在途已释放。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(single_card("ix-1"));
+            let sender = answer_sender(&fake, &pending, &store);
+            let receipt = sender
+                .execute(&ctx("a-1"), &target(), &snooze)
+                .await
+                .unwrap();
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_eq!(pending.snooze_calls(), 1);
+            assert_eq!(pending.snooze_clients(), vec![DEVICE.to_owned()]);
+            assert!(!pending.inflight("ix-1"), "snooze 不消费卡，必须释放在途");
+            assert!(pending.host_has_pending(&target(), "ix-1"));
+            assert_eq!(resolve_frames(&fake).len(), 0);
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("accepted"));
+
+            // rejected：错误原样上抛，账本保守 unknown，零 resolve。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(single_card("ix-1"));
+            pending.set_snooze_error(codes::INVALID_ACTION);
+            let sender = answer_sender(&fake, &pending, &store);
+            let error = sender
+                .execute(&ctx("a-1"), &target(), &snooze)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_action");
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("unknown"));
+            assert!(!pending.inflight("ix-1"));
+
+            // 超窗 unknown：错误上抛，账本 unknown，绝不重发。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let pending = fake_pending(single_card("ix-1"));
+            pending.set_snooze_error(codes::UNKNOWN);
+            let sender = answer_sender(&fake, &pending, &store);
+            let error = sender
+                .execute(&ctx("a-1"), &target(), &snooze)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "unknown");
+            assert_eq!(pending.snooze_calls(), 1);
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("unknown"));
         }
     }
 }

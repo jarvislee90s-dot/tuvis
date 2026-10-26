@@ -294,8 +294,8 @@ pub struct AnswerEntry {
 
 /// 统一控制动作（tagged `kind`；**全部**携 `sessionId,generation`）。
 ///
-/// 本批只实现 `Send`；其余变体在 `CommandSender::execute` 一律 `invalid_action`
-/// 且零帧零写（不伪造成功），由 T4–T6 逐个分支接入。
+/// 已接入 `Send`/`Answer`/`Snooze`；其余变体在 `CommandSender::execute` 一律
+/// `invalid_action` 且零帧零写（不伪造成功），由 T4.2–T6 逐个分支接入。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ControlAction {
@@ -434,15 +434,19 @@ pub trait CommandPort: Send + Sync {
 /// - `authorize_pending`：只证明「本进程尚未提交这张卡」，**不**代表宿主已收口；
 ///   错会话/错代际/卡已撤/重复提交 → `stale_pending`（零副作用）；投影不新鲜 →
 ///   `not_ready`（零副作用）。
-/// - `snooze`：ACK `accepted`/`duplicate` → `Ok`；`noop` → `Err(stale_pending)`
-///   （宿主不需要暂停计时了，不是成功）；`rejected` → `Err(invalid_action)`；
-///   应答窗超窗（`not_ready`，与就绪闸不可区分）→ `Err(unknown)`；绝不重发。
-/// - `host_pending_revision` / `host_has_pending`：宿主观察代数与宿主集合
-///   （**与本地消费/在途无关**；本地消费不等于宿主撤卡）。多会话管理器下按当前
-///   绑定会话的 pending 册聚合（代数求和）：同一绑定生命周期内每次宿主整体替换 +1
-///   且不减；换代/失效会清空册，调用方必须**重取基线**后才等终态。
-/// - `wait_host_cleared`：有界轮询，**只有**代数前进**且**该 id 不在宿主集合时才
-///   `true`；超时 `false`。绝不持锁 await，绝不忙等（≤ [`PENDING_CLEARED_POLL`]）。
+/// - `snooze`：ACK `accepted`/`duplicate` → `Ok`；`noop` → `Ok`（官方语义是
+///   「首次有效操作已永久暂停，重复/迟到幂等 noop」——卡若因先前操作已 snoozed，
+///   前置条件已满足，调用方仍须自行确认卡仍在宿主集合再 resolve）；
+///   `rejected` → `Err(invalid_action)`（硬失败，零 resolve）；应答窗超窗
+///   （`not_ready`，与就绪闸不可区分）→ `Err(unknown)`；绝不重发。
+///   `client_id` 必须来自可信调用方上下文（配对门/本机 DB），与 resolve 用同一身份。
+/// - `host_pending_revision` / `host_has_pending`：**精确目标**（会话 + 代际 +
+///   workspace 绑定）的宿主观察代数与宿主集合（**与本地消费/在途无关**；本地消费
+///   不等于宿主撤卡）。同一绑定生命周期内每次宿主整体替换 +1 且不减；兄弟会话的
+///   帧绝不影响本目标的判定。目标已换代/未绑定 → 代数 `0`、集合 `false`。
+/// - `wait_host_cleared`：有界轮询，**只有**该目标代数前进**且**该 id 不在其宿主
+///   集合时才 `true`；超时 `false`；等待期间目标换代/绑定消失 → `false`（绝不拿
+///   别的会话证据确认）。绝不持锁 await，绝不忙等（≤ [`PENDING_CLEARED_POLL`]）。
 pub trait PendingPort: Send + Sync {
     /// 精确目标上的应答授权（返回卡的原值克隆；不触碰宿主集合）。
     fn authorize_pending<'a>(
@@ -456,18 +460,21 @@ pub trait PendingPort: Send + Sync {
         &'a self,
         target: &'a BoundTarget,
         interaction_id: &'a str,
+        client_id: &'a str,
         timeout: Duration,
     ) -> BoxFuture<'a, ZResult<()>>;
 
-    /// 宿主 pending 集合的观察代数（每次整体替换 +1；同一绑定生命周期内不减）。
-    fn host_pending_revision(&self) -> u64;
+    /// **精确目标**的宿主 pending 观察代数（每次整体替换 +1；同一绑定生命周期内不减）。
+    fn host_pending_revision(&self, target: &BoundTarget) -> u64;
 
-    /// 宿主最近一帧里是否仍有这张卡（与本地消费/在途无关）。
-    fn host_has_pending(&self, interaction_id: &str) -> bool;
+    /// **精确目标**宿主最近一帧里是否仍有这张卡（与本地消费/在途无关）。
+    fn host_has_pending(&self, target: &BoundTarget, interaction_id: &str) -> bool;
 
-    /// 等宿主撤卡终态：代数前进**且**该 id 不在宿主集合 → `true`；超时 → `false`。
+    /// 等**精确目标**的宿主撤卡终态：该目标代数前进**且**该 id 不在其宿主集合 →
+    /// `true`；超时或等待期间目标换代/绑定消失 → `false`。
     fn wait_host_cleared<'a>(
         &'a self,
+        target: &'a BoundTarget,
         interaction_id: &'a str,
         baseline_revision: u64,
         timeout: Duration,
@@ -477,8 +484,9 @@ pub trait PendingPort: Send + Sync {
     /// 撤卡（宿主集合由下一帧整体替换独立推进）。错会话/错代际/卡不存在 → 零副作用。
     fn mark_resolved_local(&self, target: &BoundTarget, interaction_id: &str);
 
-    /// 确证零写（绑定/编码拒绝、答案校验失败）后释放本地在途：用户可以同一张卡重试。
-    /// 写后结果未知时**不得**调用（那会放开重复提交闸）。
+    /// 确证零写（绑定/编码拒绝、答案校验失败）或宿主帧已撤卡后释放本地在途：
+    /// 用户可以同一张卡重试。写后结果未知且宿主仍列该卡时**不得**调用（那会放开
+    /// 重复提交闸）；该闸只由宿主后续撤卡帧（册整体替换时缺席）或换代自然释放。
     fn clear_local_inflight(&self, target: &BoundTarget, interaction_id: &str);
 }
 

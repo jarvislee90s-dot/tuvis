@@ -1037,37 +1037,40 @@ fn epoch_ms() -> i64 {
 
 /// snooze 的 ACK 分类（官方 `CommandAck.status`）。
 ///
-/// 只认显式状态：`accepted`/`duplicate` 才是受理；`noop`（如已收口/已在 snooze）
-/// 语义上不是成功，`rejected` 是宿主拒绝；无法解释的应答按保守 `unknown`。
+/// `accepted`/`duplicate`/`noop` 都是「已暂停」的成功口径：官方语义是「首次有效
+/// 操作永久暂停本次自动结束；重复/迟到幂等 noop」（探针 `interactionBridge.ts:655-656`）
+/// ——卡若因先前操作已 snoozed，前置条件其实已满足，不得把 noop 折成硬失败（否则
+/// 每次作答都会二次 snooze → noop → 零 resolve，卡片永久不可答）。`rejected` 是
+/// 宿主显式拒绝（硬失败，零 resolve）；无法解释的应答按保守 `unknown`。
 fn classify_snooze_ack(ack: &Value) -> ZResult<()> {
     match ack.get("status").and_then(Value::as_str) {
-        Some("accepted") | Some("duplicate") => Ok(()),
-        Some("noop") => Err(ZcodeError::of(codes::STALE_PENDING)),
+        Some("accepted") | Some("duplicate") | Some("noop") => Ok(()),
         Some("rejected") => Err(ZcodeError::of(codes::INVALID_ACTION)),
         _ => Err(ZcodeError::unknown()),
     }
 }
 
 impl BridgeManager {
-    /// 在状态锁内读宿主 pending 观察：绑定会话册的观察代数之和 + 该 id 是否仍在任一册。
-    ///
-    /// 代数按会话册求和（同一绑定生命周期内每次整体替换 +1 且不减）：
-    /// `wait_host_cleared` 的「前进」判定与「id 缺席」是**且**关系，兄弟会话的替换
-    /// 不会单独让本卡被误判收口；换代清册后代数回落，调用方须重取基线。
-    fn host_pending_observation(&self, interaction_id: &str) -> (u64, bool) {
+    /// 在状态锁内读**精确目标**的宿主 pending 观察：该会话册的观察代数 + 该 id
+    /// 是否仍在册。目标换代/未绑定 → `None`（绝不拿兄弟会话的证据顶替）。
+    fn host_pending_observation(
+        &self,
+        target: &BoundTarget,
+        interaction_id: &str,
+    ) -> Option<(u64, bool)> {
         let inner = lock(&self.shared.state);
-        let revision = inner
-            .sessions
-            .values()
-            .map(|entry| entry.projection.pending_book().host_pending_revision())
-            .fold(0u64, u64::saturating_add);
-        let present = inner.sessions.values().any(|entry| {
-            entry
-                .projection
-                .pending_book()
-                .host_has_pending(interaction_id)
-        });
-        (revision, present)
+        if inner.generation != target.generation {
+            return None;
+        }
+        let entry = inner.sessions.get(&target.session_id)?;
+        if entry.target != *target {
+            return None;
+        }
+        let book = entry.projection.pending_book();
+        Some((
+            book.host_pending_revision(),
+            book.host_has_pending(interaction_id),
+        ))
     }
 }
 
@@ -1111,17 +1114,20 @@ impl PendingPort for BridgeManager {
         &'a self,
         target: &'a BoundTarget,
         interaction_id: &'a str,
+        client_id: &'a str,
         timeout: Duration,
     ) -> futures::future::BoxFuture<'a, ZResult<()>> {
         Box::pin(async move {
             if interaction_id.trim().is_empty() || interaction_id.trim() != interaction_id {
                 return Err(ZcodeError::of(codes::INVALID_ACTION));
             }
+            if client_id.trim().is_empty() {
+                return Err(ZcodeError::of(codes::INVALID_ACTION));
+            }
             let envelope = serde_json::json!({
                 "commandId": super::command::new_command_id(),
-                // 无设备上下文：clientId 取本域稳定、无秘密的客户端标识
-                // （commandId 仍是随机 UUID，语义身份不依赖它）。
-                "clientId": CLIENT_ID,
+                // clientId 与 resolve/send 同源：只来自可信调用方上下文（配对门/本机 DB）。
+                "clientId": client_id,
                 "sessionId": target.session_id,
                 "type": SNOOZE_INTERACTION_TYPE,
                 "payload": { "interactionId": interaction_id },
@@ -1148,20 +1154,26 @@ impl PendingPort for BridgeManager {
         })
     }
 
-    fn host_pending_revision(&self) -> u64 {
-        self.host_pending_observation("").0
+    fn host_pending_revision(&self, target: &BoundTarget) -> u64 {
+        self.host_pending_observation(target, "")
+            .map(|(revision, _)| revision)
+            .unwrap_or(0)
     }
 
-    fn host_has_pending(&self, interaction_id: &str) -> bool {
-        self.host_pending_observation(interaction_id).1
+    fn host_has_pending(&self, target: &BoundTarget, interaction_id: &str) -> bool {
+        self.host_pending_observation(target, interaction_id)
+            .map(|(_, present)| present)
+            .unwrap_or(false)
     }
 
-    /// 有界轮询宿主终态：代数前进**且**该 id 不在宿主集合 → `true`；超时 → `false`。
+    /// 有界轮询**精确目标**的宿主终态：代数前进**且**该 id 不在宿主集合 → `true`；
+    /// 超时或等待期间目标换代/绑定消失 → `false`。
     ///
     /// 每次判定在状态锁内完成、锁外 `sleep`（≤ [`PENDING_CLEARED_POLL`]），绝不忙等、
-    /// 绝不持锁 await；本地消费/授权不推进代数，只有宿主自己的整体替换才算数。
+    /// 绝不持锁 await；本地消费/授权不推进代数，只有目标自己的整体替换才算数。
     fn wait_host_cleared<'a>(
         &'a self,
+        target: &'a BoundTarget,
         interaction_id: &'a str,
         baseline_revision: u64,
         timeout: Duration,
@@ -1171,11 +1183,14 @@ impl PendingPort for BridgeManager {
                 .checked_add(timeout)
                 .unwrap_or_else(Instant::now);
             loop {
-                {
-                    let (revision, present) = self.host_pending_observation(interaction_id);
-                    if revision > baseline_revision && !present {
-                        return true;
+                match self.host_pending_observation(target, interaction_id) {
+                    Some((revision, present)) => {
+                        if revision > baseline_revision && !present {
+                            return true;
+                        }
                     }
+                    // 目标换代/绑定消失：旧基线不再可比，绝不拿别的会话证据确认。
+                    None => return false,
                 }
                 let now = Instant::now();
                 if now >= deadline {
@@ -3124,6 +3139,7 @@ mod tests {
         fn session_bridge_id(&self, session_id: &str) -> String {
             self.sent()
                 .iter()
+                .rev()
                 .find(|payload| {
                     payload.get("zcode_type").and_then(Value::as_str) == Some(WORKSPACE_BRIDGE_OPEN)
                         && payload.get("taskId").and_then(Value::as_str) == Some(session_id)
@@ -5006,15 +5022,26 @@ mod tests {
 
     /// 注入一帧宿主 `snapshot`（pending 集合整体替换 → 观察代数 +1）。
     async fn push_pending_snapshot(peer: &Peer, cards: Vec<Value>) {
-        let bridge = peer.session_bridge_id(SESSION_A);
+        push_pending_snapshot_on(peer, SESSION_A, "conv-sub-synthetic-1", 5, cards).await;
+    }
+
+    /// 向指定会话的当前订阅注入一帧宿主 `snapshot`。
+    async fn push_pending_snapshot_on(
+        peer: &Peer,
+        session_id: &str,
+        subscription: &str,
+        revision: u64,
+        cards: Vec<Value>,
+    ) {
+        let bridge = peer.session_bridge_id(session_id);
         let listen = peer.listen_id(&bridge);
-        let topic = format!("{CONVERSATION_TOPIC_PREFIX}{SESSION_A}");
+        let topic = format!("{CONVERSATION_TOPIC_PREFIX}{session_id}");
         let wire = test_wire(
-            &topic,
-            "conv-sub-synthetic-1",
+            topic.as_str(),
+            subscription,
             json!({
                 "kind": "snapshot",
-                "snapshot": conversation_snapshot(SESSION_A, 5, cards)
+                "snapshot": conversation_snapshot(session_id, revision, cards)
             }),
         );
         peer.inject_frame(
@@ -5055,8 +5082,8 @@ mod tests {
         );
 
         // 授权不动宿主集合/观察代数（本地 in-flight ≠ 宿主收口）。
-        let revision = manager.host_pending_revision();
-        assert!(manager.host_has_pending(PENDING));
+        let revision = manager.host_pending_revision(&target);
+        assert!(manager.host_has_pending(&target, PENDING));
 
         let duplicate = manager
             .authorize_pending(&target, PENDING)
@@ -5086,9 +5113,9 @@ mod tests {
             .expect_err("unbound sibling session")
             .is(codes::NO_SESSION));
 
-        assert_eq!(manager.host_pending_revision(), revision);
+        assert_eq!(manager.host_pending_revision(&target), revision);
         assert!(
-            manager.host_has_pending(PENDING),
+            manager.host_has_pending(&target, PENDING),
             "stale attempts must not clear the host set"
         );
     }
@@ -5098,11 +5125,13 @@ mod tests {
     async fn snooze_sends_one_frame_and_maps_ack() {
         const PENDING: &str = "pi-synthetic-b1-0002";
         const SNOOZE_TYPE: &str = "snoozeInteractionAutoResolution";
+        const CLIENT: &str = "phone-synthetic-b1";
 
-        // accepted / duplicate → Ok（duplicate = 回放缓存结果，等价受理）。
+        // accepted / duplicate / noop → Ok（noop = 已暂停的幂等回放，前置条件已满足）。
         for ack in [
             json!({"status": "accepted"}),
             json!({"status": "duplicate"}),
+            json!({"status": "noop"}),
         ] {
             let config = PeerConfig {
                 command_ack: Some(ack.clone()),
@@ -5112,9 +5141,9 @@ mod tests {
             let target = manager.bind(&key(SESSION_A)).await.expect("bind");
 
             manager
-                .snooze(&target, PENDING, Duration::from_millis(120))
+                .snooze(&target, PENDING, CLIENT, Duration::from_millis(120))
                 .await
-                .unwrap_or_else(|error| panic!("accepted/duplicate must succeed: {error:?}"));
+                .unwrap_or_else(|error| panic!("accepted/duplicate/noop must succeed: {error:?}"));
 
             let frames = command_frames(&peer, AGENT_SEND_COMMAND_METHOD);
             assert_eq!(
@@ -5134,6 +5163,11 @@ mod tests {
             assert_eq!(envelope["type"], json!(SNOOZE_TYPE));
             assert_eq!(envelope["payload"], json!({"interactionId": PENDING}));
             assert_eq!(
+                envelope["clientId"],
+                json!(CLIENT),
+                "snooze 必须用可信设备 id（与 resolve 同源）"
+            );
+            assert_eq!(
                 envelope["sessionId"],
                 json!(SESSION_A),
                 "target session only"
@@ -5145,21 +5179,7 @@ mod tests {
             );
         }
 
-        // noop → Err(stale_pending)（宿主已不需要暂停计时，不是成功）；恰一帧。
-        let config = PeerConfig {
-            command_ack: Some(json!({"status": "noop"})),
-            ..pending_config(vec![ask_user_question_card(PENDING)])
-        };
-        let (manager, peer) = manager_with(config).await;
-        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
-        assert!(manager
-            .snooze(&target, PENDING, Duration::from_millis(120))
-            .await
-            .expect_err("noop is not success")
-            .is(codes::STALE_PENDING));
-        assert_eq!(command_frames(&peer, AGENT_SEND_COMMAND_METHOD).len(), 1);
-
-        // rejected → Err(invalid_action)；恰一帧。
+        // rejected → Err(invalid_action)（硬失败）；恰一帧。
         let config = PeerConfig {
             command_ack: Some(json!({"status": "rejected"})),
             ..pending_config(vec![ask_user_question_card(PENDING)])
@@ -5167,7 +5187,7 @@ mod tests {
         let (manager, peer) = manager_with(config).await;
         let target = manager.bind(&key(SESSION_A)).await.expect("bind");
         assert!(manager
-            .snooze(&target, PENDING, Duration::from_millis(120))
+            .snooze(&target, PENDING, CLIENT, Duration::from_millis(120))
             .await
             .expect_err("rejected command")
             .is(codes::INVALID_ACTION));
@@ -5181,7 +5201,7 @@ mod tests {
         let (manager, peer) = manager_with(config).await;
         let target = manager.bind(&key(SESSION_A)).await.expect("bind");
         assert!(manager
-            .snooze(&target, PENDING, Duration::from_millis(60))
+            .snooze(&target, PENDING, CLIENT, Duration::from_millis(60))
             .await
             .expect_err("ack window expired")
             .is(codes::UNKNOWN));
@@ -5192,34 +5212,34 @@ mod tests {
         );
     }
 
-    /// 宿主终态：只有代数前进**且**该 id 消失才 true；卡仍在/无帧都 false。
+    /// 宿主终态：只有**目标会话册**代数前进**且**该 id 消失才 true；卡仍在/无帧都 false。
     #[tokio::test]
     async fn wait_host_cleared_requires_revision_advance() {
         const PENDING: &str = "pi-synthetic-b1-0003";
         let (manager, peer) =
             manager_with(pending_config(vec![ask_user_question_card(PENDING)])).await;
-        let _target = manager.bind(&key(SESSION_A)).await.expect("bind");
-        let baseline = manager.host_pending_revision();
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let baseline = manager.host_pending_revision(&target);
         assert_eq!(
             baseline, 1,
             "initial host snapshot is the first replacement"
         );
-        assert!(manager.host_has_pending(PENDING));
+        assert!(manager.host_has_pending(&target, PENDING));
 
         // 无宿主帧：代数没前进 → 超时 false（绝不把「本地等待」当撤卡）。
         assert!(
             !manager
-                .wait_host_cleared(PENDING, baseline, Duration::from_millis(30))
+                .wait_host_cleared(&target, PENDING, baseline, Duration::from_millis(30))
                 .await,
             "no host replacement must not confirm"
         );
 
         // 代数前进但卡仍在：false。
         push_pending_snapshot(&peer, vec![ask_user_question_card(PENDING)]).await;
-        assert!(manager.host_pending_revision() > baseline);
+        assert!(manager.host_pending_revision(&target) > baseline);
         assert!(
             !manager
-                .wait_host_cleared(PENDING, baseline, Duration::from_millis(30))
+                .wait_host_cleared(&target, PENDING, baseline, Duration::from_millis(30))
                 .await,
             "revision advanced but the card is still on the host"
         );
@@ -5227,10 +5247,11 @@ mod tests {
         // 代数前进 + 卡消失：在途等待在撤卡帧到达后 true。
         let waiter = {
             let manager = manager.clone();
+            let target = target.clone();
             let id = PENDING.to_owned();
             tokio::spawn(async move {
                 manager
-                    .wait_host_cleared(&id, baseline, Duration::from_millis(600))
+                    .wait_host_cleared(&target, &id, baseline, Duration::from_millis(600))
                     .await
             })
         };
@@ -5240,12 +5261,12 @@ mod tests {
             waiter.await.expect("waiter task"),
             "advance + absent is confirmed"
         );
-        assert!(!manager.host_has_pending(PENDING));
+        assert!(!manager.host_has_pending(&target, PENDING));
 
         // 撤卡之后再用旧基线：代数已前进且 id 缺席 → 立即 true（不会卡住）。
         assert!(
             manager
-                .wait_host_cleared(PENDING, baseline, Duration::from_millis(30))
+                .wait_host_cleared(&target, PENDING, baseline, Duration::from_millis(30))
                 .await
         );
     }
@@ -5256,9 +5277,9 @@ mod tests {
         const PENDING: &str = "pi-synthetic-b1-0004";
         let (manager, peer) =
             manager_with(pending_config(vec![ask_user_question_card(PENDING)])).await;
-        let _target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
 
-        let mut previous = manager.host_pending_revision();
+        let mut previous = manager.host_pending_revision(&target);
         assert!(previous >= 1);
         for cards in [
             vec![ask_user_question_card(PENDING)],
@@ -5266,14 +5287,88 @@ mod tests {
             vec![ask_user_question_card(PENDING)],
         ] {
             push_pending_snapshot(&peer, cards).await;
-            let current = manager.host_pending_revision();
+            let current = manager.host_pending_revision(&target);
             assert!(
                 current > previous,
                 "each host replacement advances the revision ({current} > {previous})"
             );
             previous = current;
         }
-        assert!(manager.host_pending_revision() >= previous);
+        assert!(manager.host_pending_revision(&target) >= previous);
+    }
+
+    /// 宿主终态证据必须**按目标会话册**取：兄弟会话的撤卡/换代绝不冒充本卡收口。
+    #[tokio::test]
+    async fn wait_host_cleared_is_target_scoped() {
+        const PENDING_A: &str = "pi-synthetic-b1-0005";
+        const PENDING_B: &str = "pi-synthetic-b1-0006";
+        let config = PeerConfig {
+            workspaces: vec![
+                workspace_entry(WS_A, Some("ws-a-identity"), "A"),
+                workspace_entry(WS_B, Some("ws-b-identity"), "B"),
+            ],
+            tasks: vec![
+                task_row(WS_A, SESSION_A, "hi"),
+                task_row(WS_B, SESSION_B, "hi"),
+            ],
+            conversation_snapshot: Some(conversation_snapshot(
+                SESSION_A,
+                2,
+                vec![ask_user_question_card(PENDING_A)],
+            )),
+            // 第二个会话订阅走 resync 快照（Peer 的订阅序号 2 → B）。
+            resync_snapshot: Some(conversation_snapshot(
+                SESSION_B,
+                2,
+                vec![ask_user_question_card(PENDING_B)],
+            )),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let target_a = manager.bind(&key(SESSION_A)).await.expect("bind A");
+        let target_b = manager.bind(&key(SESSION_B)).await.expect("bind B");
+        assert_eq!(target_a.generation, target_b.generation);
+        let baseline_a = manager.host_pending_revision(&target_a);
+        assert!(manager.host_has_pending(&target_a, PENDING_A));
+        assert!(manager.host_has_pending(&target_b, PENDING_B));
+
+        // ① 兄弟会话（B）撤卡：A 的代数/集合不动，等待不得被判 true。
+        push_pending_snapshot_on(&peer, SESSION_B, "conv-sub-synthetic-2", 5, Vec::new()).await;
+        assert!(
+            !manager.host_has_pending(&target_b, PENDING_B),
+            "B 的撤卡帧必须落在 B 册"
+        );
+        assert_eq!(
+            manager.host_pending_revision(&target_a),
+            baseline_a,
+            "B 的帧不得推进 A 的观察代数"
+        );
+        assert!(manager.host_has_pending(&target_a, PENDING_A));
+        assert!(
+            !manager
+                .wait_host_cleared(&target_a, PENDING_A, baseline_a, Duration::from_millis(30))
+                .await,
+            "other session's clear must not confirm A"
+        );
+
+        // ② 换代清册后旧目标不可再用：即使兄弟会话重新挂册把全局代数推过基线，
+        //    旧 targets 也绝不能被判 confirmed（目标已换代 → false）。
+        let stale_a = target_a.clone();
+        manager.invalidate(target_a.generation + 1).await;
+        let _rebound_b = manager.bind(&key(SESSION_B)).await.expect("rebind B");
+        push_pending_snapshot_on(&peer, SESSION_B, "conv-sub-synthetic-3", 6, Vec::new()).await;
+        assert_eq!(
+            manager.host_pending_revision(&stale_a),
+            0,
+            "stale target has no host evidence"
+        );
+        assert!(!manager.host_has_pending(&stale_a, PENDING_A));
+        assert!(
+            !manager
+                .wait_host_cleared(&stale_a, PENDING_A, baseline_a, Duration::from_millis(30))
+                .await,
+            "generation change must never be confirmed by sibling evidence"
+        );
     }
 
     #[tokio::test]
