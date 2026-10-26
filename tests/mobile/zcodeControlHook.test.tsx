@@ -316,7 +316,11 @@ describe("useZcodeControl：回执语义", () => {
   it("stale_get_cannot_overwrite_newer_connection_state", async () => {
     const connectionGate = deferred<Response>();
     installFetch((url) => {
-      if (url === ZCODE_CONNECTION_PATH) return connectionGate.promise;
+      // 同一个延迟响应可能被多次 GET 消费（同代配对跃迁会补一次纠偏读）：
+      // 每次给一个 clone，避免第二次读同 body 报「body unusable」被误判成网络错误。
+      if (url === ZCODE_CONNECTION_PATH) {
+        return connectionGate.promise.then((response) => response.clone());
+      }
       if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
       throw new Error(`unexpected fetch: ${url}`);
     });
@@ -674,5 +678,75 @@ describe("useZcodeControl：SSE 纠偏（不重放动作）", () => {
     });
     expect(result.current.session?.revision).toBe(14);
     expect(postedActions()).toHaveLength(0);
+  });
+
+  it("same_generation_paired_event_refreshes_failed_session", async () => {
+    // 手机先开：首拍连接 needs_auth（gen 3），会话 GET 失败 → session=null。
+    // 桌面端随后配对成功，Hub 发同代（gen 3）connection 帧：代次没变也不能漏掉
+    // 这次「未配对 → 已配对」的跃迁，必须重拉会话，否则手机永远停在空投影。
+    let paired = false;
+    let failSession = true;
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) {
+        return json(
+          connection(
+            paired
+              ? { state: "paired", generation: 3, reasonCode: null }
+              : { state: "needs_auth", generation: 3, reasonCode: "needs_auth" }
+          )
+        );
+      }
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        if (failSession) return json({ error: "offline" }, 503);
+        return json(sessionView({ generation: 3, revision: 21 }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    expect(result.current.connection?.state).toBe("needs_auth");
+    expect(result.current.session).toBeNull();
+    expect(sessionGets()).toBe(1);
+
+    // 同代配对跃迁：paired 帧 generation 仍是 3（没有换代）
+    paired = true;
+    failSession = false;
+    await act(async () => {
+      MockEventSource.latest().emit("connection", {
+        seq: 1,
+        generation: 3,
+        sessionId: SID,
+        kind: "connection",
+        data: connection({ generation: 3 }),
+      });
+      await Promise.resolve();
+    });
+    await flush();
+
+    expect(result.current.connection?.state).toBe("paired");
+    // 必须补一次会话 GET，并把 session 填上（不是只改连接态）
+    expect(sessionGets()).toBeGreaterThan(1);
+    expect(result.current.session?.sessionId).toBe(SID);
+    expect(result.current.session?.generation).toBe(3);
+    expect(result.current.session?.revision).toBe(21);
+
+    // 重复同代 paired 帧（已落地 paired）不再重复拉取
+    const afterPair = sessionGets();
+    await act(async () => {
+      MockEventSource.latest().emit("connection", {
+        seq: 2,
+        generation: 3,
+        sessionId: SID,
+        kind: "connection",
+        data: connection({ generation: 3 }),
+      });
+      await Promise.resolve();
+    });
+    await flush();
+    expect(sessionGets()).toBe(afterPair);
   });
 });
