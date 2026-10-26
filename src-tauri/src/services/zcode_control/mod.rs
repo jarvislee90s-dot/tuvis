@@ -16,7 +16,9 @@
 //! - `selection`：同账号模型/思考档位的纯构造与目录解析（CAS `baseRevision`、
 //!   绝不恢复原值）；
 //! - `hub`：进程内**单实例**控制 Hub（桌面与配对手机共享一条物理连接、代际权威、
-//!   能力闸与事件广播）。
+//!   能力闸与事件广播）；
+//! - `evidence`（**仅 debug 证据构建**）：T8.2 未开闸能力的单次验收许可——内存、
+//!   120 秒、一次用户动作，只放宽能力闸，不放宽目标/权限/`fullAccess` 守卫。
 //!
 //! 官方授权、适配器与写能力由生产计划逐任务装配；授权不塞进 config，也不进 IPC 大文件。
 
@@ -33,6 +35,18 @@ pub mod projection;
 pub mod relay;
 pub mod selection;
 pub mod types;
+
+// T8.2 未开闸能力的「单次验收许可」（默认关）：只允许 **debug 证据构建** 启用。
+// 编译门必须放在始终编译的 mod.rs（不能放进仅 debug 注册的 evidence 模块里）——
+// release + 该 feature 显式拒绝，杜绝验收许可带进发行包（同 `codex-ipc-e2e-stop`）。
+#[cfg(all(feature = "zcode-bridge-evidence", not(debug_assertions)))]
+compile_error!("zcode-bridge-evidence is only allowed in debug evidence builds");
+
+#[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+pub mod evidence;
+
+#[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
+pub use evidence::{EvidencePermit, EvidencePermitStore, EVIDENCE_PERMIT_TTL_MS};
 
 pub use action::{
     action_params, audit_summary, payload_hash, ActionStore, Reservation, T3_ACTION_KIND,

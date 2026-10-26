@@ -32,6 +32,10 @@ marker-helper = ["hook-listener"]
 # E11 测试专用确定性停点（默认关）：只允许 debug 证据构建启用（编译门在
 # codex_control/mod.rs，release 构建显式拒绝）。
 codex-ipc-e2e-stop = []
+# T8.2 未开闸能力的 debug 单次验收许可（默认关）：只允许 debug 证据构建启用
+# （编译门在 zcode_control/mod.rs，release + 该 feature 直接编译失败）。
+# 验收构建：`pnpm tauri dev --features hook-listener,zcode-bridge-evidence`。
+zcode-bridge-evidence = []
 
 [[bin]]
 name = "tuvis"

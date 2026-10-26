@@ -821,3 +821,197 @@ pub struct SessionView {
     pub selection: Option<SelectionView>,
     pub capabilities: CapabilityView,
 }
+
+// ---------------------------------------------------------------------------
+// 能力策略（T8.2）：宿主证据门
+// ---------------------------------------------------------------------------
+
+/// 唯一已取证宿主 APP build（合同 `identity.appBuild`，macOS 3.16.2.8769）。
+pub const EVIDENCED_APP_BUILD: &str = "3.16.2.8769";
+
+/// 已取证 v4 wire 协议版本（合同 operations；与 `bridge::V4_WIRE_PROTOCOL_VERSION` 同值）。
+pub const EVIDENCED_PROTOCOL_VERSION: u32 = 3;
+
+/// 生产能力策略：**所有**控制能力默认关闭，只有实机证据层可以逐项开闸。
+///
+/// 合同 `capabilities` 里的宽泛 `true`（send/userInput/interrupt/model/thoughtLevel…）
+/// 只代表探针在某个 run 里观察到过，不是「本宿主 + 本动作 + 本应用构建」的生产开闸
+/// 证据，因此本策略**绝不**复制它们。
+///
+/// 当前没有以「宿主 + 动作」为粒度的实机证据记录：即使宿主构建/协议/schema/hello
+/// 全部匹配，[`for_host`](Self::for_host) 仍返回
+/// [`production_unverified`](Self::production_unverified)（八项全关，原因码冻结为
+/// `needs_evidence`）。任何未知组合（APP 升级、协议变更、schema/hello 未识别）也只
+/// 得到同一全关矩阵——未知绝不放宽。
+///
+/// 生产代码中**不存在**把能力置 `true` 的路径；测试专用的
+/// [`verified_fixture`](Self::verified_fixture) 由 `#[cfg(test)]` 排除在发布构建之外。
+pub struct CapabilityPolicy;
+
+impl CapabilityPolicy {
+    /// 按宿主证据构造能力矩阵。
+    ///
+    /// - `app_version`：宿主 APP build（逐字比较，升级即失效）；
+    /// - `protocol_version`：v4 wire 协议版本；
+    /// - `schema_known`：宿主交互 schema 已识别；
+    /// - `hello_known`：宿主 hello/clientHello 握手能力已识别。
+    ///
+    /// 任一项不匹配都返回全关矩阵并附 `needs_evidence`；全部匹配也只证明协议面
+    /// 可读，逐能力实机证据仍缺，同样全关。
+    pub fn for_host(
+        app_version: &str,
+        protocol_version: u32,
+        schema_known: bool,
+        hello_known: bool,
+    ) -> CapabilityView {
+        let host_evidenced = app_version == EVIDENCED_APP_BUILD
+            && protocol_version == EVIDENCED_PROTOCOL_VERSION
+            && schema_known
+            && hello_known;
+        if !host_evidenced {
+            // 未知构建/协议/schema/hello：明确按缺证据关闭，绝不猜测兼容。
+            return Self::closed(codes::NEEDS_EVIDENCE);
+        }
+        // 已取证宿主：只证明协议面可读，没有任何动作取得实机证据 → 仍全关。
+        Self::production_unverified()
+    }
+
+    /// 生产默认（未取证）策略：八项控制能力全部关闭，原因码冻结为 `needs_evidence`。
+    pub fn production_unverified() -> CapabilityView {
+        Self::closed(codes::NEEDS_EVIDENCE)
+    }
+
+    /// 全关矩阵（原因码必须是 [`codes`] 的冻结码）。
+    fn closed(reason: &'static str) -> CapabilityView {
+        let flag = || CapabilityFlag {
+            enabled: false,
+            reason_code: Some(reason.to_owned()),
+        };
+        CapabilityView {
+            send: flag(),
+            single_select: flag(),
+            multi_select: flag(),
+            free_text: flag(),
+            interrupt: flag(),
+            approval_reply: flag(),
+            model: flag(),
+            thought_level: flag(),
+        }
+    }
+
+    /// **仅测试**：构造八项全部开闸的矩阵（`reasonCode=None`）。
+    ///
+    /// `#[cfg(test)]` 保证本函数不编入发布构建；它只供闸门/命令用例使用，
+    /// 生产中不存在任何返回开闸矩阵的路径。
+    #[cfg(test)]
+    pub fn verified_fixture() -> CapabilityView {
+        let flag = || CapabilityFlag {
+            enabled: true,
+            reason_code: None,
+        };
+        CapabilityView {
+            send: flag(),
+            single_select: flag(),
+            multi_select: flag(),
+            free_text: flag(),
+            interrupt: flag(),
+            approval_reply: flag(),
+            model: flag(),
+            thought_level: flag(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod policy {
+        use super::*;
+
+        /// 合同 `identity.appBuild`（唯一已取证宿主构建）。
+        const KNOWN_BUILD: &str = "3.16.2.8769";
+        /// 已取证 v4 wire 协议版本。
+        const KNOWN_PROTOCOL: u32 = 3;
+
+        fn flags(view: &CapabilityView) -> [(&'static str, &CapabilityFlag); 8] {
+            [
+                ("send", &view.send),
+                ("single_select", &view.single_select),
+                ("multi_select", &view.multi_select),
+                ("free_text", &view.free_text),
+                ("interrupt", &view.interrupt),
+                ("approval_reply", &view.approval_reply),
+                ("model", &view.model),
+                ("thought_level", &view.thought_level),
+            ]
+        }
+
+        fn assert_all_closed(view: &CapabilityView) {
+            for (name, flag) in flags(view) {
+                assert!(!flag.enabled, "{name} 在没有实机证据时不得开闸");
+                assert_eq!(
+                    flag.reason_code.as_deref(),
+                    Some(codes::NEEDS_EVIDENCE),
+                    "{name} 必须带冻结原因码"
+                );
+            }
+        }
+
+        #[test]
+        fn policy_never_uses_broad_probe_true_as_production_enable() {
+            // 已知构建 + 已知协议 + schema/hello 全部识别，仍不得把探针的宽泛 true
+            //（contract capabilities.send/userInput/interrupt/model/thoughtLevel）当作开闸。
+            let policy = CapabilityPolicy::for_host(KNOWN_BUILD, KNOWN_PROTOCOL, true, true);
+            assert_all_closed(&policy);
+            assert_eq!(policy, CapabilityPolicy::production_unverified());
+            assert_eq!(policy, CapabilityView::default());
+            assert!(!policy.single_select.enabled);
+            assert!(!policy.interrupt.enabled);
+            assert!(!policy.multi_select.enabled);
+            assert!(!policy.approval_reply.enabled);
+        }
+
+        #[test]
+        fn unsupported_protocol_stays_readable_but_control_disabled() {
+            // 未知协议：阅读链（SessionView.ready/正文）不受能力矩阵影响，控制面全关。
+            let policy = CapabilityPolicy::for_host(KNOWN_BUILD, KNOWN_PROTOCOL + 1, true, true);
+            assert_all_closed(&policy);
+            assert_eq!(policy, CapabilityView::default());
+        }
+
+        #[test]
+        fn unknown_schema_or_hello_is_needs_evidence() {
+            for (schema_known, hello_known) in [(false, true), (true, false), (false, false)] {
+                let policy = CapabilityPolicy::for_host(
+                    KNOWN_BUILD,
+                    KNOWN_PROTOCOL,
+                    schema_known,
+                    hello_known,
+                );
+                assert_all_closed(&policy);
+                assert_eq!(policy, CapabilityPolicy::production_unverified());
+            }
+            // 未知 APP 构建同样只是「缺证据」，不是兼容放行。
+            let unknown_build =
+                CapabilityPolicy::for_host("9.9.9.9999", KNOWN_PROTOCOL, true, true);
+            assert_all_closed(&unknown_build);
+        }
+
+        #[test]
+        fn verified_fixture_is_test_only_and_not_default() {
+            // `verified_fixture` 只在 `#[cfg(test)]` 下存在，生产策略永远不等于它。
+            let fixture = CapabilityPolicy::verified_fixture();
+            for (name, flag) in flags(&fixture) {
+                assert!(flag.enabled, "{name} 在测试夹具里应为开闸");
+                assert!(flag.reason_code.is_none(), "{name} 开闸时无原因码");
+            }
+            assert_ne!(fixture, CapabilityView::default());
+            assert_ne!(fixture, CapabilityPolicy::production_unverified());
+            assert_ne!(
+                fixture,
+                CapabilityPolicy::for_host(KNOWN_BUILD, KNOWN_PROTOCOL, true, true)
+            );
+        }
+    }
+}
