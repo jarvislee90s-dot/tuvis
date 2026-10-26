@@ -8,7 +8,7 @@
 //     是用户显式动作；**仅填链接不显示已联机**（语义红线：A4 的 saved 只表示格式已落库）。
 // 夹具只用合成 sid，不含任何真实链接（设计 §4.3「完整链接不写测试夹具」）。
 // mock 模式沿用 tests/settings/remoteSection.test.tsx（vi.hoisted + invoke/event/sonner/opener）。
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
@@ -380,7 +380,8 @@ describe("ZcodeRemoteSettingsCard 官方账号授权与连接（T7.2）", () => 
 
   it("saved_never_implies_connected：保存链接只刷新后端连接态，never 凭链接自证已配对", async () => {
     mockBackend(saved, { status: CONNECTION_NEEDS_AUTH });
-    render(<ToolRemoteSettingsSection />);
+    // 长轮询窗口：本用例锁的是「挂载首读 + 保存成功重读」的精确次数，不让后台轮询掺入。
+    render(<ToolRemoteSettingsSection zcodeStatusPollMs={60_000} />);
     await waitFor(() => expect(getCalls()).toHaveLength(1));
     fireEvent.click(header());
 
@@ -504,7 +505,8 @@ describe("ZcodeRemoteSettingsCard 官方账号授权与连接（T7.2）", () => 
           deviceLabel: state === "paired" ? "Synthetic laptop" : null,
         },
       });
-      render(<ToolRemoteSettingsSection />);
+      // 长轮询窗口：七态逐一轮换靠的是「每轮重新挂载的首读」，不是后台轮询。
+      render(<ToolRemoteSettingsSection zcodeStatusPollMs={60_000} />);
       await waitFor(() => expect(getCalls()).toHaveLength(1));
       fireEvent.click(header());
 
@@ -528,6 +530,109 @@ describe("ZcodeRemoteSettingsCard 官方账号授权与连接（T7.2）", () => 
 
     // 连接态来源是后端 status（每轮一次），不是保存链接推导
     expect(statusCalls()).toHaveLength(1);
+  });
+
+  it("async_connection_state_changes_are_polled_while_mounted", async () => {
+    // 设置卡挂载期间必须跟着后端连接态走：手机/远端把连接推进成 offline/conflict 后，
+    // 卡片文案与「重连」按钮可用性不能在首拍之后永远冻住（只靠保存/按钮动作刷新不够）。
+    // 注入 40ms 轮询窗：亚秒内验证连续两次跃迁，避免真实 1.5s 等待。
+    const control: ControlFixture = {
+      status: {
+        state: "paired",
+        generation: 5,
+        reasonCode: null,
+        deviceLabel: "Synthetic device",
+      },
+    };
+    mockBackend(saved, control);
+    const view = render(<ToolRemoteSettingsSection zcodeStatusPollMs={40} />);
+    await waitFor(() => expect(getCalls()).toHaveLength(1));
+    fireEvent.click(header());
+
+    const connect = () => screen.getByTestId("zcode-connect") as HTMLButtonElement;
+    await waitFor(() =>
+      expect(connectionState()).toHaveAttribute("data-connection-state", "paired")
+    );
+    expect(connect()).toBeDisabled();
+    expect(connectionState().textContent).toMatch(/paired/i);
+
+    // 远端掉线：等挂载期轮询自己把 state 换过来（不点击任何按钮、不保存配置）。
+    control.status = {
+      state: "offline",
+      generation: 6,
+      reasonCode: "offline",
+      deviceLabel: null,
+    };
+    await waitFor(
+      () => expect(connectionState()).toHaveAttribute("data-connection-state", "offline"),
+      { timeout: 2000 }
+    );
+    expect(connect()).toBeEnabled();
+
+    // 冲突：同一轮询通道继续更新，冲突态不可重连。
+    control.status = {
+      state: "conflict",
+      generation: 7,
+      reasonCode: "conflict",
+      deviceLabel: null,
+    };
+    await waitFor(
+      () => expect(connectionState()).toHaveAttribute("data-connection-state", "conflict"),
+      { timeout: 2000 }
+    );
+    expect(connect()).toBeDisabled();
+
+    // 卸载清理：focus / visibilitychange 监听随组件卸载移除，不再发 status 读。
+    view.unmount();
+    const callsAfterUnmount = statusCalls().length;
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    expect(statusCalls()).toHaveLength(callsAfterUnmount);
+  });
+
+  it("in_flight_status_read_queues_one_trailing_refresh", async () => {
+    // 在途守卫不能丢掉刷新请求：persist 保存成功后的强制刷新、runControl 失败后的
+    // 权威重读都可能撞上一次在途轮询。这里模拟「首读挂起 + 期间 focus 两次」：
+    // 首读结束必须补一发（且只补一发），最终状态取补读结果。
+    let release!: (value: unknown) => void;
+    const gate = new Promise<unknown>((resolve) => {
+      release = resolve;
+    });
+    let statusReads = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "zcode_remote_config_get") return saved;
+      if (cmd === "zcode_control_status") {
+        statusReads += 1;
+        if (statusReads === 1) return gate;
+        return { state: "offline", generation: 6, reasonCode: "offline", deviceLabel: null };
+      }
+      return null;
+    });
+
+    render(<ToolRemoteSettingsSection zcodeStatusPollMs={60_000} />);
+    await waitFor(() => expect(statusCalls()).toHaveLength(1));
+    fireEvent.click(header());
+
+    // 首读仍在途：两次 focus 只合并成一个 trailing 请求，不叠发 IPC。
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(statusCalls()).toHaveLength(1);
+
+    await act(async () => {
+      release(CONNECTION_NEEDS_AUTH);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(statusCalls()).toHaveLength(2));
+    await waitFor(() =>
+      expect(connectionState()).toHaveAttribute("data-connection-state", "offline")
+    );
+    // 只补一发：不是每个排队请求各补一发。
+    expect(statusCalls()).toHaveLength(2);
   });
 });
 

@@ -5,6 +5,13 @@
 // RemoteSection 持有（它是六段顺序锁的定位面，A2 就是这么定义的），本段只负责把卡挂上。
 import { ZcodeRemoteSettingsCard } from "@/components/settings/ZcodeRemoteSettingsCard";
 
-export function ToolRemoteSettingsSection() {
-  return <ZcodeRemoteSettingsCard />;
+interface ToolRemoteSettingsSectionProps {
+  /** 透传给 ZCode 卡的连接态轮询间隔（毫秒）；省略 = 卡片默认 1.5s。 */
+  zcodeStatusPollMs?: number;
+}
+
+export function ToolRemoteSettingsSection({
+  zcodeStatusPollMs,
+}: ToolRemoteSettingsSectionProps = {}) {
+  return <ZcodeRemoteSettingsCard statusPollMs={zcodeStatusPollMs} />;
 }
