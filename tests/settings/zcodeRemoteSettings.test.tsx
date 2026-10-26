@@ -566,15 +566,20 @@ describe("ZcodeRemoteSettingsCard i18n zh/en 无缺键（A5）", () => {
     expect([...used].filter((k) => !enKeys.has(k))).toEqual([]);
   });
 
-  it("手机侧发送区原因键（mobile.composer.zcode*）zh/en 同齐备", () => {
+  it("手机侧控制原因键（mobile.zcodeControl.*）zh/en 同齐备", () => {
     const zh = JSON.parse(readFileSync(path.join(root, "src/i18n/locales/zh.json"), "utf8"));
     const en = JSON.parse(readFileSync(path.join(root, "src/i18n/locales/en.json"), "utf8"));
-    const api = readFileSync(path.join(root, "src/mobile/api.ts"), "utf8");
-    const used = [...api.matchAll(/mobile\.composer\.(zcode[A-Za-z0-9_]*)/g)].map((m) => m[1]);
+    // A5/I7：原因面已迁到活的统一控制面板（旧 composer 的 zcode 分支已删），
+    // 因此键集锁定改读面板源码，而不是已不存在的 api.ts zcode 原因映射。
+    const panel = readFileSync(path.join(root, "src/mobile/ZcodeControlPanel.tsx"), "utf8");
+    const used = [...panel.matchAll(/mobile\.zcodeControl\.([A-Za-z0-9_]+)/g)].map((m) => m[1]);
     expect(used.length).toBeGreaterThan(3);
     for (const key of new Set(used)) {
-      expect(zh.mobile.composer[key], `zh 缺 mobile.composer.${key}`).toBeTypeOf("string");
-      expect(en.mobile.composer[key], `en 缺 mobile.composer.${key}`).toBeTypeOf("string");
+      expect(zh.mobile.zcodeControl[key], `zh 缺 mobile.zcodeControl.${key}`).toBeTypeOf("string");
+      expect(en.mobile.zcodeControl[key], `en 缺 mobile.zcodeControl.${key}`).toBeTypeOf("string");
     }
+    // 「打开官方页面」显式辅助入口仍挂在面板上，文案键沿用 mobile.composer 命名空间
+    expect(zh.mobile.composer.zcodeOpenOfficial).toBeTypeOf("string");
+    expect(en.mobile.composer.zcodeOpenOfficial).toBeTypeOf("string");
   });
 });

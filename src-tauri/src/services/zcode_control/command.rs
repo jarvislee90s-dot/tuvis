@@ -470,8 +470,12 @@ impl CommandSender {
     }
 
     /// 注入未知 control 的等待窗与轮询间隔（测试专用：10s 用例不真等 10s）。
-    #[cfg(test)]
-    pub(crate) fn with_initial_control_wait(mut self, timeout: Duration, poll: Duration) -> Self {
+    ///
+    /// `doc(hidden)` 跨 crate 可见：`tests/` 以独立 crate 编译库，看不到
+    /// `cfg(test)` 项（与 `ZcodeHub::with_parts` 同规）；生产装配（`ZcodeHub::new`）
+    /// 不调用本入口。
+    #[doc(hidden)]
+    pub fn with_initial_control_wait(mut self, timeout: Duration, poll: Duration) -> Self {
         self.initial_control_timeout = timeout;
         self.initial_control_poll = poll;
         self

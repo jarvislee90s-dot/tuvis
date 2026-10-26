@@ -482,6 +482,143 @@ describe("useZcodeControl：SSE 纠偏（不重放动作）", () => {
     expect(second.closed).toBe(true);
   });
 
+  it("sse_reconnect_uses_bounded_backoff", async () => {
+    vi.useFakeTimers();
+    try {
+      installFetch((url) => {
+        if (url === ZCODE_CONNECTION_PATH) return json(connection());
+        if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+
+      const { rerender, unmount } = renderHook(({ sid }: { sid: string }) => useZcodeControl(sid), {
+        initialProps: { sid: SID },
+      });
+      await flush();
+      expect(MockEventSource.instances).toHaveLength(1);
+
+      const advance = async (ms: number) => {
+        await act(async () => {
+          vi.advanceTimersByTime(ms);
+        });
+        await flush();
+      };
+      /** 断流一次，断言「恰好 delay 毫秒后才新建一条连接」 */
+      const expectReconnectAfter = async (delay: number) => {
+        const before = MockEventSource.instances.length;
+        MockEventSource.latest().fail();
+        await flush();
+        expect(MockEventSource.latest().closed).toBe(true); // 断流即关流（不叠加连接）
+        await advance(delay - 1);
+        expect(MockEventSource.instances).toHaveLength(before);
+        await advance(1);
+        expect(MockEventSource.instances).toHaveLength(before + 1);
+      };
+
+      // 1s → 2s → 4s → 8s → 16s → 30s（封顶）→ 30s（封顶后维持上限）
+      await expectReconnectAfter(1000);
+      for (const delay of [2000, 4000, 8000, 16000, 30000, 30000]) {
+        await expectReconnectAfter(delay);
+      }
+
+      // 恢复（任一帧落地）→ 退避复位：下一次断流仍只等 1s
+      await act(async () => {
+        MockEventSource.latest().emit("snapshot", { connection: connection() });
+      });
+      await flush();
+      await expectReconnectAfter(1000);
+
+      // 切会话：换新流、旧定时器作废（不再为旧会话建连）
+      const sessionChangeCount = MockEventSource.instances.length;
+      rerender({ sid: "sess_0000000000000000000000000000000b" });
+      await flush();
+      expect(MockEventSource.instances).toHaveLength(sessionChangeCount + 1);
+      await advance(120_000);
+      expect(MockEventSource.instances).toHaveLength(sessionChangeCount + 1);
+
+      // 卸载：不留定时器（长时间推进也不再建连）
+      const unmountCount = MockEventSource.instances.length;
+      unmount();
+      await advance(120_000);
+      expect(MockEventSource.instances).toHaveLength(unmountCount);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sse_resync_triggers_one_get", async () => {
+    vi.useFakeTimers();
+    try {
+      installFetch((url) => {
+        if (url === ZCODE_CONNECTION_PATH) return json(connection());
+        if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+
+      const { unmount } = renderHook(() => useZcodeControl(SID));
+      await flush();
+      const connectionGets = () =>
+        calledUrls().filter((url) => url === ZCODE_CONNECTION_PATH).length;
+      const sessionGets = () =>
+        calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+      expect(connectionGets()).toBe(1);
+      expect(sessionGets()).toBe(1);
+
+      // 一次断流 = 一次纠偏 GET（连接 + 会话各一发），不是每秒刷新的风暴
+      MockEventSource.latest().fail();
+      await flush();
+      expect(connectionGets()).toBe(2);
+      expect(sessionGets()).toBe(2);
+
+      // 退避等待期内零 GET（未重连就不纠偏）
+      await act(async () => {
+        vi.advanceTimersByTime(999);
+      });
+      await flush();
+      expect(connectionGets()).toBe(2);
+      expect(sessionGets()).toBe(2);
+      expect(MockEventSource.instances).toHaveLength(1);
+
+      // 重连建流本身不额外发 GET
+      await act(async () => {
+        vi.advanceTimersByTime(1);
+      });
+      await flush();
+      expect(MockEventSource.instances).toHaveLength(2);
+      expect(connectionGets()).toBe(2);
+      expect(sessionGets()).toBe(2);
+
+      // 连续断流（离线 / 403 拒绝）7 秒：退避把重连压到 t=1s / 3s / 7s，GET 不得按秒刷新。
+      // 旧实现每秒重连一次 → 这里会打出 8 发 connection GET（刷新风暴）。
+      for (let i = 0; i < 6; i += 1) {
+        MockEventSource.latest().fail(); // 已关闭的实例是 no-op（同真实 EventSource）
+        await flush();
+        await act(async () => {
+          vi.advanceTimersByTime(1000);
+        });
+        await flush();
+      }
+      expect(MockEventSource.instances).toHaveLength(4); // 首连 + 1s/3s/7s 各重连一次
+      expect(connectionGets()).toBe(4); // 首拍 + 三次断流纠偏，各自恰好一发
+      expect(sessionGets()).toBe(4);
+
+      // lag 帧（resync）= 恰好一次 GET 纠偏
+      const getsBeforeResync = connectionGets();
+      await act(async () => {
+        MockEventSource.latest().emit("resync", { reason: "lag" });
+      });
+      await flush();
+      expect(connectionGets()).toBe(getsBeforeResync + 1);
+      expect(sessionGets()).toBe(getsBeforeResync + 1);
+      // 纠偏只读：绝不重放动作
+      expect(postedActions()).toHaveLength(0);
+
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("sse_stale_session_event_is_ignored", async () => {
     installFetch((url) => {
       if (url === ZCODE_CONNECTION_PATH) return json(connection({ generation: 3 }));

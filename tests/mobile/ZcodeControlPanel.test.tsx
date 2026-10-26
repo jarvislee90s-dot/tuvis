@@ -863,6 +863,180 @@ describe("ZCode 控制面板：同帧双击与敏感输入清理", () => {
   });
 });
 
+describe("ZCode 控制面板：pending 卡提交防重与选中态", () => {
+  it("pending_cannot_be_resubmitted_with_new_action_id", async () => {
+    // 作答卡首次 POST 挂起：同帧双击只发一次；受理后卡面锁死，新点击绝不生成
+    // 第二个 actionId 重发同一份答案/审批（宿主 pending/session 刷新后才解锁）。
+    const firstGate = deferred<Response>();
+    let posts = 0;
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            pending: [
+              pendingView({ questions: [questionView()] }),
+              pendingView({
+                interactionId: "int_00000000000000000000000000000002",
+                kind: "permission",
+                toolName: "Bash",
+                summary: "执行合成命令",
+                options: [{ optionId: "host-allow-once-9", label: "允许一次", kind: "allowOnce" }],
+              }),
+            ],
+          })
+        );
+      }
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        posts += 1;
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        if (posts === 1) return firstGate.promise;
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const submit = (await screen.findByTestId("zcode-pending-submit")) as HTMLButtonElement;
+    await waitFor(() => expect(submit).toBeEnabled());
+
+    // 选中选项后同帧双击「提交」：一个在途槽只放行一次 POST。
+    fireEvent.click(screen.getByTestId("zcode-pending-option-0"));
+    await act(async () => {
+      submit.click();
+      submit.click();
+    });
+    await waitFor(() => expect(postedActions()).toHaveLength(1));
+
+    // 受理回执落地：卡面进入「已受理」锁定态，按钮不可再点。
+    await act(async () => {
+      firstGate.resolve(json(receipt(postedActions()[0].actionId, "accepted")));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(submit).toBeDisabled());
+    expect(screen.getByTestId("zcode-pending-notice").textContent).toBe("已受理");
+
+    fireEvent.click(submit);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(1);
+    expect(postedActions()[0].action.kind).toBe("answer");
+
+    // 审批卡同理：受理一次后再次点击不得产生新的 actionId。
+    const allow = screen.getByTestId(
+      "zcode-permission-option-host-allow-once-9"
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(allow).toBeEnabled());
+    fireEvent.click(allow);
+    await waitFor(() => expect(postedActions()).toHaveLength(2));
+    await waitFor(() => expect(allow).toBeDisabled());
+    fireEvent.click(allow);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(2);
+    expect(postedActions()[1].action.kind).toBe("permission");
+
+    // 两次受理各用各的 actionId（同一次提交绝不换 ID 重发）。
+    const ids = postedActions().map(({ actionId }) => actionId);
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it("snooze_inflight_blocks_submit_with_reason", async () => {
+    // autoResolution：首次编辑先发 snooze；在其在途期间用户点「提交」不得被静默
+    // 吞掉——按钮禁用且给出可见原因，snooze 受理后最终提交仍可发出。
+    const snoozeGate = deferred<Response>();
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            pending: [pendingView({ autoResolution: true, questions: [questionView()] })],
+          })
+        );
+      }
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as {
+          actionId: string;
+          action: ControlAction;
+        };
+        if (body.action.kind === "snooze") return snoozeGate.promise;
+        return json(receipt(body.actionId, "accepted"));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const option = (await screen.findByTestId("zcode-pending-option-0")) as HTMLButtonElement;
+    const submit = screen.getByTestId("zcode-pending-submit") as HTMLButtonElement;
+    await waitFor(() => expect(submit).toBeEnabled());
+
+    fireEvent.click(option);
+    await waitFor(() =>
+      expect(postedActions().some(({ action }) => action.kind === "snooze")).toBe(true)
+    );
+
+    // snooze 在途：提交按钮禁用 + 可见「正在暂停计时」原因（不是吞点击）。
+    await waitFor(() => expect(submit).toBeDisabled());
+    const notice = screen.getByTestId("zcode-pending-notice");
+    expect(notice).toBeVisible();
+    expect(notice.textContent).toContain("正在暂停计时");
+    fireEvent.click(submit);
+    await act(async () => {});
+    expect(postedActions().filter(({ action }) => action.kind === "answer")).toHaveLength(0);
+
+    // snooze 受理后闸门放开：最终提交真实发出（选中项随答案上行）。
+    await act(async () => {
+      snoozeGate.resolve(json(receipt(postedActions()[0].actionId, "accepted")));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(submit).toBeEnabled());
+    expect(screen.queryByTestId("zcode-pending-notice")).toBeNull();
+
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(postedActions().filter(({ action }) => action.kind === "answer")).toHaveLength(1)
+    );
+    const answer = postedActions().find(({ action }) => action.kind === "answer");
+    expect(answer?.action).toEqual({
+      kind: "answer",
+      sessionId: SID,
+      generation: GEN,
+      interactionId: PENDING_ID,
+      answers: [
+        {
+          questionText: "这个任务接下来要做什么？",
+          selectedValues: ["opt-continue"],
+          freeText: null,
+        },
+      ],
+    });
+  });
+
+  it("option_selection_exposes_aria_pressed", async () => {
+    // 选中态必须对辅助技术可见：单选按钮用 aria-pressed 表达选中，而不是只写不渲染。
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(sessionView({ pending: [pendingView({ questions: [questionView()] })] }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const first = (await screen.findByTestId("zcode-pending-option-0")) as HTMLButtonElement;
+    const second = screen.getByTestId("zcode-pending-option-1") as HTMLButtonElement;
+    expect(first).toHaveAttribute("aria-pressed", "false");
+    expect(second).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(second);
+    await waitFor(() => expect(second).toHaveAttribute("aria-pressed", "true"));
+    expect(first).toHaveAttribute("aria-pressed", "false");
+
+    // 改选另一项：选中态跟随，旧项回到未选中。
+    fireEvent.click(first);
+    await waitFor(() => expect(first).toHaveAttribute("aria-pressed", "true"));
+    expect(second).toHaveAttribute("aria-pressed", "false");
+  });
+});
+
 describe("ZCode 控制面板：模型/档位按能力开放", () => {
   it("model_thought_controls_are_capability_gated", async () => {
     const selection = {

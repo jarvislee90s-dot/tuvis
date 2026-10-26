@@ -548,15 +548,12 @@ const zcodeAvailability = (
   url,
 });
 
-/** 挂载首拍（请求在途）的保守值：不可控，但说「正在确认」而不是「未配置」 */
-export const zcodeControlChecking = (): ZcodeControlAvailability =>
-  zcodeAvailability("checking", null, null);
-
 /**
  * 只读拉取本机 ZCode 官方远控配置（GET /m/api/v1/official-control?agent_type=zcode，
  * 配对门 + Cache-Control: no-store 在服务端）。任何失败（网络 / 非 2xx / 设备失效）
- * → readState=failed：发送区给「暂时读不到」的就地原因，**正文与文件预览不受影响**
- * （与 fetchChannel 的静默降级同一惯例，但这里必须说得出原因，不能装成未配置）。
+ * → readState=failed：只有「打开官方页面」入口据此取已保存链接，**正文与文件预览
+ * 不受影响**（与 fetchChannel 的静默降级同一惯例，但这里必须说得出原因，不能装成
+ * 未配置）。控制面的连接/发送原因由 ZcodeControlPanel（官方 GET）单独持有。
  */
 export async function fetchZcodeControl(): Promise<ZcodeControlAvailability> {
   try {
@@ -569,25 +566,6 @@ export async function fetchZcodeControl(): Promise<ZcodeControlAvailability> {
     return zcodeAvailability("ok", cfg.configState, cfg.url ?? null);
   } catch {
     return zcodeAvailability("failed", null, null);
-  }
-}
-
-/**
- * 发送区的就地原因键（设计 §4.3「手机控制区」列逐档对齐）；非 ZCode 会话返回 null
- * （既有注入路径零变化）。首版对 ZCode 恒有值——没有适配器就没有「可发送」，
- * **不伪造可写按钮**；B 包接上真连接态后由那一档返回 null。
- */
-export function zcodeSendReasonKey(a: ZcodeControlAvailability | null): string | null {
-  if (a === null) return null;
-  if (a.readState === "checking") return "mobile.composer.zcodeChecking";
-  if (a.readState === "failed") return "mobile.composer.zcodeReadFailed";
-  switch (a.configState) {
-    case "missing":
-      return "mobile.composer.zcodeNeedsConfig";
-    case "invalid":
-      return "mobile.composer.zcodeNeedsUpdate";
-    default:
-      return "mobile.composer.zcodePending";
   }
 }
 
