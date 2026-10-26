@@ -38,6 +38,17 @@
 //! 在途）。在途闸只在确证零写（send_failed / snooze 失败）、resolve
 //! rejected/noop、或宿主撤卡帧（`PendingBook` 整体替换时缺席）时释放；写后
 //! unknown 保留闸（绝不自动重发）。答案正文只穿过 wire 与内存，账本只存指纹。
+//!
+//! # 打断（T4.2 Slice B）
+//!
+//! `Stop` 只停「用户点击时新鲜 control 已观察到的既有前台执行」：`StopPort::session`
+//! 取精确目标视图 → [`authorize_stop`] → **写前重取**并复核 session/generation/id →
+//! 写前才预留 → 恰一帧 `type=stop`、`payload={expectedForegroundExecutionId}`
+//! （[`AGENT_SEND_COMMAND_METHOD`] + 20s ACK 窗）。**永不**为打断合成 `sendText`，
+//! 无第二帧、无重试、无 CLI 降级。ACK accepted/duplicate 只算 `accepted`；noop
+//! （`guard.stopTargetChanged`）如实显示未停止；没有 accepted ACK 时即使宿主已清空
+//! 目标也停在 `unknown`。只有 ACK 后 [`CONFIRM_TIMEOUT`] 内观察到 control revision
+//! 前进**且**目标 id 缺席才升级 `confirmed`（新执行单独出现不算）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,7 +65,7 @@ use super::bridge::{BridgeManager, AGENT_CHANNEL};
 use super::pending::build_user_answer;
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, BoundTarget, CommandPort, ControlAction,
-    PendingPort, SessionView, StopRequest, ZResult, ZcodeError,
+    PendingPort, SessionView, StopPort, StopRequest, ZResult, ZcodeError,
 };
 
 /// 官方发送方法名（`zcodeAgent.ts:937`、探针 `SendOnceLoop`）。
@@ -66,6 +77,10 @@ pub const SEND_TEXT_TYPE: &str = "sendText";
 /// 信封 `type`（问答应答；探针 `INTERACTION_COMMAND_TYPES.resolve`，
 /// `command.ts:221-234`：payload `{interactionId, answer}`）。
 pub const RESOLVE_INTERACTION_TYPE: &str = "resolveInteraction";
+
+/// 信封 `type`（打断；探针 `INTERACTION_COMMAND_TYPES.stop`，
+/// `command.ts:161-164`：payload `{expectedForegroundExecutionId}`，守卫 id 必带）。
+pub const STOP_TYPE: &str = "stop";
 
 /// ACK 等待窗（20s，与生产计划一致）：原样交给端口（桥的 RPC 待答条目按它收口
 /// 并清账），窗内无应答按保守 `unknown`，绝不重发。
@@ -180,6 +195,27 @@ pub fn authorize_stop(view: &SessionView, request: &StopRequest) -> ZResult<Stri
     Ok(expected.to_owned())
 }
 
+/// 命令层 stop 授权：先复核端口返回的视图确属**精确目标**，再走 [`authorize_stop`]。
+///
+/// 视图不是目标会话/已换代/投影不新鲜（`ready=false`）一律零 stop——「读到的
+/// control 不新鲜」绝不等于「control 里没有目标」，也绝不拿兄弟会话视图授权。
+fn authorize_stop_on(
+    view: &SessionView,
+    target: &BoundTarget,
+    request: &StopRequest,
+) -> ZResult<String> {
+    if view.session_id != target.session_id {
+        return Err(ZcodeError::of(codes::NO_SESSION));
+    }
+    if view.generation != target.generation {
+        return Err(ZcodeError::of(codes::STALE_GENERATION));
+    }
+    if !view.ready {
+        return Err(ZcodeError::of(codes::NOT_READY));
+    }
+    authorize_stop(view, request)
+}
+
 /// ACK 分类（官方 `CommandAck`：`status` ∈ accepted/duplicate/rejected/noop）。
 ///
 /// 只认显式状态：无法解释的应答既不当受理也不谎称拒绝，按保守 `unknown`。
@@ -215,6 +251,9 @@ pub struct CommandSender {
     ack_timeout: Duration,
     /// pending 授权 / snooze / 宿主终态端口：`Answer`/`Snooze` 必需，生产接线在 T7.1。
     pending: Option<Arc<dyn PendingPort>>,
+    /// stop 授权 / 宿主停止终态端口：`Stop` 必需，生产接线在 T7.1
+    /// （`Arc<BridgeManager>`）；未装配时 Stop 一律 `not_ready`（零帧零行）。
+    stop: Option<Arc<dyn StopPort>>,
     /// 宿主撤卡观察窗（测试注入短窗；生产 [`CONFIRM_TIMEOUT`]）。
     confirm_timeout: Duration,
 }
@@ -238,6 +277,7 @@ impl CommandSender {
             store,
             ack_timeout,
             pending: None,
+            stop: None,
             confirm_timeout: CONFIRM_TIMEOUT,
         }
     }
@@ -245,6 +285,12 @@ impl CommandSender {
     /// 装配 pending 授权 / snooze / 宿主终态端口（生产 = `BridgeManager`，T7.1 接线）。
     pub fn with_pending(mut self, pending: Arc<dyn PendingPort>) -> Self {
         self.pending = Some(pending);
+        self
+    }
+
+    /// 装配 stop 授权 / 宿主停止终态端口（生产 = `BridgeManager`，T7.1 接线）。
+    pub fn with_stop(mut self, stop: Arc<dyn StopPort>) -> Self {
+        self.stop = Some(stop);
         self
     }
 
@@ -257,9 +303,9 @@ impl CommandSender {
 
     /// 执行一次控制动作。
     ///
-    /// 已接入 `Send`/`Answer`/`Snooze`；其余 `ControlAction` 变体一律 `invalid_action`
-    /// 且零帧零行（T4.2–T6 逐个接入，绝不伪造成功）。Answer/Snooze 在未装配 pending
-    /// 端口时一律 `not_ready`（零帧零行，生产接线在 T7.1）。
+    /// 已接入 `Send`/`Answer`/`Snooze`/`Stop`；其余 `ControlAction` 变体一律
+    /// `invalid_action` 且零帧零行（T5–T6 逐个接入，绝不伪造成功）。Answer/Snooze/Stop
+    /// 在未装配对应端口时一律 `not_ready`（零帧零行，生产接线在 T7.1）。
     pub async fn execute(
         &self,
         ctx: &ActionContext,
@@ -271,6 +317,7 @@ impl CommandSender {
             ControlAction::Send { .. } => self.execute_send(ctx, target, action).await,
             ControlAction::Answer { .. } => self.execute_answer(ctx, target, action).await,
             ControlAction::Snooze { .. } => self.execute_snooze(ctx, target, action).await,
+            ControlAction::Stop { .. } => self.execute_stop(ctx, target, action).await,
             _ => Err(invalid_action()),
         }
     }
@@ -541,6 +588,72 @@ impl CommandSender {
         }
     }
 
+    /// 打断：只停「用户点击时新鲜 control 已观察到的既有前台执行」。
+    ///
+    /// 顺序：只读幂等预检 → 精确目标 fresh view → [`authorize_stop`] → **写前重取**
+    /// 同一目标并复核 session/generation/id → 预留 → 恰一帧 `type=stop`。
+    /// 授权失败一律冻结码上抛（零帧零行）；**永不**先合成 `sendText`，无第二帧、
+    /// 无重试、无 CLI 降级。
+    async fn execute_stop(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        action: &ControlAction,
+    ) -> ZResult<ActionReceipt> {
+        let ControlAction::Stop {
+            expected_foreground_execution_id,
+            ..
+        } = action
+        else {
+            return Err(invalid_action());
+        };
+        let Some(stop) = self.stop.as_ref() else {
+            // 未装配 stop 端口：不能证明既有执行在场，零帧零行。
+            return Err(ZcodeError::of(codes::NOT_READY));
+        };
+        // 幂等重放（同 actionId 同载荷）：只回既有回执，零新行、零帧、零重取 control。
+        if let Some(existing) = self.lookup_action(ctx, target, action)? {
+            return Ok(existing);
+        }
+        let request = StopRequest {
+            expected_foreground_execution_id: Some(expected_foreground_execution_id.clone()),
+        };
+        // 新鲜 control（精确目标，必要时由端口只读重同步）：授权失败零帧零行。
+        let view = stop.session(target).await?;
+        authorize_stop_on(&view, target, &request)?;
+        // 写前立即复核同一目标的 control：按钮已过时（执行换了/空闲/换代）→ 零 stop。
+        let confirm_view = stop.session(target).await?;
+        let execution_id = authorize_stop_on(&confirm_view, target, &request)?;
+        // 确认基线来自写前复核视图（revision 未观察到 → 端口永远不会给真证据）。
+        let baseline_revision = confirm_view.revision.unwrap_or(0);
+        // 写即将发生：此时才预留（审计只记类别与计数，守卫 id 不进审计）。
+        match self.reserve_action(ctx, target, action)? {
+            None => {}
+            Some(existing) => return Ok(existing),
+        }
+        let mut receipt = self.dispatch_stop(ctx, target, &execution_id).await;
+        if receipt.state == ActionState::Accepted {
+            // 已受理 ≠ 已停止：先落 accepted，再等宿主自己的停止终态（有界 10s）。
+            self.record(&receipt);
+            if stop
+                .wait_stop_cleared(
+                    target,
+                    &execution_id,
+                    baseline_revision,
+                    self.confirm_timeout,
+                )
+                .await
+            {
+                // 只有「control revision 前进 + 目标缺席」才是停止终态；新执行单独出现
+                // 不算（端口保证），超时停在 accepted。
+                receipt.state = ActionState::Confirmed;
+                receipt.reason_code = None;
+            }
+        }
+        self.record(&receipt);
+        Ok(receipt)
+    }
+
     /// 构造并**恰一次**调用 resolveInteraction 端口（channel/method/信封与探针一致）。
     async fn dispatch_resolve(
         &self,
@@ -556,6 +669,41 @@ impl CommandSender {
             "sessionId": target.session_id,
             "type": RESOLVE_INTERACTION_TYPE,
             "payload": { "interactionId": interaction_id, "answer": answer },
+            "issuedAt": now_ms(),
+        });
+        let (state, reason_code) = match self
+            .bridge
+            .call(
+                target,
+                AGENT_CHANNEL,
+                AGENT_SEND_COMMAND_METHOD,
+                vec![envelope],
+                self.ack_timeout,
+            )
+            .await
+        {
+            Err(error) => classify_port_error(&error),
+            Ok(ack) => classify_ack(&ack),
+        };
+        self.make_receipt(ctx, target, state, reason_code)
+    }
+
+    /// 构造并**恰一次**调用 stop 端口（channel/method/信封与探针 `InteractionCommandLoop`
+    /// 同形）：`type=stop`、`payload={expectedForegroundExecutionId}`，无重发、无
+    /// `sendText` 合成、无 CLI 降级。
+    async fn dispatch_stop(
+        &self,
+        ctx: &ActionContext,
+        target: &BoundTarget,
+        execution_id: &str,
+    ) -> ActionReceipt {
+        let envelope = serde_json::json!({
+            "commandId": new_command_id(),
+            // clientId 只来自可信调用方上下文（配对门/本机 DB）。
+            "clientId": ctx.device_id,
+            "sessionId": target.session_id,
+            "type": STOP_TYPE,
+            "payload": { "expectedForegroundExecutionId": execution_id },
             "issuedAt": now_ms(),
         });
         let (state, reason_code) = match self
@@ -1315,8 +1463,8 @@ mod tests {
         assert_eq!(failed.reason_code.as_deref(), Some(codes::STALE_GENERATION));
     }
 
-    /// 未接入变体：invalid_action 且零帧零行；Answer/Snooze 已接入命令层，但未装配
-    /// pending 端口时一律 not_ready（零帧零行，生产接线在 T7.1）。
+    /// 未接入变体：invalid_action 且零帧零行；Answer/Snooze/Stop 已接入命令层，但未
+    /// 装配对应端口时一律 not_ready（零帧零行，生产接线在 T7.1）。
     #[tokio::test]
     async fn non_send_actions_are_invalid_and_zero_wire() {
         let store = DeviceStore::memory();
@@ -1328,11 +1476,6 @@ mod tests {
                 generation: GEN,
                 interaction_id: "ix-1".to_string(),
                 option_id: "allowOnce".to_string(),
-            },
-            ControlAction::Stop {
-                session_id: SESSION.to_string(),
-                generation: GEN,
-                expected_foreground_execution_id: "exec-1".to_string(),
             },
             ControlAction::Selection {
                 session_id: SESSION.to_string(),
@@ -1369,6 +1512,11 @@ mod tests {
                     free_text: None,
                 }],
             },
+            ControlAction::Stop {
+                session_id: SESSION.to_string(),
+                generation: GEN,
+                expected_foreground_execution_id: "exec-1".to_string(),
+            },
         ];
         for (index, action) in needs_port.iter().enumerate() {
             let err = sender
@@ -1378,7 +1526,7 @@ mod tests {
             assert_eq!(
                 err.code,
                 "not_ready",
-                "{} 未装配 pending 端口必须拒绝",
+                "{} 未装配对应端口必须拒绝",
                 action.kind()
             );
         }
@@ -2768,6 +2916,134 @@ mod tests {
             }
         }
 
+        fn stop_action(expected: &str) -> ControlAction {
+            ControlAction::Stop {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                expected_foreground_execution_id: expected.to_owned(),
+            }
+        }
+
+        /// stop 端口 fake：按次脚本化 `session` 快照 + 脚本化宿主终态判定。
+        ///
+        /// `views` 的最后一项在后续调用中重复（首读 = 新鲜 control，第二次 =
+        /// 写前复核）。`wait_stop_cleared` 直接返回脚本布尔并记录
+        /// `(executionId, baselineRevision, timeout)`——命令层只信端口证据。
+        struct FakeStop {
+            views: Mutex<Vec<SessionView>>,
+            session_calls: AtomicUsize,
+            wait_result: AtomicBool,
+            wait_calls: Mutex<Vec<(String, u64, Duration)>>,
+        }
+
+        impl FakeStop {
+            fn new(views: Vec<SessionView>) -> Arc<Self> {
+                Arc::new(Self {
+                    views: Mutex::new(views),
+                    session_calls: AtomicUsize::new(0),
+                    wait_result: AtomicBool::new(false),
+                    wait_calls: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn observed(execution_ids: &[&str]) -> Arc<Self> {
+                Self::new(vec![view(Some(observed(execution_ids)))])
+            }
+
+            fn idle() -> Arc<Self> {
+                Self::new(vec![view(Some(control(Vec::new())))])
+            }
+
+            fn unknown() -> Arc<Self> {
+                Self::new(vec![view(None)])
+            }
+
+            fn generation(generation: u64) -> Arc<Self> {
+                let mut stale = view(Some(observed(&["E-existing"])));
+                stale.generation = generation;
+                Self::new(vec![stale])
+            }
+
+            fn sequence(views: Vec<SessionView>) -> Arc<Self> {
+                Self::new(views)
+            }
+
+            fn set_wait_result(&self, result: bool) {
+                self.wait_result.store(result, Ordering::SeqCst);
+            }
+
+            fn session_calls(&self) -> usize {
+                self.session_calls.load(Ordering::SeqCst)
+            }
+
+            fn wait_calls(&self) -> Vec<(String, u64, Duration)> {
+                self.wait_calls.lock().unwrap().clone()
+            }
+        }
+
+        impl StopPort for FakeStop {
+            fn session<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+            ) -> BoxFuture<'a, ZResult<SessionView>> {
+                Box::pin(async move {
+                    let calls = self.session_calls.fetch_add(1, Ordering::SeqCst);
+                    let views = self.views.lock().unwrap();
+                    Ok(views[calls.min(views.len() - 1)].clone())
+                })
+            }
+
+            fn wait_stop_cleared<'a>(
+                &'a self,
+                _target: &'a BoundTarget,
+                execution_id: &'a str,
+                baseline_revision: u64,
+                timeout: Duration,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async move {
+                    self.wait_calls.lock().unwrap().push((
+                        execution_id.to_owned(),
+                        baseline_revision,
+                        timeout,
+                    ));
+                    self.wait_result.load(Ordering::SeqCst)
+                })
+            }
+        }
+
+        fn stop_sender(
+            fake: &Arc<FakeBridge>,
+            stop: &Arc<FakeStop>,
+            store: &DeviceStore,
+        ) -> CommandSender {
+            sender(fake, store)
+                .with_stop(stop.clone())
+                .with_confirm_timeout(Duration::from_millis(50))
+        }
+
+        /// 出站帧按信封 `type` 过滤（只读观测）。
+        fn envelopes_of_type(fake: &FakeBridge, envelope_type: &str) -> Vec<Value> {
+            fake.frames()
+                .into_iter()
+                .filter_map(|frame| {
+                    let envelope = frame.args.first()?.clone();
+                    (envelope.get("type").and_then(Value::as_str) == Some(envelope_type))
+                        .then_some(envelope)
+                })
+                .collect()
+        }
+
+        fn stored_state(store: &DeviceStore, action_id: &str) -> Option<String> {
+            store.with(|conn| {
+                conn.query_row(
+                    "SELECT state FROM zcode_actions WHERE action_id = ?1",
+                    [action_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            })
+        }
+
         /// 精确命中的请求返回**宿主观察到的原值**（不挑第一个、不改写）。
         #[test]
         fn authorize_stop_returns_exact_observed_execution() {
@@ -2783,8 +3059,8 @@ mod tests {
         }
 
         /// control 未知（宿主未宣告 `activeWorks` 数组）：零 stop，`not_ready`。
-        #[test]
-        fn unknown_control_is_zero_stop() {
+        #[tokio::test]
+        async fn unknown_control_is_zero_stop() {
             for request in [request(Some("E-existing")), request(None)] {
                 let error = authorize_stop(&view(None), &request)
                     .expect_err("unknown control must never authorize a stop");
@@ -2793,11 +3069,29 @@ mod tests {
                     "unknown control is not_ready, got {error:?}"
                 );
             }
+
+            // 命令层：未知 control → not_ready，零帧零行、零审计；未装配端口同样拒绝。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::unknown();
+            let error = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::NOT_READY));
+            let unwired = sender(&fake, &store)
+                .execute(&ctx("a-2"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap_err();
+            assert!(unwired.is(codes::NOT_READY), "未装配 stop 端口必须拒绝");
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert!(audits(&store).is_empty());
         }
 
         /// 显式空 `activeWorks` = 已确认空闲：零 stop（按钮已过时）。
-        #[test]
-        fn idle_control_is_zero_stop() {
+        #[tokio::test]
+        async fn idle_control_is_zero_stop() {
             for request in [request(Some("E-existing")), request(None)] {
                 let error = authorize_stop(&view(Some(control(Vec::new()))), &request)
                     .expect_err("idle control must never authorize a stop");
@@ -2806,6 +3100,18 @@ mod tests {
                     "idle control is stale_pending, got {error:?}"
                 );
             }
+
+            // 命令层：空闲 → stale_pending（如实回执按钮过时），零帧零行。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::idle();
+            let error = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::STALE_PENDING));
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 0);
+            assert_eq!(row_count(&store), 0);
         }
 
         /// 缺守卫 id 且有多个活动：歧义拒绝，绝不随取第一个。
@@ -2828,8 +3134,8 @@ mod tests {
         }
 
         /// 旧按钮（执行已换）：精确不匹配 → `stop_target_changed`，零 stop。
-        #[test]
-        fn changed_execution_rejects_old_button() {
+        #[tokio::test]
+        async fn changed_execution_rejects_old_button() {
             let error = authorize_stop(&view(Some(observed(&["E-new"]))), &request(Some("E-old")))
                 .expect_err("a stale stop button must be rejected");
             assert!(error.is(codes::STOP_TARGET_CHANGED));
@@ -2838,6 +3144,256 @@ mod tests {
             let error = authorize_stop(&view(Some(observed(&["E-New"]))), &request(Some("E-new")))
                 .expect_err("exact match only");
             assert!(error.is(codes::STOP_TARGET_CHANGED));
+
+            // 命令层：点击后被晚到的旧快照确认，写前复核发现执行已换 → 零帧零行。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::sequence(vec![
+                view(Some(observed(&["E-old"]))),
+                view(Some(observed(&["E-new"]))),
+            ]);
+            let error = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-old"))
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::STOP_TARGET_CHANGED));
+            assert_eq!(stop.session_calls(), 2, "写前必须重取同一目标的 control");
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert!(audits(&store).is_empty());
+        }
+
+        /// 键路径：只停新鲜 control 已观察到的既有执行——**不**先触发新执行。
+        #[tokio::test]
+        async fn production_stops_observed_existing_execution_without_trigger() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::observed(&["E-existing"]);
+            stop.set_wait_result(true);
+            let receipt = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap();
+
+            let send_text_frames = envelopes_of_type(&fake, "sendText");
+            let stop_frames = envelopes_of_type(&fake, "stop");
+            assert_eq!(send_text_frames.len(), 0, "打断绝不为先触发而合成 sendText");
+            assert_eq!(stop_frames.len(), 1, "全生命周期恰一帧");
+            assert_eq!(
+                stop_frames[0]["payload"]["expectedForegroundExecutionId"],
+                serde_json::json!("E-existing")
+            );
+            assert_eq!(
+                stop_frames[0]["payload"]
+                    .as_object()
+                    .map(serde_json::Map::len),
+                Some(1),
+                "stop payload 只带 expectedForegroundExecutionId"
+            );
+            assert_eq!(stop_frames[0]["type"], serde_json::json!(STOP_TYPE));
+            assert_eq!(stop_frames[0]["sessionId"], serde_json::json!(SESSION));
+            assert_eq!(stop_frames[0]["clientId"], serde_json::json!(DEVICE));
+            assert!(stop_frames[0].get("baseRevision").is_none(), "stop 免 CAS");
+
+            let frames = fake.frames();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].channel, "zcode-agent");
+            assert_eq!(frames[0].method, AGENT_SEND_COMMAND_METHOD);
+            assert_eq!(frames[0].target, target());
+            assert_eq!(receipt.state, ActionState::Confirmed);
+            assert_eq!(receipt.session_id, SESSION);
+            assert_eq!(receipt.generation, GEN);
+            assert_eq!(fake.wire(), 1);
+            assert_eq!(row_count(&store), 1);
+            assert_eq!(stop.session_calls(), 2, "新鲜读取 + 写前复核各一次");
+
+            let waits = stop.wait_calls();
+            assert_eq!(waits.len(), 1, "ACK 后必须观察一次宿主终态");
+            assert_eq!(waits[0].0, "E-existing");
+            assert_eq!(waits[0].1, 4, "确认基线 = 写前复核视图的 control revision");
+            assert_eq!(waits[0].2, Duration::from_millis(50));
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("confirmed"));
+        }
+
+        /// accepted ACK 只表示受理：宿主仍报目标在场时停在 accepted。
+        #[tokio::test]
+        async fn ack_does_not_prove_stopped() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::observed(&["E-existing"]);
+            let receipt = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Accepted);
+            assert_ne!(receipt.state, ActionState::Confirmed);
+            assert_eq!(stop.wait_calls().len(), 1);
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 1);
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("accepted"));
+        }
+
+        /// 宿主守卫 noop（stopTargetChanged）如实显示未停止，绝不升级 confirmed。
+        #[tokio::test]
+        async fn noop_stop_target_changed_is_noop() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(serde_json::json!({
+                "status": "noop",
+                "reasonCode": "guard.stopTargetChanged",
+            })));
+            let stop = FakeStop::observed(&["E-existing"]);
+            stop.set_wait_result(true);
+            let receipt = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Noop);
+            assert_ne!(receipt.state, ActionState::Accepted, "noop 不是成功");
+            assert_ne!(receipt.state, ActionState::Confirmed);
+            assert!(receipt.reason_code.is_none(), "宿主原因原文不得下发");
+            assert!(stop.wait_calls().is_empty(), "noop 不得观察 confirmed");
+            assert_eq!(stored_state(&store, "a-1").as_deref(), Some("noop"));
+        }
+
+        /// 宿主撤掉原目标 → confirmed；仅出现新执行（原目标仍在）→ 停在 accepted。
+        #[tokio::test]
+        async fn host_clear_confirms_and_new_execution_alone_does_not() {
+            // 原目标缺席且 revision 前进（端口证据）→ confirmed。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::observed(&["E-existing"]);
+            stop.set_wait_result(true);
+            let confirmed = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap();
+            assert_eq!(confirmed.state, ActionState::Confirmed);
+
+            // 场上只有新执行、原目标仍被报告在场：新执行不是目标停止的证明。
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let mut host = view(Some(observed(&["E-existing", "E-new"])));
+            host.revision = Some(5);
+            let stop = FakeStop::new(vec![view(Some(observed(&["E-existing"]))), host]);
+            let accepted = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap();
+            assert_eq!(accepted.state, ActionState::Accepted);
+            assert_ne!(accepted.state, ActionState::Confirmed);
+            assert_eq!(stop.wait_calls()[0].0, "E-existing");
+        }
+
+        /// stop 端口视图/动作代际过期：零 stop（不猜、不降级到旧按钮）。
+        #[tokio::test]
+        async fn stale_generation_is_zero_stop() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::generation(GEN + 1);
+            let error = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::STALE_GENERATION));
+            assert_eq!(stop.session_calls(), 1);
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 0);
+            assert_eq!(row_count(&store), 0);
+            assert!(audits(&store).is_empty());
+
+            // 动作自报的旧代际同样零帧。
+            let stale_action = ControlAction::Stop {
+                session_id: SESSION.to_owned(),
+                generation: GEN + 1,
+                expected_foreground_execution_id: "E-existing".to_owned(),
+            };
+            let error = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-2"), &target(), &stale_action)
+                .await
+                .unwrap_err();
+            assert!(error.is(codes::STALE_GENERATION));
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 0);
+            assert_eq!(row_count(&store), 0);
+        }
+
+        /// 打断路径**永不**合成/发送 sendText：成功与无效打断都只允许 stop 帧。
+        #[tokio::test]
+        async fn stop_never_sends_send_text() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::observed(&["E-existing"]);
+            stop.set_wait_result(true);
+            let sender = stop_sender(&fake, &stop, &store);
+
+            sender
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap();
+            sender
+                .execute(&ctx("a-2"), &target(), &stop_action("E-missing"))
+                .await
+                .unwrap_err();
+
+            assert_eq!(envelopes_of_type(&fake, "sendText").len(), 0);
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 1);
+            for frame in fake.frames() {
+                assert_eq!(
+                    frame.args[0]["type"],
+                    serde_json::json!(STOP_TYPE),
+                    "stop 路径唯一允许的信封类型"
+                );
+            }
+        }
+
+        /// 宿主在 ACK 前已清掉目标、但没有 accepted ACK → 保守 unknown（不确认）。
+        #[tokio::test]
+        async fn host_clear_before_ack_is_unknown() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::AckLost);
+            let stop = FakeStop::observed(&["E-existing"]);
+            stop.set_wait_result(true);
+            let receipt = stop_sender(&fake, &stop, &store)
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap();
+
+            assert_eq!(receipt.state, ActionState::Unknown);
+            assert_ne!(receipt.state, ActionState::Accepted);
+            assert_ne!(receipt.state, ActionState::Confirmed);
+            assert!(
+                stop.wait_calls().is_empty(),
+                "没有 accepted ACK 就不得拿宿主现状升级 confirmed"
+            );
+            assert_eq!(envelopes_of_type(&fake, "stop").len(), 1, "超窗绝不重发");
+        }
+
+        /// 同 actionId 同载荷重放：只回既有回执，零第二帧、零新行、零重取 control。
+        #[tokio::test]
+        async fn stop_reuses_action_id_idempotently() {
+            let store = DeviceStore::memory();
+            let fake = FakeBridge::new(Reply::Body(accepted_body()));
+            let stop = FakeStop::observed(&["E-existing"]);
+            stop.set_wait_result(true);
+            let sender = stop_sender(&fake, &stop, &store);
+
+            let first = sender
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap();
+            let second = sender
+                .execute(&ctx("a-1"), &target(), &stop_action("E-existing"))
+                .await
+                .unwrap();
+
+            assert_eq!(first.state, ActionState::Confirmed);
+            assert_eq!(second.state, ActionState::Confirmed);
+            assert_eq!(
+                envelopes_of_type(&fake, "stop").len(),
+                1,
+                "同 id 重放零第二帧"
+            );
+            assert_eq!(stop.session_calls(), 2, "重放不得重新读取 control");
+            assert_eq!(row_count(&store), 1);
         }
     }
 }

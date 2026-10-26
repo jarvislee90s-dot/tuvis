@@ -47,7 +47,7 @@ pub use codec::{
 };
 pub use command::{
     compose_official_text, new_command_id, CommandSender, ACK_TIMEOUT, AGENT_SEND_COMMAND_METHOD,
-    CONFIRM_TIMEOUT, MAX_TEXT_BYTES, RESOLVE_INTERACTION_TYPE,
+    CONFIRM_TIMEOUT, MAX_TEXT_BYTES, RESOLVE_INTERACTION_TYPE, STOP_TYPE,
 };
 pub use config::{
     get_config, set_config, validate_official_url, ConfigError, ConfigState, ZcodeRemoteConfig,
