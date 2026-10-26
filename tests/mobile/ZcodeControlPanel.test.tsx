@@ -155,6 +155,14 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 function receipt(actionId: string, state: ActionState, reasonCode: string | null = null) {
   return {
     actionId,
@@ -352,6 +360,87 @@ describe("ZCode 控制面板：回执文案不越级", () => {
     expect(unknown.textContent?.trim().length ?? 0).toBeGreaterThan(0);
     expect(unknown.textContent).not.toContain("已生效");
     expect(unknown.textContent).not.toContain("已受理");
+  });
+
+  it("previous_receipt_is_cleared_on_new_submit", async () => {
+    let posts = 0;
+    const secondGate = deferred<Response>();
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        posts += 1;
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        if (posts === 1) return json(receipt(body.actionId, "accepted"));
+        return secondGate.promise;
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const draft = (await screen.findByTestId("zcode-draft")) as HTMLTextAreaElement;
+    const send = screen.getByTestId("zcode-send") as HTMLButtonElement;
+    await waitFor(() => expect(send).toBeEnabled());
+
+    // 第一次：accepted（已受理）留在屏上
+    fireEvent.change(draft, { target: { value: "第一条草稿" } });
+    fireEvent.click(send);
+    const accepted = await screen.findByTestId("zcode-action-status");
+    await waitFor(() => expect(accepted.getAttribute("data-action-state")).toBe("accepted"));
+
+    // 第二次：新提交一开始，旧回执必须消失——上一次的「已受理」不得贴在
+    // 在途/失败/未知的新动作上（accepted 越级 = 本任务重点防的失真）。
+    fireEvent.change(draft, { target: { value: "第二条草稿" } });
+    await act(async () => {
+      fireEvent.click(send);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(postedActions()).toHaveLength(2));
+    expect(screen.queryByTestId("zcode-action-status")).toBeNull();
+
+    // 失败结果落地：只显示 send_failed，绝不与旧「已受理」并存
+    await act(async () => {
+      secondGate.resolve(json(receipt(postedActions()[1].actionId, "send_failed", "offline")));
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("zcode-action-status").getAttribute("data-action-state")).toBe(
+        "send_failed"
+      )
+    );
+    const status = screen.getByTestId("zcode-action-status");
+    expect(status.textContent).not.toContain("已受理");
+    expect(draft).toHaveValue("第二条草稿");
+  });
+});
+
+describe("ZCode 控制面板：发送能力关闭时就地说明原因", () => {
+  it("send_capability_disabled_shows_reason", async () => {
+    // paired + ready，但 send 能力关闭（reasonCode = needs_evidence）：
+    // 禁用按钮之外必须有一句可见解释，而不是让用户以为按钮坏了。
+    const caps = capabilities();
+    caps.send = flag(false);
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(sessionView({ capabilities: caps }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const send = (await screen.findByTestId("zcode-send")) as HTMLButtonElement;
+    await waitFor(() => expect(send).toBeDisabled());
+
+    const reason = screen.getByTestId("zcode-send-reason");
+    expect(reason).toBeVisible();
+    expect(reason.getAttribute("data-reason-code")).toBe("needs_evidence");
+    expect(reason.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+    expect(reason.textContent).not.toContain("needs_evidence");
+
+    fireEvent.click(send);
+    await act(async () => {});
+    expect(postedActions()).toHaveLength(0);
   });
 });
 

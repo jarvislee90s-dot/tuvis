@@ -3,8 +3,10 @@
 // 纪律（与计划 T7.2 / shared-context 对齐）：
 // - 连接态**只**来自 `GET /zcode/connection`：已保存链接、可读会话、成功 GET 都
 //   不代表已连接；确认前 `connection=null`，绝不虚构 `paired`。
-// - `submit` 只走官方 `POST /zcode/actions`（一次提交一个 `crypto.randomUUID()`
-//   actionId；重试 = 新提交 = 新 ID）。**不**回退旧 `session-send`、无头 CLI 或
+// - `submit` 只走官方 `POST /zcode/actions`（一次提交一个 actionId；重试 = 新提交 =
+//   新 ID）。actionId 用 `newActionId()`（codexIpcApi 的 LAN 安全兜底）生成——手机页
+//   由明文 TCP 伺服（http://<LAN-IP>:<port>/m），非安全上下文里 `crypto.randomUUID`
+//   不存在，直调会让全部动作静默失败。**不**回退旧 `session-send`、无头 CLI 或
 //   终端按键；unknown 绝不由本 hook 自动重发。
 // - 回执状态如实透传：`accepted` 只是宿主已受理（≠ 已生效）；`confirmed` 才是
 //   已生效。只有 `send` 的 `accepted` 允许清本次草稿；`send_failed`/`rejected`/
@@ -27,6 +29,7 @@ import {
   type ControlAction,
   type SessionView,
 } from "@/lib/api/zcodeControl";
+import { newActionId } from "./codexIpcApi";
 
 export interface UseZcodeControlResult {
   /** 服务端连接视图；null = 尚未确认（也是唯一「未知」表达，不猜 paired）。 */
@@ -168,6 +171,14 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
       });
       const [connectionResult, sessionResult] = await Promise.all([connectionRead, sessionRead]);
       if (!isCurrent()) return false;
+      // 迟到旧代次 GET 不得改写原因面（I2）：视图代次守卫只挡 state 写入，原因若照旧
+      // 求值，会出现「连接已 paired、发送可用，顶部却写未授权」的自相矛盾。旧代次
+      // 响应只算读到过，不改 reason；新代次视图已由 SSE/另一次 GET 落地。
+      const staleConnection =
+        connectionResult.ok && connectionResult.value.generation < generationRef.current.connection;
+      const staleSession =
+        sessionResult.ok && sessionResult.value.generation < generationRef.current.session;
+      if (staleConnection || staleSession) return true;
       // 原因面等两面都到齐再定：连接错误优先，连接正常时取会话错误。
       let nextReason = connectionResult.ok
         ? connectionReason(connectionResult.value)
@@ -310,7 +321,7 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
 
   const submit = useCallback(async (action: ControlAction): Promise<ActionReceipt> => {
     // 一次提交 = 一个 actionId：请求体与回执同一个；重试是新提交 → 新 ID。
-    const actionId = crypto.randomUUID();
+    const actionId = newActionId();
     if (action.kind === "send") setDraftCleared(false);
     inflightSubmitsRef.current += 1;
     setSubmitting(true);

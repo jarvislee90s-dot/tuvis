@@ -364,6 +364,9 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   const runOnce = (action: ControlAction) => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
+    // 新提交开始即清旧回执（C2）：上一次的「已受理」绝不得贴到在途/失败/未知的
+    // 新动作上——accepted 越级正是本面板要防的失真。
+    setReceipt(null);
     void submit(action)
       .then(setReceipt)
       .catch(() => {
@@ -378,6 +381,12 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
   // （按钮代表控制通道就绪），但点击时判空、绝不 POST 空动作。
   const canSend =
     gateReason === null && session !== null && session.capabilities.send.enabled && !submitting;
+  // 能力关闭就地说明（I1）：paired + ready 但 send 能力关时，禁用按钮之外必须有一句
+  // 可见原因（服务端 reasonCode），否则用户只会以为按钮坏了。
+  const sendCapabilityReason =
+    gateReason === null && session !== null && !session.capabilities.send.enabled
+      ? (session.capabilities.send.reasonCode ?? "not_ready")
+      : null;
 
   const handleSend = () => {
     if (!canSend || session === null || draft.trim().length === 0) return;
@@ -592,6 +601,15 @@ export default function ZcodeControlPanel({ sessionId }: ZcodeControlPanelProps)
           {i18n.t(submitting ? "mobile.zcodeControl.sending" : "mobile.zcodeControl.send")}
         </button>
       </div>
+      {sendCapabilityReason !== null && (
+        <p
+          data-testid="zcode-send-reason"
+          data-reason-code={sendCapabilityReason}
+          className="mt-1 text-xs text-[var(--mut)]"
+        >
+          {zcodeReasonText(sendCapabilityReason)}
+        </p>
+      )}
     </div>
   );
 }

@@ -270,6 +270,86 @@ describe("useZcodeControl：回执语义", () => {
     expect(urls.some((url) => /session-send|headless/.test(url))).toBe(false);
   });
 
+  it("action_id_works_without_secure_context", async () => {
+    // 手机页由远程端以明文 TCP 伺服（http://<LAN-IP>:<port>/m）：非安全上下文里
+    // `crypto.randomUUID` 不存在，直调会让发送/作答/审批/打断全部静默失败。
+    // 这里模拟该环境（保留 getRandomValues，去掉 randomUUID）。
+    const realCrypto = globalThis.crypto;
+    vi.stubGlobal("crypto", {
+      getRandomValues: realCrypto.getRandomValues.bind(realCrypto),
+    });
+
+    installFetch((url, init) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      if (url === ZCODE_ACTIONS_PATH && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { actionId: string };
+        return json({
+          actionId: body.actionId,
+          sessionId: SID,
+          generation: 3,
+          state: "accepted",
+          reasonCode: null,
+        } satisfies ActionReceipt);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+
+    let settled!: ActionReceipt;
+    await act(async () => {
+      settled = await result.current.submit(sendAction);
+    });
+
+    const bodies = postedActions();
+    expect(bodies).toHaveLength(1); // 缺 randomUUID 仍发出一次动作
+    expect(bodies[0].actionId.length).toBeGreaterThan(0);
+    // 仍是 v4 形状（version=4 / variant=10），宿主可直接当作 action id
+    expect(bodies[0].actionId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    );
+    expect(settled.actionId).toBe(bodies[0].actionId);
+  });
+
+  it("stale_get_cannot_overwrite_newer_connection_state", async () => {
+    const connectionGate = deferred<Response>();
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return connectionGate.promise;
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+
+    // GET 仍在途时，SSE 已把连接推进到 paired（gen 4）
+    const es = MockEventSource.latest();
+    await act(async () => {
+      es.emit("connection", {
+        seq: 1,
+        generation: 4,
+        sessionId: SID,
+        kind: "connection",
+        data: connection({ generation: 4 }),
+      });
+    });
+    expect(result.current.connection?.generation).toBe(4);
+    expect(result.current.connection?.state).toBe("paired");
+
+    // 旧 GET（gen 3, needs_auth）迟到：连接视图不被覆盖，原因面也不得被改写
+    await act(async () => {
+      connectionGate.resolve(json(connection({ state: "needs_auth", generation: 3 })));
+      await Promise.resolve();
+    });
+    await flush();
+
+    expect(result.current.connection?.state).toBe("paired");
+    expect(result.current.reason).not.toBe("needs_auth");
+    expect(result.current.reason).toBeNull();
+  });
+
   it("failure_preserves_draft", async () => {
     let response: "send_failed" | "rejected" | "network" = "send_failed";
     const gate = deferred<Response>();
