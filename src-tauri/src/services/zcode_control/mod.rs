@@ -60,6 +60,6 @@ pub use types::{
     codes, ActionContext, ActionReceipt, ActionState, ActiveWork, AnswerEntry, BoundTarget,
     CapabilityFlag, CapabilityView, CommandPort, ConnectionState, ConnectionView, ControlAction,
     ControlView, ModelChoice, PendingKind, PendingPort, PendingView, PermissionOptionView,
-    QuestionOption, QuestionView, RelaySink, SelectionView, SessionView, TargetKey, ZResult,
-    ZcodeError, PENDING_CLEARED_POLL,
+    QuestionOption, QuestionView, RelaySink, SelectionView, SessionView, StopPort, StopRequest,
+    TargetKey, ZResult, ZcodeError, PENDING_CLEARED_POLL, STOP_CLEARED_POLL,
 };

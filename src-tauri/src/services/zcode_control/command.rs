@@ -54,7 +54,7 @@ use super::bridge::{BridgeManager, AGENT_CHANNEL};
 use super::pending::build_user_answer;
 use super::types::{
     codes, ActionContext, ActionReceipt, ActionState, BoundTarget, CommandPort, ControlAction,
-    PendingPort, ZResult, ZcodeError,
+    PendingPort, SessionView, StopRequest, ZResult, ZcodeError,
 };
 
 /// 官方发送方法名（`zcodeAgent.ts:937`、探针 `SendOnceLoop`）。
@@ -131,6 +131,53 @@ pub fn compose_official_text(device_name: &str, text: &str, signature_on: bool) 
         return Err(ZcodeError::of(codes::PAYLOAD_TOO_LARGE));
     }
     Ok(composed)
+}
+
+/// stop 授权（T4.2 Slice A；**纯函数**，零帧、绝不触发 `sendText`）。
+///
+/// 打断只允许停止「用户点击时新鲜 control 里**已观察到的既有执行**」：
+///
+/// - `control = None`（宿主未宣告 `activeWorks` 数组）→ `not_ready`（unknown
+///   control；「没看到」绝不等于空闲）；
+/// - 显式 `[]` → `stale_pending`（已确认空闲：按钮已过时，零 stop）；
+/// - `expected_foreground_execution_id` 必填。缺席（`None`/空串）且
+///   `activeWorks` 多于一条 → `target_ambiguous`（绝不随取第一个）；缺席且
+///   `activeWorks` 仅一条 → `invalid_action`（缺少必需的守卫 id）；
+/// - 请求 id 必须与某个已观察的 `foregroundExecutionId` **精确相等**，否则
+///   `stop_target_changed`（旧按钮/执行已换；宿主守卫会把它当 noop，不能当成功）；
+/// - 成功时返回**宿主观察到的原值**，调用方据此填 `expectedForegroundExecutionId`。
+pub fn authorize_stop(view: &SessionView, request: &StopRequest) -> ZResult<String> {
+    // 未知 control（未宣告 `activeWorks` 数组）：「没看到」不等于空闲，零 stop。
+    let Some(control) = view.control.as_ref() else {
+        return Err(ZcodeError::of(codes::NOT_READY));
+    };
+    // 显式 `[]` = 宿主已确认空闲：按钮已过时，零 stop。
+    if control.active_works.is_empty() {
+        return Err(ZcodeError::of(codes::STALE_PENDING));
+    }
+    let Some(expected) = request
+        .expected_foreground_execution_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    else {
+        // 守卫 id 必填：多目标缺 id 是歧义（绝不随取第一个）；单目标缺 id 是
+        // 缺少必需字段（同样零 stop）。
+        return Err(if control.active_works.len() > 1 {
+            ZcodeError::of(codes::TARGET_AMBIGUOUS)
+        } else {
+            invalid_action()
+        });
+    };
+    // 只接受与某个已观察 foregroundExecutionId **精确相等**的请求（旧按钮/执行
+    // 已换 → stop_target_changed；宿主守卫会 noop，不能当成功）。
+    if !control
+        .active_works
+        .iter()
+        .any(|work| work.foreground_execution_id.as_deref() == Some(expected))
+    {
+        return Err(ZcodeError::of(codes::STOP_TARGET_CHANGED));
+    }
+    Ok(expected.to_owned())
 }
 
 /// ACK 分类（官方 `CommandAck`：`status` ∈ accepted/duplicate/rejected/noop）。
@@ -2666,6 +2713,131 @@ mod tests {
             assert_eq!(error.code, "unknown");
             assert_eq!(pending.snooze_calls(), 1);
             assert_eq!(stored_state(&store, "a-1").as_deref(), Some("unknown"));
+        }
+    }
+
+    // ============================================================
+    // T4.2 Slice A：stop 授权（tests::stop）
+    // ============================================================
+
+    mod stop {
+        use super::*;
+
+        use crate::services::zcode_control::types::{
+            ActiveWork, CapabilityView, ControlView, SessionView, StopRequest,
+        };
+
+        fn work(kind: &str, execution_id: Option<&str>) -> ActiveWork {
+            ActiveWork {
+                kind: kind.to_owned(),
+                foreground_execution_id: execution_id.map(str::to_owned),
+            }
+        }
+
+        fn control(works: Vec<ActiveWork>) -> ControlView {
+            ControlView {
+                active_works: works,
+            }
+        }
+
+        fn observed(execution_ids: &[&str]) -> ControlView {
+            control(
+                execution_ids
+                    .iter()
+                    .map(|id| work("primaryTurn", Some(id)))
+                    .collect(),
+            )
+        }
+
+        fn view(control: Option<ControlView>) -> SessionView {
+            SessionView {
+                session_id: SESSION.to_owned(),
+                generation: GEN,
+                revision: Some(4),
+                ready: true,
+                pending: Vec::new(),
+                control,
+                selection: None,
+                capabilities: CapabilityView::default(),
+            }
+        }
+
+        fn request(execution_id: Option<&str>) -> StopRequest {
+            StopRequest {
+                expected_foreground_execution_id: execution_id.map(str::to_owned),
+            }
+        }
+
+        /// 精确命中的请求返回**宿主观察到的原值**（不挑第一个、不改写）。
+        #[test]
+        fn authorize_stop_returns_exact_observed_execution() {
+            let control = control(vec![
+                work("subAgent", None),
+                work("primaryTurn", Some("E-existing")),
+                work("primaryTurn", Some("E-sibling")),
+            ]);
+            let id = authorize_stop(&view(Some(control)), &request(Some("E-existing")))
+                .expect("an observed foreground execution authorizes stop");
+            assert_eq!(id, "E-existing");
+            assert_ne!(id, "E-sibling", "must never pick another observed work");
+        }
+
+        /// control 未知（宿主未宣告 `activeWorks` 数组）：零 stop，`not_ready`。
+        #[test]
+        fn unknown_control_is_zero_stop() {
+            for request in [request(Some("E-existing")), request(None)] {
+                let error = authorize_stop(&view(None), &request)
+                    .expect_err("unknown control must never authorize a stop");
+                assert!(
+                    error.is(codes::NOT_READY),
+                    "unknown control is not_ready, got {error:?}"
+                );
+            }
+        }
+
+        /// 显式空 `activeWorks` = 已确认空闲：零 stop（按钮已过时）。
+        #[test]
+        fn idle_control_is_zero_stop() {
+            for request in [request(Some("E-existing")), request(None)] {
+                let error = authorize_stop(&view(Some(control(Vec::new()))), &request)
+                    .expect_err("idle control must never authorize a stop");
+                assert!(
+                    error.is(codes::STALE_PENDING),
+                    "idle control is stale_pending, got {error:?}"
+                );
+            }
+        }
+
+        /// 缺守卫 id 且有多个活动：歧义拒绝，绝不随取第一个。
+        #[test]
+        fn missing_requested_id_with_multiple_works_is_ambiguous() {
+            let control = observed(&["E-a", "E-b"]);
+            for absent in [None, Some("")] {
+                let error = authorize_stop(&view(Some(control.clone())), &request(absent))
+                    .expect_err("missing guard id with multiple works is ambiguous");
+                assert!(
+                    error.is(codes::TARGET_AMBIGUOUS),
+                    "multi-work missing id is target_ambiguous, got {error:?}"
+                );
+            }
+
+            // 只有一条活动时缺 id 仍是缺必需字段（不是「就停它」）。
+            let error = authorize_stop(&view(Some(observed(&["E-a"]))), &request(None))
+                .expect_err("the guard id is required");
+            assert!(error.is(codes::INVALID_ACTION));
+        }
+
+        /// 旧按钮（执行已换）：精确不匹配 → `stop_target_changed`，零 stop。
+        #[test]
+        fn changed_execution_rejects_old_button() {
+            let error = authorize_stop(&view(Some(observed(&["E-new"]))), &request(Some("E-old")))
+                .expect_err("a stale stop button must be rejected");
+            assert!(error.is(codes::STOP_TARGET_CHANGED));
+
+            // 只认精确相等：大小写/前缀都不算命中。
+            let error = authorize_stop(&view(Some(observed(&["E-New"]))), &request(Some("E-new")))
+                .expect_err("exact match only");
+            assert!(error.is(codes::STOP_TARGET_CHANGED));
         }
     }
 }

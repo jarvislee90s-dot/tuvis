@@ -48,8 +48,8 @@ use super::codec::{
 };
 use super::projection::{Projection, CONVERSATION_TOPIC_PREFIX};
 use super::types::{
-    codes, BoundTarget, CommandPort, PendingPort, PendingView, RelaySink, SessionView, TargetKey,
-    ZResult, ZcodeError,
+    codes, BoundTarget, CommandPort, PendingPort, PendingView, RelaySink, SessionView, StopPort,
+    TargetKey, ZResult, ZcodeError,
 };
 
 /// agent 服务 channel（`channels.ts:114`）。
@@ -1210,6 +1210,95 @@ impl PendingPort for BridgeManager {
     /// 确证零写后释放本地在途（写后未知不调用）。
     fn clear_local_inflight(&self, target: &BoundTarget, interaction_id: &str) {
         self.with_exact_book(target, |book| book.clear_local_inflight(interaction_id));
+    }
+}
+
+impl StopPort for BridgeManager {
+    /// 精确目标（会话 + 代际 + workspace 绑定）的只读视图；缺口时按只读方式重取快照。
+    ///
+    /// 任一不匹配都拒绝，绝不退化为「按 sessionId 找一张能读的投影」——兄弟会话的
+    /// control 不得成为 stop 守卫来源。
+    fn session<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+    ) -> futures::future::BoxFuture<'a, ZResult<SessionView>> {
+        Box::pin(async move {
+            {
+                let inner = lock(&self.shared.state);
+                if inner.generation != target.generation {
+                    return Err(stale());
+                }
+                let Some(entry) = inner.sessions.get(&target.session_id) else {
+                    return Err(ZcodeError::of(codes::NO_SESSION));
+                };
+                if entry.target != *target {
+                    return Err(stale());
+                }
+            }
+            // 复用既有只读读面：必要时重订阅取新快照；视图仍由精确会话投影产出。
+            BridgeManager::session(self, target).await
+        })
+    }
+
+    /// 有界轮询精确目标的停止终态：revision 前进**且**目标 execution 缺席才 `true`；
+    /// 目标换代/绑定消失/control 未知 → `false`。锁内判定、锁外 sleep，绝不持锁 await。
+    fn wait_stop_cleared<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        execution_id: &'a str,
+        baseline_revision: u64,
+        timeout: Duration,
+    ) -> futures::future::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now);
+            loop {
+                match self.stop_observation(target, execution_id) {
+                    Some((revision, present)) => {
+                        if revision > baseline_revision && !present {
+                            return true;
+                        }
+                    }
+                    // 无证据（未就绪/control 未知/目标换代）：绝不拿别的观察确认。
+                    None => return false,
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                tokio::time::sleep(super::types::STOP_CLEARED_POLL.min(remaining)).await;
+            }
+        })
+    }
+}
+
+impl BridgeManager {
+    /// 状态锁内读**精确目标**的（投影 revision，目标 execution 是否仍在 control 观测里）。
+    ///
+    /// 目标换代/绑定不符/投影不新鲜/control 未知/revision 未知 → `None`（无证据，
+    /// 绝不把兄弟会话或旧代际的 control 当成本目标的停止终态）。
+    fn stop_observation(&self, target: &BoundTarget, execution_id: &str) -> Option<(u64, bool)> {
+        let inner = lock(&self.shared.state);
+        if inner.generation != target.generation {
+            return None;
+        }
+        let entry = inner.sessions.get(&target.session_id)?;
+        if entry.target != *target {
+            return None;
+        }
+        let view = entry.projection.view();
+        if !view.ready {
+            return None;
+        }
+        let revision = view.revision?;
+        let control = view.control.as_ref()?;
+        let present = control
+            .active_works
+            .iter()
+            .any(|work| work.foreground_execution_id.as_deref() == Some(execution_id));
+        Some((revision, present))
     }
 }
 
@@ -5368,6 +5457,229 @@ mod tests {
                 .wait_host_cleared(&stale_a, PENDING_A, baseline_a, Duration::from_millis(30))
                 .await,
             "generation change must never be confirmed by sibling evidence"
+        );
+    }
+
+    // =======================================================================
+    // T4.2 Slice A：stop 授权端口（合成夹具，不读真实账号/DB）
+    // =======================================================================
+
+    /// 带 control 的会话快照（execution id 全为合成值）。
+    fn control_snapshot(session_id: &str, revision: u64, execution_ids: &[&str]) -> Value {
+        let works: Vec<Value> = execution_ids
+            .iter()
+            .map(|id| json!({"kind": "primaryTurn", "foregroundExecutionId": id}))
+            .collect();
+        let mut snapshot = conversation_snapshot(session_id, revision, Vec::new());
+        snapshot["control"] = json!({"activeWorks": works});
+        snapshot
+    }
+
+    /// 注入一条 control 增量（只有 `state.updated` 的键级整体替换）。
+    ///
+    /// `revision = None` 模拟「撤项但宿主 revision 未前进」的迟到/迟滞帧：观察到的
+    /// control 变了，但没有任何可确认的宿主水位。
+    #[allow(clippy::too_many_arguments)]
+    async fn push_control_delta_on(
+        peer: &Peer,
+        session_id: &str,
+        subscription: &str,
+        from: u64,
+        to: u64,
+        revision: Option<u64>,
+        active_works: Value,
+    ) {
+        let bridge = peer.session_bridge_id(session_id);
+        let listen = peer.listen_id(&bridge);
+        let topic = format!("{CONVERSATION_TOPIC_PREFIX}{session_id}");
+        let mut patch = json!({"control": {"activeWorks": active_works}});
+        if let Some(revision) = revision {
+            patch["revision"] = json!(revision);
+        }
+        let wire = json!({
+            "wireVersion": V4_WIRE_PROTOCOL_VERSION,
+            "kind": "complete",
+            "deliveryKind": "initial",
+            "logicalFrameId": format!("synthetic-control-{to}"),
+            "logicalFrameOrdinal": to,
+            "topic": topic,
+            "subscriptionId": subscription,
+            "frame": {
+                "topic": topic,
+                "subscriptionId": subscription,
+                "fromSeq": from,
+                "toSeq": to,
+                "sentAt": 0,
+                "payload": {
+                    "kind": "deltas",
+                    "deltas": [{"op": "state.updated", "patch": patch}]
+                }
+            }
+        });
+        peer.inject_frame(
+            &bridge,
+            channel_message(json!([RESPONSE_TYPE_EVENT_FIRE, listen]), &wire),
+        )
+        .await;
+    }
+
+    /// stop 端口的会话视图必须按**精确目标**取：兄弟会话的 control 绝不冒充本目标，
+    /// 伪造 workspace 绑定/未绑定会话一律拒绝。
+    #[tokio::test]
+    async fn stop_port_session_is_target_scoped() {
+        const EXEC_A: &str = "E-synthetic-stop-a";
+        const EXEC_B: &str = "E-synthetic-stop-b";
+        let config = PeerConfig {
+            workspaces: vec![
+                workspace_entry(WS_A, Some("ws-a-identity"), "A"),
+                workspace_entry(WS_B, Some("ws-b-identity"), "B"),
+            ],
+            tasks: vec![
+                task_row(WS_A, SESSION_A, "hi"),
+                task_row(WS_B, SESSION_B, "hi"),
+            ],
+            // 会话 A 走首个订阅；会话 B 走重订阅（订阅序号 2 → B）。
+            conversation_snapshot: Some(control_snapshot(SESSION_A, 2, &[EXEC_A])),
+            resync_snapshot: Some(control_snapshot(SESSION_B, 2, &[EXEC_B])),
+            ..PeerConfig::default()
+        };
+        let (manager, _peer) = manager_with(config).await;
+        let target_a = manager.bind(&key(SESSION_A)).await.expect("bind A");
+        let target_b = manager.bind(&key(SESSION_B)).await.expect("bind B");
+
+        let view_a = StopPort::session(manager.as_ref(), &target_a)
+            .await
+            .expect("A session");
+        let view_b = StopPort::session(manager.as_ref(), &target_b)
+            .await
+            .expect("B session");
+        assert_eq!(view_a.session_id, SESSION_A);
+        assert_eq!(view_b.session_id, SESSION_B);
+        assert_eq!(
+            view_a
+                .control
+                .as_ref()
+                .expect("A control")
+                .active_works
+                .iter()
+                .filter_map(|work| work.foreground_execution_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![EXEC_A],
+            "session A must only see its own observed execution"
+        );
+        assert_eq!(
+            view_b
+                .control
+                .as_ref()
+                .expect("B control")
+                .active_works
+                .iter()
+                .filter_map(|work| work.foreground_execution_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![EXEC_B],
+            "session B must only see its own observed execution"
+        );
+
+        // 同 sessionId 但 workspace 绑定被改写（手机自报形状）不是精确目标。
+        let mut forged = target_a.clone();
+        forged.workspace_key = "ws-b-identity".to_owned();
+        assert!(
+            StopPort::session(manager.as_ref(), &forged)
+                .await
+                .expect_err("forged workspace binding")
+                .is(codes::STALE_GENERATION),
+            "workspace binding mismatch must never read another target's projection"
+        );
+
+        // 未绑定的会话：no_session（绝不借 A 的投影顶替）。
+        let mut unbound = target_a.clone();
+        unbound.session_id = "sess_0f9a1c0d-0000-4000-8000-00000000ffff".to_owned();
+        assert!(StopPort::session(manager.as_ref(), &unbound)
+            .await
+            .expect_err("unbound sibling")
+            .is(codes::NO_SESSION));
+    }
+
+    /// 停止终态必须**同时**满足「该目标 revision 前进」且「目标 execution 缺席」：
+    /// 缺一项都不确认；有界轮询在两项都满足后返回 true。
+    #[tokio::test]
+    async fn wait_stop_cleared_requires_revision_and_target_absent() {
+        const EXEC: &str = "E-synthetic-stop-1";
+        const SUB: &str = "conv-sub-synthetic-1";
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(control_snapshot(SESSION_A, 2, &[EXEC])),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let view = StopPort::session(manager.as_ref(), &target)
+            .await
+            .expect("session");
+        let baseline = view.revision.expect("host revision");
+        assert_eq!(baseline, 2);
+
+        // 无宿主帧：revision 未前进 → false（绝不把「本地等待」当停止）。
+        assert!(
+            !manager
+                .wait_stop_cleared(&target, EXEC, baseline, Duration::from_millis(30))
+                .await,
+            "no host frame must not confirm"
+        );
+
+        // 目标从 control 消失但 revision 未前进：false（缺水位不算证据）。
+        push_control_delta_on(&peer, SESSION_A, SUB, 1, 2, None, json!([])).await;
+        let current = manager.session(&target).await.expect("session");
+        assert_eq!(current.revision, Some(2), "delta without revision keeps it");
+        assert!(current
+            .control
+            .as_ref()
+            .expect("control")
+            .active_works
+            .is_empty());
+        assert!(
+            !manager
+                .wait_stop_cleared(&target, EXEC, baseline, Duration::from_millis(30))
+                .await,
+            "target absent without a revision advance must not confirm"
+        );
+
+        // revision 前进但目标仍在：false。
+        push_control_delta_on(
+            &peer,
+            SESSION_A,
+            SUB,
+            2,
+            3,
+            Some(3),
+            json!([{"kind": "primaryTurn", "foregroundExecutionId": EXEC}]),
+        )
+        .await;
+        assert!(
+            !manager
+                .wait_stop_cleared(&target, EXEC, baseline, Duration::from_millis(30))
+                .await,
+            "revision advance with the target still observed must not confirm"
+        );
+
+        // 等待中「revision 前进 + 目标缺席」：true。
+        let baseline = 3;
+        let waiter = {
+            let manager = manager.clone();
+            let target = target.clone();
+            let execution = EXEC.to_owned();
+            tokio::spawn(async move {
+                manager
+                    .wait_stop_cleared(&target, &execution, baseline, Duration::from_millis(600))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        push_control_delta_on(&peer, SESSION_A, SUB, 3, 4, Some(4), json!([])).await;
+        assert!(
+            waiter.await.expect("waiter task"),
+            "advance + absent is confirmed by bounded polling"
         );
     }
 

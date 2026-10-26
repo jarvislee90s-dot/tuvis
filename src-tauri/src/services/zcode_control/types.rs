@@ -493,6 +493,44 @@ pub trait PendingPort: Send + Sync {
 /// `wait_host_cleared` 的轮询上限（50ms；有界、不忙等）。
 pub const PENDING_CLEARED_POLL: Duration = Duration::from_millis(50);
 
+// ---------------------------------------------------------------------------
+// 端口：stop 授权与宿主停止终态（T4.2 Slice A 裁决的最小抽象）
+// ---------------------------------------------------------------------------
+
+/// stop 授权与宿主停止终态的最小能力（打断只停**用户点击时新鲜 control** 指定的
+/// 既有前台执行；发送分支由 Slice B 接入）。
+///
+/// 生产实现 = [`BridgeManager`](super::bridge::BridgeManager)：只读**精确目标**
+/// （会话 + 代际 + workspace 绑定）的投影/control，**绝不**跨会话求和或取并集；
+/// 命令层因此拿不到 relay 生命周期、JWT 或配置入口。
+///
+/// # 语义（生产实现保证）
+///
+/// - `session`：返回该**精确目标**的投影视图（必要时先按只读方式重取快照）；
+///   目标未绑定 → `no_session`，代际前进/workspace 绑定不符 → `stale_generation`。
+///   绝不返回兄弟会话的视图，也绝不把多个会话的 control 合并。
+/// - `wait_stop_cleared`：有界轮询（每次判定在状态锁内完成、锁外 sleep，
+///   ≤ [`STOP_CLEARED_POLL`]，绝不持锁 await）。**只有**该目标宿主 `revision`
+///   前进**且**该 execution id 已不在其 control 观测里才 `true`；超时、control
+///   仍未知（`None`）、投影不新鲜、目标换代/绑定消失 → `false`。
+pub trait StopPort: Send + Sync {
+    /// **精确目标**的会话投影（只读；不触发任何写命令）。
+    fn session<'a>(&'a self, target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>>;
+
+    /// 等**精确目标**的宿主停止终态：`revision` 前进**且**目标 execution 缺席 →
+    /// `true`；超时或等待期间目标换代/绑定消失 → `false`。
+    fn wait_stop_cleared<'a>(
+        &'a self,
+        target: &'a BoundTarget,
+        execution_id: &'a str,
+        baseline_revision: u64,
+        timeout: Duration,
+    ) -> BoxFuture<'a, bool>;
+}
+
+/// `wait_stop_cleared` 的轮询上限（50ms；有界、不忙等）。
+pub const STOP_CLEARED_POLL: Duration = Duration::from_millis(50);
+
 /// pending 卡种类（官方 `PendingInteraction.kind` 三元）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -571,6 +609,16 @@ pub struct ActiveWork {
 #[serde(rename_all = "camelCase")]
 pub struct ControlView {
     pub active_works: Vec<ActiveWork>,
+}
+
+/// stop 请求载荷（T4.2）：`{expectedForegroundExecutionId}`。
+///
+/// 字段是 `Option` 是为了把「客户端未带守卫 id」如实建模成**可拒绝**的输入：
+/// 绝不归一为空串，也绝不自动挑 control 里的第一项（歧义即拒绝）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopRequest {
+    pub expected_foreground_execution_id: Option<String>,
 }
 
 /// 模型目录项（只含当前 provider）。
