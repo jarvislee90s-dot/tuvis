@@ -41,7 +41,7 @@ use multi_agents_manager_lib::remote::pairing::DeviceStore;
 use multi_agents_manager_lib::services::zcode_control::{
     ActionContext, ActionReceipt, BoundTarget, CapabilityFlag, CapabilityView, CommandPort,
     CommandSender, ConnectionState, ConnectionView, ControlAction, ControlView, DeviceRoute,
-    HubBackend, OAuthProvider, OpenAuthorize, PendingPort, PendingView, SelectionPort,
+    HubBackend, OAuthProvider, OpenAuthorize, PendingKind, PendingPort, PendingView, SelectionPort,
     SelectionView, SessionView, StopPort, TargetKey, ZResult, ZcodeError,
 };
 
@@ -416,6 +416,75 @@ impl HubBackend for FakeOfficial {
                 Ok(view)
             } else {
                 Err(ZcodeError::offline())
+            }
+        };
+        Box::pin(async move { result })
+    }
+
+    /// 夹具按宿主投影里的真实卡题型给出 required capabilities（与生产
+    /// `BridgeManager::required_capabilities` 同口径）：Hub 在 bind 后调用本方法，
+    /// 默认实现会 `not_ready`，导致问答/审批 e2e 误报。
+    fn required_capabilities<'a>(
+        &'a self,
+        _target: &'a BoundTarget,
+        action: &'a ControlAction,
+    ) -> BoxFuture<'a, ZResult<Vec<&'static str>>> {
+        let result = {
+            let inner = lock(&self.inner);
+            if !inner.link_up {
+                Err(ZcodeError::offline())
+            } else {
+                match action {
+                    ControlAction::Send { .. } => Ok(vec!["send"]),
+                    ControlAction::Stop { .. } => Ok(vec!["interrupt"]),
+                    ControlAction::Permission { .. } => Ok(vec!["approval_reply"]),
+                    ControlAction::Selection { .. } => Ok(vec!["model", "thought_level"]),
+                    ControlAction::Answer { interaction_id, .. }
+                    | ControlAction::Snooze { interaction_id, .. } => {
+                        let Some(view) = inner.session.as_ref() else {
+                            return Box::pin(async { Err(ZcodeError::unknown()) });
+                        };
+                        let Some(card) = view
+                            .pending
+                            .iter()
+                            .find(|card| card.interaction_id == *interaction_id)
+                        else {
+                            return Box::pin(async { Err(ZcodeError::unknown()) });
+                        };
+                        match card.kind {
+                            PendingKind::Permission => Ok(vec!["approval_reply"]),
+                            PendingKind::UserInput => {
+                                if card.questions.is_empty() {
+                                    Err(ZcodeError::unknown())
+                                } else {
+                                    let mut single = false;
+                                    let mut multi = false;
+                                    let mut free = false;
+                                    for question in &card.questions {
+                                        if question.multi_select {
+                                            multi = true;
+                                        } else {
+                                            single = true;
+                                        }
+                                        free |= question.free_text_allowed;
+                                    }
+                                    let mut required = Vec::new();
+                                    if single {
+                                        required.push("single_select");
+                                    }
+                                    if multi {
+                                        required.push("multi_select");
+                                    }
+                                    if free {
+                                        required.push("free_text");
+                                    }
+                                    Ok(required)
+                                }
+                            }
+                            PendingKind::WorkspaceHookReview => Err(ZcodeError::unknown()),
+                        }
+                    }
+                }
             }
         };
         Box::pin(async move { result })
