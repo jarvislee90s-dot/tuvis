@@ -989,7 +989,17 @@ async fn handle_incoming(
             serde_json::from_slice::<Value>(&bytes).ok()
         }
         Message::Ping(payload) => {
-            let _ = task.sink.send(Message::Pong(payload)).await;
+            let send_timeout = task.shared.timing.send_timeout;
+            if !send_pong_bounded(&mut task.sink, payload.to_vec(), send_timeout).await {
+                // 半开 socket：Pong 写不进即离线终态，actor 不在此无限挂起（D1）。
+                task.fail(
+                    ConnectionState::Offline,
+                    codes::OFFLINE,
+                    ZcodeError::offline(),
+                )
+                .await;
+                return false;
+            }
             return true;
         }
         Message::Pong(_) | Message::Frame(_) => return true,
@@ -1223,6 +1233,15 @@ async fn send_json(sink: &mut WsSink, value: &Value) -> Result<(), ()> {
 async fn send_json_bounded(shared: &Shared, sink: &mut WsSink, value: &Value) -> bool {
     matches!(
         tokio::time::timeout(shared.timing.send_timeout, send_json(sink, value)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// 有上限的 Pong 回写：对端停止读取时 Pong 同样可能永久阻塞，
+/// 不得让 actor 停在 `handle_incoming` 里（残留 D1）。
+async fn send_pong_bounded(sink: &mut WsSink, payload: Vec<u8>, timeout: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, sink.send(Message::Pong(payload.into()))).await,
         Ok(Ok(()))
     )
 }
@@ -3368,5 +3387,65 @@ mod tests {
         )
         .await;
         assert_eq!(client.view().state, ConnectionState::Offline);
+    }
+
+    /// 心跳 Pong 回写同样必须有界：对端不读但发 Ping 时，Pong 写不得把 actor
+    /// 永久挂在 `handle_incoming`（残留 D1）。
+    #[tokio::test]
+    async fn pong_write_is_bounded_on_half_open_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (_stream, _peer) = listener.accept().await.expect("accept");
+            // 半开：连接保持打开但从不读取。
+            std::future::pending::<()>().await;
+        });
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let stream = stream.into_std().expect("std stream");
+        stream.set_nonblocking(true).expect("nonblocking");
+        let stream = TcpStream::from_std(stream).expect("tokio stream");
+        // 先把本端发送缓冲灌满：此后任何写都无法前进（对端永不读取）。
+        let chunk = [0u8; 16 * 1024];
+        let mut written = 0usize;
+        loop {
+            loop {
+                match stream.try_write(&chunk) {
+                    Ok(size) => {
+                        written += size;
+                        assert!(written < 64 * 1024 * 1024, "发送缓冲未能在有界写入内填满");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("填充发送缓冲失败：{error}"),
+                }
+            }
+            // 等在途 ACK 结算后复查：仍写不进才算真正灌满。
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            match stream.try_write(&[0u8; 1]) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("复查发送缓冲失败：{error}"),
+            }
+        }
+        let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            tokio_tungstenite::MaybeTlsStream::Plain(stream),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let (mut sink, _source) = socket.split();
+
+        let started = Instant::now();
+        let bounded = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_pong_bounded(&mut sink, Vec::new(), Duration::from_millis(80)),
+        )
+        .await
+        .expect("Pong 写不得无限挂起");
+        assert!(!bounded, "半开连接上的 Pong 写必须超时失败");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "Pong 写超时必须及时收口"
+        );
+        server.abort();
     }
 }

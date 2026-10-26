@@ -100,6 +100,11 @@ pub const MAX_FRAGMENT_ASSEMBLIES: usize = 32;
 pub const MAX_LOGICAL_FRAGMENTS: u64 = 1024;
 /// 单会话连续重同步次数上限（超过即停在 `ready=false`，不无限重订阅）。
 pub const MAX_RESYNCS: u32 = 8;
+/// 单个 workspace 枚举桥连续错过 controller 收帧窗（或订阅失败）的重订阅上限。
+///
+/// 超过即停用该桥的任务索引（不再重订阅），直到换代或该桥物理缺口重置预算；
+/// 防止「订阅成功但快照永不到」把每次 `bind` 都变成一次重订阅。
+pub const MAX_CONTROLLER_MISSES: u32 = 8;
 
 /// 桥接域的资源界限（与超时一起注入；生产默认值见 [`Default`]）。
 #[derive(Debug, Clone, Copy)]
@@ -176,6 +181,8 @@ pub struct BridgeTiming {
     pub task_window: Duration,
     /// 同一会话两次只读重同步的最小间隔（指数退避基数；防重订阅自激）。
     pub resync_backoff: Duration,
+    /// controller 收帧窗错过后重订阅的基础退避（指数增长；防 tight loop）。
+    pub controller_backoff: Duration,
 }
 
 impl Default for BridgeTiming {
@@ -186,6 +193,7 @@ impl Default for BridgeTiming {
             rpc: Duration::from_secs(10),
             task_window: Duration::from_secs(8),
             resync_backoff: Duration::from_secs(2),
+            controller_backoff: Duration::from_secs(2),
         }
     }
 }
@@ -200,6 +208,7 @@ impl BridgeTiming {
             rpc: Duration::from_millis(500),
             task_window: Duration::from_millis(120),
             resync_backoff: Duration::from_millis(60),
+            controller_backoff: Duration::from_millis(60),
         }
     }
 }
@@ -310,6 +319,10 @@ struct EnumBridge {
     controller_subscription: Option<String>,
     subscribed: bool,
     snapshot_seen: bool,
+    /// 连续错过收帧窗（或订阅失败）的次数（快照到达后清零）。
+    snapshot_misses: u32,
+    /// 下一次允许重订阅的最早时刻（指数退避；防 tight loop）。
+    next_subscribe_at: Option<Instant>,
 }
 
 impl WorkspaceCache {
@@ -1126,6 +1139,10 @@ impl Shared {
     /// 并合并行（同键去重）。「单枚举桥返回全局任务索引」是未验证假设（spec I2），
     /// 因此不能只枚举 active workspace；fake 也按桥的 workspace 作用域下发。
     /// 一次枚举多会话绑定共享；缺口后由 [`Self::mark_bridge_unready`] 失效并在此重订阅。
+    ///
+    /// 收帧窗错过（订阅 ACK 到了但快照没来）不闩死：窗口结束时撤销 `subscribed`
+    /// 并记一次 miss，下一次 `load_tasks` 在指数退避后重新 `subscribeControllerV4`；
+    /// miss 超过 [`MAX_CONTROLLER_MISSES`] 即停用该桥索引（有界重试）。
     async fn load_tasks(&self, generation: u64) -> ZResult<Vec<TaskRow>> {
         let candidates = {
             let inner = lock(&self.state);
@@ -1151,10 +1168,31 @@ impl Shared {
                     .enum_bridges
                     .get(workspace_key)
                     .filter(|bridge| inner.bridges.contains_key(&bridge.bridge_id))
-                    .map(|bridge| (bridge.bridge_id.clone(), bridge.subscribed))
+                    .map(|bridge| {
+                        (
+                            bridge.bridge_id.clone(),
+                            bridge.subscribed,
+                            bridge.snapshot_misses,
+                            bridge.next_subscribe_at,
+                        )
+                    })
             };
-            let (bridge_id, subscribed) = match existing {
-                Some((bridge_id, subscribed)) => (bridge_id, subscribed),
+            let bridge_id = match existing {
+                Some((bridge_id, subscribed, misses, next_subscribe_at)) => {
+                    if subscribed {
+                        // 已有订阅在等首个快照（当前收帧窗内）→ 不重复订阅。
+                        continue;
+                    }
+                    if misses >= MAX_CONTROLLER_MISSES {
+                        // 有界重试耗尽：该 workspace 的索引停用（换代/缺口重置）。
+                        continue;
+                    }
+                    if next_subscribe_at.is_some_and(|at| Instant::now() < at) {
+                        // 退避窗内：本轮不重订阅（防 tight loop）。
+                        continue;
+                    }
+                    bridge_id
+                }
                 None => {
                     let bridge_id = self
                         .open_bridge(generation, workspace_key, None, false)
@@ -1174,57 +1212,66 @@ impl Shared {
                             controller_subscription: None,
                             subscribed: false,
                             snapshot_seen: false,
+                            snapshot_misses: 0,
+                            next_subscribe_at: None,
                         },
                     );
-                    (bridge_id, false)
+                    bridge_id
                 }
             };
-            if subscribed {
-                continue;
+            // 重订阅窗口：旧 subscriptionId 必须在发请求前摘掉。新 id 只有 ACK 才可知，
+            // 而 ACK 与首个快照可能落在同一事件泵批次（on_data 顺序处理），
+            // 保留旧 id 会把新快照误判为「旧订阅迟到帧」而零应用。
+            // 旧订阅尽力退订（读面生命周期帧；失败不影响重订阅）。
+            let (previous_subscription, release) = {
+                let mut inner = lock(&self.state);
+                let previous = inner
+                    .workspaces
+                    .as_mut()
+                    .and_then(|cache| cache.enum_bridges.get_mut(workspace_key))
+                    .and_then(|bridge| bridge.controller_subscription.take());
+                let release = previous.as_deref().and_then(|subscription| {
+                    inner.release_command(
+                        &bridge_id,
+                        WINDOW_CONTROLLER_CHANNEL,
+                        CONTROLLER_UNSUBSCRIBE_METHOD,
+                        subscription,
+                    )
+                });
+                (previous, release)
+            };
+            if let Some(command) = release {
+                let _ = self.commands.try_send(command);
             }
-            let listener_id = self.register_listener(&bridge_id, ListenerKind::Controller)?;
-            self.send_listen(
-                &bridge_id,
-                listener_id,
-                WINDOW_CONTROLLER_CHANNEL,
-                CONTROLLER_DYNAMIC_FRAME_EVENT,
-                Value::Null,
-            )
-            .await?;
-            let params = Value::Object(
-                [
-                    (
-                        "topic".to_owned(),
-                        Value::from(CONTROLLER_TASKS_INDEX_TOPIC),
-                    ),
-                    ("visibility".to_owned(), Value::from("foreground")),
-                ]
-                .into_iter()
-                .collect(),
-            );
-            let message = self
-                .rpc_call(
-                    &bridge_id,
-                    WINDOW_CONTROLLER_CHANNEL,
-                    CONTROLLER_SUBSCRIBE_METHOD,
-                    vec![params],
-                    self.timing.rpc,
-                    None,
-                )
-                .await?;
-            let subscription = message
-                .body
-                .get("ack")
-                .and_then(|ack| ack.get("subscriptionId"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| ZcodeError::of(codes::NOT_READY))?
-                .to_owned();
-            let mut inner = lock(&self.state);
-            if let Some(cache) = inner.workspaces.as_mut() {
-                if let Some(bridge) = cache.enum_bridges.get_mut(workspace_key) {
-                    bridge.controller_subscription = Some(subscription);
-                    bridge.subscribed = true;
+            match self.subscribe_controller(&bridge_id).await {
+                Ok(subscription) => {
+                    let mut inner = lock(&self.state);
+                    if let Some(cache) = inner.workspaces.as_mut() {
+                        if let Some(bridge) = cache.enum_bridges.get_mut(workspace_key) {
+                            bridge.controller_subscription = Some(subscription);
+                            bridge.subscribed = true;
+                        }
+                    }
+                }
+                Err(error) => {
+                    // 订阅失败同样计入有界退避：网络错误不得变成每次 bind 都重试。
+                    let mut inner = lock(&self.state);
+                    if let Some(cache) = inner.workspaces.as_mut() {
+                        if let Some(bridge) = cache.enum_bridges.get_mut(workspace_key) {
+                            // 旧订阅可能仍在服务端存活：恢复旧 id 以继续过滤其迟到帧。
+                            bridge.controller_subscription = previous_subscription;
+                            bridge.subscribed = false;
+                            bridge.snapshot_misses = bridge.snapshot_misses.saturating_add(1);
+                            bridge.next_subscribe_at = Some(
+                                Instant::now()
+                                    + controller_backoff(
+                                        self.timing.controller_backoff,
+                                        bridge.snapshot_misses,
+                                    ),
+                            );
+                        }
+                    }
+                    return Err(error);
                 }
             }
         }
@@ -1257,12 +1304,80 @@ impl Shared {
             }
             let _ = tokio::time::timeout(deadline.saturating_duration_since(now), notified).await;
         }
+        {
+            let mut inner = lock(&self.state);
+            let Some(cache) = inner.workspaces.as_mut() else {
+                return Err(ZcodeError::of(codes::NOT_READY));
+            };
+            if cache.generation != generation {
+                return Err(stale());
+            }
+            if !cache.rows_ready() {
+                let now = Instant::now();
+                for bridge in cache.enum_bridges.values_mut() {
+                    if bridge.subscribed && !bridge.snapshot_seen {
+                        // 窗口内没等到快照：撤销订阅位并进入退避，下一次读可重订阅。
+                        bridge.subscribed = false;
+                        bridge.snapshot_seen = false;
+                        bridge.snapshot_misses = bridge.snapshot_misses.saturating_add(1);
+                        bridge.next_subscribe_at = Some(
+                            now + controller_backoff(
+                                self.timing.controller_backoff,
+                                bridge.snapshot_misses,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         let inner = lock(&self.state);
         Ok(inner
             .workspaces
             .as_ref()
             .map(|cache| cache.rows.values().cloned().collect())
             .unwrap_or_default())
+    }
+
+    /// EventListen(onDynamicControllerFrame) → subscribeControllerV4 → ACK。
+    async fn subscribe_controller(&self, bridge_id: &str) -> ZResult<String> {
+        let listener_id = self.register_listener(bridge_id, ListenerKind::Controller)?;
+        self.send_listen(
+            bridge_id,
+            listener_id,
+            WINDOW_CONTROLLER_CHANNEL,
+            CONTROLLER_DYNAMIC_FRAME_EVENT,
+            Value::Null,
+        )
+        .await?;
+        let params = Value::Object(
+            [
+                (
+                    "topic".to_owned(),
+                    Value::from(CONTROLLER_TASKS_INDEX_TOPIC),
+                ),
+                ("visibility".to_owned(), Value::from("foreground")),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let message = self
+            .rpc_call(
+                bridge_id,
+                WINDOW_CONTROLLER_CHANNEL,
+                CONTROLLER_SUBSCRIBE_METHOD,
+                vec![params],
+                self.timing.rpc,
+                None,
+            )
+            .await?;
+        message
+            .body
+            .get("ack")
+            .and_then(|ack| ack.get("subscriptionId"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| ZcodeError::of(codes::NOT_READY))
     }
 
     /// 打开一个逻辑桥（ready 精确回显 → Initialize 门 → 会话桥补 hello/clientHello）。
@@ -1997,6 +2112,10 @@ impl Inner {
                         .find(|bridge| bridge.bridge_id == bridge_id)
                     {
                         bridge.snapshot_seen = true;
+                        // 快照到达即证明订阅有效（也覆盖「窗错过后的迟到快照」自愈）。
+                        bridge.subscribed = true;
+                        bridge.snapshot_misses = 0;
+                        bridge.next_subscribe_at = None;
                     }
                     changed = true;
                 }
@@ -2112,8 +2231,9 @@ impl Inner {
 
     /// 物理缺口/坏帧：整桥水位清空 + 所属会话置不新鲜（下次读触发重订阅）。
     ///
-    /// 若该桥是枚举桥：任务索引立即失效（清行、清快照位、退订旧 controller 订阅），
-    /// 下一次 `load_tasks` 重新订阅取新快照，绝不把带洞的任务行当新鲜（spec I1）。
+    /// 若该桥是枚举桥：**只**失效本 workspace 的任务行（清快照位、退订旧 controller
+    /// 订阅），下一次 `load_tasks` 重新订阅取新快照，绝不把带洞的任务行当新鲜（spec I1）；
+    /// 其它 workspace 的枚举桥与行保持新鲜（N1：单桥传输故障不得让其它工作区不可绑定）。
     fn mark_bridge_unready(&mut self, bridge_id: &str, releases: &mut Vec<Command>) {
         if let Some(bridge) = self.bridges.get_mut(bridge_id) {
             bridge.assembler.reset();
@@ -2136,24 +2256,29 @@ impl Inner {
                     .map(|bridge| bridge.controller_subscription.clone())
             })
             .flatten();
-        let mut enum_bridge_found = false;
+        let mut cleared_workspace: Option<String> = None;
         if let Some(cache) = self.workspaces.as_mut() {
             if let Some(bridge) = cache
                 .enum_bridges
                 .values_mut()
                 .find(|bridge| bridge.bridge_id == bridge_id)
             {
-                enum_bridge_found = true;
+                cleared_workspace = Some(bridge.workspace_path.clone());
                 bridge.snapshot_seen = false;
                 bridge.subscribed = false;
                 bridge.controller_subscription = None;
+                // 缺口是确定性失败：重试预算重置（下一次读立即重订阅）。
+                bridge.snapshot_misses = 0;
+                bridge.next_subscribe_at = None;
             }
-            if enum_bridge_found {
-                // 行可能跨 workspace（合并视图）：任一缺口都整体失效。
-                cache.rows.clear();
+            if let Some(workspace_path) = &cleared_workspace {
+                // 行按 workspace 分区存储：只清本 workspace（N1）。
+                cache
+                    .rows
+                    .retain(|(row_workspace, _), _| row_workspace != workspace_path);
             }
         }
-        if enum_bridge_found {
+        if cleared_workspace.is_some() {
             if let Some(subscription) = controller_subscription {
                 if let Some(command) = self.release_command(
                     bridge_id,
@@ -2167,6 +2292,11 @@ impl Inner {
             self.enum_notify.notify_waiters();
         }
     }
+}
+
+/// controller 重订阅退避：`base * 2^(misses-1)`（与会话重同步同构）。
+fn controller_backoff(base: Duration, misses: u32) -> Duration {
+    base.saturating_mul(1u32 << misses.saturating_sub(1).min(8))
 }
 
 /// 任务索引行入库：按 `workspacePath\0taskId` 去重，总行数受合同上限约束
@@ -2624,6 +2754,8 @@ mod tests {
         hello_protocol: u64,
         refuse_open: bool,
         controller_snapshot: bool,
+        /// 从第 N 次 controller 订阅起才下发快照（收帧窗错过用例）。
+        controller_snapshot_from_attempt: u32,
         /// 同一枚举桥第 2 次 controller 订阅时返回的（全量）任务行。
         controller_resubscribe_tasks: Option<Vec<Value>>,
         conversation_snapshot: Option<Value>,
@@ -2654,6 +2786,7 @@ mod tests {
                 hello_protocol: V4_WIRE_PROTOCOL_VERSION,
                 refuse_open: false,
                 controller_snapshot: true,
+                controller_snapshot_from_attempt: 1,
                 controller_resubscribe_tasks: None,
                 conversation_snapshot: None,
                 fragmented_snapshot: false,
@@ -3021,6 +3154,10 @@ mod tests {
                                     .or_insert(0);
                                 *attempt += 1;
                                 let attempt = *attempt;
+                                // 首次订阅故意不下发快照（收帧窗错过 → 重订阅用例）。
+                                if attempt < self.config.controller_snapshot_from_attempt {
+                                    return;
+                                }
                                 let source = if attempt >= 2 {
                                     self.config
                                         .controller_resubscribe_tasks
@@ -4035,6 +4172,136 @@ mod tests {
             vec!["sess_0f9a1c0d-0000-4000-8000-0000000000c3".to_owned()],
             "fresh snapshot replaces stale rows"
         );
+    }
+
+    /// 单枚举桥的物理缺口只允许让**本 workspace** 的任务行失效：其它 workspace
+    /// 的索引必须继续可用（N1），缺口桥随后自愈重订阅。
+    #[tokio::test]
+    async fn enum_bridge_gap_keeps_other_workspace_rows() {
+        let session_b_extra = "sess_0f9a1c0d-0000-4000-8000-0000000000b2";
+        let session_a_extra = "sess_0f9a1c0d-0000-4000-8000-0000000000a2";
+        let config = PeerConfig {
+            workspaces: vec![
+                workspace_entry(WS_A, Some("ws-a-identity"), "A"),
+                workspace_entry(WS_B, Some("ws-b-identity"), "B"),
+            ],
+            tasks: vec![
+                task_row(WS_A, SESSION_A, "hi"),
+                task_row(WS_B, SESSION_B, "hi"),
+                task_row(WS_B, session_b_extra, "hi"),
+            ],
+            controller_resubscribe_tasks: Some(vec![
+                task_row(WS_A, SESSION_A, "hi"),
+                task_row(WS_A, session_a_extra, "hi"),
+                task_row(WS_B, SESSION_B, "hi"),
+                task_row(WS_B, session_b_extra, "hi"),
+            ]),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        assert!(manager.bind(&key(SESSION_A)).await.is_ok());
+        assert_eq!(manager.task_rows(), 3, "两枚举桥的行都已入索引");
+
+        let enum_bridges = peer.enum_bridge_ids();
+        assert_eq!(enum_bridges.len(), 2);
+        let bridge_a = enum_bridges
+            .iter()
+            .find(|bridge| peer.controller_rows(bridge).contains(&SESSION_A.to_owned()))
+            .expect("workspace A enum bridge")
+            .clone();
+        let bridge_b = enum_bridges
+            .iter()
+            .find(|bridge| *bridge != &bridge_a)
+            .expect("workspace B enum bridge")
+            .clone();
+        assert!(peer
+            .controller_rows(&bridge_b)
+            .contains(&SESSION_B.to_owned()));
+
+        // A 的枚举桥物理缺口：只清 A 的行，B 的行保持新鲜。
+        let gap = json!({"zcode_type": "rpc-frame", "bridgeSessionId": bridge_a});
+        assert!(manager.on_data(gap).await.is_err());
+        assert_eq!(
+            manager.task_rows(),
+            2,
+            "缺口只允许失效本 workspace 的行（N1）"
+        );
+
+        // B 的 exact taskId（尚未绑定）在无换代的情况下仍可绑定。
+        let b_extra = manager
+            .bind(&key(session_b_extra))
+            .await
+            .expect("B row survives A gap");
+        assert_eq!(b_extra.workspace_path, WS_B);
+
+        // A 的枚举桥在同一次 load_tasks 中重订阅并恢复，新行可绑定。
+        let a_extra = manager
+            .bind(&key(session_a_extra))
+            .await
+            .expect("A reindex recovers");
+        assert_eq!(a_extra.workspace_path, WS_A);
+
+        // 只有 A 桥发生第二次 controller 订阅；B 桥不受波及。
+        let subscribes_for = |bridge: &str| {
+            peer.sent()
+                .into_iter()
+                .filter(|payload| {
+                    payload.get("zcode_type").and_then(Value::as_str) == Some("rpc-frame")
+                        && payload.get("bridgeSessionId").and_then(Value::as_str) == Some(bridge)
+                })
+                .filter(|payload| {
+                    decode_outbound(payload).method.as_deref() == Some(CONTROLLER_SUBSCRIBE_METHOD)
+                })
+                .count()
+        };
+        assert_eq!(subscribes_for(&bridge_a), 2);
+        assert_eq!(subscribes_for(&bridge_b), 1);
+    }
+
+    /// controller 收帧窗错过（订阅 ACK 到了但快照没来）不得永久闩死：
+    /// 退避窗过后允许一次新的 subscribeControllerV4，快照到达即恢复绑定。
+    #[tokio::test]
+    async fn controller_snapshot_timeout_resubscribes() {
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: Vec::new(),
+            controller_snapshot_from_attempt: 2,
+            controller_resubscribe_tasks: Some(vec![task_row(WS_A, SESSION_A, "hi")]),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+        let controller_subscribes = || {
+            channel_frames(&peer)
+                .into_iter()
+                .filter(|frame| frame.method.as_deref() == Some(CONTROLLER_SUBSCRIBE_METHOD))
+                .count()
+        };
+
+        // 首次订阅收到 ACK 但收帧窗内无快照 → 本次绑定无行可用。
+        let first = manager
+            .bind(&key(SESSION_A))
+            .await
+            .expect_err("首窗无快照不得绑定成功");
+        assert!(first.is(codes::NO_SESSION));
+        assert_eq!(controller_subscribes(), 1);
+
+        // 退避窗内不得立刻重订阅（防 tight loop），但也不得永久闩死。
+        let blocked = manager
+            .bind(&key("sess_0f9a1c0d-0000-4000-8000-00000000dead"))
+            .await
+            .expect_err("退避窗内没有新行");
+        assert!(blocked.is(codes::NO_SESSION));
+        assert_eq!(controller_subscribes(), 1, "退避窗内不得重订阅");
+
+        tokio::time::sleep(BridgeTiming::test().controller_backoff + Duration::from_millis(30))
+            .await;
+        let target = manager
+            .bind(&key(SESSION_A))
+            .await
+            .expect("退避窗过后必须允许重订阅并恢复");
+        assert_eq!(target.workspace_path, WS_A);
+        assert_eq!(target.generation, 1, "恢复不得依赖换代");
+        assert_eq!(controller_subscribes(), 2);
     }
 
     #[tokio::test]
