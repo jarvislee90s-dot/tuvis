@@ -102,9 +102,9 @@ pub async fn connection(State(st): State<Arc<RemoteState>>) -> Response {
 
 /// 当前 Tuvis 会话快照里按原 ID 对位出的 ZCode 会话。
 ///
-/// 只认**快照里活着的** `agent_type=zcode` 会话：未知 ID、非 ZCode、已离开快照
-/// （旧会话/隐藏归档）一律 None——手机不能凭自报 ID 越权恢复任何会话。
-/// 快照扫描是同步阻塞活（与 /sessions 同源），按既有惯例进阻塞池。
+/// 只认**快照里活着的** `agent_type=zcode` 会话：未知 ID、非 ZCode、已离开快照、
+/// **或已被看板「叉掉」（`board_hidden_ids` 软归档）** 一律 None——手机不能凭自报
+/// ID 越权恢复/控制任何会话。快照扫描与看板隐藏集合同源，均按既有惯例进阻塞池。
 async fn current_zcode_session(
     st: &Arc<RemoteState>,
     session_id: &str,
@@ -112,6 +112,10 @@ async fn current_zcode_session(
     let scan = st.clone();
     let wanted = session_id.to_string();
     tokio::task::spawn_blocking(move || {
+        // 看板隐藏 = 用户已从可见面移除：隐藏/归档的活会话同样不进入控制面。
+        if (scan.board_hidden_ids)().iter().any(|id| id == &wanted) {
+            return None;
+        }
         (scan.session_source)()
             .sessions
             .into_iter()
@@ -185,22 +189,32 @@ fn session_error(error: ZcodeError) -> Response {
 ///
 /// `pub` 仅为 `tests/` 可见（`doc(hidden)`，不向设置/IPC 暴露）：
 /// - 连接事件（`sessionId = None`）恒转发——两台手机共享同一条连接的状态；
-/// - 会话/动作事件只转发**请求的那个会话**——别的会话（可能由另一台手机驱动）
-///   的动作 id/投影一律不出网；缺 `sessionId` 的会话类事件保守丢弃；
+/// - 会话事件只转发**请求的那个会话**——别的会话的投影不出网，缺 `sessionId`
+///   的会话类事件保守丢弃；
+/// - 动作事件还要求**发起设备 = 请求设备**（`ControlEvent.device_id` 只留在
+///   进程内）：同一会话下别的手机的动作 id 一律不出网；缺设备维度保守丢弃；
 /// - 事件体只序列化 Hub 的 Tuvis DTO（`ControlEvent`），绝无 JWT/token/官方原文。
 #[doc(hidden)]
-pub fn control_frame(event: &ControlEvent, session_id: &str) -> Option<(&'static str, String)> {
+pub fn control_frame(
+    event: &ControlEvent,
+    session_id: &str,
+    device_id: &str,
+) -> Option<(&'static str, String)> {
     let name = match event.kind {
         ControlEventKind::Connection => "connection",
-        ControlEventKind::Session | ControlEventKind::Action => {
+        ControlEventKind::Session => {
             if event.session_id.as_deref() != Some(session_id) {
                 return None;
             }
-            if event.kind == ControlEventKind::Session {
-                "session"
-            } else {
-                "action"
+            "session"
+        }
+        ControlEventKind::Action => {
+            if event.session_id.as_deref() != Some(session_id)
+                || event.device_id.as_deref() != Some(device_id)
+            {
+                return None;
             }
+            "action"
         }
     };
     serde_json::to_string(event).ok().map(|data| (name, data))
@@ -211,7 +225,7 @@ pub fn control_frame(event: &ControlEvent, session_id: &str) -> Option<(&'static
 /// - 首帧 `snapshot` = 当前 [`ConnectionView`](crate::services::zcode_control::ConnectionView)
 ///   与（可绑定时）当前会话投影（含 `ready`）；随后转发 Hub 的
 ///   [`ControlEvent`](crate::services::zcode_control::ControlEvent)（连接恒转发，
-///   会话/动作只发本会话，见 [`control_frame`]）；
+///   会话只发本会话，动作只发本会话 + 本设备，见 [`control_frame`]）；
 /// - 广播落后（lag）只发 `resync` 帧，客户端据此重 GET connection/session，
 ///   **绝不重放动作**；
 /// - 注册进既有 [`SseRegistry`]：设备吊销/停服经 `take_until` 立即断流；
@@ -267,11 +281,13 @@ pub async fn events(
         Ok::<sse::Event, Infallible>(sse::Event::default().event("snapshot").data(initial_json))
     });
     let wanted = session_id.clone();
+    let wanted_device = device.clone();
     let updates = BroadcastStream::new(rx).filter_map(move |msg| {
         let wanted = wanted.clone();
+        let wanted_device = wanted_device.clone();
         async move {
             match msg {
-                Ok(event) => control_frame(&event, &wanted)
+                Ok(event) => control_frame(&event, &wanted, &wanted_device)
                     .map(|(name, data)| Ok(sse::Event::default().event(name).data(data))),
                 // lag = 中间事件已丢：只报 resync，由客户端重 GET 自愈；不重放动作。
                 Err(BroadcastStreamRecvError::Lagged(_)) => Some(Ok(sse::Event::default()
@@ -355,9 +371,12 @@ const ANSWER_KEYS: &[&str] = &["questionText", "selectedValues", "freeText"];
 /// 安全边界：
 /// 1. 请求体只允许 `{actionId, action}`（[`REQUEST_KEYS`]/[`ACTION_KEYS`] 严格白名单）
 ///    ——设备身份、workspace、能力、供应商等字段在解析层拒绝为 400 `invalid_action`；
-/// 2. [`ActionContext`] 的设备 id/花名只来自配对 gate 的 cookie 与本机 DB，**绝不**
+/// 2. 与 GET 同级授权门：只接受当前 Tuvis 快照里 `agent_type=zcode` 的会话——隐藏/
+///    归档（已离开快照）或非 ZCode 的会话凭自报 ID 一律 404 `no_session`，零 hub 调用，
+///    手机不能越过看板可见性边界恢复旧会话；
+/// 3. [`ActionContext`] 的设备 id/花名只来自配对 gate 的 cookie 与本机 DB，**绝不**
 ///    读请求体（ActionContext 本身不实现 Deserialize）；
-/// 3. 代际/绑定/能力闸全部由 Hub 判定；本函数只做错误码 → 状态码映射。
+/// 4. 代际/绑定/能力闸全部由 Hub 判定；本函数只做错误码 → 状态码映射。
 pub async fn actions(
     State(st): State<Arc<RemoteState>>,
     headers: HeaderMap,
@@ -377,6 +396,13 @@ pub async fn actions(
     let Some((action_id, action)) = parse_action_request(raw) else {
         return action_error(codes::INVALID_ACTION);
     };
+    // 授权门先于任何 hub 调用（与 GET 同一判据）：隐藏/归档/非 ZCode → 404，零绑定零执行。
+    if current_zcode_session(&st, action.session_id())
+        .await
+        .is_none()
+    {
+        return action_error(codes::NO_SESSION);
+    }
     // 设备身份的可信源：配对 gate 已验过 cookie；这里只取 id + 花名（DB）。
     let Some(device_id) = super::gate::extract_device(&headers) else {
         // gate 已拦设备，理论不可达——兜底与 gate 同形（空体 403，不泄露区分）。

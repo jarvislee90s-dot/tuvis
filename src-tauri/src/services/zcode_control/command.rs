@@ -287,7 +287,7 @@ fn authorize_stop_on(
     if view.session_id != target.session_id {
         return Err(ZcodeError::of(codes::NO_SESSION));
     }
-    if view.generation != target.generation {
+    if view.generation != target.bridge_generation() {
         return Err(ZcodeError::of(codes::STALE_GENERATION));
     }
     if !view.ready {
@@ -934,7 +934,7 @@ impl CommandSender {
         if view.session_id != target.session_id {
             return Err(ZcodeError::of(codes::NO_SESSION));
         }
-        if view.generation != target.generation {
+        if view.generation != target.bridge_generation() {
             return Err(ZcodeError::of(codes::STALE_GENERATION));
         }
         if !view.ready {
@@ -1178,7 +1178,7 @@ impl CommandSender {
                     if view.session_id != target.session_id {
                         return Err(ZcodeError::of(codes::NO_SESSION));
                     }
-                    if view.generation != target.generation {
+                    if view.generation != target.bridge_generation() {
                         return Err(ZcodeError::of(codes::STALE_GENERATION));
                     }
                     // `ready=false` 但 control 仍留在投影里的旧视图不算已确认：
@@ -1413,6 +1413,7 @@ mod tests {
             workspace_identity: Some("ws-identity".to_string()),
             workspace_key: "ws-identity".to_string(),
             generation: GEN,
+            bridge_generation: None,
         }
     }
 
@@ -1425,9 +1426,13 @@ mod tests {
     }
 
     fn send_action(text: &str) -> ControlAction {
+        send_action_at(GEN, text)
+    }
+
+    fn send_action_at(generation: u64, text: &str) -> ControlAction {
         ControlAction::Send {
             session_id: SESSION.to_string(),
-            generation: GEN,
+            generation,
             text: text.to_string(),
         }
     }
@@ -1655,6 +1660,49 @@ mod tests {
         assert_eq!(second.session_id, SESSION);
         assert_eq!(second.generation, GEN);
         assert_eq!(row_count(&store), 1);
+    }
+
+    /// Hub 盖好的精确目标：公开代际（Hub）用于校验/落账，桥投影代际只给桥内部。
+    /// 真实 ActionStore/CommandSender + fake CommandPort：若 sender 仍用桥代际对拍，本用例必红。
+    #[tokio::test]
+    async fn real_sender_accepts_hub_stamped_target() {
+        let store = DeviceStore::memory();
+        let fake = FakeBridge::new(Reply::Body(accepted_body()));
+        let sender = sender(&fake, &store);
+        let hub_generation = GEN + 100;
+        let mut target = target();
+        target.bridge_generation = Some(GEN);
+        target.generation = hub_generation;
+
+        let receipt = sender
+            .execute(
+                &ctx("a-hub-stamped"),
+                &target,
+                &send_action_at(hub_generation, "合成正文"),
+            )
+            .await
+            .expect("公开代际必须通过 sender 校验");
+        assert_eq!(receipt.state, ActionState::Accepted);
+        assert_eq!(receipt.generation, hub_generation, "回执盖公开代际");
+        assert_eq!(fake.wire(), 1);
+
+        let stored_generation: i64 = store.with(|c| {
+            c.query_row("SELECT generation FROM zcode_actions", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(stored_generation, hub_generation as i64, "账本存公开代际");
+
+        // 反证：动作按桥代际盖章 → 旧代际拒绝，零第二帧。
+        let err = sender
+            .execute(
+                &ctx("a-bridge-stamped"),
+                &target,
+                &send_action_at(GEN, "合成正文"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is(codes::STALE_GENERATION));
+        assert_eq!(fake.wire(), 1, "旧代际不得产生第二帧");
     }
 
     /// 同 actionId 换正文：action_payload_conflict，零第二帧、零新行。
