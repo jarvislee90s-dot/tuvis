@@ -410,7 +410,7 @@
         "step_shields_up": "Disable incoming-connection blocking",
         "step_funnel": "Enable Funnel (fixed URL)",
         "step_verify": "Board reachability check",
-        "timelineLabel": "Tailscale setup steps",
+        "timelineLabel": "Setup steps",
         "checkNow": "Check reachability",
         "repair": "Re-enable connection",
         "repairTitle": "Re-enable Tailscale connection?",
@@ -428,16 +428,16 @@
         "troubleshootingRepairOptional": "After these checks, you can choose Re-enable connection if you still want to reopen it. Nothing runs until you confirm.",
         "tsPendingChecking": "The address is not verified yet. Tuvis will check again automatically.",
         "addressWillAppear": "After verification, find the address in Settings → Remote Access → the corresponding channel card.",
-        "waitingForInstall": "Waiting for installation to finish",
-        "openingInstaller": "The installer is open. Finish it, then return here.",
-        "installNeedsDownload": "Download the installer first",
-        "autoDownload": "Download installer",
-        "retryDownload": "Retry download",
+        "waitingForInstall": "Awaiting installation",
+        "openingInstaller": "Opening the installer… (installer verified)",
+        "installNeedsDownload": "Complete the automatic download above first. The installer can open after checksum verification.",
+        "autoDownload": "Download installer automatically",
+        "retryDownload": "Retry automatic download",
         "allowIncoming": "Allow incoming connections",
         "enableFunnel": "Enable fixed address",
-        "detectFound": "Tailscale is installed.",
-        "detectMissing": "Tailscale is not installed yet.",
-        "openDownloads": "Open Downloads folder",
+        "detectFound": "Tailscale was detected. Download and installation can be skipped.",
+        "detectMissing": "Tailscale was not detected. Continue below to download and install it.",
+        "openDownloads": "Open downloads folder",
         "tsNotLive": "Fixed address not live yet",
         "tsTransientHint": "A connection failure is usually transient public-network jitter. Tuvis checks again every minute; if it remains broken after 10 minutes, inspect the Tailscale account and Funnel settings before choosing Repair.",
         "retry": "Retry",
@@ -466,23 +466,12 @@
         "tsRecoveringBadge": "Reconnecting",
         "writePathUnverifiedMac": "⚠ The write path (enable / revoke / self-heal) is not machine-verified on this platform yet — actual behavior may differ; the read-only probes are verified on macOS 1.102.4 (status / funnel status / get), but the write path has never been run.",
         "writePathUnverifiedOther": "⚠ No probing on this platform: install detection, read-only fields and the write path (enable / revoke / self-heal) have not been machine-verified on Linux and similar platforms — behavior may differ.",
-        "openingInstaller": "Opening the installer… (installer verified)",
         "completeInInstaller": "Complete the installation in the system installer, then return here and refresh the status.",
         "downloadLocation": "Installer downloaded and verified:",
-        "openDownloads": "Open downloads folder",
         "manualDownload": "Download manually",
         "manualInstallHint": "Automatic download did not finish. Retry it, or use “Download manually” to get the official package and double-click it in your system downloads folder. After installation, return to Tuvis and click “Refresh status”.",
         "actionFailedUnknown": "The action failed without error details. Retry or install manually from your downloads folder.",
-        "timelineLabel": "Setup steps",
-        "autoDownload": "Download installer automatically",
-        "retryDownload": "Retry automatic download",
-        "manualOpenHint": "The installer is downloaded and verified. Click “Open downloads folder” in this step, double-click the package to install, then return here and refresh the status.",
-        "installNeedsDownload": "Complete the automatic download above first. The installer can open after checksum verification.",
-        "detectFound": "Tailscale was detected. Download and installation can be skipped.",
-        "detectMissing": "Tailscale was not detected. Continue below to download and install it.",
-        "waitingForInstall": "Awaiting installation",
-        "allowIncoming": "Allow incoming connections",
-        "enableFunnel": "Enable fixed address"
+        "manualOpenHint": "The installer is downloaded and verified. Click “Open downloads folder” in this step, double-click the package to install, then return here and refresh the status."
       },
       "tsDisableTitle": "Revoking also clears other serve entries",
       "tsDisableDescMixed": "Revoking clears the Tuvis Funnel config together with {{count}} non-Tuvis serve entr(y/ies) — `tailscale funnel reset` wipes the whole config. Nothing happens until you confirm.",
@@ -607,6 +596,9 @@
       "usdCnyRateHint": "Used for display conversion only when the daily rate cannot be fetched; CNY prefers native RMB prices. The ledger and price sources are unchanged.",
       "pricingTitle": "Pricing catalog status",
       "pricingHint": "Only the public models.dev catalog is downloaded; refresh and toggling are always user-initiated.",
+      "sourcesTitle": "Output speed collection management",
+      "sourcesHint": "Review per-tool connection status and metric capabilities; set up or remove instrumentation. History survives uninstalling.",
+      "sourcesOpen": "Collection management",
       "providerMapRules": "Provider mapping rules (JSON)",
       "providerMapRulesPlaceholder": "{\"rules\":[{\"prefix\":\"deepseek-\",\"provider\":\"volcengine\"}]}",
       "providerMapRulesHint": "Only the {\"rules\":[{\"prefix\":…,\"provider\":…}]} shape is accepted; an invalid value is only flagged here and the save is still sent.",
@@ -1188,6 +1180,7 @@
       "unknownModel": "Unknown model"
     },
     "title": "Usage Dashboard",
+    "redirectNotice": "Opening Model Usage in the main window…",
     "menu": {
       "dashboard": "📊 Usage Dashboard",
       "usage": "🏷 Today's Usage"
@@ -1237,7 +1230,13 @@
       "quoteSave": "Save",
       "quoteCancel": "Cancel",
       "quoteSaved": "Quote saved",
-      "boardOnly": "Board tab only (the text summary and share image are board-scoped)"
+      "boardOnly": "Board tab only (the text summary and share image are board-scoped)",
+      "costTotal": "Total (estimated)",
+      "modulesTitle": "Image modules",
+      "modulesOverview": "Overview + trend (always included)",
+      "modulesOverviewHint": "The hero figure, metric rows and trend chart are always drawn and cannot be turned off.",
+      "modulesWork": "Work summary + pet speech bubble",
+      "modulesHint": "Saved on this device as soon as checked; affects the exported image only — \"Copy text\" is unchanged."
     },
     "range": {
       "last5h": "Last 5 hours",
@@ -1336,7 +1335,11 @@
       "observed": "Observed",
       "ambiguous": "Ambiguous",
       "aliasAction": "Provider display name",
-      "billingRulesAdvanced": "Advanced: billing attribution & reference rules"
+      "billingRulesAdvanced": "Advanced: billing attribution & reference rules",
+      "colModel": "Provider display name",
+      "colTokens": "Tokens",
+      "colRequests": "Requests",
+      "totalRow": "Total"
     },
     "pricing": {
       "toggle": "Enable pricing catalog",
@@ -1623,9 +1626,7 @@
     },
     "notCollected": "Not collected yet",
     "footer": {
-      "caliber": "Tokens only · incl. subagents · aggregated locally",
-      "baseline": "Baseline: previous equal-length range",
-      "retention": "No detail older than {{days}} days"
+      "caliber": "Tokens only · incl. subagents · aggregated locally"
     },
     "alias": {
       "title": "Provider display name (alias)",
@@ -1748,6 +1749,92 @@
       "colItem": "Item",
       "colAmountShort": "Amount",
       "colUnitPrice": "Unit price"
+    },
+    "tps": {
+      "title": "Recent TPS",
+      "subtitle": "While visible: reads every {{snapshotSec}}s and adds a sample every {{pointsSec}}s; no benchmark requests are sent",
+      "range": {
+        "2m": "Last 2 min",
+        "10m": "Last 10 min",
+        "1h": "Last 1 h",
+        "today": "Today"
+      },
+      "lastCallTitle": "Latest completed call",
+      "turnLabel": "Latest turn",
+      "stale": "No recent sample",
+      "noSample": "No valid sample yet",
+      "currentNone": "No series",
+      "sampleN": "Valid samples n",
+      "latestEnded": "Sample ended",
+      "detail": {
+        "modelMs": "Sample model time",
+        "toolMs": "Sample tool-call time",
+        "avgFirstToken": "Sample avg first token",
+        "tps": "Sample TPS"
+      },
+      "counters": "Candidates {{candidate}} · Timed model {{timedModel}} · Timed tool {{timedTool}} · Failed {{failed}} · Cancelled {{cancelled}} · Missing timing {{missingTiming}}",
+      "method": {
+        "streamObserved": "Stream-observed",
+        "clientNative": "Client-native",
+        "nativeEventApprox": "Native-event-approx",
+        "logBoundaryApprox": "Log approx",
+        "approxBadge": "approx"
+      },
+      "outputScope": {
+        "exclusiveOutput": "Output excludes reasoning",
+        "includesReasoning": "Output includes reasoning",
+        "providerReported": "Reasoning count not declared separately",
+        "unknown": "Scope unknown"
+      },
+      "age": {
+        "sec": "{{n}}s ago",
+        "min": "{{n}}m ago",
+        "hour": "{{n}}h ago",
+        "day": "{{n}}d ago"
+      },
+      "turnUnknown": "Turn identity unavailable",
+      "turnNone": "No turn sample yet",
+      "gapNote": "{{n}} gap(s) not connected (not drawn as 0)",
+      "refresh": "Refresh",
+      "refreshNote": {
+        "rateLimited": "Rate-limited (minimum 5s interval)",
+        "busy": "Sampler busy, try again shortly",
+        "disabled": "Usage collection is disabled"
+      },
+      "disabled": "Usage collection is disabled; TPS sampling paused. History is kept and sampling resumes when re-enabled.",
+      "chartEmpty": "No sample points in this range",
+      "sources": {
+        "title": "Sources",
+        "status": {
+          "unconfigured": "Not configured",
+          "await-restart": "Waiting for restart",
+          "no-sample": "Read, no samples",
+          "insufficient-timing": "Missing timing fields",
+          "read-failed": "Read failed",
+          "active": "Active",
+          "unknown": "Unknown"
+        },
+        "codexGap": "No TPS in this release (no reliable per-call generation window)",
+        "install": "Install instrumentation",
+        "uninstall": "Uninstall",
+        "restartHint": "Takes effect on next launch (Tuvis will not restart the Harness for you)",
+        "previewTitle": "Install preview",
+        "oldValue": "Old value",
+        "planned": "Planned value",
+        "masked": "Masked",
+        "conflictFlag": "Same signal target already exists",
+        "choiceAppend": "Append only (default)",
+        "choiceTransfer": "Transfer statistics target",
+        "uninstalledNote": "Own instrumentation removed",
+        "receiverPort": "Receiver port {{port}}",
+        "reason": {
+          "conflict": "Same signal target exists and is kept by default; choose transfer in the preview to hand it over",
+          "stale-preview": "Settings changed after preview; preview again",
+          "expired-preview": "Preview expired; preview again",
+          "preview-not-found": "Preview not found or already applied; preview again",
+          "uninstall-conflict": "Entries you edited later were kept; handle them manually"
+        }
+      }
     }
   },
   "errors": {
@@ -2061,7 +2148,8 @@
     "tswizDownloadDirInvalid": "Invalid installer download directory",
     "tswizDownloadDirFail": "Could not create the downloads folder — check permissions or download and install manually",
     "tswizInstallerCopyFail": "Could not copy the existing installer — check downloads folder permissions",
-    "tswizInstallerSaveFail": "Could not save the installer — check permissions or download and install manually"
+    "tswizInstallerSaveFail": "Could not save the installer — check permissions or download and install manually",
+    "workspaceMainWindowNotFound": "Main window not found — the navigation target is queued; reopen Tuvis from the tray"
   },
   "mobile": {
     "common": {
@@ -2717,6 +2805,140 @@
     },
     "split": {
       "handleAria": "Drag to adjust the split ratio"
+    }
+  },
+  "speed": {
+    "metric": {
+      "stream": "Streaming output speed",
+      "response": "Response throughput (incl. waits)"
+    },
+    "unit": {
+      "tps": "TPS",
+      "tokenPerSec": "Token/s"
+    },
+    "tile": {
+      "currentRate": "Current-mode speed",
+      "avgFirstToken": "Avg. first-token wait",
+      "modelMs": "Total generation time",
+      "responseMs": "Total response time",
+      "toolMs": "Total tool time",
+      "approxMark": "log-approx",
+      "toolMsHint": "No source can yet attribute tool-execution time to a single model call, so it stays out (never zero-filled); see Usage → Work activity for all-tool totals."
+    },
+    "chart": {
+      "ariaLabel": "Output speed trend: {{metric}}, unit {{unit}}",
+      "noSample": "No valid samples",
+      "tooltipWidth": "Bucket width {{width}}",
+      "tooltipN": "n={{n}}",
+      "legend": {
+        "gapConnector": "Dashed line only connects; no samples",
+        "gapBand": "Shaded area marks a no-sample gap"
+      }
+    },
+    "context": {
+      "range": "Range summary · {{metric}} · n={{n}}",
+      "bucket": "{{span}} · {{width}} · n={{n}}",
+      "backToSummary": "Back to range summary"
+    },
+    "duration": {
+      "ms": "{{n}} ms",
+      "s": "{{n}} s",
+      "min": "{{n}} min"
+    },
+    "codexFallback": "Response throughput only (incl. waits)",
+    "reason": {
+      "stream-gap:insufficient-generation-timing": "No per-call streaming generation window (response side is log-approx)",
+      "not-installed": "Stats hook not installed",
+      "never-read": "Never read any data yet",
+      "read-failed": "Last read failed",
+      "parser-errors": "Some records failed to parse",
+      "await-restart": "Installed; takes effect after host restart"
+    },
+    "range": {
+      "15m": "Last 15 minutes",
+      "1h": "Last hour",
+      "5h": "Last 5 hours",
+      "24h": "Last 24 hours"
+    },
+    "sort": {
+      "name": "Series name",
+      "rate": "Speed",
+      "sessions": "Sessions"
+    },
+    "status": {
+      "ready": "Connected",
+      "unconfigured": "Setup needed",
+      "await-restart": "Awaiting restart",
+      "needs-check": "Needs check",
+      "unsupported": "Unsupported"
+    },
+    "sources": {
+      "title": "Collection management",
+      "desc": "Per-tool connection status, metric capabilities and setup/removal actions; technical details expand on demand",
+      "empty": "No sources",
+      "fetchError": "Failed to load source status; click Refresh to retry.",
+      "actionInstall": "Install plugin",
+      "actionUninstall": "Uninstall plugin",
+      "actionDetails": "Details",
+      "detailsTitle": "Technical details",
+      "reasonLabel": "Reason",
+      "refresh": "Refresh",
+      "lastRecord": "Last record",
+      "capStream": "Stream",
+      "capResponse": "Response",
+      "responseOnly": "response only",
+      "capUnavailable": "unavailable"
+    },
+    "mode": {
+      "stream": "Streaming output",
+      "response": "Response throughput (incl. waits)"
+    },
+    "modeHint": {
+      "stream": "Streaming output speed = output tokens ÷ seconds from first valid output to generation end (first-token wait excluded)",
+      "response": "Response throughput (incl. waits) = output tokens ÷ total seconds of first-token wait + generation",
+      "line1": "Streaming output speed = output tokens ÷ seconds from first valid output to generation end (first-token wait excluded);",
+      "line2": "Response throughput (incl. waits) = output tokens ÷ total seconds of first-token wait + generation",
+      "line3": "For the same record, response ≤ streaming — the difference is the wait; Codex carries the response metric only (log-approx)"
+    },
+    "list": {
+      "listLabel": "Series list",
+      "colSeries": "Series",
+      "colRate": "Speed",
+      "colSessions": "Sessions with evidence",
+      "toolFilter": "Tool filter",
+      "toolAll": "All tools",
+      "emptyAll": "No series yet",
+      "smallSample": "small sample",
+      "sortHeaderTitle": "Click to sort (click again to flip order)",
+      "seriesPicker": "Select series"
+    },
+    "detail": {
+      "empty": "Nothing to show yet",
+      "seriesPicker": "Select series"
+    },
+    "disabled": "Speed statistics are disabled in Settings",
+    "fetchError": "Failed to load speed readings; please retry.",
+    "gapStyle": {
+      "label": "Gap style",
+      "dash": "Dashed connector",
+      "band": "Shade only"
+    }
+  },
+  "workspace": {
+    "nav": {
+      "label": "Main navigation"
+    },
+    "tab": {
+      "messages": "Messages",
+      "resources": "Resources",
+      "usage": "Model Usage",
+      "speed": "Output Speed"
+    },
+    "page": {
+      "messages": "Messages",
+      "resources": "Resources",
+      "usage": "Model Usage",
+      "speed": "Output Speed"
     }
   }
 }

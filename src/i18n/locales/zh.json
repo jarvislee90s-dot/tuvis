@@ -410,7 +410,7 @@
         "step_shields_up": "关闭「阻止传入连接」",
         "step_funnel": "开通 Funnel（固定网址）",
         "step_verify": "看板可达性校验",
-        "timelineLabel": "Tailscale 配置步骤",
+        "timelineLabel": "配置步骤",
         "checkNow": "检查公网可达性",
         "repair": "重新开通",
         "repairTitle": "重新开通 Tailscale 连接？",
@@ -428,15 +428,15 @@
         "troubleshootingRepairOptional": "完成排查后，如果仍希望重新建立连接，可以自行选择「重新开通」，确认后才会执行。",
         "tsPendingChecking": "地址尚未验证，兔维斯 会自动再次检查。",
         "addressWillAppear": "检查通过后，地址会显示在「设置 → 远程接入 → 对应通道卡」。",
-        "waitingForInstall": "等待安装完成",
-        "openingInstaller": "安装器已打开，请完成安装后返回此处。",
-        "installNeedsDownload": "请先下载安装包",
-        "autoDownload": "下载安装包",
-        "retryDownload": "重新下载",
+        "waitingForInstall": "待下载安装",
+        "openingInstaller": "正在打开安装程序…（安装包已校验通过）",
+        "installNeedsDownload": "请先完成上一步自动下载；安装包校验通过后即可打开安装程序。",
+        "autoDownload": "自动下载安装包",
+        "retryDownload": "重试自动下载",
         "allowIncoming": "允许传入连接",
         "enableFunnel": "开通固定地址",
-        "detectFound": "已检测到 Tailscale。",
-        "detectMissing": "尚未安装 Tailscale。",
+        "detectFound": "已检测到 Tailscale，可跳过下载安装。",
+        "detectMissing": "未检测到 Tailscale，请继续下一步下载安装。",
         "openDownloads": "打开下载文件夹",
         "tsNotLive": "固定地址尚未生效",
         "tsTransientHint": "连不通多为公网链路瞬时抖动，兔维斯 每分钟自动复验。若持续超过 10 分钟，请先检查 Tailscale 账号与 Funnel 设置，再决定是否修复。",
@@ -466,23 +466,12 @@
         "tsRecoveringBadge": "恢复中",
         "writePathUnverifiedMac": "⚠ 写路径（开通 / 撤销 / 自愈）尚未在本平台实机验证——实际行为可能与预期不同；只读探测（status / funnel status / get）已在 macOS 1.102.4 实测，写路径一次都没跑过。",
         "writePathUnverifiedOther": "⚠ 本平台零探测：Tailscale 的安装检测、只读字段与写路径（开通 / 撤销 / 自愈）都未在 Linux 等平台上实机验证——行为可能与预期不同。",
-        "openingInstaller": "正在打开安装程序…（安装包已校验通过）",
         "completeInInstaller": "请在系统安装界面完成安装，然后返回这里刷新状态。",
         "downloadLocation": "安装包已下载并校验：",
-        "openDownloads": "打开下载文件夹",
         "manualDownload": "手动下载",
         "manualInstallHint": "自动下载未完成。可先点击「重试自动下载」，或从官方源「手动下载」后在系统下载文件夹中双击安装。完成后返回兔维斯，点击「刷新状态」。",
         "actionFailedUnknown": "操作失败，未收到详细错误。请重试，或从下载文件夹手动安装。",
-        "timelineLabel": "配置步骤",
-        "autoDownload": "自动下载安装包",
-        "retryDownload": "重试自动下载",
-        "manualOpenHint": "安装包已下载并校验。可点击本步骤的「打开下载文件夹」，双击安装包完成安装，再返回这里刷新状态。",
-        "installNeedsDownload": "请先完成上一步自动下载；安装包校验通过后即可打开安装程序。",
-        "detectFound": "已检测到 Tailscale，可跳过下载安装。",
-        "detectMissing": "未检测到 Tailscale，请继续下一步下载安装。",
-        "waitingForInstall": "待下载安装",
-        "allowIncoming": "允许传入连接",
-        "enableFunnel": "开通固定地址"
+        "manualOpenHint": "安装包已下载并校验。可点击本步骤的「打开下载文件夹」，双击安装包完成安装，再返回这里刷新状态。"
       },
       "tsDisableTitle": "撤销会一并清除其他 serve 条目",
       "tsDisableDescMixed": "本次撤销会把 兔维斯 的 Funnel 配置与另外 {{count}} 条非 兔维斯 的 serve 条目一起清除（tailscale funnel reset 清的是整份配置）。确认后才会执行。",
@@ -607,6 +596,9 @@
       "usdCnyRateHint": "仅在当日汇率获取失败时用于展示换算；CNY 优先使用原生人民币价。不改变账本或价格源。",
       "pricingTitle": "定价目录状态",
       "pricingHint": "只下载 models.dev 公开价目表；刷新与开关均由用户显式触发。",
+      "sourcesTitle": "输出速度采集管理",
+      "sourcesHint": "查看各工具接入状态与指标能力；可接入或卸载统计项，历史不受卸载影响。",
+      "sourcesOpen": "采集管理",
       "providerMapRules": "供应商映射规则（JSON）",
       "providerMapRulesPlaceholder": "{\"rules\":[{\"prefix\":\"deepseek-\",\"provider\":\"volcengine\"}]}",
       "providerMapRulesHint": "只认 {\"rules\":[{\"prefix\":…,\"provider\":…}]} 形态；非法只在此提示，保存照发。",
@@ -1188,6 +1180,7 @@
       "unknownModel": "未知模型"
     },
     "title": "用量看板",
+    "redirectNotice": "正在打开主窗口的「模型用量」…",
     "menu": {
       "dashboard": "📊 用量看板",
       "usage": "🏷 今日用量"
@@ -1237,7 +1230,13 @@
       "quoteSave": "保存",
       "quoteCancel": "取消",
       "quoteSaved": "评语已保存",
-      "boardOnly": "仅「看板」页签可用（文本摘要与分享图都是看板口径）"
+      "boardOnly": "仅「看板」页签可用（文本摘要与分享图都是看板口径）",
+      "costTotal": "合计（估价）",
+      "modulesTitle": "出图模块",
+      "modulesOverview": "总览 + 趋势图（必选）",
+      "modulesOverviewHint": "大数字、指标行与趋势图恒定出图，不可关闭。",
+      "modulesWork": "工作小结 + 桌宠发言",
+      "modulesHint": "勾选即保存（只记在本机），仅影响导出的图片；「复制文本」不变。"
     },
     "range": {
       "last5h": "近 5 小时",
@@ -1336,7 +1335,11 @@
       "observed": "日志实测",
       "ambiguous": "含糊",
       "aliasAction": "供应商显示名",
-      "billingRulesAdvanced": "高级：计费归属与参考价规则"
+      "billingRulesAdvanced": "高级：计费归属与参考价规则",
+      "colModel": "供应商显示名",
+      "colTokens": "token 数",
+      "colRequests": "请求次数",
+      "totalRow": "合计"
     },
     "pricing": {
       "toggle": "启用定价目录",
@@ -1623,9 +1626,7 @@
     },
     "notCollected": "尚未采集",
     "footer": {
-      "caliber": "纯 token · 含子代理 · 本地聚合",
-      "baseline": "环比基准：上一等长周期",
-      "retention": "{{days}} 天前无明细"
+      "caliber": "纯 token · 含子代理 · 本地聚合"
     },
     "alias": {
       "title": "供应商显示名（别名）",
@@ -1748,6 +1749,92 @@
       "colItem": "项目",
       "colAmountShort": "金额",
       "colUnitPrice": "单价"
+    },
+    "tps": {
+      "title": "近期TPS",
+      "subtitle": "可见时每 {{snapshotSec}} 秒读一次数、每 {{pointsSec}} 秒补一个采样点；不发送测速请求",
+      "range": {
+        "2m": "近2分钟",
+        "10m": "近10分钟",
+        "1h": "近1小时",
+        "today": "当天"
+      },
+      "lastCallTitle": "最新有效完成调用",
+      "turnLabel": "最近一轮",
+      "stale": "暂无近期样本",
+      "noSample": "暂无有效样本",
+      "currentNone": "暂无 series",
+      "sampleN": "有效样本 n",
+      "latestEnded": "样本结束",
+      "detail": {
+        "modelMs": "样本模型用时",
+        "toolMs": "样本工具调用用时",
+        "avgFirstToken": "样本平均首token",
+        "tps": "样本TPS"
+      },
+      "counters": "候选 {{candidate}} · 计时模型 {{timedModel}} · 计时工具 {{timedTool}} · 失败 {{failed}} · 取消 {{cancelled}} · 缺计时 {{missingTiming}}",
+      "method": {
+        "streamObserved": "流式实测",
+        "clientNative": "客户端原生",
+        "nativeEventApprox": "原生事件近似",
+        "logBoundaryApprox": "日志近似",
+        "approxBadge": "原生近似"
+      },
+      "outputScope": {
+        "exclusiveOutput": "输出不含思考",
+        "includesReasoning": "输出已含思考",
+        "providerReported": "思考计数未单独声明",
+        "unknown": "口径未知"
+      },
+      "age": {
+        "sec": "{{n}} 秒前",
+        "min": "{{n}} 分钟前",
+        "hour": "{{n}} 小时前",
+        "day": "{{n}} 天前"
+      },
+      "turnUnknown": "回合身份缺失",
+      "turnNone": "暂无回合样本",
+      "gapNote": "{{n}} 个空窗未连线（不画 0）",
+      "refresh": "刷新",
+      "refreshNote": {
+        "rateLimited": "刷新过于频繁（最小间隔 5 秒）",
+        "busy": "采样忙，稍后再试",
+        "disabled": "用量采集已关闭"
+      },
+      "disabled": "用量采集总开关已关闭，TPS 采样暂停；历史点保留，重新开启后继续。",
+      "chartEmpty": "当前范围暂无采样点",
+      "sources": {
+        "title": "来源状态",
+        "status": {
+          "unconfigured": "未配置",
+          "await-restart": "待重启生效",
+          "no-sample": "已读无样本",
+          "insufficient-timing": "字段不足",
+          "read-failed": "读取失败",
+          "active": "有效",
+          "unknown": "未知"
+        },
+        "codexGap": "本版不提供TPS（缺同调用生成窗）",
+        "install": "安装统计",
+        "uninstall": "卸载",
+        "restartHint": "下次启动生效（Tuvis 不会替你重启 Harness）",
+        "previewTitle": "安装预览",
+        "oldValue": "原值",
+        "planned": "计划安装",
+        "masked": "已脱敏",
+        "conflictFlag": "已有相同信号目标",
+        "choiceAppend": "仅新增（默认）",
+        "choiceTransfer": "转交统计目标",
+        "uninstalledNote": "已卸载自有统计项",
+        "receiverPort": "接收器端口 {{port}}",
+        "reason": {
+          "conflict": "已有相同信号目标，默认保留；可在预览中选择转交",
+          "stale-preview": "预览后设置已变化，请重新预览",
+          "expired-preview": "预览已过期，请重新预览",
+          "preview-not-found": "预览不存在或已应用，请重新预览",
+          "uninstall-conflict": "有你后来手改的项，已保留；请手动处理"
+        }
+      }
     }
   },
   "errors": {
@@ -2061,7 +2148,8 @@
     "tswizDownloadDirInvalid": "安装包下载目录无效",
     "tswizDownloadDirFail": "创建下载目录失败——请检查目录权限或手动下载安装",
     "tswizInstallerCopyFail": "复制已有安装包失败——请检查下载目录权限",
-    "tswizInstallerSaveFail": "保存安装包失败——请检查下载目录权限或手动下载安装"
+    "tswizInstallerSaveFail": "保存安装包失败——请检查下载目录权限或手动下载安装",
+    "workspaceMainWindowNotFound": "主窗口不存在，导航目标已暂存——请从托盘重新打开兔维斯"
   },
   "mobile": {
     "common": {
@@ -2717,6 +2805,140 @@
     },
     "split": {
       "handleAria": "拖动调整分屏比例"
+    }
+  },
+  "speed": {
+    "metric": {
+      "stream": "流式输出速度",
+      "response": "响应吞吐（含等待）"
+    },
+    "unit": {
+      "tps": "TPS",
+      "tokenPerSec": "Token/s"
+    },
+    "tile": {
+      "currentRate": "当前模式速度",
+      "avgFirstToken": "首Token平均等待",
+      "modelMs": "累计用时",
+      "responseMs": "响应累计用时",
+      "toolMs": "工具累计用时",
+      "approxMark": "日志近似",
+      "toolMsHint": "现有来源无法把工具执行时长可靠归属到单次模型调用，暂不计入（不填 0）；全工具统计见「模型用量 → 工作活动」。"
+    },
+    "chart": {
+      "ariaLabel": "输出速度趋势图：{{metric}}，单位 {{unit}}",
+      "noSample": "无有效样本",
+      "tooltipWidth": "桶宽 {{width}}",
+      "tooltipN": "n={{n}}",
+      "legend": {
+        "gapConnector": "虚线仅连接，无样本",
+        "gapBand": "阴影区为无样本缺口"
+      }
+    },
+    "context": {
+      "range": "区间汇总 · {{metric}} · n={{n}}",
+      "bucket": "{{span}} · {{width}} · n={{n}}",
+      "backToSummary": "返回区间汇总"
+    },
+    "duration": {
+      "ms": "{{n}} 毫秒",
+      "s": "{{n}} 秒",
+      "min": "{{n}} 分钟"
+    },
+    "codexFallback": "仅支持响应吞吐（含等待）",
+    "reason": {
+      "stream-gap:insufficient-generation-timing": "缺少同调用流式生成窗（响应口径为日志近似）",
+      "not-installed": "未安装统计",
+      "never-read": "尚未读取过数据",
+      "read-failed": "最近一次读取失败",
+      "parser-errors": "有记录解析失败",
+      "await-restart": "已安装，等待宿主重启后生效"
+    },
+    "range": {
+      "15m": "近15分钟",
+      "1h": "近1小时",
+      "5h": "近5小时",
+      "24h": "近24小时"
+    },
+    "sort": {
+      "name": "组合名",
+      "rate": "速度",
+      "sessions": "会话数"
+    },
+    "status": {
+      "ready": "已接入",
+      "unconfigured": "待配置",
+      "await-restart": "待重启",
+      "needs-check": "待检查",
+      "unsupported": "不支持"
+    },
+    "sources": {
+      "title": "采集管理",
+      "desc": "各工具的接入状态、指标能力与接入/卸载操作；技术详情按需展开",
+      "empty": "暂无来源",
+      "fetchError": "来源状态取数失败，请点「刷新」重试。",
+      "actionInstall": "安装插件",
+      "actionUninstall": "卸载插件",
+      "actionDetails": "详情",
+      "detailsTitle": "技术详情",
+      "reasonLabel": "状态成因",
+      "refresh": "刷新",
+      "lastRecord": "最近记录",
+      "capStream": "流式",
+      "capResponse": "响应",
+      "responseOnly": "仅响应",
+      "capUnavailable": "不可用"
+    },
+    "mode": {
+      "stream": "流式输出",
+      "response": "响应吞吐（含等待）"
+    },
+    "modeHint": {
+      "stream": "流式输出速度 = 输出 Token ÷ 首个有效输出到生成完成的秒数（不含首 Token 等待）",
+      "response": "响应吞吐（含等待）= 输出 Token ÷（首 Token 等待 + 生成）总秒数",
+      "line1": "流式输出速度 = 输出 Token ÷ 首个有效输出到生成完成的秒数（不含首 Token 等待）；",
+      "line2": "响应吞吐（含等待）= 输出 Token ÷（首 Token 等待 + 生成）总秒数；",
+      "line3": "同一记录响应值 ≤ 流式值，差额即等待；Codex 仅有响应口径（日志近似）"
+    },
+    "list": {
+      "listLabel": "组合列表",
+      "colSeries": "组合",
+      "colRate": "速度",
+      "colSessions": "有依据的会话数",
+      "toolFilter": "工具筛选",
+      "toolAll": "全部工具",
+      "emptyAll": "暂无组合",
+      "smallSample": "小样本",
+      "sortHeaderTitle": "点击排序（再点翻转升降序）",
+      "seriesPicker": "选择组合"
+    },
+    "detail": {
+      "empty": "暂无可展示的组合",
+      "seriesPicker": "选择组合"
+    },
+    "disabled": "速度统计已在设置中停用",
+    "fetchError": "速度读数取数失败，请重试。",
+    "gapStyle": {
+      "label": "缺口样式",
+      "dash": "虚线连接",
+      "band": "仅阴影"
+    }
+  },
+  "workspace": {
+    "nav": {
+      "label": "主导航"
+    },
+    "tab": {
+      "messages": "消息看板",
+      "resources": "工具资源",
+      "usage": "模型用量",
+      "speed": "输出速度"
+    },
+    "page": {
+      "messages": "消息看板",
+      "resources": "工具资源",
+      "usage": "模型用量",
+      "speed": "输出速度"
     }
   }
 }
