@@ -1,4 +1,4 @@
-//! ZCode 官方 OAuth 授权与内存凭据（生产计划 T1.1）。
+//! ZCode 官方 OAuth 授权、凭据保存与恢复（生产计划 T1.1；C2 起复用持久身份）。
 //!
 //! # 合同（证据 E1：`oauthFlow.ts`／`relayAuth.ts`；合同 `auth` 段；决策 §6.3／§8.10）
 //!
@@ -15,8 +15,9 @@
 //!
 //! # 安全纪律（不可协商）
 //!
-//! - 账号 JWT 只在进程内存；不写 settings/DB/keychain/日志/文件，不 Serialize/Debug，
-//!   也不经 [`AuthService::authorize`] 上抛。唯一外出的凭据是短期 relay token
+//! - 账号 JWT 只在进程内存或系统凭据存储（C1 [`CredentialStore`]）；不写
+//!   settings/DB/日志/文件，不 Serialize/Debug，也不经 [`AuthService::authorize`] 上抛，
+//!   不进入 [`AuthStatus`]。唯一外出的凭据是短期 relay token
 //!   （[`TerminalToken`] 不实现 Debug/Serialize）。
 //! - 错误只含冻结码；`reqwest` 原始错误（可能携 URL／认证头）一律丢弃，不挂 cause。
 //! - 回环监听只 bind `127.0.0.1:0`；state 精确一次消费；错误/缺失 state 既不消费也不交换；
@@ -37,8 +38,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 
+use super::credential_store::{
+    CredentialError, CredentialStore, StoreResult, StoredCredential, SCHEMA_VERSION,
+};
 use super::types::{ZResult, ZcodeError};
 
 /// 授权回调等待上限：到点关闭回环监听并以 `needs_auth` 收尾。
@@ -98,7 +102,8 @@ impl CallbackPage {
 }
 
 /// OAuth 授权通道（对应官方 `WebOAuthProviderId` 两值）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OAuthProvider {
     /// 国内智谱（BigModel）通道：`bigmodel.cn/login`。
     Bigmodel,
@@ -132,6 +137,58 @@ impl OAuthProvider {
     }
 }
 
+/// 授权状态问题（封闭枚举；不含 JWT／原生错误文本）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthProblem {
+    /// 凭据已过期（本地 exp 判定）。
+    Expired,
+    /// 官方 401 撤销（terminal token 申请被拒）。
+    Revoked,
+    /// 系统保险箱锁定或访问被拒。
+    LockedOrDenied,
+    /// 系统保险箱不可用。
+    Unavailable,
+    /// 凭据存储/非敏感标记读写失败。
+    StorageFailed,
+    /// 持久删除失败。
+    DeleteFailed,
+    /// 记录损坏或无法识别。
+    InvalidRecord,
+    /// 记录超出平台容量上限。
+    TooLarge,
+}
+
+/// 授权状态：唯一新增授权 DTO（serde camelCase；**不含 JWT**）。
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthStatus {
+    /// 当前进程内存里是否有账号 JWT。
+    pub authorized: bool,
+    /// 内存授权是否已成功写入系统存储（写失败不假报）。
+    pub remembered: bool,
+    /// 是否正在从系统存储恢复。
+    pub restoring: bool,
+    /// 当前凭据所属 OAuth 通道。
+    pub provider: Option<OAuthProvider>,
+    /// 最近一次失效/存储问题的可见原因。
+    pub problem: Option<AuthProblem>,
+}
+
+impl AuthProblem {
+    /// 凭据存储的封闭错误 → 授权状态 problem（不携带原生错误/bytes）。
+    fn from_credential(error: CredentialError) -> Self {
+        match error {
+            CredentialError::LockedOrDenied => Self::LockedOrDenied,
+            CredentialError::Unavailable => Self::Unavailable,
+            CredentialError::StorageFailed => Self::StorageFailed,
+            CredentialError::InvalidRecord => Self::InvalidRecord,
+            CredentialError::TooLarge => Self::TooLarge,
+            CredentialError::DeleteFailed => Self::DeleteFailed,
+        }
+    }
+}
+
 /// 打开系统浏览器完成官方授权的回调：入参是完整授权 URL。
 ///
 /// 生产接线只允许「交给系统浏览器打开」；不得注入自动点击/脚本化登录。
@@ -146,7 +203,8 @@ pub struct TerminalToken {
     pub expires_in: u64,
 }
 
-/// 官方 OAuth 授权服务：持有回环监听参数与**唯一一份**账号 JWT（进程内存）。
+/// 官方 OAuth 授权服务：持有回环监听参数与**唯一一份**账号 JWT（进程内存；
+/// 可选注入 [`CredentialStore`] 后保存/恢复，默认构造不访问 OS）。
 ///
 /// 生产构造只有 [`AuthService::new`]（固定官方 origin，无 settings/IPC 入口）；
 /// 端点注入仅测试可见。
@@ -156,22 +214,38 @@ pub struct AuthService {
     /// 测试专用授权 origin 覆盖（生产恒为 `None`，即固定官方 origin）。
     authorize_origin_override: Option<String>,
     callback_timeout: Duration,
+    /// 系统凭据存储适配口：默认不接（构造不访问 OS 存储），生产装配显式注入。
+    credential_store: Option<Arc<dyn CredentialStore>>,
+    /// 系统存储 I/O 单飞锁：owned guard 随 blocking 任务存活到实际 OS 调用结束，
+    /// 调用方超时/取消不会让仍在执行的写入脱离串行约束。`AuthState` 锁不跨越 I/O。
+    store_lock: Arc<AsyncMutex<()>>,
     state: Mutex<AuthState>,
 }
 
 #[derive(Default)]
 struct AuthState {
-    /// 账号 JWT：只在内存，`clear`/失效即丢弃。
+    /// 账号 JWT：进程内存中的当前凭据，`clear`/失效即丢弃。
     jwt: Option<String>,
     /// 该 JWT 落内存时的授权 epoch（凭据代际）。
     ///
     /// `terminal_token` 必须带着它一起使用：epoch 已变（clear/新授权）时，这份凭据
     /// 及其 HTTP 结果一律作废，既不得返回 relay token，也不得清掉新凭据。
     jwt_epoch: Option<u64>,
+    /// 当前 JWT 所属 OAuth 通道（`AuthStatus.provider` 的来源）。
+    provider: Option<OAuthProvider>,
     /// 授权 epoch：clear/新授权递增，旧 epoch 的结果一律作废。
     epoch: u64,
     /// 在途授权的取消发送端（clear/新授权触发）。
     cancel: Option<oneshot::Sender<()>>,
+    /// 当前内存 JWT 是否已成功写入系统存储；写失败绝不假报。
+    /// `status` 只读本字段，不访问 OS。
+    remembered: bool,
+    /// 是否正在从系统存储恢复（只用于状态展示）。
+    restoring: bool,
+    /// 最近一次失效/存储问题的可见原因（封闭枚举，不含 JWT/原生错误）。
+    problem: Option<AuthProblem>,
+    /// forget 后的内存级恢复禁用；新授权保存成功才重新允许恢复。
+    restore_blocked: bool,
 }
 
 /// 回环回调的终局。
@@ -190,8 +264,21 @@ impl AuthService {
             zcode_origin: OFFICIAL_ZCODE_ORIGIN.to_owned(),
             authorize_origin_override: None,
             callback_timeout: AUTHORIZE_TIMEOUT,
+            credential_store: None,
+            store_lock: Arc::new(AsyncMutex::new(())),
             state: Mutex::new(AuthState::default()),
         }
+    }
+
+    /// 注入系统凭据存储（builder；默认构造不接，测试注入 fake）。
+    ///
+    /// `CredentialStore` 是 crate 内部敏感类型，故本 builder 只在 crate 内可用；
+    /// 生产装配（Hub）显式注入 `OsCredentialStore`。
+    // C3 的 Hub 生产装配接线前，crate 内除测试外暂无调用方（staged，接线后移除）。
+    #[allow(dead_code)]
+    pub(crate) fn with_credential_store(mut self, store: Arc<dyn CredentialStore>) -> Self {
+        self.credential_store = Some(store);
+        self
     }
 
     /// 测试专用端点注入（生产不得调用；不注册任何配置/IPC 入口）。
@@ -206,6 +293,8 @@ impl AuthService {
             zcode_origin,
             authorize_origin_override: Some(authorize_origin),
             callback_timeout: AUTHORIZE_TIMEOUT,
+            credential_store: None,
+            store_lock: Arc::new(AsyncMutex::new(())),
             state: Mutex::new(AuthState::default()),
         }
     }
@@ -217,7 +306,8 @@ impl AuthService {
         self
     }
 
-    /// 走一次官方授权：打开浏览器 → 等待回环回调 → 用授权码换账号 JWT（只入内存）。
+    /// 走一次官方授权：打开浏览器 → 等待回环回调 → 用授权码换账号 JWT（先入内存，
+    /// 注入存储后随即可持久保存；保存失败不影响本次授权）。
     ///
     /// 失败一律以冻结码收尾（超时/被取消/被拒 → `needs_auth`，网络不可达 → `offline`，
     /// 响应形态异常 → `unknown`）；错误不含 URL/state/code/JWT。
@@ -271,7 +361,10 @@ impl AuthService {
         let jwt = exchanged?;
 
         // 6) 只有 epoch 未变才落内存（交换在途时 clear/新授权 → 结果作废）
-        self.commit_jwt(epoch, jwt)
+        self.commit_jwt(epoch, jwt, provider)?;
+        // 7) 先落内存再保存：保存失败只回写 problem，不把本次 OAuth 变成失败。
+        self.persist_authorized(epoch, provider).await;
+        Ok(())
     }
 
     /// 以内存中的账号 JWT 现取一次性终端 token（逐连接新取，不缓存、用后即弃）。
@@ -281,7 +374,8 @@ impl AuthService {
     /// - 请求在途/响应体读取期间 clear/新授权发生（epoch 已变）→ 结果作废，返回
     ///   `needs_auth`；最终交接在状态锁内复核代际（[`Self::handoff_terminal_token`]），
     ///   因此 `clear()` 返回后绝不可能再交出旧代的 relay token；
-    /// - 401 只清仍属本代的凭据（旧 JWT 的迟到 401 不得清掉新 JWT 或取消新授权）。
+    /// - 401 只清仍属本代的凭据并持久删除；旧 JWT 的迟到 401 不得清掉新 JWT、
+    ///   取消新授权或删除新保存的记录；offline/5xx/403 不删除持久记录。
     pub async fn terminal_token(&self) -> ZResult<TerminalToken> {
         let (jwt, credential_epoch) = {
             let state = self.lock_state();
@@ -291,7 +385,8 @@ impl AuthService {
             }
         };
         if jwt_is_expired(&jwt, now_secs()) {
-            self.invalidate(credential_epoch);
+            self.invalidate(credential_epoch, AuthProblem::Expired)
+                .await;
             return Err(ZcodeError::needs_auth());
         }
 
@@ -311,7 +406,8 @@ impl AuthService {
         }
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.invalidate(credential_epoch);
+            self.invalidate(credential_epoch, AuthProblem::Revoked)
+                .await;
             return Err(ZcodeError::needs_auth());
         }
         if status == reqwest::StatusCode::FORBIDDEN {
@@ -345,15 +441,155 @@ impl AuthService {
         relay_payload(value)
     }
 
-    /// 清除账号凭据并使在途授权失效（退出/登出/401/保存新链接时调用）。
+    /// 清除内存中的账号凭据并使在途授权失效。
+    ///
+    /// **只清运行时内存**：持久记录与恢复标记不动（`forget` 才删除）；401/过期走
+    /// [`Self::invalidate`] 的持久删除入口。
     pub fn clear(&self) {
         let mut state = self.lock_state();
         state.jwt = None;
         state.jwt_epoch = None;
+        state.provider = None;
+        state.restoring = false;
         state.epoch = state.epoch.wrapping_add(1);
         if let Some(cancel) = state.cancel.take() {
             let _ = cancel.send(());
         }
+    }
+
+    /// 授权状态快照：只读内存，不访问系统存储。
+    pub fn status(&self) -> AuthStatus {
+        let state = self.lock_state();
+        status_snapshot(&state)
+    }
+
+    /// 启动/显式重试时恢复已保存的授权。
+    ///
+    /// - 已有当前代有效内存 JWT：直接返回，不读系统存储（保存失败不覆盖本次身份）；
+    /// - 内存 JWT 已过期：按失效清理（删除持久记录并报 `expired`），不再读存储；
+    /// - 无存储适配口、恢复已被忘记禁用、或有在途授权：只返回内存快照；
+    /// - 读取问题（锁定/不可用/损坏/超限）如实报 `problem`，绝不自动打开浏览器。
+    pub async fn restore(&self) -> AuthStatus {
+        // 1) 已有当前代有效内存 JWT：直接返回，不读 OS。
+        let expired_memory_epoch = {
+            let state = self.lock_state();
+            match (state.jwt.as_deref(), state.jwt_epoch) {
+                (Some(jwt), Some(_)) if !jwt_is_expired(jwt, now_secs()) => {
+                    return status_snapshot(&state);
+                }
+                (Some(_), Some(epoch)) => Some(epoch),
+                _ => None,
+            }
+        };
+        if let Some(epoch) = expired_memory_epoch {
+            self.invalidate(epoch, AuthProblem::Expired).await;
+            return self.status();
+        }
+
+        let Some(store) = self.credential_store.clone() else {
+            return self.status();
+        };
+
+        // 2) 标记恢复中；忘记后的记录不再读取，在途授权旁不插队恢复。
+        let epoch = {
+            let mut state = self.lock_state();
+            if state.restore_blocked || state.cancel.is_some() {
+                return status_snapshot(&state);
+            }
+            state.restoring = true;
+            state.epoch
+        };
+
+        // 3) 存储单飞锁内读 OS：调用前复核 epoch，guard 随 blocking 任务存活。
+        let loaded = match self
+            .store_io_if_current(epoch, store, |store| store.load())
+            .await
+        {
+            Some(result) => result,
+            // 开始前已有新授权/忘记接管：不得覆盖，也不回写旧状态。
+            None => return self.status(),
+        };
+
+        // 4) 完成复核：epoch 已变或新 JWT 已落地（并发授权完成）→ 丢弃本次恢复。
+        let mut state = self.lock_state();
+        if state.epoch != epoch || state.jwt.is_some() {
+            return status_snapshot(&state);
+        }
+        state.restoring = false;
+        match loaded {
+            Ok(None) => {
+                state.remembered = false;
+                state.problem = None;
+            }
+            Ok(Some(record)) if jwt_is_expired(&record.jwt, now_secs()) => {
+                // 过期持久记录：作废当前代并排队删除；不自动打开浏览器。
+                state.jwt = None;
+                state.jwt_epoch = None;
+                state.provider = None;
+                state.remembered = false;
+                state.problem = Some(AuthProblem::Expired);
+                state.epoch = state.epoch.wrapping_add(1);
+                let delete_epoch = state.epoch;
+                drop(state);
+                let _ = self.delete_persisted_if_current(delete_epoch).await;
+                return self.status();
+            }
+            Ok(Some(record)) => {
+                state.jwt = Some(record.jwt);
+                state.jwt_epoch = Some(epoch);
+                state.provider = Some(record.provider);
+                state.remembered = true;
+                state.problem = None;
+            }
+            Err(error) => {
+                state.remembered = false;
+                state.problem = Some(AuthProblem::from_credential(error));
+            }
+        }
+        // 先释放状态锁再组 DTO（status() 会再次取锁，绝不可重入）。
+        let status = status_snapshot(&state);
+        drop(state);
+        status
+    }
+
+    /// 忘记授权：先清内存/取消旧 epoch 并禁用恢复，再排队删除持久记录。
+    ///
+    /// 删除失败如实报 `delete_failed` 且保持恢复禁用（不得读回旧记录）。
+    pub async fn forget(&self) -> AuthStatus {
+        let (delete_epoch, store) = {
+            let mut state = self.lock_state();
+            state.jwt = None;
+            state.jwt_epoch = None;
+            state.provider = None;
+            state.remembered = false;
+            state.restoring = false;
+            state.problem = None;
+            state.restore_blocked = true;
+            state.epoch = state.epoch.wrapping_add(1);
+            if let Some(cancel) = state.cancel.take() {
+                let _ = cancel.send(());
+            }
+            (state.epoch, self.credential_store.clone())
+        };
+        let Some(store) = store else {
+            return self.status();
+        };
+        match self
+            .store_io_if_current(delete_epoch, store, |store| store.delete())
+            .await
+        {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                let mut state = self.lock_state();
+                // 只有仍是本次忘记的代际才回写问题；新授权已接管时不得覆盖。
+                if state.epoch == delete_epoch {
+                    state.problem = Some(AuthProblem::from_credential(error));
+                }
+            }
+            // 新授权/新清除已接管：旧删除不得回写状态。
+            None => {}
+        }
+        self.status()
     }
 
     /// 生产授权 origin：测试覆盖优先，否则固定官方常量（无配置/IPC 入口）。
@@ -373,6 +609,8 @@ impl AuthService {
     fn begin_authorization(&self, cancel: oneshot::Sender<()>) -> u64 {
         let mut state = self.lock_state();
         state.epoch = state.epoch.wrapping_add(1);
+        state.restoring = false;
+        state.problem = None;
         if let Some(previous) = state.cancel.replace(cancel) {
             let _ = previous.send(());
         }
@@ -393,32 +631,125 @@ impl AuthService {
 
     /// 落入内存的唯一入口：epoch 不符（clear/新授权已发生）即作废。
     ///
-    /// 成功时把 JWT 与所属 epoch 一起登记（凭据代际），供 [`Self::terminal_token`]
-    /// 判定「这份凭据是否仍属于当前授权」。
-    fn commit_jwt(&self, epoch: u64, jwt: String) -> ZResult<()> {
+    /// 成功时把 JWT、所属 epoch 与 provider 一起登记（凭据代际），供
+    /// [`Self::terminal_token`] 判定「这份凭据是否仍属于当前授权」。
+    fn commit_jwt(&self, epoch: u64, jwt: String, provider: OAuthProvider) -> ZResult<()> {
         let mut state = self.lock_state();
         if state.epoch != epoch {
             return Err(ZcodeError::needs_auth());
         }
         state.jwt = Some(jwt);
         state.jwt_epoch = Some(epoch);
+        state.provider = Some(provider);
+        state.remembered = false;
+        state.restoring = false;
+        state.problem = None;
         Ok(())
     }
 
-    /// 凭据失效（过期/401）：只清仍属**同一代际**的凭据与在途授权。
-    ///
-    /// 旧 JWT 的迟到结果（epoch 已变）不得清掉新 JWT，也不得取消新授权。
-    fn invalidate(&self, credential_epoch: u64) {
-        let mut state = self.lock_state();
-        if state.epoch != credential_epoch || state.jwt_epoch != Some(credential_epoch) {
+    /// 授权成功后持久保存当前代 JWT；失败只回写 `problem`，不改变本次身份。
+    async fn persist_authorized(&self, epoch: u64, provider: OAuthProvider) {
+        let Some(store) = self.credential_store.clone() else {
             return;
+        };
+        let jwt = {
+            let state = self.lock_state();
+            if state.epoch != epoch || state.jwt_epoch != Some(epoch) {
+                return;
+            }
+            state.jwt.clone()
+        };
+        let Some(jwt) = jwt else {
+            return;
+        };
+        let record = StoredCredential {
+            schema_version: SCHEMA_VERSION,
+            provider,
+            jwt,
+        };
+        match self
+            .store_io_if_current(epoch, store, move |store| store.save(&record))
+            .await
+        {
+            Some(Ok(())) => {
+                let mut state = self.lock_state();
+                if state.epoch == epoch && state.jwt_epoch == Some(epoch) {
+                    state.remembered = true;
+                    state.problem = None;
+                    // 只有新授权保存成功才重新允许恢复（forget 的禁用到此解除）。
+                    state.restore_blocked = false;
+                }
+            }
+            Some(Err(error)) => {
+                let mut state = self.lock_state();
+                if state.epoch == epoch && state.jwt_epoch == Some(epoch) {
+                    state.remembered = false;
+                    state.problem = Some(AuthProblem::from_credential(error));
+                }
+            }
+            // 开始前已有新授权/忘记接管：旧保存不得回写「已记住」。
+            None => {}
         }
-        state.jwt = None;
-        state.jwt_epoch = None;
-        state.epoch = state.epoch.wrapping_add(1);
-        if let Some(cancel) = state.cancel.take() {
-            let _ = cancel.send(());
+    }
+
+    /// 串行删除持久记录（只删仍属 `expected_epoch` 的那一代）。
+    async fn delete_persisted_if_current(&self, expected_epoch: u64) -> Option<StoreResult<()>> {
+        let store = self.credential_store.clone()?;
+        self.store_io_if_current(expected_epoch, store, |store| store.delete())
+            .await
+    }
+
+    /// 在存储单飞锁内复核 epoch 后执行一次阻塞存储调用。
+    ///
+    /// `None` = 开始前 epoch 已变（放弃，不触碰 OS）；`Some(result)` = 实际调用结果。
+    /// `OwnedMutexGuard` 被移进 blocking 任务，直到实际 OS 调用结束才释放：调用方超时/
+    /// 取消不会让仍在执行的写入脱离串行约束。全程不持 `AuthState` 或 DB 锁。
+    async fn store_io_if_current<T, F>(
+        &self,
+        expected_epoch: u64,
+        store: Arc<dyn CredentialStore>,
+        op: F,
+    ) -> Option<StoreResult<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn CredentialStore) -> StoreResult<T> + Send + 'static,
+    {
+        let guard = self.store_lock.clone().lock_owned().await;
+        if !self.epoch_is_current(expected_epoch) {
+            return None;
         }
+        let joined = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            op(store.as_ref())
+        })
+        .await;
+        Some(joined.unwrap_or(Err(CredentialError::Unavailable)))
+    }
+
+    /// 凭据失效（过期/401）：只清仍属**同一代际**的凭据与在途授权，并持久删除。
+    ///
+    /// 旧 JWT 的迟到结果（epoch 已变）不得清掉新 JWT、不得取消新授权，也不得删除
+    /// 新授权保存的记录——删除在存储单飞锁内复核 epoch 后才执行。401/过期是授权事实，
+    /// 删除失败不改写 `problem`。
+    async fn invalidate(&self, credential_epoch: u64, problem: AuthProblem) {
+        let delete_epoch = {
+            let mut state = self.lock_state();
+            if state.epoch != credential_epoch || state.jwt_epoch != Some(credential_epoch) {
+                return;
+            }
+            state.jwt = None;
+            state.jwt_epoch = None;
+            state.provider = None;
+            state.remembered = false;
+            state.restoring = false;
+            state.problem = Some(problem);
+            state.epoch = state.epoch.wrapping_add(1);
+            if let Some(cancel) = state.cancel.take() {
+                let _ = cancel.send(());
+            }
+            state.epoch
+        };
+        let _ = self.delete_persisted_if_current(delete_epoch).await;
     }
 
     /// 有界等待回调：得到授权码 / 被取消 / 超时 / 被拒，任何出口都关闭监听。
@@ -479,6 +810,17 @@ impl AuthService {
         }
         let value: serde_json::Value = response.json().await.map_err(|_| ZcodeError::unknown())?;
         exchange_payload(&value)
+    }
+}
+
+/// 由内存状态构造授权状态快照（不读 JWT 内容之外的任何存储）。
+fn status_snapshot(state: &AuthState) -> AuthStatus {
+    AuthStatus {
+        authorized: state.jwt.is_some(),
+        remembered: state.remembered,
+        restoring: state.restoring,
+        provider: state.provider,
+        problem: state.problem,
     }
 }
 
@@ -1774,5 +2116,437 @@ mod tests {
         assert!(!body.contains(SYNTHETIC_CODE), "响应不得回显 code");
 
         handle.await.expect("授权任务不应 panic").expect("授权成功");
+    }
+
+    // ───────────────── C2：授权保存、启动恢复、失效与忘记 ─────────────────
+
+    use super::super::credential_store::{
+        CredentialError, MemoryCredentialStore, StoredCredential, SCHEMA_VERSION,
+    };
+
+    /// 已预置一条持久记录的 fake 存储（只在测试内使用，不接触真实保险箱）。
+    fn store_with(provider: OAuthProvider, jwt: &str) -> Arc<MemoryCredentialStore> {
+        let store = Arc::new(MemoryCredentialStore::new());
+        store.seed(StoredCredential {
+            schema_version: SCHEMA_VERSION,
+            provider,
+            jwt: jwt.to_owned(),
+        });
+        store
+    }
+
+    /// 恢复持久身份：不需要任何 OAuth 交换，status 只读内存快照。
+    #[tokio::test]
+    async fn restore_uses_saved_identity_without_oauth() {
+        let store = store_with(OAuthProvider::Bigmodel, &valid_jwt());
+        let auth = AuthService::new(test_client()).with_credential_store(store.clone());
+
+        let status = auth.restore().await;
+        assert!(status.authorized);
+        assert!(status.remembered);
+        assert!(!status.restoring);
+        assert_eq!(status.provider, Some(OAuthProvider::Bigmodel));
+        assert_eq!(status.problem, None);
+        assert_eq!(store.load_count(), 1);
+        assert_eq!(store.save_count(), 0);
+        assert_eq!(store.delete_count(), 0);
+
+        // 之后的状态读取只来自内存：不得再次触碰存储。
+        assert!(auth.status().authorized);
+        assert!(auth.status().remembered);
+        assert_eq!(store.load_count(), 1);
+    }
+
+    /// 恢复出的 JWT 可直接换 terminal token：恢复路径零 OAuth 交换。
+    #[tokio::test]
+    async fn restored_credential_requests_terminal_token_without_oauth() {
+        let fake = FakeZcode::start().await;
+        let jwt = valid_jwt();
+        let store = store_with(OAuthProvider::Zai, &jwt);
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+
+        assert!(auth.restore().await.authorized);
+        let token = auth.terminal_token().await.expect("恢复的 JWT 应可用");
+        assert!(token.value == SYNTHETIC_RELAY_TOKEN);
+        assert_eq!(fake.exchange_count(), 0, "恢复路径不得 OAuth");
+        assert_eq!(fake.relay_count(), 1);
+        let relay = fake.last_relay().expect("已记录 relay");
+        assert!(
+            relay.authorization.as_deref() == Some(format!("Bearer {jwt}").as_str()),
+            "终端 token 请求必须携带恢复出的 JWT"
+        );
+    }
+
+    /// 默认构造不接系统存储：restore 不访问 OS，也不自行打开浏览器。
+    #[tokio::test]
+    async fn restore_without_store_stays_unauthorized() {
+        let auth = AuthService::new(test_client());
+        let status = auth.restore().await;
+        assert!(!status.authorized);
+        assert!(!status.remembered);
+        assert!(!status.restoring);
+        assert_eq!(status.provider, None);
+        assert_eq!(status.problem, None);
+        assert_eq!(auth.status(), status);
+    }
+
+    /// 授权成功：先落内存再保存；保存成功才标记 remembered。
+    #[tokio::test]
+    async fn authorize_saves_credential_and_marks_remembered() {
+        let fake = FakeZcode::start().await;
+        let jwt = valid_jwt();
+        fake.set_exchange(200, exchange_ok(&jwt));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+
+        let status = auth.status();
+        assert!(status.authorized);
+        assert!(status.remembered);
+        assert!(!status.restoring);
+        assert_eq!(status.provider, Some(OAuthProvider::Bigmodel));
+        assert_eq!(status.problem, None);
+        assert_eq!(store.save_count(), 1);
+        let saved = store.stored().expect("应已保存");
+        assert_eq!(saved.provider, OAuthProvider::Bigmodel);
+        assert!(saved.jwt == jwt, "持久记录必须是本次交换得到的 JWT");
+    }
+
+    /// 保存失败：本次授权仍可用、不假报记住、不把 OAuth 变失败。
+    #[tokio::test]
+    async fn save_failure_keeps_current_authorization() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        let store = Arc::new(MemoryCredentialStore::new());
+        store.fail_next(CredentialError::StorageFailed);
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("存储失败不得让授权失败");
+        let status = auth.status();
+        assert!(status.authorized);
+        assert!(!status.remembered);
+        assert_eq!(status.problem, Some(AuthProblem::StorageFailed));
+        assert_eq!(store.save_count(), 1);
+        assert!(store.stored().is_none());
+
+        // 本次身份仍可换 terminal token。
+        let token = auth.terminal_token().await.expect("本次授权仍可用");
+        assert!(token.value == SYNTHETIC_RELAY_TOKEN);
+        assert_eq!(fake.relay_count(), 1);
+    }
+
+    /// status 只读内存快照：未授权时也绝不访问存储。
+    #[tokio::test]
+    async fn status_never_touches_store() {
+        let store = store_with(OAuthProvider::Zai, &valid_jwt());
+        let auth = AuthService::new(test_client()).with_credential_store(store.clone());
+        for _ in 0..3 {
+            let status = auth.status();
+            assert!(!status.authorized);
+            assert!(!status.remembered);
+            assert!(!status.restoring);
+        }
+        assert_eq!(store.load_count(), 0);
+        assert_eq!(store.save_count(), 0);
+        assert_eq!(store.delete_count(), 0);
+    }
+
+    /// 已有当前代有效内存 JWT 时 restore 直接返回，不读存储。
+    #[tokio::test]
+    async fn restore_with_current_memory_jwt_skips_store() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+
+        let status = auth.restore().await;
+        assert!(status.authorized);
+        assert!(status.remembered);
+        assert_eq!(status.provider, Some(OAuthProvider::Bigmodel));
+        assert_eq!(store.load_count(), 0, "已有有效内存 JWT 不得读存储");
+    }
+
+    /// 过期持久记录：删除并报 expired，不自动打开浏览器。
+    #[tokio::test]
+    async fn restore_deletes_expired_record_and_reports_expired() {
+        let store = store_with(OAuthProvider::Zai, &expired_jwt());
+        let auth = AuthService::new(test_client()).with_credential_store(store.clone());
+
+        let status = auth.restore().await;
+        assert!(!status.authorized);
+        assert!(!status.remembered);
+        assert!(!status.restoring);
+        assert_eq!(status.problem, Some(AuthProblem::Expired));
+        assert_eq!(status.provider, None);
+        assert_eq!(store.load_count(), 1);
+        assert_eq!(store.delete_count(), 1, "过期持久记录必须删除");
+        assert!(store.stored().is_none());
+        assert_eq!(auth.status().problem, Some(AuthProblem::Expired));
+    }
+
+    /// 存储锁定/不可用/读坏/超限：映射为对应 problem，且读取失败不删除记录。
+    #[tokio::test]
+    async fn restore_reports_storage_problems_without_browser() {
+        for (error, problem) in [
+            (CredentialError::LockedOrDenied, AuthProblem::LockedOrDenied),
+            (CredentialError::Unavailable, AuthProblem::Unavailable),
+            (CredentialError::StorageFailed, AuthProblem::StorageFailed),
+            (CredentialError::InvalidRecord, AuthProblem::InvalidRecord),
+            (CredentialError::TooLarge, AuthProblem::TooLarge),
+        ] {
+            let store = Arc::new(MemoryCredentialStore::new());
+            store.fail_next(error);
+            let auth = AuthService::new(test_client()).with_credential_store(store.clone());
+            let status = auth.restore().await;
+            assert!(!status.authorized, "读取失败不得授权");
+            assert!(!status.restoring, "读取失败必须收尾 restoring");
+            assert_eq!(status.problem, Some(problem));
+            assert_eq!(store.load_count(), 1);
+            assert_eq!(store.delete_count(), 0, "读取失败不得删除记录");
+        }
+    }
+
+    /// 当前凭据 401：删除持久记录并报 revoked；5xx/网络错误不删。
+    #[tokio::test]
+    async fn current_401_deletes_persisted_but_network_error_does_not() {
+        // 401：当前代凭据失效 → 持久删除。
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        fake.set_relay(401, r#"{"code":401,"msg":"synthetic-upstream"}"#);
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+        assert_eq!(store.save_count(), 1);
+        assert!(auth.status().remembered);
+
+        assert_eq!(err_code(auth.terminal_token().await), "needs_auth");
+        let status = auth.status();
+        assert!(!status.authorized);
+        assert!(!status.remembered);
+        assert_eq!(status.problem, Some(AuthProblem::Revoked));
+        assert_eq!(store.delete_count(), 1);
+        assert!(store.stored().is_none());
+
+        // 5xx/offline：保留凭据与授权，不删。
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        fake.set_relay(503, r#"{"code":503,"msg":"synthetic-upstream"}"#);
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+        assert_eq!(err_code(auth.terminal_token().await), "offline");
+        assert_eq!(store.delete_count(), 0, "网络/5xx 不得删除凭据");
+        let status = auth.status();
+        assert!(status.authorized);
+        assert!(status.remembered);
+        assert_eq!(status.problem, None);
+    }
+
+    /// 内存 JWT 过期（terminal_token 入口）：删除持久记录并报 expired。
+    #[tokio::test]
+    async fn expired_current_credential_deletes_persisted_record() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&expired_jwt()));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("交换成功");
+        assert_eq!(store.save_count(), 1);
+
+        assert_eq!(err_code(auth.terminal_token().await), "needs_auth");
+        assert_eq!(fake.relay_count(), 0, "过期 JWT 不得发起请求");
+        assert_eq!(store.delete_count(), 1);
+        assert!(store.stored().is_none());
+        let status = auth.status();
+        assert!(!status.authorized);
+        assert!(!status.remembered);
+        assert_eq!(status.problem, Some(AuthProblem::Expired));
+    }
+
+    /// 迟到的旧 401 不得删除新授权保存的凭据。
+    #[tokio::test]
+    async fn late_old_401_never_deletes_new_credential() {
+        let fake = FakeZcode::start().await;
+        let first_jwt = valid_jwt();
+        let second_jwt = synthetic_jwt(now_secs() + 7200);
+        fake.set_exchange(200, exchange_ok(&first_jwt));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("首次授权成功");
+        assert_eq!(store.save_count(), 1);
+
+        // 旧 JWT 的 401 响应挂起（尚未交给客户端）。
+        fake.set_relay(401, r#"{"code":401,"msg":"synthetic-upstream"}"#);
+        let relay_gate = fake.hold_relay();
+        let stale = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.terminal_token().await }
+        });
+        wait_until(|| fake.relay_count() == 1).await;
+
+        // 新授权完成：交换先挂起，回调投递后再放行。
+        fake.set_exchange(200, exchange_ok(&second_jwt));
+        let exchange_gate = fake.hold_exchange();
+        let slot = UrlSlot::new();
+        let reauth = spawn_authorize(auth.clone(), OAuthProvider::Bigmodel, slot.clone());
+        let (redirect, state) = oauth_params(&slot.wait().await);
+        let status =
+            deliver_status(&redirect, &format!("state={state}&code={SYNTHETIC_CODE}")).await;
+        assert_eq!(status, Some(200));
+        wait_until(|| fake.exchange_count() == 2).await;
+        exchange_gate.add_permits(1);
+        reauth
+            .await
+            .expect("授权任务不应 panic")
+            .expect("二次授权成功");
+        assert_eq!(store.save_count(), 2);
+        assert!(auth.status().remembered);
+
+        // 迟到的 401 到达：只作废它自己，不得删除新凭据。
+        relay_gate.add_permits(1);
+        assert_eq!(
+            err_code(stale.await.expect("旧请求任务不应 panic")),
+            "needs_auth"
+        );
+        assert_eq!(store.delete_count(), 0, "旧 401 不得删除新凭据");
+        let status = auth.status();
+        assert!(status.authorized, "新授权不得被旧 401 清掉");
+        assert!(status.remembered);
+        assert!(
+            store.stored().expect("新凭据仍应保存").jwt == second_jwt,
+            "持久记录必须仍是新 JWT"
+        );
+
+        // 新凭据仍可用。
+        fake.clear_relay_gate();
+        fake.set_relay(200, relay_ok(SYNTHETIC_RELAY_TOKEN, 60));
+        auth.terminal_token().await.expect("新凭据仍可用");
+    }
+
+    /// 忘记授权：清内存并删除持久记录，之后 restore 不再访问存储。
+    #[tokio::test]
+    async fn forget_deletes_persisted_record_and_blocks_restore() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+
+        let status = auth.forget().await;
+        assert!(!status.authorized);
+        assert!(!status.remembered);
+        assert!(!status.restoring);
+        assert_eq!(status.provider, None);
+        assert_eq!(status.problem, None);
+        assert_eq!(store.delete_count(), 1);
+        assert!(store.stored().is_none());
+
+        let restored = auth.restore().await;
+        assert!(!restored.authorized);
+        assert_eq!(store.load_count(), 0, "忘记后不得再从存储恢复");
+    }
+
+    /// 忘记时删除失败：如实报 delete_failed，并保持恢复禁用。
+    #[tokio::test]
+    async fn forget_reports_delete_failure_and_stays_blocked() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+        store.fail_next(CredentialError::DeleteFailed);
+
+        let status = auth.forget().await;
+        assert!(!status.authorized);
+        assert!(!status.remembered);
+        assert_eq!(status.problem, Some(AuthProblem::DeleteFailed));
+        assert_eq!(store.delete_count(), 1);
+        assert!(store.stored().is_some(), "删除失败时记录可能仍在");
+
+        // 恢复仍被禁用：不得读回旧记录。
+        let restored = auth.restore().await;
+        assert!(!restored.authorized);
+        assert_eq!(restored.problem, Some(AuthProblem::DeleteFailed));
+        assert_eq!(store.load_count(), 0);
+    }
+
+    /// 忘记后迟到的授权结果不得落库复活。
+    #[tokio::test]
+    async fn forget_during_exchange_never_resurrects_credential() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        fake.set_exchange_delay(Duration::from_millis(300));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        let slot = UrlSlot::new();
+        let handle = spawn_authorize(auth.clone(), OAuthProvider::Bigmodel, slot.clone());
+        let (redirect, state) = oauth_params(&slot.wait().await);
+        let status =
+            deliver_status(&redirect, &format!("state={state}&code={SYNTHETIC_CODE}")).await;
+        assert_eq!(status, Some(200));
+        wait_until(|| fake.exchange_count() == 1).await;
+
+        let _ = auth.forget().await;
+        assert_eq!(
+            err_code(handle.await.expect("授权任务不应 panic")),
+            "needs_auth"
+        );
+        assert_eq!(store.save_count(), 0, "忘记后旧授权不得落库");
+        assert!(store.stored().is_none());
+        assert_eq!(auth.status().problem, None);
+    }
+
+    /// AuthStatus 是唯一新增 DTO：camelCase、problem snake_case、provider 小写，且绝不含 JWT。
+    #[tokio::test]
+    async fn auth_status_never_carries_jwt() {
+        let fake = FakeZcode::start().await;
+        let jwt = valid_jwt();
+        fake.set_exchange(200, exchange_ok(&jwt));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+
+        let status = auth.status();
+        let json = serde_json::to_string(&status).expect("AuthStatus 必须可序列化");
+        assert!(!json.contains(&jwt), "AuthStatus 不得携带 JWT");
+        assert!(!json.contains("synthetic-signature"), "JWT 段不得进入 DTO");
+        assert!(!format!("{status:?}").contains(&jwt), "Debug 也不得含 JWT");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("合法 JSON");
+        assert_eq!(value["authorized"], true);
+        assert_eq!(value["remembered"], true);
+        assert_eq!(value["restoring"], false);
+        assert_eq!(value["provider"], "bigmodel");
+        assert!(value.get("problem").is_some(), "problem 字段必须始终存在");
+        assert!(value["problem"].is_null());
+        assert!(value.get("jwt").is_none(), "DTO 不得出现 jwt 字段");
+
+        assert_eq!(
+            serde_json::to_string(&AuthProblem::LockedOrDenied).unwrap(),
+            "\"locked_or_denied\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuthProblem::TooLarge).unwrap(),
+            "\"too_large\""
+        );
     }
 }

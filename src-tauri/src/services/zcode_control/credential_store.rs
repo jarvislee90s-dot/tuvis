@@ -168,10 +168,15 @@ where
 }
 
 /// 生产实现：用户级系统保险箱 + settings 中的非敏感恢复标记。
+///
+/// **分期登记**：C2 已消费适配口（trait/DTO/错误），但 `OsCredentialStore` 的生产
+/// 装配由 C3 的 Hub 显式注入；接线前对该实现与其原生依赖显式 allow，不隐藏行为。
+#[allow(dead_code)]
 pub(crate) struct OsCredentialStore {
     prefs: DeviceStore,
 }
 
+#[allow(dead_code)]
 impl OsCredentialStore {
     pub(crate) fn new(prefs: DeviceStore) -> Self {
         Self { prefs }
@@ -190,6 +195,7 @@ impl OsCredentialStore {
     }
 }
 
+#[allow(dead_code)] // 同上：C3 生产装配接线前
 impl CredentialStore for OsCredentialStore {
     fn load(&self) -> StoreResult<Option<StoredCredential>> {
         let allowed = self.restore_allowed()?;
@@ -483,6 +489,11 @@ impl MemoryCredentialStore {
 
     pub(crate) fn fail_next(&self, error: CredentialError) {
         self.lock().failure = Some(error);
+    }
+
+    /// 当前持久记录快照（C2：断言保存/删除/覆盖后的内容，不算作 load 计数）。
+    pub(crate) fn stored(&self) -> Option<StoredCredential> {
+        self.lock().record.clone()
     }
 
     pub(crate) fn load_count(&self) -> usize {

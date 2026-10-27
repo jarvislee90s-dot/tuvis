@@ -38,9 +38,7 @@ pub(crate) fn try_set_setting_conn(
 
 /// 连接级可失败读取：需要区分「缺键」与「读取失败」的调用方必须用本函数。
 /// 旧 [`get_setting_conn`] 的 best-effort 语义（失败即 None）保持不变。
-// C1 先落 checked read，凭据存储（C2 接入 AuthService）才消费；分期提交期间显式
-// allow，避免中间提交在 `cargo check` 产生 dead_code 噪音。
-#[allow(dead_code)]
+// C1 落 checked read，C2 起由凭据存储（恢复禁用标记）消费。
 pub(crate) fn try_get_setting_conn(
     conn: &Connection,
     key: &str,
