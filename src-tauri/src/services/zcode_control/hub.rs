@@ -550,11 +550,28 @@ fn emit_session_event(
     );
 }
 
+/// [`apply_relay_state`] 应用一帧 relay 状态后，调用方需要执行的外部副作用。
+///
+/// 把副作用从状态机里分离：泵只按这里的标志执行通知，绝不把“是否重连”的判断
+/// 塞回 relay 层。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RelayStateEffects {
+    /// 本次**进入** KICKED 冲突（调用方持久暂停自动连接并取消待重试轮次）。
+    entered_conflict: bool,
+    /// 本次是 `paired → offline` 的**真实掉线**（调用方唤醒自动连接开新轮）。
+    ///
+    /// 只认这一个状态对：worker 自身连接失败走的是 `connecting → offline`（或
+    /// `needs_auth → offline`），绝不触发自动重连预算重置。
+    dropped_from_paired: bool,
+}
+
 /// 事件泵的 State 处理：锁内改状态/代际，锁外作废旧桥投影并广播。
 ///
 /// - `conflict`（KICKED）是终态：推进 Hub 控制代际（旧动作立即 `stale_generation`），
-///   作废桥/投影后广播；返回值 `true` 表示**本次进入**冲突（调用方据此持久暂停自动
-///   连接，绝不继续自动重连）；
+///   作废桥/投影后广播；`entered_conflict` 表示**本次进入**冲突（调用方据此持久暂停
+///   自动连接，绝不继续自动重连）；
+/// - 真实掉线（覆盖前 `paired`、新状态 `offline`）单独标记 `dropped_from_paired`：
+///   调用方唤醒自动连接开新轮；worker 自身失败（覆盖前 `connecting` 等）不标记；
 /// - `needs_auth` 同时清 `authorized`（JWT 已失效）；
 /// - Hub 处于 `needs_config`/`needs_auth` 时只接受 `needs_auth`/`conflict`：
 ///   配置变更后的旧连接离线/握手事件不得把 Hub 拉回 `offline`/`connecting`；
@@ -566,17 +583,17 @@ async fn apply_relay_state(
     events: &broadcast::Sender<ControlEvent>,
     bridge: &dyn BridgePump,
     view: ConnectionView,
-) -> bool {
-    let (out, entered_conflict, stale) = {
+) -> RelayStateEffects {
+    let (out, effects, stale) = {
         let mut state = lock_inner(inner);
         // 关闭窗口：`begin_disconnect` 已在锁内同步落定 Offline。旧 attempt 的迟到
         // relay 状态（Connecting/Paired/Offline 乃至 Conflict/NeedsAuth）一律忽略，
         // 关闭态在窗口内是唯一权威；关闭结束后的新连接自会带来新 relay 代际。
         if state.closing.is_some() {
-            return false;
+            return RelayStateEffects::default();
         }
         if view.generation <= state.relay_floor {
-            return false;
+            return RelayStateEffects::default();
         }
         state.relay_generation = state.relay_generation.max(view.generation);
         let conflict = view.state == ConnectionState::Conflict;
@@ -589,8 +606,15 @@ async fn apply_relay_state(
             ConnectionState::NeedsConfig | ConnectionState::NeedsAuth
         ) && view.state != ConnectionState::NeedsAuth
         {
-            return false;
+            return RelayStateEffects::default();
         }
+        // 覆盖前判定真实掉线：只认 paired → offline。worker 自身失败的 relay 状态是
+        // connecting → offline（或 needs_auth → offline），不会触发自动重连。
+        let effects = RelayStateEffects {
+            entered_conflict: entering_conflict,
+            dropped_from_paired: state.state == ConnectionState::Paired
+                && view.state == ConnectionState::Offline,
+        };
         state.state = view.state;
         state.reason_code = view.reason_code;
         if view.state != ConnectionState::Connecting {
@@ -610,16 +634,16 @@ async fn apply_relay_state(
         } else {
             state.stale_sessions(out.generation)
         };
-        (out, entering_conflict, stale)
+        (out, effects, stale)
     };
-    if entered_conflict {
+    if effects.entered_conflict {
         bridge.invalidate().await;
     }
     emit_connection(inner, events, &out);
     for stale in &stale {
         emit_session_event(inner, events, stale);
     }
-    entered_conflict
+    effects
 }
 
 /// 事件泵的 Data 溢出处理：旧投影**显式失效**，绝不把旧缓存继续当权威。
@@ -881,8 +905,9 @@ pub struct ZcodeHub {
     /// `forget_authorization` 后的内存暂停（授权成功/显式连接恢复）。
     ///
     /// 持久意图另见 settings 的 `remote.zcode_auto_connect`；本标记只封住忘记期间
-    /// 「旧 restore 抢在新删除之前复活内存凭据」的窗口，不跨进程。
-    auto_paused: AtomicBool,
+    /// 「旧 restore 抢在新删除之前复活内存凭据」的窗口，不跨进程。`Arc` 让 relay
+    /// 事件泵在 KICKED 时也能同步置位并唤醒 worker，立即取消待重试轮次。
+    auto_paused: Arc<AtomicBool>,
     /// 测试观察口：自动连接 worker 已执行的尝试次数（证明「等 worker 跑完」而不是
     /// 靠固定 sleep；不影响生产行为）。
     #[cfg(test)]
@@ -1001,7 +1026,7 @@ impl ZcodeHub {
             disconnect_lock: AsyncMutex::new(()),
             auto_started: AtomicBool::new(false),
             auto_notify: Arc::new(Notify::new()),
-            auto_paused: AtomicBool::new(false),
+            auto_paused: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             auto_attempts: AtomicU64::new(0),
             #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
@@ -1041,6 +1066,10 @@ impl ZcodeHub {
         let out = self.events.clone();
         // KICKED 进入时要持久化「暂停自动连接」：给泵一份与 Hub 同一库的 DeviceStore。
         let store = self.store.clone();
+        // 同一条冲突事件还要**立即**取消自动连接的待重试轮次（不等 1s/3s/10s 定时器）：
+        // 暂停标记 + 唤醒都走与 worker 共享的句柄。
+        let auto_paused = self.auto_paused.clone();
+        let auto_notify = self.auto_notify.clone();
         tokio::spawn(async move {
             loop {
                 if let Some(lag) = &lag {
@@ -1073,15 +1102,23 @@ impl ZcodeHub {
                         let _ = outcome.result;
                     }
                     RelayEvent::State(view) => {
-                        let entered_conflict =
-                            apply_relay_state(&inner, &out, bridge.as_ref(), view).await;
-                        if entered_conflict {
-                            // KICKED：持久暂停自动连接（设计 §5.2）。checked 写；失败不
-                            // 声称成功，也不阻塞事件泵（阻塞型 DB 调用交给 blocking 池）。
+                        let effects = apply_relay_state(&inner, &out, bridge.as_ref(), view).await;
+                        if effects.entered_conflict {
+                            // KICKED：先同步暂停并唤醒自动连接（取消待重试轮次），再持久化
+                            // 「暂停自动连接」（设计 §5.2）。checked 写；失败不声称成功，
+                            // 也不阻塞事件泵（阻塞型 DB 调用交给 blocking 池）。
+                            auto_paused.store(true, Ordering::SeqCst);
+                            auto_notify.notify_one();
                             let store = store.clone();
                             tokio::task::spawn_blocking(move || {
                                 let _ = persist_auto_connect(&store, false);
                             });
+                        }
+                        if effects.dropped_from_paired {
+                            // 真实掉线（paired → offline）= 设计 §5.2 的“下一次真实掉线
+                            // 开始新一轮”：只唤醒同一 worker（配对后预算已重置），不设
+                            // 暂停、不写 auto=false；worker 自身失败不会走到这里。
+                            auto_notify.notify_one();
                         }
                     }
                 }
@@ -1379,13 +1416,24 @@ impl ZcodeHub {
                 return Err(ZcodeError::of(codes::NEEDS_AUTH));
             }
         }
-        self.connect().await
+        let result = self.connect().await;
+        if matches!(&result, Err(error) if error.is(codes::OFFLINE)) {
+            // 显式连接遇到网络离线 = 新的用户触发（设计 §5.2：显式连接才开新轮）：
+            // 取消 worker 可能在途的旧退避并从首档 1s 重开预算。成功/幂等不额外唤醒，
+            // 保证一次点击最多只增加一次 backend connect。
+            self.wake_auto_connect();
+        }
+        result
     }
 
     /// 用户显式断开：先 checked 持久化 `auto=false`（失败即 `storage_failed`，**不得**
     /// 悄悄断开），再走原 [`Self::disconnect`]（保留 JWT，可再次连接）。
+    ///
+    /// 同时置内存暂停并唤醒 worker：正在退避的旧轮次立即作废（H1），不会在用户手动
+    /// 断开后自行补连；显式连接/授权成功会解除暂停。
     pub async fn disconnect_requested(&self) -> ZResult<ConnectionView> {
         persist_auto_connect(&self.store, false)?;
+        self.pause_auto_connect();
         Ok(self.disconnect().await)
     }
 
@@ -1516,12 +1564,21 @@ impl ZcodeHub {
         self.auto_paused.load(Ordering::SeqCst)
     }
 
+    /// 暂停本轮自动连接（忘记授权 / 手动断开 / KICKED）：同步置位并唤醒 worker，
+    /// 让正在退避的旧轮次立即作废，而不是等 1s/3s/10s 定时器到点。
     pub(crate) fn pause_auto_connect(&self) {
         self.auto_paused.store(true, Ordering::SeqCst);
+        self.wake_auto_connect();
     }
 
     pub(crate) fn resume_auto_connect(&self) {
         self.auto_paused.store(false, Ordering::SeqCst);
+    }
+
+    /// 自动连接轮次绑定的控制代际：换/删链接、显式断开、KICKED 推进代际后，旧的
+    /// 定时器/在途尝试一律作废，绝不向旧目标发起连接（等待结束后由 worker 现查）。
+    pub(crate) fn auto_connect_generation(&self) -> u64 {
+        self.lock().generation
     }
 
     /// 单 worker 启动幂等：第一次调用返回 true，后续调用 false。

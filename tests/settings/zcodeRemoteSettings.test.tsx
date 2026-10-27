@@ -517,6 +517,8 @@ describe("ZcodeRemoteSettingsCard 官方账号授权与连接（T7.2）", () => 
     await waitFor(() =>
       expect(connectionState()).toHaveAttribute("data-connection-state", "connecting")
     );
+    // C4：授权成功只刷新 status/auth，绝不手动再调 connect（自动连接由 Rust worker 负责）。
+    expect(controlCall("zcode_control_connect")).toHaveLength(0);
     // 回执里的 URL/token 不外显（只认四字段白名单）
     const text = document.body.textContent ?? "";
     expect(text).not.toContain("synthetic-token-never-render");
@@ -684,7 +686,10 @@ describe("ZcodeRemoteSettingsCard 记住授权（C4）", () => {
   const authState = () => screen.getByTestId("zcode-auth-state");
 
   afterEach(async () => {
-    await i18n.changeLanguage("en");
+    // 语言切换会触发 useAppTranslation 订阅的 state 更新；包 act 避免测试尾部警告。
+    await act(async () => {
+      await i18n.changeLanguage("en");
+    });
   });
 
   it("remembered_authorization_does_not_need_second_connect_click：已记住授权可见，且绝不自动/手动再调 connect", async () => {
@@ -747,7 +752,12 @@ describe("ZcodeRemoteSettingsCard 记住授权（C4）", () => {
     fireEvent.click(header());
     await waitFor(() => expect(authState()).toHaveTextContent("已记住授权"));
 
-    fireEvent.click(screen.getByTestId("zcode-forget"));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("zcode-forget"));
+      // 让 forget 回执 + 随后的并行 status/auth 刷新全部落定后再断言，
+      // 避免异步 state update 落在 act 之外（React 警告）。
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
     await waitFor(() => expect(controlCall("zcode_control_forget_authorization")).toHaveLength(1));
     await waitFor(() =>
       expect(connectionState()).toHaveAttribute("data-connection-state", "needs_auth")
