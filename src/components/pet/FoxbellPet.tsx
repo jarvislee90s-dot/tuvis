@@ -738,8 +738,8 @@ export function FoxbellPet() {
     [playTransient, stopPreview]
   );
 
-  /** 打开用量大看板（计划② Task 6 步骤 11）：菜单项自身先 onClose，这里只管建窗/聚焦；
-   *  父窗传 `"main"`——宠物窗口可能隐藏，定位会回落到屏幕居中（见 lib/usage/openWindow.ts） */
+  /** 打开用量大看板（计划② Task 6 步骤 11）：菜单项自身先 onClose，这里经 openUsageDashboard
+   *  请求主窗切「模型用量」页签（四页同窗后不再建独立窗口；title/theme 形参兼容保留，已无效果） */
   const handleOpenDashboard = useCallback(() => {
     void openUsageDashboard({
       title: t("usage.title"),
