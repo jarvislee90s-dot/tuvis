@@ -35,15 +35,7 @@ interface GridRow {
   compareTitle: string;
 }
 
-export function UsageSummary({
-  dash,
-  retentionDays,
-  t,
-}: {
-  dash: UsageDashboard;
-  retentionDays: number | null;
-  t: TFn;
-}) {
+export function UsageSummary({ dash, t }: { dash: UsageDashboard; t: TFn }) {
   const lang = getLang();
   const prev = prevOf(dash.compare);
   const unmeasured = tokenUnmeasured(dash);
@@ -139,14 +131,6 @@ export function UsageSummary({
           ))}
         </div>
       </CardContent>
-
-      <footer data-testid="usage-footer" className="text-muted-foreground px-4 text-xs">
-        <span>{t("usage.footer.caliber")}</span>
-        <span> · {t("usage.footer.baseline")}</span>
-        {retentionDays != null ? (
-          <span> · {t("usage.footer.retention", { days: retentionDays })}</span>
-        ) : null}
-      </footer>
     </Card>
   );
 }

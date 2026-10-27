@@ -214,7 +214,10 @@ export function UsageExportActions(props: {
   };
 
   return (
-    <div className="flex flex-wrap items-center gap-2">
+    // min-w-0（实机反馈轮 2026-10-27 #3b）：本根是页头动作槽（min-w-0 flex-wrap）的
+    // flex 子项，不放开 min-width 会被内容（超长「已保存」路径）撑到不收缩，
+    // 连锁把收缩压力传给标题；自身换行 + 末尾反馈截断，超宽到此为止
+    <div className="flex min-w-0 flex-wrap items-center gap-2">
       {/* 三个「看板口径」按钮（复制文本 / 导出图片 / 复制图片）：记录页签下**不再整组消失**，
           改为**禁用 + `title` 说明原因**（X7 修复）。口径不变（文本摘要与分享图都是看板口径的产物，
           放在记录页会产生口径歧义），但「按钮凭空消失」会让用户以为功能坏了、也看不出为什么。
@@ -298,7 +301,7 @@ export function UsageExportActions(props: {
           role="status"
           data-testid="usage-export-toast"
           title={note}
-          className="text-muted-foreground max-w-[18rem] truncate text-xs"
+          className="text-muted-foreground max-w-[18rem] min-w-0 truncate text-xs"
         >
           {note}
         </span>

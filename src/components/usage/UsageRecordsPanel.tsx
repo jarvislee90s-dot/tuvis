@@ -45,7 +45,7 @@ import { useUsageRecordsQuery } from "@/lib/query/queries/usage";
 import { useUsageIdentitiesQuery } from "@/lib/query/queries/usageV2";
 import { useUsageProviderAliasesQuery } from "@/lib/query/queries/usageV2";
 import { distValue } from "@/lib/usage/distribution";
-import { EM_DASH, fmtTokens, usageAgentLabel } from "@/lib/usage/format";
+import { EM_DASH, fmtInt, fmtTokens, usageAgentLabel } from "@/lib/usage/format";
 import { getLang } from "@/lib/usage/lang";
 import { cardTokenUnmeasured } from "@/lib/usage/range";
 import { FILTER_TOOL_IDS, RECORD_DIMS } from "@/lib/usage/useRecordsFilters";
@@ -193,7 +193,18 @@ function RecordCard({
         </CardAction>
       </CardHeader>
 
-      <CardContent className="space-y-1.5">
+      <CardContent className="space-y-1">
+        {/* 三列表头（第四轮实机反馈）：供应商显示名 | token 数 | 请求次数；操作区无表头 */}
+        {rows.length > 0 ? (
+          <div
+            data-testid={`usage-record-cols-${card.toolId}`}
+            className="text-muted-foreground flex items-center gap-2 border-b pb-1 text-xs"
+          >
+            <span className="min-w-0 flex-1">{t("usage.records.colModel")}</span>
+            <span className="w-20 text-right">{t("usage.records.colTokens")}</span>
+            <span className="w-16 text-right">{t("usage.records.colRequests")}</span>
+          </div>
+        ) : null}
         {rows.map((row, i) => {
           const rowNoTokens = cardTokenUnmeasured(row);
           const attr = attributionOf(card, row.label);
@@ -254,12 +265,36 @@ function RecordCard({
                 {hasAlias(card, row.label) ? t("usage.alias.edit") : t("usage.records.aliasAction")}
               </Button>
 
-              <span className="font-medium tabular-nums">
+              <span
+                className="w-20 text-right font-medium tabular-nums"
+                data-testid={`usage-record-tokens-${card.toolId}:${i}`}
+              >
                 {rowNoTokens ? EM_DASH : fmtTokens(distValue(row), lang)}
+              </span>
+              <span
+                className="text-muted-foreground w-16 text-right tabular-nums"
+                data-testid={`usage-record-requests-${card.toolId}:${i}`}
+              >
+                {fmtInt(row.metrics.requests)}
               </span>
             </div>
           );
         })}
+
+        {rows.length > 0 ? (
+          <div
+            data-testid={`usage-record-total-${card.toolId}`}
+            className="flex items-center gap-2 border-t pt-1 text-sm font-medium"
+          >
+            <span className="min-w-0 flex-1">{t("usage.records.totalRow")}</span>
+            <span className="w-20 text-right tabular-nums">
+              {noTokens ? EM_DASH : fmtTokens(total, lang)}
+            </span>
+            <span className="w-16 text-right tabular-nums">
+              {fmtInt(card.rows.reduce((sum, r) => sum + r.metrics.requests, 0))}
+            </span>
+          </div>
+        ) : null}
 
         {hidden > 0 ? (
           <Button
@@ -294,6 +329,7 @@ function AssignmentLoader({
   explicitlyBound,
   onClose,
   t,
+  active,
 }: {
   card: UsageCard;
   row: UsageRow;
@@ -304,14 +340,16 @@ function AssignmentLoader({
   explicitlyBound: boolean;
   onClose(): void;
   t: TFn;
+  /** active 门控（评审 Important 2）：随面板透传，页面隐藏期间停发读查询 */
+  active: boolean;
 }) {
   const scoped: UsageFilters =
     cardDim === "tool"
       ? { ...filters, toolIds: [card.toolId] }
       : { ...filters, projects: [card.toolId] };
-  const identities = useUsageIdentitiesQuery(range, scoped);
+  const identities = useUsageIdentitiesQuery(range, scoped, { enabled: active });
   // 别名浮窗需要当前规则（预填 / 复用 id）；与记录页行按钮共用同一查询缓存
-  const aliases = useUsageProviderAliasesQuery();
+  const aliases = useUsageProviderAliasesQuery({ enabled: active });
 
   // useMemo 固化候选数组引用：后台 refetch（["usage"] 失效链）带来新 data 引用时，
   // 不得连带触发 Dialog 的重置 effect（否则用户已选候选与预览会被清空）。
@@ -373,6 +411,7 @@ function AssignmentLoader({
       identities={candidates}
       range={range}
       t={t}
+      active={active}
     />
   );
 }
@@ -390,6 +429,11 @@ export interface UsageRecordsPanelProps {
   records: RecordsFiltersState;
   /** 译函数（`usage.records.*` / `usage.source.*` / `usage.error.*` / `common.*`） */
   t: TFn;
+  /**
+   * active 门控（评审 Important 2）：面板在四页宿主里常驻挂载，页面隐藏期间传 false——
+   * records / identities / aliases 全部读查询停发（含 focus refetch）。默认 true，旧调用者行为不变。
+   */
+  active?: boolean;
 }
 
 export function UsageRecordsPanel({
@@ -397,6 +441,7 @@ export function UsageRecordsPanel({
   retentionDays,
   records: rec,
   t,
+  active = true,
 }: UsageRecordsPanelProps) {
   /** 已展开的超限卡片（逐卡独立；`toolId` 即卡片 key）——**纯视图态**，不上提（导出用不到它） */
   const [expandedKeys, setExpandedKeys] = useState<readonly string[]>([]);
@@ -422,7 +467,7 @@ export function UsageRecordsPanel({
     filters,
   } = rec;
 
-  const records = useUsageRecordsQuery(range, cardDim, filters);
+  const records = useUsageRecordsQuery(range, cardDim, filters, { enabled: active });
   const cards = records.data?.cards ?? [];
 
   /**
@@ -430,7 +475,7 @@ export function UsageRecordsPanel({
    *  * tool 卡按 `${sourceId}|${label}` —— 不同工具的同一 label 不得互相覆盖；
    *  * project 卡按 label 聚合**所有**同 label identity（identity 无 project 字段），保守判定。
    */
-  const identities = useUsageIdentitiesQuery(range, filters);
+  const identities = useUsageIdentitiesQuery(range, filters, { enabled: active });
   const { byTool, byLabel } = useMemo(() => {
     const toolMap = new Map<string, IdentityUsage[]>();
     const labelMap = new Map<string, IdentityUsage[]>();
@@ -450,7 +495,7 @@ export function UsageRecordsPanel({
   const attributionOf = (card: UsageCard, label: string): RowAttribution =>
     aggregateAttribution(identitiesOf(card, label));
 
-  const aliases = useUsageProviderAliasesQuery();
+  const aliases = useUsageProviderAliasesQuery({ enabled: active });
   const aliasRules = aliases.data?.aliases ?? [];
   /** 命中任一身份别名即视为可编辑（打开浮窗后由用户选择具体身份）。 */
   const hasAlias = (card: UsageCard, label: string): boolean =>
@@ -628,10 +673,17 @@ export function UsageRecordsPanel({
           explicitlyBound={assign.explicitlyBound}
           onClose={() => setAssign(null)}
           t={t}
+          active={active}
         />
       ) : null}
 
-      <BillingProfilesManager t={t} open={rulesOpen} onOpenChange={setRulesOpen} hideTrigger />
+      <BillingProfilesManager
+        t={t}
+        open={rulesOpen}
+        onOpenChange={setRulesOpen}
+        hideTrigger
+        active={active}
+      />
     </div>
   );
 }
