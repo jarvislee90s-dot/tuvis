@@ -709,6 +709,20 @@ pub struct BridgeManager {
     resync: AsyncMutex<()>,
 }
 
+/// 一帧 `data` 的处理结果：既有错误/ACK 语义 + 本帧造成的会话视图变化。
+///
+/// `changed` **无论** `result` 成败都会计算：坏 CRC/解码/序号错误同样会把投影标成
+/// `ready=false`，上层（Hub 事件泵）必须据此广播降级，否则手机一直停在旧卡面，
+/// 直到一次无关 GET 才发现失效。`result` 只表示本帧是否被吸收，不改变「已发生的
+/// 状态变化必须被发布」这一纪律。顺序按 sessionId 稳定排序。
+#[derive(Debug)]
+pub struct DataOutcome {
+    /// 本帧是否被吸收（`Err` = 未吸收；ACK/退订仍照常尽力发出）。
+    pub result: ZResult<()>,
+    /// 本帧造成的会话视图变化（无变化 = 空）。
+    pub changed: Vec<SessionView>,
+}
+
 /// 管理器与 actor 共享的部分（状态锁 + sender 通道）。
 struct Shared {
     state: Mutex<Inner>,
@@ -779,14 +793,25 @@ impl BridgeManager {
 
     /// relay 事件泵入口：一条已配对的 `data` payload。
     ///
-    /// 只做解析/路由，**不 await 网络**（ACK 走 actor 队列），因此事件泵不会被慢路径拖住；
-    /// 缺口/协议不符只置 `ready=false` 并标记重同步，读面下次访问时取新快照。
-    ///
-    /// 返回**本帧内发生变化的会话视图**（同一把状态锁内前后快照对比，按 sessionId
-    /// 判定；无变化 = 空）。上层（Hub 事件泵）据此把会话变化发布给手机，而不是只在
-    /// 桥内更新投影。错误时返回 `Err`（ACK/退订仍照常尽力发出）。
+    /// **兼容包装**：[`Self::on_data_outcome`] 的 `result` + `changed` 合并成旧签名
+    /// （`Ok(changed)` / `Err(error)`）。既有调用方/测试可继续只关心错误；需要「错误
+    /// 帧也要发布降级视图」的调用方（Hub 事件泵）必须走 `on_data_outcome`。
     pub async fn on_data(&self, payload: Value) -> ZResult<Vec<SessionView>> {
-        let (result, acks, releases, views) = {
+        let DataOutcome { result, changed } = self.on_data_outcome(payload).await;
+        result.map(|()| changed)
+    }
+
+    /// relay 事件泵入口（完整结果）：一条已配对的 `data` payload。
+    ///
+    /// 只做解析/路由，**不 await 网络**（ACK 走 actor 队列），因此事件泵不会被慢路径拖住；
+    /// 缺口/协议不符/坏 CRC/未知 schema 只置 `ready=false` 并标记重同步，读面下次访问时
+    /// 取新快照。
+    ///
+    /// **无论 `result` 成败**都在同一把状态锁内做前后快照 diff（按 sessionId 稳定排序）：
+    /// 错误帧同样可能已经改写了投影（例如把会话标成不新鲜），这些变化必须原样上报，
+    /// 否则上层无法广播降级。ACK/退订仍照常尽力发出。
+    pub async fn on_data_outcome(&self, payload: Value) -> DataOutcome {
+        let (result, acks, releases, changed) = {
             let mut inner = lock(&self.shared.state);
             // 前/后快照与 `handle_data` 在同一把状态锁内：视图差异就是「本帧」
             // 的效果，不会混入锁外其它调用者的读写。
@@ -796,20 +821,17 @@ impl BridgeManager {
                 .map(|(session_id, entry)| (session_id.clone(), entry.projection.view()))
                 .collect();
             let (result, acks, releases) = inner.handle_data(&payload);
-            let mut views = Vec::new();
-            // 错误帧不报告变化（上层丢弃本帧；会话降级由连接态/读面重同步处理）；
-            // 成功帧按 sessionId 对比视图。
-            if result.is_ok() {
-                for (session_id, entry) in inner.sessions.iter() {
-                    let after = entry.projection.view();
-                    if before.get(session_id) != Some(&after) {
-                        views.push(after);
-                    }
+            // 成败都做 diff：错误帧的降级/恢复视图同样是「本帧真实发生的状态变化」。
+            let mut changed = Vec::new();
+            for (session_id, entry) in inner.sessions.iter() {
+                let after = entry.projection.view();
+                if before.get(session_id) != Some(&after) {
+                    changed.push(after);
                 }
             }
             // 稳定顺序（HashMap 迭代序随机）：同一批变化的事件顺序可复现。
-            views.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-            (result, acks, releases, views)
+            changed.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+            (result, acks, releases, changed)
         };
         for ack in acks {
             let _ = self.shared.commands.try_send(Command::SendFrame {
@@ -820,7 +842,7 @@ impl BridgeManager {
         for release in releases {
             let _ = self.shared.commands.try_send(release);
         }
-        result.map(|()| views)
+        DataOutcome { result, changed }
     }
 
     /// 连接代际变化：丢弃旧代际的全部桥/投影/临时绑定。
@@ -6507,6 +6529,96 @@ mod tests {
             manager.session(&target).await.expect("session").revision,
             Some(3)
         );
+    }
+
+    /// 坏帧（CRC 校验失败）同样必须报告它造成的投影降级：`on_data_outcome` 返回
+    /// `Err` **且** `changed` 含 `ready=false` 的会话；无变化的错误帧 `changed` 为空；
+    /// 随后有效快照恢复 `ready=true`（证明自愈路径）。
+    ///
+    /// 旧实现只在 `result.is_ok()` 时做前后 diff：错误帧把投影标成不新鲜后，降级视图
+    /// 被整包丢弃，Hub 因此永远收不到失效通知（手机停留在旧卡面，直到一次无关 GET）。
+    #[tokio::test]
+    async fn on_data_outcome_reports_degraded_views_on_frame_error() {
+        const SUB: &str = "conv-sub-synthetic-1";
+        let (manager, peer) = manager_with(single_workspace_config()).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        let baseline = manager.session(&target).await.expect("session");
+        assert!(baseline.ready, "订阅快照必须先建立就绪投影");
+        assert_eq!(baseline.revision, Some(2));
+
+        let bridge = peer.session_bridge_id(SESSION_A);
+        let listen = peer.listen_id(&bridge);
+        let topic = format!("{CONVERSATION_TOPIC_PREFIX}{SESSION_A}");
+
+        // 逐帧构造合法消息再破坏物理 CRC（seq/messageSeq 由 fake 严格递增）。
+        let bad_frame = || {
+            let mut inner = peer.inner.lock().expect("peer lock");
+            let mut frame = peer.frame(
+                &mut inner,
+                &bridge,
+                channel_message(
+                    json!([RESPONSE_TYPE_EVENT_FIRE, listen]),
+                    &test_wire(
+                        &topic,
+                        SUB,
+                        json!({
+                            "kind": "snapshot",
+                            "snapshot": conversation_snapshot(SESSION_A, 9, Vec::new()),
+                        }),
+                    ),
+                ),
+            );
+            frame["checksum"]["value"] = json!("00000000");
+            frame
+        };
+
+        // 第一次坏帧：投影 ready true→false，必须仍然上报这条降级视图。
+        let outcome = manager.on_data_outcome(bad_frame()).await;
+        let error = outcome.result.expect_err("坏 CRC 必须返回错误");
+        assert!(error.is(codes::UNSUPPORTED_PROTOCOL));
+        assert_eq!(outcome.changed.len(), 1, "错误帧必须仍报告降级视图");
+        let degraded = &outcome.changed[0];
+        assert_eq!(degraded.session_id, SESSION_A);
+        assert!(!degraded.ready, "错误帧已把投影标成不新鲜");
+        assert_eq!(degraded.revision, Some(2), "降级不得改写既有 revision");
+        assert_eq!(degraded.generation, baseline.generation);
+        assert!(!manager.peek_view(SESSION_A).expect("bound").ready);
+
+        // 投影已不新鲜后的再次坏帧：无变化 → changed 为空；兼容包装 on_data 仍返回 Err。
+        let outcome = manager.on_data_outcome(bad_frame()).await;
+        assert!(outcome.result.is_err());
+        assert!(outcome.changed.is_empty(), "无变化的错误帧不得伪造变化");
+        let error = manager
+            .on_data(bad_frame())
+            .await
+            .expect_err("on_data 兼容包装不得吞错");
+        assert!(error.is(codes::UNSUPPORTED_PROTOCOL));
+
+        // 有效快照（同订阅）恢复 ready=true，并报告恢复视图。
+        let recovered_frame = {
+            let mut inner = peer.inner.lock().expect("peer lock");
+            peer.frame(
+                &mut inner,
+                &bridge,
+                channel_message(
+                    json!([RESPONSE_TYPE_EVENT_FIRE, listen]),
+                    &test_wire(
+                        &topic,
+                        SUB,
+                        json!({
+                            "kind": "snapshot",
+                            "snapshot": conversation_snapshot(SESSION_A, 9, Vec::new()),
+                        }),
+                    ),
+                ),
+            )
+        };
+        let outcome = manager.on_data_outcome(recovered_frame).await;
+        assert!(outcome.result.is_ok(), "有效快照必须被吸收");
+        assert_eq!(outcome.changed.len(), 1, "恢复也必须报告变化");
+        assert!(outcome.changed[0].ready, "恢复视图必须 ready=true");
+        assert_eq!(outcome.changed[0].revision, Some(9));
+        assert!(manager.peek_view(SESSION_A).expect("bound").ready);
     }
 
     // =======================================================================

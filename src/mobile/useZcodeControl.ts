@@ -15,7 +15,12 @@
 //   loading，不清已有视图；迟到的旧会话/旧代次事件一律作废。
 // - SSE（`/zcode/events?sessionId=`）：`snapshot`/`connection`/`session` 帧直接落地
 //   DTO；`action` 只作纠偏信号（重拉 GET，**绝不重放动作**）；`resync`（lag）同样
-//   只重拉 GET。卸载/切会话关闭流；别的会话或旧代次帧忽略。
+//   只重拉 GET。`session`/`snapshot` 帧带回 `ready=false`（投影已被 Hub 显式失效）
+//   且落地成功时，同一代次**补一次** GET 重新绑定/现读（重复同代不刷新，防循环）。
+//   失效后**首次** `ready=true` 只代表 Hub 投影恢复，能力矩阵可能仍沿用降级时的全关
+//   （坏帧降级后 Hub 事件就是这么发的）——必须再补一次权威 GET 由 `Hub::session()`
+//   现算能力（每失效周期至多一次，绝不循环）。守卫只在 GET 落地 `ready=true`、切会话、
+//   连接换代时清空。卸载/切会话关闭流；别的会话或旧代次帧忽略。
 // - 阅读链（看板/正文/文件预览）不依赖本 hook 成功。
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -118,6 +123,10 @@ interface ControlEventFrame {
 const SSE_RECONNECT_BASE_MS = 1000;
 const SSE_RECONNECT_MAX_MS = 30_000;
 
+/** 每会话代次的恢复 GET 尝试上限（首次 + 一次重试）：失败的恢复不得无限重试，
+ *  也不得被单次失败毒化——每次 ready=false 清恢复标记，但尝试次数封顶。 */
+const MAX_RECOVERY_ATTEMPTS_PER_GENERATION = 2;
+
 export default function useZcodeControl(sessionId: string): UseZcodeControlResult {
   const [connection, setConnection] = useState<ConnectionView | null>(null);
   const [session, setSession] = useState<SessionView | null>(null);
@@ -140,6 +149,38 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
    * 也必须补拉会话，仅靠代次会漏掉（代次没变的配对完成是合法场景）。
    */
   const appliedConnectionRef = useRef<ConnectionView | null>(null);
+  /**
+   * 已因 `ready=false` 补拉过 GET 的会话代次（null = 无待自愈）。
+   *
+   * Hub 在 Data 溢出/投影失效后把**每个**跟踪会话降级为 `ready=false` 并逐条广播
+   * Session 帧；手机必须自己重拉一次 GET 重新绑定/现读，否则页面永远停在失效投影。
+   * 同一代次只允许一发（重复降级帧/重连快照不得打刷新风暴）。守卫**只在 GET 落地**
+   * `ready=true`（见 applyRead）或切会话/连接换代时清空：SSE 帧的 `ready=true` 只是
+   * Hub 投影恢复，能力矩阵可能仍是降级后的全关，不能据此清守卫。GET 直接读到
+   * `ready=false`（页面在失效窗口内打开、无降级帧）也会记为「本代次已失效」。失败的
+   * refresh 不清守卫：服务端仍返回失效投影时重试只会变成循环。
+   */
+  const staleRefreshRef = useRef<number | null>(null);
+  /**
+   * 已为「失效后首次 `ready=true`」补拉过**权威** GET 的会话代次（null = 无恢复请求）。
+   *
+   * 坏帧/投影失效后 Hub 的能力矩阵被清成基线全关；恢复帧的 `ready=true` 事件可能
+   * 沿用这份全关矩阵（Hub `apply_relay_session` 复用 last_session），手机若直接
+   * 采信就会让发送按钮持续灰着。恢复 GET 由 `Hub::session()` 现算权威能力（含验收
+   * 许可）。每代次至多 [`MAX_RECOVERY_ATTEMPTS_PER_GENERATION`] 次（首次 + 一次
+   * 重试）；封顶后不再自动重试，换代/切会话/GET 落地 ready=true 重置。绝不循环、
+   * 绝不需要手动 refresh。
+   */
+  const recoveryRefreshRef = useRef<number | null>(null);
+  /**
+   * 本会话代次已发出的恢复 GET 次数（封顶
+   * [`MAX_RECOVERY_ATTEMPTS_PER_GENERATION`]）。GET 落地 ready=true、切会话、连接
+   * 换代时重置；失败的恢复只消耗额度，不会把本代次永久毒化。
+   */
+  const recoveryAttemptsRef = useRef<{ generation: number; attempts: number }>({
+    generation: -1,
+    attempts: 0,
+  });
 
   /** 落地连接视图并推进代次；返回 false = 旧代次（不写 state）。 */
   const applyConnection = useCallback((view: ConnectionView): boolean => {
@@ -156,6 +197,8 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
     if (view.generation < generationRef.current.session) return false;
     generationRef.current.session = view.generation;
     setSession(view);
+    // 守卫**不**在这里按 `ready` 清空：SSE 帧的 ready=true 可能仍带着降级后的全关
+    // 能力矩阵，只有 GET 落地 ready=true（applyRead）才算权威恢复。
     return true;
   }, []);
 
@@ -177,7 +220,21 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
         if (outcome.ok && isCurrent()) applyConnection(outcome.value);
       });
       void sessionRead.then((outcome) => {
-        if (outcome.ok && isCurrent()) applySessionView(outcome.value);
+        if (!outcome.ok || !isCurrent()) return;
+        if (!applySessionView(outcome.value)) return;
+        // 只有 **GET 落地** 的 ready=true 才算权威恢复（能力矩阵已现算）：清掉失效/
+        // 恢复守卫。SSE 帧的 ready=true 走 requestStaleRefresh，不在此清。
+        if (outcome.value.ready) {
+          staleRefreshRef.current = null;
+          recoveryRefreshRef.current = null;
+          recoveryAttemptsRef.current = { generation: -1, attempts: 0 };
+        } else {
+          // 页面可能在失效窗口内打开：GET 直接读到 ready=false（没有任何降级 SSE 帧）
+          // 也必须记为「本代次已失效」，否则随后的 ready=true（能力全关）不会触发
+          // 恢复 GET。恢复尝试计数保留（同代次封顶语义）。
+          staleRefreshRef.current = outcome.value.generation;
+          recoveryRefreshRef.current = null;
+        }
       });
       const [connectionResult, sessionResult] = await Promise.all([connectionRead, sessionRead]);
       if (!isCurrent()) return false;
@@ -208,6 +265,10 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
     // 换会话：旧代次与旧「已落地连接视图」一律作废（新会话从自己的首个快照重新起算）。
     generationRef.current = { connection: -1, session: -1 };
     appliedConnectionRef.current = null;
+    // 旧会话的失效/恢复守卫不得吞掉新会话（同代次）的第一次降级自愈/恢复补拉。
+    staleRefreshRef.current = null;
+    recoveryRefreshRef.current = null;
+    recoveryAttemptsRef.current = { generation: -1, attempts: 0 };
     const run = ++readRunRef.current;
     // 换会话先清旧视图：旧连接/旧原因/旧草稿标记不得跨会话显示。
     setConnection(null);
@@ -231,6 +292,48 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
     if (applied) setLoading(false);
   }, [applyRead]);
 
+  /**
+   * 失效/恢复的一次性自愈（stale 每代次最多一发，恢复最多
+   * [`MAX_RECOVERY_ATTEMPTS_PER_GENERATION`] 次，绝不循环）：
+   *
+   * - `ready=false`：每次先清 recoveryRef（失败重试不被毒化）；同代已请求 → 吞掉，
+   *   否则记 staleRef、补一发 GET；
+   * - `ready=true` 且 recoveryRef 已是本代 → 恢复 GET 已请求/在途，吞掉（有界）；
+   * - `ready=true` 且 staleRef 是本代 → **失效后的首次恢复**：记 recoveryRef 并补一发
+   *   权威 GET（Hub 事件此时的能力矩阵可能是降级后的全关，必须由 GET 现算）；每代次
+   *   至多 `MAX_RECOVERY_ATTEMPTS_PER_GENERATION` 次（首次 + 一次重试），封顶后 no-op；
+   * - 其余（无失效周期）→ 清空两个守卫。
+   *
+   * 守卫只在 GET 落地 `ready=true`（applyRead）、切会话、连接换代时清空。
+   */
+  const requestStaleRefresh = useCallback(
+    (view: SessionView) => {
+      const generation = view.generation;
+      if (!view.ready) {
+        // 每次观察到失效都清恢复标记：两次 GET 都失败后，本代次的后续 ready=true
+        // 仍可再尝试（额度见 MAX_RECOVERY_ATTEMPTS_PER_GENERATION），不被毒化。
+        recoveryRefreshRef.current = null;
+        if (staleRefreshRef.current === generation) return;
+        staleRefreshRef.current = generation;
+        void refresh();
+        return;
+      }
+      if (recoveryRefreshRef.current === generation) return;
+      if (staleRefreshRef.current === generation) {
+        const attempts = recoveryAttemptsRef.current;
+        const used = attempts.generation === generation ? attempts.attempts : 0;
+        if (used >= MAX_RECOVERY_ATTEMPTS_PER_GENERATION) return;
+        recoveryAttemptsRef.current = { generation, attempts: used + 1 };
+        recoveryRefreshRef.current = generation;
+        void refresh();
+        return;
+      }
+      staleRefreshRef.current = null;
+      recoveryRefreshRef.current = null;
+    },
+    [refresh]
+  );
+
   // ==== SSE：会话作用域事件流（DTO 直接落地；lag/断流只重 GET）====
   useEffect(() => {
     if (typeof EventSource === "undefined") return; // 无 SSE 运行时：GET 首拍仍权威
@@ -253,10 +356,11 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
       if (name === "snapshot") {
         // 首帧/重连基线：连接与（可绑定时的）会话投影一起纠偏
         const connectionView = isConnectionView(frame.connection) ? frame.connection : null;
-        const sessionApplied = isSessionView(frame.session)
-          ? applySessionView(frame.session)
-          : false;
+        const sessionFrame = isSessionView(frame.session) ? frame.session : null;
+        const sessionApplied = sessionFrame !== null ? applySessionView(sessionFrame) : false;
         const connectionApplied = connectionView !== null ? applyConnection(connectionView) : false;
+        // 基线里的会话投影已失效（lag 后 ready=false）：与 session 帧同规，一次性自愈。
+        if (sessionApplied && sessionFrame !== null) requestStaleRefresh(sessionFrame);
         // 基线说已配对，却没带本会话的有效会话投影（缺失/别的会话/旧代次）：补一次
         // GET 把会话拉齐——首拍会话读失败后仅靠 connection 帧仍可能留下空投影。
         if (connectionApplied && connectionView?.state === "paired" && !sessionApplied) {
@@ -288,6 +392,9 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
         if (advanced) {
           // 换代：旧代 pending 失效（新投影由重 GET / 后续 session 帧补上）
           setSession(null);
+          staleRefreshRef.current = null;
+          recoveryRefreshRef.current = null;
+          recoveryAttemptsRef.current = { generation: -1, attempts: 0 };
           void refresh();
         } else if (
           envelope.data.state === "paired" &&
@@ -302,7 +409,9 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
       if (name === "session") {
         if (envelope.sessionId !== sessionId) return; // 缺会话维度的会话帧保守丢弃
         if (envelope.generation < generationRef.current.session) return; // 旧代次
-        if (isSessionView(envelope.data)) applySessionView(envelope.data);
+        if (!isSessionView(envelope.data)) return;
+        // 只有真正落地的帧才触发自愈（旧代次/别的会话一律不刷新）。
+        if (applySessionView(envelope.data)) requestStaleRefresh(envelope.data);
         return;
       }
       if (name === "action") {
@@ -368,7 +477,7 @@ export default function useZcodeControl(sessionId: string): UseZcodeControlResul
         retryTimer = null;
       }
     };
-  }, [sessionId, applyConnection, applySessionView, refresh]);
+  }, [sessionId, applyConnection, applySessionView, refresh, requestStaleRefresh]);
 
   const submit = useCallback(async (action: ControlAction): Promise<ActionReceipt> => {
     // 一次提交 = 一个 actionId：请求体与回执同一个；重试是新提交 → 新 ID。
