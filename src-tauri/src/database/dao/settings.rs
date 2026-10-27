@@ -38,7 +38,8 @@ pub(crate) fn try_set_setting_conn(
 
 /// 连接级可失败读取：需要区分「缺键」与「读取失败」的调用方必须用本函数。
 /// 旧 [`get_setting_conn`] 的 best-effort 语义（失败即 None）保持不变。
-// C1 落 checked read，C2 起由凭据存储（恢复禁用标记）消费。
+// C1 落 checked read；由凭据存储的 OsCredentialStore（恢复禁用标记）消费，
+// 其生产装配在 C3 完成。
 pub(crate) fn try_get_setting_conn(
     conn: &Connection,
     key: &str,

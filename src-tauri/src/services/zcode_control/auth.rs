@@ -443,7 +443,8 @@ impl AuthService {
 
     /// 清除内存中的账号凭据并使在途授权失效。
     ///
-    /// **只清运行时内存**：持久记录与恢复标记不动（`forget` 才删除）；401/过期走
+    /// **只清运行时内存**：持久记录与恢复标记不动（`forget` 才删除）；`remembered`
+    /// 保留（持久记录仍在），仅清掉本次会话的临时 `problem`。401/过期走
     /// [`Self::invalidate`] 的持久删除入口。
     pub fn clear(&self) {
         let mut state = self.lock_state();
@@ -451,6 +452,7 @@ impl AuthService {
         state.jwt_epoch = None;
         state.provider = None;
         state.restoring = false;
+        state.problem = None;
         state.epoch = state.epoch.wrapping_add(1);
         if let Some(cancel) = state.cancel.take() {
             let _ = cancel.send(());
@@ -546,7 +548,7 @@ impl AuthService {
                 state.problem = Some(AuthProblem::from_credential(error));
             }
         }
-        // 先释放状态锁再组 DTO（status() 会再次取锁，绝不可重入）。
+        // 组快照本身不取锁；随后立即释放状态锁，避免任何后续路径重入/跨 await 持锁。
         let status = status_snapshot(&state);
         drop(state);
         status
@@ -730,7 +732,7 @@ impl AuthService {
     ///
     /// 旧 JWT 的迟到结果（epoch 已变）不得清掉新 JWT、不得取消新授权，也不得删除
     /// 新授权保存的记录——删除在存储单飞锁内复核 epoch 后才执行。401/过期是授权事实，
-    /// 删除失败不改写 `problem`。
+    /// 删除失败不改写 `problem`，但必须禁用恢复，防止已撤销 JWT 被 restore 重新授权。
     async fn invalidate(&self, credential_epoch: u64, problem: AuthProblem) {
         let delete_epoch = {
             let mut state = self.lock_state();
@@ -749,7 +751,19 @@ impl AuthService {
             }
             state.epoch
         };
-        let _ = self.delete_persisted_if_current(delete_epoch).await;
+        match self.delete_persisted_if_current(delete_epoch).await {
+            Some(Ok(())) => {}
+            Some(Err(_)) => {
+                let mut state = self.lock_state();
+                // 删除失败（尤其恢复禁用标记写失败）：记录可能仍在，禁止 restore 把
+                // 已撤销的 JWT 重新授权；problem 保持 revoked/expired，不假报删除成功。
+                if state.epoch == delete_epoch {
+                    state.restore_blocked = true;
+                }
+            }
+            // 新授权/忘记已接管：旧删除结果不得回写状态。
+            None => {}
+        }
     }
 
     /// 有界等待回调：得到授权码 / 被取消 / 超时 / 被拒，任何出口都关闭监听。
@@ -813,14 +827,27 @@ impl AuthService {
     }
 }
 
-/// 由内存状态构造授权状态快照（不读 JWT 内容之外的任何存储）。
+/// 由内存状态构造授权状态快照（只读：不访问系统存储，也不写回状态）。
+///
+/// `authorized` 含本地 exp 判定：过期 JWT 在 1.5 秒状态轮询里不得继续显示为已授权；
+/// 若此前没有更具体的 problem，快照报 `Expired`。失效清理由 `terminal_token`/
+/// `restore` 的持久删除入口负责，本函数不改内存状态。
 fn status_snapshot(state: &AuthState) -> AuthStatus {
+    let authorized = state
+        .jwt
+        .as_deref()
+        .map(|jwt| !jwt_is_expired(jwt, now_secs()))
+        .unwrap_or(false);
+    let problem = match state.problem {
+        None if state.jwt.is_some() && !authorized => Some(AuthProblem::Expired),
+        problem => problem,
+    };
     AuthStatus {
-        authorized: state.jwt.is_some(),
+        authorized,
         remembered: state.remembered,
         restoring: state.restoring,
         provider: state.provider,
-        problem: state.problem,
+        problem,
     }
 }
 
@@ -2548,5 +2575,141 @@ mod tests {
             serde_json::to_string(&AuthProblem::TooLarge).unwrap(),
             "\"too_large\""
         );
+    }
+
+    // ───────────────── C2 复审修整：失效删除失败/过期快照/403/clear ─────────────────
+
+    /// 401/过期删除失败：禁止 restore 把已撤销 JWT 重新授权（problem 保留原失效原因）。
+    #[tokio::test]
+    async fn invalidated_delete_failure_blocks_restore() {
+        // 401 → invalidate → 删除失败。
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        fake.set_relay(401, r#"{"code":401,"msg":"synthetic-upstream"}"#);
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+        store.fail_next(CredentialError::DeleteFailed);
+
+        assert_eq!(err_code(auth.terminal_token().await), "needs_auth");
+        assert_eq!(store.delete_count(), 1);
+        assert!(store.stored().is_some(), "删除失败时记录可能仍在");
+        let status = auth.status();
+        assert!(!status.authorized);
+        assert_eq!(status.problem, Some(AuthProblem::Revoked));
+
+        let restored = auth.restore().await;
+        assert!(!restored.authorized);
+        assert_eq!(restored.problem, Some(AuthProblem::Revoked));
+        assert_eq!(store.load_count(), 0, "删除失败后不得 restore 旧记录");
+
+        // 内存 JWT 过期 → invalidate → 删除失败。
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&expired_jwt()));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Zai)
+            .await
+            .expect("交换成功");
+        store.fail_next(CredentialError::DeleteFailed);
+
+        assert_eq!(err_code(auth.terminal_token().await), "needs_auth");
+        assert_eq!(store.delete_count(), 1);
+        assert!(store.stored().is_some(), "删除失败时记录可能仍在");
+        assert_eq!(auth.status().problem, Some(AuthProblem::Expired));
+
+        let restored = auth.restore().await;
+        assert!(!restored.authorized);
+        assert_eq!(restored.problem, Some(AuthProblem::Expired));
+        assert_eq!(store.load_count(), 0, "过期记录删除失败后不得 restore");
+    }
+
+    /// 状态轮询遇到内存里已过期 JWT：authorized=false 且快照报 expired（不写状态）。
+    #[tokio::test]
+    async fn status_expired_memory_jwt_reports_expired() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&expired_jwt()));
+        let auth = Arc::new(test_service(&fake));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("交换成功");
+
+        let first = auth.status();
+        assert!(!first.authorized, "过期 JWT 不得在状态轮询中显示已授权");
+        assert_eq!(first.problem, Some(AuthProblem::Expired));
+        // 快照只读：再次读取结果一致（没有偷偷改写状态）。
+        assert_eq!(auth.status(), first);
+        // 真正清理由 terminal_token 的失效入口完成。
+        assert_eq!(err_code(auth.terminal_token().await), "needs_auth");
+    }
+
+    /// 403 不删除持久记录，也不把 JWT 判为失效。
+    #[tokio::test]
+    async fn forbidden_terminal_token_keeps_persisted_record() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        fake.set_relay(403, r#"{"code":403,"msg":"synthetic-upstream"}"#);
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+
+        assert_eq!(err_code(auth.terminal_token().await), "needs_auth");
+        assert_eq!(store.delete_count(), 0, "403 不得删除持久记录");
+        assert!(store.stored().is_some());
+        let status = auth.status();
+        assert!(status.authorized);
+        assert!(status.remembered);
+        assert_eq!(status.problem, None);
+    }
+
+    /// clear 只清运行时内存：持久记录仍在、remembered 保留，restore 可复用。
+    #[tokio::test]
+    async fn clear_does_not_delete_persisted_record() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("授权成功");
+
+        auth.clear();
+        assert_eq!(store.delete_count(), 0, "clear 不得删除持久记录");
+        assert!(store.stored().is_some());
+        let status = auth.status();
+        assert!(!status.authorized);
+        assert!(status.remembered, "持久记录仍在，remembered 必须保留");
+        assert_eq!(status.problem, None);
+        assert_eq!(status.provider, None);
+
+        // 持久身份仍可恢复。
+        let restored = auth.restore().await;
+        assert!(restored.authorized);
+        assert!(restored.remembered);
+        assert_eq!(store.load_count(), 1);
+    }
+
+    /// clear 清掉本次会话的临时 problem。
+    #[tokio::test]
+    async fn clear_clears_transient_problem() {
+        let fake = FakeZcode::start().await;
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        let store = Arc::new(MemoryCredentialStore::new());
+        store.fail_next(CredentialError::StorageFailed);
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("保存失败不影响授权");
+        assert_eq!(auth.status().problem, Some(AuthProblem::StorageFailed));
+
+        auth.clear();
+        let status = auth.status();
+        assert!(!status.authorized);
+        assert!(!status.remembered);
+        assert_eq!(status.problem, None, "clear 必须清掉临时 problem");
     }
 }
