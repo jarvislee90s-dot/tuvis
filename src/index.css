@@ -20,6 +20,9 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-selected: var(--selected);
+  --color-selected-foreground: var(--selected-foreground);
+  --color-surface-secondary: var(--surface-secondary);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -27,62 +30,88 @@
 }
 
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
+  /* 2026-10-26 桌面主题定稿（spec §3.1）：纯白底 + 蓝紫强调，映射到 shadcn 语义
+   * 变量；业务组件只准消费这里的 token，禁止散落色值。 */
+  --background: #ffffff; /* 页面/窗口背景 */
+  --foreground: #202735; /* 主文字 */
+  --card: #ffffff; /* 内容面板 */
+  --card-foreground: #202735;
+  --popover: #ffffff;
+  --popover-foreground: #202735;
+  --primary: #4263dc; /* 强调 / 主图线 */
+  --primary-foreground: #ffffff;
+  --secondary: #f8f9fc; /* 输入/次级面 */
+  --secondary-foreground: #202735;
+  --muted: #f8f9fc;
+  --muted-foreground: #626d80; /* 次文字 */
+  --accent: #eef1ff; /* 选中/悬停背景 */
+  --accent-foreground: #202735;
   --destructive: oklch(0.577 0.245 27.325);
-  --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  --destructive-foreground: #ffffff;
+  --border: #d9dee9; /* 边界 */
+  --input: #cdd3e0;
+  --ring: #4263dc; /* 焦点环由强调色派生 */
   --radius: 0.625rem;
+
+  /* 语义扩展位（spec §3.1 表的命名槽位，供组件按语义取名而非复用近似 token） */
+  --selected: #eef1ff; /* 选中背景 */
+  --selected-foreground: #202735;
+  --surface-secondary: #f8f9fc; /* 输入/次级面 */
+
+  /* 轻玻璃材质（spec §3.2）：仅导航与浮层消费（.workspace-glass）；
+   * 内容面板/指标/表格/图表保持平面，禁止引用。 */
+  --glass-bg: color-mix(in oklab, var(--card) 86%, transparent);
+  --glass-highlight: rgba(255, 255, 255, 0.55);
+  --glass-filter: blur(12px) saturate(1.4);
 
   /* 用量图表三变量（计划② Task 4，浅色档）：趋势图与占比条**唯一**取色来源
    * （计划 §3 第 19/20 条：图表取色只认这三个变量，浅深各一套，禁止硬编码参考实现色值）。
+   * 2026-10-26 Task 8：主图线/辅图按 spec §3.1 定稿色更新（#4263DC / #8B5CF6）。
    * ⚠️ 分享图导出（`src/lib/usage/exportLayout.ts` / `exportImage.ts`）**刻意不消费**它们：
    * 分享图是固定浅色版式、给外部看的图片，不跟随应用主题（计划 §3 第 21 条）。 */
-  --usage-accent-a: #3b82f6;
+  --usage-accent-a: #4263dc;
   --usage-accent-b: #8b5cf6;
-  --usage-track: oklch(0.922 0 0);
+  --usage-track: #e3e6ed;
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.145 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.145 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.985 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
+  /* 2026-10-27 实机反馈：冷石墨 + 靛蓝/紫罗兰（spec §3.1 修订）：成功/警示/故障等状态色**不**抹平成灰。 */
+  --background: #1b1c20; /* 页面/窗口背景（微冷石墨，不再纯灰） */
+  --foreground: #f0f0f0; /* 主文字 */
+  --card: #242630; /* 内容面板（一步提亮、带靛味） */
+  --card-foreground: #f0f0f0;
+  --popover: #242630;
+  --popover-foreground: #f0f0f0;
+  --primary: #8b95ff; /* 强调 / 主图线 = 靛蓝（有彩强调，替代亮银） */
+  --primary-foreground: #10121a;
+  --secondary: #1f2128; /* 输入/次级面 */
+  --secondary-foreground: #f0f0f0;
+  --muted: #1f2128;
+  --muted-foreground: #b8bcc8; /* 次文字（冷灰，微提对比） */
+  --accent: #2c2f45; /* 选中/悬停背景（靛蓝味） */
+  --accent-foreground: #f0f0f0;
   --destructive: oklch(0.396 0.141 25.723);
   --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(0.269 0 0);
-  --input: oklch(0.269 0 0);
-  --ring: oklch(0.439 0 0);
+  --border: #454854; /* 边界 */
+  --input: #4a4e5c;
+  --ring: #8b95ff;
+
+  /* 语义扩展位（与 :root 同键） */
+  --selected: #2c2f45; /* 选中背景（靛蓝味选中底） */
+  --selected-foreground: #f0f0f0;
+  --surface-secondary: #1f2128; /* 输入/次级面 */
+
+  /* 轻玻璃材质（深色档）：内侧高光降低强度，模糊半径不变 */
+  --glass-bg: color-mix(in oklab, var(--card) 86%, transparent);
+  --glass-highlight: rgba(255, 255, 255, 0.08);
+  --glass-filter: blur(12px) saturate(1.4);
 
   /* 用量图表三变量（计划② Task 4，深色档）：与 `:root` 同键、取值不同（夜间可读性）；
-   * 取色纪律与「分享图不消费」的例外见上一条注释。 */
-  --usage-accent-a: #60a5fa;
-  --usage-accent-b: #a78bfa;
-  --usage-track: oklch(0.269 0 0);
+   * 2026-10-27 实机反馈：冷石墨 + 靛蓝/紫罗兰（主图线 #8B95FF / 渐变端 #B49CFF）。
+   * 取色纪律与「分享图不消费」的例外见浅色档注释。 */
+  --usage-accent-a: #8b95ff;
+  --usage-accent-b: #b49cff;
+  --usage-track: #2c2f45;
 }
 
 @layer base {
@@ -106,11 +135,11 @@
 
 @layer utilities {
   .title-bar-btn {
-    @apply hover:bg-accent hover:text-accent-foreground flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-slate-400 transition-colors outline-none;
+    @apply hover:bg-accent hover:text-accent-foreground text-muted-foreground flex h-7 w-7 cursor-pointer items-center justify-center rounded-md transition-colors outline-none;
   }
 
   .title-bar-control {
-    @apply hover:bg-accent hover:text-accent-foreground flex h-8 w-9 cursor-pointer items-center justify-center text-slate-400 outline-none;
+    @apply hover:bg-accent hover:text-accent-foreground text-muted-foreground flex h-8 w-9 cursor-pointer items-center justify-center outline-none;
   }
 
   .scrollbar-none {
@@ -120,6 +149,61 @@
     & {
       -ms-overflow-style: none;
       scrollbar-width: none;
+    }
+  }
+}
+
+/* ── 轻玻璃（spec §3.2，Task 8 定稿材质）────────────────────────────────────
+ * 仅导航与浮层消费：WorkspaceTabs / TitleBar / Dialog / DropdownMenu 等浮层内容。
+ * 内容面板、指标卡、表格、图表一律平面，禁止挂此类（不叠加多层玻璃、
+ * 不模糊数字/曲线、无自动流光或折射动效）。
+ * 实心回退三保险：① JS 探测（use-glass-fallback → data-glass-fallback）；
+ * ② @supports 不支持 backdrop-filter；③ prefers-reduced-transparency。
+ * 减少动态效果时关闭玻璃面的装饰过渡。 ───────────────────────────────────── */
+@layer components {
+  .workspace-glass {
+    background: var(--glass-bg);
+    border-color: var(--border); /* 配合组件自备的 1px 边框（border / border-b） */
+    box-shadow: inset 0 1px 0 var(--glass-highlight);
+    -webkit-backdrop-filter: var(--glass-filter);
+    backdrop-filter: var(--glass-filter);
+  }
+
+  /* ① JS 探测命中：显式同色实心面（属性值 = 降级原因，可检验可测试） */
+  .workspace-glass[data-glass-fallback] {
+    background: var(--card);
+    box-shadow: none;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  /* ② 内核不支持背景模糊：同色实心面 */
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .workspace-glass {
+      background: var(--card);
+      box-shadow: none;
+      -webkit-backdrop-filter: none;
+      backdrop-filter: none;
+    }
+  }
+
+  /* ③ 系统要求减少透明度：同色实心面 */
+  @media (prefers-reduced-transparency: reduce) {
+    .workspace-glass {
+      background: var(--card);
+      box-shadow: none;
+      -webkit-backdrop-filter: none;
+      backdrop-filter: none;
+    }
+  }
+
+  /* 减少动态效果：关闭装饰过渡/动画（可读性与可操作性不受影响） */
+  @media (prefers-reduced-motion: reduce) {
+    .workspace-glass,
+    .workspace-glass * {
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
     }
   }
 }
