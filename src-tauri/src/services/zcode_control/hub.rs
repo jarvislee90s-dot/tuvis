@@ -797,6 +797,16 @@ pub(crate) struct CloseGuard {
     epoch: u64,
 }
 
+impl CloseGuard {
+    /// 本凭据是否仍是当前关闭窗口（锁内查 `closing == Some(self.epoch)`）。
+    ///
+    /// 只有 current 的清理任务才拥有清理权：更新的 `begin_disconnect` 一旦接管，
+    /// 旧凭据既不得清位，也不得再发 `backend.disconnect()`。
+    fn is_current(&self) -> bool {
+        lock_inner(&self.inner).closing == Some(self.epoch)
+    }
+}
+
 impl Drop for CloseGuard {
     fn drop(&mut self) {
         let mut inner = lock_inner(&self.inner);
@@ -816,6 +826,9 @@ pub struct ZcodeHub {
     inner: Arc<Mutex<Inner>>,
     /// 连接单飞：并发 `connect` 只让一个真正开始新连接，其余复用当前视图。
     connect_lock: AsyncMutex<()>,
+    /// 清理单飞：重叠关闭的 `finish_disconnect` 串行执行（后者不得越过前者的清理
+    /// 窗口；陈旧 owner 在窗口外一律零副作用）。`connect` 绝不取本锁。
+    disconnect_lock: AsyncMutex<()>,
     /// T8.2 debug 证据构建的单次验收许可册（进程内存；不落 settings/DB）。
     #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
     evidence: EvidencePermitStore,
@@ -927,6 +940,7 @@ impl ZcodeHub {
                 tracked_order: VecDeque::new(),
             })),
             connect_lock: AsyncMutex::new(()),
+            disconnect_lock: AsyncMutex::new(()),
             #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
             evidence: EvidencePermitStore::new(),
         };
@@ -1387,20 +1401,56 @@ impl ZcodeHub {
         )
     }
 
-    /// 断开第二阶段（清理，调用方不可用超时取消它）：立即断后端（取消在途 relay
-    /// connect）→ 取得 `connect_lock`（等在途 connect 收尾）→ 再断一次后端（关掉
-    /// 竞态窗口内新建立的连接）→ 持锁 Drop 关闭凭据清位。
+    /// 断开第二阶段（清理，调用方不可用超时取消它）：**按 epoch 归属**串行执行：
+    /// 取 `disconnect_lock` → 复核凭据仍是当前窗口 → 断后端（取消在途 relay
+    /// connect）→ 取 `connect_lock`（等在途 connect 收尾）→ 再次复核 → 再断一次后端
+    /// （关掉竞态窗口内新建立的连接）→ Drop 凭据清位。
+    ///
+    /// 两道 epoch 复核缺一不可：
+    /// - 进入时已过期 → 更新的关闭窗口已接管，本清理什么都不做；
+    /// - 等到 `connect_lock` 期间被更新窗口取代 → 不得再发第二次 `backend.disconnect`
+    ///   （否则会关掉新窗口清位后建立的新连接）。
+    ///
+    /// `disconnect_lock` 只在本函数内取得，`connect` 永不取它——锁序只有
+    /// `disconnect_lock → connect_lock`，无反转。
     ///
     /// `closing` 在整个清理期间为置位（见 [`Self::connect`] 与
     /// [`apply_relay_state`]）：即便新 connect 在这两次 `backend.disconnect` 之间
     /// 拿到锁，也不会真的开连接；旧 attempt 的 relay 状态也不会回写 Offline。
     ///
+    /// # 活性前提（不缩短清理、不撤回清理）
+    ///
+    /// 本函数会**等待** `backend.disconnect()` 终止：relay 的终态 `State` 在事件队列
+    /// 满时无超时地等待消费端（`relay.rs` 的 #8 有意取舍），所以
+    /// `RelayClient::disconnect` 可能长时间不返回；remote 侧的 5s 关停等待
+    /// （`ZCODE_HUB_SHUTDOWN_WAIT`）只是**等待上界**，超时不会 abort 清理任务
+    ///（任务继续在后台收尾）。因此「关闭后能否及时重连」以
+    /// `backend.disconnect()` 最终终止为前提。
+    ///
+    /// 这里**不得**加「超时就撤回清理」的兜底：撤回后旧任务仍可能在下一次
+    /// `begin_disconnect`/新连接之后发出 `backend.disconnect()`，重新引入「旧清理
+    /// 关掉新连接」的竞态。epoch 归属检查只能阻止**已被接管**的 owner 继续清理，
+    /// 不能让已经发出的 disconnect 撤回。
+    ///
     /// 本 future 被取消/panic 时，`guard` 随栈帧 Drop，按 epoch 兜底清位。
     pub(crate) async fn finish_disconnect(&self, guard: CloseGuard) {
+        // 清理单飞：重叠关闭的清理按到达顺序串行，后一个不得越过前一个的窗口。
+        let _cleanup = self.disconnect_lock.lock().await;
+        // 更新的 begin_disconnect 已接管：陈旧 owner 不得再发任何清理动作。
+        if !guard.is_current() {
+            drop(guard);
+            return;
+        }
         // 先取消在途握手：relay connect 等网络的 await 会就此收尾、释放 connect_lock。
         self.backend.disconnect().await;
         // 等在途 connect 收尾（此后再无持锁的旧代际握手）。
         let _single = self.connect_lock.lock().await;
+        // 等 connect_lock 期间可能又发生了更新的关闭（本凭据已过期）：不得再发第二次
+        // disconnect（否则会关掉新窗口清位后建立的新连接），只按 epoch 兜底 Drop。
+        if !guard.is_current() {
+            drop(guard);
+            return;
+        }
         // 关掉竞态窗口内可能已建立的连接（本 Hub 期间绝不留下 paired）。
         self.backend.disconnect().await;
         // 持锁清位：新 connect 只可能在清理完全结束后才被允许。
@@ -1867,6 +1917,9 @@ mod tests {
         authorize_calls: AtomicUsize,
         connect_calls: AtomicUsize,
         disconnect_calls: AtomicUsize,
+        /// 一次性 `disconnect()` 闸：第一次调用等待放行，后续调用立即返回
+        /// （关闭清理重叠窗口测试用）。
+        disconnect_gate: Mutex<Option<Arc<Notify>>>,
         reset_calls: AtomicUsize,
         bind_calls: AtomicUsize,
         execute_calls: AtomicUsize,
@@ -1952,7 +2005,13 @@ mod tests {
 
         fn disconnect<'a>(&'a self) -> BoxFuture<'a, ()> {
             self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
+            // 一次性：只有第一次调用取走闸并等待（后续立即返回）。
+            let gate = self.disconnect_gate.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+            })
         }
 
         fn reset<'a>(&'a self, generation: u64) -> BoxFuture<'a, ()> {
@@ -2477,6 +2536,128 @@ mod tests {
             fake.connect_calls.load(Ordering::SeqCst),
             connects_before + 1
         );
+    }
+
+    /// 重叠关闭的清理必须按 epoch 归属串行：后一个关闭完成后，较早的清理任务不得再
+    /// `backend.disconnect()` 把新连接关掉；陈旧凭据在新连接之后 finish 是零副作用。
+    #[tokio::test]
+    async fn old_cleanup_cannot_disconnect_a_newer_connection() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+
+        // 一次性闸：只有 A 的第一次 disconnect 会等待。
+        let gate = Arc::new(Notify::new());
+        fake.disconnect_gate.lock().unwrap().replace(gate.clone());
+
+        // A：begin + 异步清理，卡在第一次 disconnect。
+        let (_view_a, guard_a) = hub.begin_disconnect();
+        let task_a = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.finish_disconnect(guard_a).await })
+        };
+        wait_until(|| fake.disconnect_calls.load(Ordering::SeqCst) == 1).await;
+
+        // B：新的关闭窗口接管（后一个），其清理必须排在 A 的清理窗口之后。
+        let (_view_b, guard_b) = hub.begin_disconnect();
+        let task_b = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.finish_disconnect(guard_b).await })
+        };
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task_b.is_finished(),
+            "后一个清理不得越过前一个仍在进行的清理窗口"
+        );
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            1,
+            "后一个清理在窗口外不得发 disconnect"
+        );
+
+        // 关闭窗口内不得建立新连接（closing 仍置位）。
+        let blocked = hub.connect().await.expect_err("关闭窗口内不得建立新连接");
+        assert!(blocked.is(codes::OFFLINE));
+
+        // 放行 A 的第一次 disconnect：A 因 epoch 过期收尾，B 完成两次清理并清位。
+        gate.notify_one();
+        task_a.await.expect("A 清理任务不得 panic");
+        task_b.await.expect("B 清理任务不得 panic");
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            3,
+            "A 一次 + B 两次；陈旧 A 不得再发第二次（旧实现为 4）"
+        );
+
+        // 清理完全结束后允许新连接；旧实现里 A 的迟到第二次 disconnect 会杀掉它。
+        let view = hub.connect().await.expect("新连接必须成功");
+        assert_eq!(view.state, ConnectionState::Paired);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            3,
+            "陈旧清理不得在重连后再发 disconnect"
+        );
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::Paired,
+            "新连接不得被旧清理关掉"
+        );
+
+        // 陈旧凭据：在新连接之后 finish 是 no-op（is_current == false，零额外 disconnect）。
+        let calls_before = fake.disconnect_calls.load(Ordering::SeqCst);
+        let stale_guard = CloseGuard {
+            inner: hub.inner.clone(),
+            epoch: u64::MAX,
+        };
+        assert!(!stale_guard.is_current(), "陈旧凭据必须被识别为非当前窗口");
+        hub.finish_disconnect(stale_guard).await;
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            calls_before,
+            "陈旧凭据不得再 disconnect"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+        assert!(hub.lock().closing.is_none(), "重连后不得残留关闭窗口");
+    }
+
+    /// 真实可达的 stale owner（不是手工 epoch）：A `begin_disconnect` 后**不 poll**，
+    /// B 完整清理并清位，重连成功后，再 finish A 的真实凭据必须是零副作用 no-op。
+    #[tokio::test]
+    async fn stale_real_guard_after_newer_close_and_reconnect_is_noop() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = paired_hub(fake.clone()).await;
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+
+        let (_view_a, guard_a) = hub.begin_disconnect();
+        let (_view_b, guard_b) = hub.begin_disconnect();
+        hub.finish_disconnect(guard_b).await;
+        assert!(hub.lock().closing.is_none(), "B 清理后关闭窗口必须清位");
+        let calls_after_b = fake.disconnect_calls.load(Ordering::SeqCst);
+        assert_eq!(calls_after_b, 2, "B 只有自己的两次 disconnect");
+
+        let view = hub.connect().await.expect("B 完成后必须可以重连");
+        assert_eq!(view.state, ConnectionState::Paired);
+
+        // A 的真实凭据（从未被 poll）：重连后 finish 必须是 no-op。
+        assert!(!guard_a.is_current(), "A 的关闭窗口已被 B 取代");
+        hub.finish_disconnect(guard_a).await;
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            calls_after_b,
+            "陈旧 A 不得再发 backend.disconnect"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+        assert!(hub.lock().closing.is_none());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            fake.disconnect_calls.load(Ordering::SeqCst),
+            calls_after_b,
+            "稳定窗后也不得出现迟到清理"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
     }
 
     /// 关闭窗口内旧 attempt 的 relay 状态不得回写：begin 之后事件泵即使收到更高
