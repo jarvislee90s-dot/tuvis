@@ -273,9 +273,7 @@ impl AuthService {
     /// 注入系统凭据存储（builder；默认构造不接，测试注入 fake）。
     ///
     /// `CredentialStore` 是 crate 内部敏感类型，故本 builder 只在 crate 内可用；
-    /// 生产装配（Hub）显式注入 `OsCredentialStore`。
-    // C3 的 Hub 生产装配接线前，crate 内除测试外暂无调用方（staged，接线后移除）。
-    #[allow(dead_code)]
+    /// 生产装配（[`super::hub::PartsBackend::production`]）显式注入 `OsCredentialStore`。
     pub(crate) fn with_credential_store(mut self, store: Arc<dyn CredentialStore>) -> Self {
         self.credential_store = Some(store);
         self
@@ -513,45 +511,51 @@ impl AuthService {
         };
 
         // 4) 完成复核：epoch 已变或新 JWT 已落地（并发授权完成）→ 丢弃本次恢复。
-        let mut state = self.lock_state();
-        if state.epoch != epoch || state.jwt.is_some() {
-            return status_snapshot(&state);
+        //
+        // 决策与状态回写在同一把锁内完成，**锁在 await 之前释放**：本 future 必须
+        // `Send`（Hub 的 `BoxFuture` 端口会跨线程持有）。过期记录的持久删除放到锁外，
+        // 删除本身仍由 `delete_persisted_if_current` 复核 epoch。
+        let expired_delete_epoch = {
+            let mut state = self.lock_state();
+            if state.epoch != epoch || state.jwt.is_some() {
+                return status_snapshot(&state);
+            }
+            state.restoring = false;
+            match loaded {
+                Ok(None) => {
+                    state.remembered = false;
+                    state.problem = None;
+                    None
+                }
+                Ok(Some(record)) if jwt_is_expired(&record.jwt, now_secs()) => {
+                    // 过期持久记录：作废当前代并排队删除；不自动打开浏览器。
+                    state.jwt = None;
+                    state.jwt_epoch = None;
+                    state.provider = None;
+                    state.remembered = false;
+                    state.problem = Some(AuthProblem::Expired);
+                    state.epoch = state.epoch.wrapping_add(1);
+                    Some(state.epoch)
+                }
+                Ok(Some(record)) => {
+                    state.jwt = Some(record.jwt);
+                    state.jwt_epoch = Some(epoch);
+                    state.provider = Some(record.provider);
+                    state.remembered = true;
+                    state.problem = None;
+                    None
+                }
+                Err(error) => {
+                    state.remembered = false;
+                    state.problem = Some(AuthProblem::from_credential(error));
+                    None
+                }
+            }
+        };
+        if let Some(delete_epoch) = expired_delete_epoch {
+            let _ = self.delete_persisted_if_current(delete_epoch).await;
         }
-        state.restoring = false;
-        match loaded {
-            Ok(None) => {
-                state.remembered = false;
-                state.problem = None;
-            }
-            Ok(Some(record)) if jwt_is_expired(&record.jwt, now_secs()) => {
-                // 过期持久记录：作废当前代并排队删除；不自动打开浏览器。
-                state.jwt = None;
-                state.jwt_epoch = None;
-                state.provider = None;
-                state.remembered = false;
-                state.problem = Some(AuthProblem::Expired);
-                state.epoch = state.epoch.wrapping_add(1);
-                let delete_epoch = state.epoch;
-                drop(state);
-                let _ = self.delete_persisted_if_current(delete_epoch).await;
-                return self.status();
-            }
-            Ok(Some(record)) => {
-                state.jwt = Some(record.jwt);
-                state.jwt_epoch = Some(epoch);
-                state.provider = Some(record.provider);
-                state.remembered = true;
-                state.problem = None;
-            }
-            Err(error) => {
-                state.remembered = false;
-                state.problem = Some(AuthProblem::from_credential(error));
-            }
-        }
-        // 组快照本身不取锁；随后立即释放状态锁，避免任何后续路径重入/跨 await 持锁。
-        let status = status_snapshot(&state);
-        drop(state);
-        status
+        self.status()
     }
 
     /// 忘记授权：先清内存/取消旧 epoch 并禁用恢复，再排队删除持久记录。

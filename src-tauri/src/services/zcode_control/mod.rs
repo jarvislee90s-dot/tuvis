@@ -20,6 +20,8 @@
 //!   绝不恢复原值）；
 //! - `hub`：进程内**单实例**控制 Hub（桌面与配对手机共享一条物理连接、代际权威、
 //!   能力闸与事件广播）；
+//! - `auto_connect`：自动连接编排（单 worker；每次触发只做一次恢复 + 一次连接，
+//!   条件现查、绝不自动 OAuth；阶段 H 才补网络退避）；
 //! - `evidence`（**仅 debug 证据构建**）：T8.2 未开闸能力的单次验收许可——内存、
 //!   120 秒、一次用户动作，只放宽能力闸，不放宽目标/权限/`fullAccess` 守卫。
 //!
@@ -28,12 +30,14 @@
 pub mod action;
 pub mod audit;
 pub mod auth;
+// C3 起由 Hub 的 `start_auto_connect` 使用（单 worker、一次尝试）；不对外导出。
+mod auto_connect;
 pub mod bridge;
 pub mod codec;
 pub mod command;
 pub mod config;
-// C1 落适配口与 fake；C2 起由 AuthService 消费（保存/恢复/失效删除），故不再登记
-// staged dead_code。生产 `OsCredentialStore` 的显式注入在 C3 装配。
+// C1 落适配口与 fake；C2 由 AuthService 消费（保存/恢复/失效删除）；C3 起由
+// `PartsBackend::production` 显式注入 `OsCredentialStore`，故无 staged dead_code。
 pub(crate) mod credential_store;
 mod host;
 pub mod hub;
