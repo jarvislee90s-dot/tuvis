@@ -128,6 +128,45 @@ fn write_restore_allowed(conn: &Connection, allowed: bool) -> rusqlite::Result<(
     )
 }
 
+/// 纯编排：禁用恢复时绝不触碰原生读取；允许时读取并解析记录。
+fn load_record<F>(allowed: bool, read: F) -> StoreResult<Option<StoredCredential>>
+where
+    F: FnOnce() -> StoreResult<Option<Vec<u8>>>,
+{
+    if !allowed {
+        return Ok(None);
+    }
+    let Some(bytes) = read()? else {
+        return Ok(None);
+    };
+    decode_record(&bytes).map(Some)
+}
+
+/// 纯编排：先禁用恢复、再写原生存储、成功后才重新允许恢复。
+///
+/// 原生写失败时立即返回（恢复标记保持禁用）；enable 失败统一报
+/// `StorageFailed`——非敏感标记失败不得宣称「已记住」。
+fn save_record<D, W, E>(bytes: &[u8], disable: D, write: W, enable: E) -> StoreResult<()>
+where
+    D: FnOnce() -> StoreResult<()>,
+    W: FnOnce(&[u8]) -> StoreResult<()>,
+    E: FnOnce() -> StoreResult<()>,
+{
+    disable()?;
+    write(bytes)?;
+    enable().map_err(|_| CredentialError::StorageFailed)
+}
+
+/// 纯编排：先禁用恢复再删除；删除失败（NoEntry 已由平台层归一为成功）如实回报。
+fn delete_record<D, X>(disable: D, delete: X) -> StoreResult<()>
+where
+    D: FnOnce() -> StoreResult<()>,
+    X: FnOnce() -> StoreResult<()>,
+{
+    disable()?;
+    delete()
+}
+
 /// 生产实现：用户级系统保险箱 + settings 中的非敏感恢复标记。
 pub(crate) struct OsCredentialStore {
     prefs: DeviceStore,
@@ -153,28 +192,24 @@ impl OsCredentialStore {
 
 impl CredentialStore for OsCredentialStore {
     fn load(&self) -> StoreResult<Option<StoredCredential>> {
-        if !self.restore_allowed()? {
-            return Ok(None);
-        }
-        let Some(bytes) = native::read_secret()? else {
-            return Ok(None);
-        };
-        decode_record(&bytes).map(Some)
+        let allowed = self.restore_allowed()?;
+        load_record(allowed, native::read_secret)
     }
 
     fn save(&self, record: &StoredCredential) -> StoreResult<()> {
         // 先做纯格式校验：非法记录不得先把恢复禁用掉。
         let bytes = encode_record(record)?;
-        self.set_restore_allowed(false)?;
-        native::write_secret(&bytes)?;
-        // 只有保险箱写成功后才重新允许恢复。
-        self.set_restore_allowed(true)
+        save_record(
+            &bytes,
+            || self.set_restore_allowed(false),
+            native::write_secret,
+            || self.set_restore_allowed(true),
+        )
     }
 
     fn delete(&self) -> StoreResult<()> {
         // 先禁用恢复：删除失败也不会在重启后恢复旧条目；成功后保持禁用。
-        self.set_restore_allowed(false)?;
-        native::delete_secret()
+        delete_record(|| self.set_restore_allowed(false), native::delete_secret)
     }
 }
 
@@ -231,13 +266,22 @@ mod native {
         entry()?.set_secret(bytes).map_err(map_keyring_error)
     }
 
-    pub(super) fn delete_secret() -> StoreResult<()> {
-        let entry = keyring::Entry::new(service_name(), ACCOUNT)
-            .map_err(|_| CredentialError::DeleteFailed)?;
-        match entry.delete_credential() {
+    /// 纯映射（供单测覆盖）：NoEntry 视为已删除；存储不可访问仍报锁定/拒绝；
+    /// 其余删除错误统一 `DeleteFailed`（不泄漏原生错误）。
+    pub(super) fn classify_keyring_delete(result: Result<(), keyring::Error>) -> StoreResult<()> {
+        match result {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(keyring::Error::NoStorageAccess(_)) => Err(CredentialError::LockedOrDenied),
             Err(_) => Err(CredentialError::DeleteFailed),
         }
+    }
+
+    pub(super) fn delete_secret() -> StoreResult<()> {
+        let entry = entry().map_err(|error| match error {
+            CredentialError::LockedOrDenied => CredentialError::LockedOrDenied,
+            _ => CredentialError::DeleteFailed,
+        })?;
+        classify_keyring_delete(entry.delete_credential())
     }
 }
 
@@ -247,7 +291,7 @@ mod native {
 mod native {
     use super::{validate_blob_len, CredentialError, StoreResult, ACCOUNT, MAX_CREDENTIAL_BYTES};
     use windows::core::{Error as WinError, HRESULT, PCWSTR, PWSTR};
-    use windows::Win32::Foundation::{ERROR_NOT_FOUND, FILETIME};
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NOT_FOUND, FILETIME};
     use windows::Win32::Security::Credentials::{
         CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS,
         CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
@@ -275,6 +319,20 @@ mod native {
 
     fn is_not_found(error: &WinError) -> bool {
         error.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0)
+    }
+
+    fn is_access_denied(error: &WinError) -> bool {
+        error.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0)
+    }
+
+    /// 纯映射：条目不存在视为已删除；拒绝访问报锁定/拒绝；其余统一删除失败。
+    fn classify_windows_delete(result: windows::core::Result<()>) -> StoreResult<()> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) if is_access_denied(&error) => Err(CredentialError::LockedOrDenied),
+            Err(_) => Err(CredentialError::DeleteFailed),
+        }
     }
 
     /// `CredReadW` 返回的缓冲区必须由 `CredFree` 释放；RAII 覆盖全部早退路径。
@@ -335,10 +393,32 @@ mod native {
 
     pub(super) fn delete_secret() -> StoreResult<()> {
         let target = wide(&target_name());
-        match unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, None) } {
-            Ok(()) => Ok(()),
-            Err(error) if is_not_found(&error) => Ok(()),
-            Err(_) => Err(CredentialError::DeleteFailed),
+        classify_windows_delete(unsafe {
+            CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, None)
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 纯映射：不存在=幂等成功，拒绝访问=锁定/拒绝，其余=删除失败
+        #[test]
+        fn windows_delete_error_codes_map_per_design() {
+            let not_found = WinError::from_hresult(HRESULT::from_win32(ERROR_NOT_FOUND.0));
+            assert!(classify_windows_delete(Err(not_found)).is_ok());
+
+            let denied = WinError::from_hresult(HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+            assert_eq!(
+                classify_windows_delete(Err(denied)).unwrap_err(),
+                CredentialError::LockedOrDenied
+            );
+
+            let other = WinError::from_hresult(HRESULT::from_win32(0x1234));
+            assert_eq!(
+                classify_windows_delete(Err(other)).unwrap_err(),
+                CredentialError::DeleteFailed
+            );
         }
     }
 }
@@ -455,6 +535,7 @@ mod tests {
     use super::*;
     use crate::services::zcode_control::auth::OAuthProvider;
     use rusqlite::Connection;
+    use std::cell::RefCell;
     use std::sync::{Arc, Mutex};
 
     /// 记录型 fixture：常量取自被测实现，避免测试里手抄期望值。
@@ -508,6 +589,25 @@ mod tests {
         let unknown_provider = br#"{"schemaVersion":1,"provider":"other","jwt":"fixture.jwt"}"#;
         assert!(matches!(
             decode_record(unknown_provider),
+            Err(CredentialError::InvalidRecord)
+        ));
+
+        let unknown_schema_json = br#"{"schemaVersion":2,"provider":"zai","jwt":"fixture.jwt"}"#;
+        assert!(matches!(
+            decode_record(unknown_schema_json),
+            Err(CredentialError::InvalidRecord)
+        ));
+
+        let empty_jwt_json = br#"{"schemaVersion":1,"provider":"zai","jwt":""}"#;
+        assert!(matches!(
+            decode_record(empty_jwt_json),
+            Err(CredentialError::InvalidRecord)
+        ));
+
+        let unknown_field_json =
+            br#"{"schemaVersion":1,"provider":"zai","jwt":"fixture.jwt","extra":true}"#;
+        assert!(matches!(
+            decode_record(unknown_field_json),
             Err(CredentialError::InvalidRecord)
         ));
 
@@ -584,15 +684,174 @@ mod tests {
         assert!(read_restore_allowed(&broken).is_err(), "表缺失必须报错");
     }
 
-    /// 禁用恢复时 load 直接 None，不访问原生保险箱
+    /// 禁用恢复时 load 绝不触碰原生读取（read 闭包执行即 panic），只返回 None
     #[test]
-    fn disabled_restore_skips_native_store() {
-        let prefs = prefs();
-        prefs
-            .with(|conn| write_restore_allowed(conn, false))
-            .unwrap();
-        let store = OsCredentialStore::new(prefs);
-        assert!(store.load().unwrap().is_none());
+    fn load_record_skips_native_read_when_restore_disabled() {
+        let result = load_record(false, || {
+            panic!("restore disabled: native read must not run")
+        });
+        assert!(result.unwrap().is_none());
+    }
+
+    /// 允许恢复时读取并解析记录；无条目=None，原生错误/坏记录原样回报
+    #[test]
+    fn load_record_reads_and_decodes_when_allowed() {
+        let bytes = encode_record(&fixture(OAuthProvider::Bigmodel)).unwrap();
+        let record = load_record(true, || Ok(Some(bytes))).unwrap().unwrap();
+        assert!(record.provider == OAuthProvider::Bigmodel);
+        assert!(load_record(true, || Ok(None)).unwrap().is_none());
+        assert!(matches!(
+            load_record(true, || Err(CredentialError::LockedOrDenied)),
+            Err(CredentialError::LockedOrDenied)
+        ));
+        assert!(matches!(
+            load_record(true, || Ok(Some(b"not-json".to_vec()))),
+            Err(CredentialError::InvalidRecord)
+        ));
+    }
+
+    /// save 纯编排顺序：disable → native write → enable
+    #[test]
+    fn save_record_orders_disable_write_enable() {
+        let log = RefCell::new(Vec::new());
+        let bytes = encode_record(&fixture(OAuthProvider::Bigmodel)).unwrap();
+        let result = save_record(
+            &bytes,
+            || {
+                log.borrow_mut().push("disable");
+                Ok(())
+            },
+            |seen| {
+                assert!(seen == bytes.as_slice(), "写入的 bytes 必须原样传给原生层");
+                log.borrow_mut().push("write");
+                Ok(())
+            },
+            || {
+                log.borrow_mut().push("enable");
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(*log.borrow(), vec!["disable", "write", "enable"]);
+    }
+
+    /// 原生写失败：不得 enable，恢复标记保持禁用
+    #[test]
+    fn save_record_keeps_restore_disabled_when_native_write_fails() {
+        let log = RefCell::new(Vec::new());
+        let result = save_record(
+            b"secret-bytes",
+            || {
+                log.borrow_mut().push("disable");
+                Ok(())
+            },
+            |_| {
+                log.borrow_mut().push("write");
+                Err(CredentialError::StorageFailed)
+            },
+            || {
+                log.borrow_mut().push("enable");
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), CredentialError::StorageFailed);
+        assert_eq!(*log.borrow(), vec!["disable", "write"]);
+    }
+
+    /// disable 标记失败：绝不触碰原生写
+    #[test]
+    fn save_record_stops_before_native_when_disable_fails() {
+        let log = RefCell::new(Vec::new());
+        let result = save_record(
+            b"secret-bytes",
+            || {
+                log.borrow_mut().push("disable");
+                Err(CredentialError::StorageFailed)
+            },
+            |_| {
+                log.borrow_mut().push("write");
+                Ok(())
+            },
+            || {
+                log.borrow_mut().push("enable");
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), CredentialError::StorageFailed);
+        assert_eq!(*log.borrow(), vec!["disable"]);
+    }
+
+    /// enable 标记失败统一报 StorageFailed（不宣称已记住）
+    #[test]
+    fn save_record_reports_storage_failure_when_enable_fails() {
+        let log = RefCell::new(Vec::new());
+        let result = save_record(
+            b"secret-bytes",
+            || {
+                log.borrow_mut().push("disable");
+                Ok(())
+            },
+            |_| {
+                log.borrow_mut().push("write");
+                Ok(())
+            },
+            || {
+                log.borrow_mut().push("enable");
+                Err(CredentialError::Unavailable)
+            },
+        );
+        assert_eq!(result.unwrap_err(), CredentialError::StorageFailed);
+        assert_eq!(*log.borrow(), vec!["disable", "write", "enable"]);
+    }
+
+    /// delete 纯编排顺序：disable → delete（NoEntry 已由平台层归一成功）
+    #[test]
+    fn delete_record_orders_disable_then_delete() {
+        let log = RefCell::new(Vec::new());
+        let result = delete_record(
+            || {
+                log.borrow_mut().push("disable");
+                Ok(())
+            },
+            || {
+                log.borrow_mut().push("delete");
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(*log.borrow(), vec!["disable", "delete"]);
+    }
+
+    /// disable 失败不删除；删除失败原样回报
+    #[test]
+    fn delete_record_failure_paths() {
+        let log = RefCell::new(Vec::new());
+        let disabled = delete_record(
+            || {
+                log.borrow_mut().push("disable");
+                Err(CredentialError::StorageFailed)
+            },
+            || {
+                log.borrow_mut().push("delete");
+                Ok(())
+            },
+        );
+        assert_eq!(disabled.unwrap_err(), CredentialError::StorageFailed);
+        assert_eq!(*log.borrow(), vec!["disable"]);
+
+        let log = RefCell::new(Vec::new());
+        let failed = delete_record(
+            || {
+                log.borrow_mut().push("disable");
+                Ok(())
+            },
+            || {
+                log.borrow_mut().push("delete");
+                Err(CredentialError::DeleteFailed)
+            },
+        );
+        assert_eq!(failed.unwrap_err(), CredentialError::DeleteFailed);
+        assert_eq!(*log.borrow(), vec!["disable", "delete"]);
     }
 
     /// 标记读取失败必须报 StorageFailed，不能伪装成「未记住」
@@ -647,5 +906,79 @@ mod tests {
             native::classify_keyring_load(Err(bad)),
             Err(CredentialError::InvalidRecord)
         ));
+    }
+
+    /// keyring 删除：NoEntry=幂等成功；NoStorageAccess=锁定/拒绝；其余=删除失败
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn keyring_delete_maps_no_entry_and_denial() {
+        assert!(native::classify_keyring_delete(Ok(())).is_ok());
+        assert!(native::classify_keyring_delete(Err(keyring::Error::NoEntry)).is_ok());
+
+        let denied =
+            keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("fixture-locked")));
+        assert_eq!(
+            native::classify_keyring_delete(Err(denied)).unwrap_err(),
+            CredentialError::LockedOrDenied
+        );
+
+        let platform =
+            keyring::Error::PlatformFailure(Box::new(std::io::Error::other("fixture-platform")));
+        assert_eq!(
+            native::classify_keyring_delete(Err(platform)).unwrap_err(),
+            CredentialError::DeleteFailed
+        );
+
+        let invalid = keyring::Error::Invalid("secret".into(), "fixture".into());
+        assert_eq!(
+            native::classify_keyring_delete(Err(invalid)).unwrap_err(),
+            CredentialError::DeleteFailed
+        );
+    }
+
+    /// keyring 其余读取错误：TooLong/PlatformFailure/Invalid/Ambiguous
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn keyring_load_maps_remaining_errors() {
+        let too_long = keyring::Error::TooLong("secret".into(), 100);
+        assert_eq!(
+            native::classify_keyring_load(Err(too_long)).unwrap_err(),
+            CredentialError::TooLarge
+        );
+
+        let platform =
+            keyring::Error::PlatformFailure(Box::new(std::io::Error::other("fixture-platform")));
+        assert_eq!(
+            native::classify_keyring_load(Err(platform)).unwrap_err(),
+            CredentialError::Unavailable
+        );
+
+        let invalid = keyring::Error::Invalid("secret".into(), "fixture".into());
+        assert_eq!(
+            native::classify_keyring_load(Err(invalid)).unwrap_err(),
+            CredentialError::InvalidRecord
+        );
+
+        struct DummyCredential;
+        impl keyring::credential::CredentialApi for DummyCredential {
+            fn set_secret(&self, _secret: &[u8]) -> keyring::Result<()> {
+                Ok(())
+            }
+            fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+                Ok(Vec::new())
+            }
+            fn delete_credential(&self) -> keyring::Result<()> {
+                Ok(())
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let ambiguous =
+            keyring::Error::Ambiguous(vec![Box::new(DummyCredential) as Box<keyring::Credential>]);
+        assert_eq!(
+            native::classify_keyring_load(Err(ambiguous)).unwrap_err(),
+            CredentialError::InvalidRecord
+        );
     }
 }
