@@ -907,3 +907,37 @@ ack-only 或新鲜快照确认。`model` / `thoughtLevel` 由 §8.7 补全为 tr
    失效/互踢未跑前，整批只能标“部分实现/能力受限”，不得称 `spec_complete`。
 6. **边界**：本记录与验收报告不改 `docs/MASTER-PLAN.md`；不 push、不合并、不打 tag、
    不发版；未开放任何生产能力，普通构建八项控制能力仍全部 `enabled=false`。
+
+### 8.12 凭据持久化分界（2026-10-27，凭据复用批次）
+
+> 本节为**追加段**，不改写 §7.6 / §8.11 的历史口径：旧探针与旧 run 的
+> 「账号 JWT 仅内存、进程退出即弃」仍是其当时实现与取证事实，旧 run 记录原样保留；
+> 本批生产装配改用方案 A（系统保险箱持久化 + 重启恢复）。
+
+1. **旧探针仅内存（历史保留）**：B1–B4 的 `scripts/zcode-bridge-probe` 与旧产品构建
+   只把账号 JWT 放在进程内存，进程退出即弃；当时「不落 OS keychain（后续单列评估）」
+   的结论只适用于该实现与取证批次。历史报告、run id 与合同原文不追改。
+2. **本批生产采用方案 A**：OAuth 成功后账号 JWT 经 `CredentialStore` 写入系统凭据
+   保险箱（macOS Keychain / Windows Credential Manager / Linux Secret Service），
+   单条目 `{schemaVersion, provider, jwt}`；启动时 `restore` 只读该记录，不打开浏览器、
+   不自动 OAuth。terminal token 仍每次连接现取、仅内存、用后即弃，不持久化。
+3. **首次升级需授权一次**：旧版本没有持久记录，升级后第一次启动只会得到
+   「无记录 → 需要授权」；用户完成一次官方授权后 JWT 才落保险箱，后续进程重启
+   自动恢复，不再要求重新授权（过期/撤销/忘记除外）。这不是回退，而是首次迁移的
+   预期行为，用户手册与更新日志同批说明。
+4. **断开与忘记的区别**：`disconnect_requested` 持久写 `auto=false` 但**保留**凭据与
+   链接；`forget_authorization` 持久写 `auto=false`、**删除**凭据、**保留**链接。
+   换/删链接只断连接、保留账号（不重新 OAuth）；删除失败（`delete_failed`）与保存
+   失败（`storage_failed`）如实上报，不假报已删除/已记住。
+5. **JWT 边界**：仅系统保险箱 + `AuthService` 受控内存；不写 settings/SQLite/文件，
+   不进日志/错误文本/IPC/手机响应；手机只读 `AuthStatus`（authorized/remembered/
+   restoring/provider/problem），**永远不拿 JWT 或 terminal token**。本地回环 HTML
+   与设置页也不展示 JWT；探针证据只见别名与掩码。
+6. **合同夹具同步**：`tests/fixtures/zcode-official-bridge/contract.json` 的
+   `auth.credentialPersistence` 同批注明「旧探针仅内存 / 本批生产采用 A」，并保留
+   旧 run 历史；`generatedBy` 不重写，只追加本次分界说明，避免把新裁决冒充旧证据。
+7. **自动化与平台边界**：本批 `wire_e2e` 用共享 fake 持久存储 + 重新构造
+   AuthService/Hub 证明「OAuth 一次、恢复后重新取 terminal token/WS、断开与忘记后
+   重启零上游、恢复不放开能力闸」；真实 Keychain/Credential Manager/Secret Service、
+   真实 OAuth 与真实进程重启仍需 macOS/Windows/Linux 各自实机验收，未跑行保持
+   `awaiting_platform_validation` / `not_run`，不以 fake 结果标 PASS。

@@ -15,6 +15,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use axum::extract::State;
     use axum::http::StatusCode;
     use axum::routing::post;
     use axum::{Json, Router};
@@ -27,7 +28,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::super::auth::{
-        AuthService, OAuthProvider, OpenAuthorize, OAUTH_TOKEN_PATH, RELAY_TOKEN_PATH,
+        AuthService, AuthStatus, OAuthProvider, OpenAuthorize, OAUTH_TOKEN_PATH, RELAY_TOKEN_PATH,
     };
     use super::super::bridge::{
         BridgeManager, BridgeTiming, AGENT_CLIENT_HELLO_METHOD, AGENT_HELLO_METHOD,
@@ -41,12 +42,14 @@ mod tests {
     };
     use super::super::command::{AGENT_SEND_COMMAND_METHOD, SEND_TEXT_TYPE};
     use super::super::config::set_config;
+    use super::super::credential_store::MemoryCredentialStore;
     use super::super::hub::{HubBackend, PartsBackend, ZcodeHub};
     use super::super::projection::CONVERSATION_TOPIC_PREFIX;
     use super::super::relay::{DeviceRoute, RelayClient, RelayEvent};
     use super::super::types::{
         codes, CapabilityFlag, CapabilityView, ConnectionState, TargetKey, ZResult,
     };
+    use crate::database::dao::settings::try_set_setting_conn;
     use crate::database::{migration, schema};
     use crate::inject::capability::new_table;
     use crate::inject::engine::Injector;
@@ -54,6 +57,7 @@ mod tests {
     use crate::remote::pairing::{persist_device, DeviceStore, NewDevice};
     use crate::remote::pin::PinRateLimiter;
     use crate::remote::server::{router, CreateTaskHub, RemoteState, SseRegistry};
+    use crate::remote::KEY_ENABLED;
     use crate::session::{AgentType, ProcessForm, Session, SessionStatus, SessionsResponse};
 
     /// 合成账号 JWT：`header.payload.sig`，payload = `{"exp":9999999999}`（base64url）。
@@ -63,17 +67,30 @@ mod tests {
     /// 终端 token 有效期（秒）。
     const SYNTHETIC_EXPIRES_IN: u64 = 60;
 
+    /// 回环假官方端计数：OAuth 交换与 terminal token 各请求过几次。
+    ///
+    /// 凭据复用验收只看**真实生产路径实际发出的请求**，不靠测试侧自记；
+    /// 计数器由假端点自身在进入处理函数时递增。
+    #[derive(Clone, Default)]
+    struct FakeCounters {
+        oauth_exchanges: Arc<AtomicUsize>,
+        terminal_token_requests: Arc<AtomicUsize>,
+    }
+
     /// 回环假官方端：生命周期跟随测试（Drop 即中止 serve 任务）。
     struct FakeOfficialHttp {
         origin: String,
+        counters: FakeCounters,
         task: tokio::task::JoinHandle<()>,
     }
 
     impl FakeOfficialHttp {
         async fn start() -> Self {
+            let counters = FakeCounters::default();
             let app = Router::new()
                 .route(OAUTH_TOKEN_PATH, post(oauth_token))
-                .route(RELAY_TOKEN_PATH, post(terminal_token));
+                .route(RELAY_TOKEN_PATH, post(terminal_token))
+                .with_state(counters.clone());
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
                 .await
                 .expect("回环端口应可绑定");
@@ -83,8 +100,19 @@ mod tests {
             });
             Self {
                 origin: format!("http://127.0.0.1:{port}"),
+                counters,
                 task,
             }
+        }
+
+        /// 已到达 `POST /api/v1/oauth/token` 的交换次数（重启后仍应保持 1）。
+        fn oauth_exchanges(&self) -> usize {
+            self.counters.oauth_exchanges.load(Ordering::SeqCst)
+        }
+
+        /// 已到达 `POST /api/v1/remote/token` 的请求次数（每次连接现取一次）。
+        fn terminal_token_requests(&self) -> usize {
+            self.counters.terminal_token_requests.load(Ordering::SeqCst)
         }
     }
 
@@ -94,13 +122,18 @@ mod tests {
         }
     }
 
-    /// `POST /api/v1/oauth/token`：只回 `data.token`（账号 JWT）。
-    async fn oauth_token() -> Json<serde_json::Value> {
+    /// `POST /api/v1/oauth/token`：只回 `data.token`（账号 JWT），并记录一次真实交换。
+    async fn oauth_token(State(counters): State<FakeCounters>) -> Json<serde_json::Value> {
+        counters.oauth_exchanges.fetch_add(1, Ordering::SeqCst);
         Json(serde_json::json!({ "data": { "token": SYNTHETIC_JWT } }))
     }
 
-    /// `POST /api/v1/remote/token`：只回 `data.token` 与正整数 `data.expires_in`。
-    async fn terminal_token() -> Json<serde_json::Value> {
+    /// `POST /api/v1/remote/token`：只回 `data.token` 与正整数 `data.expires_in`，
+    /// 并记录一次真实 terminal token 请求。
+    async fn terminal_token(State(counters): State<FakeCounters>) -> Json<serde_json::Value> {
+        counters
+            .terminal_token_requests
+            .fetch_add(1, Ordering::SeqCst);
         Json(serde_json::json!({
             "data": { "token": SYNTHETIC_TERMINAL_TOKEN, "expires_in": SYNTHETIC_EXPIRES_IN },
         }))
@@ -698,6 +731,14 @@ mod tests {
         }
     }
 
+    /// 回环测试 HTTP 客户端：显式禁用系统代理（macOS 系统代理会把 127.0.0.1 也转发出去）。
+    fn loopback_http() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("测试 HTTP 客户端")
+    }
+
     /// 走一次完整回环授权（BigModel 通道），返回已持有内存 JWT 的 `AuthService`。
     ///
     /// `open` 只做「交给系统浏览器」的替身：从授权 URL 解析回环 redirect 与 state，
@@ -706,11 +747,22 @@ mod tests {
         fake: &FakeOfficialHttp,
         http: &reqwest::Client,
     ) -> Arc<AuthService> {
-        let auth = Arc::new(AuthService::with_endpoints(
-            http.clone(),
-            fake.origin.clone(),
-            fake.origin.clone(),
-        ));
+        authorized_service_with_store(fake, http, None).await
+    }
+
+    /// 同上，但授权成功的 JWT 会经 `store` 持久化（凭据复用用例的唯一差异点）：
+    /// 生产 `AuthService` 在 `authorize` 成功后写系统存储，恢复时不再走 OAuth。
+    async fn authorized_service_with_store(
+        fake: &FakeOfficialHttp,
+        http: &reqwest::Client,
+        store: Option<Arc<MemoryCredentialStore>>,
+    ) -> Arc<AuthService> {
+        let mut service =
+            AuthService::with_endpoints(http.clone(), fake.origin.clone(), fake.origin.clone());
+        if let Some(store) = store {
+            service = service.with_credential_store(store);
+        }
+        let auth = Arc::new(service);
         let open: OpenAuthorize = Arc::new({
             let http = http.clone();
             move |url: String| -> ZResult<()> {
@@ -1438,6 +1490,104 @@ mod tests {
         hub
     }
 
+    /// 「整进程重启」共享世界：同一个回环假官方、同一个 WS 假体、同一个合成库、
+    /// 同一个 fake 系统凭据存储。每次模拟新进程只**重新构造** `AuthService`/`ZcodeHub`，
+    /// 绝不复用已授权的 AuthService，也不用 `mark_authorized_for_test` 冒充恢复。
+    struct PersistentWorld {
+        fake: FakeOfficialHttp,
+        ws: FakeWsHandshake,
+        conn: SharedConn,
+        vault: Arc<MemoryCredentialStore>,
+    }
+
+    impl PersistentWorld {
+        async fn start() -> Self {
+            let fake = FakeOfficialHttp::start().await;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("回环 WS 端口应可绑定");
+            let ws = spawn_ws_handshake(listener);
+            let conn = shared_conn();
+            seed(&conn);
+            // 自动连接门：远程总开关开启 + 链接已保存（auto 意图缺键 = true）。
+            DeviceStore::Owned(conn.clone()).with(|c| {
+                try_set_setting_conn(c, KEY_ENABLED, "true").expect("开启远程总开关");
+            });
+            Self {
+                fake,
+                ws,
+                conn,
+                vault: Arc::new(MemoryCredentialStore::new()),
+            }
+        }
+
+        fn store(&self) -> DeviceStore {
+            DeviceStore::Owned(self.conn.clone())
+        }
+
+        /// 新进程的 AuthService：只共享 fake 系统存储，不共享内存 JWT/epoch/取消态。
+        fn new_auth(&self) -> Arc<AuthService> {
+            let auth = AuthService::with_endpoints(
+                loopback_http(),
+                self.fake.origin.clone(),
+                self.fake.origin.clone(),
+            )
+            .with_credential_store(self.vault.clone());
+            Arc::new(auth)
+        }
+
+        /// 新进程的 Hub：真实生产组件（Relay/Bridge/CommandSender + 事件泵），
+        /// 只把回环端点注入 relay；不使用 `mark_authorized_for_test`。
+        fn new_hub(&self, auth: Arc<AuthService>, policy: CapabilityView) -> Arc<ZcodeHub> {
+            let (parts, events, lag) =
+                PartsBackend::production_test(self.store(), auth, self.ws.origin.clone());
+            let bridge = parts.pump_bridge();
+            let backend: Arc<dyn HubBackend> = Arc::new(parts);
+            Arc::new(ZcodeHub::with_pump_and_lag(
+                self.store(),
+                backend,
+                policy,
+                events,
+                bridge,
+                lag,
+            ))
+        }
+
+        /// 首次进程：真实回环 OAuth 恰一次（JWT 落 fake 持久存储）→ 既有自动连接 worker。
+        async fn oauth_and_auto_connect(
+            &self,
+            policy: CapabilityView,
+        ) -> (Arc<AuthService>, Arc<ZcodeHub>) {
+            let auth = authorized_service_with_store(
+                &self.fake,
+                &loopback_http(),
+                Some(self.vault.clone()),
+            )
+            .await;
+            let hub = self.new_hub(auth.clone(), policy);
+            hub.start_auto_connect();
+            wait_paired(&hub).await;
+            (auth, hub)
+        }
+
+        /// 重启后的进程：先做启动恢复（读 fake 持久存储，绝不 OAuth），再启动自动连接。
+        async fn restart(
+            &self,
+            policy: CapabilityView,
+        ) -> (AuthStatus, Arc<AuthService>, Arc<ZcodeHub>) {
+            let auth = self.new_auth();
+            let hub = self.new_hub(auth.clone(), policy);
+            let status = hub.restore_authorization().await;
+            hub.start_auto_connect();
+            (status, auth, hub)
+        }
+    }
+
+    /// 等到自动连接 worker 把真实回环 relay 配对完成。
+    async fn wait_paired(hub: &ZcodeHub) {
+        wait_until(|| hub.connection().state == ConnectionState::Paired).await;
+    }
+
     /// 经移动端真实 `GET /zcode/session` 触发 bind/订阅，并等到投影就绪。
     ///
     /// 不手工 bind、不手推快照：就绪只来自假体在订阅 ACK 后推送的真实会话快照。
@@ -1736,5 +1886,258 @@ mod tests {
         assert_eq!(ledger_rows(&chain.store), 0, "未派发不得起账");
         assert_eq!(audit_rows(&chain.store, "zcode_send", "started"), 0);
         assert_eq!(audit_rows(&chain.store, "zcode_send", "accepted"), 0);
+    }
+
+    /// 整进程重启：第一次 OAuth + 自动连接后**丢弃**旧 AuthService/Hub，新进程只
+    /// 重新构造 AuthService/Hub 并从共享 fake 系统存储恢复 → 第二次 terminal token /
+    /// WS 配对；OAuth 交换仍只有第一次那一次（不二次授权）。
+    #[tokio::test]
+    async fn whole_new_process_state_reuses_vault_without_oauth() {
+        let world = PersistentWorld::start().await;
+        let (auth, hub) = world.oauth_and_auto_connect(send_policy()).await;
+        assert_eq!(world.fake.oauth_exchanges(), 1, "首次 OAuth 交换必须恰一次");
+        assert_eq!(
+            world.fake.terminal_token_requests(),
+            1,
+            "首次自动连接现取一次 terminal token"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+        assert_eq!(
+            world.vault.stored().expect("授权 JWT 已落 fake 存储").jwt,
+            SYNTHETIC_JWT,
+            "持久记录必须来自真实授权交换"
+        );
+        let first_hub_generation = hub.connection().generation;
+
+        // 进程退出：显式断开旧连接（保留账号），再丢弃旧 AuthService/Hub。
+        let closed = hub.disconnect().await;
+        assert_eq!(closed.state, ConnectionState::Offline);
+        drop(hub);
+        drop(auth);
+
+        // 新进程：全新的 AuthService（无内存 JWT）+ 全新 Hub，只共享 fake 持久存储。
+        let fresh_auth = world.new_auth();
+        assert!(
+            !fresh_auth.status().authorized,
+            "新建 AuthService 不得携带旧进程的内存授权"
+        );
+        let fresh_hub = world.new_hub(fresh_auth.clone(), send_policy());
+        let restored = fresh_hub.restore_authorization().await;
+        assert!(restored.authorized, "启动恢复必须从持久存储取回授权");
+        fresh_hub.start_auto_connect();
+        wait_paired(&fresh_hub).await;
+
+        let oauth_exchanges_after_second_hub = world.fake.oauth_exchanges();
+        let terminal_token_requests_after_second_hub = world.fake.terminal_token_requests();
+        assert_eq!(
+            oauth_exchanges_after_second_hub, 1,
+            "恢复路径绝不二次 OAuth"
+        );
+        assert_eq!(
+            terminal_token_requests_after_second_hub, 2,
+            "第二次连接必须重新现取 terminal token"
+        );
+        assert_eq!(
+            fresh_hub.connection().state,
+            ConnectionState::Paired,
+            "新进程必须用恢复的身份重新配对"
+        );
+        assert!(
+            fresh_hub.connection().generation >= first_hub_generation,
+            "新 Hub 是独立生命周期"
+        );
+        assert_eq!(world.vault.save_count(), 1, "全程只允许一次授权落库");
+        assert_eq!(world.vault.load_count(), 1, "恢复必须恰好读一次持久记录");
+        assert_eq!(
+            world.ws.accepted(),
+            2,
+            "每个进程各建立一条 relay 连接（旧连接已断开）"
+        );
+    }
+
+    /// 恢复授权后能力矩阵仍按生产默认全关（宿主证据门），send 依旧 409 且零上游帧。
+    #[tokio::test]
+    async fn default_closed_capabilities_remain_closed_after_restore() {
+        let world = PersistentWorld::start().await;
+        let (auth, hub) = world
+            .oauth_and_auto_connect(CapabilityView::default())
+            .await;
+        hub.disconnect().await;
+        drop(hub);
+        drop(auth);
+
+        let (status, _fresh_auth, second_hub) = world.restart(CapabilityView::default()).await;
+        assert!(status.authorized, "重启后应已从持久存储恢复授权");
+        wait_paired(&second_hub).await;
+        let app = router(remote_state(
+            &world.conn,
+            second_hub.clone(),
+            Arc::new(RecordingInjector::default()),
+        ));
+        let second_session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+
+        for capability in [
+            "send",
+            "singleSelect",
+            "multiSelect",
+            "freeText",
+            "interrupt",
+            "approvalReply",
+            "model",
+            "thoughtLevel",
+        ] {
+            assert_eq!(
+                second_session["capabilities"][capability]["enabled"], false,
+                "恢复后 {capability} 仍必须默认关闭：{second_session}"
+            );
+            assert_eq!(
+                second_session["capabilities"][capability]["reasonCode"],
+                codes::NEEDS_EVIDENCE,
+                "默认关闭必须给出 needs_evidence 原因：{second_session}"
+            );
+        }
+
+        // 证据门：即使已恢复并配对，默认关闭的 send 仍不得下发上游业务命令。
+        let generation = second_hub.connection().generation;
+        // 只比较**上游请求**：`rpc-frame-ack` 是假体对先前订阅的应答，可能晚一拍落日志，
+        // 它不是 send 触发的请求；任何新请求（bind/订阅/命令）才算回归。
+        let upstream_requests = |log: &[String]| {
+            log.iter()
+                .filter(|method| method.as_str() != "rpc-frame-ack")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let upstream_before_send = upstream_requests(&world.ws.log());
+        let (http_status, body) = post_action(
+            &app,
+            &send_body(
+                "act-restored-closed-1",
+                generation,
+                "恢复后默认关闭的合成正文",
+            ),
+        )
+        .await;
+        assert_eq!(
+            http_status,
+            StatusCode::CONFLICT,
+            "恢复不得放宽能力闸：{body}"
+        );
+        assert_eq!(body["error"], codes::NEEDS_EVIDENCE);
+        assert_eq!(world.ws.commands().len(), 0, "默认关闭时零业务命令帧");
+        assert_eq!(
+            upstream_requests(&world.ws.log()),
+            upstream_before_send,
+            "能力闸必须在 bind 前拒绝：零新增上游请求（bind/订阅/业务帧）"
+        );
+    }
+
+    /// 用户断开（持久 auto=false）或忘记授权后重启：新进程零 WS、零 terminal token。
+    #[tokio::test]
+    async fn paused_or_forgotten_restart_has_zero_upstream() {
+        // ---- 1) 用户主动断开：保留凭据，但重启后不得自动连接 ----
+        let paused_world = PersistentWorld::start().await;
+        let (paused_auth, paused_hub) = paused_world.oauth_and_auto_connect(send_policy()).await;
+        let paused_view = paused_hub
+            .disconnect_requested()
+            .await
+            .expect("用户断开必须持久化 auto=false");
+        assert_eq!(paused_view.state, ConnectionState::Offline);
+        assert_eq!(
+            paused_world.vault.stored().map(|record| record.jwt),
+            Some(SYNTHETIC_JWT.to_owned()),
+            "断开不清账号 JWT"
+        );
+        drop(paused_hub);
+        drop(paused_auth);
+        let paused_ws_before_restart = paused_world.ws.accepted();
+        let paused_tokens_before_restart = paused_world.fake.terminal_token_requests();
+
+        let (paused_status, _paused_auth, paused_restarted) =
+            paused_world.restart(send_policy()).await;
+        assert!(
+            paused_status.authorized,
+            "重启恢复仍应看到已保存的授权（只是不自动连接）"
+        );
+        wait_until(|| paused_restarted.auto_attempt_count() >= 1).await;
+        // 观察窗：给 worker 足够时间证明它**不会**在 gate 失败后仍发起连接。
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let paused_restart_ws = paused_world.ws.accepted() - paused_ws_before_restart;
+        let paused_restart_tokens =
+            paused_world.fake.terminal_token_requests() - paused_tokens_before_restart;
+        assert_eq!(paused_restart_ws, 0, "断开关机后重启不得新开 WS");
+        assert_eq!(
+            paused_restart_tokens, 0,
+            "断开关机后重启不得请求 terminal token"
+        );
+
+        // ---- 2) 忘记授权：删除持久记录，重启后既不连接也不恢复 ----
+        let forgotten_world = PersistentWorld::start().await;
+        let (forgotten_auth, forgotten_hub) =
+            forgotten_world.oauth_and_auto_connect(send_policy()).await;
+        let forgotten_view = forgotten_hub
+            .forget_authorization()
+            .await
+            .expect("忘记授权必须成功");
+        assert_eq!(forgotten_view.state, ConnectionState::NeedsAuth);
+        assert!(
+            forgotten_world.vault.stored().is_none(),
+            "忘记必须删除持久记录"
+        );
+        drop(forgotten_hub);
+        drop(forgotten_auth);
+        let forgotten_ws_before_restart = forgotten_world.ws.accepted();
+        let forgotten_tokens_before_restart = forgotten_world.fake.terminal_token_requests();
+
+        let (forgotten_status, _forgotten_auth, forgotten_restarted) =
+            forgotten_world.restart(send_policy()).await;
+        assert!(!forgotten_status.authorized, "忘记后重启不得恢复授权");
+        wait_until(|| forgotten_restarted.auto_attempt_count() >= 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let forgotten_restart_ws = forgotten_world.ws.accepted() - forgotten_ws_before_restart;
+        let forgotten_restart_tokens =
+            forgotten_world.fake.terminal_token_requests() - forgotten_tokens_before_restart;
+        assert_eq!(forgotten_restart_ws, 0, "忘记后重启不得新开 WS");
+        assert_eq!(
+            forgotten_restart_tokens, 0,
+            "忘记后重启不得请求 terminal token"
+        );
+        assert_eq!(
+            forgotten_world.vault.load_count(),
+            1,
+            "重启只读一次已删除的持久记录，绝不重新保存"
+        );
+        assert_eq!(
+            forgotten_world.vault.save_count(),
+            1,
+            "忘记后不得有新的授权落库"
+        );
+    }
+
+    /// 自动连接只负责配对：整条链零业务命令帧、零账本行、零终端注入。
+    #[tokio::test]
+    async fn auto_connection_only_never_dispatches_messages() {
+        let world = PersistentWorld::start().await;
+        let (_auth, hub) = world.oauth_and_auto_connect(send_policy()).await;
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+        // 观察窗：配对完成后再等一会儿，证明没有任何“自动补发/自动动作”。
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let all_business_command_frames = world.ws.commands().len();
+        assert_eq!(
+            all_business_command_frames, 0,
+            "自动连接不得派发任何业务命令帧"
+        );
+        assert!(
+            !world
+                .ws
+                .log()
+                .iter()
+                .any(|method| method == AGENT_SEND_COMMAND_METHOD),
+            "自动连接日志不得出现 sendConversationCommandV4：{:?}",
+            world.ws.log()
+        );
+        assert_eq!(ledger_rows(&world.store()), 0, "自动连接不得起动作账");
+        assert_eq!(audit_rows(&world.store(), "zcode_send", "started"), 0);
+        assert_eq!(audit_rows(&world.store(), "zcode_send", "accepted"), 0);
     }
 }

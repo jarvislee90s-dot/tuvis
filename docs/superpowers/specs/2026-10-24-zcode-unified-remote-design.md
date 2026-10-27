@@ -211,3 +211,55 @@ Codex 兼容发送的“偏好开启”与“当前可用”分开：保留 read
 - 2026-10-24 Mac P0-R 追踪的 APP host、官方 relay／RPC 及客户端范围；Windows 运行结果仅覆盖其已列边界。
 - [旧 H3 默认关／ZCode yolo 裁决](2026-09-27-phase2-closure-app-injection-design.md#2-裁决记录2026-09-27-对齐--2026-10-04-裁决门落档补裁--2026-10-05-复审裁决与补裁实施不得重议)。
 - [MDN 同源策略](https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Same-origin_policy)；[iframe 嵌入祖先限制](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/frame-ancestors)。不据此臆断 ZCode 当前实际 CSP，只说明嵌入不是自动获得控制权限。
+
+## 10. 追加裁决：ZCode 授权凭据持久化（2026-10-27，本批）
+
+本节覆盖 §5.2「官方凭据只留本机受保护存储」中此前未封版的落点，只规定账号 JWT 的保存与恢复；
+不改官方协议、不改读取链、不改能力闸，也不改 `docs/MASTER-PLAN.md`。
+
+### 10.1 方案 A：账号 JWT 落系统保险箱，进程重启后恢复
+
+| 项 | 裁决 |
+| --- | --- |
+| 保存位置 | **系统凭据保险箱**（macOS Keychain / Windows Credential Manager / Linux Secret Service）；单条目、单账号，不落 settings、SQLite、文件或浏览器存储 |
+| 保存内容 | `{schemaVersion, provider, jwt}`；不含 terminal token、SID、正文、设备 cookie |
+| 内存副本 | 仅 `AuthService` 受控字段持有，供现取 terminal token；不实现 `Debug`、不序列化给 IPC／手机、不进日志／错误文本 |
+| 恢复入口 | 启动接线先 `restore_authorization()`（非阻塞、只读保险箱），再启动既有自动连接 worker；显式「连接」也允许先恢复一次 |
+| 自动连接 | 用户自动连接意图（`remote.zcode_auto_connect`，缺键 = true）与远程总开关、已保存链接同时满足才自动连接；恢复授权本身不连接、不 OAuth |
+| terminal token | 仍每次连接现取、只在内存、用后即弃；不持久化、不跨进程复用 |
+
+**首次升级需授权一次**：旧版本（含 B1–B4 探针与旧产品构建）只把 JWT 放内存，没有持久记录；
+升级后第一次启动恢复只会得到「无记录 → 需要授权」，用户必须在 ZCode 卡完成一次官方授权。
+这次授权成功后 JWT 才写入保险箱，**后续进程重启不再要求重新授权**（除非过期、撤销或用户忘记）。
+
+**本批与旧探针的关系**：旧探针／旧 run 的「JWT 仅内存、进程退出即弃」结论只描述**当时的实现与取证口径**，
+历史报告与 run 记录原样保留、不追改；本批生产装配采用方案 A，`contract.json` 的
+`auth.credentialPersistence` 同批注明这一分界。两者不是矛盾证据，而是不同时间点的实现事实。
+
+### 10.2 断开、暂停与忘记的区别
+
+| 用户动作 | 连接 | 自动连接意图 | 持久凭据 | 链接 | 结果 |
+| --- | --- | --- | --- | --- | --- |
+| 「断开」 | 立即断开 | 持久写 `false` | **保留** | 保留 | 重启后不自动连接；手动「连接」或重新「授权」可恢复 |
+| 远程总开关关闭 / KICKED | 断开／停 | 关闭：不改；KICKED：写 `false` | 保留 | 保留 | 总开关重新打开才可能自动连接；KICKED 停在本轮冲突 |
+| 「忘记授权」 | 立即断开 | 持久写 `false` | **删除** | **保留** | 重启后无记录、不恢复、不连接；需重新授权 |
+| 换／删链接 | 断开旧连接 | 不改 | 保留（换链接不重新 OAuth） | 新值／空 | 按新目标连接；删链接后停在「需要配置」 |
+
+删除失败（`delete_failed`）或保存失败（`storage_failed`）必须如实显示，不得假装已记住／已删除；
+删除失败时本进程仍保持「已忘记、不恢复」，新授权保存成功才重新允许恢复。锁定／不可访问
+（`locked_or_denied` / `unavailable`）、记录损坏或超限（`invalid_record` / `too_large`）时只报原因，
+不自动打开浏览器、不静默重试、不把旧记录当成有效身份。
+
+### 10.3 失败提示与手机边界
+
+- 卡面区分「正在恢复授权 / 已记住授权 / 已授权但未连接 / 本次授权可用但未记住 / 存储不可访问 / 记录无效或过大 / 需要重新授权」；
+  无记录时是「需要授权」，不是「已连接」或「离线待重连」。
+- 授权过期／被撤销（401）时删除持久记录并回到「需要重新授权」；网络错误／5xx／403 不删除凭据。
+- 手机端只读 `AuthStatus`（authorized／remembered／restoring／provider／problem），**永远不拿 JWT、terminal token 或保险箱原文**；SID 只是定位信息，不是官方凭据；手机动作仍经本机配对门与能力闸。
+
+### 10.4 验证口径
+
+- 自动化：`wire_e2e` 以同一回环假官方 + 同一 fake 持久存储，**重新构造** AuthService/Hub 模拟整进程重启，
+  证明 OAuth 仍一次、terminal token／WS 每次连接重新发生、断开／忘记后重启零上游、恢复不放开能力闸。
+- 平台：真实系统保险箱读写、真实官方 OAuth 与真实进程重启必须在 macOS／Windows／Linux 各自实机验收；
+  未跑的行在验收报告里保持 `awaiting_platform_validation` / `not_run`，不以 fake 结果标 PASS。
