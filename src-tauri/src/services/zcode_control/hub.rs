@@ -28,7 +28,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 
 use super::auth::{AuthService, OAuthProvider, OpenAuthorize};
-use super::bridge::BridgeManager;
+use super::bridge::{BridgeManager, DataOutcome};
 use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
 use super::relay::{DeviceRoute, RelayClient, RelayEvent, RelayLag};
@@ -159,10 +159,11 @@ pub trait HubBackend: Send + Sync {
 /// 事件泵所需的桥窄口（生产 = [`BridgeManager`]，测试注入 fake）。
 ///
 /// 只含 `on_data`/`invalidate` 两个入口：泵因此拿不到 relay 生命周期或配置入口。
-/// `on_data` 返回本帧内**发生变化的会话视图**（桥侧前后快照对比）；泵据此发布
-/// `Session` 事件，而不是只让桥内投影悄悄前进。
+/// `on_data` 返回 [`DataOutcome`]（本帧是否吸收 + **发生变化的会话视图**，桥侧前后
+/// 快照对比）：即使本帧报错，降级/恢复视图也必须带出来，泵据此发布 `Session` 事件，
+/// 而不是只让桥内投影悄悄前进。
 pub(crate) trait BridgePump: Send + Sync {
-    fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<Vec<SessionView>>>;
+    fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, DataOutcome>;
     /// 作废旧桥/投影（实现内部推进自己的投影代际，不接受外部代际，避免代际空间混用）。
     fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()>;
 }
@@ -181,8 +182,8 @@ struct ProjectionBridge {
 }
 
 impl BridgePump for ProjectionBridge {
-    fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<Vec<SessionView>>> {
-        Box::pin(async move { BridgeManager::on_data(&self.bridge, payload).await })
+    fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, DataOutcome> {
+        Box::pin(async move { BridgeManager::on_data_outcome(&self.bridge, payload).await })
     }
 
     fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()> {
@@ -627,12 +628,18 @@ fn apply_relay_session(
             return;
         }
         view.generation = state.generation;
-        view.capabilities = state
-            .last_session
-            .as_ref()
-            .filter(|last| last.session_id == view.session_id)
-            .map(|last| last.capabilities.clone())
-            .unwrap_or_default();
+        view.capabilities = if view.ready {
+            state
+                .last_session
+                .as_ref()
+                .filter(|last| last.session_id == view.session_id)
+                .map(|last| last.capabilities.clone())
+                .unwrap_or_default()
+        } else {
+            // 降级视图（坏帧/解码/序号错误）：绝不沿用 last_session 里的旧开闸矩阵，
+            // 否则手机在 ready=false 的投影上仍显示可点的控制面。
+            CapabilityView::default()
+        };
         state.last_session = Some(view.clone());
         // 本会话也可能被别的手机 GET 过：变化同样登记，lag 才能逐会话降级。
         state.track_session(&view);
@@ -976,12 +983,15 @@ impl ZcodeHub {
                     RelayEvent::Data(payload) => {
                         // 本帧进入桥之前的 Hub 代际：桥处理在途若发生换代，视图作废。
                         let hub_generation = lock_inner(&inner).generation;
-                        // 错误只代表本帧未吸收，不改变连接终态，也不发布任何视图。
-                        if let Ok(views) = bridge.on_data(payload).await {
-                            for view in views {
-                                apply_relay_session(&inner, &out, hub_generation, view);
-                            }
+                        let outcome = bridge.on_data(payload).await;
+                        // 先发布本帧造成的变化（含错误帧把会话标成不新鲜的降级视图）；
+                        // 代际/配对闸在 apply_relay_session 内复核。
+                        for view in outcome.changed {
+                            apply_relay_session(&inner, &out, hub_generation, view);
                         }
+                        // 错误只代表本帧未吸收：不改变连接终态、不拆泵（ACK 已尽力发出）。
+                        // 降级视图已在上一步发布，下一次 GET 走重新 bind/现读自愈。
+                        let _ = outcome.result;
                     }
                     RelayEvent::State(view) => {
                         apply_relay_state(&inner, &out, bridge.as_ref(), view).await;
@@ -1471,6 +1481,11 @@ impl ZcodeHub {
         // 本代际仍有效的验收许可（仅 debug 证据构建）。每次 GET 现算：策略或许可
         // 变化（消费/过期/换代）在下一次 `session()` 立即可见——手机按该字段硬门。
         view.capabilities = self.session_capabilities(&view.session_id, generation);
+        // 不新鲜投影不得携带开闸矩阵：与事件路径 `apply_relay_session` 同规（坏帧/
+        // 解码/序号错误后 GET 仍可能读到 ready=false 的投影；执行闸另按策略现算）。
+        if !view.ready {
+            view.capabilities = CapabilityView::default();
+        }
         {
             let mut inner = self.lock();
             // 现读在途时代际已变（断开/配置变更）：旧投影绝不贴上新代际，也绝不
@@ -1861,6 +1876,8 @@ mod tests {
         session_gate: Mutex<Option<Arc<Notify>>>,
         /// `session()` 进入次数（配合闸判断在途）。
         session_calls: AtomicUsize,
+        /// 下一次 `session()` 返回的投影是否不新鲜（默认 false = ready）。
+        session_unready: AtomicBool,
         /// 在途 reset 的闸（配置变更窗口测试用）。
         reset_gate: Mutex<Option<Arc<Notify>>>,
         connect_result: Mutex<Option<ZResult<ConnectionView>>>,
@@ -1967,6 +1984,7 @@ mod tests {
 
         fn session<'a>(&'a self, target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>> {
             self.session_calls.fetch_add(1, Ordering::SeqCst);
+            let ready = !self.session_unready.load(Ordering::SeqCst);
             Box::pin(async move {
                 let gate = self.session_gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
@@ -1976,7 +1994,7 @@ mod tests {
                     session_id: target.session_id.clone(),
                     generation: target.generation,
                     revision: Some(1),
-                    ready: true,
+                    ready,
                     pending: Vec::new(),
                     control: None,
                     selection: None,
@@ -3448,6 +3466,61 @@ mod tests {
         assert_capabilities_closed(&view.capabilities);
     }
 
+    /// 不新鲜投影的 GET 同样不得携带开闸矩阵：与事件路径
+    /// `apply_relay_session` 同规（坏帧/解码/序号错误后 GET 读到的 ready=false）。
+    ///
+    /// 策略 source 全开（send_policy）时，ready=true 的 GET 必须按策略开闸；
+    /// ready=false 的 GET 必须回基线全关，且写回的 `last_session` 同样全关。
+    #[tokio::test]
+    async fn session_get_closes_capabilities_when_projection_not_ready() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = Arc::new(ZcodeHub::with_parts(
+            stored(URL),
+            fake.clone(),
+            send_policy(),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        let key = TargetKey {
+            session_id: "sess_not_ready_get".into(),
+        };
+
+        // fake 的投影不新鲜：GET 仍成功返回投影，但能力矩阵必须全关。
+        fake.session_unready.store(true, Ordering::SeqCst);
+        let stale = hub.session(&key).await.expect("GET 仍成功返回投影");
+        assert!(!stale.ready, "fake 已把投影标成不新鲜");
+        assert_eq!(
+            stale.capabilities,
+            CapabilityView::default(),
+            "不新鲜投影不得携带开闸矩阵（GET 与事件路径同规）"
+        );
+        {
+            let inner = hub.lock();
+            let last = inner
+                .last_session
+                .as_ref()
+                .expect("GET 已播种 last_session");
+            assert!(!last.ready);
+            assert_eq!(
+                last.capabilities,
+                CapabilityView::default(),
+                "写回 last_session 的能力矩阵也必须全关"
+            );
+        }
+
+        // 投影恢复就绪：同一策略源下 GET 必须按策略开闸（不是被上一轮全关固化）。
+        fake.session_unready.store(false, Ordering::SeqCst);
+        let ready = hub.session(&key).await.expect("恢复后 GET");
+        assert!(ready.ready);
+        assert_eq!(
+            ready.capabilities,
+            send_policy(),
+            "ready 投影必须按当前策略现算能力矩阵"
+        );
+    }
+
     /// 同一动态策略源同时喂会话矩阵与执行闸：翻转开/关，两者同步变化。
     #[tokio::test]
     async fn session_matrix_and_execute_gate_share_one_policy_source() {
@@ -3730,29 +3803,39 @@ mod tests {
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 3);
     }
 
-    /// 事件泵的 fake 桥：记录 `on_data`/`invalidate`，可注入一次瞬时错误与
-    /// 「本帧变化」的合成会话视图（取走一次；空 = 无变化）。
+    /// 事件泵的 fake 桥：记录 `on_data`/`invalidate`，按队列注入每帧的
+    /// [`DataOutcome`]（错误 + 降级视图 / 成功 + 变化 / 空 = `Ok` 无变化）。
     #[derive(Default)]
     struct FakePump {
         data: Mutex<Vec<Value>>,
         invalidations: AtomicUsize,
-        fail_next: AtomicBool,
-        /// 下一次 `on_data` 报告的会话变化（合成视图，不来自真实投影）。
-        views: Mutex<Vec<SessionView>>,
+        /// 每帧结果（取走一次；空 = `Ok` + 无变化）。
+        outcomes: Mutex<VecDeque<DataOutcome>>,
+    }
+
+    impl FakePump {
+        /// 排入下一帧的桥结果（错误与变化同时携带，模拟坏帧已降级投影）。
+        fn push_outcome(&self, result: ZResult<()>, changed: Vec<SessionView>) {
+            self.outcomes
+                .lock()
+                .unwrap()
+                .push_back(DataOutcome { result, changed });
+        }
     }
 
     impl BridgePump for FakePump {
-        fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, ZResult<Vec<SessionView>>> {
+        fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, DataOutcome> {
             self.data.lock().unwrap().push(payload);
-            let fail = self.fail_next.swap(false, Ordering::SeqCst);
-            let views = std::mem::take(&mut *self.views.lock().unwrap());
-            Box::pin(async move {
-                if fail {
-                    Err(ZcodeError::offline())
-                } else {
-                    Ok(views)
-                }
-            })
+            let outcome = self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(DataOutcome {
+                    result: Ok(()),
+                    changed: Vec::new(),
+                });
+            Box::pin(async move { outcome })
         }
 
         fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()> {
@@ -3841,7 +3924,7 @@ mod tests {
         let fake = Arc::new(FakeBackend::default());
         let (_hub, events, pump) = pumped(stored(URL), fake, send_policy());
 
-        pump.fail_next.store(true, Ordering::SeqCst);
+        pump.push_outcome(Err(ZcodeError::offline()), Vec::new());
         events
             .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
             .await
@@ -3905,10 +3988,7 @@ mod tests {
                 capabilities,
             };
         // ① 未 GET 过的会话：能力矩阵回基线全关，代际/会话/卡面全部按视图落事件。
-        pump.views
-            .lock()
-            .unwrap()
-            .push(synthetic(7, generation + 9, send_policy()));
+        pump.push_outcome(Ok(()), vec![synthetic(7, generation + 9, send_policy())]);
         events
             .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
             .await
@@ -3948,10 +4028,10 @@ mod tests {
             authoritative.capabilities = send_policy();
             inner.last_session = Some(authoritative);
         }
-        pump.views
-            .lock()
-            .unwrap()
-            .push(synthetic(8, generation + 9, CapabilityView::default()));
+        pump.push_outcome(
+            Ok(()),
+            vec![synthetic(8, generation + 9, CapabilityView::default())],
+        );
         events
             .send(RelayEvent::Data(serde_json::json!({"seq": 2})))
             .await
@@ -3984,6 +4064,179 @@ mod tests {
                 "无变化的 Data 不得发布 Session 事件"
             );
         }
+    }
+
+    /// 桥帧错误（坏 CRC/解码/序号）也必须把降级视图发给手机：Hub 泵先应用本帧的
+    /// 全部视图变化（即使 `result=Err`），再丢弃错误，连接保持 paired。
+    ///
+    /// 降级视图的能力矩阵必须回基线全关（绝不沿用 `last_session` 的旧开闸矩阵）；
+    /// 随后 ready=true 的帧发布恢复事件，GET/重绑路径仍可用。
+    #[tokio::test]
+    async fn relay_data_error_publishes_degraded_session_and_recovers() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump) = pumped(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+        let generation = hub.connection().generation;
+
+        let key = TargetKey {
+            session_id: "sess_bridge_error".into(),
+        };
+        let primed = hub.session(&key).await.expect("首次 GET");
+        assert!(primed.ready);
+        assert_eq!(primed.capabilities, send_policy(), "GET 现算出开闸矩阵");
+        let mut subscriber = hub.subscribe();
+
+        // 桥错误 + 已降级的视图（能力故意带旧开闸矩阵：Hub 必须清回基线）。
+        let degraded = SessionView {
+            session_id: key.session_id.clone(),
+            generation: generation + 9,
+            revision: Some(2),
+            ready: false,
+            pending: Vec::new(),
+            control: None,
+            selection: None,
+            capabilities: send_policy(),
+        };
+        pump.push_outcome(
+            Err(ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)),
+            vec![degraded],
+        );
+        events
+            .send(RelayEvent::Data(serde_json::json!({"bad": 1})))
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("错误帧的降级视图必须发布 Session 事件");
+        assert_eq!(event.session_id.as_deref(), Some(key.session_id.as_str()));
+        assert_eq!(event.generation, generation, "对外恒用 Hub 代际");
+        assert_eq!(event.data["ready"], false);
+        assert_eq!(
+            event.data["capabilities"],
+            serde_json::to_value(CapabilityView::default()).unwrap(),
+            "降级视图不得沿用 last_session 的旧开闸矩阵"
+        );
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::Paired,
+            "桥帧错误不得改变连接态"
+        );
+        {
+            let inner = hub.lock();
+            let last = inner
+                .last_session
+                .as_ref()
+                .expect("降级后仍有 last_session");
+            assert!(!last.ready);
+            assert_eq!(last.capabilities, CapabilityView::default());
+        }
+
+        // 恢复帧：ready=true 同样发布；GET/重绑仍可用（能力按当前策略现算）。
+        let recovered = SessionView {
+            session_id: key.session_id.clone(),
+            generation: generation + 9,
+            revision: Some(3),
+            ready: true,
+            pending: Vec::new(),
+            control: None,
+            selection: None,
+            capabilities: CapabilityView::default(),
+        };
+        pump.push_outcome(Ok(()), vec![recovered]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 2})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("恢复帧必须发布 Session 事件");
+        assert_eq!(event.session_id.as_deref(), Some(key.session_id.as_str()));
+        assert_eq!(event.data["ready"], true);
+        assert_eq!(event.generation, generation);
+
+        let rebound = hub.session(&key).await.expect("GET 仍可用");
+        assert!(rebound.ready);
+        assert_eq!(rebound.generation, generation);
+        assert_eq!(
+            rebound.capabilities,
+            send_policy(),
+            "GET 重新现算能力矩阵（不沿用失效缓存）"
+        );
+    }
+
+    /// 连续两个错误帧都必须被处理、泵绝不退出；空变化的错误不发布事件，
+    /// 随后正常帧仍能发布视图。
+    #[tokio::test]
+    async fn relay_data_errors_do_not_stop_pump() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump) = pumped(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let generation = hub.connection().generation;
+        let mut subscriber = hub.subscribe();
+
+        pump.push_outcome(Err(ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)), Vec::new());
+        pump.push_outcome(Err(ZcodeError::of(codes::UNSUPPORTED_PROTOCOL)), Vec::new());
+        for seq in 1..=2 {
+            events
+                .send(RelayEvent::Data(serde_json::json!({"seq": seq})))
+                .await
+                .unwrap();
+        }
+        wait_until(|| pump.data.lock().unwrap().len() == 2).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(event) = subscriber.try_recv() {
+            assert_ne!(
+                event.kind,
+                ControlEventKind::Session,
+                "空变化的错误帧不得发布 Session 事件"
+            );
+        }
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::Paired,
+            "错误帧不得改变连接态"
+        );
+
+        // 第三帧正常：视图仍能发布 → 泵没有因连续错误退出。
+        let alive = SessionView {
+            session_id: "sess_pump_alive".into(),
+            generation: generation + 9,
+            revision: Some(1),
+            ready: true,
+            pending: Vec::new(),
+            control: None,
+            selection: None,
+            capabilities: CapabilityView::default(),
+        };
+        pump.push_outcome(Ok(()), vec![alive]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 3})))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_session_event(&mut subscriber),
+        )
+        .await
+        .expect("连续错误后泵仍须处理后续帧");
+        assert_eq!(event.session_id.as_deref(), Some("sess_pump_alive"));
+        assert_eq!(event.data["ready"], true);
     }
 
     /// Data 溢出必须显式让投影失效：invalidate 一次 + 发布 ready=false/能力全关。
