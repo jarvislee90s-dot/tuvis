@@ -33,7 +33,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import i18n from "@/i18n";
-import UsageDashboardPage from "@/pages/usage-dashboard";
+import { UsageDashboardBody } from "@/components/usage/UsageDashboardBody";
 import { BillingAssignmentDialog } from "@/components/usage/BillingAssignmentDialog";
 import { BillingProfilesManager, ruleIssues } from "@/components/usage/BillingProfilesManager";
 import { usageBillingCommit } from "@/lib/api/usageV2";
@@ -172,7 +172,7 @@ describe("Task 13 · 记录页渠道绑定", () => {
         ]),
     });
 
-    render(wrap(<UsageDashboardPage />, makeClient()));
+    render(wrap(<UsageDashboardBody active />, makeClient()));
     fireEvent.click(await screen.findByTestId("usage-tab-records"));
     fireEvent.click(screen.getByTestId("usage-records-dim-project"));
     const card = await screen.findByTestId("usage-record-card-multiagents-manager");
@@ -244,7 +244,7 @@ describe("Task 13 · 记录页渠道绑定", () => {
         ]),
     });
 
-    render(wrap(<UsageDashboardPage />, makeClient()));
+    render(wrap(<UsageDashboardBody active />, makeClient()));
     fireEvent.click(await screen.findByTestId("usage-tab-records"));
     await screen.findByTestId("usage-record-card-claude");
 
@@ -291,7 +291,7 @@ describe("Task 13 · 记录页渠道绑定", () => {
         ]),
     });
 
-    render(wrap(<UsageDashboardPage />, makeClient()));
+    render(wrap(<UsageDashboardBody active />, makeClient()));
     fireEvent.click(await screen.findByTestId("usage-tab-records"));
     fireEvent.click(screen.getByTestId("usage-records-dim-project"));
     await screen.findByTestId("usage-record-card-multiagents-manager");
@@ -313,7 +313,7 @@ describe("Task 13 · 记录页渠道绑定", () => {
           identity("claude", "claude-sonnet-4-5", null, "unknown"),
         ]),
     });
-    render(wrap(<UsageDashboardPage />, makeClient()));
+    render(wrap(<UsageDashboardBody active />, makeClient()));
     fireEvent.click(await screen.findByTestId("usage-tab-records"));
     fireEvent.click(screen.getByTestId("usage-records-dim-project"));
     await screen.findByTestId("usage-record-card-multiagents-manager");

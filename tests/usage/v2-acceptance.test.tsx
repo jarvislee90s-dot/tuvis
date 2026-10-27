@@ -18,7 +18,7 @@ import i18n from "@/i18n";
 import { UsageCostCard } from "@/components/usage/UsageCostCard";
 import { PricingStatusPanel } from "@/components/usage/PricingStatusPanel";
 import { UsageSection } from "@/components/settings/UsageSection";
-import UsageDashboardPage from "@/pages/usage-dashboard";
+import { UsageDashboardBody } from "@/components/usage/UsageDashboardBody";
 import {
   usageBillingCommit,
   usageBillingGet,
@@ -781,7 +781,7 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
       wrap(
         <>
           <UsageSection />
-          <UsageDashboardPage />
+          <UsageDashboardBody active />
         </>
       )
     );
@@ -932,7 +932,7 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
       },
     });
 
-    render(wrap(<UsageDashboardPage />));
+    render(wrap(<UsageDashboardBody active />));
 
     // 未指派：渠道维度合并一行「未指定渠道」，Token = 200
     expect(await screen.findByTestId("usage-hero")).toHaveTextContent("200");
@@ -1075,7 +1075,7 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
         }),
     });
 
-    render(wrap(<UsageDashboardPage />));
+    render(wrap(<UsageDashboardBody active />));
 
     // C 默认渠道维度：显式绑定生效，别名不得覆盖
     expect(await screen.findByTestId("usage-hero")).toHaveTextContent("140");
@@ -1148,7 +1148,7 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
         }),
     });
 
-    render(wrap(<UsageDashboardPage />));
+    render(wrap(<UsageDashboardBody active />));
     await screen.findByTestId("usage-hero");
     // D 默认展开
     await screen.findByTestId("usage-cost-body");
@@ -1365,7 +1365,7 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
       },
     });
 
-    render(wrap(<UsageDashboardPage />));
+    render(wrap(<UsageDashboardBody active />));
     await screen.findByTestId("usage-hero");
 
     // 渠道维度：显示名 + 原始 provider 进 title
@@ -1413,7 +1413,7 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
         ),
     });
 
-    render(wrap(<UsageDashboardPage />));
+    render(wrap(<UsageDashboardBody active />));
     fireEvent.click(await screen.findByTestId("usage-tab-records"));
 
     // 行名 = 别名优先；原始「deepseek / gpt-5」留在 title 与 IPC 结果里（别名不写账本）
@@ -1468,7 +1468,7 @@ describe("Task 11 验收：供应商别名与自动定价（跨模块）", () =>
       "price_rule_kind",
     ];
 
-    render(wrap(<UsageDashboardPage />));
+    render(wrap(<UsageDashboardBody active />));
     await screen.findByTestId("usage-hero");
     fireEvent.click(screen.getByTestId("usage-export-cost-csv"));
 
@@ -1627,7 +1627,7 @@ describe("Task 10 验收：配置两段式联动 · 明细计费 · D 卡单表"
       wrap(
         <>
           <UsageSection />
-          <UsageDashboardPage />
+          <UsageDashboardBody active />
         </>
       )
     );
@@ -1766,7 +1766,7 @@ describe("Task 10 验收：配置两段式联动 · 明细计费 · D 卡单表"
       wrap(
         <>
           <UsageSection />
-          <UsageDashboardPage />
+          <UsageDashboardBody active />
         </>
       )
     );
@@ -1915,7 +1915,7 @@ describe("Task 10 验收：配置两段式联动 · 明细计费 · D 卡单表"
       wrap(
         <>
           <UsageSection />
-          <UsageDashboardPage />
+          <UsageDashboardBody active />
         </>,
         client
       )
@@ -2040,7 +2040,7 @@ describe("Task 10 验收：配置两段式联动 · 明细计费 · D 卡单表"
       },
     });
 
-    render(wrap(<UsageDashboardPage />));
+    render(wrap(<UsageDashboardBody active />));
     // D 默认展开
     const detailRegion = () => screen.getByTestId("usage-cost-details-d7-dsh");
     const gridOf = () => within(detailRegion()).getByTestId("usage-cost-table-detail-grid");
@@ -2116,7 +2116,7 @@ describe("Task 10 验收：配置两段式联动 · 明细计费 · D 卡单表"
   });
 
   it("T10-5. D 卡单表：五列表头；卡片内四列明细；合计行=分项和且单价空；缓存写无数据不出现；小字只留归一化模型+快照时间", async () => {
-    render(wrap(<UsageDashboardPage />));
+    render(wrap(<UsageDashboardBody active />));
     await screen.findByTestId("usage-hero");
     // D 默认展开
     await screen.findByTestId("usage-cost-body");
@@ -2191,7 +2191,7 @@ describe("Task 10 验收：配置两段式联动 · 明细计费 · D 卡单表"
   });
 
   it("T10-6. 表头币种切换联动金额/单价/分项；导出 CSV 仍 USD、列集不变", async () => {
-    render(wrap(<UsageDashboardPage />));
+    render(wrap(<UsageDashboardBody active />));
     await screen.findByTestId("usage-hero");
     // D 默认展开
     await screen.findByTestId("usage-cost-body");
@@ -2239,7 +2239,7 @@ describe("Task 10 验收：配置两段式联动 · 明细计费 · D 卡单表"
   });
 
   it("T10-7. 无全局金额/渠道小计/费用趋势；A 卡无缓存写入块；计量维度文案统一", async () => {
-    render(wrap(<UsageDashboardPage />));
+    render(wrap(<UsageDashboardBody active />));
     await screen.findByTestId("usage-hero");
 
     // A 卡：缓存写入（解释）整块不存在；七行计量网格 = 统一文案（新增输入/缓存命中/输出）

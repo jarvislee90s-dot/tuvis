@@ -47,7 +47,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import i18n from "@/i18n";
-import UsageDashboardPage from "@/pages/usage-dashboard";
+import { UsageDashboardBody } from "@/components/usage/UsageDashboardBody";
 import { RECORD_ROW_CAP } from "@/components/usage/UsageRecordsPanel";
 import { EM_DASH } from "@/lib/usage/format";
 import { tauriInvokeMock } from "../msw/tauriMocks";
@@ -65,7 +65,7 @@ function renderPage() {
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
-  return render(<UsageDashboardPage />, { wrapper });
+  return render(<UsageDashboardBody active />, { wrapper });
 }
 
 /** 打开「记录」页签（默认页签是「看板」——两页签共用同一 range 与同一次打开窗口） */
@@ -86,6 +86,38 @@ beforeAll(async () => {
 
 describe("usage-records（计划② Task 9：页签壳 + 用量记录页）", () => {
   beforeEach(() => localStorage.clear());
+
+  it("第四轮实机反馈：记录卡三列表头（供应商显示名 / token 数 / 请求次数）+ 每行请求次数 + 合计行", async () => {
+    renderPage();
+    await screen.findByTestId("usage-hero");
+
+    fireEvent.click(screen.getByTestId("usage-tab-records"));
+    await screen.findByTestId("usage-record-card-claude");
+
+    // 表头三列在场
+    const cols = screen.getByTestId("usage-record-cols-claude");
+    expect(cols.textContent).toContain("供应商显示名");
+    expect(cols.textContent).toContain("token 数");
+    expect(cols.textContent).toContain("请求次数");
+
+    // 行内请求次数列：夹具 claude 行 0/1 的 requests 数（mock 提供，非空数字）
+    expect(screen.getByTestId("usage-record-requests-claude:0").textContent).toMatch(/^\d/);
+    expect(screen.getByTestId("usage-record-requests-claude:1").textContent).toMatch(/^\d/);
+
+    // 合计行：含「合计」；请求合计 ≥ 任一单行值（全量行的 Σ）
+    const total = screen.getByTestId("usage-record-total-claude");
+    expect(total.textContent).toContain("合计");
+    const reqCells = screen
+      .getAllByTestId(/^usage-record-requests-claude:/)
+      .map((el) => Number((el.textContent ?? "").replace(/,/g, "")))
+      .filter((n) => Number.isFinite(n));
+    const totalReqs = Number(
+      (total.textContent ?? "").split("\n").pop()?.replace(/[^\d]/g, "") ?? ""
+    );
+    if (reqCells.length && Number.isFinite(totalReqs) && totalReqs > 0) {
+      expect(totalReqs).toBeGreaterThanOrEqual(Math.max(...reqCells));
+    }
+  });
 
   it("1. 页签壳（默认看板，两页签共用同一 range / 同一次打开窗口）+ 每工具一卡、标题走展示名与合计", async () => {
     renderPage();
@@ -438,8 +470,7 @@ describe("usage-records（计划② Task 9：页签壳 + 用量记录页）", ()
     expect(claude).not.toHaveTextContent("合计 0");
     expect(claude.querySelector("[title='0']")).toBeNull();
     // 卡内行的 token 位同理（行尾那个值）
-    const row0 = screen.getByTestId("usage-record-row-claude:0");
-    expect(row0.lastElementChild?.textContent).toBe(EM_DASH);
+    expect(screen.getByTestId("usage-record-tokens-claude:0").textContent).toBe(EM_DASH);
     // 四张卡都这样，且每个**值**位都是 `—`（模型/工具名里有数字，故只逐值断言，不做整卡"无数字"）
     const cards = screen.getAllByTestId(/^usage-record-card-/);
     expect(cards).toHaveLength(4);
@@ -460,9 +491,7 @@ describe("usage-records（计划② Task 9：页签壳 + 用量记录页）", ()
     const ok = await screen.findByTestId("usage-record-card-claude");
     expect(ok).toHaveTextContent("合计 129.22万");
     expect(ok.querySelector("[title='1,292,245']")).toBeNull();
-    expect(screen.getByTestId("usage-record-row-claude:0").lastElementChild?.textContent).toBe(
-      "16.15万"
-    );
+    expect(screen.getByTestId("usage-record-tokens-claude:0").textContent).toBe("16.15万");
   });
 
   it("12. 页脚「高级」入口打开计费归属与参考价规则管理器（旧逐行规则入口已收敛）", async () => {

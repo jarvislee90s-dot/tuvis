@@ -23,6 +23,14 @@ import {
   mockProviderAliasDelete,
   mockProviderAliasesGet,
   mockProviderAliasUpsert,
+  mockTpsHeartbeat,
+  mockTpsInstallApply,
+  mockTpsInstallPreview,
+  mockTpsPointsResult,
+  mockTpsRefresh,
+  mockTpsSnapshotResult,
+  mockTpsUninstall,
+  mockSpeedDashboard,
   mockUsageCollect,
   mockUsageCostCsv,
   mockUsageCosts,
@@ -35,6 +43,8 @@ import {
   mockUsageSettings,
   mockUsageTrend,
 } from "@/lib/usage/mockFixtures";
+import type { TpsInstallChoice, TpsSelection, TpsViewRange } from "@/types/tps";
+import type { SpeedDashboardQuery, SpeedDashboardSnapshot } from "@/types/speed";
 import type {
   UsageFilters,
   UsageGroupBy,
@@ -200,6 +210,35 @@ const mockFmSuggestion = {
 let fmMode: "suggestion" | "empty" = "suggestion";
 export function setMockFmMode(mode: "suggestion" | "empty") {
   fmMode = mode;
+}
+
+// —— 四页工作区导航 mock 状态（2026-10-26 计划 Task 7）——
+// in-memory 导航队列（先存后 emit，与 Rust `NavigationQueue` 同语义：request 换新
+// revision 并替换 pending；ack 仅在 revision 命中 pending 时清队）。`listeners` 由
+// 测试文件的 `listen` 替身登记，request 时逐个回放 `tuvis-workspace-navigation` 事件。
+export interface MockWorkspaceNavigation {
+  revision: number;
+  tab: string;
+}
+export const workspaceNavMock = {
+  nextRevision: 0,
+  pending: null as MockWorkspaceNavigation | null,
+  listeners: new Set<(e: { payload: MockWorkspaceNavigation }) => void>(),
+};
+export function resetWorkspaceNavMock() {
+  workspaceNavMock.nextRevision = 0;
+  workspaceNavMock.pending = null;
+  workspaceNavMock.listeners.clear();
+}
+
+// —— V2 速度 dashboard mock 状态（2026-10-26 计划 Task 9）——
+// 默认走同源夹具 `mockSpeedDashboard`（与 src/tauri-mock.ts 同源同形）；测试可经
+// `setMockSpeedDashboard` 注入整只覆盖（如：只改能力位 / disabled 态），null 恢复默认。
+let speedDashboardOverride: ((query?: SpeedDashboardQuery) => SpeedDashboardSnapshot) | null = null;
+export function setMockSpeedDashboard(
+  override: ((query?: SpeedDashboardQuery) => SpeedDashboardSnapshot) | null
+) {
+  speedDashboardOverride = override;
 }
 
 export const tauriInvokeMock = vi.fn((cmd: string, args?: unknown) => {
@@ -611,6 +650,57 @@ export const tauriInvokeMock = vi.fn((cmd: string, args?: unknown) => {
           quoteArgs?.fallbackRate
         )
       );
+    }
+    // —— TPS 短时抽样七命令（Task 8；与 src/tauri-mock.ts 同源同形）——
+    case "tps_snapshot":
+      return Promise.resolve(
+        mockTpsSnapshotResult((args as { selection?: TpsSelection } | undefined)?.selection)
+      );
+    case "tps_points": {
+      const tpsArgs = args as { selection?: TpsSelection; viewRange?: TpsViewRange } | undefined;
+      return Promise.resolve(mockTpsPointsResult(tpsArgs?.selection, tpsArgs?.viewRange ?? "1h"));
+    }
+    case "tps_refresh":
+      return Promise.resolve(mockTpsRefresh());
+    case "tps_view_heartbeat":
+      return Promise.resolve(mockTpsHeartbeat(args as { visible?: boolean } | undefined));
+    case "tps_install_preview":
+      return Promise.resolve(mockTpsInstallPreview((args as { tool?: string } | undefined)?.tool));
+    case "tps_install_apply": {
+      const applyArgs = args as { previewId?: string; choice?: TpsInstallChoice } | undefined;
+      return mockTpsInstallApply(applyArgs?.previewId, applyArgs?.choice);
+    }
+    case "tps_uninstall":
+      return mockTpsUninstall();
+    case "tps_speed_dashboard": {
+      // V2 速度 dashboard（Task 9）：覆盖优先（测能力位变化），否则同源夹具
+      const query = (args as { query?: SpeedDashboardQuery } | undefined)?.query;
+      if (speedDashboardOverride) return Promise.resolve(speedDashboardOverride(query));
+      return Promise.resolve(mockSpeedDashboard(query));
+    }
+
+    // —— 四页工作区导航三命令（Task 7）：与 src/tauri-mock.ts 同语义 ——
+    case "workspace_request_navigation": {
+      const tab = (args as { tab?: string } | undefined)?.tab ?? "messages";
+      workspaceNavMock.nextRevision += 1;
+      const nav: MockWorkspaceNavigation = {
+        revision: workspaceNavMock.nextRevision,
+        tab,
+      };
+      // 先存后 emit：监听器缺席也不丢目标（peek 兜底）
+      workspaceNavMock.pending = nav;
+      for (const listener of workspaceNavMock.listeners) listener({ payload: nav });
+      return Promise.resolve(nav);
+    }
+    case "workspace_peek_navigation":
+      return Promise.resolve(workspaceNavMock.pending);
+    case "workspace_ack_navigation": {
+      const revision = (args as { revision?: number } | undefined)?.revision;
+      if (workspaceNavMock.pending !== null && workspaceNavMock.pending.revision === revision) {
+        workspaceNavMock.pending = null;
+        return Promise.resolve(true);
+      }
+      return Promise.resolve(false);
     }
     default:
       return Promise.resolve(undefined);

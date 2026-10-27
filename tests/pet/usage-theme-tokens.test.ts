@@ -36,16 +36,21 @@ function cssVar(block: string, name: string): string | null {
   return m ? m[1].trim() : null;
 }
 
-/** 浅深两档的**唯一取值表**（计划② Task 4 步骤 1；用例 1/2 逐字比对）。 */
+/** 浅深两档的**唯一取值表**（计划② Task 4 步骤 1；用例 1/2 逐字比对）。
+ * 2026-10-26 桌面工作区计划 Task 8：配色方案经用户定稿（spec §3.1），主图线/辅图
+ * 随语义 token 更新为 #4263DC/#8B5CF6（浅）。
+ * 2026-10-27 实机反馈：深色由雾银纯灰改冷石墨 + 靛蓝/紫罗兰（spec §3.1 修订），
+ * 主图线/辅图 = #8B95FF/#B49CFF、轨道对齐选中背景 token——
+ * 门禁机制不变（三变量仍是图表唯一取色来源）。 */
 const LIGHT = {
-  "--usage-accent-a": "#3b82f6",
+  "--usage-accent-a": "#4263dc",
   "--usage-accent-b": "#8b5cf6",
-  "--usage-track": "oklch(0.922 0 0)",
+  "--usage-track": "#e3e6ed",
 };
 const DARK: Record<keyof typeof LIGHT, string> = {
-  "--usage-accent-a": "#60a5fa",
-  "--usage-accent-b": "#a78bfa",
-  "--usage-track": "oklch(0.269 0 0)",
+  "--usage-accent-a": "#8b95ff",
+  "--usage-accent-b": "#b49cff",
+  "--usage-track": "#2c2f45",
 };
 
 /**

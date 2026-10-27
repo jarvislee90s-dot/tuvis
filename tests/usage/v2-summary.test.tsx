@@ -52,7 +52,7 @@ describe("summaryV2（纯函数）", () => {
 describe("UsageSummary（A 固定展开卡）", () => {
   it("3. 七行固定顺序、删除 userEst、cacheMiss 行、缓存写入解释块不再存在", () => {
     const dash = mockUsageDashboard({ preset: "last7d" }, "tool");
-    render(<UsageSummary dash={dash} retentionDays={null} t={tf} />);
+    render(<UsageSummary dash={dash} t={tf} />);
 
     // hero 与新显示口径一致：万/亿缩写，不再用完整千分位
     expect(screen.getByTestId("usage-hero")).toHaveTextContent(fmtTokens(dash.hero, getLang()));
@@ -92,7 +92,7 @@ describe("UsageSummary（A 固定展开卡）", () => {
     const dash = mockUsageDashboard({ preset: "last7d" }, "tool");
     expect(tokenUnmeasured(dash)).toBe(true);
 
-    render(<UsageSummary dash={dash} retentionDays={null} t={tf} />);
+    render(<UsageSummary dash={dash} t={tf} />);
 
     expect(screen.getByTestId("usage-hero")).toHaveTextContent(EM_DASH);
     for (const key of ["requestInput", "cacheRead", "cacheMiss", "output", "hitRate"]) {

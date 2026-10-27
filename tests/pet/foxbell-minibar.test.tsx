@@ -18,7 +18,7 @@ const { createWindowMock, setSizeMock } = vi.hoisted(() => ({
   createWindowMock: vi.fn(async () => {}),
   setSizeMock: vi.fn(async () => {}),
 }));
-// 「详情 »」→ `openUsageDashboard` → `createWindow`：mock 掉窗口层即可断言钻取真的到了看板窗口
+// 「详情 »」→ `openUsageDashboard`：Task 7 四页同窗后判据反转为「**不**建窗、走主窗导航」
 vi.mock("@/lib/window", () => ({ createWindow: createWindowMock }));
 // 宠物窗口 API（与 foxbell-interactions.test.tsx 同模式），setSize 单独提出来断言高度入参
 vi.mock("@tauri-apps/api/window", () => ({
@@ -132,10 +132,13 @@ describe("foxbell-minibar（计划② Task 13 步骤 5/6：浮窗接线）", () 
 
     fireEvent.click(screen.getByTestId("usage-mini-row-detail"));
     await tick(0);
-    expect(createWindowMock).toHaveBeenCalledTimes(1);
-    const [label, options] = createWindowMock.mock.calls[0] as [string, { title: string }];
-    expect(label).toBe("usage-dashboard"); // 与菜单/标题栏入口同一个窗口（spec P1）
-    expect(options.title).toBe(i18n.t("usage.title"));
+    // Task 7：唯一入口 = workspace_request_navigation（唤起主窗 + 切模型用量页签），零建窗
+    const navCalls = tauriInvokeMock.mock.calls.filter(
+      ([cmd]) => cmd === "workspace_request_navigation"
+    );
+    expect(navCalls).toHaveLength(1);
+    expect((navCalls[0] as [string, Record<string, unknown>])[1]).toEqual({ tab: "usage" });
+    expect(createWindowMock).not.toHaveBeenCalled();
     expect(screen.queryByTestId("usage-mini")).toBeNull(); // 钻取即关浮窗（spec P2 第 5 条）
   });
 
