@@ -29,7 +29,12 @@ import {
   setPin,
   toggleChannel,
 } from "@/lib/api/remote";
-import { getZcodeRemoteConfig, setZcodeRemoteConfig } from "@/lib/api/zcodeRemote";
+import {
+  forgetZcodeAuthorization,
+  getZcodeAuthStatus,
+  getZcodeRemoteConfig,
+  setZcodeRemoteConfig,
+} from "@/lib/api/zcodeRemote";
 
 beforeEach(() => {
   invokeMock.mockReset();
@@ -218,5 +223,50 @@ describe("zcode remote config api wrappers", () => {
     await expect(
       setZcodeRemoteConfig("https://evil.example/remote/v4?sid=synthetic-sid-a4-ts-0003")
     ).rejects.toBe("ZCODE_URL_HOST: 仅支持 zcode.z.ai 官方主机");
+  });
+});
+
+// C4：记住授权相关的桌面 IPC 封装锁形。命令名/参数形态与 Rust
+// commands::zcode_remote（zcode_control_auth_status() /
+// zcode_control_forget_authorization()）是隐式契约；AuthStatus 为 camelCase，
+// 词表外的 problem 由调用方按读取失败处理。夹具全合成，不含真实 JWT/链接。
+describe("zcode auth api wrappers (C4)", () => {
+  it("getZcodeAuthStatus 无参调用 zcode_control_auth_status，透传 AuthStatus（camelCase）", async () => {
+    const status = {
+      authorized: true,
+      remembered: true,
+      restoring: false,
+      provider: "bigmodel",
+      problem: null,
+    };
+    invokeMock.mockResolvedValueOnce(status);
+    expect(await getZcodeAuthStatus()).toEqual(status);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith("zcode_control_auth_status");
+    expect(Object.keys(status)).toEqual([
+      "authorized",
+      "remembered",
+      "restoring",
+      "provider",
+      "problem",
+    ]);
+  });
+
+  it("forgetZcodeAuthorization 无参调用 zcode_control_forget_authorization，返回 ConnectionView", async () => {
+    const view = {
+      state: "needs_auth",
+      generation: 9,
+      reasonCode: null,
+      deviceLabel: null,
+    };
+    invokeMock.mockResolvedValueOnce(view);
+    expect(await forgetZcodeAuthorization()).toEqual(view);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith("zcode_control_forget_authorization");
+  });
+
+  it("forget 失败透传后端码前缀（ZCODE_CONTROL:*），前端不伪造成功", async () => {
+    invokeMock.mockRejectedValueOnce("ZCODE_CONTROL:storage_failed");
+    await expect(forgetZcodeAuthorization()).rejects.toBe("ZCODE_CONTROL:storage_failed");
   });
 });

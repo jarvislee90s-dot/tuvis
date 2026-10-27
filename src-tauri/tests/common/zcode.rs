@@ -39,10 +39,10 @@ use serde_json::{json, Value};
 
 use multi_agents_manager_lib::remote::pairing::DeviceStore;
 use multi_agents_manager_lib::services::zcode_control::{
-    ActionContext, ActionReceipt, BoundTarget, CapabilityFlag, CapabilityView, CommandPort,
-    CommandSender, ConnectionState, ConnectionView, ControlAction, ControlView, DeviceRoute,
-    HubBackend, OAuthProvider, OpenAuthorize, PendingKind, PendingPort, PendingView, SelectionPort,
-    SelectionView, SessionView, StopPort, TargetKey, ZResult, ZcodeError,
+    ActionContext, ActionReceipt, AuthStatus, BoundTarget, CapabilityFlag, CapabilityView,
+    CommandPort, CommandSender, ConnectionState, ConnectionView, ControlAction, ControlView,
+    DeviceRoute, HubBackend, OAuthProvider, OpenAuthorize, PendingKind, PendingPort, PendingView,
+    SelectionPort, SelectionView, SessionView, StopPort, TargetKey, ZResult, ZcodeError,
 };
 
 /// 命令层 `CommandPort::call` 入口的一条信封记录（`args[0]` 是命令层信封）。
@@ -81,6 +81,9 @@ struct Inner {
     frames: Vec<Frame>,
     bind_calls: Vec<TargetKey>,
     authorize_calls: usize,
+    /// 授权事实（authorize 置 true、forget 置 false）：`config_changed` 读取它，
+    /// 与生产 `AuthService` 同语义，不用默认值掩盖真实接线。
+    authorized: bool,
     connect_calls: usize,
     disconnect_calls: usize,
     reset_generations: Vec<u64>,
@@ -115,6 +118,7 @@ impl Default for Inner {
             frames: Vec::new(),
             bind_calls: Vec::new(),
             authorize_calls: 0,
+            authorized: false,
             connect_calls: 0,
             disconnect_calls: 0,
             reset_generations: Vec::new(),
@@ -352,8 +356,28 @@ impl HubBackend for FakeOfficial {
         _provider: OAuthProvider,
         _open: OpenAuthorize,
     ) -> BoxFuture<'a, ZResult<()>> {
-        lock(&self.inner).authorize_calls += 1;
+        let mut inner = lock(&self.inner);
+        inner.authorize_calls += 1;
+        inner.authorized = true;
         Box::pin(async { Ok(()) })
+    }
+
+    fn restore_authorization<'a>(&'a self) -> BoxFuture<'a, AuthStatus> {
+        let status = self.auth_status();
+        Box::pin(async move { status })
+    }
+
+    fn auth_status(&self) -> AuthStatus {
+        AuthStatus {
+            authorized: lock(&self.inner).authorized,
+            ..AuthStatus::default()
+        }
+    }
+
+    fn forget_authorization<'a>(&'a self) -> BoxFuture<'a, AuthStatus> {
+        lock(&self.inner).authorized = false;
+        let status = self.auth_status();
+        Box::pin(async move { status })
     }
 
     fn connect<'a>(&'a self, route: DeviceRoute) -> BoxFuture<'a, ZResult<ConnectionView>> {

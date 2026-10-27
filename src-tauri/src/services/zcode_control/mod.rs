@@ -4,7 +4,8 @@
 //! - `config`：官方远控链接的**格式合同**与 settings 持久化——保存只证明「格式已落库」，
 //!   绝不表示已连接官方服务或已取得官方身份；
 //! - `types`：本域公共 DTO／冻结错误码的唯一定义处；
-//! - `auth`：官方 OAuth 授权与**内存凭据**（账号 JWT 只在本进程内存）；
+//! - `auth`：官方 OAuth 授权与凭据生命周期（账号 JWT 只在本进程内存或系统凭据存储；
+//!   授权成功保存、启动 `restore`、失效删除与 `forget` 都经同一代际纪律）；
 //! - `credential_store`：系统凭据存储适配口（含可测 fake）：单条目、UTF-8 JSON 二进制
 //!   secret、恢复禁用标记 checked 写入；原生保险箱实现在桌面三平台；
 //! - `relay`：官方 terminal relay 的**单连接**生命周期（单 owner、无自动重连）；
@@ -19,6 +20,8 @@
 //!   绝不恢复原值）；
 //! - `hub`：进程内**单实例**控制 Hub（桌面与配对手机共享一条物理连接、代际权威、
 //!   能力闸与事件广播）；
+//! - `auto_connect`：自动连接编排（单 worker；每次触发只做一次恢复 + 一次连接，
+//!   条件现查、绝不自动 OAuth；阶段 H 才补网络退避）；
 //! - `evidence`（**仅 debug 证据构建**）：T8.2 未开闸能力的单次验收许可——内存、
 //!   120 秒、一次用户动作，只放宽能力闸，不放宽目标/权限/`fullAccess` 守卫。
 //!
@@ -27,13 +30,14 @@
 pub mod action;
 pub mod audit;
 pub mod auth;
+// C3 起由 Hub 的 `start_auto_connect` 使用（单 worker、一次尝试）；不对外导出。
+mod auto_connect;
 pub mod bridge;
 pub mod codec;
 pub mod command;
 pub mod config;
-// C1 只落适配口与 fake，C2 才接入 AuthService。分期提交期间显式登记 dead_code
-// （同仓先例：staged 能力用 allow 注明消费批次）；C2 消费后可移除本属性。
-#[allow(dead_code)]
+// C1 落适配口与 fake；C2 由 AuthService 消费（保存/恢复/失效删除）；C3 起由
+// `PartsBackend::production` 显式注入 `OsCredentialStore`，故无 staged dead_code。
 pub(crate) mod credential_store;
 mod host;
 pub mod hub;
@@ -64,9 +68,9 @@ pub use action::{
 };
 pub use audit::{AGENT as AUDIT_AGENT, CHANNEL as AUDIT_CHANNEL};
 pub use auth::{
-    AuthService, OAuthProvider, OpenAuthorize, TerminalToken, AUTHORIZE_TIMEOUT, OAUTH_TOKEN_PATH,
-    OFFICIAL_BIGMODEL_APP_ID, OFFICIAL_BIGMODEL_ORIGIN, OFFICIAL_OAUTH_CLIENT_ID,
-    OFFICIAL_ZAI_ORIGIN, OFFICIAL_ZCODE_ORIGIN, RELAY_TOKEN_PATH,
+    AuthProblem, AuthService, AuthStatus, OAuthProvider, OpenAuthorize, TerminalToken,
+    AUTHORIZE_TIMEOUT, OAUTH_TOKEN_PATH, OFFICIAL_BIGMODEL_APP_ID, OFFICIAL_BIGMODEL_ORIGIN,
+    OFFICIAL_OAUTH_CLIENT_ID, OFFICIAL_ZAI_ORIGIN, OFFICIAL_ZCODE_ORIGIN, RELAY_TOKEN_PATH,
 };
 pub use codec::{
     decode_channel, encode_ack, encode_call, encode_frame, encode_listen, ChannelMessage,

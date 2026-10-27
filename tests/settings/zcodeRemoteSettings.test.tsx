@@ -67,12 +67,45 @@ const CONNECTION_CONNECTING = {
   reasonCode: null,
   deviceLabel: null,
 };
+const CONNECTION_OFFLINE = {
+  state: "offline",
+  generation: 5,
+  reasonCode: "offline",
+  deviceLabel: null,
+};
+
+// ---- C4 记住授权夹具（合成 AuthStatus：camelCase 字段与 Rust serde 一致）----
+type AuthFixture = {
+  authorized: boolean;
+  remembered: boolean;
+  restoring: boolean;
+  provider: string | null;
+  problem: string | null;
+};
+
+const authStatus = (over: Partial<AuthFixture> = {}): AuthFixture => ({
+  authorized: false,
+  remembered: false,
+  restoring: false,
+  provider: null,
+  problem: null,
+  ...over,
+});
+
+const AUTH_REMEMBERED = authStatus({ authorized: true, remembered: true, provider: "bigmodel" });
+const AUTH_AUTHORIZED_ONLY = authStatus({ authorized: true, provider: "bigmodel" });
+const AUTH_STORAGE_FAILED = authStatus({
+  authorized: true,
+  problem: "storage_failed",
+});
 
 type ControlFixture = {
   status?: unknown;
+  authStatus?: unknown | (() => unknown);
   authorize?: unknown;
   connect?: unknown;
   disconnect?: unknown;
+  forget?: unknown;
 };
 
 /** 默认后端行为：读 saved；写回显（空白 → missing，其余 → saved）；
@@ -89,7 +122,14 @@ function mockBackend(getPayload: unknown = saved, control: ControlFixture = {}) 
       return { configState: "saved", url: raw };
     }
     if (cmd === "zcode_control_status") return control.status ?? CONNECTION_NEEDS_AUTH;
+    if (cmd === "zcode_control_auth_status") {
+      const value = control.authStatus;
+      return typeof value === "function" ? (value as () => unknown)() : (value ?? null);
+    }
     if (cmd === "zcode_control_authorize") return control.authorize ?? CONNECTION_CONNECTING;
+    if (cmd === "zcode_control_forget_authorization") {
+      return control.forget ?? CONNECTION_NEEDS_AUTH;
+    }
     if (cmd === "zcode_control_connect") {
       return (
         control.connect ?? {
@@ -444,7 +484,8 @@ describe("ZcodeRemoteSettingsCard 官方账号授权与连接（T7.2）", () => 
 
   it("authorize_calls_ipc_without_url_token：授权只传 provider，回执/渲染绝不带 URL 或 token", async () => {
     mockBackend(saved, {
-      status: CONNECTION_NEEDS_AUTH,
+      // C4：授权成功后会并行重读 status/auth；status 与授权回执一致（同为 connecting）。
+      status: { ...CONNECTION_CONNECTING, deviceLabel: "Synthetic device A" },
       // 后端本应只回四字段；这里故意塞 url/token，验证前端白名单消费、绝不外显
       authorize: {
         state: "connecting",
@@ -633,6 +674,88 @@ describe("ZcodeRemoteSettingsCard 官方账号授权与连接（T7.2）", () => 
     );
     // 只补一发：不是每个排队请求各补一发。
     expect(statusCalls()).toHaveLength(2);
+  });
+});
+
+// C4：记住授权与自动恢复（凭据复用设计 §5–§6）。新文案用例显式切 zh；afterEach
+// 恢复 en，既有英文用例不受影响。
+describe("ZcodeRemoteSettingsCard 记住授权（C4）", () => {
+  const connectionState = () => screen.getByTestId("zcode-connection-state");
+  const authState = () => screen.getByTestId("zcode-auth-state");
+
+  afterEach(async () => {
+    await i18n.changeLanguage("en");
+  });
+
+  it("remembered_authorization_does_not_need_second_connect_click：已记住授权可见，且绝不自动/手动再调 connect", async () => {
+    await i18n.changeLanguage("zh");
+    mockBackend(saved, { status: CONNECTION_OFFLINE, authStatus: AUTH_REMEMBERED });
+    render(<ToolRemoteSettingsSection zcodeStatusPollMs={60_000} />);
+    await waitFor(() => expect(getCalls()).toHaveLength(1));
+    fireEvent.click(header());
+
+    await waitFor(() => expect(authState()).toHaveTextContent("已记住授权"));
+    expect(screen.getByText("已记住授权")).toBeVisible();
+    expect(controlCall("zcode_control_connect")).toHaveLength(0);
+  });
+
+  it("authorized_offline_is_not_needs_auth：有授权但未连接 ≠ 需要授权", async () => {
+    await i18n.changeLanguage("zh");
+    mockBackend(saved, { status: CONNECTION_OFFLINE, authStatus: AUTH_AUTHORIZED_ONLY });
+    render(<ToolRemoteSettingsSection zcodeStatusPollMs={60_000} />);
+    await waitFor(() => expect(getCalls()).toHaveLength(1));
+    fireEvent.click(header());
+
+    await waitFor(() => expect(authState()).toHaveTextContent("已授权，未连接"));
+    expect(screen.getByText("已授权，未连接")).toBeVisible();
+    expect(screen.queryByText("需要重新授权")).toBeNull();
+    // 连接态仍照实显示离线（不是「需要授权」）
+    expect(connectionState()).toHaveAttribute("data-connection-state", "offline");
+    expect(screen.queryByText("需要授权")).toBeNull();
+  });
+
+  it("persistence_failure_is_not_a_false_success：记住失败照实说「本次授权可用，但未记住」", async () => {
+    await i18n.changeLanguage("zh");
+    mockBackend(saved, { status: CONNECTION_OFFLINE, authStatus: AUTH_STORAGE_FAILED });
+    render(<ToolRemoteSettingsSection zcodeStatusPollMs={60_000} />);
+    await waitFor(() => expect(getCalls()).toHaveLength(1));
+    fireEvent.click(header());
+
+    await waitFor(() => expect(authState()).toHaveTextContent("本次授权可用，但未记住"));
+    expect(screen.getByText("本次授权可用，但未记住")).toBeVisible();
+    expect(screen.queryByText("已记住授权")).toBeNull();
+  });
+
+  it("forget_refreshes_authorization_and_keeps_link：忘记恰一次 IPC，刷新授权/连接，链接保留", async () => {
+    await i18n.changeLanguage("zh");
+    let currentAuth: AuthFixture = AUTH_REMEMBERED;
+    let currentStatus: unknown = CONNECTION_OFFLINE;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "zcode_remote_config_get") return saved;
+      if (cmd === "zcode_control_status") return currentStatus;
+      if (cmd === "zcode_control_auth_status") return currentAuth;
+      if (cmd === "zcode_control_forget_authorization") {
+        // Hub 语义：忘记后清授权、链接保留 → needs_auth（不是 needs_config）
+        currentAuth = authStatus();
+        currentStatus = CONNECTION_NEEDS_AUTH;
+        return CONNECTION_NEEDS_AUTH;
+      }
+      return null;
+    });
+    render(<ToolRemoteSettingsSection zcodeStatusPollMs={60_000} />);
+    await waitFor(() => expect(getCalls()).toHaveLength(1));
+    fireEvent.click(header());
+    await waitFor(() => expect(authState()).toHaveTextContent("已记住授权"));
+
+    fireEvent.click(screen.getByTestId("zcode-forget"));
+    await waitFor(() => expect(controlCall("zcode_control_forget_authorization")).toHaveLength(1));
+    await waitFor(() =>
+      expect(connectionState()).toHaveAttribute("data-connection-state", "needs_auth")
+    );
+    expect(screen.getByRole("textbox")).toHaveValue(SAVED_URL);
+    // 忘记后不再宣称已记住/已授权
+    expect(screen.queryByText("已记住授权")).toBeNull();
+    expect(screen.queryByText("已授权，未连接")).toBeNull();
   });
 });
 

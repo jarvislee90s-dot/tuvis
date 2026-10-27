@@ -168,6 +168,9 @@ where
 }
 
 /// 生产实现：用户级系统保险箱 + settings 中的非敏感恢复标记。
+///
+/// C3 起由 [`super::hub::PartsBackend::production`] 显式注入 `AuthService`；构造只保存
+/// `DeviceStore`，首次真实 OS 访问发生在 `restore`/`save`/`delete`。
 pub(crate) struct OsCredentialStore {
     prefs: DeviceStore,
 }
@@ -483,6 +486,11 @@ impl MemoryCredentialStore {
 
     pub(crate) fn fail_next(&self, error: CredentialError) {
         self.lock().failure = Some(error);
+    }
+
+    /// 当前持久记录快照（C2：断言保存/删除/覆盖后的内容，不算作 load 计数）。
+    pub(crate) fn stored(&self) -> Option<StoredCredential> {
+        self.lock().record.clone()
     }
 
     pub(crate) fn load_count(&self) -> usize {

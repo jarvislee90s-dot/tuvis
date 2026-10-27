@@ -559,7 +559,18 @@
         "reasonOffline": "The connection went offline — check your network and retry",
         "reasonConflict": "Another device took over this account — resolve the conflict before reconnecting",
         "reasonUnknown": "Control is unavailable right now — try again later",
-        "authorizeNote": "Authorizing opens the official page in your system browser; Tuvis never asks for or stores your password, and never hands credentials to your phone"
+        "authorizeNote": "Authorizing opens the official page in your system browser; Tuvis never asks for or stores your password, and never hands credentials to your phone",
+        "authLabel": "Authorization status",
+        "authRestoring": "Restoring authorization…",
+        "authRemembered": "Authorization remembered",
+        "authAuthorizedOffline": "Authorized, not connected",
+        "authNotRemembered": "This authorization works, but was not remembered",
+        "authNeedsAuth": "Authorization needs to be renewed",
+        "authStorageUnavailable": "Credential storage unavailable",
+        "authStorageFailed": "Credential storage failed",
+        "authRecordInvalid": "Stored credential is invalid or too large",
+        "forget": "Forget authorization",
+        "forgetNote": "Forgetting removes only the remembered account on this computer; the remote link is kept so you can authorize again"
       }
     },
     "audit": {

@@ -1339,14 +1339,19 @@ async fn link_change_invalidates_old_pending_and_actions() {
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     assert_eq!(official.send_text_frames(), 1);
 
-    // 保存新链接 → Hub 推进代际（旧 relay/投影一律作废）。
+    // 保存新链接 → Hub 推进代际（旧 relay/投影作废），但账号 JWT 保留。
     DeviceStore::Owned(conn.clone())
         .with(|c| set_config(c, SYNTH_URL_B))
         .expect("保存合成新链接");
     let changed = hub.config_changed().await;
     let new_generation = changed.generation;
     assert!(new_generation > old_generation, "换链接必须推进代际");
-    assert_eq!(changed.state, ConnectionState::NeedsAuth);
+    assert_eq!(
+        changed.state,
+        ConnectionState::Offline,
+        "换链接保留账号（只需要重连，不需重新授权）"
+    );
+    assert_eq!(official.authorize_calls(), 1, "换链接不得重新 OAuth");
 
     // 旧代际动作（同 actionId 重放）：stale_generation，零新帧、零新账本行。
     let (status, body) = post_action(
@@ -1390,12 +1395,10 @@ async fn link_change_invalidates_old_pending_and_actions() {
     assert_eq!(official.frames().len(), 1, "旧代际卡动作零新帧");
     assert!(official.snoozes().is_empty(), "旧代际卡动作零上游调用");
 
-    // 新链接下重新授权/连接：旧 actionId 走到账本层被判载荷冲突（代际入身份），
-    // 零第二帧——绝不把旧回执当新代际的受理。
-    hub.authorize(OAuthProvider::Bigmodel, Arc::new(|_url: String| Ok(())))
-        .await
-        .expect("新链接假授权成功");
+    // 新链接下直接连接（复用保留的账号 JWT，不再 OAuth）：旧 actionId 走到账本层
+    // 被判载荷冲突（代际入身份），零第二帧——绝不把旧回执当新代际的受理。
     hub.connect().await.expect("新链接假连接成功");
+    assert_eq!(official.authorize_calls(), 1, "新链接不得重新授权");
     let (status, session) = get_json(
         app.clone(),
         &format!("/m/api/v1/zcode/session?sessionId={SESSION}"),
