@@ -102,16 +102,16 @@ function SectionTableHeader(props: {
     : (tool: string) => t("resources.openToolDir", { tool, kind });
   return (
     <div
-      className="bg-muted sticky top-0 z-20 mb-1 w-max min-w-full items-center rounded border px-2 py-1"
+      className="bg-card sticky top-0 z-20 mb-1 w-max min-w-full items-center rounded border px-2 py-1"
       style={SECTION_GRID_STYLE}
     >
       {/* 左上角格：行、列双向冻结（top-0 锁纵向页滚动，left-2 锁横向工具滚动） */}
-      <div className="bg-muted sticky top-0 left-2 z-30 flex items-center gap-1 border-r pr-2">
-        <span className="text-xs font-medium">{t("resources.nameHeader")}</span>
+      <div className="bg-card sticky top-0 left-2 z-30 flex items-center gap-1 border-r pr-2">
+        <span className="text-[13px] font-medium">{t("resources.nameHeader")}</span>
         <Button
           variant="ghost"
           size="sm"
-          className={`h-6 px-1.5 text-[10px] ${sortDir !== "none" ? "text-foreground" : "text-muted-foreground"}`}
+          className={`h-6 px-1.5 text-[11px] ${sortDir !== "none" ? "text-foreground" : "text-muted-foreground"}`}
           title={t("resources.sortByName")}
           aria-label={t("resources.sortByName")}
           onClick={onToggleSort}
@@ -131,7 +131,7 @@ function SectionTableHeader(props: {
             return (
               <span
                 key={tool.id}
-                className={`text-muted-foreground/60 flex items-center justify-center text-[9px] leading-3 ${TOOL_COL_CLS}`}
+                className={`text-muted-foreground flex items-center justify-center text-[11px] leading-3 ${TOOL_COL_CLS}`}
                 title={t("resources.kindNotSupported")}
               >
                 {t("resources.kindNotSupported")}
@@ -613,7 +613,7 @@ export function ResourceKindDialog({
     return (
       <button
         type="button"
-        className="shrink-0 cursor-pointer rounded bg-orange-500/15 px-1.5 py-0.5 text-[10px] text-orange-600 hover:bg-orange-500/25"
+        className="shrink-0 cursor-pointer rounded bg-orange-500/15 px-1.5 py-0.5 text-[11px] text-orange-600 hover:bg-orange-500/25"
         title={`${t("presets.exclusiveBadge")}: ${ex.join(", ")}`}
         onClick={() =>
           openBindingEditor(extensionId, kind === "skill" ? formatSkillName(name) : name)
@@ -676,7 +676,7 @@ export function ResourceKindDialog({
         // 断链徽标：SSOT 存在但部分工具侧符号链接失效（琥珀色警示）
         res.brokenTools && res.brokenTools.length > 0 ? (
           <span
-            className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-500"
+            className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] text-amber-500"
             title={t("resources.linkBrokenTooltip", {
               tools: res.brokenTools.join(", "),
             })}
@@ -695,7 +695,7 @@ export function ResourceKindDialog({
         // 源已停用徽标：MCP 存储 JSON 带 enable:false 原样入库（M7 口径）
         res.sourceDisabled ? (
           <span
-            className="text-muted-foreground rounded border border-dashed px-1 text-[10px]"
+            className="text-muted-foreground rounded border border-dashed px-1 text-[11px]"
             title={t("resources.mcpSourceDisabledHint")}
           >
             {t("resources.mcpSourceDisabled")}
@@ -712,12 +712,12 @@ export function ResourceKindDialog({
     },
   };
 
-  // 单段表格渲染（迁移自 ResourceByKindView，去段头/折叠；行 text-sm → text-xs，A3）
+  // 单段表格渲染（迁移自 ResourceByKindView，去段头/折叠；行 text-sm → text-[13px]，A3）
   const renderKindTable = (kind: ResourceKind) => {
     const cfg = sectionConfig[kind];
     if (cfg.items.length === 0) {
       return (
-        <div className="text-muted-foreground flex items-center gap-2 py-4 text-xs">
+        <div className="text-muted-foreground flex items-center gap-2 py-4 text-[13px]">
           <Info className="h-3.5 w-3.5" />
           {cfg.emptyHint}
         </div>
@@ -737,17 +737,17 @@ export function ResourceKindDialog({
           return (
             <div
               key={res.name}
-              className="w-max min-w-full items-center rounded border p-2 text-xs"
+              className="w-max min-w-full items-center rounded border p-2 text-[13px]"
               style={SECTION_GRID_STYLE}
             >
-              <div className="bg-background sticky left-2 z-10 flex flex-wrap items-center gap-x-1 gap-y-0.5 overflow-hidden border-r">
+              <div className="bg-card sticky left-2 z-10 flex flex-wrap items-center gap-x-1 gap-y-0.5 overflow-hidden border-r">
                 <span className="font-medium">{cfg.displayName(res)}</span>
                 {renderExclusiveBadge(kind, res.name)}
                 {cfg.extraBadge?.(res)}
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="text-destructive h-6 px-1.5 text-[10px]"
+                  className="text-destructive h-6 px-1.5 text-[11px]"
                   title={t("resources.uninstall")}
                   aria-label={t("resources.uninstall")}
                   onClick={() =>
@@ -763,7 +763,7 @@ export function ResourceKindDialog({
                 </Button>
               </div>
               <div className="flex flex-nowrap gap-1">
-                {/* 全部启用竖排双行按钮（A4）：64px 列内两行 text-[10px]——
+                {/* 全部启用竖排双行按钮（A4）：64px 列内两行 text-[11px]——
                     上行「全部」+ 下行「启用/禁用」（全启用态为「禁用」）；
                     title/aria 保留完整文案；点击语义与原单行按钮一致（handleToggleAll 原样随迁） */}
                 <Button
@@ -782,8 +782,8 @@ export function ResourceKindDialog({
                   }
                   onClick={() => handleToggleAll(res, res.enabledTools.length !== tools.length)}
                 >
-                  <span className="text-[10px] leading-tight">{t("resources.allPrefix")}</span>
-                  <span className="text-[10px] leading-tight">
+                  <span className="text-[11px] leading-tight">{t("resources.allPrefix")}</span>
+                  <span className="text-[11px] leading-tight">
                     {res.enabledTools.length === tools.length
                       ? t("resources.allOffAction")
                       : t("resources.allOnAction")}
@@ -844,7 +844,7 @@ export function ResourceKindDialog({
                   key={kind}
                   size="sm"
                   variant={activeKind === kind ? "default" : "outline"}
-                  className="h-7 px-2 text-[10px]"
+                  className="h-7 px-2 text-[11px]"
                   onClick={() => setActiveKind(kind)}
                 >
                   <Icon className="mr-1 h-3 w-3" />
@@ -861,13 +861,13 @@ export function ResourceKindDialog({
                 placeholder={t("resources.searchPlaceholder")}
                 value={search}
                 onChange={(e) => onSearchChange(e.currentTarget.value)}
-                className="h-7 w-40 rounded border px-2 text-xs"
+                className="h-7 w-40 rounded border px-2 text-[13px]"
               />
               {activeKind === "mcp" && (
                 <Button
                   size="sm"
                   variant="ghost"
-                  className="h-7 px-2 text-[10px]"
+                  className="h-7 px-2 text-[11px]"
                   onClick={() => setMcpDialogOpen(true)}
                 >
                   {t("resources.addWithPlus")}
@@ -877,7 +877,7 @@ export function ResourceKindDialog({
           </div>
 
           {/* 矩阵图例（随大表迁入弹窗）：点亮图标 / 常驻徽标 / 表头定位语义 */}
-          <p className="text-muted-foreground text-[10px] leading-tight">
+          <p className="text-muted-foreground text-[11px] leading-tight">
             {t("resources.matrixHint")}
           </p>
 
@@ -924,16 +924,19 @@ export function ResourceKindDialog({
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>{t("resources.binding.editTitle")}</DialogTitle>
-            <DialogDescription className="pt-1 text-xs">
+            <DialogDescription className="pt-1 text-[13px]">
               {bindingTarget?.displayName}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3 py-2">
             <div>
-              <label className="text-xs font-medium">{t("resources.binding.tools")}</label>
+              <label className="text-[13px] font-medium">{t("resources.binding.tools")}</label>
               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1">
                 {tools.map((tool) => (
-                  <label key={tool.id} className="flex cursor-pointer items-center gap-1 text-xs">
+                  <label
+                    key={tool.id}
+                    className="flex cursor-pointer items-center gap-1 text-[13px]"
+                  >
                     <input
                       type="checkbox"
                       checked={bindingTools.includes(tool.id)}
@@ -951,12 +954,12 @@ export function ResourceKindDialog({
               </div>
             </div>
             <div>
-              <label className="text-xs font-medium">{t("resources.binding.reason")}</label>
+              <label className="text-[13px] font-medium">{t("resources.binding.reason")}</label>
               <textarea
                 value={bindingReason}
                 onChange={(e) => setBindingReason(e.currentTarget.value)}
                 placeholder={t("resources.binding.reasonPlaceholder")}
-                className="h-16 w-full rounded border px-2 py-1 text-xs"
+                className="h-16 w-full rounded border px-2 py-1 text-[13px]"
               />
             </div>
           </div>

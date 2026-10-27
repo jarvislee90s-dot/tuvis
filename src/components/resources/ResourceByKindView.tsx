@@ -68,7 +68,7 @@ export function ResourceByKindView() {
   };
 
   if (!resources) {
-    return <div className="text-muted-foreground py-4 text-xs">{t("common.loading")}</div>;
+    return <div className="text-muted-foreground py-4 text-[13px]">{t("common.loading")}</div>;
   }
 
   // 搜索判据与弹窗共用一个实现（kindMeta.matchesResourceSearch）：段头计数与弹窗 tab
@@ -100,13 +100,13 @@ export function ResourceByKindView() {
               placeholder={t("resources.searchPlaceholder")}
               value={search}
               onChange={(e) => setSearch(e.currentTarget.value)}
-              className="h-7 w-40 rounded border px-2 text-xs"
+              className="border-input bg-background h-7 w-40 rounded border px-2 text-[13px]"
             />
             {/* 快捷跳转（用户反馈 wave33 Item B）：兔维斯 仓库 / ~/.agents 目录直达 */}
             <Button
               size="sm"
               variant="ghost"
-              className="h-6 px-1.5 text-[10px]"
+              className="h-6 px-1.5 text-[11px]"
               title={t("resources.openMamRepo")}
               aria-label={t("resources.openMamRepo")}
               onClick={() => void revealQuickJump(".tuvis/skills")}
@@ -117,7 +117,7 @@ export function ResourceByKindView() {
             <Button
               size="sm"
               variant="ghost"
-              className="h-6 px-1.5 text-[10px]"
+              className="h-6 px-1.5 text-[11px]"
               title={t("resources.openAgentsDir")}
               aria-label={t("resources.openAgentsDir")}
               onClick={() => void revealQuickJump(".agents/skills")}
@@ -129,7 +129,7 @@ export function ResourceByKindView() {
           <Button
             size="sm"
             variant="outline"
-            className="h-6 px-2 text-[10px]"
+            className="h-6 px-2 text-[11px]"
             onClick={() => setManifestDlgOpen(true)}
           >
             <FileJson className="mr-1 h-3 w-3" />
@@ -171,12 +171,12 @@ export function ResourceByKindView() {
             <DialogTitle>{t("resources.installFromManifest")}</DialogTitle>
           </DialogHeader>
           <div className="py-2">
-            <label className="text-xs font-medium">{t("resources.manifestPathLabel")}</label>
+            <label className="text-[13px] font-medium">{t("resources.manifestPathLabel")}</label>
             <input
               value={manifestPath}
               onChange={(e) => setManifestPath(e.currentTarget.value)}
               placeholder={t("resources.manifestPathPlaceholder")}
-              className="h-8 w-full rounded border px-2 text-xs"
+              className="h-8 w-full rounded border px-2 text-[13px]"
             />
           </div>
           <DialogFooter className="gap-2">
