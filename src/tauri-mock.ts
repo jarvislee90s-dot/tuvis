@@ -40,7 +40,17 @@ import {
   mockPricingCatalogSearch,
   mockPricingIdentitySet,
   mockPricingQuoteGet,
+  mockTpsHeartbeat,
+  mockTpsInstallApply,
+  mockTpsInstallPreview,
+  mockTpsPointsResult,
+  mockTpsRefresh,
+  mockTpsSnapshotResult,
+  mockTpsUninstall,
+  mockSpeedDashboard,
 } from "@/lib/usage/mockFixtures";
+import type { SpeedDashboardQuery } from "@/types/speed";
+import type { TpsInstallChoice, TpsSelection, TpsViewRange } from "@/types/tps";
 import type {
   UsageFilters,
   UsageGroupBy,
@@ -169,6 +179,29 @@ if (!isTauri) {
   // 即"一轮运行"——mock 安装时取一次常量，整页生命周期内恒定，刷新即变
   const mockAppRunId = `mock-run-${Date.now()}`;
 
+  // —— 事件回放（Task 7 新增）——
+  // transformCallback 真的把回调存下来（此前只发号不存，事件无从回放）；
+  // `plugin:event|listen` 把事件名 → 回调号登记进 mockEventListeners。
+  // `workspace_request_navigation` 先存后"emit"（逐个回放注册的回调），与 Rust
+  // 命令同语义——浏览器预览里点宠物/标题栏入口也能真实驱动四页导航 hook。
+  type MockEventMessage = { event: string; id: number; payload: unknown };
+  const mockEventCallbacks = new Map<string, (msg: MockEventMessage) => void>();
+  const mockEventListeners = new Map<string, Set<string>>();
+  let mockCallbackSeq = 0;
+  let mockEventIdSeq = 1000;
+  const dispatchMockEvent = (event: string, payload: unknown) => {
+    const handlers = mockEventListeners.get(event);
+    if (!handlers) return;
+    for (const handlerId of handlers) {
+      mockEventCallbacks.get(handlerId)?.({ event, id: mockEventIdSeq++, payload });
+    }
+  };
+
+  // —— 四页工作区导航队列（Task 7）：与 Rust NavigationQueue 同语义的 in-memory 版 ——
+  // request 换新 revision 并替换 pending；ack 仅在 revision 命中 pending 时清队。
+  let mockNavRevision = 0;
+  let mockNavPending: { revision: number; tab: string } | null = null;
+
   // Mock __TAURI_INTERNALS__
   (window as unknown as { __TAURI_INTERNALS__: TauriInternalsMock }).__TAURI_INTERNALS__ = {
     metadata: {
@@ -180,10 +213,19 @@ if (!isTauri) {
       return mockInvoke(cmd, args);
     },
     convertFileSrc: (path: string) => path,
-    transformCallback: (_callback, _once) => {
-      return Math.random().toString(36).slice(2);
+    transformCallback: (callback, once) => {
+      const id = `mock-cb-${++mockCallbackSeq}`;
+      // 与真实 Tauri 同构：回调原样登记，事件到达时以 `{event, id, payload}` 调用；
+      // 其他用途（Channel 等）无 dispatch 方，登记不副作用
+      mockEventCallbacks.set(id, (msg) => {
+        (callback as (msg: MockEventMessage) => void)(msg);
+        if (once) mockEventCallbacks.delete(id);
+      });
+      return id;
     },
-    unregisterCallback: (_id) => {},
+    unregisterCallback: (id) => {
+      mockEventCallbacks.delete(id);
+    },
     postMessage: () => {},
   };
 
@@ -259,8 +301,29 @@ if (!isTauri) {
               form: "app",
               jumpSupported: false,
             },
+            // 实机反馈轮 2026-10-27 #1 截图夹具：长项目名 + 长分支名卡——
+            // 验证首行「项目名截断兜底、分支先让路」与会话名第二行形态（仅浏览器 mock）
+            {
+              id: "mock-kimi-long-1",
+              agentType: "kimi",
+              projectName: "MultiAgents-Manager",
+              projectPath: "/Users/jarvis/Documents/MultiAgents-Manager",
+              title: "（3）使用技能【win-console-inject-probe】探测注入规格",
+              gitBranch: "feat/desktop-workspace-speed-v2-session-card-two-row-header",
+              githubUrl: null,
+              status: "processing",
+              lastMessage: "正在执行 M6R 验证脚本套件，收集屏读证据...",
+              lastMessageRole: "assistant",
+              lastMessageSubagentReport: false,
+              lastActivityAt: new Date().toISOString(),
+              pid: 12348,
+              cpuUsage: 1.7,
+              activeSubagentCount: 2,
+              form: "cli",
+              jumpSupported: true,
+            },
           ],
-          totalCount: 3,
+          totalCount: 4,
           waitingCount: 1,
         });
 
@@ -874,7 +937,25 @@ if (!isTauri) {
 
       // Event/Notification plugin commands — return safe mock values
       case "plugin:event|listen":
-      case "plugin:event|once":
+      case "plugin:event|once": {
+        // Task 7：登记 事件名 → 回调号，供 workspace_request_navigation 回放事件。
+        // 返回数值 eventId（与真实命令同形；旧 mock 返回 unlisten 函数是错形，无人消费）
+        const listenArgs = args as { event?: string; handler?: unknown } | undefined;
+        if (listenArgs?.event) {
+          const handlerId = String(listenArgs.handler ?? "");
+          const set = mockEventListeners.get(listenArgs.event) ?? new Set<string>();
+          set.add(handlerId);
+          mockEventListeners.set(listenArgs.event, set);
+        }
+        return Promise.resolve(mockEventIdSeq++);
+      }
+      case "plugin:event|unlisten": {
+        const unlistenArgs = args as { event?: string; eventId?: unknown } | undefined;
+        if (unlistenArgs?.event) {
+          mockEventListeners.get(unlistenArgs.event)?.delete(String(unlistenArgs.eventId ?? ""));
+        }
+        return Promise.resolve(undefined);
+      }
       case "plugin:notification|register_listener":
       case "plugin:notification|register_action_types":
         return Promise.resolve(() => {}); // unlisten function
@@ -1135,6 +1216,55 @@ if (!isTauri) {
             quoteArgs?.fallbackRate
           )
         );
+      }
+
+      // —— TPS 短时抽样七命令（Task 8；形状与 mockFixtures 同源）——
+      case "tps_snapshot":
+        return Promise.resolve(
+          mockTpsSnapshotResult((args as { selection?: TpsSelection } | undefined)?.selection)
+        );
+      case "tps_points": {
+        const tpsArgs = args as { selection?: TpsSelection; viewRange?: TpsViewRange } | undefined;
+        return Promise.resolve(mockTpsPointsResult(tpsArgs?.selection, tpsArgs?.viewRange ?? "1h"));
+      }
+      case "tps_refresh":
+        return Promise.resolve(mockTpsRefresh());
+      case "tps_view_heartbeat":
+        return Promise.resolve(mockTpsHeartbeat(args as { visible?: boolean } | undefined));
+      case "tps_install_preview":
+        return Promise.resolve(
+          mockTpsInstallPreview((args as { tool?: string } | undefined)?.tool)
+        );
+      case "tps_install_apply": {
+        const applyArgs = args as { previewId?: string; choice?: TpsInstallChoice } | undefined;
+        return mockTpsInstallApply(applyArgs?.previewId, applyArgs?.choice);
+      }
+      case "tps_uninstall":
+        return mockTpsUninstall();
+      case "tps_speed_dashboard":
+        // V2 速度 dashboard（Task 9）：只读快照；mock 同源夹具，形状与 Rust camelCase 一致
+        return Promise.resolve(
+          mockSpeedDashboard((args as { query?: SpeedDashboardQuery } | undefined)?.query)
+        );
+
+      // —— 四页工作区导航三命令（Task 7；先存后 emit，与 Rust 命令同语义）——
+      case "workspace_request_navigation": {
+        const tab = (args as { tab?: string } | undefined)?.tab ?? "messages";
+        mockNavRevision += 1;
+        const nav = { revision: mockNavRevision, tab };
+        mockNavPending = nav; // ① 先存
+        dispatchMockEvent("tuvis-workspace-navigation", nav); // ② 后 emit
+        return Promise.resolve(nav);
+      }
+      case "workspace_peek_navigation":
+        return Promise.resolve(mockNavPending);
+      case "workspace_ack_navigation": {
+        const revision = (args as { revision?: number } | undefined)?.revision;
+        if (mockNavPending !== null && mockNavPending.revision === revision) {
+          mockNavPending = null;
+          return Promise.resolve(true);
+        }
+        return Promise.resolve(false);
       }
 
       // Default: return empty success
