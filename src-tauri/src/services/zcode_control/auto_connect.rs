@@ -961,4 +961,179 @@ mod tests {
         assert_eq!(fake.connect_count(), 1);
         assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
     }
+
+    /// 真实掉线（覆盖前 `paired`、新状态 `offline`）唤醒新一轮；worker 自身失败
+    /// （覆盖前 `connecting`/`offline`）绝不唤醒、绝不重置预算。
+    #[tokio::test(start_paused = true)]
+    async fn real_drop_opens_new_round_but_worker_failure_does_not() {
+        let fake = Arc::new(FakeConnector::authorized());
+        fake.queue(vec![
+            Ok(paired_view()),          // 初始连接
+            Err(ZcodeError::offline()), // 真实掉线后的第一次恢复（被闸停住）
+            Err(ZcodeError::offline()), // 新轮 1s 档
+            Err(ZcodeError::offline()), // 新轮 3s 档
+            Ok(paired_view()),          // 新轮 10s 档
+        ]);
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let (events, receiver) = mpsc::channel(8);
+        let hub = Arc::new(ZcodeHub::with_pump_and_lag(
+            store.clone(),
+            fake.clone(),
+            CapabilityView::default(),
+            receiver,
+            Arc::new(TestPump),
+            RelayLag::new(),
+        ));
+        hub.start_auto_connect();
+        wait_until(|| hub.connection().state == ConnectionState::Paired).await;
+        assert_eq!(fake.connect_count(), 1);
+        let attempts_paired = hub.auto_attempt_count();
+
+        // 真实掉线：事件泵覆盖前是 paired，新状态 offline。
+        let gate = fake.gate_connect();
+        events
+            .send(RelayEvent::State(ConnectionView {
+                state: ConnectionState::Offline,
+                generation: 2,
+                reason_code: Some(codes::OFFLINE.into()),
+                device_label: None,
+            }))
+            .await
+            .unwrap();
+        wait_until(|| fake.connect_count() == 2).await;
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::Connecting,
+            "真实掉线唤醒的 attempt 必须已在握手中"
+        );
+        let attempts_after_drop = hub.auto_attempt_count();
+        assert!(
+            attempts_after_drop > attempts_paired,
+            "真实掉线必须开新一轮"
+        );
+
+        // worker 自身失败的形态：connecting → offline（覆盖前不是 paired）不得唤醒。
+        events
+            .send(RelayEvent::State(ConnectionView {
+                state: ConnectionState::Offline,
+                generation: 3,
+                reason_code: Some(codes::OFFLINE.into()),
+                device_label: None,
+            }))
+            .await
+            .unwrap();
+        wait_until(|| hub.connection().state == ConnectionState::Offline).await;
+        settle_auto().await;
+        assert_eq!(
+            hub.auto_attempt_count(),
+            attempts_after_drop,
+            "worker 自身失败的 offline 不得开新轮"
+        );
+        assert_eq!(fake.connect_count(), 2);
+
+        gate.notify_one();
+        settle_auto().await;
+        // 真实掉线开的新轮从 1s 首档重算；沿用旧轮剩余预算会变成 3s。
+        advance_and_settle(Duration::from_millis(999)).await;
+        assert_eq!(fake.connect_count(), 2, "1s 之前不得重试");
+        advance_and_settle(Duration::from_millis(1)).await;
+        wait_until(|| fake.connect_count() == 3).await;
+
+        // worker 自身失败落定后的 offline 事件（覆盖前已是 offline）同样不得唤醒。
+        let attempts_after_failure = hub.auto_attempt_count();
+        events
+            .send(RelayEvent::State(ConnectionView {
+                state: ConnectionState::Offline,
+                generation: 4,
+                reason_code: Some(codes::OFFLINE.into()),
+                device_label: None,
+            }))
+            .await
+            .unwrap();
+        settle_auto().await;
+        assert_eq!(hub.auto_attempt_count(), attempts_after_failure);
+        assert_eq!(fake.connect_count(), 3);
+
+        advance_and_settle(Duration::from_millis(2_999)).await;
+        assert_eq!(fake.connect_count(), 3, "第二次退避必须是 3s");
+        advance_and_settle(Duration::from_millis(1)).await;
+        wait_until(|| fake.connect_count() == 4).await;
+        advance_and_settle(Duration::from_millis(9_999)).await;
+        assert_eq!(fake.connect_count(), 4, "第三次退避必须是 10s");
+        advance_and_settle(Duration::from_millis(1)).await;
+        wait_until(|| fake.connect_count() == 5).await;
+        wait_until(|| hub.connection().state == ConnectionState::Paired).await;
+
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(fake.connect_count(), 5, "恢复配对后不得再自动重连");
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 显式 connect 的 offline 失败 = 新用户触发：立即取消旧退避，预算从 1s 首档重开。
+    #[tokio::test(start_paused = true)]
+    async fn explicit_connect_offline_restarts_retry_budget() {
+        let fake = Arc::new(FakeConnector::authorized());
+        fake.queue(vec![
+            Err(ZcodeError::offline()), // worker 首次
+            Err(ZcodeError::offline()), // 用户 connect_requested
+            Err(ZcodeError::offline()), // 被唤醒后的新一轮首次（立即）
+            Ok(paired_view()),          // 新预算 1s 档
+        ]);
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store,
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+
+        hub.start_auto_connect();
+        wait_until(|| fake.connect_count() == 1).await;
+
+        let error = hub.connect_requested().await.unwrap_err();
+        assert!(error.is(codes::OFFLINE));
+        // 不推进虚拟时间：旧 1s 等待必须被取消，worker 立即开新一轮（第 3 次 connect）。
+        wait_until(|| fake.connect_count() == 3).await;
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        // 预算已重置：新一轮的下一档是 1s（若沿用旧轮次则是 3s）。
+        advance_and_settle(Duration::from_millis(999)).await;
+        assert_eq!(fake.connect_count(), 3, "新轮首档 1s 之前不得重试");
+        advance_and_settle(Duration::from_millis(1)).await;
+        wait_until(|| fake.connect_count() == 4).await;
+        wait_until(|| hub.connection().state == ConnectionState::Paired).await;
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(fake.connect_count(), 4);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 显式 connect 成功不额外唤醒：一次点击只增加一次 backend connect。
+    #[tokio::test(start_paused = true)]
+    async fn explicit_connect_success_does_not_extra_wake() {
+        let fake = Arc::new(FakeConnector::authorized());
+        fake.queue(vec![Err(ZcodeError::offline()), Ok(paired_view())]);
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store,
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+
+        hub.start_auto_connect();
+        wait_until(|| fake.connect_count() == 1).await;
+
+        let view = hub.connect_requested().await.unwrap();
+        assert_eq!(view.state, ConnectionState::Paired);
+        assert_eq!(fake.connect_count(), 2);
+        settle_auto().await;
+        assert_eq!(
+            fake.connect_count(),
+            2,
+            "成功不得额外唤醒第二个 backend connect"
+        );
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(fake.connect_count(), 2);
+    }
 }
