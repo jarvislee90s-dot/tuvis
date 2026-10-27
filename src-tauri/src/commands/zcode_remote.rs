@@ -177,7 +177,7 @@ fn status_with(hub: &ZcodeHub) -> ConnectionView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use futures::future::BoxFuture;
@@ -185,8 +185,8 @@ mod tests {
     use crate::remote::pairing::DeviceStore;
     use crate::services::zcode_control::config::set_config as store_set_config;
     use crate::services::zcode_control::{
-        ActionContext, ActionReceipt, BoundTarget, CapabilityView, ConfigState, ConnectionState,
-        ControlAction, DeviceRoute, HubBackend, SessionView, TargetKey,
+        ActionContext, ActionReceipt, AuthStatus, BoundTarget, CapabilityView, ConfigState,
+        ConnectionState, ControlAction, DeviceRoute, HubBackend, SessionView, TargetKey,
     };
 
     const URL: &str = "https://zcode.z.ai/remote/v4?sid=synthetic-cmd-0001&name=SyntheticCmd";
@@ -197,6 +197,18 @@ mod tests {
         authorize_calls: AtomicUsize,
         reset_calls: AtomicUsize,
         reset_generations: Mutex<Vec<u64>>,
+        /// 授权路径的真实状态：authorize 置 true，forget 置 false；
+        /// `config_changed` 之后 Hub 必须据此保留/清除缓存（不得默认未授权）。
+        authorized: AtomicBool,
+    }
+
+    impl FakeBackend {
+        fn status(&self) -> AuthStatus {
+            AuthStatus {
+                authorized: self.authorized.load(Ordering::SeqCst),
+                ..AuthStatus::default()
+            }
+        }
     }
 
     impl HubBackend for FakeBackend {
@@ -206,7 +218,23 @@ mod tests {
             _open: OpenAuthorize,
         ) -> BoxFuture<'a, ZResult<()>> {
             self.authorize_calls.fetch_add(1, Ordering::SeqCst);
+            self.authorized.store(true, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
+        }
+
+        fn restore_authorization<'a>(&'a self) -> BoxFuture<'a, AuthStatus> {
+            let status = self.status();
+            Box::pin(async move { status })
+        }
+
+        fn auth_status(&self) -> AuthStatus {
+            self.status()
+        }
+
+        fn forget_authorization<'a>(&'a self) -> BoxFuture<'a, AuthStatus> {
+            self.authorized.store(false, Ordering::SeqCst);
+            let status = self.status();
+            Box::pin(async move { status })
         }
 
         fn connect<'a>(&'a self, _route: DeviceRoute) -> BoxFuture<'a, ZResult<ConnectionView>> {
@@ -331,7 +359,7 @@ mod tests {
         assert_eq!(hub.connection(), before, "失败保存不得改动旧连接状态");
     }
 
-    /// 保存成功：先落库、再通知同一 Hub；代际推进、JWT/投影清理、旧动作失效。
+    /// 保存成功：先落库、再通知同一 Hub；代际推进、断旧 relay/作废投影，**账号保留**。
     #[tokio::test]
     async fn config_set_success_notifies_and_advances_generation() {
         let fake = Arc::new(FakeBackend::default());
@@ -339,6 +367,11 @@ mod tests {
         hub.authorize(OAuthProvider::Bigmodel, noop_open())
             .await
             .unwrap();
+        assert_eq!(
+            fake.authorize_calls.load(Ordering::SeqCst),
+            1,
+            "前置：已授权一次"
+        );
         let before = hub.connection().generation;
 
         let conn = memory_db();
@@ -351,15 +384,28 @@ mod tests {
 
         let after = hub.connection();
         assert!(after.generation > before, "配置变更必须推进代际");
-        assert_eq!(after.state, ConnectionState::NeedsAuth);
+        assert_eq!(
+            after.state,
+            ConnectionState::Offline,
+            "换链接保留账号 JWT（不再退回 needs_auth）"
+        );
+        assert!(
+            hub.auth_status().authorized,
+            "Hub 授权缓存必须按后端真实状态保留"
+        );
         assert_eq!(fake.reset_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             *fake.reset_generations.lock().unwrap(),
             vec![after.generation],
-            "reset 必须拿到新代际（清 JWT/投影）"
+            "reset 必须拿到新代际（断 relay/作废投影）"
         );
-        // 旧 JWT 已被清理：再次连接必须重新授权，不得复用旧凭据。
-        assert!(hub.connect().await.unwrap_err().is(codes::NEEDS_AUTH));
+        // 旧 JWT 保留：无需重新授权即可连新链接，OAuth 次数不增加。
+        assert!(hub.connect().await.unwrap().is_paired());
+        assert_eq!(
+            fake.authorize_calls.load(Ordering::SeqCst),
+            1,
+            "换链接不得重新 OAuth"
+        );
     }
 
     /// status 只读返回 `ConnectionView` 四字段，序列化后绝无凭据/URL/token。

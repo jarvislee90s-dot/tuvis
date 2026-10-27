@@ -111,6 +111,9 @@ impl ZcodeHub {
     /// 顺序：内存暂停/前置条件 → 恢复授权（不打开浏览器）→ 条件复核 → connect。
     /// 任何不满足都直接返回；本阶段不重试、不调用 `execute`。
     async fn try_auto_connect(&self) {
+        // 测试观察口：证明本次尝试已开始（负向用例据此等待 worker 跑完，不用 sleep）。
+        #[cfg(test)]
+        self.record_auto_attempt();
         if self.auto_connect_paused() {
             return;
         }

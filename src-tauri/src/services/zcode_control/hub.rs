@@ -883,6 +883,10 @@ pub struct ZcodeHub {
     /// 持久意图另见 settings 的 `remote.zcode_auto_connect`；本标记只封住忘记期间
     /// 「旧 restore 抢在新删除之前复活内存凭据」的窗口，不跨进程。
     auto_paused: AtomicBool,
+    /// 测试观察口：自动连接 worker 已执行的尝试次数（证明「等 worker 跑完」而不是
+    /// 靠固定 sleep；不影响生产行为）。
+    #[cfg(test)]
+    auto_attempts: AtomicU64,
     /// T8.2 debug 证据构建的单次验收许可册（进程内存；不落 settings/DB）。
     #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
     evidence: EvidencePermitStore,
@@ -998,6 +1002,8 @@ impl ZcodeHub {
             auto_started: AtomicBool::new(false),
             auto_notify: Arc::new(Notify::new()),
             auto_paused: AtomicBool::new(false),
+            #[cfg(test)]
+            auto_attempts: AtomicU64::new(0),
             #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
             evidence: EvidencePermitStore::new(),
         };
@@ -1264,6 +1270,10 @@ impl ZcodeHub {
     /// 走官方授权。成功后落 `offline`、持久化自动连接意图并唤醒自动连接 worker
     /// （worker 未启动/条件不满足时仍需显式 [`Self::connect_requested`]）。
     ///
+    /// 进入时若已有旧连接/在途握手（`paired`/`connecting`）：先在锁内推进代际、置
+    /// `needs_auth`、作废旧投影，再锁外断开旧 relay，最后才走 OAuth；旧目标绝不跨进
+    /// 新授权代际。初次授权（`needs_auth`/`offline`）不额外断开。
+    ///
     /// 本方法**不**自动打开第二次浏览器，也不在授权结果里携带 JWT；自动连接只走
     /// 既有 [`Self::connect`]。
     pub async fn authorize(
@@ -1271,15 +1281,39 @@ impl ZcodeHub {
         provider: OAuthProvider,
         open: OpenAuthorize,
     ) -> ZResult<ConnectionView> {
-        let generation = {
-            let inner = self.lock();
+        let (generation, disconnected) = {
+            let mut inner = self.lock();
             if !inner.configured {
                 drop(inner);
                 self.publish(ConnectionState::NeedsConfig, None);
                 return Err(ZcodeError::of(codes::NEEDS_CONFIG));
             }
-            inner.generation
+            let mut disconnected = None;
+            if matches!(
+                inner.state,
+                ConnectionState::Paired | ConnectionState::Connecting
+            ) {
+                inner.generation = inner.generation.wrapping_add(1);
+                inner.authorized = false;
+                inner.state = ConnectionState::NeedsAuth;
+                inner.reason_code = None;
+                inner.device_label = None;
+                // 旧连接已应用的 relay 状态不得回写新授权代际。
+                inner.relay_floor = inner.relay_generation;
+                let view = inner.view();
+                let stale = inner.stale_sessions(view.generation);
+                disconnected = Some((view, stale));
+            }
+            (inner.generation, disconnected)
         };
+        if let Some((view, stale)) = disconnected {
+            self.emit_connection(&view);
+            for stale in &stale {
+                self.emit_session(stale);
+            }
+            // 取消在途握手/关闭旧 WS；初次授权（needs_auth/offline）不多调一次。
+            self.backend.disconnect().await;
+        }
         if let Err(error) = self.backend.authorize(provider, open).await {
             return Err(self.apply_failure(generation, error));
         }
@@ -1292,6 +1326,9 @@ impl ZcodeHub {
         inner.state = ConnectionState::Offline;
         inner.reason_code = None;
         inner.device_label = None;
+        // 断开旧连接期间可能又应用了 relay 状态：接受新授权前把 floor 抬到已应用代际，
+        // 旧连接的任何迟到状态都不得回写新授权代际。
+        inner.relay_floor = inner.relay_generation;
         let view = inner.view();
         let stale = inner.stale_sessions(view.generation);
         drop(inner);
@@ -1362,32 +1399,39 @@ impl ZcodeHub {
         self.pause_auto_connect();
         let auto_persisted = persist_auto_connect(&self.store, false).is_ok();
         // 2) 推进控制代际、进入关闭窗口并断开 relay（关闭窗口阻止并发新连接）。
-        let (_closed, guard) = self.begin_disconnect();
+        let (closed, guard) = self.begin_disconnect();
+        let closed_generation = closed.generation;
         self.lock().authorized = false;
         self.finish_disconnect(guard).await;
         // 3) 后端清内存/取消旧 epoch/禁用恢复并删除持久记录（删除失败如实上报）。
         let status = self.backend.forget_authorization().await;
-        self.sync_authorization(&status);
         // 4) 链接保留（不碰 config）；展示落「需要重新授权 / 需要配置」。
+        //
+        // 删除可能耗时：期间若更新的配置变更/断开/冲突已接管代际，更新者的状态优先，
+        // 本步骤绝不覆盖；删除失败仍如实回错（已清/不恢复语义不变）。
         let configured = self.read_configured();
-        let (view, stale, changed) = {
+        let (view, stale, changed, _superseded) = {
             let mut inner = self.lock();
-            inner.configured = configured;
-            inner.authorized = false;
-            let before = inner.state;
-            inner.state = if configured {
-                ConnectionState::NeedsAuth
+            if inner.generation != closed_generation {
+                (inner.view(), Vec::new(), false, true)
             } else {
-                ConnectionState::NeedsConfig
-            };
-            inner.reason_code = None;
-            inner.device_label = None;
-            // 断开触发的旧 relay 状态不得把「需要授权」改写回 offline。
-            inner.relay_floor = inner.relay_generation;
-            let view = inner.view();
-            let stale = inner.stale_sessions(view.generation);
-            let changed = before != view.state;
-            (view, stale, changed)
+                inner.configured = configured;
+                inner.authorized = false;
+                let before = inner.state;
+                inner.state = if configured {
+                    ConnectionState::NeedsAuth
+                } else {
+                    ConnectionState::NeedsConfig
+                };
+                inner.reason_code = None;
+                inner.device_label = None;
+                // 断开触发的旧 relay 状态不得把「需要授权」改写回 offline。
+                inner.relay_floor = inner.relay_generation;
+                let view = inner.view();
+                let stale = inner.stale_sessions(view.generation);
+                let changed = before != view.state;
+                (view, stale, changed, false)
+            }
         };
         if changed {
             self.emit_connection(&view);
@@ -1398,6 +1442,7 @@ impl ZcodeHub {
         if status.problem.is_some() || !auto_persisted {
             return Err(ZcodeError::of(codes::STORAGE_FAILED));
         }
+        // `_superseded` 时 view 已是更新者的当前视图，本函数不覆盖它。
         Ok(view)
     }
 
@@ -1454,6 +1499,17 @@ impl ZcodeHub {
 
     pub(crate) fn auto_connect_store(&self) -> &DeviceStore {
         &self.store
+    }
+
+    /// 测试观察口：worker 已执行到 `try_auto_connect` 的次数（同步信号，不用 sleep）。
+    #[cfg(test)]
+    pub(crate) fn auto_attempt_count(&self) -> u64 {
+        self.auto_attempts.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_auto_attempt(&self) {
+        self.auto_attempts.fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) fn auto_connect_paused(&self) -> bool {
@@ -2187,9 +2243,12 @@ impl ZcodeHub {
 mod tests {
     use super::*;
     use crate::database::dao::settings::{try_get_setting_conn, try_set_setting_conn};
-    use crate::services::zcode_control::auth::{AuthProblem, AuthStatus};
+    use crate::services::zcode_control::auth::{AuthProblem, AuthService, AuthStatus};
     use crate::services::zcode_control::auto_connect::AUTO_CONNECT_KEY;
     use crate::services::zcode_control::config::set_config;
+    use crate::services::zcode_control::credential_store::{
+        MemoryCredentialStore, StoredCredential, SCHEMA_VERSION,
+    };
     use crate::services::zcode_control::types::{
         ActionState, ActiveWork, AnswerEntry, CapabilityFlag, ControlView, PendingKind, PendingView,
     };
@@ -2603,6 +2662,22 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), wait)
             .await
             .expect("1s 内必须到达目标连接态");
+    }
+
+    /// 等 worker 至少执行到第 `at_least` 次尝试（同步信号；负向断言据此确认
+    /// 「worker 已跑过」而不是靠固定 sleep 猜时序）。
+    async fn wait_for_auto_attempt(hub: &ZcodeHub, at_least: u64) {
+        for _ in 0..200 {
+            if hub.auto_attempt_count() >= at_least {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "自动连接 worker 未在预期内尝试：{} < {}",
+            hub.auto_attempt_count(),
+            at_least
+        );
     }
 
     /// 等 checked 写入真正落库（KICKED 的持久暂停走 blocking 池）。
@@ -5599,7 +5674,8 @@ mod tests {
 
         hub.start_auto_connect();
         hub.wake_auto_connect();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // 同步信号：等 worker 把初始尝试 + 本次唤醒都跑完，再断言没有越权动作。
+        wait_for_auto_attempt(&hub, 2).await;
 
         assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 0);
         assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
@@ -5642,9 +5718,9 @@ mod tests {
         assert_eq!(stored_auto(&store).as_deref(), Some("false"));
 
         // 暂停后 worker 不得重连。
-        hub.start_auto_connect();
         let connects = fake.connect_calls.load(Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        hub.start_auto_connect();
+        wait_for_auto_attempt(&hub, 1).await;
         assert_eq!(fake.connect_calls.load(Ordering::SeqCst), connects);
     }
 
@@ -5730,8 +5806,9 @@ mod tests {
 
         // 忘记后即使被唤醒也不得自动重连。
         let connects = fake.connect_calls.load(Ordering::SeqCst);
+        let attempts = hub.auto_attempt_count();
         hub.wake_auto_connect();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        wait_for_auto_attempt(&hub, attempts + 1).await;
         assert_eq!(fake.connect_calls.load(Ordering::SeqCst), connects);
         assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
     }
@@ -5769,8 +5846,9 @@ mod tests {
         assert_eq!(stored_auto(&store).as_deref(), Some("false"));
 
         let connects = fake.connect_calls.load(Ordering::SeqCst);
+        let attempts = hub.auto_attempt_count();
         hub.wake_auto_connect();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        wait_for_auto_attempt(&hub, attempts + 1).await;
         assert_eq!(fake.connect_calls.load(Ordering::SeqCst), connects);
     }
 
@@ -5793,13 +5871,140 @@ mod tests {
         wait_for_stored_auto(&store, "false").await;
 
         let connects = fake.connect_calls.load(Ordering::SeqCst);
+        let attempts = hub.auto_attempt_count();
         hub.wake_auto_connect();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        wait_for_auto_attempt(&hub, attempts + 1).await;
         assert_eq!(
             fake.connect_calls.load(Ordering::SeqCst),
             connects,
             "KICKED 后不得自动抢回连接"
         );
         assert_eq!(hub.connection().state, ConnectionState::Conflict);
+    }
+
+    /// 已配对后再次授权：先断旧连接并推进代际，旧 relay 事件不得回写 paired。
+    #[tokio::test]
+    async fn authorize_after_paired_disconnects_old_connection_and_advances_generation() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, _pump) = pumped(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let paired = hub.connection();
+        assert!(paired.is_paired());
+        // 抬高已应用的 relay 代际，模拟旧连接留下的可迟到状态。
+        events
+            .send(RelayEvent::State(relay_view(ConnectionState::Paired, 9)))
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+        let disconnects = fake.disconnect_calls.load(Ordering::SeqCst);
+
+        let view = hub
+            .authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        assert_eq!(view.state, ConnectionState::Offline);
+        assert!(view.generation > paired.generation, "重新授权必须推进代际");
+        assert!(
+            fake.disconnect_calls.load(Ordering::SeqCst) > disconnects,
+            "已配对时重新授权必须先断开旧连接"
+        );
+
+        // 旧代际 relay 事件（<= relay_floor）不得把 Hub 拉回 paired。
+        events
+            .send(RelayEvent::State(relay_view(ConnectionState::Paired, 9)))
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// connect 直接返回 conflict（KICKED 在握手中落定）同样持久 auto=false。
+    #[tokio::test]
+    async fn connect_conflict_result_persists_auto_false() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_restored_auth(authorized_auth());
+        fake.set_connect(Ok(ConnectionView {
+            state: ConnectionState::Conflict,
+            generation: 7,
+            reason_code: None,
+            device_label: None,
+        }));
+        let store = stored(URL);
+        set_remote_enabled(&store, true);
+        let hub = ZcodeHub::with_parts(store.clone(), fake.clone(), send_policy());
+
+        let view = hub.connect_requested().await.unwrap();
+        assert_eq!(view.state, ConnectionState::Conflict);
+        assert_eq!(
+            stored_auto(&store).as_deref(),
+            Some("false"),
+            "KICKED 直接作为 connect 结果时也必须持久暂停"
+        );
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 生产装配（真实 AuthService + 内存凭据存储）：换/删链接的 `reset` 保留账号授权。
+    ///
+    /// 这是旧 `reset` 调 `auth.clear()` 的**可证伪**覆盖：把 clear 加回去，本用例立即失败。
+    #[tokio::test]
+    async fn production_reset_preserves_restored_account_authorization() {
+        // exp=2100 的合成 JWT：只验证本地 exp 解析，不涉及签名校验。
+        const FUTURE_JWT: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzeW50aGV0aWMtYWNjb3VudCIsImV4cCI6NDEwMjQ0NDgwMH0.synthetic-signature";
+
+        let store = stored(URL);
+        let credentials = Arc::new(MemoryCredentialStore::new());
+        credentials.seed(StoredCredential {
+            schema_version: SCHEMA_VERSION,
+            provider: OAuthProvider::Bigmodel,
+            jwt: FUTURE_JWT.to_owned(),
+        });
+        let auth = Arc::new(
+            AuthService::new(reqwest::Client::new()).with_credential_store(credentials.clone()),
+        );
+        assert!(auth.restore().await.authorized, "前置：持久身份可恢复");
+
+        let (parts, relay_events, lag) =
+            PartsBackend::production_test(store.clone(), auth.clone(), "ws://127.0.0.1:9".into());
+        let bridge = parts.pump_bridge();
+        let backend: Arc<dyn HubBackend> = Arc::new(parts);
+        let hub = ZcodeHub::with_pump_and_lag(
+            store.clone(),
+            backend,
+            send_policy(),
+            relay_events,
+            bridge,
+            lag,
+        );
+        assert!(hub.restore_authorization().await.authorized);
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+
+        // 换链接：reset 只断 relay/投影，不得清 AuthService 内存或删除持久记录。
+        let changed = hub.config_changed().await;
+        assert_eq!(changed.state, ConnectionState::Offline);
+        assert!(
+            auth.status().authorized,
+            "reset 不得清 AuthService 内存授权"
+        );
+        assert!(hub.auth_status().authorized, "Hub 缓存同样保留");
+        assert_eq!(credentials.delete_count(), 0, "换链接不得删除持久记录");
+        assert_eq!(credentials.load_count(), 1, "reset 不读存储");
+
+        // 删链接：回到 needs_config，但账号授权仍保留（不需要重新 OAuth）。
+        store.with(|conn| set_config(conn, "").unwrap());
+        let removed = hub.config_changed().await;
+        assert_eq!(removed.state, ConnectionState::NeedsConfig);
+        assert!(auth.status().authorized, "删链接不得清账号");
+        assert!(hub.auth_status().authorized);
+        assert!(
+            hub.connect().await.unwrap_err().is(codes::NEEDS_CONFIG),
+            "删链接后连接被配置门拒绝，而不是误报 needs_auth"
+        );
+        assert_eq!(credentials.delete_count(), 0);
     }
 }
