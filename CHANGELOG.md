@@ -1,4 +1,4 @@
-﻿# Changelog
+# Changelog
 
 [English](CHANGELOG.en.md) · 中文
 
@@ -12,6 +12,14 @@
 
 ### Added
 
+- **ZCode 授权自动恢复（凭据复用）**：ZCode 授权成功后账号 JWT 写入本机系统凭据保险箱
+  （macOS 钥匙串 / Windows 凭据管理器 / Linux Secret Service），启动时只读恢复并沿用既有
+  自动连接三条件（远程总开关 + 自动连接意图 + 已保存合法链接）；**首次从旧版本升级需重新
+  授权一次**（旧版本只有内存授权），之后进程重启自动恢复、不再重复 OAuth。「断开」只停
+  当前连接与自动连接并**保留凭据**，「忘记授权」删除凭据并**保留链接**；换 / 删链接不要求
+  重新授权。JWT 仅存系统保险箱 + 受控内存，不写设置 / 数据库 / 文件，不进日志、错误提示
+  或手机响应；relay 短期 token 仍每次连接现取、仅内存、用后即弃。真实保险箱 / 真实 OAuth /
+  真实进程重启的平台验收尚未执行，见验收报告。
 - **ZCode 统一控制（官方桥接）**：ZCode 接入官方桥接控制链——桌面端在 **设置 → 远程接入 →
   ④ 工具特殊配置** 的 ZCode 卡完成 **BigModel** 官方授权与连接（官方凭据只留本机、
   **JWT 仅内存**、terminal token 每次现取，手机端不持有任何凭据或短期 token），经**单条
@@ -77,6 +85,11 @@
 
 ### 工程
 
+- ZCode 凭据复用验收：`wire_e2e` 以共享 fake 持久存储 + **重新构造** AuthService/Hub 验证
+  「OAuth 仍一次、重启后重新取 terminal token / WS、断开与忘记后重启零上游、恢复不放开
+  能力闸」；同步验收报告、统一设计追加裁决、合同与 `contract.json` 持久化说明及中英手册。
+  真实系统保险箱 / 真实 OAuth / 真实进程重启仍需 macOS / Windows / Linux 实机验收，未跑
+  平台在报告中保持 `awaiting_platform_validation` / `not_run`，不标 PASS。
 - A 包门禁收尾：`tests/zcode_config_remote.rs` 一处闭包改为函数引用（新版 clippy 的
   `redundant_closure` 告警；仅测试代码，零行为变化）。
 - B 包取证产物入库：ZCode 官方桥接决策文档（`docs/superpowers/decisions/2026-10-24-zcode-official-bridge-contract.md`，

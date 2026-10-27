@@ -1,4 +1,4 @@
-﻿# Changelog
+# Changelog
 
 English · [中文](CHANGELOG.md)
 
@@ -17,6 +17,20 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Added
 
+- **ZCode authorization restores automatically (credential reuse)**: after a successful
+  ZCode authorization the account JWT is written to this machine's system credential vault
+  (macOS Keychain / Windows Credential Manager / Linux Secret Service); startup restores it
+  read-only and then applies the existing three automatic-connect conditions (remote master
+  switch on + automatic-connect intent on + a valid saved link). **The first upgrade from an
+  older version requires one fresh authorization** (older versions kept authorization in
+  memory only); after that, restarts restore it automatically with no repeated OAuth.
+  "Disconnect" stops the current connection and auto-connect but **keeps the credential**;
+  "Forget authorization" deletes the credential and **keeps the link**; changing / deleting
+  the link never requires re-authorization. The JWT lives only in the system vault +
+  controlled memory — never in settings / the database / a file, and never in logs, error
+  messages, or phone responses; the relay short-lived token is still fetched fresh per
+  connection, memory-only, and discarded after use. Real-vault / real-OAuth / real-restart
+  on-device acceptance has not run yet; see the acceptance report.
 - **ZCode unified control (official bridge)**: ZCode now drives sessions through the
   official bridge — the desktop completes **BigModel** authorization and connection in the
   ZCode card under **Settings → Remote Access → ④ Tool-specific configuration** (official
@@ -119,6 +133,14 @@ _Only versions translated so far are listed here; the full history lives in the
 
 ### Engineering
 
+- ZCode credential-reuse acceptance: `wire_e2e` uses a shared fake persistent store and
+  **rebuilt** AuthService/Hub instances to verify "OAuth still once, terminal token / WS
+  re-fetched after restart, zero upstream after disconnect or forget, capability gates not
+  widened on restore"; the acceptance report, unified-design addendum, contract +
+  `contract.json` persistence note, and the zh/en manual are updated in the same batch.
+  Real system-vault / real OAuth / real restart acceptance still needs macOS / Windows /
+  Linux on-device runs; platforms not run stay `awaiting_platform_validation` / `not_run`
+  in the report and are never marked PASS.
 - Gate cleanup for the A package: one closure in `tests/zcode_config_remote.rs` replaced
   with a function reference (new clippy `redundant_closure` warning; test-only, no
   behavior change).

@@ -20,8 +20,28 @@ pub(crate) const SCHEMA_VERSION: u8 = 1;
 /// 单个条目 secret 的字节上限（Windows 通用凭据的 blob 上限）。
 pub(crate) const MAX_CREDENTIAL_BYTES: usize = 2560;
 
-/// 「允许自动恢复」非敏感标记（设计 §3.3）。
-pub(crate) const RESTORE_ALLOWED_KEY: &str = "remote.zcode_restore_allowed";
+/// 正式版「允许自动恢复」非敏感标记（设计 §3.3）。
+///
+/// 恢复标记与保险箱条目同命名空间：正式版 `com.jarvis.tuvis.zcode` ↔
+/// `remote.zcode_restore_allowed`；开发版 `com.jarvis.tuvis.dev.zcode` ↔
+/// `remote.zcode_restore_allowed.dev`（见 [`restore_allowed_key_for`]）。
+pub(crate) const RESTORE_ALLOWED_KEY_RELEASE: &str = "remote.zcode_restore_allowed";
+
+/// 开发版「允许自动恢复」非敏感标记（设计 §3.3）。
+pub(crate) const RESTORE_ALLOWED_KEY_DEBUG: &str = "remote.zcode_restore_allowed.dev";
+
+/// 纯函数：按构建选择恢复标记键。
+///
+/// 两个构建共用同一个 settings 库（`~/.tuvis/tuvis.db`），若共用标记键，开发版的一次
+/// 忘记/删除会把正式版的恢复禁用掉（保险箱条目本身已按构建隔离）。旧共享键不迁移：
+/// 本功能尚未发布，开发版不再读写非 `.dev` 键。
+pub(crate) const fn restore_allowed_key_for(debug: bool) -> &'static str {
+    if debug {
+        RESTORE_ALLOWED_KEY_DEBUG
+    } else {
+        RESTORE_ALLOWED_KEY_RELEASE
+    }
+}
 
 /// 系统保险箱条目的固定 user／target 后缀（设计 §3.1）。
 const ACCOUNT: &str = "primary";
@@ -115,7 +135,12 @@ pub(crate) fn validate_blob_len(bytes: usize, max: Option<usize>) -> StoreResult
 
 /// 恢复禁用标记：checked read——表缺失/DB 错误是失败，不是「缺键」。
 fn read_restore_allowed(conn: &Connection) -> rusqlite::Result<bool> {
-    match try_get_setting_conn(conn, RESTORE_ALLOWED_KEY)? {
+    read_restore_allowed_for(conn, cfg!(debug_assertions))
+}
+
+/// 按构建（`debug`）读取恢复标记；测试用它证明两个命名空间互不读取。
+fn read_restore_allowed_for(conn: &Connection, debug: bool) -> rusqlite::Result<bool> {
+    match try_get_setting_conn(conn, restore_allowed_key_for(debug))? {
         None => Ok(true),
         // 设计 §3.3：非法值按 false 处理（不恢复即安全侧）。
         Some(value) => Ok(value == "true"),
@@ -123,9 +148,18 @@ fn read_restore_allowed(conn: &Connection) -> rusqlite::Result<bool> {
 }
 
 fn write_restore_allowed(conn: &Connection, allowed: bool) -> rusqlite::Result<()> {
+    write_restore_allowed_for(conn, allowed, cfg!(debug_assertions))
+}
+
+/// 按构建（`debug`）写入恢复标记（键见 [`restore_allowed_key_for`]）。
+fn write_restore_allowed_for(
+    conn: &Connection,
+    allowed: bool,
+    debug: bool,
+) -> rusqlite::Result<()> {
     try_set_setting_conn(
         conn,
-        RESTORE_ALLOWED_KEY,
+        restore_allowed_key_for(debug),
         if allowed { "true" } else { "false" },
     )
 }
@@ -859,12 +893,71 @@ mod tests {
         assert!(!read_restore_allowed(&conn).unwrap());
         write_restore_allowed(&conn, true).unwrap();
         assert!(read_restore_allowed(&conn).unwrap());
-        crate::database::dao::settings::try_set_setting_conn(&conn, RESTORE_ALLOWED_KEY, "bogus")
-            .unwrap();
+        // 用当前构建实际选择的键写入非法值（不手抄某一构建的键名）。
+        crate::database::dao::settings::try_set_setting_conn(
+            &conn,
+            restore_allowed_key_for(cfg!(debug_assertions)),
+            "bogus",
+        )
+        .unwrap();
         assert!(!read_restore_allowed(&conn).unwrap(), "非法值=false");
 
         let broken = Connection::open_in_memory().unwrap();
         assert!(read_restore_allowed(&broken).is_err(), "表缺失必须报错");
+    }
+
+    /// P2-2：恢复标记键按构建命名空间隔离（debug / 正式版互不影响）。
+    ///
+    /// 开发版保险箱条目是 `com.jarvis.tuvis.dev.zcode`，恢复标记也必须落在自己的命名
+    /// 空间：共用同一 settings 库时，开发版的禁用标记不得让正式版放弃恢复（反之亦然）。
+    #[test]
+    fn restore_marker_keys_are_namespaced_per_build() {
+        assert!(cfg!(debug_assertions), "cargo test 应在 debug 构建下运行");
+
+        let debug_key = restore_allowed_key_for(true);
+        let release_key = restore_allowed_key_for(false);
+        assert_ne!(debug_key, release_key, "debug 与正式版必须使用不同标记键");
+        assert_eq!(debug_key, "remote.zcode_restore_allowed.dev");
+        assert_eq!(release_key, "remote.zcode_restore_allowed");
+        assert_eq!(
+            restore_allowed_key_for(cfg!(debug_assertions)),
+            RESTORE_ALLOWED_KEY_DEBUG,
+            "debug 构建必须使用 `.dev` 命名空间的恢复标记"
+        );
+
+        // 命名空间隔离：正式版/旧共享键的标记对 debug 不可见；debug 的标记也不得
+        // 覆盖正式版的禁用状态。
+        let conn = pref_conn();
+        write_restore_allowed_for(&conn, false, false).unwrap();
+        assert!(
+            !read_restore_allowed_for(&conn, false).unwrap(),
+            "正式版读到自己的禁用标记"
+        );
+        assert!(
+            read_restore_allowed_for(&conn, true).unwrap(),
+            "debug 不得读取正式版（旧共享键）的标记"
+        );
+        write_restore_allowed_for(&conn, false, true).unwrap();
+        assert!(!read_restore_allowed_for(&conn, true).unwrap());
+        assert!(
+            !read_restore_allowed_for(&conn, false).unwrap(),
+            "debug 的禁用标记不得改写正式版标记"
+        );
+        write_restore_allowed_for(&conn, true, true).unwrap();
+        assert!(read_restore_allowed_for(&conn, true).unwrap());
+        assert!(
+            !read_restore_allowed_for(&conn, false).unwrap(),
+            "debug 的允许标记不得解除正式版的禁用"
+        );
+        // 两个键都在 settings 里各存一份，互不覆盖。
+        assert_eq!(
+            try_get_setting_conn(&conn, debug_key).unwrap().as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            try_get_setting_conn(&conn, release_key).unwrap().as_deref(),
+            Some("false")
+        );
     }
 
     /// 禁用恢复时 load 绝不触碰原生读取（read 闭包执行即 panic），只返回 None
