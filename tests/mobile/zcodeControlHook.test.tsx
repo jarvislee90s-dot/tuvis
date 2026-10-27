@@ -820,6 +820,9 @@ describe("useZcodeControl：SSE 纠偏（不重放动作）", () => {
     expect(sessionGets()).toBe(3);
     expect(result.current.session?.ready).toBe(true);
     expect(result.current.session?.capabilities.send.enabled).toBe(true);
+    // 面板发送门 = paired + reason=null + send.enabled：恢复 GET 必须把 #2 的
+    // not_ready 原因面也清掉，否则按钮仍会被 reason 门禁用。
+    expect(result.current.reason).toBeNull();
     expect(postedActions()).toHaveLength(0); // 恢复只读：绝不重放动作
 
     // ④ 同代重复 ready=true（能力已是权威）：有界，不得再补 GET #4。
