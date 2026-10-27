@@ -11,6 +11,8 @@ use crate::database::dao::settings::{try_get_setting_conn, try_set_setting_conn}
 use crate::remote::pairing::DeviceStore;
 use crate::services::zcode_control::auth::OAuthProvider;
 use rusqlite::Connection;
+#[cfg(test)]
+use std::sync::Arc;
 
 /// 记录格式版本（当前唯一允许值）。
 pub(crate) const SCHEMA_VERSION: u8 = 1;
@@ -446,9 +448,17 @@ mod native {
 
 /// 记录型内存 fake（仅测试）：授权保存／恢复／故障注入都经它，
 /// 绝不接触真实系统保险箱。
+///
+/// H2 起另带**精确闸门**与调用探针：`gate_load/gate_save/gate_delete` 把对应操作停在
+/// 「已进入 fake、尚未完成」的窗口，供测试构造确定交错（不靠真实 sleep）；
+/// 探针记录同时进入 fake 的最大调用数，串行缺陷会在这里暴露。
 #[cfg(test)]
 pub(crate) struct MemoryCredentialStore {
     state: std::sync::Mutex<MemoryState>,
+    /// 每类操作最多一个待用闸门，操作进入时取走（一次性）。
+    gates: std::sync::Mutex<StoreGates>,
+    /// 并发探针：同时进入 fake 的调用数上限。
+    calls: StoreCallProbe,
 }
 
 #[cfg(test)]
@@ -458,6 +468,75 @@ struct MemoryState {
     loads: usize,
     saves: usize,
     deletes: usize,
+}
+
+/// 一次被闸门挂起的原生调用（fake 侧）。
+#[cfg(test)]
+struct GateSlot {
+    /// 操作进入后通知测试（`Notify` 会存一个许可，先到先得）。
+    entered: Arc<tokio::sync::Notify>,
+    /// 测试放行；发送端被丢弃同样视为放行（测试失败也不会悬挂 blocking 线程）。
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct StoreGates {
+    load: Option<GateSlot>,
+    save: Option<GateSlot>,
+    delete: Option<GateSlot>,
+}
+
+/// 闸门句柄（测试侧）：`wait_entered()` 等到操作真正进入 fake，`release()` 放行。
+#[cfg(test)]
+pub(crate) struct StoreGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+impl StoreGate {
+    /// 等到对应操作进入 fake（此时它正阻塞在放行之前）。
+    pub(crate) async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    /// 放行一次被挂起的操作；drop 未放行的闸门等同放行。
+    pub(crate) fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum StoreOp {
+    Load,
+    Save,
+    Delete,
+}
+
+/// 并发探针：进入时递增活动调用数并刷新最大值，guard 析构时递减。
+#[cfg(test)]
+#[derive(Default)]
+struct StoreCallProbe {
+    active: std::sync::atomic::AtomicUsize,
+    max: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+struct StoreCallGuard<'a> {
+    probe: &'a StoreCallProbe,
+}
+
+#[cfg(test)]
+impl Drop for StoreCallGuard<'_> {
+    fn drop(&mut self) {
+        self.probe
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -471,6 +550,8 @@ impl MemoryCredentialStore {
                 saves: 0,
                 deletes: 0,
             }),
+            gates: std::sync::Mutex::new(StoreGates::default()),
+            calls: StoreCallProbe::default(),
         }
     }
 
@@ -504,13 +585,99 @@ impl MemoryCredentialStore {
     pub(crate) fn delete_count(&self) -> usize {
         self.lock().deletes
     }
+
+    /// fake 内观察到的最大同时在途调用数（H2 串行断言：必须恒为 1）。
+    pub(crate) fn max_concurrent_store_calls(&self) -> usize {
+        self.calls.max.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 让下一次 `load` 停在「已进入、未完成」窗口。
+    pub(crate) fn gate_load(&self) -> StoreGate {
+        self.install_gate(StoreOp::Load)
+    }
+
+    /// 让下一次 `save` 停在「已进入、未完成」窗口。
+    pub(crate) fn gate_save(&self) -> StoreGate {
+        self.install_gate(StoreOp::Save)
+    }
+
+    /// 让下一次 `delete` 停在「已进入、未完成」窗口。
+    pub(crate) fn gate_delete(&self) -> StoreGate {
+        self.install_gate(StoreOp::Delete)
+    }
+
+    fn install_gate(&self, op: StoreOp) -> StoreGate {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        let slot = GateSlot {
+            entered: entered.clone(),
+            release: receiver,
+        };
+        let mut gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match op {
+            StoreOp::Load => gates.load = Some(slot),
+            StoreOp::Save => gates.save = Some(slot),
+            StoreOp::Delete => gates.delete = Some(slot),
+        }
+        StoreGate {
+            entered,
+            release: Some(release),
+        }
+    }
+
+    fn enter_call(&self) -> StoreCallGuard<'_> {
+        let active = self
+            .calls
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.calls
+            .max
+            .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+        StoreCallGuard { probe: &self.calls }
+    }
+
+    /// 调用计数在**进入 fake** 时递增（与完成与否无关，测试可据此判断操作已开始）。
+    fn count_call(&self, op: StoreOp) {
+        let mut state = self.lock();
+        match op {
+            StoreOp::Load => state.loads += 1,
+            StoreOp::Save => state.saves += 1,
+            StoreOp::Delete => state.deletes += 1,
+        }
+    }
+
+    /// 进入 fake 后通知测试并等待放行；未安装闸门时是空操作。
+    fn wait_gate(&self, op: StoreOp) {
+        let slot = {
+            let mut gates = self
+                .gates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match op {
+                StoreOp::Load => gates.load.take(),
+                StoreOp::Save => gates.save.take(),
+                StoreOp::Delete => gates.delete.take(),
+            }
+        };
+        if let Some(slot) = slot {
+            slot.entered.notify_one();
+            // 发送端被 drop 也返回 Err：视为放行，避免测试失败时悬挂 blocking 线程。
+            let _ = slot.release.blocking_recv();
+        }
+    }
 }
 
 #[cfg(test)]
 impl CredentialStore for MemoryCredentialStore {
     fn load(&self) -> StoreResult<Option<StoredCredential>> {
+        let _call = self.enter_call();
+        self.count_call(StoreOp::Load);
+        self.wait_gate(StoreOp::Load);
         let mut state = self.lock();
-        state.loads += 1;
         if let Some(error) = state.failure.take() {
             return Err(error);
         }
@@ -518,8 +685,10 @@ impl CredentialStore for MemoryCredentialStore {
     }
 
     fn save(&self, record: &StoredCredential) -> StoreResult<()> {
+        let _call = self.enter_call();
+        self.count_call(StoreOp::Save);
+        self.wait_gate(StoreOp::Save);
         let mut state = self.lock();
-        state.saves += 1;
         if let Some(error) = state.failure.take() {
             return Err(error);
         }
@@ -528,8 +697,10 @@ impl CredentialStore for MemoryCredentialStore {
     }
 
     fn delete(&self) -> StoreResult<()> {
+        let _call = self.enter_call();
+        self.count_call(StoreOp::Delete);
+        self.wait_gate(StoreOp::Delete);
         let mut state = self.lock();
-        state.deletes += 1;
         if let Some(error) = state.failure.take() {
             return Err(error);
         }

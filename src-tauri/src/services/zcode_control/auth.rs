@@ -2716,4 +2716,420 @@ mod tests {
         assert!(!status.remembered);
         assert_eq!(status.problem, None, "clear 必须清掉临时 problem");
     }
+
+    // ───────────────── H2：受控竞态与故障矩阵（闸门精确交错，无真实睡眠） ─────────────────
+
+    /// 把一次状态快照纳入「不得泄漏 secret」的输出捕获（serde + Debug）。
+    fn capture_status(output: &mut String, status: &AuthStatus) {
+        output.push_str(&serde_json::to_string(status).expect("AuthStatus 必须可序列化"));
+        output.push(' ');
+        output.push_str(&format!("{status:?}"));
+        output.push(' ');
+    }
+
+    /// 旧 restore 的 load 在途时新授权已落地：放行旧 load 后不得覆盖新 provider/JWT。
+    ///
+    /// 闸门控制：旧 `load` 进入 fake 后挂起并持有存储串行 → 新授权完成交换、JWT 落内存，
+    /// 其保存排队 → 放行旧 `load`。旧 restore 必须丢弃结果（epoch 已变 + 新 JWT 已落地），
+    /// 后续 terminal token 必须携带**新** JWT，持久记录也只能是新 JWT。
+    #[tokio::test]
+    async fn late_restore_cannot_override_new_authorization() {
+        let fake = FakeZcode::start().await;
+        let old_jwt = valid_jwt();
+        let new_jwt = synthetic_jwt(now_secs() + 7200);
+        let store = store_with(OAuthProvider::Zai, &old_jwt);
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+
+        // 旧 restore 的 load 停在 fake 内，持有存储单飞锁。
+        let load_gate = store.gate_load();
+        let restore = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.restore().await }
+        });
+        load_gate.wait_entered().await;
+
+        // 新授权：交换立即返回，新 JWT 落内存；保存必须排在在途 load 之后。
+        fake.set_exchange(200, exchange_ok(&new_jwt));
+        let slot = UrlSlot::new();
+        let reauth = spawn_authorize(auth.clone(), OAuthProvider::Bigmodel, slot.clone());
+        let (redirect, state) = oauth_params(&slot.wait().await);
+        let delivered =
+            deliver_status(&redirect, &format!("state={state}&code={SYNTHETIC_CODE}")).await;
+        assert_eq!(delivered, Some(200), "回调应被接受");
+        wait_until(|| auth.status().authorized).await;
+        assert_eq!(
+            auth.status().provider,
+            Some(OAuthProvider::Bigmodel),
+            "新授权的 provider 已落内存"
+        );
+        assert_eq!(store.save_count(), 0, "旧 load 未完成前新保存必须排队");
+        assert!(!reauth.is_finished(), "新授权必须等待存储串行");
+
+        // 放行旧 load：旧 restore 必须丢弃结果，不得覆盖新身份。
+        load_gate.release();
+        let status_after_old_restore = restore.await.expect("旧 restore 任务不应 panic");
+        assert!(status_after_old_restore.authorized, "新身份仍应处于已授权");
+        assert_eq!(
+            status_after_old_restore.provider,
+            Some(OAuthProvider::Bigmodel),
+            "旧 restore 不得用旧记录的 provider 覆盖新授权"
+        );
+        let status = auth.status();
+        assert!(status.authorized);
+        assert_eq!(status.provider, Some(OAuthProvider::Bigmodel));
+        assert_eq!(status.problem, None);
+
+        reauth
+            .await
+            .expect("授权任务不应 panic")
+            .expect("新授权成功");
+        assert_eq!(store.save_count(), 1, "排队的保存应在旧 load 之后执行一次");
+        assert!(
+            store.stored().expect("应保存新记录").jwt == new_jwt,
+            "持久记录必须来自新授权"
+        );
+
+        // 内存里实际持有的必须是新 JWT（用下一次 relay 请求的 Authorization 证明）。
+        fake.set_relay(200, relay_ok(SYNTHETIC_RELAY_TOKEN, 60));
+        let token = auth.terminal_token().await.expect("新 JWT 仍可用");
+        assert!(token.value == SYNTHETIC_RELAY_TOKEN);
+        let relay = fake.last_relay().expect("已记录 relay 请求");
+        assert!(
+            relay.authorization.as_deref() == Some(format!("Bearer {new_jwt}").as_str()),
+            "终端 token 请求必须携带新 JWT，而不是旧 restore 的记录"
+        );
+
+        // 旧记录不得在后续恢复中复活。
+        auth.clear();
+        let restored = auth.restore().await;
+        assert!(restored.authorized);
+        assert_eq!(restored.provider, Some(OAuthProvider::Bigmodel));
+        assert!(store.stored().expect("记录仍在").jwt == new_jwt);
+    }
+
+    /// 慢保存在途时用户忘记授权：保存不得复活旧记录，重启后也不得恢复。
+    ///
+    /// 闸门控制：保存进入 fake 后挂起（尚未写记录）→ `forget` 先清内存/禁用恢复，
+    /// 其删除排队 → 放行保存（写旧记录）→ 排队的删除必须把它删掉；旧保存不得回写
+    /// `remembered`。随后新建 AuthService 模拟重启，旧记录不得被恢复。
+    #[tokio::test]
+    async fn forget_during_slow_save_never_restores_old_record() {
+        let fake = FakeZcode::start().await;
+        let jwt = valid_jwt();
+        fake.set_exchange(200, exchange_ok(&jwt));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+
+        // 保存停在「原生写完成前」：内存已授权，持久记录尚未落地。
+        let save_gate = store.gate_save();
+        let slot = UrlSlot::new();
+        let authorize = spawn_authorize(auth.clone(), OAuthProvider::Bigmodel, slot.clone());
+        let (redirect, state) = oauth_params(&slot.wait().await);
+        let delivered =
+            deliver_status(&redirect, &format!("state={state}&code={SYNTHETIC_CODE}")).await;
+        assert_eq!(delivered, Some(200));
+        save_gate.wait_entered().await;
+        assert!(auth.status().authorized, "保存前 JWT 已落内存");
+        assert_eq!(store.save_count(), 1, "保存已进入 fake");
+        assert!(store.stored().is_none(), "保存在放行前不得写入记录");
+
+        // 忘记：清内存并禁用恢复，删除必须排在在途保存之后。
+        let forget = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.forget().await }
+        });
+        wait_until(|| !auth.status().authorized).await;
+        assert_eq!(store.delete_count(), 0, "在途保存未完成前删除必须排队");
+        assert_eq!(store.max_concurrent_store_calls(), 1, "存储调用必须串行");
+
+        // 放行保存：写旧记录 → 排队的删除执行 → 旧保存不得回写 remembered。
+        save_gate.release();
+        authorize
+            .await
+            .expect("授权任务不应 panic")
+            .expect("授权本身成功");
+        let status_after_forget = forget.await.expect("忘记任务不应 panic");
+        assert!(!status_after_forget.authorized);
+        assert!(!status_after_forget.remembered);
+        assert_eq!(status_after_forget.problem, None);
+        assert_eq!(store.save_count(), 1, "旧保存只执行一次");
+        assert_eq!(store.delete_count(), 1, "排队的删除必须在保存之后执行");
+        assert!(store.stored().is_none(), "旧保存的记录必须被删除");
+        assert_eq!(store.max_concurrent_store_calls(), 1);
+
+        // 模拟重启：全新 AuthService 对同一存储 restore，旧记录不得复活。
+        let restarted = AuthService::new(test_client()).with_credential_store(store.clone());
+        let after_restart = restarted.restore().await;
+        let restored_after_forget = usize::from(after_restart.authorized);
+        assert!(!after_restart.authorized);
+        assert_eq!(restored_after_forget, 0);
+        assert_eq!(after_restart.remembered, false);
+        assert_eq!(after_restart.provider, None);
+        assert_eq!(after_restart.problem, None);
+        assert_eq!(store.load_count(), 1, "重启只读一次存储");
+        assert!(store.stored().is_none(), "旧记录不得被迟到的保存复活");
+        assert_eq!(store.max_concurrent_store_calls(), 1);
+    }
+
+    /// 旧 JWT 的 401 迟到时新授权已保存：不得删除新记录。
+    ///
+    /// 401 是**按响应头**判定失效的（响应体从不读取，两阶段闸门证明旧请求在 body
+    /// 发布之前就已收尾），所以受控窗口是「整个 401 响应尚未交付」：先让新授权完整
+    /// 保存新记录，再放行旧 401 的响应头。客户端在头后的代际复核处丢弃旧代结果，
+    /// 只能作废它自己，不得清掉新 JWT、删除新记录或给新身份挂 `revoked`。
+    #[tokio::test]
+    async fn late_401_during_new_save_does_not_delete_new_record() {
+        let fake = FakeZcode::start().await;
+        let first_jwt = valid_jwt();
+        let second_jwt = synthetic_jwt(now_secs() + 7200);
+        fake.set_exchange(200, exchange_ok(&first_jwt));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("首次授权成功");
+        assert_eq!(store.save_count(), 1);
+
+        // 旧 JWT 的 401：整个响应先挂起（headers 与 body 都未交付），body 闸门待命。
+        fake.set_relay(401, r#"{"code":401,"msg":"synthetic-upstream"}"#);
+        let relay_gate = fake.hold_relay();
+        let two_phase = fake.hold_relay_body();
+        let stale = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.terminal_token().await }
+        });
+        wait_until(|| fake.relay_count() == 1).await;
+        assert!(!stale.is_finished(), "旧 401 响应交付前不得收尾");
+
+        // 新授权完成并保存新记录（此时旧 401 响应仍未交付）。
+        fake.set_exchange(200, exchange_ok(&second_jwt));
+        run_authorize(&auth, OAuthProvider::Bigmodel)
+            .await
+            .expect("新授权成功");
+        assert_eq!(store.save_count(), 2);
+        assert!(
+            store.stored().expect("新记录").jwt == second_jwt,
+            "新记录必须已保存"
+        );
+
+        // 放行旧 401 的响应头：按时按代际复核丢弃，不得删除新记录。
+        relay_gate.add_permits(1);
+        assert!(
+            two_phase.headers_sent.acquire().await.is_ok(),
+            "401 响应头闸门应正常放行"
+        );
+        assert_eq!(
+            err_code(stale.await.expect("旧请求任务不应 panic")),
+            "needs_auth"
+        );
+        // 旧请求在 body 发布之前就收尾：401 从不读取响应体。
+        let new_record_deleted = store.delete_count();
+        assert_eq!(new_record_deleted, 0, "迟到的旧 401 不得删除新记录");
+        assert!(
+            store.stored().expect("新记录仍应存在").jwt == second_jwt,
+            "持久记录必须仍是新 JWT"
+        );
+        let status = auth.status();
+        assert!(status.authorized, "新授权不得被旧 401 清掉");
+        assert!(status.remembered);
+        assert_eq!(status.provider, Some(OAuthProvider::Bigmodel));
+        assert_eq!(
+            status.problem, None,
+            "旧 401 不得给新身份挂 revoked/storage 问题"
+        );
+
+        // 清理仍挂起的 body（连接已关闭，写入失败不影响断言）。
+        two_phase.body_gate.add_permits(1);
+    }
+
+    /// 调用方 future 取消后，仍在执行的原生调用继续持有串行所有权；最大并发必须为 1。
+    ///
+    /// 三段串联：load 在途取消 → save 排队；save 在途取消 → delete 排队；
+    /// 每次放行后下一段才进入 fake。`max_concurrent_store_calls` 由 fake 的探针记录，
+    /// 提前释放 owned guard 会让它变成 2。
+    #[tokio::test]
+    async fn cancellation_keeps_native_io_serial_until_actual_completion() {
+        let fake = FakeZcode::start().await;
+        let store = store_with(OAuthProvider::Zai, &valid_jwt());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+
+        // ① load 在途，restore 的调用方被取消（future drop，阻塞任务继续执行）。
+        let load_gate = store.gate_load();
+        let restore = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.restore().await }
+        });
+        load_gate.wait_entered().await;
+        restore.abort();
+        assert!(
+            restore
+                .await
+                .expect_err("已取消的任务必须报 JoinError")
+                .is_cancelled(),
+            "restore 调用方必须已取消"
+        );
+
+        // ② 新授权保存排队：被取消的 load 仍持串行，保存不得进入 fake。
+        fake.set_exchange(200, exchange_ok(&valid_jwt()));
+        let save_gate = store.gate_save();
+        let slot = UrlSlot::new();
+        let authorize = spawn_authorize(auth.clone(), OAuthProvider::Bigmodel, slot.clone());
+        let (redirect, state) = oauth_params(&slot.wait().await);
+        let delivered =
+            deliver_status(&redirect, &format!("state={state}&code={SYNTHETIC_CODE}")).await;
+        assert_eq!(delivered, Some(200));
+        wait_until(|| auth.status().authorized).await;
+        assert_eq!(store.save_count(), 0, "被取消的 load 未完成前保存不得进入");
+        assert_eq!(store.max_concurrent_store_calls(), 1);
+
+        // 放行 load：保存进入并挂起；保存的调用方同样被取消。
+        load_gate.release();
+        save_gate.wait_entered().await;
+        authorize.abort();
+        assert!(authorize
+            .await
+            .expect_err("已取消的授权必须报 JoinError")
+            .is_cancelled());
+
+        // ③ 忘记的删除排队：在途保存仍持串行，删除不得进入 fake。
+        let delete_gate = store.gate_delete();
+        let forget = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.forget().await }
+        });
+        wait_until(|| !auth.status().authorized).await;
+        assert_eq!(store.delete_count(), 0, "在途保存未完成前删除不得进入");
+        assert_eq!(store.max_concurrent_store_calls(), 1);
+
+        // 放行保存 → 删除进入 → 放行删除；全程只有一次调用在 fake 内。
+        save_gate.release();
+        delete_gate.wait_entered().await;
+        assert_eq!(store.save_count(), 1, "被取消的保存仍须完成一次");
+        assert_eq!(store.delete_count(), 1);
+        delete_gate.release();
+        let status = forget.await.expect("忘记任务不应 panic");
+        assert!(!status.authorized);
+        assert_eq!(status.problem, None);
+        assert_eq!(store.load_count(), 1);
+        assert!(store.stored().is_none(), "删除必须在保存之后真正完成");
+        assert_eq!(
+            store.max_concurrent_store_calls(),
+            1,
+            "取消调用方不得让底层原生调用脱离串行"
+        );
+    }
+
+    /// 故障矩阵：存储失败绝不删除有效身份，也绝不把合成 JWT 泄漏到输出。
+    ///
+    /// 组合覆盖 locked / unavailable / invalid_record / too_large 读取失败、
+    /// storage_failed / locked 保存失败、delete_failed 删除失败；每次失败后都验证
+    /// 既有有效记录仍可恢复、problem 如实映射，最后核对捕获的状态/错误输出无 JWT。
+    #[tokio::test]
+    async fn store_failures_never_delete_valid_identity_or_leak_secret() {
+        let fake = FakeZcode::start().await;
+        let saved_jwt = valid_jwt();
+        fake.set_exchange(200, exchange_ok(&saved_jwt));
+        let store = Arc::new(MemoryCredentialStore::new());
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+        run_authorize(&auth, OAuthProvider::Zai)
+            .await
+            .expect("首次授权成功");
+        assert!(store.stored().is_some(), "前置：有效身份已保存");
+
+        let mut captured_output = String::new();
+        let mut issued_jwts = vec![saved_jwt.clone()];
+
+        // 读取类故障：各自映射 problem；读取失败不得删除有效身份。
+        for (error, problem) in [
+            (CredentialError::LockedOrDenied, AuthProblem::LockedOrDenied),
+            (CredentialError::Unavailable, AuthProblem::Unavailable),
+            (CredentialError::InvalidRecord, AuthProblem::InvalidRecord),
+            (CredentialError::TooLarge, AuthProblem::TooLarge),
+        ] {
+            auth.clear();
+            store.fail_next(error);
+            let status = auth.restore().await;
+            capture_status(&mut captured_output, &status);
+            assert!(!status.authorized, "读取失败不得授权");
+            assert!(!status.remembered);
+            assert!(!status.restoring);
+            assert_eq!(status.problem, Some(problem), "problem 必须如实映射");
+        }
+        let deletes_after_locked_or_network_failure = store.delete_count();
+        assert_eq!(
+            deletes_after_locked_or_network_failure, 0,
+            "读取失败不得删除有效身份"
+        );
+
+        // 故障是一次性的：有效身份仍可恢复（证明未被误删）。
+        auth.clear();
+        let recovered = auth.restore().await;
+        capture_status(&mut captured_output, &recovered);
+        assert!(recovered.authorized);
+        assert!(recovered.remembered);
+        assert_eq!(recovered.provider, Some(OAuthProvider::Zai));
+
+        // 保存失败：本次身份仍可用、不得假报已记住、旧有效记录不得被删。
+        for error in [
+            CredentialError::StorageFailed,
+            CredentialError::LockedOrDenied,
+        ] {
+            let next_jwt = synthetic_jwt(now_secs() + 7200);
+            issued_jwts.push(next_jwt.clone());
+            fake.set_exchange(200, exchange_ok(&next_jwt));
+            store.fail_next(error);
+            run_authorize(&auth, OAuthProvider::Bigmodel)
+                .await
+                .expect("保存失败不得让 OAuth 失败");
+            let status = auth.status();
+            capture_status(&mut captured_output, &status);
+            assert!(status.authorized, "保存失败不得丢掉本次身份");
+            assert!(!status.remembered, "保存失败不得假报已记住");
+            assert_eq!(status.problem, Some(AuthProblem::from_credential(error)));
+            assert_eq!(store.delete_count(), 0, "保存失败不得删除旧记录");
+            assert!(
+                store.stored().expect("旧有效记录仍应存在").jwt == saved_jwt,
+                "保存失败不得覆盖旧有效记录"
+            );
+        }
+
+        // 删除失败：如实报 delete_failed、记录可能仍在、恢复保持禁用（零 load）。
+        let loads_before_forget = store.load_count();
+        store.fail_next(CredentialError::DeleteFailed);
+        let status = auth.forget().await;
+        capture_status(&mut captured_output, &status);
+        assert!(!status.authorized);
+        assert!(!status.remembered);
+        assert_eq!(status.problem, Some(AuthProblem::DeleteFailed));
+        assert!(store.stored().is_some(), "删除失败时记录可能仍在");
+        let blocked = auth.restore().await;
+        capture_status(&mut captured_output, &blocked);
+        assert!(!blocked.authorized);
+        assert_eq!(blocked.problem, Some(AuthProblem::DeleteFailed));
+        assert_eq!(
+            store.load_count(),
+            loads_before_forget,
+            "删除失败后不得 restore 旧记录"
+        );
+
+        // 未授权错误同样不得携带 secret。
+        match auth.terminal_token().await {
+            Ok(_) => panic!("忘记后不得再取得终端 token"),
+            Err(err) => {
+                capture_status(&mut captured_output, &auth.status());
+                captured_output.push_str(&format!("{err} {err:?}"));
+                assert_secret_free(&err);
+            }
+        }
+
+        // 捕获到的状态/错误/日志输出不得包含任何合成 JWT。
+        for jwt in &issued_jwts {
+            assert!(
+                !captured_output.contains(jwt.as_str()),
+                "状态/错误输出不得包含合成 JWT：{captured_output}"
+            );
+        }
+        assert!(!captured_output.contains("synthetic-signature"));
+        assert!(!captured_output.contains("Bearer"));
+    }
 }
