@@ -40,22 +40,24 @@ English · [中文](README.zh-CN.md)
 
 Step-by-step documentation lives in the **[user manual](docs/user-manual/en/01-overview.md)** (13 chapters). The README is the porch; the manual is the house.
 
-| Feature |                                                                            | Manual                                             |
-| ------------------------------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------- |
-| 🎛️ **Session monitoring dashboard** | Real-time traffic-light board: status, project, branch, last message, CPU — click a card to jump straight to the session's terminal or app window | [Ch. 4](docs/user-manual/en/04-dashboard.md) |
-| 📶 **Remote access & mobile board** | The same board on your phone, over four simultaneous channels with per-channel setup wizards and one permanent address option | [Ch. 8](docs/user-manual/en/08-mobile-remote.md) |
-| 📱 **Remote control** (experimental) | Send & queue messages, approve tool calls and plans, answer Q&A cards, switch permission modes, create sessions — all screen-read verified | [Ch. 8](docs/user-manual/en/08-mobile-remote.md) |
-| 🕵️ **Sub-agent observatory** | Live sub-agent chips, a dedicated sub-agent board and execution details in the session view (Claude Code) | [Ch. 5](docs/user-manual/en/05-subagent-observatory.md) |
-| 🐰 **Desktop pets** | tuvis-3D & Foxbell watch your sessions with status cards and voice alerts; open pet format for custom imports | [Ch. 7](docs/user-manual/en/07-pet.md) |
-| 🧮 **Token usage ledger** | One ledger for seven tools: overview, trends, distribution, API-equivalent cost estimates, CSV export | [Ch. 11](docs/user-manual/en/11-usage.md) |
-| 🔔 **Notifications & sound** | Change-based desktop notifications with deduplication + Web Audio chimes, clickable to jump to the terminal | [Ch. 6](docs/user-manual/en/06-notifications.md) |
-| 🚀 **Launch at login** | Shows the real OS-side state (no local cache); silent tray start when auto-launched | [Ch. 6](docs/user-manual/en/06-notifications.md) |
-| ⚡ **Quick terminal jump** | Click a card, land in the right terminal tab — even with the same project open twice | [Ch. 4](docs/user-manual/en/04-dashboard.md) |
-| 🧩 **Extension resource management** | Skills / MCP servers / Plugins in one SSOT repository, auto-imported and format-converted per tool | [Ch. 9](docs/user-manual/en/09-resources.md) |
-| 🎚️ **Preset groups** | Bundle skills + MCP + plugins into named presets, apply or revert in one click from the tray | [Ch. 10](docs/user-manual/en/10-presets.md) |
-| 👥 **Sub-agent resource allocation** | Allocate resource subsets to sub-agents; tool-level disable cascades down automatically | [Ch. 9](docs/user-manual/en/09-resources.md) |
-| ✅ **Tool toggle management** | Decide which tools Tuvis monitors and manages; unchecking fully restores and hides the tool | [Ch. 9](docs/user-manual/en/09-resources.md) |
-| 🩺 **Signal health** | Hook trust-gate self-check per tool, with honest per-tool reasons instead of a bare "unregistered" | [Ch. 12](docs/user-manual/en/12-troubleshooting.md) |
+| Feature                              |                                                                                                                                                   | Manual                                                  |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| 🎛️ **Session monitoring dashboard**  | Real-time traffic-light board: status, project, branch, last message, CPU — click a card to jump straight to the session's terminal or app window | [Ch. 4](docs/user-manual/en/04-dashboard.md)            |
+| 📶 **Remote access & mobile board**  | The same board on your phone, over four simultaneous channels with per-channel setup wizards and one permanent address option                     | [Ch. 8](docs/user-manual/en/08-mobile-remote.md)        |
+| 📱 **Remote control** (experimental) | Send & queue messages, approve tool calls and plans, answer Q&A cards, switch permission modes, create sessions — all screen-read verified        | [Ch. 8](docs/user-manual/en/08-mobile-remote.md)        |
+| 🕵️ **Sub-agent observatory**         | Live sub-agent chips, a dedicated sub-agent board and execution details in the session view (Claude Code)                                         | [Ch. 5](docs/user-manual/en/05-subagent-observatory.md) |
+| 🐰 **Desktop pets**                  | tuvis-3D & Foxbell watch your sessions with status cards and voice alerts; open pet format for custom imports                                     | [Ch. 7](docs/user-manual/en/07-pet.md)                  |
+| 🧮 **Token usage ledger**            | One ledger for seven tools: overview, trends, distribution, API-equivalent cost estimates, CSV export                                             | [Ch. 11](docs/user-manual/en/11-usage.md)               |
+| ⚡ **Output speed (TPS)**            | Locally sampled streaming TPS + inclusive response throughput, four-range chart with hover readouts; zero speed-test requests                     | [Ch. 11](docs/user-manual/en/11-usage.md)               |
+| 🖥️ **Four-tab desktop workspace**    | Main window tabs: Messages / Resources / Usage / Output Speed — each tab keeps its own state                                                      | [Ch. 11](docs/user-manual/en/11-usage.md)               |
+| 🔔 **Notifications & sound**         | Change-based desktop notifications with deduplication + Web Audio chimes, clickable to jump to the terminal                                       | [Ch. 6](docs/user-manual/en/06-notifications.md)        |
+| 🚀 **Launch at login**               | Shows the real OS-side state (no local cache); silent tray start when auto-launched                                                               | [Ch. 6](docs/user-manual/en/06-notifications.md)        |
+| ⚡ **Quick terminal jump**           | Click a card, land in the right terminal tab — even with the same project open twice                                                              | [Ch. 4](docs/user-manual/en/04-dashboard.md)            |
+| 🧩 **Extension resource management** | Skills / MCP servers / Plugins in one SSOT repository, auto-imported and format-converted per tool                                                | [Ch. 9](docs/user-manual/en/09-resources.md)            |
+| 🎚️ **Preset groups**                 | Bundle skills + MCP + plugins into named presets, apply or revert in one click from the tray                                                      | [Ch. 10](docs/user-manual/en/10-presets.md)             |
+| 👥 **Sub-agent resource allocation** | Allocate resource subsets to sub-agents; tool-level disable cascades down automatically                                                           | [Ch. 9](docs/user-manual/en/09-resources.md)            |
+| ✅ **Tool toggle management**        | Decide which tools Tuvis monitors and manages; unchecking fully restores and hides the tool                                                       | [Ch. 9](docs/user-manual/en/09-resources.md)            |
+| 🩺 **Signal health**                 | Hook trust-gate self-check per tool, with honest per-tool reasons instead of a bare "unregistered"                                                | [Ch. 12](docs/user-manual/en/12-troubleshooting.md)     |
 
 ## See it in action
 
@@ -76,21 +78,22 @@ Step-by-step documentation lives in the **[user manual](docs/user-manual/en/01-o
 
 13 capability rows × 8 terminal-class AI coding tools (✅ supported / ◐ partial / 🧪 experimental / ❌ not supported) — the master table, updated with every release. Structured source: [`docs/capabilities.json`](docs/capabilities.json), shared with the website.
 
-| Capability                              | Claude Code | Codex CLI | OpenCode | OpenClaw | Kimi Code | WorkBuddy | ZCode           | dsh    |
-| --------------------------------------- | ----------- | --------- | -------- | -------- | --------- | --------- | --------------- | ------ |
-| Session monitoring                      | ✅          | ✅        | ✅       | ✅       | ✅        | ✅        | ✅              | ✅     |
-| Desktop notifications                   | ✅          | ✅        | ✅       | ✅       | ✅        | ✅        | ✅              | ✅     |
-| Skill management                        | ✅          | ✅        | ✅       | ✅       | ✅        | ✅        | ✅              | ◐ read-only |
-| MCP management                          | ✅ JSON     | ✅ TOML   | ✅ JSONC | ✅ JSON  | ✅ JSON   | ✅ JSON   | ✅ JSON subtree | ❌     |
-| Plugin management                       | ✅          | ✅        | ✅       | ✅       | ◐ file-based | ❌     | ❌              | ❌     |
-| Status hooks                            | ✅          | ✅        | ❌       | ❌       | ✅        | ❌        | ❌              | ❌     |
-| Mobile · message viewing                | ✅          | ✅        | ✅       | ❌       | ✅        | ✅        | ✅              | ✅     |
-| Mobile · file preview                   | ✅          | ✅        | ✅       | ❌       | ✅        | ✅        | ✅              | ✅     |
-| Mobile · send messages (injection)      | 🧪          | 🧪        | 🧪       | ❌       | 🧪        | ❌        | ❌              | ❌     |
-| Mobile · create sessions                | 🧪          | 🧪        | 🧪       | ❌       | 🧪        | ❌        | ❌              | ❌     |
-| Token usage collection                  | ✅          | ✅        | ✅       | ❌       | ✅        | ✅        | ✅              | ✅     |
-| Mobile · sub-agent observatory          | ✅          | ❌        | ❌       | ❌       | ❌        | ❌        | ❌              | ❌     |
-| Mobile · Codex APP control (Desktop IPC) | ❌         | 🧪        | ❌       | ❌       | ❌        | ❌        | ❌              | ❌     |
+| Capability                               | Claude Code | Codex CLI   | OpenCode | OpenClaw | Kimi Code    | WorkBuddy | ZCode           | dsh         |
+| ---------------------------------------- | ----------- | ----------- | -------- | -------- | ------------ | --------- | --------------- | ----------- |
+| Session monitoring                       | ✅          | ✅          | ✅       | ✅       | ✅           | ✅        | ✅              | ✅          |
+| Desktop notifications                    | ✅          | ✅          | ✅       | ✅       | ✅           | ✅        | ✅              | ✅          |
+| Skill management                         | ✅          | ✅          | ✅       | ✅       | ✅           | ✅        | ✅              | ◐ read-only |
+| MCP management                           | ✅ JSON     | ✅ TOML     | ✅ JSONC | ✅ JSON  | ✅ JSON      | ✅ JSON   | ✅ JSON subtree | ❌          |
+| Plugin management                        | ✅          | ✅          | ✅       | ✅       | ◐ file-based | ❌        | ❌              | ❌          |
+| Status hooks                             | ✅          | ✅          | ❌       | ❌       | ✅           | ❌        | ❌              | ❌          |
+| Mobile · message viewing                 | ✅          | ✅          | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
+| Mobile · file preview                    | ✅          | ✅          | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
+| Mobile · send messages (injection)       | 🧪          | 🧪          | 🧪       | ❌       | 🧪           | ❌        | ❌              | ❌          |
+| Mobile · create sessions                 | 🧪          | 🧪          | 🧪       | ❌       | 🧪           | ❌        | ❌              | ❌          |
+| Token usage collection                   | ✅          | ✅          | ✅       | ❌       | ✅           | ✅        | ✅              | ✅          |
+| Output speed (TPS sampling)              | ◐ approx    | ◐ resp-only | ◐ plugin | ❌       | ✅           | ✅        | ✅              | ✅          |
+| Mobile · sub-agent observatory           | ✅          | ❌          | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
+| Mobile · Codex APP control (Desktop IPC) | ❌          | 🧪          | ❌       | ❌       | ❌           | ❌        | ❌              | ❌          |
 
 > Injection and session creation are experimental and currently cover Claude Code / Codex CLI / OpenCode / Kimi Code; Codex APP control is unlocked per exact Desktop build. Per-tool status and known limitations are documented honestly in [Ch. 8](docs/user-manual/en/08-mobile-remote.md) of the manual.
 
@@ -127,8 +130,8 @@ pnpm check          # format:check + lint + build
 
 Two hangouts, same team behind both — feedback gathered there is triaged monthly into the public backlog.
 
-| QQ group (中文)                                                                                   | Discord (international)                                                                                  |
-| ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| QQ group (中文)                                                                                                                                     | Discord (international)                                                                                                                   |
+| --------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | <img src="docs/images/community-qq.png" width="180" alt="QQ group QR code" /><br>Group **1131682176** · [join link](https://qm.qq.com/q/mgDUzWheCs) | <img src="docs/images/community-discord.png" width="180" alt="Discord QR code" /><br>[discord.gg/2PBUDYuD5](https://discord.gg/2PBUDYuD5) |
 
 Prefer staying on GitHub? **[Discussions](../../discussions)** is the public feedback pool (Ideas / Q&A / Announcements) and **[Issues](../../issues/new/choose)** is for bug reports. When reporting a problem, please include the app version, the in-app **error code** (every error carries one since v0.5.8, English & 中文), and steps or screenshots.
