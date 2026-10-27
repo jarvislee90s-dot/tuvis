@@ -1999,15 +1999,28 @@ mod tests {
 
         // 证据门：即使已恢复并配对，默认关闭的 send 仍不得下发上游业务命令。
         let generation = second_hub.connection().generation;
-        // 只比较**上游请求**：`rpc-frame-ack` 是假体对先前订阅的应答，可能晚一拍落日志，
-        // 它不是 send 触发的请求；任何新请求（bind/订阅/命令）才算回归。
-        let upstream_requests = |log: &[String]| {
+        // 只比较**业务请求**白名单：bind / 订阅 / hello / initialize / 发送命令。
+        // 假体日志同时会收到生产对每个 RPC 帧的传输层 `rpc-frame-ack`（入站，不是业务
+        // 请求，也可能在 ready 之后才到），它不在白名单内；白名单本身就是要断言的项。
+        let upstream_business_requests = |log: &[String]| {
             log.iter()
-                .filter(|method| method.as_str() != "rpc-frame-ack")
+                .filter(|method| {
+                    matches!(
+                        method.as_str(),
+                        BOOTSTRAP_REQUEST
+                            | WORKSPACE_LIST_REQUEST
+                            | WORKSPACE_BRIDGE_OPEN
+                            | AGENT_HELLO_METHOD
+                            | AGENT_CLIENT_HELLO_METHOD
+                            | CONTROLLER_SUBSCRIBE_METHOD
+                            | AGENT_SUBSCRIBE_CONVERSATION_METHOD
+                            | AGENT_SEND_COMMAND_METHOD
+                    )
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        let upstream_before_send = upstream_requests(&world.ws.log());
+        let upstream_before_send = upstream_business_requests(&world.ws.log());
         let (http_status, body) = post_action(
             &app,
             &send_body(
@@ -2025,9 +2038,9 @@ mod tests {
         assert_eq!(body["error"], codes::NEEDS_EVIDENCE);
         assert_eq!(world.ws.commands().len(), 0, "默认关闭时零业务命令帧");
         assert_eq!(
-            upstream_requests(&world.ws.log()),
+            upstream_business_requests(&world.ws.log()),
             upstream_before_send,
-            "能力闸必须在 bind 前拒绝：零新增上游请求（bind/订阅/业务帧）"
+            "能力闸必须在 bind 前拒绝：零新增业务请求（bind/订阅/hello/initialize/命令）"
         );
     }
 

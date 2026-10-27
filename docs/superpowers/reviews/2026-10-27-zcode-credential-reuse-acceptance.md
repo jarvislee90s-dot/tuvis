@@ -60,7 +60,7 @@ RED 证据：测试写完后，临时在 `AuthService::restore` 顶部插入 `re
 | `cargo test --features marker-helper,zcode-bridge-evidence` | 3931 passed / 0 failed / 46 ignored（36 个测试目标） | `0` |
 | `cargo clippy --all-targets --features marker-helper -- -D warnings` | Finished，0 warnings | `0` |
 | `cargo clippy --all-targets --features marker-helper,zcode-bridge-evidence -- -D warnings` | Finished，0 warnings | `0` |
-| `cargo fmt --check` | 通过（wire_e2e 已 `cargo fmt`） | `0` |
+| `cargo fmt --check` | 重新运行通过（`/tmp/h3-fmt-final.log`，`FMT_EXIT:0`） | `0` |
 | `pnpm test`（首轮，与 cargo 全量证据编译并行） | **6 failed / 2356 passed / 5 skipped**；失败集中在 `tests/mobile/SessionDetail.test.tsx`（超时 15s、滚动断言 `expected +0 to be 5000`、缺 `bookmark-jump-miss`）与 `tests/usage/v2-{acceptance,identity-ui}.test.tsx`（5s 超时） | `1` |
 | 上述 3 个失败文件空载复跑 | 3 files / 133 passed / 0 failed | `0` |
 | `pnpm test`（空载全量复跑） | **2362 passed / 5 skipped（194 文件）/ 0 failed** | `0` |
@@ -69,7 +69,7 @@ RED 证据：测试写完后，临时在 `AuthService::restore` 顶部插入 `re
 
 **稳定性说明（如实申报）**：`pnpm test` 首轮与 cargo 全量证据构建并行执行，6 个失败全部是移动端/用量页的超时或滚动定位断言，不涉及 ZCode 设置卡与本次改动；同一批 3 个文件与全量套件在空载下复跑均 0 failed。报告把首轮失败原样保留，不把复跑通过写成「从未失败」。
 
-日志：`/tmp/h3-green-integration.log`、`/tmp/h3-full-normal.log`、`/tmp/h3-full-evidence.log`、`/tmp/h3-clippy-normal.log`、`/tmp/h3-clippy-evidence.log`、`/tmp/h3-fmt.log`、`/tmp/h3-pnpm-test.log`、`/tmp/h3-pnpm-flake-retry.log`、`/tmp/h3-pnpm-test-rerun.log`、`/tmp/h3-pnpm-check.log`、`/tmp/h3-pnpm-mobile.log`。
+日志：`/tmp/h3-green-integration.log`、`/tmp/h3-full-normal.log`、`/tmp/h3-full-evidence.log`、`/tmp/h3-clippy-normal.log`、`/tmp/h3-clippy-evidence.log`、`/tmp/h3-fmt-final.log`（`cargo fmt --check` 重新运行，`FMT_EXIT:0`）、`/tmp/h3-pnpm-test.log`、`/tmp/h3-pnpm-flake-retry.log`、`/tmp/h3-pnpm-test-rerun.log`、`/tmp/h3-pnpm-check.log`、`/tmp/h3-pnpm-mobile.log`。
 
 ## 四、平台与真实官方验收（未执行，禁止标 PASS）
 
@@ -97,10 +97,18 @@ RED 证据：测试写完后，临时在 `AuthService::restore` 顶部插入 `re
 
 1. **`FakeOfficialHttp` 增加计数**：为断言「OAuth 仍一次 / terminal token 每次连接一次」，假官方端点新增 `oauth_exchanges`、`terminal_token_requests` 两个原子计数；只在测试 fixture 内，不触生产代码、不改变响应。
 2. **共享 fake 存储而非真实保险箱**：按 brief 用 `MemoryCredentialStore` 共享同一持久记录，重新构造 AuthService/Hub 模拟整进程；这证明**生产恢复编排**，不证明平台保险箱本身。
-3. **能力断言过滤 `rpc-frame-ack`**：`default_closed_capabilities_remain_closed_after_restore` 只比较上游**请求**序列；`rpc-frame-ack` 是假体对先前订阅的应答，可能晚一拍落日志，不属于 send 触发的新请求。命令帧计数与 409 断言不受影响。
+3. **能力断言改为业务请求白名单**：`default_closed_capabilities_remain_closed_after_restore` 只比较 bind / 订阅 / hello / initialize / 命令五类**业务请求**；`rpc-frame-ack` 是生产对假体 RPC 帧的传输层入站回执，不属于业务请求、也不由 send 触发，因此不放入白名单。断言直接锁定要断言的项（新业务请求为零），不再对整份日志做排除式比较。命令帧计数与 409 断言不受影响。
 4. **RED 为破坏桩证据**：目标行为在 C1–H2 已实现，H3 无新增生产实现；因此 RED 采用临时恢复桩证明新用例可证伪（与 H2 同法），不是「先写实现再写测试」的首次运行记录。
 5. **未改前端设置卡测试**：C4 已覆盖授权状态 / 忘记按钮 / 零 connect 等交互；H3 未发现需要新增的前端契约，`tests/settings/zcodeRemoteSettings.test.tsx` 无 diff。
 6. **未跑项目**：真实 Keychain、真实 OAuth、真实重启、Windows/Linux 构建与运行、真实官方链路、两台手机并发均为未跑；不以 fake 结果替代。
+
+### 5.1 复审修整（2026-10-28）
+
+1. **fmt 证据更正**：不再引用格式化前失败的 `/tmp/h3-fmt.log`；重新运行 `cargo fmt --check`，`/tmp/h3-fmt-final.log` 记录 `FMT_EXIT:0`。
+2. **能力断言更正**：删除对 `rpc-frame-ack` 的整日志排除式过滤，改为**业务请求白名单**（bind / 订阅 / hello / initialize / 命令）；并更正旧解释——`rpc-frame-ack` 是生产对假体 RPC 帧的传输层入站回执，不是「假体应答晚一拍」。
+3. **英文手指标签逐字对齐 UI**：`Credential storage unavailable` / `Credential storage failed` / `Stored credential is invalid or too large`。
+4. **未改动项**：暂停 / 忘记 e2e 的 100ms 观察窗保留——它用于证明 gate 失败后不会在观察期内发起连接；`auto_attempt_count` 的同步等待已避免固定毫秒级轮询，该观察窗不参与正确性判定。
+5. **修整后复跑**：`cargo test --lib services::zcode_control::wire_e2e` 13/13 PASS（EXIT 0）；`cargo fmt --check` EXIT 0；普通 / 证据 clippy 均 0 warning（EXIT 0）。
 
 ## 六、交付边界
 
