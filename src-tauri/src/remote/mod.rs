@@ -1334,13 +1334,32 @@ pub(crate) fn start_zcode_auto_connect_after_restore(
     });
 }
 
+/// 生产总开关内核（`remote_toggle` 的唯一调用点，可测包装）：成功启停后唤醒
+/// **同一** ZCode Hub 的自动连接 worker。唤醒闭包是生产实参
+/// [`wake_zcode_hub_auto_connect`]（不是 `|| {}`），由
+/// `production_toggle_wakes_state_hub` 经 STATE 槽做可证伪验证。
+fn toggle_remote_and_wake(
+    enabled: bool,
+    set_enabled: impl FnMut(bool),
+    start: impl FnOnce() -> Result<(), String>,
+    stop: impl FnOnce(),
+) -> Result<(), String> {
+    toggle_core(
+        enabled,
+        set_enabled,
+        start,
+        stop,
+        wake_zcode_hub_auto_connect,
+    )
+}
+
 /// 开关远程接入（前端设置页 invoke）：写设置 SSOT 后启停服务器（失败回滚见 toggle_core）。
 /// M5 A4 吊销收窄：关闭走 stop_server_explicit_close（停服务 + 隧道全停，不吊销——2026-09-18 裁决）；开启分支
 /// 不 stop。M5 A5 总开关恢复逻辑：开启成功 → 按各通道 KV 恢复隧道 + PIN 自动生成
 /// （关闭 = 全停，重开按各卡状态恢复——用户裁决）
 #[tauri::command]
 pub fn remote_toggle(enabled: bool) -> Result<(), String> {
-    toggle_core(
+    toggle_remote_and_wake(
         enabled,
         |v| {
             crate::database::dao::settings::set_setting(
@@ -1350,7 +1369,6 @@ pub fn remote_toggle(enabled: bool) -> Result<(), String> {
         },
         start_server,
         stop_server_explicit_close,
-        wake_zcode_hub_auto_connect,
     )?;
     if enabled {
         // 恢复开着的隧道（幂等：start_server spawn 闭包已恢复过一轮，重入切换时
@@ -4791,6 +4809,7 @@ mod zcode_wiring_tests {
         disconnect_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
         /// C4 启动/唤醒接线：后端是否持有可用授权（默认未授权 = 无 OAuth 记录）。
         authorized: AtomicBool,
+        remembered: AtomicBool,
         restore_calls: AtomicUsize,
     }
 
@@ -4824,6 +4843,7 @@ mod zcode_wiring_tests {
         fn auth_status(&self) -> AuthStatus {
             AuthStatus {
                 authorized: self.authorized.load(Ordering::SeqCst),
+                remembered: self.remembered.load(Ordering::SeqCst),
                 ..AuthStatus::default()
             }
         }
@@ -5015,6 +5035,99 @@ mod zcode_wiring_tests {
             "无授权不得连接"
         );
         assert_eq!(hub.connection().state, ConnectionState::NeedsAuth);
+    }
+
+    /// C4 启动顺序可证伪用例：远程关闭 + auto=false（worker gate 必不通过），
+    /// 但 fake 的 restore 返回 authorized/remembered——只有 `start_..._after_restore`
+    /// 里显式那次 `hub.restore_authorization().await` 能推进状态；worker 不会替它恢复。
+    /// 删掉那行恢复 → restore_calls=0、Hub 停在 NeedsAuth，本用例必红。
+    #[tokio::test]
+    async fn startup_restore_runs_before_auto_connect_gate() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.authorized.store(true, Ordering::SeqCst);
+        fake.remembered.store(true, Ordering::SeqCst);
+        let store = stored(URL);
+        store
+            .with(|conn| {
+                try_set_setting_conn(conn, KEY_ENABLED, "false")?;
+                try_set_setting_conn(conn, "remote.zcode_auto_connect", "false")
+            })
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::NeedsAuth,
+            "前置：构造后尚未恢复"
+        );
+
+        start_zcode_auto_connect_after_restore(hub.clone());
+        wait_until(
+            || fake.restore_calls.load(Ordering::SeqCst) >= 1,
+            "启动接线必须先恢复授权（worker gate 不通过不会替它恢复）",
+        )
+        .await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let status = hub.auth_status();
+        assert!(status.authorized, "显式 restore 必须对齐 Hub 授权缓存");
+        assert!(status.remembered, "fake 恢复的就是已记住授权");
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            0,
+            "remote.enabled=false + auto=false：恢复后也不得连接"
+        );
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::Offline,
+            "恢复成功但远程关闭 = 已授权未连接（offline），不是 needs_auth"
+        );
+    }
+
+    /// C4 生产唤醒接线可证伪用例：`remote_toggle` 唯一调用 `toggle_remote_and_wake`，
+    /// 后者的生产实参是 `wake_zcode_hub_auto_connect`（不是 `|| {}`）。这里经 STATE
+    /// 槽放同一个 fake Hub，走**生产包装**分别开启/关闭一次，断言 `auto_attempt_count`
+    /// 每次增长（worker 真被唤醒）。把包装里的 wake 换成 `|| {}`，本用例即超时失败。
+    #[tokio::test]
+    async fn production_toggle_wakes_state_hub() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = fake_hub(fake.clone(), stored(URL));
+        STATE.set_zcode_hub(hub.clone());
+        hub.start_auto_connect();
+        wait_until(
+            || hub.auto_attempt_count() >= 1,
+            "worker 首次尝试（start 自带一次）",
+        )
+        .await;
+
+        let before_enable = hub.auto_attempt_count();
+        toggle_remote_and_wake(true, |_| {}, || Ok(()), || panic!("开启分支不得 stop"))
+            .expect("开启包装应成功");
+        wait_until(
+            || hub.auto_attempt_count() > before_enable,
+            "开启成功必须唤醒 STATE 里的同一 Hub（不能是 || {}）",
+        )
+        .await;
+
+        let before_disable = hub.auto_attempt_count();
+        toggle_remote_and_wake(false, |_| {}, || panic!("关闭分支不得 start"), || {})
+            .expect("关闭包装应成功");
+        wait_until(
+            || hub.auto_attempt_count() > before_disable,
+            "关闭成功同样必须唤醒 worker（现查 remote.enabled=false 不连接）",
+        )
+        .await;
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            0,
+            "remote.enabled 未开：唤醒只做一次 gate 判定，不连接"
+        );
+
+        // 清理：把槽换成未启动 worker 的空 Hub，避免其他用例意外唤醒本记录型 fake。
+        // （槽按 STATE.sse_registry 身份只增不删，这是唯一可用的复位方式。）
+        let inert_fake = Arc::new(FakeBackend::default());
+        STATE.set_zcode_hub(fake_hub(inert_fake, DeviceStore::memory()));
     }
 
     /// 停服 = 显式断开 Hub（关 relay/计时器、状态 offline），**绝不自动重连**；
