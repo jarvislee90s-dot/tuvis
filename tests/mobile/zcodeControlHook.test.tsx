@@ -40,6 +40,18 @@ const capabilities = (): CapabilityView => ({
   thoughtLevel: flag(true),
 });
 
+/** Hub 降级后事件沿用的全关能力矩阵（reasonCode = needs_evidence）。 */
+const closedCapabilities = (): CapabilityView => ({
+  send: flag(false),
+  singleSelect: flag(false),
+  multiSelect: flag(false),
+  freeText: flag(false),
+  interrupt: flag(false),
+  approvalReply: flag(false),
+  model: flag(false),
+  thoughtLevel: flag(false),
+});
+
 function connection(overrides: Partial<ConnectionView> = {}): ConnectionView {
   return {
     state: "paired",
@@ -689,7 +701,13 @@ describe("useZcodeControl：SSE 纠偏（不重放动作）", () => {
     installFetch((url) => {
       if (url === ZCODE_CONNECTION_PATH) return json(connection());
       if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
-        return json(sessionView({ ready: serverReady, revision }));
+        return json(
+          sessionView({
+            ready: serverReady,
+            revision,
+            capabilities: serverReady ? capabilities() : closedCapabilities(),
+          })
+        );
       }
       throw new Error(`unexpected fetch: ${url}`);
     });
@@ -718,34 +736,274 @@ describe("useZcodeControl：SSE 纠偏（不重放动作）", () => {
     // 同代 ready=false（lag 降级）：恰好补一发会话 GET 自愈。
     serverReady = false;
     revision = 30;
-    await emitSession({ ready: false, revision: 30 });
+    await emitSession({ ready: false, revision: 30, capabilities: closedCapabilities() });
     expect(result.current.session?.ready).toBe(false);
     expect(sessionGets()).toBe(2);
 
     // 同一代次重复降级（多帧/别的设备触发）：不得再发 GET（无刷新风暴）。
-    await emitSession({ ready: false, revision: 30 });
-    await emitSession({ ready: false, revision: 30 });
+    await emitSession({ ready: false, revision: 30, capabilities: closedCapabilities() });
+    await emitSession({ ready: false, revision: 30, capabilities: closedCapabilities() });
     expect(sessionGets()).toBe(2);
 
-    // 自愈 GET 落地 ready=true 即重置守卫（不依赖额外的 ready=true SSE 帧）。
+    // 恢复快照（Hub 事件沿用降级后的全关能力）：必须**自动**补一次权威 GET，
+    // 不手动 refresh——GET 落地 ready=true 才算恢复，守卫由 GET 清空。
     serverReady = true;
     revision = 31;
-    await act(async () => {
-      await result.current.refresh();
-    });
-    await flush();
+    await emitSession({ ready: true, revision: 31, capabilities: closedCapabilities() });
     expect(result.current.session?.ready).toBe(true);
     expect(sessionGets()).toBe(3);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
 
     // 恢复后同代次再次失效：守卫已由 GET 落地重置 → 仍会自愈一次（GET 4）。
     serverReady = false;
     revision = 32;
-    await emitSession({ ready: false, revision: 32 });
+    await emitSession({ ready: false, revision: 32, capabilities: closedCapabilities() });
     expect(sessionGets()).toBe(4);
 
     // 本次 GET 仍返回失效投影：守卫保持，同代重复 false 不再刷新。
-    await emitSession({ ready: false, revision: 32 });
+    await emitSession({ ready: false, revision: 32, capabilities: closedCapabilities() });
     expect(sessionGets()).toBe(4);
+  });
+
+  it("recovery_after_not_ready_get_auto_refetches_capabilities", async () => {
+    // P2-4：坏帧降级 → 自动 GET 撞上 not_ready（重订阅 ACK 早于快照）→ 随后有效快照
+    // ready=true 但能力沿用降级后的全关。手机必须**自己**补一次权威 GET（不手动
+    // refresh）才能拿回 send；否则发送按钮会一直灰着。
+    let sessionGet: "ready" | "not_ready" | "stale" = "ready";
+    let revision = 12;
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        if (sessionGet === "not_ready") return json({ error: "not_ready" }, 503);
+        if (sessionGet === "stale") {
+          return json(sessionView({ revision, ready: false, capabilities: closedCapabilities() }));
+        }
+        return json(sessionView({ revision, ready: true, capabilities: capabilities() }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    const emitSession = async (overrides: Partial<SessionView>) => {
+      await act(async () => {
+        MockEventSource.latest().emit("session", {
+          seq: 1,
+          generation: 3,
+          sessionId: SID,
+          kind: "session",
+          data: sessionView(overrides),
+        });
+        await Promise.resolve();
+      });
+      await flush();
+    };
+
+    // ① 初始：send 可用（GET #1 现算开闸矩阵）。
+    expect(sessionGets()).toBe(1);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+
+    // ② 坏帧降级：自动 GET #2 撞上 not_ready（会话保持上一份落地的投影 = ready=false）。
+    sessionGet = "not_ready";
+    revision = 13;
+    await emitSession({ ready: false, revision: 13, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(2);
+    expect(result.current.session?.ready).toBe(false);
+    expect(result.current.reason).toBe("not_ready");
+
+    // ③ 有效快照 ready=true（能力沿用降级后的全关）：必须自动补 GET #3 拿回权威能力。
+    sessionGet = "ready";
+    revision = 14;
+    await emitSession({ ready: true, revision: 14, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(3);
+    expect(result.current.session?.ready).toBe(true);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+    expect(postedActions()).toHaveLength(0); // 恢复只读：绝不重放动作
+
+    // ④ 同代重复 ready=true（能力已是权威）：有界，不得再补 GET #4。
+    await emitSession({ ready: true, revision: 14, capabilities: capabilities() });
+    expect(sessionGets()).toBe(3);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+
+    // ⑤ 恢复后再次失效（同代）= 新的失效周期：允许再自愈一次（GET #4）；本次 GET
+    //    仍返回失效投影（守卫保持），因此重复降级帧不再加发（有界，无风暴）。
+    sessionGet = "stale";
+    revision = 15;
+    await emitSession({ ready: false, revision: 15, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(4);
+    await emitSession({ ready: false, revision: 15, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(4);
+    expect(postedActions()).toHaveLength(0);
+  });
+
+  it("stale_snapshot_recovery_refetches_capabilities", async () => {
+    // snapshot 路径同规：ready=false 快照触发失效 GET；随后 ready=true 快照（能力全关）
+    // 必须自动补一发权威 GET，重复恢复快照不再加发。
+    let serverReady = true;
+    let revision = 12;
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            revision,
+            ready: serverReady,
+            capabilities: serverReady ? capabilities() : closedCapabilities(),
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    const emitSnapshot = async (overrides: Partial<SessionView>) => {
+      await act(async () => {
+        MockEventSource.latest().emit("snapshot", {
+          connection: connection(),
+          session: sessionView(overrides),
+        });
+        await Promise.resolve();
+      });
+      await flush();
+    };
+
+    expect(sessionGets()).toBe(1);
+
+    // 降级快照 → 失效 GET #2（仍返回失效投影，守卫保持）。
+    serverReady = false;
+    revision = 20;
+    await emitSnapshot({ ready: false, revision: 20, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(2);
+
+    // 恢复快照（能力全关）→ 自动补权威 GET #3，send 恢复。
+    serverReady = true;
+    revision = 21;
+    await emitSnapshot({ ready: true, revision: 21, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(3);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+
+    // 重复恢复快照：有界，不再加发 GET #4。
+    await emitSnapshot({ ready: true, revision: 21, capabilities: capabilities() });
+    expect(sessionGets()).toBe(3);
+    expect(postedActions()).toHaveLength(0);
+  });
+
+  it("stale_get_without_sse_frame_still_recovers_capabilities", async () => {
+    // 页面在失效窗口内打开：首拍 GET **直接**读到 ready=false（没有任何降级 SSE 帧）。
+    // 随后有效快照 ready=true 但能力沿用全关 → 仍必须自动补一次权威 GET，否则发送
+    // 按钮永远灰着（本用例锁的正是「GET 是唯一失效信号」的开局）。
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        const gets = fetchMock.mock.calls.filter(([input]) =>
+          String(input).startsWith(`${ZCODE_SESSION_PATH}?`)
+        ).length;
+        if (gets === 1) {
+          return json(
+            sessionView({ ready: false, revision: 11, capabilities: closedCapabilities() })
+          );
+        }
+        return json(sessionView({ ready: true, revision: 12, capabilities: capabilities() }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    const emitSession = async (overrides: Partial<SessionView>) => {
+      await act(async () => {
+        MockEventSource.latest().emit("session", {
+          seq: 1,
+          generation: 3,
+          sessionId: SID,
+          kind: "session",
+          data: sessionView(overrides),
+        });
+        await Promise.resolve();
+      });
+      await flush();
+    };
+
+    // ① 首拍 GET #1 = ready=false（失效窗口内打开，无 SSE 降级帧）。
+    expect(sessionGets()).toBe(1);
+    expect(result.current.session?.ready).toBe(false);
+    expect(result.current.session?.capabilities.send.enabled).toBe(false);
+
+    // ② 有效快照 ready=true（Hub 事件沿用降级后的全关能力）：必须自动补 GET #2。
+    await emitSession({ ready: true, revision: 13, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(2);
+    expect(result.current.session?.ready).toBe(true);
+    expect(result.current.session?.capabilities.send.enabled).toBe(true);
+    expect(postedActions()).toHaveLength(0);
+
+    // ③ 重复 ready=true：有界，不再加发 GET #3。
+    await emitSession({ ready: true, revision: 13, capabilities: capabilities() });
+    expect(sessionGets()).toBe(2);
+  });
+
+  it("recovery_attempts_are_capped_per_generation", async () => {
+    // 恢复 GET 连续失败时不得无限重试：同一会话代次至多 2 次恢复尝试（首次 + 一次
+    // 重试）。每次 ready=false 都清恢复标记（不被毒化），但尝试计数封顶后 ready=true
+    // 直接 no-op；换代/切会话/GET 落地 ready=true 才重置。
+    let sessionGet: "ready" | "not_ready" = "ready";
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        if (sessionGet === "not_ready") return json({ error: "not_ready" }, 503);
+        return json(sessionView({ revision: 12, ready: true, capabilities: capabilities() }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    renderHook(() => useZcodeControl(SID));
+    await flush();
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    const emitSession = async (overrides: Partial<SessionView>) => {
+      await act(async () => {
+        MockEventSource.latest().emit("session", {
+          seq: 1,
+          generation: 3,
+          sessionId: SID,
+          kind: "session",
+          data: sessionView(overrides),
+        });
+        await Promise.resolve();
+      });
+      await flush();
+    };
+    expect(sessionGets()).toBe(1);
+
+    // 降级帧 → 失效 GET #2 失败。
+    sessionGet = "not_ready";
+    await emitSession({ ready: false, revision: 20, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(2);
+
+    // 恢复尝试 1/2：GET #3 仍失败。
+    await emitSession({ ready: true, revision: 20, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(3);
+
+    // 再次降级只清恢复标记，不额外 GET（同代 stale 守卫仍有效）。
+    await emitSession({ ready: false, revision: 20, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(3);
+
+    // 恢复尝试 2/2：GET #4 仍失败。
+    await emitSession({ ready: true, revision: 20, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(4);
+
+    // 第三次恢复请求触顶：no-op（有界，不循环）。
+    await emitSession({ ready: false, revision: 20, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(4);
+    await emitSession({ ready: true, revision: 20, capabilities: closedCapabilities() });
+    expect(sessionGets()).toBe(4);
+    expect(postedActions()).toHaveLength(0);
   });
 
   it("stale_snapshot_refreshes_once_and_session_switch_clears_guard", async () => {
@@ -759,7 +1017,13 @@ describe("useZcodeControl：SSE 纠偏（不重放动作）", () => {
       if (url === ZCODE_CONNECTION_PATH) return json(connection());
       if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
         const sid = url.includes(SID2) ? SID2 : SID;
-        return json(sessionView({ sessionId: sid, ready: serverReady }));
+        return json(
+          sessionView({
+            sessionId: sid,
+            ready: serverReady,
+            capabilities: serverReady ? capabilities() : closedCapabilities(),
+          })
+        );
       }
       throw new Error(`unexpected fetch: ${url}`);
     });
@@ -785,19 +1049,22 @@ describe("useZcodeControl：SSE 纠偏（不重放动作）", () => {
 
     // 重连基线带同代 ready=false：恰好一发 GET（自愈 GET 仍返回失效投影，守卫保持）。
     serverReady = false;
-    await emitSnapshot(SID, { ready: false, revision: 40 });
+    await emitSnapshot(SID, { ready: false, revision: 40, capabilities: closedCapabilities() });
     expect(sessionGets()).toBe(2);
     // 同代重复快照：不再发 GET。
-    await emitSnapshot(SID, { ready: false, revision: 40 });
+    await emitSnapshot(SID, { ready: false, revision: 40, capabilities: closedCapabilities() });
     expect(sessionGets()).toBe(2);
 
-    // 切会话：首拍 GET 后守卫清空；新会话**同代次**（gen 3）的降级帧必须能刷新。
+    // 切会话：首拍 GET（ready=true）后守卫清空；新会话**同代次**（gen 3）的降级帧
+    // 必须能刷新——若旧会话守卫残留，这里会被吞掉（计数停在 3）。
+    serverReady = true;
     rerender({ sid: SID2 });
     await flush();
     expect(sessionGets()).toBe(3);
-    await emitSnapshot(SID2, { ready: false, revision: 41 });
+    serverReady = false;
+    await emitSnapshot(SID2, { ready: false, revision: 41, capabilities: closedCapabilities() });
     expect(sessionGets()).toBe(4);
-    await emitSnapshot(SID2, { ready: false, revision: 41 });
+    await emitSnapshot(SID2, { ready: false, revision: 41, capabilities: closedCapabilities() });
     expect(sessionGets()).toBe(4);
     expect(postedActions()).toHaveLength(0);
   });
