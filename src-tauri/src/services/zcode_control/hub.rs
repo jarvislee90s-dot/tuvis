@@ -881,8 +881,9 @@ pub struct ZcodeHub {
     /// `forget_authorization` 后的内存暂停（授权成功/显式连接恢复）。
     ///
     /// 持久意图另见 settings 的 `remote.zcode_auto_connect`；本标记只封住忘记期间
-    /// 「旧 restore 抢在新删除之前复活内存凭据」的窗口，不跨进程。
-    auto_paused: AtomicBool,
+    /// 「旧 restore 抢在新删除之前复活内存凭据」的窗口，不跨进程。`Arc` 让 relay
+    /// 事件泵在 KICKED 时也能同步置位并唤醒 worker，立即取消待重试轮次。
+    auto_paused: Arc<AtomicBool>,
     /// 测试观察口：自动连接 worker 已执行的尝试次数（证明「等 worker 跑完」而不是
     /// 靠固定 sleep；不影响生产行为）。
     #[cfg(test)]
@@ -1001,7 +1002,7 @@ impl ZcodeHub {
             disconnect_lock: AsyncMutex::new(()),
             auto_started: AtomicBool::new(false),
             auto_notify: Arc::new(Notify::new()),
-            auto_paused: AtomicBool::new(false),
+            auto_paused: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             auto_attempts: AtomicU64::new(0),
             #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
@@ -1041,6 +1042,10 @@ impl ZcodeHub {
         let out = self.events.clone();
         // KICKED 进入时要持久化「暂停自动连接」：给泵一份与 Hub 同一库的 DeviceStore。
         let store = self.store.clone();
+        // 同一条冲突事件还要**立即**取消自动连接的待重试轮次（不等 1s/3s/10s 定时器）：
+        // 暂停标记 + 唤醒都走与 worker 共享的句柄。
+        let auto_paused = self.auto_paused.clone();
+        let auto_notify = self.auto_notify.clone();
         tokio::spawn(async move {
             loop {
                 if let Some(lag) = &lag {
@@ -1076,8 +1081,11 @@ impl ZcodeHub {
                         let entered_conflict =
                             apply_relay_state(&inner, &out, bridge.as_ref(), view).await;
                         if entered_conflict {
-                            // KICKED：持久暂停自动连接（设计 §5.2）。checked 写；失败不
-                            // 声称成功，也不阻塞事件泵（阻塞型 DB 调用交给 blocking 池）。
+                            // KICKED：先同步暂停并唤醒自动连接（取消待重试轮次），再持久化
+                            // 「暂停自动连接」（设计 §5.2）。checked 写；失败不声称成功，
+                            // 也不阻塞事件泵（阻塞型 DB 调用交给 blocking 池）。
+                            auto_paused.store(true, Ordering::SeqCst);
+                            auto_notify.notify_one();
                             let store = store.clone();
                             tokio::task::spawn_blocking(move || {
                                 let _ = persist_auto_connect(&store, false);
@@ -1384,8 +1392,12 @@ impl ZcodeHub {
 
     /// 用户显式断开：先 checked 持久化 `auto=false`（失败即 `storage_failed`，**不得**
     /// 悄悄断开），再走原 [`Self::disconnect`]（保留 JWT，可再次连接）。
+    ///
+    /// 同时置内存暂停并唤醒 worker：正在退避的旧轮次立即作废（H1），不会在用户手动
+    /// 断开后自行补连；显式连接/授权成功会解除暂停。
     pub async fn disconnect_requested(&self) -> ZResult<ConnectionView> {
         persist_auto_connect(&self.store, false)?;
+        self.pause_auto_connect();
         Ok(self.disconnect().await)
     }
 
@@ -1516,12 +1528,21 @@ impl ZcodeHub {
         self.auto_paused.load(Ordering::SeqCst)
     }
 
+    /// 暂停本轮自动连接（忘记授权 / 手动断开 / KICKED）：同步置位并唤醒 worker，
+    /// 让正在退避的旧轮次立即作废，而不是等 1s/3s/10s 定时器到点。
     pub(crate) fn pause_auto_connect(&self) {
         self.auto_paused.store(true, Ordering::SeqCst);
+        self.wake_auto_connect();
     }
 
     pub(crate) fn resume_auto_connect(&self) {
         self.auto_paused.store(false, Ordering::SeqCst);
+    }
+
+    /// 自动连接轮次绑定的控制代际：换/删链接、显式断开、KICKED 推进代际后，旧的
+    /// 定时器/在途尝试一律作废，绝不向旧目标发起连接（等待结束后由 worker 现查）。
+    pub(crate) fn auto_connect_generation(&self) -> u64 {
+        self.lock().generation
     }
 
     /// 单 worker 启动幂等：第一次调用返回 true，后续调用 false。

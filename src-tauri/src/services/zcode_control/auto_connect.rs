@@ -1,6 +1,5 @@
 //! ZCode 自动连接编排（凭据复用设计 §5.2）。
 //!
-//! 本模块只做**一次**启动恢复/一次连接（阶段 C3）：
 //! - 每次尝试都**现查**前置条件：远程总开关、用户自动连接意图、已保存链接、
 //!   Hub 不在关闭/冲突/已配对/握手中；任一不满足就停，绝不自动 OAuth；
 //! - 授权缺失时先经 [`ZcodeHub::restore_authorization`] 读系统存储，仍无效即停；
@@ -8,13 +7,17 @@
 //!   本模块不调用 `execute`，不恢复任何写动作。
 //!
 //! 单 worker：`start_auto_connect` 幂等（`AtomicBool`），worker 只持 `Weak<ZcodeHub>`
-//! 与一个 `Notify`；Hub 释放后自动退出。阶段 H 才补 1s/3s/10s 网络退避，C3 不重试。
+//! 与一个 `Notify`；Hub 释放后自动退出。阶段 H 的有界网络恢复：首次立即尝试，仅
+//! `offline` 才按 1s/3s/10s 退避（最多 3 次额外尝试）；等待用 `select!` 监听唤醒，
+//! 新触发/暂停/remote 关闭/忘记/换链接（Hub 代际变化）立即取消旧轮次；配对成功重置
+//! 预算，本模块自己产生的 offline 事件不重置预算、绝不触发新连接。
 //!
 //! 用户意图落在既有 settings 表（设计 §3.3，无 schema 迁移）：
 //! `remote.zcode_auto_connect` 缺键 = true、非法值 = false；**读取失败按失败处理**
 //! （不当作缺键），写入一律 checked，失败如实回报 `storage_failed`。
 
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use rusqlite::Connection;
 use tokio::sync::Notify;
@@ -24,7 +27,7 @@ use crate::remote::pairing::DeviceStore;
 
 use super::config::{get_config, ConfigState};
 use super::hub::ZcodeHub;
-use super::types::{codes, ZResult, ZcodeError};
+use super::types::{codes, ConnectionState, ZResult, ZcodeError};
 
 /// 自动连接用户意图（设计 §3.3）：`true` / `false`；缺键 = true，非法值 = false。
 pub(crate) const AUTO_CONNECT_KEY: &str = "remote.zcode_auto_connect";
@@ -82,6 +85,58 @@ pub(crate) fn persist_auto_connect(store: &DeviceStore, enabled: bool) -> ZResul
         .map_err(|_| ZcodeError::of(codes::STORAGE_FAILED))
 }
 
+/// 失败退避档位（设计 §5.2：1s／3s／10s，最多 3 次额外尝试）。
+const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(10),
+];
+
+/// 一次网络故障轮次的重连预算（设计 §5.2）。
+///
+/// 只由单 worker 持有；`reset` 仅在配对成功或显式新触发（授权成功/换链接/重新开启
+/// 远程）开新一轮时调用——**绝不**因本进程自己产生的 offline 事件重置。
+#[derive(Debug, Default)]
+struct ReconnectBudget {
+    used: usize,
+}
+
+impl ReconnectBudget {
+    /// 取下一次退避延迟；预算耗尽返回 `None`（本轮停止，等待显式触发）。
+    fn next_delay(&mut self) -> Option<Duration> {
+        let delay = *RETRY_DELAYS.get(self.used)?;
+        self.used += 1;
+        Some(delay)
+    }
+
+    /// 配对成功或显式新触发：恢复完整预算。
+    fn reset(&mut self) {
+        self.used = 0;
+    }
+}
+
+/// 单次自动连接尝试的结果分类（只有 `Offline` 允许进入退避）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoAttempt {
+    /// 已配对：连接成功。
+    Paired,
+    /// 网络/relay 不可达：唯一可重试的结果。
+    Offline,
+    /// 前置条件已不允许或不可重试（needs_auth/needs_config/conflict/unknown/暂停等）。
+    Stopped,
+    /// Hub 代际已推进（换/删链接、显式断开）：旧轮次立即作废，按新代际重开。
+    Retargeted,
+}
+
+/// 一轮自动连接编排的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoRound {
+    /// 本轮结束（成功/停机/预算耗尽）：等下一次显式唤醒。
+    Done,
+    /// 等待被新唤醒取消：立即按该触发开新一轮。
+    Triggered,
+}
+
 impl ZcodeHub {
     /// 启动唯一自动连接 worker（幂等；构造 Hub 本身仍无自动连接副作用）。
     ///
@@ -98,62 +153,147 @@ impl ZcodeHub {
         });
     }
 
-    /// 唤醒自动连接 worker（授权成功 / 链接更新 / 远程总开关开启时调用）。
+    /// 唤醒自动连接 worker（启动恢复结束 / 授权成功 / 链接更新 / 远程总开关变化）。
     ///
     /// 未启动时只留一个唤醒许可（`Notify` 语义），`start` 后仍会先做一次尝试；
-    /// 每次唤醒只做一次尝试，不排队、不重试。
+    /// 每次唤醒 = 一次**显式新触发**：取消正在等待的旧轮次并按新状态重开预算。
+    /// 本模块绝不因自己产生的 offline 事件调用它。
     pub fn wake_auto_connect(&self) {
         self.auto_notify_handle().notify_one();
     }
 
     /// 单次自动连接尝试：条件每次现查，只调用既有 [`Self::connect`]。
     ///
-    /// 顺序：内存暂停/前置条件 → 恢复授权（不打开浏览器）→ 条件复核 → connect。
-    /// 任何不满足都直接返回；本阶段不重试、不调用 `execute`。
-    async fn try_auto_connect(&self) {
+    /// 顺序：内存暂停/代际 → 前置条件 → 恢复授权（不打开浏览器）→ 条件复核 →
+    /// connect。`generation` 是本轮开始时绑定的 Hub 代际：等待/授权恢复期间换代
+    /// （换/删链接、显式断开、KICKED）即作废本次尝试，绝不向旧目标发起连接。
+    async fn auto_connect_attempt(&self, generation: u64) -> AutoAttempt {
         // 测试观察口：证明本次尝试已开始（负向用例据此等待 worker 跑完，不用 sleep）。
         #[cfg(test)]
         self.record_auto_attempt();
         if self.auto_connect_paused() {
-            return;
+            return AutoAttempt::Stopped;
+        }
+        if self.auto_connect_generation() != generation {
+            return AutoAttempt::Retargeted;
         }
         let Some(gate) = auto_connect_gate(self.auto_connect_store()) else {
-            return;
+            return AutoAttempt::Stopped;
         };
         if !gate.allows() || !self.auto_connect_runtime_ready() {
-            return;
+            return AutoAttempt::Stopped;
         }
         let status = self.restore_authorization().await;
         if !status.authorized {
-            // 恢复失败/无凭据：保持 needs_auth，绝不自动打开浏览器。
-            return;
+            // 恢复失败/无凭据：保持 needs_auth，绝不自动打开浏览器、不重试。
+            return AutoAttempt::Stopped;
         }
         // await 期间条件可能翻转（用户断开/远程关闭/换链接/KICKED）：连接前全部现查。
         if self.auto_connect_paused() {
-            return;
+            return AutoAttempt::Stopped;
+        }
+        if self.auto_connect_generation() != generation {
+            return AutoAttempt::Retargeted;
         }
         let Some(gate) = auto_connect_gate(self.auto_connect_store()) else {
-            return;
+            return AutoAttempt::Stopped;
         };
         if !gate.allows() || !self.auto_connect_runtime_ready() {
-            return;
+            return AutoAttempt::Stopped;
         }
-        // 共用既有连接内核与 connect_lock；失败留给状态面，不在 C3 重试。
-        let _ = self.connect().await;
+        // 共用既有连接内核与 connect_lock（不新增第二连接器）。
+        let result = self.connect().await;
+        // 迟到结果若跨了代际：旧目标/旧轮次一律作废（connect 自己也会回 stale）。
+        if self.auto_connect_generation() != generation {
+            return AutoAttempt::Retargeted;
+        }
+        match result {
+            Ok(view) if view.state == ConnectionState::Paired => AutoAttempt::Paired,
+            Ok(view) if view.state == ConnectionState::Offline => AutoAttempt::Offline,
+            Err(error) if error.is(codes::OFFLINE) => AutoAttempt::Offline,
+            // needs_auth/needs_config/conflict/unknown（含 stale_generation）立即停。
+            _ => AutoAttempt::Stopped,
+        }
+    }
+
+    /// 一次故障轮次：首次立即尝试；仅 offline 才按 1s/3s/10s 退避，至多 3 次额外。
+    ///
+    /// 等待用 `select!` 同时监听 sleep 与唤醒：新触发/暂停/remote 关闭/忘记/换链接
+    /// 都会取消旧轮次；等待后重查代际与前置，绝不向旧目标补连。
+    async fn auto_connect_round(&self, notify: &Notify, budget: &mut ReconnectBudget) -> AutoRound {
+        let mut generation = self.auto_connect_generation();
+        loop {
+            match self.auto_connect_attempt(generation).await {
+                AutoAttempt::Paired => {
+                    // 配对成功 = 本轮故障结束；下一次真实掉线（由显式触发重开）用新预算。
+                    budget.reset();
+                    return AutoRound::Done;
+                }
+                AutoAttempt::Stopped => return AutoRound::Done,
+                AutoAttempt::Retargeted => {
+                    // 换代是新的用户触发（换/删链接、显式断开）：立即按新代际重开，
+                    // 不沿用旧目标的剩余预算。
+                    budget.reset();
+                    generation = self.auto_connect_generation();
+                }
+                AutoAttempt::Offline => {
+                    // 等待前复核：已暂停/关闭/无授权/已配对时不再占着定时器。
+                    if !self.auto_retry_allowed() {
+                        return AutoRound::Done;
+                    }
+                    let Some(delay) = budget.next_delay() else {
+                        // 预算耗尽：显示离线，等显式连接/授权/换链接/重开远程。
+                        return AutoRound::Done;
+                    };
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = notify.notified() => return AutoRound::Triggered,
+                    }
+                    // 等待后重查：换链接/关闭/冲突推进了代际 → 旧轮次作废。
+                    let current = self.auto_connect_generation();
+                    if current != generation {
+                        budget.reset();
+                        generation = current;
+                        continue;
+                    }
+                    if !self.auto_retry_allowed() {
+                        return AutoRound::Done;
+                    }
+                    // 下一轮循环的 attempt 会现查 gate/auth/runtime ready。
+                }
+            }
+        }
+    }
+
+    /// 退避等待后的前置复核（与 attempt 入口同口径；不触发任何网络/存储）。
+    fn auto_retry_allowed(&self) -> bool {
+        if self.auto_connect_paused() || !self.auto_connect_runtime_ready() {
+            return false;
+        }
+        auto_connect_gate(self.auto_connect_store())
+            .map(|gate| gate.allows())
+            .unwrap_or(false)
     }
 }
 
-/// 单 worker 驱动：先做一次启动尝试，之后每次唤醒一次尝试。
+/// 单 worker 驱动：先做一次启动尝试，之后每次唤醒开一轮（显式触发重置预算）。
 async fn drive_auto_connect(hub: Weak<ZcodeHub>, notify: Arc<Notify>) {
-    if let Some(hub) = hub.upgrade() {
-        hub.try_auto_connect().await;
-    }
+    let mut budget = ReconnectBudget::default();
+    let mut immediate = true;
     loop {
-        notify.notified().await;
+        if !immediate {
+            notify.notified().await;
+        }
+        immediate = false;
         let Some(hub) = hub.upgrade() else {
             break;
         };
-        hub.try_auto_connect().await;
+        // 每个显式触发都是新的故障轮次（显式连接/授权成功/链接更新/远程开启）。
+        budget.reset();
+        if hub.auto_connect_round(&notify, &mut budget).await == AutoRound::Triggered {
+            // 唤醒许可已被本轮消费：立即开新一轮，不能退回外层等待（否则丢触发）。
+            immediate = true;
+        }
     }
 }
 
@@ -272,5 +412,553 @@ mod tests {
         })
         .await
         .expect("读失败必须立即返回");
+    }
+
+    // ------------------------------------------------------------------
+    // H1：有界网络恢复（`tokio::time::start_paused` 虚拟时间，不真实等待 10s）
+    // ------------------------------------------------------------------
+
+    use crate::services::zcode_control::auth::{AuthStatus, OAuthProvider, OpenAuthorize};
+    use crate::services::zcode_control::bridge::DataOutcome;
+    use crate::services::zcode_control::hub::{BridgePump, HubBackend};
+    use crate::services::zcode_control::relay::{DeviceRoute, RelayEvent, RelayLag};
+    use crate::services::zcode_control::types::{
+        ActionContext, ActionReceipt, BoundTarget, CapabilityView, ConnectionState, ConnectionView,
+        ControlAction, ControlEventKind, SessionView, TargetKey,
+    };
+    use futures::future::BoxFuture;
+    use serde_json::Value;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc;
+
+    const URL_NEXT: &str =
+        "https://zcode.z.ai/remote/v4?sid=synthetic-auto-0002&name=SyntheticAuto2";
+
+    fn offline_view() -> ConnectionView {
+        ConnectionView {
+            state: ConnectionState::Offline,
+            generation: 0,
+            reason_code: Some(codes::OFFLINE.into()),
+            device_label: None,
+        }
+    }
+
+    fn paired_view() -> ConnectionView {
+        ConnectionView {
+            state: ConnectionState::Paired,
+            generation: 0,
+            reason_code: None,
+            device_label: Some("synthetic-auto".into()),
+        }
+    }
+
+    /// H1 fake：记录 connect 次数/目标与 execute 次数，按队列返回结果（默认 paired）。
+    #[derive(Default)]
+    struct FakeConnector {
+        connect_calls: AtomicUsize,
+        restore_calls: AtomicUsize,
+        authorize_calls: AtomicUsize,
+        execute_calls: AtomicUsize,
+        disconnect_calls: AtomicUsize,
+        reset_calls: AtomicUsize,
+        routes: Mutex<Vec<String>>,
+        results: Mutex<VecDeque<ZResult<ConnectionView>>>,
+        auth: Mutex<AuthStatus>,
+        /// 在途 `connect` 的闸（一次取走；并发触发用例验证单 owner）。
+        connect_gate: Mutex<Option<Arc<Notify>>>,
+    }
+
+    impl FakeConnector {
+        fn authorized() -> Self {
+            Self {
+                auth: Mutex::new(AuthStatus {
+                    authorized: true,
+                    remembered: true,
+                    restoring: false,
+                    provider: Some(OAuthProvider::Bigmodel),
+                    problem: None,
+                }),
+                ..Self::default()
+            }
+        }
+
+        fn queue(&self, results: Vec<ZResult<ConnectionView>>) {
+            let mut queue = self.results.lock().unwrap();
+            for result in results {
+                queue.push_back(result);
+            }
+        }
+
+        fn queue_offline(&self, count: usize) {
+            let mut queue = self.results.lock().unwrap();
+            for _ in 0..count {
+                queue.push_back(Err(ZcodeError::offline()));
+            }
+        }
+
+        fn gate_connect(&self) -> Arc<Notify> {
+            let gate = Arc::new(Notify::new());
+            *self.connect_gate.lock().unwrap() = Some(gate.clone());
+            gate
+        }
+
+        fn connect_count(&self) -> usize {
+            self.connect_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl HubBackend for FakeConnector {
+        fn authorize<'a>(
+            &'a self,
+            _provider: OAuthProvider,
+            _open: OpenAuthorize,
+        ) -> BoxFuture<'a, ZResult<()>> {
+            self.authorize_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(ZcodeError::of(codes::NEEDS_AUTH)) })
+        }
+
+        fn connect<'a>(&'a self, route: DeviceRoute) -> BoxFuture<'a, ZResult<ConnectionView>> {
+            self.connect_calls.fetch_add(1, Ordering::SeqCst);
+            self.routes.lock().unwrap().push(route.sid);
+            let gate = self.connect_gate.lock().unwrap().take();
+            let result = self
+                .results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(paired_view()));
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                result
+            })
+        }
+
+        fn disconnect<'a>(&'a self) -> BoxFuture<'a, ()> {
+            self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+
+        fn reset<'a>(&'a self, _generation: u64) -> BoxFuture<'a, ()> {
+            self.reset_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+
+        fn restore_authorization<'a>(&'a self) -> BoxFuture<'a, AuthStatus> {
+            self.restore_calls.fetch_add(1, Ordering::SeqCst);
+            let status = self.auth.lock().unwrap().clone();
+            Box::pin(async move { status })
+        }
+
+        fn auth_status(&self) -> AuthStatus {
+            self.auth.lock().unwrap().clone()
+        }
+
+        fn bind_session<'a>(&'a self, _key: &'a TargetKey) -> BoxFuture<'a, ZResult<BoundTarget>> {
+            Box::pin(async { Err(ZcodeError::of(codes::NOT_READY)) })
+        }
+
+        fn session<'a>(&'a self, _target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>> {
+            Box::pin(async { Err(ZcodeError::of(codes::NOT_READY)) })
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ActionContext,
+            _target: &'a BoundTarget,
+            _action: &'a ControlAction,
+        ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(ZcodeError::of(codes::NOT_READY)) })
+        }
+
+        fn policy(&self) -> CapabilityView {
+            CapabilityView::default()
+        }
+    }
+
+    /// 只用于接收冲突事件的空桥。
+    struct TestPump;
+
+    impl BridgePump for TestPump {
+        fn on_data<'a>(&'a self, _payload: Value) -> BoxFuture<'a, DataOutcome> {
+            Box::pin(async {
+                DataOutcome {
+                    result: Ok(()),
+                    changed: Vec::new(),
+                }
+            })
+        }
+
+        fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    fn enable_remote(store: &DeviceStore, enabled: bool) {
+        set_setting(store, KEY_ENABLED, if enabled { "true" } else { "false" });
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("条件在让步循环内未成立");
+    }
+
+    /// 让 worker 把当前可运行步骤跑完（不推进虚拟时间）。
+    async fn settle_auto() {
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// 推进虚拟时间并让被唤醒的 worker 跑起来。
+    async fn advance_and_settle(duration: Duration) {
+        tokio::time::advance(duration).await;
+        settle_auto().await;
+    }
+
+    #[test]
+    fn retry_budget_is_finite() {
+        let mut budget = ReconnectBudget::default();
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(1)));
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(3)));
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(10)));
+        assert_eq!(budget.next_delay(), None);
+        // 新一轮（配对成功/显式触发）恢复完整预算。
+        budget.reset();
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(1)));
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(3)));
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(10)));
+        assert_eq!(budget.next_delay(), None);
+    }
+
+    /// offline 才退避：首次立即尝试，之后严格 1s/3s，配对后停止且不再自动重连。
+    #[tokio::test(start_paused = true)]
+    async fn offline_then_paired_retries_with_virtual_backoff() {
+        let fake = Arc::new(FakeConnector::authorized());
+        fake.queue(vec![
+            Err(ZcodeError::offline()),
+            Err(ZcodeError::offline()),
+            Ok(paired_view()),
+        ]);
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store,
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+
+        hub.start_auto_connect();
+        wait_until(|| fake.connect_count() == 1).await;
+        assert!(!hub.connection().is_paired());
+
+        advance_and_settle(Duration::from_millis(999)).await;
+        assert_eq!(fake.connect_count(), 1, "1s 之前不得提前重试");
+        advance_and_settle(Duration::from_millis(1)).await;
+        wait_until(|| fake.connect_count() == 2).await;
+
+        advance_and_settle(Duration::from_millis(2_999)).await;
+        assert_eq!(fake.connect_count(), 2, "第二次退避必须是 3s");
+        advance_and_settle(Duration::from_millis(1)).await;
+        wait_until(|| fake.connect_count() == 3).await;
+        wait_until(|| hub.connection().state == ConnectionState::Paired).await;
+
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(fake.connect_count(), 3, "paired 后不得继续自动重连");
+        assert_eq!(
+            fake.execute_calls.load(Ordering::SeqCst),
+            0,
+            "自动恢复只能连接，绝不重放动作"
+        );
+    }
+
+    /// 自己的 offline 事件（每次失败都会广播）不得重置预算：一轮至多 4 次 connect。
+    #[tokio::test(start_paused = true)]
+    async fn own_offline_events_do_not_restart_budget() {
+        let fake = Arc::new(FakeConnector::authorized());
+        fake.queue_offline(8);
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store,
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+        let mut events = hub.subscribe();
+
+        hub.start_auto_connect();
+        wait_until(|| fake.connect_count() == 1).await;
+        advance_and_settle(Duration::from_secs(1)).await;
+        wait_until(|| fake.connect_count() == 2).await;
+        advance_and_settle(Duration::from_secs(3)).await;
+        wait_until(|| fake.connect_count() == 3).await;
+        advance_and_settle(Duration::from_secs(10)).await;
+        wait_until(|| fake.connect_count() == 4).await;
+
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(
+            fake.connect_count(),
+            4,
+            "1 次首次 + 至多 3 次额外；offline 事件不得无限重置预算"
+        );
+        assert_eq!(hub.auto_attempt_count(), 4, "预算耗尽后不得再进入新的尝试");
+
+        // 失败确实产生了 offline 连接事件（正是可能诱导无限重试的那类事件）。
+        let mut offline_events = 0;
+        while let Ok(event) = events.try_recv() {
+            if event.kind == ControlEventKind::Connection
+                && event.data["state"] == Value::String("offline".into())
+            {
+                offline_events += 1;
+            }
+        }
+        assert!(offline_events >= 1, "每次失败都应广播 offline 连接事件");
+    }
+
+    /// KICKED / 手动暂停必须取消待重试轮次（旧定时器不得在新用户操作后复活）。
+    #[tokio::test(start_paused = true)]
+    async fn kicked_and_manual_pause_cancel_pending_retry() {
+        // --- KICKED：冲突终态停止本轮，唤醒也不得抢回 ---
+        let fake = Arc::new(FakeConnector::authorized());
+        fake.queue_offline(8);
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let (events, receiver) = mpsc::channel(8);
+        let hub = Arc::new(ZcodeHub::with_pump_and_lag(
+            store.clone(),
+            fake.clone(),
+            CapabilityView::default(),
+            receiver,
+            Arc::new(TestPump),
+            RelayLag::new(),
+        ));
+        hub.start_auto_connect();
+        wait_until(|| fake.connect_count() == 1).await;
+        advance_and_settle(Duration::from_secs(1)).await;
+        wait_until(|| fake.connect_count() == 2).await;
+        let attempts_before_conflict = hub.auto_attempt_count();
+
+        events
+            .send(RelayEvent::State(ConnectionView {
+                state: ConnectionState::Conflict,
+                generation: 7,
+                reason_code: None,
+                device_label: None,
+            }))
+            .await
+            .unwrap();
+        wait_until(|| hub.connection().state == ConnectionState::Conflict).await;
+        // 取消是可观察的：worker 立即结束旧等待并重跑一次（被冲突/暂停挡下）。
+        wait_until(|| hub.auto_attempt_count() > attempts_before_conflict).await;
+
+        let calls_after_conflict = fake.connect_count();
+        hub.wake_auto_connect();
+        advance_and_settle(Duration::from_secs(30)).await;
+        assert_eq!(
+            fake.connect_count(),
+            calls_after_conflict,
+            "KICKED 后不得自动重连（含任意重启触发）"
+        );
+
+        // --- 手动暂停：持久 false + 取消待重试 ---
+        let fake = Arc::new(FakeConnector::authorized());
+        fake.queue_offline(8);
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store.clone(),
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+        hub.start_auto_connect();
+        wait_until(|| fake.connect_count() == 1).await;
+        advance_and_settle(Duration::from_secs(1)).await;
+        wait_until(|| fake.connect_count() == 2).await;
+        let attempts_before_pause = hub.auto_attempt_count();
+
+        hub.disconnect_requested().await.unwrap();
+        wait_until(|| hub.auto_attempt_count() > attempts_before_pause).await;
+        assert_eq!(
+            stored_value(&store, AUTO_CONNECT_KEY).as_deref(),
+            Some("false"),
+            "手动暂停必须持久 auto=false"
+        );
+
+        let calls_after_pause = fake.connect_count();
+        // 重新打开门但**不**给新触发：若旧定时器仍在，它会在 3s 后发起连接。
+        set_setting(&store, AUTO_CONNECT_KEY, "true");
+        hub.resume_auto_connect();
+        advance_and_settle(Duration::from_secs(3)).await;
+        advance_and_settle(Duration::from_secs(10)).await;
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(
+            fake.connect_count(),
+            calls_after_pause,
+            "手动暂停必须取消旧重试定时器（不得向旧目标补连）"
+        );
+    }
+
+    /// 自动恢复只做 connect：重连全程零 execute（不重放任何写动作）。
+    ///
+    /// 这里用 `Ok(offline)`（结果状态确为 offline）触发重试，与 `Err(offline)` 的
+    /// 错误码路径一起覆盖设计 §5.2 的两种离线形态。
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_never_replays_actions() {
+        let fake = Arc::new(FakeConnector::authorized());
+        fake.queue(vec![Ok(offline_view()), Ok(paired_view())]);
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store,
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+
+        hub.start_auto_connect();
+        wait_until(|| fake.connect_count() == 1).await;
+        advance_and_settle(Duration::from_secs(1)).await;
+        wait_until(|| hub.connection().state == ConnectionState::Paired).await;
+
+        assert_eq!(
+            fake.execute_calls.load(Ordering::SeqCst),
+            0,
+            "自动恢复绝不调用 execute/重放动作"
+        );
+        assert_eq!(fake.connect_count(), 2);
+    }
+
+    /// 换链接 = Hub 代际变化：取消旧轮次，立即改连新目标，不再向旧目标重试。
+    #[tokio::test(start_paused = true)]
+    async fn link_change_cancels_pending_retry_and_connects_new_target() {
+        let fake = Arc::new(FakeConnector::authorized());
+        fake.queue(vec![Err(ZcodeError::offline()), Ok(paired_view())]);
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store.clone(),
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+
+        hub.start_auto_connect();
+        wait_until(|| fake.connect_count() == 1).await;
+
+        store.with(|conn| set_config(conn, URL_NEXT).unwrap());
+        hub.config_changed().await;
+        hub.wake_auto_connect();
+
+        // 不推进虚拟时间：新触发必须立即取消旧 1s 等待并改连新目标。
+        wait_until(|| fake.connect_count() == 2).await;
+        wait_until(|| hub.connection().state == ConnectionState::Paired).await;
+        {
+            let routes = fake.routes.lock().unwrap();
+            assert_eq!(routes.len(), 2, "旧定时器不得再向旧目标发起连接");
+            assert_eq!(routes[0], "synthetic-auto-0001");
+            assert_eq!(routes[1], "synthetic-auto-0002");
+        }
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(fake.connect_count(), 2);
+    }
+
+    /// 远程关闭取消待重试；旧定时器不得在重新开启门后偷偷连接。
+    #[tokio::test(start_paused = true)]
+    async fn remote_close_cancels_pending_retry() {
+        let fake = Arc::new(FakeConnector::authorized());
+        fake.queue_offline(8);
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store.clone(),
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+        hub.start_auto_connect();
+        wait_until(|| fake.connect_count() == 1).await;
+        advance_and_settle(Duration::from_secs(1)).await;
+        wait_until(|| fake.connect_count() == 2).await;
+
+        let attempts_before_close = hub.auto_attempt_count();
+        enable_remote(&store, false);
+        hub.wake_auto_connect();
+        wait_until(|| hub.auto_attempt_count() > attempts_before_close).await;
+        let calls_after_close = fake.connect_count();
+
+        // 重新开启总开关但不给新触发：陈旧定时器不得复活。
+        enable_remote(&store, true);
+        advance_and_settle(Duration::from_secs(3)).await;
+        advance_and_settle(Duration::from_secs(10)).await;
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(
+            fake.connect_count(),
+            calls_after_close,
+            "远程关闭必须取消旧轮次，不得向仍保存的链接补连"
+        );
+    }
+
+    /// needs_auth 立即停：不进入退避、不打开浏览器、不重复读存储。
+    #[tokio::test(start_paused = true)]
+    async fn needs_auth_stops_without_retry() {
+        let fake = Arc::new(FakeConnector::default());
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store,
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+
+        hub.start_auto_connect();
+        wait_until(|| fake.restore_calls.load(Ordering::SeqCst) == 1).await;
+        settle_auto().await;
+        assert_eq!(fake.connect_count(), 0);
+        assert_eq!(
+            fake.authorize_calls.load(Ordering::SeqCst),
+            0,
+            "绝不由自动路径打开浏览器"
+        );
+        assert_eq!(hub.auto_attempt_count(), 1, "needs_auth 立即停，不进入退避");
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(fake.connect_count(), 0);
+        assert_eq!(hub.auto_attempt_count(), 1);
+        assert_eq!(fake.restore_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 并发唤醒（连接在途时）不得开出第二个连接器：单 worker + connect_lock 单 owner。
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_wakes_keep_single_owner_and_one_connection() {
+        let fake = Arc::new(FakeConnector::authorized());
+        let gate = fake.gate_connect();
+        let store = stored(URL);
+        enable_remote(&store, true);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store,
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+
+        hub.start_auto_connect();
+        wait_until(|| fake.connect_count() == 1).await;
+        hub.wake_auto_connect();
+        hub.wake_auto_connect();
+        settle_auto().await;
+        assert_eq!(
+            fake.connect_count(),
+            1,
+            "在途连接期间的唤醒不得开第二条连接"
+        );
+
+        gate.notify_one();
+        wait_until(|| hub.connection().state == ConnectionState::Paired).await;
+        advance_and_settle(Duration::from_secs(60)).await;
+        assert_eq!(fake.connect_count(), 1);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 0);
     }
 }
