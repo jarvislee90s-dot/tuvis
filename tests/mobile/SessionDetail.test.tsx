@@ -240,6 +240,11 @@ function installFetch() {
         status: 200,
       });
     }
+    if (url.includes("/channel")) {
+      // FilePanel 挂载即拉的通道能力（装饰）：横屏进详情时面板默认打开 → 必走此路。
+      // 缺桩会落到下方 unexpected fetch（fetchChannel 内部吃掉，但会污染调用统计）
+      return new Response(JSON.stringify({ via: "direct", limited: false }), { status: 200 });
+    }
     throw new Error(`unexpected fetch: ${url}`);
   });
   vi.stubGlobal("fetch", fetchMock);
@@ -2819,5 +2824,330 @@ describe("SessionDetail：预览区 sheet 化（T1）", () => {
     expect(screen.getByTestId("subagent-detail")).toBeTruthy();
     expect(screen.getByTestId("split-container").className).toContain("flex-row");
     expect(screen.getByTestId("subagent-back")).toBeTruthy(); // 两层级导航：详情级必有返回钮
+  });
+});
+
+// ============================================================
+// 横竖屏自适应默认布局（2026-10-27 用户裁决 U1–U5）
+// ============================================================
+
+interface FakeMql {
+  media: string;
+  matches: boolean;
+  addEventListener: (type: string, cb: () => void) => void;
+  removeEventListener: (type: string, cb: () => void) => void;
+}
+
+/** 方向桩：**按 query 缓存同一 MQL 实例**——readViewportKind 每次重新 matchMedia()，
+ *  不缓存会让「订阅的实例」与「广播的实例」分家，旋转用例永远绿（假绿）。
+ *  `wide` 单独控制 min-width 查询（默认与方向耦合，真实横屏手机通常也 ≥768px）——
+ *  拆开才能造出「横屏但窄」（iPhone SE 667×375）与「竖屏但宽」（iPad 768×1024）
+ *  这两个 U1 判决点。 */
+function installViewport(initial: "portrait" | "landscape", opts: { wide?: boolean } = {}) {
+  const state = { landscape: initial === "landscape", wide: opts.wide ?? initial === "landscape" };
+  const wideCoupled = opts.wide === undefined;
+  const cache = new Map<string, FakeMql>();
+  const listeners = new Set<() => void>();
+  const matchesFor = (q: string) =>
+    q.includes("aspect-ratio") ? state.landscape : q.includes("min-width") ? state.wide : false;
+  const make = (q: string): FakeMql => ({
+    media: q,
+    matches: matchesFor(q),
+    addEventListener: (_type, cb) => listeners.add(cb),
+    removeEventListener: (_type, cb) => listeners.delete(cb),
+  });
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    configurable: true,
+    value: (q: string) => {
+      const hit = cache.get(q) ?? make(q);
+      cache.set(q, hit);
+      hit.matches = matchesFor(q); // 每次读取都对齐当前方向（等价浏览器实时求值）
+      return hit;
+    },
+  });
+  const broadcast = () => {
+    for (const [q, mq] of cache) mq.matches = matchesFor(q);
+    act(() => {
+      for (const cb of [...listeners]) cb();
+    });
+  };
+  return {
+    set(kind: "portrait" | "landscape") {
+      state.landscape = kind === "landscape";
+      if (wideCoupled) state.wide = state.landscape;
+      broadcast();
+    },
+    /** 不改值、只重复唤醒一次（change 与 orientationchange 双通道同值重复） */
+    notify: broadcast,
+  };
+}
+
+/** 根节点的方向标记（data-viewport）——比断言 flex-row 更直接 */
+function viewportAttr(): string | null {
+  return document.querySelector("[data-viewport]")?.getAttribute("data-viewport") ?? null;
+}
+
+/** 冲掉本次渲染触发的异步 setState（文件表 / 通道能力 / 审批与问答载荷），
+ *  避免用例结束后落地成 act 警告——本文件既有噪声，新用例不再添。 */
+async function flushEffects() {
+  await act(async () => {});
+}
+
+describe("SessionDetail：横竖屏默认布局（2026-10-27）", () => {
+  it("横屏（宽 > 高 × 1.2）进入详情：默认左消息 + 右文件窗格，页头面板钮高亮", async () => {
+    installFetch();
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    installViewport("landscape");
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    expect(viewportAttr()).toBe("landscape");
+    // 右栏即文件看板（open=none）+ 左右分屏
+    const container = screen.getByTestId("split-container");
+    expect(container.className).toContain("flex-row");
+    const shell = screen.getByTestId("preview-shell");
+    expect(shell.getAttribute("data-sheet")).toBe("files");
+    expect(shell.getAttribute("data-open")).toBe("none");
+    expect(shell.getAttribute("data-mode")).toBe("split-h");
+    // 页头 📁 钮反映「面板已开」：点它 = 收起右栏
+    expect(screen.getByTestId("file-panel-button").getAttribute("aria-pressed")).toBe("true");
+    // 文件表已到货（列表而非空态）
+    await screen.findByTestId("file-row-0");
+  });
+
+  it("竖屏进入详情：默认聊天框（无预览窗格），与改造前一致", async () => {
+    installFetch();
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    installViewport("portrait");
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    expect(viewportAttr()).toBe("portrait");
+    expect(screen.queryByTestId("split-container")).toBeNull();
+    expect(screen.queryByTestId("sheet-bar")).toBeNull();
+    expect(screen.getByTestId("file-panel-button").getAttribute("aria-pressed")).toBe("false");
+    await flushEffects();
+  });
+
+  it("竖 → 横（方向变化）：自动打开右栏左右分屏", async () => {
+    installFetch();
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    const vp = installViewport("portrait");
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    expect(screen.queryByTestId("split-container")).toBeNull();
+
+    vp.set("landscape");
+
+    expect(viewportAttr()).toBe("landscape");
+    expect(screen.getByTestId("split-container").className).toContain("flex-row");
+    expect(screen.getByTestId("preview-shell").getAttribute("data-open")).toBe("none");
+    await flushEffects();
+  });
+
+  it("横 → 竖（方向变化，非全屏）：关掉预览回聊天框（U4 直译）", async () => {
+    installFetch();
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    const vp = installViewport("landscape");
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+    expect(screen.getByTestId("split-container")).toBeTruthy();
+
+    vp.set("portrait");
+
+    expect(viewportAttr()).toBe("portrait");
+    expect(screen.queryByTestId("split-container")).toBeNull();
+    expect(screen.queryByTestId("sheet-bar")).toBeNull();
+    expect(screen.queryByTestId("preview-shell")).toBeNull();
+    await flushEffects();
+  });
+
+  it("横屏点正文文件链接：仍走 split-h（不因竖屏的 768 回退掉回全屏浮层）", async () => {
+    installFetch();
+    routes.messages = [
+      msg({ seq: 0, kind: "assistant", content: "改了 /tmp/proj/src/app.rs 请看" }),
+    ];
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    routes.fileContent = "fn main() {}";
+    installViewport("landscape");
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    fireEvent.click(await screen.findByTestId("file-link"));
+    const preview = await screen.findByTestId("file-preview");
+    expect(preview.getAttribute("data-mode")).toBe("split-h");
+    expect(screen.getByTestId("split-container").className).toContain("flex-row");
+  });
+
+  it("竖屏点文件仍按 ≥768 回退口径：窄竖屏 → 全屏浮层（U5 回归锁）", async () => {
+    installFetch();
+    routes.messages = [
+      msg({ seq: 0, kind: "assistant", content: "改了 /tmp/proj/src/app.rs 请看" }),
+    ];
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    routes.fileContent = "fn main() {}";
+    // 竖屏 + 窄（min-width 不命中）→ 既有 fullscreen 行为不变
+    Object.defineProperty(window, "matchMedia", {
+      writable: true,
+      configurable: true,
+      value: (q: string) => ({ matches: false, media: q }),
+    });
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    fireEvent.click(await screen.findByTestId("file-link"));
+    expect((await screen.findByTestId("file-preview")).getAttribute("data-mode")).toBe(
+      "fullscreen"
+    );
+  });
+
+  // U1 判决点：判据必须是**宽高比**，不是宽度阈值。这两条用「宽高比与 min-width 结论
+  // 相反」的两种设备剖面把判据锁死——把判据换回宽度阈值（或删掉 defaultPreviewMode 的
+  // landscape 子句）会立刻红。
+  it("iPhone SE 横屏（667×375：宽高比命中、min-width 不命中）→ 默认左右分屏，点文件仍 split-h", async () => {
+    installFetch();
+    routes.messages = [
+      msg({ seq: 0, kind: "assistant", content: "改了 /tmp/proj/src/app.rs 请看" }),
+    ];
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    routes.fileContent = "fn main() {}";
+    installViewport("landscape", { wide: false });
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    expect(viewportAttr()).toBe("landscape");
+    expect(screen.getByTestId("split-container").className).toContain("flex-row");
+    expect(screen.getByTestId("preview-shell").getAttribute("data-mode")).toBe("split-h");
+
+    // 打开文件的默认布局也不能靠 768 回退（这台设备宽 667 < 768）
+    fireEvent.click(await screen.findByTestId("file-link"));
+    expect((await screen.findByTestId("file-preview")).getAttribute("data-mode")).toBe("split-h");
+  });
+
+  it("iPad 竖屏（768×1024：min-width 命中、宽高比不命中）→ 进入详情仍是聊天框", async () => {
+    installFetch();
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    installViewport("portrait", { wide: true });
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    expect(viewportAttr()).toBe("portrait");
+    // 宽度够了但方向是竖屏 → 不自动开右栏（U1/U2）
+    expect(screen.queryByTestId("split-container")).toBeNull();
+    expect(screen.queryByTestId("sheet-bar")).toBeNull();
+    expect(screen.getByTestId("file-panel-button").getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("竖屏（宽屏）已打开文件 → 转横屏：保留该文件只改布局，且不重读文件（openSeq 不递增）", async () => {
+    installFetch();
+    routes.messages = [
+      msg({ seq: 0, kind: "assistant", content: "改了 /tmp/proj/src/app.rs 请看" }),
+    ];
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    routes.fileContent = "fn main() {}";
+    // 宽竖屏（iPad 竖屏剖面）：点文件走 split-h，横屏时才有「保留内容」这条路径
+    const vp = installViewport("portrait", { wide: true });
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    fireEvent.click(await screen.findByTestId("file-link"));
+    expect((await screen.findByTestId("file-preview")).getAttribute("data-mode")).toBe("split-h");
+    await screen.findByTestId("preview-code");
+    const fileCalls = () =>
+      fetchMock.mock.calls.filter((c) => String(c[0]).includes("/file?")).length;
+    const before = fileCalls();
+
+    vp.set("landscape");
+
+    // 内容没被顶回看板：仍是同一个文件、同一份内容、左右分屏
+    expect(screen.getByTestId("preview-shell").getAttribute("data-open")).toBe("file");
+    expect(screen.getByTestId("file-preview").getAttribute("data-mode")).toBe("split-h");
+    expect(screen.getByTestId("split-container").className).toContain("flex-row");
+    expect(screen.getByTestId("preview-code").textContent).toContain("fn main() {}");
+    // 旋转不是「显式打开」：不得递增 openSeq 触发 /file? 重读
+    expect(fileCalls()).toBe(before);
+  });
+
+  it("横屏手切上下分屏 → 竖 → 横：回到该方向默认 split-h（不记忆手动布局）", async () => {
+    installFetch();
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    const vp = installViewport("landscape");
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    fireEvent.click(screen.getByTestId("preview-toggle-split"));
+    expect(screen.getByTestId("split-container").className).toContain("flex-col");
+
+    vp.set("portrait");
+    expect(screen.queryByTestId("split-container")).toBeNull();
+
+    vp.set("landscape");
+    expect(screen.getByTestId("split-container").className).toContain("flex-row");
+    expect(screen.getByTestId("preview-shell").getAttribute("data-mode")).toBe("split-h");
+    await flushEffects();
+  });
+
+  it("同值重复唤醒（change + orientationchange 双通道）不重置用户手动布局", async () => {
+    installFetch();
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    const vp = installViewport("landscape");
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    fireEvent.click(screen.getByTestId("preview-toggle-split")); // 手动切上下分屏
+    expect(screen.getByTestId("preview-shell").getAttribute("data-mode")).toBe("split");
+
+    vp.notify(); // 方向没变，只是又唤醒一次
+
+    expect(screen.getByTestId("preview-shell").getAttribute("data-mode")).toBe("split");
+    await flushEffects();
+  });
+
+  // U7 例外（2026-10-28 用户裁决）：全屏阅读文件时，比例变化一律维持全屏——
+  // 既不降级成左右分屏，也不关掉。两个方向各锁一条。
+  it("竖屏全屏阅读 → 转横屏：维持全屏，不被默认的左右分屏覆盖", async () => {
+    installFetch();
+    routes.messages = [
+      msg({ seq: 0, kind: "assistant", content: "改了 /tmp/proj/src/app.rs 请看" }),
+    ];
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    routes.fileContent = "fn main() {}";
+    const vp = installViewport("portrait");
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    // 竖屏窄屏点文件 → 全屏浮层（U5 既有口径）
+    fireEvent.click(await screen.findByTestId("file-link"));
+    expect((await screen.findByTestId("file-preview")).getAttribute("data-mode")).toBe(
+      "fullscreen"
+    );
+
+    vp.set("landscape");
+
+    // 维持全屏：不进分屏容器，浮层仍在
+    expect(screen.getByTestId("file-preview").getAttribute("data-mode")).toBe("fullscreen");
+    expect(screen.queryByTestId("split-container")).toBeNull();
+    expect(screen.getByTestId("preview-shell").getAttribute("data-mode")).toBe("fullscreen");
+
+    // 例外只豁免「自动重排」，不冻结界面（M3）：手动仍可切回左右分屏、✕ 仍可关窗格
+    fireEvent.click(screen.getByTestId("preview-toggle-split-h"));
+    expect(screen.getByTestId("file-preview").getAttribute("data-mode")).toBe("split-h");
+    expect(screen.getByTestId("split-container").className).toContain("flex-row");
+
+    fireEvent.click(screen.getByTestId("preview-close"));
+    expect(screen.queryByTestId("split-container")).toBeNull();
+    expect(screen.queryByTestId("sheet-bar")).toBeNull();
+  });
+
+  it("横屏手切全屏 → 转竖屏：维持全屏，不被「横→竖关预览」覆盖", async () => {
+    installFetch();
+    routes.messages = [
+      msg({ seq: 0, kind: "assistant", content: "改了 /tmp/proj/src/app.rs 请看" }),
+    ];
+    routes.files = [fileEntry("/tmp/proj/src/app.rs")];
+    routes.fileContent = "fn main() {}";
+    const vp = installViewport("landscape");
+    render(<SessionDetail session={makeSession()} onBack={() => {}} />);
+
+    // 横屏默认 split-h → 点文件 → 再手切全屏
+    fireEvent.click(await screen.findByTestId("file-link"));
+    expect((await screen.findByTestId("file-preview")).getAttribute("data-mode")).toBe("split-h");
+    fireEvent.click(screen.getByTestId("preview-toggle-fullscreen"));
+    expect(screen.getByTestId("file-preview").getAttribute("data-mode")).toBe("fullscreen");
+
+    vp.set("portrait");
+
+    // 维持全屏：预览没被 setPreview(null) 关掉
+    expect(screen.getByTestId("file-preview").getAttribute("data-mode")).toBe("fullscreen");
+    expect(screen.queryByTestId("split-container")).toBeNull();
   });
 });
