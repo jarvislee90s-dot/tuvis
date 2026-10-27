@@ -36,6 +36,22 @@ pub(crate) fn try_set_setting_conn(
     Ok(())
 }
 
+/// 连接级可失败读取：需要区分「缺键」与「读取失败」的调用方必须用本函数。
+/// 旧 [`get_setting_conn`] 的 best-effort 语义（失败即 None）保持不变。
+// C1 先落 checked read，凭据存储（C2 接入 AuthService）才消费；分期提交期间显式
+// allow，避免中间提交在 `cargo check` 产生 dead_code 噪音。
+#[allow(dead_code)]
+pub(crate) fn try_get_setting_conn(
+    conn: &Connection,
+    key: &str,
+) -> rusqlite::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row("SELECT value FROM settings WHERE key = ?", [key], |row| {
+        row.get(0)
+    })
+    .optional()
+}
+
 /// 连接级 best-effort 写入（历史调用方语义：失败静默）。新代码若要区分成功/失败，
 /// 用 [`try_set_setting_conn`]——切配置这类「失败必须回传」的路径不得走本函数。
 pub(crate) fn set_setting_conn(conn: &Connection, key: &str, value: &str) {
@@ -64,6 +80,33 @@ mod tests {
             get_setting_conn(&conn, "ui_theme").as_deref(),
             Some("light"),
             "同 key 覆盖写"
+        );
+    }
+
+    /// 可失败读取：表缺失/DB 错误必须回传 Err，不能伪装成「缺键 = None」
+    #[test]
+    fn checked_get_does_not_treat_broken_db_as_missing() {
+        assert!(
+            try_get_setting_conn(
+                &Connection::open_in_memory().unwrap(),
+                "remote.zcode_restore_allowed"
+            )
+            .is_err(),
+            "无 settings 表时读取必须报错"
+        );
+
+        let conn = mem();
+        assert_eq!(
+            try_get_setting_conn(&conn, "remote.zcode_restore_allowed").unwrap(),
+            None,
+            "表存在但缺键才是 None"
+        );
+        set_setting_conn(&conn, "remote.zcode_restore_allowed", "false");
+        assert_eq!(
+            try_get_setting_conn(&conn, "remote.zcode_restore_allowed")
+                .unwrap()
+                .as_deref(),
+            Some("false")
         );
     }
 }

@@ -5,6 +5,8 @@
 //!   绝不表示已连接官方服务或已取得官方身份；
 //! - `types`：本域公共 DTO／冻结错误码的唯一定义处；
 //! - `auth`：官方 OAuth 授权与**内存凭据**（账号 JWT 只在本进程内存）；
+//! - `credential_store`：系统凭据存储适配口（含可测 fake）：单条目、UTF-8 JSON 二进制
+//!   secret、恢复禁用标记 checked 写入；原生保险箱实现在桌面三平台；
 //! - `relay`：官方 terminal relay 的**单连接**生命周期（单 owner、无自动重连）；
 //! - `codec`：官方二进制 RPC 编解码（类型标签/VQL、rpc-frame Base64+CRC32）与可靠收帧；
 //! - `bridge`：工作区桥、任务索引与会话精确绑定（只读）；
@@ -29,6 +31,10 @@ pub mod bridge;
 pub mod codec;
 pub mod command;
 pub mod config;
+// C1 只落适配口与 fake，C2 才接入 AuthService。分期提交期间显式登记 dead_code
+// （同仓先例：staged 能力用 allow 注明消费批次）；C2 消费后可移除本属性。
+#[allow(dead_code)]
+pub(crate) mod credential_store;
 mod host;
 pub mod hub;
 pub mod pending;
