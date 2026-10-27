@@ -115,6 +115,19 @@ function execute(
       };
       draw(step.w, step.track);
       draw(step.w * step.share, step.fill);
+      // 描边样式（二轮实机反馈 ②：费用段淡紫填充 + 紫描边）：沿**填充条**同一圆角路径
+      // 描一圈（同一 r，路径与填充逐像素重合）；描边不改变几何，布局层高度不受影响。
+      // save/restore 包夹（Batch 5 补充，评审 Nit）：lineJoin/lineWidth 是同一 ctx 上的
+      // 共享状态，不复位会流进后续步骤
+      if (step.stroke && step.w * step.share > 0) {
+        ctx.save();
+        roundRectPath(ctx, step.x, step.y, step.w * step.share, step.h, step.r ?? 0);
+        ctx.strokeStyle = step.stroke;
+        ctx.lineWidth = 1.5;
+        ctx.lineJoin = "round";
+        ctx.stroke();
+        ctx.restore();
+      }
       return;
     }
     case "trend": {

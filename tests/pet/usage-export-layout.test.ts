@@ -22,6 +22,7 @@ import {
   PAD,
   PAGE,
   layoutExport,
+  type ExportGroupSection,
   type ExportInput,
   type ExportLayout,
   type ExportStep,
@@ -43,6 +44,22 @@ const LAYOUT_CONSTANTS = {
 
 /** 固定浅色版的三个钉死取值（分享图不读 CSS 变量；气泡底色不是「忘了走 token」） */
 const LAYOUT_COLORS = { PAGE: "#f5f6f8", CARD: "#ffffff", BUBBLE_BG: "#fffdf9" };
+
+/** 分组段（2026-10-27 #3a：单段形状；多段/缺段用例在 `tests/usage/export-modules.test.tsx`） */
+function groupSection(over: Partial<ExportGroupSection> = {}): ExportGroupSection {
+  return {
+    groupBy: "tool",
+    title: "分组分布",
+    rows: [
+      { name: "Claude", value: "1,246,567", share: 1 },
+      { name: "Codex", value: "460,789", share: 0.37 },
+      { name: "空档", value: "0", share: 0 },
+    ],
+    // 分组区「等 N」文案（2026-10-06 X2 修复新增字段）：`null` = 一行没少、不出这行
+    groupsMore: null,
+    ...over,
+  };
+}
 
 /** 基准输入：逐条对齐 brief 的断言锚点文案（近 7 天 · 09/27 – 10/03 / 近 7 天 Token 合计 / 产出 /
  *  用量趋势 / 分组分布 / 工具调用 / 纯 token · 含子代理 · 本地聚合） */
@@ -68,14 +85,9 @@ function baseInput(over: Partial<ExportInput> = {}): ExportInput {
       { label: "09/28", value: 250 },
       { label: "10/03", value: 400 },
     ],
-    groupTitle: "分组分布",
-    groups: [
-      { name: "Claude", value: "1,246,567", share: 1 },
-      { name: "Codex", value: "460,789", share: 0.37 },
-      { name: "空档", value: "0", share: 0 },
-    ],
-    // 分组区「等 N」文案（2026-10-06 X2 修复新增字段）：`null` = 一行没少、不出这行
-    groupsMore: null,
+    groups: [groupSection()],
+    cost: null,
+    work: true,
     toolsTitle: "工具调用",
     tools2x2: [
       ["调用总数", "1,234"],
@@ -208,8 +220,12 @@ describe("exportLayout（计划② Task 12：分享图版式纯层）", () => {
       layoutExport(
         baseInput({
           groups: [
-            { name: "a", value: "1", share: 3 },
-            { name: "b", value: "1", share: Number.NaN },
+            groupSection({
+              rows: [
+                { name: "a", value: "1", share: 3 },
+                { name: "b", value: "1", share: Number.NaN },
+              ],
+            }),
           ],
         }),
         measure
@@ -222,7 +238,11 @@ describe("exportLayout（计划② Task 12：分享图版式纯层）", () => {
     const many = stepsOf(
       layoutExport(
         baseInput({
-          groups: Array.from({ length: 9 }, (_, i) => ({ name: `g${i}`, value: "1", share: 1 })),
+          groups: [
+            groupSection({
+              rows: Array.from({ length: 9 }, (_, i) => ({ name: `g${i}`, value: "1", share: 1 })),
+            }),
+          ],
         }),
         measure
       ),
@@ -235,7 +255,10 @@ describe("exportLayout（计划② Task 12：分享图版式纯层）", () => {
     // 没给（null）⇒ 一行都不多画
     expect(textsOf(layoutExport(baseInput(), measure))).not.toContain("等 6");
     // 给了 ⇒ 逐字画出来，且**内容底随之下移**（否则它会盖住下面的「工具 2×2」）
-    const withMore = layoutExport(baseInput({ groupsMore: "等 6" }), measure);
+    const withMore = layoutExport(
+      baseInput({ groups: [groupSection({ groupsMore: "等 6" })] }),
+      measure
+    );
     expect(textsOf(withMore)).toContain("等 6");
     expect(withMore.contentBottom).toBeGreaterThan(
       layoutExport(baseInput(), measure).contentBottom

@@ -225,6 +225,15 @@ describe("UsageExportActions（计划② Task 11：复制文本 + CSV 导出）"
 
   it("5. 导出图片：出图 → saveBytes 落盘（export_save_bytes）→ 路径可见 + 可定位；装配入参逐条对齐分享图版式", async () => {
     renderShareImageMock.mockResolvedValue(pngBlob);
+    // Batch 5 补充（控制器裁决）：气泡 `{tokens}` 与看板同口径（fmtTokens 万/亿）——
+    // 固定评语模板让 tokens 插值可确定性断言（默认评语池随机选条，不便逐字 pin）
+    const baseInvoke = tauriInvokeMock.getMockImplementation() as
+      ((cmd: string, args?: unknown) => Promise<unknown>) | undefined;
+    tauriInvokeMock.mockImplementation((cmd, args) =>
+      cmd === "usage_get_settings"
+        ? Promise.resolve(mockUsageSettings({ exportQuote: "T{tokens}T" }))
+        : (baseInvoke?.(cmd, args) ?? Promise.resolve())
+    );
     const view = render(<UsageExportActions {...boardProps()} />);
     fireEvent.click(screen.getByTestId("usage-export-image"));
     await waitFor(() => expect(callsOf("export_save_bytes")).toHaveLength(1));
@@ -244,10 +253,13 @@ describe("UsageExportActions（计划② Task 11：复制文本 + CSV 导出）"
     expect(input.rangeLabel).toBe("近 7 天 · 09/27 – 10/03");
     expect(input.heroLabel).toBe("近 7 天 Token 合计");
     expect(input.trendTitle).toBe("用量趋势");
-    expect(input.groupTitle).toBe("分组分布");
+    // #3a：分组段成了数组（默认模块 = 一段、按当前看板 groupBy），段标题语义不变
+    const sections = input.groups as { title: string; rows: unknown[] }[];
+    expect(sections).toHaveLength(1);
+    expect(sections[0].title).toBe("分组分布");
     expect(input.toolsTitle).toBe("工具调用");
     expect(input.footer).toBe("纯 token · 含子代理 · 本地聚合");
-    expect(input.hero).toBe("2,036,981");
+    expect(input.hero).toBe("203.70万");
     expect(input.metrics as unknown[]).toHaveLength(6);
     const metricLabels = (input.metrics as string[][]).map(([label]) => label);
     expect(metricLabels).toContain("输出");
@@ -257,9 +269,12 @@ describe("UsageExportActions（计划② Task 11：复制文本 + CSV 导出）"
     expect(input.groups as unknown[]).not.toHaveLength(0);
     expect(input.tools2x2 as unknown[]).toHaveLength(4);
     expect(input.pose).toBe("random"); // 设置缺省（夹具的 exportPose = random）
+    // 气泡 {tokens} 插值 = hero 同函数同 lang 的万/亿（整张导出图 token 单位与看板一致）
+    expect(input.quote as string).toBe("T203.70万T");
     expect(input.quote as string).not.toContain("{"); // 4 个占位符都已填
     expect(input.sheet).toBeNull(); // 图集替身给 null → 不画立绘也要出图
     expect(renderShareImageMock.mock.calls[0][1]).toMatchObject({ bitmap: null });
+    tauriInvokeMock.mockImplementation(baseInvoke as never); // 撤销 settings 覆写
 
     // 落盘**绝对路径**可见 + 复用 reveal_dir（传文件路径本身）；路径里的文件名就是上面那次落盘的名字
     expect(await screen.findByTestId("usage-export-toast")).toHaveTextContent(
@@ -432,8 +447,11 @@ describe("UsageExportActions（计划② Task 11：复制文本 + CSV 导出）"
     expect(valueOf("用户输入(估) · 含子代理")).toBeUndefined();
     // 趋势：**不把全零点交给画布**（否则画成贴底零线）⇒ 空数组，交给布局层的空态分支
     expect(input.points as unknown[]).toHaveLength(0);
-    // 分组：分布行值全为 0 ⇒ 丢光 ⇒ 交给布局层的空态分支（不是一行 0）
-    expect(input.groups as unknown[]).toHaveLength(0);
+    // 分组：分布行值全为 0 ⇒ 丢光 ⇒ 交给布局层的空态分支（不是一行 0）。
+    // #3a：段仍在场（默认模块选了 tool）但 `rows` 为空——没行可画，不是画 0 值行
+    const zeroSections = input.groups as { rows: unknown[] }[];
+    expect(zeroSections).toHaveLength(1);
+    expect(zeroSections[0].rows).toHaveLength(0);
     view.unmount();
 
     // **反断言**：有数据的窗口照旧印数字（不得把正常路径也置空）
@@ -442,10 +460,10 @@ describe("UsageExportActions（计划② Task 11：复制文本 + CSV 导出）"
     fireEvent.click(screen.getByTestId("usage-export-image"));
     await waitFor(() => expect(renderShareImageMock).toHaveBeenCalledTimes(1));
     const okInput = renderShareImageMock.mock.calls[0][0] as Record<string, unknown>;
-    expect(okInput.hero).toBe("2,036,981");
+    expect(okInput.hero).toBe("203.70万"); // 二轮实机反馈 ②：与看板同口径（fmtTokens 万/亿）
     const okMetrics = okInput.metrics as [string, string][];
-    expect(okMetrics.find(([l]) => l === "输出")?.[1]).toBe("82,713");
-    expect(okMetrics.find(([l]) => l === "未缓存命中输入")?.[1]).toBe("636,145");
+    expect(okMetrics.find(([l]) => l === "输出")?.[1]).toBe("8.27万");
+    expect(okMetrics.find(([l]) => l === "未缓存命中输入")?.[1]).toBe("63.61万");
     // V2：userEst=999 也不得进入分享图（不是 API Token）
     expect(okMetrics.find(([l]) => l === "用户输入(估) · 含子代理")).toBeUndefined();
     expect(okInput.points as unknown[]).not.toHaveLength(0);

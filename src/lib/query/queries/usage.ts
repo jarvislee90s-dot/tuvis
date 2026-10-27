@@ -40,12 +40,18 @@ const DEFAULT_COLLECT_INTERVAL_MIN = 10;
 
 // 读命令只读账本、不扫描（§3.15），账本又只在采集后才变 → 30s 短 staleTime 防抖即可，
 // 不做轮询（`refetchInterval: false`；新数据的来源是采集成功后的那次失效）。惯例照 bindings.ts / health.ts。
-export function useUsageDashboardQuery(range: UsageRange, groupBy: UsageGroupBy) {
+// `opts.enabled`（默认 true）＝ Task 7 的 active 门控：主体嵌入四页宿主后页面隐藏期间不发请求。
+export function useUsageDashboardQuery(
+  range: UsageRange,
+  groupBy: UsageGroupBy,
+  opts?: { enabled?: boolean }
+) {
   return useQuery<UsageDashboard>({
     queryKey: ["usage", "dashboard", range, groupBy],
     queryFn: () => usageDashboard(range, groupBy),
     staleTime: 30_000,
     refetchInterval: false,
+    enabled: opts?.enabled ?? true,
   });
 }
 
@@ -53,23 +59,26 @@ export function useUsageDashboardQuery(range: UsageRange, groupBy: UsageGroupBy)
 export function useUsageRecordsQuery(
   range: UsageRange,
   groupBy: UsageRecordsGroupBy,
-  filters: UsageFilters
+  filters: UsageFilters,
+  opts?: { enabled?: boolean }
 ) {
   return useQuery<UsageRecords>({
     queryKey: ["usage", "records", range, groupBy, filters],
     queryFn: () => usageRecords(range, groupBy, filters),
     staleTime: 30_000,
     refetchInterval: false,
+    enabled: opts?.enabled ?? true,
   });
 }
 
 /** 用量设置的**唯一**查询入口（Task 6/9/13/14 一律复用；键在 `USAGE_KEY` 前缀下） */
-export function useUsageSettingsQuery() {
+export function useUsageSettingsQuery(opts?: { enabled?: boolean }) {
   return useQuery<UsageSettings>({
     queryKey: ["usage", "settings"],
     queryFn: usageGetSettings,
     staleTime: 30_000,
     refetchInterval: false,
+    enabled: opts?.enabled ?? true,
   });
 }
 
@@ -80,12 +89,17 @@ export function useUsageSettingsQuery() {
  *   只会拿到上次结果，代价可忽略。挂载采集**不受 `enabled` 约束**（设置可能还没回来）：后端
  *   总开关关闭时在读游标（全局 DB 入口）之前就早退，零扫描零落库（`services/usage/collect.rs`
  *   的 `collect_sources`），故白调一次也不扫。
+ * * `active`（默认 true，Task 7 新增）：主体嵌入四页宿主后页面隐藏期间传 false——
+ *   兜底 ticker 停摆且**不设 UI 兜底**（隐藏页不采集），重新可见后按原 interval 重建 ticker；
+ *   内部 settings 查询同样按 active 门控（评审 Important 2：queryClient 未禁 focus refetch，
+ *   隐藏页重聚焦不得发任何 usage 读）；挂载即采的一次性增量**不受 active 约束**
+ *   （挂载即「打开了一次看板」，旧调用者行为不变）。
  * * 失败**不抛给 UI**（错误态由查询命令负责，看板三态读的是 `useUsageDashboardQuery`），只 `console.warn`。
  */
-export function useUsageCollect() {
+export function useUsageCollect(active = true) {
   const queryClient = useQueryClient();
   const [lastResult, setLastResult] = useState<UsageCollectResult | null>(null);
-  const { data: settings } = useUsageSettingsQuery();
+  const { data: settings } = useUsageSettingsQuery({ enabled: active });
 
   const collect = useCallback(async (): Promise<UsageCollectResult | null> => {
     try {
@@ -111,14 +125,16 @@ export function useUsageCollect() {
   // 兜底 ticker（**必须保留**）：后端只有启动后一次性采集 + `collectIntervalMin` 最小间隔复用，
   // **没有周期调度**（§3.16）——删掉它，长时间开着的看板就不再出新数据。
   // 只在窗口可见时真正触发（后台 / 被遮挡的窗口不采集）；总开关关闭或间隔非正 → 不设 ticker。
+  // `active=false`（用量页隐藏，Task 7）→ 整条 ticker 不设（无 UI 兜底），
+  // active 回 true 时本 effect 重跑、按原 interval 重建。
   useEffect(() => {
-    if (!enabled || intervalMin <= 0) return;
+    if (!active || !enabled || intervalMin <= 0) return;
     const id = setInterval(() => {
       if (document.visibilityState !== "visible") return;
       void collect();
     }, intervalMin * 60_000);
     return () => clearInterval(id);
-  }, [enabled, intervalMin, collect]);
+  }, [active, enabled, intervalMin, collect]);
 
   return { collect, lastResult };
 }

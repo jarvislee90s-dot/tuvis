@@ -13,6 +13,105 @@ English · [中文](CHANGELOG.md)
 _Only versions translated so far are listed here; the full history lives in the
 [Chinese changelog](CHANGELOG.md)._
 
+## [Unreleased]
+
+### Added
+
+- **Output Speed dual-metric page (same-window four tabs)**: the main window gains an "Output Speed"
+  tab — a combined "tool · model · channel" list on the left (search / filter by tool / sort by
+  name, speed or session count, ascending or descending) and a large chart plus four metric tiles on the right
+  (current-mode speed / avg first-token wait / total time / total tool time). Four switchable
+  ranges (15 min / 1 h / 5 h / 24 h — 5 h by default) bucket by the local wall clock with
+  completion attributed to `(from, to]` and clipped edge buckets; hover for a bucket reading,
+  click to pin a snapshot (rolling-window refreshes never wash out a pin or a hover), empty
+  buckets are never drawn as 0 or estimated, and broken measured lines get a gray dashed
+  connector only (legend: "dashed connects only, no samples"). **Two independent metrics**:
+  stream output speed (TPS, 1000 × Σ streamed output ÷ Σ generation ms) and response throughput
+  incl. waiting (tokens/s, 1000 × Σ response output ÷ Σ response ms including waiting), each
+  with independent validity and its own n, aggregated as Σ/Σ; the six native sources
+  (DSH / ZCode / Kimi / WorkBuddy Mac / Claude / OpenCode) each cover a valid subset of both,
+  with capabilities labeled honestly at the source level. **Codex joins with log-approx response
+  throughput** — log input/generation boundaries aligned by native response IDs (prominently
+  labeled "incl. waiting · log-approx"); its stream generation window and per-response
+  first-token latency stay unavailable (the matching tile shows "—", never a turn-level
+  stand-in). Total tool time counts only reliably attributed values (most sources currently
+  show "—"; the usage page's original work-activity statistics are unaffected). Ranges query and
+  aggregate raw facts from the last 24 hours with no early down-sampling; collection runs about
+  every 5 s while visible and about every 600 s in the background, and queries never trigger
+  source scans or benchmark requests. This entry **supersedes** the "Recent TPS short-window
+  sampling (standalone block)" entry below: the standalone block is replaced by this page, and
+  Codex changes from "no TPS in this version" to log-approx response throughput; the sampling
+  principles (not full coverage, gaps never drawn as 0, one-click setup with a natural restart)
+  carry over.
+
+- **WorkBuddy string-number compatibility and old-cursor recovery**: when the total/ttft/completion
+  fields of WorkBuddy Mac's qua.end records are integer strings, the old parser skipped the whole
+  source — they are now accepted through unified number normalization (empty / boolean /
+  non-integer / NaN / overflow are rejected and diagnosed per field, never defaulted to 0 and
+  never routed through floats); after the upgrade, an EOF cursor written by an older version
+  triggers one **bounded 24-hour recovery** (batched checkpoints, stable-key dedup, facts and
+  cursor committed in one transaction, failed batches advance nothing, and only new bytes are
+  read once recovery completes) — speed facts only; the old token/cost ledger and other sources
+  are untouched.
+
+- **Codex response observation**: Codex subscription-log records carrying a native `response_id`
+  and integer `output_tokens` are now parsed into waiting-inclusive response observations under
+  "same-response association" (deduplicated once per host across files / copied history;
+  interleaved tool and generation items, failures/cancellations and unattributable fragments
+  produce nothing, and whole-turn durations never fill holes); incremental reads advance a
+  per-file byte cursor plus pending boundaries in one transaction, at most 200 observations per
+  batch, with per-source read/parse budgets; auth is never read, model / API / gateway
+  configuration is never changed, and no model process is started to produce readings.
+
+- **Recent TPS short-window sampling (standalone block)**: the usage dashboard gains a standalone
+  "Recent TPS" block — a sampled-throughput curve for the last 2 min / 10 min / 1 h / today, plus
+  "Latest completed call" / "Latest turn" sample metrics (sample model time / tool-call time /
+  avg first token / TPS) and per-source states. Each point takes only valid calls **completed**
+  within the 120 seconds before it (at most 20 per curve), with point TPS =
+  1000 × Σ output tokens ÷ Σ generation ms; sampling is not full coverage, gaps are never drawn
+  as 0, nothing is interpolated, the x-axis is the actual sampling time, only the last 24 hours
+  are kept, and no multi-day TPS is offered. Everything is on-device sampling — **no benchmark
+  requests are ever sent** — and "Refresh" only reads existing facts; the TPS range is fully
+  independent of the token/cost ranges. First-version sources: ZCode / dsh / Kimi (native
+  read-only, following the usage master switch), Mac WorkBuddy, Claude (native-event-approx
+  after a one-time statistics setup) and OpenCode (observer plugin); **Codex has no TPS in this
+  version** (no reliable per-call generation window — honestly marked in the source states), and
+  the WorkBuddy Windows route produces no TPS yet (insufficient evidence). **Upgrade notes**:
+  Claude and OpenCode require a **one-click install** of the statistics config / observer plugin
+  inside the "Recent TPS" block and a **natural restart** of the respective tool (Tuvis never
+  restarts your Harness for you); installs never touch API/auth/provider configuration,
+  sensitive telemetry headers show masked values only, and uninstalling handles only Tuvis's own
+  entries while your later edits are kept and reported.
+
+- **Optional share-image modules**: the export settings dialog gains an "Image modules" block —
+  group distribution is a multi-select over the four dimensions (by tool / project / provider /
+  model, one Top-6 section per selected dimension); "API equivalent cost" (estimated total + top
+  rows) and "Work summary + pet speech bubble" (tools grid + portrait/bubble) toggle
+  independently; the overview + trend chart are **always included and cannot be turned off**.
+  Choices are saved as soon as checked, remembered in this device's browser localStorage only,
+  and affect the exported image only — the "Copy text" summary is unchanged.
+
+### Changed
+
+- **Usage record cards gain a header and request counts**: each tool card on the Records tab now has a three-column header (provider display name / tokens / requests), shows the **request count** to the right of tokens on every row, and adds a totals row (token and request totals) at the bottom.
+- **Output speed page polish**: the detail series name became a dropdown that switches the selected series directly; hovering a list row shows the full series name **instantly** (no more native-title delay); the "Total tool time" tile explains on hover why it reads "—" (tool time cannot yet be attributed to a single model call, never zero-filled; all-tool totals live in Usage → Work activity).
+- **Main window default size is now 900×750** (minimum still 800×600): the landscape ratio keeps the speed page's list and chart side by side without squeezing, and the usage board scrolls vertically for browsing.
+- **Main-window four-tab navigation and unified desktop theme**: the main window is reorganized
+  into four top-level tabs — Messages / Resources / Usage / Output Speed (Messages by default;
+  Settings keeps its own standalone window and entry). Switching pages keeps each page's state
+  and never stops session monitoring or notifications; **the standalone usage-window entries are
+  folded into a tab** — the former title-bar usage button, the pet minibar's "Details »" and the
+  tray "Details" entry now wake the main window and select the Usage tab (no usage-dashboard
+  window is created anymore), and legacy entries such as `/usage` keep compatibility redirects;
+  the desktop theme is unified (light = pure-white base with the original blue-violet accent,
+  dark = cool-graphite base with indigo/violet accents — revised from flat fog-silver after
+  device feedback; restrained glass on navigation and dropdown overlays only, dialogs are now
+  solid cards, with solid fallbacks when the system asks for reduced transparency or the
+  engine lacks backdrop-filter; mobile, pet transparent surfaces and share-image layouts stay
+  independent). **Upgrade notes**:
+  after upgrading, reach Usage and Output Speed from the main window's tabs; the cross-window
+  detail entries change from "opens a new window" to "wakes the main window and selects the tab".
+
 ## [0.6.2] - 2026-10-26
 
 ### Upgrade Notes

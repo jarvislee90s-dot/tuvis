@@ -23,7 +23,8 @@ import { useRemoteEvents } from "@/hooks/useRemoteEvents";
 const HomePage = lazy(() => import("./pages/home"));
 const AboutPage = lazy(() => import("./pages/about"));
 const SettingsPage = lazy(() => import("./pages/settings"));
-// 用量大看板（计划② Task 6）：独立窗口 `usage-dashboard` 的页面（见 lib/usage/openWindow.ts）
+// 旧 `/usage` 独立窗口路由的兼容跳转页（四页同窗后请求主窗切「模型用量」页签；
+// 见 pages/usage-dashboard.tsx 与 lib/usage/openWindow.ts）
 const UsageDashboardPage = lazy(() => import("./pages/usage-dashboard"));
 
 const NotificationPage = lazy(() => import("./pages/notification"));

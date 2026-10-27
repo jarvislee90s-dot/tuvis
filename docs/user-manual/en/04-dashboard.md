@@ -7,10 +7,10 @@ The dashboard is Tuvis's main screen: sessions from eight AI coding tools on one
 ## Board layout
 
 - **Top-bar status summary**: "N sessions" on the left is the total card count; when items need your attention, a red "N pending" counter appears on the right.
-- **"Board / Resources" dual tabs**: the Board tab holds session cards, the Resources tab manages skills, MCP, and other resource entries; switching to Resources hides the whole filter chip row.
+- **Four top-level tabs**: Messages (this page) / Resources / Usage / Output Speed — switched within the same main window, and each page keeps its own state; session summaries, filter chips and clear-finished belong to the Messages page, while resource entries live in Resources.
 - **Right of the tab bar**: a "clear finished cards" button lights up when finished cards exist — one click sweeps all green cards away; next to it sits the notification bell (Chapter 6).
 
-1. Open the main window — it lands on the Board tab by default;
+1. Open the main window — it lands on the Messages tab by default;
 2. Check the "pending" counter first; if it is not 0, handle the red cards first;
 3. Cards are read-and-cleared: hit "clear finished cards" to wipe the board.
 
@@ -32,6 +32,8 @@ A row of chips above the cards: "All" on the far left, then seven tools (Claude 
 > 💡 OpenClaw does not support message alerts, so it is not in the filter chips (its sessions still appear under "All").
 
 > 💡 Chip icons and labels share one source with the card badges — recognize a face once and find it everywhere.
+
+> 💡 Usage and Output Speed have their own tabs — see Chapter 11 (Usage statistics) and the "Output speed" section.
 
 ## Click a card: jump to the terminal
 

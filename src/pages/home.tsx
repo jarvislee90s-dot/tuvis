@@ -1,34 +1,56 @@
+// 四页宿主（2026-10-26 计划 Task 7）：主窗口唯一页面，承载 消息看板 / 工具资源 /
+// 模型用量 / 输出速度 四个一级页签（spec §2.1 固定同序、首启落消息看板）。
+//
+// 宿主职责（切页绝不重复/停止）：
+//  * useSessions / useNotification / Toaster / UpdaterDialog / PetStartupGuard /
+//    遗留技能迁移 / 托盘菜单初始化——**应用层**，只在宿主挂载一次（spec §2.7）；
+//  * useWorkspaceNavigation——跨窗导航目标的事件/peek 消费，同样只挂载一次；
+//  * 页面主体**首访才挂载，之后保留**：非活动页隐藏在四页同格堆叠容器里
+//    （`visibility:hidden` + `inert`，非 display:none——保盒树 ⇒ 保滚动位置，spec §2.6）；
+//    各页体以 active 门控隐藏期间的查询/轮询/采集（用量页全部读 + 兜底 ticker、
+//    速度页 dashboard 轮询与 TPS 视图租约），隐藏期间零 IPC（spec §2.7）。
+// 旧的「看板/资源」内部页签由四页顶层页签取代（会话摘要 / 工具 chips / 一键清除
+// 只属消息看板页）。
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { WindowFrame } from "@/components/common/window-frame";
 import { MainTitleBar } from "@/components/common/main-title-bar";
+import { WorkspaceTabs } from "@/components/common/WorkspaceTabs";
+import { WorkspacePageHeader } from "@/components/common/WorkspacePageHeader";
 import { UpdaterDialog } from "@/components/common/updater-dialog";
 import { Toaster } from "@/components/ui/sonner";
 import { SessionGrid } from "@/components/sessions/SessionGrid";
 import { ExtensionList } from "@/components/resources/ExtensionList";
-import { CheckCheck, Monitor, Package } from "lucide-react";
+import { UsageDashboardBody } from "@/components/usage/UsageDashboardBody";
+import { SpeedDashboard } from "@/components/speed/SpeedDashboard";
+import { CheckCheck, Activity, AlertCircle } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useSessions } from "@/hooks/useSessions";
 import { useNotification } from "@/hooks/useNotification";
+import { useWorkspaceNavigation } from "@/hooks/useWorkspaceNavigation";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { loadVisible, subscribeConfig } from "@/components/pet/petConfig";
 import { PetStartupGuard } from "@/components/pet/PetStartupGuard";
 import { useAppTranslation } from "@/hooks/use-app-translation";
-import { Activity, AlertCircle } from "lucide-react";
 import { NotificationBell } from "@/components/notifications/NotificationBell";
 import { useLegacySkillMigration } from "@/hooks/useLegacySkillMigration";
 import { LegacySkillMigrationDialog } from "@/components/resources/LegacySkillMigrationDialog";
 import { ToolFilterChips } from "@/components/sessions/ToolFilterChips";
 import { AGENT_BADGE } from "@/lib/agentBadge";
 import { filterByAgent, loadToolFilter, saveToolFilter, type ToolFilter } from "@/lib/toolFilter";
+import type { WorkspaceTab } from "@/types/workspace";
 
 export default function HomePage() {
   useSessions();
   useNotification();
+  // 跨窗导航消费（Task 7）：事件 + 订阅后/唤起时 peek，挂载恰一次
+  useWorkspaceNavigation();
   // 遗留 codex 技能链接检测（spec §4.3）：mount 即检测，命中 ≥1 条时弹一次性迁移对话框
   const legacyMigration = useLegacySkillMigration();
-  const [activeTab, setActiveTab] = useState<"dashboard" | "extensions">("dashboard");
+  const activeTab = useWorkspaceStore((s) => s.activeTab);
+  const visitedTabs = useWorkspaceStore((s) => s.visitedTabs);
   const { sessions, totalCount, waitingCount, loading } = useSessionStore();
   const { t, i18n } = useAppTranslation();
   const queryClient = useQueryClient();
@@ -105,6 +127,19 @@ export default function HomePage() {
     // i18n.language 变化时重跑（语言切换 → 托盘文案 + C-3 语言推送一并刷新）
   }, [t, petOn, i18n.language]);
 
+  // 页面容器（评审 Important 1 修正）：四页**堆叠在同一个 grid 单元格**，非活动页
+  // `invisible pointer-events-none` + `aria-hidden` + `inert`。刻意**不用** `hidden`
+  // （display:none）——那会拆掉盒树，Chromium/Firefox/Safari 在重新显示时丢弃子树
+  // 滚动偏移（spec §2.6「切页不重置」会破）；`visibility:hidden` 保留布局与滚动，
+  // 同时把页面从 a11y 树与命中测试里摘掉，`inert` 再挡一层焦点落入。首访前不挂载
+  // 主体，避免隐藏页在启动时白白发查询/采集（用量页另有 active 门控双保险）。
+  const shown = "col-start-1 row-start-1 flex min-h-0 flex-col gap-3 overflow-hidden";
+  const inactive =
+    "col-start-1 row-start-1 flex min-h-0 flex-col gap-3 overflow-hidden invisible pointer-events-none";
+  const pageClass = (tab: string) => (activeTab === tab ? shown : inactive);
+  const pageActive = (tab: string) => activeTab === tab;
+  const visited = (tab: WorkspaceTab) => visitedTabs.includes(tab);
+
   return (
     <WindowFrame
       titleBar={<MainTitleBar />}
@@ -113,78 +148,100 @@ export default function HomePage() {
       <UpdaterDialog />
       <Toaster />
 
-      {/* 状态摘要栏 */}
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2">
-            <Activity className="text-muted-foreground h-4 w-4" />
-            <span className="text-sm font-semibold">{totalCount}</span>
-            <span className="text-muted-foreground text-xs">{t("home.sessions")}</span>
+      {/* 四页一级导航（Task 7；Task 8 重做视觉） */}
+      <WorkspaceTabs />
+
+      {/* 四页堆叠容器：单行网格（minmax(0,1fr) 撑满剩余高度），四页同格重叠 */}
+      <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)] overflow-hidden">
+        {/* ── 消息看板：会话摘要 / 工具 chips / 清除已完成 / 通知铃 / 会话卡 ── */}
+        <section
+          className={pageClass("messages")}
+          data-testid="workspace-page-messages"
+          aria-hidden={!pageActive("messages") || undefined}
+          inert={!pageActive("messages") || undefined}
+        >
+          {/* 统一页头（Task 8）：标题 + 今日摘要/操作收进 actions 槽 */}
+          <WorkspacePageHeader
+            title={t("workspace.page.messages")}
+            actions={
+              <>
+                <div className="flex items-center gap-2">
+                  <Activity className="text-muted-foreground h-4 w-4" />
+                  <span className="text-sm font-semibold">{totalCount}</span>
+                  <span className="text-muted-foreground text-xs">{t("home.sessions")}</span>
+                </div>
+                {waitingCount > 0 && (
+                  <div className="flex items-center gap-2">
+                    <AlertCircle className="h-4 w-4 text-red-600 dark:text-red-400" />
+                    <span className="text-sm font-semibold text-red-600 dark:text-red-400">
+                      {waitingCount}
+                    </span>
+                    <span className="text-muted-foreground text-xs">{t("home.waiting")}</span>
+                  </div>
+                )}
+                {loading && (
+                  <span className="text-muted-foreground text-xs">{t("home.loading")}</span>
+                )}
+                {/* 消息页专属操作（原内部页签栏右侧迁来）：一键清除已完成 + 通知铃 */}
+                {finishedCards.length > 0 && (
+                  <button
+                    onClick={clearFinishedCards}
+                    className="text-muted-foreground hover:bg-muted hover:text-foreground rounded p-1.5 transition-colors"
+                    title={t("home.clearFinishedCards")}
+                    aria-label={t("home.clearFinishedCards")}
+                  >
+                    <CheckCheck className="h-4 w-4" />
+                  </button>
+                )}
+                <NotificationBell />
+              </>
+            }
+          />
+
+          <ToolFilterChips value={toolFilter} onChange={setToolFilter} />
+
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <SessionGrid sessions={filteredSessions} filterToolLabel={filterToolLabel} />
           </div>
-          {waitingCount > 0 && (
-            <div className="flex items-center gap-2">
-              <AlertCircle className="h-4 w-4 text-red-500" />
-              <span className="text-sm font-semibold text-red-500">{waitingCount}</span>
-              <span className="text-muted-foreground text-xs">{t("home.waiting")}</span>
+        </section>
+
+        {/* ── 工具资源 ── */}
+        <section
+          className={pageClass("resources")}
+          data-testid="workspace-page-resources"
+          aria-hidden={!pageActive("resources") || undefined}
+          inert={!pageActive("resources") || undefined}
+        >
+          {visited("resources") && (
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <ExtensionList />
             </div>
           )}
-        </div>
-        {loading && <span className="text-muted-foreground text-xs">{t("home.loading")}</span>}
+        </section>
+
+        {/* ── 模型用量：原独立窗口主体原样嵌入（Task 7 提取）；active 门控轮询/采集 ── */}
+        <section
+          className={pageClass("usage")}
+          data-testid="workspace-page-usage"
+          aria-hidden={!pageActive("usage") || undefined}
+          inert={!pageActive("usage") || undefined}
+        >
+          {visited("usage") && <UsageDashboardBody active={activeTab === "usage"} />}
+        </section>
+
+        {/* ── 输出速度：Task 12 组合页（数据 Task 9 / 图 Task 10 / 采集管理 Task 11）── */}
+        <section
+          className={pageClass("speed")}
+          data-testid="workspace-page-speed"
+          aria-hidden={!pageActive("speed") || undefined}
+          inert={!pageActive("speed") || undefined}
+        >
+          {/* 页体常驻挂载（同格堆叠隐藏保状态）；active 门控速度轮询与 TPS 视图租约
+              （visibility:hidden 下 IO 判不出页签切换，必须与页签态合取） */}
+          {visited("speed") && <SpeedDashboard active={activeTab === "speed"} />}
+        </section>
       </div>
 
-      {/* 标签栏 */}
-      <div className="flex items-center justify-between border-b pb-1">
-        <div className="flex gap-1">
-          <button
-            onClick={() => setActiveTab("dashboard")}
-            className={`flex items-center gap-1.5 rounded px-3 py-1 text-sm transition-colors ${
-              activeTab === "dashboard"
-                ? "bg-accent text-accent-foreground font-medium"
-                : "text-muted-foreground hover:bg-accent/50"
-            }`}
-          >
-            <Monitor className="h-3.5 w-3.5" />
-            {t("home.tabDashboard")}
-          </button>
-          <button
-            onClick={() => setActiveTab("extensions")}
-            className={`flex items-center gap-1.5 rounded px-3 py-1 text-sm transition-colors ${
-              activeTab === "extensions"
-                ? "bg-accent text-accent-foreground font-medium"
-                : "text-muted-foreground hover:bg-accent/50"
-            }`}
-          >
-            <Package className="h-3.5 w-3.5" />
-            {t("home.tabResources")}
-          </button>
-        </div>
-        {/* 桌宠开关已上移至标题栏（MainTitleBar 齿轮右侧）；此处不再保留副本 */}
-        <div className="flex items-center gap-2">
-          {finishedCards.length > 0 && (
-            <button
-              onClick={clearFinishedCards}
-              className="text-muted-foreground hover:bg-muted hover:text-foreground rounded p-1.5 transition-colors"
-              title={t("home.clearFinishedCards")}
-              aria-label={t("home.clearFinishedCards")}
-            >
-              <CheckCheck className="h-4 w-4" />
-            </button>
-          )}
-          <NotificationBell />
-        </div>
-      </div>
-
-      {/* 工具筛选 chips（2026-10-11）：仅看板 tab 出现，切扩展 tab 由条件渲染隐藏 */}
-      {activeTab === "dashboard" && <ToolFilterChips value={toolFilter} onChange={setToolFilter} />}
-
-      {/* 内容区 */}
-      <div className="flex-1 overflow-y-auto">
-        {activeTab === "dashboard" ? (
-          <SessionGrid sessions={filteredSessions} filterToolLabel={filterToolLabel} />
-        ) : (
-          <ExtensionList />
-        )}
-      </div>
       {/* 启动校验弹窗（EP2）：外部宠物素材异常时主窗口确认，宠物窗口先行降级 */}
       <PetStartupGuard />
       {/* 遗留 codex 技能链接迁移对话框（spec §4.3）：仅检测命中时可见 */}
