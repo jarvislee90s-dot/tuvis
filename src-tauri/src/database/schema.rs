@@ -553,6 +553,103 @@ pub fn init(conn: &Connection) {
             last_duration_ms INTEGER,
             PRIMARY KEY (probe_key, capability)
         );
+        -- ===== TPS 短时抽样三表（2026-10-24 计划 Task 2 / spec §6 固定工程契约）=====
+        -- 与旧 usage_* 账本**完全解耦**：不共用表、不共用游标（usage_cursor 是旧用量域的，
+        -- 本域游标只落 tps_state）、保留期独立 24 小时（本域 purge 只删这三张表，绝不动
+        -- usage_* 的保留设置）。
+        -- ① 事实表：主键 = source+host_instance+stable_call_key（spec §6）；UPSERT =
+        --    后写整行覆盖（同一调用重复读取取更新鲜的值，spec §7「同调用重复读取不翻倍」
+        --    的存储半边；点入样仍由 policy 层按稳定键去重）。失败/取消也落表（spec §3：
+        --    不入速度但有可靠起止仍进耗时详情），可空列 = 「不可得」，读回 None 不填 0。
+        --    started/ended 的 epoch 非负 CHECK 既是数据哨兵，也是「批内中途失败」原子性
+        --    验收的注入缝（tests/tps_store_test.rs 用 ended_at_ms=-1 的行让事务在批中段失败）。
+        CREATE TABLE IF NOT EXISTS tps_observation (
+            source             TEXT NOT NULL,
+            host_instance      TEXT NOT NULL,
+            stable_call_key    TEXT NOT NULL,
+            started_at_ms      INTEGER NOT NULL CHECK(started_at_ms >= 0),
+            first_token_at_ms  INTEGER,
+            ended_at_ms        INTEGER NOT NULL CHECK(ended_at_ms >= 0),
+            native_duration_ms INTEGER,
+            generation_ms      INTEGER,
+            -- V2（桌面四页导航与输出速度 V2 Task 1）：含等待的响应时长 ms（开始→终态）。
+            -- 可空无默认：旧行 NULL = 旧记录无显式响应窗（读取层走旧流式有效性的兼容路径）；
+            -- 老库由 migration.rs ALTER 幂等补列
+            response_elapsed_ms INTEGER,
+            output_tokens      INTEGER,
+            output_scope       TEXT NOT NULL,
+            tool_ms            INTEGER,
+            model              TEXT NOT NULL,
+            channel            TEXT,
+            session_key        TEXT,
+            turn_key           TEXT,
+            purpose            TEXT NOT NULL,
+            outcome            TEXT NOT NULL,
+            method             TEXT NOT NULL,
+            failure_reason     TEXT,
+            PRIMARY KEY (source, host_instance, stable_call_key)
+        );
+        -- spec「三表与 source/ended_at、sampled_at/series 索引」：保留清理与按 series 取数都走这两列
+        CREATE INDEX IF NOT EXISTS idx_tps_observation_ended
+            ON tps_observation(ended_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_tps_observation_series
+            ON tps_observation(source, model, method);
+        -- V2 dashboard（2026-10-26 计划 Task 6）：series 维过滤 + 完成窗范围扫描的复合索引
+        -- （source, model, channel, method, ended_at_ms）——桶查询/工具筛选都以此命中
+        -- （ channel 可空：SQLite 索引含 NULL，`channel IS ?` 仍可走该索引）
+        CREATE INDEX IF NOT EXISTS idx_tps_observation_series_ended
+            ON tps_observation(source, model, channel, method, ended_at_ms);
+        -- ② 采样点表：主键 = tick_id+series_key（spec §6）。tick_id 由 store 层取
+        --    TpsPoint.point_id（policy 层已按 {run_id}:{sampled_at}:{series_id} 确定性生成，
+        --    见 services/tps/store.rs），同点重存 = UPSERT 不重复。
+        --    列名与 spec §6 点列清单对齐：n = TpsPoint.sample_count（TPS 有效 n，≤20）；
+        --    ttft_count = ttft_sample_count（首点可对齐的独立分母）；ttft_sum_ms = ttft_sum_ms；
+        --    trigger_kind = trigger（避开 SQL 关键字）。其余列为 TpsMetrics 平铺镜像
+        --    （TpsPoint 承载全部指标面，读侧要还原整点）；age_ms 是「当时钟−结束」派生值，
+        --    **不落库**，读侧按 sampled_at 重算。status 钉 spec 逐字二值；window_ms 钉
+        --    spec 逐字 120000（与 policy::TPS_WINDOW_MS 同源常量）。
+        CREATE TABLE IF NOT EXISTS tps_point (
+            tick_id              TEXT NOT NULL,
+            series_key           TEXT NOT NULL,
+            sampled_at           INTEGER NOT NULL,
+            window_ms            INTEGER NOT NULL CHECK(window_ms = 120000),
+            run_id               TEXT NOT NULL,
+            trigger_kind         TEXT NOT NULL,
+            status               TEXT NOT NULL CHECK(status IN ('value','gap')),
+            -- 发点时生效的计划节奏 ms（可见 60000 / 后台 600000；独立复核 R11）；旧行 NULL
+            cadence_ms           INTEGER,
+            method               TEXT NOT NULL,
+            output_scope         TEXT NOT NULL,
+            quality              TEXT NOT NULL,
+            n                    INTEGER NOT NULL DEFAULT 0,
+            sum_output_tokens    INTEGER NOT NULL DEFAULT 0,
+            sum_generation_ms    INTEGER NOT NULL DEFAULT 0,
+            ttft_sum_ms          INTEGER,
+            ttft_count           INTEGER NOT NULL DEFAULT 0,
+            model_ms             INTEGER,
+            tool_ms              INTEGER,
+            avg_first_token_ms   INTEGER,
+            tps                  REAL,
+            candidate_count      INTEGER NOT NULL DEFAULT 0,
+            timed_model_count    INTEGER NOT NULL DEFAULT 0,
+            timed_tool_count     INTEGER NOT NULL DEFAULT 0,
+            failed_count         INTEGER NOT NULL DEFAULT 0,
+            cancelled_count      INTEGER NOT NULL DEFAULT 0,
+            missing_timing_count INTEGER NOT NULL DEFAULT 0,
+            latest_ended_at      INTEGER,
+            sampled_keys         TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY (tick_id, series_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tps_point_sampled
+            ON tps_point(sampled_at, series_key);
+        -- ③ 状态表：key+JSON（spec §6：源游标/安装记录/调度元数据）。键约定由
+        --    services/tps/store.rs 固定（cursor:<source> / source_state:<source>）；通用
+        --    key/JSON 通道供安装记录与调度元数据复用。游标**只**落本表，不借旧 usage_cursor。
+        CREATE TABLE IF NOT EXISTS tps_state (
+            key        TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
         "#,
     )
     .expect("Failed to initialize database schema");

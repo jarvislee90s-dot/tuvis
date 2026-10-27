@@ -27,8 +27,10 @@
       {
         "label": "main",
         "title": "Tuvis",
-        "width": 800,
-        "height": 600,
+        "width": 900,
+        "height": 750,
+        "minWidth": 800,
+        "minHeight": 600,
         "decorations": false,
         "transparent": true,
         "center": true,

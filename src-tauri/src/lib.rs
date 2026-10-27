@@ -207,6 +207,9 @@ pub fn run() {
             commands::autostart::initialize_on_first_launch(app.handle());
             // 用量账本：应用启动采集一次（按需路径，绝不进 3 秒轮询）
             crate::services::usage::collect::spawn_initial_collection();
+            // TPS 短时抽样（2026-10-24 计划 Task 7）：调度/接收随 usage.enabled 总授权
+            // 启停——关闭时每拍只读一行 settings（惯性，不改旧 usage 采集的启动时序）
+            crate::services::tps::collector::spawn_runtime();
             // 公开价格：每 5 分钟检查一次 enabled && stale；未启用时零请求
             crate::services::usage::v2::pricing::spawn_pricing_refresh_loop();
             // 升级残留清理：Windows 升级流把安装包留在 %TEMP% 的
@@ -227,7 +230,10 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![commands::autostart::AUTOSTART_ARG]),
         ))
-        .plugin(plugins::system_tray::init());
+        .plugin(plugins::system_tray::init())
+        // 四页工作区导航（2026-10-26 计划 Task 7）：待导航目标队列（revision/ACK 语义见
+        // services/workspace_navigation.rs；纯内存，不落盘）
+        .manage(services::workspace_navigation::NavigationQueue::default());
     let builder = builder.invoke_handler(tauri::generate_handler![
         greet,
         // 物理坠落按应用重启归位的前端运行标记源（见上方 app_run_id 注释）
@@ -408,6 +414,23 @@ pub fn run() {
         // 导出落盘（计划①，契约 §3 新增）：文本/二进制写导出目录（2026-10-07 A2 起 = 系统下载目录）
         commands::export::export_save_text,
         commands::export::export_save_bytes,
+        // TPS 短时抽样（2026-10-24 计划 Task 7）：调度/查询/视图租约/一次统计七命令
+        //（Spec §6 IPC 契约逐字；锁：commands/tps.rs 自检 + tests/tps_sampling_test.rs）
+        commands::tps::tps_snapshot,
+        commands::tps::tps_points,
+        commands::tps::tps_refresh,
+        // V2 速度 dashboard（2026-10-26 计划 Task 6）：只读区间/桶聚合
+        commands::tps::tps_speed_dashboard,
+        commands::tps::tps_view_heartbeat,
+        commands::tps::tps_install_preview,
+        commands::tps::tps_install_apply,
+        commands::tps::tps_uninstall,
+        // 四页工作区导航（2026-10-26 计划 Task 7）：跨窗「打开用量详情」→ 主窗页签
+        //（先存后 emit + 唤醒既有主窗；队列状态由上方先于 invoke_handler 的
+        // .manage(NavigationQueue) 注册，见本函数开头）
+        commands::workspace::workspace_request_navigation,
+        commands::workspace::workspace_peek_navigation,
+        commands::workspace::workspace_ack_navigation,
         // 升级检查（prerelease 渠道）：GitHub 发现层 + 动态端点一键升级
         commands::updater::check_for_github_update,
         commands::updater::install_github_update,
@@ -441,6 +464,8 @@ pub fn run() {
 /// 的 `on_before_exit` 钩子调用本函数，保证不留孤儿进程、不失电源锁。
 pub(crate) fn exit_cleanup() {
     crate::remote::tunnel::stop_all();
+    // TPS 接收器随进程退出而停（Spec §5「Tuvis真正退出就停止接收，不增系统守护进程」）
+    crate::services::tps::receiver::shutdown();
     // §C1 修复轮 1 Finding 2②：Funnel 无子进程可 kill_on_drop（守护 =
     // 轮询线程 + tailscaled 常驻配置），进程退出必须显式撤 + 收 DESIRED
     crate::remote::tailscale::stop_all();

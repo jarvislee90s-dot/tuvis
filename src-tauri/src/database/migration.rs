@@ -49,6 +49,24 @@ pub fn migrate(conn: &Connection) -> Result<(), String> {
     // 上面 DROP 掉的预览版账本四表，由这次 init 按新 DDL 重建为空表。
     crate::database::schema::init(conn);
 
+    // tps_point.cadence_ms（独立复核 R11）：老库的点表无此列 → 补加可空列（旧行 NULL = 无节奏信息，
+    // 前端不据此断线）；schema::init 的 CREATE IF NOT EXISTS 对已存在表不生效，须 ALTER 补齐
+    if !column_exists(conn, "tps_point", "cadence_ms") {
+        conn.execute("ALTER TABLE tps_point ADD COLUMN cadence_ms INTEGER", [])
+            .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
+    }
+
+    // tps_observation.response_elapsed_ms（V2 Task 1）：老库的事实表无此列 → 补加可空列
+    // （旧行 NULL = 旧记录无显式响应窗，读取层走旧流式有效性的兼容路径，不回填不猜测）；
+    // 同上须 ALTER 幂等补齐。**只动 TPS 域三表，绝不触碰旧 usage_* 账本与游标**
+    if !column_exists(conn, "tps_observation", "response_elapsed_ms") {
+        conn.execute(
+            "ALTER TABLE tps_observation ADD COLUMN response_elapsed_ms INTEGER",
+            [],
+        )
+        .map_err(|e| format!("MIGRATE_FAIL: 迁移失败: {}", e))?;
+    }
+
     // 检查 extension 表是否有 manifest_path 列
     if !column_exists(conn, "extensions", "manifest_path") {
         conn.execute("ALTER TABLE extensions ADD COLUMN manifest_path TEXT", [])
@@ -1010,6 +1028,102 @@ mod tests {
         }
     }
 
+    /// TPS 三表（2026-10-24 计划 Task 2）：老库形状（无三表）经 migrate 幂等补齐；
+    /// 重复迁移不报错、形状逐列与 spec §6 对齐（主键 tick_id+series_key / 三元组事实主键 /
+    /// window_ms 钉 120000）。新库由 schema.rs 直建，migrate 重放 init 全部短路。
+    #[test]
+    fn migrate_creates_tps_tables_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 老库形状：先建 extensions（migrate 前段 ALTER 依赖），不建 TPS 三表
+        conn.execute_batch(
+            "CREATE TABLE extensions (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                description TEXT, source_path TEXT NOT NULL, source_url TEXT,
+                version TEXT, tags TEXT, installed_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // 幂等：跑两遍不报错（IF NOT EXISTS 全部短路）
+        let cols = |table: &str| -> Vec<String> {
+            conn.prepare(&format!("PRAGMA table_info({})", table))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        // 事实表：主键三元组逐字在场（spec §6：source+host_instance+stable_call_key）；
+        // V2 Task 1 补列 response_elapsed_ms（原先漏登记的本完备性清单，Task 6 补上）
+        let obs_cols = cols("tps_observation");
+        for c in [
+            "source",
+            "host_instance",
+            "stable_call_key",
+            "started_at_ms",
+            "first_token_at_ms",
+            "ended_at_ms",
+            "native_duration_ms",
+            "generation_ms",
+            "response_elapsed_ms",
+            "output_tokens",
+            "output_scope",
+            "tool_ms",
+            "model",
+            "channel",
+            "session_key",
+            "turn_key",
+            "purpose",
+            "outcome",
+            "method",
+            "failure_reason",
+        ] {
+            assert!(
+                obs_cols.contains(&c.to_string()),
+                "tps_observation 缺列 {c}"
+            );
+        }
+        // 点表：spec §6 点列清单（n/sum_output/sum_generation_ms/ttft_sum/count/
+        // latest_ended_at/quality/sampled_keys）+ window_ms 逐字钉 120000
+        let point_cols = cols("tps_point");
+        for c in [
+            "tick_id",
+            "series_key",
+            "sampled_at",
+            "window_ms",
+            "run_id",
+            "trigger_kind",
+            "status",
+            "quality",
+            "n",
+            "sum_output_tokens",
+            "sum_generation_ms",
+            "ttft_sum_ms",
+            "ttft_count",
+            "latest_ended_at",
+            "sampled_keys",
+            "cadence_ms",
+        ] {
+            assert!(point_cols.contains(&c.to_string()), "tps_point 缺列 {c}");
+        }
+        // 状态表：key+JSON
+        assert_eq!(
+            cols("tps_state"),
+            vec!["key", "value_json", "updated_at"],
+            "tps_state 列序 = key+JSON"
+        );
+        // V2 Task 6：dashboard 复合索引由 migrate 重放 init 幂等补齐（老库也拿到）
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_tps_observation_series_ended'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "migrate 必须带出 idx_tps_observation_series_ended");
+    }
+
     /// Codex 动作账本：旧结构（**两列都不存在**）经迁移补列（barrier + signature）——
     /// `barrier_force_released_at` 与 `signature_applied` 都可空、存量行保留 NULL；
     /// 幂等两遍不报错。
@@ -1062,5 +1176,75 @@ mod tests {
         );
         // 幂等：迁移两遍不报错
         migrate(&conn).unwrap();
+    }
+
+    /// 独立复核 R11：老库 tps_point 无 cadence_ms 列 → migrate 以 ALTER 补加可空列（旧行 NULL），
+    /// 补后可按新列写读；重放幂等
+    #[test]
+    fn migrate_adds_cadence_ms_to_existing_tps_point() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE extensions (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                description TEXT, source_path TEXT NOT NULL, source_url TEXT,
+                version TEXT, tags TEXT, installed_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            -- 修复前形状的点表（无 cadence_ms）
+            CREATE TABLE tps_point (
+                tick_id TEXT NOT NULL, series_key TEXT NOT NULL, sampled_at INTEGER NOT NULL,
+                window_ms INTEGER NOT NULL CHECK(window_ms = 120000), run_id TEXT NOT NULL,
+                trigger_kind TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('value','gap')),
+                method TEXT NOT NULL, output_scope TEXT NOT NULL, quality TEXT NOT NULL,
+                n INTEGER NOT NULL DEFAULT 0, sum_output_tokens INTEGER NOT NULL DEFAULT 0,
+                sum_generation_ms INTEGER NOT NULL DEFAULT 0, ttft_sum_ms INTEGER,
+                ttft_count INTEGER NOT NULL DEFAULT 0, model_ms INTEGER, tool_ms INTEGER,
+                avg_first_token_ms INTEGER, tps REAL, candidate_count INTEGER NOT NULL DEFAULT 0,
+                timed_model_count INTEGER NOT NULL DEFAULT 0, timed_tool_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0, cancelled_count INTEGER NOT NULL DEFAULT 0,
+                missing_timing_count INTEGER NOT NULL DEFAULT 0, latest_ended_at INTEGER,
+                sampled_keys TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (tick_id, series_key)
+            );
+            INSERT INTO tps_point (tick_id, series_key, sampled_at, window_ms, run_id, trigger_kind,
+                status, method, output_scope, quality)
+            VALUES ('t1', 's1', 1, 120000, 'run', 'scheduled', 'gap', 'client-native', 'unknown', 'normal');",
+        )
+        .unwrap();
+        let cols = |t: &str| -> Vec<String> {
+            let mut st = conn.prepare(&format!("PRAGMA table_info({t})")).unwrap();
+            st.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert!(!cols("tps_point").contains(&"cadence_ms".to_string()));
+        migrate(&conn).unwrap();
+        assert!(
+            cols("tps_point").contains(&"cadence_ms".to_string()),
+            "ALTER 补列"
+        );
+        // 旧行 NULL；新行可写读
+        let old: Option<i64> = conn
+            .query_row(
+                "SELECT cadence_ms FROM tps_point WHERE tick_id='t1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, None);
+        conn.execute(
+            "UPDATE tps_point SET cadence_ms = 60000 WHERE tick_id='t1'",
+            [],
+        )
+        .unwrap();
+        let now: Option<i64> = conn
+            .query_row(
+                "SELECT cadence_ms FROM tps_point WHERE tick_id='t1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(now, Some(60000));
+        migrate(&conn).unwrap(); // 幂等
     }
 }
