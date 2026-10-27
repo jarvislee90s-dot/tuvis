@@ -497,8 +497,12 @@ pub(crate) struct StoreGate {
 #[cfg(test)]
 impl StoreGate {
     /// 等到对应操作进入 fake（此时它正阻塞在放行之前）。
+    ///
+    /// 带超时：闸门若因实现缺陷从未被触发，测试必须以明确失败收场而不是永久悬挂。
     pub(crate) async fn wait_entered(&self) {
-        self.entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), self.entered.notified())
+            .await
+            .expect("等待存储操作进入 fake 超时（闸门未被触发）");
     }
 
     /// 放行一次被挂起的操作；drop 未放行的闸门等同放行。
@@ -1054,7 +1058,7 @@ mod tests {
             CredentialError::InvalidRecord
         );
         assert!(
-            prefs.with(|conn| read_restore_allowed(conn)).unwrap(),
+            prefs.with(read_restore_allowed).unwrap(),
             "非法记录不应先禁用恢复"
         );
     }

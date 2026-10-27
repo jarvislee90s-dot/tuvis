@@ -2863,11 +2863,71 @@ mod tests {
         let restored_after_forget = usize::from(after_restart.authorized);
         assert!(!after_restart.authorized);
         assert_eq!(restored_after_forget, 0);
-        assert_eq!(after_restart.remembered, false);
+        assert!(!after_restart.remembered);
         assert_eq!(after_restart.provider, None);
         assert_eq!(after_restart.problem, None);
         assert_eq!(store.load_count(), 1, "重启只读一次存储");
         assert!(store.stored().is_none(), "旧记录不得被迟到的保存复活");
+        assert_eq!(store.max_concurrent_store_calls(), 1);
+    }
+
+    /// 慢 load 在途时用户忘记授权：旧记录不得被提交为当前身份，删除仍须执行。
+    ///
+    /// 闸门控制：`load` 进入 fake 后挂起 → 先驱动 `forget` 的第一次轮询（清内存/禁用恢复/
+    /// 推进 epoch 都在它首个 await 之前完成；其删除排在在途 load 之后，故此刻不可能完成）
+    /// → 放行 load。旧 load 的结果只能被 epoch 复核丢弃；删除随后真正执行，重启无恢复。
+    #[tokio::test]
+    async fn forget_during_slow_load_never_restores_old_record() {
+        let fake = FakeZcode::start().await;
+        let old_jwt = valid_jwt();
+        let store = store_with(OAuthProvider::Zai, &old_jwt);
+        let auth = Arc::new(test_service(&fake).with_credential_store(store.clone()));
+
+        let load_gate = store.gate_load();
+        let restore = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.restore().await }
+        });
+        load_gate.wait_entered().await;
+        assert_eq!(store.load_count(), 1, "load 已进入 fake");
+
+        // 驱动 forget 一次：状态更新同步完成并停在「等待存储串行」上。
+        let mut forget = Box::pin(auth.forget());
+        tokio::select! {
+            biased;
+            status = &mut forget => panic!("在途 load 完成前 forget 不得完成：{status:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(store.delete_count(), 0, "在途 load 未完成前删除必须排队");
+        assert_eq!(store.max_concurrent_store_calls(), 1);
+
+        // 放行 load：旧记录不得被提交（epoch 已变），随后排队的删除真正执行。
+        load_gate.release();
+        let restored = restore.await.expect("旧 restore 任务不应 panic");
+        assert!(!restored.authorized, "旧 load 的记录不得被提交为当前身份");
+        assert!(!restored.remembered);
+        assert_eq!(restored.provider, None);
+        assert_eq!(restored.problem, None);
+        assert!(!auth.status().authorized);
+
+        let status_after_forget = forget.await;
+        assert!(!status_after_forget.authorized);
+        assert!(!status_after_forget.remembered);
+        assert_eq!(status_after_forget.problem, None);
+        assert_eq!(store.load_count(), 1, "忘记流程不得再次读存储");
+        assert_eq!(store.delete_count(), 1, "排队的删除必须在 load 之后执行");
+        assert!(store.stored().is_none(), "旧记录必须被删除");
+        assert_eq!(store.max_concurrent_store_calls(), 1);
+
+        // 模拟重启：全新 AuthService 对同一存储 restore，旧记录不得恢复。
+        let restarted = AuthService::new(test_client()).with_credential_store(store.clone());
+        let after_restart = restarted.restore().await;
+        assert!(!after_restart.authorized);
+        assert!(!after_restart.remembered);
+        assert_eq!(after_restart.provider, None);
+        assert_eq!(after_restart.problem, None);
+        assert_eq!(store.load_count(), 2, "重启只读一次存储");
+        assert!(store.stored().is_none());
         assert_eq!(store.max_concurrent_store_calls(), 1);
     }
 
