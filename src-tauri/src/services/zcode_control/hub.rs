@@ -19,6 +19,7 @@
 //! DB 读写失败由调用方处置：`config_changed` 只在保存/删除**成功后**被调用，
 //! 失败保存不得断开旧连接（本函数不读写入结果、不自行落库）。
 
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -46,6 +47,9 @@ const EVENT_CAPACITY: usize = 64;
 /// relay→Hub 事件泵队列（有界：State 满时 relay 侧**无超时**等待消费端，Data 满时
 /// 置位 lag 并触发投影失效，消费方绝不把旧缓存当权威）。
 const RELAY_EVENT_CAPACITY: usize = 64;
+/// 已发布会话视图的跟踪上限（有界：**最后登记**的最多 32 个；超限淘汰最久未登记
+/// 的会话（LRU），不随会话数无界增长。Data 溢出按此表逐会话降级）。
+const TRACKED_SESSION_CAP: usize = 32;
 
 /// 把静态矩阵包装成现算源（测试/固定夹具；生产源来自桥的宿主证据）。
 fn static_policy_source(policy: CapabilityView) -> CapabilitySource {
@@ -557,9 +561,9 @@ async fn apply_relay_state(
         }
         let out = state.view();
         let stale = if out.state == ConnectionState::Paired {
-            None
+            Vec::new()
         } else {
-            state.stale_session(out.generation)
+            state.stale_sessions(out.generation)
         };
         (out, entering_conflict, stale)
     };
@@ -567,17 +571,19 @@ async fn apply_relay_state(
         bridge.invalidate().await;
     }
     emit_connection(inner, events, &out);
-    if let Some(stale) = stale {
-        emit_session_event(inner, events, &stale);
+    for stale in &stale {
+        emit_session_event(inner, events, stale);
     }
 }
 
 /// 事件泵的 Data 溢出处理：旧投影**显式失效**，绝不把旧缓存继续当权威。
 ///
 /// relay 侧对 Data 只置位 [`RelayLag`] + 唤醒（不阻塞 actor），因此泵在此承担「失效」
-/// 语义：先作废桥内投影（下一次 GET 必然重新 bind/现读），再在 paired 且已发布过
-/// `last_session` 时把它降级为 `ready=false`、能力回到基线全关，并在锁外广播一次
-/// `Session` 事件——手机据它丢弃卡面，下一次 GET 重新取数。不伪造任何数据内容。
+/// 语义：先作废桥内投影（下一次 GET 必然重新 bind/现读），再在 paired 时把**每个**
+/// 已发布过的跟踪会话降级为 `ready=false`、能力回到基线全关，并**逐会话**在锁外广播
+/// `Session` 事件——手机（可能不止一台、不止一个会话）据它丢弃卡面，下一次 GET 重新
+/// 取数。已全部降级时不再重复发事件；**不**为 `last_session` 单独补发（生产上每次
+/// 成功 GET 都会登记跟踪表，它只是表内普通一员）。不伪造任何数据内容。
 async fn apply_relay_lag(
     inner: &Mutex<Inner>,
     events: &broadcast::Sender<ControlEvent>,
@@ -590,20 +596,15 @@ async fn apply_relay_lag(
         if state.state != ConnectionState::Paired {
             return;
         }
-        let Some(mut view) = state.last_session.clone() else {
-            return;
-        };
-        view.generation = state.generation;
-        view.ready = false;
-        // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新事件。
-        view.capabilities = CapabilityView::default();
-        state.last_session = Some(view.clone());
-        view
+        // 只降级仍 ready 的跟踪会话：全部已降级 = 无变化 → 零事件（重复 lag 不重发）。
+        state.downgrade_tracked_sessions()
     };
-    emit_session_event(inner, events, &stale);
+    for view in &stale {
+        emit_session_event(inner, events, view);
+    }
 }
 
-/// 事件泵的 Data 会话变化：锁内校验代际/配对并落 `last_session`，锁外广播。
+/// 事件泵的 Data 会话变化：锁内校验代际/配对并落 `last_session` 与跟踪表，锁外广播。
 ///
 /// - `hub_generation` 是本帧进入桥之前的 Hub 代际：桥处理在途若发生换代（配置变更/
 ///   断开/冲突），旧代际的投影绝不得贴上新代际，一律丢弃；
@@ -633,6 +634,8 @@ fn apply_relay_session(
             .map(|last| last.capabilities.clone())
             .unwrap_or_default();
         state.last_session = Some(view.clone());
+        // 本会话也可能被别的手机 GET 过：变化同样登记，lag 才能逐会话降级。
+        state.track_session(&view);
         view
     };
     emit_session_event(inner, events, &view);
@@ -663,8 +666,15 @@ struct Inner {
     /// 事件泵地板：`generation <= relay_floor` 的 relay 状态一律忽略（配置变更/断开
     /// 之后迟到的旧代际状态不得回写新状态）。
     relay_floor: u64,
-    /// 最近一次经 `session()` 读取的投影；连接离开 paired 时据此广播降级事件。
+    /// 最近一次经 `session()` 读取的投影：用于能力矩阵复用与 legacy 兜底；
+    /// 逐会话降级/通知以 `tracked_sessions` 为准，本字段不再是唯一广播对象。
     last_session: Option<SessionView>,
+    /// 已发布过的会话视图（按 sessionId 稳定排序、有界）：Data 溢出时**逐会话**
+    /// 降级并各广播一条 `Session` 事件，不能只通知最后一个会话。
+    tracked_sessions: BTreeMap<String, SessionView>,
+    /// 跟踪表的**最后登记序**（LRU）：back = 最近登记/再次 GET，front = 最久未登记；
+    /// 超限时按它淘汰（与 `tracked_sessions` 的 key 集合同步维护）。
+    tracked_order: VecDeque<String>,
 }
 
 impl Inner {
@@ -677,18 +687,93 @@ impl Inner {
         }
     }
 
-    /// 连接离开 paired：已读投影如实降级为不新鲜（只降一次，不猜测内容）。
-    fn stale_session(&mut self, generation: u64) -> Option<SessionView> {
-        let mut view = self.last_session.clone()?;
-        if !view.ready {
-            return None;
+    /// 连接离开 paired：把**所有就绪的**跟踪会话如实降级为不新鲜（当前代际、
+    /// `ready=false`、能力回基线全关），返回按 sessionId 稳定排序的降级视图（调用方
+    /// 在锁外逐条广播），随后清空跟踪表——离开 paired 后旧桥的任何会话视图都不得在
+    /// 重连后复活（`begin_disconnect`/`config_changed`/冲突与掉线都经由本入口）。
+    ///
+    /// 关键：relay **掉线不换代**（代际不变）时也必须逐会话通知；只发 connection 帧
+    /// 时，停在别的会话的手机不一定重拉。`last_session` 只是兜底（它未进跟踪表且
+    /// 仍 ready 的 legacy 状态），不是唯一广播对象。
+    fn stale_sessions(&mut self, generation: u64) -> Vec<SessionView> {
+        let mut changed = Vec::new();
+        for view in self.tracked_sessions.values_mut() {
+            if !view.ready {
+                continue;
+            }
+            view.generation = generation;
+            view.ready = false;
+            // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新代际事件。
+            view.capabilities = CapabilityView::default();
+            changed.push(view.clone());
         }
-        view.generation = generation;
-        view.ready = false;
-        // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新代际事件。
-        view.capabilities = CapabilityView::default();
-        self.last_session = Some(view.clone());
-        Some(view)
+        if let Some(last) = self.last_session.as_mut() {
+            let was_ready = last.ready;
+            last.generation = generation;
+            last.ready = false;
+            last.capabilities = CapabilityView::default();
+            let represented = changed
+                .iter()
+                .any(|view| view.session_id == last.session_id);
+            // legacy/防御兜底：last_session 未跟踪且仍 ready（正常生产不可达，GET 恒会
+            // 登记跟踪表）时补一条；已降级/已在变化集合内的绝不重复发。
+            if was_ready && !represented {
+                changed.push(last.clone());
+            }
+        }
+        self.tracked_sessions.clear();
+        self.tracked_order.clear();
+        changed
+    }
+
+    /// 登记（有界，按**最后登记序** = LRU）已发布会话视图：每次成功 GET / Data 变化
+    /// 都刷新同一条并把它移到登记序队尾；新会话超限时淘汰最久未登记（队首）的那个。
+    fn track_session(&mut self, view: &SessionView) {
+        match self
+            .tracked_order
+            .iter()
+            .position(|id| *id == view.session_id)
+        {
+            // 已登记：同一会话再次 GET/变化 = 最近一次登记（移到队尾，不扩容）。
+            Some(index) => {
+                self.tracked_order.remove(index);
+            }
+            // 新会话：超限先淘汰最久未登记（队首）的会话，再入队尾。
+            None => {
+                if self.tracked_order.len() >= TRACKED_SESSION_CAP {
+                    if let Some(oldest) = self.tracked_order.pop_front() {
+                        self.tracked_sessions.remove(&oldest);
+                    }
+                }
+            }
+        }
+        self.tracked_order.push_back(view.session_id.clone());
+        self.tracked_sessions
+            .insert(view.session_id.clone(), view.clone());
+    }
+
+    /// Data 溢出/投影失效：把所有**就绪的**跟踪会话降级为不新鲜（当前 Hub 代际、
+    /// 能力回基线全关），写回跟踪表并同步 `last_session`，返回按 sessionId 稳定
+    /// 排序的变化视图（调用方在锁外逐条广播）。
+    fn downgrade_tracked_sessions(&mut self) -> Vec<SessionView> {
+        let generation = self.generation;
+        let mut changed = Vec::new();
+        for view in self.tracked_sessions.values_mut() {
+            if !view.ready {
+                continue;
+            }
+            view.generation = generation;
+            view.ready = false;
+            // 投影已不新鲜：能力矩阵同步回到基线全关，绝不把旧代际的许可带进新事件。
+            view.capabilities = CapabilityView::default();
+            changed.push(view.clone());
+        }
+        if let Some(last) = self.last_session.as_mut() {
+            last.generation = generation;
+            last.ready = false;
+            last.capabilities = CapabilityView::default();
+        }
+        changed
     }
 }
 
@@ -831,6 +916,8 @@ impl ZcodeHub {
                 relay_generation: 0,
                 relay_floor: 0,
                 last_session: None,
+                tracked_sessions: BTreeMap::new(),
+                tracked_order: VecDeque::new(),
             })),
             connect_lock: AsyncMutex::new(()),
             #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
@@ -942,15 +1029,15 @@ impl ZcodeHub {
             inner.device_label = device_label;
             let view = inner.view();
             let stale = if state == ConnectionState::Paired {
-                None
+                Vec::new()
             } else {
-                inner.stale_session(view.generation)
+                inner.stale_sessions(view.generation)
             };
             (view, stale, inner.state_epoch)
         };
         self.emit_connection(&view);
-        if let Some(stale) = stale {
-            self.emit_session(&stale);
+        for stale in &stale {
+            self.emit_session(stale);
         }
         (view, attempt)
     }
@@ -978,12 +1065,12 @@ impl ZcodeHub {
             inner.reason_code = None;
             inner.device_label = device_label;
             let view = inner.view();
-            let stale = inner.stale_session(view.generation);
+            let stale = inner.stale_sessions(view.generation);
             (view, stale, inner.state_epoch)
         };
         self.emit_connection(&view);
-        if let Some(stale) = stale {
-            self.emit_session(&stale);
+        for stale in &stale {
+            self.emit_session(stale);
         }
         Ok((view, attempt))
     }
@@ -1110,11 +1197,11 @@ impl ZcodeHub {
         inner.reason_code = None;
         inner.device_label = None;
         let view = inner.view();
-        let stale = inner.stale_session(view.generation);
+        let stale = inner.stale_sessions(view.generation);
         drop(inner);
         self.emit_connection(&view);
-        if let Some(stale) = stale {
-            self.emit_session(&stale);
+        for stale in &stale {
+            self.emit_session(stale);
         }
         Ok(view)
     }
@@ -1134,12 +1221,12 @@ impl ZcodeHub {
             inner.reason_code = None;
             inner.device_label = None;
             let view = inner.view();
-            let stale = inner.stale_session(view.generation);
+            let stale = inner.stale_sessions(view.generation);
             (view, stale)
         };
         self.emit_connection(&view);
-        if let Some(stale) = stale {
-            self.emit_session(&stale);
+        for stale in &stale {
+            self.emit_session(stale);
         }
         view
     }
@@ -1237,14 +1324,14 @@ impl ZcodeHub {
                 inner.device_label = view.device_label.clone().or(label);
                 let out = inner.view();
                 let stale = if out.state == ConnectionState::Paired {
-                    None
+                    Vec::new()
                 } else {
-                    inner.stale_session(out.generation)
+                    inner.stale_sessions(out.generation)
                 };
                 drop(inner);
                 self.emit_connection(&out);
-                if let Some(stale) = stale {
-                    self.emit_session(&stale);
+                for stale in &stale {
+                    self.emit_session(stale);
                 }
                 Ok(out)
             }
@@ -1274,12 +1361,12 @@ impl ZcodeHub {
             let epoch = inner.generation;
             inner.closing = Some(epoch);
             let view = inner.view();
-            let stale = inner.stale_session(view.generation);
+            let stale = inner.stale_sessions(view.generation);
             (view, stale, epoch)
         };
         self.emit_connection(&view);
-        if let Some(stale) = stale {
-            self.emit_session(&stale);
+        for stale in &stale {
+            self.emit_session(stale);
         }
         (
             view,
@@ -1344,12 +1431,12 @@ impl ZcodeHub {
             // reset 之前到达的旧 relay 状态（含 reset 触发的 offline）一律丢弃。
             inner.relay_floor = inner.relay_generation;
             let view = inner.view();
-            let stale = inner.stale_session(generation);
+            let stale = inner.stale_sessions(generation);
             (view, stale)
         };
         self.emit_connection(&view);
-        if let Some(stale) = stale {
-            self.emit_session(&stale);
+        for stale in &stale {
+            self.emit_session(stale);
         }
         // 锁外清凭据、断 relay、作废旧投影（不在任何锁内 await 网络）。
         self.backend.reset(view.generation).await;
@@ -1384,7 +1471,22 @@ impl ZcodeHub {
         // 本代际仍有效的验收许可（仅 debug 证据构建）。每次 GET 现算：策略或许可
         // 变化（消费/过期/换代）在下一次 `session()` 立即可见——手机按该字段硬门。
         view.capabilities = self.session_capabilities(&view.session_id, generation);
-        self.lock().last_session = Some(view.clone());
+        {
+            let mut inner = self.lock();
+            // 现读在途时代际已变（断开/配置变更）：旧投影绝不贴上新代际，也绝不
+            // 登记为可降级视图（否则旧桥会话会在重连后复活）。
+            if inner.generation != generation {
+                return Err(ZcodeError::of(codes::STALE_GENERATION));
+            }
+            // 同代掉线（relay offline，代际不变）同样不得登记：在途 GET 的结果不能
+            // 把 ready=true 写回一个已离开 paired 的 Hub（按当前连接态报错）。
+            if inner.state != ConnectionState::Paired {
+                return Err(Self::state_error(inner.state));
+            }
+            inner.last_session = Some(view.clone());
+            // 每个成功 GET 的会话都进跟踪表：Data 溢出时逐会话降级（不止最后一个）。
+            inner.track_session(&view);
+        }
         self.emit_session(&view);
         Ok(view)
     }
@@ -1716,12 +1818,12 @@ impl ZcodeHub {
             inner.reason_code = Some(error.code.clone());
             inner.device_label = None;
             let view = inner.view();
-            let stale = inner.stale_session(view.generation);
+            let stale = inner.stale_sessions(view.generation);
             (view, stale)
         };
         self.emit_connection(&view);
-        if let Some(stale) = stale {
-            self.emit_session(&stale);
+        for stale in &stale {
+            self.emit_session(stale);
         }
         error
     }
@@ -1755,6 +1857,10 @@ mod tests {
         execute_calls: AtomicUsize,
         /// 在途 connect 的闸（迟到结果测试用）。
         gate: Mutex<Option<Arc<Notify>>>,
+        /// 在途 `session()` 的闸（GET 在途掉线测试用）。
+        session_gate: Mutex<Option<Arc<Notify>>>,
+        /// `session()` 进入次数（配合闸判断在途）。
+        session_calls: AtomicUsize,
         /// 在途 reset 的闸（配置变更窗口测试用）。
         reset_gate: Mutex<Option<Arc<Notify>>>,
         connect_result: Mutex<Option<ZResult<ConnectionView>>>,
@@ -1860,7 +1966,12 @@ mod tests {
         }
 
         fn session<'a>(&'a self, target: &'a BoundTarget) -> BoxFuture<'a, ZResult<SessionView>> {
+            self.session_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
+                let gate = self.session_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
                 Ok(SessionView {
                     session_id: target.session_id.clone(),
                     generation: target.generation,
@@ -3713,6 +3824,17 @@ mod tests {
         (hub, events, pump, lag)
     }
 
+    /// 触发一次 relay Data 溢出（置位 + 补一帧唤醒泵），等到**本次**桥投影已作废。
+    async fn trigger_relay_lag(events: &mpsc::Sender<RelayEvent>, pump: &FakePump, lag: &RelayLag) {
+        let before = pump.invalidations.load(Ordering::SeqCst);
+        lag.set();
+        events
+            .send(RelayEvent::Data(serde_json::json!({"nudge": 1})))
+            .await
+            .unwrap();
+        wait_until(|| pump.invalidations.load(Ordering::SeqCst) > before).await;
+    }
+
     /// relay `Data` 逐帧进桥；单帧错误只丢该帧，泵继续。
     #[tokio::test]
     async fn relay_data_is_pumped_into_bridge() {
@@ -3882,16 +4004,13 @@ mod tests {
         let key = TargetKey {
             session_id: "sess_lag_stale".into(),
         };
-        // 先 GET 播种 last_session（计数 = 1），并把能力矩阵伪造成全开：lag 必须清回基线。
+        // 真实 GET 播种（跟踪表 + last_session 同时登记）：能力矩阵由 GET 现算
+        //（当前策略 = send_policy，send 开），lag 必须清回基线全关。
         let primed = hub.session(&key).await.expect("首次 GET");
         assert!(primed.ready);
+        assert_eq!(primed.capabilities, send_policy());
         assert_eq!(fake.bind_calls.load(Ordering::SeqCst), 1);
-        {
-            let mut inner = hub.lock();
-            let mut seeded = inner.last_session.clone().expect("GET 已播种 last_session");
-            seeded.capabilities = send_policy();
-            inner.last_session = Some(seeded);
-        }
+        assert_eq!(hub.lock().tracked_sessions.len(), 1, "GET 必须登记跟踪表");
         let generation = hub.connection().generation;
         let mut subscriber = hub.subscribe();
 
@@ -3940,6 +4059,416 @@ mod tests {
                 .ready,
             "last_session 必须写回 ready=false"
         );
+    }
+
+    /// Data 溢出必须让**每个**已跟踪会话失效（不是只通知最后一个），且 GET 能自愈；
+    /// 离开 paired 时清空跟踪表，旧桥会话不得在重连后复活。
+    #[tokio::test]
+    async fn relay_lag_downgrades_every_tracked_session_and_get_recovers() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump, lag) = pumped_with_lag(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+        let generation = hub.connection().generation;
+
+        let key_a = TargetKey {
+            session_id: "sess_lag_a".into(),
+        };
+        let key_b = TargetKey {
+            session_id: "sess_lag_b".into(),
+        };
+        // 两个会话各自 GET：都必须是 ready，并各自登记进跟踪表。
+        assert!(hub.session(&key_a).await.expect("A 首次 GET").ready);
+        assert!(hub.session(&key_b).await.expect("B 首次 GET").ready);
+        {
+            let mut inner = hub.lock();
+            assert_eq!(
+                inner.tracked_sessions.len(),
+                2,
+                "每次成功 GET 都必须登记会话"
+            );
+            // 能力伪造成全开：lag 必须把**每个**会话的能力清回基线（不得沿用旧许可）。
+            for view in inner.tracked_sessions.values_mut() {
+                view.capabilities = send_policy();
+            }
+        }
+        let mut subscriber = hub.subscribe();
+
+        trigger_relay_lag(&events, &pump, &lag).await;
+
+        let mut downgraded = Vec::new();
+        for _ in 0..2 {
+            downgraded.push(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    next_session_event(&mut subscriber),
+                )
+                .await
+                .expect("lag 必须为每个已跟踪会话各发布一条 Session 事件"),
+            );
+        }
+        let order: Vec<&str> = downgraded
+            .iter()
+            .map(|event| {
+                event
+                    .session_id
+                    .as_deref()
+                    .expect("会话事件必须带 sessionId")
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![key_a.session_id.as_str(), key_b.session_id.as_str()],
+            "会话降级事件必须按 sessionId 稳定排序"
+        );
+        for event in &downgraded {
+            assert_eq!(event.generation, generation, "事件代际 = 当前 Hub 代际");
+            assert_eq!(event.data["generation"], generation);
+            assert_eq!(event.data["ready"], false, "每个已跟踪会话都必须显式失效");
+            assert_eq!(
+                event.data["capabilities"],
+                serde_json::to_value(CapabilityView::default()).unwrap(),
+                "失效投影的能力矩阵必须回到基线全关"
+            );
+        }
+        {
+            let inner = hub.lock();
+            assert!(
+                inner.tracked_sessions.values().all(|view| !view.ready),
+                "跟踪表必须就地降级（不是只在事件里装样子）"
+            );
+            assert!(
+                !inner
+                    .last_session
+                    .as_ref()
+                    .expect("降级后仍有 last_session")
+                    .ready,
+                "last_session 必须同步降级"
+            );
+        }
+        // 每个会话恰好一条：不得重复发布降级事件（手机按它一次性重拉）。
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(event) = subscriber.try_recv() {
+            assert_ne!(
+                event.kind,
+                ControlEventKind::Session,
+                "降级不得重复发布（每个会话恰好一条）"
+            );
+        }
+
+        // GET 自愈：重新现读，回到 ready 且能力按当前策略现算（不沿用失效缓存）。
+        let recovered_a = hub.session(&key_a).await.expect("lag 后 A 重新 GET");
+        assert!(recovered_a.ready, "GET 必须自愈回 ready");
+        assert_eq!(recovered_a.generation, generation);
+        assert_eq!(recovered_a.capabilities, send_policy());
+        assert!(hub.session(&key_b).await.expect("lag 后 B 重新 GET").ready);
+        assert!(
+            hub.lock().tracked_sessions.values().all(|view| view.ready),
+            "GET 恢复后跟踪表不得残留失效视图"
+        );
+
+        // 离开 paired（断开）：跟踪表清空，旧桥会话不得在重连后复活。
+        hub.disconnect().await;
+        assert!(hub.lock().tracked_sessions.is_empty(), "断开必须清空跟踪表");
+    }
+
+    /// relay 掉线**不换代**：离开 paired 时同样逐会话广播 ready=false（不只是
+    /// last_session 一条，也不只是 connection 帧），并清空跟踪表。
+    #[tokio::test]
+    async fn relay_offline_notifies_every_tracked_session() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, _pump) = pumped(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert_eq!(hub.connection().state, ConnectionState::Paired);
+        let generation = hub.connection().generation;
+        let key_a = TargetKey {
+            session_id: "sess_offline_a".into(),
+        };
+        let key_b = TargetKey {
+            session_id: "sess_offline_b".into(),
+        };
+        assert!(hub.session(&key_a).await.expect("A GET").ready);
+        assert!(hub.session(&key_b).await.expect("B GET").ready);
+        let mut subscriber = hub.subscribe();
+
+        // relay 掉线（同代）：控制代际不变，只离开 paired。
+        events
+            .send(RelayEvent::State(relay_view(ConnectionState::Offline, 7)))
+            .await
+            .unwrap();
+        wait_until(|| hub.connection().state == ConnectionState::Offline).await;
+        assert_eq!(
+            hub.connection().generation,
+            generation,
+            "relay 掉线不得推进控制代际"
+        );
+
+        let mut downgraded = Vec::new();
+        for _ in 0..2 {
+            downgraded.push(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    next_session_event(&mut subscriber),
+                )
+                .await
+                .expect("掉线必须为每个已跟踪会话广播降级事件"),
+            );
+        }
+        let order: Vec<&str> = downgraded
+            .iter()
+            .map(|event| event.session_id.as_deref().expect("会话事件必带 sessionId"))
+            .collect();
+        assert_eq!(
+            order,
+            vec![key_a.session_id.as_str(), key_b.session_id.as_str()],
+            "逐会话降级必须按 sessionId 稳定排序"
+        );
+        for event in &downgraded {
+            assert_eq!(
+                event.generation, generation,
+                "掉线不换代：沿用当前 Hub 代际"
+            );
+            assert_eq!(event.data["ready"], false);
+            assert_eq!(
+                event.data["capabilities"],
+                serde_json::to_value(CapabilityView::default()).unwrap()
+            );
+        }
+        {
+            let inner = hub.lock();
+            assert!(
+                inner.tracked_sessions.is_empty(),
+                "离开 paired 必须清空跟踪表"
+            );
+            assert!(inner.tracked_order.is_empty(), "登记序也必须同步清空");
+        }
+        // 无第三条（每个会话恰好一条）。
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(event) = subscriber.try_recv() {
+            assert_ne!(event.kind, ControlEventKind::Session, "不得重复广播");
+        }
+    }
+
+    /// 同代掉线（不换代）时在途 GET 绝不能把 ready=true 登记回 Hub：末段锁内要求
+    /// 仍是 paired，否则按当前连接态报错且零登记（跟踪表 / last_session 都不写）。
+    #[tokio::test]
+    async fn session_get_in_flight_offline_is_rejected_without_registration() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, _pump) = pumped(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        let generation = hub.connection().generation;
+
+        let gate = Arc::new(Notify::new());
+        fake.session_gate.lock().unwrap().replace(gate.clone());
+        let key = TargetKey {
+            session_id: "sess_inflight_offline".into(),
+        };
+        let for_task = hub.clone();
+        let handle = tokio::spawn(async move { for_task.session(&key).await });
+        wait_until(|| fake.session_calls.load(Ordering::SeqCst) == 1).await;
+
+        // relay 同代掉线：控制代际不变，GET 仍在途。
+        events
+            .send(RelayEvent::State(relay_view(ConnectionState::Offline, 7)))
+            .await
+            .unwrap();
+        wait_until(|| hub.connection().state == ConnectionState::Offline).await;
+        assert_eq!(hub.connection().generation, generation);
+
+        gate.notify_one();
+        let error = handle.await.expect("GET 任务不得 panic").unwrap_err();
+        assert!(
+            error.is(codes::OFFLINE),
+            "掉线后完成 GET 必须报当前连接态，而不是登记 ready=true"
+        );
+        let inner = hub.lock();
+        assert!(inner.tracked_sessions.is_empty(), "掉线后不得登记跟踪视图");
+        assert!(inner.tracked_order.is_empty(), "掉线后不得登记跟踪序");
+        assert!(inner.last_session.is_none(), "不得写回 last_session");
+    }
+
+    /// 登记 cap+1 个会话：故意让**登记序与字典序相反**（先登记的 `z_first` 字典序
+    /// 最大），用于证明淘汰按最后登记序（LRU）而不是按 key 排序。
+    async fn overfill_tracked_sessions(hub: &ZcodeHub) {
+        let first = TargetKey {
+            session_id: "z_first".into(),
+        };
+        assert!(hub.session(&first).await.expect("首次 GET 应成功").ready);
+        for index in 0..TRACKED_SESSION_CAP {
+            let key = TargetKey {
+                session_id: format!("a_{index:03}"),
+            };
+            assert!(hub.session(&key).await.expect("GET 应成功").ready);
+        }
+    }
+
+    /// 跟踪表有界且按**最后登记序**淘汰（LRU）：最久未登记的会话先出局，与字典序无关；
+    /// 已登记会话再次 GET = 最近登记（移到队尾，不扩容、不淘汰）。
+    #[tokio::test]
+    async fn tracked_sessions_evict_least_recently_tracked() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, _events, _pump, _lag) = pumped_with_lag(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+
+        overfill_tracked_sessions(&hub).await;
+
+        let newest = format!("a_{:03}", TRACKED_SESSION_CAP - 1);
+        {
+            let inner = hub.lock();
+            assert_eq!(
+                inner.tracked_sessions.len(),
+                TRACKED_SESSION_CAP,
+                "跟踪表不得超过上限"
+            );
+            assert_eq!(
+                inner.tracked_order.len(),
+                TRACKED_SESSION_CAP,
+                "登记序与跟踪表长度必须一致"
+            );
+            assert!(
+                !inner.tracked_sessions.contains_key("z_first"),
+                "超限必须淘汰最久未登记的会话（LRU），而不是字典序最小的 key"
+            );
+            assert!(
+                inner.tracked_sessions.contains_key("a_000"),
+                "字典序最小的会话不是淘汰对象"
+            );
+            assert_eq!(
+                inner.tracked_order.front().map(String::as_str),
+                Some("a_000"),
+                "队首 = 当前最久未登记的会话"
+            );
+            assert_eq!(
+                inner.tracked_order.back().map(String::as_str),
+                Some(newest.as_str()),
+                "队尾 = 最近登记的会话"
+            );
+        }
+
+        // 已登记会话再次 GET = 最近登记：只改登记序，不扩容、不淘汰。
+        let refreshed = TargetKey {
+            session_id: "a_000".into(),
+        };
+        assert!(
+            hub.session(&refreshed)
+                .await
+                .expect("重复 GET 应成功")
+                .ready
+        );
+        let inner = hub.lock();
+        assert_eq!(
+            inner.tracked_sessions.len(),
+            TRACKED_SESSION_CAP,
+            "重复登记不得扩容"
+        );
+        assert_eq!(
+            inner.tracked_order.back().map(String::as_str),
+            Some("a_000"),
+            "再次 GET 必须把会话移到登记序队尾"
+        );
+        assert_eq!(
+            inner.tracked_order.front().map(String::as_str),
+            Some("a_001"),
+            "次久未登记的会话成为新队首"
+        );
+    }
+
+    /// 第二次 Data 溢出：跟踪表非空但已全部降级 → 不得重复发 Session 事件（防刷）。
+    #[tokio::test]
+    async fn second_relay_lag_does_not_republish_downgraded_sessions() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump, lag) = pumped_with_lag(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        for session_id in ["sess_lag_a", "sess_lag_b"] {
+            let key = TargetKey {
+                session_id: session_id.into(),
+            };
+            assert!(hub.session(&key).await.expect("GET 应成功").ready);
+        }
+        let mut subscriber = hub.subscribe();
+
+        trigger_relay_lag(&events, &pump, &lag).await;
+        for _ in 0..2 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                next_session_event(&mut subscriber),
+            )
+            .await
+            .expect("首轮 lag 必须逐会话降级");
+        }
+
+        // 第二次溢出：桥投影仍作废，但全部会话已 `ready=false` → 零 Session 事件。
+        trigger_relay_lag(&events, &pump, &lag).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(event) = subscriber.try_recv() {
+            assert_ne!(
+                event.kind,
+                ControlEventKind::Session,
+                "已全部降级时不得重复广播（防刷新风暴）"
+            );
+        }
+    }
+
+    /// 有界代价（不是假阳性）：被 LRU 淘汰的会话不再收到 lag 降级事件；它的下一次
+    /// GET 会重新登记并现读——跟踪表只服务最后登记的 32 个会话。
+    #[tokio::test]
+    async fn evicted_session_is_not_notified_by_lag() {
+        let fake = Arc::new(FakeBackend::default());
+        let (hub, events, pump, lag) = pumped_with_lag(stored(URL), fake.clone(), send_policy());
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        overfill_tracked_sessions(&hub).await;
+        let mut subscriber = hub.subscribe();
+
+        trigger_relay_lag(&events, &pump, &lag).await;
+
+        // 恰好跟踪表内每个会话一条，被淘汰的 `z_first` 不在其中。
+        for _ in 0..TRACKED_SESSION_CAP {
+            let event = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                next_session_event(&mut subscriber),
+            )
+            .await
+            .expect("每个跟踪会话各一条降级事件");
+            assert_ne!(
+                event.session_id.as_deref(),
+                Some("z_first"),
+                "被 LRU 淘汰的会话不得收到 lag 事件（有界代价，下一次 GET 会重新登记）"
+            );
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        while let Ok(event) = subscriber.try_recv() {
+            assert_ne!(
+                event.kind,
+                ControlEventKind::Session,
+                "只发跟踪表内的会话（不得补发第 33 条）"
+            );
+        }
     }
 
     /// relay `KICKED` → Hub `conflict` 终态：推进代际、作废桥/投影、旧动作零执行。

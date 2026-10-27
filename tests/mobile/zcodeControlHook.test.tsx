@@ -680,6 +680,128 @@ describe("useZcodeControl：SSE 纠偏（不重放动作）", () => {
     expect(postedActions()).toHaveLength(0);
   });
 
+  it("stale_session_frame_refreshes_once_per_generation", async () => {
+    // Data 溢出后 Hub 把每个已跟踪会话降级为 ready=false 并广播 Session 帧：
+    // 手机必须**自己重拉一次 GET** 重新绑定/现读（否则页面永远停在失效投影），
+    // 但同一代次的重复降级帧绝不能再触发 GET（防刷新循环）。
+    let serverReady = true;
+    let revision = 12;
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(sessionView({ ready: serverReady, revision }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { result } = renderHook(() => useZcodeControl(SID));
+    await flush();
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    expect(result.current.session?.ready).toBe(true);
+    expect(sessionGets()).toBe(1);
+
+    const emitSession = async (overrides: Partial<SessionView>) => {
+      await act(async () => {
+        MockEventSource.latest().emit("session", {
+          seq: 1,
+          generation: 3,
+          sessionId: SID,
+          kind: "session",
+          data: sessionView(overrides),
+        });
+        await Promise.resolve();
+      });
+      await flush();
+    };
+
+    // 同代 ready=false（lag 降级）：恰好补一发会话 GET 自愈。
+    serverReady = false;
+    revision = 30;
+    await emitSession({ ready: false, revision: 30 });
+    expect(result.current.session?.ready).toBe(false);
+    expect(sessionGets()).toBe(2);
+
+    // 同一代次重复降级（多帧/别的设备触发）：不得再发 GET（无刷新风暴）。
+    await emitSession({ ready: false, revision: 30 });
+    await emitSession({ ready: false, revision: 30 });
+    expect(sessionGets()).toBe(2);
+
+    // 自愈 GET 落地 ready=true 即重置守卫（不依赖额外的 ready=true SSE 帧）。
+    serverReady = true;
+    revision = 31;
+    await act(async () => {
+      await result.current.refresh();
+    });
+    await flush();
+    expect(result.current.session?.ready).toBe(true);
+    expect(sessionGets()).toBe(3);
+
+    // 恢复后同代次再次失效：守卫已由 GET 落地重置 → 仍会自愈一次（GET 4）。
+    serverReady = false;
+    revision = 32;
+    await emitSession({ ready: false, revision: 32 });
+    expect(sessionGets()).toBe(4);
+
+    // 本次 GET 仍返回失效投影：守卫保持，同代重复 false 不再刷新。
+    await emitSession({ ready: false, revision: 32 });
+    expect(sessionGets()).toBe(4);
+  });
+
+  it("stale_snapshot_refreshes_once_and_session_switch_clears_guard", async () => {
+    // snapshot（首帧/重连基线）里的 ready=false 与 Session 帧同规：一次性自愈；
+    // 换会话必须清空守卫，否则新会话同代次的降级帧会被旧守卫吞掉。
+    const SID2 = "sess_0000000000000000000000000000000b";
+    // 自愈 GET 仍返回失效投影（守卫保持）——若 GET 已恢复 ready=true，守卫会随之解除，
+    // 下一次 ready=false 属于「新的失效」，本来就该再刷一次（由上一个用例覆盖）。
+    let serverReady = true;
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        const sid = url.includes(SID2) ? SID2 : SID;
+        return json(sessionView({ sessionId: sid, ready: serverReady }));
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const { rerender } = renderHook(({ sid }: { sid: string }) => useZcodeControl(sid), {
+      initialProps: { sid: SID },
+    });
+    await flush();
+    const sessionGets = () =>
+      calledUrls().filter((url) => url.startsWith(`${ZCODE_SESSION_PATH}?`)).length;
+    expect(sessionGets()).toBe(1);
+
+    const emitSnapshot = async (sid: string, overrides: Partial<SessionView>) => {
+      await act(async () => {
+        MockEventSource.latest().emit("snapshot", {
+          connection: connection(),
+          session: sessionView({ sessionId: sid, ...overrides }),
+        });
+        await Promise.resolve();
+      });
+      await flush();
+    };
+
+    // 重连基线带同代 ready=false：恰好一发 GET（自愈 GET 仍返回失效投影，守卫保持）。
+    serverReady = false;
+    await emitSnapshot(SID, { ready: false, revision: 40 });
+    expect(sessionGets()).toBe(2);
+    // 同代重复快照：不再发 GET。
+    await emitSnapshot(SID, { ready: false, revision: 40 });
+    expect(sessionGets()).toBe(2);
+
+    // 切会话：首拍 GET 后守卫清空；新会话**同代次**（gen 3）的降级帧必须能刷新。
+    rerender({ sid: SID2 });
+    await flush();
+    expect(sessionGets()).toBe(3);
+    await emitSnapshot(SID2, { ready: false, revision: 41 });
+    expect(sessionGets()).toBe(4);
+    await emitSnapshot(SID2, { ready: false, revision: 41 });
+    expect(sessionGets()).toBe(4);
+    expect(postedActions()).toHaveLength(0);
+  });
+
   it("same_generation_paired_event_refreshes_failed_session", async () => {
     // 手机先开：首拍连接 needs_auth（gen 3），会话 GET 失败 → session=null。
     // 桌面端随后配对成功，Hub 发同代（gen 3）connection 帧：代次没变也不能漏掉
