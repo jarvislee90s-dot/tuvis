@@ -1111,7 +1111,10 @@ impl ZcodeHub {
                             auto_notify.notify_one();
                             let store = store.clone();
                             tokio::task::spawn_blocking(move || {
-                                let _ = persist_auto_connect(&store, false);
+                                if persist_auto_connect(&store, false).is_err() {
+                                    // 只报失联事实：不打印 JWT/链接等任何凭据或目标。
+                                    log::warn!("ZCode KICKED：持久化自动暂停意图失败");
+                                }
                             });
                         }
                         if effects.dropped_from_paired {
@@ -1730,7 +1733,10 @@ impl ZcodeHub {
                 if out.state == ConnectionState::Conflict {
                     // KICKED 也可能作为本次 connect 的结果直接落定：同样持久暂停自动
                     // 连接；普通掉线/显式断开绝不动用户意图。
-                    let _ = persist_auto_connect(&self.store, false);
+                    if persist_auto_connect(&self.store, false).is_err() {
+                        // 只报失联事实：不打印 JWT/链接等任何凭据或目标。
+                        log::warn!("ZCode KICKED：持久化自动暂停意图失败");
+                    }
                 }
                 Ok(out)
             }

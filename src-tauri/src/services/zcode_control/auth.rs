@@ -471,12 +471,20 @@ impl AuthService {
     /// - 读取问题（锁定/不可用/损坏/超限）如实报 `problem`，绝不自动打开浏览器。
     pub async fn restore(&self) -> AuthStatus {
         // 1) 已有当前代有效内存 JWT：直接返回，不读 OS。
+        //
+        // 返回前必须收尾 `restoring`：并发恢复可能在早退前把标记置位（上一轮恢复
+        // 尚未返回时，新一轮授权已把有效 JWT 落内存），否则状态轮询会永久显示「恢复中」。
         let expired_memory_epoch = {
-            let state = self.lock_state();
+            let mut state = self.lock_state();
+            let memory_jwt_current = match (state.jwt.as_deref(), state.jwt_epoch) {
+                (Some(jwt), Some(_)) => !jwt_is_expired(jwt, now_secs()),
+                _ => false,
+            };
+            if memory_jwt_current {
+                state.restoring = false;
+                return status_snapshot(&state);
+            }
             match (state.jwt.as_deref(), state.jwt_epoch) {
-                (Some(jwt), Some(_)) if !jwt_is_expired(jwt, now_secs()) => {
-                    return status_snapshot(&state);
-                }
                 (Some(_), Some(epoch)) => Some(epoch),
                 _ => None,
             }
@@ -518,6 +526,11 @@ impl AuthService {
         let expired_delete_epoch = {
             let mut state = self.lock_state();
             if state.epoch != epoch || state.jwt.is_some() {
+                // 同代已有 JWT（并发授权先落内存）→ 本次恢复让位，但必须收尾自己置位的
+                // `restoring`；epoch 已变则代表别的路径已接管状态，不碰任何字段。
+                if state.epoch == epoch && state.jwt.is_some() {
+                    state.restoring = false;
+                }
                 return status_snapshot(&state);
             }
             state.restoring = false;
@@ -2302,6 +2315,30 @@ mod tests {
         assert!(status.remembered);
         assert_eq!(status.provider, Some(OAuthProvider::Bigmodel));
         assert_eq!(store.load_count(), 0, "已有有效内存 JWT 不得读存储");
+    }
+
+    /// 回归：已有有效内存 JWT 的早退路径必须收尾 `restoring`（旧实现会永久卡在 true）。
+    ///
+    /// 合成「上一轮恢复已置位 restoring + 当前代有效 JWT 已落内存」：调用 restore 时
+    /// 走第一个早退分支，必须清标记并保持 authorized；旧代码直接返回快照，
+    /// `restoring` 仍为 true，本用例即失败。
+    #[tokio::test]
+    async fn restore_clears_stale_restoring_when_memory_jwt_is_current() {
+        let auth = AuthService::new(test_client());
+        {
+            let mut state = auth.lock_state();
+            state.epoch = 7;
+            state.jwt = Some(valid_jwt());
+            state.jwt_epoch = Some(7);
+            state.provider = Some(OAuthProvider::Bigmodel);
+            state.restoring = true;
+        }
+
+        let status = auth.restore().await;
+        assert!(status.authorized, "有效内存 JWT 必须保持授权");
+        assert!(!status.restoring, "restore 早退必须收尾 restoring");
+        assert_eq!(status.provider, Some(OAuthProvider::Bigmodel));
+        assert_eq!(auth.status(), status);
     }
 
     /// 过期持久记录：删除并报 expired，不自动打开浏览器。

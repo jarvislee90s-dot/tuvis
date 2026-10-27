@@ -930,8 +930,8 @@ ack-only 或新鲜快照确认。`model` / `thoughtLevel` 由 §8.7 补全为 tr
    换/删链接只断连接、保留账号（不重新 OAuth）；删除失败（`delete_failed`）与保存
    失败（`storage_failed`）如实上报，不假报已删除/已记住。
 5. **JWT 边界**：仅系统保险箱 + `AuthService` 受控内存；不写 settings/SQLite/文件，
-   不进日志/错误文本/IPC/手机响应；手机只读 `AuthStatus`（authorized/remembered/
-   restoring/provider/problem），**永远不拿 JWT 或 terminal token**。本地回环 HTML
+   不进日志/错误文本/IPC/手机响应；`AuthStatus` 仅桌面 IPC，手机只读既有
+   `ConnectionView`，**永远不拿 JWT 或 terminal token**。本地回环 HTML
    与设置页也不展示 JWT；探针证据只见别名与掩码。
 6. **合同夹具同步**：`tests/fixtures/zcode-official-bridge/contract.json` 的
    `auth.credentialPersistence` 同批注明「旧探针仅内存 / 本批生产采用 A」，并保留

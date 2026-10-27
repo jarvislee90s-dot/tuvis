@@ -1,7 +1,7 @@
 # ZCode 凭据复用验收报告（H3）
 
 - 分支：`codex/zcode-unified-remote`
-- 验收入口 HEAD：`997c515b`（H2 复审修整；H3 只改测试与文档，生产代码零改动）
+- 验收代码基线：`328c9395`（H3 收口；终审小修随后）
 - 验收平台：macOS 27.0.1 (26A434) arm64（开发机）
 - 工具链：rustc 1.97.1 / cargo 1.97.1 / Node v26.8.1 / pnpm 11.23.0
 - 范围：C1–C4 凭据持久化与自动恢复、H1/H2 生命周期加固之后的**真实组件假链**验收、自动化门禁与平台边界申报
@@ -91,7 +91,7 @@ RED 证据：测试写完后，临时在 `AuthService::restore` 顶部插入 `re
 | Windows Credential Manager（2,560 字节边界、当前用户、删除映射） | 保存/读取/删除与错误映射符合 C1；重启恢复 | 未构建（无 Windows 主机） | 未执行 | `—` | 是 | 是 | `not_run` |
 | Linux Secret Service（DBus 可用 / 服务缺失 / 锁定） | vendored 构建成功；保存/读取/删除与错误映射符合 C1 | 未构建 | 未执行 | `—` | 是 | 是 | `not_run` |
 | 真实链接失效 / 官方 401 / 撤销 | 删除记录并回「需要重新授权」；网络错误不删除 | 未执行 | 未执行 | `—` | 是 | 是 | `not_run` |
-| 两台已配对手机同时读取授权状态 | 手机只读 `AuthStatus`，无 JWT / terminal token | 未执行 | 未执行 | `—` | 是 | 是 | `not_run` |
+| 两台已配对手机同时读取授权状态 | 手机只读既有 `ConnectionView`（无 AuthStatus 接口），无 JWT / terminal token | 未执行 | 未执行 | `—` | 是 | 是 | `not_run` |
 
 ## 五、偏差与说明
 
