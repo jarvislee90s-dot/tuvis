@@ -6,7 +6,10 @@
 //   同一个 Hub `config_changed()`；失败原样回错，且不触碰旧连接（旧 JWT/relay 不动）；
 // - `zcode_control_authorize/connect/disconnect/status` 只回 `ConnectionView`，
 //   绝不返回凭据；授权只在用户显式点击时经 Rust 调 opener 打开系统浏览器，
-//   启动路径零 OAuth、零连接（Hub 构造本身也不自动授权/连接）；
+//   本命令面自身零 OAuth；启动路径的「恢复已保存授权 + 自动连接」由 `lib.rs`
+//   的非阻塞接线完成（Hub 构造本身仍零授权/零连接）；
+// - `zcode_control_auth_status` 只读 `AuthStatus`（不读保险箱、不触网）；
+//   `zcode_control_forget_authorization` 清内存/持久记录但**保留设备链接**；
 // - 错误统一映射 `ZCODE_CONTROL:<冻结码>`（errcode.rs 约定）；官方上游原文一律丢弃，
 //   不拼进错误串（`ZcodeError` 本身只携带冻结码）。
 //
@@ -21,8 +24,8 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::errcode::ZCODE_CONTROL_PREFIX;
 use crate::services::zcode_control::{
-    codes, get_config, set_config, ConnectionView, OAuthProvider, OpenAuthorize, ZResult,
-    ZcodeError, ZcodeHub, ZcodeRemoteConfig,
+    codes, get_config, set_config, AuthStatus, ConnectionView, OAuthProvider, OpenAuthorize,
+    ZResult, ZcodeError, ZcodeHub, ZcodeRemoteConfig,
 };
 
 /// 读取本机 ZCode 官方远控链接配置（读取即复验：历史坏值 → Invalid/url null）。
@@ -63,6 +66,9 @@ async fn config_set_with(
     let saved = persist()?;
     if let Some(hub) = hub {
         hub.config_changed().await;
+        // 链接更新后唤醒同一 Hub 的自动连接 worker：每次现查 remote.enabled /
+        // auto 意图 / 链接；auto=false 或远程关闭时 worker 自会 no-op。
+        hub.wake_auto_connect();
     }
     Ok(saved)
 }
@@ -84,7 +90,8 @@ pub async fn zcode_control_authorize(
     authorize_with(&state, &provider, system_browser_opener()).await
 }
 
-/// 建立唯一物理连接（同 Hub 的并发调用幂等复用；`conflict` 终态不自动重试）。
+/// 建立唯一物理连接：内部走用户意图入口（持久 auto=true、必要时恢复授权，
+/// 绝不自动 OAuth）。同 Hub 的并发调用幂等复用；`conflict` 终态不自动重试。
 #[tauri::command]
 pub async fn zcode_control_connect(
     state: State<'_, Arc<ZcodeHub>>,
@@ -92,12 +99,27 @@ pub async fn zcode_control_connect(
     connect_with(&state).await
 }
 
-/// 用户显式断开（保留本机内存 JWT，可再次连接）。
+/// 用户显式断开：内部走用户意图入口（持久 auto=false，失败如实回错）；
+/// 保留本机内存 JWT，可再次连接。
 #[tauri::command]
 pub async fn zcode_control_disconnect(
     state: State<'_, Arc<ZcodeHub>>,
 ) -> Result<ConnectionView, String> {
-    Ok(disconnect_with(&state).await)
+    disconnect_with(&state).await
+}
+
+/// 只读授权状态（不含 JWT；只读内存快照，不读保险箱、不触网）。
+#[tauri::command]
+pub fn zcode_control_auth_status(state: State<'_, Arc<ZcodeHub>>) -> Result<AuthStatus, String> {
+    Ok(auth_status_with(&state))
+}
+
+/// 忘记授权：清内存并删除系统存储记录，**保留设备链接**；删除失败如实回错。
+#[tauri::command]
+pub async fn zcode_control_forget_authorization(
+    state: State<'_, Arc<ZcodeHub>>,
+) -> Result<ConnectionView, String> {
+    forget_with(&state).await
 }
 
 /// 只读连接状态（不含凭据/URL；桌面与手机看到同一个 Hub 视图）。
@@ -163,15 +185,23 @@ async fn authorize_with(
 }
 
 async fn connect_with(hub: &ZcodeHub) -> Result<ConnectionView, String> {
-    hub.connect().await.map_err(ipc_error)
+    hub.connect_requested().await.map_err(ipc_error)
 }
 
-async fn disconnect_with(hub: &ZcodeHub) -> ConnectionView {
-    hub.disconnect().await
+async fn disconnect_with(hub: &ZcodeHub) -> Result<ConnectionView, String> {
+    hub.disconnect_requested().await.map_err(ipc_error)
 }
 
 fn status_with(hub: &ZcodeHub) -> ConnectionView {
     hub.connection()
+}
+
+fn auth_status_with(hub: &ZcodeHub) -> AuthStatus {
+    hub.auth_status()
+}
+
+async fn forget_with(hub: &ZcodeHub) -> Result<ConnectionView, String> {
+    hub.forget_authorization().await.map_err(ipc_error)
 }
 
 #[cfg(test)]
@@ -195,6 +225,10 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         authorize_calls: AtomicUsize,
+        connect_calls: AtomicUsize,
+        disconnect_calls: AtomicUsize,
+        restore_calls: AtomicUsize,
+        forget_calls: AtomicUsize,
         reset_calls: AtomicUsize,
         reset_generations: Mutex<Vec<u64>>,
         /// 授权路径的真实状态：authorize 置 true，forget 置 false；
@@ -211,6 +245,31 @@ mod tests {
         }
     }
 
+    /// 读 Hub 自己那份 settings 里的自动连接意图（缺键 = None，不是 false）。
+    fn auto_intent(hub: &ZcodeHub) -> Option<String> {
+        hub.auto_connect_store()
+            .with(|conn| {
+                crate::database::dao::settings::try_get_setting_conn(
+                    conn,
+                    "remote.zcode_auto_connect",
+                )
+            })
+            .unwrap()
+    }
+
+    /// 有界等待 worker 真正跑到第 N 次尝试（异步信号，不用固定 sleep）。
+    async fn wait_for_auto_attempt(hub: &ZcodeHub, at_least: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while hub.auto_attempt_count() < at_least {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "自动连接 worker 未在 2s 内被唤醒：{} < {at_least}",
+                hub.auto_attempt_count()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     impl HubBackend for FakeBackend {
         fn authorize<'a>(
             &'a self,
@@ -223,6 +282,7 @@ mod tests {
         }
 
         fn restore_authorization<'a>(&'a self) -> BoxFuture<'a, AuthStatus> {
+            self.restore_calls.fetch_add(1, Ordering::SeqCst);
             let status = self.status();
             Box::pin(async move { status })
         }
@@ -232,12 +292,14 @@ mod tests {
         }
 
         fn forget_authorization<'a>(&'a self) -> BoxFuture<'a, AuthStatus> {
+            self.forget_calls.fetch_add(1, Ordering::SeqCst);
             self.authorized.store(false, Ordering::SeqCst);
             let status = self.status();
             Box::pin(async move { status })
         }
 
         fn connect<'a>(&'a self, _route: DeviceRoute) -> BoxFuture<'a, ZResult<ConnectionView>> {
+            self.connect_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Ok(ConnectionView {
                     state: ConnectionState::Paired,
@@ -249,6 +311,7 @@ mod tests {
         }
 
         fn disconnect<'a>(&'a self) -> BoxFuture<'a, ()> {
+            self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
         }
 
@@ -445,5 +508,131 @@ mod tests {
             .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["deviceLabel", "generation", "reasonCode", "state"]);
+    }
+
+    /// C4：connect 命令内部转 `connect_requested`——先持久 auto=true（失败不连接），
+    /// 未授权先恢复一次（绝不自动 OAuth），成功后走原 connect。
+    #[tokio::test]
+    async fn connect_routes_through_requested_intent() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = hub_with(&fake, URL);
+        hub.auto_connect_store()
+            .with(|conn| {
+                crate::database::dao::settings::try_set_setting_conn(
+                    conn,
+                    "remote.zcode_auto_connect",
+                    "false",
+                )
+            })
+            .unwrap();
+
+        let error = connect_with(&hub).await.unwrap_err();
+        assert_eq!(error, "ZCODE_CONTROL:needs_auth");
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            1,
+            "未授权先恢复一次"
+        );
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 0, "无授权不连接");
+        assert_eq!(
+            auto_intent(&hub).as_deref(),
+            Some("true"),
+            "显式连接必须持久 auto=true"
+        );
+
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        let view = connect_with(&hub).await.unwrap();
+        assert_eq!(view.state, ConnectionState::Paired);
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.authorize_calls.load(Ordering::SeqCst),
+            1,
+            "连接路径绝不自动 OAuth"
+        );
+    }
+
+    /// C4：disconnect 命令内部转 `disconnect_requested`——持久 auto=false，保留 JWT。
+    #[tokio::test]
+    async fn disconnect_routes_through_requested_intent() {
+        let fake = Arc::new(FakeBackend::default());
+        let hub = hub_with(&fake, URL);
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .unwrap();
+        hub.connect().await.unwrap();
+        assert_eq!(auto_intent(&hub).as_deref(), Some("true"));
+
+        let view = disconnect_with(&hub).await.unwrap();
+        assert_eq!(view.state, ConnectionState::Offline);
+        assert_eq!(
+            auto_intent(&hub).as_deref(),
+            Some("false"),
+            "显式断开必须持久 auto=false"
+        );
+        assert!(hub.auth_status().authorized, "断开保留本机 JWT");
+    }
+
+    /// C4：auth_status 只读（零 restore/connect）；forget 走持久删除、保留链接。
+    #[tokio::test]
+    async fn auth_status_is_read_only_and_forget_keeps_link() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.authorized.store(true, Ordering::SeqCst);
+        let hub = hub_with(&fake, URL);
+
+        let status = auth_status_with(&hub);
+        assert!(status.authorized);
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            0,
+            "auth_status 只读，不得读保险箱"
+        );
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.authorize_calls.load(Ordering::SeqCst), 0);
+
+        let view = forget_with(&hub).await.unwrap();
+        assert_eq!(view.state, ConnectionState::NeedsAuth);
+        assert!(!auth_status_with(&hub).authorized);
+        assert_eq!(fake.forget_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.restore_calls.load(Ordering::SeqCst),
+            0,
+            "forget 不读保险箱"
+        );
+        assert_eq!(
+            hub.connection().state,
+            ConnectionState::NeedsAuth,
+            "忘记授权必须保留链接（needs_auth 而非 needs_config）"
+        );
+    }
+
+    /// C4：配置保存成功 → `config_changed` 后唤醒同一 Hub 的自动连接 worker
+    /// （远程未启用时 worker 现查 gate 后 no-op，绝不连接）。
+    #[tokio::test]
+    async fn config_set_success_wakes_auto_connect_worker() {
+        let fake = Arc::new(FakeBackend::default());
+        let store = stored(URL);
+        let hub = Arc::new(ZcodeHub::with_parts(
+            store.clone(),
+            fake.clone(),
+            CapabilityView::default(),
+        ));
+        hub.start_auto_connect();
+        wait_for_auto_attempt(&hub, 1).await;
+
+        let saved = config_set_with(
+            || store.with(|conn| persist_config(conn, URL_NEXT)),
+            Some(hub.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.url.as_deref(), Some(URL_NEXT));
+        wait_for_auto_attempt(&hub, 2).await;
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            0,
+            "远程未启用：唤醒只能让 worker 现查后放弃"
+        );
     }
 }

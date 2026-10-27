@@ -207,10 +207,15 @@ pub fn run() {
             // 构造零授权、零连接、零浏览器：状态按保存链接 = needs_config/needs_auth。
             let zcode_hub =
                 tauri::async_runtime::block_on(async { crate::remote::install_zcode_hub() });
-            app.manage(zcode_hub);
+            // 桌面 IPC 与远程 STATE 共用同一 Arc（manage 只克隆，原个留给启动任务）。
+            app.manage(zcode_hub.clone());
             // M2 远程接入：按设置恢复远程服务器（开机自启语义；内部用
             // tauri::async_runtime，无 runtime 上下文的主线程可安全调用）
             crate::remote::restore_on_launch();
+            // C4：启动恢复接线（非阻塞）。先读系统存储恢复已保存授权，再启动同一 Hub
+            // 的自动连接 worker；绝不在 Tauri 主线程等待保险箱/浏览器。Hub 未配置或
+            // 远程未启用时 worker 现查前置条件后 no-op（零连接）。
+            crate::remote::start_zcode_auto_connect_after_restore(zcode_hub);
             commands::autostart::initialize_on_first_launch(app.handle());
             // 用量账本：应用启动采集一次（按需路径，绝不进 3 秒轮询）
             crate::services::usage::collect::spawn_initial_collection();
@@ -422,13 +427,14 @@ pub fn run() {
         // 手机只经配对门内 GET /m/api/v1/official-control 读取，无写接口
         commands::zcode_remote::zcode_remote_config_get,
         commands::zcode_remote::zcode_remote_config_set,
-        // ZCode 统一控制（T7.1 C2a）：桌面入口只回 ConnectionView，绝不回凭据。
-        // `manage(Arc<ZcodeHub>)`（与 RemoteState 共用同一 Arc）在 C2b 装配；
-        // 在此之前控制命令由 Tauri 报「state not managed」，config_set 照常保存。
+        // ZCode 统一控制（T7.1 C2a / C4）：桌面入口只回 ConnectionView/AuthStatus，
+        // 绝不回凭据；同一 Arc 已在上方 manage（与 RemoteState 共用）。
         commands::zcode_remote::zcode_control_authorize,
         commands::zcode_remote::zcode_control_connect,
         commands::zcode_remote::zcode_control_disconnect,
         commands::zcode_remote::zcode_control_status,
+        commands::zcode_remote::zcode_control_auth_status,
+        commands::zcode_remote::zcode_control_forget_authorization,
         // T8.2 仅 debug 证据构建：桌面发放单次验收许可（普通构建不编入本命令，
         // generate_handler 对条目上的 cfg 属性生效；手机侧无对应 HTTP 入口）。
         #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]

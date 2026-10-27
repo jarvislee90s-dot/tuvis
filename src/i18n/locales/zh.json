@@ -559,7 +559,18 @@
         "reasonOffline": "与官方的连接已离线，请检查网络后重试",
         "reasonConflict": "该账号已被另一台设备接管，请先处理冲突再重连",
         "reasonUnknown": "控制暂时不可用，请稍后重试",
-        "authorizeNote": "授权会在系统浏览器打开官方页面；兔维斯 不询问也不保存你的密码，更不会把凭据交给手机"
+        "authorizeNote": "授权会在系统浏览器打开官方页面；兔维斯 不询问也不保存你的密码，更不会把凭据交给手机",
+        "authLabel": "授权状态",
+        "authRestoring": "正在恢复授权",
+        "authRemembered": "已记住授权",
+        "authAuthorizedOffline": "已授权，未连接",
+        "authNotRemembered": "本次授权可用，但未记住",
+        "authNeedsAuth": "需要重新授权",
+        "authStorageUnavailable": "存储不可访问",
+        "authStorageFailed": "存储失败",
+        "authRecordInvalid": "记录无效或过大",
+        "forget": "忘记授权",
+        "forgetNote": "忘记授权只删除本机记住的账号；远控链接保留，可重新授权后再连接"
       }
     },
     "audit": {

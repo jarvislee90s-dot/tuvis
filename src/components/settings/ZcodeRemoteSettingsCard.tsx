@@ -27,8 +27,12 @@ import { SETTINGS_FIELD, SETTINGS_HINT, SETTINGS_NOTE } from "@/components/setti
 import { useAppTranslation } from "@/hooks/use-app-translation";
 import { formatInvokeError } from "@/lib/invokeError";
 import {
+  forgetZcodeAuthorization,
+  getZcodeAuthStatus,
   getZcodeRemoteConfig,
+  isZcodeAuthProblem,
   setZcodeRemoteConfig,
+  type ZcodeAuthStatus,
   type ZcodeRemoteConfig,
 } from "@/lib/api/zcodeRemote";
 // 连接 DTO 唯一定义处（`src/lib/api/zcodeControl.ts`，与 Rust golden JSON 对拍）：
@@ -73,6 +77,83 @@ function parseConnection(raw: unknown): ConnectionView | null {
     reasonCode: typeof view.reasonCode === "string" ? view.reasonCode : null,
     deviceLabel: typeof view.deviceLabel === "string" ? view.deviceLabel : null,
   };
+}
+
+// C4 授权状态：严格解析 `AuthStatus`（camelCase）。任何字段形态不符/词表外 problem
+// → null（= 未知），绝不猜成已记住或需要授权；AuthStatus 本身不含 JWT。
+function parseAuthStatus(raw: unknown): ZcodeAuthStatus | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (
+    typeof value.authorized !== "boolean" ||
+    typeof value.remembered !== "boolean" ||
+    typeof value.restoring !== "boolean"
+  ) {
+    return null;
+  }
+  if (value.problem !== null && value.problem !== undefined && !isZcodeAuthProblem(value.problem)) {
+    return null;
+  }
+  const provider =
+    value.provider === "bigmodel" || value.provider === "zai" ? value.provider : null;
+  if (value.provider !== null && value.provider !== undefined && provider === null) {
+    return null;
+  }
+  return {
+    authorized: value.authorized,
+    remembered: value.remembered,
+    restoring: value.restoring,
+    provider,
+    problem: value.problem === null || value.problem === undefined ? null : value.problem,
+  };
+}
+
+type AuthPresentation =
+  | "restoring"
+  | "remembered"
+  | "authorizedOffline"
+  | "notRemembered"
+  | "needsAuth"
+  | "storageUnavailable"
+  | "storageFailed"
+  | "recordInvalid";
+
+// 授权状态 → 本地化键。优先级：恢复中 > 失效/存储问题 > 已记住 > 已授权未连接；
+// 未授权且无 problem 一律不显示（不猜）。`storage_failed` 在本次仍可用时如实说
+// 「本次授权可用，但未记住」，绝不冒充 remember 成功。
+const AUTH_LABEL_KEYS: Record<AuthPresentation, string> = {
+  restoring: "settings.remote.zcode.authRestoring",
+  remembered: "settings.remote.zcode.authRemembered",
+  authorizedOffline: "settings.remote.zcode.authAuthorizedOffline",
+  notRemembered: "settings.remote.zcode.authNotRemembered",
+  needsAuth: "settings.remote.zcode.authNeedsAuth",
+  storageUnavailable: "settings.remote.zcode.authStorageUnavailable",
+  storageFailed: "settings.remote.zcode.authStorageFailed",
+  recordInvalid: "settings.remote.zcode.authRecordInvalid",
+};
+
+function authPresentation(status: ZcodeAuthStatus | null): AuthPresentation | null {
+  if (status === null) return null;
+  if (status.restoring) return "restoring";
+  switch (status.problem) {
+    case "expired":
+    case "revoked":
+      return "needsAuth";
+    case "locked_or_denied":
+    case "unavailable":
+      return "storageUnavailable";
+    case "storage_failed":
+    case "delete_failed":
+      return status.authorized ? "notRemembered" : "storageFailed";
+    case "invalid_record":
+    case "too_large":
+      return "recordInvalid";
+    default:
+      break;
+  }
+  if (status.authorized && status.remembered) return "remembered";
+  if (status.authorized) return "authorizedOffline";
+  return null;
 }
 
 // 连接态 → 本地化键（每态一句，绝不靠「是否有链接」推导配对）
@@ -124,20 +205,23 @@ export function ZcodeRemoteSettingsCard({
   const [provider, setProvider] = useState<ProviderId>(PROVIDER_BIGMODEL);
   // 真实连接态（null = 首拍未到/读取失败 = **未知**，不是 needs_auth 也不是 paired）
   const [connection, setConnection] = useState<ConnectionView | null>(null);
+  // 真实授权状态（null = 首拍未到/读取失败 = **未知**；只读内存快照，不含 JWT）
+  const [auth, setAuth] = useState<ZcodeAuthStatus | null>(null);
   // 授权/连接/断开进行中（同一时刻只允许一个控制动作）
-  const [controlBusy, setControlBusy] = useState<"authorize" | "connect" | "disconnect" | null>(
-    null
-  );
+  const [controlBusy, setControlBusy] = useState<
+    "authorize" | "connect" | "disconnect" | "forget" | null
+  >(null);
   // 控制动作失败的就地错误（已本地化；不弹 toast 重复播报）
   const [controlError, setControlError] = useState<string | null>(null);
   /** status 读取在途守卫 + trailing 合并：在途期间的新请求只排一次，读完后补一发。 */
   const statusReadInFlightRef = useRef(false);
   const statusReadQueuedRef = useRef(false);
 
-  // 连接态唯一来源 = 后端 `zcode_control_status`（同 Hub 视图，桌面与手机一致）。
-  // 链接已保存**从不**被推导成已配对；读取失败按「未知」显示，不猜。
-  // 只写 connection：绝不碰 config / draft / saving / error（草稿与保存面不受轮询影响）。
-  const refreshConnection = useCallback(async () => {
+  // 连接态 + 授权态唯一来源 = 后端 `zcode_control_status` / `zcode_control_auth_status`
+  // （同 Hub 视图，桌面与手机一致）。两者**并行**读取；链接已保存**从不**被推导成
+  // 已配对/已授权，读取失败按「未知」显示，不猜。
+  // 只写 connection/auth：绝不碰 config / draft / saving / error（草稿与保存面不受轮询影响）。
+  const refreshStatuses = useCallback(async () => {
     if (statusReadInFlightRef.current) {
       // 在途：不能丢调用——persist 保存成功后的强制刷新、runControl 失败后的权威
       // 重读都必须落地。合并成一次 queued，当前读取结束后补一发（不叠发 IPC）。
@@ -149,12 +233,24 @@ export function ZcodeRemoteSettingsCard({
       do {
         // 进入本轮即消费 queued：读取期间再来的请求会重新置 true，从而最多再补一轮。
         statusReadQueuedRef.current = false;
-        try {
-          setConnection(parseConnection(await invoke<unknown>("zcode_control_status")));
-        } catch (e) {
-          console.error("zcode control status read failed:", e);
-          setConnection(null);
-        }
+        const [connectionResult, authResult] = await Promise.all([
+          invoke<unknown>("zcode_control_status").then(
+            (value) => ({ ok: true as const, value }),
+            (error: unknown) => {
+              console.error("zcode control status read failed:", error);
+              return { ok: false as const };
+            }
+          ),
+          getZcodeAuthStatus().then(
+            (value) => ({ ok: true as const, value }),
+            (error: unknown) => {
+              console.error("zcode auth status read failed:", error);
+              return { ok: false as const };
+            }
+          ),
+        ]);
+        setConnection(connectionResult.ok ? parseConnection(connectionResult.value) : null);
+        setAuth(authResult.ok ? parseAuthStatus(authResult.value) : null);
       } while (statusReadQueuedRef.current);
     } finally {
       statusReadInFlightRef.current = false;
@@ -163,14 +259,14 @@ export function ZcodeRemoteSettingsCard({
   }, []);
 
   useEffect(() => {
-    void refreshConnection();
-  }, [refreshConnection]);
+    void refreshStatuses();
+  }, [refreshStatuses]);
 
   // 挂载期间轮询 + 回到前台立即刷新：连接态由 Hub/手机侧异步推进，卡片不能只认首拍
   // （否则卡片文案与「重连」按钮可用性会一直冻在旧态）。卸载清理定时器与监听。
   useEffect(() => {
     const read = () => {
-      void refreshConnection();
+      void refreshStatuses();
     };
     const timer = window.setInterval(read, statusPollMs);
     const onFocus = () => read();
@@ -184,16 +280,18 @@ export function ZcodeRemoteSettingsCard({
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [refreshConnection, statusPollMs]);
+  }, [refreshStatuses, statusPollMs]);
 
   const providerVerified = provider === PROVIDER_BIGMODEL || ZAI_LIVE_VERIFIED;
   const connectionState: ConnectionState = connection?.state ?? "unknown";
+  const authView = authPresentation(auth);
+  const canForget = auth !== null && (auth.authorized || auth.remembered);
   const busy = saving || controlBusy !== null;
 
   // 授权 / 连接 / 断开：只走 IPC，参数里没有 URL/token（凭据只在本机 Rust 内存里）；
   // 回执按四字段白名单消费。失败就地报错并照实重读后端状态。
   const runControl = useCallback(
-    async (action: "authorize" | "connect" | "disconnect") => {
+    async (action: "authorize" | "connect" | "disconnect" | "forget") => {
       if (action === "authorize" && !providerVerified) return;
       setControlBusy(action);
       setControlError(null);
@@ -203,16 +301,21 @@ export function ZcodeRemoteSettingsCard({
             ? await invoke<unknown>("zcode_control_authorize", { provider })
             : action === "connect"
               ? await invoke<unknown>("zcode_control_connect")
-              : await invoke<unknown>("zcode_control_disconnect");
+              : action === "disconnect"
+                ? await invoke<unknown>("zcode_control_disconnect")
+                : await forgetZcodeAuthorization();
         setConnection(parseConnection(raw));
+        // 授权成功**不**手动再调 connect（C3 worker 自动连接）；连接/断开/忘记之后
+        // 并行刷新连接与授权（忘记要立刻清掉「已记住」，链接由配置面保留）。
+        await refreshStatuses();
       } catch (e) {
         setControlError(formatInvokeError(e, t));
-        await refreshConnection();
+        await refreshStatuses();
       } finally {
         setControlBusy(null);
       }
     },
-    [provider, providerVerified, refreshConnection, t]
+    [provider, providerVerified, refreshStatuses, t]
   );
 
   // 挂载读一次（只读 settings，不触网、不探测连接——§4.3 的「读取即复验」在服务端）
@@ -269,7 +372,7 @@ export function ZcodeRemoteSettingsCard({
         setDraft(next.url ?? "");
         // 保存成功只**刷新**后端连接态：改链接会让 Hub 推进代际并断旧连接，
         // 新态由后端说了算——不在这里凭「Saved」自证任何联机状态。
-        await refreshConnection();
+        await refreshStatuses();
         toast.success(
           next.configState === "missing"
             ? t("settings.remote.zcode.deletedToast")
@@ -282,7 +385,7 @@ export function ZcodeRemoteSettingsCard({
         setSaving(false);
       }
     },
-    [refreshConnection, t]
+    [refreshStatuses, t]
   );
 
   // 复制 = 已保存值（草稿没保存出去就不该出现在剪贴板里）；无已存值时钮本就更disabled
@@ -482,6 +585,17 @@ export function ZcodeRemoteSettingsCard({
               >
                 {t("settings.remote.zcode.disconnect")}
               </Button>
+              {/* C4：忘记授权 = 清本机记住的账号（链接保留）；只在确有授权时可用 */}
+              <Button
+                size="sm"
+                variant="outline"
+                data-testid="zcode-forget"
+                aria-busy={controlBusy === "forget"}
+                disabled={busy || !canForget}
+                onClick={() => void runControl("forget")}
+              >
+                {t("settings.remote.zcode.forget")}
+              </Button>
             </div>
 
             {/* 真实连接态：唯一权威 = 后端 status；已保存链接不参与判定 */}
@@ -512,6 +626,20 @@ export function ZcodeRemoteSettingsCard({
                   : t("errors.zcodeControl")}
               </p>
             )}
+            {/* C4 授权状态（只读内存快照；null = 未知，不显示、不猜） */}
+            {authView !== null && (
+              <div className="flex flex-wrap items-baseline gap-x-2">
+                <span className={SETTINGS_HINT}>{t("settings.remote.zcode.authLabel")}</span>
+                <span
+                  data-testid="zcode-auth-state"
+                  data-auth-state={authView}
+                  aria-live="polite"
+                  className={SETTINGS_FIELD}
+                >
+                  {t(AUTH_LABEL_KEYS[authView])}
+                </span>
+              </div>
+            )}
             {controlError !== null && (
               <p
                 data-testid="zcode-control-error"
@@ -522,6 +650,7 @@ export function ZcodeRemoteSettingsCard({
               </p>
             )}
             <p className={SETTINGS_NOTE}>{t("settings.remote.zcode.authorizeNote")}</p>
+            <p className={SETTINGS_NOTE}>{t("settings.remote.zcode.forgetNote")}</p>
           </div>
 
           {/* 获取教程：显式动作才展开；应用内取链四步，不承诺自动登录／网页引导／固定有效期 */}
