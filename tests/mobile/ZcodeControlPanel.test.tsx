@@ -1374,7 +1374,7 @@ function localeText(bundle: unknown, path: string): string | undefined {
 
 describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
   it("all_reason_codes_have_zh_en_copy", () => {
-    // 冻结码表（19 码）每一码都必须映射到 zh/en 都存在的文案键（键集 = 码集）。
+    // 冻结码表（20 码）每一码都必须映射到 zh/en 都存在的文案键（键集 = 码集）。
     expect(Object.keys(ZCODE_REASON_KEYS).sort()).toEqual([...ZCODE_ERROR_CODES].sort());
     for (const code of ZCODE_ERROR_CODES) {
       const key = ZCODE_REASON_KEYS[code];
@@ -1399,6 +1399,39 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
       // 英文侧不得混入中文，否则英文界面会漏出中文原因
       expect(enText, `en copy contains chinese for ${code}`).not.toMatch(/[\u4e00-\u9fff]/);
     }
+  });
+
+  it("unsupported_reason_code_shows_dedicated_copy_not_neutral_fallback", async () => {
+    // 冻结码 `unsupported`（Rust codes::UNSUPPORTED）= 能力被静态知识/账本明确判死：
+    // **永久**不支持。就地原因必须是专文案（对齐手册示例「暂不支持该操作」），
+    // 不得落入中性兜底「控制暂时不可用，请稍后重试」——那会让用户对一个永不开放
+    // 的能力空等重试。en 侧同码同专文案（词表守卫不在码内 → 兜底，两侧都不许）。
+    expect(localeText(zhLocale, "mobile.zcodeControl.reasonUnsupported")).toBe("暂不支持该操作");
+    expect(localeText(enLocale, "mobile.zcodeControl.reasonUnsupported")).toBe(
+      "This action is not supported yet"
+    );
+
+    const caps = capabilities();
+    caps.singleSelect = { enabled: false, reasonCode: "unsupported" };
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            capabilities: caps,
+            pending: [pendingView({ questions: [questionView()] })],
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const reason = await screen.findByTestId("zcode-pending-reason");
+    expect(reason.getAttribute("data-reason-code")).toBe("unsupported");
+    // 专文案如实呈现；中性兜底一句话都不出现
+    expect(reason.textContent).toBe("暂不支持该操作");
+    expect(reason.textContent).not.toContain("暂时不可用");
   });
 
   it("en_panel_has_no_hardcoded_chinese", async () => {
