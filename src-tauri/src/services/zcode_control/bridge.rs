@@ -41,6 +41,7 @@ use base64::Engine as _;
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 
+use super::capability::state::ZcodeInterfaceEvidence;
 use super::codec::{
     crc32_hex, decode_channel, encode_ack, encode_call, encode_frame, encode_listen,
     ChannelMessage, FrameAssembler, RpcIdentity, RESPONSE_TYPE_EVENT_FIRE,
@@ -289,6 +290,8 @@ struct Inner {
     schema_known: bool,
     /// hello 校验到的 v4 wire 协议版本（未握手 = `None`）。
     protocol_version: Option<u32>,
+    /// 本代际接口形状证据（T3 桥观察采集；invalidate 清空）。
+    interface: ZcodeInterfaceEvidence,
 }
 
 impl Default for Inner {
@@ -305,7 +308,210 @@ impl Default for Inner {
             hello_known: false,
             schema_known: false,
             protocol_version: None,
+            interface: ZcodeInterfaceEvidence::default(),
         }
+    }
+}
+
+/// 接口形状采集（T3；spec R3「静默接口解析」）：把真实 hello / 会话帧 / 选择目录
+/// 流量里的**方法存在性与形状布尔**喂给 [`ZcodeInterfaceEvidence`]。
+///
+/// 采集纪律：
+/// - 全部只读、零 I/O、幂等 OR 置位（只见过的形状不因后续帧消失而回退）；
+/// - 输入 JSON 的题干、选项、答案、命令、JWT、链接等正文**只用于形状判定**，
+///   绝不落任何字段——本类型 12 个字段全是 bool，正文无处可存；
+/// - 观察挂在「已过 topic/subscriptionId 闸的本代际真实下行帧」上（会话帧在
+///   [`apply_frame`] 进入投影前观察；hello 在 kind/协议/connectionId 校验通过后
+///   观察；目录在 [`parse_selection_view`] 解析成功后观察）。
+///
+/// 方法实现放 bridge 侧（控制者裁决允许）：wire 形状（hello 方法表、logical frame
+/// 的 snapshot/deltas 包装、getView 目录）是桥的领域知识，`capability/` 纯核保持
+/// 零 serde_json 依赖。
+impl ZcodeInterfaceEvidence {
+    /// hello 方法表存在性：`method_send` / `method_resolve_interaction` /
+    /// `method_stop` / `method_selection_get` / `method_selection_switch`。
+    ///
+    /// - hello 应答带显式方法表（`methods`：方法名数组或方法描述对象）→ 按成员
+    ///   判定（缺席方法保持 false，绝不猜测）；
+    /// - 无显式方法表 → 只对**已校验的 v4/3 协议面**背书五条控制方法（v3 合同
+    ///   钉源 + 实机探针取证；函数自含协议位核对，保证只对 v4 背书）。
+    pub(crate) fn observe_hello(&mut self, body: &Value) {
+        let Some(object) = body.as_object() else {
+            return;
+        };
+        if let Some(table) = object.get("methods") {
+            let has = |name: &str| match table {
+                Value::Array(items) => items.iter().any(|item| item.as_str() == Some(name)),
+                Value::Object(map) => map.contains_key(name),
+                _ => false,
+            };
+            self.method_send = has(super::command::AGENT_SEND_COMMAND_METHOD);
+            self.method_resolve_interaction = has(super::command::RESOLVE_INTERACTION_TYPE);
+            self.method_stop = has(super::command::STOP_TYPE);
+            self.method_selection_get = has(MODEL_SELECTION_GET_VIEW_METHOD);
+            self.method_selection_switch = has(super::selection::SWITCH_MODEL_CONFIG_TYPE);
+            return;
+        }
+        if object.get("protocolVersion").and_then(Value::as_u64) == Some(V4_WIRE_PROTOCOL_VERSION) {
+            self.method_send = true;
+            self.method_resolve_interaction = true;
+            self.method_stop = true;
+            self.method_selection_get = true;
+            self.method_selection_switch = true;
+        }
+    }
+
+    /// conversation logical frame（`{topic,subscriptionId,fromSeq,toSeq,payload}`）：
+    /// `payload.kind = snapshot`（整体）或 `deltas`（`state.updated` 键级整体替换）。
+    pub(crate) fn observe_conversation_frame(&mut self, frame: &Value) {
+        let Some(payload) = frame.get("payload") else {
+            return;
+        };
+        match payload.get("kind").and_then(Value::as_str) {
+            Some("snapshot") => {
+                if let Some(snapshot) = payload.get("snapshot") {
+                    self.observe_state_object(snapshot);
+                }
+            }
+            Some("deltas") => {
+                for delta in payload
+                    .get("deltas")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if delta.get("op").and_then(Value::as_str) == Some("state.updated") {
+                        if let Some(patch) = delta.get("patch") {
+                            self.observe_state_object(patch);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 单张 pending 卡：`has_user_input_pending` / `has_permission_pending` /
+    /// `has_multi_select` / `has_free_text`。
+    ///
+    /// 接受两种形状：wire 卡（`kind` 顶层、形状在 `payload` 包装内）与平铺形
+    /// （`kind`/`questions` 同层；`kind` 记 `user_input`，与 wire 记法 `userInput`
+    /// 同义）。自由作答形状 = `payload.freeText: true`（与 `pending.rs` 的
+    /// `free_text_allowed` 同源）**或**任一题 `isOther: true`。
+    ///
+    /// 入参泛型 [`std::borrow::Borrow`]：直接喂 `Value`（独立观察）或 `&Value`
+    /// （帧遍历路径，零克隆）皆可。
+    pub(crate) fn observe_pending<B: std::borrow::Borrow<Value>>(&mut self, card: B) {
+        let card = card.borrow();
+        let Some(object) = card.as_object() else {
+            return;
+        };
+        let payload = object.get("payload").and_then(Value::as_object);
+        let kind = object.get("kind").and_then(Value::as_str).or_else(|| {
+            payload
+                .and_then(|shape| shape.get("kind"))
+                .and_then(Value::as_str)
+        });
+        let shape = payload.unwrap_or(object);
+        match kind {
+            Some("userInput") | Some("user_input") => {
+                self.has_user_input_pending = true;
+                for question in shape
+                    .get("questions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if question.get("multiSelect").and_then(Value::as_bool) == Some(true) {
+                        self.has_multi_select = true;
+                    }
+                    if question.get("isOther").and_then(Value::as_bool) == Some(true) {
+                        self.has_free_text = true;
+                    }
+                }
+                if shape.get("freeText").and_then(Value::as_bool) == Some(true) {
+                    self.has_free_text = true;
+                }
+            }
+            Some("permission") => self.has_permission_pending = true,
+            _ => {}
+        }
+    }
+
+    /// `model-selection.getView` 组装载荷（`SelectionPort::load` 在
+    /// [`parse_selection_view`] 成功后喂入）：`has_model_catalog` /
+    /// `has_thought_levels`。
+    ///
+    /// 只认**当前会话 provider**（`config.provider` 由 load 从会话视图合成）的
+    /// 目录条目；其他账号 provider 的模型/档位绝不背书（与解析层的过滤纪律一致）。
+    pub(crate) fn observe_selection_catalog(&mut self, raw: &Value) {
+        let Some(object) = raw.as_object() else {
+            return;
+        };
+        let Some(provider) = object
+            .get("config")
+            .and_then(|config| config.get("provider"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        for entry in object
+            .get("providers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if entry.get("providerId").and_then(Value::as_str) != Some(provider) {
+                continue;
+            }
+            let Some(models) = entry.get("models").and_then(Value::as_array) else {
+                continue;
+            };
+            if !models.is_empty() {
+                self.has_model_catalog = true;
+            }
+            for model in models {
+                let levels = model
+                    .get("config")
+                    .and_then(|config| config.get("optionSpecs"))
+                    .and_then(|specs| specs.get("reasoningLevel"))
+                    .and_then(|spec| spec.get("values"))
+                    .and_then(Value::as_array);
+                if levels.is_some_and(|levels| !levels.is_empty()) {
+                    self.has_thought_levels = true;
+                }
+            }
+        }
+    }
+
+    /// snapshot / `state.updated` patch 的共用形状面（`control` /
+    /// `pendingInteractions` / `config`）。
+    fn observe_state_object(&mut self, object: &Value) {
+        if let Some(control) = object.get("control") {
+            self.has_active_work |= control
+                .get("activeWorks")
+                .and_then(Value::as_array)
+                .is_some_and(|works| !works.is_empty());
+        }
+        for card in object
+            .get("pendingInteractions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            self.observe_pending(card);
+        }
+        if let Some(config) = object.get("config") {
+            self.has_thought_levels |= config
+                .get("thoughtLevels")
+                .and_then(Value::as_array)
+                .is_some_and(|levels| !levels.is_empty());
+        }
+    }
+
+    /// 全清（断连/换代 invalidate；语义 = 回到「什么都未见」）。
+    pub(crate) fn invalidate(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -788,6 +994,7 @@ impl BridgeManager {
             protocol_version: inner.protocol_version,
             schema_known: inner.schema_known,
             hello_known: inner.hello_known,
+            interface: inner.interface,
         }
     }
 
@@ -905,10 +1112,12 @@ impl BridgeManager {
             inner.sessions.clear();
             inner.workspaces = None;
             inner.app_waiters.clear();
-            // 证据只属本代际：换代后握手/schema 事实全部作废（未重新取证 = 未知）。
+            // 证据只属本代际：换代后握手/schema 事实全部作废（未重新取证 = 未知），
+            // 接口形状证据一并全清（未重新观察 = 全未见）。
             inner.hello_known = false;
             inner.schema_known = false;
             inner.protocol_version = None;
+            inner.interface.invalidate();
             releases
         };
         for release in releases {
@@ -1547,6 +1756,11 @@ impl SelectionPort for BridgeManager {
                 object.insert("config".to_owned(), config);
             }
             let selection = parse_selection_view(&raw)?;
+            // T3：目录解析成功即采集目录/档位形状（只认当前 provider；失败不观察）。
+            {
+                let mut inner = lock(&self.shared.state);
+                inner.interface.observe_selection_catalog(&raw);
+            }
             Ok((view, selection))
         })
     }
@@ -2194,6 +2408,8 @@ impl Shared {
                     inner.hello_known = true;
                     inner.protocol_version =
                         Some(u32::try_from(protocol_version).map_err(|_| unsupported())?);
+                    // T3：hello 校验通过即采集方法存在性（显式方法表或 v4 协议面）。
+                    inner.interface.observe_hello(&hello.body);
                 }
             }
             let client_hello = Value::Object(
@@ -2262,10 +2478,12 @@ impl Shared {
             }
         };
         let mut inner = lock(&self.state);
-        let applied = inner
-            .sessions
-            .get_mut(&target.session_id)
-            .is_some_and(|entry| activate_and_flush(entry, &subscription));
+        // 先落到 &mut Inner 再拆字段借用（MutexGuard 的 DerefMut 不能拆字段）。
+        let state = &mut *inner;
+        let applied = match state.sessions.get_mut(&target.session_id) {
+            Some(entry) => activate_and_flush(entry, &subscription, &mut state.interface),
+            None => false,
+        };
         if applied {
             inner.schema_known = true;
         }
@@ -2443,22 +2661,25 @@ impl Shared {
             Ok(subscription) => {
                 let mut inner = lock(&self.state);
                 let mut still_unready = false;
-                let applied = inner
-                    .sessions
-                    .get_mut(&target.session_id)
-                    .is_some_and(|entry| {
-                        let applied = activate_and_flush(entry, &subscription);
+                // 先落到 &mut Inner 再拆字段借用（MutexGuard 的 DerefMut 不能拆字段）。
+                let state = &mut *inner;
+                let applied = match state.sessions.get_mut(&target.session_id) {
+                    Some(entry) => {
+                        let applied =
+                            activate_and_flush(entry, &subscription, &mut state.interface);
                         if entry.projection.is_ready() {
                             entry.resync_attempts = 0;
                             entry.last_resync_at = None;
                             entry.needs_resync = false;
                         } else {
                             // 新订阅也没能建立新鲜投影（例如快照仍是坏分片）：
-                            // 本次读不得把「重订阅成功」当成就绪。
+                            // 本次读不得把「重订阅成功」当就绪。
                             still_unready = true;
                         }
                         applied
-                    });
+                    }
+                    None => false,
+                };
                 if applied {
                     inner.schema_known = true;
                 }
@@ -2961,7 +3182,7 @@ impl Inner {
                     mark_session_unready(entry);
                     return;
                 }
-                applied = stage_or_apply(entry, frame, subscription);
+                applied = stage_or_apply(entry, frame, subscription, &mut self.interface);
             }
             Some("fragment") => {
                 let budget = entry.staged_budget;
@@ -2973,7 +3194,7 @@ impl Inner {
                     FragmentOutcome::Complete(frame) => {
                         entry.stats.fragments_reassembled =
                             entry.stats.fragments_reassembled.saturating_add(1);
-                        applied = stage_or_apply(entry, frame, subscription);
+                        applied = stage_or_apply(entry, frame, subscription, &mut self.interface);
                     }
                     FragmentOutcome::Fault => {
                         entry.fragments.clear();
@@ -3074,7 +3295,12 @@ fn insert_task_row(cache: &mut WorkspaceCache, row: TaskRow) {
 /// ACK 前暂存 / 已激活直通（应用级分片重组成功后也走这里）。
 ///
 /// 返回 `true` = 本帧已进入投影（schema 解析成功）；暂存/异订阅不产生证据。
-fn stage_or_apply(entry: &mut SessionEntry, frame: Value, subscription: String) -> bool {
+fn stage_or_apply(
+    entry: &mut SessionEntry,
+    frame: Value,
+    subscription: String,
+    interface: &mut ZcodeInterfaceEvidence,
+) -> bool {
     match entry.projection.subscription_id().map(str::to_owned) {
         None => {
             let frame_bytes = serde_json::to_vec(&frame).map(|bytes| bytes.len());
@@ -3101,7 +3327,7 @@ fn stage_or_apply(entry: &mut SessionEntry, frame: Value, subscription: String) 
             });
             false
         }
-        Some(bound) if bound == subscription => apply_frame(entry, frame),
+        Some(bound) if bound == subscription => apply_frame(entry, frame, interface),
         // 旧 subscriptionId（换代/重订阅后迟到）：零应用。
         Some(_) => false,
     }
@@ -3110,7 +3336,11 @@ fn stage_or_apply(entry: &mut SessionEntry, frame: Value, subscription: String) 
 /// ACK 到达后的本地 barrier 放行：只交付匹配 subscriptionId 的暂存帧。
 ///
 /// 返回 `true` = 至少一帧 schema 解析成功并进入投影（供宿主证据置位）。
-fn activate_and_flush(entry: &mut SessionEntry, subscription: &str) -> bool {
+fn activate_and_flush(
+    entry: &mut SessionEntry,
+    subscription: &str,
+    interface: &mut ZcodeInterfaceEvidence,
+) -> bool {
     entry.projection.activate(subscription);
     let staged = std::mem::take(&mut entry.staged);
     entry.staged_bytes = 0;
@@ -3119,7 +3349,7 @@ fn activate_and_flush(entry: &mut SessionEntry, subscription: &str) -> bool {
         if item.subscription_id != subscription {
             continue;
         }
-        if apply_frame(entry, item.frame) {
+        if apply_frame(entry, item.frame, interface) {
             entry.stats.staged_delivered = entry.stats.staged_delivered.saturating_add(1);
             applied = true;
         }
@@ -3128,7 +3358,15 @@ fn activate_and_flush(entry: &mut SessionEntry, subscription: &str) -> bool {
 }
 
 /// 应用一帧；缺口/未知 schema 时标记重同步（stale/异会话只丢弃）。
-fn apply_frame(entry: &mut SessionEntry, frame: Value) -> bool {
+fn apply_frame(
+    entry: &mut SessionEntry,
+    frame: Value,
+    interface: &mut ZcodeInterfaceEvidence,
+) -> bool {
+    // T3：形状观察在投影应用前做——帧已过 topic/subscriptionId 闸，属本代际
+    // 订阅上的真实下行流量；观察是幂等 OR 的存在性记录（宿主宣告过的形状不因
+    // 本帧应用成败回退），且避免为观察克隆整帧。
+    interface.observe_conversation_frame(&frame);
     match entry
         .projection
         .apply(entry.target.bridge_generation(), frame)
@@ -4658,6 +4896,260 @@ mod tests {
         let evidence = manager.host_evidence();
         assert!(evidence.hello_known, "hello 本身已通过校验");
         assert!(!evidence.schema_known, "坏快照不得冒充 schema 已识别");
+    }
+
+    // =======================================================================
+    // T3：接口形状采集（observe 只存形状布尔；invalidate 全清）
+    // =======================================================================
+
+    /// brief Step 1 逐字用例：pending 形状（multiSelect / isOther）→ 形状位。
+    #[test]
+    fn pending_shape_records_multi_and_free_text() {
+        let mut ev = ZcodeInterfaceEvidence::default();
+        ev.observe_pending(json!({
+            "kind": "user_input",
+            "questions": [{ "multiSelect": true, "isOther": true }]
+        }));
+        assert!(ev.has_user_input_pending);
+        assert!(ev.has_multi_select);
+        assert!(ev.has_free_text);
+    }
+
+    /// brief Step 1 逐字用例：invalidate 把形状位全部清空。
+    #[test]
+    fn invalidate_clears_interface_evidence() {
+        let mut ev = ZcodeInterfaceEvidence::default();
+        ev.method_send = true;
+        ev.has_active_work = true;
+        ev.invalidate();
+        assert!(!ev.method_send);
+        assert!(!ev.has_active_work);
+    }
+
+    /// 含真实感正文（题干/选项/命令/答案）的样本过 observe 后**只有形状位**变化：
+    /// 与全量布尔面逐字段相等——本类型 12 个字段全是 bool，相等断言即证明
+    /// 正文（题目、选项、命令、答案）无处可存（spec R3「只记录存在性与形状」）。
+    #[test]
+    fn observed_evidence_stays_shape_only_and_never_stores_content() {
+        let mut ev = ZcodeInterfaceEvidence::default();
+        // wire 卡形（kind 顶层 + payload 包装）携带机密正文：只允许点亮形状位。
+        ev.observe_pending(json!({
+            "interactionId": "pi-secret-1",
+            "kind": "userInput",
+            "payload": {
+                "kind": "userInput",
+                "prompt": "机密题干：请选择部署区域？",
+                "freeText": true,
+                "questions": [{
+                    "question": "机密题干：请选择部署区域？",
+                    "header": "Region",
+                    "multiSelect": true,
+                    "options": [{"value": "secret-option", "label": "机密选项"}]
+                }],
+                "options": [{"optionId": "allowOnce", "label": "机密审批项"}]
+            }
+        }));
+        // snapshot 帧（logical frame 包装）携带机密命令与档位：同样只点亮形状位。
+        ev.observe_conversation_frame(&json!({
+            "topic": "conversation/sess_x",
+            "subscriptionId": "sub-1",
+            "fromSeq": 0u64,
+            "toSeq": 1u64,
+            "payload": {
+                "kind": "snapshot",
+                "snapshot": {
+                    "control": {"activeWorks": [
+                        {"kind": "primaryTurn", "foregroundExecutionId": "E-1", "command": "secret-cmd"}
+                    ]},
+                    "pendingInteractions": [],
+                    "config": {
+                        "provider": "secret-provider",
+                        "model": "secret-model",
+                        "thoughtLevels": ["secret-level"]
+                    }
+                }
+            }
+        }));
+        assert_eq!(
+            ev,
+            ZcodeInterfaceEvidence {
+                has_user_input_pending: true,
+                has_multi_select: true,
+                has_free_text: true,
+                has_active_work: true,
+                has_thought_levels: true,
+                ..ZcodeInterfaceEvidence::default()
+            },
+            "证据必须只有形状位差异，正文字段不存在（12 个 bool 逐字段比对）"
+        );
+    }
+
+    /// hello 方法存在性：显式方法表按成员判定；无表时只对已校验的 v4 协议面
+    /// 背书（hello 校验通过才会走到 observe）；未知协议不背书。
+    #[test]
+    fn hello_records_method_existence() {
+        // 显式方法表：成员判定，缺席方法保持 false。
+        let mut ev = ZcodeInterfaceEvidence::default();
+        ev.observe_hello(&json!({
+            "kind": "hello",
+            "protocolVersion": 3u64,
+            "methods": ["sendConversationCommandV4", "resolveInteraction", "stop"]
+        }));
+        assert!(ev.method_send);
+        assert!(ev.method_resolve_interaction);
+        assert!(ev.method_stop);
+        assert!(!ev.method_selection_get);
+        assert!(!ev.method_selection_switch);
+
+        // 无显式方法表：v4/3 协议面本身携带五条控制方法（合同钉源 + 实机探针）。
+        let mut ev = ZcodeInterfaceEvidence::default();
+        ev.observe_hello(&json!({
+            "kind": "hello",
+            "protocolVersion": 3u64,
+            "connectionId": "synthetic-connection-0001"
+        }));
+        assert!(ev.method_send);
+        assert!(ev.method_resolve_interaction);
+        assert!(ev.method_stop);
+        assert!(ev.method_selection_get);
+        assert!(ev.method_selection_switch);
+
+        // 非 v4 协议（未取证面）不得背书任何方法。
+        let mut ev = ZcodeInterfaceEvidence::default();
+        ev.observe_hello(&json!({"kind": "hello", "protocolVersion": 2u64}));
+        assert!(!ev.method_send);
+        assert!(!ev.method_resolve_interaction);
+        assert!(!ev.method_stop);
+        assert!(!ev.method_selection_get);
+        assert!(!ev.method_selection_switch);
+    }
+
+    /// 桥级端到端：握手（v4 协议面方法位）+ 快照（问答卡/审批卡/扁平档位）+
+    /// control 增量（activeWorks）+ 选择目录（getView）→ 形状位逐步置位；
+    /// 换代（invalidate）全清。
+    #[tokio::test]
+    async fn bridge_collects_interface_evidence_and_invalidate_clears_it() {
+        const PROVIDER: &str = "synthetic-provider";
+        const SUB: &str = "conv-sub-synthetic-1";
+        let mut snapshot = conversation_snapshot(
+            SESSION_A,
+            2,
+            vec![
+                ask_user_question_card("pi-single"),
+                multi_select_card("pi-multi"),
+                mixed_free_text_card("pi-free"),
+                permission_card("pi-permission"),
+            ],
+        );
+        snapshot["config"] = json!({
+            "provider": PROVIDER,
+            "model": "synthetic-model-a",
+            "thought": "low",
+            "thoughtLevels": ["low", "high"],
+        });
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(snapshot),
+            model_selection_view: Some(json!({
+                "providers": [
+                    {"providerId": "acct-other", "models": [{"modelId": "other-1"}]},
+                    {"providerId": PROVIDER, "models": [
+                        {"modelId": "synthetic-model-a", "config": {"optionSpecs": {"reasoningLevel": {"values": ["low", "high"]}}}}
+                    ]}
+                ]
+            })),
+            ..PeerConfig::default()
+        };
+        let (manager, peer) = manager_with(config).await;
+
+        let before = manager.host_evidence().interface_evidence();
+        assert_eq!(
+            before,
+            ZcodeInterfaceEvidence::default(),
+            "bind 前接口形状证据全空"
+        );
+
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        manager.session(&target).await.expect("session");
+        let after_bind = manager.host_evidence().interface_evidence();
+        // hello（v4 协议面）→ 五个方法位。
+        assert!(after_bind.method_send, "v4 协议面 send 方法");
+        assert!(
+            after_bind.method_resolve_interaction,
+            "v4 协议面 resolve 方法"
+        );
+        assert!(after_bind.method_stop, "v4 协议面 stop 方法");
+        assert!(
+            after_bind.method_selection_get,
+            "v4 协议面 selection.get 方法"
+        );
+        assert!(
+            after_bind.method_selection_switch,
+            "v4 协议面 selection.switch 方法"
+        );
+        // 基线快照 → pending 形状 + 扁平档位；activeWorks 为空不置位。
+        assert!(after_bind.has_user_input_pending, "问答卡在场");
+        assert!(after_bind.has_multi_select, "multiSelect=true 的题在场");
+        assert!(after_bind.has_free_text, "freeText=true 的卡在场");
+        assert!(after_bind.has_permission_pending, "审批卡在场");
+        assert!(after_bind.has_thought_levels, "快照扁平档位在场");
+        assert!(!after_bind.has_active_work, "基线快照 activeWorks 为空");
+        assert!(!after_bind.has_model_catalog, "尚未读目录");
+
+        // control 增量：activeWorks 非空 → 打断形状。
+        let active_works = json!([{"kind": "primaryTurn", "foregroundExecutionId": "E-1"}]);
+        push_control_delta_on(&peer, SESSION_A, SUB, 1, 2, Some(3), active_works).await;
+        let with_work = manager.host_evidence().interface_evidence();
+        assert!(with_work.has_active_work, "运行回合在场");
+
+        // 选择目录：getView 应答（只认当前 provider）→ 目录形状。
+        let (_, selection) = SelectionPort::load(manager.as_ref(), &target)
+            .await
+            .expect("load");
+        assert_eq!(selection.provider, PROVIDER);
+        let with_catalog = manager.host_evidence().interface_evidence();
+        assert!(with_catalog.has_model_catalog, "当前 provider 目录非空");
+
+        // 换代（invalidate）：接口形状证据与握手证据一并全清。
+        manager.invalidate(2).await;
+        let reset = manager.host_evidence().interface_evidence();
+        assert_eq!(reset, ZcodeInterfaceEvidence::default(), "换代后全清");
+    }
+
+    /// 其他账号 provider 的目录绝不背书 `has_model_catalog`（观察只认当前会话
+    /// provider，与 `parse_selection_view` 的过滤纪律一致）。
+    #[tokio::test]
+    async fn selection_catalog_evidence_ignores_other_providers() {
+        let config = PeerConfig {
+            workspaces: vec![workspace_entry(WS_A, Some("ws-a-identity"), "A")],
+            tasks: vec![task_row(WS_A, SESSION_A, "hi")],
+            conversation_snapshot: Some(conversation_snapshot(SESSION_A, 2, Vec::new())),
+            // 目录只有其他账号 provider（有模型条目）：
+            model_selection_view: Some(json!({
+                "providers": [
+                    {"providerId": "acct-other", "models": [
+                        {"modelId": "other-1", "config": {"optionSpecs": {"reasoningLevel": {"values": ["x"]}}}}
+                    ]}
+                ]
+            })),
+            ..PeerConfig::default()
+        };
+        let (manager, _peer) = manager_with(config).await;
+        let target = manager.bind(&key(SESSION_A)).await.expect("bind");
+        // load 成功（退化为当前模型 + 快照档位），但目录形状不背书其他账号。
+        let (_, _selection) = SelectionPort::load(manager.as_ref(), &target)
+            .await
+            .expect("load");
+        let evidence = manager.host_evidence().interface_evidence();
+        assert!(
+            !evidence.has_model_catalog,
+            "其他账号 provider 的目录不得置位 has_model_catalog"
+        );
+        assert!(
+            !evidence.has_thought_levels,
+            "其他账号 provider 的档位不得置位 has_thought_levels"
+        );
     }
 
     #[tokio::test]

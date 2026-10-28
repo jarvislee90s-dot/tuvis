@@ -14,6 +14,8 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use serde_json::Value;
 
+use crate::services::zcode_control::capability::state::ZcodeInterfaceEvidence;
+
 /// 对外错误码（冻结：不得新增、改写或本地化；HTTP error 与 capability reasonCode 共用）。
 pub mod codes {
     /// 未保存官方链接/配置不可用。
@@ -962,6 +964,10 @@ pub struct HostEvidence {
     pub schema_known: bool,
     /// 已通过 `helloConversationV4` 的 kind/协议/connectionId 校验。
     pub hello_known: bool,
+    /// 本代际真实观测到的接口形状证据（T3 桥采集；只含方法/形状布尔，
+    /// 绝不承载正文——字段面见 [`ZcodeInterfaceEvidence`]；`pub(crate)` 因该
+    /// 类型是 crate 内类型，读取口统一走 [`Self::interface_evidence`]）。
+    pub(crate) interface: ZcodeInterfaceEvidence,
 }
 
 impl HostEvidence {
@@ -973,6 +979,15 @@ impl HostEvidence {
             self.schema_known,
             self.hello_known,
         )
+    }
+
+    /// 接口形状证据的克隆读取口（T3 契约；`ZcodeInterfaceEvidence` 是 `Copy`）。
+    ///
+    /// T4 resolver 尚未装配（交付时无生产消费方），沿 `capability/` 惯例仅在
+    /// 非测试构建放宽 dead_code；测试构建由 bridge 用例消费。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn interface_evidence(&self) -> ZcodeInterfaceEvidence {
+        self.interface
     }
 }
 
@@ -1119,6 +1134,7 @@ mod tests {
                 protocol_version: Some(EVIDENCED_PROTOCOL_VERSION),
                 schema_known: true,
                 hello_known: true,
+                ..Default::default()
             };
             assert_eq!(
                 evidence.policy(),
@@ -1145,6 +1161,7 @@ mod tests {
                     protocol_version,
                     schema_known,
                     hello_known,
+                    ..Default::default()
                 };
                 assert_all_closed(&evidence.policy());
             }
@@ -1154,6 +1171,7 @@ mod tests {
                 protocol_version: Some(EVIDENCED_PROTOCOL_VERSION),
                 schema_known: true,
                 hello_known: true,
+                ..Default::default()
             };
             assert_all_closed(&unknown_build.policy());
         }
