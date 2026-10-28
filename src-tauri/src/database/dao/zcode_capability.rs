@@ -3,7 +3,9 @@
 //! 每个 `(key, capability)` 一行，upsert 覆盖不追加；读失败/缺表返回空账本
 //! （能力账本是优化面，绝不阻塞连接、绝不 panic）。写入侧带受限校验硬闸：
 //! `evidence`/`reason_code` 只允许结构化判据标识，正文/凭据/链接一律拒绝落库。
-#![cfg_attr(not(test), allow(dead_code))]
+//!
+//! T5 接线后全部符号都有生产消费方（resolver 读、Hub 确认流程写），模块级
+//! dead_code 放宽已收口。
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -184,7 +186,10 @@ fn capability_from_str(raw: &str) -> Option<Capability> {
 /// * `:` 与 `/` 不在白名单 → URL/链接形状出局；
 /// * 单段（`+`/`.`/`-` 分隔）长度上限 + `eyJ` 前缀黑名单 → JWT/base64 长块出局
 ///   （JWT 各段是长 base64 块，且 header 段恒以 `eyJ`（`{"` 的 base64）起头）。
-fn validate_evidence_token(value: &str) -> Result<(), String> {
+///
+/// `pub(crate)`：T5 确认流程在写 degraded 前用同一闸净化回执原因码（冻结码外的
+/// 宿主原因一律换兜底码），保证落库形状与硬闸判定同源。
+pub(crate) fn validate_evidence_token(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("判据标识为空".to_owned());
     }

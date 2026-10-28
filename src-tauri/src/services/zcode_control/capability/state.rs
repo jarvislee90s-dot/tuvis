@@ -104,8 +104,8 @@ pub(crate) struct CapabilityRecord {
 impl CapabilityRecord {
     /// 首次真实动作确认成功（spec R4）。
     ///
-    /// 生产写入方在 R4 确认流程任务接线（T4 只装配读侧）——条目级放宽，接线后移除。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 生产写入方 = Hub 的 `ConfirmationTracker`（T5 接线）：evidence 判据词由
+    /// 写入点按能力补齐。
     pub(crate) fn confirmed(capability: Capability) -> Self {
         Self {
             capability,
@@ -117,8 +117,8 @@ impl CapabilityRecord {
 
     /// 实机确认明确失败（spec R4/R6：降级并携带冻结原因码）。
     ///
-    /// 生产写入方在 R4 确认流程任务接线（T4 只装配读侧）——条目级放宽，接线后移除。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 生产写入方 = Hub 的 `ConfirmationTracker`（T5 接线）：回执显式失败时以
+    /// 净化后的冻结原因码构造，evidence 判据词由写入点补齐。
     pub(crate) fn degraded(capability: Capability, reason: String) -> Self {
         Self {
             capability,

@@ -23,6 +23,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -31,17 +32,24 @@ use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex, Notify};
 use super::auth::{AuthService, AuthStatus, OAuthProvider, OpenAuthorize};
 use super::auto_connect::{capture_auto_intent, write_auto_intent, AutoIntentClaim};
 use super::bridge::{BridgeManager, DataOutcome};
-use super::capability::{resolve_capabilities, CapabilityKey};
+use super::capability::{
+    confirm_selection, confirm_send, resolve_capabilities, Capability, CapabilityKey,
+    CapabilityRecord, CapabilityState, ConfirmationBaseline, ConfirmationContext,
+    ConfirmationObservation, ConfirmationOutcome, ConfirmationTarget, SelectionObservation,
+    SendObservation,
+};
 use super::command::CommandSender;
 use super::config::{get_config, ConfigState};
 use super::credential_store::OsCredentialStore;
 use super::relay::{DeviceRoute, RelayClient, RelayEvent, RelayLag};
 use super::types::{
-    codes, ActionContext, ActionReceipt, BoundTarget, CapabilitySource, CapabilityView,
-    ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind, HostEvidence,
-    SessionView, TargetKey, ZResult, ZcodeError,
+    codes, ActionContext, ActionReceipt, ActionState, BoundTarget, CapabilitySource,
+    CapabilityView, ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind,
+    HostEvidence, SessionView, TargetKey, ZResult, ZcodeError,
 };
-use crate::database::dao::zcode_capability::DbCapabilityLedger;
+use crate::database::dao::zcode_capability::{
+    validate_evidence_token, CapabilityLedger, DbCapabilityLedger,
+};
 use crate::remote::pairing::DeviceStore;
 
 #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
@@ -82,6 +90,349 @@ fn capability_key(evidence: &HostEvidence) -> CapabilityKey {
         SCHEMA_FINGERPRINT_PLACEHOLDER,
         PROBE_EPOCH,
     )
+}
+
+/// 首次真实动作确认窗（spec R4：5s 有界；到点未确认 → inconclusive，绝不重发）。
+const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 确认落账的判据词表（全部是结构化判据标识，满足 T2 写入硬闸；
+/// 正文/题目/选项/答案/JWT/链接绝不进入账本）。
+mod confirmation_words {
+    /// send 确认：revision 前进 + 新用户消息可见（id 变化代表可见）。
+    pub(crate) const SEND_CONFIRMED: &str = "revision_advanced+new_user_message";
+    /// model/thought 确认：新快照选择三元组精确相等。
+    pub(crate) const SELECTION_CONFIRMED: &str = "selection_matched";
+    /// 确认窗到点未取得证据（不重发，保持候选）。
+    pub(crate) const TIMEOUT: &str = "timeout_5s";
+    /// 动作回执显式失败（host rejected/noop）。
+    pub(crate) const EXPLICIT_FAILURE: &str = "explicit_failure";
+    /// 回执保守未知（写后 ACK 超窗等——结果未知按 inconclusive）。
+    pub(crate) const UNKNOWN_RECEIPT: &str = "unknown_receipt";
+    /// 显式失败但回执原因码不是判据标识形状时的兜底冻结码。
+    pub(crate) const ACTION_FAILED: &str = "action_failed";
+}
+
+/// 首次真实动作确认的 pending 登记表（spec R4；Hub 内唯一实例）。
+///
+/// 生命周期：动作提交前登记（baseline 已捕获）→ 事件泵观察新投影调
+/// [`Self::observe_session`]，或动作回执直接给出终态调 [`Self::settle_receipt`]；
+/// 到点未决由每条登记的计时器任务走 [`Self::sweep_expired`] 写 inconclusive。
+/// 纪律：**绝不重发**动作；旧代际/别的 session 的结果丢弃不落账；ACK-only 绝不升级。
+pub(crate) struct ConfirmationTracker {
+    /// `(session_id, capability) → 登记上下文`。同槽位已有 pending 时忽略再登记
+    /// （首次确认未决期间的后续真实使用不另开确认窗，首个 baseline 已足够）。
+    pending: Mutex<BTreeMap<(String, Capability), ConfirmationContext>>,
+    /// T2 能力账本（`None` = 未装配账本：确认流程整体停用，登记面跳过）。
+    ledger: Option<Arc<dyn CapabilityLedger>>,
+}
+
+impl ConfirmationTracker {
+    fn new(ledger: Option<Arc<dyn CapabilityLedger>>) -> Self {
+        Self {
+            pending: Mutex::new(BTreeMap::new()),
+            ledger,
+        }
+    }
+
+    /// 本会话是否有未决确认（事件泵观察面的快速路径）。
+    fn has_pending(&self, session_id: &str) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .any(|(session, _)| session == session_id)
+    }
+
+    /// 该能力是否还需要首次确认（账本无 Confirmed/Degraded/Unsupported 判决；
+    /// Inconclusive/InterfaceMatched/无记录都算候选）。未装配账本 → false。
+    fn needs_confirmation(&self, key: &CapabilityKey, capability: Capability) -> bool {
+        let Some(ledger) = self.ledger.as_ref() else {
+            return false;
+        };
+        !ledger.get(key).into_iter().any(|record| {
+            record.capability == capability
+                && matches!(
+                    record.state,
+                    CapabilityState::Confirmed
+                        | CapabilityState::Degraded
+                        | CapabilityState::Unsupported
+                )
+        })
+    }
+
+    /// 登记一条确认（同槽位已有 pending → 忽略，返回 false）。
+    fn register(&self, ctx: ConfirmationContext) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((ctx.session_id.clone(), ctx.capability), ctx)
+            .is_none()
+    }
+
+    /// 事件泵观察：一条新投影（`generation` 是发布该视图的 Hub 代际；`fingerprint`
+    /// 是观察时刻的会话日志头指纹，可缺）。两段式：锁内只做判定与摘除，锁外落账。
+    fn observe_session(&self, view: &SessionView, generation: u64, fingerprint: Option<String>) {
+        let now = Instant::now();
+        let decisions = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let session_keys: Vec<(String, Capability)> = pending
+                .keys()
+                .filter(|(session, _)| session == &view.session_id)
+                .cloned()
+                .collect();
+            let mut decisions = Vec::new();
+            for slot in session_keys {
+                // 先摘除再判定：confirmed/超时/旧代际直接离场，未决的重新放回。
+                let Some(ctx) = pending.remove(&slot) else {
+                    continue;
+                };
+                // 旧代际：确认结果丢弃（spec R4），不落账、只摘除。
+                if generation != ctx.generation {
+                    continue;
+                }
+                // 到点未决：inconclusive（有界窗，绝不重发）。
+                if now >= ctx.deadline {
+                    decisions.push((ctx, inconclusive_record(slot.1)));
+                    continue;
+                }
+                let outcome = match &ctx.target {
+                    ConfirmationTarget::UserMessage { .. } => {
+                        // 观察证据缺一半（revision 或指纹未取得）→ 不判定，等下一帧。
+                        match (view.revision, fingerprint.as_ref()) {
+                            (Some(revision), Some(id)) => {
+                                let obs = SendObservation {
+                                    generation,
+                                    revision,
+                                    last_user_message_id: id.clone(),
+                                };
+                                confirm_send(&ctx, &obs)
+                            }
+                            _ => ConfirmationOutcome::Inconclusive,
+                        }
+                    }
+                    ConfirmationTarget::Selection { .. } => match view.selection.as_ref() {
+                        Some(selection) => {
+                            let obs = SelectionObservation {
+                                generation,
+                                revision: view.revision.unwrap_or(0),
+                                provider: selection.provider.clone(),
+                                model: selection.model.clone(),
+                                thought: selection.thought.clone().unwrap_or_default(),
+                            };
+                            confirm_selection(&ctx, &obs)
+                        }
+                        // 快照 config 未到：不判定，等下一帧。
+                        None => ConfirmationOutcome::Inconclusive,
+                    },
+                };
+                if outcome == ConfirmationOutcome::Confirmed {
+                    decisions.push((ctx, confirmed_record(slot.1)));
+                } else {
+                    // Inconclusive：保持 pending（等后续帧或计时器）。
+                    pending.insert(slot, ctx);
+                }
+            }
+            decisions
+        };
+        for (ctx, record) in decisions {
+            self.write(&ctx, record);
+        }
+    }
+
+    /// 动作回执终态收口（派发返回后立即判定；只有真正的 pending 才会写账）。
+    fn settle_receipt(&self, session_id: &str, receipt: &ActionReceipt) {
+        let decisions: Vec<(ConfirmationContext, CapabilityRecord)> = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let session_keys: Vec<(String, Capability)> = pending
+                .keys()
+                .filter(|(session, _)| session == session_id)
+                .cloned()
+                .collect();
+            match receipt.state {
+                // ACK-only：保持 pending，交给事件泵/计时器（绝不因此升级）。
+                ActionState::Accepted => Vec::new(),
+                // 因果终态（如 selection 的 wait_selection 命中）→ confirmed。
+                ActionState::Confirmed => session_keys
+                    .iter()
+                    .filter_map(|slot| pending.remove(slot).map(|ctx| (ctx, slot.1)))
+                    .map(|(ctx, capability)| (ctx, confirmed_record(capability)))
+                    .collect(),
+                // 宿主显式失败 → degraded，只影响本 key 本能力（冻结原因码）。
+                ActionState::Rejected | ActionState::Noop => {
+                    let reason = sanitized_reason(receipt);
+                    session_keys
+                        .iter()
+                        .filter_map(|slot| pending.remove(slot).map(|ctx| (ctx, slot.1)))
+                        .map(|(ctx, capability)| {
+                            let mut record = CapabilityRecord::degraded(capability, reason.clone());
+                            record.evidence = Some(confirmation_words::EXPLICIT_FAILURE.to_owned());
+                            (ctx, record)
+                        })
+                        .collect()
+                }
+                // 结果未知（写后 ACK 超窗等）→ inconclusive（保持候选）。
+                ActionState::Unknown => session_keys
+                    .iter()
+                    .filter_map(|slot| pending.remove(slot).map(|ctx| (ctx, slot.1)))
+                    .map(|(ctx, capability)| {
+                        (
+                            ctx,
+                            inconclusive_record_with(
+                                capability,
+                                confirmation_words::UNKNOWN_RECEIPT,
+                            ),
+                        )
+                    })
+                    .collect(),
+                // 确证零写（桥写前拒绝）：本次尝试零证据 → 只摘除，不落账。
+                ActionState::SendFailed => {
+                    for slot in &session_keys {
+                        pending.remove(slot);
+                    }
+                    Vec::new()
+                }
+            }
+        };
+        for (ctx, record) in decisions {
+            self.write(&ctx, record);
+        }
+    }
+
+    /// 派发失败（Err，无回执）：摘除 pending，不落账。
+    ///
+    /// CAS 陈旧（selection stale）与端口错误都不构成能力证据——前者只需刷新重试，
+    /// 后者可能是瞬时连通性问题；降级只留给回执显式失败。
+    fn drop_pending(&self, session_id: &str) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session_keys: Vec<(String, Capability)> = pending
+            .keys()
+            .filter(|(session, _)| session == session_id)
+            .cloned()
+            .collect();
+        for slot in session_keys {
+            pending.remove(&slot);
+        }
+    }
+
+    /// ACK 后重置确认窗期限（spec R4：「ACK 后等新投影……5s 有界」）。
+    ///
+    /// 只重置**本会话本代际**的 pending；返回每条新期限（调用方逐条补计时器任务，
+    /// 旧计时器照常醒来但只会看到更晚的期限，sweep 自然空转）。
+    fn rearm(&self, session_id: &str, generation: u64, timeout: Duration) -> Vec<Instant> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        let mut deadlines = Vec::new();
+        for ((session, _), ctx) in pending.iter_mut() {
+            if session == session_id && ctx.generation == generation {
+                ctx.deadline = now.checked_add(timeout).unwrap_or_else(Instant::now);
+                deadlines.push(ctx.deadline);
+            }
+        }
+        deadlines
+    }
+
+    /// 计时器回调：摘除并落账全部到点未决的登记（inconclusive）。
+    fn sweep_expired(&self, now: Instant) {
+        let decisions: Vec<(ConfirmationContext, CapabilityRecord)> = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let expired: Vec<(String, Capability)> = pending
+                .iter()
+                .filter(|(_, ctx)| now >= ctx.deadline)
+                .map(|(slot, _)| slot.clone())
+                .collect();
+            expired
+                .iter()
+                .filter_map(|slot| {
+                    pending.remove(slot).map(|ctx| {
+                        let capability = slot.1;
+                        (ctx, inconclusive_record(capability))
+                    })
+                })
+                .collect()
+        };
+        for (ctx, record) in decisions {
+            self.write(&ctx, record);
+        }
+    }
+
+    /// 落账（T2 账本 upsert；失败只 warn 不假报，spec R6）。日志只带能力名与
+    /// 状态判据词，绝不带指纹/正文/凭据。
+    fn write(&self, ctx: &ConfirmationContext, record: CapabilityRecord) {
+        let Some(ledger) = self.ledger.as_ref() else {
+            return;
+        };
+        if ledger.put(&ctx.key, &record).is_err() {
+            log::warn!(
+                "ZCode 能力确认落账失败（capability={} state={}），本结果不落账",
+                ctx.capability.as_str(),
+                state_word(record.state)
+            );
+        }
+    }
+}
+
+/// confirmed 行（evidence 按能力取判据词）。
+fn confirmed_record(capability: Capability) -> CapabilityRecord {
+    let mut record = CapabilityRecord::confirmed(capability);
+    record.evidence = Some(
+        match capability {
+            Capability::Send => confirmation_words::SEND_CONFIRMED,
+            Capability::Model | Capability::ThoughtLevel => confirmation_words::SELECTION_CONFIRMED,
+            _ => "confirmed",
+        }
+        .to_owned(),
+    );
+    record
+}
+
+/// inconclusive 行（默认判据词 = 确认窗到点）。
+fn inconclusive_record(capability: Capability) -> CapabilityRecord {
+    inconclusive_record_with(capability, confirmation_words::TIMEOUT)
+}
+
+fn inconclusive_record_with(capability: Capability, evidence: &str) -> CapabilityRecord {
+    CapabilityRecord {
+        capability,
+        state: CapabilityState::Inconclusive,
+        reason_code: None,
+        evidence: Some(evidence.to_owned()),
+    }
+}
+
+/// 回执原因码净化：只放行判据标识形状（与 T2 写入硬闸同一校验），否则用兜底码。
+fn sanitized_reason(receipt: &ActionReceipt) -> String {
+    receipt
+        .reason_code
+        .as_deref()
+        .filter(|code| validate_evidence_token(code).is_ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| confirmation_words::ACTION_FAILED.to_owned())
+}
+
+/// 日志用的状态词（state 列冻结词表，与 dao 的落库词一致）。
+fn state_word(state: CapabilityState) -> &'static str {
+    match state {
+        CapabilityState::Unsupported => "unsupported",
+        CapabilityState::InterfaceMatched => "interface_matched",
+        CapabilityState::Confirmed => "confirmed",
+        CapabilityState::Degraded => "degraded",
+        CapabilityState::Inconclusive => "inconclusive",
+    }
 }
 
 /// Hub 依赖的窄后端端口（测试注入 fake；生产 [`PartsBackend`]）。
@@ -206,6 +557,23 @@ pub trait HubBackend: Send + Sync {
 
     /// 本后端的证据能力矩阵（生产默认全关）。
     fn policy(&self) -> CapabilityView;
+
+    /// 动作提交路径的确认 baseline（T5 首次真实动作确认；send/model/thought 登记）。
+    ///
+    /// 返回 `None` = 后端不提供 baseline（本次动作跳过确认登记）。生产
+    /// [`PartsBackend`] 用桥的**只读快照**（revision/当前选择/日志头指纹，零网络）
+    /// 与 `policy_source` 同一拼法的 capability key 现算；默认 `None` 让既有
+    /// fake 零改动。实现必须是纯读：零出站帧、零重订阅。
+    // `private_interfaces`：`HubBackend` 的标称 pub 是 with_parts 测试构造的历史
+    // 面；baseline 类型按 spec 纯核纪律是 crate 内类型（实际可用面即本 crate）。
+    #[allow(private_interfaces)]
+    fn confirmation_baseline<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> BoxFuture<'a, Option<ConfirmationBaseline>> {
+        let _ = session_id;
+        Box::pin(async { None })
+    }
 }
 
 /// 事件泵所需的桥窄口（生产 = [`BridgeManager`]，测试注入 fake）。
@@ -218,6 +586,13 @@ pub(crate) trait BridgePump: Send + Sync {
     fn on_data<'a>(&'a self, payload: Value) -> BoxFuture<'a, DataOutcome>;
     /// 作废旧桥/投影（实现内部推进自己的投影代际，不接受外部代际，避免代际空间混用）。
     fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()>;
+
+    /// T5 确认观察：精确会话的日志头指纹（send 确认的「新用户消息可见」面）。
+    /// 默认 `None`（无指纹证据 → send 确认保守不升级）；测试 fake 零改动。
+    fn log_fingerprint(&self, session_id: &str) -> Option<String> {
+        let _ = session_id;
+        None
+    }
 }
 
 /// 事件泵装配口：relay 事件接收端 + 泵桥 + 可选 Data 溢出观察口（测试可缺省）。
@@ -242,6 +617,10 @@ impl BridgePump for ProjectionBridge {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         Box::pin(async move { BridgeManager::invalidate(&self.bridge, generation).await })
     }
+
+    fn log_fingerprint(&self, session_id: &str) -> Option<String> {
+        self.bridge.log_fingerprint(session_id)
+    }
 }
 
 /// 生产后端：一条 relay + 一个 bridge + 一个命令派发器（进程内单实例）。
@@ -253,6 +632,8 @@ pub struct PartsBackend {
     /// 能力策略的**唯一**现算源：宿主证据 + DB 能力账本 → capability resolver。
     /// 会话矩阵（Hub）与执行闸（CommandSender）共用同一实例，禁止各存一份快照。
     policy_source: CapabilitySource,
+    /// T2 能力账本实例（resolver 与 Hub 首次确认落账共用同一份，不建第二个库）。
+    ledger: Arc<dyn CapabilityLedger>,
     /// 投影代际：`reset`/重新连接/冲突时单调推进，保证 `BridgeManager::invalidate`
     /// 一定生效（事件泵与后端共用同一个计数器）。
     projection_generation: Arc<AtomicU64>,
@@ -303,9 +684,11 @@ impl PartsBackend {
         // `production_unverified()` 全关（spec §6.6），账本读失败退化为
         // shipped + 接口候选（不阻塞连接）。
         // sender 与会话 DTO 共用同一 source：证据变化后两边同时翻转。
+        // 账本实例挂在后端上（T5 首次确认落账与 resolver 共用同一份）。
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
         let policy_source: CapabilitySource = {
             let bridge = bridge.clone();
-            let ledger = Arc::new(DbCapabilityLedger::new(store.clone()));
+            let ledger = ledger.clone();
             Arc::new(move || {
                 let evidence = bridge.host_evidence();
                 resolve_capabilities(
@@ -329,6 +712,7 @@ impl PartsBackend {
                 bridge,
                 sender,
                 policy_source,
+                ledger,
                 projection_generation: Arc::new(AtomicU64::new(0)),
             },
             events_rx,
@@ -339,6 +723,11 @@ impl PartsBackend {
     /// Hub 与会话能力矩阵使用的同一策略源（clone 只复制 `Arc`，不是矩阵快照）。
     fn policy_source(&self) -> CapabilitySource {
         self.policy_source.clone()
+    }
+
+    /// T2 能力账本实例（Hub 首次确认落账与 resolver 共用同一份）。
+    fn capability_ledger(&self) -> Arc<dyn CapabilityLedger> {
+        self.ledger.clone()
     }
 
     /// 事件泵的桥端（与后端共用同一个 `BridgeManager` 与投影代际）。
@@ -469,6 +858,27 @@ impl HubBackend for PartsBackend {
     fn policy(&self) -> CapabilityView {
         // 现算（不是构造时快照）：运行时证据变化立即反映到 Hub 闸门与手机矩阵。
         (self.policy_source)()
+    }
+
+    // 同 trait 侧：baseline 类型是 crate 内类型（见 trait 方法注）。
+    #[allow(private_interfaces)]
+    fn confirmation_baseline<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> BoxFuture<'a, Option<ConfirmationBaseline>> {
+        Box::pin(async move {
+            // capability key 与 policy_source 同一拼法（同证据稳定）；
+            // 会话侧 baseline 来自桥的只读快照（零网络、零重订阅）。
+            let observation = self.bridge.confirmation_observation(session_id);
+            Some(ConfirmationBaseline {
+                key: capability_key(&self.bridge.host_evidence()),
+                observation: observation.unwrap_or(ConfirmationObservation {
+                    revision: None,
+                    provider: None,
+                    log_fingerprint: None,
+                }),
+            })
+        })
     }
 }
 
@@ -1019,6 +1429,10 @@ pub struct ZcodeHub {
     /// T8.2 debug 证据构建的单次验收许可册（进程内存；不落 settings/DB）。
     #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
     evidence: EvidencePermitStore,
+    /// 首次真实动作确认的登记表（spec R4；send/model/thought 接线在 execute/事件泵）。
+    confirmations: Arc<ConfirmationTracker>,
+    /// 确认窗时长（生产 [`CONFIRMATION_TIMEOUT`]；测试注入短窗）。
+    confirmation_timeout: Duration,
 }
 
 impl ZcodeHub {
@@ -1031,6 +1445,8 @@ impl ZcodeHub {
         let (parts, relay_events, lag) = PartsBackend::production(store.clone());
         // 生产唯一来源：宿主证据 + DB 能力账本 → capability resolver（异常回退全关）。
         let policy_source = parts.policy_source();
+        // 确认落账与 resolver 用**同一个**账本实例（同一 DeviceStore，不建第二个库）。
+        let ledger = parts.capability_ledger();
         let bridge = parts.pump_bridge();
         let backend: Arc<dyn HubBackend> = Arc::new(parts);
         Self::assemble(
@@ -1038,6 +1454,8 @@ impl ZcodeHub {
             backend,
             policy_source,
             Some((relay_events, bridge, Some(lag))),
+            Some(ledger),
+            CONFIRMATION_TIMEOUT,
         )
     }
 
@@ -1051,7 +1469,14 @@ impl ZcodeHub {
         backend: Arc<dyn HubBackend>,
         policy: CapabilityView,
     ) -> Self {
-        Self::assemble(store, backend, static_policy_source(policy), None)
+        Self::assemble(
+            store,
+            backend,
+            static_policy_source(policy),
+            None,
+            None,
+            CONFIRMATION_TIMEOUT,
+        )
     }
 
     /// 测试专用：注入**动态**策略源，验证会话矩阵与执行闸来自同一来源。
@@ -1061,7 +1486,14 @@ impl ZcodeHub {
         backend: Arc<dyn HubBackend>,
         policy_source: CapabilitySource,
     ) -> Self {
-        Self::assemble(store, backend, policy_source, None)
+        Self::assemble(
+            store,
+            backend,
+            policy_source,
+            None,
+            None,
+            CONFIRMATION_TIMEOUT,
+        )
     }
 
     /// 事件泵测试构造（fake relay 通道 + fake bridge；零网络；无 lag 观察口）。
@@ -1078,6 +1510,8 @@ impl ZcodeHub {
             backend,
             static_policy_source(policy),
             Some((events, bridge, None)),
+            None,
+            CONFIRMATION_TIMEOUT,
         )
     }
 
@@ -1096,6 +1530,32 @@ impl ZcodeHub {
             backend,
             static_policy_source(policy),
             Some((events, bridge, Some(lag))),
+            None,
+            CONFIRMATION_TIMEOUT,
+        )
+    }
+
+    /// 事件泵测试构造 + 能力确认账本注入（T5：首次真实动作确认的落账接线）。
+    ///
+    /// `confirmation_timeout` 可注入短窗（生产 [`CONFIRMATION_TIMEOUT`] 5s），
+    /// 让超时 → inconclusive 的用例不等真实 5 秒。
+    #[cfg(test)]
+    fn with_pump_and_confirmation(
+        store: DeviceStore,
+        backend: Arc<dyn HubBackend>,
+        policy: CapabilityView,
+        events: mpsc::Receiver<RelayEvent>,
+        bridge: Arc<dyn BridgePump>,
+        ledger: Arc<dyn CapabilityLedger>,
+        confirmation_timeout: Duration,
+    ) -> Self {
+        Self::assemble(
+            store,
+            backend,
+            static_policy_source(policy),
+            Some((events, bridge, None)),
+            Some(ledger),
+            confirmation_timeout,
         )
     }
 
@@ -1104,7 +1564,10 @@ impl ZcodeHub {
         backend: Arc<dyn HubBackend>,
         policy_source: CapabilitySource,
         pump: Option<PumpParts>,
+        ledger: Option<Arc<dyn CapabilityLedger>>,
+        confirmation_timeout: Duration,
     ) -> Self {
+        let confirmations = Arc::new(ConfirmationTracker::new(ledger));
         let hub = Self {
             store,
             backend,
@@ -1142,6 +1605,8 @@ impl ZcodeHub {
             auto_attempts: AtomicU64::new(0),
             #[cfg(all(feature = "zcode-bridge-evidence", debug_assertions))]
             evidence: EvidencePermitStore::new(),
+            confirmations,
+            confirmation_timeout,
         };
         let configured = hub.read_configured();
         {
@@ -1183,6 +1648,8 @@ impl ZcodeHub {
         let auto_notify = self.auto_notify.clone();
         // KICKED 的持久暂停同样走意图代际（P2-6）：事件到达即预占一代，延迟写携带它。
         let auto_intent_generation = self.auto_intent_generation.clone();
+        // T5 首次确认：事件泵把新投影喂给登记表（send/model/thought 的观察点）。
+        let confirmations = self.confirmations.clone();
         #[cfg(test)]
         let kicked_intent_probe = self.kicked_intent_probe.clone();
         tokio::spawn(async move {
@@ -1210,7 +1677,16 @@ impl ZcodeHub {
                         // 先发布本帧造成的变化（含错误帧把会话标成不新鲜的降级视图）；
                         // 代际/配对闸在 apply_relay_session 内复核。
                         for view in outcome.changed {
+                            // T5 确认观察：本会话有未决确认才取日志头指纹并克隆视图
+                            // （快速路径零克隆、零桥查询）。
+                            let observed = confirmations.has_pending(&view.session_id).then(|| {
+                                let fingerprint = bridge.log_fingerprint(&view.session_id);
+                                (view.clone(), fingerprint)
+                            });
                             apply_relay_session(&inner, &out, hub_generation, view);
+                            if let Some((view, fingerprint)) = observed {
+                                confirmations.observe_session(&view, hub_generation, fingerprint);
+                            }
                         }
                         // 错误只代表本帧未吸收：不改变连接终态、不拆泵（ACK 已尽力发出）。
                         // 降级视图已在上一步发布，下一次 GET 走重新 bind/现读自愈。
@@ -2344,16 +2820,126 @@ impl ZcodeHub {
             }
             permits = self.check_required_policy(&action, &required)?;
         }
-        let mut receipt = self
+        // R4 首次真实动作确认：闸门已全过、派发未发生——此刻登记 baseline
+        // （send/model/thought；已判决的能力与未提供 baseline 的后端跳过）。
+        let confirmable = matches!(
+            &action,
+            ControlAction::Send { .. } | ControlAction::Selection { .. }
+        );
+        if confirmable {
+            self.register_confirmations(&action, generation).await;
+        }
+        let dispatch = self
             .backend
             .execute_with_permits(&ctx, &target, &action, &permits)
-            .await?;
-        // 公开代际唯一：回执盖本次校验过的 Hub 代际（CommandSender 用公开代际
-        // 校验/落账，桥投影代际只在目标内部）。
-        // 若执行在途发生了换代，回执仍是旧代际——客户端据 connection 发现并重取。
-        receipt.generation = generation;
-        self.emit_action(&receipt, &ctx.device_id);
-        Ok(receipt)
+            .await;
+        match dispatch {
+            Ok(mut receipt) => {
+                // 回执终态先收口确认（Confirmed/Rejected/Unknown 直接落账，
+                // ACK-only 保持 pending）；spec R4 的 5s 窗从 ACK 起算 → 重置期限。
+                self.confirmations
+                    .settle_receipt(action.session_id(), &receipt);
+                if receipt.state == ActionState::Accepted {
+                    for deadline in self.confirmations.rearm(
+                        action.session_id(),
+                        generation,
+                        self.confirmation_timeout,
+                    ) {
+                        self.spawn_confirmation_timer(deadline);
+                    }
+                }
+                // 公开代际唯一：回执盖本次校验过的 Hub 代际（CommandSender 用公开代际
+                // 校验/落账，桥投影代际只在目标内部）。
+                // 若执行在途发生了换代，回执仍是旧代际——客户端据 connection 发现并重取。
+                receipt.generation = generation;
+                self.emit_action(&receipt, &ctx.device_id);
+                Ok(receipt)
+            }
+            Err(error) => {
+                // 派发失败（CAS 陈旧/端口错误）不构成能力证据：只摘除 pending，
+                // 绝不据此降级（降级只留给回执显式失败）。
+                self.confirmations.drop_pending(action.session_id());
+                Err(error)
+            }
+        }
+    }
+
+    /// R4 首次真实动作确认的登记面：捕获 baseline 并为每个仍候选的能力建立确认窗。
+    ///
+    /// 候选判定 = 账本无 Confirmed/Degraded/Unsupported 判决（Inconclusive/
+    /// InterfaceMatched/无记录都重新确认）；后端不提供 baseline 或未装配账本时
+    /// 整体跳过。确认窗的期限在 ACK 后重置（spec：「ACK 后等新投影……5s 有界」）。
+    async fn register_confirmations(&self, action: &ControlAction, generation: u64) {
+        let Some(baseline) = self
+            .backend
+            .confirmation_baseline(action.session_id())
+            .await
+        else {
+            return;
+        };
+        let capabilities: &[Capability] = match action {
+            ControlAction::Send { .. } => &[Capability::Send],
+            ControlAction::Selection { .. } => &[Capability::Model, Capability::ThoughtLevel],
+            _ => return,
+        };
+        for capability in capabilities {
+            if !self
+                .confirmations
+                .needs_confirmation(&baseline.key, *capability)
+            {
+                continue;
+            }
+            let target = match (action, capability) {
+                (ControlAction::Send { .. }, Capability::Send) => {
+                    // 登记时刻的日志头指纹 = 「最后用户消息」基线（id 形状，非正文）。
+                    ConfirmationTarget::UserMessage {
+                        baseline_id: baseline
+                            .observation
+                            .log_fingerprint
+                            .clone()
+                            .unwrap_or_default(),
+                    }
+                }
+                (
+                    ControlAction::Selection { model, thought, .. },
+                    Capability::Model | Capability::ThoughtLevel,
+                ) => ConfirmationTarget::Selection {
+                    // provider 不随模型切换变化：取登记时刻快照值（缺席 = 空串，
+                    // 三项精确相等判据自然不可能确认，保守不升级）。
+                    provider: baseline.observation.provider.clone().unwrap_or_default(),
+                    model: model.clone(),
+                    thought: thought.clone(),
+                },
+                _ => continue,
+            };
+            let ctx = ConfirmationContext {
+                capability: *capability,
+                key: baseline.key.clone(),
+                session_id: action.session_id().to_owned(),
+                generation,
+                baseline_revision: baseline.observation.revision.unwrap_or(0),
+                target,
+                deadline: Instant::now()
+                    .checked_add(self.confirmation_timeout)
+                    .unwrap_or_else(Instant::now),
+            };
+            // 同槽位已有 pending → 忽略再登记（首个确认窗未决期间不开新窗）。
+            if self.confirmations.register(ctx.clone()) {
+                self.spawn_confirmation_timer(ctx.deadline);
+            }
+        }
+    }
+
+    /// 一条有界确认计时器：到点未决 → inconclusive（绝不重发动作）。
+    fn spawn_confirmation_timer(&self, deadline: Instant) {
+        let tracker = self.confirmations.clone();
+        tokio::spawn(async move {
+            let now = Instant::now();
+            if deadline > now {
+                tokio::time::sleep(deadline - now).await;
+            }
+            tracker.sweep_expired(Instant::now());
+        });
     }
 
     /// 广播一条动作回执事件；设备 id 只留在进程内供 SSE 同会话过滤。
@@ -2636,14 +3222,20 @@ impl ZcodeHub {
 mod tests {
     use super::*;
     use crate::database::dao::settings::{try_get_setting_conn, try_set_setting_conn};
+    use crate::database::dao::zcode_capability::{CapabilityLedger, DbCapabilityLedger};
     use crate::services::zcode_control::auth::{AuthProblem, AuthService, AuthStatus};
     use crate::services::zcode_control::auto_connect::AUTO_CONNECT_KEY;
+    use crate::services::zcode_control::capability::{
+        Capability, CapabilityKey, CapabilityRecord, CapabilityState, ConfirmationBaseline,
+        ConfirmationObservation,
+    };
     use crate::services::zcode_control::config::set_config;
     use crate::services::zcode_control::credential_store::{
         MemoryCredentialStore, StoredCredential, SCHEMA_VERSION,
     };
     use crate::services::zcode_control::types::{
-        ActionState, ActiveWork, AnswerEntry, CapabilityFlag, ControlView, PendingKind, PendingView,
+        ActionState, ActiveWork, AnswerEntry, CapabilityFlag, ControlView, PendingKind,
+        PendingView, SelectionView,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Duration;
@@ -2658,6 +3250,11 @@ mod tests {
         authorize_calls: AtomicUsize,
         connect_calls: AtomicUsize,
         disconnect_calls: AtomicUsize,
+        /// T5 确认观察：`confirmation_baseline` 的替身应答（`None` = 后端不提供
+        /// baseline，登记跳过——既有用例零改动）。
+        confirmation_baseline: Mutex<Option<ConfirmationBaseline>>,
+        /// T5 确认观察：下一次 `execute` 的替身回执（`None` = 默认 Accepted）。
+        execute_receipt: Mutex<Option<ZResult<ActionReceipt>>>,
         /// 一次性 `disconnect()` 闸：第一次调用等待放行，后续调用立即返回
         /// （关闭清理重叠窗口测试用）。
         disconnect_gate: Mutex<Option<Arc<Notify>>>,
@@ -2759,6 +3356,23 @@ mod tests {
         /// 设定持久幂等查询的应答（`Some(Err(..))` = 冲突；缺省 = 无既有回执）。
         fn set_existing(&self, result: ZResult<Option<ActionReceipt>>) {
             self.existing_result.lock().unwrap().replace(result);
+        }
+
+        /// 设定 `confirmation_baseline` 的替身应答（T5 确认观察登记面）。
+        fn set_baseline(&self, baseline: ConfirmationBaseline) {
+            self.confirmation_baseline.lock().unwrap().replace(baseline);
+        }
+
+        /// 设定下一次 `execute` 的替身回执状态（T5：Confirmed/Rejected/Unknown）。
+        fn set_execute_receipt(&self, state: ActionState, reason: Option<String>) {
+            let receipt = ActionReceipt {
+                action_id: "synthetic-receipt".into(),
+                session_id: "sess_synthetic0000".into(),
+                generation: 0,
+                state,
+                reason_code: reason,
+            };
+            self.execute_receipt.lock().unwrap().replace(Ok(receipt));
         }
     }
 
@@ -2923,15 +3537,18 @@ mod tests {
         ) -> BoxFuture<'a, ZResult<ActionReceipt>> {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
             self.executed_targets.lock().unwrap().push(target.clone());
-            let receipt = ActionReceipt {
-                action_id: ctx.action_id.clone(),
-                session_id: target.session_id.clone(),
-                // 生产回执盖的是投影代际（≠ Hub 代际）：Hub 必须覆写为公开代际。
-                generation: target.generation,
-                state: ActionState::Accepted,
-                reason_code: None,
-            };
-            Box::pin(async move { Ok(receipt) })
+            let receipt = self.execute_receipt.lock().unwrap().clone();
+            let receipt = receipt.unwrap_or_else(|| {
+                Ok(ActionReceipt {
+                    action_id: ctx.action_id.clone(),
+                    session_id: target.session_id.clone(),
+                    // 生产回执盖的是投影代际（≠ Hub 代际）：Hub 必须覆写为公开代际。
+                    generation: target.generation,
+                    state: ActionState::Accepted,
+                    reason_code: None,
+                })
+            });
+            Box::pin(async move { receipt })
         }
 
         fn existing_receipt<'a>(
@@ -2966,6 +3583,14 @@ mod tests {
 
         fn policy(&self) -> CapabilityView {
             CapabilityView::default()
+        }
+
+        fn confirmation_baseline<'a>(
+            &'a self,
+            _session_id: &'a str,
+        ) -> BoxFuture<'a, Option<ConfirmationBaseline>> {
+            let baseline = self.confirmation_baseline.lock().unwrap().clone();
+            Box::pin(async move { baseline })
         }
     }
 
@@ -5191,6 +5816,8 @@ mod tests {
         invalidations: AtomicUsize,
         /// 每帧结果（取走一次；空 = `Ok` + 无变化）。
         outcomes: Mutex<VecDeque<DataOutcome>>,
+        /// T5 确认观察：按会话注入的日志头指纹（缺席 = `None`，与 trait 默认一致）。
+        fingerprints: Mutex<BTreeMap<String, String>>,
     }
 
     impl FakePump {
@@ -5200,6 +5827,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push_back(DataOutcome { result, changed });
+        }
+
+        /// 注入某会话的日志头指纹（T5 send 确认观察面）。
+        fn set_fingerprint(&self, session_id: &str, fingerprint: &str) {
+            self.fingerprints
+                .lock()
+                .unwrap()
+                .insert(session_id.to_owned(), fingerprint.to_owned());
         }
     }
 
@@ -5221,6 +5856,10 @@ mod tests {
         fn invalidate<'a>(&'a self) -> BoxFuture<'a, ()> {
             self.invalidations.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {})
+        }
+
+        fn log_fingerprint(&self, session_id: &str) -> Option<String> {
+            self.fingerprints.lock().unwrap().get(session_id).cloned()
         }
     }
 
@@ -7077,5 +7716,394 @@ mod tests {
             "删链接后连接被配置门拒绝，而不是误报 needs_auth"
         );
         assert_eq!(credentials.delete_count(), 0);
+    }
+
+    // ====================================================================
+    // T5：首次真实动作确认（spec R4）——send / model / thought 接线
+    // ====================================================================
+
+    /// 确认测试的能力 key（与 fake baseline 注入值一致；key 变化即另一份账本）。
+    fn confirmation_key() -> CapabilityKey {
+        CapabilityKey::new("macos", "9.9.9.9999", 3, "shape", 1)
+    }
+
+    /// send 确认测试的 baseline：revision 10、日志头指纹 "u0"（与纯判据用例同约定）。
+    fn send_baseline() -> ConfirmationBaseline {
+        ConfirmationBaseline {
+            key: confirmation_key(),
+            observation: ConfirmationObservation {
+                revision: Some(10),
+                provider: None,
+                log_fingerprint: Some("u0".to_owned()),
+            },
+        }
+    }
+
+    /// selection 确认测试的 baseline：revision 10、当前 provider。
+    fn selection_baseline() -> ConfirmationBaseline {
+        ConfirmationBaseline {
+            key: confirmation_key(),
+            observation: ConfirmationObservation {
+                revision: Some(10),
+                provider: Some("synthetic-provider".to_owned()),
+                log_fingerprint: None,
+            },
+        }
+    }
+
+    fn selection_action(generation: u64, model: &str, thought: &str) -> ControlAction {
+        ControlAction::Selection {
+            session_id: "sess_synthetic0000".into(),
+            generation,
+            model: model.into(),
+            thought: thought.into(),
+        }
+    }
+
+    /// 合成一条 ready 会话变化视图（确认观察的输入面）。
+    fn changed_view(session_id: &str, revision: u64) -> SessionView {
+        SessionView {
+            session_id: session_id.to_owned(),
+            generation: 0,
+            revision: Some(revision),
+            ready: true,
+            pending: Vec::new(),
+            control: None,
+            selection: None,
+            capabilities: CapabilityView::default(),
+        }
+    }
+
+    /// 带确认账本与短确认窗（50ms）的已配对 Hub（fake relay 通道 + fake 桥）。
+    async fn confirmation_hub(
+        fake: Arc<FakeBackend>,
+        ledger: Arc<dyn CapabilityLedger>,
+        policy: CapabilityView,
+    ) -> (Arc<ZcodeHub>, mpsc::Sender<RelayEvent>, Arc<FakePump>) {
+        let (events, receiver) = mpsc::channel(8);
+        let pump = Arc::new(FakePump::default());
+        let hub = Arc::new(ZcodeHub::with_pump_and_confirmation(
+            stored(URL),
+            fake,
+            policy,
+            receiver,
+            pump.clone(),
+            ledger,
+            Duration::from_millis(50),
+        ));
+        hub.authorize(OAuthProvider::Bigmodel, noop_open())
+            .await
+            .expect("fake 授权应成功");
+        hub.connect().await.expect("fake 连接应成功");
+        (hub, events, pump)
+    }
+
+    /// 带睡眠的轮询等待（确认计时器是真实 50ms 定时器，yield 循环等不到它）。
+    async fn wait_until_with_sleep(mut condition: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("条件在 2.5s 睡眠轮询内未成立");
+    }
+
+    /// ACK-only 不升级：send 被 accepted 后，确认窗内没有新投影证据 → 账本
+    /// 不写 confirmed；短窗到期由计时器写 inconclusive（保持候选，不重发）。
+    #[tokio::test]
+    async fn ack_only_send_times_out_inconclusive_without_resend() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(send_baseline());
+        let (hub, events, pump) =
+            confirmation_hub(fake.clone(), ledger.clone(), send_policy()).await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(ctx("send-ack-1"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+        assert_eq!(receipt.state, ActionState::Accepted);
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+
+        // ACK-only：账本必须仍然为空（绝不因受理升级）。
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            ledger.get(&confirmation_key()).is_empty(),
+            "ACK-only 绝不写 confirmed"
+        );
+
+        // 同形观察（revision/指纹都未前进）也不确认；随后短窗到期 → inconclusive。
+        pump.set_fingerprint("sess_synthetic0000", "u0");
+        pump.push_outcome(Ok(()), vec![changed_view("sess_synthetic0000", 10)]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 1})))
+            .await
+            .unwrap();
+        wait_until_with_sleep(|| !ledger.get(&confirmation_key()).is_empty()).await;
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1, "同一能力只落一行");
+        assert_eq!(rows[0].capability, Capability::Send);
+        assert_eq!(rows[0].state, CapabilityState::Inconclusive);
+        assert_eq!(rows[0].evidence.as_deref(), Some("timeout_5s"));
+        assert_eq!(rows[0].reason_code, None);
+        // 结构性不重发：确认窗内只派发过一次动作。
+        assert_eq!(fake.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 新用户消息可见（指纹变化）+ revision 前进 → 事件泵观察确认并落账 confirmed。
+    #[tokio::test]
+    async fn first_send_confirms_via_pump_observation() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(send_baseline());
+        let (hub, events, pump) =
+            confirmation_hub(fake.clone(), ledger.clone(), send_policy()).await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(ctx("send-confirm-1"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+        assert_eq!(receipt.state, ActionState::Accepted);
+
+        // 新投影：revision 前进 + 日志头指纹变化（新用户消息可见）。
+        pump.set_fingerprint("sess_synthetic0000", "u1");
+        pump.push_outcome(Ok(()), vec![changed_view("sess_synthetic0000", 11)]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 2})))
+            .await
+            .unwrap();
+
+        wait_until_with_sleep(|| {
+            ledger
+                .get(&confirmation_key())
+                .first()
+                .is_some_and(|row| row.state == CapabilityState::Confirmed)
+        })
+        .await;
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].capability, Capability::Send);
+        assert_eq!(rows[0].state, CapabilityState::Confirmed);
+        // 判据词经真实 T2 硬闸落库（DbCapabilityLedger 的受限校验在场）。
+        assert_eq!(
+            rows[0].evidence.as_deref(),
+            Some("revision_advanced+new_user_message")
+        );
+        assert_eq!(rows[0].reason_code, None);
+    }
+
+    /// 旧代际的确认结果丢弃：登记后代际推进（配置变更），随后哪怕新代际投影视图
+    /// 带着完全符合判据的证据，也不得写入账本。
+    #[tokio::test]
+    async fn stale_generation_confirmation_is_discarded_without_ledger_write() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(send_baseline());
+        let (hub, events, pump) =
+            confirmation_hub(fake.clone(), ledger.clone(), send_policy()).await;
+        let generation = hub.connection().generation;
+
+        hub.execute(ctx("send-stale-1"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+
+        // 配置变更推进 Hub 代际：旧代际 pending 的确认结果一律丢弃。
+        hub.config_changed().await;
+
+        pump.set_fingerprint("sess_synthetic0000", "u1");
+        pump.push_outcome(Ok(()), vec![changed_view("sess_synthetic0000", 11)]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 3})))
+            .await
+            .unwrap();
+
+        // 确认窗（50ms）+ 余量：既不得 confirmed，也不得 inconclusive——直接丢弃。
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            ledger.get(&confirmation_key()).is_empty(),
+            "旧代际确认结果丢弃，不落账"
+        );
+    }
+
+    /// 动作回执显式失败 → 该 key 的该能力 degraded（冻结原因码），只影响它自己。
+    #[tokio::test]
+    async fn explicit_receipt_failure_degrades_only_that_capability() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(selection_baseline());
+        fake.set_execute_receipt(ActionState::Rejected, None);
+        let (hub, _events, _pump) = confirmation_hub(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["model", "thought_level"]),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(
+                ctx("selection-reject-1"),
+                selection_action(generation, "GLM-5.3-Flash", "high"),
+            )
+            .await
+            .expect("回执带回显，execute 返回 Ok");
+        assert_eq!(receipt.state, ActionState::Rejected);
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 2, "只有 model/thought_level 两行");
+        for row in &rows {
+            assert_eq!(row.state, CapabilityState::Degraded);
+            assert_eq!(row.evidence.as_deref(), Some("explicit_failure"));
+            assert!(
+                matches!(row.reason_code.as_deref(), Some("action_failed") | Some(_)),
+                "原因码是判据标识形状"
+            );
+        }
+        assert!(
+            rows.iter()
+                .all(|row| matches!(row.capability, Capability::Model | Capability::ThoughtLevel)),
+            "degraded 只影响本动作涉及的能力，不波及 send 等"
+        );
+    }
+
+    /// 回执已是因果终态（CommandSender 的 wait_selection 命中）→ 直接落账 confirmed。
+    #[tokio::test]
+    async fn confirmed_receipt_writes_selection_ledger() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(selection_baseline());
+        fake.set_execute_receipt(ActionState::Confirmed, None);
+        let (hub, _events, _pump) = confirmation_hub(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["model", "thought_level"]),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        let receipt = hub
+            .execute(
+                ctx("selection-confirm-1"),
+                selection_action(generation, "GLM-5.3-Flash", "low"),
+            )
+            .await
+            .expect("confirmed 回执返回 Ok");
+        assert_eq!(receipt.state, ActionState::Confirmed);
+
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.state, CapabilityState::Confirmed);
+            assert_eq!(row.evidence.as_deref(), Some("selection_matched"));
+        }
+    }
+
+    /// ACK-only 的 selection：事件泵观察带错误模型的新快照 → 不确认（保持候选），
+    /// 直到短窗到期写 inconclusive；正确模型的新快照则确认落账。
+    #[tokio::test]
+    async fn pump_observation_confirms_selection_only_on_exact_match() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(selection_baseline());
+        let (hub, events, pump) = confirmation_hub(
+            fake.clone(),
+            ledger.clone(),
+            policy_with(&["model", "thought_level"]),
+        )
+        .await;
+        let generation = hub.connection().generation;
+
+        hub.execute(
+            ctx("selection-pump-1"),
+            selection_action(generation, "GLM-5.3-Flash", "low"),
+        )
+        .await
+        .expect("selection 应被受理");
+
+        // 错误模型的新快照（ACK-only 形态）：不确认。
+        let mut wrong = changed_view("sess_synthetic0000", 11);
+        wrong.selection = Some(SelectionView {
+            provider: "synthetic-provider".into(),
+            model: "GLM-5.3".into(),
+            thought: Some("low".into()),
+            models: Vec::new(),
+        });
+        pump.push_outcome(Ok(()), vec![wrong]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 4})))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            ledger.get(&confirmation_key()).is_empty(),
+            "wrong model 不确认（保持候选）"
+        );
+
+        // 正确模型的新快照：model/thought_level 各落一行 confirmed。
+        let mut right = changed_view("sess_synthetic0000", 12);
+        right.selection = Some(SelectionView {
+            provider: "synthetic-provider".into(),
+            model: "GLM-5.3-Flash".into(),
+            thought: Some("low".into()),
+            models: Vec::new(),
+        });
+        pump.push_outcome(Ok(()), vec![right]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 5})))
+            .await
+            .unwrap();
+        wait_until_with_sleep(|| ledger.get(&confirmation_key()).len() == 2).await;
+        for row in ledger.get(&confirmation_key()) {
+            assert_eq!(row.state, CapabilityState::Confirmed);
+            assert_eq!(row.evidence.as_deref(), Some("selection_matched"));
+        }
+    }
+
+    /// 已 confirmed 的能力不再重复确认：登记面跳过，后续确认性观察不得改写账本。
+    #[tokio::test]
+    async fn already_confirmed_capability_is_not_reconfirmed() {
+        let store = stored(URL);
+        let ledger: Arc<dyn CapabilityLedger> = Arc::new(DbCapabilityLedger::new(store.clone()));
+        ledger
+            .put(
+                &confirmation_key(),
+                &CapabilityRecord::confirmed(Capability::Send),
+            )
+            .unwrap();
+        let fake = Arc::new(FakeBackend::default());
+        fake.set_baseline(send_baseline());
+        let (hub, events, pump) =
+            confirmation_hub(fake.clone(), ledger.clone(), send_policy()).await;
+        let generation = hub.connection().generation;
+
+        hub.execute(ctx("send-again-1"), send_action(generation))
+            .await
+            .expect("send 应被受理");
+        pump.set_fingerprint("sess_synthetic0000", "u1");
+        pump.push_outcome(Ok(()), vec![changed_view("sess_synthetic0000", 11)]);
+        events
+            .send(RelayEvent::Data(serde_json::json!({"seq": 6})))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let rows = ledger.get(&confirmation_key());
+        assert_eq!(rows.len(), 1, "不产生新行");
+        assert_eq!(rows[0].state, CapabilityState::Confirmed);
+        assert_eq!(
+            rows[0].evidence, None,
+            "预置行未被确认流程改写（登记面已跳过）"
+        );
     }
 }

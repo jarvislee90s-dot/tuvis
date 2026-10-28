@@ -41,6 +41,7 @@ use base64::Engine as _;
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 
+use super::capability::confirm::ConfirmationObservation;
 use super::capability::state::ZcodeInterfaceEvidence;
 use super::codec::{
     crc32_hex, decode_channel, encode_ack, encode_call, encode_frame, encode_listen,
@@ -667,6 +668,10 @@ struct SessionEntry {
     target: BoundTarget,
     bridge_id: String,
     projection: Projection,
+    /// 会话日志头指纹（T5 首次确认的 send 观察面）：快照 `logEpoch:seq` 的 id 形状
+    /// 组合，只标识「日志头在哪」，**绝不**承载任何正文。快照整体替换、patch 前进
+    /// `seq`、两者皆缺保持不变；无完整 (epoch, seq) 对 = `None`（无指纹证据）。
+    log_fingerprint: Option<String>,
     staged: Vec<StagedFrame>,
     staged_bytes: usize,
     /// 暂存帧/在途分片的总字节预算（来自 [`BridgeLimits::staged_bytes`]）。
@@ -691,6 +696,7 @@ impl SessionEntry {
             target,
             bridge_id,
             projection,
+            log_fingerprint: None,
             staged: Vec::new(),
             staged_bytes: 0,
             staged_budget,
@@ -1388,6 +1394,33 @@ impl BridgeManager {
             book.host_pending_revision(),
             book.host_has_pending(interaction_id),
         ))
+    }
+
+    /// T5 确认观察：精确会话的 revision / 当前选择 provider / 日志头指纹。
+    ///
+    /// 状态锁内**纯读**（零网络、零重订阅、零出站帧）：动作提交路径的 baseline 与
+    /// 事件泵的确认观察共用同一来源。会话不存在 → `None`（绝不拿兄弟会话顶替）。
+    pub(crate) fn confirmation_observation(
+        &self,
+        session_id: &str,
+    ) -> Option<ConfirmationObservation> {
+        let inner = lock(&self.shared.state);
+        let entry = inner.sessions.get(session_id)?;
+        let view = entry.projection.view();
+        Some(ConfirmationObservation {
+            revision: view.revision,
+            provider: view.selection.as_ref().map(|s| s.provider.clone()),
+            log_fingerprint: entry.log_fingerprint.clone(),
+        })
+    }
+
+    /// T5 确认观察：精确会话的日志头指纹（事件泵观察面；缺席 = 无证据）。
+    pub(crate) fn log_fingerprint(&self, session_id: &str) -> Option<String> {
+        lock(&self.shared.state)
+            .sessions
+            .get(session_id)?
+            .log_fingerprint
+            .clone()
     }
 }
 
@@ -3367,6 +3400,9 @@ fn apply_frame(
     // 订阅上的真实下行流量；观察是幂等 OR 的存在性记录（宿主宣告过的形状不因
     // 本帧应用成败回退），且避免为观察克隆整帧。
     interface.observe_conversation_frame(&frame);
+    // T5：日志头指纹同步推进（send 确认的「新用户消息可见」观察面；id 形状，
+    // 不存正文）。快照应用成败不回退指纹——指纹跟随帧内容，不跟随投影状态。
+    entry.log_fingerprint = advance_log_fingerprint(entry.log_fingerprint.as_deref(), &frame);
     match entry
         .projection
         .apply(entry.target.bridge_generation(), frame)
@@ -3384,6 +3420,71 @@ fn apply_frame(
 fn mark_session_unready(entry: &mut SessionEntry) {
     entry.needs_resync = true;
     entry.projection.set_ready(false);
+}
+
+/// 从一条会话帧推进日志头指纹（T5；spec R4「新用户消息可见」的观察面）。
+///
+/// 语义：会话日志的头位置由 `(logEpoch, seq)` 标识——新消息（含 send 回显的
+/// 用户消息）追加即前进。快照整体替换两个键；`state.updated` patch 通常只带
+/// `seq`（沿用旧 epoch）；两者皆缺（pending/control/config 等其他字段的变化）
+/// 指纹不变。合成规则：
+/// - 无完整 (epoch, seq) 对（从未见过快照或字段缺席）→ `None`：无指纹证据，
+///   send 确认保守不升级（绝不用半个指纹伪造「变化」）；
+/// - 指纹是 id 形状的 `"{epoch}:{seq}"`，不含任何正文。
+fn advance_log_fingerprint(previous: Option<&str>, frame: &Value) -> Option<String> {
+    let Some(payload) = frame.get("payload") else {
+        return previous.map(str::to_owned);
+    };
+    // 本帧暴露的 (epoch, seq) 片段：快照整体替换、patch 逐个喂入。
+    let mut epoch: Option<String> = None;
+    let mut seq: Option<u64> = None;
+    let mut touched = false;
+    let mut feed = |object: &Value| {
+        if let Some(value) = object.get("logEpoch").and_then(Value::as_str) {
+            epoch = Some(value.to_owned());
+            touched = true;
+        }
+        if let Some(value) = object.get("seq").and_then(Value::as_u64) {
+            seq = Some(value);
+            touched = true;
+        }
+    };
+    match payload.get("kind").and_then(Value::as_str) {
+        Some("snapshot") => {
+            if let Some(snapshot) = payload.get("snapshot") {
+                feed(snapshot);
+            }
+        }
+        Some("deltas") => {
+            for patch in payload
+                .get("deltas")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if patch.get("op").and_then(Value::as_str) == Some("state.updated") {
+                    if let Some(patch) = patch.get("patch") {
+                        feed(patch);
+                    }
+                }
+            }
+        }
+        // 其他 payload（controller 帧等）：与会话日志无关，指纹不变。
+        _ => return previous.map(str::to_owned),
+    }
+    if !touched {
+        return previous.map(str::to_owned);
+    }
+    // 本帧缺的半边沿用旧指纹的对应半边（patch 通常只前进 seq）。
+    let (previous_epoch, previous_seq) = previous
+        .and_then(|value| value.rsplit_once(':'))
+        .map(|(epoch, seq)| (Some(epoch.to_owned()), seq.parse::<u64>().ok()))
+        .unwrap_or((None, None));
+    match (epoch.or(previous_epoch), seq.or(previous_seq)) {
+        (Some(epoch), Some(seq)) => Some(format!("{epoch}:{seq}")),
+        // 缺任一半：无可用指纹证据（保守方向——send 确认等完整对）。
+        _ => None,
+    }
 }
 
 fn parse_workspace_entry(value: &Value) -> Option<WorkspaceEntry> {
