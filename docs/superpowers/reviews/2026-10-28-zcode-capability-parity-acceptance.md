@@ -13,10 +13,10 @@
 
 | 维度 | 判定 | 依据 |
 | --- | --- | --- |
-| `code_complete`（本任务范围） | **是** | UI 合规钉住测试 + 未知 build 全链 e2e 全 GREEN；全量门禁 9 条全绿（§三） |
+| `code_complete`（本任务范围） | **是** | UI 合规钉住测试 + 未知 build 全链 e2e **两条腿**（send 首条确认 + pending 卡首答确认）全 GREEN；全量门禁 9 条全绿（§三） |
 | `platform_validated` | **否** | 实机未知 build 验证、send 指纹推进形态取证、takeover 真机端到端**未执行**（§四） |
 | `real_official_verified` | **否** | e2e 使用回环假官方 + 合成会话/任务索引；未连接真实官方 relay / 账号 |
-| `spec_complete` | **本任务是** | R5/§7.6 UI 验收项逐条钉住；§7.3 的 e2e 证明面已闭合（§二）；偏差已在 spec §12 记录 |
+| `spec_complete` | **本任务是** | R5/§7.6 UI 验收项逐条钉住；§7.3 的 e2e 证明面（send/answer 两腿 + 零探针）已闭合（§二）；偏差已在 spec §12 记录 |
 
 **一句话结论：Task 9 代码与自动化门禁完成；实机（真实未知 build / 真实 send 指纹形态 /
 真实手机抢回）验收未跑，如实留待平台验收。**
@@ -41,13 +41,17 @@ arrival；先读 `src/mobile/ZcodeControlPanel.tsx` 现状，未重复造轮子�
 
 ### 2.2 未知 build 全链 e2e（spec §7.3/§8）
 
-新增 `unknown_build_send_confirms_without_probe_message`
-（`src-tauri/src/services/zcode_control/wire_e2e.rs`），真实生产组件 × 回环假官方：
+新增两条 resolver 驱动全链用例（`src-tauri/src/services/zcode_control/wire_e2e.rs`），
+真实生产组件 × 回环假官方（brief 验收三项：send 首条确认 / pending 卡首答确认 /
+无额外探针文本——**两条腿都已覆盖，无范围缩减**）：
 
-- **装配**：`PartsBackend::production_test_with_host_build`（新测试装配缝，确定性注入
-  未知 build `9.9.9.9999`）+ `ZcodeHub::with_pump_policy_source_and_confirmation`
-  （策略矩阵 = 生产同源 capability resolver，确认落账与 resolver 共用同一 DB 账本；
-  不注入静态矩阵——这是与既有 `full_chain` 用例的本质差别）。
+**共用装配**：`PartsBackend::production_test_with_host_build`（新测试装配缝，确定性注入
+未知 build `9.9.9.9999`）+ `ZcodeHub::with_pump_policy_source_and_confirmation`
+（策略矩阵 = 生产同源 capability resolver，确认落账与 resolver 共用同一 DB 账本；
+不注入静态矩阵——这是与既有 `full_chain` 用例的本质差别）。
+
+#### 腿 1：`unknown_build_send_confirms_without_probe_message`
+
 - **断言面**（全部经真实 HTTP/router/Hub/Relay/Bridge/CommandSender/事件泵）：
   1. resolver 候选开放：GET session → `send.enabled=true` 且无原因码；形状缺席的
      singleSelect/multiSelect/freeText/model/interrupt 保持 `needs_evidence`；
@@ -64,18 +68,44 @@ arrival；先读 `src/mobile/ZcodeControlPanel.tsx` 现状，未重复造轮子�
   （`send 后会话 revision 必须前进到 2`，5s 等待超时；确认账本同样无 confirmed 行）；
   补上假体跟进快照后 GREEN，且 13 个既有 wire_e2e 用例无一破坏。
 
-### 2.3 假体跟进快照的边界（非探针消息的说明）
+#### 腿 2：`unknown_build_answer_confirms_pending_without_probe_message`（审查修复补腿）
 
-假体在 `sendConversationCommandV4` **Accepted** ACK 后推一条 revision=2 的会话快照：
-它不由生产代码发出、不携带任何文本，只是让假体作为「宿主状态」的形态来源给出 R4
-确认判据要求的观察证据（宿主吸收消息后 revision/日志头前进）。`rejected`/`malformed`
-ACK 不推（宿主状态未前进），与既有 `rejected/malformed` 用例语义一致。
+- **场景**：未知 build 会话快照带一张合成 AskUserQuestion 单选卡（wire 形状钉
+  `pending.rs` 解析的官方形态，全合成值）→ resolver 候选开放 `single_select`
+  （无原因码；无 permission 形状的 approvalReply 保持关闭）→ 提交一条真实 Answer
+  （经生产 `check_answer_precheck` → `authorize_pending` → `build_user_answer`
+  全链）→ 宿主撤卡 + revision 前进 → 账本 confirmed。
+- **断言面**：
+  1. 合成卡随真实投影上会话视图（`pending[0].interactionId` 精确相等）；
+  2. **恰一条**答案命令帧：`resolveInteraction` 信封精确指向宿主卡 id、答案以宿主
+     题干为键回传宿主原值（`answers[题干] = "opt-continue"`）、`clientId` 来自配对门、
+     零终端注入回落、零探针文本；
+  3. 作答后 GET 会话：目标卡撤下 + revision 2（确认判据的可观察证据）；
+  4. 账本 `single_select` 行 `state=confirmed`，判据词为两条生产路径之一
+     （回执因果终态 `pending_cleared`，或泵观察 `pending_cleared+revision_advanced`）；
+  5. 业务请求序列逐条钉死（同腿 1 的 9 帧，第 9 帧为用户的 answer），静置观察窗后
+     仍恰一帧命令信封。
+- **RED → GREEN**：假体跟进快照**不撤卡**（宿主未撤卡形态）→ RED：回执停在
+  `accepted`（派发内 `wait_host_cleared` 走满 10s 窗不伪造终态；账本无 confirmed 行），
+  失败点 `宿主撤下目标卡后 Answer 必须拿到因果终态 confirmed`；假体按宿主真实行为
+  在 Accepted ACK 后撤卡（跟进快照 pending 置空）→ GREEN（0.2s 级，确定性）。
+
+#### 共用说明：假体跟进快照的边界（非探针消息）
+
+假体在 `sendConversationCommandV4` **Accepted** ACK 后推一条 revision=2 的会话快照
+（send 腿：宿主吸收消息后的状态推进；answer 腿：同一机制下 pending 整体替换置空 =
+宿主撤下已作答的卡）：它不由生产代码发出、不携带任何文本，只是让假体作为「宿主
+状态」的形态来源给出 R4 确认判据要求的观察证据。`rejected`/`malformed` ACK 不推
+（宿主状态未前进），与既有 `rejected/malformed` 用例语义一致。
 
 ## 三、全量门禁（brief Step 4 逐字命令，最终代码状态重验）
 
+> 审查修复轮（补 pending 首答腿）后重验：门禁 1/2/3/4/5/6 与 fmt 后复跑全部保持
+> GREEN；下表为最终数字。
+
 | # | 命令 | 结果 |
 | --- | --- | --- |
-| 1 | `cargo test --lib services::zcode_control::` | **GREEN**：550 passed / 0 failed |
+| 1 | `cargo test --lib services::zcode_control::` | **GREEN**：551 passed / 0 failed（含新增 answer 腿） |
 | 2 | `cargo test --features marker-helper` | **GREEN**：全目标 0 failed（含 lib 3521 + 集成各套件） |
 | 3 | `cargo test --tests --features marker-helper,zcode-bridge-evidence` | **GREEN**：全目标 0 failed |
 | 4 | `cargo clippy --all-targets --features marker-helper -- -D warnings` | **GREEN** |
