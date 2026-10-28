@@ -33,6 +33,7 @@ pub mod auth;
 // C3 起由 Hub 的 `start_auto_connect` 使用（单 worker、一次尝试）；不对外导出。
 mod auto_connect;
 pub mod bridge;
+pub(crate) mod capability;
 pub mod codec;
 pub mod command;
 pub mod config;
