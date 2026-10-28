@@ -1,3 +1,5 @@
+> **2026-10-28 追加**：定点复审的 8 项 P2 已全部修复并通过独立复审，最终代码 HEAD `5b790daf`；详见 [2026-10-28-zcode-p2-fixes-report.md](2026-10-28-zcode-p2-fixes-report.md)。本文件其余 C1–H3 结论保留。
+
 # ZCode 凭据复用与自动恢复连接 · 最终执行报告
 
 日期：2026-10-27～28。分支：`codex/zcode-unified-remote`。最终代码 HEAD：`b589711d`。
