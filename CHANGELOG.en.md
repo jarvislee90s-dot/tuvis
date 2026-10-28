@@ -91,6 +91,15 @@ _Only versions translated so far are listed here; the full history lives in the
   Choices are saved as soon as checked, remembered in this device's browser localStorage only,
   and affect the exported image only — the "Copy text" summary is unchanged.
 
+- **Orientation-aware default layout on the mobile page**: the remote session detail
+  now picks its default view by viewport aspect ratio — wider than 1.2× the height
+  (landscape) opens with messages on the left and the file pane on the right, while
+  portrait and near-square viewports default to the chat-only view. Rotating or
+  resizing re-evaluates once; the four layouts (messages only / file only /
+  side-by-side / stacked) stay manually switchable from the split bar. The default
+  layout when opening a file in portrait is unchanged, and while a file is open in
+  full-screen reading mode, rotating or resizing keeps it full-screen.
+
 ### Changed
 
 - **Usage record cards gain a header and request counts**: each tool card on the Records tab now has a three-column header (provider display name / tokens / requests), shows the **request count** to the right of tokens on every row, and adds a totals row (token and request totals) at the bottom.

@@ -43,6 +43,8 @@ import ProjectedArtifacts, { buildArtifactMessageContexts } from "./ProjectedArt
 import useArtifactImages from "./useArtifactImages";
 import useCodexThread from "./useCodexThread";
 import useDelayedUnsupported from "./useDelayedUnsupported";
+import { useViewportKind } from "./useViewportKind";
+import type { ViewportKind } from "./viewport";
 import useArtifactJump, {
   ARTIFACT_JUMP_MAX_PAGES,
   type ArtifactJumpFailure,
@@ -124,6 +126,22 @@ type PreviewState = {
    *  不是新的打开，不递增。 */
   openSeq: number;
 };
+
+/** 该方向的**默认布局**（2026-10-27 用户裁决 U2/U3）：
+ *  - 横屏（宽 > 高 × 1.2）→ 左消息 + 右文件窗格，即 files sheet 看板态 + 左右分屏；
+ *  - 竖屏 → 聊天框（null = 不渲染任何预览窗格，与既有默认一致）。
+ *  纯函数、每次返回新字面量：内部不发请求也不订阅，可在 useState 的 lazy initializer
+ *  里安全地跑两次（StrictMode 双调）。openSeq 归零——旋转不是「显式打开」。 */
+function defaultPreviewFor(kind: ViewportKind): PreviewState | null {
+  if (kind !== "landscape") return null;
+  return {
+    sheet: "files",
+    open: { kind: "none" },
+    mode: "split-h",
+    backToList: false,
+    openSeq: 0,
+  };
+}
 
 /** 面板默认追溯档位（首屏数据源，与详情页默认 limit 同标尺） */
 const FILE_DEFAULT_SCOPE = 200;
@@ -412,7 +430,11 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const subagentTick = session.status === "finished" ? 0 : refreshTick;
   // 追溯档位（M3+ 用户裁决 3）：面板三档 200/500/1000，切档重拉
   const [fileScope, setFileScope] = useState<number>(FILE_DEFAULT_SCOPE);
-  const [fileLoading, setFileLoading] = useState(false);
+  // 初值 true（2026-10-27 横竖屏自适应配套）：横屏进详情会**立即挂载文件看板**，
+  // 初值 false 会先闪一帧「该范围内未发现文件」（FilePanel 的 panel-empty 判据是
+  // entries 为空 ∧ 非 loading）。下方拉取 effect 挂载即置 true、finally 置 false，
+  // 改初值只消除首帧空态，不改变任何时序。顺带修掉手动开面板的同款闪帧。
+  const [fileLoading, setFileLoading] = useState(true);
   // ===== Task 7：文件池合并与五页反向定位 =====
   // 引用范围 = 当前显示窗口（尾窗 + 已滚出的保留缓冲）+ Task 5 预算内更早页：
   // `boundedCodexHistoryWindow` 在这里只做边界收敛的便利——保留缓冲必须并入，
@@ -449,7 +471,14 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>(() => listBookmarks(session.id));
   // 跳转失败提示（书签指向更早范围，当前窗口内找不到）
   const [bookmarkJumpMiss, setBookmarkJumpMiss] = useState(false);
-  const [preview, setPreview] = useState<PreviewState | null>(null);
+  // 方向判定（2026-10-27 用户裁决 U1：宽 > 高 × 1.2 = 横屏，其余竖屏）：默认布局与
+  // 分辨率变化时的重置都以它为唯一依据；变化监听见下方「方向变化」effect
+  const viewportKind = useViewportKind();
+  // 预览态初值按当前方向给默认（U2/U3）：横屏 = 右栏文件看板 + 左右分屏；竖屏 = null = 聊天框。
+  // 用 lazy initializer 而非「先 null 再 effect 补齐」——后者会先画一帧纯聊天再弹出右栏
+  const [preview, setPreview] = useState<PreviewState | null>(() =>
+    defaultPreviewFor(viewportKind)
+  );
   /** Task 7：定位动作在窄屏关闭的全屏预览快照——失败/结束后可原样返回；
    *  宽屏分屏下预览仍在，快照为 null（不需要返回入口）。 */
   const [jumpReturnPreview, setJumpReturnPreview] = useState<PreviewState | null>(null);
@@ -666,7 +695,9 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     [isCollapsed]
   );
 
-  /** 宽屏判定（matchMedia 防御式访问；jsdom / 隐私模式可能缺失，theme.ts 同款口径） */
+  /** 宽屏判定（matchMedia 防御式访问；jsdom / 隐私模式可能缺失，theme.ts 同款口径）。
+   *  **仅作竖屏下「点文件默认布局」的回退口径**（2026-10-27 用户裁决 U5：竖屏手动点文件
+   *  的默认布局不改）——方向判定本身一律走 viewportKind（纯宽高比），不看这个阈值 */
   const isWideViewport = useCallback((): boolean => {
     try {
       return window.matchMedia?.("(min-width: 768px)")?.matches ?? false;
@@ -675,22 +706,30 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     }
   }, []);
 
+  /** 打开预览时的默认布局：横屏恒 split-h（U3 的延伸——横屏点文件不该掉回全屏浮层）；
+   *  竖屏沿用既有 ≥768px 口径（U5 明确不改），与旋转默认互不干扰 */
+  const defaultPreviewMode = useCallback(
+    (): PreviewMode =>
+      viewportKind === "landscape" || isWideViewport() ? "split-h" : "fullscreen",
+    [viewportKind, isWideViewport]
+  );
+
   // 点文件链接（消息正文）→ 预览。Bug 2 顺手项（spec P9「按屏幕宽度自适应」）：
   // ≥768px 分屏（2026-09-20 裁决 + T2 决策 2 收口：宽屏默认 split-h = 左对话右文件）、
-  // <768px 全屏；手动切换随时覆盖该默认值。
+  // <768px 全屏；手动切换随时覆盖该默认值。2026-10-27 起横屏恒 split-h（见 defaultPreviewMode）。
   // 正文进入 → files sheet 选中该文件，backToList=false（无返回列表按钮，既有行为不变）
   const openFile = useCallback(
     (path: string) => {
       setPreview((p) => ({
         sheet: "files",
         open: { kind: "file", path },
-        mode: isWideViewport() ? "split-h" : "fullscreen",
+        mode: defaultPreviewMode(),
         backToList: false,
         // 每次显式打开都推进刷新键（同一路径再点一次也重读当前内容）
         openSeq: (p?.openSeq ?? 0) + 1,
       }));
     },
-    [isWideViewport]
+    [defaultPreviewMode]
   );
 
   // 从文件看板进入单文件预览（M3+）：backToList=true → 预览页头显示返回按钮；
@@ -715,12 +754,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
       setPreview((p) => ({
         sheet: "subagents",
         open: { kind: "subagent", id },
-        mode: isWideViewport() ? "split-h" : "fullscreen",
+        mode: defaultPreviewMode(),
         backToList: true,
         openSeq: p?.openSeq ?? 0,
       }));
     },
-    [isWideViewport]
+    [defaultPreviewMode]
   );
 
   // 清单看板点卡进入（观察台 §二.5）：沿用当前 mode（往返保持，openFileFromList 同款）
@@ -744,8 +783,8 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     );
   }, []);
 
-  // 页头面板入口（M3+）：宽屏默认 split-h（列表是行集，右侧整列纵向空间大）、
-  // 窄屏 fullscreen（用户裁决：面板默认布局口径）。
+  // 页头面板入口（M3+）：默认布局见 defaultPreviewMode（横屏恒 split-h；竖屏沿用
+  // ≥768px 口径）。2026-10-27 起横屏进详情时面板本就开着，此钮即「收起右栏」。
   // 面板开启态 = files sheet 看板态（页头按钮高亮依据；文件预览/子 agent 详情
   // 不算——那是从看板或正文进入的下一层）；再点收回（ZCode 式排版，2026-09-16 用户裁决）
   const panelOpen = preview !== null && preview.sheet === "files" && preview.open.kind === "none";
@@ -756,12 +795,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         : {
             sheet: "files",
             open: { kind: "none" },
-            mode: isWideViewport() ? "split-h" : "fullscreen",
+            mode: defaultPreviewMode(),
             backToList: false,
             openSeq: p?.openSeq ?? 0,
           }
     );
-  }, [isWideViewport]);
+  }, [defaultPreviewMode]);
 
   const closePreview = useCallback(() => setPreview(null), []);
 
@@ -774,12 +813,12 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
         : {
             sheet: "files",
             open: { kind: "none" },
-            mode: isWideViewport() ? "split-h" : "fullscreen",
+            mode: defaultPreviewMode(),
             backToList: false,
             openSeq: p?.openSeq ?? 0,
           }
     );
-  }, [isWideViewport]);
+  }, [defaultPreviewMode]);
 
   // 从二级内容（文件预览 / 子 agent 详情）返回所在 sheet 的看板态（保持当前布局 mode）
   const backToBoard = useCallback(() => {
@@ -919,6 +958,33 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
     clearJumpHighlight();
     setJumpReturnPreview(null);
   }, [session.id, clearJumpHighlight]);
+
+  // 方向 / 分辨率变化（2026-10-27 用户裁决 U4：变化时检查一次，回到该方向默认；
+  // 2026-10-28 U7 追加例外：**全屏阅读文件时一律维持全屏**）。
+  // **只依赖 viewportKind**——若把 preview 读进 effect 或写进 deps，每次布局变动都会
+  // 重跑：横屏手切全屏被立刻拽回 split-h、竖屏手动打开预览被立刻关掉，切换器与页头
+  // 📁 钮全哑。故用函数式 updater 读旧值、用 prevKindRef 判首次（不用布尔门闩：
+  // StrictMode 双挂载会多跑一次重置）。
+  // 两向都清返回快照：竖屏「定位」留下的 fullscreen 快照若跨旋转存活，横屏点「返回
+  // 文件预览」会在横屏弹出竖屏时代的全屏浮层。清快照必须写在 updater 之外（updater
+  // 须是纯函数，StrictMode 下可能执行两次）。
+  const prevKindRef = useRef(viewportKind);
+  useEffect(() => {
+    if (prevKindRef.current === viewportKind) return;
+    prevKindRef.current = viewportKind;
+    setJumpReturnPreview(null);
+    setPreview((p) => {
+      // 例外（U7）：当前处于全屏阅读态时原样维持。判据是**此刻的状态**（mode），
+      // 不是「用户是否手动切过全屏」——竖屏窄屏点文件默认就是全屏，此刻同样算
+      // 「正在全屏阅读」，旋转一并豁免。左右分屏 / 上下分屏则照常按方向重排。
+      if (p?.mode === "fullscreen") return p;
+      if (viewportKind === "landscape") {
+        // 竖→横：聊天框状态下打开右栏看板；已有预览则保留内容、只改布局
+        return p === null ? defaultPreviewFor("landscape") : { ...p, mode: "split-h" };
+      }
+      return null; // 横→竖：回聊天框（U4 直译：不保留预览）
+    });
+  }, [viewportKind]);
 
   // 消息渲染器（观察台 T6 起迁至 ./message-render 共用）：renderBody 消费本页
   // 既有 openFile（正文路径点击 → 预览）与 files（链接化路径集）
@@ -1718,7 +1784,10 @@ export default function SessionDetail({ session, onBack }: SessionDetailProps) {
   ) : null;
 
   return (
-    <div className="flex h-dvh flex-col bg-[var(--pg)] text-[var(--tx)]">
+    <div
+      data-viewport={viewportKind}
+      className="flex h-dvh flex-col bg-[var(--pg)] text-[var(--tx)]"
+    >
       <header className="flex shrink-0 items-center gap-2 border-b border-[var(--cb)] px-3 py-2">
         <button
           type="button"
