@@ -39,7 +39,7 @@
 | --- | --- |
 | `cargo test --features marker-helper` | **3942 passed / 0 failed / 46 ignored**，EXIT 0 |
 | `cargo test --tests --features marker-helper,zcode-bridge-evidence` | **3961 passed / 0 failed / 46 ignored**，EXIT 0 |
-| `cargo test --lib --features marker-helper,zcode-bridge-evidence` | **3427 passed / 0 failed / 38 ignored** |
+| `cargo test --lib --features marker-helper,zcode-bridge-evidence` | **3428 passed / 0 failed / 38 ignored** |
 | 集成 4 套件 | `zcode_control_remote` 25、`zcode_control_e2e` 8、`zcode_config_remote` 3、`zcode_read_remote` 5，全 0 failed |
 | clippy 普通/证据 `--all-targets -D warnings` | 两构建 **0 warning**，EXIT 0 |
 | `cargo fmt --check` | EXIT 0 |
@@ -47,7 +47,7 @@
 | `pnpm check` | EXIT 0（format/lint/i18n/error-codes/tsc+build） |
 | `pnpm build:mobile` | EXIT 0 |
 
-环境说明：本机默认 `~/.cargo` 被沙箱拒绝，Rust 门禁使用 `CARGO_HOME=/tmp/dsh-cargo-home`。证据构建的 doctest 在该临时 CARGO_HOME 下 rustdoc 无法解析 extern crate（普通全量 doctest 通过），因此证据构建以 `--tests`/`--lib` 取证；一次 relay 半开写测试在并行负载下超时，单独复跑 PASS，属既有 timing 敏感测试。
+环境说明：本机默认 `~/.cargo` 被沙箱拒绝，Rust 门禁使用 `CARGO_HOME=/tmp/dsh-cargo-home`。证据构建的 doctest 在该临时 CARGO_HOME 下 rustdoc 无法解析 extern crate（普通全量 doctest 通过），因此证据构建以 `--tests`/`--lib` 取证；一次 relay 半开写测试在并行负载下超时，单独复跑 PASS，属既有 timing 敏感测试；另有一次全量 lib 报 3427/1 failed 未留下用例名，随后连续 3 次全量与 5 轮定向均未复现，按负载下闪失败记录。
 
 ## 四、独立审查
 
