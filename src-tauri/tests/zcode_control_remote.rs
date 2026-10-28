@@ -11,14 +11,15 @@ use multi_agents_manager_lib::remote::pairing::{
 use multi_agents_manager_lib::remote::server::{router, RemoteState};
 use multi_agents_manager_lib::remote::zcode::control_frame;
 use multi_agents_manager_lib::services::zcode_control::{
-    codes, set_config, ActionContext, ActionReceipt, ActionState, BoundTarget, CapabilityFlag,
-    CapabilityView, ConnectionState, ConnectionView, ControlAction, ControlEvent, ControlEventKind,
-    DeviceRoute, HubBackend, OAuthProvider, SessionView, TargetKey, ZResult, ZcodeError, ZcodeHub,
+    codes, set_config, ActionContext, ActionReceipt, ActionState, AuthStatus, BoundTarget,
+    CapabilityFlag, CapabilityView, ConnectionState, ConnectionView, ControlAction, ControlEvent,
+    ControlEventKind, DeviceRoute, HubBackend, OAuthProvider, SessionView, TargetKey, ZResult,
+    ZcodeError, ZcodeHub,
 };
 use multi_agents_manager_lib::session::{
     AgentType, ProcessForm, Session, SessionStatus, SessionsResponse,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt as _;
 
@@ -264,6 +265,14 @@ async fn send_info_advertises_official_control_without_connected() {
 #[derive(Default)]
 struct FakeHubBackend {
     connect_calls: AtomicUsize,
+    /// T8 抢回观察：`disconnect` 被调次数（quiesce 两段语义与 hub 单测同口径）。
+    disconnect_calls: AtomicUsize,
+    /// T8 抢回观察：`authorize` 被调次数（零 OAuth 断言面）。
+    authorize_calls: AtomicUsize,
+    /// T8 抢回替身：`auth_status` 是否已授权（默认未授权；抢回重连前由用例置位）。
+    auth_authorized: AtomicBool,
+    /// T8 抢回替身：下一次 `connect` 的合成结果（`None` = 默认 paired 视图）。
+    connect_result: Mutex<Option<ZResult<ConnectionView>>>,
     bind_calls: Mutex<Vec<TargetKey>>,
     execute_calls: AtomicUsize,
     contexts: Mutex<Vec<ActionContext>>,
@@ -274,6 +283,23 @@ struct FakeHubBackend {
 impl FakeHubBackend {
     fn connect_calls(&self) -> usize {
         self.connect_calls.load(Ordering::SeqCst)
+    }
+
+    fn disconnect_calls(&self) -> usize {
+        self.disconnect_calls.load(Ordering::SeqCst)
+    }
+
+    fn authorize_calls(&self) -> usize {
+        self.authorize_calls.load(Ordering::SeqCst)
+    }
+
+    fn set_auth_authorized(&self, authorized: bool) {
+        self.auth_authorized.store(authorized, Ordering::SeqCst);
+    }
+
+    /// 设定下一次 `connect` 的合成结果（抢回用例先 conflict 后 paired）。
+    fn set_connect_result(&self, result: ZResult<ConnectionView>) {
+        self.connect_result.lock().unwrap().replace(result);
     }
 
     fn bind_calls(&self) -> Vec<TargetKey> {
@@ -299,6 +325,7 @@ impl HubBackend for FakeHubBackend {
         _provider: OAuthProvider,
         _open: multi_agents_manager_lib::services::zcode_control::OpenAuthorize,
     ) -> futures::future::BoxFuture<'a, ZResult<()>> {
+        self.authorize_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
     }
 
@@ -307,18 +334,29 @@ impl HubBackend for FakeHubBackend {
         _route: DeviceRoute,
     ) -> futures::future::BoxFuture<'a, ZResult<ConnectionView>> {
         self.connect_calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async {
-            Ok(ConnectionView {
-                state: ConnectionState::Paired,
-                generation: 1,
-                reason_code: None,
-                device_label: Some("fake-device".into()),
+        let injected = self.connect_result.lock().unwrap().clone();
+        Box::pin(async move {
+            injected.unwrap_or_else(|| {
+                Ok(ConnectionView {
+                    state: ConnectionState::Paired,
+                    generation: 1,
+                    reason_code: None,
+                    device_label: Some("fake-device".into()),
+                })
             })
         })
     }
 
     fn disconnect<'a>(&'a self) -> futures::future::BoxFuture<'a, ()> {
+        self.disconnect_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {})
+    }
+
+    fn auth_status(&self) -> AuthStatus {
+        AuthStatus {
+            authorized: self.auth_authorized.load(Ordering::SeqCst),
+            ..Default::default()
+        }
     }
 
     fn reset<'a>(&'a self, _generation: u64) -> futures::future::BoxFuture<'a, ()> {
@@ -437,6 +475,17 @@ fn action_req(body: &serde_json::Value, cookie: bool) -> axum::http::Request<axu
         .unwrap()
 }
 
+/// POST /m/api/v1/zcode/takeover（T8 抢回；空请求体，cookie 可选）。
+fn takeover_req(cookie: bool) -> axum::http::Request<axum::body::Body> {
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri("/m/api/v1/zcode/takeover");
+    if cookie {
+        builder = builder.header("cookie", COOKIE);
+    }
+    builder.body(axum::body::Body::empty()).unwrap()
+}
+
 /// 合法提交形状：`{actionId, action}`，动作只携合同字段（无设备/路径字段）。
 fn send_body(action_id: &str, generation: u64) -> serde_json::Value {
     serde_json::json!({
@@ -492,8 +541,16 @@ async fn unpaired_zcode_endpoints_return_403() {
             "{route} 未配对必须 403"
         );
     }
+    // T8 抢回端点同门：未配对 POST takeover 也必须 403（gate 层拦截，零 hub 调用）。
+    let resp = app.clone().oneshot(takeover_req(false)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::FORBIDDEN,
+        "未配对抢回必须 403"
+    );
     assert!(backend.bind_calls().is_empty(), "403 必须先于 hub 绑定");
     assert_eq!(backend.connect_calls(), 1, "未配对请求不得新增连接");
+    assert_eq!(backend.disconnect_calls(), 0, "未配对请求不得触发断开");
     assert_eq!(injector.calls(), 0, "零终端注入");
 }
 
@@ -525,6 +582,80 @@ async fn paired_connection_is_no_store_and_has_no_credentials() {
             "连接视图不得携带凭据字段（命中 {needle}）"
         );
     }
+}
+
+/// T8 抢回（conflict）：一次断开 + 一次重连后 200 paired；no-store；响应无凭据。
+#[tokio::test]
+async fn takeover_conflict_reconnects_once_and_reports_paired() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    let injector = Arc::new(RecordingInjector::default());
+    let backend = Arc::new(FakeHubBackend::default());
+    // 初连即 conflict（官方页把 Tuvis 踢成冲突）。
+    backend.set_connect_result(Ok(ConnectionView {
+        state: ConnectionState::Conflict,
+        generation: 1,
+        reason_code: Some(codes::CONFLICT.into()),
+        device_label: None,
+    }));
+    let hub = paired_hub(&conn, backend.clone()).await;
+    assert_eq!(hub.connection().state, ConnectionState::Conflict);
+    // 抢回重连成功：合成 paired 视图 + 后端授权事实（JWT 复用，零 OAuth）。
+    backend.set_connect_result(Ok(ConnectionView {
+        state: ConnectionState::Paired,
+        generation: 2,
+        reason_code: None,
+        device_label: Some("fake-device".into()),
+    }));
+    backend.set_auth_authorized(true);
+    let st = state(&conn, injector);
+    st.set_zcode_hub(hub);
+
+    let resp = router(st).oneshot(takeover_req(true)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(no_store(&resp), Some("no-store"), "抢回响应必须 no-store");
+    let body = body_json(resp).await;
+    assert_eq!(body["state"], "paired");
+    assert_eq!(body["deviceLabel"], "fake-device");
+    // 一次断开（quiesce 两段 backend.disconnect）+ 一次重连（初连 + 抢回重连）。
+    assert_eq!(backend.connect_calls(), 2, "抢回只重连一次");
+    assert_eq!(backend.disconnect_calls(), 2, "抢回只断开一次");
+    // 响应 DTO 不携带任何凭据形态（JWT/链接不出网）。
+    let wire = body.to_string().to_lowercase();
+    for needle in ["jwt", "token", "secret", "credential", "authorization"] {
+        assert!(
+            !wire.contains(needle),
+            "抢回响应不得携带凭据字段（命中 {needle}）"
+        );
+    }
+}
+
+/// T8 抢回（未授权）：503 `needs_auth`，零 OAuth（authorize 零调用、零连接）。
+#[tokio::test]
+async fn takeover_requires_auth_returns_needs_auth_zero_oauth() {
+    let conn = shared_conn();
+    seed_device(&conn);
+    set_config(&conn.lock().unwrap(), SYNTH_URL).expect("save synthetic url");
+    let backend = Arc::new(FakeHubBackend::default());
+    // 已配置但未授权（未走 paired_hub 的 authorize）：Hub 构造即 needs_auth。
+    let hub = Arc::new(ZcodeHub::with_parts(
+        DeviceStore::Owned(conn.clone()),
+        backend.clone(),
+        CapabilityView::default(),
+    ));
+    let st = state(&conn, Arc::new(RecordingInjector::default()));
+    st.set_zcode_hub(hub);
+
+    let resp = router(st).oneshot(takeover_req(true)).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(no_store(&resp), Some("no-store"));
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({ "error": "needs_auth" })
+    );
+    assert_eq!(backend.authorize_calls(), 0, "抢回绝不触发 OAuth");
+    assert_eq!(backend.connect_calls(), 0, "未授权不得发起连接");
+    assert_eq!(backend.disconnect_calls(), 0);
 }
 
 /// 未知 sessionId：快照对位失败 → 404 no_session，hub 零绑定。

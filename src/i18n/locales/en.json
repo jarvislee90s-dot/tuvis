@@ -2274,7 +2274,11 @@
       "pendingSnoozing": "Pausing the auto-resolution timer…",
       "selectionBlocked": "Model/thinking-level switching is not available yet — adjust it in the terminal",
       "actionBlocked": "Control is not ready (connection not paired or session not ready) — finish connecting on your computer and retry",
-      "interruptBlocked": "Interrupt is unavailable right now — handle it in the terminal"
+      "interruptBlocked": "Interrupt is unavailable right now — handle it in the terminal",
+      "takeover": "Disconnect and take over",
+      "takeoverBusy": "Disconnecting and reconnecting…",
+      "takeoverHint": "Clicking disconnects the current official page and takes over from this phone (runs once).",
+      "takeoverStillConflict": "Still in conflict: close the official ZCode page first, then try again."
     },
     "question": {
       "cancelInterrupt": "Interrupt turn (destructive)",

@@ -2274,7 +2274,11 @@
       "pendingSnoozing": "正在暂停计时…",
       "selectionBlocked": "模型/档位切换暂未开放，请在终端调整",
       "actionBlocked": "控制未就绪（连接未配对或会话未就绪），请在电脑端完成连接后再试",
-      "interruptBlocked": "当前无法打断，请在终端处理"
+      "interruptBlocked": "当前无法打断，请在终端处理",
+      "takeover": "断开并抢回",
+      "takeoverBusy": "正在断开并重新连接…",
+      "takeoverHint": "点击将断开当前官方页面的连接，并由手机重新接管（只执行一次）。",
+      "takeoverStillConflict": "仍存在冲突：请先关闭官方 ZCode 页面，稍后再试。"
     },
     "question": {
       "cancelInterrupt": "中断回合（破坏性）",

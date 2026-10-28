@@ -182,6 +182,45 @@ fn session_error(error: ZcodeError) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// POST /m/api/v1/zcode/takeover（T8：手机「断开并抢回」）
+// ---------------------------------------------------------------------------
+
+/// 抢回错误码 → HTTP 状态：持久化失败 500；其余连接态一律 503（客户端按冻结码
+/// 引导，不自动 OAuth/重试）。只下发码，无上游原文/凭据。
+fn takeover_error(error: ZcodeError) -> Response {
+    let status = match error.code.as_str() {
+        codes::STORAGE_FAILED => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    json_no_store(status, serde_json::json!({ "error": error.code }))
+}
+
+/// POST /m/api/v1/zcode/takeover：手机「断开并抢回」（spec §6.5）。
+///
+/// 安全与契约：
+/// - 与同组 zcode 路由同挂 `/m/api/v1` 配对 gate 的 nest 内——未配对在 handler
+///   之前 403，绝不触达 Hub；
+/// - 空请求体（无任何参数/字段；设备身份只在配对门，不读 body）；
+/// - 成功 200 + [`ConnectionView`](crate::services::zcode_control::ConnectionView)
+///   （与 `GET /zcode/connection` 同款 DTO，无 JWT/链接字段）；失败冻结码
+///   `{error}`；一律 `Cache-Control: no-store`；
+/// - 幂等/前置/循环语义全在 Hub（`takeover_requested`）：paired 幂等、未授权零
+///   OAuth、conflict 一次断开+重连、仍 conflict 原样返回（手机端提示先关官方页，
+///   不循环）。
+pub async fn takeover(State(st): State<Arc<RemoteState>>) -> Response {
+    let Some(hub) = st.zcode_hub() else {
+        return json_no_store(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "error": codes::NOT_READY }),
+        );
+    };
+    match hub.takeover_requested().await {
+        Ok(view) => ([(CACHE_CONTROL, "no-store")], Json(view)).into_response(),
+        Err(error) => takeover_error(error),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GET /m/api/v1/zcode/events（T7.1 B3，SSE）
 // ---------------------------------------------------------------------------
 

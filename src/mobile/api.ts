@@ -6,6 +6,13 @@ import type { ActionReceipt } from "./codexIpcApi";
 // A5：ZCode 官方远控链接的 wire DTO 与桌面端**同一个形状**（type-only import：
 // 移动端零 Tauri 运行时依赖，构建期即擦除；不得在 mobile 侧重定义另一份 DTO）
 import type { ZcodeRemoteConfig } from "@/lib/api/zcodeRemote";
+// T8 抢回：冻结码解析与错误类型复用 zcodeControl 客户端（同域同契约，不另立一份）
+import {
+  ZcodeControlApiError,
+  isZcodeErrorCode,
+  type ConnectionView,
+  type ZcodeErrorCode,
+} from "@/lib/api/zcodeControl";
 
 /** 带 HTTP 状态的请求失败（status=null 表示网络层异常，无响应可读）。
  *  详情页/预览按 status 分流错误文案（404 → 会话不可读，403 → 文件不可预览）；
@@ -564,6 +571,39 @@ export async function fetchZcodeControl(): Promise<ZcodeControlAvailability> {
   } catch {
     return zcodeAvailability("failed", null, null);
   }
+}
+
+/** 手机「断开并抢回」端点（T8，spec §6.5；POST，空请求体；配对门内 no-store）。 */
+export const ZCODE_TAKEOVER_PATH = "/m/api/v1/zcode/takeover";
+
+/**
+ * 手机「断开并抢回」（POST /m/api/v1/zcode/takeover，T8）：一次 disconnect→connect。
+ *
+ * 语义在服务端 Hub：paired 幂等返回当前；未授权回 `needs_auth`（零 OAuth）；
+ * conflict 一次断开+重连，**仍 conflict 也 200** 原样返回该视图（调用方提示先关
+ * 官方页面，本函数不循环不重试）。失败（非 2xx）抛
+ * [`ZcodeControlApiError`]：冻结码在 `code`（网络层为 `null`），调用方按码取
+ * 本地化文案，不展示 `message`。
+ */
+export async function postZcodeTakeover(): Promise<ConnectionView> {
+  let r: Response;
+  try {
+    r = await fetch(ZCODE_TAKEOVER_PATH, { method: "POST" });
+  } catch (e) {
+    throw new ZcodeControlApiError(null, null, `zcode takeover network failure: ${String(e)}`);
+  }
+  if (!r.ok) {
+    let code: ZcodeErrorCode | null = null;
+    try {
+      const body = (await r.json()) as { error?: unknown } | null;
+      const raw = body?.error;
+      if (typeof raw === "string") code = isZcodeErrorCode(raw) ? raw : "unknown";
+    } catch {
+      /* 非 JSON 错误体（代理注入页等）：code 保持 null，调用方按状态码兜底 */
+    }
+    throw new ZcodeControlApiError(r.status, code, `zcode takeover ${r.status}`);
+  }
+  return (await r.json()) as ConnectionView;
 }
 
 /** 发送回执（POST /session-send 响应四态，HTTP 200 恒定，语义在 body.status）：
