@@ -750,8 +750,9 @@ pub(crate) fn install_zcode_hub() -> std::sync::Arc<crate::services::zcode_contr
 /// 再把 `finish_zcode_hub` 交给 runtime；本函数保留给测试一次调用断言「begin +
 /// 有界等待」的组合语义（`wait` 只约束等待，超时返回 `false` 且不取消清理）。
 ///
-/// `wake` 必须与生产入口一致：远程停服 = `true`（P2-5 补唤醒），退出清理 =
-/// `false`（静默：退出只释放、不自动重连）。
+/// `wake` 必须与生产入口一致：远程停服 = `true`（P2-5 补唤醒，不动
+/// `shutting_down`），退出清理 = `false`（静默：先 `begin_shutdown` 单调停机自动
+/// 连接 worker，再只释放、不自动重连）。
 #[cfg(test)]
 async fn disconnect_zcode_hub_core(
     hub: Option<std::sync::Arc<crate::services::zcode_control::ZcodeHub>>,
@@ -761,6 +762,10 @@ async fn disconnect_zcode_hub_core(
     let Some(hub) = hub else {
         return false;
     };
+    // 与生产入口同序：退出（wake=false）先单调停机自动连接 worker，再断连接。
+    if !wake {
+        hub.begin_shutdown();
+    }
     // 前半段：同步、不持 connect_lock、不 await——到点前 Hub 必须已经 offline。
     let (_view, guard) = hub.begin_disconnect();
     finish_zcode_hub(hub, guard, wait, wake).await
@@ -817,18 +822,26 @@ pub(crate) fn disconnect_zcode_hub() {
     disconnect_zcode_hub_with(true);
 }
 
-/// 退出清理的断开口（`RunEvent::Exit` / 升级前 `on_before_exit`）：**静默**——只释放
-/// relay/计时器并清位，绝不唤醒自动连接。退出时 remote.enabled/auto 意图/内存 JWT
-/// 可能仍然有效，补唤醒会真的新开一条 relay，违反「退出只释放、不自动重连」。
+/// 退出清理的断开口（`RunEvent::Exit` / 升级前 `on_before_exit`）：**静默**——先
+/// `begin_shutdown` 让自动连接 worker 单调停机（取消在途/退避轮），再只释放
+/// relay/计时器并清位，绝不唤醒。
+///
+/// 只去 wake 不够：已在途的握手被取消后 worker 会自行重试，退避中的定时器也会在
+/// 关闭窗口清位后到点——两者都无需任何唤醒就能重新 connect。退出时
+/// remote.enabled/auto 意图/内存 JWT 可能仍有效，因此必须同时置停机闸。
 pub(crate) fn disconnect_zcode_hub_silent() {
     disconnect_zcode_hub_with(false);
 }
 
-/// 同步前半段 + 交给 runtime 的公共实现（两个生产入口只差 `wake`）。
+/// 同步前半段 + 交给 runtime 的公共实现（两个生产入口只差 `wake`；退出先停机）。
 fn disconnect_zcode_hub_with(wake: bool) {
     let Some(hub) = STATE.zcode_hub() else {
         return;
     };
+    if !wake {
+        // 退出：先单调停机自动连接 worker（在途/退避轮），再断连接。
+        hub.begin_shutdown();
+    }
     let (_view, guard) = hub.begin_disconnect();
     tauri::async_runtime::spawn(finish_zcode_hub(hub, guard, ZCODE_HUB_SHUTDOWN_WAIT, wake));
 }
@@ -4835,6 +4848,8 @@ mod zcode_wiring_tests {
         disconnect_hangs: AtomicBool,
         /// 首次 disconnect 的闸：模拟「清理在超时之后才继续」（默认放行）。
         disconnect_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        /// 一次性 connect 闸：模拟「自动连接握手已在途」（退出取消在途尝试用）。
+        connect_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
         /// C4 启动/唤醒接线：后端是否持有可用授权（默认未授权 = 无 OAuth 记录）。
         authorized: AtomicBool,
         remembered: AtomicBool,
@@ -4881,7 +4896,11 @@ mod zcode_wiring_tests {
 
         fn connect<'a>(&'a self, _route: DeviceRoute) -> BoxFuture<'a, ZResult<ConnectionView>> {
             self.connect_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {
+            let gate = self.connect_gate.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
                 Ok(ConnectionView {
                     state: ConnectionState::Paired,
                     generation: 1,
@@ -5290,6 +5309,10 @@ mod zcode_wiring_tests {
             "断开 = 先取消在途 + 锁后再关一次"
         );
         assert_eq!(hub.connection().state, ConnectionState::Offline);
+        assert!(
+            !hub.shutting_down(),
+            "远程停服不是退出：不得置单调停机闸（否则重开远程后无法自动恢复）"
+        );
         assert_eq!(
             fake.connect_calls.load(Ordering::SeqCst),
             connects_before,
@@ -5310,12 +5333,80 @@ mod zcode_wiring_tests {
         );
     }
 
+    /// 终审 scoped Important（exit-only 残留）：静默入口不仅要「不唤醒」，还必须
+    /// **单调停机** worker——已在途的自动连接握手被取消后，worker 会自行重试；
+    /// 关闭窗口清位后它无需任何唤醒就能再 connect。
+    #[tokio::test]
+    async fn silent_shutdown_cancels_inflight_auto_attempt() {
+        let fake = Arc::new(FakeBackend::default());
+        fake.authorized.store(true, Ordering::SeqCst);
+        fake.remembered.store(true, Ordering::SeqCst);
+        let store = stored(URL);
+        store
+            .with(|conn| try_set_setting_conn(conn, KEY_ENABLED, "true"))
+            .unwrap();
+        let hub = fake_hub(fake.clone(), store);
+        hub.start_auto_connect();
+        wait_until(
+            || hub.connection().state == ConnectionState::Paired,
+            "前置：自动连接必须已配对",
+        )
+        .await;
+        assert_eq!(fake.connect_calls.load(Ordering::SeqCst), 1);
+
+        // 普通断开会唤醒 worker 立刻开新握手：用闸把它卡在 fake.connect 内
+        //（此时它已持 connect_lock，正是退出清理必须取消的在途尝试）。
+        let gate = Arc::new(tokio::sync::Notify::new());
+        fake.connect_gate.lock().unwrap().replace(gate.clone());
+        hub.disconnect().await;
+        wait_until(
+            || fake.connect_calls.load(Ordering::SeqCst) >= 2,
+            "worker 必须已进入在途握手（被闸卡住）",
+        )
+        .await;
+
+        // 退出静默：begin_shutdown（单调停机）+ begin_disconnect + 静默收尾。
+        let silent = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                disconnect_zcode_hub_core(Some(hub), ZCODE_HUB_SHUTDOWN_WAIT, false).await
+            })
+        };
+        wait_until(
+            || hub.connection().state == ConnectionState::Offline,
+            "静默前半段必须立即 offline",
+        )
+        .await;
+        assert!(
+            hub.shutting_down(),
+            "静默退出必须先置单调停机闸（不能只去 wake）"
+        );
+
+        // 放行在途握手：结果作废；worker 不得凭旧轮次再发起 connect。
+        gate.notify_one();
+        assert!(silent.await.expect("spawn 不应 panic"), "静默关闭应完成");
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            2,
+            "退出不得再发起新的 connect"
+        );
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            2,
+            "停机后 worker 绝不自重连"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
+    }
+
     /// 退出路径回归（P2-5 补唤醒不得外溢）：自动连接/远程/链接全开且已配对时，
-    /// **静默**入口（`disconnect_zcode_hub_silent` = `finish_zcode_hub(.., wake=false)`）
-    /// 清位后不得唤醒 worker——退出只释放，绝不因补唤醒用仍在内存的 JWT 新开 relay。
+    /// **静默**入口（`disconnect_zcode_hub_silent`）只唤醒 worker 做停机取消
+    ///（`begin_shutdown`），绝不补「可重连」的唤醒——退出只释放，不自动重连。
     ///
-    /// 反证：条件本身允许自动连接（手动唤醒仍会立刻重连），因此本用例能证伪
-    /// 「退出路径误走会唤醒的入口」。
+    /// 终审补充：停机是**单调**的（`shutting_down` 不撤销）——退出后的显式唤醒同样
+    /// 不得重连（进程即将终结，绝不复活连接）。
     #[tokio::test]
     async fn silent_shutdown_does_not_wake_auto_connect() {
         let fake = Arc::new(FakeBackend::default());
@@ -5333,7 +5424,6 @@ mod zcode_wiring_tests {
         )
         .await;
         let connects = fake.connect_calls.load(Ordering::SeqCst);
-        let attempts = hub.auto_attempt_count();
 
         // 退出清理内核：begin（同步前半段）+ finish(..., wake=false)。
         assert!(
@@ -5342,34 +5432,30 @@ mod zcode_wiring_tests {
         );
         assert_eq!(hub.connection().state, ConnectionState::Offline);
 
-        // 观察窗：误唤醒会立刻让 worker 重跑 attempt 并 connect。
+        // 观察窗：`begin_shutdown` 的唤醒只允许让 worker 跑出一次 Stopped；
+        // 若误走「可重连」的唤醒，这里会看到新 connect。
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(
-            hub.auto_attempt_count(),
-            attempts,
-            "静默清位后不得唤醒自动连接 worker"
-        );
         assert_eq!(
             fake.connect_calls.load(Ordering::SeqCst),
             connects,
             "退出静默断开后不得自动重连"
         );
         assert_eq!(hub.connection().state, ConnectionState::Offline);
+        assert!(hub.shutting_down(), "静默退出必须置单调停机闸");
 
-        // 反证：条件仍允许自动连接——只有显式唤醒才会重连（误 wake 时上面已红）。
+        // 单调停机：退出后的显式唤醒也不得重连（不复活即将终结的进程连接）。
         hub.wake_auto_connect();
-        wait_until(
-            || fake.connect_calls.load(Ordering::SeqCst) > connects,
-            "显式唤醒必须仍能自动重连（证明上面是静默而非条件不允许）",
-        )
-        .await;
-        wait_until(
-            || hub.connection().state == ConnectionState::Paired,
-            "显式唤醒后应重新配对",
-        )
-        .await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.connect_calls.load(Ordering::SeqCst),
+            connects,
+            "停机后即使显式唤醒也不得自动连接"
+        );
+        assert_eq!(hub.connection().state, ConnectionState::Offline);
     }
 
     /// 关停任务必须有界：清理被挂住时，内核按上限返回 false，Hub 仍**立即** offline，
