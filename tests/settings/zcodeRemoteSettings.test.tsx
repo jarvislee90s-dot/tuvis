@@ -701,6 +701,8 @@ describe("ZcodeRemoteSettingsCard 记住授权（C4）", () => {
 
     await waitFor(() => expect(authState()).toHaveTextContent("已记住授权"));
     expect(screen.getByText("已记住授权")).toBeVisible();
+    // 已记住 = 确有可删的授权，按钮保持可用
+    expect(screen.getByTestId("zcode-forget")).toBeEnabled();
     expect(controlCall("zcode_control_connect")).toHaveLength(0);
   });
 
@@ -717,6 +719,8 @@ describe("ZcodeRemoteSettingsCard 记住授权（C4）", () => {
     // 连接态仍照实显示离线（不是「需要授权」）
     expect(connectionState()).toHaveAttribute("data-connection-state", "offline");
     expect(screen.queryByText("需要授权")).toBeNull();
+    // 本次授权可用（未记住）也允许忘记
+    expect(screen.getByTestId("zcode-forget")).toBeEnabled();
   });
 
   it("persistence_failure_is_not_a_false_success：记住失败照实说「本次授权可用，但未记住」", async () => {
@@ -729,6 +733,8 @@ describe("ZcodeRemoteSettingsCard 记住授权（C4）", () => {
     await waitFor(() => expect(authState()).toHaveTextContent("本次授权可用，但未记住"));
     expect(screen.getByText("本次授权可用，但未记住")).toBeVisible();
     expect(screen.queryByText("已记住授权")).toBeNull();
+    // AUTH_STORAGE_FAILED 仍持有本次授权（authorized=true），忘记按钮照旧可用
+    expect(screen.getByTestId("zcode-forget")).toBeEnabled();
   });
 
   it("forget_refreshes_authorization_and_keeps_link：忘记恰一次 IPC，刷新授权/连接，链接保留", async () => {
@@ -766,6 +772,83 @@ describe("ZcodeRemoteSettingsCard 记住授权（C4）", () => {
     // 忘记后不再宣称已记住/已授权
     expect(screen.queryByText("已记住授权")).toBeNull();
     expect(screen.queryByText("已授权，未连接")).toBeNull();
+  });
+});
+
+// P2-8：忘记授权是**幂等删除**。删除失败后后端回 authorized=false /
+// remembered=false + problem（delete_failed / locked_or_denied ...）；若按钮跟着禁用，
+// 用户就永远无法重试清理。problem 非 null 即代表「确有一次待清理的授权/存储动作」，
+// 按钮必须保持可用（auth=null 未知态仍禁用，不猜）。
+describe("ZcodeRemoteSettingsCard 忘记授权失败可重试（P2-8）", () => {
+  const forgetButton = () => screen.getByTestId("zcode-forget") as HTMLButtonElement;
+
+  it.each(["delete_failed", "locked_or_denied"] as const)(
+    "forget_stays_enabled_after_%s：无授权但确有失败问题时仍可发起幂等删除",
+    async (problem) => {
+      // authorized=false + remembered=false：修复前 canForget 为 false（RED）。
+      mockBackend(saved, {
+        status: CONNECTION_NEEDS_AUTH,
+        authStatus: authStatus({ problem }),
+      });
+      render(<ToolRemoteSettingsSection zcodeStatusPollMs={60_000} />);
+      await waitFor(() => expect(getCalls()).toHaveLength(1));
+      fireEvent.click(header());
+
+      await waitFor(() => expect(forgetButton()).toBeEnabled());
+      fireEvent.click(forgetButton());
+      await waitFor(() =>
+        expect(controlCall("zcode_control_forget_authorization")).toHaveLength(1)
+      );
+    }
+  );
+
+  it("forget_failure_can_be_retried：删除失败后刷新仍是可重试态，再点一次发第二发 IPC", async () => {
+    let attempts = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "zcode_remote_config_get") return saved;
+      if (cmd === "zcode_control_status") return CONNECTION_NEEDS_AUTH;
+      // 删除失败后权威状态：无授权、未记住、problem=delete_failed
+      if (cmd === "zcode_control_auth_status") {
+        return authStatus({ problem: "delete_failed" });
+      }
+      if (cmd === "zcode_control_forget_authorization") {
+        attempts += 1;
+        throw new Error("synthetic delete failure");
+      }
+      return null;
+    });
+
+    render(<ToolRemoteSettingsSection zcodeStatusPollMs={60_000} />);
+    await waitFor(() => expect(getCalls()).toHaveLength(1));
+    fireEvent.click(header());
+    await waitFor(() => expect(forgetButton()).toBeEnabled());
+
+    // 第一次点击：恰好一发 IPC，失败就地报错且刷新后按钮仍可用
+    fireEvent.click(forgetButton());
+    await waitFor(() => expect(controlCall("zcode_control_forget_authorization")).toHaveLength(1));
+    await waitFor(() => expect(screen.getByTestId("zcode-control-error")).toBeVisible());
+    await waitFor(() => expect(forgetButton()).toBeEnabled());
+    expect(attempts).toBe(1);
+
+    // 第二次点击 = 用户重试同一幂等删除，再发且只发一发
+    fireEvent.click(forgetButton());
+    await waitFor(() => expect(controlCall("zcode_control_forget_authorization")).toHaveLength(2));
+    await waitFor(() => expect(forgetButton()).toBeEnabled());
+    expect(attempts).toBe(2);
+  });
+
+  it("forget_stays_disabled_without_auth_snapshot：auth=null（未知）不猜成可删除，零 IPC", async () => {
+    // 默认 authStatus = null：未知态不得开闸，也不得靠点击探测
+    mockBackend(saved, { status: CONNECTION_NEEDS_AUTH });
+    render(<ToolRemoteSettingsSection zcodeStatusPollMs={60_000} />);
+    await waitFor(() => expect(getCalls()).toHaveLength(1));
+    fireEvent.click(header());
+    await waitFor(() => expect(statusCalls()).toHaveLength(1));
+
+    expect(forgetButton()).toBeDisabled();
+    fireEvent.click(forgetButton());
+    await Promise.resolve();
+    expect(controlCall("zcode_control_forget_authorization")).toHaveLength(0);
   });
 });
 
