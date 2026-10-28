@@ -38,37 +38,37 @@
 
 ## 功能概览
 
-逐步操作说明都在**[用户手册](docs/user-manual/zh/01-overview.md)**（13 章）里。README 是门厅，手册才是家。
+逐步操作说明都在**[用户手册](docs/product/manual/zh/01-overview.md)**（13 章）里。README 是门厅，手册才是家。
 
 | 功能                       |                                                                                   | 手册                                                      |
 | -------------------------- | --------------------------------------------------------------------------------- | --------------------------------------------------------- |
-| 🎛️ **会话监控看板**        | 实时红绿灯看板：状态、项目、分支、最后消息、CPU——点卡片直达会话所在终端或应用窗口 | [第 4 章](docs/user-manual/zh/04-dashboard.md)            |
-| 📶 **远程接入与移动看板**  | 手机打开同一块看板，四条通道可同时开启，各带配置向导，可选永久地址                | [第 8 章](docs/user-manual/zh/08-mobile-remote.md)        |
-| 📱 **远程操控**（试验性）  | 发消息与排队、审批工具调用与计划、答问答卡、切权限模式、新建会话——全部屏读核验    | [第 8 章](docs/user-manual/zh/08-mobile-remote.md)        |
-| 🕵️ **子 Agent 观察台**     | 会话视图内实时显示后台子 Agent：运行 chip、独立看板与执行过程详情（Claude Code）  | [第 5 章](docs/user-manual/zh/05-subagent-observatory.md) |
-| 🐰 **内置桌宠**            | tuvis-3D 与 Foxbell 盯着所有会话：状态卡片 + 原声语音提醒；桌宠格式开放可导入     | [第 7 章](docs/user-manual/zh/07-pet.md)                  |
-| 🧮 **Token 用量账本**      | 七个工具统一记账：总览、趋势、分布、API 等效费用估算、CSV 导出                    | [第 11 章](docs/user-manual/zh/11-usage.md)               |
-| ⚡ **输出速度（TPS）**     | 本机采样的流式 TPS + 含等待响应吞吐双口径，四档区间图，悬停读数；零测速请求       | [第 11 章](docs/user-manual/zh/11-usage.md)               |
-| 🖥️ **桌面四页同窗**        | 主窗口四页签：消息看板 / 工具资源 / 模型用量 / 输出速度，切页保留各自状态         | [第 11 章](docs/user-manual/zh/11-usage.md)               |
-| 🔔 **通知与提示音**        | 状态变化触发桌面通知（带去重）+ Web Audio 提示音，点通知直达终端                  | [第 6 章](docs/user-manual/zh/06-notifications.md)        |
-| 🚀 **开机自启动**          | 显示的是系统真实状态（不落本地缓存）；自启拉起时静默进托盘                        | [第 6 章](docs/user-manual/zh/06-notifications.md)        |
-| ⚡ **快速跳转终端**        | 点卡片直达对应终端标签页——同项目双开也能锁定不弹窗                                | [第 4 章](docs/user-manual/zh/04-dashboard.md)            |
-| 🧩 **扩展资源统一管理**    | Skill / MCP / 插件统一仓库，首次启动自动导入、按工具自动转换配置格式              | [第 9 章](docs/user-manual/zh/09-resources.md)            |
-| 🎚️ **预设组一键切换**      | Skill + MCP + 插件打包为命名预设组，托盘菜单一键应用/还原                         | [第 10 章](docs/user-manual/zh/10-presets.md)             |
-| 👥 **子 Agent 级资源分配** | 给子 Agent 分配资源子集；工具级禁用自动级联到全部子 Agent                         | [第 9 章](docs/user-manual/zh/09-resources.md)            |
-| ✅ **工具勾选管理**        | 决定哪些工具纳入监控与管理；取消勾选彻底还原并隐藏                                | [第 9 章](docs/user-manual/zh/09-resources.md)            |
-| 🩺 **信号健康度**          | 各工具 Hook 信任门自查，未就绪时给出如实原因而非干巴巴的「未注册」                | [第 12 章](docs/user-manual/zh/12-troubleshooting.md)     |
+| 🎛️ **会话监控看板**        | 实时红绿灯看板：状态、项目、分支、最后消息、CPU——点卡片直达会话所在终端或应用窗口 | [第 4 章](docs/product/manual/zh/04-dashboard.md)            |
+| 📶 **远程接入与移动看板**  | 手机打开同一块看板，四条通道可同时开启，各带配置向导，可选永久地址                | [第 8 章](docs/product/manual/zh/08-mobile-remote.md)        |
+| 📱 **远程操控**（试验性）  | 发消息与排队、审批工具调用与计划、答问答卡、切权限模式、新建会话——全部屏读核验    | [第 8 章](docs/product/manual/zh/08-mobile-remote.md)        |
+| 🕵️ **子 Agent 观察台**     | 会话视图内实时显示后台子 Agent：运行 chip、独立看板与执行过程详情（Claude Code）  | [第 5 章](docs/product/manual/zh/05-subagent-observatory.md) |
+| 🐰 **内置桌宠**            | tuvis-3D 与 Foxbell 盯着所有会话：状态卡片 + 原声语音提醒；桌宠格式开放可导入     | [第 7 章](docs/product/manual/zh/07-pet.md)                  |
+| 🧮 **Token 用量账本**      | 七个工具统一记账：总览、趋势、分布、API 等效费用估算、CSV 导出                    | [第 11 章](docs/product/manual/zh/11-usage.md)               |
+| ⚡ **输出速度（TPS）**     | 本机采样的流式 TPS + 含等待响应吞吐双口径，四档区间图，悬停读数；零测速请求       | [第 11 章](docs/product/manual/zh/11-usage.md)               |
+| 🖥️ **桌面四页同窗**        | 主窗口四页签：消息看板 / 工具资源 / 模型用量 / 输出速度，切页保留各自状态         | [第 11 章](docs/product/manual/zh/11-usage.md)               |
+| 🔔 **通知与提示音**        | 状态变化触发桌面通知（带去重）+ Web Audio 提示音，点通知直达终端                  | [第 6 章](docs/product/manual/zh/06-notifications.md)        |
+| 🚀 **开机自启动**          | 显示的是系统真实状态（不落本地缓存）；自启拉起时静默进托盘                        | [第 6 章](docs/product/manual/zh/06-notifications.md)        |
+| ⚡ **快速跳转终端**        | 点卡片直达对应终端标签页——同项目双开也能锁定不弹窗                                | [第 4 章](docs/product/manual/zh/04-dashboard.md)            |
+| 🧩 **扩展资源统一管理**    | Skill / MCP / 插件统一仓库，首次启动自动导入、按工具自动转换配置格式              | [第 9 章](docs/product/manual/zh/09-resources.md)            |
+| 🎚️ **预设组一键切换**      | Skill + MCP + 插件打包为命名预设组，托盘菜单一键应用/还原                         | [第 10 章](docs/product/manual/zh/10-presets.md)             |
+| 👥 **子 Agent 级资源分配** | 给子 Agent 分配资源子集；工具级禁用自动级联到全部子 Agent                         | [第 9 章](docs/product/manual/zh/09-resources.md)            |
+| ✅ **工具勾选管理**        | 决定哪些工具纳入监控与管理；取消勾选彻底还原并隐藏                                | [第 9 章](docs/product/manual/zh/09-resources.md)            |
+| 🩺 **信号健康度**          | 各工具 Hook 信任门自查，未就绪时给出如实原因而非干巴巴的「未注册」                | [第 12 章](docs/product/manual/zh/12-troubleshooting.md)     |
 
 ## 产品一览
 
 <table>
   <tr>
-    <td align="center"><img src="docs/user-manual/img/mobile-board.png" alt="手机看板" height="380" /><br><sub><b>手机看板</b>——手机浏览器里同一块红绿灯看板</sub></td>
+    <td align="center"><img src="docs/product/manual/img/mobile-board.png" alt="手机看板" height="380" /><br><sub><b>手机看板</b>——手机浏览器里同一块红绿灯看板</sub></td>
     <td align="center"><img src="docs/images/mobile-detail-v0.5.0.png" alt="会话详情页" height="380" /><br><sub><b>会话详情</b>——消息、文件、子 Agent 一页看全</sub></td>
     <td align="center"><img src="docs/images/mobile-approve-v0.5.0.png" alt="远程审批卡" height="380" /><br><sub><b>远程审批</b>——手机上批准工具调用与计划</sub></td>
   </tr>
   <tr>
-    <td align="center"><img src="docs/user-manual/img/usage-dashboard.png" alt="Token 用量看板" height="230" /><br><sub><b>用量账本</b>——七个工具的 Token 与费用，口径如实</sub></td>
+    <td align="center"><img src="docs/product/manual/img/usage-dashboard.png" alt="Token 用量看板" height="230" /><br><sub><b>用量账本</b>——七个工具的 Token 与费用，口径如实</sub></td>
     <td align="center"><img src="docs/images/foxbell-pet.png" alt="内置桌宠" height="230" /><br><sub><b>内置桌宠</b>——屏幕角落的状态卡片与原声语音</sub></td>
     <td align="center"><img src="docs/images/remote-settings-v0.6.0.png" alt="远程接入设置页" height="230" /><br><sub><b>远程接入</b>——四条通道，各带配置向导</sub></td>
   </tr>
@@ -95,7 +95,7 @@
 | 手机 · 子 Agent 观察台                   | ✅          | ❌        | ❌       | ❌       | ❌        | ❌        | ❌           | ❌     |
 | 手机 · Codex APP 远程控制（Desktop IPC） | ❌          | 🧪        | ❌       | ❌       | ❌        | ❌        | ❌           | ❌     |
 
-> 注入与新建会话为试验性，当前覆盖 Claude Code / Codex CLI / OpenCode / Kimi Code；Codex APP 远程控制按精确 Desktop build 解锁。逐工具现状与已知不足在手册[第 8 章](docs/user-manual/zh/08-mobile-remote.md)如实申报。
+> **0.6.3 重磅：Codex 桌面端自适应控制。** 按操作契约证据放行、同组异步题一次提交、队列暂停保护；不做 headless 兜底、不猜审批。矩阵区分已验证与试验性；Plan 模式与权限切换仍不支持的边界，在手册[第 8 章](docs/product/manual/zh/08-mobile-remote.md)如实写明。
 
 ## 快速开始
 

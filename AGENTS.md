@@ -11,10 +11,11 @@
 
 - **未经用户在场明确同意，任何人（含任何 AI agent）不得修改 `docs/MASTER-PLAN.md`**
 - 发现实现或下层文档与宪法冲突时：停下，向用户报告冲突点，由用户裁决"改宪法"还是"改实现"，不得自行处置
-- 调研资料与三期参考库索引：`research/README.md`（持续跟踪外部依赖版本）
-- 依赖升级与月度批处理流程：`docs/DEPENDENCY-UPDATES.md`（dependabot 节奏、`Tauri version parity` 门禁、红灯处置表、ignore 命令表）
+- 调研资料与三期参考库索引：`docs/research/README.md`（持续跟踪外部依赖版本）
+- 依赖升级与月度批处理流程：`docs/operations/DEPENDENCY-UPDATES.md`（dependabot 节奏、`Tauri version parity` 门禁、红灯处置表、ignore 命令表）
 
 ## 语言规范
+
 - 本项目所有设计文档、规格说明、计划文档、任务列表均使用中文撰写
 - 代码标识符使用英文，代码注释尽量使用中文
 - Git commit message 可使用英文
@@ -38,12 +39,12 @@
 
 覆盖全部双语资产；本轮带中文改动的条目，英文侧必须同步刷新（经用户确认后可由代理翻译）：
 
-| 双语资产 | 中文侧 | 英文侧 | 说明 |
-| --- | --- | --- | --- |
-| 前端页面文案 | `src/i18n/locales/zh.json` | `src/i18n/locales/en.json` | `pnpm check:i18n` 只保**键集**一致，键下的英文值漂移不报，须逐键比对 |
-| 项目 README | `README.zh-CN.md` | `README.md` | 无门禁，人工/代理核对；`README.md` 为英文侧（默认展示），中文主笔在 `README.zh-CN.md` |
-| 用户手册（官网 `/docs` 挂载） | `docs/user-manual/zh/`（13 章） | `docs/user-manual/en/` | 无门禁；en 曾为骨架，至少核对本版有变动的章节 |
-| 更新日志（官网 `/changelog` 挂载） | `CHANGELOG.md`（纯中文） | `CHANGELOG.en.md`（纯英文） | 2026-10-17 拆分（此前「同文件内嵌 `EN:` 行」契约作废）：两份各自单语、版本/日期/分区逐条对齐，未译条目只写中文版 |
+| 双语资产                           | 中文侧                             | 英文侧                      | 说明                                                                                                             |
+| ---------------------------------- | ---------------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| 前端页面文案                       | `src/i18n/locales/zh.json`         | `src/i18n/locales/en.json`  | `pnpm check:i18n` 只保**键集**一致，键下的英文值漂移不报，须逐键比对                                             |
+| 项目 README                        | `README.zh-CN.md`                  | `README.md`                 | 无门禁，人工/代理核对；`README.md` 为英文侧（默认展示），中文主笔在 `README.zh-CN.md`                            |
+| 用户手册（官网 `/docs` 挂载）      | `docs/product/manual/zh/`（13 章） | `docs/product/manual/en/`   | 无门禁；en 曾为骨架，至少核对本版有变动的章节                                                                    |
+| 更新日志（官网 `/changelog` 挂载） | `CHANGELOG.md`（纯中文）           | `CHANGELOG.en.md`（纯英文） | 2026-10-17 拆分（此前「同文件内嵌 `EN:` 行」契约作废）：两份各自单语、版本/日期/分区逐条对齐，未译条目只写中文版 |
 
 检查方法：对上一版 tag 执行 `git diff vX.Y.Z..HEAD -- <上述路径>`，列出本轮全部中文改动逐条核对。
 配套的发版同步义务（单语，不涉对照）：`docs/capabilities.json` 与 README「多终端能力矩阵」
@@ -57,7 +58,7 @@
 | 文档 | 唯一职责 |
 | --- | --- |
 | `README.md` / `README.zh-CN.md` | 门面：是什么/为什么/30 秒上手/去哪学。只允许：首屏（logo+一句话+badge+全景主图）、功能卡片（图标+一句话+链接）、Quick Start、能力矩阵表（随 `docs/capabilities.json` 发版同步）、精简 Roadmap（≤5 条）、社区区、法务小节。 |
-| `docs/user-manual/{zh,en}/` | 手册：唯一 how-to 权威。全部操作细节、向导分步、注入能力现状申报、配置说明。zh 改动必须同步 en（遵守发版文档纪律的中英对照要求）。 |
+| `docs/product/manual/{zh,en}/` | 手册：唯一 how-to 权威。全部操作细节、向导分步、注入能力现状申报、配置说明。zh 改动必须同步 en（遵守发版文档纪律的中英对照要求）。 |
 | `CHANGELOG*.md` + `docs/release-notes/` | 账本：唯一变更权威。逐版本变更与发版说明；README 不复述版本细节。 |
 
 执行纪律：
@@ -68,6 +69,7 @@
 - README 社区区链接只允许稳定 URL（QQ 官方加群链接 / Discord 永久邀请 / Discussions），二维码图片入 `docs/images/`；**禁止直挂会过期的群码截图**（QQ 群码约 7 天过期）；换群只换图片文件与链接文本，群号文字兜底常驻。
 
 ## 技术栈
+
 - Tauri 2 + Rust + React 19 + TypeScript + shadcn/ui + Tailwind CSS v4
 
 ## 构建与开发命令
@@ -126,9 +128,8 @@ cd src-tauri && cargo clippy   # Rust 代码 lint
 │       ├── window/        #   终端聚焦（iTerm2 / Terminal.app / tmux）
 │       ├── plugins/       #   系统托盘
 │       └── session/       #   会话模型与状态枚举
-├── docs/                  # 开发文档
+├── docs/                  # 开发文档（product/engineering/operations/research）
 ├── scripts/               # 构建/发布脚本
-├── research/              # 早期调研文档（本地参考，不入库）
 ├── package.json           # 项目配置
 ├── vite.config.ts         # Vite 构建配置
 ├── tsconfig.json          # TypeScript 配置
@@ -146,7 +147,7 @@ cd src-tauri && cargo clippy   # Rust 代码 lint
 - **回执即快照的传播面**：toggle 回执 `checked`（既有）/ 多选自由作答回执 `text`+`checked` / 切题回执 `screen{heading,checked,freeText}` / GET `screen`——四路同一权威源；**中止回执不带快照但前端中止后自动重拉一次 GET**（键可能在轮询窗尽后才被终端消费）。
 - **已知边界（如实申报）**：单选题的选中项在终端屏上**无勾选框标记**（高亮是属性层，字符读法不可见）→ mqSelected 仍为本地记忆，快照权威源不覆盖该面；快照对位失败（题干匹配不到载荷题/多义匹配/勾选数不符）→ **放弃同步维持现状**（不猜纪律）；**终端手动输入且已切离该题的自由作答内容**不在任何快照窗口（快照只覆盖终端当前停着的题）→ 确认卡如实显示「未作答」（真值在终端 Review 页；Review 回显解析留待后续批次）。
 
-**项目专属技能（`.agents/skills/`，随库分发）**：`win-console-inject-probe` —— Windows 终端注入与屏读探测工作流（注入侧：P1 输入模式分族 + 确认子集 P0–P7 快路径 + 全量方法论 + M6R 验证脚本套件；屏读侧：四闸门证据纪律 + 只读探针 + 屏读形态矩阵，见 `references/screen-read-matrix.md`）。**凡涉及以下任务必须主动调用该技能**（读其 SKILL.md 按流程执行，勿从零自研探测方法）：①新 CLI 工具接入前的 Windows 注入与屏读规格探测；②注入故障诊断（写不进/被吞/打完字不提交/停摆）；③工具大版本升级后的注入与屏读规格复验；④**屏读解析与实机不符的诊断**（读得到屏但解析不出 / 中止文案与屏面状态对不上 / 卡片与终端脱钩）——先活体 dump 取证再改判据，禁止按档案手抄夹具。产出 = 单工具注入规格定案表 + 屏读形态矩阵（四闸门：样本门槛 / 证据自带失败 / 账本吸收文案漂移 / 屏读体检表），归档 `research/refs/phase2-消息注入/`。
+**项目专属技能（`.agents/skills/`，随库分发）**：`win-console-inject-probe` —— Windows 终端注入与屏读探测工作流（注入侧：P1 输入模式分族 + 确认子集 P0–P7 快路径 + 全量方法论 + M6R 验证脚本套件；屏读侧：四闸门证据纪律 + 只读探针 + 屏读形态矩阵，见 `references/screen-read-matrix.md`）。**凡涉及以下任务必须主动调用该技能**（读其 SKILL.md 按流程执行，勿从零自研探测方法）：①新 CLI 工具接入前的 Windows 注入与屏读规格探测；②注入故障诊断（写不进/被吞/打完字不提交/停摆）；③工具大版本升级后的注入与屏读规格复验；④**屏读解析与实机不符的诊断**（读得到屏但解析不出 / 中止文案与屏面状态对不上 / 卡片与终端脱钩）——先活体 dump 取证再改判据，禁止按档案手抄夹具。产出 = 单工具注入规格定案表 + 屏读形态矩阵（四闸门：样本门槛 / 证据自带失败 / 账本吸收文案漂移 / 屏读体检表），归档 `docs/research/refs/phase2-消息注入/`。
 
 ## 架构概览
 
@@ -199,6 +200,7 @@ Layer 3 指向 Layer 2（而非 Layer 1），因此工具级禁用会自动断�
 ### Agent Adapter 模式
 
 每个工具实现 `AgentAdapter` trait：
+
 - `find_processes()` — 通过 `sysinfo` 扫描运行进程
 - `find_sessions()` — 解析工具特定的会话文件
 - `mcp_format()` / `mcp_config_path()` — MCP 配置格式
@@ -222,15 +224,24 @@ SQLite 类工具（查询即过滤，如 opencode / zcode）豁免第 2、3 条�
 
 应用数据存储在 `~/.tuvis/`：
 
-| 路径 | 用途 |
-|------|------|
-| `~/.tuvis/tuvis.db` | SQLite 数据库 |
-| `~/.tuvis/skills/` | 全局 Skill 仓库 |
-| `~/.tuvis/mcp/` | 全局 MCP 服务器配置 |
-| `~/.tuvis/plugins/` | 全局 Plugin 仓库 |
-| `~/.tuvis/hooks/status-hook.sh` | 共享 Hook 脚本 |
-| `~/.tuvis/stash/` | 预设独占模式的原生技能暂存区（应用时移入、恢复时回移，stash_journal 记账） |
-| `~/.tuvis/events/` | Hook 事件文件（自动清理，30 秒 TTL） |
+| 路径                            | 用途                                                                       |
+| ------------------------------- | -------------------------------------------------------------------------- |
+| `~/.tuvis/tuvis.db`             | SQLite 数据库                                                              |
+| `~/.tuvis/skills/`              | 全局 Skill 仓库                                                            |
+| `~/.tuvis/mcp/`                 | 全局 MCP 服务器配置                                                        |
+| `~/.tuvis/plugins/`             | 全局 Plugin 仓库                                                           |
+| `~/.tuvis/hooks/status-hook.sh` | 共享 Hook 脚本                                                             |
+| `~/.tuvis/stash/`               | 预设独占模式的原生技能暂存区（应用时移入、恢复时回移，stash_journal 记账） |
+| `~/.tuvis/events/`              | Hook 事件文件（自动清理，30 秒 TTL）                                       |
+
+## 文档目录约定（2026-10-28 用户裁决）
+
+- 文档总入口：`docs/doc_README.md`。
+- 新文档只写到 `docs/engineering/` 下：需求/设计进 `engineering/specs/`，实施计划进 `engineering/plans/`，人工裁决进 `engineering/decisions/`，探测/取证进 `engineering/evidence/`，验收进 `engineering/acceptance/`。
+- **不要重建 `docs/superpowers/`**。superpowers 工作流若生成旧路径，落盘后应移动到上述分类，不得把旧目录提交回库。
+- 归档只用于“被新版本明确取代或有矛盾结论”的文档；不按日期、不按“没人引用”清仓。归档位置 `engineering/archive/<year>/<category>/`。
+- 不新增每个子目录的 README；分类说明集中在 `docs/doc_README.md`。
+- agent 的逐轮返工、测试流水、executor prompt 不入库；只把人工裁决和最终状态沉淀到 decisions/reviews。
 
 ## 贡献者行为准则
 

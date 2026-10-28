@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>线稿 · 资源管理表头：目录快捷定位 + 名字排序</title>
+<style>
+  /* 线稿风格：灰阶、虚线框、等宽标注 */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: #f5f5f4; color: #44403c; padding: 24px; }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  .sub { color: #78716c; font-size: 12px; margin-bottom: 20px; }
+  .panel { background: #fff; border: 1px dashed #a8a29e; border-radius: 10px; padding: 16px; margin-bottom: 24px; max-width: 1180px; }
+  .panel h2 { font-size: 14px; margin-bottom: 2px; color: #1c1917; }
+  .panel .desc { font-size: 11px; color: #78716c; margin-bottom: 12px; }
+  .card { border: 1px dashed #d6d3d1; border-radius: 8px; padding: 14px; }
+
+  /* 模拟真实 UI 的行结构（与实装同款尺寸：h-6 / px-2 / text-10px） */
+  .row, .header { display: flex; align-items: center; justify-content: space-between; border: 1px solid #e7e5e4; border-radius: 6px; padding: 8px; font-size: 13px; }
+  .row { margin-bottom: 4px; background: #fafaf9; }
+  .header { background: #efedeb; border-style: dashed; margin-bottom: 6px; }
+  .left { display: flex; align-items: center; gap: 4px; }
+  .right { display: flex; gap: 4px; align-items: center; }
+
+  .btn { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; border-radius: 6px; border: 1px solid transparent; font-size: 10px; cursor: pointer; background: transparent; color: #57534e; white-space: nowrap; }
+  .btn.on { background: #1c1917; color: #fafaf9; }
+  .btn:hover { background: #e7e5e4; }
+  .btn.on:hover { background: #292524; }
+  .btn .ico { width: 12px; height: 12px; display: inline-block; }
+  .folder-ico { width: 12px; height: 12px; border: 1.5px solid currentColor; border-radius: 2px; position: relative; display: inline-block; }
+  .folder-ico::before { content: ""; position: absolute; top: -4px; left: -1px; width: 7px; height: 4px; border: 1.5px solid currentColor; border-bottom: none; border-radius: 1px 1px 0 0; }
+
+  .tool-ico { width: 14px; height: 14px; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700; color: #fff; }
+  .claude { background: #d97757; } .codex { background: #10a37f; } .opencode { background: #78716c; } .openclaw { background: #a8a29e; } .kimi { background: #111; }
+
+  .sort { display: inline-flex; align-items: center; gap: 3px; height: 20px; padding: 0 6px; border: 1px dashed #a8a29e; border-radius: 4px; font-size: 10px; cursor: pointer; background: #fff; color: #78716c; }
+  .sort:hover { background: #e7e5e4; }
+  .sort.active { border-style: solid; color: #1c1917; font-weight: 600; }
+
+  .placeholder-all { width: 52px; height: 24px; border: 1px dashed #d6d3d1; border-radius: 6px; }
+  .callout { position: relative; }
+  .mark { position: absolute; border: 2px solid #ef4444; border-radius: 6px; pointer-events: none; }
+  .note { font-size: 11px; color: #78716c; line-height: 1.7; }
+  .note b { color: #1c1917; }
+  .legend { display: flex; gap: 18px; margin: 10px 0 14px; font-size: 11px; color: #57534e; flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  @media (max-width: 1100px) { .grid2 { grid-template-columns: 1fr; } }
+  .state-tag { display: inline-block; padding: 1px 6px; border-radius: 999px; background: #e7e5e4; font-size: 10px; }
+</style>
+</head>
+<body>
+  <h1>线稿 · 资源管理表头：目录快捷定位 + 名字排序</h1>
+  <div class="sub">docs/engineering/architecture/wireframes/resource-table-header.html —— 确认视觉与交互后实装到 ResourceByKindView / ResourceByToolView。排序按钮可点击（演示三态循环）。</div>
+
+  <div class="legend">
+    <span><span class="swatch" style="background:#efedeb;border:1px dashed #a8a29e"></span> 新增表头行（每类资源一条）</span>
+    <span><span class="sort">名字 ⇅</span> 排序按钮：三态循环 默认 → 升序 → 降序</span>
+    <span><span class="folder-ico"></span> 目录按钮：打开该工具对应资源位置</span>
+    <span><span class="placeholder-all" style="width:26px;height:14px"></span> 虚框 = 与下方"全部启用"列对齐的占位</span>
+  </div>
+
+  <!-- ===== 按资源视图 ===== -->
+  <div class="panel">
+    <h2>① 按资源视图 —— Skill 表头（实装位置：ResourceByKindView，"Skill (N)" 标题下、列表上方）</h2>
+    <div class="desc">表头行与下方每行的工具列自然宽度对齐（同款按钮样式）。表头按钮 = 目录定位，行内按钮 = 启用/禁用（不变）。</div>
+    <div class="card">
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px">📦 Skill (<span id="n">6</span>)</div>
+
+      <!-- 新增表头行 -->
+      <div class="header">
+        <div class="left">
+          <span style="font-size:11px;font-weight:600">名字</span>
+          <button class="sort" id="sortBtn" onclick="cycleSort()">名字 <span id="sortIco">⇅</span> <span id="sortState">默认</span></button>
+        </div>
+        <div class="right">
+          <div class="placeholder-all" title="与下方「全部启用」按钮列对齐的占位"></div>
+          <button class="btn" title="打开 Claude 的 skills 目录（~/.claude/skills，不存在则自动创建）"><span class="folder-ico"></span> Claude</button>
+          <button class="btn" title="打开 Codex 的 skills 目录（~/.agents/skills）"><span class="folder-ico"></span> Codex</button>
+          <button class="btn" title="打开 OpenCode 的 skills 目录（~/.config/opencode/skills）"><span class="folder-ico"></span> OpenCode</button>
+          <button class="btn" title="打开 OpenClaw 的 skills 目录（~/.openclaw/skills）"><span class="folder-ico"></span> OpenClaw</button>
+          <button class="btn" title="打开 Kimi Code 的 skills 目录（$KIMI_CODE_HOME/skills）"><span class="folder-ico"></span> Kimi Code</button>
+        </div>
+      </div>
+
+      <!-- 示例行（现状不变） -->
+      <div class="row"><div class="left"><span>brainstorming</span></div><div class="right"><button class="btn">全部启用</button><button class="btn on"><span class="tool-ico claude">C</span>Claude</button><button class="btn on"><span class="tool-ico codex">›</span>Codex</button><button class="btn on"><span class="tool-ico opencode">&lt;&gt;</span>OpenCode</button><button class="btn on"><span class="tool-ico openclaw">OC</span>OpenClaw</button><button class="btn on"><span class="tool-ico kimi">☾</span>Kimi Code</button></div></div>
+      <div class="row"><div class="left"><span>due-diligence-report</span></div><div class="right"><button class="btn">全部启用</button><button class="btn on"><span class="tool-ico claude">C</span>Claude</button><button class="btn on"><span class="tool-ico codex">›</span>Codex</button><button class="btn"><span class="tool-ico opencode">&lt;&gt;</span>OpenCode</button><button class="btn"><span class="tool-ico openclaw">OC</span>OpenClaw</button><button class="btn"><span class="tool-ico kimi">☾</span>Kimi Code</button></div></div>
+      <div class="row"><div class="left"><span>extract-report</span></div><div class="right"><button class="btn">全部启用</button><button class="btn on"><span class="tool-ico claude">C</span>Claude</button><button class="btn on"><span class="tool-ico codex">›</span>Codex</button><button class="btn on"><span class="tool-ico opencode">&lt;&gt;</span>OpenCode</button><button class="btn"><span class="tool-ico openclaw">OC</span>OpenClaw</button><button class="btn"><span class="tool-ico kimi">☾</span>Kimi Code</button></div></div>
+      <div class="row"><div class="left"><span>skill-creator</span></div><div class="right"><button class="btn">全部启用</button><button class="btn on"><span class="tool-ico claude">C</span>Claude</button><button class="btn on"><span class="tool-ico codex">›</span>Codex</button><button class="btn"><span class="tool-ico opencode">&lt;&gt;</span>OpenCode</button><button class="btn on"><span class="tool-ico openclaw">OC</span>OpenClaw</button><button class="btn on"><span class="tool-ico kimi">☾</span>Kimi Code</button></div></div>
+    </div>
+    <div class="note" style="margin-top:8px">
+      <b>目录按钮行为</b>：点击 → 系统文件管理器打开该工具的 skills 根目录（如 Windows Explorer）；目录不存在则<b>自动创建后打开</b>；成功 toast 显示打开的路径。tooltip 文案：「打开 {{tool}} 的 skills 目录」。
+    </div>
+  </div>
+
+  <div class="grid2">
+    <!-- ===== MCP ===== -->
+    <div class="panel">
+      <h2>② 按资源视图 —— MCP 表头</h2>
+      <div class="desc">MCP 是配置文件而非目录：按钮用<b>系统默认程序直接打开该工具的 MCP 配置文件</b>（Claude → ~/.claude.json、Codex → config.toml、OpenCode → opencode.json…）。文件不存在 → toast 报错「配置文件尚未创建」。</div>
+      <div class="card">
+        <div class="header">
+          <div class="left"><span style="font-size:11px;font-weight:600">名字</span><button class="sort" onclick="cycleSort(this)">名字 <span>⇅</span> <span>默认</span></button></div>
+          <div class="right">
+            <div class="placeholder-all"></div>
+            <button class="btn" title="打开 Claude 的 MCP 配置文件（~/.claude.json）"><span class="folder-ico"></span> Claude</button>
+            <button class="btn" title="打开 Codex 的 MCP 配置文件（config.toml）"><span class="folder-ico"></span> Codex</button>
+            <button class="btn" title="打开 OpenCode 的 MCP 配置文件（opencode.json）"><span class="folder-ico"></span> OpenCode</button>
+            <button class="btn" title="打开 OpenClaw 的 MCP 配置文件（openclaw.json）"><span class="folder-ico"></span> OpenClaw</button>
+            <button class="btn" title="打开 Kimi Code 的 MCP 配置文件（mcp.json）"><span class="folder-ico"></span> Kimi Code</button>
+          </div>
+        </div>
+        <div class="row"><div class="left"><span>context7</span></div><div class="right"><button class="btn">全部启用</button><button class="btn on"><span class="tool-ico claude">C</span>Claude</button><button class="btn on"><span class="tool-ico codex">›</span>Codex</button><button class="btn"><span class="tool-ico opencode">&lt;&gt;</span>OpenCode</button><button class="btn"><span class="tool-ico openclaw">OC</span>OpenClaw</button><button class="btn"><span class="tool-ico kimi">☾</span>Kimi Code</button></div></div>
+        <div class="row"><div class="left"><span>playwright</span></div><div class="right"><button class="btn">全部启用</button><button class="btn on"><span class="tool-ico claude">C</span>Claude</button><button class="btn on"><span class="tool-ico codex">›</span>Codex</button><button class="btn"><span class="tool-ico opencode">&lt;&gt;</span>OpenCode</button><button class="btn"><span class="tool-ico openclaw">OC</span>OpenClaw</button><button class="btn"><span class="tool-ico kimi">☾</span>Kimi Code</button></div></div>
+      </div>
+      <div class="note" style="margin-top:8px">tooltip 文案：「打开 {{tool}} 的 MCP 配置文件」；图标对 MCP 语义上是"文件"，实装时可选 FileJson 图标与 FolderOpen 区分。</div>
+    </div>
+
+    <!-- ===== 插件 ===== -->
+    <div class="panel">
+      <h2>③ 按资源视图 —— 插件表头</h2>
+      <div class="desc">打开<b>该工具自己的插件目录</b>（与启用插件的 symlink 目标同源）：Claude ~/.claude/plugins · Codex ~/.codex/plugins · OpenCode ~/.config/opencode/plugins · OpenClaw ~/.openclaw/plugins · Kimi $KIMI_CODE_HOME/plugins/managed。不存在自动创建。</div>
+      <div class="card">
+        <div class="header">
+          <div class="left"><span style="font-size:11px;font-weight:600">名字</span><button class="sort" onclick="cycleSort(this)">名字 <span>⇅</span> <span>默认</span></button></div>
+          <div class="right">
+            <div class="placeholder-all"></div>
+            <button class="btn" title="打开 Claude 的插件目录"><span class="folder-ico"></span> Claude</button>
+            <button class="btn" title="打开 Codex 的插件目录"><span class="folder-ico"></span> Codex</button>
+            <button class="btn" title="打开 OpenCode 的插件目录"><span class="folder-ico"></span> OpenCode</button>
+            <button class="btn" title="打开 OpenClaw 的插件目录"><span class="folder-ico"></span> OpenClaw</button>
+            <button class="btn" title="打开 Kimi Code 的插件目录"><span class="folder-ico"></span> Kimi Code</button>
+          </div>
+        </div>
+        <div class="row"><div class="left"><span>statusline-setup</span></div><div class="right"><button class="btn">全部启用</button><button class="btn on"><span class="tool-ico claude">C</span>Claude</button><button class="btn"><span class="tool-ico codex">›</span>Codex</button><button class="btn"><span class="tool-ico opencode">&lt;&gt;</span>OpenCode</button><button class="btn"><span class="tool-ico openclaw">OC</span>OpenClaw</button><button class="btn"><span class="tool-ico kimi">☾</span>Kimi Code</button></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 按工具视图 ===== -->
+  <div class="panel">
+    <h2>④ 按工具视图 —— 分组头加"打开目录"按钮（ResourceByToolView）</h2>
+    <div class="desc">每个工具分组头右侧、现有"扫描"按钮左边，加一个 📁 打开目录按钮（打开该工具 skills 目录）。不加排序。</div>
+    <div class="card">
+      <div style="border:1px dashed #d6d3d1;border-radius:8px;padding:12px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <h3 style="font-size:13px;display:flex;align-items:center;gap:6px"><span class="tool-ico claude" style="width:18px;height:18px">C</span> Claude Code</h3>
+          <div class="right">
+            <button class="btn" style="border-color:#d6d3d1" title="打开 Claude 的 skills 目录"><span class="folder-ico"></span> 打开目录</button>
+            <button class="btn" style="border-color:#d6d3d1" title="扫描原生资源"><span style="width:10px;height:10px;border:1.5px solid currentColor;border-radius:50%;display:inline-block"></span> 扫描</button>
+          </div>
+        </div>
+        <div class="row" style="background:#efedeb"><span style="font-size:12px">brainstorming <span style="color:#16a34a">已在仓库</span></span></div>
+        <div class="row"><span style="font-size:12px">some-native-skill <span style="color:#ea580c">原生</span></span><button class="btn" style="border-color:#d6d3d1">导入</button></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>交互与边界说明</h2>
+    <div class="note" style="line-height:2">
+      1. <b>排序三态</b>：默认（当前扫描序，图标 ⇅）→ 升序（↑）→ 降序（↓）→ 默认。Skill / MCP / 插件各自独立记忆；搜索过滤后仍保持当前排序。<br>
+      2. <b>目录按钮</b>：成功后 toast 显示打开的路径；目录不存在自动创建。<br>
+      3. <b>MCP 文件按钮</b>：用系统默认程序打开配置文件；文件不存在 → toast 报错「MCP 配置文件尚未创建：{路径}」（先在仓库添加后由启用动作生成）。<br>
+      4. <b>插件目录</b>：与启用插件的 symlink 目标目录同源（adapter.plugin_dirs），不是 ~/.tuvis/plugins 仓库。<br>
+      5. 表头仅在该资源列表<b>非空</b>时显示；"全部启用"占位保证右侧列头与行内按钮列对齐。
+    </div>
+  </div>
+
+<script>
+  // 排序三态演示：默认 ⇅ → 升序 ↑ → 降序 ↓ → 默认
+  const STATES = [
+    { ico: "⇅", label: "默认", active: false },
+    { ico: "↑", label: "升序", active: true },
+    { ico: "↓", label: "降序", active: true },
+  ];
+  function cycleSort(btn) {
+    const ico = btn.querySelector("span:nth-of-type(1)");
+    const st = btn.querySelector("span:nth-of-type(2)");
+    const cur = STATES.findIndex(s => s.label === st.textContent);
+    const next = STATES[(cur + 1) % STATES.length];
+    ico.textContent = next.ico;
+    st.textContent = next.label;
+    btn.classList.toggle("active", next.active);
+  }
+</script>
+</body>
+</html>

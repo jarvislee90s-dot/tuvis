@@ -7,7 +7,16 @@
     "experimental": "🧪 试验性",
     "no": "❌ 不支持"
   },
-  "tools": ["claude", "codex", "opencode", "kimi", "workbuddy", "zcode", "dsh", "openclaw"],
+  "tools": [
+    "claude",
+    "codex",
+    "opencode",
+    "kimi",
+    "workbuddy",
+    "zcode",
+    "dsh",
+    "openclaw"
+  ],
   "groups": [
     {
       "key": "desktop",
@@ -226,8 +235,8 @@
             "dsh": "no",
             "openclaw": "no"
           },
-          "note": "实验性；仅 Windows 26.1013.4894.0 / macOS 26.1013.40934 按 build 解锁；permissions 关闭；生成图入会话产物。三态徽标：已验证（该 build 有真机证据）/ 兼容探测（实验：未知 build 先做只读探测，服务端 15 秒硬上限，探测在飞时只显示「探测中」骨架、不提前下「未解锁」定论；兼容发送需在设置页显式开启「兼容发送（实验）」）/ 未解锁。未知 build 的兼容路径为实验能力。证据等级：命令审批已有真机证据（4894 的 accept/decline 闭环 + 6573 的 pending 形状）；文件审批目前只有官方方法表/调用点证据，端到端尚未真机闭环",
-          "noteEn": "Experimental; only Windows 26.1013.4894.0 / macOS 26.1013.40934 per exact build; permissions off; generated images are session artifacts. Three-state badge: verified (real-machine evidence for that build) / compatibility probe (experimental: an unknown build goes through a read-only probe capped at 15 seconds server-side; while it is running the UI only shows a \"probing\" skeleton and never concludes \"not unlocked\" up front; compatibility sending must be enabled explicitly via the \"Compatibility sending (experimental)\" switch in settings) / not unlocked. The unknown-build compatibility path is experimental. Evidence level: command approval has real-machine evidence (4894 accept/decline closed loop + 6573 pending shape); file approval currently has only official method-table / call-site evidence and is not yet closed end-to-end on real hardware"
+          "note": "实验性；**0.6.3 重磅：Codex 桌面端自适应控制**。按操作契约证据放行（shipped / 当前包契约匹配 / 本机真实成功），不做整 build 白名单：普通消息、阻塞问答（多题多值/自由文本）、同组异步题（一张卡、一次提交、已答自动核销）、命令/文件审批（accept/decline/cancel，摘要不足移除批准）、定向打断（v4+expectedTurnId，前置暂停）与队列暂停/恢复。完美适配：契约匹配且本机实测通过的发送/问答/异步提交；兼容适配：未知 build 按目标/状态/协议守卫尝试发送，破坏性操作仍走证据门控；不支持：permissions、Plan 模式切换、无活动回合的打断。Desktop 会话永不自动转 headless，答案/命令正文不进日志。macOS 26.1021.31345 已探针取证；Windows 与 360/390 像素验收待逐项确认。",
+          "noteEn": "Experimental; **0.6.3 flagship: Codex Desktop adaptive control**. Gated per operation by contract evidence (shipped / current-package contract match / local observed success), not a whole-build allowlist: plain messages, blocking Q&A (multi-question, multi-value, free text), grouped async questions (one card, one submit, auto-close when answered), command/file approvals (accept/decline/cancel; approve is withdrawn without a sufficient summary), targeted interrupt (v4 + expectedTurnId behind a pre-inserted pause), and queue pause/resume. Fully verified: sends/Q&A/async submit matched by contract and observed locally. Compatible: unknown builds attempt sends under target/state/protocol guards, while destructive actions stay evidence-gated. Unsupported: permissions, Plan mode switching, and interrupt without an active turn. Desktop sessions never fall back to headless; answers and command bodies never enter logs. macOS 26.1021.31345 is probe-backed; Windows and 360/390 px acceptance remain per-item checks."
         },
         {
           "name": "输出速度（TPS 采样）",

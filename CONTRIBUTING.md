@@ -6,7 +6,7 @@
 - Node.js ≥ 22.22.2、pnpm 11、Rust ≥ 1.89
   （下限不是拍脑袋写的：Node 由 `jsdom 30` 的 engines 决定、Rust 由代码实际用到的
   `File::unlock`(1.89) 决定，声明在 `package.json` 的 `engines` 与 `src-tauri/Cargo.toml`
-  的 `rust-version`；来源与门禁说明见 `docs/DEPENDENCY-UPDATES.md` §6）
+  的 `rust-version`；来源与门禁说明见 `docs/operations/DEPENDENCY-UPDATES.md` §6）
 
 ### 搭建步骤
 ```bash
@@ -22,7 +22,7 @@ pnpm tauri:dev
 - 提交信息: Conventional Commits (feat/fix/docs/refactor/test/chore)
 
 ## PR 流程
-> 处理依赖升级（dependabot）PR 前请先读 `docs/DEPENDENCY-UPDATES.md`：那里有月度批处理
+> 处理依赖升级（dependabot）PR 前请先读 `docs/operations/DEPENDENCY-UPDATES.md`：那里有月度批处理
 > 流程、`Tauri version parity` 门禁的含义、以及各类红灯的处置表。
 
 1. Fork 并创建分支: `git checkout -b feat/your-feature`

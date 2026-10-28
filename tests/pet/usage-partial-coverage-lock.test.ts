@@ -13,7 +13,7 @@
 //    `docs/user-manual/{zh,en}/11-usage.md`，锁面随内容迁移重指两章手册）。
 //
 // ⚠️ **范围（别以为它覆盖全仓）**：本锁只扫下面这几个文件 —— 判据面（`services/usage/**`）的 4 个
-//    Rust 文件 + spec + **验收清单**（`ACCEPT`）+ **双手册章**（`docs/user-manual/zh/11-usage.md` +
+//    Rust 文件 + spec + **验收清单**（`ACCEPT`）+ **双手册章**（`docs/product/manual/zh/11-usage.md` +
 //    `en/11-usage.md`，共 8 个被扫文件）。**用例 1 的 `files` 数组 =
 //    `RUST_FILES + SPEC + ACCEPT + MANUAL_ZH + MANUAL_EN`**（2026-10-06 第三轮把 ACCEPT 补进来：此前文件头声明
 //    含验收清单、而 `files` 与黑名单都不含它 ⇒ 那份文件里的 `19/99` 其实**不受本锁保护**，
@@ -67,10 +67,10 @@ const QUERY = "src-tauri/src/services/usage/query.rs";
 const DSH = "src-tauri/src/services/usage/collectors/dsh.rs";
 const COLLECT = "src-tauri/src/services/usage/collect.rs";
 const RUST_FILES = [CAPS, QUERY, DSH, COLLECT];
-const SPEC = "docs/superpowers/specs/2026-10-03-pet-token-usage-dashboard-design.md";
-const ACCEPT = "docs/release-notes/usage-dashboard-acceptance.md";
-const MANUAL_ZH = "docs/user-manual/zh/11-usage.md"; // 中文主笔：锁钉中文裁决串（不在界面表达/不写死）——2026-10-23 门面化后自 README.zh-CN.md 迁入
-const MANUAL_EN = "docs/user-manual/en/11-usage.md"; // 英文侧对应句（作废标记 obsolete）——自 README.md 迁入
+const SPEC = "docs/engineering/specs/2026-10-03-pet-token-usage-dashboard-design.md";
+const ACCEPT = "docs/engineering/acceptance/history/usage-dashboard-acceptance.md";
+const MANUAL_ZH = "docs/product/manual/zh/11-usage.md"; // 中文主笔：锁钉中文裁决串（不在界面表达/不写死）——2026-10-23 门面化后自 README.zh-CN.md 迁入
+const MANUAL_EN = "docs/product/manual/en/11-usage.md"; // 英文侧对应句（作废标记 obsolete）——自 README.md 迁入
 
 /**
  * **含 `19/99` 的被锁文件 × 逐文件行数** —— 文件头那句「七个文件、3 / 2 / 2 / 1 / 1 / 1 / 1」的

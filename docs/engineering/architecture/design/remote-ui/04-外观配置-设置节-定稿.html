@@ -1,0 +1,346 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>04 · 外观配置设置节定稿</title><style>body{margin:0;background:#EFEDE8;font-family:-apple-system,"PingFang SC",sans-serif}.wrap{max-width:860px;margin:0 auto;padding:28px 20px 60px}h2{font-size:20px;margin:0 0 4px;color:#1C1B18}.subtitle{font-size:13px;color:#8B897F;margin:0 0 8px}h3{font-size:15px;color:#26241F;margin:26px 0 4px}.note{font-size:12px;color:#666;line-height:1.7;margin:6px 0 0}.sec{margin-top:26px}.duo{display:flex;gap:14px;flex-wrap:wrap}</style></head><body><div class="wrap"><!-- 状态：已定稿 2026-10-05 · 底色等 Token 已对齐台账暖白纸感默认值 · 实现必须与本稿及 tool-color-ledger.md 一致 -->
+<h2>外观设置 v9 · 两个大框：桌面端（即点即生效）｜ 远程端（保存并下发）</h2>
+<p class="subtitle">去掉 Tab，改为两个带标题栏的独立大框——保存键的管辖范围一眼可辨：桌面端框内没有保存键，远程端框内才有「保存并下发」。</p>
+
+<style>
+  .setpg { max-width:760px; margin:16px auto; border:1px solid #E0DED6; border-radius:14px; overflow:hidden;
+    font-family:-apple-system,"PingFang SC",sans-serif; color:#26241F; background:#FAF9F6; }
+  .setnav { display:flex; align-items:center; gap:14px; padding:10px 18px; background:#fff; border-bottom:1px solid #EAE8E0; font-size:12px; }
+  .setnav .brand { font-weight:800; }
+  .setnav .nav { color:#8B897F; }
+  .setnav .nav.on { color:#1A1915; font-weight:700; border-bottom:2px solid #1A1915; padding-bottom:2px; }
+  .setbody { padding:18px 20px 20px; }
+  .setbody h3 { margin:0 0 2px; font-size:16px; }
+  .sdesc { font-size:12px; color:#8B897F; margin:0 0 14px; }
+
+  /* 大框 */
+  .bigframe { background:#fff; border:1px solid #E0DED6; border-radius:14px; overflow:hidden; margin-bottom:16px; }
+  .bf-head { display:flex; align-items:baseline; gap:10px; padding:11px 16px; background:#F5F4EF; border-bottom:1px solid #EAE8E0; }
+  .bf-head b { font-size:13.5px; }
+  .bf-head .hint { font-size:11.5px; color:#8B897F; }
+  .bf-head .scope { margin-left:auto; font-size:10.5px; font-weight:600; border-radius:99px; padding:2px 10px; }
+  .scope-now { background:#E3F2E7; color:#1E7B34; }
+  .scope-pub { background:#FBF3D9; color:#8A6D00; }
+  .bf-body { padding:14px 16px 16px; }
+
+  .frow2 { display:flex; align-items:center; justify-content:space-between; padding:8px 0; font-size:12.5px; border-top:1px solid #F4F2EC; }
+  .frow2:first-of-type { border-top:none; }
+  .seg { display:inline-flex; background:#F1F0EA; border-radius:8px; padding:2px; }
+  .seg span { font-size:11.5px; padding:4px 12px; border-radius:6px; color:#6B695F; }
+  .seg .on { background:#fff; color:#1A1915; font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,.06); }
+
+  .rc-head { display:flex; align-items:center; gap:10px; padding:11px 14px; background:#FCFBF8; border:1px solid #EAE8E0; border-radius:10px; cursor:pointer; margin-bottom:12px; }
+  .rc-head b { font-size:13px; }
+  .rc-summary { font-size:12px; color:#8B897F; display:flex; gap:5px; align-items:center; }
+  .mini-dot { width:14px; height:14px; border-radius:4px; border:1px solid rgba(0,0,0,.15); }
+  .rc-head .chev { margin-left:auto; color:#A5A29A; font-size:11px; transform:rotate(90deg); }
+
+  .row-lab { font-size:11.5px; font-weight:700; letter-spacing:.06em; color:#8B897F; margin:14px 0 7px; }
+  .row-lab.first { margin-top:0; }
+  .grid4 { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
+  .fcard { border:1.5px solid #E3E1D6; border-radius:10px; padding:8px 11px; cursor:pointer; background:#fff; line-height:1.25; }
+  .fcard.on { border-color:#1A1915; box-shadow:0 0 0 1px #1A1915; }
+  .fcard .fname { font-size:13px; font-weight:600; color:#26241F; }
+  .fcard .fsample { font-size:11px; color:#8B897F; margin-top:2px; }
+  .fcard .ftick { display:none; font-size:10px; color:#1A1915; font-weight:700; }
+  .fcard.on .ftick { display:inline; }
+
+  .sgrid { display:grid; grid-template-columns:repeat(6,1fr); gap:8px; }
+  .sw { border:1.5px solid #E3E1D6; border-radius:10px; padding:8px 6px 7px; cursor:pointer; background:#fff; text-align:center; }
+  .sw.on { border-color:#1A1915; box-shadow:0 0 0 1px #1A1915; }
+  .sw .ball { width:34px; height:34px; border-radius:50%; margin:0 auto; border:1px solid rgba(0,0,0,.12); display:flex; align-items:center; justify-content:center; }
+  .sw .ball i { display:block; width:16px; height:12px; border-radius:3px; border:1px solid rgba(255,255,255,.35); box-shadow:0 0 0 1px rgba(0,0,0,.08); }
+  .sw .nm { font-size:10.5px; font-weight:600; color:#3B3A34; margin-top:5px; }
+  .sw .md { font-size:9px; margin-top:1px; color:#8B897F; }
+  .sw.on .nm::after { content:" ✓"; color:#1A1915; }
+
+  .tgrid { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
+  .tchip { border:1.5px solid #E3E1D6; border-radius:10px; padding:8px 10px; cursor:pointer; background:#fff; font-size:12px; color:#54524A; text-align:center; }
+  .tchip.on { border-color:#1A1915; box-shadow:0 0 0 1px #1A1915; color:#1A1915; font-weight:600; }
+  .tchip small { display:block; font-size:9.5px; color:#8B897F; font-weight:400; margin-top:1px; }
+
+  .sec-lab { font-size:12px; font-weight:700; color:#3B3A34; margin:16px 0 7px; padding-top:12px; border-top:1px solid #F2F0EA; }
+  .reswrap { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .rescol .rlab { font-size:10.5px; font-weight:700; letter-spacing:.06em; color:#8B897F; margin:0 0 5px; }
+  .res { border-radius:18px; padding:12px 11px 13px; border:1px solid #E0DDD2; font-size:10.5px; line-height:1.45; background:var(--pg); --rr:12px; }
+  .rhead { display:flex; align-items:baseline; gap:6px; margin-bottom:8px; color:var(--tx); }
+  .rhead b { font-size:12.5px; font-weight:700; }
+  .rhead span { font-size:9.5px; color:var(--mut); }
+  .rhead .ic { margin-left:auto; display:flex; gap:4px; }
+  .rhead .ic i { width:15px; height:15px; border-radius:5px; background:var(--cbg); border:1px solid var(--cb); }
+  .rc2 { position:relative; background:var(--cbg); border:1.5px solid var(--cb); border-radius:var(--rr); box-shadow:var(--sh);
+    padding:7px 9px; margin-bottom:7px; color:var(--tx); }
+  .rc2:last-child { margin-bottom:0; }
+  .acc-edge .rc2 { padding-left:12px; }
+  .acc-edge .rc2::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--ec); }
+  .acc-top .rc2::before { content:""; position:absolute; left:0; right:0; top:0; height:2px; background:var(--ec); }
+  .acc-tint .rc2 { background:color-mix(in srgb, var(--ec) 7%, var(--cbg)); border-color:color-mix(in srgb, var(--ec) 28%, var(--cb)); }
+  .rrow { display:flex; align-items:center; gap:5px; }
+  .rico { width:12px; height:12px; border-radius:3.5px; flex:none; }
+  .rname { font-weight:600; }
+  .rtime { margin-left:auto; font-size:8.5px; color:var(--mut); flex:none; }
+  .rtitle { font-weight:600; margin-top:2.5px; font-size:10.5px; }
+  .rmsg { font-size:9px; color:var(--mut); margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rbdg { display:inline-flex; align-items:center; gap:3px; padding:1px 5px; border-radius:99px; font-size:8px; font-weight:500; margin-top:3px; }
+  .rbdg .dt { width:3px; height:3px; border-radius:50%; background:currentColor; }
+  .rbdg-r { background:#FEE9E5; color:#B3261E; } .rbdg-g { background:#E3F2E7; color:#1E7B34; } .rbdg-y { background:#FBF3D9; color:#8A6D00; }
+
+  .bub { align-self:flex-end; max-width:82%; background:var(--bub); border-radius:13px 13px 4px 13px; padding:6px 9px; color:var(--tx); }
+  .aline { color:var(--tx); padding:0 2px; }
+  .trow-c { display:flex; align-items:center; gap:5px; background:var(--cbg); border:1px solid var(--cb); border-radius:8px; padding:5px 8px; color:var(--mut); }
+  .mono { font-family:ui-monospace,"SF Mono",Menlo,monospace; }
+  .trow-c .mono { color:var(--tx); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chev2 { color:var(--mut); font-size:8px; flex:none; }
+  .comp { display:flex; gap:5px; margin-top:9px; align-items:center; }
+  .cplus { width:20px; height:20px; border-radius:50%; border:1px solid var(--cb); display:flex; align-items:center; justify-content:center; color:var(--mut); flex:none; font-size:9px; }
+  .cinp { flex:1; background:var(--cbg); border:1px solid var(--cb); border-radius:9px; padding:5px 8px; color:var(--mut); }
+  .cbtn { background:var(--btnp); color:var(--btnpt); border-radius:8px; padding:5px 11px; font-weight:600; flex:none; }
+
+  .appr { position:relative; border:1.5px solid #E2A79E; border-radius:12px; padding:8px 9px; background:var(--cbg); overflow:hidden; }
+  .appr.acc-edge { padding-left:12px; }
+  .appr.acc-edge::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:#B3261E; }
+  .appr-h { color:#B3261E; font-weight:700; display:flex; gap:5px; align-items:center; }
+  .appr-h .dt { width:4px; height:4px; border-radius:50%; background:#B3261E; }
+  .acmd { margin-top:6px; background:var(--pg); border:1px solid var(--cb); border-radius:7px; padding:5px 8px; color:var(--tx); }
+  .aopts { display:flex; gap:6px; margin-top:7px; }
+  .abtn-p { flex:1; background:var(--btnp); color:var(--btnpt); border-radius:8px; text-align:center; padding:5px 0; font-weight:600; }
+  .abtn-s { flex:1; border:1px solid var(--cb); color:var(--mut); border-radius:8px; text-align:center; padding:5px 0; }
+
+  .fsegs { display:flex; gap:4px; margin-bottom:6px; flex-wrap:wrap; }
+  .fseg { padding:2px 8px; border-radius:99px; background:var(--cbg); border:1px solid var(--cb); color:var(--mut); }
+  .fseg.on { background:var(--btnp); color:var(--btnpt); border-color:var(--btnp); }
+  .frow3 { display:flex; align-items:center; gap:5px; padding:5px 1px; border-bottom:1px solid var(--cb); }
+  .frow3:last-child { border-bottom:none; }
+  .fpath { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--tx); }
+  .fmod { font-size:7.5px; color:#B3261E; background:#FEE9E5; border-radius:4px; padding:0 4px; flex:none; }
+  .ftm { font-size:8px; color:var(--mut); flex:none; }
+
+  .saverow { display:flex; align-items:center; gap:10px; margin-top:16px; padding-top:12px; border-top:1px solid #F2F0EA; min-height:34px; }
+  .dirtypill { font-size:11.5px; color:#8A6D00; background:#FBF3D9; border-radius:999px; padding:3px 10px; display:none; }
+  .dirty .dirtypill { display:inline-block; }
+  .cleanhint { font-size:11.5px; color:#8B897F; }
+  .dirty .cleanhint { display:none; }
+  .btn-save { margin-left:auto; background:#1A1915; color:#fff; border:none; border-radius:9px; padding:8px 22px; font-size:12.5px; font-weight:600; cursor:pointer; }
+  .btn-save:disabled { background:#D8D5CB; cursor:default; }
+  .savedflash { font-size:11.5px; color:#1E7B34; font-weight:600; display:none; }
+  .note { font-size:12px; color:#666; margin:14px auto 0; line-height:1.8; max-width:760px; }
+</style>
+
+<div class="setpg">
+  <div class="setnav"><span class="brand">兔维斯 设置</span><span class="nav">通用</span><span class="nav on">外观</span><span class="nav">远程接入</span><span class="nav">关于</span></div>
+  <div class="setbody">
+    <h3>外观</h3>
+    <p class="sdesc">桌面端与远程端（手机看板 / 网页）的观感分别配置，互不影响。</p>
+
+    <div class="bigframe">
+      <div class="bf-head"><b>桌面端外观</b><span class="hint">即点即生效，无需保存</span><span class="scope scope-now">仅本机</span></div>
+      <div class="bf-body">
+        <div class="frow2"><span>主题</span><span class="seg"><span>浅色</span><span class="on">跟随系统</span><span>深色</span></span></div>
+        <div class="frow2"><span>语言</span><span class="seg"><span class="on">简体中文</span><span>English</span></span></div>
+      </div>
+    </div>
+
+    <div class="bigframe dirty" id="panel">
+      <div class="bf-head"><b>远程端外观</b><span class="hint">改动需保存后下发生效</span><span class="scope scope-pub">保存后下发 · 已配对 1 台</span></div>
+      <div class="bf-body">
+        <div class="rc-head">
+          <b>远程端外观配置器</b>
+          <span class="rc-summary"><span class="mini-dot" style="background:#F8F3E9"></span>暖白纸感<span style="color:#C9C6BA">/</span><span class="mini-dot" style="background:#271D0F"></span>暖黑纸感 · 标准</span>
+          <span class="chev">›</span>
+        </div>
+
+        <div class="row-lab first">① 字体气质（单选 · 文字即其字体本样）</div>
+        <div class="grid4">
+          <div class="fcard on" data-k="std" style="font-family:-apple-system,'PingFang SC',sans-serif" onclick="pickFont(this)"><span class="fname">标准</span><span class="ftick"> ✓</span><div class="fsample">远程 Aa 123</div></div>
+          <div class="fcard" data-k="term" style="font-family:ui-monospace,'SF Mono',Menlo,monospace" onclick="pickFont(this)"><span class="fname">终端</span><span class="ftick"> ✓</span><div class="fsample">远程 Aa 123</div></div>
+          <div class="fcard" data-k="round" style="font-family:ui-rounded,'Yuanti SC','PingFang SC',sans-serif" onclick="pickFont(this)"><span class="fname">圆润</span><span class="ftick"> ✓</span><div class="fsample">远程 Aa 123</div></div>
+          <div class="fcard" data-k="serif" style="font-family:ui-serif,'New York','Songti SC',serif" onclick="pickFont(this)"><span class="fname">书卷</span><span class="ftick"> ✓</span><div class="fsample">远程 Aa 123</div></div>
+        </div>
+
+        <div class="row-lab">② 皮肤底色（白天 / 夜间各选其一）</div>
+        <div class="sgrid">
+          <div class="sw on" data-k="lpaper" onclick="pickSkin(this)"><div class="ball" style="background:#F8F3E9"><i style="background:#FFFDF8"></i></div><div class="nm">暖白纸感</div><div class="md">白天 · 米调</div></div>
+          <div class="sw" data-k="lpure" onclick="pickSkin(this)"><div class="ball" style="background:#FFFFFF"><i style="background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.1)"></i></div><div class="nm">极简纯白</div><div class="md">白天</div></div>
+          <div class="sw" data-k="lmist" onclick="pickSkin(this)"><div class="ball" style="background:#EFF3F2"><i style="background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.08)"></i></div><div class="nm">雾青</div><div class="md">白天 · 冷调</div></div>
+          <div class="sw on" data-k="npaper" onclick="pickSkin(this)"><div class="ball" style="background:#271D0F"><i style="background:#3A2C1A"></i></div><div class="nm">暖黑纸感</div><div class="md">夜间 · 棕调</div></div>
+          <div class="sw" data-k="npure" onclick="pickSkin(this)"><div class="ball" style="background:#0A0A0A"><i style="background:#141414"></i></div><div class="nm">极简纯黑</div><div class="md">夜间</div></div>
+          <div class="sw" data-k="ndeep" onclick="pickSkin(this)"><div class="ball" style="background:#0C201B"><i style="background:#12281F"></i></div><div class="nm">深青</div><div class="md">夜间 · 青调</div></div>
+        </div>
+
+        <div class="row-lab">③ 卡片圆角（单选）</div>
+        <div class="tgrid" id="grid-r">
+          <div class="tchip" data-k="8" onclick="pickOne(this,'grid-r','radius')">利落<small>8px</small></div>
+          <div class="tchip on" data-k="12" onclick="pickOne(this,'grid-r','radius')">标准<small>12px</small></div>
+          <div class="tchip" data-k="18" onclick="pickOne(this,'grid-r','radius')">圆润<small>18px</small></div>
+          <div class="tchip" data-k="22" onclick="pickOne(this,'grid-r','radius')">胶囊<small>22px</small></div>
+        </div>
+
+        <div class="row-lab">④ 品牌色点缀（单选）</div>
+        <div class="tgrid" id="grid-a">
+          <div class="tchip on" data-k="edge" onclick="pickOne(this,'grid-a','accent')">左侧彩檐<small>识别度最强</small></div>
+          <div class="tchip" data-k="top" onclick="pickOne(this,'grid-a','accent')">顶部细线<small>轻量点缀</small></div>
+          <div class="tchip" data-k="tint" onclick="pickOne(this,'grid-a','accent')">淡底渲染<small>整卡品牌微底</small></div>
+          <div class="tchip" data-k="none" onclick="pickOne(this,'grid-a','accent')">无檐纯图标<small>最克制</small></div>
+        </div>
+
+        <div class="sec-lab">预览 · 看板</div>
+        <div class="reswrap">
+          <div class="rescol"><div class="rlab">白天</div>
+            <div class="res acc-edge" data-mode="lpaper">
+              <div class="rhead"><b>会话看板</b><span>6 个会话</span><span class="ic"><i></i><i></i></span></div>
+              <div class="rc2" style="--ec:#10A37F"><div class="rrow"><span class="rico" style="background:#fff;border:1px solid #1a1a1a"></span><span class="rname">Codex</span><span class="rtime">2 分钟前</span></div><div class="rtitle">修复 pet 导入路径</div><div class="rmsg">需要你批准运行 pnpm install</div><span class="rbdg rbdg-r"><span class="dt"></span>等待批准</span></div>
+              <div class="rc2" style="--ec:#D97757"><div class="rrow"><span class="rico" style="background:#D97757"></span><span class="rname">Claude</span><span class="rtime">1 小时前</span></div><div class="rtitle">远程看板 UI 改版</div><div class="rmsg">正在重构 Board.tsx…</div><span class="rbdg rbdg-y"><span class="dt"></span>运行中</span></div>
+            </div>
+          </div>
+          <div class="rescol"><div class="rlab">夜间</div>
+            <div class="res acc-edge" data-mode="npaper">
+              <div class="rhead"><b>会话看板</b><span>6 个会话</span><span class="ic"><i></i><i></i></span></div>
+              <div class="rc2" style="--ec:#8A94A6"><div class="rrow"><span class="rico" style="background:#E8EDF8"><svg viewBox="0 0 20 20" style="width:12px;height:12px"><path d="M17.5 10.66A7.5 7.5 0 1 1 9.34 2.5 5.83 5.83 0 0 0 17.5 10.66Z" fill="#0B0E1A"/></svg></span><span class="rname">Kimi</span><span class="rtime">3 小时前</span></div><div class="rtitle">首页 hero 动效</div><div class="rmsg">分析 hero 区域的实现方案</div><span class="rbdg rbdg-g"><span class="dt"></span>已完成 · 未读</span></div>
+              <div class="rc2" style="--ec:#A39C8C"><div class="rrow"><span class="rico" style="background:#141414;border:1.5px solid #ECE9E2"><svg viewBox="0 0 20 20" style="width:11px;height:11px"><path d="M5.5 5.5h9L6.5 14.5h9" stroke="#fff" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rname">ZCode</span><span class="rtime">5 小时前</span></div><div class="rtitle">M4 外部全链路联调</div><div class="rmsg">全部测试通过，任务完成 ✅</div><span class="rbdg rbdg-g"><span class="dt"></span>已完成</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec-lab">预览 · 对话流（详情页内部）</div>
+        <div class="reswrap">
+          <div class="rescol"><div class="rlab">白天</div>
+            <div class="res acc-edge" data-mode="lpaper" style="display:flex;flex-direction:column;gap:6px">
+              <div style="display:flex;align-items:center;gap:5px;color:var(--tx)"><b style="font-size:11px">mam-worktree2</b><span style="font-size:8.5px;color:var(--mut)">Codex · 修复 pet 导入路径</span><span class="rbdg rbdg-r" style="margin:0 0 0 auto"><span class="dt"></span>等待批准</span></div>
+              <div class="bub">帮我把远程看板的卡片重做一下，参考桌面端的风格</div>
+              <div class="aline">好的，我先看一下当前的 Board.tsx 实现。</div>
+              <div class="trow-c"><span class="chev2">▶</span><span>调用 Bash</span><span class="mono">grep -n "rounded" src/mobile/Board.tsx</span></div>
+              <div class="comp"><span class="cplus">＋</span><span class="cinp">输入消息发送到终端…</span><span class="cbtn">发送</span></div>
+            </div>
+          </div>
+          <div class="rescol"><div class="rlab">夜间</div>
+            <div class="res acc-edge" data-mode="npaper" style="display:flex;flex-direction:column;gap:6px">
+              <div style="display:flex;align-items:center;gap:5px;color:var(--tx)"><b style="font-size:11px">mam-worktree2</b><span style="font-size:8.5px;color:var(--mut)">Kimi · 首页 hero 动效</span><span class="rbdg rbdg-g" style="margin:0 0 0 auto"><span class="dt"></span>已完成</span></div>
+              <div class="bub">hero 区域换成视差滚动，性能注意一下</div>
+              <div class="aline">好的，我先分析现有实现，再给出改动方案。</div>
+              <div class="trow-c"><span class="chev2">▶</span><span>调用 Read</span><span class="mono">src/mobile/SessionDetail.tsx</span></div>
+              <div class="comp"><span class="cplus">＋</span><span class="cinp">输入消息发送到终端…</span><span class="cbtn">发送</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec-lab">预览 · 审批卡</div>
+        <div class="reswrap">
+          <div class="rescol"><div class="rlab">白天</div>
+            <div class="res acc-edge" data-mode="lpaper">
+              <div class="appr acc-edge">
+                <div class="appr-h"><span class="dt"></span>等待批准</div>
+                <div class="acmd mono">$ pnpm install</div>
+                <div class="aopts"><span class="abtn-p">允许</span><span class="abtn-s">拒绝</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="rescol"><div class="rlab">夜间</div>
+            <div class="res acc-edge" data-mode="npaper">
+              <div class="appr acc-edge">
+                <div class="appr-h"><span class="dt"></span>等待批准</div>
+                <div class="acmd mono">$ cargo test --all</div>
+                <div class="aopts"><span class="abtn-p">允许</span><span class="abtn-s">拒绝</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec-lab">预览 · 文件面板</div>
+        <div class="reswrap">
+          <div class="rescol"><div class="rlab">白天</div>
+            <div class="res acc-edge" data-mode="lpaper">
+              <div class="fsegs"><span class="fseg on">全部</span><span class="fseg">我上传</span><span class="fseg">工具读取</span><span class="fseg">工具写入</span></div>
+              <div class="rc2">
+                <div class="frow3"><span class="fpath mono">src/mobile/Board.tsx</span><span class="fmod">改</span><span class="ftm">12:04</span></div>
+                <div class="frow3"><span class="fpath mono">src/index.css</span><span class="ftm">11:12</span></div>
+                <div class="frow3"><span class="fpath mono">docs/engineering/architecture/design/tool-color-ledger.md</span><span class="fmod">改</span><span class="ftm">11:41</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="rescol"><div class="rlab">夜间</div>
+            <div class="res acc-edge" data-mode="npaper">
+              <div class="fsegs"><span class="fseg on">全部</span><span class="fseg">我上传</span><span class="fseg">工具读取</span><span class="fseg">工具写入</span></div>
+              <div class="rc2">
+                <div class="frow3"><span class="fpath mono">src-tauri/src/remote/watcher.rs</span><span class="fmod">改</span><span class="ftm">09:32</span></div>
+                <div class="frow3"><span class="fpath mono">src/mobile/api.ts</span><span class="fmod">改</span><span class="ftm">09:18</span></div>
+                <div class="frow3"><span class="fpath mono">mobile.html</span><span class="ftm">08:55</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="saverow">
+          <span class="cleanhint">与已保存配置一致</span>
+          <span class="dirtypill">● 有未保存的更改</span>
+          <span class="savedflash" id="savedflash">✓ 已保存并下发</span>
+          <button class="btn-save" id="btnsave" disabled onclick="doSave()">保存并下发</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p class="note">两个大框的行为差异用标题栏徽标直接写明：桌面端「仅本机 · 即点即生效」（无保存键，点到哪个是哪个）；远程端「保存后下发 · 已配对 N 台」（改动 → 黄标 + 「保存并下发」点亮 → 点击后写库、经 ui-config 接口下发，远程端下次加载生效）。两框各自独立，任何样式与行为互不混淆。</p>
+
+<script>
+  var SKINS = {
+    lpaper:{pg:"#F8F3E9",cbg:"#FFFDF8",cb:"#EAE2CF",tx:"#2B2417",mut:"#97907E",sh:"0 1px 2px rgba(80,60,20,.06),0 3px 10px rgba(80,60,20,.05)",bub:"#EFE8D8",btnp:"#1A1915",btnpt:"#FFFFFF"},
+    lpure:{pg:"#FFFFFF",cbg:"#FFFFFF",cb:"#E3E3E1",tx:"#141414",mut:"#8F8F8B",sh:"none",bub:"#F0F0EE",btnp:"#1A1915",btnpt:"#FFFFFF"},
+    lmist:{pg:"#EFF3F2",cbg:"#FFFFFF",cb:"#DFE7E5",tx:"#1D2422",mut:"#87928F",sh:"0 1px 2px rgba(30,60,55,.05),0 3px 10px rgba(30,60,55,.04)",bub:"#E2EBE8",btnp:"#14201D",btnpt:"#FFFFFF"},
+    npaper:{pg:"#271D0F",cbg:"#3A2C1A",cb:"#6E5836",tx:"#F0E9DC",mut:"#B0A896",sh:"0 1px 3px rgba(0,0,0,.35)",bub:"#564427",btnp:"#EFE9DC",btnpt:"#241B0E"},
+    npure:{pg:"#0A0A0A",cbg:"#161616",cb:"#3A3A3A",tx:"#F5F5F5",mut:"#8A8A8A",sh:"none",bub:"#262626",btnp:"#F5F5F5",btnpt:"#111111"},
+    ndeep:{pg:"#0C201B",cbg:"#12281F",cb:"#2C4A3E",tx:"#E8F0EC",mut:"#7E938C",sh:"0 1px 3px rgba(0,0,0,.4)",bub:"#1B352C",btnp:"#DDEBE3",btnpt:"#0C1A14"}
+  };
+  var FONTS = {
+    std:"-apple-system,'PingFang SC',sans-serif",
+    term:"ui-monospace,'SF Mono',Menlo,monospace",
+    round:"ui-rounded,'Yuanti SC','PingFang SC',sans-serif",
+    serif:"ui-serif,'New York','Songti SC',serif"
+  };
+  var sel = { day:"lpaper", night:"npaper", font:"std", radius:"12", accent:"edge" };
+  function markDirty() {
+    document.getElementById('panel').classList.add('dirty');
+    document.getElementById('btnsave').disabled = false;
+    document.getElementById('savedflash').style.display = 'none';
+  }
+  function render() {
+    document.querySelectorAll('.res').forEach(function (el) {
+      var s = SKINS[el.getAttribute('data-mode')];
+      el.style.fontFamily = FONTS[sel.font];
+      ['pg','cbg','cb','tx','mut','sh','bub','btnp','btnpt'].forEach(function (k) { el.style.setProperty('--' + k, s[k]); });
+      el.style.setProperty('--rr', sel.radius + 'px');
+      el.classList.remove('acc-edge', 'acc-top', 'acc-tint', 'acc-none');
+      el.classList.add('acc-' + sel.accent);
+    });
+  }
+  function pickOne(el, gridId, key) {
+    document.querySelectorAll('#' + gridId + ' .tchip').forEach(function (c) { c.classList.remove('on'); });
+    el.classList.add('on');
+    sel[key] = el.getAttribute('data-k');
+    render(); markDirty();
+  }
+  function pickSkin(el) {
+    var k = el.getAttribute('data-k');
+    var isDay = (k.charAt(0) === 'l');
+    var g = isDay ? 'l' : 'n';
+    document.querySelectorAll('.sw').forEach(function (c) {
+      if (c.getAttribute('data-k').charAt(0) === g) c.classList.remove('on');
+    });
+    el.classList.add('on');
+    sel[isDay ? 'day' : 'night'] = k;
+    render(); markDirty();
+  }
+  function pickFont(el) {
+    document.querySelectorAll('.fcard').forEach(function (c) { c.classList.remove('on'); });
+    el.classList.add('on');
+    sel.font = el.getAttribute('data-k');
+    render(); markDirty();
+  }
+  function doSave() {
+    document.getElementById('panel').classList.remove('dirty');
+    document.getElementById('btnsave').disabled = true;
+    document.getElementById('savedflash').style.display = 'inline';
+  }
+  render();
+</script>
+</div></body></html>
