@@ -31,6 +31,7 @@ export const ZCODE_ERROR_CODES = [
   "unknown",
   "not_ready",
   "unsupported_protocol",
+  "unsupported",
   "needs_evidence",
   "no_session",
   "target_ambiguous",

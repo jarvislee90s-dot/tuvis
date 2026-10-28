@@ -1431,6 +1431,15 @@ impl BridgeManager {
             .log_fingerprint
             .clone()
     }
+
+    /// 外部评审 C2：精确会话的**宿主** pending id 集合（pending 首次确认判据的
+    /// 唯一撤卡证据源；与 [`Self::wait_host_cleared`] 同一权威源）。会话不在册 →
+    /// `None`（无证据，绝不把别的会话集合顶替）。
+    pub(crate) fn host_pending_ids(&self, session_id: &str) -> Option<Vec<String>> {
+        let inner = lock(&self.shared.state);
+        let entry = inner.sessions.get(session_id)?;
+        Some(entry.projection.pending_book().host_pending_ids())
+    }
 }
 
 /// 按**宿主 pending 卡**的题型推导本次应答所需的全部能力名。

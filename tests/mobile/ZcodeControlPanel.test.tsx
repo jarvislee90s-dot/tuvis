@@ -1374,7 +1374,7 @@ function localeText(bundle: unknown, path: string): string | undefined {
 
 describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
   it("all_reason_codes_have_zh_en_copy", () => {
-    // 冻结码表（19 码）每一码都必须映射到 zh/en 都存在的文案键（键集 = 码集）。
+    // 冻结码表（20 码）每一码都必须映射到 zh/en 都存在的文案键（键集 = 码集）。
     expect(Object.keys(ZCODE_REASON_KEYS).sort()).toEqual([...ZCODE_ERROR_CODES].sort());
     for (const code of ZCODE_ERROR_CODES) {
       const key = ZCODE_REASON_KEYS[code];
@@ -1399,6 +1399,39 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
       // 英文侧不得混入中文，否则英文界面会漏出中文原因
       expect(enText, `en copy contains chinese for ${code}`).not.toMatch(/[\u4e00-\u9fff]/);
     }
+  });
+
+  it("unsupported_reason_code_shows_dedicated_copy_not_neutral_fallback", async () => {
+    // 冻结码 `unsupported`（Rust codes::UNSUPPORTED）= 能力被静态知识/账本明确判死：
+    // **永久**不支持。就地原因必须是专文案（对齐手册示例「暂不支持该操作」），
+    // 不得落入中性兜底「控制暂时不可用，请稍后重试」——那会让用户对一个永不开放
+    // 的能力空等重试。en 侧同码同专文案（词表守卫不在码内 → 兜底，两侧都不许）。
+    expect(localeText(zhLocale, "mobile.zcodeControl.reasonUnsupported")).toBe("暂不支持该操作");
+    expect(localeText(enLocale, "mobile.zcodeControl.reasonUnsupported")).toBe(
+      "This action is not supported yet"
+    );
+
+    const caps = capabilities();
+    caps.singleSelect = { enabled: false, reasonCode: "unsupported" };
+    installFetch((url) => {
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) {
+        return json(
+          sessionView({
+            capabilities: caps,
+            pending: [pendingView({ questions: [questionView()] })],
+          })
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    const reason = await screen.findByTestId("zcode-pending-reason");
+    expect(reason.getAttribute("data-reason-code")).toBe("unsupported");
+    // 专文案如实呈现；中性兜底一句话都不出现
+    expect(reason.textContent).toBe("暂不支持该操作");
+    expect(reason.textContent).not.toContain("暂时不可用");
   });
 
   it("en_panel_has_no_hardcoded_chinese", async () => {
@@ -1514,6 +1547,50 @@ describe("ZCode 控制面板：原因码 zh/en 全覆盖", () => {
     ]) {
       expect(panel.textContent ?? "", phrase).not.toContain(phrase);
     }
+  });
+});
+
+describe("ZCode 控制面板：能力呈现合规（spec R5/§7.6）", () => {
+  it("no probe UI and no approval card without pending", async () => {
+    // paired + ready + 无 pending + 无 selection + 无运行回合：屏幕上只允许
+    // 出现「如实呈现 + 发送面」。钉住三条呈现纪律：
+    // - 无探测页/按钮/徽标（build 兼容态绝不外显成任何探测 UI）；
+    // - 无 pending 不渲染审批/问答卡，无 selection 目录不渲染模型/档位控件；
+    // - 只有 capabilities.send.enabled 才显示可用（开启 → 发送面可见、无原因行）。
+    installFetch((url) => {
+      if (url.includes("/official-control")) {
+        return json({ configState: "missing", url: null });
+      }
+      if (url === ZCODE_CONNECTION_PATH) return json(connection());
+      if (url.startsWith(`${ZCODE_SESSION_PATH}?`)) return json(sessionView());
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    render(<ZcodeControlPanel sessionId={SID} />);
+    await screen.findByTestId("zcode-send");
+    // 等全部权威 GET 落定（连接/会话/官方链接），避免异步面晚到误判「缺失」。
+    await act(async () => {});
+
+    // 探测 UI 一律不存在：无测试 id、无「探测/probe」字样的任何元素。
+    expect(screen.queryByTestId("zcode-probe")).toBeNull();
+    expect(screen.queryByText(/探测/)).toBeNull();
+    expect(screen.queryByText(/probe/i)).toBeNull();
+
+    // 无 pending：审批/问答卡一张都不渲染（作答面只来自宿主真实 pending）。
+    expect(screen.queryByTestId("zcode-pending-card")).toBeNull();
+    expect(screen.queryByTestId("zcode-pending-submit")).toBeNull();
+
+    // 无 selection 目录/档位：模型/档位控件不渲染（不伪造目录）。
+    expect(screen.queryByTestId("zcode-model-select")).toBeNull();
+    expect(screen.queryByTestId("zcode-thought-select")).toBeNull();
+
+    // 无运行回合（activeWorks 空）：打断按钮不渲染。
+    expect(screen.queryByTestId("zcode-interrupt")).toBeNull();
+
+    // send 能力开启：发送面可用可见；能力开启时不得带「不可用原因」行。
+    expect(screen.getByTestId("zcode-send")).toBeVisible();
+    expect(screen.getByTestId("zcode-send")).toBeEnabled();
+    expect(screen.queryByTestId("zcode-send-reason")).toBeNull();
   });
 });
 

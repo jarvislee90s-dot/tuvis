@@ -40,14 +40,16 @@ mod tests {
         decode_channel, encode_frame, encode_response_for_test, RpcIdentity,
         REQUEST_TYPE_EVENT_LISTEN, REQUEST_TYPE_PROMISE, RESPONSE_TYPE_EVENT_FIRE,
     };
-    use super::super::command::{AGENT_SEND_COMMAND_METHOD, SEND_TEXT_TYPE};
+    use super::super::command::{
+        AGENT_SEND_COMMAND_METHOD, RESOLVE_INTERACTION_TYPE, SEND_TEXT_TYPE,
+    };
     use super::super::config::set_config;
     use super::super::credential_store::MemoryCredentialStore;
     use super::super::hub::{HubBackend, PartsBackend, ZcodeHub};
     use super::super::projection::CONVERSATION_TOPIC_PREFIX;
     use super::super::relay::{DeviceRoute, RelayClient, RelayEvent};
     use super::super::types::{
-        codes, CapabilityFlag, CapabilityView, ConnectionState, TargetKey, ZResult,
+        codes, CapabilityFlag, CapabilityView, ConnectionState, HostBuildProbe, TargetKey, ZResult,
     };
     use crate::database::dao::settings::try_set_setting_conn;
     use crate::database::{migration, schema};
@@ -175,6 +177,8 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
         commands: Arc<Mutex<Vec<serde_json::Value>>>,
         ack: Arc<Mutex<AckMode>>,
+        /// 注入合成 pending 卡（T9 首答腿）：非 None 时 conversation 快照带这张卡。
+        pending_card: Arc<Mutex<Option<serde_json::Value>>>,
         /// `drop_link()` 的断链信号：每条连接 select 它，收到即发 Close 并收尾。
         drop_tx: tokio::sync::broadcast::Sender<()>,
         task: tokio::task::JoinHandle<()>,
@@ -206,6 +210,11 @@ mod tests {
             *self.ack.lock().expect("ACK 模式锁") = mode;
         }
 
+        /// 注入合成 pending 卡（须在 connect/bind 前设定：初始快照就带它）。
+        fn set_pending_card(&self, card: serde_json::Value) {
+            *self.pending_card.lock().expect("pending 卡锁") = Some(card);
+        }
+
         /// 从假体侧主动断链：已建立的连接收到 Close（生产 relay 观察到掉线，但
         /// Hub 代际不变——符合「链路断开」而非「用户显式断开」）。
         fn drop_link(&self) {
@@ -232,7 +241,8 @@ mod tests {
     /// （`helloConversationV4` / `initializeConversationV4` / 两个订阅；
     /// `sendConversationCommandV4` 按 [`AckMode`] 回 ACK，默认 accepted）。
     /// 会话订阅 ACK 之后推一条**真实形态**的 conversation snapshot（revision=1、
-    /// 空 pending/control），让生产的 bind/投影走完整 read 面（不手推 SSE）。
+    /// pending = 测试注入的合成卡或空册、空 control），让生产的 bind/投影走完整
+    /// read 面（不手推 SSE）。
     /// 其余 JSON 文本帧（数据面 `data` 探针）**原样回显一次**（不改写、不重复）；
     /// socket 保持到对端关闭（或 `drop_link()`）。
     ///
@@ -254,6 +264,8 @@ mod tests {
         let command_log = commands.clone();
         let ack = Arc::new(Mutex::new(AckMode::Accepted));
         let ack_mode = ack.clone();
+        let pending_card = Arc::new(Mutex::new(None));
+        let pending_card_per_conn = pending_card.clone();
         let (drop_tx, _keep_drop_rx) = tokio::sync::broadcast::channel(8);
         let drop_signal = drop_tx.clone();
         let task = tokio::spawn(async move {
@@ -268,6 +280,7 @@ mod tests {
                     app_log.clone(),
                     command_log.clone(),
                     ack_mode.clone(),
+                    pending_card_per_conn.clone(),
                     drop_signal.subscribe(),
                 ));
             }
@@ -279,6 +292,7 @@ mod tests {
             log,
             commands,
             ack,
+            pending_card,
             drop_tx,
             task,
         }
@@ -380,17 +394,24 @@ mod tests {
         Some((message_type, id, channel, method))
     }
 
-    /// 合成会话快照（与 bridge 单元测试里官方假体的快照同形）：`revision=1`、
+    /// 合成会话快照（与 bridge 单元测试里官方假体的快照同形）：`revision` 可参数化、
     /// 空 pending / 空 control、带当前选择 config。生产投影据此 `ready=true`。
-    fn synthetic_conversation_snapshot(session_id: &str) -> serde_json::Value {
+    ///
+    /// `seq` 与 `revision` 同值前进：`seq` 推进日志头指纹（send 确认的「新用户消息
+    /// 可见」观察面），`revision` 推进会话水位（send 确认的「revision 前进」判据）。
+    fn synthetic_conversation_snapshot(
+        session_id: &str,
+        revision: u64,
+        pending_cards: &[serde_json::Value],
+    ) -> serde_json::Value {
         serde_json::json!({
             "protocolVersion": 1,
             "sessionId": session_id,
             "logEpoch": "synthetic-epoch",
-            "seq": 1,
-            "revision": 1,
+            "seq": revision,
+            "revision": revision,
             "control": {"activeWorks": []},
-            "pendingInteractions": [],
+            "pendingInteractions": pending_cards,
             "config": {
                 "provider": "synthetic-provider",
                 "model": "synthetic-model-a",
@@ -400,12 +421,14 @@ mod tests {
     }
 
     /// 推一条该会话 topic 的 conversation snapshot（204 事件帧）：
-    /// complete 包装 + `[fromSeq,toSeq]=[0,1]`，与官方 wire 形态一致。
+    /// complete 包装 + `[fromSeq,toSeq]=[0,revision]`，与官方 wire 形态一致。
     async fn push_conversation_snapshot(
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         peer: &mut FakePeer,
         bridge: &str,
         session_id: &str,
+        revision: u64,
+        pending_cards: &[serde_json::Value],
     ) {
         // 生产在订阅 RPC 之前先发 EventListen；缺 listen id 就无法路由事件帧。
         let Some(listen) = peer.listen.get(bridge).copied() else {
@@ -416,19 +439,19 @@ mod tests {
             "topic": topic,
             "subscriptionId": CONVERSATION_SUBSCRIPTION,
             "fromSeq": 0,
-            "toSeq": 1,
+            "toSeq": revision,
             "sentAt": 0,
             "payload": {
                 "kind": "snapshot",
-                "snapshot": synthetic_conversation_snapshot(session_id),
+                "snapshot": synthetic_conversation_snapshot(session_id, revision, pending_cards),
             },
         });
         let wire = serde_json::json!({
             "wireVersion": V4_WIRE_PROTOCOL_VERSION,
             "kind": "complete",
             "deliveryKind": "initial",
-            "logicalFrameId": "synthetic-logical-1",
-            "logicalFrameOrdinal": 1,
+            "logicalFrameId": format!("synthetic-logical-{revision}"),
+            "logicalFrameOrdinal": revision,
             "topic": topic,
             "subscriptionId": CONVERSATION_SUBSCRIPTION,
             "frame": logical,
@@ -450,6 +473,7 @@ mod tests {
         log: &Arc<Mutex<Vec<String>>>,
         commands: &Arc<Mutex<Vec<serde_json::Value>>>,
         ack: &Arc<Mutex<AckMode>>,
+        pending_card: &Arc<Mutex<Option<serde_json::Value>>>,
         payload: &serde_json::Value,
     ) {
         let bridge = payload
@@ -534,7 +558,34 @@ mod tests {
                     }
                 }
                 if let Some(session_id) = conversation_session {
-                    push_conversation_snapshot(socket, peer, &bridge, &session_id).await;
+                    peer.conversation = Some(session_id.clone());
+                    // 初始快照的 pending 集合 = 测试注入的合成卡（未注入 = 空册）。
+                    let cards = pending_card
+                        .lock()
+                        .expect("pending 卡锁")
+                        .clone()
+                        .map(|card| vec![card])
+                        .unwrap_or_default();
+                    push_conversation_snapshot(socket, peer, &bridge, &session_id, 1, &cards).await;
+                }
+                // T9：Accepted ACK 后推一条 revision/seq 前进的会话快照（revision=2），
+                // 模拟宿主吸收用户消息/答案后的会话状态推进。这**不是**探针消息——
+                // 它既不由生产发出、也不携带任何额外文本，只是让假体作为「宿主状态」
+                // 的真实形态来源给出 spec R4 确认判据要求的观察证据：
+                // - send：revision 前进 + 日志头指纹前进 = 新用户消息可见；
+                // - answer：宿主整体替换 pending 册（作答的卡撤下）+ revision 前进
+                //   = 「目标卡撤下」判据（wait_host_cleared 与泵观察同源）。
+                // rejected/malformed 的 ACK 不推（宿主状态未前进，确认窗只能到点
+                // inconclusive）。未订阅会话 topic 的连接不推（无从谈起会话状态）。
+                if method == AGENT_SEND_COMMAND_METHOD
+                    && *ack.lock().expect("ACK 模式锁") == AckMode::Accepted
+                {
+                    if let Some(session_id) = peer.conversation.clone() {
+                        // 会话快照走该会话桥的 listen id；经 rpc-frame 的 bridge 就是
+                        // 会话桥（send/resolve 命令只在会话桥上发出）。
+                        push_conversation_snapshot(socket, peer, &bridge, &session_id, 2, &[])
+                            .await;
+                    }
                 }
             }
             REQUEST_TYPE_EVENT_LISTEN => {
@@ -555,6 +606,9 @@ mod tests {
         message_seq: HashMap<String, u64>,
         /// bridgeSessionId → 最近一次 `EventListen` 的请求 id（事件推送按它路由）。
         listen: HashMap<String, u32>,
+        /// 本连接上最近一次 `subscribeConversationV4` 的会话 id（send ACK 后的
+        /// 跟进快照要推给它的 topic；未订阅过 = None，不推）。
+        conversation: Option<String>,
     }
 
     impl FakePeer {
@@ -618,6 +672,7 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
         commands: Arc<Mutex<Vec<serde_json::Value>>>,
         ack: Arc<Mutex<AckMode>>,
+        pending_card: Arc<Mutex<Option<serde_json::Value>>>,
         mut close_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
         let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
@@ -664,8 +719,16 @@ mod tests {
                 if let Some(payload) = app_payload(&value) {
                     let zcode_type = payload.get("zcode_type").and_then(|kind| kind.as_str());
                     if zcode_type == Some("rpc-frame") {
-                        serve_rpc_frame(&mut socket, &mut peer, &log, &commands, &ack, payload)
-                            .await;
+                        serve_rpc_frame(
+                            &mut socket,
+                            &mut peer,
+                            &log,
+                            &commands,
+                            &ack,
+                            &pending_card,
+                            payload,
+                        )
+                        .await;
                         continue;
                     }
                     if let Some(zcode_type) = zcode_type {
@@ -1102,6 +1165,56 @@ mod tests {
     const ACTION_ID: &str = "act-full-1";
     /// 合成正文（审计只记字数，绝不落正文）。
     const SEND_TEXT: &str = "合成正文：全链发送";
+    /// 首答腿的合成 pending 卡 id（与宿主 pendingInteractions 的 interactionId 精确相等）。
+    const ANSWER_INTERACTION_ID: &str = "int_synthetic_answer_0001";
+    /// 首答腿的合成题干（宿主原值；build_user_answer 以它为 answer 键）。
+    const ANSWER_QUESTION_TEXT: &str = "合成问答：这个任务接下来要做什么？";
+    /// 首答腿的合成选项 value（宿主原值；绝不回传 label）。
+    const ANSWER_OPTION_VALUE: &str = "opt-continue";
+
+    /// 合成 AskUserQuestion 单选卡（形状钉 `pending.rs` 解析的官方 wire 形态；
+    /// 全合成值，不读真实宿主数据）。
+    fn synthetic_user_input_card() -> serde_json::Value {
+        serde_json::json!({
+            "interactionId": ANSWER_INTERACTION_ID,
+            "kind": "userInput",
+            "anchorRowId": 7,
+            "createdAt": 1_700_000_000_500u64,
+            "payload": {
+                "kind": "userInput",
+                "prompt": "synthetic: pick one",
+                "toolCallId": "call_synthetic_answer_0001",
+                "toolName": "AskUserQuestion",
+                "questions": [{
+                    "header": "下一步",
+                    "question": ANSWER_QUESTION_TEXT,
+                    "multiSelect": false,
+                    "options": [
+                        {"value": ANSWER_OPTION_VALUE, "label": "继续实现"},
+                        {"value": "opt-test-first", "label": "先写测试"},
+                    ],
+                }],
+            },
+        })
+    }
+
+    /// 首答腿的动作体（官方 tagged answer；单选回传宿主原值）。
+    fn answer_body(action_id: &str, generation: u64) -> serde_json::Value {
+        serde_json::json!({
+            "actionId": action_id,
+            "action": {
+                "kind": "answer",
+                "sessionId": SYNTHETIC_TASK_ID,
+                "generation": generation,
+                "interactionId": ANSWER_INTERACTION_ID,
+                "answers": [{
+                    "questionText": ANSWER_QUESTION_TEXT,
+                    "selectedValues": [ANSWER_OPTION_VALUE],
+                    "freeText": null,
+                }],
+            },
+        })
+    }
 
     type SharedConn = Arc<Mutex<Connection>>;
 
@@ -1361,6 +1474,30 @@ mod tests {
         })
     }
 
+    /// 能力账本某行状态（T9 确认流转断言用；行不存在 = 测试失败）。
+    fn capability_ledger_state(store: &DeviceStore, key: &str, capability: &str) -> String {
+        store.with(|c| {
+            c.query_row(
+                "SELECT state FROM zcode_capability_evidence WHERE key = ?1 AND capability = ?2",
+                rusqlite::params![key, capability],
+                |r| r.get::<_, String>(0),
+            )
+            .expect("zcode_capability_evidence 行必须存在")
+        })
+    }
+
+    /// 能力账本某行判据词（confirmed 行必带结构化判据标识）。
+    fn capability_ledger_evidence(store: &DeviceStore, key: &str, capability: &str) -> String {
+        store.with(|c| {
+            c.query_row(
+                "SELECT evidence FROM zcode_capability_evidence WHERE key = ?1 AND capability = ?2",
+                rusqlite::params![key, capability],
+                |r| r.get::<_, String>(0),
+            )
+            .expect("zcode_capability_evidence 行必须存在")
+        })
+    }
+
     fn audit_rows(store: &DeviceStore, action: &str, result: &str) -> i64 {
         store.with(|c| {
             c.query_row(
@@ -1436,6 +1573,68 @@ mod tests {
             events,
             bridge,
             lag,
+        ));
+        // 真实 AuthService 已持有回环 OAuth 拿到的 JWT：只镜像 `authorize` 成功后的
+        // Hub 状态（不第二次 OAuth、不等第二次回调）。
+        hub.mark_authorized_for_test();
+        let connected = tokio::time::timeout(Duration::from_secs(10), hub.connect())
+            .await
+            .expect("connect 未在时限内完成")
+            .expect("真实回环 relay 应配对成功");
+        assert_eq!(
+            connected.state,
+            ConnectionState::Paired,
+            "connect 后必须已配对"
+        );
+        Chain {
+            _fake: fake,
+            ws,
+            auth,
+            conn,
+            store,
+            hub,
+            injector: Arc::new(RecordingInjector::default()),
+        }
+    }
+
+    /// T9 全链装配（resolver 驱动形态）：与 [`full_chain`] 同一回环假官方 + 生产组件，
+    /// 但 Hub 用**生产同源**的 capability resolver 策略源与确认账本（不注入静态矩阵，
+    /// 与生产 `ZcodeHub::new` 同一拼法），宿主 build 探针由调用方注入——未知 build
+    /// 用例的确定性来源（真实探针读本机 plist，跨机器/跨时间不可复现）。
+    async fn resolver_chain(host_build: HostBuildProbe) -> Chain {
+        let fake = FakeOfficialHttp::start().await;
+        // 显式禁用系统代理（macOS 系统代理会把 127.0.0.1 也转发出去）。
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("测试 HTTP 客户端");
+        let auth = authorized_service(&fake, &http).await;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("回环 WS 端口应可绑定");
+        let ws = spawn_ws_handshake(listener);
+
+        let conn = shared_conn();
+        seed(&conn);
+        let store = DeviceStore::Owned(conn.clone());
+        let (parts, events, lag) = PartsBackend::production_test_with_host_build(
+            store.clone(),
+            auth.clone(),
+            ws.origin.clone(),
+            host_build,
+        );
+        let bridge = parts.pump_bridge();
+        let policy_source = parts.policy_source();
+        let ledger = parts.capability_ledger();
+        let backend: Arc<dyn HubBackend> = Arc::new(parts);
+        let hub = Arc::new(ZcodeHub::with_pump_policy_source_and_confirmation(
+            store.clone(),
+            backend,
+            policy_source,
+            events,
+            bridge,
+            lag,
+            ledger,
         ));
         // 真实 AuthService 已持有回环 OAuth 拿到的 JWT：只镜像 `authorize` 成功后的
         // Hub 状态（不第二次 OAuth、不等第二次回调）。
@@ -1779,6 +1978,328 @@ mod tests {
         assert_eq!(audit_rows(&chain.store, "zcode_send", "accepted"), 1);
     }
 
+    /// T9 e2e（spec §7.3/§7.6/§8）：未知 build（shipped 表不命中）走 resolver 的
+    /// 接口候选（A 策略）；send 首条真实消息完成「accepted → revision 前进 →
+    /// 账本 confirmed」全链；全程**恰一条**命令帧（零探针消息、零自动重发）。
+    ///
+    /// 与既有全链用例的关键差别：Hub 不注入静态矩阵——策略矩阵与确认落账都走
+    /// 生产装配的 capability resolver + DB 账本（同 `ZcodeHub::new` 拼法），宿主
+    /// build 确定性注入为未知值。绝不访问真实官方端点/凭据（全链回环假体）。
+    #[tokio::test]
+    async fn unknown_build_send_confirms_without_probe_message() {
+        // 未知 build：`9.9.9.9999` 不在 shipped 表（唯一已知 `3.16.2.8769`），
+        // 平台/协议无关——shipped 表精确命中失败 → 只剩接口候选可判。
+        let unknown_build: HostBuildProbe = Arc::new(|| Some("9.9.9.9999".to_owned()));
+        let chain = resolver_chain(unknown_build).await;
+        let app = router(remote_state(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+        ));
+        let generation = chain.hub.connection().generation;
+        // 能力 key 与 resolver 同一拼法（platform|build|protocol|schema|epoch；
+        // schema 占位 "v4"、epoch 0 是 T4 裁决的生产常量）。
+        let key = format!("{}|9.9.9.9999|3|v4|0", std::env::consts::OS);
+
+        // ---- 1) resolver 候选开放：真实 bind/订阅/形状采集后 send enabled（无原因码）----
+        let session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+        assert_eq!(
+            session["capabilities"]["send"]["enabled"], true,
+            "未知 build 接口候选必须开放 send：{session}"
+        );
+        assert!(
+            session["capabilities"]["send"]["reasonCode"].is_null(),
+            "候选开放不带原因码（UI 只见可用）：{session}"
+        );
+        // 候选只开接口形状齐备的项：合成快照无 pending/control/目录 → 其余七项
+        // 仍是 needs_evidence（形状缺席不开闸，spec R3）。
+        for capability in [
+            "singleSelect",
+            "multiSelect",
+            "freeText",
+            "model",
+            "interrupt",
+        ] {
+            assert_eq!(
+                session["capabilities"][capability]["enabled"], false,
+                "{capability} 形状缺席必须保持关闭：{session}"
+            );
+            assert_eq!(
+                session["capabilities"][capability]["reasonCode"],
+                codes::NEEDS_EVIDENCE,
+                "{capability} 关闭必须给 needs_evidence 原因：{session}"
+            );
+        }
+        assert_eq!(session["revision"].as_u64(), Some(1));
+
+        // ---- 2) 发一条真实 send：accepted + 恰一条命令帧（正文原样、clientId 来自配对门）----
+        let (status, receipt) =
+            post_action(&app, &send_body(ACTION_ID, generation, SEND_TEXT)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "候选开放即可真实发送（A 策略）：{receipt}"
+        );
+        assert_eq!(receipt["state"], "accepted");
+        assert_eq!(
+            chain.ws.commands().len(),
+            1,
+            "整条链只允许一帧命令信封：{:#?}",
+            chain.ws.commands()
+        );
+        let envelope = &chain.ws.commands()[0]["envelope"];
+        assert_eq!(envelope["type"], SEND_TEXT_TYPE);
+        assert_eq!(
+            envelope["payload"]["text"], SEND_TEXT,
+            "正文必须原样离机，绝不携带探针文本"
+        );
+        assert_eq!(envelope["clientId"], DEVICE_ID);
+        assert_eq!(chain.injector.calls(), 0, "官方路径不得回落终端注入");
+
+        // ---- 3) revision 前进：send 后会话水位推进（宿主状态前进的可观察证据）----
+        // （RED 阶段：假体不推跟进快照 → revision 停在 1 → 本断言失败。）
+        let advanced = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let (_, body) = get_json(
+                    &app,
+                    &format!("/m/api/v1/zcode/session?sessionId={SYNTHETIC_TASK_ID}"),
+                )
+                .await;
+                if body["revision"].as_u64() == Some(2) {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        assert!(
+            advanced.await,
+            "send 后会话 revision 必须前进到 2（宿主吸收消息的推进证据）"
+        );
+
+        // ---- 4) 确认流转：泵观察「revision 前进 + 新用户消息指纹」→ 账本 confirmed ----
+        // （RED 阶段：无新投影证据 → 确认窗到点 inconclusive → 本断言失败。）
+        wait_until(|| {
+            chain.store.with(|c| {
+                c.query_row(
+                    "SELECT state FROM zcode_capability_evidence WHERE key = ?1 AND capability = 'send'",
+                    rusqlite::params![key],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .as_deref()
+                == Some("confirmed")
+            })
+        })
+        .await;
+        assert_eq!(
+            capability_ledger_state(&chain.store, &key, "send"),
+            "confirmed",
+            "未知 build 的 send 首次真实使用必须确认落账"
+        );
+        assert_eq!(
+            capability_ledger_evidence(&chain.store, &key, "send"),
+            "revision_advanced+new_user_message",
+            "confirmed 行必须携带结构化判据词（无正文）"
+        );
+
+        // ---- 5) 确认后矩阵仍开放：confirmed 优先级不降级，同一 resolver 现读 ----
+        let (_, after) = get_json(
+            &app,
+            &format!("/m/api/v1/zcode/session?sessionId={SYNTHETIC_TASK_ID}"),
+        )
+        .await;
+        assert_eq!(
+            after["capabilities"]["send"]["enabled"], true,
+            "confirmed 后 send 仍可用（账本判决被 resolver 消费）：{after}"
+        );
+
+        // ---- 6) 无探针消息：业务请求序列逐条固定 + 静置观察窗仍恰一帧 ----
+        // 整条链的业务请求恰为：bootstrap → listing → 枚举桥 → 控制器订阅（枚举桥
+        // 上）→ 会话桥 → hello → clientHello → 会话订阅 → **用户的真实 send**。
+        // 多一帧、少一帧、顺序漂移（如 send 后重新 bind/订阅）都说明链路里有额外动作。
+        let business = upstream_business_requests(&chain.ws.log());
+        assert_eq!(
+            business,
+            vec![
+                BOOTSTRAP_REQUEST.to_owned(),
+                WORKSPACE_LIST_REQUEST.to_owned(),
+                WORKSPACE_BRIDGE_OPEN.to_owned(),
+                CONTROLLER_SUBSCRIBE_METHOD.to_owned(),
+                WORKSPACE_BRIDGE_OPEN.to_owned(),
+                AGENT_HELLO_METHOD.to_owned(),
+                AGENT_CLIENT_HELLO_METHOD.to_owned(),
+                AGENT_SUBSCRIBE_CONVERSATION_METHOD.to_owned(),
+                AGENT_SEND_COMMAND_METHOD.to_owned(),
+            ],
+            "业务请求序列必须恰为 bind/订阅 + 用户的一条 send（零探针）：{business:?}"
+        );
+        // 静置观察窗：确认落账后也不得冒出第二帧（零探针、零自动重发）。
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(chain.ws.commands().len(), 1, "静置期后仍只允许一帧命令信封");
+    }
+
+    /// T9 补腿 e2e（brief 验收「pending 卡首答确认」）：未知 build 的会话快照带一张
+    /// 合成 AskUserQuestion 单选卡 → resolver 候选开放 single_select → 提交一条真实
+    /// Answer（经生产 check_answer_precheck/authorize/build_user_answer 全链）→
+    /// 宿主撤卡 + revision 前进 → 账本 confirmed；全程**恰一条**答案命令帧
+    /// （resolveInteraction，无探针文本、无自动重发）。
+    ///
+    /// 确认走两条生产路径之一（都断言接受）：派发内 `wait_host_cleared` 命中 →
+    /// 回执 `confirmed`、回执终态落账（判据词 `pending_cleared`）；或回执 accepted
+    /// 后事件泵观察「目标卡撤下 + revision 前进」先落账（判据词
+    /// `pending_cleared+revision_advanced`）。两条路径都是同一 unknown-build key 上
+    /// 恰一条 confirmed 行。
+    #[tokio::test]
+    async fn unknown_build_answer_confirms_pending_without_probe_message() {
+        let unknown_build: HostBuildProbe = Arc::new(|| Some("9.9.9.9999".to_owned()));
+        let chain = resolver_chain(unknown_build).await;
+        // 初始快照带合成单选卡（须在 connect 前注入）。
+        chain.ws.set_pending_card(synthetic_user_input_card());
+        let app = router(remote_state(
+            &chain.conn,
+            chain.hub.clone(),
+            chain.injector.clone(),
+        ));
+        let generation = chain.hub.connection().generation;
+        let key = format!("{}|9.9.9.9999|3|v4|0", std::env::consts::OS);
+
+        // ---- 1) resolver 候选开放：卡形状在场 → single_select 候选可用（无原因码）----
+        let session = bind_and_wait_ready(&app, SYNTHETIC_TASK_ID).await;
+        assert_eq!(
+            session["pending"][0]["interactionId"], ANSWER_INTERACTION_ID,
+            "合成卡必须随真实投影上会话视图：{session}"
+        );
+        assert_eq!(
+            session["capabilities"]["singleSelect"]["enabled"], true,
+            "未知 build 上 user_input 卡形状必须开放 single_select 候选：{session}"
+        );
+        assert!(
+            session["capabilities"]["singleSelect"]["reasonCode"].is_null(),
+            "候选开放不带原因码（UI 只见可用）：{session}"
+        );
+        assert_eq!(
+            session["capabilities"]["approvalReply"]["enabled"], false,
+            "无 permission 形状不得开放审批：{session}"
+        );
+
+        // ---- 2) 提交一条真实 Answer：回执 confirmed（宿主撤卡因果终态）----
+        // （RED 证据：假体跟进快照不撤卡时，wait_host_cleared 到点未命中 → 回执停在
+        // accepted，本断言失败（10s 窗）——「宿主未撤卡不得转正」的可证伪面。）
+        let (status, receipt) = post_action(&app, &answer_body(ACTION_ID, generation)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "候选开放即可真实作答（A 策略）：{receipt}"
+        );
+        assert_eq!(
+            receipt["state"], "confirmed",
+            "宿主撤下目标卡后 Answer 必须拿到因果终态 confirmed：{receipt}"
+        );
+        assert_eq!(
+            chain.ws.commands().len(),
+            1,
+            "恰一条答案命令帧：{:#?}",
+            chain.ws.commands()
+        );
+        let envelope = &chain.ws.commands()[0]["envelope"];
+        assert_eq!(envelope["type"], RESOLVE_INTERACTION_TYPE);
+        assert_eq!(
+            envelope["payload"]["interactionId"], ANSWER_INTERACTION_ID,
+            "答案命令必须精确指向宿主卡：{envelope}"
+        );
+        assert_eq!(
+            envelope["payload"]["answer"]["content"]["answers"][ANSWER_QUESTION_TEXT],
+            ANSWER_OPTION_VALUE,
+            "单选答案以宿主题干为键、回传宿主原值：{envelope}"
+        );
+        assert_eq!(envelope["clientId"], DEVICE_ID);
+        assert_eq!(chain.injector.calls(), 0, "官方路径不得回落终端注入");
+
+        // ---- 3) 宿主撤卡 + revision 前进：GET 会话 pending 清空、水位 2 ----
+        let cleared = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let (_, body) = get_json(
+                    &app,
+                    &format!("/m/api/v1/zcode/session?sessionId={SYNTHETIC_TASK_ID}"),
+                )
+                .await;
+                if body["revision"].as_u64() == Some(2)
+                    && body["pending"].as_array().is_some_and(|cards| {
+                        cards
+                            .iter()
+                            .all(|card| card["interactionId"] != ANSWER_INTERACTION_ID)
+                    })
+                {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        assert!(
+            cleared.await,
+            "作答后宿主必须撤下目标卡且 revision 前进（确认判据的可观察证据）"
+        );
+
+        // ---- 4) 确认流转：账本 confirmed（两条生产路径任一，判据词按实际走法）----
+        wait_until(|| {
+            chain.store.with(|c| {
+                c.query_row(
+                    "SELECT state FROM zcode_capability_evidence WHERE key = ?1 AND capability = 'single_select'",
+                    rusqlite::params![key],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .as_deref()
+                == Some("confirmed")
+            })
+        })
+        .await;
+        assert_eq!(
+            capability_ledger_state(&chain.store, &key, "single_select"),
+            "confirmed"
+        );
+        assert!(
+            matches!(
+                capability_ledger_evidence(&chain.store, &key, "single_select").as_str(),
+                "pending_cleared" | "pending_cleared+revision_advanced"
+            ),
+            "confirmed 判据词必须是两条生产路径之一：{}",
+            capability_ledger_evidence(&chain.store, &key, "single_select")
+        );
+
+        // ---- 5) 无探针消息：业务请求序列逐条固定 + 静置观察窗仍恰一帧 ----
+        let business = upstream_business_requests(&chain.ws.log());
+        assert_eq!(
+            business,
+            vec![
+                BOOTSTRAP_REQUEST.to_owned(),
+                WORKSPACE_LIST_REQUEST.to_owned(),
+                WORKSPACE_BRIDGE_OPEN.to_owned(),
+                CONTROLLER_SUBSCRIBE_METHOD.to_owned(),
+                WORKSPACE_BRIDGE_OPEN.to_owned(),
+                AGENT_HELLO_METHOD.to_owned(),
+                AGENT_CLIENT_HELLO_METHOD.to_owned(),
+                AGENT_SUBSCRIBE_CONVERSATION_METHOD.to_owned(),
+                AGENT_SEND_COMMAND_METHOD.to_owned(),
+            ],
+            "业务请求序列必须恰为 bind/订阅 + 用户的一条 answer（零探针）：{business:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            chain.ws.commands().len(),
+            1,
+            "静置期后仍只允许一帧命令信封（零探针、零重发）"
+        );
+    }
+
     /// 失败场景：宿主显式 `rejected` ACK → 回执 `rejected`、终态审计、绝不重发。
     ///
     /// 假官方 WS 收回真实 ACK 形状 `{"status":"rejected"}`；生产 `classify_ack` 映射为
@@ -1999,27 +2520,7 @@ mod tests {
 
         // 证据门：即使已恢复并配对，默认关闭的 send 仍不得下发上游业务命令。
         let generation = second_hub.connection().generation;
-        // 只比较**业务请求**白名单：bind / 订阅 / hello / initialize / 发送命令。
-        // 假体日志同时会收到生产对每个 RPC 帧的传输层 `rpc-frame-ack`（入站，不是业务
-        // 请求，也可能在 ready 之后才到），它不在白名单内；白名单本身就是要断言的项。
-        let upstream_business_requests = |log: &[String]| {
-            log.iter()
-                .filter(|method| {
-                    matches!(
-                        method.as_str(),
-                        BOOTSTRAP_REQUEST
-                            | WORKSPACE_LIST_REQUEST
-                            | WORKSPACE_BRIDGE_OPEN
-                            | AGENT_HELLO_METHOD
-                            | AGENT_CLIENT_HELLO_METHOD
-                            | CONTROLLER_SUBSCRIBE_METHOD
-                            | AGENT_SUBSCRIBE_CONVERSATION_METHOD
-                            | AGENT_SEND_COMMAND_METHOD
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        };
+        // 只比较**业务请求**白名单（`upstream_business_requests`，见其模块级文档）。
         let upstream_before_send = upstream_business_requests(&world.ws.log());
         let (http_status, body) = post_action(
             &app,
@@ -2042,6 +2543,28 @@ mod tests {
             upstream_before_send,
             "能力闸必须在 bind 前拒绝：零新增业务请求（bind/订阅/hello/initialize/命令）"
         );
+    }
+
+    /// 业务请求白名单（bind/订阅/hello/initialize/发送命令）：假体日志同时会收到
+    /// 生产对每个 RPC 帧的传输层 `rpc-frame-ack`（入站，不是业务请求，也可能在
+    /// ready 之后才到），它不在白名单内；白名单本身就是要断言的项。
+    fn upstream_business_requests(log: &[String]) -> Vec<String> {
+        log.iter()
+            .filter(|method| {
+                matches!(
+                    method.as_str(),
+                    BOOTSTRAP_REQUEST
+                        | WORKSPACE_LIST_REQUEST
+                        | WORKSPACE_BRIDGE_OPEN
+                        | AGENT_HELLO_METHOD
+                        | AGENT_CLIENT_HELLO_METHOD
+                        | CONTROLLER_SUBSCRIBE_METHOD
+                        | AGENT_SUBSCRIBE_CONVERSATION_METHOD
+                        | AGENT_SEND_COMMAND_METHOD
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
     }
 
     /// 用户断开（持久 auto=false）或忘记授权后重启：新进程零 WS、零 terminal token。
